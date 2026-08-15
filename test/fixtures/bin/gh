@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Fake `gh` for tests. Introspection + per-repo read.
+# Args: api <path> [-i] [--jq <expr>]
+set -euo pipefail
+
+if [ -z "${GH_TOKEN:-}" ]; then
+  echo "fake gh: GH_TOKEN not set" >&2
+  exit 95
+fi
+
+path="${2:-}"
+case "$path" in
+  /user)
+    if [ "${3:-}" = "-i" ]; then
+      scopes="${GH_SCOPES:-}"
+      cat <<EOF
+HTTP/2.0 200 OK
+content-type: application/json; charset=utf-8
+x-oauth-scopes: ${scopes}
+x-github-request-id: fake
+
+{"login":"scout-test","id":1,"type":"User"}
+EOF
+      exit 0
+    fi
+    ;;
+  repos/*)
+    if [ "${3:-}" = "--jq" ] && [ "${4:-}" = ".full_name" ]; then
+      echo "${path#repos/}"
+      exit 0
+    fi
+    ;;
+esac
+
+echo "fake gh: unhandled request path='$path' args=$*" >&2
+exit 96

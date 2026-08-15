@@ -1,0 +1,25 @@
+{
+  "name": "@the-metafactory/ranger",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Autonomous orienteer work-graph walker — scout: read-only frontier/audit/HITL digest",
+  "type": "module",
+  "bin": {
+    "ranger": "./src/cli.ts"
+  },
+  "scripts": {
+    "scout": "bun src/cli.ts scout",
+    "test": "bun test",
+    "typecheck": "bunx tsc --noEmit"
+  },
+  "dependencies": {
+    "commander": "^12.0.0",
+    "yaml": "^2.6.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5"
+  },
+  "packageManager": "yarn@1.22.22+sha512.a6b2f7906b721bba3d67d4aff083df04dad64c399707841b7acf00f6b133b7ac24255f2652fa22ae3534329dc6180534e98d17432037ff6fd140556e2bb3137e"
+}

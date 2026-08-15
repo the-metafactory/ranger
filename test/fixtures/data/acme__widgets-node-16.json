@@ -1,0 +1,19 @@
+{
+  "repo": "acme/widgets",
+  "ref": { "id": "16" },
+  "node": {
+    "id": "16",
+    "title": "Migrate the legacy store",
+    "kind": "task",
+    "checkpointId": "store-migrated",
+    "autonomy": "auto",
+    "probes": []
+  },
+  "status": "open",
+  "assignees": ["alice"],
+  "blockedBy": [],
+  "author": "bob",
+  "url": "https://github.com/acme/widgets/issues/16",
+  "typed": true,
+  "parent": { "id": "1" }
+}

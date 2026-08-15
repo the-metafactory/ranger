@@ -1,0 +1,42 @@
+{
+  "repo": "acme/gadgets",
+  "root": "5",
+  "frontier": [
+    {
+      "ref": { "id": "20" },
+      "node": {
+        "id": "20",
+        "title": "Refactor the scheduler",
+        "kind": "task",
+        "checkpointId": "scheduler-refactored",
+        "autonomy": "auto",
+        "probes": []
+      },
+      "status": "open",
+      "assignees": [],
+      "blockedBy": [],
+      "author": "carol",
+      "url": "https://github.com/acme/gadgets/issues/20",
+      "typed": true,
+      "parent": { "id": "5" }
+    },
+    {
+      "ref": { "id": "21" },
+      "node": {
+        "id": "21",
+        "title": "Compare queue backends",
+        "kind": "research",
+        "checkpointId": "queues-compared",
+        "autonomy": "auto",
+        "probes": []
+      },
+      "status": "open",
+      "assignees": [],
+      "blockedBy": [],
+      "author": "carol",
+      "url": "https://github.com/acme/gadgets/issues/21",
+      "typed": true,
+      "parent": { "id": "5" }
+    }
+  ]
+}

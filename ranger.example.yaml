@@ -1,0 +1,26 @@
+# ranger.example.yaml — annotated copy. Copy to ranger.yaml and set the env vars.
+---
+version: 1
+
+maps:
+  - repo: the-metafactory/ranger
+    root: 1
+    # walk: full is the implement-lane opt-in (walker's business, node #6)
+    walk: none
+  - repo: jcfischer/seekolous
+    root: 26
+    walk: none
+
+auth:
+  readOnlyTokens:
+    # Longest-prefix match: "the-metafactory/*" covers every metafactory repo,
+    # "jcfischer/*" covers personal repos. A more specific prefix wins.
+    "the-metafactory/*": RANGER_READONLY_GH_TOKEN_METAFACTORY
+    "jcfischer/*": RANGER_READONLY_GH_TOKEN_PERSONAL
+
+# Provision the two read-only fine-grained PATs (node #8):
+#   export RANGER_READONLY_GH_TOKEN_METAFACTORY=github_pat_…
+#      (reads the-metafactory/* — Issues: Read, Contents: Read)
+#   export RANGER_READONLY_GH_TOKEN_PERSONAL=github_pat_…
+#      (reads jcfischer/* — Issues: Read, Contents: Read)
+# Create them in GitHub → Settings → Developer settings → Fine-grained PATs.

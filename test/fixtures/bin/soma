@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Fake `soma` for tests. Only the read-only graph verbs are implemented.
+# Proves the token gate: refuses to run unless GH_TOKEN is set.
+set -euo pipefail
+
+if [ -z "${GH_TOKEN:-}" ]; then
+  echo "fake soma: GH_TOKEN not set — refusing (no keyring fallback)" >&2
+  exit 90
+fi
+if [ -z "${FAKE_SOMA_DIR:-}" ]; then
+  echo "fake soma: FAKE_SOMA_DIR not set" >&2
+  exit 91
+fi
+
+verb="${2:-}"
+root="${3:-}"
+repo=""
+json_flag=""
+i=4
+while [ $i -le $# ]; do
+  arg="${!i}"
+  case "$arg" in
+    --repo) i=$((i+1)); repo="${!i}" ;;
+    --json) json_flag=1 ;;
+  esac
+  i=$((i+1))
+done
+
+key="${repo//\//__}"
+file=""
+case "$verb" in
+  frontier) file="${FAKE_SOMA_DIR}/${key}-frontier.json" ;;
+  audit)    file="${FAKE_SOMA_DIR}/${key}-audit.json" ;;
+  node)     file="${FAKE_SOMA_DIR}/${key}-node-${root}.json" ;;
+  *)
+    echo "fake soma: verb '$verb' is not on the read-only surface" >&2
+    exit 92
+    ;;
+esac
+
+if [ ! -f "$file" ]; then
+  echo "fake soma: no fixture $file" >&2
+  exit 93
+fi
+cat "$file"
+exit 0

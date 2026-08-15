@@ -1,0 +1,8 @@
+{
+  "repo": "acme/widgets",
+  "root": "1",
+  "nodes": 16,
+  "closedWithoutReceipt": ["7", "8"],
+  "openWithoutCheckpoint": ["9"],
+  "openClaimed": [{ "id": "16", "assignees": ["alice"] }]
+}

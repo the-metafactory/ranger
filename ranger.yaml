@@ -1,0 +1,26 @@
+# ranger.yaml — per-run ranger configuration.
+---
+# Schema provisional: pending map node #6
+# ("Walk-mode opt-in and charting guidance"). Scout reads the maps registry +
+# auth; the walker's walk-mode schema is #6's business.
+
+version: 1
+
+# Maps ranger walks. Scout reports every registered map's
+# frontier/audit/HITL queue.
+maps:
+  - repo: the-metafactory/ranger
+    root: 1
+    walk: none
+  - repo: jcfischer/seekolous
+    root: 26
+    walk: none
+
+# Read-only token gate (node #8 ruling). Only env var NAMES live here — never
+# tokens. Prefixes match longest-first against map.repo. Scout refuses to run a
+# map without an explicit token; it never falls back to the gh keyring (which is
+# write-capable).
+auth:
+  readOnlyTokens:
+    "the-metafactory/*": RANGER_READONLY_GH_TOKEN_METAFACTORY
+    "jcfischer/*": RANGER_READONLY_GH_TOKEN_PERSONAL

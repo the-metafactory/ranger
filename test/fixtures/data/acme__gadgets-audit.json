@@ -1,0 +1,8 @@
+{
+  "repo": "acme/gadgets",
+  "root": "5",
+  "nodes": 6,
+  "closedWithoutReceipt": [],
+  "openWithoutCheckpoint": [],
+  "openClaimed": []
+}
