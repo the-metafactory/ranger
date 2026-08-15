@@ -213,7 +213,7 @@ Steps ship independently and are independently reversible (unload the plist → 
 
 These are charted as nodes on this repo's orienteer map rather than resolved here:
 
-1. **Executor ratification** — direct-spawn v1 vs cortex DevConsumer activation timing.
+1. ~~Executor ratification~~ — **decided (#4, closed):** v1 = ranger-owned direct `claude -p` spawn ratified; DevConsumer is a later lane gated on a proven end-to-end walk (proof node #14 charted below #4).
 2. ~~Working-tree review mechanism~~ — **decided (#5, closed):** standing rule is sage working-tree mode (`LocalGitBackend`, the-metafactory/sage#106, UPSTREAM); interim is draft-PR-first with offline `sage review` until it lands.
 3. **Merge authority** — approver-bot provisioning; branch-protection policy; the sage-verdict-is-not-human-sign-off rule.
 4. **Escalation surface** — which Discord server/channel; veto windows; ratifier pinning; digest cadence.
