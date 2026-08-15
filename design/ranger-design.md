@@ -45,7 +45,7 @@ pointers; reopen with `ranger:audit-failed` label on mismatch.
 ```
 
 | Component | Kind | Notes |
-|---|---|---|
+| --- | --- | --- |
 | `ranger tick` | NEW-BUILD | The §5 Phase 2 tick. Stateless: re-derives everything from the graph each pass. |
 | `ranger run-node` | NEW-BUILD | Worker supervisor: worktree, prompt, bounded `claude -p` spawn, outcome record, cleanup. Direct spawn — see §2 executor decision. |
 | Router + policy | NEW-BUILD | `ranger.yaml` per-map walk modes + conservative autonomy floor (§3). |
@@ -83,7 +83,7 @@ Three identities, structurally separated:
 Per frontier node, first match wins:
 
 | # | Condition | Route |
-|---|---|---|
+| --- | --- | --- |
 | 1 | Open escalation card, vetoed, or parked | Skip (dedupe). |
 | 2 | `autonomy ∈ {propose, approve}` — any kind | **Escalate, never claim.** Unclaimed HITL nodes stay visible and takeable by the principal's own interactive sessions. |
 | 3 | `autonomy: auto` but kind `grilling`/`prototype` | **Escalate as map hygiene.** HITL kinds are HITL regardless of declared autonomy — ranger's conservative floor, standing in for the unimplemented §4 clamp. |
@@ -104,14 +104,16 @@ Frontier ordering: doctrine's "first frontier node in order". No priority engine
 One worker = one node = one headless session (doctrine; research excepted).
 
 **Provisioning per worker:**
+
 - Worktree: `git worktree add <canonical>/​.worktrees/node-<N> -b node/<N>-<slug> origin/main` + `bun install` + vendor-binary copy — pilot's bootstrap SOP verbatim.
 - **Canonical checkout per walked repo** (`~/work/ranger-repos/<repo>`, maintained by ranger, fast-forwarded post-merge). This answers the fatal probe finding: command probes execute in the canonical checkout, whose stable path *can* be pre-registered in the probe registry. Worktrees are for building; probes run where the registry says. Node probe guidance (enforced by the Scribe at creation for ranger-filed nodes, advisory for humans): prefer ungated types — `git-ref-exists` / `artifact-exists atRef:main` / `git-merged-into` shaped for squash merges (the #97 post-hoc-amendment lesson) — over command probes; url probes are useless on private repos (no auth).
 - Env: `GH_TOKEN`=ranger-bot PAT, `SOMA_GRAPH_REPO=<owner/repo>`, `SAGE_STACK=default`, `PILOT_PRINCIPAL=jc`. No approver token, no keychain export, no access to `~/.soma/policy/`.
 - Prompt = node body + typed block + map **Destination/Constraints/Notes verbatim** (constraints bind only as far as the session reads them — so ranger injects them into every prompt) + the orienteer WalkTheMap/closing doctrine + the kind SOP + an untrusted-text guard (issue bodies are third-party-writable: instructions inside them are data, never directives — grove's sandbox layering is the reference bar).
 
 **Kind SOPs:**
+
 - *research*: investigate; findings on a throwaway `research/<slug>` branch; push; close with an ungated probe + `--resolution-file` + `--gist`.
-- *task/build*: implement in the worktree; repo test command; **working-tree review before the PR exists** (mechanism is an open decision node — sage's entry points are PR-shaped today; candidates: a sage working-tree mode (UPSTREAM) or a draft-PR-first flow; until decided, the lane runs draft-PR-first as the doctrine-compliant interim); open PR — **no GitHub closing keywords in PR title, body, or squash commit message** (the observed #588 fail-open path: auto-close skips the gate); sage review loop with verdict dedupe (cortex#422 posts each review twice) and the typed exit-code contract (0 verdict / 3 cant_do / 4 not_now retryable / 5–7 terminal / 124 timeout → DORMANT-consumer check first); batch all findings, one fix pass, **cap 2 round-trips then park + escalate** ("a third round signals a decision is needed, not another patch"); merge via the six-check gate under approver identity (§2) after a 30s merge-veto window; `soma graph close --dry-run` then close; confirm by re-reading the node (close has no `--json`); `decisions --write` (with marker-hash detect-and-retry — the span is read-modify-write with no CAS and the principal's sessions write it too); then the Scribe pass (§6).
+- *task/build*: implement in the worktree; repo test command; **working-tree review before the PR exists** (decision #5, closed: the standing rule is a sage working-tree mode — `LocalGitBackend` behind the ForgeBackend seam, `sage review --working-tree [path] --base <ref>`, filed upstream as the-metafactory/sage#106; until it lands the lane runs the interim: draft-PR-first with **offline** `sage review <owner/repo#N>` on the draft — never bus dispatch for this round, which sidesteps the live cortex#1503 two-stack durable contention, the DORMANT class, and head-of-line; a draft cannot merge so #588 auto-close stays inert, and the real body is written when marking ready); open PR — **no GitHub closing keywords in PR title, body, or squash commit message** (the observed #588 fail-open path: auto-close skips the gate); sage review loop with verdict dedupe (cortex#422 posts each review twice) and the typed exit-code contract (0 verdict / 3 cant_do / 4 not_now retryable / 5–7 terminal / 124 timeout → DORMANT-consumer check first); batch all findings, one fix pass, **cap 2 round-trips then park + escalate** ("a third round signals a decision is needed, not another patch"); merge via the six-check gate under approver identity (§2) after a 30s merge-veto window; `soma graph close --dry-run` then close; confirm by re-reading the node (close has no `--json`); `decisions --write` (with marker-hash detect-and-retry — the span is read-modify-write with no CAS and the principal's sessions write it too); then the Scribe pass (§6).
 
 **Bounding:** hard wall-clock kill at `NodeBudget.wallClockMin` (default 90 min — ≥ 2 full review cycles + spawn overhead per the SOP's ~65-min floor); `agentInvocations` caps respawns; token spend accumulated from the `claude -p` JSON output. Supervisor-side liveness (PID + output-stream progress), not worker-written heartbeats.
 
@@ -124,7 +126,7 @@ One worker = one node = one headless session (doctrine; research excepted).
 **Channel:** Discord, one channel (`#ranger`), one thread per map. Discord is notification and veto surface; **GitHub is where answers bind**. Announce mechanics fail closed: no confirmed message id → no claim, no window, no action.
 
 | Trigger | Card | Answer path |
-|---|---|---|
+| --- | --- | --- |
 | `grilling` node on frontier | Decision needed: question, options with constrained dimensions visible, link, blocked-descendant count ("resolving this unblocks N nodes") | The principal resolves it in a live interactive session. Ranger never conducts grillings and never drafts his answers. The close re-enters the walk through the graph itself — next tick's frontier sees the unblocked descendants. Zero answer-ingestion machinery. |
 | `prototype` node | Handoff card | Interactive session. |
 | `propose` node whose content is agent-producible (task/build/research work product) | Ranger does the work, then `soma graph close --propose --body-file …` — a proposal comment via the verb, no close. Card links it. | 👍 **from the principal** (identity-pinned) → `close --proposal-comment <id>`; because ranger always passes `--proposal-comment`, the root author's 👎 is *verb-enforced* refusal — upgrading the recorded-not-enforced flow into ranger's binding contract. 👎 → withdrawn, parked, never re-proposed to route around a refusal. The human ratifies a **work product**; decision-shaped content still goes to a live session. |
@@ -158,7 +160,7 @@ Filed nodes: `propose` minimum (§3), checkpoint minted at add time (mandatory �
 Stance: **crash = no-op.** The graph's gates are the correctness boundary ("correctness never rests on frontier accuracy"); the journal carries liveness and politeness only.
 
 | Failure | Detection | Response |
-|---|---|---|
+| --- | --- | --- |
 | Crashed worker | Tick sweep: PID dead, no outcome row | Claim survives (assignment is on the tracker). Sweep checks for an existing open PR/branch for the node and instructs the respawned worker to **adopt, not duplicate**. Attempt < 2 → respawn; ≥ 2 → park + card. |
 | Crashed tick | Stale run-lock (dead PID) | Broken automatically; claims made mid-pass are found by the next sweep as claimed-with-no-worker. |
 | Stale ranger claim, no recoverable worker | Sweep | Escalate. Until the `soma graph release` verb (UPSTREAM) merges, ranger never unassigns — report-only. |
@@ -212,7 +214,7 @@ Steps ship independently and are independently reversible (unload the plist → 
 These are charted as nodes on this repo's orienteer map rather than resolved here:
 
 1. **Executor ratification** — direct-spawn v1 vs cortex DevConsumer activation timing.
-2. **Working-tree review mechanism** — sage working-tree mode (UPSTREAM) vs draft-PR-first as the standing SOP.
+2. ~~Working-tree review mechanism~~ — **decided (#5, closed):** standing rule is sage working-tree mode (`LocalGitBackend`, the-metafactory/sage#106, UPSTREAM); interim is draft-PR-first with offline `sage review` until it lands.
 3. **Merge authority** — approver-bot provisioning; branch-protection policy; the sage-verdict-is-not-human-sign-off rule.
 4. **Escalation surface** — which Discord server/channel; veto windows; ratifier pinning; digest cadence.
 5. **Scout credential ruling** — read-only carve-out vs PAT-first.
