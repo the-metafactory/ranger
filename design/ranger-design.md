@@ -76,6 +76,8 @@ Three identities, structurally separated:
 
 **Sage verdict semantics under the bot identity.** Bot-authored PRs end sage's self-review downgrade, so formal verdicts become possible — but sage posts under the principal's login, so a sage APPROVE would satisfy branch protection *as though the human reviewed*. Rule: **sage's verdict is machine review evidence, never human sign-off.** The merge gate consumes it as "review present, 0 blockers"; branch-protection approval, where required, comes from approver-bot or the human. Attestation `verified` stays honestly unreachable while any ranger process runs on a machine where the principal's keychain credential is reachable; ranger treats `unverified` as the normal label it is.
 
+**Branch-protection policy (decided, node #6, closed).** Staged. **v1: no GitHub branch protection** on walked repos — ranger's six-check merge gate under the approver identity *is* the gate (pilot W5.0 `decideMergePolicy` shape, confirmed 2026-06-10: passed adversarial review + green CI suffices to merge, but only with a non-author approver identity provisioned; anything short → HOLD). **When approver-bot provisions:** add GitHub protection on walked repos' main requiring a review **specifically from approver-bot** (tracker-enforced two-of-two) — never a blanket any-reviewer rule, which a sage APPROVE posted under the principal's login would silently satisfy. Until approver-bot exists, merges escalate to the principal (one tap), never `--admin`.
+
 ---
 
 ## 3. Routing and the autonomy floor
@@ -215,7 +217,7 @@ These are charted as nodes on this repo's orienteer map rather than resolved her
 
 1. ~~Executor ratification~~ — **decided (#4, closed):** v1 = ranger-owned direct `claude -p` spawn ratified; DevConsumer is a later lane gated on a proven end-to-end walk (proof node #14 charted below #4).
 2. ~~Working-tree review mechanism~~ — **decided (#5, closed):** standing rule is sage working-tree mode (`LocalGitBackend`, the-metafactory/sage#106, UPSTREAM); interim is draft-PR-first with offline `sage review` until it lands.
-3. **Merge authority** — approver-bot provisioning; branch-protection policy; the sage-verdict-is-not-human-sign-off rule.
+3. ~~Merge authority~~ — **decided (#6, closed):** three-identity model ratified (ranger-bot authors, jcfischer speaks, approver-bot merges); approver credential never in a worker session; sage verdict is machine evidence, never human sign-off; branch protection staged — gate-in-code now, approver-bot-pinned required review when it provisions; until then merges escalate one tap, never `--admin`. Follow-up charted below #6: provisioning node (approver-bot identity + protection).
 4. **Escalation surface** — which Discord server/channel; veto windows; ratifier pinning; digest cadence.
 5. **Scout credential ruling** — read-only carve-out vs PAT-first.
 6. **Walk-mode opt-in and charting guidance** — `ranger.yaml` schema; how maps get charted walkable; whether orienteer's ChartTheMap gains a "charting for ranger" addendum (upstream to the skill, manual cherry-pick discipline).
