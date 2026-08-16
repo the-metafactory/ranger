@@ -1,0 +1,74 @@
+name: close-auditor
+
+# Tracker-side close audit (work-graph.md §5 Phase 2, ranger design §7).
+# Fires on issue-close and re-verifies the structurally checkable half of the
+# close evidence for work-graph NODES (issues whose body carries a
+# `soma:work-graph-node` block): a close receipt comment must exist and carry a
+# checkpoint. A node that closed without one is the #588 fail-open path
+# (auto-close via closing keywords skips the gate) — reopen it with the
+# `ranger:audit-failed` label so a human/next tick re-checks it.
+#
+# v1 scope: structural gate (receipt + checkpoint). Deeper pointer
+# re-verification (commit SHAs, CI run URLs, probe outputs against the git
+# API) is a follow-up; the receipt's evidence pointers are already
+# machine-checkable in the close itself.
+
+on:
+  issues:
+    types: [closed]
+
+permissions:
+  issues: write
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      # pinned to actions/github-script v7
+      - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
+        with:
+          script: |
+            const issue = context.payload.issue;
+            const isNode = (issue.body || '').includes('soma:work-graph-node');
+            if (!isNode) {
+              console.log(`#${issue.number} is not a node — skipping`);
+              return;
+            }
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issue.number,
+            });
+            // Latest comment that looks like a soma close receipt.
+            const receipt = [...comments].reverse().find((c) =>
+              (c.body || '').includes('## Close receipt'),
+            );
+            const hasCheckpoint = !!receipt &&
+              /\*\*checkpoint:\*\*/.test(receipt.body || '');
+            if (receipt && hasCheckpoint) {
+              console.log(`#${issue.number}: receipt OK — checkpoint present`);
+              return;
+            }
+            console.log(`AUDIT FAILED: #${issue.number} has no receipt`);
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issue.number,
+              labels: ['ranger:audit-failed'],
+            });
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issue.number,
+              state: 'open',
+            });
+            const body = '## ranger:audit-failed\n\n' +
+              'Closed without a valid close receipt (checkpoint/probes/' +
+              'evidence). Reopened by the close auditor — verify the ' +
+              'receipt, then re-close via `soma graph close`.';
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issue.number,
+              body: body,
+            });
