@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Fake ranger research worker for tests. Receives the assembled prompt as $1.
+# Performs the research SOP in the worktree: create the throwaway
+# research/api-survey branch (the declared git-ref-exists probe ref), write
+# findings.md, commit, push to origin.
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+git checkout -b research/api-survey
+cat > findings.md <<'EOF'
+# Research findings: api-survey
+
+Surveyed the third-party API (e2e fake worker).
+
+- Endpoint catalog: 3 resources
+- Auth model: OAuth2 client credentials
+- Rate limits: 1000 req/h
+
+Recommendation: adopt the API; the auth model fits the existing stack.
+EOF
+git add findings.md
+git commit -m "research findings: api-survey"
+git push -u origin research/api-survey
+echo "fake worker done; prompt bytes: ${#1}"

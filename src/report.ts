@@ -1,5 +1,6 @@
 import type { ClassifiedNode } from "./route.ts";
 import { byRoute, ESCALATE_REASONS, ROUTE_LABELS } from "./route.ts";
+import type { WalkMode } from "./config.ts";
 
 /**
  * Scout report model + text/JSON renderers.
@@ -16,7 +17,7 @@ export interface ClaimCard {
 export interface MapReport {
   repo: string;
   root: number;
-  walk: "none" | "full";
+  walk: WalkMode;
   ok: boolean;
   error?: string;
   frontier: ClassifiedNode[];
@@ -59,6 +60,7 @@ function renderMapText(map: MapReport): string {
   const ordered = [
     "escalate-hitl",
     "research",
+    "research (not walked)",
     "implement",
     "implement (not walk:full)",
     "provisioning",

@@ -34,6 +34,8 @@ export interface FrontierEntry {
   url: string;
   typed: boolean;
   parent?: { id: string };
+  /** Node body (question/prose) — carried at the entry top level by the verb. */
+  body?: string;
 }
 
 export interface FrontierResult {
@@ -62,6 +64,8 @@ export interface NodeResult {
   url: string;
   typed: boolean;
   parent?: { id: string };
+  /** Node body (question/prose) — carried at the node-result top level by the verb. */
+  body?: string;
 }
 
 function isReadonlyVerb(verb: string): verb is ReadonlyVerb {

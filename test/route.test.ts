@@ -104,7 +104,7 @@ describe("classify — design §3 routing table", () => {
       "full",
       EMPTY_REGISTRY,
     );
-    expect(node.route).toEqual({ route: "research" });
+    expect(node.route).toEqual({ route: "research", walkable: true });
   });
 
   test("auto + task on walk:full → implement lane, walkable", () => {

@@ -2,23 +2,26 @@
   "name": "@the-metafactory/ranger",
   "version": "0.1.0",
   "private": true,
-  "description": "Autonomous orienteer work-graph walker — scout: read-only frontier/audit/HITL digest",
+  "description": "Autonomous orienteer work-graph walker — scout (read-only digest) + claim & research lane (walk / run-node / sweep)",
   "type": "module",
   "bin": {
     "ranger": "./src/cli.ts"
   },
   "scripts": {
     "scout": "bun src/cli.ts scout",
+    "walk": "bun src/cli.ts walk",
     "test": "bun test",
     "typecheck": "bunx tsc --noEmit"
   },
   "dependencies": {
     "commander": "^12.0.0",
+    "drizzle-orm": "^0.45.2",
     "yaml": "^2.6.0",
     "zod": "^3.24.0"
   },
   "devDependencies": {
     "@types/bun": "latest",
+    "drizzle-kit": "^0.31.10",
     "typescript": "^5"
   },
   "packageManager": "yarn@1.22.22+sha512.a6b2f7906b721bba3d67d4aff083df04dad64c399707841b7acf00f6b133b7ac24255f2652fa22ae3534329dc6180534e98d17432037ff6fd140556e2bb3137e"

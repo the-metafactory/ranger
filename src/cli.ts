@@ -1,179 +1,370 @@
 #!/usr/bin/env bun
 import { Command } from "commander";
 import { resolve } from "node:path";
-import { loadConfig, type RangerConfig } from "./config.ts";
 import {
-  graphAudit,
-  graphFrontier,
-  graphNode,
-  type FrontierEntry,
-  type NodeResult,
+ loadConfig,
+ expandHome,
+ type RangerConfig,
+ type RangerMapConfig,
+} from "./config.ts";
+import {
+ graphAudit,
+ graphFrontier,
+ graphNode,
+ type FrontierEntry,
+ type NodeResult,
 } from "./graph.ts";
 import {
-  renderJson,
-  renderText,
-  type ClaimCard,
-  type MapReport,
-  type ScoutReport,
+ renderJson,
+ renderText,
+ type ClaimCard,
+ type MapReport,
+ type ScoutReport,
 } from "./report.ts";
 import { classify, hitlWaiting, loadProbeRegistry } from "./route.ts";
 import {
-  assertReadOnlyToken,
-  GateError,
-  type ResolvedToken,
+ assertReadOnlyToken,
+ GateError,
+ type ResolvedToken,
 } from "./token-gate.ts";
+import { openJournal, type Journal } from "./journal.ts";
+import {
+ assertNotPrincipal,
+ resolveBotIdentity,
+ resolveWriteToken,
+ WriteGateError,
+} from "./identity.ts";
+import { runNode } from "./worker.ts";
+import { sweepMap } from "./sweep.ts";
+import { walk } from "./walk.ts";
+import type { WalkMode } from "./config.ts";
 
 /**
- * ranger scout — read-only tick: frontier + audit + HITL digest across
- * registered maps, to a CLI report. Zero graph writes (design §9 build step 1).
+ * ranger — autonomous orienteer work-graph walker.
+ *
+ * - `scout` (node #12) — read-only frontier/audit/HITL digest. Zero graph writes.
+ * - `walk` (node #13) — the headless tick: claim + spawn + sweep. Graph writes.
+ * - `run-node <id>` — the detached worker supervisor (research lane).
+ * - `sweep` — reconcile the journal against reality.
+ * - `journal` — inspect the journal.
  */
 
 const READONLY_SURFACE = ["audit", "frontier", "node"] as const;
 
 interface ScoutOptions {
-  config: string;
-  json: boolean;
+ config: string;
+ json: boolean;
 }
 
 async function scoutOneMap(
-  config: RangerConfig,
-  map: { repo: string; root: number; walk: "none" | "full" },
-  registry: ReturnType<typeof loadProbeRegistry>,
+ config: RangerConfig,
+ map: { repo: string; root: number; walk: WalkMode },
+ registry: ReturnType<typeof loadProbeRegistry>,
 ): Promise<MapReport> {
-  const base: MapReport = {
-    repo: map.repo,
-    root: map.root,
-    walk: map.walk,
-    ok: true,
-    frontier: [],
-    hitlWaiting: [],
-    claims: [],
-    receiptLessCloses: [],
-    openWithoutCheckpoint: [],
-    auditNodes: 0,
+ const base: MapReport = {
+  repo: map.repo,
+  root: map.root,
+  walk: map.walk,
+  ok: true,
+  frontier: [],
+  hitlWaiting: [],
+  claims: [],
+  receiptLessCloses: [],
+  openWithoutCheckpoint: [],
+  auditNodes: 0,
+ };
+
+ let token: ResolvedToken;
+ try {
+  ({ token } = await assertReadOnlyToken(config, map.repo));
+ } catch (error) {
+  return {
+   ...base,
+   ok: false,
+   error: error instanceof GateError ? error.message : String(error),
   };
+ }
 
-  let token: ResolvedToken;
-  try {
-    ({ token } = await assertReadOnlyToken(config, map.repo));
-  } catch (error) {
-    return {
-      ...base,
-      ok: false,
-      error: error instanceof GateError ? error.message : String(error),
-    };
-  }
+ try {
+  const [frontier, audit] = await Promise.all([
+   graphFrontier(map.repo, map.root, token),
+   graphAudit(map.repo, map.root, token),
+  ]);
 
-  try {
-    const [frontier, audit] = await Promise.all([
-      graphFrontier(map.repo, map.root, token),
-      graphAudit(map.repo, map.root, token),
-    ]);
+  const classified = frontier.frontier.map((entry: FrontierEntry) =>
+   classify(entry, map.repo, map.walk, registry),
+  );
+  const waiting = hitlWaiting(classified);
 
-    const classified = frontier.frontier.map((entry: FrontierEntry) =>
-      classify(entry, map.repo, map.walk, registry),
-    );
-    const waiting = hitlWaiting(classified);
-
-    const claims: ClaimCard[] = [];
-    for (const claimed of audit.openClaimed) {
-      const node: NodeResult = await graphNode(map.repo, claimed.id, token);
-      claims.push({
-        id: claimed.id,
-        title: node.node.title,
-        assignees: claimed.assignees,
-        worker: "unknown",
-      });
-    }
-
-    return {
-      ...base,
-      frontier: classified,
-      hitlWaiting: waiting,
-      claims,
-      receiptLessCloses: audit.closedWithoutReceipt,
-      openWithoutCheckpoint: audit.openWithoutCheckpoint,
-      auditNodes: audit.nodes,
-    };
-  } catch (error) {
-    return {
-      ...base,
-      ok: false,
-      error: error instanceof Error ? error.message : String(error),
-    };
-  }
-}
-
-async function runScout(opts: ScoutOptions): Promise<ScoutReport> {
-  const configPath = resolve(process.cwd(), opts.config);
-  const { config } = loadConfig(configPath);
-  const registry = loadProbeRegistry();
-
-  // Gate the whole run on one representative token for the identity line — but
-  // per-map gating still happens in scoutOneMap (a failing map must not fail
-  // every map). First successful token wins for the header identity.
-  let identity = {
-    login: "",
-    tokenType: "fine-grained" as "classic" | "fine-grained",
-  };
-  for (const map of config.maps) {
-    try {
-      const { info } = await assertReadOnlyToken(config, map.repo);
-      identity = { login: info.login, tokenType: info.tokenType };
-      break;
-    } catch {
-      /* per-map gate handles the error */
-    }
-  }
-
-  const maps: MapReport[] = [];
-  for (const map of config.maps) {
-    maps.push(await scoutOneMap(config, map, registry));
+  const claims: ClaimCard[] = [];
+  for (const claimed of audit.openClaimed) {
+   const node: NodeResult = await graphNode(map.repo, claimed.id, token);
+   claims.push({
+    id: claimed.id,
+    title: node.node.title,
+    assignees: claimed.assignees,
+    worker: "unknown",
+   });
   }
 
   return {
-    generatedAt: new Date().toISOString(),
-    identity,
-    readonlySurface: [...READONLY_SURFACE],
-    maps,
+   ...base,
+   frontier: classified,
+   hitlWaiting: waiting,
+   claims,
+   receiptLessCloses: audit.closedWithoutReceipt,
+   openWithoutCheckpoint: audit.openWithoutCheckpoint,
+   auditNodes: audit.nodes,
   };
+ } catch (error) {
+  return {
+   ...base,
+   ok: false,
+   error: error instanceof Error ? error.message : String(error),
+  };
+ }
+}
+
+async function runScout(opts: ScoutOptions): Promise<ScoutReport> {
+ const configPath = resolve(process.cwd(), opts.config);
+ const { config } = loadConfig(configPath);
+ const registry = loadProbeRegistry();
+
+ let identity = {
+  login: "",
+  tokenType: "fine-grained" as "classic" | "fine-grained",
+ };
+ for (const map of config.maps) {
+  try {
+   const { info } = await assertReadOnlyToken(config, map.repo);
+   identity = { login: info.login, tokenType: info.tokenType };
+   break;
+  } catch {
+   /* per-map gate handles the error */
+  }
+ }
+
+ const maps: MapReport[] = [];
+ for (const map of config.maps) {
+  maps.push(await scoutOneMap(config, map, registry));
+ }
+
+ return {
+  generatedAt: new Date().toISOString(),
+  identity,
+  readonlySurface: [...READONLY_SURFACE],
+  maps,
+ };
+}
+
+// ---- walker commands ----
+
+function loadCtx(configPath: string): { config: RangerConfig; journal: Journal } {
+ const { config } = loadConfig(configPath);
+ const journal = openJournal(config);
+ return { config, journal };
+}
+
+/** Resolve the write credential + bot identity for a map, gating the principal. */
+async function writeContext(config: RangerConfig, map: RangerMapConfig) {
+ const credential = resolveWriteToken(config, map.repo);
+ const botIdentity = await resolveBotIdentity(config, credential.token);
+ assertNotPrincipal(config, botIdentity);
+ return { token: credential.token, botIdentity };
+}
+
+async function runWalk(configPath: string): Promise<string> {
+ const { config, journal } = loadCtx(configPath);
+ const result = await walk({ config, configPath, journal });
+ return renderWalkJson(result);
+}
+
+async function runRunNode(
+ nodeId: string,
+ repo: string | undefined,
+ configPath: string,
+): Promise<string> {
+ const { config, journal } = loadCtx(configPath);
+ const map = pickMap(config, repo);
+ const { token, botIdentity } = await writeContext(config, map);
+ const outcome = await runNode(nodeId, {
+  config,
+  map,
+  token,
+  botIdentity,
+  journal,
+ });
+ journal.close();
+ return JSON.stringify(outcome, null, 2);
+}
+
+async function runSweep(configPath: string): Promise<string> {
+ const { config, journal } = loadCtx(configPath);
+ const results = [];
+ for (const map of config.maps) {
+  if (map.walk === "none") {
+   results.push({ repo: map.repo, walk: map.walk, swept: false, reason: "walk: none" });
+   continue;
+  }
+  try {
+   const { token, botIdentity } = await writeContext(config, map);
+   const result = await sweepMap({ config, journal, map, token, botIdentity });
+   results.push({ repo: map.repo, walk: map.walk, swept: true, result });
+  } catch (error) {
+   results.push({
+    repo: map.repo,
+    walk: map.walk,
+    swept: false,
+    error: error instanceof Error ? error.message : String(error),
+   });
+  }
+ }
+ journal.close();
+ return JSON.stringify(results, null, 2);
+}
+
+async function runJournal(
+ repo: string | undefined,
+ configPath: string,
+): Promise<string> {
+ const { config, journal } = loadCtx(configPath);
+ const target = repo === undefined ? undefined : normalizeRepo(repo, config);
+ const rows = {
+  journalPath: expandHome(config.state.journalPath),
+  paused: journal.isPaused(),
+  deadmanCount: journal.deadmanCount(),
+  spawnsToday: journal.spawnsToday(),
+  workers: journal.listWorkers(target),
+  events: journal.listEvents(target, 50),
+ };
+ journal.close();
+ return JSON.stringify(rows, null, 2);
+}
+
+function pickMap(config: RangerConfig, repo: string | undefined): RangerMapConfig {
+ if (repo !== undefined) {
+  const map = config.maps.find((m) => m.repo === repo);
+  if (map === undefined) {
+   throw new Error(`no map registered for repo '${repo}'`);
+  }
+  return map;
+ }
+ if (config.maps.length === 1) return config.maps[0];
+ throw new Error(
+  `--map <repo> is required when more than one map is registered (registered: ${config.maps.map((m) => m.repo).join(", ")})`,
+ );
+}
+
+function normalizeRepo(repo: string, config: RangerConfig): string {
+ const map = config.maps.find((m) => m.repo === repo || m.repo.endsWith(`/${repo}`));
+ return map?.repo ?? repo;
+}
+
+function renderWalkJson(result: unknown): string {
+ return JSON.stringify(result, null, 2);
 }
 
 const program = new Command();
 program
-  .name("ranger")
-  .description("Autonomous orienteer work-graph walker")
-  .version("0.1.0");
+ .name("ranger")
+ .description("Autonomous orienteer work-graph walker")
+ .version("0.1.0");
 
 program
-  .command("scout")
-  .description(
-    "Read-only frontier/audit/HITL digest across registered maps (zero graph writes)",
-  )
-  .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
-  .option("-j, --json", "emit machine-readable JSON")
-  .action(async (options: { config: string; json: boolean }) => {
-    try {
-      const report = await runScout({
-        config: options.config,
-        json: options.json,
-      });
-      process.stdout.write(
-        options.json ? renderJson(report) + "\n" : renderText(report) + "\n",
-      );
-      const failed = report.maps.some((m) => !m.ok);
-      process.exit(failed ? 2 : 0);
-    } catch (error) {
-      process.stderr.write(
-        `ranger scout: ${error instanceof Error ? error.message : String(error)}\n`,
-      );
-      process.exit(1);
-    }
-  });
+ .command("scout")
+ .description(
+  "Read-only frontier/audit/HITL digest across registered maps (zero graph writes)",
+ )
+ .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
+ .option("-j, --json", "emit machine-readable JSON")
+ .action(async (options: { config: string; json: boolean }) => {
+  try {
+   const report = await runScout({ config: options.config, json: options.json });
+   process.stdout.write(
+    options.json ? renderJson(report) + "\n" : renderText(report) + "\n",
+   );
+   const failed = report.maps.some((m) => !m.ok);
+   process.exit(failed ? 2 : 0);
+  } catch (error) {
+   process.stderr.write(
+    `ranger scout: ${error instanceof Error ? error.message : String(error)}\n`,
+   );
+   process.exit(1);
+  }
+ });
+
+program
+ .command("walk")
+ .description(
+  "Headless tick: claim decided research frontier nodes (announce-fail-closed, race-safe), spawn detached run-node workers, then sweep",
+ )
+ .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
+ .action(async (options: { config: string }) => {
+  try {
+   const configPath = resolve(process.cwd(), options.config);
+   process.stdout.write((await runWalk(configPath)) + "\n");
+  } catch (error) {
+   process.stderr.write(
+    `ranger walk: ${error instanceof Error ? error.message : String(error)}\n`,
+   );
+   process.exit(1);
+  }
+ });
+
+program
+ .command("run-node")
+ .description("Detached worker supervisor: worktree, research worker, gated close, decisions --write")
+ .argument("<id>", "node id to execute")
+ .option("-m, --map <repo>", "map repo (required with multiple maps)")
+ .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
+ .action(async (id: string, options: { map?: string; config: string }) => {
+  try {
+   const configPath = resolve(process.cwd(), options.config);
+   process.stdout.write((await runRunNode(id, options.map, configPath)) + "\n");
+  } catch (error) {
+   process.stderr.write(
+    `ranger run-node: ${error instanceof Error ? error.message : String(error)}\n`,
+   );
+   process.exit(error instanceof WriteGateError ? 2 : 1);
+  }
+ });
+
+program
+ .command("sweep")
+ .description("Reconcile the journal against reality (crashed workers, stale claims)")
+ .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
+ .action(async (options: { config: string }) => {
+  try {
+   const configPath = resolve(process.cwd(), options.config);
+   process.stdout.write((await runSweep(configPath)) + "\n");
+  } catch (error) {
+   process.stderr.write(
+    `ranger sweep: ${error instanceof Error ? error.message : String(error)}\n`,
+   );
+   process.exit(1);
+  }
+ });
+
+program
+ .command("journal")
+ .description("Inspect the journal (workers, events, health)")
+ .option("--repo <repo>", "filter by map repo")
+ .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
+ .action(async (options: { repo?: string; config: string }) => {
+  try {
+   const configPath = resolve(process.cwd(), options.config);
+   process.stdout.write((await runJournal(options.repo, configPath)) + "\n");
+  } catch (error) {
+   process.stderr.write(
+    `ranger journal: ${error instanceof Error ? error.message : String(error)}\n`,
+   );
+   process.exit(1);
+  }
+ });
 
 program.parseAsync(process.argv).catch((error) => {
-  process.stderr.write(
-    `ranger: ${error instanceof Error ? error.message : String(error)}\n`,
-  );
-  process.exit(1);
+ process.stderr.write(
+  `ranger: ${error instanceof Error ? error.message : String(error)}\n`,
+ );
+ process.exit(1);
 });

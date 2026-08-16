@@ -1,0 +1,18 @@
+{
+  "repo": "acme/widgets",
+  "ref": { "id": "1" },
+  "node": {
+    "id": "1",
+    "title": "Widgets map",
+    "kind": "map",
+    "checkpointId": "",
+    "autonomy": "approve"
+  },
+  "status": "open",
+  "assignees": [],
+  "blockedBy": [],
+  "author": "alice",
+  "url": "https://github.com/acme/widgets/issues/1",
+  "typed": true,
+  "body": "## Destination\n\nA widgets platform that survives the third-party API migration.\n\n## Constraints\n\n- TypeScript / Bun only.\n- Every graph operation goes through the soma graph verbs.\n\n## Notes\n\n- Consult the orienteer skill when walking nodes.\n\n## Decisions so far\n\n<!-- soma:decisions:begin -->\n- none yet\n<!-- soma:decisions:end -->"
+}

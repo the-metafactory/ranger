@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import type { FrontierEntry } from "./graph.ts";
+import type { WalkMode } from "./config.ts";
 
 /**
  * Frontier classification — design §3 routing table, first match wins.
@@ -17,7 +18,7 @@ export type EscalateReason =
 
 export type RouteClass =
   | { route: "escalate-hitl"; reason: EscalateReason }
-  | { route: "research" }
+  | { route: "research"; walkable: boolean }
   | { route: "implement"; walkable: boolean }
   | { route: "provisioning" };
 
@@ -34,8 +35,8 @@ export interface ClassifiedNode {
 }
 
 export interface ClassifyContext {
-  /** The map's `walk` mode from ranger.yaml (affects implement-lane walkability). */
-  walkMode: "none" | "full";
+  /** The map's `walk` mode from ranger.yaml (affects lane walkability). */
+  walkMode: WalkMode;
   /** Probe registry (from `~/.soma/policy/probe-registry.json`), keyed by repo. */
   registry?: ProbeRegistry;
 }
@@ -119,7 +120,7 @@ export function probesRegistryBlocked(
 export function classify(
   node: FrontierEntry,
   repo: string,
-  walkMode: "none" | "full",
+  walkMode: WalkMode,
   registry: ProbeRegistry,
 ): ClassifiedNode {
   const { autonomy, kind } = node.node;
@@ -163,7 +164,13 @@ export function classify(
     return { ...base, registryBlocked: true, route: { route: "provisioning" } };
   }
   if (kind === "research") {
-    return { ...base, route: { route: "research" } };
+    return {
+      ...base,
+      route: {
+        route: "research",
+        walkable: walkMode === "full" || walkMode === "research-only",
+      },
+    };
   }
   if (IMPLEMENT_KINDS.has(kind)) {
     return {
@@ -197,6 +204,8 @@ export function byRoute(
 function routeKey(route: RouteClass): string {
   if (route.route === "implement")
     return route.walkable ? "implement" : "implement (not walk:full)";
+  if (route.route === "research")
+    return route.walkable ? "research" : "research (not walked)";
   if (route.route === "escalate-hitl") return "escalate-hitl";
   return route.route;
 }

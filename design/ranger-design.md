@@ -46,12 +46,12 @@ pointers; reopen with `ranger:audit-failed` label on mismatch.
 
 | Component | Kind | Notes |
 | --- | --- | --- |
-| `ranger tick` | NEW-BUILD | The §5 Phase 2 tick. Stateless: re-derives everything from the graph each pass. |
-| `ranger run-node` | NEW-BUILD | Worker supervisor: worktree, prompt, bounded `claude -p` spawn, outcome record, cleanup. Direct spawn — see §2 executor decision. |
-| Router + policy | NEW-BUILD | `ranger.yaml` per-map walk modes + conservative autonomy floor (§3). |
-| Escalation desk | NEW-BUILD | Discord cards, ratification poller, human-report intake (§5). |
+| `ranger tick` (claim phase) | **SHIPPED (node #13)** | The §5 Phase 2 tick. Stateless: re-derives everything from the graph each pass. `ranger walk` ships the claim phase (announce-fail-closed → `soma graph claim --identity` → detached spawn → sweep). Implement-lane routing + escalation desk remain. |
+| `ranger run-node` (research lane) | **SHIPPED (node #13)** | Worker supervisor: worktree, prompt, bounded `claude -p` spawn, outcome record, cleanup. Direct spawn — see §2 executor decision. Research-kind SOP tail ships (findings branch → gated close → decisions --write); the task/build SOP tail is the implement lane (step 4). |
+| Router + policy | **SHIPPED (node #13)** | `ranger.yaml` per-map walk modes (none/research-only/full) + conservative autonomy floor (§3); research-lane routing live. |
+| Escalation desk | NEW-BUILD | Discord cards, ratification poller, human-report intake (§5). Announce-fail-closed claim cards ship in the tick (node #13); the digest/ratification surface is step 2/5. |
 | Scribe | NEW-BUILD | Programmatic file-back via `soma graph add` (§6). Nothing in the ecosystem does this today. |
-| Journal | NEW-BUILD | SQLite: liveness, attempts, escalation pointers, dead-man counter (§8). |
+| Journal | **SHIPPED (node #13)** | SQLite (`bun:sqlite` + Drizzle): worker liveness/attempts/outcomes, event log, dead-man + spawn ledger, vetoes cache (§8). |
 | Close auditor | NEW-BUILD | GitHub Action, spec'd in §5 Phase 2; **shipped 2026-08-16 (node #16 partial)** — `.github/workflows/close-auditor.yml`, structural gate (receipt + checkpoint), `ranger:audit-failed` reopen. |
 | `soma graph` verbs | REUSED | The complete graph API: race-safe claim, hollow-close refusal, cycle rejection, audit, decisions projection (soma `src/cli/graph.ts`, `src/work-graph*.ts`). |
 | Orienteer doctrine | REUSED | WalkTheMap / closing / fog files are literal worker-prompt material — referenced, never forked. |
@@ -205,7 +205,7 @@ Claim-level safety against the principal's concurrent interactive sessions is in
 0. **Provisioning (human, gating):** machine-account PAT(s) per §5.1 checklist + collaborator invites; Discord bot + channel; probe-registry entries for the first repo's canonical checkout; approver token when ready; launchd plist. *Scout's credential mode is settled (node #8, closed): read-only components may run under the principal's credential, token-gated read-only; the machine-account PAT remains mandatory for all graph writes.*
 1. **`ranger scout`** — read-only tick: frontier + audit + HITL queue → CLI report, then daily Discord digest once the bot exists. Zero write risk; exercises the whole derive/route pipeline; would have caught map #495's receipt-less closes automatically. **Highest-ROI step per the critique — worth building even if nothing else ever ships.**
 2. **Escalation desk (graph-read-only)** — HITL cards, provisioning-request detection, human-report intake drafts (👍-gated `graph add` is its first write). Converts orienteer from "remember to start sessions" to "the map pings you."
-3. **Claim + research lane** — the smallest full claim→execute→close loop, on the safest kind, under the bot identity. Claims are automatic with no veto window (node #7); the veto surface lives on blocking items.
+3. **Claim + research lane** — the smallest full claim→execute→close loop, on the safest kind, under the bot identity. Claims are automatic with no veto window (node #7); the veto surface lives on blocking items. **Shipped 2026-08-17 (node #13):** `ranger walk` (announce-fail-closed → claim → detached spawn → sweep), `ranger run-node` (research SOP tail: worktree → findings branch pushed → gated close → decisions --write), SQLite journal with dead-man + spawn ledger. Acceptance proven by fixture e2e (claim → execute → gated close → decisions --write under the bot identity). The live real-map walk runs post-merge under the machine account once a map opts in (`walk: research-only`) and the launchd tick is provisioned. |
 4. **Implement lane** — the §4 kind SOP end-to-end on a `walk: full` map; review lane 1; merges escalated until the approver identity exists. Ship the close-auditor Action alongside — it guards this lane's merges.
 5. **Ratification flow + hardening** — propose-draft ratification, budget breaker, DevConsumer lane evaluation, review-cap config for #2517. (`soma graph release` shipped 2026-08-16; `close --json` remains optional follow-up.)
 

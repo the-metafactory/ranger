@@ -5,8 +5,15 @@ version: 1
 maps:
   - repo: the-metafactory/ranger
     root: 1
-    # walk: full is the implement-lane opt-in (walker's business, node #6)
+    # walk is the walker's autonomy opt-in (node #9):
+    #   none           — register only (scout reports; claims nothing)
+    #   research-only  — claim auto research frontier nodes (research lane)
+    #   full           — also the implement lane (later build step)
     walk: none
+    # Optional canonical-checkout override (design §4: probes run where the
+    # registry says — the canonical checkout, never a worktree). Defaults to
+    # <state.canonicalRoot>/<repo>.
+    # canonical: ~/work/ranger-repos/the-metafactory/ranger
     # Per-run Discord escalation surface (node #7): one channel per run,
     # decided individually per walk. tokenEnv = env var name holding the bot
     # token (never inline). Reused grove bot + chosen channel (node #11).
@@ -20,12 +27,45 @@ maps:
       tokenEnv: RANGER_DISCORD_TOKEN
       channelId: "1487052222067118111"
 
+# The machine account (design §2). `identity` is the login ranger labels
+# claims/closes with (soma graph ... --identity <login>); it defaults to the
+# login resolved from the write token. Graph-mutating ticks REFUSE when the
+# resolved identity equals the principal's login.
+bot:
+  identity: ivy-agent
+
+# The principal — the identity autonomous graph-mutation never runs under.
+principal:
+  login: jcfischer
+
+state:
+  # SQLite journal (design §8) — workers, events, dead-man/spawn ledger, vetoes.
+  journalPath: ~/.config/ranger/state.sqlite
+  # Root under which each walked repo's canonical checkout lives.
+  canonicalRoot: ~/work/ranger-repos
+
+workers:
+  # Daily worker-spawn cap — the global spend bound (design §7).
+  spawnCapPerDay: 10
+  # Hard wall-clock kill per worker, minutes (design §4 NodeBudget).
+  wallClockMin: 90
+  # Respawn attempts before a crashed worker is parked + claim released.
+  maxAttempts: 2
+  # Consecutive worker failures that trip the dead-man switch (claiming stops).
+  deadmanThreshold: 3
+
 auth:
   readOnlyTokens:
     # Longest-prefix match: "the-metafactory/*" covers every metafactory repo,
     # "jcfischer/*" covers personal repos. A more specific prefix wins.
     "the-metafactory/*": RANGER_READONLY_GH_TOKEN_METAFACTORY
     "jcfischer/*": RANGER_READONLY_GH_TOKEN_PERSONAL
+  writeTokens:
+    # The machine account's WRITE credential (classic repo-scoped PAT, node
+    # #11). Same longest-prefix matching. The walker refuses any write tick
+    # without one — and never under the principal's credential.
+    "the-metafactory/*": RANGER_WRITE_GH_TOKEN_METAFACTORY
+    "jcfischer/*": RANGER_WRITE_GH_TOKEN_PERSONAL
 
 # Provision the two read-only fine-grained PATs (node #8) and store them in the
 # macOS keychain (the durable store the ~/bin/ranger wrapper resolves):
@@ -40,11 +80,10 @@ auth:
 # The bot must be a member of the configured channel's guild (Metafactory for
 # the ranger map, grove for seekolous).
 #
-# Provision the machine-account write PAT (node #11, ivy-agent):
+# Provision the machine-account write PATs (node #11, ivy-agent):
 # GitHub hard limit (2026-08-16): fine-grained PATs cannot access org repos as
 # an outside collaborator (the-metafactory is GitHub Team, 0 free seats — see
 # node #16) and can never be scoped to another account's personal repos. So the
-# machine-account write credential is a CLASSIC PAT with `repo` scope (covers
-# both the-metafactory/* and jcfischer/* — one token, not org-scoped), stored
-# under keychain service `ivy-agent`. The future walker refuses any write tick
-# under the principal's credential.
+# machine-account write credential is a CLASSIC PAT with `repo` scope, stored
+# under keychain service `ivy-agent`. The walker refuses any write tick under
+# the principal's credential (design §2, node #11).

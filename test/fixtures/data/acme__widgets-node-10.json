@@ -1,0 +1,20 @@
+{
+  "repo": "acme/widgets",
+  "ref": { "id": "10" },
+  "node": {
+    "id": "10",
+    "title": "Survey third-party API",
+    "kind": "research",
+    "checkpointId": "api-surveyed",
+    "autonomy": "auto",
+    "probes": [{ "type": "git-ref-exists", "ref": "research/api-survey" }]
+  },
+  "status": "open",
+  "assignees": [],
+  "blockedBy": [],
+  "author": "alice",
+  "url": "https://github.com/acme/widgets/issues/10",
+  "typed": true,
+  "parent": { "id": "1" },
+  "body": "## Question\n\nSurvey the third-party API: endpoint catalog, auth model, rate limits, and whether it fits the existing stack. Findings go on the research/api-survey branch; the close probes that ref."
+}

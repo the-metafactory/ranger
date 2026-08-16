@@ -44,6 +44,7 @@ describe("matchTokenEnv — longest-prefix matching", () => {
       "the-metafactory/*": "RANGER_READONLY_GH_TOKEN_METAFACTORY",
       "jcfischer/seekolous": "RANGER_READONLY_GH_TOKEN_SEEKOLOUS",
     },
+    writeTokens: {},
   };
 
   test("exact repo prefix beats wildcard", () => {
@@ -71,7 +72,12 @@ describe("resolveReadOnlyToken", () => {
     maps: [],
     auth: {
       readOnlyTokens: { "acme/*": "RANGER_RO_ACME" },
+      writeTokens: {},
     },
+    bot: {},
+    principal: { login: "jcfischer" },
+    state: { journalPath: ":memory:", canonicalRoot: "/tmp/ranger-repos" },
+    workers: { spawnCapPerDay: 10, wallClockMin: 90, maxAttempts: 2, deadmanThreshold: 3 },
   };
 
   test("resolves from env when set", () => {

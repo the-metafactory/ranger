@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
-# Fake `soma` for tests. Only the read-only graph verbs are implemented.
-# Proves the token gate: refuses to run unless GH_TOKEN is set.
+# Fake `soma` for tests.
+#
+# Reads (frontier/audit/node) come from fixture JSON in $FAKE_SOMA_DIR. Mutations
+# (claim/release/close/decisions) are stateful against $FAKE_SOMA_STATE (JSON),
+# and `close` verifies git-ref-exists probes against the real git repo at
+# $FAKE_SOMA_REPO_DIR (a bare origin, so a pushed branch shows up directly).
 set -euo pipefail
 
 if [ -z "${GH_TOKEN:-}" ]; then
@@ -16,31 +20,132 @@ verb="${2:-}"
 root="${3:-}"
 repo=""
 json_flag=""
+identity=""
+resolution_file=""
+gist=""
+checkpoint=""
 i=4
 while [ $i -le $# ]; do
   arg="${!i}"
   case "$arg" in
     --repo) i=$((i+1)); repo="${!i}" ;;
     --json) json_flag=1 ;;
+    --identity) i=$((i+1)); identity="${!i}" ;;
+    --resolution-file) i=$((i+1)); resolution_file="${!i}" ;;
+    --gist) i=$((i+1)); gist="${!i}" ;;
+    --checkpoint) i=$((i+1)); checkpoint="${!i}" ;;
+    --write) : ;;
+    --dry-run) : ;;
   esac
   i=$((i+1))
 done
 
 key="${repo//\//__}"
-file=""
+
+# ---- read-only verbs: fixtures ----
 case "$verb" in
-  frontier) file="${FAKE_SOMA_DIR}/${key}-frontier.json" ;;
-  audit)    file="${FAKE_SOMA_DIR}/${key}-audit.json" ;;
-  node)     file="${FAKE_SOMA_DIR}/${key}-node-${root}.json" ;;
+  frontier|audit|node)
+    file=""
+    case "$verb" in
+      frontier) file="${FAKE_SOMA_DIR}/${key}-frontier.json" ;;
+      audit)    file="${FAKE_SOMA_DIR}/${key}-audit.json" ;;
+      node)     file="${FAKE_SOMA_DIR}/${key}-node-${root}.json" ;;
+    esac
+    if [ ! -f "$file" ]; then
+      echo "fake soma: no fixture $file" >&2
+      exit 93
+    fi
+    cat "$file"
+    exit 0
+    ;;
+esac
+
+if [ -z "${FAKE_SOMA_STATE:-}" ]; then
+  echo "fake soma: FAKE_SOMA_STATE not set for verb '$verb'" >&2
+  exit 94
+fi
+
+export FAKE_SOMA_STATE FAKE_SOMA_REPO_DIR FAKE_SOMA_IDENTITY="$identity" \
+  FAKE_SOMA_GIST="$gist" FAKE_SOMA_CHECKPOINT="$checkpoint" FAKE_SOMA_RESOLUTION_FILE="${resolution_file:-}"
+
+case "$verb" in
+  claim|release|close|decisions)
+    python3 - "$verb" "$root" "$repo" <<'PY'
+import json, os, subprocess, sys
+
+verb, nid, repo = sys.argv[1], sys.argv[2], sys.argv[3]
+state_path = os.environ["FAKE_SOMA_STATE"]
+identity = os.environ.get("FAKE_SOMA_IDENTITY", "")
+
+with open(state_path) as fh:
+    s = json.load(fh)
+nodes = s.setdefault("nodes", {})
+node = nodes.setdefault(nid, {"assignees": [], "status": "open", "probes": []})
+
+def save():
+    with open(state_path, "w") as fh:
+        json.dump(s, fh, indent=2)
+
+if verb == "claim":
+    if node.get("assignees"):
+        holder = node["assignees"][0]
+        payload = {"repo": repo, "node": nid, "held": False, "holder": holder, "assignees": node["assignees"]}
+        print(json.dumps(payload), file=sys.stderr)
+        sys.exit(1)
+    node["assignees"] = [identity]
+    save()
+    payload = {"repo": repo, "node": nid, "held": True, "holder": identity, "assignees": [identity]}
+    print(json.dumps(payload))
+    sys.exit(0)
+
+if verb == "release":
+    if identity in node.get("assignees", []):
+        node["assignees"] = [a for a in node["assignees"] if a != identity]
+        save()
+        print(json.dumps({"repo": repo, "node": nid, "released": True, "assignees": node["assignees"]}))
+    else:
+        print(json.dumps({"repo": repo, "node": nid, "released": False, "assignees": node.get("assignees", [])}))
+    sys.exit(0)
+
+if verb == "close":
+    resolution_file = os.environ.get("FAKE_SOMA_RESOLUTION_FILE", "")
+    if not resolution_file or not os.path.isfile(resolution_file):
+        print(f"fake soma: close --resolution-file {resolution_file} not readable", file=sys.stderr)
+        sys.exit(1)
+    bare = os.environ.get("FAKE_SOMA_REPO_DIR", "")
+    for probe in node.get("probes", []):
+        if probe.get("type") == "git-ref-exists" and probe.get("ref"):
+            ref = probe["ref"]
+            ok = subprocess.run(
+                ["git", "--git-dir", bare, "rev-parse", "--verify", "--quiet", f"refs/heads/{ref}"],
+                capture_output=True,
+            ).returncode == 0
+            if not ok:
+                print(f"Close refused for node {nid}: probe git-ref-exists '{ref}' failed — branch not found.", file=sys.stderr)
+                sys.exit(1)
+    node["status"] = "closed"
+    s.setdefault("decisions", []).append({
+        "id": nid,
+        "gist": os.environ.get("FAKE_SOMA_GIST", ""),
+        "closedBy": identity,
+    })
+    save()
+    print(f"Closed node {nid} ({repo}) — attestation: unverified.")
+    print("")
+    print("Receipt posted to the tracker.")
+    print(f"gist: {os.environ.get('FAKE_SOMA_GIST','')}")
+    print(f"closedBy: {identity}")
+    sys.exit(0)
+
+if verb == "decisions":
+    count = len(s.get("decisions", []))
+    print(f"Wrote {count} decision line(s) into map {nid} ({repo}).")
+    sys.exit(0)
+PY
+    exit $?
+    ;;
   *)
     echo "fake soma: verb '$verb' is not on the read-only surface" >&2
     exit 92
     ;;
 esac
-
-if [ ! -f "$file" ]; then
-  echo "fake soma: no fixture $file" >&2
-  exit 93
-fi
-cat "$file"
-exit 0

@@ -15,9 +15,19 @@ graph into merged software.
 
 ## Status
 
-Design phase. The design document lives in [`design/ranger-design.md`](design/ranger-design.md).
-The effort's own orienteer map (dogfooding) lives on this repo's issues — find it via
-the `orienteer:map` label.
+Design + early build. The design document lives in
+[`design/ranger-design.md`](design/ranger-design.md). The effort's own orienteer
+map (dogfooding) lives on this repo's issues — find it via the `orienteer:map`
+label.
+
+Shipped build-path steps:
+
+- **Step 1 — `ranger scout`** (node #12): read-only frontier/audit/HITL digest.
+- **Step 3 — claim + research lane** (node #13): the smallest full
+  claim→execute→close loop on the safest kind — `ranger walk` (headless tick:
+  announce → claim → spawn), `ranger run-node` (detached worker supervisor with
+  the research SOP tail), `ranger sweep`, `ranger journal`. The implement lane
+  (step 4) and the approver bot (node #16) remain.
 
 ## Scout (build-path step 1)
 
@@ -51,6 +61,38 @@ bun test       # unit + e2e (fake soma/gh fixtures)
 bunx tsc --noEmit
 ```
 
+## Walker — claim + research lane (build-path step 3, node #13)
+
+The smallest full claim→execute→close loop, on the safest kind (research),
+under the machine account. Every graph write goes through the `soma graph`
+verbs with `--identity <bot>`; the tick refuses to run under the principal's
+identity (design §2, node #11).
+
+```bash
+bun src/cli.ts walk                       # headless tick: announce → claim → spawn → sweep
+bun src/cli.ts run-node <id> --map <repo> # detached worker supervisor (research SOP tail)
+bun src/cli.ts sweep                      # reconcile journal vs reality (crashed workers)
+bun src/cli.ts journal                    # inspect workers/events/health
+```
+
+- **Walk-mode opt-in (node #9):** a map is claimed only when its `walk` is
+  `research-only` or `full`; `none` registers it for scout only. `auto`
+  research nodes are the lane's candidates.
+- **Announce-fail-closed (node #7):** no veto window — but no confirmed
+  Discord message id, no claim. A missing bot token or a non-2xx post refuses
+  the claim.
+- **Race-safe claim:** `soma graph claim` re-reads and tie-breaks; a lost race
+  is skipped, never fought.
+- **Dead-man + spend bound (design §7):** N consecutive worker failures pause
+  claiming; a daily spawn cap bounds spend. `RANGER_NO_SPAWN=1` claims without
+  spawning (simulation).
+- **Journal (design §8):** SQLite at `~/.config/ranger/state.sqlite` holds only
+  what the graph cannot — worker liveness/outcomes, vetoes cache, dead-man and
+  spawn ledgers. Deleting it degrades to re-announce + retry once.
+- **Acceptance (e2e):** a research node walked end-to-end against fake
+  soma/gh/worker fixtures — claim → worktree → findings branch pushed → gated
+  close (probe on the pushed ref) → `decisions --write`.
+
 ## Doctrine anchors
 
 - The seven `soma graph` verbs are the only graph API ranger uses — never raw tracker writes.
@@ -58,3 +100,5 @@ bunx tsc --noEmit
   machine account.
 - HITL nodes (`propose`/`approve`) route to the principal; ranger never stands in for
   the human's side of a decision.
+- Claims proceed automatically (no veto window); blocking items wait indefinitely
+  for the principal (node #7).
