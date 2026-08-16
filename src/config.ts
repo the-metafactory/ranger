@@ -16,6 +16,19 @@ import { z } from "zod";
 
 const WalkModeSchema = z.enum(["none", "full"]).default("none");
 
+/**
+ * Per-map Discord escalation surface (design §5, node #7 closed): one channel
+ * per run, decided individually per walk — never a global #ranger.
+ * `tokenEnv` is an env var name holding the bot token (never inline);
+ * `channelId` is the snowflake of the configured channel.
+ */
+const DiscordSchema = z.object({
+ /** Env var name holding the Discord bot token (never inline). */
+ tokenEnv: z.string().min(1),
+ /** Discord channel snowflake for this run's escalation surface. */
+ channelId: z.string().regex(/^\d+$/, "channelId must be a Discord snowflake"),
+});
+
 const MapSchema = z.object({
  /** `owner/name` — the repo whose issues hold the work graph. */
  repo: z.string().regex(/^[\w.-]+\/[\w.-]+$/, "repo must be owner/name"),
@@ -29,6 +42,8 @@ const MapSchema = z.object({
   * not-walkable.
   */
  walk: WalkModeSchema,
+ /** Optional per-run Discord escalation surface (node #7). */
+ discord: DiscordSchema.optional(),
 });
 
 const AuthSchema = z.object({

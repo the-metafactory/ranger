@@ -2,7 +2,8 @@
 ---
 # Schema provisional: pending map node #6
 # ("Walk-mode opt-in and charting guidance"). Scout reads the maps registry +
-# auth; the walker's walk-mode schema is #6's business.
+# auth; the walker's walk-mode schema is #6's business. Node #11 (provisioning,
+# closed) added the per-run Discord escalation surface (node #7 ruling).
 
 version: 1
 
@@ -12,9 +13,21 @@ maps:
   - repo: the-metafactory/ranger
     root: 1
     walk: none
+    # Per-run escalation surface (node #7): one channel per run, decided per
+    # walk. The Metafactory guild has no #ranger channel and the reused grove
+    # bot lacks MANAGE_CHANNELS there, so the run posts to #soma (one thread
+    # per map). Token is the grove bot's — reuse decision, node #11.
+    discord:
+      tokenEnv: RANGER_DISCORD_TOKEN
+      channelId: "1505550997764833444"
   - repo: jcfischer/seekolous
     root: 26
     walk: none
+    # Personal map: escalation surface is the principal's private channel on
+    # the grove guild (the bot's home server).
+    discord:
+      tokenEnv: RANGER_DISCORD_TOKEN
+      channelId: "1487052222067118111"
 
 # Read-only token gate (node #8 ruling). Only env var NAMES live here — never
 # tokens. Prefixes match longest-first against map.repo. Scout refuses to run a

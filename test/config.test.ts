@@ -50,6 +50,41 @@ describe("loadConfig", () => {
     );
   });
 
+  test("parses optional per-map discord escalation surface", () => {
+    withConfig(
+      [
+        "version: 1",
+        "maps:",
+        "  - repo: acme/widgets",
+        "    root: 1",
+        "    discord:",
+        "      tokenEnv: RANGER_DISCORD_TOKEN",
+        '      channelId: "1234567890123456789"',
+      ].join("\n"),
+      (path) => {
+        const map = loadConfig(path).config.maps[0];
+        expect(map.discord?.tokenEnv).toBe("RANGER_DISCORD_TOKEN");
+        expect(map.discord?.channelId).toBe("1234567890123456789");
+      },
+    );
+  });
+
+  test("discord without tokenEnv → ConfigError", () => {
+    withConfig(
+      [
+        "version: 1",
+        "maps:",
+        "  - repo: acme/widgets",
+        "    root: 1",
+        "    discord:",
+        '      channelId: "123"',
+      ].join("\n"),
+      (path) => {
+        expect(() => loadConfig(path)).toThrow(ConfigError);
+      },
+    );
+  });
+
   test("invalid root type → ConfigError", () => {
     withConfig(
       [

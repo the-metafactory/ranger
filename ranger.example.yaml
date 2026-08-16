@@ -1,4 +1,4 @@
-# ranger.example.yaml — annotated copy. Copy to ranger.yaml and set the env vars.
+# ranger.example.yaml — annotated copy. Copy to ranger.yaml and set env vars.
 ---
 version: 1
 
@@ -7,9 +7,18 @@ maps:
     root: 1
     # walk: full is the implement-lane opt-in (walker's business, node #6)
     walk: none
+    # Per-run Discord escalation surface (node #7): one channel per run,
+    # decided individually per walk. tokenEnv = env var name holding the bot
+    # token (never inline). Reused grove bot + chosen channel (node #11).
+    discord:
+      tokenEnv: RANGER_DISCORD_TOKEN
+      channelId: "1505550997764833444"
   - repo: jcfischer/seekolous
     root: 26
     walk: none
+    discord:
+      tokenEnv: RANGER_DISCORD_TOKEN
+      channelId: "1487052222067118111"
 
 auth:
   readOnlyTokens:
@@ -18,9 +27,21 @@ auth:
     "the-metafactory/*": RANGER_READONLY_GH_TOKEN_METAFACTORY
     "jcfischer/*": RANGER_READONLY_GH_TOKEN_PERSONAL
 
-# Provision the two read-only fine-grained PATs (node #8):
-#   export RANGER_READONLY_GH_TOKEN_METAFACTORY=github_pat_…
-#      (reads the-metafactory/* — Issues: Read, Contents: Read)
-#   export RANGER_READONLY_GH_TOKEN_PERSONAL=github_pat_…
-#      (reads jcfischer/* — Issues: Read, Contents: Read)
+# Provision the two read-only fine-grained PATs (node #8) and store them in the
+# macOS keychain (the durable store the ~/bin/ranger wrapper resolves):
+#   security add-generic-password -s ranger-ro-metafactory -a token -w <pat>
+#   security add-generic-password -s ranger-ro-personal -a token -w <pat>
+#     (the-metafactory/* — Issues: Read, Contents: Read)
+#     (jcfischer/* — Issues: Read, Contents: Read)
 # Create them in GitHub → Settings → Developer settings → Fine-grained PATs.
+#
+# Provision the Discord token (node #11, reuse grove's bot):
+#   export RANGER_DISCORD_TOKEN=<the grove bot token — see grove/bot.env>
+# The bot must be a member of the configured channel's guild (Metafactory for
+# the ranger map, grove for seekolous).
+#
+# Provision the machine-account write PAT (node #11, ivy-agent FG PAT):
+# create a fine-grained PAT for ivy-agent (write: Issues/Contents/PRs on both
+# the-metafactory/* and jcfischer/* — two PATs, org-scoped) and store the
+# the-metafactory one under keychain service `ivy-agent`; the future walker
+# refuses any write tick under the principal's credential.
