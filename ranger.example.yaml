@@ -40,8 +40,11 @@ auth:
 # The bot must be a member of the configured channel's guild (Metafactory for
 # the ranger map, grove for seekolous).
 #
-# Provision the machine-account write PAT (node #11, ivy-agent FG PAT):
-# create a fine-grained PAT for ivy-agent (write: Issues/Contents/PRs on both
-# the-metafactory/* and jcfischer/* — two PATs, org-scoped) and store the
-# the-metafactory one under keychain service `ivy-agent`; the future walker
-# refuses any write tick under the principal's credential.
+# Provision the machine-account write PAT (node #11, ivy-agent):
+# GitHub hard limit (2026-08-16): fine-grained PATs cannot access org repos as
+# an outside collaborator (the-metafactory is GitHub Team, 0 free seats — see
+# node #16) and can never be scoped to another account's personal repos. So the
+# machine-account write credential is a CLASSIC PAT with `repo` scope (covers
+# both the-metafactory/* and jcfischer/* — one token, not org-scoped), stored
+# under keychain service `ivy-agent`. The future walker refuses any write tick
+# under the principal's credential.
