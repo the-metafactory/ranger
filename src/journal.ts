@@ -508,9 +508,7 @@ export class Journal {
      isNull(escalations.notedAt),
      // Only rows ABSENT from the current frontier — don't load and skip
      // every active card on each no-op tick (round-19 review).
-     ...(exclude.length === 0
-      ? []
-      : [notInArray(escalations.nodeId, exclude)]),
+     ...(exclude.length === 0 ? [] : [notInArray(escalations.nodeId, exclude)]),
      // KEYSET pagination: resume strictly AFTER the last row seen — O(page),
      // not O(offset) (round-31 review: a 50k-row queue must not skip ~50k
      // indexed rows per 50-row batch). nodeId is the tiebreaker (unique per
@@ -527,10 +525,13 @@ export class Journal {
          ),
         ]),
     ),
-    // Oldest exits first (most urgent), and capped to the remaining request
-    // budget so a large drain can't walk every unnoted card after the budget
-    // is spent (round-23 review) - the rest are deferred to the next tick.
-    orderBy: asc(escalations.createdAt),
+    // Oldest exits first (most urgent) with nodeId as the tiebreak — MUST
+    // match the keyset cursor's (createdAt, nodeId) predicate so same-createdAt
+    // rows (cards posted in one pass share a timestamp) aren't skipped
+    // (round-32 review), and capped to the remaining request budget so a large
+    // drain can't walk every unnoted card after the budget is spent (round-23
+    // review) - the rest are deferred to the next tick.
+    orderBy: [asc(escalations.createdAt), asc(escalations.nodeId)],
     ...(opts.limit === undefined ? {} : { limit: opts.limit }),
    })
    .sync();

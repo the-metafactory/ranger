@@ -1,10 +1,21 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EscalationDiscord } from "../src/discord.ts";
 import { Journal } from "../src/journal.ts";
-import { baseConfigLines, fakeDiscord, runCli, runCliSpawn } from "./support.ts";
+import {
+  baseConfigLines,
+  fakeDiscord,
+  runCli,
+  runCliSpawn,
+} from "./support.ts";
 
 const fixturesBin = join(import.meta.dir, "fixtures", "bin");
 
@@ -533,7 +544,7 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
       expect(typeof a?.nonce).toBe("string");
       expect(a?.nonce?.startsWith(String(a?.pid))).toBe(true);
       expect(typeof a?.leaseUntil).toBe("number");
-      expect((a?.leaseUntil ?? 0)).toBeGreaterThan(Date.now());
+      expect(a?.leaseUntil ?? 0).toBeGreaterThan(Date.now());
 
       // Simulate run B reclaiming A's expired lease: the lock now belongs to
       // another LIVE run (different nonce, valid lease). When A finishes it
@@ -592,7 +603,11 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
       });
       writeFileSync(
         join(fixtureDir, "acme__widgets-frontier.json"),
-        JSON.stringify({ repo: "acme/widgets", root: "1", frontier: nodes }, null, 2),
+        JSON.stringify(
+          { repo: "acme/widgets", root: "1", frontier: nodes },
+          null,
+          2,
+        ),
       );
       writeFileSync(
         join(fixtureDir, "acme__widgets-audit.json"),
@@ -1084,4 +1099,75 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
       server.stop(true);
     }
   });
+});
+
+test("a many-destination absent card reconciles across ticks via a per-card cursor, not a restart (round-32)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ranger-escalate-reconcile-cur-"));
+  const fixtureDir = mkdtempSync(
+    join(tmpdir(), "ranger-escalate-reconcile-cur-fx-"),
+  );
+  const discord = fakeDiscord();
+  try {
+    writeFixtures(fixtureDir); // 4 active HITL cards (11-14)
+    const config = writeConfig(dir);
+    const env = envFor(fixtureDir, discord.port);
+
+    // Seed an OPEN, un-noted card that is ABSENT from the frontier (node 900
+    // is not in the fixture) with 60 historical destinations (60 channel
+    // moves) — more than one tick's 50-request budget can reconcile.
+    const journal = new Journal(join(dir, "state.sqlite"));
+    journal.upsertEscalation({
+      key: "acme/widgets:900",
+      repo: "acme/widgets",
+      nodeId: "900",
+      title: "Moved-away card",
+      lastContent: "old content",
+      messageId: "discord-msg-seed",
+      channelId: "chan-0",
+      createdAt: new Date(Date.now() - 3 * 86_400_000).toISOString(),
+      status: "open",
+      notedAt: null,
+    });
+    for (let i = 0; i < 60; i++) {
+      journal.setEscalationDestination(
+        "acme/widgets:900",
+        `chan-${i}`,
+        `discord-msg-${i}`,
+        new Date(Date.now() - (60 - i) * 60_000).toISOString(),
+      );
+    }
+
+    // Tick 1: 4 active posts + 46 destination edits (50 total) → the absent
+    // card defers at cursor 46 — it must NOT restart at 0 next tick.
+    const run1 = await runCli(["escalate", "-c", config, "--json"], env);
+    expect(run1.code).toBe(0);
+    const r1 = JSON.parse(run1.stdout).maps[0];
+    expect(r1.posted).toHaveLength(4);
+    expect(r1.deferred).toContain("900");
+
+    // Tick 2: resumes at 46 → edits the remaining 14, completes, sets notedAt.
+    const run2 = await runCli(["escalate", "-c", config, "--json"], env);
+    expect(run2.code).toBe(0);
+    const r2 = JSON.parse(run2.stdout).maps[0];
+    expect(r2.posted).toHaveLength(0);
+    expect(r2.deferred).not.toContain("900");
+    expect(r2.keptOpen).toContain("900");
+
+    // Tick 3: notedAt set → the card is no longer a reconciliation candidate.
+    const run3 = await runCli(["escalate", "-c", config, "--json"], env);
+    expect(run3.code).toBe(0);
+    const r3 = JSON.parse(run3.stdout).maps[0];
+    expect(r3.deferred).not.toContain("900");
+    expect(r3.keptOpen).not.toContain("900");
+
+    // Each destination edited EXACTLY once (46 + 14 = 60): a restart-at-0
+    // cursor would have re-edited the first 46 each tick and never finished.
+    expect(discord.edits.length).toBe(60);
+    const j2 = new Journal(join(dir, "state.sqlite"));
+    expect(j2.getEscalation("acme/widgets", "900")?.notedAt).not.toBeNull();
+  } finally {
+    discord.stop();
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(fixtureDir, { recursive: true, force: true });
+  }
 });

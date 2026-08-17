@@ -48,10 +48,14 @@ the end section makes explicit.
   map moves to a channel never visited before, the desk first edits the card
   it is LEAVING to a non-actionable "moved to channel …" note, then posts
   fresh in the new channel — so at most ONE card per escalation is active in
-  steady state (a move never leaves the old card active-looking; it can never
-  leave TWO). Honest gap: the migration is two remote ops (note-old then
-  post/recover-new), so a crash between them leaves ZERO active cards until
-  the next tick re-runs it. On A→B→A the
+  steady state (a move never leaves the old card active-looking). Honest
+  gaps: the migration is three remote ops (note-old → post-new → journal the
+  new destination), so a crash between them leaves ZERO active cards until
+  the next tick re-runs it, and a crash after the replacement POST is
+  accepted but before its destination is journaled leaves the next tick
+  unaware and able to post ANOTHER replacement — the same POST→journal
+  duplicate window as announce-once, so two active cards are possible across
+  that window (the reconcile-on-move recovery retires one). On A→B→A the
   return recovers A's original message AND notes the card left behind in B
   (the same reconcile-on-move rule applies in both directions). So
   "recovery" is no-duplicate-in-the-current-channel AND at-most-one-active-

@@ -44,11 +44,17 @@ export interface RunNodeContext {
  /** Wall-clock budget in minutes (overrides config.workers.wallClockMin). */
  wallClockMin?: number;
  /** For tests: drive the supervisor with an injected worker prompt instead of spawning. */
- worker?: (prompt: string, opts: RunOptions) => Promise<{ code: number; stdout: string; stderr: string }>;
+ worker?: (
+  prompt: string,
+  opts: RunOptions,
+ ) => Promise<{ code: number; stdout: string; stderr: string }>;
 }
 
 /** The canonical checkout dir for a repo (design §4: probes run there). */
-export function canonicalDir(config: RangerConfig, map: RangerMapConfig): string {
+export function canonicalDir(
+ config: RangerConfig,
+ map: RangerMapConfig,
+): string {
  return map.canonical === undefined
   ? join(expandHome(config.state.canonicalRoot), map.repo)
   : expandHome(map.canonical);
@@ -69,23 +75,27 @@ export function worktreeBranch(nodeId: string, slug: string): string {
  * `git-ref-exists research/…` probe's ref — the close gate probes that exact
  * ref — else fall back to `research/<slug>`.
  */
-export function researchBranchFor(
-  node: { title: string; probes?: { type: string; ref?: string }[] },
-): string {
-  const refProbe = (node.probes ?? []).find(
-    (p) => p.type === "git-ref-exists" && typeof p.ref === "string" && p.ref.startsWith("research/"),
-  );
-  if (refProbe?.ref !== undefined) return refProbe.ref;
-  return `research/${slugify(node.title)}`;
+export function researchBranchFor(node: {
+ title: string;
+ probes?: { type: string; ref?: string }[];
+}): string {
+ const refProbe = (node.probes ?? []).find(
+  (p) =>
+   p.type === "git-ref-exists" &&
+   typeof p.ref === "string" &&
+   p.ref.startsWith("research/"),
+ );
+ if (refProbe?.ref !== undefined) return refProbe.ref;
+ return `research/${slugify(node.title)}`;
 }
 
 export function slugify(title: string): string {
-  const slug = title
-   .toLowerCase()
-   .replace(/[^a-z0-9]+/g, "-")
-   .replace(/^-+|-+$/g, "")
-   .slice(0, 48);
-  return slug.length === 0 ? "node" : slug;
+ const slug = title
+  .toLowerCase()
+  .replace(/[^a-z0-9]+/g, "-")
+  .replace(/^-+|-+$/g, "")
+  .slice(0, 48);
+ return slug.length === 0 ? "node" : slug;
 }
 
 /** Basic-auth git header env (no credential persistence; the token never lands in .git/config). */
@@ -108,76 +118,79 @@ export async function bootstrapCanonical(
  repo: string,
  token: string,
 ): Promise<void> {
-  if (existsSync(dir) && existsSync(join(dir, ".git"))) {
-   return;
-  }
-  const parent = resolve(dir, "..");
-  const result = await runCmd(
-   "git",
-   ["clone", `https://github.com/${repo}.git`, dir],
-   { env: gitAuthEnv(token), cwd: parent, timeoutMs: 120_000 },
+ if (existsSync(dir) && existsSync(join(dir, ".git"))) {
+  return;
+ }
+ const parent = resolve(dir, "..");
+ const result = await runCmd(
+  "git",
+  ["clone", `https://github.com/${repo}.git`, dir],
+  { env: gitAuthEnv(token), cwd: parent, timeoutMs: 120_000 },
+ );
+ if (result.code !== 0) {
+  throw new Error(
+   `cannot bootstrap canonical checkout ${dir} (git clone, exit ${result.code}): ${result.stderr.trim()}`,
   );
-  if (result.code !== 0) {
-   throw new Error(
-    `cannot bootstrap canonical checkout ${dir} (git clone, exit ${result.code}): ${result.stderr.trim()}`,
-   );
-  }
+ }
 }
 
 async function runGit(
-  args: string[],
-  opts: RunOptions,
+ args: string[],
+ opts: RunOptions,
 ): Promise<{ code: number; stdout: string; stderr: string }> {
-  return runCmd("git", args, opts);
+ return runCmd("git", args, opts);
 }
 
 /** Add a worktree off origin/main (adopts an existing one on conflict). */
 export async function bootstrapWorktree(
-  canonical: string,
-  nodeId: string,
-  slug: string,
-  token: string,
+ canonical: string,
+ nodeId: string,
+ slug: string,
+ token: string,
 ): Promise<string> {
-  const dir = worktreeDir(canonical, nodeId);
-  if (existsSync(dir)) {
-   return dir; // adopt — a crashed worker's worktree is reused (design §7).
-  }
-  const branch = worktreeBranch(nodeId, slug);
-  // The branch can already exist without a worktree — orphaned after a pruned
-  // worktree or a prior run — and `-b` would fail on it. Add the worktree from
-  // the existing branch instead (adopt semantics). Found live on node #19.
-  const existing = await runGit(
-   ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`],
-   { cwd: canonical, timeoutMs: 10_000 },
+ const dir = worktreeDir(canonical, nodeId);
+ if (existsSync(dir)) {
+  return dir; // adopt — a crashed worker's worktree is reused (design §7).
+ }
+ const branch = worktreeBranch(nodeId, slug);
+ // The branch can already exist without a worktree — orphaned after a pruned
+ // worktree or a prior run — and `-b` would fail on it. Add the worktree from
+ // the existing branch instead (adopt semantics). Found live on node #19.
+ const existing = await runGit(
+  ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`],
+  { cwd: canonical, timeoutMs: 10_000 },
+ );
+ const args =
+  existing.code === 0
+   ? ["worktree", "add", dir, branch]
+   : ["worktree", "add", dir, "-b", branch, "origin/main"];
+ const result = await runGit(args, {
+  cwd: canonical,
+  env: gitAuthEnv(token),
+  timeoutMs: 60_000,
+ });
+ if (result.code !== 0) {
+  throw new Error(
+   `cannot add worktree for node ${nodeId} (exit ${result.code}): ${result.stderr.trim()}`,
   );
-  const args =
-   existing.code === 0
-    ? ["worktree", "add", dir, branch]
-    : ["worktree", "add", dir, "-b", branch, "origin/main"];
-  const result = await runGit(args, {
-   cwd: canonical,
-   env: gitAuthEnv(token),
-   timeoutMs: 60_000,
-  });
-  if (result.code !== 0) {
-   throw new Error(
-    `cannot add worktree for node ${nodeId} (exit ${result.code}): ${result.stderr.trim()}`,
-   );
-  }
-  return dir;
+ }
+ return dir;
 }
 
 function defaultWorkerCommand(): string[] {
-  const envCmd = process.env.RANGER_WORKER_CMD;
-  if (envCmd !== undefined && envCmd.length > 0) return [envCmd];
-  return ["claude", "-p"];
+ const envCmd = process.env.RANGER_WORKER_CMD;
+ if (envCmd !== undefined && envCmd.length > 0) return [envCmd];
+ return ["claude", "-p"];
 }
 
 /**
  * Run one research node to completion: worktree → prompt → worker → gated
  * close → decisions --write. Returns the outcome and records it in the journal.
  */
-export async function runNode(nodeId: string, ctx: RunNodeContext): Promise<RunNodeOutcome> {
+export async function runNode(
+ nodeId: string,
+ ctx: RunNodeContext,
+): Promise<RunNodeOutcome> {
  const { config, map, token, botIdentity, journal } = ctx;
  const repo = map.repo;
  const base: RunNodeOutcome = {
@@ -190,7 +203,10 @@ export async function runNode(nodeId: string, ctx: RunNodeContext): Promise<RunN
 
  try {
   const node = await graphNode(repo, nodeId, { token, source: "write-token" });
-  const rootNode = await graphNode(repo, String(map.root), { token, source: "write-token" });
+  const rootNode = await graphNode(repo, String(map.root), {
+   token,
+   source: "write-token",
+  });
 
   if (node.node.kind !== "research") {
    const detail = `node #${nodeId} is kind '${node.node.kind}' — the research lane only walks research nodes (design §3).`;
@@ -198,7 +214,11 @@ export async function runNode(nodeId: string, ctx: RunNodeContext): Promise<RunN
    return { ...base, status: "refused", detail };
   }
 
-  journal.recordEvent("worker-start", { nodeId, repo, detail: "worktree bootstrap" });
+  journal.recordEvent("worker-start", {
+   nodeId,
+   repo,
+   detail: "worktree bootstrap",
+  });
   const canonical = canonicalDir(config, map);
   await bootstrapCanonical(canonical, repo, token);
   const slug = slugify(node.node.title);
@@ -213,7 +233,11 @@ export async function runNode(nodeId: string, ctx: RunNodeContext): Promise<RunN
    attempts: prior?.attempts ?? 0,
   };
 
-  journal.recordEvent("worker-start", { nodeId, repo, detail: `worktree ${worktree}, branch ${branch}` });
+  journal.recordEvent("worker-start", {
+   nodeId,
+   repo,
+   detail: `worktree ${worktree}, branch ${branch}`,
+  });
   journal.upsertWorker({
    nodeId,
    repo,
@@ -242,7 +266,8 @@ export async function runNode(nodeId: string, ctx: RunNodeContext): Promise<RunN
    botIdentity,
   });
 
-  const wallClockMs = (ctx.wallClockMin ?? config.workers.wallClockMin) * 60_000;
+  const wallClockMs =
+   (ctx.wallClockMin ?? config.workers.wallClockMin) * 60_000;
   const workerCmd = ctx.workerCommand ?? defaultWorkerCommand();
   const workerRun =
    ctx.worker ??
@@ -317,9 +342,17 @@ export async function runNode(nodeId: string, ctx: RunNodeContext): Promise<RunN
   );
 
   if (close.closed) {
-   journal.recordEvent("closed", { nodeId, repo, detail: close.detail.slice(0, 400) });
+   journal.recordEvent("closed", {
+    nodeId,
+    repo,
+    detail: close.detail.slice(0, 400),
+   });
    await graphDecisions(repo, String(map.root), token, { cwd: probeCwd });
-   journal.recordEvent("decisions-written", { nodeId, repo, detail: "decisions --write after confirmed close" });
+   journal.recordEvent("decisions-written", {
+    nodeId,
+    repo,
+    detail: "decisions --write after confirmed close",
+   });
    journal.upsertWorker({
     nodeId,
     repo,
@@ -332,10 +365,20 @@ export async function runNode(nodeId: string, ctx: RunNodeContext): Promise<RunN
     outcome: close.detail.slice(0, 400),
     messageId: keep.messageId,
    });
-   return { ...base, status: "success", detail: close.detail.slice(0, 400), workerExit: 0, close };
+   return {
+    ...base,
+    status: "success",
+    detail: close.detail.slice(0, 400),
+    workerExit: 0,
+    close,
+   };
   }
 
-  journal.recordEvent("refused", { nodeId, repo, detail: close.detail.slice(0, 400) });
+  journal.recordEvent("refused", {
+   nodeId,
+   repo,
+   detail: close.detail.slice(0, 400),
+  });
   journal.bumpDeadman();
   journal.upsertWorker({
    nodeId,
@@ -349,23 +392,97 @@ export async function runNode(nodeId: string, ctx: RunNodeContext): Promise<RunN
    outcome: close.detail.slice(0, 400),
    messageId: keep.messageId,
   });
-  return { ...base, status: "refused", detail: close.detail, workerExit: 0, close };
+  return {
+   ...base,
+   status: "refused",
+   detail: close.detail,
+   workerExit: 0,
+   close,
+  };
  } catch (error) {
   const detail = error instanceof Error ? error.message : String(error);
-  journal.recordEvent("refused", { nodeId, repo, detail: detail.slice(0, 400) });
+  journal.recordEvent("refused", {
+   nodeId,
+   repo,
+   detail: detail.slice(0, 400),
+  });
   journal.bumpDeadman();
   return { ...base, status: "failed", detail };
  }
 }
 
-/** Worker env: machine-account git auth, repo context, no keychain, no approver token. */
+/** The minimal host env a headless worker needs to run claude/git/soma:
+ *  PATH/HOME/locale, git-identity + config passthrough, and LLM-credential +
+ *  soma/pi variables. Deliberately EXCLUDES the RANGER_* secrets (the Discord
+ *  bot token, write tokens, keychain vars) and anything unknown: a graph-
+ *  authored prompt injection in the worker must not be able to read the bot
+ *  token (round-32 security blocker). Git auth (GIT_CONFIG_VALUE_0) is
+ *  injected by gitAuthEnv AFTER this spread, so it overrides any passthrough.
+ */
+function workerHostEnv(): NodeJS.ProcessEnv {
+ const allowedNames = new Set([
+  "PATH",
+  "HOME",
+  "USER",
+  "LOGNAME",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "LC_MESSAGES",
+  "LC_TIME",
+  "TERM",
+  "TZ",
+  "SHELL",
+  "PWD",
+  "TMPDIR",
+  "XDG_CONFIG_HOME",
+  "XDG_CACHE_HOME",
+  "XDG_STATE_HOME",
+  "SSH_AUTH_SOCK",
+  "GIT_ASKPASS",
+  "GIT_TERMINAL_PROMPT",
+ ]);
+ const allowedPrefixes = [
+  "ANTHROPIC_",
+  "CLAUDE_",
+  "CLAUDECODE_",
+  "CODEX_",
+  "OPENAI_",
+  "AZURE_",
+  "BEDROCK_",
+  "VERTEX_",
+  "GEMINI_",
+  "GOOGLE_",
+  "OPENROUTER_",
+  "LITELLM_",
+  "SOMA_",
+  "SAGE_",
+  "PILOT_",
+  "GIT_", // git identity + config passthrough (auth header is overridden below)
+ ];
+ const env: NodeJS.ProcessEnv = {};
+ for (const [key, value] of Object.entries(process.env)) {
+  if (value === undefined) continue;
+  if (
+   allowedNames.has(key) ||
+   allowedPrefixes.some((prefix) => key.startsWith(prefix))
+  ) {
+   env[key] = value;
+  }
+ }
+ return env;
+}
+
+/** Worker env: machine-account git auth, repo context, and ONLY an allow-
+ *  listed host env — never a spread of process.env (a prompt injection in
+ *  the headless worker must not reach the Discord bot token). */
 function workerEnv(
  token: string,
  config: RangerConfig,
  repo: string,
 ): NodeJS.ProcessEnv {
  return gitAuthEnv(token, {
-  ...process.env,
+  ...workerHostEnv(),
   SOMA_GRAPH_REPO: repo,
   SAGE_STACK: "default",
   PILOT_PRINCIPAL: config.principal.login,

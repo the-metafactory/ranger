@@ -173,7 +173,13 @@ export class EscalationDiscord {
         throw new EscalateError("discord deferred: pass deadline reached");
       }
       await sleep(
-        Math.min(250, this.cooldownUntil - Date.now(), deadline === undefined ? Infinity : Math.max(0, deadline - Date.now())),
+        Math.min(
+          250,
+          this.cooldownUntil - Date.now(),
+          deadline === undefined
+            ? Infinity
+            : Math.max(0, deadline - Date.now()),
+        ),
       );
     }
     this.cooldownUntil = 0;
@@ -266,9 +272,7 @@ export class EscalationDiscord {
               content,
               allowed_mentions: {
                 parse: [],
-                users: this.principalDiscordId
-                  ? [this.principalDiscordId]
-                  : [],
+                users: this.principalDiscordId ? [this.principalDiscordId] : [],
               },
             }),
           },

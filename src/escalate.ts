@@ -130,7 +130,10 @@ function ageSuffix(
 
 /** Route-specific card framing: the mention-inerted head/map/url/checkpoint
  *  prefix plus (for provisioning cards) the blocked-probe registration lines. */
-function cardFraming(node: ClassifiedNode, map: { repo: string }): {
+function cardFraming(
+  node: ClassifiedNode,
+  map: { repo: string },
+): {
   prefixLines: string[];
   probeLines: string[];
 } {
@@ -182,8 +185,7 @@ function renderBoundedBody(
   kind: string,
 ): string | null {
   if (bodyText === null) return null;
-  const bodyBudget =
-    1950 - prefixLines.join("\n").length - suffix.length - 8;
+  const bodyBudget = 1950 - prefixLines.join("\n").length - suffix.length - 8;
   return `_${truncate(
     bodyText,
     kind === "grilling" ? Math.max(120, bodyBudget) : 140,
@@ -205,12 +207,7 @@ function cardContent(
       ? sanitizeGraphText(node.body)
       : null;
   const suffix = ageSuffix(ageDays, principal, principalDiscordId);
-  const bodyLine = renderBoundedBody(
-    bodyText,
-    prefixLines,
-    suffix,
-    node.kind,
-  );
+  const bodyLine = renderBoundedBody(bodyText, prefixLines, suffix, node.kind);
   const lines = [...prefixLines, bodyLine, ...probeLines, suffix].filter(
     (line): line is string => line !== null,
   );
@@ -556,9 +553,10 @@ async function acquireLease(
  * overwrite their lock. Returns the interval plus a ref the release uses to
  * surface a lost-ownership reclaim loudly.
  */
-function startHeartbeat(
-  lease: Lease,
-): { heartbeat: ReturnType<typeof setInterval>; lostOwnership: { value: boolean } } {
+function startHeartbeat(lease: Lease): {
+  heartbeat: ReturnType<typeof setInterval>;
+  lostOwnership: { value: boolean };
+} {
   const lostOwnership = { value: false };
   const heartbeat = setInterval(() => {
     try {
@@ -778,7 +776,7 @@ async function editInPlace(
   editContent: string,
   createdAt: string,
 ): Promise<SyncOutcome> {
-  const { client, journal, budget, node, now } = ctx;
+  const { client, budget, node, now } = ctx;
   if (!charge(budget)) return { action: "deferred", id: node.id };
   try {
     await client.edit(messageId, editContent, budget.deadline);
@@ -908,7 +906,12 @@ async function syncCard(
         card: cardFrom(node, prior, ageDays),
       };
     }
-    return await editInPlace(cardCtx, prior.messageId, content, prior.createdAt);
+    return await editInPlace(
+      cardCtx,
+      prior.messageId,
+      content,
+      prior.createdAt,
+    );
   } catch (cardError) {
     // A transient Discord failure on one card must not fail the whole desk —
     // the card retries next tick (announce-once stays intact: a failed post
@@ -916,12 +919,10 @@ async function syncCard(
     return {
       action: "error" as const,
       id: node.id,
-      error:
-        cardError instanceof Error ? cardError.message : String(cardError),
+      error: cardError instanceof Error ? cardError.message : String(cardError),
     };
   }
 }
-
 
 /**
  * Cards whose node left the HITL/provisioning queue are edited to a "no
@@ -1056,14 +1057,16 @@ async function reconcileAbsentCard(
 ): Promise<AbsentOutcome> {
   const { clientFor, journal, map, now, budget } = ctx;
   const nodeId = prior.nodeId;
+  const key = `${map.repo}:${nodeId}`;
   const content = queueExitContent(nodeId, prior.title, map.repo);
+  const cursorKey = `escalate.reconcile.${key}`;
   try {
     // Reconcile EVERY destination's card: a card that moved channels still
     // holds a live, actionable message in each visited channel — write the
     // queue-exit note to all of them so none stays active-looking (round-19
     // review). Legacy rows (pre-0006, no destination rows) fall back to the
     // row's own channel/message when known.
-    const stored = journal.getEscalationDestinations(`${map.repo}:${nodeId}`);
+    const stored = journal.getEscalationDestinations(key);
     let destinations: { channelId: string; messageId: string }[];
     if (stored.length > 0) {
       destinations = stored;
@@ -1074,9 +1077,22 @@ async function reconcileAbsentCard(
         { channelId: prior.channelId, messageId: prior.messageId },
       ];
     }
+    // A per-card destination cursor: with more destinations than the
+    // remaining budget, a restart-at-0 would re-edit the same first N each
+    // tick and never reach the tail (round-32 review). Resume from the
+    // persisted index; destinations are createdAt-ordered (deterministic).
+    let start = journal.getInt(cursorKey);
+    if (start > destinations.length) start = 0; // destinations changed
     let anyEdit = false;
-    for (const dest of destinations) {
-      if (!charge(budget)) return { action: "deferred", id: nodeId };
+    let i = start;
+    for (; i < destinations.length; i++) {
+      const dest = destinations[i];
+      if (!charge(budget)) {
+        // Persist the resume point; notedAt stays null → re-reconciled next
+        // tick from where we left off.
+        journal.setHealth(cursorKey, String(i));
+        return { action: "deferred", id: nodeId };
+      }
       try {
         await clientFor(dest.channelId).edit(
           dest.messageId,
@@ -1089,10 +1105,11 @@ async function reconcileAbsentCard(
         // this destination's card is already gone — nothing to note there
       }
     }
-    // Set notedAt only after every destination reconciled (or a definitive
-    // 404 each); a transient failure throws → retried next tick.
+    // All destinations reconciled (or a definitive 404 each) — clear the
+    // cursor + set notedAt; a transient failure throws → retried next tick.
+    journal.setHealth(cursorKey, "");
     journal.upsertEscalation({
-      key: `${map.repo}:${nodeId}`,
+      key,
       repo: map.repo,
       nodeId,
       title: prior.title,
@@ -1105,9 +1122,7 @@ async function reconcileAbsentCard(
       notedAt: now.toISOString(),
     });
     return {
-      action: (anyEdit ? "keptOpen" : "unchanged") as
-        | "keptOpen"
-        | "unchanged",
+      action: (anyEdit ? "keptOpen" : "unchanged") as "keptOpen" | "unchanged",
       id: nodeId,
     };
   } catch (cardError) {
@@ -1116,8 +1131,7 @@ async function reconcileAbsentCard(
     return {
       action: "error" as const,
       id: nodeId,
-      error:
-        cardError instanceof Error ? cardError.message : String(cardError),
+      error: cardError instanceof Error ? cardError.message : String(cardError),
     };
   }
 }
@@ -1280,7 +1294,11 @@ async function escalateOneMap(
   // the end-to-end pass can't drift unboundedly past the deadline (round-30
   // review: the 120s bound is not just the budget's charge gate).
   if (Date.now() > passDeadline) {
-    return { ...base, ok: false, error: "pass deadline reached before this map" };
+    return {
+      ...base,
+      ok: false,
+      error: "pass deadline reached before this map",
+    };
   }
 
   let token: ResolvedToken;
@@ -1331,9 +1349,7 @@ async function escalateOneMap(
     const sorted = [...needed].sort((a, b) => a.id.localeCompare(b.id));
     const pageSize = MAX_CARDS_PER_TICK * 2;
     const offset =
-      sorted.length === 0
-        ? 0
-        : (journal.getInt(cursorKey) % sorted.length);
+      sorted.length === 0 ? 0 : journal.getInt(cursorKey) % sorted.length;
     const page = sorted
       .slice(offset, offset + pageSize)
       .concat(
@@ -1342,10 +1358,7 @@ async function escalateOneMap(
           : [],
       );
     if (sorted.length > 0) {
-      journal.setHealth(
-        cursorKey,
-        String((offset + pageSize) % sorted.length),
-      );
+      journal.setHealth(cursorKey, String((offset + pageSize) % sorted.length));
     }
 
     // The active pass needs ONLY the rows for the nodes in this tick's page
@@ -1424,14 +1437,7 @@ export async function escalateMaps(
     const maps: EscalateMapResult[] = [];
     for (const map of config.maps) {
       maps.push(
-        await escalateOneMap(
-          config,
-          map,
-          journal,
-          registry,
-          now,
-          passDeadline,
-        ),
+        await escalateOneMap(config, map, journal, registry, now, passDeadline),
       );
     }
     return { generatedAt: now.toISOString(), maps };
@@ -1514,9 +1520,7 @@ function digestContent(inputs: DigestInputs): string {
     // (round-26 review).
     const inert = items.map(sanitizeGraphText);
     const head = inert.slice(0, max).join(", ");
-    return items.length > max
-      ? `${head}, …+${items.length - max}`
-      : head;
+    return items.length > max ? `${head}, …+${items.length - max}` : head;
   };
   const auditLines: string[] = [
     `**Audit:** receipt-less closes ${audit.closedWithoutReceipt.length}${audit.closedWithoutReceipt.length > 0 ? ` (${summarize(audit.closedWithoutReceipt, 8)})` : ""} · open w/o checkpoint ${audit.openWithoutCheckpoint.length}${audit.openWithoutCheckpoint.length > 0 ? ` (${summarize(audit.openWithoutCheckpoint, 8)})` : ""} · open claims ${audit.openClaimed.length}`,
@@ -1633,7 +1637,10 @@ async function digestOneMap(
     // deadline (round-30 blocker).
     const remainingMs = Math.max(0, digestDeadline - Date.now());
     const audit = await graphAudit(map.repo, map.root, token, {
-      timeoutMs: Math.min(GRAPH_CALL_TIMEOUT_MS, remainingMs || GRAPH_CALL_TIMEOUT_MS),
+      timeoutMs: Math.min(
+        GRAPH_CALL_TIMEOUT_MS,
+        remainingMs || GRAPH_CALL_TIMEOUT_MS,
+      ),
     });
     // Open cards only — capped to what the digest renders (≤15), with the
     // total + age aggregates from the same query, so the daily read doesn't
