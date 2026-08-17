@@ -108,7 +108,7 @@ export async function loginForToken(
  try {
   const result = await runCmd(
    "gh",
-   ["api", "user", "--jq", ".login"],
+   ["api", "/user", "--jq", ".login"],
    { ...opts, env: gated.env },
   );
   if (result.code !== 0) {
@@ -125,16 +125,29 @@ export async function loginForToken(
 /**
  * The bot identity ranger labels graph operations with: `bot.identity` if
  * configured, else the login resolved from the write token. Never a static
- * guess — the label must match the credential actually driving the write.
+ * guess — the label must match the credential actually driving the write, so
+ * the token's real login is always resolved and a configured `bot.identity`
+ * that does not match it is refused (a mismatched label would let mutations
+ * run under a credential they claim not to be, e.g. the principal's PAT
+ * labeled as the machine account).
  */
 export async function resolveBotIdentity(
- config: RangerConfig,
- token: string,
+  config: RangerConfig,
+  token: string,
 ): Promise<string> {
- if (config.bot.identity !== undefined && config.bot.identity.length > 0) {
-  return config.bot.identity;
- }
- return loginForToken(token);
+  const resolved = await loginForToken(token);
+  if (config.bot.identity !== undefined && config.bot.identity.length > 0) {
+    if (resolved !== config.bot.identity) {
+      throw new WriteGateError(
+        `configured bot.identity '${config.bot.identity}' does not match the ` +
+          `write token's login '${resolved}' — the mutation would run under a ` +
+          `credential it claims not to be (design §2, node #11). ` +
+          `Fix bot.identity or the write-token mapping.`,
+      );
+    }
+    return config.bot.identity;
+  }
+  return resolved;
 }
 
 /**

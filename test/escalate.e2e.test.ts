@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCmd } from "../src/exec.ts";
@@ -331,6 +331,39 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
       expect(journal.listEscalations("acme/widgets")).toHaveLength(4);
       journal.close();
       expect(existsSync(join(dir, ".escalate.lock"))).toBe(false);
+    } finally {
+      discord.stop();
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(fixtureDir, { recursive: true, force: true });
+    }
+  });
+
+  test("reclaims a stale announce-once lock left by a dead owner", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ranger-escalate-stale-"));
+    const fixtureDir = mkdtempSync(join(tmpdir(), "ranger-escalate-stale-fx-"));
+    const discord = fakeDiscord();
+    try {
+      writeFixtures(fixtureDir);
+      const config = writeConfig(dir);
+      const env = envFor(fixtureDir, discord.port);
+
+      // Simulate a killed run: lock dir with an owner whose pid is dead and
+      // whose startedAt is old. A live run must reclaim it, not wait 60s.
+      const lockDir = join(dir, ".escalate.lock");
+      mkdirSync(lockDir);
+      writeFileSync(
+        join(lockDir, "owner.json"),
+        JSON.stringify({
+          pid: 2_000_000_000, // out of pid range → ESRCH on kill(pid, 0)
+          startedAt: Date.now() - 3 * 24 * 60 * 60 * 1000,
+        }),
+      );
+
+      const run = await runCli(["escalate", "-c", config, "--json"], env);
+      expect(run.code).toBe(0);
+      const report = JSON.parse(run.stdout);
+      expect(report.maps[0].posted).toHaveLength(4);
+      expect(existsSync(lockDir)).toBe(false); // released after the run
     } finally {
       discord.stop();
       rmSync(dir, { recursive: true, force: true });

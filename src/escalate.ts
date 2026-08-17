@@ -1,6 +1,7 @@
-import { mkdirSync, rmSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
+import { resolveDiscordApiBase } from "./discord.ts";
 import {
   classify,
   ESCALATE_REASONS,
@@ -38,7 +39,7 @@ export class EscalationDiscord {
   constructor(
     private readonly token: string,
     private readonly channelId: string,
-    private readonly apiBase: string = escalationApiBase(),
+    private readonly apiBase: string = resolveDiscordApiBase(),
     private readonly principalDiscordId?: string,
   ) {}
 
@@ -134,48 +135,9 @@ export class EscalationDiscord {
 }
 
 /**
- * The Discord API base for production, with a hardened test seam.
- * `RANGER_DISCORD_API_BASE` may only target discord.com over https, or a
- * loopback listener when the test seam is explicitly opted in
- * (`RANGER_DISCORD_ALLOW_TEST_OVERRIDE=1`) — an injected override can
- * otherwise redirect the bot token to an attacker host (security review).
- * Absent/empty → the fixed Discord origin.
+ * The Discord API base for production, with a hardened test seam — shared
+ * with the walker announcer (src/discord.ts).
  */
-function escalationApiBase(): string {
-  const override = process.env.RANGER_DISCORD_API_BASE;
-  if (override === undefined || override.length === 0) {
-    return "https://discord.com/api/v10";
-  }
-  let url: URL;
-  try {
-    url = new URL(override);
-  } catch {
-    throw new EscalateError(
-      "RANGER_DISCORD_API_BASE is not a valid URL; refusing to use it",
-    );
-  }
-  const host = url.hostname.toLowerCase();
-  if (host === "discord.com") {
-    if (url.protocol !== "https:") {
-      throw new EscalateError(
-        "RANGER_DISCORD_API_BASE discord.com override must be https",
-      );
-    }
-    return override;
-  }
-  // Loopback is only a test seam, and only when explicitly opted in — an
-  // injected override otherwise redirects the bot token to a local listener.
-  if (
-    (host === "localhost" || host === "127.0.0.1") &&
-    process.env.RANGER_DISCORD_ALLOW_TEST_OVERRIDE === "1"
-  ) {
-    return override;
-  }
-  throw new EscalateError(
-    `RANGER_DISCORD_API_BASE host ${host} is not allowed — ` +
-      "discord.com (https) or an explicit localhost test override only",
-  );
-}
 
 // ---- card content ----
 
@@ -218,9 +180,18 @@ function truncate(text: string, max: number): string {
   return oneLine.length > max ? `${oneLine.slice(0, max - 1)}…` : oneLine;
 }
 
-function ageSuffix(ageDays: number, principal: string): string {
+function ageSuffix(
+  ageDays: number,
+  principal: string,
+  principalDiscordId?: string,
+): string {
   if (ageBand(ageDays) === "overdue") {
-    return `📣 @${principal} **${ageDays}d** — needs your attention`;
+    // A real Discord ping needs `<@id>` in content; the id is allow-listed
+    // in allowed_mentions. Without a configured id, the mention is inert text.
+    return principalDiscordId === undefined
+      ? `📣 @${principal} **${ageDays}d** — needs your attention ` +
+          "(no ping — configure principal.discordId)"
+      : `📣 <@${principalDiscordId}> **${ageDays}d** — needs your attention`;
   }
   if (ageBand(ageDays) === "aging") {
     return `⚠️ **${ageDays}d** — aging; blocked-descendant count unavailable ` +
@@ -234,6 +205,7 @@ function cardContent(
   map: { repo: string },
   ageDays: number,
   principal: string,
+  principalDiscordId?: string,
 ): string {
   const reason =
     node.route.route === "escalate-hitl"
@@ -266,7 +238,7 @@ function cardContent(
     reason ? `_${reason}_` : null,
     bodyLine,
     ...probeLines,
-    ageSuffix(ageDays, principal),
+    ageSuffix(ageDays, principal, principalDiscordId),
   ].filter((line): line is string => line !== null);
   return lines.join("\n");
 }
@@ -362,14 +334,54 @@ async function withEscalateLock<T>(
   fn: () => Promise<T>,
 ): Promise<T> {
   const lockDir = join(dirname(journal.path), ".escalate.lock");
+  const ownerFile = join(lockDir, "owner.json");
   const started = Date.now();
   const timeoutMs = 60_000;
+  // A lock this old is never a live run — a reboot leaves the dir behind and
+  // can even recycle the pid, so time alone makes it safe to reclaim.
+  const STALE_MS = 24 * 60 * 60 * 1000;
+  const owner = { pid: process.pid, startedAt: Date.now() };
   for (;;) {
     try {
       mkdirSync(lockDir);
       break;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      // Someone holds the lock. Reclaim it when the owner is dead (kill(pid,0)
+      // → ESRCH) or the owner record is stale (reboot / pid reuse), so a
+      // killed or rebooted run can't disable the scheduled cards/digests.
+      let reclaimable = false;
+      try {
+        const prior = JSON.parse(
+          readFileSync(ownerFile, "utf8"),
+        ) as { pid?: number; startedAt?: number };
+        if (typeof prior.pid === "number") {
+          try {
+            process.kill(prior.pid, 0);
+          } catch (killError) {
+            reclaimable =
+              (killError as NodeJS.ErrnoException).code === "ESRCH";
+          }
+        }
+        if (
+          !reclaimable &&
+          typeof prior.startedAt === "number" &&
+          Date.now() - prior.startedAt > STALE_MS
+        ) {
+          reclaimable = true;
+        }
+      } catch {
+        /* unreadable/missing owner — a fresh crash window; short grace */
+        reclaimable = Date.now() - started > 10_000;
+      }
+      if (reclaimable) {
+        try {
+          rmSync(lockDir, { recursive: true, force: true });
+        } catch {
+          /* concurrent reclaim — keep waiting */
+        }
+        continue;
+      }
       if (Date.now() - started > timeoutMs) {
         throw new EscalateError(
           `another escalate run holds the lock (${lockDir}) — ` +
@@ -380,10 +392,11 @@ async function withEscalateLock<T>(
     }
   }
   try {
+    writeFileSync(ownerFile, JSON.stringify(owner));
     return await fn();
   } finally {
     try {
-      rmSync(lockDir, { recursive: true });
+      rmSync(lockDir, { recursive: true, force: true });
     } catch {
       /* best-effort release */
     }
@@ -484,7 +497,13 @@ async function escalateOneMap(
       const prior = existing.get(node.id);
       const ageDays =
         prior === undefined ? 0 : dayDiff(prior.createdAt, now);
-      const content = cardContent(node, map, ageDays, principal);
+      const content = cardContent(
+        node,
+        map,
+        ageDays,
+        principal,
+        config.principal.discordId,
+      );
       if (prior === undefined) {
         const messageId = await client.post(content);
         const row = {

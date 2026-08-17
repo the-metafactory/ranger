@@ -110,6 +110,7 @@ describe("ranger walk — claim phase (node #13)", () => {
     FAKE_SOMA_DIR: dataDir,
     FAKE_SOMA_STATE: statePath,
     RANGER_DISCORD_API_BASE: `http://127.0.0.1:${discord.port}`,
+    RANGER_DISCORD_ALLOW_TEST_OVERRIDE: "1",
     RANGER_DISCORD_TOKEN: "fake-bot-token",
     RANGER_WRITE_TEST: "ghp_write",
     RANGER_NO_SPAWN: "1",
@@ -187,8 +188,12 @@ describe("ranger walk — claim phase (node #13)", () => {
     FAKE_SOMA_DIR: dataDir,
     FAKE_SOMA_STATE: statePath,
     RANGER_DISCORD_API_BASE: "http://127.0.0.1:1",
+    RANGER_DISCORD_ALLOW_TEST_OVERRIDE: "1",
     RANGER_DISCORD_TOKEN: "fake-bot-token",
-    RANGER_WRITE_TEST: "ghp_write",
+    // a token whose real login is the principal — the refusal must fire even
+    // though bot.identity labels it the principal (resolveBotIdentity passes
+    // the label↔login match, then assertNotPrincipal refuses).
+    RANGER_WRITE_TEST: "ghp_principal",
     RANGER_NO_SPAWN: "1",
    };
 
@@ -199,6 +204,39 @@ describe("ranger walk — claim phase (node #13)", () => {
    expect(result.stdout).toContain("principal");
   } finally {
    rmSync(dir, { recursive: true, force: true });
+  }
+ });
+
+ test("refuses when bot.identity does not match the write token's real login", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ranger-walk-mismatch-"));
+  const dataDir = mkdtempSync(join(tmpdir(), "ranger-walk-mismatch-data-"));
+  try {
+   // Label says ivy-bot but the write token is the principal's — the identity
+   // gate must catch the mismatch, not run mutations under the principal
+   // credential while claiming to be the machine account.
+   const config = writeConfig(dir);
+   const statePath = writeState(dir, { "10": RESEARCH_NODE_STATE });
+   const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    ...GIT_ENV,
+    PATH: `${fixturesBin}:${process.env.PATH ?? ""}`,
+    FAKE_SOMA_DIR: dataDir,
+    FAKE_SOMA_STATE: statePath,
+    RANGER_DISCORD_API_BASE: "http://127.0.0.1:1",
+    RANGER_DISCORD_ALLOW_TEST_OVERRIDE: "1",
+    RANGER_DISCORD_TOKEN: "fake-bot-token",
+    RANGER_WRITE_TEST: "ghp_principal", // resolves to jcfischer, not ivy-bot
+    RANGER_NO_SPAWN: "1",
+   };
+
+   const result = await runCli(["walk", "-c", config], env);
+   expect(result.code).toBe(0);
+   const state = JSON.parse(readFileSync(statePath, "utf8"));
+   expect(state.nodes["10"].assignees).toEqual([]); // gated before any claim
+   expect(result.stdout).toContain("does not match");
+  } finally {
+   rmSync(dir, { recursive: true, force: true });
+   rmSync(dataDir, { recursive: true, force: true });
   }
  });
 });

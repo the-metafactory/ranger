@@ -89,33 +89,7 @@ export function probesRegistryBlocked(
   repo: string,
   registry: ProbeRegistry,
 ): boolean {
-  const probes = node.probes ?? [];
-  if (probes.length === 0) return false;
-  const repoEntry = registry.repos?.[repo];
-  const declaredCommands = new Set(
-    (repoEntry?.commands ?? []).map((c) => `${c.run}\u0000${c.cwd}`),
-  );
-  const declaredHosts = new Set(
-    (repoEntry?.urlHosts ?? []).map((h) => h.toLowerCase()),
-  );
-  for (const probe of probes) {
-    if (probe.type === "command") {
-      const run = typeof probe.run === "string" ? probe.run : "";
-      const cwd = typeof probe.cwd === "string" ? probe.cwd : "";
-      if (!declaredCommands.has(`${run}\u0000${cwd}`)) return true;
-    } else if (probe.type === "url") {
-      let host = "";
-      const target = typeof probe.target === "string" ? probe.target : "";
-      try {
-        host = new URL(target).host.toLowerCase();
-      } catch {
-        /* unparseable target counts as blocked */
-        return true;
-      }
-      if (!declaredHosts.has(host)) return true;
-    }
-  }
-  return false;
+  return blockedProbeSpecs(node, repo, registry).length > 0;
 }
 
 /** A declared probe the registry does not satisfy (class-5 preflight). */

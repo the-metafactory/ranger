@@ -55,11 +55,23 @@ reported both jobs loaded with exit status 0 at record time.
 
 ## Re-verifying these claims
 
-The cards pass is idempotent (announce-once, edit-not-repost), so re-running
-it reproduces the same observable state without new posts:
+Scope of the commands below (each verifies only the escalation-desk claims it
+can observe):
+
+- Re-running the cards pass is **concurrency-safe** (a cross-process lock
+  serializes overlapping runs so the second edits instead of re-posting), but
+  not **crash-atomic**: between Discord's POST response and the journal write
+  there is a tiny window where a crash/SQLite failure leaves no cached id, and
+  the next run posts a duplicate card (visible and deletable in the thread).
+  The journal's `escalations` rows and the cards in the threads are the
+  record; a duplicate is the recoverable consequence, not corruption.
+- The **#19 walk** claims (claim/close identity, worker execution, decisions
+  write, findings-branch revision) are operator-recorded here, not derivable
+  from the escalation commands; verify them against the soma graph itself.
 
 ```bash
-# 1. Re-run the cards pass + digest (idempotent) and inspect the reports.
+# 1. Re-run the cards pass + digest and inspect the reports (idempotent across
+#    overlapping runs via the lock; still safe to run on the live host).
 ~/bin/ranger escalate --config ~/work/mf/ranger/ranger.yaml --json
 ~/bin/ranger escalate --config ~/work/mf/ranger/ranger.yaml --digest --json
 
@@ -71,4 +83,10 @@ sqlite3 ~/.config/ranger/state.sqlite \
 
 # 3. The scheduled jobs and their last exit.
 launchctl list | grep ranger
+
+# 4. The #19 walk claims against the live graph (status, close checkpoint,
+#    decisions) and the findings branch revision.
+soma graph node --repo the-metafactory/ranger --id 19 --json
+soma graph audit --repo the-metafactory/ranger --root 1 --json
+git -C ~/work/ranger-repos/the-metafactory/ranger rev-parse research/walker-readiness-inventory
 ```

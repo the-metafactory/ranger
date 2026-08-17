@@ -1,4 +1,5 @@
 import type { RangerMapConfig } from "./config.ts";
+import { resolveDiscordApiBase } from "./discord.ts";
 
 /**
  * Claim-announce, fail-closed (design §5, node #7).
@@ -44,8 +45,7 @@ export class DiscordAnnouncer implements Announcer {
  constructor(
   private readonly token: string,
   private readonly channelId: string,
-  private readonly apiBase: string =
-   process.env.RANGER_DISCORD_API_BASE ?? "https://discord.com/api/v10",
+  private readonly apiBase: string = resolveDiscordApiBase(),
  ) {}
 
  static fromMap(
