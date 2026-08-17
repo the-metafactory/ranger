@@ -673,37 +673,37 @@ const MAX_ABSENT_SCAN = 500;
  *  without letting a hang block the pass bound. */
 const GRAPH_CALL_TIMEOUT_MS = 60_000;
 
-async function syncCard(
-  ctx: {
-    client: EscalationDiscord;
-    clientFor: (channelId: string) => EscalationDiscord;
-    journal: Journal;
-    map: RangerMapConfig;
-    config: RangerConfig;
-    now: Date;
-    budget: CardBudget;
-  },
-  node: ClassifiedNode,
-  prior: EscalationRow | undefined,
-): Promise<SyncOutcome> {
-  const { client, clientFor, journal, map, config, now, budget } = ctx;
-  const ageDays = prior === undefined ? 0 : dayDiff(prior.createdAt, now);
-  const content = cardContent(
-    node,
-    map,
-    ageDays,
-    config.principal.login,
-    config.principal.discordId,
-  );
-  const key = `${map.repo}:${node.id}`;
-  /** One row assembly shared by post and edit — card fields live in one place. */
-  const escalationRow = (params: {
+/** Shared context for one card's sync lifecycle — the per-card derivations
+ *  (key, age, content) plus the pass context, so post/edit/recover/migrate
+ *  live as focused module-level helpers instead of coupled closures
+ *  (round-31 suggestion). */
+interface CardSyncContext {
+  client: EscalationDiscord;
+  clientFor: (channelId: string) => EscalationDiscord;
+  journal: Journal;
+  map: RangerMapConfig;
+  config: RangerConfig;
+  now: Date;
+  budget: CardBudget;
+  node: ClassifiedNode;
+  key: string;
+  ageDays: number;
+  content: string;
+}
+
+/** One row assembly shared by post and edit — card fields live in one place. */
+function escalationRow(
+  ctx: CardSyncContext,
+  params: {
     messageId: string;
     lastContent: string;
     createdAt: string;
     lastEditedAt?: string;
-  }) => ({
-    key,
+  },
+) {
+  const { client, map, node } = ctx;
+  return {
+    key: ctx.key,
     repo: map.repo,
     nodeId: node.id,
     title: node.title,
@@ -718,109 +718,171 @@ async function syncCard(
     status: "open" as const,
     // A fresh or re-activated card is never reconciled.
     notedAt: null,
+  };
+}
+
+/** Persist the card row and build the outcome — the shared tail of every
+ *  successful post/edit. */
+function saveAndReturn(
+  ctx: CardSyncContext,
+  row: ReturnType<typeof escalationRow>,
+  action: "posted" | "edited",
+): SyncOutcome {
+  ctx.journal.upsertEscalation(row);
+  return {
+    action,
+    id: ctx.node.id,
+    card: cardFrom(ctx.node, row, ctx.ageDays),
+  };
+}
+
+/** Post a fresh card in the client's channel + record row + destination.
+ *  `priorCreatedAt` preserves the card's IMMUTABLE first-appearance age on a
+ *  repost (moved channel / message gone); a brand-new card (no arg) starts
+ *  its age now. */
+async function postFresh(
+  ctx: CardSyncContext,
+  priorCreatedAt?: string,
+): Promise<SyncOutcome> {
+  const { client, journal, budget, node, now } = ctx;
+  if (!charge(budget)) return { action: "deferred", id: node.id };
+  // The posted content is the SAME `content` the edit path would use — one
+  // render source, no drift (round-30 suggestion). A reposted card is the
+  // SAME unresolved escalation, re-surfaced WITH ITS AGE (design §5); new
+  // cards render age 0.
+  const messageId = await client.post(ctx.content, budget.deadline);
+  const row = escalationRow(ctx, {
+    messageId,
+    lastContent: ctx.content,
+    // Immutable first-appearance timestamp: the card's age is its age since
+    // it first appeared, preserved across reposts. The per-destination
+    // created_at (escalation_destinations) tracks each channel visit for
+    // recovery, not the card's age.
+    createdAt: priorCreatedAt ?? now.toISOString(),
   });
-  /** Persist the card row and build the outcome — the shared tail of every
-   *  successful post/edit. */
-  const saveAndReturn = (
-    row: ReturnType<typeof escalationRow>,
-    action: "posted" | "edited",
-  ): SyncOutcome => {
-    journal.upsertEscalation(row);
-    return { action, id: node.id, card: cardFrom(node, row, ageDays) };
-  };
-  /** Post a fresh card in the client's channel + record row + destination. */
-  const postFresh = async (): Promise<SyncOutcome> => {
-    if (!charge(budget)) return { action: "deferred", id: node.id };
-    // The posted content is the SAME `content` the edit path would use — one
-    // render source, no drift (round-30 suggestion). A reposted card (moved
-    // channel / message gone) is the SAME unresolved escalation, re-surfaced
-    // WITH ITS AGE (design §5); new cards (prior undefined) render age 0.
-    const messageId = await client.post(content, budget.deadline);
-    const row = escalationRow({
-      messageId,
-      lastContent: content,
-      // Immutable first-appearance timestamp: the card's age is its age
-      // since it first appeared, preserved across reposts. The per-destination
-      // created_at (escalation_destinations) tracks each channel visit for
-      // recovery, not the card's age.
-      createdAt: prior?.createdAt ?? now.toISOString(),
-    });
-    journal.setEscalationDestination(
-      key,
-      client.channel,
-      messageId,
-      now.toISOString(),
-    );
-    return saveAndReturn(row, "posted");
-  };
-  /** Edit a card message in place; if the message is gone (deleted or in a
-   *  moved channel), repost fresh instead of retrying a doomed edit. */
-  const editInPlace = async (
-    messageId: string,
-    editContent: string,
-    createdAt: string,
-  ): Promise<SyncOutcome> => {
-    if (!charge(budget)) return { action: "deferred", id: node.id };
-    try {
-      await client.edit(messageId, editContent, budget.deadline);
-    } catch (cardError) {
-      if (cardError instanceof DiscordMessageGoneError) {
-        return await postFresh();
-      }
-      throw cardError;
-    }
-    const row = escalationRow({
-      messageId,
-      lastContent: editContent,
-      createdAt,
-      lastEditedAt: now.toISOString(),
-    });
-    return saveAndReturn(row, "edited");
-  };
-  /** A card whose destination channel moved: recover its existing message in
-   *  the CURRENT channel if one exists (edit in place, age kept — it is the
-   *  same card), else post fresh — never a duplicate while a channel is
-   *  re-visited (destination recovery, round-14/15). */
-  /** Edit the card we're LEAVING (in the prior channel) to a "moved" note —
-   *  one active card per escalation: a channel move must not leave the old
-   *  card active-looking (round-25 review, resolves the round-23 stale-B
-   *  gap). A 404 (already gone) is fine; a deferral aborts the move so we
-   *  never create a second active card without retiring the first. */
-  const noteMoved = async (
-   priorChannelId: string | null,
-   priorMessageId: string,
-  ): Promise<"noted" | SyncOutcome> => {
-   // The caller only routes here when prior.channelId is a real, different
-   // channel, but TS can't carry that narrowing through — a null is a
-   // legacy row with no channel to note (nothing to do).
-   if (priorChannelId === null) return "noted";
-   if (!charge(budget)) return { action: "deferred", id: node.id };
-   try {
-    await clientFor(priorChannelId).edit(
-     priorMessageId,
-     movedCardNote(node.id, node.title, client.channel),
-     budget.deadline,
-    );
-    return "noted";
-   } catch (cardError) {
+  journal.setEscalationDestination(
+    ctx.key,
+    client.channel,
+    messageId,
+    now.toISOString(),
+  );
+  return saveAndReturn(ctx, row, "posted");
+}
+
+/** Edit a card message in place; if the message is gone (deleted or in a
+ *  moved channel), repost fresh (keeping the card's age) instead of retrying
+ *  a doomed edit. */
+async function editInPlace(
+  ctx: CardSyncContext,
+  messageId: string,
+  editContent: string,
+  createdAt: string,
+): Promise<SyncOutcome> {
+  const { client, journal, budget, node, now } = ctx;
+  if (!charge(budget)) return { action: "deferred", id: node.id };
+  try {
+    await client.edit(messageId, editContent, budget.deadline);
+  } catch (cardError) {
     if (cardError instanceof DiscordMessageGoneError) {
-     return "noted"; // already gone — nothing to note
+      return await postFresh(ctx, createdAt);
     }
     throw cardError;
-   }
-  };
-  const syncMovedCard = async (prior: EscalationRow): Promise<SyncOutcome> => {
-   const noted = await noteMoved(prior.channelId, prior.messageId);
-   if (noted !== "noted") return noted;
-   const recoveredId = journal.getEscalationDestination(key, client.channel);
-   if (recoveredId !== null) {
-    return editInPlace(recoveredId, content, prior.createdAt);
-   }
-   return postFresh();
+  }
+  const row = escalationRow(ctx, {
+    messageId,
+    lastContent: editContent,
+    createdAt,
+    lastEditedAt: now.toISOString(),
+  });
+  return saveAndReturn(ctx, row, "edited");
+}
+
+/** Edit the card we're LEAVING (in the prior channel) to a "moved" note —
+ *  one active card per escalation: a channel move must not leave the old card
+ *  active-looking (round-25 review, resolves the round-23 stale-B gap). A 404
+ *  (already gone) is fine; a deferral aborts the move so we never create a
+ *  second active card without retiring the first. */
+async function noteMoved(
+  ctx: CardSyncContext,
+  priorChannelId: string | null,
+  priorMessageId: string,
+): Promise<"noted" | SyncOutcome> {
+  const { clientFor, client, budget, node } = ctx;
+  // The caller only routes here when prior.channelId is a real, different
+  // channel, but TS can't carry that narrowing through — a null is a legacy
+  // row with no channel to note (nothing to do).
+  if (priorChannelId === null) return "noted";
+  if (!charge(budget)) return { action: "deferred", id: node.id };
+  try {
+    await clientFor(priorChannelId).edit(
+      priorMessageId,
+      movedCardNote(node.id, node.title, client.channel),
+      budget.deadline,
+    );
+    return "noted";
+  } catch (cardError) {
+    if (cardError instanceof DiscordMessageGoneError) {
+      return "noted"; // already gone — nothing to note
+    }
+    throw cardError;
+  }
+}
+
+/** A card whose destination channel moved: recover its existing message in
+ *  the CURRENT channel if one exists (edit in place, age kept — it is the
+ *  same card), else post fresh — never a duplicate while a channel is
+ *  re-visited (destination recovery, round-14/15). */
+async function syncMovedCard(
+  ctx: CardSyncContext,
+  prior: EscalationRow,
+): Promise<SyncOutcome> {
+  const { client, journal } = ctx;
+  const noted = await noteMoved(ctx, prior.channelId, prior.messageId);
+  if (noted !== "noted") return noted;
+  const recoveredId = journal.getEscalationDestination(ctx.key, client.channel);
+  if (recoveredId !== null) {
+    return editInPlace(ctx, recoveredId, ctx.content, prior.createdAt);
+  }
+  return postFresh(ctx, prior.createdAt);
+}
+
+/** One card's post/edit/journal lifecycle — a thin dispatcher: derive the
+ *  per-card context, then route to the named stage (post / edit-in-place /
+ *  moved-channel recovery). Isolated from map orchestration (announce-once
+ *  for fresh cards, edit-on-change for repeats, transient failures returned
+ *  as outcomes — never thrown). */
+async function syncCard(
+  ctx: {
+    client: EscalationDiscord;
+    clientFor: (channelId: string) => EscalationDiscord;
+    journal: Journal;
+    map: RangerMapConfig;
+    config: RangerConfig;
+    now: Date;
+    budget: CardBudget;
+  },
+  node: ClassifiedNode,
+  prior: EscalationRow | undefined,
+): Promise<SyncOutcome> {
+  const { client, config, map, now } = ctx;
+  const ageDays = prior === undefined ? 0 : dayDiff(prior.createdAt, now);
+  const content = cardContent(
+    node,
+    map,
+    ageDays,
+    config.principal.login,
+    config.principal.discordId,
+  );
+  const cardCtx: CardSyncContext = {
+    ...ctx,
+    node,
+    key: `${map.repo}:${node.id}`,
+    ageDays,
+    content,
   };
   try {
     if (prior === undefined) {
-      return await postFresh();
+      return await postFresh(cardCtx);
     }
     // A card CLOSED by the write-side (node #21) must not be re-activated by
     // a sync — the row's status is preserved, not force-set to open (round-31
@@ -834,7 +896,7 @@ async function syncCard(
       };
     }
     if (prior.channelId !== null && prior.channelId !== client.channel) {
-      return await syncMovedCard(prior);
+      return await syncMovedCard(cardCtx, prior);
     }
     // Edit-on-change: a 900s tick re-runs ~96×/day; re-editing identical
     // cards churns Discord writes and trips rate limits (observed live).
@@ -846,7 +908,7 @@ async function syncCard(
         card: cardFrom(node, prior, ageDays),
       };
     }
-    return await editInPlace(prior.messageId, content, prior.createdAt);
+    return await editInPlace(cardCtx, prior.messageId, content, prior.createdAt);
   } catch (cardError) {
     // A transient Discord failure on one card must not fail the whole desk —
     // the card retries next tick (announce-once stays intact: a failed post
@@ -854,10 +916,12 @@ async function syncCard(
     return {
       action: "error" as const,
       id: node.id,
-      error: cardError instanceof Error ? cardError.message : String(cardError),
+      error:
+        cardError instanceof Error ? cardError.message : String(cardError),
     };
   }
 }
+
 
 /**
  * Cards whose node left the HITL/provisioning queue are edited to a "no
