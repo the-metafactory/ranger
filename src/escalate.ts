@@ -15,7 +15,7 @@ import {
   loadProbeRegistry,
   type ClassifiedNode,
 } from "./route.ts";
-import { graphAudit, graphFrontier, type AuditResult, type FrontierEntry } from "./graph.ts";
+import { graphAudit, graphFrontier, type AuditResult } from "./graph.ts";
 import { assertReadOnlyToken, type ResolvedToken } from "./token-gate.ts";
 import type { EscalationRow, Journal } from "./journal.ts";
 
@@ -274,12 +274,6 @@ interface EscalateMapResult {
 export interface EscalateResult {
   generatedAt: string;
   maps: EscalateMapResult[];
-  /**
-   * The raw frontier entries each map's pass already fetched — the tick
-   * reuses them for walk instead of a second graphFrontier call (round-28
-   * review: "fetch the frontier once per tick").
-   */
-  frontiers: Record<string, FrontierEntry[]>;
 }
 
 function dayDiff(fromIso: string, now: Date): number {
@@ -673,6 +667,11 @@ const MAX_PASS_MS = 120_000;
  *  pagination past needed rows) — a large drain must not walk the whole
  *  journal (round-27 review). */
 const MAX_ABSENT_SCAN = 500;
+/** Timeout on every graph CLI call the escalation pass makes — a hung `soma`
+ *  command must not hold the tick (and hence walk) indefinitely (round-29
+ *  blocker). Generous: the CLI responds in seconds; this covers slow networks
+ *  without letting a hang block the pass bound. */
+const GRAPH_CALL_TIMEOUT_MS = 60_000;
 
 async function syncCard(
   ctx: {
@@ -890,28 +889,36 @@ async function markAbsentCards(
   // as absent (round-26 review).
   // Collect up to budget.remaining USABLE (non-needed) open cards, scanning
   // past needed rows that slipped past the capped SQL exclusion via offset
-  // pagination: with >ABSENT_EXCLUDE_CAP needed cards older than a real
-  // absent card, a single page would repeatedly load+discard the same needed
-  // rows and never reach the absent one (round-27 review). The scan is still
-  // bounded (MAX_ABSENT_SCAN total rows) so it can't walk the whole journal.
+  // pagination. A PERSISTED cursor advances the resume point each tick: with
+  // >ABSENT_EXCLUDE_CAP needed cards older than a real absent card, a scan
+  // restarting at 0 every tick would repeatedly discard the same needed
+  // prefix and never reach the absent one (round-29 review: "no absent card
+  // starves" must hold). The scan stays bounded (MAX_ABSENT_SCAN rows) and
+  // wraps to 0 once it sweeps the whole open-unnoted set.
   const wanted = Math.max(budget.remaining, 0);
   const scanPage = 50;
-  let openCards: EscalationRow[] = [];
-  for (
-    let offset = 0;
-    openCards.length < wanted && offset < MAX_ABSENT_SCAN;
-    offset += scanPage
-  ) {
+  const cursorKey = `escalate.absentCursor.${map.repo}`;
+  let offset = journal.getInt(cursorKey);
+  let scanned = 0;
+  let reachedEnd = false;
+  const openCards: EscalationRow[] = [];
+  while (openCards.length < wanted && scanned < MAX_ABSENT_SCAN) {
     const batch = journal.listUnreconciledOpen(map.repo, neededIds, {
       limit: scanPage,
       offset,
     });
+    scanned += batch.length;
     openCards.push(...batch.filter((row) => !neededIds.has(row.nodeId)));
-    if (batch.length < scanPage) break; // exhausted
+    if (batch.length < scanPage) {
+      reachedEnd = true; // swept the whole set — wrap the cursor next tick
+      break;
+    }
+    offset += scanPage;
   }
-  openCards = openCards.slice(0, wanted);
+  journal.setHealth(cursorKey, String(reachedEnd ? 0 : offset));
+  const usable = openCards.slice(0, wanted);
   const clientFor = channelClientFor(client);
-  const outcomes = await mapPool(openCards, 3, async (prior) => {
+  const outcomes = await mapPool(usable, 3, async (prior) => {
     const nodeId = prior.nodeId;
     const content = queueExitContent(nodeId, prior.title, map.repo);
     try {
@@ -1131,7 +1138,6 @@ async function escalateOneMap(
   registry: ReturnType<typeof loadProbeRegistry>,
   now: Date,
   passDeadline: number,
-  frontiers: Record<string, FrontierEntry[]>,
 ): Promise<EscalateMapResult> {
   const base: EscalateMapResult = {
     repo: map.repo,
@@ -1158,10 +1164,9 @@ async function escalateOneMap(
   }
 
   try {
-    const frontier = await graphFrontier(map.repo, map.root, token);
-    // Surface the raw entries so the tick can reuse them for walk (one
-    // frontier fetch per tick, round-28 review).
-    frontiers[map.repo] = frontier.frontier;
+    const frontier = await graphFrontier(map.repo, map.root, token, {
+      timeoutMs: GRAPH_CALL_TIMEOUT_MS,
+    });
 
     const classified = frontier.frontier.map((entry) =>
       classify(entry, map.repo, map.walk, registry),
@@ -1285,20 +1290,19 @@ export async function escalateMaps(
     const passDeadline = Date.now() + MAX_PASS_MS;
     const registry = loadProbeRegistry();
     const maps: EscalateMapResult[] = [];
-    const frontiers: Record<string, FrontierEntry[]> = {};
     for (const map of config.maps) {
-      const result = await escalateOneMap(
-        config,
-        map,
-        journal,
-        registry,
-        now,
-        passDeadline,
-        frontiers,
+      maps.push(
+        await escalateOneMap(
+          config,
+          map,
+          journal,
+          registry,
+          now,
+          passDeadline,
+        ),
       );
-      maps.push(result);
     }
-    return { generatedAt: now.toISOString(), maps, frontiers };
+    return { generatedAt: now.toISOString(), maps };
   });
 }
 

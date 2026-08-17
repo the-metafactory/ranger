@@ -106,6 +106,16 @@ export const escalations = sqliteTable(
    table.status,
    table.createdAt,
   ),
+  // The absent-card reconciliation reads open+unnoted rows ORDERED BY
+  // created_at (oldest first) with a LIMIT — a covering index for the sort,
+  // so historical open cards don't make the per-tick reconciliation scan
+  // sort every matching row (round-29 review).
+  index("escalations_repo_status_noted_created_idx").on(
+   table.repo,
+   table.status,
+   table.notedAt,
+   table.createdAt,
+  ),
  ],
 );
 

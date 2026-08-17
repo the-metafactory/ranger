@@ -47,12 +47,15 @@ the end section makes explicit.
   duplicate in the current channel. RECONCILE-ON-MOVE (round-25/26): when the
   map moves to a channel never visited before, the desk first edits the card
   it is LEAVING to a non-actionable "moved to channel …" note, then posts
-  fresh in the new channel — so exactly ONE card per escalation is active at
-  any time (a move never leaves the old card active-looking). On A→B→A the
+  fresh in the new channel — so at most ONE card per escalation is active in
+  steady state (a move never leaves the old card active-looking; it can never
+  leave TWO). Honest gap: the migration is two remote ops (note-old then
+  post/recover-new), so a crash between them leaves ZERO active cards until
+  the next tick re-runs it. On A→B→A the
   return recovers A's original message AND notes the card left behind in B
   (the same reconcile-on-move rule applies in both directions). So
-  "recovery" is no-duplicate-in-the-current-channel AND one-active-card-per-
-  escalation. A PATCH
+  "recovery" is no-duplicate-in-the-current-channel AND at-most-one-active-
+  card-per-escalation. A PATCH
   that 404s (legacy row or deleted card) reposts fresh. Absent-card
   reconciliation is bounded by a `noted_at` marker (drizzle 0007): a noted
   card drops out of the scan; closing resolved cards (which shrinks the open

@@ -133,10 +133,16 @@ export class EscalationDiscord {
     );
   }
 
-  /** Wait out any client-wide cooldown (a global 429) before sending. */
-  private async waitForCooldown(): Promise<void> {
+  /** Wait out any client-wide cooldown (a global 429) before sending — but
+   *  never past the pass deadline (round-29 review). */
+  private async waitForCooldown(deadline?: number): Promise<void> {
     while (this.cooldownUntil > Date.now()) {
-      await sleep(Math.min(250, this.cooldownUntil - Date.now()));
+      if (deadline !== undefined && Date.now() > deadline) {
+        throw new EscalateError("discord deferred: pass deadline reached");
+      }
+      await sleep(
+        Math.min(250, this.cooldownUntil - Date.now(), deadline === undefined ? Infinity : Math.max(0, deadline - Date.now())),
+      );
     }
     this.cooldownUntil = 0;
   }
@@ -153,9 +159,18 @@ export class EscalationDiscord {
       headers?: Record<string, string>;
       body?: string;
     },
+    deadline?: number,
   ): Promise<Response> {
-    await this.waitForCooldown();
+    await this.waitForCooldown(deadline);
     await this.throttle();
+    // Recheck the pass deadline AFTER the queued cooldown + throttle waits —
+    // a request queued behind a 30s cooldown must not then spend its own 30s
+    // fetch timeout past the pass bound (round-29 review).
+    if (deadline !== undefined && Date.now() > deadline) {
+      throw new EscalateError(
+        `discord ${init.method} ${path} deferred: pass deadline reached`,
+      );
+    }
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 30_000);
     try {
@@ -200,20 +215,26 @@ export class EscalationDiscord {
       }
       let response: Response;
       try {
-        response = await this.fetchOnce(path, {
-          method,
-          headers: { "Content-Type": "application/json" },
-          // parse: [] suppresses untrusted @everyone/@here/role mentions in
-          // graph-derived content; only the principal's id (when configured)
-          // is allowed to ping.
-          body: JSON.stringify({
-            content,
-            allowed_mentions: {
-              parse: [],
-              users: this.principalDiscordId ? [this.principalDiscordId] : [],
-            },
-          }),
-        });
+        response = await this.fetchOnce(
+          path,
+          {
+            method,
+            headers: { "Content-Type": "application/json" },
+            // parse: [] suppresses untrusted @everyone/@here/role mentions in
+            // graph-derived content; only the principal's id (when configured)
+            // is allowed to ping.
+            body: JSON.stringify({
+              content,
+              allowed_mentions: {
+                parse: [],
+                users: this.principalDiscordId
+                  ? [this.principalDiscordId]
+                  : [],
+              },
+            }),
+          },
+          deadline,
+        );
       } catch (error) {
         throw new EscalateError(
           `discord ${method} ${path} failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -255,11 +276,16 @@ export class EscalationDiscord {
       // The per-attempt sleep is CAPPED like the cooldown deadline — a large
       // Retry-After must not hold this attempt (and hence the tick) for the
       // full value; the request resumes, 429s again, and the attempt budget
-      // defers the card (round-27 review).
+      // defers the card. The sleep is also CAPPED at the pass deadline — a
+      // 429 just before expiry must not sleep past the bound (round-29
+      // review).
+      const cappedWait = global
+        ? Math.min(Math.max(waitMs, 30_000), MAX_COOLDOWN_MS)
+        : Math.min(waitMs, 30_000);
       await sleep(
-        global
-          ? Math.min(Math.max(waitMs, 30_000), MAX_COOLDOWN_MS)
-          : Math.min(waitMs, 30_000),
+        deadline === undefined
+          ? cappedWait
+          : Math.min(cappedWait, Math.max(0, deadline - Date.now())),
       );
     }
     throw new EscalateError(
@@ -337,7 +363,7 @@ export class EscalationDiscord {
     const path = `/channels/${this.channelId}/messages/${messageId}`;
     let response: Response;
     try {
-      response = await this.fetchOnce(path, { method: "GET" });
+      response = await this.fetchOnce(path, { method: "GET" }, deadline);
     } catch {
       return true; // transient read failure — do not repost on a guess
     }
@@ -351,7 +377,7 @@ export class EscalationDiscord {
         if (deadline !== undefined && Date.now() > deadline) return true;
         await sleep(500 * (attempt + 1));
         try {
-          response = await this.fetchOnce(path, { method: "GET" });
+          response = await this.fetchOnce(path, { method: "GET" }, deadline);
         } catch {
           return true;
         }
