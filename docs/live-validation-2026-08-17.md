@@ -92,12 +92,15 @@ can observe):
   holding the lock (or the `.reclaiming` marker) is cleaned up on the next
   run. The main lock carries a LEASE renewed by a heartbeat while the run is
   live — a dead/crashed/recycled-pid holder's lease expires (60s) and the
-  lock is reclaimable on the next tick, while a live run's renewed lock is
-  never stolen. The reclaim marker is removed only when its owner is dead or
-  its age proves it a crash artifact; the main lock is deleted only after
-  re-validating its owner is still stale. One residual
-  window remains, disclosed honestly: if a process dies mid-reclaim at the
-  exact instant another run re-creates the marker, a stale-cleanup could
+  lock is reclaimable on the next tick, while a run whose heartbeat is
+  actively renewing is never stolen. Residual windows, disclosed honestly:
+  (1) a run PAUSED >60s (e.g. machine suspend) stops heartbeating, so its
+  lease expires and another run may reclaim it — the resumed holder's nonce
+  fence keeps it from overwriting/unlinking the new owner's lock, but both
+  runs may already have posted cards in that window (a visible, recoverable
+  duplicate — the inherent cost of a lease); (2) if a process dies
+  mid-reclaim at the exact instant another run re-creates the marker, a
+  stale-cleanup could
   unlink a just-created marker and, under a pathological ≥3-contender
   thundering herd, two runs could both reclaim and post one duplicate card
   (visible and deletable in the thread) — the same recoverable class as the

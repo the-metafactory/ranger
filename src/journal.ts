@@ -301,7 +301,12 @@ export class Journal {
      | "lastEditedAt"
      | "status"
      | "notedAt"
-    >
+    > &
+     // A fresh post (moved channel / 404-repost) REBIRTHS the card in its
+     // channel — its age restarts, so the stored createdAt must be replaced,
+     // not preserved (round-22 review: preserving it made a repost revert to
+     // an old age next tick and re-ping as overdue).
+     { replaceCreatedAt?: boolean }
    >,
  ): void {
   const existing = this.getEscalation(row.repo, row.nodeId);
@@ -313,7 +318,10 @@ export class Journal {
    lastContent: row.lastContent ?? existing?.lastContent ?? null,
    channelId: row.channelId ?? existing?.channelId ?? null,
    messageId: row.messageId,
-   createdAt: existing?.createdAt ?? row.createdAt,
+   createdAt:
+    row.replaceCreatedAt
+     ? row.createdAt
+     : existing?.createdAt ?? row.createdAt,
    lastEditedAt: row.lastEditedAt ?? existing?.lastEditedAt ?? null,
    status: row.status ?? existing?.status ?? "open",
    notedAt:

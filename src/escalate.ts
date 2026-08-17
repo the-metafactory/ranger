@@ -755,18 +755,14 @@ async function withEscalateLock<T>(
   const reclaimMarker = `${lockFile}.reclaiming`;
   const started = Date.now();
   const timeoutMs = 60_000;
-  // The lock carries a LEASE: while we hold it, a heartbeat renews
-  // `leaseUntil` every half-lease, so a live run is never stale (no other run
-  // can steal its lock) yet a dead/crashed/recycled-pid holder's lease
-  // expires and the lock becomes safely reclaimable on the next tick.
   const lockStartedAt = Date.now();
   // The lock carries a LEASE and an OWNER NONCE. The lease (renewed by a
-  // heartbeat while we hold the lock) makes a live run never-stale, so only
-  // a dead/crashed/recycled-pid holder is reclaimed. The nonce FENCES the
-  // lease: if our lease ever expires and another run reclaims the lock, our
-  // heartbeat and release re-read the lock and act only when the nonce is
-  // still OURS — a resumed holder can never overwrite or unlink a lock
-  // another run now owns (round-21 blocker).
+  // heartbeat while we hold the lock) makes an actively-running run
+  // never-stale, so only a dead/crashed/recycled-pid holder is reclaimed.
+  // The nonce FENCES the lease: if our lease ever expires and another run
+  // reclaims the lock, our heartbeat and release re-read the lock and act
+  // only when the nonce is still OURS — a resumed holder can never overwrite
+  // or unlink a lock another run now owns (round-21 blocker).
   const ownerNonce = `${process.pid}-${randomUUID()}`;
   const leaseOwner = () =>
     JSON.stringify({
@@ -775,11 +771,14 @@ async function withEscalateLock<T>(
       startedAt: lockStartedAt,
       leaseUntil: Date.now() + LOCK_LEASE_MS,
     });
-  const owner = leaseOwner();
   for (;;) {
-    if (tryAcquireLock(lockFile, owner)) break;
+    // Generate a FRESH owner at each attempt: the loop can wait ~60s under
+    // contention, and a lease computed before the wait would already be
+    // expired when acquisition succeeds — another run could then reclaim our
+    // live lock before the heartbeat ever starts (round-22 blocker).
+    if (tryAcquireLock(lockFile, leaseOwner())) break;
     if (lockOwnerStale(lockFile)) {
-      const outcome = reclaimDeadLock(lockFile, reclaimMarker, owner);
+      const outcome = reclaimDeadLock(lockFile, reclaimMarker, leaseOwner());
       if (outcome === "acquired") break;
       // "busy" / "not-dead" — wait and re-check the lock below.
     }
@@ -894,6 +893,7 @@ async function syncCard(
     lastContent: string;
     createdAt: string;
     lastEditedAt?: string;
+    replaceCreatedAt?: boolean;
   }) => ({
     key,
     repo: map.repo,
@@ -907,23 +907,17 @@ async function syncCard(
     ...(params.lastEditedAt === undefined
       ? {}
       : { lastEditedAt: params.lastEditedAt }),
+    ...(params.replaceCreatedAt === undefined
+      ? {}
+      : { replaceCreatedAt: params.replaceCreatedAt }),
     status: "open" as const,
     // A fresh or re-activated card is never reconciled.
     notedAt: null,
   });
-  /** Charge one Discord-request slot from the tick budget. Returns false when
-   *  the budget is exhausted — the card is deferred (kept open + unsynced)
-   *  and served next tick, rather than holding this pass past the walk
-   *  interval. */
-  const charge = (): boolean => {
-    if (budget.remaining <= 0) return false;
-    budget.remaining -= 1;
-    return true;
-  };
   /** Post a fresh card in the client's channel + record row + destination.
    *  The card's age restarts — it is new in this channel. */
   const postFresh = async (): Promise<SyncOutcome> => {
-    if (!charge()) return { action: "deferred", id: node.id };
+    if (!charge(budget)) return { action: "deferred", id: node.id };
     // Render age-0 content INSIDE the post: a reposted card (destination
     // moved or the old message gone) must start fresh — posting content that
     // still shows the old age/ping, then editing it back to 0d on the next
@@ -940,6 +934,10 @@ async function syncCard(
       messageId,
       lastContent: freshContent,
       createdAt: now.toISOString(),
+      // The card is born (or reborn) in this channel now — REPLACE the
+      // stored age so a moved/404-reposted card doesn't revert to an old
+      // age next tick and re-ping as overdue (round-22 review).
+      replaceCreatedAt: true,
     });
     journal.upsertEscalation(row);
     journal.setEscalationDestination(
@@ -961,7 +959,7 @@ async function syncCard(
     editContent: string,
     createdAt: string,
   ): Promise<SyncOutcome> => {
-    if (!charge()) return { action: "deferred", id: node.id };
+    if (!charge(budget)) return { action: "deferred", id: node.id };
     try {
       await client.edit(messageId, editContent);
     } catch (cardError) {
@@ -1038,10 +1036,11 @@ async function markAbsentCards(
     journal: Journal;
     map: RangerMapConfig;
     now: Date;
+    budget: CardBudget;
   },
   neededIds: ReadonlySet<string>,
-): Promise<{ keptOpen: string[]; errors: string[] }> {
-  const { client, journal, map, now } = ctx;
+): Promise<{ keptOpen: string[]; deferred: string[]; errors: string[] }> {
+  const { client, journal, map, now, budget } = ctx;
   // Reconcile ONLY open, un-noted cards ABSENT from the current frontier — a
   // no-op tick never loads (or skips) the active cards (round-19 review), and
   // a noted card drops out entirely. Closing resolved cards (which shrinks
@@ -1072,14 +1071,23 @@ async function markAbsentCards(
       // review). Legacy rows (pre-0006, no destination rows) fall back to the
       // row's own channel/message when known.
       const stored = journal.getEscalationDestinations(`${map.repo}:${nodeId}`);
-      const destinations =
-        stored.length > 0
-          ? stored
-          : prior.channelId === null
-            ? []
-            : [{ channelId: prior.channelId, messageId: prior.messageId }];
+      let destinations: { channelId: string; messageId: string }[];
+      if (stored.length > 0) {
+        destinations = stored;
+      } else if (prior.channelId === null) {
+        destinations = [];
+      } else {
+        destinations = [
+          { channelId: prior.channelId, messageId: prior.messageId },
+        ];
+      }
       let anyEdit = false;
       for (const dest of destinations) {
+        // The reconciliation shares the SAME per-tick request budget as the
+        // active pass — a mass queue exit can't blow the 50-request bound
+        // and starve the tick (round-22 review). A deferred card keeps its
+        // notedAt null and is re-reconciled next tick.
+        if (!charge(budget)) return { action: "deferred", id: nodeId };
         try {
           await clientFor(dest.channelId).edit(dest.messageId, content);
           anyEdit = true;
@@ -1121,15 +1129,29 @@ async function markAbsentCards(
     }
   });
   const keptOpen: string[] = [];
+  const deferred: string[] = [];
   const errors: string[] = [];
   for (const outcome of outcomes) {
     if (outcome.action === "error") {
       errors.push(`#${outcome.id}: ${outcome.error}`);
+    } else if (outcome.action === "deferred") {
+      deferred.push(outcome.id);
     } else if (outcome.action === "keptOpen") {
       keptOpen.push(outcome.id);
     }
   }
-  return { keptOpen, errors };
+  return { keptOpen, deferred, errors };
+}
+
+/** Charge one Discord-request slot from the shared tick budget. Returns false
+ *  when the budget is exhausted — the caller defers (the card stays open and
+ *  unsynced) and serves it next tick, rather than holding this pass past the
+ *  walk interval. Shared by the active-card pass and the absent-card
+ *  reconciliation so the per-tick request bound is one budget across both. */
+function charge(budget: CardBudget): boolean {
+  if (budget.remaining <= 0) return false;
+  budget.remaining -= 1;
+  return true;
 }
 
 /** The deterministic queue-exit note — one source of truth for card content. */
@@ -1301,10 +1323,11 @@ async function escalateOneMap(
 
     const neededIds = new Set(needed.map((n) => n.id));
     const absent = await markAbsentCards(
-      { client, journal, map, now },
+      { client, journal, map, now, budget },
       neededIds,
     );
     base.keptOpen.push(...absent.keptOpen);
+    base.deferred.push(...absent.deferred);
     base.cardErrors.push(...absent.errors);
 
     return { ...base, cards };
