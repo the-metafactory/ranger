@@ -430,7 +430,7 @@ function cardFraming(node: ClassifiedNode, map: { repo: string }): {
     // Every graph-derived interpolation is mention-inerted (a graph author
     // can set kind/autonomy/title/url to `<@principal-id>`), and the title
     // is capped so a giant title can't evict the decision body or the suffix.
-    `${cardHead(node)} — **#${node.id}** ${truncate(sanitizeGraphText(node.title), 200)}`,
+    `${cardHead(node)} — **#${sanitizeGraphText(node.id)}** ${truncate(sanitizeGraphText(node.title), 200)}`,
     `map: ${map.repo} · ${sanitizeGraphText(node.kind)} · ${sanitizeGraphText(node.autonomy)}`,
     `url: ${sanitizeGraphText(node.url)}`,
     node.checkpointId !== undefined && node.checkpointId.length > 0
@@ -854,6 +854,11 @@ function startHeartbeat(
  * Stop the heartbeat and release the lock — but only OUR lock: if the nonce
  * changed (we were reclaimed), leave the new owner's lock alone (unlinking it
  * would let a third run in), and surface the lost-ownership reclaim loudly.
+ * The `.reclaiming` marker is deliberately NOT touched here: it is owned by
+ * reclaimDeadLock (removed in its own finally), and a resumed holder must
+ * never unlink a marker a NEW reclaimer currently holds — doing so would let
+ * a third run in and deserialize the desk (round-25 review). A crashed
+ * reclaimer's marker is cleaned by the next run's stale-marker reclaim.
  */
 function releaseLease(
   lease: Lease,
@@ -872,7 +877,6 @@ function releaseLease(
       /* unreadable — nothing to release */
     }
     if (ours) rmSync(lease.lockFile, { force: true });
-    rmSync(lease.reclaimMarker, { force: true });
   } catch {
     /* best-effort release */
   }
@@ -927,6 +931,7 @@ interface CardBudget {
 async function syncCard(
   ctx: {
     client: EscalationDiscord;
+    clientFor: (channelId: string) => EscalationDiscord;
     journal: Journal;
     map: RangerMapConfig;
     config: RangerConfig;
@@ -936,7 +941,7 @@ async function syncCard(
   node: ClassifiedNode,
   prior: EscalationRow | undefined,
 ): Promise<SyncOutcome> {
-  const { client, journal, map, config, now, budget } = ctx;
+  const { client, clientFor, journal, map, config, now, budget } = ctx;
   const ageDays = prior === undefined ? 0 : dayDiff(prior.createdAt, now);
   const content = cardContent(
     node,
@@ -1039,7 +1044,36 @@ async function syncCard(
    *  the CURRENT channel if one exists (edit in place, age kept — it is the
    *  same card), else post fresh — never a duplicate while a channel is
    *  re-visited (destination recovery, round-14/15). */
+  /** Edit the card we're LEAVING (in the prior channel) to a "moved" note —
+   *  one active card per escalation: a channel move must not leave the old
+   *  card active-looking (round-25 review, resolves the round-23 stale-B
+   *  gap). A 404 (already gone) is fine; a deferral aborts the move so we
+   *  never create a second active card without retiring the first. */
+  const noteMoved = async (
+   priorChannelId: string | null,
+   priorMessageId: string,
+  ): Promise<"noted" | SyncOutcome> => {
+   // The caller only routes here when prior.channelId is a real, different
+   // channel, but TS can't carry that narrowing through — a null is a
+   // legacy row with no channel to note (nothing to do).
+   if (priorChannelId === null) return "noted";
+   if (!charge(budget)) return { action: "deferred", id: node.id };
+   try {
+    await clientFor(priorChannelId).edit(
+     priorMessageId,
+     movedCardNote(node.id, node.title, client.channel),
+    );
+    return "noted";
+   } catch (cardError) {
+    if (cardError instanceof DiscordMessageGoneError) {
+     return "noted"; // already gone — nothing to note
+    }
+    throw cardError;
+   }
+  };
   const syncMovedCard = async (prior: EscalationRow): Promise<SyncOutcome> => {
+   const noted = await noteMoved(prior.channelId, prior.messageId);
+   if (noted !== "noted") return noted;
    const recoveredId = journal.getEscalationDestination(key, client.channel);
    if (recoveredId !== null) {
     return editInPlace(recoveredId, content, prior.createdAt);
@@ -1214,6 +1248,18 @@ function charge(budget: CardBudget): boolean {
   return true;
 }
 
+/** The deterministic "card moved channels" note — one source of truth for
+ *  the reconciliation a channel move leaves behind (round-25 review). */
+function movedCardNote(
+  nodeId: string,
+  title: string | null,
+  channelId: string,
+): string {
+  // Mention-inert (a graph id/title can't ping), non-actionable: the active
+  // card lives in the current channel.
+  return `~~**#${sanitizeGraphText(nodeId)}** ${sanitizeGraphText(title ?? "")}~~ moved to channel ${channelId} — the active card is in the new channel`;
+}
+
 /** The deterministic queue-exit note — one source of truth for card content. */
 function queueExitContent(
   nodeId: string,
@@ -1221,7 +1267,7 @@ function queueExitContent(
   repo: string,
 ): string {
   return [
-    `~~**#${nodeId}** ${sanitizeGraphText(title ?? "")}~~ no longer on the HITL/provisioning queue`,
+    `~~**#${sanitizeGraphText(nodeId)}** ${sanitizeGraphText(title ?? "")}~~ no longer on the HITL/provisioning queue`,
     `map: ${repo} — card kept open; resolves on a principal response or operator verb`,
   ]
     .filter((l) => l.trim().length > 0)
@@ -1259,7 +1305,7 @@ function cardFrom(
 ): EscalationCard {
   return {
     nodeId: row.nodeId,
-    title: row.title ?? `#${row.nodeId}`,
+    title: row.title ?? `#${sanitizeGraphText(row.nodeId)}`,
     kind: node.kind,
     autonomy: node.autonomy,
     url: node.url,
@@ -1341,7 +1387,13 @@ async function escalateOneMap(
     // Bound the pass so a large frontier can't hold this tick past the walk
     // interval. TWO bounds work together (rounds 21–24):
     //  1. A REQUEST budget charged only when syncCard actually POSTs/EDITs
-    //     (unchanged no-op cards are free) — caps real Discord writes at 50.
+    //     (unchanged no-op cards are free) — caps logical card operations at
+    //     50. NOTE: the budget counts one POST/PATCH per card op, not raw
+    //     HTTP calls — a rate-limited op retries per the client's own 429
+    //     policy (each PATCH/POST can make up to 4 fetchOnce calls), so under
+    //     heavy rate-limiting the wall time per op grows and a tick may not
+    //     finish its 50 ops before the next one — the desk converges over
+    //     ticks (round-25 review).
     //  2. A PAGE of candidate nodes evaluated this tick, swept through the
     //     frontier via a persisted cursor — caps the SQL lookup (SQLite bind
     //     limit) and the render+decision walk, and nothing starves: the
@@ -1384,9 +1436,24 @@ async function escalateOneMap(
       .concat(page.filter((n) => existing.has(n.id)));
 
     const cards: EscalationCard[] = [];
+    // One throttled client per channel, shared by the active pass (a moved
+    // card's "left the channel" note goes to the prior channel) — edits to
+    // other channels share a limiter instead of each card building its own
+    // and bursting the rate-limit bucket.
+    const clients = new Map<string, EscalationDiscord>([
+      [client.channel, client],
+    ]);
+    const clientFor = (channelId: string): EscalationDiscord => {
+      let c = clients.get(channelId);
+      if (c === undefined) {
+        c = client.forChannel(channelId);
+        clients.set(channelId, c);
+      }
+      return c;
+    };
     const outcomes = await mapPool(pageOrder, 3, (node) =>
       syncCard(
-        { client, journal, map, config, now, budget },
+        { client, clientFor, journal, map, config, now, budget },
         node,
         existing.get(node.id),
       ),
@@ -1522,7 +1589,7 @@ function digestContent(inputs: DigestInputs): string {
   ];
   if (audit.openClaimed.length > 0) {
     for (const c of audit.openClaimed.slice(0, 8)) {
-      auditLines.push(`    #${c.id} [${c.assignees.join(", ")}]`);
+      auditLines.push(`    #${sanitizeGraphText(c.id)} [${c.assignees.join(", ")}]`);
     }
     if (audit.openClaimed.length > 8) {
       auditLines.push(
@@ -1549,7 +1616,7 @@ function digestContent(inputs: DigestInputs): string {
     for (const card of cards) {
       if (shown >= 15) break; // hard cap on per-message card count
       const band = ageBand(card.ageDays);
-      const line = `  #${card.nodeId} ${sanitizeGraphText(card.title)} — ${card.route} · ${ageText(
+      const line = `  #${sanitizeGraphText(card.nodeId)} ${sanitizeGraphText(card.title)} — ${card.route} · ${ageText(
         band,
         card.ageDays,
         principal,
@@ -1628,7 +1695,7 @@ async function digestOneMap(
     });
     const open = openCards.rows.map((row) => ({
       nodeId: row.nodeId,
-      title: row.title ?? `#${row.nodeId}`,
+      title: row.title ?? `#${sanitizeGraphText(row.nodeId)}`,
       route: row.route ?? "escalate-hitl",
       ageDays: dayDiff(row.createdAt, now),
       messageId: row.messageId,

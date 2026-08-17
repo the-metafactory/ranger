@@ -750,6 +750,66 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
     }
   });
 
+  test("a node whose ID embeds a mention cannot ping the principal early (round-25 blocker)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ranger-escalate-id-"));
+    const fixtureDir = mkdtempSync(join(tmpdir(), "ranger-escalate-id-fx-"));
+    const discord = fakeDiscord();
+    try {
+      // A graph author sets ref.id to the principal's mention: rendered raw it
+      // would ping BEFORE day 7 (allowed_mentions always permits the
+      // principal id) — the blocker is that node.id must be mention-inerted
+      // at every render site (head line, queue-exit note, digest lines).
+      const node = {
+        ref: { id: "<@1234567890>" },
+        node: {
+          id: "<@1234567890>",
+          title: "Sneaky id",
+          kind: "task",
+          checkpointId: "id-done",
+          autonomy: "propose",
+          probes: [],
+        },
+        status: "open",
+        assignees: [],
+        blockedBy: [],
+        author: "alice",
+        url: "https://github.com/acme/widgets/issues/1",
+        typed: true,
+        parent: { id: "1" },
+      };
+      writeFileSync(
+        join(fixtureDir, "acme__widgets-frontier.json"),
+        JSON.stringify({ repo: "acme/widgets", root: "1", frontier: [node] }),
+      );
+      writeFileSync(
+        join(fixtureDir, "acme__widgets-audit.json"),
+        JSON.stringify({
+          repo: "acme/widgets",
+          root: "1",
+          nodes: 1,
+          closedWithoutReceipt: [],
+          openWithoutCheckpoint: [],
+          openClaimed: [],
+        }),
+      );
+      const config = writeConfig(dir, "999"); // pings are possible
+      const env = envFor(fixtureDir, discord.port);
+      const run = await runCli(["escalate", "-c", config, "--json"], env);
+      expect(run.code).toBe(0);
+      const content = discord.posts.at(-1)?.content ?? "";
+      // The raw mention must not reach Discord (no early ping); the inerted
+      // form appears instead, and the LEGITIMATE 7-day ping id is NOT present
+      // (age 0).
+      expect(content).not.toContain("<@1234567890>");
+      expect(content).toContain("‹@1234567890");
+      expect(content).not.toContain("<@999>");
+    } finally {
+      discord.stop();
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(fixtureDir, { recursive: true, force: true });
+    }
+  });
+
   test("a map whose Discord channel moves reposts cards in the new channel (destination persisted)", async () => {
     const dir = mkdtempSync(join(tmpdir(), "ranger-escalate-move-"));
     const fixtureDir = mkdtempSync(join(tmpdir(), "ranger-escalate-move-fx-"));
@@ -784,6 +844,12 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
       const report2 = JSON.parse(run2.stdout);
       expect(report2.maps[0].posted).toHaveLength(4); // reposted, new channel
       expect(report2.maps[0].edited).toEqual([]);
+      // Reconcile-on-move (round-25): the OLD channel's cards are edited to
+      // a "moved to channel …" note — one active card per escalation.
+      expect(discord.edits).toHaveLength(4);
+      for (const e of discord.edits) {
+        expect(e.content).toContain("moved to channel 9999999999");
+      }
       const j = new Journal(join(dir, "state.sqlite"));
       for (const id of ["11", "12", "13", "14"]) {
         expect(j.getEscalation("acme/widgets", id)?.channelId).toBe(
@@ -834,12 +900,24 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
       const postsAfterB = discord.posts.length; // 8
 
       // Move back to A: the ORIGINAL messages are recovered — edited, NOT
-      // reposted (no duplicate card in A).
+      // reposted (no duplicate card in A) — and the cards left behind in B
+      // are noted "moved to channel 1234567890" (reconcile-on-move,
+      // round-25: one active card per escalation).
+      const editsBeforeR3 = discord.edits.length; // 4 moved-notes from r2
       const r3 = await cardsAt("1234567890");
       const report3 = JSON.parse(r3.stdout);
       expect(report3.maps[0].posted).toHaveLength(0); // no new posts
       expect(discord.posts.length).toBe(postsAfterB); // 8, unchanged
       expect(report3.maps[0].edited).toHaveLength(4); // recovered + edited
+      // r3 added: 4 B-cards noted "moved to channel 1234567890" + 4 A
+      // recoveries — the B cards are no longer stale-active (round-23).
+      // (Edits interleave under mapPool concurrency, so filter by content.)
+      const r3Edits = discord.edits.slice(editsBeforeR3);
+      expect(r3Edits).toHaveLength(8);
+      const r3MovedNotes = r3Edits.filter((e) =>
+        e.content.includes("moved to channel 1234567890"),
+      );
+      expect(r3MovedNotes).toHaveLength(4);
       const j = new Journal(join(dir, "state.sqlite"));
       const backMessageIds = j
         .listEscalations("acme/widgets")

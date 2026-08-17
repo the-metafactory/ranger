@@ -140,6 +140,8 @@ One worker = one node = one headless session (doctrine; research excepted).
 
 Cards are announce-once, edited not reposted, re-surfaced in a daily digest with age. **Digest: daily**, one per map thread — aged open cards (with age), audit findings (receipt-less closes, stale claims), and budget/spend state; morning Europe/Zurich; absence of the digest is the outer dead-man signal. **Re-surface: age-banded** — age shown from day 1; 3+ days get a louder summary + blocked-descendant count; 7+ days get an @-mention escalation. Silence never un-surfaces. **Meanwhile, nothing blocks:** escalated nodes stay unclaimed; `blocked-by` edges keep dependent work off the frontier automatically; every independent branch keeps walking. The frontier predicate is the scheduler.
 
+**Channel migration (amended round-25).** A card's message id is tracked per destination channel (`escalation_destinations`), and the card's age is its *first-appearance* timestamp (immutable across moves — a move never erases 3/7-day escalation state). When the map's Discord channel moves, the desk posts a fresh card in the new channel, first editing the card it is LEAVING to a non-actionable "moved to channel …" note — so exactly ONE card per escalation is active at any time (an edit can't cross channels; the note retires the prior destination before the replacement posts). Returning to a former channel recovers that channel's original message (edit in place, no duplicate) and notes the card it is leaving. This is reconcile-on-move; the multi-destination write-side lifecycle that *closes* resolved cards remains node #21.
+
 **Ratifier pinning:** the 👍 ratifying a `--proposal-comment` is pinned to the principal's identity (GitHub `jcfischer` / Discord user 285727653603049472), verified by reaction authorship — never any non-proposer's 👍. **Veto durability:** a veto is recorded as a comment on the node (additive, non-gating, provenance-bearing) *and* cached in the journal. On journal loss, ranger re-reads its own veto comments before any claim. A human's NO never lives only in a disposable store.
 
 ---
@@ -189,7 +191,16 @@ Everything parked or vetoed is terminal until an operator verb. Silence never un
 - Review-consuming lane: **1** (implement workers may overlap in their build stage and queue at the review gate).
 - Research lane: **N** (default 2–3).
 - Merge/close: serialized (the decisions span has no CAS).
-- Escalations: unbounded, non-blocking.
+- Escalations: non-blocking, and BOUNDED per tick — the desk processes at
+  most `MAX_CARDS_PER_TICK` card operations (posts+edits) per map per tick,
+  evaluated against a bounded page of frontier nodes swept via a persisted
+  cursor. The escalation lane therefore NEVER blocks the walk lane (a huge
+  frontier can't hold the tick past the walk interval): it converges over
+  ticks, deferring the remainder. Deferred cards stay open and are served on
+  a later tick — nothing is dropped, only delayed. (Amendment: §8 originally
+  said "unbounded" — the per-tick bound is an operational guarantee that
+  escalation never starves walking, and is the model the desk implements,
+  round-25 review.)
 - When #2517 lands, the lane cap is a config integer, not a redesign.
 
 Claim-level safety against the principal's concurrent interactive sessions is inherited from the verb (post-write re-read + deterministic tie-break), not built.
