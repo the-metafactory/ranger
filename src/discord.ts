@@ -172,7 +172,14 @@ export class EscalationDiscord {
       );
     }
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 30_000);
+    // The abort timeout is the smaller of 30s and the remaining deadline — a
+    // request begun just before the pass cutoff must not spend a full 30s
+    // fetch timeout past the bound (round-30 review).
+    const abortMs =
+      deadline === undefined
+        ? 30_000
+        : Math.max(1, Math.min(30_000, deadline - Date.now()));
+    const timer = setTimeout(() => controller.abort(), abortMs);
     try {
       return await fetch(`${this.apiBase}${path}`, {
         method: init.method,

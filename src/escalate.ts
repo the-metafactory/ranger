@@ -731,22 +731,14 @@ async function syncCard(
   /** Post a fresh card in the client's channel + record row + destination. */
   const postFresh = async (): Promise<SyncOutcome> => {
     if (!charge(budget)) return { action: "deferred", id: node.id };
-    // A reposted card (moved channel / message gone) is the SAME unresolved
-    // escalation, re-surfaced WITH ITS AGE (design §5 "edited not reposted,
-    // re-surfaced with age") — a channel move must not erase a card's
-    // 3/7-day escalation state (round-23 review). New cards (prior undefined)
-    // render age 0.
-    const freshContent = cardContent(
-      node,
-      map,
-      ageDays,
-      config.principal.login,
-      config.principal.discordId,
-    );
-    const messageId = await client.post(freshContent, budget.deadline);
+    // The posted content is the SAME `content` the edit path would use — one
+    // render source, no drift (round-30 suggestion). A reposted card (moved
+    // channel / message gone) is the SAME unresolved escalation, re-surfaced
+    // WITH ITS AGE (design §5); new cards (prior undefined) render age 0.
+    const messageId = await client.post(content, budget.deadline);
     const row = escalationRow({
       messageId,
-      lastContent: freshContent,
+      lastContent: content,
       // Immutable first-appearance timestamp: the card's age is its age
       // since it first appeared, preserved across reposts. The per-destination
       // created_at (escalation_destinations) tracks each channel visit for
@@ -878,117 +870,16 @@ async function markAbsentCards(
   // Reconcile ONLY open, un-noted cards ABSENT from the current frontier — a
   // no-op tick never loads (or skips) the active cards (round-19 review), and
   // a noted card drops out entirely. Closing resolved cards (which shrinks
-  // the open set) is the write-side resolution lifecycle (node #21).
-  // Cap the LOAD to the remaining request budget (oldest exits first): each
-  // card needs ≥1 destination edit, so loading more than the budget could
-  // never be fully processed this tick — and a large drain must not walk
-  // every unnoted card after the budget is spent (round-23 review). The SQL
-  // NOT IN exclusion is capped too (bind limit); JS-filtering against the
-  // FULL needed set here preserves correctness at any frontier size — a
-  // needed card that slipped past the truncated exclusion is never treated
-  // as absent (round-26 review).
-  // Collect up to budget.remaining USABLE (non-needed) open cards, scanning
-  // past needed rows that slipped past the capped SQL exclusion via offset
-  // pagination. A PERSISTED cursor advances the resume point each tick: with
-  // >ABSENT_EXCLUDE_CAP needed cards older than a real absent card, a scan
-  // restarting at 0 every tick would repeatedly discard the same needed
-  // prefix and never reach the absent one (round-29 review: "no absent card
-  // starves" must hold). The scan stays bounded (MAX_ABSENT_SCAN rows) and
-  // wraps to 0 once it sweeps the whole open-unnoted set.
-  const wanted = Math.max(budget.remaining, 0);
-  const scanPage = 50;
-  const cursorKey = `escalate.absentCursor.${map.repo}`;
-  let offset = journal.getInt(cursorKey);
-  let scanned = 0;
-  let reachedEnd = false;
-  const openCards: EscalationRow[] = [];
-  while (openCards.length < wanted && scanned < MAX_ABSENT_SCAN) {
-    const batch = journal.listUnreconciledOpen(map.repo, neededIds, {
-      limit: scanPage,
-      offset,
-    });
-    scanned += batch.length;
-    openCards.push(...batch.filter((row) => !neededIds.has(row.nodeId)));
-    if (batch.length < scanPage) {
-      reachedEnd = true; // swept the whole set — wrap the cursor next tick
-      break;
-    }
-    offset += scanPage;
-  }
-  journal.setHealth(cursorKey, String(reachedEnd ? 0 : offset));
-  const usable = openCards.slice(0, wanted);
+  // the open set) is the write-side resolution lifecycle (node #21). The
+  // candidate selection (bounded + cursor-swept past needed rows) is
+  // `selectAbsentCards`; the per-card destination reconciliation is
+  // `reconcileAbsentCard`.
+  const usable = selectAbsentCards(journal, map.repo, neededIds, budget);
   const clientFor = channelClientFor(client);
-  const outcomes = await mapPool(usable, 3, async (prior) => {
-    const nodeId = prior.nodeId;
-    const content = queueExitContent(nodeId, prior.title, map.repo);
-    try {
-      // Reconcile EVERY destination's card: a card that moved channels still
-      // holds a live, actionable message in each visited channel — write the
-      // queue-exit note to all of them so none stays active-looking (round-19
-      // review). Legacy rows (pre-0006, no destination rows) fall back to the
-      // row's own channel/message when known.
-      const stored = journal.getEscalationDestinations(`${map.repo}:${nodeId}`);
-      let destinations: { channelId: string; messageId: string }[];
-      if (stored.length > 0) {
-        destinations = stored;
-      } else if (prior.channelId === null) {
-        destinations = [];
-      } else {
-        destinations = [
-          { channelId: prior.channelId, messageId: prior.messageId },
-        ];
-      }
-      let anyEdit = false;
-      for (const dest of destinations) {
-        // The reconciliation shares the SAME per-tick request budget as the
-        // active pass — a mass queue exit can't blow the 50-request bound
-        // and starve the tick (round-22 review). A deferred card keeps its
-        // notedAt null and is re-reconciled next tick.
-        if (!charge(budget)) return { action: "deferred", id: nodeId };
-        try {
-          await clientFor(dest.channelId).edit(
-            dest.messageId,
-            content,
-            budget.deadline,
-          );
-          anyEdit = true;
-        } catch (destError) {
-          if (!(destError instanceof DiscordMessageGoneError)) throw destError;
-          // this destination's card is already gone — nothing to note there
-        }
-      }
-      // Set notedAt only after every destination reconciled (or a definitive
-      // 404 each); a transient failure throws → retried next tick.
-      journal.upsertEscalation({
-        key: `${map.repo}:${nodeId}`,
-        repo: map.repo,
-        nodeId,
-        title: prior.title,
-        lastContent: content,
-        messageId: prior.messageId,
-        channelId: prior.channelId,
-        createdAt: prior.createdAt,
-        lastEditedAt: now.toISOString(),
-        status: prior.status, // stays open — cards persist (design §5)
-        notedAt: now.toISOString(),
-      });
-      return {
-        action: (anyEdit ? "keptOpen" : "unchanged") as
-          | "keptOpen"
-          | "unchanged",
-        id: nodeId,
-      };
-    } catch (cardError) {
-      // A transient failure on one card must not fail the desk — it retries
-      // next tick and the card stays open.
-      return {
-        action: "error" as const,
-        id: nodeId,
-        error:
-          cardError instanceof Error ? cardError.message : String(cardError),
-      };
-    }
-  });
+  const reconcileCtx = { clientFor, journal, map, now, budget };
+  const outcomes = await mapPool(usable, 3, (prior) =>
+    reconcileAbsentCard(reconcileCtx, prior),
+  );
   const keptOpen: string[] = [];
   const deferred: string[] = [];
   const errors: string[] = [];
@@ -1002,6 +893,143 @@ async function markAbsentCards(
     }
   }
   return { keptOpen, deferred, errors };
+}
+
+/**
+ * Select up to budget.remaining USABLE (non-needed) open cards for absent-
+ * card reconciliation. Cap the LOAD to the remaining request budget (oldest
+ * exits first): each card needs ≥1 destination edit, so loading more than the
+ * budget could never be fully processed this tick — and a large drain must
+ * not walk every unnoted card after the budget is spent. The SQL NOT IN
+ * exclusion is capped too (bind limit); JS-filtering against the FULL needed
+ * set here preserves correctness at any frontier size — a needed card that
+ * slipped past the truncated exclusion is never treated as absent. A PERSISTED
+ * cursor advances the resume point each tick: with >ABSENT_EXCLUDE_CAP needed
+ * cards older than a real absent card, a scan restarting at 0 every tick
+ * would repeatedly discard the same needed prefix and never reach the absent
+ * one (round-29: "no absent card starves" must hold). The scan stays bounded
+ * (MAX_ABSENT_SCAN rows) and wraps to 0 once it sweeps the whole set.
+ */
+function selectAbsentCards(
+  journal: Journal,
+  repo: string,
+  neededIds: ReadonlySet<string>,
+  budget: CardBudget,
+): EscalationRow[] {
+  const wanted = Math.max(budget.remaining, 0);
+  const scanPage = 50;
+  const cursorKey = `escalate.absentCursor.${repo}`;
+  let offset = journal.getInt(cursorKey);
+  let scanned = 0;
+  let reachedEnd = false;
+  const openCards: EscalationRow[] = [];
+  while (openCards.length < wanted && scanned < MAX_ABSENT_SCAN) {
+    const batch = journal.listUnreconciledOpen(repo, neededIds, {
+      limit: scanPage,
+      offset,
+    });
+    scanned += batch.length;
+    openCards.push(...batch.filter((row) => !neededIds.has(row.nodeId)));
+    if (batch.length < scanPage) {
+      reachedEnd = true; // swept the whole set — wrap the cursor next tick
+      break;
+    }
+    offset += scanPage;
+  }
+  journal.setHealth(cursorKey, String(reachedEnd ? 0 : offset));
+  return openCards.slice(0, wanted);
+}
+
+type AbsentOutcome =
+  | { action: "keptOpen" | "unchanged"; id: string }
+  | { action: "deferred"; id: string }
+  | { action: "error"; id: string; error: string };
+
+/**
+ * Reconcile ONE absent card: write the queue-exit note to EVERY destination's
+ * card (a card that moved channels still holds a live message in each visited
+ * channel — none may stay active-looking), then set notedAt. Shares the same
+ * per-tick request budget as the active pass (a mass queue exit can't blow
+ * the bound); a deferred card keeps notedAt null and is re-reconciled next
+ * tick; a transient failure is returned (never thrown) so one card can't fail
+ * the desk.
+ */
+async function reconcileAbsentCard(
+  ctx: {
+    clientFor: (channelId: string) => EscalationDiscord;
+    journal: Journal;
+    map: RangerMapConfig;
+    now: Date;
+    budget: CardBudget;
+  },
+  prior: EscalationRow,
+): Promise<AbsentOutcome> {
+  const { clientFor, journal, map, now, budget } = ctx;
+  const nodeId = prior.nodeId;
+  const content = queueExitContent(nodeId, prior.title, map.repo);
+  try {
+    // Reconcile EVERY destination's card: a card that moved channels still
+    // holds a live, actionable message in each visited channel — write the
+    // queue-exit note to all of them so none stays active-looking (round-19
+    // review). Legacy rows (pre-0006, no destination rows) fall back to the
+    // row's own channel/message when known.
+    const stored = journal.getEscalationDestinations(`${map.repo}:${nodeId}`);
+    let destinations: { channelId: string; messageId: string }[];
+    if (stored.length > 0) {
+      destinations = stored;
+    } else if (prior.channelId === null) {
+      destinations = [];
+    } else {
+      destinations = [
+        { channelId: prior.channelId, messageId: prior.messageId },
+      ];
+    }
+    let anyEdit = false;
+    for (const dest of destinations) {
+      if (!charge(budget)) return { action: "deferred", id: nodeId };
+      try {
+        await clientFor(dest.channelId).edit(
+          dest.messageId,
+          content,
+          budget.deadline,
+        );
+        anyEdit = true;
+      } catch (destError) {
+        if (!(destError instanceof DiscordMessageGoneError)) throw destError;
+        // this destination's card is already gone — nothing to note there
+      }
+    }
+    // Set notedAt only after every destination reconciled (or a definitive
+    // 404 each); a transient failure throws → retried next tick.
+    journal.upsertEscalation({
+      key: `${map.repo}:${nodeId}`,
+      repo: map.repo,
+      nodeId,
+      title: prior.title,
+      lastContent: content,
+      messageId: prior.messageId,
+      channelId: prior.channelId,
+      createdAt: prior.createdAt,
+      lastEditedAt: now.toISOString(),
+      status: prior.status, // stays open — cards persist (design §5)
+      notedAt: now.toISOString(),
+    });
+    return {
+      action: (anyEdit ? "keptOpen" : "unchanged") as
+        | "keptOpen"
+        | "unchanged",
+      id: nodeId,
+    };
+  } catch (cardError) {
+    // A transient failure on one card must not fail the desk — it retries
+    // next tick and the card stays open.
+    return {
+      action: "error" as const,
+      id: nodeId,
+      error:
+        cardError instanceof Error ? cardError.message : String(cardError),
+    };
+  }
 }
 
 /** One throttled client per channel, shared by a pass — edits to OTHER
@@ -1044,9 +1072,11 @@ function movedCardNote(
   title: string | null,
   channelId: string,
 ): string {
-  // Mention-inert (a graph id/title can't ping), non-actionable: the active
-  // card lives in the current channel.
-  return `~~**#${sanitizeGraphText(nodeId)}** ${sanitizeGraphText(title ?? "")}~~ moved to channel ${channelId} — the active card is in the new channel`;
+  // Mention-inert (a graph id/title can't ping), non-actionable, and title-
+  // CAPPED: a graph title over Discord's 2000-char message limit would fail
+  // the PATCH and leave the old card active-looking — the note must always
+  // fit (round-30 review).
+  return `~~**#${sanitizeGraphText(nodeId)}** ${truncate(sanitizeGraphText(title ?? ""), 200)}~~ moved to channel ${channelId} — the active card is in the new channel`;
 }
 
 /** The deterministic queue-exit note — one source of truth for card content. */
@@ -1055,8 +1085,11 @@ function queueExitContent(
   title: string | null,
   repo: string,
 ): string {
+  // Title is CAPPED (like movedCardNote): a graph title over Discord's
+  // 2000-char limit would fail the PATCH and leave the card actionable
+  // (round-30 review).
   return [
-    `~~**#${sanitizeGraphText(nodeId)}** ${sanitizeGraphText(title ?? "")}~~ no longer on the HITL/provisioning queue`,
+    `~~**#${sanitizeGraphText(nodeId)}** ${truncate(sanitizeGraphText(title ?? ""), 200)}~~ no longer on the HITL/provisioning queue`,
     `map: ${repo} — card kept open; resolves on a principal response or operator verb`,
   ]
     .filter((l) => l.trim().length > 0)
@@ -1150,6 +1183,15 @@ async function escalateOneMap(
     cardErrors: [],
     cards: [],
   };
+
+  // Pre-map deadline gate: if the tick-wide pass deadline has already passed
+  // (a prior map consumed it), skip this map's graph calls entirely — its
+  // cards are served next tick. This keeps the per-map overhead bounded so
+  // the end-to-end pass can't drift unboundedly past the deadline (round-30
+  // review: the 120s bound is not just the budget's charge gate).
+  if (Date.now() > passDeadline) {
+    return { ...base, ok: false, error: "pass deadline reached before this map" };
+  }
 
   let token: ResolvedToken;
   let client: EscalationDiscord;
@@ -1495,7 +1537,14 @@ async function digestOneMap(
   }
 
   try {
-    const audit = await graphAudit(map.repo, map.root, token);
+    // Every graph call is TIMEOUT-bound: a hung `soma` audit must not hold
+    // the shared escalation lock indefinitely (blocking later card + digest
+    // runs). Capped by both the graph-call timeout and the remaining digest
+    // deadline (round-30 blocker).
+    const remainingMs = Math.max(0, digestDeadline - Date.now());
+    const audit = await graphAudit(map.repo, map.root, token, {
+      timeoutMs: Math.min(GRAPH_CALL_TIMEOUT_MS, remainingMs || GRAPH_CALL_TIMEOUT_MS),
+    });
     // Open cards only — capped to what the digest renders (≤15), with the
     // total + age aggregates from the same query, so the daily read doesn't
     // grow with historical escalations (round-17/20 reviews).

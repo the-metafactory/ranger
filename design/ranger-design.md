@@ -197,16 +197,23 @@ Everything parked or vetoed is terminal until an operator verb. Silence never un
   most `MAX_CARDS_PER_TICK` card operations (posts+edits) per map per tick,
   evaluated against a bounded page of frontier nodes swept via a persisted
   cursor, with ONE tick-wide 120s pass DEADLINE (a fresh deadline is NOT
-  granted per map — serialized maps share it, so a two-map config is bounded
-  at ~120s total, round-28 review), a 30s cap on any Discord 429 cooldown,
-  and the deadline threaded into the client's retry loop (an in-flight
-  rate-limited op defers rather than running four 30s attempts past it). The
+  granted per map — serialized maps share it; a pre-map gate skips a map
+  whose deadline has already passed, so a two-map config does NOT get 2×120s),
+  a 30s cap on any Discord 429 cooldown, and the deadline threaded into the
+  client's cooldown/throttle/retry/fetch-timeout waits (an in-flight op
+  defers rather than spending its full timeout past the bound). The
   escalation lane therefore NEVER blocks the walk lane past that bound: it
   converges over ticks, deferring the remainder. Deferred cards stay open
   and are served on a later tick — nothing is dropped, only delayed.
   (Amendment: §8 originally said "unbounded" — the per-tick bound is an
   operational guarantee that escalation never starves walking, and is the
   model the desk implements, round-25 review.)
+  End-to-end bound, stated honestly: the pass is bounded by the tick
+  deadline + lock acquisition (≤60s) + one graph call per map (each capped at
+  GRAPH_CALL_TIMEOUT_MS=60s; the pre-map gate prevents a map from starting
+  after expiry) + one in-flight Discord request (≤30s capped by remaining
+  deadline). It is a small constant multiple of the deadline, never unbounded
+  — every graph and Discord call has a hard timeout (round-30 review).
   Honest scope of "never blocks": the desk's OWN processing is what the
   bound/deadline/cooldown-cap constrain. The O(frontier) frontier read +
   route classification is the SCHEDULER's inherent routing cost — ranger must
