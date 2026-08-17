@@ -1,4 +1,4 @@
-import { and, desc, eq, isNull } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { openDb, type RangerDb } from "./store/db.ts";
 import {
  escalations,
@@ -347,6 +347,24 @@ export class Journal {
   return row?.messageId ?? null;
  }
 
+ /**
+  * Batch lookup for one repo's cards — the active pass resolves its whole
+  * frontier in ONE query instead of N round trips per tick (round-17
+  * review).
+  */
+ getEscalations(repo: string, nodeIds: string[]): Map<string, EscalationRow> {
+  if (nodeIds.length === 0) return new Map();
+  const rows = this.db.query.escalations
+   .findMany({
+    where: and(
+     eq(escalations.repo, repo),
+     inArray(escalations.nodeId, nodeIds),
+    ),
+   })
+   .sync();
+  return new Map(rows.map((r) => [r.nodeId, hydrateEscalation(r)]));
+ }
+
  getEscalation(repo: string, nodeId: string): EscalationRow | null {
   const row = this.db.query.escalations
    .findFirst({
@@ -369,13 +387,31 @@ export class Journal {
  }
 
  /** Open cards only — avoids materializing resolved history on every pass. */
- listOpenEscalations(repo: string): EscalationRow[] {
+ /**
+  * Open cards for a repo, optionally capped at `limit`. Returns the capped
+  * rows plus the TOTAL count — the digest renders ≤15 cards but must know
+  * how many open cards exist (round-17 review: don't materialize all open
+  * escalations just to render a capped list).
+  */
+ listOpenEscalations(
+  repo: string,
+  opts: { limit?: number } = {},
+ ): { rows: EscalationRow[]; total: number } {
+  const countRow = this.db
+   .select({ n: sql<number>`count(*)` })
+   .from(escalations)
+   .where(and(eq(escalations.repo, repo), eq(escalations.status, "open")))
+   .get();
   const rows = this.db.query.escalations
    .findMany({
     where: and(eq(escalations.repo, repo), eq(escalations.status, "open")),
+    ...(opts.limit === undefined ? {} : { limit: opts.limit }),
    })
    .sync();
-  return rows.map(hydrateEscalation);
+  return {
+   rows: rows.map(hydrateEscalation),
+   total: Number(countRow?.n ?? 0),
+  };
  }
 
  /**

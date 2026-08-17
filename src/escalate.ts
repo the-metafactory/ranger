@@ -258,7 +258,9 @@ export class EscalationDiscord {
         },
       );
       if (response.status === 404) return false;
-      return response.ok;
+      // Every other status (2xx, 5xx, 401/403) is NOT a definitive delete —
+      // a repost decision must only be made on a certain 404.
+      return true;
     } catch {
       return true; // transient read failure — do not repost on a guess
     } finally {
@@ -884,8 +886,22 @@ async function markAbsentCards(
    .join("\n");
   try {
    // The note lives where the card lives: if the card's destination moved
-   // to another channel, leave the row (no repost noise for an absent node).
+   // to another channel, the note cannot be written there (no repost noise
+   // for an absent node) — but the reconciliation IS complete, so mark it
+   // noted. The card stays open (surfaced in the digest) until an operator
+   // verb resolves it; the scan stops retrying it every tick.
    if (prior.channelId !== null && prior.channelId !== client.channel) {
+    journal.upsertEscalation({
+     key: `${map.repo}:${nodeId}`,
+     repo: map.repo,
+     nodeId,
+     title: prior.title,
+     messageId: prior.messageId,
+     channelId: prior.channelId,
+     createdAt: prior.createdAt,
+     status: prior.status,
+     notedAt: now.toISOString(),
+    });
     return { action: "unchanged" as const, id: nodeId };
    }
    await client.edit(prior.messageId, content);
@@ -1046,11 +1062,9 @@ async function escalateOneMap(
     // history every 15-minute tick (round-15 review: the scan grows as
     // cards accumulate until the write-side resolution lifecycle closes
     // them). The absent-card pass separately queries open cards.
-    const existing = new Map(
-      needed
-        .map((node) => journal.getEscalation(map.repo, node.id))
-        .filter((row): row is EscalationRow => row !== null)
-        .map((row) => [row.nodeId, row] as const),
+    const existing = journal.getEscalations(
+      map.repo,
+      needed.map((n) => n.id),
     );
 
     const cards: EscalationCard[] = [];
@@ -1148,6 +1162,8 @@ export interface DigestResult {
 interface DigestInputs {
   map: RangerMapConfig;
   cards: DigestCard[];
+  /** total open cards (cards is capped at what the message can render). */
+  openCount: number;
   audit: AuditResult;
   budget: DigestMapResult["budget"];
   principal: string;
@@ -1156,14 +1172,14 @@ interface DigestInputs {
 }
 
 function digestContent(inputs: DigestInputs): string {
-  const { map, cards, audit, budget, principal, principalDiscordId, now } =
+  const { map, cards, openCount, audit, budget, principal, principalDiscordId, now } =
     inputs;
   const aged = cards.filter((c) => ageBand(c.ageDays) !== "fresh"); // 3+
   const overdue = cards.filter((c) => ageBand(c.ageDays) === "overdue"); // 7+
   const header = [
     `:newspaper: **ranger digest** — ${map.repo} (root ${map.root}, walk: ${map.walk}) · ${localDateKey(now)}`,
     "",
-    `**Cards: ${cards.length}**${aged.length > 0 ? ` (${aged.length} aged 3+d, ${overdue.length} 7+d${principalDiscordId ? " @-mentioned" : " no ping"})` : ""}`,
+    `**Cards: ${openCount}**${aged.length > 0 ? ` (${aged.length} aged 3+d, ${overdue.length} 7+d${principalDiscordId ? " @-mentioned" : " no ping"})` : ""}`,
   ];
   const summarize = (items: string[], max: number): string => {
     if (items.length === 0) return "";
@@ -1270,8 +1286,11 @@ async function digestOneMap(
 
   try {
     const audit = await graphAudit(map.repo, map.root, token);
-    // Open cards only — the digest never needs resolved history (suggestion).
-    const open = journal.listOpenEscalations(map.repo).map((row) => ({
+    // Open cards only — and capped to what the digest renders (≤15), with
+    // the total kept for the count line, so the daily read doesn't grow with
+    // historical escalations (round-17 review).
+    const openCards = journal.listOpenEscalations(map.repo, { limit: 15 });
+    const open = openCards.rows.map((row) => ({
       nodeId: row.nodeId,
       title: row.title ?? `#${row.nodeId}`,
       route: row.route ?? "escalate-hitl",
@@ -1282,6 +1301,7 @@ async function digestOneMap(
     const content = digestContent({
       map,
       cards: open,
+      openCount: openCards.total,
       audit,
       budget: base.budget,
       principal: config.principal.login,
