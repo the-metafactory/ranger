@@ -12,7 +12,7 @@ import {
   GateError,
   type ResolvedToken,
 } from "./token-gate.ts";
-import type { EscalationRow, Journal } from "./journal.ts";
+import type { Journal } from "./journal.ts";
 
 /**
  * Escalation desk (design §5, build-path step 2) — graph-read-only.
@@ -274,10 +274,7 @@ async function escalateOneMap(
   }
 
   try {
-    const [frontier, audit] = await Promise.all([
-      graphFrontier(map.repo, map.root, token),
-      graphAudit(map.repo, map.root, token),
-    ]);
+    const frontier = await graphFrontier(map.repo, map.root, token);
 
     const classified = frontier.frontier.map((entry) =>
       classify(entry, map.repo, map.walk, registry),
