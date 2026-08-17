@@ -15,20 +15,6 @@
       "when": 1786958151459,
       "tag": "0001_escalations",
       "breakpoints": true
-    },
-    {
-      "idx": 2,
-      "version": "6",
-      "when": 1786962371703,
-      "tag": "0002_escalation-route",
-      "breakpoints": true
-    },
-    {
-      "idx": 3,
-      "version": "6",
-      "when": 1786972544465,
-      "tag": "0003_escalation-last-content",
-      "breakpoints": true
     }
   ]
 }

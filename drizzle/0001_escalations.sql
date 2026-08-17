@@ -3,6 +3,8 @@ CREATE TABLE `escalations` (
 	`repo` text NOT NULL,
 	`node_id` text NOT NULL,
 	`title` text,
+	`route` text,
+	`last_content` text,
 	`message_id` text NOT NULL,
 	`created_at` text NOT NULL,
 	`last_edited_at` text,

@@ -12,7 +12,6 @@ import {
 import { graphAudit, graphFrontier, type AuditResult } from "./graph.ts";
 import {
   assertReadOnlyToken,
-  GateError,
   type ResolvedToken,
 } from "./token-gate.ts";
 import type { EscalationRow, Journal } from "./journal.ts";
@@ -29,7 +28,7 @@ import type { EscalationRow, Journal } from "./journal.ts";
  * effects are Discord messages and the journal `escalations` table.
  */
 
-export class EscalateError extends Error {
+class EscalateError extends Error {
   override readonly name = "EscalateError";
 }
 
@@ -631,6 +630,20 @@ function cardNeeded(node: ClassifiedNode): boolean {
   );
 }
 
+/**
+ * Shared map-context setup for the cards and digest runs: read-only token
+ * (no keyring fallback) + the per-map Discord client. One place for the
+ * policy; both runs use it so they can't drift.
+ */
+async function resolveDeskContext(
+  config: RangerConfig,
+  map: RangerMapConfig,
+): Promise<{ token: ResolvedToken; client: EscalationDiscord }> {
+  const { token } = await assertReadOnlyToken(config, map.repo);
+  const client = EscalationDiscord.fromMap(map, config.principal.discordId);
+  return { token, client };
+}
+
 async function escalateOneMap(
   config: RangerConfig,
   map: RangerMapConfig,
@@ -650,19 +663,9 @@ async function escalateOneMap(
   };
 
   let token: ResolvedToken;
-  try {
-    ({ token } = await assertReadOnlyToken(config, map.repo));
-  } catch (error) {
-    return {
-      ...base,
-      ok: false,
-      error: error instanceof GateError ? error.message : String(error),
-    };
-  }
-
   let client: EscalationDiscord;
   try {
-    client = EscalationDiscord.fromMap(map, config.principal.discordId);
+    ({ token, client } = await resolveDeskContext(config, map));
   } catch (error) {
     return {
       ...base,
@@ -884,18 +887,28 @@ function digestContent(inputs: DigestInputs): string {
     }
   }
   lines.push("");
+  const summarize = (items: string[], max: number): string => {
+    if (items.length === 0) return "";
+    const head = items.slice(0, max).join(", ");
+    return items.length > max ? `${head}, …+${items.length - max}` : head;
+  };
   lines.push(
-    `**Audit:** receipt-less closes ${audit.closedWithoutReceipt.length}${audit.closedWithoutReceipt.length > 0 ? ` (${audit.closedWithoutReceipt.join(", ")})` : ""} · open w/o checkpoint ${audit.openWithoutCheckpoint.length}${audit.openWithoutCheckpoint.length > 0 ? ` (${audit.openWithoutCheckpoint.join(", ")})` : ""} · open claims ${audit.openClaimed.length}`,
+    `**Audit:** receipt-less closes ${audit.closedWithoutReceipt.length}${audit.closedWithoutReceipt.length > 0 ? ` (${summarize(audit.closedWithoutReceipt, 8)})` : ""} · open w/o checkpoint ${audit.openWithoutCheckpoint.length}${audit.openWithoutCheckpoint.length > 0 ? ` (${summarize(audit.openWithoutCheckpoint, 8)})` : ""} · open claims ${audit.openClaimed.length}`,
   );
   if (audit.openClaimed.length > 0) {
-    for (const c of audit.openClaimed) {
+    for (const c of audit.openClaimed.slice(0, 8)) {
       lines.push(`    #${c.id} [${c.assignees.join(", ")}]`);
+    }
+    if (audit.openClaimed.length > 8) {
+      lines.push(`    … and ${audit.openClaimed.length - 8} more open claims`);
     }
   }
   lines.push(
     `**Budget:** spawns today ${budget.spawnsToday}/${budget.spawnCapPerDay} · dead-man ${budget.deadman} · ${budget.paused ? "PAUSED" : "running"}`,
   );
-  return lines.join("\n");
+  // Discord rejects >2000-char messages; hard-cap the whole digest too.
+  const joined = lines.join("\n");
+  return joined.length > 1950 ? `${joined.slice(0, 1949)}…` : joined;
 }
 
 async function digestOneMap(
@@ -923,18 +936,9 @@ async function digestOneMap(
   };
 
   let token: ResolvedToken;
-  try {
-    ({ token } = await assertReadOnlyToken(config, map.repo));
-  } catch (error) {
-    return {
-      ...base,
-      ok: false,
-      error: error instanceof GateError ? error.message : String(error),
-    };
-  }
   let client: EscalationDiscord;
   try {
-    client = EscalationDiscord.fromMap(map, config.principal.discordId);
+    ({ token, client } = await resolveDeskContext(config, map));
   } catch (error) {
     return {
       ...base,

@@ -35,6 +35,20 @@
           "notNull": false,
           "autoincrement": false
         },
+        "route": {
+          "name": "route",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "last_content": {
+          "name": "last_content",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
         "message_id": {
           "name": "message_id",
           "type": "text",
