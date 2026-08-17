@@ -1,4 +1,10 @@
-import { index, integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
+import {
+ index,
+ integer,
+ primaryKey,
+ sqliteTable,
+ text,
+} from "drizzle-orm/sqlite-core";
 
 /**
  * Ranger journal schema (design §8) — SQLite at `~/.config/ranger/state.sqlite`.
@@ -78,3 +84,20 @@ export const escalations = sqliteTable("escalations", {
  // Repo-scoped escalation lookups (listEscalations) stay indexed as history grows.
  index("escalations_repo_idx").on(table.repo),
 ]);
+
+/**
+ * One card message per (card, destination-channel) pair: when a map's
+ * channel moves away and back, the original message is recovered instead of
+ * posting a duplicate (design §5 — one card per node).
+ */
+export const escalationDestinations = sqliteTable(
+ "escalation_destinations",
+ {
+  /** `${repo}:${nodeId}` — matches escalations.key. */
+  key: text("key").notNull(),
+  channelId: text("channel_id").notNull(),
+  messageId: text("message_id").notNull(),
+  createdAt: text("created_at").notNull(),
+ },
+ (table) => [primaryKey({ columns: [table.key, table.channelId] })],
+);

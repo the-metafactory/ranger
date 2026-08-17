@@ -38,10 +38,11 @@ host.
   (verified live across many 900s ticks). Edits happen only when content
   actually changes (e.g. an age-band bump, or a node title/body edit).
 - Card destinations are persisted (`escalations.channel_id`, drizzle 0004)
-  and indexed by repo (0005). If a map's Discord channel moves, the persisted
-  destination differs from the current channel and cards are reposted fresh
-  there (announce-once per destination) instead of editing a foreign
-  message; a PATCH that 404s (legacy row or deleted card) also reposts.
+  and indexed by repo (0005). Each card's message id is also tracked per
+  destination channel (`escalation_destinations`, 0006), so a map that moves
+  A→B→A RECOVERS its original A message on return instead of posting a
+  duplicate (one card per node). A PATCH that 404s (legacy row or deleted
+  card) reposts fresh.
 - Digests: `digest.the-metafactory/ranger` = `2026-08-17:1538840582615728139`,
   `digest.jcfischer/seekolous` = `2026-08-17:1538840628891230208` (same local
   day re-runs edit only when the digest content changed; otherwise no-op).

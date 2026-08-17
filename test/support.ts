@@ -51,6 +51,7 @@ export function baseConfigLines(
   beforeState?: string[];
   state?: string[];
   workers?: string[];
+  channelId?: string;
  } = {},
 ): string[] {
  return [
@@ -62,7 +63,7 @@ export function baseConfigLines(
   ...(opts.map ?? []),
   "    discord:",
   "      tokenEnv: RANGER_DISCORD_TOKEN",
-  '      channelId: "1234567890"',
+  `      channelId: "${opts.channelId ?? "1234567890"}"`,
   "auth:",
   "  readOnlyTokens:",
   '    "acme/*": RANGER_RO_TEST',

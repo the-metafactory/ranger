@@ -682,27 +682,80 @@ async function syncCard(
     config.principal.login,
     config.principal.discordId,
   );
-  /** Post a fresh card in the client's channel + record the row (announce-once
-   *  per destination). The card's age restarts — it is new in this channel. */
+  const key = `${map.repo}:${node.id}`;
+  /** Post a fresh card in the client's channel + record row + destination.
+   *  The card's age restarts — it is new in this channel. */
   const postFresh = async (): Promise<SyncOutcome> => {
-    const messageId = await client.post(content);
+    // Render age-0 content INSIDE the post: a reposted card (destination
+    // moved or the old message gone) must start fresh — posting content that
+    // still shows the old age/ping, then editing it back to 0d on the next
+    // pass, would send an erroneous 7-day ping on a brand-new card.
+    const freshContent = cardContent(
+      node,
+      map,
+      0,
+      config.principal.login,
+      config.principal.discordId,
+    );
+    const messageId = await client.post(freshContent);
     const row = {
-      key: `${map.repo}:${node.id}`,
+      key,
       repo: map.repo,
       nodeId: node.id,
       title: node.title,
       route: node.route.route,
       channelId: client.channel,
-      lastContent: content,
+      lastContent: freshContent,
       messageId,
       createdAt: now.toISOString(),
       status: "open" as const,
     };
     journal.upsertEscalation(row);
+    journal.setEscalationDestination(
+      key,
+      client.channel,
+      messageId,
+      now.toISOString(),
+    );
     return {
       action: "posted" as const,
       id: node.id,
       card: cardFrom(node, row, 0),
+    };
+  };
+  /** Edit a card message in place; if the message is gone (deleted or in a
+   *  moved channel), repost fresh instead of retrying a doomed edit. */
+  const editInPlace = async (
+    messageId: string,
+    editContent: string,
+    createdAt: string,
+  ): Promise<SyncOutcome> => {
+    try {
+      await client.edit(messageId, editContent);
+    } catch (cardError) {
+      if (cardError instanceof DiscordMessageGoneError) {
+        return await postFresh();
+      }
+      throw cardError;
+    }
+    const row = {
+      key,
+      repo: map.repo,
+      nodeId: node.id,
+      title: node.title,
+      route: node.route.route,
+      channelId: client.channel,
+      lastContent: editContent,
+      messageId,
+      createdAt,
+      lastEditedAt: now.toISOString(),
+      status: "open" as const,
+    };
+    journal.upsertEscalation(row);
+    return {
+      action: "edited" as const,
+      id: node.id,
+      card: cardFrom(node, row, ageDays),
     };
   };
   try {
@@ -710,10 +763,18 @@ async function syncCard(
       return await postFresh();
     }
     // The card's destination moved (persisted channelId differs from the
-    // current channel): its message id lives elsewhere and can't be edited
-    // here — repost fresh in the current channel (announce-once per
-    // destination) instead of editing a foreign message.
+    // current channel): if the card already has a message in the current
+    // channel from a prior visit, RECOVER it (edit in place, age kept — it
+    // is the same card) instead of posting a duplicate; only post fresh the
+    // first time a channel is seen.
     if (prior.channelId !== null && prior.channelId !== client.channel) {
+      const recoveredId = journal.getEscalationDestination(
+        key,
+        client.channel,
+      );
+      if (recoveredId !== null) {
+        return await editInPlace(recoveredId, content, prior.createdAt);
+      }
       return await postFresh();
     }
     // Edit-on-change: a 900s tick re-runs ~96×/day; re-editing identical
@@ -726,36 +787,7 @@ async function syncCard(
         card: cardFrom(node, prior, ageDays),
       };
     }
-    try {
-      await client.edit(prior.messageId, content);
-    } catch (cardError) {
-      if (cardError instanceof DiscordMessageGoneError) {
-        // The message is not in this channel (legacy row whose channel was
-        // never recorded, or a deleted card) — repost fresh instead of
-        // retrying a doomed edit every tick.
-        return await postFresh();
-      }
-      throw cardError;
-    }
-    const row = {
-      key: `${map.repo}:${node.id}`,
-      repo: map.repo,
-      nodeId: node.id,
-      title: node.title,
-      route: node.route.route,
-      channelId: client.channel,
-      lastContent: content,
-      messageId: prior.messageId,
-      createdAt: prior.createdAt,
-      lastEditedAt: now.toISOString(),
-      status: "open" as const,
-    };
-    journal.upsertEscalation(row);
-    return {
-      action: "edited" as const,
-      id: node.id,
-      card: cardFrom(node, row, ageDays),
-    };
+    return await editInPlace(prior.messageId, content, prior.createdAt);
   } catch (cardError) {
     // A transient Discord failure on one card must not fail the whole desk —
     // the card retries next tick (announce-once stays intact: a failed post
@@ -777,79 +809,80 @@ async function syncCard(
  * Returns the node ids kept open this pass.
  */
 async function markAbsentCards(
-  ctx: {
-    client: EscalationDiscord;
-    journal: Journal;
-    map: RangerMapConfig;
-    now: Date;
-  },
-  existing: Map<string, EscalationRow>,
-  neededIds: Set<string>,
+ ctx: {
+  client: EscalationDiscord;
+  journal: Journal;
+  map: RangerMapConfig;
+  now: Date;
+ },
+ neededIds: Set<string>,
 ): Promise<{ keptOpen: string[]; errors: string[] }> {
-  const { client, journal, map, now } = ctx;
-  const openCards = [...existing.entries()].filter(
-    ([, prior]) => prior.status !== "resolved",
-  );
-  const outcomes = await mapPool(openCards, 3, async ([nodeId, prior]) => {
-    if (neededIds.has(nodeId)) return { action: "skip" as const };
-    const content = [
-      `~~**#${nodeId}** ${sanitizeGraphText(prior.title ?? "")}~~ no longer on the HITL/provisioning queue`,
-      `map: ${map.repo} — card kept open; resolves on a principal response or operator verb`,
-    ]
-      .filter((l) => l.trim().length > 0)
-      .join("\n");
-    try {
-      // The note lives where the card lives: if the card's destination moved
-      // to another channel, leave the row (no repost noise for an absent
-      // node — the queue-exit note is not a decision the principal needs in
-      // the new channel).
-      if (prior.channelId !== null && prior.channelId !== client.channel) {
-        return { action: "unchanged" as const, id: nodeId };
-      }
-      if (prior.lastContent === content) {
-        return { action: "unchanged" as const, id: nodeId };
-      }
-      await client.edit(prior.messageId, content);
-      journal.upsertEscalation({
-        key: `${map.repo}:${nodeId}`,
-        repo: map.repo,
-        nodeId,
-        title: prior.title,
-        lastContent: content,
-        messageId: prior.messageId,
-        channelId: prior.channelId,
-        createdAt: prior.createdAt,
-        lastEditedAt: now.toISOString(),
-        status: prior.status, // stays open — cards persist (design §5)
-      });
-      return { action: "keptOpen" as const, id: nodeId };
-    } catch (cardError) {
-      // The card is gone (deleted or the channel moved on a legacy row):
-      // nothing to edit — the row persists until an operator verb resolves
-      // it. A transient failure retries next tick.
-      if (cardError instanceof DiscordMessageGoneError) {
-        return { action: "unchanged" as const, id: nodeId };
-      }
-      // A transient failure on one card must not fail the desk — it retries
-      // next tick and the card stays open.
-      return {
-        action: "error" as const,
-        id: nodeId,
-        error:
-          cardError instanceof Error ? cardError.message : String(cardError),
-      };
-    }
-  });
-  const keptOpen: string[] = [];
-  const errors: string[] = [];
-  for (const outcome of outcomes) {
-    if (outcome.action === "error") {
-      errors.push(`#${outcome.id}: ${outcome.error}`);
-    } else if (outcome.action === "keptOpen") {
-      keptOpen.push(outcome.id);
-    }
+ const { client, journal, map, now } = ctx;
+ // Open cards only (resolved history is never materialized). Cards already
+ // reconciled to the queue-exit note are skipped by content compare, so as
+ // cards age the per-pass work stays bounded; only the write-side resolution
+ // lifecycle (node #21) closes cards and shrinks the open set itself.
+ const openCards = journal.listOpenEscalations(map.repo);
+ const outcomes = await mapPool(openCards, 3, async (prior) => {
+  const nodeId = prior.nodeId;
+  if (neededIds.has(nodeId)) return { action: "skip" as const };
+  const content = [
+   `~~**#${nodeId}** ${sanitizeGraphText(prior.title ?? "")}~~ no longer on the HITL/provisioning queue`,
+   `map: ${map.repo} — card kept open; resolves on a principal response or operator verb`,
+  ]
+   .filter((l) => l.trim().length > 0)
+   .join("\n");
+  // Already reconciled to the queue-exit note — a no-op, no Discord write.
+  if (prior.lastContent === content) {
+   return { action: "unchanged" as const, id: nodeId };
   }
-  return { keptOpen, errors };
+  try {
+   // The note lives where the card lives: if the card's destination moved
+   // to another channel, leave the row (no repost noise for an absent node).
+   if (prior.channelId !== null && prior.channelId !== client.channel) {
+    return { action: "unchanged" as const, id: nodeId };
+   }
+   await client.edit(prior.messageId, content);
+   journal.upsertEscalation({
+    key: `${map.repo}:${nodeId}`,
+    repo: map.repo,
+    nodeId,
+    title: prior.title,
+    lastContent: content,
+    messageId: prior.messageId,
+    channelId: prior.channelId,
+    createdAt: prior.createdAt,
+    lastEditedAt: now.toISOString(),
+    status: prior.status, // stays open — cards persist (design §5)
+   });
+   return { action: "keptOpen" as const, id: nodeId };
+  } catch (cardError) {
+   // The card is gone (deleted or the channel moved on a legacy row):
+   // nothing to edit — the row persists until an operator verb resolves it.
+   // A transient failure retries next tick.
+   if (cardError instanceof DiscordMessageGoneError) {
+    return { action: "unchanged" as const, id: nodeId };
+   }
+   // A transient failure on one card must not fail the desk — it retries
+   // next tick and the card stays open.
+   return {
+    action: "error" as const,
+    id: nodeId,
+    error:
+     cardError instanceof Error ? cardError.message : String(cardError),
+   };
+  }
+ });
+ const keptOpen: string[] = [];
+ const errors: string[] = [];
+ for (const outcome of outcomes) {
+  if (outcome.action === "error") {
+   errors.push(`#${outcome.id}: ${outcome.error}`);
+  } else if (outcome.action === "keptOpen") {
+   keptOpen.push(outcome.id);
+  }
+ }
+ return { keptOpen, errors };
 }
 
 function ageText(
@@ -961,9 +994,15 @@ async function escalateOneMap(
       ...classified.filter((n) => n.route.route === "provisioning"),
     ].filter(cardNeeded);
 
+    // The active pass needs ONLY the rows for nodes on the frontier now —
+    // query them directly instead of scanning the whole repo's escalation
+    // history every 15-minute tick (round-15 review: the scan grows as
+    // cards accumulate until the write-side resolution lifecycle closes
+    // them). The absent-card pass separately queries open cards.
     const existing = new Map(
-      journal
-        .listEscalations(map.repo)
+      needed
+        .map((node) => journal.getEscalation(map.repo, node.id))
+        .filter((row): row is EscalationRow => row !== null)
         .map((row) => [row.nodeId, row] as const),
     );
 
@@ -990,7 +1029,6 @@ async function escalateOneMap(
     const neededIds = new Set(needed.map((n) => n.id));
     const absent = await markAbsentCards(
       { client, journal, map, now },
-      existing,
       neededIds,
     );
     base.keptOpen.push(...absent.keptOpen);
@@ -1229,7 +1267,17 @@ async function digestOneMap(
     if (cached !== null && cached.today === today) {
       messageId = cached.messageId;
       if (cached.lastContent !== content) {
-        await client.edit(messageId, content);
+        try {
+          await client.edit(messageId, content);
+        } catch (editError) {
+          if (!(editError instanceof DiscordMessageGoneError)) throw editError;
+          // The cached digest message was deleted (or moved): post a fresh
+          // digest and replace the cached message id — otherwise unchanged
+          // runs would no-op against the stale cache and leave NO digest
+          // until the next day.
+          messageId = await client.post(content);
+          posted = true;
+        }
         journal.setHealth(
           `digest.${map.repo}`,
           JSON.stringify({ today, messageId, lastContent: content }),

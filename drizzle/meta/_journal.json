@@ -43,6 +43,13 @@
       "when": 1786982123316,
       "tag": "0005_escalation-repo-index",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1786983423280,
+      "tag": "0006_escalation-destinations",
+      "breakpoints": true
     }
   ]
 }

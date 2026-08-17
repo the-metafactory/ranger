@@ -558,25 +558,9 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
       writeFixtures(fixtureDir);
       const writeCfg = (channelId: string) => {
         const config = [
-          "version: 1",
-          "maps:",
-          "  - repo: acme/widgets",
-          "    root: 1",
-          "    walk: research-only",
-          "    discord:",
-          "      tokenEnv: RANGER_DISCORD_TOKEN",
-          `      channelId: "${channelId}"`,
-          "auth:",
-          "  readOnlyTokens:",
-          '    "acme/*": RANGER_RO_TEST',
-          "bot:",
-          "  identity: ivy-bot",
+          ...baseConfigLines(dir, { channelId }),
           "principal:",
           "  login: jcfischer",
-          "state:",
-          `  journalPath: ${join(dir, "state.sqlite")}`,
-          "workers:",
-          "  spawnCapPerDay: 10",
         ].join("\n");
         const p = join(dir, "ranger.yaml");
         writeFileSync(p, config);
@@ -606,6 +590,62 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
           "9999999999",
         );
       }
+      j.close();
+    } finally {
+      discord.stop();
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(fixtureDir, { recursive: true, force: true });
+    }
+  });
+
+  test("a map that moves A→B→A recovers its original cards (no duplicates)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ranger-escalate-aba-"));
+    const fixtureDir = mkdtempSync(join(tmpdir(), "ranger-escalate-aba-fx-"));
+    const discord = fakeDiscord();
+    try {
+      writeFixtures(fixtureDir);
+      const writeCfg = (channelId: string) => {
+        const p = join(dir, "ranger.yaml");
+        writeFileSync(
+          p,
+          [
+            ...baseConfigLines(dir, { channelId }),
+            "principal:",
+            "  login: jcfischer",
+          ].join("\n"),
+        );
+        return p;
+      };
+      const env = envFor(fixtureDir, discord.port);
+      const cardsAt = (channel: string) =>
+        runCli(["escalate", "-c", writeCfg(channel), "--json"], env);
+
+      // Snowflake-shaped channel ids: "A" = 1234567890, "B" = 9999999999.
+      const r1 = await cardsAt("1234567890");
+      expect(JSON.parse(r1.stdout).maps[0].posted).toHaveLength(4);
+      const aMessageIds = new Journal(join(dir, "state.sqlite"))
+        .listEscalations("acme/widgets")
+        .map((r) => r.messageId)
+        .sort();
+
+      // Move to B: fresh cards in the new channel (messages 5-8).
+      const r2 = await cardsAt("9999999999");
+      expect(JSON.parse(r2.stdout).maps[0].posted).toHaveLength(4);
+      const postsAfterB = discord.posts.length; // 8
+
+      // Move back to A: the ORIGINAL messages are recovered — edited, NOT
+      // reposted (no duplicate card in A).
+      const r3 = await cardsAt("1234567890");
+      const report3 = JSON.parse(r3.stdout);
+      expect(report3.maps[0].posted).toHaveLength(0); // no new posts
+      expect(discord.posts.length).toBe(postsAfterB); // 8, unchanged
+      expect(report3.maps[0].edited).toHaveLength(4); // recovered + edited
+      const j = new Journal(join(dir, "state.sqlite"));
+      const backMessageIds = j
+        .listEscalations("acme/widgets")
+        .map((r) => r.messageId)
+        .sort();
+      expect(backMessageIds).toEqual(aMessageIds); // original A ids recovered
       j.close();
     } finally {
       discord.stop();

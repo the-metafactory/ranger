@@ -2,6 +2,7 @@ import { and, desc, eq } from "drizzle-orm";
 import { openDb, type RangerDb } from "./store/db.ts";
 import {
  escalations,
+ escalationDestinations,
  events,
  health,
  vetoes,
@@ -303,6 +304,43 @@ export class Journal {
    .values({ key: row.key, repo: row.repo, nodeId: row.nodeId, ...fields })
    .onConflictDoUpdate({ target: escalations.key, set: fields })
    .run();
+ }
+
+ /**
+  * Record which Discord message a card lives in per destination channel. A
+  * map that moves away and back recovers its original message via
+  * `getEscalationDestination` instead of posting a duplicate.
+  */
+ setEscalationDestination(
+  key: string,
+  channelId: string,
+  messageId: string,
+  createdAt: string,
+ ): void {
+  this.db
+   .insert(escalationDestinations)
+   .values({ key, channelId, messageId, createdAt })
+   .onConflictDoUpdate({
+    target: [escalationDestinations.key, escalationDestinations.channelId],
+    set: { messageId, createdAt },
+   })
+   .run();
+ }
+
+ /** The card's message id in a given destination channel, or null. */
+ getEscalationDestination(
+  key: string,
+  channelId: string,
+ ): string | null {
+  const row = this.db.query.escalationDestinations
+   .findFirst({
+    where: and(
+     eq(escalationDestinations.key, key),
+     eq(escalationDestinations.channelId, channelId),
+    ),
+   })
+   .sync();
+  return row?.messageId ?? null;
  }
 
  getEscalation(repo: string, nodeId: string): EscalationRow | null {
