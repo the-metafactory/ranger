@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import { resolveDiscordApiBase } from "./discord.ts";
@@ -15,7 +15,7 @@ import {
   GateError,
   type ResolvedToken,
 } from "./token-gate.ts";
-import type { Journal } from "./journal.ts";
+import type { EscalationRow, Journal } from "./journal.ts";
 
 /**
  * Escalation desk (design §5, build-path step 2) — graph-read-only.
@@ -73,6 +73,10 @@ export class EscalationDiscord {
     path: string,
     content: string,
   ): Promise<Response> {
+    // Every call times out — a run can never stall indefinitely holding the
+    // announce-once lock (the lock's stale-reclaim bound depends on this).
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 30_000);
     try {
       return await fetch(`${this.apiBase}${path}`, {
         method,
@@ -92,11 +96,14 @@ export class EscalationDiscord {
               : [],
           },
         }),
+        signal: controller.signal,
       });
     } catch (error) {
       throw new EscalateError(
         `discord ${method} ${path} failed: ${error instanceof Error ? error.message : String(error)}`,
       );
+    } finally {
+      clearTimeout(timer);
     }
   }
 
@@ -333,28 +340,31 @@ async function withEscalateLock<T>(
   journal: Journal,
   fn: () => Promise<T>,
 ): Promise<T> {
-  const lockDir = join(dirname(journal.path), ".escalate.lock");
-  const ownerFile = join(lockDir, "owner.json");
+  const lockFile = join(dirname(journal.path), ".escalate.lock");
   const started = Date.now();
   const timeoutMs = 60_000;
-  // A lock this old is never a live run — a reboot leaves the dir behind and
-  // can even recycle the pid, so time alone makes it safe to reclaim.
+  // Every Discord call times out at 30s, so no live run can legitimately hold
+  // the lock anywhere near this — a lock this old is always a dead/rebooted
+  // run (and a reboot can recycle the pid), so time alone makes it reclaimable
+  // without ever stealing a live run's lock.
   const STALE_MS = 24 * 60 * 60 * 1000;
-  const owner = { pid: process.pid, startedAt: Date.now() };
+  const owner = JSON.stringify({ pid: process.pid, startedAt: Date.now() });
   for (;;) {
     try {
-      mkdirSync(lockDir);
+      // Atomic create-with-content (wx): the lock never exists without an
+      // owner, so there is no window where a paused run looks ownerless.
+      writeFileSync(lockFile, owner, { flag: "wx" });
       break;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
       // Someone holds the lock. Reclaim it when the owner is dead (kill(pid,0)
-      // → ESRCH) or the owner record is stale (reboot / pid reuse), so a
-      // killed or rebooted run can't disable the scheduled cards/digests.
+      // → ESRCH) or the owner record is stale (reboot / pid reuse).
       let reclaimable = false;
       try {
-        const prior = JSON.parse(
-          readFileSync(ownerFile, "utf8"),
-        ) as { pid?: number; startedAt?: number };
+        const prior = JSON.parse(readFileSync(lockFile, "utf8")) as {
+          pid?: number;
+          startedAt?: number;
+        };
         if (typeof prior.pid === "number") {
           try {
             process.kill(prior.pid, 0);
@@ -371,12 +381,13 @@ async function withEscalateLock<T>(
           reclaimable = true;
         }
       } catch {
-        /* unreadable/missing owner — a fresh crash window; short grace */
-        reclaimable = Date.now() - started > 10_000;
+        // A torn/corrupt lock file — never reclaim on a live-owned guess;
+        // the 60s timeout bounds the damage for the rare unreadable case.
+        reclaimable = false;
       }
       if (reclaimable) {
         try {
-          rmSync(lockDir, { recursive: true, force: true });
+          rmSync(lockFile, { force: true });
         } catch {
           /* concurrent reclaim — keep waiting */
         }
@@ -384,7 +395,7 @@ async function withEscalateLock<T>(
       }
       if (Date.now() - started > timeoutMs) {
         throw new EscalateError(
-          `another escalate run holds the lock (${lockDir}) — ` +
+          `another escalate run holds the lock (${lockFile}) — ` +
             "refusing to risk duplicate cards",
         );
       }
@@ -392,15 +403,76 @@ async function withEscalateLock<T>(
     }
   }
   try {
-    writeFileSync(ownerFile, JSON.stringify(owner));
     return await fn();
   } finally {
     try {
-      rmSync(lockDir, { recursive: true, force: true });
+      rmSync(lockFile, { force: true });
     } catch {
       /* best-effort release */
     }
   }
+}
+
+/**
+ * Resolution phase: edit cards whose node left the HITL/provisioning queue to
+ * a resolved note (design §5 — cards persist; only resolution ends them).
+ * Returns the resolved node ids. Bounded-pool like the active pass so a
+ * many-card map doesn't edit serially.
+ */
+async function resolveStaleCards(
+  client: EscalationDiscord,
+  journal: Journal,
+  map: RangerMapConfig,
+  existing: Map<string, EscalationRow>,
+  neededIds: Set<string>,
+  now: Date,
+): Promise<string[]> {
+  const resolvable = [...existing.entries()].filter(
+    ([, prior]) => prior.status !== "resolved",
+  );
+  const resolved = await mapPool(resolvable, 3, async ([nodeId, prior]) => {
+    if (neededIds.has(nodeId)) return null;
+    await client.edit(
+      prior.messageId,
+      [
+        `~~**#${nodeId}** ${prior.title ?? ""}~~ ✅ resolved`,
+        `map: ${map.repo} — no longer on the HITL/provisioning queue`,
+        `_edited ${now.toISOString()}_`,
+      ]
+        .filter((l) => l.trim().length > 0)
+        .join("\n"),
+    );
+    journal.upsertEscalation({
+      key: `${map.repo}:${nodeId}`,
+      repo: map.repo,
+      nodeId,
+      title: prior.title,
+      messageId: prior.messageId,
+      createdAt: prior.createdAt,
+      lastEditedAt: now.toISOString(),
+      status: "resolved",
+    });
+    return nodeId;
+  });
+  return resolved.filter((nodeId): nodeId is string => nodeId !== null);
+}
+
+function ageText(
+  band: AgeBand,
+  ageDays: number,
+  principal: string,
+  principalDiscordId?: string,
+): string {
+  if (band === "overdue") {
+    if (principalDiscordId !== undefined) {
+      return `📣 <@${principalDiscordId}> ${ageDays}d`;
+    }
+    return `📣 @${principal} ${ageDays}d (no ping)`;
+  }
+  if (band === "aging") {
+    return `⚠️ ${ageDays}d`;
+  }
+  return `${ageDays}d`;
 }
 
 /** Build the card + journal-row inputs for a node in one place (no drift). */
@@ -540,41 +612,17 @@ async function escalateOneMap(
       cards.push(outcome.card);
     }
 
-    // Resolve cards whose node is no longer on the HITL/provisioning queue —
-    // the card is edited to a resolved note, never silently dropped (design
-    // §5: cards persist; only resolution ends them). Bounded-pool like the
-    // active pass so a many-card map doesn't edit serially.
     const neededIds = new Set(needed.map((n) => n.id));
-    const resolvable = [...existing.entries()].filter(
-      ([, prior]) => prior.status !== "resolved",
+    base.resolved.push(
+      ...(await resolveStaleCards(
+        client,
+        journal,
+        map,
+        existing,
+        neededIds,
+        now,
+      )),
     );
-    const resolved = await mapPool(resolvable, 3, async ([nodeId, prior]) => {
-      if (neededIds.has(nodeId)) return null;
-      await client.edit(
-        prior.messageId,
-        [
-          `~~**#${nodeId}** ${prior.title ?? ""}~~ ✅ resolved`,
-          `map: ${map.repo} — no longer on the HITL/provisioning queue`,
-          `_edited ${now.toISOString()}_`,
-        ]
-          .filter((l) => l.trim().length > 0)
-          .join("\n"),
-      );
-      journal.upsertEscalation({
-        key: `${map.repo}:${nodeId}`,
-        repo: map.repo,
-        nodeId,
-        title: prior.title,
-        messageId: prior.messageId,
-        createdAt: prior.createdAt,
-        lastEditedAt: now.toISOString(),
-        status: "resolved",
-      });
-      return nodeId;
-    });
-    for (const nodeId of resolved) {
-      if (nodeId !== null) base.resolved.push(nodeId);
-    }
 
     return { ...base, cards };
   } catch (error) {
@@ -631,33 +679,39 @@ export interface DigestResult {
   maps: DigestMapResult[];
 }
 
-function digestContent(
-  map: RangerMapConfig,
-  cards: DigestCard[],
-  audit: AuditResult,
-  budget: DigestMapResult["budget"],
-  principal: string,
-  now: Date,
-): string {
+interface DigestInputs {
+  map: RangerMapConfig;
+  cards: DigestCard[];
+  audit: AuditResult;
+  budget: DigestMapResult["budget"];
+  principal: string;
+  principalDiscordId?: string;
+  now: Date;
+}
+
+function digestContent(inputs: DigestInputs): string {
+  const { map, cards, audit, budget, principal, principalDiscordId, now } =
+    inputs;
   const aged = cards.filter((c) => ageBand(c.ageDays) !== "fresh"); // 3+
   const overdue = cards.filter((c) => ageBand(c.ageDays) === "overdue"); // 7+
   const lines: string[] = [
     `:newspaper: **ranger digest** — ${map.repo} (root ${map.root}, walk: ${map.walk}) · ${now.toISOString().slice(0, 10)}`,
     "",
-    `**Cards: ${cards.length}**${aged.length > 0 ? ` (${aged.length} aged 3+d, ${overdue.length} @-mentioned)` : ""}`,
+    `**Cards: ${cards.length}**${aged.length > 0 ? ` (${aged.length} aged 3+d, ${overdue.length} 7+d${principalDiscordId ? " @-mentioned" : " no ping"})` : ""}`,
   ];
   if (cards.length === 0) {
     lines.push("  none open — clean");
   } else {
     for (const card of cards) {
       const band = ageBand(card.ageDays);
-      const age =
-        band === "overdue"
-          ? `📣 @${principal} ${card.ageDays}d`
-          : band === "aging"
-            ? `⚠️ ${card.ageDays}d`
-            : `${card.ageDays}d`;
-      lines.push(`  #${card.nodeId} ${card.title} — ${card.route} · ${age}`);
+      lines.push(
+        `  #${card.nodeId} ${card.title} — ${card.route} · ${ageText(
+          band,
+          card.ageDays,
+          principal,
+          principalDiscordId,
+        )}`,
+      );
     }
   }
   lines.push("");
@@ -730,14 +784,15 @@ async function digestOneMap(
         messageId: row.messageId,
       }));
 
-    const content = digestContent(
+    const content = digestContent({
       map,
-      open,
+      cards: open,
       audit,
-      base.budget,
-      config.principal.login,
+      budget: base.budget,
+      principal: config.principal.login,
+      principalDiscordId: config.principal.discordId,
       now,
-    );
+    });
 
     // Digest is edit-not-repost within a day: cache the message id under
     // `digest.<repo>`; a new day posts a fresh digest.

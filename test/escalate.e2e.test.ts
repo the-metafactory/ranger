@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCmd } from "../src/exec.ts";
@@ -347,12 +347,11 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
       const config = writeConfig(dir);
       const env = envFor(fixtureDir, discord.port);
 
-      // Simulate a killed run: lock dir with an owner whose pid is dead and
-      // whose startedAt is old. A live run must reclaim it, not wait 60s.
-      const lockDir = join(dir, ".escalate.lock");
-      mkdirSync(lockDir);
+      // Simulate a killed run: the lock file with an owner whose pid is dead
+      // and whose startedAt is old. A live run must reclaim it, not wait 60s.
+      const lockFile = join(dir, ".escalate.lock");
       writeFileSync(
-        join(lockDir, "owner.json"),
+        lockFile,
         JSON.stringify({
           pid: 2_000_000_000, // out of pid range → ESRCH on kill(pid, 0)
           startedAt: Date.now() - 3 * 24 * 60 * 60 * 1000,
@@ -363,7 +362,7 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
       expect(run.code).toBe(0);
       const report = JSON.parse(run.stdout);
       expect(report.maps[0].posted).toHaveLength(4);
-      expect(existsSync(lockDir)).toBe(false); // released after the run
+      expect(existsSync(lockFile)).toBe(false); // released after the run
     } finally {
       discord.stop();
       rmSync(dir, { recursive: true, force: true });

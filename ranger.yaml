@@ -53,3 +53,10 @@ auth:
 # REFUSE when the resolved identity equals the principal's login.
 bot:
   identity: ivy-agent
+
+# The principal. `discordId` is the escalation desk's 7+ day @-mention target
+# (rendered as a real <@id> ping — without it, overdue cards show a no-ping
+# hint). Node #20 review round.
+principal:
+  login: jcfischer
+  discordId: "285727653603049472"
