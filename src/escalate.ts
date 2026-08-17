@@ -41,6 +41,11 @@ export class EscalationDiscord {
   private readonly minIntervalMs =
     Number(process.env.RANGER_DISCORD_MIN_INTERVAL_MS) || 1000;
   private lastRequestAt = 0;
+  /** Client-wide pause (epoch ms): set on a global 429 so POOLED requests —
+   *  not just the one that got the 429 — wait it out before sending. Without
+   *  this, concurrent cards already past the throttle fire into a hot bucket
+   *  and extend the cooldown (observed live). */
+  private cooldownUntil = 0;
 
   constructor(
     private readonly token: string,
@@ -74,6 +79,14 @@ export class EscalationDiscord {
     );
   }
 
+  /** Wait out any client-wide cooldown (a global 429) before sending. */
+  private async waitForCooldown(): Promise<void> {
+    while (this.cooldownUntil > Date.now()) {
+      await sleep(Math.min(250, this.cooldownUntil - Date.now()));
+    }
+    this.cooldownUntil = 0;
+  }
+
   private async request(
     method: "POST" | "PATCH",
     path: string,
@@ -89,6 +102,10 @@ export class EscalationDiscord {
     let firstRetryAfterSec = 0;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       await this.throttle();
+      // A global cooldown applies to every request on this client — wait for
+      // it here, immediately before sending, so pooled cards don't fire into
+      // a hot bucket.
+      await this.waitForCooldown();
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 30_000);
       try {
@@ -123,6 +140,15 @@ export class EscalationDiscord {
           Number.isFinite(retryAfter) && retryAfter > 0
             ? retryAfter * 1000
             : 1000 * 2 ** (attempt - 1);
+        if (global) {
+          // Advance the client-wide deadline so every pooled request waits
+          // this out too, not just this one.
+          const cooldownMs = Math.max(waitMs, 30_000);
+          this.cooldownUntil = Math.max(
+            this.cooldownUntil,
+            Date.now() + cooldownMs,
+          );
+        }
         // A long first cooldown (>30s) means the card is hot; retrying into it
         // just extends it (observed live) — fail fast so the card is deferred
         // to next tick instead of hammering.
@@ -313,9 +339,12 @@ function cardContent(
       ? sanitizeGraphText(node.body)
       : null;
   const prefixLines = [
-    `${cardHead(node)} — **#${node.id}** ${sanitizeGraphText(node.title)}`,
-    `map: ${map.repo} · ${node.kind} · ${node.autonomy}`,
-    `url: ${node.url}`,
+    // Every graph-derived interpolation is mention-inerted (a graph author
+    // can set kind/autonomy/title/url to `<@principal-id>`), and the title
+    // is capped so a giant title can't evict the decision body or the suffix.
+    `${cardHead(node)} — **#${node.id}** ${truncate(sanitizeGraphText(node.title), 200)}`,
+    `map: ${map.repo} · ${sanitizeGraphText(node.kind)} · ${sanitizeGraphText(node.autonomy)}`,
+    `url: ${sanitizeGraphText(node.url)}`,
     node.checkpointId !== undefined && node.checkpointId.length > 0
       ? `checkpoint: \`${sanitizeGraphText(node.checkpointId)}\``
       : null,
@@ -341,9 +370,17 @@ function cardContent(
   const lines = [...prefixLines, bodyLine, ...probeLines, suffix].filter(
     (line): line is string => line !== null,
   );
-  // Discord rejects >2000-char messages; hard-cap as a final guard.
+  // Discord rejects >2000-char messages. Cap the FRONT of the card (graph
+  // fields + body) so the trailing suffix — which carries the 7-day `<@id>`
+  // mention — always survives: a long graph title can never strip the ping.
   const joined = lines.join("\n");
-  return joined.length > 1950 ? `${joined.slice(0, 1949)}…` : joined;
+  const suffixLength = suffix.length;
+  const front = joined.slice(0, joined.length - suffixLength);
+  const maxFront = 1949 - suffixLength - 1;
+  if (joined.length <= 1950) return joined;
+  const frontCapped =
+    front.length > maxFront ? `${front.slice(0, maxFront - 1)}…` : front;
+  return `${frontCapped}\n${suffix}`;
 }
 
 // ---- the cards run ----
@@ -483,34 +520,71 @@ function lockOwnerDead(lockFile: string): boolean {
 }
 
 /**
- * EXCLUSIVE reclaim of a dead-owner lock: the reclaim marker is itself
- * created atomically (wx), so only one process can hold it and remove+
- * re-acquire — two contenders cannot both observe the dead owner and both
- * proceed. Returns true when we now hold the lock; false when another
- * process holds the marker (mid-reclaim) and the caller should wait.
+ * Reclaim outcome for a dead-owner lock: `acquired` (we now hold it),
+ * `busy` (a live holder is mid-reclaim), or `not-dead` (the lock was
+ * replaced by a live owner while we waited — do NOT delete it).
+ */
+type ReclaimOutcome = "acquired" | "busy" | "not-dead";
+
+/**
+ * EXCLUSIVE reclaim of a dead-owner lock. The reclaim marker is created
+ * atomically (wx), so only one process can hold it and remove+re-acquire.
+ * Two refinements make this both race-safe and crash-safe:
+ *
+ * - Stale-marker reclaim: a process that dies mid-reclaim leaves `.reclaiming`
+ *   behind, which would strand every later run (EEXIST forever → timeout).
+ *   When the marker's OWNER is provably dead, we remove it and retry the wx
+ *   create — the desk can never permanently stop.
+ * - Owner revalidation: after acquiring the marker we RE-READ the main lock
+ *   and delete it only if the owner is STILL dead. If another contender
+ *   reclaimed and re-acquired it while we waited for the marker, we back off
+ *   instead of deleting a live lock (which would let two runs both POST).
+ *
+ * Returns "acquired" | "busy" | "not-dead". The residual window — a stale-
+ * marker cleanup unlinking a marker re-created in the same instant — is
+ * documented in docs/live-validation: its worst case is one visible duplicate
+ * card, the same class as the acknowledged POST→journal crash window.
  */
 function reclaimDeadLock(
   lockFile: string,
   reclaimMarker: string,
   owner: string,
-): boolean {
-  try {
-    writeFileSync(
-      reclaimMarker,
-      JSON.stringify({ pid: process.pid, at: Date.now() }),
-      { flag: "wx" },
-    );
-  } catch (markerError) {
-    if ((markerError as NodeJS.ErrnoException).code !== "EEXIST") {
-      throw markerError;
+): ReclaimOutcome {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      writeFileSync(
+        reclaimMarker,
+        JSON.stringify({ pid: process.pid, at: Date.now() }),
+        { flag: "wx" },
+      );
+      break;
+    } catch (markerError) {
+      if ((markerError as NodeJS.ErrnoException).code !== "EEXIST") {
+        throw markerError;
+      }
+      // Someone holds the marker. If its owner is provably dead (a crashed
+      // reclaim), remove the stale marker and retry — otherwise a live
+      // holder is mid-reclaim and we wait.
+      if (!lockOwnerDead(reclaimMarker) || attempt >= 2) {
+        return "busy";
+      }
+      try {
+        rmSync(reclaimMarker, { force: true });
+      } catch {
+        return "busy"; // lost the unlink race — someone else owns the marker
+      }
     }
-    return false; // another process is mid-reclaim
   }
   try {
-    // We hold the marker: remove the dead lock and re-acquire.
+    // Revalidate the main lock before deleting it: a contender may have
+    // reclaimed and re-acquired it while we waited for the marker. Delete
+    // only a lock whose owner is STILL dead.
+    if (!lockOwnerDead(lockFile)) {
+      return "not-dead";
+    }
     rmSync(lockFile, { force: true });
     writeFileSync(lockFile, owner, { flag: "wx" });
-    return true; // acquired
+    return "acquired";
   } finally {
     try {
       rmSync(reclaimMarker, { force: true });
@@ -532,8 +606,9 @@ async function withEscalateLock<T>(
   for (;;) {
     if (tryAcquireLock(lockFile, owner)) break;
     if (lockOwnerDead(lockFile)) {
-      if (reclaimDeadLock(lockFile, reclaimMarker, owner)) break;
-      // Another process is mid-reclaim — bounded wait below.
+      const outcome = reclaimDeadLock(lockFile, reclaimMarker, owner);
+      if (outcome === "acquired") break;
+      // "busy" / "not-dead" — wait and re-check the lock below.
     }
     if (Date.now() - started > timeoutMs) {
       throw new EscalateError(

@@ -431,6 +431,115 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
     }
   });
 
+  test("a stale reclaim marker from a crashed reclaim does not strand the desk", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ranger-escalate-marker-"));
+    const fixtureDir = mkdtempSync(join(tmpdir(), "ranger-escalate-marker-fx-"));
+    const discord = fakeDiscord();
+    try {
+      writeFixtures(fixtureDir);
+      const config = writeConfig(dir);
+      const env = envFor(fixtureDir, discord.port);
+
+      // A crashed reclaim leaves BOTH a dead lock and a stale `.reclaiming`
+      // marker whose owner is dead. The desk must not strand forever (EEXIST
+      // on the marker): the stale marker is cleaned up and the dead lock
+      // reclaimed (round-13 review fix).
+      const lockFile = join(dir, ".escalate.lock");
+      const marker = `${lockFile}.reclaiming`;
+      const deadPid = 2_000_000_000; // ESRCH on kill(pid, 0)
+      writeFileSync(
+        lockFile,
+        JSON.stringify({ pid: deadPid, startedAt: Date.now() - 60_000 }),
+      );
+      writeFileSync(
+        marker,
+        JSON.stringify({ pid: deadPid, at: Date.now() - 60_000 }),
+      );
+
+      const run = await runCli(["escalate", "-c", config, "--json"], env);
+      expect(run.code).toBe(0);
+      const report = JSON.parse(run.stdout);
+      expect(report.maps[0].posted).toHaveLength(4); // not stranded
+      expect(existsSync(lockFile)).toBe(false); // released after the run
+      expect(existsSync(marker)).toBe(false); // stale marker cleaned up
+    } finally {
+      discord.stop();
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(fixtureDir, { recursive: true, force: true });
+    }
+  });
+
+  test("mention syntax in kind/url is inerted, and the overdue suffix survives a huge decision body", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ranger-escalate-suffix-"));
+    const fixtureDir = mkdtempSync(join(tmpdir(), "ranger-escalate-suffix-fx-"));
+    const discord = fakeDiscord();
+    try {
+      // One grilling node: kind + url embed `<@1234567890>` (a graph author
+      // trying to ping the principal outside the 7-day policy) and the body
+      // (entry top level) is huge to force the front-cap to engage.
+      const node = {
+        ref: { id: "31" },
+        node: {
+          id: "31",
+          title: "Decision with mention",
+          kind: "<@1234567890>",
+          checkpointId: "decide",
+          autonomy: "propose",
+          probes: [],
+        },
+        status: "open",
+        assignees: [],
+        blockedBy: [],
+        author: "alice",
+        url: "https://github.com/acme/widgets/issues/<@1234567890>",
+        typed: true,
+        parent: { id: "1" },
+        body: "This is the full grilling question and its options. ".repeat(120),
+      };
+      writeFileSync(
+        join(fixtureDir, "acme__widgets-frontier.json"),
+        JSON.stringify({ repo: "acme/widgets", root: "1", frontier: [node] }),
+      );
+      writeFileSync(
+        join(fixtureDir, "acme__widgets-audit.json"),
+        JSON.stringify({
+          repo: "acme/widgets",
+          root: "1",
+          nodes: 2,
+          closedWithoutReceipt: [],
+          openWithoutCheckpoint: [],
+          openClaimed: [],
+        }),
+      );
+      const config = writeConfig(dir, "999"); // principal.discordId → pings
+      const env = envFor(fixtureDir, discord.port);
+      const run1 = await runCli(["escalate", "-c", config, "--json"], env);
+      expect(JSON.parse(run1.stdout).maps[0].posted).toHaveLength(1);
+
+      // A week later the age band is overdue: content changes → edit in
+      // place. Assert kind/url mentions are inerted and the `<@id>` suffix
+      // survives the 1950-char front-cap.
+      const later = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+      const run2 = await runCli(["escalate", "-c", config, "--json"], {
+        ...env,
+        RANGER_NOW: later.toISOString(),
+      });
+      expect(JSON.parse(run2.stdout).maps[0].edited).toEqual(["31"]);
+      const content = discord.edits.at(-1)?.content ?? "";
+      expect(content).not.toContain("<@1234567890>");
+      expect(content).toContain("‹@1234567890");
+      // The overdue suffix — including the `<@id>` ping — survives the
+      // 1950-char front-cap (round-13 review fix).
+      expect(content).toContain("📣 <@999>");
+      expect(content.endsWith("**7d** — needs your attention")).toBe(true);
+      expect(content.length).toBeLessThanOrEqual(1950);
+    } finally {
+      discord.stop();
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(fixtureDir, { recursive: true, force: true });
+    }
+  });
+
   test("rejects a non-discord/non-localhost RANGER_DISCORD_API_BASE (token-exfil guard)", async () => {
     const dir = mkdtempSync(join(tmpdir(), "ranger-escalate-evil-"));
     const fixtureDir = mkdtempSync(join(tmpdir(), "ranger-escalate-evil-fx-"));

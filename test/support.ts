@@ -1,9 +1,40 @@
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { runCmd } from "../src/exec.ts";
 
 export const fixturesBin = join(import.meta.dir, "fixtures", "bin");
 export const cliPath = join(import.meta.dir, "..", "src", "cli.ts");
 export const bun = process.execPath;
+
+export const GIT_ENV = {
+ GIT_AUTHOR_NAME: "ranger-test",
+ GIT_AUTHOR_EMAIL: "ranger-test@example.com",
+ GIT_COMMITTER_NAME: "ranger-test",
+ GIT_COMMITTER_EMAIL: "ranger-test@example.com",
+};
+
+/**
+ * Seed a real git origin (with a main branch) and a canonical clone, the
+ * fixture shared by every run-node/worktree test. Returns the origin and
+ * canonical paths.
+ */
+export async function createCanonicalRepo(
+ dir: string,
+): Promise<{ origin: string; canonical: string }> {
+ const seed = join(dir, "seed");
+ mkdirSync(seed, { recursive: true });
+ writeFileSync(join(seed, "README.md"), "# acme/widgets\n");
+ const git = (args: string[], cwd: string) =>
+  runCmd("git", args, { cwd, env: { ...process.env, ...GIT_ENV } });
+ await git(["init", "-b", "main"], seed);
+ await git(["add", "-A"], seed);
+ await git(["commit", "-m", "initial"], seed);
+ const origin = join(dir, "origin.git");
+ await git(["clone", "--bare", seed, origin], dir);
+ const canonical = join(dir, "canonical");
+ await git(["clone", origin, canonical], dir);
+ return { origin, canonical };
+}
 
 /**
  * The ranger.yaml skeleton shared by every e2e suite. Suites inject their

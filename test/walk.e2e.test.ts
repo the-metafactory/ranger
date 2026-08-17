@@ -19,17 +19,17 @@ import {
 import { researchCandidates } from "../src/walk.ts";
 import { bootstrapWorktree } from "../src/worker.ts";
 import type { FrontierEntry } from "../src/graph.ts";
-import { baseConfigLines, fakeDiscord, runCli } from "./support.ts";
+import {
+ baseConfigLines,
+ createCanonicalRepo,
+ fakeDiscord,
+ GIT_ENV,
+ runCli,
+} from "./support.ts";
 
 const fixturesBin = join(import.meta.dir, "fixtures", "bin");
 const dataDir = join(import.meta.dir, "fixtures", "data");
 
-const GIT_ENV = {
- GIT_AUTHOR_NAME: "ranger-test",
- GIT_AUTHOR_EMAIL: "ranger-test@example.com",
- GIT_COMMITTER_NAME: "ranger-test",
- GIT_COMMITTER_EMAIL: "ranger-test@example.com",
-};
 
 function writeConfig(dir: string, extra: string[] = []): string {
  const config = [
@@ -259,33 +259,7 @@ describe("ranger run-node — research worker full loop (node #13 acceptance)", 
   const dir = mkdtempSync(join(tmpdir(), "ranger-run-"));
   try {
    // Seed a real git origin with a main branch, then a canonical clone.
-   const seed = join(dir, "seed");
-   mkdirSync(seed, { recursive: true });
-   writeFileSync(join(seed, "README.md"), "# acme/widgets\n");
-   await runCmd("git", ["init", "-b", "main"], {
-    cwd: seed,
-    env: { ...process.env, ...GIT_ENV },
-   });
-   await runCmd("git", ["add", "-A"], {
-    cwd: seed,
-    env: { ...process.env, ...GIT_ENV },
-   });
-   await runCmd("git", ["commit", "-m", "initial"], {
-    cwd: seed,
-    env: { ...process.env, ...GIT_ENV },
-   });
-
-   const origin = join(dir, "origin.git");
-   await runCmd("git", ["clone", "--bare", seed, origin], {
-    cwd: dir,
-    env: { ...process.env, ...GIT_ENV },
-   });
-
-   const canonical = join(dir, "canonical");
-   await runCmd("git", ["clone", origin, canonical], {
-    cwd: dir,
-    env: { ...process.env, ...GIT_ENV },
-   });
+const { origin, canonical } = await createCanonicalRepo(dir);
 
    const config = writeConfig(dir);
    // Node 10 is already claimed by the bot (walk claimed it in a prior tick).
@@ -358,31 +332,7 @@ describe("ranger run-node — research worker full loop (node #13 acceptance)", 
  test("worker crash with no findings → refused, dead-man increments", async () => {
   const dir = mkdtempSync(join(tmpdir(), "ranger-run-"));
   try {
-   const seed = join(dir, "seed");
-   mkdirSync(seed, { recursive: true });
-   writeFileSync(join(seed, "README.md"), "# acme/widgets\n");
-   await runCmd("git", ["init", "-b", "main"], {
-    cwd: seed,
-    env: { ...process.env, ...GIT_ENV },
-   });
-   await runCmd("git", ["add", "-A"], {
-    cwd: seed,
-    env: { ...process.env, ...GIT_ENV },
-   });
-   await runCmd("git", ["commit", "-m", "initial"], {
-    cwd: seed,
-    env: { ...process.env, ...GIT_ENV },
-   });
-   const origin = join(dir, "origin.git");
-   await runCmd("git", ["clone", "--bare", seed, origin], {
-    cwd: dir,
-    env: { ...process.env, ...GIT_ENV },
-   });
-   const canonical = join(dir, "canonical");
-   await runCmd("git", ["clone", origin, canonical], {
-    cwd: dir,
-    env: { ...process.env, ...GIT_ENV },
-   });
+const { origin } = await createCanonicalRepo(dir);
 
    const config = writeConfig(dir);
    const statePath = writeState(dir, {
@@ -517,31 +467,7 @@ describe("bootstrapWorktree — orphaned branch (node #19 live finding)", () => 
  test("creates the worktree when the worktree branch already exists (no `-b` failure)", async () => {
   const dir = mkdtempSync(join(tmpdir(), "ranger-wt-"));
   try {
-   const seed = join(dir, "seed");
-   mkdirSync(seed, { recursive: true });
-   writeFileSync(join(seed, "README.md"), "# acme/widgets\n");
-   await runCmd("git", ["init", "-b", "main"], {
-    cwd: seed,
-    env: { ...process.env, ...GIT_ENV },
-   });
-   await runCmd("git", ["add", "-A"], {
-    cwd: seed,
-    env: { ...process.env, ...GIT_ENV },
-   });
-   await runCmd("git", ["commit", "-m", "initial"], {
-    cwd: seed,
-    env: { ...process.env, ...GIT_ENV },
-   });
-   const origin = join(dir, "origin.git");
-   await runCmd("git", ["clone", "--bare", seed, origin], {
-    cwd: dir,
-    env: { ...process.env, ...GIT_ENV },
-   });
-   const canonical = join(dir, "canonical");
-   await runCmd("git", ["clone", origin, canonical], {
-    cwd: dir,
-    env: { ...process.env, ...GIT_ENV },
-   });
+const { canonical } = await createCanonicalRepo(dir);
 
    // Orphan the branch: create `node/10-test-node` but never attach a worktree
    // to it (the crash + prune case — the ref outlives its worktree).

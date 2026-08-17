@@ -68,6 +68,17 @@ can observe):
   the next run posts a duplicate card (visible and deletable in the thread).
   The journal's `escalations` rows and the cards in the threads are the
   record; a duplicate is the recoverable consequence, not corruption.
+- The reclaim path is crash-safe for the common crash: a run that dies while
+  holding the lock (or the `.reclaiming` marker) is cleaned up on the next
+  run — a dead-owner marker is removed before reclaim, and the main lock is
+  deleted only after re-validating its owner is still dead. One residual
+  window remains, disclosed honestly: if a process dies mid-reclaim at the
+  exact instant another run re-creates the marker, a stale-cleanup could
+  unlink a just-created marker and, under a pathological ≥3-contender
+  thundering herd, two runs could both reclaim and post one duplicate card
+  (visible and deletable in the thread) — the same recoverable class as the
+  POST→journal window above. It has never been observed; the revalidation
+  makes it require three concurrent reclaimers in one instant.
 - The **#19 walk** claims (claim/close identity, `claude -p` worker execution,
   the historical decisions write, findings-branch revision at close time) are
   operator-recorded here — the commands below can only confirm the *current*

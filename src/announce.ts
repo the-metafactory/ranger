@@ -113,7 +113,7 @@ export class DiscordAnnouncer implements Announcer {
 }
 
 /** In-memory announcer for tests: records posts, optionally fails. */
-class RecordingAnnouncer implements Announcer {
+export class RecordingAnnouncer implements Announcer {
  posts: { ctx: AnnounceContext; messageId: string }[] = [];
  private readonly fail: boolean;
 
