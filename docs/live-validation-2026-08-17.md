@@ -65,9 +65,12 @@ can observe):
   the next run posts a duplicate card (visible and deletable in the thread).
   The journal's `escalations` rows and the cards in the threads are the
   record; a duplicate is the recoverable consequence, not corruption.
-- The **#19 walk** claims (claim/close identity, worker execution, decisions
-  write, findings-branch revision) are operator-recorded here, not derivable
-  from the escalation commands; verify them against the soma graph itself.
+- The **#19 walk** claims (claim/close identity, `claude -p` worker execution,
+  the historical decisions write, findings-branch revision at close time) are
+  operator-recorded here — the commands below can only confirm the *current*
+  graph state and branch ref, not reconstruct who ran the worker or what was
+  decided months ago. The #19-specific facts remain assertions recorded by the
+  operator, not independently re-derivable from these commands.
 
 ```bash
 # 1. Re-run the cards pass + digest and inspect the reports (idempotent across

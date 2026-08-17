@@ -282,32 +282,21 @@ export class Journal {
    >,
  ): void {
   const existing = this.getEscalation(row.repo, row.nodeId);
+  // One resolved field set, reused for both the insert values and the
+  // conflict-update set (adding an escalation field is a single edit).
+  const fields = {
+   title: row.title ?? existing?.title ?? null,
+   route: row.route ?? existing?.route ?? null,
+   lastContent: row.lastContent ?? existing?.lastContent ?? null,
+   messageId: row.messageId,
+   createdAt: existing?.createdAt ?? row.createdAt,
+   lastEditedAt: row.lastEditedAt ?? existing?.lastEditedAt ?? null,
+   status: row.status ?? existing?.status ?? "open",
+  };
   this.db
    .insert(escalations)
-   .values({
-    key: row.key,
-    repo: row.repo,
-    nodeId: row.nodeId,
-    title: row.title ?? existing?.title ?? null,
-    route: row.route ?? existing?.route ?? null,
-    lastContent: row.lastContent ?? existing?.lastContent ?? null,
-    messageId: row.messageId,
-    createdAt: existing?.createdAt ?? row.createdAt,
-    lastEditedAt: row.lastEditedAt ?? existing?.lastEditedAt ?? null,
-    status: row.status ?? existing?.status ?? "open",
-   })
-   .onConflictDoUpdate({
-    target: escalations.key,
-    set: {
-     title: row.title ?? existing?.title ?? null,
-     route: row.route ?? existing?.route ?? null,
-     lastContent: row.lastContent ?? existing?.lastContent ?? null,
-     messageId: row.messageId,
-     createdAt: existing?.createdAt ?? row.createdAt,
-     lastEditedAt: row.lastEditedAt ?? existing?.lastEditedAt ?? null,
-     status: row.status ?? existing?.status ?? "open",
-    },
-   })
+   .values({ key: row.key, repo: row.repo, nodeId: row.nodeId, ...fields })
+   .onConflictDoUpdate({ target: escalations.key, set: fields })
    .run();
  }
 

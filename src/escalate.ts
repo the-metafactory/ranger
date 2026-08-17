@@ -1,4 +1,9 @@
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import { resolveDiscordApiBase } from "./discord.ts";
@@ -36,10 +41,14 @@ export class EscalateError extends Error {
 // ---- Discord card client (POST announce / PATCH edit) ----
 
 export class EscalationDiscord {
-  /** Minimum spacing between API calls from one client — Discord throttles
-   *  message writes per channel (~5/5s for bots), and a pooled pass of many
-   *  cards would otherwise trip 429s (observed live: 6 edits → 429). */
-  private static readonly MIN_INTERVAL_MS = 1000;
+  /**
+   * Minimum spacing between API calls from one client — Discord throttles
+   * message writes per channel (~5/5s for bots), and a pooled pass of many
+   * cards would otherwise trip 429s (observed live). Test seam:
+   * `RANGER_DISCORD_MIN_INTERVAL_MS` shrinks it so e2e suites stay fast.
+   */
+  private readonly minIntervalMs =
+    Number(process.env.RANGER_DISCORD_MIN_INTERVAL_MS) || 1000;
   private lastRequestAt = 0;
 
   constructor(
@@ -143,15 +152,18 @@ export class EscalationDiscord {
     );
   }
 
-  /** Space calls from this client apart so a pooled pass stays rate-limit-safe. */
+  /** Space calls from this client apart so a pooled pass stays rate-limit-safe.
+   *  The slot is reserved synchronously BEFORE any await, so concurrent
+   *  callers line up at 1s offsets instead of sleeping the same delay and
+   *  waking together (a burst that re-triggers the 429s). */
   private async throttle(): Promise<void> {
     const now = Date.now();
-    const wait =
-      this.lastRequestAt + EscalationDiscord.MIN_INTERVAL_MS - now;
+    const target = Math.max(this.lastRequestAt + this.minIntervalMs, now);
+    this.lastRequestAt = target; // reserve — atomic within the event loop
+    const wait = target - now;
     if (wait > 0) {
       await sleep(wait);
     }
-    this.lastRequestAt = Date.now();
   }
 
   /** Post a new card; returns the Discord message id (announce-once). */
@@ -433,11 +445,37 @@ async function withEscalateLock<T>(
         reclaimable = false;
       }
       if (reclaimable) {
+        // Atomically replace the dead lock via rename (rename replaces the
+        // target in one step) — never delete-then-recreate, which lets two
+        // reclaims delete each other's freshly-acquired lock and both POST.
+        const tmp = join(
+          dirname(lockFile),
+          `.escalate.lock.${process.pid}.tmp`,
+        );
+        writeFileSync(tmp, owner);
         try {
-          rmSync(lockFile, { force: true });
+          renameSync(tmp, lockFile);
         } catch {
-          /* concurrent reclaim — keep waiting */
+          try {
+            rmSync(tmp, { force: true });
+          } catch {
+            /* best-effort */
+          }
+          continue; // concurrent rename — keep waiting
         }
+        // Verify we actually hold it: a racing reclaim may have renamed over
+        // ours in the same instant — the loser waits instead of proceeding, so
+        // exactly one reclaiming process takes the lock (no duplicate cards).
+        let mine = false;
+        try {
+          const after = JSON.parse(readFileSync(lockFile, "utf8")) as {
+            pid?: number;
+          };
+          mine = after.pid === process.pid;
+        } catch {
+          mine = false;
+        }
+        if (mine) break; // we hold the lock
         continue;
       }
       if (Date.now() - started > timeoutMs) {

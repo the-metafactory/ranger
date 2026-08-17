@@ -55,10 +55,6 @@ export const vetoes = sqliteTable("vetoes", {
  * timestamp back the announce-once / edit-not-repost / age-banding contract:
  * a card is posted once, edited in place thereafter, and aged from `createdAt`.
  */
-/**
- * The Discord API base for production, with a hardened test seam — shared
- * with the walker announcer (src/discord.ts).
- */
 
 export const escalations = sqliteTable("escalations", {
  /** `${repo}:${nodeId}` — one card per node per map. */

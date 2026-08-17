@@ -119,6 +119,7 @@ describe("ranger walk — claim phase (node #13)", () => {
     FAKE_SOMA_STATE: statePath,
     RANGER_DISCORD_API_BASE: `http://127.0.0.1:${discord.port}`,
     RANGER_DISCORD_ALLOW_TEST_OVERRIDE: "1",
+    RANGER_DISCORD_MIN_INTERVAL_MS: "5", // keep e2e fast
     RANGER_DISCORD_TOKEN: "fake-bot-token",
     RANGER_WRITE_TEST: "ghp_write",
     RANGER_NO_SPAWN: "1",
@@ -167,6 +168,7 @@ describe("ranger walk — claim phase (node #13)", () => {
     FAKE_SOMA_STATE: statePath,
     RANGER_DISCORD_API_BASE: `http://127.0.0.1:${discord.port}`,
     RANGER_DISCORD_ALLOW_TEST_OVERRIDE: "1",
+    RANGER_DISCORD_MIN_INTERVAL_MS: "5", // keep e2e fast
     RANGER_DISCORD_TOKEN: "fake-bot-token",
     RANGER_WRITE_TEST: "ghp_write",
     RANGER_RO_TEST: "ghp_ro", // escalate cards pass needs the read-only token
@@ -242,6 +244,7 @@ describe("ranger walk — claim phase (node #13)", () => {
     FAKE_SOMA_STATE: statePath,
     RANGER_DISCORD_API_BASE: "http://127.0.0.1:1",
     RANGER_DISCORD_ALLOW_TEST_OVERRIDE: "1",
+    RANGER_DISCORD_MIN_INTERVAL_MS: "5", // keep e2e fast
     RANGER_DISCORD_TOKEN: "fake-bot-token",
     // a token whose real login is the principal — the refusal must fire even
     // though bot.identity labels it the principal (resolveBotIdentity passes
@@ -277,6 +280,7 @@ describe("ranger walk — claim phase (node #13)", () => {
     FAKE_SOMA_STATE: statePath,
     RANGER_DISCORD_API_BASE: "http://127.0.0.1:1",
     RANGER_DISCORD_ALLOW_TEST_OVERRIDE: "1",
+    RANGER_DISCORD_MIN_INTERVAL_MS: "5", // keep e2e fast
     RANGER_DISCORD_TOKEN: "fake-bot-token",
     RANGER_WRITE_TEST: "ghp_principal", // resolves to jcfischer, not ivy-bot
     RANGER_NO_SPAWN: "1",

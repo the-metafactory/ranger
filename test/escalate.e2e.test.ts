@@ -192,6 +192,7 @@ function envFor(dir: string, discordPort: number): NodeJS.ProcessEnv {
     FAKE_SOMA_DIR: dir,
     RANGER_DISCORD_API_BASE: `http://127.0.0.1:${discordPort}`,
     RANGER_DISCORD_ALLOW_TEST_OVERRIDE: "1",
+    RANGER_DISCORD_MIN_INTERVAL_MS: "5", // keep e2e fast
     RANGER_DISCORD_TOKEN: "fake-bot-token",
     RANGER_RO_TEST: "ghp_ro",
   };
@@ -453,6 +454,38 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
       const id = await client.post("hello");
       expect(id).toBe("retried-ok");
       expect(calls).toBe(2);
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  test("throttle reserves slots so concurrent posts do not burst", async () => {
+    const arrivals: number[] = [];
+    const server = Bun.serve({
+      port: 0,
+      async fetch() {
+        arrivals.push(Date.now());
+        await new Promise((r) => setTimeout(r, 5));
+        return Response.json({ id: `m-${arrivals.length}` });
+      },
+    });
+    try {
+      const client = new EscalationDiscord(
+        "tok",
+        "chan",
+        `http://127.0.0.1:${server.port}`,
+      );
+      await Promise.all([
+        client.post("a"),
+        client.post("b"),
+        client.post("c"),
+      ]);
+      // Slots are reserved 1s apart before any awaits, so the three arrivals
+      // must be spaced ~1s, never a [0, ~0, ~1s] burst.
+      expect(arrivals).toHaveLength(3);
+      const gaps = arrivals.slice(1).map((t, i) => t - arrivals[i]);
+      expect(gaps[0]).toBeGreaterThanOrEqual(900);
+      expect(gaps[1]).toBeGreaterThanOrEqual(900);
     } finally {
       server.stop(true);
     }
