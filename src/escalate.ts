@@ -10,10 +10,7 @@ import {
   type ClassifiedNode,
 } from "./route.ts";
 import { graphAudit, graphFrontier, type AuditResult } from "./graph.ts";
-import {
-  assertReadOnlyToken,
-  type ResolvedToken,
-} from "./token-gate.ts";
+import { assertReadOnlyToken, type ResolvedToken } from "./token-gate.ts";
 import type { EscalationRow, Journal } from "./journal.ts";
 
 /**
@@ -132,7 +129,9 @@ export class EscalationDiscord {
         if (attempt === 1 && firstRetryAfterSec > 30) {
           break;
         }
-        await sleep(global ? Math.max(waitMs, 30_000) : Math.min(waitMs, 30_000));
+        await sleep(
+          global ? Math.max(waitMs, 30_000) : Math.min(waitMs, 30_000),
+        );
       } catch (error) {
         throw new EscalateError(
           `discord ${method} ${path} failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -302,7 +301,10 @@ function cardContent(
     node.route.route === "escalate-hitl" &&
     node.body !== undefined &&
     node.body.trim().length > 0
-      ? `_${truncate(sanitizeGraphText(node.body), 140)}_`
+      ? // The body IS the decision payload (grilling question + prose options);
+        // give grilling cards more room so options stay visible, other HITL
+        // kinds stay terse.
+        `_${truncate(sanitizeGraphText(node.body), node.kind === "grilling" ? 400 : 140)}_`
       : null;
   const lines = [
     `${cardHead(node)} — **#${node.id}** ${sanitizeGraphText(node.title)}`,
@@ -348,8 +350,12 @@ interface EscalateMapResult {
   posted: string[];
   /** Node ids whose card was edited in place (edit-not-repost). */
   edited: string[];
-  /** Node ids whose card was marked resolved (no longer on the HITL queue). */
-  resolved: string[];
+  /**
+   * Node ids whose node left the HITL/provisioning queue: the card was
+   * edited to a "no longer on queue" note but KEPT open — cards persist
+   * until a principal response or operator verb resolves them (design §5).
+   */
+  keptOpen: string[];
   /** Per-card transient failures (e.g. Discord 429) — retried next tick. */
   cardErrors: string[];
   cards: EscalationCard[];
@@ -527,12 +533,107 @@ async function withEscalateLock<T>(
 }
 
 /**
- * Resolution phase: edit cards whose node left the HITL/provisioning queue to
- * a resolved note (design §5 — cards persist; only resolution ends them).
- * Returns the resolved node ids. Bounded-pool like the active pass so a
- * many-card map doesn't edit serially.
+ * One card's post/edit/journal state machine, isolated from map
+ * orchestration (announce-once for fresh cards, edit-on-change for repeats,
+ * transient failures returned as outcomes — never thrown).
  */
-async function resolveStaleCards(
+type SyncOutcome =
+  | { action: "posted"; id: string; card: EscalationCard }
+  | { action: "edited"; id: string; card: EscalationCard }
+  | { action: "unchanged"; id: string; card: EscalationCard }
+  | { action: "error"; id: string; error: string };
+
+async function syncCard(
+  ctx: {
+    client: EscalationDiscord;
+    journal: Journal;
+    map: RangerMapConfig;
+    config: RangerConfig;
+    now: Date;
+  },
+  node: ClassifiedNode,
+  prior: EscalationRow | undefined,
+): Promise<SyncOutcome> {
+  const { client, journal, map, config, now } = ctx;
+  const ageDays = prior === undefined ? 0 : dayDiff(prior.createdAt, now);
+  const content = cardContent(
+    node,
+    map,
+    ageDays,
+    config.principal.login,
+    config.principal.discordId,
+  );
+  try {
+    if (prior === undefined) {
+      const messageId = await client.post(content);
+      const row = {
+        key: `${map.repo}:${node.id}`,
+        repo: map.repo,
+        nodeId: node.id,
+        title: node.title,
+        route: node.route.route,
+        lastContent: content,
+        messageId,
+        createdAt: now.toISOString(),
+        status: "open" as const,
+      };
+      journal.upsertEscalation(row);
+      return {
+        action: "posted" as const,
+        id: node.id,
+        card: cardFrom(node, row, ageDays),
+      };
+    }
+    // Edit-on-change: a 900s tick re-runs ~96×/day; re-editing identical
+    // cards churns Discord writes and trips rate limits (observed live).
+    // Only PATCH when the rendered content actually differs.
+    if (prior.lastContent === content) {
+      return {
+        action: "unchanged" as const,
+        id: node.id,
+        card: cardFrom(node, prior, ageDays),
+      };
+    }
+    await client.edit(prior.messageId, content);
+    const row = {
+      key: `${map.repo}:${node.id}`,
+      repo: map.repo,
+      nodeId: node.id,
+      title: node.title,
+      route: node.route.route,
+      lastContent: content,
+      messageId: prior.messageId,
+      createdAt: prior.createdAt,
+      lastEditedAt: now.toISOString(),
+      status: "open" as const,
+    };
+    journal.upsertEscalation(row);
+    return {
+      action: "edited" as const,
+      id: node.id,
+      card: cardFrom(node, row, ageDays),
+    };
+  } catch (cardError) {
+    // A transient Discord failure on one card must not fail the whole desk —
+    // the card retries next tick (announce-once stays intact: a failed post
+    // writes no row, a failed edit keeps its row).
+    return {
+      action: "error" as const,
+      id: node.id,
+      error: cardError instanceof Error ? cardError.message : String(cardError),
+    };
+  }
+}
+
+/**
+ * Cards whose node left the HITL/provisioning queue are edited to a "no
+ * longer on queue" note but KEPT OPEN — design §5 says cards persist until a
+ * principal response or an operator verb resolves them; leaving the frontier
+ * is not a resolution. Edit-on-change applies, so a re-run of an already-
+ * noted card is a no-op. Bounded-pool like the active pass.
+ * Returns the node ids kept open this pass.
+ */
+async function markAbsentCards(
   ctx: {
     client: EscalationDiscord;
     journal: Journal;
@@ -541,21 +642,24 @@ async function resolveStaleCards(
   },
   existing: Map<string, EscalationRow>,
   neededIds: Set<string>,
-): Promise<{ resolved: string[]; errors: string[] }> {
+): Promise<{ keptOpen: string[]; errors: string[] }> {
   const { client, journal, map, now } = ctx;
-  const resolvable = [...existing.entries()].filter(
+  const openCards = [...existing.entries()].filter(
     ([, prior]) => prior.status !== "resolved",
   );
-  const outcomes = await mapPool(resolvable, 3, async ([nodeId, prior]) => {
+  const outcomes = await mapPool(openCards, 3, async ([nodeId, prior]) => {
     if (neededIds.has(nodeId)) return { action: "skip" as const };
+    const content = [
+      `~~**#${nodeId}** ${sanitizeGraphText(prior.title ?? "")}~~ no longer on the HITL/provisioning queue`,
+      `map: ${map.repo} — card kept open; resolves on a principal response or operator verb`,
+      `_edited ${now.toISOString()}_`,
+    ]
+      .filter((l) => l.trim().length > 0)
+      .join("\n");
     try {
-      const content = [
-        `~~**#${nodeId}** ${prior.title ?? ""}~~ ✅ resolved`,
-        `map: ${map.repo} — no longer on the HITL/provisioning queue`,
-        `_edited ${now.toISOString()}_`,
-      ]
-        .filter((l) => l.trim().length > 0)
-        .join("\n");
+      if (prior.lastContent === content) {
+        return { action: "unchanged" as const, id: nodeId };
+      }
       await client.edit(prior.messageId, content);
       journal.upsertEscalation({
         key: `${map.repo}:${nodeId}`,
@@ -566,29 +670,30 @@ async function resolveStaleCards(
         messageId: prior.messageId,
         createdAt: prior.createdAt,
         lastEditedAt: now.toISOString(),
-        status: "resolved",
+        status: prior.status, // stays open — cards persist (design §5)
       });
-      return { action: "resolved" as const, id: nodeId };
+      return { action: "keptOpen" as const, id: nodeId };
     } catch (cardError) {
-      // A transient failure on one resolution must not fail the desk — the
-      // card stays open and resolves on a later tick.
+      // A transient failure on one card must not fail the desk — it retries
+      // next tick and the card stays open.
       return {
         action: "error" as const,
         id: nodeId,
-        error: cardError instanceof Error ? cardError.message : String(cardError),
+        error:
+          cardError instanceof Error ? cardError.message : String(cardError),
       };
     }
   });
-  const resolved: string[] = [];
+  const keptOpen: string[] = [];
   const errors: string[] = [];
   for (const outcome of outcomes) {
     if (outcome.action === "error") {
       errors.push(`#${outcome.id}: ${outcome.error}`);
-    } else if (outcome.action === "resolved") {
-      resolved.push(outcome.id);
+    } else if (outcome.action === "keptOpen") {
+      keptOpen.push(outcome.id);
     }
   }
-  return { resolved, errors };
+  return { keptOpen, errors };
 }
 
 function ageText(
@@ -672,7 +777,7 @@ async function escalateOneMap(
     ok: true,
     posted: [],
     edited: [],
-    resolved: [],
+    keptOpen: [],
     cardErrors: [],
     cards: [],
   };
@@ -707,78 +812,13 @@ async function escalateOneMap(
     );
 
     const principal = config.principal.login;
+    void principal; // (login is read inside syncCard via config)
     const cards: EscalationCard[] = [];
-    const outcomes = await mapPool(needed, 3, async (node) => {
-      const prior = existing.get(node.id);
-      const ageDays = prior === undefined ? 0 : dayDiff(prior.createdAt, now);
-      const content = cardContent(
-        node,
-        map,
-        ageDays,
-        principal,
-        config.principal.discordId,
-      );
-      try {
-        if (prior === undefined) {
-          const messageId = await client.post(content);
-          const row = {
-            key: `${map.repo}:${node.id}`,
-            repo: map.repo,
-            nodeId: node.id,
-            title: node.title,
-            route: node.route.route,
-            lastContent: content,
-            messageId,
-            createdAt: now.toISOString(),
-            status: "open" as const,
-          };
-          journal.upsertEscalation(row);
-          return {
-            action: "posted" as const,
-            id: node.id,
-            card: cardFrom(node, row, ageDays),
-          };
-        }
-        // Edit-on-change: a 900s tick re-runs ~96×/day; re-editing identical
-        // cards churns Discord writes and trips rate limits (observed live).
-        // Only PATCH when the rendered content actually differs.
-        if (prior.lastContent === content) {
-          return {
-            action: "unchanged" as const,
-            id: node.id,
-            card: cardFrom(node, prior, ageDays),
-          };
-        }
-        await client.edit(prior.messageId, content);
-        const row = {
-          key: `${map.repo}:${node.id}`,
-          repo: map.repo,
-          nodeId: node.id,
-          title: node.title,
-          route: node.route.route,
-          lastContent: content,
-          messageId: prior.messageId,
-          createdAt: prior.createdAt,
-          lastEditedAt: now.toISOString(),
-          status: "open" as const,
-        };
-        journal.upsertEscalation(row);
-        return {
-          action: "edited" as const,
-          id: node.id,
-          card: cardFrom(node, row, ageDays),
-        };
-      } catch (cardError) {
-        // A transient Discord failure on one card must not fail the whole
-        // desk — the card retries next tick (announce-once stays intact: a
-        // failed post writes no row, a failed edit keeps its row).
-        return {
-          action: "error" as const,
-          id: node.id,
-          error: cardError instanceof Error ? cardError.message : String(cardError),
-        };
-      }
-    });
+    const outcomes = await mapPool(
+      needed,
+      3,
+      (node) => syncCard({ client, journal, map, config, now }, node, existing.get(node.id)),
+    );
     for (const outcome of outcomes) {
       if (outcome.action === "posted" || outcome.action === "edited") {
         cards.push(outcome.card);
@@ -792,13 +832,13 @@ async function escalateOneMap(
     }
 
     const neededIds = new Set(needed.map((n) => n.id));
-    const resolution = await resolveStaleCards(
+    const absent = await markAbsentCards(
       { client, journal, map, now },
       existing,
       neededIds,
     );
-    base.resolved.push(...resolution.resolved);
-    base.cardErrors.push(...resolution.errors);
+    base.keptOpen.push(...absent.keptOpen);
+    base.cardErrors.push(...absent.errors);
 
     return { ...base, cards };
   } catch (error) {
@@ -898,7 +938,9 @@ function digestContent(inputs: DigestInputs): string {
       );
     }
     if (cards.length > 15) {
-      lines.push(`  … and ${cards.length - 15} more open cards (full list in the thread)`);
+      lines.push(
+        `  … and ${cards.length - 15} more open cards (full list in the thread)`,
+      );
     }
   }
   lines.push("");

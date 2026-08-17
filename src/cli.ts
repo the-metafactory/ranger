@@ -312,7 +312,7 @@ function renderEscalateText(result: EscalateResult | DigestResult): string {
     `  edited: ${e.edited.length ? e.edited.map((n) => `#${n}`).join(", ") : "—"}`,
    );
    lines.push(
-    `  resolved: ${e.resolved.length ? e.resolved.map((n) => `#${n}`).join(", ") : "—"}`,
+    `  keptOpen: ${e.keptOpen.length ? e.keptOpen.map((n) => `#${n}`).join(", ") : "—"}`,
    );
    lines.push(`  cards: ${e.cards.length}`);
    if (e.cardErrors.length > 0) {

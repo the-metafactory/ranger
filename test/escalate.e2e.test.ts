@@ -62,7 +62,7 @@ function writeFixtures(dir: string, drop: string[] = []): string {
       ref: { id: "12" },
       node: {
         id: "12",
-        title: "Draft UX copy",
+        title: "Draft UX copy <@1234567890>",
         kind: "grilling",
         checkpointId: "copy-drafted",
         autonomy: "auto",
@@ -265,23 +265,37 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
       // A content change DOES edit in place: bump the age to day 1 (the age
       // suffix renders `· 1d`, so every card's content differs).
       const later = new Date(Date.now() + 24 * 60 * 60 * 1000);
-      const ageRun = await runCli(
-        ["escalate", "-c", config, "--json"],
-        { ...env, RANGER_NOW: later.toISOString() },
-      );
+      const ageRun = await runCli(["escalate", "-c", config, "--json"], {
+        ...env,
+        RANGER_NOW: later.toISOString(),
+      });
       const ageReport = JSON.parse(ageRun.stdout);
       expect(ageReport.maps[0].posted).toEqual([]);
       expect(ageReport.maps[0].edited.sort()).toEqual(["11", "12", "13", "14"]);
       expect(discord.posts).toHaveLength(4); // still no new posts
 
-      // Third run: node 12 leaves the queue → its card resolves, others edit.
+      // Third run: node 12 leaves the queue → its card is edited to a "no
+      // longer on queue" note but KEPT OPEN (design §5 — cards persist until
+      // a principal response or operator verb resolves them; leaving the
+      // frontier is not a resolution).
       writeFixtures(fixtureDir, ["12"]);
       const run3 = await runCli(["escalate", "-c", config, "--json"], env);
       const report3 = JSON.parse(run3.stdout);
-      expect(report3.maps[0].resolved).toEqual(["12"]);
+      expect(report3.maps[0].keptOpen).toEqual(["12"]);
       expect(report3.maps[0].posted).toEqual([]);
       const j2 = new Journal(join(dir, "state.sqlite"));
-      expect(j2.getEscalation("acme/widgets", "12")?.status).toBe("resolved");
+      expect(j2.getEscalation("acme/widgets", "12")?.status).toBe("open");
+      expect(j2.getEscalation("acme/widgets", "12")?.lastContent).toContain(
+        "no longer on the HITL/provisioning queue",
+      );
+      // The absent-card note inertes mention syntax too (a graph title can't
+      // ping the principal on resolve — review fix).
+      expect(j2.getEscalation("acme/widgets", "12")?.lastContent).not.toContain(
+        "<@1234567890>",
+      );
+      expect(j2.getEscalation("acme/widgets", "12")?.lastContent).toContain(
+        "‹@1234567890",
+      );
       expect(j2.getEscalation("acme/widgets", "11")?.status).toBe("open");
       j2.close();
     } finally {
@@ -319,7 +333,7 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
       expect(content).toContain("spawns today 0/10");
       // The digest renders the persisted route, not the node id (review fix).
       expect(content).toContain("#14 Provision the staging env — provisioning");
-      expect(content).toContain("#12 Draft UX copy — escalate-hitl");
+      expect(content).toContain("#12 Draft UX copy ‹@1234567890> — escalate-hitl");
 
       const postsBefore = discord.posts.length;
       const digest2 = await runCli(
@@ -479,11 +493,7 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
         "chan",
         `http://127.0.0.1:${server.port}`,
       );
-      await Promise.all([
-        client.post("a"),
-        client.post("b"),
-        client.post("c"),
-      ]);
+      await Promise.all([client.post("a"), client.post("b"), client.post("c")]);
       // Slots are reserved 1s apart before any awaits, so the three arrivals
       // must be spaced ~1s, never a [0, ~0, ~1s] burst.
       expect(arrivals).toHaveLength(3);
