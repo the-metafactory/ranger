@@ -338,12 +338,9 @@ function cardContent(
           bodyText,
           node.kind === "grilling" ? Math.max(120, bodyBudget) : 140,
         )}_`;
-  const lines = [
-    ...prefixLines,
-    bodyLine,
-    ...probeLines,
-    suffix,
-  ].filter((line): line is string => line !== null);
+  const lines = [...prefixLines, bodyLine, ...probeLines, suffix].filter(
+    (line): line is string => line !== null,
+  );
   // Discord rejects >2000-char messages; hard-cap as a final guard.
   const joined = lines.join("\n");
   return joined.length > 1950 ? `${joined.slice(0, 1949)}…` : joined;
@@ -838,10 +835,12 @@ async function escalateOneMap(
     );
 
     const cards: EscalationCard[] = [];
-    const outcomes = await mapPool(
-      needed,
-      3,
-      (node) => syncCard({ client, journal, map, config, now }, node, existing.get(node.id)),
+    const outcomes = await mapPool(needed, 3, (node) =>
+      syncCard(
+        { client, journal, map, config, now },
+        node,
+        existing.get(node.id),
+      ),
     );
     for (const outcome of outcomes) {
       if (outcome.action === "posted" || outcome.action === "edited") {
@@ -941,54 +940,74 @@ function digestContent(inputs: DigestInputs): string {
     inputs;
   const aged = cards.filter((c) => ageBand(c.ageDays) !== "fresh"); // 3+
   const overdue = cards.filter((c) => ageBand(c.ageDays) === "overdue"); // 7+
-  const lines: string[] = [
+  const header = [
     `:newspaper: **ranger digest** — ${map.repo} (root ${map.root}, walk: ${map.walk}) · ${localDateKey(now)}`,
     "",
     `**Cards: ${cards.length}**${aged.length > 0 ? ` (${aged.length} aged 3+d, ${overdue.length} 7+d${principalDiscordId ? " @-mentioned" : " no ping"})` : ""}`,
   ];
-  if (cards.length === 0) {
-    lines.push("  none open — clean");
-  } else {
-    // Cap the per-message card list — Discord rejects >2000-char payloads.
-    for (const card of cards.slice(0, 15)) {
-      const band = ageBand(card.ageDays);
-      lines.push(
-        `  #${card.nodeId} ${sanitizeGraphText(card.title)} — ${card.route} · ${ageText(
-          band,
-          card.ageDays,
-          principal,
-          principalDiscordId,
-        )}`,
-      );
-    }
-    if (cards.length > 15) {
-      lines.push(
-        `  … and ${cards.length - 15} more open cards (full list in the thread)`,
-      );
-    }
-  }
-  lines.push("");
   const summarize = (items: string[], max: number): string => {
     if (items.length === 0) return "";
     const head = items.slice(0, max).join(", ");
     return items.length > max ? `${head}, …+${items.length - max}` : head;
   };
-  lines.push(
+  const auditLines: string[] = [
     `**Audit:** receipt-less closes ${audit.closedWithoutReceipt.length}${audit.closedWithoutReceipt.length > 0 ? ` (${summarize(audit.closedWithoutReceipt, 8)})` : ""} · open w/o checkpoint ${audit.openWithoutCheckpoint.length}${audit.openWithoutCheckpoint.length > 0 ? ` (${summarize(audit.openWithoutCheckpoint, 8)})` : ""} · open claims ${audit.openClaimed.length}`,
-  );
+  ];
   if (audit.openClaimed.length > 0) {
     for (const c of audit.openClaimed.slice(0, 8)) {
-      lines.push(`    #${c.id} [${c.assignees.join(", ")}]`);
+      auditLines.push(`    #${c.id} [${c.assignees.join(", ")}]`);
     }
     if (audit.openClaimed.length > 8) {
-      lines.push(`    … and ${audit.openClaimed.length - 8} more open claims`);
+      auditLines.push(
+        `    … and ${audit.openClaimed.length - 8} more open claims`,
+      );
     }
   }
-  lines.push(
-    `**Budget:** spawns today ${budget.spawnsToday}/${budget.spawnCapPerDay} · dead-man ${budget.deadman} · ${budget.paused ? "PAUSED" : "running"}`,
+  const budgetLine = `**Budget:** spawns today ${budget.spawnsToday}/${budget.spawnCapPerDay} · dead-man ${budget.deadman} · ${budget.paused ? "PAUSED" : "running"}`;
+  // Reserve room for the audit + budget sections so a long card list can
+  // never evict the promised parts of a "cards + audit + budget" digest —
+  // the card list is capped to fit, not the tail sliced off.
+  const reserved =
+    header.join("\n").length +
+    2 +
+    auditLines.join("\n").length +
+    1 +
+    budgetLine.length;
+  const cardBudget = 1950 - reserved - 80; // +80 slack for the "… N more" line
+  const cardLines: string[] = [];
+  if (cards.length === 0) {
+    cardLines.push("  none open — clean");
+  } else {
+    let shown = 0;
+    for (const card of cards) {
+      if (shown >= 15) break; // hard cap on per-message card count
+      const band = ageBand(card.ageDays);
+      const line = `  #${card.nodeId} ${sanitizeGraphText(card.title)} — ${card.route} · ${ageText(
+        band,
+        card.ageDays,
+        principal,
+        principalDiscordId,
+      )}`;
+      if (
+        cardBudget > 0 &&
+        cardLines.join("\n").length + line.length + 1 > cardBudget
+      ) {
+        break; // stop before the promised sections would be evicted
+      }
+      cardLines.push(line);
+      shown++;
+    }
+    const skipped = cards.length - shown;
+    if (skipped > 0) {
+      cardLines.push(
+        `  … and ${skipped} more open cards (full list in the thread)`,
+      );
+    }
+  }
+  const joined = [...header, ...cardLines, "", ...auditLines, budgetLine].join(
+    "\n",
   );
-  // Discord rejects >2000-char messages; hard-cap the whole digest too.
-  const joined = lines.join("\n");
+  // Final guard (should not trigger — audit/budget are reserved above).
   return joined.length > 1950 ? `${joined.slice(0, 1949)}…` : joined;
 }
 
@@ -1049,18 +1068,46 @@ async function digestOneMap(
       now,
     });
 
-    // Digest is edit-not-repost within a day: cache the message id under
-    // `digest.<repo>`; a new (host-local) day posts a fresh digest.
+    // Digest is edit-not-repost within a day — and edit-on-change within the
+    // day: cache {today, messageId, lastContent}; a new (host-local) day posts
+    // a fresh digest, a same-day content change edits in place, and an
+    // unchanged same-day digest is a no-op (no Discord write — re-runs must
+    // not churn rate limits).
     const today = localDateKey(now);
-    const cached = journal.getHealth(`digest.${map.repo}`);
+    const cachedRaw = journal.getHealth(`digest.${map.repo}`);
+    let cached: {
+      today: string;
+      messageId: string;
+      lastContent: string;
+    } | null = null;
+    if (cachedRaw !== null) {
+      try {
+        cached = JSON.parse(cachedRaw) as {
+          today: string;
+          messageId: string;
+          lastContent: string;
+        };
+      } catch {
+        cached = null; // pre-edit-on-change cache format — treat as fresh
+      }
+    }
     let messageId = "";
     let posted = false;
-    if (cached !== null && cached.startsWith(`${today}:`)) {
-      messageId = cached.slice(today.length + 1);
-      await client.edit(messageId, content);
+    if (cached !== null && cached.today === today) {
+      messageId = cached.messageId;
+      if (cached.lastContent !== content) {
+        await client.edit(messageId, content);
+        journal.setHealth(
+          `digest.${map.repo}`,
+          JSON.stringify({ today, messageId, lastContent: content }),
+        );
+      }
     } else {
       messageId = await client.post(content);
-      journal.setHealth(`digest.${map.repo}`, `${today}:${messageId}`);
+      journal.setHealth(
+        `digest.${map.repo}`,
+        JSON.stringify({ today, messageId, lastContent: content }),
+      );
       posted = true;
     }
 

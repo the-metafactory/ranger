@@ -193,12 +193,12 @@ export function classify(
     // Unknown autonomy value — fail safe toward escalation.
     return { ...base, route: { route: "escalate-hitl", reason: "untyped" } };
   }
-  const blocked = probesRegistryBlocked(node.node, repo, registry);
-  if (blocked) {
+  const blockedProbes = blockedProbeSpecs(node.node, repo, registry);
+  if (blockedProbes.length > 0) {
     return {
       ...base,
       registryBlocked: true,
-      blockedProbes: blockedProbeSpecs(node.node, repo, registry),
+      blockedProbes,
       route: { route: "provisioning" },
     };
   }

@@ -277,9 +277,12 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
       expect(content).toContain("spawns today 0/10");
       // The digest renders the persisted route, not the node id (review fix).
       expect(content).toContain("#14 Provision the staging env — provisioning");
-      expect(content).toContain("#12 Draft UX copy ‹@1234567890> — escalate-hitl");
+      expect(content).toContain(
+        "#12 Draft UX copy ‹@1234567890> — escalate-hitl",
+      );
 
       const postsBefore = discord.posts.length;
+      const editsBefore = discord.edits.length;
       const digest2 = await runCli(
         ["escalate", "--digest", "-c", config, "--json"],
         env,
@@ -287,6 +290,79 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
       const d2 = JSON.parse(digest2.stdout);
       expect(d2.maps[0].posted).toBe(false); // same day → edited, not reposted
       expect(discord.posts.length).toBe(postsBefore); // no new digest message
+      // Edit-on-change: unchanged same-day content is a no-op — re-running
+      // the digest must not churn Discord writes (review fix).
+      expect(discord.edits.length).toBe(editsBefore);
+      expect(d2.maps[0].digestMessageId).toBe(d1.maps[0].digestMessageId);
+    } finally {
+      discord.stop();
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(fixtureDir, { recursive: true, force: true });
+    }
+  });
+
+  test("digest reserves room for audit + budget when card titles are long (review fix)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ranger-digest-long-"));
+    const fixtureDir = mkdtempSync(join(tmpdir(), "ranger-digest-long-fx-"));
+    const discord = fakeDiscord();
+    try {
+      // Five HITL nodes with very long titles — enough that an un-reserved
+      // digest would tail-slice the audit + budget sections.
+      const longTitle = (n: string) =>
+        `This is an extremely long decision title for node ${n} that stretches far beyond a normal card title ` +
+        `so the assembled card list consumes most of the Discord message budget and forces the budget-driven card cap to engage `.repeat(3) +
+        `(end of node ${n} title)`;
+      const nodes = Array.from({ length: 5 }, (_, i) => {
+        const id = String(21 + i);
+        return {
+          ref: { id },
+          node: {
+            id,
+            title: longTitle(id),
+            kind: "grilling",
+            checkpointId: "decide",
+            autonomy: "propose",
+            probes: [],
+          },
+          status: "open",
+          assignees: [],
+          blockedBy: [],
+          author: "alice",
+          url: `https://github.com/acme/widgets/issues/${id}`,
+          typed: true,
+          parent: { id: "1" },
+        };
+      });
+      writeFileSync(
+        join(fixtureDir, "acme__widgets-frontier.json"),
+        JSON.stringify({ repo: "acme/widgets", root: "1", frontier: nodes }),
+      );
+      writeFileSync(
+        join(fixtureDir, "acme__widgets-audit.json"),
+        JSON.stringify({
+          repo: "acme/widgets",
+          root: "1",
+          nodes: 16,
+          closedWithoutReceipt: ["7", "8"],
+          openWithoutCheckpoint: ["9"],
+          openClaimed: [{ id: "16", assignees: ["alice"] }],
+        }),
+      );
+      const config = writeConfig(dir);
+      const env = envFor(fixtureDir, discord.port);
+
+      const cards = await runCli(["escalate", "-c", config, "--json"], env);
+      expect(JSON.parse(cards.stdout).maps[0].posted).toHaveLength(5);
+
+      const digest = await runCli(["escalate", "--digest", "-c", config, "--json"], env);
+      expect(digest.code).toBe(0);
+      const content = discord.posts.at(-1)?.content ?? "";
+      // The promised sections survive a long card list.
+      expect(content).toContain("**Audit:** receipt-less closes");
+      expect(content).toContain("**Budget:** spawns today");
+      // The card list was capped to fit (not the tail sliced off).
+      expect(content).toMatch(/more open cards \(full list in the thread\)/);
+      expect(content.length).toBeLessThanOrEqual(1950);
     } finally {
       discord.stop();
       rmSync(dir, { recursive: true, force: true });
