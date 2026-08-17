@@ -3,8 +3,7 @@
 <plist version="1.0">
 <dict>
     <!-- ranger escalation desk — daily digest (design §5, map node #20).
-         Runs the token-injecting wrapper (~/bin/ranger) escalate --digest each
-         morning (07:30 Europe/Zurich): one aged-cards + audit + budget digest
+         Runs the token-injecting wrapper (~/bin/ranger) escalate --digest each morning at 07:30 in the host's local time (this host runs Europe/Zurich — launchd StartCalendarInterval cannot encode a timezone, so on another host the instant shifts with local time): one aged-cards + audit + budget digest
          per map thread, edit-not-repost within a day. Cards themselves are
          posted/edited by the 15-min tick surface only when the tick env runs
          them; the digest is the daily re-surface (age-banded, 7+ @-mention).

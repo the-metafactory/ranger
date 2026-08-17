@@ -39,10 +39,12 @@ export class EscalationDiscord {
     private readonly token: string,
     private readonly channelId: string,
     private readonly apiBase: string = escalationApiBase(),
+    private readonly principalDiscordId?: string,
   ) {}
 
   static fromMap(
     map: RangerMapConfig,
+    principalDiscordId?: string,
     env: NodeJS.ProcessEnv = process.env,
   ): EscalationDiscord {
     if (map.discord === undefined) {
@@ -57,7 +59,12 @@ export class EscalationDiscord {
         `discord token env ${map.discord.tokenEnv} is unset — cannot post escalation cards for ${map.repo}.`,
       );
     }
-    return new EscalationDiscord(token, map.discord.channelId);
+    return new EscalationDiscord(
+      token,
+      map.discord.channelId,
+      undefined,
+      principalDiscordId,
+    );
   }
 
   private async request(
@@ -72,7 +79,18 @@ export class EscalationDiscord {
           Authorization: `Bot ${this.token}`,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ content }),
+        // parse: [] suppresses untrusted @everyone/@here/role mentions in
+        // graph-derived content; only the principal's id (when configured)
+        // is allowed to ping.
+        body: JSON.stringify({
+          content,
+          allowed_mentions: {
+            parse: [],
+            users: this.principalDiscordId
+              ? [this.principalDiscordId]
+              : [],
+          },
+        }),
       });
     } catch (error) {
       throw new EscalateError(
@@ -117,30 +135,46 @@ export class EscalationDiscord {
 
 /**
  * The Discord API base for production, with a hardened test seam.
- * `RANGER_DISCORD_API_BASE` must resolve to discord.com or localhost — an
- * injected override can otherwise redirect the bot token to an attacker
- * host (security review). Absent/empty → the fixed Discord origin.
+ * `RANGER_DISCORD_API_BASE` may only target discord.com over https, or a
+ * loopback listener when the test seam is explicitly opted in
+ * (`RANGER_DISCORD_ALLOW_TEST_OVERRIDE=1`) — an injected override can
+ * otherwise redirect the bot token to an attacker host (security review).
+ * Absent/empty → the fixed Discord origin.
  */
 function escalationApiBase(): string {
   const override = process.env.RANGER_DISCORD_API_BASE;
   if (override === undefined || override.length === 0) {
     return "https://discord.com/api/v10";
   }
-  let host = "";
+  let url: URL;
   try {
-    host = new URL(override).hostname.toLowerCase();
+    url = new URL(override);
   } catch {
     throw new EscalateError(
       "RANGER_DISCORD_API_BASE is not a valid URL; refusing to use it",
     );
   }
-  if (host !== "discord.com" && host !== "localhost" && host !== "127.0.0.1") {
-    throw new EscalateError(
-      `RANGER_DISCORD_API_BASE host ${host} is not allowed — ` +
-        "discord.com or localhost only",
-    );
+  const host = url.hostname.toLowerCase();
+  if (host === "discord.com") {
+    if (url.protocol !== "https:") {
+      throw new EscalateError(
+        "RANGER_DISCORD_API_BASE discord.com override must be https",
+      );
+    }
+    return override;
   }
-  return override;
+  // Loopback is only a test seam, and only when explicitly opted in — an
+  // injected override otherwise redirects the bot token to a local listener.
+  if (
+    (host === "localhost" || host === "127.0.0.1") &&
+    process.env.RANGER_DISCORD_ALLOW_TEST_OVERRIDE === "1"
+  ) {
+    return override;
+  }
+  throw new EscalateError(
+    `RANGER_DISCORD_API_BASE host ${host} is not allowed — ` +
+      "discord.com (https) or an explicit localhost test override only",
+  );
 }
 
 // ---- card content ----
@@ -170,18 +204,32 @@ function cardHead(node: ClassifiedNode): string {
 }
 
 /** Age band (design §5): shown from day 1, louder at 3+, @-mention at 7+. */
+type AgeBand = "fresh" | "aging" | "overdue";
+
+function ageBand(ageDays: number): AgeBand {
+  if (ageDays >= 7) return "overdue";
+  if (ageDays >= 3) return "aging";
+  return "fresh";
+}
+
+/** Collapse prose to one line, truncating at `max` chars. */
+function truncate(text: string, max: number): string {
+  const oneLine = text.replace(/\s+/g, " ").trim();
+  return oneLine.length > max ? `${oneLine.slice(0, max - 1)}…` : oneLine;
+}
+
 function ageSuffix(ageDays: number, principal: string): string {
-  if (ageDays >= 7) {
+  if (ageBand(ageDays) === "overdue") {
     return `📣 @${principal} **${ageDays}d** — needs your attention`;
   }
-  if (ageDays >= 3) {
+  if (ageBand(ageDays) === "aging") {
     return `⚠️ **${ageDays}d** — aging; blocked-descendant count unavailable ` +
       "(read-only surface can't enumerate blocked nodes)";
   }
   return `· ${ageDays}d`;
 }
 
-export function cardContent(
+function cardContent(
   node: ClassifiedNode,
   map: { repo: string },
   ageDays: number,
@@ -202,6 +250,12 @@ export function cardContent(
           ),
         ]
       : [];
+  const bodyLine =
+    node.route.route === "escalate-hitl" &&
+    node.body !== undefined &&
+    node.body.trim().length > 0
+      ? `_${truncate(node.body, 140)}_`
+      : null;
   const lines = [
     `${cardHead(node)} — **#${node.id}** ${node.title}`,
     `map: ${map.repo} · ${node.kind} · ${node.autonomy}`,
@@ -210,6 +264,7 @@ export function cardContent(
       ? `checkpoint: \`${node.checkpointId}\``
       : null,
     reason ? `_${reason}_` : null,
+    bodyLine,
     ...probeLines,
     ageSuffix(ageDays, principal),
   ].filter((line): line is string => line !== null);
@@ -218,7 +273,7 @@ export function cardContent(
 
 // ---- the cards run ----
 
-export interface EscalationCard {
+interface EscalationCard {
   nodeId: string;
   title: string;
   kind: string;
@@ -233,7 +288,7 @@ export interface EscalationCard {
   messageId: string;
 }
 
-export interface EscalateMapResult {
+interface EscalateMapResult {
   repo: string;
   ok: boolean;
   error?: string;
@@ -251,7 +306,7 @@ export interface EscalateResult {
   maps: EscalateMapResult[];
 }
 
-export function dayDiff(fromIso: string, now: Date): number {
+function dayDiff(fromIso: string, now: Date): number {
   const from = new Date(fromIso);
   const fromDay = Date.UTC(
     from.getUTCFullYear(),
@@ -400,7 +455,7 @@ async function escalateOneMap(
 
   let client: EscalationDiscord;
   try {
-    client = EscalationDiscord.fromMap(map);
+    client = EscalationDiscord.fromMap(map, config.principal.discordId);
   } catch (error) {
     return {
       ...base,
@@ -468,10 +523,14 @@ async function escalateOneMap(
 
     // Resolve cards whose node is no longer on the HITL/provisioning queue —
     // the card is edited to a resolved note, never silently dropped (design
-    // §5: cards persist; only resolution ends them).
-    for (const [nodeId, prior] of existing) {
-      if (prior.status === "resolved") continue;
-      if (needed.some((n) => n.id === nodeId)) continue;
+    // §5: cards persist; only resolution ends them). Bounded-pool like the
+    // active pass so a many-card map doesn't edit serially.
+    const neededIds = new Set(needed.map((n) => n.id));
+    const resolvable = [...existing.entries()].filter(
+      ([, prior]) => prior.status !== "resolved",
+    );
+    const resolved = await mapPool(resolvable, 3, async ([nodeId, prior]) => {
+      if (neededIds.has(nodeId)) return null;
       await client.edit(
         prior.messageId,
         [
@@ -492,7 +551,10 @@ async function escalateOneMap(
         lastEditedAt: now.toISOString(),
         status: "resolved",
       });
-      base.resolved.push(nodeId);
+      return nodeId;
+    });
+    for (const nodeId of resolved) {
+      if (nodeId !== null) base.resolved.push(nodeId);
     }
 
     return { ...base, cards };
@@ -558,8 +620,8 @@ function digestContent(
   principal: string,
   now: Date,
 ): string {
-  const aged = cards.filter((c) => c.ageDays >= 3);
-  const overdue = cards.filter((c) => c.ageDays >= 7);
+  const aged = cards.filter((c) => ageBand(c.ageDays) !== "fresh"); // 3+
+  const overdue = cards.filter((c) => ageBand(c.ageDays) === "overdue"); // 7+
   const lines: string[] = [
     `:newspaper: **ranger digest** — ${map.repo} (root ${map.root}, walk: ${map.walk}) · ${now.toISOString().slice(0, 10)}`,
     "",
@@ -569,10 +631,11 @@ function digestContent(
     lines.push("  none open — clean");
   } else {
     for (const card of cards) {
+      const band = ageBand(card.ageDays);
       const age =
-        card.ageDays >= 7
+        band === "overdue"
           ? `📣 @${principal} ${card.ageDays}d`
-          : card.ageDays >= 3
+          : band === "aging"
             ? `⚠️ ${card.ageDays}d`
             : `${card.ageDays}d`;
       lines.push(`  #${card.nodeId} ${card.title} — ${card.route} · ${age}`);
@@ -626,7 +689,7 @@ async function digestOneMap(
   }
   let client: EscalationDiscord;
   try {
-    client = EscalationDiscord.fromMap(map);
+    client = EscalationDiscord.fromMap(map, config.principal.discordId);
   } catch (error) {
     return {
       ...base,
@@ -637,9 +700,9 @@ async function digestOneMap(
 
   try {
     const audit = await graphAudit(map.repo, map.root, token);
+    // Open cards only — the digest never needs resolved history (suggestion).
     const open = journal
-      .listEscalations(map.repo)
-      .filter((row) => row.status === "open")
+      .listOpenEscalations(map.repo)
       .map((row) => ({
         nodeId: row.nodeId,
         title: row.title ?? `#${row.nodeId}`,

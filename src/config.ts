@@ -84,6 +84,8 @@ const BotSchema = z.object({
 const PrincipalSchema = z.object({
  /** The principal's login — the identity autonomous graph-mutation may never run under. */
  login: z.string().default("jcfischer"),
+ /** Discord user id for the aged-card @-mention; absent → no pings. */
+ discordId: z.string().optional(),
 });
 
 const StateSchema = z.object({

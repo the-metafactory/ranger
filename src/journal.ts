@@ -1,4 +1,4 @@
-import { desc, eq } from "drizzle-orm";
+import { and, desc, eq } from "drizzle-orm";
 import { openDb, type RangerDb } from "./store/db.ts";
 import {
  escalations,
@@ -320,6 +320,16 @@ export class Journal {
         where: eq(escalations.repo, repo),
        })
        .sync();
+  return rows.map(hydrateEscalation);
+ }
+
+ /** Open cards only — avoids materializing resolved history on every pass. */
+ listOpenEscalations(repo: string): EscalationRow[] {
+  const rows = this.db.query.escalations
+   .findMany({
+    where: and(eq(escalations.repo, repo), eq(escalations.status, "open")),
+   })
+   .sync();
   return rows.map(hydrateEscalation);
  }
 

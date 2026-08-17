@@ -1,9 +1,11 @@
 # Live validation — claim+research lane + escalation desk (2026-08-17)
 
-Operational evidence for the node #18 (walker live validation) and node #20
-(escalation desk) increments. Everything below was executed against the live
-soma graph under the machine account `ivy-agent` on 2026-08-17; the message
-ids are Discord snowflakes from the ranger (`#soma`) and Seekolous threads.
+Operator-recorded evidence for the node #18 (walker live validation) and node `#20` (escalation desk) increments. The assertions below were logged by the
+operator (the machine account `ivy-agent`) against the live soma graph on
+2026-08-17. They are **records of what ran, not independently verifiable audit
+artifacts** — the snowflake ids are the Discord message identifiers, and the
+section at the end gives the exact commands to re-verify each claim on a live
+host.
 
 ## Claim + research lane under the machine account
 
@@ -41,10 +43,32 @@ ids are Discord snowflakes from the ranger (`#soma`) and Seekolous threads.
 The live plists at `~/Library/LaunchAgents/` embed the principal's home path
 and machine-account wrapper, so the repo versions them as `.plist.example`
 templates with `/Users/__USER__` placeholders (`ops/launchd/*.plist.example`);
-install by substituting the real home path.
+install by substituting the real home path. `launchctl list` on this host
+reported both jobs loaded with exit status 0 at record time.
 
 - `ch.invisible.ranger-tick` — walk pass every 900s via `~/bin/ranger` wrapper
   (injects keychain `ivy-agent` write PAT + grove Discord bot token into the
-  tick env). `launchctl list` exit 0.
-- `ch.invisible.ranger-escalate` — daily digest at 07:30 Europe/Zurich.
-  `launchctl list` exit 0.
+  tick env).
+- `ch.invisible.ranger-escalate` — daily digest at 07:30 **in the host's local
+  time** (this host runs Europe/Zurich; launchd `StartCalendarInterval` cannot
+  encode a timezone, so the instant is local-time-relative).
+
+## Re-verifying these claims
+
+The cards pass is idempotent (announce-once, edit-not-repost), so re-running
+it reproduces the same observable state without new posts:
+
+```bash
+# 1. Re-run the cards pass + digest (idempotent) and inspect the reports.
+~/bin/ranger escalate --config ~/work/mf/ranger/ranger.yaml --json
+~/bin/ranger escalate --config ~/work/mf/ranger/ranger.yaml --digest --json
+
+# 2. The journal is the record of message ids and digests.
+sqlite3 ~/.config/ranger/state.sqlite \
+  "SELECT repo, node_id, status, message_id FROM escalations;"
+sqlite3 ~/.config/ranger/state.sqlite \
+  "SELECT key, value FROM health WHERE key LIKE 'digest.%';"
+
+# 3. The scheduled jobs and their last exit.
+launchctl list | grep ranger
+```

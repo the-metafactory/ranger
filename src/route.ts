@@ -35,6 +35,8 @@ export interface ClassifiedNode {
   registryBlocked: boolean;
   /** The blocked probe specs (run/cwd/host) — rendered on provisioning cards. */
   blockedProbes?: BlockedProbe[];
+  /** The node question/prose body — rendered on grilling cards (design §5). */
+  body?: string;
 }
 
 export interface ClassifyContext {
@@ -191,6 +193,7 @@ export function classify(
     url: node.url,
     checkpointId: node.node.checkpointId,
     registryBlocked: false,
+    body: node.body,
   };
 
   // Class 4 — untyped block (fail-safe approve). Reported as needs-typing.

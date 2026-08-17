@@ -74,6 +74,7 @@ function writeFixtures(dir: string, drop: string[] = []): string {
       url: "https://github.com/acme/widgets/issues/12",
       typed: true,
       parent: { id: "1" },
+      body: "Should we ship the copy now or wait for the brand refresh?",
     },
     {
       ref: { id: "13" },
@@ -183,6 +184,7 @@ function envFor(dir: string, discordPort: number): NodeJS.ProcessEnv {
     PATH: `${fixturesBin}:${process.env.PATH ?? ""}`,
     FAKE_SOMA_DIR: dir,
     RANGER_DISCORD_API_BASE: `http://127.0.0.1:${discordPort}`,
+    RANGER_DISCORD_ALLOW_TEST_OVERRIDE: "1",
     RANGER_DISCORD_TOKEN: "fake-bot-token",
     RANGER_RO_TEST: "ghp_ro",
   };
@@ -212,6 +214,10 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
       expect(joined).toContain("**Needs typing**");
       expect(joined).toContain("**Provisioning needed**");
       expect(joined).toContain("· 0d");
+      // Grilling cards carry the question body (design §5 decision payload).
+      expect(joined).toContain(
+        "Should we ship the copy now or wait for the brand refresh?",
+      );
       // Provisioning cards carry the exact probe run+cwd for the principal
       // to paste into the registry (design §5 actionable provisioning).
       expect(joined).toContain("run `bun test`");
@@ -339,16 +345,34 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
     try {
       writeFixtures(fixtureDir);
       const config = writeConfig(dir);
-      const env = {
-        ...envFor(fixtureDir, discord.port),
-        RANGER_DISCORD_API_BASE: "http://evil.example",
-      };
 
-      const run = await runCli(["escalate", "-c", config, "--json"], env);
-      expect(run.code).toBe(2); // maps failed → exit 2
-      const report = JSON.parse(run.stdout);
-      expect(report.maps[0].ok).toBe(false);
-      expect(report.maps[0].error).toContain("not allowed");
+      // A non-loopback host is refused even with the test sentinel set.
+      const evil = await runCli(
+        ["escalate", "-c", config, "--json"],
+        {
+          ...envFor(fixtureDir, discord.port),
+          RANGER_DISCORD_API_BASE: "http://evil.example",
+        },
+      );
+      expect(evil.code).toBe(2); // maps failed → exit 2
+      const evilReport = JSON.parse(evil.stdout);
+      expect(evilReport.maps[0].ok).toBe(false);
+      expect(evilReport.maps[0].error).toContain("not allowed");
+      expect(discord.posts).toHaveLength(0);
+
+      // Loopback without the explicit test sentinel is refused too — an
+      // injected override cannot exfiltrate the token to a local listener.
+      const unsentineled = await runCli(
+        ["escalate", "-c", config, "--json"],
+        {
+          ...envFor(fixtureDir, discord.port),
+          RANGER_DISCORD_ALLOW_TEST_OVERRIDE: undefined,
+        },
+      );
+      expect(unsentineled.code).toBe(2);
+      const unSent = JSON.parse(unsentineled.stdout);
+      expect(unSent.maps[0].ok).toBe(false);
+      expect(unSent.maps[0].error).toContain("not allowed");
       expect(discord.posts).toHaveLength(0);
     } finally {
       discord.stop();
