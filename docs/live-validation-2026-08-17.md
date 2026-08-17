@@ -32,11 +32,14 @@ host.
 | jcfischer/seekolous | #99 | escalate-hitl | `1538840442777501776` |
 | jcfischer/seekolous | #100 | escalate-hitl | `1538840443662372924` |
 
-- First run: 7 cards posted (announce-once). Second run: 0 posted, 7 edited
-  (edit-not-repost — journal-cached message ids).
+- First run: 7 cards posted (announce-once). Subsequent runs against
+  unchanged state: 0 posted, 0 edited — edit-on-change skips cards whose
+  rendered content is identical, so the desk converges to a full no-op
+  (verified live across many 900s ticks). Edits happen only when content
+  actually changes (e.g. an age-band bump, or a node title/body edit).
 - Digests: `digest.the-metafactory/ranger` = `2026-08-17:1538840582615728139`,
-  `digest.jcfischer/seekolous` = `2026-08-17:1538840628891230208` (same-day
-  re-run edits instead of reposting).
+  `digest.jcfischer/seekolous` = `2026-08-17:1538840628891230208` (same local
+  day re-runs edit only when the digest content changed; otherwise no-op).
 
 ## launchd schedule (versioned as templates in ops/launchd)
 
@@ -59,8 +62,8 @@ Scope of the commands below (each verifies only the escalation-desk claims it
 can observe):
 
 - Re-running the cards pass is **concurrency-safe** (a cross-process lock
-  serializes overlapping runs so the second edits instead of re-posting), but
-  not **crash-atomic**: between Discord's POST response and the journal write
+  serializes overlapping runs so the second observes the first's rows as
+  already-posted (no duplicate cards) — not crash-atomic: between Discord's POST response and the journal write
   there is a tiny window where a crash/SQLite failure leaves no cached id, and
   the next run posts a duplicate card (visible and deletable in the thread).
   The journal's `escalations` rows and the cards in the threads are the

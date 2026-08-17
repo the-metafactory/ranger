@@ -231,6 +231,15 @@ function ageBand(ageDays: number): AgeBand {
   return "fresh";
 }
 
+/** Host-local YYYY-MM-DD — the digest cache key and date must match the
+ * launchd schedule (host-local 07:30), not the UTC calendar day. */
+function localDateKey(now: Date): string {
+  const y = now.getFullYear();
+  const m = String(now.getMonth() + 1).padStart(2, "0");
+  const d = String(now.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
 /** Collapse prose to one line, truncating at `max` chars. */
 function truncate(text: string, max: number): string {
   const oneLine = text.replace(/\s+/g, " ").trim();
@@ -297,16 +306,13 @@ function cardContent(
             : []),
         ]
       : [];
-  const bodyLine =
+  const bodyText =
     node.route.route === "escalate-hitl" &&
     node.body !== undefined &&
     node.body.trim().length > 0
-      ? // The body IS the decision payload (grilling question + prose options);
-        // give grilling cards more room so options stay visible, other HITL
-        // kinds stay terse.
-        `_${truncate(sanitizeGraphText(node.body), node.kind === "grilling" ? 400 : 140)}_`
+      ? sanitizeGraphText(node.body)
       : null;
-  const lines = [
+  const prefixLines = [
     `${cardHead(node)} — **#${node.id}** ${sanitizeGraphText(node.title)}`,
     `map: ${map.repo} · ${node.kind} · ${node.autonomy}`,
     `url: ${node.url}`,
@@ -314,9 +320,29 @@ function cardContent(
       ? `checkpoint: \`${sanitizeGraphText(node.checkpointId)}\``
       : null,
     reason ? `_${reason}_` : null,
+  ].filter((line): line is string => line !== null);
+  const suffix = ageSuffix(ageDays, principal, principalDiscordId);
+  // The body IS the decision payload (grilling question + prose options) —
+  // give it the room the rest of the card leaves up to Discord's message cap
+  // rather than an arbitrary truncation that silently omits options. Other
+  // HITL kinds stay terse. The assembled card is hard-capped below as a final
+  // guard.
+  const bodyBudget =
+    bodyText === null
+      ? 0
+      : 1950 - prefixLines.join("\n").length - suffix.length - 8;
+  const bodyLine =
+    bodyText === null
+      ? null
+      : `_${truncate(
+          bodyText,
+          node.kind === "grilling" ? Math.max(120, bodyBudget) : 140,
+        )}_`;
+  const lines = [
+    ...prefixLines,
     bodyLine,
     ...probeLines,
-    ageSuffix(ageDays, principal, principalDiscordId),
+    suffix,
   ].filter((line): line is string => line !== null);
   // Discord rejects >2000-char messages; hard-cap as a final guard.
   const joined = lines.join("\n");
@@ -811,8 +837,6 @@ async function escalateOneMap(
         .map((row) => [row.nodeId, row] as const),
     );
 
-    const principal = config.principal.login;
-    void principal; // (login is read inside syncCard via config)
     const cards: EscalationCard[] = [];
     const outcomes = await mapPool(
       needed,
@@ -918,7 +942,7 @@ function digestContent(inputs: DigestInputs): string {
   const aged = cards.filter((c) => ageBand(c.ageDays) !== "fresh"); // 3+
   const overdue = cards.filter((c) => ageBand(c.ageDays) === "overdue"); // 7+
   const lines: string[] = [
-    `:newspaper: **ranger digest** — ${map.repo} (root ${map.root}, walk: ${map.walk}) · ${now.toISOString().slice(0, 10)}`,
+    `:newspaper: **ranger digest** — ${map.repo} (root ${map.root}, walk: ${map.walk}) · ${localDateKey(now)}`,
     "",
     `**Cards: ${cards.length}**${aged.length > 0 ? ` (${aged.length} aged 3+d, ${overdue.length} 7+d${principalDiscordId ? " @-mentioned" : " no ping"})` : ""}`,
   ];
@@ -1026,8 +1050,8 @@ async function digestOneMap(
     });
 
     // Digest is edit-not-repost within a day: cache the message id under
-    // `digest.<repo>`; a new day posts a fresh digest.
-    const today = now.toISOString().slice(0, 10);
+    // `digest.<repo>`; a new (host-local) day posts a fresh digest.
+    const today = localDateKey(now);
     const cached = journal.getHealth(`digest.${map.repo}`);
     let messageId = "";
     let posted = false;

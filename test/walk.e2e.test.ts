@@ -9,8 +9,8 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runCmd } from "../src/exec.ts";
 import { Journal } from "../src/journal.ts";
+import { runCmd } from "../src/exec.ts";
 import {
  classify,
  loadProbeRegistry,
@@ -19,11 +19,10 @@ import {
 import { researchCandidates } from "../src/walk.ts";
 import { bootstrapWorktree } from "../src/worker.ts";
 import type { FrontierEntry } from "../src/graph.ts";
+import { baseConfigLines, fakeDiscord, runCli } from "./support.ts";
 
 const fixturesBin = join(import.meta.dir, "fixtures", "bin");
 const dataDir = join(import.meta.dir, "fixtures", "data");
-const cliPath = join(import.meta.dir, "..", "src", "cli.ts");
-const bun = process.execPath;
 
 const GIT_ENV = {
  GIT_AUTHOR_NAME: "ranger-test",
@@ -34,30 +33,12 @@ const GIT_ENV = {
 
 function writeConfig(dir: string, extra: string[] = []): string {
  const config = [
-  "version: 1",
-  "maps:",
-  "  - repo: acme/widgets",
-  "    root: 1",
-  "    walk: research-only",
-  `    canonical: ${join(dir, "canonical")}`,
-  "    discord:",
-  "      tokenEnv: RANGER_DISCORD_TOKEN",
-  '      channelId: "1234567890"',
-  "auth:",
-  "  readOnlyTokens:",
-  '    "acme/*": RANGER_RO_TEST',
-  "  writeTokens:",
-  '    "acme/*": RANGER_WRITE_TEST',
-  "bot:",
-  "  identity: ivy-bot",
-  "state:",
-  `  journalPath: ${join(dir, "state.sqlite")}`,
-  `  canonicalRoot: ${dir}`,
-  "workers:",
-  "  spawnCapPerDay: 10",
-  "  wallClockMin: 1",
-  "  maxAttempts: 2",
-  "  deadmanThreshold: 3",
+  ...baseConfigLines(dir, {
+   map: [`    canonical: ${join(dir, "canonical")}`],
+   auth: ["  writeTokens:", '    "acme/*": RANGER_WRITE_TEST'],
+   state: [`  canonicalRoot: ${dir}`],
+   workers: ["  wallClockMin: 1", "  maxAttempts: 2", "  deadmanThreshold: 3"],
+  }),
   ...extra,
  ].join("\n");
  const path = join(dir, "ranger.yaml");
@@ -77,31 +58,6 @@ const RESEARCH_NODE_STATE = {
  checkpoint: "api-surveyed",
  probes: [{ type: "git-ref-exists", ref: "research/api-survey" }],
 };
-
-async function runCli(
- args: string[],
- env: NodeJS.ProcessEnv,
- cwd = join(import.meta.dir, ".."),
-) {
- return runCmd(bun, [cliPath, ...args], { env, cwd });
-}
-
-/** Spin up a fake Discord server; returns {port, posts}. */
-function fakeDiscord() {
- const posts: string[] = [];
- const server = Bun.serve({
-  port: 0,
-  fetch(req) {
-   const url = new URL(req.url);
-   if (req.method === "POST" && url.pathname.startsWith("/channels/")) {
-    posts.push(req.url);
-    return Response.json({ id: `discord-msg-${posts.length}` });
-   }
-   return new Response("not found", { status: 404 });
-  },
- });
- return { port: server.port, posts, stop: () => server.stop(true) };
-}
 
 describe("ranger walk — claim phase (node #13)", () => {
  test("claims an auto+research frontier node: announce (fail-closed) → soma graph claim → journal", async () => {
@@ -132,7 +88,7 @@ describe("ranger walk — claim phase (node #13)", () => {
    const state = JSON.parse(readFileSync(statePath, "utf8"));
    expect(state.nodes["10"].assignees).toEqual(["ivy-bot"]);
    expect(discord.posts).toHaveLength(1);
-   expect(discord.posts[0]).toContain("/channels/1234567890/messages");
+   expect(discord.posts[0].url).toContain("/channels/1234567890/messages");
 
    // The journal recorded the claim.
    const journal = new Journal(join(dir, "state.sqlite"));

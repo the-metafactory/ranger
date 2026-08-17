@@ -2,35 +2,18 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runCmd } from "../src/exec.ts";
 import { EscalationDiscord } from "../src/escalate.ts";
 import { Journal } from "../src/journal.ts";
+import { baseConfigLines, fakeDiscord, runCli } from "./support.ts";
 
 const fixturesBin = join(import.meta.dir, "fixtures", "bin");
-const cliPath = join(import.meta.dir, "..", "src", "cli.ts");
-const bun = process.execPath;
 
-function writeConfig(dir: string): string {
+function writeConfig(dir: string, discordId?: string): string {
   const config = [
-    "version: 1",
-    "maps:",
-    "  - repo: acme/widgets",
-    "    root: 1",
-    "    walk: research-only",
-    "    discord:",
-    "      tokenEnv: RANGER_DISCORD_TOKEN",
-    '      channelId: "1234567890"',
-    "auth:",
-    "  readOnlyTokens:",
-    '    "acme/*": RANGER_RO_TEST',
-    "bot:",
-    "  identity: ivy-bot",
+    ...baseConfigLines(dir),
     "principal:",
     "  login: jcfischer",
-    "state:",
-    `  journalPath: ${join(dir, "state.sqlite")}`,
-    "workers:",
-    "  spawnCapPerDay: 10",
+    ...(discordId === undefined ? [] : [`  discordId: "${discordId}"`]),
   ].join("\n");
   const path = join(dir, "ranger.yaml");
   writeFileSync(path, config);
@@ -144,46 +127,7 @@ function writeFixtures(dir: string, drop: string[] = []): string {
 }
 
 /** Fake Discord: records POST (new card) and PATCH (edit) with message id + body. */
-function fakeDiscord() {
-  const posts: { messageId: string; content: string }[] = [];
-  const edits: { messageId: string; content: string }[] = [];
-  const server = Bun.serve({
-    port: 0,
-    async fetch(req) {
-      const url = new URL(req.url);
-      if (req.method === "POST" && url.pathname.startsWith("/channels/")) {
-        const parsed = (await req.json()) as { content?: string };
-        const messageId = `msg-${posts.length + 1}`;
-        posts.push({ messageId, content: parsed?.content ?? "" });
-        return Response.json({ id: messageId });
-      }
-      const editMatch = url.pathname.match(
-        /^\/channels\/[^/]+\/messages\/([^/]+)$/,
-      );
-      if (req.method === "PATCH" && editMatch) {
-        const messageId = editMatch[1];
-        const parsed = (await req.json()) as { content?: string };
-        edits.push({ messageId, content: parsed?.content ?? "" });
-        return Response.json({ id: messageId });
-      }
-      return new Response("not found", { status: 404 });
-    },
-  });
-  return {
-    port: server.port as number,
-    posts,
-    edits,
-    stop: () => server.stop(true),
-  };
-}
-
-async function runCli(
-  args: string[],
-  env: NodeJS.ProcessEnv,
-  cwd = join(import.meta.dir, ".."),
-) {
-  return runCmd(bun, [cliPath, ...args], { env, cwd });
-}
+/** Fake Discord server: records POSTs and PATCHes for assertion (shared from ./support.ts). */
 
 function envFor(dir: string, discordPort: number): NodeJS.ProcessEnv {
   return {
