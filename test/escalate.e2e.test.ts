@@ -854,6 +854,65 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
     }
   });
 
+  test("a moved card keeps its true age — repost shows 8d overdue, not age 0 (round-23 immutable createdAt)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ranger-escalate-age-"));
+    const fixtureDir = mkdtempSync(join(tmpdir(), "ranger-escalate-age-fx-"));
+    const discord = fakeDiscord();
+    try {
+      writeFixtures(fixtureDir);
+      const writeCfg = (channelId: string) => {
+        const config = [
+          ...baseConfigLines(dir, { channelId }),
+          "principal:",
+          "  login: jcfischer",
+          '  discordId: "285727653603049472"',
+        ].join("\n");
+        const p = join(dir, "ranger.yaml");
+        writeFileSync(p, config);
+        return p;
+      };
+      const baseEnv = envFor(fixtureDir, discord.port);
+      const t0 = new Date("2026-08-01T09:00:00.000Z");
+      const t8 = new Date(t0.getTime() + 8 * 24 * 60 * 60 * 1000);
+
+      // Day 0 in channel A.
+      const r1 = await runCli(
+        ["escalate", "-c", writeCfg("1234567890"), "--json"],
+        { ...baseEnv, RANGER_NOW: t0.toISOString() },
+      );
+      expect(JSON.parse(r1.stdout).maps[0].posted).toHaveLength(4);
+      const j = new Journal(join(dir, "state.sqlite"));
+      const created = j.getEscalation("acme/widgets", "11")?.createdAt;
+      expect(created).toBe(t0.toISOString());
+
+      // Day 8, move to channel B: reposted fresh, but KEEPS the true age.
+      const postsBefore = discord.posts.length; // 4
+      const r2 = await runCli(
+        ["escalate", "-c", writeCfg("9999999999"), "--json"],
+        { ...baseEnv, RANGER_NOW: t8.toISOString() },
+      );
+      expect(JSON.parse(r2.stdout).maps[0].posted).toHaveLength(4); // reposted in B
+      // The reposted B card shows the card's TRUE age (8d overdue + ping),
+      // not age 0 — a channel move must not erase escalation state.
+      const bPost = discord.posts[postsBefore]; // first B card (node 11)
+      expect(bPost.content).toContain("**8d**");
+      expect(bPost.content).toContain("<@285727653603049472>");
+      // The row's createdAt is IMMUTABLE across the move.
+      expect(j.getEscalation("acme/widgets", "11")?.createdAt).toBe(created);
+      // Next tick in B at day 8: no edit (content already shows true age).
+      const r3 = await runCli(
+        ["escalate", "-c", writeCfg("9999999999"), "--json"],
+        { ...baseEnv, RANGER_NOW: t8.toISOString() },
+      );
+      expect(JSON.parse(r3.stdout).maps[0].edited).toEqual([]);
+      j.close();
+    } finally {
+      discord.stop();
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(fixtureDir, { recursive: true, force: true });
+    }
+  });
+
   test("rejects a non-discord/non-localhost RANGER_DISCORD_API_BASE (token-exfil guard)", async () => {
     const dir = mkdtempSync(join(tmpdir(), "ranger-escalate-evil-"));
     const fixtureDir = mkdtempSync(join(tmpdir(), "ranger-escalate-evil-fx-"));

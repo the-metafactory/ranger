@@ -399,13 +399,12 @@ function ageSuffix(
   return `· ${ageDays}d`;
 }
 
-function cardContent(
-  node: ClassifiedNode,
-  map: { repo: string },
-  ageDays: number,
-  principal: string,
-  principalDiscordId?: string,
-): string {
+/** Route-specific card framing: the mention-inerted head/map/url/checkpoint
+ *  prefix plus (for provisioning cards) the blocked-probe registration lines. */
+function cardFraming(node: ClassifiedNode, map: { repo: string }): {
+  prefixLines: string[];
+  probeLines: string[];
+} {
   const reason = sanitizeGraphText(
     node.route.route === "escalate-hitl"
       ? ESCALATE_REASONS[node.route.reason]
@@ -427,12 +426,6 @@ function cardContent(
             : []),
         ]
       : [];
-  const bodyText =
-    node.route.route === "escalate-hitl" &&
-    node.body !== undefined &&
-    node.body.trim().length > 0
-      ? sanitizeGraphText(node.body)
-      : null;
   const prefixLines = [
     // Every graph-derived interpolation is mention-inerted (a graph author
     // can set kind/autonomy/title/url to `<@principal-id>`), and the title
@@ -445,26 +438,50 @@ function cardContent(
       : null,
     reason ? `_${reason}_` : null,
   ].filter((line): line is string => line !== null);
-  const suffix = ageSuffix(ageDays, principal, principalDiscordId);
-  // The body IS the decision payload (grilling question + prose options) —
-  // give it the room the rest of the card leaves up to Discord's 2000-char
-  // message cap (an arbitrary small cap would drop options sooner). Discord
-  // physically caps the card, so a body longer than the room left is
-  // truncated with an explicit `…` — never silently. The `url:` line is the
-  // graph node's reference: whether it renders the full body is the graph
-  // surface's job, not ranger's — ranger does not claim the link restores
-  // truncated options.
+  return { prefixLines, probeLines };
+}
+
+/** The decision body, budgeted to the room the rest of the card leaves up to
+ *  Discord's 2000-char message cap (an arbitrary small cap would drop options
+ *  sooner) and truncated with an explicit `…` — never silently. The `url:`
+ *  line is the graph node's reference; whether it renders the full body is
+ *  the graph surface's job, not ranger's. */
+function renderBoundedBody(
+  bodyText: string | null,
+  prefixLines: string[],
+  suffix: string,
+  kind: string,
+): string | null {
+  if (bodyText === null) return null;
   const bodyBudget =
-    bodyText === null
-      ? 0
-      : 1950 - prefixLines.join("\n").length - suffix.length - 8;
-  const bodyLine =
-    bodyText === null
-      ? null
-      : `_${truncate(
-          bodyText,
-          node.kind === "grilling" ? Math.max(120, bodyBudget) : 140,
-        )}_`;
+    1950 - prefixLines.join("\n").length - suffix.length - 8;
+  return `_${truncate(
+    bodyText,
+    kind === "grilling" ? Math.max(120, bodyBudget) : 140,
+  )}_`;
+}
+
+function cardContent(
+  node: ClassifiedNode,
+  map: { repo: string },
+  ageDays: number,
+  principal: string,
+  principalDiscordId?: string,
+): string {
+  const { prefixLines, probeLines } = cardFraming(node, map);
+  const bodyText =
+    node.route.route === "escalate-hitl" &&
+    node.body !== undefined &&
+    node.body.trim().length > 0
+      ? sanitizeGraphText(node.body)
+      : null;
+  const suffix = ageSuffix(ageDays, principal, principalDiscordId);
+  const bodyLine = renderBoundedBody(
+    bodyText,
+    prefixLines,
+    suffix,
+    node.kind,
+  );
   const lines = [...prefixLines, bodyLine, ...probeLines, suffix].filter(
     (line): line is string => line !== null,
   );
@@ -747,12 +764,27 @@ function reclaimDeadLock(
   }
 }
 
-async function withEscalateLock<T>(
-  journal: Journal,
-  fn: () => Promise<T>,
-): Promise<T> {
-  const lockFile = join(dirname(journal.path), ".escalate.lock");
-  const reclaimMarker = `${lockFile}.reclaiming`;
+/** An acquired announce-once lease: the lock file + marker paths and the
+ *  owner nonce + fresh-owner generator used by the heartbeat and release. */
+interface Lease {
+  lockFile: string;
+  reclaimMarker: string;
+  ownerNonce: string;
+  leaseOwner: () => string;
+}
+
+/**
+ * Acquire the announce-once lease, waiting (up to the timeout) under
+ * contention and reclaiming a provably-dead/stale owner. The owner payload is
+ * generated FRESH at each attempt: the wait can run ~60s, and a lease
+ * computed beforehand would already be expired when acquisition succeeds —
+ * letting another run reclaim our live lock before the heartbeat starts
+ * (round-22 blocker).
+ */
+async function acquireLease(
+  lockFile: string,
+  reclaimMarker: string,
+): Promise<Lease> {
   const started = Date.now();
   const timeoutMs = 60_000;
   const lockStartedAt = Date.now();
@@ -771,15 +803,12 @@ async function withEscalateLock<T>(
       startedAt: lockStartedAt,
       leaseUntil: Date.now() + LOCK_LEASE_MS,
     });
+  const lease: Lease = { lockFile, reclaimMarker, ownerNonce, leaseOwner };
   for (;;) {
-    // Generate a FRESH owner at each attempt: the loop can wait ~60s under
-    // contention, and a lease computed before the wait would already be
-    // expired when acquisition succeeds — another run could then reclaim our
-    // live lock before the heartbeat ever starts (round-22 blocker).
-    if (tryAcquireLock(lockFile, leaseOwner())) break;
+    if (tryAcquireLock(lockFile, leaseOwner())) return lease;
     if (lockOwnerStale(lockFile)) {
       const outcome = reclaimDeadLock(lockFile, reclaimMarker, leaseOwner());
-      if (outcome === "acquired") break;
+      if (outcome === "acquired") return lease;
       // "busy" / "not-dead" — wait and re-check the lock below.
     }
     if (Date.now() - started > timeoutMs) {
@@ -790,56 +819,86 @@ async function withEscalateLock<T>(
     }
     await sleep(250);
   }
-  // Heartbeat: renew the lease while the run is live so a long (or paused)
-  // run is never reclaimed by an expired lease — but only while the lock is
-  // still OURS. If the nonce changed (another run reclaimed us), stop
-  // heartbeating: never overwrite their lock.
-  let lostOwnership = false;
+}
+
+/**
+ * Renew the lease while the run is live so a long (or paused) run is never
+ * reclaimed by an expired lease — but only while the lock is still OURS. If
+ * the nonce changed (another run reclaimed us), stop heartbeating: never
+ * overwrite their lock. Returns the interval plus a ref the release uses to
+ * surface a lost-ownership reclaim loudly.
+ */
+function startHeartbeat(
+  lease: Lease,
+): { heartbeat: ReturnType<typeof setInterval>; lostOwnership: { value: boolean } } {
+  const lostOwnership = { value: false };
   const heartbeat = setInterval(() => {
     try {
-      const cur = JSON.parse(readFileSync(lockFile, "utf8")) as {
+      const cur = JSON.parse(readFileSync(lease.lockFile, "utf8")) as {
         nonce?: string;
       };
-      if (cur.nonce !== ownerNonce) {
-        lostOwnership = true;
+      if (cur.nonce !== lease.ownerNonce) {
+        lostOwnership.value = true;
         clearInterval(heartbeat);
         return;
       }
-      writeFileSync(lockFile, leaseOwner());
+      writeFileSync(lease.lockFile, lease.leaseOwner());
     } catch {
       /* lock released — nothing to renew */
     }
   }, LOCK_LEASE_MS / 2);
+  return { heartbeat, lostOwnership };
+}
+
+/**
+ * Stop the heartbeat and release the lock — but only OUR lock: if the nonce
+ * changed (we were reclaimed), leave the new owner's lock alone (unlinking it
+ * would let a third run in), and surface the lost-ownership reclaim loudly.
+ */
+function releaseLease(
+  lease: Lease,
+  heartbeat: ReturnType<typeof setInterval>,
+  lostOwnership: { value: boolean },
+): void {
+  clearInterval(heartbeat);
+  try {
+    let ours = false;
+    try {
+      const cur = JSON.parse(readFileSync(lease.lockFile, "utf8")) as {
+        nonce?: string;
+      };
+      ours = cur.nonce === lease.ownerNonce;
+    } catch {
+      /* unreadable — nothing to release */
+    }
+    if (ours) rmSync(lease.lockFile, { force: true });
+    rmSync(lease.reclaimMarker, { force: true });
+  } catch {
+    /* best-effort release */
+  }
+  if (lostOwnership.value) {
+    // We were reclaimed mid-run (lease expired, machine paused >60s): our
+    // cards already posted this run are duplicative of the new holder's —
+    // surface it loudly rather than hiding it.
+    console.error(
+      "[escalate] lock was reclaimed mid-run (lease expired >60s); " +
+        "another run owns the desk now — check for duplicate cards",
+    );
+  }
+}
+
+async function withEscalateLock<T>(
+  journal: Journal,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const lockFile = join(dirname(journal.path), ".escalate.lock");
+  const reclaimMarker = `${lockFile}.reclaiming`;
+  const lease = await acquireLease(lockFile, reclaimMarker);
+  const { heartbeat, lostOwnership } = startHeartbeat(lease);
   try {
     return await fn();
   } finally {
-    clearInterval(heartbeat);
-    try {
-      // Release only OUR lock: if the nonce changed (reclaimed), leave the
-      // new owner's lock alone — unlinking it would let a third run in.
-      let ours = false;
-      try {
-        const cur = JSON.parse(readFileSync(lockFile, "utf8")) as {
-          nonce?: string;
-        };
-        ours = cur.nonce === ownerNonce;
-      } catch {
-        /* unreadable — nothing to release */
-      }
-      if (ours) rmSync(lockFile, { force: true });
-      rmSync(reclaimMarker, { force: true });
-    } catch {
-      /* best-effort release */
-    }
-    if (lostOwnership) {
-      // We were reclaimed mid-run (lease expired, machine paused >60s): our
-      // cards already posted this run are duplicative of the new holder's —
-      // surface it loudly rather than hiding it.
-      console.error(
-        "[escalate] lock was reclaimed mid-run (lease expired >60s); " +
-          "another run owns the desk now — check for duplicate cards",
-      );
-    }
+    releaseLease(lease, heartbeat, lostOwnership);
   }
 }
 
@@ -893,7 +952,6 @@ async function syncCard(
     lastContent: string;
     createdAt: string;
     lastEditedAt?: string;
-    replaceCreatedAt?: boolean;
   }) => ({
     key,
     repo: map.repo,
@@ -907,9 +965,6 @@ async function syncCard(
     ...(params.lastEditedAt === undefined
       ? {}
       : { lastEditedAt: params.lastEditedAt }),
-    ...(params.replaceCreatedAt === undefined
-      ? {}
-      : { replaceCreatedAt: params.replaceCreatedAt }),
     status: "open" as const,
     // A fresh or re-activated card is never reconciled.
     notedAt: null,
@@ -925,7 +980,12 @@ async function syncCard(
     const freshContent = cardContent(
       node,
       map,
-      0,
+      // A reposted card (moved channel / message gone) is the SAME
+      // unresolved escalation, re-surfaced WITH ITS AGE (design §5 "edited
+      // not reposted, re-surfaced with age") — a channel move must not erase
+      // a card's 3/7-day escalation state (round-23 review). New cards
+      // (prior undefined) render age 0.
+      ageDays,
       config.principal.login,
       config.principal.discordId,
     );
@@ -933,11 +993,11 @@ async function syncCard(
     const row = escalationRow({
       messageId,
       lastContent: freshContent,
-      createdAt: now.toISOString(),
-      // The card is born (or reborn) in this channel now — REPLACE the
-      // stored age so a moved/404-reposted card doesn't revert to an old
-      // age next tick and re-ping as overdue (round-22 review).
-      replaceCreatedAt: true,
+      // Immutable first-appearance timestamp: the card's age is its age
+      // since it first appeared, preserved across reposts. The per-destination
+      // created_at (escalation_destinations) tracks each channel visit for
+      // recovery, not the card's age.
+      createdAt: prior?.createdAt ?? now.toISOString(),
     });
     journal.upsertEscalation(row);
     journal.setEscalationDestination(
@@ -949,7 +1009,7 @@ async function syncCard(
     return {
       action: "posted" as const,
       id: node.id,
-      card: cardFrom(node, row, 0),
+      card: cardFrom(node, row, ageDays),
     };
   };
   /** Edit a card message in place; if the message is gone (deleted or in a
@@ -1045,7 +1105,13 @@ async function markAbsentCards(
   // no-op tick never loads (or skips) the active cards (round-19 review), and
   // a noted card drops out entirely. Closing resolved cards (which shrinks
   // the open set) is the write-side resolution lifecycle (node #21).
-  const openCards = journal.listUnreconciledOpen(map.repo, neededIds);
+  // Cap the LOAD to the remaining request budget (oldest exits first): each
+  // card needs ≥1 destination edit, so loading more than the budget could
+  // never be fully processed this tick — and a large drain must not walk
+  // every unnoted card after the budget is spent (round-23 review).
+  const openCards = journal.listUnreconciledOpen(map.repo, neededIds, {
+    limit: Math.max(budget.remaining, 0),
+  });
   // One throttled client per channel: moved-channel edits share a limiter
   // instead of each card building its own and bursting the 5-writes/5s
   // bucket. Seed with the pass's own client so the current channel reuses

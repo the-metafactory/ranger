@@ -301,12 +301,7 @@ export class Journal {
      | "lastEditedAt"
      | "status"
      | "notedAt"
-    > &
-     // A fresh post (moved channel / 404-repost) REBIRTHS the card in its
-     // channel — its age restarts, so the stored createdAt must be replaced,
-     // not preserved (round-22 review: preserving it made a repost revert to
-     // an old age next tick and re-ping as overdue).
-     { replaceCreatedAt?: boolean }
+    >
    >,
  ): void {
   const existing = this.getEscalation(row.repo, row.nodeId);
@@ -318,10 +313,11 @@ export class Journal {
    lastContent: row.lastContent ?? existing?.lastContent ?? null,
    channelId: row.channelId ?? existing?.channelId ?? null,
    messageId: row.messageId,
-   createdAt:
-    row.replaceCreatedAt
-     ? row.createdAt
-     : existing?.createdAt ?? row.createdAt,
+   // createdAt is IMMUTABLE once set: it is the card's first appearance, and
+   // reposts (moved channel / message gone) keep it so the card's 3/7-day
+   // escalation age survives channel moves (design §5 "re-surfaced with
+   // age"; round-23 review).
+   createdAt: existing?.createdAt ?? row.createdAt,
    lastEditedAt: row.lastEditedAt ?? existing?.lastEditedAt ?? null,
    status: row.status ?? existing?.status ?? "open",
    notedAt:
@@ -483,6 +479,7 @@ export class Journal {
  listUnreconciledOpen(
   repo: string,
   excludeNodeIds: ReadonlySet<string> = new Set(),
+  opts: { limit?: number } = {},
  ): EscalationRow[] {
   const rows = this.db.query.escalations
    .findMany({
@@ -496,6 +493,11 @@ export class Journal {
       ? []
       : [notInArray(escalations.nodeId, [...excludeNodeIds])]),
     ),
+    // Oldest exits first (most urgent), and capped to the remaining request
+    // budget so a large drain can't walk every unnoted card after the budget
+    // is spent (round-23 review) — the rest are deferred to the next tick.
+    orderBy: asc(escalations.createdAt),
+    ...(opts.limit === undefined ? {} : { limit: opts.limit }),
    })
    .sync();
   return rows.map(hydrateEscalation);
