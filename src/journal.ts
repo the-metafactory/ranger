@@ -436,11 +436,15 @@ export class Journal {
   opts: { limit?: number } = {},
  ): { rows: EscalationRow[]; total: number; aged: number; overdue: number } {
   // ONE aggregate: total + aged (≥3 UTC days) + overdue (≥7 UTC days) over
-  // ALL open rows — the digest header must report the true counts even when
-  // an overdue card falls outside the rendered ≤15 list. UTC calendar-day
-  // cutoffs match dayDiff (a card created 23:59 yesterday is 1d old at
-  // 00:01 today; a rolling 72h window would exclude a card dayDiff shows as
-  // 3d).
+  // ACTIONABLE open rows — the digest header must report the true counts
+  // even when an overdue card falls outside the rendered ≤15 list. UTC
+  // calendar-day cutoffs match dayDiff (a card created 23:59 yesterday is 1d
+  // old at 00:01 today; a rolling 72h window would exclude a card dayDiff
+  // shows as 3d). NOTED cards (their queue-exit note already written, design
+  // §5 — status stays open pending the #21 write-side resolution) are
+  // EXCLUDED: they have been surfaced and would otherwise accumulate in the
+  // daily aggregate + scan forever while rendering only 15 (round-37
+  // review).
   const dayStart = (daysBack: number) =>
    new Date(
     Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()) -
@@ -455,11 +459,21 @@ export class Journal {
     overdue: sql<number>`sum(case when ${escalations.createdAt} <= ${overdueAt} then 1 else 0 end)`,
    })
    .from(escalations)
-   .where(and(eq(escalations.repo, repo), eq(escalations.status, "open")))
+   .where(
+    and(
+     eq(escalations.repo, repo),
+     eq(escalations.status, "open"),
+     isNull(escalations.notedAt),
+    ),
+   )
    .get();
   const rows = this.db.query.escalations
    .findMany({
-    where: and(eq(escalations.repo, repo), eq(escalations.status, "open")),
+    where: and(
+     eq(escalations.repo, repo),
+     eq(escalations.status, "open"),
+     isNull(escalations.notedAt),
+    ),
     // Oldest first — the most urgent cards are the ones surfaced in the
     // capped display.
     orderBy: asc(escalations.createdAt),
