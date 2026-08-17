@@ -15,7 +15,12 @@ import {
   loadProbeRegistry,
   type ClassifiedNode,
 } from "./route.ts";
-import { graphAudit, graphFrontier, type AuditResult } from "./graph.ts";
+import {
+  GRAPH_CALL_TIMEOUT_MS,
+  graphAudit,
+  graphFrontier,
+  type AuditResult,
+} from "./graph.ts";
 import { assertReadOnlyToken, type ResolvedToken } from "./token-gate.ts";
 import type { EscalationRow, Journal } from "./journal.ts";
 
@@ -359,7 +364,16 @@ const LOCK_LEASE_MS = 60_000;
  * large frontier can't starve `walk` (each card spends ≥1s in the Discord
  * throttle); capped-out cards stay "needed" and are served next tick.
  */
+/** The per-tick request budget (round-21) — split into two lanes so NEITHER
+ *  starves the other (round-33 review): the ACTIVE pass caps at
+ *  MAX_CARDS_PER_TICK - ABSENT_RESERVE, and the ABSENT-card reconciliation
+ *  is guaranteed ABSENT_RESERVE ops per tick regardless of active-card
+ *  churn, so an obsolete actionable card is always eventually reconciled
+ *  ("no absent card starves" holds). The total per-tick bound is still
+ *  MAX_CARDS_PER_TICK (50). */
 const MAX_CARDS_PER_TICK = 50;
+const ABSENT_RESERVE = 5;
+const ACTIVE_CARD_CAP = MAX_CARDS_PER_TICK - ABSENT_RESERVE;
 /** Legacy locks (pre-lease, or the reclaim marker) fall back to age. */
 const LOCK_STALE_MS = 30 * 60 * 1000;
 /** The reclaim marker is held for microseconds — any marker this old is a
@@ -665,17 +679,16 @@ const MAX_PASS_MS = 120_000;
  *  pagination past needed rows) — a large drain must not walk the whole
  *  journal (round-27 review). */
 const MAX_ABSENT_SCAN = 500;
-/** Timeout on every graph CLI call the escalation pass makes — a hung `soma`
- *  command must not hold the tick (and hence walk) indefinitely (round-29
- *  blocker). Generous: the CLI responds in seconds; this covers slow networks
- *  without letting a hang block the pass bound. */
-const GRAPH_CALL_TIMEOUT_MS = 60_000;
 
 /** Shared context for one card's sync lifecycle — the per-card derivations
  *  (key, age, content) plus the pass context, so post/edit/recover/migrate
  *  live as focused module-level helpers instead of coupled closures
  *  (round-31 suggestion). */
-interface CardSyncContext {
+/** The pass context shared by every card-sync stage — the base for both
+ *  `syncCard` (which builds the per-card derivations on top) and the full
+ *  `CardSyncContext` (round-33 suggestion: one shape, no duplicated fields).
+ */
+interface CardSyncCtxBase {
   client: EscalationDiscord;
   clientFor: (channelId: string) => EscalationDiscord;
   journal: Journal;
@@ -683,6 +696,9 @@ interface CardSyncContext {
   config: RangerConfig;
   now: Date;
   budget: CardBudget;
+}
+
+interface CardSyncContext extends CardSyncCtxBase {
   node: ClassifiedNode;
   key: string;
   ageDays: number;
@@ -850,15 +866,7 @@ async function syncMovedCard(
  *  for fresh cards, edit-on-change for repeats, transient failures returned
  *  as outcomes — never thrown). */
 async function syncCard(
-  ctx: {
-    client: EscalationDiscord;
-    clientFor: (channelId: string) => EscalationDiscord;
-    journal: Journal;
-    map: RangerMapConfig;
-    config: RangerConfig;
-    now: Date;
-    budget: CardBudget;
-  },
+  ctx: CardSyncCtxBase,
   node: ClassifiedNode,
   prior: EscalationRow | undefined,
 ): Promise<SyncOutcome> {
@@ -1342,7 +1350,7 @@ async function escalateOneMap(
     //     cursor advances each tick, so every needed node is eventually
     //     evaluated, and fresh cards (no row) within the page go first.
     const budget = {
-      remaining: MAX_CARDS_PER_TICK,
+      remaining: ACTIVE_CARD_CAP,
       deadline: passDeadline,
     };
     const cursorKey = `escalate.cursor.${map.repo}`;
@@ -1401,8 +1409,13 @@ async function escalateOneMap(
     }
 
     const neededIds = new Set(needed.map((n) => n.id));
+    // The absent-card pass gets its OWN reserved budget slice — active-card
+    // churn can never consume it, so an obsolete actionable card is always
+    // eventually reconciled (round-33 review: "no absent card starves" was
+    // violated when the active pass exhausted the shared 50). Total per-tick
+    // bound is still MAX_CARDS_PER_TICK (active cap + absent reserve).
     const absent = await markAbsentCards(
-      { client, journal, map, now, budget },
+      { client, journal, map, now, budget: { ...budget, remaining: ABSENT_RESERVE } },
       neededIds,
     );
     base.keptOpen.push(...absent.keptOpen);

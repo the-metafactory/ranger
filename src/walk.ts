@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { join } from "node:path";
 import type { RangerConfig, RangerMapConfig, WalkMode } from "./config.ts";
 import { DiscordAnnouncer } from "./announce.ts";
-import { graphFrontier } from "./graph.ts";
+import { GRAPH_CALL_TIMEOUT_MS, graphFrontier } from "./graph.ts";
 import { graphClaim } from "./graph-write.ts";
 import {
  assertNotPrincipal,
@@ -161,10 +161,12 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
     // that window would still be announced+claimed as auto+research
     // (round-29 review supersedes round-28's one-fetch-per-tick suggestion:
     // the second read is a bounded correctness cost, not waste).
-    const fetched = await graphFrontier(map.repo, map.root, {
-     token,
-     source: "write-token",
-    });
+    const fetched = await graphFrontier(
+     map.repo,
+     map.root,
+     { token, source: "write-token" },
+     { timeoutMs: GRAPH_CALL_TIMEOUT_MS },
+    );
     const frontierEntries = fetched.frontier;
     const classified = frontierEntries.map((entry) =>
      classify(entry, map.repo, map.walk, registry),

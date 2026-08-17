@@ -573,7 +573,7 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
     }
   });
 
-  test("caps cards synced per tick (50) and continues the rest next tick (round-21 bound)", async () => {
+  test("caps active cards synced per tick (45; 50 total with the absent reserve) and continues the rest next tick (round-21/33 bound)", async () => {
     const dir = mkdtempSync(join(tmpdir(), "ranger-escalate-cap-"));
     const fixtureDir = mkdtempSync(join(tmpdir(), "ranger-escalate-cap-fx-"));
     const discord = fakeDiscord();
@@ -627,16 +627,17 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
       const config = writeConfig(dir);
       const env = envFor(fixtureDir, discord.port);
 
-      // Tick 1: exactly the cap is synced (50), never the whole 55.
+      // Tick 1: exactly the ACTIVE lane cap is synced (45 — the total 50
+      // bound reserves 5 for absent-card reconciliation), never the whole 55.
       const run1 = await runCli(["escalate", "-c", config, "--json"], env);
       expect(run1.code).toBe(0);
-      expect(JSON.parse(run1.stdout).maps[0].posted).toHaveLength(50);
+      expect(JSON.parse(run1.stdout).maps[0].posted).toHaveLength(45);
 
-      // Tick 2: the remaining 5 (still needed, mismatched lastContent) are
+      // Tick 2: the remaining 10 (still needed, mismatched lastContent) are
       // served — nothing was dropped, the desk converged over two ticks.
       const run2 = await runCli(["escalate", "-c", config, "--json"], env);
       expect(run2.code).toBe(0);
-      expect(JSON.parse(run2.stdout).maps[0].posted).toHaveLength(5);
+      expect(JSON.parse(run2.stdout).maps[0].posted).toHaveLength(10);
 
       // Tick 3: fully converged — no-op.
       const run3 = await runCli(["escalate", "-c", config, "--json"], env);
@@ -1101,7 +1102,7 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
   });
 });
 
-test("a many-destination absent card reconciles across ticks via a per-card cursor, not a restart (round-32)", async () => {
+test("a many-destination absent card reconciles across ticks via a per-card cursor, not a restart (round-32/33)", async () => {
   const dir = mkdtempSync(join(tmpdir(), "ranger-escalate-reconcile-cur-"));
   const fixtureDir = mkdtempSync(
     join(tmpdir(), "ranger-escalate-reconcile-cur-fx-"),
@@ -1113,8 +1114,8 @@ test("a many-destination absent card reconciles across ticks via a per-card curs
     const env = envFor(fixtureDir, discord.port);
 
     // Seed an OPEN, un-noted card that is ABSENT from the frontier (node 900
-    // is not in the fixture) with 60 historical destinations (60 channel
-    // moves) — more than one tick's 50-request budget can reconcile.
+    // is not in the fixture) with 12 historical destinations (12 channel
+    // moves) — more than one tick's ABSENT_RESERVE (5) can reconcile.
     const journal = new Journal(join(dir, "state.sqlite"));
     journal.upsertEscalation({
       key: "acme/widgets:900",
@@ -1128,41 +1129,49 @@ test("a many-destination absent card reconciles across ticks via a per-card curs
       status: "open",
       notedAt: null,
     });
-    for (let i = 0; i < 60; i++) {
+    for (let i = 0; i < 12; i++) {
       journal.setEscalationDestination(
         "acme/widgets:900",
         `chan-${i}`,
         `discord-msg-${i}`,
-        new Date(Date.now() - (60 - i) * 60_000).toISOString(),
+        new Date(Date.now() - (12 - i) * 60_000).toISOString(),
       );
     }
 
-    // Tick 1: 4 active posts + 46 destination edits (50 total) → the absent
-    // card defers at cursor 46 — it must NOT restart at 0 next tick.
+    // Tick 1: the 4 active cards post (against the ACTIVE lane) + the absent
+    // lane reconciles its reserved 5 destinations, deferring at cursor 5 — it
+    // must NOT restart at 0 next tick.
     const run1 = await runCli(["escalate", "-c", config, "--json"], env);
     expect(run1.code).toBe(0);
     const r1 = JSON.parse(run1.stdout).maps[0];
     expect(r1.posted).toHaveLength(4);
     expect(r1.deferred).toContain("900");
 
-    // Tick 2: resumes at 46 → edits the remaining 14, completes, sets notedAt.
+    // Tick 2: resumes at 5 → 5 more (cursor 10), still deferred.
     const run2 = await runCli(["escalate", "-c", config, "--json"], env);
     expect(run2.code).toBe(0);
     const r2 = JSON.parse(run2.stdout).maps[0];
     expect(r2.posted).toHaveLength(0);
-    expect(r2.deferred).not.toContain("900");
-    expect(r2.keptOpen).toContain("900");
+    expect(r2.deferred).toContain("900");
 
-    // Tick 3: notedAt set → the card is no longer a reconciliation candidate.
+    // Tick 3: resumes at 10 → the last 2, completes, sets notedAt.
     const run3 = await runCli(["escalate", "-c", config, "--json"], env);
     expect(run3.code).toBe(0);
     const r3 = JSON.parse(run3.stdout).maps[0];
+    expect(r3.posted).toHaveLength(0);
     expect(r3.deferred).not.toContain("900");
-    expect(r3.keptOpen).not.toContain("900");
+    expect(r3.keptOpen).toContain("900");
 
-    // Each destination edited EXACTLY once (46 + 14 = 60): a restart-at-0
-    // cursor would have re-edited the first 46 each tick and never finished.
-    expect(discord.edits.length).toBe(60);
+    // Tick 4: notedAt set → the card is no longer a reconciliation candidate.
+    const run4 = await runCli(["escalate", "-c", config, "--json"], env);
+    expect(run4.code).toBe(0);
+    const r4 = JSON.parse(run4.stdout).maps[0];
+    expect(r4.deferred).not.toContain("900");
+    expect(r4.keptOpen).not.toContain("900");
+
+    // Each destination edited EXACTLY once (5 + 5 + 2 = 12): a restart-at-0
+    // cursor would have re-edited the first 5 each tick and never finished.
+    expect(discord.edits.length).toBe(12);
     const j2 = new Journal(join(dir, "state.sqlite"));
     expect(j2.getEscalation("acme/widgets", "900")?.notedAt).not.toBeNull();
   } finally {
