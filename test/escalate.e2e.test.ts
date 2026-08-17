@@ -691,6 +691,37 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
     }
   });
 
+  test("an UNREADABLE lock (corrupt heartbeat JSON) is reclaimed, not stranded (round-34)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ranger-escalate-corrupt-lock-"));
+    const fixtureDir = mkdtempSync(
+      join(tmpdir(), "ranger-escalate-corrupt-lock-fx-"),
+    );
+    const discord = fakeDiscord();
+    try {
+      writeFixtures(fixtureDir);
+      const config = writeConfig(dir);
+      const env = envFor(fixtureDir, discord.port);
+
+      // A NON-ATOMIC heartbeat write interrupted mid-write leaves truncated,
+      // unparseable lock JSON. The desk must still reclaim it (with atomic
+      // lock writes, an unreadable lock is definitively a crash artifact — no
+      // heartbeat can be running) instead of timing out forever on the wx
+      // acquire and never walking (round-34 blocker).
+      const lockFile = join(dir, ".escalate.lock");
+      writeFileSync(lockFile, `{"nonce":"900-abc","pid":1234,"startedAt":${Date.now() - 120_000},"leaseUntil":"partial`);
+
+      const run = await runCli(["escalate", "-c", config, "--json"], env);
+      expect(run.code).toBe(0);
+      const report = JSON.parse(run.stdout);
+      expect(report.maps[0].posted).toHaveLength(4); // not stranded
+      expect(existsSync(lockFile)).toBe(false); // released after the run
+    } finally {
+      discord.stop();
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(fixtureDir, { recursive: true, force: true });
+    }
+  });
+
   test("mention syntax in kind/url is inerted, and the overdue suffix survives a huge decision body", async () => {
     const dir = mkdtempSync(join(tmpdir(), "ranger-escalate-suffix-"));
     const fixtureDir = mkdtempSync(

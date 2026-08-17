@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import {
@@ -334,6 +334,20 @@ async function mapPool<T, R>(
  * An atomic mkdir next to the journal doubles as the lock; released on
  * completion or error.
  */
+/** ATOMIC lock write: write the new content to a temp file then rename over
+ *  the lock. A rename is atomic on POSIX, so an interrupted heartbeat can
+ *  never leave the lock file UNREADABLE — a lock is either the old or the new
+ *  complete JSON, never a partial write. (The wx create-only acquires are
+ *  already atomic.) This is what makes "unreadable ⇒ definitively dead" a
+ *  sound rule in lockOwnerStale (round-34 blocker: a non-atomic heartbeat
+ *  could corrupt the lock and strand the desk forever).
+ */
+function writeLockAtomic(lockFile: string, content: string): void {
+  const tmp = `${lockFile}.tmp`;
+  writeFileSync(tmp, content);
+  renameSync(tmp, lockFile);
+}
+
 /** Atomic create-with-content: returns true when we now hold the lock. */
 function tryAcquireLock(lockFile: string, owner: string): boolean {
   try {
@@ -423,8 +437,14 @@ function lockOwnerStale(
       return (killError as NodeJS.ErrnoException).code === "ESRCH";
     }
   } catch {
-    /* unreadable owner — never reclaim on a guess */
-    return false;
+    /* Unreadable owner — with ATOMIC lock writes (writeLockAtomic) a live
+     * holder's lock is always complete readable JSON with a valid lease, so
+     * an unreadable lock can only be a crash artifact (a partial write from
+     * a pre-atomic path, or a zero-length file left by a killed heartbeat).
+     * It is NOT being renewed (no heartbeat can be running), so it is
+     * definitively stale — reclaim it instead of stranding the desk forever
+     * (round-34 blocker). */
+    return true;
   }
 }
 
@@ -582,7 +602,7 @@ function startHeartbeat(lease: Lease): {
         clearInterval(heartbeat);
         return;
       }
-      writeFileSync(lease.lockFile, lease.leaseOwner());
+      writeLockAtomic(lease.lockFile, lease.leaseOwner());
     } catch {
       /* lock released — nothing to renew */
     }
@@ -1358,15 +1378,28 @@ async function escalateOneMap(
     const pageSize = MAX_CARDS_PER_TICK * 2;
     const offset =
       sorted.length === 0 ? 0 : journal.getInt(cursorKey) % sorted.length;
-    const page = sorted
-      .slice(offset, offset + pageSize)
-      .concat(
-        offset + pageSize > sorted.length
-          ? sorted.slice(0, (offset + pageSize) % sorted.length)
-          : [],
+    // A bounded page of candidate nodes swept through the frontier via a
+    // persisted cursor. When the whole frontier fits in one page there is
+    // nothing to sweep — use it DIRECTLY: the modulo wrap would duplicate
+    // IDs already in the first slice (a duplicated FRESH id both enters
+    // postFresh and posts two cards, round-34 blocker). Only when the
+    // frontier EXCEEDS the page do we window it, and the wrap appends the
+    // exact overflow (offset+pageSize-N < N for N>pageSize, so no overlap).
+    const page =
+      sorted.length <= pageSize
+        ? sorted
+        : sorted
+            .slice(offset, offset + pageSize)
+            .concat(
+              offset + pageSize > sorted.length
+                ? sorted.slice(0, offset + pageSize - sorted.length)
+                : [],
+            );
+    if (sorted.length > pageSize) {
+      journal.setHealth(
+        cursorKey,
+        String((offset + pageSize) % sorted.length),
       );
-    if (sorted.length > 0) {
-      journal.setHealth(cursorKey, String((offset + pageSize) % sorted.length));
     }
 
     // The active pass needs ONLY the rows for the nodes in this tick's page
@@ -1601,6 +1634,88 @@ function digestContent(inputs: DigestInputs): string {
   return joined.length > 1950 ? `${joined.slice(0, 1949)}…` : joined;
 }
 
+/** The daily digest's cached post/edit/repost delivery state machine —
+ *  separated from data collection + rendering (round-34 suggestion), so a
+ *  change to digest DATA or DELIVERY doesn't require navigating the whole
+ *  function.
+ *
+ *  Edit-not-repost within a day, and edit-on-change within the day: the cache
+ *  is {today, messageId, lastContent}; a new (host-local) day posts a fresh
+ *  digest, a same-day content change edits in place, and an unchanged
+ *  same-day digest is a no-op (no Discord write — re-runs must not churn
+ *  rate limits). A DELETED cached message is only noticed via a read: if it
+ *  is definitively gone (404), repost so the daily audit/budget digest never
+ *  silently vanishes.
+ */
+async function syncDailyDigest(
+  client: EscalationDiscord,
+  journal: Journal,
+  repo: string,
+  content: string,
+  now: Date,
+  deadline: number,
+): Promise<{ messageId: string; posted: boolean; edited: boolean }> {
+  const today = localDateKey(now);
+  const cachedRaw = journal.getHealth(`digest.${repo}`);
+  let cached: {
+    today: string;
+    messageId: string;
+    lastContent: string;
+  } | null = null;
+  if (cachedRaw !== null) {
+    try {
+      cached = JSON.parse(cachedRaw) as {
+        today: string;
+        messageId: string;
+        lastContent: string;
+      };
+    } catch {
+      cached = null; // pre-edit-on-change cache format — treat as fresh
+    }
+  }
+  let messageId = "";
+  let posted = false;
+  let edited = false;
+  if (cached !== null && cached.today === today) {
+    messageId = cached.messageId;
+    if (cached.lastContent === content) {
+      // Unchanged same-day digest is a write no-op — but a DELETED cached
+      // message is only noticed via a read. Verify it still exists; if it
+      // is definitively gone (404), repost so the daily audit/budget digest
+      // never silently vanishes.
+      if (!(await client.messageExists(messageId, deadline))) {
+        messageId = await client.post(content, deadline);
+        posted = true;
+      }
+    } else {
+      try {
+        await client.edit(messageId, content, deadline);
+        edited = true;
+      } catch (editError) {
+        if (!(editError instanceof DiscordMessageGoneError)) throw editError;
+        // The cached digest message was deleted (or moved): post a fresh
+        // digest and replace the cached message id — otherwise unchanged
+        // runs would no-op against the stale cache and leave NO digest
+        // until the next day.
+        messageId = await client.post(content, deadline);
+        posted = true;
+      }
+    }
+    journal.setHealth(
+      `digest.${repo}`,
+      JSON.stringify({ today, messageId, lastContent: content }),
+    );
+  } else {
+    messageId = await client.post(content, deadline);
+    journal.setHealth(
+      `digest.${repo}`,
+      JSON.stringify({ today, messageId, lastContent: content }),
+    );
+    posted = true;
+  }
+  return { messageId, posted, edited };
+}
+
 async function digestOneMap(
   config: RangerConfig,
   map: RangerMapConfig,
@@ -1681,69 +1796,16 @@ async function digestOneMap(
       now,
     });
 
-    // Digest is edit-not-repost within a day — and edit-on-change within the
-    // day: cache {today, messageId, lastContent}; a new (host-local) day posts
-    // a fresh digest, a same-day content change edits in place, and an
-    // unchanged same-day digest is a no-op (no Discord write — re-runs must
-    // not churn rate limits).
-    const today = localDateKey(now);
-    const cachedRaw = journal.getHealth(`digest.${map.repo}`);
-    let cached: {
-      today: string;
-      messageId: string;
-      lastContent: string;
-    } | null = null;
-    if (cachedRaw !== null) {
-      try {
-        cached = JSON.parse(cachedRaw) as {
-          today: string;
-          messageId: string;
-          lastContent: string;
-        };
-      } catch {
-        cached = null; // pre-edit-on-change cache format — treat as fresh
-      }
-    }
-    let messageId = "";
-    let posted = false;
-    let edited = false;
-    if (cached !== null && cached.today === today) {
-      messageId = cached.messageId;
-      if (cached.lastContent === content) {
-        // Unchanged same-day digest is a write no-op — but a DELETED cached
-        // message is only noticed via a read. Verify it still exists; if it
-        // is definitively gone (404), repost so the daily audit/budget digest
-        // never silently vanishes.
-        if (!(await client.messageExists(messageId, digestDeadline))) {
-          messageId = await client.post(content, digestDeadline);
-          posted = true;
-        }
-      } else {
-        try {
-          await client.edit(messageId, content, digestDeadline);
-          edited = true;
-        } catch (editError) {
-          if (!(editError instanceof DiscordMessageGoneError)) throw editError;
-          // The cached digest message was deleted (or moved): post a fresh
-          // digest and replace the cached message id — otherwise unchanged
-          // runs would no-op against the stale cache and leave NO digest
-          // until the next day.
-          messageId = await client.post(content, digestDeadline);
-          posted = true;
-        }
-      }
-      journal.setHealth(
-        `digest.${map.repo}`,
-        JSON.stringify({ today, messageId, lastContent: content }),
-      );
-    } else {
-      messageId = await client.post(content, digestDeadline);
-      journal.setHealth(
-        `digest.${map.repo}`,
-        JSON.stringify({ today, messageId, lastContent: content }),
-      );
-      posted = true;
-    }
+    // Digest delivery is its own state machine (cached post/edit/repost) —
+    // see syncDailyDigest.
+    const synced = await syncDailyDigest(
+      client,
+      journal,
+      map.repo,
+      content,
+      now,
+      digestDeadline,
+    );
 
     return {
       ...base,
@@ -1751,10 +1813,10 @@ async function digestOneMap(
       receiptLessCloses: audit.closedWithoutReceipt,
       openWithoutCheckpoint: audit.openWithoutCheckpoint,
       openClaims: audit.openClaimed,
-      digestMessageId: messageId,
-      posted,
+      digestMessageId: synced.messageId,
+      posted: synced.posted,
       // Honest label for the operator: fresh post | in-place edit | no-op.
-      action: digestAction(posted, edited),
+      action: digestAction(synced.posted, synced.edited),
     };
   } catch (error) {
     return {

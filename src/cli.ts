@@ -379,10 +379,30 @@ program
  )
  .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
  .action(async (options: { config: string }) => {
+  const configPath = resolve(process.cwd(), options.config);
+  let config: RangerConfig;
+  let journal: Journal;
   try {
-   const configPath = resolve(process.cwd(), options.config);
-   const { config, journal } = loadCtx(configPath);
-   const escalateResult = await escalateMaps(config, journal);
+   ({ config, journal } = loadCtx(configPath));
+  } catch (error) {
+   process.stderr.write(
+    `ranger tick: ${error instanceof Error ? error.message : String(error)}\n`,
+   );
+   process.exit(1);
+  }
+  // Escalation must NOT prevent walking: a lock-contention timeout (an
+  // overlapping digest/cards run holds the desk) or any other escalate
+  // failure is REPORTED in the output, but walk still runs — scheduled
+  // claims are independent of the desk (round-34 review).
+  let escalateResult: EscalateResult | null = null;
+  let escalateError: string | undefined;
+  try {
+   escalateResult = await escalateMaps(config, journal);
+  } catch (error) {
+   escalateError =
+    error instanceof Error ? error.message : String(error);
+  }
+  try {
    // walk re-fetches its OWN frontier: claims must classify from a fresh
    // read — a ~120s-old escalation-pass frontier could misroute a node
    // edited to HITL in that window (round-29 review).
@@ -392,7 +412,7 @@ program
     JSON.stringify(
      {
       generatedAt: new Date().toISOString(),
-      escalate: escalateResult,
+      escalate: escalateResult ?? { error: escalateError, maps: [] },
       walk: walkResult,
      },
      null,
@@ -400,10 +420,12 @@ program
     ) + "\n",
    );
    const failed =
-    escalateResult.maps.some((m) => !m.ok) ||
+    escalateError !== undefined ||
+    (escalateResult?.maps.some((m) => !m.ok) ?? false) ||
     walkResult.maps.some((m) => m.errors.length > 0);
    process.exit(failed ? 2 : 0);
   } catch (error) {
+   journal.close();
    process.stderr.write(
     `ranger tick: ${error instanceof Error ? error.message : String(error)}\n`,
    );

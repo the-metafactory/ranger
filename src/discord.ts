@@ -92,6 +92,13 @@ export class DiscordMessageGoneError extends EscalateError {
 
 // ---- Discord card client (POST announce / PATCH edit) ----
 
+/** Shared global-429 pause state, held BY REFERENCE across all clients a map
+ *  derives (the primary + every `forChannel` destination client), so a global
+ *  429 pauses them ALL at once (round-34 review). */
+interface CooldownState {
+  until: number;
+}
+
 /**
  * Cap on any client-wide Discord cooldown (a global 429's Retry-After): a
  * long retry must not hold the tick — and hence the walk lane — indefinitely
@@ -113,30 +120,38 @@ export class EscalationDiscord {
   /** Client-wide pause (epoch ms): set on a global 429 so POOLED requests —
    *  not just the one that got the 429 — wait it out before sending. Without
    *  this, concurrent cards already past the throttle fire into a hot bucket
-   *  and extend the cooldown (observed live). */
-  private cooldownUntil = 0;
+   *  and extend the cooldown (observed live). SHARED BY REFERENCE across the
+   *  clients `forChannel` derives, so a global 429 pauses EVERY destination-
+   *  channel client too, not just the one that received it (round-34). */
+  private readonly cooldown: CooldownState;
 
   constructor(
     private readonly token: string,
     private readonly channelId: string,
     private readonly apiBase: string = resolveDiscordApiBase(),
     private readonly principalDiscordId?: string,
-  ) {}
+    cooldown: CooldownState = { until: 0 },
+  ) {
+    this.cooldown = cooldown;
+  }
 
   /** The configured Discord channel this client posts/edits in. */
   get channel(): string {
     return this.channelId;
   }
 
-  /** A client for a DIFFERENT channel, sharing token/base/principal config.
-   *  Used to reconcile a card that lives in a channel the map moved away
-   *  from (patch its queue-exit note where it actually is). */
+  /** A client for a DIFFERENT channel, sharing token/base/principal config
+   *  AND the same global cooldown state — used to reconcile a card that
+   *  lives in a channel the map moved away from (patch its queue-exit note
+   *  where it actually is). Sharing the cooldown means a global 429 pauses
+   *  every destination-channel client at once (round-34 review). */
   forChannel(channelId: string): EscalationDiscord {
     return new EscalationDiscord(
       this.token,
       channelId,
       this.apiBase,
       this.principalDiscordId,
+      this.cooldown,
     );
   }
 
@@ -168,21 +183,21 @@ export class EscalationDiscord {
   /** Wait out any client-wide cooldown (a global 429) before sending — but
    *  never past the pass deadline (round-29 review). */
   private async waitForCooldown(deadline?: number): Promise<void> {
-    while (this.cooldownUntil > Date.now()) {
+    while (this.cooldown.until > Date.now()) {
       if (deadline !== undefined && Date.now() > deadline) {
         throw new EscalateError("discord deferred: pass deadline reached");
       }
       await sleep(
         Math.min(
           250,
-          this.cooldownUntil - Date.now(),
+          this.cooldown.until - Date.now(),
           deadline === undefined
             ? Infinity
             : Math.max(0, deadline - Date.now()),
         ),
       );
     }
-    this.cooldownUntil = 0;
+    this.cooldown.until = 0;
   }
 
   /**
@@ -201,6 +216,10 @@ export class EscalationDiscord {
   ): Promise<Response> {
     await this.waitForCooldown(deadline);
     await this.throttle();
+    // A global 429 may have been set by another pooled request WHILE we
+    // queued behind the throttle slot — re-wait so a cooldown set mid-queue
+    // isn't bypassed (round-34 review).
+    await this.waitForCooldown(deadline);
     // Recheck the pass deadline AFTER the queued cooldown + throttle waits —
     // a request queued behind a 30s cooldown must not then spend its own 30s
     // fetch timeout past the pass bound (round-29 review).
@@ -298,8 +317,8 @@ export class EscalationDiscord {
         // cap the request resumes, likely 429s again, and the attempt budget
         // eventually defers the card rather than sleeping the whole cooldown.
         const cooldownMs = Math.max(policy.waitMs, 30_000);
-        this.cooldownUntil = Math.min(
-          Math.max(this.cooldownUntil, Date.now() + cooldownMs),
+        this.cooldown.until = Math.min(
+          Math.max(this.cooldown.until, Date.now() + cooldownMs),
           Date.now() + MAX_COOLDOWN_MS,
         );
       }
