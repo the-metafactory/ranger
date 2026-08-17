@@ -3,6 +3,7 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCmd } from "../src/exec.ts";
+import { EscalationDiscord } from "../src/escalate.ts";
 import { Journal } from "../src/journal.ts";
 
 const fixturesBin = join(import.meta.dir, "fixtures", "bin");
@@ -102,7 +103,9 @@ function writeFixtures(dir: string, drop: string[] = []): string {
         kind: "task",
         checkpointId: "staging-provisioned",
         autonomy: "auto",
-        probes: [{ type: "command", run: "bun test", cwd: "/tmp/not-declared" }],
+        probes: [
+          { type: "command", run: "bun test", cwd: "/tmp/not-declared" },
+        ],
       },
       status: "open",
       assignees: [],
@@ -116,7 +119,11 @@ function writeFixtures(dir: string, drop: string[] = []): string {
 
   writeFileSync(
     join(dir, "acme__widgets-frontier.json"),
-    JSON.stringify({ repo: "acme/widgets", root: "1", frontier: nodes }, null, 2),
+    JSON.stringify(
+      { repo: "acme/widgets", root: "1", frontier: nodes },
+      null,
+      2,
+    ),
   );
   writeFileSync(
     join(dir, "acme__widgets-audit.json"),
@@ -226,26 +233,41 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
       const journal = new Journal(join(dir, "state.sqlite"));
       expect(journal.listEscalations("acme/widgets")).toHaveLength(4);
       expect(
-        journal.listEscalations("acme/widgets").every((r) => r.status === "open"),
+        journal
+          .listEscalations("acme/widgets")
+          .every((r) => r.status === "open"),
       ).toBe(true);
       // The §3 route is persisted so the digest can render it (review fix).
-      expect(
-        journal.getEscalation("acme/widgets", "14")?.route,
-      ).toBe("provisioning");
-      expect(
-        journal.getEscalation("acme/widgets", "12")?.route,
-      ).toBe("escalate-hitl");
+      expect(journal.getEscalation("acme/widgets", "14")?.route).toBe(
+        "provisioning",
+      );
+      expect(journal.getEscalation("acme/widgets", "12")?.route).toBe(
+        "escalate-hitl",
+      );
       journal.close();
       // The announce-once lock is released after the run (no stale lock).
       expect(existsSync(join(dir, ".escalate.lock"))).toBe(false);
 
-      // Second run, unchanged frontier: edit-not-repost — no new POSTs.
+      // Second run, unchanged frontier: content is identical → edit-on-change
+      // skips every card (no posts, no edits — no needless Discord writes).
       const run2 = await runCli(["escalate", "-c", config, "--json"], env);
       const report2 = JSON.parse(run2.stdout);
       expect(report2.maps[0].posted).toEqual([]);
-      expect(report2.maps[0].edited.sort()).toEqual(["11", "12", "13", "14"]);
+      expect(report2.maps[0].edited).toEqual([]);
       expect(discord.posts).toHaveLength(4); // unchanged — nothing reposted
-      expect(discord.edits.length).toBeGreaterThanOrEqual(4);
+      expect(discord.edits).toHaveLength(0); // no-op edits skipped
+
+      // A content change DOES edit in place: bump the age to day 1 (the age
+      // suffix renders `· 1d`, so every card's content differs).
+      const later = new Date(Date.now() + 24 * 60 * 60 * 1000);
+      const ageRun = await runCli(
+        ["escalate", "-c", config, "--json"],
+        { ...env, RANGER_NOW: later.toISOString() },
+      );
+      const ageReport = JSON.parse(ageRun.stdout);
+      expect(ageReport.maps[0].posted).toEqual([]);
+      expect(ageReport.maps[0].edited.sort()).toEqual(["11", "12", "13", "14"]);
+      expect(discord.posts).toHaveLength(4); // still no new posts
 
       // Third run: node 12 leaves the queue → its card resolves, others edit.
       writeFixtures(fixtureDir, ["12"]);
@@ -379,13 +401,10 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
       const config = writeConfig(dir);
 
       // A non-loopback host is refused even with the test sentinel set.
-      const evil = await runCli(
-        ["escalate", "-c", config, "--json"],
-        {
-          ...envFor(fixtureDir, discord.port),
-          RANGER_DISCORD_API_BASE: "http://evil.example",
-        },
-      );
+      const evil = await runCli(["escalate", "-c", config, "--json"], {
+        ...envFor(fixtureDir, discord.port),
+        RANGER_DISCORD_API_BASE: "http://evil.example",
+      });
       expect(evil.code).toBe(2); // maps failed → exit 2
       const evilReport = JSON.parse(evil.stdout);
       expect(evilReport.maps[0].ok).toBe(false);
@@ -394,13 +413,10 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
 
       // Loopback without the explicit test sentinel is refused too — an
       // injected override cannot exfiltrate the token to a local listener.
-      const unsentineled = await runCli(
-        ["escalate", "-c", config, "--json"],
-        {
-          ...envFor(fixtureDir, discord.port),
-          RANGER_DISCORD_ALLOW_TEST_OVERRIDE: undefined,
-        },
-      );
+      const unsentineled = await runCli(["escalate", "-c", config, "--json"], {
+        ...envFor(fixtureDir, discord.port),
+        RANGER_DISCORD_ALLOW_TEST_OVERRIDE: undefined,
+      });
       expect(unsentineled.code).toBe(2);
       const unSent = JSON.parse(unsentineled.stdout);
       expect(unSent.maps[0].ok).toBe(false);
@@ -410,6 +426,35 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
       discord.stop();
       rmSync(dir, { recursive: true, force: true });
       rmSync(fixtureDir, { recursive: true, force: true });
+    }
+  });
+
+  test("retries a 429 rate-limit response before giving up", async () => {
+    let calls = 0;
+    const server = Bun.serve({
+      port: 0,
+      fetch() {
+        calls++;
+        if (calls === 1) {
+          return new Response("rate limited", {
+            status: 429,
+            headers: { "Retry-After": "0" },
+          });
+        }
+        return Response.json({ id: "retried-ok" });
+      },
+    });
+    try {
+      const client = new EscalationDiscord(
+        "tok",
+        "chan",
+        `http://127.0.0.1:${server.port}`,
+      );
+      const id = await client.post("hello");
+      expect(id).toBe("retried-ok");
+      expect(calls).toBe(2);
+    } finally {
+      server.stop(true);
     }
   });
 });

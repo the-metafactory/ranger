@@ -36,6 +36,12 @@ export class EscalateError extends Error {
 // ---- Discord card client (POST announce / PATCH edit) ----
 
 export class EscalationDiscord {
+  /** Minimum spacing between API calls from one client — Discord throttles
+   *  message writes per channel (~5/5s for bots), and a pooled pass of many
+   *  cards would otherwise trip 429s (observed live: 6 edits → 429). */
+  private static readonly MIN_INTERVAL_MS = 1000;
+  private lastRequestAt = 0;
+
   constructor(
     private readonly token: string,
     private readonly channelId: string,
@@ -74,37 +80,78 @@ export class EscalationDiscord {
     content: string,
   ): Promise<Response> {
     // Every call times out — a run can never stall indefinitely holding the
-    // announce-once lock (the lock's stale-reclaim bound depends on this).
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 30_000);
-    try {
-      return await fetch(`${this.apiBase}${path}`, {
-        method,
-        headers: {
-          Authorization: `Bot ${this.token}`,
-          "Content-Type": "application/json",
-        },
-        // parse: [] suppresses untrusted @everyone/@here/role mentions in
-        // graph-derived content; only the principal's id (when configured)
-        // is allowed to ping.
-        body: JSON.stringify({
-          content,
-          allowed_mentions: {
-            parse: [],
-            users: this.principalDiscordId
-              ? [this.principalDiscordId]
-              : [],
+    // announce-once lock. Calls are spaced ≥1s apart. On a rate limit (429),
+    // a GLOBAL cooldown must be waited out in full — retrying into it just
+    // resets the bucket and extends the throttle (observed live) — so a global
+    // 429 waits max(Retry-After, 30s); a local 429 waits Retry-After.
+    const maxAttempts = 4;
+    let lastStatus = 0;
+    let firstRetryAfterSec = 0;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      await this.throttle();
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 30_000);
+      try {
+        const response = await fetch(`${this.apiBase}${path}`, {
+          method,
+          headers: {
+            Authorization: `Bot ${this.token}`,
+            "Content-Type": "application/json",
           },
-        }),
-        signal: controller.signal,
-      });
-    } catch (error) {
-      throw new EscalateError(
-        `discord ${method} ${path} failed: ${error instanceof Error ? error.message : String(error)}`,
-      );
-    } finally {
-      clearTimeout(timer);
+          // parse: [] suppresses untrusted @everyone/@here/role mentions in
+          // graph-derived content; only the principal's id (when configured)
+          // is allowed to ping.
+          body: JSON.stringify({
+            content,
+            allowed_mentions: {
+              parse: [],
+              users: this.principalDiscordId ? [this.principalDiscordId] : [],
+            },
+          }),
+          signal: controller.signal,
+        });
+        if (response.status !== 429 && response.status < 500) {
+          return response;
+        }
+        lastStatus = response.status;
+        const retryAfter = Number(response.headers.get("retry-after"));
+        if (attempt === 1) {
+          firstRetryAfterSec = Number.isFinite(retryAfter) ? retryAfter : 0;
+        }
+        const global = response.headers.get("x-ratelimit-global") !== null;
+        const waitMs =
+          Number.isFinite(retryAfter) && retryAfter > 0
+            ? retryAfter * 1000
+            : 1000 * 2 ** (attempt - 1);
+        // A long first cooldown (>30s) means the card is hot; retrying into it
+        // just extends it (observed live) — fail fast so the card is deferred
+        // to next tick instead of hammering.
+        if (attempt === 1 && firstRetryAfterSec > 30) {
+          break;
+        }
+        await sleep(global ? Math.max(waitMs, 30_000) : Math.min(waitMs, 30_000));
+      } catch (error) {
+        throw new EscalateError(
+          `discord ${method} ${path} failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      } finally {
+        clearTimeout(timer);
+      }
     }
+    throw new EscalateError(
+      `discord ${method} ${path} failed after ${lastStatus === 0 ? "setup" : maxAttempts} attempts (last HTTP ${lastStatus}${firstRetryAfterSec > 0 ? `, retry-after ${firstRetryAfterSec}s` : ""})`,
+    );
+  }
+
+  /** Space calls from this client apart so a pooled pass stays rate-limit-safe. */
+  private async throttle(): Promise<void> {
+    const now = Date.now();
+    const wait =
+      this.lastRequestAt + EscalationDiscord.MIN_INTERVAL_MS - now;
+    if (wait > 0) {
+      await sleep(wait);
+    }
+    this.lastRequestAt = Date.now();
   }
 
   /** Post a new card; returns the Discord message id (announce-once). */
@@ -115,9 +162,7 @@ export class EscalationDiscord {
       content,
     );
     if (!response.ok) {
-      throw new EscalateError(
-        `discord post returned HTTP ${response.status}`,
-      );
+      throw new EscalateError(`discord post returned HTTP ${response.status}`);
     }
     const body = (await response.json()) as { id?: string };
     if (typeof body.id !== "string" || body.id.length === 0) {
@@ -201,8 +246,10 @@ function ageSuffix(
       : `📣 <@${principalDiscordId}> **${ageDays}d** — needs your attention`;
   }
   if (ageBand(ageDays) === "aging") {
-    return `⚠️ **${ageDays}d** — aging; blocked-descendant count unavailable ` +
-      "(read-only surface can't enumerate blocked nodes)";
+    return (
+      `⚠️ **${ageDays}d** — aging; blocked-descendant count unavailable ` +
+      "(read-only surface can't enumerate blocked nodes)"
+    );
   }
   return `· ${ageDays}d`;
 }
@@ -277,6 +324,8 @@ interface EscalateMapResult {
   edited: string[];
   /** Node ids whose card was marked resolved (no longer on the HITL queue). */
   resolved: string[];
+  /** Per-card transient failures (e.g. Discord 429) — retried next tick. */
+  cardErrors: string[];
   cards: EscalationCard[];
 }
 
@@ -324,7 +373,16 @@ async function mapPool<T, R>(
       })(),
     );
   }
-  await Promise.all(workers);
+  // allSettled — wait for every in-flight worker before propagating a failure,
+  // so the caller never releases the announce-once lock while a sibling's
+  // journal write is still pending (a second run could otherwise post dupes).
+  const settled = await Promise.allSettled(workers);
+  const rejected = settled.find(
+    (s): s is PromiseRejectedResult => s.status === "rejected",
+  );
+  if (rejected !== undefined) {
+    throw rejected.reason;
+  }
   return results;
 }
 
@@ -343,11 +401,6 @@ async function withEscalateLock<T>(
   const lockFile = join(dirname(journal.path), ".escalate.lock");
   const started = Date.now();
   const timeoutMs = 60_000;
-  // Every Discord call times out at 30s, so no live run can legitimately hold
-  // the lock anywhere near this — a lock this old is always a dead/rebooted
-  // run (and a reboot can recycle the pid), so time alone makes it reclaimable
-  // without ever stealing a live run's lock.
-  const STALE_MS = 24 * 60 * 60 * 1000;
   const owner = JSON.stringify({ pid: process.pid, startedAt: Date.now() });
   for (;;) {
     try {
@@ -357,32 +410,26 @@ async function withEscalateLock<T>(
       break;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      // Someone holds the lock. Reclaim it when the owner is dead (kill(pid,0)
-      // → ESRCH) or the owner record is stale (reboot / pid reuse).
+      // Someone holds the lock. Reclaim it ONLY when the owner's pid is dead
+      // (kill(pid,0) → ESRCH). We never reclaim a lock whose owner is alive,
+      // whatever its age — stealing a live run's lock would let two runs both
+      // POST fresh cards and break announce-once. A rebooted host whose old
+      // pid got recycled (alive but unrelated) is left to the 60s timeout → a
+      // visible refusal, never silent duplicates; the operator clears it.
       let reclaimable = false;
       try {
         const prior = JSON.parse(readFileSync(lockFile, "utf8")) as {
           pid?: number;
-          startedAt?: number;
         };
         if (typeof prior.pid === "number") {
           try {
             process.kill(prior.pid, 0);
           } catch (killError) {
-            reclaimable =
-              (killError as NodeJS.ErrnoException).code === "ESRCH";
+            reclaimable = (killError as NodeJS.ErrnoException).code === "ESRCH";
           }
         }
-        if (
-          !reclaimable &&
-          typeof prior.startedAt === "number" &&
-          Date.now() - prior.startedAt > STALE_MS
-        ) {
-          reclaimable = true;
-        }
       } catch {
-        // A torn/corrupt lock file — never reclaim on a live-owned guess;
-        // the 60s timeout bounds the damage for the rare unreadable case.
+        /* unreadable owner — never reclaim on a guess */
         reclaimable = false;
       }
       if (reclaimable) {
@@ -420,41 +467,62 @@ async function withEscalateLock<T>(
  * many-card map doesn't edit serially.
  */
 async function resolveStaleCards(
-  client: EscalationDiscord,
-  journal: Journal,
-  map: RangerMapConfig,
+  ctx: {
+    client: EscalationDiscord;
+    journal: Journal;
+    map: RangerMapConfig;
+    now: Date;
+  },
   existing: Map<string, EscalationRow>,
   neededIds: Set<string>,
-  now: Date,
-): Promise<string[]> {
+): Promise<{ resolved: string[]; errors: string[] }> {
+  const { client, journal, map, now } = ctx;
   const resolvable = [...existing.entries()].filter(
     ([, prior]) => prior.status !== "resolved",
   );
-  const resolved = await mapPool(resolvable, 3, async ([nodeId, prior]) => {
-    if (neededIds.has(nodeId)) return null;
-    await client.edit(
-      prior.messageId,
-      [
+  const outcomes = await mapPool(resolvable, 3, async ([nodeId, prior]) => {
+    if (neededIds.has(nodeId)) return { action: "skip" as const };
+    try {
+      const content = [
         `~~**#${nodeId}** ${prior.title ?? ""}~~ ✅ resolved`,
         `map: ${map.repo} — no longer on the HITL/provisioning queue`,
         `_edited ${now.toISOString()}_`,
       ]
         .filter((l) => l.trim().length > 0)
-        .join("\n"),
-    );
-    journal.upsertEscalation({
-      key: `${map.repo}:${nodeId}`,
-      repo: map.repo,
-      nodeId,
-      title: prior.title,
-      messageId: prior.messageId,
-      createdAt: prior.createdAt,
-      lastEditedAt: now.toISOString(),
-      status: "resolved",
-    });
-    return nodeId;
+        .join("\n");
+      await client.edit(prior.messageId, content);
+      journal.upsertEscalation({
+        key: `${map.repo}:${nodeId}`,
+        repo: map.repo,
+        nodeId,
+        title: prior.title,
+        lastContent: content,
+        messageId: prior.messageId,
+        createdAt: prior.createdAt,
+        lastEditedAt: now.toISOString(),
+        status: "resolved",
+      });
+      return { action: "resolved" as const, id: nodeId };
+    } catch (cardError) {
+      // A transient failure on one resolution must not fail the desk — the
+      // card stays open and resolves on a later tick.
+      return {
+        action: "error" as const,
+        id: nodeId,
+        error: cardError instanceof Error ? cardError.message : String(cardError),
+      };
+    }
   });
-  return resolved.filter((nodeId): nodeId is string => nodeId !== null);
+  const resolved: string[] = [];
+  const errors: string[] = [];
+  for (const outcome of outcomes) {
+    if (outcome.action === "error") {
+      errors.push(`#${outcome.id}: ${outcome.error}`);
+    } else if (outcome.action === "resolved") {
+      resolved.push(outcome.id);
+    }
+  }
+  return { resolved, errors };
 }
 
 function ageText(
@@ -524,6 +592,7 @@ async function escalateOneMap(
     posted: [],
     edited: [],
     resolved: [],
+    cardErrors: [],
     cards: [],
   };
 
@@ -555,7 +624,10 @@ async function escalateOneMap(
     const classified = frontier.frontier.map((entry) =>
       classify(entry, map.repo, map.walk, registry),
     );
-    const needed = [...hitlWaiting(classified), ...classified.filter((n) => n.route.route === "provisioning")].filter(cardNeeded);
+    const needed = [
+      ...hitlWaiting(classified),
+      ...classified.filter((n) => n.route.route === "provisioning"),
+    ].filter(cardNeeded);
 
     const existing = new Map(
       journal
@@ -567,8 +639,7 @@ async function escalateOneMap(
     const cards: EscalationCard[] = [];
     const outcomes = await mapPool(needed, 3, async (node) => {
       const prior = existing.get(node.id);
-      const ageDays =
-        prior === undefined ? 0 : dayDiff(prior.createdAt, now);
+      const ageDays = prior === undefined ? 0 : dayDiff(prior.createdAt, now);
       const content = cardContent(
         node,
         map,
@@ -576,53 +647,87 @@ async function escalateOneMap(
         principal,
         config.principal.discordId,
       );
-      if (prior === undefined) {
-        const messageId = await client.post(content);
+      try {
+        if (prior === undefined) {
+          const messageId = await client.post(content);
+          const row = {
+            key: `${map.repo}:${node.id}`,
+            repo: map.repo,
+            nodeId: node.id,
+            title: node.title,
+            route: node.route.route,
+            lastContent: content,
+            messageId,
+            createdAt: now.toISOString(),
+            status: "open" as const,
+          };
+          journal.upsertEscalation(row);
+          return {
+            action: "posted" as const,
+            id: node.id,
+            card: cardFrom(node, row, ageDays),
+          };
+        }
+        // Edit-on-change: a 900s tick re-runs ~96×/day; re-editing identical
+        // cards churns Discord writes and trips rate limits (observed live).
+        // Only PATCH when the rendered content actually differs.
+        if (prior.lastContent === content) {
+          return {
+            action: "unchanged" as const,
+            id: node.id,
+            card: cardFrom(node, prior, ageDays),
+          };
+        }
+        await client.edit(prior.messageId, content);
         const row = {
           key: `${map.repo}:${node.id}`,
           repo: map.repo,
           nodeId: node.id,
           title: node.title,
           route: node.route.route,
-          messageId,
-          createdAt: now.toISOString(),
+          lastContent: content,
+          messageId: prior.messageId,
+          createdAt: prior.createdAt,
+          lastEditedAt: now.toISOString(),
           status: "open" as const,
         };
         journal.upsertEscalation(row);
-        return { action: "posted" as const, id: node.id, card: cardFrom(node, row, ageDays) };
+        return {
+          action: "edited" as const,
+          id: node.id,
+          card: cardFrom(node, row, ageDays),
+        };
+      } catch (cardError) {
+        // A transient Discord failure on one card must not fail the whole
+        // desk — the card retries next tick (announce-once stays intact: a
+        // failed post writes no row, a failed edit keeps its row).
+        return {
+          action: "error" as const,
+          id: node.id,
+          error: cardError instanceof Error ? cardError.message : String(cardError),
+        };
       }
-      await client.edit(prior.messageId, content);
-      const row = {
-        key: `${map.repo}:${node.id}`,
-        repo: map.repo,
-        nodeId: node.id,
-        title: node.title,
-        route: node.route.route,
-        messageId: prior.messageId,
-        createdAt: prior.createdAt,
-        lastEditedAt: now.toISOString(),
-        status: "open" as const,
-      };
-      journal.upsertEscalation(row);
-      return { action: "edited" as const, id: node.id, card: cardFrom(node, row, ageDays) };
     });
     for (const outcome of outcomes) {
+      if (outcome.action === "posted" || outcome.action === "edited") {
+        cards.push(outcome.card);
+      } else if (outcome.action === "unchanged") {
+        cards.push(outcome.card);
+      } else {
+        base.cardErrors.push(`#${outcome.id}: ${outcome.error}`);
+      }
       if (outcome.action === "posted") base.posted.push(outcome.id);
-      else base.edited.push(outcome.id);
-      cards.push(outcome.card);
+      else if (outcome.action === "edited") base.edited.push(outcome.id);
     }
 
     const neededIds = new Set(needed.map((n) => n.id));
-    base.resolved.push(
-      ...(await resolveStaleCards(
-        client,
-        journal,
-        map,
-        existing,
-        neededIds,
-        now,
-      )),
+    const resolution = await resolveStaleCards(
+      { client, journal, map, now },
+      existing,
+      neededIds,
     );
+    base.resolved.push(...resolution.resolved);
+    base.cardErrors.push(...resolution.errors);
 
     return { ...base, cards };
   } catch (error) {
@@ -669,7 +774,12 @@ interface DigestMapResult {
   receiptLessCloses: string[];
   openWithoutCheckpoint: string[];
   openClaims: { id: string; assignees: string[] }[];
-  budget: { spawnsToday: number; spawnCapPerDay: number; deadman: number; paused: boolean };
+  budget: {
+    spawnsToday: number;
+    spawnCapPerDay: number;
+    deadman: number;
+    paused: boolean;
+  };
   digestMessageId: string;
   posted: boolean;
 }
@@ -715,7 +825,9 @@ function digestContent(inputs: DigestInputs): string {
     }
   }
   lines.push("");
-  lines.push(`**Audit:** receipt-less closes ${audit.closedWithoutReceipt.length}${audit.closedWithoutReceipt.length > 0 ? ` (${audit.closedWithoutReceipt.join(", ")})` : ""} · open w/o checkpoint ${audit.openWithoutCheckpoint.length}${audit.openWithoutCheckpoint.length > 0 ? ` (${audit.openWithoutCheckpoint.join(", ")})` : ""} · open claims ${audit.openClaimed.length}`);
+  lines.push(
+    `**Audit:** receipt-less closes ${audit.closedWithoutReceipt.length}${audit.closedWithoutReceipt.length > 0 ? ` (${audit.closedWithoutReceipt.join(", ")})` : ""} · open w/o checkpoint ${audit.openWithoutCheckpoint.length}${audit.openWithoutCheckpoint.length > 0 ? ` (${audit.openWithoutCheckpoint.join(", ")})` : ""} · open claims ${audit.openClaimed.length}`,
+  );
   if (audit.openClaimed.length > 0) {
     for (const c of audit.openClaimed) {
       lines.push(`    #${c.id} [${c.assignees.join(", ")}]`);
@@ -774,15 +886,13 @@ async function digestOneMap(
   try {
     const audit = await graphAudit(map.repo, map.root, token);
     // Open cards only — the digest never needs resolved history (suggestion).
-    const open = journal
-      .listOpenEscalations(map.repo)
-      .map((row) => ({
-        nodeId: row.nodeId,
-        title: row.title ?? `#${row.nodeId}`,
-        route: row.route ?? "escalate-hitl",
-        ageDays: dayDiff(row.createdAt, now),
-        messageId: row.messageId,
-      }));
+    const open = journal.listOpenEscalations(map.repo).map((row) => ({
+      nodeId: row.nodeId,
+      title: row.title ?? `#${row.nodeId}`,
+      route: row.route ?? "escalate-hitl",
+      ageDays: dayDiff(row.createdAt, now),
+      messageId: row.messageId,
+    }));
 
     const content = digestContent({
       map,

@@ -70,37 +70,37 @@ export class DiscordAnnouncer implements Announcer {
 
  async announce(ctx: AnnounceContext): Promise<AnnounceResult> {
   const content = [
-    `:ranger: **claim** #${ctx.nodeId} — ${ctx.nodeTitle}`,
-    `map: ${ctx.repo}${ctx.mapTitle === undefined ? "" : ` (${ctx.mapTitle})`}`,
+   `:ranger: **claim** #${ctx.nodeId} — ${ctx.nodeTitle}`,
+   `map: ${ctx.repo}${ctx.mapTitle === undefined ? "" : ` (${ctx.mapTitle})`}`,
   ].join("\n");
   let response: Response;
   try {
-    response = await fetch(
-      `${this.apiBase}/channels/${this.channelId}/messages`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bot ${this.token}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ content }),
-      },
-    );
+   response = await fetch(
+    `${this.apiBase}/channels/${this.channelId}/messages`,
+    {
+     method: "POST",
+     headers: {
+      Authorization: `Bot ${this.token}`,
+      "Content-Type": "application/json",
+     },
+     body: JSON.stringify({ content }),
+    },
+   );
   } catch (error) {
-    throw new AnnounceError(
-      `announce failed for #${ctx.nodeId}: ${error instanceof Error ? error.message : String(error)}`,
-    );
+   throw new AnnounceError(
+    `announce failed for #${ctx.nodeId}: ${error instanceof Error ? error.message : String(error)}`,
+   );
   }
   if (!response.ok) {
-    throw new AnnounceError(
-      `announce for #${ctx.nodeId} returned HTTP ${response.status} — fail-closed, no claim.`,
-    );
+   throw new AnnounceError(
+    `announce for #${ctx.nodeId} returned HTTP ${response.status} — fail-closed, no claim.`,
+   );
   }
   const body = (await response.json()) as { id?: string };
   if (typeof body.id !== "string" || body.id.length === 0) {
-    throw new AnnounceError(
-      `announce for #${ctx.nodeId} returned no message id — fail-closed, no claim.`,
-    );
+   throw new AnnounceError(
+    `announce for #${ctx.nodeId} returned no message id — fail-closed, no claim.`,
+   );
   }
   return { messageId: body.id };
  }
@@ -117,7 +117,9 @@ export class RecordingAnnouncer implements Announcer {
 
  async announce(ctx: AnnounceContext): Promise<AnnounceResult> {
   if (this.fail) {
-   throw new AnnounceError(`recording announcer told to fail for #${ctx.nodeId}`);
+   throw new AnnounceError(
+    `recording announcer told to fail for #${ctx.nodeId}`,
+   );
   }
   const messageId = `msg-${ctx.nodeId}-${this.posts.length}`;
   this.posts.push({ ctx, messageId });

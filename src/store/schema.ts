@@ -55,6 +55,11 @@ export const vetoes = sqliteTable("vetoes", {
  * timestamp back the announce-once / edit-not-repost / age-banding contract:
  * a card is posted once, edited in place thereafter, and aged from `createdAt`.
  */
+/**
+ * The Discord API base for production, with a hardened test seam — shared
+ * with the walker announcer (src/discord.ts).
+ */
+
 export const escalations = sqliteTable("escalations", {
  /** `${repo}:${nodeId}` — one card per node per map. */
  key: text("key").primaryKey(),
@@ -64,6 +69,8 @@ export const escalations = sqliteTable("escalations", {
  title: text("title"),
  /** The §3 route class at (last) post/edit — escalate-hitl | provisioning. */
  route: text("route"),
+ /** The content last sent to Discord — edit-on-change skips identical re-edits. */
+ lastContent: text("last_content"),
  messageId: text("message_id").notNull(),
  createdAt: text("created_at").notNull(),
  lastEditedAt: text("last_edited_at"),

@@ -54,6 +54,8 @@ export interface EscalationRow {
  title: string | null;
  /** §3 route class at last post/edit — escalate-hitl | provisioning. */
  route: string | null;
+ /** Content last sent to Discord — edit-on-change skips identical re-edits. */
+ lastContent: string | null;
  messageId: string;
  createdAt: string;
  lastEditedAt: string | null;
@@ -272,7 +274,12 @@ export class Journal {
    EscalationRow,
    "key" | "repo" | "nodeId" | "messageId" | "createdAt"
   > &
-   Partial<Pick<EscalationRow, "title" | "route" | "lastEditedAt" | "status">>,
+   Partial<
+    Pick<
+     EscalationRow,
+     "title" | "route" | "lastContent" | "lastEditedAt" | "status"
+    >
+   >,
  ): void {
   const existing = this.getEscalation(row.repo, row.nodeId);
   this.db
@@ -283,6 +290,7 @@ export class Journal {
     nodeId: row.nodeId,
     title: row.title ?? existing?.title ?? null,
     route: row.route ?? existing?.route ?? null,
+    lastContent: row.lastContent ?? existing?.lastContent ?? null,
     messageId: row.messageId,
     createdAt: existing?.createdAt ?? row.createdAt,
     lastEditedAt: row.lastEditedAt ?? existing?.lastEditedAt ?? null,
@@ -293,6 +301,7 @@ export class Journal {
     set: {
      title: row.title ?? existing?.title ?? null,
      route: row.route ?? existing?.route ?? null,
+     lastContent: row.lastContent ?? existing?.lastContent ?? null,
      messageId: row.messageId,
      createdAt: existing?.createdAt ?? row.createdAt,
      lastEditedAt: row.lastEditedAt ?? existing?.lastEditedAt ?? null,
@@ -408,6 +417,7 @@ function hydrateEscalation(row: {
  nodeId: string;
  title: string | null;
  route: string | null;
+ lastContent: string | null;
  messageId: string;
  createdAt: string;
  lastEditedAt: string | null;
@@ -419,6 +429,7 @@ function hydrateEscalation(row: {
   nodeId: row.nodeId,
   title: row.title,
   route: row.route,
+  lastContent: row.lastContent,
   messageId: row.messageId,
   createdAt: row.createdAt,
   lastEditedAt: row.lastEditedAt,

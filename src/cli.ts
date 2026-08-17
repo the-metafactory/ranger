@@ -37,7 +37,12 @@ import {
 import { runNode } from "./worker.ts";
 import { sweepMap } from "./sweep.ts";
 import { walk } from "./walk.ts";
-import { escalateMaps, runDigest, type EscalateResult, type DigestResult } from "./escalate.ts";
+import {
+ escalateMaps,
+ runDigest,
+ type EscalateResult,
+ type DigestResult,
+} from "./escalate.ts";
 import type { WalkMode } from "./config.ts";
 
 /**
@@ -160,7 +165,10 @@ async function runScout(opts: ScoutOptions): Promise<ScoutReport> {
 
 // ---- walker commands ----
 
-function loadCtx(configPath: string): { config: RangerConfig; journal: Journal } {
+function loadCtx(configPath: string): {
+ config: RangerConfig;
+ journal: Journal;
+} {
  const { config } = loadConfig(configPath);
  const journal = openJournal(config);
  return { config, journal };
@@ -204,7 +212,12 @@ async function runSweep(configPath: string): Promise<string> {
  const results = [];
  for (const map of config.maps) {
   if (map.walk === "none") {
-   results.push({ repo: map.repo, walk: map.walk, swept: false, reason: "walk: none" });
+   results.push({
+    repo: map.repo,
+    walk: map.walk,
+    swept: false,
+    reason: "walk: none",
+   });
    continue;
   }
   try {
@@ -243,7 +256,10 @@ async function runJournal(
  return JSON.stringify(rows, null, 2);
 }
 
-function pickMap(config: RangerConfig, repo: string | undefined): RangerMapConfig {
+function pickMap(
+ config: RangerConfig,
+ repo: string | undefined,
+): RangerMapConfig {
  if (repo !== undefined) {
   const map = config.maps.find((m) => m.repo === repo);
   if (map === undefined) {
@@ -258,7 +274,9 @@ function pickMap(config: RangerConfig, repo: string | undefined): RangerMapConfi
 }
 
 function normalizeRepo(repo: string, config: RangerConfig): string {
- const map = config.maps.find((m) => m.repo === repo || m.repo.endsWith(`/${repo}`));
+ const map = config.maps.find(
+  (m) => m.repo === repo || m.repo.endsWith(`/${repo}`),
+ );
  return map?.repo ?? repo;
 }
 
@@ -276,7 +294,9 @@ function renderEscalateText(result: EscalateResult | DigestResult): string {
   if ("cards" in map && "receiptLessCloses" in map && "budget" in map) {
    // digest map
    const d = map as DigestResult["maps"][number];
-   lines.push(`map: ${map.repo} (digest ${d.posted ? "posted" : "edited"} ${d.digestMessageId})`);
+   lines.push(
+    `map: ${map.repo} (digest ${d.posted ? "posted" : "edited"} ${d.digestMessageId})`,
+   );
    lines.push(
     `  cards: ${d.cards.length}${d.cards.length ? ` (${d.cards.map((c) => `#${c.nodeId} ${c.ageDays}d`).join(", ")})` : " — clean"}`,
    );
@@ -296,6 +316,9 @@ function renderEscalateText(result: EscalateResult | DigestResult): string {
     `  resolved: ${e.resolved.length ? e.resolved.map((n) => `#${n}`).join(", ") : "—"}`,
    );
    lines.push(`  cards: ${e.cards.length}`);
+   if (e.cardErrors.length > 0) {
+    lines.push(`  ⚠ retry-next-tick: ${e.cardErrors.join("; ")}`);
+   }
   }
   lines.push("");
  }
@@ -317,7 +340,10 @@ program
  .option("-j, --json", "emit machine-readable JSON")
  .action(async (options: { config: string; json: boolean }) => {
   try {
-   const report = await runScout({ config: options.config, json: options.json });
+   const report = await runScout({
+    config: options.config,
+    json: options.json,
+   });
    process.stdout.write(
     options.json ? renderJson(report) + "\n" : renderText(report) + "\n",
    );
@@ -350,8 +376,46 @@ program
  });
 
 program
+ .command("tick")
+ .description(
+  "One bounded autonomous pass (design §1): escalation cards (design §5) then the walk claim phase — so HITL/provisioning cards are posted/edited on the schedule, not just by the daily digest. The launchd tick runs this.",
+ )
+ .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
+ .action(async (options: { config: string }) => {
+  try {
+   const configPath = resolve(process.cwd(), options.config);
+   const { config, journal } = loadCtx(configPath);
+   const escalateResult = await escalateMaps(config, journal);
+   const walkResult = await walk({ config, configPath, journal });
+   journal.close();
+   process.stdout.write(
+    JSON.stringify(
+     {
+      generatedAt: new Date().toISOString(),
+      escalate: escalateResult,
+      walk: walkResult,
+     },
+     null,
+     2,
+    ) + "\n",
+   );
+   const failed =
+    escalateResult.maps.some((m) => !m.ok) ||
+    walkResult.maps.some((m) => m.errors.length > 0);
+   process.exit(failed ? 2 : 0);
+  } catch (error) {
+   process.stderr.write(
+    `ranger tick: ${error instanceof Error ? error.message : String(error)}\n`,
+   );
+   process.exit(1);
+  }
+ });
+
+program
  .command("run-node")
- .description("Detached worker supervisor: worktree, research worker, gated close, decisions --write")
+ .description(
+  "Detached worker supervisor: worktree, research worker, gated close, decisions --write",
+ )
  .argument("<id>", "node id to execute")
  .option("-m, --map <repo>", "map repo (required with multiple maps)")
  .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
@@ -369,7 +433,9 @@ program
 
 program
  .command("sweep")
- .description("Reconcile the journal against reality (crashed workers, stale claims)")
+ .description(
+  "Reconcile the journal against reality (crashed workers, stale claims)",
+ )
  .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
  .action(async (options: { config: string }) => {
   try {
@@ -408,29 +474,35 @@ program
  .option("--digest", "emit the daily digest instead of the cards pass")
  .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
  .option("-j, --json", "emit machine-readable JSON")
- .action(async (options: { digest: boolean; config: string; json: boolean }) => {
-  try {
-   const configPath = resolve(process.cwd(), options.config);
-   const { config } = loadConfig(configPath);
-   const journal = openJournal(config);
-   const result = options.digest
-    ? await runDigest(config, journal)
-    : await escalateMaps(config, journal);
-   journal.close();
-   process.stdout.write(
-    options.json
-     ? JSON.stringify(result, null, 2) + "\n"
-     : renderEscalateText(result) + "\n",
-   );
-   const failed = result.maps.some((m) => !m.ok);
-   process.exit(failed ? 2 : 0);
-  } catch (error) {
-   process.stderr.write(
-    `ranger escalate: ${error instanceof Error ? error.message : String(error)}\n`,
-   );
-   process.exit(1);
-  }
- });
+ .action(
+  async (options: { digest: boolean; config: string; json: boolean }) => {
+   try {
+    const configPath = resolve(process.cwd(), options.config);
+    const { config } = loadConfig(configPath);
+    const journal = openJournal(config);
+    // Test seam: RANGER_NOW injects the clock (age-banding tests).
+    const now = process.env.RANGER_NOW
+     ? new Date(process.env.RANGER_NOW)
+     : undefined;
+    const result = options.digest
+     ? await runDigest(config, journal, now === undefined ? {} : { now })
+     : await escalateMaps(config, journal, now === undefined ? {} : { now });
+    journal.close();
+    process.stdout.write(
+     options.json
+      ? JSON.stringify(result, null, 2) + "\n"
+      : renderEscalateText(result) + "\n",
+    );
+    const failed = result.maps.some((m) => !m.ok);
+    process.exit(failed ? 2 : 0);
+   } catch (error) {
+    process.stderr.write(
+     `ranger escalate: ${error instanceof Error ? error.message : String(error)}\n`,
+    );
+    process.exit(1);
+   }
+  },
+ );
 
 program.parseAsync(process.argv).catch((error) => {
  process.stderr.write(

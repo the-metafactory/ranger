@@ -1,10 +1,21 @@
- import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { describe, expect, test } from "bun:test";
+import {
+ mkdirSync,
+ mkdtempSync,
+ readFileSync,
+ realpathSync,
+ rmSync,
+ writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCmd } from "../src/exec.ts";
 import { Journal } from "../src/journal.ts";
-import { classify, loadProbeRegistry, type ClassifiedNode } from "../src/route.ts";
+import {
+ classify,
+ loadProbeRegistry,
+ type ClassifiedNode,
+} from "../src/route.ts";
 import { researchCandidates } from "../src/walk.ts";
 import { bootstrapWorktree } from "../src/worker.ts";
 import type { FrontierEntry } from "../src/graph.ts";
@@ -56,10 +67,7 @@ function writeConfig(dir: string, extra: string[] = []): string {
 
 function writeState(dir: string, nodes: Record<string, unknown>): string {
  const path = join(dir, "state.json");
- writeFileSync(
-  path,
-  JSON.stringify({ nodes, decisions: [] }, null, 2),
- );
+ writeFileSync(path, JSON.stringify({ nodes, decisions: [] }, null, 2));
  return path;
 }
 
@@ -71,11 +79,11 @@ const RESEARCH_NODE_STATE = {
 };
 
 async function runCli(
-  args: string[],
-  env: NodeJS.ProcessEnv,
-  cwd = join(import.meta.dir, ".."),
+ args: string[],
+ env: NodeJS.ProcessEnv,
+ cwd = join(import.meta.dir, ".."),
 ) {
-  return runCmd(bun, [cliPath, ...args], { env, cwd });
+ return runCmd(bun, [cliPath, ...args], { env, cwd });
 }
 
 /** Spin up a fake Discord server; returns {port, posts}. */
@@ -131,11 +139,56 @@ describe("ranger walk — claim phase (node #13)", () => {
    const kinds = events.map((e) => e.kind);
    expect(kinds).toContain("announced");
    expect(kinds).toContain("claimed");
-   expect(events.find((e) => e.kind === "claimed")?.detail).toContain("ivy-bot");
+   expect(events.find((e) => e.kind === "claimed")?.detail).toContain(
+    "ivy-bot",
+   );
    const worker = journal.getWorker("10");
    expect(worker?.status).toBe("claimed");
    expect(worker?.messageId).toMatch(/^discord-msg-/);
    journal.close();
+  } finally {
+   discord.stop();
+   rmSync(dir, { recursive: true, force: true });
+  }
+ });
+
+ test("tick runs the escalation cards pass then the walk claim phase (design §1)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ranger-tick-"));
+  const discord = fakeDiscord();
+  try {
+   const config = writeConfig(dir);
+   const statePath = writeState(dir, { "10": RESEARCH_NODE_STATE });
+
+   const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    ...GIT_ENV,
+    PATH: `${fixturesBin}:${process.env.PATH ?? ""}`,
+    FAKE_SOMA_DIR: dataDir,
+    FAKE_SOMA_STATE: statePath,
+    RANGER_DISCORD_API_BASE: `http://127.0.0.1:${discord.port}`,
+    RANGER_DISCORD_ALLOW_TEST_OVERRIDE: "1",
+    RANGER_DISCORD_TOKEN: "fake-bot-token",
+    RANGER_WRITE_TEST: "ghp_write",
+    RANGER_RO_TEST: "ghp_ro", // escalate cards pass needs the read-only token
+    RANGER_NO_SPAWN: "1",
+   };
+
+   const result = await runCli(["tick", "-c", config], env);
+   expect(result.code).toBe(0);
+   const report = JSON.parse(result.stdout);
+   // The cards pass ran and carded the fixture's HITL/provisioning nodes;
+   // the walk claimed node 10. Both phases under one tick.
+   expect(report.escalate.maps[0].ok).toBe(true);
+   expect(report.escalate.maps[0].posted.sort()).toEqual([
+    "11",
+    "12",
+    "13",
+    "14",
+   ]);
+   expect(report.walk.maps[0].claimed).toEqual(["10"]);
+
+   const state = JSON.parse(readFileSync(statePath, "utf8"));
+   expect(state.nodes["10"].assignees).toEqual(["ivy-bot"]);
   } finally {
    discord.stop();
    rmSync(dir, { recursive: true, force: true });
@@ -249,19 +302,36 @@ describe("ranger run-node — research worker full loop (node #13 acceptance)", 
    const seed = join(dir, "seed");
    mkdirSync(seed, { recursive: true });
    writeFileSync(join(seed, "README.md"), "# acme/widgets\n");
-   await runCmd("git", ["init", "-b", "main"], { cwd: seed, env: { ...process.env, ...GIT_ENV } });
-   await runCmd("git", ["add", "-A"], { cwd: seed, env: { ...process.env, ...GIT_ENV } });
-   await runCmd("git", ["commit", "-m", "initial"], { cwd: seed, env: { ...process.env, ...GIT_ENV } });
+   await runCmd("git", ["init", "-b", "main"], {
+    cwd: seed,
+    env: { ...process.env, ...GIT_ENV },
+   });
+   await runCmd("git", ["add", "-A"], {
+    cwd: seed,
+    env: { ...process.env, ...GIT_ENV },
+   });
+   await runCmd("git", ["commit", "-m", "initial"], {
+    cwd: seed,
+    env: { ...process.env, ...GIT_ENV },
+   });
 
    const origin = join(dir, "origin.git");
-   await runCmd("git", ["clone", "--bare", seed, origin], { cwd: dir, env: { ...process.env, ...GIT_ENV } });
+   await runCmd("git", ["clone", "--bare", seed, origin], {
+    cwd: dir,
+    env: { ...process.env, ...GIT_ENV },
+   });
 
    const canonical = join(dir, "canonical");
-   await runCmd("git", ["clone", origin, canonical], { cwd: dir, env: { ...process.env, ...GIT_ENV } });
+   await runCmd("git", ["clone", origin, canonical], {
+    cwd: dir,
+    env: { ...process.env, ...GIT_ENV },
+   });
 
    const config = writeConfig(dir);
    // Node 10 is already claimed by the bot (walk claimed it in a prior tick).
-   const statePath = writeState(dir, { "10": { ...RESEARCH_NODE_STATE, assignees: ["ivy-bot"] } });
+   const statePath = writeState(dir, {
+    "10": { ...RESEARCH_NODE_STATE, assignees: ["ivy-bot"] },
+   });
 
    const env: NodeJS.ProcessEnv = {
     ...process.env,
@@ -275,7 +345,10 @@ describe("ranger run-node — research worker full loop (node #13 acceptance)", 
     RANGER_DISCORD_TOKEN: "unused",
    };
 
-   const result = await runCli(["run-node", "10", "--map", "acme/widgets", "-c", config], env);
+   const result = await runCli(
+    ["run-node", "10", "--map", "acme/widgets", "-c", config],
+    env,
+   );
    expect(result.code).toBe(0);
 
    const outcome = JSON.parse(result.stdout);
@@ -284,7 +357,14 @@ describe("ranger run-node — research worker full loop (node #13 acceptance)", 
    // The research branch was pushed to the origin (the close probe's ref).
    const refCheck = await runCmd(
     "git",
-    ["--git-dir", origin, "rev-parse", "--verify", "--quiet", "refs/heads/research/api-survey"],
+    [
+     "--git-dir",
+     origin,
+     "rev-parse",
+     "--verify",
+     "--quiet",
+     "refs/heads/research/api-survey",
+    ],
     { env: { ...process.env, ...GIT_ENV } },
    );
    expect(refCheck.code).toBe(0);
@@ -321,23 +401,45 @@ describe("ranger run-node — research worker full loop (node #13 acceptance)", 
    const seed = join(dir, "seed");
    mkdirSync(seed, { recursive: true });
    writeFileSync(join(seed, "README.md"), "# acme/widgets\n");
-   await runCmd("git", ["init", "-b", "main"], { cwd: seed, env: { ...process.env, ...GIT_ENV } });
-   await runCmd("git", ["add", "-A"], { cwd: seed, env: { ...process.env, ...GIT_ENV } });
-   await runCmd("git", ["commit", "-m", "initial"], { cwd: seed, env: { ...process.env, ...GIT_ENV } });
+   await runCmd("git", ["init", "-b", "main"], {
+    cwd: seed,
+    env: { ...process.env, ...GIT_ENV },
+   });
+   await runCmd("git", ["add", "-A"], {
+    cwd: seed,
+    env: { ...process.env, ...GIT_ENV },
+   });
+   await runCmd("git", ["commit", "-m", "initial"], {
+    cwd: seed,
+    env: { ...process.env, ...GIT_ENV },
+   });
    const origin = join(dir, "origin.git");
-   await runCmd("git", ["clone", "--bare", seed, origin], { cwd: dir, env: { ...process.env, ...GIT_ENV } });
+   await runCmd("git", ["clone", "--bare", seed, origin], {
+    cwd: dir,
+    env: { ...process.env, ...GIT_ENV },
+   });
    const canonical = join(dir, "canonical");
-   await runCmd("git", ["clone", origin, canonical], { cwd: dir, env: { ...process.env, ...GIT_ENV } });
+   await runCmd("git", ["clone", origin, canonical], {
+    cwd: dir,
+    env: { ...process.env, ...GIT_ENV },
+   });
 
    const config = writeConfig(dir);
-   const statePath = writeState(dir, { "10": { ...RESEARCH_NODE_STATE, assignees: ["ivy-bot"] } });
+   const statePath = writeState(dir, {
+    "10": { ...RESEARCH_NODE_STATE, assignees: ["ivy-bot"] },
+   });
 
    // A fake worker that exits 0 but writes nothing.
    const noopWorker = join(dir, "noop-worker");
-   writeFileSync(noopWorker, "#!/usr/bin/env bash\necho 'noop worker; no findings'\n");
+   writeFileSync(
+    noopWorker,
+    "#!/usr/bin/env bash\necho 'noop worker; no findings'\n",
+   );
    mkdirSync(dir, { recursive: true });
    // chmod handled below via runCmd-free approach
-   const chmodResult = await runCmd("chmod", ["+x", noopWorker], { env: process.env });
+   const chmodResult = await runCmd("chmod", ["+x", noopWorker], {
+    env: process.env,
+   });
    expect(chmodResult.code).toBe(0);
 
    const env: NodeJS.ProcessEnv = {
@@ -352,7 +454,10 @@ describe("ranger run-node — research worker full loop (node #13 acceptance)", 
     RANGER_DISCORD_TOKEN: "unused",
    };
 
-   const result = await runCli(["run-node", "10", "--map", "acme/widgets", "-c", config], env);
+   const result = await runCli(
+    ["run-node", "10", "--map", "acme/widgets", "-c", config],
+    env,
+   );
    expect(result.code).toBe(0);
    const outcome = JSON.parse(result.stdout);
    expect(outcome.status).toBe("failed");
@@ -380,7 +485,9 @@ describe("ranger sweep — reconcile journal vs reality (design §7)", () => {
    const map = loaded.config.maps[0];
    const journal = openJournal(loaded.config);
 
-   const statePath = writeState(dir, { "7": { assignees: ["ivy-bot"], status: "open" } });
+   const statePath = writeState(dir, {
+    "7": { assignees: ["ivy-bot"], status: "open" },
+   });
    process.env.FAKE_SOMA_STATE = statePath;
    process.env.FAKE_SOMA_DIR = dataDir;
    process.env.PATH = `${fixturesBin}:${process.env.PATH ?? ""}`;
@@ -388,7 +495,13 @@ describe("ranger sweep — reconcile journal vs reality (design §7)", () => {
 
    // Crashed worker (dead pid) that has already crashed once → respawned
    // (attempt 1 < 2), then parked + released on the next crash (attempt 2 ≥ 2).
-   journal.upsertWorker({ nodeId: "7", repo: map.repo, status: "claimed", attempts: 1, pid: 2_147_483_647 });
+   journal.upsertWorker({
+    nodeId: "7",
+    repo: map.repo,
+    status: "claimed",
+    attempts: 1,
+    pid: 2_147_483_647,
+   });
    const respawned: string[] = [];
    const first = await sweepMap({
     config: loaded.config,

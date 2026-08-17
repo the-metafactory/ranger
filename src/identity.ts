@@ -106,11 +106,10 @@ export async function loginForToken(
 ): Promise<string> {
  const gated = writeEnv(token);
  try {
-  const result = await runCmd(
-   "gh",
-   ["api", "/user", "--jq", ".login"],
-   { ...opts, env: gated.env },
-  );
+  const result = await runCmd("gh", ["api", "/user", "--jq", ".login"], {
+   ...opts,
+   env: gated.env,
+  });
   if (result.code !== 0) {
    throw new WriteGateError(
     `cannot resolve the identity behind the write token (gh api user, exit ${result.code}): ${result.stderr.trim()}`,
@@ -132,22 +131,22 @@ export async function loginForToken(
  * labeled as the machine account).
  */
 export async function resolveBotIdentity(
-  config: RangerConfig,
-  token: string,
+ config: RangerConfig,
+ token: string,
 ): Promise<string> {
-  const resolved = await loginForToken(token);
-  if (config.bot.identity !== undefined && config.bot.identity.length > 0) {
-    if (resolved !== config.bot.identity) {
-      throw new WriteGateError(
-        `configured bot.identity '${config.bot.identity}' does not match the ` +
-          `write token's login '${resolved}' — the mutation would run under a ` +
-          `credential it claims not to be (design §2, node #11). ` +
-          `Fix bot.identity or the write-token mapping.`,
-      );
-    }
-    return config.bot.identity;
+ const resolved = await loginForToken(token);
+ if (config.bot.identity !== undefined && config.bot.identity.length > 0) {
+  if (resolved !== config.bot.identity) {
+   throw new WriteGateError(
+    `configured bot.identity '${config.bot.identity}' does not match the ` +
+     `write token's login '${resolved}' — the mutation would run under a ` +
+     `credential it claims not to be (design §2, node #11). ` +
+     `Fix bot.identity or the write-token mapping.`,
+   );
   }
-  return resolved;
+  return config.bot.identity;
+ }
+ return resolved;
 }
 
 /**
