@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- ranger escalation desk — daily digest (design §5, map node #20).
+         Runs the token-injecting wrapper (~/bin/ranger) escalate --digest each
+         morning (07:30 Europe/Zurich): one aged-cards + audit + budget digest
+         per map thread, edit-not-repost within a day. Cards themselves are
+         posted/edited by the 15-min tick surface only when the tick env runs
+         them; the digest is the daily re-surface (age-banded, 7+ @-mention).
+         Provisioned at node #20.
+         Activation:
+           launchctl unload ...; launchctl load ... -->
+    <key>Label</key>
+    <string>ch.invisible.ranger-escalate</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/__USER__/bin/ranger</string>
+        <string>escalate</string>
+        <string>--digest</string>
+        <string>--config</string>
+        <string>/Users/__USER__/work/mf/ranger/ranger.yaml</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>7</integer>
+        <key>Minute</key>
+        <integer>30</integer>
+    </dict>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>/Users/__USER__/.config/ranger/logs/digest.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/__USER__/.config/ranger/logs/digest.stderr.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/__USER__/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>/Users/__USER__</string>
+    </dict>
+</dict>
+</plist>

@@ -62,6 +62,8 @@ export const escalations = sqliteTable("escalations", {
  nodeId: text("node_id").notNull(),
  /** Node title at first post — the resolved note keeps a readable remnant. */
  title: text("title"),
+ /** The §3 route class at (last) post/edit — escalate-hitl | provisioning. */
+ route: text("route"),
  messageId: text("message_id").notNull(),
  createdAt: text("created_at").notNull(),
  lastEditedAt: text("last_edited_at"),

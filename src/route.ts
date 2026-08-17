@@ -33,6 +33,8 @@ export interface ClassifiedNode {
   route: RouteClass;
   /** Auto node declaring command/url probes — the class-5 signal. */
   registryBlocked: boolean;
+  /** The blocked probe specs (run/cwd/host) — rendered on provisioning cards. */
+  blockedProbes?: BlockedProbe[];
 }
 
 export interface ClassifyContext {
@@ -114,6 +116,59 @@ export function probesRegistryBlocked(
   return false;
 }
 
+/** A declared probe the registry does not satisfy (class-5 preflight). */
+export interface BlockedProbe {
+  type: "command" | "url";
+  /** command probe — the exact run string the registry must declare. */
+  run?: string;
+  /** command probe — the exact cwd the registry must declare. */
+  cwd?: string;
+  /** url probe — the target host the registry must declare. */
+  target?: string;
+  host?: string;
+}
+
+/** The declared probes that are not satisfiable by the registry on this host. */
+export function blockedProbeSpecs(
+  node: FrontierEntry["node"],
+  repo: string,
+  registry: ProbeRegistry,
+): BlockedProbe[] {
+  const probes = node.probes ?? [];
+  if (probes.length === 0) return [];
+  const repoEntry = registry.repos?.[repo];
+  const declaredCommands = new Set(
+    (repoEntry?.commands ?? []).map((c) => `${c.run}\u0000${c.cwd}`),
+  );
+  const declaredHosts = new Set(
+    (repoEntry?.urlHosts ?? []).map((h) => h.toLowerCase()),
+  );
+  const blocked: BlockedProbe[] = [];
+  for (const probe of probes) {
+    if (probe.type === "command") {
+      const run = typeof probe.run === "string" ? probe.run : "";
+      const cwd = typeof probe.cwd === "string" ? probe.cwd : "";
+      if (!declaredCommands.has(`${run}\u0000${cwd}`)) {
+        blocked.push({ type: "command", run, cwd });
+      }
+    } else if (probe.type === "url") {
+      let host = "";
+      const target = typeof probe.target === "string" ? probe.target : "";
+      try {
+        host = new URL(target).host.toLowerCase();
+      } catch {
+        /* unparseable target counts as blocked */
+        blocked.push({ type: "url", target, host: "(unparseable)" });
+        continue;
+      }
+      if (!declaredHosts.has(host)) {
+        blocked.push({ type: "url", target, host });
+      }
+    }
+  }
+  return blocked;
+}
+
 /**
  * Classify a frontier node per the §3 routing table. `registryBlocked` is
  * computed for auto nodes with command/url probes (class 5 preflight).
@@ -163,7 +218,12 @@ export function classify(
   }
   const blocked = probesRegistryBlocked(node.node, repo, registry);
   if (blocked) {
-    return { ...base, registryBlocked: true, route: { route: "provisioning" } };
+    return {
+      ...base,
+      registryBlocked: true,
+      blockedProbes: blockedProbeSpecs(node.node, repo, registry),
+      route: { route: "provisioning" },
+    };
   }
   if (kind === "research") {
     return {

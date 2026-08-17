@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCmd } from "../src/exec.ts";
@@ -212,13 +212,26 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
       expect(joined).toContain("**Needs typing**");
       expect(joined).toContain("**Provisioning needed**");
       expect(joined).toContain("· 0d");
+      // Provisioning cards carry the exact probe run+cwd for the principal
+      // to paste into the registry (design §5 actionable provisioning).
+      expect(joined).toContain("run `bun test`");
+      expect(joined).toContain("cwd `/tmp/not-declared`");
 
       const journal = new Journal(join(dir, "state.sqlite"));
       expect(journal.listEscalations("acme/widgets")).toHaveLength(4);
       expect(
         journal.listEscalations("acme/widgets").every((r) => r.status === "open"),
       ).toBe(true);
+      // The §3 route is persisted so the digest can render it (review fix).
+      expect(
+        journal.getEscalation("acme/widgets", "14")?.route,
+      ).toBe("provisioning");
+      expect(
+        journal.getEscalation("acme/widgets", "12")?.route,
+      ).toBe("escalate-hitl");
       journal.close();
+      // The announce-once lock is released after the run (no stale lock).
+      expect(existsSync(join(dir, ".escalate.lock"))).toBe(false);
 
       // Second run, unchanged frontier: edit-not-repost — no new POSTs.
       const run2 = await runCli(["escalate", "-c", config, "--json"], env);
@@ -271,6 +284,9 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
       expect(content).toContain("Cards: 4");
       expect(content).toContain("receipt-less closes 2");
       expect(content).toContain("spawns today 0/10");
+      // The digest renders the persisted route, not the node id (review fix).
+      expect(content).toContain("#14 Provision the staging env — provisioning");
+      expect(content).toContain("#12 Draft UX copy — escalate-hitl");
 
       const postsBefore = discord.posts.length;
       const digest2 = await runCli(
@@ -280,6 +296,60 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
       const d2 = JSON.parse(digest2.stdout);
       expect(d2.maps[0].posted).toBe(false); // same day → edited, not reposted
       expect(discord.posts.length).toBe(postsBefore); // no new digest message
+    } finally {
+      discord.stop();
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(fixtureDir, { recursive: true, force: true });
+    }
+  });
+
+  test("two overlapping runs do not duplicate cards (announce-once lock)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ranger-escalate-lock-"));
+    const fixtureDir = mkdtempSync(join(tmpdir(), "ranger-escalate-lock-fx-"));
+    const discord = fakeDiscord();
+    try {
+      writeFixtures(fixtureDir);
+      const config = writeConfig(dir);
+      const env = envFor(fixtureDir, discord.port);
+
+      const [run1, run2] = await Promise.all([
+        runCli(["escalate", "-c", config, "--json"], env),
+        runCli(["escalate", "-c", config, "--json"], env),
+      ]);
+      expect(run1.code).toBe(0);
+      expect(run2.code).toBe(0);
+      // The lock serializes the runs: exactly one announce pass, the second
+      // run edits in place — 4 posts, never 8.
+      expect(discord.posts).toHaveLength(4);
+      const journal = new Journal(join(dir, "state.sqlite"));
+      expect(journal.listEscalations("acme/widgets")).toHaveLength(4);
+      journal.close();
+      expect(existsSync(join(dir, ".escalate.lock"))).toBe(false);
+    } finally {
+      discord.stop();
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(fixtureDir, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects a non-discord/non-localhost RANGER_DISCORD_API_BASE (token-exfil guard)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ranger-escalate-evil-"));
+    const fixtureDir = mkdtempSync(join(tmpdir(), "ranger-escalate-evil-fx-"));
+    const discord = fakeDiscord();
+    try {
+      writeFixtures(fixtureDir);
+      const config = writeConfig(dir);
+      const env = {
+        ...envFor(fixtureDir, discord.port),
+        RANGER_DISCORD_API_BASE: "http://evil.example",
+      };
+
+      const run = await runCli(["escalate", "-c", config, "--json"], env);
+      expect(run.code).toBe(2); // maps failed → exit 2
+      const report = JSON.parse(run.stdout);
+      expect(report.maps[0].ok).toBe(false);
+      expect(report.maps[0].error).toContain("not allowed");
+      expect(discord.posts).toHaveLength(0);
     } finally {
       discord.stop();
       rmSync(dir, { recursive: true, force: true });

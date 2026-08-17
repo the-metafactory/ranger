@@ -1,6 +1,12 @@
 import { desc, eq } from "drizzle-orm";
 import { openDb, type RangerDb } from "./store/db.ts";
-import { escalations, events, health, vetoes, workers } from "./store/schema.ts";
+import {
+ escalations,
+ events,
+ health,
+ vetoes,
+ workers,
+} from "./store/schema.ts";
 import type { RangerConfig } from "./config.ts";
 import { expandHome } from "./config.ts";
 
@@ -11,12 +17,12 @@ import { expandHome } from "./config.ts";
  */
 
 export type WorkerStatus =
-  | "claimed"
-  | "running"
-  | "success"
-  | "failed"
-  | "parked"
-  | "released";
+ | "claimed"
+ | "running"
+ | "success"
+ | "failed"
+ | "parked"
+ | "released";
 
 export interface WorkerRow {
  nodeId: string;
@@ -46,6 +52,8 @@ export interface EscalationRow {
  repo: string;
  nodeId: string;
  title: string | null;
+ /** §3 route class at last post/edit — escalate-hitl | provisioning. */
+ route: string | null;
  messageId: string;
  createdAt: string;
  lastEditedAt: string | null;
@@ -53,25 +61,28 @@ export interface EscalationRow {
 }
 
 export type EventKind =
-  | "announced"
-  | "claimed"
-  | "worker-start"
-  | "worker-success"
-  | "closed"
-  | "decisions-written"
-  | "refused"
-  | "parked"
-  | "released"
-  | "sweep"
-  | "deadman-paused";
+ | "announced"
+ | "claimed"
+ | "worker-start"
+ | "worker-success"
+ | "closed"
+ | "decisions-written"
+ | "refused"
+ | "parked"
+ | "released"
+ | "sweep"
+ | "deadman-paused";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 export class Journal {
  private readonly db: RangerDb;
  private readonly closeDb: () => void;
+ /** The sqlite file path — callers derive sibling lock/state dirs from it. */
+ readonly path: string;
 
  constructor(path: string) {
+  this.path = path;
   const opened = openDb(path);
   this.db = opened.db;
   this.closeDb = opened.close;
@@ -79,7 +90,9 @@ export class Journal {
 
  // ---- workers ----
 
- upsertWorker(row: Partial<WorkerRow> & Pick<WorkerRow, "nodeId" | "repo" | "status">): void {
+ upsertWorker(
+  row: Partial<WorkerRow> & Pick<WorkerRow, "nodeId" | "repo" | "status">,
+ ): void {
   this.db
    .insert(workers)
    .values({
@@ -112,9 +125,11 @@ export class Journal {
  }
 
  getWorker(nodeId: string): WorkerRow | null {
-  const row = this.db.query.workers.findFirst({
-   where: eq(workers.nodeId, nodeId),
-  }).sync();
+  const row = this.db.query.workers
+   .findFirst({
+    where: eq(workers.nodeId, nodeId),
+   })
+   .sync();
   return row === undefined ? null : hydrateWorker(row);
  }
 
@@ -122,15 +137,20 @@ export class Journal {
   const rows =
    repo === undefined
     ? this.db.query.workers.findMany().sync()
-    : this.db.query.workers.findMany({
-       where: eq(workers.repo, repo),
-      }).sync();
+    : this.db.query.workers
+       .findMany({
+        where: eq(workers.repo, repo),
+       })
+       .sync();
   return rows.map(hydrateWorker);
  }
 
  // ---- events ----
 
- recordEvent(kind: EventKind, opts: { nodeId?: string; repo?: string; detail?: string } = {}): void {
+ recordEvent(
+  kind: EventKind,
+  opts: { nodeId?: string; repo?: string; detail?: string } = {},
+ ): void {
   this.db
    .insert(events)
    .values({
@@ -156,9 +176,11 @@ export class Journal {
  // ---- health ----
 
  getHealth(key: string): string | null {
-  const row = this.db.query.health.findFirst({
-   where: eq(health.key, key),
-  }).sync();
+  const row = this.db.query.health
+   .findFirst({
+    where: eq(health.key, key),
+   })
+   .sync();
   return row?.value ?? null;
  }
 
@@ -229,9 +251,11 @@ export class Journal {
  }
 
  hasVeto(nodeId: string): boolean {
-  const row = this.db.query.vetoes.findFirst({
-   where: eq(vetoes.nodeId, nodeId),
-  }).sync();
+  const row = this.db.query.vetoes
+   .findFirst({
+    where: eq(vetoes.nodeId, nodeId),
+   })
+   .sync();
   return row !== undefined;
  }
 
@@ -244,8 +268,11 @@ export class Journal {
   * set is marked `resolved` (its card was edited to a resolved note).
   */
  upsertEscalation(
-  row: Pick<EscalationRow, "key" | "repo" | "nodeId" | "messageId" | "createdAt"> &
-   Partial<Pick<EscalationRow, "title" | "lastEditedAt" | "status">>,
+  row: Pick<
+   EscalationRow,
+   "key" | "repo" | "nodeId" | "messageId" | "createdAt"
+  > &
+   Partial<Pick<EscalationRow, "title" | "route" | "lastEditedAt" | "status">>,
  ): void {
   const existing = this.getEscalation(row.repo, row.nodeId);
   this.db
@@ -255,6 +282,7 @@ export class Journal {
     repo: row.repo,
     nodeId: row.nodeId,
     title: row.title ?? existing?.title ?? null,
+    route: row.route ?? existing?.route ?? null,
     messageId: row.messageId,
     createdAt: existing?.createdAt ?? row.createdAt,
     lastEditedAt: row.lastEditedAt ?? existing?.lastEditedAt ?? null,
@@ -264,6 +292,7 @@ export class Journal {
     target: escalations.key,
     set: {
      title: row.title ?? existing?.title ?? null,
+     route: row.route ?? existing?.route ?? null,
      messageId: row.messageId,
      createdAt: existing?.createdAt ?? row.createdAt,
      lastEditedAt: row.lastEditedAt ?? existing?.lastEditedAt ?? null,
@@ -274,9 +303,11 @@ export class Journal {
  }
 
  getEscalation(repo: string, nodeId: string): EscalationRow | null {
-  const row = this.db.query.escalations.findFirst({
-   where: eq(escalations.key, `${repo}:${nodeId}`),
-  }).sync();
+  const row = this.db.query.escalations
+   .findFirst({
+    where: eq(escalations.key, `${repo}:${nodeId}`),
+   })
+   .sync();
   return row === undefined ? null : hydrateEscalation(row);
  }
 
@@ -284,18 +315,25 @@ export class Journal {
   const rows =
    repo === undefined
     ? this.db.query.escalations.findMany().sync()
-    : this.db.query.escalations.findMany({
-       where: eq(escalations.repo, repo),
-      }).sync();
+    : this.db.query.escalations
+       .findMany({
+        where: eq(escalations.repo, repo),
+       })
+       .sync();
   return rows.map(hydrateEscalation);
  }
 
  /** Prune spawn-ledger keys older than the retention window (keeps health tidy). */
  pruneSpawnLedger(now = new Date(), retentionDays = 30): void {
   const cutoff = dayKey(new Date(now.getTime() - retentionDays * DAY_MS));
-  const stale = this.db.select({ key: health.key }).from(health).all().filter((r) =>
-   r.key.startsWith("spawns.") && r.key.slice("spawns.".length) < cutoff,
-  );
+  const stale = this.db
+   .select({ key: health.key })
+   .from(health)
+   .all()
+   .filter(
+    (r) =>
+     r.key.startsWith("spawns.") && r.key.slice("spawns.".length) < cutoff,
+   );
   for (const row of stale) {
    this.db.delete(health).where(eq(health.key, row.key)).run();
   }
@@ -359,6 +397,7 @@ function hydrateEscalation(row: {
  repo: string;
  nodeId: string;
  title: string | null;
+ route: string | null;
  messageId: string;
  createdAt: string;
  lastEditedAt: string | null;
@@ -369,6 +408,7 @@ function hydrateEscalation(row: {
   repo: row.repo,
   nodeId: row.nodeId,
   title: row.title,
+  route: row.route,
   messageId: row.messageId,
   createdAt: row.createdAt,
   lastEditedAt: row.lastEditedAt,

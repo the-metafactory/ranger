@@ -1,3 +1,5 @@
+import { mkdirSync, rmSync } from "node:fs";
+import { dirname, join } from "node:path";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import {
   classify,
@@ -36,8 +38,7 @@ export class EscalationDiscord {
   constructor(
     private readonly token: string,
     private readonly channelId: string,
-    private readonly apiBase: string =
-      process.env.RANGER_DISCORD_API_BASE ?? "https://discord.com/api/v10",
+    private readonly apiBase: string = escalationApiBase(),
   ) {}
 
   static fromMap(
@@ -114,6 +115,34 @@ export class EscalationDiscord {
   }
 }
 
+/**
+ * The Discord API base for production, with a hardened test seam.
+ * `RANGER_DISCORD_API_BASE` must resolve to discord.com or localhost — an
+ * injected override can otherwise redirect the bot token to an attacker
+ * host (security review). Absent/empty → the fixed Discord origin.
+ */
+function escalationApiBase(): string {
+  const override = process.env.RANGER_DISCORD_API_BASE;
+  if (override === undefined || override.length === 0) {
+    return "https://discord.com/api/v10";
+  }
+  let host = "";
+  try {
+    host = new URL(override).hostname.toLowerCase();
+  } catch {
+    throw new EscalateError(
+      "RANGER_DISCORD_API_BASE is not a valid URL; refusing to use it",
+    );
+  }
+  if (host !== "discord.com" && host !== "localhost" && host !== "127.0.0.1") {
+    throw new EscalateError(
+      `RANGER_DISCORD_API_BASE host ${host} is not allowed — ` +
+        "discord.com or localhost only",
+    );
+  }
+  return override;
+}
+
 // ---- card content ----
 
 const CARD_HEADS: Record<string, string> = {
@@ -146,7 +175,8 @@ function ageSuffix(ageDays: number, principal: string): string {
     return `📣 @${principal} **${ageDays}d** — needs your attention`;
   }
   if (ageDays >= 3) {
-    return `⚠️ **${ageDays}d** — aging, blocked-descendant count on the digest`;
+    return `⚠️ **${ageDays}d** — aging; blocked-descendant count unavailable ` +
+      "(read-only surface can't enumerate blocked nodes)";
   }
   return `· ${ageDays}d`;
 }
@@ -161,6 +191,17 @@ export function cardContent(
     node.route.route === "escalate-hitl"
       ? ESCALATE_REASONS[node.route.reason]
       : "auto node with registry-blocked probes — provisioning needed";
+  const probeLines =
+    node.route.route === "provisioning" && node.blockedProbes !== undefined
+      ? [
+          "register these in the probe registry (run + cwd must match exactly):",
+          ...node.blockedProbes.map((p) =>
+            p.type === "command"
+              ? `  · command: run \`${p.run}\` · cwd \`${p.cwd}\``
+              : `  · url host: \`${p.host}\` (target \`${p.target}\`)`,
+          ),
+        ]
+      : [];
   const lines = [
     `${cardHead(node)} — **#${node.id}** ${node.title}`,
     `map: ${map.repo} · ${node.kind} · ${node.autonomy}`,
@@ -169,6 +210,7 @@ export function cardContent(
       ? `checkpoint: \`${node.checkpointId}\``
       : null,
     reason ? `_${reason}_` : null,
+    ...probeLines,
     ageSuffix(ageDays, principal),
   ].filter((line): line is string => line !== null);
   return lines.join("\n");
@@ -209,11 +251,6 @@ export interface EscalateResult {
   maps: EscalateMapResult[];
 }
 
-export interface EscalateOptions {
-  configPath: string;
-  now?: Date;
-}
-
 export function dayDiff(fromIso: string, now: Date): number {
   const from = new Date(fromIso);
   const fromDay = Date.UTC(
@@ -227,6 +264,105 @@ export function dayDiff(fromIso: string, now: Date): number {
     now.getUTCDate(),
   );
   return Math.floor((nowDay - fromDay) / 86_400_000);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Bounded-concurrency pool — preserves input order in the results array. */
+async function mapPool<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  const workerCount = Math.max(1, Math.min(limit, items.length));
+  const workers: Promise<void>[] = [];
+  for (let w = 0; w < workerCount; w++) {
+    workers.push(
+      (async () => {
+        while (next < items.length) {
+          const index = next++;
+          results[index] = await fn(items[index], index);
+        }
+      })(),
+    );
+  }
+  await Promise.all(workers);
+  return results;
+}
+
+/**
+ * Cross-process advisory lock over the escalation card/digest runs. The
+ * announce-once contract is read-then-post, so two overlapping runs could
+ * both POST a fresh card and clobber the journal message id — the lock
+ * serializes them so the second run sees the first's row and edits instead.
+ * An atomic mkdir next to the journal doubles as the lock; released on
+ * completion or error.
+ */
+async function withEscalateLock<T>(
+  journal: Journal,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const lockDir = join(dirname(journal.path), ".escalate.lock");
+  const started = Date.now();
+  const timeoutMs = 60_000;
+  for (;;) {
+    try {
+      mkdirSync(lockDir);
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      if (Date.now() - started > timeoutMs) {
+        throw new EscalateError(
+          `another escalate run holds the lock (${lockDir}) — ` +
+            "refusing to risk duplicate cards",
+        );
+      }
+      await sleep(250);
+    }
+  }
+  try {
+    return await fn();
+  } finally {
+    try {
+      rmSync(lockDir, { recursive: true });
+    } catch {
+      /* best-effort release */
+    }
+  }
+}
+
+/** Build the card + journal-row inputs for a node in one place (no drift). */
+function cardFrom(
+  node: ClassifiedNode,
+  row: {
+    nodeId: string;
+    title: string | null;
+    messageId: string;
+    createdAt: string;
+  },
+  ageDays: number,
+): EscalationCard {
+  return {
+    nodeId: row.nodeId,
+    title: row.title ?? `#${row.nodeId}`,
+    kind: node.kind,
+    autonomy: node.autonomy,
+    url: node.url,
+    checkpointId: node.checkpointId,
+    route: node.route.route,
+    reason:
+      node.route.route === "escalate-hitl"
+        ? node.route.reason
+        : "registry-blocked",
+    ageDays,
+    status: "open",
+    createdAt: row.createdAt,
+    messageId: row.messageId,
+  };
 }
 
 function cardNeeded(node: ClassifiedNode): boolean {
@@ -289,72 +425,45 @@ async function escalateOneMap(
 
     const principal = config.principal.login;
     const cards: EscalationCard[] = [];
-
-    for (const node of needed) {
+    const outcomes = await mapPool(needed, 3, async (node) => {
       const prior = existing.get(node.id);
       const ageDays =
         prior === undefined ? 0 : dayDiff(prior.createdAt, now);
       const content = cardContent(node, map, ageDays, principal);
       if (prior === undefined) {
         const messageId = await client.post(content);
-        journal.upsertEscalation({
+        const row = {
           key: `${map.repo}:${node.id}`,
           repo: map.repo,
           nodeId: node.id,
           title: node.title,
+          route: node.route.route,
           messageId,
           createdAt: now.toISOString(),
-          status: "open",
-        });
-        base.posted.push(node.id);
-        cards.push({
-          nodeId: node.id,
-          title: node.title,
-          kind: node.kind,
-          autonomy: node.autonomy,
-          url: node.url,
-          checkpointId: node.checkpointId,
-          route: node.route.route,
-          reason:
-            node.route.route === "escalate-hitl"
-              ? node.route.reason
-              : "registry-blocked",
-          ageDays,
-          status: "open",
-          createdAt: now.toISOString(),
-          messageId,
-        });
-      } else {
-        await client.edit(prior.messageId, content);
-        journal.upsertEscalation({
-          key: `${map.repo}:${node.id}`,
-          repo: map.repo,
-          nodeId: node.id,
-          title: node.title,
-          messageId: prior.messageId,
-          createdAt: prior.createdAt,
-          lastEditedAt: now.toISOString(),
-          status: "open",
-        });
-        base.edited.push(node.id);
-        cards.push({
-          nodeId: node.id,
-          title: node.title,
-          kind: node.kind,
-          autonomy: node.autonomy,
-          url: node.url,
-          checkpointId: node.checkpointId,
-          route: node.route.route,
-          reason:
-            node.route.route === "escalate-hitl"
-              ? node.route.reason
-              : "registry-blocked",
-          ageDays,
-          status: "open",
-          createdAt: prior.createdAt,
-          messageId: prior.messageId,
-        });
+          status: "open" as const,
+        };
+        journal.upsertEscalation(row);
+        return { action: "posted" as const, id: node.id, card: cardFrom(node, row, ageDays) };
       }
+      await client.edit(prior.messageId, content);
+      const row = {
+        key: `${map.repo}:${node.id}`,
+        repo: map.repo,
+        nodeId: node.id,
+        title: node.title,
+        route: node.route.route,
+        messageId: prior.messageId,
+        createdAt: prior.createdAt,
+        lastEditedAt: now.toISOString(),
+        status: "open" as const,
+      };
+      journal.upsertEscalation(row);
+      return { action: "edited" as const, id: node.id, card: cardFrom(node, row, ageDays) };
+    });
+    for (const outcome of outcomes) {
+      if (outcome.action === "posted") base.posted.push(outcome.id);
+      else base.edited.push(outcome.id);
+      cards.push(outcome.card);
     }
 
     // Resolve cards whose node is no longer on the HITL/provisioning queue —
@@ -402,18 +511,20 @@ export async function escalateMaps(
   journal: Journal,
   opts: { now?: Date } = {},
 ): Promise<EscalateResult> {
-  const now = opts.now ?? new Date();
-  const registry = loadProbeRegistry();
-  const maps: EscalateMapResult[] = [];
-  for (const map of config.maps) {
-    maps.push(await escalateOneMap(config, map, journal, registry, now));
-  }
-  return { generatedAt: now.toISOString(), maps };
+  return withEscalateLock(journal, async () => {
+    const now = opts.now ?? new Date();
+    const registry = loadProbeRegistry();
+    const maps: EscalateMapResult[] = [];
+    for (const map of config.maps) {
+      maps.push(await escalateOneMap(config, map, journal, registry, now));
+    }
+    return { generatedAt: now.toISOString(), maps };
+  });
 }
 
 // ---- the daily digest ----
 
-export interface DigestCard {
+interface DigestCard {
   nodeId: string;
   title: string;
   route: string;
@@ -421,7 +532,7 @@ export interface DigestCard {
   messageId: string;
 }
 
-export interface DigestMapResult {
+interface DigestMapResult {
   repo: string;
   ok: boolean;
   error?: string;
@@ -532,7 +643,7 @@ async function digestOneMap(
       .map((row) => ({
         nodeId: row.nodeId,
         title: row.title ?? `#${row.nodeId}`,
-        route: row.nodeId,
+        route: row.route ?? "escalate-hitl",
         ageDays: dayDiff(row.createdAt, now),
         messageId: row.messageId,
       }));
@@ -585,10 +696,12 @@ export async function runDigest(
   journal: Journal,
   opts: { now?: Date } = {},
 ): Promise<DigestResult> {
-  const now = opts.now ?? new Date();
-  const maps: DigestMapResult[] = [];
-  for (const map of config.maps) {
-    maps.push(await digestOneMap(config, map, journal, now));
-  }
-  return { generatedAt: now.toISOString(), maps };
+  return withEscalateLock(journal, async () => {
+    const now = opts.now ?? new Date();
+    const maps: DigestMapResult[] = [];
+    for (const map of config.maps) {
+      maps.push(await digestOneMap(config, map, journal, now));
+    }
+    return { generatedAt: now.toISOString(), maps };
+  });
 }
