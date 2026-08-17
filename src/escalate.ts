@@ -238,6 +238,16 @@ function truncate(text: string, max: number): string {
   return oneLine.length > max ? `${oneLine.slice(0, max - 1)}…` : oneLine;
 }
 
+/**
+ * Inert a `<` in graph-derived text so Discord cannot parse mention/emoji
+ * tokens out of it (a node title could otherwise embed `<@principal-id>` and
+ * force a ping outside the 7-day policy, or `<@&role>`). `‹` reads like `<`
+ * but is not mention syntax.
+ */
+function sanitizeGraphText(text: string | null | undefined): string {
+  return (text ?? "").replace(/</g, "\u2039");
+}
+
 function ageSuffix(
   ageDays: number,
   principal: string,
@@ -267,10 +277,11 @@ function cardContent(
   principal: string,
   principalDiscordId?: string,
 ): string {
-  const reason =
+  const reason = sanitizeGraphText(
     node.route.route === "escalate-hitl"
       ? ESCALATE_REASONS[node.route.reason]
-      : "auto node with registry-blocked probes — provisioning needed";
+      : "auto node with registry-blocked probes — provisioning needed",
+  );
   const probeLines =
     node.route.route === "provisioning" && node.blockedProbes !== undefined
       ? [
@@ -279,8 +290,8 @@ function cardContent(
             .slice(0, 6)
             .map((p) =>
               p.type === "command"
-                ? `  · command: run \`${p.run}\` · cwd \`${p.cwd}\``
-                : `  · url host: \`${p.host}\` (target \`${p.target}\`)`,
+                ? `  · command: run \`${sanitizeGraphText(p.run)}\` · cwd \`${sanitizeGraphText(p.cwd)}\``
+                : `  · url host: \`${sanitizeGraphText(p.host)}\` (target \`${sanitizeGraphText(p.target)}\`)`,
             ),
           ...(node.blockedProbes.length > 6
             ? [`  · … and ${node.blockedProbes.length - 6} more probes`]
@@ -291,14 +302,14 @@ function cardContent(
     node.route.route === "escalate-hitl" &&
     node.body !== undefined &&
     node.body.trim().length > 0
-      ? `_${truncate(node.body, 140)}_`
+      ? `_${truncate(sanitizeGraphText(node.body), 140)}_`
       : null;
   const lines = [
-    `${cardHead(node)} — **#${node.id}** ${node.title}`,
+    `${cardHead(node)} — **#${node.id}** ${sanitizeGraphText(node.title)}`,
     `map: ${map.repo} · ${node.kind} · ${node.autonomy}`,
     `url: ${node.url}`,
     node.checkpointId !== undefined && node.checkpointId.length > 0
-      ? `checkpoint: \`${node.checkpointId}\``
+      ? `checkpoint: \`${sanitizeGraphText(node.checkpointId)}\``
       : null,
     reason ? `_${reason}_` : null,
     bodyLine,
@@ -409,6 +420,77 @@ async function mapPool<T, R>(
  * An atomic mkdir next to the journal doubles as the lock; released on
  * completion or error.
  */
+/** Atomic create-with-content: returns true when we now hold the lock. */
+function tryAcquireLock(lockFile: string, owner: string): boolean {
+  try {
+    writeFileSync(lockFile, owner, { flag: "wx" });
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    return false;
+  }
+}
+
+/**
+ * Is the lock's owner a dead process (ESRCH)? Never reclaim on age or on an
+ * unreadable owner — stealing a live run's lock breaks announce-once.
+ */
+function lockOwnerDead(lockFile: string): boolean {
+  try {
+    const prior = JSON.parse(readFileSync(lockFile, "utf8")) as {
+      pid?: number;
+    };
+    if (typeof prior.pid !== "number") return false;
+    try {
+      process.kill(prior.pid, 0);
+      return false;
+    } catch (killError) {
+      return (killError as NodeJS.ErrnoException).code === "ESRCH";
+    }
+  } catch {
+    /* unreadable owner — never reclaim on a guess */
+    return false;
+  }
+}
+
+/**
+ * EXCLUSIVE reclaim of a dead-owner lock: the reclaim marker is itself
+ * created atomically (wx), so only one process can hold it and remove+
+ * re-acquire — two contenders cannot both observe the dead owner and both
+ * proceed. Returns true when we now hold the lock; false when another
+ * process holds the marker (mid-reclaim) and the caller should wait.
+ */
+function reclaimDeadLock(
+  lockFile: string,
+  reclaimMarker: string,
+  owner: string,
+): boolean {
+  try {
+    writeFileSync(
+      reclaimMarker,
+      JSON.stringify({ pid: process.pid, at: Date.now() }),
+      { flag: "wx" },
+    );
+  } catch (markerError) {
+    if ((markerError as NodeJS.ErrnoException).code !== "EEXIST") {
+      throw markerError;
+    }
+    return false; // another process is mid-reclaim
+  }
+  try {
+    // We hold the marker: remove the dead lock and re-acquire.
+    rmSync(lockFile, { force: true });
+    writeFileSync(lockFile, owner, { flag: "wx" });
+    return true; // acquired
+  } finally {
+    try {
+      rmSync(reclaimMarker, { force: true });
+    } catch {
+      /* best-effort */
+    }
+  }
+}
+
 async function withEscalateLock<T>(
   journal: Journal,
   fn: () => Promise<T>,
@@ -419,85 +501,18 @@ async function withEscalateLock<T>(
   const timeoutMs = 60_000;
   const owner = JSON.stringify({ pid: process.pid, startedAt: Date.now() });
   for (;;) {
-    try {
-      // Atomic create-with-content (wx): the lock never exists without an
-      // owner, so there is no window where a paused run looks ownerless.
-      writeFileSync(lockFile, owner, { flag: "wx" });
-      break;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      // Someone holds the lock. Reclaim it ONLY when the owner's pid is dead
-      // (kill(pid,0) → ESRCH). We never reclaim a lock whose owner is alive,
-      // whatever its age — stealing a live run's lock would let two runs both
-      // POST fresh cards and break announce-once. A rebooted host whose old
-      // pid got recycled (alive but unrelated) is left to the 60s timeout → a
-      // visible refusal, never silent duplicates; the operator clears it.
-      let reclaimable = false;
-      try {
-        const prior = JSON.parse(readFileSync(lockFile, "utf8")) as {
-          pid?: number;
-        };
-        if (typeof prior.pid === "number") {
-          try {
-            process.kill(prior.pid, 0);
-          } catch (killError) {
-            reclaimable = (killError as NodeJS.ErrnoException).code === "ESRCH";
-          }
-        }
-      } catch {
-        /* unreadable owner — never reclaim on a guess */
-        reclaimable = false;
-      }
-      if (reclaimable) {
-        // Reclaim EXCLUSIVELY: the reclaim marker is itself created atomically
-        // (wx), so only one process can hold it and remove+re-acquire the dead
-        // lock. Two contenders cannot both observe the dead owner and both
-        // proceed — the marker serializes the reclaim (rename+verify is not
-        // exclusive: a later contender renames over and both pass the verify).
-        try {
-          writeFileSync(
-            reclaimMarker,
-            JSON.stringify({ pid: process.pid, at: Date.now() }),
-            { flag: "wx" },
-          );
-        } catch (markerError) {
-          if (
-            (markerError as NodeJS.ErrnoException).code !== "EEXIST"
-          ) {
-            throw markerError;
-          }
-          // Another process is mid-reclaim — wait and re-check.
-          if (Date.now() - started > timeoutMs) {
-            throw new EscalateError(
-              `another escalate run is reclaiming the lock (${reclaimMarker}) — ` +
-                "refusing to risk duplicate cards",
-            );
-          }
-          await sleep(250);
-          continue;
-        }
-        try {
-          // We hold the marker: remove the dead lock and re-acquire. No other
-          // process can be in this section (they hold no marker).
-          rmSync(lockFile, { force: true });
-          writeFileSync(lockFile, owner, { flag: "wx" });
-          break; // acquired
-        } finally {
-          try {
-            rmSync(reclaimMarker, { force: true });
-          } catch {
-            /* best-effort */
-          }
-        }
-      }
-      if (Date.now() - started > timeoutMs) {
-        throw new EscalateError(
-          `another escalate run holds the lock (${lockFile}) — ` +
-            "refusing to risk duplicate cards",
-        );
-      }
-      await sleep(250);
+    if (tryAcquireLock(lockFile, owner)) break;
+    if (lockOwnerDead(lockFile)) {
+      if (reclaimDeadLock(lockFile, reclaimMarker, owner)) break;
+      // Another process is mid-reclaim — bounded wait below.
     }
+    if (Date.now() - started > timeoutMs) {
+      throw new EscalateError(
+        `another escalate run holds the lock (${lockFile}) — ` +
+          "refusing to risk duplicate cards",
+      );
+    }
+    await sleep(250);
   }
   try {
     return await fn();
@@ -874,7 +889,7 @@ function digestContent(inputs: DigestInputs): string {
     for (const card of cards.slice(0, 15)) {
       const band = ageBand(card.ageDays);
       lines.push(
-        `  #${card.nodeId} ${card.title} — ${card.route} · ${ageText(
+        `  #${card.nodeId} ${sanitizeGraphText(card.title)} — ${card.route} · ${ageText(
           band,
           card.ageDays,
           principal,

@@ -75,7 +75,7 @@ function writeFixtures(dir: string, drop: string[] = []): string {
       url: "https://github.com/acme/widgets/issues/12",
       typed: true,
       parent: { id: "1" },
-      body: "Should we ship the copy now or wait for the brand refresh?",
+      body: "Should we ship the copy now or wait for the brand refresh? <@1234567890>",
     },
     {
       ref: { id: "13" },
@@ -226,6 +226,10 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
       expect(joined).toContain(
         "Should we ship the copy now or wait for the brand refresh?",
       );
+      // Graph-derived mention syntax is inerted (`<` → `‹`), so a node body
+      // can't force a ping outside the 7-day policy (review fix).
+      expect(joined).not.toContain("<@1234567890>");
+      expect(joined).toContain("‹@1234567890");
       // Provisioning cards carry the exact probe run+cwd for the principal
       // to paste into the registry (design §5 actionable provisioning).
       expect(joined).toContain("run `bun test`");

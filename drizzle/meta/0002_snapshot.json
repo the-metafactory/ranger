@@ -1,8 +1,8 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "9fe5f30d-7fb2-480c-8bc3-63e1ea137ed9",
-  "prevId": "1eeac814-6d95-42bd-a004-72c443edbe3e",
+  "id": "6812ec72-8268-4c1b-bb63-a78f78eebb6e",
+  "prevId": "9fe5f30d-7fb2-480c-8bc3-63e1ea137ed9",
   "tables": {
     "escalations": {
       "name": "escalations",
@@ -30,6 +30,13 @@
         },
         "title": {
           "name": "title",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "route": {
+          "name": "route",
           "type": "text",
           "primaryKey": false,
           "notNull": false,
