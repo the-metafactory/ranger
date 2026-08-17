@@ -155,16 +155,27 @@ export class EscalationDiscord {
     method: "POST" | "PATCH",
     path: string,
     content: string,
+    deadline?: number,
   ): Promise<Response> {
     // Every call times out — a run can never stall indefinitely holding the
     // announce-once lock. Calls are spaced ≥1s apart. On a rate limit (429),
     // a GLOBAL cooldown must be waited out in full — retrying into it just
     // resets the bucket and extends the throttle (observed live) — so a global
-    // 429 waits max(Retry-After, 30s); a local 429 waits Retry-After.
+    // 429 waits max(Retry-After, 30s) capped at MAX_COOLDOWN_MS; a local 429
+    // waits Retry-After.
     const maxAttempts = 4;
     let lastStatus = 0;
     let firstRetryAfterSec = 0;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      // The pass deadline bounds RETRIES too, not just starts: a request
+      // begun just before the deadline must not hold the tick through four
+      // 30s-cooldown attempts past it (round-27 review — "never blocks
+      // walking").
+      if (deadline !== undefined && Date.now() > deadline) {
+        throw new EscalateError(
+          `discord ${method} ${path} deferred: pass deadline reached`,
+        );
+      }
       let response: Response;
       try {
         response = await this.fetchOnce(path, {
@@ -219,7 +230,15 @@ export class EscalationDiscord {
       if (attempt === 1 && firstRetryAfterSec > 30) {
         break;
       }
-      await sleep(global ? Math.max(waitMs, 30_000) : Math.min(waitMs, 30_000));
+      // The per-attempt sleep is CAPPED like the cooldown deadline — a large
+      // Retry-After must not hold this attempt (and hence the tick) for the
+      // full value; the request resumes, 429s again, and the attempt budget
+      // defers the card (round-27 review).
+      await sleep(
+        global
+          ? Math.min(Math.max(waitMs, 30_000), MAX_COOLDOWN_MS)
+          : Math.min(waitMs, 30_000),
+      );
     }
     throw new EscalateError(
       `discord ${method} ${path} failed after ${lastStatus === 0 ? "setup" : maxAttempts} attempts (last HTTP ${lastStatus}${firstRetryAfterSec > 0 ? `, retry-after ${firstRetryAfterSec}s` : ""})`,
@@ -241,11 +260,12 @@ export class EscalationDiscord {
   }
 
   /** Post a new card; returns the Discord message id (announce-once). */
-  async post(content: string): Promise<string> {
+  async post(content: string, deadline?: number): Promise<string> {
     const response = await this.request(
       "POST",
       `/channels/${this.channelId}/messages`,
       content,
+      deadline,
     );
     if (!response.ok) {
       throw new EscalateError(`discord post returned HTTP ${response.status}`);
@@ -258,11 +278,16 @@ export class EscalationDiscord {
   }
 
   /** Edit an existing card in place (edit-not-repost). */
-  async edit(messageId: string, content: string): Promise<void> {
+  async edit(
+    messageId: string,
+    content: string,
+    deadline?: number,
+  ): Promise<void> {
     const response = await this.request(
       "PATCH",
       `/channels/${this.channelId}/messages/${messageId}`,
       content,
+      deadline,
     );
     // 404 = the message is not in THIS channel — the destination moved (or
     // the card was deleted). Surface it distinctly so the caller can repost
@@ -286,7 +311,7 @@ export class EscalationDiscord {
    * transient read failure (5xx, network, timeout) assume it exists: a repost
    * decision must never be made on an unreliable read.
    */
-  async messageExists(messageId: string): Promise<boolean> {
+  async messageExists(messageId: string, deadline?: number): Promise<boolean> {
     const path = `/channels/${this.channelId}/messages/${messageId}`;
     let response: Response;
     try {
@@ -300,6 +325,8 @@ export class EscalationDiscord {
     // read; a persistent 5xx is an outage, not a deletion).
     if (response.status >= 500) {
       for (let attempt = 0; attempt < 2; attempt++) {
+        // Bound the retry by the pass deadline (round-27 review).
+        if (deadline !== undefined && Date.now() > deadline) return true;
         await sleep(500 * (attempt + 1));
         try {
           response = await this.fetchOnce(path, { method: "GET" });
@@ -523,7 +550,7 @@ interface EscalationCard {
   route: string;
   reason?: string;
   ageDays: number;
-  status: "open" | "resolved";
+  status: "open" | "closed";
   createdAt: string;
   messageId: string;
 }
@@ -948,6 +975,10 @@ interface CardBudget {
  *  and returns, so the escalation lane never blocks the walk lane (the tick
  *  awaits escalateMaps before walk). */
 const MAX_PASS_MS = 120_000;
+/** Bounded total rows the absent-card reconciliation may scan (offset
+ *  pagination past needed rows) — a large drain must not walk the whole
+ *  journal (round-27 review). */
+const MAX_ABSENT_SCAN = 500;
 
 async function syncCard(
   ctx: {
@@ -1019,7 +1050,7 @@ async function syncCard(
       config.principal.login,
       config.principal.discordId,
     );
-    const messageId = await client.post(freshContent);
+    const messageId = await client.post(freshContent, budget.deadline);
     const row = escalationRow({
       messageId,
       lastContent: freshContent,
@@ -1046,7 +1077,7 @@ async function syncCard(
   ): Promise<SyncOutcome> => {
     if (!charge(budget)) return { action: "deferred", id: node.id };
     try {
-      await client.edit(messageId, editContent);
+      await client.edit(messageId, editContent, budget.deadline);
     } catch (cardError) {
       if (cardError instanceof DiscordMessageGoneError) {
         return await postFresh();
@@ -1083,6 +1114,7 @@ async function syncCard(
     await clientFor(priorChannelId).edit(
      priorMessageId,
      movedCardNote(node.id, node.title, client.channel),
+     budget.deadline,
     );
     return "noted";
    } catch (cardError) {
@@ -1162,10 +1194,28 @@ async function markAbsentCards(
   // FULL needed set here preserves correctness at any frontier size — a
   // needed card that slipped past the truncated exclusion is never treated
   // as absent (round-26 review).
-  let openCards = journal.listUnreconciledOpen(map.repo, neededIds, {
-    limit: Math.max(budget.remaining, 0),
-  });
-  openCards = openCards.filter((row) => !neededIds.has(row.nodeId));
+  // Collect up to budget.remaining USABLE (non-needed) open cards, scanning
+  // past needed rows that slipped past the capped SQL exclusion via offset
+  // pagination: with >ABSENT_EXCLUDE_CAP needed cards older than a real
+  // absent card, a single page would repeatedly load+discard the same needed
+  // rows and never reach the absent one (round-27 review). The scan is still
+  // bounded (MAX_ABSENT_SCAN total rows) so it can't walk the whole journal.
+  const wanted = Math.max(budget.remaining, 0);
+  const scanPage = 50;
+  let openCards: EscalationRow[] = [];
+  for (
+    let offset = 0;
+    openCards.length < wanted && offset < MAX_ABSENT_SCAN;
+    offset += scanPage
+  ) {
+    const batch = journal.listUnreconciledOpen(map.repo, neededIds, {
+      limit: scanPage,
+      offset,
+    });
+    openCards.push(...batch.filter((row) => !neededIds.has(row.nodeId)));
+    if (batch.length < scanPage) break; // exhausted
+  }
+  openCards = openCards.slice(0, wanted);
   const clientFor = channelClientFor(client);
   const outcomes = await mapPool(openCards, 3, async (prior) => {
     const nodeId = prior.nodeId;
@@ -1195,7 +1245,11 @@ async function markAbsentCards(
         // notedAt null and is re-reconciled next tick.
         if (!charge(budget)) return { action: "deferred", id: nodeId };
         try {
-          await clientFor(dest.channelId).edit(dest.messageId, content);
+          await clientFor(dest.channelId).edit(
+            dest.messageId,
+            content,
+            budget.deadline,
+          );
           anyEdit = true;
         } catch (destError) {
           if (!(destError instanceof DiscordMessageGoneError)) throw destError;
@@ -1704,6 +1758,11 @@ async function digestOneMap(
     action: "unchanged" as const,
   };
 
+  // The digest is one logical op per map, but it must still not hold the
+  // tick past a bound under rate-limiting — a generous per-digest deadline
+  // (round-27 review: the cooldown cap already bounds each wait).
+  const digestDeadline = Date.now() + MAX_PASS_MS;
+
   let token: ResolvedToken;
   let client: EscalationDiscord;
   try {
@@ -1777,13 +1836,13 @@ async function digestOneMap(
         // message is only noticed via a read. Verify it still exists; if it
         // is definitively gone (404), repost so the daily audit/budget digest
         // never silently vanishes.
-        if (!(await client.messageExists(messageId))) {
-          messageId = await client.post(content);
+        if (!(await client.messageExists(messageId, digestDeadline))) {
+          messageId = await client.post(content, digestDeadline);
           posted = true;
         }
       } else {
         try {
-          await client.edit(messageId, content);
+          await client.edit(messageId, content, digestDeadline);
           edited = true;
         } catch (editError) {
           if (!(editError instanceof DiscordMessageGoneError)) throw editError;

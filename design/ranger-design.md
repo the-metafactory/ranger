@@ -140,7 +140,7 @@ One worker = one node = one headless session (doctrine; research excepted).
 
 Cards are announce-once, edited not reposted, re-surfaced in a daily digest with age. **Digest: daily**, one per map thread — aged open cards (with age), audit findings (receipt-less closes, stale claims), and budget/spend state; morning Europe/Zurich; absence of the digest is the outer dead-man signal. **Re-surface: age-banded** — age shown from day 1; 3+ days get a louder summary + blocked-descendant count; 7+ days get an @-mention escalation. Silence never un-surfaces. **Meanwhile, nothing blocks:** escalated nodes stay unclaimed; `blocked-by` edges keep dependent work off the frontier automatically; every independent branch keeps walking. The frontier predicate is the scheduler.
 
-**Channel migration (amended round-25).** A card's message id is tracked per destination channel (`escalation_destinations`), and the card's age is its *first-appearance* timestamp (immutable across moves — a move never erases 3/7-day escalation state). When the map's Discord channel moves, the desk posts a fresh card in the new channel, first editing the card it is LEAVING to a non-actionable "moved to channel …" note — so exactly ONE card per escalation is active at any time (an edit can't cross channels; the note retires the prior destination before the replacement posts). Returning to a former channel recovers that channel's original message (edit in place, no duplicate) and notes the card it is leaving. This is reconcile-on-move; the multi-destination write-side lifecycle that *closes* resolved cards remains node #21.
+**Channel migration (amended round-25/27).** A card's message id is tracked per destination channel (`escalation_destinations`), and the card's age is its *first-appearance* timestamp (immutable across moves — a move never erases 3/7-day escalation state). When the map's Discord channel moves, the desk posts a fresh card in the new channel, first editing the card it is LEAVING to a non-actionable "moved to channel …" note — so exactly ONE card per escalation is active in steady state (an edit can't cross channels; the note retires the prior destination before the replacement posts). Honest gap: the migration is two remote ops (note-old then post/recover-new), so a crash between them leaves ZERO active cards until the next tick re-runs the migration — it can never leave TWO active, but a pause of one tick is possible. Returning to a former channel recovers that channel's original message (edit in place, no duplicate) and notes the card it is leaving. This is reconcile-on-move; the multi-destination write-side lifecycle that *closes* resolved cards remains node #21.
 
 **Stable resolution schema (amended round-26).** The deployed `escalations.status` column (`text NOT NULL DEFAULT 'open'`, drizzle 0001) IS the stable resolution contract, kept deliberately minimal and forward-compatible so #21 can inherit it without compensating migrations: the desk only ever writes `open` (plus `noted_at`, `last_content`, per-destination rows); the write-side (node #21) transitions `open` → `closed` on a principal response or operator verb, which shrinks the open set that every scan is bounded by. No lifecycle-affecting column is added after 0001 that would force #21 to rework the model.
 
@@ -196,13 +196,23 @@ Everything parked or vetoed is terminal until an operator verb. Silence never un
 - Escalations: non-blocking, and BOUNDED per tick — the desk processes at
   most `MAX_CARDS_PER_TICK` card operations (posts+edits) per map per tick,
   evaluated against a bounded page of frontier nodes swept via a persisted
-  cursor. The escalation lane therefore NEVER blocks the walk lane (a huge
-  frontier can't hold the tick past the walk interval): it converges over
-  ticks, deferring the remainder. Deferred cards stay open and are served on
-  a later tick — nothing is dropped, only delayed. (Amendment: §8 originally
-  said "unbounded" — the per-tick bound is an operational guarantee that
-  escalation never starves walking, and is the model the desk implements,
-  round-25 review.)
+  cursor, with a 120s pass DEADLINE (deferred past it) and a 30s cap on any
+  Discord 429 cooldown. The escalation lane therefore NEVER blocks the walk
+  lane (a huge frontier can't hold the tick past the walk interval): it
+  converges over ticks, deferring the remainder. Deferred cards stay open
+  and are served on a later tick — nothing is dropped, only delayed.
+  (Amendment: §8 originally said "unbounded" — the per-tick bound is an
+  operational guarantee that escalation never starves walking, and is the
+  model the desk implements, round-25 review.)
+  Honest scope of "never blocks": the desk's OWN processing is what the
+  bound/deadline/cooldown-cap constrain. The O(frontier) frontier read +
+  route classification is the SCHEDULER's inherent routing cost — ranger must
+  see the whole frontier to know which nodes are escalate-hitl vs
+  implement/research (paging routing would miss escalate nodes elsewhere in
+  the frontier) — and is shared scheduling work, not an escalation-lane cost.
+  For ranger's maps the frontier is small; a pathological multi-thousand-node
+  frontier pays one O(frontier) read per tick, which is the graph's cost, not
+  a pass that grows with the escalation backlog (round-27 review).
 - When #2517 lands, the lane cap is a config integer, not a redesign.
 
 Claim-level safety against the principal's concurrent interactive sessions is inherited from the verb (post-write re-read + deterministic tie-break), not built.

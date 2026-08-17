@@ -79,8 +79,11 @@ export interface EscalationRow {
  messageId: string;
  createdAt: string;
  lastEditedAt: string | null;
- /** open | resolved — a resolved card was edited to a resolved note. */
- status: "open" | "resolved";
+ /** open | closed — the write-side (node #21) transitions a card to closed
+  *  on a principal response or operator verb; the desk only ever writes open.
+  *  (Unified vocabulary, round-27 review — the design contract is open →
+  *  closed.) */
+ status: "open" | "closed";
  /** When the queue-exit note was written (bounds the absent-card scan). */
  notedAt: string | null;
 }
@@ -487,7 +490,7 @@ export class Journal {
  listUnreconciledOpen(
   repo: string,
   excludeNodeIds: ReadonlySet<string> = new Set(),
-  opts: { limit?: number } = {},
+  opts: { limit?: number; offset?: number } = {},
  ): EscalationRow[] {
   // The NOT IN exclusion is CAPPED: a pathological frontier (thousands of
   // needed nodes) must not exceed SQLite's bind limit. Correctness is
@@ -509,9 +512,10 @@ export class Journal {
     ),
     // Oldest exits first (most urgent), and capped to the remaining request
     // budget so a large drain can't walk every unnoted card after the budget
-    // is spent (round-23 review) — the rest are deferred to the next tick.
+    // is spent (round-23 review) - the rest are deferred to the next tick.
     orderBy: asc(escalations.createdAt),
     ...(opts.limit === undefined ? {} : { limit: opts.limit }),
+    ...(opts.offset === undefined ? {} : { offset: opts.offset }),
    })
    .sync();
   return rows.map(hydrateEscalation);
@@ -611,7 +615,7 @@ function hydrateEscalation(row: {
   messageId: row.messageId,
   createdAt: row.createdAt,
   lastEditedAt: row.lastEditedAt,
-  status: row.status as "open" | "resolved",
+  status: row.status as "open" | "closed",
   notedAt: row.notedAt,
  };
 }

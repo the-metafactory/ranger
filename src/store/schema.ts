@@ -69,7 +69,7 @@ export const escalations = sqliteTable(
   key: text("key").primaryKey(),
   repo: text("repo").notNull(),
   nodeId: text("node_id").notNull(),
-  /** Node title at first post — the resolved note keeps a readable remnant. */
+  /** Node title at first post — the closed note keeps a readable remnant. */
   title: text("title"),
   /** The §3 route class at (last) post/edit — escalate-hitl | provisioning. */
   route: text("route"),
@@ -80,7 +80,9 @@ export const escalations = sqliteTable(
   messageId: text("message_id").notNull(),
   createdAt: text("created_at").notNull(),
   lastEditedAt: text("last_edited_at"),
-  /** open | resolved — a resolved card was edited to a resolved note. */
+  /** open | closed — the write-side (node #21) transitions to closed on a
+   *  principal response or operator verb (design §5); the desk only ever
+   *  writes open. */
   status: text("status").notNull().default("open"),
   /** When the queue-exit note was written — reconciles the absent-card scan. */
   notedAt: text("noted_at"),
