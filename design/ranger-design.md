@@ -219,8 +219,10 @@ Everything parked or vetoed is terminal until an operator verb. Silence never un
   after expiry) + one in-flight Discord request (≤30s capped by remaining
   deadline). It is a small constant multiple of the deadline, never unbounded
   — every graph and Discord call has a hard timeout (round-30 review),
-  including walk's FRESH read for claims (walk.ts now passes
-  GRAPH_CALL_TIMEOUT_MS too; round-33 closed the earlier unbounded window).
+  including walk's FRESH read for claims and its graphClaim write (both pass
+  GRAPH_CALL_TIMEOUT_MS; round-33 + round-35 closed the earlier unbounded
+  windows) and the claim-announce Discord POST (abort-bounded at 30s,
+  round-35).
   Honest scope of "never blocks": the desk's OWN processing is what the
   bound/deadline/cooldown-cap constrain. The O(frontier) frontier read +
   route classification is the SCHEDULER's inherent routing cost — ranger must

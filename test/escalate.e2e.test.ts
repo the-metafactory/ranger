@@ -560,7 +560,11 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
       );
 
       const res = await result;
-      expect(res.code).toBe(0);
+      // Round-35 hardening: A's pass re-asserts ownership before EVERY
+      // mutation (not just on heartbeat/release), so a resumed holder whose
+      // lock was reclaimed ABORTS at its first fenced write (exit 2) instead
+      // of posting alongside the new owner.
+      expect(res.code).toBe(2); // lost lease → map ok:false
       expect(existsSync(lockFile)).toBe(true); // A did NOT unlink B's lock
       const after = JSON.parse(readFileSync(lockFile, "utf8")) as {
         nonce: string;

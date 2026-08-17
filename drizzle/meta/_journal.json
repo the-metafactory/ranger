@@ -78,6 +78,13 @@
       "when": 1786997826046,
       "tag": "0010_escalation-noted-created-index",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "6",
+      "when": 1787006714145,
+      "tag": "0011_escalation-drop-redundant-indexes",
+      "breakpoints": true
     }
   ]
 }

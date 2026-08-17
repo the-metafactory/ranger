@@ -651,16 +651,53 @@ function releaseLease(
   }
 }
 
+/** Thrown when the announce-once lease is no longer OURS at a mutation
+ *  boundary (round-35 blocker): a resumed holder whose lease was reclaimed
+ *  must stop before its next Discord write or journal update, not after —
+ *  otherwise it can post/overwrite alongside the new owner. Caught by the
+ *  pass orchestration, which aborts the whole map (every further write would
+ *  be dangerous) and surfaces the lost-ownership loudly.
+ */
+class LeaseLostError extends EscalateError {
+  override readonly name = "LeaseLostError";
+}
+
+/** Re-reads the lock and throws LeaseLostError when the nonce is no longer
+ *  ours (or the lock is unreadable/released — either way we do not own it). */
+type OwnedCheck = () => void;
+
 async function withEscalateLock<T>(
   journal: Journal,
-  fn: () => Promise<T>,
+  fn: (owned: OwnedCheck) => Promise<T>,
 ): Promise<T> {
   const lockFile = join(dirname(journal.path), ".escalate.lock");
   const reclaimMarker = `${lockFile}.reclaiming`;
   const lease = await acquireLease(lockFile, reclaimMarker);
   const { heartbeat, lostOwnership } = startHeartbeat(lease);
+  const owned: OwnedCheck = () => {
+    try {
+      const cur = JSON.parse(readFileSync(lockFile, "utf8")) as {
+        nonce?: string;
+      };
+      if (cur.nonce !== lease.ownerNonce) {
+        lostOwnership.value = true;
+        throw new LeaseLostError(
+          "announce-once lease lost: another run owns the desk",
+        );
+      }
+    } catch (error) {
+      if (error instanceof LeaseLostError) throw error;
+      // Unreadable or missing lock: a live holder's lock is always complete
+      // JSON (atomic writes) and carries OUR nonce while we run — anything
+      // else means the lock was reclaimed or released. Treat as lost.
+      lostOwnership.value = true;
+      throw new LeaseLostError(
+        "announce-once lease lost: lock unreadable/released",
+      );
+    }
+  };
   try {
-    return await fn();
+    return await fn(owned);
   } finally {
     releaseLease(lease, heartbeat, lostOwnership);
   }
@@ -716,6 +753,11 @@ interface CardSyncCtxBase {
   config: RangerConfig;
   now: Date;
   budget: CardBudget;
+  /** Pre-mutation lease-ownership assertion (round-35): re-reads the lock
+   *  nonce and throws LeaseLostError when the lock is no longer ours, so a
+   *  resumed holder whose lease was reclaimed stops BEFORE its next Discord
+   *  write or journal update instead of posting alongside the new owner. */
+  owned: OwnedCheck;
 }
 
 interface CardSyncContext extends CardSyncCtxBase {
@@ -762,6 +804,9 @@ function saveAndReturn(
   row: ReturnType<typeof escalationRow>,
   action: "posted" | "edited",
 ): SyncOutcome {
+  // Fence the row write: the new owner's journal must not be overwritten by
+  // a resumed holder (round-35 blocker).
+  ctx.owned();
   ctx.journal.upsertEscalation(row);
   return {
     action,
@@ -780,6 +825,9 @@ async function postFresh(
 ): Promise<SyncOutcome> {
   const { client, journal, budget, node, now } = ctx;
   if (!charge(budget)) return { action: "deferred", id: node.id };
+  // A resumed holder whose lease was reclaimed must stop before its next
+  // mutation (round-35 blocker): the fresh post is the announcement itself.
+  ctx.owned();
   // The posted content is the SAME `content` the edit path would use — one
   // render source, no drift (round-30 suggestion). A reposted card is the
   // SAME unresolved escalation, re-surfaced WITH ITS AGE (design §5); new
@@ -794,6 +842,9 @@ async function postFresh(
     // recovery, not the card's age.
     createdAt: priorCreatedAt ?? now.toISOString(),
   });
+  // Fence the destination + row writes too: a resumed holder must not
+  // overwrite the new owner's journal state (round-35).
+  ctx.owned();
   journal.setEscalationDestination(
     ctx.key,
     client.channel,
@@ -814,6 +865,8 @@ async function editInPlace(
 ): Promise<SyncOutcome> {
   const { client, budget, node, now } = ctx;
   if (!charge(budget)) return { action: "deferred", id: node.id };
+  // Fence the edit (round-35 blocker): a reclaimed holder must not write.
+  ctx.owned();
   try {
     await client.edit(messageId, editContent, budget.deadline);
   } catch (cardError) {
@@ -847,6 +900,8 @@ async function noteMoved(
   // row with no channel to note (nothing to do).
   if (priorChannelId === null) return "noted";
   if (!charge(budget)) return { action: "deferred", id: node.id };
+  // Fence the note-write (round-35): a reclaimed holder must not mutate.
+  ctx.owned();
   try {
     await clientFor(priorChannelId).edit(
       priorMessageId,
@@ -943,7 +998,10 @@ async function syncCard(
   } catch (cardError) {
     // A transient Discord failure on one card must not fail the whole desk —
     // the card retries next tick (announce-once stays intact: a failed post
-    // writes no row, a failed edit keeps its row).
+    // writes no row, a failed edit keeps its row). A LOST LEASE is NOT a
+    // per-card failure: it aborts the whole pass and surfaces loudly
+    // (round-35 blocker).
+    if (cardError instanceof LeaseLostError) throw cardError;
     return {
       action: "error" as const,
       id: node.id,
@@ -967,10 +1025,11 @@ async function markAbsentCards(
     map: RangerMapConfig;
     now: Date;
     budget: CardBudget;
+    owned: OwnedCheck;
   },
   neededIds: ReadonlySet<string>,
 ): Promise<{ keptOpen: string[]; deferred: string[]; errors: string[] }> {
-  const { client, journal, map, now, budget } = ctx;
+  const { client, journal, map, now, budget, owned } = ctx;
   // Reconcile ONLY open, un-noted cards ABSENT from the current frontier — a
   // no-op tick never loads (or skips) the active cards (round-19 review), and
   // a noted card drops out entirely. Closing resolved cards (which shrinks
@@ -980,7 +1039,7 @@ async function markAbsentCards(
   // `reconcileAbsentCard`.
   const usable = selectAbsentCards(journal, map.repo, neededIds, budget);
   const clientFor = channelClientFor(client);
-  const reconcileCtx = { clientFor, journal, map, now, budget };
+  const reconcileCtx = { clientFor, journal, map, now, budget, owned };
   const outcomes = await mapPool(usable, 3, (prior) =>
     reconcileAbsentCard(reconcileCtx, prior),
   );
@@ -1080,10 +1139,11 @@ async function reconcileAbsentCard(
     map: RangerMapConfig;
     now: Date;
     budget: CardBudget;
+    owned: OwnedCheck;
   },
   prior: EscalationRow,
 ): Promise<AbsentOutcome> {
-  const { clientFor, journal, map, now, budget } = ctx;
+  const { clientFor, journal, map, now, budget, owned } = ctx;
   const nodeId = prior.nodeId;
   const key = `${map.repo}:${nodeId}`;
   const content = queueExitContent(nodeId, prior.title, map.repo);
@@ -1121,6 +1181,9 @@ async function reconcileAbsentCard(
         journal.setHealth(cursorKey, String(i));
         return { action: "deferred", id: nodeId };
       }
+      // A resumed holder whose lease was reclaimed must stop before its next
+      // write — the queue-exit note is a Discord mutation (round-35).
+      owned();
       try {
         await clientFor(dest.channelId).edit(
           dest.messageId,
@@ -1136,6 +1199,9 @@ async function reconcileAbsentCard(
     // All destinations reconciled (or a definitive 404 each) — clear the
     // cursor + set notedAt; a transient failure throws → retried next tick.
     journal.setHealth(cursorKey, "");
+    // Fence the row write too: the new owner's journal must not be
+    // overwritten by a resumed holder (round-35).
+    owned();
     journal.upsertEscalation({
       key,
       repo: map.repo,
@@ -1155,7 +1221,9 @@ async function reconcileAbsentCard(
     };
   } catch (cardError) {
     // A transient failure on one card must not fail the desk — it retries
-    // next tick and the card stays open.
+    // next tick and the card stays open. A LOST LEASE aborts the pass
+    // (round-35 blocker): the new owner owns the journal now.
+    if (cardError instanceof LeaseLostError) throw cardError;
     return {
       action: "error" as const,
       id: nodeId,
@@ -1296,6 +1364,129 @@ async function resolveDeskContext(
   return { token, client };
 }
 
+/** One tick's ACTIVE card pass for a map — extracted from the map
+ *  orchestration so paging, sync, and result-collation don't live inline in
+ *  the 160+-line map flow (round-35 suggestion). Bounds the pass: a REQUEST
+ *  budget charged only when syncCard actually POSTs/EDITs (unchanged no-op
+ *  cards are free) caps logical card operations; a PAGE of candidates
+ *  evaluated this tick, swept via a persisted cursor, caps the SQL lookup
+ *  and the render+decision walk. Nothing starves: the cursor advances each
+ *  tick so every needed node is eventually evaluated, and fresh cards (no
+ *  row) within the page announce before page re-edits. Returns the collated
+ *  outcomes + the budget the absent-card pass reuses with its reserved slice
+ *  (round-33).
+ */
+async function syncActivePage(ctx: {
+  client: EscalationDiscord;
+  config: RangerConfig;
+  map: RangerMapConfig;
+  journal: Journal;
+  now: Date;
+  passDeadline: number;
+  needed: ClassifiedNode[];
+  owned: OwnedCheck;
+}): Promise<{
+  cards: EscalationCard[];
+  posted: string[];
+  edited: string[];
+  deferred: string[];
+  cardErrors: string[];
+  neededIds: Set<string>;
+  budget: CardBudget;
+}> {
+  const {
+    client,
+    config,
+    map,
+    journal,
+    now,
+    passDeadline,
+    needed,
+    owned,
+  } = ctx;
+  const budget = {
+    remaining: ACTIVE_CARD_CAP,
+    deadline: passDeadline,
+  };
+  const cursorKey = `escalate.cursor.${map.repo}`;
+  const sorted = [...needed].sort((a, b) => a.id.localeCompare(b.id));
+  const pageSize = MAX_CARDS_PER_TICK * 2;
+  const offset =
+    sorted.length === 0 ? 0 : journal.getInt(cursorKey) % sorted.length;
+  // A bounded page of candidate nodes swept through the frontier via a
+  // persisted cursor. When the whole frontier fits in one page there is
+  // nothing to sweep — use it DIRECTLY: the modulo wrap would duplicate
+  // IDs already in the first slice (a duplicated FRESH id both enters
+  // postFresh and posts two cards, round-34 blocker). Only when the
+  // frontier EXCEEDS the page do we window it, and the wrap appends the
+  // exact overflow (offset+pageSize-N < N for N>pageSize, so no overlap).
+  const page =
+    sorted.length <= pageSize
+      ? sorted
+      : sorted
+          .slice(offset, offset + pageSize)
+          .concat(
+            offset + pageSize > sorted.length
+              ? sorted.slice(0, offset + pageSize - sorted.length)
+              : [],
+          );
+  if (sorted.length > pageSize) {
+    journal.setHealth(
+      cursorKey,
+      String((offset + pageSize) % sorted.length),
+    );
+  }
+
+  // The active pass needs ONLY the rows for the nodes in this tick's page
+  // — query them directly instead of scanning the whole repo's escalation
+  // history every 15-minute tick (round-15 review). The absent-card pass
+  // separately queries open cards.
+  const existing = journal.getEscalations(map.repo, page.map((n) => n.id));
+  // Fresh cards (no row yet) announce before page re-edits — they are the
+  // urgent ones and must not wait behind a sweep of already-synced cards.
+  const pageOrder = page
+    .filter((n) => !existing.has(n.id))
+    .concat(page.filter((n) => existing.has(n.id)));
+
+  const cards: EscalationCard[] = [];
+  const posted: string[] = [];
+  const edited: string[] = [];
+  const deferred: string[] = [];
+  const cardErrors: string[] = [];
+  const clientFor = channelClientFor(client);
+  const outcomes = await mapPool(pageOrder, 3, (node) =>
+    syncCard(
+      { client, clientFor, journal, map, config, now, budget, owned },
+      node,
+      existing.get(node.id),
+    ),
+  );
+  for (const outcome of outcomes) {
+    if (outcome.action === "deferred") {
+      deferred.push(outcome.id);
+    } else if (
+      outcome.action === "posted" ||
+      outcome.action === "edited" ||
+      outcome.action === "unchanged"
+    ) {
+      cards.push(outcome.card);
+    } else {
+      cardErrors.push(`#${outcome.id}: ${outcome.error}`);
+    }
+    if (outcome.action === "posted") posted.push(outcome.id);
+    else if (outcome.action === "edited") edited.push(outcome.id);
+  }
+  return {
+    cards,
+    posted,
+    edited,
+    deferred,
+    cardErrors,
+    neededIds: new Set(needed.map((n) => n.id)),
+    budget,
+  };
+}
+
 async function escalateOneMap(
   config: RangerConfig,
   map: RangerMapConfig,
@@ -1303,6 +1494,7 @@ async function escalateOneMap(
   registry: ReturnType<typeof loadProbeRegistry>,
   now: Date,
   passDeadline: number,
+  owned: OwnedCheck,
 ): Promise<EscalateMapResult> {
   const base: EscalateMapResult = {
     repo: map.repo,
@@ -1354,108 +1546,43 @@ async function escalateOneMap(
       ...classified.filter((n) => n.route.route === "provisioning"),
     ].filter(cardNeeded);
 
-    // Bound the pass so a large frontier can't hold this tick past the walk
-    // interval. TWO bounds work together (rounds 21–24):
-    //  1. A REQUEST budget charged only when syncCard actually POSTs/EDITs
-    //     (unchanged no-op cards are free) — caps logical card operations at
-    //     50. NOTE: the budget counts one POST/PATCH per card op, not raw
-    //     HTTP calls — a rate-limited op retries per the client's own 429
-    //     policy (each PATCH/POST can make up to 4 fetchOnce calls), so under
-    //     heavy rate-limiting the wall time per op grows and a tick may not
-    //     finish its 50 ops before the next one — the desk converges over
-    //     ticks (round-25 review).
-    //  2. A PAGE of candidate nodes evaluated this tick, swept through the
-    //     frontier via a persisted cursor — caps the SQL lookup (SQLite bind
-    //     limit) and the render+decision walk, and nothing starves: the
-    //     cursor advances each tick, so every needed node is eventually
-    //     evaluated, and fresh cards (no row) within the page go first.
-    const budget = {
-      remaining: ACTIVE_CARD_CAP,
-      deadline: passDeadline,
-    };
-    const cursorKey = `escalate.cursor.${map.repo}`;
-    const sorted = [...needed].sort((a, b) => a.id.localeCompare(b.id));
-    const pageSize = MAX_CARDS_PER_TICK * 2;
-    const offset =
-      sorted.length === 0 ? 0 : journal.getInt(cursorKey) % sorted.length;
-    // A bounded page of candidate nodes swept through the frontier via a
-    // persisted cursor. When the whole frontier fits in one page there is
-    // nothing to sweep — use it DIRECTLY: the modulo wrap would duplicate
-    // IDs already in the first slice (a duplicated FRESH id both enters
-    // postFresh and posts two cards, round-34 blocker). Only when the
-    // frontier EXCEEDS the page do we window it, and the wrap appends the
-    // exact overflow (offset+pageSize-N < N for N>pageSize, so no overlap).
-    const page =
-      sorted.length <= pageSize
-        ? sorted
-        : sorted
-            .slice(offset, offset + pageSize)
-            .concat(
-              offset + pageSize > sorted.length
-                ? sorted.slice(0, offset + pageSize - sorted.length)
-                : [],
-            );
-    if (sorted.length > pageSize) {
-      journal.setHealth(
-        cursorKey,
-        String((offset + pageSize) % sorted.length),
-      );
-    }
-
-    // The active pass needs ONLY the rows for the nodes in this tick's page
-    // — query them directly instead of scanning the whole repo's escalation
-    // history every 15-minute tick (round-15 review). The absent-card pass
-    // separately queries open cards.
-    const existing = journal.getEscalations(
-      map.repo,
-      page.map((n) => n.id),
-    );
-    // Fresh cards (no row yet) announce before page re-edits — they are the
-    // urgent ones and must not wait behind a sweep of already-synced cards.
-    const pageOrder = page
-      .filter((n) => !existing.has(n.id))
-      .concat(page.filter((n) => existing.has(n.id)));
-
-    const cards: EscalationCard[] = [];
-    const clientFor = channelClientFor(client);
-    const outcomes = await mapPool(pageOrder, 3, (node) =>
-      syncCard(
-        { client, clientFor, journal, map, config, now, budget },
-        node,
-        existing.get(node.id),
-      ),
-    );
-    for (const outcome of outcomes) {
-      if (outcome.action === "deferred") {
-        base.deferred.push(outcome.id);
-      } else if (
-        outcome.action === "posted" ||
-        outcome.action === "edited" ||
-        outcome.action === "unchanged"
-      ) {
-        cards.push(outcome.card);
-      } else {
-        base.cardErrors.push(`#${outcome.id}: ${outcome.error}`);
-      }
-      if (outcome.action === "posted") base.posted.push(outcome.id);
-      else if (outcome.action === "edited") base.edited.push(outcome.id);
-    }
-
-    const neededIds = new Set(needed.map((n) => n.id));
-    // The absent-card pass gets its OWN reserved budget slice — active-card
-    // churn can never consume it, so an obsolete actionable card is always
-    // eventually reconciled (round-33 review: "no absent card starves" was
-    // violated when the active pass exhausted the shared 50). Total per-tick
-    // bound is still MAX_CARDS_PER_TICK (active cap + absent reserve).
+    // The ACTIVE card pass (budgeted page + announce-fresh-first sync) is a
+    // self-contained stage — see syncActivePage. The absent-card pass gets
+    // its OWN reserved budget slice: active-card churn can never consume it,
+    // so an obsolete actionable card is always eventually reconciled
+    // (round-33 review: "no absent card starves" was violated when the
+    // active pass exhausted the shared 50). Total per-tick bound is still
+    // MAX_CARDS_PER_TICK (active cap + absent reserve).
+    const active = await syncActivePage({
+      client,
+      config,
+      map,
+      journal,
+      now,
+      passDeadline,
+      needed,
+      owned,
+    });
+    base.posted.push(...active.posted);
+    base.edited.push(...active.edited);
+    base.deferred.push(...active.deferred);
+    base.cardErrors.push(...active.cardErrors);
     const absent = await markAbsentCards(
-      { client, journal, map, now, budget: { ...budget, remaining: ABSENT_RESERVE } },
-      neededIds,
+      {
+        client,
+        journal,
+        map,
+        now,
+        budget: { ...active.budget, remaining: ABSENT_RESERVE },
+        owned,
+      },
+      active.neededIds,
     );
     base.keptOpen.push(...absent.keptOpen);
     base.deferred.push(...absent.deferred);
     base.cardErrors.push(...absent.errors);
 
-    return { ...base, cards };
+    return { ...base, cards: active.cards };
   } catch (error) {
     return {
       ...base,
@@ -1471,7 +1598,7 @@ export async function escalateMaps(
   journal: Journal,
   opts: { now?: Date } = {},
 ): Promise<EscalateResult> {
-  return withEscalateLock(journal, async () => {
+  return withEscalateLock(journal, async (owned) => {
     const now = opts.now ?? new Date();
     // ONE tick-wide deadline for the whole escalation pass — maps are
     // serialized, so a fresh 120s per map would let a two-map config hold
@@ -1483,7 +1610,15 @@ export async function escalateMaps(
     const maps: EscalateMapResult[] = [];
     for (const map of config.maps) {
       maps.push(
-        await escalateOneMap(config, map, journal, registry, now, passDeadline),
+        await escalateOneMap(
+          config,
+          map,
+          journal,
+          registry,
+          now,
+          passDeadline,
+          owned,
+        ),
       );
     }
     return { generatedAt: now.toISOString(), maps };
@@ -1654,6 +1789,7 @@ async function syncDailyDigest(
   content: string,
   now: Date,
   deadline: number,
+  owned: OwnedCheck,
 ): Promise<{ messageId: string; posted: boolean; edited: boolean }> {
   const today = localDateKey(now);
   const cachedRaw = journal.getHealth(`digest.${repo}`);
@@ -1684,11 +1820,16 @@ async function syncDailyDigest(
       // is definitively gone (404), repost so the daily audit/budget digest
       // never silently vanishes.
       if (!(await client.messageExists(messageId, deadline))) {
+        // A resumed holder whose lease was reclaimed must stop before its
+        // next mutation (round-35 blocker).
+        owned();
         messageId = await client.post(content, deadline);
         posted = true;
       }
     } else {
       try {
+        // Fence the edit: same rule as the post.
+        owned();
         await client.edit(messageId, content, deadline);
         edited = true;
       } catch (editError) {
@@ -1697,15 +1838,21 @@ async function syncDailyDigest(
         // digest and replace the cached message id — otherwise unchanged
         // runs would no-op against the stale cache and leave NO digest
         // until the next day.
+        owned();
         messageId = await client.post(content, deadline);
         posted = true;
       }
     }
+    // Fence the cache write: a resumed holder must not overwrite the new
+    // owner's digest cache (round-35).
+    owned();
     journal.setHealth(
       `digest.${repo}`,
       JSON.stringify({ today, messageId, lastContent: content }),
     );
   } else {
+    // Fence the fresh post + its cache write.
+    owned();
     messageId = await client.post(content, deadline);
     journal.setHealth(
       `digest.${repo}`,
@@ -1721,6 +1868,7 @@ async function digestOneMap(
   map: RangerMapConfig,
   journal: Journal,
   now: Date,
+  owned: OwnedCheck,
 ): Promise<DigestMapResult> {
   const base: DigestMapResult = {
     repo: map.repo,
@@ -1805,6 +1953,7 @@ async function digestOneMap(
       content,
       now,
       digestDeadline,
+      owned,
     );
 
     return {
@@ -1833,11 +1982,11 @@ export async function runDigest(
   journal: Journal,
   opts: { now?: Date } = {},
 ): Promise<DigestResult> {
-  return withEscalateLock(journal, async () => {
+  return withEscalateLock(journal, async (owned) => {
     const now = opts.now ?? new Date();
     const maps: DigestMapResult[] = [];
     for (const map of config.maps) {
-      maps.push(await digestOneMap(config, map, journal, now));
+      maps.push(await digestOneMap(config, map, journal, now, owned));
     }
     return { generatedAt: now.toISOString(), maps };
   });

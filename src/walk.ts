@@ -210,7 +210,12 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
       detail: messageId,
      });
 
-     const claim = await graphClaim(map.repo, node.id, botIdentity, token);
+     const claim = await graphClaim(map.repo, node.id, botIdentity, token, {
+      // Every graph CLI call is timeout-bound — a hung claim must not hold
+      // the scheduled tick (round-35: walk's write-side calls were the last
+      // unbounded surface).
+      timeoutMs: GRAPH_CALL_TIMEOUT_MS,
+     });
      if (!claim.held) {
       errors.push(
        `#${node.id} claim race lost to ${claim.holder ?? "another session"} — skipped`,

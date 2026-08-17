@@ -88,17 +88,14 @@ export const escalations = sqliteTable(
   notedAt: text("noted_at"),
  },
  (table) => [
-  // Repo-scoped escalation lookups (listEscalations) stay indexed as history grows.
-  index("escalations_repo_idx").on(table.repo),
   // Hot tick lookups: the active pass (repo+node_id batch) and the absent
   // pass / digest (repo+status open, unreconciled) — composite so the
-  // synchronous per-tick queries don't scan every row of the repo.
+  // synchronous per-tick queries don't scan every row of the repo. The plain
+  // (repo) and (repo,status,noted_at) indexes are REDUNDANT (covered by the
+  // composite ones below) and were dropped in migration 0011 — each kept
+  // index is maintained on every bounded but frequent card upsert (round-35
+  // suggestion).
   index("escalations_repo_node_idx").on(table.repo, table.nodeId),
-  index("escalations_repo_status_noted_idx").on(
-   table.repo,
-   table.status,
-   table.notedAt,
-  ),
   // The digest's oldest-first capped read (repo, status open, ordered by
   // created_at) — without this it scans+sorts every open card per day.
   index("escalations_repo_status_created_idx").on(

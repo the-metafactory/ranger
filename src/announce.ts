@@ -73,6 +73,12 @@ export class DiscordAnnouncer implements Announcer {
    `:ranger: **claim** #${ctx.nodeId} — ${ctx.nodeTitle}`,
    `map: ${ctx.repo}${ctx.mapTitle === undefined ? "" : ` (${ctx.mapTitle})`}`,
   ].join("\n");
+  // A hung announce must not hold the scheduled tick — the fetch is
+  // abort-bounded (round-35: the claim-announce was the last unbounded
+  // Discord surface). The announcer is fail-closed: a timeout aborts the
+  // claim, which is the safe side.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 30_000);
   let response: Response;
   try {
    response = await fetch(
@@ -90,12 +96,15 @@ export class DiscordAnnouncer implements Announcer {
       // claimed (review fix, mirrors the escalation client).
       allowed_mentions: { parse: [] },
      }),
+     signal: controller.signal,
     },
    );
   } catch (error) {
    throw new AnnounceError(
     `announce failed for #${ctx.nodeId}: ${error instanceof Error ? error.message : String(error)}`,
    );
+  } finally {
+   clearTimeout(timer);
   }
   if (!response.ok) {
    throw new AnnounceError(
