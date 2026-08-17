@@ -48,3 +48,23 @@ export const vetoes = sqliteTable("vetoes", {
  at: text("at").notNull(),
  detail: text("detail"),
 });
+
+/**
+ * Escalation cards (design §5, build-path step 2) — one row per HITL/
+ * provisioning card, keyed `repo:nodeId`. The Discord message id + first-post
+ * timestamp back the announce-once / edit-not-repost / age-banding contract:
+ * a card is posted once, edited in place thereafter, and aged from `createdAt`.
+ */
+export const escalations = sqliteTable("escalations", {
+ /** `${repo}:${nodeId}` — one card per node per map. */
+ key: text("key").primaryKey(),
+ repo: text("repo").notNull(),
+ nodeId: text("node_id").notNull(),
+ /** Node title at first post — the resolved note keeps a readable remnant. */
+ title: text("title"),
+ messageId: text("message_id").notNull(),
+ createdAt: text("created_at").notNull(),
+ lastEditedAt: text("last_edited_at"),
+ /** open | resolved — a resolved card was edited to a resolved note. */
+ status: text("status").notNull().default("open"),
+});

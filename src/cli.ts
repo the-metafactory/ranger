@@ -37,6 +37,7 @@ import {
 import { runNode } from "./worker.ts";
 import { sweepMap } from "./sweep.ts";
 import { walk } from "./walk.ts";
+import { escalateMaps, runDigest, type EscalateResult, type DigestResult } from "./escalate.ts";
 import type { WalkMode } from "./config.ts";
 
 /**
@@ -235,6 +236,7 @@ async function runJournal(
   deadmanCount: journal.deadmanCount(),
   spawnsToday: journal.spawnsToday(),
   workers: journal.listWorkers(target),
+  escalations: journal.listEscalations(target),
   events: journal.listEvents(target, 50),
  };
  journal.close();
@@ -262,6 +264,42 @@ function normalizeRepo(repo: string, config: RangerConfig): string {
 
 function renderWalkJson(result: unknown): string {
  return JSON.stringify(result, null, 2);
+}
+
+function renderEscalateText(result: EscalateResult | DigestResult): string {
+ const lines: string[] = [`ranger escalate — ${result.generatedAt}`];
+ for (const map of result.maps) {
+  if (!map.ok) {
+   lines.push(`map: ${map.repo}`, `  ✗ FAILED — ${map.error}`, "");
+   continue;
+  }
+  if ("cards" in map && "receiptLessCloses" in map && "budget" in map) {
+   // digest map
+   const d = map as DigestResult["maps"][number];
+   lines.push(`map: ${map.repo} (digest ${d.posted ? "posted" : "edited"} ${d.digestMessageId})`);
+   lines.push(
+    `  cards: ${d.cards.length}${d.cards.length ? ` (${d.cards.map((c) => `#${c.nodeId} ${c.ageDays}d`).join(", ")})` : " — clean"}`,
+   );
+   lines.push(
+    `  audit: receipt-less ${d.receiptLessCloses.length}${d.receiptLessCloses.length ? ` ${d.receiptLessCloses.join(",")}` : ""} · stale ${d.openClaims.length} · budget ${d.budget.spawnsToday}/${d.budget.spawnCapPerDay}${d.budget.paused ? " PAUSED" : ""}`,
+   );
+  } else {
+   const e = map as EscalateResult["maps"][number];
+   lines.push(`map: ${map.repo}`);
+   lines.push(
+    `  posted: ${e.posted.length ? e.posted.map((n) => `#${n}`).join(", ") : "—"}`,
+   );
+   lines.push(
+    `  edited: ${e.edited.length ? e.edited.map((n) => `#${n}`).join(", ") : "—"}`,
+   );
+   lines.push(
+    `  resolved: ${e.resolved.length ? e.resolved.map((n) => `#${n}`).join(", ") : "—"}`,
+   );
+   lines.push(`  cards: ${e.cards.length}`);
+  }
+  lines.push("");
+ }
+ return lines.join("\n").trimEnd();
 }
 
 const program = new Command();
@@ -357,6 +395,38 @@ program
   } catch (error) {
    process.stderr.write(
     `ranger journal: ${error instanceof Error ? error.message : String(error)}\n`,
+   );
+   process.exit(1);
+  }
+ });
+
+program
+ .command("escalate")
+ .description(
+  "Escalation desk (design §5): post/edit HITL + provisioning cards in each map's Discord thread (announce-once, edit-not-repost, age-banded); --digest emits the daily aged-cards + audit + budget digest. Graph-read-only.",
+ )
+ .option("--digest", "emit the daily digest instead of the cards pass")
+ .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
+ .option("-j, --json", "emit machine-readable JSON")
+ .action(async (options: { digest: boolean; config: string; json: boolean }) => {
+  try {
+   const configPath = resolve(process.cwd(), options.config);
+   const { config } = loadConfig(configPath);
+   const journal = openJournal(config);
+   const result = options.digest
+    ? await runDigest(config, journal)
+    : await escalateMaps(config, journal);
+   journal.close();
+   process.stdout.write(
+    options.json
+     ? JSON.stringify(result, null, 2) + "\n"
+     : renderEscalateText(result) + "\n",
+   );
+   const failed = result.maps.some((m) => !m.ok);
+   process.exit(failed ? 2 : 0);
+  } catch (error) {
+   process.stderr.write(
+    `ranger escalate: ${error instanceof Error ? error.message : String(error)}\n`,
    );
    process.exit(1);
   }

@@ -1,6 +1,6 @@
 import { desc, eq } from "drizzle-orm";
 import { openDb, type RangerDb } from "./store/db.ts";
-import { events, health, vetoes, workers } from "./store/schema.ts";
+import { escalations, events, health, vetoes, workers } from "./store/schema.ts";
 import type { RangerConfig } from "./config.ts";
 import { expandHome } from "./config.ts";
 
@@ -38,6 +38,18 @@ export interface EventRow {
  repo: string | null;
  kind: string;
  detail: string | null;
+}
+
+export interface EscalationRow {
+ /** `${repo}:${nodeId}` */
+ key: string;
+ repo: string;
+ nodeId: string;
+ title: string | null;
+ messageId: string;
+ createdAt: string;
+ lastEditedAt: string | null;
+ status: "open" | "resolved";
 }
 
 export type EventKind =
@@ -223,6 +235,61 @@ export class Journal {
   return row !== undefined;
  }
 
+ // ---- escalations (design §5 escalation desk) ----
+
+ /**
+  * Record/update the card for a node. `key` is `${repo}:${nodeId}`. Called
+  * with a new messageId on first post, or the existing messageId + an
+  * `lastEditedAt` on an in-place edit. A node leaving the HITL/provisioning
+  * set is marked `resolved` (its card was edited to a resolved note).
+  */
+ upsertEscalation(
+  row: Pick<EscalationRow, "key" | "repo" | "nodeId" | "messageId" | "createdAt"> &
+   Partial<Pick<EscalationRow, "title" | "lastEditedAt" | "status">>,
+ ): void {
+  const existing = this.getEscalation(row.repo, row.nodeId);
+  this.db
+   .insert(escalations)
+   .values({
+    key: row.key,
+    repo: row.repo,
+    nodeId: row.nodeId,
+    title: row.title ?? existing?.title ?? null,
+    messageId: row.messageId,
+    createdAt: existing?.createdAt ?? row.createdAt,
+    lastEditedAt: row.lastEditedAt ?? existing?.lastEditedAt ?? null,
+    status: row.status ?? existing?.status ?? "open",
+   })
+   .onConflictDoUpdate({
+    target: escalations.key,
+    set: {
+     title: row.title ?? existing?.title ?? null,
+     messageId: row.messageId,
+     createdAt: existing?.createdAt ?? row.createdAt,
+     lastEditedAt: row.lastEditedAt ?? existing?.lastEditedAt ?? null,
+     status: row.status ?? existing?.status ?? "open",
+    },
+   })
+   .run();
+ }
+
+ getEscalation(repo: string, nodeId: string): EscalationRow | null {
+  const row = this.db.query.escalations.findFirst({
+   where: eq(escalations.key, `${repo}:${nodeId}`),
+  }).sync();
+  return row === undefined ? null : hydrateEscalation(row);
+ }
+
+ listEscalations(repo?: string): EscalationRow[] {
+  const rows =
+   repo === undefined
+    ? this.db.query.escalations.findMany().sync()
+    : this.db.query.escalations.findMany({
+       where: eq(escalations.repo, repo),
+      }).sync();
+  return rows.map(hydrateEscalation);
+ }
+
  /** Prune spawn-ledger keys older than the retention window (keeps health tidy). */
  pruneSpawnLedger(now = new Date(), retentionDays = 30): void {
   const cutoff = dayKey(new Date(now.getTime() - retentionDays * DAY_MS));
@@ -284,6 +351,28 @@ function hydrateEvent(row: {
   repo: row.repo,
   kind: row.kind,
   detail: row.detail,
+ };
+}
+
+function hydrateEscalation(row: {
+ key: string;
+ repo: string;
+ nodeId: string;
+ title: string | null;
+ messageId: string;
+ createdAt: string;
+ lastEditedAt: string | null;
+ status: string;
+}): EscalationRow {
+ return {
+  key: row.key,
+  repo: row.repo,
+  nodeId: row.nodeId,
+  title: row.title,
+  messageId: row.messageId,
+  createdAt: row.createdAt,
+  lastEditedAt: row.lastEditedAt,
+  status: row.status as "open" | "resolved",
  };
 }
 

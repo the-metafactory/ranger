@@ -29,6 +29,7 @@ export interface ClassifiedNode {
   autonomy: string;
   typed: boolean;
   url: string;
+  checkpointId?: string;
   route: RouteClass;
   /** Auto node declaring command/url probes — the class-5 signal. */
   registryBlocked: boolean;
@@ -133,6 +134,7 @@ export function classify(
     autonomy,
     typed,
     url: node.url,
+    checkpointId: node.node.checkpointId,
     registryBlocked: false,
   };
 
