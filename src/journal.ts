@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { openDb, type RangerDb } from "./store/db.ts";
 import {
  escalations,
@@ -393,7 +393,7 @@ export class Journal {
   * how many open cards exist (round-17 review: don't materialize all open
   * escalations just to render a capped list).
   */
- listOpenEscalations(
+  listOpenEscalations(
   repo: string,
   opts: { limit?: number } = {},
  ): { rows: EscalationRow[]; total: number } {
@@ -405,12 +405,45 @@ export class Journal {
   const rows = this.db.query.escalations
    .findMany({
     where: and(eq(escalations.repo, repo), eq(escalations.status, "open")),
+    // Oldest first — the most urgent cards are the ones surfaced in the
+    // capped display.
+    orderBy: asc(escalations.createdAt),
     ...(opts.limit === undefined ? {} : { limit: opts.limit }),
    })
    .sync();
   return {
    rows: rows.map(hydrateEscalation),
    total: Number(countRow?.n ?? 0),
+  };
+ }
+
+ /**
+  * Open-card age aggregates over ALL rows (not just the capped display):
+  * total, aged (≥3d), overdue (≥7d) — the digest header must report the
+  * true counts even when an overdue card falls outside the ≤15 rendered
+  * list (round-18 review).
+  */
+ openCardAgeCounts(
+  repo: string,
+  now: Date,
+ ): { total: number; aged: number; overdue: number } {
+  const cutoff = (days: number) =>
+   new Date(now.getTime() - days * DAY_MS).toISOString();
+  const agedAt = cutoff(3);
+  const overdueAt = cutoff(7);
+  const row = this.db
+   .select({
+    total: sql<number>`count(*)`,
+    aged: sql<number>`sum(case when ${escalations.createdAt} <= ${agedAt} then 1 else 0 end)`,
+    overdue: sql<number>`sum(case when ${escalations.createdAt} <= ${overdueAt} then 1 else 0 end)`,
+   })
+   .from(escalations)
+   .where(and(eq(escalations.repo, repo), eq(escalations.status, "open")))
+   .get();
+  return {
+   total: Number(row?.total ?? 0),
+   aged: Number(row?.aged ?? 0),
+   overdue: Number(row?.overdue ?? 0),
   };
  }
 

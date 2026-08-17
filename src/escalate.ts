@@ -66,6 +66,18 @@ export class EscalationDiscord {
   return this.channelId;
  }
 
+ /** A client for a DIFFERENT channel, sharing token/base/principal config.
+  *  Used to reconcile a card that lives in a channel the map moved away
+  *  from (patch its queue-exit note where it actually is). */
+ forChannel(channelId: string): EscalationDiscord {
+  return new EscalationDiscord(
+   this.token,
+   channelId,
+   this.apiBase,
+   this.principalDiscordId,
+  );
+ }
+
   static fromMap(
     map: RangerMapConfig,
     principalDiscordId?: string,
@@ -99,6 +111,38 @@ export class EscalationDiscord {
     this.cooldownUntil = 0;
   }
 
+  /**
+   * One throttled, cooldown-aware, timeout-bounded fetch — the shared setup
+   * for every Discord write AND read (writes and existence checks can't
+   * drift on throttling/timeout behavior). Throws on network errors/timeout.
+   */
+  private async fetchOnce(
+   path: string,
+   init: {
+    method: "GET" | "POST" | "PATCH";
+    headers?: Record<string, string>;
+    body?: string;
+   },
+  ): Promise<Response> {
+   await this.waitForCooldown();
+   await this.throttle();
+   const controller = new AbortController();
+   const timer = setTimeout(() => controller.abort(), 30_000);
+   try {
+    return await fetch(`${this.apiBase}${path}`, {
+     method: init.method,
+     headers: {
+      Authorization: `Bot ${this.token}`,
+      ...(init.headers ?? {}),
+     },
+     ...(init.body === undefined ? {} : { body: init.body }),
+     signal: controller.signal,
+    });
+   } finally {
+    clearTimeout(timer);
+   }
+  }
+
   private async request(
     method: "POST" | "PATCH",
     path: string,
@@ -113,21 +157,11 @@ export class EscalationDiscord {
     let lastStatus = 0;
     let firstRetryAfterSec = 0;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      // A global cooldown applies to every request on this client — wait it
-      // out BEFORE reserving a throttle slot, so pooled cards that finished
-      // a cooldown re-serialize through the throttle instead of firing
-      // together with now-expired reservations (re-triggering 429s).
-      await this.waitForCooldown();
-      await this.throttle();
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 30_000);
+      let response: Response;
       try {
-        const response = await fetch(`${this.apiBase}${path}`, {
+        response = await this.fetchOnce(path, {
           method,
-          headers: {
-            Authorization: `Bot ${this.token}`,
-            "Content-Type": "application/json",
-          },
+          headers: { "Content-Type": "application/json" },
           // parse: [] suppresses untrusted @everyone/@here/role mentions in
           // graph-derived content; only the principal's id (when configured)
           // is allowed to ping.
@@ -138,46 +172,43 @@ export class EscalationDiscord {
               users: this.principalDiscordId ? [this.principalDiscordId] : [],
             },
           }),
-          signal: controller.signal,
         });
-        if (response.status !== 429 && response.status < 500) {
-          return response;
-        }
-        lastStatus = response.status;
-        const retryAfter = Number(response.headers.get("retry-after"));
-        if (attempt === 1) {
-          firstRetryAfterSec = Number.isFinite(retryAfter) ? retryAfter : 0;
-        }
-        const global = response.headers.get("x-ratelimit-global") !== null;
-        const waitMs =
-          Number.isFinite(retryAfter) && retryAfter > 0
-            ? retryAfter * 1000
-            : 1000 * 2 ** (attempt - 1);
-        if (global) {
-          // Advance the client-wide deadline so every pooled request waits
-          // this out too, not just this one.
-          const cooldownMs = Math.max(waitMs, 30_000);
-          this.cooldownUntil = Math.max(
-            this.cooldownUntil,
-            Date.now() + cooldownMs,
-          );
-        }
-        // A long first cooldown (>30s) means the card is hot; retrying into it
-        // just extends it (observed live) — fail fast so the card is deferred
-        // to next tick instead of hammering.
-        if (attempt === 1 && firstRetryAfterSec > 30) {
-          break;
-        }
-        await sleep(
-          global ? Math.max(waitMs, 30_000) : Math.min(waitMs, 30_000),
-        );
       } catch (error) {
         throw new EscalateError(
           `discord ${method} ${path} failed: ${error instanceof Error ? error.message : String(error)}`,
         );
-      } finally {
-        clearTimeout(timer);
       }
+      if (response.status !== 429 && response.status < 500) {
+        return response;
+      }
+      lastStatus = response.status;
+      const retryAfter = Number(response.headers.get("retry-after"));
+      if (attempt === 1) {
+        firstRetryAfterSec = Number.isFinite(retryAfter) ? retryAfter : 0;
+      }
+      const global = response.headers.get("x-ratelimit-global") !== null;
+      const waitMs =
+        Number.isFinite(retryAfter) && retryAfter > 0
+          ? retryAfter * 1000
+          : 1000 * 2 ** (attempt - 1);
+      if (global) {
+        // Advance the client-wide deadline so every pooled request waits
+        // this out too, not just this one.
+        const cooldownMs = Math.max(waitMs, 30_000);
+        this.cooldownUntil = Math.max(
+          this.cooldownUntil,
+          Date.now() + cooldownMs,
+        );
+      }
+      // A long first cooldown (>30s) means the card is hot; retrying into it
+      // just extends it (observed live) — fail fast so the card is deferred
+      // to next tick instead of hammering.
+      if (attempt === 1 && firstRetryAfterSec > 30) {
+        break;
+      }
+      await sleep(
+        global ? Math.max(waitMs, 30_000) : Math.min(waitMs, 30_000),
+      );
     }
     throw new EscalateError(
       `discord ${method} ${path} failed after ${lastStatus === 0 ? "setup" : maxAttempts} attempts (last HTTP ${lastStatus}${firstRetryAfterSec > 0 ? `, retry-after ${firstRetryAfterSec}s` : ""})`,
@@ -245,27 +276,31 @@ export class EscalationDiscord {
    * decision must never be made on an unreliable read.
    */
   async messageExists(messageId: string): Promise<boolean> {
-    await this.waitForCooldown();
-    await this.throttle();
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 30_000);
+    const path = `/channels/${this.channelId}/messages/${messageId}`;
+    let response: Response;
     try {
-      const response = await fetch(
-        `${this.apiBase}/channels/${this.channelId}/messages/${messageId}`,
-        {
-          headers: { Authorization: `Bot ${this.token}` },
-          signal: controller.signal,
-        },
-      );
-      if (response.status === 404) return false;
-      // Every other status (2xx, 5xx, 401/403) is NOT a definitive delete —
-      // a repost decision must only be made on a certain 404.
-      return true;
+      response = await this.fetchOnce(path, { method: "GET" });
     } catch {
       return true; // transient read failure — do not repost on a guess
-    } finally {
-      clearTimeout(timer);
     }
+    if (response.status === 404) return false;
+    // A 5xx is transient — retry a couple of times before falling back to
+    // "assume it exists" (a repost must never be based on an unreliable
+    // read; a persistent 5xx is an outage, not a deletion).
+    if (response.status >= 500) {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        await sleep(500 * (attempt + 1));
+        try {
+          response = await this.fetchOnce(path, { method: "GET" });
+        } catch {
+          return true;
+        }
+        if (response.status === 404) return false;
+        if (response.status < 500) break;
+      }
+    }
+    // 2xx / 401 / 403 / persistent 5xx — NOT a definitive delete.
+    return true;
   }
 }
 
@@ -886,23 +921,42 @@ async function markAbsentCards(
    .join("\n");
   try {
    // The note lives where the card lives: if the card's destination moved
-   // to another channel, the note cannot be written there (no repost noise
-   // for an absent node) — but the reconciliation IS complete, so mark it
-   // noted. The card stays open (surfaced in the digest) until an operator
-   // verb resolves it; the scan stops retrying it every tick.
+   // to another channel, patch the note THERE (via a client for the recorded
+   // channel) so the old card stops looking actionable — the stale card
+   // otherwise remains an active-looking request forever. Set notedAt only
+   // after the patch succeeds (or a definitive 404 means the old card is
+   // already gone). A transient failure retries next tick.
    if (prior.channelId !== null && prior.channelId !== client.channel) {
+    try {
+     await client.forChannel(prior.channelId).edit(prior.messageId, content);
+    } catch (oldError) {
+     if (oldError instanceof DiscordMessageGoneError) {
+      // The old card is already gone — reconciliation complete.
+     } else {
+      return {
+       action: "error" as const,
+       id: nodeId,
+       error:
+        oldError instanceof Error
+         ? oldError.message
+         : String(oldError),
+      };
+     }
+    }
     journal.upsertEscalation({
      key: `${map.repo}:${nodeId}`,
      repo: map.repo,
      nodeId,
      title: prior.title,
+     lastContent: content,
      messageId: prior.messageId,
      channelId: prior.channelId,
      createdAt: prior.createdAt,
+     lastEditedAt: now.toISOString(),
      status: prior.status,
      notedAt: now.toISOString(),
     });
-    return { action: "unchanged" as const, id: nodeId };
+    return { action: "keptOpen" as const, id: nodeId };
    }
    await client.edit(prior.messageId, content);
    journal.upsertEscalation({
@@ -1164,6 +1218,9 @@ interface DigestInputs {
   cards: DigestCard[];
   /** total open cards (cards is capped at what the message can render). */
   openCount: number;
+  /** age-band counts over ALL open cards (the header must not under-report
+   *  an overdue card that falls outside the rendered ≤15 list). */
+  ageCounts: { aged: number; overdue: number };
   audit: AuditResult;
   budget: DigestMapResult["budget"];
   principal: string;
@@ -1172,14 +1229,12 @@ interface DigestInputs {
 }
 
 function digestContent(inputs: DigestInputs): string {
-  const { map, cards, openCount, audit, budget, principal, principalDiscordId, now } =
+  const { map, cards, openCount, ageCounts, audit, budget, principal, principalDiscordId, now } =
     inputs;
-  const aged = cards.filter((c) => ageBand(c.ageDays) !== "fresh"); // 3+
-  const overdue = cards.filter((c) => ageBand(c.ageDays) === "overdue"); // 7+
   const header = [
     `:newspaper: **ranger digest** — ${map.repo} (root ${map.root}, walk: ${map.walk}) · ${localDateKey(now)}`,
     "",
-    `**Cards: ${openCount}**${aged.length > 0 ? ` (${aged.length} aged 3+d, ${overdue.length} 7+d${principalDiscordId ? " @-mentioned" : " no ping"})` : ""}`,
+    `**Cards: ${openCount}**${ageCounts.aged > 0 ? ` (${ageCounts.aged} aged 3+d, ${ageCounts.overdue} 7+d${principalDiscordId ? " @-mentioned" : " no ping"})` : ""}`,
   ];
   const summarize = (items: string[], max: number): string => {
     if (items.length === 0) return "";
@@ -1290,6 +1345,7 @@ async function digestOneMap(
     // the total kept for the count line, so the daily read doesn't grow with
     // historical escalations (round-17 review).
     const openCards = journal.listOpenEscalations(map.repo, { limit: 15 });
+    const ageCounts = journal.openCardAgeCounts(map.repo, now);
     const open = openCards.rows.map((row) => ({
       nodeId: row.nodeId,
       title: row.title ?? `#${row.nodeId}`,
@@ -1301,7 +1357,8 @@ async function digestOneMap(
     const content = digestContent({
       map,
       cards: open,
-      openCount: openCards.total,
+      openCount: ageCounts.total,
+      ageCounts,
       audit,
       budget: base.budget,
       principal: config.principal.login,

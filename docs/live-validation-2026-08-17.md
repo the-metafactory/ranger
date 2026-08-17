@@ -41,12 +41,19 @@ host.
   and indexed by repo (0005). Each card's message id is also tracked per
   destination channel (`escalation_destinations`, 0006), so a map that moves
   A→B→A RECOVERS its original A message on return instead of posting a
-  duplicate (one card per node). A PATCH that 404s (legacy row or deleted
-  card) reposts fresh. Absent-card reconciliation is bounded by a `noted_at`
-  marker (drizzle 0007): a noted card drops out of the scan; closing
-  resolved cards (which shrinks the open set) is the write-side (node #21).
+  duplicate. During a move to a channel never visited before, a fresh card is
+  posted in the new channel while the old channel's card remains — two live
+  cards for one node until a return to the old channel recovers it. A PATCH
+  that 404s (legacy row or deleted card) reposts fresh. Absent-card
+  reconciliation is bounded by a `noted_at` marker (drizzle 0007): a noted
+  card drops out of the scan; closing resolved cards (which shrinks the open
+  set) is the write-side (node #21).
 - An unchanged same-day digest verifies its cached message still exists (GET)
-  and reposts if deleted — the daily summary never silently vanishes.
+  and reposts on a definitive 404. On a transient read failure (401/403/5xx,
+  timeout) it conservatively assumes the message exists — no repost on an
+  unreliable read — so recovery is best-effort, not guaranteed; a persistent
+  outage surfaces as "unchanged" until the cache row is cleared or content
+  changes.
 - Digests: `digest.the-metafactory/ranger` = `2026-08-17:1538840582615728139`,
   `digest.jcfischer/seekolous` = `2026-08-17:1538840628891230208` (same local
   day re-runs edit only when the digest content changed; otherwise no-op).

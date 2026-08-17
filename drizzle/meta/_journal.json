@@ -57,6 +57,13 @@
       "when": 1786984651850,
       "tag": "0007_escalation-noted-at",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1786986228796,
+      "tag": "0008_escalation-composite-indexes",
+      "breakpoints": true
     }
   ]
 }

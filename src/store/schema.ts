@@ -85,6 +85,15 @@ export const escalations = sqliteTable("escalations", {
 }, (table) => [
  // Repo-scoped escalation lookups (listEscalations) stay indexed as history grows.
  index("escalations_repo_idx").on(table.repo),
+ // Hot tick lookups: the active pass (repo+node_id batch) and the absent
+ // pass / digest (repo+status open, unreconciled) — composite so the
+ // synchronous per-tick queries don't scan every row of the repo.
+ index("escalations_repo_node_idx").on(table.repo, table.nodeId),
+ index("escalations_repo_status_noted_idx").on(
+  table.repo,
+  table.status,
+  table.notedAt,
+ ),
 ]);
 
 /**
