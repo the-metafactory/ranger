@@ -94,6 +94,13 @@ export const escalations = sqliteTable("escalations", {
   table.status,
   table.notedAt,
  ),
+ // The digest's oldest-first capped read (repo, status open, ordered by
+ // created_at) — without this it scans+sorts every open card per day.
+ index("escalations_repo_status_created_idx").on(
+  table.repo,
+  table.status,
+  table.createdAt,
+ ),
 ]);
 
 /**

@@ -411,10 +411,32 @@ export class Journal {
   */
   listOpenEscalations(
   repo: string,
+  now: Date,
   opts: { limit?: number } = {},
- ): { rows: EscalationRow[]; total: number } {
-  const countRow = this.db
-   .select({ n: sql<number>`count(*)` })
+ ): { rows: EscalationRow[]; total: number; aged: number; overdue: number } {
+  // ONE aggregate: total + aged (≥3 UTC days) + overdue (≥7 UTC days) over
+  // ALL open rows — the digest header must report the true counts even when
+  // an overdue card falls outside the rendered ≤15 list. UTC calendar-day
+  // cutoffs match dayDiff (a card created 23:59 yesterday is 1d old at
+  // 00:01 today; a rolling 72h window would exclude a card dayDiff shows as
+  // 3d).
+  const dayStart = (daysBack: number) =>
+   new Date(
+    Date.UTC(
+     now.getUTCFullYear(),
+     now.getUTCMonth(),
+     now.getUTCDate(),
+    ) -
+     daysBack * DAY_MS,
+   ).toISOString();
+  const agedAt = dayStart(3);
+  const overdueAt = dayStart(7);
+  const agg = this.db
+   .select({
+    total: sql<number>`count(*)`,
+    aged: sql<number>`sum(case when ${escalations.createdAt} <= ${agedAt} then 1 else 0 end)`,
+    overdue: sql<number>`sum(case when ${escalations.createdAt} <= ${overdueAt} then 1 else 0 end)`,
+   })
    .from(escalations)
    .where(and(eq(escalations.repo, repo), eq(escalations.status, "open")))
    .get();
@@ -429,47 +451,9 @@ export class Journal {
    .sync();
   return {
    rows: rows.map(hydrateEscalation),
-   total: Number(countRow?.n ?? 0),
-  };
- }
-
- /**
-  * Open-card age aggregates over ALL rows (not just the capped display):
-  * total, aged (≥3d), overdue (≥7d) — the digest header must report the
-  * true counts even when an overdue card falls outside the ≤15 rendered
-  * list (round-18 review).
-  */
- openCardAgeCounts(
-  repo: string,
-  now: Date,
- ): { total: number; aged: number; overdue: number } {
-  // UTC calendar-day cutoffs — matching dayDiff, which counts whole UTC days
-  // (a card created at 23:59 yesterday is 1d old at 00:01 today). A rolling
-  // 72h window would exclude a card that dayDiff already shows as 3d.
-  const dayStart = (daysBack: number) =>
-   new Date(
-    Date.UTC(
-     now.getUTCFullYear(),
-     now.getUTCMonth(),
-     now.getUTCDate(),
-    ) -
-     daysBack * DAY_MS,
-   ).toISOString();
-  const agedAt = dayStart(3);
-  const overdueAt = dayStart(7);
-  const row = this.db
-   .select({
-    total: sql<number>`count(*)`,
-    aged: sql<number>`sum(case when ${escalations.createdAt} <= ${agedAt} then 1 else 0 end)`,
-    overdue: sql<number>`sum(case when ${escalations.createdAt} <= ${overdueAt} then 1 else 0 end)`,
-   })
-   .from(escalations)
-   .where(and(eq(escalations.repo, repo), eq(escalations.status, "open")))
-   .get();
-  return {
-   total: Number(row?.total ?? 0),
-   aged: Number(row?.aged ?? 0),
-   overdue: Number(row?.overdue ?? 0),
+   total: Number(agg?.total ?? 0),
+   aged: Number(agg?.aged ?? 0),
+   overdue: Number(agg?.overdue ?? 0),
   };
  }
 

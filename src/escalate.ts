@@ -452,8 +452,10 @@ function cardContent(
   // give it the room the rest of the card leaves up to Discord's 2000-char
   // message cap (an arbitrary small cap would drop options sooner). Discord
   // physically caps the card, so a body longer than the room left is
-  // truncated with an explicit `…` — never silently — and the full body is
-  // always one click away at the `url:` line below.
+  // truncated with an explicit `…` — never silently. The `url:` line is the
+  // graph node's reference: whether it renders the full body is the graph
+  // surface's job, not ranger's — ranger does not claim the link restores
+  // truncated options.
   const bodyBudget =
     bodyText === null
       ? 0
@@ -604,27 +606,51 @@ function tryAcquireLock(lockFile: string, owner: string): boolean {
  *  catches the PID-reuse case a PID check cannot: a dead process's lock whose
  *  pid got recycled by an unrelated, still-alive process would otherwise look
  *  live forever and strand the desk (every tick times out, no cards/digests). */
+/** Lease expiry (and heartbeat interval) for the announce-once lock — see
+ *  `withEscalateLock`. A holder renews its lease while running, so a live run
+ *  is NEVER stale, while a dead/crashed/recycled-pid holder's lease expires
+ *  and the lock becomes safely reclaimable. */
+const LOCK_LEASE_MS = 60_000;
+/** Legacy locks (pre-lease, or the reclaim marker) fall back to age. */
 const LOCK_STALE_MS = 30 * 60 * 1000;
+/** The reclaim marker is held for microseconds — any marker this old is a
+ *  crash artifact (immediate cleanup on a dead pid, plus this age arm for
+ *  the recycled-pid case). */
+const MARKER_STALE_MS = 60_000;
 
 /**
- * Is the lock's owner provably gone? True when its recorded pid is dead
- * (ESRCH) OR the lock is older than LOCK_STALE_MS (a recycled-pid lock, or a
- * stuck/alive-after-death run). A live run's fresh lock is never reclaimed.
+ * Is the lock's owner provably gone? For a LEASED lock: true when its
+ * `leaseUntil` has passed — a live run renews the lease, so an expired lease
+ * means the holder died, crashed, or its pid got recycled (no heartbeat). For
+ * legacy/marker locks: true when the recorded pid is dead (ESRCH) OR the
+ * lock is older than `maxAgeMs`. A live, renewing run is never reclaimed.
  * Never reclaim on an unreadable owner — stealing a live run's lock breaks
- * announce-once. Residual edge, documented: a machine suspended >30min
- * mid-run can have its lock age-reclaimed on wake — worst case is one visible
- * duplicate card (recoverable), never a permanent outage.
+ * announce-once.
  */
-function lockOwnerStale(lockFile: string): boolean {
+function lockOwnerStale(
+  lockFile: string,
+  maxAgeMs: number = LOCK_STALE_MS,
+): boolean {
   try {
     const prior = JSON.parse(readFileSync(lockFile, "utf8")) as {
       pid?: number;
       startedAt?: number;
       at?: number;
+      leaseUntil?: number;
     };
     if (typeof prior.pid !== "number") return false;
+    // Leased lock: an expired lease is a definitive signal the holder is gone
+    // (its heartbeat stopped). This is what makes PID-reuse reclaimable while
+    // never touching a live run's renewed lock.
+    if (
+      typeof prior.leaseUntil === "number" &&
+      prior.leaseUntil < Date.now()
+    ) {
+      return true;
+    }
+    // Legacy / marker fallback: dead pid OR old enough to be a crash.
     const stamp = prior.startedAt ?? prior.at;
-    if (typeof stamp === "number" && Date.now() - stamp > LOCK_STALE_MS) {
+    if (typeof stamp === "number" && Date.now() - stamp > maxAgeMs) {
       return true;
     }
     try {
@@ -685,7 +711,7 @@ function reclaimDeadLock(
       // Someone holds the marker. If its owner is provably stale (dead pid
       // or old enough to be a crashed reclaim), remove it and retry —
       // otherwise a live holder is mid-reclaim and we wait.
-      if (!lockOwnerStale(reclaimMarker) || attempt >= 2) {
+      if (!lockOwnerStale(reclaimMarker, MARKER_STALE_MS) || attempt >= 2) {
         return "busy";
       }
       try {
@@ -722,7 +748,18 @@ async function withEscalateLock<T>(
   const reclaimMarker = `${lockFile}.reclaiming`;
   const started = Date.now();
   const timeoutMs = 60_000;
-  const owner = JSON.stringify({ pid: process.pid, startedAt: Date.now() });
+  // The lock carries a LEASE: while we hold it, a heartbeat renews
+  // `leaseUntil` every half-lease, so a live run is never stale (no other run
+  // can steal its lock) yet a dead/crashed/recycled-pid holder's lease
+  // expires and the lock becomes safely reclaimable on the next tick.
+  const lockStartedAt = Date.now();
+  const leaseOwner = () =>
+   JSON.stringify({
+    pid: process.pid,
+    startedAt: lockStartedAt,
+    leaseUntil: Date.now() + LOCK_LEASE_MS,
+   });
+  const owner = leaseOwner();
   for (;;) {
     if (tryAcquireLock(lockFile, owner)) break;
     if (lockOwnerStale(lockFile)) {
@@ -738,9 +775,19 @@ async function withEscalateLock<T>(
     }
     await sleep(250);
   }
+  // Heartbeat: renew the lease while the run is live so a long (or paused)
+  // run is never reclaimed by an expired lease.
+  const heartbeat = setInterval(() => {
+   try {
+    writeFileSync(lockFile, leaseOwner());
+   } catch {
+    /* lock released — nothing to renew */
+   }
+  }, LOCK_LEASE_MS / 2);
   try {
     return await fn();
   } finally {
+    clearInterval(heartbeat);
     try {
       rmSync(lockFile, { force: true });
       rmSync(reclaimMarker, { force: true });
@@ -1314,7 +1361,10 @@ function digestContent(inputs: DigestInputs): string {
       cardLines.push(line);
       shown++;
     }
-    const skipped = cards.length - shown;
+    // skipped counts against the TRUE total (openCount), not the capped
+    // query's length — with 16+ open cards the query returns 15 but the
+    // remainder must still be reported (round-20 review).
+    const skipped = openCount - shown;
     if (skipped > 0) {
       cardLines.push(
         `  … and ${skipped} more open cards (full list in the thread)`,
@@ -1367,11 +1417,12 @@ async function digestOneMap(
 
   try {
     const audit = await graphAudit(map.repo, map.root, token);
-    // Open cards only — and capped to what the digest renders (≤15), with
-    // the total kept for the count line, so the daily read doesn't grow with
-    // historical escalations (round-17 review).
-    const openCards = journal.listOpenEscalations(map.repo, { limit: 15 });
-    const ageCounts = journal.openCardAgeCounts(map.repo, now);
+    // Open cards only — capped to what the digest renders (≤15), with the
+    // total + age aggregates from the same query, so the daily read doesn't
+    // grow with historical escalations (round-17/20 reviews).
+    const openCards = journal.listOpenEscalations(map.repo, now, {
+      limit: 15,
+    });
     const open = openCards.rows.map((row) => ({
       nodeId: row.nodeId,
       title: row.title ?? `#${row.nodeId}`,
@@ -1383,8 +1434,8 @@ async function digestOneMap(
     const content = digestContent({
       map,
       cards: open,
-      openCount: ageCounts.total,
-      ageCounts,
+      openCount: openCards.total,
+      ageCounts: openCards,
       audit,
       budget: base.budget,
       principal: config.principal.login,

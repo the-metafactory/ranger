@@ -468,14 +468,16 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
 
       // The dead process's pid got reused by an unrelated ALIVE process (here:
       // the test runner) — a PID-only check would treat this lock as live
-      // forever and strand the desk (every tick times out). The startedAt is
-      // older than LOCK_STALE_MS, so the age arm reclaims it.
+      // forever and strand the desk (every tick times out). The lease has
+      // EXPIRED (no heartbeat from the dead original holder), so it is
+      // safely reclaimable — while a live run's renewed lease is never.
       const lockFile = join(dir, ".escalate.lock");
       writeFileSync(
         lockFile,
         JSON.stringify({
           pid: process.pid, // alive right now — kill(pid, 0) succeeds
-          startedAt: Date.now() - 40 * 60 * 1000, // > 30min stale
+          startedAt: Date.now() - 40 * 60 * 1000,
+          leaseUntil: Date.now() - 1000, // expired lease
         }),
       );
 

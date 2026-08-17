@@ -87,8 +87,12 @@ can observe):
   record; a duplicate is the recoverable consequence, not corruption.
 - The reclaim path is crash-safe for the common crash: a run that dies while
   holding the lock (or the `.reclaiming` marker) is cleaned up on the next
-  run — a dead-owner marker is removed before reclaim, and the main lock is
-  deleted only after re-validating its owner is still dead. One residual
+  run. The main lock carries a LEASE renewed by a heartbeat while the run is
+  live — a dead/crashed/recycled-pid holder's lease expires (60s) and the
+  lock is reclaimable on the next tick, while a live run's renewed lock is
+  never stolen. The reclaim marker is removed only when its owner is dead or
+  its age proves it a crash artifact; the main lock is deleted only after
+  re-validating its owner is still stale. One residual
   window remains, disclosed honestly: if a process dies mid-reclaim at the
   exact instant another run re-creates the marker, a stale-cleanup could
   unlink a just-created marker and, under a pathological ≥3-contender
