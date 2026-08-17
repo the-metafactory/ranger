@@ -113,15 +113,22 @@ if verb == "close":
         print(f"fake soma: close --resolution-file {resolution_file} not readable", file=sys.stderr)
         sys.exit(1)
     bare = os.environ.get("FAKE_SOMA_REPO_DIR", "")
+    # Faithful to the real gate (DD-16 Amendment A containment): an ungated
+    # git-ref-exists probe resolves against the close runner's cwd — the probe
+    # tree is bounded to that tree. The findings branch lives in the canonical
+    # checkout (a linked worktree's branch is a ref there), so the close must
+    # run FROM the canonical checkout. Record the cwd so the test can assert it.
+    probe_cwd = os.getcwd()
+    s["lastCloseCwd"] = probe_cwd
     for probe in node.get("probes", []):
         if probe.get("type") == "git-ref-exists" and probe.get("ref"):
             ref = probe["ref"]
             ok = subprocess.run(
-                ["git", "--git-dir", bare, "rev-parse", "--verify", "--quiet", f"refs/heads/{ref}"],
+                ["git", "-C", probe_cwd, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
                 capture_output=True,
             ).returncode == 0
             if not ok:
-                print(f"Close refused for node {nid}: probe git-ref-exists '{ref}' failed — branch not found.", file=sys.stderr)
+                print(f"Close refused for node {nid}: probe git-ref-exists '{ref}' failed — {ref} does not resolve in {probe_cwd}.", file=sys.stderr)
                 sys.exit(1)
     node["status"] = "closed"
     s.setdefault("decisions", []).append({

@@ -143,10 +143,22 @@ export async function bootstrapWorktree(
    return dir; // adopt — a crashed worker's worktree is reused (design §7).
   }
   const branch = worktreeBranch(nodeId, slug);
-  const result = await runGit(
-   ["worktree", "add", dir, "-b", branch, "origin/main"],
-   { cwd: canonical, env: gitAuthEnv(token), timeoutMs: 60_000 },
+  // The branch can already exist without a worktree — orphaned after a pruned
+  // worktree or a prior run — and `-b` would fail on it. Add the worktree from
+  // the existing branch instead (adopt semantics). Found live on node #19.
+  const existing = await runGit(
+   ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`],
+   { cwd: canonical, timeoutMs: 10_000 },
   );
+  const args =
+   existing.code === 0
+    ? ["worktree", "add", dir, branch]
+    : ["worktree", "add", dir, "-b", branch, "origin/main"];
+  const result = await runGit(args, {
+   cwd: canonical,
+   env: gitAuthEnv(token),
+   timeoutMs: 60_000,
+  });
   if (result.code !== 0) {
    throw new Error(
     `cannot add worktree for node ${nodeId} (exit ${result.code}): ${result.stderr.trim()}`,
@@ -282,15 +294,31 @@ export async function runNode(nodeId: string, ctx: RunNodeContext): Promise<RunN
   const resolutionFile = join(tmpdir(), `ranger-close-${nodeId}.md`);
   writeFileSync(resolutionFile, resolution, "utf8");
 
-  const close = await graphClose(repo, nodeId, botIdentity, token, {
-   resolutionFile,
-   gist: gistFrom(resolution),
-   checkpointId: node.node.checkpointId,
-  });
+  // The close gate's ungated probes (git-ref-exists / artifact-exists) resolve
+  // against the close runner's cwd — the probe tree is bounded to that tree
+  // (DD-16 Amendment A containment). The findings branch lives in the canonical
+  // checkout (a linked worktree's branch is a ref there), so the close must run
+  // FROM the canonical checkout, not this supervisor's cwd. Found live on node
+  // #19: the first close was refused because the probe resolved against the
+  // walk's working tree. Design §4 / node #9: probes run in the canonical
+  // checkout.
+  const probeCwd = canonical;
+  const close = await graphClose(
+   repo,
+   nodeId,
+   botIdentity,
+   token,
+   {
+    resolutionFile,
+    gist: gistFrom(resolution),
+    checkpointId: node.node.checkpointId,
+   },
+   { cwd: probeCwd },
+  );
 
   if (close.closed) {
    journal.recordEvent("closed", { nodeId, repo, detail: close.detail.slice(0, 400) });
-   await graphDecisions(repo, String(map.root), token);
+   await graphDecisions(repo, String(map.root), token, { cwd: probeCwd });
    journal.recordEvent("decisions-written", { nodeId, repo, detail: "decisions --write after confirmed close" });
    journal.upsertWorker({
     nodeId,

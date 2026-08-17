@@ -1,17 +1,12 @@
  import { describe, expect, test } from "bun:test";
-import {
- mkdirSync,
- mkdtempSync,
- readFileSync,
- rmSync,
- writeFileSync,
-} from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCmd } from "../src/exec.ts";
 import { Journal } from "../src/journal.ts";
 import { classify, loadProbeRegistry, type ClassifiedNode } from "../src/route.ts";
 import { researchCandidates } from "../src/walk.ts";
+import { bootstrapWorktree } from "../src/worker.ts";
 import type { FrontierEntry } from "../src/graph.ts";
 
 const fixturesBin = join(import.meta.dir, "fixtures", "bin");
@@ -263,6 +258,12 @@ describe("ranger run-node — research worker full loop (node #13 acceptance)", 
    expect(state.decisions[0].id).toBe("10");
    expect(state.decisions[0].closedBy).toBe("ivy-bot");
 
+   // The close ran FROM the canonical checkout (design §4 / node #9: probes
+   // resolve in the canonical checkout, never the supervisor's cwd). Found
+   // live on node #19 — the first close was refused because the git-ref-exists
+   // probe resolved against the walk's working tree instead.
+   expect(state.lastCloseCwd).toBe(realpathSync(canonical));
+
    // The journal records the loop.
    const journal = new Journal(join(dir, "state.sqlite"));
    const kinds = journal.listEvents("acme/widgets").map((e) => e.kind);
@@ -398,5 +399,71 @@ describe("researchCandidates — lane selection (design §3)", () => {
   );
   const candidates = researchCandidates(classified);
   expect(candidates.map((c) => c.id)).toEqual(["10"]);
+ });
+});
+
+describe("bootstrapWorktree — orphaned branch (node #19 live finding)", () => {
+ test("creates the worktree when the worktree branch already exists (no `-b` failure)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ranger-wt-"));
+  try {
+   const seed = join(dir, "seed");
+   mkdirSync(seed, { recursive: true });
+   writeFileSync(join(seed, "README.md"), "# acme/widgets\n");
+   await runCmd("git", ["init", "-b", "main"], {
+    cwd: seed,
+    env: { ...process.env, ...GIT_ENV },
+   });
+   await runCmd("git", ["add", "-A"], {
+    cwd: seed,
+    env: { ...process.env, ...GIT_ENV },
+   });
+   await runCmd("git", ["commit", "-m", "initial"], {
+    cwd: seed,
+    env: { ...process.env, ...GIT_ENV },
+   });
+   const origin = join(dir, "origin.git");
+   await runCmd("git", ["clone", "--bare", seed, origin], {
+    cwd: dir,
+    env: { ...process.env, ...GIT_ENV },
+   });
+   const canonical = join(dir, "canonical");
+   await runCmd("git", ["clone", origin, canonical], {
+    cwd: dir,
+    env: { ...process.env, ...GIT_ENV },
+   });
+
+   // Orphan the branch: create `node/10-test-node` but never attach a worktree
+   // to it (the crash + prune case — the ref outlives its worktree).
+   await runCmd("git", ["checkout", "-b", "node/10-test-node"], {
+    cwd: canonical,
+    env: { ...process.env, ...GIT_ENV },
+   });
+   await runCmd("git", ["checkout", "main"], {
+    cwd: canonical,
+    env: { ...process.env, ...GIT_ENV },
+   });
+
+   // Pre-fix this failed: `worktree add -b node/10-test-node` → "fatal: a
+   // branch named 'node/10-test-node' already exists".
+   const worktree = await bootstrapWorktree(
+    canonical,
+    "10",
+    "test-node",
+    "ghp_write",
+   );
+   expect(worktree).toBe(join(canonical, ".worktrees", "node-10"));
+   const onBranch = await runCmd(
+    "git",
+    ["-C", worktree, "branch", "--show-current"],
+    { env: { ...process.env, ...GIT_ENV } },
+   );
+   expect(onBranch.stdout.trim()).toBe("node/10-test-node");
+   await runCmd("git", ["worktree", "remove", "--force", worktree], {
+    cwd: canonical,
+    env: { ...process.env, ...GIT_ENV },
+   });
+  } finally {
+   rmSync(dir, { recursive: true, force: true });
+  }
  });
 });
