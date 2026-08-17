@@ -291,9 +291,8 @@ function renderEscalateText(result: EscalateResult | DigestResult): string {
    lines.push(`map: ${map.repo}`, `  ✗ FAILED — ${map.error}`, "");
    continue;
   }
-  if ("cards" in map && "receiptLessCloses" in map && "budget" in map) {
-   // digest map
-   const d = map as DigestResult["maps"][number];
+  if (map.kind === "digest") {
+   const d = map;
    lines.push(
     `map: ${map.repo} (digest ${d.posted ? "posted" : "edited"} ${d.digestMessageId})`,
    );
@@ -304,7 +303,7 @@ function renderEscalateText(result: EscalateResult | DigestResult): string {
     `  audit: receipt-less ${d.receiptLessCloses.length}${d.receiptLessCloses.length ? ` ${d.receiptLessCloses.join(",")}` : ""} · stale ${d.openClaims.length} · budget ${d.budget.spawnsToday}/${d.budget.spawnCapPerDay}${d.budget.paused ? " PAUSED" : ""}`,
    );
   } else {
-   const e = map as EscalateResult["maps"][number];
+   const e = map;
    lines.push(`map: ${map.repo}`);
    lines.push(
     `  posted: ${e.posted.length ? e.posted.map((n) => `#${n}`).join(", ") : "—"}`,

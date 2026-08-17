@@ -83,7 +83,13 @@ export class DiscordAnnouncer implements Announcer {
       Authorization: `Bot ${this.token}`,
       "Content-Type": "application/json",
      },
-     body: JSON.stringify({ content }),
+     body: JSON.stringify({
+      content,
+      // parse: [] suppresses untrusted @everyone/@here/role mentions — a
+      // frontier node titled `@everyone` must not ping the channel when
+      // claimed (review fix, mirrors the escalation client).
+      allowed_mentions: { parse: [] },
+     }),
     },
    );
   } catch (error) {
@@ -107,7 +113,7 @@ export class DiscordAnnouncer implements Announcer {
 }
 
 /** In-memory announcer for tests: records posts, optionally fails. */
-export class RecordingAnnouncer implements Announcer {
+class RecordingAnnouncer implements Announcer {
  posts: { ctx: AnnounceContext; messageId: string }[] = [];
  private readonly fail: boolean;
 

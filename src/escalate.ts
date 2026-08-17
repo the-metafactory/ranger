@@ -1,9 +1,4 @@
-import {
-  readFileSync,
-  renameSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import { resolveDiscordApiBase } from "./discord.ts";
@@ -281,11 +276,16 @@ function cardContent(
     node.route.route === "provisioning" && node.blockedProbes !== undefined
       ? [
           "register these in the probe registry (run + cwd must match exactly):",
-          ...node.blockedProbes.map((p) =>
-            p.type === "command"
-              ? `  · command: run \`${p.run}\` · cwd \`${p.cwd}\``
-              : `  · url host: \`${p.host}\` (target \`${p.target}\`)`,
-          ),
+          ...node.blockedProbes
+            .slice(0, 6)
+            .map((p) =>
+              p.type === "command"
+                ? `  · command: run \`${p.run}\` · cwd \`${p.cwd}\``
+                : `  · url host: \`${p.host}\` (target \`${p.target}\`)`,
+            ),
+          ...(node.blockedProbes.length > 6
+            ? [`  · … and ${node.blockedProbes.length - 6} more probes`]
+            : []),
         ]
       : [];
   const bodyLine =
@@ -306,7 +306,9 @@ function cardContent(
     ...probeLines,
     ageSuffix(ageDays, principal, principalDiscordId),
   ].filter((line): line is string => line !== null);
-  return lines.join("\n");
+  // Discord rejects >2000-char messages; hard-cap as a final guard.
+  const joined = lines.join("\n");
+  return joined.length > 1950 ? `${joined.slice(0, 1949)}…` : joined;
 }
 
 // ---- the cards run ----
@@ -328,6 +330,8 @@ interface EscalationCard {
 
 interface EscalateMapResult {
   repo: string;
+  /** discriminates cards-pass results from digest results in renderers. */
+  kind: "cards";
   ok: boolean;
   error?: string;
   /** Node ids whose card was posted fresh (announce-once). */
@@ -411,6 +415,7 @@ async function withEscalateLock<T>(
   fn: () => Promise<T>,
 ): Promise<T> {
   const lockFile = join(dirname(journal.path), ".escalate.lock");
+  const reclaimMarker = `${lockFile}.reclaiming`;
   const started = Date.now();
   const timeoutMs = 60_000;
   const owner = JSON.stringify({ pid: process.pid, startedAt: Date.now() });
@@ -445,38 +450,46 @@ async function withEscalateLock<T>(
         reclaimable = false;
       }
       if (reclaimable) {
-        // Atomically replace the dead lock via rename (rename replaces the
-        // target in one step) — never delete-then-recreate, which lets two
-        // reclaims delete each other's freshly-acquired lock and both POST.
-        const tmp = join(
-          dirname(lockFile),
-          `.escalate.lock.${process.pid}.tmp`,
-        );
-        writeFileSync(tmp, owner);
+        // Reclaim EXCLUSIVELY: the reclaim marker is itself created atomically
+        // (wx), so only one process can hold it and remove+re-acquire the dead
+        // lock. Two contenders cannot both observe the dead owner and both
+        // proceed — the marker serializes the reclaim (rename+verify is not
+        // exclusive: a later contender renames over and both pass the verify).
         try {
-          renameSync(tmp, lockFile);
-        } catch {
+          writeFileSync(
+            reclaimMarker,
+            JSON.stringify({ pid: process.pid, at: Date.now() }),
+            { flag: "wx" },
+          );
+        } catch (markerError) {
+          if (
+            (markerError as NodeJS.ErrnoException).code !== "EEXIST"
+          ) {
+            throw markerError;
+          }
+          // Another process is mid-reclaim — wait and re-check.
+          if (Date.now() - started > timeoutMs) {
+            throw new EscalateError(
+              `another escalate run is reclaiming the lock (${reclaimMarker}) — ` +
+                "refusing to risk duplicate cards",
+            );
+          }
+          await sleep(250);
+          continue;
+        }
+        try {
+          // We hold the marker: remove the dead lock and re-acquire. No other
+          // process can be in this section (they hold no marker).
+          rmSync(lockFile, { force: true });
+          writeFileSync(lockFile, owner, { flag: "wx" });
+          break; // acquired
+        } finally {
           try {
-            rmSync(tmp, { force: true });
+            rmSync(reclaimMarker, { force: true });
           } catch {
             /* best-effort */
           }
-          continue; // concurrent rename — keep waiting
         }
-        // Verify we actually hold it: a racing reclaim may have renamed over
-        // ours in the same instant — the loser waits instead of proceeding, so
-        // exactly one reclaiming process takes the lock (no duplicate cards).
-        let mine = false;
-        try {
-          const after = JSON.parse(readFileSync(lockFile, "utf8")) as {
-            pid?: number;
-          };
-          mine = after.pid === process.pid;
-        } catch {
-          mine = false;
-        }
-        if (mine) break; // we hold the lock
-        continue;
       }
       if (Date.now() - started > timeoutMs) {
         throw new EscalateError(
@@ -492,6 +505,7 @@ async function withEscalateLock<T>(
   } finally {
     try {
       rmSync(lockFile, { force: true });
+      rmSync(reclaimMarker, { force: true });
     } catch {
       /* best-effort release */
     }
@@ -626,6 +640,7 @@ async function escalateOneMap(
 ): Promise<EscalateMapResult> {
   const base: EscalateMapResult = {
     repo: map.repo,
+    kind: "cards",
     ok: true,
     posted: [],
     edited: [],
@@ -806,6 +821,8 @@ interface DigestCard {
 
 interface DigestMapResult {
   repo: string;
+  /** discriminates digest results from cards-pass results in renderers. */
+  kind: "digest";
   ok: boolean;
   error?: string;
   cards: DigestCard[];
@@ -850,7 +867,8 @@ function digestContent(inputs: DigestInputs): string {
   if (cards.length === 0) {
     lines.push("  none open — clean");
   } else {
-    for (const card of cards) {
+    // Cap the per-message card list — Discord rejects >2000-char payloads.
+    for (const card of cards.slice(0, 15)) {
       const band = ageBand(card.ageDays);
       lines.push(
         `  #${card.nodeId} ${card.title} — ${card.route} · ${ageText(
@@ -860,6 +878,9 @@ function digestContent(inputs: DigestInputs): string {
           principalDiscordId,
         )}`,
       );
+    }
+    if (cards.length > 15) {
+      lines.push(`  … and ${cards.length - 15} more open cards (full list in the thread)`);
     }
   }
   lines.push("");
@@ -885,6 +906,7 @@ async function digestOneMap(
 ): Promise<DigestMapResult> {
   const base: DigestMapResult = {
     repo: map.repo,
+    kind: "digest",
     ok: true,
     cards: [],
     receiptLessCloses: [],
