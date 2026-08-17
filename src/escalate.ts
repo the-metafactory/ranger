@@ -38,6 +38,14 @@ class DiscordMessageGoneError extends EscalateError {
 
 // ---- Discord card client (POST announce / PATCH edit) ----
 
+/**
+ * Cap on any client-wide Discord cooldown (a global 429's Retry-After): a
+ * long retry must not hold the tick — and hence the walk lane — indefinitely
+ * (round-26 review). After the cap the client resumes and retries, and the
+ * attempt budget defers the card rather than sleeping the whole cooldown.
+ */
+const MAX_COOLDOWN_MS = 30_000;
+
 export class EscalationDiscord {
   /**
    * Minimum spacing between API calls from one client — Discord throttles
@@ -193,11 +201,16 @@ export class EscalationDiscord {
           : 1000 * 2 ** (attempt - 1);
       if (global) {
         // Advance the client-wide deadline so every pooled request waits
-        // this out too, not just this one.
+        // this out too, not just this one. CAPPED at MAX_COOLDOWN_MS: an
+        // arbitrary Retry-After (Discord can return minutes-to-an-hour) must
+        // not hold the tick — and hence the walk lane — for that long
+        // (round-26 review: "escalation never blocks walking"). After the
+        // cap the request resumes, likely 429s again, and the attempt budget
+        // eventually defers the card rather than sleeping the whole cooldown.
         const cooldownMs = Math.max(waitMs, 30_000);
-        this.cooldownUntil = Math.max(
-          this.cooldownUntil,
-          Date.now() + cooldownMs,
+        this.cooldownUntil = Math.min(
+          Math.max(this.cooldownUntil, Date.now() + cooldownMs),
+          Date.now() + MAX_COOLDOWN_MS,
         );
       }
       // A long first cooldown (>30s) means the card is hot; retrying into it
@@ -919,14 +932,22 @@ type SyncOutcome =
   | { action: "error"; id: string; error: string };
 
 /**
- * Shared per-map budget of Discord requests (posts + edits) for one tick —
- * bounds the pass so a large frontier can't starve `walk`. Charged only when
- * syncCard actually hits the API; unchanged no-ops are free; deferred cards
- * stay unsynced and are served next tick.
+ * Shared per-map budget of card operations for one tick — bounds the pass so
+ * a large frontier can't starve `walk`. `remaining` caps logical Discord
+ * requests (unchanged no-ops are free); `deadline` caps WALL TIME so a
+ * rate-limited/cooldown-bound tick defers the rest instead of holding the
+ * walk lane (round-26 review). Deferred cards stay unsynced and are served
+ * next tick.
  */
 interface CardBudget {
   remaining: number;
+  deadline: number;
 }
+
+/** One pass's wall-clock budget: after this the pass defers remaining cards
+ *  and returns, so the escalation lane never blocks the walk lane (the tick
+ *  awaits escalateMaps before walk). */
+const MAX_PASS_MS = 120_000;
 
 async function syncCard(
   ctx: {
@@ -1136,25 +1157,16 @@ async function markAbsentCards(
   // Cap the LOAD to the remaining request budget (oldest exits first): each
   // card needs ≥1 destination edit, so loading more than the budget could
   // never be fully processed this tick — and a large drain must not walk
-  // every unnoted card after the budget is spent (round-23 review).
-  const openCards = journal.listUnreconciledOpen(map.repo, neededIds, {
+  // every unnoted card after the budget is spent (round-23 review). The SQL
+  // NOT IN exclusion is capped too (bind limit); JS-filtering against the
+  // FULL needed set here preserves correctness at any frontier size — a
+  // needed card that slipped past the truncated exclusion is never treated
+  // as absent (round-26 review).
+  let openCards = journal.listUnreconciledOpen(map.repo, neededIds, {
     limit: Math.max(budget.remaining, 0),
   });
-  // One throttled client per channel: moved-channel edits share a limiter
-  // instead of each card building its own and bursting the 5-writes/5s
-  // bucket. Seed with the pass's own client so the current channel reuses
-  // its state.
-  const clients = new Map<string, EscalationDiscord>([
-    [client.channel, client],
-  ]);
-  const clientFor = (channelId: string): EscalationDiscord => {
-    let c = clients.get(channelId);
-    if (c === undefined) {
-      c = client.forChannel(channelId);
-      clients.set(channelId, c);
-    }
-    return c;
-  };
+  openCards = openCards.filter((row) => !neededIds.has(row.nodeId));
+  const clientFor = channelClientFor(client);
   const outcomes = await mapPool(openCards, 3, async (prior) => {
     const nodeId = prior.nodeId;
     const content = queueExitContent(nodeId, prior.title, map.repo);
@@ -1237,12 +1249,34 @@ async function markAbsentCards(
   return { keptOpen, deferred, errors };
 }
 
+/** One throttled client per channel, shared by a pass — edits to OTHER
+ *  channels (a moved card's "left the channel" note, absent-card queue-exit
+ *  notes) share a limiter instead of each card building its own and bursting
+ *  the rate-limit bucket. Seeded with the pass's own client so the current
+ *  channel reuses its state (round-26: single source for both paths). */
+function channelClientFor(
+  client: EscalationDiscord,
+): (channelId: string) => EscalationDiscord {
+  const clients = new Map<string, EscalationDiscord>([
+    [client.channel, client],
+  ]);
+  return (channelId: string): EscalationDiscord => {
+    let c = clients.get(channelId);
+    if (c === undefined) {
+      c = client.forChannel(channelId);
+      clients.set(channelId, c);
+    }
+    return c;
+  };
+}
+
 /** Charge one Discord-request slot from the shared tick budget. Returns false
  *  when the budget is exhausted — the caller defers (the card stays open and
  *  unsynced) and serves it next tick, rather than holding this pass past the
  *  walk interval. Shared by the active-card pass and the absent-card
  *  reconciliation so the per-tick request bound is one budget across both. */
 function charge(budget: CardBudget): boolean {
+  if (Date.now() > budget.deadline) return false; // pass deadline — defer
   if (budget.remaining <= 0) return false;
   budget.remaining -= 1;
   return true;
@@ -1399,7 +1433,10 @@ async function escalateOneMap(
     //     limit) and the render+decision walk, and nothing starves: the
     //     cursor advances each tick, so every needed node is eventually
     //     evaluated, and fresh cards (no row) within the page go first.
-    const budget = { remaining: MAX_CARDS_PER_TICK };
+    const budget = {
+      remaining: MAX_CARDS_PER_TICK,
+      deadline: Date.now() + MAX_PASS_MS,
+    };
     const cursorKey = `escalate.cursor.${map.repo}`;
     const sorted = [...needed].sort((a, b) => a.id.localeCompare(b.id));
     const pageSize = MAX_CARDS_PER_TICK * 2;
@@ -1436,21 +1473,7 @@ async function escalateOneMap(
       .concat(page.filter((n) => existing.has(n.id)));
 
     const cards: EscalationCard[] = [];
-    // One throttled client per channel, shared by the active pass (a moved
-    // card's "left the channel" note goes to the prior channel) — edits to
-    // other channels share a limiter instead of each card building its own
-    // and bursting the rate-limit bucket.
-    const clients = new Map<string, EscalationDiscord>([
-      [client.channel, client],
-    ]);
-    const clientFor = (channelId: string): EscalationDiscord => {
-      let c = clients.get(channelId);
-      if (c === undefined) {
-        c = client.forChannel(channelId);
-        clients.set(channelId, c);
-      }
-      return c;
-    };
+    const clientFor = channelClientFor(client);
     const outcomes = await mapPool(pageOrder, 3, (node) =>
       syncCard(
         { client, clientFor, journal, map, config, now, budget },
@@ -1581,15 +1604,23 @@ function digestContent(inputs: DigestInputs): string {
   ];
   const summarize = (items: string[], max: number): string => {
     if (items.length === 0) return "";
-    const head = items.slice(0, max).join(", ");
-    return items.length > max ? `${head}, …+${items.length - max}` : head;
+    // Every item is graph-derived — sanitize so a crafted `<@principal-id>`
+    // audit value can't ping the principal before the 7-day policy
+    // (round-26 review).
+    const inert = items.map(sanitizeGraphText);
+    const head = inert.slice(0, max).join(", ");
+    return items.length > max
+      ? `${head}, …+${items.length - max}`
+      : head;
   };
   const auditLines: string[] = [
     `**Audit:** receipt-less closes ${audit.closedWithoutReceipt.length}${audit.closedWithoutReceipt.length > 0 ? ` (${summarize(audit.closedWithoutReceipt, 8)})` : ""} · open w/o checkpoint ${audit.openWithoutCheckpoint.length}${audit.openWithoutCheckpoint.length > 0 ? ` (${summarize(audit.openWithoutCheckpoint, 8)})` : ""} · open claims ${audit.openClaimed.length}`,
   ];
   if (audit.openClaimed.length > 0) {
     for (const c of audit.openClaimed.slice(0, 8)) {
-      auditLines.push(`    #${sanitizeGraphText(c.id)} [${c.assignees.join(", ")}]`);
+      auditLines.push(
+        `    #${sanitizeGraphText(c.id)} [${c.assignees.map(sanitizeGraphText).join(", ")}]`,
+      );
     }
     if (audit.openClaimed.length > 8) {
       auditLines.push(

@@ -44,14 +44,15 @@ the end section makes explicit.
   and indexed by repo (0005). Each card's message id is also tracked per
   destination channel (`escalation_destinations`, 0006), so a map that moves
   A→B→A RECOVERS its original A message on return instead of posting a
-  duplicate in the current channel. Honest limits of that recovery: (1) during
-  a move to a channel never visited before, a fresh card is posted in the new
-  channel while the old channel's card remains live; (2) on A→B→A the OLD
-  channel's card (B) is NOT reconciled while the node is still on the
-  frontier — it stays stale (outdated content, still looking actionable)
-  until the node leaves the queue, at which point the absent pass notes every
-  destination. So "recovery" is no-duplicate-in-the-current-channel, not
-  consolidation of every historical card. A PATCH
+  duplicate in the current channel. RECONCILE-ON-MOVE (round-25/26): when the
+  map moves to a channel never visited before, the desk first edits the card
+  it is LEAVING to a non-actionable "moved to channel …" note, then posts
+  fresh in the new channel — so exactly ONE card per escalation is active at
+  any time (a move never leaves the old card active-looking). On A→B→A the
+  return recovers A's original message AND notes the card left behind in B
+  (the same reconcile-on-move rule applies in both directions). So
+  "recovery" is no-duplicate-in-the-current-channel AND one-active-card-per-
+  escalation. A PATCH
   that 404s (legacy row or deleted card) reposts fresh. Absent-card
   reconciliation is bounded by a `noted_at` marker (drizzle 0007): a noted
   card drops out of the scan; closing resolved cards (which shrinks the open

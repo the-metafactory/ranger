@@ -18,6 +18,14 @@ import {
  workers,
 } from "./store/schema.ts";
 import type { RangerConfig } from "./config.ts";
+
+/**
+ * Cap on the NOT IN exclusion in listUnreconciledOpen: a pathological
+ * frontier (thousands of needed nodes) must not exceed SQLite's bind limit.
+ * The caller JS-filters the loaded page against the full needed set, so
+ * correctness is preserved (round-26 review).
+ */
+const ABSENT_EXCLUDE_CAP = 1000;
 import { expandHome } from "./config.ts";
 
 /**
@@ -481,6 +489,12 @@ export class Journal {
   excludeNodeIds: ReadonlySet<string> = new Set(),
   opts: { limit?: number } = {},
  ): EscalationRow[] {
+  // The NOT IN exclusion is CAPPED: a pathological frontier (thousands of
+  // needed nodes) must not exceed SQLite's bind limit. Correctness is
+  // preserved by the caller JS-filtering the page against the FULL needed
+  // set, so a needed card that slips past the truncated exclusion is never
+  // treated as absent (round-26 review).
+  const exclude = [...excludeNodeIds].slice(0, ABSENT_EXCLUDE_CAP);
   const rows = this.db.query.escalations
    .findMany({
     where: and(
@@ -489,9 +503,9 @@ export class Journal {
      isNull(escalations.notedAt),
      // Only rows ABSENT from the current frontier — don't load and skip
      // every active card on each no-op tick (round-19 review).
-     ...(excludeNodeIds.size === 0
+     ...(exclude.length === 0
       ? []
-      : [notInArray(escalations.nodeId, [...excludeNodeIds])]),
+      : [notInArray(escalations.nodeId, exclude)]),
     ),
     // Oldest exits first (most urgent), and capped to the remaining request
     // budget so a large drain can't walk every unnoted card after the budget
