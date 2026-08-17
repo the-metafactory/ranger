@@ -1098,14 +1098,19 @@ function selectAbsentCards(
   let reachedEnd = false;
   const openCards: EscalationRow[] = [];
   while (openCards.length < wanted && scanned < MAX_ABSENT_SCAN) {
-    const batch = journal.listUnreconciledOpen(repo, neededIds, {
+    // Raw keyset pages (NO SQL exclusion — a NOT IN against a large
+    // all-active queue would force SQLite to scan every row proving no
+    // results, round-36 review). Needed rows are dropped here in JS, and the
+    // cursor advances on the RAW last row so an all-active queue still
+    // terminates.
+    const batch = journal.listUnreconciledOpen(repo, {
       limit: scanPage,
       after,
     });
     scanned += batch.length;
     openCards.push(...batch.filter((row) => !neededIds.has(row.nodeId)));
     if (batch.length < scanPage) {
-      reachedEnd = true; // swept the whole set — reset the cursor next tick
+      reachedEnd = true; // swept the whole raw set — reset the cursor next tick
       break;
     }
     const last = batch[batch.length - 1]; // non-empty: length >= scanPage here

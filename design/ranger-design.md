@@ -221,8 +221,14 @@ Everything parked or vetoed is terminal until an operator verb. Silence never un
   — every graph and Discord call has a hard timeout (round-30 review),
   including walk's FRESH read for claims and its graphClaim write (both pass
   GRAPH_CALL_TIMEOUT_MS; round-33 + round-35 closed the earlier unbounded
-  windows) and the claim-announce Discord POST (abort-bounded at 30s,
-  round-35).
+  windows), the claim-announce Discord POST (abort-bounded at 30s, round-35),
+  and the worker's own graph calls — runNode's graphNode (×2), graphClose,
+  and graphDecisions — which pass GRAPH_CALL_TIMEOUT_MS too, so a hung soma
+  can't leave a detached worker alive holding its claim forever (round-36).
+  The absent-card scan loads RAW bounded keyset pages and drops the
+  current-frontier rows in JS (no SQL NOT IN — a large all-active queue must
+  not force SQLite to scan every row proving no results, round-36), with the
+  cursor advancing on raw rows so an all-active queue still terminates.
   Honest scope of "never blocks": the desk's OWN processing is what the
   bound/deadline/cooldown-cap constrain. The O(frontier) frontier read +
   route classification is the SCHEDULER's inherent routing cost — ranger must

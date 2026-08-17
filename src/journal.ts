@@ -6,7 +6,6 @@ import {
  gt,
  inArray,
  isNull,
- notInArray,
  or,
  sql,
 } from "drizzle-orm";
@@ -20,14 +19,6 @@ import {
  workers,
 } from "./store/schema.ts";
 import type { RangerConfig } from "./config.ts";
-
-/**
- * Cap on the NOT IN exclusion in listUnreconciledOpen: a pathological
- * frontier (thousands of needed nodes) must not exceed SQLite's bind limit.
- * The caller JS-filters the loaded page against the full needed set, so
- * correctness is preserved (round-26 review).
- */
-const ABSENT_EXCLUDE_CAP = 1000;
 import { expandHome } from "./config.ts";
 
 /**
@@ -484,35 +475,31 @@ export class Journal {
  }
 
  /**
-  * Open cards whose queue-exit note has NOT yet been written. This is what
-  * the absent-card pass reconciles — once a card is noted, `noted_at` is set
-  * and it drops out of the scan, so per-tick work stays bounded even as
-  * open (persisted) cards accumulate (design §5).
+  * Open cards whose queue-exit note has NOT yet been written — RAW keyset
+  * pages (NO exclusion predicate, round-36 review). This is what the
+  * absent-card pass reconciles: once a card is noted, `noted_at` is set and
+  * it drops out of the scan, so per-tick work stays bounded even as open
+  * (persisted) cards accumulate (design §5). The caller (selectAbsentCards)
+  * drops the current-frontier rows in JS and advances the cursor on the raw
+  * rows.
   */
  listUnreconciledOpen(
   repo: string,
-  excludeNodeIds: ReadonlySet<string> = new Set(),
-  opts: { limit?: number; after?: { createdAt: string; nodeId: string } } = {},
+  opts: {
+   limit?: number;
+   after?: { createdAt: string; nodeId: string };
+  } = {},
  ): EscalationRow[] {
-  // The NOT IN exclusion is CAPPED: a pathological frontier (thousands of
-  // needed nodes) must not exceed SQLite's bind limit. Correctness is
-  // preserved by the caller JS-filtering the page against the FULL needed
-  // set, so a needed card that slips past the truncated exclusion is never
-  // treated as absent (round-26 review).
-  const exclude = [...excludeNodeIds].slice(0, ABSENT_EXCLUDE_CAP);
   const rows = this.db.query.escalations
    .findMany({
     where: and(
      eq(escalations.repo, repo),
      eq(escalations.status, "open"),
      isNull(escalations.notedAt),
-     // Only rows ABSENT from the current frontier — don't load and skip
-     // every active card on each no-op tick (round-19 review).
-     ...(exclude.length === 0 ? [] : [notInArray(escalations.nodeId, exclude)]),
-     // KEYSET pagination: resume strictly AFTER the last row seen — O(page),
-     // not O(offset) (round-31 review: a 50k-row queue must not skip ~50k
-     // indexed rows per 50-row batch). nodeId is the tiebreaker (unique per
-     // repo).
+     // KEYSET pagination: resume strictly AFTER the last raw row seen —
+     // O(page), not O(offset) (round-31 review: a 50k-row queue must not
+     // skip ~50k indexed rows per 50-row batch). nodeId is the tiebreaker
+     // (unique per repo).
      ...(opts.after === undefined
       ? []
       : [
@@ -528,9 +515,7 @@ export class Journal {
     // Oldest exits first (most urgent) with nodeId as the tiebreak — MUST
     // match the keyset cursor's (createdAt, nodeId) predicate so same-createdAt
     // rows (cards posted in one pass share a timestamp) aren't skipped
-    // (round-32 review), and capped to the remaining request budget so a large
-    // drain can't walk every unnoted card after the budget is spent (round-23
-    // review) - the rest are deferred to the next tick.
+    // (round-32 review).
     orderBy: [asc(escalations.createdAt), asc(escalations.nodeId)],
     ...(opts.limit === undefined ? {} : { limit: opts.limit }),
    })

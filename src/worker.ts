@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import { expandHome } from "./config.ts";
 import { runCmd, type RunOptions } from "./exec.ts";
-import { graphNode } from "./graph.ts";
+import { GRAPH_CALL_TIMEOUT_MS, graphNode } from "./graph.ts";
 import { graphClose, graphDecisions, type CloseResult } from "./graph-write.ts";
 import type { Journal } from "./journal.ts";
 import { assembleResearchPrompt } from "./prompt.ts";
@@ -202,10 +202,14 @@ export async function runNode(
  };
 
  try {
-  const node = await graphNode(repo, nodeId, { token, source: "write-token" });
-  const rootNode = await graphNode(repo, String(map.root), {
-   token,
-   source: "write-token",
+  const node = await graphNode(repo, nodeId, { token, source: "write-token" }, {
+   // Every graph CLI call is timeout-bound — a hung soma must not leave a
+   // detached worker alive holding its claim forever (round-36: the worker's
+   // read/close/decisions were the last unbounded surface).
+   timeoutMs: GRAPH_CALL_TIMEOUT_MS,
+  });
+  const rootNode = await graphNode(repo, String(map.root), { token, source: "write-token" }, {
+   timeoutMs: GRAPH_CALL_TIMEOUT_MS,
   });
 
   if (node.node.kind !== "research") {
@@ -338,7 +342,7 @@ export async function runNode(
     gist: gistFrom(resolution),
     checkpointId: node.node.checkpointId,
    },
-   { cwd: probeCwd },
+   { cwd: probeCwd, timeoutMs: GRAPH_CALL_TIMEOUT_MS },
   );
 
   if (close.closed) {
@@ -347,7 +351,10 @@ export async function runNode(
     repo,
     detail: close.detail.slice(0, 400),
    });
-   await graphDecisions(repo, String(map.root), token, { cwd: probeCwd });
+   await graphDecisions(repo, String(map.root), token, {
+    cwd: probeCwd,
+    timeoutMs: GRAPH_CALL_TIMEOUT_MS,
+   });
    journal.recordEvent("decisions-written", {
     nodeId,
     repo,
