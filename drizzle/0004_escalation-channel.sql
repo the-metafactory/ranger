@@ -1,0 +1,1 @@
+ALTER TABLE `escalations` ADD `channel_id` text;

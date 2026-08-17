@@ -200,6 +200,16 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
       // Second run, unchanged frontier: content is identical → edit-on-change
       // skips every card (no posts, no edits — no needless Discord writes).
       const run2 = await runCli(["escalate", "-c", config, "--json"], env);
+      if (run2.code !== 0 || run2.stderr.length > 0) {
+        console.error(
+          "[flaky-diag] run2 code=",
+          run2.code,
+          "stdout=",
+          run2.stdout.slice(0, 200),
+          "stderr=",
+          run2.stderr.slice(0, 800),
+        );
+      }
       const report2 = JSON.parse(run2.stdout);
       expect(report2.maps[0].posted).toEqual([]);
       expect(report2.maps[0].edited).toEqual([]);
@@ -533,6 +543,70 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
       expect(content).toContain("📣 <@999>");
       expect(content.endsWith("**7d** — needs your attention")).toBe(true);
       expect(content.length).toBeLessThanOrEqual(1950);
+    } finally {
+      discord.stop();
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(fixtureDir, { recursive: true, force: true });
+    }
+  });
+
+  test("a map whose Discord channel moves reposts cards in the new channel (destination persisted)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ranger-escalate-move-"));
+    const fixtureDir = mkdtempSync(join(tmpdir(), "ranger-escalate-move-fx-"));
+    const discord = fakeDiscord();
+    try {
+      writeFixtures(fixtureDir);
+      const writeCfg = (channelId: string) => {
+        const config = [
+          "version: 1",
+          "maps:",
+          "  - repo: acme/widgets",
+          "    root: 1",
+          "    walk: research-only",
+          "    discord:",
+          "      tokenEnv: RANGER_DISCORD_TOKEN",
+          `      channelId: "${channelId}"`,
+          "auth:",
+          "  readOnlyTokens:",
+          '    "acme/*": RANGER_RO_TEST',
+          "bot:",
+          "  identity: ivy-bot",
+          "principal:",
+          "  login: jcfischer",
+          "state:",
+          `  journalPath: ${join(dir, "state.sqlite")}`,
+          "workers:",
+          "  spawnCapPerDay: 10",
+        ].join("\n");
+        const p = join(dir, "ranger.yaml");
+        writeFileSync(p, config);
+        return p;
+      };
+      const env = envFor(fixtureDir, discord.port);
+
+      const run1 = await runCli(
+        ["escalate", "-c", writeCfg("1234567890"), "--json"],
+        env,
+      );
+      expect(JSON.parse(run1.stdout).maps[0].posted).toHaveLength(4);
+
+      // The map moves to a new channel: the persisted destination differs →
+      // cards are reposted fresh there (announce-once per destination), and
+      // the journal rows track the new channel (round-14 review fix).
+      const run2 = await runCli(
+        ["escalate", "-c", writeCfg("9999999999"), "--json"],
+        env,
+      );
+      const report2 = JSON.parse(run2.stdout);
+      expect(report2.maps[0].posted).toHaveLength(4); // reposted, new channel
+      expect(report2.maps[0].edited).toEqual([]);
+      const j = new Journal(join(dir, "state.sqlite"));
+      for (const id of ["11", "12", "13", "14"]) {
+        expect(j.getEscalation("acme/widgets", id)?.channelId).toBe(
+          "9999999999",
+        );
+      }
+      j.close();
     } finally {
       discord.stop();
       rmSync(dir, { recursive: true, force: true });

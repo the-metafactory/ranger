@@ -1,4 +1,4 @@
-import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
+import { index, integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
 
 /**
  * Ranger journal schema (design §8) — SQLite at `~/.config/ranger/state.sqlite`.
@@ -67,9 +67,14 @@ export const escalations = sqliteTable("escalations", {
  route: text("route"),
  /** The content last sent to Discord — edit-on-change skips identical re-edits. */
  lastContent: text("last_content"),
+ /** The Discord channel the card lives in — a moved destination reposts. */
+ channelId: text("channel_id"),
  messageId: text("message_id").notNull(),
  createdAt: text("created_at").notNull(),
  lastEditedAt: text("last_edited_at"),
  /** open | resolved — a resolved card was edited to a resolved note. */
  status: text("status").notNull().default("open"),
-});
+}, (table) => [
+ // Repo-scoped escalation lookups (listEscalations) stay indexed as history grows.
+ index("escalations_repo_idx").on(table.repo),
+]);

@@ -29,6 +29,20 @@
       "when": 1786972544465,
       "tag": "0003_escalation-last-content",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1786982040432,
+      "tag": "0004_escalation-channel",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1786982123316,
+      "tag": "0005_escalation-repo-index",
+      "breakpoints": true
     }
   ]
 }

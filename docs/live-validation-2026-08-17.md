@@ -37,6 +37,11 @@ host.
   rendered content is identical, so the desk converges to a full no-op
   (verified live across many 900s ticks). Edits happen only when content
   actually changes (e.g. an age-band bump, or a node title/body edit).
+- Card destinations are persisted (`escalations.channel_id`, drizzle 0004)
+  and indexed by repo (0005). If a map's Discord channel moves, the persisted
+  destination differs from the current channel and cards are reposted fresh
+  there (announce-once per destination) instead of editing a foreign
+  message; a PATCH that 404s (legacy row or deleted card) also reposts.
 - Digests: `digest.the-metafactory/ranger` = `2026-08-17:1538840582615728139`,
   `digest.jcfischer/seekolous` = `2026-08-17:1538840628891230208` (same local
   day re-runs edit only when the digest content changed; otherwise no-op).

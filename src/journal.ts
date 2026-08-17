@@ -56,6 +56,8 @@ export interface EscalationRow {
  route: string | null;
  /** Content last sent to Discord — edit-on-change skips identical re-edits. */
  lastContent: string | null;
+ /** Discord channel the card lives in — a moved destination reposts. */
+ channelId: string | null;
  messageId: string;
  createdAt: string;
  lastEditedAt: string | null;
@@ -266,8 +268,10 @@ export class Journal {
  /**
   * Record/update the card for a node. `key` is `${repo}:${nodeId}`. Called
   * with a new messageId on first post, or the existing messageId + an
-  * `lastEditedAt` on an in-place edit. A node leaving the HITL/provisioning
-  * set is marked `resolved` (its card was edited to a resolved note).
+  * `lastEditedAt` on an in-place edit. A card whose node leaves the
+  * HITL/provisioning set is EDITED to a queue-exit note but KEPT OPEN — it
+  * stays open until a principal response or an operator verb resolves it
+  * (design §5: cards persist; leaving the frontier is not a resolution).
   */
  upsertEscalation(
   row: Pick<
@@ -277,7 +281,7 @@ export class Journal {
    Partial<
     Pick<
      EscalationRow,
-     "title" | "route" | "lastContent" | "lastEditedAt" | "status"
+     "title" | "route" | "lastContent" | "channelId" | "lastEditedAt" | "status"
     >
    >,
  ): void {
@@ -288,6 +292,7 @@ export class Journal {
    title: row.title ?? existing?.title ?? null,
    route: row.route ?? existing?.route ?? null,
    lastContent: row.lastContent ?? existing?.lastContent ?? null,
+   channelId: row.channelId ?? existing?.channelId ?? null,
    messageId: row.messageId,
    createdAt: existing?.createdAt ?? row.createdAt,
    lastEditedAt: row.lastEditedAt ?? existing?.lastEditedAt ?? null,
@@ -407,6 +412,7 @@ function hydrateEscalation(row: {
  title: string | null;
  route: string | null;
  lastContent: string | null;
+ channelId: string | null;
  messageId: string;
  createdAt: string;
  lastEditedAt: string | null;
@@ -419,6 +425,7 @@ function hydrateEscalation(row: {
   title: row.title,
   route: row.route,
   lastContent: row.lastContent,
+  channelId: row.channelId,
   messageId: row.messageId,
   createdAt: row.createdAt,
   lastEditedAt: row.lastEditedAt,
