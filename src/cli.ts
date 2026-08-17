@@ -383,7 +383,17 @@ program
    const configPath = resolve(process.cwd(), options.config);
    const { config, journal } = loadCtx(configPath);
    const escalateResult = await escalateMaps(config, journal);
-   const walkResult = await walk({ config, configPath, journal });
+   // Reuse the escalation pass's frontier reads for walk — one frontier
+   // fetch + classification per map per tick (round-28 review).
+   const preloadedFrontiers = new Map(
+    Object.entries(escalateResult.frontiers),
+   );
+   const walkResult = await walk({
+    config,
+    configPath,
+    journal,
+    preloadedFrontiers,
+   });
    journal.close();
    process.stdout.write(
     JSON.stringify(

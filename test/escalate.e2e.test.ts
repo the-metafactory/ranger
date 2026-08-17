@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { EscalationDiscord } from "../src/escalate.ts";
+import { EscalationDiscord } from "../src/discord.ts";
 import { Journal } from "../src/journal.ts";
 import { baseConfigLines, fakeDiscord, runCli, runCliSpawn } from "./support.ts";
 

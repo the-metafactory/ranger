@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { join } from "node:path";
 import type { RangerConfig, RangerMapConfig, WalkMode } from "./config.ts";
 import { DiscordAnnouncer } from "./announce.ts";
-import { graphFrontier } from "./graph.ts";
+import { graphFrontier, type FrontierEntry } from "./graph.ts";
 import { graphClaim } from "./graph-write.ts";
 import {
  assertNotPrincipal,
@@ -78,6 +78,15 @@ export interface WalkContext {
  /** Detached run-node spawner — tests inject a recorder. Returns the child PID or null. */
  spawnRunNode?: (args: SpawnRunNodeArgs) => Promise<number | null>;
  now?: () => Date;
+ /**
+  * Raw frontier entries already fetched by the tick's escalation pass — walk
+  * reuses them instead of a second graphFrontier call + classification
+  * (round-28 review: "fetch the frontier once per tick"). When absent, walk
+  * fetches as before (backward compatible). Claim safety against concurrent
+  * edits is inherited from the verb's post-write re-read + tie-break, so a
+  * frontier read a few seconds earlier is safe.
+  */
+ preloadedFrontiers?: ReadonlyMap<string, FrontierEntry[]>;
 }
 
 /** Research-lane candidates: routed research AND walkable on this map's walk mode. */
@@ -140,8 +149,18 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
   const errors: string[] = [];
   if (!mapResult.gated) {
    try {
-    const frontier = await graphFrontier(map.repo, map.root, { token, source: "write-token" });
-    const classified = frontier.frontier.map((entry) =>
+    const preloaded = ctx.preloadedFrontiers?.get(map.repo);
+    let frontierEntries: FrontierEntry[];
+    if (preloaded === undefined) {
+      const fetched = await graphFrontier(map.repo, map.root, {
+        token,
+        source: "write-token",
+      });
+      frontierEntries = fetched.frontier;
+    } else {
+      frontierEntries = preloaded;
+    }
+    const classified = frontierEntries.map((entry) =>
      classify(entry, map.repo, map.walk, registry),
     );
     const candidates = researchCandidates(classified);

@@ -2,7 +2,12 @@ import { randomUUID } from "node:crypto";
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
-import { resolveDiscordApiBase } from "./discord.ts";
+import {
+  EscalationDiscord,
+  EscalateError,
+  DiscordMessageGoneError,
+  sleep,
+} from "./discord.ts";
 import {
   classify,
   ESCALATE_REASONS,
@@ -10,7 +15,7 @@ import {
   loadProbeRegistry,
   type ClassifiedNode,
 } from "./route.ts";
-import { graphAudit, graphFrontier, type AuditResult } from "./graph.ts";
+import { graphAudit, graphFrontier, type AuditResult, type FrontierEntry } from "./graph.ts";
 import { assertReadOnlyToken, type ResolvedToken } from "./token-gate.ts";
 import type { EscalationRow, Journal } from "./journal.ts";
 
@@ -25,322 +30,6 @@ import type { EscalationRow, Journal } from "./journal.ts";
  * graph (node #8: reads are outside the doctrine's teeth) — its only side
  * effects are Discord messages and the journal `escalations` table.
  */
-
-class EscalateError extends Error {
-  override name = "EscalateError";
-}
-
-/** A PATCH targeted a message that is not in the current channel — the
- *  destination moved (or the card was deleted); the caller reposts. */
-class DiscordMessageGoneError extends EscalateError {
-  override readonly name = "DiscordMessageGoneError";
-}
-
-// ---- Discord card client (POST announce / PATCH edit) ----
-
-/**
- * Cap on any client-wide Discord cooldown (a global 429's Retry-After): a
- * long retry must not hold the tick — and hence the walk lane — indefinitely
- * (round-26 review). After the cap the client resumes and retries, and the
- * attempt budget defers the card rather than sleeping the whole cooldown.
- */
-const MAX_COOLDOWN_MS = 30_000;
-
-export class EscalationDiscord {
-  /**
-   * Minimum spacing between API calls from one client — Discord throttles
-   * message writes per channel (~5/5s for bots), and a pooled pass of many
-   * cards would otherwise trip 429s (observed live). Test seam:
-   * `RANGER_DISCORD_MIN_INTERVAL_MS` shrinks it so e2e suites stay fast.
-   */
-  private readonly minIntervalMs =
-    Number(process.env.RANGER_DISCORD_MIN_INTERVAL_MS) || 1000;
-  private lastRequestAt = 0;
-  /** Client-wide pause (epoch ms): set on a global 429 so POOLED requests —
-   *  not just the one that got the 429 — wait it out before sending. Without
-   *  this, concurrent cards already past the throttle fire into a hot bucket
-   *  and extend the cooldown (observed live). */
-  private cooldownUntil = 0;
-
-  constructor(
-    private readonly token: string,
-    private readonly channelId: string,
-    private readonly apiBase: string = resolveDiscordApiBase(),
-    private readonly principalDiscordId?: string,
-  ) {}
-
-  /** The configured Discord channel this client posts/edits in. */
-  get channel(): string {
-    return this.channelId;
-  }
-
-  /** A client for a DIFFERENT channel, sharing token/base/principal config.
-   *  Used to reconcile a card that lives in a channel the map moved away
-   *  from (patch its queue-exit note where it actually is). */
-  forChannel(channelId: string): EscalationDiscord {
-    return new EscalationDiscord(
-      this.token,
-      channelId,
-      this.apiBase,
-      this.principalDiscordId,
-    );
-  }
-
-  static fromMap(
-    map: RangerMapConfig,
-    principalDiscordId?: string,
-    env: NodeJS.ProcessEnv = process.env,
-  ): EscalationDiscord {
-    if (map.discord === undefined) {
-      throw new EscalateError(
-        `map ${map.repo} has no discord surface — cannot post escalation cards. ` +
-          `Add a discord.tokenEnv + channelId to the map (node #7).`,
-      );
-    }
-    const token = env[map.discord.tokenEnv];
-    if (token === undefined || token.length === 0) {
-      throw new EscalateError(
-        `discord token env ${map.discord.tokenEnv} is unset — cannot post escalation cards for ${map.repo}.`,
-      );
-    }
-    return new EscalationDiscord(
-      token,
-      map.discord.channelId,
-      undefined,
-      principalDiscordId,
-    );
-  }
-
-  /** Wait out any client-wide cooldown (a global 429) before sending. */
-  private async waitForCooldown(): Promise<void> {
-    while (this.cooldownUntil > Date.now()) {
-      await sleep(Math.min(250, this.cooldownUntil - Date.now()));
-    }
-    this.cooldownUntil = 0;
-  }
-
-  /**
-   * One throttled, cooldown-aware, timeout-bounded fetch — the shared setup
-   * for every Discord write AND read (writes and existence checks can't
-   * drift on throttling/timeout behavior). Throws on network errors/timeout.
-   */
-  private async fetchOnce(
-    path: string,
-    init: {
-      method: "GET" | "POST" | "PATCH";
-      headers?: Record<string, string>;
-      body?: string;
-    },
-  ): Promise<Response> {
-    await this.waitForCooldown();
-    await this.throttle();
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 30_000);
-    try {
-      return await fetch(`${this.apiBase}${path}`, {
-        method: init.method,
-        headers: {
-          Authorization: `Bot ${this.token}`,
-          ...(init.headers ?? {}),
-        },
-        ...(init.body === undefined ? {} : { body: init.body }),
-        signal: controller.signal,
-      });
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-
-  private async request(
-    method: "POST" | "PATCH",
-    path: string,
-    content: string,
-    deadline?: number,
-  ): Promise<Response> {
-    // Every call times out — a run can never stall indefinitely holding the
-    // announce-once lock. Calls are spaced ≥1s apart. On a rate limit (429),
-    // a GLOBAL cooldown must be waited out in full — retrying into it just
-    // resets the bucket and extends the throttle (observed live) — so a global
-    // 429 waits max(Retry-After, 30s) capped at MAX_COOLDOWN_MS; a local 429
-    // waits Retry-After.
-    const maxAttempts = 4;
-    let lastStatus = 0;
-    let firstRetryAfterSec = 0;
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      // The pass deadline bounds RETRIES too, not just starts: a request
-      // begun just before the deadline must not hold the tick through four
-      // 30s-cooldown attempts past it (round-27 review — "never blocks
-      // walking").
-      if (deadline !== undefined && Date.now() > deadline) {
-        throw new EscalateError(
-          `discord ${method} ${path} deferred: pass deadline reached`,
-        );
-      }
-      let response: Response;
-      try {
-        response = await this.fetchOnce(path, {
-          method,
-          headers: { "Content-Type": "application/json" },
-          // parse: [] suppresses untrusted @everyone/@here/role mentions in
-          // graph-derived content; only the principal's id (when configured)
-          // is allowed to ping.
-          body: JSON.stringify({
-            content,
-            allowed_mentions: {
-              parse: [],
-              users: this.principalDiscordId ? [this.principalDiscordId] : [],
-            },
-          }),
-        });
-      } catch (error) {
-        throw new EscalateError(
-          `discord ${method} ${path} failed: ${error instanceof Error ? error.message : String(error)}`,
-        );
-      }
-      if (response.status !== 429 && response.status < 500) {
-        return response;
-      }
-      lastStatus = response.status;
-      const retryAfter = Number(response.headers.get("retry-after"));
-      if (attempt === 1) {
-        firstRetryAfterSec = Number.isFinite(retryAfter) ? retryAfter : 0;
-      }
-      const global = response.headers.get("x-ratelimit-global") !== null;
-      const waitMs =
-        Number.isFinite(retryAfter) && retryAfter > 0
-          ? retryAfter * 1000
-          : 1000 * 2 ** (attempt - 1);
-      if (global) {
-        // Advance the client-wide deadline so every pooled request waits
-        // this out too, not just this one. CAPPED at MAX_COOLDOWN_MS: an
-        // arbitrary Retry-After (Discord can return minutes-to-an-hour) must
-        // not hold the tick — and hence the walk lane — for that long
-        // (round-26 review: "escalation never blocks walking"). After the
-        // cap the request resumes, likely 429s again, and the attempt budget
-        // eventually defers the card rather than sleeping the whole cooldown.
-        const cooldownMs = Math.max(waitMs, 30_000);
-        this.cooldownUntil = Math.min(
-          Math.max(this.cooldownUntil, Date.now() + cooldownMs),
-          Date.now() + MAX_COOLDOWN_MS,
-        );
-      }
-      // A long first cooldown (>30s) means the card is hot; retrying into it
-      // just extends it (observed live) — fail fast so the card is deferred
-      // to next tick instead of hammering.
-      if (attempt === 1 && firstRetryAfterSec > 30) {
-        break;
-      }
-      // The per-attempt sleep is CAPPED like the cooldown deadline — a large
-      // Retry-After must not hold this attempt (and hence the tick) for the
-      // full value; the request resumes, 429s again, and the attempt budget
-      // defers the card (round-27 review).
-      await sleep(
-        global
-          ? Math.min(Math.max(waitMs, 30_000), MAX_COOLDOWN_MS)
-          : Math.min(waitMs, 30_000),
-      );
-    }
-    throw new EscalateError(
-      `discord ${method} ${path} failed after ${lastStatus === 0 ? "setup" : maxAttempts} attempts (last HTTP ${lastStatus}${firstRetryAfterSec > 0 ? `, retry-after ${firstRetryAfterSec}s` : ""})`,
-    );
-  }
-
-  /** Space calls from this client apart so a pooled pass stays rate-limit-safe.
-   *  The slot is reserved synchronously BEFORE any await, so concurrent
-   *  callers line up at 1s offsets instead of sleeping the same delay and
-   *  waking together (a burst that re-triggers the 429s). */
-  private async throttle(): Promise<void> {
-    const now = Date.now();
-    const target = Math.max(this.lastRequestAt + this.minIntervalMs, now);
-    this.lastRequestAt = target; // reserve — atomic within the event loop
-    const wait = target - now;
-    if (wait > 0) {
-      await sleep(wait);
-    }
-  }
-
-  /** Post a new card; returns the Discord message id (announce-once). */
-  async post(content: string, deadline?: number): Promise<string> {
-    const response = await this.request(
-      "POST",
-      `/channels/${this.channelId}/messages`,
-      content,
-      deadline,
-    );
-    if (!response.ok) {
-      throw new EscalateError(`discord post returned HTTP ${response.status}`);
-    }
-    const body = (await response.json()) as { id?: string };
-    if (typeof body.id !== "string" || body.id.length === 0) {
-      throw new EscalateError("discord post returned no message id");
-    }
-    return body.id;
-  }
-
-  /** Edit an existing card in place (edit-not-repost). */
-  async edit(
-    messageId: string,
-    content: string,
-    deadline?: number,
-  ): Promise<void> {
-    const response = await this.request(
-      "PATCH",
-      `/channels/${this.channelId}/messages/${messageId}`,
-      content,
-      deadline,
-    );
-    // 404 = the message is not in THIS channel — the destination moved (or
-    // the card was deleted). Surface it distinctly so the caller can repost
-    // fresh instead of retrying a doomed edit every tick.
-    if (response.status === 404) {
-      throw new DiscordMessageGoneError(
-        `discord message ${messageId} is not in channel ${this.channelId} — destination moved; repost needed`,
-      );
-    }
-    if (!response.ok) {
-      throw new EscalateError(
-        `discord edit ${messageId} returned HTTP ${response.status}`,
-      );
-    }
-  }
-
-  /**
-   * Does a message still exist in this channel? The digest's unchanged
-   * same-day path is a write-no-op, so a DELETED message is only noticed via
-   * a read — return false on a definitive 404 so the caller reposts. On a
-   * transient read failure (5xx, network, timeout) assume it exists: a repost
-   * decision must never be made on an unreliable read.
-   */
-  async messageExists(messageId: string, deadline?: number): Promise<boolean> {
-    const path = `/channels/${this.channelId}/messages/${messageId}`;
-    let response: Response;
-    try {
-      response = await this.fetchOnce(path, { method: "GET" });
-    } catch {
-      return true; // transient read failure — do not repost on a guess
-    }
-    if (response.status === 404) return false;
-    // A 5xx is transient — retry a couple of times before falling back to
-    // "assume it exists" (a repost must never be based on an unreliable
-    // read; a persistent 5xx is an outage, not a deletion).
-    if (response.status >= 500) {
-      for (let attempt = 0; attempt < 2; attempt++) {
-        // Bound the retry by the pass deadline (round-27 review).
-        if (deadline !== undefined && Date.now() > deadline) return true;
-        await sleep(500 * (attempt + 1));
-        try {
-          response = await this.fetchOnce(path, { method: "GET" });
-        } catch {
-          return true;
-        }
-        if (response.status === 404) return false;
-        if (response.status < 500) break;
-      }
-    }
-    // 2xx / 401 / 403 / persistent 5xx — NOT a definitive delete.
-    return true;
-  }
-}
 
 /**
  * The Discord API base for production, with a hardened test seam — shared
@@ -585,6 +274,12 @@ interface EscalateMapResult {
 export interface EscalateResult {
   generatedAt: string;
   maps: EscalateMapResult[];
+  /**
+   * The raw frontier entries each map's pass already fetched — the tick
+   * reuses them for walk instead of a second graphFrontier call (round-28
+   * review: "fetch the frontier once per tick").
+   */
+  frontiers: Record<string, FrontierEntry[]>;
 }
 
 function dayDiff(fromIso: string, now: Date): number {
@@ -600,10 +295,6 @@ function dayDiff(fromIso: string, now: Date): number {
     now.getUTCDate(),
   );
   return Math.floor((nowDay - fromDay) / 86_400_000);
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /** Bounded-concurrency pool — preserves input order in the results array. */
@@ -706,13 +397,16 @@ function lockOwnerStale(
       leaseUntil?: number;
     };
     if (typeof prior.pid !== "number") return false;
-    // Leased lock: an expired lease is a definitive signal the holder is gone
-    // (its heartbeat stopped). This is what makes PID-reuse reclaimable while
-    // never touching a live run's renewed lock.
-    if (typeof prior.leaseUntil === "number" && prior.leaseUntil < Date.now()) {
-      return true;
+    // Leased lock: the LEASE governs — an expired lease is a definitive signal
+    // the holder is gone (its heartbeat stopped), which is what makes
+    // PID-reuse reclaimable while never touching a live run's RENEWED lock.
+    // A valid lease NEVER falls through to the age arm (a run held >30min
+    // with a renewed lease is not stale — round-28 review).
+    if (typeof prior.leaseUntil === "number") {
+      return prior.leaseUntil < Date.now();
     }
-    // Legacy / marker fallback: dead pid OR old enough to be a crash.
+    // Legacy / marker fallback (no lease): dead pid OR old enough to be a
+    // crash artifact.
     const stamp = prior.startedAt ?? prior.at;
     if (typeof stamp === "number" && Date.now() - stamp > maxAgeMs) {
       return true;
@@ -1436,6 +1130,8 @@ async function escalateOneMap(
   journal: Journal,
   registry: ReturnType<typeof loadProbeRegistry>,
   now: Date,
+  passDeadline: number,
+  frontiers: Record<string, FrontierEntry[]>,
 ): Promise<EscalateMapResult> {
   const base: EscalateMapResult = {
     repo: map.repo,
@@ -1463,6 +1159,9 @@ async function escalateOneMap(
 
   try {
     const frontier = await graphFrontier(map.repo, map.root, token);
+    // Surface the raw entries so the tick can reuse them for walk (one
+    // frontier fetch per tick, round-28 review).
+    frontiers[map.repo] = frontier.frontier;
 
     const classified = frontier.frontier.map((entry) =>
       classify(entry, map.repo, map.walk, registry),
@@ -1489,7 +1188,7 @@ async function escalateOneMap(
     //     evaluated, and fresh cards (no row) within the page go first.
     const budget = {
       remaining: MAX_CARDS_PER_TICK,
-      deadline: Date.now() + MAX_PASS_MS,
+      deadline: passDeadline,
     };
     const cursorKey = `escalate.cursor.${map.repo}`;
     const sorted = [...needed].sort((a, b) => a.id.localeCompare(b.id));
@@ -1578,12 +1277,28 @@ export async function escalateMaps(
 ): Promise<EscalateResult> {
   return withEscalateLock(journal, async () => {
     const now = opts.now ?? new Date();
+    // ONE tick-wide deadline for the whole escalation pass — maps are
+    // serialized, so a fresh 120s per map would let a two-map config hold
+    // walk for ~240s (round-28 review: "escalation never blocks walking"
+    // is bounded at the TICK scope, not per map). Deferred maps/cards are
+    // served next tick.
+    const passDeadline = Date.now() + MAX_PASS_MS;
     const registry = loadProbeRegistry();
     const maps: EscalateMapResult[] = [];
+    const frontiers: Record<string, FrontierEntry[]> = {};
     for (const map of config.maps) {
-      maps.push(await escalateOneMap(config, map, journal, registry, now));
+      const result = await escalateOneMap(
+        config,
+        map,
+        journal,
+        registry,
+        now,
+        passDeadline,
+        frontiers,
+      );
+      maps.push(result);
     }
-    return { generatedAt: now.toISOString(), maps };
+    return { generatedAt: now.toISOString(), maps, frontiers };
   });
 }
 
@@ -1850,7 +1565,7 @@ async function digestOneMap(
           // digest and replace the cached message id — otherwise unchanged
           // runs would no-op against the stale cache and leave NO digest
           // until the next day.
-          messageId = await client.post(content);
+          messageId = await client.post(content, digestDeadline);
           posted = true;
         }
       }
@@ -1859,7 +1574,7 @@ async function digestOneMap(
         JSON.stringify({ today, messageId, lastContent: content }),
       );
     } else {
-      messageId = await client.post(content);
+      messageId = await client.post(content, digestDeadline);
       journal.setHealth(
         `digest.${map.repo}`,
         JSON.stringify({ today, messageId, lastContent: content }),

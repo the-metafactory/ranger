@@ -196,9 +196,12 @@ Everything parked or vetoed is terminal until an operator verb. Silence never un
 - Escalations: non-blocking, and BOUNDED per tick — the desk processes at
   most `MAX_CARDS_PER_TICK` card operations (posts+edits) per map per tick,
   evaluated against a bounded page of frontier nodes swept via a persisted
-  cursor, with a 120s pass DEADLINE (deferred past it) and a 30s cap on any
-  Discord 429 cooldown. The escalation lane therefore NEVER blocks the walk
-  lane (a huge frontier can't hold the tick past the walk interval): it
+  cursor, with ONE tick-wide 120s pass DEADLINE (a fresh deadline is NOT
+  granted per map — serialized maps share it, so a two-map config is bounded
+  at ~120s total, round-28 review), a 30s cap on any Discord 429 cooldown,
+  and the deadline threaded into the client's retry loop (an in-flight
+  rate-limited op defers rather than running four 30s attempts past it). The
+  escalation lane therefore NEVER blocks the walk lane past that bound: it
   converges over ticks, deferring the remainder. Deferred cards stay open
   and are served on a later tick — nothing is dropped, only delayed.
   (Amendment: §8 originally said "unbounded" — the per-tick bound is an
@@ -210,6 +213,8 @@ Everything parked or vetoed is terminal until an operator verb. Silence never un
   see the whole frontier to know which nodes are escalate-hitl vs
   implement/research (paging routing would miss escalate nodes elsewhere in
   the frontier) — and is shared scheduling work, not an escalation-lane cost.
+  It is fetched ONCE per map per tick and reused by the escalation pass and
+  the walk claim phase (round-28 review).
   For ranger's maps the frontier is small; a pathological multi-thousand-node
   frontier pays one O(frontier) read per tick, which is the graph's cost, not
   a pass that grows with the escalation backlog (round-27 review).
