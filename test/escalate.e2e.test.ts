@@ -457,6 +457,39 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
     }
   });
 
+  test("reclaims a lock whose pid is ALIVE but stale — the age arm catches PID-reuse (round-19 blocker)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ranger-escalate-reuse-"));
+    const fixtureDir = mkdtempSync(join(tmpdir(), "ranger-escalate-reuse-fx-"));
+    const discord = fakeDiscord();
+    try {
+      writeFixtures(fixtureDir);
+      const config = writeConfig(dir);
+      const env = envFor(fixtureDir, discord.port);
+
+      // The dead process's pid got reused by an unrelated ALIVE process (here:
+      // the test runner) — a PID-only check would treat this lock as live
+      // forever and strand the desk (every tick times out). The startedAt is
+      // older than LOCK_STALE_MS, so the age arm reclaims it.
+      const lockFile = join(dir, ".escalate.lock");
+      writeFileSync(
+        lockFile,
+        JSON.stringify({
+          pid: process.pid, // alive right now — kill(pid, 0) succeeds
+          startedAt: Date.now() - 40 * 60 * 1000, // > 30min stale
+        }),
+      );
+
+      const run = await runCli(["escalate", "-c", config, "--json"], env);
+      expect(run.code).toBe(0);
+      expect(JSON.parse(run.stdout).maps[0].posted).toHaveLength(4);
+      expect(existsSync(lockFile)).toBe(false); // reclaimed + released
+    } finally {
+      discord.stop();
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(fixtureDir, { recursive: true, force: true });
+    }
+  });
+
   test("a stale reclaim marker from a crashed reclaim does not strand the desk", async () => {
     const dir = mkdtempSync(join(tmpdir(), "ranger-escalate-marker-"));
     const fixtureDir = mkdtempSync(join(tmpdir(), "ranger-escalate-marker-fx-"));

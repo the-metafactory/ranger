@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, notInArray, sql } from "drizzle-orm";
 import { openDb, type RangerDb } from "./store/db.ts";
 import {
  escalations,
@@ -332,6 +332,22 @@ export class Journal {
  }
 
  /** The card's message id in a given destination channel, or null. */
+ /** All (channel, message) destinations for a card, oldest first — the
+  *  queue-exit note must reconcile EVERY live card, not just the current
+  *  channel's (round-19 review). */
+ getEscalationDestinations(key: string): {
+  channelId: string;
+  messageId: string;
+ }[] {
+  return this.db.query.escalationDestinations
+   .findMany({
+    where: eq(escalationDestinations.key, key),
+    orderBy: asc(escalationDestinations.createdAt),
+   })
+   .sync()
+   .map((r) => ({ channelId: r.channelId, messageId: r.messageId }));
+ }
+
  getEscalationDestination(
   key: string,
   channelId: string,
@@ -427,10 +443,20 @@ export class Journal {
   repo: string,
   now: Date,
  ): { total: number; aged: number; overdue: number } {
-  const cutoff = (days: number) =>
-   new Date(now.getTime() - days * DAY_MS).toISOString();
-  const agedAt = cutoff(3);
-  const overdueAt = cutoff(7);
+  // UTC calendar-day cutoffs — matching dayDiff, which counts whole UTC days
+  // (a card created at 23:59 yesterday is 1d old at 00:01 today). A rolling
+  // 72h window would exclude a card that dayDiff already shows as 3d.
+  const dayStart = (daysBack: number) =>
+   new Date(
+    Date.UTC(
+     now.getUTCFullYear(),
+     now.getUTCMonth(),
+     now.getUTCDate(),
+    ) -
+     daysBack * DAY_MS,
+   ).toISOString();
+  const agedAt = dayStart(3);
+  const overdueAt = dayStart(7);
   const row = this.db
    .select({
     total: sql<number>`count(*)`,
@@ -453,13 +479,21 @@ export class Journal {
   * and it drops out of the scan, so per-tick work stays bounded even as
   * open (persisted) cards accumulate (design §5).
   */
- listUnreconciledOpen(repo: string): EscalationRow[] {
+ listUnreconciledOpen(
+  repo: string,
+  excludeNodeIds: ReadonlySet<string> = new Set(),
+ ): EscalationRow[] {
   const rows = this.db.query.escalations
    .findMany({
     where: and(
      eq(escalations.repo, repo),
      eq(escalations.status, "open"),
      isNull(escalations.notedAt),
+     // Only rows ABSENT from the current frontier — don't load and skip
+     // every active card on each no-op tick (round-19 review).
+     ...(excludeNodeIds.size === 0
+      ? []
+      : [notInArray(escalations.nodeId, [...excludeNodeIds])]),
     ),
    })
    .sync();

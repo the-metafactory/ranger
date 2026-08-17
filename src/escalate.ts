@@ -599,12 +599,34 @@ function tryAcquireLock(lockFile: string, owner: string): boolean {
  * Is the lock's owner a dead process (ESRCH)? Never reclaim on age or on an
  * unreadable owner — stealing a live run's lock breaks announce-once.
  */
-function lockOwnerDead(lockFile: string): boolean {
+/** A lock older than this is a dead run — no live escalate pass takes this
+ *  long (throttled writes + bounded backoffs finish in minutes). The age arm
+ *  catches the PID-reuse case a PID check cannot: a dead process's lock whose
+ *  pid got recycled by an unrelated, still-alive process would otherwise look
+ *  live forever and strand the desk (every tick times out, no cards/digests). */
+const LOCK_STALE_MS = 30 * 60 * 1000;
+
+/**
+ * Is the lock's owner provably gone? True when its recorded pid is dead
+ * (ESRCH) OR the lock is older than LOCK_STALE_MS (a recycled-pid lock, or a
+ * stuck/alive-after-death run). A live run's fresh lock is never reclaimed.
+ * Never reclaim on an unreadable owner — stealing a live run's lock breaks
+ * announce-once. Residual edge, documented: a machine suspended >30min
+ * mid-run can have its lock age-reclaimed on wake — worst case is one visible
+ * duplicate card (recoverable), never a permanent outage.
+ */
+function lockOwnerStale(lockFile: string): boolean {
   try {
     const prior = JSON.parse(readFileSync(lockFile, "utf8")) as {
       pid?: number;
+      startedAt?: number;
+      at?: number;
     };
     if (typeof prior.pid !== "number") return false;
+    const stamp = prior.startedAt ?? prior.at;
+    if (typeof stamp === "number" && Date.now() - stamp > LOCK_STALE_MS) {
+      return true;
+    }
     try {
       process.kill(prior.pid, 0);
       return false;
@@ -660,10 +682,10 @@ function reclaimDeadLock(
       if ((markerError as NodeJS.ErrnoException).code !== "EEXIST") {
         throw markerError;
       }
-      // Someone holds the marker. If its owner is provably dead (a crashed
-      // reclaim), remove the stale marker and retry — otherwise a live
-      // holder is mid-reclaim and we wait.
-      if (!lockOwnerDead(reclaimMarker) || attempt >= 2) {
+      // Someone holds the marker. If its owner is provably stale (dead pid
+      // or old enough to be a crashed reclaim), remove it and retry —
+      // otherwise a live holder is mid-reclaim and we wait.
+      if (!lockOwnerStale(reclaimMarker) || attempt >= 2) {
         return "busy";
       }
       try {
@@ -676,8 +698,8 @@ function reclaimDeadLock(
   try {
     // Revalidate the main lock before deleting it: a contender may have
     // reclaimed and re-acquired it while we waited for the marker. Delete
-    // only a lock whose owner is STILL dead.
-    if (!lockOwnerDead(lockFile)) {
+    // only a lock whose owner is STILL stale.
+    if (!lockOwnerStale(lockFile)) {
       return "not-dead";
     }
     rmSync(lockFile, { force: true });
@@ -703,7 +725,7 @@ async function withEscalateLock<T>(
   const owner = JSON.stringify({ pid: process.pid, startedAt: Date.now() });
   for (;;) {
     if (tryAcquireLock(lockFile, owner)) break;
-    if (lockOwnerDead(lockFile)) {
+    if (lockOwnerStale(lockFile)) {
       const outcome = reclaimDeadLock(lockFile, reclaimMarker, owner);
       if (outcome === "acquired") break;
       // "busy" / "not-dead" — wait and re-check the lock below.
@@ -901,64 +923,57 @@ async function markAbsentCards(
   map: RangerMapConfig;
   now: Date;
  },
- neededIds: Set<string>,
+ neededIds: ReadonlySet<string>,
 ): Promise<{ keptOpen: string[]; errors: string[] }> {
  const { client, journal, map, now } = ctx;
- // Reconcile ONLY open cards whose queue-exit note has not been written yet
- // (`noted_at IS NULL`) — a noted card drops out of the scan entirely, so
- // per-tick work stays bounded even as open (persisted) cards accumulate.
- // Closing resolved cards (which shrinks the open set itself) is the
- // write-side resolution lifecycle (node #21).
- const openCards = journal.listUnreconciledOpen(map.repo);
+ // Reconcile ONLY open, un-noted cards ABSENT from the current frontier — a
+ // no-op tick never loads (or skips) the active cards (round-19 review), and
+ // a noted card drops out entirely. Closing resolved cards (which shrinks
+ // the open set) is the write-side resolution lifecycle (node #21).
+ const openCards = journal.listUnreconciledOpen(map.repo, neededIds);
+ // One throttled client per channel: moved-channel edits share a limiter
+ // instead of each card building its own and bursting the 5-writes/5s
+ // bucket. Seed with the pass's own client so the current channel reuses
+ // its state.
+ const clients = new Map<string, EscalationDiscord>([
+  [client.channel, client],
+ ]);
+ const clientFor = (channelId: string): EscalationDiscord => {
+  let c = clients.get(channelId);
+  if (c === undefined) {
+   c = client.forChannel(channelId);
+   clients.set(channelId, c);
+  }
+  return c;
+ };
  const outcomes = await mapPool(openCards, 3, async (prior) => {
   const nodeId = prior.nodeId;
-  if (neededIds.has(nodeId)) return { action: "skip" as const };
-  const content = [
-   `~~**#${nodeId}** ${sanitizeGraphText(prior.title ?? "")}~~ no longer on the HITL/provisioning queue`,
-   `map: ${map.repo} — card kept open; resolves on a principal response or operator verb`,
-  ]
-   .filter((l) => l.trim().length > 0)
-   .join("\n");
+  const content = queueExitContent(nodeId, prior.title, map.repo);
   try {
-   // The note lives where the card lives: if the card's destination moved
-   // to another channel, patch the note THERE (via a client for the recorded
-   // channel) so the old card stops looking actionable — the stale card
-   // otherwise remains an active-looking request forever. Set notedAt only
-   // after the patch succeeds (or a definitive 404 means the old card is
-   // already gone). A transient failure retries next tick.
-   if (prior.channelId !== null && prior.channelId !== client.channel) {
+   // Reconcile EVERY destination's card: a card that moved channels still
+   // holds a live, actionable message in each visited channel — write the
+   // queue-exit note to all of them so none stays active-looking (round-19
+   // review). Legacy rows (pre-0006, no destination rows) fall back to the
+   // row's own channel/message when known.
+   const stored = journal.getEscalationDestinations(`${map.repo}:${nodeId}`);
+   const destinations =
+    stored.length > 0
+     ? stored
+     : prior.channelId === null
+       ? []
+       : [{ channelId: prior.channelId, messageId: prior.messageId }];
+   let anyEdit = false;
+   for (const dest of destinations) {
     try {
-     await client.forChannel(prior.channelId).edit(prior.messageId, content);
-    } catch (oldError) {
-     if (oldError instanceof DiscordMessageGoneError) {
-      // The old card is already gone — reconciliation complete.
-     } else {
-      return {
-       action: "error" as const,
-       id: nodeId,
-       error:
-        oldError instanceof Error
-         ? oldError.message
-         : String(oldError),
-      };
-     }
+     await clientFor(dest.channelId).edit(dest.messageId, content);
+     anyEdit = true;
+    } catch (destError) {
+     if (!(destError instanceof DiscordMessageGoneError)) throw destError;
+     // this destination's card is already gone — nothing to note there
     }
-    journal.upsertEscalation({
-     key: `${map.repo}:${nodeId}`,
-     repo: map.repo,
-     nodeId,
-     title: prior.title,
-     lastContent: content,
-     messageId: prior.messageId,
-     channelId: prior.channelId,
-     createdAt: prior.createdAt,
-     lastEditedAt: now.toISOString(),
-     status: prior.status,
-     notedAt: now.toISOString(),
-    });
-    return { action: "keptOpen" as const, id: nodeId };
    }
-   await client.edit(prior.messageId, content);
+   // Set notedAt only after every destination reconciled (or a definitive
+   // 404 each); a transient failure throws → retried next tick.
    journal.upsertEscalation({
     key: `${map.repo}:${nodeId}`,
     repo: map.repo,
@@ -970,16 +985,13 @@ async function markAbsentCards(
     createdAt: prior.createdAt,
     lastEditedAt: now.toISOString(),
     status: prior.status, // stays open — cards persist (design §5)
-    notedAt: now.toISOString(), // reconciled — drops out of the scan
+    notedAt: now.toISOString(),
    });
-   return { action: "keptOpen" as const, id: nodeId };
+   return {
+    action: (anyEdit ? "keptOpen" : "unchanged") as "keptOpen" | "unchanged",
+    id: nodeId,
+   };
   } catch (cardError) {
-   // The card is gone (deleted or the channel moved on a legacy row):
-   // nothing to edit — the row persists until an operator verb resolves it.
-   // A transient failure retries next tick.
-   if (cardError instanceof DiscordMessageGoneError) {
-    return { action: "unchanged" as const, id: nodeId };
-   }
    // A transient failure on one card must not fail the desk — it retries
    // next tick and the card stays open.
    return {
@@ -1000,6 +1012,20 @@ async function markAbsentCards(
   }
  }
  return { keptOpen, errors };
+}
+
+/** The deterministic queue-exit note — one source of truth for card content. */
+function queueExitContent(
+ nodeId: string,
+ title: string | null,
+ repo: string,
+): string {
+ return [
+  `~~**#${nodeId}** ${sanitizeGraphText(title ?? "")}~~ no longer on the HITL/provisioning queue`,
+  `map: ${repo} — card kept open; resolves on a principal response or operator verb`,
+ ]
+  .filter((l) => l.trim().length > 0)
+  .join("\n");
 }
 
 function ageText(
