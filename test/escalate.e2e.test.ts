@@ -304,6 +304,22 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
       // the digest must not churn Discord writes (review fix).
       expect(discord.edits.length).toBe(editsBefore);
       expect(d2.maps[0].digestMessageId).toBe(d1.maps[0].digestMessageId);
+
+      // A DELETED unchanged digest message is recovered on the next no-op
+      // run: the unchanged path verifies the message still exists (GET) and
+      // reposts when it is definitively gone — the daily summary never
+      // silently vanishes until the next day (round-16 review fix).
+      const deletedDigestId = d1.maps[0].digestMessageId;
+      discord.deleteMessage(deletedDigestId);
+      const postsAfterDelete = discord.posts.length;
+      const digest3 = await runCli(
+        ["escalate", "--digest", "-c", config, "--json"],
+        env,
+      );
+      const d3 = JSON.parse(digest3.stdout);
+      expect(d3.maps[0].posted).toBe(true); // reposted after the delete
+      expect(discord.posts.length).toBe(postsAfterDelete + 1); // one fresh digest
+      expect(d3.maps[0].digestMessageId).not.toBe(deletedDigestId);
     } finally {
       discord.stop();
       rmSync(dir, { recursive: true, force: true });

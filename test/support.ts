@@ -97,6 +97,7 @@ export async function runCli(
 export function fakeDiscord() {
  const posts: { url: string; messageId: string; content: string }[] = [];
  const edits: { messageId: string; content: string }[] = [];
+ const deleted = new Set<string>(); // messages removed — GET returns 404
  const server = Bun.serve({
   port: 0,
   async fetch(req) {
@@ -116,6 +117,16 @@ export function fakeDiscord() {
     edits.push({ messageId, content: parsed?.content ?? "" });
     return Response.json({ id: messageId });
    }
+   if (req.method === "GET" && editMatch) {
+    const messageId = editMatch[1];
+    if (deleted.has(messageId)) {
+     return new Response("not found", { status: 404 });
+    }
+    const exists = posts.some((p) => p.messageId === messageId);
+    return exists
+     ? Response.json({ id: messageId })
+     : new Response("not found", { status: 404 });
+   }
    return new Response("not found", { status: 404 });
   },
  });
@@ -123,6 +134,7 @@ export function fakeDiscord() {
   port: server.port as number,
   posts,
   edits,
+  deleteMessage: (id: string) => deleted.add(id),
   stop: () => server.stop(true),
  };
 }

@@ -1,4 +1,4 @@
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, isNull } from "drizzle-orm";
 import { openDb, type RangerDb } from "./store/db.ts";
 import {
  escalations,
@@ -62,7 +62,10 @@ export interface EscalationRow {
  messageId: string;
  createdAt: string;
  lastEditedAt: string | null;
+ /** open | resolved — a resolved card was edited to a resolved note. */
  status: "open" | "resolved";
+ /** When the queue-exit note was written (bounds the absent-card scan). */
+ notedAt: string | null;
 }
 
 export type EventKind =
@@ -282,7 +285,7 @@ export class Journal {
    Partial<
     Pick<
      EscalationRow,
-     "title" | "route" | "lastContent" | "channelId" | "lastEditedAt" | "status"
+     "title" | "route" | "lastContent" | "channelId" | "lastEditedAt" | "status" | "notedAt"
     >
    >,
  ): void {
@@ -298,6 +301,7 @@ export class Journal {
    createdAt: existing?.createdAt ?? row.createdAt,
    lastEditedAt: row.lastEditedAt ?? existing?.lastEditedAt ?? null,
    status: row.status ?? existing?.status ?? "open",
+   notedAt: row.notedAt === undefined ? (existing?.notedAt ?? null) : row.notedAt,
   };
   this.db
    .insert(escalations)
@@ -369,6 +373,25 @@ export class Journal {
   const rows = this.db.query.escalations
    .findMany({
     where: and(eq(escalations.repo, repo), eq(escalations.status, "open")),
+   })
+   .sync();
+  return rows.map(hydrateEscalation);
+ }
+
+ /**
+  * Open cards whose queue-exit note has NOT yet been written. This is what
+  * the absent-card pass reconciles — once a card is noted, `noted_at` is set
+  * and it drops out of the scan, so per-tick work stays bounded even as
+  * open (persisted) cards accumulate (design §5).
+  */
+ listUnreconciledOpen(repo: string): EscalationRow[] {
+  const rows = this.db.query.escalations
+   .findMany({
+    where: and(
+     eq(escalations.repo, repo),
+     eq(escalations.status, "open"),
+     isNull(escalations.notedAt),
+    ),
    })
    .sync();
   return rows.map(hydrateEscalation);
@@ -455,6 +478,7 @@ function hydrateEscalation(row: {
  createdAt: string;
  lastEditedAt: string | null;
  status: string;
+ notedAt: string | null;
 }): EscalationRow {
  return {
   key: row.key,
@@ -468,6 +492,7 @@ function hydrateEscalation(row: {
   createdAt: row.createdAt,
   lastEditedAt: row.lastEditedAt,
   status: row.status as "open" | "resolved",
+  notedAt: row.notedAt,
  };
 }
 

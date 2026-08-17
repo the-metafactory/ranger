@@ -236,6 +236,35 @@ export class EscalationDiscord {
       );
     }
   }
+
+  /**
+   * Does a message still exist in this channel? The digest's unchanged
+   * same-day path is a write-no-op, so a DELETED message is only noticed via
+   * a read — return false on a definitive 404 so the caller reposts. On a
+   * transient read failure (5xx, network, timeout) assume it exists: a repost
+   * decision must never be made on an unreliable read.
+   */
+  async messageExists(messageId: string): Promise<boolean> {
+    await this.waitForCooldown();
+    await this.throttle();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 30_000);
+    try {
+      const response = await fetch(
+        `${this.apiBase}/channels/${this.channelId}/messages/${messageId}`,
+        {
+          headers: { Authorization: `Bot ${this.token}` },
+          signal: controller.signal,
+        },
+      );
+      if (response.status === 404) return false;
+      return response.ok;
+    } catch {
+      return true; // transient read failure — do not repost on a guess
+    } finally {
+      clearTimeout(timer);
+    }
+  }
 }
 
 /**
@@ -285,6 +314,16 @@ function localDateKey(now: Date): string {
   const m = String(now.getMonth() + 1).padStart(2, "0");
   const d = String(now.getDate()).padStart(2, "0");
   return `${y}-${m}-${d}`;
+}
+
+/** Label a digest run honestly: fresh post | in-place edit | no-op. */
+function digestAction(
+  posted: boolean,
+  edited: boolean,
+): "posted" | "edited" | "unchanged" {
+  if (posted) return "posted";
+  if (edited) return "edited";
+  return "unchanged";
 }
 
 /** Collapse prose to one line, truncating at `max` chars. */
@@ -373,10 +412,11 @@ function cardContent(
   ].filter((line): line is string => line !== null);
   const suffix = ageSuffix(ageDays, principal, principalDiscordId);
   // The body IS the decision payload (grilling question + prose options) —
-  // give it the room the rest of the card leaves up to Discord's message cap
-  // rather than an arbitrary truncation that silently omits options. Other
-  // HITL kinds stay terse. The assembled card is hard-capped below as a final
-  // guard.
+  // give it the room the rest of the card leaves up to Discord's 2000-char
+  // message cap (an arbitrary small cap would drop options sooner). Discord
+  // physically caps the card, so a body longer than the room left is
+  // truncated with an explicit `…` — never silently — and the full body is
+  // always one click away at the `url:` line below.
   const bodyBudget =
     bodyText === null
       ? 0
@@ -683,6 +723,29 @@ async function syncCard(
     config.principal.discordId,
   );
   const key = `${map.repo}:${node.id}`;
+  /** One row assembly shared by post and edit — card fields live in one place. */
+  const escalationRow = (params: {
+   messageId: string;
+   lastContent: string;
+   createdAt: string;
+   lastEditedAt?: string;
+  }) => ({
+   key,
+   repo: map.repo,
+   nodeId: node.id,
+   title: node.title,
+   route: node.route.route,
+   channelId: client.channel,
+   lastContent: params.lastContent,
+   messageId: params.messageId,
+   createdAt: params.createdAt,
+   ...(params.lastEditedAt === undefined
+    ? {}
+    : { lastEditedAt: params.lastEditedAt }),
+   status: "open" as const,
+   // A fresh or re-activated card is never reconciled.
+   notedAt: null,
+  });
   /** Post a fresh card in the client's channel + record row + destination.
    *  The card's age restarts — it is new in this channel. */
   const postFresh = async (): Promise<SyncOutcome> => {
@@ -698,18 +761,11 @@ async function syncCard(
       config.principal.discordId,
     );
     const messageId = await client.post(freshContent);
-    const row = {
-      key,
-      repo: map.repo,
-      nodeId: node.id,
-      title: node.title,
-      route: node.route.route,
-      channelId: client.channel,
-      lastContent: freshContent,
-      messageId,
-      createdAt: now.toISOString(),
-      status: "open" as const,
-    };
+    const row = escalationRow({
+     messageId,
+     lastContent: freshContent,
+     createdAt: now.toISOString(),
+    });
     journal.upsertEscalation(row);
     journal.setEscalationDestination(
       key,
@@ -738,19 +794,12 @@ async function syncCard(
       }
       throw cardError;
     }
-    const row = {
-      key,
-      repo: map.repo,
-      nodeId: node.id,
-      title: node.title,
-      route: node.route.route,
-      channelId: client.channel,
-      lastContent: editContent,
-      messageId,
-      createdAt,
-      lastEditedAt: now.toISOString(),
-      status: "open" as const,
-    };
+    const row = escalationRow({
+     messageId,
+     lastContent: editContent,
+     createdAt,
+     lastEditedAt: now.toISOString(),
+    });
     journal.upsertEscalation(row);
     return {
       action: "edited" as const,
@@ -818,11 +867,12 @@ async function markAbsentCards(
  neededIds: Set<string>,
 ): Promise<{ keptOpen: string[]; errors: string[] }> {
  const { client, journal, map, now } = ctx;
- // Open cards only (resolved history is never materialized). Cards already
- // reconciled to the queue-exit note are skipped by content compare, so as
- // cards age the per-pass work stays bounded; only the write-side resolution
- // lifecycle (node #21) closes cards and shrinks the open set itself.
- const openCards = journal.listOpenEscalations(map.repo);
+ // Reconcile ONLY open cards whose queue-exit note has not been written yet
+ // (`noted_at IS NULL`) — a noted card drops out of the scan entirely, so
+ // per-tick work stays bounded even as open (persisted) cards accumulate.
+ // Closing resolved cards (which shrinks the open set itself) is the
+ // write-side resolution lifecycle (node #21).
+ const openCards = journal.listUnreconciledOpen(map.repo);
  const outcomes = await mapPool(openCards, 3, async (prior) => {
   const nodeId = prior.nodeId;
   if (neededIds.has(nodeId)) return { action: "skip" as const };
@@ -832,10 +882,6 @@ async function markAbsentCards(
   ]
    .filter((l) => l.trim().length > 0)
    .join("\n");
-  // Already reconciled to the queue-exit note — a no-op, no Discord write.
-  if (prior.lastContent === content) {
-   return { action: "unchanged" as const, id: nodeId };
-  }
   try {
    // The note lives where the card lives: if the card's destination moved
    // to another channel, leave the row (no repost noise for an absent node).
@@ -854,6 +900,7 @@ async function markAbsentCards(
     createdAt: prior.createdAt,
     lastEditedAt: now.toISOString(),
     status: prior.status, // stays open — cards persist (design §5)
+    notedAt: now.toISOString(), // reconciled — drops out of the scan
    });
    return { action: "keptOpen" as const, id: nodeId };
   } catch (cardError) {
@@ -1089,6 +1136,8 @@ interface DigestMapResult {
   };
   digestMessageId: string;
   posted: boolean;
+  /** what happened to today's digest message: fresh post | in-place edit | no-op. */
+  action: "posted" | "edited" | "unchanged";
 }
 
 export interface DigestResult {
@@ -1204,6 +1253,7 @@ async function digestOneMap(
     },
     digestMessageId: "",
     posted: false,
+    action: "unchanged" as const,
   };
 
   let token: ResolvedToken;
@@ -1264,11 +1314,22 @@ async function digestOneMap(
     }
     let messageId = "";
     let posted = false;
+    let edited = false;
     if (cached !== null && cached.today === today) {
       messageId = cached.messageId;
-      if (cached.lastContent !== content) {
+      if (cached.lastContent === content) {
+        // Unchanged same-day digest is a write no-op — but a DELETED cached
+        // message is only noticed via a read. Verify it still exists; if it
+        // is definitively gone (404), repost so the daily audit/budget digest
+        // never silently vanishes.
+        if (!(await client.messageExists(messageId))) {
+          messageId = await client.post(content);
+          posted = true;
+        }
+      } else {
         try {
           await client.edit(messageId, content);
+          edited = true;
         } catch (editError) {
           if (!(editError instanceof DiscordMessageGoneError)) throw editError;
           // The cached digest message was deleted (or moved): post a fresh
@@ -1278,11 +1339,11 @@ async function digestOneMap(
           messageId = await client.post(content);
           posted = true;
         }
-        journal.setHealth(
-          `digest.${map.repo}`,
-          JSON.stringify({ today, messageId, lastContent: content }),
-        );
       }
+      journal.setHealth(
+        `digest.${map.repo}`,
+        JSON.stringify({ today, messageId, lastContent: content }),
+      );
     } else {
       messageId = await client.post(content);
       journal.setHealth(
@@ -1300,6 +1361,8 @@ async function digestOneMap(
       openClaims: audit.openClaimed,
       digestMessageId: messageId,
       posted,
+      // Honest label for the operator: fresh post | in-place edit | no-op.
+      action: digestAction(posted, edited),
     };
   } catch (error) {
     return {

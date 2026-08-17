@@ -80,6 +80,8 @@ export const escalations = sqliteTable("escalations", {
  lastEditedAt: text("last_edited_at"),
  /** open | resolved — a resolved card was edited to a resolved note. */
  status: text("status").notNull().default("open"),
+ /** When the queue-exit note was written — reconciles the absent-card scan. */
+ notedAt: text("noted_at"),
 }, (table) => [
  // Repo-scoped escalation lookups (listEscalations) stay indexed as history grows.
  index("escalations_repo_idx").on(table.repo),
