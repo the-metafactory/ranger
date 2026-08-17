@@ -969,22 +969,26 @@ async function syncCard(
     // A fresh or re-activated card is never reconciled.
     notedAt: null,
   });
-  /** Post a fresh card in the client's channel + record row + destination.
-   *  The card's age restarts — it is new in this channel. */
+  /** Persist the card row and build the outcome — the shared tail of every
+   *  successful post/edit. */
+  const saveAndReturn = (
+    row: ReturnType<typeof escalationRow>,
+    action: "posted" | "edited",
+  ): SyncOutcome => {
+    journal.upsertEscalation(row);
+    return { action, id: node.id, card: cardFrom(node, row, ageDays) };
+  };
+  /** Post a fresh card in the client's channel + record row + destination. */
   const postFresh = async (): Promise<SyncOutcome> => {
     if (!charge(budget)) return { action: "deferred", id: node.id };
-    // Render age-0 content INSIDE the post: a reposted card (destination
-    // moved or the old message gone) must start fresh — posting content that
-    // still shows the old age/ping, then editing it back to 0d on the next
-    // pass, would send an erroneous 7-day ping on a brand-new card.
+    // A reposted card (moved channel / message gone) is the SAME unresolved
+    // escalation, re-surfaced WITH ITS AGE (design §5 "edited not reposted,
+    // re-surfaced with age") — a channel move must not erase a card's
+    // 3/7-day escalation state (round-23 review). New cards (prior undefined)
+    // render age 0.
     const freshContent = cardContent(
       node,
       map,
-      // A reposted card (moved channel / message gone) is the SAME
-      // unresolved escalation, re-surfaced WITH ITS AGE (design §5 "edited
-      // not reposted, re-surfaced with age") — a channel move must not erase
-      // a card's 3/7-day escalation state (round-23 review). New cards
-      // (prior undefined) render age 0.
       ageDays,
       config.principal.login,
       config.principal.discordId,
@@ -999,18 +1003,13 @@ async function syncCard(
       // recovery, not the card's age.
       createdAt: prior?.createdAt ?? now.toISOString(),
     });
-    journal.upsertEscalation(row);
     journal.setEscalationDestination(
       key,
       client.channel,
       messageId,
       now.toISOString(),
     );
-    return {
-      action: "posted" as const,
-      id: node.id,
-      card: cardFrom(node, row, ageDays),
-    };
+    return saveAndReturn(row, "posted");
   };
   /** Edit a card message in place; if the message is gone (deleted or in a
    *  moved channel), repost fresh instead of retrying a doomed edit. */
@@ -1034,12 +1033,7 @@ async function syncCard(
       createdAt,
       lastEditedAt: now.toISOString(),
     });
-    journal.upsertEscalation(row);
-    return {
-      action: "edited" as const,
-      id: node.id,
-      card: cardFrom(node, row, ageDays),
-    };
+    return saveAndReturn(row, "edited");
   };
   /** A card whose destination channel moved: recover its existing message in
    *  the CURRENT channel if one exists (edit in place, age kept — it is the
@@ -1345,26 +1339,52 @@ async function escalateOneMap(
     ].filter(cardNeeded);
 
     // Bound the pass so a large frontier can't hold this tick past the walk
-    // interval (each card spends ≥1s in the Discord throttle). The budget is
-    // charged only when syncCard actually POSTs/EDITs — unchanged no-op cards
-    // are free, so the cap bounds real Discord requests, not cards that are
-    // already synced. Deferred cards keep a mismatched lastContent and are
-    // served next tick (round-21 review) — nothing is dropped, the desk just
-    // converges over ticks.
+    // interval. TWO bounds work together (rounds 21–24):
+    //  1. A REQUEST budget charged only when syncCard actually POSTs/EDITs
+    //     (unchanged no-op cards are free) — caps real Discord writes at 50.
+    //  2. A PAGE of candidate nodes evaluated this tick, swept through the
+    //     frontier via a persisted cursor — caps the SQL lookup (SQLite bind
+    //     limit) and the render+decision walk, and nothing starves: the
+    //     cursor advances each tick, so every needed node is eventually
+    //     evaluated, and fresh cards (no row) within the page go first.
     const budget = { remaining: MAX_CARDS_PER_TICK };
+    const cursorKey = `escalate.cursor.${map.repo}`;
+    const sorted = [...needed].sort((a, b) => a.id.localeCompare(b.id));
+    const pageSize = MAX_CARDS_PER_TICK * 2;
+    const offset =
+      sorted.length === 0
+        ? 0
+        : (journal.getInt(cursorKey) % sorted.length);
+    const page = sorted
+      .slice(offset, offset + pageSize)
+      .concat(
+        offset + pageSize > sorted.length
+          ? sorted.slice(0, (offset + pageSize) % sorted.length)
+          : [],
+      );
+    if (sorted.length > 0) {
+      journal.setHealth(
+        cursorKey,
+        String((offset + pageSize) % sorted.length),
+      );
+    }
 
-    // The active pass needs ONLY the rows for nodes on the frontier now —
-    // query them directly instead of scanning the whole repo's escalation
-    // history every 15-minute tick (round-15 review: the scan grows as
-    // cards accumulate until the write-side resolution lifecycle closes
-    // them). The absent-card pass separately queries open cards.
+    // The active pass needs ONLY the rows for the nodes in this tick's page
+    // — query them directly instead of scanning the whole repo's escalation
+    // history every 15-minute tick (round-15 review). The absent-card pass
+    // separately queries open cards.
     const existing = journal.getEscalations(
       map.repo,
-      needed.map((n) => n.id),
+      page.map((n) => n.id),
     );
+    // Fresh cards (no row yet) announce before page re-edits — they are the
+    // urgent ones and must not wait behind a sweep of already-synced cards.
+    const pageOrder = page
+      .filter((n) => !existing.has(n.id))
+      .concat(page.filter((n) => existing.has(n.id)));
 
     const cards: EscalationCard[] = [];
-    const outcomes = await mapPool(needed, 3, (node) =>
+    const outcomes = await mapPool(pageOrder, 3, (node) =>
       syncCard(
         { client, journal, map, config, now, budget },
         node,
