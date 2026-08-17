@@ -62,46 +62,50 @@ export const vetoes = sqliteTable("vetoes", {
  * a card is posted once, edited in place thereafter, and aged from `createdAt`.
  */
 
-export const escalations = sqliteTable("escalations", {
- /** `${repo}:${nodeId}` — one card per node per map. */
- key: text("key").primaryKey(),
- repo: text("repo").notNull(),
- nodeId: text("node_id").notNull(),
- /** Node title at first post — the resolved note keeps a readable remnant. */
- title: text("title"),
- /** The §3 route class at (last) post/edit — escalate-hitl | provisioning. */
- route: text("route"),
- /** The content last sent to Discord — edit-on-change skips identical re-edits. */
- lastContent: text("last_content"),
- /** The Discord channel the card lives in — a moved destination reposts. */
- channelId: text("channel_id"),
- messageId: text("message_id").notNull(),
- createdAt: text("created_at").notNull(),
- lastEditedAt: text("last_edited_at"),
- /** open | resolved — a resolved card was edited to a resolved note. */
- status: text("status").notNull().default("open"),
- /** When the queue-exit note was written — reconciles the absent-card scan. */
- notedAt: text("noted_at"),
-}, (table) => [
- // Repo-scoped escalation lookups (listEscalations) stay indexed as history grows.
- index("escalations_repo_idx").on(table.repo),
- // Hot tick lookups: the active pass (repo+node_id batch) and the absent
- // pass / digest (repo+status open, unreconciled) — composite so the
- // synchronous per-tick queries don't scan every row of the repo.
- index("escalations_repo_node_idx").on(table.repo, table.nodeId),
- index("escalations_repo_status_noted_idx").on(
-  table.repo,
-  table.status,
-  table.notedAt,
- ),
- // The digest's oldest-first capped read (repo, status open, ordered by
- // created_at) — without this it scans+sorts every open card per day.
- index("escalations_repo_status_created_idx").on(
-  table.repo,
-  table.status,
-  table.createdAt,
- ),
-]);
+export const escalations = sqliteTable(
+ "escalations",
+ {
+  /** `${repo}:${nodeId}` — one card per node per map. */
+  key: text("key").primaryKey(),
+  repo: text("repo").notNull(),
+  nodeId: text("node_id").notNull(),
+  /** Node title at first post — the resolved note keeps a readable remnant. */
+  title: text("title"),
+  /** The §3 route class at (last) post/edit — escalate-hitl | provisioning. */
+  route: text("route"),
+  /** The content last sent to Discord — edit-on-change skips identical re-edits. */
+  lastContent: text("last_content"),
+  /** The Discord channel the card lives in — a moved destination reposts. */
+  channelId: text("channel_id"),
+  messageId: text("message_id").notNull(),
+  createdAt: text("created_at").notNull(),
+  lastEditedAt: text("last_edited_at"),
+  /** open | resolved — a resolved card was edited to a resolved note. */
+  status: text("status").notNull().default("open"),
+  /** When the queue-exit note was written — reconciles the absent-card scan. */
+  notedAt: text("noted_at"),
+ },
+ (table) => [
+  // Repo-scoped escalation lookups (listEscalations) stay indexed as history grows.
+  index("escalations_repo_idx").on(table.repo),
+  // Hot tick lookups: the active pass (repo+node_id batch) and the absent
+  // pass / digest (repo+status open, unreconciled) — composite so the
+  // synchronous per-tick queries don't scan every row of the repo.
+  index("escalations_repo_node_idx").on(table.repo, table.nodeId),
+  index("escalations_repo_status_noted_idx").on(
+   table.repo,
+   table.status,
+   table.notedAt,
+  ),
+  // The digest's oldest-first capped read (repo, status open, ordered by
+  // created_at) — without this it scans+sorts every open card per day.
+  index("escalations_repo_status_created_idx").on(
+   table.repo,
+   table.status,
+   table.createdAt,
+  ),
+ ],
+);
 
 /**
  * One card message per (card, destination-channel) pair: when a map's

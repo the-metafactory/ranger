@@ -4,8 +4,11 @@ Operator-recorded evidence for the node #18 (walker live validation) and node `#
 operator (the machine account `ivy-agent`) against the live soma graph on
 2026-08-17. They are **records of what ran, not independently verifiable audit
 artifacts** — the snowflake ids are the Discord message identifiers, and the
-section at the end gives the exact commands to re-verify each claim on a live
-host.
+section at the end gives the commands to RE-RUN the desk and inspect the
+current journal/graph state. Re-running does not independently re-derive the
+historical facts below (the Discord messages themselves, the #19 worker's
+actions, the decisions write): those remain operator-recorded assertions, as
+the end section makes explicit.
 
 ## Claim + research lane under the machine account
 

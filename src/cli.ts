@@ -293,9 +293,7 @@ function renderEscalateText(result: EscalateResult | DigestResult): string {
   }
   if (map.kind === "digest") {
    const d = map;
-   lines.push(
-    `map: ${map.repo} (digest ${d.action} ${d.digestMessageId})`,
-   );
+   lines.push(`map: ${map.repo} (digest ${d.action} ${d.digestMessageId})`);
    lines.push(
     `  cards: ${d.cards.length}${d.cards.length ? ` (${d.cards.map((c) => `#${c.nodeId} ${c.ageDays}d`).join(", ")})` : " — clean"}`,
    );

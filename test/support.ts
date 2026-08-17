@@ -1,5 +1,7 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import type { ChildProcess } from "node:child_process";
+import { spawn } from "node:child_process";
 import { runCmd } from "../src/exec.ts";
 
 export const fixturesBin = join(import.meta.dir, "fixtures", "bin");
@@ -87,6 +89,35 @@ export async function runCli(
  cwd = join(import.meta.dir, ".."),
 ) {
  return runCmd(bun, [cliPath, ...args], { env, cwd });
+}
+
+/**
+ * Spawn the CLI WITHOUT waiting for it — the test gets the ChildProcess so it
+ * can observe mid-run state (e.g. the announce-once lock while a run holds
+ * it) and a `result` promise resolving to {code, stdout, stderr} on exit.
+ */
+export function runCliSpawn(
+ args: string[],
+ env: NodeJS.ProcessEnv,
+ cwd = join(import.meta.dir, ".."),
+): {
+ child: ChildProcess;
+ result: Promise<{ code: number; stdout: string; stderr: string }>;
+} {
+ const child = spawn(bun, [cliPath, ...args], {
+  env,
+  cwd,
+  stdio: ["ignore", "pipe", "pipe"],
+ });
+ let stdout = "";
+ let stderr = "";
+ child.stdout.on("data", (c) => (stdout += c.toString()));
+ child.stderr.on("data", (c) => (stderr += c.toString()));
+ const result = new Promise<{ code: number; stdout: string; stderr: string }>(
+  (resolve) =>
+   child.on("close", (code) => resolve({ code: code ?? -1, stdout, stderr })),
+ );
+ return { child, result };
 }
 
 /**

@@ -1,10 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EscalationDiscord } from "../src/escalate.ts";
 import { Journal } from "../src/journal.ts";
-import { baseConfigLines, fakeDiscord, runCli } from "./support.ts";
+import { baseConfigLines, fakeDiscord, runCli, runCliSpawn } from "./support.ts";
 
 const fixturesBin = join(import.meta.dir, "fixtures", "bin");
 
@@ -129,7 +129,11 @@ function writeFixtures(dir: string, drop: string[] = []): string {
 /** Fake Discord: records POST (new card) and PATCH (edit) with message id + body. */
 /** Fake Discord server: records POSTs and PATCHes for assertion (shared from ./support.ts). */
 
-function envFor(dir: string, discordPort: number): NodeJS.ProcessEnv {
+function envFor(
+  dir: string,
+  discordPort: number,
+  overrides: NodeJS.ProcessEnv = {},
+): NodeJS.ProcessEnv {
   return {
     ...process.env,
     PATH: `${fixturesBin}:${process.env.PATH ?? ""}`,
@@ -139,6 +143,7 @@ function envFor(dir: string, discordPort: number): NodeJS.ProcessEnv {
     RANGER_DISCORD_MIN_INTERVAL_MS: "5", // keep e2e fast
     RANGER_DISCORD_TOKEN: "fake-bot-token",
     RANGER_RO_TEST: "ghp_ro",
+    ...overrides,
   };
 }
 
@@ -336,7 +341,9 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
       // digest would tail-slice the audit + budget sections.
       const longTitle = (n: string) =>
         `This is an extremely long decision title for node ${n} that stretches far beyond a normal card title ` +
-        `so the assembled card list consumes most of the Discord message budget and forces the budget-driven card cap to engage `.repeat(3) +
+        `so the assembled card list consumes most of the Discord message budget and forces the budget-driven card cap to engage `.repeat(
+          3,
+        ) +
         `(end of node ${n} title)`;
       const nodes = Array.from({ length: 5 }, (_, i) => {
         const id = String(21 + i);
@@ -380,7 +387,10 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
       const cards = await runCli(["escalate", "-c", config, "--json"], env);
       expect(JSON.parse(cards.stdout).maps[0].posted).toHaveLength(5);
 
-      const digest = await runCli(["escalate", "--digest", "-c", config, "--json"], env);
+      const digest = await runCli(
+        ["escalate", "--digest", "-c", config, "--json"],
+        env,
+      );
       expect(digest.code).toBe(0);
       const content = discord.posts.at(-1)?.content ?? "";
       // The promised sections survive a long card list.
@@ -492,9 +502,144 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
     }
   });
 
+  test("a resumed holder never unlinks a lock another run reclaimed (nonce fence — round-21 blocker)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ranger-escalate-fence-"));
+    const fixtureDir = mkdtempSync(join(tmpdir(), "ranger-escalate-fence-fx-"));
+    const discord = fakeDiscord();
+    try {
+      writeFixtures(fixtureDir);
+      const config = writeConfig(dir);
+      // Slow throttle so run A holds the lock long enough to observe it.
+      const env = envFor(fixtureDir, discord.port, {
+        RANGER_DISCORD_MIN_INTERVAL_MS: "800",
+      });
+      const lockFile = join(dir, ".escalate.lock");
+      const { result } = runCliSpawn(["escalate", "-c", config], env);
+      // Wait for run A to acquire the lock; capture its nonce + lease.
+      let a: { nonce?: string; pid?: number; leaseUntil?: number } | null =
+        null;
+      for (let i = 0; i < 500; i++) {
+        if (existsSync(lockFile)) {
+          try {
+            a = JSON.parse(readFileSync(lockFile, "utf8"));
+            break;
+          } catch {
+            /* not fully written yet */
+          }
+        }
+        await Bun.sleep(10);
+      }
+      expect(a).not.toBeNull();
+      expect(typeof a?.nonce).toBe("string");
+      expect(a?.nonce?.startsWith(String(a?.pid))).toBe(true);
+      expect(typeof a?.leaseUntil).toBe("number");
+      expect((a?.leaseUntil ?? 0)).toBeGreaterThan(Date.now());
+
+      // Simulate run B reclaiming A's expired lease: the lock now belongs to
+      // another LIVE run (different nonce, valid lease). When A finishes it
+      // must NOT unlink B's lock — the nonce fence (round-21 blocker).
+      writeFileSync(
+        lockFile,
+        JSON.stringify({
+          nonce: "run-b-reclaimed",
+          pid: process.pid, // alive
+          startedAt: Date.now(),
+          leaseUntil: Date.now() + 60_000,
+        }),
+      );
+
+      const res = await result;
+      expect(res.code).toBe(0);
+      expect(existsSync(lockFile)).toBe(true); // A did NOT unlink B's lock
+      const after = JSON.parse(readFileSync(lockFile, "utf8")) as {
+        nonce: string;
+      };
+      expect(after.nonce).toBe("run-b-reclaimed");
+    } finally {
+      discord.stop();
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(fixtureDir, { recursive: true, force: true });
+    }
+  });
+
+  test("caps cards synced per tick (50) and continues the rest next tick (round-21 bound)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ranger-escalate-cap-"));
+    const fixtureDir = mkdtempSync(join(tmpdir(), "ranger-escalate-cap-fx-"));
+    const discord = fakeDiscord();
+    try {
+      // A frontier with 55 needing cards — every one is a typed task/propose
+      // node that classifies as escalate-hitl (55 > the 50/tick cap).
+      const nodes = Array.from({ length: 55 }, (_, i) => {
+        const id = String(100 + i);
+        return {
+          ref: { id },
+          node: {
+            id,
+            title: `Cap card ${id}`,
+            kind: "task",
+            checkpointId: `cap-${id}-done`,
+            autonomy: "propose",
+            probes: [],
+          },
+          status: "open",
+          assignees: [],
+          blockedBy: [],
+          author: "alice",
+          url: `https://github.com/acme/widgets/issues/${id}`,
+          typed: true,
+          parent: { id: "1" },
+        };
+      });
+      writeFileSync(
+        join(fixtureDir, "acme__widgets-frontier.json"),
+        JSON.stringify({ repo: "acme/widgets", root: "1", frontier: nodes }, null, 2),
+      );
+      writeFileSync(
+        join(fixtureDir, "acme__widgets-audit.json"),
+        JSON.stringify(
+          {
+            repo: "acme/widgets",
+            root: "1",
+            nodes: 55,
+            closedWithoutReceipt: [],
+            openWithoutCheckpoint: [],
+            openClaimed: [],
+          },
+          null,
+          2,
+        ),
+      );
+      const config = writeConfig(dir);
+      const env = envFor(fixtureDir, discord.port);
+
+      // Tick 1: exactly the cap is synced (50), never the whole 55.
+      const run1 = await runCli(["escalate", "-c", config, "--json"], env);
+      expect(run1.code).toBe(0);
+      expect(JSON.parse(run1.stdout).maps[0].posted).toHaveLength(50);
+
+      // Tick 2: the remaining 5 (still needed, mismatched lastContent) are
+      // served — nothing was dropped, the desk converged over two ticks.
+      const run2 = await runCli(["escalate", "-c", config, "--json"], env);
+      expect(run2.code).toBe(0);
+      expect(JSON.parse(run2.stdout).maps[0].posted).toHaveLength(5);
+
+      // Tick 3: fully converged — no-op.
+      const run3 = await runCli(["escalate", "-c", config, "--json"], env);
+      expect(run3.code).toBe(0);
+      expect(JSON.parse(run3.stdout).maps[0].posted).toHaveLength(0);
+      expect(JSON.parse(run3.stdout).maps[0].edited).toHaveLength(0);
+    } finally {
+      discord.stop();
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(fixtureDir, { recursive: true, force: true });
+    }
+  });
+
   test("a stale reclaim marker from a crashed reclaim does not strand the desk", async () => {
     const dir = mkdtempSync(join(tmpdir(), "ranger-escalate-marker-"));
-    const fixtureDir = mkdtempSync(join(tmpdir(), "ranger-escalate-marker-fx-"));
+    const fixtureDir = mkdtempSync(
+      join(tmpdir(), "ranger-escalate-marker-fx-"),
+    );
     const discord = fakeDiscord();
     try {
       writeFixtures(fixtureDir);
@@ -532,7 +677,9 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
 
   test("mention syntax in kind/url is inerted, and the overdue suffix survives a huge decision body", async () => {
     const dir = mkdtempSync(join(tmpdir(), "ranger-escalate-suffix-"));
-    const fixtureDir = mkdtempSync(join(tmpdir(), "ranger-escalate-suffix-fx-"));
+    const fixtureDir = mkdtempSync(
+      join(tmpdir(), "ranger-escalate-suffix-fx-"),
+    );
     const discord = fakeDiscord();
     try {
       // One grilling node: kind + url embed `<@1234567890>` (a graph author
@@ -555,7 +702,9 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
         url: "https://github.com/acme/widgets/issues/<@1234567890>",
         typed: true,
         parent: { id: "1" },
-        body: "This is the full grilling question and its options. ".repeat(120),
+        body: "This is the full grilling question and its options. ".repeat(
+          120,
+        ),
       };
       writeFileSync(
         join(fixtureDir, "acme__widgets-frontier.json"),

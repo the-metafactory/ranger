@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
@@ -55,28 +56,27 @@ export class EscalationDiscord {
 
   constructor(
     private readonly token: string,
-  private readonly channelId: string,
-  private readonly apiBase: string = resolveDiscordApiBase(),
-  private readonly principalDiscordId?: string,
-) {
- }
+    private readonly channelId: string,
+    private readonly apiBase: string = resolveDiscordApiBase(),
+    private readonly principalDiscordId?: string,
+  ) {}
 
- /** The configured Discord channel this client posts/edits in. */
- get channel(): string {
-  return this.channelId;
- }
+  /** The configured Discord channel this client posts/edits in. */
+  get channel(): string {
+    return this.channelId;
+  }
 
- /** A client for a DIFFERENT channel, sharing token/base/principal config.
-  *  Used to reconcile a card that lives in a channel the map moved away
-  *  from (patch its queue-exit note where it actually is). */
- forChannel(channelId: string): EscalationDiscord {
-  return new EscalationDiscord(
-   this.token,
-   channelId,
-   this.apiBase,
-   this.principalDiscordId,
-  );
- }
+  /** A client for a DIFFERENT channel, sharing token/base/principal config.
+   *  Used to reconcile a card that lives in a channel the map moved away
+   *  from (patch its queue-exit note where it actually is). */
+  forChannel(channelId: string): EscalationDiscord {
+    return new EscalationDiscord(
+      this.token,
+      channelId,
+      this.apiBase,
+      this.principalDiscordId,
+    );
+  }
 
   static fromMap(
     map: RangerMapConfig,
@@ -117,30 +117,30 @@ export class EscalationDiscord {
    * drift on throttling/timeout behavior). Throws on network errors/timeout.
    */
   private async fetchOnce(
-   path: string,
-   init: {
-    method: "GET" | "POST" | "PATCH";
-    headers?: Record<string, string>;
-    body?: string;
-   },
+    path: string,
+    init: {
+      method: "GET" | "POST" | "PATCH";
+      headers?: Record<string, string>;
+      body?: string;
+    },
   ): Promise<Response> {
-   await this.waitForCooldown();
-   await this.throttle();
-   const controller = new AbortController();
-   const timer = setTimeout(() => controller.abort(), 30_000);
-   try {
-    return await fetch(`${this.apiBase}${path}`, {
-     method: init.method,
-     headers: {
-      Authorization: `Bot ${this.token}`,
-      ...(init.headers ?? {}),
-     },
-     ...(init.body === undefined ? {} : { body: init.body }),
-     signal: controller.signal,
-    });
-   } finally {
-    clearTimeout(timer);
-   }
+    await this.waitForCooldown();
+    await this.throttle();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 30_000);
+    try {
+      return await fetch(`${this.apiBase}${path}`, {
+        method: init.method,
+        headers: {
+          Authorization: `Bot ${this.token}`,
+          ...(init.headers ?? {}),
+        },
+        ...(init.body === undefined ? {} : { body: init.body }),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   private async request(
@@ -206,9 +206,7 @@ export class EscalationDiscord {
       if (attempt === 1 && firstRetryAfterSec > 30) {
         break;
       }
-      await sleep(
-        global ? Math.max(waitMs, 30_000) : Math.min(waitMs, 30_000),
-      );
+      await sleep(global ? Math.max(waitMs, 30_000) : Math.min(waitMs, 30_000));
     }
     throw new EscalateError(
       `discord ${method} ${path} failed after ${lastStatus === 0 ? "setup" : maxAttempts} attempts (last HTTP ${lastStatus}${firstRetryAfterSec > 0 ? `, retry-after ${firstRetryAfterSec}s` : ""})`,
@@ -511,6 +509,12 @@ interface EscalateMapResult {
   /** Node ids whose card was edited in place (edit-not-repost). */
   edited: string[];
   /**
+   * Node ids whose card was deferred because this tick's request budget ran
+   * out (round-21 bound) — the card is still open and still needs a request;
+   * it is served on a later tick. Not an error and not a resolution.
+   */
+  deferred: string[];
+  /**
    * Node ids whose node left the HITL/provisioning queue: the card was
    * edited to a "no longer on queue" note but KEPT open — cards persist
    * until a principal response or operator verb resolves them (design §5).
@@ -611,6 +615,12 @@ function tryAcquireLock(lockFile: string, owner: string): boolean {
  *  is NEVER stale, while a dead/crashed/recycled-pid holder's lease expires
  *  and the lock becomes safely reclaimable. */
 const LOCK_LEASE_MS = 60_000;
+/**
+ * Per-map cap on cards synced in one escalate tick. Bounds the pass so a
+ * large frontier can't starve `walk` (each card spends ≥1s in the Discord
+ * throttle); capped-out cards stay "needed" and are served next tick.
+ */
+const MAX_CARDS_PER_TICK = 50;
 /** Legacy locks (pre-lease, or the reclaim marker) fall back to age. */
 const LOCK_STALE_MS = 30 * 60 * 1000;
 /** The reclaim marker is held for microseconds — any marker this old is a
@@ -642,10 +652,7 @@ function lockOwnerStale(
     // Leased lock: an expired lease is a definitive signal the holder is gone
     // (its heartbeat stopped). This is what makes PID-reuse reclaimable while
     // never touching a live run's renewed lock.
-    if (
-      typeof prior.leaseUntil === "number" &&
-      prior.leaseUntil < Date.now()
-    ) {
+    if (typeof prior.leaseUntil === "number" && prior.leaseUntil < Date.now()) {
       return true;
     }
     // Legacy / marker fallback: dead pid OR old enough to be a crash.
@@ -753,12 +760,21 @@ async function withEscalateLock<T>(
   // can steal its lock) yet a dead/crashed/recycled-pid holder's lease
   // expires and the lock becomes safely reclaimable on the next tick.
   const lockStartedAt = Date.now();
+  // The lock carries a LEASE and an OWNER NONCE. The lease (renewed by a
+  // heartbeat while we hold the lock) makes a live run never-stale, so only
+  // a dead/crashed/recycled-pid holder is reclaimed. The nonce FENCES the
+  // lease: if our lease ever expires and another run reclaims the lock, our
+  // heartbeat and release re-read the lock and act only when the nonce is
+  // still OURS — a resumed holder can never overwrite or unlink a lock
+  // another run now owns (round-21 blocker).
+  const ownerNonce = `${process.pid}-${randomUUID()}`;
   const leaseOwner = () =>
-   JSON.stringify({
-    pid: process.pid,
-    startedAt: lockStartedAt,
-    leaseUntil: Date.now() + LOCK_LEASE_MS,
-   });
+    JSON.stringify({
+      nonce: ownerNonce,
+      pid: process.pid,
+      startedAt: lockStartedAt,
+      leaseUntil: Date.now() + LOCK_LEASE_MS,
+    });
   const owner = leaseOwner();
   for (;;) {
     if (tryAcquireLock(lockFile, owner)) break;
@@ -776,23 +792,54 @@ async function withEscalateLock<T>(
     await sleep(250);
   }
   // Heartbeat: renew the lease while the run is live so a long (or paused)
-  // run is never reclaimed by an expired lease.
+  // run is never reclaimed by an expired lease — but only while the lock is
+  // still OURS. If the nonce changed (another run reclaimed us), stop
+  // heartbeating: never overwrite their lock.
+  let lostOwnership = false;
   const heartbeat = setInterval(() => {
-   try {
-    writeFileSync(lockFile, leaseOwner());
-   } catch {
-    /* lock released — nothing to renew */
-   }
+    try {
+      const cur = JSON.parse(readFileSync(lockFile, "utf8")) as {
+        nonce?: string;
+      };
+      if (cur.nonce !== ownerNonce) {
+        lostOwnership = true;
+        clearInterval(heartbeat);
+        return;
+      }
+      writeFileSync(lockFile, leaseOwner());
+    } catch {
+      /* lock released — nothing to renew */
+    }
   }, LOCK_LEASE_MS / 2);
   try {
     return await fn();
   } finally {
     clearInterval(heartbeat);
     try {
-      rmSync(lockFile, { force: true });
+      // Release only OUR lock: if the nonce changed (reclaimed), leave the
+      // new owner's lock alone — unlinking it would let a third run in.
+      let ours = false;
+      try {
+        const cur = JSON.parse(readFileSync(lockFile, "utf8")) as {
+          nonce?: string;
+        };
+        ours = cur.nonce === ownerNonce;
+      } catch {
+        /* unreadable — nothing to release */
+      }
+      if (ours) rmSync(lockFile, { force: true });
       rmSync(reclaimMarker, { force: true });
     } catch {
       /* best-effort release */
+    }
+    if (lostOwnership) {
+      // We were reclaimed mid-run (lease expired, machine paused >60s): our
+      // cards already posted this run are duplicative of the new holder's —
+      // surface it loudly rather than hiding it.
+      console.error(
+        "[escalate] lock was reclaimed mid-run (lease expired >60s); " +
+          "another run owns the desk now — check for duplicate cards",
+      );
     }
   }
 }
@@ -806,7 +853,18 @@ type SyncOutcome =
   | { action: "posted"; id: string; card: EscalationCard }
   | { action: "edited"; id: string; card: EscalationCard }
   | { action: "unchanged"; id: string; card: EscalationCard }
+  | { action: "deferred"; id: string }
   | { action: "error"; id: string; error: string };
+
+/**
+ * Shared per-map budget of Discord requests (posts + edits) for one tick —
+ * bounds the pass so a large frontier can't starve `walk`. Charged only when
+ * syncCard actually hits the API; unchanged no-ops are free; deferred cards
+ * stay unsynced and are served next tick.
+ */
+interface CardBudget {
+  remaining: number;
+}
 
 async function syncCard(
   ctx: {
@@ -815,11 +873,12 @@ async function syncCard(
     map: RangerMapConfig;
     config: RangerConfig;
     now: Date;
+    budget: CardBudget;
   },
   node: ClassifiedNode,
   prior: EscalationRow | undefined,
 ): Promise<SyncOutcome> {
-  const { client, journal, map, config, now } = ctx;
+  const { client, journal, map, config, now, budget } = ctx;
   const ageDays = prior === undefined ? 0 : dayDiff(prior.createdAt, now);
   const content = cardContent(
     node,
@@ -831,30 +890,40 @@ async function syncCard(
   const key = `${map.repo}:${node.id}`;
   /** One row assembly shared by post and edit — card fields live in one place. */
   const escalationRow = (params: {
-   messageId: string;
-   lastContent: string;
-   createdAt: string;
-   lastEditedAt?: string;
+    messageId: string;
+    lastContent: string;
+    createdAt: string;
+    lastEditedAt?: string;
   }) => ({
-   key,
-   repo: map.repo,
-   nodeId: node.id,
-   title: node.title,
-   route: node.route.route,
-   channelId: client.channel,
-   lastContent: params.lastContent,
-   messageId: params.messageId,
-   createdAt: params.createdAt,
-   ...(params.lastEditedAt === undefined
-    ? {}
-    : { lastEditedAt: params.lastEditedAt }),
-   status: "open" as const,
-   // A fresh or re-activated card is never reconciled.
-   notedAt: null,
+    key,
+    repo: map.repo,
+    nodeId: node.id,
+    title: node.title,
+    route: node.route.route,
+    channelId: client.channel,
+    lastContent: params.lastContent,
+    messageId: params.messageId,
+    createdAt: params.createdAt,
+    ...(params.lastEditedAt === undefined
+      ? {}
+      : { lastEditedAt: params.lastEditedAt }),
+    status: "open" as const,
+    // A fresh or re-activated card is never reconciled.
+    notedAt: null,
   });
+  /** Charge one Discord-request slot from the tick budget. Returns false when
+   *  the budget is exhausted — the card is deferred (kept open + unsynced)
+   *  and served next tick, rather than holding this pass past the walk
+   *  interval. */
+  const charge = (): boolean => {
+    if (budget.remaining <= 0) return false;
+    budget.remaining -= 1;
+    return true;
+  };
   /** Post a fresh card in the client's channel + record row + destination.
    *  The card's age restarts — it is new in this channel. */
   const postFresh = async (): Promise<SyncOutcome> => {
+    if (!charge()) return { action: "deferred", id: node.id };
     // Render age-0 content INSIDE the post: a reposted card (destination
     // moved or the old message gone) must start fresh — posting content that
     // still shows the old age/ping, then editing it back to 0d on the next
@@ -868,9 +937,9 @@ async function syncCard(
     );
     const messageId = await client.post(freshContent);
     const row = escalationRow({
-     messageId,
-     lastContent: freshContent,
-     createdAt: now.toISOString(),
+      messageId,
+      lastContent: freshContent,
+      createdAt: now.toISOString(),
     });
     journal.upsertEscalation(row);
     journal.setEscalationDestination(
@@ -892,6 +961,7 @@ async function syncCard(
     editContent: string,
     createdAt: string,
   ): Promise<SyncOutcome> => {
+    if (!charge()) return { action: "deferred", id: node.id };
     try {
       await client.edit(messageId, editContent);
     } catch (cardError) {
@@ -901,10 +971,10 @@ async function syncCard(
       throw cardError;
     }
     const row = escalationRow({
-     messageId,
-     lastContent: editContent,
-     createdAt,
-     lastEditedAt: now.toISOString(),
+      messageId,
+      lastContent: editContent,
+      createdAt,
+      lastEditedAt: now.toISOString(),
     });
     journal.upsertEscalation(row);
     return {
@@ -913,24 +983,23 @@ async function syncCard(
       card: cardFrom(node, row, ageDays),
     };
   };
+  /** A card whose destination channel moved: recover its existing message in
+   *  the CURRENT channel if one exists (edit in place, age kept — it is the
+   *  same card), else post fresh — never a duplicate while a channel is
+   *  re-visited (destination recovery, round-14/15). */
+  const syncMovedCard = async (prior: EscalationRow): Promise<SyncOutcome> => {
+   const recoveredId = journal.getEscalationDestination(key, client.channel);
+   if (recoveredId !== null) {
+    return editInPlace(recoveredId, content, prior.createdAt);
+   }
+   return postFresh();
+  };
   try {
     if (prior === undefined) {
       return await postFresh();
     }
-    // The card's destination moved (persisted channelId differs from the
-    // current channel): if the card already has a message in the current
-    // channel from a prior visit, RECOVER it (edit in place, age kept — it
-    // is the same card) instead of posting a duplicate; only post fresh the
-    // first time a channel is seen.
     if (prior.channelId !== null && prior.channelId !== client.channel) {
-      const recoveredId = journal.getEscalationDestination(
-        key,
-        client.channel,
-      );
-      if (recoveredId !== null) {
-        return await editInPlace(recoveredId, content, prior.createdAt);
-      }
-      return await postFresh();
+      return await syncMovedCard(prior);
     }
     // Edit-on-change: a 900s tick re-runs ~96×/day; re-editing identical
     // cards churns Discord writes and trips rate limits (observed live).
@@ -964,115 +1033,117 @@ async function syncCard(
  * Returns the node ids kept open this pass.
  */
 async function markAbsentCards(
- ctx: {
-  client: EscalationDiscord;
-  journal: Journal;
-  map: RangerMapConfig;
-  now: Date;
- },
- neededIds: ReadonlySet<string>,
+  ctx: {
+    client: EscalationDiscord;
+    journal: Journal;
+    map: RangerMapConfig;
+    now: Date;
+  },
+  neededIds: ReadonlySet<string>,
 ): Promise<{ keptOpen: string[]; errors: string[] }> {
- const { client, journal, map, now } = ctx;
- // Reconcile ONLY open, un-noted cards ABSENT from the current frontier — a
- // no-op tick never loads (or skips) the active cards (round-19 review), and
- // a noted card drops out entirely. Closing resolved cards (which shrinks
- // the open set) is the write-side resolution lifecycle (node #21).
- const openCards = journal.listUnreconciledOpen(map.repo, neededIds);
- // One throttled client per channel: moved-channel edits share a limiter
- // instead of each card building its own and bursting the 5-writes/5s
- // bucket. Seed with the pass's own client so the current channel reuses
- // its state.
- const clients = new Map<string, EscalationDiscord>([
-  [client.channel, client],
- ]);
- const clientFor = (channelId: string): EscalationDiscord => {
-  let c = clients.get(channelId);
-  if (c === undefined) {
-   c = client.forChannel(channelId);
-   clients.set(channelId, c);
-  }
-  return c;
- };
- const outcomes = await mapPool(openCards, 3, async (prior) => {
-  const nodeId = prior.nodeId;
-  const content = queueExitContent(nodeId, prior.title, map.repo);
-  try {
-   // Reconcile EVERY destination's card: a card that moved channels still
-   // holds a live, actionable message in each visited channel — write the
-   // queue-exit note to all of them so none stays active-looking (round-19
-   // review). Legacy rows (pre-0006, no destination rows) fall back to the
-   // row's own channel/message when known.
-   const stored = journal.getEscalationDestinations(`${map.repo}:${nodeId}`);
-   const destinations =
-    stored.length > 0
-     ? stored
-     : prior.channelId === null
-       ? []
-       : [{ channelId: prior.channelId, messageId: prior.messageId }];
-   let anyEdit = false;
-   for (const dest of destinations) {
-    try {
-     await clientFor(dest.channelId).edit(dest.messageId, content);
-     anyEdit = true;
-    } catch (destError) {
-     if (!(destError instanceof DiscordMessageGoneError)) throw destError;
-     // this destination's card is already gone — nothing to note there
+  const { client, journal, map, now } = ctx;
+  // Reconcile ONLY open, un-noted cards ABSENT from the current frontier — a
+  // no-op tick never loads (or skips) the active cards (round-19 review), and
+  // a noted card drops out entirely. Closing resolved cards (which shrinks
+  // the open set) is the write-side resolution lifecycle (node #21).
+  const openCards = journal.listUnreconciledOpen(map.repo, neededIds);
+  // One throttled client per channel: moved-channel edits share a limiter
+  // instead of each card building its own and bursting the 5-writes/5s
+  // bucket. Seed with the pass's own client so the current channel reuses
+  // its state.
+  const clients = new Map<string, EscalationDiscord>([
+    [client.channel, client],
+  ]);
+  const clientFor = (channelId: string): EscalationDiscord => {
+    let c = clients.get(channelId);
+    if (c === undefined) {
+      c = client.forChannel(channelId);
+      clients.set(channelId, c);
     }
-   }
-   // Set notedAt only after every destination reconciled (or a definitive
-   // 404 each); a transient failure throws → retried next tick.
-   journal.upsertEscalation({
-    key: `${map.repo}:${nodeId}`,
-    repo: map.repo,
-    nodeId,
-    title: prior.title,
-    lastContent: content,
-    messageId: prior.messageId,
-    channelId: prior.channelId,
-    createdAt: prior.createdAt,
-    lastEditedAt: now.toISOString(),
-    status: prior.status, // stays open — cards persist (design §5)
-    notedAt: now.toISOString(),
-   });
-   return {
-    action: (anyEdit ? "keptOpen" : "unchanged") as "keptOpen" | "unchanged",
-    id: nodeId,
-   };
-  } catch (cardError) {
-   // A transient failure on one card must not fail the desk — it retries
-   // next tick and the card stays open.
-   return {
-    action: "error" as const,
-    id: nodeId,
-    error:
-     cardError instanceof Error ? cardError.message : String(cardError),
-   };
+    return c;
+  };
+  const outcomes = await mapPool(openCards, 3, async (prior) => {
+    const nodeId = prior.nodeId;
+    const content = queueExitContent(nodeId, prior.title, map.repo);
+    try {
+      // Reconcile EVERY destination's card: a card that moved channels still
+      // holds a live, actionable message in each visited channel — write the
+      // queue-exit note to all of them so none stays active-looking (round-19
+      // review). Legacy rows (pre-0006, no destination rows) fall back to the
+      // row's own channel/message when known.
+      const stored = journal.getEscalationDestinations(`${map.repo}:${nodeId}`);
+      const destinations =
+        stored.length > 0
+          ? stored
+          : prior.channelId === null
+            ? []
+            : [{ channelId: prior.channelId, messageId: prior.messageId }];
+      let anyEdit = false;
+      for (const dest of destinations) {
+        try {
+          await clientFor(dest.channelId).edit(dest.messageId, content);
+          anyEdit = true;
+        } catch (destError) {
+          if (!(destError instanceof DiscordMessageGoneError)) throw destError;
+          // this destination's card is already gone — nothing to note there
+        }
+      }
+      // Set notedAt only after every destination reconciled (or a definitive
+      // 404 each); a transient failure throws → retried next tick.
+      journal.upsertEscalation({
+        key: `${map.repo}:${nodeId}`,
+        repo: map.repo,
+        nodeId,
+        title: prior.title,
+        lastContent: content,
+        messageId: prior.messageId,
+        channelId: prior.channelId,
+        createdAt: prior.createdAt,
+        lastEditedAt: now.toISOString(),
+        status: prior.status, // stays open — cards persist (design §5)
+        notedAt: now.toISOString(),
+      });
+      return {
+        action: (anyEdit ? "keptOpen" : "unchanged") as
+          | "keptOpen"
+          | "unchanged",
+        id: nodeId,
+      };
+    } catch (cardError) {
+      // A transient failure on one card must not fail the desk — it retries
+      // next tick and the card stays open.
+      return {
+        action: "error" as const,
+        id: nodeId,
+        error:
+          cardError instanceof Error ? cardError.message : String(cardError),
+      };
+    }
+  });
+  const keptOpen: string[] = [];
+  const errors: string[] = [];
+  for (const outcome of outcomes) {
+    if (outcome.action === "error") {
+      errors.push(`#${outcome.id}: ${outcome.error}`);
+    } else if (outcome.action === "keptOpen") {
+      keptOpen.push(outcome.id);
+    }
   }
- });
- const keptOpen: string[] = [];
- const errors: string[] = [];
- for (const outcome of outcomes) {
-  if (outcome.action === "error") {
-   errors.push(`#${outcome.id}: ${outcome.error}`);
-  } else if (outcome.action === "keptOpen") {
-   keptOpen.push(outcome.id);
-  }
- }
- return { keptOpen, errors };
+  return { keptOpen, errors };
 }
 
 /** The deterministic queue-exit note — one source of truth for card content. */
 function queueExitContent(
- nodeId: string,
- title: string | null,
- repo: string,
+  nodeId: string,
+  title: string | null,
+  repo: string,
 ): string {
- return [
-  `~~**#${nodeId}** ${sanitizeGraphText(title ?? "")}~~ no longer on the HITL/provisioning queue`,
-  `map: ${repo} — card kept open; resolves on a principal response or operator verb`,
- ]
-  .filter((l) => l.trim().length > 0)
-  .join("\n");
+  return [
+    `~~**#${nodeId}** ${sanitizeGraphText(title ?? "")}~~ no longer on the HITL/provisioning queue`,
+    `map: ${repo} — card kept open; resolves on a principal response or operator verb`,
+  ]
+    .filter((l) => l.trim().length > 0)
+    .join("\n");
 }
 
 function ageText(
@@ -1156,6 +1227,7 @@ async function escalateOneMap(
     ok: true,
     posted: [],
     edited: [],
+    deferred: [],
     keptOpen: [],
     cardErrors: [],
     cards: [],
@@ -1184,6 +1256,15 @@ async function escalateOneMap(
       ...classified.filter((n) => n.route.route === "provisioning"),
     ].filter(cardNeeded);
 
+    // Bound the pass so a large frontier can't hold this tick past the walk
+    // interval (each card spends ≥1s in the Discord throttle). The budget is
+    // charged only when syncCard actually POSTs/EDITs — unchanged no-op cards
+    // are free, so the cap bounds real Discord requests, not cards that are
+    // already synced. Deferred cards keep a mismatched lastContent and are
+    // served next tick (round-21 review) — nothing is dropped, the desk just
+    // converges over ticks.
+    const budget = { remaining: MAX_CARDS_PER_TICK };
+
     // The active pass needs ONLY the rows for nodes on the frontier now —
     // query them directly instead of scanning the whole repo's escalation
     // history every 15-minute tick (round-15 review: the scan grows as
@@ -1197,15 +1278,19 @@ async function escalateOneMap(
     const cards: EscalationCard[] = [];
     const outcomes = await mapPool(needed, 3, (node) =>
       syncCard(
-        { client, journal, map, config, now },
+        { client, journal, map, config, now, budget },
         node,
         existing.get(node.id),
       ),
     );
     for (const outcome of outcomes) {
-      if (outcome.action === "posted" || outcome.action === "edited") {
-        cards.push(outcome.card);
-      } else if (outcome.action === "unchanged") {
+      if (outcome.action === "deferred") {
+        base.deferred.push(outcome.id);
+      } else if (
+        outcome.action === "posted" ||
+        outcome.action === "edited" ||
+        outcome.action === "unchanged"
+      ) {
         cards.push(outcome.card);
       } else {
         base.cardErrors.push(`#${outcome.id}: ${outcome.error}`);
@@ -1302,8 +1387,17 @@ interface DigestInputs {
 }
 
 function digestContent(inputs: DigestInputs): string {
-  const { map, cards, openCount, ageCounts, audit, budget, principal, principalDiscordId, now } =
-    inputs;
+  const {
+    map,
+    cards,
+    openCount,
+    ageCounts,
+    audit,
+    budget,
+    principal,
+    principalDiscordId,
+    now,
+  } = inputs;
   const header = [
     `:newspaper: **ranger digest** — ${map.repo} (root ${map.root}, walk: ${map.walk}) · ${localDateKey(now)}`,
     "",

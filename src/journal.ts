@@ -1,4 +1,13 @@
-import { and, asc, desc, eq, inArray, isNull, notInArray, sql } from "drizzle-orm";
+import {
+ and,
+ asc,
+ desc,
+ eq,
+ inArray,
+ isNull,
+ notInArray,
+ sql,
+} from "drizzle-orm";
 import { openDb, type RangerDb } from "./store/db.ts";
 import {
  escalations,
@@ -285,7 +294,13 @@ export class Journal {
    Partial<
     Pick<
      EscalationRow,
-     "title" | "route" | "lastContent" | "channelId" | "lastEditedAt" | "status" | "notedAt"
+     | "title"
+     | "route"
+     | "lastContent"
+     | "channelId"
+     | "lastEditedAt"
+     | "status"
+     | "notedAt"
     >
    >,
  ): void {
@@ -301,7 +316,8 @@ export class Journal {
    createdAt: existing?.createdAt ?? row.createdAt,
    lastEditedAt: row.lastEditedAt ?? existing?.lastEditedAt ?? null,
    status: row.status ?? existing?.status ?? "open",
-   notedAt: row.notedAt === undefined ? (existing?.notedAt ?? null) : row.notedAt,
+   notedAt:
+    row.notedAt === undefined ? (existing?.notedAt ?? null) : row.notedAt,
   };
   this.db
    .insert(escalations)
@@ -348,10 +364,7 @@ export class Journal {
    .map((r) => ({ channelId: r.channelId, messageId: r.messageId }));
  }
 
- getEscalationDestination(
-  key: string,
-  channelId: string,
- ): string | null {
+ getEscalationDestination(key: string, channelId: string): string | null {
   const row = this.db.query.escalationDestinations
    .findFirst({
     where: and(
@@ -409,7 +422,7 @@ export class Journal {
   * how many open cards exist (round-17 review: don't materialize all open
   * escalations just to render a capped list).
   */
-  listOpenEscalations(
+ listOpenEscalations(
   repo: string,
   now: Date,
   opts: { limit?: number } = {},
@@ -422,11 +435,7 @@ export class Journal {
   // 3d).
   const dayStart = (daysBack: number) =>
    new Date(
-    Date.UTC(
-     now.getUTCFullYear(),
-     now.getUTCMonth(),
-     now.getUTCDate(),
-    ) -
+    Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()) -
      daysBack * DAY_MS,
    ).toISOString();
   const agedAt = dayStart(3);

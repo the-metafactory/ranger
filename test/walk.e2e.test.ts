@@ -30,7 +30,6 @@ import {
 const fixturesBin = join(import.meta.dir, "fixtures", "bin");
 const dataDir = join(import.meta.dir, "fixtures", "data");
 
-
 function writeConfig(dir: string, extra: string[] = []): string {
  const config = [
   ...baseConfigLines(dir, {
@@ -259,7 +258,7 @@ describe("ranger run-node — research worker full loop (node #13 acceptance)", 
   const dir = mkdtempSync(join(tmpdir(), "ranger-run-"));
   try {
    // Seed a real git origin with a main branch, then a canonical clone.
-const { origin, canonical } = await createCanonicalRepo(dir);
+   const { origin, canonical } = await createCanonicalRepo(dir);
 
    const config = writeConfig(dir);
    // Node 10 is already claimed by the bot (walk claimed it in a prior tick).
@@ -332,7 +331,7 @@ const { origin, canonical } = await createCanonicalRepo(dir);
  test("worker crash with no findings → refused, dead-man increments", async () => {
   const dir = mkdtempSync(join(tmpdir(), "ranger-run-"));
   try {
-const { origin } = await createCanonicalRepo(dir);
+   const { origin } = await createCanonicalRepo(dir);
 
    const config = writeConfig(dir);
    const statePath = writeState(dir, {
@@ -467,7 +466,7 @@ describe("bootstrapWorktree — orphaned branch (node #19 live finding)", () => 
  test("creates the worktree when the worktree branch already exists (no `-b` failure)", async () => {
   const dir = mkdtempSync(join(tmpdir(), "ranger-wt-"));
   try {
-const { canonical } = await createCanonicalRepo(dir);
+   const { canonical } = await createCanonicalRepo(dir);
 
    // Orphan the branch: create `node/10-test-node` but never attach a worktree
    // to it (the crash + prune case — the ref outlives its worktree).
