@@ -822,6 +822,17 @@ async function syncCard(
     if (prior === undefined) {
       return await postFresh();
     }
+    // A card CLOSED by the write-side (node #21) must not be re-activated by
+    // a sync — the row's status is preserved, not force-set to open (round-31
+    // review: closed cards would otherwise reopen on the next content/age
+    // update while still on the frontier).
+    if (prior.status === "closed") {
+      return {
+        action: "unchanged" as const,
+        id: node.id,
+        card: cardFrom(node, prior, ageDays),
+      };
+    }
     if (prior.channelId !== null && prior.channelId !== client.channel) {
       return await syncMovedCard(prior);
     }
@@ -919,24 +930,39 @@ function selectAbsentCards(
   const wanted = Math.max(budget.remaining, 0);
   const scanPage = 50;
   const cursorKey = `escalate.absentCursor.${repo}`;
-  let offset = journal.getInt(cursorKey);
+  // KEYSET cursor (the last row seen: createdAt + nodeId tiebreak) — resumes
+  // AFTER it, which is O(page) per tick instead of the O(offset) skip a
+  // growing queue would incur (round-31 review).
+  let after: { createdAt: string; nodeId: string } | undefined;
+  const cursorRaw = journal.getHealth(cursorKey);
+  if (cursorRaw !== null) {
+    try {
+      after = JSON.parse(cursorRaw) as { createdAt: string; nodeId: string };
+    } catch {
+      after = undefined; // corrupt cursor — restart the sweep
+    }
+  }
   let scanned = 0;
   let reachedEnd = false;
   const openCards: EscalationRow[] = [];
   while (openCards.length < wanted && scanned < MAX_ABSENT_SCAN) {
     const batch = journal.listUnreconciledOpen(repo, neededIds, {
       limit: scanPage,
-      offset,
+      after,
     });
     scanned += batch.length;
     openCards.push(...batch.filter((row) => !neededIds.has(row.nodeId)));
     if (batch.length < scanPage) {
-      reachedEnd = true; // swept the whole set — wrap the cursor next tick
+      reachedEnd = true; // swept the whole set — reset the cursor next tick
       break;
     }
-    offset += scanPage;
+    const last = batch[batch.length - 1]; // non-empty: length >= scanPage here
+    after = { createdAt: last.createdAt, nodeId: last.nodeId };
   }
-  journal.setHealth(cursorKey, String(reachedEnd ? 0 : offset));
+  journal.setHealth(
+    cursorKey,
+    reachedEnd || after === undefined ? "" : JSON.stringify(after),
+  );
   return openCards.slice(0, wanted);
 }
 

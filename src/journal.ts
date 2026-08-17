@@ -3,9 +3,11 @@ import {
  asc,
  desc,
  eq,
+ gt,
  inArray,
  isNull,
  notInArray,
+ or,
  sql,
 } from "drizzle-orm";
 import { openDb, type RangerDb } from "./store/db.ts";
@@ -490,7 +492,7 @@ export class Journal {
  listUnreconciledOpen(
   repo: string,
   excludeNodeIds: ReadonlySet<string> = new Set(),
-  opts: { limit?: number; offset?: number } = {},
+  opts: { limit?: number; after?: { createdAt: string; nodeId: string } } = {},
  ): EscalationRow[] {
   // The NOT IN exclusion is CAPPED: a pathological frontier (thousands of
   // needed nodes) must not exceed SQLite's bind limit. Correctness is
@@ -509,13 +511,27 @@ export class Journal {
      ...(exclude.length === 0
       ? []
       : [notInArray(escalations.nodeId, exclude)]),
+     // KEYSET pagination: resume strictly AFTER the last row seen — O(page),
+     // not O(offset) (round-31 review: a 50k-row queue must not skip ~50k
+     // indexed rows per 50-row batch). nodeId is the tiebreaker (unique per
+     // repo).
+     ...(opts.after === undefined
+      ? []
+      : [
+         or(
+          gt(escalations.createdAt, opts.after.createdAt),
+          and(
+           eq(escalations.createdAt, opts.after.createdAt),
+           gt(escalations.nodeId, opts.after.nodeId),
+          ),
+         ),
+        ]),
     ),
     // Oldest exits first (most urgent), and capped to the remaining request
     // budget so a large drain can't walk every unnoted card after the budget
     // is spent (round-23 review) - the rest are deferred to the next tick.
     orderBy: asc(escalations.createdAt),
     ...(opts.limit === undefined ? {} : { limit: opts.limit }),
-    ...(opts.offset === undefined ? {} : { offset: opts.offset }),
    })
    .sync();
   return rows.map(hydrateEscalation);

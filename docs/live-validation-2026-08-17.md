@@ -105,9 +105,15 @@ can observe):
   actively renewing is never stolen. Residual windows, disclosed honestly:
   (1) a run PAUSED >60s (e.g. machine suspend) stops heartbeating, so its
   lease expires and another run may reclaim it — the resumed holder's nonce
-  fence keeps it from overwriting/unlinking the new owner's lock, but both
-  runs may already have posted cards in that window (a visible, recoverable
-  duplicate — the inherent cost of a lease); (2) if a process dies
+  fence REDUCES (but does not eliminate, round-31) the chance it clobbers the
+  new owner's lock: the heartbeat write and the release unlink re-read the
+  nonce first, and a plain file read-then-write/remove is NOT an atomic
+  compare-and-swap, so a reclaim that lands between the resumed holder's read
+  and its write/unlink can still be overwritten/unlinked (a tiny TOCTOU
+  window — the inherent limit of file-based locking without a CAS primitive;
+  Node/Bun expose none). Both runs may also already have posted cards in that
+  window (a visible, recoverable duplicate — the inherent cost of a lease);
+  (2) if a process dies
   mid-reclaim at the exact instant another run re-creates the marker, a
   stale-cleanup could
   unlink a just-created marker and, under a pathological ≥3-contender

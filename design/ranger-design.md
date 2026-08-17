@@ -220,11 +220,15 @@ Everything parked or vetoed is terminal until an operator verb. Silence never un
   see the whole frontier to know which nodes are escalate-hitl vs
   implement/research (paging routing would miss escalate nodes elsewhere in
   the frontier) — and is shared scheduling work, not an escalation-lane cost.
-  It is fetched ONCE per map per tick and reused by the escalation pass and
-  the walk claim phase (round-28 review).
+  The frontier is fetched TWICE per map per tick (round-29 revert): once by
+  the escalation pass for cards and once by the walk claim phase. The second
+  read is a deliberate correctness cost — walk must classify from a FRESH
+  read; reusing the escalation pass's ~120s-old frontier could misroute a
+  node edited to HITL in that window (a stale classification would
+  announce+claim it). Two bounded reads per tick, not one (round-31 review).
   For ranger's maps the frontier is small; a pathological multi-thousand-node
-  frontier pays one O(frontier) read per tick, which is the graph's cost, not
-  a pass that grows with the escalation backlog (round-27 review).
+  frontier pays two O(frontier) reads per tick, which is the graph's cost,
+  not a pass that grows with the escalation backlog (round-27 review).
 - When #2517 lands, the lane cap is a config integer, not a redesign.
 
 Claim-level safety against the principal's concurrent interactive sessions is inherited from the verb (post-write re-read + deterministic tie-break), not built.

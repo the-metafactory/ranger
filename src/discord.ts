@@ -48,6 +48,38 @@ export function resolveDiscordApiBase(
 
 // ---- Escalation desk transport (moved from escalate.ts, round-28) ----
 
+/**
+ * Rate-limit policy for one Discord 429: parse Retry-After, classify global
+ * vs local, and decide the (uncapped) wait + whether to fail fast (a hot
+ * card's long first cooldown — retrying into it just extends it, so the card
+ * is deferred to next tick instead of hammering). Pure and small so the
+ * transport loop (`request`) stays focused on issuing attempts (round-31
+ * suggestion).
+ */
+function rateLimitWait(
+  response: Response,
+  attempt: number,
+): {
+  waitMs: number;
+  global: boolean;
+  failFast: boolean;
+  firstRetryAfterSec: number;
+} {
+  const retryAfter = Number(response.headers.get("retry-after"));
+  const firstRetryAfterSec = Number.isFinite(retryAfter) ? retryAfter : 0;
+  const global = response.headers.get("x-ratelimit-global") !== null;
+  const waitMs =
+    Number.isFinite(retryAfter) && retryAfter > 0
+      ? retryAfter * 1000
+      : 1000 * 2 ** (attempt - 1);
+  return {
+    waitMs,
+    global,
+    failFast: attempt === 1 && firstRetryAfterSec > 30,
+    firstRetryAfterSec,
+  };
+}
+
 export class EscalateError extends Error {
   override name = "EscalateError";
 }
@@ -251,16 +283,9 @@ export class EscalationDiscord {
         return response;
       }
       lastStatus = response.status;
-      const retryAfter = Number(response.headers.get("retry-after"));
-      if (attempt === 1) {
-        firstRetryAfterSec = Number.isFinite(retryAfter) ? retryAfter : 0;
-      }
-      const global = response.headers.get("x-ratelimit-global") !== null;
-      const waitMs =
-        Number.isFinite(retryAfter) && retryAfter > 0
-          ? retryAfter * 1000
-          : 1000 * 2 ** (attempt - 1);
-      if (global) {
+      const policy = rateLimitWait(response, attempt);
+      if (attempt === 1) firstRetryAfterSec = policy.firstRetryAfterSec;
+      if (policy.global) {
         // Advance the client-wide deadline so every pooled request waits
         // this out too, not just this one. CAPPED at MAX_COOLDOWN_MS: an
         // arbitrary Retry-After (Discord can return minutes-to-an-hour) must
@@ -268,27 +293,21 @@ export class EscalationDiscord {
         // (round-26 review: "escalation never blocks walking"). After the
         // cap the request resumes, likely 429s again, and the attempt budget
         // eventually defers the card rather than sleeping the whole cooldown.
-        const cooldownMs = Math.max(waitMs, 30_000);
+        const cooldownMs = Math.max(policy.waitMs, 30_000);
         this.cooldownUntil = Math.min(
           Math.max(this.cooldownUntil, Date.now() + cooldownMs),
           Date.now() + MAX_COOLDOWN_MS,
         );
       }
-      // A long first cooldown (>30s) means the card is hot; retrying into it
-      // just extends it (observed live) — fail fast so the card is deferred
-      // to next tick instead of hammering.
-      if (attempt === 1 && firstRetryAfterSec > 30) {
-        break;
+      if (policy.failFast) {
+        break; // hot card — defer to next tick instead of hammering
       }
       // The per-attempt sleep is CAPPED like the cooldown deadline — a large
       // Retry-After must not hold this attempt (and hence the tick) for the
-      // full value; the request resumes, 429s again, and the attempt budget
-      // defers the card. The sleep is also CAPPED at the pass deadline — a
-      // 429 just before expiry must not sleep past the bound (round-29
-      // review).
-      const cappedWait = global
-        ? Math.min(Math.max(waitMs, 30_000), MAX_COOLDOWN_MS)
-        : Math.min(waitMs, 30_000);
+      // full value — and also capped at the pass deadline (round-29 review).
+      const cappedWait = policy.global
+        ? Math.min(Math.max(policy.waitMs, 30_000), MAX_COOLDOWN_MS)
+        : Math.min(policy.waitMs, 30_000);
       await sleep(
         deadline === undefined
           ? cappedWait
