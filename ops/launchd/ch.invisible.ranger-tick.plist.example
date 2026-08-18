@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- ranger walker tick: one bounded autonomous pass per interval (design
+         §1). Runs the token-injecting wrapper (~/bin/ranger) so the machine
+         account's write PAT (auth.writeTokens → keychain `ivy-agent`) and the
+         grove Discord bot token are present in the tick env (map node #18).
+         `ranger tick` runs the escalation cards pass (design #5) then the walk
+         claim phase (design #1), so HITL/provisioning cards are posted/edited
+         on the schedule, not just by the daily digest (round-5 review).
+         Provisioned at node #11; cards pass wired into the tick at #20 round 5.
+         Activation:
+           launchctl unload ...; launchctl load ... -->
+    <key>Label</key>
+    <string>ch.invisible.ranger-tick</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/__USER__/bin/ranger</string>
+        <string>tick</string>
+        <string>--config</string>
+        <string>/Users/__USER__/work/mf/ranger/ranger.yaml</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>900</integer>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>/Users/__USER__/.config/ranger/logs/walk.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/__USER__/.config/ranger/logs/walk.stderr.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/__USER__/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>/Users/__USER__</string>
+    </dict>
+</dict>
+</plist>

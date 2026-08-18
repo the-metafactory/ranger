@@ -1,0 +1,1 @@
+CREATE INDEX `escalations_repo_status_created_idx` ON `escalations` (`repo`,`status`,`created_at`);

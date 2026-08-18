@@ -1,0 +1,1 @@
+ALTER TABLE `escalations` ADD `last_content` text;

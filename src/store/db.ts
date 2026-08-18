@@ -3,7 +3,7 @@ import { chmodSync, existsSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { drizzle, type BunSQLiteDatabase } from "drizzle-orm/bun-sqlite";
 import { migrate } from "drizzle-orm/bun-sqlite/migrator";
-import * as schema from "./schema";
+import * as schema from "./schema.ts";
 
 export type RangerDb = BunSQLiteDatabase<typeof schema>;
 
@@ -33,8 +33,12 @@ export function openDb(path: string): { db: RangerDb; close: () => void } {
       if (suffix === "" || existsSync(f)) chmodSync(f, 0o600);
     }
   }
-  sqlite.run("PRAGMA journal_mode = WAL;");
   sqlite.run("PRAGMA busy_timeout = 5000;");
+  // WAL switch needs an exclusive lock — the busy handler must be armed
+  // BEFORE it, or a transient WAL-recovery lock (previous process's WAL not
+  // yet checkpointed) returns an immediate SQLITE_BUSY "database is locked"
+  // on open (observed flaking under test load).
+  sqlite.run("PRAGMA journal_mode = WAL;");
   sqlite.run("PRAGMA foreign_keys = ON;");
 
   const db = drizzle(sqlite, { schema });

@@ -77,6 +77,14 @@ export interface GraphCallOptions {
   timeoutMs?: number;
 }
 
+/** Hard timeout for every graph CLI call (round-29): a hung `soma` subprocess
+ *  must not hold the tick past its bound. Generous: the CLI responds in
+ *  seconds; this covers slow networks without letting a hang block the pass
+ *  bound. Shared by the escalation pass and walk's fresh-read (round-33:
+ *  walk.ts's re-fetch was previously unbounded).
+ */
+export const GRAPH_CALL_TIMEOUT_MS = 60_000;
+
 interface CallGraphArgs {
   verb: ReadonlyVerb;
   root: string;

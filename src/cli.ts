@@ -37,6 +37,12 @@ import {
 import { runNode } from "./worker.ts";
 import { sweepMap } from "./sweep.ts";
 import { walk } from "./walk.ts";
+import {
+ escalateMaps,
+ runDigest,
+ type EscalateResult,
+ type DigestResult,
+} from "./escalate.ts";
 import type { WalkMode } from "./config.ts";
 
 /**
@@ -159,7 +165,10 @@ async function runScout(opts: ScoutOptions): Promise<ScoutReport> {
 
 // ---- walker commands ----
 
-function loadCtx(configPath: string): { config: RangerConfig; journal: Journal } {
+function loadCtx(configPath: string): {
+ config: RangerConfig;
+ journal: Journal;
+} {
  const { config } = loadConfig(configPath);
  const journal = openJournal(config);
  return { config, journal };
@@ -203,7 +212,12 @@ async function runSweep(configPath: string): Promise<string> {
  const results = [];
  for (const map of config.maps) {
   if (map.walk === "none") {
-   results.push({ repo: map.repo, walk: map.walk, swept: false, reason: "walk: none" });
+   results.push({
+    repo: map.repo,
+    walk: map.walk,
+    swept: false,
+    reason: "walk: none",
+   });
    continue;
   }
   try {
@@ -235,13 +249,17 @@ async function runJournal(
   deadmanCount: journal.deadmanCount(),
   spawnsToday: journal.spawnsToday(),
   workers: journal.listWorkers(target),
+  escalations: journal.listEscalations(target),
   events: journal.listEvents(target, 50),
  };
  journal.close();
  return JSON.stringify(rows, null, 2);
 }
 
-function pickMap(config: RangerConfig, repo: string | undefined): RangerMapConfig {
+function pickMap(
+ config: RangerConfig,
+ repo: string | undefined,
+): RangerMapConfig {
  if (repo !== undefined) {
   const map = config.maps.find((m) => m.repo === repo);
   if (map === undefined) {
@@ -256,12 +274,52 @@ function pickMap(config: RangerConfig, repo: string | undefined): RangerMapConfi
 }
 
 function normalizeRepo(repo: string, config: RangerConfig): string {
- const map = config.maps.find((m) => m.repo === repo || m.repo.endsWith(`/${repo}`));
+ const map = config.maps.find(
+  (m) => m.repo === repo || m.repo.endsWith(`/${repo}`),
+ );
  return map?.repo ?? repo;
 }
 
 function renderWalkJson(result: unknown): string {
  return JSON.stringify(result, null, 2);
+}
+
+function renderEscalateText(result: EscalateResult | DigestResult): string {
+ const lines: string[] = [`ranger escalate — ${result.generatedAt}`];
+ for (const map of result.maps) {
+  if (!map.ok) {
+   lines.push(`map: ${map.repo}`, `  ✗ FAILED — ${map.error}`, "");
+   continue;
+  }
+  if (map.kind === "digest") {
+   const d = map;
+   lines.push(`map: ${map.repo} (digest ${d.action} ${d.digestMessageId})`);
+   lines.push(
+    `  cards: ${d.cards.length}${d.cards.length ? ` (${d.cards.map((c) => `#${c.nodeId} ${c.ageDays}d`).join(", ")})` : " — clean"}`,
+   );
+   lines.push(
+    `  audit: receipt-less ${d.receiptLessCloses.length}${d.receiptLessCloses.length ? ` ${d.receiptLessCloses.join(",")}` : ""} · stale ${d.openClaims.length} · budget ${d.budget.spawnsToday}/${d.budget.spawnCapPerDay}${d.budget.paused ? " PAUSED" : ""}`,
+   );
+  } else {
+   const e = map;
+   lines.push(`map: ${map.repo}`);
+   lines.push(
+    `  posted: ${e.posted.length ? e.posted.map((n) => `#${n}`).join(", ") : "—"}`,
+   );
+   lines.push(
+    `  edited: ${e.edited.length ? e.edited.map((n) => `#${n}`).join(", ") : "—"}`,
+   );
+   lines.push(
+    `  keptOpen: ${e.keptOpen.length ? e.keptOpen.map((n) => `#${n}`).join(", ") : "—"}`,
+   );
+   lines.push(`  cards: ${e.cards.length}`);
+   if (e.cardErrors.length > 0) {
+    lines.push(`  ⚠ retry-next-tick: ${e.cardErrors.join("; ")}`);
+   }
+  }
+  lines.push("");
+ }
+ return lines.join("\n").trimEnd();
 }
 
 const program = new Command();
@@ -279,7 +337,10 @@ program
  .option("-j, --json", "emit machine-readable JSON")
  .action(async (options: { config: string; json: boolean }) => {
   try {
-   const report = await runScout({ config: options.config, json: options.json });
+   const report = await runScout({
+    config: options.config,
+    json: options.json,
+   });
    process.stdout.write(
     options.json ? renderJson(report) + "\n" : renderText(report) + "\n",
    );
@@ -312,8 +373,70 @@ program
  });
 
 program
+ .command("tick")
+ .description(
+  "One bounded autonomous pass (design §1): escalation cards (design §5) then the walk claim phase — so HITL/provisioning cards are posted/edited on the schedule, not just by the daily digest. The launchd tick runs this.",
+ )
+ .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
+ .action(async (options: { config: string }) => {
+  const configPath = resolve(process.cwd(), options.config);
+  let config: RangerConfig;
+  let journal: Journal;
+  try {
+   ({ config, journal } = loadCtx(configPath));
+  } catch (error) {
+   process.stderr.write(
+    `ranger tick: ${error instanceof Error ? error.message : String(error)}\n`,
+   );
+   process.exit(1);
+  }
+  // Escalation must NOT prevent walking: a lock-contention timeout (an
+  // overlapping digest/cards run holds the desk) or any other escalate
+  // failure is REPORTED in the output, but walk still runs — scheduled
+  // claims are independent of the desk (round-34 review).
+  let escalateResult: EscalateResult | null = null;
+  let escalateError: string | undefined;
+  try {
+   escalateResult = await escalateMaps(config, journal);
+  } catch (error) {
+   escalateError = error instanceof Error ? error.message : String(error);
+  }
+  try {
+   // walk re-fetches its OWN frontier: claims must classify from a fresh
+   // read — a ~120s-old escalation-pass frontier could misroute a node
+   // edited to HITL in that window (round-29 review).
+   const walkResult = await walk({ config, configPath, journal });
+   journal.close();
+   process.stdout.write(
+    JSON.stringify(
+     {
+      generatedAt: new Date().toISOString(),
+      escalate: escalateResult ?? { error: escalateError, maps: [] },
+      walk: walkResult,
+     },
+     null,
+     2,
+    ) + "\n",
+   );
+   const failed =
+    escalateError !== undefined ||
+    (escalateResult?.maps.some((m) => !m.ok) ?? false) ||
+    walkResult.maps.some((m) => m.errors.length > 0);
+   process.exit(failed ? 2 : 0);
+  } catch (error) {
+   journal.close();
+   process.stderr.write(
+    `ranger tick: ${error instanceof Error ? error.message : String(error)}\n`,
+   );
+   process.exit(1);
+  }
+ });
+
+program
  .command("run-node")
- .description("Detached worker supervisor: worktree, research worker, gated close, decisions --write")
+ .description(
+  "Detached worker supervisor: worktree, research worker, gated close, decisions --write",
+ )
  .argument("<id>", "node id to execute")
  .option("-m, --map <repo>", "map repo (required with multiple maps)")
  .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
@@ -331,7 +454,9 @@ program
 
 program
  .command("sweep")
- .description("Reconcile the journal against reality (crashed workers, stale claims)")
+ .description(
+  "Reconcile the journal against reality (crashed workers, stale claims)",
+ )
  .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
  .action(async (options: { config: string }) => {
   try {
@@ -361,6 +486,44 @@ program
    process.exit(1);
   }
  });
+
+program
+ .command("escalate")
+ .description(
+  "Escalation desk (design §5): post/edit HITL + provisioning cards in each map's Discord thread (announce-once, edit-not-repost, age-banded); --digest emits the daily aged-cards + audit + budget digest. Graph-read-only.",
+ )
+ .option("--digest", "emit the daily digest instead of the cards pass")
+ .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
+ .option("-j, --json", "emit machine-readable JSON")
+ .action(
+  async (options: { digest: boolean; config: string; json: boolean }) => {
+   try {
+    const configPath = resolve(process.cwd(), options.config);
+    const { config } = loadConfig(configPath);
+    const journal = openJournal(config);
+    // Test seam: RANGER_NOW injects the clock (age-banding tests).
+    const now = process.env.RANGER_NOW
+     ? new Date(process.env.RANGER_NOW)
+     : undefined;
+    const result = options.digest
+     ? await runDigest(config, journal, now === undefined ? {} : { now })
+     : await escalateMaps(config, journal, now === undefined ? {} : { now });
+    journal.close();
+    process.stdout.write(
+     options.json
+      ? JSON.stringify(result, null, 2) + "\n"
+      : renderEscalateText(result) + "\n",
+    );
+    const failed = result.maps.some((m) => !m.ok);
+    process.exit(failed ? 2 : 0);
+   } catch (error) {
+    process.stderr.write(
+     `ranger escalate: ${error instanceof Error ? error.message : String(error)}\n`,
+    );
+    process.exit(1);
+   }
+  },
+ );
 
 program.parseAsync(process.argv).catch((error) => {
  process.stderr.write(

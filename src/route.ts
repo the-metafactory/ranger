@@ -29,9 +29,14 @@ export interface ClassifiedNode {
   autonomy: string;
   typed: boolean;
   url: string;
+  checkpointId?: string;
   route: RouteClass;
   /** Auto node declaring command/url probes — the class-5 signal. */
   registryBlocked: boolean;
+  /** The blocked probe specs (run/cwd/host) — rendered on provisioning cards. */
+  blockedProbes?: BlockedProbe[];
+  /** The node question/prose body — rendered on grilling cards (design §5). */
+  body?: string;
 }
 
 export interface ClassifyContext {
@@ -84,8 +89,29 @@ export function probesRegistryBlocked(
   repo: string,
   registry: ProbeRegistry,
 ): boolean {
+  return blockedProbeSpecs(node, repo, registry).length > 0;
+}
+
+/** A declared probe the registry does not satisfy (class-5 preflight). */
+export interface BlockedProbe {
+  type: "command" | "url";
+  /** command probe — the exact run string the registry must declare. */
+  run?: string;
+  /** command probe — the exact cwd the registry must declare. */
+  cwd?: string;
+  /** url probe — the target host the registry must declare. */
+  target?: string;
+  host?: string;
+}
+
+/** The declared probes that are not satisfiable by the registry on this host. */
+export function blockedProbeSpecs(
+  node: FrontierEntry["node"],
+  repo: string,
+  registry: ProbeRegistry,
+): BlockedProbe[] {
   const probes = node.probes ?? [];
-  if (probes.length === 0) return false;
+  if (probes.length === 0) return [];
   const repoEntry = registry.repos?.[repo];
   const declaredCommands = new Set(
     (repoEntry?.commands ?? []).map((c) => `${c.run}\u0000${c.cwd}`),
@@ -93,11 +119,14 @@ export function probesRegistryBlocked(
   const declaredHosts = new Set(
     (repoEntry?.urlHosts ?? []).map((h) => h.toLowerCase()),
   );
+  const blocked: BlockedProbe[] = [];
   for (const probe of probes) {
     if (probe.type === "command") {
       const run = typeof probe.run === "string" ? probe.run : "";
       const cwd = typeof probe.cwd === "string" ? probe.cwd : "";
-      if (!declaredCommands.has(`${run}\u0000${cwd}`)) return true;
+      if (!declaredCommands.has(`${run}\u0000${cwd}`)) {
+        blocked.push({ type: "command", run, cwd });
+      }
     } else if (probe.type === "url") {
       let host = "";
       const target = typeof probe.target === "string" ? probe.target : "";
@@ -105,12 +134,15 @@ export function probesRegistryBlocked(
         host = new URL(target).host.toLowerCase();
       } catch {
         /* unparseable target counts as blocked */
-        return true;
+        blocked.push({ type: "url", target, host: "(unparseable)" });
+        continue;
       }
-      if (!declaredHosts.has(host)) return true;
+      if (!declaredHosts.has(host)) {
+        blocked.push({ type: "url", target, host });
+      }
     }
   }
-  return false;
+  return blocked;
 }
 
 /**
@@ -133,7 +165,9 @@ export function classify(
     autonomy,
     typed,
     url: node.url,
+    checkpointId: node.node.checkpointId,
     registryBlocked: false,
+    body: node.body,
   };
 
   // Class 4 — untyped block (fail-safe approve). Reported as needs-typing.
@@ -159,9 +193,14 @@ export function classify(
     // Unknown autonomy value — fail safe toward escalation.
     return { ...base, route: { route: "escalate-hitl", reason: "untyped" } };
   }
-  const blocked = probesRegistryBlocked(node.node, repo, registry);
-  if (blocked) {
-    return { ...base, registryBlocked: true, route: { route: "provisioning" } };
+  const blockedProbes = blockedProbeSpecs(node.node, repo, registry);
+  if (blockedProbes.length > 0) {
+    return {
+      ...base,
+      registryBlocked: true,
+      blockedProbes,
+      route: { route: "provisioning" },
+    };
   }
   if (kind === "research") {
     return {

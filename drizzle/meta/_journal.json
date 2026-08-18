@@ -8,6 +8,83 @@
       "when": 1786918227425,
       "tag": "0000_overconfident_agent_zero",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1786958151459,
+      "tag": "0001_escalations",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1786962371703,
+      "tag": "0002_escalation-route",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1786972544465,
+      "tag": "0003_escalation-last-content",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1786982040432,
+      "tag": "0004_escalation-channel",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1786982123316,
+      "tag": "0005_escalation-repo-index",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1786983423280,
+      "tag": "0006_escalation-destinations",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1786984651850,
+      "tag": "0007_escalation-noted-at",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1786986228796,
+      "tag": "0008_escalation-composite-indexes",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "6",
+      "when": 1786988354196,
+      "tag": "0009_escalation-created-index",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "6",
+      "when": 1786997826046,
+      "tag": "0010_escalation-noted-created-index",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "6",
+      "when": 1787006714145,
+      "tag": "0011_escalation-drop-redundant-indexes",
+      "breakpoints": true
     }
   ]
 }

@@ -11,6 +11,15 @@ fi
 path="${2:-}"
 case "$path" in
   /user)
+    # login depends on the credential: write token → machine account, a
+    # principal-token sentinel → the principal, else the read account.
+    login="scout-test"
+    if [ "${GH_TOKEN:-}" = "ghp_write" ]; then
+      login="ivy-bot"
+    fi
+    if [ "${GH_TOKEN:-}" = "ghp_principal" ]; then
+      login="jcfischer"
+    fi
     if [ "${3:-}" = "-i" ]; then
       scopes="${GH_SCOPES:-}"
       cat <<EOF
@@ -19,8 +28,12 @@ content-type: application/json; charset=utf-8
 x-oauth-scopes: ${scopes}
 x-github-request-id: fake
 
-{"login":"scout-test","id":1,"type":"User"}
+{"login":"${login}","id":1,"type":"User"}
 EOF
+      exit 0
+    fi
+    if [ "${3:-}" = "--jq" ] && [ "${4:-}" = ".login" ]; then
+      echo "${login}"
       exit 0
     fi
     ;;

@@ -2,8 +2,16 @@
 # Fake ranger research worker for tests. Receives the assembled prompt as $1.
 # Performs the research SOP in the worktree: create the throwaway
 # research/api-survey branch (the declared git-ref-exists probe ref), write
-# findings.md, commit, push to origin.
+# findings.md, commit LOCALLY — NO push: the worker never holds the write
+# PAT (round-38 security blocker); the SUPERVISOR performs the vetted push.
 set -euo pipefail
+
+# Security guard (round-38): the worker must NEVER see the write PAT — the
+# supervisor performs the vetted push. Fail hard if it leaks into the env.
+if [ -n "${GIT_CONFIG_VALUE_0:-}" ]; then
+  echo "worker env leaked the write PAT — refusing to run" >&2
+  exit 3
+fi
 
 cd "$(git rev-parse --show-toplevel)"
 git checkout -b research/api-survey
@@ -20,5 +28,4 @@ Recommendation: adopt the API; the auth model fits the existing stack.
 EOF
 git add findings.md
 git commit -m "research findings: api-survey"
-git push -u origin research/api-survey
 echo "fake worker done; prompt bytes: ${#1}"

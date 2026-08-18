@@ -4,6 +4,8 @@
 # ("Walk-mode opt-in and charting guidance"). Scout reads the maps registry +
 # auth; the walker's walk-mode schema is #6's business. Node #11 (provisioning,
 # closed) added the per-run Discord escalation surface (node #7 ruling).
+# Node #18 (live validation): the ranger map opts in to walk: research-only so
+# the machine account can walk the auto research node #19 end-to-end.
 
 version: 1
 
@@ -12,7 +14,7 @@ version: 1
 maps:
   - repo: the-metafactory/ranger
     root: 1
-    walk: none
+    walk: research-only
     # Per-run escalation surface (node #7): one channel per run, decided per
     # walk. The Metafactory guild has no #ranger channel and the reused grove
     # bot lacks MANAGE_CHANNELS there, so the run posts to #soma (one thread
@@ -37,3 +39,24 @@ auth:
   readOnlyTokens:
     "the-metafactory/*": RANGER_READONLY_GH_TOKEN_METAFACTORY
     "jcfischer/*": RANGER_READONLY_GH_TOKEN_PERSONAL
+  # The machine-account WRITE credential (node #11): a single classic
+  # `repo`-scoped PAT covers both the org and personal walked repos, so both
+  # prefixes map to env names the ~/bin/ranger wrapper exports from the
+  # `ivy-agent` keychain service. The walker refuses any write tick without
+  # one — and never under the principal's credential (design §2).
+  writeTokens:
+    "the-metafactory/*": RANGER_WRITE_GH_TOKEN_METAFACTORY
+    "jcfischer/*": RANGER_WRITE_GH_TOKEN_PERSONAL
+
+# The machine account (design §2). `identity` is the login ranger labels
+# claims/closes with (`soma graph ... --identity <login>`). Graph-mutating ticks
+# REFUSE when the resolved identity equals the principal's login.
+bot:
+  identity: ivy-agent
+
+# The principal. `discordId` is the escalation desk's 7+ day @-mention target
+# (rendered as a real <@id> ping — without it, overdue cards show a no-ping
+# hint). Node #20 review round.
+principal:
+  login: jcfischer
+  discordId: "285727653603049472"

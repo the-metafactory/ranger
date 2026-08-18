@@ -1,4 +1,5 @@
 import type { RangerMapConfig } from "./config.ts";
+import { resolveDiscordApiBase } from "./discord.ts";
 
 /**
  * Claim-announce, fail-closed (design §5, node #7).
@@ -44,8 +45,7 @@ export class DiscordAnnouncer implements Announcer {
  constructor(
   private readonly token: string,
   private readonly channelId: string,
-  private readonly apiBase: string =
-   process.env.RANGER_DISCORD_API_BASE ?? "https://discord.com/api/v10",
+  private readonly apiBase: string = resolveDiscordApiBase(),
  ) {}
 
  static fromMap(
@@ -70,37 +70,58 @@ export class DiscordAnnouncer implements Announcer {
 
  async announce(ctx: AnnounceContext): Promise<AnnounceResult> {
   const content = [
-    `:ranger: **claim** #${ctx.nodeId} — ${ctx.nodeTitle}`,
-    `map: ${ctx.repo}${ctx.mapTitle === undefined ? "" : ` (${ctx.mapTitle})`}`,
+   `:ranger: **claim** #${ctx.nodeId} — ${ctx.nodeTitle}`,
+   `map: ${ctx.repo}${ctx.mapTitle === undefined ? "" : ` (${ctx.mapTitle})`}`,
   ].join("\n");
+  // A hung announce must not hold the scheduled tick — the fetch is
+  // abort-bounded (round-35: the claim-announce was the last unbounded
+  // Discord surface). The announcer is fail-closed: a timeout aborts the
+  // claim, which is the safe side.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 30_000);
   let response: Response;
   try {
-    response = await fetch(
-      `${this.apiBase}/channels/${this.channelId}/messages`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bot ${this.token}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ content }),
-      },
-    );
+   response = await fetch(
+    `${this.apiBase}/channels/${this.channelId}/messages`,
+    {
+     method: "POST",
+     headers: {
+      Authorization: `Bot ${this.token}`,
+      "Content-Type": "application/json",
+     },
+     body: JSON.stringify({
+      content,
+      // parse: [] suppresses untrusted @everyone/@here/role mentions — a
+      // frontier node titled `@everyone` must not ping the channel when
+      // claimed (review fix, mirrors the escalation client).
+      allowed_mentions: { parse: [] },
+     }),
+     signal: controller.signal,
+    },
+   );
   } catch (error) {
-    throw new AnnounceError(
-      `announce failed for #${ctx.nodeId}: ${error instanceof Error ? error.message : String(error)}`,
-    );
+   throw new AnnounceError(
+    `announce failed for #${ctx.nodeId}: ${error instanceof Error ? error.message : String(error)}`,
+   );
   }
   if (!response.ok) {
-    throw new AnnounceError(
-      `announce for #${ctx.nodeId} returned HTTP ${response.status} — fail-closed, no claim.`,
-    );
+   clearTimeout(timer);
+   throw new AnnounceError(
+    `announce for #${ctx.nodeId} returned HTTP ${response.status} — fail-closed, no claim.`,
+   );
   }
-  const body = (await response.json()) as { id?: string };
+  // The abort timer stays alive through the BODY read (round-38 blocker): a
+  // server that sends headers then stalls its body must not run unbounded.
+  let body: { id?: string };
+  try {
+   body = (await response.json()) as { id?: string };
+  } finally {
+   clearTimeout(timer);
+  }
   if (typeof body.id !== "string" || body.id.length === 0) {
-    throw new AnnounceError(
-      `announce for #${ctx.nodeId} returned no message id — fail-closed, no claim.`,
-    );
+   throw new AnnounceError(
+    `announce for #${ctx.nodeId} returned no message id — fail-closed, no claim.`,
+   );
   }
   return { messageId: body.id };
  }
@@ -117,7 +138,9 @@ export class RecordingAnnouncer implements Announcer {
 
  async announce(ctx: AnnounceContext): Promise<AnnounceResult> {
   if (this.fail) {
-   throw new AnnounceError(`recording announcer told to fail for #${ctx.nodeId}`);
+   throw new AnnounceError(
+    `recording announcer told to fail for #${ctx.nodeId}`,
+   );
   }
   const messageId = `msg-${ctx.nodeId}-${this.posts.length}`;
   this.posts.push({ ctx, messageId });

@@ -1,6 +1,13 @@
-import { desc, eq } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
 import { openDb, type RangerDb } from "./store/db.ts";
-import { events, health, vetoes, workers } from "./store/schema.ts";
+import {
+ escalations,
+ escalationDestinations,
+ events,
+ health,
+ vetoes,
+ workers,
+} from "./store/schema.ts";
 import type { RangerConfig } from "./config.ts";
 import { expandHome } from "./config.ts";
 
@@ -11,12 +18,12 @@ import { expandHome } from "./config.ts";
  */
 
 export type WorkerStatus =
-  | "claimed"
-  | "running"
-  | "success"
-  | "failed"
-  | "parked"
-  | "released";
+ | "claimed"
+ | "running"
+ | "success"
+ | "failed"
+ | "parked"
+ | "released";
 
 export interface WorkerRow {
  nodeId: string;
@@ -40,26 +47,54 @@ export interface EventRow {
  detail: string | null;
 }
 
+export interface EscalationRow {
+ /** `${repo}:${nodeId}` */
+ key: string;
+ repo: string;
+ nodeId: string;
+ title: string | null;
+ /** §3 route class at last post/edit — escalate-hitl | provisioning. */
+ route: string | null;
+ /** Content last sent to Discord — edit-on-change skips identical re-edits. */
+ lastContent: string | null;
+ /** Discord channel the card lives in — a moved destination reposts. */
+ channelId: string | null;
+ messageId: string;
+ createdAt: string;
+ lastEditedAt: string | null;
+ /** open | closed — the write-side (node #21) transitions a card to closed
+  *  on a principal response or operator verb; the desk only ever writes open.
+  *  (Unified vocabulary, round-27 review — the design contract is open →
+  *  closed.) */
+ status: "open" | "closed";
+ /** When the queue-exit note was written (bounds the absent-card scan). */
+ notedAt: string | null;
+}
+
 export type EventKind =
-  | "announced"
-  | "claimed"
-  | "worker-start"
-  | "worker-success"
-  | "closed"
-  | "decisions-written"
-  | "refused"
-  | "parked"
-  | "released"
-  | "sweep"
-  | "deadman-paused";
+ | "announced"
+ | "claimed"
+ | "worker-start"
+ | "worker-success"
+ | "closed"
+ | "decisions-written"
+ | "decisions-failed"
+ | "refused"
+ | "parked"
+ | "released"
+ | "sweep"
+ | "deadman-paused";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 export class Journal {
  private readonly db: RangerDb;
  private readonly closeDb: () => void;
+ /** The sqlite file path — callers derive sibling lock/state dirs from it. */
+ readonly path: string;
 
  constructor(path: string) {
+  this.path = path;
   const opened = openDb(path);
   this.db = opened.db;
   this.closeDb = opened.close;
@@ -67,7 +102,9 @@ export class Journal {
 
  // ---- workers ----
 
- upsertWorker(row: Partial<WorkerRow> & Pick<WorkerRow, "nodeId" | "repo" | "status">): void {
+ upsertWorker(
+  row: Partial<WorkerRow> & Pick<WorkerRow, "nodeId" | "repo" | "status">,
+ ): void {
   this.db
    .insert(workers)
    .values({
@@ -100,9 +137,11 @@ export class Journal {
  }
 
  getWorker(nodeId: string): WorkerRow | null {
-  const row = this.db.query.workers.findFirst({
-   where: eq(workers.nodeId, nodeId),
-  }).sync();
+  const row = this.db.query.workers
+   .findFirst({
+    where: eq(workers.nodeId, nodeId),
+   })
+   .sync();
   return row === undefined ? null : hydrateWorker(row);
  }
 
@@ -110,15 +149,20 @@ export class Journal {
   const rows =
    repo === undefined
     ? this.db.query.workers.findMany().sync()
-    : this.db.query.workers.findMany({
-       where: eq(workers.repo, repo),
-      }).sync();
+    : this.db.query.workers
+       .findMany({
+        where: eq(workers.repo, repo),
+       })
+       .sync();
   return rows.map(hydrateWorker);
  }
 
  // ---- events ----
 
- recordEvent(kind: EventKind, opts: { nodeId?: string; repo?: string; detail?: string } = {}): void {
+ recordEvent(
+  kind: EventKind,
+  opts: { nodeId?: string; repo?: string; detail?: string } = {},
+ ): void {
   this.db
    .insert(events)
    .values({
@@ -144,9 +188,11 @@ export class Journal {
  // ---- health ----
 
  getHealth(key: string): string | null {
-  const row = this.db.query.health.findFirst({
-   where: eq(health.key, key),
-  }).sync();
+  const row = this.db.query.health
+   .findFirst({
+    where: eq(health.key, key),
+   })
+   .sync();
   return row?.value ?? null;
  }
 
@@ -217,18 +263,282 @@ export class Journal {
  }
 
  hasVeto(nodeId: string): boolean {
-  const row = this.db.query.vetoes.findFirst({
-   where: eq(vetoes.nodeId, nodeId),
-  }).sync();
+  const row = this.db.query.vetoes
+   .findFirst({
+    where: eq(vetoes.nodeId, nodeId),
+   })
+   .sync();
   return row !== undefined;
+ }
+
+ // ---- escalations (design §5 escalation desk) ----
+
+ /**
+  * Record/update the card for a node. `key` is `${repo}:${nodeId}`. Called
+  * with a new messageId on first post, or the existing messageId + an
+  * `lastEditedAt` on an in-place edit. A card whose node leaves the
+  * HITL/provisioning set is EDITED to a queue-exit note but KEPT OPEN — it
+  * stays open until a principal response or an operator verb resolves it
+  * (design §5: cards persist; leaving the frontier is not a resolution).
+  */
+ upsertEscalation(
+  row: Pick<
+   EscalationRow,
+   "key" | "repo" | "nodeId" | "messageId" | "createdAt"
+  > &
+   Partial<
+    Pick<
+     EscalationRow,
+     | "title"
+     | "route"
+     | "lastContent"
+     | "channelId"
+     | "lastEditedAt"
+     | "status"
+     | "notedAt"
+    >
+   >,
+ ): void {
+  const existing = this.getEscalation(row.repo, row.nodeId);
+  // One resolved field set, reused for both the insert values and the
+  // conflict-update set (adding an escalation field is a single edit).
+  const fields = {
+   title: row.title ?? existing?.title ?? null,
+   route: row.route ?? existing?.route ?? null,
+   lastContent: row.lastContent ?? existing?.lastContent ?? null,
+   channelId: row.channelId ?? existing?.channelId ?? null,
+   messageId: row.messageId,
+   // createdAt is IMMUTABLE once set: it is the card's first appearance, and
+   // reposts (moved channel / message gone) keep it so the card's 3/7-day
+   // escalation age survives channel moves (design §5 "re-surfaced with
+   // age"; round-23 review).
+   createdAt: existing?.createdAt ?? row.createdAt,
+   lastEditedAt: row.lastEditedAt ?? existing?.lastEditedAt ?? null,
+   status: row.status ?? existing?.status ?? "open",
+   notedAt:
+    row.notedAt === undefined ? (existing?.notedAt ?? null) : row.notedAt,
+  };
+  this.db
+   .insert(escalations)
+   .values({ key: row.key, repo: row.repo, nodeId: row.nodeId, ...fields })
+   .onConflictDoUpdate({ target: escalations.key, set: fields })
+   .run();
+ }
+
+ /**
+  * Record which Discord message a card lives in per destination channel. A
+  * map that moves away and back recovers its original message via
+  * `getEscalationDestination` instead of posting a duplicate.
+  */
+ setEscalationDestination(
+  key: string,
+  channelId: string,
+  messageId: string,
+  createdAt: string,
+ ): void {
+  this.db
+   .insert(escalationDestinations)
+   .values({ key, channelId, messageId, createdAt })
+   .onConflictDoUpdate({
+    target: [escalationDestinations.key, escalationDestinations.channelId],
+    set: { messageId, createdAt },
+   })
+   .run();
+ }
+
+ /** The card's message id in a given destination channel, or null. */
+ /** All (channel, message) destinations for a card, oldest first — the
+  *  queue-exit note must reconcile EVERY live card, not just the current
+  *  channel's (round-19 review). */
+ getEscalationDestinations(key: string): {
+  channelId: string;
+  messageId: string;
+ }[] {
+  return this.db.query.escalationDestinations
+   .findMany({
+    where: eq(escalationDestinations.key, key),
+    orderBy: asc(escalationDestinations.createdAt),
+   })
+   .sync()
+   .map((r) => ({ channelId: r.channelId, messageId: r.messageId }));
+ }
+
+ getEscalationDestination(key: string, channelId: string): string | null {
+  const row = this.db.query.escalationDestinations
+   .findFirst({
+    where: and(
+     eq(escalationDestinations.key, key),
+     eq(escalationDestinations.channelId, channelId),
+    ),
+   })
+   .sync();
+  return row?.messageId ?? null;
+ }
+
+ /**
+  * Batch lookup for one repo's cards — the active pass resolves its whole
+  * frontier in ONE query instead of N round trips per tick (round-17
+  * review).
+  */
+ getEscalations(repo: string, nodeIds: string[]): Map<string, EscalationRow> {
+  if (nodeIds.length === 0) return new Map();
+  const rows = this.db.query.escalations
+   .findMany({
+    where: and(
+     eq(escalations.repo, repo),
+     inArray(escalations.nodeId, nodeIds),
+    ),
+   })
+   .sync();
+  return new Map(rows.map((r) => [r.nodeId, hydrateEscalation(r)]));
+ }
+
+ getEscalation(repo: string, nodeId: string): EscalationRow | null {
+  const row = this.db.query.escalations
+   .findFirst({
+    where: eq(escalations.key, `${repo}:${nodeId}`),
+   })
+   .sync();
+  return row === undefined ? null : hydrateEscalation(row);
+ }
+
+ listEscalations(repo?: string): EscalationRow[] {
+  const rows =
+   repo === undefined
+    ? this.db.query.escalations.findMany().sync()
+    : this.db.query.escalations
+       .findMany({
+        where: eq(escalations.repo, repo),
+       })
+       .sync();
+  return rows.map(hydrateEscalation);
+ }
+
+ /** Open cards only — avoids materializing resolved history on every pass. */
+ /**
+  * Open cards for a repo, optionally capped at `limit`. Returns the capped
+  * rows plus the TOTAL count — the digest renders ≤15 cards but must know
+  * how many open cards exist (round-17 review: don't materialize all open
+  * escalations just to render a capped list).
+  */
+ listOpenEscalations(
+  repo: string,
+  now: Date,
+  opts: { limit?: number } = {},
+ ): { rows: EscalationRow[]; total: number; aged: number; overdue: number } {
+  // ONE aggregate: total + aged (≥3 UTC days) + overdue (≥7 UTC days) over
+  // ACTIONABLE open rows — the digest header must report the true counts
+  // even when an overdue card falls outside the rendered ≤15 list. UTC
+  // calendar-day cutoffs match dayDiff (a card created 23:59 yesterday is 1d
+  // old at 00:01 today; a rolling 72h window would exclude a card dayDiff
+  // shows as 3d). NOTED cards (their queue-exit note already written, design
+  // §5 — status stays open pending the #21 write-side resolution) are
+  // EXCLUDED: they have been surfaced and would otherwise accumulate in the
+  // daily aggregate + scan forever while rendering only 15 (round-37
+  // review).
+  const dayStart = (daysBack: number) =>
+   new Date(
+    Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()) -
+     daysBack * DAY_MS,
+   ).toISOString();
+  const agedAt = dayStart(3);
+  const overdueAt = dayStart(7);
+  const agg = this.db
+   .select({
+    total: sql<number>`count(*)`,
+    aged: sql<number>`sum(case when ${escalations.createdAt} <= ${agedAt} then 1 else 0 end)`,
+    overdue: sql<number>`sum(case when ${escalations.createdAt} <= ${overdueAt} then 1 else 0 end)`,
+   })
+   .from(escalations)
+   .where(
+    and(
+     eq(escalations.repo, repo),
+     eq(escalations.status, "open"),
+     isNull(escalations.notedAt),
+    ),
+   )
+   .get();
+  const rows = this.db.query.escalations
+   .findMany({
+    where: and(
+     eq(escalations.repo, repo),
+     eq(escalations.status, "open"),
+     isNull(escalations.notedAt),
+    ),
+    // Oldest first — the most urgent cards are the ones surfaced in the
+    // capped display.
+    orderBy: asc(escalations.createdAt),
+    ...(opts.limit === undefined ? {} : { limit: opts.limit }),
+   })
+   .sync();
+  return {
+   rows: rows.map(hydrateEscalation),
+   total: Number(agg?.total ?? 0),
+   aged: Number(agg?.aged ?? 0),
+   overdue: Number(agg?.overdue ?? 0),
+  };
+ }
+
+ /**
+  * Open cards whose queue-exit note has NOT yet been written — RAW keyset
+  * pages (NO exclusion predicate, round-36 review). This is what the
+  * absent-card pass reconciles: once a card is noted, `noted_at` is set and
+  * it drops out of the scan, so per-tick work stays bounded even as open
+  * (persisted) cards accumulate (design §5). The caller (selectAbsentCards)
+  * drops the current-frontier rows in JS and advances the cursor on the raw
+  * rows.
+  */
+ listUnreconciledOpen(
+  repo: string,
+  opts: {
+   limit?: number;
+   after?: { createdAt: string; nodeId: string };
+  } = {},
+ ): EscalationRow[] {
+  const rows = this.db.query.escalations
+   .findMany({
+    where: and(
+     eq(escalations.repo, repo),
+     eq(escalations.status, "open"),
+     isNull(escalations.notedAt),
+     // KEYSET pagination: resume strictly AFTER the last raw row seen —
+     // O(page), not O(offset) (round-31 review: a 50k-row queue must not
+     // skip ~50k indexed rows per 50-row batch). nodeId is the tiebreaker
+     // (unique per repo).
+     ...(opts.after === undefined
+      ? []
+      : [
+         or(
+          gt(escalations.createdAt, opts.after.createdAt),
+          and(
+           eq(escalations.createdAt, opts.after.createdAt),
+           gt(escalations.nodeId, opts.after.nodeId),
+          ),
+         ),
+        ]),
+    ),
+    // Oldest exits first (most urgent) with nodeId as the tiebreak — MUST
+    // match the keyset cursor's (createdAt, nodeId) predicate so same-createdAt
+    // rows (cards posted in one pass share a timestamp) aren't skipped
+    // (round-32 review).
+    orderBy: [asc(escalations.createdAt), asc(escalations.nodeId)],
+    ...(opts.limit === undefined ? {} : { limit: opts.limit }),
+   })
+   .sync();
+  return rows.map(hydrateEscalation);
  }
 
  /** Prune spawn-ledger keys older than the retention window (keeps health tidy). */
  pruneSpawnLedger(now = new Date(), retentionDays = 30): void {
   const cutoff = dayKey(new Date(now.getTime() - retentionDays * DAY_MS));
-  const stale = this.db.select({ key: health.key }).from(health).all().filter((r) =>
-   r.key.startsWith("spawns.") && r.key.slice("spawns.".length) < cutoff,
-  );
+  const stale = this.db
+   .select({ key: health.key })
+   .from(health)
+   .all()
+   .filter(
+    (r) =>
+     r.key.startsWith("spawns.") && r.key.slice("spawns.".length) < cutoff,
+   );
   for (const row of stale) {
    this.db.delete(health).where(eq(health.key, row.key)).run();
   }
@@ -284,6 +594,36 @@ function hydrateEvent(row: {
   repo: row.repo,
   kind: row.kind,
   detail: row.detail,
+ };
+}
+
+function hydrateEscalation(row: {
+ key: string;
+ repo: string;
+ nodeId: string;
+ title: string | null;
+ route: string | null;
+ lastContent: string | null;
+ channelId: string | null;
+ messageId: string;
+ createdAt: string;
+ lastEditedAt: string | null;
+ status: string;
+ notedAt: string | null;
+}): EscalationRow {
+ return {
+  key: row.key,
+  repo: row.repo,
+  nodeId: row.nodeId,
+  title: row.title,
+  route: row.route,
+  lastContent: row.lastContent,
+  channelId: row.channelId,
+  messageId: row.messageId,
+  createdAt: row.createdAt,
+  lastEditedAt: row.lastEditedAt,
+  status: row.status as "open" | "closed",
+  notedAt: row.notedAt,
  };
 }
 

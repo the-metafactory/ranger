@@ -1,0 +1,1 @@
+ALTER TABLE `escalations` ADD `noted_at` text;

@@ -140,6 +140,10 @@ One worker = one node = one headless session (doctrine; research excepted).
 
 Cards are announce-once, edited not reposted, re-surfaced in a daily digest with age. **Digest: daily**, one per map thread — aged open cards (with age), audit findings (receipt-less closes, stale claims), and budget/spend state; morning Europe/Zurich; absence of the digest is the outer dead-man signal. **Re-surface: age-banded** — age shown from day 1; 3+ days get a louder summary + blocked-descendant count; 7+ days get an @-mention escalation. Silence never un-surfaces. **Meanwhile, nothing blocks:** escalated nodes stay unclaimed; `blocked-by` edges keep dependent work off the frontier automatically; every independent branch keeps walking. The frontier predicate is the scheduler.
 
+**Channel migration (amended round-25/27).** A card's message id is tracked per destination channel (`escalation_destinations`), and the card's age is its *first-appearance* timestamp (immutable across moves — a move never erases 3/7-day escalation state). When the map's Discord channel moves, the desk posts a fresh card in the new channel, first editing the card it is LEAVING to a non-actionable "moved to channel …" note — so exactly ONE card per escalation is active in steady state (an edit can't cross channels; the note retires the prior destination before the replacement posts). Honest gaps: the migration is three remote ops (note-old → post-new → journal the new destination), so a crash between them leaves ZERO active cards until the next tick re-runs the migration, and a crash AFTER the replacement POST is accepted but BEFORE its destination is journaled leaves the next tick unaware of that post and able to post ANOTHER replacement — the same POST→journal duplicate window as announce-once, so two active cards are possible across that window (both carry the same escalation; the reconcile-on-move recovery retires one). A pause of one tick is also possible. Returning to a former channel recovers that channel's original message (edit in place, no duplicate) and notes the card it is leaving. This is reconcile-on-move; the multi-destination write-side lifecycle that *closes* resolved cards remains node #21.
+
+**Stable resolution schema (amended round-26/37/38).** The deployed `escalations.status` column (`text NOT NULL DEFAULT 'open'`, drizzle 0001) IS the stable resolution contract, kept deliberately minimal and forward-compatible so #21 can inherit it without compensating migrations: the desk only ever writes `open` (plus `noted_at`, `last_content`, per-destination rows); the write-side (node #21) transitions `open` → `closed` on a principal response or operator verb, which shrinks the open set that every scan is bounded by. Honest exception: drizzle 0007 added `noted_at`, which is lifecycle-affecting in one narrow sense — it gates whether an open card remains in absent-card reconciliation (a noted card's queue-exit note is written; it stays `open` only until #21 resolves it). #21 must therefore inherit `noted_at` as the reconciliation tombstone (a card with `noted_at` set is awaiting resolution, not re-reconciled) — that is the one forward-compatibility constraint on the model; no other lifecycle-affecting column is added after 0001. **Honest scope of the journal status (round-38):** this read-only desk's `status` is a JOURNAL CACHE, not the binding record — §5's "GitHub is where answers bind" + §7's "liveness and politeness only" mean resolution is not durable in SQLite. A journal loss degrades an OPEN card to re-escalation (a visible, recoverable duplicate, never a false resolution: a truly CLOSED node leaves the frontier, so it is not re-announced). #21 MUST persist/recover resolution from a binding graph record (a node comment / the close receipt) and treat the journal status as cache-only, so a resolved decision survives journal loss.
+
 **Ratifier pinning:** the 👍 ratifying a `--proposal-comment` is pinned to the principal's identity (GitHub `jcfischer` / Discord user 285727653603049472), verified by reaction authorship — never any non-proposer's 👍. **Veto durability:** a veto is recorded as a comment on the node (additive, non-gating, provenance-bearing) *and* cached in the journal. On journal loss, ranger re-reads its own veto comments before any claim. A human's NO never lives only in a disposable store.
 
 ---
@@ -189,7 +193,57 @@ Everything parked or vetoed is terminal until an operator verb. Silence never un
 - Review-consuming lane: **1** (implement workers may overlap in their build stage and queue at the review gate).
 - Research lane: **N** (default 2–3).
 - Merge/close: serialized (the decisions span has no CAS).
-- Escalations: unbounded, non-blocking.
+- Escalations: non-blocking, and BOUNDED per tick — the desk processes at
+  most `MAX_CARDS_PER_TICK` card operations (posts+edits) per map per tick,
+  split into two lanes (round-33 review): the ACTIVE card pass caps at
+  `MAX_CARDS_PER_TICK - ABSENT_RESERVE` (45) and the absent-card
+  reconciliation is GUARANTEED a reserved `ABSENT_RESERVE` (5) per tick, so
+  active-card churn can never starve an obsolete actionable card AND a mass
+  queue-exit can never starve the active cards (total ≤50 per map per tick).
+  Both lanes are evaluated against a bounded page of frontier nodes swept via
+  a persisted cursor, with ONE tick-wide 120s pass DEADLINE (a fresh deadline is NOT
+  granted per map — serialized maps share it; a pre-map gate skips a map
+  whose deadline has already passed, so a two-map config does NOT get 2×120s),
+  a 30s cap on any Discord 429 cooldown, and the deadline threaded into the
+  client's cooldown/throttle/retry/fetch-timeout waits (an in-flight op
+  defers rather than spending its full timeout past the bound). The
+  escalation lane therefore NEVER blocks the walk lane past that bound: it
+  converges over ticks, deferring the remainder. Deferred cards stay open
+  and are served on a later tick — nothing is dropped, only delayed.
+  (Amendment: §8 originally said "unbounded" — the per-tick bound is an
+  operational guarantee that escalation never starves walking, and is the
+  model the desk implements, round-25 review.)
+  End-to-end bound, stated honestly: the pass is bounded by the tick
+  deadline + lock acquisition (≤60s) + one graph call per map (each capped at
+  GRAPH_CALL_TIMEOUT_MS=60s; the pre-map gate prevents a map from starting
+  after expiry) + one in-flight Discord request (≤30s capped by remaining
+  deadline). It is a small constant multiple of the deadline, never unbounded
+  — every graph and Discord call has a hard timeout (round-30 review),
+  including walk's FRESH read for claims and its graphClaim write (both pass
+  GRAPH_CALL_TIMEOUT_MS; round-33 + round-35 closed the earlier unbounded
+  windows), the claim-announce Discord POST (abort-bounded at 30s, round-35),
+  and the worker's own graph calls — runNode's graphNode (×2), graphClose,
+  and graphDecisions — which pass GRAPH_CALL_TIMEOUT_MS too, so a hung soma
+  can't leave a detached worker alive holding its claim forever (round-36).
+  The absent-card scan loads RAW bounded keyset pages and drops the
+  current-frontier rows in JS (no SQL NOT IN — a large all-active queue must
+  not force SQLite to scan every row proving no results, round-36), with the
+  cursor advancing on raw rows so an all-active queue still terminates.
+  Honest scope of "never blocks": the desk's OWN processing is what the
+  bound/deadline/cooldown-cap constrain. The O(frontier) frontier read +
+  route classification is the SCHEDULER's inherent routing cost — ranger must
+  see the whole frontier to know which nodes are escalate-hitl vs
+  implement/research (paging routing would miss escalate nodes elsewhere in
+  the frontier) — and is shared scheduling work, not an escalation-lane cost.
+  The frontier is fetched TWICE per map per tick (round-29 revert): once by
+  the escalation pass for cards and once by the walk claim phase. The second
+  read is a deliberate correctness cost — walk must classify from a FRESH
+  read; reusing the escalation pass's ~120s-old frontier could misroute a
+  node edited to HITL in that window (a stale classification would
+  announce+claim it). Two bounded reads per tick, not one (round-31 review).
+  For ranger's maps the frontier is small; a pathological multi-thousand-node
+  frontier pays two O(frontier) reads per tick, which is the graph's cost,
+  not a pass that grows with the escalation backlog (round-27 review).
 - When #2517 lands, the lane cap is a config integer, not a redesign.
 
 Claim-level safety against the principal's concurrent interactive sessions is inherited from the verb (post-write re-read + deterministic tie-break), not built.

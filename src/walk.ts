@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { join } from "node:path";
 import type { RangerConfig, RangerMapConfig, WalkMode } from "./config.ts";
 import { DiscordAnnouncer } from "./announce.ts";
-import { graphFrontier } from "./graph.ts";
+import { GRAPH_CALL_TIMEOUT_MS, graphFrontier } from "./graph.ts";
 import { graphClaim } from "./graph-write.ts";
 import {
  assertNotPrincipal,
@@ -62,11 +62,23 @@ export async function spawnRunNodeDetached(
  if (process.env.RANGER_NO_SPAWN === "1") {
   return null;
  }
- const child = spawn(process.execPath, [args.cliEntry, "run-node", args.nodeId, "--map", args.repo, "--config", args.configPath], {
-  detached: true,
-  stdio: "ignore",
-  env: process.env,
- });
+ const child = spawn(
+  process.execPath,
+  [
+   args.cliEntry,
+   "run-node",
+   args.nodeId,
+   "--map",
+   args.repo,
+   "--config",
+   args.configPath,
+  ],
+  {
+   detached: true,
+   stdio: "ignore",
+   env: process.env,
+  },
+ );
  child.unref();
  return child.pid ?? null;
 }
@@ -92,7 +104,10 @@ export function researchCandidates(
 export async function walk(ctx: WalkContext): Promise<WalkResult> {
  const { config, journal } = ctx;
  const registry = loadProbeRegistry();
- const result: WalkResult = { maps: [], spawnCapPerDay: config.workers.spawnCapPerDay };
+ const result: WalkResult = {
+  maps: [],
+  spawnCapPerDay: config.workers.spawnCapPerDay,
+ };
  const cliEntry = join(import.meta.dir, "cli.ts");
 
  for (const map of config.maps) {
@@ -134,20 +149,35 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
   // Dead-man gate (design §7): paused ⇒ read-only pass (sweep still runs).
   if (journal.isPaused()) {
    mapResult.gated = true;
-   mapResult.gateReason = "dead-man paused — claiming stopped; human resume-run required";
+   mapResult.gateReason =
+    "dead-man paused — claiming stopped; human resume-run required";
   }
 
   const errors: string[] = [];
   if (!mapResult.gated) {
    try {
-    const frontier = await graphFrontier(map.repo, map.root, { token, source: "write-token" });
-    const classified = frontier.frontier.map((entry) =>
+    // walk MUST classify from a FRESH frontier: reusing the escalation pass's
+    // read (up to ~120s old) could misroute claims — a node edited to HITL in
+    // that window would still be announced+claimed as auto+research
+    // (round-29 review supersedes round-28's one-fetch-per-tick suggestion:
+    // the second read is a bounded correctness cost, not waste).
+    const fetched = await graphFrontier(
+     map.repo,
+     map.root,
+     { token, source: "write-token" },
+     { timeoutMs: GRAPH_CALL_TIMEOUT_MS },
+    );
+    const frontierEntries = fetched.frontier;
+    const classified = frontierEntries.map((entry) =>
      classify(entry, map.repo, map.walk, registry),
     );
     const candidates = researchCandidates(classified);
 
     for (const node of candidates) {
-     if (journal.spawnsToday(ctx.now?.() ?? new Date()) >= config.workers.spawnCapPerDay) {
+     if (
+      journal.spawnsToday(ctx.now?.() ?? new Date()) >=
+      config.workers.spawnCapPerDay
+     ) {
       mapResult.spawnCapExhausted = true;
       break;
      }
@@ -168,15 +198,28 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
       });
       messageId = announced.messageId;
      } catch (error) {
-      errors.push(`#${node.id} announce failed (${error instanceof Error ? error.message : String(error)}) — claim refused`);
+      errors.push(
+       `#${node.id} announce failed (${error instanceof Error ? error.message : String(error)}) — claim refused`,
+      );
       continue;
      }
      mapResult.announced.push(node.id);
-     journal.recordEvent("announced", { nodeId: node.id, repo: map.repo, detail: messageId });
+     journal.recordEvent("announced", {
+      nodeId: node.id,
+      repo: map.repo,
+      detail: messageId,
+     });
 
-     const claim = await graphClaim(map.repo, node.id, botIdentity, token);
+     const claim = await graphClaim(map.repo, node.id, botIdentity, token, {
+      // Every graph CLI call is timeout-bound — a hung claim must not hold
+      // the scheduled tick (round-35: walk's write-side calls were the last
+      // unbounded surface).
+      timeoutMs: GRAPH_CALL_TIMEOUT_MS,
+     });
      if (!claim.held) {
-      errors.push(`#${node.id} claim race lost to ${claim.holder ?? "another session"} — skipped`);
+      errors.push(
+       `#${node.id} claim race lost to ${claim.holder ?? "another session"} — skipped`,
+      );
       continue;
      }
      mapResult.claimed.push(node.id);
@@ -197,7 +240,11 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
       pid,
       messageId,
      });
-     journal.recordEvent("claimed", { nodeId: node.id, repo: map.repo, detail: `by ${botIdentity}` });
+     journal.recordEvent("claimed", {
+      nodeId: node.id,
+      repo: map.repo,
+      detail: `by ${botIdentity}`,
+     });
     }
    } catch (error) {
     errors.push(error instanceof Error ? error.message : String(error));
@@ -214,10 +261,17 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
     token,
     botIdentity,
     respawn: (nodeId, repo) =>
-     (ctx.spawnRunNode ?? spawnRunNodeDetached)({ nodeId, repo, cliEntry, configPath: ctx.configPath }).then((pid) => pid !== null),
+     (ctx.spawnRunNode ?? spawnRunNodeDetached)({
+      nodeId,
+      repo,
+      cliEntry,
+      configPath: ctx.configPath,
+     }).then((pid) => pid !== null),
    });
   } catch (error) {
-   errors.push(`sweep failed: ${error instanceof Error ? error.message : String(error)}`);
+   errors.push(
+    `sweep failed: ${error instanceof Error ? error.message : String(error)}`,
+   );
   }
 
   result.maps.push(mapResult);

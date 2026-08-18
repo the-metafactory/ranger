@@ -1,0 +1,1 @@
+CREATE INDEX `escalations_repo_idx` ON `escalations` (`repo`);
