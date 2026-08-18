@@ -202,15 +202,25 @@ export async function runNode(
  };
 
  try {
-  const node = await graphNode(repo, nodeId, { token, source: "write-token" }, {
-   // Every graph CLI call is timeout-bound — a hung soma must not leave a
-   // detached worker alive holding its claim forever (round-36: the worker's
-   // read/close/decisions were the last unbounded surface).
-   timeoutMs: GRAPH_CALL_TIMEOUT_MS,
-  });
-  const rootNode = await graphNode(repo, String(map.root), { token, source: "write-token" }, {
-   timeoutMs: GRAPH_CALL_TIMEOUT_MS,
-  });
+  const node = await graphNode(
+   repo,
+   nodeId,
+   { token, source: "write-token" },
+   {
+    // Every graph CLI call is timeout-bound — a hung soma must not leave a
+    // detached worker alive holding its claim forever (round-36: the worker's
+    // read/close/decisions were the last unbounded surface).
+    timeoutMs: GRAPH_CALL_TIMEOUT_MS,
+   },
+  );
+  const rootNode = await graphNode(
+   repo,
+   String(map.root),
+   { token, source: "write-token" },
+   {
+    timeoutMs: GRAPH_CALL_TIMEOUT_MS,
+   },
+  );
 
   if (node.node.kind !== "research") {
    const detail = `node #${nodeId} is kind '${node.node.kind}' — the research lane only walks research nodes (design §3).`;
@@ -281,7 +291,7 @@ export async function runNode(
   const workerResult = await workerRun(prompt, {
    cwd: worktree,
    timeoutMs: wallClockMs,
-   env: workerEnv(token, config, repo),
+   env: workerEnv(config, repo),
   });
   journal.upsertWorker({
    nodeId,
@@ -319,6 +329,25 @@ export async function runNode(
 
   journal.resetDeadman();
 
+  // The VETTED PUSH (round-38 security blocker): the worker itself never sees
+  // the machine write PAT — it COMMITS locally on the research branch but does
+  // NOT push (a malicious node could otherwise have the worker read/decode the
+  // basic-auth header from its env and exfiltrate a repo-scoped credential).
+  // The SUPERVISOR performs the single push of exactly the branch the close
+  // gate probes, using the PAT from the supervisor's own env (gitAuthEnv),
+  // which never enters the worker.
+  const push = await runCmd(
+   "git",
+   ["push", "origin", branch],
+   { env: gitAuthEnv(token), cwd: worktree, timeoutMs: 60_000 },
+  );
+  if (push.code !== 0) {
+   const detail = `research branch push failed (${branch}): ${push.stderr.trim()}`;
+   journal.recordEvent("refused", { nodeId, repo, detail });
+   journal.bumpDeadman();
+   return { ...base, status: "failed", detail, workerExit: 0 };
+  }
+
   const resolution = readFileSync(findingsPath, "utf8").trim();
   const resolutionFile = join(tmpdir(), `ranger-close-${nodeId}.md`);
   writeFileSync(resolutionFile, resolution, "utf8");
@@ -351,14 +380,31 @@ export async function runNode(
     repo,
     detail: close.detail.slice(0, 400),
    });
-   await graphDecisions(repo, String(map.root), token, {
-    cwd: probeCwd,
-    timeoutMs: GRAPH_CALL_TIMEOUT_MS,
-   });
+   // graphDecisions is a best-effort map-level index re-projection AFTER a
+   // confirmed close — its failure must NOT leave the worker row "running"
+   // with no terminal outcome (round-38 review): the node IS closed (the
+   // graph binds the resolution), so the worker is finalized as terminal
+   // success regardless, with the decisions failure surfaced loudly in the
+   // event log + worker outcome instead of silently dropping it.
+   let decisionsDetail =
+    "decisions --write after confirmed close";
+   try {
+    await graphDecisions(repo, String(map.root), token, {
+     cwd: probeCwd,
+     timeoutMs: GRAPH_CALL_TIMEOUT_MS,
+    });
+   } catch (decisionsError) {
+    decisionsDetail = `decisions --write FAILED after close: ${decisionsError instanceof Error ? decisionsError.message : String(decisionsError)}`;
+    journal.recordEvent("decisions-failed", {
+     nodeId,
+     repo,
+     detail: decisionsDetail.slice(0, 400),
+    });
+   }
    journal.recordEvent("decisions-written", {
     nodeId,
     repo,
-    detail: "decisions --write after confirmed close",
+    detail: decisionsDetail.slice(0, 400),
    });
    journal.upsertWorker({
     nodeId,
@@ -480,20 +526,20 @@ function workerHostEnv(): NodeJS.ProcessEnv {
  return env;
 }
 
-/** Worker env: machine-account git auth, repo context, and ONLY an allow-
- *  listed host env — never a spread of process.env (a prompt injection in
- *  the headless worker must not reach the Discord bot token). */
+/** Worker env: repo context + an ALLOW-LISTED host env — and CRUCIALLY NO
+ *  write PAT (round-38 security blocker): the worker COMMITS locally but the
+ *  SUPERVISOR performs the vetted push, so a malicious node can never have
+ *  the worker read/decode a machine credential from its env. */
 function workerEnv(
- token: string,
  config: RangerConfig,
  repo: string,
 ): NodeJS.ProcessEnv {
- return gitAuthEnv(token, {
+ return {
   ...workerHostEnv(),
   SOMA_GRAPH_REPO: repo,
   SAGE_STACK: "default",
   PILOT_PRINCIPAL: config.principal.login,
- });
+ };
 }
 
 /** First non-empty line of the resolution, truncated — the receipt's one-line form. */

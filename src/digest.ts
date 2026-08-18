@@ -267,4 +267,3 @@ export async function syncDailyDigest(
   }
   return { messageId, posted, edited };
 }
-

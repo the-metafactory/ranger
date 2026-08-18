@@ -712,7 +712,10 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
       // heartbeat can be running) instead of timing out forever on the wx
       // acquire and never walking (round-34 blocker).
       const lockFile = join(dir, ".escalate.lock");
-      writeFileSync(lockFile, `{"nonce":"900-abc","pid":1234,"startedAt":${Date.now() - 120_000},"leaseUntil":"partial`);
+      writeFileSync(
+        lockFile,
+        `{"nonce":"900-abc","pid":1234,"startedAt":${Date.now() - 120_000},"leaseUntil":"partial`,
+      );
 
       const run = await runCli(["escalate", "-c", config, "--json"], env);
       expect(run.code).toBe(0);

@@ -103,15 +103,21 @@ export class DiscordAnnouncer implements Announcer {
    throw new AnnounceError(
     `announce failed for #${ctx.nodeId}: ${error instanceof Error ? error.message : String(error)}`,
    );
-  } finally {
-   clearTimeout(timer);
   }
   if (!response.ok) {
+   clearTimeout(timer);
    throw new AnnounceError(
     `announce for #${ctx.nodeId} returned HTTP ${response.status} — fail-closed, no claim.`,
    );
   }
-  const body = (await response.json()) as { id?: string };
+  // The abort timer stays alive through the BODY read (round-38 blocker): a
+  // server that sends headers then stalls its body must not run unbounded.
+  let body: { id?: string };
+  try {
+   body = (await response.json()) as { id?: string };
+  } finally {
+   clearTimeout(timer);
+  }
   if (typeof body.id !== "string" || body.id.length === 0) {
    throw new AnnounceError(
     `announce for #${ctx.nodeId} returned no message id — fail-closed, no claim.`,

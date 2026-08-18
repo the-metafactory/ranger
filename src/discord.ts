@@ -57,7 +57,7 @@ export function resolveDiscordApiBase(
  * suggestion).
  */
 function rateLimitWait(
-  response: Response,
+  headers: Headers,
   attempt: number,
 ): {
   waitMs: number;
@@ -65,9 +65,9 @@ function rateLimitWait(
   failFast: boolean;
   firstRetryAfterSec: number;
 } {
-  const retryAfter = Number(response.headers.get("retry-after"));
+  const retryAfter = Number(headers.get("retry-after"));
   const firstRetryAfterSec = Number.isFinite(retryAfter) ? retryAfter : 0;
-  const global = response.headers.get("x-ratelimit-global") !== null;
+  const global = headers.get("x-ratelimit-global") !== null;
   const waitMs =
     Number.isFinite(retryAfter) && retryAfter > 0
       ? retryAfter * 1000
@@ -106,6 +106,15 @@ interface CooldownState {
  * attempt budget defers the card rather than sleeping the whole cooldown.
  */
 const MAX_COOLDOWN_MS = 30_000;
+
+/** A Discord HTTP result with the body already buffered inside the abort
+ *  scope — a server that sends headers then stalls its body is still bounded
+ *  (round-38 blocker; the body read must not run unbounded past the timer). */
+interface DiscordHttpResult {
+  status: number;
+  headers: Headers;
+  bodyText: string;
+}
 
 export class EscalationDiscord {
   /**
@@ -213,9 +222,9 @@ export class EscalationDiscord {
       body?: string;
     },
     deadline?: number,
-  ): Promise<Response> {
+  ): Promise<DiscordHttpResult> {
     await this.waitForCooldown(deadline);
-    await this.throttle();
+    await this.throttle(deadline);
     // A global 429 may have been set by another pooled request WHILE we
     // queued behind the throttle slot — re-wait so a cooldown set mid-queue
     // isn't bypassed (round-34 review).
@@ -231,14 +240,18 @@ export class EscalationDiscord {
     const controller = new AbortController();
     // The abort timeout is the smaller of 30s and the remaining deadline — a
     // request begun just before the pass cutoff must not spend a full 30s
-    // fetch timeout past the bound (round-30 review).
+    // fetch timeout past the bound (round-30 review). The controller stays
+    // alive through the BODY read too (round-38 blocker): the timer is
+    // cleared only after response.text() resolves, so a server that sends
+    // headers then stalls its body is still aborted — a bare
+    // `await response.json()` after the fetch would be unbounded.
     const abortMs =
       deadline === undefined
         ? 30_000
         : Math.max(1, Math.min(30_000, deadline - Date.now()));
     const timer = setTimeout(() => controller.abort(), abortMs);
     try {
-      return await fetch(`${this.apiBase}${path}`, {
+      const response = await fetch(`${this.apiBase}${path}`, {
         method: init.method,
         headers: {
           Authorization: `Bot ${this.token}`,
@@ -247,6 +260,10 @@ export class EscalationDiscord {
         ...(init.body === undefined ? {} : { body: init.body }),
         signal: controller.signal,
       });
+      // Buffer the body INSIDE the abort scope: the headers arriving without
+      // the body is a real stalled-response case that must not run unbounded.
+      const bodyText = await response.text();
+      return { status: response.status, headers: response.headers, bodyText };
     } finally {
       clearTimeout(timer);
     }
@@ -257,7 +274,7 @@ export class EscalationDiscord {
     path: string,
     content: string,
     deadline?: number,
-  ): Promise<Response> {
+  ): Promise<DiscordHttpResult> {
     // Every call times out — a run can never stall indefinitely holding the
     // announce-once lock. Calls are spaced ≥1s apart. On a rate limit (429),
     // a GLOBAL cooldown must be waited out in full — retrying into it just
@@ -277,7 +294,7 @@ export class EscalationDiscord {
           `discord ${method} ${path} deferred: pass deadline reached`,
         );
       }
-      let response: Response;
+      let response: DiscordHttpResult;
       try {
         response = await this.fetchOnce(
           path,
@@ -306,7 +323,7 @@ export class EscalationDiscord {
         return response;
       }
       lastStatus = response.status;
-      const policy = rateLimitWait(response, attempt);
+      const policy = rateLimitWait(response.headers, attempt);
       if (attempt === 1) firstRetryAfterSec = policy.firstRetryAfterSec;
       if (policy.global) {
         // Advance the client-wide deadline so every pooled request waits
@@ -346,13 +363,21 @@ export class EscalationDiscord {
    *  The slot is reserved synchronously BEFORE any await, so concurrent
    *  callers line up at 1s offsets instead of sleeping the same delay and
    *  waking together (a burst that re-triggers the 429s). */
-  private async throttle(): Promise<void> {
+  private async throttle(deadline?: number): Promise<void> {
     const now = Date.now();
     const target = Math.max(this.lastRequestAt + this.minIntervalMs, now);
     this.lastRequestAt = target; // reserve — atomic within the event loop
     const wait = target - now;
-    if (wait > 0) {
-      await sleep(wait);
+    // The throttle sleep is CAPPED by the remaining pass deadline (round-38
+    // review): a RANGER_DISCORD_MIN_INTERVAL_MS larger than the 120s pass
+    // bound must not hold the walk lane past it. The slot is still reserved
+    // (a deferred request resumes next tick), so the spacing guarantee holds.
+    const boundedWait =
+      deadline === undefined
+        ? wait
+        : Math.min(wait, Math.max(0, deadline - Date.now()));
+    if (boundedWait > 0) {
+      await sleep(boundedWait);
     }
   }
 
@@ -364,10 +389,17 @@ export class EscalationDiscord {
       content,
       deadline,
     );
-    if (!response.ok) {
+    if (response.status < 200 || response.status >= 300) {
       throw new EscalateError(`discord post returned HTTP ${response.status}`);
     }
-    const body = (await response.json()) as { id?: string };
+    let body: { id?: string };
+    try {
+      body = JSON.parse(response.bodyText) as { id?: string };
+    } catch {
+      throw new EscalateError(
+        `discord post returned an unparseable body (HTTP ${response.status})`,
+      );
+    }
     if (typeof body.id !== "string" || body.id.length === 0) {
       throw new EscalateError("discord post returned no message id");
     }
@@ -394,7 +426,7 @@ export class EscalationDiscord {
         `discord message ${messageId} is not in channel ${this.channelId} — destination moved; repost needed`,
       );
     }
-    if (!response.ok) {
+    if (!(response.status >= 200 && response.status < 300)) {
       throw new EscalateError(
         `discord edit ${messageId} returned HTTP ${response.status}`,
       );
@@ -410,7 +442,7 @@ export class EscalationDiscord {
    */
   async messageExists(messageId: string, deadline?: number): Promise<boolean> {
     const path = `/channels/${this.channelId}/messages/${messageId}`;
-    let response: Response;
+    let response: DiscordHttpResult;
     try {
       response = await this.fetchOnce(path, { method: "GET" }, deadline);
     } catch {

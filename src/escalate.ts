@@ -1,20 +1,9 @@
 import { join } from "node:path";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import type { EscalationDiscord } from "./discord.ts";
-import {
-  classify,
-  hitlWaiting,
-  loadProbeRegistry,
-} from "./route.ts";
-import {
-  GRAPH_CALL_TIMEOUT_MS,
-  graphAudit,
-  graphFrontier,
-} from "./graph.ts";
-import {
-  type OwnedCheck,
-  withEscalateLock,
-} from "./lock.ts";
+import { classify, hitlWaiting, loadProbeRegistry } from "./route.ts";
+import { GRAPH_CALL_TIMEOUT_MS, graphAudit, graphFrontier } from "./graph.ts";
+import { type OwnedCheck, withEscalateLock } from "./lock.ts";
 import type { ResolvedToken } from "./token-gate.ts";
 import type { Journal } from "./journal.ts";
 import {

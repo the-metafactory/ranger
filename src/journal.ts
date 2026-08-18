@@ -1,14 +1,4 @@
-import {
- and,
- asc,
- desc,
- eq,
- gt,
- inArray,
- isNull,
- or,
- sql,
-} from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
 import { openDb, type RangerDb } from "./store/db.ts";
 import {
  escalations,
@@ -88,6 +78,7 @@ export type EventKind =
  | "worker-success"
  | "closed"
  | "decisions-written"
+ | "decisions-failed"
  | "refused"
  | "parked"
  | "released"

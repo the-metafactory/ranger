@@ -673,15 +673,17 @@ export async function markAbsentCards(
  * card reconciliation. Cap the LOAD to the remaining request budget (oldest
  * exits first): each card needs ≥1 destination edit, so loading more than the
  * budget could never be fully processed this tick — and a large drain must
- * not walk every unnoted card after the budget is spent. The SQL NOT IN
- * exclusion is capped too (bind limit); JS-filtering against the FULL needed
- * set here preserves correctness at any frontier size — a needed card that
- * slipped past the truncated exclusion is never treated as absent. A PERSISTED
- * cursor advances the resume point each tick: with >ABSENT_EXCLUDE_CAP needed
- * cards older than a real absent card, a scan restarting at 0 every tick
- * would repeatedly discard the same needed prefix and never reach the absent
- * one (round-29: "no absent card starves" must hold). The scan stays bounded
- * (MAX_ABSENT_SCAN rows) and wraps to 0 once it sweeps the whole set.
+ * not walk every unnoted card after the budget is spent. The exclusion is
+ * applied in JS ONLY (round-36: no SQL NOT IN — an all-active queue must not
+ * force SQLite to scan every row proving no results); the needed set is
+ * filtered per raw row here, so a needed card is never treated as absent at
+ * any frontier size. A PERSISTED keyset cursor advances on the RAW last row
+ * each tick — with a large needed prefix older than a real absent card, a
+ * scan restarting at 0 every tick would repeatedly discard the same needed
+ * prefix and never reach the absent one (round-29: "no absent card starves"
+ * must hold); advancing on raw rows means an all-active queue still
+ * terminates. The scan stays bounded (MAX_ABSENT_SCAN rows) and wraps to 0
+ * once it sweeps the whole set.
  */
 function selectAbsentCards(
   journal: Journal,
@@ -930,7 +932,7 @@ export function ageText(
 }
 
 /** Build the card + journal-row inputs for a node in one place (no drift). */
-export function cardFrom(
+function cardFrom(
   node: ClassifiedNode,
   row: {
     nodeId: string;
@@ -1008,16 +1010,8 @@ export async function syncActivePage(ctx: {
   cardErrors: string[];
   budget: CardBudget;
 }> {
-  const {
-    client,
-    config,
-    map,
-    journal,
-    now,
-    passDeadline,
-    needed,
-    owned,
-  } = ctx;
+  const { client, config, map, journal, now, passDeadline, needed, owned } =
+    ctx;
   const budget = {
     remaining: ACTIVE_CARD_CAP,
     deadline: passDeadline,
@@ -1045,17 +1039,17 @@ export async function syncActivePage(ctx: {
               : [],
           );
   if (sorted.length > pageSize) {
-    journal.setHealth(
-      cursorKey,
-      String((offset + pageSize) % sorted.length),
-    );
+    journal.setHealth(cursorKey, String((offset + pageSize) % sorted.length));
   }
 
   // The active pass needs ONLY the rows for the nodes in this tick's page
   // — query them directly instead of scanning the whole repo's escalation
   // history every 15-minute tick (round-15 review). The absent-card pass
   // separately queries open cards.
-  const existing = journal.getEscalations(map.repo, page.map((n) => n.id));
+  const existing = journal.getEscalations(
+    map.repo,
+    page.map((n) => n.id),
+  );
   // Fresh cards (no row yet) announce before page re-edits — they are the
   // urgent ones and must not wait behind a sweep of already-synced cards.
   const pageOrder = page
@@ -1099,4 +1093,3 @@ export async function syncActivePage(ctx: {
     budget,
   };
 }
-

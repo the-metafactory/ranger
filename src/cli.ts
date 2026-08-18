@@ -399,8 +399,7 @@ program
   try {
    escalateResult = await escalateMaps(config, journal);
   } catch (error) {
-   escalateError =
-    error instanceof Error ? error.message : String(error);
+   escalateError = error instanceof Error ? error.message : String(error);
   }
   try {
    // walk re-fetches its OWN frontier: claims must classify from a fresh
