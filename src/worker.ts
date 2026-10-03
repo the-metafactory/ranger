@@ -336,11 +336,11 @@ export async function runNode(
   // The SUPERVISOR performs the single push of exactly the branch the close
   // gate probes, using the PAT from the supervisor's own env (gitAuthEnv),
   // which never enters the worker.
-  const push = await runCmd(
-   "git",
-   ["push", "origin", branch],
-   { env: gitAuthEnv(token), cwd: worktree, timeoutMs: 60_000 },
-  );
+  const push = await runCmd("git", ["push", "origin", branch], {
+   env: gitAuthEnv(token),
+   cwd: worktree,
+   timeoutMs: 60_000,
+  });
   if (push.code !== 0) {
    const detail = `research branch push failed (${branch}): ${push.stderr.trim()}`;
    journal.recordEvent("refused", { nodeId, repo, detail });
@@ -386,8 +386,7 @@ export async function runNode(
    // graph binds the resolution), so the worker is finalized as terminal
    // success regardless, with the decisions failure surfaced loudly in the
    // event log + worker outcome instead of silently dropping it.
-   let decisionsDetail =
-    "decisions --write after confirmed close";
+   let decisionsDetail = "decisions --write after confirmed close";
    try {
     await graphDecisions(repo, String(map.root), token, {
      cwd: probeCwd,
@@ -530,10 +529,7 @@ function workerHostEnv(): NodeJS.ProcessEnv {
  *  write PAT (round-38 security blocker): the worker COMMITS locally but the
  *  SUPERVISOR performs the vetted push, so a malicious node can never have
  *  the worker read/decode a machine credential from its env. */
-function workerEnv(
- config: RangerConfig,
- repo: string,
-): NodeJS.ProcessEnv {
+function workerEnv(config: RangerConfig, repo: string): NodeJS.ProcessEnv {
  return {
   ...workerHostEnv(),
   SOMA_GRAPH_REPO: repo,

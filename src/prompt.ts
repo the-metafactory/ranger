@@ -114,7 +114,10 @@ function extractMapSections(body: string): MapSections {
  const lines: string[] = [];
  for (const line of body.split("\n")) {
   const match = line.match(/^##\s+([^\n]+?)\s*$/);
-  if (match !== null && (MAP_SECTIONS as readonly string[]).includes(match[1])) {
+  if (
+   match !== null &&
+   (MAP_SECTIONS as readonly string[]).includes(match[1])
+  ) {
    if (current !== null) out[current] = lines.join("\n").trim();
    current = match[1] as MapSectionName;
    lines.length = 0;
