@@ -2,7 +2,9 @@ import { spawn } from "node:child_process";
 import { join } from "node:path";
 import type { RangerConfig, RangerMapConfig, WalkMode } from "./config.ts";
 import { DiscordAnnouncer } from "./announce.ts";
-import { GRAPH_CALL_TIMEOUT_MS, graphFrontier } from "./graph.ts";
+import { BudgetDeferral, budgetPolicy } from "./budget.ts";
+import { readFrontier } from "./frontier-cache.ts";
+import { GRAPH_CALL_TIMEOUT_MS } from "./graph.ts";
 import { graphClaim } from "./graph-write.ts";
 import {
  assertNotPrincipal,
@@ -175,17 +177,23 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
   const errors: string[] = [];
   if (!mapResult.gated) {
    try {
-    // walk MUST classify from a FRESH frontier: reusing the escalation pass's
-    // read (up to ~120s old) could misroute claims — a node edited to HITL in
-    // that window would still be announced+claimed as auto+research
-    // (round-29 review supersedes round-28's one-fetch-per-tick suggestion:
-    // the second read is a bounded correctness cost, not waste).
-    const fetched = await graphFrontier(
-     map.repo,
-     map.root,
-     { token, source: "write-token" },
-     { timeoutMs: GRAPH_CALL_TIMEOUT_MS },
-    );
+    // walk MUST classify from a frontier no older than the repo is NOW:
+    // reusing the escalation pass's read (up to ~120s old) unchecked could
+    // misroute claims — a node edited to HITL in that window would still be
+    // announced+claimed as auto+research (round-29 review). readFrontier
+    // re-reads the repo's sentinel here and serves the cached read only when
+    // nothing changed since it was taken, so round-29 holds without paying
+    // GraphQL for an unchanged map (src/frontier-cache.ts).
+    const { frontier: fetched } = await readFrontier({
+     journal,
+     repo: map.repo,
+     root: map.root,
+     token: { token, source: "write-token" },
+     policy: budgetPolicy(config),
+     maxAgeMs: config.budget.frontierMaxAgeMin * 60_000,
+     now: ctx.now?.() ?? new Date(),
+     timeoutMs: GRAPH_CALL_TIMEOUT_MS,
+    });
     const frontierEntries = fetched.frontier;
     const classified = frontierEntries.map((entry) =>
      classify(entry, map.repo, map.walk, registry, {
@@ -291,7 +299,14 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
      });
     }
    } catch (error) {
-    errors.push(error instanceof Error ? error.message : String(error));
+    if (error instanceof BudgetDeferral) {
+     // Not an error: nothing was read, so nothing was claimed. The next
+     // tick with budget walks the map (src/budget.ts).
+     mapResult.gated = true;
+     mapResult.gateReason = error.message;
+    } else {
+     errors.push(error instanceof Error ? error.message : String(error));
+    }
    }
   }
 
