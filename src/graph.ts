@@ -12,7 +12,40 @@ export const READONLY_VERBS = ["frontier", "node", "audit"] as const;
 export type ReadonlyVerb = (typeof READONLY_VERBS)[number];
 
 export class GraphError extends Error {
-  override readonly name = "GraphError";
+  override readonly name: string = "GraphError";
+}
+
+/**
+ * A graph read GitHub refused for rate limiting — the hourly allowance or a
+ * secondary (burst/concurrency) limit. Distinct from GraphError so callers
+ * can defer instead of failing (src/budget.ts sets a cooldown on it).
+ */
+export class RateLimitError extends GraphError {
+  override readonly name = "RateLimitError";
+}
+
+/**
+ * The forge-qualified repo `soma graph --repo` needs. Soma resolves a bare
+ * `owner/name` only from a checkout with an origin remote, and launchd runs
+ * ranger from `/` — every scheduled tick from 2026-09-25 failed on it. Ranger
+ * keeps `map.repo` bare (token prefixes, `gh api repos/…`, journal keys) and
+ * qualifies at the soma boundary only. A value already carrying a forge
+ * (`github:…`) passes through.
+ */
+export function somaRepo(repo: string): string {
+  return repo.includes(":") ? repo : `github:github.com/${repo}`;
+}
+
+const RATE_LIMITED = /rate limit/i;
+
+/** The error for a failed graph verb: RateLimitError when GitHub throttled it. */
+export function graphFailure(
+  message: string,
+  stderr: string,
+): GraphError {
+  return RATE_LIMITED.test(stderr)
+    ? new RateLimitError(message)
+    : new GraphError(message);
 }
 
 export interface FrontierEntryNode {
@@ -109,7 +142,14 @@ async function callGraph(
   }
   const gated = gatedEnv(token.token);
   try {
-    const cliArgs = ["graph", verb, String(root), "--repo", repo, "--json"];
+    const cliArgs = [
+      "graph",
+      verb,
+      String(root),
+      "--repo",
+      somaRepo(repo),
+      "--json",
+    ];
     return await runCmd("soma", cliArgs, {
       cwd: opts.cwd,
       timeoutMs: opts.timeoutMs,
@@ -142,8 +182,9 @@ export async function graphFrontier(
     opts,
   });
   if (result.code !== 0) {
-    throw new GraphError(
+    throw graphFailure(
       `soma graph frontier ${root} (${repo}) failed (exit ${result.code}): ${result.stderr.trim()}`,
+      result.stderr,
     );
   }
   return parseJson<FrontierResult>("frontier", result.stdout);
@@ -163,8 +204,9 @@ export async function graphAudit(
     opts,
   });
   if (result.code !== 0) {
-    throw new GraphError(
+    throw graphFailure(
       `soma graph audit ${root} (${repo}) failed (exit ${result.code}): ${result.stderr.trim()}`,
+      result.stderr,
     );
   }
   return parseJson<AuditResult>("audit", result.stdout);
@@ -178,8 +220,9 @@ export async function graphNode(
 ): Promise<NodeResult> {
   const result = await callGraph({ verb: "node", root: id, repo, token, opts });
   if (result.code !== 0) {
-    throw new GraphError(
+    throw graphFailure(
       `soma graph node ${id} (${repo}) failed (exit ${result.code}): ${result.stderr.trim()}`,
+      result.stderr,
     );
   }
   return parseJson<NodeResult>("node", result.stdout);

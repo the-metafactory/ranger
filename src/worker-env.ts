@@ -1,3 +1,4 @@
+import { somaRepo } from "./graph.ts";
 import type { RangerConfig } from "./config.ts";
 
 /**
@@ -85,7 +86,7 @@ export function workerEnv(
  const identity = config.bot.identity;
  return {
   ...workerHostEnv(),
-  SOMA_GRAPH_REPO: repo,
+  SOMA_GRAPH_REPO: somaRepo(repo),
   SAGE_STACK: "default",
   PILOT_PRINCIPAL: config.principal.login,
   // The host's global git hooks are the principal's, not the walk's: they
