@@ -1,3 +1,4 @@
+import { somaRepo } from "./graph.ts";
 import { runCmd, type RunOptions } from "./exec.ts";
 import { writeEnv } from "./identity.ts";
 
@@ -76,7 +77,7 @@ export async function graphClaim(
  token: string,
  opts: RunOptions = {},
 ): Promise<ClaimResult> {
- const args = ["graph", "claim", id, "--identity", identity, "--repo", repo, "--json"];
+ const args = ["graph", "claim", id, "--identity", identity, "--repo", somaRepo(repo), "--json"];
  const result = await callWrite(args, token, opts);
  const payload = parsePayload(result, "claim");
  if (result.code === 0) {
@@ -101,7 +102,7 @@ export async function graphRelease(
  token: string,
  opts: RunOptions = {},
 ): Promise<ReleaseResult> {
- const args = ["graph", "release", id, "--identity", identity, "--repo", repo, "--json"];
+ const args = ["graph", "release", id, "--identity", identity, "--repo", somaRepo(repo), "--json"];
  const result = await callWrite(args, token, opts);
  if (result.code !== 0) {
   throw new GraphWriteError(
@@ -141,7 +142,7 @@ export async function graphClose(
   "graph", "close", id,
   "--resolution-file", options.resolutionFile,
   "--identity", identity,
-  "--repo", repo,
+  "--repo", somaRepo(repo),
  ];
  if (options.gist !== undefined) args.push("--gist", options.gist);
  if (options.checkpointId !== undefined) args.push("--checkpoint", options.checkpointId);
@@ -165,7 +166,7 @@ export async function graphDecisions(
  token: string,
  opts: RunOptions = {},
 ): Promise<DecisionsResult> {
- const args = ["graph", "decisions", root, "--write", "--repo", repo];
+ const args = ["graph", "decisions", root, "--write", "--repo", somaRepo(repo)];
  const result = await callWrite(args, token, opts);
  const detail = (result.stdout || result.stderr).trim();
  if (result.code !== 0) {

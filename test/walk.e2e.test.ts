@@ -566,3 +566,42 @@ describe("walk claims exactly planTick's take (#37)", () => {
   });
  }
 });
+
+describe("ranger walk — GitHub budget deferral (src/budget.ts)", () => {
+ test("a rate-limited frontier read gates the map: nothing announced, nothing claimed", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ranger-walk-budget-"));
+  const discord = fakeDiscord();
+  try {
+   const config = writeConfig(dir);
+   const statePath = writeState(dir, { "10": RESEARCH_NODE_STATE });
+   const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    ...GIT_ENV,
+    PATH: `${fixturesBin}:${process.env.PATH ?? ""}`,
+    FAKE_SOMA_DIR: dataDir,
+    FAKE_SOMA_STATE: statePath,
+    FAKE_SOMA_RATE_LIMITED: "1",
+    RANGER_DISCORD_API_BASE: `http://127.0.0.1:${discord.port}`,
+    RANGER_DISCORD_ALLOW_TEST_OVERRIDE: "1",
+    RANGER_DISCORD_MIN_INTERVAL_MS: "5",
+    RANGER_DISCORD_TOKEN: "fake-bot-token",
+    RANGER_WRITE_TEST: "ghp_write",
+    RANGER_NO_SPAWN: "1",
+   };
+
+   const result = await runCli(["walk", "-c", config], env);
+   expect(result.code).toBe(0);
+   const report = JSON.parse(result.stdout);
+   expect(report.maps[0].gated).toBe(true);
+   expect(report.maps[0].gateReason).toContain("secondary rate limit");
+   expect(report.maps[0].errors).toEqual([]);
+   expect(report.maps[0].claimed).toEqual([]);
+   expect(discord.posts).toHaveLength(0);
+   const state = JSON.parse(readFileSync(statePath, "utf8"));
+   expect(state.nodes["10"].assignees ?? []).toEqual([]);
+  } finally {
+   discord.stop();
+   rmSync(dir, { recursive: true, force: true });
+  }
+ });
+});

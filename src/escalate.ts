@@ -2,7 +2,9 @@ import { join } from "node:path";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import type { EscalationDiscord } from "./discord.ts";
 import { classify, hitlWaiting, loadProbeRegistry } from "./route.ts";
-import { GRAPH_CALL_TIMEOUT_MS, graphAudit, graphFrontier } from "./graph.ts";
+import { BudgetDeferral, budgetPolicy, budgetedRead } from "./budget.ts";
+import { readFrontier } from "./frontier-cache.ts";
+import { GRAPH_CALL_TIMEOUT_MS, graphAudit } from "./graph.ts";
 import { type OwnedCheck, withEscalateLock } from "./lock.ts";
 import type { ResolvedToken } from "./token-gate.ts";
 import type { Journal } from "./journal.ts";
@@ -98,7 +100,14 @@ async function escalateOneMap(
   }
 
   try {
-    const frontier = await graphFrontier(map.repo, map.root, token, {
+    const { frontier } = await readFrontier({
+      journal,
+      repo: map.repo,
+      root: map.root,
+      token,
+      policy: budgetPolicy(config),
+      maxAgeMs: config.budget.frontierMaxAgeMin * 60_000,
+      now,
       timeoutMs: GRAPH_CALL_TIMEOUT_MS,
     });
 
@@ -155,6 +164,11 @@ async function escalateOneMap(
 
     return { ...base, cards: active.cards };
   } catch (error) {
+    // A budget deferral returns BEFORE the absent-card pass: an unread
+    // frontier must never read as "every card left the queue".
+    if (error instanceof BudgetDeferral) {
+      return { ...base, budgetDeferred: error.message };
+    }
     return {
       ...base,
       ok: false,
@@ -245,12 +259,19 @@ async function digestOneMap(
     // runs). Capped by both the graph-call timeout and the remaining digest
     // deadline (round-30 blocker).
     const remainingMs = Math.max(0, digestDeadline - Date.now());
-    const audit = await graphAudit(map.repo, map.root, token, {
-      timeoutMs: Math.min(
-        GRAPH_CALL_TIMEOUT_MS,
-        remainingMs || GRAPH_CALL_TIMEOUT_MS,
-      ),
-    });
+    const audit = await budgetedRead(
+      journal,
+      token,
+      budgetPolicy(config),
+      now,
+      () =>
+        graphAudit(map.repo, map.root, token, {
+          timeoutMs: Math.min(
+            GRAPH_CALL_TIMEOUT_MS,
+            remainingMs || GRAPH_CALL_TIMEOUT_MS,
+          ),
+        }),
+    );
     // Open cards only — capped to what the digest renders (≤15), with the
     // total + age aggregates from the same query, so the daily read doesn't
     // grow with historical escalations (round-17/20 reviews).

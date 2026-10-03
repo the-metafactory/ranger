@@ -78,6 +78,7 @@ describe("resolveReadOnlyToken", () => {
     principal: { login: "jcfischer" },
     state: { journalPath: ":memory:", canonicalRoot: "/tmp/ranger-repos" },
     workers: { spawnCapPerDay: 10, wallClockMin: 90, maxAttempts: 2, deadmanThreshold: 3, reviewRounds: 2 },
+  budget: { graphqlFloor: 1000, rateLimitCooldownMin: 10, frontierMaxAgeMin: 60 },
   };
 
   test("resolves from env when set", () => {

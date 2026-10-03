@@ -8,13 +8,25 @@ import {
  type RangerMapConfig,
 } from "./config.ts";
 import {
+ graphAudit,
+ graphFrontier,
+ graphNode,
+ type FrontierEntry,
+ type NodeResult,
+} from "./graph.ts";
+import {
  renderJson,
  renderText,
+ type ClaimCard,
  type MapReport,
  type ScoutReport,
 } from "./report.ts";
-import { loadProbeRegistry } from "./route.ts";
-import { assertReadOnlyToken } from "./token-gate.ts";
+import { classify, hitlWaiting, loadProbeRegistry } from "./route.ts";
+import {
+ assertReadOnlyToken,
+ GateError,
+ type ResolvedToken,
+} from "./token-gate.ts";
 import { openJournal, type Journal } from "./journal.ts";
 import {
  assertNotPrincipal,
@@ -25,14 +37,14 @@ import {
 import { runNode } from "./worker.ts";
 import { sweepMap } from "./sweep.ts";
 import { spawnRunNodeDetached, walk } from "./walk.ts";
+import { startServe } from "./serve.ts";
 import {
  escalateMaps,
  runDigest,
  type EscalateResult,
  type DigestResult,
 } from "./escalate.ts";
-import { scoutOneMap } from "./scout.ts";
-import { startServe } from "./serve.ts";
+import type { WalkMode } from "./config.ts";
 
 /**
  * ranger — autonomous orienteer work-graph walker.
@@ -51,6 +63,79 @@ const READONLY_SURFACE = ["audit", "frontier", "node"] as const;
 interface ScoutOptions {
  config: string;
  json: boolean;
+}
+
+async function scoutOneMap(
+ config: RangerConfig,
+ map: { repo: string; root: number; walk: WalkMode; nodes?: string[]; skip?: string[] },
+ registry: ReturnType<typeof loadProbeRegistry>,
+): Promise<MapReport> {
+ const base: MapReport = {
+  repo: map.repo,
+  root: map.root,
+  walk: map.walk,
+  ok: true,
+  frontier: [],
+  hitlWaiting: [],
+  claims: [],
+  receiptLessCloses: [],
+  openWithoutCheckpoint: [],
+  auditNodes: 0,
+ };
+
+ let token: ResolvedToken;
+ try {
+  ({ token } = await assertReadOnlyToken(config, map.repo));
+ } catch (error) {
+  return {
+   ...base,
+   ok: false,
+   error: error instanceof GateError ? error.message : String(error),
+  };
+ }
+
+ try {
+  const [frontier, audit] = await Promise.all([
+   graphFrontier(map.repo, map.root, token),
+   graphAudit(map.repo, map.root, token),
+  ]);
+
+  const classified = frontier.frontier.map((entry: FrontierEntry) =>
+   classify(entry, map.repo, map.walk, registry, {
+        botIdentity: config.bot.identity,
+        allowlist: map.nodes,
+        skip: map.skip,
+      }),
+  );
+  const waiting = hitlWaiting(classified);
+
+  const claims: ClaimCard[] = [];
+  for (const claimed of audit.openClaimed) {
+   const node: NodeResult = await graphNode(map.repo, claimed.id, token);
+   claims.push({
+    id: claimed.id,
+    title: node.node.title,
+    assignees: claimed.assignees,
+    worker: "unknown",
+   });
+  }
+
+  return {
+   ...base,
+   frontier: classified,
+   hitlWaiting: waiting,
+   claims,
+   receiptLessCloses: audit.closedWithoutReceipt,
+   openWithoutCheckpoint: audit.openWithoutCheckpoint,
+   auditNodes: audit.nodes,
+  };
+ } catch (error) {
+  return {
+   ...base,
+   ok: false,
+   error: error instanceof Error ? error.message : String(error),
+  };
+ }
 }
 
 async function runScout(opts: ScoutOptions): Promise<ScoutReport> {

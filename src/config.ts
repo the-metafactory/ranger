@@ -128,8 +128,12 @@ const ServeMapSchema = z.object({
 const ServeSchema = z.object({
  /** Bound on 127.0.0.1 only. */
  port: z.number().int().min(1024).max(65535).default(7311),
- /** Seconds between background frontier refreshes (one in flight at a time). */
- refreshSec: z.number().int().min(30).default(180),
+ /**
+  * Seconds between the dashboard's own GitHub reads — serve-only maps and
+  * in-flight titles, one at a time. Registered maps come from the tick's
+  * cache and cost nothing here. The PATs are the principal's (`budget.ts`).
+  */
+ refreshSec: z.number().int().min(300).default(900),
  extraMaps: z.array(ServeMapSchema).default([]),
 });
 
@@ -194,6 +198,22 @@ const WorkersSchema = z.object({
  reviewRounds: z.number().int().positive().default(2),
 });
 
+/**
+ * The GitHub budget (src/budget.ts). Ranger's read-only PATs draw on the
+ * principal's own GraphQL allowance, so ranger yields well before it is spent.
+ */
+const BudgetSchema = z.object({
+ /** Defer graph reads while fewer GraphQL points than this remain this hour. */
+ graphqlFloor: z.number().int().nonnegative().default(1000),
+ /** Pause graph reads this long after a secondary (burst) rate-limit refusal, minutes. */
+ rateLimitCooldownMin: z.number().int().positive().default(10),
+ /**
+  * Oldest a cached frontier may be before it is re-read regardless of the
+  * repo's issue activity, minutes (src/frontier-cache.ts).
+  */
+ frontierMaxAgeMin: z.number().int().positive().default(60),
+});
+
 const RangerConfigSchema = z.object({
  version: z.literal(1).default(1),
  maps: z.array(MapSchema).min(1, "at least one map must be registered"),
@@ -202,6 +222,7 @@ const RangerConfigSchema = z.object({
  principal: PrincipalSchema.default({}),
  state: StateSchema.default({}),
  workers: WorkersSchema.default({}),
+ budget: BudgetSchema.default({}),
  serve: ServeSchema.optional(),
 });
 

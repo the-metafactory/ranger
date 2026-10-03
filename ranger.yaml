@@ -96,7 +96,7 @@ principal:
 # `ranger serve` (#37): the local dashboard, bound on 127.0.0.1.
 serve:
   port: 7311
-  refreshSec: 180
+  refreshSec: 900
   # Shown on the dashboard only — not walked, not in `ranger scout`'s report,
   # no cards (serve still reads their frontier). Seelite's
   # gameplay map #460 is registered for walking once two maps on one repo are

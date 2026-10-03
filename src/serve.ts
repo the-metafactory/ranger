@@ -35,11 +35,12 @@ import {
 import { planTick, walkableCandidates } from "./candidates.ts";
 import { pidAlive as defaultPidAlive } from "./exec.ts";
 import { Journal, type WorkerRow } from "./journal.ts";
-import type { MapReport } from "./report.ts";
-import { type ClassifiedNode, loadProbeRegistry } from "./route.ts";
-import { graphNode } from "./graph.ts";
-import { scoutOneMap } from "./scout.ts";
-import { assertReadOnlyToken } from "./token-gate.ts";
+import { activeCooldown, readGraphqlBudget } from "./budget.ts";
+import { cachedFrontier } from "./frontier-cache.ts";
+import { type FrontierEntry, graphFrontier, RateLimitError } from "./graph.ts";
+import { runCmd } from "./exec.ts";
+import { classify, type ClassifiedNode, loadProbeRegistry } from "./route.ts";
+import { assertReadOnlyToken, gatedEnv } from "./token-gate.ts";
 
 const ID_PATTERN = /^\d+$/;
 
@@ -111,10 +112,27 @@ export function servedMaps(config: RangerConfig): ServeMap[] {
 
 // ---- state ----
 
+/** One map's frontier as the dashboard has it. */
+export interface MapRead {
+ ok: boolean;
+ error?: string;
+ /** Classified exactly as the walk classifies. */
+ frontier: ClassifiedNode[];
+ /** When it was read from GitHub. */
+ readAt: string | null;
+ /**
+  * `ranger`: the frontier the tick cached in the journal (no GitHub call from
+  * here). `serve`: a serve-only map this dashboard read itself, rarely.
+  */
+ source: "ranger" | "serve";
+}
+
 export interface StateInputs {
  maps: ServeMap[];
- /** Scout reports by `ServeMap.key`. */
- reports: Map<string, MapReport>;
+ /** Frontier reads by `ServeMap.key`. */
+ reports: Map<string, MapRead>;
+ /** Titles of in-flight nodes not on any frontier, by `repo#id`. */
+ titles: Map<string, string>;
  workers: WorkerRow[];
  laneHolder: WorkerRow | null;
  paused: boolean;
@@ -122,7 +140,6 @@ export interface StateInputs {
  spawnCap: number;
  vetoed: (nodeId: string) => boolean;
  pidAlive: (pid: number | null) => boolean;
- frontierAt: string | null;
  refreshing: boolean;
  refreshError: string | null;
  now: Date;
@@ -174,6 +191,8 @@ export interface DashboardMap {
  servedOnly: boolean;
  ok: boolean;
  error?: string;
+ readAt: string | null;
+ source: "ranger" | "serve";
  localCheckout?: string;
  next: NextJob;
  autonomous: NodeView[];
@@ -182,7 +201,6 @@ export interface DashboardMap {
 
 export interface DashboardState {
  generatedAt: string;
- frontierAt: string | null;
  refreshing: boolean;
  refreshError: string | null;
  gates: {
@@ -222,7 +240,7 @@ interface TickSoFar {
 
 function nextFor(
  map: ServeMap,
- report: MapReport | undefined,
+ report: MapRead | undefined,
  inputs: StateInputs,
  tick: TickSoFar,
 ): NextJob {
@@ -287,12 +305,10 @@ export function assembleState(inputs: StateInputs): DashboardState {
   for (const map of inputs.maps) {
    if (map.repo !== repo) continue;
    const report = inputs.reports.get(map.key);
-   const hit =
-    report?.claims.find((c) => c.id === id)?.title ??
-    report?.frontier.find((n) => n.id === id)?.title;
+   const hit = report?.frontier.find((n) => n.id === id)?.title;
    if (hit !== undefined) return hit;
   }
-  return null;
+  return inputs.titles.get(`${repo}#${id}`) ?? null;
  };
 
  const current: CurrentJob[] = inputs.workers
@@ -332,6 +348,8 @@ export function assembleState(inputs: StateInputs): DashboardState {
    servedOnly: map.servedOnly,
    ok: report?.ok ?? false,
    error: report?.error,
+   readAt: report?.readAt ?? null,
+   source: report?.source ?? (map.servedOnly ? "serve" : "ranger"),
    localCheckout: map.localCheckout,
    next: nextFor(map, report, inputs, tick),
    autonomous: walked ? walkableCandidates(frontier).map(view) : [],
@@ -351,7 +369,6 @@ export function assembleState(inputs: StateInputs): DashboardState {
  const holder = inputs.laneHolder;
  return {
   generatedAt: inputs.now.toISOString(),
-  frontierAt: inputs.frontierAt,
   refreshing: inputs.refreshing,
   refreshError: inputs.refreshError,
   gates: {
@@ -590,7 +607,7 @@ button:disabled { opacity:.45; cursor:default; }
 </style>
 </head>
 <body>
-<header><h1>Ranger</h1><span class="meta" id="meta">loading…</span><button id="refresh">Refresh frontier</button></header>
+<header><h1>Ranger</h1><span class="meta" id="meta">loading…</span><button id="refresh" title="Re-reads only the maps this dashboard reads itself; ranger's maps come from its tick">Refresh</button></header>
 <div id="msg"></div>
 <main>
 <section><h2>Current job</h2><div id="current"></div></section>
@@ -607,10 +624,10 @@ const ago = (iso) => { if (!iso) return "never"; const s = Math.round((Date.now(
 function say(text, err) { const m = document.getElementById("msg"); m.textContent = text; m.className = err ? "err" : ""; }
 async function post(path, body) { const r = await fetch(path, { method: "POST", headers: { "content-type": "application/json", "x-ranger-token": TOKEN }, body: JSON.stringify(body || {}) }); const j = await r.json().catch(() => ({})); if (!r.ok) throw new Error(j.error || r.statusText); return j; }
 const unavailable = (m, none) => empty(m.ok ? none : "Frontier unavailable: " + (m.error || "not read yet"));
-const mapHead = (m, extra) => el("h3", { text: m.repo + " · map #" + m.root + (extra || "") });
+const mapHead = (m, extra) => el("h3", { text: m.repo + " · map #" + m.root + (extra || "") + " · read " + ago(m.readAt) + (m.source === "ranger" ? " by ranger" : " by this dashboard") });
 function renderMeta(s) {
  const g = s.gates;
- document.getElementById("meta").textContent = "frontier read " + ago(s.frontierAt) + (s.refreshing ? " · refreshing…" : "") + (s.refreshError ? " · refresh failed: " + s.refreshError : "") + " · spawns today " + g.spawnsToday + "/" + g.spawnCap + (g.paused ? " · DEAD-MAN PAUSED" : "");
+ document.getElementById("meta").textContent = "maps read by ranger's tick, shown from its cache" + (s.refreshing ? " · dashboard reading…" : "") + (s.refreshError ? " · dashboard read: " + s.refreshError : "") + " · spawns today " + g.spawnsToday + "/" + g.spawnCap + (g.paused ? " · DEAD-MAN PAUSED" : "");
 }
 function jobTag(j) {
  if (j.stale) return el("span", { class: "tag stale", text: "stale: process gone" });
@@ -669,66 +686,222 @@ load(); setInterval(load, 15000);
 
 // ---- the server ----
 
-/** One background frontier read at a time; the last good one is kept. */
-export class FrontierCache {
- reports = new Map<string, MapReport>();
- at: string | null = null;
+/**
+ * **The dashboard spends almost none of the principal's GitHub budget.**
+ * Ranger's read-only PATs belong to the principal (`budget.ts`), so every
+ * GraphQL point serve spends is one their own `gh`, sage and Claude sessions
+ * cannot. So:
+ *
+ * - a registered map is shown from the frontier the tick cached in the
+ *   journal (`frontier-cache.ts`) — no GitHub call at all;
+ * - a serve-only map (#38) is read here, one map at a time, at most every
+ *   `serve.refreshSec`, and only while the journal shows no cooldown on the
+ *   token and `/rate_limit` (free) shows the allowance above
+ *   `budget.graphqlFloor`; a refusal backs off in memory, doubling to an hour;
+ * - the titles of in-flight nodes and the launch check use REST
+ *   (`/repos/{repo}/issues/{id}`), a separate bucket from GraphQL.
+ */
+export class ServeReader {
+ extra = new Map<string, MapRead>();
+ titles = new Map<string, string>();
  refreshing = false;
- error: string | null = null;
+ lastError: string | null = null;
+ private backoffUntil = 0;
+ private strikes = 0;
+ private wantedTitles = new Set<string>();
 
- constructor(private readonly read: () => Promise<Map<string, MapReport>>) {}
+ constructor(
+  private readonly config: RangerConfig,
+  private readonly maps: ServeMap[],
+  private readonly journalPath: string,
+ ) {}
+
+ /** Ask for titles of nodes no frontier names; fetched on the next refresh. */
+ want(keys: string[]): void {
+  for (const key of keys) if (!this.titles.has(key)) this.wantedTitles.add(key);
+ }
 
  refresh(): void {
   if (this.refreshing) return;
   this.refreshing = true;
-  this.read()
-   .then((reports) => {
-    this.reports = reports;
-    this.at = new Date().toISOString();
-    this.error = null;
+  this.run()
+   .then(() => {
+    this.lastError = null;
    })
    .catch((error) => {
-    this.error = error instanceof Error ? error.message : String(error);
+    this.lastError = error instanceof Error ? error.message : String(error);
    })
    .finally(() => {
     this.refreshing = false;
    });
  }
+
+ private async run(): Promise<void> {
+  const now = new Date();
+  if (now.getTime() < this.backoffUntil) {
+   throw new Error(`backing off GitHub until ${new Date(this.backoffUntil).toISOString()}`);
+  }
+  const registry = loadProbeRegistry();
+  for (const map of this.maps.filter((m) => m.servedOnly)) {
+   const prev = this.extra.get(map.key);
+   const keep = (error: string): void => {
+    this.extra.set(map.key, {
+     ok: prev?.ok ?? false,
+     frontier: prev?.frontier ?? [],
+     readAt: prev?.readAt ?? null,
+     source: "serve",
+     error,
+    });
+   };
+   const { token } = await assertReadOnlyToken(this.config, map.repo);
+   const journal = Journal.openReadOnly(this.journalPath);
+   const cooling = journal === null ? null : activeCooldown(journal, token.source, now);
+   journal?.close();
+   if (cooling !== null) {
+    keep(`deferred: ${token.source} cooling down until ${cooling.until.toISOString()} (${cooling.reason})`);
+    continue;
+   }
+   const budget = await readGraphqlBudget(token.token);
+   if (budget !== null && budget.remaining < this.config.budget.graphqlFloor) {
+    keep(`deferred: GraphQL allowance ${budget.remaining}/${budget.limit} under the floor of ${this.config.budget.graphqlFloor}`);
+    continue;
+   }
+   try {
+    const read = await graphFrontier(map.repo, map.root, token);
+    this.extra.set(map.key, {
+     ok: true,
+     frontier: read.frontier.map((e: FrontierEntry) =>
+      classify(e, map.repo, "none", registry, { botIdentity: this.config.bot.identity }),
+     ),
+     readAt: now.toISOString(),
+     source: "serve",
+    });
+    this.strikes = 0;
+   } catch (error) {
+    if (!(error instanceof RateLimitError)) throw error;
+    this.strikes += 1;
+    const ms = Math.min(
+     this.config.budget.rateLimitCooldownMin * 60_000 * 2 ** (this.strikes - 1),
+     60 * 60_000,
+    );
+    this.backoffUntil = now.getTime() + ms;
+    keep(`GitHub refused the read; backing off until ${new Date(this.backoffUntil).toISOString()}`);
+    return;
+   }
+  }
+  for (const key of [...this.wantedTitles]) {
+   const [repo, id] = key.split("#");
+   const issue = await readIssue(this.config, repo, id);
+   if (issue !== null) this.titles.set(key, issue.title);
+   this.wantedTitles.delete(key);
+  }
+ }
 }
 
-export async function readReports(
+interface IssueRead {
+ title: string;
+ state: string;
+ assignees: string[];
+ kind: string | null;
+}
+
+/** One issue over REST under the read-only gate: no GraphQL. Null if unreadable. */
+async function readIssue(
  config: RangerConfig,
- maps: ServeMap[],
-): Promise<Map<string, MapReport>> {
- const registry = loadProbeRegistry();
- const entries = await Promise.all(
-  maps.map(
-   async (map) =>
-    [
-     map.key,
-     await scoutOneMap(
-      config,
-      { repo: map.repo, root: map.root, walk: map.walk, nodes: map.nodes, skip: map.skip },
-      registry,
-     ),
-    ] as const,
-  ),
- );
- return new Map(entries);
+ repo: string,
+ id: string,
+): Promise<IssueRead | null> {
+ if (!REPO_PATTERN.test(repo) || !ID_PATTERN.test(id)) return null;
+ const { token } = await assertReadOnlyToken(config, repo);
+ const gated = gatedEnv(token.token);
+ try {
+  const result = await runCmd("gh", ["api", `repos/${repo}/issues/${id}`], {
+   env: gated.env,
+   timeoutMs: 15_000,
+  });
+  if (result.code !== 0) return null;
+  const raw = JSON.parse(result.stdout) as {
+   title?: string;
+   state?: string;
+   assignees?: { login?: string }[];
+   body?: string | null;
+  };
+  // The node's kind is in its typed block, which the verbs write (#89-style
+  // `soma:work-graph-node` JSON in an HTML comment).
+  const block = /<!--\s*soma:work-graph-node\s*([\s\S]*?)-->/.exec(raw.body ?? "")?.[1];
+  let kind: string | null = null;
+  if (block !== undefined) {
+   try {
+    kind = (JSON.parse(block) as { kind?: string }).kind ?? null;
+   } catch {
+    kind = null;
+   }
+  }
+  return {
+   title: raw.title ?? "",
+   state: raw.state ?? "unknown",
+   assignees: (raw.assignees ?? []).map((a) => a.login ?? "").filter(Boolean),
+   kind,
+  };
+ } finally {
+  gated.cleanup();
+ }
 }
 
 export function stateFromJournal(
  config: RangerConfig,
  maps: ServeMap[],
- cache: FrontierCache,
+ reader: ServeReader,
  now = new Date(),
 ): DashboardState {
  const journal = Journal.openReadOnly(expandHome(config.state.journalPath));
  try {
+  const registry = loadProbeRegistry();
+  const reports = new Map<string, MapRead>();
+  for (const map of maps) {
+   if (map.servedOnly) {
+    reports.set(
+     map.key,
+     reader.extra.get(map.key) ?? {
+      ok: false,
+      error: "not read yet",
+      frontier: [],
+      readAt: null,
+      source: "serve",
+     },
+    );
+    continue;
+   }
+   const cached = journal === null ? null : cachedFrontier(journal, map.repo, map.root);
+   reports.set(
+    map.key,
+    cached === null
+     ? {
+        ok: false,
+        error: "ranger has not cached this map's frontier yet; the next tick does",
+        frontier: [],
+        readAt: null,
+        source: "ranger",
+       }
+     : {
+        ok: true,
+        frontier: cached.frontier.frontier.map((e) =>
+         classify(e, map.repo, map.walk, registry, {
+          botIdentity: config.bot.identity,
+          allowlist: map.nodes,
+          skip: map.skip,
+         }),
+        ),
+        readAt: cached.fetchedAt,
+        source: "ranger",
+       },
+   );
+  }
   const vetoed = journal?.listVetoes() ?? new Set<string>();
-  return assembleState({
+  const state = assembleState({
    maps,
-   reports: cache.reports,
+   reports,
+   titles: reader.titles,
    workers: journal?.listWorkers() ?? [],
    laneHolder: journal?.implementLaneHolder() ?? null,
    paused: journal?.isPaused() ?? false,
@@ -736,28 +909,31 @@ export function stateFromJournal(
    spawnCap: config.workers.spawnCapPerDay,
    vetoed: (id) => vetoed.has(id),
    pidAlive: defaultPidAlive,
-   frontierAt: cache.at,
-   refreshing: cache.refreshing,
-   refreshError: cache.error,
+   refreshing: reader.refreshing,
+   refreshError: reader.lastError,
    now,
   });
+  reader.want(
+   state.current.filter((j) => j.title === null).map((j) => `${j.repo}#${j.nodeId}`),
+  );
+  return state;
  } finally {
   journal?.close();
  }
 }
 
-/** The live read behind `verifyGrilling`: one read verb under the read-only gate. */
+/** The live check behind `verifyGrilling`: one REST read under the read-only gate. */
 export async function verifyGrillingLive(
  config: RangerConfig,
  map: DashboardMap,
  nodeId: string,
 ): Promise<string | null> {
  try {
-  const { token } = await assertReadOnlyToken(config, map.repo);
-  const node = await graphNode(map.repo, nodeId, token);
-  if (node.status !== "open") return `#${nodeId} is ${node.status} now`;
-  if (node.node.kind !== "grilling") return `#${nodeId} is a ${node.node.kind} now`;
-  if (node.assignees.length > 0) return `#${nodeId} is claimed by ${node.assignees.join(", ")}`;
+  const issue = await readIssue(config, map.repo, nodeId);
+  if (issue === null) return `could not read #${nodeId} live`;
+  if (issue.state !== "open") return `#${nodeId} is ${issue.state} now`;
+  if (issue.kind !== "grilling") return `#${nodeId} is a ${issue.kind ?? "untyped node"} now`;
+  if (issue.assignees.length > 0) return `#${nodeId} is claimed by ${issue.assignees.join(", ")}`;
   return null;
  } catch (error) {
   return `could not read #${nodeId} live: ${error instanceof Error ? error.message : String(error)}`;
@@ -773,14 +949,18 @@ export function startServe(opts: {
  const port = opts.port ?? serve.port;
  const token = randomBytes(24).toString("hex");
  const maps = servedMaps(opts.config);
- const cache = new FrontierCache(() => readReports(opts.config, maps));
- cache.refresh();
- const timer = setInterval(() => cache.refresh(), serve.refreshSec * 1000);
+ const reader = new ServeReader(
+  opts.config,
+  maps,
+  expandHome(opts.config.state.journalPath),
+ );
+ reader.refresh();
+ const timer = setInterval(() => reader.refresh(), serve.refreshSec * 1000);
  const handler = createHandler({
   port,
   token,
-  getState: () => stateFromJournal(opts.config, maps, cache),
-  refresh: () => cache.refresh(),
+  getState: () => stateFromJournal(opts.config, maps, reader),
+  refresh: () => reader.refresh(),
   launch: spawnLaunch,
   verifyGrilling: (map, nodeId) => verifyGrillingLive(opts.config, map, nodeId),
  });

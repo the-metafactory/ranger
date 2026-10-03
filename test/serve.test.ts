@@ -5,7 +5,6 @@ import { dirname, join } from "node:path";
 import type { FrontierEntry } from "../src/graph.ts";
 import { Journal } from "../src/journal.ts";
 import type { WorkerRow } from "../src/journal.ts";
-import type { MapReport } from "../src/report.ts";
 import { classify, loadProbeRegistry } from "../src/route.ts";
 import type { RangerConfig } from "../src/config.ts";
 import {
@@ -14,6 +13,9 @@ import {
  servedMaps,
  createHandler,
  launchPlan,
+ type MapRead,
+ ServeReader,
+ stateFromJournal,
  type ServeMap,
  type StateInputs,
 } from "../src/serve.ts";
@@ -58,17 +60,11 @@ const classified = (entries: FrontierEntry[], skip: string[] = []) =>
   classify(e, REPO, "full", registry, { botIdentity: "bot", skip }),
  );
 
-const report = (entries: FrontierEntry[], skip: string[] = []): MapReport => ({
- repo: REPO,
- root: 1,
- walk: "full",
+const report = (entries: FrontierEntry[], skip: string[] = []): MapRead => ({
  ok: true,
  frontier: classified(entries, skip),
- hitlWaiting: [],
- claims: [{ id: "50", title: "the running one", assignees: ["bot"], worker: "unknown" }],
- receiptLessCloses: [],
- openWithoutCheckpoint: [],
- auditNodes: 0,
+ readAt: "2026-10-03T10:00:00Z",
+ source: "ranger",
 });
 
 const worker = (over: Partial<WorkerRow>): WorkerRow => ({
@@ -105,6 +101,7 @@ const FRONTIER = [
 const inputs = (over: Partial<StateInputs> = {}): StateInputs => ({
  maps: [walked],
  reports: new Map([[walked.key, report(FRONTIER, ["11"])]]),
+ titles: new Map([[`${REPO}#50`, "the running one"]]),
  workers: [],
  laneHolder: null,
  paused: false,
@@ -112,7 +109,6 @@ const inputs = (over: Partial<StateInputs> = {}): StateInputs => ({
  spawnCap: 10,
  vetoed: () => false,
  pidAlive: () => true,
- frontierAt: "2026-10-03T10:00:00Z",
  refreshing: false,
  refreshError: null,
  now: new Date("2026-10-03T10:05:00Z"),
@@ -158,7 +154,7 @@ describe("#37 — the state the dashboard shows", () => {
   };
   visit(join(src, "serve.ts"));
   const local = [...seen].map((f) => f.slice(src.length + 1));
-  expect(local).toContain("scout.ts");
+  expect(local).toContain("frontier-cache.ts");
   expect(local.filter((f) => /graph-write|walk|sweep|worker|implement/.test(f))).toEqual([]);
  });
 
@@ -422,6 +418,56 @@ describe("#37 — a checkout the session may open", () => {
    expect(map.checkoutRefused).toMatch(/machine-account clone/);
   }
   expect(servedMaps(config("/opt/clone", "/opt/clone"))[0].localCheckout).toBeUndefined();
+ });
+});
+
+describe("#37 — a registered map is shown from ranger's own cache, with no GitHub call", () => {
+ const cfg = (journalPath: string) =>
+  ({
+   version: 1,
+   maps: [{ repo: REPO, root: 1, walk: "full", skip: ["11"], commands: {}, autoMerge: false, base: "main" }],
+   auth: { readOnlyTokens: {}, writeTokens: {} },
+   bot: { identity: "bot" },
+   principal: {},
+   state: { journalPath, canonicalRoot: "/srv/ranger-repos" },
+   workers: { spawnCapPerDay: 10, wallClockMin: 90, maxAttempts: 2, deadmanThreshold: 3, reviewRounds: 2 },
+   budget: { graphqlFloor: 1000, rateLimitCooldownMin: 10, frontierMaxAgeMin: 60 },
+  }) as unknown as RangerConfig;
+
+ test("the cached frontier is classified as the walk classifies it, and stamped with its age", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ranger-serve-cache-"));
+  const path = join(dir, "state.sqlite");
+  const writer = new Journal(path);
+  writer.setHealth(
+   `frontier:${REPO}#1`,
+   JSON.stringify({
+    sentinel: "s",
+    fetchedAt: "2026-10-03T09:00:00Z",
+    frontier: { repo: REPO, root: "1", frontier: FRONTIER },
+   }),
+  );
+  writer.close();
+  const config = cfg(path);
+  const maps = servedMaps(config);
+  const reader = new ServeReader(config, maps, path);
+  const map = stateFromJournal(config, maps, reader).maps[0];
+  expect(map).toMatchObject({ ok: true, readAt: "2026-10-03T09:00:00Z", source: "ranger" });
+  expect(map.autonomous.map((n) => n.id)).toEqual(["10", "14"]);
+  expect(map.grillings.map((g) => g.id)).toEqual(["12", "13"]);
+  expect(reader.refreshing).toBe(false);
+  rmSync(dir, { recursive: true });
+ });
+
+ test("no cache yet says so, rather than reading GitHub", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ranger-serve-cache-"));
+  const path = join(dir, "state.sqlite");
+  new Journal(path).close();
+  const config = cfg(path);
+  const maps = servedMaps(config);
+  const map = stateFromJournal(config, maps, new ServeReader(config, maps, path)).maps[0];
+  expect(map.ok).toBe(false);
+  expect(map.error).toMatch(/next tick/);
+  rmSync(dir, { recursive: true });
  });
 });
 

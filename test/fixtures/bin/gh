@@ -9,6 +9,11 @@ if [ -z "${GH_TOKEN:-}" ]; then
 fi
 
 path="${2:-}"
+# Every request is logged when the test asks, so a test can assert that a
+# throttled token makes no GitHub call at all (src/budget.ts).
+if [ -n "${FAKE_GH_CALLS:-}" ]; then
+  printf "%s\n" "$path" >> "$FAKE_GH_CALLS"
+fi
 case "$path" in
   /user)
     # login depends on the credential: write token → machine account, a
@@ -36,6 +41,33 @@ EOF
       echo "${login}"
       exit 0
     fi
+    ;;
+  rate_limit)
+    # GET /rate_limit, already narrowed to .resources.graphql by the caller.
+    reset=$(( $(date +%s) + 3600 ))
+    echo "{\"limit\":5000,\"remaining\":${FAKE_GH_GRAPHQL_REMAINING:-5000},\"reset\":${reset},\"used\":0}"
+    exit 0
+    ;;
+  repos/*/issues/events\?*)
+    # The frontier cache's sentinel, second half: the newest issue-event id.
+    [ -n "${FAKE_GH_SENTINEL_FAIL:-}" ] && { echo "fake gh: sentinel down" >&2; exit 1; }
+    # Default: a checksum of the fake graph, so a test that rewrites its
+    # fixtures has "changed the repo" exactly as a real edit moves GitHub's
+    # sentinel — and the frontier cache re-reads.
+    if [ -n "${FAKE_GH_EVENTS_LATEST:-}" ]; then
+      echo "$FAKE_GH_EVENTS_LATEST"
+    elif [ -n "${FAKE_SOMA_DIR:-}" ]; then
+      cat "$FAKE_SOMA_DIR"/*.json 2>/dev/null | cksum | cut -d' ' -f1
+    else
+      echo 1000
+    fi
+    exit 0
+    ;;
+  repos/*/issues\?*)
+    # The frontier cache's sentinel, first half: the newest issue updated_at.
+    [ -n "${FAKE_GH_SENTINEL_FAIL:-}" ] && { echo "fake gh: sentinel down" >&2; exit 1; }
+    echo "${FAKE_GH_ISSUES_UPDATED:-2026-01-01T00:00:00Z}"
+    exit 0
     ;;
   repos/*)
     if [ "${3:-}" = "--jq" ] && [ "${4:-}" = ".full_name" ]; then
