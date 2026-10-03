@@ -16,7 +16,7 @@ import {
  loadProbeRegistry,
  type ClassifiedNode,
 } from "../src/route.ts";
-import { researchCandidates } from "../src/walk.ts";
+import { planTick, researchCandidates } from "../src/walk.ts";
 import { bootstrapWorktree } from "../src/worker.ts";
 import type { FrontierEntry } from "../src/graph.ts";
 import {
@@ -504,4 +504,65 @@ describe("bootstrapWorktree — orphaned branch (node #19 live finding)", () => 
    rmSync(dir, { recursive: true, force: true });
   }
  });
+});
+
+/**
+ * #37: `ranger serve` names `planTick(...).take[0]` as the next job, so the
+ * real walk must claim exactly `take` — checked by running it, not by reading
+ * its source. Once with no veto, once with the only walkable node vetoed.
+ */
+describe("walk claims exactly planTick's take (#37)", () => {
+ const frontier = (
+  JSON.parse(
+   readFileSync(join(dataDir, "acme__widgets-frontier.json"), "utf8"),
+  ) as { frontier: FrontierEntry[] }
+ ).frontier.map((e) =>
+  classify(e, "acme/widgets", "research-only", loadProbeRegistry(), {
+   botIdentity: "ivy-bot",
+  }),
+ );
+
+ for (const vetoed of [[], ["10"]] as string[][]) {
+  test(`vetoed: [${vetoed.join(", ")}]`, async () => {
+   const dir = mkdtempSync(join(tmpdir(), "ranger-walk-plan-"));
+   const discord = fakeDiscord();
+   try {
+    const config = writeConfig(dir);
+    const statePath = writeState(dir, { "10": RESEARCH_NODE_STATE });
+    const journal = new Journal(join(dir, "state.sqlite"));
+    for (const id of vetoed) journal.recordVeto(id, `comment-${id}`);
+    journal.close();
+
+    const result = await runCli(["walk", "-c", config], {
+     ...process.env,
+     ...GIT_ENV,
+     PATH: `${fixturesBin}:${process.env.PATH ?? ""}`,
+     FAKE_SOMA_DIR: dataDir,
+     FAKE_SOMA_STATE: statePath,
+     RANGER_DISCORD_API_BASE: `http://127.0.0.1:${discord.port}`,
+     RANGER_DISCORD_ALLOW_TEST_OVERRIDE: "1",
+     RANGER_DISCORD_MIN_INTERVAL_MS: "5",
+     RANGER_DISCORD_TOKEN: "fake-bot-token",
+     RANGER_WRITE_TEST: "ghp_write",
+     RANGER_NO_SPAWN: "1",
+    });
+    expect(result.code).toBe(0);
+
+    const state = JSON.parse(readFileSync(statePath, "utf8")) as {
+     nodes: Record<string, { assignees: string[] }>;
+    };
+    const claimed = Object.entries(state.nodes)
+     .filter(([, n]) => n.assignees.includes("ivy-bot"))
+     .map(([id]) => id);
+    const plan = planTick(frontier, {
+     laneBusy: false,
+     vetoed: (id) => vetoed.includes(id),
+    });
+    expect(claimed).toEqual(plan.take.map((n) => n.id));
+   } finally {
+    discord.stop();
+    rmSync(dir, { recursive: true, force: true });
+   }
+  });
+ }
 });

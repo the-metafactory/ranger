@@ -32,9 +32,12 @@ const DiscordSchema = z.object({
  channelId: z.string().regex(/^\d+$/, "channelId must be a Discord snowflake"),
 });
 
+/** `owner/name`: the one pattern config validation and `ranger serve`'s launch check share. */
+export const REPO_PATTERN = /^[\w.-]+\/[\w.-]+$/;
+
 const MapSchema = z.object({
  /** `owner/name` — the repo whose issues hold the work graph. */
- repo: z.string().regex(/^[\w.-]+\/[\w.-]+$/, "repo must be owner/name"),
+ repo: z.string().regex(REPO_PATTERN, "repo must be owner/name"),
  /** Root node id of the orienteer map (the `orienteer:map` issue). */
  root: z
   .union([z.number().int().positive(), z.string().regex(/^\d+$/)])
@@ -101,8 +104,9 @@ const MapSchema = z.object({
  base: z.string().min(1).default("main"),
  /**
   * The principal's own checkout of this repo (#37). `ranger serve` opens an
-  * interactive grilling session there; never `canonical`, which is the
-  * machine account's clone. Unset means the dashboard offers no session.
+  * interactive grilling session there. A path inside `state.canonicalRoot`
+  * or this map's `canonical` — the machine account's clones — is refused by
+  * `servedMaps` and the dashboard says why. Unset means no session.
   */
  localCheckout: z.string().optional(),
 });
@@ -113,7 +117,7 @@ const MapSchema = z.object({
  * #460 until two maps on one repo are supported (#38).
  */
 const ServeMapSchema = z.object({
- repo: z.string().regex(/^[\w.-]+\/[\w.-]+$/, "repo must be owner/name"),
+ repo: z.string().regex(REPO_PATTERN, "repo must be owner/name"),
  root: z
   .union([z.number().int().positive(), z.string().regex(/^\d+$/)])
   .transform(Number),

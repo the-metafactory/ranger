@@ -7,9 +7,11 @@ import { Journal } from "../src/journal.ts";
 import type { WorkerRow } from "../src/journal.ts";
 import type { MapReport } from "../src/report.ts";
 import { classify, loadProbeRegistry } from "../src/route.ts";
+import type { RangerConfig } from "../src/config.ts";
 import {
  assembleState,
  childEnv,
+ servedMaps,
  createHandler,
  launchPlan,
  type ServeMap,
@@ -160,11 +162,37 @@ describe("#37 — the state the dashboard shows", () => {
   expect(local.filter((f) => /graph-write|walk|sweep|worker|implement/.test(f))).toEqual([]);
  });
 
- test("walk.ts takes its order and veto rule from planTick, the plan serve reads", () => {
-  const source = readFileSync(join(import.meta.dir, "..", "src", "walk.ts"), "utf8");
-  expect(source).toMatch(/=\s*planTick\(classified,/);
-  expect(source).toMatch(/const candidates = plan\.selected;/);
-  expect(source).toMatch(/plan\.vetoed\.includes\(node\)/);
+ test("an earlier map's implement claim takes the lane for a later map in the same tick", () => {
+  const second: ServeMap = { ...walked, key: `${REPO}#2`, root: 2 };
+  const state = assembleState(
+   inputs({
+    maps: [walked, second],
+    reports: new Map([
+     [walked.key, report(FRONTIER, ["11"])],
+     [second.key, report(FRONTIER, ["11"])],
+    ]),
+   }),
+  );
+  expect(state.maps[0].next).toMatchObject({ nodeId: "10", waiting: false });
+  expect(state.maps[1].next).toMatchObject({ nodeId: "10", waiting: true });
+  expect(state.maps[1].next.reason).toMatch(/this tick claims #10/);
+ });
+
+ test("an earlier map's claims count against the shared daily cap", () => {
+  const second: ServeMap = { ...walked, key: `${REPO}#2`, root: 2 };
+  const state = assembleState(
+   inputs({
+    maps: [walked, second],
+    reports: new Map([
+     [walked.key, report(FRONTIER, ["11"])],
+     [second.key, report(FRONTIER, ["11"])],
+    ]),
+    spawnsToday: 9,
+   }),
+  );
+  expect(state.maps[0].next.nodeId).toBe("10");
+  expect(state.maps[1].next.nodeId).toBeUndefined();
+  expect(state.maps[1].next.reason).toMatch(/spent by earlier maps/);
  });
 
  test("a held lane with its head vetoed names no waiting node", () => {
@@ -359,13 +387,41 @@ describe("#37 — the launch endpoint refuses", () => {
   expect(res.status).toBe(403);
  });
 
- test("the page carries the token for its own requests", async () => {
+ test("the page carries the token for its own requests, and refuses to be framed", async () => {
   const { handler } = setup();
   const res = await handler(
    new Request(`http://127.0.0.1:${PORT}/`, { headers: { host: `127.0.0.1:${PORT}` } }),
   );
   expect(res.status).toBe(200);
+  expect(res.headers.get("content-security-policy")).toBe("frame-ancestors 'none'");
+  expect(res.headers.get("x-frame-options")).toBe("DENY");
   expect(await res.text()).toContain(TOKEN);
+ });
+});
+
+describe("#37 — a checkout the session may open", () => {
+ const config = (localCheckout: string, canonical?: string) =>
+  ({
+   version: 1,
+   maps: [{ repo: REPO, root: 1, walk: "full", localCheckout, canonical, skip: [], commands: {}, autoMerge: false, base: "main" }],
+   auth: { readOnlyTokens: {}, writeTokens: {} },
+   bot: {},
+   principal: {},
+   state: { journalPath: "/tmp/x.sqlite", canonicalRoot: "/srv/ranger-repos" },
+   workers: { spawnCapPerDay: 10, wallClockMin: 90, maxAttempts: 2, deadmanThreshold: 3, reviewRounds: 2 },
+  }) as unknown as RangerConfig;
+
+ test("the principal's own checkout is offered", () => {
+  expect(servedMaps(config("/Users/someone/acme"))[0].localCheckout).toBe("/Users/someone/acme");
+ });
+
+ test("a path inside the machine account's clones is refused, and says why", () => {
+  for (const path of ["/srv/ranger-repos/acme/widgets", "/srv/ranger-repos", "/srv/ranger-repos/x/.worktrees/node-1"]) {
+   const map = servedMaps(config(path))[0];
+   expect(map.localCheckout).toBeUndefined();
+   expect(map.checkoutRefused).toMatch(/machine-account clone/);
+  }
+  expect(servedMaps(config("/opt/clone", "/opt/clone"))[0].localCheckout).toBeUndefined();
  });
 });
 

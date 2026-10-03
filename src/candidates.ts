@@ -56,8 +56,8 @@ export function walkableCandidates(frontier: ClassifiedNode[]): ClassifiedNode[]
 export interface TickPlan {
  /** What one tick tries, in order: the implement node first, then research. */
  selected: ClassifiedNode[];
+ /** The implement node in `selected`, if any (walk records each claim's lane from it). */
  implement: ClassifiedNode[];
- research: ClassifiedNode[];
  /** The selected nodes the veto cache stops; the tick skips them, never reaching past one. */
  vetoed: ClassifiedNode[];
  /** `selected` less `vetoed`: what the tick claims, cap permitting. */
@@ -82,14 +82,14 @@ export function planTick(
 ): TickPlan {
  const { implement, research } = selectCandidates(frontier, opts.laneBusy);
  const selected = [...implement, ...research];
+ // One veto read per node: in walk the predicate is a journal query.
  const vetoed = selected.filter((n) => opts.vetoed(n.id));
  const head = opts.laneBusy ? implementCandidates(frontier)[0] : undefined;
  return {
   selected,
   implement,
-  research,
   vetoed,
-  take: selected.filter((n) => !opts.vetoed(n.id)),
+  take: selected.filter((n) => !vetoed.includes(n)),
   waiting: head !== undefined && !opts.vetoed(head.id) ? head : null,
  };
 }

@@ -16,15 +16,19 @@
  * prompt carries a configured repo and a numeric id only, and the endpoint
  * refuses a foreign Host or Origin, a missing token, and any node that is not
  * a grilling on the cached frontier and still open and unclaimed when read
- * live. The allowlist governs `osascript` only: the shell iTerm2 opens takes
- * iTerm2's own environment (the principal's login session), so no machine
- * credential reaches it either way.
+ * live. **What the allowlist proves is narrower than the session**: it is the
+ * environment `osascript` runs with, and `test/serve.test.ts` holds it. The
+ * shell iTerm2 then opens is started by iTerm2, and is expected to take
+ * iTerm2's own environment rather than this process's — that is how a
+ * launched app's window works, and it is not tested here.
  */
 import { spawn } from "node:child_process";
 import { randomBytes, timingSafeEqual } from "node:crypto";
+import { resolve, sep } from "node:path";
 import {
  expandHome,
  type RangerConfig,
+ REPO_PATTERN,
  serveConfig,
  type WalkMode,
 } from "./config.ts";
@@ -37,7 +41,6 @@ import { graphNode } from "./graph.ts";
 import { scoutOneMap } from "./scout.ts";
 import { assertReadOnlyToken } from "./token-gate.ts";
 
-const REPO_PATTERN = /^[\w.-]+\/[\w.-]+$/;
 const ID_PATTERN = /^\d+$/;
 
 /** A map the dashboard shows: a registered one, or a serve-only extra (#38). */
@@ -51,20 +54,43 @@ export interface ServeMap {
  servedOnly: boolean;
  /** The principal's checkout, `~` expanded; unset means no session button. */
  localCheckout?: string;
+ /** Why a configured `localCheckout` was refused (it is a machine-account clone). */
+ checkoutRefused?: string;
  nodes?: string[];
  skip?: string[];
 }
 
+/**
+ * The principal's checkout for a map, or the reason it is refused: a path
+ * inside `state.canonicalRoot`, or the map's own `canonical`, is a machine-
+ * account clone, and a session there would be the principal working in it.
+ */
+function checkoutFor(
+ config: RangerConfig,
+ repo: string,
+ configured: string | undefined,
+ canonical: string | undefined,
+): Pick<ServeMap, "localCheckout" | "checkoutRefused"> {
+ if (configured === undefined) return {};
+ const path = resolve(expandHome(configured));
+ const root = resolve(expandHome(config.state.canonicalRoot));
+ const clone = resolve(expandHome(canonical ?? `${config.state.canonicalRoot}/${repo}`));
+ if (path === root || path.startsWith(root + sep) || path === clone) {
+  return {
+   checkoutRefused: `localCheckout ${path} is a machine-account clone (state.canonicalRoot or canonical)`,
+  };
+ }
+ return { localCheckout: path };
+}
+
 export function servedMaps(config: RangerConfig): ServeMap[] {
- const local = (path: string | undefined) =>
-  path === undefined ? undefined : expandHome(path);
  const maps: ServeMap[] = config.maps.map((m) => ({
   key: `${m.repo}#${m.root}`,
   repo: m.repo,
   root: m.root,
   walk: m.walk,
   servedOnly: false,
-  localCheckout: local(m.localCheckout),
+  ...checkoutFor(config, m.repo, m.localCheckout, m.canonical),
   nodes: m.nodes,
   skip: m.skip,
  }));
@@ -77,7 +103,7 @@ export function servedMaps(config: RangerConfig): ServeMap[] {
    root: extra.root,
    walk: "none",
    servedOnly: true,
-   localCheckout: local(extra.localCheckout),
+   ...checkoutFor(config, extra.repo, extra.localCheckout, undefined),
   });
  }
  return maps;
@@ -184,10 +210,21 @@ const view = (n: ClassifiedNode): NodeView => ({
  lane: laneOf(n),
 });
 
+/**
+ * What one tick has spent by the time it reaches a map: walk visits maps in
+ * config order, and an earlier map's claims take the implement lane and
+ * count against the shared daily cap before a later map is planned.
+ */
+interface TickSoFar {
+ holder: { repo: string; nodeId: string; thisTick: boolean } | null;
+ spawns: number;
+}
+
 function nextFor(
  map: ServeMap,
  report: MapReport | undefined,
  inputs: StateInputs,
+ tick: TickSoFar,
 ): NextJob {
  const none = (reason: string): NextJob => ({ waiting: false, reason });
  if (map.servedOnly) return none("not walked by ranger yet: shown here only (#38)");
@@ -195,16 +232,27 @@ function nextFor(
  if (!report.ok) return none(`frontier unavailable: ${report.error ?? "unknown error"}`);
  if (map.walk === "none") return none("walk: none — registered, not walked");
  if (inputs.paused) return none("dead-man paused — claiming stopped until `ranger resume-run`");
- if (inputs.spawnsToday >= inputs.spawnCap) {
-  return none(`daily spawn cap reached (${inputs.spawnsToday}/${inputs.spawnCap})`);
+ if (tick.spawns >= inputs.spawnCap) {
+  return none(
+   tick.spawns > inputs.spawnsToday
+    ? `the daily spawn cap (${inputs.spawnCap}) is spent by earlier maps this tick`
+    : `daily spawn cap reached (${inputs.spawnsToday}/${inputs.spawnCap})`,
+  );
  }
  // The tick's own plan (candidates.ts): the order and the veto rule walk uses.
- const holder = inputs.laneHolder;
+ const holder = tick.holder;
  const plan = planTick(report.frontier, {
   laneBusy: holder !== null,
   vetoed: inputs.vetoed,
  });
- const first = plan.take[0];
+ // What this map spends of the tick, for the maps after it.
+ const claims = plan.take.slice(0, inputs.spawnCap - tick.spawns);
+ tick.spawns += claims.length;
+ const implementClaim = claims.find((n) => plan.implement.includes(n));
+ if (implementClaim !== undefined) {
+  tick.holder = { repo: map.key, nodeId: implementClaim.id, thisTick: true };
+ }
+ const first = claims[0];
  if (first !== undefined) {
   return {
    nodeId: first.id,
@@ -222,7 +270,9 @@ function nextFor(
    url: plan.waiting.url,
    lane: "implement",
    waiting: true,
-   reason: `waits for the implement lane, held by #${holder.nodeId} (${holder.repo})`,
+   reason: holder.thisTick
+    ? `waits for the implement lane: this tick claims #${holder.nodeId} (${holder.repo}) first`
+    : `waits for the implement lane, held by #${holder.nodeId} (${holder.repo})`,
   };
  }
  const vetoed = plan.vetoed.map((n) => `#${n.id}`);
@@ -264,6 +314,12 @@ export function assembleState(inputs: StateInputs): DashboardState {
     !inputs.pidAlive(w.pid),
   }));
 
+ const lane = inputs.laneHolder;
+ const tick: TickSoFar = {
+  holder: lane === null ? null : { repo: lane.repo, nodeId: lane.nodeId, thisTick: false },
+  spawns: inputs.spawnsToday,
+ };
+ // In config order, as walk visits them, so each map sees what the earlier ones spent.
  const maps: DashboardMap[] = inputs.maps.map((map) => {
   const report = inputs.reports.get(map.key);
   const frontier = report?.ok ? report.frontier : [];
@@ -277,7 +333,7 @@ export function assembleState(inputs: StateInputs): DashboardState {
    ok: report?.ok ?? false,
    error: report?.error,
    localCheckout: map.localCheckout,
-   next: nextFor(map, report, inputs),
+   next: nextFor(map, report, inputs, tick),
    autonomous: walked ? walkableCandidates(frontier).map(view) : [],
    grillings: frontier
     .filter((n) => n.kind === "grilling")
@@ -285,9 +341,9 @@ export function assembleState(inputs: StateInputs): DashboardState {
      ...view(n),
      launchable: map.localCheckout !== undefined,
      why:
-      map.localCheckout === undefined
-       ? `no localCheckout for ${map.repo} in ranger.yaml`
-       : undefined,
+      map.localCheckout !== undefined
+       ? undefined
+       : (map.checkoutRefused ?? `no localCheckout for ${map.repo} in ranger.yaml`),
     })),
   };
  });
@@ -432,7 +488,13 @@ export function createHandler(ctx: HandlerContext): (req: Request) => Promise<Re
 
   if (req.method === "GET" && url.pathname === "/") {
    return new Response(renderPage(ctx.token), {
-    headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" },
+    headers: {
+     "content-type": "text/html; charset=utf-8",
+     "cache-control": "no-store",
+     // No other page may frame this one and steer a click onto "Start session".
+     "content-security-policy": "frame-ancestors 'none'",
+     "x-frame-options": "DENY",
+    },
    });
   }
   if (req.method === "GET" && url.pathname === "/api/state") {
@@ -544,30 +606,59 @@ const empty = (text) => el("p", { class: "empty", text });
 const ago = (iso) => { if (!iso) return "never"; const s = Math.round((Date.now() - Date.parse(iso)) / 1000); return s < 90 ? s + " s ago" : Math.round(s / 60) + " min ago"; };
 function say(text, err) { const m = document.getElementById("msg"); m.textContent = text; m.className = err ? "err" : ""; }
 async function post(path, body) { const r = await fetch(path, { method: "POST", headers: { "content-type": "application/json", "x-ranger-token": TOKEN }, body: JSON.stringify(body || {}) }); const j = await r.json().catch(() => ({})); if (!r.ok) throw new Error(j.error || r.statusText); return j; }
-function render(s) {
- document.getElementById("meta").textContent = "frontier read " + ago(s.frontierAt) + (s.refreshing ? " · refreshing…" : "") + (s.refreshError ? " · refresh failed: " + s.refreshError : "") + " · spawns today " + s.gates.spawnsToday + "/" + s.gates.spawnCap + (s.gates.paused ? " · DEAD-MAN PAUSED" : "");
- const cur = document.getElementById("current"); cur.replaceChildren();
- if (s.current.length === 0) cur.append(empty("No worker is running."));
- else cur.append(el("ul", {}, ...s.current.map((j) => el("li", {}, el("span", { class: "id", text: "#" + j.nodeId }), el("span", { class: "t", text: (j.title || "(title not in the frontier read)") + " — " + j.repo }), el("span", { class: "tag" + (j.stale ? " stale" : ""), text: j.stale ? "stale: process gone" : [j.status, j.phase, j.prNumber ? "PR #" + j.prNumber : "", j.reviewRound ? "round " + j.reviewRound : ""].filter(Boolean).join(" · ") })))));
- const next = document.getElementById("next"); next.replaceChildren();
+const unavailable = (m, none) => empty(m.ok ? none : "Frontier unavailable: " + (m.error || "not read yet"));
+const mapHead = (m, extra) => el("h3", { text: m.repo + " · map #" + m.root + (extra || "") });
+function renderMeta(s) {
+ const g = s.gates;
+ document.getElementById("meta").textContent = "frontier read " + ago(s.frontierAt) + (s.refreshing ? " · refreshing…" : "") + (s.refreshError ? " · refresh failed: " + s.refreshError : "") + " · spawns today " + g.spawnsToday + "/" + g.spawnCap + (g.paused ? " · DEAD-MAN PAUSED" : "");
+}
+function jobTag(j) {
+ if (j.stale) return el("span", { class: "tag stale", text: "stale: process gone" });
+ const parts = [j.status, j.phase, j.prNumber ? "PR #" + j.prNumber : "", j.reviewRound ? "round " + j.reviewRound : ""];
+ return el("span", { class: "tag", text: parts.filter(Boolean).join(" · ") });
+}
+function renderCurrent(s) {
+ const box = document.getElementById("current"); box.replaceChildren();
+ if (s.current.length === 0) { box.append(empty("No worker is running.")); return; }
+ box.append(el("ul", {}, ...s.current.map((j) => el("li", {}, el("span", { class: "id", text: "#" + j.nodeId }), el("span", { class: "t", text: (j.title || "(title not in the frontier read)") + " — " + j.repo }), jobTag(j)))));
+}
+function renderNext(s) {
+ const box = document.getElementById("next"); box.replaceChildren();
  for (const m of s.maps) {
-  next.append(el("h3", { text: m.repo + " · map #" + m.root }));
+  box.append(mapHead(m));
   const n = m.next;
-  next.append(n.nodeId ? el("p", {}, el("span", { class: "id", text: "#" + n.nodeId + " " }), link(n.url, n.title), el("span", { class: "reason", text: (n.lane ? n.lane + " lane · " : "") + n.reason })) : empty(n.reason));
- }
- const auto = document.getElementById("auto"); auto.replaceChildren();
- for (const m of s.maps) {
-  if (m.servedOnly) continue;
-  auto.append(el("h3", { text: m.repo + " · map #" + m.root + " (walk: " + m.walk + ")" }));
-  auto.append(m.autonomous.length === 0 ? empty(m.ok ? "None." : "Frontier unavailable: " + (m.error || "not read yet")) : el("ul", {}, ...m.autonomous.map((n) => el("li", {}, el("span", { class: "id", text: "#" + n.id }), el("span", { class: "t" }, link(n.url, n.title)), el("span", { class: "tag", text: n.lane + " · " + n.kind })))));
- }
- const grill = document.getElementById("grill"); grill.replaceChildren();
- for (const m of s.maps) {
-  grill.append(el("h3", { text: m.repo + " · map #" + m.root + (m.servedOnly ? " (shown only)" : "") }));
-  if (m.grillings.length === 0) { grill.append(empty(m.ok ? "None open." : "Frontier unavailable: " + (m.error || "not read yet"))); continue; }
-  grill.append(el("ul", {}, ...m.grillings.map((g) => { const b = el("button", { text: "Start session", disabled: !g.launchable, title: g.why || "Open iTerm2 in " + m.localCheckout + " and start claude on #" + g.id }); b.onclick = async () => { b.disabled = true; try { await post("/api/grill", { key: m.key, id: g.id }); say("Opened a session on #" + g.id + " in iTerm2."); } catch (e) { say("Could not start #" + g.id + ": " + e.message, true); } finally { setTimeout(() => (b.disabled = !g.launchable), 3000); } }; return el("li", {}, el("span", { class: "id", text: "#" + g.id }), el("span", { class: "t" }, link(g.url, g.title)), b); })));
+  if (!n.nodeId) { box.append(empty(n.reason)); continue; }
+  box.append(el("p", {}, el("span", { class: "id", text: "#" + n.nodeId + " " }), link(n.url, n.title), el("span", { class: "reason", text: (n.lane ? n.lane + " lane · " : "") + n.reason })));
  }
 }
+function renderAuto(s) {
+ const box = document.getElementById("auto"); box.replaceChildren();
+ for (const m of s.maps) {
+  if (m.servedOnly) continue;
+  box.append(mapHead(m, " (walk: " + m.walk + ")"));
+  if (m.autonomous.length === 0) { box.append(unavailable(m, "None.")); continue; }
+  box.append(el("ul", {}, ...m.autonomous.map((n) => el("li", {}, el("span", { class: "id", text: "#" + n.id }), el("span", { class: "t" }, link(n.url, n.title)), el("span", { class: "tag", text: n.lane + " · " + n.kind })))));
+ }
+}
+function grillButton(m, g) {
+ const b = el("button", { text: "Start session", disabled: !g.launchable, title: g.why || "Open iTerm2 in " + m.localCheckout + " and start claude on #" + g.id });
+ b.onclick = async () => {
+  b.disabled = true;
+  try { await post("/api/grill", { key: m.key, id: g.id }); say("Opened a session on #" + g.id + " in iTerm2."); }
+  catch (e) { say("Could not start #" + g.id + ": " + e.message, true); }
+  finally { setTimeout(() => (b.disabled = !g.launchable), 3000); }
+ };
+ return b;
+}
+function renderGrill(s) {
+ const box = document.getElementById("grill"); box.replaceChildren();
+ for (const m of s.maps) {
+  box.append(mapHead(m, m.servedOnly ? " (shown only)" : ""));
+  if (m.grillings.length === 0) { box.append(unavailable(m, "None open.")); continue; }
+  box.append(el("ul", {}, ...m.grillings.map((g) => el("li", {}, el("span", { class: "id", text: "#" + g.id }), el("span", { class: "t" }, link(g.url, g.title)), grillButton(m, g)))));
+ }
+}
+function render(s) { renderMeta(s); renderCurrent(s); renderNext(s); renderAuto(s); renderGrill(s); }
 async function load() { try { const r = await fetch("/api/state", { cache: "no-store" }); render(await r.json()); } catch (e) { say("Could not read state: " + e.message, true); } }
 document.getElementById("refresh").onclick = async () => { try { await post("/api/refresh"); say("Refreshing the frontier…"); setTimeout(load, 1500); } catch (e) { say(e.message, true); } };
 load(); setInterval(load, 15000);

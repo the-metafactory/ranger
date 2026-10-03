@@ -63,16 +63,18 @@ export async function scoutOneMap(
   );
   const waiting = hitlWaiting(classified);
 
-  const claims: ClaimCard[] = [];
-  for (const claimed of audit.openClaimed) {
-   const node: NodeResult = await graphNode(map.repo, claimed.id, token);
-   claims.push({
-    id: claimed.id,
-    title: node.node.title,
-    assignees: claimed.assignees,
-    worker: "unknown",
-   });
-  }
+  // In parallel: `ranger serve` (#37) re-reads every map on a timer.
+  const claims: ClaimCard[] = await Promise.all(
+   audit.openClaimed.map(async (claimed) => {
+    const node: NodeResult = await graphNode(map.repo, claimed.id, token);
+    return {
+     id: claimed.id,
+     title: node.node.title,
+     assignees: claimed.assignees,
+     worker: "unknown" as const,
+    };
+   }),
+  );
 
   return {
    ...base,

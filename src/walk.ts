@@ -22,7 +22,7 @@ import {
 
 // Re-exported where they were: the candidate selection moved to a module with
 // no graph-write import, so `ranger serve` (#37) can share it (one copy).
-export { implementCandidates, researchCandidates, selectCandidates };
+export { implementCandidates, planTick, researchCandidates, selectCandidates };
 
 /**
  * The headless tick (design §1, build-path step 3) — one bounded pass:
