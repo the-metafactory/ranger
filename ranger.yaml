@@ -14,7 +14,17 @@ version: 1
 maps:
   - repo: the-metafactory/ranger
     root: 1
-    walk: research-only
+    # walk: full since 2026-10-03 so ranger builds its own substrate selection
+    # (#45, decided in #44). The allowlist keeps the other open task nodes
+    # (#23, #25, #32, #38) off the walk until the principal widens it.
+    walk: full
+    nodes: ["45"]
+    # Ranger merges its own gate-passed PRs (principal, 2026-10-03), except
+    # nodes labelled ranger:needs-eye.
+    autoMerge: true
+    commands:
+      install: bun install --frozen-lockfile
+      test: bun test && bunx tsc --noEmit
     # The principal's checkout: `ranger serve` (#37) opens grilling
     # sessions here, never in the machine account's canonical clone.
     localCheckout: ~/work/mf/ranger
@@ -85,6 +95,12 @@ auth:
 # REFUSE when the resolved identity equals the principal's login.
 bot:
   identity: ivy-agent
+
+# Worker budgets. reviewRounds: sage rounds per implement-lane PR before ranger
+# parks it for the principal (principal, 2026-10-03: 5, up from the design §4
+# default of 2).
+workers:
+  reviewRounds: 5
 
 # The principal. `discordId` is the escalation desk's 7+ day @-mention target
 # (rendered as a real <@id> ping — without it, overdue cards show a no-ping
