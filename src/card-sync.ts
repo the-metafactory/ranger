@@ -239,6 +239,12 @@ export interface EscalateMapResult {
   kind: "cards";
   ok: boolean;
   error?: string;
+  /**
+   * Why this map's frontier was not read this pass (src/budget.ts: a GitHub
+   * rate-limit cooldown or the GraphQL floor). Not an error: no card was
+   * touched, and the next pass with budget serves the map.
+   */
+  budgetDeferred?: string;
   /** Node ids whose card was posted fresh (announce-once). */
   posted: string[];
   /** Node ids whose card was edited in place (edit-not-repost). */

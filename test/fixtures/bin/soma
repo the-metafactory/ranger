@@ -44,6 +44,33 @@ while [ $i -le $# ]; do
   i=$((i+1))
 done
 
+# Real soma resolves a bare owner/name only from a checkout with an origin
+# remote, and launchd runs ranger from `/` (2026-09-25 outage). The fake is
+# stricter than soma: it refuses a bare repo wherever it runs, so a call site
+# that forgets to qualify fails here instead of only in production.
+case "$repo" in
+  github:github.com/*) repo="${repo#github:github.com/}" ;;
+  "") ;;
+  *)
+    echo "fake soma: \"$repo\" names no forge or host — pass --repo github:github.com/<owner/name>" >&2
+    exit 2
+    ;;
+esac
+# Every invocation is logged (verb + bare repo) when the test asks, so a test
+# can count graph reads — the cache (src/frontier-cache.ts) is judged by it.
+if [ -n "${FAKE_SOMA_CALLS:-}" ]; then
+  printf "%s %s\n" "$verb" "$repo" >> "$FAKE_SOMA_CALLS"
+fi
+# A test can make the read verbs fail as GitHub's throttle does.
+if [ -n "${FAKE_SOMA_RATE_LIMITED:-}" ]; then
+  case "$verb" in
+    frontier|audit|node)
+      echo "gh api POST graphql failed (exit 1): gh: API rate limit already exceeded for user ID 1." >&2
+      exit 1
+      ;;
+  esac
+fi
+
 key="${repo//\//__}"
 
 # ---- read-only verbs: fixtures ----

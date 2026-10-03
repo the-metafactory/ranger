@@ -1218,3 +1218,63 @@ test("a many-destination absent card reconciles across ticks via a per-card curs
     rmSync(fixtureDir, { recursive: true, force: true });
   }
 });
+
+describe("ranger escalate — GitHub budget deferral (src/budget.ts)", () => {
+  test("a rate-limited frontier read defers the map without marking any card absent, and the cooldown persists", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ranger-escalate-budget-"));
+    const fixtureDir = mkdtempSync(join(tmpdir(), "ranger-escalate-budget-fx-"));
+    const discord = fakeDiscord();
+    try {
+      writeFixtures(fixtureDir);
+      const config = writeConfig(dir);
+      const env = envFor(fixtureDir, discord.port);
+
+      const run1 = await runCli(["escalate", "-c", config, "--json"], env);
+      expect(JSON.parse(run1.stdout).maps[0].posted.sort()).toEqual([
+        "11",
+        "12",
+        "13",
+        "14",
+      ]);
+
+      // Node 12 leaves the queue, but GitHub throttles the read: the map is
+      // deferred, and NO card is noted absent — an unread frontier is not an
+      // empty one.
+      writeFixtures(fixtureDir, ["12"]);
+      const now = new Date();
+      const run2 = await runCli(["escalate", "-c", config, "--json"], {
+        ...env,
+        FAKE_SOMA_RATE_LIMITED: "1",
+        RANGER_NOW: now.toISOString(),
+      });
+      const report2 = JSON.parse(run2.stdout);
+      expect(report2.maps[0].budgetDeferred).toContain("secondary rate limit");
+      expect(report2.maps[0].keptOpen).toEqual([]);
+      expect(discord.edits).toHaveLength(0);
+
+      // The throttle has lifted, but the cooldown persisted in the journal:
+      // still deferred, still nothing touched.
+      const run3 = await runCli(["escalate", "-c", config, "--json"], {
+        ...env,
+        RANGER_NOW: new Date(now.getTime() + 60_000).toISOString(),
+      });
+      expect(JSON.parse(run3.stdout).maps[0].budgetDeferred).toContain(
+        "deferred until",
+      );
+      expect(discord.edits).toHaveLength(0);
+
+      // After the 10-minute cooldown the map is read again and 12 is noted.
+      const run4 = await runCli(["escalate", "-c", config, "--json"], {
+        ...env,
+        RANGER_NOW: new Date(now.getTime() + 11 * 60_000).toISOString(),
+      });
+      const report4 = JSON.parse(run4.stdout);
+      expect(report4.maps[0].budgetDeferred).toBeUndefined();
+      expect(report4.maps[0].keptOpen).toEqual(["12"]);
+    } finally {
+      discord.stop();
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(fixtureDir, { recursive: true, force: true });
+    }
+  });
+});

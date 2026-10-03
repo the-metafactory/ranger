@@ -90,6 +90,18 @@ auth:
     "the-metafactory/*": RANGER_WRITE_GH_TOKEN_METAFACTORY
     "jcfischer/*": RANGER_WRITE_GH_TOKEN_PERSONAL
 
+# GitHub budget (src/budget.ts, src/frontier-cache.ts). The read-only PATs are
+# the principal's, so ranger's reads share the principal's GraphQL allowance.
+# All three are optional; these are the defaults.
+budget:
+  # Defer graph reads while fewer GraphQL points than this remain this hour.
+  graphqlFloor: 1000
+  # Pause a token's graph reads this long after a secondary (burst) limit.
+  rateLimitCooldownMin: 10
+  # Re-read a map's frontier at least this often, even when the repo's
+  # sentinel (newest issue update + newest issue event) has not moved.
+  frontierMaxAgeMin: 60
+
 # Provision the two read-only fine-grained PATs (node #8) and store them in the
 # macOS keychain (the durable store the ~/bin/ranger wrapper resolves):
 #   security add-generic-password -s ranger-ro-metafactory -a token -w <pat>
