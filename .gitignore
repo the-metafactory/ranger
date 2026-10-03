@@ -2,3 +2,6 @@ node_modules/
 *.log
 .DS_Store
 state.sqlite*
+
+# SwiftPM cache dirs a host git hook can leave behind (never ranger output)
+.build/
