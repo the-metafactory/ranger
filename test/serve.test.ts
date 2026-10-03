@@ -160,9 +160,19 @@ describe("#37 — the state the dashboard shows", () => {
   expect(local.filter((f) => /graph-write|walk|sweep|worker|implement/.test(f))).toEqual([]);
  });
 
- test("walk.ts takes its candidates from selectCandidates, so the two cannot drift", () => {
+ test("walk.ts takes its order and veto rule from planTick, the plan serve reads", () => {
   const source = readFileSync(join(import.meta.dir, "..", "src", "walk.ts"), "utf8");
-  expect(source).toMatch(/=\s*selectCandidates\(\s*classified,/);
+  expect(source).toMatch(/=\s*planTick\(classified,/);
+  expect(source).toMatch(/const candidates = plan\.selected;/);
+  expect(source).toMatch(/plan\.vetoed\.includes\(node\)/);
+ });
+
+ test("a held lane with its head vetoed names no waiting node", () => {
+  const holder = worker({});
+  const map = assembleState(
+   inputs({ laneHolder: holder, workers: [holder], vetoed: (id) => id === "10" }),
+  ).maps[0];
+  expect(map.next.nodeId).toBeUndefined();
  });
 
  test("a held lane names the holder, and the first implement node waits for it", () => {
@@ -251,16 +261,22 @@ describe("#37 — the session the dashboard may launch", () => {
 describe("#37 — the launch endpoint refuses", () => {
  const PORT = 7311;
  const TOKEN = "t".repeat(48);
- const setup = () => {
+ const setup = (
+  over: {
+   getState?: () => ReturnType<typeof assembleState>;
+   verifyGrilling?: () => Promise<string | null>;
+  } = {},
+ ) => {
   const launched: string[][] = [];
   const handler = createHandler({
    port: PORT,
    token: TOKEN,
-   getState: () => assembleState(inputs()),
+   getState: over.getState ?? (() => assembleState(inputs())),
    refresh: () => {},
    launch: (argv) => {
     launched.push(argv);
    },
+   verifyGrilling: over.verifyGrilling ?? (async () => null),
   });
   return { handler, launched };
  };
@@ -316,19 +332,20 @@ describe("#37 — the launch endpoint refuses", () => {
  }
 
  test("refuses a map with no checkout", async () => {
-  const launched: string[][] = [];
-  const handler = createHandler({
-   port: PORT,
-   token: TOKEN,
+  const { handler, launched } = setup({
    getState: () =>
     assembleState(inputs({ maps: [{ ...walked, localCheckout: undefined }] })),
-   refresh: () => {},
-   launch: (argv) => {
-    launched.push(argv);
-   },
   });
   const res = await handler(post(ok));
   expect(res.status).toBe(409);
+  expect(launched).toHaveLength(0);
+ });
+
+ test("refuses a grilling the live read says is no longer open", async () => {
+  const { handler, launched } = setup({ verifyGrilling: async () => "#12 is closed now" });
+  const res = await handler(post(ok));
+  expect(res.status).toBe(409);
+  expect(((await res.json()) as { error: string }).error).toMatch(/closed/);
   expect(launched).toHaveLength(0);
  });
 
@@ -359,6 +376,14 @@ describe("#37 — the journal is read, never written", () => {
   expect(Journal.openReadOnly(path)).toBeNull();
   expect(existsSync(path)).toBe(false);
   rmSync(dir, { recursive: true });
+ });
+
+ test("the veto set is one read", () => {
+  const j = new Journal(":memory:");
+  j.recordVeto("10", "c1");
+  j.recordVeto("14", "c2");
+  expect([...j.listVetoes()].sort()).toEqual(["10", "14"]);
+  j.close();
  });
 
  test("an existing journal reads, and a write is refused without touching it", () => {

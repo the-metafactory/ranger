@@ -547,8 +547,11 @@ program
    const configPath = resolve(process.cwd(), options.config);
    const { config } = loadConfig(configPath);
    const port = options.port === undefined ? undefined : Number(options.port);
-   if (port !== undefined && !Number.isInteger(port)) {
-    throw new Error(`--port must be an integer, got ${options.port}`);
+   if (
+    port !== undefined &&
+    (!Number.isInteger(port) || port < 1024 || port > 65535)
+   ) {
+    throw new Error(`--port must be an integer from 1024 to 65535, got ${options.port}`);
    }
    const { url } = startServe({ config, port, open: options.open });
    process.stdout.write(`ranger serve: ${url} (Ctrl-C stops it)\n`);

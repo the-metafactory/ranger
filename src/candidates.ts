@@ -31,9 +31,8 @@ export function implementCandidates(
 /**
  * The candidates one tick takes from a classified frontier: every walkable
  * research node, and at most one implement node while no implement worker
- * holds the lane (the lane is serial — design §8). `ranger serve` (#37)
- * reads its "next" from this same function, so the dashboard cannot name a
- * node the tick would not take.
+ * holds the lane (the lane is serial — design §8). `planTick` below is the
+ * one caller the walk and the dashboard share.
  */
 export function selectCandidates(
  frontier: ClassifiedNode[],
@@ -42,5 +41,55 @@ export function selectCandidates(
  return {
   research: researchCandidates(frontier),
   implement: laneBusy ? [] : implementCandidates(frontier).slice(0, 1),
+ };
+}
+
+/** Every node ranger may take on its own: walkable implement or research, in frontier order. */
+export function walkableCandidates(frontier: ClassifiedNode[]): ClassifiedNode[] {
+ return frontier.filter(
+  (n) =>
+   (n.route.route === "implement" || n.route.route === "research") &&
+   n.route.walkable,
+ );
+}
+
+export interface TickPlan {
+ /** What one tick tries, in order: the implement node first, then research. */
+ selected: ClassifiedNode[];
+ implement: ClassifiedNode[];
+ research: ClassifiedNode[];
+ /** The selected nodes the veto cache stops; the tick skips them, never reaching past one. */
+ vetoed: ClassifiedNode[];
+ /** `selected` less `vetoed`: what the tick claims, cap permitting. */
+ take: ClassifiedNode[];
+ /**
+  * While another worker holds the implement lane: the implement node the
+  * tick takes once it frees — the first walkable one, unless vetoed, in
+  * which case none (the tick takes one and then drops a vetoed one).
+  */
+ waiting: ClassifiedNode | null;
+}
+
+/**
+ * One tick's plan for a classified frontier — the candidate order and the
+ * veto rule. `walk` iterates `selected` and skips `vetoed`; `ranger serve`
+ * (#37) names `take[0]` or `waiting` as the next job. The map gates (walk
+ * mode, dead-man pause, spawn cap) are checked by each caller before this.
+ */
+export function planTick(
+ frontier: ClassifiedNode[],
+ opts: { laneBusy: boolean; vetoed: (nodeId: string) => boolean },
+): TickPlan {
+ const { implement, research } = selectCandidates(frontier, opts.laneBusy);
+ const selected = [...implement, ...research];
+ const vetoed = selected.filter((n) => opts.vetoed(n.id));
+ const head = opts.laneBusy ? implementCandidates(frontier)[0] : undefined;
+ return {
+  selected,
+  implement,
+  research,
+  vetoed,
+  take: selected.filter((n) => !opts.vetoed(n.id)),
+  waiting: head !== undefined && !opts.vetoed(head.id) ? head : null,
  };
 }

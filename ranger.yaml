@@ -97,7 +97,8 @@ principal:
 serve:
   port: 7311
   refreshSec: 180
-  # Shown on the dashboard only — not walked, not scouted, no cards. Seelite's
+  # Shown on the dashboard only — not walked, not in `ranger scout`'s report,
+  # no cards (serve still reads their frontier). Seelite's
   # gameplay map #460 is registered for walking once two maps on one repo are
   # supported (#38, the principal's choice of walk: full on 2026-10-03).
   extraMaps:

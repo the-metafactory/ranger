@@ -15,7 +15,10 @@
  * `GH_CONFIG_DIR`. The launcher's environment is an allowlist (`childEnv`), the
  * prompt carries a configured repo and a numeric id only, and the endpoint
  * refuses a foreign Host or Origin, a missing token, and any node that is not
- * an open grilling on the current frontier.
+ * a grilling on the cached frontier and still open and unclaimed when read
+ * live. The allowlist governs `osascript` only: the shell iTerm2 opens takes
+ * iTerm2's own environment (the principal's login session), so no machine
+ * credential reaches it either way.
  */
 import { spawn } from "node:child_process";
 import { randomBytes, timingSafeEqual } from "node:crypto";
@@ -25,12 +28,14 @@ import {
  serveConfig,
  type WalkMode,
 } from "./config.ts";
-import { implementCandidates, selectCandidates } from "./candidates.ts";
+import { planTick, walkableCandidates } from "./candidates.ts";
 import { pidAlive as defaultPidAlive } from "./exec.ts";
 import { Journal, type WorkerRow } from "./journal.ts";
 import type { MapReport } from "./report.ts";
 import { type ClassifiedNode, loadProbeRegistry } from "./route.ts";
+import { graphNode } from "./graph.ts";
 import { scoutOneMap } from "./scout.ts";
+import { assertReadOnlyToken } from "./token-gate.ts";
 
 const REPO_PATTERN = /^[\w.-]+\/[\w.-]+$/;
 const ID_PATTERN = /^\d+$/;
@@ -42,7 +47,7 @@ export interface ServeMap {
  repo: string;
  root: number;
  walk: WalkMode;
- /** Shown here only: ranger neither walks nor scouts it elsewhere. */
+ /** Shown here only: not walked, not in `ranger scout`'s report, no cards. */
  servedOnly: boolean;
  /** The principal's checkout, `~` expanded; unset means no session button. */
  localCheckout?: string;
@@ -193,11 +198,13 @@ function nextFor(
  if (inputs.spawnsToday >= inputs.spawnCap) {
   return none(`daily spawn cap reached (${inputs.spawnsToday}/${inputs.spawnCap})`);
  }
- // walk's own order: select, then drop vetoed candidates (walk.ts).
- const laneBusy = inputs.laneHolder !== null;
- const { implement, research } = selectCandidates(report.frontier, laneBusy);
- const selected = [...implement, ...research];
- const first = selected.find((n) => !inputs.vetoed(n.id));
+ // The tick's own plan (candidates.ts): the order and the veto rule walk uses.
+ const holder = inputs.laneHolder;
+ const plan = planTick(report.frontier, {
+  laneBusy: holder !== null,
+  vetoed: inputs.vetoed,
+ });
+ const first = plan.take[0];
  if (first !== undefined) {
   return {
    nodeId: first.id,
@@ -208,22 +215,19 @@ function nextFor(
    reason: "the next tick claims this",
   };
  }
- const vetoed = selected.filter((n) => inputs.vetoed(n.id)).map((n) => `#${n.id}`);
+ if (holder !== null && plan.waiting !== null) {
+  return {
+   nodeId: plan.waiting.id,
+   title: plan.waiting.title,
+   url: plan.waiting.url,
+   lane: "implement",
+   waiting: true,
+   reason: `waits for the implement lane, held by #${holder.nodeId} (${holder.repo})`,
+  };
+ }
+ const vetoed = plan.vetoed.map((n) => `#${n.id}`);
  if (vetoed.length > 0) {
   return none(`${vetoed.join(", ")} vetoed — the tick claims nothing else this pass`);
- }
- if (laneBusy && inputs.laneHolder !== null) {
-  const queued = implementCandidates(report.frontier).find((n) => !inputs.vetoed(n.id));
-  if (queued !== undefined) {
-   return {
-    nodeId: queued.id,
-    title: queued.title,
-    url: queued.url,
-    lane: "implement",
-    waiting: true,
-    reason: `waits for the implement lane, held by #${inputs.laneHolder.nodeId} (${inputs.laneHolder.repo})`,
-   };
-  }
  }
  return none("nothing walkable on this map's frontier");
 }
@@ -274,15 +278,7 @@ export function assembleState(inputs: StateInputs): DashboardState {
    error: report?.error,
    localCheckout: map.localCheckout,
    next: nextFor(map, report, inputs),
-   autonomous: walked
-    ? frontier
-       .filter(
-        (n) =>
-         (n.route.route === "implement" || n.route.route === "research") &&
-         n.route.walkable,
-       )
-       .map(view)
-    : [],
+   autonomous: walked ? walkableCandidates(frontier).map(view) : [],
    grillings: frontier
     .filter((n) => n.kind === "grilling")
     .map((n) => ({
@@ -387,6 +383,10 @@ export function launchPlan(args: {
 function spawnLaunch(argv: string[], env: Record<string, string>): void {
  const [command, ...args] = argv;
  const child = spawn(command, args, { env, stdio: "ignore", detached: true });
+ // A failed spawn (ENOENT) is reported, never an unhandled crash of the server.
+ child.on("error", (error) => {
+  process.stderr.write(`ranger serve: launch failed: ${error.message}\n`);
+ });
  child.unref();
 }
 
@@ -398,6 +398,12 @@ export interface HandlerContext {
  getState: () => DashboardState;
  refresh: () => void;
  launch: (argv: string[], env: Record<string, string>) => void;
+ /**
+  * Read the node live before a launch: the frontier cache can be minutes
+  * old. Resolves `null` when it is still an open, unclaimed grilling, or the
+  * reason it is not.
+  */
+ verifyGrilling: (map: DashboardMap, nodeId: string) => Promise<string | null>;
 }
 
 const json = (status: number, body: unknown): Response =>
@@ -466,6 +472,8 @@ export function createHandler(ctx: HandlerContext): (req: Request) => Promise<Re
   if (!grilling.launchable || map.localCheckout === undefined) {
    return refuse(409, grilling.why ?? "no checkout configured");
   }
+  const stale = await ctx.verifyGrilling(map, grilling.id);
+  if (stale !== null) return refuse(409, stale);
   const plan = launchPlan({
    repo: map.repo,
    root: map.root,
@@ -602,18 +610,20 @@ export async function readReports(
  maps: ServeMap[],
 ): Promise<Map<string, MapReport>> {
  const registry = loadProbeRegistry();
- const reports = new Map<string, MapReport>();
- for (const map of maps) {
-  reports.set(
-   map.key,
-   await scoutOneMap(
-    config,
-    { repo: map.repo, root: map.root, walk: map.walk, nodes: map.nodes, skip: map.skip },
-    registry,
-   ),
-  );
- }
- return reports;
+ const entries = await Promise.all(
+  maps.map(
+   async (map) =>
+    [
+     map.key,
+     await scoutOneMap(
+      config,
+      { repo: map.repo, root: map.root, walk: map.walk, nodes: map.nodes, skip: map.skip },
+      registry,
+     ),
+    ] as const,
+  ),
+ );
+ return new Map(entries);
 }
 
 export function stateFromJournal(
@@ -624,12 +634,7 @@ export function stateFromJournal(
 ): DashboardState {
  const journal = Journal.openReadOnly(expandHome(config.state.journalPath));
  try {
-  const vetoed = new Set<string>();
-  if (journal !== null) {
-   for (const report of cache.reports.values()) {
-    for (const node of report.frontier) if (journal.hasVeto(node.id)) vetoed.add(node.id);
-   }
-  }
+  const vetoed = journal?.listVetoes() ?? new Set<string>();
   return assembleState({
    maps,
    reports: cache.reports,
@@ -647,6 +652,24 @@ export function stateFromJournal(
   });
  } finally {
   journal?.close();
+ }
+}
+
+/** The live read behind `verifyGrilling`: one read verb under the read-only gate. */
+export async function verifyGrillingLive(
+ config: RangerConfig,
+ map: DashboardMap,
+ nodeId: string,
+): Promise<string | null> {
+ try {
+  const { token } = await assertReadOnlyToken(config, map.repo);
+  const node = await graphNode(map.repo, nodeId, token);
+  if (node.status !== "open") return `#${nodeId} is ${node.status} now`;
+  if (node.node.kind !== "grilling") return `#${nodeId} is a ${node.node.kind} now`;
+  if (node.assignees.length > 0) return `#${nodeId} is claimed by ${node.assignees.join(", ")}`;
+  return null;
+ } catch (error) {
+  return `could not read #${nodeId} live: ${error instanceof Error ? error.message : String(error)}`;
  }
 }
 
@@ -668,6 +691,7 @@ export function startServe(opts: {
   getState: () => stateFromJournal(opts.config, maps, cache),
   refresh: () => cache.refresh(),
   launch: spawnLaunch,
+  verifyGrilling: (map, nodeId) => verifyGrillingLive(opts.config, map, nodeId),
  });
  const server = Bun.serve({ hostname: "127.0.0.1", port, fetch: handler });
  const url = `http://127.0.0.1:${port}/`;

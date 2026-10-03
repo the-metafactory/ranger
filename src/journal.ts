@@ -391,6 +391,13 @@ export class Journal {
    .run();
  }
 
+ /** Every vetoed node id, in one query (#37: `ranger serve` reads them per poll). */
+ listVetoes(): Set<string> {
+  return new Set(
+   this.db.query.vetoes.findMany({ columns: { nodeId: true } }).sync().map((v) => v.nodeId),
+  );
+ }
+
  hasVeto(nodeId: string): boolean {
   const row = this.db.query.vetoes
    .findFirst({

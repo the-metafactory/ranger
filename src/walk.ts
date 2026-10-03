@@ -13,7 +13,12 @@ import {
 import type { Journal } from "./journal.ts";
 import { classify, loadProbeRegistry, type ClassifiedNode } from "./route.ts";
 import { sweepMap, type SweepMapResult } from "./sweep.ts";
-import { implementCandidates, researchCandidates, selectCandidates } from "./candidates.ts";
+import {
+ implementCandidates,
+ planTick,
+ researchCandidates,
+ selectCandidates,
+} from "./candidates.ts";
 
 // Re-exported where they were: the candidate selection moved to a module with
 // no graph-write import, so `ranger serve` (#37) can share it (one copy).
@@ -176,13 +181,14 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
       skip: map.skip,
      }),
     );
-    const { research, implement } = selectCandidates(
-     classified,
-     implementLaneBusy(journal),
-    );
-    const candidates = [...implement, ...research];
+    // The plan `ranger serve` (#37) also reads, so its "next" is this order.
+    const plan = planTick(classified, {
+     laneBusy: implementLaneBusy(journal),
+     vetoed: (id) => journal.hasVeto(id),
+    });
+    const candidates = plan.selected;
     const laneOf = (id: string) =>
-     implement.some((n) => n.id === id) ? "implement" : "research";
+     plan.implement.some((n) => n.id === id) ? "implement" : "research";
 
     for (const node of candidates) {
      if (
@@ -193,7 +199,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
       break;
      }
      // Veto cache: a vetoed node is never claimed (design §5, journal durability).
-     if (journal.hasVeto(node.id)) {
+     if (plan.vetoed.includes(node)) {
       errors.push(`#${node.id} vetoed — not claimed`);
       continue;
      }
