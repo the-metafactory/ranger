@@ -22,6 +22,10 @@ maps:
     # commands:
     #   install: bun install
     #   test: bun test
+    #   # Optional slower tier, run once on the final sage-clean head; a passing
+    #   # run is recorded on the PR and gates the merge card. {node} -> node id.
+    #   probe: 'npm run probe:pr -- --base origin/main --head HEAD --intent "… node #{node} …"'
+    #   probeTimeoutMin: 30
     # Optional allowlist: walk only these node ids (a first live run).
     # nodes: [550]
     # The branch PRs target and atRef probes resolve against (default main).

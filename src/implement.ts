@@ -151,6 +151,131 @@ export function recordedReviews(
  return out.sort((a, b) => a.round - b.round);
 }
 
+export interface RecordedProbe {
+ sha: string;
+ passed: boolean;
+ /** Probes the selector chose ("?" when the output did not say). */
+ selected: string;
+ mode: string;
+}
+
+const PROBE_MARKER =
+ /<!-- ranger:probes sha=([0-9a-f]{7,64}) result=(pass|fail) selected=(\d+|\?) mode=([\w-]+) -->/;
+
+export function probeMarker(p: RecordedProbe): string {
+ return `<!-- ranger:probes sha=${p.sha} result=${p.passed ? "pass" : "fail"} selected=${p.selected} mode=${p.mode} -->`;
+}
+
+/** Probe runs recorded on the PR by the MACHINE ACCOUNT (anyone else's markers are ignored). */
+export function recordedProbes(
+ comments: IssueComment[],
+ botIdentity: string,
+): RecordedProbe[] {
+ const out: RecordedProbe[] = [];
+ for (const c of comments) {
+  if (c.author !== botIdentity) continue;
+  const m = c.body.match(PROBE_MARKER);
+  if (m === null) continue;
+  out.push({ sha: m[1], passed: m[2] === "pass", selected: m[3], mode: m[4] });
+ }
+ return out;
+}
+
+/** The selector's own summary lines (`probe selection: <mode>`, `selected: <n>`). */
+export function parseProbeSummary(stdout: string): { selected: string; mode: string } {
+ const mode = stdout.match(/^probe selection: ([\w-]+)/m)?.[1] ?? "unknown";
+ const selected = stdout.match(/^selected: (\d+)/m)?.[1] ?? "?";
+ return { selected, mode };
+}
+
+/** `commands.probe` with `{node}` replaced — the node id is digits, so nothing else gets in. */
+export function probeCommandFor(template: string, nodeId: string): string {
+ if (!/^\d+$/.test(nodeId)) {
+  throw new ParkSignal(`node id ${nodeId} is not numeric — refusing to template the probe command`);
+ }
+ return template.replaceAll("{node}", nodeId);
+}
+
+/**
+ * The probe tier (#23 follow-up, principal's choice 2026-10-03): run the
+ * map's probe command ONCE on the final, sage-clean head — exactly the head
+ * the merge card certifies. A failure is retried once (design §7's flaky-probe
+ * rule), then the node parks with the output. Every run is recorded on the PR
+ * as a bot marker; a passing record at the same head is reused on resume.
+ */
+async function probeFinalHead(
+ ctx: ImplementContext,
+ github: GitHubPort,
+ prNumber: number,
+): Promise<RecordedProbe> {
+ const { map, journal, node, token, botIdentity, worktree } = ctx;
+ const repo = map.repo;
+ const nodeId = node.ref.id;
+ const live = await github.getPr(repo, prNumber, token);
+ const existing = recordedProbes(
+  await github.listComments(repo, prNumber, token),
+  botIdentity,
+ ).find((p) => p.sha === live.headSha && p.passed);
+ if (existing !== undefined) return existing;
+
+ if ((await headSha(worktree)) !== live.headSha) {
+  throw new ParkSignal(
+   `the worktree is not at PR #${prNumber}'s head ${live.headSha.slice(0, 8)} — refusing to certify probes for a different tree`,
+  );
+ }
+ const command = probeCommandFor(map.commands.probe as string, nodeId);
+ const timeoutMs = map.commands.probeTimeoutMin * 60_000;
+ let result = await runShell(command, worktree, ctx, timeoutMs);
+ let attempts = 1;
+ if (result.code !== 0) {
+  journal.recordEvent("reviewed", { nodeId, repo, detail: `probe run 1 failed (exit ${result.code}) — retrying once` });
+  result = await runShell(command, worktree, ctx, timeoutMs);
+  attempts = 2;
+ }
+ const summary = parseProbeSummary(result.stdout);
+ const record: RecordedProbe = {
+  sha: live.headSha,
+  passed: result.code === 0,
+  ...summary,
+ };
+ ctx.journal.assertGeneration(nodeId, ctx.generation, "post the probe record");
+ await github.postComment(repo, prNumber, probeComment(command, record, attempts, result), token);
+ journal.recordEvent("reviewed", {
+  nodeId,
+  repo,
+  detail: `probes ${record.passed ? "passed" : "FAILED"} at ${record.sha.slice(0, 8)} (${record.mode}, ${record.selected} selected, ${attempts} run(s))`,
+ });
+ if (!record.passed) {
+  throw new ParkSignal(
+   `browser probes failed twice at ${record.sha.slice(0, 8)} on PR #${prNumber} (exit ${result.code}): ${tail(result)}`,
+  );
+ }
+ return record;
+}
+
+function probeComment(
+ command: string,
+ p: RecordedProbe,
+ attempts: number,
+ result: RunResult,
+): string {
+ const out = (result.stdout + (result.stderr ? `\n${result.stderr}` : "")).trim();
+ const clipped = out.length > 20_000 ? `…${out.slice(-20_000)}` : out;
+ return [
+  probeMarker(p),
+  `**Probes — ${p.passed ? "passed" : "failed"}** at \`${p.sha.slice(0, 8)}\` (selection ${p.mode}, ${p.selected} probe(s); ${attempts} run(s))`,
+  "",
+  `\`${command}\``,
+  "",
+  "<details><summary>output</summary>",
+  "",
+  "```",
+  clipped,
+  "```",
+  "</details>",
+ ].join("\n");
+}
+
 /**
  * The branch the lane works on. A declared `git-merged-into` probe names the
  * branch the close checks, so it wins; otherwise the worktree branch.
@@ -336,10 +461,16 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
   await awaitHead(github, repo, open.number, fixed.sha, token, ctx.headPollMs);
  }
 
+ // ---- probe tier, once, on the final head ----
+ let probe: RecordedProbe | undefined;
+ if (map.commands.probe !== undefined) {
+  probe = await probeFinalHead(ctx, github, open.number);
+ }
+
  // ---- ready → awaiting merge ----
  fence("mark ready");
  const final = reviews[reviews.length - 1];
- await github.updatePrBody(repo, open.number, readyBody(ctx, final, reviews.length), token);
+ await github.updatePrBody(repo, open.number, readyBody(ctx, final, reviews.length, probe), token);
  await github.markReady(repo, await github.getPr(repo, open.number, token), token);
  journal.updateWorker(nodeId, {
   status: "awaiting-merge",
@@ -480,7 +611,10 @@ async function closeAfterMerge(
  const reviews = recordedReviews(await github.listComments(repo, pr.number, token), botIdentity);
  const final = reviews[reviews.length - 1];
 
- const resolution = closeResolution(ctx, pr, final, reviews.length, success);
+ const probe = recordedProbes(await github.listComments(repo, pr.number, token), botIdentity).find(
+  (p) => p.sha === pr.headSha && p.passed,
+ );
+ const resolution = closeResolution(ctx, pr, final, reviews.length, success, probe);
  const resolutionFile = join(tmpdir(), `ranger-close-${repo.replace("/", "__")}-${nodeId}.md`);
  writeFileSync(resolutionFile, resolution, "utf8");
 
@@ -620,10 +754,18 @@ function draftBody(ctx: ImplementContext): string {
  ].join("\n");
 }
 
+function probeLine(ctx: ImplementContext, probe: RecordedProbe | undefined): string[] {
+ if (ctx.map.commands.probe === undefined) return [];
+ return probe === undefined
+  ? ["- Probes: not recorded at this head."]
+  : [`- Probes: passed at \`${probe.sha.slice(0, 8)}\` (selection ${probe.mode}, ${probe.selected} probe(s)). Only the selected probes ran, not the full suite.`];
+}
+
 function readyBody(
  ctx: ImplementContext,
  final: RecordedReview,
  rounds: number,
+ probe?: RecordedProbe,
 ): string {
  const ratify =
   ctx.ratify === "merge"
@@ -634,6 +776,7 @@ function readyBody(
   "",
   `- Tests: \`${ctx.map.commands.test}\` passed in the supervisor before every push.`,
   `- Sage: ${rounds} offline round(s); the last, at \`${final.sha.slice(0, 8)}\`, found ${final.blockers} blockers, ${final.majors} majors, ${final.nits} nits. Machine review evidence, not a human sign-off.`,
+  ...probeLine(ctx, probe),
   `- Merge: ranger never merges. ${ratify}`,
   "",
   "Squash-merge keeps one commit per node. The node is not referenced with a closing keyword on purpose: the close goes through the graph's gate.",
@@ -646,6 +789,7 @@ function closeResolution(
  final: RecordedReview | undefined,
  rounds: number,
  ci: CheckRun,
+ probe?: RecordedProbe,
 ): string {
  const deferred =
   final === undefined || final.majors + final.nits === 0
@@ -658,6 +802,7 @@ function closeResolution(
   final === undefined
    ? "- Sage: no recorded review round."
    : `- Sage: ${rounds} offline round(s); the last at ${final.sha.slice(0, 8)} found ${final.blockers} blockers, ${final.majors} majors, ${final.nits} nits (machine evidence).`,
+  ...probeLine(ctx, probe),
   `- Ratification: ${ctx.ratify === "merge" ? "the principal's merge of the PR (propose node, #23 ruling)." : "auto node; declared probes and CI."}`,
   `- Unfixed review findings: ${deferred}`,
  ].join("\n");

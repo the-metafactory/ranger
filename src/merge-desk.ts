@@ -1,6 +1,11 @@
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import { DiscordAnnouncer } from "./announce.ts";
-import { realGitHub, recordedReviews, type GitHubPort } from "./implement.ts";
+import {
+ realGitHub,
+ recordedProbes,
+ recordedReviews,
+ type GitHubPort,
+} from "./implement.ts";
 import type { Journal, WorkerRow } from "./journal.ts";
 import { evaluateMergeGate } from "./merge-gate.ts";
 
@@ -138,14 +143,47 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    return;
   }
 
-  const reviews = recordedReviews(await github.listComments(repo, pr.number, token), botIdentity);
+  const comments = await github.listComments(repo, pr.number, token);
+  const reviews = recordedReviews(comments, botIdentity);
   const last = reviews.find((r) => r.sha === pr.headSha);
+  const probe = recordedProbes(comments, botIdentity).find(
+   (p) => p.sha === pr.headSha && p.passed,
+  );
+  const probesRequired = map.commands.probe !== undefined;
+
+  // A ready PR on a probe-tier map with no passing probe record at its head
+  // (the tier was configured after the PR went ready, or the record is
+  // missing): hand it back to run-node, which finds the clean review at this
+  // head and runs only the probe step. A failing probe run parks it there.
+  if (
+   probesRequired &&
+   probe === undefined &&
+   last !== undefined &&
+   last.blockers === 0 &&
+   ctx.spawn !== undefined
+  ) {
+   const pid = await ctx.spawn(row.nodeId, repo);
+   if (pid === null) {
+    result.errors.push(`#${row.nodeId}: probes missing at the head, but run-node did not spawn — retrying next tick`);
+    return;
+   }
+   journal.updateWorker(row.nodeId, { status: "running", phase: "review", pid });
+   journal.recordEvent("sweep", {
+    nodeId: row.nodeId,
+    repo,
+    detail: `PR #${pr.number} has no passing probe run at ${pr.headSha.slice(0, 8)} — run-node resumes for the probe tier (pid ${pid})`,
+   });
+   result.resumed.push(row.nodeId);
+   return;
+  }
   const gate = evaluateMergeGate({
    pr,
    checkRuns: await github.checkRunsFor(repo, pr.headSha, token),
    expectedBase: map.base,
    verdictSha: last?.sha ?? null,
    verdictBlockers: last?.blockers ?? null,
+   probesRequired,
+   probePassedSha: probe?.sha ?? null,
   });
 
   if (gate.status === "pending") {
@@ -163,6 +201,9 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
     `:ranger: **merge needed** #${row.nodeId} — ${title}`,
     `map: ${repo}`,
     `Gate passed at \`${gate.headSha.slice(0, 8)}\`: CI green, mergeable, base \`${map.base}\`, sage ${last?.round ?? "?"} round(s) with 0 blockers and ${last?.majors ?? "?"} majors (machine evidence, not a sign-off).`,
+    ...(probesRequired
+     ? [`Probes passed at \`${gate.headSha.slice(0, 8)}\` (selection ${probe?.mode ?? "?"}, ${probe?.selected ?? "?"} probe(s)). Only the selected probes ran, not the full suite.`]
+     : ["No probe tier on this map: CI and the tests are the only automated checks."]),
     "Merge it by hand (squash). For a `propose` node your merge is the ratification. Ranger closes the node after the merge; it never merges itself.",
    ].join("\n"),
    `merge card for #${row.nodeId}`,

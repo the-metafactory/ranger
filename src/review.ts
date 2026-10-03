@@ -52,7 +52,19 @@ export async function sageReview(
     processGroup: true,
    },
   );
+  // sage exits 1 on a changes-requested verdict, after printing the review
+  // and its verdict block (sage src/cli/index.ts) — that is a verdict, not a
+  // failure. Any other non-zero exit, or exit 1 without that verdict, is.
   if (result.code !== 0) {
+   let verdict: ReviewVerdict | undefined;
+   if (result.code === 1) {
+    try {
+     verdict = parseVerdictBlock(result.stdout);
+    } catch {
+     verdict = undefined;
+    }
+   }
+   if (verdict?.verdict === "changes-requested") return verdict;
    throw new ReviewError(
     `sage review ${repo}#${prNumber} exited ${result.code}: ${(result.stderr || result.stdout).trim().slice(-400)}`,
    );

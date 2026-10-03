@@ -16,7 +16,8 @@ export type GateCheck =
  | "ci-green"
  | "mergeable"
  | "base-branch"
- | "review-clean";
+ | "review-clean"
+ | "probes";
 
 export interface MergeGateInput {
  pr: PullRequest;
@@ -25,6 +26,12 @@ export interface MergeGateInput {
  /** Ranger's recorded sage verdict: the SHA it read and its blocker count. */
  verdictSha: string | null;
  verdictBlockers: number | null;
+ /**
+  * The map declares a probe tier (`commands.probe`): ranger's passing probe
+  * record must be at exactly the live head. Undefined/false = no probe tier.
+  */
+ probesRequired?: boolean;
+ probePassedSha?: string | null;
 }
 
 export type MergeGateResult =
@@ -116,6 +123,15 @@ export function evaluateMergeGate(input: MergeGateInput): MergeGateResult {
    status: "fail",
    check: "review-clean",
    reason: `sage verdict at ${pr.headSha.slice(0, 8)} has ${input.verdictBlockers ?? "unknown"} blocker(s)`,
+  };
+ }
+
+ // 5. the probe tier, when the map has one: a passing run recorded at this head.
+ if (input.probesRequired === true && input.probePassedSha !== pr.headSha) {
+  return {
+   status: "fail",
+   check: "probes",
+   reason: `no passing probe run recorded at head ${pr.headSha.slice(0, 8)}`,
   };
  }
 

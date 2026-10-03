@@ -311,3 +311,48 @@ describe("walk — implement lane selection (#23)", () => {
   }
  });
 });
+
+describe("probe tier (#23 follow-up)", () => {
+ test("the gate requires a passing probe record at the live head when the map has a probe tier", async () => {
+  expect(gate({ probesRequired: true, probePassedSha: null })).toMatchObject({ status: "fail", check: "probes" });
+  expect(gate({ probesRequired: true, probePassedSha: OTHER })).toMatchObject({ status: "fail", check: "probes" });
+  expect(gate({ probesRequired: true, probePassedSha: SHA }).status).toBe("pass");
+  expect(gate({ probesRequired: false }).status).toBe("pass");
+ });
+ test("templating substitutes only a numeric node id", async () => {
+  const { probeCommandFor } = await import("../src/implement.ts");
+  expect(probeCommandFor('npm run probe:pr -- --intent "node #{node}"', "550")).toBe('npm run probe:pr -- --intent "node #550"');
+  expect(() => probeCommandFor("x {node}", '1"; rm -rf ~')).toThrow();
+ });
+ test("summary parsing and forged probe markers", async () => {
+  const { parseProbeSummary, probeMarker, recordedProbes } = await import("../src/implement.ts");
+  expect(parseProbeSummary("probe selection: semantic\nreason: x\nselected: 4\n")).toEqual({ selected: "4", mode: "semantic" });
+  expect(parseProbeSummary("No browser probes selected")).toEqual({ selected: "?", mode: "unknown" });
+  const pass = probeMarker({ sha: SHA, passed: true, selected: "4", mode: "semantic" });
+  expect(recordedProbes([{ id: 1, author: "mallory", body: pass }, { id: 2, author: "ivy-bot", body: `${pass}\nok` }], "ivy-bot")).toEqual([
+   { sha: SHA, passed: true, selected: "4", mode: "semantic" },
+  ]);
+ });
+});
+
+describe("sage exit codes (live finding on seelite #667)", () => {
+ const fake = join(import.meta.dir, "fixtures", "bin", "fake-sage");
+ const run = async (mode: string) => {
+  const { sageReview } = await import("../src/review.ts");
+  const saved = process.env.SAGE_FAKE_MODE;
+  process.env.SAGE_FAKE_MODE = mode;
+  try {
+   return await sageReview("acme/widgets", 7, "ghp_readonly", { command: fake });
+  } finally {
+   if (saved === undefined) delete process.env.SAGE_FAKE_MODE;
+   else process.env.SAGE_FAKE_MODE = saved;
+  }
+ };
+ test("exit 1 with a changes-requested verdict block is a verdict, not a failure", async () => {
+  expect(await run("changes-requested")).toMatchObject({ verdict: "changes-requested", blockers: 2 });
+ });
+ test("exit 0 approved parses; exit 1 without a block is a failure", async () => {
+  expect(await run("approved")).toMatchObject({ verdict: "approved", blockers: 0 });
+  await expect(run("crash")).rejects.toThrow(ReviewError);
+ });
+});

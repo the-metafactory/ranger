@@ -43,6 +43,14 @@ maps:
     commands:
       install: npm ci --no-audit --no-fund
       test: npm test
+      # The browser tier (principal, 2026-10-03): the TypeSafe-selected probes
+      # for the branch diff, once on the final sage-clean head; a passing run
+      # gates the merge card. The selector reads TYPESAFE_API_KEY from ~/.env
+      # itself. The intent is ranger-authored: only the node id is templated
+      # (seelite CLAUDE.md: never paste tracker or PR text into --intent).
+      # GPU lane: headed Chromium opens on the host screen while it runs.
+      probe: 'npm run probe:pr -- --base origin/main --head HEAD --intent "Ranger implement lane: the diff on this branch implements orienteer node #{node}; select every browser probe the changed files can affect."'
+      probeTimeoutMin: 30
     discord:
       tokenEnv: RANGER_DISCORD_TOKEN
       channelId: "1487052222067118111"
