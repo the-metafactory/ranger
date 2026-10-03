@@ -52,3 +52,18 @@ export function openDb(path: string): { db: RangerDb; close: () => void } {
   }
   return { db, close: () => sqlite.close() };
 }
+
+/**
+ * Open an existing journal for reading only (#37, `ranger serve`): no create,
+ * no chmod, no migration and no WAL switch, because the tick and the run-node
+ * supervisors own the file and write it while the dashboard reads. Returns
+ * `null` when there is no journal yet.
+ */
+export function openDbReadOnly(
+  path: string,
+): { db: RangerDb; close: () => void } | null {
+  if (!existsSync(path)) return null;
+  const sqlite = new Database(path, { readonly: true });
+  sqlite.run("PRAGMA busy_timeout = 5000;");
+  return { db: drizzle(sqlite, { schema }), close: () => sqlite.close() };
+}

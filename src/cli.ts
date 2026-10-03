@@ -8,25 +8,13 @@ import {
  type RangerMapConfig,
 } from "./config.ts";
 import {
- graphAudit,
- graphFrontier,
- graphNode,
- type FrontierEntry,
- type NodeResult,
-} from "./graph.ts";
-import {
  renderJson,
  renderText,
- type ClaimCard,
  type MapReport,
  type ScoutReport,
 } from "./report.ts";
-import { classify, hitlWaiting, loadProbeRegistry } from "./route.ts";
-import {
- assertReadOnlyToken,
- GateError,
- type ResolvedToken,
-} from "./token-gate.ts";
+import { loadProbeRegistry } from "./route.ts";
+import { assertReadOnlyToken } from "./token-gate.ts";
 import { openJournal, type Journal } from "./journal.ts";
 import {
  assertNotPrincipal,
@@ -43,7 +31,8 @@ import {
  type EscalateResult,
  type DigestResult,
 } from "./escalate.ts";
-import type { WalkMode } from "./config.ts";
+import { scoutOneMap } from "./scout.ts";
+import { startServe } from "./serve.ts";
 
 /**
  * ranger — autonomous orienteer work-graph walker.
@@ -53,6 +42,8 @@ import type { WalkMode } from "./config.ts";
  * - `run-node <id>` — the detached worker supervisor (research + implement lanes).
  * - `sweep` — reconcile the journal against reality.
  * - `journal` — inspect the journal.
+ * - `serve` (node #37) — local read-only dashboard; launches the principal's
+ *   own grilling sessions, never a graph write.
  */
 
 const READONLY_SURFACE = ["audit", "frontier", "node"] as const;
@@ -60,79 +51,6 @@ const READONLY_SURFACE = ["audit", "frontier", "node"] as const;
 interface ScoutOptions {
  config: string;
  json: boolean;
-}
-
-async function scoutOneMap(
- config: RangerConfig,
- map: { repo: string; root: number; walk: WalkMode; nodes?: string[]; skip?: string[] },
- registry: ReturnType<typeof loadProbeRegistry>,
-): Promise<MapReport> {
- const base: MapReport = {
-  repo: map.repo,
-  root: map.root,
-  walk: map.walk,
-  ok: true,
-  frontier: [],
-  hitlWaiting: [],
-  claims: [],
-  receiptLessCloses: [],
-  openWithoutCheckpoint: [],
-  auditNodes: 0,
- };
-
- let token: ResolvedToken;
- try {
-  ({ token } = await assertReadOnlyToken(config, map.repo));
- } catch (error) {
-  return {
-   ...base,
-   ok: false,
-   error: error instanceof GateError ? error.message : String(error),
-  };
- }
-
- try {
-  const [frontier, audit] = await Promise.all([
-   graphFrontier(map.repo, map.root, token),
-   graphAudit(map.repo, map.root, token),
-  ]);
-
-  const classified = frontier.frontier.map((entry: FrontierEntry) =>
-   classify(entry, map.repo, map.walk, registry, {
-        botIdentity: config.bot.identity,
-        allowlist: map.nodes,
-        skip: map.skip,
-      }),
-  );
-  const waiting = hitlWaiting(classified);
-
-  const claims: ClaimCard[] = [];
-  for (const claimed of audit.openClaimed) {
-   const node: NodeResult = await graphNode(map.repo, claimed.id, token);
-   claims.push({
-    id: claimed.id,
-    title: node.node.title,
-    assignees: claimed.assignees,
-    worker: "unknown",
-   });
-  }
-
-  return {
-   ...base,
-   frontier: classified,
-   hitlWaiting: waiting,
-   claims,
-   receiptLessCloses: audit.closedWithoutReceipt,
-   openWithoutCheckpoint: audit.openWithoutCheckpoint,
-   auditNodes: audit.nodes,
-  };
- } catch (error) {
-  return {
-   ...base,
-   ok: false,
-   error: error instanceof Error ? error.message : String(error),
-  };
- }
 }
 
 async function runScout(opts: ScoutOptions): Promise<ScoutReport> {
@@ -615,6 +533,32 @@ program
    }
   },
  );
+
+program
+ .command("serve")
+ .description(
+  "Local read-only dashboard (#37): the current job, the next in queue, autonomous nodes, and open grillings with a button that opens an interactive session",
+ )
+ .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
+ .option("-p, --port <port>", "port on 127.0.0.1 (default: serve.port, 7311)")
+ .option("--open", "open the dashboard in the browser")
+ .action((options: { config: string; port?: string; open?: boolean }) => {
+  try {
+   const configPath = resolve(process.cwd(), options.config);
+   const { config } = loadConfig(configPath);
+   const port = options.port === undefined ? undefined : Number(options.port);
+   if (port !== undefined && !Number.isInteger(port)) {
+    throw new Error(`--port must be an integer, got ${options.port}`);
+   }
+   const { url } = startServe({ config, port, open: options.open });
+   process.stdout.write(`ranger serve: ${url} (Ctrl-C stops it)\n`);
+  } catch (error) {
+   process.stderr.write(
+    `ranger serve: ${error instanceof Error ? error.message : String(error)}\n`,
+   );
+   process.exit(1);
+  }
+ });
 
 program.parseAsync(process.argv).catch((error) => {
  process.stderr.write(

@@ -1,5 +1,5 @@
 import { and, asc, desc, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
-import { openDb, type RangerDb } from "./store/db.ts";
+import { openDb, openDbReadOnly, type RangerDb } from "./store/db.ts";
 import {
  escalations,
  escalationDestinations,
@@ -129,11 +129,23 @@ export class Journal {
  /** The sqlite file path — callers derive sibling lock/state dirs from it. */
  readonly path: string;
 
- constructor(path: string) {
+ constructor(
+  path: string,
+  opened: { db: RangerDb; close: () => void } = openDb(path),
+ ) {
   this.path = path;
-  const opened = openDb(path);
   this.db = opened.db;
   this.closeDb = opened.close;
+ }
+
+ /**
+  * The journal for a reader that must not write it (#37, `ranger serve`):
+  * `null` when no journal exists yet. Calling a write method on it throws
+  * SQLITE_READONLY rather than touching the file.
+  */
+ static openReadOnly(path: string): Journal | null {
+  const opened = openDbReadOnly(path);
+  return opened === null ? null : new Journal(path, opened);
  }
 
  // ---- workers ----

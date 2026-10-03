@@ -99,6 +99,34 @@ const MapSchema = z.object({
  autoMerge: z.boolean().default(false),
  /** The branch PRs target and probes resolve `atRef` against. */
  base: z.string().min(1).default("main"),
+ /**
+  * The principal's own checkout of this repo (#37). `ranger serve` opens an
+  * interactive grilling session there; never `canonical`, which is the
+  * machine account's clone. Unset means the dashboard offers no session.
+  */
+ localCheckout: z.string().optional(),
+});
+
+/**
+ * A map `ranger serve` shows and nothing else reads (#37): no walk, no scout
+ * report, no escalation cards. For a root ranger cannot walk yet — seelite
+ * #460 until two maps on one repo are supported (#38).
+ */
+const ServeMapSchema = z.object({
+ repo: z.string().regex(/^[\w.-]+\/[\w.-]+$/, "repo must be owner/name"),
+ root: z
+  .union([z.number().int().positive(), z.string().regex(/^\d+$/)])
+  .transform(Number),
+ localCheckout: z.string().optional(),
+});
+
+/** `ranger serve` (#37): the local dashboard. */
+const ServeSchema = z.object({
+ /** Bound on 127.0.0.1 only. */
+ port: z.number().int().min(1024).max(65535).default(7311),
+ /** Seconds between background frontier refreshes (one in flight at a time). */
+ refreshSec: z.number().int().min(30).default(180),
+ extraMaps: z.array(ServeMapSchema).default([]),
 });
 
 const AuthSchema = z.object({
@@ -170,12 +198,19 @@ const RangerConfigSchema = z.object({
  principal: PrincipalSchema.default({}),
  state: StateSchema.default({}),
  workers: WorkersSchema.default({}),
+ serve: ServeSchema.optional(),
 });
 
 export type RangerMapConfig = z.infer<typeof MapSchema>;
 export type RangerAuthConfig = z.infer<typeof AuthSchema>;
 export type RangerBotConfig = z.infer<typeof BotSchema>;
 export type RangerConfig = z.infer<typeof RangerConfigSchema>;
+export type RangerServeConfig = z.infer<typeof ServeSchema>;
+
+/** The `serve` block with its defaults filled, present or not. */
+export function serveConfig(config: RangerConfig): RangerServeConfig {
+ return config.serve ?? ServeSchema.parse({});
+}
 
 export interface LoadedConfig {
  config: RangerConfig;

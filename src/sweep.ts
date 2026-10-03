@@ -1,6 +1,6 @@
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import type { Journal } from "./journal.ts";
-import { killProcessGroup, processGroupCommands } from "./exec.ts";
+import { killProcessGroup, pidAlive, processGroupCommands } from "./exec.ts";
 import { graphRelease } from "./graph-write.ts";
 import type { GitHubPort } from "./implement.ts";
 import {
@@ -49,16 +49,9 @@ export interface SweepMapResult {
  mergeDesk?: MergeDeskResult;
 }
 
-/** Is a PID alive on this host? `kill(pid, 0)` is a pure liveness probe. */
-export function pidAlive(pid: number | null): boolean {
- if (pid === null || pid <= 0) return false;
- try {
-  process.kill(pid, 0);
-  return true;
- } catch {
-  return false;
- }
-}
+// `pidAlive` moved to exec.ts so `ranger serve` (#37) can read liveness
+// without importing this module's graph writes; re-exported where it was.
+export { pidAlive };
 
 export async function sweepMap(ctx: SweepContext): Promise<SweepMapResult> {
  const { config, journal, map, token, botIdentity } = ctx;
