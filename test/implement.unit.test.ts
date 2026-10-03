@@ -396,3 +396,16 @@ describe("implement lane holder", () => {
   }
  });
 });
+
+describe("skip list", () => {
+ test("a skipped node is never walkable: an auto task stays unwalkable, a propose task keeps its HITL card", () => {
+  const opts = { botIdentity: "ivy-bot", skip: ["5"] };
+  expect(classify(entry({ autonomy: "auto" }), "acme/widgets", "full", {}, opts).route).toEqual({
+   route: "implement",
+   walkable: false,
+   ratify: "auto",
+  });
+  expect(classify(entry({}), "acme/widgets", "full", {}, opts).route.route).toBe("escalate-hitl");
+  expect(classify(entry({}, "alice", "6"), "acme/widgets", "full", {}, opts).route).toMatchObject({ walkable: true, ratify: "merge" });
+ });
+});

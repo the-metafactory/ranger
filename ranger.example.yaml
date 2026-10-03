@@ -28,6 +28,8 @@ maps:
     #   probeTimeoutMin: 30
     # Optional allowlist: walk only these node ids (a first live run).
     # nodes: [550]
+    # Optional skip list: never walk these ids (the map is otherwise walked in full).
+    # skip: [559]
     # The branch PRs target and atRef probes resolve against (default main).
     # base: main
     # Per-run Discord escalation surface (node #7): one channel per run,

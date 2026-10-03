@@ -81,6 +81,16 @@ const MapSchema = z.object({
   .array(z.union([z.number().int().positive(), z.string().regex(/^\d+$/)]))
   .transform((ids) => ids.map(String))
   .optional(),
+ /**
+  * Node ids the walker never takes on this map, even when they route as
+  * walkable — the inverse of `nodes`, for a map walked in full except a few
+  * nodes that need the principal (e.g. work judged by ear, or a probe that
+  * needs re-charting).
+  */
+ skip: z
+  .array(z.union([z.number().int().positive(), z.string().regex(/^\d+$/)]))
+  .transform((ids) => ids.map(String))
+  .default([]),
  /** The branch PRs target and probes resolve `atRef` against. */
  base: z.string().min(1).default("main"),
 });
