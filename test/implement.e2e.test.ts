@@ -126,7 +126,12 @@ class FakeGitHub implements GitHubPort {
 }
 
 /** A scripted sage: blockers per round; the commit id is the PR's live head. */
-function scriptedReviewer(github: FakeGitHub, blockers: number[], onReview?: (round: number) => void) {
+function scriptedReviewer(
+ github: FakeGitHub,
+ blockers: number[],
+ onReview?: (round: number) => void,
+ majors: number[] = [0],
+) {
  const calls: number[] = [];
  const reviewer = async (_repo: string, pr: number): Promise<ReviewVerdict> => {
   const round = calls.length + 1;
@@ -134,14 +139,15 @@ function scriptedReviewer(github: FakeGitHub, blockers: number[], onReview?: (ro
   onReview?.(round);
   const head = (await github.getPr("acme/widgets", pr)).headSha;
   const b = blockers[Math.min(round - 1, blockers.length - 1)];
+  const m = majors[Math.min(round - 1, majors.length - 1)];
   return {
-   verdict: b > 0 ? "changes-requested" : "approved",
+   verdict: b + m > 0 ? "changes-requested" : "approved",
    summary: `round ${round}`,
    commitId: head,
    blockers: b,
-   majors: 1,
+   majors: m,
    nits: 2,
-   body: `## Sage\n\nRound ${round}: ${b} blocker(s).`,
+   body: `## Sage\n\nRound ${round}: ${b} blocker(s), ${m} major(s).`,
   };
  };
  return { reviewer, calls };
@@ -164,6 +170,7 @@ async function rig(opts: {
  autonomy?: "auto" | "propose";
  author?: string;
  blockers?: number[];
+ majors?: number[];
  onReview?: (round: number) => void;
  /** commands.probe for the map (a fake-probe invocation). */
  probe?: string;
@@ -240,7 +247,7 @@ async function rig(opts: {
  const journal = openJournal(config);
  journal.upsertWorker({ nodeId, repo: "acme/widgets", status: "claimed", lane: "implement" });
  const github = new FakeGitHub(origin);
- const { reviewer, calls } = scriptedReviewer(github, opts.blockers ?? [0], opts.onReview);
+ const { reviewer, calls } = scriptedReviewer(github, opts.blockers ?? [0], opts.onReview, opts.majors ?? [0]);
  const ctx: RunNodeContext = {
   config,
   map: config.maps[0],
@@ -377,7 +384,7 @@ describe("implement lane (node #23)", () => {
   cleanup.push(r.dir);
   const outcome = await runNode("20", r.ctx);
   expect(outcome.status).toBe("parked");
-  expect(outcome.detail).toContain("remain after 2 sage round(s)");
+  expect(outcome.detail).toContain("blocker(s) and 0 major(s) remain after 2 sage round(s)");
   expect(r.journal.getWorker("20")?.status).toBe("parked");
   expect(r.journal.deadmanCount()).toBe(0); // a park is not a crash
   expect(state(r.statePath).nodes["20"].assignees).toEqual([BOT]);
@@ -568,5 +575,59 @@ describe("implement lane (node #23)", () => {
   expect(r.calls.length).toBe(before);
   const probe = (r.github.comments.get(1) ?? []).find((c) => c.body.includes("ranger:probes"));
   expect(probe?.body).toContain("result=pass");
+ }, 60_000);
+ test("a major gates like a blocker: fix pass, then a new sage round", async () => {
+  const r = await rig({ blockers: [0, 0], majors: [1, 0] });
+  cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  expect(r.calls).toHaveLength(2);
+  const rounds = (r.github.comments.get(1) ?? []).map((c) => c.body.match(/round=(\d) sha=\w+ blockers=(\d) majors=(\d)/)?.slice(1).join(","));
+  expect(rounds).toEqual(["1,0,1", "2,0,0"]);
+ }, 60_000);
+
+ test("majors left after the round cap park the node", async () => {
+  const r = await rig({ blockers: [0], majors: [1, 1] });
+  cleanup.push(r.dir);
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("parked");
+  expect(outcome.detail).toContain("0 blocker(s) and 1 major(s) remain after 2 sage round(s)");
+ }, 60_000);
+
+ test("a ready PR whose last review still has a major (it went ready under the old rule) is sent back, and its merge card withdrawn", async () => {
+  const r = await rig({ blockers: [0], majors: [1, 0] });
+  cleanup.push(r.dir);
+  // Simulate the old rule: the PR went ready after round 1 with one major.
+  r.ctx.config.workers.reviewRounds = 1;
+  // A cap of 1 parks on the major; stand the PR up as ready by hand.
+  expect((await runNode("20", r.ctx)).status).toBe("parked");
+  const pr = r.github.prs.get(1);
+  if (pr) pr.draft = false;
+  r.journal.updateWorker("20", { status: "awaiting-merge", phase: "awaiting-merge", mergeMessageId: "old-card" });
+  r.ctx.config.workers.reviewRounds = 2;
+
+  const posts: string[] = [];
+  const spawned: string[] = [];
+  const tick = await sweepMap({
+   config: r.ctx.config,
+   journal: r.journal,
+   map: r.ctx.map,
+   token: "ghp_write",
+   botIdentity: BOT,
+   github: r.github,
+   post: async (content) => {
+    posts.push(content);
+    return `msg-${posts.length}`;
+   },
+   respawn: async (nodeId) => {
+    spawned.push(nodeId);
+    return DEAD_PID;
+   },
+  });
+  expect(tick.mergeDesk?.resumed).toEqual(["20"]);
+  expect(posts[0]).toContain("merge card withdrawn");
+  expect(r.journal.getWorker("20")?.mergeMessageId).toBeNull();
+  // The resumed run-node reworks the major and runs round 2.
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  expect(r.calls).toHaveLength(2);
  }, 60_000);
 });

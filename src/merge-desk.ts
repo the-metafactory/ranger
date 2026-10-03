@@ -1,6 +1,7 @@
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import { DiscordAnnouncer } from "./announce.ts";
 import {
+ gatingFindings,
  realGitHub,
  recordedProbes,
  recordedReviews,
@@ -151,27 +152,44 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   );
   const probesRequired = map.commands.probe !== undefined;
 
-  // A ready PR on a probe-tier map with no passing probe record at its head
-  // (the tier was configured after the PR went ready, or the record is
-  // missing): hand it back to run-node, which finds the clean review at this
-  // head and runs only the probe step. A failing probe run parks it there.
-  if (
-   probesRequired &&
-   probe === undefined &&
-   last !== undefined &&
-   last.blockers === 0 &&
-   ctx.spawn !== undefined
-  ) {
+  // Send a ready PR back to run-node when the rules it went ready under no
+  // longer hold at its head: the review there still carries gating findings
+  // (majors started gating after the PR went ready), or the map now has a
+  // probe tier with no passing run recorded. run-node resumes in the review
+  // phase: a fix pass and a new round, or only the probe step. The round cap
+  // and a failing probe run still park it there. A posted merge card is
+  // withdrawn first, so a stale "merge needed" never stands.
+  const reworkFindings = last !== undefined && gatingFindings(last) > 0;
+  const missingProbes = probesRequired && probe === undefined && last !== undefined;
+  if ((reworkFindings || missingProbes) && ctx.spawn !== undefined) {
+   const why = reworkFindings
+    ? `sage round ${last?.round} at ${pr.headSha.slice(0, 8)} has ${last?.blockers} blocker(s) and ${last?.majors} major(s) to rework`
+    : `no passing probe run at ${pr.headSha.slice(0, 8)}`;
+   if (row.mergeMessageId !== null) {
+    try {
+     await post(
+      [
+       `:ranger: **merge card withdrawn** #${row.nodeId} — ${title}`,
+       `Do not merge yet: ${why}. Ranger reworks it; a new merge card follows when the PR is clean.`,
+      ].join("\n"),
+      `merge card withdrawal for #${row.nodeId}`,
+     );
+    } catch {
+     result.errors.push(`#${row.nodeId}: could not post the card withdrawal — retrying next tick`);
+     return;
+    }
+    journal.updateWorker(row.nodeId, { mergeMessageId: null });
+   }
    const pid = await ctx.spawn(row.nodeId, repo);
    if (pid === null) {
-    result.errors.push(`#${row.nodeId}: probes missing at the head, but run-node did not spawn — retrying next tick`);
+    result.errors.push(`#${row.nodeId}: ${why}, but run-node did not spawn — retrying next tick`);
     return;
    }
    journal.updateWorker(row.nodeId, { status: "running", phase: "review", pid });
    journal.recordEvent("sweep", {
     nodeId: row.nodeId,
     repo,
-    detail: `PR #${pr.number} has no passing probe run at ${pr.headSha.slice(0, 8)} — run-node resumes for the probe tier (pid ${pid})`,
+    detail: `PR #${pr.number}: ${why} — run-node resumes (pid ${pid})`,
    });
    result.resumed.push(row.nodeId);
    return;
@@ -182,6 +200,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    expectedBase: map.base,
    verdictSha: last?.sha ?? null,
    verdictBlockers: last?.blockers ?? null,
+   verdictMajors: last?.majors ?? null,
    probesRequired,
    probePassedSha: probe?.sha ?? null,
   });
@@ -200,7 +219,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    [
     `:ranger: **merge needed** #${row.nodeId} — ${title}`,
     `map: ${repo}`,
-    `Gate passed at \`${gate.headSha.slice(0, 8)}\`: CI green, mergeable, base \`${map.base}\`, sage ${last?.round ?? "?"} round(s) with 0 blockers and ${last?.majors ?? "?"} majors (machine evidence, not a sign-off).`,
+    `Gate passed at \`${gate.headSha.slice(0, 8)}\`: CI green, mergeable, base \`${map.base}\`, sage ${last?.round ?? "?"} round(s), the last with 0 blockers and 0 majors (machine evidence, not a sign-off).`,
     ...(probesRequired
      ? [`Probes passed at \`${gate.headSha.slice(0, 8)}\` (selection ${probe?.mode ?? "?"}, ${probe?.selected ?? "?"} probe(s)). Only the selected probes ran, not the full suite.`]
      : ["No probe tier on this map: CI and the tests are the only automated checks."]),

@@ -26,6 +26,8 @@ export interface MergeGateInput {
  /** Ranger's recorded sage verdict: the SHA it read and its blocker count. */
  verdictSha: string | null;
  verdictBlockers: number | null;
+ /** Majors gate too (principal, 2026-10-03): a major is reworked and re-reviewed. */
+ verdictMajors?: number | null;
  /**
   * The map declares a probe tier (`commands.probe`): ranger's passing probe
   * record must be at exactly the live head. Undefined/false = no probe tier.
@@ -118,11 +120,15 @@ export function evaluateMergeGate(input: MergeGateInput): MergeGateResult {
    reason: `no sage verdict recorded for head ${pr.headSha.slice(0, 8)}`,
   };
  }
- if (input.verdictBlockers === null || input.verdictBlockers > 0) {
+ if (
+  input.verdictBlockers === null ||
+  input.verdictBlockers > 0 ||
+  (input.verdictMajors ?? 0) > 0
+ ) {
   return {
    status: "fail",
    check: "review-clean",
-   reason: `sage verdict at ${pr.headSha.slice(0, 8)} has ${input.verdictBlockers ?? "unknown"} blocker(s)`,
+   reason: `sage verdict at ${pr.headSha.slice(0, 8)} has ${input.verdictBlockers ?? "unknown"} blocker(s) and ${input.verdictMajors ?? 0} major(s)`,
   };
  }
 
