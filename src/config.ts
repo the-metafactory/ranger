@@ -61,6 +61,15 @@ const MapSchema = z.object({
    install: z.string().min(1).optional(),
    /** The repo's test command; must exit 0 before ranger pushes (e.g. `bun test tests/`). */
    test: z.string().min(1).optional(),
+   /**
+    * A slower verification tier (e.g. browser probes) run once on the final,
+    * sage-clean head before the PR is marked ready. A passing run is recorded
+    * on the PR and gates the merge card. `{node}` is replaced with the
+    * numeric node id — the only substitution, so no tracker text reaches it.
+    */
+   probe: z.string().min(1).optional(),
+   /** Wall clock for one probe run, minutes. */
+   probeTimeoutMin: z.number().int().positive().default(30),
   })
   .default({}),
  /**

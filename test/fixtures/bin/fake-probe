@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Fake probe tier for tests. Args: <mode> <node> [statefile]
+# Prints the selector's summary lines, then: ok → exit 0; fail → exit 1;
+# flaky → fail on the first run (creating statefile), pass on the next.
+# Refuses (exit 3) when a ranger credential leaked into its env.
+set -euo pipefail
+if [ -n "${GH_TOKEN:-}" ] || [ -n "${GIT_CONFIG_VALUE_0:-}" ] || [ -n "${RANGER_WRITE_TEST:-}" ]; then
+  echo "probe env leaked a ranger credential" >&2
+  exit 3
+fi
+mode="$1"; node="$2"; state="${3:-}"
+echo "probe selection: semantic"
+echo "reason: fake selector"
+echo "selected: 2"
+case "$mode" in
+  ok) echo "node $node: 2 probes passed"; exit 0 ;;
+  fail) echo "probe-hud failed" >&2; exit 1 ;;
+  flaky)
+    if [ -f "$state" ]; then echo "passed on retry"; exit 0; fi
+    touch "$state"; echo "flaked" >&2; exit 1 ;;
+esac

@@ -165,6 +165,8 @@ async function rig(opts: {
  author?: string;
  blockers?: number[];
  onReview?: (round: number) => void;
+ /** commands.probe for the map (a fake-probe invocation). */
+ probe?: string;
 }): Promise<Rig & { calls: number[] }> {
  const nodeId = opts.nodeId ?? "20";
  const dir = mkdtempSync(join(tmpdir(), "ranger-implement-"));
@@ -218,6 +220,7 @@ async function rig(opts: {
    `    canonical: ${canonical}`,
    "    commands:",
    "      test: test -f src/feature.ts",
+   ...(opts.probe === undefined ? [] : [`      probe: '${opts.probe}'`]),
   ],
   auth: ["  writeTokens:", '    "acme/*": RANGER_WRITE_TEST'],
   state: [`  canonicalRoot: ${dir}`],
@@ -474,5 +477,96 @@ describe("implement lane (node #23)", () => {
   const closed = await runNode("20", r.ctx);
   expect(closed.status).toBe("success");
   expect(state(r.statePath).nodes["20"].status).toBe("closed");
+ }, 60_000);
+ test("probe tier passes on the final head: recorded on the PR, named in the body, gates and names the merge card — and never sees a ranger credential", async () => {
+  const r = await rig({ blockers: [1, 0], probe: "fake-probe ok {node}" });
+  cleanup.push(r.dir);
+  process.env.RANGER_WRITE_TEST = "ghp_write"; // must not reach the probe
+  const first = await runNode("20", r.ctx);
+  expect(first.status).toBe("awaiting-merge");
+  const comments = r.github.comments.get(1) ?? [];
+  const probes = comments.filter((c) => c.body.includes("ranger:probes"));
+  expect(probes).toHaveLength(1); // once, on the final head only
+  const head = await r.github.sha("node/20-add-the-feature-module");
+  expect(probes[0].body).toContain(`sha=${head} result=pass selected=2 mode=semantic`);
+  expect(probes[0].body).toContain("node 20: 2 probes passed"); // {node} templated
+  expect(r.github.prs.get(1)?.body).toContain("- Probes: passed at");
+
+  const posts: string[] = [];
+  const tick = await sweepMap({
+   config: r.ctx.config,
+   journal: r.journal,
+   map: r.ctx.map,
+   token: "ghp_write",
+   botIdentity: BOT,
+   github: r.github,
+   post: async (content) => {
+    posts.push(content);
+    return "msg-1";
+   },
+  });
+  expect(tick.mergeDesk?.cards).toEqual(["20"]);
+  expect(posts[0]).toContain("Probes passed at");
+ }, 60_000);
+
+ test("a flaky probe run is retried once and passes", async () => {
+  const r = await rig({ probe: `fake-probe flaky {node} ${tmpdir()}/ranger-flaky-${Date.now()}` });
+  cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  const probe = (r.github.comments.get(1) ?? []).find((c) => c.body.includes("ranger:probes"));
+  expect(probe?.body).toContain("result=pass");
+  expect(probe?.body).toContain("2 run(s)");
+ }, 60_000);
+
+ test("probes failing twice park the node: the PR stays a draft, the failure is on the PR, no merge card", async () => {
+  const r = await rig({ probe: "fake-probe fail {node}" });
+  cleanup.push(r.dir);
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("parked");
+  expect(outcome.detail).toContain("browser probes failed twice");
+  expect(r.github.prs.get(1)?.draft).toBe(true);
+  const probe = (r.github.comments.get(1) ?? []).find((c) => c.body.includes("ranger:probes"));
+  expect(probe?.body).toContain("result=fail");
+  expect(r.journal.deadmanCount()).toBe(0);
+  const tick = await sweepMap({
+   config: r.ctx.config,
+   journal: r.journal,
+   map: r.ctx.map,
+   token: "ghp_write",
+   botIdentity: BOT,
+   github: r.github,
+   post: async () => "msg",
+  });
+  expect(tick.mergeDesk?.cards ?? []).toEqual([]);
+ }, 60_000);
+ test("a PR that went ready before the map had a probe tier is sent back for probes, not parked", async () => {
+  const r = await rig({});
+  cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge"); // no probe tier yet
+  // The principal adds the probe tier while the PR waits for the merge.
+  r.ctx.map.commands.probe = "fake-probe ok {node}";
+  const spawned: string[] = [];
+  const tick = await sweepMap({
+   config: r.ctx.config,
+   journal: r.journal,
+   map: r.ctx.map,
+   token: "ghp_write",
+   botIdentity: BOT,
+   github: r.github,
+   post: async () => "msg",
+   respawn: async (nodeId) => {
+    spawned.push(nodeId);
+    return DEAD_PID;
+   },
+  });
+  expect(tick.mergeDesk?.resumed).toEqual(["20"]);
+  expect(tick.mergeDesk?.parked).toEqual([]);
+  expect(spawned).toEqual(["20"]);
+  // The resumed run-node runs only the probe step: no new review round.
+  const before = r.calls.length;
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  expect(r.calls.length).toBe(before);
+  const probe = (r.github.comments.get(1) ?? []).find((c) => c.body.includes("ranger:probes"));
+  expect(probe?.body).toContain("result=pass");
  }, 60_000);
 });
