@@ -40,6 +40,9 @@ maps:
     # are the principal's, ranger builds what they spawn) except the skip
     # list: #559 needs the principal's ear and a squash-safe probe first.
     skip: [559]
+    # Ranger merges a gate-passed PR itself (principal, 2026-10-03), except
+    # nodes labelled ranger:needs-eye, which keep the one-tap merge card.
+    autoMerge: true
     commands:
       install: npm ci --no-audit --no-fund
       test: npm test
