@@ -117,13 +117,7 @@ export function implementCandidates(
 
 /** Is an implement worker building or under review anywhere? (awaiting-merge does not hold the lane.) */
 export function implementLaneBusy(journal: Journal): boolean {
- return journal
-  .listWorkers()
-  .some(
-   (w) =>
-    w.lane === "implement" &&
-    (w.status === "claimed" || w.status === "running"),
-  );
+ return journal.implementLaneHolder() !== null;
 }
 
 export async function walk(ctx: WalkContext): Promise<WalkResult> {

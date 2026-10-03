@@ -251,6 +251,7 @@ async function runResumeNode(
  nodeId: string,
  repo: string | undefined,
  configPath: string,
+ force?: boolean,
 ): Promise<string> {
  const { config, journal } = loadCtx(configPath);
  try {
@@ -262,6 +263,13 @@ async function runResumeNode(
   }
   if (row.status === "released") {
    throw new Error(`node ${nodeId}'s claim was released — the walk re-claims it from the frontier`);
+  }
+  // The implement lane is one at a time: a resume starts a worker session.
+  const holder = row.lane === "implement" ? journal.implementLaneHolder(nodeId) : null;
+  if (holder !== null && force !== true) {
+   throw new Error(
+    `the implement lane is held by #${holder.nodeId} (${holder.repo}, ${holder.status}) — resume #${nodeId} after it leaves the lane, or pass --force to run both`,
+   );
   }
   journal.updateWorker(nodeId, { status: "claimed", pid: null, workerPgid: null, finishedAt: null });
   const pid = await spawnRunNodeDetached({
@@ -529,11 +537,12 @@ program
  )
  .argument("<id>", "node id to resume")
  .option("-m, --map <repo>", "map repo (required with multiple maps)")
+ .option("--force", "resume even while another implement worker holds the lane")
  .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
- .action(async (id: string, options: { map?: string; config: string }) => {
+ .action(async (id: string, options: { map?: string; config: string; force?: boolean }) => {
   try {
    const configPath = resolve(process.cwd(), options.config);
-   process.stdout.write((await runResumeNode(id, options.map, configPath)) + "\n");
+   process.stdout.write((await runResumeNode(id, options.map, configPath, options.force)) + "\n");
   } catch (error) {
    process.stderr.write(
     `ranger resume-node: ${error instanceof Error ? error.message : String(error)}\n`,

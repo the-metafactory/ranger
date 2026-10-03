@@ -376,3 +376,23 @@ describe("worker prompts are headless-aware (found live on seelite #669)", () =>
   }
  });
 });
+
+describe("implement lane holder", () => {
+ test("names the implement worker building or under review, except the asking node", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ranger-holder-"));
+  try {
+   const path = join(dir, "ranger.yaml");
+   require("node:fs").writeFileSync(path, baseConfigLines(dir).join("\n"));
+   const journal = openJournal(loadConfig(path).config);
+   journal.upsertWorker({ nodeId: "1", repo: "acme/widgets", status: "awaiting-merge", lane: "implement" });
+   journal.upsertWorker({ nodeId: "2", repo: "acme/widgets", status: "running", lane: "research" });
+   expect(journal.implementLaneHolder()).toBeNull();
+   journal.upsertWorker({ nodeId: "3", repo: "acme/widgets", status: "running", lane: "implement" });
+   expect(journal.implementLaneHolder()?.nodeId).toBe("3");
+   expect(journal.implementLaneHolder("3")).toBeNull();
+   journal.close();
+  } finally {
+   rmSync(dir, { recursive: true, force: true });
+  }
+ });
+});

@@ -634,4 +634,46 @@ describe("implement lane (node #23)", () => {
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
   expect(r.calls).toHaveLength(2);
  }, 60_000);
+ test("a send-back waits for the implement lane, after withdrawing the stale card", async () => {
+  const r = await rig({ blockers: [0], majors: [1, 0] });
+  cleanup.push(r.dir);
+  r.ctx.config.workers.reviewRounds = 1;
+  expect((await runNode("20", r.ctx)).status).toBe("parked");
+  r.journal.updateWorker("20", { status: "awaiting-merge", phase: "awaiting-merge", mergeMessageId: "old-card" });
+  r.ctx.config.workers.reviewRounds = 2;
+  // Another implement worker holds the lane.
+  r.journal.upsertWorker({ nodeId: "99", repo: "acme/widgets", status: "running", lane: "implement" });
+
+  const posts: string[] = [];
+  const spawned: string[] = [];
+  const sweep = () =>
+   sweepMap({
+    config: r.ctx.config,
+    journal: r.journal,
+    map: r.ctx.map,
+    token: "ghp_write",
+    botIdentity: BOT,
+    github: r.github,
+    post: async (content) => {
+     posts.push(content);
+     return `msg-${posts.length}`;
+    },
+    respawn: async (nodeId) => {
+     spawned.push(nodeId);
+     return DEAD_PID;
+    },
+   });
+  const waiting = await sweep();
+  expect(waiting.mergeDesk?.pending).toEqual(["20"]);
+  expect(spawned).toEqual([]);
+  expect(posts[0]).toContain("merge card withdrawn");
+  expect(r.journal.getWorker("20")?.mergeMessageId).toBeNull();
+
+  // The lane frees; the next tick sends it back, without a second withdrawal.
+  r.journal.updateWorker("99", { status: "success" });
+  const resumed = await sweep();
+  expect(resumed.mergeDesk?.resumed).toEqual(["20"]);
+  expect(spawned).toEqual(["20"]);
+  expect(posts).toHaveLength(1);
+ }, 60_000);
 });
