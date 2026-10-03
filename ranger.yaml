@@ -31,6 +31,17 @@ maps:
       tokenEnv: RANGER_DISCORD_TOKEN
       channelId: "1487052222067118111"
 
+  - repo: jcfischer/seelite
+    root: 1
+    walk: none
+    # Personal map, charting phase: 6 HITL decisions and one implement node the
+    # walker cannot take yet (task kind → implement lane, build-path step 4).
+    # Registered for scout + the escalation desk; shares seekolous's private
+    # grove channel rather than opening a second personal surface.
+    discord:
+      tokenEnv: RANGER_DISCORD_TOKEN
+      channelId: "1487052222067118111"
+
 # Read-only token gate (node #8 ruling). Only env var NAMES live here — never
 # tokens. Prefixes match longest-first against map.repo. Scout refuses to run a
 # map without an explicit token; it never falls back to the gh keyring (which is
