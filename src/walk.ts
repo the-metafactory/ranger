@@ -15,6 +15,16 @@ import {
 import type { Journal } from "./journal.ts";
 import { classify, loadProbeRegistry, type ClassifiedNode } from "./route.ts";
 import { sweepMap, type SweepMapResult } from "./sweep.ts";
+import {
+ implementCandidates,
+ planTick,
+ researchCandidates,
+ selectCandidates,
+} from "./candidates.ts";
+
+// Re-exported where they were: the candidate selection moved to a module with
+// no graph-write import, so `ranger serve` (#37) can share it (one copy).
+export { implementCandidates, planTick, researchCandidates, selectCandidates };
 
 /**
  * The headless tick (design §1, build-path step 3) — one bounded pass:
@@ -92,29 +102,6 @@ export interface WalkContext {
  /** Detached run-node spawner — tests inject a recorder. Returns the child PID or null. */
  spawnRunNode?: (args: SpawnRunNodeArgs) => Promise<number | null>;
  now?: () => Date;
-}
-
-/** Research-lane candidates: routed research AND walkable on this map's walk mode. */
-export function researchCandidates(
- frontier: ClassifiedNode[],
-): ClassifiedNode[] {
- return frontier.filter(
-  (n) => n.route.route === "research" && n.route.walkable,
- );
-}
-
-/**
- * Implement-lane candidates (design §3 class 8 + the #23 ruling): routed
- * implement AND walkable. The lane is serial — review concurrency is 1 per
- * machine (design §8) — so the caller claims at most one, and none while
- * another implement worker is in its build/review phases.
- */
-export function implementCandidates(
- frontier: ClassifiedNode[],
-): ClassifiedNode[] {
- return frontier.filter(
-  (n) => n.route.route === "implement" && n.route.walkable,
- );
 }
 
 /** Is an implement worker building or under review anywhere? (awaiting-merge does not hold the lane.) */
@@ -202,13 +189,14 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
       skip: map.skip,
      }),
     );
-    const research = researchCandidates(classified);
-    const implement = implementLaneBusy(journal)
-     ? []
-     : implementCandidates(classified).slice(0, 1);
-    const candidates = [...implement, ...research];
+    // The plan `ranger serve` (#37) also reads, so its "next" is this order.
+    const plan = planTick(classified, {
+     laneBusy: implementLaneBusy(journal),
+     vetoed: (id) => journal.hasVeto(id),
+    });
+    const candidates = plan.selected;
     const laneOf = (id: string) =>
-     implement.some((n) => n.id === id) ? "implement" : "research";
+     plan.implement.some((n) => n.id === id) ? "implement" : "research";
 
     for (const node of candidates) {
      if (
@@ -219,7 +207,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
       break;
      }
      // Veto cache: a vetoed node is never claimed (design §5, journal durability).
-     if (journal.hasVeto(node.id)) {
+     if (plan.vetoed.includes(node)) {
       errors.push(`#${node.id} vetoed — not claimed`);
       continue;
      }

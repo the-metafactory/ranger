@@ -37,6 +37,7 @@ import {
 import { runNode } from "./worker.ts";
 import { sweepMap } from "./sweep.ts";
 import { spawnRunNodeDetached, walk } from "./walk.ts";
+import { startServe } from "./serve.ts";
 import {
  escalateMaps,
  runDigest,
@@ -53,6 +54,8 @@ import type { WalkMode } from "./config.ts";
  * - `run-node <id>` — the detached worker supervisor (research + implement lanes).
  * - `sweep` — reconcile the journal against reality.
  * - `journal` — inspect the journal.
+ * - `serve` (node #37) — local read-only dashboard; launches the principal's
+ *   own grilling sessions, never a graph write.
  */
 
 const READONLY_SURFACE = ["audit", "frontier", "node"] as const;
@@ -615,6 +618,35 @@ program
    }
   },
  );
+
+program
+ .command("serve")
+ .description(
+  "Local read-only dashboard (#37): the current job, the next in queue, autonomous nodes, and open grillings with a button that opens an interactive session",
+ )
+ .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
+ .option("-p, --port <port>", "port on 127.0.0.1 (default: serve.port, 7311)")
+ .option("--open", "open the dashboard in the browser")
+ .action((options: { config: string; port?: string; open?: boolean }) => {
+  try {
+   const configPath = resolve(process.cwd(), options.config);
+   const { config } = loadConfig(configPath);
+   const port = options.port === undefined ? undefined : Number(options.port);
+   if (
+    port !== undefined &&
+    (!Number.isInteger(port) || port < 1024 || port > 65535)
+   ) {
+    throw new Error(`--port must be an integer from 1024 to 65535, got ${options.port}`);
+   }
+   const { url } = startServe({ config, port, open: options.open });
+   process.stdout.write(`ranger serve: ${url} (Ctrl-C stops it)\n`);
+  } catch (error) {
+   process.stderr.write(
+    `ranger serve: ${error instanceof Error ? error.message : String(error)}\n`,
+   );
+   process.exit(1);
+  }
+ });
 
 program.parseAsync(process.argv).catch((error) => {
  process.stderr.write(

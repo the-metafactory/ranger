@@ -155,3 +155,20 @@ export async function readFrontier(
   }
   return { frontier, source: "fresh" };
 }
+
+/**
+ * The last frontier the walk or the escalation pass cached for a map, or null.
+ * A plain journal read, with no GitHub call and no sentinel check: `ranger
+ * serve` (#37) shows it with its age rather than re-reading a map ranger reads
+ * every tick on the principal's own budget.
+ */
+export function cachedFrontier(
+  journal: Journal,
+  repo: string,
+  root: number,
+): { fetchedAt: string; frontier: FrontierResult } | null {
+  const cached = readCache(journal, repo, root);
+  return cached === null
+    ? null
+    : { fetchedAt: cached.fetchedAt, frontier: cached.frontier };
+}

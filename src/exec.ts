@@ -98,3 +98,14 @@ export async function processGroupCommands(pgid: number): Promise<string[]> {
   }
   return commands;
 }
+
+/** Is a PID alive on this host? `kill(pid, 0)` is a pure liveness probe. */
+export function pidAlive(pid: number | null): boolean {
+ if (pid === null || pid <= 0) return false;
+ try {
+  process.kill(pid, 0);
+  return true;
+ } catch {
+  return false;
+ }
+}

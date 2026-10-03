@@ -15,6 +15,9 @@ maps:
   - repo: the-metafactory/ranger
     root: 1
     walk: research-only
+    # The principal's checkout: `ranger serve` (#37) opens grilling
+    # sessions here, never in the machine account's canonical clone.
+    localCheckout: ~/work/mf/ranger
     # Per-run escalation surface (node #7): one channel per run, decided per
     # walk. The Metafactory guild has no #ranger channel and the reused grove
     # bot lacks MANAGE_CHANNELS there, so the run posts to #soma (one thread
@@ -25,6 +28,7 @@ maps:
   - repo: jcfischer/seekolous
     root: 26
     walk: none
+    localCheckout: ~/work/cyphr/spark/seekolous
     # Personal map: escalation surface is the principal's private channel on
     # the grove guild (the bot's home server).
     discord:
@@ -34,6 +38,7 @@ maps:
   - repo: jcfischer/seelite
     root: 1
     walk: full
+    localCheckout: ~/work/cyphr/spark/seelite
     # Shares seekolous's private grove channel rather than opening a second
     # personal surface. walk: full since 2026-10-03 (ivy-agent has write
     # access). Every eligible task is walked (principal, 2026-10-03: grillings
@@ -87,3 +92,16 @@ bot:
 principal:
   login: jcfischer
   discordId: "285727653603049472"
+
+# `ranger serve` (#37): the local dashboard, bound on 127.0.0.1.
+serve:
+  port: 7311
+  refreshSec: 900
+  # Shown on the dashboard only — not walked, not in `ranger scout`'s report,
+  # no cards (serve still reads their frontier). Seelite's
+  # gameplay map #460 is registered for walking once two maps on one repo are
+  # supported (#38, the principal's choice of walk: full on 2026-10-03).
+  extraMaps:
+    - repo: jcfischer/seelite
+      root: 460
+      localCheckout: ~/work/cyphr/spark/seelite
