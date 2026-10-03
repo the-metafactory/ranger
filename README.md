@@ -26,8 +26,17 @@ Shipped build-path steps:
 - **Step 3 — claim + research lane** (node #13): the smallest full
   claim→execute→close loop on the safest kind — `ranger walk` (headless tick:
   announce → claim → spawn), `ranger run-node` (detached worker supervisor with
-  the research SOP tail), `ranger sweep`, `ranger journal`. The implement lane
-  (step 4) and the approver bot (node #16) remain.
+  the research SOP tail), `ranger sweep`, `ranger journal`.
+- **Step 4 — implement lane** (node #23; built, live acceptance on seelite #550
+  pending): `walk: full` maps get the task/build
+  SOP — worker implements and commits; the supervisor tests, pushes, opens a
+  draft PR, runs offline sage rounds (cap 2) with fix passes, marks it ready, and
+  the tick posts a one-tap merge card. Ranger never merges; after the
+  principal's merge it closes the node through the gate, citing the PR's CI
+  run. `propose` task/build nodes take the same lane, with the merge as the
+  ratification. Each run-node is a fenced occupant (generation check before every
+  outward action, process-group kill) and resumes its phase from GitHub. The
+  approver bot (node #16) remains.
 
 ## Scout (build-path step 1)
 

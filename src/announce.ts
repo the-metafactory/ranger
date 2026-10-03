@@ -73,6 +73,14 @@ export class DiscordAnnouncer implements Announcer {
    `:ranger: **claim** #${ctx.nodeId} — ${ctx.nodeTitle}`,
    `map: ${ctx.repo}${ctx.mapTitle === undefined ? "" : ` (${ctx.mapTitle})`}`,
   ].join("\n");
+  return { messageId: await this.post(content, `claim announce for #${ctx.nodeId}`) };
+ }
+
+ /**
+  * Post one message to the map's channel and return its id, or throw. The
+  * claim announce and the implement lane's merge cards (#23) share it.
+  */
+ async post(content: string, label: string): Promise<string> {
   // A hung announce must not hold the scheduled tick — the fetch is
   // abort-bounded (round-35: the claim-announce was the last unbounded
   // Discord surface). The announcer is fail-closed: a timeout aborts the
@@ -101,13 +109,13 @@ export class DiscordAnnouncer implements Announcer {
    );
   } catch (error) {
    throw new AnnounceError(
-    `announce failed for #${ctx.nodeId}: ${error instanceof Error ? error.message : String(error)}`,
+    `${label} failed: ${error instanceof Error ? error.message : String(error)}`,
    );
   }
   if (!response.ok) {
    clearTimeout(timer);
    throw new AnnounceError(
-    `announce for #${ctx.nodeId} returned HTTP ${response.status} — fail-closed, no claim.`,
+    `${label} returned HTTP ${response.status} — fail-closed.`,
    );
   }
   // The abort timer stays alive through the BODY read (round-38 blocker): a
@@ -120,10 +128,10 @@ export class DiscordAnnouncer implements Announcer {
   }
   if (typeof body.id !== "string" || body.id.length === 0) {
    throw new AnnounceError(
-    `announce for #${ctx.nodeId} returned no message id — fail-closed, no claim.`,
+    `${label} returned no message id — fail-closed.`,
    );
   }
-  return { messageId: body.id };
+  return body.id;
  }
 }
 

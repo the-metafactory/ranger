@@ -24,6 +24,8 @@ identity=""
 resolution_file=""
 gist=""
 checkpoint=""
+ci=""
+evidence_file="$(mktemp)"
 i=4
 while [ $i -le $# ]; do
   arg="${!i}"
@@ -34,6 +36,8 @@ while [ $i -le $# ]; do
     --resolution-file) i=$((i+1)); resolution_file="${!i}" ;;
     --gist) i=$((i+1)); gist="${!i}" ;;
     --checkpoint) i=$((i+1)); checkpoint="${!i}" ;;
+    --ci) i=$((i+1)); ci="${!i}" ;;
+    --evidence) i=$((i+1)); printf "%s\n" "${!i}" >> "$evidence_file" ;;
     --write) : ;;
     --dry-run) : ;;
   esac
@@ -66,7 +70,8 @@ if [ -z "${FAKE_SOMA_STATE:-}" ]; then
 fi
 
 export FAKE_SOMA_STATE FAKE_SOMA_REPO_DIR FAKE_SOMA_IDENTITY="$identity" \
-  FAKE_SOMA_GIST="$gist" FAKE_SOMA_CHECKPOINT="$checkpoint" FAKE_SOMA_RESOLUTION_FILE="${resolution_file:-}"
+  FAKE_SOMA_GIST="$gist" FAKE_SOMA_CHECKPOINT="$checkpoint" FAKE_SOMA_RESOLUTION_FILE="${resolution_file:-}" \
+  FAKE_SOMA_CI="$ci" FAKE_SOMA_EVIDENCE_FILE="$evidence_file"
 
 case "$verb" in
   claim|release|close|decisions)
@@ -120,6 +125,15 @@ if verb == "close":
     # run FROM the canonical checkout. Record the cwd so the test can assert it.
     probe_cwd = os.getcwd()
     s["lastCloseCwd"] = probe_cwd
+    ci = os.environ.get("FAKE_SOMA_CI", "")
+    with open(os.environ["FAKE_SOMA_EVIDENCE_FILE"]) as fh:
+        evidence = [json.loads(line) for line in fh if line.strip()]
+    s["lastClose"] = {"ci": ci, "evidence": evidence, "checkpoint": os.environ.get("FAKE_SOMA_CHECKPOINT", "")}
+    # Faithful to the installed gate: an auto node must cite a CI check run.
+    if node.get("autonomy") == "auto" and not ci:
+        print(f"Close refused: node {nid} (auto) must cite a successful CI check run (checkRunId and headSha) to close", file=sys.stderr)
+        save()
+        sys.exit(1)
     for probe in node.get("probes", []):
         if probe.get("type") == "git-ref-exists" and probe.get("ref"):
             ref = probe["ref"]
@@ -128,7 +142,15 @@ if verb == "close":
                 capture_output=True,
             ).returncode == 0
             if not ok:
+                save()
                 print(f"Close refused for node {nid}: probe git-ref-exists '{ref}' failed — {ref} does not resolve in {probe_cwd}.", file=sys.stderr)
+                sys.exit(1)
+        if probe.get("type") == "artifact-exists" and probe.get("atRef"):
+            spec = f"{probe['atRef']}:{probe['path']}"
+            ok = subprocess.run(["git", "-C", probe_cwd, "cat-file", "-e", spec], capture_output=True).returncode == 0
+            if not ok:
+                save()
+                print(f"Close refused for node {nid}: probe artifact-exists {spec} failed in {probe_cwd}.", file=sys.stderr)
                 sys.exit(1)
     node["status"] = "closed"
     s.setdefault("decisions", []).append({

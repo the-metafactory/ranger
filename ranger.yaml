@@ -31,6 +31,23 @@ maps:
       tokenEnv: RANGER_DISCORD_TOKEN
       channelId: "1487052222067118111"
 
+  - repo: jcfischer/seelite
+    root: 1
+    walk: none
+    # Registered for scout + the escalation desk; shares seekolous's private
+    # grove channel rather than opening a second personal surface.
+    # Implement-lane acceptance (node #23): flip walk to full once ivy-agent
+    # has write access on jcfischer/seelite. The allowlist keeps the first
+    # live run to #550 (headless test, artifact-exists probe); #559 needs the
+    # principal's ear and a squash-safe probe first.
+    nodes: [550]
+    commands:
+      install: npm ci --no-audit --no-fund
+      test: npm test
+    discord:
+      tokenEnv: RANGER_DISCORD_TOKEN
+      channelId: "1487052222067118111"
+
 # Read-only token gate (node #8 ruling). Only env var NAMES live here — never
 # tokens. Prefixes match longest-first against map.repo. Scout refuses to run a
 # map without an explicit token; it never falls back to the gh keyring (which is

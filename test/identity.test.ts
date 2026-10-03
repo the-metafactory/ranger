@@ -16,7 +16,7 @@ function config(over: Partial<RangerConfig> = {}): RangerConfig {
   bot: {},
   principal: { login: "jcfischer" },
   state: { journalPath: ":memory:", canonicalRoot: "/tmp/repos" },
-  workers: { spawnCapPerDay: 10, wallClockMin: 90, maxAttempts: 2, deadmanThreshold: 3 },
+  workers: { spawnCapPerDay: 10, wallClockMin: 90, maxAttempts: 2, deadmanThreshold: 3, reviewRounds: 2 },
   ...over,
  };
 }

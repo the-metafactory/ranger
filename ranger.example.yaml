@@ -8,12 +8,24 @@ maps:
     # walk is the walker's autonomy opt-in (node #9):
     #   none           — register only (scout reports; claims nothing)
     #   research-only  — claim auto research frontier nodes (research lane)
-    #   full           — also the implement lane (later build step)
+    #   full           — also the implement lane (node #23): auto task/build
+    #                    nodes, and propose task/build nodes whose ratification
+    #                    is the principal's merge of the PR
     walk: none
     # Optional canonical-checkout override (design §4: probes run where the
     # registry says — the canonical checkout, never a worktree). Defaults to
     # <state.canonicalRoot>/<repo>.
     # canonical: ~/work/ranger-repos/the-metafactory/ranger
+    # Implement-lane commands (walk: full). They run in the worktree under the
+    # worker's env (no credential) because they execute worker-written code.
+    # A walk: full map without commands.test refuses its implement nodes.
+    # commands:
+    #   install: bun install
+    #   test: bun test
+    # Optional allowlist: walk only these node ids (a first live run).
+    # nodes: [550]
+    # The branch PRs target and atRef probes resolve against (default main).
+    # base: main
     # Per-run Discord escalation surface (node #7): one channel per run,
     # decided individually per walk. tokenEnv = env var name holding the bot
     # token (never inline). Reused grove bot + chosen channel (node #11).
@@ -53,6 +65,8 @@ workers:
   maxAttempts: 2
   # Consecutive worker failures that trip the dead-man switch (claiming stops).
   deadmanThreshold: 3
+  # Sage review rounds per implement-lane PR before ranger parks + escalates.
+  reviewRounds: 2
 
 auth:
   readOnlyTokens:

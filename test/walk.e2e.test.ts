@@ -374,7 +374,9 @@ describe("ranger run-node — research worker full loop (node #13 acceptance)", 
 
    const journal = new Journal(join(dir, "state.sqlite"));
    expect(journal.deadmanCount()).toBe(1);
-   expect(journal.getWorker("10")?.status).toBe("running"); // claim survives; no close attempted
+   // The claim survives on the tracker; the row is terminal, not a "running"
+   // row with no PID that sweep can never see (#23 F1).
+   expect(journal.getWorker("10")?.status).toBe("failed");
    journal.close();
   } finally {
    rmSync(dir, { recursive: true, force: true });
@@ -420,7 +422,7 @@ describe("ranger sweep — reconcile journal vs reality (design §7)", () => {
     botIdentity: "ivy-bot",
     respawn: async (nodeId) => {
      respawned.push(nodeId);
-     return true;
+     return 2_147_483_646; // the respawned supervisor's pid (dead too)
     },
    });
    expect(first.crashed).toBe(1);
@@ -433,7 +435,7 @@ describe("ranger sweep — reconcile journal vs reality (design §7)", () => {
     map,
     token: "ghp_write",
     botIdentity: "ivy-bot",
-    respawn: async () => true,
+    respawn: async () => 2_147_483_646,
    });
    expect(second.parked).toEqual(["7"]);
    expect(second.released).toEqual(["7"]);

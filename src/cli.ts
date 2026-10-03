@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import { Command } from "commander";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import {
  loadConfig,
  expandHome,
@@ -36,7 +36,7 @@ import {
 } from "./identity.ts";
 import { runNode } from "./worker.ts";
 import { sweepMap } from "./sweep.ts";
-import { walk } from "./walk.ts";
+import { spawnRunNodeDetached, walk } from "./walk.ts";
 import {
  escalateMaps,
  runDigest,
@@ -50,7 +50,7 @@ import type { WalkMode } from "./config.ts";
  *
  * - `scout` (node #12) — read-only frontier/audit/HITL digest. Zero graph writes.
  * - `walk` (node #13) — the headless tick: claim + spawn + sweep. Graph writes.
- * - `run-node <id>` — the detached worker supervisor (research lane).
+ * - `run-node <id>` — the detached worker supervisor (research + implement lanes).
  * - `sweep` — reconcile the journal against reality.
  * - `journal` — inspect the journal.
  */
@@ -64,7 +64,7 @@ interface ScoutOptions {
 
 async function scoutOneMap(
  config: RangerConfig,
- map: { repo: string; root: number; walk: WalkMode },
+ map: { repo: string; root: number; walk: WalkMode; nodes?: string[] },
  registry: ReturnType<typeof loadProbeRegistry>,
 ): Promise<MapReport> {
  const base: MapReport = {
@@ -98,7 +98,10 @@ async function scoutOneMap(
   ]);
 
   const classified = frontier.frontier.map((entry: FrontierEntry) =>
-   classify(entry, map.repo, map.walk, registry),
+   classify(entry, map.repo, map.walk, registry, {
+        botIdentity: config.bot.identity,
+        allowlist: map.nodes,
+      }),
   );
   const waiting = hitlWaiting(classified);
 
@@ -237,6 +240,55 @@ async function runSweep(configPath: string): Promise<string> {
  return JSON.stringify(results, null, 2);
 }
 
+/**
+ * Operator verb (design §5/§7): put a parked, failed or stuck node back in
+ * motion. The row returns to `claimed` and a detached run-node takes it as a
+ * new occupant; the implement lane re-derives its phase from GitHub (F2), so
+ * a resumed node picks up where its PR is. The tracker claim is untouched —
+ * a node whose claim was released must be re-claimed by the walk instead.
+ */
+async function runResumeNode(
+ nodeId: string,
+ repo: string | undefined,
+ configPath: string,
+): Promise<string> {
+ const { config, journal } = loadCtx(configPath);
+ try {
+  const map = pickMap(config, repo);
+  await writeContext(config, map); // the same identity gate as run-node
+  const row = journal.getWorker(nodeId);
+  if (row === null || row.repo !== map.repo) {
+   throw new Error(`no journal row for node ${nodeId} on ${map.repo} — nothing to resume`);
+  }
+  if (row.status === "released") {
+   throw new Error(`node ${nodeId}'s claim was released — the walk re-claims it from the frontier`);
+  }
+  journal.updateWorker(nodeId, { status: "claimed", pid: null, workerPgid: null, finishedAt: null });
+  const pid = await spawnRunNodeDetached({
+   nodeId,
+   repo: map.repo,
+   cliEntry: join(import.meta.dir, "cli.ts"),
+   configPath,
+  });
+  if (pid !== null) journal.updateWorker(nodeId, { pid });
+  journal.recordEvent("sweep", { nodeId, repo: map.repo, detail: `resume-node by operator (was ${row.status}); run-node pid ${pid ?? "none"}` });
+  return JSON.stringify({ nodeId, repo: map.repo, was: row.status, pid }, null, 2);
+ } finally {
+  journal.close();
+ }
+}
+
+/** Operator verb (design §7): clear the dead-man pause and its counter. */
+function runResumeRun(configPath: string): string {
+ const { journal } = loadCtx(configPath);
+ const was = { paused: journal.isPaused(), deadmanCount: journal.deadmanCount() };
+ journal.setPaused(false);
+ journal.resetDeadman();
+ journal.recordEvent("sweep", { detail: `resume-run by operator (was paused=${was.paused}, dead-man ${was.deadmanCount})` });
+ journal.close();
+ return JSON.stringify({ resumed: true, was }, null, 2);
+}
+
 async function runJournal(
  repo: string | undefined,
  configPath: string,
@@ -357,7 +409,7 @@ program
 program
  .command("walk")
  .description(
-  "Headless tick: claim decided research frontier nodes (announce-fail-closed, race-safe), spawn detached run-node workers, then sweep",
+  "Headless tick: claim decided research + implement frontier nodes (announce-fail-closed, race-safe), spawn detached run-node workers, then sweep (crash recovery + the merge desk)",
  )
  .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
  .action(async (options: { config: string }) => {
@@ -435,7 +487,7 @@ program
 program
  .command("run-node")
  .description(
-  "Detached worker supervisor: worktree, research worker, gated close, decisions --write",
+  "Detached worker supervisor: worktree, worker session, then the kind SOP — research (findings → gated close) or implement (tests → PR → sage → merge card → gated close after the principal's merge)",
  )
  .argument("<id>", "node id to execute")
  .option("-m, --map <repo>", "map repo (required with multiple maps)")
@@ -468,6 +520,35 @@ program
    );
    process.exit(1);
   }
+ });
+
+program
+ .command("resume-node")
+ .description(
+  "Operator verb: put a parked/failed node back in motion — the row returns to claimed and a detached run-node resumes it (the implement lane resumes from its PR)",
+ )
+ .argument("<id>", "node id to resume")
+ .option("-m, --map <repo>", "map repo (required with multiple maps)")
+ .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
+ .action(async (id: string, options: { map?: string; config: string }) => {
+  try {
+   const configPath = resolve(process.cwd(), options.config);
+   process.stdout.write((await runResumeNode(id, options.map, configPath)) + "\n");
+  } catch (error) {
+   process.stderr.write(
+    `ranger resume-node: ${error instanceof Error ? error.message : String(error)}\n`,
+   );
+   process.exit(1);
+  }
+ });
+
+program
+ .command("resume-run")
+ .description("Operator verb: clear the dead-man pause (claiming resumes on the next tick)")
+ .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
+ .action((options: { config: string }) => {
+  const configPath = resolve(process.cwd(), options.config);
+  process.stdout.write(runResumeRun(configPath) + "\n");
  });
 
 program

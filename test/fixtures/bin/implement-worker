@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Fake ranger implement worker for tests. Args: [mode] <prompt> — the prompt is
+# always the last argument (the supervisor appends it); an optional leading
+# mode arg selects the behaviour (the worker env is allow-listed, so a test
+# cannot steer it through the environment).
+# Build pass: writes src/feature.ts + tests/feature.test.ts and commits on the
+# checked-out branch. Fix pass (prompt carries "Fix pass"): amends the feature
+# and commits again. NO push — the worker never holds the write PAT.
+#
+# Modes: build (default); keyword — the commit message carries a closing
+# keyword; noop — commits nothing; dirty — commits but leaves an untracked file; sleep — starts a long-running grandchild
+# (for the process-group tests) then sleeps.
+set -euo pipefail
+
+if [ -n "${GIT_CONFIG_VALUE_0:-}" ] || [ -n "${GH_TOKEN:-}" ]; then
+  echo "worker env leaked a credential — refusing to run" >&2
+  exit 3
+fi
+
+mode="build"
+if [ $# -ge 2 ]; then mode="$1"; fi
+prompt="${!#}"
+cd "$(git rev-parse --show-toplevel)"
+
+if [ "$mode" = "noop" ]; then exit 0; fi
+if [ "$mode" = "dirty" ]; then
+  mkdir -p src tests
+  echo "export const feature = () => 1;" > src/feature.ts
+  echo "// never committed" > src/scratch.ts
+  git add src/feature.ts
+  git commit -q -m "feat: implement node #20 (scratch left behind)"
+  exit 0
+fi
+if [ "$mode" = "sleep" ]; then
+  sleep 300 &
+  sleep 300
+  exit 0
+fi
+
+mkdir -p src tests
+if printf '%s' "$prompt" | grep -q "Fix pass"; then
+  echo "export const feature = () => 2; // fixed per review" > src/feature.ts
+  git add -A
+  git commit -q -m "fix: address sage review blockers for node #20"
+  echo "fake worker fix pass done"
+  exit 0
+fi
+
+echo "export const feature = () => 1;" > src/feature.ts
+echo "import { feature } from '../src/feature.ts';" > tests/feature.test.ts
+git add -A
+msg="feat: implement node #20"
+if [ "$mode" = "keyword" ]; then msg="feat: implement the feature, closes #20"; fi
+git commit -q -m "$msg"
+echo "fake worker build pass done; prompt bytes: ${#prompt}"
