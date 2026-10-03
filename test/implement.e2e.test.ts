@@ -40,9 +40,13 @@ class FakeGitHub implements GitHubPort {
    state: "open" | "closed";
    merged: boolean;
    mergedSha: string | null;
+   mergedBy: string | null;
   }
  >();
  comments = new Map<number, IssueComment[]>();
+ /** Issue labels by node id (ranger:needs-eye). */
+ labels = new Map<number, string[]>();
+ merges: { n: number; sha: string; title: string }[] = [];
  checkRuns: CheckRun[] = [
   { id: 101, name: "build", status: "completed", conclusion: "success" },
  ];
@@ -65,6 +69,8 @@ class FakeGitHub implements GitHubPort {
    state: pr.state,
    merged: pr.merged,
    draft: pr.draft,
+   title: pr.title,
+   mergedBy: pr.mergedBy,
    headRef: pr.head,
    headSha: pr.mergedSha ?? (await this.sha(pr.head)),
    baseRef: pr.base,
@@ -88,7 +94,7 @@ class FakeGitHub implements GitHubPort {
   pr: { head: string; base: string; title: string; body: string },
  ) {
   const n = this.next++;
-  this.prs.set(n, { ...pr, draft: true, state: "open", merged: false, mergedSha: null });
+  this.prs.set(n, { ...pr, draft: true, state: "open", merged: false, mergedSha: null, mergedBy: null });
   return this.view(n);
  }
  async updatePrBody(_repo: string, n: number, body: string) {
@@ -112,8 +118,20 @@ class FakeGitHub implements GitHubPort {
   return this.comments.get(n) ?? [];
  }
 
- /** The principal's merge: fast-forward origin main to the PR head. */
- async merge(n: number): Promise<string> {
+ async issueLabels(_repo: string, n: number) {
+  return this.labels.get(n) ?? [];
+ }
+ /** Ranger's merge: like GitHub, refused when the head moved off `sha`. */
+ async mergePr(_repo: string, n: number, sha: string, title: string) {
+  const pr = this.prs.get(n);
+  if (pr === undefined) throw new Error(`no PR #${n}`);
+  if ((await this.sha(pr.head)) !== sha) throw new Error("409 head moved");
+  this.merges.push({ n, sha, title });
+  await this.merge(n, BOT);
+ }
+
+ /** A merge (the principal's by default): fast-forward origin main to the PR head. */
+ async merge(n: number, by = "jcfischer"): Promise<string> {
   const pr = this.prs.get(n);
   if (pr === undefined) throw new Error(`no PR #${n}`);
   const head = await this.sha(pr.head);
@@ -121,6 +139,7 @@ class FakeGitHub implements GitHubPort {
   pr.merged = true;
   pr.state = "closed";
   pr.mergedSha = head;
+  pr.mergedBy = by;
   return head;
  }
 }
@@ -174,6 +193,7 @@ async function rig(opts: {
  onReview?: (round: number) => void;
  /** commands.probe for the map (a fake-probe invocation). */
  probe?: string;
+ autoMerge?: boolean;
 }): Promise<Rig & { calls: number[] }> {
  const nodeId = opts.nodeId ?? "20";
  const dir = mkdtempSync(join(tmpdir(), "ranger-implement-"));
@@ -228,6 +248,7 @@ async function rig(opts: {
    "    commands:",
    "      test: test -f src/feature.ts",
    ...(opts.probe === undefined ? [] : [`      probe: '${opts.probe}'`]),
+   ...(opts.autoMerge === true ? ["    autoMerge: true"] : []),
   ],
   auth: ["  writeTokens:", '    "acme/*": RANGER_WRITE_TEST'],
   state: [`  canonicalRoot: ${dir}`],
@@ -675,5 +696,65 @@ describe("implement lane (node #23)", () => {
   expect(resumed.mergeDesk?.resumed).toEqual(["20"]);
   expect(spawned).toEqual(["20"]);
   expect(posts).toHaveLength(1);
+ }, 60_000);
+ test("autoMerge: a gate-passed PR with no needs-eye label is squash-merged by ranger at the gated head, then closed — the receipt names ranger and the standing grant", async () => {
+  const r = await rig({ autonomy: "propose", autoMerge: true });
+  cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  expect(r.github.prs.get(1)?.body).toContain("Ranger squash-merges this itself");
+  const posts: string[] = [];
+  const spawned: string[] = [];
+  const tick = await sweepMap({
+   config: r.ctx.config,
+   journal: r.journal,
+   map: r.ctx.map,
+   token: "ghp_write",
+   botIdentity: BOT,
+   github: r.github,
+   post: async (content) => {
+    posts.push(content);
+    return `msg-${posts.length}`;
+   },
+   respawn: async (nodeId) => {
+    spawned.push(nodeId);
+    return DEAD_PID;
+   },
+  });
+  expect(tick.mergeDesk?.merged).toEqual(["20"]);
+  expect(tick.mergeDesk?.cards).toEqual([]);
+  expect(spawned).toEqual(["20"]);
+  const head = r.github.prs.get(1)?.mergedSha;
+  expect(r.github.merges).toEqual([{ n: 1, sha: head as string, title: "Add the feature module (node #20)" }]);
+  expect(posts[0]).toContain("**merged** #20");
+
+  const closed = await runNode("20", r.ctx);
+  expect(closed.status).toBe("success");
+  const tested = state(r.statePath).lastClose.evidence.find((e: { kind: string }) => e.kind === "tested");
+  expect(tested.summary).toContain(`${BOT} merged PR #1 under the principal's standing grant`);
+ }, 60_000);
+
+ test("autoMerge: a node labelled ranger:needs-eye keeps the one-tap merge card", async () => {
+  const r = await rig({ autoMerge: true });
+  cleanup.push(r.dir);
+  r.github.labels.set(20, ["ranger:needs-eye"]);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  const posts: string[] = [];
+  const tick = await sweepMap({
+   config: r.ctx.config,
+   journal: r.journal,
+   map: r.ctx.map,
+   token: "ghp_write",
+   botIdentity: BOT,
+   github: r.github,
+   post: async (content) => {
+    posts.push(content);
+    return "msg-1";
+   },
+   respawn: async () => DEAD_PID,
+  });
+  expect(tick.mergeDesk?.merged).toEqual([]);
+  expect(tick.mergeDesk?.cards).toEqual(["20"]);
+  expect(r.github.merges).toEqual([]);
+  expect(posts[0]).toContain("your eye is the check");
  }, 60_000);
 });

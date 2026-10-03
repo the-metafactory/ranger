@@ -19,6 +19,7 @@ export interface PullRequest {
  state: "open" | "closed";
  merged: boolean;
  draft: boolean;
+ title: string;
  headRef: string;
  headSha: string;
  baseRef: string;
@@ -27,6 +28,8 @@ export interface PullRequest {
  /** clean | dirty | blocked | unstable | behind | draft | unknown | has_hooks */
  mergeableState: string;
  mergeCommitSha: string | null;
+ /** Who merged it (null while unmerged) — the receipt names the actual merger. */
+ mergedBy: string | null;
  url: string;
  author: string;
 }
@@ -77,11 +80,13 @@ function toPullRequest(raw: unknown): PullRequest {
  const head = (r.head ?? {}) as Record<string, unknown>;
  const base = (r.base ?? {}) as Record<string, unknown>;
  const user = (r.user ?? {}) as Record<string, unknown>;
+ const mergedBy = (r.merged_by ?? null) as Record<string, unknown> | null;
  return {
   number: Number(r.number),
   state: r.state === "closed" ? "closed" : "open",
   merged: r.merged === true || (typeof r.merged_at === "string" && r.merged_at.length > 0),
   draft: r.draft === true,
+  title: String(r.title ?? ""),
   headRef: String(head.ref ?? ""),
   headSha: String(head.sha ?? ""),
   baseRef: String(base.ref ?? ""),
@@ -89,6 +94,7 @@ function toPullRequest(raw: unknown): PullRequest {
   mergeableState: String(r.mergeable_state ?? "unknown"),
   mergeCommitSha:
    typeof r.merge_commit_sha === "string" ? r.merge_commit_sha : null,
+  mergedBy: mergedBy === null ? null : String(mergedBy.login ?? ""),
   url: String(r.html_url ?? ""),
   author: String(user.login ?? ""),
  };
@@ -192,6 +198,50 @@ export async function markReady(
    `id=${nodeId}`,
   ],
   `mark PR #${pr.number} ready`,
+ );
+}
+
+/**
+ * Squash-merge a PR, pinned to the head SHA the gate passed: GitHub refuses
+ * the merge if the head moved in between (409), so ranger never merges a
+ * commit its gate did not see.
+ */
+export async function mergePr(
+ repo: string,
+ number: number,
+ sha: string,
+ title: string,
+ token: string,
+): Promise<void> {
+ await ghApi(
+  token,
+  [
+   `repos/${repo}/pulls/${number}/merge`,
+   "--method",
+   "PUT",
+   "-f",
+   "merge_method=squash",
+   "-f",
+   `sha=${sha}`,
+   "-f",
+   `commit_title=${title} (#${number})`,
+  ],
+  `merge PR #${number}`,
+ );
+}
+
+export async function issueLabels(
+ repo: string,
+ number: number,
+ token: string,
+): Promise<string[]> {
+ const raw = await ghApi(
+  token,
+  [`repos/${repo}/issues/${number}/labels?per_page=100`],
+  `labels of #${number}`,
+ );
+ return (Array.isArray(raw) ? raw : []).map((l) =>
+  String((l as Record<string, unknown>).name ?? ""),
  );
 }
 

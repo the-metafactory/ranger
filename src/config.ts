@@ -91,6 +91,12 @@ const MapSchema = z.object({
   .array(z.union([z.number().int().positive(), z.string().regex(/^\d+$/)]))
   .transform((ids) => ids.map(String))
   .default([]),
+ /**
+  * Ranger squash-merges a gate-passed PR itself (principal, 2026-10-03),
+  * except for nodes labelled `ranger:needs-eye`, which keep the one-tap
+  * merge card. Off by default: the merge card is the default authority.
+  */
+ autoMerge: z.boolean().default(false),
  /** The branch PRs target and probes resolve `atRef` against. */
  base: z.string().min(1).default("main"),
 });

@@ -30,6 +30,9 @@ maps:
     # nodes: [550]
     # Optional skip list: never walk these ids (the map is otherwise walked in full).
     # skip: [559]
+    # Ranger squash-merges a gate-passed PR itself, except nodes labelled
+    # ranger:needs-eye (those keep the one-tap merge card). Default false.
+    # autoMerge: true
     # The branch PRs target and atRef probes resolve against (default main).
     # base: main
     # Per-run Discord escalation surface (node #7): one channel per run,

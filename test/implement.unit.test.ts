@@ -30,6 +30,8 @@ function pr(over: Partial<PullRequest> = {}): PullRequest {
   state: "open",
   merged: false,
   draft: false,
+  title: "t",
+  mergedBy: null,
   headRef: "node/20-x",
   headSha: SHA,
   baseRef: "main",

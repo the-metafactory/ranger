@@ -56,6 +56,8 @@ export interface GitHubPort {
  updatePrBody(repo: string, n: number, body: string, token: string): Promise<void>;
  markReady(repo: string, pr: PullRequest, token: string): Promise<void>;
  checkRunsFor(repo: string, sha: string, token: string): Promise<CheckRun[]>;
+ mergePr(repo: string, n: number, sha: string, title: string, token: string): Promise<void>;
+ issueLabels(repo: string, n: number, token: string): Promise<string[]>;
  postComment(repo: string, n: number, body: string, token: string): Promise<number>;
  listComments(repo: string, n: number, token: string): Promise<IssueComment[]>;
 }
@@ -151,6 +153,9 @@ export function recordedReviews(
  }
  return out.sort((a, b) => a.round - b.round);
 }
+
+/** A node that needs the principal's eye (or ear): its PR is merged by hand, never by ranger. */
+export const NEEDS_EYE_LABEL = "ranger:needs-eye";
 
 /** The findings that gate a PR: blockers and majors (principal, 2026-10-03). */
 export function gatingFindings(r: { blockers: number; majors: number }): number {
@@ -648,7 +653,7 @@ async function closeAfterMerge(
   // it is informational, and the merged PR is the externally checkable pointer.
   evidence.push({
    kind: "tested",
-   summary: `CI check run ${success.name} succeeded at ${pr.headSha.slice(0, 8)}; the principal merged PR #${pr.number} (merge = ratification, #23 ruling)`,
+   summary: `CI check run ${success.name} succeeded at ${pr.headSha.slice(0, 8)}; ${ratificationText(ctx, pr)}`,
    pointer: `https://github.com/${repo}/runs/${success.id}`,
   });
  }
@@ -783,8 +788,9 @@ function readyBody(
  rounds: number,
  probe?: RecordedProbe,
 ): string {
- const ratify =
-  ctx.ratify === "merge"
+ const ratify = ctx.map.autoMerge
+  ? `Ranger squash-merges this itself once the gate passes, unless the node is labelled \`${NEEDS_EYE_LABEL}\`; then the principal merges by hand.${ctx.ratify === "merge" ? " For this `propose` node the merge is the ratification." : ""} Ranger closes the node after the merge.`
+  : ctx.ratify === "merge"
    ? "This node is `propose`: **merging this PR is the ratification**. Ranger closes the node after the merge."
    : "Ranger closes the node after the merge, through its declared probes and this PR's CI run.";
  return [
@@ -810,18 +816,29 @@ function closeResolution(
  const deferred =
   final === undefined || final.majors + final.nits === 0
    ? "None."
-   : `${final.majors} major(s) and ${final.nits} nit(s) from the last sage round were not gating and are not filed back yet (the Scribe, design §6, is a follow-up); they are on the PR.`;
+   : `${final.blockers} blocker(s), ${final.majors} major(s) and ${final.nits} nit(s) from the last sage round are on the PR and not filed back yet (the Scribe, design §6, is a follow-up).`;
  return [
-  `Implemented by ranger's implement lane in PR #${pr.number} (${pr.url || `https://github.com/${ctx.map.repo}/pull/${pr.number}`}), merged by the principal${pr.mergeCommitSha === null ? "" : ` as ${pr.mergeCommitSha.slice(0, 8)}`}.`,
+  `Implemented by ranger's implement lane in PR #${pr.number} (${pr.url || `https://github.com/${ctx.map.repo}/pull/${pr.number}`}), merged by ${pr.mergedBy ?? "an unknown login"}${pr.mergeCommitSha === null ? "" : ` as ${pr.mergeCommitSha.slice(0, 8)}`}.`,
   "",
   `- Tests: \`${ctx.map.commands.test}\` passed before every push; CI check run "${ci.name}" (${ci.id}) succeeded on the PR head ${pr.headSha.slice(0, 8)}.`,
   final === undefined
    ? "- Sage: no recorded review round."
    : `- Sage: ${rounds} offline round(s); the last at ${final.sha.slice(0, 8)} found ${final.blockers} blockers, ${final.majors} majors, ${final.nits} nits (machine evidence).`,
   ...probeLine(ctx, probe),
-  `- Ratification: ${ctx.ratify === "merge" ? "the principal's merge of the PR (propose node, #23 ruling)." : "auto node; declared probes and CI."}`,
+  `- Ratification: ${ctx.ratify === "merge" ? `${ratificationText(ctx, pr)}.` : "auto node; declared probes and CI."}`,
   `- Unfixed review findings: ${deferred}`,
  ].join("\n");
+}
+
+/**
+ * Who ratified a propose node: the principal's own merge, or ranger's merge
+ * under the principal's standing grant (2026-10-03: ranger merges nodes that
+ * need no visual judgment; a `ranger:needs-eye` node is merged by hand).
+ */
+function ratificationText(ctx: ImplementContext, pr: PullRequest): string {
+ return pr.mergedBy !== null && pr.mergedBy === ctx.config.principal.login
+  ? `the principal merged PR #${pr.number} (merge = ratification, #23 ruling)`
+  : `${pr.mergedBy ?? "ranger"} merged PR #${pr.number} under the principal's standing grant (2026-10-03: ranger merges nodes that need no visual judgment)`;
 }
 
 function gistLine(title: string, pr: number): string {

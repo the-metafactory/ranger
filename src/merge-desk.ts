@@ -2,6 +2,7 @@ import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import { DiscordAnnouncer } from "./announce.ts";
 import {
  gatingFindings,
+ NEEDS_EYE_LABEL,
  realGitHub,
  recordedProbes,
  recordedReviews,
@@ -46,6 +47,8 @@ export interface MergeDeskContext {
 
 export interface MergeDeskResult {
  cards: string[];
+ /** PRs ranger squash-merged itself (autoMerge maps, no needs-eye label). */
+ merged: string[];
  resumed: string[];
  parked: string[];
  pending: string[];
@@ -64,7 +67,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
  const { journal, map, token, botIdentity } = ctx;
  const github = ctx.github ?? realGitHub;
  const repo = map.repo;
- const result: MergeDeskResult = { cards: [], resumed: [], parked: [], pending: [], errors: [] };
+ const result: MergeDeskResult = { cards: [], merged: [], resumed: [], parked: [], pending: [], errors: [] };
  const post =
   ctx.post ??
   ((content: string, label: string) => DiscordAnnouncer.fromMap(map).post(content, label));
@@ -227,6 +230,41 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   }
   if (row.mergeMessageId !== null) return; // card already up — announce once
 
+  // Auto-merge (principal, 2026-10-03): on a map that opts in, ranger
+  // squash-merges the gate-passed PR itself, pinned to the gated head, unless
+  // the node is labelled ranger:needs-eye. The close follows on this tick.
+  const needsEye = map.autoMerge
+   ? (await github.issueLabels(repo, Number(row.nodeId), token)).includes(NEEDS_EYE_LABEL)
+   : true;
+  if (!needsEye) {
+   await github.mergePr(repo, pr.number, gate.headSha, pr.title, token);
+   journal.recordEvent("merged", {
+    nodeId: row.nodeId,
+    repo,
+    detail: `PR #${pr.number} squash-merged by ranger at ${gate.headSha.slice(0, 8)} (no ${NEEDS_EYE_LABEL} label; standing grant 2026-10-03)`,
+   });
+   result.merged.push(row.nodeId);
+   try {
+    await post(
+     [
+      `:ranger: **merged** #${row.nodeId} — ${title}`,
+      `Gate passed at \`${gate.headSha.slice(0, 8)}\` (CI, mergeable, sage 0 blockers / 0 majors${probesRequired ? ", probes" : ""}); squash-merged by ranger. The node closes through the gate next.`,
+     ].join("\n"),
+     `merge notice for #${row.nodeId}`,
+    );
+   } catch {
+    /* the merged PR and the event are the record */
+   }
+   if (ctx.spawn !== undefined) {
+    const pid = await ctx.spawn(row.nodeId, repo);
+    if (pid !== null) {
+     journal.updateWorker(row.nodeId, { status: "running", phase: "close", pid });
+     result.resumed.push(row.nodeId);
+    }
+   }
+   return;
+  }
+
   const messageId = await post(
    [
     `:ranger: **merge needed** #${row.nodeId} — ${title}`,
@@ -235,7 +273,9 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
     ...(probesRequired
      ? [`Probes passed at \`${gate.headSha.slice(0, 8)}\` (selection ${probe?.mode ?? "?"}, ${probe?.selected ?? "?"} probe(s)). Only the selected probes ran, not the full suite.`]
      : ["No probe tier on this map: CI and the tests are the only automated checks."]),
-    "Merge it by hand (squash). For a `propose` node your merge is the ratification. Ranger closes the node after the merge; it never merges itself.",
+    map.autoMerge
+     ? `Labelled \`${NEEDS_EYE_LABEL}\`: your eye is the check. Merge it by hand (squash); ranger closes the node after the merge.`
+     : "Merge it by hand (squash). For a `propose` node your merge is the ratification. Ranger closes the node after the merge; it never merges itself.",
    ].join("\n"),
    `merge card for #${row.nodeId}`,
   );
