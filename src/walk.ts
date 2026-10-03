@@ -101,6 +101,31 @@ export function researchCandidates(
  );
 }
 
+/**
+ * Implement-lane candidates (design §3 class 8 + the #23 ruling): routed
+ * implement AND walkable. The lane is serial — review concurrency is 1 per
+ * machine (design §8) — so the caller claims at most one, and none while
+ * another implement worker is in its build/review phases.
+ */
+export function implementCandidates(
+ frontier: ClassifiedNode[],
+): ClassifiedNode[] {
+ return frontier.filter(
+  (n) => n.route.route === "implement" && n.route.walkable,
+ );
+}
+
+/** Is an implement worker building or under review anywhere? (awaiting-merge does not hold the lane.) */
+export function implementLaneBusy(journal: Journal): boolean {
+ return journal
+  .listWorkers()
+  .some(
+   (w) =>
+    w.lane === "implement" &&
+    (w.status === "claimed" || w.status === "running"),
+  );
+}
+
 export async function walk(ctx: WalkContext): Promise<WalkResult> {
  const { config, journal } = ctx;
  const registry = loadProbeRegistry();
@@ -174,7 +199,13 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
       allowlist: map.nodes,
      }),
     );
-    const candidates = researchCandidates(classified);
+    const research = researchCandidates(classified);
+    const implement = implementLaneBusy(journal)
+     ? []
+     : implementCandidates(classified).slice(0, 1);
+    const candidates = [...implement, ...research];
+    const laneOf = (id: string) =>
+     implement.some((n) => n.id === id) ? "implement" : "research";
 
     for (const node of candidates) {
      if (
@@ -227,22 +258,37 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
      }
      mapResult.claimed.push(node.id);
      journal.recordSpawn(ctx.now?.() ?? new Date());
-     // Spawn first so the claim row can carry the supervisor's PID — a row
-     // with no observed PID is left alone by the sweep, never flagged crashed.
+     // A fresh claim starts a clean row BEFORE the supervisor spawns: a node
+     // re-claimed after an earlier park must not inherit that attempt's
+     // phase, PR or review record (the implement lane re-derives them from
+     // GitHub anyway, F2), and the spawned run-node must find its row to take
+     // a generation. The PID is patched in after the spawn; a row with no
+     // observed PID is left alone by the sweep, never flagged crashed.
+     journal.upsertWorker({
+      nodeId: node.id,
+      repo: map.repo,
+      status: "claimed",
+      attempts: 0,
+      pid: null,
+      messageId,
+      lane: laneOf(node.id),
+      workerPgid: null,
+      phase: null,
+      prNumber: null,
+      reviewRound: 0,
+      verdictSha: null,
+      verdictBlockers: null,
+      mergeMessageId: null,
+      outcome: null,
+      finishedAt: null,
+     });
      const pid = await (ctx.spawnRunNode ?? spawnRunNodeDetached)({
       nodeId: node.id,
       repo: map.repo,
       cliEntry,
       configPath: ctx.configPath,
      });
-     journal.upsertWorker({
-      nodeId: node.id,
-      repo: map.repo,
-      status: "claimed",
-      attempts: 0,
-      pid,
-      messageId,
-     });
+     if (pid !== null) journal.updateWorker(node.id, { pid });
      journal.recordEvent("claimed", {
       nodeId: node.id,
       repo: map.repo,
@@ -269,7 +315,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
       repo,
       cliEntry,
       configPath: ctx.configPath,
-     }).then((pid) => pid !== null),
+     }),
    });
   } catch (error) {
    errors.push(

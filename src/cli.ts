@@ -50,7 +50,7 @@ import type { WalkMode } from "./config.ts";
  *
  * - `scout` (node #12) — read-only frontier/audit/HITL digest. Zero graph writes.
  * - `walk` (node #13) — the headless tick: claim + spawn + sweep. Graph writes.
- * - `run-node <id>` — the detached worker supervisor (research lane).
+ * - `run-node <id>` — the detached worker supervisor (research + implement lanes).
  * - `sweep` — reconcile the journal against reality.
  * - `journal` — inspect the journal.
  */
@@ -360,7 +360,7 @@ program
 program
  .command("walk")
  .description(
-  "Headless tick: claim decided research frontier nodes (announce-fail-closed, race-safe), spawn detached run-node workers, then sweep",
+  "Headless tick: claim decided research + implement frontier nodes (announce-fail-closed, race-safe), spawn detached run-node workers, then sweep (crash recovery + the merge desk)",
  )
  .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
  .action(async (options: { config: string }) => {
@@ -438,7 +438,7 @@ program
 program
  .command("run-node")
  .description(
-  "Detached worker supervisor: worktree, research worker, gated close, decisions --write",
+  "Detached worker supervisor: worktree, worker session, then the kind SOP — research (findings → gated close) or implement (tests → PR → sage → merge card → gated close after the principal's merge)",
  )
  .argument("<id>", "node id to execute")
  .option("-m, --map <repo>", "map repo (required with multiple maps)")

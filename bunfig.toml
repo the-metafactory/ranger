@@ -1,0 +1,4 @@
+[test]
+# Several e2e tests drive real git + subprocess fixtures and take longer than
+# bun's 5 s default on a loaded machine.
+timeout = 60000

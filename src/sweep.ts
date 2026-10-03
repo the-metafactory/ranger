@@ -1,6 +1,9 @@
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import type { Journal } from "./journal.ts";
+import { killProcessGroup, processGroupCommands } from "./exec.ts";
 import { graphRelease } from "./graph-write.ts";
+import type { GitHubPort } from "./implement.ts";
+import { runMergeDesk, type MergeDeskResult } from "./merge-desk.ts";
 
 /**
  * Sweep (design §7) — reconcile the journal against reality, crash = no-op.
@@ -19,10 +22,15 @@ export interface SweepContext {
  token: string;
  botIdentity: string;
  /**
-  * Called to respawn a crashed worker. Return false when the spawn cap is
-  * exhausted (the claim stays, and the next tick's sweep retries).
+  * Called to (re)spawn a detached run-node: a crashed worker's respawn, and
+  * the merge desk's resume-for-close. Returns the new supervisor's PID, or
+  * null when nothing spawned (spawn cap, no hook) — the claim stays and the
+  * next tick's sweep retries.
   */
- respawn?: (nodeId: string, repo: string) => Promise<boolean>;
+ respawn?: (nodeId: string, repo: string) => Promise<number | null>;
+ /** Merge-desk seams (tests): the forge and the Discord post. */
+ github?: GitHubPort;
+ post?: (content: string, label: string) => Promise<string>;
 }
 
 export interface SweepMapResult {
@@ -33,6 +41,8 @@ export interface SweepMapResult {
  released: string[];
  paused: boolean;
  deadmanCount: number;
+ orphansKilled: string[];
+ mergeDesk?: MergeDeskResult;
 }
 
 /** Is a PID alive on this host? `kill(pid, 0)` is a pure liveness probe. */
@@ -57,6 +67,7 @@ export async function sweepMap(ctx: SweepContext): Promise<SweepMapResult> {
   released: [],
   paused: journal.isPaused(),
   deadmanCount: journal.deadmanCount(),
+  orphansKilled: [],
  };
 
  const inFlight = journal.listWorkers(repo).filter(
@@ -76,16 +87,35 @@ export async function sweepMap(ctx: SweepContext): Promise<SweepMapResult> {
    detail: `crashed worker (pid ${worker.pid ?? "?"}) with no outcome — attempt ${worker.attempts}/${config.workers.maxAttempts}`,
   });
 
+  // The supervisor is dead, but its worker session may not be: a group the
+  // dead supervisor started is reparented and keeps running in the worktree.
+  // Kill it before a new occupant adopts the worktree (#23 F1) — but only
+  // when a live member still names this node's worktree, never on the
+  // journal's recorded group id alone (group ids are recycled).
+  if (worker.workerPgid !== null && worker.worktree !== null) {
+   const commands = await processGroupCommands(worker.workerPgid);
+   const ours = commands.some((c) => c.includes(worker.worktree as string));
+   if (ours && killProcessGroup(worker.workerPgid)) {
+    result.orphansKilled.push(worker.nodeId);
+    journal.recordEvent("orphan-killed", {
+     nodeId: worker.nodeId,
+     repo,
+     detail: `killed orphaned worker group ${worker.workerPgid} (${commands.length} process(es)) in ${worker.worktree}`,
+    });
+   }
+   journal.updateWorker(worker.nodeId, { workerPgid: null });
+  }
+
   if (worker.attempts < config.workers.maxAttempts) {
    const attempt = worker.attempts + 1;
-   journal.upsertWorker({
-    nodeId: worker.nodeId,
-    repo,
+   journal.updateWorker(worker.nodeId, {
     status: "claimed",
     attempts: attempt,
+    pid: null,
    });
-   const launched = ctx.respawn === undefined ? false : await ctx.respawn(worker.nodeId, repo);
-   if (launched) {
+   const pid = ctx.respawn === undefined ? null : await ctx.respawn(worker.nodeId, repo);
+   if (pid !== null) {
+    journal.updateWorker(worker.nodeId, { pid });
     result.respawned.push(worker.nodeId);
     journal.recordEvent("sweep", { nodeId: worker.nodeId, repo, detail: `respawned (attempt ${attempt})` });
    } else {
@@ -116,6 +146,20 @@ export async function sweepMap(ctx: SweepContext): Promise<SweepMapResult> {
     journal.recordEvent("released", { nodeId: worker.nodeId, repo, detail: "claim released after park" });
    }
   }
+ }
+
+ // Implement-lane rows waiting on the principal's merge (#23).
+ if (journal.listWorkers(repo).some((w) => w.status === "awaiting-merge")) {
+  result.mergeDesk = await runMergeDesk({
+   config,
+   journal,
+   map,
+   token,
+   botIdentity,
+   github: ctx.github,
+   post: ctx.post,
+   spawn: ctx.respawn,
+  });
  }
 
  return result;

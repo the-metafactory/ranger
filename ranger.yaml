@@ -34,10 +34,16 @@ maps:
   - repo: jcfischer/seelite
     root: 1
     walk: none
-    # Personal map, charting phase: 6 HITL decisions and one implement node the
-    # walker cannot take yet (task kind → implement lane, build-path step 4).
     # Registered for scout + the escalation desk; shares seekolous's private
     # grove channel rather than opening a second personal surface.
+    # Implement-lane acceptance (node #23): flip walk to full once ivy-agent
+    # has write access on jcfischer/seelite. The allowlist keeps the first
+    # live run to #550 (headless test, artifact-exists probe); #559 needs the
+    # principal's ear and a squash-safe probe first.
+    nodes: [550]
+    commands:
+      install: npm ci --no-audit --no-fund
+      test: npm test
     discord:
       tokenEnv: RANGER_DISCORD_TOKEN
       channelId: "1487052222067118111"
