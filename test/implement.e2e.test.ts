@@ -409,6 +409,10 @@ describe("implement lane (node #23)", () => {
   expect(outcome.status).toBe("failed");
   expect(outcome.detail).toContain("committed nothing");
   expect(r.journal.deadmanCount()).toBe(1);
+  // The session output is kept, and the failure names where (found live on #669).
+  const log = outcome.detail.match(/worker log: ([^)]+)\)/)?.[1];
+  expect(log).toBeDefined();
+  expect(readFileSync(log as string, "utf8")).toContain("build pass — exit 0");
  }, 60_000);
 
  test("propose node: merge is the ratification — the close carries tested evidence and no --ci", async () => {
