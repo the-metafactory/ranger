@@ -22,6 +22,14 @@ import { graphClose, graphDecisions, type CloseResult } from "./graph-write.ts";
 import type { ImplementPhase, Journal } from "./journal.ts";
 import { assembleImplementPrompt } from "./prompt.ts";
 import { sageReview, type ReviewVerdict } from "./review.ts";
+import {
+ cacheClaudeRateLimitEvents,
+ detectClaudeCap,
+ detectCodexCap,
+ selectForReview,
+ type CapSignal,
+ type SubstrateName,
+} from "./substrate.ts";
 import { workerEnv } from "./worker-env.ts";
 import { saveWorkerLog } from "./worker-log.ts";
 
@@ -68,6 +76,7 @@ export type Reviewer = (
  repo: string,
  prNumber: number,
  readOnlyToken: string,
+ opts?: { substrate?: string },
 ) => Promise<ReviewVerdict>;
 
 export type WorkerRun = (prompt: string, opts: RunOptions) => Promise<RunResult>;
@@ -93,6 +102,8 @@ export interface ImplementContext {
  reviewer?: Reviewer;
  /** How long to wait for GitHub to show a pushed head (default 2 min; tests shorten it). */
  headPollMs?: number;
+ /** The substrate the worker runs on (node #44). */
+ substrate?: SubstrateName;
 }
 
 export interface ImplementOutcome {
@@ -101,6 +112,8 @@ export interface ImplementOutcome {
  workerExit: number | null;
  close?: CloseResult;
  prNumber?: number;
+ /** When the failure was caused by a substrate rate limit (node #44). */
+ substrateCapped?: { substrate: SubstrateName; resetsAt: number | null };
 }
 
 /** A failure that parks the node for the principal instead of counting toward the dead-man. */
@@ -112,8 +125,9 @@ const INSTALL_TIMEOUT_MS = 15 * 60 * 1000;
 const TEST_TIMEOUT_MS = 20 * 60 * 1000;
 
 /** The review-round marker ranger writes into each review comment it posts. */
-export function reviewMarker(round: number, v: ReviewVerdict): string {
- return `<!-- ranger:review round=${round} sha=${v.commitId} blockers=${v.blockers} majors=${v.majors} nits=${v.nits} -->`;
+export function reviewMarker(round: number, v: ReviewVerdict, substrate?: SubstrateName): string {
+ const base = `<!-- ranger:review round=${round} sha=${v.commitId} blockers=${v.blockers} majors=${v.majors} nits=${v.nits}`;
+ return substrate !== undefined ? `${base} substrate=${substrate} -->` : `${base} -->`;
 }
 
 export interface RecordedReview {
@@ -122,11 +136,13 @@ export interface RecordedReview {
  blockers: number;
  majors: number;
  nits: number;
+ /** The substrate the review ran on (node #44); undefined for old markers. */
+ substrate?: string;
  /** The review text, without the marker — the fix pass's input on a resume. */
  body: string;
 }
 
-const MARKER = /<!-- ranger:review round=(\d+) sha=([0-9a-f]{7,64}) blockers=(\d+) majors=(\d+) nits=(\d+) -->/;
+const MARKER = /<!-- ranger:review round=(\d+) sha=([0-9a-f]{7,64}) blockers=(\d+) majors=(\d+) nits=(\d+)(?:\s+substrate=(\w+))? -->/;
 
 /**
  * The durable review record on the PR: markers in comments the MACHINE
@@ -148,6 +164,7 @@ export function recordedReviews(
    blockers: Number(m[3]),
    majors: Number(m[4]),
    nits: Number(m[5]),
+   substrate: m[6] ?? undefined,
    body: c.body.replace(MARKER, "").trim(),
   });
  }
@@ -409,7 +426,22 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
    }
    const round = reviews.length + 1;
    fence("review");
-   const verdict = await (ctx.reviewer ?? sageReview)(repo, open.number, ctx.readOnlyToken);
+   // Substrate selection for review (node #44): cross-model — the reviewer
+   // runs on a substrate other than the one that wrote the PR head.
+   const authorSubstrate: SubstrateName = ctx.substrate ?? "pi";
+   const reviewReadings = journal.listSubstrateReadings();
+   const reviewSubstrate = ctx.reviewer
+    ? undefined
+    : selectForReview(
+       { readings: reviewReadings, now: new Date(), config: config.substrates },
+       authorSubstrate,
+      );
+   const verdict = await (ctx.reviewer ?? sageReview)(
+    repo,
+    open.number,
+    ctx.readOnlyToken,
+    reviewSubstrate !== undefined ? { substrate: reviewSubstrate } : undefined,
+   );
    if (verdict.commitId !== live.headSha) {
     throw new ParkSignal(
      `sage reviewed ${verdict.commitId.slice(0, 8)} but PR #${open.number}'s head is ${live.headSha.slice(0, 8)} — the head moved during review`,
@@ -419,7 +451,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
    await github.postComment(
     repo,
     open.number,
-    reviewComment(round, verdict),
+    reviewComment(round, verdict, reviewSubstrate),
     token,
    );
    current = {
@@ -428,6 +460,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
     blockers: verdict.blockers,
     majors: verdict.majors,
     nits: verdict.nits,
+    substrate: reviewSubstrate,
     body: verdict.body,
    };
    reviews = [...reviews, current];
@@ -508,6 +541,8 @@ interface PassResult {
  snapshot: string;
  sha: string;
  failure?: ImplementOutcome;
+ /** Substrate cap detected in the worker result (node #44). */
+ cap?: CapSignal;
 }
 
 /** One worker session (build or fix), then the supervisor's own test + keyword checks. */
@@ -548,6 +583,12 @@ async function workerPass(
   onSpawn: (pgid) => journal.updateWorker(nodeId, { workerPgid: pgid }),
  });
  journal.updateWorker(nodeId, { workerPgid: null });
+
+ // Cache Claude rate limit events from the run (node #44).
+ if (ctx.substrate === "claude") {
+  cacheClaudeRateLimitEvents(result.stdout, journal);
+ }
+
  const log = saveWorkerLog(
   journal.path,
   map.repo,
@@ -559,13 +600,30 @@ async function workerPass(
  // Before ANY git call after the worker: a tampered config or hook would run
  // with whatever the next git call carries.
  assertGitUntouched(ctx.canonical, snapshot);
+
+ // Mid-session cap detection (node #44): detect from the substrate's own
+ // signal, not from a generic non-zero exit. When detected, the failure does
+ // not count toward attempts or the dead-man switch.
+ const cap: CapSignal | null =
+  ctx.substrate === "claude"
+   ? detectClaudeCap(result)
+   : ctx.substrate === "codex"
+    ? detectCodexCap(result)
+    : null;
+
  const fail = (detail: string): PassResult => ({
   workerExit: result.code,
   snapshot,
   sha: before,
-  failure: { status: "failed", detail: `${detail} (worker log: ${log})`, workerExit: result.code },
+  failure: { status: "failed", detail: `${detail} (worker log: ${log})`, workerExit: result.code,
+   ...(cap !== null ? { substrateCapped: { substrate: cap.substrate, resetsAt: cap.resetsAt } } : {}),
+  },
+  cap: cap ?? undefined,
  });
  if (result.code !== 0) {
+  if (cap !== null) {
+   return fail(`substrate ${cap.substrate} hit a rate limit`);
+  }
   return fail(`worker exited ${result.code}: ${tail(result)}`);
  }
  const sha = await headSha(worktree);
@@ -737,8 +795,8 @@ async function awaitHead(
 /** GitHub caps a comment at 65 536 characters; the marker always survives, first. */
 const COMMENT_BUDGET = 60_000;
 
-function reviewComment(round: number, verdict: ReviewVerdict): string {
- const head = `${reviewMarker(round, verdict)}\n**Sage review — round ${round}** (offline, machine evidence; not a human sign-off)\n\n`;
+function reviewComment(round: number, verdict: ReviewVerdict, substrate?: SubstrateName): string {
+ const head = `${reviewMarker(round, verdict, substrate)}\n**Sage review — round ${round}** (offline, machine evidence; not a human sign-off)\n\n`;
  const room = COMMENT_BUDGET - head.length;
  const body =
   verdict.body.length <= room

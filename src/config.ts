@@ -202,6 +202,24 @@ const WorkersSchema = z.object({
  * The GitHub budget (src/budget.ts). Ranger's read-only PATs draw on the
  * principal's own GraphQL allowance, so ranger yields well before it is spent.
  */
+const PiSubstrateSchema = z.object({
+ provider: z.string().min(1).default("spark"),
+ model: z.string().min(1).default("longctx-think"),
+});
+
+const SubstratesSchema = z.object({
+ /** 5-hour window: eligible when used% < this (default 70). */
+ fiveHourMaxUsedPct: z.number().min(0).max(100).default(70),
+ /** 7-day window: eligible when used% < this (default 80). */
+ sevenDayMaxUsedPct: z.number().min(0).max(100).default(80),
+ /** Claude probe reading max age, minutes (default 15). */
+ claudeProbeMaxAgeMin: z.number().int().positive().default(15),
+ /** Codex reading max age, minutes (default 5). */
+ codexReadMaxAgeMin: z.number().int().positive().default(5),
+ /** Pi substrate configuration. */
+ pi: PiSubstrateSchema.default({}),
+});
+
 const BudgetSchema = z.object({
  /** Defer graph reads while fewer GraphQL points than this remain this hour. */
  graphqlFloor: z.number().int().nonnegative().default(1000),
@@ -223,6 +241,7 @@ const RangerConfigSchema = z.object({
  state: StateSchema.default({}),
  workers: WorkersSchema.default({}),
  budget: BudgetSchema.default({}),
+ substrates: SubstratesSchema.default({}),
  serve: ServeSchema.optional(),
 });
 

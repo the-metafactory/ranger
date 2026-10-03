@@ -39,13 +39,15 @@ export async function sageReview(
  repo: string,
  prNumber: number,
  readOnlyToken: string,
- opts: { command?: string; timeoutMs?: number } = {},
+ opts: { command?: string; timeoutMs?: number; substrate?: string } = {},
 ): Promise<ReviewVerdict> {
  const gated = gatedEnv(readOnlyToken, {}, workerHostEnv());
  try {
+  const args = ["review", `${repo}#${prNumber}`, "--emit-verdict-block"];
+  if (opts.substrate !== undefined) args.push("--substrate", opts.substrate);
   const result = await runCmd(
    opts.command ?? process.env.RANGER_SAGE_CMD ?? "sage",
-   ["review", `${repo}#${prNumber}`, "--emit-verdict-block"],
+   args,
    {
     env: gated.env,
     timeoutMs: opts.timeoutMs ?? REVIEW_TIMEOUT_MS,

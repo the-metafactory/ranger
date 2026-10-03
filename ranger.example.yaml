@@ -102,6 +102,25 @@ budget:
   # sentinel (newest issue update + newest issue event) has not moved.
   frontierMaxAgeMin: 60
 
+# Substrate selection (node #44): route implement sessions, fix passes and sage
+# reviews across Claude, Codex and Pi by remaining 5h/7d quota. Strong substrates
+# (Claude, Codex) are eligible while every reported window is under its reserve;
+# once both are capped, Pi is the fallback. Cross-model review: the reviewer
+# runs on a substrate other than the one that wrote the PR head.
+substrates:
+  # 5-hour window: eligible when used% < this.
+  fiveHourMaxUsedPct: 70
+  # 7-day window: eligible when used% < this.
+  sevenDayMaxUsedPct: 80
+  # Claude probe reading max age, minutes. A stale reading triggers a haiku probe.
+  claudeProbeMaxAgeMin: 15
+  # Codex reading max age, minutes. A stale reading triggers an app-server read.
+  codexReadMaxAgeMin: 5
+  # Pi substrate configuration.
+  pi:
+    provider: spark
+    model: longctx-think
+
 # Provision the two read-only fine-grained PATs (node #8) and store them in the
 # macOS keychain (the durable store the ~/bin/ranger wrapper resolves):
 #   security add-generic-password -s ranger-ro-metafactory -a token -w <pat>

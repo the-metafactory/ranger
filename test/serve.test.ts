@@ -87,6 +87,7 @@ const worker = (over: Partial<WorkerRow>): WorkerRow => ({
  verdictSha: null,
  verdictBlockers: null,
  mergeMessageId: null,
+ substrate: null,
  ...over,
 });
 

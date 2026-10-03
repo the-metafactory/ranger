@@ -5,6 +5,7 @@ import {
  escalationDestinations,
  events,
  health,
+ substrateReadings,
  vetoes,
  workers,
 } from "./store/schema.ts";
@@ -50,6 +51,8 @@ export interface WorkerRow {
  verdictSha: string | null;
  verdictBlockers: number | null;
  mergeMessageId: string | null;
+ /** The substrate the worker ran on (claude | codex | pi). */
+ substrate: string | null;
 }
 
 /** Fields a supervisor may update in place on its own row. */
@@ -73,6 +76,16 @@ export interface EventRow {
  repo: string | null;
  kind: string;
  detail: string | null;
+}
+
+export interface SubstrateReading {
+ substrate: string;
+ readAt: string;
+ fiveHourUsedPct: number | null;
+ sevenDayUsedPct: number | null;
+ resetsAt: string | null;
+ capped: boolean;
+ cappedUntil: string | null;
 }
 
 export interface EscalationRow {
@@ -119,7 +132,8 @@ export type EventKind =
  | "awaiting-merge"
  | "merge-card"
  | "merged"
- | "orphan-killed";
+ | "orphan-killed"
+ | "substrate-capped";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -174,6 +188,7 @@ export class Journal {
     verdictSha: row.verdictSha ?? null,
     verdictBlockers: row.verdictBlockers ?? null,
     mergeMessageId: row.mergeMessageId ?? null,
+    substrate: row.substrate ?? null,
    })
    .onConflictDoUpdate({
     target: workers.nodeId,
@@ -195,6 +210,7 @@ export class Journal {
      verdictSha: row.verdictSha,
      verdictBlockers: row.verdictBlockers,
      mergeMessageId: row.mergeMessageId,
+     substrate: row.substrate,
     },
    })
    .run();
@@ -664,6 +680,56 @@ export class Journal {
   return rows.map(hydrateEscalation);
  }
 
+ // ---- substrate readings (node #44) ----
+
+ /** Upsert a substrate quota reading. */
+ upsertSubstrateReading(row: {
+  substrate: string;
+  readAt: string;
+  fiveHourUsedPct: number | null;
+  sevenDayUsedPct: number | null;
+  resetsAt: string | null;
+  capped: boolean;
+  cappedUntil: string | null;
+ }): void {
+  this.db
+   .insert(substrateReadings)
+   .values({
+    substrate: row.substrate,
+    readAt: row.readAt,
+    fiveHourUsedPct: row.fiveHourUsedPct,
+    sevenDayUsedPct: row.sevenDayUsedPct,
+    resetsAt: row.resetsAt,
+    capped: row.capped,
+    cappedUntil: row.cappedUntil,
+   })
+   .onConflictDoUpdate({
+    target: substrateReadings.substrate,
+    set: {
+     readAt: row.readAt,
+     fiveHourUsedPct: row.fiveHourUsedPct,
+     sevenDayUsedPct: row.sevenDayUsedPct,
+     resetsAt: row.resetsAt,
+     capped: row.capped,
+     cappedUntil: row.cappedUntil,
+    },
+   })
+   .run();
+ }
+
+ /** Get the latest reading for a substrate. */
+ getSubstrateReading(substrate: string): SubstrateReading | null {
+  const row = this.db.query.substrateReadings
+   .findFirst({ where: eq(substrateReadings.substrate, substrate) })
+   .sync();
+  return row === undefined ? null : hydrateSubstrateReading(row);
+ }
+
+ /** Get all substrate readings. */
+ listSubstrateReadings(): SubstrateReading[] {
+  return this.db.query.substrateReadings.findMany().sync().map(hydrateSubstrateReading);
+ }
+
  /** Prune spawn-ledger keys older than the retention window (keeps health tidy). */
  pruneSpawnLedger(now = new Date(), retentionDays = 30): void {
   const cutoff = dayKey(new Date(now.getTime() - retentionDays * DAY_MS));
@@ -709,6 +775,7 @@ function hydrateWorker(row: {
  verdictSha: string | null;
  verdictBlockers: number | null;
  mergeMessageId: string | null;
+ substrate: string | null;
 }): WorkerRow {
  return {
   nodeId: row.nodeId,
@@ -730,6 +797,7 @@ function hydrateWorker(row: {
   verdictSha: row.verdictSha,
   verdictBlockers: row.verdictBlockers,
   mergeMessageId: row.mergeMessageId,
+  substrate: row.substrate,
  };
 }
 
@@ -778,6 +846,26 @@ function hydrateEscalation(row: {
   lastEditedAt: row.lastEditedAt,
   status: row.status as "open" | "closed",
   notedAt: row.notedAt,
+ };
+}
+
+function hydrateSubstrateReading(row: {
+ substrate: string;
+ readAt: string;
+ fiveHourUsedPct: number | null;
+ sevenDayUsedPct: number | null;
+ resetsAt: string | null;
+ capped: number | boolean;
+ cappedUntil: string | null;
+}): SubstrateReading {
+ return {
+  substrate: row.substrate,
+  readAt: row.readAt,
+  fiveHourUsedPct: row.fiveHourUsedPct,
+  sevenDayUsedPct: row.sevenDayUsedPct,
+  resetsAt: row.resetsAt,
+  capped: row.capped === true || row.capped === 1,
+  cappedUntil: row.cappedUntil,
  };
 }
 

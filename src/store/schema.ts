@@ -33,6 +33,8 @@ export const workers = sqliteTable("workers", {
  messageId: text("message_id"),
  /** research | implement — the §3 lane the node was claimed into. */
  lane: text("lane"),
+ /** The substrate the worker session ran on (claude | codex | pi). */
+ substrate: text("substrate"),
  /**
   * Occupant generation (the OpenRig occupant-generation pattern, #23
   * amendment): bumped by every run-node start. A supervisor re-checks its
@@ -155,3 +157,24 @@ export const escalationDestinations = sqliteTable(
  },
  (table) => [primaryKey({ columns: [table.key, table.channelId] })],
 );
+
+/**
+ * Substrate quota readings (node #44): one row per substrate, upserted on
+ * every read. `ranger serve` and successive ticks share them through SQLite.
+ */
+export const substrateReadings = sqliteTable("substrate_readings", {
+ /** claude | codex | pi */
+ substrate: text("substrate").primaryKey(),
+ /** ISO timestamp of the reading. */
+ readAt: text("read_at").notNull(),
+ /** 5-hour window usage percent (0–100), null when the substrate doesn't report one. */
+ fiveHourUsedPct: integer("five_hour_used_pct"),
+ /** 7-day window usage percent (0–100), null when the substrate doesn't report one. */
+ sevenDayUsedPct: integer("seven_day_used_pct"),
+ /** ISO timestamp: the earliest resetsAt across reported windows. */
+ resetsAt: text("resets_at"),
+ /** True when the substrate is capped (rate limit hit). */
+ capped: integer("capped", { mode: "boolean" }).notNull().default(false),
+ /** ISO timestamp: capped until this time (from the substrate's own resetsAt). */
+ cappedUntil: text("capped_until"),
+});

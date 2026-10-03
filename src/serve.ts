@@ -40,6 +40,7 @@ import { cachedFrontier } from "./frontier-cache.ts";
 import { type FrontierEntry, graphFrontier, RateLimitError } from "./graph.ts";
 import { runCmd } from "./exec.ts";
 import { classify, type ClassifiedNode, loadProbeRegistry } from "./route.ts";
+import type { SubstrateReading } from "./journal.ts";
 import { assertReadOnlyToken, gatedEnv } from "./token-gate.ts";
 
 const ID_PATTERN = /^\d+$/;
@@ -143,6 +144,8 @@ export interface StateInputs {
  refreshing: boolean;
  refreshError: string | null;
  now: Date;
+ /** Latest substrate quota readings (node #44). */
+ substrateReadings?: SubstrateReading[];
 }
 
 export interface CurrentJob {
@@ -199,6 +202,16 @@ export interface DashboardMap {
  grillings: GrillingView[];
 }
 
+export interface SubstrateView {
+ substrate: string;
+ fiveHourUsedPct: number | null;
+ sevenDayUsedPct: number | null;
+ resetsAt: string | null;
+ readAt: string;
+ capped: boolean;
+ cappedUntil: string | null;
+}
+
 export interface DashboardState {
  generatedAt: string;
  refreshing: boolean;
@@ -211,6 +224,7 @@ export interface DashboardState {
  };
  current: CurrentJob[];
  maps: DashboardMap[];
+ substrates: SubstrateView[];
 }
 
 const IN_FLIGHT = new Set<WorkerRow["status"]>(["claimed", "running", "awaiting-merge"]);
@@ -382,6 +396,15 @@ export function assembleState(inputs: StateInputs): DashboardState {
   },
   current,
   maps,
+  substrates: (inputs.substrateReadings ?? []).map((r) => ({
+   substrate: r.substrate,
+   fiveHourUsedPct: r.fiveHourUsedPct,
+   sevenDayUsedPct: r.sevenDayUsedPct,
+   resetsAt: r.resetsAt,
+   readAt: r.readAt,
+   capped: r.capped,
+   cappedUntil: r.cappedUntil,
+  })),
  };
 }
 
@@ -611,6 +634,7 @@ button:disabled { opacity:.45; cursor:default; }
 <div id="msg"></div>
 <main>
 <section><h2>Current job</h2><div id="current"></div></section>
+<section><h2>Substrates</h2><div id="substrates"></div></section>
 <section><h2>Next in queue</h2><div id="next"></div></section>
 <section><h2>Autonomous — ranger can take these</h2><div id="auto"></div></section>
 <section><h2>Open grillings</h2><div id="grill"></div></section>
@@ -675,7 +699,19 @@ function renderGrill(s) {
   box.append(el("ul", {}, ...m.grillings.map((g) => el("li", {}, el("span", { class: "id", text: "#" + g.id }), el("span", { class: "t" }, link(g.url, g.title)), grillButton(m, g)))));
  }
 }
-function render(s) { renderMeta(s); renderCurrent(s); renderNext(s); renderAuto(s); renderGrill(s); }
+function renderSubstrates(s) {
+ const box = document.getElementById("substrates"); box.replaceChildren();
+ if (!s.substrates || s.substrates.length === 0) { box.append(empty("No substrate readings yet.")); return; }
+ box.append(el("ul", {}, ...s.substrates.map((sub) => {
+  const parts = [sub.substrate.toUpperCase()];
+  if (sub.fiveHourUsedPct !== null) parts.push("5h: " + sub.fiveHourUsedPct + "%");
+  if (sub.sevenDayUsedPct !== null) parts.push("7d: " + sub.sevenDayUsedPct + "%");
+  parts.push("read " + ago(sub.readAt));
+  if (sub.capped) parts.push("CAPPED until " + (sub.cappedUntil ? new Date(sub.cappedUntil).toLocaleTimeString() : "?"));
+  return el("li", {}, el("span", { class: "t", text: parts.join(" · ") }), el("span", { class: sub.capped ? "tag stale" : "tag", text: sub.capped ? "capped" : "ok" }));
+ })));
+}
+function render(s) { renderMeta(s); renderCurrent(s); renderSubstrates(s); renderNext(s); renderAuto(s); renderGrill(s); }
 async function load() { try { const r = await fetch("/api/state", { cache: "no-store" }); render(await r.json()); } catch (e) { say("Could not read state: " + e.message, true); } }
 document.getElementById("refresh").onclick = async () => { try { await post("/api/refresh"); say("Refreshing the frontier…"); setTimeout(load, 1500); } catch (e) { say(e.message, true); } };
 load(); setInterval(load, 15000);
@@ -912,6 +948,7 @@ export function stateFromJournal(
    refreshing: reader.refreshing,
    refreshError: reader.lastError,
    now,
+   substrateReadings: journal?.listSubstrateReadings() ?? [],
   });
   reader.want(
    state.current.filter((j) => j.title === null).map((j) => `${j.repo}#${j.nodeId}`),
