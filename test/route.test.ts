@@ -114,7 +114,7 @@ describe("classify — design §3 routing table", () => {
       "full",
       EMPTY_REGISTRY,
     );
-    expect(node.route).toEqual({ route: "implement", walkable: true });
+    expect(node.route).toEqual({ route: "implement", walkable: true, ratify: "auto" });
   });
 
   test("auto + build on walk:none → implement lane, not walkable", () => {
@@ -124,7 +124,7 @@ describe("classify — design §3 routing table", () => {
       "none",
       EMPTY_REGISTRY,
     );
-    expect(node.route).toEqual({ route: "implement", walkable: false });
+    expect(node.route).toEqual({ route: "implement", walkable: false, ratify: "auto" });
   });
 
   test("auto + undeclared command probe → provisioning (class 5)", () => {
@@ -165,7 +165,7 @@ describe("classify — design §3 routing table", () => {
       "full",
       registry,
     );
-    expect(node.route).toEqual({ route: "implement", walkable: true });
+    expect(node.route).toEqual({ route: "implement", walkable: true, ratify: "auto" });
     expect(node.registryBlocked).toBe(false);
   });
 

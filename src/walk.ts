@@ -169,7 +169,10 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
     );
     const frontierEntries = fetched.frontier;
     const classified = frontierEntries.map((entry) =>
-     classify(entry, map.repo, map.walk, registry),
+     classify(entry, map.repo, map.walk, registry, {
+      botIdentity,
+      allowlist: map.nodes,
+     }),
     );
     const candidates = researchCandidates(classified);
 

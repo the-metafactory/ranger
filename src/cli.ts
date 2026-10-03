@@ -64,7 +64,7 @@ interface ScoutOptions {
 
 async function scoutOneMap(
  config: RangerConfig,
- map: { repo: string; root: number; walk: WalkMode },
+ map: { repo: string; root: number; walk: WalkMode; nodes?: string[] },
  registry: ReturnType<typeof loadProbeRegistry>,
 ): Promise<MapReport> {
  const base: MapReport = {
@@ -98,7 +98,10 @@ async function scoutOneMap(
   ]);
 
   const classified = frontier.frontier.map((entry: FrontierEntry) =>
-   classify(entry, map.repo, map.walk, registry),
+   classify(entry, map.repo, map.walk, registry, {
+        botIdentity: config.bot.identity,
+        allowlist: map.nodes,
+      }),
   );
   const waiting = hitlWaiting(classified);
 

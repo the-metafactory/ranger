@@ -49,6 +49,31 @@ const MapSchema = z.object({
   * `<state.canonicalRoot>/<repo>`.
   */
  canonical: z.string().optional(),
+ /**
+  * Implement-lane commands (design §4, #23). The supervisor runs them in the
+  * worktree under the worker's env (no machine credential): they execute
+  * worker-written code. `test` is required before a `walk: full` map's
+  * implement node can be claimed.
+  */
+ commands: z
+  .object({
+   /** Dependency install, run once per worktree before the worker (e.g. `bun install`). */
+   install: z.string().min(1).optional(),
+   /** The repo's test command; must exit 0 before ranger pushes (e.g. `bun test tests/`). */
+   test: z.string().min(1).optional(),
+  })
+  .default({}),
+ /**
+  * Optional node allowlist: when set, the walker claims only these node ids
+  * on this map. A first live run uses it to walk one acceptance node without
+  * the rest of the `auto` frontier coming along.
+  */
+ nodes: z
+  .array(z.union([z.number().int().positive(), z.string().regex(/^\d+$/)]))
+  .transform((ids) => ids.map(String))
+  .optional(),
+ /** The branch PRs target and probes resolve `atRef` against. */
+ base: z.string().min(1).default("main"),
 });
 
 const AuthSchema = z.object({
@@ -104,6 +129,12 @@ const WorkersSchema = z.object({
  maxAttempts: z.number().int().positive().default(2),
  /** Consecutive worker failures that trip the dead-man switch (design §7). */
  deadmanThreshold: z.number().int().positive().default(3),
+ /**
+  * Sage reviews per implement-lane PR before ranger parks and escalates
+  * (design §4: "cap 2 round-trips then park + escalate" — a third round
+  * signals a decision is needed, not another patch).
+  */
+ reviewRounds: z.number().int().positive().default(2),
 });
 
 const RangerConfigSchema = z.object({

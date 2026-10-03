@@ -1,0 +1,91 @@
+import type { RangerConfig } from "./config.ts";
+
+/**
+ * The environments for code ranger runs but does not trust: the headless
+ * worker session, and (implement lane, #23) the install/test commands and the
+ * sage review that execute or read worker-written code.
+ */
+
+/** The minimal host env a headless worker needs to run claude/git/soma:
+ *  PATH/HOME/locale, git-identity + config passthrough, and LLM-credential +
+ *  soma/pi variables. Deliberately EXCLUDES the RANGER_* secrets (the Discord
+ *  bot token, write tokens, keychain vars) and anything unknown: a graph-
+ *  authored prompt injection in the worker must not be able to read the bot
+ *  token (round-32 security blocker). Git auth (GIT_CONFIG_VALUE_0) is
+ *  injected by gitAuthEnv AFTER this spread, so it overrides any passthrough.
+ */
+export function workerHostEnv(
+ source: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+ const allowedNames = new Set([
+  "PATH",
+  "HOME",
+  "USER",
+  "LOGNAME",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "LC_MESSAGES",
+  "LC_TIME",
+  "TERM",
+  "TZ",
+  "SHELL",
+  "PWD",
+  "TMPDIR",
+  "XDG_CONFIG_HOME",
+  "XDG_CACHE_HOME",
+  "XDG_STATE_HOME",
+  "SSH_AUTH_SOCK",
+  "GIT_ASKPASS",
+  "GIT_TERMINAL_PROMPT",
+ ]);
+ const allowedPrefixes = [
+  "ANTHROPIC_",
+  "CLAUDE_",
+  "CLAUDECODE_",
+  "CODEX_",
+  "OPENAI_",
+  "AZURE_",
+  "BEDROCK_",
+  "VERTEX_",
+  "GEMINI_",
+  "GOOGLE_",
+  "OPENROUTER_",
+  "LITELLM_",
+  "SOMA_",
+  "SAGE_",
+  "PILOT_",
+  "GIT_", // git identity + config passthrough (auth header is overridden below)
+ ];
+ const env: NodeJS.ProcessEnv = {};
+ for (const [key, value] of Object.entries(source)) {
+  if (value === undefined) continue;
+  if (
+   allowedNames.has(key) ||
+   allowedPrefixes.some((prefix) => key.startsWith(prefix))
+  ) {
+   env[key] = value;
+  }
+ }
+ // A GitHub token in the host env must never reach untrusted code, whatever
+ // prefix rule it slipped through.
+ delete env.GH_TOKEN;
+ delete env.GITHUB_TOKEN;
+ return env;
+}
+
+/** Worker env: repo context + an ALLOW-LISTED host env — and CRUCIALLY NO
+ *  write PAT (round-38 security blocker): the worker COMMITS locally but the
+ *  SUPERVISOR performs the vetted push, so a malicious node can never have
+ *  the worker read/decode a machine credential from its env. */
+export function workerEnv(
+ config: RangerConfig,
+ repo: string,
+): NodeJS.ProcessEnv {
+ return {
+  ...workerHostEnv(),
+  SOMA_GRAPH_REPO: repo,
+  SAGE_STACK: "default",
+  PILOT_PRINCIPAL: config.principal.login,
+ };
+}

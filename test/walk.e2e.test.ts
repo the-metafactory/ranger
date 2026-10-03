@@ -374,7 +374,9 @@ describe("ranger run-node — research worker full loop (node #13 acceptance)", 
 
    const journal = new Journal(join(dir, "state.sqlite"));
    expect(journal.deadmanCount()).toBe(1);
-   expect(journal.getWorker("10")?.status).toBe("running"); // claim survives; no close attempted
+   // The claim survives on the tracker; the row is terminal, not a "running"
+   // row with no PID that sweep can never see (#23 F1).
+   expect(journal.getWorker("10")?.status).toBe("failed");
    journal.close();
   } finally {
    rmSync(dir, { recursive: true, force: true });

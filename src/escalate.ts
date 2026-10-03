@@ -103,7 +103,10 @@ async function escalateOneMap(
     });
 
     const classified = frontier.frontier.map((entry) =>
-      classify(entry, map.repo, map.walk, registry),
+      classify(entry, map.repo, map.walk, registry, {
+        botIdentity: config.bot.identity,
+        allowlist: map.nodes,
+      }),
     );
     const needed = [
       ...hitlWaiting(classified),

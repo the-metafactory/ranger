@@ -31,6 +31,29 @@ export const workers = sqliteTable("workers", {
  outcome: text("outcome"),
  /** Discord message id of the confirmed claim-announce. */
  messageId: text("message_id"),
+ /** research | implement — the §3 lane the node was claimed into. */
+ lane: text("lane"),
+ /**
+  * Occupant generation (the OpenRig occupant-generation pattern, #23
+  * amendment): bumped by every run-node start. A supervisor re-checks its
+  * generation before each outward action, so a superseded occupant can
+  * never push, open a PR, review or close after it was replaced.
+  */
+ generation: integer("generation").notNull().default(0),
+ /** Process group of the headless worker session — sweep kills a dead
+  *  supervisor's orphaned group before respawning (F1). */
+ workerPgid: integer("worker_pgid"),
+ /** Implement-lane phase: implement | review | awaiting-merge | close. */
+ phase: text("phase"),
+ /** The implement lane's PR number (the F2 resume anchor on GitHub). */
+ prNumber: integer("pr_number"),
+ /** Sage review rounds run on the PR (the 2-round cap, design §4). */
+ reviewRound: integer("review_round").notNull().default(0),
+ /** Head SHA of ranger's last recorded sage verdict, and its blocker count. */
+ verdictSha: text("verdict_sha"),
+ verdictBlockers: integer("verdict_blockers"),
+ /** Discord message id of the merge-request card (posted once, idempotent). */
+ mergeMessageId: text("merge_message_id"),
 });
 
 export const events = sqliteTable("events", {

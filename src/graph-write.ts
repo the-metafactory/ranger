@@ -116,6 +116,10 @@ export interface CloseOptions {
  gist?: string;
  checkpointId?: string;
  dryRun?: boolean;
+ /** `<checkRunId>@<headSha>` — soma requires a successful CI run to close an auto node. */
+ ci?: string;
+ /** Informational evidence entries (soma derives the gating kinds itself). */
+ evidence?: { kind: string; summary: string; pointer: string }[];
 }
 
 /**
@@ -141,6 +145,10 @@ export async function graphClose(
  ];
  if (options.gist !== undefined) args.push("--gist", options.gist);
  if (options.checkpointId !== undefined) args.push("--checkpoint", options.checkpointId);
+ if (options.ci !== undefined) args.push("--ci", options.ci);
+ for (const entry of options.evidence ?? []) {
+  args.push("--evidence", JSON.stringify(entry));
+ }
  if (options.dryRun === true) args.push("--dry-run");
  const result = await callWrite(args, token, opts);
  const detail = (result.stdout || result.stderr).trim();

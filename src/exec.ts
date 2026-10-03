@@ -11,6 +11,15 @@ export interface RunOptions {
   env?: NodeJS.ProcessEnv;
   cwd?: string;
   timeoutMs?: number;
+  /**
+   * Run the child as the leader of its own process group, and on timeout kill
+   * the whole group, not just the child (#23 amendment F1). A headless worker
+   * starts grandchildren (test runners, git, reviewers); killing only the
+   * direct child leaves them running in the worktree.
+   */
+  processGroup?: boolean;
+  /** Called with the child's PID once it has spawned (the group id when `processGroup`). */
+  onSpawn?: (pid: number) => void;
 }
 
 /**
@@ -28,7 +37,9 @@ export function runCmd(
       env: opts.env ?? process.env,
       cwd: opts.cwd,
       stdio: ["ignore", "pipe", "pipe"],
+      detached: opts.processGroup === true,
     });
+    if (child.pid !== undefined) opts.onSpawn?.(child.pid);
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (chunk) => {
@@ -41,7 +52,11 @@ export function runCmd(
       opts.timeoutMs === undefined
         ? undefined
         : setTimeout(() => {
-            child.kill("SIGKILL");
+            if (opts.processGroup === true && child.pid !== undefined) {
+              killProcessGroup(child.pid);
+            } else {
+              child.kill("SIGKILL");
+            }
           }, opts.timeoutMs);
     child.on("error", (error) => {
       if (timer) clearTimeout(timer);
@@ -52,4 +67,34 @@ export function runCmd(
       resolvePromise({ code: code ?? -1, stdout, stderr });
     });
   });
+}
+
+/** SIGKILL a whole process group. Returns false when the group is already gone. */
+export function killProcessGroup(pgid: number): boolean {
+  if (pgid <= 1) return false;
+  try {
+    process.kill(-pgid, "SIGKILL");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The command lines of every live process in a group. Sweep uses this to
+ * confirm a recorded group is still ranger's worker before killing it: a
+ * recycled group id must never be killed on the journal's word alone.
+ */
+export async function processGroupCommands(pgid: number): Promise<string[]> {
+  if (pgid <= 1) return [];
+  const result = await runCmd("ps", ["-A", "-ww", "-o", "pgid=,command="], {
+    timeoutMs: 10_000,
+  });
+  if (result.code !== 0) return [];
+  const commands: string[] = [];
+  for (const line of result.stdout.split("\n")) {
+    const match = line.match(/^\s*(\d+)\s+(.*)$/);
+    if (match !== null && Number(match[1]) === pgid) commands.push(match[2]);
+  }
+  return commands;
 }

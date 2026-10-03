@@ -19,7 +19,16 @@ export type EscalateReason =
 export type RouteClass =
   | { route: "escalate-hitl"; reason: EscalateReason }
   | { route: "research"; walkable: boolean }
-  | { route: "implement"; walkable: boolean }
+  | {
+      route: "implement";
+      walkable: boolean;
+      /**
+       * How the close is ratified: `auto` closes on probes + CI; `merge`
+       * is a `propose` task/build node whose ratification is the
+       * principal's merge of the PR (#23 ruling, 2026-10-03).
+       */
+      ratify: "auto" | "merge";
+    }
   | { route: "provisioning" };
 
 export interface ClassifiedNode {
@@ -37,6 +46,14 @@ export interface ClassifiedNode {
   blockedProbes?: BlockedProbe[];
   /** The node question/prose body — rendered on grilling cards (design §5). */
   body?: string;
+}
+
+/** Per-map walk scope beyond the walk mode (#23). */
+export interface ClassifyOptions {
+  /** The machine account. Nodes it authored never take the propose→merge route (node #9 ban). */
+  botIdentity?: string;
+  /** `ranger.yaml` map.nodes: when set, only these ids are walkable. */
+  allowlist?: string[];
 }
 
 export interface ClassifyContext {
@@ -154,6 +171,7 @@ export function classify(
   repo: string,
   walkMode: WalkMode,
   registry: ProbeRegistry,
+  opts: ClassifyOptions = {},
 ): ClassifiedNode {
   const { autonomy, kind } = node.node;
   const { typed } = node;
@@ -173,6 +191,27 @@ export function classify(
   // Class 4 — untyped block (fail-safe approve). Reported as needs-typing.
   if (!typed) {
     return { ...base, route: { route: "escalate-hitl", reason: "untyped" } };
+  }
+  const allowed =
+    opts.allowlist === undefined || opts.allowlist.includes(id);
+  // Class 2a (#23 ruling) — a `propose` task/build node on a `walk: full`
+  // map is walked like an auto one up to the merge; the principal's merge is
+  // the ratification. Never for nodes ranger itself filed (node #9: ranger
+  // never walks work it minted), never when the bot identity is unknown,
+  // and never off the allowlist — an unwalked node keeps its HITL card.
+  if (
+    autonomy === "propose" &&
+    IMPLEMENT_KINDS.has(kind) &&
+    walkMode === "full" &&
+    allowed &&
+    opts.botIdentity !== undefined &&
+    node.author !== opts.botIdentity &&
+    blockedProbeSpecs(node.node, repo, registry).length === 0
+  ) {
+    return {
+      ...base,
+      route: { route: "implement", walkable: true, ratify: "merge" },
+    };
   }
   // Class 2 — HITL autonomy, any kind.
   if (autonomy === "propose" || autonomy === "approve") {
@@ -207,14 +246,19 @@ export function classify(
       ...base,
       route: {
         route: "research",
-        walkable: walkMode === "full" || walkMode === "research-only",
+        walkable:
+          allowed && (walkMode === "full" || walkMode === "research-only"),
       },
     };
   }
   if (IMPLEMENT_KINDS.has(kind)) {
     return {
       ...base,
-      route: { route: "implement", walkable: walkMode === "full" },
+      route: {
+        route: "implement",
+        walkable: allowed && walkMode === "full",
+        ratify: "auto",
+      },
     };
   }
   // Unknown kind — conservative hygiene escalate.

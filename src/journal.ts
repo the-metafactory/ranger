@@ -23,7 +23,12 @@ export type WorkerStatus =
  | "success"
  | "failed"
  | "parked"
- | "released";
+ | "released"
+ /** Implement lane: PR ready, waiting on the principal's one-tap merge. */
+ | "awaiting-merge";
+
+/** Implement-lane phases (F2, #23 amendment) — GitHub wins on resume. */
+export type ImplementPhase = "implement" | "review" | "awaiting-merge" | "close";
 
 export interface WorkerRow {
  nodeId: string;
@@ -36,6 +41,29 @@ export interface WorkerRow {
  finishedAt: string | null;
  outcome: string | null;
  messageId: string | null;
+ lane: string | null;
+ generation: number;
+ workerPgid: number | null;
+ phase: ImplementPhase | null;
+ prNumber: number | null;
+ reviewRound: number;
+ verdictSha: string | null;
+ verdictBlockers: number | null;
+ mergeMessageId: string | null;
+}
+
+/** Fields a supervisor may update in place on its own row. */
+export type WorkerPatch = Partial<
+ Omit<WorkerRow, "nodeId" | "repo" | "generation">
+>;
+
+/**
+ * Thrown when a supervisor's generation is no longer the row's — a newer
+ * run-node took the node over, so this occupant must stop before any outward
+ * action (the OpenRig occupant-generation pattern, #23 amendment F1).
+ */
+export class FencedError extends Error {
+ override readonly name = "FencedError";
 }
 
 export interface EventRow {
@@ -83,7 +111,14 @@ export type EventKind =
  | "parked"
  | "released"
  | "sweep"
- | "deadman-paused";
+ | "deadman-paused"
+ | "fenced"
+ | "pushed"
+ | "pr-opened"
+ | "reviewed"
+ | "awaiting-merge"
+ | "merge-card"
+ | "orphan-killed";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -118,6 +153,14 @@ export class Journal {
     finishedAt: row.finishedAt ?? null,
     outcome: row.outcome ?? null,
     messageId: row.messageId ?? null,
+    lane: row.lane ?? null,
+    workerPgid: row.workerPgid ?? null,
+    phase: row.phase ?? null,
+    prNumber: row.prNumber ?? null,
+    reviewRound: row.reviewRound ?? 0,
+    verdictSha: row.verdictSha ?? null,
+    verdictBlockers: row.verdictBlockers ?? null,
+    mergeMessageId: row.mergeMessageId ?? null,
    })
    .onConflictDoUpdate({
     target: workers.nodeId,
@@ -131,9 +174,64 @@ export class Journal {
      finishedAt: row.finishedAt,
      outcome: row.outcome,
      messageId: row.messageId,
+     lane: row.lane,
+     workerPgid: row.workerPgid,
+     phase: row.phase,
+     prNumber: row.prNumber,
+     reviewRound: row.reviewRound,
+     verdictSha: row.verdictSha,
+     verdictBlockers: row.verdictBlockers,
+     mergeMessageId: row.mergeMessageId,
     },
    })
    .run();
+ }
+
+ /**
+  * Patch fields on an existing row. Unlike upsertWorker this never inserts and
+  * never touches a field the patch omits, so a phase update cannot null a PID
+  * or a message id by accident (the worker.ts pid:null bug, #23 F1).
+  */
+ updateWorker(nodeId: string, patch: WorkerPatch): void {
+  const set = Object.fromEntries(
+   Object.entries(patch).filter(([, v]) => v !== undefined),
+  );
+  if (Object.keys(set).length === 0) return;
+  this.db.update(workers).set(set).where(eq(workers.nodeId, nodeId)).run();
+ }
+
+ /**
+  * Take the node as a new occupant: bump and return its generation. Every
+  * run-node start calls this once; the row must exist (the claim made it).
+  */
+ beginGeneration(nodeId: string): number {
+  const rows = this.db
+   .update(workers)
+   .set({ generation: sql`${workers.generation} + 1` })
+   .where(eq(workers.nodeId, nodeId))
+   .returning({ generation: workers.generation })
+   .all();
+  if (rows.length === 0) {
+   throw new FencedError(
+    `node ${nodeId} has no worker row — run-node needs the claim's row to take a generation`,
+   );
+  }
+  return rows[0].generation;
+ }
+
+ /**
+  * The fence: throw unless `generation` is still the row's. Called before
+  * every outward action (push, PR, review, ready, close, decisions). The
+  * journal is a single-host SQLite file, so this is sound for supervisors on
+  * this host; the window between check and action is milliseconds.
+  */
+ assertGeneration(nodeId: string, generation: number, action: string): void {
+  const row = this.getWorker(nodeId);
+  if (row === null || row.generation !== generation) {
+   throw new FencedError(
+    `node ${nodeId}: generation ${generation} superseded by ${row?.generation ?? "a removed row"} — refusing to ${action}`,
+   );
+  }
  }
 
  getWorker(nodeId: string): WorkerRow | null {
@@ -564,6 +662,15 @@ function hydrateWorker(row: {
  finishedAt: string | null;
  outcome: string | null;
  messageId: string | null;
+ lane: string | null;
+ generation: number;
+ workerPgid: number | null;
+ phase: string | null;
+ prNumber: number | null;
+ reviewRound: number;
+ verdictSha: string | null;
+ verdictBlockers: number | null;
+ mergeMessageId: string | null;
 }): WorkerRow {
  return {
   nodeId: row.nodeId,
@@ -576,6 +683,15 @@ function hydrateWorker(row: {
   finishedAt: row.finishedAt,
   outcome: row.outcome,
   messageId: row.messageId,
+  lane: row.lane,
+  generation: row.generation,
+  workerPgid: row.workerPgid,
+  phase: row.phase as ImplementPhase | null,
+  prNumber: row.prNumber,
+  reviewRound: row.reviewRound,
+  verdictSha: row.verdictSha,
+  verdictBlockers: row.verdictBlockers,
+  mergeMessageId: row.mergeMessageId,
  };
 }
 
