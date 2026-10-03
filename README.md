@@ -27,7 +27,8 @@ Shipped build-path steps:
   claim→execute→close loop on the safest kind — `ranger walk` (headless tick:
   announce → claim → spawn), `ranger run-node` (detached worker supervisor with
   the research SOP tail), `ranger sweep`, `ranger journal`.
-- **Step 4 — implement lane** (node #23): `walk: full` maps get the task/build
+- **Step 4 — implement lane** (node #23; built, live acceptance on seelite #550
+  pending): `walk: full` maps get the task/build
   SOP — worker implements and commits; the supervisor tests, pushes, opens a
   draft PR, runs offline sage rounds (cap 2) with fix passes, marks it ready, and
   the tick posts a one-tap merge card. Ranger never merges; after the

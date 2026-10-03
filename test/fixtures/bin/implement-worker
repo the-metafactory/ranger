@@ -8,7 +8,7 @@
 # and commits again. NO push — the worker never holds the write PAT.
 #
 # Modes: build (default); keyword — the commit message carries a closing
-# keyword; noop — commits nothing; sleep — starts a long-running grandchild
+# keyword; noop — commits nothing; dirty — commits but leaves an untracked file; sleep — starts a long-running grandchild
 # (for the process-group tests) then sleeps.
 set -euo pipefail
 
@@ -23,6 +23,14 @@ prompt="${!#}"
 cd "$(git rev-parse --show-toplevel)"
 
 if [ "$mode" = "noop" ]; then exit 0; fi
+if [ "$mode" = "dirty" ]; then
+  mkdir -p src tests
+  echo "export const feature = () => 1;" > src/feature.ts
+  echo "// never committed" > src/scratch.ts
+  git add src/feature.ts
+  git commit -q -m "feat: implement node #20 (scratch left behind)"
+  exit 0
+fi
 if [ "$mode" = "sleep" ]; then
   sleep 300 &
   sleep 300

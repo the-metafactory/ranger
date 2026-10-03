@@ -4,12 +4,15 @@ import { join } from "node:path";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import { runCmd, type RunOptions, type RunResult } from "./exec.ts";
 import {
+ assertGitUntouched,
  assertNoClosingKeywords,
  commitsAhead,
+ dirtyFiles,
  fastForwardCanonical,
  findClosingKeyword,
  gitConfigSnapshot,
  headSha,
+ safeGit,
  vettedPush,
 } from "./git-ops.ts";
 import * as gh from "./github.ts";
@@ -85,6 +88,8 @@ export interface ImplementContext {
  workerRun: WorkerRun;
  github?: GitHubPort;
  reviewer?: Reviewer;
+ /** How long to wait for GitHub to show a pushed head (default 2 min; tests shorten it). */
+ headPollMs?: number;
 }
 
 export interface ImplementOutcome {
@@ -186,7 +191,13 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
   };
  }
 
- let pr = await github.findPrByHead(repo, branch, token);
+ // F2 resume: the recorded PR first (a head-branch lookup misses a PR whose
+ // branch was deleted on merge), then the PR found by head branch.
+ const recorded = journal.getWorker(nodeId)?.prNumber ?? null;
+ let pr =
+  recorded === null
+   ? await github.findPrByHead(repo, branch, token)
+   : await github.getPr(repo, recorded, token);
  const phase = resolvePhase(pr);
  journal.recordEvent("worker-start", {
   nodeId,
@@ -239,6 +250,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
    token,
   );
   journal.updateWorker(nodeId, { phase: "review", prNumber: pr.number });
+  await awaitHead(github, repo, pr.number, built.sha, token, ctx.headPollMs);
   journal.recordEvent("pr-opened", { nodeId, repo, detail: `PR #${pr.number} (draft) ${pr.url}` });
  }
 
@@ -271,7 +283,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
    await github.postComment(
     repo,
     open.number,
-    `${reviewMarker(round, verdict)}\n**Sage review — round ${round}** (offline, machine evidence; not a human sign-off)\n\n${verdict.body}`,
+    reviewComment(round, verdict),
     token,
    );
    current = {
@@ -321,6 +333,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
    repo,
    detail: `fix pass ${current.round} @ ${fixed.sha.slice(0, 8)}`,
   });
+  await awaitHead(github, repo, open.number, fixed.sha, token, ctx.headPollMs);
  }
 
  // ---- ready → awaiting merge ----
@@ -390,6 +403,9 @@ async function workerPass(
   onSpawn: (pgid) => journal.updateWorker(nodeId, { workerPgid: pgid }),
  });
  journal.updateWorker(nodeId, { workerPgid: null });
+ // Before ANY git call after the worker: a tampered config or hook would run
+ // with whatever the next git call carries.
+ assertGitUntouched(ctx.canonical, snapshot);
  const fail = (detail: string): PassResult => ({
   workerExit: result.code,
   snapshot,
@@ -405,6 +421,14 @@ async function workerPass(
    review === undefined
     ? "worker exited 0 but committed nothing — nothing to push"
     : `fix pass ${review.round} committed nothing — the blockers stand`,
+  );
+ }
+ // The supervisor tests the working tree but pushes commits: a dirty tree
+ // would let a green test run cover code that never lands.
+ const dirty = await dirtyFiles(worktree);
+ if (dirty.length > 0) {
+  return fail(
+   `worker left ${dirty.length} uncommitted or untracked file(s) (${dirty.slice(0, 5).join("; ")}) — the tests would not test what gets pushed`,
   );
  }
  const tests = await runShell(testCommand, worktree, ctx, TEST_TIMEOUT_MS);
@@ -513,9 +537,8 @@ async function closeAfterMerge(
  journal.recordEvent("decisions-written", { nodeId, repo, detail: decisionsDetail.slice(0, 400) });
 
  // The merged branch's worktree is ranger's scratch; drop it.
- await runCmd("git", ["worktree", "remove", "--force", ctx.worktree], {
+ await safeGit(["worktree", "remove", "--force", ctx.worktree], {
   cwd: ctx.canonical,
-  timeoutMs: 60_000,
  });
  rmSync(resolutionFile, { force: true });
 
@@ -526,6 +549,46 @@ async function closeAfterMerge(
   close,
   prNumber: pr.number,
  };
+}
+
+/**
+ * GitHub can serve a PR's previous head for a few seconds after a push. Wait
+ * until it shows the pushed SHA before reviewing, or a stale head would match
+ * the last round's verdict again (a spurious second fix pass) or look like a
+ * mid-review push (a spurious park).
+ */
+async function awaitHead(
+ github: GitHubPort,
+ repo: string,
+ prNumber: number,
+ sha: string,
+ token: string,
+ timeoutMs = 120_000,
+): Promise<void> {
+ const deadline = Date.now() + timeoutMs;
+ for (;;) {
+  const live = await github.getPr(repo, prNumber, token);
+  if (live.headSha === sha) return;
+  if (Date.now() >= deadline) {
+   throw new ParkSignal(
+    `GitHub still shows PR #${prNumber} at ${live.headSha.slice(0, 8)}, not the pushed ${sha.slice(0, 8)}, after ${Math.round(timeoutMs / 1000)}s`,
+   );
+  }
+  await Bun.sleep(3_000);
+ }
+}
+
+/** GitHub caps a comment at 65 536 characters; the marker always survives, first. */
+const COMMENT_BUDGET = 60_000;
+
+function reviewComment(round: number, verdict: ReviewVerdict): string {
+ const head = `${reviewMarker(round, verdict)}\n**Sage review — round ${round}** (offline, machine evidence; not a human sign-off)\n\n`;
+ const room = COMMENT_BUDGET - head.length;
+ const body =
+  verdict.body.length <= room
+   ? verdict.body
+   : `${verdict.body.slice(0, room - 80)}\n\n… (truncated by ranger; the full review is in the run log)`;
+ return head + body;
 }
 
 function tail(result: RunResult): string {

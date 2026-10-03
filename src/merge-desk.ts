@@ -15,6 +15,11 @@ import { evaluateMergeGate } from "./merge-gate.ts";
  *   tick — a PR nobody knows to merge is the failure this guards against);
  *   a hard gate failure parks with a card; pending waits.
  *
+ * A PARKED implement-lane PR is watched too, for one event only: the
+ * principal merging it anyway (a review-cap park hands good-enough to the
+ * principal). The merge resumes the close; nothing else about a parked row
+ * changes on its own.
+ *
  * Ranger never merges: approver-bot is unprovisioned (node #6/#16), so the
  * principal merges by hand. The review evidence is read from the bot's own
  * markers on the PR, not the journal (the journal is a cache).
@@ -41,6 +46,14 @@ export interface MergeDeskResult {
  errors: string[];
 }
 
+/** Rows the desk watches: awaiting a merge, or parked with a PR the principal may still merge. */
+export function watchedByMergeDesk(w: WorkerRow): boolean {
+ return (
+  w.status === "awaiting-merge" ||
+  (w.status === "parked" && w.lane === "implement" && w.prNumber !== null)
+ );
+}
+
 export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResult> {
  const { journal, map, token, botIdentity } = ctx;
  const github = ctx.github ?? realGitHub;
@@ -52,7 +65,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
 
  const waiting = journal
   .listWorkers(repo)
-  .filter((w) => w.status === "awaiting-merge");
+  .filter(watchedByMergeDesk);
 
  for (const row of waiting) {
   try {
@@ -116,6 +129,9 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    result.resumed.push(row.nodeId);
    return;
   }
+
+  // A parked row moves only on a merge.
+  if (row.status === "parked") return;
 
   if (pr.state === "closed") {
    await park(row, `PR #${pr.number} was closed without merging — declined; ranger will not reopen or re-propose it`, title);

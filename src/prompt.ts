@@ -115,6 +115,10 @@ const IMPLEMENT_SOP = `Task/build kind SOP (ranger implement lane):
   closing keywords followed by an issue reference ("closes #N", "fixes #N",
   "resolves #N"): a squash merge would auto-close the node and skip its close gate.
   Refer to the node as "node #N" instead. The supervisor refuses to push otherwise.
+- Never amend, rebase, squash or reset existing commits: add new commits on top. The
+  supervisor pushes fast-forward only, and a rewritten branch parks the node.
+- Leave nothing uncommitted or untracked: the supervisor tests the working tree and
+  refuses a dirty one.
 - Do NOT claim, close or edit any graph node, and do NOT edit the map.
 - Stay inside the node's scope. Work the node says is out of scope stays out.`;
 

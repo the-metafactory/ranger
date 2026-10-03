@@ -82,10 +82,26 @@ export function workerEnv(
  config: RangerConfig,
  repo: string,
 ): NodeJS.ProcessEnv {
+ const identity = config.bot.identity;
  return {
   ...workerHostEnv(),
   SOMA_GRAPH_REPO: repo,
   SAGE_STACK: "default",
   PILOT_PRINCIPAL: config.principal.login,
+  // The host's global git hooks are the principal's, not the walk's: they
+  // can leave build caches in the worktree (a dirty tree the implement lane
+  // refuses) and nothing about them is part of ranger's gate. Disabled for
+  // every git call in the worker session and the repo commands (#23).
+  GIT_CONFIG_PARAMETERS: "'core.hooksPath'='/dev/null'",
+  // The machine account authors the work (design §2), not whoever the host's
+  // global git identity is.
+  ...(identity === undefined
+   ? {}
+   : {
+      GIT_AUTHOR_NAME: identity,
+      GIT_AUTHOR_EMAIL: `${identity}@users.noreply.github.com`,
+      GIT_COMMITTER_NAME: identity,
+      GIT_COMMITTER_EMAIL: `${identity}@users.noreply.github.com`,
+     }),
  };
 }

@@ -7,8 +7,8 @@ import { DiscordAnnouncer } from "./announce.ts";
 import { runCmd, type RunOptions } from "./exec.ts";
 import {
  fastForwardCanonical,
- gitAuthEnv,
  gitConfigSnapshot,
+ safeGit,
  GitSafetyError,
  vettedPush,
 } from "./git-ops.ts";
@@ -136,23 +136,15 @@ export async function bootstrapCanonical(
   return;
  }
  const parent = resolve(dir, "..");
- const result = await runCmd(
-  "git",
+ const result = await safeGit(
   ["clone", `https://github.com/${repo}.git`, dir],
-  { env: gitAuthEnv(token), cwd: parent, timeoutMs: 120_000 },
+  { cwd: parent, token, timeoutMs: 120_000 },
  );
  if (result.code !== 0) {
   throw new Error(
    `cannot bootstrap canonical checkout ${dir} (git clone, exit ${result.code}): ${result.stderr.trim()}`,
   );
  }
-}
-
-async function runGit(
- args: string[],
- opts: RunOptions,
-): Promise<{ code: number; stdout: string; stderr: string }> {
- return runCmd("git", args, opts);
 }
 
 /**
@@ -176,7 +168,7 @@ export async function bootstrapWorktree(
  // The branch can already exist without a worktree — orphaned after a pruned
  // worktree or a prior run — and `-b` would fail on it. Add the worktree from
  // the existing branch instead (adopt semantics). Found live on node #19.
- const existing = await runGit(
+ const existing = await safeGit(
   ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`],
   { cwd: canonical, timeoutMs: 10_000 },
  );
@@ -184,9 +176,11 @@ export async function bootstrapWorktree(
   existing.code === 0
    ? ["worktree", "add", dir, branch]
    : ["worktree", "add", dir, "-b", branch, `origin/${base}`];
- const result = await runGit(args, {
+ // worktree add fires post-checkout; safeGit keeps a planted hook from
+ // running with the supervisor's credentials.
+ const result = await safeGit(args, {
   cwd: canonical,
-  env: gitAuthEnv(token),
+  token,
   timeoutMs: 60_000,
  });
  if (result.code !== 0) {

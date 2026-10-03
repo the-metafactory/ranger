@@ -3,7 +3,11 @@ import type { Journal } from "./journal.ts";
 import { killProcessGroup, processGroupCommands } from "./exec.ts";
 import { graphRelease } from "./graph-write.ts";
 import type { GitHubPort } from "./implement.ts";
-import { runMergeDesk, type MergeDeskResult } from "./merge-desk.ts";
+import {
+ runMergeDesk,
+ watchedByMergeDesk,
+ type MergeDeskResult,
+} from "./merge-desk.ts";
 
 /**
  * Sweep (design §7) — reconcile the journal against reality, crash = no-op.
@@ -148,8 +152,8 @@ export async function sweepMap(ctx: SweepContext): Promise<SweepMapResult> {
   }
  }
 
- // Implement-lane rows waiting on the principal's merge (#23).
- if (journal.listWorkers(repo).some((w) => w.status === "awaiting-merge")) {
+ // Implement-lane rows waiting on (or parked before) the principal's merge (#23).
+ if (journal.listWorkers(repo).some(watchedByMergeDesk)) {
   result.mergeDesk = await runMergeDesk({
    config,
    journal,

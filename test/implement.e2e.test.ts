@@ -291,6 +291,9 @@ describe("implement lane (node #23)", () => {
   // The fix pass's commit is on origin: two commits ahead of main.
   const log = await runCmd("git", ["log", "--format=%s", "main..refs/heads/node/20-add-the-feature-module"], { cwd: r.origin });
   expect(log.stdout.trim().split("\n")).toHaveLength(2);
+  // The machine account authors the work (design §2), not the host identity.
+  const authors = await runCmd("git", ["log", "--format=%an <%ae>", "main..refs/heads/node/20-add-the-feature-module"], { cwd: r.origin });
+  expect(new Set(authors.stdout.trim().split("\n"))).toEqual(new Set([`${BOT} <${BOT}@users.noreply.github.com>`]));
 
   // Tick: the merge desk posts the card once.
   const posts: string[] = [];
@@ -435,5 +438,41 @@ describe("implement lane (node #23)", () => {
   expect(outcome.detail).toContain("superseded");
   expect(r.github.prs.size).toBe(0); // never pushed, never opened a PR
   expect(await r.github.sha("node/20-add-the-feature-module")).toBe("");
+ }, 60_000);
+ test("a worker that leaves the tree dirty fails: the test run must cover exactly what is pushed", async () => {
+  const r = await rig({});
+  cleanup.push(r.dir);
+  r.ctx.workerCommand = [implementWorker, "dirty"];
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("failed");
+  expect(outcome.detail).toContain("uncommitted or untracked");
+  expect(r.github.prs.size).toBe(0);
+ }, 60_000);
+
+ test("a PR parked at the review cap that the principal merges anyway still closes (merge desk watches parked PRs)", async () => {
+  const r = await rig({ blockers: [2, 1] });
+  cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("parked");
+  const sweep = () =>
+   sweepMap({
+    config: r.ctx.config,
+    journal: r.journal,
+    map: r.ctx.map,
+    token: "ghp_write",
+    botIdentity: BOT,
+    github: r.github,
+    post: async () => "msg",
+    respawn: async () => DEAD_PID,
+   });
+  const quiet = await sweep(); // open + parked: the desk does nothing
+  expect(quiet.mergeDesk?.resumed).toEqual([]);
+  expect(quiet.mergeDesk?.cards).toEqual([]);
+  expect(r.journal.getWorker("20")?.status).toBe("parked");
+
+  await r.github.merge(1);
+  expect((await sweep()).mergeDesk?.resumed).toEqual(["20"]);
+  const closed = await runNode("20", r.ctx);
+  expect(closed.status).toBe("success");
+  expect(state(r.statePath).nodes["20"].status).toBe("closed");
  }, 60_000);
 });
