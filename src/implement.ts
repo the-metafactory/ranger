@@ -151,6 +151,11 @@ export function recordedReviews(
  return out.sort((a, b) => a.round - b.round);
 }
 
+/** The findings that gate a PR: blockers and majors (principal, 2026-10-03). */
+export function gatingFindings(r: { blockers: number; majors: number }): number {
+ return r.blockers + r.majors;
+}
+
 export interface RecordedProbe {
  sha: string;
  passed: boolean;
@@ -431,13 +436,15 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
    verdictSha: current.sha,
    verdictBlockers: current.blockers,
   });
-  if (current.blockers === 0) break;
+  // Blockers AND majors gate (principal, 2026-10-03): each is reworked and
+  // re-reviewed. Suggestions and nits do not gate.
+  if (gatingFindings(current) === 0) break;
   if (current.round >= cap) {
    throw new ParkSignal(
-    `${current.blockers} blocker(s) remain after ${current.round} sage round(s) on PR #${open.number} — good-enough is the principal's call (design §4/§7)`,
+    `${current.blockers} blocker(s) and ${current.majors} major(s) remain after ${current.round} sage round(s) on PR #${open.number} — good-enough is the principal's call (design §4/§7)`,
    );
   }
-  // One fix pass per review that found blockers. On a resume the review is
+  // One fix pass per review that found blockers or majors. On a resume the review is
   // re-read from its PR comment, so a crash between review and fix loses nothing.
   const fixed = await workerPass(ctx, testCommand, {
    round: current.round,

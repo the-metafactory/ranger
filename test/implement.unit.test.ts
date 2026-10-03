@@ -80,8 +80,10 @@ describe("merge gate (#23)", () => {
  test("a push after the review (head moved off the verdict) fails", () => {
   expect(gate({ verdictSha: OTHER })).toMatchObject({ status: "fail", check: "review-clean" });
  });
- test("blockers at the head fail; majors do not gate", () => {
+ test("blockers or majors at the head fail the gate (principal, 2026-10-03)", () => {
   expect(gate({ verdictBlockers: 1 })).toMatchObject({ status: "fail", check: "review-clean" });
+  expect(gate({ verdictBlockers: 0, verdictMajors: 1 })).toMatchObject({ status: "fail", check: "review-clean" });
+  expect(gate({ verdictBlockers: 0, verdictMajors: 0 }).status).toBe("pass");
  });
  test("a merged or closed PR fails the open check", () => {
   expect(gate({ pr: pr({ state: "closed" }) })).toMatchObject({ status: "fail", check: "open" });
