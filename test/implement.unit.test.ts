@@ -379,6 +379,28 @@ describe("worker prompts are headless-aware (found live on seelite #669)", () =>
  });
 });
 
+describe("the implement prompt leaves the full probe suite to the supervisor (found live on seelite #661)", () => {
+ const base = {
+  repo: "acme/widgets",
+  node: { id: "9", title: "t", body: "b", kind: "task", autonomy: "auto", url: "u" },
+  map: { title: "m", body: "" },
+  branch: "node/9-t",
+  worktree: "/w",
+  botIdentity: "ivy-bot",
+  testCommand: "bun test",
+ };
+ test("a map with a probe tier tells the worker not to run the full suite", async () => {
+  const { assembleImplementPrompt } = await import("../src/prompt.ts");
+  const prompt = assembleImplementPrompt({ ...base, probeTier: true });
+  expect(prompt).toContain("Do NOT run the full probe suite");
+  expect(prompt).toContain("the supervisor runs it once on the final reviewed head");
+ });
+ test("a map without a probe tier says nothing about probes", async () => {
+  const { assembleImplementPrompt } = await import("../src/prompt.ts");
+  expect(assembleImplementPrompt(base)).not.toContain("probe suite");
+ });
+});
+
 describe("implement lane holder", () => {
  test("names the implement worker building or under review, except the asking node", () => {
   const dir = mkdtempSync(join(tmpdir(), "ranger-holder-"));

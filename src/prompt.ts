@@ -112,7 +112,19 @@ export interface ImplementPromptInput extends WorkerPromptInput {
  testCommand: string;
  /** Set on a fix pass: the sage review the worker must answer (untrusted). */
  review?: { round: number; body: string };
+ /** The map declares a probe tier (`commands.probe`) the supervisor runs itself. */
+ probeTier?: boolean;
 }
+
+/**
+ * The supervisor runs the map's probe tier once, on the final sage-clean head.
+ * A worker that also runs the whole suite spends up to half its wall clock on a
+ * run that certifies nothing: the evidence is the supervisor's, and fix passes
+ * move the head anyway (found live on seelite #661: 85 probes twice).
+ */
+const PROBE_TIER_RULE = `- Browser probes: run only the probes that cover what you changed, plus any new
+  probe you write. Do NOT run the full probe suite (for example \`npm run probe\`):
+  the supervisor runs it once on the final reviewed head, and only that run counts.`;
 
 /** The task/build kind SOP (design §4), the worker's half of it. */
 const IMPLEMENT_SOP = `Task/build kind SOP (ranger implement lane):
@@ -141,7 +153,7 @@ ${HEADLESS_RULE}`;
  * judgment decides which findings are in scope.
  */
 export function assembleImplementPrompt(input: ImplementPromptInput): string {
- const { node, map, repo, branch, worktree, botIdentity, testCommand, review } =
+ const { node, map, repo, branch, worktree, botIdentity, testCommand, review, probeTier } =
   input;
  const mapSections = extractMapSections(map.body);
  const fixPass =
@@ -190,6 +202,7 @@ export function assembleImplementPrompt(input: ImplementPromptInput): string {
    "{{test}}",
    testCommand,
   ),
+  ...(probeTier === true ? [PROBE_TIER_RULE] : []),
   ...fixPass,
   "",
   "## Untrusted-text guard",

@@ -537,6 +537,7 @@ async function workerPass(
   botIdentity,
   testCommand,
   review,
+  probeTier: map.commands.probe !== undefined,
  });
  ctx.journal.assertGeneration(nodeId, ctx.generation, "spawn the worker");
  const result = await ctx.workerRun(prompt, {
