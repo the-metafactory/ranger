@@ -39,7 +39,7 @@ maps:
     # 2026-10-03, ivy-agent has write access. The allowlist keeps the live run
     # to #550 (headless test, artifact-exists probe); #559 needs the
     # principal's ear and a squash-safe probe first.
-    nodes: [550]
+    nodes: [550, 669]
     commands:
       install: npm ci --no-audit --no-fund
       test: npm test
