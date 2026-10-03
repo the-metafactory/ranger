@@ -35,11 +35,11 @@ maps:
     root: 1
     walk: full
     # Shares seekolous's private grove channel rather than opening a second
-    # personal surface. Implement-lane acceptance (node #23): walk: full since
-    # 2026-10-03, ivy-agent has write access. The allowlist keeps the live run
-    # to #550 (headless test, artifact-exists probe); #559 needs the
-    # principal's ear and a squash-safe probe first.
-    nodes: [550, 669]
+    # personal surface. walk: full since 2026-10-03 (ivy-agent has write
+    # access). Every eligible task is walked (principal, 2026-10-03: grillings
+    # are the principal's, ranger builds what they spawn) except the skip
+    # list: #559 needs the principal's ear and a squash-safe probe first.
+    skip: [559]
     commands:
       install: npm ci --no-audit --no-fund
       test: npm test

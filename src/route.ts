@@ -54,6 +54,8 @@ export interface ClassifyOptions {
   botIdentity?: string;
   /** `ranger.yaml` map.nodes: when set, only these ids are walkable. */
   allowlist?: string[];
+  /** `ranger.yaml` map.skip: these ids are never walkable. */
+  skip?: string[];
 }
 
 export interface ClassifyContext {
@@ -193,7 +195,8 @@ export function classify(
     return { ...base, route: { route: "escalate-hitl", reason: "untyped" } };
   }
   const allowed =
-    opts.allowlist === undefined || opts.allowlist.includes(id);
+    (opts.allowlist === undefined || opts.allowlist.includes(id)) &&
+    !(opts.skip ?? []).includes(id);
   // Class 2a (#23 ruling) — a `propose` task/build node on a `walk: full`
   // map is walked like an auto one up to the merge; the principal's merge is
   // the ratification. Never for nodes ranger itself filed (node #9: ranger

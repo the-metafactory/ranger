@@ -106,6 +106,7 @@ async function escalateOneMap(
       classify(entry, map.repo, map.walk, registry, {
         botIdentity: config.bot.identity,
         allowlist: map.nodes,
+        skip: map.skip,
       }),
     );
     const needed = [

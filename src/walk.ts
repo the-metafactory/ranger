@@ -191,6 +191,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
      classify(entry, map.repo, map.walk, registry, {
       botIdentity,
       allowlist: map.nodes,
+      skip: map.skip,
      }),
     );
     const research = researchCandidates(classified);
