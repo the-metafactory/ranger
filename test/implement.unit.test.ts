@@ -358,3 +358,21 @@ describe("sage exit codes (live finding on seelite #667)", () => {
   await expect(run("crash")).rejects.toThrow(ReviewError);
  });
 });
+
+describe("worker prompts are headless-aware (found live on seelite #669)", () => {
+ test("both SOPs forbid ending the turn while waiting on background work", async () => {
+  const { assembleImplementPrompt, assembleResearchPrompt } = await import("../src/prompt.ts");
+  const base = {
+   repo: "acme/widgets",
+   node: { id: "9", title: "t", body: "b", kind: "task", autonomy: "auto", url: "u" },
+   map: { title: "m", body: "" },
+   branch: "node/9-t",
+   worktree: "/w",
+   botIdentity: "ivy-bot",
+  };
+  for (const prompt of [assembleResearchPrompt(base), assembleImplementPrompt({ ...base, testCommand: "bun test" })]) {
+   expect(prompt).toContain("HEADLESS session");
+   expect(prompt).toContain("Never start work in the background and end your turn waiting for it");
+  }
+ });
+});

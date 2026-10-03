@@ -27,6 +27,7 @@ import { assembleResearchPrompt } from "./prompt.ts";
 import { IMPLEMENT_KINDS } from "./route.ts";
 import { resolveReadOnlyToken } from "./token-gate.ts";
 import { workerEnv } from "./worker-env.ts";
+import { saveWorkerLog } from "./worker-log.ts";
 
 export { gitAuthEnv } from "./git-ops.ts";
 
@@ -508,9 +509,10 @@ async function runResearch(
   onSpawn: (pgid) => journal.updateWorker(nodeId, { workerPgid: pgid }),
  });
  journal.updateWorker(nodeId, { workerPgid: null });
+ const log = saveWorkerLog(journal.path, repo, nodeId, generation, "research pass", workerResult);
 
  if (workerResult.code !== 0) {
-  const detail = `worker exited ${workerResult.code}: ${workerResult.stderr.trim() || workerResult.stdout.trim().slice(0, 500)}`;
+  const detail = `worker exited ${workerResult.code}: ${workerResult.stderr.trim() || workerResult.stdout.trim().slice(0, 500)} (worker log: ${log})`;
   journal.recordEvent("refused", { nodeId, repo, detail });
   countFailure(config, journal, repo);
   finish(journal, nodeId, "failed", detail);
@@ -520,7 +522,7 @@ async function runResearch(
  // Research SOP tail: findings must exist on the worktree.
  const findingsPath = join(worktree, "findings.md");
  if (!existsSync(findingsPath)) {
-  const detail = `worker succeeded but wrote no findings.md at ${findingsPath} — the close would be hollow, so ranger refuses to close.`;
+  const detail = `worker succeeded but wrote no findings.md at ${findingsPath} — the close would be hollow, so ranger refuses to close. (worker log: ${log})`;
   journal.recordEvent("refused", { nodeId, repo, detail });
   countFailure(config, journal, repo);
   finish(journal, nodeId, "failed", detail);

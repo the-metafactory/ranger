@@ -35,6 +35,17 @@ export interface WorkerPromptInput {
  botIdentity: string;
 }
 
+/**
+ * Every worker is a headless `claude -p` session: when it ends its turn, the
+ * session ends. A worker that starts work in the background and ends its turn
+ * "waiting" exits with the work unfinished (found live on seelite #669).
+ */
+const HEADLESS_RULE = `- This is a HEADLESS session: when you end your turn, the session ends and nothing
+  wakes you again. Run every command in the foreground and wait for it to finish.
+  Never start work in the background and end your turn waiting for it, and never end
+  your turn before your work is committed. Long measurements run in the foreground,
+  one after another.`;
+
 /** The orienteer research kind SOP, quoted into every research worker prompt. */
 const RESEARCH_SOP = `Research kind SOP (orienteer):
 - Investigate the node's question. Findings go to \`findings.md\` at the worktree root.
@@ -43,7 +54,8 @@ const RESEARCH_SOP = `Research kind SOP (orienteer):
   credential. The close gate probes that exact ref, so the branch name is not negotiable.
 - Do NOT open a pull request, do NOT merge anything, do NOT touch the map body,
   do NOT claim or close any other node. This is research; it is read + write
-  only on your findings branch.`;
+  only on your findings branch.
+${HEADLESS_RULE}`;
 
 /**
  * Assemble the worker prompt for a research node. The map body is spliced so
@@ -120,7 +132,8 @@ const IMPLEMENT_SOP = `Task/build kind SOP (ranger implement lane):
 - Leave nothing uncommitted or untracked: the supervisor tests the working tree and
   refuses a dirty one.
 - Do NOT claim, close or edit any graph node, and do NOT edit the map.
-- Stay inside the node's scope. Work the node says is out of scope stays out.`;
+- Stay inside the node's scope. Work the node says is out of scope stays out.
+${HEADLESS_RULE}`;
 
 /**
  * Assemble the implement-lane worker prompt. On a fix pass the sage review is

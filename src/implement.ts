@@ -23,6 +23,7 @@ import type { ImplementPhase, Journal } from "./journal.ts";
 import { assembleImplementPrompt } from "./prompt.ts";
 import { sageReview, type ReviewVerdict } from "./review.ts";
 import { workerEnv } from "./worker-env.ts";
+import { saveWorkerLog } from "./worker-log.ts";
 
 /**
  * The implement lane (design §4 task/build SOP, build-path step 4, node #23).
@@ -541,6 +542,14 @@ async function workerPass(
   onSpawn: (pgid) => journal.updateWorker(nodeId, { workerPgid: pgid }),
  });
  journal.updateWorker(nodeId, { workerPgid: null });
+ const log = saveWorkerLog(
+  journal.path,
+  map.repo,
+  nodeId,
+  ctx.generation,
+  review === undefined ? "build pass" : `fix pass ${review.round}`,
+  result,
+ );
  // Before ANY git call after the worker: a tampered config or hook would run
  // with whatever the next git call carries.
  assertGitUntouched(ctx.canonical, snapshot);
@@ -548,7 +557,7 @@ async function workerPass(
   workerExit: result.code,
   snapshot,
   sha: before,
-  failure: { status: "failed", detail, workerExit: result.code },
+  failure: { status: "failed", detail: `${detail} (worker log: ${log})`, workerExit: result.code },
  });
  if (result.code !== 0) {
   return fail(`worker exited ${result.code}: ${tail(result)}`);
