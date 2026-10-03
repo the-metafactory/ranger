@@ -234,6 +234,24 @@ export class Journal {
   }
  }
 
+ /**
+  * The implement worker holding the lane — building or under review — other
+  * than `exceptNodeId`. The lane is one at a time on this machine (design §8;
+  * concurrent browser-probe runs also degrade each other, seelite #84), and
+  * every entry point that starts an implement worker session checks it: the
+  * walk's claims, the merge desk's send-backs, and `resume-node`.
+  */
+ implementLaneHolder(exceptNodeId?: string): WorkerRow | null {
+  return (
+   this.listWorkers().find(
+    (w) =>
+     w.nodeId !== exceptNodeId &&
+     w.lane === "implement" &&
+     (w.status === "claimed" || w.status === "running"),
+   ) ?? null
+  );
+ }
+
  getWorker(nodeId: string): WorkerRow | null {
   const row = this.db.query.workers
    .findFirst({

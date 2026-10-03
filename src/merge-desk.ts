@@ -180,6 +180,18 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
     }
     journal.updateWorker(row.nodeId, { mergeMessageId: null });
    }
+   // A send-back starts a worker session (fix pass or probes): it waits for
+   // the implement lane like any other start. The stale card is already gone.
+   const holder = journal.implementLaneHolder(row.nodeId);
+   if (holder !== null) {
+    result.pending.push(row.nodeId);
+    journal.recordEvent("sweep", {
+     nodeId: row.nodeId,
+     repo,
+     detail: `PR #${pr.number}: ${why} — waiting for the implement lane (held by #${holder.nodeId})`,
+    });
+    return;
+   }
    const pid = await ctx.spawn(row.nodeId, repo);
    if (pid === null) {
     result.errors.push(`#${row.nodeId}: ${why}, but run-node did not spawn — retrying next tick`);
