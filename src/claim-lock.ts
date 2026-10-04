@@ -31,7 +31,12 @@ import { acquireLease, leaseOwnedCheck, type OwnedCheck, releaseLease, startHear
  * lock of its own under tmpdir.
  */
 
-/** How long a claim waits for another claim to finish (announce + claim + spawn are each bounded). */
+/**
+ * How long a claim waits for another claim to finish (the frontier read,
+ * announce, claim and spawn are each bounded). A holder near every bound at
+ * once (build-now: ~150 s) outlasts it; the walk then stops claiming that map
+ * for the tick, and the next tick claims.
+ */
 export const CLAIM_LOCK_TIMEOUT_MS = 120_000;
 
 export class ClaimLockBusy extends Error {

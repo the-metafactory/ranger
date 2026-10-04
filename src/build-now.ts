@@ -131,7 +131,9 @@ export async function buildNow(nodeId: string, ctx: BuildNowContext): Promise<Bu
    now: now(),
   });
   switch (refusal?.gate) {
-   // Dead-man gate (design §7): the walk claims nothing while paused, nor does this.
+   // Dead-man gate (design §7), as in the walk: a pause seen before the graph
+   // claim stops it; one landing during the claim leaves a parked row, never
+   // a worker (`claimNode`).
    case "paused":
     return refuse("dead-man paused — claiming stopped; `ranger resume-run` first");
    case "vetoed":
