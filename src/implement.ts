@@ -214,6 +214,28 @@ export function recordedProbes(
  return out;
 }
 
+/** A probe file name as the runner prints it: no path, no shell metacharacters. */
+const PROBE_FILE = /^[\w.-]+\.m?js$/;
+
+/**
+ * The probes a failed run names on its `FAILED: a.mjs · b.mjs` line (the
+ * seelite runner's summary). Empty when there is no such line or any name
+ * is not a plain probe file name, so the caller falls back to the full suite.
+ */
+export function parseFailedProbes(stdout: string): string[] {
+ const line = stdout.match(/^FAILED: (.+)$/m)?.[1];
+ if (line === undefined) return [];
+ const names = line.split("·").map((n) => n.trim()).filter(Boolean);
+ return names.length > 0 && names.every((n) => PROBE_FILE.test(n)) ? names : [];
+}
+
+export function probeRetryCommandFor(template: string, nodeId: string, failed: string[]): string {
+ if (failed.length === 0 || !failed.every((n) => PROBE_FILE.test(n))) {
+  throw new ParkSignal("refusing to template probe names that are not plain probe file names");
+ }
+ return probeCommandFor(template, nodeId).replaceAll("{failed}", failed.join(","));
+}
+
 /** The selector's own summary lines (`probe selection: <mode>`, `selected: <n>`). */
 export function parseProbeSummary(stdout: string): { selected: string; mode: string } {
  const mode = stdout.match(/^probe selection: ([\w-]+)/m)?.[1] ?? "unknown";
@@ -260,19 +282,29 @@ async function probeFinalHead(
  const timeoutMs = map.commands.probeTimeoutMin * 60_000;
  let result = await runShell(command, worktree, ctx, timeoutMs);
  let attempts = 1;
+ let ranCommand = command;
+ // The record names the selection of the first run: a narrowed retry selects only the failures.
+ const summary = parseProbeSummary(result.stdout);
  if (result.code !== 0) {
-  journal.recordEvent("reviewed", { nodeId, repo, detail: `probe run 1 failed (exit ${result.code}) — retrying once` });
-  result = await runShell(command, worktree, ctx, timeoutMs);
+  // A run that named its failures (exit > 0) retries only those, when the map
+  // says how; a timeout or a runner crash (exit < 0, no FAILED line) reruns all.
+  const failed = result.code > 0 ? parseFailedProbes(result.stdout) : [];
+  const retryTemplate = map.commands.probeRetry;
+  if (retryTemplate !== undefined && failed.length > 0) {
+   ranCommand = probeRetryCommandFor(retryTemplate, nodeId, failed);
+  }
+  const what = ranCommand === command ? "the full suite" : `only ${failed.join(", ")}`;
+  journal.recordEvent("reviewed", { nodeId, repo, detail: `probe run 1 failed (exit ${result.code}) — retrying ${what}` });
+  result = await runShell(ranCommand, worktree, ctx, timeoutMs);
   attempts = 2;
  }
- const summary = parseProbeSummary(result.stdout);
  const record: RecordedProbe = {
   sha: live.headSha,
   passed: result.code === 0,
   ...summary,
  };
  ctx.journal.assertGeneration(nodeId, ctx.generation, "post the probe record");
- await github.postComment(repo, prNumber, probeComment(command, record, attempts, result), token);
+ await github.postComment(repo, prNumber, probeComment(ranCommand, record, attempts, result), token);
  journal.recordEvent("reviewed", {
   nodeId,
   repo,

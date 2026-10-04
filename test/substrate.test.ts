@@ -577,8 +577,18 @@ describe("workerCommandFor", () => {
   expect(cmd).toEqual(["claude", "-p", "--output-format", "stream-json", "--verbose"]);
  });
 
- test("codex: exec", () => {
-  expect(workerCommandFor("codex", config)).toEqual(["codex", "exec"]);
+ test("codex: a writable workspace sandbox, plus the common git dir a worktree commits into", () => {
+  expect(workerCommandFor("codex", config)).toEqual(["codex", "exec", "--sandbox", "workspace-write"]);
+  expect(workerCommandFor("codex", config, { writableGitDir: "/c/acme/widgets/.git" })).toEqual([
+   "codex",
+   "exec",
+   "--sandbox",
+   "workspace-write",
+   "--add-dir",
+   "/c/acme/widgets/.git",
+  ]);
+  // Never the read-only default, never the unsandboxed escape hatch.
+  expect(workerCommandFor("codex", config)).not.toContain("--dangerously-bypass-approvals-and-sandbox");
  });
 
  test("pi: provider and model from config", () => {

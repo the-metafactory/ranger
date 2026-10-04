@@ -14,12 +14,12 @@ version: 1
 maps:
   - repo: the-metafactory/ranger
     root: 1
-    # walk: full since 2026-10-03 so ranger builds its own substrate selection
-    # (#45, decided in #44) and two maps per repo (#47, decided in #38). The
-    # allowlist keeps the other open task nodes (#23, #25, #32) off the walk
-    # until the principal widens it.
+    # walk: full, every eligible node (principal, 2026-10-04: fully
+    # autonomous). Skipped: #23 describes the implement lane, which already
+    # walks seelite (the principal closes it); #32 waits on cortex#1009,
+    # #925 and #929, all open.
     walk: full
-    nodes: ["45", "47"]
+    skip: [23, 32]
     # Ranger merges its own gate-passed PRs (principal, 2026-10-03), except
     # nodes labelled ranger:needs-eye.
     autoMerge: true
@@ -69,6 +69,10 @@ maps:
       # (seelite CLAUDE.md: never paste tracker or PR text into --intent).
       # GPU lane: headed Chromium opens on the host screen while it runs.
       probe: 'npm run probe:pr -- --base origin/main --head HEAD --intent "Ranger implement lane: the diff on this branch implements orienteer node #{node}; select every browser probe the changed files can affect."'
+      # A failed run retries only the probes it named (2026-10-04: one
+      # load-induced crash cost a 25-minute full rerun). The runner takes an
+      # exact list through PROBE_SELECTION/PROBE_FILES.
+      probeRetry: PROBE_SELECTION=1 PROBE_FILES={failed} npm run probe
       probeTimeoutMin: 30
     discord:
       tokenEnv: RANGER_DISCORD_TOKEN

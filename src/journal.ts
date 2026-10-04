@@ -135,7 +135,8 @@ export type EventKind =
  | "merge-card"
  | "merged"
  | "orphan-killed"
- | "substrate-capped";
+ | "substrate-capped"
+ | "transient";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 

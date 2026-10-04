@@ -39,6 +39,7 @@ import { selectForBuild } from "./substrate-policy.ts";
 import { resolveReadOnlyToken } from "./token-gate.ts";
 import { workerEnv } from "./worker-env.ts";
 import { saveWorkerLog } from "./worker-log.ts";
+import { isTransientGitHubError } from "./transient.ts";
 
 export { gitAuthEnv } from "./git-ops.ts";
 
@@ -228,8 +229,15 @@ function envWorkerOverride(ctx: RunNodeContext): string[] | undefined {
 }
 
 /** Resolve the worker command: explicit override > the substrate's command. */
-function resolveWorkerCommand(ctx: RunNodeContext, substrate: SubstrateName): string[] {
- return ctx.workerCommand ?? workerCommandFor(substrate, ctx.config);
+function resolveWorkerCommand(
+ ctx: RunNodeContext,
+ substrate: SubstrateName,
+ canonical: string,
+): string[] {
+ return (
+  ctx.workerCommand ??
+  workerCommandFor(substrate, ctx.config, { writableGitDir: join(canonical, ".git") })
+ );
 }
 
 /** An in-process worker, reviewer or command: a test run, never the real CLIs' quota. */
@@ -327,6 +335,33 @@ function countFailure(config: RangerConfig, journal: Journal, repo: string): voi
  }
 }
 
+/**
+ * A run that failed. A transient GitHub error (`transient.ts`) is not the
+ * node's fault: it is not counted toward the dead-man switch, and the row is
+ * left running under this supervisor's PID, so when the process exits the
+ * sweep finds a crashed worker and respawns it (bounded by maxAttempts) —
+ * the implement lane re-derives its phase from GitHub, so finished work is
+ * kept. Any other failure counts and ends the row as failed.
+ */
+function failNode(
+ config: RangerConfig,
+ journal: Journal,
+ nodeId: string,
+ repo: string,
+ detail: string,
+): void {
+ if (isTransientGitHubError(detail)) {
+  journal.recordEvent("transient", {
+   nodeId,
+   repo,
+   detail: `GitHub-side transient error, left for the sweep to respawn (not counted): ${detail.slice(0, 300)}`,
+  });
+  return;
+ }
+ countFailure(config, journal, repo);
+ finish(journal, nodeId, "failed", detail);
+}
+
 /** Mark the row terminal: the supervisor PID is released only here (F1). */
 function finish(
  journal: Journal,
@@ -418,8 +453,7 @@ export async function runNode(
    repo,
    detail: detail.slice(0, 400),
   });
-  countFailure(config, journal, repo);
-  finish(journal, nodeId, "failed", detail);
+  failNode(config, journal, nodeId, repo, detail);
   return { ...base, status: "failed", detail };
  }
 }
@@ -462,7 +496,7 @@ async function runSession(
   envCmd === undefined
    ? await selectBuildSubstrate(ctx, capped)
    : { substrate: undefined, chosenOn: "RANGER_WORKER_CMD override; its heads count as Pi-written" };
- const workerCmd = envCmd ?? resolveWorkerCommand(ctx, substrate as SubstrateName);
+ const workerCmd = envCmd ?? resolveWorkerCommand(ctx, substrate as SubstrateName, session.canonical);
  journal.updateWorker(nodeId, { substrate: substrate ?? null });
  journal.recordEvent("worker-start", {
   nodeId,
@@ -568,9 +602,10 @@ async function runImplementNode(
    break;
   default:
    journal.recordEvent("refused", { nodeId, repo, detail: outcome.detail.slice(0, 400) });
-   // Backstop: a capped failure never counts (node #45), even if it ends the run.
-   if (outcome.substrateCapped === undefined) countFailure(config, journal, repo);
-   finish(journal, nodeId, "failed", outcome.detail);
+   // Backstop: a capped failure never counts (node #45), even if it ends the
+   // run; a transient GitHub error is left for the sweep (failNode).
+   if (outcome.substrateCapped !== undefined) finish(journal, nodeId, "failed", outcome.detail);
+   else failNode(config, journal, nodeId, repo, outcome.detail);
  }
  return {
   ...base,
@@ -678,8 +713,7 @@ async function runResearch(
  if (workerResult.code !== 0) {
   const detail = `worker exited ${workerResult.code}: ${workerResult.stderr.trim() || workerResult.stdout.trim().slice(0, 500)} (worker log: ${log})`;
   journal.recordEvent("refused", { nodeId, repo, detail });
-  countFailure(config, journal, repo);
-  finish(journal, nodeId, "failed", detail);
+  failNode(config, journal, nodeId, repo, detail);
   return { ...base, status: "failed", detail, workerExit: workerResult.code };
  }
 
@@ -688,8 +722,7 @@ async function runResearch(
  if (!existsSync(findingsPath)) {
   const detail = `worker succeeded but wrote no findings.md at ${findingsPath} — the close would be hollow, so ranger refuses to close. (worker log: ${log})`;
   journal.recordEvent("refused", { nodeId, repo, detail });
-  countFailure(config, journal, repo);
-  finish(journal, nodeId, "failed", detail);
+  failNode(config, journal, nodeId, repo, detail);
   return { ...base, status: "failed", detail, workerExit: 0 };
  }
 
@@ -714,8 +747,7 @@ async function runResearch(
   if (error instanceof FencedError) throw error;
   const detail = `research branch push failed (${branch}): ${error instanceof Error ? error.message : String(error)}`;
   journal.recordEvent("refused", { nodeId, repo, detail });
-  countFailure(config, journal, repo);
-  finish(journal, nodeId, "failed", detail);
+  failNode(config, journal, nodeId, repo, detail);
   return { ...base, status: "failed", detail, workerExit: 0 };
  }
 

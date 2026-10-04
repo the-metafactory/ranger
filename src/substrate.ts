@@ -373,15 +373,29 @@ function epochIso(seconds: number): string {
 
 /**
  * The worker command + leading args for a substrate; the caller appends the
- * prompt as the final arg. Headless flags follow sage's substrates
- * (sage src/substrate/{claude,codex,pi}.ts).
+ * prompt as the final arg. Claude and Pi take sage's headless flags (sage
+ * src/substrate/{claude,pi}.ts). Codex does not: sage only reviews, and a bare
+ * `codex exec` runs in Codex's read-only sandbox, where a build session cannot
+ * write. A worker gets `--sandbox workspace-write` (its cwd, the worktree) plus
+ * the canonical clone's `.git` via `--add-dir`, because a worktree commits
+ * into the common git dir, which lies outside the worktree.
  */
-export function workerCommandFor(substrate: SubstrateName, config: RangerConfig): string[] {
+export function workerCommandFor(
+ substrate: SubstrateName,
+ config: RangerConfig,
+ opts: { writableGitDir?: string } = {},
+): string[] {
  switch (substrate) {
   case "claude":
    return ["claude", "-p", "--output-format", "stream-json", "--verbose"];
   case "codex":
-   return ["codex", "exec"];
+   return [
+    "codex",
+    "exec",
+    "--sandbox",
+    "workspace-write",
+    ...(opts.writableGitDir !== undefined ? ["--add-dir", opts.writableGitDir] : []),
+   ];
   case "pi":
    return ["pi", "-p", "--provider", config.substrates.pi.provider, "--model", config.substrates.pi.model];
  }
