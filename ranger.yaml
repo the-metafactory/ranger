@@ -123,6 +123,9 @@ bot:
 # default of 2).
 workers:
   reviewRounds: 5
+  # New claims per UTC day across all maps (default 10). Raised to 20
+  # (principal, 2026-10-04): two lanes and three walked maps used up 10 by midday.
+  spawnCapPerDay: 20
   # Hard wall clock per worker session, minutes (default 90). Raised to 150
   # (principal, 2026-10-04): seelite #684, a large Traffic build on Codex, was
   # still uncommitted at 80 minutes.
