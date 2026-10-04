@@ -14,12 +14,12 @@ version: 1
 maps:
   - repo: the-metafactory/ranger
     root: 1
-    # walk: full since 2026-10-03 so ranger builds its own substrate selection
-    # (#45, decided in #44) and two maps per repo (#47, decided in #38). The
-    # allowlist keeps the other open task nodes (#23, #25, #32) off the walk
-    # until the principal widens it.
+    # walk: full, every eligible node (principal, 2026-10-04: fully
+    # autonomous). Skipped: #23 describes the implement lane, which already
+    # walks seelite (the principal closes it); #32 waits on cortex#1009,
+    # #925 and #929, all open.
     walk: full
-    nodes: ["45", "47"]
+    skip: [23, 32]
     # Ranger merges its own gate-passed PRs (principal, 2026-10-03), except
     # nodes labelled ranger:needs-eye.
     autoMerge: true
