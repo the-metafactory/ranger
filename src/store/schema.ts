@@ -228,6 +228,8 @@ export const substrateSessions = sqliteTable(
   startedAt: text("started_at").notNull(),
   endedAt: text("ended_at"),
   outcome: text("outcome", { enum: SESSION_OUTCOMES }),
+  /** The model ranger pinned for a worker session (node #60); null for a sage round or an unpinned one. */
+  model: text("model"),
  },
  (table) => [
   index("substrate_sessions_started_at_idx").on(table.startedAt),

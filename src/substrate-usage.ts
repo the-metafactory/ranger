@@ -46,6 +46,8 @@ export interface SessionScope {
  nodeId: string;
  /** The supervisor generation running the session (the worker row's). */
  generation: number;
+ /** The model ranger pinned for a worker session (node #60); null for a sage round or an unpinned one. */
+ model?: string | null;
 }
 
 /**

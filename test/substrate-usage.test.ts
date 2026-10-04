@@ -128,6 +128,28 @@ describe("the substrate_sessions migration", () => {
   }
  });
 
+ test("a session's pinned model is stored, and a journal from before the model column still lists sessions (node #60)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ranger-usage-"));
+  try {
+   const path = join(dir, "state.sqlite");
+   const j = new Journal(path);
+   occupy(j, "7", 3);
+   const scope = { substrate: "codex" as const, kind: "worker" as const, repo: "acme/widgets", nodeId: "7", generation: 3 };
+   j.endSubstrateSession(j.startSubstrateSession({ ...scope, model: "gpt-6.1-sol" }, NOW), "ok", NOW);
+   j.close();
+   const sqlite = new Database(path);
+   expect(sqlite.query("SELECT model FROM substrate_sessions").all()).toEqual([{ model: "gpt-6.1-sol" }]);
+   sqlite.run("ALTER TABLE substrate_sessions DROP COLUMN model");
+   sqlite.close();
+   const reader = Journal.openReadOnly(path)!;
+   expect(reader.listSubstrateSessions(new Date(0))?.map((s) => s.substrate)).toEqual(["codex"]);
+   expect(reader.lastSubstrateSession("codex")?.outcome).toBe("ok");
+   reader.close();
+  } finally {
+   rmSync(dir, { recursive: true, force: true });
+  }
+ });
+
  test("serve reading a journal no migration has reached has no history to count, not an error", () => {
   const dir = mkdtempSync(join(tmpdir(), "ranger-usage-"));
   try {

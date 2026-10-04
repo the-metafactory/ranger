@@ -101,6 +101,8 @@ export interface ImplementContext {
  headPollMs?: number;
  /** The substrate the worker runs on (node #45). */
  substrate?: SubstrateName;
+ /** The model the worker command pins (node #60); unset when ranger did not build the command. */
+ model?: string;
  /** Quota readers for review selection and cap confirmation (tests inject them). */
  substrateReaders?: SubstrateReaders;
  /** Substrates capped earlier in this run: review selection leaves them out. */
@@ -673,6 +675,7 @@ async function workerPass(
    repo: ctx.map.repo,
    nodeId,
    generation: ctx.generation,
+   model: ctx.model ?? null,
   },
   (open) => checkedWorkerPass(ctx, testCommand, review, open),
   (pass) =>

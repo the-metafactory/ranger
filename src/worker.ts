@@ -28,8 +28,10 @@ import { assembleResearchPrompt } from "./prompt.ts";
 import { IMPLEMENT_KINDS } from "./route.ts";
 import {
  markSubstrateCapped,
+ describeWorkerModel,
  selectSubstrate,
  workerCommandFor,
+ workerModelFor,
  type CapSignal,
  type QuotaReading,
  type SubstrateName,
@@ -493,7 +495,7 @@ function ratifyFor(
 }
 
 /** What every implement session of a node shares; runSession adds the substrate. */
-type SessionScope = Omit<ImplementContext, "workerRun" | "substrate" | "excludedSubstrates">;
+type SessionScope = Omit<ImplementContext, "workerRun" | "substrate" | "model" | "excludedSubstrates">;
 
 /**
  * One worker session (node #45): select its substrate (leaving out those
@@ -512,11 +514,17 @@ async function runSession(
    ? await selectBuildSubstrate(ctx, capped)
    : { substrate: undefined, chosenOn: "RANGER_WORKER_CMD override; its heads count as Pi-written" };
  const workerCmd = envCmd ?? resolveWorkerCommand(ctx, substrate as SubstrateName, session.canonical);
+ // The pinned model (node #60), only when ranger built the command from its
+ // config: an operator's or a test's command carries no model ranger knows.
+ const model =
+  envCmd === undefined && ctx.workerCommand === undefined && substrate !== undefined
+   ? workerModelFor(substrate, ctx.config)
+   : null;
  journal.updateWorker(nodeId, session.map.repo, { substrate: substrate ?? null });
  journal.recordEvent("worker-start", {
   nodeId,
   repo: session.map.repo,
-  detail: `substrate ${substrate ?? "unknown"} (${chosenOn}), command: ${workerCmd[0]}`.slice(0, 400),
+  detail: `substrate ${substrate ?? "unknown"}${model === null ? "" : ` (${describeWorkerModel(model)})`} (${chosenOn}), command: ${workerCmd[0]}`.slice(0, 400),
  });
  return runImplement({
   ...session,
@@ -524,6 +532,7 @@ async function runSession(
    ctx.worker ??
    ((p: string, opts: RunOptions) => runCmd(workerCmd[0], [...workerCmd.slice(1), p], opts)),
   substrate,
+  model: model?.model,
   excludedSubstrates: capped,
  });
 }
