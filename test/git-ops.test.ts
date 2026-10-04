@@ -89,7 +89,10 @@ describe("gitConfigSnapshot: everything else stays in the hash", () => {
    "a node-branch section that gains pushRemote",
    async () => {
     await bootstrapWorktree(canonical, "663", "x", "tok");
+    // The snapshot taken after the branch exists, then the section grows.
+    const mid = gitConfigSnapshot(canonical);
     await config("branch.node/663-x.pushRemote", "origin");
+    expect(gitConfigSnapshot(canonical)).not.toBe(mid);
    },
   ],
   [
