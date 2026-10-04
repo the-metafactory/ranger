@@ -25,8 +25,9 @@ import { lastImplementMaps, mapKey, implementMapOrder } from "./maps.ts";
  *
  * **"Needs you" actions run outside this process (node #54).** The parked,
  * failed and needs-eye rows (`serve-parked.ts`) carry buttons, and each one
- * only spawns an existing CLI verb (`ranger resume-node`), the principal's own
- * `gh pr merge` (no machine-account token or gh config in its environment), or
+ * only spawns an existing CLI verb (`ranger resume-node`), `gh pr merge` with
+ * no machine-account token or gh config in its environment (gh uses the login
+ * stored under HOME; which account that is goes unchecked), or
  * the iTerm2 launch above. The process itself still writes nothing: the
  * journal stays read-only here and no graph write is imported. Each action is
  * guarded like the launch — Host, Origin, page token, a numeric id — and the
