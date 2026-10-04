@@ -415,10 +415,11 @@ describe("ranger run-node — research worker full loop (node #13 acceptance)", 
  }, 10_000);
 
  for (const mode of ["failure", "skipped"]) {
-  test(`research CI ${mode} stays parked until external CI changes; retry reuses the draft and findings`, async () => {
+  test(`research CI ${mode} preserves failure budget and resumes after ${mode === "failure" ? "base advancement" : "replace-ref tampering"}`, async () => {
    const dir = mkdtempSync(join(tmpdir(), "ranger-research-ci-"));
    try {
-    const { origin } = await createCanonicalRepo(dir);
+    const { origin, canonical } = await createCanonicalRepo(dir);
+    const originalBase = await runCmd("git", ["rev-parse", "origin/main"], { cwd: canonical, env: GIT_ENV });
     const config = writeConfig(dir);
     const statePath = writeState(dir, { "10": { ...RESEARCH_NODE_STATE, assignees: ["ivy-bot"] } });
     const env = {
@@ -438,11 +439,59 @@ describe("ranger run-node — research worker full loop (node #13 acceptance)", 
     const journal = new Journal(join(dir, "state.sqlite"));
     expect(journal.getWorker("10")?.status).toBe("parked");
     expect(journal.getWorker("10")?.prNumber).toBe(31);
+    expect(journal.deadmanCount()).toBe(0);
+    expect(journal.isPaused()).toBe(false);
+    expect(journal.getWorker("10")?.researchBaseSha).toBe(originalBase.stdout.trim());
+    journal.bumpDeadman();
+    journal.bumpDeadman();
     journal.close();
 
     const unchanged = await runCli(args, env);
     expect(JSON.parse(unchanged.stdout).status).toBe("parked");
     expect(JSON.parse(readFileSync(statePath, "utf8")).lastClose).toBeUndefined();
+    const retryJournal = new Journal(join(dir, "state.sqlite"));
+    expect(retryJournal.deadmanCount()).toBe(2);
+    expect(retryJournal.isPaused()).toBe(false);
+    expect(retryJournal.listEvents("acme/widgets").filter((event) => event.kind === "deadman-paused")).toHaveLength(0);
+    retryJournal.close();
+
+    if (mode === "failure") {
+     const legacyJournal = new Journal(join(dir, "state.sqlite"));
+     legacyJournal.updateWorker("10", { researchBaseSha: null });
+     legacyJournal.close();
+     const missingAnchor = await runCli(args, { ...env, FAKE_RESEARCH_CI: "success" });
+     expect(JSON.parse(missingAnchor.stdout)).toMatchObject({ status: "parked" });
+     expect(JSON.parse(missingAnchor.stdout).detail).toContain("pre-worker base is missing");
+     expect(JSON.parse(readFileSync(statePath, "utf8")).lastClose).toBeUndefined();
+     const restoreJournal = new Journal(join(dir, "state.sqlite"));
+     expect(restoreJournal.deadmanCount()).toBe(2);
+     expect(restoreJournal.isPaused()).toBe(false);
+     restoreJournal.updateWorker("10", { researchBaseSha: originalBase.stdout.trim() });
+     restoreJournal.close();
+    }
+
+    const git = async (args: string[], cwd = canonical) => {
+     const result = await runCmd("git", args, { cwd, env: { ...process.env, ...GIT_ENV } });
+     expect(result.code).toBe(0);
+     return result.stdout.trim();
+    };
+    if (mode === "failure") {
+     writeFileSync(join(canonical, "README.md"), "# advanced main\n");
+     await git(["add", "README.md"]);
+     await git(["commit", "-m", "advance base"]);
+     await git(["push", "origin", "main"]);
+     await git(["fetch", "origin"]);
+     expect(await git(["rev-parse", "origin/main"])).not.toBe(originalBase.stdout.trim());
+    } else {
+     const worktree = join(canonical, ".worktrees", "node-10");
+     writeFileSync(join(worktree, "findings.md"), "# forged replacement findings\n");
+     await git(["add", "findings.md"], worktree);
+     await git(["commit", "-m", "replacement findings"], worktree);
+     const replacement = await git(["rev-parse", "HEAD"], worktree);
+     await git(["reset", "--hard", parked.researchPr.head.sha], worktree);
+     await git(["replace", parked.researchPr.head.sha, replacement]);
+     expect(await git(["show", `${parked.researchPr.head.sha}:findings.md`])).toContain("forged replacement findings");
+    }
 
     // Simulate an operator rerunning CI successfully on the same head.
     // The fixture worker cannot recreate its branch, so success also proves
@@ -454,6 +503,9 @@ describe("ranger run-node — research worker full loop (node #13 acceptance)", 
     expect(closed.nodes["10"].status).toBe("closed");
     expect(closed.researchPrCreates).toBe(1);
     expect(closed.lastClose.ci).toBe(`901@${closed.researchPr.head.sha}`);
+    const resolution = readFileSync(join(tmpdir(), "ranger-close-acme__widgets-10.md"), "utf8");
+    expect(resolution).toContain("Surveyed the third-party API");
+    expect(resolution).not.toContain("forged replacement findings");
     const resumedJournal = new Journal(join(dir, "state.sqlite"));
     expect(resumedJournal.listEvents("acme/widgets").filter((event) => event.kind === "pr-opened")).toHaveLength(1);
     resumedJournal.close();

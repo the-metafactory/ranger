@@ -122,6 +122,9 @@ bun src/cli.ts journal                    # inspect workers/events/health
   pending, failed, or stale-head evidence parks the node; a retry reuses the
   open draft and committed findings. Failed CI needs an operator to rerun or
   repair CI; retrying alone does not change the verdict on the same head.
+  CI parks do not consume the dead-man failure budget. The journal preserves
+  the pre-worker base SHA across retries; a draft without that anchor parks
+  for operator intervention.
   A closed draft needs operator intervention.
   The PR stays draft and unmerged.
 - **Acceptance (e2e):** an auto research node walked end-to-end against fake

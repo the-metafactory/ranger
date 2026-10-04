@@ -459,7 +459,6 @@ export async function runNode(
    detail: detail.slice(0, 400),
   });
   if (error instanceof ParkSignal) {
-   countFailure(config, journal, repo);
    finish(journal, nodeId, "parked", detail);
    return { ...base, status: "parked", detail };
   }
@@ -649,9 +648,13 @@ async function parkCard(
  }
 }
 
-async function resolveBranchSha(canonical: string, branch: string): Promise<string | null> {
- const head = await safeGit(["--no-replace-objects", "rev-parse", "--verify", `refs/heads/${branch}^{commit}`], { cwd: canonical });
+async function resolveCommit(canonical: string, ref: string): Promise<string | null> {
+ const head = await safeGit(["--no-replace-objects", "rev-parse", "--verify", `${ref}^{commit}`], { cwd: canonical });
  return head.code === 0 && /^[0-9a-f]{40}$/.test(head.stdout.trim()) ? head.stdout.trim() : null;
+}
+
+async function resolveBranchSha(canonical: string, branch: string): Promise<string | null> {
+ return resolveCommit(canonical, `refs/heads/${branch}`);
 }
 
 /**
@@ -677,13 +680,8 @@ async function runResearch(
  });
  const canonical = canonicalDir(config, map);
  await bootstrapCanonical(canonical, repo, token);
- const baseHead = await safeGit(["--no-replace-objects", "rev-parse", "--verify", `refs/remotes/origin/${map.base}^{commit}`], { cwd: canonical });
- if (baseHead.code !== 0 || !/^[0-9a-f]{40}$/.test(baseHead.stdout.trim())) {
-  throw new GitSafetyError(`cannot resolve research base origin/${map.base}`);
- }
- const baseSha = baseHead.stdout.trim();
  const slug = slugify(node.node.title);
- const worktree = await bootstrapWorktree(canonical, nodeId, slug, token);
+ const worktree = await bootstrapWorktree(canonical, nodeId, slug, token, undefined, map.base);
  const branch = researchBranchFor(node.node);
 
  journal.recordEvent("worker-start", {
@@ -698,6 +696,18 @@ async function runResearch(
  const existingPr = recorded === null
   ? await github.findPrByHead(repo, branch, token)
   : await github.getPr(repo, recorded, token);
+ let baseSha = journal.getWorker(nodeId)?.researchBaseSha ?? null;
+ if (baseSha === null) {
+  if (existingPr !== null || await resolveBranchSha(canonical, branch) !== null) {
+   throw new ParkSignal(`research pre-worker base is missing for ${branch}; operator intervention required`);
+  }
+  baseSha = await resolveCommit(canonical, `refs/heads/${worktreeBranch(nodeId, slug)}`);
+  if (baseSha === null) {
+   throw new GitSafetyError(`cannot resolve research pre-worker base for node #${nodeId}`);
+  }
+  fence("record research base");
+  journal.updateWorker(nodeId, { researchBaseSha: baseSha });
+ }
  let sha: string;
 
  // A retry after the draft was opened resumes its CI/close tail, without
@@ -795,7 +805,7 @@ async function runResearch(
   sha = head;
   await assertResearchFindingsOnly(canonical, baseSha, sha);
  }
- const findings = await safeGit(["show", `${sha}:findings.md`], { cwd: canonical });
+ const findings = await safeGit(["--no-replace-objects", "show", `${sha}:findings.md`], { cwd: canonical });
  if (findings.code !== 0 || findings.stdout.trim().length === 0) {
   throw new ParkSignal(`research findings.md is missing or empty at ${sha}`);
  }

@@ -50,6 +50,7 @@ export interface WorkerRow {
  workerPgid: number | null;
  phase: ImplementPhase | null;
  prNumber: number | null;
+ researchBaseSha: string | null;
  reviewRound: number;
  verdictSha: string | null;
  verdictBlockers: number | null;
@@ -192,6 +193,7 @@ export class Journal {
     workerPgid: row.workerPgid ?? null,
     phase: row.phase ?? null,
     prNumber: row.prNumber ?? null,
+    researchBaseSha: row.researchBaseSha ?? null,
     reviewRound: row.reviewRound ?? 0,
     verdictSha: row.verdictSha ?? null,
     verdictBlockers: row.verdictBlockers ?? null,
@@ -214,6 +216,7 @@ export class Journal {
      workerPgid: row.workerPgid,
      phase: row.phase,
      prNumber: row.prNumber,
+     researchBaseSha: row.researchBaseSha,
      reviewRound: row.reviewRound,
      verdictSha: row.verdictSha,
      verdictBlockers: row.verdictBlockers,
@@ -782,6 +785,7 @@ function hydrateWorker(row: {
  workerPgid: number | null;
  phase: string | null;
  prNumber: number | null;
+ researchBaseSha: string | null;
  reviewRound: number;
  verdictSha: string | null;
  verdictBlockers: number | null;
@@ -804,6 +808,7 @@ function hydrateWorker(row: {
   workerPgid: row.workerPgid,
   phase: row.phase as ImplementPhase | null,
   prNumber: row.prNumber,
+  researchBaseSha: row.researchBaseSha,
   reviewRound: row.reviewRound,
   verdictSha: row.verdictSha,
   verdictBlockers: row.verdictBlockers,
