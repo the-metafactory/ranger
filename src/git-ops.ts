@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
@@ -67,19 +68,110 @@ export function safeGit(
  );
 }
 
+/** Ranger's own node branches: `node/<N>-<slug>` (`worktreeBranch` + `slugify` in worker.ts). */
+export const NODE_BRANCH = /^node\/\d+-[a-z0-9-]+$/;
+
+/** The remote ranger's node branches track (`worktree add -b … origin/<base>`). */
+const MAP_REMOTE = "origin";
+
+/** `branch.<name>.<key>` → name and key (subsection split on the first and last dot; names may hold dots). */
+function branchKey(key: string): { name: string; key: string } | null {
+ const first = key.indexOf(".");
+ const last = key.lastIndexOf(".");
+ if (first === -1 || last === first) return null;
+ if (key.slice(0, first).toLowerCase() !== "branch") return null;
+ return { name: key.slice(first + 1, last), key: key.slice(last + 1).toLowerCase() };
+}
+
 /**
- * Snapshot of the git state a worker could tamper with: the shared `config`,
- * per-worktree `config.worktree` files, and the hooks directory. Taken before
- * the worker runs; `assertGitUntouched` compares it before any git call after.
+ * The shared `config` as hashable bytes, less the branch-tracking entries
+ * ranger writes for its own node branches. Adding a node worktree off
+ * origin/<base> writes `branch."node/…".remote` + `.merge` to the SHARED
+ * config, so a second node started in the same clone during a worker session
+ * tripped the first one's tamper check (node #63: seelite #212 parked by
+ * #663). Remove, don't select: every other record stays in the hash, and a
+ * node-branch section is dropped only when it holds exactly `remote=origin`
+ * and `merge=refs/heads/<base>`. Parsed by git without includes, so an
+ * include line is hashed as the line it is; a file git cannot parse is
+ * hashed raw, never as an empty listing.
  */
-export function gitConfigSnapshot(canonical: string): string {
+function configRecords(file: string, base: string): Buffer | string {
+ if (!existsSync(file)) return "(absent)";
+ const listed = spawnSync(
+  "git",
+  [
+   "-c", "core.hooksPath=/dev/null",
+   "-c", "core.fsmonitor=false",
+   "config", "--file", file, "--no-includes", "--list", "--null",
+  ],
+  { env: minimalGitEnv(), encoding: "utf8", timeout: 10_000 },
+ );
+ if (listed.status !== 0 || listed.error !== undefined) {
+  return Buffer.concat([Buffer.from("(unparsed)\0"), readFileSync(file)]);
+ }
+ // --null: each record ends in NUL; the key ends at the first newline, and a
+ // valueless boolean key has none.
+ const records = listed.stdout
+  .split("\0")
+  .filter((r) => r.length > 0)
+  .map((r) => {
+   const nl = r.indexOf("\n");
+   return nl === -1
+    ? { key: r, value: null }
+    : { key: r.slice(0, nl), value: r.slice(nl + 1) };
+  });
+ const sections = new Map<string, { key: string; value: string | null }[]>();
+ for (const { key, value } of records) {
+  const parsed = branchKey(key);
+  if (parsed === null) continue;
+  const entries = sections.get(parsed.name) ?? [];
+  entries.push({ key: parsed.key, value });
+  sections.set(parsed.name, entries);
+ }
+ const own = new Set<string>();
+ for (const [name, entries] of sections) {
+  const remote = entries.filter((e) => e.key === "remote");
+  const merge = entries.filter((e) => e.key === "merge");
+  if (
+   NODE_BRANCH.test(name) &&
+   entries.length === 2 &&
+   remote.length === 1 &&
+   merge.length === 1 &&
+   remote[0].value === MAP_REMOTE &&
+   merge[0].value === `refs/heads/${base}`
+  ) {
+   own.add(name);
+  }
+ }
+ return JSON.stringify(
+  records
+   .filter(({ key }) => {
+    const parsed = branchKey(key);
+    return parsed === null || !own.has(parsed.name);
+   })
+   .map(({ key, value }) => (value === null ? key : `${key}=${value}`))
+   .sort(),
+ );
+}
+
+/**
+ * Snapshot of the git state a worker could tamper with: the shared `config`
+ * (less ranger's own node-branch tracking, see `configRecords`), per-worktree
+ * `config.worktree` files, and the hooks directory. Taken before the worker
+ * runs; `assertGitUntouched` compares it before any git call after. `base` is
+ * the map's base branch, the merge target of those tracking entries: the
+ * snapshot and its assert must be given the same one.
+ */
+export function gitConfigSnapshot(canonical: string, base = "main"): string {
  const gitDir = join(canonical, ".git");
  const hash = createHash("sha256");
  const add = (file: string) => {
   hash.update(file);
   hash.update(existsSync(file) ? readFileSync(file) : "(absent)");
  };
- add(join(gitDir, "config"));
+ const config = join(gitDir, "config");
+ hash.update(config);
+ hash.update(configRecords(config, base));
  add(join(gitDir, "config.worktree"));
  const worktrees = join(gitDir, "worktrees");
  if (existsSync(worktrees)) {
@@ -95,8 +187,12 @@ export function gitConfigSnapshot(canonical: string): string {
  return hash.digest("hex");
 }
 
-export function assertGitUntouched(canonical: string, snapshot: string): void {
- if (gitConfigSnapshot(canonical) !== snapshot) {
+export function assertGitUntouched(
+ canonical: string,
+ snapshot: string,
+ base = "main",
+): void {
+ if (gitConfigSnapshot(canonical, base) !== snapshot) {
   throw new GitSafetyError(
    "the git config or hooks changed while the worker ran — refusing to run git against a tampered checkout",
   );
@@ -180,10 +276,12 @@ export async function vettedPush(opts: {
  branch: string;
  token: string;
  configSnapshot: string;
+ /** The map's base, as given to `gitConfigSnapshot` (default main). */
+ base?: string;
  /** What to push (default HEAD); research pushes its named local branch. */
  source?: string;
 }): Promise<void> {
- assertGitUntouched(opts.canonical, opts.configSnapshot);
+ assertGitUntouched(opts.canonical, opts.configSnapshot, opts.base);
  const push = await safeGit(
   ["push", "--no-verify", "origin", `${opts.source ?? "HEAD"}:refs/heads/${opts.branch}`],
   { cwd: opts.worktree, token: opts.token, timeoutMs: 120_000 },

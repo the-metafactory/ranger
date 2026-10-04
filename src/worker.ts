@@ -745,7 +745,7 @@ async function runResearch(
    (async (p: string, opts: RunOptions) =>
     runCmd(workerCmd[0], [...workerCmd.slice(1), p], opts));
 
-  const snapshot = gitConfigSnapshot(canonical);
+  const snapshot = gitConfigSnapshot(canonical, map.base);
   fence("spawn the worker");
   const workerResult = await workerRun(prompt, {
    cwd: worktree,
@@ -781,7 +781,7 @@ async function runResearch(
   // close gate probes, with hooks disabled and the git config checked against
   // the pre-worker snapshot (#23: the worker shares the canonical .git).
   try {
-   assertGitUntouched(canonical, snapshot);
+   assertGitUntouched(canonical, snapshot, map.base);
    const head = await resolveBranchSha(canonical, branch);
    if (head === null) {
     throw new GitSafetyError(`research findings branch ${branch} is missing from the canonical checkout`);
@@ -795,6 +795,7 @@ async function runResearch(
     branch,
     token,
     configSnapshot: snapshot,
+    base: map.base,
     source: sha,
    });
   } catch (error) {
