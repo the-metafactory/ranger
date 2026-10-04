@@ -253,12 +253,12 @@ export function* claudeRateLimitEvents(lines: string[]): Generator<ClaudeRateLim
 /**
  * The only Claude stream-json lines ranger reads: rate_limit_events and the
  * final result event. A worker run keeps just these as they stream (the
- * verbose stream carries every tool result). A quoted `"type":"result"`
+ * verbose stream carries every tool result). A quoted `"type":...` key
  * inside a JSON string is escaped, so only a real key matches; the parsers
  * re-check the top-level type.
  */
 export function isClaudeSignalLine(line: string): boolean {
- return line.includes("rate_limit_event") || line.includes('"type":"result"');
+ return line.includes('"type":"rate_limit_event"') || line.includes('"type":"result"');
 }
 
 /**
