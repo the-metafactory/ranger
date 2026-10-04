@@ -152,8 +152,12 @@ export function readCodexQuota(opts: { timeoutMs?: number } = {}): Promise<Quota
    done = true;
    clearTimeout(timer);
    child.kill("SIGTERM");
-   rmSync(scratch, { recursive: true, force: true });
    fn();
+   try {
+    rmSync(scratch, { recursive: true, force: true });
+   } catch {
+    // a leftover empty scratch dir never blocks the read
+   }
   };
   const timer = setTimeout(
    () => settle(() => reject(new Error("codex app-server timed out"))),

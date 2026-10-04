@@ -1,8 +1,8 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "30eb7280-f2f6-4d24-840c-09180a372020",
-  "prevId": "a6447003-0fdd-48e8-9062-aed5367a71b7",
+  "id": "fbc80c97-dcde-43c9-a142-68fe55546611",
+  "prevId": "93a3a180-e29a-4fe7-8f9f-d5606371bd4d",
   "tables": {
     "escalation_destinations": {
       "name": "escalation_destinations",
@@ -222,6 +222,67 @@
       "indexes": {},
       "foreignKeys": {},
       "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {}
+    },
+    "head_substrates": {
+      "name": "head_substrates",
+      "columns": {
+        "repo": {
+          "name": "repo",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "sha": {
+          "name": "sha",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "node_id": {
+          "name": "node_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "substrate": {
+          "name": "substrate",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "recorded_at": {
+          "name": "recorded_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "head_substrates_recorded_at_idx": {
+          "name": "head_substrates_recorded_at_idx",
+          "columns": [
+            "recorded_at"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {
+        "head_substrates_repo_sha_pk": {
+          "columns": [
+            "repo",
+            "sha"
+          ],
+          "name": "head_substrates_repo_sha_pk"
+        }
+      },
       "uniqueConstraints": {},
       "checkConstraints": {}
     },
