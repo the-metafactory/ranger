@@ -1,6 +1,5 @@
 #!/usr/bin/env bun
-import { implementLane, startsImplementSession } from "./lanes.ts";
-import { laneHeldMessage, recordImplementStart, mapKey, pickMap, resumeMap } from "./maps.ts";
+import { mapKey, pickMap, resumeMap } from "./maps.ts";
 import { Command } from "commander";
 import { join, resolve } from "node:path";
 import {
@@ -14,6 +13,7 @@ import {
  graphFrontier,
  graphNode,
  type FrontierEntry,
+ GRAPH_CALL_TIMEOUT_MS,
  type NodeResult,
 } from "./graph.ts";
 import {
@@ -38,9 +38,12 @@ import {
 } from "./identity.ts";
 import { runNode } from "./worker.ts";
 import { sweepMap } from "./sweep.ts";
-import { spawnRunNodeDetached, walk } from "./walk.ts";
+import { walk } from "./walk.ts";
 import { holdAwake } from "./awake.ts";
 import { buildNow } from "./build-now.ts";
+import { BUILD_NOW_CLAIM_START_BY_MS } from "./build-now-bounds.ts";
+import { resumeNode } from "./resume-node.ts";
+import type { RunOptions } from "./exec.ts";
 import { startServe } from "./serve.ts";
 import {
  escalateMaps,
@@ -187,9 +190,9 @@ function loadCtx(configPath: string): {
 }
 
 /** Resolve the write credential + bot identity for a map, gating the principal. */
-async function writeContext(config: RangerConfig, map: RangerMapConfig) {
+async function writeContext(config: RangerConfig, map: RangerMapConfig, opts: RunOptions = {}) {
  const credential = resolveWriteToken(config, map.repo);
- const botIdentity = await resolveBotIdentity(config, credential.token);
+ const botIdentity = await resolveBotIdentity(config, credential.token, opts);
  assertNotPrincipal(config, botIdentity);
  return { token: credential.token, botIdentity };
 }
@@ -249,13 +252,7 @@ async function runSweep(configPath: string): Promise<string> {
  return JSON.stringify(results, null, 2);
 }
 
-/**
- * Operator verb (design §5/§7): put a parked, failed or stuck node back in
- * motion. The row returns to `claimed` and a detached run-node takes it as a
- * new occupant; the implement lane re-derives its phase from GitHub (F2), so
- * a resumed node picks up where its PR is. The tracker claim is untouched —
- * a node whose claim was released must be re-claimed by the walk instead.
- */
+/** Operator verb (design §5/§7): put a parked, failed or stuck node back in motion (src/resume-node.ts). */
 async function runResumeNode(
  nodeId: string,
  repo: string | undefined,
@@ -266,32 +263,8 @@ async function runResumeNode(
  try {
   const map = resumeMap(config, journal.listWorkers(), nodeId, repo);
   await writeContext(config, map); // the same identity gate as run-node
-  const row = journal.getWorker(nodeId, map.repo);
-  if (row === null || row.repo !== map.repo) {
-   throw new Error(`no journal row for node ${nodeId} on ${map.repo} — nothing to resume`);
-  }
-  if (row.status === "released") {
-   throw new Error(`node ${nodeId}'s claim was released — the walk re-claims it from the frontier`);
-  }
-  // A resume starts a worker session in this map's resource lane.
-  const lane = implementLane(map);
-  const takesLane = startsImplementSession(row);
-  const holder = takesLane ? journal.laneHolder(lane, { nodeId, repo: map.repo }) : null;
-  if (holder !== null && force !== true) {
-   throw new Error(laneHeldMessage(lane, holder, "resume", nodeId));
-  }
-  journal.updateWorker(nodeId, map.repo, { status: "claimed", pid: null, workerPgid: null, finishedAt: null });
-  if (takesLane) recordImplementStart(journal, map);
-  const pid = await spawnRunNodeDetached({
-   nodeId,
-   repo: map.repo,
-   root: map.root,
-   cliEntry: join(import.meta.dir, "cli.ts"),
-   configPath,
-  });
-  if (pid !== null) journal.updateWorker(nodeId, map.repo, { pid });
-  journal.recordEvent("sweep", { nodeId, repo: map.repo, detail: `resume-node by operator (was ${row.status}); run-node pid ${pid ?? "none"}` });
-  return JSON.stringify({ nodeId, repo: map.repo, root: map.root, was: row.status, pid }, null, 2);
+  const result = await resumeNode(nodeId, { journal, map, configPath, force });
+  return JSON.stringify(result, null, 2);
  } finally {
   journal.close();
  }
@@ -311,8 +284,12 @@ async function runBuildNow(
  try {
   const map = pickMap(config, selector);
   if (map.walk === "none") throw new Error(`${mapKey(map)} is walk: none — registered, not walked`);
-  const { token, botIdentity } = await writeContext(config, map);
-  const result = await buildNow(nodeId, { config, configPath, journal, map, token, botIdentity, force });
+  // Bounded, as every read before the claim is; `claimBy` below keeps the
+  // claim itself inside the dashboard's kill however long they took. Counted
+  // from the process start, as the dashboard's timer is.
+  const { token, botIdentity } = await writeContext(config, map, { timeoutMs: GRAPH_CALL_TIMEOUT_MS });
+  const claimBy = new Date(performance.timeOrigin + BUILD_NOW_CLAIM_START_BY_MS);
+  const result = await buildNow(nodeId, { config, configPath, journal, map, token, botIdentity, force, claimBy });
   return JSON.stringify(result, null, 2);
  } finally {
   journal.close();

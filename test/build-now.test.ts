@@ -10,6 +10,7 @@ import { openJournal, type Journal } from "../src/journal.ts";
 import type { AnnounceContext } from "../src/announce.ts";
 import type { SpawnRunNodeArgs } from "../src/walk.ts";
 import { claimLockFile, withClaimLock } from "../src/claim-lock.ts";
+import { resumeNode } from "../src/resume-node.ts";
 
 /**
  * node #58 — `ranger build-now`: the walk's claim for one chosen node. The
@@ -338,6 +339,38 @@ describe("node #58 — build-now refuses", () => {
   expect(r.journal.listEvents(REPO).map((e) => e.kind)).toEqual(["announced"]);
   expect(r.journal.spawnsToday(new Date("2026-10-04T10:00:00Z"))).toBe(0);
  });
+
+ test("a claim not started by its start-by time: nothing announced or claimed", async () => {
+  const r = rig();
+  const claimBy = new Date("2026-10-04T09:59:59Z");
+  expect(await refusal(buildNow("10", r.ctx({ claimBy })))).toMatch(/past its start-by time.*before the announce/);
+  untouched(r, "10");
+ });
+
+ test("a start-by time passing during the announce stops before the graph claim", async () => {
+  const r = rig();
+  let clock = new Date("2026-10-04T10:00:00Z");
+  const announce = r.ctx().announce!;
+  const message = await refusal(
+   buildNow(
+    "10",
+    r.ctx({
+     claimBy: new Date("2026-10-04T10:00:30Z"),
+     now: () => clock,
+     announce: async (map, a) => {
+      clock = new Date("2026-10-04T10:00:31Z");
+      return announce(map, a);
+     },
+    }),
+   ),
+  );
+  expect(message).toMatch(/past its start-by time.*before the graph claim/);
+  expect(r.claimed).toHaveLength(0);
+  expect(r.spawned).toHaveLength(0);
+  expect(r.journal.getWorker("10", REPO)).toBeNull();
+  expect(r.journal.listEvents(REPO).map((e) => e.kind)).toEqual(["announced"]);
+  expect(r.journal.spawnsToday(clock)).toBe(0);
+ });
 });
 
 describe("node #58 — concurrent claims are serialized by the claim lock", () => {
@@ -453,6 +486,48 @@ describe("node #58 — concurrent claims are serialized by the claim lock", () =
   await walkClaim;
   expect(await refusal(build)).toMatch(/escalate-hitl.*never forced/);
   untouched(r, "10");
+ });
+
+ test("a resume during build-now's announce waits for the lock, then finds the lane held", async () => {
+  const r = rig();
+  // A parked implement worker the operator resumes while build-now announces #10.
+  r.journal.upsertWorker({ nodeId: "20", repo: REPO, root: 1, status: "parked", lane: "implement", pid: null });
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => (release = resolve));
+  let entered!: () => void;
+  const announcing = new Promise<void>((resolve) => (entered = resolve));
+  const build = buildNow(
+   "10",
+   r.ctx({
+    announce: async (_map, a) => {
+     entered();
+     await held;
+     return { messageId: `msg-${a.nodeId}` };
+    },
+   }),
+  );
+  await announcing;
+  const resumed: SpawnRunNodeArgs[] = [];
+  const resume = resumeNode("20", {
+   journal: r.otherJournal(),
+   map: r.config.maps[0],
+   configPath: "/c/ranger.yaml",
+   spawnRunNode: async (args) => {
+    resumed.push(args);
+    return 4343;
+   },
+  });
+  const resumeOutcome = resume.then(
+   () => null,
+   (error: Error) => error.message,
+  );
+  await Bun.sleep(300);
+  expect(r.journal.getWorker("20", REPO)?.status).toBe("parked");
+  release();
+  expect((await build).nodeId).toBe("10");
+  expect(await resumeOutcome).toMatch(/held by #10 .*--force/);
+  expect(resumed).toHaveLength(0);
+  expect(r.journal.getWorker("20", REPO)?.status).toBe("parked");
  });
 
  test("a claim lock held past the wait is a refusal to press again, with nothing touched", async () => {

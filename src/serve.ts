@@ -44,6 +44,7 @@ import { planTick, walkableCandidates } from "./candidates.ts";
 import { pidAlive as defaultPidAlive } from "./exec.ts";
 import { Journal, type WorkerRow } from "./journal.ts";
 import { implementLane, workerLane, type ImplementLane } from "./lanes.ts";
+import { BUILD_NOW_TIMEOUT_MS } from "./build-now-bounds.ts";
 import { activeCooldown, readGraphqlBudget } from "./budget.ts";
 import { cachedFrontier } from "./frontier-cache.ts";
 import { type FrontierEntry, graphFrontier, RateLimitError } from "./graph.ts";
@@ -562,29 +563,23 @@ export interface VerbRun {
 }
 
 const TAIL_LINES = 20;
-/**
- * The dashboard bound on one build-now. The verb bounds what it does up to
- * the claimed row at about three minutes: the frontier read (60 s,
- * GRAPH_CALL_TIMEOUT_MS), the claim-lock wait (30 s, BUILD_NOW_LOCK_WAIT_MS),
- * the announce (30 s) and the claim (60 s). This sits well above that sum, so
- * a kill lands on a verb hung past its own bounds, not between a graph claim
- * and its journal row. (The token-login read before all of it has no bound
- * of its own; a kill there happens before anything is claimed.)
- */
-const BUILD_NOW_TIMEOUT_MS = 300_000;
 /** How long a timed-out verb gets after SIGTERM before its group is SIGKILLed. */
 const KILL_GRACE_MS = 5_000;
 /** The exit code a timed-out verb reports (timeout(1)'s), whatever the child did. */
 export const VERB_TIMEOUT_CODE = 124;
 
 /**
- * Run a ranger verb detached in its own process group and wait for its exit:
- * the verb returns once its run-node is spawned, and that worker (detached
- * again, stdio ignored) outlives both. A verb still running at the timeout
- * gets SIGTERM, then SIGKILL after a grace period, both to its group; it
- * resolves as a timeout failure (code 124) no later than the kill,
- * whatever the child exits with. The SIGKILL stays scheduled when the verb
- * itself exits on SIGTERM: a descendant that ignored it is still in the group.
+ * Run a ranger verb detached in its own process group and wait for its exit.
+ * The bound is the dashboard's (BUILD_NOW_TIMEOUT_MS); the verb refuses to
+ * start a graph claim it could not finish before it (build-now-bounds.ts), so
+ * a kill lands on a verb hung past its own bounds, not between a graph claim
+ * and its journal row. The verb returns once its run-node is spawned, and
+ * that worker (detached again, stdio ignored) outlives both. A verb still
+ * running at the timeout gets SIGTERM, then SIGKILL after a grace period,
+ * both to its group; it resolves as a timeout failure (code 124) no later
+ * than the kill, whatever the child exits with. The SIGKILL stays scheduled
+ * when the verb itself exits on SIGTERM: a descendant that ignored it is
+ * still in the group.
  */
 export function runVerb(
  argv: string[],
@@ -694,10 +689,17 @@ function tokenMatches(given: string | null, token: string): boolean {
  return a.length === b.length && timingSafeEqual(a, b);
 }
 
-export function createHandler(ctx: HandlerContext): (req: Request) => Promise<Response> {
+/** The part of Bun's server the handler uses: a per-request idle timeout. */
+export interface RequestTimeouts {
+ timeout(req: Request, seconds: number): void;
+}
+
+export function createHandler(
+ ctx: HandlerContext,
+): (req: Request, server?: RequestTimeouts) => Promise<Response> {
  const hosts = [`127.0.0.1:${ctx.port}`, `localhost:${ctx.port}`];
  const origins = hosts.map((h) => `http://${h}`);
- return async (req: Request): Promise<Response> => {
+ return async (req: Request, server?: RequestTimeouts): Promise<Response> => {
   const url = new URL(req.url);
   // DNS rebinding: a page on another name must not read or drive this server.
   const host = req.headers.get("host") ?? url.host;
@@ -755,6 +757,12 @@ export function createHandler(ctx: HandlerContext): (req: Request) => Promise<Re
    }
    const argv = ctx.buildNowCommand(map, node.id);
    if (body.dryRun === true) return json(200, { dryRun: true, argv });
+   // The verb runs for minutes at most, silent until it exits, so this
+   // request's idle timeout (Bun's default 10 s, 255 s at most) is lifted:
+   // the wait is bounded by `runVerb` instead. Bun 1.3 keeps a pending
+   // response open past the idle timeout anyway (test/serve.test.ts); the
+   // explicit lift keeps the exit code from depending on that.
+   server?.timeout(req, 0);
    const run = await ctx.runVerb(argv, childEnv(process.env));
    return json(200, { nodeId: node.id, exitCode: run.code, tail: run.tail });
   }

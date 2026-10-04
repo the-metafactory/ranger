@@ -557,6 +557,56 @@ describe("node #58 — the Build now endpoint", () => {
   expect(built).toHaveLength(0);
  });
 
+ // A real loopback server with a 1 s idle timeout and a verb silent for 3 s.
+ const slowServer = async () => {
+  let handler: ReturnType<typeof createHandler> | undefined;
+  const server = Bun.serve({
+   hostname: "127.0.0.1",
+   port: 0,
+   idleTimeout: 1,
+   fetch: (req, srv) => handler!(req, srv),
+  });
+  handler = createHandler({
+   port: server.port!,
+   token: TOKEN,
+   getState: () => assembleState(inputs()),
+   refresh: () => {},
+   launch: () => {},
+   verifyGrilling: async () => null,
+   buildNowCommand: (map, nodeId) =>
+    buildNowArgv({ bin: "/bin/ranger", key: map.key, nodeId, configPath: "/c/ranger.yaml" }),
+   runVerb: async () => {
+    await Bun.sleep(3_000);
+    return { code: 0, tail: "started" };
+   },
+  });
+  try {
+   const res = await fetch(`http://127.0.0.1:${server.port}/api/build-now`, {
+    method: "POST",
+    headers: { "x-ranger-token": TOKEN, "content-type": "application/json" },
+    body: JSON.stringify(ok),
+   });
+   return { status: res.status, body: await res.json() };
+  } finally {
+   server.stop(true);
+  }
+ };
+
+ test("a verb outlasting the server's idle timeout still returns its exit code", async () => {
+  expect(await slowServer()).toEqual({ status: 200, body: { nodeId: "10", exitCode: 0, tail: "started" } });
+ }, 10_000);
+
+ test("the handler lifts the idle timeout for a build-now run, and only for one", async () => {
+  const { handler } = setup();
+  const lifted: number[] = [];
+  const server = { timeout: (_req: Request, seconds: number) => void lifted.push(seconds) };
+  await handler(post({ ...ok, dryRun: true }), server);
+  await handler(post({ key: walked.key, id: "99" }), server);
+  expect(lifted).toEqual([]);
+  await handler(post(ok), server);
+  expect(lifted).toEqual([0]);
+ });
+
  test("the argv refuses a bad id or map", () => {
   expect(() => buildNowArgv({ bin: "b", key: `${REPO}#1`, nodeId: "1;x", configPath: "c" })).toThrow();
   expect(() => buildNowArgv({ bin: "b", key: "bad repo#1", nodeId: "1", configPath: "c" })).toThrow();

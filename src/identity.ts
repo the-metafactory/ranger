@@ -112,7 +112,7 @@ export async function loginForToken(
   });
   if (result.code !== 0) {
    throw new WriteGateError(
-    `cannot resolve the identity behind the write token (gh api user, exit ${result.code}): ${result.stderr.trim()}`,
+    `cannot resolve the identity behind the write token (gh api user, exit ${result.code}${result.code === -1 ? ": killed — timed out or signalled" : ""}): ${result.stderr.trim()}`,
    );
   }
   return result.stdout.trim();
@@ -133,8 +133,9 @@ export async function loginForToken(
 export async function resolveBotIdentity(
  config: RangerConfig,
  token: string,
+ opts: RunOptions = {},
 ): Promise<string> {
- const resolved = await loginForToken(token);
+ const resolved = await loginForToken(token, opts);
  if (config.bot.identity !== undefined && config.bot.identity.length > 0) {
   if (resolved !== config.bot.identity) {
    throw new WriteGateError(

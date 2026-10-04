@@ -16,6 +16,14 @@ import { acquireLease, leaseOwnedCheck, type OwnedCheck, releaseLease, startHear
  * Both also read the frontier under it, so a node blocked or re-routed while
  * a claimer waited for the lease is seen before its claim.
  *
+ * The other paths that admit a new worker to an implement lane take it too,
+ * around their lane read, row update and spawn: `ranger resume-node` and
+ * the merge desk's send-back of a ready PR (`merge-desk.ts`). So a claim
+ * that read the lane empty is not joined there before its `claimed` row
+ * holds the lane. The sweep's respawn of a crashed worker takes no lock: that
+ * row still holds the lane for every reader above, so the respawn admits no
+ * one new.
+ *
  * It is the announce-once lease (`lock.ts`): atomic create, renewed while
  * held, reclaimable once its lease expires. A holder stopped past the lease
  * (a suspended laptop, SIGSTOP) can be reclaimed while its callback still
@@ -34,7 +42,8 @@ import { acquireLease, leaseOwnedCheck, type OwnedCheck, releaseLease, startHear
 /**
  * How long a claim waits for another claim to finish (the frontier read,
  * announce, claim and spawn are each bounded). A holder near every bound at
- * once (build-now: ~150 s) outlasts it; the walk then stops claiming that map
+ * once (build-now: ~165 s, the sentinel and frontier reads 75 s, announce 30 s,
+ * claim 60 s) outlasts it; the walk then stops claiming that map
  * for the tick, and the next tick claims.
  */
 export const CLAIM_LOCK_TIMEOUT_MS = 120_000;

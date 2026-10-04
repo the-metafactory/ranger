@@ -32,6 +32,10 @@ import {
  * spawn cap, and, without `--force`, a held implement lane. With `--force` it
  * starts beside the holder; nothing forces a HITL node.
  *
+ * A claim not started by `claimBy` is refused before it starts, so the
+ * dashboard's own kill (BUILD_NOW_TIMEOUT_MS) lands after the bounded claim
+ * and its journal row, never between them.
+ *
  * The announce is best-effort here: the principal chose this node, so a
  * Discord failure is reported (stdout and the `claimed` event) rather than
  * blocking the claim the way it blocks the walk. A pause landing during the
@@ -60,6 +64,11 @@ export interface BuildNowContext {
  now?: () => Date;
  /** How long to wait for another claim to finish (BUILD_NOW_LOCK_WAIT_MS unless injected). */
  claimLockWaitMs?: number;
+ /**
+  * The latest time the announce and graph claim may start (`claimNode`'s
+  * `claimBy`); the CLI sets it from its process start (BUILD_NOW_CLAIM_START_BY_MS).
+  */
+ claimBy?: Date;
 }
 
 export interface BuildNowResult {
@@ -165,6 +174,7 @@ export async function buildNow(nodeId: string, ctx: BuildNowContext): Promise<Bu
    spawnRunNode: ctx.spawnRunNode,
    now: ctx.now,
    owned,
+   claimBy: ctx.claimBy,
   });
   return { outcome, holder, node, lane };
  }, ctx.claimLockWaitMs ?? BUILD_NOW_LOCK_WAIT_MS).catch((error: unknown) => {

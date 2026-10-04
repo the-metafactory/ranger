@@ -164,6 +164,13 @@ export interface ClaimNodeArgs {
   * resumed holder stops instead of claiming, writing or spawning beside it.
   */
  owned?: OwnedCheck;
+ /**
+  * The latest time the announce and the graph claim may start. A caller
+  * killed at a deadline of its own (`ranger build-now` under the dashboard)
+  * sets it so the bounded claim always ends before that kill, however long
+  * the reads before it took: a late claim is refused, never started.
+  */
+ claimBy?: Date;
 }
 
 /**
@@ -277,6 +284,12 @@ export async function claimNode(args: ClaimNodeArgs): Promise<ClaimNodeOutcome> 
   }
  };
  fence("nothing was written");
+ const late = (step: string) =>
+  args.claimBy !== undefined && now().getTime() > args.claimBy.getTime()
+   ? `#${node.id} not claimed: past its start-by time (${args.claimBy.toISOString()}) before the ${step} — press again`
+   : null;
+ const lateAnnounce = late("announce");
+ if (lateAnnounce !== null) return { claimed: false, messageId: null, error: lateAnnounce };
  // Announce, fail-closed in the walk (node #7: no veto window, but announce gates the claim).
  let messageId: string | null = null;
  let announceError: string | null = null;
@@ -315,6 +328,8 @@ export async function claimNode(args: ClaimNodeArgs): Promise<ClaimNodeOutcome> 
    error: `#${node.id} not claimed: dead-man paused during the announce — claiming stopped`,
   };
  }
+ const lateClaim = late("graph claim");
+ if (lateClaim !== null) return { claimed: false, messageId, error: lateClaim };
 
  const claim = await (args.claim ?? graphClaim)(map.repo, node.id, botIdentity, token, {
   // Every graph CLI call is timeout-bound — a hung claim must not hold
@@ -330,6 +345,29 @@ export async function claimNode(args: ClaimNodeArgs): Promise<ClaimNodeOutcome> 
    error: `#${node.id} claim race lost to ${claim.holder ?? "another session"} — skipped`,
   };
  }
+ // A fresh claim's row: a node re-claimed after an earlier park must not
+ // inherit that attempt's phase, PR or review record (the implement lane
+ // re-derives them from GitHub anyway, F2).
+ const freshRow = (status: "claimed" | "parked", outcome: string | null, finishedAt: string | null) => ({
+  nodeId: node.id,
+  repo: map.repo,
+  root: map.root,
+  status,
+  attempts: 0,
+  pid: null,
+  messageId,
+  lane: args.lane,
+  workerPgid: null,
+  phase: null,
+  prNumber: null,
+  reviewRound: 0,
+  verdictSha: null,
+  verdictBlockers: null,
+  mergeMessageId: null,
+  outcome,
+  finishedAt,
+  substrate: null,
+ });
  // Fenced again after the claim's await. If the lock was reclaimed meanwhile
  // and the new holder took this node too (the same identity's claim holds),
  // it writes the row and spawns. Otherwise the node is assigned to the bot
@@ -346,57 +384,16 @@ export async function claimNode(args: ClaimNodeArgs): Promise<ClaimNodeOutcome> 
  if (journal.isPaused()) {
   const detail =
    `dead-man paused during the claim — no worker started; \`ranger resume-run\`, then \`ranger resume-node ${node.id}\``;
-  journal.upsertWorker({
-   nodeId: node.id,
-   repo: map.repo,
-   root: map.root,
-   status: "parked",
-   attempts: 0,
-   pid: null,
-   messageId,
-   lane: args.lane,
-   workerPgid: null,
-   phase: null,
-   prNumber: null,
-   reviewRound: 0,
-   verdictSha: null,
-   verdictBlockers: null,
-   mergeMessageId: null,
-   outcome: detail,
-   finishedAt: now().toISOString(),
-   substrate: null,
-  });
+  journal.upsertWorker(freshRow("parked", detail, now().toISOString()));
   journal.recordEvent("parked", { nodeId: node.id, repo: map.repo, detail: `by ${botIdentity}: ${detail}` });
   return { claimed: false, messageId, paused: true, error: `#${node.id} claimed but parked: ${detail}` };
  }
  if (args.lane === "implement") recordImplementStart(journal, map);
  journal.recordSpawn(now());
- // A fresh claim starts a clean row BEFORE the supervisor spawns: a node
- // re-claimed after an earlier park must not inherit that attempt's
- // phase, PR or review record (the implement lane re-derives them from
- // GitHub anyway, F2), and the spawned run-node must find its row to take
- // a generation. The PID is patched in after the spawn; a row with no
+ // A fresh claim starts a clean row BEFORE the supervisor spawns: the
+ // spawned run-node must find its row to take a generation. The PID is patched in after the spawn; a row with no
  // observed PID is left alone by the sweep, never flagged crashed.
- journal.upsertWorker({
-  nodeId: node.id,
-  repo: map.repo,
-  root: map.root,
-  status: "claimed",
-  attempts: 0,
-  pid: null,
-  messageId,
-  lane: args.lane,
-  workerPgid: null,
-  phase: null,
-  prNumber: null,
-  reviewRound: 0,
-  verdictSha: null,
-  verdictBlockers: null,
-  mergeMessageId: null,
-  outcome: null,
-  finishedAt: null,
-  substrate: null,
- });
+ journal.upsertWorker(freshRow("claimed", null, null));
  const pid = await (args.spawnRunNode ?? spawnRunNodeDetached)({
   nodeId: node.id,
   repo: map.repo,
@@ -526,8 +523,8 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
       errors.push(`#${node.id} vetoed — not claimed`);
       continue;
      }
-     // Every gate (the frontier, then `claimAdmission`: pause, veto, cap,
-     // in-flight row, root, lane) is re-read under the claim lock
+     // Every gate (`claimAdmission`: pause, veto, cap, in-flight row,
+     // root, lane; then the frontier) is re-read under the claim lock
      // `ranger build-now` also takes (node #58), held through the claimed
      // row and the spawn count: a frontier change, a pause, a veto or a
      // build-now landing while this tick waited for the lock is seen here,
@@ -535,16 +532,6 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
      let step: "claimed" | "skipped" | "cap" | "paused";
      try {
       step = await withClaimLock(journal, async (owned) => {
-       const fresh = (await reclassify()).find((n) => n.id === node.id);
-       const why =
-        fresh === undefined
-         ? "is no longer on the frontier"
-         : (notWalkable(fresh) ??
-          (fresh.route.route === laneOf(node.id) ? null : `routes ${fresh.route.route} since the plan`));
-       if (fresh === undefined || why !== null) {
-        errors.push(`#${node.id} ${why} — not claimed`);
-        return "skipped";
-       }
        const { refusal, laneHolder } = claimAdmission({
         journal,
         map,
@@ -570,6 +557,19 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
        }
        if (laneHolder !== null) {
         errors.push(`#${node.id} implement lane taken since the plan — not claimed`);
+        return "skipped";
+       }
+       // The frontier last: an admission refusal needs no network read while
+       // the shared lock is held. The lane is the plan's, and a node routed
+       // elsewhere since is skipped, so the admission above read the right lane.
+       const fresh = (await reclassify()).find((n) => n.id === node.id);
+       const why =
+        fresh === undefined
+         ? "is no longer on the frontier"
+         : (notWalkable(fresh) ??
+          (fresh.route.route === laneOf(node.id) ? null : `routes ${fresh.route.route} since the plan`));
+       if (fresh === undefined || why !== null) {
+        errors.push(`#${node.id} ${why} — not claimed`);
         return "skipped";
        }
 
