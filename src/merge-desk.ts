@@ -1,7 +1,8 @@
 import { implementLane } from "./lanes.ts";
 import { recordImplementStart, mapKey } from "./maps.ts";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
-import { DiscordAnnouncer } from "./announce.ts";
+import { DiscordClient, type DiscordFile } from "./discord.ts";
+import { viewsCard, viewsDirectory } from "./views.ts";
 import {
  gatingFindings,
  NEEDS_EYE_LABEL,
@@ -42,7 +43,7 @@ export interface MergeDeskContext {
  botIdentity: string;
  github?: GitHubPort;
  /** Post a message to the map's channel; returns the message id. */
- post?: (content: string, label: string) => Promise<string>;
+ post?: (content: string, label: string, files?: readonly DiscordFile[], embeds?: readonly { description: string }[]) => Promise<string>;
  /** Spawn a detached run-node (the resume-for-close); returns its PID. */
  spawn?: (nodeId: string, repo: string, root: number) => Promise<number | null>;
 }
@@ -70,9 +71,11 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
  const github = ctx.github ?? realGitHub;
  const repo = map.repo;
  const result: MergeDeskResult = { cards: [], merged: [], resumed: [], parked: [], pending: [], errors: [] };
+ let discord: DiscordClient | undefined;
  const post =
   ctx.post ??
-  ((content: string, label: string) => DiscordAnnouncer.fromMap(map).post(content, label));
+  ((content: string, _label: string, files?: readonly DiscordFile[], embeds?: readonly { description: string }[]) =>
+   (discord ??= DiscordClient.fromMap(map)).post(content, undefined, files, embeds));
 
  const waiting = journal
   .listWorkers(repo, map.root)
@@ -237,10 +240,8 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   // Auto-merge (principal, 2026-10-03): on a map that opts in, ranger
   // squash-merges the gate-passed PR itself, pinned to the gated head, unless
   // the node is labelled ranger:needs-eye. The close follows on this tick.
-  const needsEye = map.autoMerge
-   ? (await github.issueLabels(repo, Number(row.nodeId), token)).includes(NEEDS_EYE_LABEL)
-   : true;
-  if (!needsEye) {
+  const needsEye = (await github.issueLabels(repo, Number(row.nodeId), token)).includes(NEEDS_EYE_LABEL);
+  if (map.autoMerge && !needsEye) {
    await github.mergePr(repo, pr.number, gate.headSha, pr.title, token);
    journal.recordEvent("merged", {
     nodeId: row.nodeId,
@@ -269,19 +270,31 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    return;
   }
 
-  const messageId = await post(
-   [
+  const content = [
     `:ranger: **merge needed** #${row.nodeId} — ${title}`,
     `map: ${mapKey(map)}`,
     `Gate passed at \`${gate.headSha.slice(0, 8)}\`: CI green, mergeable, base \`${map.base}\`, sage ${last?.round ?? "?"} round(s), the last with 0 blockers and 0 majors (machine evidence, not a sign-off).`,
     ...(probesRequired
      ? [`Probes passed at \`${gate.headSha.slice(0, 8)}\` (selection ${probe?.mode ?? "?"}, ${probe?.selected ?? "?"} probe(s)). Only the selected probes ran, not the full suite.`]
      : ["No probe tier on this map: CI and the tests are the only automated checks."]),
-    map.autoMerge
+    needsEye
      ? `Labelled \`${NEEDS_EYE_LABEL}\`: your eye is the check. Merge it by hand (squash); ranger closes the node after the merge.`
      : "Merge it by hand (squash). For a `propose` node your merge is the ratification. Ranger closes the node after the merge; it never merges itself.",
-   ].join("\n"),
+   ].join("\n");
+  let evidence: ReturnType<typeof viewsCard> | undefined;
+  if (needsEye) {
+   try { evidence = viewsCard(viewsDirectory(journal.path, repo, row.nodeId, gate.headSha), gate.headSha); }
+   catch (error) { evidence = { summary: `Sheet could not be made: ${String(error).slice(-500)}`, files: [] }; }
+  }
+  const fits = evidence === undefined || content.length + evidence.summary.length + 1 <= 2000;
+  const messageId = await post(
+   fits && evidence ? `${content}\n${evidence.summary}` : content,
    `merge card for #${row.nodeId}`,
+   evidence?.files,
+   !fits && evidence ? [
+    { description: evidence.summary.slice(0, 4096) },
+    ...(evidence.summary.length > 4096 ? [{ description: evidence.summary.slice(4096) }] : []),
+   ] : undefined,
   );
   journal.updateWorker(row.nodeId, repo, { mergeMessageId: messageId });
   journal.recordEvent("merge-card", { nodeId: row.nodeId, repo, detail: `PR #${pr.number}, message ${messageId}` });

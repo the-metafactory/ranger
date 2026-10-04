@@ -74,6 +74,9 @@ maps:
       # exact list through PROBE_SELECTION/PROBE_FILES.
       probeRetry: PROBE_SELECTION=1 PROBE_FILES={failed} npm run probe
       probeTimeoutMin: 30
+      views: PROBE_ORIGIN={origin} npm run views -- --label {label} --out {out}
+      viewsServe: npx vite --port {port} --strictPort
+      viewsDiff: node scripts/diff-view-set.mjs {out} {a} {b}
     discord:
       tokenEnv: RANGER_DISCORD_TOKEN
       channelId: "1487052222067118111"
@@ -91,6 +94,9 @@ maps:
       probe: 'npm run probe:pr -- --base origin/main --head HEAD --intent "Ranger implement lane: the diff on this branch implements orienteer node #{node}; select every browser probe the changed files can affect."'
       probeRetry: PROBE_SELECTION=1 PROBE_FILES={failed} npm run probe
       probeTimeoutMin: 30
+      views: PROBE_ORIGIN={origin} npm run views -- --label {label} --out {out}
+      viewsServe: npx vite --port {port} --strictPort
+      viewsDiff: node scripts/diff-view-set.mjs {out} {a} {b}
     discord:
       tokenEnv: RANGER_DISCORD_TOKEN
       channelId: "1487052222067118111"

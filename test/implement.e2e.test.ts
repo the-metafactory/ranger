@@ -21,6 +21,7 @@ import { LAST_IMPLEMENT_MAP } from "../src/maps.ts";
 import { sweepMap } from "../src/sweep.ts";
 import { runNode, type RunNodeContext } from "../src/worker.ts";
 import { baseConfigLines, createCanonicalRepo, GIT_ENV } from "./support.ts";
+import { viewsDirectory } from "../src/views.ts";
 
 const fixturesBin = join(import.meta.dir, "fixtures", "bin");
 const dataDir = join(import.meta.dir, "fixtures", "data");
@@ -831,6 +832,110 @@ describe("implement lane (node #23)", () => {
   expect(tick.mergeDesk?.cards).toEqual(["20"]);
   expect(r.github.merges).toEqual([]);
   expect(posts[0]).toContain("your eye is the check");
+ }, 60_000);
+
+ test("needs-eye capture refusal posts its reason on the merge card and PR without parking", async () => {
+  const r = await rig({ autoMerge: true, probe: "fake-probe ok {node}" });
+  cleanup.push(r.dir);
+  r.github.labels.set(20, ["ranger:needs-eye"]);
+  Object.assign(r.ctx.map.commands, { views: "capture {label} {out} {origin}", viewsServe: "serve {port}", viewsDiff: "diff {out} {a} {b}" });
+  let stopped = false;
+  let captures = 0;
+  r.ctx.viewsDependencies = {
+   freePort: async () => 45678,
+   startServer: async () => ({ stop: async () => { stopped = true; } }),
+   run: async (_bin, _args, opts) => {
+    expect((r.github.comments.get(1) ?? []).some(c => c.body.includes("ranger:probes") && c.body.includes("result=pass"))).toBe(true);
+    expect(opts?.env?.RANGER_WRITE_TEST).toBeUndefined();
+    captures++;
+    return { code: 1, stdout: "", stderr: "software renderer refused" };
+   },
+  };
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("awaiting-merge");
+  expect(captures).toBe(1);
+  expect(stopped).toBe(true);
+  const comments = r.github.comments.get(1) ?? [];
+  expect(comments.find(c => c.body.includes("ranger:views"))?.body).toContain("software renderer refused");
+  const posts: string[] = [];
+  const tick = await sweepMap({
+   config: r.ctx.config, journal: r.journal, map: r.ctx.map, token: "ghp_write", botIdentity: BOT, github: r.github,
+   post: async (content) => { posts.push(content); return "views-failure-card"; },
+   respawn: async () => DEAD_PID,
+  });
+  expect(tick.mergeDesk?.cards).toEqual(["20"]);
+  expect(tick.mergeDesk?.parked).toEqual([]);
+  expect(r.journal.getWorker("20", r.ctx.map.repo)?.status).toBe("awaiting-merge");
+  expect(posts[0]).toContain("Sheet could not be made");
+  expect(posts[0]).toContain("software renderer refused");
+  expect(r.github.merges).toEqual([]);
+ }, 60_000);
+
+ test("needs-eye evidence captures after probes and reaches the card in most-changed pairs with full PR table", async () => {
+  const r = await rig({ probe: "fake-probe ok {node}" });
+  cleanup.push(r.dir);
+  r.github.labels.set(20, ["ranger:needs-eye"]); // manual-merge maps carry evidence too
+  Object.assign(r.ctx.map.commands, { views: "capture {label} {out} {origin}", viewsServe: "serve {port}", viewsDiff: "diff {out} {a} {b}" });
+  const labels: string[] = [];
+  const capturedCwds: string[] = [];
+  let stops = 0;
+  r.ctx.viewsDependencies = {
+   freePort: async () => 45678,
+   startServer: async () => ({ stop: async () => { stops++; } }),
+   run: async (_bin, args, opts) => {
+    expect((r.github.comments.get(1) ?? []).some(c => c.body.includes("ranger:probes") && c.body.includes("result=pass"))).toBe(true);
+    expect(r.github.prs.get(1)?.draft).toBe(true); // before ready
+    expect(opts?.env?.RANGER_WRITE_TEST).toBeUndefined();
+    const command = args[1];
+    if (command.startsWith("capture")) {
+     const [, label, out] = command.match(/^capture '([^']+)' '([^']+)'/)!;
+     labels.push(label);
+     capturedCwds.push(opts!.cwd!);
+     mkdirSync(join(out, label), { recursive: true });
+     for (const view of ["hull", "station", "sky"]) writeFileSync(join(out, label, `${view}.png`), "PNG");
+     writeFileSync(join(out, "index.html"), "full contact sheet");
+    }
+    const noise = command.endsWith("'after' 'after2'");
+    return { code: 0, stderr: "", stdout: command.startsWith("diff") ?
+     `hull moved >24/255: ${noise ? 0.1 : 2}% any change: 3%\nstation moved >24/255: ${noise ? 0.2 : 5}% any change: 6%\nsky moved >24/255: 0% any change: 0%\n` : "" };
+   },
+  };
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  expect(labels).toEqual(["before", "after", "after2"]);
+  expect(stops).toBe(2);
+  expect(capturedCwds[0]).not.toBe(capturedCwds[1]);
+  expect(capturedCwds[1]).toBe(capturedCwds[2]);
+  expect(existsSync(capturedCwds[0])).toBe(false);
+  const pr = await r.github.getPr("acme/widgets", 1);
+  const out = viewsDirectory(r.journal.path, r.ctx.map.repo, "20", pr.headSha);
+  const comment = (r.github.comments.get(1) ?? []).find(c => c.body.includes("ranger:views"))!.body;
+  expect(comment).toContain(`<!-- ranger:views sha=${pr.headSha} -->`);
+  expect(comment).toContain("| station | 5.00% | 0.20% |");
+  expect(comment).toContain(`${out}/index.html`);
+  const posts: { content: string; names: string[] }[] = [];
+  const tick = await sweepMap({
+   config: r.ctx.config, journal: r.journal, map: r.ctx.map, token: "ghp_write", botIdentity: BOT, github: r.github,
+   post: async (content, _label, files) => { posts.push({ content, names: files?.map(f => f.name) ?? [] }); return "views-card"; },
+   respawn: async () => DEAD_PID,
+  });
+  expect(tick.mergeDesk?.cards).toEqual(["20"]);
+  expect(posts[0].names).toEqual(["station-before.png", "station-after.png", "hull-before.png", "hull-after.png"]);
+  expect(posts[0].content).toContain("sky (within control noise)");
+ }, 60_000);
+
+ test("configured views do nothing on a non-needs-eye node or after failed probes", async () => {
+  for (const probeFails of [false, true]) {
+   const r = await rig({ probe: probeFails ? "fake-probe fail {node}" : "fake-probe ok {node}" });
+   cleanup.push(r.dir);
+   if (probeFails) r.github.labels.set(20, ["ranger:needs-eye"]);
+   Object.assign(r.ctx.map.commands, { views: "capture {label} {out} {origin}", viewsServe: "serve {port}", viewsDiff: "diff {out} {a} {b}" });
+   r.ctx.viewsDependencies = {
+    run: async () => { throw new Error("capture must not run"); },
+    startServer: async () => { throw new Error("server must not start"); },
+   };
+   expect((await runNode("20", r.ctx)).status).toBe(probeFails ? "parked" : "awaiting-merge");
+   expect((r.github.comments.get(1) ?? []).some(c => c.body.includes("ranger:views"))).toBe(false);
+  }
  }, 60_000);
  // ---- substrate caps (node #45) ----
 

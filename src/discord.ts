@@ -116,6 +116,24 @@ interface DiscordHttpResult {
   bodyText: string;
 }
 
+export const DISCORD_MAX_FILES = 10;
+// Conservative file limit; leave room below the 25 MiB request limit for multipart metadata.
+export const DISCORD_MAX_FILE_BYTES = 10 * 1024 * 1024;
+export const DISCORD_MAX_FILES_BYTES = 24 * 1024 * 1024;
+export interface DiscordFile {
+  name: string;
+  data: Blob;
+  description?: string;
+}
+
+export function validateDiscordFiles(files: readonly DiscordFile[]): void {
+  if (files.length > DISCORD_MAX_FILES) throw new EscalateError("too many Discord attachments");
+  if (files.some(f => f.data.size > DISCORD_MAX_FILE_BYTES)) throw new EscalateError("Discord attachment too large");
+  if (files.reduce((sum, f) => sum + f.data.size, 0) > DISCORD_MAX_FILES_BYTES) {
+    throw new EscalateError("Discord attachments exceed the request budget");
+  }
+}
+
 export class EscalationDiscord {
   /**
    * Minimum spacing between API calls from one client — Discord throttles
@@ -140,6 +158,7 @@ export class EscalationDiscord {
     private readonly apiBase: string = resolveDiscordApiBase(),
     private readonly principalDiscordId?: string,
     cooldown: CooldownState = { until: 0 },
+    private readonly fetchFn: typeof fetch = fetch,
   ) {
     this.cooldown = cooldown;
   }
@@ -161,6 +180,7 @@ export class EscalationDiscord {
       this.apiBase,
       this.principalDiscordId,
       this.cooldown,
+      this.fetchFn,
     );
   }
 
@@ -219,7 +239,7 @@ export class EscalationDiscord {
     init: {
       method: "GET" | "POST" | "PATCH";
       headers?: Record<string, string>;
-      body?: string;
+      body?: string | FormData;
     },
     deadline?: number,
   ): Promise<DiscordHttpResult> {
@@ -251,7 +271,7 @@ export class EscalationDiscord {
         : Math.max(1, Math.min(30_000, deadline - Date.now()));
     const timer = setTimeout(() => controller.abort(), abortMs);
     try {
-      const response = await fetch(`${this.apiBase}${path}`, {
+      const response = await this.fetchFn(`${this.apiBase}${path}`, {
         method: init.method,
         headers: {
           Authorization: `Bot ${this.token}`,
@@ -274,7 +294,10 @@ export class EscalationDiscord {
     path: string,
     content: string,
     deadline?: number,
+    files: readonly DiscordFile[] = [],
+    embeds: readonly { description: string }[] = [],
   ): Promise<DiscordHttpResult> {
+    validateDiscordFiles(files);
     // Every call times out — a run can never stall indefinitely holding the
     // announce-once lock. Calls are spaced ≥1s apart. On a rate limit (429),
     // a GLOBAL cooldown must be waited out in full — retrying into it just
@@ -296,21 +319,33 @@ export class EscalationDiscord {
       }
       let response: DiscordHttpResult;
       try {
+        const payload = {
+          content,
+          allowed_mentions: {
+            parse: [],
+            users: this.principalDiscordId ? [this.principalDiscordId] : [],
+          },
+          ...(embeds.length === 0 ? {} : { embeds }),
+          ...(files.length === 0 ? {} : {
+            attachments: files.map((f, id) => ({ id, filename: f.name, description: f.description })),
+          }),
+        };
+        let body: string | FormData = JSON.stringify(payload);
+        if (files.length > 0) {
+          const form = new FormData();
+          form.append("payload_json", body);
+          files.forEach((f, id) => form.append(`files[${id}]`, f.data, f.name));
+          body = form;
+        }
         response = await this.fetchOnce(
           path,
           {
             method,
-            headers: { "Content-Type": "application/json" },
+            headers: files.length === 0 ? { "Content-Type": "application/json" } : {},
             // parse: [] suppresses untrusted @everyone/@here/role mentions in
             // graph-derived content; only the principal's id (when configured)
             // is allowed to ping.
-            body: JSON.stringify({
-              content,
-              allowed_mentions: {
-                parse: [],
-                users: this.principalDiscordId ? [this.principalDiscordId] : [],
-              },
-            }),
+            body,
           },
           deadline,
         );
@@ -382,12 +417,19 @@ export class EscalationDiscord {
   }
 
   /** Post a new card; returns the Discord message id (announce-once). */
-  async post(content: string, deadline?: number): Promise<string> {
+  async post(
+    content: string,
+    deadline?: number,
+    files: readonly DiscordFile[] = [],
+    embeds: readonly { description: string }[] = [],
+  ): Promise<string> {
     const response = await this.request(
       "POST",
       `/channels/${this.channelId}/messages`,
       content,
       deadline,
+      files,
+      embeds,
     );
     if (response.status < 200 || response.status >= 300) {
       throw new EscalateError(`discord post returned HTTP ${response.status}`);
@@ -470,6 +512,9 @@ export class EscalationDiscord {
     return true;
   }
 }
+
+/** The shared card transport, including multipart uploads and retry handling. */
+export { EscalationDiscord as DiscordClient };
 
 export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));

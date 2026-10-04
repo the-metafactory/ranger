@@ -30,6 +30,21 @@ maps:
     #   probe: 'npm run probe:pr -- --base origin/main --head HEAD --intent "… node #{node} …"'
     #   probeRetry: PROBE_SELECTION=1 PROBE_FILES={failed} npm run probe   # retry only the failures
     #   probeTimeoutMin: 30
+    #   # Informational sheet for ranger:needs-eye, after passing final-head probes.
+    #   # before = detached merge-base build; after + after2 = final head + noise control.
+    #   # {out} is outside the worktree, under the journal directory, per repo/node/SHA.
+    #   # Templates accept only these ranger-owned placeholders; leave them unquoted.
+    #   # Captures have a 30-minute timeout each; servers stop by process group.
+    #   # commands.install also installs the detached build's dependencies.
+    #   views: PROBE_ORIGIN={origin} npm run views -- --label {label} --out {out}
+    #   viewsServe: npx vite --port {port} --strictPort
+    #   viewsDiff: node scripts/diff-view-set.mjs {out} {a} {b}
+    #   # viewsDiff prints one Seelite-style row per PNG:
+    #   # hull moved >24/255: 1.23% any change: 4.56%
+    #   # Cards attach up to five changed before/after pairs, most-changed first,
+    #   # within 10 MiB/file and a 24 MiB total upload budget. Omitted views are named.
+    #   # The PR comment records the diff table and local {out}/index.html path.
+    #   # Capture/refusal/timeout is reported on the card; it never parks the node.
     # Optional allowlist: walk only these node ids (a first live run).
     # nodes: [550]
     # Optional skip list: never walk these ids (the map is otherwise walked in full).
