@@ -1,4 +1,5 @@
 import { runCmd } from "./exec.ts";
+import { runReadRetryingTransient } from "./transient.ts";
 import { writeEnv } from "./identity.ts";
 
 /**
@@ -13,6 +14,24 @@ export class GitHubError extends Error {
 }
 
 const GH_TIMEOUT_MS = 60_000;
+
+/** gh api flags that make the request a write (a method other than GET, or a body). */
+const WRITE_FLAGS = new Set(["-f", "-F", "--field", "--raw-field", "--input"]);
+
+/** A plain GET is safe to repeat; anything with a body or another method is not. */
+export function isReadRequest(args: string[]): boolean {
+ for (let i = 0; i < args.length; i++) {
+  const a = args[i];
+  if (WRITE_FLAGS.has(a) || a.startsWith("--field=") || a.startsWith("--raw-field=") || a.startsWith("--input=")) return false;
+  if (a === "-X" || a === "--method") {
+   if ((args[i + 1] ?? "").toUpperCase() !== "GET") return false;
+  } else if (a.startsWith("--method=") || a.startsWith("-X")) {
+   const method = a.startsWith("--method=") ? a.slice(9) : a.slice(2);
+   if (method.length > 0 && method.toUpperCase() !== "GET") return false;
+  }
+ }
+ return true;
+}
 
 export interface PullRequest {
  number: number;
@@ -54,7 +73,9 @@ async function ghApi(
 ): Promise<unknown> {
  const gated = writeEnv(token);
  try {
-  const result = await runCmd("gh", ["api", ...args], {
+  // Reads retry a transient GitHub error; writes run once (a timed-out POST may have landed).
+  const run = isReadRequest(args) ? runReadRetryingTransient : runCmd;
+  const result = await run("gh", ["api", ...args], {
    env: gated.env,
    timeoutMs: GH_TIMEOUT_MS,
   });

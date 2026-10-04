@@ -436,6 +436,24 @@ describe("implement lane (node #23)", () => {
   expect(readFileSync(log as string, "utf8")).toContain("build pass — exit 0");
  }, 60_000);
 
+ test("a transient GitHub error at review is not counted and leaves the row for the sweep (found live on #45)", async () => {
+  const r = await rig({});
+  cleanup.push(r.dir);
+  r.ctx.reviewer = async () => {
+   throw new Error(
+    "sage review acme/widgets#1 exited 1: gh: We couldn't respond to your request in time. Sorry about that. (https://api.github.com/graphql)",
+   );
+  };
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("failed");
+  expect(r.journal.deadmanCount()).toBe(0);
+  // Still running under this supervisor's PID: when it exits, the sweep sees a crash and respawns.
+  expect(r.journal.getWorker("20")?.status).toBe("running");
+  expect(r.journal.listEvents().some((e) => e.kind === "transient")).toBe(true);
+  // The pushed work and the PR survive for the respawn to pick up.
+  expect(r.github.prs.size).toBe(1);
+ }, 60_000);
+
  test("propose node: merge is the ratification — the close carries tested evidence and no --ci", async () => {
   const r = await rig({ autonomy: "propose" });
   cleanup.push(r.dir);

@@ -1,4 +1,4 @@
-import { runCmd } from "./exec.ts";
+import { runReadRetryingTransient } from "./transient.ts";
 import { gatedEnv } from "./token-gate.ts";
 import { workerHostEnv } from "./worker-env.ts";
 
@@ -43,7 +43,7 @@ export async function sageReview(
 ): Promise<ReviewVerdict> {
  const gated = gatedEnv(readOnlyToken, {}, workerHostEnv());
  try {
-  const result = await runCmd(
+  const result = await runReadRetryingTransient(
    opts.command ?? process.env.RANGER_SAGE_CMD ?? "sage",
    ["review", `${repo}#${prNumber}`, "--emit-verdict-block"],
    {
@@ -51,6 +51,9 @@ export async function sageReview(
     timeoutMs: opts.timeoutMs ?? REVIEW_TIMEOUT_MS,
     processGroup: true,
    },
+   // A verdict is never retried, whatever its text says; only a failed run
+   // with no verdict block whose error is GitHub-side.
+   { shouldRetry: (r) => !hasVerdictBlock(r.stdout) },
   );
   // sage exits 1 on a changes-requested verdict, after printing the review
   // and its verdict block (sage src/cli/index.ts) — that is a verdict, not a
@@ -73,6 +76,11 @@ export async function sageReview(
  } finally {
   gated.cleanup();
  }
+}
+
+/** True when stdout carries a ```json fence — the shape of sage's verdict block. */
+function hasVerdictBlock(stdout: string): boolean {
+ return /```json\s*\n[\s\S]*?\n```/.test(stdout);
 }
 
 /**

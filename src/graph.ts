@@ -1,4 +1,4 @@
-import { runCmd } from "./exec.ts";
+import { runReadRetryingTransient } from "./transient.ts";
 import { gatedEnv, type ResolvedToken } from "./token-gate.ts";
 
 /**
@@ -150,7 +150,7 @@ async function callGraph(
       somaRepo(repo),
       "--json",
     ];
-    return await runCmd("soma", cliArgs, {
+    return await runReadRetryingTransient("soma", cliArgs, {
       cwd: opts.cwd,
       timeoutMs: opts.timeoutMs,
       env: gated.env,

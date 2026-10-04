@@ -71,6 +71,16 @@ const MapSchema = z.object({
     * numeric node id — the only substitution, so no tracker text reaches it.
     */
    probe: z.string().min(1).optional(),
+   /**
+    * Optional retry for a failed probe run: only the probes that failed run
+    * again, instead of the whole suite (2026-10-04: a load-induced crash in one
+    * probe cost a 25-minute rerun). `{failed}` becomes the comma-separated
+    * probe files from the run's `FAILED: a · b` line, each checked against a
+    * plain file-name pattern; `{node}` as in `probe`. Without it, or when the
+    * first run names no failures (a timeout or a crash of the runner), the
+    * retry is the whole `probe` command.
+    */
+   probeRetry: z.string().min(1).optional(),
    /** Wall clock for one probe run, minutes. */
    probeTimeoutMin: z.number().int().positive().default(30),
   })
