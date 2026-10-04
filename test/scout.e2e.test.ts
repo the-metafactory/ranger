@@ -20,6 +20,11 @@ function writeConfig(repoTokens: Record<string, string>): string {
     "  - repo: acme/gadgets",
     "    root: 5",
     "    walk: none",
+    // Never the default journalPath: that is the live ~/.config/ranger/state.sqlite,
+    // and opening a journal applies this checkout's migrations to it (2026-10-04:
+    // a branch run of this test migrated the live journal and broke claiming).
+    "state:",
+    `  journalPath: ${join(dir, "state.sqlite")}`,
     "auth:",
     "  readOnlyTokens:",
     ...Object.entries(repoTokens).map(
@@ -146,7 +151,10 @@ describe("ranger scout — end-to-end against fake soma/gh", () => {
   });
 
   test("unknown command exits non-zero with usage help", async () => {
-    const result = await runCmd(bun, [cliPath, "tick"], {
+    // A name that can never become a real verb: this test once ran `tick`, which
+    // later became the real scheduled tick — every `bun test` then ran a real tick
+    // against the repo's ranger.yaml and migrated the live journal (2026-10-04).
+    const result = await runCmd(bun, [cliPath, "no-such-command-ranger-test"], {
       env: process.env,
       cwd: join(import.meta.dir, ".."),
     });
