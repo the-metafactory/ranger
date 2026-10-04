@@ -41,7 +41,7 @@ import { activeCooldown, readGraphqlBudget } from "./budget.ts";
 import { cachedFrontier } from "./frontier-cache.ts";
 import { type FrontierEntry, graphFrontier, RateLimitError } from "./graph.ts";
 import { runCmd } from "./exec.ts";
-import { classify, type ClassifiedNode, loadProbeRegistry } from "./route.ts";
+import { classify, classifyFrontier, type ClassifiedNode, loadProbeRegistry } from "./route.ts";
 import type { SubstrateReading } from "./journal.ts";
 import {
  activeCappedUntil,
@@ -983,13 +983,7 @@ export function stateFromJournal(
        }
      : {
         ok: true,
-        frontier: cached.frontier.frontier.map((e) =>
-         classify(e, map.repo, map.walk, registry, {
-          botIdentity: config.bot.identity,
-          allowlist: map.nodes,
-          skip: map.skip,
-         }),
-        ),
+        frontier: classifyFrontier(cached.frontier.frontier, map, registry, config.bot.identity),
         readAt: cached.fetchedAt,
         source: "ranger",
        },
