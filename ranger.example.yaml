@@ -12,6 +12,10 @@ maps:
     #                    nodes, and propose task/build nodes whose ratification
     #                    is the principal's merge of the PR
     walk: none
+    # Implement capacity: visual when commands.probe is declared, headless
+    # otherwise. One claimed/running implement worker per lane across maps.
+    # Override for GPU tests without probes, or probes that need no GPU:
+    # lane: visual   # visual | headless
     # Optional canonical-checkout override (design §4: probes run where the
     # registry says — the canonical checkout, never a worktree). Defaults to
     # <state.canonicalRoot>/<repo>.

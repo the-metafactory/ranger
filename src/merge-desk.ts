@@ -10,6 +10,7 @@ import {
 } from "./implement.ts";
 import type { Journal, WorkerRow } from "./journal.ts";
 import { evaluateMergeGate } from "./merge-gate.ts";
+import { implementLane } from "./lanes.ts";
 
 /**
  * The merge desk (design §4/§5, #23): each tick, every implement-lane row
@@ -185,13 +186,14 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    }
    // A send-back starts a worker session (fix pass or probes): it waits for
    // the implement lane like any other start. The stale card is already gone.
-   const holder = journal.implementLaneHolder(row.nodeId);
+   const lane = implementLane(map);
+   const holder = journal.laneHolder(lane, row.nodeId);
    if (holder !== null) {
     result.pending.push(row.nodeId);
     journal.recordEvent("sweep", {
      nodeId: row.nodeId,
      repo,
-     detail: `PR #${pr.number}: ${why} — waiting for the implement lane (held by #${holder.nodeId})`,
+     detail: `PR #${pr.number}: ${why} — waiting for the ${lane} implement lane (held by #${holder.nodeId})`,
     });
     return;
    }

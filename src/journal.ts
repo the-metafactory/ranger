@@ -13,6 +13,7 @@ import {
 } from "./store/schema.ts";
 import type { RangerConfig } from "./config.ts";
 import { expandHome } from "./config.ts";
+import { holdsImplementLane, workerLane, type ImplementLane, type LaneMap } from "./lanes.ts";
 
 /**
  * Journal (design §8) — the typed data-access layer over the Drizzle schema.
@@ -151,6 +152,7 @@ export class Journal {
  constructor(
   path: string,
   opened: { db: RangerDb; close: () => void } = openDb(path),
+  private readonly maps: readonly LaneMap[] = [],
  ) {
   this.path = path;
   this.db = opened.db;
@@ -162,9 +164,9 @@ export class Journal {
   * `null` when no journal exists yet. Calling a write method on it throws
   * SQLITE_READONLY rather than touching the file.
   */
- static openReadOnly(path: string): Journal | null {
+ static openReadOnly(path: string, maps: readonly LaneMap[] = []): Journal | null {
   const opened = openDbReadOnly(path);
-  return opened === null ? null : new Journal(path, opened);
+  return opened === null ? null : new Journal(path, opened, maps);
  }
 
  // ---- workers ----
@@ -269,20 +271,16 @@ export class Journal {
  }
 
  /**
-  * The implement worker holding the lane — building or under review — other
-  * than `exceptNodeId`. The lane is one at a time on this machine (design §8;
-  * concurrent browser-probe runs also degrade each other, seelite #84), and
-  * every entry point that starts an implement worker session checks it: the
-  * walk's claims, the merge desk's send-backs, and `resume-node`.
+  * One claimed/running implement worker per resource lane. Unknown maps
+  * conservatively hold both lanes until their config or row is reconciled.
   */
- implementLaneHolder(exceptNodeId?: string): WorkerRow | null {
+ laneHolder(lane: ImplementLane, exceptNodeId?: string): WorkerRow | null {
   return (
-   this.listWorkers().find(
-    (w) =>
-     w.nodeId !== exceptNodeId &&
-     w.lane === "implement" &&
-     (w.status === "claimed" || w.status === "running"),
-   ) ?? null
+   this.listWorkers().find((w) => {
+    if (w.nodeId === exceptNodeId || !holdsImplementLane(w)) return false;
+    const resolved = workerLane(w, this.maps);
+    return resolved === lane || resolved === null;
+   }) ?? null
   );
  }
 
@@ -887,5 +885,5 @@ function hydrateSubstrateReading(row: {
 
 /** Open the configured journal (default from config.state.journalPath). */
 export function openJournal(config: RangerConfig): Journal {
- return new Journal(expandHome(config.state.journalPath));
+ return new Journal(expandHome(config.state.journalPath), undefined, config.maps);
 }
