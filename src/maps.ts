@@ -1,9 +1,11 @@
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import type { Journal, WorkerRow } from "./journal.ts";
+import { implementLane, IMPLEMENT_LANES, type ImplementLane, type LaneMap } from "./lanes.ts";
 
 export const LAST_IMPLEMENT_MAP = "implement.lastMap";
-export function recordImplementStart(journal: Journal, map: { repo: string; root: number }): void {
+export function recordImplementStart(journal: Journal, map: LaneMap): void {
  journal.setHealth(LAST_IMPLEMENT_MAP, mapKey(map));
+ journal.setHealth(`${LAST_IMPLEMENT_MAP}.${implementLane(map)}`, mapKey(map));
 }
 export function mapKey(map: { repo: string; root: number }): string {
  return `${map.repo}#${map.root}`;
@@ -27,8 +29,20 @@ export function resumeMap(config: RangerConfig, rows: WorkerRow[], nodeId: strin
  return pickMap(config, mapKey(matches[0]));
 }
 
-/** Rotate past the last successful implement claim; empty/gated maps are skipped by planning. */
+/** Rotate past the map of the last implement start; empty/gated maps are skipped by planning. */
 export function mapOrder<T extends { repo: string; root: number }>(maps: readonly T[], last: string | null): T[] {
  const at = maps.findIndex(m => mapKey(m) === last);
  return at < 0 ? [...maps] : [...maps.slice(at + 1), ...maps.slice(0, at + 1)];
+}
+
+/** Each resource lane rotates independently, retaining the config's lane slots. */
+export function implementMapOrder<T extends { repo: string; root: number }>(
+ maps: readonly T[],
+ lastByLane: Partial<Record<ImplementLane, string | null>>,
+ laneOf: (map: T) => ImplementLane,
+): T[] {
+ const queues = Object.fromEntries(IMPLEMENT_LANES.map(lane => [
+  lane, mapOrder(maps.filter(m => laneOf(m) === lane), lastByLane[lane] ?? null),
+ ])) as Record<ImplementLane, T[]>;
+ return maps.map(map => queues[laneOf(map)].shift()!);
 }

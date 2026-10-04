@@ -1,5 +1,10 @@
--- Append after the substrate migrations despite the checkpoint-required filename.
--- Legacy roots are supplied by openDb from the registered map configuration.
+-- Existing registrations at the worker-root cutover; custom roots may be seeded
+-- as ordinary rows before applying this migration.
+CREATE TABLE IF NOT EXISTS ranger_legacy_roots (repo text PRIMARY KEY, root integer NOT NULL);
+--> statement-breakpoint
+INSERT OR IGNORE INTO ranger_legacy_roots (repo, root) VALUES
+ ('the-metafactory/ranger', 1), ('jcfischer/seelite', 1), ('jcfischer/seekolous', 26);
+--> statement-breakpoint
 CREATE TABLE workers_root (node_id text NOT NULL, repo text NOT NULL, root integer NOT NULL,
 pid integer, status text DEFAULT 'claimed' NOT NULL, attempts integer DEFAULT 0 NOT NULL,
 worktree text, started_at text, finished_at text, outcome text, message_id text,
@@ -35,3 +40,5 @@ FROM health JOIN ranger_legacy_roots
 ON health.key IN ('digest.' || ranger_legacy_roots.repo,
  'escalate.cursor.' || ranger_legacy_roots.repo,
  'escalate.absentCursor.' || ranger_legacy_roots.repo);
+--> statement-breakpoint
+DROP TABLE ranger_legacy_roots;

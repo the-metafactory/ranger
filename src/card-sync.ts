@@ -832,7 +832,7 @@ async function reconcileAbsentCard(
     journal.upsertEscalation({
       key,
       repo: map.repo,
-    root: map.root,
+      root: map.root,
       nodeId,
       title: prior.title,
       lastContent: content,

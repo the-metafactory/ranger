@@ -12,7 +12,9 @@ maps:
     #                    nodes, and propose task/build nodes whose ratification
     #                    is the principal's merge of the PR
     walk: none
-    # Implement capacity: one claimed/running worker across all maps.
+    # Implement resource lanes (node #57): one visual + one headless worker.
+    # Defaults: visual with commands.probe, headless otherwise.
+    # lane: headless
     # Optional canonical-checkout override (design §4: probes run where the
     # registry says — the canonical checkout, never a worktree). Defaults to
     # <state.canonicalRoot>/<repo>.

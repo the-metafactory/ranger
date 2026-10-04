@@ -3,6 +3,7 @@ import { chmodSync, existsSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { drizzle, type BunSQLiteDatabase } from "drizzle-orm/bun-sqlite";
 import { migrate } from "drizzle-orm/bun-sqlite/migrator";
+import { seedLegacyRoots } from "./legacy-roots.ts";
 import * as schema from "./schema.ts";
 
 export type RangerDb = BunSQLiteDatabase<typeof schema>;
@@ -47,33 +48,8 @@ export function openDb(
 
   const db = drizzle(sqlite, { schema });
   try {
-    // This connection-local input exists only while applying the root migration.
-    sqlite.run("CREATE TEMP TABLE ranger_legacy_roots (repo text PRIMARY KEY, root integer NOT NULL)");
-    const roots = new Map<string, number>();
-    for (const repo of new Set(maps.map(m => m.repo))) {
-      const candidates = maps.filter(m => m.repo === repo);
-      const explicit = legacyMapRoots[repo];
-      if (explicit !== undefined && !candidates.some(m => m.root === explicit)) {
-        throw new Error(`state.legacyMapRoots.${repo} must name a registered root`);
-      }
-      if (explicit !== undefined || candidates.length === 1) roots.set(repo, explicit ?? candidates[0].root);
-    }
-    for (const [repo, root] of roots) sqlite.run("INSERT INTO ranger_legacy_roots VALUES (?, ?)", [repo, root]);
-    const needsRoot = (table: string) => {
-      const columns = sqlite.query(`PRAGMA table_info(${table})`).all() as { name: string }[];
-      return columns.length > 0 && !columns.some(c => c.name === "root");
-    };
-    const unresolved = new Set<string>();
-    for (const table of ["workers", "escalations"]) {
-      if (!needsRoot(table)) continue;
-      const rows = sqlite.query(`SELECT DISTINCT repo FROM ${table}`).all() as { repo: string }[];
-      for (const { repo } of rows) if (!roots.has(repo)) unresolved.add(repo);
-    }
-    if (unresolved.size > 0) {
-      throw new Error(`Cannot backfill legacy map roots for: ${[...unresolved].sort().join(", ")}. Register one map per repo or set state.legacyMapRoots to its registered legacy root.`);
-    }
+    seedLegacyRoots(sqlite, maps, legacyMapRoots);
     migrate(db, { migrationsFolder: MIGRATIONS_DIR });
-    sqlite.run("DROP TABLE ranger_legacy_roots");
   } catch (error) {
     sqlite.close();
     throw new Error(

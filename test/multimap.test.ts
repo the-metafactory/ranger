@@ -57,6 +57,33 @@ function rig() {
 }
 
 describe("node #47 — map identity", () => {
+ test("standalone Drizzle migration backfills registered roots without application setup", () => {
+  const { dir, sqlite } = legacyJournal();
+  try {
+   const repos = ["the-metafactory/ranger", "jcfischer/seelite", "jcfischer/seekolous"];
+   repos.forEach((repo, i) => {
+    sqlite.run("INSERT INTO workers(node_id,repo,status) VALUES(?,?, 'running')", [String(i + 1), repo]);
+    sqlite.run("INSERT INTO escalations(key,repo,node_id,message_id,created_at) VALUES(?,?,?,?,?)", [repo + ":99", repo, "99", "card", "2026-10-01"]);
+   });
+   migrate(drizzle(sqlite), { migrationsFolder: join(import.meta.dir, "../drizzle") });
+   expect(sqlite.query("SELECT root FROM workers ORDER BY node_id").all()).toEqual([{ root: 1 }, { root: 1 }, { root: 26 }]);
+   expect(sqlite.query("SELECT root FROM escalations ORDER BY repo").all()).toEqual([{ root: 26 }, { root: 1 }, { root: 1 }]);
+   sqlite.run("INSERT INTO workers(node_id,repo,root) VALUES('1','jcfischer/seelite',460)");
+   expect(sqlite.query("SELECT repo FROM workers WHERE node_id='1'").all()).toHaveLength(2);
+   expect(sqlite.query("SELECT name FROM sqlite_master WHERE name='ranger_legacy_roots'").all()).toEqual([]);
+  } finally { sqlite.close(); rmSync(dir, { recursive: true, force: true }); }
+ });
+
+ test("standalone migration refuses unknown legacy roots and rolls back schema changes", () => {
+  const { dir, sqlite } = legacyJournal();
+  try {
+   sqlite.run("INSERT INTO workers(node_id,repo,status) VALUES('99','unknown/repo','running')");
+   expect(() => migrate(drizzle(sqlite), { migrationsFolder: join(import.meta.dir, "../drizzle") })).toThrow();
+   expect(sqlite.query("SELECT repo FROM workers").all()).toEqual([{ repo: "unknown/repo" }]);
+   expect((sqlite.query("PRAGMA table_info(workers)").all() as { name: string }[]).some(c => c.name === "root")).toBe(false);
+  } finally { sqlite.close(); rmSync(dir, { recursive: true, force: true }); }
+ });
+
  test("migration backfills roots, preserves worker state and rekeys repo/node ids", () => {
   const { dir, path, sqlite } = legacyJournal();
   const repos = ["the-metafactory/ranger", "jcfischer/seelite", "jcfischer/seekolous", "example/custom"];
@@ -68,7 +95,7 @@ describe("node #47 — map identity", () => {
   }
   sqlite.run("INSERT INTO health(key,value) VALUES('digest.jcfischer/seelite#460','sibling-state')");
   sqlite.close();
-  const maps = repos.map((repo, i) => ({ repo, root: roots[i] })).concat({ repo: "jcfischer/seelite", root: 460 });
+  const maps = repos.map((repo, i) => ({ repo, root: roots[i], commands: {} })).concat({ repo: "jcfischer/seelite", root: 460, commands: {} });
   const journal = new Journal(path, undefined, maps, { "jcfischer/seelite": 1 });
   try {
    expect(repos.map((repo, i) => journal.getWorker(String(i + 1), repo)?.root)).toEqual(roots);
@@ -106,7 +133,7 @@ describe("node #47 — map identity", () => {
    sqlite.close();
    try {
     expect(() => new Journal(path)).toThrow("Cannot backfill legacy map roots for: example/custom");
-    const maps = [1, 460].map(root => ({ repo: "example/custom", root }));
+    const maps = [1, 460].map(root => ({ repo: "example/custom", root, commands: {} }));
     expect(() => new Journal(path, undefined, maps)).toThrow("state.legacyMapRoots");
     expect(() => new Journal(path, undefined, maps, { "example/custom": 999 })).toThrow("must name a registered root");
     const unchanged = new Database(path);
@@ -159,7 +186,43 @@ describe("node #47 — map identity", () => {
   } finally { r.close(); }
  });
 
- test("the global lane alternates maps across restarts and serve predicts the same choice", async () => {
+ test("a crashed close-only worker neither takes capacity nor advances rotation", async () => {
+  const r = rig();
+  try {
+   r.journal.upsertWorker({ nodeId: "30", repo: REPO, root: 1, status: "running", lane: "implement" });
+   r.journal.upsertWorker({ nodeId: "31", repo: REPO, root: 460, status: "running", lane: "implement", phase: "close", pid: 2_147_483_646 });
+   r.journal.setHealth(LAST_IMPLEMENT_MAP, REPO + "#1");
+   r.journal.setHealth(`${LAST_IMPLEMENT_MAP}.headless`, REPO + "#1");
+   expect(r.journal.laneHolder("headless", { nodeId: "30", repo: REPO })).toBeNull();
+   const result = await sweepMap({ config: r.config, journal: r.journal, map: r.config.maps[1], token: "unused", botIdentity: "ivy-bot",
+    respawn: async (_id, _repo, root) => { expect(root).toBe(460); return 2_147_483_646; } });
+   expect(result.respawned).toEqual(["31"]);
+   expect(r.journal.getHealth(LAST_IMPLEMENT_MAP)).toBe(REPO + "#1");
+   expect(r.journal.getHealth(`${LAST_IMPLEMENT_MAP}.headless`)).toBe(REPO + "#1");
+   r.journal.updateWorker("31", REPO, { status: "parked", pid: null });
+   const resumed = await runCli(["resume-node", "31", "-c", r.configPath], r.env);
+   expect(resumed.code).toBe(0);
+   expect(JSON.parse(resumed.stdout).root).toBe(460);
+   expect(r.journal.getHealth(LAST_IMPLEMENT_MAP)).toBe(REPO + "#1");
+   expect(r.journal.getHealth(`${LAST_IMPLEMENT_MAP}.headless`)).toBe(REPO + "#1");
+  } finally { r.close(); }
+ });
+
+ test("a sibling respawn waits for its own resource lane without consuming an attempt", async () => {
+  const r = rig();
+  try {
+   r.journal.upsertWorker({ nodeId: "30", repo: REPO, root: 1, status: "running", lane: "implement" });
+   r.journal.upsertWorker({ nodeId: "31", repo: REPO, root: 460, status: "running", lane: "implement", pid: 2_147_483_646 });
+   let spawned = false;
+   const result = await sweepMap({ config: r.config, journal: r.journal, map: r.config.maps[1], token: "unused", botIdentity: "ivy-bot",
+    respawn: async () => { spawned = true; return 2_147_483_646; } });
+   expect(result.respawned).toEqual([]);
+   expect(spawned).toBe(false);
+   expect(r.journal.getWorker("31", REPO)?.attempts).toBe(0);
+  } finally { r.close(); }
+ });
+
+ test("a resource lane alternates maps across restarts and serve predicts the same choice", async () => {
   const r = rig();
   const predicted = () => {
    const maps = servedMaps(r.config);
@@ -187,6 +250,34 @@ describe("node #47 — map identity", () => {
    r.frontier(1, ["23"]);
    expect((await tick()).code).toBe(0);
    expect(r.journal.getWorker("23", REPO)?.root).toBe(1); // empty sibling skipped
+  } finally { r.close(); }
+ });
+
+ test("starts in another resource lane do not starve sibling map rotation", async () => {
+  const r = rig();
+  try {
+   const visual = { ...r.config.maps[0], repo: "acme/game", commands: { ...r.config.maps[0].commands, test: "bun test", probe: "true" } };
+   r.config.maps.push(visual);
+   writeFileSync(r.configPath, stringify(r.config));
+   const visualFrontier = join(r.dir, "data", "acme__game-frontier-1.json");
+   const fixture = JSON.parse(readFileSync(join(r.dir, "data", "acme__widgets-frontier-1.json"), "utf8"));
+   fixture.repo = visual.repo;
+   fixture.frontier[0].ref.id = fixture.frontier[0].node.id = "50";
+   writeFileSync(visualFrontier, JSON.stringify(fixture));
+   expect((await runCli(["walk", "-c", r.configPath], r.env)).code).toBe(0);
+   expect(r.journal.listWorkers().map(w => [w.repo, w.nodeId, w.root])).toEqual([[REPO, "20", 1], [visual.repo, "50", 1]]);
+   expect(r.journal.getHealth(LAST_IMPLEMENT_MAP)).toBe("acme/game#1");
+   r.journal.updateWorker("20", REPO, { status: "success" });
+   r.journal.updateWorker("50", visual.repo, { status: "success" });
+   fixture.frontier[0].ref.id = fixture.frontier[0].node.id = "51";
+   writeFileSync(visualFrontier, JSON.stringify(fixture));
+   const maps = servedMaps(r.config);
+   const reader = new ServeReader(r.config, maps, r.config.state.journalPath);
+   const predicted = stateFromJournal(r.config, maps, reader).maps.filter(m => m.next.lane === "implement" && !m.next.waiting).map(m => m.key);
+   expect(predicted).toEqual([REPO + "#460", "acme/game#1"]);
+   expect((await runCli(["walk", "-c", r.configPath], r.env)).code).toBe(0);
+   expect(r.journal.getWorker("21", REPO)?.root).toBe(460);
+   expect(r.journal.getWorker("51", visual.repo)?.status).toBe("claimed");
   } finally { r.close(); }
  });
 

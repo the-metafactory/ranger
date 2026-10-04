@@ -13,7 +13,7 @@ import {
 } from "./store/schema.ts";
 import type { RangerConfig } from "./config.ts";
 import { expandHome } from "./config.ts";
-import { holdsImplementLane } from "./lanes.ts";
+import { holdsImplementLane, workerLane, type ImplementLane, type LaneMap } from "./lanes.ts";
 
 /**
  * Journal (design §8) — the typed data-access layer over the Drizzle schema.
@@ -143,7 +143,7 @@ export type EventKind =
  | "substrate-capped"
  | "transient";
 
-const escalationRootFilter = (root?: number) => root === undefined ? undefined : eq(escalations.root, root);
+const rootFilter = (column: typeof workers.root | typeof escalations.root, root?: number) => root === undefined ? undefined : eq(column, root);
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -156,7 +156,7 @@ export class Journal {
  constructor(
   path: string,
   opened?: { db: RangerDb; close: () => void },
-  maps: readonly { repo: string; root: number }[] = [],
+  private readonly maps: readonly LaneMap[] = [],
   legacyMapRoots: Readonly<Record<string, number>> = {},
  ) {
   this.path = path;
@@ -170,9 +170,9 @@ export class Journal {
   * `null` when no journal exists yet. Calling a write method on it throws
   * SQLITE_READONLY rather than touching the file.
   */
- static openReadOnly(path: string): Journal | null {
+ static openReadOnly(path: string, maps: readonly LaneMap[] = []): Journal | null {
   const opened = openDbReadOnly(path);
-  return opened === null ? null : new Journal(path, opened);
+  return opened === null ? null : new Journal(path, opened, maps);
  }
 
  // ---- workers ----
@@ -281,13 +281,16 @@ export class Journal {
  }
 
  /**
-  * One claimed/running implement worker across all maps; excluding an occupant
-  * requires its repo as well as node id.
+  * One claimed/running implement worker per resource lane across all maps.
+  * Excluding an occupant requires its repo as well as node id.
   */
- implementHolder(except?: { nodeId: string; repo: string }): WorkerRow | null {
+ laneHolder(lane: ImplementLane, except?: { nodeId: string; repo: string }): WorkerRow | null {
   return (
    this.listWorkers().find((w) => {
-    return !(w.nodeId === except?.nodeId && w.repo === except?.repo) && holdsImplementLane(w);
+    if (w.nodeId === except?.nodeId && w.repo === except?.repo) return false;
+    if (!holdsImplementLane(w)) return false;
+    const resource = workerLane(w, this.maps);
+    return resource === lane || resource === null;
    }) ?? null
   );
  }
@@ -307,7 +310,7 @@ export class Journal {
     ? this.db.query.workers.findMany().sync()
     : this.db.query.workers
        .findMany({
-        where: and(eq(workers.repo, repo), root === undefined ? undefined : eq(workers.root, root)),
+        where: and(eq(workers.repo, repo), rootFilter(workers.root, root)),
        })
        .sync();
   return rows.map(hydrateWorker);
@@ -617,7 +620,7 @@ export class Journal {
    .where(
     and(
      eq(escalations.repo, repo),
-     escalationRootFilter(opts.root),
+     rootFilter(escalations.root, opts.root),
      eq(escalations.status, "open"),
      isNull(escalations.notedAt),
     ),
@@ -627,7 +630,7 @@ export class Journal {
    .findMany({
     where: and(
      eq(escalations.repo, repo),
-     escalationRootFilter(opts.root),
+     rootFilter(escalations.root, opts.root),
      eq(escalations.status, "open"),
      isNull(escalations.notedAt),
     ),
@@ -666,7 +669,7 @@ export class Journal {
    .findMany({
     where: and(
      eq(escalations.repo, repo),
-     escalationRootFilter(opts.root),
+     rootFilter(escalations.root, opts.root),
      eq(escalations.status, "open"),
      isNull(escalations.notedAt),
      // KEYSET pagination: resume strictly AFTER the last raw row seen —

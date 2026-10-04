@@ -38,10 +38,13 @@ Shipped build-path steps:
   outward action, process-group kill) and resumes its phase from GitHub. The
   approver bot (node #16) remains.
 
-One claimed/running implement worker holds the shared lane across all maps
-(node #47). Maps alternate by a persisted round-robin cursor; empty or gated
-maps are skipped. Awaiting-merge releases the lane. The dashboard shows the
-holder and the same next choice as walk. Research selection is unchanged.
+Implement resource lanes (node #57): **1 visual + 1 headless** across all maps.
+A map defaults to visual with `commands.probe`, headless otherwise; `lane` can
+override that choice. Within each lane, maps alternate by the persisted map of
+the last implement start (node #47); empty or gated maps are skipped. Claims,
+operator resumes, sweep respawns and merge-desk send-backs record starts;
+close-only runs leave the cursor unchanged. Awaiting-merge releases capacity.
+The dashboard shows both holders and the same next choices as walk.
 
 ## Scout (build-path step 1)
 

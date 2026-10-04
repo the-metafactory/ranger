@@ -1,4 +1,5 @@
-import { LAST_IMPLEMENT_MAP, recordImplementStart, mapKey, mapOrder } from "./maps.ts";
+import { implementLane, type ImplementLane } from "./lanes.ts";
+import { LAST_IMPLEMENT_MAP, recordImplementStart, mapKey, implementMapOrder } from "./maps.ts";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
 import type { RangerConfig, RangerMapConfig, WalkMode } from "./config.ts";
@@ -107,8 +108,8 @@ export interface WalkContext {
 }
 
 /** Is the implement lane held? (awaiting-merge does not hold it.) */
-export function implementLaneBusy(journal: Journal): boolean {
- return journal.implementHolder() !== null;
+export function implementLaneBusy(journal: Journal, lane: ImplementLane): boolean {
+ return journal.laneHolder(lane) !== null;
 }
 
 export async function walk(ctx: WalkContext): Promise<WalkResult> {
@@ -120,10 +121,13 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
  };
  const cliEntry = join(import.meta.dir, "cli.ts");
  // Even a worker finishing during this tick must not allow a second claim
- // across maps: at most one new implement claim per tick.
- let implementClaimed = false;
+ // across maps: at most one new implement claim per resource lane per tick.
+ const implementClaimed = new Set<ImplementLane>();
 
- for (const map of mapOrder(config.maps, journal.getHealth(LAST_IMPLEMENT_MAP))) {
+ for (const map of implementMapOrder(config.maps, {
+  visual: journal.getHealth(`${LAST_IMPLEMENT_MAP}.visual`) ?? journal.getHealth(LAST_IMPLEMENT_MAP),
+  headless: journal.getHealth(`${LAST_IMPLEMENT_MAP}.headless`) ?? journal.getHealth(LAST_IMPLEMENT_MAP),
+ }, implementLane)) {
   const mapResult: WalkMapResult = {
    repo: map.repo,
    walkMode: map.walk,
@@ -196,7 +200,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
     );
     // The plan `ranger serve` (#37) also reads, so its "next" is this order.
     const plan = planTick(classified, {
-     laneBusy: implementClaimed || implementLaneBusy(journal),
+     laneBusy: implementClaimed.has(implementLane(map)) || implementLaneBusy(journal, implementLane(map)),
      vetoed: (id) => journal.hasVeto(id),
     });
     const candidates = plan.selected;
@@ -260,7 +264,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
      }
      mapResult.claimed.push(node.id);
      if (laneOf(node.id) === "implement") {
-      implementClaimed = true;
+      implementClaimed.add(implementLane(map));
       recordImplementStart(journal, map);
      }
      journal.recordSpawn(ctx.now?.() ?? new Date());

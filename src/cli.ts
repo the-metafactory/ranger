@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import { implementLane } from "./lanes.ts";
 import { recordImplementStart, mapKey, pickMap, resumeMap } from "./maps.ts";
 import { Command } from "commander";
 import { join, resolve } from "node:path";
@@ -270,15 +271,17 @@ async function runResumeNode(
   if (row.status === "released") {
    throw new Error(`node ${nodeId}'s claim was released — the walk re-claims it from the frontier`);
   }
-  // A resume starts a worker session in the shared implement lane.
-  const holder = row.lane === "implement" ? journal.implementHolder({ nodeId, repo: map.repo }) : null;
+  // A resume starts a worker session in this map's resource lane.
+  const lane = implementLane(map);
+  const takesLane = row.lane === "implement" && row.phase !== "close";
+  const holder = takesLane ? journal.laneHolder(lane, { nodeId, repo: map.repo }) : null;
   if (holder !== null && force !== true) {
    throw new Error(
-    `the implement lane is held by #${holder.nodeId} (${mapKey(holder)}, ${holder.status}) — resume #${nodeId} after it leaves the lane, or pass --force to run both`,
+    `the ${lane} implement lane is held by #${holder.nodeId} (${mapKey(holder)}, ${holder.status}) — resume #${nodeId} after it leaves the lane, or pass --force to run both`,
    );
   }
   journal.updateWorker(nodeId, map.repo, { status: "claimed", pid: null, workerPgid: null, finishedAt: null });
-  if (row.lane === "implement") recordImplementStart(journal, map);
+  if (takesLane) recordImplementStart(journal, map);
   const pid = await spawnRunNodeDetached({
    nodeId,
    repo: map.repo,

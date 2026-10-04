@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
+import { IMPLEMENT_LANES } from "./lanes.ts";
 import { resolve } from "node:path";
 import { parse } from "yaml";
 import { z } from "zod";
@@ -44,6 +45,8 @@ const MapSchema = z.object({
   .transform(Number),
  /** Walk mode (node #9): what ranger may autonomously do on this map. */
  walk: WalkModeSchema,
+ /** Machine-resource lane; defaults to visual with commands.probe, headless otherwise. */
+ lane: z.enum(IMPLEMENT_LANES).optional(),
  /** Optional per-run Discord escalation surface (node #7). */
  discord: DiscordSchema.optional(),
  /**
@@ -123,7 +126,7 @@ const MapSchema = z.object({
 
 /**
  * A map `ranger serve` shows and nothing else reads (#37): no walk, no scout
- * report, no escalation cards. Registered maps instead share the walk's cache.
+ * report, no escalation cards. Roots that ranger walks belong in `maps`, not here.
  */
 const ServeMapSchema = z.object({
  repo: z.string().regex(REPO_PATTERN, "repo must be owner/name"),

@@ -1,3 +1,4 @@
+import { implementLane } from "./lanes.ts";
 import { recordImplementStart, mapKey } from "./maps.ts";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import { DiscordAnnouncer } from "./announce.ts";
@@ -186,13 +187,14 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    }
    // A send-back starts a worker session (fix pass or probes): it waits for
    // the implement lane like any other start. The stale card is already gone.
-   const holder = journal.implementHolder({ nodeId: row.nodeId, repo });
+   const lane = implementLane(map);
+   const holder = journal.laneHolder(lane, { nodeId: row.nodeId, repo });
    if (holder !== null) {
     result.pending.push(row.nodeId);
     journal.recordEvent("sweep", {
      nodeId: row.nodeId,
      repo,
-     detail: `PR #${pr.number}: ${why} — waiting for the implement lane (held by #${holder.nodeId}, ${mapKey(holder)})`,
+     detail: `PR #${pr.number}: ${why} — waiting for the ${lane} implement lane (held by #${holder.nodeId}, ${mapKey(holder)})`,
     });
     return;
    }
@@ -202,7 +204,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
     return;
    }
    journal.updateWorker(row.nodeId, repo, { status: "running", phase: "review", pid });
-   recordImplementStart(journal, row);
+   recordImplementStart(journal, map);
    journal.recordEvent("sweep", {
     nodeId: row.nodeId,
     repo,

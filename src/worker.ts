@@ -1,4 +1,4 @@
-import { recordImplementStart, mapKey } from "./maps.ts";
+import { mapKey } from "./maps.ts";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -390,10 +390,8 @@ export async function runNode(
 ): Promise<RunNodeOutcome> {
  const { config, token, journal } = ctx;
  const row = journal.getWorker(nodeId, ctx.map.repo);
- const map = row === null ? ctx.map : ctx.config.maps.find(m => m.repo === row.repo && m.root === row.root);
- if (map === undefined) throw new Error('worker map is no longer registered');
  if (row !== null && row.root !== ctx.map.root) throw new Error('run-node map disagrees with the journal root');
- ctx = { ...ctx, map };
+ const map = ctx.map;
  const repo = map.repo;
  const base: RunNodeOutcome = {
   nodeId,
@@ -546,7 +544,6 @@ async function runImplementNode(
  const branch = implementBranchFor(node.node, worktreeBranch(nodeId, slug));
  const worktree = await bootstrapWorktree(canonical, nodeId, slug, token, branch, map.base);
  journal.updateWorker(nodeId, ctx.map.repo, { worktree, lane: "implement" });
- recordImplementStart(journal, map);
 
  // Substrate selection (node #45), re-run at every session start. A session
  // that hits its substrate's limit is not a failure: the substrate is marked

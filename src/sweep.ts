@@ -1,4 +1,5 @@
 import { recordImplementStart, mapKey } from "./maps.ts";
+import { implementLane } from "./lanes.ts";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import type { Journal } from "./journal.ts";
 import { killProcessGroup, pidAlive, processGroupCommands } from "./exec.ts";
@@ -105,6 +106,14 @@ export async function sweepMap(ctx: SweepContext): Promise<SweepMapResult> {
   }
 
   if (worker.attempts < config.workers.maxAttempts) {
+   if (worker.lane === "implement" && worker.phase !== "close") {
+    const holder = journal.laneHolder(implementLane(map), { nodeId: worker.nodeId, repo });
+    if (holder !== null) {
+     journal.recordEvent("sweep", { nodeId: worker.nodeId, repo,
+      detail: `respawn waits for the ${implementLane(map)} implement lane (held by #${holder.nodeId}, ${mapKey(holder)})` });
+     continue;
+    }
+   }
    const attempt = worker.attempts + 1;
    journal.updateWorker(worker.nodeId, repo, {
     status: "claimed",
@@ -114,7 +123,7 @@ export async function sweepMap(ctx: SweepContext): Promise<SweepMapResult> {
    const pid = ctx.respawn === undefined ? null : await ctx.respawn(worker.nodeId, repo, worker.root);
    if (pid !== null) {
     journal.updateWorker(worker.nodeId, repo, { pid });
-    if (worker.lane === "implement") recordImplementStart(journal, worker);
+    if (worker.lane === "implement" && worker.phase !== "close") recordImplementStart(journal, map);
     result.respawned.push(worker.nodeId);
     journal.recordEvent("sweep", { nodeId: worker.nodeId, repo, detail: `respawned (attempt ${attempt})` });
    } else {
