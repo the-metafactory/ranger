@@ -674,7 +674,7 @@ program
    ) {
     throw new Error(`--port must be an integer from 1024 to 65535, got ${options.port}`);
    }
-   const { url } = startServe({ config, port, open: options.open });
+   const { url } = startServe({ config, configPath, port, open: options.open });
    process.stdout.write(`ranger serve: ${url} (Ctrl-C stops it)\n`);
   } catch (error) {
    process.stderr.write(

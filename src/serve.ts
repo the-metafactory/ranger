@@ -22,6 +22,13 @@ import { lastImplementMaps, mapKey, implementMapOrder } from "./maps.ts";
  * shell iTerm2 then opens is started by iTerm2, and is expected to take
  * iTerm2's own environment rather than this process's — that is how a
  * launched app's window works, and it is not tested here.
+ *
+ * **Build now (node #58) is the principal's own CLI verb, run for them.** The
+ * button spawns `~/bin/ranger build-now <id> --map <repo#root> --force` with
+ * the same allowlisted environment (the wrapper injects the machine account's
+ * credentials itself), for a node this dashboard reads as walkable on the
+ * map's cached frontier at the moment of the request. Every graph write is
+ * the verb's, in its own process: this module still imports none.
  */
 import { spawn } from "node:child_process";
 import { randomBytes, timingSafeEqual } from "node:crypto";
@@ -532,6 +539,67 @@ export function launchPlan(args: {
  return { prompt, shellCommand, argv: ["osascript", "-e", script] };
 }
 
+/** The token-injecting wrapper every scheduled ranger run goes through (node #11). */
+export const RANGER_BIN = "~/bin/ranger";
+
+/** The CLI the Build now button runs: `build-now --force`, nothing a principal can't type. */
+export function buildNowArgv(args: {
+ bin: string;
+ key: string;
+ nodeId: string;
+ configPath: string;
+}): string[] {
+ if (!ID_PATTERN.test(args.nodeId)) throw new Error(`bad node id: ${args.nodeId}`);
+ const [repo, root] = args.key.split("#");
+ if (!REPO_PATTERN.test(repo) || !ID_PATTERN.test(root ?? "")) throw new Error(`bad map: ${args.key}`);
+ return [args.bin, "build-now", args.nodeId, "--map", args.key, "--force", "--config", args.configPath];
+}
+
+export interface VerbRun {
+ code: number;
+ /** The last lines of stdout and stderr together. */
+ tail: string;
+}
+
+const TAIL_LINES = 20;
+const BUILD_NOW_TIMEOUT_MS = 180_000;
+
+/**
+ * Run a ranger verb detached in its own process group and wait for its exit:
+ * the verb returns once its run-node is spawned, and that worker (detached
+ * again, stdio ignored) outlives both. A verb that hangs past the timeout is
+ * killed with its group.
+ */
+export function runVerb(argv: string[], env: Record<string, string>, timeoutMs = BUILD_NOW_TIMEOUT_MS): Promise<VerbRun> {
+ return new Promise((resolveRun) => {
+  const [command, ...args] = argv;
+  let out = "";
+  const child = spawn(command, args, { env, stdio: ["ignore", "pipe", "pipe"], detached: true });
+  const take = (chunk: Buffer) => {
+   out = (out + chunk.toString()).slice(-16_000);
+  };
+  child.stdout?.on("data", take);
+  child.stderr?.on("data", take);
+  const timer = setTimeout(() => {
+   out += `\n(killed after ${Math.round(timeoutMs / 1000)} s)`;
+   try {
+    if (child.pid !== undefined) process.kill(-child.pid, "SIGTERM");
+   } catch {
+    /* already gone */
+   }
+  }, timeoutMs);
+  const tail = () => out.trimEnd().split("\n").slice(-TAIL_LINES).join("\n");
+  child.on("error", (error) => {
+   clearTimeout(timer);
+   resolveRun({ code: -1, tail: `could not start ${command}: ${error.message}` });
+  });
+  child.on("close", (code, signal) => {
+   clearTimeout(timer);
+   resolveRun({ code: code ?? (signal === null ? -1 : 128), tail: tail() });
+  });
+ });
+}
+
 function spawnLaunch(argv: string[], env: Record<string, string>): void {
  const [command, ...args] = argv;
  const child = spawn(command, args, { env, stdio: "ignore", detached: true });
@@ -556,6 +624,10 @@ export interface HandlerContext {
   * reason it is not.
   */
  verifyGrilling: (map: DashboardMap, nodeId: string) => Promise<string | null>;
+ /** The `build-now --force` argv for a node (node #58). */
+ buildNowCommand: (map: DashboardMap, nodeId: string) => string[];
+ /** Run a verb and wait for its exit code and output tail. */
+ runVerb: (argv: string[], env: Record<string, string>) => Promise<VerbRun>;
 }
 
 const json = (status: number, body: unknown): Response =>
@@ -608,7 +680,9 @@ export function createHandler(ctx: HandlerContext): (req: Request) => Promise<Re
    ctx.refresh();
    return json(202, { refreshing: true });
   }
-  if (url.pathname !== "/api/grill") return refuse(404, "not found");
+  if (url.pathname !== "/api/grill" && url.pathname !== "/api/build-now") {
+   return refuse(404, "not found");
+  }
 
   let body: { key?: unknown; id?: unknown; dryRun?: unknown };
   try {
@@ -623,6 +697,18 @@ export function createHandler(ctx: HandlerContext): (req: Request) => Promise<Re
   const state = ctx.getState();
   const map = state.maps.find((m) => m.key === body.key);
   if (map === undefined) return refuse(404, `no map ${body.key}`);
+  if (url.pathname === "/api/build-now") {
+   // `autonomous` is the walkable set of the frontier ranger cached, read
+   // from the journal for this request; the verb re-reads and re-checks it.
+   const node = map.autonomous.find((n) => n.id === body.id);
+   if (node === undefined) {
+    return refuse(404, `#${body.id} is not walkable on ${map.key}'s frontier`);
+   }
+   const argv = ctx.buildNowCommand(map, node.id);
+   if (body.dryRun === true) return json(200, { dryRun: true, argv });
+   const run = await ctx.runVerb(argv, childEnv(process.env));
+   return json(200, { nodeId: node.id, exitCode: run.code, tail: run.tail });
+  }
   const grilling = map.grillings.find((g) => g.id === body.id);
   if (grilling === undefined) {
    return refuse(404, `#${body.id} is not an open grilling on ${map.key}'s frontier`);
@@ -683,11 +769,14 @@ button:hover:not(:disabled) { border-color:var(--accent); color:var(--accent); }
 button:disabled { opacity:.45; cursor:default; }
 #msg { padding:0 20px; color:var(--ok); min-height:1em; font-size:12px; }
 #msg.err { color:var(--warn); }
+#out { margin:4px 20px 0; padding:8px 10px; font:12px/1.4 ui-monospace, Menlo, monospace; white-space:pre-wrap; overflow-wrap:anywhere; background:var(--card); border:1px solid var(--line); border-radius:6px; }
+#out:empty { display:none; }
 </style>
 </head>
 <body>
 <header><h1>Ranger</h1><span class="meta" id="meta">loading…</span><button id="refresh" title="Re-reads only the maps this dashboard reads itself; ranger's maps come from its tick">Refresh</button></header>
 <div id="msg"></div>
+<pre id="out"></pre>
 <main>
 <section><h2>Current job</h2><div id="current"></div></section>
 <section><h2>Substrates</h2><div id="substrates"></div></section>
@@ -728,9 +817,27 @@ function renderNext(s) {
    box.append(mapHead(m));
    const n = m.next;
    if (!n.nodeId) { box.append(empty(n.reason)); continue; }
-   box.append(el("p", {}, el("span", { class: "id", text: "#" + n.nodeId + " " }), link(n.url, n.title), el("span", { class: "reason", text: (n.lane ? n.lane + " lane · " : "") + n.reason })));
+   box.append(el("p", {}, el("span", { class: "id", text: "#" + n.nodeId + " " }), link(n.url, n.title), " ", buildButton(s, m, { id: n.nodeId, title: n.title, lane: n.lane }), el("span", { class: "reason", text: (n.lane ? n.lane + " lane · " : "") + n.reason })));
   }
  }
+}
+function buildButton(s, m, n) {
+ const b = el("button", { text: "Build now", title: "ranger build-now " + n.id + " --map " + m.key + " --force" });
+ b.onclick = async () => {
+  const holder = n.lane === "implement" ? s.gates.laneHolders[m.lane] : null;
+  const beside = holder ? "\\n\\nBuilds beside #" + holder.nodeId + " (" + holder.repo + "#" + holder.root + ", " + holder.status + "), which holds the " + m.lane + " lane." : "";
+  if (!confirm("Build #" + n.id + " — " + n.title + " now?\\n\\nClaims it under the machine account and starts its worker (ranger build-now --force)." + beside)) return;
+  b.disabled = true;
+  say("Building #" + n.id + "…");
+  document.getElementById("out").textContent = "";
+  try {
+   const r = await post("/api/build-now", { key: m.key, id: n.id });
+   say("build-now #" + n.id + " exited " + r.exitCode + (r.exitCode === 0 ? " — started." : " — refused or failed."), r.exitCode !== 0);
+   document.getElementById("out").textContent = r.tail;
+  } catch (e) { say("Could not build #" + n.id + ": " + e.message, true); }
+  finally { b.disabled = false; load(); }
+ };
+ return b;
 }
 function renderAuto(s) {
  const box = document.getElementById("auto"); box.replaceChildren();
@@ -738,7 +845,7 @@ function renderAuto(s) {
   if (m.servedOnly) continue;
   box.append(mapHead(m, " (walk: " + m.walk + ")"));
   if (m.autonomous.length === 0) { box.append(unavailable(m, "None.")); continue; }
-  box.append(el("ul", {}, ...m.autonomous.map((n) => el("li", {}, el("span", { class: "id", text: "#" + n.id }), el("span", { class: "t" }, link(n.url, n.title)), el("span", { class: "tag", text: n.lane + " · " + n.kind })))));
+  box.append(el("ul", {}, ...m.autonomous.map((n) => el("li", {}, el("span", { class: "id", text: "#" + n.id }), el("span", { class: "t" }, link(n.url, n.title)), el("span", { class: "tag", text: n.lane + " · " + n.kind }), buildButton(s, m, n)))));
  }
 }
 function grillButton(m, g) {
@@ -1036,6 +1143,8 @@ export async function verifyGrillingLive(
 
 export function startServe(opts: {
  config: RangerConfig;
+ /** The ranger.yaml the Build now verb is run with. */
+ configPath: string;
  port?: number;
  open?: boolean;
 }): { url: string; stop: () => void } {
@@ -1057,6 +1166,9 @@ export function startServe(opts: {
   refresh: () => reader.refresh(),
   launch: spawnLaunch,
   verifyGrilling: (map, nodeId) => verifyGrillingLive(opts.config, map, nodeId),
+  buildNowCommand: (map, nodeId) =>
+   buildNowArgv({ bin: expandHome(RANGER_BIN), key: map.key, nodeId, configPath: opts.configPath }),
+  runVerb: (argv, env) => runVerb(argv, env),
  });
  const server = Bun.serve({ hostname: "127.0.0.1", port, fetch: handler });
  const url = `http://127.0.0.1:${port}/`;

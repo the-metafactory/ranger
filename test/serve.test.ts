@@ -9,7 +9,9 @@ import { classify, loadProbeRegistry } from "../src/route.ts";
 import type { RangerConfig } from "../src/config.ts";
 import {
  assembleState,
+ buildNowArgv,
  childEnv,
+ runVerb,
  servedMaps,
  createHandler,
  launchPlan,
@@ -353,6 +355,8 @@ describe("#37 — the launch endpoint refuses", () => {
     launched.push(argv);
    },
    verifyGrilling: over.verifyGrilling ?? (async () => null),
+   buildNowCommand: () => [],
+   runVerb: async () => ({ code: 0, tail: "" }),
   });
   return { handler, launched };
  };
@@ -444,6 +448,143 @@ describe("#37 — the launch endpoint refuses", () => {
   expect(res.headers.get("content-security-policy")).toBe("frame-ancestors 'none'");
   expect(res.headers.get("x-frame-options")).toBe("DENY");
   expect(await res.text()).toContain(TOKEN);
+ });
+});
+
+describe("node #58 — the Build now endpoint", () => {
+ const PORT = 7311;
+ const TOKEN = "t".repeat(48);
+ const setup = (getState: () => ReturnType<typeof assembleState> = () => assembleState(inputs())) => {
+  const built: { argv: string[]; env: Record<string, string> }[] = [];
+  const launched: string[][] = [];
+  const handler = createHandler({
+   port: PORT,
+   token: TOKEN,
+   getState,
+   refresh: () => {},
+   launch: (argv) => {
+    launched.push(argv);
+   },
+   verifyGrilling: async () => null,
+   buildNowCommand: (map, nodeId) =>
+    buildNowArgv({ bin: "/bin/ranger", key: map.key, nodeId, configPath: "/c/ranger.yaml" }),
+   runVerb: async (argv, env) => {
+    built.push({ argv, env });
+    return { code: 1, tail: "ranger build-now: the headless implement lane is held by #663" };
+   },
+  });
+  return { handler, built, launched };
+ };
+ const post = (body: unknown, headers: Record<string, string> = {}) =>
+  new Request(`http://127.0.0.1:${PORT}/api/build-now`, {
+   method: "POST",
+   headers: {
+    host: `127.0.0.1:${PORT}`,
+    origin: `http://127.0.0.1:${PORT}`,
+    "x-ranger-token": TOKEN,
+    "content-type": "application/json",
+    ...headers,
+   },
+   body: JSON.stringify(body),
+  });
+ const ok = { key: walked.key, id: "10" };
+
+ test("a walkable node runs build-now --force once and returns its exit code and output tail", async () => {
+  const { handler, built, launched } = setup();
+  const res = await handler(post(ok));
+  expect(res.status).toBe(200);
+  expect(await res.json()).toEqual({
+   nodeId: "10",
+   exitCode: 1,
+   tail: "ranger build-now: the headless implement lane is held by #663",
+  });
+  expect(built).toHaveLength(1);
+  expect(built[0].argv).toEqual([
+   "/bin/ranger", "build-now", "10", "--map", `${REPO}#1`, "--force", "--config", "/c/ranger.yaml",
+  ]);
+  expect(launched).toHaveLength(0);
+ });
+
+ test("the verb runs with the launcher's allowlisted environment", async () => {
+  const { handler, built } = setup();
+  await handler(post(ok));
+  expect(built[0].env).toEqual(childEnv(process.env));
+ });
+
+ test("the next node in queue is buildable too: it is one of the walkable nodes", async () => {
+  const state = assembleState(inputs());
+  const next = state.maps[0].next.nodeId!;
+  expect(state.maps[0].autonomous.map((n) => n.id)).toContain(next);
+  const { handler, built } = setup(() => state);
+  expect((await handler(post({ key: walked.key, id: next }))).status).toBe(200);
+  expect(built).toHaveLength(1);
+ });
+
+ test("dry run returns the argv and runs nothing", async () => {
+  const { handler, built } = setup();
+  const res = await handler(post({ ...ok, dryRun: true }));
+  expect(((await res.json()) as { argv: string[] }).argv).toContain("--force");
+  expect(built).toHaveLength(0);
+ });
+
+ const refusals: [string, Request][] = [
+  ["no token", post(ok, { "x-ranger-token": "" })],
+  ["wrong token", post(ok, { "x-ranger-token": "x".repeat(48) })],
+  ["foreign origin", post(ok, { origin: "https://evil.example" })],
+  ["rebound host", post(ok, { host: `evil.example:${PORT}` })],
+  ["unknown map", post({ key: "other/repo#1", id: "10" })],
+  ["non-numeric id", post({ key: walked.key, id: "10 --map x" })],
+  ["a grilling (not walkable)", post({ key: walked.key, id: "12" })],
+  ["a skip-listed node", post({ key: walked.key, id: "11" })],
+  ["an id not on the frontier", post({ key: walked.key, id: "99" })],
+ ];
+ for (const [name, req] of refusals) {
+  test(`refuses: ${name}`, async () => {
+   const { handler, built } = setup();
+   const res = await handler(req);
+   expect(res.status).toBeGreaterThanOrEqual(400);
+   expect(built).toHaveLength(0);
+  });
+ }
+
+ test("refuses a serve-only map: ranger does not walk it", async () => {
+  const served: ServeMap = { ...walked, key: `${REPO}#460`, root: 460, walk: "none", servedOnly: true };
+  const { handler, built } = setup(() =>
+   assembleState(inputs({ maps: [served], reports: new Map([[served.key, report(FRONTIER)]]) })),
+  );
+  expect((await handler(post({ key: served.key, id: "10" }))).status).toBe(404);
+  expect(built).toHaveLength(0);
+ });
+
+ test("the argv refuses a bad id or map", () => {
+  expect(() => buildNowArgv({ bin: "b", key: `${REPO}#1`, nodeId: "1;x", configPath: "c" })).toThrow();
+  expect(() => buildNowArgv({ bin: "b", key: "bad repo#1", nodeId: "1", configPath: "c" })).toThrow();
+ });
+
+ test("runVerb returns the exit code and the last lines of output", async () => {
+  const run = await runVerb(
+   ["/bin/sh", "-c", "for i in $(seq 1 30); do echo line$i; done; echo oops >&2; exit 3"],
+   childEnv(process.env),
+  );
+  expect(run.code).toBe(3);
+  const lines = run.tail.split("\n");
+  expect(lines).toHaveLength(20);
+  expect(lines.at(-1)).toBe("oops");
+  expect((await runVerb(["/nonexistent/ranger"], {})).code).toBe(-1);
+ });
+
+ test("the page has a Build now button whose confirm names the lane holder", async () => {
+  const { handler } = setup();
+  const res = await handler(
+   new Request(`http://127.0.0.1:${PORT}/`, { headers: { host: `127.0.0.1:${PORT}` } }),
+  );
+  const page = await res.text();
+  expect(page).toContain("Build now");
+  expect(page).toContain("/api/build-now");
+  expect(page).toContain("Builds beside #");
+  // The page's script is a template literal: an unescaped "\n" would break it.
+  const script = page.split("<script>")[1].split("</script>")[0];
+  expect(() => new Function(script)).not.toThrow();
  });
 });
 
