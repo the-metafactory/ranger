@@ -106,6 +106,10 @@ bot:
 # default of 2).
 workers:
   reviewRounds: 5
+  # Hard wall clock per worker session, minutes (default 90). Raised to 150
+  # (principal, 2026-10-04): seelite #684, a large Traffic build on Codex, was
+  # still uncommitted at 80 minutes.
+  wallClockMin: 150
 
 # The principal. `discordId` is the escalation desk's 7+ day @-mention target
 # (rendered as a real <@id> ping — without it, overdue cards show a no-ping
