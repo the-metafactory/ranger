@@ -175,6 +175,9 @@ export const substrateReadings = sqliteTable("substrate_readings", {
  fiveHourUsedPct: integer("five_hour_used_pct"),
  /** 7-day window usage percent (0–100), null when the substrate doesn't report one. */
  sevenDayUsedPct: integer("seven_day_used_pct"),
+ /** Per-window reset times; old rows remain null until the next quota read. */
+ fiveHourResetsAt: text("five_hour_resets_at"),
+ sevenDayResetsAt: text("seven_day_resets_at"),
  /** ISO timestamp: the earliest resetsAt across reported windows. */
  resetsAt: text("resets_at"),
  /** True when the substrate is capped (rate limit hit). */

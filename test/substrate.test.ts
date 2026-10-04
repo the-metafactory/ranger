@@ -8,6 +8,7 @@ import {
  confirmCap,
  detectClaudeCap,
  drainJsonLines,
+ effectiveThreshold,
  extractClaudeResultText,
  freshReadings,
  isClaudeSignalLine,
@@ -52,6 +53,8 @@ function reading(
   readAt: new Date().toISOString(),
   fiveHourUsedPct: 20,
   sevenDayUsedPct: 30,
+  fiveHourResetsAt: null,
+  sevenDayResetsAt: null,
   resetsAt: null,
   capped: false,
   cappedUntil: null,
@@ -223,6 +226,39 @@ describe("parseClaudeRateLimitEvent", () => {
   expect(q.windows).toHaveLength(0);
   expect(q.capped).toBe(false);
  });
+
+ test("a reported window without resetsAt persists with its fixed threshold", async () => {
+  await withJournal((journal) => {
+   const now = new Date();
+   persistReading(journal, parseClaudeRateLimitEvent({
+    type: "rate_limit_event",
+    rate_limit_info: { status: "allowed", unifiedWindows: { seven_day: { utilization: 0.75 } } },
+   }, now));
+   const r = journal.getSubstrateReading("claude")!;
+   expect(r.sevenDayResetsAt).toBeNull();
+   expect(effectiveThreshold("seven_day", r, now, DEFAULT_CONFIG)).toBe(80);
+  });
+ });
+
+ test("persists each window's own reset instead of reusing the earliest", async () => {
+  await withJournal((journal) => {
+   const now = new Date("2026-10-04T12:00:00.000Z");
+   const fiveHourReset = Math.floor(now.getTime() / 1000) + 3600;
+   const sevenDayReset = Math.floor(now.getTime() / 1000) + 5 * 3600;
+   persistReading(journal, parseClaudeRateLimitEvent({
+    type: "rate_limit_event",
+    rate_limit_info: { status: "allowed", unifiedWindows: {
+     five_hour: { utilization: 0.2, resetsAt: fiveHourReset },
+     seven_day: { utilization: 0.85, resetsAt: sevenDayReset },
+    } },
+   }, now));
+   const r = journal.getSubstrateReading("claude")!;
+   expect(r.fiveHourResetsAt).toBe(new Date(fiveHourReset * 1000).toISOString());
+   expect(r.sevenDayResetsAt).toBe(new Date(sevenDayReset * 1000).toISOString());
+   expect(effectiveThreshold("five_hour", r, now, DEFAULT_CONFIG)).toBe(94);
+   expect(effectiveThreshold("seven_day", r, now, DEFAULT_CONFIG)).toBeCloseTo(99.405, 2);
+  });
+ });
 });
 
 // ---- Claude result text extraction ----
@@ -245,6 +281,48 @@ describe("extractClaudeResultText", () => {
 });
 
 // ---- selection policy ----
+
+describe("effectiveThreshold", () => {
+ const now = new Date("2026-10-04T12:00:00.000Z");
+ const resetIn = (hours: number) => new Date(now.getTime() + hours * 3_600_000).toISOString();
+ const cases = [
+  { name: "7d, six days left", window: "seven_day", hours: 144, threshold: 82.857 },
+  { name: "7d, one day left", window: "seven_day", hours: 24, threshold: 97.143 },
+  { name: "7d, five hours left", window: "seven_day", hours: 5, threshold: 99.405 },
+  { name: "7d, at reset", window: "seven_day", hours: 0, threshold: 100 },
+  { name: "5h, half its window left", window: "five_hour", hours: 2.5, threshold: 85 },
+  { name: "5h, full window left", window: "five_hour", hours: 5, threshold: 70 },
+  { name: "7d, reset in the past", window: "seven_day", hours: -1, threshold: 100 },
+ ] as const;
+ for (const c of cases) {
+  test(c.name, () => {
+   const field = c.window === "five_hour" ? "fiveHourResetsAt" : "sevenDayResetsAt";
+   const r = reading("claude", { [field]: resetIn(c.hours) });
+   expect(effectiveThreshold(c.window, r, now, DEFAULT_CONFIG)).toBeCloseTo(c.threshold, 2);
+  });
+ }
+
+ test("missing reset keeps its fixed threshold", () => {
+  const r = reading("claude");
+  expect(effectiveThreshold("five_hour", r, now, DEFAULT_CONFIG)).toBe(70);
+  expect(effectiveThreshold("seven_day", r, now, DEFAULT_CONFIG)).toBe(80);
+ });
+
+ test("Codex with only its 7d duration uses that window", async () => {
+  await withJournal((journal) => {
+   persistReading(journal, parseCodexQuota({ rateLimits: {
+    primary: { usedPercent: 85, windowDurationMins: 10080, resetsAt: Math.floor((now.getTime() + 5 * 3_600_000) / 1000) },
+    secondary: null,
+    rateLimitReachedType: null,
+   } }, now));
+   const r = journal.getSubstrateReading("codex")!;
+   expect(r.fiveHourUsedPct).toBeNull();
+   expect(r.sevenDayResetsAt).toBe(resetIn(5));
+   expect(effectiveThreshold("seven_day", r, now, DEFAULT_CONFIG)).toBeCloseTo(99.405, 2);
+   expect(selectForBuild({ readings: [r], now, config: DEFAULT_CONFIG })).toBe("codex");
+  });
+ });
+});
 
 describe("isEligible", () => {
  const now = new Date();
@@ -342,6 +420,15 @@ describe("selectForBuild", () => {
   expect(selectForBuild({ readings: [], now, config: DEFAULT_CONFIG })).toBe("pi");
  });
 
+ test("85% on 7d flips from Pi to Claude as reset approaches", () => {
+  const early = reading("claude", { readAt: fresh, fiveHourUsedPct: 20, sevenDayUsedPct: 85,
+   sevenDayResetsAt: new Date(now.getTime() + 6 * 24 * 3_600_000).toISOString() });
+  const near = { ...early, sevenDayResetsAt: new Date(now.getTime() + 5 * 3_600_000).toISOString() };
+  expect(selectForBuild({ readings: [early], now, config: DEFAULT_CONFIG })).toBe("pi");
+  expect(selectForBuild({ readings: [near], now, config: DEFAULT_CONFIG })).toBe("claude");
+  expect(isEligible(near, DEFAULT_CONFIG, now)?.headroom).toBeCloseTo(14.405, 2);
+ });
+
  test("stale readings are treated as capped", () => {
   const stale = new Date(now.getTime() - 30 * 60_000).toISOString();
   const readings = [
@@ -396,6 +483,14 @@ describe("selectForReview — cross-model selection", () => {
   expect(
    selectForReview({ readings: noneEligible, now, config: DEFAULT_CONFIG }, "claude"),
   ).toBe("pi");
+ });
+
+ test("a near-reset Claude reading becomes eligible for review", () => {
+  const early = reading("claude", { readAt: fresh, fiveHourUsedPct: null, sevenDayUsedPct: 85,
+   sevenDayResetsAt: new Date(now.getTime() + 6 * 24 * 3_600_000).toISOString() });
+  const near = { ...early, sevenDayResetsAt: new Date(now.getTime() + 5 * 3_600_000).toISOString() };
+  expect(selectForReview({ readings: [early], now, config: DEFAULT_CONFIG }, "codex")).toBe("pi");
+  expect(selectForReview({ readings: [near], now, config: DEFAULT_CONFIG }, "codex")).toBe("claude");
  });
 });
 
@@ -715,8 +810,16 @@ describe("describeReadings", () => {
   const text = describeReadings(
    [reading("claude", { readAt: new Date(now.getTime() - 3 * 60_000).toISOString(), capped: true })],
    now,
+   DEFAULT_CONFIG,
   );
-  expect(text).toBe("claude 5h 20% 7d 30% read 3m ago CAPPED; codex unread");
+  expect(text).toBe("claude 5h 20% < 70.0% (reset unknown) 7d 30% < 80.0% (reset unknown) read 3m ago CAPPED; codex unread");
+ });
+
+ test("names the threshold and time to reset used for selection", () => {
+  const now = new Date("2026-10-04T12:00:00.000Z");
+  const r = reading("claude", { readAt: now.toISOString(), fiveHourUsedPct: null, sevenDayUsedPct: 85,
+   sevenDayResetsAt: new Date(now.getTime() + 5 * 3_600_000).toISOString() });
+  expect(describeReadings([r], now, DEFAULT_CONFIG)).toContain("claude 7d 85% < 99.4% (5h to reset)");
  });
 });
 
@@ -821,6 +924,11 @@ describe("substrateViews — the serve panel's derived state", () => {
   // A lapsed capped-until is not shown; a 10-minute-old codex reading is stale (max 5).
   expect(views[1]).toMatchObject({ substrate: "codex", capped: false, cappedUntil: null, fresh: false, eligible: false, ageMin: 10 });
   expect(substrateViews([reading("codex")], DEFAULT_CONFIG, now)[0].eligible).toBe(true);
+  const near = reading("claude", { sevenDayUsedPct: 85,
+   sevenDayResetsAt: new Date(now.getTime() + 5 * 3_600_000).toISOString() });
+  expect(substrateViews([near], DEFAULT_CONFIG, now)[0]).toMatchObject({
+   sevenDayThreshold: expect.closeTo(99.405, 2), eligible: true,
+  });
  });
 });
 

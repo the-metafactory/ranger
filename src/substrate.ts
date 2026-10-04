@@ -4,7 +4,7 @@
  *
  * Strong substrates (Claude, Codex) are eligible while their reading is
  * fresh, reports at least one window, and every window's used% is under its
- * max-used threshold. Once neither is eligible (over threshold, stale or
+ * effective threshold. Once neither is eligible (over threshold, stale or
  * failed read, no windows, or capped), Pi is the fallback. Review selection
  * prefers a substrate other than the one that wrote the PR head; when no
  * other substrate is eligible the review runs on the author's own
@@ -28,6 +28,8 @@ import {
  type SubstrateConfig,
 } from "./substrate-policy.ts";
 
+export { effectiveThreshold } from "./substrate-policy.ts";
+
 // ---- types ----
 
 export type { SubstrateName };
@@ -37,7 +39,7 @@ export interface QuotaWindow {
  /** 0–100 usage percent. */
  usedPct: number;
  /** Epoch seconds when this window resets. */
- resetsAt: number;
+ resetsAt?: number;
 }
 
 export interface QuotaReading {
@@ -60,7 +62,7 @@ export interface SubstrateReaders {
 export interface CodexRateLimitEntry {
  usedPercent: number;
  windowDurationMins: number;
- resetsAt: number;
+ resetsAt?: number;
 }
 
 /** The `result` of `account/rateLimits/read` (only the fields ranger reads). */
@@ -107,7 +109,8 @@ export function parseCodexQuota(resp: CodexRateLimitsResponse, now = new Date())
 }
 
 function earliestReset(windows: QuotaWindow[]): number | null {
- return windows.length === 0 ? null : Math.min(...windows.map((w) => w.resetsAt));
+ const resets = windows.map((w) => w.resetsAt).filter((reset): reset is number => reset !== undefined);
+ return resets.length === 0 ? null : Math.min(...resets);
 }
 
 /**
@@ -229,8 +232,8 @@ export interface ClaudeRateLimitEvent {
   resetsAt?: number;
   rateLimitType?: string;
   unifiedWindows?: {
-   five_hour?: { utilization: number; resetsAt: number };
-   seven_day?: { utilization: number; resetsAt: number };
+   five_hour?: { utilization: number; resetsAt?: number };
+   seven_day?: { utilization: number; resetsAt?: number };
   };
  };
 }
@@ -359,6 +362,8 @@ export function persistReading(journal: Journal, reading: QuotaReading): void {
   readAt: reading.readAt.toISOString(),
   fiveHourUsedPct: fiveHour?.usedPct ?? null,
   sevenDayUsedPct: sevenDay?.usedPct ?? null,
+  fiveHourResetsAt: fiveHour?.resetsAt === undefined ? null : epochIso(fiveHour.resetsAt),
+  sevenDayResetsAt: sevenDay?.resetsAt === undefined ? null : epochIso(sevenDay.resetsAt),
   resetsAt: resets === null ? null : epochIso(resets),
   capped: reading.capped,
   cappedUntil: reading.cappedUntil !== null ? epochIso(reading.cappedUntil) : priorUntil,
@@ -501,7 +506,7 @@ export async function selectSubstrate(
  const selectable = readings.filter((r) => !excluded.has(r.substrate));
  return {
   substrate: pick({ readings: selectable, now, config }),
-  chosenOn: describeReadings(readings, now),
+  chosenOn: describeReadings(readings, now, config),
  };
 }
 
@@ -571,6 +576,8 @@ export function markSubstrateCapped(
   readAt: reading?.readAt ?? now.toISOString(),
   fiveHourUsedPct: reading?.fiveHourUsedPct ?? null,
   sevenDayUsedPct: reading?.sevenDayUsedPct ?? null,
+  fiveHourResetsAt: reading?.fiveHourResetsAt ?? null,
+  sevenDayResetsAt: reading?.sevenDayResetsAt ?? null,
   resetsAt: reading?.resetsAt ?? until,
   capped: true,
   cappedUntil: until,

@@ -43,6 +43,7 @@ import { classify, type ClassifiedNode, loadProbeRegistry } from "./route.ts";
 import type { SubstrateReading } from "./journal.ts";
 import {
  activeCappedUntil,
+ effectiveThreshold,
  isCappedAt,
  isEligible,
  isFresh,
@@ -219,6 +220,8 @@ export interface SubstrateView {
  substrate: SubstrateReading["substrate"];
  fiveHourUsedPct: number | null;
  sevenDayUsedPct: number | null;
+ fiveHourThreshold: number | null;
+ sevenDayThreshold: number | null;
  /** ISO: the earliest reported window reset. */
  resetsAt: string | null;
  readAt: string;
@@ -243,6 +246,8 @@ export function substrateViews(
   substrate: r.substrate,
   fiveHourUsedPct: r.fiveHourUsedPct,
   sevenDayUsedPct: r.sevenDayUsedPct,
+  fiveHourThreshold: r.fiveHourUsedPct === null ? null : effectiveThreshold("five_hour", r, now, config),
+  sevenDayThreshold: r.sevenDayUsedPct === null ? null : effectiveThreshold("seven_day", r, now, config),
   resetsAt: r.resetsAt,
   readAt: r.readAt,
   ageMin: readingAgeMin(r, now),
@@ -737,8 +742,8 @@ function renderSubstrates(s) {
  if (!s.substrates || s.substrates.length === 0) { box.append(empty("No substrate readings yet.")); return; }
  box.append(el("ul", {}, ...s.substrates.map((sub) => {
   const parts = [sub.substrate.toUpperCase()];
-  if (sub.fiveHourUsedPct !== null) parts.push("5h: " + sub.fiveHourUsedPct + "%");
-  if (sub.sevenDayUsedPct !== null) parts.push("7d: " + sub.sevenDayUsedPct + "%");
+  if (sub.fiveHourUsedPct !== null) parts.push("5h: " + sub.fiveHourUsedPct + "% < " + sub.fiveHourThreshold.toFixed(1) + "%");
+  if (sub.sevenDayUsedPct !== null) parts.push("7d: " + sub.sevenDayUsedPct + "% < " + sub.sevenDayThreshold.toFixed(1) + "%");
   if (sub.resetsAt) parts.push("resets " + new Date(sub.resetsAt).toLocaleString());
   parts.push("read " + sub.ageMin + "m ago" + (sub.fresh ? "" : " (stale)"));
   if (sub.capped) parts.push("CAPPED until " + (sub.cappedUntil ? new Date(sub.cappedUntil).toLocaleString() : "next reading"));

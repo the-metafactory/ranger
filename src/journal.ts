@@ -85,6 +85,8 @@ export interface SubstrateReading {
  readAt: string;
  fiveHourUsedPct: number | null;
  sevenDayUsedPct: number | null;
+ fiveHourResetsAt: string | null;
+ sevenDayResetsAt: string | null;
  resetsAt: string | null;
  capped: boolean;
  cappedUntil: string | null;
@@ -864,6 +866,8 @@ function hydrateSubstrateReading(row: {
  readAt: string;
  fiveHourUsedPct: number | null;
  sevenDayUsedPct: number | null;
+ fiveHourResetsAt: string | null;
+ sevenDayResetsAt: string | null;
  resetsAt: string | null;
  capped: number | boolean;
  cappedUntil: string | null;
@@ -873,6 +877,8 @@ function hydrateSubstrateReading(row: {
   readAt: row.readAt,
   fiveHourUsedPct: row.fiveHourUsedPct,
   sevenDayUsedPct: row.sevenDayUsedPct,
+  fiveHourResetsAt: row.fiveHourResetsAt,
+  sevenDayResetsAt: row.sevenDayResetsAt,
   resetsAt: row.resetsAt,
   capped: row.capped === true || row.capped === 1,
   cappedUntil: row.cappedUntil,
