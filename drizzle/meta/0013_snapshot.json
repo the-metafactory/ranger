@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "70c815e1-9fae-4f0a-8aff-c17d87d6cffa",
+  "id": "90990997-84c3-4527-b882-bd1c99aea531",
   "prevId": "a6447003-0fdd-48e8-9062-aed5367a71b7",
   "tables": {
     "escalation_destinations": {
@@ -228,15 +228,15 @@
     "head_substrates": {
       "name": "head_substrates",
       "columns": {
-        "sha": {
-          "name": "sha",
+        "repo": {
+          "name": "repo",
           "type": "text",
-          "primaryKey": true,
+          "primaryKey": false,
           "notNull": true,
           "autoincrement": false
         },
-        "repo": {
-          "name": "repo",
+        "sha": {
+          "name": "sha",
           "type": "text",
           "primaryKey": false,
           "notNull": true,
@@ -264,9 +264,25 @@
           "autoincrement": false
         }
       },
-      "indexes": {},
+      "indexes": {
+        "head_substrates_recorded_at_idx": {
+          "name": "head_substrates_recorded_at_idx",
+          "columns": [
+            "recorded_at"
+          ],
+          "isUnique": false
+        }
+      },
       "foreignKeys": {},
-      "compositePrimaryKeys": {},
+      "compositePrimaryKeys": {
+        "head_substrates_repo_sha_pk": {
+          "columns": [
+            "repo",
+            "sha"
+          ],
+          "name": "head_substrates_repo_sha_pk"
+        }
+      },
       "uniqueConstraints": {},
       "checkConstraints": {}
     },

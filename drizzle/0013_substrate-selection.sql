@@ -1,11 +1,13 @@
 CREATE TABLE `head_substrates` (
-	`sha` text PRIMARY KEY NOT NULL,
 	`repo` text NOT NULL,
+	`sha` text NOT NULL,
 	`node_id` text NOT NULL,
 	`substrate` text NOT NULL,
-	`recorded_at` text NOT NULL
+	`recorded_at` text NOT NULL,
+	PRIMARY KEY(`repo`, `sha`)
 );
 --> statement-breakpoint
+CREATE INDEX `head_substrates_recorded_at_idx` ON `head_substrates` (`recorded_at`);--> statement-breakpoint
 CREATE TABLE `substrate_readings` (
 	`substrate` text PRIMARY KEY NOT NULL,
 	`read_at` text NOT NULL,

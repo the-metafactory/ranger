@@ -564,7 +564,7 @@ async function selectReviewSubstrate(
  ctx: ImplementContext,
  headSha: string,
 ): Promise<{ substrate: SubstrateName; chosenOn: string }> {
- const author = ctx.journal.headSubstrate(headSha) ?? "pi";
+ const author = ctx.journal.headSubstrate(ctx.map.repo, headSha) ?? "pi";
  const { substrate, chosenOn } = await selectSubstrate(
   ctx.journal,
   ctx.config.substrates,

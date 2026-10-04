@@ -808,7 +808,7 @@ describe("implement lane (node #23)", () => {
 
   // The capped session's leftovers were dropped; the pushed head is Codex's.
   const head = await r.github.sha("node/20-add-the-feature-module");
-  expect(r.journal.headSubstrate(head)).toBe("codex");
+  expect(r.journal.headSubstrate("acme/widgets", head)).toBe("codex");
   const files = await runCmd("git", ["ls-tree", "-r", "--name-only", head], { cwd: r.origin });
   expect(files.stdout).not.toContain("half-done.ts");
  }, 60_000);
@@ -893,7 +893,7 @@ describe("implement lane (node #23)", () => {
   expect(reviewSubstrates).toEqual(["codex"]);
   expect(r.journal.getWorker("20")?.substrate).toBeNull();
   const head = await r.github.sha("node/20-add-the-feature-module");
-  expect(r.journal.headSubstrate(head)).toBeNull();
+  expect(r.journal.headSubstrate("acme/widgets", head)).toBeNull();
   const start = r.journal
    .listEvents("acme/widgets", 200)
    .find((e) => e.kind === "worker-start" && e.detail?.startsWith("substrate "));

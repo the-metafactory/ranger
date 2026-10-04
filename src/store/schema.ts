@@ -184,14 +184,22 @@ export const substrateReadings = sqliteTable("substrate_readings", {
 });
 
 /**
- * Which substrate wrote each pushed SHA (node #45): review selection reads
- * the PR head's author here. An unknown SHA counts as Pi-written.
+ * Which substrate wrote each pushed SHA (node #45), keyed per repo: review
+ * selection reads the PR head's author here. An unknown SHA counts as
+ * Pi-written. Rows past the retention window are pruned on write.
  */
-export const headSubstrates = sqliteTable("head_substrates", {
- sha: text("sha").primaryKey(),
- repo: text("repo").notNull(),
- nodeId: text("node_id").notNull(),
- /** claude | codex | pi */
- substrate: text("substrate", { enum: SUBSTRATE_NAMES }).notNull(),
- recordedAt: text("recorded_at").notNull(),
-});
+export const headSubstrates = sqliteTable(
+ "head_substrates",
+ {
+  repo: text("repo").notNull(),
+  sha: text("sha").notNull(),
+  nodeId: text("node_id").notNull(),
+  /** claude | codex | pi */
+  substrate: text("substrate", { enum: SUBSTRATE_NAMES }).notNull(),
+  recordedAt: text("recorded_at").notNull(),
+ },
+ (table) => [
+  primaryKey({ columns: [table.repo, table.sha] }),
+  index("head_substrates_recorded_at_idx").on(table.recordedAt),
+ ],
+);

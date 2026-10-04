@@ -650,8 +650,25 @@ describe("head author substrate (node #45)", () => {
  test("records which substrate wrote a pushed SHA; unknown SHAs read null", async () => {
   await withJournal((journal) => {
    journal.recordHeadSubstrate({ sha: SHA, repo: "acme/widgets", nodeId: "9", substrate: "codex" });
-   expect(journal.headSubstrate(SHA)).toBe("codex");
-   expect(journal.headSubstrate("b".repeat(40))).toBeNull();
+   expect(journal.headSubstrate("acme/widgets", SHA)).toBe("codex");
+   expect(journal.headSubstrate("acme/widgets", "b".repeat(40))).toBeNull();
+  });
+ });
+
+ test("the same SHA in two repos keeps two authors", async () => {
+  await withJournal((journal) => {
+   journal.recordHeadSubstrate({ sha: SHA, repo: "acme/widgets", nodeId: "9", substrate: "codex" });
+   journal.recordHeadSubstrate({ sha: SHA, repo: "acme/fork", nodeId: "3", substrate: "claude" });
+   expect(journal.headSubstrate("acme/widgets", SHA)).toBe("codex");
+   expect(journal.headSubstrate("acme/fork", SHA)).toBe("claude");
+  });
+ });
+
+ test("head records past the retention window are pruned", async () => {
+  await withJournal((journal) => {
+   journal.recordHeadSubstrate({ sha: SHA, repo: "acme/widgets", nodeId: "9", substrate: "codex" });
+   journal.pruneHeadSubstrates(new Date(Date.now() + 31 * 86_400_000));
+   expect(journal.headSubstrate("acme/widgets", SHA)).toBeNull();
   });
  });
 });

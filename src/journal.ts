@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, lt, or, sql } from "drizzle-orm";
 import { openDb, openDbReadOnly, type RangerDb } from "./store/db.ts";
 import {
  escalations,
@@ -726,23 +726,34 @@ export class Journal {
 
  /** Record which substrate wrote a pushed SHA (review selection reads it back). */
  recordHeadSubstrate(row: { sha: string; repo: string; nodeId: string; substrate: SubstrateName }): void {
-  const recordedAt = new Date().toISOString();
+  const now = new Date();
+  const recordedAt = now.toISOString();
   this.db
    .insert(headSubstrates)
    .values({ ...row, recordedAt })
    .onConflictDoUpdate({
-    target: headSubstrates.sha,
+    target: [headSubstrates.repo, headSubstrates.sha],
     set: { substrate: row.substrate, recordedAt },
    })
    .run();
+  this.pruneHeadSubstrates(now);
  }
 
- /** The substrate that wrote a pushed SHA, or null when ranger never recorded it. */
- headSubstrate(sha: string): SubstrateName | null {
+ /** The substrate that wrote a pushed SHA in a repo, or null when ranger never recorded it. */
+ headSubstrate(repo: string, sha: string): SubstrateName | null {
   const row = this.db.query.headSubstrates
-   .findFirst({ where: eq(headSubstrates.sha, sha) })
+   .findFirst({ where: and(eq(headSubstrates.repo, repo), eq(headSubstrates.sha, sha)) })
    .sync();
   return row?.substrate ?? null;
+ }
+
+ /**
+  * Drop head records past the retention window: a head that old has long
+  * been reviewed, and an unrecorded head only falls back to Pi-written.
+  */
+ pruneHeadSubstrates(now = new Date(), retentionDays = 30): void {
+  const cutoff = new Date(now.getTime() - retentionDays * DAY_MS).toISOString();
+  this.db.delete(headSubstrates).where(lt(headSubstrates.recordedAt, cutoff)).run();
  }
 
  /** Prune spawn-ledger keys older than the retention window (keeps health tidy). */
