@@ -17,6 +17,16 @@ export function mapKey(map: { repo: string; root: number }): string {
  return `${map.repo}#${map.root}`;
 }
 
+/** The refusal `resume-node` and `build-now` (node #58) give while a lane is held. */
+export function laneHeldMessage(
+ lane: ImplementLane,
+ holder: { nodeId: string; repo: string; root: number; status: string },
+ verb: "resume" | "build",
+ nodeId: string,
+): string {
+ return `the ${lane} implement lane is held by #${holder.nodeId} (${mapKey(holder)}, ${holder.status}) — ${verb} #${nodeId} after it leaves the lane, or pass --force to run both`;
+}
+
 export function pickMap(config: RangerConfig, selector?: string): RangerMapConfig {
  const matches = selector === undefined ? config.maps : config.maps.filter(
   m => selector === m.repo || selector === mapKey(m),

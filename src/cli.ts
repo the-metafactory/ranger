@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import { implementLane, startsImplementSession } from "./lanes.ts";
-import { recordImplementStart, mapKey, pickMap, resumeMap } from "./maps.ts";
+import { laneHeldMessage, recordImplementStart, mapKey, pickMap, resumeMap } from "./maps.ts";
 import { Command } from "commander";
 import { join, resolve } from "node:path";
 import {
@@ -40,6 +40,7 @@ import { runNode } from "./worker.ts";
 import { sweepMap } from "./sweep.ts";
 import { spawnRunNodeDetached, walk } from "./walk.ts";
 import { holdAwake } from "./awake.ts";
+import { buildNow } from "./build-now.ts";
 import { startServe } from "./serve.ts";
 import {
  escalateMaps,
@@ -55,6 +56,7 @@ import type { WalkMode } from "./config.ts";
  * - `scout` (node #12) — read-only frontier/audit/HITL digest. Zero graph writes.
  * - `walk` (node #13) — the headless tick: claim + spawn + sweep. Graph writes.
  * - `run-node <id>` — the detached worker supervisor (research + implement lanes).
+ * - `build-now <id>` (node #58) — the walk's claim for one chosen node, started now.
  * - `sweep` — reconcile the journal against reality.
  * - `journal` — inspect the journal.
  * - `serve` (node #37) — local read-only dashboard; launches the principal's
@@ -276,9 +278,7 @@ async function runResumeNode(
   const takesLane = startsImplementSession(row);
   const holder = takesLane ? journal.laneHolder(lane, { nodeId, repo: map.repo }) : null;
   if (holder !== null && force !== true) {
-   throw new Error(
-    `the ${lane} implement lane is held by #${holder.nodeId} (${mapKey(holder)}, ${holder.status}) — resume #${nodeId} after it leaves the lane, or pass --force to run both`,
-   );
+   throw new Error(laneHeldMessage(lane, holder, "resume", nodeId));
   }
   journal.updateWorker(nodeId, map.repo, { status: "claimed", pid: null, workerPgid: null, finishedAt: null });
   if (takesLane) recordImplementStart(journal, map);
@@ -292,6 +292,28 @@ async function runResumeNode(
   if (pid !== null) journal.updateWorker(nodeId, map.repo, { pid });
   journal.recordEvent("sweep", { nodeId, repo: map.repo, detail: `resume-node by operator (was ${row.status}); run-node pid ${pid ?? "none"}` });
   return JSON.stringify({ nodeId, repo: map.repo, root: map.root, was: row.status, pid }, null, 2);
+ } finally {
+  journal.close();
+ }
+}
+
+/**
+ * Operator verb (node #58): claim one walkable frontier node and start it
+ * now, through the walk's own classification and claim (src/build-now.ts).
+ */
+async function runBuildNow(
+ nodeId: string,
+ selector: string,
+ configPath: string,
+ force?: boolean,
+): Promise<string> {
+ const { config, journal } = loadCtx(configPath);
+ try {
+  const map = pickMap(config, selector);
+  if (map.walk === "none") throw new Error(`${mapKey(map)} is walk: none — registered, not walked`);
+  const { token, botIdentity } = await writeContext(config, map);
+  const result = await buildNow(nodeId, { config, configPath, journal, map, token, botIdentity, force });
+  return JSON.stringify(result, null, 2);
  } finally {
   journal.close();
  }
@@ -544,6 +566,28 @@ program
     `ranger resume-node: ${error instanceof Error ? error.message : String(error)}\n`,
    );
    process.exit(1);
+  }
+ });
+
+program
+ .command("build-now")
+ .description(
+  "Operator verb (node #58): claim one walkable frontier node under the bot identity and start its run-node now — the walk's own claim for one node; refuses HITL, off-frontier, skip-listed, vetoed or in-flight nodes, a spent spawn cap, a paused run, and a held implement lane unless --force",
+ )
+ .argument("<id>", "node id to build")
+ .requiredOption("-m, --map <owner/name#root>", "map repo#root (repo alone only when unique)")
+ .option("--force", "start beside whatever holds the implement lane")
+ .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
+ .action(async (id: string, options: { map: string; config: string; force?: boolean }) => {
+  try {
+   if (!/^\d+$/.test(id)) throw new Error(`node id must be numeric, got ${id}`);
+   const configPath = resolve(process.cwd(), options.config);
+   process.stdout.write((await runBuildNow(id, options.map, configPath, options.force)) + "\n");
+  } catch (error) {
+   process.stderr.write(
+    `ranger build-now: ${error instanceof Error ? error.message : String(error)}\n`,
+   );
+   process.exit(error instanceof WriteGateError ? 2 : 1);
   }
  });
 
