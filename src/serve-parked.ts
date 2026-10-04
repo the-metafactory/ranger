@@ -18,6 +18,7 @@
  * reads when the request arrives, and the spawner is injected so no test runs
  * `gh`, `osascript` or ranger.
  */
+import { classifyCi } from "./ci-policy.ts";
 import { REPO_PATTERN } from "./config.ts";
 import type { EventRow, WorkerRow } from "./journal.ts";
 import { childEnv, itermArgv, shellQuote } from "./launch.ts";
@@ -200,20 +201,9 @@ export interface PrView {
  readAt: string;
 }
 
-const OK_CONCLUSIONS = new Set(["success", "neutral", "skipped"]);
-
-/**
- * The CI state of a head from its check runs, by the merge gate's rules
- * (`merge-gate.ts`, mirrored rather than imported to keep serve's import
- * graph small): neutral and skipped pass, but the close cites one check run
- * that concluded success, so a head without one is not green.
- */
+/** The CI state of a head from its check runs, by the merge gate's own policy (`ci-policy.ts`). */
 export function ciState(runs: { status: string; conclusion: string | null }[]): PrView["ci"] {
- if (runs.length === 0) return "none";
- if (runs.some((r) => r.status !== "completed")) return "pending";
- if (runs.some((r) => !OK_CONCLUSIONS.has(r.conclusion ?? ""))) return "failed";
- if (!runs.some((r) => r.conclusion === "success")) return "no-success";
- return "green";
+ return classifyCi(runs).state;
 }
 
 /**
