@@ -1417,19 +1417,32 @@ export const spawnAction: ActionRunner = (argv, env, opts) =>
   const [command, ...args] = argv;
   let stderr = "";
   let settled = false;
+  let markExited: () => void = () => {};
+  const exited = new Promise<void>((resolve) => {
+   markExited = resolve;
+  });
   const settle = (code: number | null, extra = "") => {
    if (settled) return;
    settled = true;
    clearTimeout(timer);
-   done({ code, stderr: (stderr + extra).slice(-4000) });
+   done({ code, stderr: (stderr + extra).slice(-4000), exited });
   };
   const child = spawn(command, args, { env, stdio: ["ignore", "ignore", "pipe"], detached: opts.detached });
+  // The page is answered at the timeout; the child is not killed (a resume
+  // cut mid-journal-write is worse than a slow one), and `exited` keeps the
+  // node held until it really ends.
   const timer = setTimeout(() => settle(null, `\n(no exit after ${ACTION_TIMEOUT_MS / 1000} s; still running)`), ACTION_TIMEOUT_MS);
   child.stderr?.on("data", (chunk: Buffer) => {
    stderr = (stderr + chunk.toString()).slice(-4000);
   });
-  child.on("error", (error) => settle(null, `could not start ${command}: ${error.message}`));
-  child.on("close", (code) => settle(code));
+  child.on("error", (error) => {
+   settle(null, `could not start ${command}: ${error.message}`);
+   markExited();
+  });
+  child.on("close", (code) => {
+   settle(code);
+   markExited();
+  });
   if (opts.detached) child.unref();
  });
 

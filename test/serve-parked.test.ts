@@ -597,6 +597,41 @@ describe("node #54 — the actions and their guards", () => {
   expect(runs).toBe(2);
  });
 
+ test("a timed-out action keeps the node held until its child really exits", async () => {
+  let exit: () => void = () => {};
+  const exited = new Promise<void>((done) => {
+   exit = done;
+  });
+  let runs = 0;
+  const handler = createHandler({
+   port: PORT,
+   token: TOKEN,
+   getState: () => assembleState({ ...baseInputs(), needsYou: needsYouEntries(entryInputs()) }),
+   refresh: () => {},
+   launch: () => {},
+   verifyGrilling: async () => null,
+   actions: {
+    // Answers like the runner's timeout: no exit code, child still running.
+    run: async () => {
+     runs++;
+     return { code: null, stderr: "(no exit after 120 s; still running)", exited };
+    },
+    rangerBin: "/bin/ranger",
+    configPath: "/x/ranger.yaml",
+    readPr: async () => greenPr(),
+    exists: () => true,
+   },
+  });
+  expect((await handler(post("/api/resume", ok))).status).toBe(200);
+  expect((await handler(post("/api/resume", ok))).status).toBe(409);
+  expect(runs).toBe(1);
+  exit();
+  await exited;
+  await Bun.sleep(0);
+  expect((await handler(post("/api/resume", ok))).status).toBe(200);
+  expect(runs).toBe(2);
+ });
+
  test("a failing action shows its exit code and stderr tail", async () => {
   const handler = createHandler({
    port: PORT,

@@ -404,6 +404,12 @@ export interface ActionResult {
  code: number | null;
  /** The tail of its stderr (or the spawn error). */
  stderr: string;
+ /**
+  * Settles when the child has actually exited. A timed-out result answers the
+  * page early, but the child may still be running, and the node's in-flight
+  * hold lasts until this settles. Absent means the child is already gone.
+  */
+ exited?: Promise<void>;
 }
 
 /** Spawns a child and resolves with its exit; injected so tests run nothing. */
@@ -513,6 +519,8 @@ export interface ActionResponse {
  body: Record<string, unknown>;
  /** The entry acted on, when the action ran. */
  entry?: NeedsYouEntry;
+ /** The child's real exit (see `ActionResult.exited`); never sent to the page. */
+ exited?: Promise<void>;
 }
 
 const refusal = (status: number, error: string): ActionResponse => ({ status, body: { error } });
@@ -540,10 +548,16 @@ export async function runAction(
  const held = `${entry.repo}#${entry.nodeId}`;
  if (deps.inFlight.has(held)) return refusal(409, `an action on #${entry.nodeId} is already running: wait for it, then reload`);
  deps.inFlight.add(held);
+ let exited: Promise<void> | undefined;
  try {
-  return await runHeldAction(kind, body, deps, entry);
+  const response = await runHeldAction(kind, body, deps, entry);
+  exited = response.exited;
+  return response;
  } finally {
-  deps.inFlight.delete(held);
+  // Held until the child exits, not until the page is answered: a resume
+  // that outlives the HTTP timeout must still refuse a second one.
+  if (exited === undefined) deps.inFlight.delete(held);
+  else void exited.finally(() => deps.inFlight.delete(held));
  }
 }
 
@@ -576,7 +590,12 @@ async function runHeldAction(
    return refusal(409, "the confirmed head SHA is not the PR's head: reload and confirm again");
   }
   const pr = entry.pr as NonNullable<NeedsYouEntry["pr"]>;
-  const live = await deps.readPr(entry.repo, pr.number);
+  let live: PrView | null;
+  try {
+   live = await deps.readPr(entry.repo, pr.number);
+  } catch (error) {
+   return refusal(502, `could not read PR #${pr.number} live: ${error instanceof Error ? error.message : String(error)}`);
+  }
   const stale = mergeRefusal(live);
   if (stale !== null) return refusal(409, `read live: ${stale}`);
   if ((live as PrView).headSha !== body.sha) {
@@ -597,5 +616,6 @@ async function runHeldAction(
   status: 200,
   body: { action: kind, nodeId: entry.nodeId, ok: result.code === 0, code: result.code, stderr: tailOf(result.stderr) },
   entry,
+  exited: result.exited,
  };
 }
