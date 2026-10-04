@@ -2,21 +2,27 @@
  * Substrate selection (node #45): route implement sessions, fix passes and
  * sage reviews across Claude, Codex and Pi by remaining 5h/7d quota.
  *
- * Strong substrates (Claude, Codex) are eligible while every reported window
- * is under its reserve; once both are capped, Pi is the fallback. Review
- * selection cross-matches: the reviewer runs on a substrate other than the
- * one that wrote the PR head.
+ * Strong substrates (Claude, Codex) are eligible while every reported
+ * window's used% is under its max-used threshold; once both are capped, Pi is
+ * the fallback. Review selection prefers a substrate other than the one that
+ * wrote the PR head; when no other substrate is eligible the review runs on
+ * the author's own (best-effort independence, not a guarantee).
  */
 import { spawn } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { RangerConfig } from "./config.ts";
 import { runCmd } from "./exec.ts";
 import type { Journal, SubstrateReading } from "./journal.ts";
+import type { SubstrateName } from "./store/schema.ts";
+import { workerHostEnv } from "./worker-env.ts";
+import { isFresh, STRONG_SUBSTRATES, type SubstrateConfig } from "./substrate-policy.ts";
 
 // ---- types ----
 
-export type SubstrateName = "claude" | "codex" | "pi";
-export const STRONG_SUBSTRATES: SubstrateName[] = ["claude", "codex"];
+export type { SubstrateName };
+export * from "./substrate-policy.ts";
 
 export interface QuotaWindow {
  kind: "five_hour" | "seven_day";
@@ -163,6 +169,10 @@ export function readCodexQuota(opts: { timeoutMs?: number } = {}): Promise<Quota
    settle(() => reject(new Error("codex app-server exited before responding"))),
   );
 
+  // A spawn failure or early exit surfaces as EPIPE on stdin: settle, never throw.
+  child.stdin.on("error", (err) =>
+   settle(() => reject(new Error(`codex app-server stdin failed: ${err.message}`))),
+  );
   const send = (msg: object) => child.stdin.write(`${JSON.stringify(msg)}\n`);
   send({
    jsonrpc: "2.0",
@@ -190,6 +200,18 @@ export interface ClaudeRateLimitEvent {
  };
 }
 
+/**
+ * Statuses that still allow requests. `allowed_warning` is Claude's
+ * approaching-the-limit notice, not a cap: the max-used thresholds already
+ * keep a near-limit Claude out of selection. Anything else (`rejected`, or a
+ * status ranger does not know) counts as capped, so the rule fails closed.
+ */
+const CLAUDE_UNCAPPED_STATUSES = new Set(["allowed", "allowed_warning"]);
+
+export function isClaudeCappedStatus(status: string): boolean {
+ return !CLAUDE_UNCAPPED_STATUSES.has(status);
+}
+
 export function parseClaudeRateLimitEvent(event: ClaudeRateLimitEvent, now = new Date()): QuotaReading {
  const info = event.rate_limit_info;
  const windows: QuotaWindow[] = [];
@@ -199,8 +221,7 @@ export function parseClaudeRateLimitEvent(event: ClaudeRateLimitEvent, now = new
    windows.push({ kind, usedPct: Math.round(w.utilization * 100), resetsAt: w.resetsAt });
   }
  }
- // The node #45 brief: any status other than "allowed" counts as capped.
- const capped = info.status !== "allowed";
+ const capped = isClaudeCappedStatus(info.status);
  return {
   substrate: "claude",
   readAt: now,
@@ -230,6 +251,17 @@ export function* claudeRateLimitEvents(lines: string[]): Generator<ClaudeRateLim
 }
 
 /**
+ * The only Claude stream-json lines ranger reads: rate_limit_events and the
+ * final result event. A worker run keeps just these as they stream (the
+ * verbose stream carries every tool result). A quoted `"type":"result"`
+ * inside a JSON string is escaped, so only a real key matches; the parsers
+ * re-check the top-level type.
+ */
+export function isClaudeSignalLine(line: string): boolean {
+ return line.includes("rate_limit_event") || line.includes('"type":"result"');
+}
+
+/**
  * The final summary text of a Claude stream-json run (its `result` event),
  * so worker logs read as the plain `claude -p` output did. Raw stdout when
  * the stream carries no result event.
@@ -256,15 +288,23 @@ export function cacheClaudeRateLimitEvents(lines: string[], journal: Journal, no
 }
 
 /**
- * Probe Claude's quota with a one-turn haiku call in a scratch cwd. A capped
- * probe may exit non-zero, so the stream is read before the exit code.
+ * Probe Claude's quota with a one-turn haiku call. It runs in a fresh private
+ * scratch dir (mkdtemp, mode 0700) so no planted project settings or hooks
+ * load, with the worker host env (no RANGER_* tokens). A capped probe may
+ * exit non-zero, so the stream is read before the exit code.
  */
 export async function probeClaudeQuota(opts: { timeoutMs?: number } = {}): Promise<QuotaReading> {
- const result = await runCmd(
-  "claude",
-  ["-p", "ok", "--model", "haiku", "--output-format", "stream-json", "--verbose"],
-  { cwd: tmpdir(), timeoutMs: opts.timeoutMs ?? 60_000 },
- );
+ const scratch = mkdtempSync(join(tmpdir(), "ranger-probe-"));
+ let result: Awaited<ReturnType<typeof runCmd>>;
+ try {
+  result = await runCmd(
+   "claude",
+   ["-p", "ok", "--model", "haiku", "--output-format", "stream-json", "--verbose"],
+   { cwd: scratch, env: workerHostEnv(), timeoutMs: opts.timeoutMs ?? 60_000 },
+  );
+ } finally {
+  rmSync(scratch, { recursive: true, force: true });
+ }
  for (const event of claudeRateLimitEvents(result.stdout.split("\n"))) {
   return parseClaudeRateLimitEvent(event);
  }
@@ -303,111 +343,6 @@ function epochIso(seconds: number): string {
  return new Date(seconds * 1000).toISOString();
 }
 
-/** One line per reading for journal events: what a selection was made on. */
-export function describeReadings(readings: SubstrateReading[], now: Date): string {
- const parts = STRONG_SUBSTRATES.map((name) => {
-  const r = readings.find((x) => x.substrate === name);
-  if (r === undefined) return `${name} unread`;
-  const age = Math.round((now.getTime() - Date.parse(r.readAt)) / 60_000);
-  const windows = [
-   r.fiveHourUsedPct === null ? null : `5h ${r.fiveHourUsedPct}%`,
-   r.sevenDayUsedPct === null ? null : `7d ${r.sevenDayUsedPct}%`,
-  ].filter((w) => w !== null);
-  const capped = r.capped || (r.cappedUntil !== null && Date.parse(r.cappedUntil) > now.getTime());
-  return `${name} ${windows.join(" ") || "no windows"} read ${age}m ago${capped ? " CAPPED" : ""}`;
- });
- return parts.join("; ");
-}
-
-// ---- selection policy (pure functions, unit-tested) ----
-
-export interface SubstrateConfig {
- fiveHourMaxUsedPct: number;
- sevenDayMaxUsedPct: number;
- claudeProbeMaxAgeMin: number;
- codexReadMaxAgeMin: number;
-}
-
-export interface SelectionInput {
- readings: SubstrateReading[];
- now: Date;
- config: SubstrateConfig;
-}
-
-export interface EligibleSubstrate {
- name: SubstrateName;
- headroom: number;
-}
-
-export function maxReadingAgeMs(name: SubstrateName, config: SubstrateConfig): number {
- return (name === "claude" ? config.claudeProbeMaxAgeMin : config.codexReadMaxAgeMin) * 60_000;
-}
-
-export function isFresh(reading: SubstrateReading, config: SubstrateConfig, now: Date): boolean {
- const ageMs = now.getTime() - Date.parse(reading.readAt);
- return ageMs <= maxReadingAgeMs(reading.substrate as SubstrateName, config);
-}
-
-/**
- * A strong substrate is eligible when its reading is fresh, it is neither
- * capped nor capped-until in the future, and every reported window is under
- * its reserve. Missing or stale readings fail closed.
- */
-export function isEligible(
- reading: SubstrateReading | null,
- config: SubstrateConfig,
- now: Date,
-): EligibleSubstrate | null {
- if (reading === null) return null;
- const name = reading.substrate as SubstrateName;
- if (name !== "claude" && name !== "codex") return null;
- if (!isFresh(reading, config, now)) return null;
- if (reading.capped) return null;
- if (reading.cappedUntil !== null && Date.parse(reading.cappedUntil) > now.getTime()) return null;
-
- // Headroom: the smallest (threshold − used%) over the reported windows.
- let headroom = Infinity;
- if (reading.fiveHourUsedPct !== null) {
-  headroom = Math.min(headroom, config.fiveHourMaxUsedPct - reading.fiveHourUsedPct);
- }
- if (reading.sevenDayUsedPct !== null) {
-  headroom = Math.min(headroom, config.sevenDayMaxUsedPct - reading.sevenDayUsedPct);
- }
- if (headroom <= 0) return null;
- // A fresh reading with no windows: eligible, with the least headroom.
- if (headroom === Infinity) headroom = 1;
- return { name, headroom };
-}
-
-/** The eligible strong substrates, most headroom first. */
-export function eligibleStrong(input: SelectionInput): EligibleSubstrate[] {
- return STRONG_SUBSTRATES.map((name) =>
-  isEligible(input.readings.find((r) => r.substrate === name) ?? null, input.config, input.now),
- )
-  .filter((e): e is EligibleSubstrate => e !== null)
-  .sort((a, b) => b.headroom - a.headroom);
-}
-
-/** Implement session or fix pass: the eligible strong substrate with the most headroom, else Pi. */
-export function selectForBuild(input: SelectionInput): SubstrateName {
- return eligibleStrong(input)[0]?.name ?? "pi";
-}
-
-/**
- * Sage review: an eligible substrate other than the head's author
- * (Claude-written → Codex and vice versa); a Pi-written head gets the
- * strongest eligible. No other substrate eligible → the author's substrate
- * if eligible, else Pi.
- */
-export function selectForReview(input: SelectionInput, authorSubstrate: SubstrateName): SubstrateName {
- const eligible = eligibleStrong(input);
- return (
-  eligible.find((e) => e.name !== authorSubstrate)?.name ??
-  eligible.find((e) => e.name === authorSubstrate)?.name ??
-  "pi"
- );
-}
-
 // ---- per-substrate command builders ----
 
 /**
@@ -430,8 +365,8 @@ export function workerCommandFor(substrate: SubstrateName, config: RangerConfig)
 
 function readerFor(substrate: "claude" | "codex", readers: SubstrateReaders | undefined) {
  return substrate === "codex"
-  ? (readers?.codex ?? (() => readCodexQuota({ timeoutMs: 30_000 })))
-  : (readers?.claude ?? (() => probeClaudeQuota({ timeoutMs: 60_000 })));
+  ? (readers?.codex ?? (() => readCodexQuota()))
+  : (readers?.claude ?? (() => probeClaudeQuota()));
 }
 
 /**
@@ -476,10 +411,10 @@ export interface CapSignal {
  resetsAt: number | null;
 }
 
-/** A Claude stream's own cap signal: a rate_limit_event whose status is not "allowed". */
+/** A Claude stream's own cap signal: a rate_limit_event with a capped status (see isClaudeCappedStatus). */
 export function detectClaudeCap(lines: string[]): CapSignal | null {
  for (const event of claudeRateLimitEvents(lines)) {
-  if (event.rate_limit_info.status !== "allowed") {
+  if (isClaudeCappedStatus(event.rate_limit_info.status)) {
    const reading = parseClaudeRateLimitEvent(event);
    return { substrate: "claude", resetsAt: reading.cappedUntil };
   }

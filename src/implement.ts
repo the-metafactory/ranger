@@ -28,6 +28,7 @@ import {
  describeReadings,
  extractClaudeResultText,
  freshReadings,
+ isClaudeSignalLine,
  selectForReview,
  type CapSignal,
  type SubstrateName,
@@ -79,7 +80,7 @@ export type Reviewer = (
  repo: string,
  prNumber: number,
  readOnlyToken: string,
- opts?: { substrate?: string },
+ opts?: { substrate?: SubstrateName },
 ) => Promise<ReviewVerdict>;
 
 export type WorkerRun = (prompt: string, opts: RunOptions) => Promise<RunResult>;
@@ -109,6 +110,8 @@ export interface ImplementContext {
  substrate?: SubstrateName;
  /** Quota readers for review selection and cap confirmation (tests inject them). */
  substrateReaders?: SubstrateReaders;
+ /** Substrates capped earlier in this run: review selection leaves them out. */
+ excludedSubstrates?: ReadonlySet<SubstrateName>;
 }
 
 export interface ImplementOutcome {
@@ -432,30 +435,16 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
    }
    const round = reviews.length + 1;
    fence("review");
-   // Cross-model review (node #45): the reviewer runs on a substrate other
-   // than the one that wrote the head; an unrecorded head counts as Pi's.
-   // An injected reviewer (tests) skips selection.
-   let reviewSubstrate: SubstrateName | undefined;
-   let chosenOn = "";
-   if (ctx.reviewer === undefined) {
-    const now = new Date();
-    const readings = await freshReadings(journal, config.substrates, now, ctx.substrateReaders);
-    const author = (journal.headSubstrate(live.headSha) ?? "pi") as SubstrateName;
-    reviewSubstrate = selectForReview({ readings, now, config: config.substrates }, author);
-    chosenOn = ` on ${reviewSubstrate} (head by ${author}; ${describeReadings(readings, now)})`;
-   }
+   const { substrate: reviewSubstrate, chosenOn } = await selectReviewSubstrate(ctx, live.headSha);
    let verdict: ReviewVerdict;
    try {
-    verdict = await (ctx.reviewer ?? sageReview)(
-     repo,
-     open.number,
-     ctx.readOnlyToken,
-     reviewSubstrate !== undefined ? { substrate: reviewSubstrate } : undefined,
-    );
+    verdict = await (ctx.reviewer ?? sageReview)(repo, open.number, ctx.readOnlyToken, {
+     substrate: reviewSubstrate,
+    });
    } catch (error) {
     // A review that failed on its substrate's limit resumes elsewhere; any
     // other review failure is an ordinary one.
-    if (!(error instanceof ReviewError) || reviewSubstrate === undefined) throw error;
+    if (!(error instanceof ReviewError)) throw error;
     const capSignal = await confirmCap(reviewSubstrate, journal, { readers: ctx.substrateReaders });
     if (capSignal === null) throw error;
     return {
@@ -568,6 +557,29 @@ interface PassResult {
  failure?: ImplementOutcome;
 }
 
+/**
+ * Cross-model review selection (node #45): prefer a substrate other than the
+ * one that wrote the head; an unrecorded head counts as Pi's. Substrates
+ * capped earlier in this run are left out, so a review never re-picks one
+ * whose capped-until has lapsed meanwhile.
+ */
+async function selectReviewSubstrate(
+ ctx: ImplementContext,
+ headSha: string,
+): Promise<{ substrate: SubstrateName; chosenOn: string }> {
+ const sc = ctx.config.substrates;
+ const now = new Date();
+ const readings = await freshReadings(ctx.journal, sc, now, ctx.substrateReaders);
+ const excluded = ctx.excludedSubstrates ?? new Set<SubstrateName>();
+ const selectable = readings.filter((r) => !excluded.has(r.substrate));
+ const author = ctx.journal.headSubstrate(headSha) ?? "pi";
+ const substrate = selectForReview({ readings: selectable, now, config: sc }, author);
+ return {
+  substrate,
+  chosenOn: ` on ${substrate} (head by ${author}; ${describeReadings(readings, now)})`,
+ };
+}
+
 /** Which substrate wrote a pushed SHA: the review of that head reads it back. */
 function recordHead(ctx: ImplementContext, sha: string): void {
  if (ctx.substrate === undefined) return;
@@ -613,14 +625,16 @@ async function workerPass(
   cwd: worktree,
   timeoutMs: config.workers.wallClockMin * 60_000,
   env: workerEnv(config, map.repo),
+  ...(ctx.substrate === "claude" ? { keepStdoutLine: isClaudeSignalLine } : {}),
   processGroup: true,
   onSpawn: (pgid) => journal.updateWorker(nodeId, { workerPgid: pgid }),
  });
  journal.updateWorker(nodeId, { workerPgid: null });
 
- // A Claude worker streams JSON (node #45): its rate_limit_events are the
- // current reading and its cap signal, and its result event is the summary
- // the worker log carries, as plain `claude -p` output did.
+ // A Claude worker streams JSON (node #45), kept to its signal lines as it
+ // runs: its rate_limit_events are the current reading and its cap signal,
+ // and its result event is the summary the worker log carries, as plain
+ // `claude -p` output did.
  const lines = ctx.substrate === "claude" ? raw.stdout.split("\n") : undefined;
  if (lines !== undefined) cacheClaudeRateLimitEvents(lines, journal);
  const result: RunResult =

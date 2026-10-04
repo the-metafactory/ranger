@@ -30,8 +30,8 @@ import {
  freshReadings,
  markSubstrateCapped,
  selectForBuild,
- STRONG_SUBSTRATES,
  workerCommandFor,
+ type CapSignal,
  type QuotaReading,
  type SubstrateName,
  type SubstrateReaders,
@@ -91,7 +91,7 @@ export interface RunNodeContext {
  readOnlyToken?: string;
  /** For tests: the first session's substrate (later sessions after a cap are selected). */
  substrate?: SubstrateName;
- /** For tests: the quota readers (with a command override and none injected, reads fail closed). */
+ /** For tests: the quota readers (with an injected worker, reviewer or command and none injected, reads fail closed). */
  substrateReaders?: SubstrateReaders;
 }
 
@@ -221,17 +221,23 @@ function resolveWorkerCommand(ctx: RunNodeContext, substrate: SubstrateName): st
  return workerCommandFor(substrate, ctx.config);
 }
 
+/** Any injected worker, reviewer or command: a test or operator run, never the real CLIs' quota. */
 function commandOverridden(ctx: RunNodeContext): boolean {
- return ctx.workerCommand !== undefined || Boolean(process.env.RANGER_WORKER_CMD);
+ return (
+  ctx.workerCommand !== undefined ||
+  ctx.worker !== undefined ||
+  ctx.reviewer !== undefined ||
+  Boolean(process.env.RANGER_WORKER_CMD)
+ );
 }
 
 const failingRead = (): Promise<QuotaReading> =>
  Promise.reject(new Error("quota reads are off under a worker command override"));
 
 /**
- * The quota readers: injected ones, else the real CLIs — except under a
- * worker command override (tests, operator runs), where reads fail closed
- * rather than spawn a real `claude` or `codex`.
+ * The quota readers: injected ones, else the real CLIs — except under an
+ * injected worker, reviewer or command (tests, operator runs), where reads
+ * fail closed rather than spawn a real `claude` or `codex`.
  */
 function resolveReaders(ctx: RunNodeContext): SubstrateReaders | undefined {
  if (ctx.substrateReaders !== undefined) return ctx.substrateReaders;
@@ -252,11 +258,10 @@ async function selectBuildSubstrate(
  }
  const now = new Date();
  const sc = ctx.config.substrates;
- const readings = (await freshReadings(ctx.journal, sc, now, resolveReaders(ctx))).filter(
-  (r) => !excluded.has(r.substrate as SubstrateName),
- );
+ const readings = await freshReadings(ctx.journal, sc, now, resolveReaders(ctx));
+ const selectable = readings.filter((r) => !excluded.has(r.substrate));
  return {
-  substrate: selectForBuild({ readings, now, config: sc }),
+  substrate: selectForBuild({ readings: selectable, now, config: sc }),
   chosenOn: describeReadings(readings, now),
  };
 }
@@ -278,6 +283,32 @@ async function resetToPushed(worktree: string, branch: string, base: string): Pr
    throw new GitSafetyError(`cannot reset ${worktree} to ${target} (git ${args[0]}): ${r.stderr.trim()}`);
   }
  }
+}
+
+/**
+ * A session or review hit its substrate's limit (node #45): mark the substrate
+ * capped, journal it, and put the worktree back to the last pushed state so
+ * the next eligible substrate resumes from there. Not counted toward attempts
+ * or the dead-man switch.
+ */
+async function handleSubstrateCap(
+ ctx: RunNodeContext,
+ run: { nodeId: string; generation: number; worktree: string; branch: string },
+ cap: CapSignal,
+ outcome: ImplementOutcome,
+ capped: Set<SubstrateName>,
+): Promise<void> {
+ const { journal, map } = ctx;
+ capped.add(cap.substrate);
+ markSubstrateCapped(journal, cap.substrate, cap.resetsAt, new Date());
+ const resets = cap.resetsAt === null ? "unknown" : new Date(cap.resetsAt * 1000).toISOString();
+ journal.recordEvent("substrate-capped", {
+  nodeId: run.nodeId,
+  repo: map.repo,
+  detail: `${cap.substrate} hit its limit (resets ${resets}); resuming on the next eligible substrate: ${outcome.detail}`.slice(0, 400),
+ });
+ journal.assertGeneration(run.nodeId, run.generation, "resume on another substrate");
+ await resetToPushed(run.worktree, run.branch, map.base);
 }
 
 /** Count a failure toward the dead-man switch, pausing claiming at the threshold. */
@@ -438,8 +469,9 @@ async function runImplementNode(
  // Substrate selection (node #45), re-run at every session start. A session
  // that hits its substrate's limit is not a failure: the substrate is marked
  // capped and the node resumes in this supervisor on the next eligible one,
- // re-deriving its phase from GitHub (F2). Each strong substrate caps at most
- // once per run, so the loop ends on Pi at the latest.
+ // re-deriving its phase from GitHub (F2). Build and review selection both
+ // leave out the substrates capped in this run and Pi never caps, so each
+ // strong substrate caps at most once and the loop ends on Pi at the latest.
  const capped = new Set<SubstrateName>();
  let outcome: ImplementOutcome;
  for (;;) {
@@ -475,21 +507,11 @@ async function runImplementNode(
     reviewer: ctx.reviewer,
     substrate,
     substrateReaders: resolveReaders(ctx),
+    excludedSubstrates: capped,
    });
    const cap = outcome.substrateCapped;
-   if (cap === undefined || capped.has(cap.substrate) || capped.size >= STRONG_SUBSTRATES.length) {
-    break;
-   }
-   // Not counted toward attempts or the dead-man switch.
-   capped.add(cap.substrate);
-   markSubstrateCapped(journal, cap.substrate, cap.resetsAt, new Date());
-   journal.recordEvent("substrate-capped", {
-    nodeId,
-    repo,
-    detail: `${cap.substrate} hit its limit (resets ${cap.resetsAt === null ? "unknown" : new Date(cap.resetsAt * 1000).toISOString()}); resuming on the next eligible substrate: ${outcome.detail}`.slice(0, 400),
-   });
-   journal.assertGeneration(nodeId, generation, "resume on another substrate");
-   await resetToPushed(worktree, branch, map.base);
+   if (cap === undefined || capped.has(cap.substrate)) break;
+   await handleSubstrateCap(ctx, { nodeId, generation, worktree, branch }, cap, outcome, capped);
   } catch (error) {
    if (error instanceof ParkSignal || error instanceof GitSafetyError) {
     const detail = error.message;
@@ -518,7 +540,8 @@ async function runImplementNode(
    break;
   default:
    journal.recordEvent("refused", { nodeId, repo, detail: outcome.detail.slice(0, 400) });
-   countFailure(config, journal, repo);
+   // Backstop: a capped failure never counts (node #45), even if it ends the run.
+   if (outcome.substrateCapped === undefined) countFailure(config, journal, repo);
    finish(journal, nodeId, "failed", outcome.detail);
  }
  return {

@@ -41,6 +41,7 @@ import { type FrontierEntry, graphFrontier, RateLimitError } from "./graph.ts";
 import { runCmd } from "./exec.ts";
 import { classify, type ClassifiedNode, loadProbeRegistry } from "./route.ts";
 import type { SubstrateReading } from "./journal.ts";
+import { isCappedAt, isEligible, isFresh, type SubstrateConfig } from "./substrate-policy.ts";
 import { assertReadOnlyToken, gatedEnv } from "./token-gate.ts";
 
 const ID_PATTERN = /^\d+$/;
@@ -144,8 +145,8 @@ export interface StateInputs {
  refreshing: boolean;
  refreshError: string | null;
  now: Date;
- /** Latest substrate quota readings (node #45). */
- substrateReadings?: SubstrateReading[];
+ /** Latest substrate quota readings, as the panel shows them (node #45). */
+ substrates?: SubstrateView[];
 }
 
 export interface CurrentJob {
@@ -202,8 +203,49 @@ export interface DashboardMap {
  grillings: GrillingView[];
 }
 
-/** A substrate's latest quota reading, as the panel shows it (node #45). */
-export type SubstrateView = SubstrateReading;
+/**
+ * A substrate's latest quota reading, as the panel shows it (node #45): the
+ * cap and eligibility state are derived here with the selector's own rules,
+ * so the dashboard never re-derives them and the storage row stays private.
+ */
+export interface SubstrateView {
+ substrate: SubstrateReading["substrate"];
+ fiveHourUsedPct: number | null;
+ sevenDayUsedPct: number | null;
+ /** ISO: the earliest reported window reset. */
+ resetsAt: string | null;
+ readAt: string;
+ /** Minutes since the reading. */
+ ageMin: number;
+ /** Within its max age: a stale reading is ineligible (fail closed). */
+ fresh: boolean;
+ /** Capped now (by status or a future capped-until). */
+ capped: boolean;
+ /** ISO, only while still in the future. */
+ cappedUntil: string | null;
+ /** Selectable for the next session right now. */
+ eligible: boolean;
+}
+
+export function substrateViews(
+ readings: SubstrateReading[],
+ config: SubstrateConfig,
+ now: Date,
+): SubstrateView[] {
+ return readings.map((r) => ({
+  substrate: r.substrate,
+  fiveHourUsedPct: r.fiveHourUsedPct,
+  sevenDayUsedPct: r.sevenDayUsedPct,
+  resetsAt: r.resetsAt,
+  readAt: r.readAt,
+  ageMin: Math.max(0, Math.round((now.getTime() - Date.parse(r.readAt)) / 60_000)),
+  fresh: isFresh(r, config, now),
+  capped: isCappedAt(r, now),
+  cappedUntil:
+   r.cappedUntil !== null && Date.parse(r.cappedUntil) > now.getTime() ? r.cappedUntil : null,
+  eligible: isEligible(r, config, now) !== null,
+ }));
+}
 
 export interface DashboardState {
  generatedAt: string;
@@ -389,7 +431,7 @@ export function assembleState(inputs: StateInputs): DashboardState {
   },
   current,
   maps,
-  substrates: inputs.substrateReadings ?? [],
+  substrates: inputs.substrates ?? [],
  };
 }
 
@@ -692,11 +734,10 @@ function renderSubstrates(s) {
   if (sub.fiveHourUsedPct !== null) parts.push("5h: " + sub.fiveHourUsedPct + "%");
   if (sub.sevenDayUsedPct !== null) parts.push("7d: " + sub.sevenDayUsedPct + "%");
   if (sub.resetsAt) parts.push("resets " + new Date(sub.resetsAt).toLocaleString());
-  parts.push("read " + ago(sub.readAt));
-  const until = sub.cappedUntil && new Date(sub.cappedUntil).getTime() > Date.now() ? sub.cappedUntil : null;
-  const capped = sub.capped || until !== null;
-  if (capped) parts.push("CAPPED until " + (until ? new Date(until).toLocaleString() : "next reading"));
-  return el("li", {}, el("span", { class: "t", text: parts.join(" · ") }), el("span", { class: capped ? "tag stale" : "tag", text: capped ? "capped" : "ok" }));
+  parts.push("read " + sub.ageMin + "m ago" + (sub.fresh ? "" : " (stale)"));
+  if (sub.capped) parts.push("CAPPED until " + (sub.cappedUntil ? new Date(sub.cappedUntil).toLocaleString() : "next reading"));
+  const state = sub.capped ? "capped" : sub.eligible ? "eligible" : "ineligible";
+  return el("li", {}, el("span", { class: "t", text: parts.join(" · ") }), el("span", { class: sub.eligible ? "tag" : "tag stale", text: state }));
  })));
 }
 function render(s) { renderMeta(s); renderCurrent(s); renderSubstrates(s); renderNext(s); renderAuto(s); renderGrill(s); }
@@ -936,7 +977,7 @@ export function stateFromJournal(
    refreshing: reader.refreshing,
    refreshError: reader.lastError,
    now,
-   substrateReadings: journal?.listSubstrateReadings() ?? [],
+   substrates: substrateViews(journal?.listSubstrateReadings() ?? [], config.substrates, now),
   });
   reader.want(
    state.current.filter((j) => j.title === null).map((j) => `${j.repo}#${j.nodeId}`),

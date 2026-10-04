@@ -7,6 +7,7 @@ import {
  headSubstrates,
  health,
  substrateReadings,
+ type SubstrateName,
  vetoes,
  workers,
 } from "./store/schema.ts";
@@ -53,7 +54,7 @@ export interface WorkerRow {
  verdictBlockers: number | null;
  mergeMessageId: string | null;
  /** The substrate the worker ran on (claude | codex | pi). */
- substrate: string | null;
+ substrate: SubstrateName | null;
 }
 
 /** Fields a supervisor may update in place on its own row. */
@@ -80,7 +81,7 @@ export interface EventRow {
 }
 
 export interface SubstrateReading {
- substrate: string;
+ substrate: SubstrateName;
  readAt: string;
  fiveHourUsedPct: number | null;
  sevenDayUsedPct: number | null;
@@ -711,7 +712,7 @@ export class Journal {
  }
 
  /** Get the latest reading for a substrate. */
- getSubstrateReading(substrate: string): SubstrateReading | null {
+ getSubstrateReading(substrate: SubstrateName): SubstrateReading | null {
   const row = this.db.query.substrateReadings
    .findFirst({ where: eq(substrateReadings.substrate, substrate) })
    .sync();
@@ -724,7 +725,7 @@ export class Journal {
  }
 
  /** Record which substrate wrote a pushed SHA (review selection reads it back). */
- recordHeadSubstrate(row: { sha: string; repo: string; nodeId: string; substrate: string }): void {
+ recordHeadSubstrate(row: { sha: string; repo: string; nodeId: string; substrate: SubstrateName }): void {
   const recordedAt = new Date().toISOString();
   this.db
    .insert(headSubstrates)
@@ -737,7 +738,7 @@ export class Journal {
  }
 
  /** The substrate that wrote a pushed SHA, or null when ranger never recorded it. */
- headSubstrate(sha: string): string | null {
+ headSubstrate(sha: string): SubstrateName | null {
   const row = this.db.query.headSubstrates
    .findFirst({ where: eq(headSubstrates.sha, sha) })
    .sync();
@@ -789,7 +790,7 @@ function hydrateWorker(row: {
  verdictSha: string | null;
  verdictBlockers: number | null;
  mergeMessageId: string | null;
- substrate: string | null;
+ substrate: SubstrateName | null;
 }): WorkerRow {
  return {
   nodeId: row.nodeId,
@@ -864,7 +865,7 @@ function hydrateEscalation(row: {
 }
 
 function hydrateSubstrateReading(row: {
- substrate: string;
+ substrate: SubstrateName;
  readAt: string;
  fiveHourUsedPct: number | null;
  sevenDayUsedPct: number | null;

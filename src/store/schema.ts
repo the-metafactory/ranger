@@ -6,6 +6,10 @@ import {
  text,
 } from "drizzle-orm/sqlite-core";
 
+/** The substrates a worker session or review runs on (node #45). */
+export const SUBSTRATE_NAMES = ["claude", "codex", "pi"] as const;
+export type SubstrateName = (typeof SUBSTRATE_NAMES)[number];
+
 /**
  * Ranger journal schema (design §8) — SQLite at `~/.config/ranger/state.sqlite`.
  *
@@ -34,7 +38,7 @@ export const workers = sqliteTable("workers", {
  /** research | implement — the §3 lane the node was claimed into. */
  lane: text("lane"),
  /** The substrate the worker session ran on (claude | codex | pi). */
- substrate: text("substrate"),
+ substrate: text("substrate", { enum: SUBSTRATE_NAMES }),
  /**
   * Occupant generation (the OpenRig occupant-generation pattern, #23
   * amendment): bumped by every run-node start. A supervisor re-checks its
@@ -164,7 +168,7 @@ export const escalationDestinations = sqliteTable(
  */
 export const substrateReadings = sqliteTable("substrate_readings", {
  /** claude | codex | pi */
- substrate: text("substrate").primaryKey(),
+ substrate: text("substrate", { enum: SUBSTRATE_NAMES }).primaryKey(),
  /** ISO timestamp of the reading. */
  readAt: text("read_at").notNull(),
  /** 5-hour window usage percent (0–100), null when the substrate doesn't report one. */
@@ -188,6 +192,6 @@ export const headSubstrates = sqliteTable("head_substrates", {
  repo: text("repo").notNull(),
  nodeId: text("node_id").notNull(),
  /** claude | codex | pi */
- substrate: text("substrate").notNull(),
+ substrate: text("substrate", { enum: SUBSTRATE_NAMES }).notNull(),
  recordedAt: text("recorded_at").notNull(),
 });

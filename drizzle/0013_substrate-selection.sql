@@ -1,3 +1,11 @@
+CREATE TABLE `head_substrates` (
+	`sha` text PRIMARY KEY NOT NULL,
+	`repo` text NOT NULL,
+	`node_id` text NOT NULL,
+	`substrate` text NOT NULL,
+	`recorded_at` text NOT NULL
+);
+--> statement-breakpoint
 CREATE TABLE `substrate_readings` (
 	`substrate` text PRIMARY KEY NOT NULL,
 	`read_at` text NOT NULL,

@@ -104,9 +104,10 @@ budget:
 
 # Substrate selection (node #45): route implement sessions, fix passes and sage
 # reviews across Claude, Codex and Pi by remaining 5h/7d quota. Strong substrates
-# (Claude, Codex) are eligible while every reported window is under its reserve;
-# once both are capped, Pi is the fallback. Cross-model review: the reviewer
-# runs on a substrate other than the one that wrote the PR head.
+# (Claude, Codex) are eligible while every reported window's used% is under its
+# max-used threshold below; once both are capped, Pi is the fallback. Review
+# prefers a substrate other than the one that wrote the PR head (best effort:
+# when no other substrate is eligible, the author's own substrate or Pi reviews).
 substrates:
   # 5-hour window: eligible when used% < this.
   fiveHourMaxUsedPct: 70

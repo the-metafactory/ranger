@@ -10,6 +10,7 @@ import {
  detectClaudeCap,
  drainJsonLines,
  extractClaudeResultText,
+ isClaudeSignalLine,
  isEligible,
  markSubstrateCapped,
  parseClaudeRateLimitEvent,
@@ -25,6 +26,8 @@ import {
 } from "../src/substrate.ts";
 import { recordedReviews, reviewMarker } from "../src/implement.ts";
 import { sageReview } from "../src/review.ts";
+import { runCmd } from "../src/exec.ts";
+import { substrateViews } from "../src/serve.ts";
 import { baseConfigLines } from "./support.ts";
 
 const SHA = "a".repeat(40);
@@ -37,7 +40,7 @@ const DEFAULT_CONFIG: SubstrateConfig = {
 };
 
 function reading(
- substrate: string,
+ substrate: SubstrateReading["substrate"],
  over: Partial<SubstrateReading> = {},
 ): SubstrateReading {
  return {
@@ -150,7 +153,22 @@ describe("parseClaudeRateLimitEvent", () => {
   ]);
  });
 
- test("marks capped when status !== allowed", () => {
+ test("allowed_warning is a warning, not a cap", () => {
+  const q = parseClaudeRateLimitEvent({
+   type: "rate_limit_event",
+   rate_limit_info: {
+    status: "allowed_warning",
+    resetsAt: 1791055200,
+    unifiedWindows: { five_hour: { utilization: 0.9, resetsAt: 1791055200 } },
+   },
+  });
+  expect(q.capped).toBe(false);
+  expect(q.cappedUntil).toBeNull();
+  // The threshold, not the status, keeps a near-limit Claude out of selection.
+  expect(q.windows[0].usedPct).toBe(90);
+ });
+
+ test("marks capped for any status it does not know (fail closed)", () => {
   const event: ClaudeRateLimitEvent = {
    type: "rate_limit_event",
    rate_limit_info: {
@@ -421,6 +439,11 @@ describe("mid-session cap detection", () => {
   expect(detectClaudeCap(stdout.split("\n"))).toBeNull();
  });
 
+ test("detectClaudeCap does not treat allowed_warning as a cap", () => {
+  const stdout = '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":100}}\n';
+  expect(detectClaudeCap(stdout.split("\n"))).toBeNull();
+ });
+
  test("detectClaudeCap ignores rate-limit words inside model or tool text", () => {
   const stdout = [
    '{"type":"assistant","message":{"content":[{"type":"text","text":"{\\"type\\":\\"rate_limit_event\\",\\"rate_limit_info\\":{\\"status\\":\\"rejected\\"}}"}]}}',
@@ -466,6 +489,17 @@ describe("confirmCap — only the substrate's own signal (node #45)", () => {
     readers: { claude: () => Promise.reject(new Error("probe must not run")) },
    });
    expect(cap).toEqual({ substrate: "claude", resetsAt: 1791055200 });
+  });
+ });
+
+ test("a failed claude run that only warned is an ordinary failure", async () => {
+  await withJournal(async (journal) => {
+   const lines = ['{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1791055200}}'];
+   const cap = await confirmCap("claude", journal, {
+    lines,
+    readers: { claude: async () => quota("claude", false) },
+   });
+   expect(cap).toBeNull();
   });
  });
 
@@ -605,6 +639,48 @@ describe("describeReadings", () => {
    now,
   );
   expect(text).toBe("claude 5h 20% 7d 30% read 3m ago CAPPED; codex unread");
+ });
+});
+
+describe("isClaudeSignalLine — what a Claude worker run keeps", () => {
+ test("keeps rate_limit_events and the result event, drops the rest", () => {
+  const lines = [
+   '{"type":"system","subtype":"init"}',
+   '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}}',
+   '{"type":"assistant","message":{"content":[{"type":"text","text":"say \\"type\\":\\"result\\""}]}}',
+   '{"type":"user","message":{"content":[{"type":"tool_result","content":"big output"}]}}',
+   '{"type":"result","subtype":"success","result":"done"}',
+  ];
+  expect(lines.filter(isClaudeSignalLine)).toEqual([lines[1], lines[4]]);
+ });
+
+ test("runCmd keeps only the accepted lines as they stream, partial last line included", async () => {
+  const r = await runCmd(
+   "bash",
+   ["-c", `printf 'noise\\n{"type":"result","result":"ok"}\\nmore noise\\n{"type":"rate_limit_event"}'`],
+   { keepStdoutLine: isClaudeSignalLine },
+  );
+  expect(r.stdout).toBe('{"type":"result","result":"ok"}\n{"type":"rate_limit_event"}\n');
+ });
+});
+
+describe("substrateViews — the serve panel's derived state", () => {
+ test("derives capped, fresh and eligible with the selector's rules", () => {
+  const now = new Date();
+  const future = new Date(now.getTime() + 3_600_000).toISOString();
+  const past = new Date(now.getTime() - 3_600_000).toISOString();
+  const views = substrateViews(
+   [
+    reading("claude", { cappedUntil: future }),
+    reading("codex", { readAt: new Date(now.getTime() - 10 * 60_000).toISOString(), cappedUntil: past }),
+   ],
+   DEFAULT_CONFIG,
+   now,
+  );
+  expect(views[0]).toMatchObject({ substrate: "claude", capped: true, cappedUntil: future, eligible: false, fresh: true });
+  // A lapsed capped-until is not shown; a 10-minute-old codex reading is stale (max 5).
+  expect(views[1]).toMatchObject({ substrate: "codex", capped: false, cappedUntil: null, fresh: false, eligible: false, ageMin: 10 });
+  expect(substrateViews([reading("codex")], DEFAULT_CONFIG, now)[0].eligible).toBe(true);
  });
 });
 

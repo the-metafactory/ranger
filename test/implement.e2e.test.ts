@@ -16,7 +16,7 @@ import { runCmd } from "../src/exec.ts";
 import type { CheckRun, IssueComment, PullRequest } from "../src/github.ts";
 import type { GitHubPort } from "../src/implement.ts";
 import { openJournal, type Journal } from "../src/journal.ts";
-import type { ReviewVerdict } from "../src/review.ts";
+import { ReviewError, type ReviewVerdict } from "../src/review.ts";
 import { sweepMap } from "../src/sweep.ts";
 import { runNode, type RunNodeContext } from "../src/worker.ts";
 import { baseConfigLines, createCanonicalRepo, GIT_ENV } from "./support.ts";
@@ -811,6 +811,57 @@ describe("implement lane (node #23)", () => {
   expect(r.journal.headSubstrate(head)).toBe("codex");
   const files = await runCmd("git", ["ls-tree", "-r", "--name-only", head], { cwd: r.origin });
   expect(files.stdout).not.toContain("half-done.ts");
+ }, 60_000);
+
+ test("a review capped on its substrate resumes cross-model without touching attempts or the dead-man", async () => {
+  const r = await rig({});
+  cleanup.push(r.dir);
+  const resetsAt = Math.floor(Date.now() / 1000) + 3600;
+  r.ctx.substrate = "claude";
+  // Codex reads eligible for the review's selection, then capped once sage fails on it.
+  let codexReads = 0;
+  r.ctx.substrateReaders = {
+   claude: () => Promise.reject(new Error("probe down")),
+   codex: async () => {
+    codexReads += 1;
+    const capped = codexReads > 1;
+    return {
+     substrate: "codex",
+     readAt: new Date(),
+     windows: [{ kind: "five_hour", usedPct: capped ? 100 : 10, resetsAt }],
+     capped,
+     cappedUntil: capped ? resetsAt : null,
+    };
+   },
+  };
+  const scripted = r.ctx.reviewer!;
+  const reviewSubstrates: (string | undefined)[] = [];
+  r.ctx.reviewer = async (repo, pr, token, opts) => {
+   reviewSubstrates.push(opts?.substrate);
+   if (reviewSubstrates.length === 1) throw new ReviewError("sage exited 1: usage limit");
+   return scripted(repo, pr, token, opts);
+  };
+
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("awaiting-merge");
+  // Claude wrote the head: the review goes to Codex first; once Codex caps
+  // (and Claude is unread), the resumed review falls back to Pi.
+  expect(reviewSubstrates).toEqual(["codex", "pi"]);
+  expect(r.journal.deadmanCount()).toBe(0);
+  expect(r.journal.getWorker("20")?.attempts).toBe(0);
+  expect(r.journal.getSubstrateReading("codex")?.cappedUntil).toBe(new Date(resetsAt * 1000).toISOString());
+
+  const events = r.journal.listEvents("acme/widgets", 200);
+  const capped = events.filter((e) => e.kind === "substrate-capped");
+  expect(capped).toHaveLength(1);
+  expect(capped[0].detail).toContain("codex hit its limit");
+  const reviewed = events.filter((e) => e.kind === "reviewed");
+  expect(reviewed).toHaveLength(1);
+  expect(reviewed[0].detail).toContain("on pi (head by claude;");
+
+  const markers = (r.github.comments.get(1) ?? []).filter((c) => c.body.includes("ranger:review"));
+  expect(markers).toHaveLength(1);
+  expect(markers[0].body).toContain("substrate=pi -->");
  }, 60_000);
 
  test("a codex failure that only prints 'rate limit' is an ordinary failure (no spoofed cap)", async () => {

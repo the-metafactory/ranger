@@ -20,6 +20,11 @@ export interface RunOptions {
   processGroup?: boolean;
   /** Called with the child's PID once it has spawned (the group id when `processGroup`). */
   onSpawn?: (pid: number) => void;
+  /**
+   * Keep only the stdout lines this accepts, filtered as they stream: a long
+   * verbose stream (Claude stream-json) is never held whole in memory.
+   */
+  keepStdoutLine?: (line: string) => boolean;
 }
 
 /**
@@ -42,8 +47,19 @@ export function runCmd(
     if (child.pid !== undefined) opts.onSpawn?.(child.pid);
     let stdout = "";
     let stderr = "";
+    const keep = opts.keepStdoutLine;
+    let partial = "";
+    const keepLine = (line: string) => {
+      if (keep?.(line)) stdout += `${line}\n`;
+    };
     child.stdout.on("data", (chunk) => {
-      stdout += chunk.toString();
+      if (keep === undefined) {
+        stdout += chunk.toString();
+        return;
+      }
+      const lines = (partial + chunk.toString()).split("\n");
+      partial = lines.pop() ?? "";
+      for (const line of lines) keepLine(line);
     });
     child.stderr.on("data", (chunk) => {
       stderr += chunk.toString();
@@ -64,6 +80,7 @@ export function runCmd(
     });
     child.on("close", (code) => {
       if (timer) clearTimeout(timer);
+      if (keep !== undefined && partial.length > 0) keepLine(partial);
       resolvePromise({ code: code ?? -1, stdout, stderr });
     });
   });
