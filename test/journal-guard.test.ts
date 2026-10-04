@@ -5,6 +5,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import { expandHome, loadConfig } from "../src/config.ts";
+import { createHandler, ServeReader, servedMaps, stateFromJournal } from "../src/serve.ts";
 import { Journal, openJournal } from "../src/journal.ts";
 import {
  assertNotLiveJournalUnderTest,
@@ -30,13 +31,18 @@ function tempDir(): string {
  return dir;
 }
 
+/** Stamp migrations this code does not ship onto an existing journal. */
+function stampForeign(path: string): void {
+ const sqlite = new Database(path);
+ FOREIGN.forEach((hash, i) => sqlite.run("INSERT INTO __drizzle_migrations (hash, created_at) VALUES (?, ?)", [hash, 9_000_000_000_000 + i]));
+ sqlite.close();
+}
+
 /** A journal built by this code, then stamped with migrations it does not ship. */
 function foreignJournal(dir: string): string {
  const path = join(dir, "state.sqlite");
  new Journal(path).close();
- const sqlite = new Database(path);
- FOREIGN.forEach((hash, i) => sqlite.run("INSERT INTO __drizzle_migrations (hash, created_at) VALUES (?, ?)", [hash, 9_000_000_000_000 + i]));
- sqlite.close();
+ stampForeign(path);
  return path;
 }
 
@@ -69,6 +75,32 @@ describe("foreign migrations (node #66)", () => {
  test("the read-only open (serve) refuses it too", () => {
   const path = foreignJournal(tempDir());
   expect(() => Journal.openReadOnly(path)).toThrow(REFUSAL);
+ });
+
+ test("serve answers every state read with the refusal once its journal turns foreign mid-run", async () => {
+  const dir = tempDir();
+  const path = join(dir, "state.sqlite");
+  new Journal(path).close();
+  writeFileSync(join(dir, "ranger.yaml"), baseConfigLines(dir).join("\n"));
+  const { config } = loadConfig(join(dir, "ranger.yaml"), {});
+  const maps = servedMaps(config);
+  const reader = new ServeReader(config, maps, path);
+  const handler = createHandler({
+   port: 47366,
+   token: "page-key",
+   getState: () => stateFromJournal(config, maps, reader),
+   refresh: () => {},
+   launch: () => {},
+   verifyGrilling: async () => null,
+  });
+  const read = () => handler(new Request("http://127.0.0.1:47366/api/state"));
+  expect((await read()).status).toBe(200);
+  stampForeign(path);
+  const refused = await read();
+  expect(refused.status).toBe(503);
+  const body = (await refused.json()) as { error: string };
+  expect(body.error).toContain(REFUSAL);
+  expect(body.error).toContain(FOREIGN[1]);
  });
 
  test("a journal this code migrated opens, and reopens", () => {

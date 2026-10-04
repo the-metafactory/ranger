@@ -48,6 +48,7 @@ import {
 import { planTick, walkableCandidates } from "./candidates.ts";
 import { pidAlive as defaultPidAlive } from "./exec.ts";
 import { Journal, type WorkerRow } from "./journal.ts";
+import { ForeignMigrationError } from "./journal-guard.ts";
 import { implementLane, workerLane, type ImplementLane } from "./lanes.ts";
 import { activeCooldown, readGraphqlBudget } from "./budget.ts";
 import { cachedFrontier } from "./frontier-cache.ts";
@@ -554,7 +555,7 @@ export function createHandler(ctx: HandlerContext): (req: Request) => Promise<Re
  const hosts = [`127.0.0.1:${ctx.port}`, `localhost:${ctx.port}`];
  const inFlight = new Set<string>();
  const origins = hosts.map((h) => `http://${h}`);
- return async (req: Request): Promise<Response> => {
+ const handle = async (req: Request): Promise<Response> => {
   const url = new URL(req.url);
   // DNS rebinding: a page on another name must not read or drive this server.
   const host = req.headers.get("host") ?? url.host;
@@ -634,6 +635,16 @@ export function createHandler(ctx: HandlerContext): (req: Request) => Promise<Re
   if (body.dryRun === true) return json(200, { dryRun: true, ...plan });
   ctx.launch(plan.argv, childEnv(process.env));
   return json(200, { launched: true, nodeId: grilling.id, cwd: map.localCheckout });
+ };
+ // A journal migrated by foreign code while serve runs (node #66): every
+ // request answers with that refusal, which the page shows, not a bare 500.
+ return async (req: Request): Promise<Response> => {
+  try {
+   return await handle(req);
+  } catch (error) {
+   if (error instanceof ForeignMigrationError) return refuse(503, error.message);
+   throw error;
+  }
  };
 }
 
@@ -885,7 +896,7 @@ function renderSubstrates(s) {
  })));
 }
 function render(s) { renderMeta(s); renderCurrent(s); renderSubstrates(s); renderNext(s); renderAuto(s); renderNeeds(s); renderGrill(s); }
-async function load() { try { const r = await fetch("/api/state", { cache: "no-store" }); render(await r.json()); } catch (e) { say("Could not read state: " + e.message, true); } }
+async function load() { try { const r = await fetch("/api/state", { cache: "no-store" }); const j = await r.json(); if (!r.ok) throw new Error(j.error || r.statusText); render(j); } catch (e) { say("Could not read state: " + e.message, true); } }
 document.getElementById("refresh").onclick = async () => { try { await post("/api/refresh"); say("Refreshing the frontier…"); setTimeout(load, 1500); } catch (e) { say(e.message, true); } };
 load(); setInterval(load, 15000);
 </script>

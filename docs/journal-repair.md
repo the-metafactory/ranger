@@ -41,7 +41,7 @@ Run every step from a `main` checkout (`~/work/mf/ranger`), never from a worktre
    bun -e 'import {readMigrationFiles} from "drizzle-orm/migrator"; for (const m of readMigrationFiles({migrationsFolder: "drizzle"})) console.log(m.hash, m.folderMillis)'
    ```
 
-   The hashes in the first list that are missing from the second are the ones the refusal named.
+   The hashes in the first list that are missing from the second are the ones the refusal named. If one of them belongs to a migration `main` still ships under the same tag, then someone edited a committed migration file after it was applied. In that case, revert the edit on `main` instead of repairing the journal.
 
 4. **Diff the schema against a fresh journal built by `main`.** `RANGER_JOURNAL_PATH` points `main`'s code at a scratch file, so the live journal is not touched:
 
