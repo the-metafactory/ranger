@@ -23,6 +23,26 @@ export interface EligibleSubstrate {
  headroom: number;
 }
 
+export type QuotaWindowKind = "five_hour" | "seven_day";
+
+/** The configured reserve decays linearly over its own quota window. */
+export function effectiveThreshold(
+ window: QuotaWindowKind,
+ reading: SubstrateReading,
+ now: Date,
+ config: SubstrateConfig,
+): number {
+ const fiveHour = window === "five_hour";
+ const fixed = fiveHour ? config.fiveHourMaxUsedPct : config.sevenDayMaxUsedPct;
+ const reset = fiveHour ? reading.fiveHourResetsAt : reading.sevenDayResetsAt;
+ if (reset === null) return fixed;
+ const resetMs = Date.parse(reset);
+ if (!Number.isFinite(resetMs)) return fixed;
+ const lengthMs = (fiveHour ? 5 * 60 : 7 * 24 * 60) * 60_000;
+ const remaining = Math.min(1, Math.max(0, (resetMs - now.getTime()) / lengthMs));
+ return 100 - (100 - fixed) * remaining;
+}
+
 export function maxReadingAgeMs(name: SubstrateName, config: SubstrateConfig): number {
  return (name === "claude" ? config.claudeProbeMaxAgeMin : config.codexReadMaxAgeMin) * 60_000;
 }
@@ -52,7 +72,7 @@ export function isCappedAt(reading: SubstrateReading, now: Date): boolean {
 /**
  * A strong substrate is eligible when its reading is fresh, it is neither
  * capped nor capped-until in the future, it reports at least one window, and
- * every reported window's used% is under its max-used threshold. Missing,
+ * every reported window's used% is under its effective threshold. Missing,
  * stale or window-less readings fail closed: a reading with no windows says
  * nothing about the reserve, so it must not look unlimited.
  */
@@ -70,10 +90,10 @@ export function isEligible(
  // Headroom: the smallest (threshold − used%) over the reported windows.
  let headroom = Infinity;
  if (reading.fiveHourUsedPct !== null) {
-  headroom = Math.min(headroom, config.fiveHourMaxUsedPct - reading.fiveHourUsedPct);
+  headroom = Math.min(headroom, effectiveThreshold("five_hour", reading, now, config) - reading.fiveHourUsedPct);
  }
  if (reading.sevenDayUsedPct !== null) {
-  headroom = Math.min(headroom, config.sevenDayMaxUsedPct - reading.sevenDayUsedPct);
+  headroom = Math.min(headroom, effectiveThreshold("seven_day", reading, now, config) - reading.sevenDayUsedPct);
  }
  // No window reported (Infinity) or one at/over its threshold: ineligible.
  if (headroom === Infinity || headroom <= 0) return null;
@@ -111,17 +131,29 @@ export function selectForReview(input: SelectionInput, authorSubstrate: Substrat
 }
 
 /** One line per reading for journal events: what a selection was made on. */
-export function describeReadings(readings: SubstrateReading[], now: Date): string {
+export function describeReadings(readings: SubstrateReading[], now: Date, config: SubstrateConfig): string {
  const parts = STRONG_SUBSTRATES.map((name) => {
   const r = readings.find((x) => x.substrate === name);
   if (r === undefined) return `${name} unread`;
   const age = readingAgeMin(r, now);
-  const windows = [
-   r.fiveHourUsedPct === null ? null : `5h ${r.fiveHourUsedPct}%`,
-   r.sevenDayUsedPct === null ? null : `7d ${r.sevenDayUsedPct}%`,
-  ].filter((w) => w !== null);
+  const windows = (["five_hour", "seven_day"] as const).flatMap((window) => {
+   const used = window === "five_hour" ? r.fiveHourUsedPct : r.sevenDayUsedPct;
+   if (used === null) return [];
+   const reset = window === "five_hour" ? r.fiveHourResetsAt : r.sevenDayResetsAt;
+   const remaining = reset === null ? "reset unknown" : formatTimeToReset(Date.parse(reset) - now.getTime());
+   return [`${window === "five_hour" ? "5h" : "7d"} ${used}% < ${effectiveThreshold(window, r, now, config).toFixed(1)}% (${remaining})`];
+  });
   const capped = isCappedAt(r, now);
   return `${name} ${windows.join(" ") || "no windows"} read ${age}m ago${capped ? " CAPPED" : ""}`;
  });
  return parts.join("; ");
+}
+
+function formatTimeToReset(ms: number): string {
+ if (!Number.isFinite(ms)) return "reset unknown";
+ if (ms <= 0) return "reset reached";
+ const hours = ms / 3_600_000;
+ const amount = hours >= 24 ? hours / 24 : hours;
+ const rounded = amount.toFixed(1).replace(/\.0$/, "");
+ return `${rounded}${hours >= 24 ? "d" : "h"} to reset`;
 }

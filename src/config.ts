@@ -218,9 +218,9 @@ const PiSubstrateSchema = z.object({
  * implement session, fix pass or sage review, by remaining 5h/7d quota.
  */
 const SubstratesSchema = z.object({
- /** 5-hour window: eligible when used% < this (default 70). */
+ /** 5-hour reserve at window start: eligible below this, rising toward 100% at reset (default 70). */
  fiveHourMaxUsedPct: z.number().min(0).max(100).default(70),
- /** 7-day window: eligible when used% < this (default 80). */
+ /** 7-day reserve at window start: eligible below this, rising toward 100% at reset (default 80). */
  sevenDayMaxUsedPct: z.number().min(0).max(100).default(80),
  /** Claude probe reading max age, minutes (default 15). */
  claudeProbeMaxAgeMin: z.number().int().positive().default(15),
