@@ -35,6 +35,9 @@ export function reviewCapHeadMovedOutcome(r: { rounds: number; pr: number }): st
  return `review cap reached: ${r.rounds} sage round(s) on PR #${r.pr} and the head moved since the last one — a further round is the principal's call (design §4)`;
 }
 
+/** The head-moved variant alone: the last sage round read an earlier head. */
+export const REVIEW_CAP_HEAD_MOVED_OUTCOME = /^review cap reached: \d+ sage round\(s\) on PR #\d+ and the head moved since the last one/;
+
 export const REVIEW_CAP_OUTCOME = /^(?:\d+ blocker\(s\) and \d+ major\(s\) remain after \d+ sage round\(s\)|review cap reached: )/;
 
 /**

@@ -4,15 +4,19 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RangerConfig } from "../src/config.ts";
 import { Journal, type EventRow, type WorkerRow } from "../src/journal.ts";
-import { parseFailedProbes, probesFailedOutcome, reviewCapOutcome } from "../src/outcomes.ts";
-import { assembleState, createHandler, renderPage, ServeReader, servedMaps, stateFromJournal, type StateInputs } from "../src/serve.ts";
+import { parseFailedProbes, probesFailedOutcome, reviewCapHeadMovedOutcome, reviewCapOutcome } from "../src/outcomes.ts";
+import { assembleState, createHandler, DETAIL_CONCURRENCY, renderPage, ServeReader, servedMaps, stateFromJournal, type StateInputs } from "../src/serve.ts";
 import {
  type ActionRunner,
+ checkRunsFromPages,
+ ciState,
  classifyReason,
+ mergeRefusal,
  MACHINE_GH_KEYS,
  needsYouEntries,
  type NeedsYouInputs,
  type PrView,
+ uncheckedNeedsEye,
 } from "../src/serve-parked.ts";
 
 /**
@@ -102,8 +106,24 @@ describe("node #54 — the reason class, by ranger's own rules", () => {
  });
 
  test("review cap: the head-moved variant too", () => {
-  const r = row({ outcome: "review cap reached: 2 sage round(s) on PR #50 and the head moved since the last one — a further round is the principal's call (design §4)" });
+  const r = row({ outcome: reviewCapHeadMovedOutcome({ rounds: 2, pr: 50 }) });
   expect(classifyReason(r, [], null, 2).class).toBe("review cap");
+ });
+
+ test("review cap, head moved: the stop is the unreviewed head, never the earlier head's counts as current", () => {
+  const r = row({ outcome: reviewCapHeadMovedOutcome({ rounds: 5, pr: 687 }) });
+  const events = [ev("parked", r.outcome as string), ev("reviewed", "round 5 @ 4b2109fa: commented, 0 blocker(s), 0 major(s) on claude")];
+  const reason = classifyReason(r, events, null, 5);
+  expect(reason.class).toBe("review cap");
+  expect(reason.detail).not.toContain("still open after");
+  expect(reason.detail).toContain("the current head is unreviewed");
+  expect(reason.detail).toContain("round 5 read the earlier head 4b2109fa");
+  // The entry says the round read an earlier head, so the card does not show its counts as current.
+  const moved = greenPr({ headSha: "9".repeat(40) });
+  const [e] = needsYouEntries(entryInputs({ workers: [r], events: () => events, prs: () => moved }));
+  expect(e.sageOnHead).toBe(false);
+  const [same] = needsYouEntries(entryInputs({ workers: [r], events: () => events }));
+  expect(same.sageOnHead).toBe(true);
  });
 
  test("probes failed: the names from the run's FAILED: line, when the outcome kept it", () => {
@@ -204,6 +224,34 @@ const entryInputs = (over: Partial<NeedsYouInputs> = {}): NeedsYouInputs => ({
  reviewRounds: 5,
  exists: () => true,
  ...over,
+});
+
+describe("node #54 — CI, by the merge gate's rules", () => {
+ const done = (conclusion: string) => ({ status: "completed", conclusion });
+ test("all skipped or all neutral is not green: the close needs one success to cite", () => {
+  expect(ciState([done("skipped"), done("skipped")])).toBe("no-success");
+  expect(ciState([done("neutral")])).toBe("no-success");
+  expect(mergeRefusal(greenPr({ ci: "no-success" }))).toMatch(/no check run concluded success/);
+  expect(needsYouEntries(entryInputs({ prs: () => greenPr({ ci: "no-success" }) }))[0].actions.merge.offered).toBe(false);
+ });
+ test("success beside skipped is green; a failure or a running check is not", () => {
+  expect(ciState([done("success"), done("skipped"), done("neutral")])).toBe("green");
+  expect(ciState([done("success"), done("failure")])).toBe("failed");
+  expect(ciState([done("success"), { status: "in_progress", conclusion: null }])).toBe("pending");
+  expect(ciState([])).toBe("none");
+ });
+ test("every page of check runs counts: a failure on page two is not green", () => {
+  const page1 = { check_runs: Array.from({ length: 100 }, () => done("success")) };
+  const page2 = { check_runs: [done("failure")] };
+  const runs = checkRunsFromPages([page1, page2]);
+  expect(runs).toHaveLength(101);
+  expect(ciState(runs ?? [])).toBe("failed");
+ });
+ test("a malformed page makes the whole read unreadable rather than dropping it", () => {
+  expect(checkRunsFromPages([{ check_runs: [done("success")] }, { message: "Bad gateway" }])).toBeNull();
+  expect(checkRunsFromPages({ check_runs: [] })).toBeNull();
+  expect(checkRunsFromPages(null)).toBeNull();
+ });
 });
 
 describe("node #54 — the entries", () => {
@@ -536,7 +584,8 @@ describe("node #54 — the journal feeds the section, with no GitHub call from a
   expect(reader.hasUnreadDetails()).toBe(true);
   await reader.refreshDetails();
   expect(calls).toEqual([`issue ${SEELITE}#663`, "pr"]);
-  expect(reader.detailError).toMatch(/HTTP 502/);
+  expect(reader.detailErrors.get(`pr:${SEELITE}#687`)).toMatch(/HTTP 502/);
+  expect(reader.detailErrors.get(`issue:${SEELITE}#663`)).toMatch(/could not read the issue/);
   expect(reader.lastError).toBeNull();
   // The next state read finds nothing untried: no second round of REST.
   expect(reader.hasUnreadDetails()).toBe(false);
@@ -548,5 +597,74 @@ describe("node #54 — the journal feeds the section, with no GitHub call from a
   // An action forgets its entry, so that entry is read once more at once.
   reader.forget(`${SEELITE}#663`, `${SEELITE}#687`);
   expect(reader.hasUnreadDetails()).toBe(true);
+ });
+});
+
+describe("node #54 — details read a few at a time, and an unread label never reads as nothing waiting", () => {
+ test("PR reads do not wait behind a slow issue, and no more than the limit run at once", async () => {
+  const config = { state: { journalPath: "/nonexistent" } } as unknown as RangerConfig;
+  let inFlight = 0;
+  let peak = 0;
+  const started: string[] = [];
+  let releaseSlow: () => void = () => {};
+  const slow = new Promise<void>((resolve) => (releaseSlow = resolve));
+  const track = async <T>(name: string, wait: Promise<void> | null, value: T): Promise<T> => {
+   started.push(name);
+   inFlight += 1;
+   peak = Math.max(peak, inFlight);
+   await (wait ?? Promise.resolve());
+   inFlight -= 1;
+   return value;
+  };
+  const reader = new ServeReader(config, [], "/nonexistent", {
+   issue: (repo, id) => track(`issue ${id}`, id === "1" ? slow : null, { title: id, labels: [] }),
+   pr: (repo, n) => track(`pr ${n}`, null, greenPr({ number: n })),
+  });
+  const issues = Array.from({ length: 6 }, (_, i) => `${SEELITE}#${i + 1}`);
+  reader.wantDetails(issues, [`${SEELITE}#700`, `${SEELITE}#701`]);
+  const done = reader.refreshDetails();
+  // Let every fast read finish while issue 1 is still held.
+  for (let i = 0; i < 50; i++) await Promise.resolve();
+  expect(started).toContain("pr 700");
+  expect(started).toContain("pr 701");
+  expect(reader.prs.has(`${SEELITE}#701`)).toBe(true);
+  expect(reader.labels.has(`${SEELITE}#1`)).toBe(false);
+  releaseSlow();
+  await done;
+  expect(reader.labels.has(`${SEELITE}#1`)).toBe(true);
+  expect(peak).toBeLessThanOrEqual(DETAIL_CONCURRENCY);
+  expect(peak).toBeGreaterThan(1);
+ });
+
+ test("an awaiting-merge row whose labels are unknown is named, never hidden behind 'nothing waits'", () => {
+  const waiting = row({ nodeId: "433", status: "awaiting-merge", outcome: null });
+  const known = row({ nodeId: "434", status: "awaiting-merge", outcome: null });
+  const foreign = row({ nodeId: "435", status: "awaiting-merge", root: 99 });
+  const inputs = entryInputs({
+   workers: [waiting, known, foreign],
+   labels: (_repo, id) => (id === "434" ? [] : null),
+  });
+  expect(needsYouEntries(inputs)).toEqual([]);
+  expect(uncheckedNeedsEye(inputs)).toEqual([`${SEELITE}#433`]);
+  const state = assembleState({
+   maps: [{ ...MAP, walk: "full", lane: "visual", servedOnly: false }],
+   reports: new Map(),
+   titles: new Map(),
+   workers: [waiting],
+   laneHolders: { visual: null, headless: null },
+   paused: false,
+   spawnsToday: 0,
+   spawnCap: 10,
+   vetoed: () => false,
+   pidAlive: () => true,
+   refreshing: false,
+   refreshError: null,
+   now: new Date("2026-10-04T15:00:00Z"),
+   needsYouUnchecked: [{ key: `${SEELITE}#433`, error: "HTTP 502" }],
+  });
+  expect(state.needsYouUnchecked).toEqual([{ key: `${SEELITE}#433`, error: "HTTP 502" }]);
+  const page = renderPage("token");
+  expect(page).toContain("not yet checked for needs-eye");
+  expect(page).toContain("if (unchecked.length === 0) box.append(empty(\"Nothing is parked");
  });
 });

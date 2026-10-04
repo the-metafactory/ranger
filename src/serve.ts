@@ -68,11 +68,13 @@ import { childEnv, itermArgv, shellQuote } from "./launch.ts";
 import {
  type ActionKind,
  type ActionRunner,
+ checkRunsFromPages,
  ciState,
  needsYouEntries,
  type NeedsYouEntry,
  type PrView,
  runAction,
+ uncheckedNeedsEye,
 } from "./serve-parked.ts";
 
 export { childEnv };
@@ -186,6 +188,15 @@ export interface StateInputs {
  substrates?: SubstrateView[];
  /** Parked, failed and needs-eye rows (node #54). */
  needsYou?: NeedsYouEntry[];
+ /** Awaiting-merge rows whose labels are not known yet, with the read's error. */
+ needsYouUnchecked?: UncheckedRow[];
+}
+
+/** An awaiting-merge row that may need the principal's eye; its labels are unknown. */
+export interface UncheckedRow {
+ key: string;
+ /** The last failed read of its labels; null while it is only unread. */
+ error: string | null;
 }
 
 export interface CurrentJob {
@@ -305,6 +316,7 @@ export interface DashboardState {
  maps: DashboardMap[];
  substrates: SubstrateView[];
  needsYou: NeedsYouEntry[];
+ needsYouUnchecked: UncheckedRow[];
 }
 
 const IN_FLIGHT = new Set<WorkerRow["status"]>(["claimed", "running", "awaiting-merge"]);
@@ -488,6 +500,7 @@ export function assembleState(inputs: StateInputs): DashboardState {
   maps,
   substrates: inputs.substrates ?? [],
   needsYou: inputs.needsYou ?? [],
+  needsYouUnchecked: inputs.needsYouUnchecked ?? [],
  };
 }
 
@@ -806,7 +819,7 @@ const short = (sha) => (sha || "").slice(0, 8);
 function needsFacts(n) {
  const facts = [n.repo + " · map #" + n.root, n.status, "ended " + ago(n.endedAt)];
  if (n.pr) { const v = n.pr.view; facts.push("PR #" + n.pr.number + (v ? " · " + (v.merged ? "merged" : v.state === "closed" ? "closed" : v.draft ? "draft" : "ready") + " · head " + short(v.headSha) + " · CI " + v.ci : " · not read yet")); }
- if (n.sage) facts.push("sage round " + n.sage.round + ": " + n.sage.blockers + " blocker(s), " + n.sage.majors + " major(s)");
+ if (n.sage) facts.push("sage round " + n.sage.round + (n.sageOnHead === false ? " (an earlier head, " + short(n.sage.sha) + "; the current head is unreviewed)" : "") + ": " + n.sage.blockers + " blocker(s), " + n.sage.majors + " major(s)");
  if (n.probe) facts.push("probes " + (n.probe.passed ? "passed" : "FAILED") + " at " + short(n.probe.sha));
  return facts.join(" · ");
 }
@@ -855,7 +868,15 @@ function needsCard(n) {
 function renderNeeds(s) {
  const box = document.getElementById("needsyou");
  box.replaceChildren();
- if (!s.needsYou || s.needsYou.length === 0) { box.append(empty("Nothing is parked, failed or waiting on a needs-eye merge.")); return; }
+ const unchecked = s.needsYouUnchecked || [];
+ if (unchecked.length > 0) {
+  const errs = unchecked.filter((u) => u.error).map((u) => u.key + ": " + u.error);
+  box.append(el("div", { class: "reason", text: unchecked.length + " awaiting-merge row(s) not yet checked for needs-eye (" + unchecked.map((u) => u.key).join(", ") + "): " + (errs.length > 0 ? "the label read failed — " + errs.join("; ") : "labels not read yet") }));
+ }
+ if (!s.needsYou || s.needsYou.length === 0) {
+  if (unchecked.length === 0) box.append(empty("Nothing is parked, failed or waiting on a needs-eye merge."));
+  return;
+ }
  box.append(...s.needsYou.map(needsCard));
 }
 function renderSubstrates(s) {
@@ -909,8 +930,11 @@ export class ServeReader {
  /** "Needs you" details (node #54): issue labels by `repo#id`, PRs by `repo#pr`. */
  labels = new Map<string, string[]>();
  prs = new Map<string, PrView>();
- /** The last detail read that failed; kept apart from the frontier's `lastError`. */
- detailError: string | null = null;
+ /**
+  * Failed detail reads by key (`issue:repo#id`, `pr:repo#n`), kept apart from
+  * the frontier's `lastError`; a key's entry goes when its read succeeds.
+  */
+ detailErrors = new Map<string, string>();
  private detailIssues = new Set<string>();
  private detailPrs = new Set<string>();
  /** Keys tried since they were last wanted fresh: a failed read waits for the timer. */
@@ -982,27 +1006,37 @@ export class ServeReader {
    this.detailTried.add(key);
    try {
     await read();
+    this.detailErrors.delete(key);
    } catch (error) {
-    this.detailError = `${key}: ${error instanceof Error ? error.message : String(error)}`;
+    this.detailErrors.set(key, error instanceof Error ? error.message : String(error));
    }
   };
-  for (const key of keys.issues) {
-   await attempt(`issue:${key}`, async () => {
-    const [repo, id] = key.split("#");
-    const issue = await this.details.issue(repo, id);
-    if (issue === null) throw new Error("could not read the issue");
-    this.labels.set(key, issue.labels);
-    this.titles.set(key, issue.title);
-   });
-  }
-  for (const key of keys.prs) {
-   await attempt(`pr:${key}`, async () => {
-    const [repo, n] = key.split("#");
-    const pr = await this.details.pr(repo, Number(n));
-    if (pr === null) throw new Error("could not read the PR");
-    this.prs.set(key, pr);
-   });
-  }
+  // Issues and PRs are independent reads: one queue, a few at a time, so a
+  // slow issue does not hold every PR (nor the refresh an action waits on).
+  const jobs: (() => Promise<void>)[] = [
+   ...keys.issues.map((key) => () =>
+    attempt(`issue:${key}`, async () => {
+     const [repo, id] = key.split("#");
+     const issue = await this.details.issue(repo, id);
+     if (issue === null) throw new Error("could not read the issue");
+     this.labels.set(key, issue.labels);
+     this.titles.set(key, issue.title);
+    }),
+   ),
+   ...keys.prs.map((key) => () =>
+    attempt(`pr:${key}`, async () => {
+     const [repo, n] = key.split("#");
+     const pr = await this.details.pr(repo, Number(n));
+     if (pr === null) throw new Error("could not read the PR");
+     this.prs.set(key, pr);
+    }),
+   ),
+  ];
+  let next = 0;
+  const worker = async (): Promise<void> => {
+   while (next < jobs.length) await jobs[next++]();
+  };
+  await Promise.all(Array.from({ length: Math.min(DETAIL_CONCURRENCY, jobs.length) }, worker));
  }
 
  /** Ask for titles of nodes no frontier names; fetched on the next refresh. */
@@ -1088,6 +1122,9 @@ export class ServeReader {
  }
 }
 
+/** How many "Needs you" REST reads run at once. */
+export const DETAIL_CONCURRENCY = 4;
+
 /** The REST reads behind "Needs you"; injected so no test runs `gh`. */
 export interface DetailReader {
  issue: (repo: string, id: string) => Promise<Pick<IssueRead, "title" | "labels"> | null>;
@@ -1103,11 +1140,11 @@ interface IssueRead {
 }
 
 /** One `gh api` GET under the read-only gate; null on any failure. */
-async function restRead(config: RangerConfig, repo: string, path: string): Promise<unknown> {
+async function restRead(config: RangerConfig, repo: string, path: string, flags: string[] = []): Promise<unknown> {
  const { token } = await assertReadOnlyToken(config, repo);
  const gated = gatedEnv(token.token);
  try {
-  const result = await runCmd("gh", ["api", path], { env: gated.env, timeoutMs: 15_000 });
+  const result = await runCmd("gh", ["api", path, ...flags], { env: gated.env, timeoutMs: 15_000 });
   if (result.code !== 0) return null;
   try {
    return JSON.parse(result.stdout) as unknown;
@@ -1130,10 +1167,14 @@ export async function readPrLive(
  if (raw === null) return null;
  const head = (raw.head ?? {}) as { sha?: unknown };
  const headSha = typeof head.sha === "string" ? head.sha : "";
+ // Every page: a failure on page two must not read as green.
  const checks = /^[0-9a-f]{40}$/.test(headSha)
-  ? ((await restRead(config, repo, `repos/${repo}/commits/${headSha}/check-runs?filter=latest&per_page=100`)) as {
-     check_runs?: { status?: string; conclusion?: string | null }[];
-    } | null)
+  ? checkRunsFromPages(
+     await restRead(config, repo, `repos/${repo}/commits/${headSha}/check-runs?filter=latest&per_page=100`, [
+      "--paginate",
+      "--slurp",
+     ]),
+    )
   : null;
  return {
   number,
@@ -1143,10 +1184,7 @@ export async function readPrLive(
   draft: raw.draft === true,
   headSha,
   mergeable: typeof raw.mergeable === "boolean" ? raw.mergeable : null,
-  ci:
-   checks === null || !Array.isArray(checks.check_runs)
-    ? "none"
-    : ciState(checks.check_runs.map((c) => ({ status: String(c.status ?? ""), conclusion: c.conclusion ?? null }))),
+  ci: checks === null ? "none" : ciState(checks),
   readAt: new Date().toISOString(),
  };
 }
@@ -1264,6 +1302,11 @@ export function stateFromJournal(
    reviewRounds: config.workers.reviewRounds,
    exists: existsSync,
   });
+  const needsYouUnchecked = uncheckedNeedsEye({
+   maps,
+   workers,
+   labels: (repo, nodeId) => reader.labels.get(`${repo}#${nodeId}`) ?? null,
+  }).map((key) => ({ key, error: reader.detailErrors.get(`issue:${key}`) ?? null }));
   // Details for every row that may need the principal: an awaiting-merge row
   // shows only once its labels say needs-eye.
   const candidates = workers.filter(
@@ -1281,6 +1324,7 @@ export function stateFromJournal(
    titles: reader.titles,
    workers,
    needsYou,
+   needsYouUnchecked,
    lastImplementMaps: lastImplementMaps(journal),
    laneHolders: { visual: journal?.laneHolder("visual") ?? null, headless: journal?.laneHolder("headless") ?? null },
    paused: journal?.isPaused() ?? false,

@@ -22,7 +22,9 @@ import { childEnv, itermArgv, shellQuote } from "./launch.ts";
 import {
  NEEDS_EYE_LABEL,
  parseFailedProbes,
+ PROBE_FILE,
  PROBES_FAILED_OUTCOME,
+ REVIEW_CAP_HEAD_MOVED_OUTCOME,
  REVIEW_CAP_OUTCOME,
  SUBSTRATE_CAPPED_OUTCOME,
 } from "./outcomes.ts";
@@ -125,6 +127,19 @@ export function classifyReason(
  }
  const outcome = row.outcome ?? "";
  const recent = sinceMotion(events);
+ if (REVIEW_CAP_HEAD_MOVED_OUTCOME.test(outcome)) {
+  // The counts of the last round belong to the head before the move: the
+  // stop is that the current head has no review at all.
+  const sage = lastSageRound(recent) ?? lastSageRound(events);
+  return {
+   class: "review cap",
+   detail:
+    `review cap of ${reviewRounds} sage round(s) reached and the head moved after the last one: ` +
+    (sage === null
+     ? "the current head is unreviewed"
+     : `the current head is unreviewed (round ${sage.round} read the earlier head ${sage.sha.slice(0, 8)})`),
+  };
+ }
  if (REVIEW_CAP_OUTCOME.test(outcome)) {
   const sage = lastSageRound(recent) ?? lastSageRound(events);
   const round = sage?.round ?? row.reviewRound;
@@ -142,7 +157,7 @@ export function classifyReason(
    const retry = recent
     .map((e) => (e.kind === "reviewed" ? PROBE_RETRY_EVENT.exec(e.detail ?? "") : null))
     .find((m) => m !== null);
-   probes = retry?.[1].split(",").map((n) => n.trim()).filter((n) => /^[\w.-]+\.m?js$/.test(n)) ?? [];
+   probes = retry?.[1].split(",").map((n) => n.trim()).filter((n) => PROBE_FILE.test(n)) ?? [];
   }
   return {
    class: "probes failed",
@@ -174,19 +189,45 @@ export interface PrView {
  headSha: string;
  /** GitHub's mergeability; null while it is still computing. */
  mergeable: boolean | null;
- /** Check runs on the head: none yet, still running, any failed, or all green. */
- ci: "none" | "pending" | "failed" | "green";
+ /**
+  * Check runs on the head: none yet, still running, any failed, all passed
+  * but none concluded success, or green (all passed, at least one success).
+  */
+ ci: "none" | "pending" | "failed" | "no-success" | "green";
  readAt: string;
 }
 
 const OK_CONCLUSIONS = new Set(["success", "neutral", "skipped"]);
 
-/** The CI state of a head from its check runs, the way the merge gate reads them. */
+/**
+ * The CI state of a head from its check runs, by the merge gate's rules
+ * (`merge-gate.ts`, mirrored rather than imported to keep serve's import
+ * graph small): neutral and skipped pass, but the close cites one check run
+ * that concluded success, so a head without one is not green.
+ */
 export function ciState(runs: { status: string; conclusion: string | null }[]): PrView["ci"] {
  if (runs.length === 0) return "none";
  if (runs.some((r) => r.status !== "completed")) return "pending";
  if (runs.some((r) => !OK_CONCLUSIONS.has(r.conclusion ?? ""))) return "failed";
+ if (!runs.some((r) => r.conclusion === "success")) return "no-success";
  return "green";
+}
+
+/**
+ * The check runs from `gh api --paginate --slurp` (an array of pages), or
+ * null when any page is malformed: a dropped page could hide a failure.
+ */
+export function checkRunsFromPages(raw: unknown): { status: string; conclusion: string | null }[] | null {
+ if (!Array.isArray(raw)) return null;
+ const runs: { status: string; conclusion: string | null }[] = [];
+ for (const page of raw) {
+  const list = (page as { check_runs?: unknown } | null)?.check_runs;
+  if (!Array.isArray(list)) return null;
+  for (const c of list as { status?: unknown; conclusion?: unknown }[]) {
+   runs.push({ status: String(c?.status ?? ""), conclusion: typeof c?.conclusion === "string" ? c.conclusion : null });
+  }
+ }
+ return runs;
 }
 
 /** Why a PR cannot be merged from the dashboard, or null when it can. */
@@ -196,6 +237,7 @@ export function mergeRefusal(pr: PrView | null): string | null {
  if (pr.state !== "open") return "the PR is closed";
  if (pr.draft) return "the PR is a draft: mark it ready first";
  if (pr.mergeable !== true) return pr.mergeable === null ? "GitHub is still computing mergeability" : "the PR is not mergeable";
+ if (pr.ci === "no-success") return "no check run concluded success (all neutral/skipped): the close has nothing to cite";
  if (pr.ci !== "green") return `CI is ${pr.ci}`;
  if (!SHA_PATTERN.test(pr.headSha)) return "the PR head is unknown";
  return null;
@@ -221,6 +263,12 @@ export interface NeedsYouEntry {
  reason: Reason;
  pr: { number: number; url: string; view: PrView | null } | null;
  sage: SageRound | null;
+ /**
+  * Whether the last sage round read the PR's current head: false when the
+  * head moved after it (its counts belong to an earlier head), null when
+  * there is no round or no PR read to compare.
+  */
+ sageOnHead: boolean | null;
  probe: ProbeResult | null;
  actions: {
   resume: boolean;
@@ -254,6 +302,7 @@ export function needsYouEntries(inputs: NeedsYouInputs): NeedsYouEntry[] {
   if (!waiting && !needsEye) continue;
   const events = inputs.events(row.repo, row.nodeId);
   const view = row.prNumber === null ? null : inputs.prs(row.repo, row.prNumber);
+  const sage = lastSageRound(events);
   const refused = row.prNumber === null ? "no PR" : mergeRefusal(view);
   const cwd = [row.worktree, map.localCheckout].find(
    (p): p is string => typeof p === "string" && p.length > 0 && inputs.exists(p),
@@ -272,7 +321,8 @@ export function needsYouEntries(inputs: NeedsYouInputs): NeedsYouEntry[] {
     row.prNumber === null
      ? null
      : { number: row.prNumber, url: view?.url || `https://github.com/${row.repo}/pull/${row.prNumber}`, view },
-   sage: lastSageRound(events),
+   sage,
+   sageOnHead: sage === null || view === null || view.headSha === "" ? null : view.headSha.startsWith(sage.sha),
    probe: lastProbe(events),
    actions: {
     resume: waiting,
@@ -288,6 +338,23 @@ export function needsYouEntries(inputs: NeedsYouInputs): NeedsYouEntry[] {
   });
  }
  return out.sort((a, b) => (b.endedAt ?? "").localeCompare(a.endedAt ?? ""));
+}
+
+/**
+ * The awaiting-merge rows on a served map whose labels are not known —
+ * unread yet, or the read failed — as `repo#id`. Any of them may need the
+ * principal's eye, so the section never says "nothing waits" while one is
+ * left.
+ */
+export function uncheckedNeedsEye(inputs: Pick<NeedsYouInputs, "maps" | "workers" | "labels">): string[] {
+ return inputs.workers
+  .filter(
+   (row) =>
+    row.status === "awaiting-merge" &&
+    inputs.maps.some((m) => m.repo === row.repo && m.root === row.root) &&
+    inputs.labels(row.repo, row.nodeId) === null,
+  )
+  .map((row) => `${row.repo}#${row.nodeId}`);
 }
 
 // ---- the actions ----
