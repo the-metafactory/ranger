@@ -1,4 +1,8 @@
 import { describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Journal } from "../src/journal.ts";
 
 describe("Journal — SQLite state (design §8)", () => {
@@ -55,6 +59,28 @@ describe("Journal — SQLite state (design §8)", () => {
   const later = new Date("2026-08-17T08:00:00Z");
   expect(j.spawnsToday(later)).toBe(0);
   j.close();
+ });
+
+ test("one node's events read through the (repo, node_id, id) index, not a journal scan (node #54)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ranger-events-idx-"));
+  try {
+   const path = join(dir, "state.sqlite");
+   const j = new Journal(path);
+   j.recordEvent("parked", { nodeId: "54", repo: "acme/widgets", detail: "review cap" });
+   j.recordEvent("parked", { nodeId: "55", repo: "acme/widgets", detail: "other" });
+   expect(j.listNodeEvents("acme/widgets", "54").map((e) => e.nodeId)).toEqual(["54"]);
+   j.close();
+   const raw = new Database(path, { readonly: true });
+   const plan = raw
+    .query("EXPLAIN QUERY PLAN SELECT * FROM events WHERE repo = ? AND node_id = ? ORDER BY id DESC LIMIT 60")
+    .all("acme/widgets", "54") as { detail: string }[];
+   raw.close();
+   const steps = plan.map((r) => r.detail).join(" | ");
+   expect(steps).toContain("events_repo_node_id_idx");
+   expect(steps).not.toContain("TEMP B-TREE");
+  } finally {
+   rmSync(dir, { recursive: true, force: true });
+  }
  });
 
  test("vetoes are durable (journal is a cache of the node comment record)", () => {

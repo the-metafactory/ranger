@@ -1,0 +1,1 @@
+CREATE INDEX `events_repo_node_id_idx` ON `events` (`repo`,`node_id`,`id`);
