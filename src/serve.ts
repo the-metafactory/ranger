@@ -44,7 +44,7 @@ import { planTick, walkableCandidates } from "./candidates.ts";
 import { pidAlive as defaultPidAlive } from "./exec.ts";
 import { Journal, type WorkerRow } from "./journal.ts";
 import { implementLane, workerLane, type ImplementLane } from "./lanes.ts";
-import { BUILD_NOW_TIMEOUT_MS } from "./build-now-bounds.ts";
+import { BUILD_NOW_CLAIM_START_BY_MS, BUILD_NOW_TIMEOUT_MS } from "./build-now-bounds.ts";
 import { activeCooldown, readGraphqlBudget } from "./budget.ts";
 import { cachedFrontier } from "./frontier-cache.ts";
 import { type FrontierEntry, graphFrontier, RateLimitError } from "./graph.ts";
@@ -549,11 +549,17 @@ export function buildNowArgv(args: {
  key: string;
  nodeId: string;
  configPath: string;
+ /** The latest the verb may start its graph claim (epoch ms): the dashboard's deadline. */
+ claimBy: number;
 }): string[] {
  if (!ID_PATTERN.test(args.nodeId)) throw new Error(`bad node id: ${args.nodeId}`);
  const [repo, root] = args.key.split("#");
  if (!REPO_PATTERN.test(repo) || !ID_PATTERN.test(root ?? "")) throw new Error(`bad map: ${args.key}`);
- return [args.bin, "build-now", args.nodeId, "--map", args.key, "--force", "--config", args.configPath];
+ if (!Number.isSafeInteger(args.claimBy) || args.claimBy < 0) throw new Error(`bad deadline: ${args.claimBy}`);
+ return [
+  args.bin, "build-now", args.nodeId, "--map", args.key, "--force",
+  "--claim-by", String(args.claimBy), "--config", args.configPath,
+ ];
 }
 
 export interface VerbRun {
@@ -668,8 +674,8 @@ export interface HandlerContext {
   * reason it is not.
   */
  verifyGrilling: (map: DashboardMap, nodeId: string) => Promise<string | null>;
- /** The `build-now --force` argv for a node (node #58). */
- buildNowCommand: (map: DashboardMap, nodeId: string) => string[];
+ /** The `build-now --force` argv for a node (node #58), its claim to start by `claimBy` (epoch ms). */
+ buildNowCommand: (map: DashboardMap, nodeId: string, claimBy: number) => string[];
  /** Run a verb and wait for its exit code and output tail. */
  runVerb: (argv: string[], env: Record<string, string>) => Promise<VerbRun>;
 }
@@ -755,13 +761,16 @@ export function createHandler(
    if (node === undefined) {
     return refuse(404, `#${body.id} is not walkable on ${map.key}'s frontier`);
    }
-   const argv = ctx.buildNowCommand(map, node.id);
+   // The verb's claim must start early enough to end before runVerb's kill,
+   // counted from here: the token wrapper's keychain reads come first.
+   const argv = ctx.buildNowCommand(map, node.id, Date.now() + BUILD_NOW_CLAIM_START_BY_MS);
    if (body.dryRun === true) return json(200, { dryRun: true, argv });
    // The verb runs for minutes at most, silent until it exits, so this
    // request's idle timeout (Bun's default 10 s, 255 s at most) is lifted:
-   // the wait is bounded by `runVerb` instead. Bun 1.3 keeps a pending
-   // response open past the idle timeout anyway (test/serve.test.ts); the
-   // explicit lift keeps the exit code from depending on that.
+   // the wait is bounded by `runVerb` instead. Bun 1.3.14 was seen to keep
+   // a pending response open past it anyway (idleTimeout 1–10 s, a handler
+   // silent for 5–14 s: 200 to fetch and curl); the explicit lift keeps the
+   // exit code from depending on that.
    server?.timeout(req, 0);
    const run = await ctx.runVerb(argv, childEnv(process.env));
    return json(200, { nodeId: node.id, exitCode: run.code, tail: run.tail });
@@ -1223,8 +1232,8 @@ export function startServe(opts: {
   refresh: () => reader.refresh(),
   launch: spawnLaunch,
   verifyGrilling: (map, nodeId) => verifyGrillingLive(opts.config, map, nodeId),
-  buildNowCommand: (map, nodeId) =>
-   buildNowArgv({ bin: expandHome(RANGER_BIN), key: map.key, nodeId, configPath: opts.configPath }),
+  buildNowCommand: (map, nodeId, claimBy) =>
+   buildNowArgv({ bin: expandHome(RANGER_BIN), key: map.key, nodeId, configPath: opts.configPath, claimBy }),
   runVerb: (argv, env) => runVerb(argv, env),
  });
  const server = Bun.serve({ hostname: "127.0.0.1", port, fetch: handler });

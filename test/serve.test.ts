@@ -2,7 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import type { FrontierEntry } from "../src/graph.ts";
+import { type FrontierEntry, GRAPH_CALL_TIMEOUT_MS } from "../src/graph.ts";
+import { BUILD_NOW_CLAIM_START_BY_MS, BUILD_NOW_TIMEOUT_MS } from "../src/build-now-bounds.ts";
 import { Journal } from "../src/journal.ts";
 import type { WorkerRow } from "../src/journal.ts";
 import { classify, loadProbeRegistry } from "../src/route.ts";
@@ -467,8 +468,8 @@ describe("node #58 — the Build now endpoint", () => {
     launched.push(argv);
    },
    verifyGrilling: async () => null,
-   buildNowCommand: (map, nodeId) =>
-    buildNowArgv({ bin: "/bin/ranger", key: map.key, nodeId, configPath: "/c/ranger.yaml" }),
+   buildNowCommand: (map, nodeId, claimBy) =>
+    buildNowArgv({ bin: "/bin/ranger", key: map.key, nodeId, configPath: "/c/ranger.yaml", claimBy }),
    runVerb: async (argv, env) => {
     built.push({ argv, env });
     return { code: 1, tail: "ranger build-now: the headless implement lane is held by #663" };
@@ -501,9 +502,21 @@ describe("node #58 — the Build now endpoint", () => {
   });
   expect(built).toHaveLength(1);
   expect(built[0].argv).toEqual([
-   "/bin/ranger", "build-now", "10", "--map", `${REPO}#1`, "--force", "--config", "/c/ranger.yaml",
+   "/bin/ranger", "build-now", "10", "--map", `${REPO}#1`, "--force",
+   "--claim-by", expect.stringMatching(/^\d+$/), "--config", "/c/ranger.yaml",
   ]);
   expect(launched).toHaveLength(0);
+ });
+
+ test("the verb's claim must start early enough to end before the dashboard's kill", async () => {
+  const { handler, built } = setup();
+  const before = Date.now();
+  await handler(post(ok));
+  const claimBy = Number(built[0].argv[built[0].argv.indexOf("--claim-by") + 1]);
+  expect(claimBy).toBeGreaterThanOrEqual(before + BUILD_NOW_CLAIM_START_BY_MS);
+  expect(claimBy).toBeLessThanOrEqual(Date.now() + BUILD_NOW_CLAIM_START_BY_MS);
+  // The bounded claim (GRAPH_CALL_TIMEOUT_MS) started by then ends before runVerb's kill.
+  expect(BUILD_NOW_CLAIM_START_BY_MS + GRAPH_CALL_TIMEOUT_MS).toBeLessThan(BUILD_NOW_TIMEOUT_MS);
  });
 
  test("the verb runs with the launcher's allowlisted environment", async () => {
@@ -573,8 +586,8 @@ describe("node #58 — the Build now endpoint", () => {
    refresh: () => {},
    launch: () => {},
    verifyGrilling: async () => null,
-   buildNowCommand: (map, nodeId) =>
-    buildNowArgv({ bin: "/bin/ranger", key: map.key, nodeId, configPath: "/c/ranger.yaml" }),
+   buildNowCommand: (map, nodeId, claimBy) =>
+    buildNowArgv({ bin: "/bin/ranger", key: map.key, nodeId, configPath: "/c/ranger.yaml", claimBy }),
    runVerb: async () => {
     await Bun.sleep(3_000);
     return { code: 0, tail: "started" };
@@ -607,9 +620,10 @@ describe("node #58 — the Build now endpoint", () => {
   expect(lifted).toEqual([0]);
  });
 
- test("the argv refuses a bad id or map", () => {
-  expect(() => buildNowArgv({ bin: "b", key: `${REPO}#1`, nodeId: "1;x", configPath: "c" })).toThrow();
-  expect(() => buildNowArgv({ bin: "b", key: "bad repo#1", nodeId: "1", configPath: "c" })).toThrow();
+ test("the argv refuses a bad id, map or deadline", () => {
+  expect(() => buildNowArgv({ bin: "b", key: `${REPO}#1`, nodeId: "1;x", configPath: "c", claimBy: 1 })).toThrow();
+  expect(() => buildNowArgv({ bin: "b", key: "bad repo#1", nodeId: "1", configPath: "c", claimBy: 1 })).toThrow();
+  expect(() => buildNowArgv({ bin: "b", key: `${REPO}#1`, nodeId: "1", configPath: "c", claimBy: 1.5 })).toThrow();
  });
 
  test("runVerb returns the exit code and the last lines of output", async () => {

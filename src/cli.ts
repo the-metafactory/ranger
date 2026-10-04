@@ -279,16 +279,20 @@ async function runBuildNow(
  selector: string,
  configPath: string,
  force?: boolean,
+ claimByMs?: number,
 ): Promise<string> {
  const { config, journal } = loadCtx(configPath);
  try {
   const map = pickMap(config, selector);
   if (map.walk === "none") throw new Error(`${mapKey(map)} is walk: none — registered, not walked`);
   // Bounded, as every read before the claim is; `claimBy` below keeps the
-  // claim itself inside the dashboard's kill however long they took. Counted
-  // from the process start, as the dashboard's timer is.
+  // claim itself inside the caller's kill however long they took. The
+  // dashboard passes its own deadline (--claim-by), counted from its spawn
+  // of the token wrapper, whose keychain reads run before this process
+  // starts; without one it counts from this process's start.
   const { token, botIdentity } = await writeContext(config, map, { timeoutMs: GRAPH_CALL_TIMEOUT_MS });
-  const claimBy = new Date(performance.timeOrigin + BUILD_NOW_CLAIM_START_BY_MS);
+  const ownStartBy = performance.timeOrigin + BUILD_NOW_CLAIM_START_BY_MS;
+  const claimBy = new Date(claimByMs === undefined ? ownStartBy : Math.min(claimByMs, ownStartBy));
   const result = await buildNow(nodeId, { config, configPath, journal, map, token, botIdentity, force, claimBy });
   return JSON.stringify(result, null, 2);
  } finally {
@@ -554,12 +558,17 @@ program
  .argument("<id>", "node id to build")
  .requiredOption("-m, --map <owner/name#root>", "map repo#root (repo alone only when unique)")
  .option("--force", "start beside whatever holds the implement lane")
+ .option("--claim-by <epoch-ms>", "refuse to start the announce or graph claim after this time (the dashboard's deadline)")
  .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
- .action(async (id: string, options: { map: string; config: string; force?: boolean }) => {
+ .action(async (id: string, options: { map: string; config: string; force?: boolean; claimBy?: string }) => {
   try {
    if (!/^\d+$/.test(id)) throw new Error(`node id must be numeric, got ${id}`);
+   if (options.claimBy !== undefined && !/^\d+$/.test(options.claimBy)) {
+    throw new Error(`--claim-by must be epoch milliseconds, got ${options.claimBy}`);
+   }
    const configPath = resolve(process.cwd(), options.config);
-   process.stdout.write((await runBuildNow(id, options.map, configPath, options.force)) + "\n");
+   const claimBy = options.claimBy === undefined ? undefined : Number(options.claimBy);
+   process.stdout.write((await runBuildNow(id, options.map, configPath, options.force, claimBy)) + "\n");
   } catch (error) {
    process.stderr.write(
     `ranger build-now: ${error instanceof Error ? error.message : String(error)}\n`,
