@@ -1,3 +1,5 @@
+import { recordImplementStart, mapKey } from "./maps.ts";
+import { implementLane, startsImplementSession } from "./lanes.ts";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import type { Journal } from "./journal.ts";
 import { killProcessGroup, pidAlive, processGroupCommands } from "./exec.ts";
@@ -31,7 +33,7 @@ export interface SweepContext {
   * null when nothing spawned (spawn cap, no hook) — the claim stays and the
   * next tick's sweep retries.
   */
- respawn?: (nodeId: string, repo: string) => Promise<number | null>;
+ respawn?: (nodeId: string, repo: string, root: number) => Promise<number | null>;
  /** Merge-desk seams (tests): the forge and the Discord post. */
  github?: GitHubPort;
  post?: (content: string, label: string) => Promise<string>;
@@ -67,7 +69,7 @@ export async function sweepMap(ctx: SweepContext): Promise<SweepMapResult> {
   orphansKilled: [],
  };
 
- const inFlight = journal.listWorkers(repo).filter(
+ const inFlight = journal.listWorkers(repo, map.root).filter(
   (w) => w.status === "claimed" || w.status === "running",
  );
 
@@ -100,19 +102,29 @@ export async function sweepMap(ctx: SweepContext): Promise<SweepMapResult> {
      detail: `killed orphaned worker group ${worker.workerPgid} (${commands.length} process(es)) in ${worker.worktree}`,
     });
    }
-   journal.updateWorker(worker.nodeId, { workerPgid: null });
+   journal.updateWorker(worker.nodeId, repo, { workerPgid: null });
   }
 
   if (worker.attempts < config.workers.maxAttempts) {
+   if (startsImplementSession(worker)) {
+    const holder = journal.laneHolder(implementLane(map), { nodeId: worker.nodeId, repo },
+     row => row.pid === null || pidAlive(row.pid));
+    if (holder !== null) {
+     journal.recordEvent("sweep", { nodeId: worker.nodeId, repo,
+      detail: `respawn waits for the ${implementLane(map)} implement lane (held by #${holder.nodeId}, ${mapKey(holder)})` });
+     continue;
+    }
+   }
    const attempt = worker.attempts + 1;
-   journal.updateWorker(worker.nodeId, {
+   journal.updateWorker(worker.nodeId, repo, {
     status: "claimed",
     attempts: attempt,
     pid: null,
    });
-   const pid = ctx.respawn === undefined ? null : await ctx.respawn(worker.nodeId, repo);
+   const pid = ctx.respawn === undefined ? null : await ctx.respawn(worker.nodeId, repo, worker.root);
    if (pid !== null) {
-    journal.updateWorker(worker.nodeId, { pid });
+    journal.updateWorker(worker.nodeId, repo, { pid });
+    if (startsImplementSession(worker)) recordImplementStart(journal, map);
     result.respawned.push(worker.nodeId);
     journal.recordEvent("sweep", { nodeId: worker.nodeId, repo, detail: `respawned (attempt ${attempt})` });
    } else {
@@ -133,6 +145,7 @@ export async function sweepMap(ctx: SweepContext): Promise<SweepMapResult> {
    journal.upsertWorker({
     nodeId: worker.nodeId,
     repo,
+    root: worker.root,
     status: released.released ? "released" : "parked",
     attempts: worker.attempts,
     finishedAt: new Date().toISOString(),
@@ -146,7 +159,7 @@ export async function sweepMap(ctx: SweepContext): Promise<SweepMapResult> {
  }
 
  // Implement-lane rows waiting on (or parked before) the principal's merge (#23).
- if (journal.listWorkers(repo).some(watchedByMergeDesk)) {
+ if (journal.listWorkers(repo, map.root).some(watchedByMergeDesk)) {
   result.mergeDesk = await runMergeDesk({
    config,
    journal,

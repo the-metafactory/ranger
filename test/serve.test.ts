@@ -70,6 +70,7 @@ const report = (entries: FrontierEntry[], skip: string[] = []): MapRead => ({
 
 const worker = (over: Partial<WorkerRow>): WorkerRow => ({
  nodeId: "50",
+ root: 1,
  repo: REPO,
  pid: 111,
  status: "running",
@@ -194,7 +195,7 @@ describe("#37 — the state the dashboard shows", () => {
   expect(state.maps[1].next.reason).toMatch(/spent by earlier maps/);
  });
 
- test("visual and headless queues can each claim, while a later visual map waits", () => {
+ test("resource lanes select independently while sibling maps share capacity", () => {
   const visual: ServeMap = { ...walked, key: "acme/game#1", repo: "acme/game", lane: "visual" };
   const sibling: ServeMap = { ...visual, key: "acme/game#2", root: 2 };
   const state = assembleState(inputs({
@@ -223,7 +224,7 @@ describe("#37 — the state the dashboard shows", () => {
   expect(state.maps[1].next.reason).toMatch(/headless implement lane.*#50/);
  });
 
- test("one held lane does not make the other lane wait; the cap is still shared", () => {
+ test("a held visual lane leaves headless free; the cap is shared", () => {
   const visual: ServeMap = { ...walked, key: "acme/game#1", repo: "acme/game", lane: "visual" };
   const game = worker({ repo: visual.repo, nodeId: "60" });
   const state = assembleState(inputs({
@@ -543,7 +544,7 @@ describe("#37 — the journal is read, never written", () => {
   const dir = mkdtempSync(join(tmpdir(), "ranger-serve-"));
   const path = join(dir, "state.sqlite");
   const writer = new Journal(path);
-  writer.upsertWorker({ nodeId: "50", repo: REPO, status: "running", attempts: 0 });
+  writer.upsertWorker({ root: 1, nodeId: "50", repo: REPO, status: "running", attempts: 0 });
   writer.close();
   const before = statSync(path).mtimeMs;
   const reader = Journal.openReadOnly(path);

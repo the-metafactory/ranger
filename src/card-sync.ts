@@ -1,3 +1,4 @@
+import { mapKey } from "./maps.ts";
 import { EscalationDiscord, DiscordMessageGoneError } from "./discord.ts";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import type { Journal, EscalationRow } from "./journal.ts";
@@ -124,7 +125,7 @@ function ageSuffix(
  *  prefix plus (for provisioning cards) the blocked-probe registration lines. */
 function cardFraming(
   node: ClassifiedNode,
-  map: { repo: string },
+  map: { repo: string; root: number },
 ): {
   prefixLines: string[];
   probeLines: string[];
@@ -155,7 +156,7 @@ function cardFraming(
     // can set kind/autonomy/title/url to `<@principal-id>`), and the title
     // is capped so a giant title can't evict the decision body or the suffix.
     `${cardHead(node)} — **#${sanitizeGraphText(node.id)}** ${truncate(sanitizeGraphText(node.title), 200)}`,
-    `map: ${map.repo} · ${sanitizeGraphText(node.kind)} · ${sanitizeGraphText(node.autonomy)}`,
+    `map: ${mapKey(map)} · ${sanitizeGraphText(node.kind)} · ${sanitizeGraphText(node.autonomy)}`,
     `url: ${sanitizeGraphText(node.url)}`,
     node.checkpointId !== undefined && node.checkpointId.length > 0
       ? `checkpoint: \`${sanitizeGraphText(node.checkpointId)}\``
@@ -186,7 +187,7 @@ function renderBoundedBody(
 
 function cardContent(
   node: ClassifiedNode,
-  map: { repo: string },
+  map: { repo: string; root: number },
   ageDays: number,
   principal: string,
   principalDiscordId?: string,
@@ -397,6 +398,7 @@ function escalationRow(
   return {
     key: ctx.key,
     repo: map.repo,
+    root: map.root,
     nodeId: node.id,
     title: node.title,
     route: node.route.route,
@@ -578,6 +580,9 @@ async function syncCard(
     content,
   };
   try {
+    if (prior !== undefined && prior.root !== map.root) {
+      throw new Error(`escalation ${map.repo}#${node.id} belongs to map ${map.repo}#${prior.root}; refusing map ${mapKey(map)}`);
+    }
     if (prior === undefined) {
       return await postFresh(cardCtx);
     }
@@ -653,7 +658,7 @@ export async function markAbsentCards(
   // candidate selection (bounded + cursor-swept past needed rows) is
   // `selectAbsentCards`; the per-card destination reconciliation is
   // `reconcileAbsentCard`.
-  const usable = selectAbsentCards(journal, map.repo, neededIds, budget);
+  const usable = selectAbsentCards(journal, map.repo, neededIds, budget, map.root);
   const clientFor = channelClientFor(client);
   const reconcileCtx = { clientFor, journal, map, now, budget, owned };
   const outcomes = await mapPool(usable, 3, (prior) =>
@@ -696,10 +701,11 @@ function selectAbsentCards(
   repo: string,
   neededIds: ReadonlySet<string>,
   budget: CardBudget,
+  root: number,
 ): EscalationRow[] {
   const wanted = Math.max(budget.remaining, 0);
   const scanPage = 50;
-  const cursorKey = `escalate.absentCursor.${repo}`;
+  const cursorKey = `escalate.absentCursor.${mapKey({ repo, root })}`;
   // KEYSET cursor (the last row seen: createdAt + nodeId tiebreak) — resumes
   // AFTER it, which is O(page) per tick instead of the O(offset) skip a
   // growing queue would incur (round-31 review).
@@ -722,6 +728,7 @@ function selectAbsentCards(
     // cursor advances on the RAW last row so an all-active queue still
     // terminates.
     const batch = journal.listUnreconciledOpen(repo, {
+      root,
       limit: scanPage,
       after,
     });
@@ -828,6 +835,7 @@ async function reconcileAbsentCard(
     journal.upsertEscalation({
       key,
       repo: map.repo,
+      root: map.root,
       nodeId,
       title: prior.title,
       lastContent: content,
@@ -1022,7 +1030,7 @@ export async function syncActivePage(ctx: {
     remaining: ACTIVE_CARD_CAP,
     deadline: passDeadline,
   };
-  const cursorKey = `escalate.cursor.${map.repo}`;
+  const cursorKey = `escalate.cursor.${mapKey(map)}`;
   const sorted = [...needed].sort((a, b) => a.id.localeCompare(b.id));
   const pageSize = MAX_CARDS_PER_TICK * 2;
   const offset =

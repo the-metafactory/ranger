@@ -1,9 +1,9 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
+import { IMPLEMENT_LANES } from "./lanes.ts";
 import { resolve } from "node:path";
 import { parse } from "yaml";
 import { z } from "zod";
-import { IMPLEMENT_LANES } from "./lanes.ts";
 
 /**
  * ranger.yaml — per-run ranger configuration.
@@ -126,8 +126,7 @@ const MapSchema = z.object({
 
 /**
  * A map `ranger serve` shows and nothing else reads (#37): no walk, no scout
- * report, no escalation cards. For a root ranger cannot walk yet — seelite
- * #460 until two maps on one repo are supported (#38).
+ * report, no escalation cards. Roots that ranger walks belong in `maps`, not here.
  */
 const ServeMapSchema = z.object({
  repo: z.string().regex(REPO_PATTERN, "repo must be owner/name"),
@@ -188,6 +187,8 @@ const PrincipalSchema = z.object({
 });
 
 const StateSchema = z.object({
+ /** Migration-only: original roots for ambiguous or deregistered legacy repos; remove after cutover. */
+ legacyMapRoots: z.record(z.string().regex(REPO_PATTERN), z.number().int().positive()).default({}),
  /** SQLite journal path (design §8). */
  journalPath: z.string().default("~/.config/ranger/state.sqlite"),
  /** Root under which each walked repo's canonical checkout lives. */

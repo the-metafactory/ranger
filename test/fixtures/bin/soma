@@ -71,6 +71,9 @@ if [ -n "${FAKE_SOMA_RATE_LIMITED:-}" ]; then
   esac
 fi
 
+if [ -n "${FAKE_SOMA_ROOT_CALLS:-}" ]; then
+  printf "%s %s %s\n" "$verb" "$repo" "$root" >> "$FAKE_SOMA_ROOT_CALLS"
+fi
 key="${repo//\//__}"
 
 # ---- read-only verbs: fixtures ----
@@ -82,6 +85,9 @@ case "$verb" in
       audit)    file="${FAKE_SOMA_DIR}/${key}-audit.json" ;;
       node)     file="${FAKE_SOMA_DIR}/${key}-node-${root}.json" ;;
     esac
+    if [ "$verb" != "node" ] && [ -f "${FAKE_SOMA_DIR}/${key}-${verb}-${root}.json" ]; then
+      file="${FAKE_SOMA_DIR}/${key}-${verb}-${root}.json"
+    fi
     if [ ! -f "$file" ]; then
       echo "fake soma: no fixture $file" >&2
       exit 93

@@ -1,11 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { readFileSync as read, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stringify } from "yaml";
+import { implementLane, workerLane } from "../src/lanes.ts";
 import { ConfigError, loadConfig } from "../src/config.ts";
 import { openJournal } from "../src/journal.ts";
-import { implementLane, workerLane } from "../src/lanes.ts";
 import { runMergeDesk } from "../src/merge-desk.ts";
 import { realGitHub, type GitHubPort } from "../src/implement.ts";
 import type { PullRequest } from "../src/github.ts";
@@ -60,12 +60,12 @@ function rig(cap = 10) {
   RANGER_DISCORD_API_BASE: `http://127.0.0.1:${discord.port}`,
   RANGER_DISCORD_ALLOW_TEST_OVERRIDE: "1", RANGER_DISCORD_MIN_INTERVAL_MS: "5",
  };
- return { config, configPath, journal, env, raw, close() {
+ return { config, configPath, journal, env, raw, data, close() {
   journal.close(); discord.stop(); rmSync(dir, { recursive: true, force: true });
  } };
 }
 
-describe("node #57 — resource lanes", () => {
+describe("node #57/#47 — root-aware resource lanes", () => {
  test("probe defaults, explicit overrides and schema validation", () => {
   const r = rig();
   try {
@@ -82,46 +82,44 @@ describe("node #57 — resource lanes", () => {
   } finally { r.close(); }
  });
 
- test("legacy rows resolve at read time; only claimed/running implement workers hold lanes", () => {
-  const r = rig();
-  try {
-   r.journal.upsertWorker({ nodeId: "90", repo: GAME, status: "running", lane: "implement" });
-   r.journal.upsertWorker({ nodeId: "91", repo: TOOL, status: "claimed", lane: "implement" });
-   expect(r.journal.laneHolder("visual")?.nodeId).toBe("90");
-   expect(r.journal.laneHolder("headless")?.nodeId).toBe("91");
-   expect(r.journal.laneHolder("visual", "90")).toBeNull();
-   r.config.maps[0].lane = "headless";
-   expect(r.journal.laneHolder("visual")).toBeNull();
-   expect(r.journal.laneHolder("headless")?.nodeId).toBe("90");
-   for (const status of ["awaiting-merge", "parked", "success", "failed", "released"] as const) {
-    r.journal.updateWorker("90", { status });
-    expect(r.journal.laneHolder("headless")?.nodeId).toBe("91");
-   }
-   r.journal.updateWorker("91", { lane: "research" });
-   expect(r.journal.laneHolder("headless")).toBeNull();
-   r.journal.upsertWorker({ nodeId: "92", repo: "removed/map", status: "running", lane: "implement" });
-   expect(r.journal.laneHolder("visual")?.nodeId).toBe("92");
-   expect(r.journal.laneHolder("headless")?.nodeId).toBe("92");
-  } finally { r.close(); }
- });
-
- test("same-repo maps share a lane; roots distinguish explicit overrides when available", () => {
+ test("same-repo roots resolve distinct resource overrides and holders", () => {
   const r = rig();
   try {
    const game = r.config.maps[0];
-   const sibling = { ...game, root: 2 };
-   expect(workerLane({ repo: GAME }, [game, sibling])).toBe("visual");
-   sibling.lane = "headless";
-   expect(workerLane({ repo: GAME }, [game, sibling])).toBeNull();
-   expect(workerLane({ repo: GAME, root: 2 }, [game, sibling])).toBe("headless");
+   const sibling = { ...game, root: 460, lane: "headless" as const };
+   r.config.maps.push(sibling);
+   const journal = openJournal(r.config);
+   try {
+    expect(workerLane({ repo: GAME, root: 1 }, r.config.maps)).toBe("visual");
+    expect(workerLane({ repo: GAME, root: 460 }, r.config.maps)).toBe("headless");
+    journal.upsertWorker({ nodeId: "90", repo: GAME, root: 1, lane: "implement", status: "running" });
+    journal.upsertWorker({ nodeId: "91", repo: GAME, root: 460, lane: "implement", status: "running" });
+    expect(journal.laneHolder("visual")?.root).toBe(1);
+    expect(journal.laneHolder("headless")?.root).toBe(460);
+   } finally { journal.close(); }
+  } finally { r.close(); }
+ });
+
+ test("independent holders; exclusion uses repo and id", () => {
+  const r = rig();
+  try {
+   r.journal.upsertWorker({ root: 1, nodeId: "90", repo: GAME, status: "running", lane: "implement" });
+   r.journal.upsertWorker({ root: 1, nodeId: "90", repo: TOOL, status: "claimed", lane: "implement" });
+   expect(r.journal.laneHolder("visual")?.repo).toBe(GAME);
+   expect(r.journal.laneHolder("headless", { nodeId: "90", repo: GAME })?.repo).toBe(TOOL);
+   r.journal.updateWorker("90", GAME, { status: "awaiting-merge" });
+   expect(r.journal.laneHolder("visual")).toBeNull();
+   expect(r.journal.laneHolder("headless")?.repo).toBe(TOOL);
+   r.journal.updateWorker("90", TOOL, { lane: "research" });
+   expect(r.journal.laneHolder("headless")).toBeNull();
   } finally { r.close(); }
  });
 
  for (const occupied of [false, true]) {
-  test(`walk claims at most one per free lane in a tick (visual occupied=${occupied})`, async () => {
+  test(`walk claims one per resource lane (visual occupied=${occupied})`, async () => {
    const r = rig();
    try {
-    if (occupied) r.journal.upsertWorker({ nodeId: "90", repo: GAME, status: "running", lane: "implement" });
+    if (occupied) r.journal.upsertWorker({ root: 1, nodeId: "90", repo: GAME, status: "running", lane: "implement" });
     const out = await runCli(["walk", "-c", r.configPath], r.env);
     expect(out.code).toBe(0);
     const result = JSON.parse(out.stdout);
@@ -131,9 +129,26 @@ describe("node #57 — resource lanes", () => {
   });
  }
 
- test("the daily spawn cap bounds both lanes together", async () => {
+ test("the daily spawn cap bounds visual and headless implement claims together", async () => {
   const r = rig(1);
   try {
+   const out = await runCli(["walk", "-c", r.configPath], r.env);
+   expect(out.code).toBe(0);
+   const result = JSON.parse(out.stdout);
+   expect(result.maps.map((m: { claimed: string[] }) => m.claimed)).toEqual([["10"], [], []]);
+   expect(result.maps[1].spawnCapExhausted).toBe(true);
+   expect(r.journal.spawnsToday()).toBe(1);
+   expect(r.journal.getWorker("20", TOOL)).toBeNull();
+  } finally { r.close(); }
+ });
+
+ test("the daily spawn cap blocks research independently of implement capacity", async () => {
+  const r = rig(1);
+  try {
+   const path = join(r.data, TOOL.replace("/", "__") + "-frontier.json");
+   const fixture = JSON.parse(read(path, "utf8"));
+   fixture.frontier[0].node.kind = "research";
+   writeFileSync(path, JSON.stringify(fixture));
    const out = await runCli(["walk", "-c", r.configPath], r.env);
    expect(out.code).toBe(0);
    const result = JSON.parse(out.stdout);
@@ -143,7 +158,7 @@ describe("node #57 — resource lanes", () => {
   } finally { r.close(); }
  });
 
- test("pause prevents claims in both lanes", async () => {
+ test("pause prevents claims on every map", async () => {
   const r = rig();
   try {
    r.journal.setPaused(true);
@@ -154,33 +169,33 @@ describe("node #57 — resource lanes", () => {
   } finally { r.close(); }
  });
 
- test("resume refuses only the asking node's lane; force and research behavior remain", async () => {
+ test("resume enforces resource capacity; explicit force and research behavior remain", async () => {
   const r = rig();
   try {
-   r.journal.upsertWorker({ nodeId: "90", repo: GAME, status: "running", lane: "implement" });
+   r.journal.upsertWorker({ root: 1, nodeId: "90", repo: GAME, status: "running", lane: "implement" });
    for (const [id, repo, lane] of [["20", TOOL, "implement"], ["30", SECOND_GAME, "implement"], ["31", SECOND_GAME, "research"]]) {
-    r.journal.upsertWorker({ nodeId: id, repo, status: "parked", lane });
+    r.journal.upsertWorker({ root: 1, nodeId: id, repo, status: "parked", lane });
     const out = await runCli(["resume-node", id, "--map", repo, "-c", r.configPath], r.env);
     if (id === "30") {
      expect(out.code).toBe(1);
-     expect(out.stderr).toMatch(/visual implement lane.*#90/);
-     expect(r.journal.getWorker(id)?.status).toBe("parked");
+     expect(out.stderr).toMatch(/implement lane.*#90/);
+     expect(r.journal.getWorker(id, repo)?.status).toBe("parked");
      expect((await runCli(["resume-node", id, "--map", repo, "--force", "-c", r.configPath], r.env)).code).toBe(0);
     } else {
      expect(out.code).toBe(0);
     }
-    expect(r.journal.getWorker(id)?.status).toBe("claimed");
+    expect(r.journal.getWorker(id, repo)?.status).toBe("claimed");
    }
-   r.journal.upsertWorker({ nodeId: "21", repo: TOOL, status: "parked", lane: "implement" });
+   r.journal.upsertWorker({ root: 1, nodeId: "21", repo: TOOL, status: "parked", lane: "implement" });
    const blocked = await runCli(["resume-node", "21", "--map", TOOL, "-c", r.configPath], r.env);
    expect(blocked.code).toBe(1);
-   expect(blocked.stderr).toMatch(/headless implement lane.*#20/);
-   expect(r.journal.getWorker("21")?.status).toBe("parked");
+   expect(blocked.stderr).toMatch(/headless implement lane.*#20.*acme\/ranger#1/);
+   expect(r.journal.getWorker("21", TOOL)?.status).toBe("parked");
    expect((await runCli(["resume-node", "20", "--map", TOOL, "-c", r.configPath], r.env)).code).toBe(0);
   } finally { r.close(); }
  });
 
- test("merge desk resumes rework beside another lane, then waits on its own lane", async () => {
+ test("merge desk waits only for the map's resource capacity", async () => {
   const r = rig();
   try {
    const head = "a".repeat(40);
@@ -189,7 +204,7 @@ describe("node #57 — resource lanes", () => {
     getPr: async (_repo, number) => ({ number, state: "open", merged: false, headSha: head, url: "" } as PullRequest),
     listComments: async () => [{ id: 1, author: "ivy-bot", body: `<!-- ranger:review round=1 sha=${head} blockers=1 majors=0 nits=0 -->` }],
    };
-   r.journal.upsertWorker({ nodeId: "90", repo: GAME, status: "running", lane: "implement" });
+   r.journal.upsertWorker({ root: 1, nodeId: "90", repo: GAME, status: "running", lane: "implement" });
    const spawned: string[] = [];
    const posts: string[] = [];
    const desk = (index: number) => runMergeDesk({
@@ -199,28 +214,28 @@ describe("node #57 — resource lanes", () => {
     spawn: async (id) => { spawned.push(id); return 123; },
    });
    for (const [id, repo] of [["20", TOOL], ["21", TOOL], ["30", SECOND_GAME]]) {
-    r.journal.upsertWorker({ nodeId: id, repo, status: "awaiting-merge", lane: "implement", prNumber: Number(id), mergeMessageId: "old-card" });
+    r.journal.upsertWorker({ root: 1, nodeId: id, repo, status: "awaiting-merge", lane: "implement", prNumber: Number(id), mergeMessageId: "old-card" });
    }
    expect(await desk(1)).toMatchObject({ resumed: ["20"], pending: ["21"], errors: [] });
    expect(await desk(2)).toMatchObject({ resumed: [], pending: ["30"], errors: [] });
    expect(spawned).toEqual(["20"]);
    expect(posts).toHaveLength(3);
-   r.journal.updateWorker("90", { status: "success" });
+   r.journal.updateWorker("90", GAME, { status: "success" });
    expect(await desk(2)).toMatchObject({ resumed: ["30"], pending: [], errors: [] });
    expect(spawned).toEqual(["20", "30"]);
    expect(posts).toHaveLength(3);
   } finally { r.close(); }
  });
 
- test("read-only dashboard reads both holders from current config", () => {
+ test("read-only dashboard reads both resource holders", () => {
   const r = rig();
   try {
-   r.journal.upsertWorker({ nodeId: "90", repo: GAME, status: "running", lane: "implement" });
-   r.journal.upsertWorker({ nodeId: "91", repo: TOOL, status: "claimed", lane: "implement" });
+   r.journal.upsertWorker({ root: 1, nodeId: "90", repo: GAME, status: "running", lane: "implement" });
+   r.journal.upsertWorker({ root: 1, nodeId: "91", repo: TOOL, status: "claimed", lane: "implement" });
    const reader = new ServeReader(r.config, servedMaps(r.config), r.config.state.journalPath);
    const state = stateFromJournal(r.config, servedMaps(r.config), reader);
-   expect(state.gates.laneHolders.visual?.nodeId).toBe("90");
-   expect(state.gates.laneHolders.headless?.nodeId).toBe("91");
+   expect(state.gates.laneHolders.visual).toMatchObject({ nodeId: "90", repo: GAME });
+   expect(state.gates.laneHolders.headless).toMatchObject({ nodeId: "91", repo: TOOL });
    expect(state.current.map((j) => j.resourceLane)).toEqual(["visual", "headless"]);
   } finally { r.close(); }
  });

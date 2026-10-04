@@ -1,3 +1,4 @@
+import { mapKey } from "./maps.ts";
 import type { RangerMapConfig } from "./config.ts";
 import { resolveDiscordApiBase } from "./discord.ts";
 
@@ -23,6 +24,7 @@ export interface AnnounceResult {
 
 export interface AnnounceContext {
  repo: string;
+ root: number;
  nodeId: string;
  nodeTitle: string;
  mapTitle?: string;
@@ -71,7 +73,7 @@ export class DiscordAnnouncer implements Announcer {
  async announce(ctx: AnnounceContext): Promise<AnnounceResult> {
   const content = [
    `:ranger: **claim** #${ctx.nodeId} — ${ctx.nodeTitle}`,
-   `map: ${ctx.repo}${ctx.mapTitle === undefined ? "" : ` (${ctx.mapTitle})`}`,
+   `map: ${mapKey(ctx)}${ctx.mapTitle === undefined ? "" : ` (${ctx.mapTitle})`}`,
   ].join("\n");
   return { messageId: await this.post(content, `claim announce for #${ctx.nodeId}`) };
  }

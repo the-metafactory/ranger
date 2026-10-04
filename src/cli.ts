@@ -1,4 +1,6 @@
 #!/usr/bin/env bun
+import { implementLane, startsImplementSession } from "./lanes.ts";
+import { recordImplementStart, mapKey, pickMap, resumeMap } from "./maps.ts";
 import { Command } from "commander";
 import { join, resolve } from "node:path";
 import {
@@ -28,7 +30,6 @@ import {
  type ResolvedToken,
 } from "./token-gate.ts";
 import { openJournal, type Journal } from "./journal.ts";
-import { implementLane } from "./lanes.ts";
 import {
  assertNotPrincipal,
  resolveBotIdentity,
@@ -261,9 +262,9 @@ async function runResumeNode(
 ): Promise<string> {
  const { config, journal } = loadCtx(configPath);
  try {
-  const map = pickMap(config, repo);
+  const map = resumeMap(config, journal.listWorkers(), nodeId, repo);
   await writeContext(config, map); // the same identity gate as run-node
-  const row = journal.getWorker(nodeId);
+  const row = journal.getWorker(nodeId, map.repo);
   if (row === null || row.repo !== map.repo) {
    throw new Error(`no journal row for node ${nodeId} on ${map.repo} — nothing to resume`);
   }
@@ -272,22 +273,25 @@ async function runResumeNode(
   }
   // A resume starts a worker session in this map's resource lane.
   const lane = implementLane(map);
-  const holder = row.lane === "implement" ? journal.laneHolder(lane, nodeId) : null;
+  const takesLane = startsImplementSession(row);
+  const holder = takesLane ? journal.laneHolder(lane, { nodeId, repo: map.repo }) : null;
   if (holder !== null && force !== true) {
    throw new Error(
-    `the ${lane} implement lane is held by #${holder.nodeId} (${holder.repo}, ${holder.status}) — resume #${nodeId} after it leaves the lane, or pass --force to run both`,
+    `the ${lane} implement lane is held by #${holder.nodeId} (${mapKey(holder)}, ${holder.status}) — resume #${nodeId} after it leaves the lane, or pass --force to run both`,
    );
   }
-  journal.updateWorker(nodeId, { status: "claimed", pid: null, workerPgid: null, finishedAt: null });
+  journal.updateWorker(nodeId, map.repo, { status: "claimed", pid: null, workerPgid: null, finishedAt: null });
+  if (takesLane) recordImplementStart(journal, map);
   const pid = await spawnRunNodeDetached({
    nodeId,
    repo: map.repo,
+   root: map.root,
    cliEntry: join(import.meta.dir, "cli.ts"),
    configPath,
   });
-  if (pid !== null) journal.updateWorker(nodeId, { pid });
+  if (pid !== null) journal.updateWorker(nodeId, map.repo, { pid });
   journal.recordEvent("sweep", { nodeId, repo: map.repo, detail: `resume-node by operator (was ${row.status}); run-node pid ${pid ?? "none"}` });
-  return JSON.stringify({ nodeId, repo: map.repo, was: row.status, pid }, null, 2);
+  return JSON.stringify({ nodeId, repo: map.repo, root: map.root, was: row.status, pid }, null, 2);
  } finally {
   journal.close();
  }
@@ -321,23 +325,6 @@ async function runJournal(
  };
  journal.close();
  return JSON.stringify(rows, null, 2);
-}
-
-function pickMap(
- config: RangerConfig,
- repo: string | undefined,
-): RangerMapConfig {
- if (repo !== undefined) {
-  const map = config.maps.find((m) => m.repo === repo);
-  if (map === undefined) {
-   throw new Error(`no map registered for repo '${repo}'`);
-  }
-  return map;
- }
- if (config.maps.length === 1) return config.maps[0];
- throw new Error(
-  `--map <repo> is required when more than one map is registered (registered: ${config.maps.map((m) => m.repo).join(", ")})`,
- );
 }
 
 function normalizeRepo(repo: string, config: RangerConfig): string {
@@ -505,7 +492,7 @@ program
   "Detached worker supervisor: worktree, worker session, then the kind SOP — research (findings → gated close) or implement (tests → PR → sage → merge card → gated close after the principal's merge)",
  )
  .argument("<id>", "node id to execute")
- .option("-m, --map <repo>", "map repo (required with multiple maps)")
+ .option("-m, --map <owner/name#root>", "map repo#root (repo alone only when unique)")
  .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
  .action(async (id: string, options: { map?: string; config: string }) => {
   try {
@@ -545,7 +532,7 @@ program
   "Operator verb: put a parked/failed node back in motion — the row returns to claimed and a detached run-node resumes it (the implement lane resumes from its PR)",
  )
  .argument("<id>", "node id to resume")
- .option("-m, --map <repo>", "map repo (required with multiple maps)")
+ .option("-m, --map <owner/name#root>", "map repo or repo#root (optional; inferred from the journal row)")
  .option("--force", "resume even while another implement worker holds the lane")
  .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
  .action(async (id: string, options: { map?: string; config: string; force?: boolean }) => {

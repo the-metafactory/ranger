@@ -1,3 +1,4 @@
+import { lastImplementMaps, mapKey, implementMapOrder } from "./maps.ts";
 /**
  * `ranger serve` (#37) — a local dashboard of the walk: the job a worker is on
  * now, the next node a tick would take, every node ranger can take on its own,
@@ -143,6 +144,7 @@ export interface MapRead {
 
 export interface StateInputs {
  maps: ServeMap[];
+ lastImplementMaps?: Partial<Record<ImplementLane, string | null>>;
  /** Frontier reads by `ServeMap.key`. */
  reports: Map<string, MapRead>;
  /** Titles of in-flight nodes not on any frontier, by `repo#id`. */
@@ -272,7 +274,7 @@ export interface DashboardState {
   paused: boolean;
   spawnsToday: number;
   spawnCap: number;
-  laneHolders: Record<ImplementLane, { repo: string; nodeId: string; status: string } | null>;
+  laneHolders: Record<ImplementLane, { repo: string; root: number; nodeId: string; status: string } | null>;
  };
  current: CurrentJob[];
  maps: DashboardMap[];
@@ -296,7 +298,7 @@ const view = (n: ClassifiedNode): NodeView => ({
 
 /**
  * What one tick has spent by the time it reaches a map: walk visits maps in
- * config order, and an earlier map's claims take the implement lane and
+ * persisted rotation order, and an earlier map's claims take the implement lane and
  * count against the shared daily cap before a later map is planned.
  */
 interface TickSoFar {
@@ -400,13 +402,17 @@ export function assembleState(inputs: StateInputs): DashboardState {
 
  const tickHolder = (lane: ImplementLane) => {
   const holder = inputs.laneHolders[lane];
-  return holder === null ? null : { repo: holder.repo, nodeId: holder.nodeId, thisTick: false };
+  return holder === null ? null : { repo: mapKey(holder), nodeId: holder.nodeId, thisTick: false };
  };
  const tick: TickSoFar = {
   holders: { visual: tickHolder("visual"), headless: tickHolder("headless") },
   spawns: inputs.spawnsToday,
  };
- // In config order, as walk visits them, so each map sees what the earlier ones spent.
+ // Plan in the walk's rotation order; retain config order for display.
+ const planned = new Map<string, NextJob>();
+ for (const map of implementMapOrder(inputs.maps, inputs.lastImplementMaps ?? {}, m => m.lane)) {
+  planned.set(map.key, nextFor(map, inputs.reports.get(map.key), inputs, tick));
+ }
  const maps: DashboardMap[] = inputs.maps.map((map) => {
   const report = inputs.reports.get(map.key);
   const frontier = report?.ok ? report.frontier : [];
@@ -423,7 +429,7 @@ export function assembleState(inputs: StateInputs): DashboardState {
    readAt: report?.readAt ?? null,
    source: report?.source ?? (map.servedOnly ? "serve" : "ranger"),
    localCheckout: map.localCheckout,
-   next: nextFor(map, report, inputs, tick),
+   next: planned.get(map.key)!,
    autonomous: walked ? walkableCandidates(frontier).map(view) : [],
    grillings: frontier
     .filter((n) => n.kind === "grilling")
@@ -440,7 +446,7 @@ export function assembleState(inputs: StateInputs): DashboardState {
 
  const holderView = (lane: ImplementLane) => {
   const holder = inputs.laneHolders[lane];
-  return holder === null ? null : { repo: holder.repo, nodeId: holder.nodeId, status: holder.status };
+  return holder === null ? null : { repo: holder.repo, root: holder.root, nodeId: holder.nodeId, status: holder.status };
  };
  return {
   generatedAt: inputs.now.toISOString(),
@@ -717,7 +723,7 @@ function renderNext(s) {
  const box = document.getElementById("next"); box.replaceChildren();
  for (const lane of ["visual", "headless"]) {
   const holder = s.gates.laneHolders[lane];
-  box.append(el("h3", { text: lane + " lane · " + (holder ? "held by #" + holder.nodeId + " (" + holder.repo + ")" : "free") }));
+  box.append(el("h3", { text: lane + " lane · " + (holder ? "held by #" + holder.nodeId + " (" + holder.repo + "#" + holder.root + ")" : "free") }));
   for (const m of s.maps.filter((m) => m.lane === lane)) {
    box.append(mapHead(m));
    const n = m.next;
@@ -995,6 +1001,7 @@ export function stateFromJournal(
    reports,
    titles: reader.titles,
    workers: journal?.listWorkers() ?? [],
+   lastImplementMaps: lastImplementMaps(journal),
    laneHolders: { visual: journal?.laneHolder("visual") ?? null, headless: journal?.laneHolder("headless") ?? null },
    paused: journal?.isPaused() ?? false,
    spawnsToday: journal?.spawnsToday(now) ?? 0,

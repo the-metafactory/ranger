@@ -15,7 +15,10 @@ const MIGRATIONS_DIR = join(import.meta.dir, "../../drizzle");
  * run committed migrations before returning. The journal holds operator-private
  * state (spend ledger, vetoes) — 0700 dir, 0600 files (reflex R-103 convention).
  */
-export function openDb(path: string): { db: RangerDb; close: () => void } {
+export function openDb(
+  path: string,
+  beforeMigrate?: (sqlite: Database) => void,
+): { db: RangerDb; close: () => void } {
   if (path !== ":memory:") {
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   }
@@ -43,6 +46,7 @@ export function openDb(path: string): { db: RangerDb; close: () => void } {
 
   const db = drizzle(sqlite, { schema });
   try {
+    beforeMigrate?.(sqlite);
     migrate(db, { migrationsFolder: MIGRATIONS_DIR });
   } catch (error) {
     sqlite.close();

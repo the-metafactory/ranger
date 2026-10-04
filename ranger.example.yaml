@@ -12,10 +12,9 @@ maps:
     #                    nodes, and propose task/build nodes whose ratification
     #                    is the principal's merge of the PR
     walk: none
-    # Implement capacity: visual when commands.probe is declared, headless
-    # otherwise. One claimed/running implement worker per lane across maps.
-    # Override for GPU tests without probes, or probes that need no GPU:
-    # lane: visual   # visual | headless
+    # Implement resource lanes (node #57): one visual + one headless worker.
+    # Defaults: visual with commands.probe, headless otherwise.
+    # lane: headless
     # Optional canonical-checkout override (design §4: probes run where the
     # registry says — the canonical checkout, never a worktree). Defaults to
     # <state.canonicalRoot>/<repo>.
@@ -53,6 +52,22 @@ maps:
       tokenEnv: RANGER_DISCORD_TOKEN
       channelId: "1487052222067118111"
 
+  # Two maps may share a repo. Select one with --map owner/name#root.
+  # A repo-only selector works only while that repo has exactly one map.
+  - repo: jcfischer/seelite
+    root: 1
+    walk: none
+    discord:
+      tokenEnv: RANGER_DISCORD_TOKEN
+      channelId: "1487052222067118111"
+  - repo: jcfischer/seelite
+    root: 460
+    walk: none
+    # Commands, autoMerge, discord and skip belong to each map independently.
+    discord:
+      tokenEnv: RANGER_DISCORD_TOKEN
+      channelId: "1487052222067118111"
+
 # The machine account (design §2). `identity` is the login ranger labels
 # claims/closes with (soma graph ... --identity <login>); it defaults to the
 # login resolved from the write token. Graph-mutating ticks REFUSE when the
@@ -65,6 +80,11 @@ principal:
   login: jcfischer
 
 state:
+  # Migration-only: set the original root for ambiguous or deregistered repos.
+  # One registered map infers it; otherwise migration refuses until supplied.
+  # Historical roots need not remain registered. Remove this after cutover.
+  # legacyMapRoots:
+  #   jcfischer/seelite: 1
   # SQLite journal (design §8) — workers, events, dead-man/spawn ledger, vetoes.
   journalPath: ~/.config/ranger/state.sqlite
   # Root under which each walked repo's canonical checkout lives.

@@ -1,8 +1,8 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "1ae4c289-b5d5-4590-8068-df0effae9044",
-  "prevId": "2bb144b9-973a-4d21-94fe-cb00f8694d75",
+  "id": "85e5d89e-23e4-472b-bf9a-ca7b21cd5836",
+  "prevId": "1ae4c289-b5d5-4590-8068-df0effae9044",
   "tables": {
     "escalation_destinations": {
       "name": "escalation_destinations",
@@ -584,6 +584,13 @@
           "type": "integer",
           "primaryKey": false,
           "notNull": true,
+          "autoincrement": false
+        },
+        "research_base_sha": {
+          "name": "research_base_sha",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
           "autoincrement": false
         }
       },

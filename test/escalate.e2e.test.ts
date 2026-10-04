@@ -1155,7 +1155,7 @@ test("a many-destination absent card reconciles across ticks via a per-card curs
     // is not in the fixture) with 12 historical destinations (12 channel
     // moves) — more than one tick's ABSENT_RESERVE (5) can reconcile.
     const journal = new Journal(join(dir, "state.sqlite"));
-    journal.upsertEscalation({
+    journal.upsertEscalation({ root: 1,
       key: "acme/widgets:900",
       repo: "acme/widgets",
       nodeId: "900",

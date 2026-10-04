@@ -21,7 +21,8 @@ export type SubstrateName = (typeof SUBSTRATE_NAMES)[number];
  */
 
 export const workers = sqliteTable("workers", {
- nodeId: text("node_id").primaryKey(),
+ nodeId: text("node_id").notNull(),
+ root: integer("root").notNull(),
  repo: text("repo").notNull(),
  pid: integer("pid"),
  /** claimed | running | success | failed | parked | released */
@@ -62,7 +63,7 @@ export const workers = sqliteTable("workers", {
  verdictBlockers: integer("verdict_blockers"),
  /** Discord message id of the merge-request card (posted once, idempotent). */
  mergeMessageId: text("merge_message_id"),
-});
+}, (table) => [primaryKey({ columns: [table.repo, table.nodeId] })]);
 
 export const events = sqliteTable("events", {
  id: integer("id").primaryKey({ autoIncrement: true }),
@@ -96,8 +97,9 @@ export const vetoes = sqliteTable("vetoes", {
 export const escalations = sqliteTable(
  "escalations",
  {
-  /** `${repo}:${nodeId}` — one card per node per map. */
+  /** `${repo}:${nodeId}` — one card per node per repo. */
   key: text("key").primaryKey(),
+  root: integer("root").notNull(),
   repo: text("repo").notNull(),
   nodeId: text("node_id").notNull(),
   /** Node title at first post — the closed note keeps a readable remnant. */
@@ -131,6 +133,7 @@ export const escalations = sqliteTable(
   // created_at) — without this it scans+sorts every open card per day.
   index("escalations_repo_status_created_idx").on(
    table.repo,
+   table.root,
    table.status,
    table.createdAt,
   ),
@@ -140,9 +143,11 @@ export const escalations = sqliteTable(
   // sort every matching row (round-29 review).
   index("escalations_repo_status_noted_created_idx").on(
    table.repo,
+   table.root,
    table.status,
    table.notedAt,
    table.createdAt,
+   table.nodeId,
   ),
  ],
 );

@@ -208,14 +208,14 @@ describe("occupant fence + process groups (#23 F1)", () => {
   const dir = mkdtempSync(join(tmpdir(), "ranger-fence-"));
   try {
    const { journal } = journalIn(dir);
-   journal.upsertWorker({ nodeId: "3", repo: "acme/widgets", status: "claimed" });
-   const first = journal.beginGeneration("3");
-   journal.assertGeneration("3", first, "push");
-   const second = journal.beginGeneration("3");
+   journal.upsertWorker({ root: 1, nodeId: "3", repo: "acme/widgets", status: "claimed" });
+   const first = journal.beginGeneration("3", "acme/widgets");
+   journal.assertGeneration("3", "acme/widgets", first, "push");
+   const second = journal.beginGeneration("3", "acme/widgets");
    expect(second).toBe(first + 1);
-   expect(() => journal.assertGeneration("3", first, "push")).toThrow(FencedError);
-   journal.assertGeneration("3", second, "push");
-   expect(() => journal.beginGeneration("missing")).toThrow(FencedError);
+   expect(() => journal.assertGeneration("3", "acme/widgets", first, "push")).toThrow(FencedError);
+   journal.assertGeneration("3", "acme/widgets", second, "push");
+   expect(() => journal.beginGeneration("missing", "acme/widgets")).toThrow(FencedError);
    journal.close();
   } finally {
    rmSync(dir, { recursive: true, force: true });
@@ -252,7 +252,7 @@ describe("occupant fence + process groups (#23 F1)", () => {
   try {
    const { journal, config } = journalIn(dir);
    for (const [nodeId, pgid] of [["4", orphan], ["5", stranger]] as const) {
-    journal.upsertWorker({
+    journal.upsertWorker({ root: 1,
      nodeId,
      repo: "acme/widgets",
      status: "running",
@@ -273,7 +273,7 @@ describe("occupant fence + process groups (#23 F1)", () => {
    await Bun.sleep(200);
    expect(await processGroupCommands(orphan)).toEqual([]);
    expect((await processGroupCommands(stranger)).length).toBeGreaterThan(0); // not ours: left alone
-   expect(journal.getWorker("4")?.workerPgid).toBeNull();
+   expect(journal.getWorker("4", "acme/widgets")?.workerPgid).toBeNull();
    journal.close();
   } finally {
    try {
@@ -303,11 +303,11 @@ describe("walk — implement lane selection (#23)", () => {
    require("node:fs").writeFileSync(path, baseConfigLines(dir).join("\n"));
    const journal = openJournal(loadConfig(path).config);
    expect(implementLaneBusy(journal, "headless")).toBe(false);
-   journal.upsertWorker({ nodeId: "1", repo: "acme/widgets", status: "awaiting-merge", lane: "implement" });
+   journal.upsertWorker({ root: 1, nodeId: "1", repo: "acme/widgets", status: "awaiting-merge", lane: "implement" });
    expect(implementLaneBusy(journal, "headless")).toBe(false); // waiting on a merge does not hold the lane
-   journal.upsertWorker({ nodeId: "2", repo: "acme/widgets", status: "running", lane: "research" });
+   journal.upsertWorker({ root: 1, nodeId: "2", repo: "acme/widgets", status: "running", lane: "research" });
    expect(implementLaneBusy(journal, "headless")).toBe(false);
-   journal.upsertWorker({ nodeId: "4", repo: "acme/widgets", status: "running", lane: "implement" });
+   journal.upsertWorker({ root: 1, nodeId: "4", repo: "acme/widgets", status: "running", lane: "implement" });
    expect(implementLaneBusy(journal, "headless")).toBe(true);
    journal.close();
   } finally {
@@ -408,12 +408,12 @@ describe("implement lane holder", () => {
    const path = join(dir, "ranger.yaml");
    require("node:fs").writeFileSync(path, baseConfigLines(dir).join("\n"));
    const journal = openJournal(loadConfig(path).config);
-   journal.upsertWorker({ nodeId: "1", repo: "acme/widgets", status: "awaiting-merge", lane: "implement" });
-   journal.upsertWorker({ nodeId: "2", repo: "acme/widgets", status: "running", lane: "research" });
+   journal.upsertWorker({ root: 1, nodeId: "1", repo: "acme/widgets", status: "awaiting-merge", lane: "implement" });
+   journal.upsertWorker({ root: 1, nodeId: "2", repo: "acme/widgets", status: "running", lane: "research" });
    expect(journal.laneHolder("headless")).toBeNull();
-   journal.upsertWorker({ nodeId: "3", repo: "acme/widgets", status: "running", lane: "implement" });
+   journal.upsertWorker({ root: 1, nodeId: "3", repo: "acme/widgets", status: "running", lane: "implement" });
    expect(journal.laneHolder("headless")?.nodeId).toBe("3");
-   expect(journal.laneHolder("headless", "3")).toBeNull();
+   expect(journal.laneHolder("headless", { nodeId: "3", repo: "acme/widgets" })).toBeNull();
    journal.close();
   } finally {
    rmSync(dir, { recursive: true, force: true });

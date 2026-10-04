@@ -1,5 +1,6 @@
 import { and, asc, desc, eq, gt, inArray, isNull, lt, or, sql } from "drizzle-orm";
 import { openDb, openDbReadOnly, type RangerDb } from "./store/db.ts";
+import { seedLegacyRoots } from "./store/legacy-roots.ts";
 import {
  escalations,
  escalationDestinations,
@@ -36,6 +37,7 @@ export type ImplementPhase = "implement" | "review" | "awaiting-merge" | "close"
 
 export interface WorkerRow {
  nodeId: string;
+ root: number;
  repo: string;
  pid: number | null;
  status: WorkerStatus;
@@ -61,7 +63,7 @@ export interface WorkerRow {
 
 /** Fields a supervisor may update in place on its own row. */
 export type WorkerPatch = Partial<
- Omit<WorkerRow, "nodeId" | "repo" | "generation">
+ Omit<WorkerRow, "nodeId" | "repo" | "root" | "generation">
 >;
 
 /**
@@ -97,6 +99,7 @@ export interface SubstrateReading {
 export interface EscalationRow {
  /** `${repo}:${nodeId}` */
  key: string;
+ root: number;
  repo: string;
  nodeId: string;
  title: string | null;
@@ -143,6 +146,8 @@ export type EventKind =
  | "substrate-capped"
  | "transient";
 
+const rootFilter = (column: typeof workers.root | typeof escalations.root, root?: number) => root === undefined ? undefined : eq(column, root);
+
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 export class Journal {
@@ -153,12 +158,14 @@ export class Journal {
 
  constructor(
   path: string,
-  opened: { db: RangerDb; close: () => void } = openDb(path),
+  opened?: { db: RangerDb; close: () => void },
   private readonly maps: readonly LaneMap[] = [],
+  legacyMapRoots: Readonly<Record<string, number>> = {},
  ) {
   this.path = path;
-  this.db = opened.db;
-  this.closeDb = opened.close;
+  const connection = opened ?? openDb(path, sqlite => seedLegacyRoots(sqlite, maps, legacyMapRoots));
+  this.db = connection.db;
+  this.closeDb = connection.close;
  }
 
  /**
@@ -173,14 +180,23 @@ export class Journal {
 
  // ---- workers ----
 
+ assertWorkerRoot(nodeId: string, repo: string, root: number): void {
+  const existing = this.getWorker(nodeId, repo);
+  if (existing !== null && existing.root !== root) {
+   throw new Error(`node ${repo}#${nodeId} already belongs to map ${repo}#${existing.root}; refusing to move it to map ${repo}#${root}`);
+  }
+ }
+
  upsertWorker(
-  row: Partial<WorkerRow> & Pick<WorkerRow, "nodeId" | "repo" | "status">,
+  row: Partial<WorkerRow> & Pick<WorkerRow, "nodeId" | "repo" | "root" | "status">,
  ): void {
+  this.assertWorkerRoot(row.nodeId, row.repo, row.root);
   this.db
    .insert(workers)
    .values({
     nodeId: row.nodeId,
     repo: row.repo,
+    root: row.root,
     pid: row.pid ?? null,
     status: row.status,
     attempts: row.attempts ?? 0,
@@ -201,9 +217,8 @@ export class Journal {
     substrate: row.substrate ?? null,
    })
    .onConflictDoUpdate({
-    target: workers.nodeId,
+    target: [workers.repo, workers.nodeId],
     set: {
-     repo: row.repo,
      pid: row.pid,
      status: row.status,
      attempts: row.attempts,
@@ -232,23 +247,23 @@ export class Journal {
   * never touches a field the patch omits, so a phase update cannot null a PID
   * or a message id by accident (the worker.ts pid:null bug, #23 F1).
   */
- updateWorker(nodeId: string, patch: WorkerPatch): void {
+ updateWorker(nodeId: string, repo: string, patch: WorkerPatch): void {
   const set = Object.fromEntries(
    Object.entries(patch).filter(([, v]) => v !== undefined),
   );
   if (Object.keys(set).length === 0) return;
-  this.db.update(workers).set(set).where(eq(workers.nodeId, nodeId)).run();
+  this.db.update(workers).set(set).where(and(eq(workers.nodeId, nodeId), eq(workers.repo, repo))).run();
  }
 
  /**
   * Take the node as a new occupant: bump and return its generation. Every
   * run-node start calls this once; the row must exist (the claim made it).
   */
- beginGeneration(nodeId: string): number {
+ beginGeneration(nodeId: string, repo: string): number {
   const rows = this.db
    .update(workers)
    .set({ generation: sql`${workers.generation} + 1` })
-   .where(eq(workers.nodeId, nodeId))
+   .where(and(eq(workers.nodeId, nodeId), eq(workers.repo, repo)))
    .returning({ generation: workers.generation })
    .all();
   if (rows.length === 0) {
@@ -265,8 +280,8 @@ export class Journal {
   * journal is a single-host SQLite file, so this is sound for supervisors on
   * this host; the window between check and action is milliseconds.
   */
- assertGeneration(nodeId: string, generation: number, action: string): void {
-  const row = this.getWorker(nodeId);
+ assertGeneration(nodeId: string, repo: string, generation: number, action: string): void {
+  const row = this.getWorker(nodeId, repo);
   if (row === null || row.generation !== generation) {
    throw new FencedError(
     `node ${nodeId}: generation ${generation} superseded by ${row?.generation ?? "a removed row"} — refusing to ${action}`,
@@ -275,35 +290,42 @@ export class Journal {
  }
 
  /**
-  * One claimed/running implement worker per resource lane. Unknown maps
-  * conservatively hold both lanes until their config or row is reconciled.
+  * One claimed/running implement worker per resource lane across all maps.
+  * Excluding an occupant requires its repo as well as node id.
+  * Unknown or ambiguous maps conservatively hold both resource lanes.
   */
- laneHolder(lane: ImplementLane, exceptNodeId?: string): WorkerRow | null {
+ laneHolder(
+  lane: ImplementLane,
+  except?: { nodeId: string; repo: string },
+  isActive: (worker: WorkerRow) => boolean = () => true,
+ ): WorkerRow | null {
   return (
    this.listWorkers().find((w) => {
-    if (w.nodeId === exceptNodeId || !holdsImplementLane(w)) return false;
-    const resolved = workerLane(w, this.maps);
-    return resolved === lane || resolved === null;
+    if (w.nodeId === except?.nodeId && w.repo === except?.repo) return false;
+    if (!holdsImplementLane(w)) return false;
+    if (!isActive(w)) return false;
+    const resource = workerLane(w, this.maps);
+    return resource === lane || resource === null;
    }) ?? null
   );
  }
 
- getWorker(nodeId: string): WorkerRow | null {
+ getWorker(nodeId: string, repo: string): WorkerRow | null {
   const row = this.db.query.workers
    .findFirst({
-    where: eq(workers.nodeId, nodeId),
+    where: and(eq(workers.nodeId, nodeId), eq(workers.repo, repo)),
    })
    .sync();
   return row === undefined ? null : hydrateWorker(row);
  }
 
- listWorkers(repo?: string): WorkerRow[] {
+ listWorkers(repo?: string, root?: number): WorkerRow[] {
   const rows =
    repo === undefined
     ? this.db.query.workers.findMany().sync()
     : this.db.query.workers
        .findMany({
-        where: eq(workers.repo, repo),
+        where: and(eq(workers.repo, repo), rootFilter(workers.root, root)),
        })
        .sync();
   return rows.map(hydrateWorker);
@@ -443,7 +465,7 @@ export class Journal {
  upsertEscalation(
   row: Pick<
    EscalationRow,
-   "key" | "repo" | "nodeId" | "messageId" | "createdAt"
+   "key" | "repo" | "root" | "nodeId" | "messageId" | "createdAt"
   > &
    Partial<
     Pick<
@@ -459,9 +481,13 @@ export class Journal {
    >,
  ): void {
   const existing = this.getEscalation(row.repo, row.nodeId);
+  if (existing !== null && existing.root !== row.root) {
+   throw new Error(`escalation ${row.repo}#${row.nodeId} belongs to map ${row.repo}#${existing.root}; refusing to move it to map ${row.repo}#${row.root}`);
+  }
   // One resolved field set, reused for both the insert values and the
   // conflict-update set (adding an escalation field is a single edit).
   const fields = {
+   root: row.root,
    title: row.title ?? existing?.title ?? null,
    route: row.route ?? existing?.route ?? null,
    lastContent: row.lastContent ?? existing?.lastContent ?? null,
@@ -583,7 +609,7 @@ export class Journal {
  listOpenEscalations(
   repo: string,
   now: Date,
-  opts: { limit?: number } = {},
+  opts: { limit?: number; root?: number } = {},
  ): { rows: EscalationRow[]; total: number; aged: number; overdue: number } {
   // ONE aggregate: total + aged (≥3 UTC days) + overdue (≥7 UTC days) over
   // ACTIONABLE open rows — the digest header must report the true counts
@@ -612,6 +638,7 @@ export class Journal {
    .where(
     and(
      eq(escalations.repo, repo),
+     rootFilter(escalations.root, opts.root),
      eq(escalations.status, "open"),
      isNull(escalations.notedAt),
     ),
@@ -621,6 +648,7 @@ export class Journal {
    .findMany({
     where: and(
      eq(escalations.repo, repo),
+     rootFilter(escalations.root, opts.root),
      eq(escalations.status, "open"),
      isNull(escalations.notedAt),
     ),
@@ -651,6 +679,7 @@ export class Journal {
   repo: string,
   opts: {
    limit?: number;
+   root?: number;
    after?: { createdAt: string; nodeId: string };
   } = {},
  ): EscalationRow[] {
@@ -658,6 +687,7 @@ export class Journal {
    .findMany({
     where: and(
      eq(escalations.repo, repo),
+     rootFilter(escalations.root, opts.root),
      eq(escalations.status, "open"),
      isNull(escalations.notedAt),
      // KEYSET pagination: resume strictly AFTER the last raw row seen —
@@ -770,6 +800,7 @@ function dayKey(date: Date): string {
 }
 
 function hydrateWorker(row: {
+ root: number;
  nodeId: string;
  repo: string;
  pid: number | null;
@@ -795,6 +826,7 @@ function hydrateWorker(row: {
  return {
   nodeId: row.nodeId,
   repo: row.repo,
+  root: row.root,
   pid: row.pid,
   status: row.status as WorkerStatus,
   attempts: row.attempts,
@@ -836,6 +868,7 @@ function hydrateEvent(row: {
 }
 
 function hydrateEscalation(row: {
+ root: number;
  key: string;
  repo: string;
  nodeId: string;
@@ -852,6 +885,7 @@ function hydrateEscalation(row: {
  return {
   key: row.key,
   repo: row.repo,
+  root: row.root,
   nodeId: row.nodeId,
   title: row.title,
   route: row.route,
@@ -891,5 +925,5 @@ function hydrateSubstrateReading(row: {
 
 /** Open the configured journal (default from config.state.journalPath). */
 export function openJournal(config: RangerConfig): Journal {
- return new Journal(expandHome(config.state.journalPath), undefined, config.maps);
+ return new Journal(expandHome(config.state.journalPath), undefined, config.maps, config.state.legacyMapRoots);
 }

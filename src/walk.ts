@@ -1,3 +1,5 @@
+import { implementLane, type ImplementLane } from "./lanes.ts";
+import { lastImplementMaps, recordImplementStart, mapKey, implementMapOrder } from "./maps.ts";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
 import type { RangerConfig, RangerMapConfig, WalkMode } from "./config.ts";
@@ -13,7 +15,6 @@ import {
  WriteGateError,
 } from "./identity.ts";
 import type { Journal } from "./journal.ts";
-import { implementLane, type ImplementLane } from "./lanes.ts";
 import { classify, loadProbeRegistry, type ClassifiedNode } from "./route.ts";
 import { sweepMap, type SweepMapResult } from "./sweep.ts";
 import {
@@ -59,6 +60,7 @@ export interface WalkResult {
 export interface SpawnRunNodeArgs {
  nodeId: string;
  repo: string;
+ root: number;
  cliEntry: string;
  configPath: string;
 }
@@ -82,7 +84,7 @@ export async function spawnRunNodeDetached(
    "run-node",
    args.nodeId,
    "--map",
-   args.repo,
+   mapKey(args),
    "--config",
    args.configPath,
   ],
@@ -119,10 +121,10 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
  };
  const cliEntry = join(import.meta.dir, "cli.ts");
  // Even a worker finishing during this tick must not allow a second claim
- // in the same lane: at most one new implement claim per lane per tick.
- const claimedLanes = new Set<ImplementLane>();
+ // across maps: at most one new implement claim per resource lane per tick.
+ const implementClaimed = new Set<ImplementLane>();
 
- for (const map of config.maps) {
+ for (const map of implementMapOrder(config.maps, lastImplementMaps(journal), implementLane)) {
   const mapResult: WalkMapResult = {
    repo: map.repo,
    walkMode: map.walk,
@@ -195,7 +197,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
     );
     // The plan `ranger serve` (#37) also reads, so its "next" is this order.
     const plan = planTick(classified, {
-     laneBusy: claimedLanes.has(implementLane(map)) || implementLaneBusy(journal, implementLane(map)),
+     laneBusy: implementClaimed.has(implementLane(map)) || implementLaneBusy(journal, implementLane(map)),
      vetoed: (id) => journal.hasVeto(id),
     });
     const candidates = plan.selected;
@@ -215,6 +217,12 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
       errors.push(`#${node.id} vetoed — not claimed`);
       continue;
      }
+     try {
+      journal.assertWorkerRoot(node.id, map.repo, map.root);
+     } catch (error) {
+      errors.push(error instanceof Error ? error.message : String(error));
+      continue;
+     }
 
      // Announce, fail-closed (node #7: no veto window, but announce gates the claim).
      let messageId: string;
@@ -222,6 +230,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
       const announcer = DiscordAnnouncer.fromMap(map);
       const announced = await announcer.announce({
        repo: map.repo,
+       root: map.root,
        nodeId: node.id,
        nodeTitle: node.title,
       });
@@ -252,7 +261,10 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
       continue;
      }
      mapResult.claimed.push(node.id);
-     if (laneOf(node.id) === "implement") claimedLanes.add(implementLane(map));
+     if (laneOf(node.id) === "implement") {
+      implementClaimed.add(implementLane(map));
+      recordImplementStart(journal, map);
+     }
      journal.recordSpawn(ctx.now?.() ?? new Date());
      // A fresh claim starts a clean row BEFORE the supervisor spawns: a node
      // re-claimed after an earlier park must not inherit that attempt's
@@ -263,6 +275,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
      journal.upsertWorker({
       nodeId: node.id,
       repo: map.repo,
+      root: map.root,
       status: "claimed",
       attempts: 0,
       pid: null,
@@ -282,10 +295,11 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
      const pid = await (ctx.spawnRunNode ?? spawnRunNodeDetached)({
       nodeId: node.id,
       repo: map.repo,
+      root: map.root,
       cliEntry,
       configPath: ctx.configPath,
      });
-     if (pid !== null) journal.updateWorker(node.id, { pid });
+     if (pid !== null) journal.updateWorker(node.id, map.repo, { pid });
      journal.recordEvent("claimed", {
       nodeId: node.id,
       repo: map.repo,
@@ -313,10 +327,11 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
     map,
     token,
     botIdentity,
-    respawn: (nodeId, repo) =>
+    respawn: (nodeId, repo, root) =>
      (ctx.spawnRunNode ?? spawnRunNodeDetached)({
       nodeId,
       repo,
+      root,
       cliEntry,
       configPath: ctx.configPath,
      }),

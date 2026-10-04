@@ -38,14 +38,24 @@ Shipped build-path steps:
   outward action, process-group kill) and resumes its phase from GitHub. The
   approver bot (node #16) remains.
 
-Implement capacity is split into **visual** and **headless** lanes (node #57):
-maps with `commands.probe` use visual; other maps use headless. An optional
-map `lane: visual | headless` overrides that default. Walk, resume and merge-desk
-send-backs check the map's own lane; each lane holds one claimed/running
-implement node. The daily spawn cap and dead-man pause remain global; research
-selection is unchanged. The dashboard shows both holders and groups queues by
-lane. Existing worker rows resolve their lane from current config; an unknown
-or ambiguous map conservatively holds both lanes.
+Implement resource lanes (node #57): **1 visual + 1 headless** across all maps.
+The daily spawn cap and dead-man pause remain global across both lanes.
+A map defaults to visual with `commands.probe`, headless otherwise; `lane` can
+override that choice. Within each lane, maps alternate by the persisted map of
+the last implement start (node #47); empty or gated maps are skipped. Claims,
+operator resumes, sweep respawns and merge-desk send-backs record starts;
+close-only runs leave the cursor unchanged. Awaiting-merge releases capacity.
+The dashboard shows both holders and the same next choices as walk.
+Unknown or ambiguous worker maps conservatively hold both resource lanes.
+
+Journal upgrades run through `openJournal`, which seeds the root inputs required
+by `drizzle/0009_worker-root.sql` before applying migrations. A legacy repo with
+one registered map inherits that root. For multiple maps or a deregistered repo,
+set `state.legacyMapRoots` to its original root; that historical root need not be
+registered now. This includes repos with only legacy digest or escalation cursor
+cache entries. Remove the migration-only overrides after cutover. Standalone
+Drizzle callers must seed `ranger_legacy_roots(repo, root)` for every legacy repo
+before applying this migration.
 
 ## Scout (build-path step 1)
 
