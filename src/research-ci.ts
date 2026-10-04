@@ -1,9 +1,25 @@
 import * as githubApi from "./github.ts";
 import type { CheckRun, PullRequest } from "./github.ts";
 import { ParkSignal } from "./implement.ts";
+import { GitSafetyError, safeGit } from "./git-ops.ts";
 
 export type ResearchGitHubPort = Pick<typeof githubApi,
  "findPrByHead" | "getPr" | "createDraftPr" | "checkRunsFor" | "workflowRunsFor" | "commitStatusesFor">;
+
+/** The base SHA must be captured before the worker can move local refs. */
+export async function assertResearchFindingsOnly(canonical: string, baseSha: string, sha: string): Promise<void> {
+ const diff = await safeGit([
+  "--no-replace-objects", "diff", "--no-ext-diff", "--no-textconv", "--no-renames",
+  "--name-only", "-z", baseSha, sha, "--",
+ ], { cwd: canonical });
+ if (diff.code !== 0) {
+  throw new GitSafetyError(`cannot validate research findings diff: ${diff.stderr.trim()}`);
+ }
+ const forbidden = diff.stdout.split("\0").filter((path) => path !== "" && path !== "findings.md");
+ if (forbidden.length > 0) {
+  throw new GitSafetyError(`research commits may change only findings.md; refused paths: ${forbidden.map((path) => JSON.stringify(path)).join(", ")}`);
+ }
+}
 
 /** Drafts carry research CI evidence; they stay drafts and never enter the merge desk. */
 export async function researchCi(opts: {

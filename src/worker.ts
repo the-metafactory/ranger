@@ -42,7 +42,7 @@ import { workerEnv } from "./worker-env.ts";
 import { saveWorkerLog } from "./worker-log.ts";
 import { isTransientGitHubError } from "./transient.ts";
 import * as githubApi from "./github.ts";
-import { researchCi } from "./research-ci.ts";
+import { assertResearchFindingsOnly, researchCi } from "./research-ci.ts";
 
 export { gitAuthEnv } from "./git-ops.ts";
 
@@ -670,6 +670,11 @@ async function runResearch(
  });
  const canonical = canonicalDir(config, map);
  await bootstrapCanonical(canonical, repo, token);
+ const baseHead = await safeGit(["--no-replace-objects", "rev-parse", "--verify", `refs/remotes/origin/${map.base}^{commit}`], { cwd: canonical });
+ if (baseHead.code !== 0 || !/^[0-9a-f]{40}$/.test(baseHead.stdout.trim())) {
+  throw new GitSafetyError(`cannot resolve research base origin/${map.base}`);
+ }
+ const baseSha = baseHead.stdout.trim();
  const slug = slugify(node.node.title);
  const worktree = await bootstrapWorktree(canonical, nodeId, slug, token);
  const branch = researchBranchFor(node.node);
@@ -758,6 +763,7 @@ async function runResearch(
     throw new GitSafetyError(`research findings branch ${branch} is missing from the canonical checkout`);
    }
    sha = head.stdout.trim();
+   await assertResearchFindingsOnly(canonical, baseSha, sha);
    fence("push");
    await vettedPush({
     worktree,
@@ -780,6 +786,7 @@ async function runResearch(
    throw new ParkSignal(`research findings branch ${branch} is missing from the canonical checkout`);
   }
   sha = head.stdout.trim();
+  await assertResearchFindingsOnly(canonical, baseSha, sha);
  }
  const findings = await safeGit(["show", `${sha}:findings.md`], { cwd: canonical });
  if (findings.code !== 0 || findings.stdout.trim().length === 0) {
@@ -789,7 +796,9 @@ async function runResearch(
   repo, branch, base: map.base, sha, nodeId, token, pr: existingPr, github, fence,
   recordPr: (pr) => {
    journal.updateWorker(nodeId, { prNumber: pr.number });
-   journal.recordEvent("pr-opened", { nodeId, repo, detail: `research draft PR #${pr.number} ${pr.url}` });
+   if (existingPr === null) {
+    journal.recordEvent("pr-opened", { nodeId, repo, detail: `research draft PR #${pr.number} ${pr.url}` });
+   }
   },
  });
  journal.recordEvent("ci-passed", { nodeId, repo, detail: `research ${evidence.ci} (${evidence.check.name})` });

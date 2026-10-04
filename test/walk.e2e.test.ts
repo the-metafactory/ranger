@@ -59,6 +59,81 @@ const RESEARCH_NODE_STATE = {
  probes: [{ type: "git-ref-exists", ref: "research/api-survey" }],
 };
 
+for (const [name, tamper] of [
+ ["workflow addition", "mkdir -p .github/workflows; printf 'forged CI' > .github/workflows/ci.yml"],
+ ["tracked deletion", "git rm README.md"],
+ ["tracked rename", "git mv README.md renamed.md"],
+ ["base ref moved by worker", "printf 'forged CI' > README.md"],
+] as const) {
+ test(`research refuses ${name} before pushing or opening a draft`, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ranger-research-tamper-"));
+  try {
+   const { origin } = await createCanonicalRepo(dir);
+   const config = writeConfig(dir);
+   const statePath = writeState(dir, { "10": { ...RESEARCH_NODE_STATE, assignees: ["ivy-bot"] } });
+   const worker = join(dir, "tamper-worker");
+   writeFileSync(worker, [
+    "#!/usr/bin/env bash", "set -euo pipefail",
+    `bash '${join(fixturesBin, "worker")}' "$1"`,
+    tamper, "git add -A", 'git commit -m "research extra changes"',
+    ...(name === "base ref moved by worker" ? ["git update-ref refs/remotes/origin/main HEAD", "git update-ref refs/heads/main HEAD"] : []),
+   ].join("\n"), { mode: 0o755 });
+   const result = await runCli(["run-node", "10", "--map", "acme/widgets", "-c", config], {
+    ...process.env, ...GIT_ENV, PATH: `${fixturesBin}:${process.env.PATH ?? ""}`,
+    FAKE_SOMA_DIR: dataDir, FAKE_SOMA_STATE: statePath, FAKE_SOMA_REPO_DIR: origin,
+    RANGER_WRITE_TEST: "ghp_write", RANGER_WORKER_CMD: worker, FAKE_RESEARCH_CI: "failure",
+   });
+   expect(result.code).toBe(0);
+   expect(JSON.parse(result.stdout)).toMatchObject({ status: "failed" });
+   expect(JSON.parse(result.stdout).detail).toContain("only findings.md");
+   const remote = await runCmd("git", ["--git-dir", origin, "rev-parse", "--verify", "refs/heads/research/api-survey"]);
+   expect(remote.code).not.toBe(0);
+   const state = JSON.parse(readFileSync(statePath, "utf8"));
+   expect(state.researchPr).toBeUndefined();
+   expect(state.lastClose).toBeUndefined();
+   expect(state.nodes["10"].status).toBe("open");
+  } finally {
+   rmSync(dir, { recursive: true, force: true });
+  }
+ });
+}
+
+test("research retry refuses an altered findings branch before citing CI", async () => {
+ const dir = mkdtempSync(join(tmpdir(), "ranger-research-retry-tamper-"));
+ try {
+  const { origin, canonical } = await createCanonicalRepo(dir);
+  const config = writeConfig(dir);
+  const statePath = writeState(dir, { "10": { ...RESEARCH_NODE_STATE, assignees: ["ivy-bot"] } });
+  const env = {
+   ...process.env, ...GIT_ENV, PATH: `${fixturesBin}:${process.env.PATH ?? ""}`,
+   FAKE_SOMA_DIR: dataDir, FAKE_SOMA_STATE: statePath, FAKE_SOMA_REPO_DIR: origin,
+   RANGER_WRITE_TEST: "ghp_write", RANGER_WORKER_CMD: join(fixturesBin, "worker"),
+   FAKE_RESEARCH_CI: "failure",
+  };
+  const args = ["run-node", "10", "--map", "acme/widgets", "-c", config];
+  const first = await runCli(args, env);
+  expect(JSON.parse(first.stdout).status).toBe("parked");
+  const originalSha = JSON.parse(readFileSync(statePath, "utf8")).researchPr.head.sha;
+  const worktree = join(canonical, ".worktrees", "node-10");
+  writeFileSync(join(worktree, "README.md"), "altered CI inputs\n");
+  for (const command of [["add", "README.md"], ["commit", "-m", "research extra changes"]]) {
+   expect((await runCmd("git", command, { cwd: worktree, env: { ...process.env, ...GIT_ENV } })).code).toBe(0);
+  }
+  const retry = await runCli(args, { ...env, FAKE_RESEARCH_CI: "success" });
+  expect(retry.code).toBe(0);
+  expect(JSON.parse(retry.stdout).status).toBe("failed");
+  expect(JSON.parse(retry.stdout).detail).toContain("only findings.md");
+  const state = JSON.parse(readFileSync(statePath, "utf8"));
+  expect(state.lastClose).toBeUndefined();
+  expect(state.researchPrCreates).toBe(1);
+  expect(state.nodes["10"].status).toBe("open");
+  const remote = await runCmd("git", ["--git-dir", origin, "rev-parse", "refs/heads/research/api-survey"]);
+  expect(remote.stdout.trim()).toBe(originalSha);
+ } finally {
+  rmSync(dir, { recursive: true, force: true });
+ }
+});
+
 describe("ranger walk — claim phase (node #13)", () => {
  test("claims an auto+research frontier node: announce (fail-closed) → soma graph claim → journal", async () => {
   const dir = mkdtempSync(join(tmpdir(), "ranger-walk-"));
@@ -335,7 +410,7 @@ describe("ranger run-node — research worker full loop (node #13 acceptance)", 
  }, 60_000);
 
  for (const mode of ["failure", "skipped"]) {
-  test(`research CI ${mode} parks without closing; retry reuses the draft and findings`, async () => {
+  test(`research CI ${mode} stays parked until external CI changes; retry reuses the draft and findings`, async () => {
    const dir = mkdtempSync(join(tmpdir(), "ranger-research-ci-"));
    try {
     const { origin } = await createCanonicalRepo(dir);
@@ -360,8 +435,13 @@ describe("ranger run-node — research worker full loop (node #13 acceptance)", 
     expect(journal.getWorker("10")?.prNumber).toBe(31);
     journal.close();
 
-    // The fixture worker cannot recreate its branch: a successful retry
-    // proves the supervisor resumed the CI/close tail instead of spawning it.
+    const unchanged = await runCli(args, env);
+    expect(JSON.parse(unchanged.stdout).status).toBe("parked");
+    expect(JSON.parse(readFileSync(statePath, "utf8")).lastClose).toBeUndefined();
+
+    // Simulate an operator rerunning CI successfully on the same head.
+    // The fixture worker cannot recreate its branch, so success also proves
+    // the supervisor resumed the tail without spawning another worker.
     const resumed = await runCli(args, { ...env, FAKE_RESEARCH_CI: "success" });
     expect(resumed.code).toBe(0);
     expect(JSON.parse(resumed.stdout)).toMatchObject({ status: "success", workerExit: null });
@@ -369,6 +449,9 @@ describe("ranger run-node — research worker full loop (node #13 acceptance)", 
     expect(closed.nodes["10"].status).toBe("closed");
     expect(closed.researchPrCreates).toBe(1);
     expect(closed.lastClose.ci).toBe(`901@${closed.researchPr.head.sha}`);
+    const resumedJournal = new Journal(join(dir, "state.sqlite"));
+    expect(resumedJournal.listEvents("acme/widgets").filter((event) => event.kind === "pr-opened")).toHaveLength(1);
+    resumedJournal.close();
    } finally {
     rmSync(dir, { recursive: true, force: true });
    }
