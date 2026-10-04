@@ -583,7 +583,8 @@ export const VERB_TIMEOUT_CODE = 124;
  * again, stdio ignored) outlives both. A verb still running at the timeout
  * gets SIGTERM, then SIGKILL after a grace period, both to its group; it
  * resolves as a timeout failure (code 124) no later than the kill,
- * whatever the child exits with.
+ * whatever the child exits with. The SIGKILL stays scheduled when the verb
+ * itself exits on SIGTERM: a descendant that ignored it is still in the group.
  */
 export function runVerb(
  argv: string[],
@@ -608,7 +609,9 @@ export function runVerb(
    if (settled) return;
    settled = true;
    clearTimeout(timer);
-   clearTimeout(killTimer);
+   // Past the timeout the group SIGKILL still lands: the verb exiting on
+   // SIGTERM says nothing of a descendant that ignored it.
+   if (!timedOut) clearTimeout(killTimer);
    resolveRun(run);
   };
   const signalGroup = (signal: NodeJS.Signals): boolean => {
@@ -638,7 +641,7 @@ export function runVerb(
   });
   child.on("close", (code, signal) => {
    if (timedOut) {
-    settle(timedOutRun(`exited ${signal ?? code} after SIGTERM`));
+    settle(timedOutRun(`exited ${signal ?? code} after SIGTERM; its group gets SIGKILL after the grace period`));
     return;
    }
    settle({ code: code ?? (signal === null ? -1 : 128), tail: tail() });

@@ -7,16 +7,11 @@ import { type FrontierEntry, GRAPH_CALL_TIMEOUT_MS } from "./graph.ts";
 import type { Journal, WorkerRow } from "./journal.ts";
 import { implementLane } from "./lanes.ts";
 import { laneHeldMessage } from "./maps.ts";
-import {
- classifyFrontier,
- ESCALATE_REASONS,
- loadProbeRegistry,
- type ClassifiedNode,
- type ProbeRegistry,
-} from "./route.ts";
+import { classifyFrontier, loadProbeRegistry, type ProbeRegistry } from "./route.ts";
 import {
  claimAdmission,
  claimNode,
+ notWalkable,
  type AnnounceFn,
  type ClaimFn,
  type SpawnRunNodeArgs,
@@ -30,16 +25,17 @@ import {
  * count, the fresh `claimed` row and event, and a detached `run-node`.
  *
  * It refuses everything the walk would not take, before any announce or
- * claim: a paused run, a node off the frontier, one that does not route to
- * the implement or research lane as walkable (HITL, provisioning, skip-listed,
- * off the allowlist, authored by the bot — node #9), a vetoed node, one
- * already in flight, an exhausted daily spawn cap, and, without `--force`, a
- * held implement lane. With `--force` it starts beside the holder; nothing
- * forces a HITL node.
+ * claim, reading the frontier under the claim lock: a paused run, a node off
+ * the frontier, one that does not route to the implement or research lane as
+ * walkable (HITL, provisioning, skip-listed, off the allowlist, authored by the
+ * bot — node #9), a vetoed node, one already in flight, an exhausted daily
+ * spawn cap, and, without `--force`, a held implement lane. With `--force` it
+ * starts beside the holder; nothing forces a HITL node.
  *
  * The announce is best-effort here: the principal chose this node, so a
  * Discord failure is reported (stdout and the `claimed` event) rather than
- * blocking the claim the way it blocks the walk.
+ * blocking the claim the way it blocks the walk. A pause landing during the
+ * announce or the graph claim stops it as it stops the walk (`claimNode`).
  */
 
 export class BuildNowRefusal extends Error {
@@ -79,21 +75,6 @@ export interface BuildNowResult {
  pid: number | null;
 }
 
-/** Why a classified node is not one the walk takes, or null when it is. */
-function notWalkable(node: ClassifiedNode): string | null {
- const route = node.route;
- if (route.route === "escalate-hitl") {
-  return `routes escalate-hitl: ${ESCALATE_REASONS[route.reason]} — a HITL node is never forced`;
- }
- if (route.route === "provisioning") {
-  return "routes provisioning: its probes are not in the probe registry";
- }
- if (!route.walkable) {
-  return `routes ${route.route} but is not walkable on this map (walk mode, nodes allowlist or skip list)`;
- }
- return null;
-}
-
 /**
  * How long build-now waits for another claim (the walk takes the same lock).
  * Short, unlike the walk: the dashboard bounds the whole verb (serve.ts
@@ -108,11 +89,12 @@ export async function buildNow(nodeId: string, ctx: BuildNowContext): Promise<Bu
   throw new BuildNowRefusal(`#${nodeId} on ${map.repo}#${map.root}: ${why}`);
  };
 
- // Cheap first look at the dead-man gate, before any network read; the
- // authoritative check is the one under the claim lock below.
+ // Cheap first look at the dead-man gate, before the lock or any network
+ // read; the authoritative check is the one under the claim lock below.
  if (journal.isPaused()) refuse("dead-man paused — claiming stopped; `ranger resume-run` first");
 
- const entries = await (ctx.readFrontier ??
+ const read =
+  ctx.readFrontier ??
   (async () =>
    (
     await readFrontier({
@@ -125,26 +107,29 @@ export async function buildNow(nodeId: string, ctx: BuildNowContext): Promise<Bu
      now: now(),
      timeoutMs: GRAPH_CALL_TIMEOUT_MS,
     })
-   ).frontier.frontier))();
- const classified = classifyFrontier(entries, map, ctx.registry ?? loadProbeRegistry(), ctx.botIdentity);
- const node = classified.find((n) => n.id === nodeId);
- if (node === undefined) refuse("not on the map's frontier (closed, blocked, or not under this root)");
- const why = notWalkable(node!);
- if (why !== null) refuse(why);
- const lane = node!.route.route as "implement" | "research";
+   ).frontier.frontier);
+ const registry = ctx.registry ?? loadProbeRegistry();
 
- // Every gate below is re-read under the claim lock the walk also takes, and
- // held through the claimed row and the spawn count: two concurrent claims
- // (a second build-now, or the tick) cannot both pass the same gate.
+ // Every gate below, the frontier first, is read under the claim lock the
+ // walk also takes, and held through the claimed row and the spawn count: a
+ // node blocked or re-routed while this waited for the lock is refused, and
+ // two concurrent claims (a second build-now, or the tick) cannot both pass
+ // the same gate.
  const claimed = withClaimLock(journal, async (owned) => {
-  const { refusal, laneHolder: holder } = claimAdmission(
+  const classified = classifyFrontier(await read(), map, registry, ctx.botIdentity);
+  const node = classified.find((n) => n.id === nodeId);
+  if (node === undefined) return refuse("not on the map's frontier (closed, blocked, or not under this root)");
+  const why = notWalkable(node);
+  if (why !== null) refuse(why);
+  const lane = node.route.route as "implement" | "research";
+  const { refusal, laneHolder: holder } = claimAdmission({
    journal,
    map,
    nodeId,
    lane,
-   config.workers.spawnCapPerDay,
-   now(),
-  );
+   spawnCapPerDay: config.workers.spawnCapPerDay,
+   now: now(),
+  });
   switch (refusal?.gate) {
    // Dead-man gate (design §7): the walk claims nothing while paused, nor does this.
    case "paused":
@@ -166,7 +151,7 @@ export async function buildNow(nodeId: string, ctx: BuildNowContext): Promise<Bu
   const outcome = await claimNode({
    journal,
    map,
-   node: node!,
+   node,
    lane,
    botIdentity: ctx.botIdentity,
    token: ctx.token,
@@ -179,7 +164,7 @@ export async function buildNow(nodeId: string, ctx: BuildNowContext): Promise<Bu
    now: ctx.now,
    owned,
   });
-  return { outcome, holder };
+  return { outcome, holder, node, lane };
  }, ctx.claimLockWaitMs ?? BUILD_NOW_LOCK_WAIT_MS).catch((error: unknown) => {
   if (error instanceof ClaimLeaseLost) {
    // Stopped at the fence: another claimer holds the lock now, and may be
@@ -190,14 +175,14 @@ export async function buildNow(nodeId: string, ctx: BuildNowContext): Promise<Bu
   if (!(error instanceof ClaimLockBusy)) throw error;
   return refuse(`another claim is in progress (the tick or a second build-now) — press again: ${error.message}`);
  });
- const { outcome, holder } = await claimed;
+ const { outcome, holder, node, lane } = await claimed;
  // A lost race is reported, never retried: someone else holds the node now.
  if (!outcome.claimed) throw new BuildNowRefusal(outcome.error);
  return {
   nodeId,
   repo: map.repo,
   root: map.root,
-  title: node!.title,
+  title: node.title,
   lane,
   beside:
    holder === null

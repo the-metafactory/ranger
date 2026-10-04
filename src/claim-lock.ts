@@ -13,6 +13,8 @@ import { acquireLease, leaseOwnedCheck, type OwnedCheck, releaseLease, startHear
  * serialized, and the second re-reads the gates after the first has written
  * its row and counted its spawn. Both claim under the same bot identity, so
  * the graph claim alone would let both through.
+ * Both also read the frontier under it, so a node blocked or re-routed while
+ * a claimer waited for the lease is seen before its claim.
  *
  * It is the announce-once lease (`lock.ts`): atomic create, renewed while
  * held, reclaimable once its lease expires. A holder stopped past the lease

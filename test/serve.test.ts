@@ -599,6 +599,42 @@ describe("node #58 — the Build now endpoint", () => {
   expect(run.tail).toContain("timed out after");
  });
 
+ test("runVerb still SIGKILLs the group when the verb exits on SIGTERM but a descendant ignores it", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ranger-runverb-"));
+  const pidFile = join(dir, "descendant.pid");
+  try {
+   // The descendant ignores SIGTERM and holds none of the verb's pipes, so the
+   // verb's close fires as soon as the verb itself exits.
+   const run = await runVerb(
+    [
+     "/bin/sh",
+     "-c",
+     `sh -c 'trap "" TERM; while :; do sleep 0.05; done' </dev/null >/dev/null 2>&1 & echo $! > ${pidFile}; ` +
+      `trap "exit 0" TERM; while :; do sleep 0.05; done`,
+    ],
+    childEnv(process.env),
+    300,
+    300,
+   );
+   expect(run.code).toBe(VERB_TIMEOUT_CODE);
+   const pid = Number(readFileSync(pidFile, "utf8").trim());
+   const alive = () => {
+    try {
+     process.kill(pid, 0);
+     return true;
+    } catch {
+     return false;
+    }
+   };
+   // Still alive after SIGTERM, gone once the grace period's SIGKILL lands.
+   expect(alive()).toBe(true);
+   await Bun.sleep(800);
+   expect(alive()).toBe(false);
+  } finally {
+   rmSync(dir, { recursive: true, force: true });
+  }
+ });
+
  test("the page has a Build now button whose confirm names the lane holder", async () => {
   const { handler } = setup();
   const res = await handler(
