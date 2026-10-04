@@ -838,7 +838,7 @@ function needsCard(n) {
  }
  const merge = n.actions.merge;
  acts.append(actionButton("Merge", merge.offered ? "gh pr merge --squash, pinned to " + short(merge.headSha) + ", under your own gh login" : merge.why, merge.offered, async () => {
-  if (!confirm("Squash-merge PR #" + n.pr.number + " on " + n.repo + " at head " + merge.headSha + "?\\n\\nIt runs under your own gh login; the merge desk closes the node on its next tick.")) return;
+  if (!confirm("Squash-merge PR #" + n.pr.number + " on " + n.repo + " at head " + merge.headSha + "?\\n\\nIt runs under your own gh login; " + (n.status === "failed" ? "the merge desk watches only parked and awaiting-merge rows, so Resume it afterwards to run the close." : "the merge desk closes the node on its next tick."))) return;
   await act("merge", n, { sha: merge.headSha });
  }));
  const session = n.actions.session;
@@ -909,9 +909,13 @@ export class ServeReader {
  /** "Needs you" details (node #54): issue labels by `repo#id`, PRs by `repo#pr`. */
  labels = new Map<string, string[]>();
  prs = new Map<string, PrView>();
+ /** The last detail read that failed; kept apart from the frontier's `lastError`. */
+ detailError: string | null = null;
  private detailIssues = new Set<string>();
  private detailPrs = new Set<string>();
- private detailing = false;
+ /** Keys tried since they were last wanted fresh: a failed read waits for the timer. */
+ private detailTried = new Set<string>();
+ private detailing: Promise<void> | null = null;
  private readonly details: DetailReader;
 
  constructor(
@@ -927,53 +931,77 @@ export class ServeReader {
  }
 
  /**
-  * The issues and PRs the "Needs you" rows show. Read on the next
-  * `refreshDetails`, never from a state read: the dashboard spends REST only
-  * on a timer, on a new row, and after an action.
+  * The issues and PRs the "Needs you" rows show. Read by `refreshDetails`,
+  * never from a state read: the dashboard spends REST on the refresh timer,
+  * once for a row it has not tried yet, and after an action.
   */
  wantDetails(issues: string[], prs: string[]): void {
   this.detailIssues = new Set(issues);
   this.detailPrs = new Set(prs);
  }
 
- /** A wanted issue or PR that has not been read yet. */
+ private unread(): { issues: string[]; prs: string[] } {
+  return {
+   issues: [...this.detailIssues].filter((k) => !this.labels.has(k) && !this.detailTried.has(`issue:${k}`)),
+   prs: [...this.detailPrs].filter((k) => !this.prs.has(k) && !this.detailTried.has(`pr:${k}`)),
+  };
+ }
+
+ /** A wanted issue or PR that has not been read, nor tried since it was wanted. */
  hasUnreadDetails(): boolean {
-  return (
-   [...this.detailIssues].some((k) => !this.labels.has(k)) ||
-   [...this.detailPrs].some((k) => !this.prs.has(k))
-  );
+  const { issues, prs } = this.unread();
+  return issues.length + prs.length > 0;
  }
 
  /** Forget an entry's details, so the next read takes them fresh (after an action). */
  forget(issue: string, pr: string | null): void {
   this.labels.delete(issue);
-  if (pr !== null) this.prs.delete(pr);
- }
-
- refreshDetails(): void {
-  if (this.detailing) return;
-  this.detailing = true;
-  this.readDetails()
-   .catch((error) => {
-    this.lastError = error instanceof Error ? error.message : String(error);
-   })
-   .finally(() => {
-    this.detailing = false;
-   });
- }
-
- private async readDetails(): Promise<void> {
-  for (const key of [...this.detailIssues]) {
-   const [repo, id] = key.split("#");
-   const issue = await this.details.issue(repo, id);
-   if (issue === null) continue;
-   this.labels.set(key, issue.labels);
-   this.titles.set(key, issue.title);
+  this.detailTried.delete(`issue:${issue}`);
+  if (pr !== null) {
+   this.prs.delete(pr);
+   this.detailTried.delete(`pr:${pr}`);
   }
-  for (const key of [...this.detailPrs]) {
-   const [repo, n] = key.split("#");
-   const pr = await this.details.pr(repo, Number(n));
-   if (pr !== null) this.prs.set(key, pr);
+ }
+
+ /**
+  * Read the details: only the untried ones (`all: false`, on a state read or
+  * after an action), or every wanted one (the refresh timer). One read at a
+  * time; a failed key is not retried until the timer comes round.
+  */
+ refreshDetails(all = false): Promise<void> {
+  if (this.detailing !== null) return this.detailing;
+  this.detailing = this.readDetails(all).finally(() => {
+   this.detailing = null;
+  });
+  return this.detailing;
+ }
+
+ private async readDetails(all: boolean): Promise<void> {
+  const keys = all ? { issues: [...this.detailIssues], prs: [...this.detailPrs] } : this.unread();
+  const attempt = async (key: string, read: () => Promise<void>): Promise<void> => {
+   this.detailTried.add(key);
+   try {
+    await read();
+   } catch (error) {
+    this.detailError = `${key}: ${error instanceof Error ? error.message : String(error)}`;
+   }
+  };
+  for (const key of keys.issues) {
+   await attempt(`issue:${key}`, async () => {
+    const [repo, id] = key.split("#");
+    const issue = await this.details.issue(repo, id);
+    if (issue === null) throw new Error("could not read the issue");
+    this.labels.set(key, issue.labels);
+    this.titles.set(key, issue.title);
+   });
+  }
+  for (const key of keys.prs) {
+   await attempt(`pr:${key}`, async () => {
+    const [repo, n] = key.split("#");
+    const pr = await this.details.pr(repo, Number(n));
+    if (pr === null) throw new Error("could not read the PR");
+    this.prs.set(key, pr);
+   });
   }
  }
 
@@ -1056,7 +1084,7 @@ export class ServeReader {
    if (issue !== null) this.titles.set(key, issue.title);
    this.wantedTitles.delete(key);
   }
-  await this.readDetails();
+  await this.refreshDetails(true);
  }
 }
 
@@ -1346,7 +1374,7 @@ export function startServe(opts: {
    const state = stateFromJournal(opts.config, maps, reader);
    // A row that newly needs the principal gets its PR and labels read now,
    // not on the next timer.
-   if (reader.hasUnreadDetails()) reader.refreshDetails();
+   if (reader.hasUnreadDetails()) void reader.refreshDetails();
    return state;
   },
   refresh: () => reader.refresh(),
@@ -1360,7 +1388,7 @@ export function startServe(opts: {
    exists: existsSync,
    after: (entry) => {
     reader.forget(`${entry.repo}#${entry.nodeId}`, entry.pr === null ? null : `${entry.repo}#${entry.pr.number}`);
-    reader.refreshDetails();
+    void reader.refreshDetails();
    },
   },
  });

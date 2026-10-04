@@ -518,4 +518,35 @@ describe("node #54 — the journal feeds the section, with no GitHub call from a
   expect(reader.hasUnreadDetails()).toBe(true);
   rmSync(dir, { recursive: true });
  });
+
+ test("a detail read that fails is not retried on every state read, only on the timer", async () => {
+  const config = { state: { journalPath: "/nonexistent" } } as unknown as RangerConfig;
+  const calls: string[] = [];
+  const reader = new ServeReader(config, [], "/nonexistent", {
+   issue: async (repo, id) => {
+    calls.push(`issue ${repo}#${id}`);
+    return null;
+   },
+   pr: async () => {
+    calls.push("pr");
+    throw new Error("HTTP 502");
+   },
+  });
+  reader.wantDetails([`${SEELITE}#663`], [`${SEELITE}#687`]);
+  expect(reader.hasUnreadDetails()).toBe(true);
+  await reader.refreshDetails();
+  expect(calls).toEqual([`issue ${SEELITE}#663`, "pr"]);
+  expect(reader.detailError).toMatch(/HTTP 502/);
+  expect(reader.lastError).toBeNull();
+  // The next state read finds nothing untried: no second round of REST.
+  expect(reader.hasUnreadDetails()).toBe(false);
+  await reader.refreshDetails();
+  expect(calls).toHaveLength(2);
+  // The timer reads everything wanted again.
+  await reader.refreshDetails(true);
+  expect(calls).toHaveLength(4);
+  // An action forgets its entry, so that entry is read once more at once.
+  reader.forget(`${SEELITE}#663`, `${SEELITE}#687`);
+  expect(reader.hasUnreadDetails()).toBe(true);
+ });
 });
