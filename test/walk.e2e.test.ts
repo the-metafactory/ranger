@@ -52,6 +52,7 @@ function writeState(dir: string, nodes: Record<string, unknown>): string {
 }
 
 const RESEARCH_NODE_STATE = {
+ autonomy: "auto",
  assignees: [],
  status: "open",
  checkpoint: "api-surveyed",
@@ -308,6 +309,10 @@ describe("ranger run-node — research worker full loop (node #13 acceptance)", 
    expect(state.decisions).toHaveLength(1);
    expect(state.decisions[0].id).toBe("10");
    expect(state.decisions[0].closedBy).toBe("ivy-bot");
+   expect(state.researchPr.draft).toBe(true);
+   expect(state.researchPr.head.ref).toBe("research/api-survey");
+   expect(state.lastClose.ci).toBe(`901@${refCheck.stdout.trim()}`);
+   expect(state.researchPr.head.sha).toBe(refCheck.stdout.trim());
 
    // The close ran FROM the canonical checkout (design §4 / node #9: probes
    // resolve in the canonical checkout, never the supervisor's cwd). Found
@@ -322,11 +327,53 @@ describe("ranger run-node — research worker full loop (node #13 acceptance)", 
    expect(kinds).toContain("closed");
    expect(kinds).toContain("decisions-written");
    expect(journal.getWorker("10")?.status).toBe("success");
+   expect(journal.getWorker("10")?.prNumber).toBe(31);
    journal.close();
   } finally {
    rmSync(dir, { recursive: true, force: true });
   }
  });
+
+ for (const mode of ["failure", "skipped"]) {
+  test(`research CI ${mode} parks without closing; retry reuses the draft and findings`, async () => {
+   const dir = mkdtempSync(join(tmpdir(), "ranger-research-ci-"));
+   try {
+    const { origin } = await createCanonicalRepo(dir);
+    const config = writeConfig(dir);
+    const statePath = writeState(dir, { "10": { ...RESEARCH_NODE_STATE, assignees: ["ivy-bot"] } });
+    const env = {
+     ...process.env, ...GIT_ENV, PATH: `${fixturesBin}:${process.env.PATH ?? ""}`,
+     FAKE_SOMA_DIR: dataDir, FAKE_SOMA_STATE: statePath, FAKE_SOMA_REPO_DIR: origin,
+     RANGER_WRITE_TEST: "ghp_write", RANGER_WORKER_CMD: join(fixturesBin, "worker"),
+     FAKE_RESEARCH_CI: mode,
+    };
+    const args = ["run-node", "10", "--map", "acme/widgets", "-c", config];
+    const failed = await runCli(args, env);
+    expect(failed.code).toBe(0);
+    expect(JSON.parse(failed.stdout).status).toBe("parked");
+    const parked = JSON.parse(readFileSync(statePath, "utf8"));
+    expect(parked.nodes["10"].status).toBe("open");
+    expect(parked.lastClose).toBeUndefined();
+    expect(parked.decisions).toEqual([]);
+    const journal = new Journal(join(dir, "state.sqlite"));
+    expect(journal.getWorker("10")?.status).toBe("parked");
+    expect(journal.getWorker("10")?.prNumber).toBe(31);
+    journal.close();
+
+    // The fixture worker cannot recreate its branch: a successful retry
+    // proves the supervisor resumed the CI/close tail instead of spawning it.
+    const resumed = await runCli(args, { ...env, FAKE_RESEARCH_CI: "success" });
+    expect(resumed.code).toBe(0);
+    expect(JSON.parse(resumed.stdout)).toMatchObject({ status: "success", workerExit: null });
+    const closed = JSON.parse(readFileSync(statePath, "utf8"));
+    expect(closed.nodes["10"].status).toBe("closed");
+    expect(closed.researchPrCreates).toBe(1);
+    expect(closed.lastClose.ci).toBe(`901@${closed.researchPr.head.sha}`);
+   } finally {
+    rmSync(dir, { recursive: true, force: true });
+   }
+  });
+ }
 
  test("worker crash with no findings → refused, dead-man increments", async () => {
   const dir = mkdtempSync(join(tmpdir(), "ranger-run-"));

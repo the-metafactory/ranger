@@ -133,6 +133,7 @@ export type EventKind =
  | "fenced"
  | "pushed"
  | "pr-opened"
+ | "ci-passed"
  | "reviewed"
  | "awaiting-merge"
  | "merge-card"

@@ -15,6 +15,9 @@ if [ -n "${FAKE_GH_CALLS:-}" ]; then
   printf "%s\n" "$path" >> "$FAKE_GH_CALLS"
 fi
 case "$path" in
+  repos/*/pulls*|repos/*/commits/*/check-runs\?*)
+    exec bun "$(dirname "$0")/research-gh.ts" "$path" "${@:3}"
+    ;;
   /user)
     # login depends on the credential: write token → machine account, a
     # principal-token sentinel → the principal, else the read account.

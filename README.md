@@ -107,9 +107,16 @@ bun src/cli.ts journal                    # inspect workers/events/health
 - **Journal (design §8):** SQLite at `~/.config/ranger/state.sqlite` holds only
   what the graph cannot — worker liveness/outcomes, vetoes cache, dead-man and
   spawn ledgers. Deleting it degrades to re-announce + retry once.
-- **Acceptance (e2e):** a research node walked end-to-end against fake
-  soma/gh/worker fixtures — claim → worktree → findings branch pushed → gated
-  close (probe on the pushed ref) → `decisions --write`.
+- **Research CI (node #25):** after the findings push, the supervisor opens a
+  draft PR against the map's base and waits up to 15 minutes for CI on the
+  findings head. All checks must finish without failure, with at least one
+  successful run for `soma graph close --ci <checkRunId>@<headSha>`. Missing,
+  pending, failed, or stale-head evidence parks the node; a retry reuses the
+  draft and committed findings. The PR stays draft and unmerged.
+- **Acceptance (e2e):** an auto research node walked end-to-end against fake
+  soma/gh/worker fixtures — claim → worktree → findings branch pushed → draft
+  PR → successful CI citation → gated close → `decisions --write`. Live close
+  validation for node #25 remains a supervisor action after deployment.
 
 ## Doctrine anchors
 

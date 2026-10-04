@@ -7,6 +7,7 @@ import { DiscordAnnouncer } from "./announce.ts";
 import { runCmd, type RunOptions } from "./exec.ts";
 import {
  fastForwardCanonical,
+ assertGitUntouched,
  gitConfigSnapshot,
  safeGit,
  GitSafetyError,
@@ -40,6 +41,8 @@ import { resolveReadOnlyToken } from "./token-gate.ts";
 import { workerEnv } from "./worker-env.ts";
 import { saveWorkerLog } from "./worker-log.ts";
 import { isTransientGitHubError } from "./transient.ts";
+import * as githubApi from "./github.ts";
+import { researchCi } from "./research-ci.ts";
 
 export { gitAuthEnv } from "./git-ops.ts";
 
@@ -86,7 +89,7 @@ export interface RunNodeContext {
   prompt: string,
   opts: RunOptions,
  ) => Promise<{ code: number; stdout: string; stderr: string }>;
- /** For tests: the implement lane's forge and reviewer. */
+ /** For tests: the supervisor's forge and implement lane's reviewer. */
  github?: GitHubPort;
  reviewer?: Reviewer;
  /** For tests: the read-only token (defaults to the map's `auth.readOnlyTokens` env). */
@@ -453,6 +456,11 @@ export async function runNode(
    repo,
    detail: detail.slice(0, 400),
   });
+  if (error instanceof ParkSignal) {
+   countFailure(config, journal, repo);
+   finish(journal, nodeId, "parked", detail);
+   return { ...base, status: "parked", detail };
+  }
   failNode(config, journal, nodeId, repo, detail);
   return { ...base, status: "failed", detail };
  }
@@ -673,86 +681,120 @@ async function runResearch(
  });
  journal.updateWorker(nodeId, { worktree, lane: "research" });
 
- const prompt = assembleResearchPrompt({
-  repo,
-  node: {
-   id: node.ref.id,
-   title: node.node.title,
-   body: node.body ?? "",
-   kind: node.node.kind,
-   autonomy: node.node.autonomy,
-   checkpointId: node.node.checkpointId,
-   url: node.url,
-  },
-  map: { title: rootNode.node.title, body: rootNode.body ?? "" },
-  branch,
-  worktree,
-  botIdentity,
- });
+ const github = ctx.github ?? githubApi;
+ const recorded = journal.getWorker(nodeId)?.prNumber ?? null;
+ const existingPr = recorded === null
+  ? await github.findPrByHead(repo, branch, token)
+  : await github.getPr(repo, recorded, token);
+ let sha: string;
 
- const wallClockMs =
-  (ctx.wallClockMin ?? config.workers.wallClockMin) * 60_000;
- const workerCmd = ctx.workerCommand ?? defaultWorkerCommand();
- const workerRun =
-  ctx.worker ??
-  (async (p: string, opts: RunOptions) =>
-   runCmd(workerCmd[0], [...workerCmd.slice(1), p], opts));
-
- const snapshot = gitConfigSnapshot(canonical);
- fence("spawn the worker");
- const workerResult = await workerRun(prompt, {
-  cwd: worktree,
-  timeoutMs: wallClockMs,
-  env: workerEnv(config, repo),
-  processGroup: true,
-  onSpawn: (pgid) => journal.updateWorker(nodeId, { workerPgid: pgid }),
- });
- journal.updateWorker(nodeId, { workerPgid: null });
- const log = saveWorkerLog(journal.path, repo, nodeId, generation, "research pass", workerResult);
-
- if (workerResult.code !== 0) {
-  const detail = `worker exited ${workerResult.code}: ${workerResult.stderr.trim() || workerResult.stdout.trim().slice(0, 500)} (worker log: ${log})`;
-  journal.recordEvent("refused", { nodeId, repo, detail });
-  failNode(config, journal, nodeId, repo, detail);
-  return { ...base, status: "failed", detail, workerExit: workerResult.code };
- }
-
- // Research SOP tail: findings must exist on the worktree.
- const findingsPath = join(worktree, "findings.md");
- if (!existsSync(findingsPath)) {
-  const detail = `worker succeeded but wrote no findings.md at ${findingsPath} — the close would be hollow, so ranger refuses to close. (worker log: ${log})`;
-  journal.recordEvent("refused", { nodeId, repo, detail });
-  failNode(config, journal, nodeId, repo, detail);
-  return { ...base, status: "failed", detail, workerExit: 0 };
- }
-
- journal.resetDeadman();
-
- // The VETTED PUSH (round-38 security blocker): the worker itself never sees
- // the machine write PAT — it COMMITS locally on the research branch but does
- // NOT push. The SUPERVISOR performs the single push of exactly the branch the
- // close gate probes, with hooks disabled and the git config checked against
- // the pre-worker snapshot (#23: the worker shares the canonical .git).
- try {
-  fence("push");
-  await vettedPush({
-   worktree,
-   canonical,
+ // A retry after the draft was opened resumes its CI/close tail, without
+ // asking a worker to recreate an existing findings branch.
+ if (existingPr === null) {
+  const prompt = assembleResearchPrompt({
+   repo,
+   node: {
+    id: node.ref.id,
+    title: node.node.title,
+    body: node.body ?? "",
+    kind: node.node.kind,
+    autonomy: node.node.autonomy,
+    checkpointId: node.node.checkpointId,
+    url: node.url,
+   },
+   map: { title: rootNode.node.title, body: rootNode.body ?? "" },
    branch,
-   token,
-   configSnapshot: snapshot,
-   source: `refs/heads/${branch}`,
+   worktree,
+   botIdentity,
   });
- } catch (error) {
-  if (error instanceof FencedError) throw error;
-  const detail = `research branch push failed (${branch}): ${error instanceof Error ? error.message : String(error)}`;
-  journal.recordEvent("refused", { nodeId, repo, detail });
-  failNode(config, journal, nodeId, repo, detail);
-  return { ...base, status: "failed", detail, workerExit: 0 };
- }
 
- const resolution = readFileSync(findingsPath, "utf8").trim();
- const resolutionFile = join(tmpdir(), `ranger-close-${nodeId}.md`);
+  const wallClockMs =
+   (ctx.wallClockMin ?? config.workers.wallClockMin) * 60_000;
+  const workerCmd = ctx.workerCommand ?? defaultWorkerCommand();
+  const workerRun =
+   ctx.worker ??
+   (async (p: string, opts: RunOptions) =>
+    runCmd(workerCmd[0], [...workerCmd.slice(1), p], opts));
+
+  const snapshot = gitConfigSnapshot(canonical);
+  fence("spawn the worker");
+  const workerResult = await workerRun(prompt, {
+   cwd: worktree,
+   timeoutMs: wallClockMs,
+   env: workerEnv(config, repo),
+   processGroup: true,
+   onSpawn: (pgid) => journal.updateWorker(nodeId, { workerPgid: pgid }),
+  });
+  journal.updateWorker(nodeId, { workerPgid: null });
+  const log = saveWorkerLog(journal.path, repo, nodeId, generation, "research pass", workerResult);
+
+  if (workerResult.code !== 0) {
+   const detail = `worker exited ${workerResult.code}: ${workerResult.stderr.trim() || workerResult.stdout.trim().slice(0, 500)} (worker log: ${log})`;
+   journal.recordEvent("refused", { nodeId, repo, detail });
+   failNode(config, journal, nodeId, repo, detail);
+   return { ...base, status: "failed", detail, workerExit: workerResult.code };
+  }
+
+  // Research SOP tail: findings must exist on the worktree.
+  const findingsPath = join(worktree, "findings.md");
+  if (!existsSync(findingsPath)) {
+   const detail = `worker succeeded but wrote no findings.md at ${findingsPath} — the close would be hollow, so ranger refuses to close. (worker log: ${log})`;
+   journal.recordEvent("refused", { nodeId, repo, detail });
+   failNode(config, journal, nodeId, repo, detail);
+   return { ...base, status: "failed", detail, workerExit: 0 };
+  }
+
+  journal.resetDeadman();
+
+  // The VETTED PUSH (round-38 security blocker): the worker itself never sees
+  // the machine write PAT — it COMMITS locally on the research branch but does
+  // NOT push. The SUPERVISOR performs the single push of exactly the branch the
+  // close gate probes, with hooks disabled and the git config checked against
+  // the pre-worker snapshot (#23: the worker shares the canonical .git).
+  try {
+   assertGitUntouched(canonical, snapshot);
+   const head = await safeGit(["rev-parse", "--verify", `refs/heads/${branch}^{commit}`], { cwd: canonical });
+   if (head.code !== 0 || !/^[0-9a-f]{40}$/.test(head.stdout.trim())) {
+    throw new GitSafetyError(`research findings branch ${branch} is missing from the canonical checkout`);
+   }
+   sha = head.stdout.trim();
+   fence("push");
+   await vettedPush({
+    worktree,
+    canonical,
+    branch,
+    token,
+    configSnapshot: snapshot,
+    source: sha,
+   });
+  } catch (error) {
+   if (error instanceof FencedError) throw error;
+   const detail = `research branch push failed (${branch}): ${error instanceof Error ? error.message : String(error)}`;
+   journal.recordEvent("refused", { nodeId, repo, detail });
+   failNode(config, journal, nodeId, repo, detail);
+   return { ...base, status: "failed", detail, workerExit: 0 };
+  }
+ } else {
+  const head = await safeGit(["rev-parse", "--verify", `refs/heads/${branch}^{commit}`], { cwd: canonical });
+  if (head.code !== 0 || !/^[0-9a-f]{40}$/.test(head.stdout.trim())) {
+   throw new ParkSignal(`research findings branch ${branch} is missing from the canonical checkout`);
+  }
+  sha = head.stdout.trim();
+ }
+ const findings = await safeGit(["show", `${sha}:findings.md`], { cwd: canonical });
+ if (findings.code !== 0 || findings.stdout.trim().length === 0) {
+  throw new ParkSignal(`research findings.md is missing or empty at ${sha}`);
+ }
+ const evidence = await researchCi({
+  repo, branch, base: map.base, sha, nodeId, token, pr: existingPr, github, fence,
+  recordPr: (pr) => {
+   journal.updateWorker(nodeId, { prNumber: pr.number });
+   journal.recordEvent("pr-opened", { nodeId, repo, detail: `research draft PR #${pr.number} ${pr.url}` });
+  },
+ });
+ journal.recordEvent("ci-passed", { nodeId, repo, detail: `research ${evidence.ci} (${evidence.check.name})` });
+ const resolution = `${findings.stdout.trim()}\n\nResearch CI evidence: draft ${evidence.pr.url}, check run ${evidence.ci}.`;
+ const resolutionFile = join(tmpdir(), `ranger-close-${repo.replace("/", "__")}-${nodeId}.md`);
  writeFileSync(resolutionFile, resolution, "utf8");
 
  // The close gate's ungated probes (git-ref-exists / artifact-exists) resolve
@@ -774,6 +816,7 @@ async function runResearch(
    resolutionFile,
    gist: gistFrom(resolution),
    checkpointId: node.node.checkpointId,
+   ci: evidence.ci,
   },
   { cwd: probeCwd, timeoutMs: GRAPH_CALL_TIMEOUT_MS },
  );
@@ -815,7 +858,7 @@ async function runResearch(
    ...base,
    status: "success",
    detail: close.detail.slice(0, 400),
-   workerExit: 0,
+   workerExit: existingPr === null ? 0 : null,
    close,
   };
  }
