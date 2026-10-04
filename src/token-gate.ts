@@ -228,3 +228,27 @@ function extractLogin(output: string): string {
     return "";
   }
 }
+
+/** A repo's read-only token, gated once per batch of reads. */
+export type TokenBatch = (repo: string) => Promise<ResolvedToken>;
+
+/**
+ * Run the gate once per repo and hand the validated token to every read in
+ * one batch; a refusal is shared the same way. Make a new batch per refresh
+ * or live read, never a long-lived one: the gate must see a token revoked
+ * or re-scoped since.
+ */
+export function tokenBatch(
+  config: RangerConfig,
+  gate: (config: RangerConfig, repo: string) => Promise<{ token: ResolvedToken }> = assertReadOnlyToken,
+): TokenBatch {
+  const gated = new Map<string, Promise<ResolvedToken>>();
+  return (repo) => {
+    let token = gated.get(repo);
+    if (token === undefined) {
+      token = gate(config, repo).then((r) => r.token);
+      gated.set(repo, token);
+    }
+    return token;
+  };
+}

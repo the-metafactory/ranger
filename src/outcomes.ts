@@ -64,3 +64,18 @@ export const PROBES_FAILED_OUTCOME = /^browser probes failed twice\b/;
 
 /** A session or review that stopped on its substrate's limit (node #45). */
 export const SUBSTRATE_CAPPED_OUTCOME = /\bhit its rate limit\b/;
+
+/** The sweep parked a row whose worker crashed `attempts` times. */
+export function crashParkOutcome(r: { attempts: number; released: boolean; assignees: string[] }): string {
+ return `parked after ${r.attempts} crash(es); release ${r.released ? "ok" : `refused: ${r.assignees.join(",") || "unclaimed"}`}`;
+}
+
+/** A crash park names no failure of its own: the cause is in the last attempt's events. */
+export const CRASH_PARK_OUTCOME = /^parked after \d+ crash\(es\); release /;
+
+/** The sweep's event when it respawns a crashed worker: a new attempt begins. */
+export function respawnedEvent(attempt: number): string {
+ return `respawned (attempt ${attempt})`;
+}
+
+export const RESPAWNED_EVENT = /^respawned \(attempt \d+\)$/;

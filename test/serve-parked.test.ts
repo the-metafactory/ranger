@@ -4,7 +4,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RangerConfig } from "../src/config.ts";
 import { Journal, type EventRow, type WorkerRow } from "../src/journal.ts";
-import { parseFailedProbes, probesFailedOutcome, reviewCapHeadMovedOutcome, reviewCapOutcome } from "../src/outcomes.ts";
+import {
+ CRASH_PARK_OUTCOME,
+ crashParkOutcome,
+ parseFailedProbes,
+ probesFailedOutcome,
+ RESPAWNED_EVENT,
+ respawnedEvent,
+ reviewCapHeadMovedOutcome,
+ reviewCapOutcome,
+} from "../src/outcomes.ts";
 import { assembleState, createHandler, DETAIL_CONCURRENCY, renderPage, ServeReader, servedMaps, stateFromJournal, type StateInputs } from "../src/serve.ts";
 import {
  type ActionRunner,
@@ -145,6 +154,9 @@ describe("node #54 — the reason class, by ranger's own rules", () => {
   const reason = classifyReason(ROW_684, EVENTS_684, null, 5);
   expect(reason.class).toBe("probes failed");
   expect(reason.probes).toEqual(["probe-bounty.mjs", "probe-hold.mjs", "probe-sky.mjs"]);
+  // The retry's selection is not shown as the final run's failures.
+  expect(reason.detail).not.toMatch(/^failed:/);
+  expect(reason.detail).toMatch(/the first run failed .*the retry's own failures are not recorded/);
  });
 
  test("needs-eye: an awaiting-merge row with the label", () => {
@@ -174,6 +186,41 @@ describe("node #54 — the reason class, by ranger's own rules", () => {
   // A transient error before the row was last put in motion says nothing now.
   const older = [events[0], ev("claimed", "claimed"), events[1]];
   expect(classifyReason(r, older, null, 5).class).toBe("other");
+ });
+
+ test("transient: an earlier attempt's error does not hide a permanent failure after the respawn", () => {
+  const r = row({ nodeId: "663", status: "failed", outcome: "worker exited 1: TypeError: x is undefined\nstack" });
+  const events = [
+   ev("failed", "worker exited 1"),
+   ev("worker-start", "implement lane resumes at phase review"),
+   ev("sweep", respawnedEvent(2)),
+   ev("transient", "GitHub-side transient error, left for the sweep to respawn (not counted): HTTP 502"),
+   ev("worker-start", "implement lane starts"),
+   ev("claimed", "claimed"),
+  ];
+  expect(classifyReason(r, events, null, 5)).toEqual({ class: "worker failed", detail: "worker exited 1: TypeError: x is undefined" });
+ });
+
+ test("transient: a crash park counts only its last attempt's transient error", () => {
+  const r = row({ nodeId: "663", outcome: crashParkOutcome({ attempts: 2, released: false, assignees: ["ivy-agent"] }) });
+  const events = [
+   ev("parked", "crashed 2 times — parking; releasing the claim"),
+   ev("worker-start", "implement lane resumes at phase review"),
+   ev("sweep", respawnedEvent(2)),
+   ev("transient", "GitHub-side transient error, left for the sweep to respawn (not counted): HTTP 502"),
+   ev("claimed", "claimed"),
+  ];
+  expect(classifyReason(r, events, null, 5).class).toBe("other");
+  // "respawn waits" and "respawn refused" start no new attempt.
+  const waited = [events[0], ev("sweep", "respawn waits for the visual implement lane (held by #1)"), events[3], events[4]];
+  expect(classifyReason(r, waited, null, 5).class).toBe("transient");
+ });
+
+ test("the sweep's builders and the classifier agree on the crash-park and respawn words", () => {
+  expect(CRASH_PARK_OUTCOME.test(crashParkOutcome({ attempts: 2, released: true, assignees: [] }))).toBe(true);
+  expect(CRASH_PARK_OUTCOME.test(crashParkOutcome({ attempts: 3, released: false, assignees: [] }))).toBe(true);
+  expect(RESPAWNED_EVENT.test(respawnedEvent(4))).toBe(true);
+  expect(RESPAWNED_EVENT.test("respawn refused (spawn cap or no respawn hook) — claim kept for the next tick")).toBe(false);
  });
 
  test("substrate capped", () => {
@@ -317,11 +364,15 @@ describe("node #54 — the entries", () => {
   expect(why(greenPr({ merged: true }))).toMatch(/merged/);
  });
 
- test("the session opens in the worktree, else the map's checkout, else not at all", () => {
-  const cwd = (exists: (p: string) => boolean) => needsYouEntries(entryInputs({ exists }))[0].actions.session;
-  expect(cwd(() => true)).toEqual({ offered: true, cwd: ROW_663.worktree as string });
-  expect(cwd((p) => p === MAP.localCheckout)).toEqual({ offered: true, cwd: MAP.localCheckout });
-  expect(cwd(() => false).offered).toBe(false);
+ test("the session opens only in the principal's checkout, never the worker's worktree", () => {
+  const session = (exists: (p: string) => boolean, maps: NeedsYouInputs["maps"] = [MAP]) =>
+   needsYouEntries(entryInputs({ exists, maps }))[0].actions.session;
+  // The worktree exists and is still not chosen: it is the machine-account clone's.
+  expect(session(() => true)).toEqual({ offered: true, cwd: MAP.localCheckout });
+  expect(session((p) => p === ROW_663.worktree)).toEqual({ offered: false, why: `${MAP.localCheckout} does not exist` });
+  const noCheckout = session(() => true, [{ ...MAP, localCheckout: undefined }]);
+  expect(noCheckout.offered).toBe(false);
+  expect(noCheckout.offered ? "" : noCheckout.why).toMatch(/no localCheckout/);
  });
 });
 
@@ -634,6 +685,38 @@ describe("node #54 — the journal feeds the section, with no GitHub call from a
   });
   expect(needsYouEntries(inputs)).toEqual([]);
   expect(uncheckedNeedsEye(inputs)).toEqual([`${SEELITE}#433`]);
+ });
+
+ test("the refresh reads details even when the frontier read fails", async () => {
+  const config = {
+   auth: { readOnlyTokens: {} },
+   budget: { graphqlFloor: 1000, rateLimitCooldownMin: 10 },
+   bot: { identity: "bot" },
+   state: { journalPath: "/nonexistent" },
+  } as unknown as RangerConfig;
+  const maps = [{ key: `${SEELITE}#1`, repo: SEELITE, root: 1, walk: "none" as const, lane: "headless" as const, servedOnly: true }];
+  const reads: string[] = [];
+  const reader = new ServeReader(config, maps, "/nonexistent", {
+   issue: async (_repo, id) => {
+    reads.push(id);
+    return { title: "t", labels: ["ranger:needs-eye"] };
+   },
+   pr: async () => greenPr(),
+  });
+  reader.wantDetails([`${SEELITE}#433`], [`${SEELITE}#687`]);
+  // Read once, so nothing is left untried: only the timer's full refresh reads again.
+  await reader.refreshDetails(true);
+  expect(reads).toEqual(["433"]);
+  reader.refresh();
+  // The in-flight full read, when the refresh started one; else an untried-only read of nothing.
+  await reader.refreshDetails();
+  for (let i = 0; i < 50 && reader.refreshing; i++) await new Promise((r) => setTimeout(r, 1));
+  // No read-only token for the map: the frontier read is refused...
+  expect(reader.lastError).toMatch(/no read-only token mapping/);
+  // ...and the labels are read again all the same.
+  expect(reads).toEqual(["433", "433"]);
+  expect(reader.labels.get(`${SEELITE}#433`)).toEqual(["ranger:needs-eye"]);
+  expect(reader.prs.has(`${SEELITE}#687`)).toBe(true);
  });
 
  test("details for nodes no row wants any more are dropped", async () => {

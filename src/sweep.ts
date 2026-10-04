@@ -10,6 +10,7 @@ import {
  watchedByMergeDesk,
  type MergeDeskResult,
 } from "./merge-desk.ts";
+import { crashParkOutcome, respawnedEvent } from "./outcomes.ts";
 
 /**
  * Sweep (design §7) — reconcile the journal against reality, crash = no-op.
@@ -126,7 +127,7 @@ export async function sweepMap(ctx: SweepContext): Promise<SweepMapResult> {
     journal.updateWorker(worker.nodeId, repo, { pid });
     if (startsImplementSession(worker)) recordImplementStart(journal, map);
     result.respawned.push(worker.nodeId);
-    journal.recordEvent("sweep", { nodeId: worker.nodeId, repo, detail: `respawned (attempt ${attempt})` });
+    journal.recordEvent("sweep", { nodeId: worker.nodeId, repo, detail: respawnedEvent(attempt) });
    } else {
     journal.recordEvent("sweep", {
      nodeId: worker.nodeId,
@@ -149,7 +150,7 @@ export async function sweepMap(ctx: SweepContext): Promise<SweepMapResult> {
     status: released.released ? "released" : "parked",
     attempts: worker.attempts,
     finishedAt: new Date().toISOString(),
-    outcome: `parked after ${config.workers.maxAttempts} crash(es); release ${released.released ? "ok" : `refused: ${released.assignees.join(",") || "unclaimed"}`}`,
+    outcome: crashParkOutcome({ attempts: config.workers.maxAttempts, released: released.released, assignees: released.assignees }),
    });
    if (released.released) {
     result.released.push(worker.nodeId);

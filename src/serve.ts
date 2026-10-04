@@ -64,7 +64,7 @@ import {
  readingAgeMin,
  type SubstrateConfig,
 } from "./substrate-policy.ts";
-import { assertReadOnlyToken, gatedEnv } from "./token-gate.ts";
+import { gatedEnv, tokenBatch, type TokenBatch } from "./token-gate.ts";
 import { childEnv, itermArgv, shellQuote } from "./launch.ts";
 import {
  type ActionKind,
@@ -819,9 +819,22 @@ function renderGrill(s) {
  }
 }
 const short = (sha) => (sha || "").slice(0, 8);
+function prLifecycle(v) {
+ if (v.merged) return "merged";
+ if (v.state === "closed") return "closed";
+ return v.draft ? "draft" : "ready";
+}
+function prFacts(pr) {
+ const v = pr.view;
+ const parts = ["PR #" + pr.number];
+ if (v) parts.push(prLifecycle(v), "head " + short(v.headSha), "CI " + v.ci);
+ if (pr.error) parts.push(v ? "stale, read " + ago(v.readAt) + "; the last refresh failed: " + pr.error : "the read failed: " + pr.error);
+ else if (!v) parts.push("not read yet");
+ return parts.join(" · ");
+}
 function needsFacts(n) {
  const facts = [n.repo + " · map #" + n.root, n.status, "ended " + ago(n.endedAt)];
- if (n.pr) { const v = n.pr.view; facts.push("PR #" + n.pr.number + (v ? " · " + (v.merged ? "merged" : v.state === "closed" ? "closed" : v.draft ? "draft" : "ready") + " · head " + short(v.headSha) + " · CI " + v.ci : "") + (n.pr.error ? (v ? " · stale, read " + ago(v.readAt) + "; the last refresh failed: " : " · the read failed: ") + n.pr.error : v ? "" : " · not read yet")); }
+ if (n.pr) facts.push(prFacts(n.pr));
  if (n.sage) facts.push("sage round " + n.sage.round + (n.sageOnHead === false ? " (an earlier head, " + short(n.sage.sha) + "; the current head is unreviewed)" : "") + ": " + n.sage.blockers + " blocker(s), " + n.sage.majors + " major(s)");
  if (n.probe) facts.push("probes " + (n.probe.passed ? "passed" : "FAILED") + " at " + short(n.probe.sha));
  return facts.join(" · ");
@@ -920,7 +933,10 @@ load(); setInterval(load, 15000);
  *   token and `/rate_limit` (free) shows the allowance above
  *   `budget.graphqlFloor`; a refusal backs off in memory, doubling to an hour;
  * - the titles of in-flight nodes and the launch check use REST
- *   (`/repos/{repo}/issues/{id}`), a separate bucket from GraphQL.
+ *   (`/repos/{repo}/issues/{id}`), a separate bucket from GraphQL;
+ * - the "Needs you" issues and PRs (node #54) are REST too, read on every
+ *   refresh whatever the frontier's backoff, with the read-only gate run once
+ *   per repo per batch (`tokenBatch`).
  */
 export class ServeReader {
  extra = new Map<string, MapRead>();
@@ -952,8 +968,8 @@ export class ServeReader {
   details?: DetailReader,
  ) {
   this.details = details ?? {
-   issue: (repo, id) => readIssue(config, repo, id),
-   pr: (repo, n) => readPrLive(config, repo, n),
+   issue: (repo, id, tokens) => readIssue(config, repo, id, tokens),
+   pr: (repo, n, tokens) => readPrLive(config, repo, n, tokens),
   };
  }
 
@@ -1018,6 +1034,8 @@ export class ServeReader {
 
  private async readDetails(all: boolean): Promise<void> {
   const keys = all ? { issues: [...this.detailIssues], prs: [...this.detailPrs] } : this.unread();
+  // One gate per repo for the whole batch, not two REST calls before every read.
+  const tokens = tokenBatch(this.config);
   const attempt = async (key: string, read: () => Promise<void>, unknown?: () => void): Promise<void> => {
    this.detailTried.add(key);
    try {
@@ -1034,7 +1052,7 @@ export class ServeReader {
    ...keys.issues.map((key) => () =>
     attempt(`issue:${key}`, async () => {
      const [repo, id] = key.split("#");
-     const issue = await this.details.issue(repo, id);
+     const issue = await this.details.issue(repo, id, tokens);
      if (issue === null) throw new Error("could not read the issue");
      this.labels.set(key, issue.labels);
      this.titles.set(key, issue.title);
@@ -1046,7 +1064,7 @@ export class ServeReader {
    ...keys.prs.map((key) => () =>
     attempt(`pr:${key}`, async () => {
      const [repo, n] = key.split("#");
-     const pr = await this.details.pr(repo, Number(n));
+     const pr = await this.details.pr(repo, Number(n), tokens);
      if (pr === null) throw new Error("could not read the PR");
      this.prs.set(key, pr);
     }),
@@ -1065,6 +1083,10 @@ export class ServeReader {
  }
 
  refresh(): void {
+  // "Needs you" reads REST, apart from the frontier: a GraphQL backoff, a
+  // deferral or a failed frontier read must not leave labels unknown and PR
+  // reads stale until it clears.
+  void this.refreshDetails(true);
   if (this.refreshing) return;
   this.refreshing = true;
   this.run()
@@ -1085,6 +1107,7 @@ export class ServeReader {
    throw new Error(`backing off GitHub until ${new Date(this.backoffUntil).toISOString()}`);
   }
   const registry = loadProbeRegistry();
+  const tokens = tokenBatch(this.config);
   for (const map of this.maps.filter((m) => m.servedOnly)) {
    const prev = this.extra.get(map.key);
    const keep = (error: string): void => {
@@ -1096,7 +1119,7 @@ export class ServeReader {
      error,
     });
    };
-   const { token } = await assertReadOnlyToken(this.config, map.repo);
+   const token = await tokens(map.repo);
    const journal = Journal.openReadOnly(this.journalPath);
    const cooling = journal === null ? null : activeCooldown(journal, token.source, now);
    journal?.close();
@@ -1134,11 +1157,10 @@ export class ServeReader {
   }
   for (const key of [...this.wantedTitles]) {
    const [repo, id] = key.split("#");
-   const issue = await readIssue(this.config, repo, id);
+   const issue = await readIssue(this.config, repo, id, tokens);
    if (issue !== null) this.titles.set(key, issue.title);
    this.wantedTitles.delete(key);
   }
-  await this.refreshDetails(true);
  }
 }
 
@@ -1147,8 +1169,8 @@ export const DETAIL_CONCURRENCY = 4;
 
 /** The REST reads behind "Needs you"; injected so no test runs `gh`. */
 export interface DetailReader {
- issue: (repo: string, id: string) => Promise<Pick<IssueRead, "title" | "labels"> | null>;
- pr: (repo: string, pr: number) => Promise<PrView | null>;
+ issue: (repo: string, id: string, tokens: TokenBatch) => Promise<Pick<IssueRead, "title" | "labels"> | null>;
+ pr: (repo: string, pr: number, tokens: TokenBatch) => Promise<PrView | null>;
 }
 
 interface IssueRead {
@@ -1160,8 +1182,8 @@ interface IssueRead {
 }
 
 /** One `gh api` GET under the read-only gate; null on any failure. */
-async function restRead(config: RangerConfig, repo: string, path: string, flags: string[] = []): Promise<unknown> {
- const { token } = await assertReadOnlyToken(config, repo);
+async function restRead(tokens: TokenBatch, repo: string, path: string, flags: string[] = []): Promise<unknown> {
+ const token = await tokens(repo);
  const gated = gatedEnv(token.token);
  try {
   const result = await runCmd("gh", ["api", path, ...flags], { env: gated.env, timeoutMs: 15_000 });
@@ -1176,21 +1198,25 @@ async function restRead(config: RangerConfig, repo: string, path: string, flags:
  }
 }
 
-/** A PR and the CI state of its head, over REST under the read-only gate. */
+/**
+ * A PR and the CI state of its head, over REST under the read-only gate: run
+ * once for both reads, or once for a whole refresh batch when `tokens` is given.
+ */
 export async function readPrLive(
  config: RangerConfig,
  repo: string,
  number: number,
+ tokens: TokenBatch = tokenBatch(config),
 ): Promise<PrView | null> {
  if (!REPO_PATTERN.test(repo) || !Number.isInteger(number) || number <= 0) return null;
- const raw = (await restRead(config, repo, `repos/${repo}/pulls/${number}`)) as Record<string, unknown> | null;
+ const raw = (await restRead(tokens, repo, `repos/${repo}/pulls/${number}`)) as Record<string, unknown> | null;
  if (raw === null) return null;
  const head = (raw.head ?? {}) as { sha?: unknown };
  const headSha = typeof head.sha === "string" ? head.sha : "";
  // Every page: a failure on page two must not read as green.
  const checks = /^[0-9a-f]{40}$/.test(headSha)
   ? checkRunsFromPages(
-     await restRead(config, repo, `repos/${repo}/commits/${headSha}/check-runs?filter=latest&per_page=100`, [
+     await restRead(tokens, repo, `repos/${repo}/commits/${headSha}/check-runs?filter=latest&per_page=100`, [
       "--paginate",
       "--slurp",
      ]),
@@ -1214,9 +1240,10 @@ async function readIssue(
  config: RangerConfig,
  repo: string,
  id: string,
+ tokens: TokenBatch = tokenBatch(config),
 ): Promise<IssueRead | null> {
  if (!REPO_PATTERN.test(repo) || !ID_PATTERN.test(id)) return null;
- const { token } = await assertReadOnlyToken(config, repo);
+ const token = await tokens(repo);
  const gated = gatedEnv(token.token);
  try {
   const result = await runCmd("gh", ["api", `repos/${repo}/issues/${id}`], {

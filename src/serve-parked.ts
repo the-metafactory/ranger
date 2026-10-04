@@ -13,8 +13,8 @@
  * `gh` with the machine account's token and config dropped, so gh uses the
  * login stored under this user's HOME (the principal's, on the principal's
  * machine; nothing here checks which account that is), and a session opens
- * iTerm2 the way the
- * grilling button does. Every action is re-checked against the journal as it
+ * iTerm2 the way the grilling button does, in the map's `localCheckout` only:
+ * the worker's worktree belongs to the machine-account clone. Every action is re-checked against the journal as it
  * reads when the request arrives, and the spawner is injected so no test runs
  * `gh`, `osascript` or ranger.
  */
@@ -23,11 +23,13 @@ import { REPO_PATTERN } from "./config.ts";
 import type { EventRow, WorkerRow } from "./journal.ts";
 import { childEnv, itermArgv, shellQuote } from "./launch.ts";
 import {
+ CRASH_PARK_OUTCOME,
  NEEDS_EYE_LABEL,
  parseFailedProbes,
  PROBE_FILE,
  PROBES_FAILED_OUTCOME,
  REVIEW_CAP_HEAD_MOVED_OUTCOME,
+ RESPAWNED_EVENT,
  REVIEW_CAP_OUTCOME,
  SUBSTRATE_CAPPED_OUTCOME,
 } from "./outcomes.ts";
@@ -51,7 +53,7 @@ export interface Reason {
  class: ReasonClass;
  /** One line, built here from ranger's own numbers. */
  detail: string;
- /** `probes failed`: the names the run's `FAILED:` line gave. */
+ /** `probes failed`: the names the run's `FAILED:` line gave, else the first run's retry selection. */
  probes?: string[];
 }
 
@@ -111,6 +113,16 @@ function sinceMotion(events: EventRow[]): EventRow[] {
  return out;
 }
 
+/**
+ * The events of the last attempt, newest first: up to the sweep's respawn of
+ * a crashed worker. An earlier attempt's transient error says nothing about
+ * how the last one ended.
+ */
+function lastAttempt(recent: EventRow[]): EventRow[] {
+ const cut = recent.findIndex((e) => e.kind === "sweep" && RESPAWNED_EVENT.test(e.detail ?? ""));
+ return cut === -1 ? recent : recent.slice(0, cut);
+}
+
 const firstLine = (text: string): string => text.split("\n")[0].trim();
 
 /**
@@ -155,23 +167,32 @@ export function classifyReason(
   };
  }
  if (PROBES_FAILED_OUTCOME.test(outcome) || /^merge gate failed \(probes\)/.test(outcome)) {
-  let probes = parseFailedProbes(outcome);
-  if (probes.length === 0) {
-   const retry = recent
-    .map((e) => (e.kind === "reviewed" ? PROBE_RETRY_EVENT.exec(e.detail ?? "") : null))
-    .find((m) => m !== null);
-   probes = retry?.[1].split(",").map((n) => n.trim()).filter((n) => PROBE_FILE.test(n)) ?? [];
-  }
+  const probes = parseFailedProbes(outcome);
+  if (probes.length > 0) return { class: "probes failed", detail: `failed: ${probes.join(", ")}`, probes };
+  // The outcome named none (a cut or a timed-out retry): the first run's
+  // failures are what the retry selected, not proof of how the retry ended.
+  const retry = recent
+   .map((e) => (e.kind === "reviewed" ? PROBE_RETRY_EVENT.exec(e.detail ?? "") : null))
+   .find((m) => m !== null);
+  const first = retry?.[1].split(",").map((n) => n.trim()).filter((n) => PROBE_FILE.test(n)) ?? [];
   return {
    class: "probes failed",
-   detail: probes.length > 0 ? `failed: ${probes.join(", ")}` : "the run named no failed probes",
-   probes,
+   detail:
+    first.length > 0
+     ? `the first run failed ${first.join(", ")}; the retry's own failures are not recorded`
+     : "the run named no failed probes",
+   probes: first,
   };
  }
  if (SUBSTRATE_CAPPED_OUTCOME.test(outcome)) {
   return { class: "substrate capped", detail: firstLine(outcome).slice(0, 200) };
  }
- if (isTransientGitHubError(outcome) || recent.some((e) => e.kind === "transient")) {
+ // An outcome that names its own failure is that failure. Only a crash park,
+ // which names none, takes its cause from the last attempt's events.
+ if (
+  isTransientGitHubError(outcome) ||
+  (CRASH_PARK_OUTCOME.test(outcome) && lastAttempt(recent).some((e) => e.kind === "transient"))
+ ) {
   return { class: "transient", detail: "a GitHub-side error, not the node's fault: resuming usually clears it" };
  }
  if (row.status === "failed") {
@@ -301,9 +322,10 @@ export function needsYouEntries(inputs: NeedsYouInputs): NeedsYouEntry[] {
   const view = row.prNumber === null ? null : inputs.prs(row.repo, row.prNumber);
   const sage = lastSageRound(events);
   const refused = row.prNumber === null ? "no PR" : mergeRefusal(view);
-  const cwd = [row.worktree, map.localCheckout].find(
-   (p): p is string => typeof p === "string" && p.length > 0 && inputs.exists(p),
-  );
+  // Only the principal's checkout, never the worker's worktree: that is a
+  // worktree of the machine-account clone, whose files and git hooks the
+  // worker controls (`servedMaps` refuses those clones for the same reason).
+  const cwd = map.localCheckout !== undefined && inputs.exists(map.localCheckout) ? map.localCheckout : undefined;
   out.push({
    key: map.key,
    repo: row.repo,
@@ -334,7 +356,13 @@ export function needsYouEntries(inputs: NeedsYouInputs): NeedsYouEntry[] {
       : { offered: false, why: refused ?? "no PR" },
     session:
      cwd === undefined
-      ? { offered: false, why: "neither the node's worktree nor the map's localCheckout exists" }
+      ? {
+         offered: false,
+         why:
+          map.localCheckout === undefined
+           ? "the map has no localCheckout (the worker's worktree is the machine account's, never a session's)"
+           : `${map.localCheckout} does not exist`,
+        }
       : { offered: true, cwd },
    },
   });
