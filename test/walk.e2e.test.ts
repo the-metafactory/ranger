@@ -26,13 +26,14 @@ import {
  GIT_ENV,
  bun,
  cliPath,
+ testCliEnv,
 } from "./support.ts";
 
 const fixturesBin = join(import.meta.dir, "fixtures", "bin");
 const dataDir = join(import.meta.dir, "fixtures", "data");
 
 function runCli(args: string[], env: NodeJS.ProcessEnv) {
- return runCmd(bun, ["--preload", join(import.meta.dir, "fixtures", "research-timing.ts"), cliPath, ...args], { env });
+ return runCmd(bun, ["--preload", join(import.meta.dir, "fixtures", "research-timing.ts"), cliPath, ...args], { env: testCliEnv(env) });
 }
 
 function writeConfig(dir: string, extra: string[] = []): string {

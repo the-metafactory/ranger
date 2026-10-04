@@ -40,6 +40,7 @@ import {
 import { selectForBuild } from "./substrate-policy.ts";
 import { resolveReadOnlyToken } from "./token-gate.ts";
 import { workerEnv } from "./worker-env.ts";
+import { sessionJournalPath } from "./journal-guard.ts";
 import { saveWorkerLog } from "./worker-log.ts";
 import { isTransientGitHubError } from "./transient.ts";
 import * as githubApi from "./github.ts";
@@ -104,6 +105,8 @@ export interface RunNodeContext {
  /** For tests: the quota readers (with an injected worker, reviewer or command and none injected, reads fail closed). */
  substrateReaders?: SubstrateReaders;
  viewsDependencies?: ImplementContext["viewsDependencies"];
+ /** For tests: the implement lane's repo-command runner (install/test/probe). */
+ shellRun?: ImplementContext["shellRun"];
 }
 
 /** The canonical checkout dir for a repo (design §4: probes run there). */
@@ -586,6 +589,10 @@ async function runImplementNode(
   branch,
   generation,
   ratify,
+  // One temp journal per run-node session (node #66): the worker and the
+  // repo commands share it, and it is never the live one.
+  sessionJournal: sessionJournalPath(),
+  shellRun: ctx.shellRun,
   github: ctx.github,
   reviewer: ctx.reviewer,
   viewsDependencies: ctx.viewsDependencies,
@@ -759,7 +766,7 @@ async function runResearch(
   const workerResult = await workerRun(prompt, {
    cwd: worktree,
    timeoutMs: wallClockMs,
-   env: workerEnv(config, repo),
+   env: workerEnv(config, repo, sessionJournalPath()),
    processGroup: true,
    onSpawn: (pgid) => journal.updateWorker(nodeId, repo, { workerPgid: pgid }),
   });

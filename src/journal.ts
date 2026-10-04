@@ -18,6 +18,7 @@ import {
 import type { RangerConfig } from "./config.ts";
 import { expandHome } from "./config.ts";
 import { holdsImplementLane, workerLane, type ImplementLane, type LaneMap } from "./lanes.ts";
+import { assertNotLiveJournalUnderTest } from "./journal-guard.ts";
 
 /**
  * Journal (design §8) — the typed data-access layer over the Drizzle schema.
@@ -179,6 +180,8 @@ export class Journal {
   private readonly maps: readonly LaneMap[] = [],
   legacyMapRoots: Readonly<Record<string, number>> = {},
  ) {
+  // Under test, the live journal is out of reach (node #66).
+  assertNotLiveJournalUnderTest(expandHome(path));
   this.path = path;
   const connection = opened ?? openDb(path, sqlite => seedLegacyRoots(sqlite, maps, legacyMapRoots));
   this.db = connection.db;

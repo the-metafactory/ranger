@@ -323,6 +323,30 @@ describe("implement lane (node #23)", () => {
   Object.assign(process.env, savedEnv);
  });
 
+ test("the worker session and the test command get one per-session temp journal, never the live one (node #66)", async () => {
+  const r = await rig({});
+  cleanup.push(r.dir);
+  const workerJournals: (string | undefined)[] = [];
+  const shellCalls: { command: string; journal: string | undefined }[] = [];
+  r.ctx.worker = async (prompt, opts) => {
+   workerJournals.push(opts.env?.RANGER_JOURNAL_PATH);
+   return runCmd(implementWorker, ["build", prompt], opts);
+  };
+  r.ctx.shellRun = (command, opts) => {
+   shellCalls.push({ command, journal: opts.env?.RANGER_JOURNAL_PATH });
+   return runCmd("/bin/sh", ["-c", command], opts);
+  };
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  expect(workerJournals).toHaveLength(1);
+  const session = workerJournals[0] as string;
+  expect(session.startsWith(tmpdir())).toBe(true);
+  expect(session).not.toBe(r.journal.path);
+  expect(session).not.toContain(join(".config", "ranger"));
+  const test = shellCalls.find((c) => c.command === "test -f src/feature.ts");
+  expect(test?.journal).toBe(session);
+  for (const call of shellCalls) expect(call.journal).toBe(session);
+ });
+
  test("two maps: gameplay prompt, merge recovery and decision projection stay on root 460", async () => {
   const r = await rig({ root: 460 });
   cleanup.push(r.dir);

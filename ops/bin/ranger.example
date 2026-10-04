@@ -1,0 +1,72 @@
+#!/bin/bash
+# ranger — token-injecting entrypoint for ranger's process tree (node #11).
+#
+# Versioned copy of ~/bin/ranger (install: copy, replace __USER__, chmod +x).
+#
+# Resolves every credential ranger needs from durable local stores (macOS
+# keychain + grove's bot.env), exports them into the process environment, then
+# execs the real CLI. Never any token inline in a file (gitleaks-clean on
+# push; ranger.yaml carries only env var NAMES).
+#
+# Tokens resolved here (design §2 identity model):
+#   GH_TOKEN                         — ivy-agent machine-account PAT (write path;
+#                                      the future walker refuses any graph-mutating
+#                                      tick under the principal's credential).
+#   RANGER_WRITE_GH_TOKEN_METAFACTORY / RANGER_WRITE_GH_TOKEN_PERSONAL — the
+#                                      walker's auth.writeTokens env names (node
+#                                      #18): one classic repo-scoped PAT covers
+#                                      both the-metafactory/* and jcfischer/*.
+#   RANGER_READONLY_GH_TOKEN_METAFACTORY — fine-grained read-only PAT for
+#   RANGER_READONLY_GH_TOKEN_PERSONAL    the-metafactory/* and jcfischer/*
+#                                      (node #8 read-only gate; no keyring fallback).
+#   RANGER_DISCORD_TOKEN             — reused grove Discord bot token (node #11
+#                                      reuse decision).
+#
+# Keychain entries are created by the principal (fine-grained PATs are GitHub
+# UI-only; the keychain is the durable store). See ranger.example.yaml.
+
+set -euo pipefail
+
+HOME="${HOME:-/Users/__USER__}"
+# The user's current Claude Code lives in ~/.local/bin. launchd's PATH starts
+# at /opt/homebrew/bin, whose global npm `claude` was 2.1.107: its
+# rate_limit_event carries no unifiedWindows, so every Claude quota read came
+# back empty and ranger never picked Claude (2026-10-04).
+export PATH="$HOME/.local/bin:$PATH"
+RANGER_CLI="$HOME/work/mf/ranger/src/cli.ts"
+BUN="${BUN:-/opt/homebrew/bin/bun}"
+RANGER_LOGS="${RANGER_LOGS:-$HOME/.config/ranger/logs}"
+mkdir -p "$RANGER_LOGS"
+
+resolve_keychain() { # svce -> token or ""
+  security find-generic-password -s "$1" -w 2>/dev/null || true
+}
+
+# Machine-account write PAT (ivy-agent). Service name: ivy-agent (classic
+# repo-scoped PAT, node #11). One token covers both walked orgs/personals, so
+# it fills GH_TOKEN (design §2 pins the process tree) and the two
+# auth.writeTokens env names the walker's resolveWriteToken reads (node #18).
+IVY_TOKEN="$(resolve_keychain ivy-agent)"
+export GH_TOKEN="${GH_TOKEN:-$IVY_TOKEN}"
+export RANGER_WRITE_GH_TOKEN_METAFACTORY="${RANGER_WRITE_GH_TOKEN_METAFACTORY:-$IVY_TOKEN}"
+export RANGER_WRITE_GH_TOKEN_PERSONAL="${RANGER_WRITE_GH_TOKEN_PERSONAL:-$IVY_TOKEN}"
+
+# Read-only fine-grained PATs (node #8 gate). Empty until provisioned; scout
+# then refuses both maps explicitly rather than falling back to the keyring.
+export RANGER_READONLY_GH_TOKEN_METAFACTORY="${RANGER_READONLY_GH_TOKEN_METAFACTORY:-$(resolve_keychain ranger-ro-metafactory)}"
+export RANGER_READONLY_GH_TOKEN_PERSONAL="${RANGER_READONLY_GH_TOKEN_PERSONAL:-$(resolve_keychain ranger-ro-personal)}"
+
+# Discord bot token — reuse the grove bot (node #11 decision).
+export RANGER_DISCORD_TOKEN="${RANGER_DISCORD_TOKEN:-$(grep -m1 '^DISCORD_BOT_TOKEN=' "$HOME/.config/grove/bot.env" 2>/dev/null | cut -d= -f2- || true)}"
+
+# Isolate gh from the write-capable keyring (the read-only gate's invariant).
+export GH_CONFIG_DIR="${GH_CONFIG_DIR:-$HOME/.config/ranger/gh-config}"
+mkdir -p "$GH_CONFIG_DIR"
+
+# The live journal is ~/.config/ranger/state.sqlite (state.journalPath).
+# RANGER_JOURNAL_PATH is the per-session temp journal the supervisor gives a
+# worker session (node #66); a live tick, run-node or serve started from inside
+# such a session must still open the live journal, so it never passes through.
+unset RANGER_JOURNAL_PATH
+
+exec "$BUN" "$RANGER_CLI" "$@"

@@ -2,3 +2,5 @@
 # Several e2e tests drive real git + subprocess fixtures and take longer than
 # bun's 5 s default on a loaded machine.
 timeout = 60000
+# Drops RANGER_JOURNAL_PATH from the test env (node #66, test/preload.ts).
+preload = ["./test/preload.ts"]

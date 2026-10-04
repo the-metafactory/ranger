@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { IMPLEMENT_LANES } from "./lanes.ts";
+import { defaultJournalPath, journalPathOverride } from "./journal-guard.ts";
 import { resolve } from "node:path";
 import { parse } from "yaml";
 import { z } from "zod";
@@ -195,8 +196,12 @@ const PrincipalSchema = z.object({
 const StateSchema = z.object({
  /** Migration-only: original roots for ambiguous or deregistered legacy repos; remove after cutover. */
  legacyMapRoots: z.record(z.string().regex(REPO_PATTERN), z.number().int().positive()).default({}),
- /** SQLite journal path (design §8). */
- journalPath: z.string().default("~/.config/ranger/state.sqlite"),
+ /**
+  * SQLite journal path (design §8): the live ~/.config/ranger/state.sqlite,
+  * except under test, where an unset path is a fresh temp file (node #66).
+  * RANGER_JOURNAL_PATH overrides it (see loadConfig).
+  */
+ journalPath: z.string().default(() => defaultJournalPath()),
  /** Root under which each walked repo's canonical checkout lives. */
  canonicalRoot: z.string().default("~/work/ranger-repos"),
 });
@@ -311,7 +316,13 @@ export function expandHome(path: string): string {
  return path;
 }
 
-export function loadConfig(path: string): LoadedConfig {
+/**
+ * Load and validate ranger.yaml. `RANGER_JOURNAL_PATH` in `env` overrides
+ * `state.journalPath` (node #66): the supervisor sets it for worker sessions,
+ * so branch code they run opens a per-session temp journal, never the live
+ * one. The live processes never set it, and ranger's wrapper unsets it.
+ */
+export function loadConfig(path: string, env: NodeJS.ProcessEnv = process.env): LoadedConfig {
  let raw: string;
  try {
   raw = readFileSync(path, "utf8");
@@ -334,6 +345,8 @@ export function loadConfig(path: string): LoadedConfig {
    `invalid config at ${path}: ${formatZodError(parsed.error)}`,
   );
  }
+ const override = journalPathOverride(env);
+ if (override !== undefined) parsed.data.state.journalPath = override;
  return { config: parsed.data, path };
 }
 

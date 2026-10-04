@@ -1438,6 +1438,9 @@ export function startServe(opts: {
  const serve = serveConfig(opts.config);
  const port = opts.port ?? serve.port;
  const token = randomBytes(24).toString("hex");
+ // A journal migrated by code this ranger isn't running stops serve at launch
+ // with that error, rather than a dashboard that half-works (node #66).
+ Journal.openReadOnly(expandHome(opts.config.state.journalPath), opts.config.maps)?.close();
  const maps = servedMaps(opts.config);
  const reader = new ServeReader(
   opts.config,
