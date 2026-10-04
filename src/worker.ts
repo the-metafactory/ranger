@@ -101,6 +101,7 @@ export interface RunNodeContext {
  substrate?: SubstrateName;
  /** For tests: the quota readers (with an injected worker, reviewer or command and none injected, reads fail closed). */
  substrateReaders?: SubstrateReaders;
+ viewsDependencies?: ImplementContext["viewsDependencies"];
 }
 
 /** The canonical checkout dir for a repo (design §4: probes run there). */
@@ -578,6 +579,7 @@ async function runImplementNode(
   ratify,
   github: ctx.github,
   reviewer: ctx.reviewer,
+  viewsDependencies: ctx.viewsDependencies,
   substrateReaders: resolveReaders(ctx),
  };
  const capped = new Set<SubstrateName>();

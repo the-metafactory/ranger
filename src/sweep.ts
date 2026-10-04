@@ -37,7 +37,7 @@ export interface SweepContext {
  respawn?: (nodeId: string, repo: string, root: number) => Promise<number | null>;
  /** Merge-desk seams (tests): the forge and the Discord post. */
  github?: GitHubPort;
- post?: (content: string, label: string) => Promise<string>;
+ post?: import("./merge-desk.ts").MergeDeskContext["post"];
 }
 
 export interface SweepMapResult {

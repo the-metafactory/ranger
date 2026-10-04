@@ -7,8 +7,8 @@
  * import graph must stay free of graph writes (`test/serve.test.ts`).
  */
 
-/** A node that needs the principal's eye (or ear): its PR is merged by hand, never by ranger. */
-export const NEEDS_EYE_LABEL = "ranger:needs-eye";
+/** Defined once in labels.ts; re-exported for the outcome texts that name it. */
+export { NEEDS_EYE_LABEL } from "./labels.ts";
 
 /** A probe file name as the runner prints it: no path, no shell metacharacters. */
 export const PROBE_FILE = /^[\w.-]+\.m?js$/;

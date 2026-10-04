@@ -1,6 +1,6 @@
 import { mapKey } from "./maps.ts";
 import type { RangerMapConfig } from "./config.ts";
-import { resolveDiscordApiBase } from "./discord.ts";
+import { EscalationDiscord, resolveDiscordApiBase, type DiscordFile } from "./discord.ts";
 
 /**
  * Claim-announce, fail-closed (design §5, node #7).
@@ -44,11 +44,15 @@ export interface Announcer {
  * `discord.tokenEnv` env var name; unset token → fail-closed throw.
  */
 export class DiscordAnnouncer implements Announcer {
+ private readonly discord: EscalationDiscord;
  constructor(
-  private readonly token: string,
-  private readonly channelId: string,
-  private readonly apiBase: string = resolveDiscordApiBase(),
- ) {}
+  token: string,
+  channelId: string,
+  apiBase: string = resolveDiscordApiBase(),
+  fetchFn: typeof fetch = fetch,
+ ) {
+  this.discord = new EscalationDiscord(token, channelId, apiBase, undefined, undefined, fetchFn);
+ }
 
  static fromMap(
   map: RangerMapConfig,
@@ -82,58 +86,19 @@ export class DiscordAnnouncer implements Announcer {
   * Post one message to the map's channel and return its id, or throw. The
   * claim announce and the implement lane's merge cards (#23) share it.
   */
- async post(content: string, label: string): Promise<string> {
-  // A hung announce must not hold the scheduled tick — the fetch is
-  // abort-bounded (round-35: the claim-announce was the last unbounded
-  // Discord surface). The announcer is fail-closed: a timeout aborts the
-  // claim, which is the safe side.
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 30_000);
-  let response: Response;
+ async post(content: string, label: string, files: readonly DiscordFile[] = [], embeds: readonly { description: string }[] = []): Promise<string> {
   try {
-   response = await fetch(
-    `${this.apiBase}/channels/${this.channelId}/messages`,
-    {
-     method: "POST",
-     headers: {
-      Authorization: `Bot ${this.token}`,
-      "Content-Type": "application/json",
-     },
-     body: JSON.stringify({
-      content,
-      // parse: [] suppresses untrusted @everyone/@here/role mentions — a
-      // frontier node titled `@everyone` must not ping the channel when
-      // claimed (review fix, mirrors the escalation client).
-      allowed_mentions: { parse: [] },
-     }),
-     signal: controller.signal,
-    },
-   );
+   // Bounded at 30 s through the body read (round-35/38), and fail-closed:
+   // a 429 is resent, but a 5xx is not, since Discord may already have
+   // created the message and a resend would announce the claim twice.
+   return await this.discord.post(content, Date.now() + 30_000, files, embeds, {
+    retryServerErrors: false,
+   });
   } catch (error) {
    throw new AnnounceError(
-    `${label} failed: ${error instanceof Error ? error.message : String(error)}`,
+    `${label} failed: ${error instanceof Error ? error.message : String(error)} — fail-closed.`,
    );
   }
-  if (!response.ok) {
-   clearTimeout(timer);
-   throw new AnnounceError(
-    `${label} returned HTTP ${response.status} — fail-closed.`,
-   );
-  }
-  // The abort timer stays alive through the BODY read (round-38 blocker): a
-  // server that sends headers then stalls its body must not run unbounded.
-  let body: { id?: string };
-  try {
-   body = (await response.json()) as { id?: string };
-  } finally {
-   clearTimeout(timer);
-  }
-  if (typeof body.id !== "string" || body.id.length === 0) {
-   throw new AnnounceError(
-    `${label} returned no message id — fail-closed.`,
-   );
-  }
-  return body.id;
  }
 }
 
