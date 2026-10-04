@@ -14,6 +14,7 @@ import {
  createHandler,
  launchPlan,
  type MapRead,
+ renderPage,
  ServeReader,
  stateFromJournal,
  type ServeMap,
@@ -143,6 +144,13 @@ describe("#37 — the state the dashboard shows", () => {
   const tick = selectCandidates(frontier, false);
   const tickFirst = [...tick.implement, ...tick.research][0];
   expect(assembleState(inputs()).maps[0].next.nodeId).toBe(tickFirst.id);
+ });
+
+ test("the page's inline script parses (string-built client code has no compile step)", () => {
+  const page = renderPage("tok");
+  const body = page.slice(page.indexOf("<script>") + "<script>".length, page.indexOf("</script>"));
+  expect(body.length).toBeGreaterThan(0);
+  expect(() => new Function(body)).not.toThrow();
  });
 
  test("serve imports no graph write, directly or through another module", () => {

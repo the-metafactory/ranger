@@ -821,7 +821,7 @@ function renderGrill(s) {
 const short = (sha) => (sha || "").slice(0, 8);
 function needsFacts(n) {
  const facts = [n.repo + " · map #" + n.root, n.status, "ended " + ago(n.endedAt)];
- if (n.pr) { const v = n.pr.view; facts.push("PR #" + n.pr.number + (v ? " · " + (v.merged ? "merged" : v.state === "closed" ? "closed" : v.draft ? "draft" : "ready") + " · head " + short(v.headSha) + " · CI " + v.ci : "") + (n.pr.error ? (v ? " · stale: the last refresh failed: " : " · the read failed: ") + n.pr.error : v ? "" : " · not read yet")); }
+ if (n.pr) { const v = n.pr.view; facts.push("PR #" + n.pr.number + (v ? " · " + (v.merged ? "merged" : v.state === "closed" ? "closed" : v.draft ? "draft" : "ready") + " · head " + short(v.headSha) + " · CI " + v.ci : "") + (n.pr.error ? (v ? " · stale, read " + ago(v.readAt) + "; the last refresh failed: " : " · the read failed: ") + n.pr.error : v ? "" : " · not read yet")); }
  if (n.sage) facts.push("sage round " + n.sage.round + (n.sageOnHead === false ? " (an earlier head, " + short(n.sage.sha) + "; the current head is unreviewed)" : "") + ": " + n.sage.blockers + " blocker(s), " + n.sage.majors + " major(s)");
  if (n.probe) facts.push("probes " + (n.probe.passed ? "passed" : "FAILED") + " at " + short(n.probe.sha));
  return facts.join(" · ");
@@ -853,8 +853,8 @@ function needsCard(n) {
   acts.append(el("label", {}, force, document.createTextNode(" run beside the lane holder")));
  }
  const merge = n.actions.merge;
- acts.append(actionButton("Merge", merge.offered ? "gh pr merge --squash, pinned to " + short(merge.headSha) + ", under the gh login stored in your HOME (machine-account tokens stripped; the account is not checked)" : merge.why, merge.offered, async () => {
-  if (!confirm("Squash-merge PR #" + n.pr.number + " on " + n.repo + " at head " + merge.headSha + "?\\n\\nIt runs under whichever gh login your HOME holds: the machine account's GH_TOKEN, GITHUB_TOKEN and GH_CONFIG_DIR are stripped, but the account itself is not checked. " + (n.status === "failed" ? "The merge desk watches only parked and awaiting-merge rows, so Resume it afterwards to run the close." : "The merge desk closes the node on its next tick."))) return;
+ acts.append(actionButton("Merge", merge.offered ? "gh pr merge --squash, pinned to " + short(merge.headSha) + ", under gh's configured login (machine-account tokens stripped; the account is not checked)" : merge.why, merge.offered, async () => {
+  if (!confirm("Squash-merge PR #" + n.pr.number + " on " + n.repo + " at head " + merge.headSha + "?\\n\\nIt runs under gh's configured login: the machine account's GH_TOKEN, GITHUB_TOKEN and GH_CONFIG_DIR are stripped, but the account itself is not checked. " + (n.status === "failed" ? "The merge desk watches only parked and awaiting-merge rows, so Resume it afterwards to run the close." : "The merge desk closes the node on its next tick."))) return;
   await act("merge", n, { sha: merge.headSha });
  }));
  const session = n.actions.session;
