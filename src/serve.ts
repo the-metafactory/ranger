@@ -608,6 +608,7 @@ function tokenMatches(given: string | null, token: string): boolean {
 
 export function createHandler(ctx: HandlerContext): (req: Request) => Promise<Response> {
  const hosts = [`127.0.0.1:${ctx.port}`, `localhost:${ctx.port}`];
+ const inFlight = new Set<string>();
  const origins = hosts.map((h) => `http://${h}`);
  return async (req: Request): Promise<Response> => {
   const url = new URL(req.url);
@@ -655,6 +656,7 @@ export function createHandler(ctx: HandlerContext): (req: Request) => Promise<Re
     configPath: actions.configPath,
     readPr: actions.readPr,
     exists: actions.exists,
+    inFlight,
    });
    if (result.entry !== undefined) actions.after?.(result.entry);
    return json(result.status, result.body);
@@ -827,7 +829,7 @@ function prLifecycle(v) {
 function prFacts(pr) {
  const v = pr.view;
  const parts = ["PR #" + pr.number];
- if (v) parts.push(prLifecycle(v), "head " + short(v.headSha), "CI " + v.ci);
+ if (v) parts.push(prLifecycle(v), "head " + short(v.headSha), ...(v.ci === "not-read" ? [] : ["CI " + v.ci]));
  if (pr.error) parts.push(v ? "stale, read " + ago(v.readAt) + "; the last refresh failed: " + pr.error : "the read failed: " + pr.error);
  else if (!v) parts.push("not read yet");
  return parts.join(" · ");
@@ -867,7 +869,7 @@ function needsCard(n) {
  }
  const merge = n.actions.merge;
  acts.append(actionButton("Merge", merge.offered ? "gh pr merge --squash, pinned to " + short(merge.headSha) + ", under gh's configured login (machine-account tokens stripped; the account is not checked)" : merge.why, merge.offered, async () => {
-  if (!confirm("Squash-merge PR #" + n.pr.number + " on " + n.repo + " at head " + merge.headSha + "?\\n\\nIt runs under gh's configured login: the machine account's GH_TOKEN, GITHUB_TOKEN and GH_CONFIG_DIR are stripped, but the account itself is not checked. " + (n.status === "failed" ? "The merge desk watches only parked and awaiting-merge rows, so Resume it afterwards to run the close." : "The merge desk closes the node on its next tick."))) return;
+  if (!confirm("Squash-merge PR #" + n.pr.number + " on " + n.repo + " at head " + merge.headSha + "?\\n\\nIt runs under gh's configured login: the machine account's GH_TOKEN, GITHUB_TOKEN and GH_CONFIG_DIR are stripped, but the account itself is not checked. " + (n.status === "failed" ? "The merge desk watches only parked and awaiting-merge rows, so Resume it afterwards to run the close." : "On its next tick the merge desk starts the close; check that the node closed (a failed spawn or a refused close leaves it open)."))) return;
   await act("merge", n, { sha: merge.headSha });
  }));
  const session = n.actions.session;
@@ -1213,8 +1215,10 @@ export async function readPrLive(
  if (raw === null) return null;
  const head = (raw.head ?? {}) as { sha?: unknown };
  const headSha = typeof head.sha === "string" ? head.sha : "";
- // Every page: a failure on page two must not read as green.
- const checks = /^[0-9a-f]{40}$/.test(headSha)
+ const terminal = raw.state === "closed" || raw.merged === true;
+ // Every page: a failure on page two must not read as green. A closed or
+ // merged PR offers no action its checks could gate, so they are not read.
+ const checks = !terminal && /^[0-9a-f]{40}$/.test(headSha)
   ? checkRunsFromPages(
      await restRead(tokens, repo, `repos/${repo}/commits/${headSha}/check-runs?filter=latest&per_page=100`, [
       "--paginate",
@@ -1230,7 +1234,7 @@ export async function readPrLive(
   draft: raw.draft === true,
   headSha,
   mergeable: typeof raw.mergeable === "boolean" ? raw.mergeable : null,
-  ci: checks === null ? "unreadable" : ciState(checks),
+  ci: terminal ? "not-read" : checks === null ? "unreadable" : ciState(checks),
   readAt: new Date().toISOString(),
  };
 }
@@ -1243,42 +1247,32 @@ async function readIssue(
  tokens: TokenBatch = tokenBatch(config),
 ): Promise<IssueRead | null> {
  if (!REPO_PATTERN.test(repo) || !ID_PATTERN.test(id)) return null;
- const token = await tokens(repo);
- const gated = gatedEnv(token.token);
- try {
-  const result = await runCmd("gh", ["api", `repos/${repo}/issues/${id}`], {
-   env: gated.env,
-   timeoutMs: 15_000,
-  });
-  if (result.code !== 0) return null;
-  const raw = JSON.parse(result.stdout) as {
-   title?: string;
-   state?: string;
-   assignees?: { login?: string }[];
-   labels?: ({ name?: string } | string)[];
-   body?: string | null;
-  };
-  // The node's kind is in its typed block, which the verbs write (#89-style
-  // `soma:work-graph-node` JSON in an HTML comment).
-  const block = /<!--\s*soma:work-graph-node\s*([\s\S]*?)-->/.exec(raw.body ?? "")?.[1];
-  let kind: string | null = null;
-  if (block !== undefined) {
-   try {
-    kind = (JSON.parse(block) as { kind?: string }).kind ?? null;
-   } catch {
-    kind = null;
-   }
+ const raw = (await restRead(tokens, repo, `repos/${repo}/issues/${id}`)) as {
+  title?: string;
+  state?: string;
+  assignees?: { login?: string }[];
+  labels?: ({ name?: string } | string)[];
+  body?: string | null;
+ } | null;
+ if (raw === null || typeof raw !== "object") return null;
+ // The node's kind is in its typed block, which the verbs write (#89-style
+ // `soma:work-graph-node` JSON in an HTML comment).
+ const block = /<!--\s*soma:work-graph-node\s*([\s\S]*?)-->/.exec(raw.body ?? "")?.[1];
+ let kind: string | null = null;
+ if (block !== undefined) {
+  try {
+   kind = (JSON.parse(block) as { kind?: string }).kind ?? null;
+  } catch {
+   kind = null;
   }
-  return {
-   title: raw.title ?? "",
-   state: raw.state ?? "unknown",
-   assignees: (raw.assignees ?? []).map((a) => a.login ?? "").filter(Boolean),
-   labels: (raw.labels ?? []).map((l) => (typeof l === "string" ? l : (l.name ?? ""))).filter(Boolean),
-   kind,
-  };
- } finally {
-  gated.cleanup();
  }
+ return {
+  title: raw.title ?? "",
+  state: raw.state ?? "unknown",
+  assignees: (raw.assignees ?? []).map((a) => a.login ?? "").filter(Boolean),
+  labels: (raw.labels ?? []).map((l) => (typeof l === "string" ? l : (l.name ?? ""))).filter(Boolean),
+  kind,
+ };
 }
 
 export function stateFromJournal(

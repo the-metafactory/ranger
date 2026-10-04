@@ -193,7 +193,14 @@ export function classifyReason(
   isTransientGitHubError(outcome) ||
   (CRASH_PARK_OUTCOME.test(outcome) && lastAttempt(recent).some((e) => e.kind === "transient"))
  ) {
-  return { class: "transient", detail: "a GitHub-side error, not the node's fault: resuming usually clears it" };
+  // A text match (timeouts, 5xx, connection resets), not a provenance check:
+  // it cannot say the error came from GitHub or that the node did nothing
+  // wrong, so the detail names the match and keeps the outcome beside it.
+  const said = firstLine(outcome).slice(0, 160);
+  return {
+   class: "transient",
+   detail: `reads like a transient network or HTTP error${said ? ` (${said})` : ""}; if that is all it was, resuming usually clears it`,
+  };
  }
  if (row.status === "failed") {
   return { class: "worker failed", detail: firstLine(outcome).slice(0, 200) || "no outcome recorded" };
@@ -215,10 +222,11 @@ export interface PrView {
  mergeable: boolean | null;
  /**
   * Check runs on the head: none yet, still running, any failed, all passed
-  * but none concluded success, green (all passed, at least one success), or
-  * unreadable (the check-runs read failed: nothing is known).
+  * but none concluded success, green (all passed, at least one success),
+  * unreadable (the check-runs read failed: nothing is known), or not-read (the
+  * PR is closed or merged, so its checks are not fetched).
   */
- ci: "none" | "pending" | "failed" | "no-success" | "green" | "unreadable";
+ ci: "none" | "pending" | "failed" | "no-success" | "green" | "unreadable" | "not-read";
  readAt: string;
 }
 
@@ -491,6 +499,13 @@ export interface ActionDeps {
  /** Read the PR live before a merge; null when it cannot be read. */
  readPr: (repo: string, pr: number) => Promise<PrView | null>;
  exists: (path: string) => boolean;
+ /**
+  * Nodes with an action running now (`repo#id`), owned by the server. Held
+  * from the row check until the child returns: the journal only shows a
+  * resumed row as claimed once `resume-node` has written it, so two clicks
+  * inside that window would otherwise both pass the parked check.
+  */
+ inFlight: Set<string>;
 }
 
 export interface ActionResponse {
@@ -522,6 +537,22 @@ export async function runAction(
  if (entry === undefined) {
   return refusal(404, `#${body.id} is not parked, failed or awaiting a needs-eye merge on ${body.key}`);
  }
+ const held = `${entry.repo}#${entry.nodeId}`;
+ if (deps.inFlight.has(held)) return refusal(409, `an action on #${entry.nodeId} is already running: wait for it, then reload`);
+ deps.inFlight.add(held);
+ try {
+  return await runHeldAction(kind, body, deps, entry);
+ } finally {
+  deps.inFlight.delete(held);
+ }
+}
+
+async function runHeldAction(
+ kind: ActionKind,
+ body: ActionBody,
+ deps: ActionDeps,
+ entry: NeedsYouEntry,
+): Promise<ActionResponse> {
  let argv: string[];
  let env: Record<string, string>;
  let detached = false;

@@ -174,6 +174,17 @@ describe("node #54 — the reason class, by ranger's own rules", () => {
   expect(classifyReason(r, [], null, 5).class).toBe("transient");
  });
 
+ test("transient: the detail names the match and keeps the outcome, never exonerating the node", () => {
+  // A worker's own bug can carry ECONNRESET from another service; the text
+  // match cannot tell, so the dashboard must not say it was GitHub's fault.
+  const r = row({ nodeId: "54", repo: RANGER, status: "failed", outcome: "TypeError: fetch to the views server failed: ECONNRESET" });
+  const reason = classifyReason(r, [], null, 5);
+  expect(reason.class).toBe("transient");
+  expect(reason.detail).toContain("TypeError: fetch to the views server failed: ECONNRESET");
+  expect(reason.detail).not.toContain("not the node's fault");
+  expect(reason.detail).not.toContain("GitHub-side");
+ });
+
  test("transient: a crash park after a transient event in this run", () => {
   const r = row({ nodeId: "663", outcome: "parked after 2 crash(es); release refused: ivy-agent" });
   const events = [
@@ -547,6 +558,44 @@ describe("node #54 — the actions and their guards", () => {
    expect(after).toHaveLength(0);
   });
  }
+
+ test("a second action on the same node while the first runs is refused with 409", async () => {
+  let release: () => void = () => {};
+  const gate = new Promise<void>((done) => {
+   release = done;
+  });
+  let runs = 0;
+  const handler = createHandler({
+   port: PORT,
+   token: TOKEN,
+   getState: () => assembleState({ ...baseInputs(), needsYou: needsYouEntries(entryInputs()) }),
+   refresh: () => {},
+   launch: () => {},
+   verifyGrilling: async () => null,
+   actions: {
+    run: async () => {
+     runs++;
+     await gate;
+     return { code: 0, stderr: "" };
+    },
+    rangerBin: "/bin/ranger",
+    configPath: "/x/ranger.yaml",
+    readPr: async () => greenPr(),
+    exists: () => true,
+   },
+  });
+  const first = handler(post("/api/resume", ok));
+  await Bun.sleep(0);
+  const second = await handler(post("/api/resume", ok));
+  expect(second.status).toBe(409);
+  expect(await second.json()).toMatchObject({ error: expect.stringContaining("already running") });
+  release();
+  expect((await first).status).toBe(200);
+  expect(runs).toBe(1);
+  // Released with the child: the next request is judged on the journal again.
+  expect((await handler(post("/api/resume", ok))).status).toBe(200);
+  expect(runs).toBe(2);
+ });
 
  test("a failing action shows its exit code and stderr tail", async () => {
   const handler = createHandler({
