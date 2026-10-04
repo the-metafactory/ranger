@@ -193,6 +193,39 @@ export const substrateReadings = sqliteTable("substrate_readings", {
  cappedUntil: text("capped_until"),
 });
 
+/** What a substrate session was (node #56): a build, a fix pass or a sage round. */
+export const SESSION_KINDS = ["worker", "fix-pass", "review"] as const;
+export type SessionKind = (typeof SESSION_KINDS)[number];
+
+/** How a substrate session ended (node #56). */
+export const SESSION_OUTCOMES = ["ok", "failed", "capped", "transient"] as const;
+export type SessionOutcome = (typeof SESSION_OUTCOMES)[number];
+
+/**
+ * One row per substrate session (node #56): written by the implement lane as
+ * a worker session or a sage round starts and ends, counted by `ranger serve`.
+ * An open row (no `ended_at`) is a session still running, or one whose
+ * supervisor died. Rows past the retention window are pruned on write.
+ */
+export const substrateSessions = sqliteTable(
+ "substrate_sessions",
+ {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  substrate: text("substrate", { enum: SUBSTRATE_NAMES }).notNull(),
+  kind: text("kind", { enum: SESSION_KINDS }).notNull(),
+  repo: text("repo").notNull(),
+  nodeId: text("node_id").notNull(),
+  startedAt: text("started_at").notNull(),
+  endedAt: text("ended_at"),
+  outcome: text("outcome", { enum: SESSION_OUTCOMES }),
+ },
+ (table) => [
+  index("substrate_sessions_started_at_idx").on(table.startedAt),
+  index("substrate_sessions_substrate_started_idx").on(table.substrate, table.startedAt),
+  index("substrate_sessions_node_open_idx").on(table.repo, table.nodeId, table.endedAt),
+ ],
+);
+
 /**
  * Which substrate wrote each pushed SHA (node #45), keyed per repo: review
  * selection reads the PR head's author here. An unknown SHA counts as

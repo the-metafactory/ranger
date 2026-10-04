@@ -295,6 +295,14 @@ async function rig(opts: {
  return { dir, origin, canonical, journal, statePath, ctx, github, calls };
 }
 
+/** The node's substrate sessions (node #56), oldest first: [substrate, kind, outcome]. */
+function sessions(journal: Journal): [string, string, string | null][] {
+ return journal.listSubstrateSessions(new Date(0)).map((s) => {
+  expect(s.endedAt).not.toBeNull();
+  return [s.substrate, s.kind, s.outcome];
+ });
+}
+
 function state(path: string) {
  return JSON.parse(readFileSync(path, "utf8"));
 }
@@ -369,6 +377,13 @@ describe("implement lane (node #23)", () => {
   expect(row?.reviewRound).toBe(2);
   expect(row?.verdictBlockers).toBe(0);
   expect(r.calls).toHaveLength(2);
+  // Quota reads fail closed under the injected worker, so every session ran on Pi (node #56).
+  expect(sessions(r.journal)).toEqual([
+   ["pi", "worker", "ok"],
+   ["pi", "review", "ok"],
+   ["pi", "fix-pass", "ok"],
+   ["pi", "review", "ok"],
+  ]);
 
   const pr = r.github.prs.get(1);
   expect(pr?.draft).toBe(false);
@@ -886,6 +901,11 @@ describe("implement lane (node #23)", () => {
   expect(r.journal.headSubstrate("acme/widgets", head)).toBe("codex");
   const files = await runCmd("git", ["ls-tree", "-r", "--name-only", head], { cwd: r.origin });
   expect(files.stdout).not.toContain("half-done.ts");
+  // The capped Claude session and the Codex one that finished are both recorded (node #56).
+  expect(sessions(r.journal).slice(0, 2)).toEqual([
+   ["claude", "worker", "capped"],
+   ["codex", "worker", "ok"],
+  ]);
  }, 60_000);
 
  test("a review capped on its substrate resumes cross-model without touching attempts or the dead-man", async () => {
@@ -937,6 +957,11 @@ describe("implement lane (node #23)", () => {
   const markers = (r.github.comments.get(1) ?? []).filter((c) => c.body.includes("ranger:review"));
   expect(markers).toHaveLength(1);
   expect(markers[0].body).toContain("substrate=pi -->");
+  expect(sessions(r.journal)).toEqual([
+   ["claude", "worker", "ok"],
+   ["codex", "review", "capped"],
+   ["pi", "review", "ok"],
+  ]);
  }, 60_000);
 
  test("a RANGER_WORKER_CMD session runs unlabelled and its review still selects on real quota", async () => {
@@ -974,6 +999,8 @@ describe("implement lane (node #23)", () => {
    .listEvents("acme/widgets", 200)
    .find((e) => e.kind === "worker-start" && e.detail?.startsWith("substrate "));
   expect(start?.detail).toContain("substrate unknown (RANGER_WORKER_CMD override");
+  // A session on an unknown substrate is not recorded; its review is.
+  expect(sessions(r.journal)).toEqual([["codex", "review", "ok"]]);
  }, 60_000);
 
  test("a codex failure that only prints 'rate limit' is an ordinary failure (no spoofed cap)", async () => {
@@ -991,5 +1018,6 @@ describe("implement lane (node #23)", () => {
   expect(outcome.detail).toContain("worker exited 1");
   expect(r.journal.deadmanCount()).toBe(1);
   expect(r.journal.listEvents("acme/widgets", 200).some((e) => e.kind === "substrate-capped")).toBe(false);
+  expect(sessions(r.journal)).toEqual([["codex", "worker", "failed"]]);
  }, 60_000);
 });

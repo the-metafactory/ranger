@@ -8,6 +8,9 @@ import {
  headSubstrates,
  health,
  substrateReadings,
+ substrateSessions,
+ type SessionKind,
+ type SessionOutcome,
  type SubstrateName,
  vetoes,
  workers,
@@ -94,6 +97,18 @@ export interface SubstrateReading {
  resetsAt: string | null;
  capped: boolean;
  cappedUntil: string | null;
+}
+
+/** One substrate session (node #56): a build, a fix pass or a sage round. */
+export interface SubstrateSessionRow {
+ id: number;
+ substrate: SubstrateName;
+ kind: SessionKind;
+ repo: string;
+ nodeId: string;
+ startedAt: string;
+ endedAt: string | null;
+ outcome: SessionOutcome | null;
 }
 
 export interface EscalationRow {
@@ -774,6 +789,81 @@ export class Journal {
   this.db.delete(headSubstrates).where(lt(headSubstrates.recordedAt, cutoff)).run();
  }
 
+ // ---- substrate sessions (node #56) ----
+
+ /**
+  * Open a session row and return its id. A node runs one session at a time
+  * under one supervisor, so a row still open for the same node belongs to a
+  * supervisor that died mid-session: it is closed as failed here, and its
+  * own late `endSubstrateSession` (if any) no longer applies.
+  */
+ startSubstrateSession(
+  scope: { substrate: SubstrateName; kind: SessionKind; repo: string; nodeId: string },
+  now = new Date(),
+ ): number {
+  const at = now.toISOString();
+  return this.db.transaction((tx) => {
+   tx.update(substrateSessions)
+    .set({ endedAt: at, outcome: "failed" })
+    .where(
+     and(
+      eq(substrateSessions.repo, scope.repo),
+      eq(substrateSessions.nodeId, scope.nodeId),
+      isNull(substrateSessions.endedAt),
+     ),
+    )
+    .run();
+   const cutoff = new Date(now.getTime() - SESSION_RETENTION_DAYS * DAY_MS).toISOString();
+   tx.delete(substrateSessions).where(lt(substrateSessions.startedAt, cutoff)).run();
+   const [row] = tx
+    .insert(substrateSessions)
+    .values({ ...scope, startedAt: at })
+    .returning({ id: substrateSessions.id })
+    .all();
+   return row.id;
+  });
+ }
+
+ /** Close a session row; a row already closed (superseded) stays as it is. */
+ endSubstrateSession(id: number, outcome: SessionOutcome, now = new Date()): void {
+  this.db
+   .update(substrateSessions)
+   .set({ endedAt: now.toISOString(), outcome })
+   .where(and(eq(substrateSessions.id, id), isNull(substrateSessions.endedAt)))
+   .run();
+ }
+
+ /**
+  * Sessions started since `since`, plus every still-open row. A journal no
+  * migration has reached yet (`ranger serve` reads it without migrating)
+  * has no sessions.
+  */
+ listSubstrateSessions(since: Date): SubstrateSessionRow[] {
+  return withoutSessionsTable(() =>
+   this.db
+    .select()
+    .from(substrateSessions)
+    .where(or(gt(substrateSessions.startedAt, since.toISOString()), isNull(substrateSessions.endedAt)))
+    .orderBy(asc(substrateSessions.id))
+    .all(),
+  );
+ }
+
+ /** A substrate's most recent session, however old (within retention). */
+ lastSubstrateSession(substrate: SubstrateName): SubstrateSessionRow | null {
+  return (
+   withoutSessionsTable(() =>
+    this.db
+     .select()
+     .from(substrateSessions)
+     .where(eq(substrateSessions.substrate, substrate))
+     .orderBy(desc(substrateSessions.startedAt), desc(substrateSessions.id))
+     .limit(1)
+     .all(),
+   )[0] ?? null
+  );
+ }
+
  /** Prune spawn-ledger keys older than the retention window (keeps health tidy). */
  pruneSpawnLedger(now = new Date(), retentionDays = 30): void {
   const cutoff = dayKey(new Date(now.getTime() - retentionDays * DAY_MS));
@@ -792,6 +882,19 @@ export class Journal {
 
  close(): void {
   this.closeDb();
+ }
+}
+
+/** Session rows are kept a month: the panel's widest window is 7 days. */
+const SESSION_RETENTION_DAYS = 30;
+
+/** An empty read when `substrate_sessions` is not migrated in yet. */
+function withoutSessionsTable(read: () => SubstrateSessionRow[]): SubstrateSessionRow[] {
+ try {
+  return read();
+ } catch (error) {
+  if (error instanceof Error && error.message.includes("no such table: substrate_sessions")) return [];
+  throw error;
  }
 }
 

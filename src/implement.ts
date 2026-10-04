@@ -32,6 +32,7 @@ import {
  type SubstrateReaders,
 } from "./substrate.ts";
 import { selectForReview } from "./substrate-policy.ts";
+import { failedSessionOutcome, recordSession } from "./substrate-usage.ts";
 import { workerEnv } from "./worker-env.ts";
 import { saveWorkerLog } from "./worker-log.ts";
 
@@ -446,25 +447,38 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
    const round = reviews.length + 1;
    fence("review");
    const { substrate: reviewSubstrate, chosenOn } = await selectReviewSubstrate(ctx, live.headSha);
-   let verdict: ReviewVerdict;
-   try {
-    verdict = await (ctx.reviewer ?? sageReview)(repo, open.number, ctx.readOnlyToken, {
-     substrate: reviewSubstrate,
-    });
-   } catch (error) {
+   // The sage round is a substrate session (node #56): its row ends with
+   // the cap confirmation, so a capped review is recorded as capped.
+   const reviewed = await recordSession(
+    journal,
+    { substrate: reviewSubstrate, kind: "review", repo, nodeId },
+    async (): Promise<{ verdict: ReviewVerdict } | { error: ReviewError; cap: CapSignal | null }> => {
+     try {
+      return {
+       verdict: await (ctx.reviewer ?? sageReview)(repo, open.number, ctx.readOnlyToken, {
+        substrate: reviewSubstrate,
+       }),
+      };
+     } catch (error) {
+      if (!(error instanceof ReviewError)) throw error;
+      return { error, cap: await confirmCap(reviewSubstrate, journal, { readers: ctx.substrateReaders }) };
+     }
+    },
+    (r) => ("verdict" in r ? "ok" : failedSessionOutcome(r.error.message, r.cap)),
+   );
+   if (!("verdict" in reviewed)) {
     // A review that failed on its substrate's limit resumes elsewhere; any
     // other review failure is an ordinary one.
-    if (!(error instanceof ReviewError)) throw error;
-    const capSignal = await confirmCap(reviewSubstrate, journal, { readers: ctx.substrateReaders });
-    if (capSignal === null) throw error;
+    if (reviewed.cap === null) throw reviewed.error;
     return {
      status: "failed",
-     detail: `sage review round ${round} on ${reviewSubstrate} hit its rate limit: ${error.message.slice(0, 300)}`,
+     detail: `sage review round ${round} on ${reviewSubstrate} hit its rate limit: ${reviewed.error.message.slice(0, 300)}`,
      workerExit,
      prNumber: open.number,
-     substrateCapped: capSignal,
+     substrateCapped: reviewed.cap,
     };
    }
+   const verdict = reviewed.verdict;
    if (verdict.commitId !== live.headSha) {
     throw new ParkSignal(
      `sage reviewed ${verdict.commitId.slice(0, 8)} but PR #${open.number}'s head is ${live.headSha.slice(0, 8)} — the head moved during review`,
@@ -598,8 +612,31 @@ function recordHead(ctx: ImplementContext, sha: string): void {
  });
 }
 
-/** One worker session (build or fix), then the supervisor's own test + keyword checks. */
+/**
+ * One worker session (build or fix), recorded as a substrate session (node
+ * #56) that ends once the supervisor's own checks have judged it. A
+ * RANGER_WORKER_CMD session runs on a substrate ranger cannot know, so it is
+ * not recorded.
+ */
 async function workerPass(
+ ctx: ImplementContext,
+ testCommand: string,
+ review: { round: number; body: string } | undefined,
+): Promise<PassResult> {
+ const nodeId = ctx.node.ref.id;
+ ctx.journal.assertGeneration(nodeId, ctx.map.repo, ctx.generation, "spawn the worker");
+ if (ctx.substrate === undefined) return checkedWorkerPass(ctx, testCommand, review);
+ return recordSession(
+  ctx.journal,
+  { substrate: ctx.substrate, kind: review === undefined ? "worker" : "fix-pass", repo: ctx.map.repo, nodeId },
+  () => checkedWorkerPass(ctx, testCommand, review),
+  (pass) =>
+   pass.failure === undefined ? "ok" : failedSessionOutcome(pass.failure.detail, pass.failure.substrateCapped),
+ );
+}
+
+/** The worker session itself, then the supervisor's own test + keyword checks. */
+async function checkedWorkerPass(
  ctx: ImplementContext,
  testCommand: string,
  review: { round: number; body: string } | undefined,
@@ -627,7 +664,6 @@ async function workerPass(
   review,
   probeTier: map.commands.probe !== undefined,
  });
- ctx.journal.assertGeneration(nodeId, ctx.map.repo, ctx.generation, "spawn the worker");
  const output = workerOutputFor(ctx.substrate);
  const raw = await ctx.workerRun(prompt, {
   cwd: worktree,
