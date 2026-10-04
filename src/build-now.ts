@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { budgetPolicy } from "./budget.ts";
-import { ClaimLockBusy, withClaimLock } from "./claim-lock.ts";
+import { ClaimLeaseLost, ClaimLockBusy, withClaimLock } from "./claim-lock.ts";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import { readFrontier } from "./frontier-cache.ts";
 import { type FrontierEntry, GRAPH_CALL_TIMEOUT_MS } from "./graph.ts";
@@ -15,8 +15,8 @@ import {
  type ProbeRegistry,
 } from "./route.ts";
 import {
+ claimAdmission,
  claimNode,
- IN_FLIGHT_STATUSES,
  type AnnounceFn,
  type ClaimFn,
  type SpawnRunNodeArgs,
@@ -136,26 +136,30 @@ export async function buildNow(nodeId: string, ctx: BuildNowContext): Promise<Bu
  // Every gate below is re-read under the claim lock the walk also takes, and
  // held through the claimed row and the spawn count: two concurrent claims
  // (a second build-now, or the tick) cannot both pass the same gate.
- const claimed = withClaimLock(journal, async () => {
-  // Dead-man gate (design §7): the walk claims nothing while paused, nor does this.
-  if (journal.isPaused()) refuse("dead-man paused — claiming stopped; `ranger resume-run` first");
-  if (journal.hasVeto(nodeId)) refuse("vetoed — the walk never claims a vetoed node");
-  const row = journal.getWorker(nodeId, map.repo);
-  if (row !== null && IN_FLIGHT_STATUSES.has(row.status)) {
-   refuse(`already in flight (${row.status}) — \`ranger resume-node\` puts a stuck worker back in motion`);
+ const claimed = withClaimLock(journal, async (owned) => {
+  const { refusal, laneHolder: holder } = claimAdmission(
+   journal,
+   map,
+   nodeId,
+   lane,
+   config.workers.spawnCapPerDay,
+   now(),
+  );
+  switch (refusal?.gate) {
+   // Dead-man gate (design §7): the walk claims nothing while paused, nor does this.
+   case "paused":
+    return refuse("dead-man paused — claiming stopped; `ranger resume-run` first");
+   case "vetoed":
+    return refuse("vetoed — the walk never claims a vetoed node");
+   case "cap":
+    return refuse(`the daily spawn cap is spent (${refusal.spawns}/${refusal.cap})`);
+   case "in-flight":
+    return refuse(
+     `already in flight (${refusal.status}) — \`ranger resume-node\` puts a stuck worker back in motion`,
+    );
+   case "root":
+    return refuse(refusal.message);
   }
-  try {
-   journal.assertWorkerRoot(nodeId, map.repo, map.root);
-  } catch (error) {
-   refuse(error instanceof Error ? error.message : String(error));
-  }
-  const spawns = journal.spawnsToday(now());
-  if (spawns >= config.workers.spawnCapPerDay) {
-   refuse(`the daily spawn cap is spent (${spawns}/${config.workers.spawnCapPerDay})`);
-  }
-  // Only the implement lane is serial; research never holds it.
-  const holder =
-   lane === "implement" ? journal.laneHolder(implementLane(map), { nodeId, repo: map.repo }) : null;
   if (holder !== null && ctx.force !== true) {
    refuse(laneHeldMessage(implementLane(map), holder, "build", nodeId));
   }
@@ -173,9 +177,16 @@ export async function buildNow(nodeId: string, ctx: BuildNowContext): Promise<Bu
    claim: ctx.claim,
    spawnRunNode: ctx.spawnRunNode,
    now: ctx.now,
+   owned,
   });
   return { outcome, holder };
  }, ctx.claimLockWaitMs ?? BUILD_NOW_LOCK_WAIT_MS).catch((error: unknown) => {
+  if (error instanceof ClaimLeaseLost) {
+   // Stopped at the fence: another claimer holds the lock now, and may be
+   // claiming this very node. Whatever this run wrote before the fence is in
+   // the journal and on the page; nothing after it was.
+   return refuse(`stopped mid-claim — ${error.message}; check the page before pressing again`);
+  }
   if (!(error instanceof ClaimLockBusy)) throw error;
   return refuse(`another claim is in progress (the tick or a second build-now) — press again: ${error.message}`);
  });

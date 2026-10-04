@@ -756,7 +756,8 @@ describe("walk claims exactly planTick's take (#37)", () => {
 });
 
 describe("walk claims under the claim lock build-now also takes (node #58)", () => {
- test("a claim made elsewhere while the walk waits for the lock is re-read: the walk does not claim it again", async () => {
+ /** Starts a walk while this process holds the claim lock, runs `during` once the walk waits on it, then lets it go. */
+ async function walkWhileLockHeld(during: (journal: Journal) => void) {
   const dir = mkdtempSync(join(tmpdir(), "ranger-walk-lock-"));
   const discord = fakeDiscord();
   const journal = new Journal(join(dir, "state.sqlite"));
@@ -783,18 +784,49 @@ describe("walk claims under the claim lock build-now also takes (node #58)", () 
     });
     await Bun.sleep(2_000);
     expect(assignees()).not.toContain("ivy-bot");
-    // What build-now writes once it has claimed node 10 under the lock.
-    journal.upsertWorker({ nodeId: "10", repo: "acme/widgets", root: 1, status: "claimed", lane: "research" });
+    during(journal);
    });
    const result = await walking;
-   expect(result.code).toBe(0);
-   expect(assignees()).not.toContain("ivy-bot");
-   expect(`${result.stdout}${result.stderr}`).toContain("#10 already in flight (claimed)");
+   return { result, output: `${result.stdout}${result.stderr}`, assignees: assignees(), announces: discord.posts.length };
   } finally {
    journal.close();
    discord.stop();
    rmSync(dir, { recursive: true, force: true });
   }
+ }
+
+ test("a claim made elsewhere while the walk waits for the lock is re-read: the walk does not claim it again", async () => {
+  const { result, output, assignees } = await walkWhileLockHeld((journal) =>
+   // What build-now writes once it has claimed node 10 under the lock.
+   journal.upsertWorker({ nodeId: "10", repo: "acme/widgets", root: 1, status: "claimed", lane: "research" }),
+  );
+  expect(result.code).toBe(0);
+  expect(assignees).not.toContain("ivy-bot");
+  expect(output).toContain("#10 already in flight (claimed)");
+ });
+
+ test("a veto recorded while the walk waits for the lock is re-read: nothing is announced or claimed", async () => {
+  const { result, output, assignees, announces } = await walkWhileLockHeld((journal) =>
+   journal.recordVeto("10", "comment-1", "principal veto"),
+  );
+  expect(result.code).toBe(0);
+  expect(assignees).not.toContain("ivy-bot");
+  expect(announces).toBe(0);
+  expect(output).toContain("#10 vetoed — not claimed");
+ });
+
+ test("a pause recorded while the walk waits for the lock is re-read: the map stops claiming", async () => {
+  const { result, assignees, announces } = await walkWhileLockHeld((journal) => journal.setPaused(true));
+  expect(result.code).toBe(0);
+  expect(assignees).not.toContain("ivy-bot");
+  expect(announces).toBe(0);
+  const walked = JSON.parse(result.stdout) as { maps: { paused: boolean; gated: boolean; gateReason?: string }[] };
+  expect(walked.maps[0]).toMatchObject({
+   paused: true,
+   gated: true,
+   gateReason: expect.stringContaining("dead-man paused"),
+   claimed: [],
+  });
  });
 });
 

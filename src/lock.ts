@@ -189,7 +189,7 @@ export function reclaimDeadLock(
 
 /** An acquired announce-once lease: the lock file + marker paths and the
  *  owner nonce + fresh-owner generator used by the heartbeat and release. */
-interface Lease {
+export interface Lease {
   lockFile: string;
   reclaimMarker: string;
   ownerNonce: string;
@@ -331,6 +331,43 @@ export class LeaseLostError extends EscalateError {
  *  ours (or the lock is unreadable/released — either way we do not own it). */
 export type OwnedCheck = () => void;
 
+/**
+ * The owned check for an acquired lease: re-reads the lock and throws
+ * `lost(why)` when the nonce is no longer ours, or the lock is unreadable or
+ * released (a live holder's lock is always complete JSON carrying OUR nonce,
+ * thanks to the atomic writes). With `rejectExpired`, a lease of ours that
+ * has already expired is lost too: a contender may reclaim it at any moment,
+ * so the holder must not start another mutation on it.
+ */
+export function leaseOwnedCheck(
+  lease: Lease,
+  lostOwnership: { value: boolean },
+  lost: (why: string) => Error,
+  opts: { rejectExpired?: boolean } = {},
+): OwnedCheck {
+  return () => {
+    let cur: { nonce?: string; leaseUntil?: number };
+    try {
+      cur = JSON.parse(readFileSync(lease.lockFile, "utf8")) as typeof cur;
+    } catch {
+      lostOwnership.value = true;
+      throw lost("lock unreadable/released");
+    }
+    if (cur.nonce !== lease.ownerNonce) {
+      lostOwnership.value = true;
+      throw lost("another run owns the lock");
+    }
+    if (
+      opts.rejectExpired === true &&
+      typeof cur.leaseUntil === "number" &&
+      cur.leaseUntil < Date.now()
+    ) {
+      lostOwnership.value = true;
+      throw lost("our lease expired (held >60s without a heartbeat)");
+    }
+  };
+}
+
 export async function withEscalateLock<T>(
   journal: Journal,
   fn: (owned: OwnedCheck) => Promise<T>,
@@ -339,28 +376,11 @@ export async function withEscalateLock<T>(
   const reclaimMarker = `${lockFile}.reclaiming`;
   const lease = await acquireLease(lockFile, reclaimMarker);
   const { heartbeat, lostOwnership } = startHeartbeat(lease);
-  const owned: OwnedCheck = () => {
-    try {
-      const cur = JSON.parse(readFileSync(lockFile, "utf8")) as {
-        nonce?: string;
-      };
-      if (cur.nonce !== lease.ownerNonce) {
-        lostOwnership.value = true;
-        throw new LeaseLostError(
-          "announce-once lease lost: another run owns the desk",
-        );
-      }
-    } catch (error) {
-      if (error instanceof LeaseLostError) throw error;
-      // Unreadable or missing lock: a live holder's lock is always complete
-      // JSON (atomic writes) and carries OUR nonce while we run — anything
-      // else means the lock was reclaimed or released. Treat as lost.
-      lostOwnership.value = true;
-      throw new LeaseLostError(
-        "announce-once lease lost: lock unreadable/released",
-      );
-    }
-  };
+  const owned = leaseOwnedCheck(lease, lostOwnership, (why) =>
+    why === "another run owns the lock"
+      ? new LeaseLostError("announce-once lease lost: another run owns the desk")
+      : new LeaseLostError(`announce-once lease lost: ${why}`),
+  );
   try {
     return await fn(owned);
   } finally {

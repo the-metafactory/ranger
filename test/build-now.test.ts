@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stringify } from "yaml";
@@ -9,7 +9,7 @@ import type { FrontierEntry } from "../src/graph.ts";
 import { openJournal, type Journal } from "../src/journal.ts";
 import type { AnnounceContext } from "../src/announce.ts";
 import type { SpawnRunNodeArgs } from "../src/walk.ts";
-import { withClaimLock } from "../src/claim-lock.ts";
+import { claimLockFile, withClaimLock } from "../src/claim-lock.ts";
 
 /**
  * node #58 — `ranger build-now`: the walk's claim for one chosen node. The
@@ -385,5 +385,82 @@ describe("node #58 — concurrent claims are serialized by the claim lock", () =
   untouched(r, "10");
   release();
   await walkClaim;
+ });
+});
+
+describe("node #58 — the claim lock's fence: a holder whose lease was lost stops at its next write", () => {
+ /** Another process reclaimed the claim lock (our lease expired while we were stopped). */
+ function reclaimElsewhere(journal: Journal) {
+  writeFileSync(
+   claimLockFile(journal),
+   JSON.stringify({ nonce: "other-process", pid: process.pid, startedAt: Date.now(), leaseUntil: Date.now() + 60_000 }),
+  );
+ }
+
+ test("lost during the announce: no claim, no row, no event, no spawn counted or started", async () => {
+  const r = rig();
+  const announce = r.ctx().announce!;
+  const message = await refusal(
+   buildNow(
+    "10",
+    r.ctx({
+     announce: async (map, a) => {
+      reclaimElsewhere(r.journal);
+      return announce(map, a);
+     },
+    }),
+   ),
+  );
+  expect(message).toMatch(/stopped mid-claim — claim lock lost mid-claim \(another run owns the lock\)/);
+  expect(r.announced).toHaveLength(1);
+  expect(r.claimed).toHaveLength(0);
+  expect(r.spawned).toHaveLength(0);
+  expect(r.journal.getWorker("10", REPO)).toBeNull();
+  expect(r.journal.listEvents(REPO).filter((e) => e.nodeId === "10")).toEqual([]);
+  expect(r.journal.spawnsToday(new Date("2026-10-04T10:00:00Z"))).toBe(0);
+ });
+
+ test("lost during the graph claim: no row, no spawn counted or started (the new holder writes them)", async () => {
+  const r = rig();
+  const claim = r.ctx().claim!;
+  const message = await refusal(
+   buildNow(
+    "10",
+    r.ctx({
+     claim: async (...args) => {
+      reclaimElsewhere(r.journal);
+      return claim(...args);
+     },
+    }),
+   ),
+  );
+  expect(message).toMatch(/stopped mid-claim/);
+  expect(r.claimed).toEqual(["10"]);
+  expect(r.spawned).toHaveLength(0);
+  expect(r.journal.getWorker("10", REPO)).toBeNull();
+  expect(r.journal.listEvents(REPO).filter((e) => e.nodeId === "10" && e.kind === "claimed")).toEqual([]);
+  expect(r.journal.spawnsToday(new Date("2026-10-04T10:00:00Z"))).toBe(0);
+ });
+
+ test("our own lease already expired: stopped before the claim, though no one has reclaimed it yet", async () => {
+  const r = rig();
+  const announce = r.ctx().announce!;
+  const message = await refusal(
+   buildNow(
+    "10",
+    r.ctx({
+     announce: async (map, a) => {
+      const file = claimLockFile(r.journal);
+      const lease = JSON.parse(readFileSync(file, "utf8")) as { leaseUntil: number };
+      writeFileSync(file, JSON.stringify({ ...lease, leaseUntil: Date.now() - 1 }));
+      return announce(map, a);
+     },
+    }),
+   ),
+  );
+  expect(message).toMatch(/our lease expired/);
+  expect(r.claimed).toHaveLength(0);
+  expect(r.spawned).toHaveLength(0);
+  expect(r.journal.getWorker("10", REPO)).toBeNull();
  });
 });
