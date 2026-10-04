@@ -14,6 +14,7 @@ import {
  createHandler,
  launchPlan,
  type MapRead,
+ renderPage,
  ServeReader,
  stateFromJournal,
  type ServeMap,
@@ -145,6 +146,13 @@ describe("#37 — the state the dashboard shows", () => {
   expect(assembleState(inputs()).maps[0].next.nodeId).toBe(tickFirst.id);
  });
 
+ test("the page's inline script parses (string-built client code has no compile step)", () => {
+  const page = renderPage("tok");
+  const body = page.slice(page.indexOf("<script>") + "<script>".length, page.indexOf("</script>"));
+  expect(body.length).toBeGreaterThan(0);
+  expect(() => new Function(body)).not.toThrow();
+ });
+
  test("serve imports no graph write, directly or through another module", () => {
   const seen = new Set<string>();
   const src = join(import.meta.dir, "..", "src");
@@ -159,6 +167,8 @@ describe("#37 — the state the dashboard shows", () => {
   visit(join(src, "serve.ts"));
   const local = [...seen].map((f) => f.slice(src.length + 1));
   expect(local).toContain("frontier-cache.ts");
+  // Node #54: the "Needs you" actions are walked too, and import no write either.
+  expect(local).toContain("serve-parked.ts");
   expect(local.filter((f) => /graph-write|walk|sweep|worker|implement/.test(f))).toEqual([]);
  });
 

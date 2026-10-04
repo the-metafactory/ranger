@@ -1,3 +1,4 @@
+import { classifyCi } from "./ci-policy.ts";
 import type { CheckRun, PullRequest } from "./github.ts";
 
 /**
@@ -43,8 +44,6 @@ export type MergeGateResult =
  /** A hard failure that needs a human or a new round — park + card. */
  | { status: "fail"; check: GateCheck; reason: string };
 
-const OK_CONCLUSIONS = new Set(["success", "neutral", "skipped"]);
-
 export function evaluateMergeGate(input: MergeGateInput): MergeGateResult {
  const { pr } = input;
 
@@ -56,38 +55,34 @@ export function evaluateMergeGate(input: MergeGateInput): MergeGateResult {
   };
  }
 
- // 1. CI green on the live head. Zero check runs is not green: a gate that
- //    passes on an empty rollup is the silent fail-open this check exists for.
- if (input.checkRuns.length === 0) {
+ // 1. CI green on the live head, by the shared policy (`ci-policy.ts`).
+ const ci = classifyCi(input.checkRuns);
+ if (ci.state === "none") {
   return { status: "pending", check: "ci-green", reason: "no check runs on the head yet" };
  }
- const running = input.checkRuns.filter((c) => c.status !== "completed");
- if (running.length > 0) {
+ if (ci.state === "pending") {
   return {
    status: "pending",
    check: "ci-green",
-   reason: `${running.length} check run(s) still running: ${running.map((c) => c.name).join(", ")}`,
+   reason: `${ci.running.length} check run(s) still running: ${ci.running.map((c) => c.name).join(", ")}`,
   };
  }
- const failed = input.checkRuns.filter(
-  (c) => !OK_CONCLUSIONS.has(c.conclusion ?? ""),
- );
- if (failed.length > 0) {
+ if (ci.state === "failed") {
   return {
    status: "fail",
    check: "ci-green",
-   reason: `CI failed: ${failed.map((c) => `${c.name}=${c.conclusion}`).join(", ")}`,
+   reason: `CI failed: ${ci.failed.map((c) => `${c.name}=${c.conclusion}`).join(", ")}`,
   };
  }
  // soma's auto close cites one successful check run (`--ci <id>@<sha>`).
- const success = input.checkRuns.find((c) => c.conclusion === "success");
- if (success === undefined) {
+ if (ci.state === "no-success") {
   return {
    status: "fail",
    check: "ci-green",
    reason: "no check run concluded success (all neutral/skipped) — nothing for the close to cite",
   };
  }
+ const success = ci.success;
 
  // 2. mergeable. GitHub computes this lazily; null means "ask again".
  if (pr.mergeable === null || pr.mergeableState === "unknown") {

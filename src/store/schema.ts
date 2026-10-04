@@ -65,15 +65,23 @@ export const workers = sqliteTable("workers", {
  mergeMessageId: text("merge_message_id"),
 }, (table) => [primaryKey({ columns: [table.repo, table.nodeId] })]);
 
-export const events = sqliteTable("events", {
- id: integer("id").primaryKey({ autoIncrement: true }),
- at: text("at").notNull(),
- nodeId: text("node_id"),
- repo: text("repo"),
- /** claimed | announced | worker-start | worker-success | closed | decisions-written | refused | parked | released | sweep | deadman-paused | veto */
- kind: text("kind").notNull(),
- detail: text("detail"),
-});
+export const events = sqliteTable(
+ "events",
+ {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  at: text("at").notNull(),
+  nodeId: text("node_id"),
+  repo: text("repo"),
+  /** claimed | announced | worker-start | worker-success | closed | decisions-written | refused | parked | released | sweep | deadman-paused | veto */
+  kind: text("kind").notNull(),
+  detail: text("detail"),
+ },
+ (table) => [
+  // The dashboard reads one node's newest events per card on every poll
+  // (node #54); without this the read scans the whole append-only journal.
+  index("events_repo_node_id_idx").on(table.repo, table.nodeId, table.id),
+ ],
+);
 
 export const health = sqliteTable("health", {
  key: text("key").primaryKey(),

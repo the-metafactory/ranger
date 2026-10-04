@@ -18,6 +18,13 @@ import {
 import * as gh from "./github.ts";
 import type { CheckRun, IssueComment, PullRequest, GitHubPort } from "./github.ts";
 import { ParkSignal } from "./signals.ts";
+import {
+ PROBE_FILE,
+ parseFailedProbes,
+ probesFailedOutcome,
+ reviewCapHeadMovedOutcome,
+ reviewCapOutcome,
+} from "./outcomes.ts";
 import { GRAPH_CALL_TIMEOUT_MS, type NodeResult } from "./graph.ts";
 import { graphClose, graphDecisions, type CloseResult } from "./graph-write.ts";
 import type { ImplementPhase, Journal } from "./journal.ts";
@@ -162,6 +169,7 @@ export function recordedReviews(
  return out.sort((a, b) => a.round - b.round);
 }
 
+export { parseFailedProbes };
 export { NEEDS_EYE_LABEL } from "./labels.ts";
 
 /** The findings that gate a PR: blockers and majors (principal, 2026-10-03). */
@@ -197,21 +205,6 @@ export function recordedProbes(
   out.push({ sha: m[1], passed: m[2] === "pass", selected: m[3], mode: m[4] });
  }
  return out;
-}
-
-/** A probe file name as the runner prints it: no path, no shell metacharacters. */
-const PROBE_FILE = /^[\w.-]+\.m?js$/;
-
-/**
- * The probes a failed run names on its `FAILED: a.mjs · b.mjs` line (the
- * seelite runner's summary). Empty when there is no such line or any name
- * is not a plain probe file name, so the caller falls back to the full suite.
- */
-export function parseFailedProbes(stdout: string): string[] {
- const line = stdout.match(/^FAILED: (.+)$/m)?.[1];
- if (line === undefined) return [];
- const names = line.split("·").map((n) => n.trim()).filter(Boolean);
- return names.length > 0 && names.every((n) => PROBE_FILE.test(n)) ? names : [];
 }
 
 export function probeRetryCommandFor(template: string, nodeId: string, failed: string[]): string {
@@ -297,7 +290,13 @@ async function probeFinalHead(
  });
  if (!record.passed) {
   throw new ParkSignal(
-   `browser probes failed twice at ${record.sha.slice(0, 8)} on PR #${prNumber} (exit ${result.code}): ${tail(result)}`,
+   probesFailedOutcome({
+    sha: record.sha,
+    pr: prNumber,
+    exit: result.code,
+    failed: result.code > 0 ? parseFailedProbes(result.stdout) : [],
+    tail: tail(result),
+   }),
   );
  }
  return record;
@@ -443,9 +442,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
   let current = reviews.find((r) => r.sha === live.headSha);
   if (current === undefined) {
    if (reviews.length >= cap) {
-    throw new ParkSignal(
-     `review cap reached: ${reviews.length} sage round(s) on PR #${open.number} and the head moved since the last one — a further round is the principal's call (design §4)`,
-    );
+    throw new ParkSignal(reviewCapHeadMovedOutcome({ rounds: reviews.length, pr: open.number }));
    }
    const round = reviews.length + 1;
    fence("review");
@@ -523,7 +520,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
   if (gatingFindings(current) === 0) break;
   if (current.round >= cap) {
    throw new ParkSignal(
-    `${current.blockers} blocker(s) and ${current.majors} major(s) remain after ${current.round} sage round(s) on PR #${open.number} — good-enough is the principal's call (design §4/§7)`,
+    reviewCapOutcome({ blockers: current.blockers, majors: current.majors, round: current.round, pr: open.number }),
    );
   }
   // One fix pass per review that found blockers or majors. On a resume the review is

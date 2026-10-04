@@ -141,6 +141,13 @@
       "when": 1791138315577,
       "tag": "0019_substrate-sessions",
       "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "6",
+      "when": 1791141897560,
+      "tag": "0020_events-node-index",
+      "breakpoints": true
     }
   ]
 }
