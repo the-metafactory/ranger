@@ -46,6 +46,7 @@ the last implement start (node #47); empty or gated maps are skipped. Claims,
 operator resumes, sweep respawns and merge-desk send-backs record starts;
 close-only runs leave the cursor unchanged. Awaiting-merge releases capacity.
 The dashboard shows both holders and the same next choices as walk.
+Unknown or ambiguous worker maps conservatively hold both resource lanes.
 
 ## Scout (build-path step 1)
 

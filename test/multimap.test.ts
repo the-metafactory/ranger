@@ -6,7 +6,7 @@ import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stringify } from "yaml";
-import { loadConfig } from "../src/config.ts";
+import { loadConfig, type RangerConfig } from "../src/config.ts";
 import { Journal, openJournal } from "../src/journal.ts";
 import { LAST_IMPLEMENT_MAP, mapKey, pickMap, resumeMap } from "../src/maps.ts";
 import { servedMaps, ServeReader, stateFromJournal } from "../src/serve.ts";
@@ -14,6 +14,11 @@ import { sweepMap } from "../src/sweep.ts";
 import { fakeDiscord, fixturesBin, runCli } from "./support.ts";
 
 const REPO = "acme/widgets";
+function predicted(config: RangerConfig) {
+ const maps = servedMaps(config);
+ const reader = new ServeReader(config, maps, config.state.journalPath);
+ return stateFromJournal(config, maps, reader).maps.filter(m => m.next.lane === "implement" && !m.next.waiting).map(m => m.key);
+}
 function legacyJournal() {
  const dir = mkdtempSync(join(tmpdir(), "ranger-migration-"));
  const migrations = join(dir, "drizzle"); mkdirSync(join(migrations, "meta"), { recursive: true });
@@ -26,6 +31,16 @@ function legacyJournal() {
  const sqlite = new Database(path);
  migrate(drizzle(sqlite), { migrationsFolder: migrations });
  return { dir, path, sqlite };
+}
+function expectMigrationFailure(sqlite: Database, message: string) {
+ let failure: Error | undefined;
+ try {
+  migrate(drizzle(sqlite), { migrationsFolder: join(import.meta.dir, "../drizzle") });
+ } catch (error) {
+  failure = error as Error;
+ }
+ expect(failure).toBeDefined();
+ expect(failure?.cause instanceof Error ? failure.cause.message : failure?.message).toContain(message);
 }
 function rig() {
  const dir = mkdtempSync(join(tmpdir(), "ranger-multimap-"));
@@ -57,32 +72,53 @@ function rig() {
 }
 
 describe("node #47 — map identity", () => {
- test("standalone Drizzle migration backfills registered roots without application setup", () => {
+ test("standalone Drizzle migration backfills only operator-seeded roots", () => {
   const { dir, sqlite } = legacyJournal();
   try {
-   const repos = ["the-metafactory/ranger", "jcfischer/seelite", "jcfischer/seekolous"];
+   const repos = ["the-metafactory/ranger", "jcfischer/seelite", "example/custom"];
+   const roots = [78, 460, 87];
+   sqlite.run("CREATE TABLE ranger_legacy_roots (repo text PRIMARY KEY, root integer NOT NULL)");
    repos.forEach((repo, i) => {
+    sqlite.run("INSERT INTO ranger_legacy_roots VALUES (?, ?)", [repo, roots[i]]);
     sqlite.run("INSERT INTO workers(node_id,repo,status) VALUES(?,?, 'running')", [String(i + 1), repo]);
     sqlite.run("INSERT INTO escalations(key,repo,node_id,message_id,created_at) VALUES(?,?,?,?,?)", [repo + ":99", repo, "99", "card", "2026-10-01"]);
    });
    migrate(drizzle(sqlite), { migrationsFolder: join(import.meta.dir, "../drizzle") });
-   expect(sqlite.query("SELECT root FROM workers ORDER BY node_id").all()).toEqual([{ root: 1 }, { root: 1 }, { root: 26 }]);
-   expect(sqlite.query("SELECT root FROM escalations ORDER BY repo").all()).toEqual([{ root: 26 }, { root: 1 }, { root: 1 }]);
+   expect(sqlite.query("SELECT root FROM workers ORDER BY node_id").all()).toEqual(roots.map(root => ({ root })));
+   expect(sqlite.query("SELECT root FROM escalations ORDER BY repo").all()).toEqual([{ root: 87 }, { root: 460 }, { root: 78 }]);
    sqlite.run("INSERT INTO workers(node_id,repo,root) VALUES('1','jcfischer/seelite',460)");
    expect(sqlite.query("SELECT repo FROM workers WHERE node_id='1'").all()).toHaveLength(2);
    expect(sqlite.query("SELECT name FROM sqlite_master WHERE name='ranger_legacy_roots'").all()).toEqual([]);
   } finally { sqlite.close(); rmSync(dir, { recursive: true, force: true }); }
  });
 
- test("standalone migration refuses unknown legacy roots and rolls back schema changes", () => {
+ test("standalone migration requires the input table and rolls back schema changes", () => {
   const { dir, sqlite } = legacyJournal();
   try {
    sqlite.run("INSERT INTO workers(node_id,repo,status) VALUES('99','unknown/repo','running')");
-   expect(() => migrate(drizzle(sqlite), { migrationsFolder: join(import.meta.dir, "../drizzle") })).toThrow();
+   expectMigrationFailure(sqlite, "requires ranger_legacy_roots seeded before migrate");
    expect(sqlite.query("SELECT repo FROM workers").all()).toEqual([{ repo: "unknown/repo" }]);
    expect((sqlite.query("PRAGMA table_info(workers)").all() as { name: string }[]).some(c => c.name === "root")).toBe(false);
   } finally { sqlite.close(); rmSync(dir, { recursive: true, force: true }); }
  });
+
+ for (const table of ["workers", "escalations"] as const) {
+  test(`standalone migration rolls back when inputs omit a ${table} repo`, () => {
+   const { dir, sqlite } = legacyJournal();
+   try {
+    sqlite.run("CREATE TABLE ranger_legacy_roots (repo text PRIMARY KEY, root integer NOT NULL)");
+    sqlite.run("INSERT INTO ranger_legacy_roots VALUES ('example/known', 87)");
+    sqlite.run("INSERT INTO workers(node_id,repo,status) VALUES('1','example/known','running')");
+    if (table === "workers") sqlite.run("INSERT INTO workers(node_id,repo) VALUES('99','jcfischer/seelite')");
+    else sqlite.run("INSERT INTO escalations(key,repo,node_id,message_id,created_at) VALUES('card','jcfischer/seelite','99','card','2026-10-01')");
+    expectMigrationFailure(sqlite, "NOT NULL");
+    for (const name of ["workers", "escalations"]) {
+     expect((sqlite.query(`PRAGMA table_info(${name})`).all() as { name: string }[]).some(c => c.name === "root")).toBe(false);
+    }
+    expect(sqlite.query(`SELECT repo FROM ${table} WHERE repo='jcfischer/seelite'`).all()).toHaveLength(1);
+   } finally { sqlite.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+ }
 
  test("migration backfills roots, preserves worker state and rekeys repo/node ids", () => {
   const { dir, path, sqlite } = legacyJournal();
@@ -120,6 +156,16 @@ describe("node #47 — map identity", () => {
    const columns = check.query("PRAGMA table_info(workers)").all() as { name: string; pk: number; notnull: number }[];
    expect(columns.filter(c => c.pk).sort((a,b) => a.pk-b.pk).map(c => c.name)).toEqual(["repo", "node_id"]);
    expect(columns.find(c => c.name === "root")).toMatchObject({ notnull: 1 });
+   for (const [index, expected] of [
+    ["escalations_repo_status_created_idx", ["repo", "root", "status", "created_at"]],
+    ["escalations_repo_status_noted_created_idx", ["repo", "root", "status", "noted_at", "created_at", "node_id"]],
+   ] as const) {
+    const info = check.query(`PRAGMA index_info(${index})`).all() as { name: string }[];
+    expect(info.map(c => c.name)).toEqual([...expected]);
+   }
+   const queryPlan = check.query("EXPLAIN QUERY PLAN SELECT * FROM escalations WHERE repo=? AND root=? AND status='open' AND noted_at IS NULL ORDER BY created_at, node_id LIMIT 50").all("jcfischer/seelite", 460) as { detail: string }[];
+   expect(queryPlan.some(p => p.detail.includes("repo=? AND root=?"))).toBe(true);
+   expect(queryPlan.some(p => p.detail.includes("TEMP B-TREE"))).toBe(false);
    expect(() => check.run("INSERT INTO workers(node_id,repo) VALUES('99','missing/repo')")).toThrow();
    check.close();
   } finally { journal.close(); rmSync(dir, { recursive: true, force: true }); }
@@ -264,23 +310,18 @@ describe("node #47 — map identity", () => {
 
  test("a resource lane alternates maps across restarts and serve predicts the same choice", async () => {
   const r = rig();
-  const predicted = () => {
-   const maps = servedMaps(r.config);
-   const reader = new ServeReader(r.config, maps, r.config.state.journalPath);
-   return stateFromJournal(r.config, maps, reader).maps.filter(m => m.next.lane === "implement" && !m.next.waiting).map(m => m.key);
-  };
   const tick = () => runCli(["walk", "-c", r.configPath], r.env);
   try {
    expect((await tick()).code).toBe(0);
    expect(r.journal.listWorkers().map(w => [w.nodeId, w.root])).toEqual([["20", 1]]);
    expect(r.journal.getHealth(LAST_IMPLEMENT_MAP)).toBe(REPO + "#1");
    r.journal.updateWorker("20", REPO, { status: "success" });
-   expect(predicted()).toEqual([REPO + "#460"]);
+   expect(predicted(r.config)).toEqual([REPO + "#460"]);
    expect((await tick()).code).toBe(0);
    expect(r.journal.getWorker("21", REPO)?.root).toBe(460);
    expect(r.discord.posts[1].content).toContain("map: acme/widgets#460");
    r.journal.updateWorker("21", REPO, { status: "success" });
-   expect(predicted()).toEqual([REPO + "#1"]);
+   expect(predicted(r.config)).toEqual([REPO + "#1"]);
    r.frontier(1, ["22"]);
    expect((await tick()).code).toBe(0);
    expect(r.journal.getHealth(LAST_IMPLEMENT_MAP)).toBe(REPO + "#1");
@@ -311,10 +352,7 @@ describe("node #47 — map identity", () => {
    r.journal.updateWorker("50", visual.repo, { status: "success" });
    fixture.frontier[0].ref.id = fixture.frontier[0].node.id = "51";
    writeFileSync(visualFrontier, JSON.stringify(fixture));
-   const maps = servedMaps(r.config);
-   const reader = new ServeReader(r.config, maps, r.config.state.journalPath);
-   const predicted = stateFromJournal(r.config, maps, reader).maps.filter(m => m.next.lane === "implement" && !m.next.waiting).map(m => m.key);
-   expect(predicted).toEqual([REPO + "#460", "acme/game#1"]);
+   expect(predicted(r.config)).toEqual([REPO + "#460", "acme/game#1"]);
    expect((await runCli(["walk", "-c", r.configPath], r.env)).code).toBe(0);
    expect(r.journal.getWorker("21", REPO)?.root).toBe(460);
    expect(r.journal.getWorker("51", visual.repo)?.status).toBe("claimed");
@@ -343,6 +381,41 @@ describe("node #47 — map identity", () => {
    expect(digest.code).toBe(0);
    expect(r.journal.getHealth(`digest.${REPO}#1`)).not.toBeNull();
    expect(r.journal.getHealth(`digest.${REPO}#460`)).not.toBeNull();
+  } finally { r.close(); }
+ });
+
+ test("a shared frontier node cannot move its escalation to a sibling map", async () => {
+  const r = rig();
+  try {
+   r.frontier(460, ["20"]);
+   for (const root of [1, 460]) {
+    const path = join(r.dir, "data", `acme__widgets-frontier-${root}.json`);
+    const fixture = JSON.parse(readFileSync(path, "utf8"));
+    fixture.frontier[0].node.kind = "grilling";
+    fixture.frontier[0].node.autonomy = "propose";
+    writeFileSync(path, JSON.stringify(fixture));
+   }
+   for (let pass = 0; pass < 2; pass++) {
+    const result = await runCli(["escalate", "--json", "-c", r.configPath], r.env);
+    const report = JSON.parse(result.stdout);
+    expect(report.maps[1].cardErrors[0]).toContain("belongs to map acme/widgets#1; refusing map acme/widgets#460");
+    expect(r.journal.listEscalations()).toHaveLength(1);
+    expect(r.journal.getEscalation(REPO, "20")).toMatchObject({ root: 1, channelId: "111", notedAt: null });
+   }
+   expect(r.discord.posts).toHaveLength(1);
+   expect(r.discord.edits).toHaveLength(0);
+   const card = r.journal.getEscalation(REPO, "20")!;
+   expect(() => r.journal.upsertEscalation({ ...card, root: 460 })).toThrow("refusing to move it to map acme/widgets#460");
+   expect(r.journal.getEscalation(REPO, "20")).toEqual(card);
+  } finally { r.close(); }
+ });
+
+ test("a worker whose map was removed holds both resource lanes", () => {
+  const r = rig();
+  try {
+   r.journal.upsertWorker({ nodeId: "90", repo: REPO, root: 999, lane: "implement", status: "running" });
+   expect(r.journal.laneHolder("headless")?.root).toBe(999);
+   expect(r.journal.laneHolder("visual")?.root).toBe(999);
   } finally { r.close(); }
  });
 

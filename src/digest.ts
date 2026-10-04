@@ -181,7 +181,7 @@ export function digestContent(inputs: DigestInputs): string {
 interface DigestSyncContext {
   client: EscalationDiscord;
   journal: Journal;
-  repo: string;
+  mapKey: string;
   content: string;
   now: Date;
   deadline: number;
@@ -191,9 +191,9 @@ interface DigestSyncContext {
 export async function syncDailyDigest(
   ctx: DigestSyncContext,
 ): Promise<{ messageId: string; posted: boolean; edited: boolean }> {
-  const { client, journal, repo, content, now, deadline, owned } = ctx;
+  const { client, journal, mapKey, content, now, deadline, owned } = ctx;
   const today = localDateKey(now);
-  const cachedRaw = journal.getHealth(`digest.${repo}`);
+  const cachedRaw = journal.getHealth(`digest.${mapKey}`);
   let cached: {
     today: string;
     messageId: string;
@@ -248,7 +248,7 @@ export async function syncDailyDigest(
     // owner's digest cache (round-35).
     owned();
     journal.setHealth(
-      `digest.${repo}`,
+      `digest.${mapKey}`,
       JSON.stringify({ today, messageId, lastContent: content }),
     );
   } else {
@@ -260,7 +260,7 @@ export async function syncDailyDigest(
     messageId = await client.post(content, deadline);
     owned();
     journal.setHealth(
-      `digest.${repo}`,
+      `digest.${mapKey}`,
       JSON.stringify({ today, messageId, lastContent: content }),
     );
     posted = true;

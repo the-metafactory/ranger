@@ -3,7 +3,6 @@ import { chmodSync, existsSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { drizzle, type BunSQLiteDatabase } from "drizzle-orm/bun-sqlite";
 import { migrate } from "drizzle-orm/bun-sqlite/migrator";
-import { seedLegacyRoots } from "./legacy-roots.ts";
 import * as schema from "./schema.ts";
 
 export type RangerDb = BunSQLiteDatabase<typeof schema>;
@@ -18,8 +17,7 @@ const MIGRATIONS_DIR = join(import.meta.dir, "../../drizzle");
  */
 export function openDb(
   path: string,
-  maps: readonly { repo: string; root: number }[] = [],
-  legacyMapRoots: Readonly<Record<string, number>> = {},
+  beforeMigrate?: (sqlite: Database) => void,
 ): { db: RangerDb; close: () => void } {
   if (path !== ":memory:") {
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
@@ -48,7 +46,7 @@ export function openDb(
 
   const db = drizzle(sqlite, { schema });
   try {
-    seedLegacyRoots(sqlite, maps, legacyMapRoots);
+    beforeMigrate?.(sqlite);
     migrate(db, { migrationsFolder: MIGRATIONS_DIR });
   } catch (error) {
     sqlite.close();

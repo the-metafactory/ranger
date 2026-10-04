@@ -131,6 +131,7 @@ export const escalations = sqliteTable(
   // created_at) — without this it scans+sorts every open card per day.
   index("escalations_repo_status_created_idx").on(
    table.repo,
+   table.root,
    table.status,
    table.createdAt,
   ),
@@ -140,9 +141,11 @@ export const escalations = sqliteTable(
   // sort every matching row (round-29 review).
   index("escalations_repo_status_noted_created_idx").on(
    table.repo,
+   table.root,
    table.status,
    table.notedAt,
    table.createdAt,
+   table.nodeId,
   ),
  ],
 );

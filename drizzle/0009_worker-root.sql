@@ -1,9 +1,12 @@
--- Existing registrations at the worker-root cutover; custom roots may be seeded
--- as ordinary rows before applying this migration.
-CREATE TABLE IF NOT EXISTS ranger_legacy_roots (repo text PRIMARY KEY, root integer NOT NULL);
+-- Seed ranger_legacy_roots from the operator's registrations before migrating,
+-- including an empty table for a new journal.
+CREATE TABLE ranger_root_inputs_guard (ok integer CONSTRAINT
+ "worker-root migration requires ranger_legacy_roots seeded before migrate" CHECK (ok = 1));
 --> statement-breakpoint
-INSERT OR IGNORE INTO ranger_legacy_roots (repo, root) VALUES
- ('the-metafactory/ranger', 1), ('jcfischer/seelite', 1), ('jcfischer/seekolous', 26);
+INSERT INTO ranger_root_inputs_guard SELECT EXISTS (
+ SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ranger_legacy_roots');
+--> statement-breakpoint
+DROP TABLE ranger_root_inputs_guard;
 --> statement-breakpoint
 CREATE TABLE workers_root (node_id text NOT NULL, repo text NOT NULL, root integer NOT NULL,
 pid integer, status text DEFAULT 'claimed' NOT NULL, attempts integer DEFAULT 0 NOT NULL,
@@ -30,9 +33,9 @@ ALTER TABLE escalations_root RENAME TO escalations;
 --> statement-breakpoint
 CREATE INDEX escalations_repo_node_idx ON escalations (repo, node_id);
 --> statement-breakpoint
-CREATE INDEX escalations_repo_status_created_idx ON escalations (repo, status, created_at);
+CREATE INDEX escalations_repo_status_created_idx ON escalations (repo, root, status, created_at);
 --> statement-breakpoint
-CREATE INDEX escalations_repo_status_noted_created_idx ON escalations (repo, status, noted_at, created_at);
+CREATE INDEX escalations_repo_status_noted_created_idx ON escalations (repo, root, status, noted_at, created_at, node_id);
 --> statement-breakpoint
 INSERT OR IGNORE INTO health (key, value)
 SELECT health.key || '#' || ranger_legacy_roots.root, health.value

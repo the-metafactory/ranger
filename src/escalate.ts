@@ -305,7 +305,7 @@ async function digestOneMap(
     const synced = await syncDailyDigest({
       client,
       journal,
-      repo: mapKey(map),
+      mapKey: mapKey(map),
       content,
       now,
       deadline: digestDeadline,

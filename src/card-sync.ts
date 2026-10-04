@@ -580,6 +580,9 @@ async function syncCard(
     content,
   };
   try {
+    if (prior !== undefined && prior.root !== map.root) {
+      throw new Error(`escalation ${map.repo}#${node.id} belongs to map ${map.repo}#${prior.root}; refusing map ${mapKey(map)}`);
+    }
     if (prior === undefined) {
       return await postFresh(cardCtx);
     }

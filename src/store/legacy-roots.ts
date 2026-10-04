@@ -13,8 +13,6 @@ export function seedLegacyRoots(
   const rows = sqlite.query(`SELECT DISTINCT repo FROM ${table}`).all() as { repo: string }[];
   for (const { repo } of rows) legacyRepos.add(repo);
  }
- if (legacyRepos.size === 0) return;
-
  const roots = new Map<string, number>();
  for (const repo of legacyRepos) {
   const candidates = maps.filter(m => m.repo === repo);
@@ -29,6 +27,9 @@ export function seedLegacyRoots(
   throw new Error(`Cannot backfill legacy map roots for: ${unresolved.join(", ")}. Register one map per repo or set state.legacyMapRoots to its registered legacy root.`);
  }
  sqlite.transaction(() => {
+  // Only prepare cutover inputs before workers have acquired their root column.
+  const columns = sqlite.query("PRAGMA table_info(workers)").all() as { name: string }[];
+  if (columns.some(c => c.name === "root")) return;
   sqlite.run("CREATE TABLE IF NOT EXISTS ranger_legacy_roots (repo text PRIMARY KEY, root integer NOT NULL)");
   for (const repo of legacyRepos) {
    sqlite.run("INSERT OR REPLACE INTO ranger_legacy_roots VALUES (?, ?)", [repo, roots.get(repo)!]);

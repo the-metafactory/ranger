@@ -202,7 +202,7 @@ Everything parked or vetoed is terminal until an operator verb. Silence never un
 
 **Concurrency, shaped around the real bottleneck** (review concurrency is 1 in-flight per agent lane: the cortex#2516 mechanism is merged but defaults to 1 and no boot site passes the knob; #2517 holds the plumbing; a second downstream serialization point is unlocated — do not design around a fix you cannot observe):
 
-- Implement resource lanes (node #57): **1 visual + 1 headless** across all maps. Map config (`lane`, otherwise visual with `commands.probe`, headless without) determines capacity by `(repo, root)`. Within each lane, the persisted map of the last implement start determines round-robin order (node #47); maps with nothing takeable are skipped. Claims, operator resumes, sweep respawns and merge-desk send-backs record starts; close-only runs do not. Awaiting-merge releases capacity; the dashboard predicts the same next choices as walk.
+- Implement resource lanes (node #57): **1 visual + 1 headless** across all maps. Map config (`lane`, otherwise visual with `commands.probe`, headless without) determines capacity by `(repo, root)`. Unknown or ambiguous worker maps conservatively hold both resource lanes. Within each lane, the persisted map of the last implement start determines round-robin order (node #47); maps with nothing takeable are skipped. Claims, operator resumes, sweep respawns and merge-desk send-backs record starts; close-only runs do not. Awaiting-merge releases capacity; the dashboard predicts the same next choices as walk.
 - Research lane: **N** (default 2–3).
 - Merge/close: serialized (the decisions span has no CAS).
 - Escalations: non-blocking, and BOUNDED per tick — the desk processes at

@@ -392,7 +392,7 @@ export async function runNode(
  const map = ctx.map;
  const repo = map.repo;
  const row = journal.getWorker(nodeId, repo);
- if (row !== null && row.root !== map.root) throw new Error('run-node map disagrees with the journal root');
+ journal.assertWorkerRoot(nodeId, repo, map.root);
  const base: RunNodeOutcome = {
   nodeId,
   repo,

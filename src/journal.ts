@@ -1,5 +1,6 @@
 import { and, asc, desc, eq, gt, inArray, isNull, lt, or, sql } from "drizzle-orm";
 import { openDb, openDbReadOnly, type RangerDb } from "./store/db.ts";
+import { seedLegacyRoots } from "./store/legacy-roots.ts";
 import {
  escalations,
  escalationDestinations,
@@ -160,7 +161,7 @@ export class Journal {
   legacyMapRoots: Readonly<Record<string, number>> = {},
  ) {
   this.path = path;
-  const connection = opened ?? openDb(path, maps, legacyMapRoots);
+  const connection = opened ?? openDb(path, sqlite => seedLegacyRoots(sqlite, maps, legacyMapRoots));
   this.db = connection.db;
   this.closeDb = connection.close;
  }
@@ -177,13 +178,17 @@ export class Journal {
 
  // ---- workers ----
 
+ assertWorkerRoot(nodeId: string, repo: string, root: number): void {
+  const existing = this.getWorker(nodeId, repo);
+  if (existing !== null && existing.root !== root) {
+   throw new Error(`node ${repo}#${nodeId} already belongs to map ${repo}#${existing.root}; refusing to move it to map ${repo}#${root}`);
+  }
+ }
+
  upsertWorker(
   row: Partial<WorkerRow> & Pick<WorkerRow, "nodeId" | "repo" | "root" | "status">,
  ): void {
-  const existing = this.getWorker(row.nodeId, row.repo);
-  if (existing !== null && existing.root !== row.root) {
-   throw new Error(`node ${row.repo}#${row.nodeId} already belongs to map ${existing.root}; refusing to move it to map ${row.root}`);
-  }
+  this.assertWorkerRoot(row.nodeId, row.repo, row.root);
   this.db
    .insert(workers)
    .values({
@@ -283,6 +288,7 @@ export class Journal {
  /**
   * One claimed/running implement worker per resource lane across all maps.
   * Excluding an occupant requires its repo as well as node id.
+  * Unknown or ambiguous maps conservatively hold both resource lanes.
   */
  laneHolder(
   lane: ImplementLane,
@@ -471,6 +477,9 @@ export class Journal {
    >,
  ): void {
   const existing = this.getEscalation(row.repo, row.nodeId);
+  if (existing !== null && existing.root !== row.root) {
+   throw new Error(`escalation ${row.repo}#${row.nodeId} belongs to map ${row.repo}#${existing.root}; refusing to move it to map ${row.repo}#${row.root}`);
+  }
   // One resolved field set, reused for both the insert values and the
   // conflict-update set (adding an escalation field is a single edit).
   const fields = {

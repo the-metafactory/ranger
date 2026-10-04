@@ -217,9 +217,10 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
       errors.push(`#${node.id} vetoed — not claimed`);
       continue;
      }
-     const existing = journal.getWorker(node.id, map.repo);
-     if (existing !== null && existing.root !== map.root) {
-      errors.push(`#${node.id} already belongs to ${mapKey(existing)} — claim refused`);
+     try {
+      journal.assertWorkerRoot(node.id, map.repo, map.root);
+     } catch (error) {
+      errors.push(error instanceof Error ? error.message : String(error));
       continue;
      }
 

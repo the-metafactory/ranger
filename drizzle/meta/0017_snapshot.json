@@ -159,6 +159,7 @@
           "name": "escalations_repo_status_created_idx",
           "columns": [
             "repo",
+            "root",
             "status",
             "created_at"
           ],
@@ -168,9 +169,11 @@
           "name": "escalations_repo_status_noted_created_idx",
           "columns": [
             "repo",
+            "root",
             "status",
             "noted_at",
-            "created_at"
+            "created_at",
+            "node_id"
           ],
           "isUnique": false
         }
