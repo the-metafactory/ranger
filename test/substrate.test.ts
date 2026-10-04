@@ -16,6 +16,7 @@ import {
  parseCodexQuota,
  persistReading,
  type QuotaReading,
+ workerOutputFor,
  workerCommandFor,
  type ClaudeRateLimitEvent,
  type CodexRateLimitsResponse,
@@ -688,6 +689,68 @@ describe("isClaudeSignalLine — what a Claude worker run keeps", () => {
  });
 });
 
+describe("runCmd stdout tail beside a filtered stream", () => {
+ test("keeps the last unfiltered lines, each cut to a bounded length", async () => {
+  const r = await runCmd(
+   "bash",
+   ["-c", `for i in $(seq 1 60); do echo "line $i"; done; head -c 5000 /dev/zero | tr '\\0' x; echo`],
+   { keepStdoutLine: isClaudeSignalLine },
+  );
+  expect(r.stdout).toBe("");
+  const tail = (r.stdoutTail ?? "").split("\n");
+  expect(tail).toHaveLength(50);
+  expect(tail[0]).toBe("line 12");
+  expect(tail[49]).toBe(`${"x".repeat(2000)}…`);
+ });
+
+ test("a line streamed over many chunks is joined whole", async () => {
+  const big = "y".repeat(300_000);
+  const r = await runCmd(
+   "bash",
+   ["-c", `printf '{"type":"result","result":"%s"}\n' "$(head -c 300000 /dev/zero | tr '\\0' y)"`],
+   { keepStdoutLine: isClaudeSignalLine },
+  );
+  expect(r.stdout).toBe(`{"type":"result","result":"${big}"}\n`);
+ });
+});
+
+describe("workerOutputFor — reading a run on its substrate's format", () => {
+ test("claude: the result event is the summary and the rate_limit_event is cached", async () => {
+  await withJournal((journal) => {
+   const stdout = [
+    '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","unifiedWindows":{"five_hour":{"utilization":0.28,"resetsAt":1791055200}}}}',
+    '{"type":"result","subtype":"success","result":"All done."}',
+    "",
+   ].join("\n");
+   const { result, lines } = workerOutputFor("claude").read({ code: 0, stdout, stderr: "" }, journal);
+   expect(result.stdout).toBe("All done.");
+   expect(lines).toHaveLength(3);
+   expect(journal.getSubstrateReading("claude")?.fiveHourUsedPct).toBe(28);
+  });
+ });
+
+ test("claude: a crash before the result event logs the unfiltered tail", async () => {
+  await withJournal((journal) => {
+   const { result } = workerOutputFor("claude").read(
+    { code: 1, stdout: "", stderr: "boom", stdoutTail: "panic: out of memory" },
+    journal,
+   );
+   expect(result.stdout).toBe("panic: out of memory");
+  });
+ });
+
+ test("pi, codex and an unlabelled run read as plain text", async () => {
+  await withJournal((journal) => {
+   for (const substrate of ["pi", "codex", undefined] as const) {
+    const out = workerOutputFor(substrate);
+    expect(out.runOptions).toEqual({});
+    const raw = { code: 0, stdout: '{"type":"result","result":"x"}', stderr: "" };
+    expect(out.read(raw, journal)).toEqual({ result: raw });
+   }
+  });
+ });
+});
+
 describe("substrateViews — the serve panel's derived state", () => {
  test("derives capped, fresh and eligible with the selector's rules", () => {
   const now = new Date();
@@ -720,7 +783,8 @@ describe("sageReview passes the chosen substrate (sage src/cli/index.ts --substr
   );
   process.env.SAGE_ARGV_OUT = out;
   try {
-   await sageReview("acme/widgets", 7, "ghp_readonly", { command: fake, substrate: "codex" });
+   const verdict = await sageReview("acme/widgets", 7, "ghp_readonly", { command: fake, substrate: "codex" });
+   expect(verdict.verdict).toBe("approved");
    expect(readFileSync(out, "utf8").trim().split("\n")).toEqual([
     "review",
     "acme/widgets#7",
@@ -728,6 +792,11 @@ describe("sageReview passes the chosen substrate (sage src/cli/index.ts --substr
     "--substrate",
     "codex",
    ]);
+   // The fake holds sage's argv contract: a substrate sage does not know is
+   // an ordinary review failure.
+   await expect(
+    sageReview("acme/widgets", 7, "ghp_readonly", { command: fake, substrate: "gemini" as never }),
+   ).rejects.toThrow("unknown substrate 'gemini'");
   } finally {
    delete process.env.SAGE_ARGV_OUT;
    rmSync(dir, { recursive: true, force: true });

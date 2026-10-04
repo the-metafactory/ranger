@@ -32,12 +32,21 @@ export function isFresh(reading: SubstrateReading, config: SubstrateConfig, now:
  return ageMs <= maxReadingAgeMs(reading.substrate, config);
 }
 
+/** Minutes since the reading was taken (never negative). */
+export function readingAgeMin(reading: SubstrateReading, now: Date): number {
+ return Math.max(0, Math.round((now.getTime() - Date.parse(reading.readAt)) / 60_000));
+}
+
+/** The reading's capped-until while it is still in the future, else null. */
+export function activeCappedUntil(reading: SubstrateReading, now: Date): string | null {
+ return reading.cappedUntil !== null && Date.parse(reading.cappedUntil) > now.getTime()
+  ? reading.cappedUntil
+  : null;
+}
+
 /** Capped now: the reading says so, or a capped-until is still in the future. */
 export function isCappedAt(reading: SubstrateReading, now: Date): boolean {
- return (
-  reading.capped ||
-  (reading.cappedUntil !== null && Date.parse(reading.cappedUntil) > now.getTime())
- );
+ return reading.capped || activeCappedUntil(reading, now) !== null;
 }
 
 /**
@@ -52,7 +61,7 @@ export function isEligible(
 ): EligibleSubstrate | null {
  if (reading === null) return null;
  const name = reading.substrate;
- if (name !== "claude" && name !== "codex") return null;
+ if (!STRONG_SUBSTRATES.includes(name)) return null;
  if (!isFresh(reading, config, now)) return null;
  if (isCappedAt(reading, now)) return null;
 
@@ -105,7 +114,7 @@ export function describeReadings(readings: SubstrateReading[], now: Date): strin
  const parts = STRONG_SUBSTRATES.map((name) => {
   const r = readings.find((x) => x.substrate === name);
   if (r === undefined) return `${name} unread`;
-  const age = Math.round((now.getTime() - Date.parse(r.readAt)) / 60_000);
+  const age = readingAgeMin(r, now);
   const windows = [
    r.fiveHourUsedPct === null ? null : `5h ${r.fiveHourUsedPct}%`,
    r.sevenDayUsedPct === null ? null : `7d ${r.sevenDayUsedPct}%`,

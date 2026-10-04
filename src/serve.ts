@@ -41,7 +41,14 @@ import { type FrontierEntry, graphFrontier, RateLimitError } from "./graph.ts";
 import { runCmd } from "./exec.ts";
 import { classify, type ClassifiedNode, loadProbeRegistry } from "./route.ts";
 import type { SubstrateReading } from "./journal.ts";
-import { isCappedAt, isEligible, isFresh, type SubstrateConfig } from "./substrate-policy.ts";
+import {
+ activeCappedUntil,
+ isCappedAt,
+ isEligible,
+ isFresh,
+ readingAgeMin,
+ type SubstrateConfig,
+} from "./substrate-policy.ts";
 import { assertReadOnlyToken, gatedEnv } from "./token-gate.ts";
 
 const ID_PATTERN = /^\d+$/;
@@ -238,11 +245,10 @@ export function substrateViews(
   sevenDayUsedPct: r.sevenDayUsedPct,
   resetsAt: r.resetsAt,
   readAt: r.readAt,
-  ageMin: Math.max(0, Math.round((now.getTime() - Date.parse(r.readAt)) / 60_000)),
+  ageMin: readingAgeMin(r, now),
   fresh: isFresh(r, config, now),
   capped: isCappedAt(r, now),
-  cappedUntil:
-   r.cappedUntil !== null && Date.parse(r.cappedUntil) > now.getTime() ? r.cappedUntil : null,
+  cappedUntil: activeCappedUntil(r, now),
   eligible: isEligible(r, config, now) !== null,
  }));
 }

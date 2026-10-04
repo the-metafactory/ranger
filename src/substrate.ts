@@ -13,11 +13,12 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RangerConfig } from "./config.ts";
-import { runCmd } from "./exec.ts";
+import { runCmd, splitLines, type RunOptions, type RunResult } from "./exec.ts";
 import type { Journal, SubstrateReading } from "./journal.ts";
 import type { SubstrateName } from "./store/schema.ts";
 import { workerHostEnv } from "./worker-env.ts";
 import {
+ activeCappedUntil,
  describeReadings,
  isFresh,
  STRONG_SUBSTRATES,
@@ -113,13 +114,10 @@ function earliestReset(windows: QuotaWindow[]): number | null {
  * chunk.
  */
 export function drainJsonLines(buffer: string): { messages: unknown[]; rest: string } {
+ const { lines, rest } = splitLines(buffer);
  const messages: unknown[] = [];
- let start = 0;
- for (;;) {
-  const end = buffer.indexOf("\n", start);
-  if (end < 0) break;
-  const line = buffer.slice(start, end).trim();
-  start = end + 1;
+ for (const raw of lines) {
+  const line = raw.trim();
   if (line.length === 0) continue;
   try {
    messages.push(JSON.parse(line));
@@ -127,7 +125,7 @@ export function drainJsonLines(buffer: string): { messages: unknown[]; rest: str
    // a non-JSON line (a log line) is not a protocol message
   }
  }
- return { messages, rest: buffer.slice(start) };
+ return { messages, rest };
 }
 
 const CODEX_RATE_LIMITS_ID = 3;
@@ -135,11 +133,18 @@ const CODEX_RATE_LIMITS_ID = 3;
 /**
  * Read Codex quota (free): spawn `codex app-server`, send `initialize`, the
  * `initialized` notification and `account/rateLimits/read`, parse the reply.
+ * Like the Claude probe it runs in a private scratch dir with the worker host
+ * env (no RANGER_* tokens; HOME and CODEX_* pass, so codex finds its auth).
  */
 export function readCodexQuota(opts: { timeoutMs?: number } = {}): Promise<QuotaReading> {
  const timeout = opts.timeoutMs ?? 30_000;
  return new Promise((resolve, reject) => {
-  const child = spawn("codex", ["app-server"], { stdio: ["pipe", "pipe", "ignore"] });
+  const scratch = mkdtempSync(join(tmpdir(), "ranger-codex-"));
+  const child = spawn("codex", ["app-server"], {
+   cwd: scratch,
+   env: workerHostEnv(),
+   stdio: ["pipe", "pipe", "ignore"],
+  });
   let buffer = "";
   let done = false;
   const settle = (fn: () => void) => {
@@ -147,6 +152,7 @@ export function readCodexQuota(opts: { timeoutMs?: number } = {}): Promise<Quota
    done = true;
    clearTimeout(timer);
    child.kill("SIGTERM");
+   rmSync(scratch, { recursive: true, force: true });
    fn();
   };
   const timer = setTimeout(
@@ -275,10 +281,10 @@ export function isClaudeSignalLine(line: string): boolean {
 
 /**
  * The final summary text of a Claude stream-json run (its `result` event),
- * so worker logs read as the plain `claude -p` output did. Raw stdout when
- * the stream carries no result event.
+ * so worker logs read as the plain `claude -p` output did. `fallback` when
+ * the stream carries no result event (a crash before it).
  */
-export function extractClaudeResultText(lines: string[], raw: string): string {
+export function extractClaudeResultText(lines: string[], fallback: string): string {
  for (let i = lines.length - 1; i >= 0; i--) {
   const line = lines[i].trim();
   if (!line.startsWith("{")) continue;
@@ -289,7 +295,7 @@ export function extractClaudeResultText(lines: string[], raw: string): string {
    continue;
   }
  }
- return raw;
+ return fallback;
 }
 
 /** Cache the last rate_limit_event of a Claude run as the current reading. */
@@ -333,10 +339,7 @@ export async function probeClaudeQuota(opts: { timeoutMs?: number } = {}): Promi
  */
 export function persistReading(journal: Journal, reading: QuotaReading): void {
  const prior = journal.getSubstrateReading(reading.substrate);
- const priorUntil =
-  prior?.cappedUntil != null && Date.parse(prior.cappedUntil) > reading.readAt.getTime()
-   ? prior.cappedUntil
-   : null;
+ const priorUntil = prior === null ? null : activeCappedUntil(prior, reading.readAt);
  const fiveHour = reading.windows.find((w) => w.kind === "five_hour");
  const sevenDay = reading.windows.find((w) => w.kind === "seven_day");
  const resets = earliestReset(reading.windows);
@@ -371,6 +374,43 @@ export function workerCommandFor(substrate: SubstrateName, config: RangerConfig)
   case "pi":
    return ["pi", "-p", "--provider", config.substrates.pi.provider, "--model", config.substrates.pi.model];
  }
+}
+
+/** How a worker run's output is read on its substrate. */
+export interface WorkerOutput {
+ /** Run options the substrate's output needs (stream filtering). */
+ runOptions: Pick<RunOptions, "keepStdoutLine">;
+ /**
+  * The run as the worker log carries it, plus the stream lines the
+  * substrate's quota and cap signals are read from (none for plain output).
+  * Caches any quota reading the stream carries.
+  */
+ read(raw: RunResult, journal: Journal): { result: RunResult; lines?: string[] };
+}
+
+const PLAIN_OUTPUT: WorkerOutput = { runOptions: {}, read: (raw) => ({ result: raw }) };
+
+/**
+ * A Claude worker streams JSON, kept to its signal lines as it runs: its
+ * rate_limit_events are the current reading and its cap signal, and its
+ * result event is the summary. A run that crashes before the result event
+ * logs its unfiltered stdout tail and stderr instead.
+ */
+const CLAUDE_STREAM_OUTPUT: WorkerOutput = {
+ runOptions: { keepStdoutLine: isClaudeSignalLine },
+ read(raw, journal) {
+  const lines = raw.stdout.split("\n");
+  cacheClaudeRateLimitEvents(lines, journal);
+  return {
+   result: { ...raw, stdout: extractClaudeResultText(lines, raw.stdoutTail ?? raw.stdout) },
+   lines,
+  };
+ },
+};
+
+/** The output reader for a substrate; an unlabelled run is plain text. */
+export function workerOutputFor(substrate: SubstrateName | undefined): WorkerOutput {
+ return substrate === "claude" ? CLAUDE_STREAM_OUTPUT : PLAIN_OUTPUT;
 }
 
 // ---- refresh ----

@@ -23,11 +23,9 @@ import type { ImplementPhase, Journal } from "./journal.ts";
 import { assembleImplementPrompt } from "./prompt.ts";
 import { ReviewError, sageReview, type ReviewVerdict } from "./review.ts";
 import {
- cacheClaudeRateLimitEvents,
  confirmCap,
- extractClaudeResultText,
- isClaudeSignalLine,
  selectSubstrate,
+ workerOutputFor,
  type CapSignal,
  type SubstrateName,
  type SubstrateReaders,
@@ -618,24 +616,20 @@ async function workerPass(
   probeTier: map.commands.probe !== undefined,
  });
  ctx.journal.assertGeneration(nodeId, ctx.generation, "spawn the worker");
+ const output = workerOutputFor(ctx.substrate);
  const raw = await ctx.workerRun(prompt, {
   cwd: worktree,
   timeoutMs: config.workers.wallClockMin * 60_000,
   env: workerEnv(config, map.repo),
-  ...(ctx.substrate === "claude" ? { keepStdoutLine: isClaudeSignalLine } : {}),
+  ...output.runOptions,
   processGroup: true,
   onSpawn: (pgid) => journal.updateWorker(nodeId, { workerPgid: pgid }),
  });
  journal.updateWorker(nodeId, { workerPgid: null });
 
- // A Claude worker streams JSON (node #45), kept to its signal lines as it
- // runs: its rate_limit_events are the current reading and its cap signal,
- // and its result event is the summary the worker log carries, as plain
- // `claude -p` output did.
- const lines = ctx.substrate === "claude" ? raw.stdout.split("\n") : undefined;
- if (lines !== undefined) cacheClaudeRateLimitEvents(lines, journal);
- const result: RunResult =
-  lines === undefined ? raw : { ...raw, stdout: extractClaudeResultText(lines, raw.stdout) };
+ // Read on the substrate's own output format (node #45): a Claude stream's
+ // quota readings are cached, and its signal lines feed the cap check.
+ const { result, lines } = output.read(raw, journal);
 
  const log = saveWorkerLog(
   journal.path,
