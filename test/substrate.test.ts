@@ -6,24 +6,27 @@ import { loadConfig } from "../src/config.ts";
 import { openJournal, type Journal, type SubstrateReading } from "../src/journal.ts";
 import {
  confirmCap,
- describeReadings,
  detectClaudeCap,
  drainJsonLines,
  extractClaudeResultText,
+ freshReadings,
  isClaudeSignalLine,
- isEligible,
  markSubstrateCapped,
  parseClaudeRateLimitEvent,
  parseCodexQuota,
  persistReading,
  type QuotaReading,
- selectForBuild,
- selectForReview,
  workerCommandFor,
  type ClaudeRateLimitEvent,
  type CodexRateLimitsResponse,
- type SubstrateConfig,
 } from "../src/substrate.ts";
+import {
+ describeReadings,
+ isEligible,
+ selectForBuild,
+ selectForReview,
+ type SubstrateConfig,
+} from "../src/substrate-policy.ts";
 import { recordedReviews, reviewMarker } from "../src/implement.ts";
 import { sageReview } from "../src/review.ts";
 import { runCmd } from "../src/exec.ts";
@@ -125,6 +128,27 @@ describe("parseCodexQuota", () => {
   const q = parseCodexQuota(resp);
   expect(q.windows).toHaveLength(0);
   expect(q.capped).toBe(false);
+ });
+
+ test("a window of an unknown duration fails the read, so Codex stays ineligible", async () => {
+  const resp: CodexRateLimitsResponse = {
+   rateLimits: {
+    primary: { usedPercent: 99, windowDurationMins: 1440, resetsAt: 1791647617 },
+    secondary: null,
+    rateLimitReachedType: null,
+   },
+  };
+  expect(() => parseCodexQuota(resp)).toThrow("1440-minute window");
+
+  await withJournal(async (journal) => {
+   const now = new Date();
+   const readings = await freshReadings(journal, DEFAULT_CONFIG, now, {
+    codex: async () => parseCodexQuota(resp, now),
+    claude: () => Promise.reject(new Error("unread")),
+   });
+   expect(readings.find((r) => r.substrate === "codex")).toBeUndefined();
+   expect(selectForBuild({ readings, now, config: DEFAULT_CONFIG })).toBe("pi");
+  });
  });
 });
 

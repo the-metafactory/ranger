@@ -17,12 +17,17 @@ import { runCmd } from "./exec.ts";
 import type { Journal, SubstrateReading } from "./journal.ts";
 import type { SubstrateName } from "./store/schema.ts";
 import { workerHostEnv } from "./worker-env.ts";
-import { isFresh, STRONG_SUBSTRATES, type SubstrateConfig } from "./substrate-policy.ts";
+import {
+ describeReadings,
+ isFresh,
+ STRONG_SUBSTRATES,
+ type SelectionInput,
+ type SubstrateConfig,
+} from "./substrate-policy.ts";
 
 // ---- types ----
 
 export type { SubstrateName };
-export * from "./substrate-policy.ts";
 
 export interface QuotaWindow {
  kind: "five_hour" | "seven_day";
@@ -72,12 +77,19 @@ function codexWindowKind(mins: number): QuotaWindow["kind"] | null {
  return null;
 }
 
+/**
+ * A window of a duration ranger does not know throws: dropping it would leave
+ * a reading that looks unlimited, so the read fails and the missing reading
+ * keeps Codex ineligible (fail closed).
+ */
 export function parseCodexQuota(resp: CodexRateLimitsResponse, now = new Date()): QuotaReading {
  const windows: QuotaWindow[] = [];
  for (const slot of [resp.rateLimits.primary, resp.rateLimits.secondary]) {
   if (slot === null) continue;
   const kind = codexWindowKind(slot.windowDurationMins);
-  if (kind === null) continue;
+  if (kind === null) {
+   throw new Error(`codex reports a ${slot.windowDurationMins}-minute window ranger cannot judge`);
+  }
   windows.push({ kind, usedPct: slot.usedPercent, resetsAt: slot.resetsAt });
  }
  const capped =
@@ -402,6 +414,27 @@ export async function freshReadings(
   STRONG_SUBSTRATES.map((name) => ensureFreshReading(name, journal, config, now, readers)),
  );
  return journal.listSubstrateReadings();
+}
+
+/**
+ * Refresh the readings, leave out the substrates capped earlier in this run,
+ * and pick with `pick` (selectForBuild, or selectForReview for a head).
+ * `chosenOn` describes every reading the choice was made on.
+ */
+export async function selectSubstrate(
+ journal: Journal,
+ config: SubstrateConfig,
+ excluded: ReadonlySet<SubstrateName>,
+ readers: SubstrateReaders | undefined,
+ pick: (input: SelectionInput) => SubstrateName,
+): Promise<{ substrate: SubstrateName; chosenOn: string }> {
+ const now = new Date();
+ const readings = await freshReadings(journal, config, now, readers);
+ const selectable = readings.filter((r) => !excluded.has(r.substrate));
+ return {
+  substrate: pick({ readings: selectable, now, config }),
+  chosenOn: describeReadings(readings, now),
+ };
 }
 
 // ---- mid-session cap detection ----

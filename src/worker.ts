@@ -26,16 +26,15 @@ import { FencedError, type Journal } from "./journal.ts";
 import { assembleResearchPrompt } from "./prompt.ts";
 import { IMPLEMENT_KINDS } from "./route.ts";
 import {
- describeReadings,
- freshReadings,
  markSubstrateCapped,
- selectForBuild,
+ selectSubstrate,
  workerCommandFor,
  type CapSignal,
  type QuotaReading,
  type SubstrateName,
  type SubstrateReaders,
 } from "./substrate.ts";
+import { selectForBuild } from "./substrate-policy.ts";
 import { resolveReadOnlyToken } from "./token-gate.ts";
 import { workerEnv } from "./worker-env.ts";
 import { saveWorkerLog } from "./worker-log.ts";
@@ -73,7 +72,8 @@ export interface RunNodeContext {
  /**
   * Worker command + leading args; the prompt is appended as the final arg.
   * Defaults to the selected substrate's command (`workerCommandFor`);
-  * `RANGER_WORKER_CMD` overrides the implement lane's. Tests point this
+  * `RANGER_WORKER_CMD` overrides the implement lane's, unlabelled
+  * (`envWorkerOverride`). Tests point this
   * at a fake worker script.
   */
  workerCommand?: string[];
@@ -214,34 +214,39 @@ function defaultWorkerCommand(): string[] {
  return ["claude", "-p"];
 }
 
-/** Resolve the worker command: explicit override > the substrate's command. */
-function resolveWorkerCommand(ctx: RunNodeContext, substrate: SubstrateName): string[] {
- if (ctx.workerCommand !== undefined) return ctx.workerCommand;
- if (process.env.RANGER_WORKER_CMD) return defaultWorkerCommand();
- return workerCommandFor(substrate, ctx.config);
+/**
+ * The operator's `RANGER_WORKER_CMD` (no in-process injection): a fixed
+ * command whose substrate ranger cannot know. Build selection is skipped and
+ * the session runs unlabelled: its heads read back as Pi-written (node #45
+ * brief), its output is read as plain text and no cap is inferred from it.
+ * Review selection still reads the real quota.
+ */
+function envWorkerOverride(ctx: RunNodeContext): string[] | undefined {
+ if (ctx.workerCommand !== undefined || ctx.worker !== undefined) return undefined;
+ return process.env.RANGER_WORKER_CMD ? defaultWorkerCommand() : undefined;
 }
 
-/** Any injected worker, reviewer or command: a test or operator run, never the real CLIs' quota. */
-function commandOverridden(ctx: RunNodeContext): boolean {
- return (
-  ctx.workerCommand !== undefined ||
-  ctx.worker !== undefined ||
-  ctx.reviewer !== undefined ||
-  Boolean(process.env.RANGER_WORKER_CMD)
- );
+/** Resolve the worker command: explicit override > the substrate's command. */
+function resolveWorkerCommand(ctx: RunNodeContext, substrate: SubstrateName): string[] {
+ return ctx.workerCommand ?? workerCommandFor(substrate, ctx.config);
+}
+
+/** An in-process worker, reviewer or command: a test run, never the real CLIs' quota. */
+function injected(ctx: RunNodeContext): boolean {
+ return ctx.workerCommand !== undefined || ctx.worker !== undefined || ctx.reviewer !== undefined;
 }
 
 const failingRead = (): Promise<QuotaReading> =>
- Promise.reject(new Error("quota reads are off under a worker command override"));
+ Promise.reject(new Error("quota reads are off under an injected worker, reviewer or command"));
 
 /**
  * The quota readers: injected ones, else the real CLIs — except under an
- * injected worker, reviewer or command (tests, operator runs), where reads
- * fail closed rather than spawn a real `claude` or `codex`.
+ * injected worker, reviewer or command (tests), where reads fail closed
+ * rather than spawn a real `claude` or `codex`.
  */
 function resolveReaders(ctx: RunNodeContext): SubstrateReaders | undefined {
  if (ctx.substrateReaders !== undefined) return ctx.substrateReaders;
- return commandOverridden(ctx) ? { claude: failingRead, codex: failingRead } : undefined;
+ return injected(ctx) ? { claude: failingRead, codex: failingRead } : undefined;
 }
 
 /**
@@ -256,14 +261,7 @@ async function selectBuildSubstrate(
  if (ctx.substrate !== undefined && excluded.size === 0) {
   return { substrate: ctx.substrate, chosenOn: "fixed by the caller" };
  }
- const now = new Date();
- const sc = ctx.config.substrates;
- const readings = await freshReadings(ctx.journal, sc, now, resolveReaders(ctx));
- const selectable = readings.filter((r) => !excluded.has(r.substrate));
- return {
-  substrate: selectForBuild({ readings: selectable, now, config: sc }),
-  chosenOn: describeReadings(readings, now),
- };
+ return selectSubstrate(ctx.journal, ctx.config.substrates, excluded, resolveReaders(ctx), selectForBuild);
 }
 
 /**
@@ -475,13 +473,17 @@ async function runImplementNode(
  const capped = new Set<SubstrateName>();
  let outcome: ImplementOutcome;
  for (;;) {
-  const { substrate, chosenOn } = await selectBuildSubstrate(ctx, capped);
-  const workerCmd = resolveWorkerCommand(ctx, substrate);
-  journal.updateWorker(nodeId, { substrate });
+  const envCmd = envWorkerOverride(ctx);
+  const { substrate, chosenOn } =
+   envCmd === undefined
+    ? await selectBuildSubstrate(ctx, capped)
+    : { substrate: undefined, chosenOn: "RANGER_WORKER_CMD override; its heads count as Pi-written" };
+  const workerCmd = envCmd ?? resolveWorkerCommand(ctx, substrate as SubstrateName);
+  journal.updateWorker(nodeId, { substrate: substrate ?? null });
   journal.recordEvent("worker-start", {
    nodeId,
    repo,
-   detail: `substrate ${substrate} (${chosenOn}), command: ${workerCmd[0]}`.slice(0, 400),
+   detail: `substrate ${substrate ?? "unknown"} (${chosenOn}), command: ${workerCmd[0]}`.slice(0, 400),
   });
   try {
    outcome = await runImplement({

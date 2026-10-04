@@ -864,6 +864,42 @@ describe("implement lane (node #23)", () => {
   expect(markers[0].body).toContain("substrate=pi -->");
  }, 60_000);
 
+ test("a RANGER_WORKER_CMD session runs unlabelled and its review still selects on real quota", async () => {
+  const r = await rig({});
+  cleanup.push(r.dir);
+  delete r.ctx.workerCommand;
+  process.env.RANGER_WORKER_CMD = implementWorker;
+  r.ctx.substrateReaders = {
+   claude: () => Promise.reject(new Error("down")),
+   codex: async () => ({
+    substrate: "codex",
+    readAt: new Date(),
+    windows: [{ kind: "five_hour", usedPct: 10, resetsAt: Math.floor(Date.now() / 1000) + 3600 }],
+    capped: false,
+    cappedUntil: null,
+   }),
+  };
+  const scripted = r.ctx.reviewer!;
+  const reviewSubstrates: (string | undefined)[] = [];
+  r.ctx.reviewer = async (repo, pr, token, opts) => {
+   reviewSubstrates.push(opts?.substrate);
+   return scripted(repo, pr, token, opts);
+  };
+
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("awaiting-merge");
+  // The override's substrate is unknown: no head label (it counts as Pi's),
+  // and the review runs on the eligible strong substrate, not on Pi.
+  expect(reviewSubstrates).toEqual(["codex"]);
+  expect(r.journal.getWorker("20")?.substrate).toBeNull();
+  const head = await r.github.sha("node/20-add-the-feature-module");
+  expect(r.journal.headSubstrate(head)).toBeNull();
+  const start = r.journal
+   .listEvents("acme/widgets", 200)
+   .find((e) => e.kind === "worker-start" && e.detail?.startsWith("substrate "));
+  expect(start?.detail).toContain("substrate unknown (RANGER_WORKER_CMD override");
+ }, 60_000);
+
  test("a codex failure that only prints 'rate limit' is an ordinary failure (no spoofed cap)", async () => {
   const r = await rig({});
   cleanup.push(r.dir);

@@ -25,15 +25,14 @@ import { ReviewError, sageReview, type ReviewVerdict } from "./review.ts";
 import {
  cacheClaudeRateLimitEvents,
  confirmCap,
- describeReadings,
  extractClaudeResultText,
- freshReadings,
  isClaudeSignalLine,
- selectForReview,
+ selectSubstrate,
  type CapSignal,
  type SubstrateName,
  type SubstrateReaders,
 } from "./substrate.ts";
+import { selectForReview } from "./substrate-policy.ts";
 import { workerEnv } from "./worker-env.ts";
 import { saveWorkerLog } from "./worker-log.ts";
 
@@ -567,17 +566,15 @@ async function selectReviewSubstrate(
  ctx: ImplementContext,
  headSha: string,
 ): Promise<{ substrate: SubstrateName; chosenOn: string }> {
- const sc = ctx.config.substrates;
- const now = new Date();
- const readings = await freshReadings(ctx.journal, sc, now, ctx.substrateReaders);
- const excluded = ctx.excludedSubstrates ?? new Set<SubstrateName>();
- const selectable = readings.filter((r) => !excluded.has(r.substrate));
  const author = ctx.journal.headSubstrate(headSha) ?? "pi";
- const substrate = selectForReview({ readings: selectable, now, config: sc }, author);
- return {
-  substrate,
-  chosenOn: ` on ${substrate} (head by ${author}; ${describeReadings(readings, now)})`,
- };
+ const { substrate, chosenOn } = await selectSubstrate(
+  ctx.journal,
+  ctx.config.substrates,
+  ctx.excludedSubstrates ?? new Set<SubstrateName>(),
+  ctx.substrateReaders,
+  (input) => selectForReview(input, author),
+ );
+ return { substrate, chosenOn: ` on ${substrate} (head by ${author}; ${chosenOn})` };
 }
 
 /** Which substrate wrote a pushed SHA: the review of that head reads it back. */
