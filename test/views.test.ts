@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "../src/config.ts";
 import { captureViews, chooseViews, compareViews, fillViewsTemplate, freeViewsPort, loadViewsRecord, parseViewsDiff, redactViewsReason, saveViewsRecord, startViewsServer, viewsCard, viewsCardMessage, viewsComment, viewsDirectory, type CaptureViewsContext, type ViewsDependencies } from "../src/views.ts";
-import { pidAlive, processGroupCommands } from "../src/exec.ts";
+import { pidAlive, processGroupCommands, runCmd } from "../src/exec.ts";
 import { baseConfigLines } from "./support.ts";
 
 const SHA = "a".repeat(40);
@@ -356,7 +356,12 @@ describe("dev server lifecycle (no browser)", () => {
   try {
    expect(pidAlive(pids.pid)).toBe(true);
    expect(pidAlive(pids.child)).toBe(true);
-   expect((await processGroupCommands(pids.pid)).some(c => c.includes("sleep 60"))).toBe(true);
+   // The group is the detached `/bin/sh -c`'s, not the script's: macOS sh execs a
+   // simple command in place, so the two coincide there, but dash (Ubuntu CI)
+   // keeps the shell as leader. Ask for the script's group rather than assume it.
+   const pgid = Number((await runCmd("ps", ["-o", "pgid=", "-p", String(pids.pid)], { timeoutMs: 10_000 })).stdout.trim());
+   expect(Number.isInteger(pgid) && pgid > 1).toBe(true);
+   expect((await processGroupCommands(pgid)).some(c => c.includes("sleep 60"))).toBe(true);
   } finally { await server.stop(); }
   expect(pidAlive(pids.pid)).toBe(false);
   expect(pidAlive(pids.child)).toBe(false);
