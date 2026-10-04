@@ -1,10 +1,45 @@
 import * as githubApi from "./github.ts";
-import type { CheckRun, PullRequest } from "./github.ts";
-import { ParkSignal } from "./implement.ts";
+import type { CheckRun, CommitStatus, WorkflowRun, PullRequest, GitHubPort } from "./github.ts";
+import { ParkSignal } from "./signals.ts";
 import { GitSafetyError, safeGit } from "./git-ops.ts";
 
-export type ResearchGitHubPort = Pick<typeof githubApi,
+export type ResearchGitHubPort = Pick<GitHubPort,
  "findPrByHead" | "getPr" | "createDraftPr" | "checkRunsFor" | "workflowRunsFor" | "commitStatusesFor">;
+
+export interface ResearchCiTiming {
+ timeoutMs?: number;
+ pollMs?: number;
+ settleMs?: number;
+ clock?: { now(): number; sleep(ms: number): Promise<void> };
+}
+
+type CiState = { kind: "failed"; message: string }
+ | { kind: "pending"; reason: string }
+ | { kind: "complete"; success: CheckRun; snapshot: string };
+
+export function classifyCi(runs: CheckRun[], workflows: WorkflowRun[], statuses: CommitStatus[]): CiState {
+ const allRuns = [...runs, ...workflows];
+ const failures = [
+  ...allRuns.filter((r) => r.status === "completed" && !["success", "neutral", "skipped"].includes(r.conclusion ?? ""))
+   .map((r) => `${r.name}=${r.conclusion}`),
+  ...statuses.filter((s) => !["pending", "success"].includes(s.state)).map((s) => `${s.context}=${s.state}`),
+ ];
+ if (failures.length > 0) return { kind: "failed", message: failures.join(", ") };
+ const running = allRuns.filter((r) => r.status !== "completed");
+ const pendingStatuses = statuses.filter((s) => s.state === "pending");
+ if (runs.length === 0 || running.length > 0 || pendingStatuses.length > 0) {
+  return { kind: "pending", reason: runs.length === 0 ? "no check runs on the findings head"
+   : `${running.length} check/workflow run(s) and ${pendingStatuses.length} commit status(es) still running` };
+ }
+ const success = runs.find((r) => r.status === "completed" && r.conclusion === "success" && Number.isSafeInteger(r.id) && r.id > 0);
+ if (success === undefined) return { kind: "failed", message: "no successful check run to cite" };
+ const snapshot = JSON.stringify([
+  runs.map((r) => JSON.stringify(r)).sort(),
+  workflows.map((r) => JSON.stringify(r)).sort(),
+  statuses.map((s) => JSON.stringify(s)).sort(),
+ ]);
+ return { kind: "complete", success, snapshot };
+}
 
 /** The base SHA must be captured before the worker can move local refs. */
 export async function assertResearchFindingsOnly(canonical: string, baseSha: string, sha: string): Promise<void> {
@@ -33,12 +68,7 @@ export async function researchCi(opts: {
  fence(action: string): void;
  recordPr(pr: PullRequest): void;
  github?: ResearchGitHubPort;
- timeoutMs?: number;
- pollMs?: number;
- settleMs?: number;
- /** Injectable clock for deterministic CI-registration regression tests. */
- clock?: { now(): number; sleep(ms: number): Promise<void> };
-}): Promise<{ pr: PullRequest; ci: string; check: CheckRun }> {
+} & ResearchCiTiming): Promise<{ pr: PullRequest; ci: string; check: CheckRun }> {
  const github = opts.github ?? githubApi;
  let pr = opts.pr;
  if (pr === null) {
@@ -72,28 +102,14 @@ export async function researchCi(opts: {
     github.workflowRunsFor(opts.repo, opts.sha, opts.token),
     github.commitStatusesFor(opts.repo, opts.sha, opts.token),
    ]);
-   const allRuns = [...runs, ...workflows];
-   const failed = allRuns.filter((r) => r.status === "completed" && !["success", "neutral", "skipped"].includes(r.conclusion ?? ""));
-   if (failed.length > 0) {
-    throw new ParkSignal(`research CI failed on ${opts.sha}: ${failed.map((r) => `${r.name}=${r.conclusion}`).join(", ")}`);
-   }
-   const failedStatuses = statuses.filter((s) => !["pending", "success"].includes(s.state));
-   if (failedStatuses.length > 0) {
-    throw new ParkSignal(`research CI failed on ${opts.sha}: ${failedStatuses.map((s) => `${s.context}=${s.state}`).join(", ")}`);
-   }
-   const running = allRuns.filter((r) => r.status !== "completed");
-   const pendingStatuses = statuses.filter((s) => s.state === "pending");
-   const success = runs.find((r) => r.status === "completed" && r.conclusion === "success" && Number.isSafeInteger(r.id) && r.id > 0);
-   if (runs.length > 0 && running.length === 0 && pendingStatuses.length === 0) {
-    if (success === undefined) throw new ParkSignal("research CI has no successful check run to cite");
-    const snapshot = JSON.stringify([
-     runs.map((r) => JSON.stringify(r)).sort(),
-     workflows.map((r) => JSON.stringify(r)).sort(),
-     statuses.map((s) => JSON.stringify(s)).sort(),
-    ]);
+   const state = classifyCi(runs, workflows, statuses);
+   if (state.kind === "failed") throw new ParkSignal(`research CI failed on ${opts.sha}: ${state.message}`);
+   if (state.kind === "complete") {
+    const { success, snapshot } = state;
     if (snapshot !== previousSnapshot) {
      previousSnapshot = snapshot;
      settledSince = clock.now();
+     pollMs = Math.min(opts.pollMs ?? 10_000, settleMs);
     }
     if (clock.now() - settledSince >= settleMs && clock.now() <= deadline) {
      opts.fence("confirm research head");
@@ -107,14 +123,16 @@ export async function researchCi(opts: {
     reason = "completed CI snapshot still settling";
    } else {
     previousSnapshot = null;
-    reason = runs.length === 0 ? "no check runs on the findings head" : `${running.length} check/workflow run(s) and ${pendingStatuses.length} commit status(es) still running`;
+    reason = state.reason;
    }
   } else {
    previousSnapshot = null;
+   reason = "PR head has not caught up to the findings push";
   }
   const remaining = deadline - clock.now();
   if (remaining <= 0) throw new ParkSignal(`research CI wait expired for PR #${pr.number}: ${reason}`);
-  await clock.sleep(Math.min(pollMs, remaining));
-  pollMs = Math.min(pollMs * 2, 60_000);
+  const settlingRemaining = previousSnapshot === null ? remaining : settleMs - (clock.now() - settledSince);
+  await clock.sleep(Math.min(pollMs, remaining, settlingRemaining));
+  if (previousSnapshot === null) pollMs = Math.min(pollMs * 2, 60_000);
  }
 }

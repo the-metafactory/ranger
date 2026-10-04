@@ -17,9 +17,7 @@ import { GRAPH_CALL_TIMEOUT_MS, graphNode, type NodeResult } from "./graph.ts";
 import { graphClose, graphDecisions, type CloseResult } from "./graph-write.ts";
 import {
  implementBranchFor,
- ParkSignal,
  runImplement,
- type GitHubPort,
  type ImplementContext,
  type ImplementOutcome,
  type Reviewer,
@@ -42,7 +40,9 @@ import { workerEnv } from "./worker-env.ts";
 import { saveWorkerLog } from "./worker-log.ts";
 import { isTransientGitHubError } from "./transient.ts";
 import * as githubApi from "./github.ts";
-import { assertResearchFindingsOnly, researchCi } from "./research-ci.ts";
+import type { GitHubPort } from "./github.ts";
+import { ParkSignal } from "./signals.ts";
+import { assertResearchFindingsOnly, researchCi, type ResearchCiTiming } from "./research-ci.ts";
 
 export { gitAuthEnv } from "./git-ops.ts";
 
@@ -91,6 +91,8 @@ export interface RunNodeContext {
  ) => Promise<{ code: number; stdout: string; stderr: string }>;
  /** For tests: the supervisor's forge and implement lane's reviewer. */
  github?: GitHubPort;
+ /** Injectable CI timing for tests; production uses the default settling window. */
+ researchCiTiming?: ResearchCiTiming;
  reviewer?: Reviewer;
  /** For tests: the read-only token (defaults to the map's `auth.readOnlyTokens` env). */
  readOnlyToken?: string;
@@ -647,6 +649,11 @@ async function parkCard(
  }
 }
 
+async function resolveBranchSha(canonical: string, branch: string): Promise<string | null> {
+ const head = await safeGit(["--no-replace-objects", "rev-parse", "--verify", `refs/heads/${branch}^{commit}`], { cwd: canonical });
+ return head.code === 0 && /^[0-9a-f]{40}$/.test(head.stdout.trim()) ? head.stdout.trim() : null;
+}
+
 /**
  * Run one research node to completion: worktree → prompt → worker → gated
  * close → decisions --write.
@@ -758,11 +765,11 @@ async function runResearch(
   // the pre-worker snapshot (#23: the worker shares the canonical .git).
   try {
    assertGitUntouched(canonical, snapshot);
-   const head = await safeGit(["rev-parse", "--verify", `refs/heads/${branch}^{commit}`], { cwd: canonical });
-   if (head.code !== 0 || !/^[0-9a-f]{40}$/.test(head.stdout.trim())) {
+   const head = await resolveBranchSha(canonical, branch);
+   if (head === null) {
     throw new GitSafetyError(`research findings branch ${branch} is missing from the canonical checkout`);
    }
-   sha = head.stdout.trim();
+   sha = head;
    await assertResearchFindingsOnly(canonical, baseSha, sha);
    fence("push");
    await vettedPush({
@@ -781,11 +788,11 @@ async function runResearch(
    return { ...base, status: "failed", detail, workerExit: 0 };
   }
  } else {
-  const head = await safeGit(["rev-parse", "--verify", `refs/heads/${branch}^{commit}`], { cwd: canonical });
-  if (head.code !== 0 || !/^[0-9a-f]{40}$/.test(head.stdout.trim())) {
+  const head = await resolveBranchSha(canonical, branch);
+  if (head === null) {
    throw new ParkSignal(`research findings branch ${branch} is missing from the canonical checkout`);
   }
-  sha = head.stdout.trim();
+  sha = head;
   await assertResearchFindingsOnly(canonical, baseSha, sha);
  }
  const findings = await safeGit(["show", `${sha}:findings.md`], { cwd: canonical });
@@ -793,6 +800,7 @@ async function runResearch(
   throw new ParkSignal(`research findings.md is missing or empty at ${sha}`);
  }
  const evidence = await researchCi({
+  ...ctx.researchCiTiming,
   repo, branch, base: map.base, sha, nodeId, token, pr: existingPr, github, fence,
   recordPr: (pr) => {
    journal.updateWorker(nodeId, { prNumber: pr.number });

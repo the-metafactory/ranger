@@ -24,11 +24,16 @@ import {
  createCanonicalRepo,
  fakeDiscord,
  GIT_ENV,
- runCli,
+ bun,
+ cliPath,
 } from "./support.ts";
 
 const fixturesBin = join(import.meta.dir, "fixtures", "bin");
 const dataDir = join(import.meta.dir, "fixtures", "data");
+
+function runCli(args: string[], env: NodeJS.ProcessEnv) {
+ return runCmd(bun, ["--preload", join(import.meta.dir, "fixtures", "research-timing.ts"), cliPath, ...args], { env });
+}
 
 function writeConfig(dir: string, extra: string[] = []): string {
  const config = [
@@ -407,7 +412,7 @@ describe("ranger run-node — research worker full loop (node #13 acceptance)", 
   } finally {
    rmSync(dir, { recursive: true, force: true });
   }
- }, 60_000);
+ }, 10_000);
 
  for (const mode of ["failure", "skipped"]) {
   test(`research CI ${mode} stays parked until external CI changes; retry reuses the draft and findings`, async () => {
@@ -455,7 +460,7 @@ describe("ranger run-node — research worker full loop (node #13 acceptance)", 
    } finally {
     rmSync(dir, { recursive: true, force: true });
    }
-  }, 60_000);
+  }, 10_000);
  }
 
  test("worker crash with no findings → refused, dead-man increments", async () => {

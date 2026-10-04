@@ -15,13 +15,16 @@ const GREEN: CheckRun = { id: 901, name: "test", status: "completed", conclusion
 
 const WORKFLOW: WorkflowRun = { ...GREEN, id: 501, workflowId: 10, event: "pull_request", attempt: 1 };
 
+const seq = <T>(xs: T[]) => { let i = 0; return () => xs[Math.min(i++, xs.length - 1)]!; };
+
 function setup(opts: { runs?: CheckRun[][]; workflows?: WorkflowRun[][]; statuses?: CommitStatus[][]; prs?: PullRequest[]; existing?: boolean; timeoutMs?: number; settleMs?: number } = {}) {
  let creates = 0;
- let reads = 0;
- let checks = 0;
- let workflowReads = 0;
- let statusReads = 0;
+ const nextPr = seq(opts.prs ?? [PR]);
+ const nextRuns = seq(opts.runs ?? [[GREEN]]);
+ const nextWorkflows = seq(opts.workflows ?? [[WORKFLOW]]);
+ const nextStatuses = seq(opts.statuses ?? [[]]);
  let now = 0;
+ const sleeps: number[] = [];
  const queried: string[] = [];
  const fences: string[] = [];
  const recorded: number[] = [];
@@ -34,33 +37,23 @@ function setup(opts: { runs?: CheckRun[][]; workflows?: WorkflowRun[][]; statuse
    creates++;
    return PR;
   },
-  getPr: async () => {
-   const prs = opts.prs ?? [PR];
-   return prs[Math.min(reads++, prs.length - 1)]!;
-  },
+  getPr: async () => nextPr(),
   checkRunsFor: async (_repo, sha) => {
    queried.push(sha);
-   const runs = opts.runs ?? [[GREEN]];
-   return runs[Math.min(checks++, runs.length - 1)]!;
+   return nextRuns();
   },
-  workflowRunsFor: async () => {
-   const runs = opts.workflows ?? [[WORKFLOW]];
-   return runs[Math.min(workflowReads++, runs.length - 1)]!;
-  },
-  commitStatusesFor: async () => {
-   const statuses = opts.statuses ?? [[]];
-   return statuses[Math.min(statusReads++, statuses.length - 1)]!;
-  },
+  workflowRunsFor: async () => nextWorkflows(),
+  commitStatusesFor: async () => nextStatuses(),
  };
  const input: Parameters<typeof researchCi>[0] = {
   repo: "acme/widgets", branch: PR.headRef, base: "main", sha: SHA, nodeId: "25",
   token: "machine", pr: opts.existing ? PR : null, github, pollMs: 10,
   settleMs: opts.settleMs ?? 0,
-  clock: { now: () => now, sleep: async (ms) => { now += ms; } },
+  clock: { now: () => now, sleep: async (ms) => { sleeps.push(ms); now += ms; } },
   timeoutMs: opts.timeoutMs ?? 100,
   fence: (action) => { fences.push(action); }, recordPr: (pr) => { recorded.push(pr.number); },
  };
- return { input, queried, fences, recorded, creates: () => creates, elapsed: () => now };
+ return { input, queried, fences, recorded, sleeps, creates: () => creates, elapsed: () => now };
 }
 
 test("completed checks wait for queued workflows even before their jobs register", async () => {
@@ -98,23 +91,39 @@ test("a new completed workflow resets the settling window", async () => {
  const extra = { ...WORKFLOW, id: 502, workflowId: 11 };
  const s = setup({ settleMs: 30, workflows: [[WORKFLOW], [WORKFLOW, extra]] });
  expect((await researchCi(s.input)).ci).toBe(`901@${SHA}`);
- expect(s.elapsed()).toBe(70);
+ expect(s.elapsed()).toBe(40);
 });
 
 test("a late pending status resets settling until it succeeds", async () => {
  const status = { id: 601, context: "external-ci", state: "pending" };
  const s = setup({ settleMs: 30, timeoutMs: 200, statuses: [[], [status], [{ ...status, state: "success" }]] });
  expect((await researchCi(s.input)).ci).toBe(`901@${SHA}`);
- expect(s.elapsed()).toBe(70);
+ expect(s.elapsed()).toBe(50);
 });
 
-test("production settling duration is 30 seconds and polling backs off", async () => {
+test("long-running CI backs off but confirms green after only the settling window", async () => {
+ const queued = { ...WORKFLOW, status: "queued", conclusion: null };
+ const s = setup({ workflows: [[queued], [queued], [queued], [queued], [queued], [WORKFLOW]],
+  settleMs: 30_000, timeoutMs: 300_000 });
+ s.input.pollMs = 10_000;
+ expect((await researchCi(s.input)).ci).toBe(`901@${SHA}`);
+ expect(s.sleeps).toEqual([10_000, 20_000, 40_000, 60_000, 60_000, 10_000, 10_000, 10_000]);
+ expect(s.elapsed()).toBe(220_000);
+});
+
+test("reports check and external status failures together", async () => {
+ const s = setup({ runs: [[{ ...GREEN, conclusion: "failure" }]],
+  statuses: [[{ id: 601, context: "external-ci", state: "error" }]] });
+ await expect(researchCi(s.input)).rejects.toThrow("test=failure, external-ci=error");
+});
+
+test("production settling duration is 30 seconds at the reset poll interval", async () => {
  const s = setup({ timeoutMs: 60_000 });
  delete s.input.settleMs;
  delete s.input.pollMs;
  expect((await researchCi(s.input)).ci).toBe(`901@${SHA}`);
  expect(s.elapsed()).toBe(30_000);
- expect(s.queried).toHaveLength(3);
+ expect(s.queried).toHaveLength(4);
 });
 
 test("settling cannot outlive the CI deadline", async () => {

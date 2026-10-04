@@ -78,6 +78,26 @@ export interface IssueComment {
  body: string;
 }
 
+/** The GitHub surface the supervisor lanes use — injectable without a forge. */
+export interface GitHubPort {
+ findPrByHead(repo: string, branch: string, token: string): Promise<PullRequest | null>;
+ getPr(repo: string, n: number, token: string): Promise<PullRequest>;
+ createDraftPr(
+  repo: string,
+  pr: { head: string; base: string; title: string; body: string },
+  token: string,
+ ): Promise<PullRequest>;
+ updatePrBody(repo: string, n: number, body: string, token: string): Promise<void>;
+ markReady(repo: string, pr: PullRequest, token: string): Promise<void>;
+ checkRunsFor(repo: string, sha: string, token: string): Promise<CheckRun[]>;
+ workflowRunsFor(repo: string, sha: string, token: string): Promise<WorkflowRun[]>;
+ commitStatusesFor(repo: string, sha: string, token: string): Promise<CommitStatus[]>;
+ mergePr(repo: string, n: number, sha: string, title: string, token: string): Promise<void>;
+ issueLabels(repo: string, n: number, token: string): Promise<string[]>;
+ postComment(repo: string, n: number, body: string, token: string): Promise<number>;
+ listComments(repo: string, n: number, token: string): Promise<IssueComment[]>;
+}
+
 async function ghApi(
  token: string,
  args: string[],

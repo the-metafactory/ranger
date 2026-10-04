@@ -116,7 +116,8 @@ bun src/cli.ts journal                    # inspect workers/events/health
   finish without failure. The completed snapshot must stay unchanged for 30
   seconds, with at least one successful check run for
   `soma graph close --ci <checkRunId>@<headSha>`. Polling backs off from 10 to
-  60 seconds. This observes CI registered during the wait; it cannot guarantee
+  60 seconds while CI is pending, then resets to 10 seconds while settling.
+  This observes CI registered during the wait; it cannot guarantee
   that an external provider will never register more CI afterward. Missing,
   pending, failed, or stale-head evidence parks the node; a retry reuses the
   open draft and committed findings. Failed CI needs an operator to rerun or
