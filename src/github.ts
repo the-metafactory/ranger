@@ -60,6 +60,18 @@ export interface CheckRun {
  conclusion: string | null;
 }
 
+export interface WorkflowRun extends CheckRun {
+ workflowId: number;
+ event: string;
+ attempt: number;
+}
+
+export interface CommitStatus {
+ id: number;
+ context: string;
+ state: string;
+}
+
 export interface IssueComment {
  id: number;
  author: string;
@@ -271,12 +283,15 @@ export async function checkRunsFor(
  sha: string,
  token: string,
 ): Promise<CheckRun[]> {
- const raw = (await ghApi(
+ const pages = (await ghApi(
   token,
-  [`repos/${repo}/commits/${sha}/check-runs?per_page=100`],
+  [`repos/${repo}/commits/${sha}/check-runs?filter=latest&per_page=100`, "--paginate", "--slurp"],
   `check runs for ${sha.slice(0, 8)}`,
- )) as { check_runs?: unknown[] } | null;
- return (raw?.check_runs ?? []).map((c) => {
+ )) as { check_runs: unknown[] }[];
+ if (!Array.isArray(pages) || pages.some((p) => !Array.isArray(p.check_runs))) {
+  throw new GitHubError("invalid check runs response");
+ }
+ return pages.flatMap((p) => p.check_runs).map((c) => {
   const r = c as Record<string, unknown>;
   return {
    id: Number(r.id),
@@ -285,6 +300,43 @@ export async function checkRunsFor(
    conclusion: typeof r.conclusion === "string" ? r.conclusion : null,
   };
  });
+}
+
+/** Workflow runs expose queued workflows before their job check runs exist. */
+export async function workflowRunsFor(repo: string, sha: string, token: string): Promise<WorkflowRun[]> {
+ const pages = await ghApi(token,
+  [`repos/${repo}/actions/runs?head_sha=${encodeURIComponent(sha)}&per_page=100`, "--paginate", "--slurp"],
+  `workflow runs for ${sha.slice(0, 8)}`,
+ ) as { total_count: number; workflow_runs: Record<string, unknown>[] }[];
+ if (!Array.isArray(pages) || pages.some((p) => !Array.isArray(p.workflow_runs) || !Number.isSafeInteger(p.total_count) || p.total_count >= 1000)) {
+  throw new GitHubError("invalid or search-limited workflow runs response");
+ }
+ const latest = new Map<string, WorkflowRun>();
+ for (const r of pages.flatMap((p) => p.workflow_runs)) {
+  if (r.head_sha !== sha) throw new GitHubError("workflow head differs from requested SHA");
+  const run: WorkflowRun = {
+   id: Number(r.id), name: String(r.name ?? ""), status: String(r.status ?? ""),
+   conclusion: typeof r.conclusion === "string" ? r.conclusion : null,
+   workflowId: Number(r.workflow_id), event: String(r.event ?? ""), attempt: Number(r.run_attempt),
+  };
+  const key = `${run.workflowId}:${run.event}`;
+  if (!latest.has(key) || latest.get(key)!.id < run.id) latest.set(key, run);
+ }
+ return [...latest.values()];
+}
+
+/** Combined status pages contain the current status of each external CI context. */
+export async function commitStatusesFor(repo: string, sha: string, token: string): Promise<CommitStatus[]> {
+ const pages = await ghApi(token,
+  [`repos/${repo}/commits/${sha}/status?per_page=100`, "--paginate", "--slurp"],
+  `commit statuses for ${sha.slice(0, 8)}`,
+ ) as { statuses: Record<string, unknown>[] }[];
+ if (!Array.isArray(pages) || pages.some((p) => !Array.isArray(p.statuses))) {
+  throw new GitHubError("invalid commit statuses response");
+ }
+ return pages.flatMap((p) => p.statuses).map((s) => ({
+  id: Number(s.id), context: String(s.context ?? ""), state: String(s.state ?? ""),
+ }));
 }
 
 export async function postComment(

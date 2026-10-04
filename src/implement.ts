@@ -16,7 +16,7 @@ import {
  vettedPush,
 } from "./git-ops.ts";
 import * as gh from "./github.ts";
-import type { CheckRun, IssueComment, PullRequest } from "./github.ts";
+import type { CheckRun, CommitStatus, WorkflowRun, IssueComment, PullRequest } from "./github.ts";
 import { GRAPH_CALL_TIMEOUT_MS, type NodeResult } from "./graph.ts";
 import { graphClose, graphDecisions, type CloseResult } from "./graph-write.ts";
 import type { ImplementPhase, Journal } from "./journal.ts";
@@ -65,6 +65,8 @@ export interface GitHubPort {
  updatePrBody(repo: string, n: number, body: string, token: string): Promise<void>;
  markReady(repo: string, pr: PullRequest, token: string): Promise<void>;
  checkRunsFor(repo: string, sha: string, token: string): Promise<CheckRun[]>;
+ workflowRunsFor(repo: string, sha: string, token: string): Promise<WorkflowRun[]>;
+ commitStatusesFor(repo: string, sha: string, token: string): Promise<CommitStatus[]>;
  mergePr(repo: string, n: number, sha: string, title: string, token: string): Promise<void>;
  issueLabels(repo: string, n: number, token: string): Promise<string[]>;
  postComment(repo: string, n: number, body: string, token: string): Promise<number>;

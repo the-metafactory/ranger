@@ -28,7 +28,15 @@ if (path.includes("/pulls?")) {
  if (sha !== state.researchPr.head.sha) throw new Error("check runs requested for wrong head");
  const mode = process.env.FAKE_RESEARCH_CI ?? "success";
  const runs = mode === "empty" ? [] : [{ id: 901, name: "test", status: "completed", conclusion: mode }];
- console.log(JSON.stringify({ check_runs: runs }));
+ console.log(JSON.stringify([{ check_runs: runs }]));
+} else if (path.includes("/actions/runs?")) {
+ if (!path.includes(`head_sha=${state.researchPr.head.sha}`)) throw new Error("workflow requested for wrong head");
+ console.log(JSON.stringify([{ total_count: 1, workflow_runs: [{
+  id: 501, workflow_id: 10, name: "test", head_sha: state.researchPr.head.sha,
+  event: "pull_request", run_attempt: 1, status: "completed", conclusion: "success",
+ }] }]));
+} else if (path.includes("/status?")) {
+ console.log(JSON.stringify([{ statuses: [] }]));
 } else {
  console.log(JSON.stringify(state.researchPr));
 }

@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import type { CheckRun, PullRequest } from "../src/github.ts";
+import type { CheckRun, CommitStatus, WorkflowRun, PullRequest } from "../src/github.ts";
 import { FencedError } from "../src/journal.ts";
 import { researchCi, type ResearchGitHubPort } from "../src/research-ci.ts";
 
@@ -13,10 +13,15 @@ const PR: PullRequest = {
 };
 const GREEN: CheckRun = { id: 901, name: "test", status: "completed", conclusion: "success" };
 
-function setup(opts: { runs?: CheckRun[][]; prs?: PullRequest[]; existing?: boolean; timeoutMs?: number } = {}) {
+const WORKFLOW: WorkflowRun = { ...GREEN, id: 501, workflowId: 10, event: "pull_request", attempt: 1 };
+
+function setup(opts: { runs?: CheckRun[][]; workflows?: WorkflowRun[][]; statuses?: CommitStatus[][]; prs?: PullRequest[]; existing?: boolean; timeoutMs?: number; settleMs?: number } = {}) {
  let creates = 0;
  let reads = 0;
  let checks = 0;
+ let workflowReads = 0;
+ let statusReads = 0;
+ let now = 0;
  const queried: string[] = [];
  const fences: string[] = [];
  const recorded: number[] = [];
@@ -38,15 +43,84 @@ function setup(opts: { runs?: CheckRun[][]; prs?: PullRequest[]; existing?: bool
    const runs = opts.runs ?? [[GREEN]];
    return runs[Math.min(checks++, runs.length - 1)]!;
   },
+  workflowRunsFor: async () => {
+   const runs = opts.workflows ?? [[WORKFLOW]];
+   return runs[Math.min(workflowReads++, runs.length - 1)]!;
+  },
+  commitStatusesFor: async () => {
+   const statuses = opts.statuses ?? [[]];
+   return statuses[Math.min(statusReads++, statuses.length - 1)]!;
+  },
  };
  const input: Parameters<typeof researchCi>[0] = {
   repo: "acme/widgets", branch: PR.headRef, base: "main", sha: SHA, nodeId: "25",
-  token: "machine", pr: opts.existing ? PR : null, github, pollMs: 0,
+  token: "machine", pr: opts.existing ? PR : null, github, pollMs: 10,
+  settleMs: opts.settleMs ?? 0,
+  clock: { now: () => now, sleep: async (ms) => { now += ms; } },
   timeoutMs: opts.timeoutMs ?? 100,
   fence: (action) => { fences.push(action); }, recordPr: (pr) => { recorded.push(pr.number); },
  };
- return { input, queried, fences, recorded, creates: () => creates };
+ return { input, queried, fences, recorded, creates: () => creates, elapsed: () => now };
 }
+
+test("completed checks wait for queued workflows even before their jobs register", async () => {
+ const s = setup({ workflows: [[{ ...WORKFLOW, status: "queued", conclusion: null }], [WORKFLOW]] });
+ expect((await researchCi(s.input)).ci).toBe(`901@${SHA}`);
+ expect(s.queried).toHaveLength(2);
+});
+
+test("a failed workflow blocks an otherwise green check", async () => {
+ const s = setup({ workflows: [[{ ...WORKFLOW, conclusion: "failure" }]] });
+ await expect(researchCi(s.input)).rejects.toThrow("research CI failed");
+});
+
+test("pending external commit status delays evidence", async () => {
+ const status = { id: 601, context: "external-ci", state: "pending" };
+ const s = setup({ statuses: [[status], [{ ...status, state: "success" }]] });
+ expect((await researchCi(s.input)).ci).toBe(`901@${SHA}`);
+ expect(s.queried).toHaveLength(2);
+});
+
+for (const state of ["failure", "error", "unknown"]) {
+ test(`external commit status ${state} blocks green checks`, async () => {
+  const s = setup({ statuses: [[{ id: 601, context: "external-ci", state }]] });
+  await expect(researchCi(s.input)).rejects.toThrow("external-ci=");
+ });
+}
+
+test("a late registered failed job prevents evidence during settling", async () => {
+ const s = setup({ settleMs: 30, runs: [[GREEN], [GREEN], [GREEN, { ...GREEN, id: 902, conclusion: "failure" }]] });
+ await expect(researchCi(s.input)).rejects.toThrow("research CI failed");
+ expect(s.queried).toHaveLength(3);
+});
+
+test("a new completed workflow resets the settling window", async () => {
+ const extra = { ...WORKFLOW, id: 502, workflowId: 11 };
+ const s = setup({ settleMs: 30, workflows: [[WORKFLOW], [WORKFLOW, extra]] });
+ expect((await researchCi(s.input)).ci).toBe(`901@${SHA}`);
+ expect(s.elapsed()).toBe(70);
+});
+
+test("a late pending status resets settling until it succeeds", async () => {
+ const status = { id: 601, context: "external-ci", state: "pending" };
+ const s = setup({ settleMs: 30, timeoutMs: 200, statuses: [[], [status], [{ ...status, state: "success" }]] });
+ expect((await researchCi(s.input)).ci).toBe(`901@${SHA}`);
+ expect(s.elapsed()).toBe(70);
+});
+
+test("production settling duration is 30 seconds and polling backs off", async () => {
+ const s = setup({ timeoutMs: 60_000 });
+ delete s.input.settleMs;
+ delete s.input.pollMs;
+ expect((await researchCi(s.input)).ci).toBe(`901@${SHA}`);
+ expect(s.elapsed()).toBe(30_000);
+ expect(s.queried).toHaveLength(3);
+});
+
+test("settling cannot outlive the CI deadline", async () => {
+ const s = setup({ settleMs: 30, timeoutMs: 20 });
+ await expect(researchCi(s.input)).rejects.toThrow("wait expired");
+});
 
 test("opens a draft, waits through empty and running checks, then returns a head-bound citation", async () => {
  const s = setup({ runs: [[], [{ ...GREEN, status: "in_progress", conclusion: null }], [GREEN]] });

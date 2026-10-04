@@ -332,7 +332,7 @@ describe("ranger run-node — research worker full loop (node #13 acceptance)", 
   } finally {
    rmSync(dir, { recursive: true, force: true });
   }
- });
+ }, 60_000);
 
  for (const mode of ["failure", "skipped"]) {
   test(`research CI ${mode} parks without closing; retry reuses the draft and findings`, async () => {
@@ -372,7 +372,7 @@ describe("ranger run-node — research worker full loop (node #13 acceptance)", 
    } finally {
     rmSync(dir, { recursive: true, force: true });
    }
-  });
+  }, 60_000);
  }
 
  test("worker crash with no findings → refused, dead-man increments", async () => {
