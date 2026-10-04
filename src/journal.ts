@@ -119,7 +119,8 @@ export type EventKind =
  | "awaiting-merge"
  | "merge-card"
  | "merged"
- | "orphan-killed";
+ | "orphan-killed"
+ | "transient";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 

@@ -37,6 +37,7 @@ import {
 import { runNode } from "./worker.ts";
 import { sweepMap } from "./sweep.ts";
 import { spawnRunNodeDetached, walk } from "./walk.ts";
+import { holdAwake } from "./awake.ts";
 import { startServe } from "./serve.ts";
 import {
  escalateMaps,
@@ -507,6 +508,8 @@ program
  .action(async (id: string, options: { map?: string; config: string }) => {
   try {
    const configPath = resolve(process.cwd(), options.config);
+   // The worker, sage rounds and probe tier must not run on a sleeping host.
+   holdAwake();
    process.stdout.write((await runRunNode(id, options.map, configPath)) + "\n");
   } catch (error) {
    process.stderr.write(

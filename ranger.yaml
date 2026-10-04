@@ -69,6 +69,10 @@ maps:
       # (seelite CLAUDE.md: never paste tracker or PR text into --intent).
       # GPU lane: headed Chromium opens on the host screen while it runs.
       probe: 'npm run probe:pr -- --base origin/main --head HEAD --intent "Ranger implement lane: the diff on this branch implements orienteer node #{node}; select every browser probe the changed files can affect."'
+      # A failed run retries only the probes it named (2026-10-04: one
+      # load-induced crash cost a 25-minute full rerun). The runner takes an
+      # exact list through PROBE_SELECTION/PROBE_FILES.
+      probeRetry: PROBE_SELECTION=1 PROBE_FILES={failed} npm run probe
       probeTimeoutMin: 30
     discord:
       tokenEnv: RANGER_DISCORD_TOKEN
