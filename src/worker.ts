@@ -19,6 +19,7 @@ import {
  ParkSignal,
  runImplement,
  type GitHubPort,
+ type ImplementContext,
  type ImplementOutcome,
  type Reviewer,
 } from "./implement.ts";
@@ -256,12 +257,17 @@ function resolveReaders(ctx: RunNodeContext): SubstrateReaders | undefined {
  */
 async function selectBuildSubstrate(
  ctx: RunNodeContext,
- excluded: Set<SubstrateName>,
+ excluded: ReadonlySet<SubstrateName>,
 ): Promise<{ substrate: SubstrateName; chosenOn: string }> {
  if (ctx.substrate !== undefined && excluded.size === 0) {
   return { substrate: ctx.substrate, chosenOn: "fixed by the caller" };
  }
- return selectSubstrate(ctx.journal, ctx.config.substrates, excluded, resolveReaders(ctx), selectForBuild);
+ return selectSubstrate(ctx.journal, {
+  config: ctx.config.substrates,
+  excluded,
+  readers: resolveReaders(ctx),
+  pick: selectForBuild,
+ });
 }
 
 /**
@@ -437,6 +443,42 @@ function ratifyFor(
  return `node #${node.ref.id} is ${node.node.autonomy} — it waits for the principal (design §3)`;
 }
 
+/** What every implement session of a node shares; runSession adds the substrate. */
+type SessionScope = Omit<ImplementContext, "workerRun" | "substrate" | "excludedSubstrates">;
+
+/**
+ * One worker session (node #45): select its substrate (leaving out those
+ * capped in this run), record the worker-start event, run the implement lane.
+ */
+async function runSession(
+ ctx: RunNodeContext,
+ nodeId: string,
+ session: SessionScope,
+ capped: ReadonlySet<SubstrateName>,
+): Promise<ImplementOutcome> {
+ const { journal } = session;
+ const envCmd = envWorkerOverride(ctx);
+ const { substrate, chosenOn } =
+  envCmd === undefined
+   ? await selectBuildSubstrate(ctx, capped)
+   : { substrate: undefined, chosenOn: "RANGER_WORKER_CMD override; its heads count as Pi-written" };
+ const workerCmd = envCmd ?? resolveWorkerCommand(ctx, substrate as SubstrateName);
+ journal.updateWorker(nodeId, { substrate: substrate ?? null });
+ journal.recordEvent("worker-start", {
+  nodeId,
+  repo: session.map.repo,
+  detail: `substrate ${substrate ?? "unknown"} (${chosenOn}), command: ${workerCmd[0]}`.slice(0, 400),
+ });
+ return runImplement({
+  ...session,
+  workerRun:
+   ctx.worker ??
+   ((p: string, opts: RunOptions) => runCmd(workerCmd[0], [...workerCmd.slice(1), p], opts)),
+  substrate,
+  excludedSubstrates: capped,
+ });
+}
+
 async function runImplementNode(
  nodeId: string,
  ctx: RunNodeContext,
@@ -470,47 +512,31 @@ async function runImplementNode(
  // re-deriving its phase from GitHub (F2). Build and review selection both
  // leave out the substrates capped in this run and Pi never caps, so each
  // strong substrate caps at most once and the loop ends on Pi at the latest.
+ const session: SessionScope = {
+  config: ctx.wallClockMin === undefined
+   ? config
+   : { ...config, workers: { ...config.workers, wallClockMin: ctx.wallClockMin } },
+  map,
+  token,
+  readOnlyToken,
+  botIdentity,
+  journal,
+  node,
+  rootNode,
+  canonical,
+  worktree,
+  branch,
+  generation,
+  ratify,
+  github: ctx.github,
+  reviewer: ctx.reviewer,
+  substrateReaders: resolveReaders(ctx),
+ };
  const capped = new Set<SubstrateName>();
  let outcome: ImplementOutcome;
  for (;;) {
-  const envCmd = envWorkerOverride(ctx);
-  const { substrate, chosenOn } =
-   envCmd === undefined
-    ? await selectBuildSubstrate(ctx, capped)
-    : { substrate: undefined, chosenOn: "RANGER_WORKER_CMD override; its heads count as Pi-written" };
-  const workerCmd = envCmd ?? resolveWorkerCommand(ctx, substrate as SubstrateName);
-  journal.updateWorker(nodeId, { substrate: substrate ?? null });
-  journal.recordEvent("worker-start", {
-   nodeId,
-   repo,
-   detail: `substrate ${substrate ?? "unknown"} (${chosenOn}), command: ${workerCmd[0]}`.slice(0, 400),
-  });
   try {
-   outcome = await runImplement({
-    config: ctx.wallClockMin === undefined
-     ? config
-     : { ...config, workers: { ...config.workers, wallClockMin: ctx.wallClockMin } },
-    map,
-    token,
-    readOnlyToken,
-    botIdentity,
-    journal,
-    node,
-    rootNode,
-    canonical,
-    worktree,
-    branch,
-    generation,
-    ratify,
-    workerRun:
-     ctx.worker ??
-     ((p: string, opts: RunOptions) => runCmd(workerCmd[0], [...workerCmd.slice(1), p], opts)),
-    github: ctx.github,
-    reviewer: ctx.reviewer,
-    substrate,
-    substrateReaders: resolveReaders(ctx),
-    excludedSubstrates: capped,
-   });
+   outcome = await runSession(ctx, nodeId, session, capped);
    const cap = outcome.substrateCapped;
    if (cap === undefined || capped.has(cap.substrate)) break;
    await handleSubstrateCap(ctx, { nodeId, generation, worktree, branch }, cap, outcome, capped);

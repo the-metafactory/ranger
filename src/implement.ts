@@ -565,13 +565,12 @@ async function selectReviewSubstrate(
  headSha: string,
 ): Promise<{ substrate: SubstrateName; chosenOn: string }> {
  const author = ctx.journal.headSubstrate(ctx.map.repo, headSha) ?? "pi";
- const { substrate, chosenOn } = await selectSubstrate(
-  ctx.journal,
-  ctx.config.substrates,
-  ctx.excludedSubstrates ?? new Set<SubstrateName>(),
-  ctx.substrateReaders,
-  (input) => selectForReview(input, author),
- );
+ const { substrate, chosenOn } = await selectSubstrate(ctx.journal, {
+  config: ctx.config.substrates,
+  excluded: ctx.excludedSubstrates ?? new Set<SubstrateName>(),
+  readers: ctx.substrateReaders,
+  pick: (input) => selectForReview(input, author),
+ });
  return { substrate, chosenOn: ` on ${substrate} (head by ${author}; ${chosenOn})` };
 }
 

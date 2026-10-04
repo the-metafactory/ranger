@@ -104,10 +104,13 @@ budget:
 
 # Substrate selection (node #45): route implement sessions, fix passes and sage
 # reviews across Claude, Codex and Pi by remaining 5h/7d quota. Strong substrates
-# (Claude, Codex) are eligible while every reported window's used% is under its
-# max-used threshold below; once both are capped, Pi is the fallback. Review
-# prefers a substrate other than the one that wrote the PR head (best effort:
-# when no other substrate is eligible, the author's own substrate or Pi reviews).
+# (Claude, Codex) are eligible while their reading is fresh, reports at least one
+# window, and every window's used% is under its max-used threshold below. Once
+# neither is eligible (over threshold, stale or failed read, no windows, or
+# capped), Pi is the fallback: a missing `claude` or `codex` CLI sends every
+# session to Pi. Review prefers a substrate other than the one that wrote the PR
+# head (best effort: when no other substrate is eligible, the author's own
+# substrate or Pi reviews).
 substrates:
   # 5-hour window: eligible when used% < this.
   fiveHourMaxUsedPct: 70

@@ -686,28 +686,11 @@ export class Journal {
 
  /** Upsert a substrate quota reading. */
  upsertSubstrateReading(row: SubstrateReading): void {
+  const { substrate: _key, ...reading } = row;
   this.db
    .insert(substrateReadings)
-   .values({
-    substrate: row.substrate,
-    readAt: row.readAt,
-    fiveHourUsedPct: row.fiveHourUsedPct,
-    sevenDayUsedPct: row.sevenDayUsedPct,
-    resetsAt: row.resetsAt,
-    capped: row.capped,
-    cappedUntil: row.cappedUntil,
-   })
-   .onConflictDoUpdate({
-    target: substrateReadings.substrate,
-    set: {
-     readAt: row.readAt,
-     fiveHourUsedPct: row.fiveHourUsedPct,
-     sevenDayUsedPct: row.sevenDayUsedPct,
-     resetsAt: row.resetsAt,
-     capped: row.capped,
-     cappedUntil: row.cappedUntil,
-    },
-   })
+   .values(row)
+   .onConflictDoUpdate({ target: substrateReadings.substrate, set: reading })
    .run();
  }
 

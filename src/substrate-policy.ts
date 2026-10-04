@@ -51,8 +51,10 @@ export function isCappedAt(reading: SubstrateReading, now: Date): boolean {
 
 /**
  * A strong substrate is eligible when its reading is fresh, it is neither
- * capped nor capped-until in the future, and every reported window's used% is
- * under its max-used threshold. Missing or stale readings fail closed.
+ * capped nor capped-until in the future, it reports at least one window, and
+ * every reported window's used% is under its max-used threshold. Missing,
+ * stale or window-less readings fail closed: a reading with no windows says
+ * nothing about the reserve, so it must not look unlimited.
  */
 export function isEligible(
  reading: SubstrateReading | null,
@@ -73,9 +75,8 @@ export function isEligible(
  if (reading.sevenDayUsedPct !== null) {
   headroom = Math.min(headroom, config.sevenDayMaxUsedPct - reading.sevenDayUsedPct);
  }
- if (headroom <= 0) return null;
- // A fresh reading with no windows: eligible, with the least headroom.
- if (headroom === Infinity) headroom = 1;
+ // No window reported (Infinity) or one at/over its threshold: ineligible.
+ if (headroom === Infinity || headroom <= 0) return null;
  return { name, headroom };
 }
 

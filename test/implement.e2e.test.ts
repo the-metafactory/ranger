@@ -868,6 +868,7 @@ describe("implement lane (node #23)", () => {
   const r = await rig({});
   cleanup.push(r.dir);
   delete r.ctx.workerCommand;
+  // afterEach restores process.env from savedEnv, so this never leaks.
   process.env.RANGER_WORKER_CMD = implementWorker;
   r.ctx.substrateReaders = {
    claude: () => Promise.reject(new Error("down")),

@@ -310,11 +310,11 @@ describe("isEligible", () => {
   expect(e!.headroom).toBe(30); // 80-50
  });
 
- test("eligible with no windows = minimum headroom", () => {
-  const r = reading("claude", { readAt: fresh, fiveHourUsedPct: null, sevenDayUsedPct: null });
-  const e = isEligible(r, DEFAULT_CONFIG, now);
-  expect(e).not.toBeNull();
-  expect(e!.headroom).toBe(1);
+ test("ineligible with no windows reported (fail closed)", () => {
+  for (const name of ["claude", "codex"] as const) {
+   const r = reading(name, { readAt: fresh, fiveHourUsedPct: null, sevenDayUsedPct: null });
+   expect(isEligible(r, DEFAULT_CONFIG, now)).toBeNull();
+  }
  });
 });
 
@@ -604,6 +604,32 @@ async function withJournal(fn: (journal: Journal) => Promise<void> | void): Prom
   rmSync(dir, { recursive: true, force: true });
  }
 }
+
+describe("window-less readings never bypass the reserve", () => {
+ test("codex null/null and claude without unifiedWindows route to Pi", async () => {
+  await withJournal((journal) => {
+   const now = new Date();
+   persistReading(
+    journal,
+    parseCodexQuota(
+     { rateLimits: { primary: null, secondary: null, rateLimitReachedType: null } },
+     now,
+    ),
+   );
+   persistReading(
+    journal,
+    parseClaudeRateLimitEvent(
+     { type: "rate_limit_event", rate_limit_info: { status: "allowed", resetsAt: 100 } },
+     now,
+    ),
+   );
+   const readings = journal.listSubstrateReadings();
+   expect(readings).toHaveLength(2);
+   expect(selectForBuild({ readings, now, config: DEFAULT_CONFIG })).toBe("pi");
+   expect(selectForReview({ readings, now, config: DEFAULT_CONFIG }, "claude")).toBe("pi");
+  });
+ });
+});
 
 describe("markSubstrateCapped", () => {
  test("marks a substrate as capped until its reported reset", async () => {

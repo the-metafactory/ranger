@@ -2,11 +2,13 @@
  * Substrate selection (node #45): route implement sessions, fix passes and
  * sage reviews across Claude, Codex and Pi by remaining 5h/7d quota.
  *
- * Strong substrates (Claude, Codex) are eligible while every reported
- * window's used% is under its max-used threshold; once both are capped, Pi is
- * the fallback. Review selection prefers a substrate other than the one that
- * wrote the PR head; when no other substrate is eligible the review runs on
- * the author's own (best-effort independence, not a guarantee).
+ * Strong substrates (Claude, Codex) are eligible while their reading is
+ * fresh, reports at least one window, and every window's used% is under its
+ * max-used threshold. Once neither is eligible (over threshold, stale or
+ * failed read, no windows, or capped), Pi is the fallback. Review selection
+ * prefers a substrate other than the one that wrote the PR head; when no
+ * other substrate is eligible the review runs on the author's own
+ * (best-effort independence, not a guarantee).
  */
 import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -119,13 +121,20 @@ export function drainJsonLines(buffer: string): { messages: unknown[]; rest: str
  for (const raw of lines) {
   const line = raw.trim();
   if (line.length === 0) continue;
-  try {
-   messages.push(JSON.parse(line));
-  } catch {
-   // a non-JSON line (a log line) is not a protocol message
-  }
+  // a non-JSON line (a log line) is not a protocol message
+  const msg = tryParseJson(line);
+  if (msg !== undefined) messages.push(msg);
  }
  return { messages, rest };
+}
+
+/** A line's JSON value, or undefined when it is not JSON. */
+function tryParseJson(line: string): unknown {
+ try {
+  return JSON.parse(line) as unknown;
+ } catch {
+  return undefined;
+ }
 }
 
 const CODEX_RATE_LIMITS_ID = 3;
@@ -209,6 +218,10 @@ export function readCodexQuota(opts: { timeoutMs?: number } = {}): Promise<Quota
 
 // ---- Claude quota parser ----
 
+/**
+ * A `rate_limit_event` line of `claude -p … --output-format stream-json
+ * --verbose`, shaped after the sample captured for the node #45 brief.
+ */
 export interface ClaudeRateLimitEvent {
  type: "rate_limit_event";
  rate_limit_info: {
@@ -261,13 +274,11 @@ export function parseClaudeRateLimitEvent(event: ClaudeRateLimitEvent, now = new
 export function* claudeRateLimitEvents(lines: string[]): Generator<ClaudeRateLimitEvent> {
  for (const line of lines) {
   if (!line.includes("rate_limit_event")) continue;
-  try {
-   const obj = JSON.parse(line) as { type?: string; rate_limit_info?: { status?: unknown } };
-   if (obj.type === "rate_limit_event" && typeof obj.rate_limit_info?.status === "string") {
-    yield obj as ClaudeRateLimitEvent;
-   }
-  } catch {
-   continue;
+  const obj = tryParseJson(line) as
+   | { type?: string; rate_limit_info?: { status?: unknown } }
+   | undefined;
+  if (obj?.type === "rate_limit_event" && typeof obj.rate_limit_info?.status === "string") {
+   yield obj as ClaudeRateLimitEvent;
   }
  }
 }
@@ -292,12 +303,8 @@ export function extractClaudeResultText(lines: string[], fallback: string): stri
  for (let i = lines.length - 1; i >= 0; i--) {
   const line = lines[i].trim();
   if (!line.startsWith("{")) continue;
-  try {
-   const obj = JSON.parse(line) as { type?: string; result?: unknown };
-   if (obj.type === "result" && typeof obj.result === "string") return obj.result;
-  } catch {
-   continue;
-  }
+  const obj = tryParseJson(line) as { type?: string; result?: unknown } | undefined;
+  if (obj?.type === "result" && typeof obj.result === "string") return obj.result;
  }
  return fallback;
 }
@@ -467,11 +474,14 @@ export async function freshReadings(
  */
 export async function selectSubstrate(
  journal: Journal,
- config: SubstrateConfig,
- excluded: ReadonlySet<SubstrateName>,
- readers: SubstrateReaders | undefined,
- pick: (input: SelectionInput) => SubstrateName,
+ opts: {
+  config: SubstrateConfig;
+  excluded: ReadonlySet<SubstrateName>;
+  readers: SubstrateReaders | undefined;
+  pick: (input: SelectionInput) => SubstrateName;
+ },
 ): Promise<{ substrate: SubstrateName; chosenOn: string }> {
+ const { config, excluded, readers, pick } = opts;
  const now = new Date();
  const readings = await freshReadings(journal, config, now, readers);
  const selectable = readings.filter((r) => !excluded.has(r.substrate));
