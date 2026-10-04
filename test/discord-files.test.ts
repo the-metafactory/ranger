@@ -27,6 +27,23 @@ describe("Discord multipart files", () => {
   expect(await announcer.post("card", "merge card for node 52", files, [{ description: "diff" }])).toBe("789");
   expect(calls).toBe(2);
  });
+ test("announcer never resends after a 5xx: Discord may already have posted it", async () => {
+  let calls = 0;
+  const fetchFn = (async () => {
+   calls++;
+   return new Response("upstream", { status: 502 });
+  }) as unknown as typeof fetch;
+  const announcer = new DiscordAnnouncer("bot-secret", "123", undefined, fetchFn);
+  await expect(announcer.post("claim", "claim announce for node 52")).rejects.toThrow("HTTP 502");
+  expect(calls).toBe(1);
+ });
+ test("the escalation client still retries a 5xx", async () => {
+  let calls = 0;
+  const fetchFn = (async () =>
+   ++calls === 1 ? new Response("upstream", { status: 502, headers: { "retry-after": "0.001" } }) : Response.json({ id: "9" })) as unknown as typeof fetch;
+  expect(await client(fetchFn).post("card")).toBe("9");
+  expect(calls).toBe(2);
+ });
  test.each([403, 200])("announcer preserves label and fail-closed error on HTTP %p or missing id", async status => {
   const fetchFn = (async () => Response.json({}, { status })) as unknown as typeof fetch;
   const announcer = new DiscordAnnouncer("bot-secret", "123", undefined, fetchFn);

@@ -88,7 +88,12 @@ export class DiscordAnnouncer implements Announcer {
   */
  async post(content: string, label: string, files: readonly DiscordFile[] = [], embeds: readonly { description: string }[] = []): Promise<string> {
   try {
-   return await this.discord.post(content, Date.now() + 30_000, files, embeds);
+   // Bounded at 30 s through the body read (round-35/38), and fail-closed:
+   // a 429 is resent, but a 5xx is not, since Discord may already have
+   // created the message and a resend would announce the claim twice.
+   return await this.discord.post(content, Date.now() + 30_000, files, embeds, {
+    retryServerErrors: false,
+   });
   } catch (error) {
    throw new AnnounceError(
     `${label} failed: ${error instanceof Error ? error.message : String(error)} — fail-closed.`,

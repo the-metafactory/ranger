@@ -297,6 +297,7 @@ export class EscalationDiscord {
     deadline?: number,
     files: readonly DiscordFile[] = [],
     embeds: readonly { description: string }[] = [],
+    retryServerErrors = true,
   ): Promise<DiscordHttpResult> {
     validateDiscordFiles(files);
     // Every call times out — a run can never stall indefinitely holding the
@@ -356,6 +357,12 @@ export class EscalationDiscord {
         );
       }
       if (response.status !== 429 && response.status < 500) {
+        return response;
+      }
+      // A 429 created nothing and is always safe to resend. A 5xx may arrive
+      // after Discord already created the message, so a caller that must not
+      // double-post (the claim announce) takes it as the answer instead.
+      if (response.status !== 429 && !retryServerErrors) {
         return response;
       }
       lastStatus = response.status;
@@ -423,6 +430,7 @@ export class EscalationDiscord {
     deadline?: number,
     files: readonly DiscordFile[] = [],
     embeds: readonly { description: string }[] = [],
+    opts: { retryServerErrors?: boolean } = {},
   ): Promise<string> {
     const response = await this.request(
       "POST",
@@ -431,6 +439,7 @@ export class EscalationDiscord {
       deadline,
       files,
       embeds,
+      opts.retryServerErrors ?? true,
     );
     if (response.status < 200 || response.status >= 300) {
       throw new EscalateError(`discord post returned HTTP ${response.status}`);
