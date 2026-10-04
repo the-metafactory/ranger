@@ -1,8 +1,8 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "6846bcbf-54ac-476b-a226-d7da19503bab",
-  "prevId": "85e5d89e-23e4-472b-bf9a-ca7b21cd5836",
+  "id": "97dc4df2-a258-45d6-90e8-642132a2f0c2",
+  "prevId": "6846bcbf-54ac-476b-a226-d7da19503bab",
   "tables": {
     "escalation_destinations": {
       "name": "escalation_destinations",
@@ -229,7 +229,17 @@
           "autoincrement": false
         }
       },
-      "indexes": {},
+      "indexes": {
+        "events_repo_node_id_idx": {
+          "name": "events_repo_node_id_idx",
+          "columns": [
+            "repo",
+            "node_id",
+            "id"
+          ],
+          "isUnique": false
+        }
+      },
       "foreignKeys": {},
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},

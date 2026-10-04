@@ -685,6 +685,7 @@ describe("node #54 — the journal feeds the section, with no GitHub call from a
    state: { journalPath: path, canonicalRoot: "/srv/ranger-repos" },
    workers: { spawnCapPerDay: 10, wallClockMin: 90, maxAttempts: 2, deadmanThreshold: 3, reviewRounds: 5 },
    budget: { graphqlFloor: 1000, rateLimitCooldownMin: 10, frontierMaxAgeMin: 60 },
+   substrates: { fiveHourMaxUsedPct: 70, sevenDayMaxUsedPct: 80, claudeProbeMaxAgeMin: 15, codexReadMaxAgeMin: 5 },
   } as unknown as RangerConfig;
   const maps = servedMaps(config);
   const reads: string[] = [];

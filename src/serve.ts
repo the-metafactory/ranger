@@ -54,17 +54,8 @@ import { cachedFrontier } from "./frontier-cache.ts";
 import { type FrontierEntry, graphFrontier, RateLimitError } from "./graph.ts";
 import { runCmd } from "./exec.ts";
 import { classify, type ClassifiedNode, loadProbeRegistry } from "./route.ts";
-import type { SubstrateReading } from "./journal.ts";
-import {
- activeCappedUntil,
- effectiveThreshold,
- isCappedAt,
- isEligible,
- isFresh,
- readingAgeMin,
- type SubstrateConfig,
-} from "./substrate-policy.ts";
-import { gatedEnv, tokenBatch, type TokenBatch } from "./token-gate.ts";
+import { liveSession, substrateUsageViews, type SubstrateUsageView } from "./substrate-usage.ts";
+import { assertReadOnlyToken, gatedEnv, tokenBatch, type TokenBatch } from "./token-gate.ts";
 import { childEnv, itermArgv, shellQuote } from "./launch.ts";
 import {
  type ActionKind,
@@ -185,8 +176,8 @@ export interface StateInputs {
  refreshing: boolean;
  refreshError: string | null;
  now: Date;
- /** Latest substrate quota readings, as the panel shows them (node #45). */
- substrates?: SubstrateView[];
+ /** Every substrate's limits and sessions, as the panel shows them (node #56). */
+ substrates?: SubstrateUsageView[];
  /** Parked, failed and needs-eye rows (node #54). */
  needsYou?: NeedsYouEntry[];
  /** Awaiting-merge rows whose labels are not known yet, with the read's error. */
@@ -256,53 +247,6 @@ export interface DashboardMap {
  grillings: GrillingView[];
 }
 
-/**
- * A substrate's latest quota reading, as the panel shows it (node #45): the
- * cap and eligibility state are derived here with the selector's own rules,
- * so the dashboard never re-derives them and the storage row stays private.
- */
-export interface SubstrateView {
- substrate: SubstrateReading["substrate"];
- fiveHourUsedPct: number | null;
- sevenDayUsedPct: number | null;
- fiveHourThreshold: number | null;
- sevenDayThreshold: number | null;
- /** ISO: the earliest reported window reset. */
- resetsAt: string | null;
- readAt: string;
- /** Minutes since the reading. */
- ageMin: number;
- /** Within its max age: a stale reading is ineligible (fail closed). */
- fresh: boolean;
- /** Capped now (by status or a future capped-until). */
- capped: boolean;
- /** ISO, only while still in the future. */
- cappedUntil: string | null;
- /** Selectable for the next session right now. */
- eligible: boolean;
-}
-
-export function substrateViews(
- readings: SubstrateReading[],
- config: SubstrateConfig,
- now: Date,
-): SubstrateView[] {
- return readings.map((r) => ({
-  substrate: r.substrate,
-  fiveHourUsedPct: r.fiveHourUsedPct,
-  sevenDayUsedPct: r.sevenDayUsedPct,
-  fiveHourThreshold: r.fiveHourUsedPct === null ? null : effectiveThreshold("five_hour", r, now, config),
-  sevenDayThreshold: r.sevenDayUsedPct === null ? null : effectiveThreshold("seven_day", r, now, config),
-  resetsAt: r.resetsAt,
-  readAt: r.readAt,
-  ageMin: readingAgeMin(r, now),
-  fresh: isFresh(r, config, now),
-  capped: isCappedAt(r, now),
-  cappedUntil: activeCappedUntil(r, now),
-  eligible: isEligible(r, config, now) !== null,
- }));
-}
-
 export interface DashboardState {
  generatedAt: string;
  refreshing: boolean;
@@ -315,7 +259,7 @@ export interface DashboardState {
  };
  current: CurrentJob[];
  maps: DashboardMap[];
- substrates: SubstrateView[];
+ substrates: SubstrateUsageView[];
  needsYou: NeedsYouEntry[];
  needsYouUnchecked: UncheckedRow[];
 }
@@ -740,6 +684,9 @@ button:disabled { opacity:.45; cursor:default; }
 .card label { font-size:12px; color:var(--muted); }
 .card pre { margin:6px 0 0; padding:6px 8px; font-size:11px; white-space:pre-wrap; overflow-wrap:anywhere; border:1px solid var(--line); border-radius:6px; }
 .card pre.err { color:var(--warn); border-color:var(--warn); }
+.line { display:block; font-size:12px; }
+.muted { opacity:.5; }
+.warn { color:var(--warn); }
 </style>
 </head>
 <body>
@@ -758,7 +705,7 @@ const TOKEN = document.querySelector('meta[name="ranger-token"]').content;
 const el = (tag, props = {}, ...kids) => { const n = document.createElement(tag); for (const [k, v] of Object.entries(props)) { if (k === "class") n.className = v; else if (k === "text") n.textContent = v; else n[k] = v; } for (const c of kids) if (c) n.append(c); return n; };
 const link = (url, text) => el("a", { href: url, target: "_blank", rel: "noopener", text });
 const empty = (text) => el("p", { class: "empty", text });
-const ago = (iso) => { if (!iso) return "never"; const s = Math.round((Date.now() - Date.parse(iso)) / 1000); return s < 90 ? s + " s ago" : Math.round(s / 60) + " min ago"; };
+const ago = (iso) => { if (!iso) return "never"; const s = Math.round((Date.now() - Date.parse(iso)) / 1000); const m = Math.round(s / 60); return s < 90 ? s + " s ago" : m < 90 ? m + " min ago" : m < 2880 ? Math.round(m / 60) + " h ago" : Math.round(m / 1440) + " d ago"; };
 // The page token rotates when serve restarts: a refused one means this page is stale.
 const REFUSED = "token refused";
 const RELOAD = "the dashboard restarted and this page's token is stale: reload the page";
@@ -897,18 +844,44 @@ function renderNeeds(s) {
  }
  box.append(...s.needsYou.map(needsCard));
 }
+const KINDS = [["worker", "worker"], ["fix-pass", "fix pass"], ["review", "review"]];
+const span = (text, cls) => el("span", { class: "line" + (cls ? " " + cls : ""), text });
+const until = (min) => min === null ? "" : min === 0 ? " (reset reached)" : " (in " + (min >= 1440 ? (min / 1440).toFixed(1) + " d" : min >= 60 ? Math.floor(min / 60) + " h " + (min % 60) + " min" : min + " min") + ")";
+const at = (iso) => new Date(iso).toLocaleString();
+function quotaWindow(label, w) {
+ if (!w) return label + ": not reported";
+ return label + ": " + w.usedPct + "% used, threshold " + w.threshold.toFixed(1) + "% \u00B7 " + (w.resetsAt ? "resets " + at(w.resetsAt) + until(w.resetInMin) : "reset unknown");
+}
+function sessionCounts(label, c) {
+ const kinds = KINDS.map(([k, name]) => {
+  const n = c[k]; const bad = ["failed", "capped", "transient"].filter((o) => n[o] > 0).map((o) => n[o] + " " + o);
+  return n.sessions + " " + name + (bad.length ? " (" + bad.join(", ") + ")" : "");
+ });
+ return label + ": " + kinds.join(" \u00B7 ");
+}
 function renderSubstrates(s) {
  const box = document.getElementById("substrates"); box.replaceChildren();
- if (!s.substrates || s.substrates.length === 0) { box.append(empty("No substrate readings yet.")); return; }
+ if (!s.substrates || s.substrates.length === 0) { box.append(empty("No substrates.")); return; }
  box.append(el("ul", {}, ...s.substrates.map((sub) => {
-  const parts = [sub.substrate.toUpperCase()];
-  if (sub.fiveHourUsedPct !== null) parts.push("5h: " + sub.fiveHourUsedPct + "% < " + sub.fiveHourThreshold.toFixed(1) + "%");
-  if (sub.sevenDayUsedPct !== null) parts.push("7d: " + sub.sevenDayUsedPct + "% < " + sub.sevenDayThreshold.toFixed(1) + "%");
-  if (sub.resetsAt) parts.push("resets " + new Date(sub.resetsAt).toLocaleString());
-  parts.push("read " + sub.ageMin + "m ago" + (sub.fresh ? "" : " (stale)"));
-  if (sub.capped) parts.push("CAPPED until " + (sub.cappedUntil ? new Date(sub.cappedUntil).toLocaleString() : "next reading"));
-  const state = sub.capped ? "capped" : sub.eligible ? "eligible" : "ineligible";
-  return el("li", {}, el("span", { class: "t", text: parts.join(" · ") }), el("span", { class: sub.eligible ? "tag" : "tag stale", text: state }));
+  const lines = [];
+  if (sub.quota === "none") lines.push(span("no quota (always eligible)"));
+  else if (sub.quota === "unread") lines.push(span("no reading: treated as capped", "warn"));
+  else {
+   const grey = sub.fresh ? "" : "muted";
+   lines.push(span(quotaWindow("5h", sub.fiveHour), grey), span(quotaWindow("7d", sub.sevenDay), grey));
+   lines.push(span("read " + sub.ageMin + " min ago (max " + sub.maxAgeMin + " min)" + (sub.cappedUntil ? " \u00B7 capped until " + at(sub.cappedUntil) : sub.capped ? " \u00B7 capped until the next reading" : ""), grey));
+  }
+  lines.push(span("eligible now: " + sub.eligible.state + " \u00B7 " + sub.eligible.reason));
+  if (!sub.sessions) lines.push(span("sessions: no session history to read", "muted"));
+  else {
+   const running = KINDS.filter(([k]) => sub.sessions.running[k] > 0).map(([k, name]) => sub.sessions.running[k] + " " + name);
+   lines.push(span("running now: " + (running.length ? running.join(" \u00B7 ") : "none")));
+   lines.push(span(sessionCounts("last 24 h", sub.sessions.day)), span(sessionCounts("last 7 d", sub.sessions.week)));
+  }
+  const last = sub.lastSession;
+  if (sub.sessions) lines.push(span(last ? "last: #" + last.nodeId + " (" + last.repo + ") " + KINDS.find(([k]) => k === last.kind)[1] + ", started " + ago(last.startedAt) + (last.endedAt ? ", " + (last.outcome || "ended") : ", open") : "last: no session yet"));
+  const tag = sub.eligible.state === "yes" ? "eligible" : sub.eligible.state === "stale" ? "stale" : "ineligible";
+  return el("li", {}, el("span", { class: "t" }, el("strong", { text: sub.substrate.toUpperCase() }), ...lines), el("span", { class: sub.eligible.state === "no" ? "tag stale" : "tag", text: tag }));
  })));
 }
 function render(s) { renderMeta(s); renderCurrent(s); renderSubstrates(s); renderNext(s); renderAuto(s); renderNeeds(s); renderGrill(s); }
@@ -1377,7 +1350,14 @@ export function stateFromJournal(
    refreshing: reader.refreshing,
    refreshError: reader.lastError,
    now,
-   substrates: substrateViews(journal?.listSubstrateReadings() ?? [], config.substrates, now),
+   substrates: substrateUsageViews({
+    readings: journal?.listSubstrateReadings() ?? [],
+    sessions: journal?.listSubstrateSessions(new Date(now.getTime() - 7 * 24 * 60 * 60_000)) ?? null,
+    lastSession: (substrate) => journal?.lastSubstrateSession(substrate) ?? null,
+    live: liveSession(workers, defaultPidAlive),
+    config: config.substrates,
+    now,
+   }),
   });
   reader.want(
    state.current.filter((j) => j.title === null).map((j) => `${j.repo}#${j.nodeId}`),
