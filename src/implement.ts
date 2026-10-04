@@ -21,14 +21,17 @@ import { GRAPH_CALL_TIMEOUT_MS, type NodeResult } from "./graph.ts";
 import { graphClose, graphDecisions, type CloseResult } from "./graph-write.ts";
 import type { ImplementPhase, Journal } from "./journal.ts";
 import { assembleImplementPrompt } from "./prompt.ts";
-import { sageReview, type ReviewVerdict } from "./review.ts";
+import { ReviewError, sageReview, type ReviewVerdict } from "./review.ts";
 import {
  cacheClaudeRateLimitEvents,
- detectClaudeCap,
- detectCodexCap,
+ confirmCap,
+ describeReadings,
+ extractClaudeResultText,
+ freshReadings,
  selectForReview,
  type CapSignal,
  type SubstrateName,
+ type SubstrateReaders,
 } from "./substrate.ts";
 import { workerEnv } from "./worker-env.ts";
 import { saveWorkerLog } from "./worker-log.ts";
@@ -102,8 +105,10 @@ export interface ImplementContext {
  reviewer?: Reviewer;
  /** How long to wait for GitHub to show a pushed head (default 2 min; tests shorten it). */
  headPollMs?: number;
- /** The substrate the worker runs on (node #44). */
+ /** The substrate the worker runs on (node #45). */
  substrate?: SubstrateName;
+ /** Quota readers for review selection and cap confirmation (tests inject them). */
+ substrateReaders?: SubstrateReaders;
 }
 
 export interface ImplementOutcome {
@@ -112,8 +117,8 @@ export interface ImplementOutcome {
  workerExit: number | null;
  close?: CloseResult;
  prNumber?: number;
- /** When the failure was caused by a substrate rate limit (node #44). */
- substrateCapped?: { substrate: SubstrateName; resetsAt: number | null };
+ /** When the failure was caused by a substrate rate limit (node #45). */
+ substrateCapped?: CapSignal;
 }
 
 /** A failure that parks the node for the principal instead of counting toward the dead-man. */
@@ -136,7 +141,7 @@ export interface RecordedReview {
  blockers: number;
  majors: number;
  nits: number;
- /** The substrate the review ran on (node #44); undefined for old markers. */
+ /** The substrate the review ran on (node #45); undefined for old markers. */
  substrate?: string;
  /** The review text, without the marker — the fix pass's input on a resume. */
  body: string;
@@ -394,6 +399,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
    configSnapshot: built.snapshot,
   });
   journal.recordEvent("pushed", { nodeId, repo, detail: `${branch} @ ${built.sha.slice(0, 8)}` });
+  recordHead(ctx, built.sha);
 
   const title = prTitle(node);
   fence("open PR");
@@ -426,22 +432,40 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
    }
    const round = reviews.length + 1;
    fence("review");
-   // Substrate selection for review (node #44): cross-model — the reviewer
-   // runs on a substrate other than the one that wrote the PR head.
-   const authorSubstrate: SubstrateName = ctx.substrate ?? "pi";
-   const reviewReadings = journal.listSubstrateReadings();
-   const reviewSubstrate = ctx.reviewer
-    ? undefined
-    : selectForReview(
-       { readings: reviewReadings, now: new Date(), config: config.substrates },
-       authorSubstrate,
-      );
-   const verdict = await (ctx.reviewer ?? sageReview)(
-    repo,
-    open.number,
-    ctx.readOnlyToken,
-    reviewSubstrate !== undefined ? { substrate: reviewSubstrate } : undefined,
-   );
+   // Cross-model review (node #45): the reviewer runs on a substrate other
+   // than the one that wrote the head; an unrecorded head counts as Pi's.
+   // An injected reviewer (tests) skips selection.
+   let reviewSubstrate: SubstrateName | undefined;
+   let chosenOn = "";
+   if (ctx.reviewer === undefined) {
+    const now = new Date();
+    const readings = await freshReadings(journal, config.substrates, now, ctx.substrateReaders);
+    const author = (journal.headSubstrate(live.headSha) ?? "pi") as SubstrateName;
+    reviewSubstrate = selectForReview({ readings, now, config: config.substrates }, author);
+    chosenOn = ` on ${reviewSubstrate} (head by ${author}; ${describeReadings(readings, now)})`;
+   }
+   let verdict: ReviewVerdict;
+   try {
+    verdict = await (ctx.reviewer ?? sageReview)(
+     repo,
+     open.number,
+     ctx.readOnlyToken,
+     reviewSubstrate !== undefined ? { substrate: reviewSubstrate } : undefined,
+    );
+   } catch (error) {
+    // A review that failed on its substrate's limit resumes elsewhere; any
+    // other review failure is an ordinary one.
+    if (!(error instanceof ReviewError) || reviewSubstrate === undefined) throw error;
+    const capSignal = await confirmCap(reviewSubstrate, journal, { readers: ctx.substrateReaders });
+    if (capSignal === null) throw error;
+    return {
+     status: "failed",
+     detail: `sage review round ${round} on ${reviewSubstrate} hit its rate limit: ${error.message.slice(0, 300)}`,
+     workerExit,
+     prNumber: open.number,
+     substrateCapped: capSignal,
+    };
+   }
    if (verdict.commitId !== live.headSha) {
     throw new ParkSignal(
      `sage reviewed ${verdict.commitId.slice(0, 8)} but PR #${open.number}'s head is ${live.headSha.slice(0, 8)} — the head moved during review`,
@@ -467,7 +491,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
    journal.recordEvent("reviewed", {
     nodeId,
     repo,
-    detail: `round ${round} @ ${verdict.commitId.slice(0, 8)}: ${verdict.verdict}, ${verdict.blockers} blocker(s), ${verdict.majors} major(s)`,
+    detail: `round ${round} @ ${verdict.commitId.slice(0, 8)}: ${verdict.verdict}, ${verdict.blockers} blocker(s), ${verdict.majors} major(s)${chosenOn}`,
    });
   }
   journal.updateWorker(nodeId, {
@@ -504,6 +528,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
    repo,
    detail: `fix pass ${current.round} @ ${fixed.sha.slice(0, 8)}`,
   });
+  recordHead(ctx, fixed.sha);
   await awaitHead(github, repo, open.number, fixed.sha, token, ctx.headPollMs);
  }
 
@@ -541,8 +566,17 @@ interface PassResult {
  snapshot: string;
  sha: string;
  failure?: ImplementOutcome;
- /** Substrate cap detected in the worker result (node #44). */
- cap?: CapSignal;
+}
+
+/** Which substrate wrote a pushed SHA: the review of that head reads it back. */
+function recordHead(ctx: ImplementContext, sha: string): void {
+ if (ctx.substrate === undefined) return;
+ ctx.journal.recordHeadSubstrate({
+  sha,
+  repo: ctx.map.repo,
+  nodeId: ctx.node.ref.id,
+  substrate: ctx.substrate,
+ });
 }
 
 /** One worker session (build or fix), then the supervisor's own test + keyword checks. */
@@ -575,7 +609,7 @@ async function workerPass(
   probeTier: map.commands.probe !== undefined,
  });
  ctx.journal.assertGeneration(nodeId, ctx.generation, "spawn the worker");
- const result = await ctx.workerRun(prompt, {
+ const raw = await ctx.workerRun(prompt, {
   cwd: worktree,
   timeoutMs: config.workers.wallClockMin * 60_000,
   env: workerEnv(config, map.repo),
@@ -584,10 +618,13 @@ async function workerPass(
  });
  journal.updateWorker(nodeId, { workerPgid: null });
 
- // Cache Claude rate limit events from the run (node #44).
- if (ctx.substrate === "claude") {
-  cacheClaudeRateLimitEvents(result.stdout, journal);
- }
+ // A Claude worker streams JSON (node #45): its rate_limit_events are the
+ // current reading and its cap signal, and its result event is the summary
+ // the worker log carries, as plain `claude -p` output did.
+ const lines = ctx.substrate === "claude" ? raw.stdout.split("\n") : undefined;
+ if (lines !== undefined) cacheClaudeRateLimitEvents(lines, journal);
+ const result: RunResult =
+  lines === undefined ? raw : { ...raw, stdout: extractClaudeResultText(lines, raw.stdout) };
 
  const log = saveWorkerLog(
   journal.path,
@@ -601,29 +638,25 @@ async function workerPass(
  // with whatever the next git call carries.
  assertGitUntouched(ctx.canonical, snapshot);
 
- // Mid-session cap detection (node #44): detect from the substrate's own
- // signal, not from a generic non-zero exit. When detected, the failure does
- // not count toward attempts or the dead-man switch.
- const cap: CapSignal | null =
-  ctx.substrate === "claude"
-   ? detectClaudeCap(result)
-   : ctx.substrate === "codex"
-    ? detectCodexCap(result)
-    : null;
-
- const fail = (detail: string): PassResult => ({
+ const fail = (detail: string, substrateCapped?: CapSignal): PassResult => ({
   workerExit: result.code,
   snapshot,
   sha: before,
-  failure: { status: "failed", detail: `${detail} (worker log: ${log})`, workerExit: result.code,
-   ...(cap !== null ? { substrateCapped: { substrate: cap.substrate, resetsAt: cap.resetsAt } } : {}),
+  failure: {
+   status: "failed",
+   detail: `${detail} (worker log: ${log})`,
+   workerExit: result.code,
+   ...(substrateCapped === undefined ? {} : { substrateCapped }),
   },
-  cap: cap ?? undefined,
  });
  if (result.code !== 0) {
-  if (cap !== null) {
-   return fail(`substrate ${cap.substrate} hit a rate limit`);
-  }
+  // Mid-session cap (node #45): only the substrate's own signal says so, and
+  // only a failed run can be one. A capped failure does not count.
+  const capSignal: CapSignal | null =
+   ctx.substrate === undefined
+    ? null
+    : await confirmCap(ctx.substrate, journal, { lines, readers: ctx.substrateReaders });
+  if (capSignal !== null) return fail(`substrate ${capSignal.substrate} hit its rate limit`, capSignal);
   return fail(`worker exited ${result.code}: ${tail(result)}`);
  }
  const sha = await headSha(worktree);

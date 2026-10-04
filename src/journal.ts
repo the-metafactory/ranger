@@ -4,6 +4,7 @@ import {
  escalations,
  escalationDestinations,
  events,
+ headSubstrates,
  health,
  substrateReadings,
  vetoes,
@@ -680,18 +681,10 @@ export class Journal {
   return rows.map(hydrateEscalation);
  }
 
- // ---- substrate readings (node #44) ----
+ // ---- substrate readings (node #45) ----
 
  /** Upsert a substrate quota reading. */
- upsertSubstrateReading(row: {
-  substrate: string;
-  readAt: string;
-  fiveHourUsedPct: number | null;
-  sevenDayUsedPct: number | null;
-  resetsAt: string | null;
-  capped: boolean;
-  cappedUntil: string | null;
- }): void {
+ upsertSubstrateReading(row: SubstrateReading): void {
   this.db
    .insert(substrateReadings)
    .values({
@@ -728,6 +721,27 @@ export class Journal {
  /** Get all substrate readings. */
  listSubstrateReadings(): SubstrateReading[] {
   return this.db.query.substrateReadings.findMany().sync().map(hydrateSubstrateReading);
+ }
+
+ /** Record which substrate wrote a pushed SHA (review selection reads it back). */
+ recordHeadSubstrate(row: { sha: string; repo: string; nodeId: string; substrate: string }): void {
+  const recordedAt = new Date().toISOString();
+  this.db
+   .insert(headSubstrates)
+   .values({ ...row, recordedAt })
+   .onConflictDoUpdate({
+    target: headSubstrates.sha,
+    set: { substrate: row.substrate, recordedAt },
+   })
+   .run();
+ }
+
+ /** The substrate that wrote a pushed SHA, or null when ranger never recorded it. */
+ headSubstrate(sha: string): string | null {
+  const row = this.db.query.headSubstrates
+   .findFirst({ where: eq(headSubstrates.sha, sha) })
+   .sync();
+  return row?.substrate ?? null;
  }
 
  /** Prune spawn-ledger keys older than the retention window (keeps health tidy). */

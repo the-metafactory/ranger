@@ -144,7 +144,7 @@ export interface StateInputs {
  refreshing: boolean;
  refreshError: string | null;
  now: Date;
- /** Latest substrate quota readings (node #44). */
+ /** Latest substrate quota readings (node #45). */
  substrateReadings?: SubstrateReading[];
 }
 
@@ -202,15 +202,8 @@ export interface DashboardMap {
  grillings: GrillingView[];
 }
 
-export interface SubstrateView {
- substrate: string;
- fiveHourUsedPct: number | null;
- sevenDayUsedPct: number | null;
- resetsAt: string | null;
- readAt: string;
- capped: boolean;
- cappedUntil: string | null;
-}
+/** A substrate's latest quota reading, as the panel shows it (node #45). */
+export type SubstrateView = SubstrateReading;
 
 export interface DashboardState {
  generatedAt: string;
@@ -396,15 +389,7 @@ export function assembleState(inputs: StateInputs): DashboardState {
   },
   current,
   maps,
-  substrates: (inputs.substrateReadings ?? []).map((r) => ({
-   substrate: r.substrate,
-   fiveHourUsedPct: r.fiveHourUsedPct,
-   sevenDayUsedPct: r.sevenDayUsedPct,
-   resetsAt: r.resetsAt,
-   readAt: r.readAt,
-   capped: r.capped,
-   cappedUntil: r.cappedUntil,
-  })),
+  substrates: inputs.substrateReadings ?? [],
  };
 }
 
@@ -706,9 +691,12 @@ function renderSubstrates(s) {
   const parts = [sub.substrate.toUpperCase()];
   if (sub.fiveHourUsedPct !== null) parts.push("5h: " + sub.fiveHourUsedPct + "%");
   if (sub.sevenDayUsedPct !== null) parts.push("7d: " + sub.sevenDayUsedPct + "%");
+  if (sub.resetsAt) parts.push("resets " + new Date(sub.resetsAt).toLocaleString());
   parts.push("read " + ago(sub.readAt));
-  if (sub.capped) parts.push("CAPPED until " + (sub.cappedUntil ? new Date(sub.cappedUntil).toLocaleTimeString() : "?"));
-  return el("li", {}, el("span", { class: "t", text: parts.join(" · ") }), el("span", { class: sub.capped ? "tag stale" : "tag", text: sub.capped ? "capped" : "ok" }));
+  const until = sub.cappedUntil && new Date(sub.cappedUntil).getTime() > Date.now() ? sub.cappedUntil : null;
+  const capped = sub.capped || until !== null;
+  if (capped) parts.push("CAPPED until " + (until ? new Date(until).toLocaleString() : "next reading"));
+  return el("li", {}, el("span", { class: "t", text: parts.join(" · ") }), el("span", { class: capped ? "tag stale" : "tag", text: capped ? "capped" : "ok" }));
  })));
 }
 function render(s) { renderMeta(s); renderCurrent(s); renderSubstrates(s); renderNext(s); renderAuto(s); renderGrill(s); }

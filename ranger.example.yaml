@@ -102,7 +102,7 @@ budget:
   # sentinel (newest issue update + newest issue event) has not moved.
   frontierMaxAgeMin: 60
 
-# Substrate selection (node #44): route implement sessions, fix passes and sage
+# Substrate selection (node #45): route implement sessions, fix passes and sage
 # reviews across Claude, Codex and Pi by remaining 5h/7d quota. Strong substrates
 # (Claude, Codex) are eligible while every reported window is under its reserve;
 # once both are capped, Pi is the fallback. Cross-model review: the reviewer

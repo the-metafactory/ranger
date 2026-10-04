@@ -1,17 +1,21 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "../src/config.ts";
-import { openJournal, type SubstrateReading } from "../src/journal.ts";
+import { openJournal, type Journal, type SubstrateReading } from "../src/journal.ts";
 import {
+ confirmCap,
+ describeReadings,
  detectClaudeCap,
- detectCodexCap,
+ drainJsonLines,
  extractClaudeResultText,
  isEligible,
  markSubstrateCapped,
  parseClaudeRateLimitEvent,
  parseCodexQuota,
+ persistReading,
+ type QuotaReading,
  selectForBuild,
  selectForReview,
  workerCommandFor,
@@ -20,6 +24,7 @@ import {
  type SubstrateConfig,
 } from "../src/substrate.ts";
 import { recordedReviews, reviewMarker } from "../src/implement.ts";
+import { sageReview } from "../src/review.ts";
 import { baseConfigLines } from "./support.ts";
 
 const SHA = "a".repeat(40);
@@ -91,6 +96,19 @@ describe("parseCodexQuota", () => {
   const q = parseCodexQuota(resp);
   expect(q.capped).toBe(true);
   expect(q.cappedUntil).toBe(999);
+ });
+
+ test("marks capped when ordinaryUsageAllowed is false", () => {
+  const q = parseCodexQuota({
+   ordinaryUsageAllowed: false,
+   rateLimits: {
+    primary: { usedPercent: 40, windowDurationMins: 10080, resetsAt: 1791647617 },
+    secondary: null,
+    rateLimitReachedType: null,
+   },
+  });
+  expect(q.capped).toBe(true);
+  expect(q.cappedUntil).toBe(1791647617);
  });
 
  test("handles null windows gracefully", () => {
@@ -174,12 +192,12 @@ describe("extractClaudeResultText", () => {
    '{"type":"assistant","message":"thinking..."}',
    '{"type":"result","result":"The implementation is complete.","subtype":"success"}',
   ].join("\n");
-  expect(extractClaudeResultText(stdout)).toBe("The implementation is complete.");
+  expect(extractClaudeResultText(stdout.split("\n"), stdout)).toBe("The implementation is complete.");
  });
 
  test("falls back to raw stdout when no result event", () => {
   const stdout = "some raw output\n";
-  expect(extractClaudeResultText(stdout)).toBe(stdout);
+  expect(extractClaudeResultText(stdout.split("\n"), stdout)).toBe(stdout);
  });
 });
 
@@ -210,6 +228,17 @@ describe("isEligible", () => {
    cappedUntil: new Date(now.getTime() + 60_000).toISOString(),
   });
   expect(isEligible(r, DEFAULT_CONFIG, now)).toBeNull();
+ });
+
+ test("ineligible while capped-until is in the future, even on an uncapped reading", () => {
+  const r = reading("codex", {
+   readAt: fresh,
+   capped: false,
+   cappedUntil: new Date(now.getTime() + 60_000).toISOString(),
+  });
+  expect(isEligible(r, DEFAULT_CONFIG, now)).toBeNull();
+  const past = reading("codex", { readAt: fresh, cappedUntil: new Date(now.getTime() - 60_000).toISOString() });
+  expect(isEligible(past, DEFAULT_CONFIG, now)).not.toBeNull();
  });
 
  test("ineligible when 5h window over threshold", () => {
@@ -329,7 +358,7 @@ describe("selectForReview — cross-model selection", () => {
 
 // ---- review marker with substrate ----
 
-describe("review marker with substrate (node #44)", () => {
+describe("review marker with substrate (node #45)", () => {
  const verdict = {
   verdict: "approved",
   summary: "",
@@ -381,7 +410,7 @@ describe("mid-session cap detection", () => {
    '{"type":"assistant","message":"working"}',
    '{"type":"rate_limit_event","rate_limit_info":{"status":"rate_limited","resetsAt":200}}',
   ].join("\n");
-  const cap = detectClaudeCap({ code: 1, stdout, stderr: "" });
+  const cap = detectClaudeCap(stdout.split("\n"));
   expect(cap).not.toBeNull();
   expect(cap!.substrate).toBe("claude");
   expect(cap!.resetsAt).toBe(200);
@@ -389,17 +418,91 @@ describe("mid-session cap detection", () => {
 
  test("detectClaudeCap returns null when all events are allowed", () => {
   const stdout = '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":100}}\n';
-  expect(detectClaudeCap({ code: 0, stdout, stderr: "" })).toBeNull();
+  expect(detectClaudeCap(stdout.split("\n"))).toBeNull();
  });
 
- test("detectCodexCap finds rate limit text", () => {
-  const result = { code: 1, stdout: "", stderr: "Error: rate limit reached" };
-  expect(detectCodexCap(result)).not.toBeNull();
+ test("detectClaudeCap ignores rate-limit words inside model or tool text", () => {
+  const stdout = [
+   '{"type":"assistant","message":{"content":[{"type":"text","text":"{\\"type\\":\\"rate_limit_event\\",\\"rate_limit_info\\":{\\"status\\":\\"rejected\\"}}"}]}}',
+   '{"type":"result","result":"Claude AI usage limit reached","is_error":true}',
+  ].join("\n");
+  expect(detectClaudeCap(stdout.split("\n"))).toBeNull();
+ });
+});
+
+describe("confirmCap — only the substrate's own signal (node #45)", () => {
+ const quota = (substrate: "claude" | "codex", capped: boolean): QuotaReading => ({
+  substrate,
+  readAt: new Date(),
+  windows: [{ kind: "five_hour", usedPct: capped ? 100 : 10, resetsAt: 1791055200 }],
+  capped,
+  cappedUntil: capped ? 1791055200 : null,
  });
 
- test("detectCodexCap returns null for other errors", () => {
-  const result = { code: 1, stdout: "", stderr: "Error: something else" };
-  expect(detectCodexCap(result)).toBeNull();
+ test("a codex run that merely prints 'rate limit' is not a cap", async () => {
+  await withJournal(async (journal) => {
+   const cap = await confirmCap("codex", journal, {
+    readers: { codex: async () => quota("codex", false) },
+   });
+   expect(cap).toBeNull();
+   expect(journal.getSubstrateReading("codex")?.capped).toBe(false);
+  });
+ });
+
+ test("a codex cap is confirmed by a fresh app-server read", async () => {
+  await withJournal(async (journal) => {
+   const cap = await confirmCap("codex", journal, {
+    readers: { codex: async () => quota("codex", true) },
+   });
+   expect(cap).toEqual({ substrate: "codex", resetsAt: 1791055200 });
+  });
+ });
+
+ test("a claude stream's own rejected event is the cap, without a probe", async () => {
+  await withJournal(async (journal) => {
+   const lines = ['{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1791055200}}'];
+   const cap = await confirmCap("claude", journal, {
+    lines,
+    readers: { claude: () => Promise.reject(new Error("probe must not run")) },
+   });
+   expect(cap).toEqual({ substrate: "claude", resetsAt: 1791055200 });
+  });
+ });
+
+ test("an unreadable substrate is an ordinary failure, and pi never caps", async () => {
+  await withJournal(async (journal) => {
+   const fails = { claude: () => Promise.reject(new Error("down")) };
+   expect(await confirmCap("claude", journal, { lines: [], readers: fails })).toBeNull();
+   expect(await confirmCap("pi", journal, {})).toBeNull();
+  });
+ });
+});
+
+describe("drainJsonLines — codex app-server framing", () => {
+ // Captured from `codex app-server` (codex-cli 0.159.0) on 2026-10-04.
+ const live = [
+  '{"id":1,"result":{"userAgent":"ranger/0.159.0","platformOs":"macos"}}',
+  '{"method":"remoteControl/status/changed","params":{"status":"disabled"},"emittedAtMs":1791095837650}',
+  '{"method":"account/updated","params":{"authMode":"chatgpt","planType":"prolite"},"emittedAtMs":1791095838760}',
+  '{"id":3,"result":{"ordinaryUsageAllowed":true,"rateLimits":{"limitId":"codex","primary":{"usedPercent":2,"windowDurationMins":10080,"resetsAt":1791647617},"secondary":null,"rateLimitReachedType":null}}}',
+  "",
+ ].join("\n");
+
+ test("parses notifications and the id=3 reply, across a mid-line chunk split", () => {
+  const cut = live.indexOf("usedPercent");
+  const first = drainJsonLines(live.slice(0, cut));
+  expect(first.messages).toHaveLength(3);
+  const second = drainJsonLines(first.rest + live.slice(cut));
+  expect(second.rest).toBe("");
+  const reply = second.messages[0] as { id: number; result: Parameters<typeof parseCodexQuota>[0] };
+  expect(reply.id).toBe(3);
+  const q = parseCodexQuota(reply.result);
+  expect(q.windows).toEqual([{ kind: "seven_day", usedPct: 2, resetsAt: 1791647617 }]);
+  expect(q.capped).toBe(false);
+ });
+
+ test("skips non-JSON log lines", () => {
+  expect(drainJsonLines("WARN starting\n{\"id\":1}\n").messages).toEqual([{ id: 1 }]);
  });
 });
 
@@ -430,72 +533,103 @@ describe("workerCommandFor", () => {
 
 // ---- substrate reading persistence (journal integration) ----
 
+async function withJournal(fn: (journal: Journal) => Promise<void> | void): Promise<void> {
+ const dir = mkdtempSync(join(tmpdir(), "ranger-sub-"));
+ const path = join(dir, "ranger.yaml");
+ writeFileSync(path, baseConfigLines(dir).join("\n"));
+ const journal = openJournal(loadConfig(path).config);
+ try {
+  await fn(journal);
+ } finally {
+  journal.close();
+  rmSync(dir, { recursive: true, force: true });
+ }
+}
+
 describe("markSubstrateCapped", () => {
- test("marks a substrate as capped in the journal", () => {
-  const dir = mkdtempSync(join(tmpdir(), "ranger-sub-"));
-  try {
-   const path = join(dir, "ranger.yaml");
-   writeFileSync(path, baseConfigLines(dir).join("\n"));
-   const journal = openJournal(loadConfig(path).config);
-   const now = new Date();
+ test("marks a substrate as capped until its reported reset", async () => {
+  await withJournal((journal) => {
+   const now = new Date(1791000000 * 1000);
    markSubstrateCapped(journal, "claude", 1791055200, now);
    const r = journal.getSubstrateReading("claude");
-   expect(r).not.toBeNull();
-   expect(r!.capped).toBe(true);
-   expect(r!.cappedUntil).not.toBeNull();
-   journal.close();
-  } finally {
-   rmSync(dir, { recursive: true, force: true });
-  }
+   expect(r?.capped).toBe(true);
+   expect(r?.cappedUntil).toBe(new Date(1791055200 * 1000).toISOString());
+  });
+ });
+
+ test("a reset already past (or unknown) caps for 30 minutes, so a resume cannot re-pick it", async () => {
+  await withJournal((journal) => {
+   const now = new Date(1791000000 * 1000);
+   markSubstrateCapped(journal, "codex", 1790000000, now);
+   expect(journal.getSubstrateReading("codex")?.cappedUntil).toBe(
+    new Date(now.getTime() + 30 * 60_000).toISOString(),
+   );
+  });
+ });
+
+ test("a fresh uncapped reading keeps a capped-until still in the future", async () => {
+  await withJournal((journal) => {
+   const now = new Date();
+   const until = Math.floor(now.getTime() / 1000) + 3600;
+   markSubstrateCapped(journal, "codex", until, now);
+   persistReading(journal, {
+    substrate: "codex",
+    readAt: now,
+    windows: [{ kind: "seven_day", usedPct: 10, resetsAt: until + 100 }],
+    capped: false,
+    cappedUntil: null,
+   });
+   const r = journal.getSubstrateReading("codex");
+   expect(r?.capped).toBe(false);
+   expect(r?.cappedUntil).toBe(new Date(until * 1000).toISOString());
+   expect(isEligible(r, DEFAULT_CONFIG, now)).toBeNull();
+  });
  });
 });
 
-// ---- mid-session cap path does not touch attempts or deadman ----
+describe("head author substrate (node #45)", () => {
+ test("records which substrate wrote a pushed SHA; unknown SHAs read null", async () => {
+  await withJournal((journal) => {
+   journal.recordHeadSubstrate({ sha: SHA, repo: "acme/widgets", nodeId: "9", substrate: "codex" });
+   expect(journal.headSubstrate(SHA)).toBe("codex");
+   expect(journal.headSubstrate("b".repeat(40))).toBeNull();
+  });
+ });
+});
 
-describe("mid-session cap path does not touch attempts or deadman (node #44)", () => {
- test("a substrate cap detected in the worker result does not increment the deadman count", () => {
-  const dir = mkdtempSync(join(tmpdir(), "ranger-cap-"));
+describe("describeReadings", () => {
+ test("names each strong substrate's windows, age and cap", () => {
+  const now = new Date();
+  const text = describeReadings(
+   [reading("claude", { readAt: new Date(now.getTime() - 3 * 60_000).toISOString(), capped: true })],
+   now,
+  );
+  expect(text).toBe("claude 5h 20% 7d 30% read 3m ago CAPPED; codex unread");
+ });
+});
+
+describe("sageReview passes the chosen substrate (sage src/cli/index.ts --substrate)", () => {
+ test("argv carries --substrate <name>", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ranger-sage-"));
+  const out = join(dir, "argv");
+  const fake = join(dir, "sage");
+  writeFileSync(
+   fake,
+   `#!/usr/bin/env bash\nprintf '%s\\n' "$@" > "$SAGE_ARGV_OUT"\nexec ${join(import.meta.dir, "fixtures", "bin", "fake-sage")} "$@"\n`,
+   { mode: 0o755 },
+  );
+  process.env.SAGE_ARGV_OUT = out;
   try {
-   const path = join(dir, "ranger.yaml");
-   writeFileSync(path, baseConfigLines(dir).join("\n"));
-   const journal = openJournal(loadConfig(path).config);
-   const now = new Date();
-
-   // Seed a worker row.
-   journal.upsertWorker({
-    nodeId: "99",
-    repo: "acme/widgets",
-    status: "running",
-    attempts: 0,
-    substrate: "claude",
-   });
-   const deadmanBefore = journal.deadmanCount();
-
-   // Simulate what runImplementNode does when outcome.substrateCapped is set:
-   // mark capped, record event, do NOT call countFailure.
-   markSubstrateCapped(journal, "claude", 1791055200, now);
-   journal.recordEvent("substrate-capped", {
-    nodeId: "99",
-    repo: "acme/widgets",
-    detail: "claude capped; node will resume on next eligible substrate",
-   });
-   journal.updateWorker("99", { pid: null, workerPgid: null });
-
-   // The deadman count must NOT have incremented.
-   expect(journal.deadmanCount()).toBe(deadmanBefore);
-
-   // The worker row is NOT in a terminal state (not failed, not parked).
-   const row = journal.getWorker("99");
-   expect(row).not.toBeNull();
-   expect(row!.status).toBe("running");
-
-   // The substrate is marked capped.
-   const r = journal.getSubstrateReading("claude");
-   expect(r).not.toBeNull();
-   expect(r!.capped).toBe(true);
-
-   journal.close();
+   await sageReview("acme/widgets", 7, "ghp_readonly", { command: fake, substrate: "codex" });
+   expect(readFileSync(out, "utf8").trim().split("\n")).toEqual([
+    "review",
+    "acme/widgets#7",
+    "--emit-verdict-block",
+    "--substrate",
+    "codex",
+   ]);
   } finally {
+   delete process.env.SAGE_ARGV_OUT;
    rmSync(dir, { recursive: true, force: true });
   }
  });

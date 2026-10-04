@@ -159,7 +159,7 @@ export const escalationDestinations = sqliteTable(
 );
 
 /**
- * Substrate quota readings (node #44): one row per substrate, upserted on
+ * Substrate quota readings (node #45): one row per substrate, upserted on
  * every read. `ranger serve` and successive ticks share them through SQLite.
  */
 export const substrateReadings = sqliteTable("substrate_readings", {
@@ -177,4 +177,17 @@ export const substrateReadings = sqliteTable("substrate_readings", {
  capped: integer("capped", { mode: "boolean" }).notNull().default(false),
  /** ISO timestamp: capped until this time (from the substrate's own resetsAt). */
  cappedUntil: text("capped_until"),
+});
+
+/**
+ * Which substrate wrote each pushed SHA (node #45): review selection reads
+ * the PR head's author here. An unknown SHA counts as Pi-written.
+ */
+export const headSubstrates = sqliteTable("head_substrates", {
+ sha: text("sha").primaryKey(),
+ repo: text("repo").notNull(),
+ nodeId: text("node_id").notNull(),
+ /** claude | codex | pi */
+ substrate: text("substrate").notNull(),
+ recordedAt: text("recorded_at").notNull(),
 });

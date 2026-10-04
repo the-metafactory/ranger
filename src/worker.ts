@@ -26,11 +26,15 @@ import { FencedError, type Journal } from "./journal.ts";
 import { assembleResearchPrompt } from "./prompt.ts";
 import { IMPLEMENT_KINDS } from "./route.ts";
 import {
- ensureFreshReading,
+ describeReadings,
+ freshReadings,
  markSubstrateCapped,
  selectForBuild,
+ STRONG_SUBSTRATES,
  workerCommandFor,
+ type QuotaReading,
  type SubstrateName,
+ type SubstrateReaders,
 } from "./substrate.ts";
 import { resolveReadOnlyToken } from "./token-gate.ts";
 import { workerEnv } from "./worker-env.ts";
@@ -68,7 +72,8 @@ export interface RunNodeContext {
  journal: Journal;
  /**
   * Worker command + leading args; the prompt is appended as the final arg.
-  * Defaults to `RANGER_WORKER_CMD` (or `claude`) + `["-p"]`. Tests point this
+  * Defaults to the selected substrate's command (`workerCommandFor`);
+  * `RANGER_WORKER_CMD` overrides the implement lane's. Tests point this
   * at a fake worker script.
   */
  workerCommand?: string[];
@@ -84,13 +89,10 @@ export interface RunNodeContext {
  reviewer?: Reviewer;
  /** For tests: the read-only token (defaults to the map's `auth.readOnlyTokens` env). */
  readOnlyToken?: string;
- /** For tests: override substrate selection. */
+ /** For tests: the first session's substrate (later sessions after a cap are selected). */
  substrate?: SubstrateName;
- /** For tests: injectable substrate readers. */
- substrateReaders?: {
-  codex?: () => Promise<import("./substrate.ts").QuotaReading>;
-  claude?: () => Promise<import("./substrate.ts").QuotaReading>;
- };
+ /** For tests: the quota readers (with a command override and none injected, reads fail closed). */
+ substrateReaders?: SubstrateReaders;
 }
 
 /** The canonical checkout dir for a repo (design §4: probes run there). */
@@ -212,33 +214,70 @@ function defaultWorkerCommand(): string[] {
  return ["claude", "-p"];
 }
 
-/** Resolve the worker command: explicit override > substrate-aware > default. */
-function resolveWorkerCommand(
- ctx: RunNodeContext,
- substrate: SubstrateName,
-): string[] {
- // Explicit overrides skip substrate selection (test seam).
+/** Resolve the worker command: explicit override > the substrate's command. */
+function resolveWorkerCommand(ctx: RunNodeContext, substrate: SubstrateName): string[] {
  if (ctx.workerCommand !== undefined) return ctx.workerCommand;
  if (process.env.RANGER_WORKER_CMD) return defaultWorkerCommand();
  return workerCommandFor(substrate, ctx.config);
 }
 
-/**
- * Select the substrate for a build session: read fresh quota, pick the
- * strong substrate with the most headroom, else Pi.
- */
-async function selectBuildSubstrate(ctx: RunNodeContext): Promise<SubstrateName> {
- if (ctx.substrate !== undefined) return ctx.substrate;
- if (ctx.workerCommand !== undefined || process.env.RANGER_WORKER_CMD) return "claude";
+function commandOverridden(ctx: RunNodeContext): boolean {
+ return ctx.workerCommand !== undefined || Boolean(process.env.RANGER_WORKER_CMD);
+}
 
- const { config, journal } = ctx;
- const now = new Date();
- const sc = config.substrates;
- for (const name of ["claude", "codex"] as const) {
-  await ensureFreshReading(name, journal, sc, now, ctx.substrateReaders);
+const failingRead = (): Promise<QuotaReading> =>
+ Promise.reject(new Error("quota reads are off under a worker command override"));
+
+/**
+ * The quota readers: injected ones, else the real CLIs — except under a
+ * worker command override (tests, operator runs), where reads fail closed
+ * rather than spawn a real `claude` or `codex`.
+ */
+function resolveReaders(ctx: RunNodeContext): SubstrateReaders | undefined {
+ if (ctx.substrateReaders !== undefined) return ctx.substrateReaders;
+ return commandOverridden(ctx) ? { claude: failingRead, codex: failingRead } : undefined;
+}
+
+/**
+ * Select the substrate for a worker session (node #45): refresh both strong
+ * readings, then the eligible one with the most headroom, else Pi.
+ * Substrates capped earlier in this run are left out.
+ */
+async function selectBuildSubstrate(
+ ctx: RunNodeContext,
+ excluded: Set<SubstrateName>,
+): Promise<{ substrate: SubstrateName; chosenOn: string }> {
+ if (ctx.substrate !== undefined && excluded.size === 0) {
+  return { substrate: ctx.substrate, chosenOn: "fixed by the caller" };
  }
- const readings = journal.listSubstrateReadings();
- return selectForBuild({ readings, now, config: sc });
+ const now = new Date();
+ const sc = ctx.config.substrates;
+ const readings = (await freshReadings(ctx.journal, sc, now, resolveReaders(ctx))).filter(
+  (r) => !excluded.has(r.substrate as SubstrateName),
+ );
+ return {
+  substrate: selectForBuild({ readings, now, config: sc }),
+  chosenOn: describeReadings(readings, now),
+ };
+}
+
+/**
+ * Back to the last pushed state before another substrate resumes the node
+ * (node #45): the pushed branch when there is one, else the base. A capped
+ * session's unpushed commits and files are dropped.
+ */
+async function resetToPushed(worktree: string, branch: string, base: string): Promise<void> {
+ const pushed = await safeGit(
+  ["rev-parse", "--verify", "--quiet", `refs/remotes/origin/${branch}`],
+  { cwd: worktree, timeoutMs: 10_000 },
+ );
+ const target = pushed.code === 0 ? pushed.stdout.trim() : `origin/${base}`;
+ for (const args of [["reset", "--hard", target], ["clean", "-fd"]]) {
+  const r = await safeGit(args, { cwd: worktree, timeoutMs: 60_000 });
+  if (r.code !== 0) {
+   throw new GitSafetyError(`cannot reset ${worktree} to ${target} (git ${args[0]}): ${r.stderr.trim()}`);
+  }
+ }
 }
 
 /** Count a failure toward the dead-man switch, pausing claiming at the threshold. */
@@ -396,50 +435,71 @@ async function runImplementNode(
  const worktree = await bootstrapWorktree(canonical, nodeId, slug, token, branch, map.base);
  journal.updateWorker(nodeId, { worktree, lane: "implement" });
 
- // Substrate selection (node #44): pick the strong substrate with headroom.
- const substrate = await selectBuildSubstrate(ctx);
- const workerCmd = resolveWorkerCommand(ctx, substrate);
- journal.updateWorker(nodeId, { substrate });
- journal.recordEvent("worker-start", {
-  nodeId,
-  repo,
-  detail: `substrate: ${substrate}, command: ${workerCmd[0]}`,
- });
-
+ // Substrate selection (node #45), re-run at every session start. A session
+ // that hits its substrate's limit is not a failure: the substrate is marked
+ // capped and the node resumes in this supervisor on the next eligible one,
+ // re-deriving its phase from GitHub (F2). Each strong substrate caps at most
+ // once per run, so the loop ends on Pi at the latest.
+ const capped = new Set<SubstrateName>();
  let outcome: ImplementOutcome;
- try {
-  outcome = await runImplement({
-   config: ctx.wallClockMin === undefined
-    ? config
-    : { ...config, workers: { ...config.workers, wallClockMin: ctx.wallClockMin } },
-   map,
-   token,
-   readOnlyToken,
-   botIdentity,
-   journal,
-   node,
-   rootNode,
-   canonical,
-   worktree,
-   branch,
-   generation,
-   ratify,
-   workerRun:
-    ctx.worker ??
-    ((p: string, opts: RunOptions) => runCmd(workerCmd[0], [...workerCmd.slice(1), p], opts)),
-   github: ctx.github,
-   reviewer: ctx.reviewer,
-   substrate,
+ for (;;) {
+  const { substrate, chosenOn } = await selectBuildSubstrate(ctx, capped);
+  const workerCmd = resolveWorkerCommand(ctx, substrate);
+  journal.updateWorker(nodeId, { substrate });
+  journal.recordEvent("worker-start", {
+   nodeId,
+   repo,
+   detail: `substrate ${substrate} (${chosenOn}), command: ${workerCmd[0]}`.slice(0, 400),
   });
- } catch (error) {
-  if (error instanceof ParkSignal || error instanceof GitSafetyError) {
-   const detail = error.message;
-   journal.recordEvent("parked", { nodeId, repo, detail: detail.slice(0, 400) });
-   finish(journal, nodeId, "parked", detail);
-   await parkCard(map, nodeId, node.node.title, detail);
-   return { ...base, status: "parked", detail };
+  try {
+   outcome = await runImplement({
+    config: ctx.wallClockMin === undefined
+     ? config
+     : { ...config, workers: { ...config.workers, wallClockMin: ctx.wallClockMin } },
+    map,
+    token,
+    readOnlyToken,
+    botIdentity,
+    journal,
+    node,
+    rootNode,
+    canonical,
+    worktree,
+    branch,
+    generation,
+    ratify,
+    workerRun:
+     ctx.worker ??
+     ((p: string, opts: RunOptions) => runCmd(workerCmd[0], [...workerCmd.slice(1), p], opts)),
+    github: ctx.github,
+    reviewer: ctx.reviewer,
+    substrate,
+    substrateReaders: resolveReaders(ctx),
+   });
+   const cap = outcome.substrateCapped;
+   if (cap === undefined || capped.has(cap.substrate) || capped.size >= STRONG_SUBSTRATES.length) {
+    break;
+   }
+   // Not counted toward attempts or the dead-man switch.
+   capped.add(cap.substrate);
+   markSubstrateCapped(journal, cap.substrate, cap.resetsAt, new Date());
+   journal.recordEvent("substrate-capped", {
+    nodeId,
+    repo,
+    detail: `${cap.substrate} hit its limit (resets ${cap.resetsAt === null ? "unknown" : new Date(cap.resetsAt * 1000).toISOString()}); resuming on the next eligible substrate: ${outcome.detail}`.slice(0, 400),
+   });
+   journal.assertGeneration(nodeId, generation, "resume on another substrate");
+   await resetToPushed(worktree, branch, map.base);
+  } catch (error) {
+   if (error instanceof ParkSignal || error instanceof GitSafetyError) {
+    const detail = error.message;
+    journal.recordEvent("parked", { nodeId, repo, detail: detail.slice(0, 400) });
+    finish(journal, nodeId, "parked", detail);
+    await parkCard(map, nodeId, node.node.title, detail);
+    return { ...base, status: "parked", detail };
+   }
+   throw error;
   }
-  throw error;
  }
 
  switch (outcome.status) {
@@ -457,30 +517,9 @@ async function runImplementNode(
    finish(journal, nodeId, "parked", outcome.detail);
    break;
   default:
-   if (outcome.substrateCapped !== undefined) {
-    // Mid-session cap (node #44): the failure was caused by a substrate rate
-    // limit. Mark the substrate capped, record the event, and do NOT count
-    // toward attempts or the dead-man switch. The node resumes on the next
-    // eligible substrate — the implement lane re-derives phase from GitHub.
-    markSubstrateCapped(
-     journal,
-     outcome.substrateCapped.substrate,
-     outcome.substrateCapped.resetsAt,
-     new Date(),
-    );
-    journal.recordEvent("substrate-capped", {
-     nodeId,
-     repo,
-     detail: `${outcome.substrateCapped.substrate} capped; node will resume on next eligible substrate`,
-    });
-    // Leave the row as "running" — the next tick's sweep or planTick
-    // re-derives what to do from GitHub state. Do NOT park or fail.
-    journal.updateWorker(nodeId, { pid: null, workerPgid: null });
-   } else {
-    journal.recordEvent("refused", { nodeId, repo, detail: outcome.detail.slice(0, 400) });
-    countFailure(config, journal, repo);
-    finish(journal, nodeId, "failed", outcome.detail);
-   }
+   journal.recordEvent("refused", { nodeId, repo, detail: outcome.detail.slice(0, 400) });
+   countFailure(config, journal, repo);
+   finish(journal, nodeId, "failed", outcome.detail);
  }
  return {
   ...base,

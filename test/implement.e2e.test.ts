@@ -757,4 +757,76 @@ describe("implement lane (node #23)", () => {
   expect(r.github.merges).toEqual([]);
   expect(posts[0]).toContain("your eye is the check");
  }, 60_000);
+ // ---- substrate caps (node #45) ----
+
+ test("a session capped mid-build resumes on the next substrate without touching attempts or the dead-man", async () => {
+  const r = await rig({});
+  cleanup.push(r.dir);
+  const resetsAt = Math.floor(Date.now() / 1000) + 3600;
+  let calls = 0;
+  r.ctx.substrate = "claude";
+  r.ctx.substrateReaders = {
+   claude: () => Promise.reject(new Error("claude probe must not decide this")),
+   codex: async () => ({
+    substrate: "codex",
+    readAt: new Date(),
+    windows: [{ kind: "seven_day", usedPct: 5, resetsAt: resetsAt + 86_400 }],
+    capped: false,
+    cappedUntil: null,
+   }),
+  };
+  r.ctx.worker = async (prompt, opts) => {
+   calls += 1;
+   if (calls === 1) {
+    // A half-done session, then Claude's own stream says the limit hit.
+    writeFileSync(join(opts.cwd as string, "half-done.ts"), "// capped mid-session\n");
+    return {
+     code: 1,
+     stdout: `{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":${resetsAt}}}\n`,
+     stderr: "",
+    };
+   }
+   return runCmd(implementWorker, ["build", prompt], opts);
+  };
+
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("awaiting-merge");
+  expect(calls).toBe(2);
+  expect(r.journal.deadmanCount()).toBe(0);
+  const row = r.journal.getWorker("20");
+  expect(row?.attempts).toBe(0);
+  expect(row?.substrate).toBe("codex");
+  expect(r.journal.getSubstrateReading("claude")?.cappedUntil).toBe(new Date(resetsAt * 1000).toISOString());
+
+  const events = r.journal.listEvents("acme/widgets", 200);
+  const capped = events.filter((e) => e.kind === "substrate-capped");
+  expect(capped).toHaveLength(1);
+  expect(capped[0].detail).toContain("claude hit its limit");
+  const starts = events.filter((e) => e.kind === "worker-start" && e.detail?.startsWith("substrate "));
+  expect(starts.map((e) => e.detail?.split(" ")[1]).reverse()).toEqual(["claude", "codex"]);
+  expect(starts[0].detail).toContain("codex 7d 5%");
+
+  // The capped session's leftovers were dropped; the pushed head is Codex's.
+  const head = await r.github.sha("node/20-add-the-feature-module");
+  expect(r.journal.headSubstrate(head)).toBe("codex");
+  const files = await runCmd("git", ["ls-tree", "-r", "--name-only", head], { cwd: r.origin });
+  expect(files.stdout).not.toContain("half-done.ts");
+ }, 60_000);
+
+ test("a codex failure that only prints 'rate limit' is an ordinary failure (no spoofed cap)", async () => {
+  const r = await rig({});
+  cleanup.push(r.dir);
+  r.ctx.substrate = "codex";
+  r.ctx.substrateReaders = {
+   claude: () => Promise.reject(new Error("down")),
+   codex: async () => ({ substrate: "codex", readAt: new Date(), windows: [], capped: false, cappedUntil: null }),
+  };
+  r.ctx.worker = async () => ({ code: 1, stdout: "Error: rate limit reached\nrateLimitReachedType", stderr: "Rate limit" });
+
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("failed");
+  expect(outcome.detail).toContain("worker exited 1");
+  expect(r.journal.deadmanCount()).toBe(1);
+  expect(r.journal.listEvents("acme/widgets", 200).some((e) => e.kind === "substrate-capped")).toBe(false);
+ }, 60_000);
 });

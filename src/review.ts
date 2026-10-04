@@ -44,6 +44,8 @@ export async function sageReview(
  const gated = gatedEnv(readOnlyToken, {}, workerHostEnv());
  try {
   const args = ["review", `${repo}#${prNumber}`, "--emit-verdict-block"];
+  // `sage review --substrate {pi|claude|codex}` (sage src/cli/index.ts) — the
+  // cross-model choice; without it sage falls back to SAGE_SUBSTRATE / config.
   if (opts.substrate !== undefined) args.push("--substrate", opts.substrate);
   const result = await runCmd(
    opts.command ?? process.env.RANGER_SAGE_CMD ?? "sage",
