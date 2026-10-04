@@ -290,6 +290,8 @@ export function releaseLease(
   lease: Lease,
   heartbeat: ReturnType<typeof setInterval>,
   lostOwnership: { value: boolean },
+  lostMessage = "[escalate] lock was reclaimed mid-run (lease expired >60s); " +
+    "another run owns the desk now — check for duplicate cards",
 ): void {
   clearInterval(heartbeat);
   try {
@@ -310,10 +312,7 @@ export function releaseLease(
     // We were reclaimed mid-run (lease expired, machine paused >60s): our
     // cards already posted this run are duplicative of the new holder's —
     // surface it loudly rather than hiding it.
-    console.error(
-      "[escalate] lock was reclaimed mid-run (lease expired >60s); " +
-        "another run owns the desk now — check for duplicate cards",
-    );
+    console.error(lostMessage);
   }
 }
 

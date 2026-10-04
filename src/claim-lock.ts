@@ -53,6 +53,11 @@ export async function withClaimLock<T>(
  try {
   return await fn();
  } finally {
-  releaseLease(lease, heartbeat, lostOwnership);
+  releaseLease(
+   lease,
+   heartbeat,
+   lostOwnership,
+   "[claim] claim lock was reclaimed mid-claim (lease expired >60s) — check for a duplicate claim or spawn",
+  );
  }
 }

@@ -562,7 +562,16 @@ export interface VerbRun {
 }
 
 const TAIL_LINES = 20;
-const BUILD_NOW_TIMEOUT_MS = 180_000;
+/**
+ * The dashboard bound on one build-now. The verb bounds what it does up to
+ * the claimed row at about three minutes: the frontier read (60 s,
+ * GRAPH_CALL_TIMEOUT_MS), the claim-lock wait (30 s, BUILD_NOW_LOCK_WAIT_MS),
+ * the announce (30 s) and the claim (60 s). This sits well above that sum, so
+ * a kill lands on a verb hung past its own bounds, not between a graph claim
+ * and its journal row. (The token-login read before all of it has no bound
+ * of its own; a kill there happens before anything is claimed.)
+ */
+const BUILD_NOW_TIMEOUT_MS = 300_000;
 /** How long a timed-out verb gets after SIGTERM before its group is SIGKILLed. */
 const KILL_GRACE_MS = 5_000;
 /** The exit code a timed-out verb reports (timeout(1)'s), whatever the child did. */

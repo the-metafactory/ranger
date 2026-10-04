@@ -367,4 +367,23 @@ describe("node #58 — concurrent claims are serialized by the claim lock", () =
   expect(await refusal(build)).toMatch(/spawn cap is spent \(1\/1\)/);
   expect(r.announced).toHaveLength(0);
  });
+
+ test("a claim lock held past the wait is a refusal to press again, with nothing touched", async () => {
+  const r = rig();
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => (release = resolve));
+  let entered!: () => void;
+  const inside = new Promise<void>((resolve) => (entered = resolve));
+  const walkClaim = withClaimLock(r.otherJournal(), async () => {
+   entered();
+   await held;
+  });
+  await inside;
+  expect(await refusal(buildNow("10", r.ctx({ force: true, claimLockWaitMs: 300 })))).toMatch(
+   /another claim is in progress.*press again/,
+  );
+  untouched(r, "10");
+  release();
+  await walkClaim;
+ });
 });

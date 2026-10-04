@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { budgetPolicy } from "./budget.ts";
-import { withClaimLock } from "./claim-lock.ts";
+import { ClaimLockBusy, withClaimLock } from "./claim-lock.ts";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import { readFrontier } from "./frontier-cache.ts";
 import { type FrontierEntry, GRAPH_CALL_TIMEOUT_MS } from "./graph.ts";
@@ -62,6 +62,8 @@ export interface BuildNowContext {
  claim?: ClaimFn;
  spawnRunNode?: (args: SpawnRunNodeArgs) => Promise<number | null>;
  now?: () => Date;
+ /** How long to wait for another claim to finish (BUILD_NOW_LOCK_WAIT_MS unless injected). */
+ claimLockWaitMs?: number;
 }
 
 export interface BuildNowResult {
@@ -92,12 +94,23 @@ function notWalkable(node: ClassifiedNode): string | null {
  return null;
 }
 
+/**
+ * How long build-now waits for another claim (the walk takes the same lock).
+ * Short, unlike the walk: the dashboard bounds the whole verb (serve.ts
+ * BUILD_NOW_TIMEOUT_MS), and a principal can simply press again.
+ */
+export const BUILD_NOW_LOCK_WAIT_MS = 30_000;
+
 export async function buildNow(nodeId: string, ctx: BuildNowContext): Promise<BuildNowResult> {
  const { config, journal, map } = ctx;
  const now = () => ctx.now?.() ?? new Date();
  const refuse = (why: string): never => {
   throw new BuildNowRefusal(`#${nodeId} on ${map.repo}#${map.root}: ${why}`);
  };
+
+ // Cheap first look at the dead-man gate, before any network read; the
+ // authoritative check is the one under the claim lock below.
+ if (journal.isPaused()) refuse("dead-man paused — claiming stopped; `ranger resume-run` first");
 
  const entries = await (ctx.readFrontier ??
   (async () =>
@@ -123,7 +136,7 @@ export async function buildNow(nodeId: string, ctx: BuildNowContext): Promise<Bu
  // Every gate below is re-read under the claim lock the walk also takes, and
  // held through the claimed row and the spawn count: two concurrent claims
  // (a second build-now, or the tick) cannot both pass the same gate.
- const { outcome, holder } = await withClaimLock(journal, async () => {
+ const claimed = withClaimLock(journal, async () => {
   // Dead-man gate (design §7): the walk claims nothing while paused, nor does this.
   if (journal.isPaused()) refuse("dead-man paused — claiming stopped; `ranger resume-run` first");
   if (journal.hasVeto(nodeId)) refuse("vetoed — the walk never claims a vetoed node");
@@ -162,7 +175,11 @@ export async function buildNow(nodeId: string, ctx: BuildNowContext): Promise<Bu
    now: ctx.now,
   });
   return { outcome, holder };
+ }, ctx.claimLockWaitMs ?? BUILD_NOW_LOCK_WAIT_MS).catch((error: unknown) => {
+  if (!(error instanceof ClaimLockBusy)) throw error;
+  return refuse(`another claim is in progress (the tick or a second build-now) — press again: ${error.message}`);
  });
+ const { outcome, holder } = await claimed;
  // A lost race is reported, never retried: someone else holds the node now.
  if (!outcome.claimed) throw new BuildNowRefusal(outcome.error);
  return {
