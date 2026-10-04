@@ -93,7 +93,9 @@ function branchKey(key: string): { name: string; key: string } | null {
  * node-branch section is dropped only when it holds exactly `remote=origin`
  * and `merge=refs/heads/<base>`. Parsed by git without includes, so an
  * include line is hashed as the line it is; a file git cannot parse is
- * hashed raw, never as an empty listing.
+ * hashed raw, never as an empty listing. Records keep git's file order, never
+ * sorted: for a repeated single-value key the last one wins, so reordering
+ * `http.sslVerify` or `core.sshCommand` entries changes what git runs.
  */
 function configRecords(file: string, base: string): Buffer | string {
  if (!existsSync(file)) return "(absent)";
@@ -149,8 +151,7 @@ function configRecords(file: string, base: string): Buffer | string {
     const parsed = branchKey(key);
     return parsed === null || !own.has(parsed.name);
    })
-   .map(({ key, value }) => (value === null ? key : `${key}=${value}`))
-   .sort(),
+   .map(({ key, value }) => (value === null ? key : `${key}=${value}`)),
  );
 }
 

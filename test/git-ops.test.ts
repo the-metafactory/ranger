@@ -158,6 +158,24 @@ describe("gitConfigSnapshot: everything else stays in the hash", () => {
   });
  }
 
+ // The last of a repeated single-value key wins, so order is behaviour.
+ for (const [key, first, second] of [
+  ["http.sslVerify", "false", "true"],
+  ["core.sshCommand", "ssh -o ProxyCommand=evil", "ssh"],
+ ]) {
+  test(`reversing repeated ${key} entries changes the snapshot`, async () => {
+   await config("--add", key, first);
+   await config("--add", key, second);
+   const before = gitConfigSnapshot(canonical);
+   await config("--unset-all", key);
+   await config("--add", key, second);
+   await config("--add", key, first);
+   expect(await config("--get", key)).toBe(first);
+   expect(gitConfigSnapshot(canonical)).not.toBe(before);
+   expect(() => assertGitUntouched(canonical, before)).toThrow(GitSafetyError);
+  });
+ }
+
  test("an unparseable config is hashed raw: two different broken files differ", () => {
   const file = join(canonical, ".git", "config");
   writeFileSync(file, "[core\n\tbare = false\n");
