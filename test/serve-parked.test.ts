@@ -247,6 +247,14 @@ describe("node #54 — CI, by the merge gate's rules", () => {
   expect(runs).toHaveLength(101);
   expect(ciState(runs ?? [])).toBe("failed");
  });
+ test("an unreadable check-runs read refuses the merge and says so", () => {
+  expect(mergeRefusal(greenPr({ ci: "unreadable" }))).toBe("the check runs could not be read");
+ });
+ test("a failed PR read is carried on the entry, not shown as merely unread", () => {
+  const [e] = needsYouEntries(entryInputs({ prs: () => null, prError: () => "HTTP 502" }));
+  expect(e.pr).toMatchObject({ number: 687, view: null, error: "HTTP 502" });
+  expect(renderPage("token")).toContain("the read failed: ");
+ });
  test("a malformed page makes the whole read unreadable rather than dropping it", () => {
   expect(checkRunsFromPages([{ check_runs: [done("success")] }, { message: "Bad gateway" }])).toBeNull();
   expect(checkRunsFromPages({ check_runs: [] })).toBeNull();

@@ -818,7 +818,7 @@ function renderGrill(s) {
 const short = (sha) => (sha || "").slice(0, 8);
 function needsFacts(n) {
  const facts = [n.repo + " · map #" + n.root, n.status, "ended " + ago(n.endedAt)];
- if (n.pr) { const v = n.pr.view; facts.push("PR #" + n.pr.number + (v ? " · " + (v.merged ? "merged" : v.state === "closed" ? "closed" : v.draft ? "draft" : "ready") + " · head " + short(v.headSha) + " · CI " + v.ci : " · not read yet")); }
+ if (n.pr) { const v = n.pr.view; facts.push("PR #" + n.pr.number + (v ? " · " + (v.merged ? "merged" : v.state === "closed" ? "closed" : v.draft ? "draft" : "ready") + " · head " + short(v.headSha) + " · CI " + v.ci : n.pr.error ? " · the read failed: " + n.pr.error : " · not read yet")); }
  if (n.sage) facts.push("sage round " + n.sage.round + (n.sageOnHead === false ? " (an earlier head, " + short(n.sage.sha) + "; the current head is unreviewed)" : "") + ": " + n.sage.blockers + " blocker(s), " + n.sage.majors + " major(s)");
  if (n.probe) facts.push("probes " + (n.probe.passed ? "passed" : "FAILED") + " at " + short(n.probe.sha));
  return facts.join(" · ");
@@ -1184,7 +1184,7 @@ export async function readPrLive(
   draft: raw.draft === true,
   headSha,
   mergeable: typeof raw.mergeable === "boolean" ? raw.mergeable : null,
-  ci: checks === null ? "none" : ciState(checks),
+  ci: checks === null ? "unreadable" : ciState(checks),
   readAt: new Date().toISOString(),
  };
 }
@@ -1291,6 +1291,7 @@ export function stateFromJournal(
    events: (repo, nodeId) => journal?.listNodeEvents(repo, nodeId) ?? [],
    labels: (repo, nodeId) => reader.labels.get(`${repo}#${nodeId}`) ?? null,
    prs: (repo, pr) => reader.prs.get(`${repo}#${pr}`) ?? null,
+   prError: (repo, pr) => reader.detailErrors.get(`pr:${repo}#${pr}`) ?? null,
    titleOf: (repo, nodeId) => {
     for (const map of maps) {
      if (map.repo !== repo) continue;

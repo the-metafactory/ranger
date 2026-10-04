@@ -191,9 +191,10 @@ export interface PrView {
  mergeable: boolean | null;
  /**
   * Check runs on the head: none yet, still running, any failed, all passed
-  * but none concluded success, or green (all passed, at least one success).
+  * but none concluded success, green (all passed, at least one success), or
+  * unreadable (the check-runs read failed: nothing is known).
   */
- ci: "none" | "pending" | "failed" | "no-success" | "green";
+ ci: "none" | "pending" | "failed" | "no-success" | "green" | "unreadable";
  readAt: string;
 }
 
@@ -237,9 +238,10 @@ export function mergeRefusal(pr: PrView | null): string | null {
  if (pr.state !== "open") return "the PR is closed";
  if (pr.draft) return "the PR is a draft: mark it ready first";
  if (pr.mergeable !== true) return pr.mergeable === null ? "GitHub is still computing mergeability" : "the PR is not mergeable";
- if (pr.ci === "no-success") return "no check run concluded success (all neutral/skipped): the close has nothing to cite";
- if (pr.ci !== "green") return `CI is ${pr.ci}`;
  if (!SHA_PATTERN.test(pr.headSha)) return "the PR head is unknown";
+ if (pr.ci === "no-success") return "no check run concluded success (all neutral/skipped): the close has nothing to cite";
+ if (pr.ci === "unreadable") return "the check runs could not be read";
+ if (pr.ci !== "green") return `CI is ${pr.ci}`;
  return null;
 }
 
@@ -261,7 +263,8 @@ export interface NeedsYouEntry {
  status: "parked" | "failed" | "awaiting-merge";
  endedAt: string | null;
  reason: Reason;
- pr: { number: number; url: string; view: PrView | null } | null;
+ /** `error`: the last failed read of the PR, while `view` is unread. */
+ pr: { number: number; url: string; view: PrView | null; error: string | null } | null;
  sage: SageRound | null;
  /**
   * Whether the last sage round read the PR's current head: false when the
@@ -285,6 +288,8 @@ export interface NeedsYouInputs {
  /** The issue's labels as last read, null when not read yet. */
  labels: (repo: string, nodeId: string) => string[] | null;
  prs: (repo: string, pr: number) => PrView | null;
+ /** The last failed read of a PR, null when none failed. */
+ prError?: (repo: string, pr: number) => string | null;
  titleOf: (repo: string, nodeId: string) => string | null;
  reviewRounds: number;
  exists: (path: string) => boolean;
@@ -320,7 +325,12 @@ export function needsYouEntries(inputs: NeedsYouInputs): NeedsYouEntry[] {
    pr:
     row.prNumber === null
      ? null
-     : { number: row.prNumber, url: view?.url || `https://github.com/${row.repo}/pull/${row.prNumber}`, view },
+     : {
+        number: row.prNumber,
+        url: view?.url || `https://github.com/${row.repo}/pull/${row.prNumber}`,
+        view,
+        error: inputs.prError?.(row.repo, row.prNumber) ?? null,
+       },
    sage,
    sageOnHead: sage === null || view === null || view.headSha === "" ? null : view.headSha.startsWith(sage.sha),
    probe: lastProbe(events),
