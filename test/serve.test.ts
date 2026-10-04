@@ -12,6 +12,7 @@ import {
  buildNowArgv,
  childEnv,
  runVerb,
+ VERB_TIMEOUT_CODE,
  servedMaps,
  createHandler,
  launchPlan,
@@ -571,6 +572,31 @@ describe("node #58 — the Build now endpoint", () => {
   expect(lines).toHaveLength(20);
   expect(lines.at(-1)).toBe("oops");
   expect((await runVerb(["/nonexistent/ranger"], {})).code).toBe(-1);
+ });
+
+ test("runVerb kills a verb that ignores SIGTERM and reports a timeout, never success", async () => {
+  const started = Date.now();
+  const run = await runVerb(
+   ["/bin/sh", "-c", "trap \"\" TERM; echo started; while :; do sleep 0.05; done"],
+   childEnv(process.env),
+   300,
+   200,
+  );
+  expect(Date.now() - started).toBeLessThan(3_000);
+  expect(run.code).toBe(VERB_TIMEOUT_CODE);
+  expect(run.tail).toContain("started");
+  expect(run.tail).toContain("SIGKILL");
+ });
+
+ test("runVerb reports a timeout for a verb that exits 0 after SIGTERM", async () => {
+  const run = await runVerb(
+   ["/bin/sh", "-c", "trap \"exit 0\" TERM; while :; do sleep 0.05; done"],
+   childEnv(process.env),
+   200,
+   2_000,
+  );
+  expect(run.code).toBe(VERB_TIMEOUT_CODE);
+  expect(run.tail).toContain("timed out after");
  });
 
  test("the page has a Build now button whose confirm names the lane holder", async () => {

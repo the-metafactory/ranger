@@ -10,13 +10,14 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Journal } from "../src/journal.ts";
-import { runCmd } from "../src/exec.ts";
+import { runCmd, type RunResult } from "../src/exec.ts";
 import {
  classify,
  loadProbeRegistry,
  type ClassifiedNode,
 } from "../src/route.ts";
 import { planTick, researchCandidates } from "../src/walk.ts";
+import { withClaimLock } from "../src/claim-lock.ts";
 import { bootstrapWorktree } from "../src/worker.ts";
 import type { FrontierEntry } from "../src/graph.ts";
 import {
@@ -752,6 +753,49 @@ describe("walk claims exactly planTick's take (#37)", () => {
    }
   });
  }
+});
+
+describe("walk claims under the claim lock build-now also takes (node #58)", () => {
+ test("a claim made elsewhere while the walk waits for the lock is re-read: the walk does not claim it again", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ranger-walk-lock-"));
+  const discord = fakeDiscord();
+  const journal = new Journal(join(dir, "state.sqlite"));
+  try {
+   const config = writeConfig(dir);
+   const statePath = writeState(dir, { "10": RESEARCH_NODE_STATE });
+   const assignees = () =>
+    (JSON.parse(readFileSync(statePath, "utf8")) as { nodes: Record<string, { assignees: string[] }> })
+     .nodes["10"].assignees;
+   let walking!: Promise<RunResult>;
+   await withClaimLock(journal, async () => {
+    walking = runCli(["walk", "-c", config], {
+     ...process.env,
+     ...GIT_ENV,
+     PATH: `${fixturesBin}:${process.env.PATH ?? ""}`,
+     FAKE_SOMA_DIR: dataDir,
+     FAKE_SOMA_STATE: statePath,
+     RANGER_DISCORD_API_BASE: `http://127.0.0.1:${discord.port}`,
+     RANGER_DISCORD_ALLOW_TEST_OVERRIDE: "1",
+     RANGER_DISCORD_MIN_INTERVAL_MS: "5",
+     RANGER_DISCORD_TOKEN: "fake-bot-token",
+     RANGER_WRITE_TEST: "ghp_write",
+     RANGER_NO_SPAWN: "1",
+    });
+    await Bun.sleep(2_000);
+    expect(assignees()).not.toContain("ivy-bot");
+    // What build-now writes once it has claimed node 10 under the lock.
+    journal.upsertWorker({ nodeId: "10", repo: "acme/widgets", root: 1, status: "claimed", lane: "research" });
+   });
+   const result = await walking;
+   expect(result.code).toBe(0);
+   expect(assignees()).not.toContain("ivy-bot");
+   expect(`${result.stdout}${result.stderr}`).toContain("#10 already in flight (claimed)");
+  } finally {
+   journal.close();
+   discord.stop();
+   rmSync(dir, { recursive: true, force: true });
+  }
+ });
 });
 
 describe("ranger walk — GitHub budget deferral (src/budget.ts)", () => {

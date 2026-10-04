@@ -9,6 +9,7 @@ import type { FrontierEntry } from "../src/graph.ts";
 import { openJournal, type Journal } from "../src/journal.ts";
 import type { AnnounceContext } from "../src/announce.ts";
 import type { SpawnRunNodeArgs } from "../src/walk.ts";
+import { withClaimLock } from "../src/claim-lock.ts";
 
 /**
  * node #58 — `ranger build-now`: the walk's claim for one chosen node. The
@@ -42,6 +43,7 @@ const FRONTIER = [
  entry("13", "task"),
  entry("14", "task", "propose", BOT),
  entry("15", "task", "propose"),
+ entry("16", "task"),
 ];
 
 let cleanup: (() => void)[] = [];
@@ -114,6 +116,12 @@ function rig(opts: { cap?: number } = {}) {
  return {
   config,
   journal,
+  /** A second journal on the same file: another process's view. */
+  otherJournal: () => {
+   const other = openJournal(config);
+   cleanup.unshift(() => other.close());
+   return other;
+  },
   ctx,
   announced,
   claimed,
@@ -285,5 +293,78 @@ describe("node #58 — build-now refuses", () => {
   expect(r.journal.getWorker("10", REPO)).toBeNull();
   expect(r.journal.listEvents(REPO).map((e) => e.kind)).toEqual(["announced"]);
   expect(r.journal.spawnsToday(new Date("2026-10-04T10:00:00Z"))).toBe(0);
+ });
+});
+
+describe("node #58 — concurrent claims are serialized by the claim lock", () => {
+ /** An announce slow enough that two unserialized calls would both pass every gate. */
+ const slowAnnounce: BuildNowContext["announce"] = async (_map, a) => {
+  await Bun.sleep(40);
+  return { messageId: `msg-${a.nodeId}` };
+ };
+
+ async function both(calls: Promise<unknown>[]) {
+  const settled = await Promise.allSettled(calls);
+  const ok = settled.filter((s) => s.status === "fulfilled");
+  const refused = settled.flatMap((s) => (s.status === "rejected" ? [s.reason as Error] : []));
+  for (const error of refused) expect(error).toBeInstanceOf(BuildNowRefusal);
+  return { ok, refused: refused.map((e) => e.message) };
+ }
+
+ test("the same node twice at once (two journals on one file): one start, one already in flight", async () => {
+  const r = rig();
+  const other = r.otherJournal();
+  const { ok, refused } = await both([
+   buildNow("10", r.ctx({ force: true, announce: slowAnnounce })),
+   buildNow("10", r.ctx({ force: true, announce: slowAnnounce, journal: other })),
+  ]);
+  expect(ok).toHaveLength(1);
+  expect(refused).toEqual([expect.stringMatching(/already in flight \(claimed\)/)]);
+  expect(r.spawned).toHaveLength(1);
+  expect(r.journal.spawnsToday(new Date("2026-10-04T10:00:00Z"))).toBe(1);
+ });
+
+ test("two nodes at once against a cap of one: one spawn, one refusal", async () => {
+  const r = rig({ cap: 1 });
+  const { ok, refused } = await both([
+   buildNow("10", r.ctx({ force: true, announce: slowAnnounce })),
+   buildNow("11", r.ctx({ force: true, announce: slowAnnounce, journal: r.otherJournal() })),
+  ]);
+  expect(ok).toHaveLength(1);
+  expect(refused).toEqual([expect.stringMatching(/spawn cap is spent \(1\/1\)/)]);
+  expect(r.spawned).toHaveLength(1);
+  expect(r.journal.spawnsToday(new Date("2026-10-04T10:00:00Z"))).toBe(1);
+ });
+
+ test("two implement nodes at once without --force: the second finds the lane held", async () => {
+  const r = rig();
+  const { ok, refused } = await both([
+   buildNow("10", r.ctx({ announce: slowAnnounce })),
+   buildNow("16", r.ctx({ announce: slowAnnounce, journal: r.otherJournal() })),
+  ]);
+  expect(ok).toHaveLength(1);
+  expect(refused).toEqual([expect.stringMatching(/held by #(10|16) .*--force/)]);
+  expect(r.spawned).toHaveLength(1);
+ });
+
+ test("a claim in progress elsewhere (the walk) holds build-now before any gate or announce", async () => {
+  const r = rig({ cap: 1 });
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => (release = resolve));
+  let entered!: () => void;
+  const inside = new Promise<void>((resolve) => (entered = resolve));
+  const walkClaim = withClaimLock(r.otherJournal(), async () => {
+   entered();
+   await held;
+   r.journal.recordSpawn(new Date("2026-10-04T10:00:00Z"));
+  });
+  await inside;
+  const build = buildNow("10", r.ctx({ force: true }));
+  await Bun.sleep(400);
+  expect(r.announced).toHaveLength(0);
+  release();
+  await walkClaim;
+  expect(await refusal(build)).toMatch(/spawn cap is spent \(1\/1\)/);
+  expect(r.announced).toHaveLength(0);
  });
 });

@@ -207,9 +207,10 @@ interface Lease {
 export async function acquireLease(
   lockFile: string,
   reclaimMarker: string,
+  opts: { timeoutMs?: number; contended?: () => Error } = {},
 ): Promise<Lease> {
   const started = Date.now();
-  const timeoutMs = 60_000;
+  const timeoutMs = opts.timeoutMs ?? 60_000;
   const lockStartedAt = Date.now();
   // The lock carries a LEASE and an OWNER NONCE. The lease (renewed by a
   // heartbeat while we hold the lock) makes an actively-running run
@@ -235,6 +236,7 @@ export async function acquireLease(
       // "busy" / "not-dead" — wait and re-check the lock below.
     }
     if (Date.now() - started > timeoutMs) {
+      if (opts.contended !== undefined) throw opts.contended();
       throw new EscalateError(
         `another escalate run holds the lock (${lockFile}) — ` +
           "refusing to risk duplicate cards",

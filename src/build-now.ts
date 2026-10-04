@@ -1,5 +1,6 @@
 import { join } from "node:path";
 import { budgetPolicy } from "./budget.ts";
+import { withClaimLock } from "./claim-lock.ts";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import { readFrontier } from "./frontier-cache.ts";
 import { type FrontierEntry, GRAPH_CALL_TIMEOUT_MS } from "./graph.ts";
@@ -15,6 +16,7 @@ import {
 } from "./route.ts";
 import {
  claimNode,
+ IN_FLIGHT_STATUSES,
  type AnnounceFn,
  type ClaimFn,
  type SpawnRunNodeArgs,
@@ -75,8 +77,6 @@ export interface BuildNowResult {
  pid: number | null;
 }
 
-const IN_FLIGHT = new Set<WorkerRow["status"]>(["claimed", "running", "awaiting-merge"]);
-
 /** Why a classified node is not one the walk takes, or null when it is. */
 function notWalkable(node: ClassifiedNode): string | null {
  const route = node.route;
@@ -99,9 +99,6 @@ export async function buildNow(nodeId: string, ctx: BuildNowContext): Promise<Bu
   throw new BuildNowRefusal(`#${nodeId} on ${map.repo}#${map.root}: ${why}`);
  };
 
- // Dead-man gate (design §7): the walk claims nothing while paused, nor does this.
- if (journal.isPaused()) refuse("dead-man paused — claiming stopped; `ranger resume-run` first");
-
  const entries = await (ctx.readFrontier ??
   (async () =>
    (
@@ -123,41 +120,48 @@ export async function buildNow(nodeId: string, ctx: BuildNowContext): Promise<Bu
  if (why !== null) refuse(why);
  const lane = node!.route.route as "implement" | "research";
 
- if (journal.hasVeto(nodeId)) refuse("vetoed — the walk never claims a vetoed node");
- const row = journal.getWorker(nodeId, map.repo);
- if (row !== null && IN_FLIGHT.has(row.status)) {
-  refuse(`already in flight (${row.status}) — \`ranger resume-node\` puts a stuck worker back in motion`);
- }
- try {
-  journal.assertWorkerRoot(nodeId, map.repo, map.root);
- } catch (error) {
-  refuse(error instanceof Error ? error.message : String(error));
- }
- const spawns = journal.spawnsToday(now());
- if (spawns >= config.workers.spawnCapPerDay) {
-  refuse(`the daily spawn cap is spent (${spawns}/${config.workers.spawnCapPerDay})`);
- }
- // Only the implement lane is serial; research never holds it.
- const holder =
-  lane === "implement" ? journal.laneHolder(implementLane(map), { nodeId, repo: map.repo }) : null;
- if (holder !== null && ctx.force !== true) {
-  refuse(laneHeldMessage(implementLane(map), holder, "build", nodeId));
- }
-
- const outcome = await claimNode({
-  journal,
-  map,
-  node: node!,
-  lane,
-  botIdentity: ctx.botIdentity,
-  token: ctx.token,
-  cliEntry: join(import.meta.dir, "cli.ts"),
-  configPath: ctx.configPath,
-  announceRequired: false,
-  announce: ctx.announce,
-  claim: ctx.claim,
-  spawnRunNode: ctx.spawnRunNode,
-  now: ctx.now,
+ // Every gate below is re-read under the claim lock the walk also takes, and
+ // held through the claimed row and the spawn count: two concurrent claims
+ // (a second build-now, or the tick) cannot both pass the same gate.
+ const { outcome, holder } = await withClaimLock(journal, async () => {
+  // Dead-man gate (design §7): the walk claims nothing while paused, nor does this.
+  if (journal.isPaused()) refuse("dead-man paused — claiming stopped; `ranger resume-run` first");
+  if (journal.hasVeto(nodeId)) refuse("vetoed — the walk never claims a vetoed node");
+  const row = journal.getWorker(nodeId, map.repo);
+  if (row !== null && IN_FLIGHT_STATUSES.has(row.status)) {
+   refuse(`already in flight (${row.status}) — \`ranger resume-node\` puts a stuck worker back in motion`);
+  }
+  try {
+   journal.assertWorkerRoot(nodeId, map.repo, map.root);
+  } catch (error) {
+   refuse(error instanceof Error ? error.message : String(error));
+  }
+  const spawns = journal.spawnsToday(now());
+  if (spawns >= config.workers.spawnCapPerDay) {
+   refuse(`the daily spawn cap is spent (${spawns}/${config.workers.spawnCapPerDay})`);
+  }
+  // Only the implement lane is serial; research never holds it.
+  const holder =
+   lane === "implement" ? journal.laneHolder(implementLane(map), { nodeId, repo: map.repo }) : null;
+  if (holder !== null && ctx.force !== true) {
+   refuse(laneHeldMessage(implementLane(map), holder, "build", nodeId));
+  }
+  const outcome = await claimNode({
+   journal,
+   map,
+   node: node!,
+   lane,
+   botIdentity: ctx.botIdentity,
+   token: ctx.token,
+   cliEntry: join(import.meta.dir, "cli.ts"),
+   configPath: ctx.configPath,
+   announceRequired: false,
+   announce: ctx.announce,
+   claim: ctx.claim,
+   spawnRunNode: ctx.spawnRunNode,
+   now: ctx.now,
+  });
+  return { outcome, holder };
  });
  // A lost race is reported, never retried: someone else holds the node now.
  if (!outcome.claimed) throw new BuildNowRefusal(outcome.error);

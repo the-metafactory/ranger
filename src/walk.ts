@@ -14,7 +14,8 @@ import {
  resolveWriteToken,
  WriteGateError,
 } from "./identity.ts";
-import type { Journal } from "./journal.ts";
+import { ClaimLockBusy, withClaimLock } from "./claim-lock.ts";
+import type { Journal, WorkerRow } from "./journal.ts";
 import { classifyFrontier, loadProbeRegistry } from "./route.ts";
 import { sweepMap, type SweepMapResult } from "./sweep.ts";
 import {
@@ -106,6 +107,13 @@ export interface WalkContext {
  spawnRunNode?: (args: SpawnRunNodeArgs) => Promise<number | null>;
  now?: () => Date;
 }
+
+/** A row in one of these states is a node already being worked: never claimed again. */
+export const IN_FLIGHT_STATUSES: ReadonlySet<WorkerRow["status"]> = new Set([
+ "claimed",
+ "running",
+ "awaiting-merge",
+]);
 
 /** Is this resource lane held? (awaiting-merge does not hold it.) */
 export function implementLaneBusy(journal: Journal, lane: ImplementLane): boolean {
@@ -339,42 +347,68 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
      plan.implement.some((n) => n.id === id) ? "implement" : "research";
 
     for (const node of candidates) {
-     if (
-      journal.spawnsToday(ctx.now?.() ?? new Date()) >=
-      config.workers.spawnCapPerDay
-     ) {
-      mapResult.spawnCapExhausted = true;
-      break;
-     }
      // Veto cache: a vetoed node is never claimed (design §5, journal durability).
      if (plan.vetoed.includes(node)) {
       errors.push(`#${node.id} vetoed — not claimed`);
       continue;
      }
+     // The gates are re-read under the claim lock `ranger build-now` also
+     // takes (node #58), held through the claimed row and the spawn count:
+     // a build-now running beside this tick cannot pass the same gate.
+     let step: "claimed" | "skipped" | "cap";
      try {
-      journal.assertWorkerRoot(node.id, map.repo, map.root);
-     } catch (error) {
-      errors.push(error instanceof Error ? error.message : String(error));
-      continue;
-     }
+      step = await withClaimLock(journal, async () => {
+       if (
+        journal.spawnsToday(ctx.now?.() ?? new Date()) >=
+        config.workers.spawnCapPerDay
+       ) {
+        return "cap";
+       }
+       const row = journal.getWorker(node.id, map.repo);
+       if (row !== null && IN_FLIGHT_STATUSES.has(row.status)) {
+        errors.push(`#${node.id} already in flight (${row.status}) — not claimed`);
+        return "skipped";
+       }
+       if (laneOf(node.id) === "implement" && implementLaneBusy(journal, implementLane(map))) {
+        errors.push(`#${node.id} implement lane taken since the plan — not claimed`);
+        return "skipped";
+       }
+       try {
+        journal.assertWorkerRoot(node.id, map.repo, map.root);
+       } catch (error) {
+        errors.push(error instanceof Error ? error.message : String(error));
+        return "skipped";
+       }
 
-     const outcome = await claimNode({
-      journal,
-      map,
-      node,
-      lane: laneOf(node.id),
-      botIdentity,
-      token,
-      cliEntry,
-      configPath: ctx.configPath,
-      spawnRunNode: ctx.spawnRunNode,
-      now: ctx.now,
-     });
-     if (outcome.messageId !== null) mapResult.announced.push(node.id);
-     if (!outcome.claimed) {
-      errors.push(outcome.error);
-      continue;
+       const outcome = await claimNode({
+        journal,
+        map,
+        node,
+        lane: laneOf(node.id),
+        botIdentity,
+        token,
+        cliEntry,
+        configPath: ctx.configPath,
+        spawnRunNode: ctx.spawnRunNode,
+        now: ctx.now,
+       });
+       if (outcome.messageId !== null) mapResult.announced.push(node.id);
+       if (!outcome.claimed) {
+        errors.push(outcome.error);
+        return "skipped";
+       }
+       return "claimed";
+      });
+     } catch (error) {
+      if (!(error instanceof ClaimLockBusy)) throw error;
+      errors.push(`#${node.id} not claimed: ${error.message}`);
+      break;
      }
+     if (step === "cap") {
+      mapResult.spawnCapExhausted = true;
+      break;
+     }
+     if (step === "skipped") continue;
      mapResult.claimed.push(node.id);
      if (laneOf(node.id) === "implement") implementClaimed.add(implementLane(map));
     }

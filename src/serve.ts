@@ -563,39 +563,76 @@ export interface VerbRun {
 
 const TAIL_LINES = 20;
 const BUILD_NOW_TIMEOUT_MS = 180_000;
+/** How long a timed-out verb gets after SIGTERM before its group is SIGKILLed. */
+const KILL_GRACE_MS = 5_000;
+/** The exit code a timed-out verb reports (timeout(1)'s), whatever the child did. */
+export const VERB_TIMEOUT_CODE = 124;
 
 /**
  * Run a ranger verb detached in its own process group and wait for its exit:
  * the verb returns once its run-node is spawned, and that worker (detached
- * again, stdio ignored) outlives both. A verb that hangs past the timeout is
- * killed with its group.
+ * again, stdio ignored) outlives both. A verb still running at the timeout
+ * gets SIGTERM, then SIGKILL after a grace period, both to its group; it
+ * resolves as a timeout failure (code 124) no later than the kill,
+ * whatever the child exits with.
  */
-export function runVerb(argv: string[], env: Record<string, string>, timeoutMs = BUILD_NOW_TIMEOUT_MS): Promise<VerbRun> {
+export function runVerb(
+ argv: string[],
+ env: Record<string, string>,
+ timeoutMs = BUILD_NOW_TIMEOUT_MS,
+ graceMs = KILL_GRACE_MS,
+): Promise<VerbRun> {
  return new Promise((resolveRun) => {
   const [command, ...args] = argv;
   let out = "";
+  let settled = false;
+  let timedOut = false;
+  let killTimer: ReturnType<typeof setTimeout> | undefined;
   const child = spawn(command, args, { env, stdio: ["ignore", "pipe", "pipe"], detached: true });
   const take = (chunk: Buffer) => {
    out = (out + chunk.toString()).slice(-16_000);
   };
   child.stdout?.on("data", take);
   child.stderr?.on("data", take);
-  const timer = setTimeout(() => {
-   out += `\n(killed after ${Math.round(timeoutMs / 1000)} s)`;
-   try {
-    if (child.pid !== undefined) process.kill(-child.pid, "SIGTERM");
-   } catch {
-    /* already gone */
-   }
-  }, timeoutMs);
   const tail = () => out.trimEnd().split("\n").slice(-TAIL_LINES).join("\n");
-  child.on("error", (error) => {
+  const settle = (run: VerbRun) => {
+   if (settled) return;
+   settled = true;
    clearTimeout(timer);
-   resolveRun({ code: -1, tail: `could not start ${command}: ${error.message}` });
+   clearTimeout(killTimer);
+   resolveRun(run);
+  };
+  const signalGroup = (signal: NodeJS.Signals): boolean => {
+   try {
+    if (child.pid !== undefined) process.kill(-child.pid, signal);
+    return true;
+   } catch {
+    return false; // the group is already gone
+   }
+  };
+  const timedOutRun = (how: string): VerbRun => ({
+   code: VERB_TIMEOUT_CODE,
+   tail: `${tail()}\n(timed out after ${Math.round(timeoutMs / 1000)} s: ${how})`.trimStart(),
+  });
+  const timer = setTimeout(() => {
+   timedOut = true;
+   signalGroup("SIGTERM");
+   killTimer = setTimeout(() => {
+    const killed = signalGroup("SIGKILL");
+    child.stdout?.destroy();
+    child.stderr?.destroy();
+    settle(timedOutRun(killed ? "SIGKILL sent after SIGTERM was ignored" : "exited after SIGTERM"));
+   }, graceMs);
+  }, timeoutMs);
+  child.on("error", (error) => {
+   settle({ code: -1, tail: `could not start ${command}: ${error.message}` });
   });
   child.on("close", (code, signal) => {
-   clearTimeout(timer);
-   resolveRun({ code: code ?? (signal === null ? -1 : 128), tail: tail() });
+   if (timedOut) {
+    settle(timedOutRun(`exited ${signal ?? code} after SIGTERM`));
+    return;
+   }
+   settle({ code: code ?? (signal === null ? -1 : 128), tail: tail() });
   });
  });
 }
