@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCmd } from "../src/exec.ts";
@@ -175,6 +175,19 @@ describe("gitConfigSnapshot: everything else stays in the hash", () => {
    expect(() => assertGitUntouched(canonical, before)).toThrow(GitSafetyError);
   });
  }
+
+ // Values are bytes, not UTF-8: two invalid bytes must not hash alike.
+ test("a core.sshCommand differing only in a non-UTF-8 byte changes the snapshot", () => {
+  const file = join(canonical, ".git", "config");
+  const original = readFileSync(file);
+  const withByte = (byte: number) =>
+   Buffer.concat([original, Buffer.from("[core]\n\tsshCommand = /tmp/ssh"), Buffer.from([byte, 0x0a])]);
+  writeFileSync(file, withByte(0xff));
+  const one = gitConfigSnapshot(canonical);
+  writeFileSync(file, withByte(0xfe));
+  expect(gitConfigSnapshot(canonical)).not.toBe(one);
+  expect(() => assertGitUntouched(canonical, one)).toThrow(GitSafetyError);
+ });
 
  test("an unparseable config is hashed raw: two different broken files differ", () => {
   const file = join(canonical, ".git", "config");

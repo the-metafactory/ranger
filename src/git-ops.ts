@@ -106,7 +106,10 @@ function configRecords(file: string, base: string): Buffer | string {
    "-c", "core.fsmonitor=false",
    "config", "--file", file, "--no-includes", "--list", "--null",
   ],
-  { env: minimalGitEnv(), encoding: "utf8", timeout: 10_000 },
+  // latin1, not utf8: one char per byte, so a value with bytes that are not
+  // valid UTF-8 (FF vs FE in a command path) never collapses to the same
+  // replacement character and hashes alike.
+  { env: minimalGitEnv(), encoding: "latin1", timeout: 10_000 },
  );
  if (listed.status !== 0 || listed.error !== undefined) {
   return Buffer.concat([Buffer.from("(unparsed)\0"), readFileSync(file)]);
