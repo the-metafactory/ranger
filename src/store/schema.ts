@@ -54,6 +54,8 @@ export const workers = sqliteTable("workers", {
  phase: text("phase"),
  /** The implement lane's PR number (the F2 resume anchor on GitHub). */
  prNumber: integer("pr_number"),
+ /** Original research worktree head, captured before the worker runs. */
+ researchBaseSha: text("research_base_sha"),
  /** Sage review rounds run on the PR (the 2-round cap, design §4). */
  reviewRound: integer("review_round").notNull().default(0),
  /** Head SHA of ranger's last recorded sage verdict, and its blocker count. */

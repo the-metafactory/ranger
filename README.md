@@ -117,9 +117,30 @@ bun src/cli.ts journal                    # inspect workers/events/health
 - **Journal (design §8):** SQLite at `~/.config/ranger/state.sqlite` holds only
   what the graph cannot — worker liveness/outcomes, vetoes cache, dead-man and
   spawn ledgers. Deleting it degrades to re-announce + retry once.
-- **Acceptance (e2e):** a research node walked end-to-end against fake
-  soma/gh/worker fixtures — claim → worktree → findings branch pushed → gated
-  close (probe on the pushed ref) → `decisions --write`.
+- **Research CI (node #25):** the supervisor refuses a commit whose tree differs
+  from the pre-worker base in any path other than `findings.md`, before pushing
+  or citing CI on a retry. After the findings push, the supervisor opens a
+  draft PR against the map's base and waits up to 15 minutes for CI on the
+  findings head. Registered check runs, Actions workflow runs (including queued
+  workflows whose jobs have not registered) and external commit statuses must
+  finish without failure. The completed snapshot must stay unchanged for 30
+  seconds, with at least one successful check run for
+  `soma graph close --ci <checkRunId>@<headSha>`. Polling backs off from 10 to
+  60 seconds while CI is pending, then resets to 10 seconds while settling.
+  This observes CI registered during the wait; it cannot guarantee
+  that an external provider will never register more CI afterward. Missing,
+  pending, failed, or stale-head evidence parks the node; a retry reuses the
+  open draft and committed findings. Failed CI needs an operator to rerun or
+  repair CI; retrying alone does not change the verdict on the same head.
+  CI parks do not consume the dead-man failure budget. The journal preserves
+  the pre-worker base SHA across retries; a draft without that anchor parks
+  for operator intervention.
+  A closed draft needs operator intervention.
+  The PR stays draft and unmerged.
+- **Acceptance (e2e):** an auto research node walked end-to-end against fake
+  soma/gh/worker fixtures — claim → worktree → findings branch pushed → draft
+  PR → successful CI citation → gated close → `decisions --write`. Live close
+  validation for node #25 remains a supervisor action after deployment.
 
 ## Doctrine anchors
 

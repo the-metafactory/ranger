@@ -24,7 +24,10 @@ function legacyJournal() {
  const migrations = join(dir, "drizzle"); mkdirSync(join(migrations, "meta"), { recursive: true });
  const source = join(import.meta.dir, "../drizzle");
  const manifest = JSON.parse(readFileSync(join(source, "meta/_journal.json"), "utf8"));
- manifest.entries = manifest.entries.filter((e: { tag: string }) => e.tag !== "0009_worker-root");
+ // A legacy journal is the state before this migration: every entry before it in order.
+ // Excluding only 0009 would keep 0017_research-base, a newer timestamp, which makes
+ // drizzle treat 0009 as already applied (it compares folderMillis to the newest row).
+ manifest.entries = manifest.entries.slice(0, manifest.entries.findIndex((e: { tag: string }) => e.tag === "0009_worker-root"));
  writeFileSync(join(migrations, "meta/_journal.json"), JSON.stringify(manifest));
  for (const entry of manifest.entries) copyFileSync(join(source, `${entry.tag}.sql`), join(migrations, `${entry.tag}.sql`));
  const path = join(dir, "journal.sqlite");

@@ -85,6 +85,7 @@ const worker = (over: Partial<WorkerRow>): WorkerRow => ({
  workerPgid: null,
  phase: "review",
  prNumber: 12,
+ researchBaseSha: null,
  reviewRound: 1,
  verdictSha: null,
  verdictBlockers: null,
