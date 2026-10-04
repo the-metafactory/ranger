@@ -54,13 +54,19 @@ maps:
 
   # Two maps may share a repo. Select one with --map owner/name#root.
   # A repo-only selector works only while that repo has exactly one map.
-  - repo: the-metafactory/ranger
+  - repo: jcfischer/seelite
+    root: 1
+    walk: none
+    discord:
+      tokenEnv: RANGER_DISCORD_TOKEN
+      channelId: "1487052222067118111"
+  - repo: jcfischer/seelite
     root: 460
     walk: none
     # Commands, autoMerge, discord and skip belong to each map independently.
     discord:
       tokenEnv: RANGER_DISCORD_TOKEN
-      channelId: "1505550997764833444"
+      channelId: "1487052222067118111"
 
 # The machine account (design §2). `identity` is the login ranger labels
 # claims/closes with (soma graph ... --identity <login>); it defaults to the
@@ -74,8 +80,9 @@ principal:
   login: jcfischer
 
 state:
-  # Migration-only: set an original root when a legacy repo now has two maps.
-  # Repos with one registered map infer it; unknown/ambiguous repos refuse.
+  # Migration-only: set the original root for ambiguous or deregistered repos.
+  # One registered map infers it; otherwise migration refuses until supplied.
+  # Historical roots need not remain registered. Remove this after cutover.
   # legacyMapRoots:
   #   jcfischer/seelite: 1
   # SQLite journal (design §8) — workers, events, dead-man/spawn ledger, vetoes.

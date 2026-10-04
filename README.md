@@ -48,6 +48,15 @@ close-only runs leave the cursor unchanged. Awaiting-merge releases capacity.
 The dashboard shows both holders and the same next choices as walk.
 Unknown or ambiguous worker maps conservatively hold both resource lanes.
 
+Journal upgrades run through `openJournal`, which seeds the root inputs required
+by `drizzle/0009_worker-root.sql` before applying migrations. A legacy repo with
+one registered map inherits that root. For multiple maps or a deregistered repo,
+set `state.legacyMapRoots` to its original root; that historical root need not be
+registered now. This includes repos with only legacy digest or escalation cursor
+cache entries. Remove the migration-only overrides after cutover. Standalone
+Drizzle callers must seed `ranger_legacy_roots(repo, root)` for every legacy repo
+before applying this migration.
+
 ## Scout (build-path step 1)
 
 `ranger scout` is the first shipped component: a read-only tick that digests every

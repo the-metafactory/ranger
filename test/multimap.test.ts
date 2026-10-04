@@ -182,23 +182,74 @@ describe("node #47 — map identity", () => {
      expect(() => new Journal(path)).toThrow(`Cannot backfill legacy map roots for: ${repo}`);
      const maps = [1, 460].map(root => ({ repo, root, commands: {} }));
      expect(() => new Journal(path, undefined, maps)).toThrow("state.legacyMapRoots");
-     expect(() => new Journal(path, undefined, maps, { [repo]: 999 })).toThrow("must name a registered root");
+     expect(() => new Journal(path, undefined, maps, { [repo]: 0 })).toThrow("must be a positive integer");
      const unchanged = new Database(path);
      expect(unchanged.query(`SELECT repo FROM ${table}`).all()).toEqual([{ repo }]);
      expect((unchanged.query(`PRAGMA table_info(${table})`).all() as { name: string }[]).some(c => c.name === "root")).toBe(false);
      unchanged.close();
-     const journal = new Journal(path, undefined, maps, { [repo]: 460 });
+     const journal = new Journal(path, undefined, maps, { [repo]: 999 });
      const rows = table === "workers" ? journal.listWorkers() : journal.listEscalations();
-     expect(rows[0]).toMatchObject({ repo, nodeId: "99", root: 460 });
+     expect(rows[0]).toMatchObject({ repo, nodeId: "99", root: 999 });
      journal.close();
      // Subsequent opens use the stored root, with no config or fallback required.
      const reopened = new Journal(path);
-     expect((table === "workers" ? reopened.listWorkers() : reopened.listEscalations())[0].root).toBe(460);
+     expect((table === "workers" ? reopened.listWorkers() : reopened.listEscalations())[0].root).toBe(999);
      reopened.close();
     } finally { rmSync(dir, { recursive: true, force: true }); }
    });
   }
  }
+
+ for (const table of ["workers", "escalations"] as const) {
+  test(`migration accepts explicit historical roots for deregistered ${table} repos`, () => {
+   const { dir, path, sqlite } = legacyJournal();
+   const repo = "example/retired";
+   if (table === "workers") sqlite.run("INSERT INTO workers(node_id,repo,status) VALUES('99',?,'parked')", [repo]);
+   else sqlite.run("INSERT INTO escalations(key,repo,node_id,message_id,created_at) VALUES(?,?,'99','card','2026-10-01')", [repo + ":99", repo]);
+   sqlite.close();
+   const maps = [{ repo: "example/current", root: 1, commands: {} }];
+   try {
+    expect(() => new Journal(path, undefined, maps)).toThrow("set state.legacyMapRoots");
+    const journal = new Journal(path, undefined, maps, { [repo]: 87 });
+    try {
+     expect((table === "workers" ? journal.listWorkers() : journal.listEscalations())[0]).toMatchObject({ repo, nodeId: "99", root: 87 });
+    } finally { journal.close(); }
+    const reopened = new Journal(path, undefined, maps);
+    try {
+     expect((table === "workers" ? reopened.listWorkers() : reopened.listEscalations())[0].root).toBe(87);
+    } finally { reopened.close(); }
+   } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+ }
+
+ test("migration preserves health-only repos and ignores already rooted keys", () => {
+  const { dir, path, sqlite } = legacyJournal();
+  const repos = ["example/single", "example/multiple", "example/retired"];
+  const prefixes = ["digest.", "escalate.cursor.", "escalate.absentCursor."];
+  for (const repo of repos) for (const prefix of prefixes) {
+   sqlite.run("INSERT INTO health(key,value) VALUES(?,?)", [prefix + repo, "legacy-state"]);
+  }
+  sqlite.run("INSERT INTO health(key,value) VALUES('digest.example/multiple#460','sibling-state')");
+  sqlite.run("INSERT INTO health(key,value) VALUES('digest.example/rooted-only#99','rooted-state')");
+  sqlite.run("INSERT INTO health(key,value) VALUES('unrelated.state','other-state')");
+  sqlite.close();
+  const maps = [{ repo: repos[0], root: 26, commands: {} }, ...[1, 460].map(root => ({ repo: repos[1], root, commands: {} }))];
+  try {
+   expect(() => { new Journal(path, undefined, maps).close(); }).toThrow("Cannot backfill legacy map roots");
+   const journal = new Journal(path, undefined, maps, { [repos[1]]: 1, [repos[2]]: 87 });
+   try {
+    repos.forEach((repo, i) => {
+     for (const prefix of prefixes) expect(journal.getHealth(`${prefix}${repo}#${[26, 1, 87][i]}`)).toBe("legacy-state");
+    });
+    expect(journal.getHealth("digest.example/multiple#460")).toBe("sibling-state");
+    expect(journal.getHealth("digest.example/rooted-only#99")).toBe("rooted-state");
+    expect(journal.getHealth("unrelated.state")).toBe("other-state");
+   } finally { journal.close(); }
+   const reopened = new Journal(path);
+   try { expect(reopened.getHealth("digest.example/retired#87")).toBe("legacy-state"); }
+   finally { reopened.close(); }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+ });
 
  test("selectors refuse ambiguous repos; resume infers the journal root", async () => {
   const r = rig();

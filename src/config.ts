@@ -187,7 +187,7 @@ const PrincipalSchema = z.object({
 });
 
 const StateSchema = z.object({
- /** Migration-only: original roots for repos now registering multiple maps. */
+ /** Migration-only: original roots for ambiguous or deregistered legacy repos; remove after cutover. */
  legacyMapRoots: z.record(z.string().regex(REPO_PATTERN), z.number().int().positive()).default({}),
  /** SQLite journal path (design §8). */
  journalPath: z.string().default("~/.config/ranger/state.sqlite"),
