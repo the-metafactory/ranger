@@ -159,6 +159,8 @@ describe("#37 — the state the dashboard shows", () => {
   visit(join(src, "serve.ts"));
   const local = [...seen].map((f) => f.slice(src.length + 1));
   expect(local).toContain("frontier-cache.ts");
+  // Node #54: the "Needs you" actions are walked too, and import no write either.
+  expect(local).toContain("serve-parked.ts");
   expect(local.filter((f) => /graph-write|walk|sweep|worker|implement/.test(f))).toEqual([]);
  });
 
