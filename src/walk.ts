@@ -1,3 +1,4 @@
+import { LAST_IMPLEMENT_MAP, mapKey, mapOrder } from "./maps.ts";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
 import type { RangerConfig, RangerMapConfig, WalkMode } from "./config.ts";
@@ -59,6 +60,7 @@ export interface WalkResult {
 export interface SpawnRunNodeArgs {
  nodeId: string;
  repo: string;
+ root: number;
  cliEntry: string;
  configPath: string;
 }
@@ -82,7 +84,7 @@ export async function spawnRunNodeDetached(
    "run-node",
    args.nodeId,
    "--map",
-   args.repo,
+   mapKey(args),
    "--config",
    args.configPath,
   ],
@@ -119,10 +121,10 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
  };
  const cliEntry = join(import.meta.dir, "cli.ts");
  // Even a worker finishing during this tick must not allow a second claim
- // in the same lane: at most one new implement claim per lane per tick.
- const claimedLanes = new Set<ImplementLane>();
+ // across maps: at most one new implement claim per tick.
+ let implementClaimed = false;
 
- for (const map of config.maps) {
+ for (const map of mapOrder(config.maps, journal.getHealth(LAST_IMPLEMENT_MAP))) {
   const mapResult: WalkMapResult = {
    repo: map.repo,
    walkMode: map.walk,
@@ -195,7 +197,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
     );
     // The plan `ranger serve` (#37) also reads, so its "next" is this order.
     const plan = planTick(classified, {
-     laneBusy: claimedLanes.has(implementLane(map)) || implementLaneBusy(journal, implementLane(map)),
+     laneBusy: implementClaimed || implementLaneBusy(journal, implementLane(map)),
      vetoed: (id) => journal.hasVeto(id),
     });
     const candidates = plan.selected;
@@ -222,6 +224,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
       const announcer = DiscordAnnouncer.fromMap(map);
       const announced = await announcer.announce({
        repo: map.repo,
+       root: map.root,
        nodeId: node.id,
        nodeTitle: node.title,
       });
@@ -252,7 +255,10 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
       continue;
      }
      mapResult.claimed.push(node.id);
-     if (laneOf(node.id) === "implement") claimedLanes.add(implementLane(map));
+     if (laneOf(node.id) === "implement") {
+      implementClaimed = true;
+      journal.setHealth(LAST_IMPLEMENT_MAP, mapKey(map));
+     }
      journal.recordSpawn(ctx.now?.() ?? new Date());
      // A fresh claim starts a clean row BEFORE the supervisor spawns: a node
      // re-claimed after an earlier park must not inherit that attempt's
@@ -263,6 +269,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
      journal.upsertWorker({
       nodeId: node.id,
       repo: map.repo,
+      root: map.root,
       status: "claimed",
       attempts: 0,
       pid: null,
@@ -282,10 +289,11 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
      const pid = await (ctx.spawnRunNode ?? spawnRunNodeDetached)({
       nodeId: node.id,
       repo: map.repo,
+      root: map.root,
       cliEntry,
       configPath: ctx.configPath,
      });
-     if (pid !== null) journal.updateWorker(node.id, { pid });
+     if (pid !== null) journal.updateWorker(node.id, map.repo, { pid });
      journal.recordEvent("claimed", {
       nodeId: node.id,
       repo: map.repo,
@@ -313,10 +321,11 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
     map,
     token,
     botIdentity,
-    respawn: (nodeId, repo) =>
+    respawn: (nodeId, repo, root) =>
      (ctx.spawnRunNode ?? spawnRunNodeDetached)({
       nodeId,
       repo,
+      root,
       cliEntry,
       configPath: ctx.configPath,
      }),

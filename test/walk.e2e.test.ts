@@ -98,7 +98,7 @@ describe("ranger walk — claim phase (node #13)", () => {
    expect(events.find((e) => e.kind === "claimed")?.detail).toContain(
     "ivy-bot",
    );
-   const worker = journal.getWorker("10");
+   const worker = journal.getWorker("10", "acme/widgets");
    expect(worker?.status).toBe("claimed");
    expect(worker?.messageId).toMatch(/^discord-msg-/);
    journal.close();
@@ -321,7 +321,7 @@ describe("ranger run-node — research worker full loop (node #13 acceptance)", 
    expect(kinds).toContain("worker-start");
    expect(kinds).toContain("closed");
    expect(kinds).toContain("decisions-written");
-   expect(journal.getWorker("10")?.status).toBe("success");
+   expect(journal.getWorker("10", "acme/widgets")?.status).toBe("success");
    journal.close();
   } finally {
    rmSync(dir, { recursive: true, force: true });
@@ -376,7 +376,7 @@ describe("ranger run-node — research worker full loop (node #13 acceptance)", 
    expect(journal.deadmanCount()).toBe(1);
    // The claim survives on the tracker; the row is terminal, not a "running"
    // row with no PID that sweep can never see (#23 F1).
-   expect(journal.getWorker("10")?.status).toBe("failed");
+   expect(journal.getWorker("10", "acme/widgets")?.status).toBe("failed");
    journal.close();
   } finally {
    rmSync(dir, { recursive: true, force: true });
@@ -406,7 +406,7 @@ describe("ranger sweep — reconcile journal vs reality (design §7)", () => {
 
    // Crashed worker (dead pid) that has already crashed once → respawned
    // (attempt 1 < 2), then parked + released on the next crash (attempt 2 ≥ 2).
-   journal.upsertWorker({
+   journal.upsertWorker({ root: 1,
     nodeId: "7",
     repo: map.repo,
     status: "claimed",
@@ -439,7 +439,7 @@ describe("ranger sweep — reconcile journal vs reality (design §7)", () => {
    });
    expect(second.parked).toEqual(["7"]);
    expect(second.released).toEqual(["7"]);
-   expect(journal.getWorker("7")?.status).toBe("released");
+   expect(journal.getWorker("7", "acme/widgets")?.status).toBe("released");
    const state = JSON.parse(readFileSync(statePath, "utf8"));
    expect(state.nodes["7"].assignees).toEqual([]);
 

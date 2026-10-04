@@ -4,13 +4,13 @@ import { Journal } from "../src/journal.ts";
 describe("Journal — SQLite state (design §8)", () => {
  test("workers: upsert, read, list by repo, attempts bump", () => {
   const j = new Journal(":memory:");
-  j.upsertWorker({ nodeId: "10", repo: "acme/widgets", status: "claimed", attempts: 0 });
-  let row = j.getWorker("10");
+  j.upsertWorker({ root: 1, nodeId: "10", repo: "acme/widgets", status: "claimed", attempts: 0 });
+  let row = j.getWorker("10", "acme/widgets");
   expect(row?.status).toBe("claimed");
   expect(row?.repo).toBe("acme/widgets");
 
-  j.upsertWorker({ nodeId: "10", repo: "acme/widgets", status: "running", attempts: 1, pid: 4242, worktree: "/tmp/wt" });
-  row = j.getWorker("10");
+  j.upsertWorker({ root: 1, nodeId: "10", repo: "acme/widgets", status: "running", attempts: 1, pid: 4242, worktree: "/tmp/wt" });
+  row = j.getWorker("10", "acme/widgets");
   expect(row?.status).toBe("running");
   expect(row?.attempts).toBe(1);
   expect(row?.pid).toBe(4242);

@@ -23,6 +23,7 @@ export interface AnnounceResult {
 
 export interface AnnounceContext {
  repo: string;
+ root?: number;
  nodeId: string;
  nodeTitle: string;
  mapTitle?: string;
@@ -71,7 +72,7 @@ export class DiscordAnnouncer implements Announcer {
  async announce(ctx: AnnounceContext): Promise<AnnounceResult> {
   const content = [
    `:ranger: **claim** #${ctx.nodeId} — ${ctx.nodeTitle}`,
-   `map: ${ctx.repo}${ctx.mapTitle === undefined ? "" : ` (${ctx.mapTitle})`}`,
+   `map: ${ctx.repo}${ctx.root === undefined ? "" : `#${ctx.root}`}${ctx.mapTitle === undefined ? "" : ` (${ctx.mapTitle})`}`,
   ].join("\n");
   return { messageId: await this.post(content, `claim announce for #${ctx.nodeId}`) };
  }

@@ -70,6 +70,7 @@ const report = (entries: FrontierEntry[], skip: string[] = []): MapRead => ({
 
 const worker = (over: Partial<WorkerRow>): WorkerRow => ({
  nodeId: "50",
+ root: 1,
  repo: REPO,
  pid: 111,
  status: "running",
@@ -193,7 +194,7 @@ describe("#37 — the state the dashboard shows", () => {
   expect(state.maps[1].next.reason).toMatch(/spent by earlier maps/);
  });
 
- test("visual and headless queues can each claim, while a later visual map waits", () => {
+ test("all resource tags share one implement queue", () => {
   const visual: ServeMap = { ...walked, key: "acme/game#1", repo: "acme/game", lane: "visual" };
   const sibling: ServeMap = { ...visual, key: "acme/game#2", root: 2 };
   const state = assembleState(inputs({
@@ -201,7 +202,7 @@ describe("#37 — the state the dashboard shows", () => {
    reports: new Map([visual, walked, sibling].map((m) => [m.key, report(FRONTIER)])),
   }));
   expect(state.maps.map((m) => [m.lane, m.next.nodeId, m.next.waiting])).toEqual([
-   ["visual", "10", false], ["headless", "10", false], ["visual", "10", true],
+   ["visual", "10", false], ["headless", "10", true], ["visual", "10", true],
   ]);
   expect(state.maps[2].next.reason).toMatch(/visual implement lane.*this tick claims #10/);
  });
@@ -219,10 +220,10 @@ describe("#37 — the state the dashboard shows", () => {
   expect(state.gates.laneHolders.headless?.nodeId).toBe("50");
   expect(state.maps[0].next).toMatchObject({ nodeId: "10", waiting: true });
   expect(state.maps[0].next.reason).toMatch(/visual implement lane.*#60/);
-  expect(state.maps[1].next.reason).toMatch(/headless implement lane.*#50/);
+  expect(state.maps[1].next.reason).toMatch(/headless implement lane.*#60/);
  });
 
- test("one held lane does not make the other lane wait; the cap is still shared", () => {
+ test("one implement holder makes every map wait; the cap is shared", () => {
   const visual: ServeMap = { ...walked, key: "acme/game#1", repo: "acme/game", lane: "visual" };
   const game = worker({ repo: visual.repo, nodeId: "60" });
   const state = assembleState(inputs({
@@ -231,7 +232,7 @@ describe("#37 — the state the dashboard shows", () => {
    workers: [game], laneHolders: { visual: game, headless: null }, spawnsToday: 9,
   }));
   expect(state.maps[0].next.waiting).toBe(true);
-  expect(state.maps[1].next).toMatchObject({ nodeId: "10", waiting: false });
+  expect(state.maps[1].next).toMatchObject({ nodeId: "10", waiting: true });
   const capped = assembleState(inputs({
    maps: [{ ...visual, lane: "visual" }, walked],
    reports: new Map([visual, walked].map((m) => [m.key, report(FRONTIER)])), spawnsToday: 9,
@@ -542,7 +543,7 @@ describe("#37 — the journal is read, never written", () => {
   const dir = mkdtempSync(join(tmpdir(), "ranger-serve-"));
   const path = join(dir, "state.sqlite");
   const writer = new Journal(path);
-  writer.upsertWorker({ nodeId: "50", repo: REPO, status: "running", attempts: 0 });
+  writer.upsertWorker({ root: 1, nodeId: "50", repo: REPO, status: "running", attempts: 0 });
   writer.close();
   const before = statSync(path).mtimeMs;
   const reader = Journal.openReadOnly(path);

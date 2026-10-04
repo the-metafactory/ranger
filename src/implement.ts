@@ -303,7 +303,7 @@ async function probeFinalHead(
   passed: result.code === 0,
   ...summary,
  };
- ctx.journal.assertGeneration(nodeId, ctx.generation, "post the probe record");
+ ctx.journal.assertGeneration(nodeId, ctx.map.repo, ctx.generation, "post the probe record");
  await github.postComment(repo, prNumber, probeComment(ranCommand, record, attempts, result), token);
  journal.recordEvent("reviewed", {
   nodeId,
@@ -370,7 +370,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
  const nodeId = node.ref.id;
  const base = map.base;
  const fence = (action: string) =>
-  journal.assertGeneration(nodeId, ctx.generation, action);
+  journal.assertGeneration(nodeId, ctx.map.repo, ctx.generation, action);
 
  const testCommand = map.commands.test;
  if (testCommand === undefined) {
@@ -383,7 +383,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
 
  // F2 resume: the recorded PR first (a head-branch lookup misses a PR whose
  // branch was deleted on merge), then the PR found by head branch.
- const recorded = journal.getWorker(nodeId)?.prNumber ?? null;
+ const recorded = journal.getWorker(nodeId, ctx.map.repo)?.prNumber ?? null;
  let pr =
   recorded === null
    ? await github.findPrByHead(repo, branch, token)
@@ -407,7 +407,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
  // ---- implement ----
  let workerExit: number | null = null;
  if (phase === "implement") {
-  journal.updateWorker(nodeId, { phase: "implement" });
+  journal.updateWorker(nodeId, ctx.map.repo, { phase: "implement" });
   if (map.commands.install !== undefined) {
    const install = await runShell(map.commands.install, worktree, ctx, INSTALL_TIMEOUT_MS);
    if (install.code !== 0) {
@@ -440,14 +440,14 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
    { head: branch, base, title, body: draftBody(ctx) },
    token,
   );
-  journal.updateWorker(nodeId, { phase: "review", prNumber: pr.number });
+  journal.updateWorker(nodeId, ctx.map.repo, { phase: "review", prNumber: pr.number });
   await awaitHead(github, repo, pr.number, built.sha, token, ctx.headPollMs);
   journal.recordEvent("pr-opened", { nodeId, repo, detail: `PR #${pr.number} (draft) ${pr.url}` });
  }
 
  // ---- review loop ----
  const open = pr as PullRequest;
- journal.updateWorker(nodeId, { phase: "review", prNumber: open.number });
+ journal.updateWorker(nodeId, ctx.map.repo, { phase: "review", prNumber: open.number });
  const cap = config.workers.reviewRounds;
  let reviews = recordedReviews(
   await github.listComments(repo, open.number, token),
@@ -512,7 +512,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
     detail: `round ${round} @ ${verdict.commitId.slice(0, 8)}: ${verdict.verdict}, ${verdict.blockers} blocker(s), ${verdict.majors} major(s)${chosenOn}`,
    });
   }
-  journal.updateWorker(nodeId, {
+  journal.updateWorker(nodeId, ctx.map.repo, {
    reviewRound: current.round,
    verdictSha: current.sha,
    verdictBlockers: current.blockers,
@@ -561,7 +561,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
  const final = reviews[reviews.length - 1];
  await github.updatePrBody(repo, open.number, readyBody(ctx, final, reviews.length, probe), token);
  await github.markReady(repo, await github.getPr(repo, open.number, token), token);
- journal.updateWorker(nodeId, {
+ journal.updateWorker(nodeId, ctx.map.repo, {
   status: "awaiting-merge",
   phase: "awaiting-merge",
   workerPgid: null,
@@ -646,7 +646,7 @@ async function workerPass(
   review,
   probeTier: map.commands.probe !== undefined,
  });
- ctx.journal.assertGeneration(nodeId, ctx.generation, "spawn the worker");
+ ctx.journal.assertGeneration(nodeId, ctx.map.repo, ctx.generation, "spawn the worker");
  const output = workerOutputFor(ctx.substrate);
  const raw = await ctx.workerRun(prompt, {
   cwd: worktree,
@@ -654,9 +654,9 @@ async function workerPass(
   env: workerEnv(config, map.repo),
   ...output.runOptions,
   processGroup: true,
-  onSpawn: (pgid) => journal.updateWorker(nodeId, { workerPgid: pgid }),
+  onSpawn: (pgid) => journal.updateWorker(nodeId, ctx.map.repo, { workerPgid: pgid }),
  });
- journal.updateWorker(nodeId, { workerPgid: null });
+ journal.updateWorker(nodeId, ctx.map.repo, { workerPgid: null });
 
  // Read on the substrate's own output format (node #45): a Claude stream's
  // quota readings are cached, and its signal lines feed the cap check.
@@ -746,7 +746,7 @@ async function closeAfterMerge(
  const { map, journal, node, token, botIdentity } = ctx;
  const repo = map.repo;
  const nodeId = node.ref.id;
- journal.updateWorker(nodeId, { phase: "close", prNumber: pr.number });
+ journal.updateWorker(nodeId, ctx.map.repo, { phase: "close", prNumber: pr.number });
 
  await fastForwardCanonical(ctx.canonical, map.base, token);
 
@@ -786,7 +786,7 @@ async function closeAfterMerge(
   });
  }
 
- journal.assertGeneration(nodeId, ctx.generation, "close the node");
+ journal.assertGeneration(nodeId, ctx.map.repo, ctx.generation, "close the node");
  const close = await graphClose(
   repo,
   nodeId,
@@ -808,7 +808,7 @@ async function closeAfterMerge(
 
  let decisionsDetail = "decisions --write after confirmed close";
  try {
-  journal.assertGeneration(nodeId, ctx.generation, "write decisions");
+  journal.assertGeneration(nodeId, ctx.map.repo, ctx.generation, "write decisions");
   await graphDecisions(repo, String(map.root), token, {
    cwd: ctx.canonical,
    timeoutMs: GRAPH_CALL_TIMEOUT_MS,

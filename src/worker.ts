@@ -1,3 +1,4 @@
+import { LAST_IMPLEMENT_MAP, mapKey } from "./maps.ts";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -319,7 +320,7 @@ async function handleSubstrateCap(
   repo: map.repo,
   detail: `${cap.substrate} hit its limit (resets ${resets}); resuming on the next eligible substrate: ${outcome.detail}`.slice(0, 400),
  });
- journal.assertGeneration(run.nodeId, run.generation, "resume on another substrate");
+ journal.assertGeneration(run.nodeId, ctx.map.repo, run.generation, "resume on another substrate");
  await resetToPushed(run.worktree, run.branch, map.base);
 }
 
@@ -359,17 +360,18 @@ function failNode(
   return;
  }
  countFailure(config, journal, repo);
- finish(journal, nodeId, "failed", detail);
+ finish(journal, nodeId, repo, "failed", detail);
 }
 
 /** Mark the row terminal: the supervisor PID is released only here (F1). */
 function finish(
  journal: Journal,
  nodeId: string,
+ repo: string,
  status: "success" | "failed" | "parked",
  outcome: string,
 ): void {
- journal.updateWorker(nodeId, {
+ journal.updateWorker(nodeId, repo, {
   status,
   pid: null,
   workerPgid: null,
@@ -386,7 +388,12 @@ export async function runNode(
  nodeId: string,
  ctx: RunNodeContext,
 ): Promise<RunNodeOutcome> {
- const { config, map, token, journal } = ctx;
+ const { config, token, journal } = ctx;
+ const row = journal.getWorker(nodeId, ctx.map.repo);
+ const map = row === null ? ctx.map : ctx.config.maps.find(m => m.repo === row.repo && m.root === row.root);
+ if (map === undefined) throw new Error('worker map is no longer registered');
+ if (row !== null && row.root !== ctx.map.root) throw new Error('run-node map disagrees with the journal root');
+ ctx = { ...ctx, map };
  const repo = map.repo;
  const base: RunNodeOutcome = {
   nodeId,
@@ -398,13 +405,13 @@ export async function runNode(
 
  // Take the node as a new occupant. A run-node with no claim row (an
  // operator's manual run) gets a running row first.
- if (journal.getWorker(nodeId) === null) {
-  journal.upsertWorker({ nodeId, repo, status: "running", attempts: 0 });
+ if (journal.getWorker(nodeId, ctx.map.repo) === null) {
+  journal.upsertWorker({ nodeId, repo, root: map.root, status: "running", attempts: 0 });
  }
- const generation = journal.beginGeneration(nodeId);
+ const generation = journal.beginGeneration(nodeId, ctx.map.repo);
  // The supervisor's PID stays on the row until a terminal state (F1): a
  // supervisor crash anywhere in the SOP tail is then visible to sweep.
- journal.updateWorker(nodeId, {
+ journal.updateWorker(nodeId, ctx.map.repo, {
   pid: process.pid,
   status: "running",
   startedAt: new Date().toISOString(),
@@ -439,7 +446,7 @@ export async function runNode(
   }
   const detail = `node #${nodeId} is kind '${node.node.kind}' — ranger walks research and task/build nodes only (design §3).`;
   journal.recordEvent("refused", { nodeId, repo, detail });
-  finish(journal, nodeId, "parked", detail);
+  finish(journal, nodeId, repo, "parked", detail);
   return { ...base, status: "refused", detail };
  } catch (error) {
   const detail = error instanceof Error ? error.message : String(error);
@@ -497,7 +504,7 @@ async function runSession(
    ? await selectBuildSubstrate(ctx, capped)
    : { substrate: undefined, chosenOn: "RANGER_WORKER_CMD override; its heads count as Pi-written" };
  const workerCmd = envCmd ?? resolveWorkerCommand(ctx, substrate as SubstrateName, session.canonical);
- journal.updateWorker(nodeId, { substrate: substrate ?? null });
+ journal.updateWorker(nodeId, ctx.map.repo, { substrate: substrate ?? null });
  journal.recordEvent("worker-start", {
   nodeId,
   repo: session.map.repo,
@@ -527,7 +534,7 @@ async function runImplementNode(
  const ratify = ratifyFor(node, map, botIdentity);
  if (ratify !== "auto" && ratify !== "merge") {
   journal.recordEvent("refused", { nodeId, repo, detail: ratify });
-  finish(journal, nodeId, "parked", ratify);
+  finish(journal, nodeId, repo, "parked", ratify);
   return { ...base, status: "refused", detail: ratify };
  }
  const readOnlyToken = ctx.readOnlyToken ?? resolveReadOnlyToken(config, repo).token;
@@ -538,7 +545,8 @@ async function runImplementNode(
  const slug = slugify(node.node.title);
  const branch = implementBranchFor(node.node, worktreeBranch(nodeId, slug));
  const worktree = await bootstrapWorktree(canonical, nodeId, slug, token, branch, map.base);
- journal.updateWorker(nodeId, { worktree, lane: "implement" });
+ journal.updateWorker(nodeId, ctx.map.repo, { worktree, lane: "implement" });
+ journal.setHealth(LAST_IMPLEMENT_MAP, mapKey(map));
 
  // Substrate selection (node #45), re-run at every session start. A session
  // that hits its substrate's limit is not a failure: the substrate is marked
@@ -578,7 +586,7 @@ async function runImplementNode(
    if (error instanceof ParkSignal || error instanceof GitSafetyError) {
     const detail = error.message;
     journal.recordEvent("parked", { nodeId, repo, detail: detail.slice(0, 400) });
-    finish(journal, nodeId, "parked", detail);
+    finish(journal, nodeId, repo, "parked", detail);
     await parkCard(map, nodeId, node.node.title, detail);
     return { ...base, status: "parked", detail };
    }
@@ -589,22 +597,22 @@ async function runImplementNode(
  switch (outcome.status) {
   case "success":
    journal.resetDeadman();
-   finish(journal, nodeId, "success", outcome.detail);
+   finish(journal, nodeId, repo, "success", outcome.detail);
    break;
   case "awaiting-merge":
    journal.resetDeadman();
    // The row already says awaiting-merge; the supervisor exits, so its PID goes.
-   journal.updateWorker(nodeId, { pid: null });
+   journal.updateWorker(nodeId, ctx.map.repo, { pid: null });
    break;
   case "refused":
    journal.recordEvent("refused", { nodeId, repo, detail: outcome.detail.slice(0, 400) });
-   finish(journal, nodeId, "parked", outcome.detail);
+   finish(journal, nodeId, repo, "parked", outcome.detail);
    break;
   default:
    journal.recordEvent("refused", { nodeId, repo, detail: outcome.detail.slice(0, 400) });
    // Backstop: a capped failure never counts (node #45), even if it ends the
    // run; a transient GitHub error is left for the sweep (failNode).
-   if (outcome.substrateCapped !== undefined) finish(journal, nodeId, "failed", outcome.detail);
+   if (outcome.substrateCapped !== undefined) finish(journal, nodeId, repo, "failed", outcome.detail);
    else failNode(config, journal, nodeId, repo, outcome.detail);
  }
  return {
@@ -628,7 +636,7 @@ async function parkCard(
   await DiscordAnnouncer.fromMap(map).post(
    [
     `:ranger: **parked** #${nodeId} — ${title}`,
-    `map: ${map.repo}`,
+    `map: ${map.repo}#${map.root}`,
     detail.slice(0, 1500),
     "Parked work waits for you: `ranger resume-node`, or take it in a session.",
    ].join("\n"),
@@ -653,7 +661,7 @@ async function runResearch(
  const { config, map, token, botIdentity, journal } = ctx;
  const repo = map.repo;
  const base: RunNodeOutcome = { nodeId, repo, status: "skipped", detail: "", workerExit: null };
- const fence = (action: string) => journal.assertGeneration(nodeId, generation, action);
+ const fence = (action: string) => journal.assertGeneration(nodeId, ctx.map.repo, generation, action);
 
  journal.recordEvent("worker-start", {
   nodeId,
@@ -671,7 +679,7 @@ async function runResearch(
   repo,
   detail: `worktree ${worktree}, branch ${branch}`,
  });
- journal.updateWorker(nodeId, { worktree, lane: "research" });
+ journal.updateWorker(nodeId, ctx.map.repo, { worktree, lane: "research" });
 
  const prompt = assembleResearchPrompt({
   repo,
@@ -705,9 +713,9 @@ async function runResearch(
   timeoutMs: wallClockMs,
   env: workerEnv(config, repo),
   processGroup: true,
-  onSpawn: (pgid) => journal.updateWorker(nodeId, { workerPgid: pgid }),
+  onSpawn: (pgid) => journal.updateWorker(nodeId, ctx.map.repo, { workerPgid: pgid }),
  });
- journal.updateWorker(nodeId, { workerPgid: null });
+ journal.updateWorker(nodeId, ctx.map.repo, { workerPgid: null });
  const log = saveWorkerLog(journal.path, repo, nodeId, generation, "research pass", workerResult);
 
  if (workerResult.code !== 0) {
@@ -810,7 +818,7 @@ async function runResearch(
    repo,
    detail: decisionsDetail.slice(0, 400),
   });
-  finish(journal, nodeId, "success", close.detail);
+  finish(journal, nodeId, repo, "success", close.detail);
   return {
    ...base,
    status: "success",
@@ -826,7 +834,7 @@ async function runResearch(
   detail: close.detail.slice(0, 400),
  });
  countFailure(config, journal, repo);
- finish(journal, nodeId, "parked", close.detail);
+ finish(journal, nodeId, repo, "parked", close.detail);
  return {
   ...base,
   status: "refused",

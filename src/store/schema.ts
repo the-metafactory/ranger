@@ -21,7 +21,8 @@ export type SubstrateName = (typeof SUBSTRATE_NAMES)[number];
  */
 
 export const workers = sqliteTable("workers", {
- nodeId: text("node_id").primaryKey(),
+ nodeId: text("node_id").notNull(),
+ root: integer("root").notNull(),
  repo: text("repo").notNull(),
  pid: integer("pid"),
  /** claimed | running | success | failed | parked | released */
@@ -60,7 +61,7 @@ export const workers = sqliteTable("workers", {
  verdictBlockers: integer("verdict_blockers"),
  /** Discord message id of the merge-request card (posted once, idempotent). */
  mergeMessageId: text("merge_message_id"),
-});
+}, (table) => [primaryKey({ columns: [table.repo, table.nodeId] })]);
 
 export const events = sqliteTable("events", {
  id: integer("id").primaryKey({ autoIncrement: true }),
@@ -96,6 +97,7 @@ export const escalations = sqliteTable(
  {
   /** `${repo}:${nodeId}` — one card per node per map. */
   key: text("key").primaryKey(),
+  root: integer("root").notNull(),
   repo: text("repo").notNull(),
   nodeId: text("node_id").notNull(),
   /** Node title at first post — the closed note keeps a readable remnant. */

@@ -186,6 +186,7 @@ const savedEnv = { ...process.env };
 
 async function rig(opts: {
  nodeId?: string;
+ root?: number;
  autonomy?: "auto" | "propose";
  author?: string;
  blockers?: number[];
@@ -257,6 +258,14 @@ async function rig(opts: {
  const configPath = join(dir, "ranger.yaml");
  writeFileSync(configPath, lines.join("\n"));
  const { config } = loadConfig(configPath);
+ if (opts.root === 460) {
+  config.maps.push({ ...config.maps[0], root: 460 });
+  const mapNode = JSON.parse(readFileSync(join(data, "acme__widgets-node-1.json"), "utf8"));
+  mapNode.node.title = "Gameplay map 460";
+  mapNode.ref.id = "460";
+  mapNode.body = "## Constraints\n\nGAMEPLAY_460_ONLY: preserve gameplay authority.";
+  writeFileSync(join(data, "acme__widgets-node-460.json"), JSON.stringify(mapNode));
+ }
 
  Object.assign(process.env, GIT_ENV, {
   PATH: `${fixturesBin}:${savedEnv.PATH ?? ""}`,
@@ -266,12 +275,12 @@ async function rig(opts: {
  delete process.env.RANGER_DISCORD_TOKEN; // park cards are best-effort
 
  const journal = openJournal(config);
- journal.upsertWorker({ nodeId, repo: "acme/widgets", status: "claimed", lane: "implement" });
+ journal.upsertWorker({ root: opts.root ?? 1, nodeId, repo: "acme/widgets", status: "claimed", lane: "implement" });
  const github = new FakeGitHub(origin);
  const { reviewer, calls } = scriptedReviewer(github, opts.blockers ?? [0], opts.onReview, opts.majors ?? [0]);
  const ctx: RunNodeContext = {
   config,
-  map: config.maps[0],
+  map: config.maps.find(m => m.root === (opts.root ?? 1))!,
   token: "ghp_write",
   botIdentity: BOT,
   journal,
@@ -300,6 +309,47 @@ describe("implement lane (node #23)", () => {
   Object.assign(process.env, savedEnv);
  });
 
+ test("two maps: gameplay prompt, merge recovery and decision projection stay on root 460", async () => {
+  const r = await rig({ root: 460 });
+  cleanup.push(r.dir);
+  const callsFile = join(r.dir, "root-calls.log");
+  process.env.FAKE_SOMA_ROOT_CALLS = callsFile;
+  const prompts: string[] = [];
+  r.ctx.worker = async (prompt, opts) => {
+   prompts.push(prompt);
+   return runCmd(implementWorker, ["build", prompt], opts);
+  };
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  expect(prompts).toHaveLength(1);
+  expect(prompts[0]).toContain("Gameplay map 460");
+  expect(prompts[0]).toContain("GAMEPLAY_460_ONLY");
+  expect(prompts[0]).not.toContain("A widgets platform");
+  expect(r.journal.getWorker("20", "acme/widgets")?.root).toBe(460);
+  const posts: string[] = [];
+  const spawns: string[] = [];
+  const sweep = (root: number) => sweepMap({
+   config: r.ctx.config, journal: r.journal,
+   map: r.ctx.config.maps.find(m => m.root === root)!,
+   token: "ghp_write", botIdentity: BOT, github: r.github,
+   post: async content => { posts.push(content); return "merge-card"; },
+   respawn: async (id, repo, root) => { spawns.push(repo + "#" + root + ":" + id); return DEAD_PID; },
+  });
+  expect((await sweep(1)).mergeDesk).toBeUndefined();
+  expect((await sweep(460)).mergeDesk?.cards).toEqual(["20"]);
+  expect(posts).toHaveLength(1);
+  expect(posts[0]).toContain("map: acme/widgets#460");
+  await r.github.merge(1);
+  await sweep(1);
+  expect((await sweep(460)).mergeDesk?.resumed).toEqual(["20"]);
+  expect(spawns).toEqual(["acme/widgets#460:20"]);
+  expect((await runNode("20", r.ctx)).status).toBe("success");
+  const rootCalls = readFileSync(callsFile, "utf8");
+  expect(rootCalls).toContain("decisions acme/widgets 460");
+  expect(rootCalls).not.toContain("decisions acme/widgets 1\n");
+  expect(prompts).toHaveLength(1);
+  r.journal.close();
+ }, 60_000);
+
  test("auto node end to end: build → draft PR → review r1 blockers → fix → r2 clean → ready → merge card once → merge → gated close citing CI", async () => {
   const r = await rig({ blockers: [1, 0] });
   cleanup.push(r.dir);
@@ -307,7 +357,7 @@ describe("implement lane (node #23)", () => {
   const first = await runNode("20", r.ctx);
   expect(first.status).toBe("awaiting-merge");
   expect(first.prNumber).toBe(1);
-  const row = r.journal.getWorker("20");
+  const row = r.journal.getWorker("20", "acme/widgets");
   expect(row?.status).toBe("awaiting-merge");
   expect(row?.reviewRound).toBe(2);
   expect(row?.verdictBlockers).toBe(0);
@@ -358,7 +408,7 @@ describe("implement lane (node #23)", () => {
   const tick3 = await sweep();
   expect(tick3.mergeDesk?.resumed).toEqual(["20"]);
   expect(spawned).toEqual(["20"]);
-  expect(r.journal.getWorker("20")?.attempts).toBe(0); // the resume is not a crash
+  expect(r.journal.getWorker("20", "acme/widgets")?.attempts).toBe(0); // the resume is not a crash
 
   const closed = await runNode("20", r.ctx);
   expect(closed.status).toBe("success");
@@ -367,8 +417,8 @@ describe("implement lane (node #23)", () => {
   expect(s.lastClose.ci).toBe(`101@${merged}`);
   expect(s.lastClose.evidence.map((e: { kind: string }) => e.kind)).toEqual(["judged"]);
   expect(realpathSync(s.lastCloseCwd)).toBe(realpathSync(r.canonical));
-  expect(r.journal.getWorker("20")?.status).toBe("success");
-  expect(r.journal.getWorker("20")?.pid).toBeNull();
+  expect(r.journal.getWorker("20", "acme/widgets")?.status).toBe("success");
+  expect(r.journal.getWorker("20", "acme/widgets")?.pid).toBeNull();
   expect(existsSync(join(r.canonical, ".worktrees", "node-20"))).toBe(false);
  }, 60_000);
 
@@ -392,7 +442,7 @@ describe("implement lane (node #23)", () => {
   expect(r.calls).toHaveLength(1);
 
   mode[1] = "build";
-  r.journal.updateWorker("20", { status: "claimed" });
+  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
   const resumed = await runNode("20", r.ctx);
   expect(resumed.status).toBe("awaiting-merge");
   expect(r.calls).toHaveLength(2); // round 1 was read back from the PR, not re-run
@@ -406,7 +456,7 @@ describe("implement lane (node #23)", () => {
   const outcome = await runNode("20", r.ctx);
   expect(outcome.status).toBe("parked");
   expect(outcome.detail).toContain("blocker(s) and 0 major(s) remain after 2 sage round(s)");
-  expect(r.journal.getWorker("20")?.status).toBe("parked");
+  expect(r.journal.getWorker("20", "acme/widgets")?.status).toBe("parked");
   expect(r.journal.deadmanCount()).toBe(0); // a park is not a crash
   expect(state(r.statePath).nodes["20"].assignees).toEqual([BOT]);
  }, 60_000);
@@ -448,7 +498,7 @@ describe("implement lane (node #23)", () => {
   expect(outcome.status).toBe("failed");
   expect(r.journal.deadmanCount()).toBe(0);
   // Still running under this supervisor's PID: when it exits, the sweep sees a crash and respawns.
-  expect(r.journal.getWorker("20")?.status).toBe("running");
+  expect(r.journal.getWorker("20", "acme/widgets")?.status).toBe("running");
   expect(r.journal.listEvents().some((e) => e.kind === "transient")).toBe(true);
   // The pushed work and the PR survive for the respawn to pick up.
   expect(r.github.prs.size).toBe(1);
@@ -460,7 +510,7 @@ describe("implement lane (node #23)", () => {
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
   expect(r.github.prs.get(1)?.body).toContain("merging this PR is the ratification");
   await r.github.merge(1);
-  r.journal.updateWorker("20", { status: "running" });
+  r.journal.updateWorker("20", "acme/widgets", { status: "running" });
   const closed = await runNode("20", r.ctx);
   expect(closed.status).toBe("success");
   const s = state(r.statePath);
@@ -483,7 +533,7 @@ describe("implement lane (node #23)", () => {
   cleanup.push(r.dir);
   const realWorker = r.ctx.workerCommand as string[];
   r.ctx.worker = async (prompt, opts) => {
-   r.journal.beginGeneration("20"); // a newer occupant arrives mid-run
+   r.journal.beginGeneration("20", "acme/widgets"); // a newer occupant arrives mid-run
    return runCmd(realWorker[0], [...realWorker.slice(1), prompt], opts);
   };
   const outcome = await runNode("20", r.ctx);
@@ -520,7 +570,7 @@ describe("implement lane (node #23)", () => {
   const quiet = await sweep(); // open + parked: the desk does nothing
   expect(quiet.mergeDesk?.resumed).toEqual([]);
   expect(quiet.mergeDesk?.cards).toEqual([]);
-  expect(r.journal.getWorker("20")?.status).toBe("parked");
+  expect(r.journal.getWorker("20", "acme/widgets")?.status).toBe("parked");
 
   await r.github.merge(1);
   expect((await sweep()).mergeDesk?.resumed).toEqual(["20"]);
@@ -645,7 +695,7 @@ describe("implement lane (node #23)", () => {
   expect((await runNode("20", r.ctx)).status).toBe("parked");
   const pr = r.github.prs.get(1);
   if (pr) pr.draft = false;
-  r.journal.updateWorker("20", { status: "awaiting-merge", phase: "awaiting-merge", mergeMessageId: "old-card" });
+  r.journal.updateWorker("20", "acme/widgets", { status: "awaiting-merge", phase: "awaiting-merge", mergeMessageId: "old-card" });
   r.ctx.config.workers.reviewRounds = 2;
 
   const posts: string[] = [];
@@ -668,7 +718,7 @@ describe("implement lane (node #23)", () => {
   });
   expect(tick.mergeDesk?.resumed).toEqual(["20"]);
   expect(posts[0]).toContain("merge card withdrawn");
-  expect(r.journal.getWorker("20")?.mergeMessageId).toBeNull();
+  expect(r.journal.getWorker("20", "acme/widgets")?.mergeMessageId).toBeNull();
   // The resumed run-node reworks the major and runs round 2.
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
   expect(r.calls).toHaveLength(2);
@@ -678,10 +728,10 @@ describe("implement lane (node #23)", () => {
   cleanup.push(r.dir);
   r.ctx.config.workers.reviewRounds = 1;
   expect((await runNode("20", r.ctx)).status).toBe("parked");
-  r.journal.updateWorker("20", { status: "awaiting-merge", phase: "awaiting-merge", mergeMessageId: "old-card" });
+  r.journal.updateWorker("20", "acme/widgets", { status: "awaiting-merge", phase: "awaiting-merge", mergeMessageId: "old-card" });
   r.ctx.config.workers.reviewRounds = 2;
   // Another implement worker holds the lane.
-  r.journal.upsertWorker({ nodeId: "99", repo: "acme/widgets", status: "running", lane: "implement" });
+  r.journal.upsertWorker({ root: 1, nodeId: "99", repo: "acme/widgets", status: "running", lane: "implement" });
 
   const posts: string[] = [];
   const spawned: string[] = [];
@@ -706,10 +756,10 @@ describe("implement lane (node #23)", () => {
   expect(waiting.mergeDesk?.pending).toEqual(["20"]);
   expect(spawned).toEqual([]);
   expect(posts[0]).toContain("merge card withdrawn");
-  expect(r.journal.getWorker("20")?.mergeMessageId).toBeNull();
+  expect(r.journal.getWorker("20", "acme/widgets")?.mergeMessageId).toBeNull();
 
   // The lane frees; the next tick sends it back, without a second withdrawal.
-  r.journal.updateWorker("99", { status: "success" });
+  r.journal.updateWorker("99", "acme/widgets", { status: "success" });
   const resumed = await sweep();
   expect(resumed.mergeDesk?.resumed).toEqual(["20"]);
   expect(spawned).toEqual(["20"]);
@@ -811,7 +861,7 @@ describe("implement lane (node #23)", () => {
   expect(outcome.status).toBe("awaiting-merge");
   expect(calls).toBe(2);
   expect(r.journal.deadmanCount()).toBe(0);
-  const row = r.journal.getWorker("20");
+  const row = r.journal.getWorker("20", "acme/widgets");
   expect(row?.attempts).toBe(0);
   expect(row?.substrate).toBe("codex");
   expect(r.journal.getSubstrateReading("claude")?.cappedUntil).toBe(new Date(resetsAt * 1000).toISOString());
@@ -866,7 +916,7 @@ describe("implement lane (node #23)", () => {
   // (and Claude is unread), the resumed review falls back to Pi.
   expect(reviewSubstrates).toEqual(["codex", "pi"]);
   expect(r.journal.deadmanCount()).toBe(0);
-  expect(r.journal.getWorker("20")?.attempts).toBe(0);
+  expect(r.journal.getWorker("20", "acme/widgets")?.attempts).toBe(0);
   expect(r.journal.getSubstrateReading("codex")?.cappedUntil).toBe(new Date(resetsAt * 1000).toISOString());
 
   const events = r.journal.listEvents("acme/widgets", 200);
@@ -910,7 +960,7 @@ describe("implement lane (node #23)", () => {
   // The override's substrate is unknown: no head label (it counts as Pi's),
   // and the review runs on the eligible strong substrate, not on Pi.
   expect(reviewSubstrates).toEqual(["codex"]);
-  expect(r.journal.getWorker("20")?.substrate).toBeNull();
+  expect(r.journal.getWorker("20", "acme/widgets")?.substrate).toBeNull();
   const head = await r.github.sha("node/20-add-the-feature-module");
   expect(r.journal.headSubstrate("acme/widgets", head)).toBeNull();
   const start = r.journal

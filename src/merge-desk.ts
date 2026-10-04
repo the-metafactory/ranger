@@ -1,3 +1,4 @@
+import { LAST_IMPLEMENT_MAP, mapKey } from "./maps.ts";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import { DiscordAnnouncer } from "./announce.ts";
 import {
@@ -43,7 +44,7 @@ export interface MergeDeskContext {
  /** Post a message to the map's channel; returns the message id. */
  post?: (content: string, label: string) => Promise<string>;
  /** Spawn a detached run-node (the resume-for-close); returns its PID. */
- spawn?: (nodeId: string, repo: string) => Promise<number | null>;
+ spawn?: (nodeId: string, repo: string, root: number) => Promise<number | null>;
 }
 
 export interface MergeDeskResult {
@@ -74,7 +75,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   ((content: string, label: string) => DiscordAnnouncer.fromMap(map).post(content, label));
 
  const waiting = journal
-  .listWorkers(repo)
+  .listWorkers(repo, map.root)
   .filter(watchedByMergeDesk);
 
  for (const row of waiting) {
@@ -89,7 +90,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
  return result;
 
  async function park(row: WorkerRow, detail: string, title: string): Promise<void> {
-  journal.updateWorker(row.nodeId, {
+  journal.updateWorker(row.nodeId, repo, {
    status: "parked",
    finishedAt: new Date().toISOString(),
    outcome: detail.slice(0, 400),
@@ -100,7 +101,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    await post(
     [
      `:ranger: **parked** #${row.nodeId} — ${title}`,
-     `map: ${repo}${row.prNumber === null ? "" : ` · PR #${row.prNumber}`}`,
+     `map: ${repo}#${map.root}${row.prNumber === null ? "" : ` · PR #${row.prNumber}`}`,
      detail.slice(0, 1500),
     ].join("\n"),
     `park card for #${row.nodeId}`,
@@ -125,12 +126,12 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    }
    // The resume-for-close: no LLM session, so it neither counts an attempt
    // nor touches the dead-man counter.
-   const pid = await ctx.spawn(row.nodeId, repo);
+   const pid = await ctx.spawn(row.nodeId, repo, row.root);
    if (pid === null) {
     result.errors.push(`#${row.nodeId}: merged, but the close run-node did not spawn — retrying next tick`);
     return;
    }
-   journal.updateWorker(row.nodeId, { status: "running", phase: "close", pid });
+   journal.updateWorker(row.nodeId, repo, { status: "running", phase: "close", pid });
    journal.recordEvent("sweep", {
     nodeId: row.nodeId,
     repo,
@@ -182,12 +183,12 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
      result.errors.push(`#${row.nodeId}: could not post the card withdrawal — retrying next tick`);
      return;
     }
-    journal.updateWorker(row.nodeId, { mergeMessageId: null });
+    journal.updateWorker(row.nodeId, repo, { mergeMessageId: null });
    }
    // A send-back starts a worker session (fix pass or probes): it waits for
    // the implement lane like any other start. The stale card is already gone.
    const lane = implementLane(map);
-   const holder = journal.laneHolder(lane, row.nodeId);
+   const holder = journal.laneHolder(lane, row.nodeId, repo);
    if (holder !== null) {
     result.pending.push(row.nodeId);
     journal.recordEvent("sweep", {
@@ -197,12 +198,13 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
     });
     return;
    }
-   const pid = await ctx.spawn(row.nodeId, repo);
+   const pid = await ctx.spawn(row.nodeId, repo, row.root);
    if (pid === null) {
     result.errors.push(`#${row.nodeId}: ${why}, but run-node did not spawn — retrying next tick`);
     return;
    }
-   journal.updateWorker(row.nodeId, { status: "running", phase: "review", pid });
+   journal.updateWorker(row.nodeId, repo, { status: "running", phase: "review", pid });
+   journal.setHealth(LAST_IMPLEMENT_MAP, mapKey(row));
    journal.recordEvent("sweep", {
     nodeId: row.nodeId,
     repo,
@@ -258,9 +260,9 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
     /* the merged PR and the event are the record */
    }
    if (ctx.spawn !== undefined) {
-    const pid = await ctx.spawn(row.nodeId, repo);
+    const pid = await ctx.spawn(row.nodeId, repo, row.root);
     if (pid !== null) {
-     journal.updateWorker(row.nodeId, { status: "running", phase: "close", pid });
+     journal.updateWorker(row.nodeId, repo, { status: "running", phase: "close", pid });
      result.resumed.push(row.nodeId);
     }
    }
@@ -270,7 +272,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   const messageId = await post(
    [
     `:ranger: **merge needed** #${row.nodeId} — ${title}`,
-    `map: ${repo}`,
+    `map: ${repo}#${map.root}`,
     `Gate passed at \`${gate.headSha.slice(0, 8)}\`: CI green, mergeable, base \`${map.base}\`, sage ${last?.round ?? "?"} round(s), the last with 0 blockers and 0 majors (machine evidence, not a sign-off).`,
     ...(probesRequired
      ? [`Probes passed at \`${gate.headSha.slice(0, 8)}\` (selection ${probe?.mode ?? "?"}, ${probe?.selected ?? "?"} probe(s)). Only the selected probes ran, not the full suite.`]
@@ -281,7 +283,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    ].join("\n"),
    `merge card for #${row.nodeId}`,
   );
-  journal.updateWorker(row.nodeId, { mergeMessageId: messageId });
+  journal.updateWorker(row.nodeId, repo, { mergeMessageId: messageId });
   journal.recordEvent("merge-card", { nodeId: row.nodeId, repo, detail: `PR #${pr.number}, message ${messageId}` });
   result.cards.push(row.nodeId);
  }

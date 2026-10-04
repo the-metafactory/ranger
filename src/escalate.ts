@@ -276,6 +276,7 @@ async function digestOneMap(
     // total + age aggregates from the same query, so the daily read doesn't
     // grow with historical escalations (round-17/20 reviews).
     const openCards = journal.listOpenEscalations(map.repo, now, {
+      root: map.root,
       limit: 15,
     });
     const open = openCards.rows.map((row) => ({
@@ -303,7 +304,7 @@ async function digestOneMap(
     const synced = await syncDailyDigest({
       client,
       journal,
-      repo: map.repo,
+      repo: `${map.repo}#${map.root}`,
       content,
       now,
       deadline: digestDeadline,

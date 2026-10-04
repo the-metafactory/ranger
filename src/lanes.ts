@@ -1,4 +1,4 @@
-/** Implement capacity follows machine resources, independently of worker substrate. */
+/** Resource tags describe a worker's machine requirements, independently of substrate. */
 export const IMPLEMENT_LANES = ["visual", "headless"] as const;
 export type ImplementLane = (typeof IMPLEMENT_LANES)[number];
 
@@ -14,12 +14,12 @@ export function implementLane(map: Pick<LaneMap, "lane" | "commands">): Implemen
  return map.lane ?? (map.commands.probe === undefined ? "headless" : "visual");
 }
 
-/** Resolve legacy rows from current config, without persisting a resource lane. */
+/** Resolve the worker's exact map without persisting a resource lane. */
 export function workerLane(
- row: { repo: string; root?: number },
+ row: { repo: string; root: number },
  maps: readonly LaneMap[],
 ): ImplementLane | null {
- const matches = maps.filter((m) => m.repo === row.repo && (row.root === undefined || m.root === row.root));
+ const matches = maps.filter((m) => m.repo === row.repo && m.root === row.root);
  const lanes = new Set(matches.map(implementLane));
  // An absent/ambiguous map cannot safely be assigned machine capacity.
  return lanes.size === 1 ? [...lanes][0] : null;

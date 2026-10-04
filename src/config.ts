@@ -126,8 +126,7 @@ const MapSchema = z.object({
 
 /**
  * A map `ranger serve` shows and nothing else reads (#37): no walk, no scout
- * report, no escalation cards. For a root ranger cannot walk yet — seelite
- * #460 until two maps on one repo are supported (#38).
+ * report, no escalation cards. Registered maps instead share the walk's cache.
  */
 const ServeMapSchema = z.object({
  repo: z.string().regex(REPO_PATTERN, "repo must be owner/name"),

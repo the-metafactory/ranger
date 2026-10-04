@@ -13,7 +13,7 @@ maps:
     #                    is the principal's merge of the PR
     walk: none
     # Implement capacity: visual when commands.probe is declared, headless
-    # otherwise. One claimed/running implement worker per lane across maps.
+    # otherwise. One claimed/running implement worker across all maps.
     # Override for GPU tests without probes, or probes that need no GPU:
     # lane: visual   # visual | headless
     # Optional canonical-checkout override (design §4: probes run where the
@@ -52,6 +52,16 @@ maps:
     discord:
       tokenEnv: RANGER_DISCORD_TOKEN
       channelId: "1487052222067118111"
+
+  # Two maps may share a repo. Select one with --map owner/name#root.
+  # A repo-only selector works only while that repo has exactly one map.
+  - repo: the-metafactory/ranger
+    root: 460
+    walk: none
+    # Commands, autoMerge, discord and skip belong to each map independently.
+    discord:
+      tokenEnv: RANGER_DISCORD_TOKEN
+      channelId: "1505550997764833444"
 
 # The machine account (design §2). `identity` is the login ranger labels
 # claims/closes with (soma graph ... --identity <login>); it defaults to the

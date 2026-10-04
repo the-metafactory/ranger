@@ -1,3 +1,4 @@
+import { LAST_IMPLEMENT_MAP, mapOrder } from "./maps.ts";
 /**
  * `ranger serve` (#37) — a local dashboard of the walk: the job a worker is on
  * now, the next node a tick would take, every node ranger can take on its own,
@@ -143,6 +144,7 @@ export interface MapRead {
 
 export interface StateInputs {
  maps: ServeMap[];
+ lastImplementMap?: string | null;
  /** Frontier reads by `ServeMap.key`. */
  reports: Map<string, MapRead>;
  /** Titles of in-flight nodes not on any frontier, by `repo#id`. */
@@ -296,7 +298,7 @@ const view = (n: ClassifiedNode): NodeView => ({
 
 /**
  * What one tick has spent by the time it reaches a map: walk visits maps in
- * config order, and an earlier map's claims take the implement lane and
+ * persisted rotation order, and an earlier map's claims take the implement lane and
  * count against the shared daily cap before a later map is planned.
  */
 interface TickSoFar {
@@ -324,7 +326,7 @@ function nextFor(
   );
  }
  // The tick's own plan (candidates.ts): the order and the veto rule walk uses.
- const holder = tick.holders[map.lane];
+ const holder = tick.holders.visual ?? tick.holders.headless;
  const plan = planTick(report.frontier, {
   laneBusy: holder !== null,
   vetoed: inputs.vetoed,
@@ -334,7 +336,9 @@ function nextFor(
  tick.spawns += claims.length;
  const implementClaim = claims.find((n) => plan.implement.includes(n));
  if (implementClaim !== undefined) {
-  tick.holders[map.lane] = { repo: map.key, nodeId: implementClaim.id, thisTick: true };
+  const claimed = { repo: map.key, nodeId: implementClaim.id, thisTick: true };
+  tick.holders.visual = claimed;
+  tick.holders.headless = claimed;
  }
  const first = claims[0];
  if (first !== undefined) {
@@ -406,7 +410,11 @@ export function assembleState(inputs: StateInputs): DashboardState {
   holders: { visual: tickHolder("visual"), headless: tickHolder("headless") },
   spawns: inputs.spawnsToday,
  };
- // In config order, as walk visits them, so each map sees what the earlier ones spent.
+ // Plan in the walk's rotation order; retain config order for display.
+ const planned = new Map<string, NextJob>();
+ for (const map of mapOrder(inputs.maps, inputs.lastImplementMap ?? null)) {
+  planned.set(map.key, nextFor(map, inputs.reports.get(map.key), inputs, tick));
+ }
  const maps: DashboardMap[] = inputs.maps.map((map) => {
   const report = inputs.reports.get(map.key);
   const frontier = report?.ok ? report.frontier : [];
@@ -423,7 +431,7 @@ export function assembleState(inputs: StateInputs): DashboardState {
    readAt: report?.readAt ?? null,
    source: report?.source ?? (map.servedOnly ? "serve" : "ranger"),
    localCheckout: map.localCheckout,
-   next: nextFor(map, report, inputs, tick),
+   next: planned.get(map.key)!,
    autonomous: walked ? walkableCandidates(frontier).map(view) : [],
    grillings: frontier
     .filter((n) => n.kind === "grilling")
@@ -995,6 +1003,7 @@ export function stateFromJournal(
    reports,
    titles: reader.titles,
    workers: journal?.listWorkers() ?? [],
+   lastImplementMap: journal?.getHealth(LAST_IMPLEMENT_MAP) ?? null,
    laneHolders: { visual: journal?.laneHolder("visual") ?? null, headless: journal?.laneHolder("headless") ?? null },
    paused: journal?.isPaused() ?? false,
    spawnsToday: journal?.spawnsToday(now) ?? 0,

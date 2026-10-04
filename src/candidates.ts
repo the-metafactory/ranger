@@ -16,7 +16,7 @@ export function researchCandidates(
 
 /**
  * Implement-lane candidates (design §3 class 8 + the #23 ruling): routed
- * implement AND walkable. Each resource lane is serial, so the caller claims
+ * implement AND walkable. The global implement lane is serial, so the caller claims
  * at most one, and none while another implement worker holds that lane.
  */
 export function implementCandidates(
@@ -30,7 +30,7 @@ export function implementCandidates(
 /**
  * The candidates one tick takes from a classified frontier: every walkable
  * research node, and at most one implement node while no implement worker
- * holds this map's resource lane. `planTick` below is the
+ * holds the implement lane. `planTick` below is the
  * one caller the walk and the dashboard share.
  */
 export function selectCandidates(
