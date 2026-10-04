@@ -1,11 +1,12 @@
 import { implementLane } from "./lanes.ts";
 import { recordImplementStart, mapKey } from "./maps.ts";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
-import { DiscordClient, type DiscordFile } from "./discord.ts";
-import { viewsCard, viewsDirectory } from "./views.ts";
+import { DiscordAnnouncer } from "./announce.ts";
+import type { DiscordFile } from "./discord.ts";
+import { redactViewsReason, viewsCard, viewsCardMessage, viewsDirectory } from "./views.ts";
+import { NEEDS_EYE_LABEL } from "./labels.ts";
 import {
  gatingFindings,
- NEEDS_EYE_LABEL,
  realGitHub,
  recordedProbes,
  recordedReviews,
@@ -71,11 +72,11 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
  const github = ctx.github ?? realGitHub;
  const repo = map.repo;
  const result: MergeDeskResult = { cards: [], merged: [], resumed: [], parked: [], pending: [], errors: [] };
- let discord: DiscordClient | undefined;
+ let announcer: DiscordAnnouncer | undefined;
  const post =
   ctx.post ??
-  ((content: string, _label: string, files?: readonly DiscordFile[], embeds?: readonly { description: string }[]) =>
-   (discord ??= DiscordClient.fromMap(map)).post(content, undefined, files, embeds));
+  ((content: string, label: string, files?: readonly DiscordFile[], embeds?: readonly { description: string }[]) =>
+   (announcer ??= DiscordAnnouncer.fromMap(map)).post(content, label, files, embeds));
 
  const waiting = journal
   .listWorkers(repo, map.root)
@@ -240,7 +241,9 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   // Auto-merge (principal, 2026-10-03): on a map that opts in, ranger
   // squash-merges the gate-passed PR itself, pinned to the gated head, unless
   // the node is labelled ranger:needs-eye. The close follows on this tick.
-  const needsEye = (await github.issueLabels(repo, Number(row.nodeId), token)).includes(NEEDS_EYE_LABEL);
+  const needsEye = !map.autoMerge && !map.commands.views
+   ? false
+   : (await github.issueLabels(repo, Number(row.nodeId), token)).includes(NEEDS_EYE_LABEL);
   if (map.autoMerge && !needsEye) {
    await github.mergePr(repo, pr.number, gate.headSha, pr.title, token);
    journal.recordEvent("merged", {
@@ -281,20 +284,17 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
      ? `Labelled \`${NEEDS_EYE_LABEL}\`: your eye is the check. Merge it by hand (squash); ranger closes the node after the merge.`
      : "Merge it by hand (squash). For a `propose` node your merge is the ratification. Ranger closes the node after the merge; it never merges itself.",
    ].join("\n");
-  let evidence: ReturnType<typeof viewsCard> | undefined;
-  if (needsEye) {
-   try { evidence = viewsCard(viewsDirectory(journal.path, repo, row.nodeId, gate.headSha), gate.headSha); }
-   catch (error) { evidence = { summary: `Sheet could not be made: ${String(error).slice(-500)}`, files: [] }; }
+  let evidence: Awaited<ReturnType<typeof viewsCard>> | undefined;
+  if (needsEye && map.commands.views) {
+   try { evidence = await viewsCard(viewsDirectory(journal.path, repo, row.nodeId, gate.headSha), gate.headSha); }
+   catch (error) { evidence = { summary: `Sheet could not be made: ${redactViewsReason(String(error), process.env)}`, files: [] }; }
   }
-  const fits = evidence === undefined || content.length + evidence.summary.length + 1 <= 2000;
+  const message = viewsCardMessage(content, evidence);
   const messageId = await post(
-   fits && evidence ? `${content}\n${evidence.summary}` : content,
+   message.content,
    `merge card for #${row.nodeId}`,
-   evidence?.files,
-   !fits && evidence ? [
-    { description: evidence.summary.slice(0, 4096) },
-    ...(evidence.summary.length > 4096 ? [{ description: evidence.summary.slice(4096) }] : []),
-   ] : undefined,
+   message.files,
+   message.embeds,
   );
   journal.updateWorker(row.nodeId, repo, { mergeMessageId: messageId });
   journal.recordEvent("merge-card", { nodeId: row.nodeId, repo, detail: `PR #${pr.number}, message ${messageId}` });

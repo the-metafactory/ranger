@@ -34,7 +34,8 @@ import {
 import { selectForReview } from "./substrate-policy.ts";
 import { workerEnv } from "./worker-env.ts";
 import { saveWorkerLog } from "./worker-log.ts";
-import { captureViews, NEEDS_EYE_LABEL, saveViewsRecord, viewsComment, viewsDirectory, type ViewsDependencies, type ViewsRecord } from "./views.ts";
+import { captureViews, redactViewsReason, saveViewsRecord, viewsComment, viewsDirectory, type ViewsDependencies, type ViewsRecord } from "./views.ts";
+import { NEEDS_EYE_LABEL } from "./labels.ts";
 
 /**
  * The implement lane (design §4 task/build SOP, build-path step 4, node #23).
@@ -160,8 +161,7 @@ export function recordedReviews(
  return out.sort((a, b) => a.round - b.round);
 }
 
-/** A node that needs the principal's eye (or ear): its PR is merged by hand, never by ranger. */
-export { NEEDS_EYE_LABEL } from "./views.ts";
+export { NEEDS_EYE_LABEL } from "./labels.ts";
 
 /** The findings that gate a PR: blockers and majors (principal, 2026-10-03). */
 export function gatingFindings(r: { blockers: number; majors: number }): number {
@@ -543,7 +543,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
  // The run-node awake hold covers this informational capture step too.
  const final = reviews[reviews.length - 1];
  let labels: string[] = [];
- try { labels = await github.issueLabels(repo, Number(nodeId), token); }
+ try { if (map.commands.views) labels = await github.issueLabels(repo, Number(nodeId), token); }
  catch (error) {
   journal.recordEvent("reviewed", { nodeId, repo, detail: `views label lookup failed (informational): ${String(error).slice(-500)}` });
  }
@@ -557,15 +557,16 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
     env: workerEnv(config, repo), dependencies: ctx.viewsDependencies,
    });
   } catch (error) {
-   record = { sha: final.sha, status: "failed", reason: String(error).slice(-1000) };
+   record = { sha: final.sha, status: "failed", reason: redactViewsReason(String(error), workerEnv(config, repo)) };
    try { saveViewsRecord(viewsDirectory(journal.path, repo, nodeId, final.sha), record); } catch { /* best effort */ }
   }
   if (record !== undefined) {
    fence("post the views record");
    try {
     const comments = await github.listComments(repo, open.number, token);
-    if (!comments.some(c => c.author === botIdentity && c.body.includes(`<!-- ranger:views sha=${final.sha} -->`))) {
-     await github.postComment(repo, open.number, viewsComment(record, viewsDirectory(journal.path, repo, nodeId, final.sha)), token);
+    const body = viewsComment(record, viewsDirectory(journal.path, repo, nodeId, final.sha));
+    if (!comments.some(c => c.author === botIdentity && c.body === body)) {
+     await github.postComment(repo, open.number, body, token);
     }
    } catch (error) {
     journal.recordEvent("reviewed", { nodeId, repo, detail: `views comment failed (informational): ${String(error).slice(-500)}` });

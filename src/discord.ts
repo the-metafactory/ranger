@@ -117,7 +117,8 @@ interface DiscordHttpResult {
 }
 
 export const DISCORD_MAX_FILES = 10;
-// Conservative file limit; leave room below the 25 MiB request limit for multipart metadata.
+// Ranger caps files at 10 MiB and reserves room for multipart metadata.
+// https://docs.discord.com/developers/resources/message#create-message (25 MiB request cap)
 export const DISCORD_MAX_FILE_BYTES = 10 * 1024 * 1024;
 export const DISCORD_MAX_FILES_BYTES = 24 * 1024 * 1024;
 export interface DiscordFile {
@@ -512,9 +513,6 @@ export class EscalationDiscord {
     return true;
   }
 }
-
-/** The shared card transport, including multipart uploads and retry handling. */
-export { EscalationDiscord as DiscordClient };
 
 export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));

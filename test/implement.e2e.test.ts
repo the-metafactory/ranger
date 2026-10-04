@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import {
  copyFileSync,
  existsSync,
@@ -22,6 +22,7 @@ import { sweepMap } from "../src/sweep.ts";
 import { runNode, type RunNodeContext } from "../src/worker.ts";
 import { baseConfigLines, createCanonicalRepo, GIT_ENV } from "./support.ts";
 import { viewsDirectory } from "../src/views.ts";
+import { DiscordAnnouncer } from "../src/announce.ts";
 
 const fixturesBin = join(import.meta.dir, "fixtures", "bin");
 const dataDir = join(import.meta.dir, "fixtures", "data");
@@ -871,6 +872,27 @@ describe("implement lane (node #23)", () => {
   expect(r.github.merges).toEqual([]);
  }, 60_000);
 
+ test("unconfigured manual map posts its card without a label read or views evidence", async () => {
+  const r = await rig({});
+  cleanup.push(r.dir);
+  r.github.labels.set(20, ["ranger:needs-eye"]);
+  r.github.issueLabels = async () => { throw new Error("unconfigured map must not read labels"); };
+  r.ctx.viewsDependencies = {
+   run: async () => { throw new Error("must not capture"); },
+  };
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  expect((r.github.comments.get(1) ?? []).some(c => c.body.includes("ranger:views"))).toBe(false);
+  const posts: string[] = [];
+  const tick = await sweepMap({
+   config: r.ctx.config, journal: r.journal, map: r.ctx.map, token: "ghp_write", botIdentity: BOT, github: r.github,
+   post: async content => { posts.push(content); return "unconfigured-card"; },
+   respawn: async () => DEAD_PID,
+  });
+  expect(tick.mergeDesk?.cards).toEqual(["20"]);
+  expect(tick.mergeDesk?.errors).toEqual([]);
+  expect(posts[0]).not.toContain("Sheet could not be made");
+ }, 60_000);
+
  test("needs-eye evidence captures after probes and reaches the card in most-changed pairs with full PR table", async () => {
   const r = await rig({ probe: "fake-probe ok {node}" });
   cleanup.push(r.dir);
@@ -921,6 +943,25 @@ describe("implement lane (node #23)", () => {
   expect(tick.mergeDesk?.cards).toEqual(["20"]);
   expect(posts[0].names).toEqual(["station-before.png", "station-after.png", "hull-before.png", "hull-after.png"]);
   expect(posts[0].content).toContain("sky (within control noise)");
+
+  r.journal.updateWorker("20", r.ctx.map.repo, { mergeMessageId: null });
+  const announcer = new DiscordAnnouncer("fake-token", "channel");
+  const fromMap = spyOn(DiscordAnnouncer, "fromMap").mockReturnValue(announcer);
+  const post = spyOn(announcer, "post").mockResolvedValue("announcer-card");
+  try {
+   const next = await sweepMap({
+    config: r.ctx.config, journal: r.journal, map: r.ctx.map, token: "ghp_write", botIdentity: BOT, github: r.github,
+    respawn: async () => DEAD_PID,
+   });
+   expect(next.mergeDesk?.cards).toEqual(["20"]);
+   expect(post).toHaveBeenCalledTimes(1);
+   const [, label, files] = post.mock.calls[0];
+   expect(label).toBe("merge card for #20");
+   expect(files?.map(f => f.name)).toEqual(posts[0].names);
+  } finally {
+   post.mockRestore();
+   fromMap.mockRestore();
+  }
  }, 60_000);
 
  test("configured views do nothing on a non-needs-eye node or after failed probes", async () => {

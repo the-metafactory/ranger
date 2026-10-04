@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "../src/config.ts";
-import { captureViews, chooseViews, compareViews, fillViewsTemplate, freeViewsPort, loadViewsRecord, parseViewsDiff, saveViewsRecord, startViewsServer, viewsCard, viewsComment, viewsDirectory, type CaptureViewsContext, type ViewsDependencies } from "../src/views.ts";
+import { captureViews, chooseViews, compareViews, fillViewsTemplate, freeViewsPort, loadViewsRecord, parseViewsDiff, redactViewsReason, saveViewsRecord, startViewsServer, viewsCard, viewsCardMessage, viewsComment, viewsDirectory, type CaptureViewsContext, type ViewsDependencies } from "../src/views.ts";
 import { pidAlive, processGroupCommands } from "../src/exec.ts";
 import { baseConfigLines } from "./support.ts";
 
@@ -116,6 +116,57 @@ describe("diff selection", () => {
 });
 
 describe("capture orchestration", () => {
+ test("unconfigured needs-eye map does not run or persist failure evidence", async () => {
+  const r = rig();
+  r.ctx.map.commands.views = undefined;
+  expect(await captureViews(r.ctx)).toBeUndefined();
+  expect(r.calls).toEqual([]);
+  expect(existsSync(r.out)).toBe(false);
+ });
+ test("failed preflight retries on the same SHA once probes pass", async () => {
+  const r = rig();
+  r.ctx.probePassed = false;
+  expect(await captureViews(r.ctx)).toMatchObject({ status: "failed" });
+  r.ctx.probePassed = true;
+  expect(await captureViews(r.ctx)).toMatchObject({ status: "ok" });
+  expect(loadViewsRecord(r.out, SHA)).toMatchObject({ status: "ok" });
+  expect(r.servers).toHaveLength(2);
+ });
+ test("transient capture failure retries, removing partial frames before recapture", async () => {
+  const r = rig();
+  const run = r.ctx.dependencies!.run!;
+  r.ctx.dependencies!.run = async (bin, args, opts) => {
+   const result = await run(bin, args, opts);
+   if (args[1].startsWith("capture 'after2'")) {
+    writeFileSync(join(r.out, "after2", "partial.png"), "stale");
+    return { code: -1, stdout: "", stderr: "transient timeout" };
+   }
+   return result;
+  };
+  expect(await captureViews(r.ctx)).toMatchObject({ status: "failed" });
+  expect(existsSync(join(r.out, "after2", "partial.png"))).toBe(true);
+  r.ctx.dependencies!.run = run;
+  expect(await captureViews(r.ctx)).toMatchObject({ status: "ok" });
+  expect(existsSync(join(r.out, "after2", "partial.png"))).toBe(false);
+  expect(r.servers).toHaveLength(4);
+  expect(r.servers.every(s => s.stopped)).toBe(true);
+ });
+ test("command secrets are redacted before persistence, PR comment and card", async () => {
+  const r = rig();
+  const secret = "worker-secret-value";
+  const token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+  r.ctx.env.API_KEY = secret;
+  r.ctx.dependencies!.run = async () => ({ code: 1, stdout: token, stderr: `install refused ${secret}\n` });
+  const record = await captureViews(r.ctx);
+  expect(record).toMatchObject({ status: "failed" });
+  const published = [readFileSync(join(r.out, "ranger-views.json"), "utf8"), viewsComment(record!, r.out), (await viewsCard(r.out, SHA)).summary];
+  for (const text of published) {
+   expect(text).not.toContain(secret);
+   expect(text).not.toContain(token);
+   expect(text).toContain("[redacted]");
+  }
+  expect(redactViewsReason(`refused ${secret}`, { PASSWORD: secret })).toBe("refused [redacted]");
+ });
  test("without needs-eye runs nothing, even with missing configuration", async () => {
   const r = rig();
   r.ctx.labels = [];
@@ -130,7 +181,7 @@ describe("capture orchestration", () => {
   r.ctx.probePassed = false;
   expect(await captureViews(r.ctx)).toMatchObject({ status: "failed", reason: "no passing probe tier on the final head" });
   expect(r.calls).toEqual([]);
-  expect(viewsCard(r.out, SHA).summary).toContain("Sheet could not be made");
+  expect((await viewsCard(r.out, SHA)).summary).toContain("Sheet could not be made");
  });
  test("merge-base detached before, final-head after/control, diff and cleanup, persisted per SHA", async () => {
   const r = rig();
@@ -152,7 +203,7 @@ describe("capture orchestration", () => {
   const before = r.calls.length;
   await captureViews(r.ctx);
   expect(r.calls).toHaveLength(before); // resume uses only this head's evidence
-  const card = viewsCard(r.out, SHA);
+  const card = await viewsCard(r.out, SHA);
   expect(card.files.map(f => f.name)).toEqual(["hull-before.png", "hull-after.png"]);
   expect(card.summary).toContain("sky (within control noise)");
   expect(viewsComment(record!, r.out)).toContain(`<!-- ranger:views sha=${SHA} -->`);
@@ -164,8 +215,8 @@ describe("capture orchestration", () => {
   r.ctx.dependencies!.run = async () => ({ code, stdout: "", stderr: "software renderer refused" });
   const record = await captureViews(r.ctx);
   expect(record).toMatchObject({ status: "failed" });
-  expect(viewsCard(r.out, SHA).summary).toContain("software renderer refused");
-  if (code === -1) expect(viewsCard(r.out, SHA).summary).toContain("timed out");
+  expect((await viewsCard(r.out, SHA)).summary).toContain("software renderer refused");
+  if (code === -1) expect((await viewsCard(r.out, SHA)).summary).toContain("timed out");
   expect(r.servers).toEqual([]); // failed install before any server starts
   expect(r.calls.at(-1)).toStartWith("git worktree remove --force");
  });
@@ -186,7 +237,7 @@ describe("capture orchestration", () => {
   expect(await captureViews(r.ctx)).toMatchObject({ status: "failed" });
   expect(r.servers).toHaveLength(2);
   expect(r.servers.every(s => s.stopped)).toBe(true);
-  expect(viewsCard(r.out, SHA).summary).toContain("after2 capture timed out");
+  expect((await viewsCard(r.out, SHA)).summary).toContain("after2 capture timed out");
  });
  test("server failure is informational and cleans the detached tree", async () => {
   const r = rig();
@@ -214,7 +265,7 @@ describe("capture orchestration", () => {
    for (const row of rows) writeFileSync(join(r.out, label, `${row.view}.png`), "PNG");
   }
   saveViewsRecord(r.out, { sha: SHA, status: "ok", rows });
-  const card = viewsCard(r.out, SHA);
+  const card = await viewsCard(r.out, SHA);
   expect(card.summary.length).toBeLessThan(2000);
   expect(card.files).toHaveLength(9); // four intact pairs and the full text
   expect(card.files.at(-1)?.name).toBe("views-summary.txt");
@@ -237,6 +288,18 @@ describe("capture orchestration", () => {
    };
    expect(await captureViews(r.ctx)).toMatchObject({ status: "failed" });
   }
+ });
+});
+
+describe("card message fitting", () => {
+ test("keeps small summaries in content and longer summaries within embed limits", () => {
+  expect(viewsCardMessage("card")).toEqual({ content: "card" });
+  expect(viewsCardMessage("card", { summary: "diff", files: [] })).toEqual({ content: "card\ndiff", files: [] });
+  const summary = "s".repeat(6000);
+  const card = viewsCardMessage("card", { summary, files: [] });
+  expect(card.content).toBe("card");
+  expect(card.embeds?.map(e => e.description.length)).toEqual([4096, 1904]);
+  expect(card.embeds?.map(e => e.description).join("")).toBe(summary);
  });
 });
 

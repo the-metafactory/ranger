@@ -6,8 +6,9 @@ import type { RangerMapConfig } from "./config.ts";
 import { DISCORD_MAX_FILES, DISCORD_MAX_FILE_BYTES, DISCORD_MAX_FILES_BYTES, type DiscordFile, sleep } from "./discord.ts";
 import { killProcessGroup, runCmd, type RunResult } from "./exec.ts";
 import { safeGit } from "./git-ops.ts";
+import { NEEDS_EYE_LABEL } from "./labels.ts";
+import { readFile } from "node:fs/promises";
 
-export const NEEDS_EYE_LABEL = "ranger:needs-eye";
 const VIEW_NAME = /^[\w-]+$/;
 const SHA = /^[a-f0-9]{40,64}$/;
 const TIMEOUT_MS = 30 * 60_000;
@@ -21,6 +22,7 @@ export function fillViewsTemplate(template: string, values: Record<string, strin
 }
 
 export interface ViewDiff { view: string; change: number; noise: number }
+export const byMostChanged = (a: ViewDiff, b: ViewDiff): number => b.change - a.change || a.view.localeCompare(b.view);
 export type ViewsRecord =
  | { sha: string; status: "ok"; rows: ViewDiff[] }
  | { sha: string; status: "failed"; reason: string };
@@ -72,7 +74,7 @@ export function chooseViews(
  const attached: ViewDiff[] = [];
  const omitted: ViewsSelection["omitted"] = [];
  let bytes = 0;
- for (const row of [...rows].sort((a, b) => b.change - a.change || a.view.localeCompare(b.view))) {
+ for (const row of [...rows].sort(byMostChanged)) {
   if (row.change <= row.noise) {
    omitted.push({ view: row.view, reason: "within control noise" });
    continue;
@@ -138,7 +140,17 @@ function pngSize(out: string, label: string, view: string): number {
  return stat.size;
 }
 
-export function viewsCard(out: string, sha: string): { summary: string; files: DiscordFile[] } {
+function verifyCaptureSet(out: string, rows: readonly ViewDiff[]): void {
+ const expected = rows.map(r => `${r.view}.png`).sort().join("\n");
+ for (const label of ["before", "after", "after2"]) {
+  const names = readdirSync(join(out, label)).filter(n => n.endsWith(".png")).sort();
+  if (names.join("\n") !== expected) throw new Error(`${label} PNGs differ from the diff view set`);
+  for (const row of rows) pngSize(out, label, row.view);
+ }
+ if (!existsSync(join(out, "index.html"))) throw new Error("capture did not write index.html");
+}
+
+export async function viewsCard(out: string, sha: string): Promise<{ summary: string; files: DiscordFile[] }> {
  const record = loadViewsRecord(out, sha);
  if (record === undefined) return { summary: "Sheet could not be made: no capture record for this head.", files: [] };
  if (record.status === "failed") return { summary: `Sheet could not be made: ${record.reason}`, files: [] };
@@ -146,7 +158,7 @@ export function viewsCard(out: string, sha: string): { summary: string; files: D
  let selection = chooseViews(record.rows, sizes);
  const summaryFor = (selected: ViewsSelection) => [
   "Visual evidence: before → after; after → after2 is the same-build noise control. Your eye is the gate.",
-  ...[...record.rows].sort((a, b) => b.change - a.change).map(r => `${r.view}: ${r.change.toFixed(2)}% (noise ${r.noise.toFixed(2)}%)`),
+  ...[...record.rows].sort(byMostChanged).map(r => `${r.view}: ${r.change.toFixed(2)}% (noise ${r.noise.toFixed(2)}%)`),
   `Attached pairs: ${selected.attached.map(r => r.view).join(", ") || "none"}.`,
   `Left out: ${selected.omitted.map(r => `${r.view} (${r.reason})`).join(", ") || "none"}.`,
   `Full sheet: ${join(out, "index.html")}`,
@@ -161,13 +173,41 @@ export function viewsCard(out: string, sha: string): { summary: string; files: D
   summaryFile = { name: "views-summary.txt", data: new Blob([full], { type: "text/plain" }) };
   summary = `Visual evidence: ${selection.attached.length} before/after pairs above the same-build noise floor. Full diff and every left-out view are named in views-summary.txt and the PR comment. Your eye is the gate.\nFull sheet: ${join(out, "index.html")}`;
  }
- const files: DiscordFile[] = selection.attached.flatMap(row => ["before", "after"].map(label => ({
+ const files: DiscordFile[] = await Promise.all(selection.attached.flatMap(row => ["before", "after"].map(async label => ({
   name: `${row.view}-${label}.png`,
   description: `${row.view}: ${label}`,
-  data: new Blob([readFileSync(join(out, label, `${row.view}.png`))], { type: "image/png" }),
- })));
+  data: new Blob([await readFile(join(out, label, `${row.view}.png`))], { type: "image/png" }),
+ }))));
  if (summaryFile !== undefined) files.push(summaryFile);
  return { summary, files };
+}
+
+export function viewsCardMessage(content: string, evidence?: Awaited<ReturnType<typeof viewsCard>>): {
+ content: string; files?: DiscordFile[]; embeds?: { description: string }[];
+} {
+ if (evidence === undefined) return { content };
+ if (content.length + evidence.summary.length + 1 <= 2000) {
+  return { content: `${content}\n${evidence.summary}`, files: evidence.files };
+ }
+ return {
+  content, files: evidence.files,
+  embeds: [
+   { description: evidence.summary.slice(0, 4096) },
+   ...(evidence.summary.length > 4096 ? [{ description: evidence.summary.slice(4096) }] : []),
+  ],
+ };
+}
+
+export function redactViewsReason(reason: string, env: NodeJS.ProcessEnv): string {
+ for (const [key, value] of Object.entries(env)) {
+  if (value && /token|secret|password|passwd|credential|api_?key|private_?key/i.test(key)) {
+   reason = reason.replaceAll(value, "[redacted]");
+  }
+ }
+ return reason
+  .replace(/\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]{20,})\b/g, "[redacted]")
+  .replace(/\b(?:mfa\.[\w-]{20,}|[\w-]{24,}\.[\w-]{6}\.[\w-]{27,})\b/g, "[redacted]")
+  .slice(-1000);
 }
 
 export interface ViewsServer { stop(): Promise<void> }
@@ -200,7 +240,7 @@ export async function startViewsServer(command: string, cwd: string, env: NodeJS
   child.once("close", () => { closed = true; resolveDone(); });
  });
  child.once("error", e => { error = e; });
- const read = (data: Buffer) => { diagnostic = (diagnostic + data.toString()).slice(-1000); };
+ const read = (data: Buffer) => { diagnostic = redactViewsReason(diagnostic + data.toString(), env); };
  child.stdout?.on("data", read);
  child.stderr?.on("data", read);
  const server: ViewsServer = { stop: async () => {
@@ -239,23 +279,23 @@ export interface CaptureViewsContext {
 
 /** Called inside run-node's existing awake hold, after the final-head probe tier. */
 export async function captureViews(ctx: CaptureViewsContext): Promise<ViewsRecord | undefined> {
- if (!ctx.labels.includes(NEEDS_EYE_LABEL)) return undefined;
+ if (!ctx.labels.includes(NEEDS_EYE_LABEL) || !ctx.map.commands.views) return undefined;
  const { map, sha, dependencies: deps = {} } = ctx;
  const out = viewsDirectory(ctx.journalPath, map.repo, ctx.nodeId, sha);
  const cached = loadViewsRecord(out, sha);
- if (cached !== undefined) return cached;
+ if (cached?.status === "ok") return cached;
  const run = deps.run ?? runCmd;
  const git = deps.git ?? safeGit;
  const shell = async (command: string, cwd: string, step: string, origin?: string): Promise<string> => {
   const result: RunResult = await run("/bin/sh", ["-c", command], {
    cwd, env: { ...ctx.env, ...(origin ? { PROBE_ORIGIN: origin } : {}) }, timeoutMs: TIMEOUT_MS, processGroup: true,
   });
-  if (result.code !== 0) throw new Error(`${step} ${result.code === -1 ? "timed out or was killed" : `failed (exit ${result.code})`}: ${(result.stderr + result.stdout).slice(-1000)}`);
+  if (result.code !== 0) throw new Error(`${step} ${result.code === -1 ? "timed out or was killed" : `failed (exit ${result.code})`}: ${result.stderr + result.stdout}`);
   return result.stdout;
  };
  const checkedGit = async (args: string[]): Promise<string> => {
   const result = await git(args, { cwd: ctx.worktree });
-  if (result.code !== 0) throw new Error(`views git ${args[0]} failed: ${result.stderr.slice(-1000)}`);
+  if (result.code !== 0) throw new Error(`views git ${args[0]} failed: ${redactViewsReason(result.stderr, ctx.env)}`);
   return result.stdout.trim();
  };
  let scratch: string | undefined;
@@ -288,15 +328,10 @@ export async function captureViews(ctx: CaptureViewsContext): Promise<ViewsRecor
   if (await checkedGit(["rev-parse", "HEAD"]) !== sha) throw new Error("head moved during capture");
   const diff = async (a: string, b: string) => parseViewsDiff(await shell(fillViewsTemplate(map.commands.viewsDiff!, { out, a, b }), ctx.worktree, `${a} → ${b} diff`));
   const rows = compareViews(await diff("before", "after"), await diff("after", "after2"));
-  for (const label of ["before", "after", "after2"]) {
-   const names = readdirSync(join(out, label)).filter(n => n.endsWith(".png")).sort();
-   if (names.join("\n") !== rows.map(r => `${r.view}.png`).sort().join("\n")) throw new Error(`${label} PNGs differ from the diff view set`);
-   for (const row of rows) pngSize(out, label, row.view);
-  }
-  if (!existsSync(join(out, "index.html"))) throw new Error("capture did not write index.html");
+  verifyCaptureSet(out, rows);
   record = { sha, status: "ok", rows };
  } catch (error) {
-  record = { sha, status: "failed", reason: error instanceof Error ? error.message : String(error) };
+  record = { sha, status: "failed", reason: redactViewsReason(error instanceof Error ? error.message : String(error), ctx.env) };
  } finally {
   if (before !== undefined) {
    try { await checkedGit(["worktree", "remove", "--force", before]); } catch { /* best-effort after an incomplete add */ }
