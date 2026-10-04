@@ -3,6 +3,22 @@
 # FAKE_SAGE_MODE (via the allow-listed SAGE_ prefix: SAGE_FAKE_MODE) selects
 # changes-requested (exit 1, like real sage), approved (exit 0) or crash (exit 1, no block).
 set -euo pipefail
+# Accept only the argv real sage's `review` takes from ranger (sage 0.2.12,
+# a4f12c9, src/cli/index.ts: `--emit-verdict-block`, `--substrate <name>`
+# with {pi|claude|codex}); anything else fails like commander's usage error.
+if [ "${1:-}" != "review" ] || [ $# -lt 2 ]; then echo "error: usage: sage review <ref>" >&2; exit 2; fi
+shift 2
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --emit-verdict-block) shift ;;
+    --substrate)
+      case "${2:-}" in
+        pi|claude|codex) shift 2 ;;
+        *) echo "error: unknown substrate '${2:-}'" >&2; exit 2 ;;
+      esac ;;
+    *) echo "error: unknown option '$1'" >&2; exit 2 ;;
+  esac
+done
 mode="${SAGE_FAKE_MODE:-approved}"
 if [ "$mode" = "crash" ]; then echo "[sage] substrate failed" >&2; exit 1; fi
 verdict="approved"; blockers=0

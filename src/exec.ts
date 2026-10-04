@@ -4,6 +4,23 @@ export interface RunResult {
   code: number;
   stdout: string;
   stderr: string;
+  /**
+   * With `keepStdoutLine`: the last unfiltered stdout lines (each cut to a
+   * bounded length), so a run that dies before its signal lines still leaves
+   * diagnostics.
+   */
+  stdoutTail?: string;
+}
+
+/** Stdout tail kept beside a filtered stream: lines, and characters per line. */
+const TAIL_LINES = 50;
+const TAIL_LINE_CHARS = 2_000;
+
+/** Split complete lines off a buffer; the trailing partial line is `rest`. */
+export function splitLines(buffer: string): { lines: string[]; rest: string } {
+  const lines = buffer.split("\n");
+  const rest = lines.pop() ?? "";
+  return { lines, rest };
 }
 
 export interface RunOptions {
@@ -20,6 +37,11 @@ export interface RunOptions {
   processGroup?: boolean;
   /** Called with the child's PID once it has spawned (the group id when `processGroup`). */
   onSpawn?: (pid: number) => void;
+  /**
+   * Keep only the stdout lines this accepts, filtered as they stream: a long
+   * verbose stream (Claude stream-json) is never held whole in memory.
+   */
+  keepStdoutLine?: (line: string) => boolean;
 }
 
 /**
@@ -42,8 +64,29 @@ export function runCmd(
     if (child.pid !== undefined) opts.onSpawn?.(child.pid);
     let stdout = "";
     let stderr = "";
+    const keep = opts.keepStdoutLine;
+    // A partial line accumulates as chunks and is joined once its newline
+    // arrives: a multi-MB stream line is never re-copied per chunk.
+    let partial: string[] = [];
+    const tail: string[] = [];
+    const keepLine = (line: string) => {
+      if (keep?.(line)) stdout += `${line}\n`;
+      tail.push(line.length > TAIL_LINE_CHARS ? `${line.slice(0, TAIL_LINE_CHARS)}…` : line);
+      if (tail.length > TAIL_LINES) tail.shift();
+    };
     child.stdout.on("data", (chunk) => {
-      stdout += chunk.toString();
+      const text = chunk.toString();
+      if (keep === undefined) {
+        stdout += text;
+        return;
+      }
+      if (!text.includes("\n")) {
+        partial.push(text);
+        return;
+      }
+      const { lines, rest } = splitLines(partial.join("") + text);
+      partial = rest.length > 0 ? [rest] : [];
+      for (const line of lines) keepLine(line);
     });
     child.stderr.on("data", (chunk) => {
       stderr += chunk.toString();
@@ -64,7 +107,12 @@ export function runCmd(
     });
     child.on("close", (code) => {
       if (timer) clearTimeout(timer);
-      resolvePromise({ code: code ?? -1, stdout, stderr });
+      if (keep === undefined) {
+        resolvePromise({ code: code ?? -1, stdout, stderr });
+        return;
+      }
+      if (partial.length > 0) keepLine(partial.join(""));
+      resolvePromise({ code: code ?? -1, stdout, stderr, stdoutTail: tail.join("\n") });
     });
   });
 }

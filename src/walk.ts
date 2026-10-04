@@ -272,6 +272,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
       mergeMessageId: null,
       outcome: null,
       finishedAt: null,
+      substrate: null,
      });
      const pid = await (ctx.spawnRunNode ?? spawnRunNodeDetached)({
       nodeId: node.id,

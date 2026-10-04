@@ -208,6 +208,28 @@ const WorkersSchema = z.object({
  reviewRounds: z.number().int().positive().default(2),
 });
 
+const PiSubstrateSchema = z.object({
+ provider: z.string().min(1).default("spark"),
+ model: z.string().min(1).default("longctx-think"),
+});
+
+/**
+ * Substrate selection (node #45): which of Claude, Codex and Pi runs an
+ * implement session, fix pass or sage review, by remaining 5h/7d quota.
+ */
+const SubstratesSchema = z.object({
+ /** 5-hour window: eligible when used% < this (default 70). */
+ fiveHourMaxUsedPct: z.number().min(0).max(100).default(70),
+ /** 7-day window: eligible when used% < this (default 80). */
+ sevenDayMaxUsedPct: z.number().min(0).max(100).default(80),
+ /** Claude probe reading max age, minutes (default 15). */
+ claudeProbeMaxAgeMin: z.number().int().positive().default(15),
+ /** Codex reading max age, minutes (default 5). */
+ codexReadMaxAgeMin: z.number().int().positive().default(5),
+ /** Pi substrate configuration. */
+ pi: PiSubstrateSchema.default({}),
+});
+
 /**
  * The GitHub budget (src/budget.ts). Ranger's read-only PATs draw on the
  * principal's own GraphQL allowance, so ranger yields well before it is spent.
@@ -233,6 +255,7 @@ const RangerConfigSchema = z.object({
  state: StateSchema.default({}),
  workers: WorkersSchema.default({}),
  budget: BudgetSchema.default({}),
+ substrates: SubstratesSchema.default({}),
  serve: ServeSchema.optional(),
 });
 

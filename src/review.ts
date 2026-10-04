@@ -1,3 +1,4 @@
+import type { SubstrateName } from "./store/schema.ts";
 import { runReadRetryingTransient } from "./transient.ts";
 import { gatedEnv } from "./token-gate.ts";
 import { workerHostEnv } from "./worker-env.ts";
@@ -39,13 +40,20 @@ export async function sageReview(
  repo: string,
  prNumber: number,
  readOnlyToken: string,
- opts: { command?: string; timeoutMs?: number } = {},
+ opts: { command?: string; timeoutMs?: number; substrate?: SubstrateName } = {},
 ): Promise<ReviewVerdict> {
  const gated = gatedEnv(readOnlyToken, {}, workerHostEnv());
  try {
+  const args = ["review", `${repo}#${prNumber}`, "--emit-verdict-block"];
+  // The cross-model choice. Checked against sage 0.2.12 (a4f12c9,
+  // src/cli/index.ts): `review` takes `--substrate <name>` with
+  // {pi|claude|codex}; without it sage falls back to SAGE_SUBSTRATE / config.
+  // A sage that rejects the flag fails here as an ordinary ReviewError
+  // carrying its stderr, never as a cap (confirmCap reads the quota, not text).
+  if (opts.substrate !== undefined) args.push("--substrate", opts.substrate);
   const result = await runReadRetryingTransient(
    opts.command ?? process.env.RANGER_SAGE_CMD ?? "sage",
-   ["review", `${repo}#${prNumber}`, "--emit-verdict-block"],
+   args,
    {
     env: gated.env,
     timeoutMs: opts.timeoutMs ?? REVIEW_TIMEOUT_MS,

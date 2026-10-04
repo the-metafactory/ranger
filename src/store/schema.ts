@@ -6,6 +6,10 @@ import {
  text,
 } from "drizzle-orm/sqlite-core";
 
+/** The substrates a worker session or review runs on (node #45). */
+export const SUBSTRATE_NAMES = ["claude", "codex", "pi"] as const;
+export type SubstrateName = (typeof SUBSTRATE_NAMES)[number];
+
 /**
  * Ranger journal schema (design §8) — SQLite at `~/.config/ranger/state.sqlite`.
  *
@@ -33,6 +37,8 @@ export const workers = sqliteTable("workers", {
  messageId: text("message_id"),
  /** research | implement — the §3 lane the node was claimed into. */
  lane: text("lane"),
+ /** The substrate the worker session ran on (claude | codex | pi). */
+ substrate: text("substrate", { enum: SUBSTRATE_NAMES }),
  /**
   * Occupant generation (the OpenRig occupant-generation pattern, #23
   * amendment): bumped by every run-node start. A supervisor re-checks its
@@ -154,4 +160,46 @@ export const escalationDestinations = sqliteTable(
   createdAt: text("created_at").notNull(),
  },
  (table) => [primaryKey({ columns: [table.key, table.channelId] })],
+);
+
+/**
+ * Substrate quota readings (node #45): one row per substrate, upserted on
+ * every read. `ranger serve` and successive ticks share them through SQLite.
+ */
+export const substrateReadings = sqliteTable("substrate_readings", {
+ /** claude | codex | pi */
+ substrate: text("substrate", { enum: SUBSTRATE_NAMES }).primaryKey(),
+ /** ISO timestamp of the reading. */
+ readAt: text("read_at").notNull(),
+ /** 5-hour window usage percent (0–100), null when the substrate doesn't report one. */
+ fiveHourUsedPct: integer("five_hour_used_pct"),
+ /** 7-day window usage percent (0–100), null when the substrate doesn't report one. */
+ sevenDayUsedPct: integer("seven_day_used_pct"),
+ /** ISO timestamp: the earliest resetsAt across reported windows. */
+ resetsAt: text("resets_at"),
+ /** True when the substrate is capped (rate limit hit). */
+ capped: integer("capped", { mode: "boolean" }).notNull().default(false),
+ /** ISO timestamp: capped until this time (from the substrate's own resetsAt). */
+ cappedUntil: text("capped_until"),
+});
+
+/**
+ * Which substrate wrote each pushed SHA (node #45), keyed per repo: review
+ * selection reads the PR head's author here. An unknown SHA counts as
+ * Pi-written. Rows past the retention window are pruned on write.
+ */
+export const headSubstrates = sqliteTable(
+ "head_substrates",
+ {
+  repo: text("repo").notNull(),
+  sha: text("sha").notNull(),
+  nodeId: text("node_id").notNull(),
+  /** claude | codex | pi */
+  substrate: text("substrate", { enum: SUBSTRATE_NAMES }).notNull(),
+  recordedAt: text("recorded_at").notNull(),
+ },
+ (table) => [
+  primaryKey({ columns: [table.repo, table.sha] }),
+  index("head_substrates_recorded_at_idx").on(table.recordedAt),
+ ],
 );

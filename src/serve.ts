@@ -40,6 +40,15 @@ import { cachedFrontier } from "./frontier-cache.ts";
 import { type FrontierEntry, graphFrontier, RateLimitError } from "./graph.ts";
 import { runCmd } from "./exec.ts";
 import { classify, type ClassifiedNode, loadProbeRegistry } from "./route.ts";
+import type { SubstrateReading } from "./journal.ts";
+import {
+ activeCappedUntil,
+ isCappedAt,
+ isEligible,
+ isFresh,
+ readingAgeMin,
+ type SubstrateConfig,
+} from "./substrate-policy.ts";
 import { assertReadOnlyToken, gatedEnv } from "./token-gate.ts";
 
 const ID_PATTERN = /^\d+$/;
@@ -143,6 +152,8 @@ export interface StateInputs {
  refreshing: boolean;
  refreshError: string | null;
  now: Date;
+ /** Latest substrate quota readings, as the panel shows them (node #45). */
+ substrates?: SubstrateView[];
 }
 
 export interface CurrentJob {
@@ -199,6 +210,49 @@ export interface DashboardMap {
  grillings: GrillingView[];
 }
 
+/**
+ * A substrate's latest quota reading, as the panel shows it (node #45): the
+ * cap and eligibility state are derived here with the selector's own rules,
+ * so the dashboard never re-derives them and the storage row stays private.
+ */
+export interface SubstrateView {
+ substrate: SubstrateReading["substrate"];
+ fiveHourUsedPct: number | null;
+ sevenDayUsedPct: number | null;
+ /** ISO: the earliest reported window reset. */
+ resetsAt: string | null;
+ readAt: string;
+ /** Minutes since the reading. */
+ ageMin: number;
+ /** Within its max age: a stale reading is ineligible (fail closed). */
+ fresh: boolean;
+ /** Capped now (by status or a future capped-until). */
+ capped: boolean;
+ /** ISO, only while still in the future. */
+ cappedUntil: string | null;
+ /** Selectable for the next session right now. */
+ eligible: boolean;
+}
+
+export function substrateViews(
+ readings: SubstrateReading[],
+ config: SubstrateConfig,
+ now: Date,
+): SubstrateView[] {
+ return readings.map((r) => ({
+  substrate: r.substrate,
+  fiveHourUsedPct: r.fiveHourUsedPct,
+  sevenDayUsedPct: r.sevenDayUsedPct,
+  resetsAt: r.resetsAt,
+  readAt: r.readAt,
+  ageMin: readingAgeMin(r, now),
+  fresh: isFresh(r, config, now),
+  capped: isCappedAt(r, now),
+  cappedUntil: activeCappedUntil(r, now),
+  eligible: isEligible(r, config, now) !== null,
+ }));
+}
+
 export interface DashboardState {
  generatedAt: string;
  refreshing: boolean;
@@ -211,6 +265,7 @@ export interface DashboardState {
  };
  current: CurrentJob[];
  maps: DashboardMap[];
+ substrates: SubstrateView[];
 }
 
 const IN_FLIGHT = new Set<WorkerRow["status"]>(["claimed", "running", "awaiting-merge"]);
@@ -382,6 +437,7 @@ export function assembleState(inputs: StateInputs): DashboardState {
   },
   current,
   maps,
+  substrates: inputs.substrates ?? [],
  };
 }
 
@@ -611,6 +667,7 @@ button:disabled { opacity:.45; cursor:default; }
 <div id="msg"></div>
 <main>
 <section><h2>Current job</h2><div id="current"></div></section>
+<section><h2>Substrates</h2><div id="substrates"></div></section>
 <section><h2>Next in queue</h2><div id="next"></div></section>
 <section><h2>Autonomous — ranger can take these</h2><div id="auto"></div></section>
 <section><h2>Open grillings</h2><div id="grill"></div></section>
@@ -675,7 +732,21 @@ function renderGrill(s) {
   box.append(el("ul", {}, ...m.grillings.map((g) => el("li", {}, el("span", { class: "id", text: "#" + g.id }), el("span", { class: "t" }, link(g.url, g.title)), grillButton(m, g)))));
  }
 }
-function render(s) { renderMeta(s); renderCurrent(s); renderNext(s); renderAuto(s); renderGrill(s); }
+function renderSubstrates(s) {
+ const box = document.getElementById("substrates"); box.replaceChildren();
+ if (!s.substrates || s.substrates.length === 0) { box.append(empty("No substrate readings yet.")); return; }
+ box.append(el("ul", {}, ...s.substrates.map((sub) => {
+  const parts = [sub.substrate.toUpperCase()];
+  if (sub.fiveHourUsedPct !== null) parts.push("5h: " + sub.fiveHourUsedPct + "%");
+  if (sub.sevenDayUsedPct !== null) parts.push("7d: " + sub.sevenDayUsedPct + "%");
+  if (sub.resetsAt) parts.push("resets " + new Date(sub.resetsAt).toLocaleString());
+  parts.push("read " + sub.ageMin + "m ago" + (sub.fresh ? "" : " (stale)"));
+  if (sub.capped) parts.push("CAPPED until " + (sub.cappedUntil ? new Date(sub.cappedUntil).toLocaleString() : "next reading"));
+  const state = sub.capped ? "capped" : sub.eligible ? "eligible" : "ineligible";
+  return el("li", {}, el("span", { class: "t", text: parts.join(" · ") }), el("span", { class: sub.eligible ? "tag" : "tag stale", text: state }));
+ })));
+}
+function render(s) { renderMeta(s); renderCurrent(s); renderSubstrates(s); renderNext(s); renderAuto(s); renderGrill(s); }
 async function load() { try { const r = await fetch("/api/state", { cache: "no-store" }); render(await r.json()); } catch (e) { say("Could not read state: " + e.message, true); } }
 document.getElementById("refresh").onclick = async () => { try { await post("/api/refresh"); say("Refreshing the frontier…"); setTimeout(load, 1500); } catch (e) { say(e.message, true); } };
 load(); setInterval(load, 15000);
@@ -912,6 +983,7 @@ export function stateFromJournal(
    refreshing: reader.refreshing,
    refreshError: reader.lastError,
    now,
+   substrates: substrateViews(journal?.listSubstrateReadings() ?? [], config.substrates, now),
   });
   reader.want(
    state.current.filter((j) => j.title === null).map((j) => `${j.repo}#${j.nodeId}`),

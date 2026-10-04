@@ -1,10 +1,13 @@
-import { and, asc, desc, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, lt, or, sql } from "drizzle-orm";
 import { openDb, openDbReadOnly, type RangerDb } from "./store/db.ts";
 import {
  escalations,
  escalationDestinations,
  events,
+ headSubstrates,
  health,
+ substrateReadings,
+ type SubstrateName,
  vetoes,
  workers,
 } from "./store/schema.ts";
@@ -50,6 +53,8 @@ export interface WorkerRow {
  verdictSha: string | null;
  verdictBlockers: number | null;
  mergeMessageId: string | null;
+ /** The substrate the worker ran on (claude | codex | pi). */
+ substrate: SubstrateName | null;
 }
 
 /** Fields a supervisor may update in place on its own row. */
@@ -73,6 +78,16 @@ export interface EventRow {
  repo: string | null;
  kind: string;
  detail: string | null;
+}
+
+export interface SubstrateReading {
+ substrate: SubstrateName;
+ readAt: string;
+ fiveHourUsedPct: number | null;
+ sevenDayUsedPct: number | null;
+ resetsAt: string | null;
+ capped: boolean;
+ cappedUntil: string | null;
 }
 
 export interface EscalationRow {
@@ -120,6 +135,7 @@ export type EventKind =
  | "merge-card"
  | "merged"
  | "orphan-killed"
+ | "substrate-capped"
  | "transient";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -175,6 +191,7 @@ export class Journal {
     verdictSha: row.verdictSha ?? null,
     verdictBlockers: row.verdictBlockers ?? null,
     mergeMessageId: row.mergeMessageId ?? null,
+    substrate: row.substrate ?? null,
    })
    .onConflictDoUpdate({
     target: workers.nodeId,
@@ -196,6 +213,7 @@ export class Journal {
      verdictSha: row.verdictSha,
      verdictBlockers: row.verdictBlockers,
      mergeMessageId: row.mergeMessageId,
+     substrate: row.substrate,
     },
    })
    .run();
@@ -665,6 +683,63 @@ export class Journal {
   return rows.map(hydrateEscalation);
  }
 
+ // ---- substrate readings (node #45) ----
+
+ /** Upsert a substrate quota reading. */
+ upsertSubstrateReading(row: SubstrateReading): void {
+  const { substrate: _key, ...reading } = row;
+  this.db
+   .insert(substrateReadings)
+   .values(row)
+   .onConflictDoUpdate({ target: substrateReadings.substrate, set: reading })
+   .run();
+ }
+
+ /** Get the latest reading for a substrate. */
+ getSubstrateReading(substrate: SubstrateName): SubstrateReading | null {
+  const row = this.db.query.substrateReadings
+   .findFirst({ where: eq(substrateReadings.substrate, substrate) })
+   .sync();
+  return row === undefined ? null : hydrateSubstrateReading(row);
+ }
+
+ /** Get all substrate readings. */
+ listSubstrateReadings(): SubstrateReading[] {
+  return this.db.query.substrateReadings.findMany().sync().map(hydrateSubstrateReading);
+ }
+
+ /** Record which substrate wrote a pushed SHA (review selection reads it back). */
+ recordHeadSubstrate(row: { sha: string; repo: string; nodeId: string; substrate: SubstrateName }): void {
+  const now = new Date();
+  const recordedAt = now.toISOString();
+  this.db
+   .insert(headSubstrates)
+   .values({ ...row, recordedAt })
+   .onConflictDoUpdate({
+    target: [headSubstrates.repo, headSubstrates.sha],
+    set: { substrate: row.substrate, recordedAt },
+   })
+   .run();
+  this.pruneHeadSubstrates(now);
+ }
+
+ /** The substrate that wrote a pushed SHA in a repo, or null when ranger never recorded it. */
+ headSubstrate(repo: string, sha: string): SubstrateName | null {
+  const row = this.db.query.headSubstrates
+   .findFirst({ where: and(eq(headSubstrates.repo, repo), eq(headSubstrates.sha, sha)) })
+   .sync();
+  return row?.substrate ?? null;
+ }
+
+ /**
+  * Drop head records past the retention window: a head that old has long
+  * been reviewed, and an unrecorded head only falls back to Pi-written.
+  */
+ pruneHeadSubstrates(now = new Date(), retentionDays = 30): void {
+  const cutoff = new Date(now.getTime() - retentionDays * DAY_MS).toISOString();
+  this.db.delete(headSubstrates).where(lt(headSubstrates.recordedAt, cutoff)).run();
+ }
+
  /** Prune spawn-ledger keys older than the retention window (keeps health tidy). */
  pruneSpawnLedger(now = new Date(), retentionDays = 30): void {
   const cutoff = dayKey(new Date(now.getTime() - retentionDays * DAY_MS));
@@ -710,6 +785,7 @@ function hydrateWorker(row: {
  verdictSha: string | null;
  verdictBlockers: number | null;
  mergeMessageId: string | null;
+ substrate: SubstrateName | null;
 }): WorkerRow {
  return {
   nodeId: row.nodeId,
@@ -731,6 +807,7 @@ function hydrateWorker(row: {
   verdictSha: row.verdictSha,
   verdictBlockers: row.verdictBlockers,
   mergeMessageId: row.mergeMessageId,
+  substrate: row.substrate,
  };
 }
 
@@ -779,6 +856,26 @@ function hydrateEscalation(row: {
   lastEditedAt: row.lastEditedAt,
   status: row.status as "open" | "closed",
   notedAt: row.notedAt,
+ };
+}
+
+function hydrateSubstrateReading(row: {
+ substrate: SubstrateName;
+ readAt: string;
+ fiveHourUsedPct: number | null;
+ sevenDayUsedPct: number | null;
+ resetsAt: string | null;
+ capped: number | boolean;
+ cappedUntil: string | null;
+}): SubstrateReading {
+ return {
+  substrate: row.substrate,
+  readAt: row.readAt,
+  fiveHourUsedPct: row.fiveHourUsedPct,
+  sevenDayUsedPct: row.sevenDayUsedPct,
+  resetsAt: row.resetsAt,
+  capped: row.capped === true || row.capped === 1,
+  cappedUntil: row.cappedUntil,
  };
 }
 
