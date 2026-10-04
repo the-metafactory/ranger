@@ -1,0 +1,471 @@
+/**
+ * `ranger serve`'s "Needs you" section (node #54): every journal worker row
+ * that ended parked or failed, and every awaiting-merge row labelled
+ * `ranger:needs-eye`, with what the principal can do next — resume, merge,
+ * open a session, open the PR.
+ *
+ * **The reason class is ranger's own reading, never tracker text.** It comes
+ * from the row's outcome, written by the builders in `outcomes.ts`, and from
+ * the node's journal events since the row was last put in motion.
+ *
+ * **Actions stay out of process.** Nothing here writes the journal or the
+ * graph: a resume spawns the existing `ranger resume-node` verb, a merge runs
+ * the principal's own `gh` (the machine account's token and config dropped,
+ * so gh falls back to the keyring), and a session opens iTerm2 the way the
+ * grilling button does. Every action is re-checked against the journal as it
+ * reads when the request arrives, and the spawner is injected so no test runs
+ * `gh`, `osascript` or ranger.
+ */
+import { REPO_PATTERN } from "./config.ts";
+import type { EventRow, WorkerRow } from "./journal.ts";
+import { childEnv, itermArgv, shellQuote } from "./launch.ts";
+import {
+ NEEDS_EYE_LABEL,
+ parseFailedProbes,
+ PROBES_FAILED_OUTCOME,
+ REVIEW_CAP_OUTCOME,
+ SUBSTRATE_CAPPED_OUTCOME,
+} from "./outcomes.ts";
+import { isTransientGitHubError } from "./transient.ts";
+
+const ID_PATTERN = /^\d+$/;
+const SHA_PATTERN = /^[0-9a-f]{40}$/;
+
+// ---- the reason class ----
+
+export type ReasonClass =
+ | "review cap"
+ | "probes failed"
+ | "needs-eye"
+ | "transient"
+ | "substrate capped"
+ | "worker failed"
+ | "other";
+
+export interface Reason {
+ class: ReasonClass;
+ /** One line, built here from ranger's own numbers. */
+ detail: string;
+ /** `probes failed`: the names the run's `FAILED:` line gave. */
+ probes?: string[];
+}
+
+export interface SageRound {
+ round: number;
+ sha: string;
+ blockers: number;
+ majors: number;
+}
+
+export interface ProbeResult {
+ passed: boolean;
+ sha: string;
+}
+
+/** The `reviewed` event the implement lane writes per sage round. */
+const SAGE_EVENT = /^round (\d+) @ ([0-9a-f]{7,40}): [\w-]+, (\d+) blocker\(s\), (\d+) major\(s\)/;
+/** The `reviewed` event the probe tier writes per recorded run. */
+const PROBE_EVENT = /^probes (passed|FAILED) at ([0-9a-f]{7,40})/;
+/** The first probe run's narrowed retry, which names its failures. */
+const PROBE_RETRY_EVENT = /^probe run 1 failed \(exit -?\d+\) — retrying only (.+)$/;
+
+/** The newest sage round in `events` (newest first). */
+export function lastSageRound(events: EventRow[]): SageRound | null {
+ for (const e of events) {
+  if (e.kind !== "reviewed") continue;
+  const m = SAGE_EVENT.exec(e.detail ?? "");
+  if (m !== null) {
+   return { round: Number(m[1]), sha: m[2], blockers: Number(m[3]), majors: Number(m[4]) };
+  }
+ }
+ return null;
+}
+
+/** The newest recorded probe run in `events` (newest first). */
+export function lastProbe(events: EventRow[]): ProbeResult | null {
+ for (const e of events) {
+  if (e.kind !== "reviewed") continue;
+  const m = PROBE_EVENT.exec(e.detail ?? "");
+  if (m !== null) return { passed: m[1] === "passed", sha: m[2] };
+ }
+ return null;
+}
+
+/**
+ * The events since the row was last put in motion — a claim, or an
+ * operator's `resume-node` — newest first. An earlier run's transient error
+ * says nothing about why this one stopped.
+ */
+function sinceMotion(events: EventRow[]): EventRow[] {
+ const out: EventRow[] = [];
+ for (const e of events) {
+  if (e.kind === "claimed") break;
+  if (e.kind === "sweep" && (e.detail ?? "").startsWith("resume-node by operator")) break;
+  out.push(e);
+ }
+ return out;
+}
+
+const firstLine = (text: string): string => text.split("\n")[0].trim();
+
+/**
+ * Why a row needs the principal, by ranger's rules, in this order: the review
+ * cap, failed probes, a substrate limit, a GitHub-side transient error, then
+ * any other failed worker; anything else parked is `other` with the outcome's
+ * first line.
+ */
+export function classifyReason(
+ row: Pick<WorkerRow, "status" | "outcome" | "reviewRound">,
+ events: EventRow[],
+ labels: string[] | null,
+ reviewRounds: number,
+): Reason {
+ if (row.status === "awaiting-merge" && labels?.includes(NEEDS_EYE_LABEL) === true) {
+  return { class: "needs-eye", detail: `labelled ${NEEDS_EYE_LABEL}: your eye is the check, and the merge is yours` };
+ }
+ const outcome = row.outcome ?? "";
+ const recent = sinceMotion(events);
+ if (REVIEW_CAP_OUTCOME.test(outcome)) {
+  const sage = lastSageRound(recent) ?? lastSageRound(events);
+  const round = sage?.round ?? row.reviewRound;
+  return {
+   class: "review cap",
+   detail:
+    sage === null
+     ? `review cap of ${reviewRounds} sage round(s) reached`
+     : `${sage.majors} major(s) and ${sage.blockers} blocker(s) still open after ${round} sage round(s) (cap ${reviewRounds})`,
+  };
+ }
+ if (PROBES_FAILED_OUTCOME.test(outcome) || /^merge gate failed \(probes\)/.test(outcome)) {
+  let probes = parseFailedProbes(outcome);
+  if (probes.length === 0) {
+   const retry = recent
+    .map((e) => (e.kind === "reviewed" ? PROBE_RETRY_EVENT.exec(e.detail ?? "") : null))
+    .find((m) => m !== null);
+   probes = retry?.[1].split(",").map((n) => n.trim()).filter((n) => /^[\w.-]+\.m?js$/.test(n)) ?? [];
+  }
+  return {
+   class: "probes failed",
+   detail: probes.length > 0 ? `failed: ${probes.join(", ")}` : "the run named no failed probes",
+   probes,
+  };
+ }
+ if (SUBSTRATE_CAPPED_OUTCOME.test(outcome)) {
+  return { class: "substrate capped", detail: firstLine(outcome).slice(0, 200) };
+ }
+ if (isTransientGitHubError(outcome) || recent.some((e) => e.kind === "transient")) {
+  return { class: "transient", detail: "a GitHub-side error, not the node's fault: resuming usually clears it" };
+ }
+ if (row.status === "failed") {
+  return { class: "worker failed", detail: firstLine(outcome).slice(0, 200) || "no outcome recorded" };
+ }
+ return { class: "other", detail: firstLine(outcome).slice(0, 200) || "no outcome recorded" };
+}
+
+// ---- the entries ----
+
+/** A PR as the dashboard last read it (REST, under the read-only gate). */
+export interface PrView {
+ number: number;
+ url: string;
+ state: "open" | "closed";
+ merged: boolean;
+ draft: boolean;
+ headSha: string;
+ /** GitHub's mergeability; null while it is still computing. */
+ mergeable: boolean | null;
+ /** Check runs on the head: none yet, still running, any failed, or all green. */
+ ci: "none" | "pending" | "failed" | "green";
+ readAt: string;
+}
+
+const OK_CONCLUSIONS = new Set(["success", "neutral", "skipped"]);
+
+/** The CI state of a head from its check runs, the way the merge gate reads them. */
+export function ciState(runs: { status: string; conclusion: string | null }[]): PrView["ci"] {
+ if (runs.length === 0) return "none";
+ if (runs.some((r) => r.status !== "completed")) return "pending";
+ if (runs.some((r) => !OK_CONCLUSIONS.has(r.conclusion ?? ""))) return "failed";
+ return "green";
+}
+
+/** Why a PR cannot be merged from the dashboard, or null when it can. */
+export function mergeRefusal(pr: PrView | null): string | null {
+ if (pr === null) return "the PR has not been read yet";
+ if (pr.merged) return "the PR is already merged";
+ if (pr.state !== "open") return "the PR is closed";
+ if (pr.draft) return "the PR is a draft: mark it ready first";
+ if (pr.mergeable !== true) return pr.mergeable === null ? "GitHub is still computing mergeability" : "the PR is not mergeable";
+ if (pr.ci !== "green") return `CI is ${pr.ci}`;
+ if (!SHA_PATTERN.test(pr.headSha)) return "the PR head is unknown";
+ return null;
+}
+
+export interface NeedsYouMap {
+ key: string;
+ repo: string;
+ root: number;
+ localCheckout?: string;
+}
+
+export interface NeedsYouEntry {
+ /** The map's `owner/name#root`. */
+ key: string;
+ repo: string;
+ root: number;
+ nodeId: string;
+ title: string | null;
+ url: string;
+ status: "parked" | "failed" | "awaiting-merge";
+ endedAt: string | null;
+ reason: Reason;
+ pr: { number: number; url: string; view: PrView | null } | null;
+ sage: SageRound | null;
+ probe: ProbeResult | null;
+ actions: {
+  resume: boolean;
+  merge: { offered: true; headSha: string } | { offered: false; why: string };
+  session: { offered: true; cwd: string } | { offered: false; why: string };
+ };
+}
+
+export interface NeedsYouInputs {
+ maps: NeedsYouMap[];
+ workers: WorkerRow[];
+ /** A node's events, newest first. */
+ events: (repo: string, nodeId: string) => EventRow[];
+ /** The issue's labels as last read, null when not read yet. */
+ labels: (repo: string, nodeId: string) => string[] | null;
+ prs: (repo: string, pr: number) => PrView | null;
+ titleOf: (repo: string, nodeId: string) => string | null;
+ reviewRounds: number;
+ exists: (path: string) => boolean;
+}
+
+/** The rows that wait on the principal, newest first. */
+export function needsYouEntries(inputs: NeedsYouInputs): NeedsYouEntry[] {
+ const out: NeedsYouEntry[] = [];
+ for (const row of inputs.workers) {
+  const map = inputs.maps.find((m) => m.repo === row.repo && m.root === row.root);
+  if (map === undefined) continue;
+  const labels = inputs.labels(row.repo, row.nodeId);
+  const waiting = row.status === "parked" || row.status === "failed";
+  const needsEye = row.status === "awaiting-merge" && labels?.includes(NEEDS_EYE_LABEL) === true;
+  if (!waiting && !needsEye) continue;
+  const events = inputs.events(row.repo, row.nodeId);
+  const view = row.prNumber === null ? null : inputs.prs(row.repo, row.prNumber);
+  const refused = row.prNumber === null ? "no PR" : mergeRefusal(view);
+  const cwd = [row.worktree, map.localCheckout].find(
+   (p): p is string => typeof p === "string" && p.length > 0 && inputs.exists(p),
+  );
+  out.push({
+   key: map.key,
+   repo: row.repo,
+   root: row.root,
+   nodeId: row.nodeId,
+   title: inputs.titleOf(row.repo, row.nodeId),
+   url: `https://github.com/${row.repo}/issues/${row.nodeId}`,
+   status: row.status as NeedsYouEntry["status"],
+   endedAt: row.finishedAt,
+   reason: classifyReason(row, events, labels, inputs.reviewRounds),
+   pr:
+    row.prNumber === null
+     ? null
+     : { number: row.prNumber, url: view?.url || `https://github.com/${row.repo}/pull/${row.prNumber}`, view },
+   sage: lastSageRound(events),
+   probe: lastProbe(events),
+   actions: {
+    resume: waiting,
+    merge:
+     refused === null && view !== null
+      ? { offered: true, headSha: view.headSha }
+      : { offered: false, why: refused ?? "no PR" },
+    session:
+     cwd === undefined
+      ? { offered: false, why: "neither the node's worktree nor the map's localCheckout exists" }
+      : { offered: true, cwd },
+   },
+  });
+ }
+ return out.sort((a, b) => (b.endedAt ?? "").localeCompare(a.endedAt ?? ""));
+}
+
+// ---- the actions ----
+
+export type ActionKind = "resume" | "merge" | "session";
+
+export interface ActionResult {
+ /** The child's exit code; null when it could not start or timed out. */
+ code: number | null;
+ /** The tail of its stderr (or the spawn error). */
+ stderr: string;
+}
+
+/** Spawns a child and resolves with its exit; injected so tests run nothing. */
+export type ActionRunner = (
+ argv: string[],
+ env: Record<string, string>,
+ opts: { detached: boolean },
+) => Promise<ActionResult>;
+
+/** Keys a merge must never carry: they would make gh act as the machine account. */
+export const MACHINE_GH_KEYS = ["GH_TOKEN", "GITHUB_TOKEN", "GH_CONFIG_DIR"] as const;
+
+/**
+ * The merge's environment: the launch allowlist, and none of the machine
+ * account's gh keys, so `gh` uses the principal's keyring login.
+ */
+export function mergeEnv(env: Record<string, string | undefined>): Record<string, string> {
+ const out = childEnv(env);
+ for (const key of MACHINE_GH_KEYS) delete out[key];
+ return out;
+}
+
+/** `gh pr merge`, squash, pinned to the head the principal confirmed. */
+export function mergeArgv(args: { repo: string; pr: number; sha: string }): string[] {
+ if (!REPO_PATTERN.test(args.repo)) throw new Error(`bad repo: ${args.repo}`);
+ if (!Number.isInteger(args.pr) || args.pr <= 0) throw new Error(`bad PR: ${args.pr}`);
+ if (!SHA_PATTERN.test(args.sha)) throw new Error(`bad head SHA: ${args.sha}`);
+ return ["gh", "pr", "merge", String(args.pr), "--repo", args.repo, "--squash", "--match-head-commit", args.sha];
+}
+
+/** `ranger resume-node`, the operator verb: it resets the row and detaches run-node itself. */
+export function resumeArgv(args: {
+ rangerBin: string;
+ configPath: string;
+ repo: string;
+ root: number;
+ nodeId: string;
+ force: boolean;
+}): string[] {
+ if (!REPO_PATTERN.test(args.repo)) throw new Error(`bad repo: ${args.repo}`);
+ if (!ID_PATTERN.test(args.nodeId)) throw new Error(`bad node id: ${args.nodeId}`);
+ if (!Number.isInteger(args.root) || args.root <= 0) throw new Error(`bad root: ${args.root}`);
+ return [
+  args.rangerBin,
+  "resume-node",
+  args.nodeId,
+  "--map",
+  `${args.repo}#${args.root}`,
+  "-c",
+  args.configPath,
+  ...(args.force ? ["--force"] : []),
+ ];
+}
+
+/**
+ * The session the principal opens on a parked node. The prompt carries the
+ * repo, the id and the reason class only: the session reads the node, the
+ * PR and the journal itself.
+ */
+export function sessionPlan(args: {
+ repo: string;
+ nodeId: string;
+ reason: ReasonClass;
+ cwd: string;
+}): { prompt: string; shellCommand: string; argv: string[] } {
+ if (!REPO_PATTERN.test(args.repo)) throw new Error(`bad repo: ${args.repo}`);
+ if (!ID_PATTERN.test(args.nodeId)) throw new Error(`bad node id: ${args.nodeId}`);
+ const prompt =
+  `Node #${args.nodeId} on ${args.repo} stopped and needs me (ranger's reason: ${args.reason}). ` +
+  `Read the node with \`soma graph node ${args.nodeId} --repo ${args.repo}\`, its PR, and ranger's ` +
+  `journal for it (\`ranger journal --repo ${args.repo}\`), then tell me what the next step is.`;
+ const shellCommand = `cd ${shellQuote(args.cwd)} && claude ${shellQuote(prompt)}`;
+ return { prompt, shellCommand, argv: itermArgv(shellCommand) };
+}
+
+export interface ActionBody {
+ key?: unknown;
+ id?: unknown;
+ force?: unknown;
+ sha?: unknown;
+ dryRun?: unknown;
+}
+
+export interface ActionDeps {
+ /** The entries as the journal reads now. */
+ entries: NeedsYouEntry[];
+ run: ActionRunner;
+ env: Record<string, string | undefined>;
+ rangerBin: string;
+ configPath: string | undefined;
+ /** Read the PR live before a merge; null when it cannot be read. */
+ readPr: (repo: string, pr: number) => Promise<PrView | null>;
+ exists: (path: string) => boolean;
+}
+
+export interface ActionResponse {
+ status: number;
+ body: Record<string, unknown>;
+ /** The entry acted on, when the action ran. */
+ entry?: NeedsYouEntry;
+}
+
+const refusal = (status: number, error: string): ActionResponse => ({ status, body: { error } });
+
+const tailOf = (text: string): string => text.trim().slice(-1500);
+
+/**
+ * One action, guarded: a numeric id naming a row the journal holds in the
+ * action's state now, then the action's own checks. The caller has already
+ * checked the Host, the Origin and the page token.
+ */
+export async function runAction(
+ kind: ActionKind,
+ body: ActionBody,
+ deps: ActionDeps,
+): Promise<ActionResponse> {
+ if (typeof body.key !== "string" || typeof body.id !== "string") {
+  return refusal(400, "key and id are required strings");
+ }
+ if (!ID_PATTERN.test(body.id)) return refusal(400, "id must be numeric");
+ const entry = deps.entries.find((e) => e.key === body.key && e.nodeId === body.id);
+ if (entry === undefined) {
+  return refusal(404, `#${body.id} is not parked, failed or awaiting a needs-eye merge on ${body.key}`);
+ }
+ let argv: string[];
+ let env: Record<string, string>;
+ let detached = false;
+ if (kind === "resume") {
+  if (!entry.actions.resume) return refusal(409, `#${entry.nodeId} is ${entry.status}, not parked or failed`);
+  if (deps.configPath === undefined) return refusal(409, "serve was started without a config path to resume with");
+  argv = resumeArgv({
+   rangerBin: deps.rangerBin,
+   configPath: deps.configPath,
+   repo: entry.repo,
+   root: entry.root,
+   nodeId: entry.nodeId,
+   force: body.force === true,
+  });
+  // The wrapper resolves the machine account's tokens itself; nothing ambient goes along.
+  env = childEnv(deps.env);
+  detached = true;
+ } else if (kind === "merge") {
+  if (!entry.actions.merge.offered) return refusal(409, entry.actions.merge.why);
+  if (typeof body.sha !== "string" || body.sha !== entry.actions.merge.headSha) {
+   return refusal(409, "the confirmed head SHA is not the PR's head: reload and confirm again");
+  }
+  const pr = entry.pr as NonNullable<NeedsYouEntry["pr"]>;
+  const live = await deps.readPr(entry.repo, pr.number);
+  const stale = mergeRefusal(live);
+  if (stale !== null) return refusal(409, `read live: ${stale}`);
+  if ((live as PrView).headSha !== body.sha) {
+   return refusal(409, "the PR head moved since the page read it: reload and confirm again");
+  }
+  argv = mergeArgv({ repo: entry.repo, pr: pr.number, sha: body.sha });
+  env = mergeEnv(deps.env);
+ } else {
+  if (!entry.actions.session.offered) return refusal(409, entry.actions.session.why);
+  const cwd = entry.actions.session.cwd;
+  if (!deps.exists(cwd)) return refusal(409, `${cwd} no longer exists`);
+  argv = sessionPlan({ repo: entry.repo, nodeId: entry.nodeId, reason: entry.reason.class, cwd }).argv;
+  env = childEnv(deps.env);
+ }
+ if (body.dryRun === true) return { status: 200, body: { dryRun: true, argv, envKeys: Object.keys(env).sort() } };
+ const result = await deps.run(argv, env, { detached });
+ return {
+  status: 200,
+  body: { action: kind, nodeId: entry.nodeId, ok: result.code === 0, code: result.code, stderr: tailOf(result.stderr) },
+  entry,
+ };
+}

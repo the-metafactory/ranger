@@ -359,6 +359,18 @@ export class Journal {
   return rows.map(hydrateEvent);
  }
 
+ /** One node's events, newest first (node #54: the dashboard's reason class). */
+ listNodeEvents(repo: string, nodeId: string, limit = 60): EventRow[] {
+  return this.db
+   .select()
+   .from(events)
+   .where(and(eq(events.repo, repo), eq(events.nodeId, nodeId)))
+   .orderBy(desc(events.id))
+   .limit(limit)
+   .all()
+   .map(hydrateEvent);
+ }
+
  // ---- health ----
 
  getHealth(key: string): string | null {

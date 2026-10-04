@@ -22,8 +22,19 @@ import { lastImplementMaps, mapKey, implementMapOrder } from "./maps.ts";
  * shell iTerm2 then opens is started by iTerm2, and is expected to take
  * iTerm2's own environment rather than this process's — that is how a
  * launched app's window works, and it is not tested here.
+ *
+ * **"Needs you" actions run outside this process (node #54).** The parked,
+ * failed and needs-eye rows (`serve-parked.ts`) carry buttons, and each one
+ * only spawns an existing CLI verb (`ranger resume-node`), the principal's own
+ * `gh pr merge` (no machine-account token or gh config in its environment), or
+ * the iTerm2 launch above. The process itself still writes nothing: the
+ * journal stays read-only here and no graph write is imported. Each action is
+ * guarded like the launch — Host, Origin, page token, a numeric id — and the
+ * id must name a row the journal holds in the action's state when the request
+ * is read.
  */
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { resolve, sep } from "node:path";
 import {
@@ -53,6 +64,18 @@ import {
  type SubstrateConfig,
 } from "./substrate-policy.ts";
 import { assertReadOnlyToken, gatedEnv } from "./token-gate.ts";
+import { childEnv, itermArgv, shellQuote } from "./launch.ts";
+import {
+ type ActionKind,
+ type ActionRunner,
+ ciState,
+ needsYouEntries,
+ type NeedsYouEntry,
+ type PrView,
+ runAction,
+} from "./serve-parked.ts";
+
+export { childEnv };
 
 const ID_PATTERN = /^\d+$/;
 
@@ -161,6 +184,8 @@ export interface StateInputs {
  now: Date;
  /** Latest substrate quota readings, as the panel shows them (node #45). */
  substrates?: SubstrateView[];
+ /** Parked, failed and needs-eye rows (node #54). */
+ needsYou?: NeedsYouEntry[];
 }
 
 export interface CurrentJob {
@@ -279,6 +304,7 @@ export interface DashboardState {
  current: CurrentJob[];
  maps: DashboardMap[];
  substrates: SubstrateView[];
+ needsYou: NeedsYouEntry[];
 }
 
 const IN_FLIGHT = new Set<WorkerRow["status"]>(["claimed", "running", "awaiting-merge"]);
@@ -461,41 +487,11 @@ export function assembleState(inputs: StateInputs): DashboardState {
   current,
   maps,
   substrates: inputs.substrates ?? [],
+  needsYou: inputs.needsYou ?? [],
  };
 }
 
 // ---- the launch ----
-
-/** Environment keys a launched session may inherit — an allowlist, never a denylist. */
-const CHILD_ENV_KEYS = [
- "PATH",
- "HOME",
- "USER",
- "LOGNAME",
- "SHELL",
- "LANG",
- "LC_ALL",
- "LC_CTYPE",
- "TMPDIR",
-] as const;
-
-export function childEnv(
- env: Record<string, string | undefined>,
-): Record<string, string> {
- const out: Record<string, string> = {};
- for (const key of CHILD_ENV_KEYS) {
-  const value = env[key];
-  if (value !== undefined) out[key] = value;
- }
- return out;
-}
-
-/** POSIX single-quote a string for a shell. */
-const shellQuote = (s: string): string => `'${s.replaceAll("'", `'\\''`)}'`;
-
-/** Escape a string for an AppleScript string literal. */
-const appleQuote = (s: string): string =>
- `"${s.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
 
 export interface LaunchPlan {
  prompt: string;
@@ -522,14 +518,7 @@ export function launchPlan(args: {
   `Read it with \`soma graph node ${args.nodeId} --repo ${args.repo}\`, ` +
   `then work it with the grilling skill.`;
  const shellCommand = `cd ${shellQuote(args.cwd)} && claude ${shellQuote(prompt)}`;
- const script = [
-  'tell application "iTerm2"',
-  " set w to (create window with default profile)",
-  ` tell current session of w to write text ${appleQuote(shellCommand)}`,
-  " activate",
-  "end tell",
- ].join("\n");
- return { prompt, shellCommand, argv: ["osascript", "-e", script] };
+ return { prompt, shellCommand, argv: itermArgv(shellCommand) };
 }
 
 function spawnLaunch(argv: string[], env: Record<string, string>): void {
@@ -556,7 +545,27 @@ export interface HandlerContext {
   * reason it is not.
   */
  verifyGrilling: (map: DashboardMap, nodeId: string) => Promise<string | null>;
+ /** The "Needs you" actions (node #54); unset refuses them. */
+ actions?: {
+  run: ActionRunner;
+  /** The environment the children are built from (default: this process's). */
+  env?: Record<string, string | undefined>;
+  /** `~/bin/ranger`, expanded. */
+  rangerBin: string;
+  /** The ranger.yaml serve was started with; `resume-node` gets the same one. */
+  configPath?: string;
+  readPr: (repo: string, pr: number) => Promise<PrView | null>;
+  exists: (path: string) => boolean;
+  /** Called after an action ran, to re-read what it changed. */
+  after?: (entry: NeedsYouEntry) => void;
+ };
 }
+
+const ACTION_PATHS: Record<string, ActionKind> = {
+ "/api/resume": "resume",
+ "/api/merge": "merge",
+ "/api/session": "session",
+};
 
 const json = (status: number, body: unknown): Response =>
  new Response(JSON.stringify(body), {
@@ -607,6 +616,28 @@ export function createHandler(ctx: HandlerContext): (req: Request) => Promise<Re
   if (url.pathname === "/api/refresh") {
    ctx.refresh();
    return json(202, { refreshing: true });
+  }
+  const action = ACTION_PATHS[url.pathname];
+  if (action !== undefined) {
+   if (ctx.actions === undefined) return refuse(501, "actions are not wired in this server");
+   let body: Record<string, unknown>;
+   try {
+    body = (await req.json()) as Record<string, unknown>;
+   } catch {
+    return refuse(400, "body is not JSON");
+   }
+   const actions = ctx.actions;
+   const result = await runAction(action, body, {
+    entries: ctx.getState().needsYou,
+    run: actions.run,
+    env: actions.env ?? process.env,
+    rangerBin: actions.rangerBin,
+    configPath: actions.configPath,
+    readPr: actions.readPr,
+    exists: actions.exists,
+   });
+   if (result.entry !== undefined) actions.after?.(result.entry);
+   return json(result.status, result.body);
   }
   if (url.pathname !== "/api/grill") return refuse(404, "not found");
 
@@ -683,6 +714,14 @@ button:hover:not(:disabled) { border-color:var(--accent); color:var(--accent); }
 button:disabled { opacity:.45; cursor:default; }
 #msg { padding:0 20px; color:var(--ok); min-height:1em; font-size:12px; }
 #msg.err { color:var(--warn); }
+#needs { grid-column:1 / -1; }
+.card { border-top:1px solid var(--line); padding:8px 0; }
+.card:first-child { border-top:0; }
+.card .facts { color:var(--muted); font-size:12px; }
+.card .acts { display:flex; flex-wrap:wrap; gap:6px; align-items:center; margin-top:6px; }
+.card label { font-size:12px; color:var(--muted); }
+.card pre { margin:6px 0 0; padding:6px 8px; font-size:11px; white-space:pre-wrap; overflow-wrap:anywhere; border:1px solid var(--line); border-radius:6px; }
+.card pre.err { color:var(--warn); border-color:var(--warn); }
 </style>
 </head>
 <body>
@@ -693,6 +732,7 @@ button:disabled { opacity:.45; cursor:default; }
 <section><h2>Substrates</h2><div id="substrates"></div></section>
 <section><h2>Next in queue</h2><div id="next"></div></section>
 <section><h2>Autonomous — ranger can take these</h2><div id="auto"></div></section>
+<section id="needs"><h2>Needs you</h2><div id="needsyou"></div></section>
 <section><h2>Open grillings</h2><div id="grill"></div></section>
 </main>
 <script>
@@ -701,8 +741,11 @@ const el = (tag, props = {}, ...kids) => { const n = document.createElement(tag)
 const link = (url, text) => el("a", { href: url, target: "_blank", rel: "noopener", text });
 const empty = (text) => el("p", { class: "empty", text });
 const ago = (iso) => { if (!iso) return "never"; const s = Math.round((Date.now() - Date.parse(iso)) / 1000); return s < 90 ? s + " s ago" : Math.round(s / 60) + " min ago"; };
+// The page token rotates when serve restarts: a refused one means this page is stale.
+const REFUSED = "token refused";
+const RELOAD = "the dashboard restarted and this page's token is stale: reload the page";
 function say(text, err) { const m = document.getElementById("msg"); m.textContent = text; m.className = err ? "err" : ""; }
-async function post(path, body) { const r = await fetch(path, { method: "POST", headers: { "content-type": "application/json", "x-ranger-token": TOKEN }, body: JSON.stringify(body || {}) }); const j = await r.json().catch(() => ({})); if (!r.ok) throw new Error(j.error || r.statusText); return j; }
+async function post(path, body) { const r = await fetch(path, { method: "POST", headers: { "content-type": "application/json", "x-ranger-token": TOKEN }, body: JSON.stringify(body || {}) }); const j = await r.json().catch(() => ({})); if (!r.ok) throw new Error(j.error === REFUSED ? RELOAD : (j.error || r.statusText)); return j; }
 const unavailable = (m, none) => empty(m.ok ? none : "Frontier unavailable: " + (m.error || "not read yet"));
 const mapHead = (m, extra) => el("h3", { text: m.repo + " · map #" + m.root + (extra || "") + " · read " + ago(m.readAt) + (m.source === "ranger" ? " by ranger" : " by this dashboard") });
 function renderMeta(s) {
@@ -759,6 +802,62 @@ function renderGrill(s) {
   box.append(el("ul", {}, ...m.grillings.map((g) => el("li", {}, el("span", { class: "id", text: "#" + g.id }), el("span", { class: "t" }, link(g.url, g.title)), grillButton(m, g)))));
  }
 }
+const short = (sha) => (sha || "").slice(0, 8);
+function needsFacts(n) {
+ const facts = [n.repo + " · map #" + n.root, n.status, "ended " + ago(n.endedAt)];
+ if (n.pr) { const v = n.pr.view; facts.push("PR #" + n.pr.number + (v ? " · " + (v.merged ? "merged" : v.state === "closed" ? "closed" : v.draft ? "draft" : "ready") + " · head " + short(v.headSha) + " · CI " + v.ci : " · not read yet")); }
+ if (n.sage) facts.push("sage round " + n.sage.round + ": " + n.sage.blockers + " blocker(s), " + n.sage.majors + " major(s)");
+ if (n.probe) facts.push("probes " + (n.probe.passed ? "passed" : "FAILED") + " at " + short(n.probe.sha));
+ return facts.join(" · ");
+}
+function actionButton(text, title, enabled, run) {
+ const b = el("button", { text, title, disabled: !enabled });
+ b.onclick = async () => { b.disabled = true; try { await run(); } finally { setTimeout(() => (b.disabled = !enabled), 3000); } };
+ return b;
+}
+// The last result per card survives the re-render that follows every action.
+const results = new Map();
+const forced = new Set();
+async function act(kind, n, extra) {
+ const id = n.key + "/" + n.nodeId;
+ try {
+  const r = await post("/api/" + kind, Object.assign({ key: n.key, id: n.nodeId }, extra));
+  results.set(id, { err: !r.ok, text: kind + " #" + n.nodeId + ": exit " + (r.code === null ? "none" : r.code) + (r.stderr ? "\\n" + r.stderr : "") });
+  say(kind + " #" + n.nodeId + (r.ok ? " ran." : " failed: see its card."), !r.ok);
+ } catch (e) { results.set(id, { err: true, text: kind + " #" + n.nodeId + " refused: " + e.message }); say(e.message, true); }
+ load(); setTimeout(load, 3000);
+}
+function needsCard(n) {
+ const id = n.key + "/" + n.nodeId;
+ const force = el("input", { type: "checkbox", checked: forced.has(id) });
+ force.onchange = () => { if (force.checked) forced.add(id); else forced.delete(id); };
+ const acts = el("div", { class: "acts" });
+ if (n.actions.resume) {
+  acts.append(actionButton("Resume", "ranger resume-node " + n.nodeId + " --map " + n.key, true, () => act("resume", n, { force: force.checked })));
+  acts.append(el("label", {}, force, document.createTextNode(" run beside the lane holder")));
+ }
+ const merge = n.actions.merge;
+ acts.append(actionButton("Merge", merge.offered ? "gh pr merge --squash, pinned to " + short(merge.headSha) + ", under your own gh login" : merge.why, merge.offered, async () => {
+  if (!confirm("Squash-merge PR #" + n.pr.number + " on " + n.repo + " at head " + merge.headSha + "?\\n\\nIt runs under your own gh login; the merge desk closes the node on its next tick.")) return;
+  await act("merge", n, { sha: merge.headSha });
+ }));
+ const session = n.actions.session;
+ acts.append(actionButton("Open session", session.offered ? "Open iTerm2 in " + session.cwd + " and start claude on #" + n.nodeId : session.why, session.offered, () => act("session", n, {})));
+ if (n.pr) acts.append(link(n.pr.url, "Open PR"));
+ const last = results.get(id);
+ return el("div", { class: "card" },
+  el("div", {}, el("span", { class: "id", text: "#" + n.nodeId + " " }), link(n.url, n.title || "(title not read yet)"), document.createTextNode(" "), el("span", { class: "tag stale", text: n.reason.class })),
+  el("div", { class: "facts", text: needsFacts(n) }),
+  el("div", { class: "reason", text: n.reason.detail }),
+  acts,
+  last ? el("pre", { class: last.err ? "err" : "", text: last.text }) : null);
+}
+function renderNeeds(s) {
+ const box = document.getElementById("needsyou");
+ box.replaceChildren();
+ if (!s.needsYou || s.needsYou.length === 0) { box.append(empty("Nothing is parked, failed or waiting on a needs-eye merge.")); return; }
+ box.append(...s.needsYou.map(needsCard));
+}
 function renderSubstrates(s) {
  const box = document.getElementById("substrates"); box.replaceChildren();
  if (!s.substrates || s.substrates.length === 0) { box.append(empty("No substrate readings yet.")); return; }
@@ -773,7 +872,7 @@ function renderSubstrates(s) {
   return el("li", {}, el("span", { class: "t", text: parts.join(" · ") }), el("span", { class: sub.eligible ? "tag" : "tag stale", text: state }));
  })));
 }
-function render(s) { renderMeta(s); renderCurrent(s); renderSubstrates(s); renderNext(s); renderAuto(s); renderGrill(s); }
+function render(s) { renderMeta(s); renderCurrent(s); renderSubstrates(s); renderNext(s); renderAuto(s); renderNeeds(s); renderGrill(s); }
 async function load() { try { const r = await fetch("/api/state", { cache: "no-store" }); render(await r.json()); } catch (e) { say("Could not read state: " + e.message, true); } }
 document.getElementById("refresh").onclick = async () => { try { await post("/api/refresh"); say("Refreshing the frontier…"); setTimeout(load, 1500); } catch (e) { say(e.message, true); } };
 load(); setInterval(load, 15000);
@@ -807,12 +906,76 @@ export class ServeReader {
  private backoffUntil = 0;
  private strikes = 0;
  private wantedTitles = new Set<string>();
+ /** "Needs you" details (node #54): issue labels by `repo#id`, PRs by `repo#pr`. */
+ labels = new Map<string, string[]>();
+ prs = new Map<string, PrView>();
+ private detailIssues = new Set<string>();
+ private detailPrs = new Set<string>();
+ private detailing = false;
+ private readonly details: DetailReader;
 
  constructor(
   private readonly config: RangerConfig,
   private readonly maps: ServeMap[],
   private readonly journalPath: string,
- ) {}
+  details?: DetailReader,
+ ) {
+  this.details = details ?? {
+   issue: (repo, id) => readIssue(config, repo, id),
+   pr: (repo, n) => readPrLive(config, repo, n),
+  };
+ }
+
+ /**
+  * The issues and PRs the "Needs you" rows show. Read on the next
+  * `refreshDetails`, never from a state read: the dashboard spends REST only
+  * on a timer, on a new row, and after an action.
+  */
+ wantDetails(issues: string[], prs: string[]): void {
+  this.detailIssues = new Set(issues);
+  this.detailPrs = new Set(prs);
+ }
+
+ /** A wanted issue or PR that has not been read yet. */
+ hasUnreadDetails(): boolean {
+  return (
+   [...this.detailIssues].some((k) => !this.labels.has(k)) ||
+   [...this.detailPrs].some((k) => !this.prs.has(k))
+  );
+ }
+
+ /** Forget an entry's details, so the next read takes them fresh (after an action). */
+ forget(issue: string, pr: string | null): void {
+  this.labels.delete(issue);
+  if (pr !== null) this.prs.delete(pr);
+ }
+
+ refreshDetails(): void {
+  if (this.detailing) return;
+  this.detailing = true;
+  this.readDetails()
+   .catch((error) => {
+    this.lastError = error instanceof Error ? error.message : String(error);
+   })
+   .finally(() => {
+    this.detailing = false;
+   });
+ }
+
+ private async readDetails(): Promise<void> {
+  for (const key of [...this.detailIssues]) {
+   const [repo, id] = key.split("#");
+   const issue = await this.details.issue(repo, id);
+   if (issue === null) continue;
+   this.labels.set(key, issue.labels);
+   this.titles.set(key, issue.title);
+  }
+  for (const key of [...this.detailPrs]) {
+   const [repo, n] = key.split("#");
+   const pr = await this.details.pr(repo, Number(n));
+   if (pr !== null) this.prs.set(key, pr);
+  }
+ }
 
  /** Ask for titles of nodes no frontier names; fetched on the next refresh. */
  want(keys: string[]): void {
@@ -893,14 +1056,71 @@ export class ServeReader {
    if (issue !== null) this.titles.set(key, issue.title);
    this.wantedTitles.delete(key);
   }
+  await this.readDetails();
  }
+}
+
+/** The REST reads behind "Needs you"; injected so no test runs `gh`. */
+export interface DetailReader {
+ issue: (repo: string, id: string) => Promise<Pick<IssueRead, "title" | "labels"> | null>;
+ pr: (repo: string, pr: number) => Promise<PrView | null>;
 }
 
 interface IssueRead {
  title: string;
  state: string;
  assignees: string[];
+ labels: string[];
  kind: string | null;
+}
+
+/** One `gh api` GET under the read-only gate; null on any failure. */
+async function restRead(config: RangerConfig, repo: string, path: string): Promise<unknown> {
+ const { token } = await assertReadOnlyToken(config, repo);
+ const gated = gatedEnv(token.token);
+ try {
+  const result = await runCmd("gh", ["api", path], { env: gated.env, timeoutMs: 15_000 });
+  if (result.code !== 0) return null;
+  try {
+   return JSON.parse(result.stdout) as unknown;
+  } catch {
+   return null;
+  }
+ } finally {
+  gated.cleanup();
+ }
+}
+
+/** A PR and the CI state of its head, over REST under the read-only gate. */
+export async function readPrLive(
+ config: RangerConfig,
+ repo: string,
+ number: number,
+): Promise<PrView | null> {
+ if (!REPO_PATTERN.test(repo) || !Number.isInteger(number) || number <= 0) return null;
+ const raw = (await restRead(config, repo, `repos/${repo}/pulls/${number}`)) as Record<string, unknown> | null;
+ if (raw === null) return null;
+ const head = (raw.head ?? {}) as { sha?: unknown };
+ const headSha = typeof head.sha === "string" ? head.sha : "";
+ const checks = /^[0-9a-f]{40}$/.test(headSha)
+  ? ((await restRead(config, repo, `repos/${repo}/commits/${headSha}/check-runs?filter=latest&per_page=100`)) as {
+     check_runs?: { status?: string; conclusion?: string | null }[];
+    } | null)
+  : null;
+ return {
+  number,
+  url: typeof raw.html_url === "string" ? raw.html_url : `https://github.com/${repo}/pull/${number}`,
+  state: raw.state === "closed" ? "closed" : "open",
+  merged: raw.merged === true,
+  draft: raw.draft === true,
+  headSha,
+  mergeable: typeof raw.mergeable === "boolean" ? raw.mergeable : null,
+  ci:
+   checks === null || !Array.isArray(checks.check_runs)
+    ? "none"
+    : ciState(checks.check_runs.map((c) => ({ status: String(c.status ?? ""), conclusion: c.conclusion ?? null }))),
+  readAt: new Date().toISOString(),
+ };
 }
 
 /** One issue over REST under the read-only gate: no GraphQL. Null if unreadable. */
@@ -922,6 +1142,7 @@ async function readIssue(
    title?: string;
    state?: string;
    assignees?: { login?: string }[];
+   labels?: ({ name?: string } | string)[];
    body?: string | null;
   };
   // The node's kind is in its typed block, which the verbs write (#89-style
@@ -939,6 +1160,7 @@ async function readIssue(
    title: raw.title ?? "",
    state: raw.state ?? "unknown",
    assignees: (raw.assignees ?? []).map((a) => a.login ?? "").filter(Boolean),
+   labels: (raw.labels ?? []).map((l) => (typeof l === "string" ? l : (l.name ?? ""))).filter(Boolean),
    kind,
   };
  } finally {
@@ -996,11 +1218,41 @@ export function stateFromJournal(
    );
   }
   const vetoed = journal?.listVetoes() ?? new Set<string>();
+  const workers = journal?.listWorkers() ?? [];
+  const needsYou = needsYouEntries({
+   maps,
+   workers,
+   events: (repo, nodeId) => journal?.listNodeEvents(repo, nodeId) ?? [],
+   labels: (repo, nodeId) => reader.labels.get(`${repo}#${nodeId}`) ?? null,
+   prs: (repo, pr) => reader.prs.get(`${repo}#${pr}`) ?? null,
+   titleOf: (repo, nodeId) => {
+    for (const map of maps) {
+     if (map.repo !== repo) continue;
+     const hit = reports.get(map.key)?.frontier.find((n) => n.id === nodeId)?.title;
+     if (hit !== undefined) return hit;
+    }
+    return reader.titles.get(`${repo}#${nodeId}`) ?? null;
+   },
+   reviewRounds: config.workers.reviewRounds,
+   exists: existsSync,
+  });
+  // Details for every row that may need the principal: an awaiting-merge row
+  // shows only once its labels say needs-eye.
+  const candidates = workers.filter(
+   (w) =>
+    (w.status === "parked" || w.status === "failed" || w.status === "awaiting-merge") &&
+    maps.some((m) => m.repo === w.repo && m.root === w.root),
+  );
+  reader.wantDetails(
+   candidates.map((w) => `${w.repo}#${w.nodeId}`),
+   candidates.filter((w) => w.prNumber !== null).map((w) => `${w.repo}#${w.prNumber}`),
+  );
   const state = assembleState({
    maps,
    reports,
    titles: reader.titles,
-   workers: journal?.listWorkers() ?? [],
+   workers,
+   needsYou,
    lastImplementMaps: lastImplementMaps(journal),
    laneHolders: { visual: journal?.laneHolder("visual") ?? null, headless: journal?.laneHolder("headless") ?? null },
    paused: journal?.isPaused() ?? false,
@@ -1040,8 +1292,39 @@ export async function verifyGrillingLive(
  }
 }
 
+/**
+ * Run an action's child and wait for its exit, keeping the tail of its
+ * stderr for the page. `resume-node` returns once it has detached run-node,
+ * so waiting on it is short; the child is detached all the same, so a serve
+ * restart never takes a resume down with it.
+ */
+export const spawnAction: ActionRunner = (argv, env, opts) =>
+ new Promise((done) => {
+  const [command, ...args] = argv;
+  let stderr = "";
+  let settled = false;
+  const settle = (code: number | null, extra = "") => {
+   if (settled) return;
+   settled = true;
+   clearTimeout(timer);
+   done({ code, stderr: (stderr + extra).slice(-4000) });
+  };
+  const child = spawn(command, args, { env, stdio: ["ignore", "ignore", "pipe"], detached: opts.detached });
+  const timer = setTimeout(() => settle(null, `\n(no exit after ${ACTION_TIMEOUT_MS / 1000} s; still running)`), ACTION_TIMEOUT_MS);
+  child.stderr?.on("data", (chunk: Buffer) => {
+   stderr = (stderr + chunk.toString()).slice(-4000);
+  });
+  child.on("error", (error) => settle(null, `could not start ${command}: ${error.message}`));
+  child.on("close", (code) => settle(code));
+  if (opts.detached) child.unref();
+ });
+
+const ACTION_TIMEOUT_MS = 120_000;
+
 export function startServe(opts: {
  config: RangerConfig;
+ /** The ranger.yaml this was loaded from; `resume-node` is run with the same one. */
+ configPath?: string;
  port?: number;
  open?: boolean;
 }): { url: string; stop: () => void } {
@@ -1059,10 +1342,27 @@ export function startServe(opts: {
  const handler = createHandler({
   port,
   token,
-  getState: () => stateFromJournal(opts.config, maps, reader),
+  getState: () => {
+   const state = stateFromJournal(opts.config, maps, reader);
+   // A row that newly needs the principal gets its PR and labels read now,
+   // not on the next timer.
+   if (reader.hasUnreadDetails()) reader.refreshDetails();
+   return state;
+  },
   refresh: () => reader.refresh(),
   launch: spawnLaunch,
   verifyGrilling: (map, nodeId) => verifyGrillingLive(opts.config, map, nodeId),
+  actions: {
+   run: spawnAction,
+   rangerBin: expandHome("~/bin/ranger"),
+   configPath: opts.configPath,
+   readPr: (repo, pr) => readPrLive(opts.config, repo, pr),
+   exists: existsSync,
+   after: (entry) => {
+    reader.forget(`${entry.repo}#${entry.nodeId}`, entry.pr === null ? null : `${entry.repo}#${entry.pr.number}`);
+    reader.refreshDetails();
+   },
+  },
  });
  const server = Bun.serve({ hostname: "127.0.0.1", port, fetch: handler });
  const url = `http://127.0.0.1:${port}/`;
