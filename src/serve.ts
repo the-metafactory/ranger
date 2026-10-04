@@ -734,11 +734,14 @@ function renderSubstrates(s) {
    lines.push(span("read " + sub.ageMin + " min ago (max " + sub.maxAgeMin + " min)" + (sub.cappedUntil ? " \u00B7 capped until " + at(sub.cappedUntil) : sub.capped ? " \u00B7 capped until the next reading" : ""), grey));
   }
   lines.push(span("eligible now: " + sub.eligible.state + " \u00B7 " + sub.eligible.reason));
-  const running = KINDS.filter(([k]) => sub.sessions.running[k] > 0).map(([k, name]) => sub.sessions.running[k] + " " + name);
-  lines.push(span("running now: " + (running.length ? running.join(" \u00B7 ") : "none")));
-  lines.push(span(sessionCounts("last 24 h", sub.sessions.day)), span(sessionCounts("last 7 d", sub.sessions.week)));
+  if (!sub.sessions) lines.push(span("sessions: no history to count (journal not migrated yet)", "muted"));
+  else {
+   const running = KINDS.filter(([k]) => sub.sessions.running[k] > 0).map(([k, name]) => sub.sessions.running[k] + " " + name);
+   lines.push(span("running now: " + (running.length ? running.join(" \u00B7 ") : "none")));
+   lines.push(span(sessionCounts("last 24 h", sub.sessions.day)), span(sessionCounts("last 7 d", sub.sessions.week)));
+  }
   const last = sub.lastSession;
-  lines.push(span(last ? "last: #" + last.nodeId + " (" + last.repo + ") " + KINDS.find(([k]) => k === last.kind)[1] + ", started " + ago(last.startedAt) + (last.endedAt ? ", " + (last.outcome || "ended") : ", open") : "last: no session yet"));
+  if (sub.sessions) lines.push(span(last ? "last: #" + last.nodeId + " (" + last.repo + ") " + KINDS.find(([k]) => k === last.kind)[1] + ", started " + ago(last.startedAt) + (last.endedAt ? ", " + (last.outcome || "ended") : ", open") : "last: no session yet"));
   const tag = sub.eligible.state === "yes" ? "eligible" : sub.eligible.state === "stale" ? "stale" : "ineligible";
   return el("li", {}, el("span", { class: "t" }, el("strong", { text: sub.substrate.toUpperCase() }), ...lines), el("span", { class: sub.eligible.state === "no" ? "tag stale" : "tag", text: tag }));
  })));
@@ -984,7 +987,7 @@ export function stateFromJournal(
    now,
    substrates: substrateUsageViews({
     readings: journal?.listSubstrateReadings() ?? [],
-    sessions: journal?.listSubstrateSessions(new Date(now.getTime() - 7 * 24 * 60 * 60_000)) ?? [],
+    sessions: journal?.listSubstrateSessions(new Date(now.getTime() - 7 * 24 * 60 * 60_000)) ?? null,
     lastSession: (substrate) => journal?.lastSubstrateSession(substrate) ?? null,
     live: liveSession(workers, defaultPidAlive),
     config: config.substrates,

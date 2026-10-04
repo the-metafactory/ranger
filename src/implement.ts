@@ -451,7 +451,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
    // the cap confirmation, so a capped review is recorded as capped.
    const reviewed = await recordSession(
     journal,
-    { substrate: reviewSubstrate, kind: "review", repo, nodeId },
+    { substrate: reviewSubstrate, kind: "review", repo, nodeId, generation: ctx.generation },
     async (): Promise<{ verdict: ReviewVerdict } | { error: ReviewError; cap: CapSignal | null }> => {
      try {
       return {
@@ -624,11 +624,19 @@ async function workerPass(
  review: { round: number; body: string } | undefined,
 ): Promise<PassResult> {
  const nodeId = ctx.node.ref.id;
+ // A superseded supervisor opens no session row (checkedWorkerPass checks
+ // again right before the spawn: the generation can move during its awaits).
  ctx.journal.assertGeneration(nodeId, ctx.map.repo, ctx.generation, "spawn the worker");
  if (ctx.substrate === undefined) return checkedWorkerPass(ctx, testCommand, review);
  return recordSession(
   ctx.journal,
-  { substrate: ctx.substrate, kind: review === undefined ? "worker" : "fix-pass", repo: ctx.map.repo, nodeId },
+  {
+   substrate: ctx.substrate,
+   kind: review === undefined ? "worker" : "fix-pass",
+   repo: ctx.map.repo,
+   nodeId,
+   generation: ctx.generation,
+  },
   () => checkedWorkerPass(ctx, testCommand, review),
   (pass) =>
    pass.failure === undefined ? "ok" : failedSessionOutcome(pass.failure.detail, pass.failure.substrateCapped),
@@ -664,6 +672,7 @@ async function checkedWorkerPass(
   review,
   probeTier: map.commands.probe !== undefined,
  });
+ ctx.journal.assertGeneration(nodeId, ctx.map.repo, ctx.generation, "spawn the worker");
  const output = workerOutputFor(ctx.substrate);
  const raw = await ctx.workerRun(prompt, {
   cwd: worktree,

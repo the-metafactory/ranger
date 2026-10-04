@@ -40,6 +40,8 @@ export interface SessionScope {
  kind: SessionKind;
  repo: string;
  nodeId: string;
+ /** The supervisor generation running the session (the worker row's). */
+ generation: number;
 }
 
 /**
@@ -131,20 +133,24 @@ export interface SubstrateUsageView {
  /** ISO, only while still in the future. */
  cappedUntil: string | null;
  eligible: Eligibility;
+ /** Null when the journal has no session history to count (not migrated yet). */
  sessions: {
   /** Sessions whose supervisor is alive now, by kind. */
   running: Record<SessionKind, number>;
   day: SessionCounts;
   week: SessionCounts;
- };
+ } | null;
  lastSession: LastSession | null;
 }
 
 export interface UsageInputs {
  /** Stored quota readings (no reads from here). */
  readings: SubstrateReading[];
- /** Sessions started in the last 7 days, plus every open one. */
- sessions: SubstrateSessionRow[];
+ /**
+  * Sessions started in the last 7 days, plus every open one; null when the
+  * journal has no session table to read.
+  */
+ sessions: SubstrateSessionRow[] | null;
  /** Each substrate's most recent session, however old. */
  lastSession: (substrate: SubstrateName) => SubstrateSessionRow | null;
  /** Whether an open session's supervisor is still running it. */
@@ -163,7 +169,7 @@ export function substrateUsageViews(inputs: UsageInputs): SubstrateUsageView[] {
 function usageView(name: SubstrateName, inputs: UsageInputs): SubstrateUsageView {
  const { now, config } = inputs;
  const reading = name === "pi" ? null : (inputs.readings.find((r) => r.substrate === name) ?? null);
- const mine = inputs.sessions.filter((s) => s.substrate === name);
+ const mine = inputs.sessions?.filter((s) => s.substrate === name) ?? null;
  const last = inputs.lastSession(name);
  const fresh = reading !== null && isFresh(reading, config, now);
  const cappedUntil = reading === null ? null : activeCappedUntil(reading, now);
@@ -179,11 +185,14 @@ function usageView(name: SubstrateName, inputs: UsageInputs): SubstrateUsageView
   capped: cappedUntil !== null || (fresh && reading?.capped === true),
   cappedUntil,
   eligible: eligibility(name, reading, config, now),
-  sessions: {
-   running: runningByKind(mine.filter((s) => s.endedAt === null && inputs.live(s))),
-   day: countSince(mine, now.getTime() - DAY_MS),
-   week: countSince(mine, now.getTime() - 7 * DAY_MS),
-  },
+  sessions:
+   mine === null
+    ? null
+    : {
+       running: runningByKind(mine.filter((s) => s.endedAt === null && inputs.live(s))),
+       day: countSince(mine, now.getTime() - DAY_MS),
+       week: countSince(mine, now.getTime() - 7 * DAY_MS),
+      },
   lastSession:
    last === null
     ? null
@@ -273,9 +282,11 @@ function countSince(sessions: SubstrateSessionRow[], sinceMs: number): SessionCo
 }
 
 /**
- * An open session is running while its node's supervisor is: the worker
- * row is claimed or running and its process is alive. An open row of a dead
- * supervisor is not running (the next session of the node closes it).
+ * An open session is running while the supervisor that opened it is: the
+ * node's worker row still carries the session's generation, is claimed or
+ * running, and its process is alive. An open row of a dead or superseded
+ * supervisor is not running, even while a replacement supervisor holds the
+ * node (the node's next recorded session closes it).
  */
 export function liveSession(
  workers: WorkerRow[],
@@ -285,6 +296,7 @@ export function liveSession(
   const w = workers.find((x) => x.repo === session.repo && x.nodeId === session.nodeId);
   return (
    w !== undefined &&
+   w.generation === session.generation &&
    (w.status === "claimed" || w.status === "running") &&
    w.pid !== null &&
    pidAlive(w.pid)

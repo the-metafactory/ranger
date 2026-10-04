@@ -215,6 +215,8 @@ export const substrateSessions = sqliteTable(
   kind: text("kind", { enum: SESSION_KINDS }).notNull(),
   repo: text("repo").notNull(),
   nodeId: text("node_id").notNull(),
+  /** The supervisor generation that opened the row: only that supervisor runs it. */
+  generation: integer("generation").notNull(),
   startedAt: text("started_at").notNull(),
   endedAt: text("ended_at"),
   outcome: text("outcome", { enum: SESSION_OUTCOMES }),
@@ -223,6 +225,7 @@ export const substrateSessions = sqliteTable(
   index("substrate_sessions_started_at_idx").on(table.startedAt),
   index("substrate_sessions_substrate_started_idx").on(table.substrate, table.startedAt),
   index("substrate_sessions_node_open_idx").on(table.repo, table.nodeId, table.endedAt),
+  index("substrate_sessions_ended_at_idx").on(table.endedAt),
  ],
 );
 

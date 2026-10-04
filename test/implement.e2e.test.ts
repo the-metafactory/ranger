@@ -297,7 +297,7 @@ async function rig(opts: {
 
 /** The node's substrate sessions (node #56), oldest first: [substrate, kind, outcome]. */
 function sessions(journal: Journal): [string, string, string | null][] {
- return journal.listSubstrateSessions(new Date(0)).map((s) => {
+ return (journal.listSubstrateSessions(new Date(0)) ?? []).map((s) => {
   expect(s.endedAt).not.toBeNull();
   return [s.substrate, s.kind, s.outcome];
  });
@@ -384,6 +384,10 @@ describe("implement lane (node #23)", () => {
    ["pi", "fix-pass", "ok"],
    ["pi", "review", "ok"],
   ]);
+  // Each row carries the supervisor generation that ran it: the panel's liveness check.
+  expect(new Set(r.journal.listSubstrateSessions(new Date(0))?.map((s) => s.generation))).toEqual(
+   new Set([row!.generation]),
+  );
 
   const pr = r.github.prs.get(1);
   expect(pr?.draft).toBe(false);

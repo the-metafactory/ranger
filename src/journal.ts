@@ -106,6 +106,8 @@ export interface SubstrateSessionRow {
  kind: SessionKind;
  repo: string;
  nodeId: string;
+ /** The supervisor generation that opened the row. */
+ generation: number;
  startedAt: string;
  endedAt: string | null;
  outcome: SessionOutcome | null;
@@ -798,7 +800,7 @@ export class Journal {
   * own late `endSubstrateSession` (if any) no longer applies.
   */
  startSubstrateSession(
-  scope: { substrate: SubstrateName; kind: SessionKind; repo: string; nodeId: string },
+  scope: { substrate: SubstrateName; kind: SessionKind; repo: string; nodeId: string; generation: number },
   now = new Date(),
  ): number {
   const at = now.toISOString();
@@ -834,19 +836,23 @@ export class Journal {
  }
 
  /**
-  * Sessions started since `since`, plus every still-open row. A journal no
-  * migration has reached yet (`ranger serve` reads it without migrating)
-  * has no sessions.
+  * Sessions started since `since`, plus every still-open row: two indexed
+  * reads (recent by `started_at`, open by `ended_at`), so a dashboard poll
+  * never scans the retained history. Null for a journal no migration has
+  * reached yet (`ranger serve` reads it without migrating): there is no
+  * history to count, which is not the same as no sessions.
   */
- listSubstrateSessions(since: Date): SubstrateSessionRow[] {
-  return withoutSessionsTable(() =>
-   this.db
+ listSubstrateSessions(since: Date): SubstrateSessionRow[] | null {
+  return withoutSessionsTable(() => {
+   const recent = this.db
     .select()
     .from(substrateSessions)
-    .where(or(gt(substrateSessions.startedAt, since.toISOString()), isNull(substrateSessions.endedAt)))
-    .orderBy(asc(substrateSessions.id))
-    .all(),
-  );
+    .where(gt(substrateSessions.startedAt, since.toISOString()))
+    .all();
+   const open = this.db.select().from(substrateSessions).where(isNull(substrateSessions.endedAt)).all();
+   const byId = new Map([...recent, ...open].map((row) => [row.id, row]));
+   return [...byId.values()].sort((a, b) => a.id - b.id);
+  });
  }
 
  /** A substrate's most recent session, however old (within retention). */
@@ -860,7 +866,7 @@ export class Journal {
      .orderBy(desc(substrateSessions.startedAt), desc(substrateSessions.id))
      .limit(1)
      .all(),
-   )[0] ?? null
+   )?.[0] ?? null
   );
  }
 
@@ -888,12 +894,12 @@ export class Journal {
 /** Session rows are kept a month: the panel's widest window is 7 days. */
 const SESSION_RETENTION_DAYS = 30;
 
-/** An empty read when `substrate_sessions` is not migrated in yet. */
-function withoutSessionsTable(read: () => SubstrateSessionRow[]): SubstrateSessionRow[] {
+/** Null when `substrate_sessions` is not migrated in yet. */
+function withoutSessionsTable(read: () => SubstrateSessionRow[]): SubstrateSessionRow[] | null {
  try {
   return read();
  } catch (error) {
-  if (error instanceof Error && error.message.includes("no such table: substrate_sessions")) return [];
+  if (error instanceof Error && error.message.includes("no such table: substrate_sessions")) return null;
   throw error;
  }
 }
