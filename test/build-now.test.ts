@@ -411,7 +411,9 @@ describe("node #58 — the claim lock's fence: a holder whose lease was lost sto
     }),
    ),
   );
-  expect(message).toMatch(/stopped mid-claim — claim lock lost mid-claim \(another run owns the lock\)/);
+  expect(message).toMatch(
+   /stopped mid-claim — claim lock lost mid-claim \(another run owns the lock\) — stopped before the next write; only the announce was posted \(message msg-10\)/,
+  );
   expect(r.announced).toHaveLength(1);
   expect(r.claimed).toHaveLength(0);
   expect(r.spawned).toHaveLength(0);
@@ -420,7 +422,7 @@ describe("node #58 — the claim lock's fence: a holder whose lease was lost sto
   expect(r.journal.spawnsToday(new Date("2026-10-04T10:00:00Z"))).toBe(0);
  });
 
- test("lost during the graph claim: no row, no spawn counted or started (the new holder writes them)", async () => {
+ test("lost during the graph claim: no row, no spawn counted or started, and the refusal names the graph claim left behind", async () => {
   const r = rig();
   const claim = r.ctx().claim!;
   const message = await refusal(
@@ -435,6 +437,7 @@ describe("node #58 — the claim lock's fence: a holder whose lease was lost sto
    ),
   );
   expect(message).toMatch(/stopped mid-claim/);
+  expect(message).toMatch(/#10 is claimed on the graph under ivy-bot with no journal row .*soma graph release 10/);
   expect(r.claimed).toEqual(["10"]);
   expect(r.spawned).toHaveLength(0);
   expect(r.journal.getWorker("10", REPO)).toBeNull();

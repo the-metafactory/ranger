@@ -226,7 +226,16 @@ export async function claimNode(args: ClaimNodeArgs): Promise<ClaimNodeOutcome> 
  const { journal, map, node, botIdentity, token } = args;
  const now = () => args.now?.() ?? new Date();
  const owned = args.owned ?? (() => {});
- owned();
+ // The fence, naming what this claim already did when it fires.
+ const fence = (done: string) => {
+  try {
+   owned();
+  } catch (error) {
+   if (!(error instanceof ClaimLeaseLost)) throw error;
+   throw new ClaimLeaseLost(`${error.message}; ${done}`);
+  }
+ };
+ fence("nothing was written");
  // Announce, fail-closed in the walk (node #7: no veto window, but announce gates the claim).
  let messageId: string | null = null;
  let announceError: string | null = null;
@@ -248,7 +257,7 @@ export async function claimNode(args: ClaimNodeArgs): Promise<ClaimNodeOutcome> 
    };
   }
  }
- owned();
+ fence(messageId === null ? "nothing was written" : `only the announce was posted (message ${messageId})`);
  if (messageId !== null) {
   journal.recordEvent("announced", {
    nodeId: node.id,
@@ -271,10 +280,16 @@ export async function claimNode(args: ClaimNodeArgs): Promise<ClaimNodeOutcome> 
    error: `#${node.id} claim race lost to ${claim.holder ?? "another session"} — skipped`,
   };
  }
- // Fenced again after the claim's await: if the lock was reclaimed meanwhile,
- // the new holder writes the row and spawns. The graph claim is the same bot
- // identity's, so there is nothing to release.
- owned();
+ // Fenced again after the claim's await. If the lock was reclaimed meanwhile
+ // and the new holder took this node too (the same identity's claim holds),
+ // it writes the row and spawns. Otherwise the node is assigned to the bot
+ // with no row: off the frontier (open, unassigned) until released, and in
+ // the digest's open claims. Releasing it here could undo the new holder's
+ // claim of this node under the shared identity, so the error names it.
+ fence(
+  `#${node.id} is claimed on the graph under ${botIdentity} with no journal row — unless the new holder took it, ` +
+   `release it (\`soma graph release ${node.id}\` under the machine account) to put it back on the frontier`,
+ );
  if (args.lane === "implement") recordImplementStart(journal, map);
  journal.recordSpawn(now());
  // A fresh claim starts a clean row BEFORE the supervisor spawns: a node

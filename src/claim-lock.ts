@@ -17,12 +17,13 @@ import { acquireLease, leaseOwnedCheck, type OwnedCheck, releaseLease, startHear
  * It is the announce-once lease (`lock.ts`): atomic create, renewed while
  * held, reclaimable once its lease expires. A holder stopped past the lease
  * (a suspended laptop, SIGSTOP) can be reclaimed while its callback still
- * runs, so the callback gets an `owned` fence and calls it before each
- * mutation (announce, graph claim, journal writes, spawn — `claimNode`): a
- * holder whose lease expired or was reclaimed throws `ClaimLeaseLost` at its
- * next boundary instead of writing beside the new holder. The residual
- * window is a stop between a passed fence and the synchronous write right
- * after it, the same class as the escalate desk's (`lock.ts`).
+ * runs, so the callback gets an `owned` fence. `claimNode` calls it before
+ * the announce, before the graph claim, and before the journal writes that
+ * precede the spawn (no await between those and the spawn): a holder whose
+ * lease expired or was reclaimed throws `ClaimLeaseLost` at its next fence
+ * instead of writing beside the new holder. The residual window is a stop
+ * between a passed fence and the writes right after it, the same class as
+ * the escalate desk's (`lock.ts`).
  *
  * The lock lives next to the journal; an in-memory journal (tests) gets a
  * lock of its own under tmpdir.
