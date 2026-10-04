@@ -893,6 +893,38 @@ describe("implement lane (node #23)", () => {
   expect(posts[0]).not.toContain("Sheet could not be made");
  }, 60_000);
 
+ test.each([false, true])("label outage with views configured: autoMerge=%s", async (autoMerge) => {
+  const r = await rig({ autoMerge });
+  cleanup.push(r.dir);
+  r.ctx.map.commands.views = "capture {label} {out} {origin}";
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  let reads = 0;
+  r.github.issueLabels = async () => { reads++; throw new Error("labels unavailable"); };
+  const posts: string[] = [];
+  const tick = await sweepMap({
+   config: r.ctx.config, journal: r.journal, map: r.ctx.map, token: "ghp_write", botIdentity: BOT, github: r.github,
+   post: async content => { posts.push(content); return "label-outage-card"; },
+   respawn: async () => DEAD_PID,
+  });
+  expect(reads).toBe(1);
+  expect(tick.mergeDesk?.merged).toEqual([]);
+  expect(tick.mergeDesk?.parked).toEqual([]);
+  expect(r.github.merges).toEqual([]);
+  expect(r.journal.getWorker("20", r.ctx.map.repo)?.status).toBe("awaiting-merge");
+  if (autoMerge) {
+   expect(tick.mergeDesk?.cards).toEqual([]);
+   expect(tick.mergeDesk?.errors).toEqual(["#20: labels unavailable"]);
+   expect(posts).toEqual([]);
+   expect(r.journal.getWorker("20", r.ctx.map.repo)?.mergeMessageId).toBeNull();
+  } else {
+   expect(tick.mergeDesk?.cards).toEqual(["20"]);
+   expect(tick.mergeDesk?.errors).toEqual([]);
+   expect(posts[0]).toContain("**merge needed**");
+   expect(posts[0]).not.toContain("Visual evidence");
+   expect(r.journal.getWorker("20", r.ctx.map.repo)?.mergeMessageId).toBe("label-outage-card");
+  }
+ }, 60_000);
+
  test("needs-eye evidence captures after probes and reaches the card in most-changed pairs with full PR table", async () => {
   const r = await rig({ probe: "fake-probe ok {node}" });
   cleanup.push(r.dir);

@@ -241,9 +241,15 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   // Auto-merge (principal, 2026-10-03): on a map that opts in, ranger
   // squash-merges the gate-passed PR itself, pinned to the gated head, unless
   // the node is labelled ranger:needs-eye. The close follows on this tick.
-  const needsEye = !map.autoMerge && !map.commands.views
-   ? false
-   : (await github.issueLabels(repo, Number(row.nodeId), token)).includes(NEEDS_EYE_LABEL);
+  let needsEye = false;
+  if (map.autoMerge || map.commands.views) {
+   try {
+    needsEye = (await github.issueLabels(repo, Number(row.nodeId), token)).includes(NEEDS_EYE_LABEL);
+   } catch (error) {
+    if (map.autoMerge) throw error;
+    // On manual maps labels only select evidence; an outage must not suppress the card.
+   }
+  }
   if (map.autoMerge && !needsEye) {
    await github.mergePr(repo, pr.number, gate.headSha, pr.title, token);
    journal.recordEvent("merged", {

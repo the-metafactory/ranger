@@ -22,7 +22,7 @@ export function fillViewsTemplate(template: string, values: Record<string, strin
 }
 
 export interface ViewDiff { view: string; change: number; noise: number }
-export const byMostChanged = (a: ViewDiff, b: ViewDiff): number => b.change - a.change || a.view.localeCompare(b.view);
+const byMostChanged = (a: ViewDiff, b: ViewDiff): number => b.change - a.change || a.view.localeCompare(b.view);
 export type ViewsRecord =
  | { sha: string; status: "ok"; rows: ViewDiff[] }
  | { sha: string; status: "failed"; reason: string };
@@ -98,7 +98,7 @@ export function chooseViews(
 
 export function viewsTable(rows: readonly ViewDiff[]): string {
  return [
-  "| View | Before → after | After → after2 (noise) |",
+  "| View | Before → after | After → after2 (single control sample) |",
   "| --- | ---: | ---: |",
   ...rows.map(r => `| ${r.view} | ${r.change.toFixed(2)}% | ${r.noise.toFixed(2)}% |`),
  ].join("\n");
@@ -157,7 +157,7 @@ export async function viewsCard(out: string, sha: string): Promise<{ summary: st
  const sizes = (view: string): [number, number] => [pngSize(out, "before", view), pngSize(out, "after", view)];
  let selection = chooseViews(record.rows, sizes);
  const summaryFor = (selected: ViewsSelection) => [
-  "Visual evidence: before → after; after → after2 is the same-build noise control. Your eye is the gate.",
+  "Visual evidence: before → after; after → after2 is one same-build noise sample, not an established noise floor. Your eye is the gate.",
   ...[...record.rows].sort(byMostChanged).map(r => `${r.view}: ${r.change.toFixed(2)}% (noise ${r.noise.toFixed(2)}%)`),
   `Attached pairs: ${selected.attached.map(r => r.view).join(", ") || "none"}.`,
   `Left out: ${selected.omitted.map(r => `${r.view} (${r.reason})`).join(", ") || "none"}.`,
@@ -171,7 +171,7 @@ export async function viewsCard(out: string, sha: string): Promise<{ summary: st
   selection = chooseViews(record.rows, sizes, { files: DISCORD_MAX_FILES - 1, fileBytes: DISCORD_MAX_FILE_BYTES, totalBytes: DISCORD_MAX_FILES_BYTES - textBytes });
   const full = summaryFor(selection);
   summaryFile = { name: "views-summary.txt", data: new Blob([full], { type: "text/plain" }) };
-  summary = `Visual evidence: ${selection.attached.length} before/after pairs above the same-build noise floor. Full diff and every left-out view are named in views-summary.txt and the PR comment. Your eye is the gate.\nFull sheet: ${join(out, "index.html")}`;
+  summary = `Visual evidence: ${selection.attached.length} before/after pairs above one same-build noise sample. Full diff and every left-out view are named in views-summary.txt and the PR comment. Your eye is the gate.\nFull sheet: ${join(out, "index.html")}`;
  }
  const files: DiscordFile[] = await Promise.all(selection.attached.flatMap(row => ["before", "after"].map(async label => ({
   name: `${row.view}-${label}.png`,
@@ -240,7 +240,7 @@ export async function startViewsServer(command: string, cwd: string, env: NodeJS
   child.once("close", () => { closed = true; resolveDone(); });
  });
  child.once("error", e => { error = e; });
- const read = (data: Buffer) => { diagnostic = redactViewsReason(diagnostic + data.toString(), env); };
+ const read = (data: Buffer) => { diagnostic = (diagnostic + data.toString()).slice(-4000); };
  child.stdout?.on("data", read);
  child.stderr?.on("data", read);
  const server: ViewsServer = { stop: async () => {
@@ -250,7 +250,7 @@ export async function startViewsServer(command: string, cwd: string, env: NodeJS
  try {
   const deadline = Date.now() + 30_000;
   while (Date.now() < deadline) {
-   if (error || closed) throw new Error(`views server failed: ${error?.message ?? diagnostic}`);
+   if (error || closed) throw new Error(`views server failed: ${redactViewsReason(error?.message ?? diagnostic, env)}`);
    try {
     const response = await fetch(origin, { signal: AbortSignal.timeout(1000) });
     await response.body?.cancel();
@@ -258,7 +258,7 @@ export async function startViewsServer(command: string, cwd: string, env: NodeJS
    } catch { /* waiting for the server to bind */ }
    await sleep(100);
   }
-  throw new Error(`views server readiness timed out: ${diagnostic}`);
+  throw new Error(`views server readiness timed out: ${redactViewsReason(diagnostic, env)}`);
  } catch (e) {
   await server.stop();
   throw e;
@@ -327,7 +327,10 @@ export async function captureViews(ctx: CaptureViewsContext): Promise<ViewsRecor
   await capture(ctx.worktree, ["after", "after2"]);
   if (await checkedGit(["rev-parse", "HEAD"]) !== sha) throw new Error("head moved during capture");
   const diff = async (a: string, b: string) => parseViewsDiff(await shell(fillViewsTemplate(map.commands.viewsDiff!, { out, a, b }), ctx.worktree, `${a} → ${b} diff`));
-  const rows = compareViews(await diff("before", "after"), await diff("after", "after2"));
+  const [change, noise] = await Promise.allSettled([diff("before", "after"), diff("after", "after2")]);
+  if (change.status === "rejected") throw change.reason;
+  if (noise.status === "rejected") throw noise.reason;
+  const rows = compareViews(change.value, noise.value);
   verifyCaptureSet(out, rows);
   record = { sha, status: "ok", rows };
  } catch (error) {
