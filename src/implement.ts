@@ -16,7 +16,8 @@ import {
  vettedPush,
 } from "./git-ops.ts";
 import * as gh from "./github.ts";
-import type { CheckRun, IssueComment, PullRequest } from "./github.ts";
+import type { CheckRun, IssueComment, PullRequest, GitHubPort } from "./github.ts";
+import { ParkSignal } from "./signals.ts";
 import { GRAPH_CALL_TIMEOUT_MS, type NodeResult } from "./graph.ts";
 import { graphClose, graphDecisions, type CloseResult } from "./graph-write.ts";
 import type { ImplementPhase, Journal } from "./journal.ts";
@@ -53,23 +54,8 @@ import { saveWorkerLog } from "./worker-log.ts";
  * outward action is fenced by the occupant generation (F1).
  */
 
-/** The GitHub surface the lane uses — injectable so tests run without a forge. */
-export interface GitHubPort {
- findPrByHead(repo: string, branch: string, token: string): Promise<PullRequest | null>;
- getPr(repo: string, n: number, token: string): Promise<PullRequest>;
- createDraftPr(
-  repo: string,
-  pr: { head: string; base: string; title: string; body: string },
-  token: string,
- ): Promise<PullRequest>;
- updatePrBody(repo: string, n: number, body: string, token: string): Promise<void>;
- markReady(repo: string, pr: PullRequest, token: string): Promise<void>;
- checkRunsFor(repo: string, sha: string, token: string): Promise<CheckRun[]>;
- mergePr(repo: string, n: number, sha: string, title: string, token: string): Promise<void>;
- issueLabels(repo: string, n: number, token: string): Promise<string[]>;
- postComment(repo: string, n: number, body: string, token: string): Promise<number>;
- listComments(repo: string, n: number, token: string): Promise<IssueComment[]>;
-}
+export type { GitHubPort } from "./github.ts";
+export { ParkSignal } from "./signals.ts";
 
 export const realGitHub: GitHubPort = gh;
 
@@ -119,11 +105,6 @@ export interface ImplementOutcome {
  prNumber?: number;
  /** When the failure was caused by a substrate rate limit (node #45). */
  substrateCapped?: CapSignal;
-}
-
-/** A failure that parks the node for the principal instead of counting toward the dead-man. */
-export class ParkSignal extends Error {
- override readonly name = "ParkSignal";
 }
 
 const INSTALL_TIMEOUT_MS = 15 * 60 * 1000;

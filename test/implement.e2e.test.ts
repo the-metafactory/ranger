@@ -29,6 +29,8 @@ const DEAD_PID = 2_147_483_646;
 
 /** In-memory forge over the real bare origin: a PR's head is the origin branch's tip. */
 class FakeGitHub implements GitHubPort {
+ async workflowRunsFor() { return []; }
+ async commitStatusesFor() { return []; }
  prs = new Map<
   number,
   {

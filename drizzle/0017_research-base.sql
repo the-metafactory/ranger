@@ -1,0 +1,1 @@
+ALTER TABLE `workers` ADD `research_base_sha` text;
