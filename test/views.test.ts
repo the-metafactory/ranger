@@ -363,8 +363,15 @@ describe("dev server lifecycle (no browser)", () => {
    expect(Number.isInteger(pgid) && pgid > 1).toBe(true);
    expect((await processGroupCommands(pgid)).some(c => c.includes("sleep 60"))).toBe(true);
   } finally { await server.stop(); }
-  expect(pidAlive(pids.pid)).toBe(false);
-  expect(pidAlive(pids.child)).toBe(false);
+  // SIGKILL reaches the whole group at once, but where the shell stayed leader
+  // the script is orphaned with it and stays a zombie, which kill(pid, 0) still
+  // reports alive, until init reaps it. Wait for the reap, not the signal.
+  const reaped = async (pid: number) => {
+   for (const end = Date.now() + 5_000; pidAlive(pid) && Date.now() < end; ) await Bun.sleep(25);
+   return !pidAlive(pid);
+  };
+  expect(await reaped(pids.pid)).toBe(true);
+  expect(await reaped(pids.child)).toBe(true);
  }, 10_000);
  test("a server exiting before readiness fails with diagnostics", async () => {
   const r = rig();
