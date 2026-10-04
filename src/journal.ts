@@ -13,7 +13,7 @@ import {
 } from "./store/schema.ts";
 import type { RangerConfig } from "./config.ts";
 import { expandHome } from "./config.ts";
-import { holdsImplementLane, type ImplementLane, type LaneMap } from "./lanes.ts";
+import { holdsImplementLane } from "./lanes.ts";
 
 /**
  * Journal (design §8) — the typed data-access layer over the Drizzle schema.
@@ -143,6 +143,8 @@ export type EventKind =
  | "substrate-capped"
  | "transient";
 
+const escalationRootFilter = (root?: number) => root === undefined ? undefined : eq(escalations.root, root);
+
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 export class Journal {
@@ -153,12 +155,14 @@ export class Journal {
 
  constructor(
   path: string,
-  opened: { db: RangerDb; close: () => void } = openDb(path),
-  private readonly maps: readonly LaneMap[] = [],
+  opened?: { db: RangerDb; close: () => void },
+  maps: readonly { repo: string; root: number }[] = [],
+  legacyMapRoots: Readonly<Record<string, number>> = {},
  ) {
   this.path = path;
-  this.db = opened.db;
-  this.closeDb = opened.close;
+  const connection = opened ?? openDb(path, maps, legacyMapRoots);
+  this.db = connection.db;
+  this.closeDb = connection.close;
  }
 
  /**
@@ -166,9 +170,9 @@ export class Journal {
   * `null` when no journal exists yet. Calling a write method on it throws
   * SQLITE_READONLY rather than touching the file.
   */
- static openReadOnly(path: string, maps: readonly LaneMap[] = []): Journal | null {
+ static openReadOnly(path: string): Journal | null {
   const opened = openDbReadOnly(path);
-  return opened === null ? null : new Journal(path, opened, maps);
+  return opened === null ? null : new Journal(path, opened);
  }
 
  // ---- workers ----
@@ -176,6 +180,10 @@ export class Journal {
  upsertWorker(
   row: Partial<WorkerRow> & Pick<WorkerRow, "nodeId" | "repo" | "root" | "status">,
  ): void {
+  const existing = this.getWorker(row.nodeId, row.repo);
+  if (existing !== null && existing.root !== row.root) {
+   throw new Error(`node ${row.repo}#${row.nodeId} already belongs to map ${existing.root}; refusing to move it to map ${row.root}`);
+  }
   this.db
    .insert(workers)
    .values({
@@ -203,7 +211,6 @@ export class Journal {
    .onConflictDoUpdate({
     target: [workers.repo, workers.nodeId],
     set: {
-     root: row.root,
      pid: row.pid,
      status: row.status,
      attempts: row.attempts,
@@ -274,13 +281,13 @@ export class Journal {
  }
 
  /**
-  * One claimed/running implement worker across all maps. Resource tags remain
-  * descriptive; excluding an occupant requires its repo as well as node id.
+  * One claimed/running implement worker across all maps; excluding an occupant
+  * requires its repo as well as node id.
   */
- laneHolder(_lane: ImplementLane, exceptNodeId?: string, exceptRepo?: string): WorkerRow | null {
+ implementHolder(except?: { nodeId: string; repo: string }): WorkerRow | null {
   return (
    this.listWorkers().find((w) => {
-    return !(w.nodeId === exceptNodeId && w.repo === exceptRepo) && holdsImplementLane(w);
+    return !(w.nodeId === except?.nodeId && w.repo === except?.repo) && holdsImplementLane(w);
    }) ?? null
   );
  }
@@ -610,7 +617,7 @@ export class Journal {
    .where(
     and(
      eq(escalations.repo, repo),
-     opts.root === undefined ? undefined : eq(escalations.root, opts.root),
+     escalationRootFilter(opts.root),
      eq(escalations.status, "open"),
      isNull(escalations.notedAt),
     ),
@@ -620,7 +627,7 @@ export class Journal {
    .findMany({
     where: and(
      eq(escalations.repo, repo),
-     opts.root === undefined ? undefined : eq(escalations.root, opts.root),
+     escalationRootFilter(opts.root),
      eq(escalations.status, "open"),
      isNull(escalations.notedAt),
     ),
@@ -659,7 +666,7 @@ export class Journal {
    .findMany({
     where: and(
      eq(escalations.repo, repo),
-     opts.root === undefined ? undefined : eq(escalations.root, opts.root),
+     escalationRootFilter(opts.root),
      eq(escalations.status, "open"),
      isNull(escalations.notedAt),
      // KEYSET pagination: resume strictly AFTER the last raw row seen —
@@ -895,5 +902,5 @@ function hydrateSubstrateReading(row: {
 
 /** Open the configured journal (default from config.state.journalPath). */
 export function openJournal(config: RangerConfig): Journal {
- return new Journal(expandHome(config.state.journalPath), undefined, config.maps);
+ return new Journal(expandHome(config.state.journalPath), undefined, config.maps, config.state.legacyMapRoots);
 }

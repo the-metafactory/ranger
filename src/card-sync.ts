@@ -1,3 +1,4 @@
+import { mapKey } from "./maps.ts";
 import { EscalationDiscord, DiscordMessageGoneError } from "./discord.ts";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import type { Journal, EscalationRow } from "./journal.ts";
@@ -155,7 +156,7 @@ function cardFraming(
     // can set kind/autonomy/title/url to `<@principal-id>`), and the title
     // is capped so a giant title can't evict the decision body or the suffix.
     `${cardHead(node)} — **#${sanitizeGraphText(node.id)}** ${truncate(sanitizeGraphText(node.title), 200)}`,
-    `map: ${map.repo}#${map.root} · ${sanitizeGraphText(node.kind)} · ${sanitizeGraphText(node.autonomy)}`,
+    `map: ${mapKey(map)} · ${sanitizeGraphText(node.kind)} · ${sanitizeGraphText(node.autonomy)}`,
     `url: ${sanitizeGraphText(node.url)}`,
     node.checkpointId !== undefined && node.checkpointId.length > 0
       ? `checkpoint: \`${sanitizeGraphText(node.checkpointId)}\``
@@ -701,7 +702,7 @@ function selectAbsentCards(
 ): EscalationRow[] {
   const wanted = Math.max(budget.remaining, 0);
   const scanPage = 50;
-  const cursorKey = `escalate.absentCursor.${repo}#${root}`;
+  const cursorKey = `escalate.absentCursor.${mapKey({ repo, root })}`;
   // KEYSET cursor (the last row seen: createdAt + nodeId tiebreak) — resumes
   // AFTER it, which is O(page) per tick instead of the O(offset) skip a
   // growing queue would incur (round-31 review).
@@ -1026,7 +1027,7 @@ export async function syncActivePage(ctx: {
     remaining: ACTIVE_CARD_CAP,
     deadline: passDeadline,
   };
-  const cursorKey = `escalate.cursor.${map.repo}#${map.root}`;
+  const cursorKey = `escalate.cursor.${mapKey(map)}`;
   const sorted = [...needed].sort((a, b) => a.id.localeCompare(b.id));
   const pageSize = MAX_CARDS_PER_TICK * 2;
   const offset =

@@ -1,4 +1,4 @@
-import { LAST_IMPLEMENT_MAP, mapKey } from "./maps.ts";
+import { recordImplementStart, mapKey } from "./maps.ts";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -546,7 +546,7 @@ async function runImplementNode(
  const branch = implementBranchFor(node.node, worktreeBranch(nodeId, slug));
  const worktree = await bootstrapWorktree(canonical, nodeId, slug, token, branch, map.base);
  journal.updateWorker(nodeId, ctx.map.repo, { worktree, lane: "implement" });
- journal.setHealth(LAST_IMPLEMENT_MAP, mapKey(map));
+ recordImplementStart(journal, map);
 
  // Substrate selection (node #45), re-run at every session start. A session
  // that hits its substrate's limit is not a failure: the substrate is marked
@@ -636,7 +636,7 @@ async function parkCard(
   await DiscordAnnouncer.fromMap(map).post(
    [
     `:ranger: **parked** #${nodeId} — ${title}`,
-    `map: ${map.repo}#${map.root}`,
+    `map: ${mapKey(map)}`,
     detail.slice(0, 1500),
     "Parked work waits for you: `ranger resume-node`, or take it in a session.",
    ].join("\n"),

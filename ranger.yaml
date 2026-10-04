@@ -133,3 +133,8 @@ principal:
 serve:
   port: 7311
   refreshSec: 900
+
+# Original map before gameplay was registered; used only for journal migration.
+state:
+  legacyMapRoots:
+    jcfischer/seelite: 1

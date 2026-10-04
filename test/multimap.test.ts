@@ -14,6 +14,19 @@ import { sweepMap } from "../src/sweep.ts";
 import { fakeDiscord, fixturesBin, runCli } from "./support.ts";
 
 const REPO = "acme/widgets";
+function legacyJournal() {
+ const dir = mkdtempSync(join(tmpdir(), "ranger-migration-"));
+ const migrations = join(dir, "drizzle"); mkdirSync(join(migrations, "meta"), { recursive: true });
+ const source = join(import.meta.dir, "../drizzle");
+ const manifest = JSON.parse(readFileSync(join(source, "meta/_journal.json"), "utf8"));
+ manifest.entries = manifest.entries.filter((e: { tag: string }) => e.tag !== "0009_worker-root");
+ writeFileSync(join(migrations, "meta/_journal.json"), JSON.stringify(manifest));
+ for (const entry of manifest.entries) copyFileSync(join(source, `${entry.tag}.sql`), join(migrations, `${entry.tag}.sql`));
+ const path = join(dir, "journal.sqlite");
+ const sqlite = new Database(path);
+ migrate(drizzle(sqlite), { migrationsFolder: migrations });
+ return { dir, path, sqlite };
+}
 function rig() {
  const dir = mkdtempSync(join(tmpdir(), "ranger-multimap-"));
  const discord = fakeDiscord();
@@ -45,26 +58,31 @@ function rig() {
 
 describe("node #47 — map identity", () => {
  test("migration backfills roots, preserves worker state and rekeys repo/node ids", () => {
-  const dir = mkdtempSync(join(tmpdir(), "ranger-migration-"));
-  const migrations = join(dir, "drizzle"); mkdirSync(join(migrations, "meta"), { recursive: true });
-  const source = join(import.meta.dir, "../drizzle");
-  const manifest = JSON.parse(readFileSync(join(source, "meta/_journal.json"), "utf8"));
-  manifest.entries = manifest.entries.filter((e: { tag: string }) => e.tag !== "0009_worker-root");
-  writeFileSync(join(migrations, "meta/_journal.json"), JSON.stringify(manifest));
-  for (const entry of manifest.entries) copyFileSync(join(source, `${entry.tag}.sql`), join(migrations, `${entry.tag}.sql`));
-  const path = join(dir, "journal.sqlite");
-  const sqlite = new Database(path);
-  migrate(drizzle(sqlite), { migrationsFolder: migrations });
-  const repos = ["the-metafactory/ranger", "jcfischer/seelite", "jcfischer/seekolous"];
+  const { dir, path, sqlite } = legacyJournal();
+  const repos = ["the-metafactory/ranger", "jcfischer/seelite", "jcfischer/seekolous", "example/custom"];
+  const roots = [1, 1, 26, 87];
   repos.forEach((repo, i) => sqlite.run("INSERT INTO workers(node_id,repo,status,generation,substrate) VALUES(?,?, 'running',7,'codex')", [String(i + 1), repo]));
+  sqlite.run("INSERT INTO escalations(key,repo,node_id,message_id,created_at) VALUES('example/custom:99','example/custom','99','card','2026-10-01')");
+  for (const prefix of ["digest.", "escalate.cursor.", "escalate.absentCursor."]) {
+   sqlite.run("INSERT INTO health(key,value) VALUES(?,?)", [prefix + "jcfischer/seelite", "legacy-state"]);
+  }
+  sqlite.run("INSERT INTO health(key,value) VALUES('digest.jcfischer/seelite#460','sibling-state')");
   sqlite.close();
-  const journal = new Journal(path);
+  const maps = repos.map((repo, i) => ({ repo, root: roots[i] })).concat({ repo: "jcfischer/seelite", root: 460 });
+  const journal = new Journal(path, undefined, maps, { "jcfischer/seelite": 1 });
   try {
-   expect(repos.map((repo, i) => journal.getWorker(String(i + 1), repo)?.root)).toEqual([1, 1, 26]);
+   expect(repos.map((repo, i) => journal.getWorker(String(i + 1), repo)?.root)).toEqual(roots);
+   expect(journal.listEscalations()[0]).toMatchObject({ repo: "example/custom", root: 87, nodeId: "99" });
+   for (const prefix of ["digest.", "escalate.cursor.", "escalate.absentCursor."]) {
+    expect(journal.getHealth(prefix + "jcfischer/seelite#1")).toBe("legacy-state");
+   }
+   expect(journal.getHealth("digest.jcfischer/seelite#460")).toBe("sibling-state");
    expect(journal.getWorker("1", repos[0])?.generation).toBe(7);
    expect(journal.getWorker("1", repos[0])?.substrate).toBe("codex");
    journal.upsertWorker({ nodeId: "1", repo: repos[1], root: 460, status: "claimed" });
-   expect(journal.listWorkers()).toHaveLength(4);
+   expect(journal.listWorkers()).toHaveLength(5);
+   expect(() => journal.upsertWorker({ nodeId: "1", repo: repos[0], root: 460, status: "claimed" })).toThrow("refusing to move");
+   expect(journal.getWorker("1", repos[0])?.root).toBe(1);
    journal.updateWorker("1", repos[1], { status: "parked" });
    expect(journal.getWorker("1", repos[0])?.status).toBe("running");
    const generation = journal.beginGeneration("1", repos[1]);
@@ -79,6 +97,33 @@ describe("node #47 — map identity", () => {
    check.close();
   } finally { journal.close(); rmSync(dir, { recursive: true, force: true }); }
  });
+
+ for (const table of ["workers", "escalations"] as const) {
+  test(`migration refuses unresolved ${table} repos without changing legacy rows`, () => {
+   const { dir, path, sqlite } = legacyJournal();
+   if (table === "workers") sqlite.run("INSERT INTO workers(node_id,repo,status) VALUES('99','example/custom','parked')");
+   else sqlite.run("INSERT INTO escalations(key,repo,node_id,message_id,created_at) VALUES('example/custom:99','example/custom','99','card','2026-10-01')");
+   sqlite.close();
+   try {
+    expect(() => new Journal(path)).toThrow("Cannot backfill legacy map roots for: example/custom");
+    const maps = [1, 460].map(root => ({ repo: "example/custom", root }));
+    expect(() => new Journal(path, undefined, maps)).toThrow("state.legacyMapRoots");
+    expect(() => new Journal(path, undefined, maps, { "example/custom": 999 })).toThrow("must name a registered root");
+    const unchanged = new Database(path);
+    expect(unchanged.query(`SELECT repo FROM ${table}`).all()).toEqual([{ repo: "example/custom" }]);
+    expect((unchanged.query(`PRAGMA table_info(${table})`).all() as { name: string }[]).some(c => c.name === "root")).toBe(false);
+    unchanged.close();
+    const journal = new Journal(path, undefined, maps, { "example/custom": 460 });
+    const rows = table === "workers" ? journal.listWorkers() : journal.listEscalations();
+    expect(rows[0]).toMatchObject({ repo: "example/custom", nodeId: "99", root: 460 });
+    journal.close();
+    // Subsequent opens use the stored root, with no config or fallback required.
+    const reopened = new Journal(path);
+    expect((table === "workers" ? reopened.listWorkers() : reopened.listEscalations())[0].root).toBe(460);
+    reopened.close();
+   } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+ }
 
  test("selectors refuse ambiguous repos; resume infers the journal root", async () => {
   const r = rig();

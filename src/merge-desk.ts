@@ -1,4 +1,4 @@
-import { LAST_IMPLEMENT_MAP, mapKey } from "./maps.ts";
+import { recordImplementStart, mapKey } from "./maps.ts";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import { DiscordAnnouncer } from "./announce.ts";
 import {
@@ -11,7 +11,6 @@ import {
 } from "./implement.ts";
 import type { Journal, WorkerRow } from "./journal.ts";
 import { evaluateMergeGate } from "./merge-gate.ts";
-import { implementLane } from "./lanes.ts";
 
 /**
  * The merge desk (design §4/§5, #23): each tick, every implement-lane row
@@ -101,7 +100,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    await post(
     [
      `:ranger: **parked** #${row.nodeId} — ${title}`,
-     `map: ${repo}#${map.root}${row.prNumber === null ? "" : ` · PR #${row.prNumber}`}`,
+     `map: ${mapKey(map)}${row.prNumber === null ? "" : ` · PR #${row.prNumber}`}`,
      detail.slice(0, 1500),
     ].join("\n"),
     `park card for #${row.nodeId}`,
@@ -187,14 +186,13 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    }
    // A send-back starts a worker session (fix pass or probes): it waits for
    // the implement lane like any other start. The stale card is already gone.
-   const lane = implementLane(map);
-   const holder = journal.laneHolder(lane, row.nodeId, repo);
+   const holder = journal.implementHolder({ nodeId: row.nodeId, repo });
    if (holder !== null) {
     result.pending.push(row.nodeId);
     journal.recordEvent("sweep", {
      nodeId: row.nodeId,
      repo,
-     detail: `PR #${pr.number}: ${why} — waiting for the ${lane} implement lane (held by #${holder.nodeId})`,
+     detail: `PR #${pr.number}: ${why} — waiting for the implement lane (held by #${holder.nodeId}, ${mapKey(holder)})`,
     });
     return;
    }
@@ -204,7 +202,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
     return;
    }
    journal.updateWorker(row.nodeId, repo, { status: "running", phase: "review", pid });
-   journal.setHealth(LAST_IMPLEMENT_MAP, mapKey(row));
+   recordImplementStart(journal, row);
    journal.recordEvent("sweep", {
     nodeId: row.nodeId,
     repo,
@@ -272,7 +270,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   const messageId = await post(
    [
     `:ranger: **merge needed** #${row.nodeId} — ${title}`,
-    `map: ${repo}#${map.root}`,
+    `map: ${mapKey(map)}`,
     `Gate passed at \`${gate.headSha.slice(0, 8)}\`: CI green, mergeable, base \`${map.base}\`, sage ${last?.round ?? "?"} round(s), the last with 0 blockers and 0 majors (machine evidence, not a sign-off).`,
     ...(probesRequired
      ? [`Probes passed at \`${gate.headSha.slice(0, 8)}\` (selection ${probe?.mode ?? "?"}, ${probe?.selected ?? "?"} probe(s)). Only the selected probes ran, not the full suite.`]

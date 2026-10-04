@@ -12,10 +12,7 @@ maps:
     #                    nodes, and propose task/build nodes whose ratification
     #                    is the principal's merge of the PR
     walk: none
-    # Implement capacity: visual when commands.probe is declared, headless
-    # otherwise. One claimed/running implement worker across all maps.
-    # Override for GPU tests without probes, or probes that need no GPU:
-    # lane: visual   # visual | headless
+    # Implement capacity: one claimed/running worker across all maps.
     # Optional canonical-checkout override (design §4: probes run where the
     # registry says — the canonical checkout, never a worktree). Defaults to
     # <state.canonicalRoot>/<repo>.
@@ -75,6 +72,10 @@ principal:
   login: jcfischer
 
 state:
+  # Migration-only: set an original root when a legacy repo now has two maps.
+  # Repos with one registered map infer it; unknown/ambiguous repos refuse.
+  # legacyMapRoots:
+  #   jcfischer/seelite: 1
   # SQLite journal (design §8) — workers, events, dead-man/spawn ledger, vetoes.
   journalPath: ~/.config/ranger/state.sqlite
   # Root under which each walked repo's canonical checkout lives.

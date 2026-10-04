@@ -1,3 +1,4 @@
+import { mapKey } from "./maps.ts";
 import { join } from "node:path";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import type { EscalationDiscord } from "./discord.ts";
@@ -304,7 +305,7 @@ async function digestOneMap(
     const synced = await syncDailyDigest({
       client,
       journal,
-      repo: `${map.repo}#${map.root}`,
+      repo: mapKey(map),
       content,
       now,
       deadline: digestDeadline,

@@ -302,13 +302,13 @@ describe("walk — implement lane selection (#23)", () => {
    const path = join(dir, "ranger.yaml");
    require("node:fs").writeFileSync(path, baseConfigLines(dir).join("\n"));
    const journal = openJournal(loadConfig(path).config);
-   expect(implementLaneBusy(journal, "headless")).toBe(false);
+   expect(implementLaneBusy(journal)).toBe(false);
    journal.upsertWorker({ root: 1, nodeId: "1", repo: "acme/widgets", status: "awaiting-merge", lane: "implement" });
-   expect(implementLaneBusy(journal, "headless")).toBe(false); // waiting on a merge does not hold the lane
+   expect(implementLaneBusy(journal)).toBe(false); // waiting on a merge does not hold the lane
    journal.upsertWorker({ root: 1, nodeId: "2", repo: "acme/widgets", status: "running", lane: "research" });
-   expect(implementLaneBusy(journal, "headless")).toBe(false);
+   expect(implementLaneBusy(journal)).toBe(false);
    journal.upsertWorker({ root: 1, nodeId: "4", repo: "acme/widgets", status: "running", lane: "implement" });
-   expect(implementLaneBusy(journal, "headless")).toBe(true);
+   expect(implementLaneBusy(journal)).toBe(true);
    journal.close();
   } finally {
    rmSync(dir, { recursive: true, force: true });
@@ -410,10 +410,10 @@ describe("implement lane holder", () => {
    const journal = openJournal(loadConfig(path).config);
    journal.upsertWorker({ root: 1, nodeId: "1", repo: "acme/widgets", status: "awaiting-merge", lane: "implement" });
    journal.upsertWorker({ root: 1, nodeId: "2", repo: "acme/widgets", status: "running", lane: "research" });
-   expect(journal.laneHolder("headless")).toBeNull();
+   expect(journal.implementHolder()).toBeNull();
    journal.upsertWorker({ root: 1, nodeId: "3", repo: "acme/widgets", status: "running", lane: "implement" });
-   expect(journal.laneHolder("headless")?.nodeId).toBe("3");
-   expect(journal.laneHolder("headless", "3", "acme/widgets")).toBeNull();
+   expect(journal.implementHolder()?.nodeId).toBe("3");
+   expect(journal.implementHolder({ nodeId: "3", repo: "acme/widgets" })).toBeNull();
    journal.close();
   } finally {
    rmSync(dir, { recursive: true, force: true });

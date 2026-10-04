@@ -38,14 +38,10 @@ Shipped build-path steps:
   outward action, process-group kill) and resumes its phase from GitHub. The
   approver bot (node #16) remains.
 
-Implement capacity is split into **visual** and **headless** lanes (node #57):
-maps with `commands.probe` use visual; other maps use headless. An optional
-map `lane: visual | headless` overrides that default. Walk, resume and merge-desk
-send-backs check the map's own lane; each lane holds one claimed/running
-implement node. The daily spawn cap and dead-man pause remain global; research
-selection is unchanged. The dashboard shows both holders and groups queues by
-lane. Existing worker rows resolve their lane from current config; an unknown
-or ambiguous map conservatively holds both lanes.
+One claimed/running implement worker holds the shared lane across all maps
+(node #47). Maps alternate by a persisted round-robin cursor; empty or gated
+maps are skipped. Awaiting-merge releases the lane. The dashboard shows the
+holder and the same next choice as walk. Research selection is unchanged.
 
 ## Scout (build-path step 1)
 

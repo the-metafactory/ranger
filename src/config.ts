@@ -3,7 +3,6 @@ import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { parse } from "yaml";
 import { z } from "zod";
-import { IMPLEMENT_LANES } from "./lanes.ts";
 
 /**
  * ranger.yaml — per-run ranger configuration.
@@ -45,8 +44,6 @@ const MapSchema = z.object({
   .transform(Number),
  /** Walk mode (node #9): what ranger may autonomously do on this map. */
  walk: WalkModeSchema,
- /** Machine-resource lane; defaults to visual with commands.probe, headless otherwise. */
- lane: z.enum(IMPLEMENT_LANES).optional(),
  /** Optional per-run Discord escalation surface (node #7). */
  discord: DiscordSchema.optional(),
  /**
@@ -187,6 +184,8 @@ const PrincipalSchema = z.object({
 });
 
 const StateSchema = z.object({
+ /** Migration-only: original roots for repos now registering multiple maps. */
+ legacyMapRoots: z.record(z.string().regex(REPO_PATTERN), z.number().int().positive()).default({}),
  /** SQLite journal path (design §8). */
  journalPath: z.string().default("~/.config/ranger/state.sqlite"),
  /** Root under which each walked repo's canonical checkout lives. */

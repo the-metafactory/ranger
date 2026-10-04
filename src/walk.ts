@@ -1,4 +1,4 @@
-import { LAST_IMPLEMENT_MAP, mapKey, mapOrder } from "./maps.ts";
+import { LAST_IMPLEMENT_MAP, recordImplementStart, mapKey, mapOrder } from "./maps.ts";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
 import type { RangerConfig, RangerMapConfig, WalkMode } from "./config.ts";
@@ -14,7 +14,6 @@ import {
  WriteGateError,
 } from "./identity.ts";
 import type { Journal } from "./journal.ts";
-import { implementLane, type ImplementLane } from "./lanes.ts";
 import { classify, loadProbeRegistry, type ClassifiedNode } from "./route.ts";
 import { sweepMap, type SweepMapResult } from "./sweep.ts";
 import {
@@ -107,9 +106,9 @@ export interface WalkContext {
  now?: () => Date;
 }
 
-/** Is this resource lane held? (awaiting-merge does not hold it.) */
-export function implementLaneBusy(journal: Journal, lane: ImplementLane): boolean {
- return journal.laneHolder(lane) !== null;
+/** Is the implement lane held? (awaiting-merge does not hold it.) */
+export function implementLaneBusy(journal: Journal): boolean {
+ return journal.implementHolder() !== null;
 }
 
 export async function walk(ctx: WalkContext): Promise<WalkResult> {
@@ -197,7 +196,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
     );
     // The plan `ranger serve` (#37) also reads, so its "next" is this order.
     const plan = planTick(classified, {
-     laneBusy: implementClaimed || implementLaneBusy(journal, implementLane(map)),
+     laneBusy: implementClaimed || implementLaneBusy(journal),
      vetoed: (id) => journal.hasVeto(id),
     });
     const candidates = plan.selected;
@@ -215,6 +214,11 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
      // Veto cache: a vetoed node is never claimed (design §5, journal durability).
      if (plan.vetoed.includes(node)) {
       errors.push(`#${node.id} vetoed — not claimed`);
+      continue;
+     }
+     const existing = journal.getWorker(node.id, map.repo);
+     if (existing !== null && existing.root !== map.root) {
+      errors.push(`#${node.id} already belongs to ${mapKey(existing)} — claim refused`);
       continue;
      }
 
@@ -257,7 +261,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
      mapResult.claimed.push(node.id);
      if (laneOf(node.id) === "implement") {
       implementClaimed = true;
-      journal.setHealth(LAST_IMPLEMENT_MAP, mapKey(map));
+      recordImplementStart(journal, map);
      }
      journal.recordSpawn(ctx.now?.() ?? new Date());
      // A fresh claim starts a clean row BEFORE the supervisor spawns: a node

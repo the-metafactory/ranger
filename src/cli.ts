@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { LAST_IMPLEMENT_MAP, mapKey, pickMap, resumeMap } from "./maps.ts";
+import { recordImplementStart, mapKey, pickMap, resumeMap } from "./maps.ts";
 import { Command } from "commander";
 import { join, resolve } from "node:path";
 import {
@@ -29,7 +29,6 @@ import {
  type ResolvedToken,
 } from "./token-gate.ts";
 import { openJournal, type Journal } from "./journal.ts";
-import { implementLane } from "./lanes.ts";
 import {
  assertNotPrincipal,
  resolveBotIdentity,
@@ -271,16 +270,15 @@ async function runResumeNode(
   if (row.status === "released") {
    throw new Error(`node ${nodeId}'s claim was released — the walk re-claims it from the frontier`);
   }
-  // A resume starts a worker session in this map's resource lane.
-  const lane = implementLane(map);
-  const holder = row.lane === "implement" ? journal.laneHolder(lane, nodeId, map.repo) : null;
+  // A resume starts a worker session in the shared implement lane.
+  const holder = row.lane === "implement" ? journal.implementHolder({ nodeId, repo: map.repo }) : null;
   if (holder !== null && force !== true) {
    throw new Error(
-    `the ${lane} implement lane is held by #${holder.nodeId} (${holder.repo}, ${holder.status}) — resume #${nodeId} after it leaves the lane, or pass --force to run both`,
+    `the implement lane is held by #${holder.nodeId} (${mapKey(holder)}, ${holder.status}) — resume #${nodeId} after it leaves the lane, or pass --force to run both`,
    );
   }
   journal.updateWorker(nodeId, map.repo, { status: "claimed", pid: null, workerPgid: null, finishedAt: null });
-  if (row.lane === "implement") journal.setHealth(LAST_IMPLEMENT_MAP, mapKey(map));
+  if (row.lane === "implement") recordImplementStart(journal, map);
   const pid = await spawnRunNodeDetached({
    nodeId,
    repo: map.repo,
@@ -531,7 +529,7 @@ program
   "Operator verb: put a parked/failed node back in motion — the row returns to claimed and a detached run-node resumes it (the implement lane resumes from its PR)",
  )
  .argument("<id>", "node id to resume")
- .option("-m, --map <owner/name#root>", "map repo (required with multiple maps)")
+ .option("-m, --map <owner/name#root>", "map repo or repo#root (optional; inferred from the journal row)")
  .option("--force", "resume even while another implement worker holds the lane")
  .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
  .action(async (id: string, options: { map?: string; config: string; force?: boolean }) => {
