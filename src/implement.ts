@@ -649,9 +649,9 @@ async function workerPass(
 
 /**
  * The worker session itself, then the supervisor's own test + keyword checks.
- * `fenceSpawn` runs right before the spawn: the generation fence, which also
- * opens the session row (node #56), so a pass superseded during the awaits
- * before it neither spawns nor records a session.
+ * `fenceSpawn` runs right before the spawn: the generation fence, which for
+ * a recorded substrate also opens the session row (node #56), so a pass
+ * superseded during the awaits before it neither spawns nor records a session.
  */
 async function checkedWorkerPass(
  ctx: ImplementContext,

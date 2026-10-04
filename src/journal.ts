@@ -798,8 +798,8 @@ export class Journal {
   * transaction: a superseded supervisor (generation no longer the worker
   * row's) gets a FencedError and touches no row. A node runs one session at
   * a time under its current supervisor, so a row still open for the same
-  * node belongs to a supervisor that died mid-session: it is closed as
-  * failed here, and its own late `endSubstrateSession` (if any) no longer
+  * node belongs to an older generation, superseded or dead mid-session: it
+  * is closed as failed here, and its own late `endSubstrateSession` (if any) no longer
   * applies.
   */
  startSubstrateSession(
