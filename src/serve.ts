@@ -588,6 +588,16 @@ const json = (status: number, body: unknown): Response =>
 
 const refuse = (status: number, error: string): Response => json(status, { error });
 
+/** A POST body that parses to a JSON object; null for anything else (`null`, an array, a number, bad JSON). */
+async function readObject(req: Request): Promise<Record<string, unknown> | null> {
+ try {
+  const body: unknown = await req.json();
+  return typeof body === "object" && body !== null && !Array.isArray(body) ? (body as Record<string, unknown>) : null;
+ } catch {
+  return null;
+ }
+}
+
 function tokenMatches(given: string | null, token: string): boolean {
  if (given === null) return false;
  const a = Buffer.from(given);
@@ -633,12 +643,8 @@ export function createHandler(ctx: HandlerContext): (req: Request) => Promise<Re
   const action = ACTION_PATHS[url.pathname];
   if (action !== undefined) {
    if (ctx.actions === undefined) return refuse(501, "actions are not wired in this server");
-   let body: Record<string, unknown>;
-   try {
-    body = (await req.json()) as Record<string, unknown>;
-   } catch {
-    return refuse(400, "body is not JSON");
-   }
+   const body = await readObject(req);
+   if (body === null) return refuse(400, "body is not a JSON object");
    const actions = ctx.actions;
    const result = await runAction(action, body, {
     entries: ctx.getState().needsYou,
@@ -654,12 +660,8 @@ export function createHandler(ctx: HandlerContext): (req: Request) => Promise<Re
   }
   if (url.pathname !== "/api/grill") return refuse(404, "not found");
 
-  let body: { key?: unknown; id?: unknown; dryRun?: unknown };
-  try {
-   body = (await req.json()) as typeof body;
-  } catch {
-   return refuse(400, "body is not JSON");
-  }
+  const body: { key?: unknown; id?: unknown; dryRun?: unknown } | null = await readObject(req);
+  if (body === null) return refuse(400, "body is not a JSON object");
   if (typeof body.key !== "string" || typeof body.id !== "string") {
    return refuse(400, "key and id are required strings");
   }
@@ -962,6 +964,19 @@ export class ServeReader {
  wantDetails(issues: string[], prs: string[]): void {
   this.detailIssues = new Set(issues);
   this.detailPrs = new Set(prs);
+  // Drop what no row wants any more, so the caches hold today's candidates,
+  // not every node the dashboard has ever shown.
+  for (const key of this.labels.keys()) if (!this.detailIssues.has(key)) this.labels.delete(key);
+  for (const key of this.prs.keys()) if (!this.detailPrs.has(key)) this.prs.delete(key);
+  for (const set of [this.detailErrors, this.detailTried]) {
+   for (const key of set.keys()) if (!this.wantedDetail(key)) set.delete(key);
+  }
+ }
+
+ private wantedDetail(key: string): boolean {
+  if (key.startsWith("issue:")) return this.detailIssues.has(key.slice("issue:".length));
+  if (key.startsWith("pr:")) return this.detailPrs.has(key.slice("pr:".length));
+  return false;
  }
 
  private unread(): { issues: string[]; prs: string[] } {
@@ -1002,13 +1017,14 @@ export class ServeReader {
 
  private async readDetails(all: boolean): Promise<void> {
   const keys = all ? { issues: [...this.detailIssues], prs: [...this.detailPrs] } : this.unread();
-  const attempt = async (key: string, read: () => Promise<void>): Promise<void> => {
+  const attempt = async (key: string, read: () => Promise<void>, unknown?: () => void): Promise<void> => {
    this.detailTried.add(key);
    try {
     await read();
     this.detailErrors.delete(key);
    } catch (error) {
     this.detailErrors.set(key, error instanceof Error ? error.message : String(error));
+    unknown?.();
    }
   };
   // Issues and PRs are independent reads: one queue, a few at a time, so a
@@ -1021,7 +1037,10 @@ export class ServeReader {
      if (issue === null) throw new Error("could not read the issue");
      this.labels.set(key, issue.labels);
      this.titles.set(key, issue.title);
-    }),
+    },
+    // A failed refresh leaves the labels unknown, not as last read: a label
+    // added since must not hide behind "nothing waits".
+    () => this.labels.delete(key)),
    ),
    ...keys.prs.map((key) => () =>
     attempt(`pr:${key}`, async () => {

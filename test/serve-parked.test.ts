@@ -434,7 +434,7 @@ describe("node #54 — the actions and their guards", () => {
   expect(runs[1].argv).not.toContain("--force");
  });
 
- test("merge runs gh under the principal's login, pinned to the confirmed head", async () => {
+ test("merge runs gh without the machine account's credential, pinned to the confirmed head", async () => {
   const { handler, runs } = setup();
   const res = await handler(post("/api/merge", { ...ok, sha: SHA }));
   expect(res.status).toBe(200);
@@ -483,6 +483,9 @@ describe("node #54 — the actions and their guards", () => {
   ["merge whose CI failed when read live", "merge", post("/api/merge", { ...ok, sha: SHA }), { live: greenPr({ ci: "failed" }) }],
   ["merge when the PR cannot be read live", "merge", post("/api/merge", { ...ok, sha: SHA }), { live: null }],
   ["session with no directory", "session", post("/api/session", ok), { exists: () => false }],
+  ["a null body", "resume", post("/api/resume", null)],
+  ["an array body", "merge", post("/api/merge", [ok])],
+  ["a null body on the grilling launch", "grill", post("/api/grill", null)],
  ];
  for (const [name, , req, opts] of refusals) {
   test(`refuses: ${name}`, async () => {
@@ -604,6 +607,54 @@ describe("node #54 — the journal feeds the section, with no GitHub call from a
   expect(calls).toHaveLength(4);
   // An action forgets its entry, so that entry is read once more at once.
   reader.forget(`${SEELITE}#663`, `${SEELITE}#687`);
+  expect(reader.hasUnreadDetails()).toBe(true);
+ });
+
+ test("a failed label refresh makes the labels unknown, even when an earlier read cached them", async () => {
+  const config = { state: { journalPath: "/nonexistent" } } as unknown as RangerConfig;
+  let fail = false;
+  const reader = new ServeReader(config, [], "/nonexistent", {
+   issue: async () => {
+    if (fail) throw new Error("HTTP 502");
+    return { title: "t", labels: [] };
+   },
+   pr: async () => greenPr(),
+  });
+  reader.wantDetails([`${SEELITE}#433`], []);
+  await reader.refreshDetails(true);
+  expect(reader.labels.get(`${SEELITE}#433`)).toEqual([]);
+  // The label may have been added since; a failed read must not keep the old answer.
+  fail = true;
+  await reader.refreshDetails(true);
+  expect(reader.labels.has(`${SEELITE}#433`)).toBe(false);
+  expect(reader.detailErrors.get(`issue:${SEELITE}#433`)).toMatch(/HTTP 502/);
+  const inputs = entryInputs({
+   workers: [row({ nodeId: "433", status: "awaiting-merge", outcome: null })],
+   labels: (repo, id) => reader.labels.get(`${repo}#${id}`) ?? null,
+  });
+  expect(needsYouEntries(inputs)).toEqual([]);
+  expect(uncheckedNeedsEye(inputs)).toEqual([`${SEELITE}#433`]);
+ });
+
+ test("details for nodes no row wants any more are dropped", async () => {
+  const config = { state: { journalPath: "/nonexistent" } } as unknown as RangerConfig;
+  const reader = new ServeReader(config, [], "/nonexistent", {
+   issue: async (_repo, id) => (id === "2" ? null : { title: id, labels: [] }),
+   pr: async () => {
+    throw new Error("HTTP 502");
+   },
+  });
+  reader.wantDetails([`${SEELITE}#1`, `${SEELITE}#2`], [`${SEELITE}#700`]);
+  await reader.refreshDetails(true);
+  expect(reader.labels.has(`${SEELITE}#1`)).toBe(true);
+  expect(reader.detailErrors.size).toBe(2);
+  reader.wantDetails([], []);
+  expect(reader.labels.size).toBe(0);
+  expect(reader.prs.size).toBe(0);
+  expect(reader.detailErrors.size).toBe(0);
+  expect(reader.hasUnreadDetails()).toBe(false);
+  // Wanted again, they are read afresh rather than skipped as already tried.
+  reader.wantDetails([`${SEELITE}#1`], []);
   expect(reader.hasUnreadDetails()).toBe(true);
  });
 });

@@ -10,8 +10,10 @@
  *
  * **Actions stay out of process.** Nothing here writes the journal or the
  * graph: a resume spawns the existing `ranger resume-node` verb, a merge runs
- * the principal's own `gh` (the machine account's token and config dropped,
- * so gh falls back to the keyring), and a session opens iTerm2 the way the
+ * `gh` with the machine account's token and config dropped, so gh uses the
+ * login stored under this user's HOME (the principal's, on the principal's
+ * machine; nothing here checks which account that is), and a session opens
+ * iTerm2 the way the
  * grilling button does. Every action is re-checked against the journal as it
  * reads when the request arrives, and the spawner is injected so no test runs
  * `gh`, `osascript` or ranger.
@@ -390,7 +392,9 @@ export const MACHINE_GH_KEYS = ["GH_TOKEN", "GITHUB_TOKEN", "GH_CONFIG_DIR"] as 
 
 /**
  * The merge's environment: the launch allowlist, and none of the machine
- * account's gh keys, so `gh` uses the principal's keyring login.
+ * account's gh keys, so `gh` uses the login stored under HOME. What this
+ * proves is the absence of the machine account's credential, not whose login
+ * HOME holds.
  */
 export function mergeEnv(env: Record<string, string | undefined>): Record<string, string> {
  const out = childEnv(env);
