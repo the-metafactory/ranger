@@ -133,7 +133,7 @@ export interface SubstrateUsageView {
  /** ISO, only while still in the future. */
  cappedUntil: string | null;
  eligible: Eligibility;
- /** Null when the journal has no session history to count (not migrated yet). */
+ /** Null when there is no session history to read (no journal, or one not migrated yet). */
  sessions: {
   /** Sessions whose supervisor is alive now, by kind. */
   running: Record<SessionKind, number>;

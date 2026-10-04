@@ -734,7 +734,7 @@ function renderSubstrates(s) {
    lines.push(span("read " + sub.ageMin + " min ago (max " + sub.maxAgeMin + " min)" + (sub.cappedUntil ? " \u00B7 capped until " + at(sub.cappedUntil) : sub.capped ? " \u00B7 capped until the next reading" : ""), grey));
   }
   lines.push(span("eligible now: " + sub.eligible.state + " \u00B7 " + sub.eligible.reason));
-  if (!sub.sessions) lines.push(span("sessions: no history to count (journal not migrated yet)", "muted"));
+  if (!sub.sessions) lines.push(span("sessions: no session history to read", "muted"));
   else {
    const running = KINDS.filter(([k]) => sub.sessions.running[k] > 0).map(([k, name]) => sub.sessions.running[k] + " " + name);
    lines.push(span("running now: " + (running.length ? running.join(" \u00B7 ") : "none")));
