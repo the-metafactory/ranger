@@ -100,6 +100,42 @@ describe("loadConfig", () => {
     );
   });
 
+  test("substrates.codex: a model name with a space or a quote, or an unknown effort → ConfigError (node #60)", () => {
+    const base = ["version: 1", "maps:", "  - repo: acme/widgets", "    root: 1", "substrates:", "  codex:"];
+    for (const line of [
+      '    model: "gpt 6.1"',
+      '    model: "gpt-6.1\\"sol"',
+      "    model: \"gpt-6.1'sol\"",
+      '    model: "gpt;rm"',
+      "    reasoningEffort: xhigh",
+    ]) {
+      withConfig([...base, line].join("\n"), (path) => {
+        expect(() => loadConfig(path)).toThrow(ConfigError);
+      });
+    }
+  });
+
+  test("substrates.codex: configured model and effort parse (node #60)", () => {
+    withConfig(
+      [
+        "version: 1",
+        "maps:",
+        "  - repo: acme/widgets",
+        "    root: 1",
+        "substrates:",
+        "  codex:",
+        "    model: gpt-5.5-codex",
+        "    reasoningEffort: medium",
+      ].join("\n"),
+      (path) => {
+        expect(loadConfig(path).config.substrates.codex).toEqual({
+          model: "gpt-5.5-codex",
+          reasoningEffort: "medium",
+        });
+      },
+    );
+  });
+
   test("missing file → ConfigError", () => {
     expect(() => loadConfig("/nonexistent/ranger.yaml")).toThrow(ConfigError);
   });
