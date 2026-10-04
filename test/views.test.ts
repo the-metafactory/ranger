@@ -81,7 +81,7 @@ describe("views templates", () => {
 });
 
 describe("diff selection", () => {
- test("strictly above each control floor, most changed first, whole pairs under the cap", () => {
+ test("strictly above each single control sample, most changed first, whole pairs under the cap", () => {
   const rows = [
    { view: "quiet", change: 1, noise: 1 },
    { view: "noisy", change: 2, noise: 3 },
@@ -92,9 +92,9 @@ describe("diff selection", () => {
   const selected = chooseViews(rows, () => [1, 1], { files: 4, fileBytes: 10, totalBytes: 100 });
   expect(selected.attached.map(r => r.view)).toEqual(["big", "medium"]);
   expect(selected.omitted).toEqual([
-   { view: "noisy", reason: "within control noise" },
+   { view: "noisy", reason: "change does not exceed single control sample" },
    { view: "small", reason: "message attachment limit" },
-   { view: "quiet", reason: "within control noise" },
+   { view: "quiet", reason: "change does not exceed single control sample" },
   ]);
  });
  test("file and total byte budgets and missing PNGs omit pairs while smaller pairs still fit", () => {
@@ -116,6 +116,42 @@ describe("diff selection", () => {
 });
 
 describe("capture orchestration", () => {
+ test("diff processes sharing the output directory never overlap", async () => {
+  const r = rig();
+  const run = r.ctx.dependencies!.run!;
+  let active = false;
+  const completed: string[] = [];
+  r.ctx.dependencies!.run = async (bin, args, opts) => {
+   if (!args[1].startsWith("diff")) return run(bin, args, opts);
+   if (active) throw new Error("overlapping diffs");
+   active = true;
+   try {
+    await new Promise(resolve => setTimeout(resolve, 10));
+    const result = await run(bin, args, opts);
+    completed.push(args[1]);
+    return result;
+   } finally { active = false; }
+  };
+  expect(await captureViews(r.ctx)).toMatchObject({ status: "ok" });
+  expect(completed).toHaveLength(2);
+  expect(completed[0]).toEndWith("'before' 'after'");
+  expect(completed[1]).toEndWith("'after' 'after2'");
+ });
+ test("failed worktree removal still prunes after deleting the scratch directory", async () => {
+  const r = rig();
+  const git = r.ctx.dependencies!.git!;
+  let pruned = false;
+  r.ctx.dependencies!.git = async (args, opts) => {
+   if (args[0] === "worktree" && args[1] === "remove") return { code: 1, stdout: "", stderr: "remove refused" };
+   if (args[0] === "worktree" && args[1] === "prune") {
+    expect(existsSync(r.servers[0].cwd)).toBe(false);
+    pruned = true;
+   }
+   return git(args, opts);
+  };
+  expect(await captureViews(r.ctx)).toMatchObject({ status: "ok" });
+  expect(pruned).toBe(true);
+ });
  test("unconfigured needs-eye map does not run or persist failure evidence", async () => {
   const r = rig();
   r.ctx.map.commands.views = undefined;
@@ -197,7 +233,8 @@ describe("capture orchestration", () => {
   expect(r.servers.every(s => s.stopped)).toBe(true);
   expect(r.servers[1].cwd).toBe(r.ctx.worktree);
   expect(existsSync(r.servers[0].cwd)).toBe(false);
-  expect(r.calls.at(-1)).toStartWith("git worktree remove --force");
+  expect(r.calls.at(-2)).toStartWith("git worktree remove --force");
+  expect(r.calls.at(-1)).toBe("git worktree prune");
   expect(loadViewsRecord(r.out, SHA)).toEqual(record);
   expect(loadViewsRecord(r.out, BASE)).toBeUndefined();
   const before = r.calls.length;
@@ -205,7 +242,7 @@ describe("capture orchestration", () => {
   expect(r.calls).toHaveLength(before); // resume uses only this head's evidence
   const card = await viewsCard(r.out, SHA);
   expect(card.files.map(f => f.name)).toEqual(["hull-before.png", "hull-after.png"]);
-  expect(card.summary).toContain("sky (within control noise)");
+  expect(card.summary).toContain("sky (change does not exceed single control sample)");
   expect(viewsComment(record!, r.out)).toContain(`<!-- ranger:views sha=${SHA} -->`);
   expect(viewsComment(record!, r.out)).toContain("| hull | 2.30% | 0.10% |");
   expect(viewsComment(record!, r.out)).toContain(`${r.out}/index.html`);
@@ -218,7 +255,8 @@ describe("capture orchestration", () => {
   expect((await viewsCard(r.out, SHA)).summary).toContain("software renderer refused");
   if (code === -1) expect((await viewsCard(r.out, SHA)).summary).toContain("timed out");
   expect(r.servers).toEqual([]); // failed install before any server starts
-  expect(r.calls.at(-1)).toStartWith("git worktree remove --force");
+  expect(r.calls.at(-2)).toStartWith("git worktree remove --force");
+  expect(r.calls.at(-1)).toBe("git worktree prune");
  });
  test("a refused capture stops its server in finally", async () => {
   const r = rig();
@@ -243,7 +281,8 @@ describe("capture orchestration", () => {
   const r = rig();
   r.ctx.dependencies!.startServer = async () => { throw new Error("server readiness timed out"); };
   expect(await captureViews(r.ctx)).toMatchObject({ status: "failed", reason: "server readiness timed out" });
-  expect(r.calls.at(-1)).toStartWith("git worktree remove --force");
+  expect(r.calls.at(-2)).toStartWith("git worktree remove --force");
+  expect(r.calls.at(-1)).toBe("git worktree prune");
  });
  test("moved worktree head cannot produce evidence for the reviewed head", async () => {
   const r = rig();

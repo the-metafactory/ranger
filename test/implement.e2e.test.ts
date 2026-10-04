@@ -21,7 +21,7 @@ import { LAST_IMPLEMENT_MAP } from "../src/maps.ts";
 import { sweepMap } from "../src/sweep.ts";
 import { runNode, type RunNodeContext } from "../src/worker.ts";
 import { baseConfigLines, createCanonicalRepo, GIT_ENV } from "./support.ts";
-import { viewsDirectory } from "../src/views.ts";
+import { saveViewsRecord, viewsDirectory } from "../src/views.ts";
 import { DiscordAnnouncer } from "../src/announce.ts";
 
 const fixturesBin = join(import.meta.dir, "fixtures", "bin");
@@ -922,7 +922,95 @@ describe("implement lane (node #23)", () => {
    expect(posts[0]).toContain("**merge needed**");
    expect(posts[0]).not.toContain("Visual evidence");
    expect(r.journal.getWorker("20", r.ctx.map.repo)?.mergeMessageId).toBe("label-outage-card");
+   expect(r.journal.listEvents().some(e => e.kind === "merge-card" && e.detail?.includes("label lookup failed (informational): Error: labels unavailable"))).toBe(true);
   }
+ }, 60_000);
+
+ test.each([413, 400])("evidence rejected with HTTP %s falls back to a text merge card once", async status => {
+  const r = await rig({ autoMerge: true });
+  cleanup.push(r.dir);
+  r.github.labels.set(20, ["ranger:needs-eye"]);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  r.ctx.map.commands.views = "capture {label} {out} {origin}";
+  const pr = await r.github.getPr(r.ctx.map.repo, 1);
+  const out = viewsDirectory(r.journal.path, r.ctx.map.repo, "20", pr.headSha);
+  // 413 exercises multipart files; 400 exercises embeds with no files.
+  const rows = status === 413 ? [{ view: "hull", change: 2, noise: 0.1 }]
+   : Array.from({ length: 40 }, (_, i) => ({ view: `quiet-view-${i}`, change: 0, noise: 0 }));
+  if (status === 413) {
+   for (const label of ["before", "after"]) {
+    mkdirSync(join(out, label), { recursive: true });
+    writeFileSync(join(out, label, "hull.png"), "PNG");
+   }
+  }
+  saveViewsRecord(out, { sha: pr.headSha, status: "ok", rows });
+  const requests: RequestInit[] = [];
+  const fetchFn = (async (_url, init) => {
+   requests.push(init!);
+   if (requests.length === 1) {
+    if (status === 413) expect(init!.body).toBeInstanceOf(FormData);
+    else expect(JSON.parse(init!.body as string).embeds.length).toBeGreaterThan(0);
+    return new Response("rejected evidence", { status });
+   }
+   const body = JSON.parse(init!.body as string);
+   expect(body.attachments).toBeUndefined();
+   expect(body.embeds).toBeUndefined();
+   expect(body.content).toContain("**merge needed**");
+   expect(body.content).toContain("your eye is the check");
+   expect(body.content).toContain("Visual evidence could not be delivered:");
+   expect(body.content).toContain(`discord post returned HTTP ${status}`);
+   expect(body.content.length).toBeLessThanOrEqual(2000);
+   return new Response(JSON.stringify({ id: "text-fallback-card" }), { status: 200 });
+  }) as typeof fetch;
+  const announcer = new DiscordAnnouncer("fake-token", "channel", "https://discord.test", fetchFn);
+  const sweep = () => sweepMap({
+   config: r.ctx.config, journal: r.journal, map: r.ctx.map, token: "ghp_write", botIdentity: BOT, github: r.github,
+   post: (content, label, files, embeds) => announcer.post(content, label, files, embeds),
+   respawn: async () => DEAD_PID,
+  });
+  const tick = await sweep();
+  expect(tick.mergeDesk?.errors).toEqual([]);
+  expect(tick.mergeDesk?.cards).toEqual(["20"]);
+  expect(tick.mergeDesk?.parked).toEqual([]);
+  expect(r.journal.getWorker("20", r.ctx.map.repo)?.status).toBe("awaiting-merge");
+  expect(r.journal.getWorker("20", r.ctx.map.repo)?.mergeMessageId).toBe("text-fallback-card");
+  expect(r.journal.listEvents().some(e => e.detail?.includes("views delivery failed (informational)"))).toBe(true);
+  expect(r.github.merges).toEqual([]);
+  expect((await sweep()).mergeDesk?.cards).toEqual([]);
+  expect(requests).toHaveLength(2);
+ }, 60_000);
+
+ test("failure of the text fallback leaves the card unrecorded for a later tick without parking", async () => {
+  const r = await rig({ autoMerge: true });
+  cleanup.push(r.dir);
+  r.github.labels.set(20, ["ranger:needs-eye"]);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  r.ctx.map.commands.views = "capture {label} {out} {origin}";
+  const pr = await r.github.getPr(r.ctx.map.repo, 1);
+  saveViewsRecord(viewsDirectory(r.journal.path, r.ctx.map.repo, "20", pr.headSha), {
+   sha: pr.headSha, status: "ok",
+   rows: Array.from({ length: 40 }, (_, i) => ({ view: `quiet-view-${i}`, change: 0, noise: 0 })),
+  });
+  let attempts = 0;
+  const sweep = () => sweepMap({
+   config: r.ctx.config, journal: r.journal, map: r.ctx.map, token: "ghp_write", botIdentity: BOT, github: r.github,
+   post: async (_content, _label, files, embeds) => {
+    attempts++;
+    if (attempts === 1) { expect(embeds?.length).toBeGreaterThan(0); throw new Error("embed rejected"); }
+    if (attempts === 2) { expect(files).toBeUndefined(); expect(embeds).toBeUndefined(); throw new Error("Discord unavailable"); }
+    return "retry-card";
+   },
+   respawn: async () => DEAD_PID,
+  });
+  const tick = await sweep();
+  expect(tick.mergeDesk?.cards).toEqual([]);
+  expect(tick.mergeDesk?.errors).toEqual(["#20: Discord unavailable"]);
+  expect(tick.mergeDesk?.parked).toEqual([]);
+  expect(r.journal.getWorker("20", r.ctx.map.repo)?.mergeMessageId).toBeNull();
+  expect(r.journal.getWorker("20", r.ctx.map.repo)?.status).toBe("awaiting-merge");
+  expect(attempts).toBe(2);
+  expect((await sweep()).mergeDesk?.cards).toEqual(["20"]);
+  expect(r.journal.getWorker("20", r.ctx.map.repo)?.mergeMessageId).toBe("retry-card");
  }, 60_000);
 
  test("needs-eye evidence captures after probes and reaches the card in most-changed pairs with full PR table", async () => {
@@ -974,7 +1062,7 @@ describe("implement lane (node #23)", () => {
   });
   expect(tick.mergeDesk?.cards).toEqual(["20"]);
   expect(posts[0].names).toEqual(["station-before.png", "station-after.png", "hull-before.png", "hull-after.png"]);
-  expect(posts[0].content).toContain("sky (within control noise)");
+  expect(posts[0].content).toContain("sky (change does not exceed single control sample)");
 
   r.journal.updateWorker("20", r.ctx.map.repo, { mergeMessageId: null });
   const announcer = new DiscordAnnouncer("fake-token", "channel");

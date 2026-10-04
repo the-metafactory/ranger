@@ -248,6 +248,10 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    } catch (error) {
     if (map.autoMerge) throw error;
     // On manual maps labels only select evidence; an outage must not suppress the card.
+    journal.recordEvent("merge-card", {
+     nodeId: row.nodeId, repo,
+     detail: `label lookup failed (informational): ${redactViewsReason(String(error), process.env).slice(-500)}`,
+    });
    }
   }
   if (map.autoMerge && !needsEye) {
@@ -296,12 +300,21 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    catch (error) { evidence = { summary: `Sheet could not be made: ${redactViewsReason(String(error), process.env)}`, files: [] }; }
   }
   const message = viewsCardMessage(content, evidence);
-  const messageId = await post(
-   message.content,
-   `merge card for #${row.nodeId}`,
-   message.files,
-   message.embeds,
-  );
+  const label = `merge card for #${row.nodeId}`;
+  let messageId: string;
+  try {
+   messageId = await post(message.content, label, message.files, message.embeds);
+  } catch (error) {
+   if (!message.files?.length && !message.embeds?.length) throw error;
+   const reason = redactViewsReason(String(error), process.env).slice(-500);
+   journal.recordEvent("merge-card", {
+    nodeId: row.nodeId, repo, detail: `views delivery failed (informational): ${reason}`,
+   });
+   messageId = await post(
+    `${content}\nVisual evidence could not be delivered: ${reason}. See the PR views comment for the diff and full local sheet.`.slice(0, 2000),
+    label,
+   );
+  }
   journal.updateWorker(row.nodeId, repo, { mergeMessageId: messageId });
   journal.recordEvent("merge-card", { nodeId: row.nodeId, repo, detail: `PR #${pr.number}, message ${messageId}` });
   result.cards.push(row.nodeId);

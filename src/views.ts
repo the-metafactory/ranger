@@ -76,7 +76,7 @@ export function chooseViews(
  let bytes = 0;
  for (const row of [...rows].sort(byMostChanged)) {
   if (row.change <= row.noise) {
-   omitted.push({ view: row.view, reason: "within control noise" });
+   omitted.push({ view: row.view, reason: "change does not exceed single control sample" });
    continue;
   }
   let pair: readonly [number, number];
@@ -304,6 +304,7 @@ export async function captureViews(ctx: CaptureViewsContext): Promise<ViewsRecor
  try {
   if (!ctx.probePassed) throw new Error("no passing probe tier on the final head");
   if (!map.commands.views || !map.commands.viewsServe || !map.commands.viewsDiff) throw new Error("views, viewsServe and viewsDiff are not all configured");
+  const { views, viewsServe, viewsDiff } = map.commands;
   if (out.startsWith(resolve(ctx.worktree) + sep)) throw new Error("views output must be outside the worktree");
   if (await checkedGit(["rev-parse", "HEAD"]) !== sha) throw new Error("worktree differs from final PR head");
   const base = await checkedGit(["merge-base", sha, `origin/${map.base}`]);
@@ -318,19 +319,18 @@ export async function captureViews(ctx: CaptureViewsContext): Promise<ViewsRecor
   const capture = async (cwd: string, labels: string[]) => {
    const port = await (deps.freePort ?? freeViewsPort)();
    const origin = `http://localhost:${port}`;
-   const server = await (deps.startServer ?? startViewsServer)(fillViewsTemplate(map.commands.viewsServe!, { port }), cwd, ctx.env, origin);
+   const server = await (deps.startServer ?? startViewsServer)(fillViewsTemplate(viewsServe, { port }), cwd, ctx.env, origin);
    try {
-    for (const label of labels) await shell(fillViewsTemplate(map.commands.views!, { label, out, origin }), cwd, `${label} capture`, origin);
+    for (const label of labels) await shell(fillViewsTemplate(views, { label, out, origin }), cwd, `${label} capture`, origin);
    } finally { await server.stop(); }
   };
   await capture(before, ["before"]);
   await capture(ctx.worktree, ["after", "after2"]);
   if (await checkedGit(["rev-parse", "HEAD"]) !== sha) throw new Error("head moved during capture");
-  const diff = async (a: string, b: string) => parseViewsDiff(await shell(fillViewsTemplate(map.commands.viewsDiff!, { out, a, b }), ctx.worktree, `${a} → ${b} diff`));
-  const [change, noise] = await Promise.allSettled([diff("before", "after"), diff("after", "after2")]);
-  if (change.status === "rejected") throw change.reason;
-  if (noise.status === "rejected") throw noise.reason;
-  const rows = compareViews(change.value, noise.value);
+  const diff = async (a: string, b: string) => parseViewsDiff(await shell(fillViewsTemplate(viewsDiff, { out, a, b }), ctx.worktree, `${a} → ${b} diff`));
+  const change = await diff("before", "after");
+  const noise = await diff("after", "after2");
+  const rows = compareViews(change, noise);
   verifyCaptureSet(out, rows);
   record = { sha, status: "ok", rows };
  } catch (error) {
@@ -341,6 +341,7 @@ export async function captureViews(ctx: CaptureViewsContext): Promise<ViewsRecor
   }
   if (scratch !== undefined) {
    try { rmSync(scratch, { recursive: true, force: true }); } catch { /* cleanup must not turn evidence into a gate */ }
+   try { await checkedGit(["worktree", "prune"]); } catch { /* cleanup must not turn evidence into a gate */ }
   }
  }
  try { saveViewsRecord(out, record); } catch { /* evidence storage failure must not block ready */ }
