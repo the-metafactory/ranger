@@ -28,6 +28,7 @@ import {
  type ResolvedToken,
 } from "./token-gate.ts";
 import { openJournal, type Journal } from "./journal.ts";
+import { implementLane } from "./lanes.ts";
 import {
  assertNotPrincipal,
  resolveBotIdentity,
@@ -269,11 +270,12 @@ async function runResumeNode(
   if (row.status === "released") {
    throw new Error(`node ${nodeId}'s claim was released — the walk re-claims it from the frontier`);
   }
-  // The implement lane is one at a time: a resume starts a worker session.
-  const holder = row.lane === "implement" ? journal.implementLaneHolder(nodeId) : null;
+  // A resume starts a worker session in this map's resource lane.
+  const lane = implementLane(map);
+  const holder = row.lane === "implement" ? journal.laneHolder(lane, nodeId) : null;
   if (holder !== null && force !== true) {
    throw new Error(
-    `the implement lane is held by #${holder.nodeId} (${holder.repo}, ${holder.status}) — resume #${nodeId} after it leaves the lane, or pass --force to run both`,
+    `the ${lane} implement lane is held by #${holder.nodeId} (${holder.repo}, ${holder.status}) — resume #${nodeId} after it leaves the lane, or pass --force to run both`,
    );
   }
   journal.updateWorker(nodeId, { status: "claimed", pid: null, workerPgid: null, finishedAt: null });

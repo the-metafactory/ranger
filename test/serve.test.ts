@@ -51,6 +51,7 @@ const walked: ServeMap = {
  repo: REPO,
  root: 1,
  walk: "full",
+ lane: "headless",
  servedOnly: false,
  localCheckout: "/Users/someone/acme",
 };
@@ -104,7 +105,7 @@ const inputs = (over: Partial<StateInputs> = {}): StateInputs => ({
  reports: new Map([[walked.key, report(FRONTIER, ["11"])]]),
  titles: new Map([[`${REPO}#50`, "the running one"]]),
  workers: [],
- laneHolder: null,
+ laneHolders: { visual: null, headless: null },
  paused: false,
  spawnsToday: 0,
  spawnCap: 10,
@@ -192,17 +193,65 @@ describe("#37 — the state the dashboard shows", () => {
   expect(state.maps[1].next.reason).toMatch(/spent by earlier maps/);
  });
 
+ test("visual and headless queues can each claim, while a later visual map waits", () => {
+  const visual: ServeMap = { ...walked, key: "acme/game#1", repo: "acme/game", lane: "visual" };
+  const sibling: ServeMap = { ...visual, key: "acme/game#2", root: 2 };
+  const state = assembleState(inputs({
+   maps: [visual, walked, sibling],
+   reports: new Map([visual, walked, sibling].map((m) => [m.key, report(FRONTIER)])),
+  }));
+  expect(state.maps.map((m) => [m.lane, m.next.nodeId, m.next.waiting])).toEqual([
+   ["visual", "10", false], ["headless", "10", false], ["visual", "10", true],
+  ]);
+  expect(state.maps[2].next.reason).toMatch(/visual implement lane.*this tick claims #10/);
+ });
+
+ test("both held lanes name their own holder and waiting node", () => {
+  const visual: ServeMap = { ...walked, key: "acme/game#1", repo: "acme/game", lane: "visual" };
+  const game = worker({ repo: visual.repo, nodeId: "60" });
+  const tool = worker({});
+  const state = assembleState(inputs({
+   maps: [visual, walked],
+   reports: new Map([visual, walked].map((m) => [m.key, report(FRONTIER)])),
+   workers: [game, tool], laneHolders: { visual: game, headless: tool },
+  }));
+  expect(state.gates.laneHolders.visual?.nodeId).toBe("60");
+  expect(state.gates.laneHolders.headless?.nodeId).toBe("50");
+  expect(state.maps[0].next).toMatchObject({ nodeId: "10", waiting: true });
+  expect(state.maps[0].next.reason).toMatch(/visual implement lane.*#60/);
+  expect(state.maps[1].next.reason).toMatch(/headless implement lane.*#50/);
+ });
+
+ test("one held lane does not make the other lane wait; the cap is still shared", () => {
+  const visual: ServeMap = { ...walked, key: "acme/game#1", repo: "acme/game", lane: "visual" };
+  const game = worker({ repo: visual.repo, nodeId: "60" });
+  const state = assembleState(inputs({
+   maps: [visual, walked],
+   reports: new Map([visual, walked].map((m) => [m.key, report(FRONTIER)])),
+   workers: [game], laneHolders: { visual: game, headless: null }, spawnsToday: 9,
+  }));
+  expect(state.maps[0].next.waiting).toBe(true);
+  expect(state.maps[1].next).toMatchObject({ nodeId: "10", waiting: false });
+  const capped = assembleState(inputs({
+   maps: [{ ...visual, lane: "visual" }, walked],
+   reports: new Map([visual, walked].map((m) => [m.key, report(FRONTIER)])), spawnsToday: 9,
+  }));
+  expect(capped.maps[0].next.waiting).toBe(false);
+  expect(capped.maps[1].next.nodeId).toBeUndefined();
+  expect(capped.maps[1].next.reason).toMatch(/spent by earlier maps/);
+ });
+
  test("a held lane with its head vetoed names no waiting node", () => {
   const holder = worker({});
   const map = assembleState(
-   inputs({ laneHolder: holder, workers: [holder], vetoed: (id) => id === "10" }),
+   inputs({ laneHolders: { visual: null, headless: holder }, workers: [holder], vetoed: (id) => id === "10" }),
   ).maps[0];
   expect(map.next.nodeId).toBeUndefined();
  });
 
  test("a held lane names the holder, and the first implement node waits for it", () => {
   const holder = worker({});
-  const map = assembleState(inputs({ laneHolder: holder, workers: [holder] })).maps[0];
+  const map = assembleState(inputs({ laneHolders: { visual: null, headless: holder }, workers: [holder] })).maps[0];
   expect(map.next.nodeId).toBe("10");
   expect(map.next.reason).toMatch(/#50/);
   expect(map.next.waiting).toBe(true);

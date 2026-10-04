@@ -38,6 +38,15 @@ Shipped build-path steps:
   outward action, process-group kill) and resumes its phase from GitHub. The
   approver bot (node #16) remains.
 
+Implement capacity is split into **visual** and **headless** lanes (node #57):
+maps with `commands.probe` use visual; other maps use headless. An optional
+map `lane: visual | headless` overrides that default. Walk, resume and merge-desk
+send-backs check the map's own lane; each lane holds one claimed/running
+implement node. The daily spawn cap and dead-man pause remain global; research
+selection is unchanged. The dashboard shows both holders and groups queues by
+lane. Existing worker rows resolve their lane from current config; an unknown
+or ambiguous map conservatively holds both lanes.
+
 ## Scout (build-path step 1)
 
 `ranger scout` is the first shipped component: a read-only tick that digests every

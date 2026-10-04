@@ -302,13 +302,13 @@ describe("walk — implement lane selection (#23)", () => {
    const path = join(dir, "ranger.yaml");
    require("node:fs").writeFileSync(path, baseConfigLines(dir).join("\n"));
    const journal = openJournal(loadConfig(path).config);
-   expect(implementLaneBusy(journal)).toBe(false);
+   expect(implementLaneBusy(journal, "headless")).toBe(false);
    journal.upsertWorker({ nodeId: "1", repo: "acme/widgets", status: "awaiting-merge", lane: "implement" });
-   expect(implementLaneBusy(journal)).toBe(false); // waiting on a merge does not hold the lane
+   expect(implementLaneBusy(journal, "headless")).toBe(false); // waiting on a merge does not hold the lane
    journal.upsertWorker({ nodeId: "2", repo: "acme/widgets", status: "running", lane: "research" });
-   expect(implementLaneBusy(journal)).toBe(false);
+   expect(implementLaneBusy(journal, "headless")).toBe(false);
    journal.upsertWorker({ nodeId: "4", repo: "acme/widgets", status: "running", lane: "implement" });
-   expect(implementLaneBusy(journal)).toBe(true);
+   expect(implementLaneBusy(journal, "headless")).toBe(true);
    journal.close();
   } finally {
    rmSync(dir, { recursive: true, force: true });
@@ -410,10 +410,10 @@ describe("implement lane holder", () => {
    const journal = openJournal(loadConfig(path).config);
    journal.upsertWorker({ nodeId: "1", repo: "acme/widgets", status: "awaiting-merge", lane: "implement" });
    journal.upsertWorker({ nodeId: "2", repo: "acme/widgets", status: "running", lane: "research" });
-   expect(journal.implementLaneHolder()).toBeNull();
+   expect(journal.laneHolder("headless")).toBeNull();
    journal.upsertWorker({ nodeId: "3", repo: "acme/widgets", status: "running", lane: "implement" });
-   expect(journal.implementLaneHolder()?.nodeId).toBe("3");
-   expect(journal.implementLaneHolder("3")).toBeNull();
+   expect(journal.laneHolder("headless")?.nodeId).toBe("3");
+   expect(journal.laneHolder("headless", "3")).toBeNull();
    journal.close();
   } finally {
    rmSync(dir, { recursive: true, force: true });

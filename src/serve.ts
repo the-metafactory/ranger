@@ -35,6 +35,7 @@ import {
 import { planTick, walkableCandidates } from "./candidates.ts";
 import { pidAlive as defaultPidAlive } from "./exec.ts";
 import { Journal, type WorkerRow } from "./journal.ts";
+import { implementLane, workerLane, type ImplementLane } from "./lanes.ts";
 import { activeCooldown, readGraphqlBudget } from "./budget.ts";
 import { cachedFrontier } from "./frontier-cache.ts";
 import { type FrontierEntry, graphFrontier, RateLimitError } from "./graph.ts";
@@ -61,6 +62,7 @@ export interface ServeMap {
  repo: string;
  root: number;
  walk: WalkMode;
+ lane: ImplementLane;
  /** Shown here only: not walked, not in `ranger scout`'s report, no cards. */
  servedOnly: boolean;
  /** The principal's checkout, `~` expanded; unset means no session button. */
@@ -100,6 +102,7 @@ export function servedMaps(config: RangerConfig): ServeMap[] {
   repo: m.repo,
   root: m.root,
   walk: m.walk,
+  lane: implementLane(m),
   servedOnly: false,
   ...checkoutFor(config, m.repo, m.localCheckout, m.canonical),
   nodes: m.nodes,
@@ -113,6 +116,7 @@ export function servedMaps(config: RangerConfig): ServeMap[] {
    repo: extra.repo,
    root: extra.root,
    walk: "none",
+   lane: "headless",
    servedOnly: true,
    ...checkoutFor(config, extra.repo, extra.localCheckout, undefined),
   });
@@ -144,7 +148,7 @@ export interface StateInputs {
  /** Titles of in-flight nodes not on any frontier, by `repo#id`. */
  titles: Map<string, string>;
  workers: WorkerRow[];
- laneHolder: WorkerRow | null;
+ laneHolders: Record<ImplementLane, WorkerRow | null>;
  paused: boolean;
  spawnsToday: number;
  spawnCap: number;
@@ -164,6 +168,7 @@ export interface CurrentJob {
  status: WorkerRow["status"];
  phase: WorkerRow["phase"];
  lane: string | null;
+ resourceLane: ImplementLane | null;
  prNumber: number | null;
  reviewRound: number;
  startedAt: string | null;
@@ -200,6 +205,7 @@ export interface DashboardMap {
  repo: string;
  root: number;
  walk: WalkMode;
+ lane: ImplementLane;
  servedOnly: boolean;
  ok: boolean;
  error?: string;
@@ -266,7 +272,7 @@ export interface DashboardState {
   paused: boolean;
   spawnsToday: number;
   spawnCap: number;
-  laneHolder: { repo: string; nodeId: string; status: string } | null;
+  laneHolders: Record<ImplementLane, { repo: string; nodeId: string; status: string } | null>;
  };
  current: CurrentJob[];
  maps: DashboardMap[];
@@ -294,7 +300,7 @@ const view = (n: ClassifiedNode): NodeView => ({
  * count against the shared daily cap before a later map is planned.
  */
 interface TickSoFar {
- holder: { repo: string; nodeId: string; thisTick: boolean } | null;
+ holders: Record<ImplementLane, { repo: string; nodeId: string; thisTick: boolean } | null>;
  spawns: number;
 }
 
@@ -318,7 +324,7 @@ function nextFor(
   );
  }
  // The tick's own plan (candidates.ts): the order and the veto rule walk uses.
- const holder = tick.holder;
+ const holder = tick.holders[map.lane];
  const plan = planTick(report.frontier, {
   laneBusy: holder !== null,
   vetoed: inputs.vetoed,
@@ -328,7 +334,7 @@ function nextFor(
  tick.spawns += claims.length;
  const implementClaim = claims.find((n) => plan.implement.includes(n));
  if (implementClaim !== undefined) {
-  tick.holder = { repo: map.key, nodeId: implementClaim.id, thisTick: true };
+  tick.holders[map.lane] = { repo: map.key, nodeId: implementClaim.id, thisTick: true };
  }
  const first = claims[0];
  if (first !== undefined) {
@@ -349,8 +355,8 @@ function nextFor(
    lane: "implement",
    waiting: true,
    reason: holder.thisTick
-    ? `waits for the implement lane: this tick claims #${holder.nodeId} (${holder.repo}) first`
-    : `waits for the implement lane, held by #${holder.nodeId} (${holder.repo})`,
+    ? `waits for the ${map.lane} implement lane: this tick claims #${holder.nodeId} (${holder.repo}) first`
+    : `waits for the ${map.lane} implement lane, held by #${holder.nodeId} (${holder.repo})`,
   };
  }
  const vetoed = plan.vetoed.map((n) => `#${n.id}`);
@@ -361,6 +367,7 @@ function nextFor(
 }
 
 export function assembleState(inputs: StateInputs): DashboardState {
+ const laneMaps = inputs.maps.filter((m) => !m.servedOnly).map((m) => ({ ...m, commands: {} }));
  const titleOf = (repo: string, id: string): string | null => {
   for (const map of inputs.maps) {
    if (map.repo !== repo) continue;
@@ -380,6 +387,7 @@ export function assembleState(inputs: StateInputs): DashboardState {
    status: w.status,
    phase: w.phase,
    lane: w.lane,
+   resourceLane: w.lane === "implement" ? workerLane(w, laneMaps) : null,
    prNumber: w.prNumber,
    reviewRound: w.reviewRound,
    startedAt: w.startedAt,
@@ -390,9 +398,12 @@ export function assembleState(inputs: StateInputs): DashboardState {
     !inputs.pidAlive(w.pid),
   }));
 
- const lane = inputs.laneHolder;
+ const tickHolder = (lane: ImplementLane) => {
+  const holder = inputs.laneHolders[lane];
+  return holder === null ? null : { repo: holder.repo, nodeId: holder.nodeId, thisTick: false };
+ };
  const tick: TickSoFar = {
-  holder: lane === null ? null : { repo: lane.repo, nodeId: lane.nodeId, thisTick: false },
+  holders: { visual: tickHolder("visual"), headless: tickHolder("headless") },
   spawns: inputs.spawnsToday,
  };
  // In config order, as walk visits them, so each map sees what the earlier ones spent.
@@ -405,6 +416,7 @@ export function assembleState(inputs: StateInputs): DashboardState {
    repo: map.repo,
    root: map.root,
    walk: map.walk,
+   lane: map.lane,
    servedOnly: map.servedOnly,
    ok: report?.ok ?? false,
    error: report?.error,
@@ -426,7 +438,10 @@ export function assembleState(inputs: StateInputs): DashboardState {
   };
  });
 
- const holder = inputs.laneHolder;
+ const holderView = (lane: ImplementLane) => {
+  const holder = inputs.laneHolders[lane];
+  return holder === null ? null : { repo: holder.repo, nodeId: holder.nodeId, status: holder.status };
+ };
  return {
   generatedAt: inputs.now.toISOString(),
   refreshing: inputs.refreshing,
@@ -435,10 +450,7 @@ export function assembleState(inputs: StateInputs): DashboardState {
    paused: inputs.paused,
    spawnsToday: inputs.spawnsToday,
    spawnCap: inputs.spawnCap,
-   laneHolder:
-    holder === null
-     ? null
-     : { repo: holder.repo, nodeId: holder.nodeId, status: holder.status },
+   laneHolders: { visual: holderView("visual"), headless: holderView("headless") },
   },
   current,
   maps,
@@ -693,7 +705,7 @@ function renderMeta(s) {
 }
 function jobTag(j) {
  if (j.stale) return el("span", { class: "tag stale", text: "stale: process gone" });
- const parts = [j.status, j.phase, j.prNumber ? "PR #" + j.prNumber : "", j.reviewRound ? "round " + j.reviewRound : ""];
+ const parts = [j.resourceLane || j.lane, j.status, j.phase, j.prNumber ? "PR #" + j.prNumber : "", j.reviewRound ? "round " + j.reviewRound : ""];
  return el("span", { class: "tag", text: parts.filter(Boolean).join(" · ") });
 }
 function renderCurrent(s) {
@@ -703,11 +715,15 @@ function renderCurrent(s) {
 }
 function renderNext(s) {
  const box = document.getElementById("next"); box.replaceChildren();
- for (const m of s.maps) {
-  box.append(mapHead(m));
-  const n = m.next;
-  if (!n.nodeId) { box.append(empty(n.reason)); continue; }
-  box.append(el("p", {}, el("span", { class: "id", text: "#" + n.nodeId + " " }), link(n.url, n.title), el("span", { class: "reason", text: (n.lane ? n.lane + " lane · " : "") + n.reason })));
+ for (const lane of ["visual", "headless"]) {
+  const holder = s.gates.laneHolders[lane];
+  box.append(el("h3", { text: lane + " lane · " + (holder ? "held by #" + holder.nodeId + " (" + holder.repo + ")" : "free") }));
+  for (const m of s.maps.filter((m) => m.lane === lane)) {
+   box.append(mapHead(m));
+   const n = m.next;
+   if (!n.nodeId) { box.append(empty(n.reason)); continue; }
+   box.append(el("p", {}, el("span", { class: "id", text: "#" + n.nodeId + " " }), link(n.url, n.title), el("span", { class: "reason", text: (n.lane ? n.lane + " lane · " : "") + n.reason })));
+  }
  }
 }
 function renderAuto(s) {
@@ -930,7 +946,7 @@ export function stateFromJournal(
  reader: ServeReader,
  now = new Date(),
 ): DashboardState {
- const journal = Journal.openReadOnly(expandHome(config.state.journalPath));
+ const journal = Journal.openReadOnly(expandHome(config.state.journalPath), config.maps);
  try {
   const registry = loadProbeRegistry();
   const reports = new Map<string, MapRead>();
@@ -979,7 +995,7 @@ export function stateFromJournal(
    reports,
    titles: reader.titles,
    workers: journal?.listWorkers() ?? [],
-   laneHolder: journal?.implementLaneHolder() ?? null,
+   laneHolders: { visual: journal?.laneHolder("visual") ?? null, headless: journal?.laneHolder("headless") ?? null },
    paused: journal?.isPaused() ?? false,
    spawnsToday: journal?.spawnsToday(now) ?? 0,
    spawnCap: config.workers.spawnCapPerDay,

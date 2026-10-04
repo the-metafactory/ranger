@@ -13,6 +13,7 @@ import {
  WriteGateError,
 } from "./identity.ts";
 import type { Journal } from "./journal.ts";
+import { implementLane, type ImplementLane } from "./lanes.ts";
 import { classify, loadProbeRegistry, type ClassifiedNode } from "./route.ts";
 import { sweepMap, type SweepMapResult } from "./sweep.ts";
 import {
@@ -104,9 +105,9 @@ export interface WalkContext {
  now?: () => Date;
 }
 
-/** Is an implement worker building or under review anywhere? (awaiting-merge does not hold the lane.) */
-export function implementLaneBusy(journal: Journal): boolean {
- return journal.implementLaneHolder() !== null;
+/** Is this resource lane held? (awaiting-merge does not hold it.) */
+export function implementLaneBusy(journal: Journal, lane: ImplementLane): boolean {
+ return journal.laneHolder(lane) !== null;
 }
 
 export async function walk(ctx: WalkContext): Promise<WalkResult> {
@@ -117,6 +118,9 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
   spawnCapPerDay: config.workers.spawnCapPerDay,
  };
  const cliEntry = join(import.meta.dir, "cli.ts");
+ // Even a worker finishing during this tick must not allow a second claim
+ // in the same lane: at most one new implement claim per lane per tick.
+ const claimedLanes = new Set<ImplementLane>();
 
  for (const map of config.maps) {
   const mapResult: WalkMapResult = {
@@ -191,7 +195,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
     );
     // The plan `ranger serve` (#37) also reads, so its "next" is this order.
     const plan = planTick(classified, {
-     laneBusy: implementLaneBusy(journal),
+     laneBusy: claimedLanes.has(implementLane(map)) || implementLaneBusy(journal, implementLane(map)),
      vetoed: (id) => journal.hasVeto(id),
     });
     const candidates = plan.selected;
@@ -248,6 +252,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
       continue;
      }
      mapResult.claimed.push(node.id);
+     if (laneOf(node.id) === "implement") claimedLanes.add(implementLane(map));
      journal.recordSpawn(ctx.now?.() ?? new Date());
      // A fresh claim starts a clean row BEFORE the supervisor spawns: a node
      // re-claimed after an earlier park must not inherit that attempt's
