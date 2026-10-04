@@ -794,10 +794,13 @@ export class Journal {
  // ---- substrate sessions (node #56) ----
 
  /**
-  * Open a session row and return its id. A node runs one session at a time
-  * under one supervisor, so a row still open for the same node belongs to a
-  * supervisor that died mid-session: it is closed as failed here, and its
-  * own late `endSubstrateSession` (if any) no longer applies.
+  * Open a session row and return its id. The fence runs inside the
+  * transaction: a superseded supervisor (generation no longer the worker
+  * row's) gets a FencedError and touches no row. A node runs one session at
+  * a time under its current supervisor, so a row still open for the same
+  * node belongs to a supervisor that died mid-session: it is closed as
+  * failed here, and its own late `endSubstrateSession` (if any) no longer
+  * applies.
   */
  startSubstrateSession(
   scope: { substrate: SubstrateName; kind: SessionKind; repo: string; nodeId: string; generation: number },
@@ -805,6 +808,16 @@ export class Journal {
  ): number {
   const at = now.toISOString();
   return this.db.transaction((tx) => {
+   const occupant = tx
+    .select({ generation: workers.generation })
+    .from(workers)
+    .where(and(eq(workers.nodeId, scope.nodeId), eq(workers.repo, scope.repo)))
+    .all()[0];
+   if (occupant === undefined || occupant.generation !== scope.generation) {
+    throw new FencedError(
+     `node ${scope.nodeId}: generation ${scope.generation} superseded by ${occupant?.generation ?? "a removed row"} — refusing to open a ${scope.kind} session`,
+    );
+   }
    tx.update(substrateSessions)
     .set({ endedAt: at, outcome: "failed" })
     .where(

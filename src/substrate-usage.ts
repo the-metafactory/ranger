@@ -5,8 +5,12 @@
  * `substrate_sessions` (`recordSession`); `ranger serve` builds one panel row
  * per substrate from those rows and the stored quota readings
  * (`substrateUsageViews`). Eligibility comes from the selector's own policy
- * functions (`substrate-policy.ts`, the `pick` the selector runs), so the
- * panel cannot disagree with what ranger will do.
+ * functions (`substrate-policy.ts`, the `pick` the selector runs), so for a
+ * stored reading the panel decides what the selector decides on it. It does
+ * not model what selection does before it picks: it re-reads a missing or
+ * stale reading (the panel shows "no reading: treated as capped" and
+ * "stale", so selection may still choose that substrate once its read
+ * succeeds), and it leaves out a substrate a run excludes.
  *
  * Read-only consumers import this module: it imports no spawning code and no
  * quota reader. Refreshing a reading stays the selector's job.
@@ -55,26 +59,33 @@ export function failedSessionOutcome(detail: string, capSignal?: unknown): Sessi
 }
 
 /**
- * Run one substrate session between a started and an ended row. A thrown
- * error still ends the row (failed or transient) before it propagates.
+ * Run one substrate session. `run` calls `open` right before the substrate
+ * is spawned: that opens the row under the generation fence
+ * (`startSubstrateSession` throws FencedError for a superseded supervisor),
+ * so an attempt that never reaches its spawn records no session. Once open,
+ * the row ends with the judged outcome, and a thrown error still ends it
+ * (failed or transient) before it propagates.
  */
 export async function recordSession<T>(
  journal: Journal,
  scope: SessionScope,
- run: () => Promise<T>,
+ run: (open: () => void) => Promise<T>,
  outcomeOf: (result: T) => SessionOutcome,
 ): Promise<T> {
- const id = journal.startSubstrateSession(scope);
+ let id: number | null = null;
+ const open = (): void => {
+  if (id === null) id = journal.startSubstrateSession(scope);
+ };
  let outcome: SessionOutcome = "failed";
  try {
-  const result = await run();
+  const result = await run(open);
   outcome = outcomeOf(result);
   return result;
  } catch (error) {
   outcome = failedSessionOutcome(error instanceof Error ? error.message : String(error));
   throw error;
  } finally {
-  journal.endSubstrateSession(id, outcome);
+  if (id !== null) journal.endSubstrateSession(id, outcome);
  }
 }
 

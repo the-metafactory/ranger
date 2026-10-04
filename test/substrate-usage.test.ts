@@ -3,7 +3,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Journal, type SubstrateReading, type SubstrateSessionRow, type WorkerRow } from "../src/journal.ts";
+import { FencedError, Journal, type SubstrateReading, type SubstrateSessionRow, type WorkerRow } from "../src/journal.ts";
 import { assembleState } from "../src/serve.ts";
 import { SUBSTRATE_NAMES } from "../src/store/schema.ts";
 import { isEligible, selectForBuild, type SubstrateConfig } from "../src/substrate-policy.ts";
@@ -47,6 +47,12 @@ function reading(substrate: SubstrateReading["substrate"], over: Partial<Substra
  };
 }
 
+/** Give a node an occupant at `generation`, as a claim + run-node start would. */
+function occupy(j: Journal, nodeId: string, generation = 1, repo = "acme/widgets"): void {
+ j.upsertWorker({ root: 1, nodeId, repo, status: "claimed" });
+ while ((j.getWorker(nodeId, repo)?.generation ?? 0) < generation) j.beginGeneration(nodeId, repo);
+}
+
 let nextId = 1;
 function session(over: Partial<SubstrateSessionRow>): SubstrateSessionRow {
  return {
@@ -83,6 +89,7 @@ describe("the substrate_sessions migration", () => {
   try {
    const path = join(dir, "state.sqlite");
    const j = new Journal(path);
+   occupy(j, "7", 3);
    const id = j.startSubstrateSession({ substrate: "codex", kind: "review", repo: "acme/widgets", nodeId: "7", generation: 3 }, NOW);
    j.endSubstrateSession(id, "capped", new Date(NOW.getTime() + 5 * MIN));
    j.close();
@@ -143,6 +150,8 @@ describe("recording sessions", () => {
  test("a new session of a node closes the dead supervisor's open row as failed; its late end is ignored", () => {
   const j = new Journal(":memory:");
   const scope = { substrate: "claude" as const, kind: "worker" as const, repo: "acme/widgets", nodeId: "20", generation: 1 };
+  occupy(j, "20");
+  occupy(j, "21");
   const orphan = j.startSubstrateSession(scope, new Date(NOW.getTime() - 30 * MIN));
   const other = j.startSubstrateSession({ ...scope, nodeId: "21" }, new Date(NOW.getTime() - 20 * MIN));
   const next = j.startSubstrateSession({ ...scope, substrate: "codex" }, NOW);
@@ -157,6 +166,8 @@ describe("recording sessions", () => {
  test("rows past the retention window are pruned; the last session is found beyond 7 days", () => {
   const j = new Journal(":memory:");
   const scope = { substrate: "codex" as const, kind: "review" as const, repo: "acme/widgets", generation: 1 };
+  occupy(j, "1");
+  occupy(j, "2");
   j.endSubstrateSession(j.startSubstrateSession({ ...scope, nodeId: "1" }, new Date(NOW.getTime() - 41 * 24 * 60 * MIN)), "ok");
   const tenDays = j.startSubstrateSession({ ...scope, nodeId: "2" }, new Date(NOW.getTime() - 10 * 24 * 60 * MIN));
   j.endSubstrateSession(tenDays, "ok");
@@ -171,12 +182,13 @@ describe("recording sessions", () => {
  test("recordSession ends the row with the judged outcome, and a thrown error as failed or transient", async () => {
   const j = new Journal(":memory:");
   const scope = { substrate: "pi" as const, kind: "fix-pass" as const, repo: "acme/widgets", nodeId: "20", generation: 1 };
-  expect(await recordSession(j, scope, async () => 42, () => "ok")).toBe(42);
+  for (const node of ["20", "21", "22"]) occupy(j, node);
+  expect(await recordSession(j, scope, async (open) => { open(); return 42; }, () => "ok")).toBe(42);
   await expect(
-   recordSession(j, { ...scope, nodeId: "21" }, async () => { throw new Error("HTTP 502 from GitHub"); }, () => "ok"),
+   recordSession(j, { ...scope, nodeId: "21" }, async (open) => { open(); throw new Error("HTTP 502 from GitHub"); }, () => "ok"),
   ).rejects.toThrow("HTTP 502");
   await expect(
-   recordSession(j, { ...scope, nodeId: "22" }, async () => { throw new Error("git safety"); }, () => "ok"),
+   recordSession(j, { ...scope, nodeId: "22" }, async (open) => { open(); throw new Error("git safety"); }, () => "ok"),
   ).rejects.toThrow("git safety");
   const rows = j.listSubstrateSessions(new Date(0))!;
   expect(rows.map((r) => [r.nodeId, r.outcome, r.endedAt !== null])).toEqual([
@@ -184,6 +196,34 @@ describe("recording sessions", () => {
    ["21", "transient", true],
    ["22", "failed", true],
   ]);
+  j.close();
+ });
+
+ test("a superseded supervisor opens no row and leaves its replacement's open row alone", () => {
+  const j = new Journal(":memory:");
+  occupy(j, "20", 2);
+  const scope = { substrate: "claude" as const, kind: "worker" as const, repo: "acme/widgets", nodeId: "20" };
+  const current = j.startSubstrateSession({ ...scope, generation: 2 }, NOW);
+  expect(() => j.startSubstrateSession({ ...scope, kind: "review", generation: 1 }, NOW)).toThrow(FencedError);
+  expect(() => j.startSubstrateSession({ ...scope, nodeId: "99", generation: 1 }, NOW)).toThrow(FencedError);
+  expect(j.listSubstrateSessions(new Date(0))).toEqual([
+   expect.objectContaining({ id: current, generation: 2, endedAt: null, outcome: null }),
+  ]);
+  j.close();
+ });
+
+ test("an attempt that never reaches its spawn records no session", async () => {
+  const j = new Journal(":memory:");
+  occupy(j, "20");
+  const scope = { substrate: "codex" as const, kind: "worker" as const, repo: "acme/widgets", nodeId: "20", generation: 1 };
+  // Superseded during the awaits before the spawn: open() is fenced.
+  j.beginGeneration("20", "acme/widgets");
+  await expect(recordSession(j, scope, async (open) => { open(); return 1; }, () => "ok")).rejects.toThrow(FencedError);
+  // Failed before the spawn point: open() was never reached.
+  await expect(
+   recordSession(j, { ...scope, generation: 2 }, async () => { throw new Error("worktree missing"); }, () => "ok"),
+  ).rejects.toThrow("worktree missing");
+  expect(j.listSubstrateSessions(new Date(0))).toEqual([]);
   j.close();
  });
 

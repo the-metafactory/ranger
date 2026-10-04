@@ -447,12 +447,15 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
    const round = reviews.length + 1;
    fence("review");
    const { substrate: reviewSubstrate, chosenOn } = await selectReviewSubstrate(ctx, live.headSha);
-   // The sage round is a substrate session (node #56): its row ends with
-   // the cap confirmation, so a capped review is recorded as capped.
+   // The sage round is a substrate session (node #56): its row opens under
+   // the generation fence once selection has settled (selection awaits, and
+   // the generation can move meanwhile), and ends with the cap confirmation,
+   // so a capped review is recorded as capped.
    const reviewed = await recordSession(
     journal,
     { substrate: reviewSubstrate, kind: "review", repo, nodeId, generation: ctx.generation },
-    async (): Promise<{ verdict: ReviewVerdict } | { error: ReviewError; cap: CapSignal | null }> => {
+    async (openSession): Promise<{ verdict: ReviewVerdict } | { error: ReviewError; cap: CapSignal | null }> => {
+     openSession();
      try {
       return {
        verdict: await (ctx.reviewer ?? sageReview)(repo, open.number, ctx.readOnlyToken, {
@@ -624,10 +627,11 @@ async function workerPass(
  review: { round: number; body: string } | undefined,
 ): Promise<PassResult> {
  const nodeId = ctx.node.ref.id;
- // A superseded supervisor opens no session row (checkedWorkerPass checks
- // again right before the spawn: the generation can move during its awaits).
- ctx.journal.assertGeneration(nodeId, ctx.map.repo, ctx.generation, "spawn the worker");
- if (ctx.substrate === undefined) return checkedWorkerPass(ctx, testCommand, review);
+ if (ctx.substrate === undefined) {
+  return checkedWorkerPass(ctx, testCommand, review, () =>
+   ctx.journal.assertGeneration(nodeId, ctx.map.repo, ctx.generation, "spawn the worker"),
+  );
+ }
  return recordSession(
   ctx.journal,
   {
@@ -637,17 +641,23 @@ async function workerPass(
    nodeId,
    generation: ctx.generation,
   },
-  () => checkedWorkerPass(ctx, testCommand, review),
+  (open) => checkedWorkerPass(ctx, testCommand, review, open),
   (pass) =>
    pass.failure === undefined ? "ok" : failedSessionOutcome(pass.failure.detail, pass.failure.substrateCapped),
  );
 }
 
-/** The worker session itself, then the supervisor's own test + keyword checks. */
+/**
+ * The worker session itself, then the supervisor's own test + keyword checks.
+ * `fenceSpawn` runs right before the spawn: the generation fence, which also
+ * opens the session row (node #56), so a pass superseded during the awaits
+ * before it neither spawns nor records a session.
+ */
 async function checkedWorkerPass(
  ctx: ImplementContext,
  testCommand: string,
  review: { round: number; body: string } | undefined,
+ fenceSpawn: () => void,
 ): Promise<PassResult> {
  const { config, map, journal, node, worktree, branch, botIdentity } = ctx;
  const nodeId = node.ref.id;
@@ -672,7 +682,7 @@ async function checkedWorkerPass(
   review,
   probeTier: map.commands.probe !== undefined,
  });
- ctx.journal.assertGeneration(nodeId, ctx.map.repo, ctx.generation, "spawn the worker");
+ fenceSpawn();
  const output = workerOutputFor(ctx.substrate);
  const raw = await ctx.workerRun(prompt, {
   cwd: worktree,
