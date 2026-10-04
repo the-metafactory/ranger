@@ -2,9 +2,11 @@ import { implementLane } from "./lanes.ts";
 import { recordImplementStart, mapKey } from "./maps.ts";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import { DiscordAnnouncer } from "./announce.ts";
+import type { DiscordFile } from "./discord.ts";
+import { redactViewsReason, viewsCard, viewsCardMessage, viewsDirectory } from "./views.ts";
+import { NEEDS_EYE_LABEL } from "./labels.ts";
 import {
  gatingFindings,
- NEEDS_EYE_LABEL,
  realGitHub,
  recordedProbes,
  recordedReviews,
@@ -42,7 +44,7 @@ export interface MergeDeskContext {
  botIdentity: string;
  github?: GitHubPort;
  /** Post a message to the map's channel; returns the message id. */
- post?: (content: string, label: string) => Promise<string>;
+ post?: (content: string, label: string, files?: readonly DiscordFile[], embeds?: readonly { description: string }[]) => Promise<string>;
  /** Spawn a detached run-node (the resume-for-close); returns its PID. */
  spawn?: (nodeId: string, repo: string, root: number) => Promise<number | null>;
 }
@@ -70,9 +72,11 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
  const github = ctx.github ?? realGitHub;
  const repo = map.repo;
  const result: MergeDeskResult = { cards: [], merged: [], resumed: [], parked: [], pending: [], errors: [] };
+ let announcer: DiscordAnnouncer | undefined;
  const post =
   ctx.post ??
-  ((content: string, label: string) => DiscordAnnouncer.fromMap(map).post(content, label));
+  ((content: string, label: string, files?: readonly DiscordFile[], embeds?: readonly { description: string }[]) =>
+   (announcer ??= DiscordAnnouncer.fromMap(map)).post(content, label, files, embeds));
 
  const waiting = journal
   .listWorkers(repo, map.root)
@@ -237,10 +241,20 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   // Auto-merge (principal, 2026-10-03): on a map that opts in, ranger
   // squash-merges the gate-passed PR itself, pinned to the gated head, unless
   // the node is labelled ranger:needs-eye. The close follows on this tick.
-  const needsEye = map.autoMerge
-   ? (await github.issueLabels(repo, Number(row.nodeId), token)).includes(NEEDS_EYE_LABEL)
-   : true;
-  if (!needsEye) {
+  let needsEye = false;
+  if (map.autoMerge || map.commands.views) {
+   try {
+    needsEye = (await github.issueLabels(repo, Number(row.nodeId), token)).includes(NEEDS_EYE_LABEL);
+   } catch (error) {
+    if (map.autoMerge) throw error;
+    // On manual maps labels only select evidence; an outage must not suppress the card.
+    journal.recordEvent("merge-card", {
+     nodeId: row.nodeId, repo,
+     detail: `label lookup failed (informational): ${redactViewsReason(String(error), process.env).slice(-500)}`,
+    });
+   }
+  }
+  if (map.autoMerge && !needsEye) {
    await github.mergePr(repo, pr.number, gate.headSha, pr.title, token);
    journal.recordEvent("merged", {
     nodeId: row.nodeId,
@@ -269,20 +283,38 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    return;
   }
 
-  const messageId = await post(
-   [
+  const content = [
     `:ranger: **merge needed** #${row.nodeId} — ${title}`,
     `map: ${mapKey(map)}`,
     `Gate passed at \`${gate.headSha.slice(0, 8)}\`: CI green, mergeable, base \`${map.base}\`, sage ${last?.round ?? "?"} round(s), the last with 0 blockers and 0 majors (machine evidence, not a sign-off).`,
     ...(probesRequired
      ? [`Probes passed at \`${gate.headSha.slice(0, 8)}\` (selection ${probe?.mode ?? "?"}, ${probe?.selected ?? "?"} probe(s)). Only the selected probes ran, not the full suite.`]
      : ["No probe tier on this map: CI and the tests are the only automated checks."]),
-    map.autoMerge
+    needsEye
      ? `Labelled \`${NEEDS_EYE_LABEL}\`: your eye is the check. Merge it by hand (squash); ranger closes the node after the merge.`
      : "Merge it by hand (squash). For a `propose` node your merge is the ratification. Ranger closes the node after the merge; it never merges itself.",
-   ].join("\n"),
-   `merge card for #${row.nodeId}`,
-  );
+   ].join("\n");
+  let evidence: Awaited<ReturnType<typeof viewsCard>> | undefined;
+  if (needsEye && map.commands.views) {
+   try { evidence = await viewsCard(viewsDirectory(journal.path, repo, row.nodeId, gate.headSha), gate.headSha); }
+   catch (error) { evidence = { summary: `Sheet could not be made: ${redactViewsReason(String(error), process.env)}`, files: [] }; }
+  }
+  const message = viewsCardMessage(content, evidence);
+  const label = `merge card for #${row.nodeId}`;
+  let messageId: string;
+  try {
+   messageId = await post(message.content, label, message.files, message.embeds);
+  } catch (error) {
+   if (!message.files?.length && !message.embeds?.length) throw error;
+   const reason = redactViewsReason(String(error), process.env).slice(-500);
+   journal.recordEvent("merge-card", {
+    nodeId: row.nodeId, repo, detail: `views delivery failed (informational): ${reason}`,
+   });
+   messageId = await post(
+    `${content}\nVisual evidence could not be delivered: ${reason}. See the PR views comment for the diff and full local sheet.`.slice(0, 2000),
+    label,
+   );
+  }
   journal.updateWorker(row.nodeId, repo, { mergeMessageId: messageId });
   journal.recordEvent("merge-card", { nodeId: row.nodeId, repo, detail: `PR #${pr.number}, message ${messageId}` });
   result.cards.push(row.nodeId);

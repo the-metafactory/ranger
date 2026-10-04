@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import {
  copyFileSync,
  existsSync,
@@ -21,6 +21,8 @@ import { LAST_IMPLEMENT_MAP } from "../src/maps.ts";
 import { sweepMap } from "../src/sweep.ts";
 import { runNode, type RunNodeContext } from "../src/worker.ts";
 import { baseConfigLines, createCanonicalRepo, GIT_ENV } from "./support.ts";
+import { saveViewsRecord, viewsDirectory } from "../src/views.ts";
+import { DiscordAnnouncer } from "../src/announce.ts";
 
 const fixturesBin = join(import.meta.dir, "fixtures", "bin");
 const dataDir = join(import.meta.dir, "fixtures", "data");
@@ -831,6 +833,270 @@ describe("implement lane (node #23)", () => {
   expect(tick.mergeDesk?.cards).toEqual(["20"]);
   expect(r.github.merges).toEqual([]);
   expect(posts[0]).toContain("your eye is the check");
+ }, 60_000);
+
+ test("needs-eye capture refusal posts its reason on the merge card and PR without parking", async () => {
+  const r = await rig({ autoMerge: true, probe: "fake-probe ok {node}" });
+  cleanup.push(r.dir);
+  r.github.labels.set(20, ["ranger:needs-eye"]);
+  Object.assign(r.ctx.map.commands, { views: "capture {label} {out} {origin}", viewsServe: "serve {port}", viewsDiff: "diff {out} {a} {b}" });
+  let stopped = false;
+  let captures = 0;
+  r.ctx.viewsDependencies = {
+   freePort: async () => 45678,
+   startServer: async () => ({ stop: async () => { stopped = true; } }),
+   run: async (_bin, _args, opts) => {
+    expect((r.github.comments.get(1) ?? []).some(c => c.body.includes("ranger:probes") && c.body.includes("result=pass"))).toBe(true);
+    expect(opts?.env?.RANGER_WRITE_TEST).toBeUndefined();
+    captures++;
+    return { code: 1, stdout: "", stderr: "software renderer refused" };
+   },
+  };
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("awaiting-merge");
+  expect(captures).toBe(1);
+  expect(stopped).toBe(true);
+  const comments = r.github.comments.get(1) ?? [];
+  expect(comments.find(c => c.body.includes("ranger:views"))?.body).toContain("software renderer refused");
+  const posts: string[] = [];
+  const tick = await sweepMap({
+   config: r.ctx.config, journal: r.journal, map: r.ctx.map, token: "ghp_write", botIdentity: BOT, github: r.github,
+   post: async (content) => { posts.push(content); return "views-failure-card"; },
+   respawn: async () => DEAD_PID,
+  });
+  expect(tick.mergeDesk?.cards).toEqual(["20"]);
+  expect(tick.mergeDesk?.parked).toEqual([]);
+  expect(r.journal.getWorker("20", r.ctx.map.repo)?.status).toBe("awaiting-merge");
+  expect(posts[0]).toContain("Sheet could not be made");
+  expect(posts[0]).toContain("software renderer refused");
+  expect(r.github.merges).toEqual([]);
+ }, 60_000);
+
+ test("unconfigured manual map posts its card without a label read or views evidence", async () => {
+  const r = await rig({});
+  cleanup.push(r.dir);
+  r.github.labels.set(20, ["ranger:needs-eye"]);
+  r.github.issueLabels = async () => { throw new Error("unconfigured map must not read labels"); };
+  r.ctx.viewsDependencies = {
+   run: async () => { throw new Error("must not capture"); },
+  };
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  expect((r.github.comments.get(1) ?? []).some(c => c.body.includes("ranger:views"))).toBe(false);
+  const posts: string[] = [];
+  const tick = await sweepMap({
+   config: r.ctx.config, journal: r.journal, map: r.ctx.map, token: "ghp_write", botIdentity: BOT, github: r.github,
+   post: async content => { posts.push(content); return "unconfigured-card"; },
+   respawn: async () => DEAD_PID,
+  });
+  expect(tick.mergeDesk?.cards).toEqual(["20"]);
+  expect(tick.mergeDesk?.errors).toEqual([]);
+  expect(posts[0]).not.toContain("Sheet could not be made");
+ }, 60_000);
+
+ test.each([false, true])("label outage with views configured: autoMerge=%s", async (autoMerge) => {
+  const r = await rig({ autoMerge });
+  cleanup.push(r.dir);
+  r.ctx.map.commands.views = "capture {label} {out} {origin}";
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  let reads = 0;
+  r.github.issueLabels = async () => { reads++; throw new Error("labels unavailable"); };
+  const posts: string[] = [];
+  const tick = await sweepMap({
+   config: r.ctx.config, journal: r.journal, map: r.ctx.map, token: "ghp_write", botIdentity: BOT, github: r.github,
+   post: async content => { posts.push(content); return "label-outage-card"; },
+   respawn: async () => DEAD_PID,
+  });
+  expect(reads).toBe(1);
+  expect(tick.mergeDesk?.merged).toEqual([]);
+  expect(tick.mergeDesk?.parked).toEqual([]);
+  expect(r.github.merges).toEqual([]);
+  expect(r.journal.getWorker("20", r.ctx.map.repo)?.status).toBe("awaiting-merge");
+  if (autoMerge) {
+   expect(tick.mergeDesk?.cards).toEqual([]);
+   expect(tick.mergeDesk?.errors).toEqual(["#20: labels unavailable"]);
+   expect(posts).toEqual([]);
+   expect(r.journal.getWorker("20", r.ctx.map.repo)?.mergeMessageId).toBeNull();
+  } else {
+   expect(tick.mergeDesk?.cards).toEqual(["20"]);
+   expect(tick.mergeDesk?.errors).toEqual([]);
+   expect(posts[0]).toContain("**merge needed**");
+   expect(posts[0]).not.toContain("Visual evidence");
+   expect(r.journal.getWorker("20", r.ctx.map.repo)?.mergeMessageId).toBe("label-outage-card");
+   expect(r.journal.listEvents().some(e => e.kind === "merge-card" && e.detail?.includes("label lookup failed (informational): Error: labels unavailable"))).toBe(true);
+  }
+ }, 60_000);
+
+ test.each([413, 400])("evidence rejected with HTTP %s falls back to a text merge card once", async status => {
+  const r = await rig({ autoMerge: true });
+  cleanup.push(r.dir);
+  r.github.labels.set(20, ["ranger:needs-eye"]);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  r.ctx.map.commands.views = "capture {label} {out} {origin}";
+  const pr = await r.github.getPr(r.ctx.map.repo, 1);
+  const out = viewsDirectory(r.journal.path, r.ctx.map.repo, "20", pr.headSha);
+  // 413 exercises multipart files; 400 exercises embeds with no files.
+  const rows = status === 413 ? [{ view: "hull", change: 2, noise: 0.1 }]
+   : Array.from({ length: 40 }, (_, i) => ({ view: `quiet-view-${i}`, change: 0, noise: 0 }));
+  if (status === 413) {
+   for (const label of ["before", "after"]) {
+    mkdirSync(join(out, label), { recursive: true });
+    writeFileSync(join(out, label, "hull.png"), "PNG");
+   }
+  }
+  saveViewsRecord(out, { sha: pr.headSha, status: "ok", rows });
+  const requests: RequestInit[] = [];
+  const fetchFn = (async (_url, init) => {
+   requests.push(init!);
+   if (requests.length === 1) {
+    if (status === 413) expect(init!.body).toBeInstanceOf(FormData);
+    else expect(JSON.parse(init!.body as string).embeds.length).toBeGreaterThan(0);
+    return new Response("rejected evidence", { status });
+   }
+   const body = JSON.parse(init!.body as string);
+   expect(body.attachments).toBeUndefined();
+   expect(body.embeds).toBeUndefined();
+   expect(body.content).toContain("**merge needed**");
+   expect(body.content).toContain("your eye is the check");
+   expect(body.content).toContain("Visual evidence could not be delivered:");
+   expect(body.content).toContain(`discord post returned HTTP ${status}`);
+   expect(body.content.length).toBeLessThanOrEqual(2000);
+   return new Response(JSON.stringify({ id: "text-fallback-card" }), { status: 200 });
+  }) as typeof fetch;
+  const announcer = new DiscordAnnouncer("fake-token", "channel", "https://discord.test", fetchFn);
+  const sweep = () => sweepMap({
+   config: r.ctx.config, journal: r.journal, map: r.ctx.map, token: "ghp_write", botIdentity: BOT, github: r.github,
+   post: (content, label, files, embeds) => announcer.post(content, label, files, embeds),
+   respawn: async () => DEAD_PID,
+  });
+  const tick = await sweep();
+  expect(tick.mergeDesk?.errors).toEqual([]);
+  expect(tick.mergeDesk?.cards).toEqual(["20"]);
+  expect(tick.mergeDesk?.parked).toEqual([]);
+  expect(r.journal.getWorker("20", r.ctx.map.repo)?.status).toBe("awaiting-merge");
+  expect(r.journal.getWorker("20", r.ctx.map.repo)?.mergeMessageId).toBe("text-fallback-card");
+  expect(r.journal.listEvents().some(e => e.detail?.includes("views delivery failed (informational)"))).toBe(true);
+  expect(r.github.merges).toEqual([]);
+  expect((await sweep()).mergeDesk?.cards).toEqual([]);
+  expect(requests).toHaveLength(2);
+ }, 60_000);
+
+ test("failure of the text fallback leaves the card unrecorded for a later tick without parking", async () => {
+  const r = await rig({ autoMerge: true });
+  cleanup.push(r.dir);
+  r.github.labels.set(20, ["ranger:needs-eye"]);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  r.ctx.map.commands.views = "capture {label} {out} {origin}";
+  const pr = await r.github.getPr(r.ctx.map.repo, 1);
+  saveViewsRecord(viewsDirectory(r.journal.path, r.ctx.map.repo, "20", pr.headSha), {
+   sha: pr.headSha, status: "ok",
+   rows: Array.from({ length: 40 }, (_, i) => ({ view: `quiet-view-${i}`, change: 0, noise: 0 })),
+  });
+  let attempts = 0;
+  const sweep = () => sweepMap({
+   config: r.ctx.config, journal: r.journal, map: r.ctx.map, token: "ghp_write", botIdentity: BOT, github: r.github,
+   post: async (_content, _label, files, embeds) => {
+    attempts++;
+    if (attempts === 1) { expect(embeds?.length).toBeGreaterThan(0); throw new Error("embed rejected"); }
+    if (attempts === 2) { expect(files).toBeUndefined(); expect(embeds).toBeUndefined(); throw new Error("Discord unavailable"); }
+    return "retry-card";
+   },
+   respawn: async () => DEAD_PID,
+  });
+  const tick = await sweep();
+  expect(tick.mergeDesk?.cards).toEqual([]);
+  expect(tick.mergeDesk?.errors).toEqual(["#20: Discord unavailable"]);
+  expect(tick.mergeDesk?.parked).toEqual([]);
+  expect(r.journal.getWorker("20", r.ctx.map.repo)?.mergeMessageId).toBeNull();
+  expect(r.journal.getWorker("20", r.ctx.map.repo)?.status).toBe("awaiting-merge");
+  expect(attempts).toBe(2);
+  expect((await sweep()).mergeDesk?.cards).toEqual(["20"]);
+  expect(r.journal.getWorker("20", r.ctx.map.repo)?.mergeMessageId).toBe("retry-card");
+ }, 60_000);
+
+ test("needs-eye evidence captures after probes and reaches the card in most-changed pairs with full PR table", async () => {
+  const r = await rig({ probe: "fake-probe ok {node}" });
+  cleanup.push(r.dir);
+  r.github.labels.set(20, ["ranger:needs-eye"]); // manual-merge maps carry evidence too
+  Object.assign(r.ctx.map.commands, { views: "capture {label} {out} {origin}", viewsServe: "serve {port}", viewsDiff: "diff {out} {a} {b}" });
+  const labels: string[] = [];
+  const capturedCwds: string[] = [];
+  let stops = 0;
+  r.ctx.viewsDependencies = {
+   freePort: async () => 45678,
+   startServer: async () => ({ stop: async () => { stops++; } }),
+   run: async (_bin, args, opts) => {
+    expect((r.github.comments.get(1) ?? []).some(c => c.body.includes("ranger:probes") && c.body.includes("result=pass"))).toBe(true);
+    expect(r.github.prs.get(1)?.draft).toBe(true); // before ready
+    expect(opts?.env?.RANGER_WRITE_TEST).toBeUndefined();
+    const command = args[1];
+    if (command.startsWith("capture")) {
+     const [, label, out] = command.match(/^capture '([^']+)' '([^']+)'/)!;
+     labels.push(label);
+     capturedCwds.push(opts!.cwd!);
+     mkdirSync(join(out, label), { recursive: true });
+     for (const view of ["hull", "station", "sky"]) writeFileSync(join(out, label, `${view}.png`), "PNG");
+     writeFileSync(join(out, "index.html"), "full contact sheet");
+    }
+    const noise = command.endsWith("'after' 'after2'");
+    return { code: 0, stderr: "", stdout: command.startsWith("diff") ?
+     `hull moved >24/255: ${noise ? 0.1 : 2}% any change: 3%\nstation moved >24/255: ${noise ? 0.2 : 5}% any change: 6%\nsky moved >24/255: 0% any change: 0%\n` : "" };
+   },
+  };
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  expect(labels).toEqual(["before", "after", "after2"]);
+  expect(stops).toBe(2);
+  expect(capturedCwds[0]).not.toBe(capturedCwds[1]);
+  expect(capturedCwds[1]).toBe(capturedCwds[2]);
+  expect(existsSync(capturedCwds[0])).toBe(false);
+  const pr = await r.github.getPr("acme/widgets", 1);
+  const out = viewsDirectory(r.journal.path, r.ctx.map.repo, "20", pr.headSha);
+  const comment = (r.github.comments.get(1) ?? []).find(c => c.body.includes("ranger:views"))!.body;
+  expect(comment).toContain(`<!-- ranger:views sha=${pr.headSha} -->`);
+  expect(comment).toContain("| station | 5.00% | 0.20% |");
+  expect(comment).toContain(`${out}/index.html`);
+  const posts: { content: string; names: string[] }[] = [];
+  const tick = await sweepMap({
+   config: r.ctx.config, journal: r.journal, map: r.ctx.map, token: "ghp_write", botIdentity: BOT, github: r.github,
+   post: async (content, _label, files) => { posts.push({ content, names: files?.map(f => f.name) ?? [] }); return "views-card"; },
+   respawn: async () => DEAD_PID,
+  });
+  expect(tick.mergeDesk?.cards).toEqual(["20"]);
+  expect(posts[0].names).toEqual(["station-before.png", "station-after.png", "hull-before.png", "hull-after.png"]);
+  expect(posts[0].content).toContain("sky (change does not exceed single control sample)");
+
+  r.journal.updateWorker("20", r.ctx.map.repo, { mergeMessageId: null });
+  const announcer = new DiscordAnnouncer("fake-token", "channel");
+  const fromMap = spyOn(DiscordAnnouncer, "fromMap").mockReturnValue(announcer);
+  const post = spyOn(announcer, "post").mockResolvedValue("announcer-card");
+  try {
+   const next = await sweepMap({
+    config: r.ctx.config, journal: r.journal, map: r.ctx.map, token: "ghp_write", botIdentity: BOT, github: r.github,
+    respawn: async () => DEAD_PID,
+   });
+   expect(next.mergeDesk?.cards).toEqual(["20"]);
+   expect(post).toHaveBeenCalledTimes(1);
+   const [, label, files] = post.mock.calls[0];
+   expect(label).toBe("merge card for #20");
+   expect(files?.map(f => f.name)).toEqual(posts[0].names);
+  } finally {
+   post.mockRestore();
+   fromMap.mockRestore();
+  }
+ }, 60_000);
+
+ test("configured views do nothing on a non-needs-eye node or after failed probes", async () => {
+  for (const probeFails of [false, true]) {
+   const r = await rig({ probe: probeFails ? "fake-probe fail {node}" : "fake-probe ok {node}" });
+   cleanup.push(r.dir);
+   if (probeFails) r.github.labels.set(20, ["ranger:needs-eye"]);
+   Object.assign(r.ctx.map.commands, { views: "capture {label} {out} {origin}", viewsServe: "serve {port}", viewsDiff: "diff {out} {a} {b}" });
+   r.ctx.viewsDependencies = {
+    run: async () => { throw new Error("capture must not run"); },
+    startServer: async () => { throw new Error("server must not start"); },
+   };
+   expect((await runNode("20", r.ctx)).status).toBe(probeFails ? "parked" : "awaiting-merge");
+   expect((r.github.comments.get(1) ?? []).some(c => c.body.includes("ranger:views"))).toBe(false);
+  }
  }, 60_000);
  // ---- substrate caps (node #45) ----
 

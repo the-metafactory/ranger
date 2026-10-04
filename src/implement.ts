@@ -34,6 +34,8 @@ import {
 import { selectForReview } from "./substrate-policy.ts";
 import { workerEnv } from "./worker-env.ts";
 import { saveWorkerLog } from "./worker-log.ts";
+import { captureViews, redactViewsReason, saveViewsRecord, viewsComment, viewsDirectory, type ViewsDependencies, type ViewsRecord } from "./views.ts";
+import { NEEDS_EYE_LABEL } from "./labels.ts";
 
 /**
  * The implement lane (design §4 task/build SOP, build-path step 4, node #23).
@@ -95,6 +97,8 @@ export interface ImplementContext {
  substrateReaders?: SubstrateReaders;
  /** Substrates capped earlier in this run: review selection leaves them out. */
  excludedSubstrates?: ReadonlySet<SubstrateName>;
+ /** Capture shell/server injection; tests launch no browser. */
+ viewsDependencies?: ViewsDependencies;
 }
 
 export interface ImplementOutcome {
@@ -157,8 +161,7 @@ export function recordedReviews(
  return out.sort((a, b) => a.round - b.round);
 }
 
-/** A node that needs the principal's eye (or ear): its PR is merged by hand, never by ranger. */
-export const NEEDS_EYE_LABEL = "ranger:needs-eye";
+export { NEEDS_EYE_LABEL } from "./labels.ts";
 
 /** The findings that gate a PR: blockers and majors (principal, 2026-10-03). */
 export function gatingFindings(r: { blockers: number; majors: number }): number {
@@ -537,9 +540,42 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
   probe = await probeFinalHead(ctx, github, open.number);
  }
 
+ // The run-node awake hold covers this informational capture step too.
+ const final = reviews[reviews.length - 1];
+ let labels: string[] = [];
+ try { if (map.commands.views) labels = await github.issueLabels(repo, Number(nodeId), token); }
+ catch (error) {
+  journal.recordEvent("reviewed", { nodeId, repo, detail: `views label lookup failed (informational): ${String(error).slice(-500)}` });
+ }
+ if (labels.includes(NEEDS_EYE_LABEL)) {
+  let record: ViewsRecord | undefined;
+  try {
+   record = await captureViews({
+    map, nodeId, sha: final.sha, labels,
+    probePassed: probe?.passed === true && probe.sha === final.sha,
+    journalPath: journal.path, worktree,
+    env: workerEnv(config, repo), dependencies: ctx.viewsDependencies,
+   });
+  } catch (error) {
+   record = { sha: final.sha, status: "failed", reason: redactViewsReason(String(error), workerEnv(config, repo)) };
+   try { saveViewsRecord(viewsDirectory(journal.path, repo, nodeId, final.sha), record); } catch { /* best effort */ }
+  }
+  if (record !== undefined) {
+   fence("post the views record");
+   try {
+    const comments = await github.listComments(repo, open.number, token);
+    const body = viewsComment(record, viewsDirectory(journal.path, repo, nodeId, final.sha));
+    if (!comments.some(c => c.author === botIdentity && c.body === body)) {
+     await github.postComment(repo, open.number, body, token);
+    }
+   } catch (error) {
+    journal.recordEvent("reviewed", { nodeId, repo, detail: `views comment failed (informational): ${String(error).slice(-500)}` });
+   }
+  }
+ }
+
  // ---- ready → awaiting merge ----
  fence("mark ready");
- const final = reviews[reviews.length - 1];
  await github.updatePrBody(repo, open.number, readyBody(ctx, final, reviews.length, probe), token);
  await github.markReady(repo, await github.getPr(repo, open.number, token), token);
  journal.updateWorker(nodeId, ctx.map.repo, {

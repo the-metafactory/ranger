@@ -84,6 +84,12 @@ const MapSchema = z.object({
     * retry is the whole `probe` command.
     */
    probeRetry: z.string().min(1).optional(),
+   /** Needs-eye evidence only: {label}, {out}, {origin}; never a merge gate. */
+   views: z.string().min(1).optional(),
+   /** Start a dev server for captures; {port} is a ranger-selected free port. */
+   viewsServe: z.string().min(1).optional(),
+   /** Compare captured runs; {out}, {a}, {b}. */
+   viewsDiff: z.string().min(1).optional(),
    /** Wall clock for one probe run, minutes. */
    probeTimeoutMin: z.number().int().positive().default(30),
   })
