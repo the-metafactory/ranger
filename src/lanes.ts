@@ -1,4 +1,4 @@
-/** Resource tags describe a worker's machine requirements, independently of substrate. */
+/** Implement resource lanes follow machine resources, independently of worker substrate. */
 export const IMPLEMENT_LANES = ["visual", "headless"] as const;
 export type ImplementLane = (typeof IMPLEMENT_LANES)[number];
 
@@ -25,6 +25,10 @@ export function workerLane(
  return lanes.size === 1 ? [...lanes][0] : null;
 }
 
+export function startsImplementSession(row: { lane: string | null; phase?: string | null }): boolean {
+ return row.lane === "implement" && row.phase !== "close";
+}
+
 export function holdsImplementLane(row: { lane: string | null; status: string; phase?: string | null }): boolean {
- return row.lane === "implement" && row.phase !== "close" && (row.status === "claimed" || row.status === "running");
+ return startsImplementSession(row) && (row.status === "claimed" || row.status === "running");
 }

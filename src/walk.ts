@@ -1,5 +1,5 @@
 import { implementLane, type ImplementLane } from "./lanes.ts";
-import { LAST_IMPLEMENT_MAP, recordImplementStart, mapKey, implementMapOrder } from "./maps.ts";
+import { lastImplementMaps, recordImplementStart, mapKey, implementMapOrder } from "./maps.ts";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
 import type { RangerConfig, RangerMapConfig, WalkMode } from "./config.ts";
@@ -107,7 +107,7 @@ export interface WalkContext {
  now?: () => Date;
 }
 
-/** Is the implement lane held? (awaiting-merge does not hold it.) */
+/** Is this resource lane held? (awaiting-merge does not hold it.) */
 export function implementLaneBusy(journal: Journal, lane: ImplementLane): boolean {
  return journal.laneHolder(lane) !== null;
 }
@@ -124,10 +124,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
  // across maps: at most one new implement claim per resource lane per tick.
  const implementClaimed = new Set<ImplementLane>();
 
- for (const map of implementMapOrder(config.maps, {
-  visual: journal.getHealth(`${LAST_IMPLEMENT_MAP}.visual`) ?? journal.getHealth(LAST_IMPLEMENT_MAP),
-  headless: journal.getHealth(`${LAST_IMPLEMENT_MAP}.headless`) ?? journal.getHealth(LAST_IMPLEMENT_MAP),
- }, implementLane)) {
+ for (const map of implementMapOrder(config.maps, lastImplementMaps(journal), implementLane)) {
   const mapResult: WalkMapResult = {
    repo: map.repo,
    walkMode: map.walk,

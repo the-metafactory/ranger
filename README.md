@@ -39,6 +39,7 @@ Shipped build-path steps:
   approver bot (node #16) remains.
 
 Implement resource lanes (node #57): **1 visual + 1 headless** across all maps.
+The daily spawn cap and dead-man pause remain global across both lanes.
 A map defaults to visual with `commands.probe`, headless otherwise; `lane` can
 override that choice. Within each lane, maps alternate by the persisted map of
 the last implement start (node #47); empty or gated maps are skipped. Claims,

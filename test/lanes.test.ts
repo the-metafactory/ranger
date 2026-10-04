@@ -129,6 +129,19 @@ describe("node #57/#47 — root-aware resource lanes", () => {
   });
  }
 
+ test("the daily spawn cap bounds visual and headless implement claims together", async () => {
+  const r = rig(1);
+  try {
+   const out = await runCli(["walk", "-c", r.configPath], r.env);
+   expect(out.code).toBe(0);
+   const result = JSON.parse(out.stdout);
+   expect(result.maps.map((m: { claimed: string[] }) => m.claimed)).toEqual([["10"], [], []]);
+   expect(result.maps[1].spawnCapExhausted).toBe(true);
+   expect(r.journal.spawnsToday()).toBe(1);
+   expect(r.journal.getWorker("20", TOOL)).toBeNull();
+  } finally { r.close(); }
+ });
+
  test("the daily spawn cap blocks research independently of implement capacity", async () => {
   const r = rig(1);
   try {

@@ -389,10 +389,10 @@ export async function runNode(
  ctx: RunNodeContext,
 ): Promise<RunNodeOutcome> {
  const { config, token, journal } = ctx;
- const row = journal.getWorker(nodeId, ctx.map.repo);
- if (row !== null && row.root !== ctx.map.root) throw new Error('run-node map disagrees with the journal root');
  const map = ctx.map;
  const repo = map.repo;
+ const row = journal.getWorker(nodeId, repo);
+ if (row !== null && row.root !== map.root) throw new Error('run-node map disagrees with the journal root');
  const base: RunNodeOutcome = {
   nodeId,
   repo,
@@ -403,13 +403,13 @@ export async function runNode(
 
  // Take the node as a new occupant. A run-node with no claim row (an
  // operator's manual run) gets a running row first.
- if (journal.getWorker(nodeId, ctx.map.repo) === null) {
+ if (row === null) {
   journal.upsertWorker({ nodeId, repo, root: map.root, status: "running", attempts: 0 });
  }
- const generation = journal.beginGeneration(nodeId, ctx.map.repo);
+ const generation = journal.beginGeneration(nodeId, repo);
  // The supervisor's PID stays on the row until a terminal state (F1): a
  // supervisor crash anywhere in the SOP tail is then visible to sweep.
- journal.updateWorker(nodeId, ctx.map.repo, {
+ journal.updateWorker(nodeId, repo, {
   pid: process.pid,
   status: "running",
   startedAt: new Date().toISOString(),
@@ -502,7 +502,7 @@ async function runSession(
    ? await selectBuildSubstrate(ctx, capped)
    : { substrate: undefined, chosenOn: "RANGER_WORKER_CMD override; its heads count as Pi-written" };
  const workerCmd = envCmd ?? resolveWorkerCommand(ctx, substrate as SubstrateName, session.canonical);
- journal.updateWorker(nodeId, ctx.map.repo, { substrate: substrate ?? null });
+ journal.updateWorker(nodeId, session.map.repo, { substrate: substrate ?? null });
  journal.recordEvent("worker-start", {
   nodeId,
   repo: session.map.repo,
@@ -543,7 +543,7 @@ async function runImplementNode(
  const slug = slugify(node.node.title);
  const branch = implementBranchFor(node.node, worktreeBranch(nodeId, slug));
  const worktree = await bootstrapWorktree(canonical, nodeId, slug, token, branch, map.base);
- journal.updateWorker(nodeId, ctx.map.repo, { worktree, lane: "implement" });
+ journal.updateWorker(nodeId, repo, { worktree, lane: "implement" });
 
  // Substrate selection (node #45), re-run at every session start. A session
  // that hits its substrate's limit is not a failure: the substrate is marked
@@ -599,7 +599,7 @@ async function runImplementNode(
   case "awaiting-merge":
    journal.resetDeadman();
    // The row already says awaiting-merge; the supervisor exits, so its PID goes.
-   journal.updateWorker(nodeId, ctx.map.repo, { pid: null });
+   journal.updateWorker(nodeId, repo, { pid: null });
    break;
   case "refused":
    journal.recordEvent("refused", { nodeId, repo, detail: outcome.detail.slice(0, 400) });
@@ -658,7 +658,7 @@ async function runResearch(
  const { config, map, token, botIdentity, journal } = ctx;
  const repo = map.repo;
  const base: RunNodeOutcome = { nodeId, repo, status: "skipped", detail: "", workerExit: null };
- const fence = (action: string) => journal.assertGeneration(nodeId, ctx.map.repo, generation, action);
+ const fence = (action: string) => journal.assertGeneration(nodeId, repo, generation, action);
 
  journal.recordEvent("worker-start", {
   nodeId,
@@ -676,7 +676,7 @@ async function runResearch(
   repo,
   detail: `worktree ${worktree}, branch ${branch}`,
  });
- journal.updateWorker(nodeId, ctx.map.repo, { worktree, lane: "research" });
+ journal.updateWorker(nodeId, repo, { worktree, lane: "research" });
 
  const prompt = assembleResearchPrompt({
   repo,
@@ -710,9 +710,9 @@ async function runResearch(
   timeoutMs: wallClockMs,
   env: workerEnv(config, repo),
   processGroup: true,
-  onSpawn: (pgid) => journal.updateWorker(nodeId, ctx.map.repo, { workerPgid: pgid }),
+  onSpawn: (pgid) => journal.updateWorker(nodeId, repo, { workerPgid: pgid }),
  });
- journal.updateWorker(nodeId, ctx.map.repo, { workerPgid: null });
+ journal.updateWorker(nodeId, repo, { workerPgid: null });
  const log = saveWorkerLog(journal.path, repo, nodeId, generation, "research pass", workerResult);
 
  if (workerResult.code !== 0) {

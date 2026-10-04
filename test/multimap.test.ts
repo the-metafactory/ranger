@@ -126,30 +126,32 @@ describe("node #47 — map identity", () => {
  });
 
  for (const table of ["workers", "escalations"] as const) {
-  test(`migration refuses unresolved ${table} repos without changing legacy rows`, () => {
-   const { dir, path, sqlite } = legacyJournal();
-   if (table === "workers") sqlite.run("INSERT INTO workers(node_id,repo,status) VALUES('99','example/custom','parked')");
-   else sqlite.run("INSERT INTO escalations(key,repo,node_id,message_id,created_at) VALUES('example/custom:99','example/custom','99','card','2026-10-01')");
-   sqlite.close();
-   try {
-    expect(() => new Journal(path)).toThrow("Cannot backfill legacy map roots for: example/custom");
-    const maps = [1, 460].map(root => ({ repo: "example/custom", root, commands: {} }));
-    expect(() => new Journal(path, undefined, maps)).toThrow("state.legacyMapRoots");
-    expect(() => new Journal(path, undefined, maps, { "example/custom": 999 })).toThrow("must name a registered root");
-    const unchanged = new Database(path);
-    expect(unchanged.query(`SELECT repo FROM ${table}`).all()).toEqual([{ repo: "example/custom" }]);
-    expect((unchanged.query(`PRAGMA table_info(${table})`).all() as { name: string }[]).some(c => c.name === "root")).toBe(false);
-    unchanged.close();
-    const journal = new Journal(path, undefined, maps, { "example/custom": 460 });
-    const rows = table === "workers" ? journal.listWorkers() : journal.listEscalations();
-    expect(rows[0]).toMatchObject({ repo: "example/custom", nodeId: "99", root: 460 });
-    journal.close();
-    // Subsequent opens use the stored root, with no config or fallback required.
-    const reopened = new Journal(path);
-    expect((table === "workers" ? reopened.listWorkers() : reopened.listEscalations())[0].root).toBe(460);
-    reopened.close();
-   } finally { rmSync(dir, { recursive: true, force: true }); }
-  });
+  for (const repo of ["example/custom", "jcfischer/seelite"]) {
+   test(`migration refuses unresolved ${table} repo ${repo} without changing legacy rows`, () => {
+    const { dir, path, sqlite } = legacyJournal();
+    if (table === "workers") sqlite.run("INSERT INTO workers(node_id,repo,status) VALUES('99',?,'parked')", [repo]);
+    else sqlite.run("INSERT INTO escalations(key,repo,node_id,message_id,created_at) VALUES(?,?,'99','card','2026-10-01')", [repo + ":99", repo]);
+    sqlite.close();
+    try {
+     expect(() => new Journal(path)).toThrow(`Cannot backfill legacy map roots for: ${repo}`);
+     const maps = [1, 460].map(root => ({ repo, root, commands: {} }));
+     expect(() => new Journal(path, undefined, maps)).toThrow("state.legacyMapRoots");
+     expect(() => new Journal(path, undefined, maps, { [repo]: 999 })).toThrow("must name a registered root");
+     const unchanged = new Database(path);
+     expect(unchanged.query(`SELECT repo FROM ${table}`).all()).toEqual([{ repo }]);
+     expect((unchanged.query(`PRAGMA table_info(${table})`).all() as { name: string }[]).some(c => c.name === "root")).toBe(false);
+     unchanged.close();
+     const journal = new Journal(path, undefined, maps, { [repo]: 460 });
+     const rows = table === "workers" ? journal.listWorkers() : journal.listEscalations();
+     expect(rows[0]).toMatchObject({ repo, nodeId: "99", root: 460 });
+     journal.close();
+     // Subsequent opens use the stored root, with no config or fallback required.
+     const reopened = new Journal(path);
+     expect((table === "workers" ? reopened.listWorkers() : reopened.listEscalations())[0].root).toBe(460);
+     reopened.close();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+   });
+  }
  }
 
  test("selectors refuse ambiguous repos; resume infers the journal root", async () => {
@@ -218,6 +220,44 @@ describe("node #47 — map identity", () => {
     respawn: async () => { spawned = true; return 2_147_483_646; } });
    expect(result.respawned).toEqual([]);
    expect(spawned).toBe(false);
+   expect(r.journal.getWorker("31", REPO)?.attempts).toBe(0);
+  } finally { r.close(); }
+ });
+
+ for (const siblingRoot of [1, 460]) {
+  test(`dead implement peers recover serially (second root=${siblingRoot})`, async () => {
+   const r = rig();
+   try {
+    r.journal.upsertWorker({ nodeId: "30", repo: REPO, root: 1, status: "claimed", lane: "implement", pid: 2_147_483_646 });
+    r.journal.upsertWorker({ nodeId: "31", repo: REPO, root: siblingRoot, status: "running", lane: "implement", pid: 2_147_483_646 });
+    const spawns: string[] = [];
+    const sweep = (root: number) => sweepMap({ config: r.config, journal: r.journal,
+     map: pickMap(r.config, `${REPO}#${root}`), token: "unused", botIdentity: "ivy-bot",
+     respawn: async (id) => { spawns.push(id); return process.pid; } });
+    await sweep(1);
+    if (siblingRoot !== 1) await sweep(siblingRoot);
+    expect(spawns).toEqual(["30"]);
+    expect(r.journal.getWorker("30", REPO)?.attempts).toBe(1);
+    expect(r.journal.getWorker("31", REPO)?.attempts).toBe(0);
+    r.journal.updateWorker("30", REPO, { status: "success", pid: null });
+    expect((await sweep(siblingRoot)).respawned).toEqual(["31"]);
+    expect(spawns).toEqual(["30", "31"]);
+    expect(r.journal.getWorker("31", REPO)?.attempts).toBe(1);
+   } finally { r.close(); }
+  });
+ }
+
+ test("a dead holder cannot hide a later live holder from sweep", async () => {
+  const r = rig();
+  try {
+   for (const [id, root, pid] of [["30", 1, 2_147_483_646], ["31", 460, 2_147_483_646], ["32", 460, process.pid]] as const) {
+    r.journal.upsertWorker({ nodeId: id, repo: REPO, root, pid, status: "running", lane: "implement" });
+   }
+   let spawns = 0;
+   const result = await sweepMap({ config: r.config, journal: r.journal, map: r.config.maps[1],
+    token: "unused", botIdentity: "ivy-bot", respawn: async () => { spawns++; return process.pid; } });
+   expect(result.respawned).toEqual([]);
+   expect(spawns).toBe(0);
    expect(r.journal.getWorker("31", REPO)?.attempts).toBe(0);
   } finally { r.close(); }
  });

@@ -3,6 +3,12 @@ import type { Journal, WorkerRow } from "./journal.ts";
 import { implementLane, IMPLEMENT_LANES, type ImplementLane, type LaneMap } from "./lanes.ts";
 
 export const LAST_IMPLEMENT_MAP = "implement.lastMap";
+export function lastImplementMaps(journal: Pick<Journal, "getHealth"> | null): Record<ImplementLane, string | null> {
+ return Object.fromEntries(IMPLEMENT_LANES.map(lane => [lane,
+  journal?.getHealth(`${LAST_IMPLEMENT_MAP}.${lane}`) ?? journal?.getHealth(LAST_IMPLEMENT_MAP) ?? null,
+ ])) as Record<ImplementLane, string | null>;
+}
+
 export function recordImplementStart(journal: Journal, map: LaneMap): void {
  journal.setHealth(LAST_IMPLEMENT_MAP, mapKey(map));
  journal.setHealth(`${LAST_IMPLEMENT_MAP}.${implementLane(map)}`, mapKey(map));

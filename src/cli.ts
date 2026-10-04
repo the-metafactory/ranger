@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { implementLane } from "./lanes.ts";
+import { implementLane, startsImplementSession } from "./lanes.ts";
 import { recordImplementStart, mapKey, pickMap, resumeMap } from "./maps.ts";
 import { Command } from "commander";
 import { join, resolve } from "node:path";
@@ -273,7 +273,7 @@ async function runResumeNode(
   }
   // A resume starts a worker session in this map's resource lane.
   const lane = implementLane(map);
-  const takesLane = row.lane === "implement" && row.phase !== "close";
+  const takesLane = startsImplementSession(row);
   const holder = takesLane ? journal.laneHolder(lane, { nodeId, repo: map.repo }) : null;
   if (holder !== null && force !== true) {
    throw new Error(

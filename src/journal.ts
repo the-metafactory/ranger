@@ -284,11 +284,16 @@ export class Journal {
   * One claimed/running implement worker per resource lane across all maps.
   * Excluding an occupant requires its repo as well as node id.
   */
- laneHolder(lane: ImplementLane, except?: { nodeId: string; repo: string }): WorkerRow | null {
+ laneHolder(
+  lane: ImplementLane,
+  except?: { nodeId: string; repo: string },
+  isActive: (worker: WorkerRow) => boolean = () => true,
+ ): WorkerRow | null {
   return (
    this.listWorkers().find((w) => {
     if (w.nodeId === except?.nodeId && w.repo === except?.repo) return false;
     if (!holdsImplementLane(w)) return false;
+    if (!isActive(w)) return false;
     const resource = workerLane(w, this.maps);
     return resource === lane || resource === null;
    }) ?? null

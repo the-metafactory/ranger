@@ -1,4 +1,4 @@
-import { LAST_IMPLEMENT_MAP, mapKey, implementMapOrder } from "./maps.ts";
+import { lastImplementMaps, mapKey, implementMapOrder } from "./maps.ts";
 /**
  * `ranger serve` (#37) — a local dashboard of the walk: the job a worker is on
  * now, the next node a tick would take, every node ranger can take on its own,
@@ -1001,10 +1001,7 @@ export function stateFromJournal(
    reports,
    titles: reader.titles,
    workers: journal?.listWorkers() ?? [],
-   lastImplementMaps: {
-    visual: journal?.getHealth(`${LAST_IMPLEMENT_MAP}.visual`) ?? journal?.getHealth(LAST_IMPLEMENT_MAP) ?? null,
-    headless: journal?.getHealth(`${LAST_IMPLEMENT_MAP}.headless`) ?? journal?.getHealth(LAST_IMPLEMENT_MAP) ?? null,
-   },
+   lastImplementMaps: lastImplementMaps(journal),
    laneHolders: { visual: journal?.laneHolder("visual") ?? null, headless: journal?.laneHolder("headless") ?? null },
    paused: journal?.isPaused() ?? false,
    spawnsToday: journal?.spawnsToday(now) ?? 0,

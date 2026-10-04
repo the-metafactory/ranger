@@ -15,10 +15,7 @@ export function seedLegacyRoots(
  }
  if (legacyRepos.size === 0) return;
 
- // These defaults match the standalone SQL migration's historical registrations.
- const roots = new Map<string, number>([
-  ["the-metafactory/ranger", 1], ["jcfischer/seelite", 1], ["jcfischer/seekolous", 26],
- ]);
+ const roots = new Map<string, number>();
  for (const repo of legacyRepos) {
   const candidates = maps.filter(m => m.repo === repo);
   const explicit = legacyMapRoots[repo];

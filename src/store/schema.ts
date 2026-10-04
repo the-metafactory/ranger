@@ -95,7 +95,7 @@ export const vetoes = sqliteTable("vetoes", {
 export const escalations = sqliteTable(
  "escalations",
  {
-  /** `${repo}:${nodeId}` — one card per node per map. */
+  /** `${repo}:${nodeId}` — one card per node per repo. */
   key: text("key").primaryKey(),
   root: integer("root").notNull(),
   repo: text("repo").notNull(),

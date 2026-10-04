@@ -78,8 +78,8 @@ maps:
       tokenEnv: RANGER_DISCORD_TOKEN
       channelId: "1487052222067118111"
 
-  # Principal ruling: node #38, 2026-10-03 — walk full with #1's commands
-  # and autoMerge policy. Node #47 omits #1's map-specific skip list.
+  # Node #38: register gameplay with walk: full and the same commands and
+  # autoMerge as platform. Node #47 omits platform's map-specific skip list.
   - repo: jcfischer/seelite
     root: 460
     walk: full
