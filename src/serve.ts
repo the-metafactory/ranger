@@ -62,12 +62,13 @@ import { type FrontierEntry, graphFrontier, RateLimitError } from "./graph.ts";
 import { runCmd } from "./exec.ts";
 import { classify, classifyFrontier, type ClassifiedNode, loadProbeRegistry } from "./route.ts";
 import { liveSession, substrateUsageViews, type SubstrateUsageView } from "./substrate-usage.ts";
-import { assertReadOnlyToken, gatedEnv, tokenBatch, type TokenBatch } from "./token-gate.ts";
+import { resolveReadOnlyToken, assertReadOnlyToken, gatedEnv, tokenBatch, type TokenBatch } from "./token-gate.ts";
 import { childEnv, itermArgv, shellQuote } from "./launch.ts";
 import {
  type ActionKind,
  type ActionRunner,
  checkRunsFromPages,
+ workflowRunsFromPages,
  ciState,
  needsYouEntries,
  type NeedsYouEntry,
@@ -903,7 +904,7 @@ function prLifecycle(v) {
 function prFacts(pr) {
  const v = pr.view;
  const parts = ["PR #" + pr.number];
- if (v) parts.push(prLifecycle(v), "head " + short(v.headSha), ...(v.ci === "not-read" ? [] : ["CI " + v.ci]));
+ if (v) parts.push(prLifecycle(v), "head " + short(v.headSha), ...(v.ci === "not-read" ? [] : ["CI " + v.ci + (v.ciSource === "actions" ? " (Actions only)" : "")]));
  if (pr.error) parts.push(v ? "stale, read " + ago(v.readAt) + "; the last refresh failed: " + pr.error : "the read failed: " + pr.error);
  else if (!v) parts.push("not read yet");
  return parts.join(" · ");
@@ -1318,7 +1319,8 @@ export async function readPrLive(
  const terminal = raw.state === "closed" || raw.merged === true;
  // Every page: a failure on page two must not read as green. A closed or
  // merged PR offers no action its checks could gate, so they are not read.
- const checks = !terminal && /^[0-9a-f]{40}$/.test(headSha)
+ const readable = !terminal && /^[0-9a-f]{40}$/.test(headSha);
+ let checks = readable
   ? checkRunsFromPages(
      await restRead(tokens, repo, `repos/${repo}/commits/${headSha}/check-runs?filter=latest&per_page=100`, [
       "--paginate",
@@ -1326,6 +1328,16 @@ export async function readPrLive(
      ]),
     )
   : null;
+ // A token refused check runs (seelite's fine-grained one is) may still read
+ // the Actions workflow runs: shown, marked as Actions-only, never merged on.
+ let ciSource: "checks" | "actions" | undefined = checks === null ? undefined : "checks";
+ if (readable && checks === null) {
+  checks = workflowRunsFromPages(
+   await restRead(tokens, repo, `repos/${repo}/actions/runs?head_sha=${headSha}&per_page=100`, ["--paginate", "--slurp"]),
+   headSha,
+  );
+  if (checks !== null) ciSource = "actions";
+ }
  return {
   number,
   url: typeof raw.html_url === "string" ? raw.html_url : `https://github.com/${repo}/pull/${number}`,
@@ -1335,6 +1347,7 @@ export async function readPrLive(
   headSha,
   mergeable: typeof raw.mergeable === "boolean" ? raw.mergeable : null,
   ci: terminal ? "not-read" : checks === null ? "unreadable" : ciState(checks),
+  ...(ciSource === undefined || terminal ? {} : { ciSource }),
   readAt: new Date().toISOString(),
  };
 }
@@ -1549,17 +1562,58 @@ export const spawnAction: ActionRunner = (argv, env, opts) =>
 
 const ACTION_TIMEOUT_MS = 120_000;
 
+/**
+ * Every served repo's read-only token must be set before the dashboard
+ * listens. Started outside `~/bin/ranger` (which exports them from the
+ * keychain), a dashboard used to come up and show "the read failed" on every
+ * PR of a repo whose token was missing (2026-10-05); it now refuses to
+ * start, naming each missing token.
+ */
+export function assertReadOnlyTokens(
+ config: RangerConfig,
+ maps: { repo: string }[],
+ env: NodeJS.ProcessEnv = process.env,
+): void {
+ const unset = new Map<string, string[]>(); // token env -> the repos that need it
+ const other: string[] = [];
+ for (const repo of [...new Set(maps.map((m) => m.repo))]) {
+  try {
+   resolveReadOnlyToken(config, repo, env);
+  } catch (error) {
+   const message = error instanceof Error ? error.message : String(error);
+   const name = /read-only token env (\S+) is unset/.exec(message)?.[1];
+   if (name === undefined) other.push(message);
+   else unset.set(name, [...(unset.get(name) ?? []), repo]);
+  }
+ }
+ const lines = [
+  ...[...unset].map(
+   ([name, repos]) =>
+    `read-only token env ${name} is unset (needed for ${repos.join(", ")}) — refusing to fall back to the gh keyring, which is write-capable`,
+  ),
+  ...other,
+ ];
+ if (lines.length > 0) {
+  throw new Error(
+   `${lines.join("\n")}\nStart the dashboard through ~/bin/ranger serve, which exports the read-only tokens from the keychain.`,
+  );
+ }
+}
+
 export function startServe(opts: {
  config: RangerConfig;
  /** The ranger.yaml this was loaded from; `resume-node` and `build-now` are run with the same one. */
  configPath?: string;
  port?: number;
  open?: boolean;
+ /** The environment the read-only tokens are read from (tests pass their own). */
+ env?: NodeJS.ProcessEnv;
 }): { url: string; stop: () => void } {
  const serve = serveConfig(opts.config);
  const port = opts.port ?? serve.port;
  const token = randomBytes(24).toString("hex");
  const maps = servedMaps(opts.config);
+ assertReadOnlyTokens(opts.config, maps, opts.env);
  const reader = new ServeReader(
   opts.config,
   maps,

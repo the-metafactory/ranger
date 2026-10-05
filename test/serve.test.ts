@@ -8,6 +8,7 @@ import type { WorkerRow } from "../src/journal.ts";
 import { classify, loadProbeRegistry } from "../src/route.ts";
 import type { RangerConfig } from "../src/config.ts";
 import {
+ assertReadOnlyTokens,
  assembleState,
  buildNowArgv,
  childEnv,
@@ -616,6 +617,33 @@ describe("node #58 — the Build now endpoint", () => {
   // The page's script is a template literal: an unescaped "\n" would break it.
   const script = page.split("<script>")[1].split("</script>")[0];
   expect(() => new Function(script)).not.toThrow();
+ });
+});
+
+describe("serve refuses to start without every served repo's read-only token (2026-10-05)", () => {
+ const config = {
+  maps: [
+   { repo: "the-metafactory/ranger", root: 1 },
+   { repo: "jcfischer/seelite", root: 1 },
+   { repo: "jcfischer/seelite", root: 460 },
+  ],
+  auth: { readOnlyTokens: { "the-metafactory/*": "RO_METAFACTORY", "jcfischer/*": "RO_PERSONAL" }, writeTokens: {} },
+ } as unknown as RangerConfig;
+
+ test("a missing token is named, with the way to start it that sets them", () => {
+  expect(() => assertReadOnlyTokens(config, config.maps, { RO_METAFACTORY: "ro1" })).toThrow(
+   /read-only token env RO_PERSONAL is unset[\s\S]*Start the dashboard through ~\/bin\/ranger serve/,
+  );
+  // each repo once, however many of its maps are served
+  try {
+   assertReadOnlyTokens(config, config.maps, {});
+  } catch (error) {
+   expect(String(error).match(/is unset/g)).toHaveLength(2);
+  }
+ });
+
+ test("with every token set it passes", () => {
+  expect(() => assertReadOnlyTokens(config, config.maps, { RO_METAFACTORY: "ro1", RO_PERSONAL: "ro2" })).not.toThrow();
  });
 });
 
