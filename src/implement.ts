@@ -87,6 +87,9 @@ export type Reviewer = (
 
 export type WorkerRun = (prompt: string, opts: RunOptions) => Promise<RunResult>;
 
+/** Runs a repo command (install/test/probe) as `/bin/sh -c`; tests inject it. */
+export type ShellRun = (command: string, opts: RunOptions) => Promise<RunResult>;
+
 export interface ImplementContext {
  config: RangerConfig;
  map: RangerMapConfig;
@@ -104,6 +107,13 @@ export interface ImplementContext {
  /** auto: probes + CI close the node. merge: the principal's merge ratifies it (#23 ruling). */
  ratify: "auto" | "merge";
  workerRun: WorkerRun;
+ /**
+  * The session's temp journal (node #66): RANGER_JOURNAL_PATH for the worker
+  * and every repo command, so branch code never opens the live journal.
+  */
+ sessionJournal: string;
+ /** Repo-command runner (default `/bin/sh -c`); tests inject it. */
+ shellRun?: ShellRun;
  github?: GitHubPort;
  reviewer?: Reviewer;
  /** How long to wait for GitHub to show a pushed head (default 2 min; tests shorten it). */
@@ -814,10 +824,10 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
     map, nodeId, sha: final.sha, labels,
     probePassed: probe?.passed === true && probe.sha === final.sha,
     journalPath: journal.path, worktree,
-    env: workerEnv(config, repo), dependencies: ctx.viewsDependencies,
+    env: workerEnv(config, repo, ctx.sessionJournal), dependencies: ctx.viewsDependencies,
    });
   } catch (error) {
-   record = { sha: final.sha, status: "failed", reason: redactViewsReason(String(error), workerEnv(config, repo)) };
+   record = { sha: final.sha, status: "failed", reason: redactViewsReason(String(error), workerEnv(config, repo, ctx.sessionJournal)) };
    try { saveViewsRecord(viewsDirectory(journal.path, repo, nodeId, final.sha), record); } catch { /* best effort */ }
   }
   if (record !== undefined) {
@@ -1143,7 +1153,7 @@ async function checkedWorkerPass(
   cwd: worktree,
   timeoutMs: config.workers.wallClockMin * 60_000,
   nice: config.workers.niceness,
-  env: workerEnv(config, map.repo),
+  env: workerEnv(config, map.repo, ctx.sessionJournal),
   ...output.runOptions,
   processGroup: true,
   onSpawn: (pgid) => journal.updateWorker(nodeId, ctx.map.repo, { workerPgid: pgid }),
@@ -1236,9 +1246,10 @@ function runShell(
  timeoutMs: number,
  priority: "background" | "probe" = "background",
 ): Promise<RunResult> {
- return runCmd("/bin/sh", ["-c", command], {
+ const run: ShellRun = ctx.shellRun ?? ((cmd, opts) => runCmd("/bin/sh", ["-c", cmd], opts));
+ return run(command, {
   cwd,
-  env: workerEnv(ctx.config, ctx.map.repo),
+  env: workerEnv(ctx.config, ctx.map.repo, ctx.sessionJournal),
   timeoutMs,
   processGroup: true,
   // Install and tests yield the CPU; the timing-sensitive probes do not.

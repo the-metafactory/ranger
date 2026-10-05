@@ -8,6 +8,15 @@ export const fixturesBin = join(import.meta.dir, "fixtures", "bin");
 export const cliPath = join(import.meta.dir, "..", "src", "cli.ts");
 export const bun = process.execPath;
 
+/**
+ * A spawned CLI stays in test mode (node #66): RANGER_UNDER_TEST=1 keeps the
+ * live journal directory refused and an unset state.journalPath a temp file,
+ * even when the test hands the child a minimal env.
+ */
+export function testCliEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+ return { ...env, RANGER_UNDER_TEST: "1" };
+}
+
 export const GIT_ENV = {
  GIT_AUTHOR_NAME: "ranger-test",
  GIT_AUTHOR_EMAIL: "ranger-test@example.com",
@@ -64,6 +73,8 @@ export async function addTrackedWorktree(
  * one place. Sections: `map` (inside the map stanza after `walk`), `auth`
  * (after readOnlyTokens), `beforeState` (between bot and state, e.g.
  * principal), `state` (after journalPath), `workers` (after spawnCapPerDay).
+ * Every config it builds carries a temp `state.journalPath` under `dir`, never
+ * the live default (node #66).
  */
 export function baseConfigLines(
  dir: string,
@@ -111,7 +122,7 @@ export async function runCli(
  env: NodeJS.ProcessEnv,
  cwd = join(import.meta.dir, ".."),
 ) {
- return runCmd(bun, [cliPath, ...args], { env, cwd });
+ return runCmd(bun, [cliPath, ...args], { env: testCliEnv(env), cwd });
 }
 
 /**
@@ -128,7 +139,7 @@ export function runCliSpawn(
  result: Promise<{ code: number; stdout: string; stderr: string }>;
 } {
  const child = spawn(bun, [cliPath, ...args], {
-  env,
+  env: testCliEnv(env),
   cwd,
   stdio: ["ignore", "pipe", "pipe"],
  });

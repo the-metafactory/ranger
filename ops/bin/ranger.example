@@ -1,0 +1,140 @@
+#!/bin/bash -p
+# ranger — token-injecting entrypoint for ranger's process tree (node #11).
+#
+# Versioned copy of ~/bin/ranger (install: copy, replace __USER__, chmod +x).
+#
+# Resolves every credential ranger needs from durable local stores (macOS
+# keychain + grove's bot.env), exports them into the process environment, then
+# execs the real CLI. Never any token inline in a file (gitleaks-clean on
+# push; ranger.yaml carries only env var NAMES).
+#
+# Tokens resolved here (design §2 identity model):
+#   GH_TOKEN                         — ivy-agent machine-account PAT (write path;
+#                                      the future walker refuses any graph-mutating
+#                                      tick under the principal's credential).
+#   RANGER_WRITE_GH_TOKEN_METAFACTORY / RANGER_WRITE_GH_TOKEN_PERSONAL — the
+#                                      walker's auth.writeTokens env names (node
+#                                      #18): one classic repo-scoped PAT covers
+#                                      both the-metafactory/* and jcfischer/*.
+#   RANGER_READONLY_GH_TOKEN_METAFACTORY — fine-grained read-only PAT for
+#   RANGER_READONLY_GH_TOKEN_PERSONAL    the-metafactory/* and jcfischer/*
+#                                      (node #8 read-only gate; no keyring fallback).
+#   RANGER_DISCORD_TOKEN             — reused grove Discord bot token (node #11
+#                                      reuse decision).
+#
+# Keychain entries are created by the principal (fine-grained PATs are GitHub
+# UI-only; the keychain is the durable store). See ranger.example.yaml.
+#
+# The caller picks no program that receives these tokens (node #66). A worker
+# session runs as the same user and can invoke this wrapper, so every program
+# it runs is pinned here and the CLI starts in a clean environment:
+#   - `bash -p` ignores BASH_ENV, exported functions and SHELLOPTS/BASHOPTS
+#     from the caller (an exported `exec`, or xtrace into the log, would leak);
+#   - HOME, PATH, bun, the keychain/grep/cut tools and gh's config dir are
+#     fixed here, never read from the caller;
+#   - bun reads ranger's own bunfig.toml (`--config`): its default is
+#     $cwd/bunfig.toml, whose `preload` would run the caller's code first;
+#   - bun loads no .env (`--no-env-file`): its default reads $cwd/.env*
+#     after this clean-up, and `SAGE_X=$GH_TOKEN` there would copy a token
+#     into a name the worker environment forwards (src/worker-env.ts);
+#   - every environment entry outside PASS_THROUGH and the pinned names is
+#     dropped, including entries bash cannot unset (readonly SHELLOPTS) or
+#     never imports (BASH_FUNC_*%%, which a child bash would): BUN_OPTIONS,
+#     DYLD_*, GIT_* (ssh command, config injection), CLAUDE_CONFIG_DIR (hooks),
+#     XDG_*, ranger's own RANGER_WORKER_CMD / RANGER_SAGE_CMD, and
+#     RANGER_JOURNAL_PATH (a worker session's temp journal) with both
+#     test-mode markers, RANGER_UNDER_TEST and NODE_ENV (src/journal-guard.ts),
+#     so a live tick, run-node or serve always opens the live journal.
+# Under launchd the tick gets only HOME and PATH from its plist, so this is
+# the environment it already runs in.
+#
+# This is an override and tamper guard, not a sandbox: a same-user process
+# can still read the keychain itself. It closes the paths by which this
+# wrapper would hand the tokens to a program the caller chose. The pinned
+# locations (~/.local/bin, ~/bin, ranger's checkout) are the user's own and
+# writable by the same user by design; tamper with ranger's files is the git
+# tamper guard's job (src/git-ops.ts), not this wrapper's.
+
+set -euo pipefail
+
+# Clean environment first, before any name below is assigned: a variable the
+# caller exported stays exported through a reassignment. Every exported name
+# outside PASS_THROUGH is dropped; the token names survive only so a token the
+# caller already holds can win below. The tokens go in by export, never as
+# argv (`env -i NAME=token …` shows in ps). The exec at the end drops what
+# this loop cannot.
+unset PASS_THROUGH
+PASS_THROUGH=" USER LOGNAME SHELL TMPDIR LANG LC_ALL LC_CTYPE TERM TZ SSH_AUTH_SOCK __CF_USER_TEXT_ENCODING
+  GH_TOKEN RANGER_WRITE_GH_TOKEN_METAFACTORY RANGER_WRITE_GH_TOKEN_PERSONAL
+  RANGER_READONLY_GH_TOKEN_METAFACTORY RANGER_READONLY_GH_TOKEN_PERSONAL RANGER_DISCORD_TOKEN "
+for name in $(compgen -e); do
+  case "$PASS_THROUGH" in
+    *[[:space:]]"$name"[[:space:]]*) ;;
+    *) unset "$name" 2>/dev/null || true ;;
+  esac
+done
+
+HOME="/Users/__USER__"
+BUN="/opt/homebrew/bin/bun"
+SECURITY="/usr/bin/security"
+GREP="/usr/bin/grep"
+CUT="/usr/bin/cut"
+MKDIR="/bin/mkdir"
+RANGER_DIR="$HOME/work/mf/ranger"
+RANGER_CLI="$RANGER_DIR/src/cli.ts"
+RANGER_LOGS="$HOME/.config/ranger/logs"
+# Isolate gh from the write-capable keyring (the read-only gate's invariant).
+# Pinned too: a gh config.yml names pager, editor and browser programs.
+GH_CONFIG_DIR="$HOME/.config/ranger/gh-config"
+# The user's current Claude Code lives in ~/.local/bin. launchd's PATH starts
+# at /opt/homebrew/bin, whose global npm `claude` was 2.1.107: its
+# rate_limit_event carries no unifiedWindows, so every Claude quota read came
+# back empty and ranger never picked Claude (2026-10-04).
+PATH="$HOME/.local/bin:$HOME/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+"$MKDIR" -p "$RANGER_LOGS" "$GH_CONFIG_DIR"
+
+resolve_keychain() { # svce -> token or ""
+  "$SECURITY" find-generic-password -s "$1" -w 2>/dev/null || true
+}
+
+# Machine-account write PAT (ivy-agent). Service name: ivy-agent (classic
+# repo-scoped PAT, node #11). One token covers both walked orgs/personals, so
+# it fills GH_TOKEN (design §2 pins the process tree) and the two
+# auth.writeTokens env names the walker's resolveWriteToken reads (node #18).
+# A token the caller sets still wins: it hands ranger no more than the caller
+# already holds.
+IVY_TOKEN="$(resolve_keychain ivy-agent)"
+gh_token="${GH_TOKEN:-$IVY_TOKEN}"
+write_metafactory="${RANGER_WRITE_GH_TOKEN_METAFACTORY:-$IVY_TOKEN}"
+write_personal="${RANGER_WRITE_GH_TOKEN_PERSONAL:-$IVY_TOKEN}"
+
+# Read-only fine-grained PATs (node #8 gate). Empty until provisioned; scout
+# then refuses both maps explicitly rather than falling back to the keyring.
+readonly_metafactory="${RANGER_READONLY_GH_TOKEN_METAFACTORY:-$(resolve_keychain ranger-ro-metafactory)}"
+readonly_personal="${RANGER_READONLY_GH_TOKEN_PERSONAL:-$(resolve_keychain ranger-ro-personal)}"
+
+# Discord bot token — reuse the grove bot (node #11 decision).
+discord_token="${RANGER_DISCORD_TOKEN:-$("$GREP" -m1 '^DISCORD_BOT_TOKEN=' "$HOME/.config/grove/bot.env" 2>/dev/null | "$CUT" -d= -f2- || true)}"
+
+export HOME PATH GH_CONFIG_DIR
+export GH_TOKEN="$gh_token"
+export RANGER_WRITE_GH_TOKEN_METAFACTORY="$write_metafactory"
+export RANGER_WRITE_GH_TOKEN_PERSONAL="$write_personal"
+export RANGER_READONLY_GH_TOKEN_METAFACTORY="$readonly_metafactory"
+export RANGER_READONLY_GH_TOKEN_PERSONAL="$readonly_personal"
+export RANGER_DISCORD_TOKEN="$discord_token"
+
+# Entries the loop above could not drop (readonly, or names bash never
+# imports) still sit in the environment bash hands on: `env -u` strips them.
+KEEP="$PASS_THROUGH HOME PATH GH_CONFIG_DIR PWD SHLVL _ "
+drop=()
+while IFS= read -r -d '' entry; do
+  name="${entry%%=*}"
+  case "$KEEP" in
+    *[[:space:]]"$name"[[:space:]]*) ;;
+    *) if [ -n "$name" ]; then drop+=(-u "$name"); fi ;;
+  esac
+done < <(/usr/bin/env -0)
+
+exec /usr/bin/env ${drop[@]+"${drop[@]}"} "$BUN" --config="$RANGER_DIR/bunfig.toml" --no-env-file "$RANGER_CLI" "$@"

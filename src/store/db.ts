@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import { drizzle, type BunSQLiteDatabase } from "drizzle-orm/bun-sqlite";
 import { migrate } from "drizzle-orm/bun-sqlite/migrator";
 import * as schema from "./schema.ts";
+import { assertKnownMigrations } from "../journal-guard.ts";
 
 export type RangerDb = BunSQLiteDatabase<typeof schema>;
 
@@ -14,6 +15,8 @@ const MIGRATIONS_DIR = join(import.meta.dir, "../../drizzle");
  * Open (creating if needed) the ranger journal: WAL mode, busy timeout, then
  * run committed migrations before returning. The journal holds operator-private
  * state (spend ledger, vetoes) — 0700 dir, 0600 files (reflex R-103 convention).
+ * A journal carrying a migration this code does not ship is refused before
+ * anything writes it (node #66).
  */
 export function openDb(
   path: string,
@@ -37,6 +40,7 @@ export function openDb(
     }
   }
   sqlite.run("PRAGMA busy_timeout = 5000;");
+  refuseForeignMigrations(sqlite, path);
   // WAL switch needs an exclusive lock — the busy handler must be armed
   // BEFORE it, or a transient WAL-recovery lock (previous process's WAL not
   // yet checkpointed) returns an immediate SQLITE_BUSY "database is locked"
@@ -62,6 +66,16 @@ export function openDb(
     );
   }
   return { db, close: () => sqlite.close() };
+}
+
+/** Close the handle and rethrow when the journal was migrated by foreign code. */
+function refuseForeignMigrations(sqlite: Database, path: string): void {
+  try {
+    assertKnownMigrations(sqlite, path, MIGRATIONS_DIR);
+  } catch (error) {
+    sqlite.close();
+    throw error;
+  }
 }
 
 /** Attempts at a step that can lose an open race before its error stands. */
@@ -119,5 +133,6 @@ export function openDbReadOnly(
   if (!existsSync(path)) return null;
   const sqlite = new Database(path, { readonly: true });
   sqlite.run("PRAGMA busy_timeout = 5000;");
+  refuseForeignMigrations(sqlite, path);
   return { db: drizzle(sqlite, { schema }), close: () => sqlite.close() };
 }
