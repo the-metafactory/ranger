@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { execFile, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { closeSync, constants, existsSync, fstatSync, openSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -51,12 +51,28 @@ function minimalGitEnv(): NodeJS.ProcessEnv {
 }
 
 /**
- * Run git with hooks and fsmonitor disabled, in a minimal env. `token` adds
- * the auth header (remote calls only); every such call but `clone` names the
- * `canonical` checkout whose git state was vetted, and runs only where git
- * resolves to it (`assertCheckoutOf`).
+ * Config every credentialed call runs with: no submodule recursion. A fetch
+ * defaults to fetching submodules on demand, each from its own
+ * `.git/modules/<name>/config`, which `readGitState` never vets, and the
+ * child git inherits the auth header (sage round 4 on node #86). Command-line
+ * `-c` outranks every config file; an explicit `--recurse-submodules` flag
+ * would outrank it, and `assertNamedRefs` refuses one.
  */
-export function safeGit(
+const NO_SUBMODULE_RECURSION = [
+ "-c", "fetch.recurseSubmodules=false",
+ "-c", "push.recurseSubmodules=no",
+ "-c", "submodule.recurse=false",
+];
+
+/**
+ * Run git with hooks and fsmonitor disabled, in a minimal env. `token` adds
+ * the auth header (remote calls only) and turns submodule recursion off
+ * (`NO_SUBMODULE_RECURSION`); every such call but `clone` names the
+ * `canonical` checkout whose git state was vetted, and runs only where git
+ * resolves its repository to that one (`assertCheckoutOf`). Git's remote
+ * helper gets the header: that is what it is for.
+ */
+export async function safeGit(
  args: string[],
  opts: { cwd: string; token?: string; canonical?: string; timeoutMs?: number },
 ): Promise<RunResult> {
@@ -66,13 +82,18 @@ export function safeGit(
    if (opts.canonical === undefined) {
     throw new GitSafetyError(`refusing a credentialed \`git ${args[0]}\`: it names no canonical checkout to check its repository against`);
    }
-   assertCheckoutOf(opts.cwd, opts.canonical);
+   await assertCheckoutOf(opts.cwd, opts.canonical);
   }
  }
  const base = minimalGitEnv();
  return runCmd(
   "git",
-  ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", ...args],
+  [
+   "-c", "core.hooksPath=/dev/null",
+   "-c", "core.fsmonitor=false",
+   ...(opts.token === undefined ? [] : NO_SUBMODULE_RECURSION),
+   ...args,
+  ],
   {
    cwd: opts.cwd,
    env: opts.token === undefined ? base : gitAuthEnv(opts.token, base),
@@ -87,10 +108,16 @@ export function safeGit(
  * `worktree add` reach no remote through a branch's upstream. The tamper
  * state leaves out node branches' tracking lines (`configRecords`), which is
  * safe only while no credentialed call falls back to an upstream: a bare
- * `fetch`, `push` or any `pull` would.
+ * `fetch`, `push` or any `pull` would. No call asks for submodule recursion
+ * (`NO_SUBMODULE_RECURSION`).
  */
 export function assertNamedRefs(args: string[]): void {
  const [verb, ...rest] = args;
+ if (rest.some((a) => a.startsWith("--recurse-submodules"))) {
+  throw new GitSafetyError(
+   `refusing a credentialed \`git ${args.join(" ")}\`: submodules fetch from config the git state never vets`,
+  );
+ }
  if (verb === "clone" || (verb === "worktree" && rest[0] === "add")) return;
  const positional = rest.filter((a) => !a.startsWith("-"));
  if ((verb === "fetch" || verb === "push") && positional.length >= 2) return;
@@ -109,19 +136,22 @@ export function assertNamedRefs(args: string[]): void {
  * whose config (another origin) the hash never covered, and a credentialed
  * call would send the write credential there. Git resolves the pointers
  * itself (`rev-parse`, no credential, hooks off): ranger does not
- * re-implement how git reads a gitfile.
+ * re-implement how git reads a gitfile. Paths are compared as bytes, never
+ * decoded: UTF-8 decoding maps every invalid byte to U+FFFD, so
+ * `worktrees/raw\xff` read as a decoy `worktrees/raw�` (sage round 4 on
+ * node #86). Which `worktrees/<name>` it is does not matter here: every one
+ * is in the hash, and `readGitState` refuses a name that is not UTF-8.
  */
-export function assertCheckoutOf(cwd: string, canonical: string): void {
- const got = spawnSync(
-  "git",
+export async function assertCheckoutOf(cwd: string, canonical: string): Promise<void> {
+ const got = await gitBytes(
   [
    "-c", "core.hooksPath=/dev/null",
    "-c", "core.fsmonitor=false",
    "rev-parse", "--path-format=absolute", "--git-common-dir", "--absolute-git-dir",
   ],
-  { cwd, env: minimalGitEnv(), encoding: "utf8", timeout: 10_000 },
+  cwd,
  );
- const [common, gitDir] = got.error === undefined && got.status === 0 ? gitDirLines(got.stdout) : [];
+ const [common, gitDir] = got === null ? [] : gitDirLines(got);
  const vetted = realPath(join(canonical, ".git"));
  const commonReal = realPath(common);
  const gitDirReal = realPath(gitDir);
@@ -133,10 +163,26 @@ export function assertCheckoutOf(cwd: string, canonical: string): void {
    ? gitDirReal === vetted
    : dirname(gitDirReal) === realPath(join(canonical, ".git", "worktrees")));
  if (!ours) {
+  const shown = (p: string | null) => (p === null ? null : Buffer.from(p, "latin1").toString("utf8"));
   throw new GitSafetyError(
-   `refusing a credentialed git call in ${cwd}: git there uses ${gitDirReal ?? "no repository"} (common dir ${commonReal ?? "none"}), not the vetted ${join(canonical, ".git")}`,
+   `refusing a credentialed git call in ${cwd}: git there uses ${shown(gitDirReal) ?? "no repository"} (common dir ${shown(commonReal) ?? "none"}), not the vetted ${join(canonical, ".git")}`,
   );
  }
+}
+
+/**
+ * Git's stdout as bytes, or null when it fails, exits nonzero or runs past
+ * 10s. Awaited, so the supervisor's event loop keeps running meanwhile.
+ */
+function gitBytes(args: string[], cwd: string): Promise<Buffer | null> {
+ return new Promise((resolvePromise) => {
+  execFile(
+   "git",
+   args,
+   { cwd, env: minimalGitEnv(), encoding: "buffer", timeout: 10_000, maxBuffer: 1024 * 1024 },
+   (error, stdout) => resolvePromise(error === null ? stdout : null),
+  );
+ });
 }
 
 /**
@@ -146,17 +192,23 @@ export function assertCheckoutOf(cwd: string, canonical: string): void {
  * vetted directory, so a split that kept the first two lines accepted a
  * foreign repository (sage round 2 on node #86).
  */
-function gitDirLines(stdout: string): [string, string] | [] {
- const lines = stdout.split("\n");
- if (lines.length !== 3 || lines[2] !== "" || lines[0] === "" || lines[1] === "") return [];
- return [lines[0], lines[1]];
+function gitDirLines(stdout: Buffer): [Buffer, Buffer] | [] {
+ const first = stdout.indexOf(0x0a);
+ if (first <= 0) return [];
+ const second = stdout.indexOf(0x0a, first + 1);
+ if (second === first + 1 || second !== stdout.length - 1) return [];
+ return [stdout.subarray(0, first), stdout.subarray(first + 1, second)];
 }
 
-/** A path with every symlink resolved; null when it is empty or not there. */
-function realPath(path: string | undefined): string | null {
+/**
+ * A path with every symlink resolved, as a latin1 string: one char per byte,
+ * so no two paths collide and `dirname` still splits on "/". Null when it is
+ * empty or not there.
+ */
+function realPath(path: Buffer | string | undefined): string | null {
  if (path === undefined || path.length === 0) return null;
  try {
-  return realpathSync(path);
+  return realpathSync(typeof path === "string" ? Buffer.from(path) : path, { encoding: "latin1" });
  } catch {
   return null;
  }
@@ -474,6 +526,30 @@ function readConfigFile(file: string, read: ConfigReader): Records | null {
  * that for its worktree (a main `http.sslVerify=true` over a shared
  * `false`), so it is kept: emptying or deleting a copy is a change.
  */
+/**
+ * A directory's entry names, sorted; throws on a name that is not UTF-8.
+ * Node decodes names as UTF-8 by default, which maps every invalid byte to
+ * U+FFFD: `worktrees/raw\xff` read as `worktrees/raw�`, so a decoy
+ * directory of that name was vetted in place of the one git reads (sage
+ * round 4 on node #86). A name is UTF-8 when it survives the round trip
+ * byte for byte; `TextDecoder` would also drop a leading BOM.
+ */
+function entryNames(dir: string): string[] {
+ return readdirSync(dir, { encoding: "buffer" })
+  .map((bytes) => {
+   // Bun hands back plain Uint8Arrays, whose toString lists the bytes.
+   const raw = Buffer.from(bytes);
+   const name = raw.toString("utf8");
+   if (!Buffer.from(name, "utf8").equals(raw)) {
+    throw new GitSafetyError(
+     `${join(dir, name)} has a name that is not UTF-8 (hex ${raw.toString("hex")}) — refusing to judge the git state. Remove it, then resume the node.`,
+    );
+   }
+   return name;
+  })
+  .sort();
+}
+
 function linkedWorktreeConfigs(
  gitDir: string,
  main: { present: boolean; records: Records | null },
@@ -484,7 +560,7 @@ function linkedWorktreeConfigs(
  if (!existsSync(worktrees)) return [];
  const mainSetsNothing = !main.present || (main.records !== null && setsNothing(main.records));
  const kept: string[] = [];
- for (const entry of readdirSync(worktrees).sort()) {
+ for (const entry of entryNames(worktrees)) {
   if (statSync(join(worktrees, entry), { throwIfNoEntry: false })?.isDirectory() !== true) continue;
   const file = join(worktrees, entry, "config.worktree");
   const records = readConfigFile(file, read);
@@ -573,7 +649,7 @@ export function readGitState(canonical: string): GitState {
  }
  const hooks = join(gitDir, "hooks");
  if (existsSync(hooks)) {
-  for (const entry of readdirSync(hooks).sort()) add(join(hooks, entry));
+  for (const entry of entryNames(hooks)) add(join(hooks, entry));
  }
  return { hash: hash.digest("hex"), entries, includes: [...includes].sort() };
 }
