@@ -621,6 +621,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
    branch,
    token,
    configSnapshot: built.snapshot,
+   base: ctx.map.base,
   });
   journal.recordEvent("pushed", { nodeId, repo, detail: `${branch} @ ${built.sha.slice(0, 8)}` });
   recordHead(ctx, built.sha);
@@ -888,6 +889,7 @@ async function publishPass(
   branch: ctx.branch,
   token: ctx.token,
   configSnapshot: pass.snapshot,
+  base: ctx.map.base,
  });
  ctx.journal.recordEvent("pushed", { nodeId: ctx.node.ref.id, repo: ctx.map.repo, detail });
  recordHead(ctx, pass.sha);
@@ -1087,7 +1089,7 @@ async function checkedWorkerPass(
 ): Promise<PassResult> {
  const { config, map, journal, node, worktree, branch, botIdentity } = ctx;
  const nodeId = node.ref.id;
- const snapshot = gitConfigSnapshot(ctx.canonical);
+ const snapshot = gitConfigSnapshot(ctx.canonical, ctx.map.base);
  const before = await headSha(worktree);
  const prompt = assembleImplementPrompt({
   repo: map.repo,
@@ -1129,7 +1131,7 @@ async function checkedWorkerPass(
  const log = saveWorkerLog(journal.path, map.repo, nodeId, ctx.generation, pass, result);
  // Before ANY git call after the worker: a tampered config or hook would run
  // with whatever the next git call carries.
- assertGitUntouched(ctx.canonical, snapshot);
+ assertGitUntouched(ctx.canonical, snapshot, ctx.map.base);
 
  const fail = (detail: string, substrateCapped?: CapSignal): PassResult => ({
   workerExit: result.code,
