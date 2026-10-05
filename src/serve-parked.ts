@@ -232,6 +232,13 @@ export interface PrView {
   * PR is closed or merged, so its checks are not fetched).
   */
  ci: "none" | "pending" | "failed" | "no-success" | "green" | "unreadable" | "not-read";
+ /**
+  * Where `ci` came from: the check runs (every check, Actions and external
+  * apps alike), or only the Actions workflow runs when the token could not
+  * read checks. Actions-only evidence is shown, never merged on: a failing
+  * external check would not be in it.
+  */
+ ciSource?: "checks" | "actions";
  readAt: string;
 }
 
@@ -255,6 +262,31 @@ export function checkRunsFromPages(raw: unknown): { status: string; conclusion: 
   }
  }
  return runs;
+}
+
+/**
+ * The latest workflow run per workflow and event for `sha`, read off a
+ * slurped `actions/runs?head_sha=` listing: what a read-only token that is
+ * refused check runs can still see (2026-10-05: seelite's fine-grained token
+ * was, and the dashboard read every PR's CI as unreadable). Actions runs
+ * only: an external app's checks are not in it. Null on any malformed page
+ * or a run for another head.
+ */
+export function workflowRunsFromPages(raw: unknown, sha: string): { status: string; conclusion: string | null }[] | null {
+ if (!Array.isArray(raw)) return null;
+ const latest = new Map<string, { id: number; status: string; conclusion: string | null }>();
+ for (const page of raw) {
+  const list = (page as { workflow_runs?: unknown } | null)?.workflow_runs;
+  if (!Array.isArray(list)) return null;
+  for (const r of list as Record<string, unknown>[]) {
+   if (r?.head_sha !== sha) return null;
+   const run = { id: Number(r.id), status: String(r.status ?? ""), conclusion: typeof r.conclusion === "string" ? r.conclusion : null };
+   const key = `${String(r.workflow_id)}:${String(r.event)}`;
+   const seen = latest.get(key);
+   if (seen === undefined || seen.id < run.id) latest.set(key, run);
+  }
+ }
+ return [...latest.values()].map(({ status, conclusion }) => ({ status, conclusion }));
 }
 
 /** Why a PR cannot be merged from the dashboard, or null when it can. */
@@ -509,6 +541,13 @@ export interface ActionDeps {
  configPath: string | undefined;
  /** Read the PR live before a merge; null when it cannot be read. */
  readPr: (repo: string, pr: number) => Promise<PrView | null>;
+ /**
+  * Every check run on `sha`, read under the merge's own environment (the
+  * `gh` account stored under HOME, machine credentials removed): the CI
+  * state, or null when it cannot be read. Used when the dashboard's
+  * read-only token saw only the Actions runs.
+  */
+ verifyChecks?: (repo: string, sha: string, env: Record<string, string>) => Promise<PrView["ci"] | null>;
  exists: (path: string) => boolean;
  /**
   * Nodes with an action running now (`repo#id`), owned by the server. Held
@@ -606,8 +645,18 @@ async function runHeldAction(
   if ((live as PrView).headSha !== body.sha) {
    return refusal(409, "the PR head moved since the page read it: reload and confirm again");
   }
-  argv = mergeArgv({ repo: entry.repo, pr: pr.number, sha: body.sha });
   env = mergeEnv(deps.env);
+  // The dashboard's token saw only the Actions runs: an external app's
+  // failing check would not be in them. Before merging, every check is read
+  // under the same gh account the merge itself runs as.
+  if ((live as PrView).ciSource === "actions") {
+   const full = deps.verifyChecks === undefined ? null : await deps.verifyChecks(entry.repo, body.sha, env);
+   if (full === null) {
+    return refusal(409, "only the Actions runs were readable, and every check could not be read under your login: merge it on GitHub");
+   }
+   if (full !== "green") return refusal(409, `every check, read under your login: CI is ${full}`);
+  }
+  argv = mergeArgv({ repo: entry.repo, pr: pr.number, sha: body.sha });
  } else {
   if (!entry.actions.session.offered) return refusal(409, entry.actions.session.why);
   const cwd = entry.actions.session.cwd;

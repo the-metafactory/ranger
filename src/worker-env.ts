@@ -1,5 +1,6 @@
 import { somaRepo } from "./graph.ts";
 import type { RangerConfig } from "./config.ts";
+import { JOURNAL_PATH_ENV } from "./journal-guard.ts";
 
 /**
  * The environments for code ranger runs but does not trust: the headless
@@ -78,10 +79,14 @@ export function workerHostEnv(
 /** Worker env: repo context + an ALLOW-LISTED host env — and CRUCIALLY NO
  *  write PAT (round-38 security blocker): the worker COMMITS locally but the
  *  SUPERVISOR performs the vetted push, so a malicious node can never have
- *  the worker read/decode a machine credential from its env. */
+ *  the worker read/decode a machine credential from its env.
+ *  `sessionJournal` (node #66) becomes RANGER_JOURNAL_PATH: any ranger code
+ *  the session runs (its own CLI, its tests) opens that per-session temp
+ *  journal, never the live one. */
 export function workerEnv(
  config: RangerConfig,
  repo: string,
+ sessionJournal: string,
 ): NodeJS.ProcessEnv {
  const identity = config.bot.identity;
  return {
@@ -89,6 +94,7 @@ export function workerEnv(
   SOMA_GRAPH_REPO: somaRepo(repo),
   SAGE_STACK: "default",
   PILOT_PRINCIPAL: config.principal.login,
+  [JOURNAL_PATH_ENV]: sessionJournal,
   // The host's global git hooks are the principal's, not the walk's: they
   // can leave build caches in the worktree (a dirty tree the implement lane
   // refuses) and nothing about them is part of ranger's gate. Disabled for

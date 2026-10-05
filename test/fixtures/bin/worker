@@ -13,6 +13,15 @@ if [ -n "${GIT_CONFIG_VALUE_0:-}" ]; then
   exit 3
 fi
 
+# Node #66: the supervisor hands every worker session its own temp journal,
+# never the live one. Fail hard if it is missing.
+case "${RANGER_JOURNAL_PATH:-}" in
+  "" | "$HOME/.config/ranger/"*)
+    echo "worker env has no per-session journal (RANGER_JOURNAL_PATH=${RANGER_JOURNAL_PATH:-unset}) — refusing to run" >&2
+    exit 4
+    ;;
+esac
+
 cd "$(git rev-parse --show-toplevel)"
 git checkout -b research/api-survey
 cat > findings.md <<'EOF'
