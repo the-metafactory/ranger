@@ -67,20 +67,26 @@ export function baseConflictOutcome(r: { pr: number; base: string; passes: numbe
 
 /**
  * The probes a run selected (the seelite selector lists them, indented, after
- * `selected: <n>`) that had not passed when it stopped: no `ok` or `warn`
- * line from the runner. Failed and never-started ones alike. Empty when the
- * output names no selection, so the caller falls back to the full suite.
+ * `selected: <n>`, a semantic pick with ` (p=0.750)` after the name) that
+ * had not passed when it stopped: no `ok` or `warn` line from the runner.
+ * Failed and never-started ones alike. Empty, so the caller falls back to
+ * the full suite, when the output names no selection or a listing shorter
+ * than the count it announced (a run killed while printing it): a narrowed
+ * retry must never certify probes that were not listed.
  */
 export function unfinishedProbes(stdout: string): string[] {
  const lines = stdout.split("\n");
  const at = lines.findIndex((l) => /^selected: \d+$/.test(l));
  if (at < 0) return [];
+ const count = Number(lines[at].slice("selected: ".length));
  const selected: string[] = [];
  for (const line of lines.slice(at + 1)) {
-  const m = /^ {2}([\w.-]+\.m?js)$/.exec(line);
+  const m = /^ {2}([\w.-]+\.m?js)(?: \(p=[\d.]+\))?$/.exec(line);
   if (m === null) break;
-  if (PROBE_FILE.test(m[1])) selected.push(m[1]);
+  if (!PROBE_FILE.test(m[1])) return [];
+  selected.push(m[1]);
  }
+ if (selected.length !== count) return [];
  const passed = new Set<string>();
  for (const line of lines) {
   const m = /^(ok|warn) +([\w.-]+\.m?js) \(/.exec(line);

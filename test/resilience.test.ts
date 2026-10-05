@@ -122,6 +122,13 @@ describe("a failed probe run retries only its failures", () => {
   expect(unfinishedProbes(out)).toEqual(["probe-a.mjs", "probe-c.mjs"]);
   expect(unfinishedProbes("no selection here\n")).toEqual([]);
  });
+ test("a semantic selection's probability suffix is read; a listing short of its count falls back to the full suite", () => {
+  const semantic = "selected: 2\n  probe-a.mjs (p=0.750)\n  probe-b.mjs (p=0.900)\nok   probe-a.mjs (1.0s)\n";
+  expect(unfinishedProbes(semantic)).toEqual(["probe-b.mjs"]);
+  // killed while printing the selection: probe-b was announced but never listed
+  expect(unfinishedProbes("selected: 2\n  probe-a.mjs\n  probe-b.m")).toEqual([]);
+  expect(unfinishedProbes("selected: 3\n  probe-a.mjs\n  probe-b.mjs\n")).toEqual([]);
+ });
  test("failed checks are read per failed probe, without their run-specific detail", () => {
   const out = [
    "ok   probe-music.mjs (3.0s)",
