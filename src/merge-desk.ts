@@ -6,6 +6,7 @@ import type { DiscordFile } from "./discord.ts";
 import { redactViewsReason, viewsCard, viewsCardMessage, viewsDirectory } from "./views.ts";
 import { NEEDS_EYE_LABEL } from "./labels.ts";
 import {
+ baseRedNote,
  gatingFindings,
  realGitHub,
  recordedProbes,
@@ -288,7 +289,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
     `map: ${mapKey(map)}`,
     `Gate passed at \`${gate.headSha.slice(0, 8)}\`: CI green, mergeable, base \`${map.base}\`, sage ${last?.round ?? "?"} round(s), the last with 0 blockers and 0 majors (machine evidence, not a sign-off).`,
     ...(probesRequired
-     ? [`Probes passed at \`${gate.headSha.slice(0, 8)}\` (selection ${probe?.mode ?? "?"}, ${probe?.selected ?? "?"} probe(s)). Only the selected probes ran, not the full suite.`]
+     ? [`Probes passed at \`${gate.headSha.slice(0, 8)}\` (selection ${probe?.mode ?? "?"}, ${probe?.selected ?? "?"} probe(s)). Only the selected probes ran, not the full suite.${baseRedNote(probe)}`]
      : ["No probe tier on this map: CI and the tests are the only automated checks."]),
     needsEye
      ? `Labelled \`${NEEDS_EYE_LABEL}\`: your eye is the check. Merge it by hand (squash); ranger closes the node after the merge.`

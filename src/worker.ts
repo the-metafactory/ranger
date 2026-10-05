@@ -27,6 +27,7 @@ import { FencedError, type Journal } from "./journal.ts";
 import { assembleResearchPrompt } from "./prompt.ts";
 import { IMPLEMENT_KINDS } from "./route.ts";
 import {
+ hookStopReason,
  markSubstrateCapped,
  selectSubstrate,
  workerCommandFor,
@@ -43,6 +44,7 @@ import { isTransientGitHubError } from "./transient.ts";
 import * as githubApi from "./github.ts";
 import type { GitHubPort } from "./github.ts";
 import { ParkSignal } from "./signals.ts";
+import { policyBlockedOutcome } from "./outcomes.ts";
 import { assertResearchFindingsOnly, researchCi, type ResearchCiTiming } from "./research-ci.ts";
 
 export { gitAuthEnv } from "./git-ops.ts";
@@ -102,6 +104,10 @@ export interface RunNodeContext {
  /** For tests: the quota readers (with an injected worker, reviewer or command and none injected, reads fail closed). */
  substrateReaders?: SubstrateReaders;
  viewsDependencies?: ImplementContext["viewsDependencies"];
+ /** Probe-tier host load, quiet-host wait and channel post (tests inject them). */
+ hostLoad?: ImplementContext["hostLoad"];
+ quietHost?: ImplementContext["quietHost"];
+ announce?: ImplementContext["announce"];
 }
 
 /** The canonical checkout dir for a repo (design §4: probes run there). */
@@ -580,6 +586,9 @@ async function runImplementNode(
   github: ctx.github,
   reviewer: ctx.reviewer,
   viewsDependencies: ctx.viewsDependencies,
+  hostLoad: ctx.hostLoad,
+  quietHost: ctx.quietHost,
+  announce: ctx.announce,
   substrateReaders: resolveReaders(ctx),
  };
  const capped = new Set<SubstrateName>();
@@ -756,6 +765,10 @@ async function runResearch(
   });
   journal.updateWorker(nodeId, repo, { workerPgid: null });
   const log = saveWorkerLog(journal.path, repo, nodeId, generation, "research pass", workerResult);
+  const stopped = hookStopReason(workerResult.stdout);
+  if (stopped !== null) {
+   throw new ParkSignal(policyBlockedOutcome({ pass: "research pass", reason: stopped, log }));
+  }
 
   if (workerResult.code !== 0) {
    const detail = `worker exited ${workerResult.code}: ${workerResult.stderr.trim() || workerResult.stdout.trim().slice(0, 500)} (worker log: ${log})`;

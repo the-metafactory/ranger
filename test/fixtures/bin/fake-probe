@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Fake probe tier for tests. Args: <mode> <node> [statefile]
 # Prints the selector's summary lines, then: ok → exit 0; fail → exit 1;
-# flaky → fail on the first run (creating statefile), pass on the next.
+# flaky → fail on the first run (creating statefile), pass on the next;
+# red → probe-hud.mjs fails everywhere (a red base); branch-red → probe-hud.mjs
+# fails only where the worker's src/feature.ts exists (the branch, not its base).
 # Refuses (exit 3) when a ranger credential leaked into its env.
 set -euo pipefail
 if [ -n "${GH_TOKEN:-}" ] || [ -n "${GIT_CONFIG_VALUE_0:-}" ] || [ -n "${RANGER_WRITE_TEST:-}" ]; then
@@ -15,6 +17,10 @@ echo "selected: 2"
 case "$mode" in
   ok) echo "node $node: 2 probes passed"; exit 0 ;;
   fail) echo "probe-hud failed" >&2; exit 1 ;;
+  red) echo "FAILED: probe-hud.mjs"; exit 1 ;;
+  branch-red)
+    if [ -f src/feature.ts ]; then echo "FAILED: probe-hud.mjs"; exit 1; fi
+    echo "node $node: probe-hud.mjs passed"; exit 0 ;;
   flaky)
     if [ -f "$state" ]; then echo "passed on retry"; exit 0; fi
     touch "$state"; echo "flaked" >&2; exit 1 ;;

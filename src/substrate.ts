@@ -312,6 +312,31 @@ export function extractClaudeResultText(lines: string[], fallback: string): stri
  return fallback;
 }
 
+/** Claude Code's whole result text when a prompt hook stops the session (`continue: false`). */
+const HOOK_STOP = /^Operation stopped by hook: ([^\n]+)$/;
+
+/**
+ * The reason a hook gave for stopping a worker session before its first turn,
+ * or null. `claude -p` exits 0 on such a stop, so the exit code cannot tell it
+ * from a session that worked and committed nothing (2026-10-04: soma's prompt
+ * guard stopped three fix passes on sage findings quoting "bypass the guard").
+ * On a Claude stream the result event must also report zero turns; a session
+ * that ran and was denied a tool call later is not a stop. Plain output has no
+ * turn count, so only the bare stop line counts.
+ */
+export function hookStopReason(result: string, lines?: string[]): string | null {
+ if (lines === undefined) return HOOK_STOP.exec(result.trim())?.[1].trim() ?? null;
+ for (let i = lines.length - 1; i >= 0; i--) {
+  const line = lines[i].trim();
+  if (!line.startsWith("{")) continue;
+  const obj = tryParseJson(line) as { type?: string; result?: unknown; num_turns?: unknown } | undefined;
+  if (obj?.type !== "result") continue;
+  if (obj.num_turns !== 0 || typeof obj.result !== "string") return null;
+  return HOOK_STOP.exec(obj.result.trim())?.[1].trim() ?? null;
+ }
+ return null;
+}
+
 /** Cache the last rate_limit_event of a Claude run as the current reading. */
 export function cacheClaudeRateLimitEvents(lines: string[], journal: Journal, now = new Date()): void {
  let latest: ClaudeRateLimitEvent | null = null;

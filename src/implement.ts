@@ -1,6 +1,8 @@
-import { rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { availableParallelism, loadavg, tmpdir } from "node:os";
 import { join } from "node:path";
+import { DiscordAnnouncer } from "./announce.ts";
+import { mapKey } from "./maps.ts";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import { runCmd, type RunOptions, type RunResult } from "./exec.ts";
 import {
@@ -21,6 +23,7 @@ import { ParkSignal } from "./signals.ts";
 import {
  PROBE_FILE,
  parseFailedProbes,
+ policyBlockedOutcome,
  probesFailedOutcome,
  reviewCapHeadMovedOutcome,
  reviewCapOutcome,
@@ -32,6 +35,7 @@ import { assembleImplementPrompt } from "./prompt.ts";
 import { ReviewError, sageReview, type ReviewVerdict } from "./review.ts";
 import {
  confirmCap,
+ hookStopReason,
  selectSubstrate,
  workerOutputFor,
  type CapSignal,
@@ -107,6 +111,12 @@ export interface ImplementContext {
  excludedSubstrates?: ReadonlySet<SubstrateName>;
  /** Capture shell/server injection; tests launch no browser. */
  viewsDependencies?: ViewsDependencies;
+ /** The host load the probe tier waits on (tests inject a quiet or busy host). */
+ hostLoad?: HostLoad;
+ /** How often and how long the probe tier waits for a quiet host. */
+ quietHost?: { pollMs: number; maxMs: number };
+ /** Posts to the map's channel (the base-red notice); tests capture it. */
+ announce?: (text: string) => Promise<unknown>;
 }
 
 export interface ImplementOutcome {
@@ -183,13 +193,20 @@ export interface RecordedProbe {
  /** Probes the selector chose ("?" when the output did not say). */
  selected: string;
  mode: string;
+ /**
+  * Probes that failed twice at this head and fail at its merge base too:
+  * the base is red on them, so they do not gate this branch. Undefined when
+  * every probe passed.
+  */
+ baseRed?: string[];
 }
 
 const PROBE_MARKER =
- /<!-- ranger:probes sha=([0-9a-f]{7,64}) result=(pass|fail) selected=(\d+|\?) mode=([\w-]+) -->/;
+ /<!-- ranger:probes sha=([0-9a-f]{7,64}) result=(pass|fail) selected=(\d+|\?) mode=([\w-]+)(?: base-red=([\w.,-]+))? -->/;
 
 export function probeMarker(p: RecordedProbe): string {
- return `<!-- ranger:probes sha=${p.sha} result=${p.passed ? "pass" : "fail"} selected=${p.selected} mode=${p.mode} -->`;
+ const baseRed = p.baseRed !== undefined && p.baseRed.length > 0 ? ` base-red=${p.baseRed.join(",")}` : "";
+ return `<!-- ranger:probes sha=${p.sha} result=${p.passed ? "pass" : "fail"} selected=${p.selected} mode=${p.mode}${baseRed} -->`;
 }
 
 /** Probe runs recorded on the PR by the MACHINE ACCOUNT (anyone else's markers are ignored). */
@@ -202,7 +219,14 @@ export function recordedProbes(
   if (c.author !== botIdentity) continue;
   const m = c.body.match(PROBE_MARKER);
   if (m === null) continue;
-  out.push({ sha: m[1], passed: m[2] === "pass", selected: m[3], mode: m[4] });
+  const baseRed = m[5]?.split(",").filter((n) => PROBE_FILE.test(n));
+  out.push({
+   sha: m[1],
+   passed: m[2] === "pass",
+   selected: m[3],
+   mode: m[4],
+   ...(baseRed !== undefined && baseRed.length > 0 ? { baseRed } : {}),
+  });
  }
  return out;
 }
@@ -258,6 +282,7 @@ async function probeFinalHead(
  }
  const command = probeCommandFor(map.commands.probe as string, nodeId);
  const timeoutMs = map.commands.probeTimeoutMin * 60_000;
+ await awaitQuietHost(ctx, "probe run 1");
  let result = await runShell(command, worktree, ctx, timeoutMs);
  let attempts = 1;
  let ranCommand = command;
@@ -273,20 +298,38 @@ async function probeFinalHead(
   }
   const what = ranCommand === command ? "the full suite" : `only ${failed.join(", ")}`;
   journal.recordEvent("reviewed", { nodeId, repo, detail: `probe run 1 failed (exit ${result.code}) — retrying ${what}` });
+  await awaitQuietHost(ctx, "the probe retry");
   result = await runShell(ranCommand, worktree, ctx, timeoutMs);
   attempts = 2;
  }
+ const failed = result.code > 0 ? parseFailedProbes(result.stdout) : [];
+ // A failure the merge base shares is the base's, not this branch's
+ // (2026-10-05: main went red on one probe and parked every later node).
+ const base = result.code === 0 ? null : await probeMergeBase(ctx, failed);
+ if (base !== null) {
+  journal.recordEvent("reviewed", {
+   nodeId,
+   repo,
+   detail:
+    base.red.length === 0
+     ? `${failed.join(", ")} pass at the merge base ${base.sha.slice(0, 8)} — the failure is this branch's`
+     : `${base.red.join(", ")} fail at the merge base ${base.sha.slice(0, 8)} too`,
+  });
+ }
+ const baseRed = base !== null && base.red.length === failed.length ? base.red : undefined;
+ if (baseRed !== undefined) await announceBaseRed(ctx, (base as BaseProbeResult).sha, baseRed);
  const record: RecordedProbe = {
   sha: live.headSha,
-  passed: result.code === 0,
+  passed: result.code === 0 || baseRed !== undefined,
   ...summary,
+  ...(baseRed === undefined ? {} : { baseRed }),
  };
  ctx.journal.assertGeneration(nodeId, ctx.map.repo, ctx.generation, "post the probe record");
  await github.postComment(repo, prNumber, probeComment(ranCommand, record, attempts, result), token);
  journal.recordEvent("reviewed", {
   nodeId,
   repo,
-  detail: `probes ${record.passed ? "passed" : "FAILED"} at ${record.sha.slice(0, 8)} (${record.mode}, ${record.selected} selected, ${attempts} run(s))`,
+  detail: `probes ${record.passed ? "passed" : "FAILED"} at ${record.sha.slice(0, 8)} (${record.mode}, ${record.selected} selected, ${attempts} run(s))${baseRed === undefined ? "" : `; red on the merge base too, not gating: ${baseRed.join(", ")}`}`,
  });
  if (!record.passed) {
   throw new ParkSignal(
@@ -294,12 +337,121 @@ async function probeFinalHead(
     sha: record.sha,
     pr: prNumber,
     exit: result.code,
-    failed: result.code > 0 ? parseFailedProbes(result.stdout) : [],
+    failed,
+    redOnBase: base?.red ?? [],
     tail: tail(result),
    }),
   );
  }
  return record;
+}
+
+/** The host's 1-minute load and core count: the probe tier waits for a quiet host. */
+export type HostLoad = () => { load: number; cores: number };
+
+const realHostLoad: HostLoad = () => ({ load: loadavg()[0], cores: availableParallelism() });
+
+/** How long a probe run waits for the host to quiet down before running anyway. */
+const QUIET_HOST = { pollMs: 30_000, maxMs: 20 * 60_000 };
+
+/**
+ * Wait until the 1-minute load is below the core count before a probe run.
+ * The browser probes are timing-sensitive, and the headless lane's worker and
+ * test runs load the same host (2026-10-04: probe-gamepad failed at peak load
+ * 28.6 on 10 cores during node 58's fix pass, and the immediate retry ran
+ * under the same load; one quiet run passed the same head). After `maxMs`
+ * the run goes ahead anyway: a busy host delays the probe tier, never stops it.
+ */
+async function awaitQuietHost(ctx: ImplementContext, run: string): Promise<void> {
+ const read = ctx.hostLoad ?? realHostLoad;
+ const { pollMs, maxMs } = ctx.quietHost ?? QUIET_HOST;
+ let host = read();
+ if (host.load < host.cores) return;
+ const nodeId = ctx.node.ref.id;
+ const repo = ctx.map.repo;
+ const started = Date.now();
+ ctx.journal.recordEvent("reviewed", {
+  nodeId,
+  repo,
+  detail: `${run} waits for the host: load ${host.load.toFixed(1)} on ${host.cores} cores`,
+ });
+ while (host.load >= host.cores && Date.now() - started < maxMs) {
+  await new Promise((r) => setTimeout(r, pollMs));
+  host = read();
+ }
+ const waited = Math.round((Date.now() - started) / 1000);
+ ctx.journal.recordEvent("reviewed", {
+  nodeId,
+  repo,
+  detail:
+   host.load < host.cores
+    ? `${run} starts after ${waited}s: load ${host.load.toFixed(1)} on ${host.cores} cores`
+    : `${run} starts on a busy host after ${waited}s: load ${host.load.toFixed(1)} on ${host.cores} cores`,
+ });
+}
+
+interface BaseProbeResult {
+ /** The merge base the probes ran at. */
+ sha: string;
+ /** Which of the probes asked about failed there too. */
+ red: string[];
+}
+
+/**
+ * Run the probes that failed at the head once more at the branch's merge base
+ * with the map base, in a throwaway detached worktree. Null when the answer is
+ * unknown: no retry template to name exact probes, no named failures, or a
+ * base run that could not be set up, timed out, or named nothing.
+ */
+async function probeMergeBase(ctx: ImplementContext, failed: string[]): Promise<BaseProbeResult | null> {
+ const { map, worktree } = ctx;
+ const template = map.commands.probeRetry;
+ if (template === undefined || failed.length === 0) return null;
+ const command = probeRetryCommandFor(template, ctx.node.ref.id, failed);
+ const merged = await safeGit(["merge-base", "HEAD", `origin/${map.base}`], { cwd: worktree, timeoutMs: 30_000 });
+ const sha = merged.stdout.trim();
+ if (merged.code !== 0 || !/^[0-9a-f]{40}$/.test(sha)) return null;
+ const scratch = mkdtempSync(join(tmpdir(), "ranger-probe-base-"));
+ const dir = join(scratch, "worktree");
+ try {
+  const add = await safeGit(["worktree", "add", "--detach", dir, sha], { cwd: worktree, timeoutMs: 120_000 });
+  if (add.code !== 0) return null;
+  if (map.commands.install !== undefined) {
+   const install = await runShell(map.commands.install, dir, ctx, INSTALL_TIMEOUT_MS);
+   if (install.code !== 0) return null;
+  }
+  await awaitQuietHost(ctx, "the merge-base probe run");
+  const run = await runShell(command, dir, ctx, map.commands.probeTimeoutMin * 60_000);
+  if (run.code === 0) return { sha, red: [] };
+  const named = run.code > 0 ? parseFailedProbes(run.stdout) : [];
+  if (named.length === 0) return null;
+  return { sha, red: failed.filter((n) => named.includes(n)) };
+ } finally {
+  await safeGit(["worktree", "remove", "--force", dir], { cwd: worktree, timeoutMs: 60_000 });
+  rmSync(scratch, { recursive: true, force: true });
+  await safeGit(["worktree", "prune"], { cwd: worktree, timeoutMs: 30_000 });
+ }
+}
+
+/**
+ * Tell the map's channel once per merge base and probe set that the base is
+ * red: every later branch off it would otherwise fail the same probes. Best
+ * effort; the probe record on the PR is the durable trace.
+ */
+async function announceBaseRed(ctx: ImplementContext, sha: string, red: string[]): Promise<void> {
+ const key = `base-red.${ctx.map.repo}.${sha}.${[...red].sort().join(",")}`;
+ if (ctx.journal.getHealth(key) !== null) return;
+ const text = [
+  `:ranger: **${ctx.map.base} is red** at \`${sha.slice(0, 8)}\` on ${red.join(", ")}`,
+  `map: ${mapKey(ctx.map)}`,
+  `Node #${ctx.node.ref.id} failed these probes twice, and they fail at its merge base too. Branches off this base do not gate on them; ${ctx.map.base} needs a fix.`,
+ ].join("\n");
+ try {
+  await (ctx.announce ?? ((t: string) => DiscordAnnouncer.fromMap(ctx.map).post(t, "base-red notice")))(text);
+  ctx.journal.setHealth(key, new Date().toISOString());
+ } catch {
+  /* best effort: the next node off this base tries again */
+ }
 }
 
 function probeComment(
@@ -312,7 +464,7 @@ function probeComment(
  const clipped = out.length > 20_000 ? `…${out.slice(-20_000)}` : out;
  return [
   probeMarker(p),
-  `**Probes — ${p.passed ? "passed" : "failed"}** at \`${p.sha.slice(0, 8)}\` (selection ${p.mode}, ${p.selected} probe(s); ${attempts} run(s))`,
+  `**Probes — ${p.passed ? "passed" : "failed"}** at \`${p.sha.slice(0, 8)}\` (selection ${p.mode}, ${p.selected} probe(s); ${attempts} run(s))${baseRedNote(p)}`,
   "",
   `\`${command}\``,
   "",
@@ -731,14 +883,8 @@ async function checkedWorkerPass(
  // quota readings are cached, and its signal lines feed the cap check.
  const { result, lines } = output.read(raw, journal);
 
- const log = saveWorkerLog(
-  journal.path,
-  map.repo,
-  nodeId,
-  ctx.generation,
-  review === undefined ? "build pass" : `fix pass ${review.round}`,
-  result,
- );
+ const pass = review === undefined ? "build pass" : `fix pass ${review.round}`;
+ const log = saveWorkerLog(journal.path, map.repo, nodeId, ctx.generation, pass, result);
  // Before ANY git call after the worker: a tampered config or hook would run
  // with whatever the next git call carries.
  assertGitUntouched(ctx.canonical, snapshot);
@@ -754,6 +900,8 @@ async function checkedWorkerPass(
    ...(substrateCapped === undefined ? {} : { substrateCapped }),
   },
  });
+ const stopped = hookStopReason(result.stdout, lines);
+ if (stopped !== null) throw new ParkSignal(policyBlockedOutcome({ pass, reason: stopped, log }));
  if (result.code !== 0) {
   // Mid-session cap (node #45): only the substrate's own signal says so, and
   // only a failed run can be one. A capped failure does not count.
@@ -976,7 +1124,13 @@ function probeLine(ctx: ImplementContext, probe: RecordedProbe | undefined): str
  if (ctx.map.commands.probe === undefined) return [];
  return probe === undefined
   ? ["- Probes: not recorded at this head."]
-  : [`- Probes: passed at \`${probe.sha.slice(0, 8)}\` (selection ${probe.mode}, ${probe.selected} probe(s)). Only the selected probes ran, not the full suite.`];
+  : [`- Probes: passed at \`${probe.sha.slice(0, 8)}\` (selection ${probe.mode}, ${probe.selected} probe(s)). Only the selected probes ran, not the full suite.${baseRedNote(probe)}`];
+}
+
+/** The probes a passing record excuses because the merge base fails them too. */
+export function baseRedNote(probe: Pick<RecordedProbe, "baseRed"> | undefined): string {
+ const red = probe?.baseRed ?? [];
+ return red.length === 0 ? "" : ` Not gating: ${red.join(", ")} failed here and fail at the merge base too.`;
 }
 
 function readyBody(

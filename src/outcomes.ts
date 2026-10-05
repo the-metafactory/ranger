@@ -50,17 +50,34 @@ export function probesFailedOutcome(r: {
  pr: number;
  exit: number;
  failed: string[];
+ /** The failed probes that fail at the merge base too (the rest are this branch's). */
+ redOnBase?: string[];
  tail: string;
 }): string {
  const names = r.failed.filter((n) => PROBE_FILE.test(n));
+ const onBase = (r.redOnBase ?? []).filter((n) => PROBE_FILE.test(n));
  return [
   `browser probes failed twice at ${r.sha.slice(0, 8)} on PR #${r.pr} (exit ${r.exit})`,
   ...(names.length > 0 ? [`FAILED: ${names.join(" · ")}`] : []),
+  ...(onBase.length > 0 ? [`red on the merge base too: ${onBase.join(" · ")}`] : []),
   r.tail,
  ].join("\n");
 }
 
 export const PROBES_FAILED_OUTCOME = /^browser probes failed twice\b/;
+
+/**
+ * A hook (soma's runtime-policy guard, in practice) stopped a worker session
+ * before its first turn. The prompt is rebuilt from the same node and review
+ * text on a resume, so a resume stops again: the rule or the text must change
+ * first. A park, not a failure: it is no evidence against the node or the
+ * worker, so it does not count toward the dead-man.
+ */
+export function policyBlockedOutcome(r: { pass: string; reason: string; log: string }): string {
+ return `policy-blocked: a hook stopped the ${r.pass} before its first turn (${r.reason}) — a resume re-sends the same prompt and stops again; change the rule or the text it matched first (worker log: ${r.log})`;
+}
+
+export const POLICY_BLOCKED_OUTCOME = /^policy-blocked: /;
 
 /** A session or review that stopped on its substrate's limit (node #45). */
 export const SUBSTRATE_CAPPED_OUTCOME = /\bhit its rate limit\b/;

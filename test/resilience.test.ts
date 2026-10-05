@@ -1,8 +1,15 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { caffeinateArgs, holdAwake } from "../src/awake.ts";
+import { fastForwardCanonical } from "../src/git-ops.ts";
 import { isReadRequest } from "../src/github.ts";
-import { parseFailedProbes, probeRetryCommandFor } from "../src/implement.ts";
+import { parseFailedProbes, probeMarker, probeRetryCommandFor, recordedProbes } from "../src/implement.ts";
+import { probesFailedOutcome } from "../src/outcomes.ts";
 import { isTransientGitHubError, runReadRetryingTransient } from "../src/transient.ts";
+import { runCmd } from "../src/exec.ts";
+import { createCanonicalRepo, GIT_ENV } from "./support.ts";
 
 /** The two errors that ended #45 and #663 on 2026-10-03, verbatim in shape. */
 const GRAPHQL_TIMEOUT =
@@ -89,6 +96,63 @@ describe("a failed probe run retries only its failures", () => {
   expect(probeRetryCommandFor("PROBE_SELECTION=1 PROBE_FILES={failed} npm run probe # {node}", "433", ["probe-a.mjs", "probe-b.mjs"]))
    .toBe("PROBE_SELECTION=1 PROBE_FILES=probe-a.mjs,probe-b.mjs npm run probe # 433");
   expect(() => probeRetryCommandFor("x {failed}", "1", ["a;b.mjs"])).toThrow();
+ });
+ test("a base-red record round-trips through its marker; an old marker still reads", () => {
+  const marker = probeMarker({ sha: "a".repeat(40), passed: true, selected: "87", mode: "all", baseRed: ["probe-traffic-engagement.mjs"] });
+  expect(marker).toContain("result=pass selected=87 mode=all base-red=probe-traffic-engagement.mjs -->");
+  const old = `<!-- ranger:probes sha=${"b".repeat(40)} result=fail selected=86 mode=all -->`;
+  const read = recordedProbes([{ author: "bot", body: marker }, { author: "bot", body: old }, { author: "eve", body: marker }] as never, "bot");
+  expect(read).toEqual([
+   { sha: "a".repeat(40), passed: true, selected: "87", mode: "all", baseRed: ["probe-traffic-engagement.mjs"] },
+   { sha: "b".repeat(40), passed: false, selected: "86", mode: "all" },
+  ]);
+ });
+ test("a park names the failures the merge base shares on its own line, after FAILED", () => {
+  const outcome = probesFailedOutcome({ sha: "545ce725ff", pr: 695, exit: 1, failed: ["probe-commander.mjs", "probe-traffic-engagement.mjs"], redOnBase: ["probe-traffic-engagement.mjs"], tail: "…" });
+  expect(outcome.split("\n").slice(0, 3)).toEqual([
+   "browser probes failed twice at 545ce725 on PR #695 (exit 1)",
+   "FAILED: probe-commander.mjs · probe-traffic-engagement.mjs",
+   "red on the merge base too: probe-traffic-engagement.mjs",
+  ]);
+  expect(parseFailedProbes(outcome)).toEqual(["probe-commander.mjs", "probe-traffic-engagement.mjs"]);
+ });
+});
+
+describe("two closes fast-forward the shared canonical checkout at once (#686/#687, 2026-10-04)", () => {
+ /** A merge lands on origin, so the next fetch must move refs/remotes/origin/main. */
+ async function mergeOnOrigin(dir: string): Promise<void> {
+  const git = (args: string[]) => runCmd("git", args, { cwd: join(dir, "seed"), env: { ...process.env, ...GIT_ENV } });
+  writeFileSync(join(dir, "seed", "merged.md"), "merged\n");
+  await git(["add", "-A"]);
+  await git(["commit", "-m", "merged"]);
+  expect((await git(["push", join(dir, "origin.git"), "main"])).code).toBe(0);
+ }
+
+ test("a held ref lock is waited out, then the fast-forward lands", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ranger-ff-"));
+  try {
+   const { canonical } = await createCanonicalRepo(dir);
+   await mergeOnOrigin(dir);
+   const lock = join(canonical, ".git", "refs", "remotes", "origin", "main.lock");
+   writeFileSync(lock, "");
+   setTimeout(() => rmSync(lock, { force: true }), 150);
+   await fastForwardCanonical(canonical, "main", "x", { attempts: 4, backoffMs: 100 });
+   const log = await runCmd("git", ["log", "-1", "--format=%s", "main"], { cwd: canonical });
+   expect(log.stdout.trim()).toBe("merged");
+  } finally {
+   rmSync(dir, { recursive: true, force: true });
+  }
+ });
+ test("a lock that never clears still fails, after the attempts", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ranger-ff-"));
+  try {
+   const { canonical } = await createCanonicalRepo(dir);
+   await mergeOnOrigin(dir);
+   writeFileSync(join(canonical, ".git", "refs", "remotes", "origin", "main.lock"), "");
+   await expect(fastForwardCanonical(canonical, "main", "x", { attempts: 2, backoffMs: 10 })).rejects.toThrow(/cannot lock ref|\.lock/);
+  } finally {
+   rmSync(dir, { recursive: true, force: true });
+  }
  });
 });
 
