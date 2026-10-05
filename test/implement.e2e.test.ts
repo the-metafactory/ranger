@@ -990,23 +990,28 @@ describe("implement lane (node #23)", () => {
   rmSync(flag, { force: true });
  }, 60_000);
 
- test("an adopted head is credited to the substrate that built it, not the one that resumed", async () => {
+ test("an adopted head is credited to the substrate that wrote it, not to a later session that committed nothing", async () => {
   const flag = join(tmpdir(), `ranger-adopt-author-${Date.now()}`);
   const r = await rig({ test: `test -f ${flag}` });
   cleanup.push(r.dir);
   delete r.ctx.workerCommand;
+  let mode = "build";
   let sessions = 0;
   r.ctx.worker = async (prompt, opts) => {
    sessions += 1;
-   return runCmd(implementWorker, ["build", prompt], opts);
+   return runCmd(implementWorker, [mode, prompt], opts);
   };
   r.ctx.substrate = "claude";
   expect((await runNode("20", r.ctx)).status).toBe("failed"); // Claude built it; the tests fail
-  writeFileSync(flag, "");
   r.ctx.substrate = "codex";
+  mode = "noop";
+  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  expect((await runNode("20", r.ctx)).status).toBe("failed"); // still failing: Codex's session commits nothing
+  writeFileSync(flag, "");
+  r.ctx.substrate = "pi";
   r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
-  expect(sessions).toBe(1); // adopted: Codex ran no session
+  expect(sessions).toBe(2); // the third run adopted: no session
   const head = await r.github.sha("node/20-add-the-feature-module");
   expect(r.journal.headSubstrate("acme/widgets", head)).toBe("claude");
   rmSync(flag, { force: true });
@@ -1022,6 +1027,22 @@ describe("implement lane (node #23)", () => {
   const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
   expect(events.some((d) => d.includes("on the work a previous run committed") && d.endsWith("— the worker continues"))).toBe(true);
   expect(events.some((d) => d.startsWith("adopting "))).toBe(false);
+ }, 60_000);
+
+ test("a retry whose install rewrites tracked source certifies nothing: the repair is not in the pushed commit", async () => {
+  const r = await rig({
+   // Only the retry checkout gets "repaired"; the tests pass only on the repair.
+   install: "case \"$PWD\" in *ranger-test-retry-*) echo repaired >> README.md ;; esac",
+   test: "grep -q repaired README.md",
+  });
+  cleanup.push(r.dir);
+  r.ctx.hostLoad = () => ({ load: 14, cores: 10 });
+  r.ctx.quietHost = { pollMs: 1, maxMs: 5 };
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("failed");
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.includes("passed on the retry"))).toBe(false);
+  expect(r.github.prs.size).toBe(0);
  }, 60_000);
 
  test("a busy host delays the probe run until the load drops", async () => {

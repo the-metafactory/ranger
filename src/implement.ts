@@ -626,10 +626,10 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
    configSnapshot: built.snapshot,
   });
   journal.recordEvent("pushed", { nodeId, repo, detail: `${branch} @ ${built.sha.slice(0, 8)}` });
-  // Review selection reads who wrote a head: an adopted build is the earlier
-  // session's work, never this run's substrate's.
-  if (built.adoptedFrom === undefined) recordHead(ctx, built.sha);
-  else if (built.adoptedFrom !== null) recordHead(ctx, built.sha, built.adoptedFrom);
+  // Review selection reads who wrote a head. Every session records its own
+  // commit as it makes it (checkedWorkerPass); an adopted build keeps that
+  // record and is never credited to this run's substrate.
+  if (built.adopted !== true) recordHead(ctx, built.sha);
 
   const title = prTitle(node);
   fence("open PR");
@@ -987,11 +987,8 @@ interface PassResult {
  snapshot: string;
  sha: string;
  failure?: ImplementOutcome;
- /**
-  * Set when the commits were adopted, not written by this run's worker: the
-  * substrate whose build session wrote them (null when no session says).
-  */
- adoptedFrom?: SubstrateName | null;
+ /** The commits were adopted from an earlier run, not written by this run's worker. */
+ adopted?: boolean;
 }
 
 /**
@@ -1015,13 +1012,13 @@ async function selectReviewSubstrate(
 }
 
 /** Which substrate wrote a pushed SHA: the review of that head reads it back. */
-function recordHead(ctx: ImplementContext, sha: string, substrate = ctx.substrate): void {
- if (substrate === undefined) return;
+function recordHead(ctx: ImplementContext, sha: string): void {
+ if (ctx.substrate === undefined) return;
  ctx.journal.recordHeadSubstrate({
   sha,
   repo: ctx.map.repo,
   nodeId: ctx.node.ref.id,
-  substrate,
+  substrate: ctx.substrate,
  });
 }
 
@@ -1180,6 +1177,9 @@ async function checkedWorkerPass(
  if (sha === before || (await commitsAhead(worktree, map.base)) === 0) {
   return fail(nothingCommitted(spec));
  }
+ // This session wrote `sha`: record it now, so a later run that adopts the
+ // commit unpushed still credits the substrate that actually wrote it.
+ recordHead(ctx, sha);
  // The supervisor tests the working tree but pushes commits: a dirty tree
  // would let a green test run cover code that never lands.
  const dirty = await dirtyFiles(worktree);
@@ -1425,7 +1425,27 @@ async function testsInFreshCheckout(ctx: ImplementContext, testCommand: string, 
    const install = await runShell(ctx.map.commands.install, dir, ctx, INSTALL_TIMEOUT_MS);
    if (install.code !== 0) return { ...install, stderr: `install for the retry failed\n${install.stderr}` };
   }
-  return await runShell(testCommand, dir, ctx, TEST_TIMEOUT_MS);
+  const tests = await runShell(testCommand, dir, ctx, TEST_TIMEOUT_MS);
+  // The pass certifies `sha` only if install and the tests left its tracked
+  // content as committed: no new HEAD, no modified tracked file, no index
+  // flag hiding one (--skip-worktree, --assume-unchanged).
+  const now = await safeGit(["rev-parse", "HEAD"], { cwd: dir, timeoutMs: 10_000 });
+  const tracked = await safeGit(["status", "--porcelain", "--untracked-files=no"], { cwd: dir, timeoutMs: 60_000 });
+  const flags = await safeGit(["ls-files", "-v"], { cwd: dir, timeoutMs: 60_000 });
+  const changed =
+   now.stdout.trim() !== sha ||
+   tracked.code !== 0 ||
+   tracked.stdout.trim() !== "" ||
+   flags.code !== 0 ||
+   flags.stdout.split("\n").some((l) => l.length > 0 && !l.startsWith("H "));
+  if (changed) {
+   return {
+    ...tests,
+    code: tests.code === 0 ? 1 : tests.code,
+    stderr: `install or the tests changed ${sha.slice(0, 8)}'s tracked content or HEAD in the retry checkout — the retry certifies nothing that gets pushed\n${tests.stderr}`,
+   };
+  }
+  return tests;
  } finally {
   await safeGit(["worktree", "remove", "--force", dir], { cwd: ctx.worktree, timeoutMs: 60_000 });
   rmSync(scratch, { recursive: true, force: true });
@@ -1468,12 +1488,7 @@ async function adoptBuiltWork(ctx: ImplementContext, testCommand: string): Promi
   repo: map.repo,
   detail: `adopting ${sha.slice(0, 8)}: a previous run built and committed it, and it passes the supervisor's tests — no new worker session`,
  });
- // The substrate of the last build session for this node wrote these
- // commits (sessions are kept within retention; none means unknown).
- const builtBy = (journal.listSubstrateSessions(new Date(0)) ?? [])
-  .filter((s) => s.repo === map.repo && s.nodeId === node.ref.id && s.kind === "worker")
-  .at(-1);
- return { workerExit: null, snapshot, sha, adoptedFrom: builtBy?.substrate ?? null };
+ return { workerExit: null, snapshot, sha, adopted: true };
 }
 
 function tail(result: RunResult): string {
