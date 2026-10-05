@@ -289,6 +289,22 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
  const implementClaimed = new Set<ImplementLane>();
 
  const order = implementMapOrder(config.maps, lastImplementMaps(journal), implementLane);
+ // One sweep wiring for both phases; only the phase differs.
+ const sweepPhase = (
+  w: { map: RangerMapConfig; token: string; botIdentity: string },
+  phase: "liveness" | "desk",
+ ): Promise<SweepMapResult> =>
+  sweepMap({
+   config,
+   journal,
+   map: w.map,
+   token: w.token,
+   botIdentity: w.botIdentity,
+   github: ctx.github,
+   phase,
+   respawn: (nodeId, repo, root) =>
+    (ctx.spawnRunNode ?? spawnRunNodeDetached)({ nodeId, repo, root, cliEntry, configPath: ctx.configPath }),
+  });
  const maps: WalkMapResult[] = [];
  const walked: { map: (typeof order)[number]; mapResult: WalkMapResult; token: string; botIdentity: string; errors: string[] }[] = [];
 
@@ -347,23 +363,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
   const errors: string[] = [];
   // Sweep always runs for a walked map (even paused — liveness/audit surface).
   try {
-   mapResult.sweep = await sweepMap({
-    config,
-    journal,
-    map,
-    token,
-    botIdentity,
-    github: ctx.github,
-    phase: "liveness",
-    respawn: (nodeId, repo, root) =>
-     (ctx.spawnRunNode ?? spawnRunNodeDetached)({
-      nodeId,
-      repo,
-      root,
-      cliEntry,
-      configPath: ctx.configPath,
-     }),
-   });
+   mapResult.sweep = await sweepPhase({ map, token, botIdentity }, "liveness");
   } catch (error) {
    errors.push(
     `sweep failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -377,18 +377,11 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
  // Pass 1b — the merge desks, against lanes every liveness sweep has settled.
  for (const { map, mapResult, token, botIdentity, errors } of walked) {
   try {
-   const desk = await sweepMap({
-    config,
-    journal,
-    map,
-    token,
-    botIdentity,
-    github: ctx.github,
-    phase: "desk",
-    respawn: (nodeId, repo, root) =>
-     (ctx.spawnRunNode ?? spawnRunNodeDetached)({ nodeId, repo, root, cliEntry, configPath: ctx.configPath }),
-   });
-   if (mapResult.sweep !== undefined && desk.mergeDesk !== undefined) mapResult.sweep.mergeDesk = desk.mergeDesk;
+   const desk = await sweepPhase({ map, token, botIdentity }, "desk");
+   // A failed liveness sweep left no result: the desk's own stands in, so
+   // what the desk did (and its row errors) still reaches the report.
+   if (mapResult.sweep === undefined) mapResult.sweep = desk;
+   else if (desk.mergeDesk !== undefined) mapResult.sweep.mergeDesk = desk.mergeDesk;
   } catch (error) {
    errors.push(`merge desk failed: ${error instanceof Error ? error.message : String(error)}`);
   }

@@ -462,6 +462,33 @@ describe("node #47 — map identity", () => {
   }
  });
 
+ test("a liveness sweep that throws still reports what the merge desk did", async () => {
+  const r = rig();
+  const saved = { ...process.env };
+  try {
+   Object.assign(process.env, r.env);
+   r.journal.upsertWorker({ root: 460, nodeId: "40", repo: REPO, status: "awaiting-merge", lane: "implement" });
+   r.journal.updateWorker("40", REPO, { phase: "awaiting-merge", prNumber: 7 });
+   // A crashed worker whose respawn throws: the liveness sweep fails, and the row keeps the lane.
+   r.journal.upsertWorker({ root: 460, nodeId: "45", repo: REPO, status: "running", lane: "implement" });
+   r.journal.updateWorker("45", REPO, { pid: 999_999, attempts: 0, phase: "implement" });
+   const result = await walk({
+    config: r.config, configPath: r.configPath, journal: r.journal, github: conflictingPrForge(),
+    spawnRunNode: async ({ nodeId }) => {
+     if (nodeId === "45") throw new Error("spawn exploded");
+     return process.pid;
+    },
+   });
+   const map460 = result.maps.find((m) => m.repo === REPO && m.errors.some((e) => e.includes("spawn exploded")));
+   expect(map460).toBeDefined();
+   expect(map460?.sweep?.mergeDesk?.pending).toEqual(["40"]); // the desk ran, waited on the held lane, and says so
+  } finally {
+   for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
+   Object.assign(process.env, saved);
+   r.close();
+  }
+ });
+
  test("starts in another resource lane do not starve sibling map rotation", async () => {
   const r = rig();
   try {
