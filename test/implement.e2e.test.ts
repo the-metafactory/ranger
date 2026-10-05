@@ -610,6 +610,28 @@ describe("implement lane (node #23)", () => {
    expect(await fetchedMain(r)).not.toBe(fetched);
   }, 60_000);
 
+  test("a failed test run that sets http.sslVerify parks the adoption of its committed work before any credentialed git call", async () => {
+   const r = await rig({});
+   cleanup.push(r.dir);
+   r.ctx.map.commands.test = TAMPER;
+   expect((await runNode("20", r.ctx)).status).toBe("failed"); // built and committed; the tests tamper and fail
+   expect((await git(["config", "--get", "http.sslVerify"], r.canonical)).stdout.trim()).toBe("false");
+
+   r.ctx.map.commands.test = "test -f src/feature.ts"; // the committed work would now pass adoption
+   r.ctx.workerCommand = [implementWorker, "noop"]; // a worker session would commit nothing and fail, not park
+   await moveOriginMain(r);
+   const fetched = await fetchedMain(r);
+   r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+   const resumed = await runNode("20", r.ctx);
+   expect(resumed.status).toBe("parked");
+   expect(resumed.detail).toContain("http.sslverify (new)");
+   const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+   expect(events.some((d) => d.startsWith("adopting "))).toBe(false);
+   expect(await fetchedMain(r)).toBe(fetched);
+   expect(await r.github.sha("node/20-add-the-feature-module")).toBe("");
+   expect(r.github.prs.size).toBe(0);
+  }, 60_000);
+
   test("a failed fix-pass test run that sets http.sslVerify parks the resume at the review phase before its push", async () => {
    const r = await rig({ blockers: [1, 0] });
    cleanup.push(r.dir);

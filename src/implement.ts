@@ -1553,15 +1553,15 @@ async function testsInFreshCheckout(ctx: ImplementContext, testCommand: string, 
  * to the worker as before, which can fix what broke. Null when there is
  * nothing to adopt or it does not pass.
  *
- * The git state is trusted exactly as on any resumed pass: the tamper
- * snapshot is taken now, at the start of this run (node #81: a stored
- * known-good snapshot instead).
+ * The git state is trusted exactly as on any resumed pass: checked against
+ * the known-good record (node #81), so a change the failed run's tests made
+ * parks here instead of becoming this run's baseline.
  */
 async function adoptBuiltWork(ctx: ImplementContext, testCommand: string): Promise<PassResult | null> {
  const { map, worktree, journal, node } = ctx;
  if ((await commitsAhead(worktree, map.base)) === 0) return null;
  if ((await dirtyFiles(worktree)).length > 0) return null;
- const snapshot = gitConfigSnapshot(ctx.canonical);
+ const snapshot = trustedSnapshot(journal, ctx.canonical, { repo: map.repo, nodeId: node.ref.id }, mapKey(map));
  const sha = await headSha(worktree);
  // Tested in a fresh clone of the commit, not in the worktree: whatever the
  // failed run left there (ignored fixtures, links, replacement refs) must
@@ -1580,7 +1580,7 @@ async function adoptBuiltWork(ctx: ImplementContext, testCommand: string): Promi
    }
   }
  }
- assertGitUntouched(ctx.canonical, snapshot);
+ const clean = assertGitUntouched(ctx.canonical, snapshot);
  if (tests.code !== 0) {
   journal.recordEvent("reviewed", {
    nodeId: node.ref.id,
@@ -1590,6 +1590,7 @@ async function adoptBuiltWork(ctx: ImplementContext, testCommand: string): Promi
   return null;
  }
  if ((await headSha(worktree)) !== sha || (await dirtyFiles(worktree)).length > 0) return null;
+ recordKnownGood(journal, ctx.canonical, clean, "passing adoption tests");
  await assertNoClosingKeywords(worktree, map.base);
  const restored = await restoreWorktree(ctx, sha);
  if (restored !== null) {
