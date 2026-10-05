@@ -1031,6 +1031,24 @@ describe("implement lane (node #23)", () => {
   expect(r.github.prs.size).toBe(0);
  }, 60_000);
 
+ test("adoption tests that fail on a busy host get one retry, and the work is adopted", async () => {
+  const counter = join(tmpdir(), `ranger-adopt-busy-${Date.now()}`);
+  // Run 0 (the build's own) and run 1 (adoption) fail; run 2 (the adoption retry) passes.
+  const r = await rig({ test: `n=$(cat ${counter} 2>/dev/null || echo 0); echo $((n + 1)) > ${counter}; [ "$n" -ge 2 ]` });
+  cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("failed"); // quiet host: no retry
+  r.ctx.workerCommand = [implementWorker, "noop"];
+  const loads = [14, 13, 2];
+  r.ctx.hostLoad = () => ({ load: loads.length > 1 ? (loads.shift() as number) : loads[0], cores: 10 });
+  r.ctx.quietHost = { pollMs: 1, maxMs: 60_000 };
+  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.startsWith("adoption tests failed on a busy host (load 14.0 on 10 cores)"))).toBe(true);
+  expect(events.some((d) => d.startsWith("adopting "))).toBe(true);
+  rmSync(counter, { force: true });
+ }, 60_000);
+
  test("adopted work that fails the supervisor's tests goes to the worker, which fixes it", async () => {
   const r = await rig({ test: "test -f src/fixed.ts" });
   cleanup.push(r.dir);

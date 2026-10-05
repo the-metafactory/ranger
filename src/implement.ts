@@ -1,4 +1,5 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { rm } from "node:fs/promises";
 import { availableParallelism, loadavg, tmpdir } from "node:os";
 import { join } from "node:path";
 import { DiscordAnnouncer } from "./announce.ts";
@@ -1375,9 +1376,15 @@ function testsFailedDetail(testCommand: string, tests: RunResult, after: string)
  * The retry runs in a fresh clone of the committed head, with its own
  * install (testsInFreshCheckout): nothing the failed run wrote into the
  * node's worktree or the shared repository (untracked or ignored fixtures,
- * index flags, links, replacement refs) reaches it, and the pass counts only
- * if install and the tests left the commit's tracked content as committed.
- * The node's worktree is left as it is.
+ * index flags, links, replacement refs) reaches it. The node's worktree is
+ * left as it is, and a retry whose pass ends with the worktree on another
+ * HEAD counts for nothing.
+ *
+ * What this guards against is leftovers: state outside the commit that a
+ * failed run produced. The commit's own install and test scripts are the
+ * commit; one that misreports itself (an `exit 0`, a redirected git
+ * worktree) is the commit's behaviour, which no re-run can catch, and the
+ * review reads that code.
  */
 async function supervisorTests(
  ctx: ImplementContext,
@@ -1406,6 +1413,9 @@ async function supervisorTests(
  });
  await awaitQuietHost(ctx, "the test retry");
  tests = await testsInFreshCheckout(ctx, testCommand, head);
+ if (tests.code === 0 && (await headSha(worktree)) !== head) {
+  tests = { ...tests, code: 1, stderr: `the retry passed at ${head.slice(0, 8)}, but the worktree moved off it meanwhile\n${tests.stderr}` };
+ }
  if (tests.code === 0) {
   journal.recordEvent("reviewed", { nodeId: node.ref.id, repo: map.repo, detail: `tests (${testCommand}) passed on the retry in a fresh checkout` });
   return { tests, log };
@@ -1438,9 +1448,10 @@ async function testsInFreshCheckout(ctx: ImplementContext, testCommand: string, 
    if (install.code !== 0) return { ...install, stderr: `install for the retry failed\n${install.stderr}` };
   }
   const tests = await runShell(testCommand, dir, ctx, TEST_TIMEOUT_MS);
-  // The pass certifies `sha` only if install and the tests left its tracked
-  // content as committed: no new HEAD, no modified tracked file, no index
-  // flag hiding one (--skip-worktree, --assume-unchanged).
+  // A sanity check on the run, not proof against the commit's own scripts
+  // (see supervisorTests): install and the tests should leave the commit's
+  // tracked content as committed — no new HEAD, no modified tracked file,
+  // no index flag hiding one.
   const now = await git(["rev-parse", "HEAD"], dir, 10_000);
   const tracked = await git(["status", "--porcelain", "--untracked-files=no"], dir);
   const flags = await git(["ls-files", "-v"], dir);
@@ -1459,7 +1470,7 @@ async function testsInFreshCheckout(ctx: ImplementContext, testCommand: string, 
   }
   return tests;
  } finally {
-  rmSync(scratch, { recursive: true, force: true });
+  await rm(scratch, { recursive: true, force: true });
  }
 }
 
@@ -1483,8 +1494,20 @@ async function adoptBuiltWork(ctx: ImplementContext, testCommand: string): Promi
  const sha = await headSha(worktree);
  // Tested in a fresh clone of the commit, not in the worktree: whatever the
  // failed run left there (ignored fixtures, links, replacement refs) must
- // not be what makes the adopted commit pass.
- const tests = await testsInFreshCheckout(ctx, testCommand, sha);
+ // not be what makes the adopted commit pass. A failure on a busy host gets
+ // the same one retry as any supervisor test run, or a load flake would hand
+ // finished work back to a worker with nothing left to commit.
+ let tests = await testsInFreshCheckout(ctx, testCommand, sha);
+ const host = (ctx.hostLoad ?? realHostLoad)();
+ if (tests.code !== 0 && host.load >= host.cores) {
+  journal.recordEvent("reviewed", {
+   nodeId: node.ref.id,
+   repo: map.repo,
+   detail: `adoption tests failed on a busy host (load ${host.load.toFixed(1)} on ${host.cores} cores) — retrying once, in a fresh checkout of ${sha.slice(0, 8)}, when it quiets`,
+  });
+  await awaitQuietHost(ctx, "the adoption test retry");
+  tests = await testsInFreshCheckout(ctx, testCommand, sha);
+ }
  assertGitUntouched(ctx.canonical, snapshot);
  if (tests.code !== 0) {
   saveWorkerLog(journal.path, map.repo, node.ref.id, ctx.generation, `adopted build: supervisor tests in a fresh checkout (${testCommand})`, tests);
