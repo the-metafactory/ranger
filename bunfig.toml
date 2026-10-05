@@ -2,3 +2,7 @@
 # Several e2e tests drive real git + subprocess fixtures and take longer than
 # bun's 5 s default on a loaded machine.
 timeout = 60000
+# Shuffle test order every run, so a test that leans on another's leftovers
+# (files, env, module state) fails instead of passing by position. A failing
+# order is replayed with `bun test --seed <n>`.
+randomize = true
