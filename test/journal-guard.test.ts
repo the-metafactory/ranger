@@ -13,8 +13,11 @@ import {
  ForeignMigrationError,
  LIVE_JOURNAL_PATH,
  liveJournalDir,
+ UNDER_TEST_ENV,
+ underTest,
 } from "../src/journal-guard.ts";
-import { baseConfigLines, runCli } from "./support.ts";
+import { runCmd } from "../src/exec.ts";
+import { baseConfigLines, bun, runCli } from "./support.ts";
 
 const FOREIGN = ["f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0", "e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1"];
 const REFUSAL = "this journal was migrated by code this ranger isn't running";
@@ -168,6 +171,27 @@ describe("the live journal under test (node #66)", () => {
    assertNotLiveJournalUnderTest(path, { liveDir, env: { NODE_ENV: "test", RANGER_TEST_ALLOW_LIVE_JOURNAL: "1" } }),
   ).not.toThrow();
   expect(() => assertNotLiveJournalUnderTest(path, { liveDir, env: {} })).not.toThrow();
+ });
+
+ test("test mode holds whatever NODE_ENV says: the preload's marker wins", async () => {
+  expect(underTest({ [UNDER_TEST_ENV]: "1", NODE_ENV: "production" })).toBe(true);
+  expect(underTest({ NODE_ENV: "test" })).toBe(true);
+  expect(underTest({ NODE_ENV: "production" })).toBe(false);
+  const liveDir = tempDir();
+  expect(() =>
+   assertNotLiveJournalUnderTest(join(liveDir, "state.sqlite"), {
+    liveDir,
+    env: { [UNDER_TEST_ENV]: "1", NODE_ENV: "production" },
+   }),
+  ).toThrow("under test");
+  // The real case: `bun test` keeps NODE_ENV=production; the child gets no
+  // marker from here, so only its own preload can turn test mode on.
+  const env: NodeJS.ProcessEnv = { ...process.env, NODE_ENV: "production" };
+  delete env[UNDER_TEST_ENV];
+  const probe = "./test/fixtures/probes/production-node-env.probe.ts";
+  const result = await runCmd(bun, ["test", probe], { env, cwd: join(import.meta.dir, "..") });
+  expect(`${result.stdout}${result.stderr}`).toContain("1 pass");
+  expect(result.code).toBe(0);
  });
 
  test("new Journal(path) and openJournal refuse the live directory", () => {

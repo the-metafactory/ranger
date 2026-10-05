@@ -68,5 +68,8 @@ mkdir -p "$GH_CONFIG_DIR"
 # worker session (node #66); a live tick, run-node or serve started from inside
 # such a session must still open the live journal, so it never passes through.
 unset RANGER_JOURNAL_PATH
+# RANGER_UNDER_TEST is the test-mode marker (test/preload.ts): a live process
+# that inherited it would run on a temp journal.
+unset RANGER_UNDER_TEST
 
 exec "$BUN" "$RANGER_CLI" "$@"

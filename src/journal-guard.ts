@@ -32,9 +32,19 @@ export function liveJournalDir(): string {
  return join(homedir(), ".config", "ranger");
 }
 
-/** `bun test` sets NODE_ENV=test; spawned CLIs inherit it from the test's env. */
+/**
+ * Set to "1" by the test preload (test/preload.ts) and by `testCliEnv`: the
+ * test-mode marker. NODE_ENV alone is not enough, since `bun test` keeps a
+ * NODE_ENV the caller already set (NODE_ENV=production bun test).
+ */
+export const UNDER_TEST_ENV = "RANGER_UNDER_TEST";
+
+/**
+ * Test mode: the preload's marker, or NODE_ENV=test (what `bun test` sets
+ * when NODE_ENV is unset). Spawned CLIs inherit either from the test's env.
+ */
 export function underTest(env: NodeJS.ProcessEnv = process.env): boolean {
- return env.NODE_ENV === "test";
+ return env[UNDER_TEST_ENV] === "1" || env.NODE_ENV === "test";
 }
 
 /**

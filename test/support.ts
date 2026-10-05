@@ -9,12 +9,12 @@ export const cliPath = join(import.meta.dir, "..", "src", "cli.ts");
 export const bun = process.execPath;
 
 /**
- * A spawned CLI stays in test mode (node #66): NODE_ENV=test keeps the live
- * journal directory refused and an unset state.journalPath a temp file, even
- * when the test hands the child a minimal env.
+ * A spawned CLI stays in test mode (node #66): RANGER_UNDER_TEST=1 keeps the
+ * live journal directory refused and an unset state.journalPath a temp file,
+ * even when the test hands the child a minimal env.
  */
 export function testCliEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
- return { ...env, NODE_ENV: "test" };
+ return { ...env, RANGER_UNDER_TEST: "1" };
 }
 
 export const GIT_ENV = {
