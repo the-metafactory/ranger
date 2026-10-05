@@ -133,9 +133,20 @@ export class ForeignMigrationError extends Error {
  }
 }
 
-/** Hashes of the migrations the running code ships. */
-export function knownMigrationHashes(migrationsFolder: string): Set<string> {
- return new Set(readMigrationFiles({ migrationsFolder }).map((m) => m.hash));
+const knownHashesByFolder = new Map<string, ReadonlySet<string>>();
+
+/**
+ * Hashes of the migrations the running code ships. Read once per folder: the
+ * folder is fixed for the process, and serve opens the journal on every poll.
+ * The journal's own rows are still checked on every open.
+ */
+export function knownMigrationHashes(migrationsFolder: string): ReadonlySet<string> {
+ let known = knownHashesByFolder.get(migrationsFolder);
+ if (known === undefined) {
+  known = new Set(readMigrationFiles({ migrationsFolder }).map((m) => m.hash));
+  knownHashesByFolder.set(migrationsFolder, known);
+ }
+ return known;
 }
 
 /**

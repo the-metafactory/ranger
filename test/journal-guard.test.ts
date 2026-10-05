@@ -243,3 +243,27 @@ describe("state.journalPath (node #66)", () => {
   );
  });
 });
+
+describe("the live wrapper (node #66)", () => {
+ test("drops the worker journal and both test-mode markers; any other NODE_ENV passes through", async () => {
+  const home = tempDir();
+  const bin = join(home, "bin");
+  mkdirSync(bin);
+  // A stand-in bun that prints the env the CLI would get, and a keychain with nothing in it.
+  const fakeBun = join(bin, "bun");
+  writeFileSync(fakeBun, "#!/bin/sh\nenv\n", { mode: 0o755 });
+  writeFileSync(join(bin, "security"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+  const wrapper = join(import.meta.dir, "..", "ops", "bin", "ranger.example");
+  const run = async (extra: NodeJS.ProcessEnv) => {
+   const env: NodeJS.ProcessEnv = { HOME: home, PATH: `${bin}:/usr/bin:/bin`, BUN: fakeBun, ...extra };
+   const result = await runCmd("/bin/bash", [wrapper, "tick"], { env });
+   expect(result.code).toBe(0);
+   return result.stdout.split("\n");
+  };
+  const tested = await run({ NODE_ENV: "test", [UNDER_TEST_ENV]: "1", RANGER_JOURNAL_PATH: "/tmp/session/state.sqlite" });
+  expect(tested.some((l) => l.startsWith("NODE_ENV="))).toBe(false);
+  expect(tested.some((l) => l.startsWith(`${UNDER_TEST_ENV}=`))).toBe(false);
+  expect(tested.some((l) => l.startsWith("RANGER_JOURNAL_PATH="))).toBe(false);
+  expect(await run({ NODE_ENV: "production" })).toContain("NODE_ENV=production");
+ });
+});
