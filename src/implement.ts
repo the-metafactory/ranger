@@ -938,8 +938,10 @@ async function baseMergePass(ctx: ImplementContext, testCommand: string, pushedH
  // reviewed. The pass redoes the merge on the pushed head — only while this
  // supervisor still owns the node: a superseded one must not erase a newer
  // run's work.
- ctx.journal.assertGeneration(ctx.node.ref.id, ctx.map.repo, ctx.generation, "reset the worktree for a base merge");
  for (const args of [["reset", "--hard", pushedHead], ["clean", "-fd"]]) {
+  // Fenced before EACH destructive command: a replacement run can take the
+  // node over while the previous one awaits.
+  ctx.journal.assertGeneration(ctx.node.ref.id, ctx.map.repo, ctx.generation, `git ${args[0]} before a base merge`);
   const r = await safeGit(args, { cwd: ctx.worktree, timeoutMs: 60_000 });
   if (r.code !== 0) throw new GitSafetyError(`cannot reset ${ctx.worktree} to ${pushedHead.slice(0, 8)} (git ${args[0]}): ${r.stderr.trim()}`);
  }
