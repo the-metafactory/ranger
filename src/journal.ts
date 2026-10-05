@@ -8,6 +8,9 @@ import {
  headSubstrates,
  health,
  substrateReadings,
+ substrateSessions,
+ type SessionKind,
+ type SessionOutcome,
  type SubstrateName,
  vetoes,
  workers,
@@ -94,6 +97,20 @@ export interface SubstrateReading {
  resetsAt: string | null;
  capped: boolean;
  cappedUntil: string | null;
+}
+
+/** One substrate session (node #56): a build, a fix pass or a sage round. */
+export interface SubstrateSessionRow {
+ id: number;
+ substrate: SubstrateName;
+ kind: SessionKind;
+ repo: string;
+ nodeId: string;
+ /** The supervisor generation that opened the row. */
+ generation: number;
+ startedAt: string;
+ endedAt: string | null;
+ outcome: SessionOutcome | null;
 }
 
 export interface EscalationRow {
@@ -357,6 +374,18 @@ export class Journal {
     : base.where(eq(events.repo, repo)).orderBy(desc(events.id)).limit(limit);
   const rows = query.all();
   return rows.map(hydrateEvent);
+ }
+
+ /** One node's events, newest first (node #54: the dashboard's reason class). */
+ listNodeEvents(repo: string, nodeId: string, limit = 60): EventRow[] {
+  return this.db
+   .select()
+   .from(events)
+   .where(and(eq(events.repo, repo), eq(events.nodeId, nodeId)))
+   .orderBy(desc(events.id))
+   .limit(limit)
+   .all()
+   .map(hydrateEvent);
  }
 
  // ---- health ----
@@ -774,6 +803,105 @@ export class Journal {
   this.db.delete(headSubstrates).where(lt(headSubstrates.recordedAt, cutoff)).run();
  }
 
+ // ---- substrate sessions (node #56) ----
+
+ /**
+  * Open a session row and return its id. The fence runs inside the
+  * transaction: a superseded supervisor (generation no longer the worker
+  * row's) gets a FencedError and touches no row. A node runs one session at
+  * a time under its current supervisor, so a row still open for the same
+  * node belongs to an older generation, superseded or dead mid-session: it
+  * is closed as failed here, and its own late `endSubstrateSession` (if any) no longer
+  * applies.
+  */
+ startSubstrateSession(
+  scope: {
+   substrate: SubstrateName;
+   kind: SessionKind;
+   repo: string;
+   nodeId: string;
+   generation: number;
+   model?: string | null;
+  },
+  now = new Date(),
+ ): number {
+  const at = now.toISOString();
+  return this.db.transaction((tx) => {
+   const occupant = tx
+    .select({ generation: workers.generation })
+    .from(workers)
+    .where(and(eq(workers.nodeId, scope.nodeId), eq(workers.repo, scope.repo)))
+    .all()[0];
+   if (occupant === undefined || occupant.generation !== scope.generation) {
+    throw new FencedError(
+     `node ${scope.nodeId}: generation ${scope.generation} superseded by ${occupant?.generation ?? "a removed row"} — refusing to open a ${scope.kind} session`,
+    );
+   }
+   tx.update(substrateSessions)
+    .set({ endedAt: at, outcome: "failed" })
+    .where(
+     and(
+      eq(substrateSessions.repo, scope.repo),
+      eq(substrateSessions.nodeId, scope.nodeId),
+      isNull(substrateSessions.endedAt),
+     ),
+    )
+    .run();
+   const cutoff = new Date(now.getTime() - SESSION_RETENTION_DAYS * DAY_MS).toISOString();
+   tx.delete(substrateSessions).where(lt(substrateSessions.startedAt, cutoff)).run();
+   const [row] = tx
+    .insert(substrateSessions)
+    .values({ ...scope, startedAt: at })
+    .returning({ id: substrateSessions.id })
+    .all();
+   return row.id;
+  });
+ }
+
+ /** Close a session row; a row already closed (superseded) stays as it is. */
+ endSubstrateSession(id: number, outcome: SessionOutcome, now = new Date()): void {
+  this.db
+   .update(substrateSessions)
+   .set({ endedAt: now.toISOString(), outcome })
+   .where(and(eq(substrateSessions.id, id), isNull(substrateSessions.endedAt)))
+   .run();
+ }
+
+ /**
+  * Sessions started since `since`, plus every still-open row: two indexed
+  * reads (recent by `started_at`, open by `ended_at`), so a dashboard poll
+  * never scans the retained history. Null for a journal no migration has
+  * reached yet (`ranger serve` reads it without migrating): there is no
+  * history to count, which is not the same as no sessions.
+  */
+ listSubstrateSessions(since: Date): SubstrateSessionRow[] | null {
+  return withoutSessionsTable(() => {
+   const recent = this.db
+    .select(SESSION_COLUMNS)
+    .from(substrateSessions)
+    .where(gt(substrateSessions.startedAt, since.toISOString()))
+    .all();
+   const open = this.db.select(SESSION_COLUMNS).from(substrateSessions).where(isNull(substrateSessions.endedAt)).all();
+   const byId = new Map([...recent, ...open].map((row) => [row.id, row]));
+   return [...byId.values()].sort((a, b) => a.id - b.id);
+  });
+ }
+
+ /** A substrate's most recent session, however old (within retention). */
+ lastSubstrateSession(substrate: SubstrateName): SubstrateSessionRow | null {
+  return (
+   withoutSessionsTable(() =>
+    this.db
+     .select(SESSION_COLUMNS)
+     .from(substrateSessions)
+     .where(eq(substrateSessions.substrate, substrate))
+     .orderBy(desc(substrateSessions.startedAt), desc(substrateSessions.id))
+     .limit(1)
+     .all(),
+   )?.[0] ?? null
+  );
+ }
+
  /** Prune spawn-ledger keys older than the retention window (keeps health tidy). */
  pruneSpawnLedger(now = new Date(), retentionDays = 30): void {
   const cutoff = dayKey(new Date(now.getTime() - retentionDays * DAY_MS));
@@ -792,6 +920,36 @@ export class Journal {
 
  close(): void {
   this.closeDb();
+ }
+}
+
+/**
+ * The columns a session read returns. Named rather than `select()`: `ranger
+ * serve` reads without migrating, and a journal from before the `model`
+ * column (node #60) still has every one of these.
+ */
+const SESSION_COLUMNS = {
+ id: substrateSessions.id,
+ substrate: substrateSessions.substrate,
+ kind: substrateSessions.kind,
+ repo: substrateSessions.repo,
+ nodeId: substrateSessions.nodeId,
+ generation: substrateSessions.generation,
+ startedAt: substrateSessions.startedAt,
+ endedAt: substrateSessions.endedAt,
+ outcome: substrateSessions.outcome,
+};
+
+/** Session rows are kept a month: the panel's widest window is 7 days. */
+const SESSION_RETENTION_DAYS = 30;
+
+/** Null when `substrate_sessions` is not migrated in yet. */
+function withoutSessionsTable(read: () => SubstrateSessionRow[]): SubstrateSessionRow[] | null {
+ try {
+  return read();
+ } catch (error) {
+  if (error instanceof Error && error.message.includes("no such table: substrate_sessions")) return null;
+  throw error;
  }
 }
 

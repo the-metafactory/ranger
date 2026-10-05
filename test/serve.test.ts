@@ -16,6 +16,7 @@ import {
  createHandler,
  launchPlan,
  type MapRead,
+ renderPage,
  ServeReader,
  stateFromJournal,
  type ServeMap,
@@ -147,6 +148,13 @@ describe("#37 — the state the dashboard shows", () => {
   expect(assembleState(inputs()).maps[0].next.nodeId).toBe(tickFirst.id);
  });
 
+ test("the page's inline script parses (string-built client code has no compile step)", () => {
+  const page = renderPage("tok");
+  const body = page.slice(page.indexOf("<script>") + "<script>".length, page.indexOf("</script>"));
+  expect(body.length).toBeGreaterThan(0);
+  expect(() => new Function(body)).not.toThrow();
+ });
+
  test("serve imports no graph write, directly or through another module", () => {
   const seen = new Set<string>();
   const src = join(import.meta.dir, "..", "src");
@@ -161,6 +169,8 @@ describe("#37 — the state the dashboard shows", () => {
   visit(join(src, "serve.ts"));
   const local = [...seen].map((f) => f.slice(src.length + 1));
   expect(local).toContain("frontier-cache.ts");
+  // Node #54: the "Needs you" actions are walked too, and import no write either.
+  expect(local).toContain("serve-parked.ts");
   expect(local.filter((f) => /graph-write|walk|sweep|worker|implement/.test(f))).toEqual([]);
  });
 
@@ -355,8 +365,7 @@ describe("#37 — the launch endpoint refuses", () => {
     launched.push(argv);
    },
    verifyGrilling: over.verifyGrilling ?? (async () => null),
-   buildNowCommand: () => [],
-   runVerb: async () => ({ code: 0, tail: "" }),
+   buildNow: { command: () => [], runVerb: async () => ({ code: 0, tail: "" }) },
   });
   return { handler, launched };
  };
@@ -466,11 +475,13 @@ describe("node #58 — the Build now endpoint", () => {
     launched.push(argv);
    },
    verifyGrilling: async () => null,
-   buildNowCommand: (map, nodeId) =>
-    buildNowArgv({ bin: "/bin/ranger", key: map.key, nodeId, configPath: "/c/ranger.yaml" }),
-   runVerb: async (argv, env) => {
-    built.push({ argv, env });
-    return { code: 1, tail: "ranger build-now: the headless implement lane is held by #663" };
+   buildNow: {
+    command: (map, nodeId) =>
+     buildNowArgv({ bin: "/bin/ranger", key: map.key, nodeId, configPath: "/c/ranger.yaml" }),
+    runVerb: async (argv, env) => {
+     built.push({ argv, env });
+     return { code: 1, tail: "ranger build-now: the headless implement lane is held by #663" };
+    },
    },
   });
   return { handler, built, launched };
@@ -645,6 +656,7 @@ describe("#37 — a registered map is shown from ranger's own cache, with no Git
    state: { journalPath, canonicalRoot: "/srv/ranger-repos" },
    workers: { spawnCapPerDay: 10, wallClockMin: 90, maxAttempts: 2, deadmanThreshold: 3, reviewRounds: 2 },
    budget: { graphqlFloor: 1000, rateLimitCooldownMin: 10, frontierMaxAgeMin: 60 },
+   substrates: { fiveHourMaxUsedPct: 70, sevenDayMaxUsedPct: 80, claudeProbeMaxAgeMin: 15, codexReadMaxAgeMin: 5 },
   }) as unknown as RangerConfig;
 
  test("the cached frontier is classified as the walk classifies it, and stamped with its age", () => {

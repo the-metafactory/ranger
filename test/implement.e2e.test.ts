@@ -15,6 +15,7 @@ import { loadConfig } from "../src/config.ts";
 import { runCmd } from "../src/exec.ts";
 import type { CheckRun, IssueComment, PullRequest } from "../src/github.ts";
 import type { GitHubPort } from "../src/implement.ts";
+import { Database } from "bun:sqlite";
 import { openJournal, type Journal } from "../src/journal.ts";
 import { ReviewError, type ReviewVerdict } from "../src/review.ts";
 import { LAST_IMPLEMENT_MAP } from "../src/maps.ts";
@@ -297,6 +298,14 @@ async function rig(opts: {
  return { dir, origin, canonical, journal, statePath, ctx, github, calls };
 }
 
+/** The node's substrate sessions (node #56), oldest first: [substrate, kind, outcome]. */
+function sessions(journal: Journal): [string, string, string | null][] {
+ return (journal.listSubstrateSessions(new Date(0)) ?? []).map((s) => {
+  expect(s.endedAt).not.toBeNull();
+  return [s.substrate, s.kind, s.outcome];
+ });
+}
+
 function state(path: string) {
  return JSON.parse(readFileSync(path, "utf8"));
 }
@@ -371,6 +380,17 @@ describe("implement lane (node #23)", () => {
   expect(row?.reviewRound).toBe(2);
   expect(row?.verdictBlockers).toBe(0);
   expect(r.calls).toHaveLength(2);
+  // Quota reads fail closed under the injected worker, so every session ran on Pi (node #56).
+  expect(sessions(r.journal)).toEqual([
+   ["pi", "worker", "ok"],
+   ["pi", "review", "ok"],
+   ["pi", "fix-pass", "ok"],
+   ["pi", "review", "ok"],
+  ]);
+  // Each row carries the supervisor generation that ran it: the panel's liveness check.
+  expect(new Set(r.journal.listSubstrateSessions(new Date(0))?.map((s) => s.generation))).toEqual(
+   new Set([row!.generation]),
+  );
 
   const pr = r.github.prs.get(1);
   expect(pr?.draft).toBe(false);
@@ -1106,6 +1126,9 @@ describe("implement lane (node #23)", () => {
   const resetsAt = Math.floor(Date.now() / 1000) + 3600;
   let calls = 0;
   r.ctx.substrate = "claude";
+  // The session runs through ctx.worker; without a fixed command, ranger
+  // builds each substrate's own and names its pinned model (node #60).
+  delete r.ctx.workerCommand;
   r.ctx.substrateReaders = {
    claude: () => Promise.reject(new Error("claude probe must not decide this")),
    codex: async () => ({
@@ -1146,12 +1169,32 @@ describe("implement lane (node #23)", () => {
   const starts = events.filter((e) => e.kind === "worker-start" && e.detail?.startsWith("substrate "));
   expect(starts.map((e) => e.detail?.split(" ")[1]).reverse()).toEqual(["claude", "codex"]);
   expect(starts[0].detail).toContain("codex 7d 5%");
+  // The Codex session names the model ranger pins; Claude's is not pinned.
+  expect(starts[0].detail).toStartWith("substrate codex (gpt-6.1-sol, high) (");
+  expect(starts[1].detail).toStartWith("substrate claude (fixed by the caller)");
 
   // The capped session's leftovers were dropped; the pushed head is Codex's.
   const head = await r.github.sha("node/20-add-the-feature-module");
   expect(r.journal.headSubstrate("acme/widgets", head)).toBe("codex");
   const files = await runCmd("git", ["ls-tree", "-r", "--name-only", head], { cwd: r.origin });
   expect(files.stdout).not.toContain("half-done.ts");
+  // The capped Claude session and the Codex one that finished are both recorded (node #56).
+  expect(sessions(r.journal).slice(0, 2)).toEqual([
+   ["claude", "worker", "capped"],
+   ["codex", "worker", "ok"],
+  ]);
+  // The session rows carry the pinned model (node #60); the sage rounds do not.
+  const db = new Database(join(r.dir, "state.sqlite"), { readonly: true });
+  try {
+   const models = db.query("SELECT substrate, kind, model FROM substrate_sessions ORDER BY id").all();
+   expect(models.slice(0, 2)).toEqual([
+    { substrate: "claude", kind: "worker", model: null },
+    { substrate: "codex", kind: "worker", model: "gpt-6.1-sol" },
+   ]);
+   expect(models.filter((m) => (m as { kind: string }).kind === "review").every((m) => (m as { model: unknown }).model === null)).toBe(true);
+  } finally {
+   db.close();
+  }
  }, 60_000);
 
  test("a review capped on its substrate resumes cross-model without touching attempts or the dead-man", async () => {
@@ -1203,6 +1246,11 @@ describe("implement lane (node #23)", () => {
   const markers = (r.github.comments.get(1) ?? []).filter((c) => c.body.includes("ranger:review"));
   expect(markers).toHaveLength(1);
   expect(markers[0].body).toContain("substrate=pi -->");
+  expect(sessions(r.journal)).toEqual([
+   ["claude", "worker", "ok"],
+   ["codex", "review", "capped"],
+   ["pi", "review", "ok"],
+  ]);
  }, 60_000);
 
  test("a RANGER_WORKER_CMD session runs unlabelled and its review still selects on real quota", async () => {
@@ -1240,6 +1288,8 @@ describe("implement lane (node #23)", () => {
    .listEvents("acme/widgets", 200)
    .find((e) => e.kind === "worker-start" && e.detail?.startsWith("substrate "));
   expect(start?.detail).toContain("substrate unknown (RANGER_WORKER_CMD override");
+  // A session on an unknown substrate is not recorded; its review is.
+  expect(sessions(r.journal)).toEqual([["codex", "review", "ok"]]);
  }, 60_000);
 
  test("a codex failure that only prints 'rate limit' is an ordinary failure (no spoofed cap)", async () => {
@@ -1257,5 +1307,6 @@ describe("implement lane (node #23)", () => {
   expect(outcome.detail).toContain("worker exited 1");
   expect(r.journal.deadmanCount()).toBe(1);
   expect(r.journal.listEvents("acme/widgets", 200).some((e) => e.kind === "substrate-capped")).toBe(false);
+  expect(sessions(r.journal)).toEqual([["codex", "worker", "failed"]]);
  }, 60_000);
 });

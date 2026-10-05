@@ -4,6 +4,7 @@ import {
   matchTokenEnv,
   resolveReadOnlyToken,
   GateError,
+  tokenBatch,
 } from "../src/token-gate.ts";
 import type { RangerConfig } from "../src/config.ts";
 
@@ -79,7 +80,7 @@ describe("resolveReadOnlyToken", () => {
     state: { journalPath: ":memory:", canonicalRoot: "/tmp/ranger-repos", legacyMapRoots: {} },
     workers: { spawnCapPerDay: 10, wallClockMin: 90, maxAttempts: 2, deadmanThreshold: 3, reviewRounds: 2 },
   budget: { graphqlFloor: 1000, rateLimitCooldownMin: 10, frontierMaxAgeMin: 60 },
-  substrates: { fiveHourMaxUsedPct: 70, sevenDayMaxUsedPct: 80, claudeProbeMaxAgeMin: 15, codexReadMaxAgeMin: 5, pi: { provider: "spark", model: "longctx-think" } },
+  substrates: { fiveHourMaxUsedPct: 70, sevenDayMaxUsedPct: 80, claudeProbeMaxAgeMin: 15, codexReadMaxAgeMin: 5, codex: { model: "gpt-6.1-sol", reasoningEffort: "high" }, pi: { provider: "spark", model: "longctx-think" } },
   };
 
   test("resolves from env when set", () => {
@@ -105,5 +106,36 @@ describe("resolveReadOnlyToken", () => {
     expect(() => resolveReadOnlyToken(config, "other/repo", {})).toThrow(
       /no read-only token mapping/,
     );
+  });
+});
+
+describe("tokenBatch — the gate once per repo per batch (node #54)", () => {
+  const config = {} as RangerConfig;
+
+  test("same repo: one gate run; another repo: its own", async () => {
+    const gated: string[] = [];
+    const tokens = tokenBatch(config, async (_c, repo) => {
+      gated.push(repo);
+      return { token: { token: `t-${repo}`, source: "RANGER_RO" } };
+    });
+    const [a, b, c] = await Promise.all([tokens("acme/a"), tokens("acme/a"), tokens("acme/b")]);
+    expect(a.token).toBe("t-acme/a");
+    expect(b).toBe(a);
+    expect(c.token).toBe("t-acme/b");
+    expect(gated).toEqual(["acme/a", "acme/b"]);
+  });
+
+  test("a refusal is shared within the batch; a new batch runs the gate again", async () => {
+    let runs = 0;
+    const gate = async (): Promise<{ token: { token: string; source: string } }> => {
+      runs += 1;
+      throw new GateError("write-capable token");
+    };
+    const tokens = tokenBatch(config, gate);
+    await expect(tokens("acme/a")).rejects.toThrow(/write-capable/);
+    await expect(tokens("acme/a")).rejects.toThrow(/write-capable/);
+    expect(runs).toBe(1);
+    await expect(tokenBatch(config, gate)("acme/a")).rejects.toThrow(GateError);
+    expect(runs).toBe(2);
   });
 });

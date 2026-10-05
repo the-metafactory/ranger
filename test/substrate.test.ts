@@ -6,6 +6,7 @@ import { loadConfig } from "../src/config.ts";
 import { openJournal, type Journal, type SubstrateReading } from "../src/journal.ts";
 import {
  confirmCap,
+ describeWorkerModel,
  detectClaudeCap,
  drainJsonLines,
  effectiveThreshold,
@@ -19,6 +20,7 @@ import {
  type QuotaReading,
  workerOutputFor,
  workerCommandFor,
+ workerModelFor,
  type ClaudeRateLimitEvent,
  type CodexRateLimitsResponse,
 } from "../src/substrate.ts";
@@ -32,7 +34,6 @@ import {
 import { recordedReviews, reviewMarker } from "../src/implement.ts";
 import { sageReview } from "../src/review.ts";
 import { runCmd } from "../src/exec.ts";
-import { substrateViews } from "../src/serve.ts";
 import { baseConfigLines } from "./support.ts";
 
 const SHA = "a".repeat(40);
@@ -673,7 +674,16 @@ describe("workerCommandFor", () => {
  });
 
  test("codex: a writable workspace sandbox, plus the common git dir a worktree commits into", () => {
-  expect(workerCommandFor("codex", config)).toEqual(["codex", "exec", "--sandbox", "workspace-write"]);
+  expect(workerCommandFor("codex", config)).toEqual([
+   "codex",
+   "exec",
+   "--sandbox",
+   "workspace-write",
+   "--model",
+   "gpt-6.1-sol",
+   "-c",
+   'model_reasoning_effort="high"',
+  ]);
   expect(workerCommandFor("codex", config, { writableGitDir: "/c/acme/widgets/.git" })).toEqual([
    "codex",
    "exec",
@@ -681,9 +691,54 @@ describe("workerCommandFor", () => {
    "workspace-write",
    "--add-dir",
    "/c/acme/widgets/.git",
+   "--model",
+   "gpt-6.1-sol",
+   "-c",
+   'model_reasoning_effort="high"',
   ]);
   // Never the read-only default, never the unsandboxed escape hatch.
   expect(workerCommandFor("codex", config)).not.toContain("--dangerously-bypass-approvals-and-sandbox");
+ });
+
+ test("codex: the model pin defaults apply to a config without a codex block (node #60)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ranger-codex-"));
+  try {
+   const path = join(dir, "ranger.yaml");
+   writeFileSync(path, baseConfigLines(dir).join("\n"));
+   const bare = loadConfig(path).config;
+   expect(bare.substrates.codex).toEqual({ model: "gpt-6.1-sol", reasoningEffort: "high" });
+   const cmd = workerCommandFor("codex", bare, { writableGitDir: "/c/.git" });
+   expect(cmd.slice(cmd.indexOf("--model"), cmd.indexOf("--model") + 2)).toEqual(["--model", "gpt-6.1-sol"]);
+   expect(cmd).toContain('model_reasoning_effort="high"');
+   expect(cmd).toContain("workspace-write");
+   expect(cmd).not.toContain("--dangerously-bypass-approvals-and-sandbox");
+   expect(workerModelFor("codex", bare)).toEqual({ model: "gpt-6.1-sol", reasoningEffort: "high" });
+   expect(describeWorkerModel(workerModelFor("codex", bare)!)).toBe("gpt-6.1-sol, high");
+   expect(workerModelFor("claude", bare)).toBeNull();
+  } finally {
+   rmSync(dir, { recursive: true, force: true });
+  }
+ });
+
+ test("codex: the configured model and effort reach the argv (node #60)", () => {
+  const pinned = {
+   ...config,
+   substrates: { ...config.substrates, codex: { model: "gpt-5.5-codex", reasoningEffort: "low" as const } },
+  };
+  const cmd = workerCommandFor("codex", pinned, { writableGitDir: "/c/.git" });
+  expect(cmd).toEqual([
+   "codex",
+   "exec",
+   "--sandbox",
+   "workspace-write",
+   "--add-dir",
+   "/c/.git",
+   "--model",
+   "gpt-5.5-codex",
+   "-c",
+   'model_reasoning_effort="low"',
+  ]);
+  expect(cmd).not.toContain("--dangerously-bypass-approvals-and-sandbox");
  });
 
  test("pi: provider and model from config", () => {
@@ -903,31 +958,6 @@ describe("workerOutputFor — reading a run on its substrate's format", () => {
     const raw = { code: 0, stdout: '{"type":"result","result":"x"}', stderr: "" };
     expect(out.read(raw, journal)).toEqual({ result: raw });
    }
-  });
- });
-});
-
-describe("substrateViews — the serve panel's derived state", () => {
- test("derives capped, fresh and eligible with the selector's rules", () => {
-  const now = new Date();
-  const future = new Date(now.getTime() + 3_600_000).toISOString();
-  const past = new Date(now.getTime() - 3_600_000).toISOString();
-  const views = substrateViews(
-   [
-    reading("claude", { cappedUntil: future }),
-    reading("codex", { readAt: new Date(now.getTime() - 10 * 60_000).toISOString(), cappedUntil: past }),
-   ],
-   DEFAULT_CONFIG,
-   now,
-  );
-  expect(views[0]).toMatchObject({ substrate: "claude", capped: true, cappedUntil: future, eligible: false, fresh: true });
-  // A lapsed capped-until is not shown; a 10-minute-old codex reading is stale (max 5).
-  expect(views[1]).toMatchObject({ substrate: "codex", capped: false, cappedUntil: null, fresh: false, eligible: false, ageMin: 10 });
-  expect(substrateViews([reading("codex")], DEFAULT_CONFIG, now)[0].eligible).toBe(true);
-  const near = reading("claude", { sevenDayUsedPct: 85,
-   sevenDayResetsAt: new Date(now.getTime() + 5 * 3_600_000).toISOString() });
-  expect(substrateViews([near], DEFAULT_CONFIG, now)[0]).toMatchObject({
-   sevenDayThreshold: expect.closeTo(99.405, 2), eligible: true,
   });
  });
 });

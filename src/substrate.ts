@@ -376,6 +376,32 @@ function epochIso(seconds: number): string {
 
 // ---- per-substrate command builders ----
 
+/** The model a worker session runs, as ranger's config pins it (node #60). */
+export interface WorkerModel {
+ model: string;
+ reasoningEffort?: string;
+}
+
+/**
+ * The model ranger pins for a substrate's worker sessions: Codex and Pi from
+ * `substrates` in ranger's config. Null for Claude, which ranger does not pin.
+ */
+export function workerModelFor(substrate: SubstrateName, config: RangerConfig): WorkerModel | null {
+ switch (substrate) {
+  case "claude":
+   return null;
+  case "codex":
+   return { model: config.substrates.codex.model, reasoningEffort: config.substrates.codex.reasoningEffort };
+  case "pi":
+   return { model: config.substrates.pi.model };
+ }
+}
+
+/** "gpt-6.1-sol, high": a worker model as the journal names it. */
+export function describeWorkerModel(model: WorkerModel): string {
+ return model.reasoningEffort === undefined ? model.model : `${model.model}, ${model.reasoningEffort}`;
+}
+
 /**
  * The worker command + leading args for a substrate; the caller appends the
  * prompt as the final arg. Claude and Pi take sage's headless flags (sage
@@ -383,7 +409,10 @@ function epochIso(seconds: number): string {
  * `codex exec` runs in Codex's read-only sandbox, where a build session cannot
  * write. A worker gets `--sandbox workspace-write` (its cwd, the worktree) plus
  * the canonical clone's `.git` via `--add-dir`, because a worktree commits
- * into the common git dir, which lies outside the worktree.
+ * into the common git dir, which lies outside the worktree. Its model and
+ * reasoning effort come from ranger's config (node #60), never the
+ * principal's own Codex defaults; the config schema admits only plain names
+ * and the effort enum, so the `-c` override stays a literal TOML string.
  */
 export function workerCommandFor(
  substrate: SubstrateName,
@@ -400,6 +429,10 @@ export function workerCommandFor(
     "--sandbox",
     "workspace-write",
     ...(opts.writableGitDir !== undefined ? ["--add-dir", opts.writableGitDir] : []),
+    "--model",
+    config.substrates.codex.model,
+    "-c",
+    `model_reasoning_effort="${config.substrates.codex.reasoningEffort}"`,
    ];
   case "pi":
    return ["pi", "-p", "--provider", config.substrates.pi.provider, "--model", config.substrates.pi.model];

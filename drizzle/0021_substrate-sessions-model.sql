@@ -1,0 +1,1 @@
+ALTER TABLE `substrate_sessions` ADD `model` text;

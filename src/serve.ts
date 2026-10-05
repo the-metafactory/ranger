@@ -23,6 +23,17 @@ import { lastImplementMaps, mapKey, implementMapOrder } from "./maps.ts";
  * iTerm2's own environment rather than this process's — that is how a
  * launched app's window works, and it is not tested here.
  *
+ * **"Needs you" actions run outside this process (node #54).** The parked,
+ * failed and needs-eye rows (`serve-parked.ts`) carry buttons, and each one
+ * only spawns an existing CLI verb (`ranger resume-node`), `gh pr merge` with
+ * no machine-account token or gh config in its environment (gh uses the login
+ * stored under HOME; which account that is goes unchecked), or
+ * the iTerm2 launch above. The process itself still writes nothing: the
+ * journal stays read-only here and no graph write is imported. Each action is
+ * guarded like the launch — Host, Origin, page token, a numeric id — and the
+ * id must name a row the journal holds in the action's state when the request
+ * is read.
+ *
  * **Build now (node #58) is the principal's own CLI verb, run for them.** The
  * button spawns `~/bin/ranger build-now <id> --map <repo#root> --force` with
  * the same allowlisted environment (the wrapper injects the machine account's
@@ -31,6 +42,7 @@ import { lastImplementMaps, mapKey, implementMapOrder } from "./maps.ts";
  * the verb's, in its own process: this module still imports none.
  */
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { resolve, sep } from "node:path";
 import {
@@ -49,17 +61,22 @@ import { cachedFrontier } from "./frontier-cache.ts";
 import { type FrontierEntry, graphFrontier, RateLimitError } from "./graph.ts";
 import { runCmd } from "./exec.ts";
 import { classify, classifyFrontier, type ClassifiedNode, loadProbeRegistry } from "./route.ts";
-import type { SubstrateReading } from "./journal.ts";
+import { liveSession, substrateUsageViews, type SubstrateUsageView } from "./substrate-usage.ts";
+import { assertReadOnlyToken, gatedEnv, tokenBatch, type TokenBatch } from "./token-gate.ts";
+import { childEnv, itermArgv, shellQuote } from "./launch.ts";
 import {
- activeCappedUntil,
- effectiveThreshold,
- isCappedAt,
- isEligible,
- isFresh,
- readingAgeMin,
- type SubstrateConfig,
-} from "./substrate-policy.ts";
-import { assertReadOnlyToken, gatedEnv } from "./token-gate.ts";
+ type ActionKind,
+ type ActionRunner,
+ checkRunsFromPages,
+ ciState,
+ needsYouEntries,
+ type NeedsYouEntry,
+ type PrView,
+ runAction,
+ uncheckedNeedsEye,
+} from "./serve-parked.ts";
+
+export { childEnv };
 
 const ID_PATTERN = /^\d+$/;
 
@@ -166,8 +183,19 @@ export interface StateInputs {
  refreshing: boolean;
  refreshError: string | null;
  now: Date;
- /** Latest substrate quota readings, as the panel shows them (node #45). */
- substrates?: SubstrateView[];
+ /** Every substrate's limits and sessions, as the panel shows them (node #56). */
+ substrates?: SubstrateUsageView[];
+ /** Parked, failed and needs-eye rows (node #54). */
+ needsYou?: NeedsYouEntry[];
+ /** Awaiting-merge rows whose labels are not known yet, with the read's error. */
+ needsYouUnchecked?: UncheckedRow[];
+}
+
+/** An awaiting-merge row that may need the principal's eye; its labels are unknown. */
+export interface UncheckedRow {
+ key: string;
+ /** The last failed read of its labels; null while it is only unread. */
+ error: string | null;
 }
 
 export interface CurrentJob {
@@ -226,53 +254,6 @@ export interface DashboardMap {
  grillings: GrillingView[];
 }
 
-/**
- * A substrate's latest quota reading, as the panel shows it (node #45): the
- * cap and eligibility state are derived here with the selector's own rules,
- * so the dashboard never re-derives them and the storage row stays private.
- */
-export interface SubstrateView {
- substrate: SubstrateReading["substrate"];
- fiveHourUsedPct: number | null;
- sevenDayUsedPct: number | null;
- fiveHourThreshold: number | null;
- sevenDayThreshold: number | null;
- /** ISO: the earliest reported window reset. */
- resetsAt: string | null;
- readAt: string;
- /** Minutes since the reading. */
- ageMin: number;
- /** Within its max age: a stale reading is ineligible (fail closed). */
- fresh: boolean;
- /** Capped now (by status or a future capped-until). */
- capped: boolean;
- /** ISO, only while still in the future. */
- cappedUntil: string | null;
- /** Selectable for the next session right now. */
- eligible: boolean;
-}
-
-export function substrateViews(
- readings: SubstrateReading[],
- config: SubstrateConfig,
- now: Date,
-): SubstrateView[] {
- return readings.map((r) => ({
-  substrate: r.substrate,
-  fiveHourUsedPct: r.fiveHourUsedPct,
-  sevenDayUsedPct: r.sevenDayUsedPct,
-  fiveHourThreshold: r.fiveHourUsedPct === null ? null : effectiveThreshold("five_hour", r, now, config),
-  sevenDayThreshold: r.sevenDayUsedPct === null ? null : effectiveThreshold("seven_day", r, now, config),
-  resetsAt: r.resetsAt,
-  readAt: r.readAt,
-  ageMin: readingAgeMin(r, now),
-  fresh: isFresh(r, config, now),
-  capped: isCappedAt(r, now),
-  cappedUntil: activeCappedUntil(r, now),
-  eligible: isEligible(r, config, now) !== null,
- }));
-}
-
 export interface DashboardState {
  generatedAt: string;
  refreshing: boolean;
@@ -285,7 +266,9 @@ export interface DashboardState {
  };
  current: CurrentJob[];
  maps: DashboardMap[];
- substrates: SubstrateView[];
+ substrates: SubstrateUsageView[];
+ needsYou: NeedsYouEntry[];
+ needsYouUnchecked: UncheckedRow[];
 }
 
 const IN_FLIGHT = new Set<WorkerRow["status"]>(["claimed", "running", "awaiting-merge"]);
@@ -468,41 +451,12 @@ export function assembleState(inputs: StateInputs): DashboardState {
   current,
   maps,
   substrates: inputs.substrates ?? [],
+  needsYou: inputs.needsYou ?? [],
+  needsYouUnchecked: inputs.needsYouUnchecked ?? [],
  };
 }
 
 // ---- the launch ----
-
-/** Environment keys a launched session may inherit — an allowlist, never a denylist. */
-const CHILD_ENV_KEYS = [
- "PATH",
- "HOME",
- "USER",
- "LOGNAME",
- "SHELL",
- "LANG",
- "LC_ALL",
- "LC_CTYPE",
- "TMPDIR",
-] as const;
-
-export function childEnv(
- env: Record<string, string | undefined>,
-): Record<string, string> {
- const out: Record<string, string> = {};
- for (const key of CHILD_ENV_KEYS) {
-  const value = env[key];
-  if (value !== undefined) out[key] = value;
- }
- return out;
-}
-
-/** POSIX single-quote a string for a shell. */
-const shellQuote = (s: string): string => `'${s.replaceAll("'", `'\\''`)}'`;
-
-/** Escape a string for an AppleScript string literal. */
-const appleQuote = (s: string): string =>
- `"${s.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
 
 export interface LaunchPlan {
  prompt: string;
@@ -529,14 +483,7 @@ export function launchPlan(args: {
   `Read it with \`soma graph node ${args.nodeId} --repo ${args.repo}\`, ` +
   `then work it with the grilling skill.`;
  const shellCommand = `cd ${shellQuote(args.cwd)} && claude ${shellQuote(prompt)}`;
- const script = [
-  'tell application "iTerm2"',
-  " set w to (create window with default profile)",
-  ` tell current session of w to write text ${appleQuote(shellCommand)}`,
-  " activate",
-  "end tell",
- ].join("\n");
- return { prompt, shellCommand, argv: ["osascript", "-e", script] };
+ return { prompt, shellCommand, argv: itermArgv(shellCommand) };
 }
 
 /** The token-injecting wrapper every scheduled ranger run goes through (node #11). */
@@ -632,11 +579,34 @@ export interface HandlerContext {
   * reason it is not.
   */
  verifyGrilling: (map: DashboardMap, nodeId: string) => Promise<string | null>;
- /** The `build-now --force` argv for a node (node #58). */
- buildNowCommand: (map: DashboardMap, nodeId: string) => string[];
- /** Run a verb and wait for its exit code and output tail. */
- runVerb: (argv: string[], env: Record<string, string>) => Promise<VerbRun>;
+ /** Build now (node #58); unset refuses it. */
+ buildNow?: {
+  /** The `build-now --force` argv for a node; null when serve has no config path to run it with. */
+  command: (map: DashboardMap, nodeId: string) => string[] | null;
+  /** Run a verb and wait for its exit code and output tail. */
+  runVerb: (argv: string[], env: Record<string, string>) => Promise<VerbRun>;
+ };
+ /** The "Needs you" actions (node #54); unset refuses them. */
+ actions?: {
+  run: ActionRunner;
+  /** The environment the children are built from (default: this process's). */
+  env?: Record<string, string | undefined>;
+  /** `~/bin/ranger`, expanded. */
+  rangerBin: string;
+  /** The ranger.yaml serve was started with; `resume-node` gets the same one. */
+  configPath?: string;
+  readPr: (repo: string, pr: number) => Promise<PrView | null>;
+  exists: (path: string) => boolean;
+  /** Called after an action ran, to re-read what it changed. */
+  after?: (entry: NeedsYouEntry) => void;
+ };
 }
+
+const ACTION_PATHS: Record<string, ActionKind> = {
+ "/api/resume": "resume",
+ "/api/merge": "merge",
+ "/api/session": "session",
+};
 
 const json = (status: number, body: unknown): Response =>
  new Response(JSON.stringify(body), {
@@ -645,6 +615,16 @@ const json = (status: number, body: unknown): Response =>
  });
 
 const refuse = (status: number, error: string): Response => json(status, { error });
+
+/** A POST body that parses to a JSON object; null for anything else (`null`, an array, a number, bad JSON). */
+async function readObject(req: Request): Promise<Record<string, unknown> | null> {
+ try {
+  const body: unknown = await req.json();
+  return typeof body === "object" && body !== null && !Array.isArray(body) ? (body as Record<string, unknown>) : null;
+ } catch {
+  return null;
+ }
+}
 
 function tokenMatches(given: string | null, token: string): boolean {
  if (given === null) return false;
@@ -655,6 +635,7 @@ function tokenMatches(given: string | null, token: string): boolean {
 
 export function createHandler(ctx: HandlerContext): (req: Request) => Promise<Response> {
  const hosts = [`127.0.0.1:${ctx.port}`, `localhost:${ctx.port}`];
+ const inFlight = new Set<string>();
  const origins = hosts.map((h) => `http://${h}`);
  return async (req: Request): Promise<Response> => {
   const url = new URL(req.url);
@@ -688,16 +669,31 @@ export function createHandler(ctx: HandlerContext): (req: Request) => Promise<Re
    ctx.refresh();
    return json(202, { refreshing: true });
   }
+  const action = ACTION_PATHS[url.pathname];
+  if (action !== undefined) {
+   if (ctx.actions === undefined) return refuse(501, "actions are not wired in this server");
+   const body = await readObject(req);
+   if (body === null) return refuse(400, "body is not a JSON object");
+   const actions = ctx.actions;
+   const result = await runAction(action, body, {
+    entries: ctx.getState().needsYou,
+    run: actions.run,
+    env: actions.env ?? process.env,
+    rangerBin: actions.rangerBin,
+    configPath: actions.configPath,
+    readPr: actions.readPr,
+    exists: actions.exists,
+    inFlight,
+   });
+   if (result.entry !== undefined) actions.after?.(result.entry);
+   return json(result.status, result.body);
+  }
   if (url.pathname !== "/api/grill" && url.pathname !== "/api/build-now") {
    return refuse(404, "not found");
   }
 
-  let body: { key?: unknown; id?: unknown; dryRun?: unknown };
-  try {
-   body = (await req.json()) as typeof body;
-  } catch {
-   return refuse(400, "body is not JSON");
-  }
+  const body: { key?: unknown; id?: unknown; dryRun?: unknown } | null = await readObject(req);
+  if (body === null) return refuse(400, "body is not a JSON object");
   if (typeof body.key !== "string" || typeof body.id !== "string") {
    return refuse(400, "key and id are required strings");
   }
@@ -712,9 +708,11 @@ export function createHandler(ctx: HandlerContext): (req: Request) => Promise<Re
    if (node === undefined) {
     return refuse(404, `#${body.id} is not walkable on ${map.key}'s frontier`);
    }
-   const argv = ctx.buildNowCommand(map, node.id);
+   if (ctx.buildNow === undefined) return refuse(501, "build now is not wired in this server");
+   const argv = ctx.buildNow.command(map, node.id);
+   if (argv === null) return refuse(409, "serve was started without a config path to build with");
    if (body.dryRun === true) return json(200, { dryRun: true, argv });
-   const run = await ctx.runVerb(argv, childEnv(process.env));
+   const run = await ctx.buildNow.runVerb(argv, childEnv(process.env));
    return json(200, { nodeId: node.id, exitCode: run.code, tail: run.tail });
   }
   const grilling = map.grillings.find((g) => g.id === body.id);
@@ -779,6 +777,17 @@ button:disabled { opacity:.45; cursor:default; }
 #msg.err { color:var(--warn); }
 #out { margin:4px 20px 0; padding:8px 10px; font:12px/1.4 ui-monospace, Menlo, monospace; white-space:pre-wrap; overflow-wrap:anywhere; background:var(--card); border:1px solid var(--line); border-radius:6px; }
 #out:empty { display:none; }
+#needs { grid-column:1 / -1; }
+.card { border-top:1px solid var(--line); padding:8px 0; }
+.card:first-child { border-top:0; }
+.card .facts { color:var(--muted); font-size:12px; }
+.card .acts { display:flex; flex-wrap:wrap; gap:6px; align-items:center; margin-top:6px; }
+.card label { font-size:12px; color:var(--muted); }
+.card pre { margin:6px 0 0; padding:6px 8px; font-size:11px; white-space:pre-wrap; overflow-wrap:anywhere; border:1px solid var(--line); border-radius:6px; }
+.card pre.err { color:var(--warn); border-color:var(--warn); }
+.line { display:block; font-size:12px; }
+.muted { opacity:.5; }
+.warn { color:var(--warn); }
 </style>
 </head>
 <body>
@@ -790,6 +799,7 @@ button:disabled { opacity:.45; cursor:default; }
 <section><h2>Substrates</h2><div id="substrates"></div></section>
 <section><h2>Next in queue</h2><div id="next"></div></section>
 <section><h2>Autonomous — ranger can take these</h2><div id="auto"></div></section>
+<section id="needs"><h2>Needs you</h2><div id="needsyou"></div></section>
 <section><h2>Open grillings</h2><div id="grill"></div></section>
 </main>
 <script>
@@ -797,9 +807,12 @@ const TOKEN = document.querySelector('meta[name="ranger-token"]').content;
 const el = (tag, props = {}, ...kids) => { const n = document.createElement(tag); for (const [k, v] of Object.entries(props)) { if (k === "class") n.className = v; else if (k === "text") n.textContent = v; else n[k] = v; } for (const c of kids) if (c) n.append(c); return n; };
 const link = (url, text) => el("a", { href: url, target: "_blank", rel: "noopener", text });
 const empty = (text) => el("p", { class: "empty", text });
-const ago = (iso) => { if (!iso) return "never"; const s = Math.round((Date.now() - Date.parse(iso)) / 1000); return s < 90 ? s + " s ago" : Math.round(s / 60) + " min ago"; };
+const ago = (iso) => { if (!iso) return "never"; const s = Math.round((Date.now() - Date.parse(iso)) / 1000); const m = Math.round(s / 60); return s < 90 ? s + " s ago" : m < 90 ? m + " min ago" : m < 2880 ? Math.round(m / 60) + " h ago" : Math.round(m / 1440) + " d ago"; };
+// The page token rotates when serve restarts: a refused one means this page is stale.
+const REFUSED = "token refused";
+const RELOAD = "the dashboard restarted and this page's token is stale: reload the page";
 function say(text, err) { const m = document.getElementById("msg"); m.textContent = text; m.className = err ? "err" : ""; }
-async function post(path, body) { const r = await fetch(path, { method: "POST", headers: { "content-type": "application/json", "x-ranger-token": TOKEN }, body: JSON.stringify(body || {}) }); const j = await r.json().catch(() => ({})); if (!r.ok) throw new Error(j.error || r.statusText); return j; }
+async function post(path, body) { const r = await fetch(path, { method: "POST", headers: { "content-type": "application/json", "x-ranger-token": TOKEN }, body: JSON.stringify(body || {}) }); const j = await r.json().catch(() => ({})); if (!r.ok) throw new Error(j.error === REFUSED ? RELOAD : (j.error || r.statusText)); return j; }
 const unavailable = (m, none) => empty(m.ok ? none : "Frontier unavailable: " + (m.error || "not read yet"));
 const mapHead = (m, extra) => el("h3", { text: m.repo + " · map #" + m.root + (extra || "") + " · read " + ago(m.readAt) + (m.source === "ranger" ? " by ranger" : " by this dashboard") });
 function renderMeta(s) {
@@ -881,21 +894,124 @@ function renderGrill(s) {
   box.append(el("ul", {}, ...m.grillings.map((g) => el("li", {}, el("span", { class: "id", text: "#" + g.id }), el("span", { class: "t" }, link(g.url, g.title)), grillButton(m, g)))));
  }
 }
+const short = (sha) => (sha || "").slice(0, 8);
+function prLifecycle(v) {
+ if (v.merged) return "merged";
+ if (v.state === "closed") return "closed";
+ return v.draft ? "draft" : "ready";
+}
+function prFacts(pr) {
+ const v = pr.view;
+ const parts = ["PR #" + pr.number];
+ if (v) parts.push(prLifecycle(v), "head " + short(v.headSha), ...(v.ci === "not-read" ? [] : ["CI " + v.ci]));
+ if (pr.error) parts.push(v ? "stale, read " + ago(v.readAt) + "; the last refresh failed: " + pr.error : "the read failed: " + pr.error);
+ else if (!v) parts.push("not read yet");
+ return parts.join(" · ");
+}
+function needsFacts(n) {
+ const facts = [n.repo + " · map #" + n.root, n.status, "ended " + ago(n.endedAt)];
+ if (n.pr) facts.push(prFacts(n.pr));
+ if (n.sage) facts.push("sage round " + n.sage.round + (n.sageOnHead === false ? " (an earlier head, " + short(n.sage.sha) + "; the current head is unreviewed)" : "") + ": " + n.sage.blockers + " blocker(s), " + n.sage.majors + " major(s)");
+ if (n.probe) facts.push("probes " + (n.probe.passed ? "passed" : "FAILED") + " at " + short(n.probe.sha));
+ return facts.join(" · ");
+}
+function actionButton(text, title, enabled, run) {
+ const b = el("button", { text, title, disabled: !enabled });
+ b.onclick = async () => { b.disabled = true; try { await run(); } finally { setTimeout(() => (b.disabled = !enabled), 3000); } };
+ return b;
+}
+// The last result per card survives the re-render that follows every action.
+const results = new Map();
+const forced = new Set();
+async function act(kind, n, extra) {
+ const id = n.key + "/" + n.nodeId;
+ try {
+  const r = await post("/api/" + kind, Object.assign({ key: n.key, id: n.nodeId }, extra));
+  results.set(id, { err: !r.ok, text: kind + " #" + n.nodeId + ": exit " + (r.code === null ? "none" : r.code) + (r.stderr ? "\\n" + r.stderr : "") });
+  say(kind + " #" + n.nodeId + (r.ok ? " ran." : " failed: see its card."), !r.ok);
+ } catch (e) { results.set(id, { err: true, text: kind + " #" + n.nodeId + " refused: " + e.message }); say(e.message, true); }
+ load(); setTimeout(load, 3000);
+}
+function needsCard(n) {
+ const id = n.key + "/" + n.nodeId;
+ const force = el("input", { type: "checkbox", checked: forced.has(id) });
+ force.onchange = () => { if (force.checked) forced.add(id); else forced.delete(id); };
+ const acts = el("div", { class: "acts" });
+ if (n.actions.resume) {
+  acts.append(actionButton("Resume", "ranger resume-node " + n.nodeId + " --map " + n.key, true, () => act("resume", n, { force: force.checked })));
+  acts.append(el("label", {}, force, document.createTextNode(" run beside the lane holder")));
+ }
+ const merge = n.actions.merge;
+ acts.append(actionButton("Merge", merge.offered ? "gh pr merge --squash, pinned to " + short(merge.headSha) + ", under gh's configured login (machine-account tokens stripped; the account is not checked)" : merge.why, merge.offered, async () => {
+  if (!confirm("Squash-merge PR #" + n.pr.number + " on " + n.repo + " at head " + merge.headSha + "?\\n\\nIt runs under gh's configured login: the machine account's GH_TOKEN, GITHUB_TOKEN and GH_CONFIG_DIR are stripped, but the account itself is not checked. " + (n.status === "failed" ? "The merge desk watches only parked and awaiting-merge rows, so Resume it afterwards to run the close." : "On its next tick the merge desk starts the close; check that the node closed (a failed spawn or a refused close leaves it open)."))) return;
+  await act("merge", n, { sha: merge.headSha });
+ }));
+ const session = n.actions.session;
+ acts.append(actionButton("Open session", session.offered ? "Open iTerm2 in " + session.cwd + " and start claude on #" + n.nodeId : session.why, session.offered, () => act("session", n, {})));
+ if (n.pr) acts.append(link(n.pr.url, "Open PR"));
+ const last = results.get(id);
+ return el("div", { class: "card" },
+  el("div", {}, el("span", { class: "id", text: "#" + n.nodeId + " " }), link(n.url, n.title || "(title not read yet)"), document.createTextNode(" "), el("span", { class: "tag stale", text: n.reason.class })),
+  el("div", { class: "facts", text: needsFacts(n) }),
+  el("div", { class: "reason", text: n.reason.detail }),
+  acts,
+  last ? el("pre", { class: last.err ? "err" : "", text: last.text }) : null);
+}
+function renderNeeds(s) {
+ const box = document.getElementById("needsyou");
+ box.replaceChildren();
+ const unchecked = s.needsYouUnchecked || [];
+ if (unchecked.length > 0) {
+  const errs = unchecked.filter((u) => u.error).map((u) => u.key + ": " + u.error);
+  box.append(el("div", { class: "reason", text: unchecked.length + " awaiting-merge row(s) not yet checked for needs-eye (" + unchecked.map((u) => u.key).join(", ") + "): " + (errs.length > 0 ? "the label read failed — " + errs.join("; ") : "labels not read yet") }));
+ }
+ if (!s.needsYou || s.needsYou.length === 0) {
+  if (unchecked.length === 0) box.append(empty("Nothing is parked, failed or waiting on a needs-eye merge."));
+  return;
+ }
+ box.append(...s.needsYou.map(needsCard));
+}
+const KINDS = [["worker", "worker"], ["fix-pass", "fix pass"], ["review", "review"]];
+const span = (text, cls) => el("span", { class: "line" + (cls ? " " + cls : ""), text });
+const until = (min) => min === null ? "" : min === 0 ? " (reset reached)" : " (in " + (min >= 1440 ? (min / 1440).toFixed(1) + " d" : min >= 60 ? Math.floor(min / 60) + " h " + (min % 60) + " min" : min + " min") + ")";
+const at = (iso) => new Date(iso).toLocaleString();
+function quotaWindow(label, w) {
+ if (!w) return label + ": not reported";
+ return label + ": " + w.usedPct + "% used, threshold " + w.threshold.toFixed(1) + "% \u00B7 " + (w.resetsAt ? "resets " + at(w.resetsAt) + until(w.resetInMin) : "reset unknown");
+}
+function sessionCounts(label, c) {
+ const kinds = KINDS.map(([k, name]) => {
+  const n = c[k]; const bad = ["failed", "capped", "transient"].filter((o) => n[o] > 0).map((o) => n[o] + " " + o);
+  return n.sessions + " " + name + (bad.length ? " (" + bad.join(", ") + ")" : "");
+ });
+ return label + ": " + kinds.join(" \u00B7 ");
+}
 function renderSubstrates(s) {
  const box = document.getElementById("substrates"); box.replaceChildren();
- if (!s.substrates || s.substrates.length === 0) { box.append(empty("No substrate readings yet.")); return; }
+ if (!s.substrates || s.substrates.length === 0) { box.append(empty("No substrates.")); return; }
  box.append(el("ul", {}, ...s.substrates.map((sub) => {
-  const parts = [sub.substrate.toUpperCase()];
-  if (sub.fiveHourUsedPct !== null) parts.push("5h: " + sub.fiveHourUsedPct + "% < " + sub.fiveHourThreshold.toFixed(1) + "%");
-  if (sub.sevenDayUsedPct !== null) parts.push("7d: " + sub.sevenDayUsedPct + "% < " + sub.sevenDayThreshold.toFixed(1) + "%");
-  if (sub.resetsAt) parts.push("resets " + new Date(sub.resetsAt).toLocaleString());
-  parts.push("read " + sub.ageMin + "m ago" + (sub.fresh ? "" : " (stale)"));
-  if (sub.capped) parts.push("CAPPED until " + (sub.cappedUntil ? new Date(sub.cappedUntil).toLocaleString() : "next reading"));
-  const state = sub.capped ? "capped" : sub.eligible ? "eligible" : "ineligible";
-  return el("li", {}, el("span", { class: "t", text: parts.join(" · ") }), el("span", { class: sub.eligible ? "tag" : "tag stale", text: state }));
+  const lines = [];
+  if (sub.quota === "none") lines.push(span("no quota (always eligible)"));
+  else if (sub.quota === "unread") lines.push(span("no reading: treated as capped", "warn"));
+  else {
+   const grey = sub.fresh ? "" : "muted";
+   lines.push(span(quotaWindow("5h", sub.fiveHour), grey), span(quotaWindow("7d", sub.sevenDay), grey));
+   lines.push(span("read " + sub.ageMin + " min ago (max " + sub.maxAgeMin + " min)" + (sub.cappedUntil ? " \u00B7 capped until " + at(sub.cappedUntil) : sub.capped ? " \u00B7 capped until the next reading" : ""), grey));
+  }
+  lines.push(span("eligible now: " + sub.eligible.state + " \u00B7 " + sub.eligible.reason));
+  if (!sub.sessions) lines.push(span("sessions: no session history to read", "muted"));
+  else {
+   const running = KINDS.filter(([k]) => sub.sessions.running[k] > 0).map(([k, name]) => sub.sessions.running[k] + " " + name);
+   lines.push(span("running now: " + (running.length ? running.join(" \u00B7 ") : "none")));
+   lines.push(span(sessionCounts("last 24 h", sub.sessions.day)), span(sessionCounts("last 7 d", sub.sessions.week)));
+  }
+  const last = sub.lastSession;
+  if (sub.sessions) lines.push(span(last ? "last: #" + last.nodeId + " (" + last.repo + ") " + KINDS.find(([k]) => k === last.kind)[1] + ", started " + ago(last.startedAt) + (last.endedAt ? ", " + (last.outcome || "ended") : ", open") : "last: no session yet"));
+  const tag = sub.eligible.state === "yes" ? "eligible" : sub.eligible.state === "stale" ? "stale" : "ineligible";
+  return el("li", {}, el("span", { class: "t" }, el("strong", { text: sub.substrate.toUpperCase() }), ...lines), el("span", { class: sub.eligible.state === "no" ? "tag stale" : "tag", text: tag }));
  })));
 }
-function render(s) { renderMeta(s); renderCurrent(s); renderSubstrates(s); renderNext(s); renderAuto(s); renderGrill(s); }
+function render(s) { renderMeta(s); renderCurrent(s); renderSubstrates(s); renderNext(s); renderAuto(s); renderNeeds(s); renderGrill(s); }
 async function load() { try { const r = await fetch("/api/state", { cache: "no-store" }); render(await r.json()); } catch (e) { say("Could not read state: " + e.message, true); } }
 document.getElementById("refresh").onclick = async () => { try { await post("/api/refresh"); say("Refreshing the frontier…"); setTimeout(load, 1500); } catch (e) { say(e.message, true); } };
 load(); setInterval(load, 15000);
@@ -919,7 +1035,10 @@ load(); setInterval(load, 15000);
  *   token and `/rate_limit` (free) shows the allowance above
  *   `budget.graphqlFloor`; a refusal backs off in memory, doubling to an hour;
  * - the titles of in-flight nodes and the launch check use REST
- *   (`/repos/{repo}/issues/{id}`), a separate bucket from GraphQL.
+ *   (`/repos/{repo}/issues/{id}`), a separate bucket from GraphQL;
+ * - the "Needs you" issues and PRs (node #54) are REST too, read on every
+ *   refresh whatever the frontier's backoff, with the read-only gate run once
+ *   per repo per batch (`tokenBatch`).
  */
 export class ServeReader {
  extra = new Map<string, MapRead>();
@@ -929,12 +1048,136 @@ export class ServeReader {
  private backoffUntil = 0;
  private strikes = 0;
  private wantedTitles = new Set<string>();
+ /** "Needs you" details (node #54): issue labels by `repo#id`, PRs by `repo#pr`. */
+ labels = new Map<string, string[]>();
+ prs = new Map<string, PrView>();
+ /**
+  * Failed detail reads by key (`issue:repo#id`, `pr:repo#n`), kept apart from
+  * the frontier's `lastError`; a key's entry goes when its read succeeds.
+  */
+ detailErrors = new Map<string, string>();
+ private detailIssues = new Set<string>();
+ private detailPrs = new Set<string>();
+ /** Keys tried since they were last wanted fresh: a failed read waits for the timer. */
+ private detailTried = new Set<string>();
+ private detailing: Promise<void> | null = null;
+ private readonly details: DetailReader;
 
  constructor(
   private readonly config: RangerConfig,
   private readonly maps: ServeMap[],
   private readonly journalPath: string,
- ) {}
+  details?: DetailReader,
+ ) {
+  this.details = details ?? {
+   issue: (repo, id, tokens) => readIssue(config, repo, id, tokens),
+   pr: (repo, n, tokens) => readPrLive(config, repo, n, tokens),
+  };
+ }
+
+ /**
+  * The issues and PRs the "Needs you" rows show. Read by `refreshDetails`,
+  * never from a state read: the dashboard spends REST on the refresh timer,
+  * once for a row it has not tried yet, and after an action.
+  */
+ wantDetails(issues: string[], prs: string[]): void {
+  this.detailIssues = new Set(issues);
+  this.detailPrs = new Set(prs);
+  // Drop what no row wants any more, so the caches hold today's candidates,
+  // not every node the dashboard has ever shown.
+  for (const key of this.labels.keys()) if (!this.detailIssues.has(key)) this.labels.delete(key);
+  for (const key of this.prs.keys()) if (!this.detailPrs.has(key)) this.prs.delete(key);
+  for (const set of [this.detailErrors, this.detailTried]) {
+   for (const key of set.keys()) if (!this.wantedDetail(key)) set.delete(key);
+  }
+ }
+
+ private wantedDetail(key: string): boolean {
+  if (key.startsWith("issue:")) return this.detailIssues.has(key.slice("issue:".length));
+  if (key.startsWith("pr:")) return this.detailPrs.has(key.slice("pr:".length));
+  return false;
+ }
+
+ private unread(): { issues: string[]; prs: string[] } {
+  return {
+   issues: [...this.detailIssues].filter((k) => !this.labels.has(k) && !this.detailTried.has(`issue:${k}`)),
+   prs: [...this.detailPrs].filter((k) => !this.prs.has(k) && !this.detailTried.has(`pr:${k}`)),
+  };
+ }
+
+ /** A wanted issue or PR that has not been read, nor tried since it was wanted. */
+ hasUnreadDetails(): boolean {
+  const { issues, prs } = this.unread();
+  return issues.length + prs.length > 0;
+ }
+
+ /** Forget an entry's details, so the next read takes them fresh (after an action). */
+ forget(issue: string, pr: string | null): void {
+  this.labels.delete(issue);
+  this.detailTried.delete(`issue:${issue}`);
+  if (pr !== null) {
+   this.prs.delete(pr);
+   this.detailTried.delete(`pr:${pr}`);
+  }
+ }
+
+ /**
+  * Read the details: only the untried ones (`all: false`, on a state read or
+  * after an action), or every wanted one (the refresh timer). One read at a
+  * time; a failed key is not retried until the timer comes round.
+  */
+ refreshDetails(all = false): Promise<void> {
+  if (this.detailing !== null) return this.detailing;
+  this.detailing = this.readDetails(all).finally(() => {
+   this.detailing = null;
+  });
+  return this.detailing;
+ }
+
+ private async readDetails(all: boolean): Promise<void> {
+  const keys = all ? { issues: [...this.detailIssues], prs: [...this.detailPrs] } : this.unread();
+  // One gate per repo for the whole batch, not two REST calls before every read.
+  const tokens = tokenBatch(this.config);
+  const attempt = async (key: string, read: () => Promise<void>, unknown?: () => void): Promise<void> => {
+   this.detailTried.add(key);
+   try {
+    await read();
+    this.detailErrors.delete(key);
+   } catch (error) {
+    this.detailErrors.set(key, error instanceof Error ? error.message : String(error));
+    unknown?.();
+   }
+  };
+  // Issues and PRs are independent reads: one queue, a few at a time, so a
+  // slow issue does not hold every PR (nor the refresh an action waits on).
+  const jobs: (() => Promise<void>)[] = [
+   ...keys.issues.map((key) => () =>
+    attempt(`issue:${key}`, async () => {
+     const [repo, id] = key.split("#");
+     const issue = await this.details.issue(repo, id, tokens);
+     if (issue === null) throw new Error("could not read the issue");
+     this.labels.set(key, issue.labels);
+     this.titles.set(key, issue.title);
+    },
+    // A failed refresh leaves the labels unknown, not as last read: a label
+    // added since must not hide behind "nothing waits".
+    () => this.labels.delete(key)),
+   ),
+   ...keys.prs.map((key) => () =>
+    attempt(`pr:${key}`, async () => {
+     const [repo, n] = key.split("#");
+     const pr = await this.details.pr(repo, Number(n), tokens);
+     if (pr === null) throw new Error("could not read the PR");
+     this.prs.set(key, pr);
+    }),
+   ),
+  ];
+  let next = 0;
+  const worker = async (): Promise<void> => {
+   while (next < jobs.length) await jobs[next++]();
+  };
+  await Promise.all(Array.from({ length: Math.min(DETAIL_CONCURRENCY, jobs.length) }, worker));
+ }
 
  /** Ask for titles of nodes no frontier names; fetched on the next refresh. */
  want(keys: string[]): void {
@@ -942,6 +1185,10 @@ export class ServeReader {
  }
 
  refresh(): void {
+  // "Needs you" reads REST, apart from the frontier: a GraphQL backoff, a
+  // deferral or a failed frontier read must not leave labels unknown and PR
+  // reads stale until it clears.
+  void this.refreshDetails(true);
   if (this.refreshing) return;
   this.refreshing = true;
   this.run()
@@ -962,6 +1209,7 @@ export class ServeReader {
    throw new Error(`backing off GitHub until ${new Date(this.backoffUntil).toISOString()}`);
   }
   const registry = loadProbeRegistry();
+  const tokens = tokenBatch(this.config);
   for (const map of this.maps.filter((m) => m.servedOnly)) {
    const prev = this.extra.get(map.key);
    const keep = (error: string): void => {
@@ -973,7 +1221,7 @@ export class ServeReader {
      error,
     });
    };
-   const { token } = await assertReadOnlyToken(this.config, map.repo);
+   const token = await tokens(map.repo);
    const journal = Journal.openReadOnly(this.journalPath);
    const cooling = journal === null ? null : activeCooldown(journal, token.source, now);
    journal?.close();
@@ -1011,18 +1259,84 @@ export class ServeReader {
   }
   for (const key of [...this.wantedTitles]) {
    const [repo, id] = key.split("#");
-   const issue = await readIssue(this.config, repo, id);
+   const issue = await readIssue(this.config, repo, id, tokens);
    if (issue !== null) this.titles.set(key, issue.title);
    this.wantedTitles.delete(key);
   }
  }
 }
 
+/** How many "Needs you" REST reads run at once. */
+export const DETAIL_CONCURRENCY = 4;
+
+/** The REST reads behind "Needs you"; injected so no test runs `gh`. */
+export interface DetailReader {
+ issue: (repo: string, id: string, tokens: TokenBatch) => Promise<Pick<IssueRead, "title" | "labels"> | null>;
+ pr: (repo: string, pr: number, tokens: TokenBatch) => Promise<PrView | null>;
+}
+
 interface IssueRead {
  title: string;
  state: string;
  assignees: string[];
+ labels: string[];
  kind: string | null;
+}
+
+/** One `gh api` GET under the read-only gate; null on any failure. */
+async function restRead(tokens: TokenBatch, repo: string, path: string, flags: string[] = []): Promise<unknown> {
+ const token = await tokens(repo);
+ const gated = gatedEnv(token.token);
+ try {
+  const result = await runCmd("gh", ["api", path, ...flags], { env: gated.env, timeoutMs: 15_000 });
+  if (result.code !== 0) return null;
+  try {
+   return JSON.parse(result.stdout) as unknown;
+  } catch {
+   return null;
+  }
+ } finally {
+  gated.cleanup();
+ }
+}
+
+/**
+ * A PR and the CI state of its head, over REST under the read-only gate: run
+ * once for both reads, or once for a whole refresh batch when `tokens` is given.
+ */
+export async function readPrLive(
+ config: RangerConfig,
+ repo: string,
+ number: number,
+ tokens: TokenBatch = tokenBatch(config),
+): Promise<PrView | null> {
+ if (!REPO_PATTERN.test(repo) || !Number.isInteger(number) || number <= 0) return null;
+ const raw = (await restRead(tokens, repo, `repos/${repo}/pulls/${number}`)) as Record<string, unknown> | null;
+ if (raw === null) return null;
+ const head = (raw.head ?? {}) as { sha?: unknown };
+ const headSha = typeof head.sha === "string" ? head.sha : "";
+ const terminal = raw.state === "closed" || raw.merged === true;
+ // Every page: a failure on page two must not read as green. A closed or
+ // merged PR offers no action its checks could gate, so they are not read.
+ const checks = !terminal && /^[0-9a-f]{40}$/.test(headSha)
+  ? checkRunsFromPages(
+     await restRead(tokens, repo, `repos/${repo}/commits/${headSha}/check-runs?filter=latest&per_page=100`, [
+      "--paginate",
+      "--slurp",
+     ]),
+    )
+  : null;
+ return {
+  number,
+  url: typeof raw.html_url === "string" ? raw.html_url : `https://github.com/${repo}/pull/${number}`,
+  state: raw.state === "closed" ? "closed" : "open",
+  merged: raw.merged === true,
+  draft: raw.draft === true,
+  headSha,
+  mergeable: typeof raw.mergeable === "boolean" ? raw.mergeable : null,
+  ci: terminal ? "not-read" : checks === null ? "unreadable" : ciState(checks),
+  readAt: new Date().toISOString(),
+ };
 }
 
 /** One issue over REST under the read-only gate: no GraphQL. Null if unreadable. */
@@ -1030,42 +1344,35 @@ async function readIssue(
  config: RangerConfig,
  repo: string,
  id: string,
+ tokens: TokenBatch = tokenBatch(config),
 ): Promise<IssueRead | null> {
  if (!REPO_PATTERN.test(repo) || !ID_PATTERN.test(id)) return null;
- const { token } = await assertReadOnlyToken(config, repo);
- const gated = gatedEnv(token.token);
- try {
-  const result = await runCmd("gh", ["api", `repos/${repo}/issues/${id}`], {
-   env: gated.env,
-   timeoutMs: 15_000,
-  });
-  if (result.code !== 0) return null;
-  const raw = JSON.parse(result.stdout) as {
-   title?: string;
-   state?: string;
-   assignees?: { login?: string }[];
-   body?: string | null;
-  };
-  // The node's kind is in its typed block, which the verbs write (#89-style
-  // `soma:work-graph-node` JSON in an HTML comment).
-  const block = /<!--\s*soma:work-graph-node\s*([\s\S]*?)-->/.exec(raw.body ?? "")?.[1];
-  let kind: string | null = null;
-  if (block !== undefined) {
-   try {
-    kind = (JSON.parse(block) as { kind?: string }).kind ?? null;
-   } catch {
-    kind = null;
-   }
+ const raw = (await restRead(tokens, repo, `repos/${repo}/issues/${id}`)) as {
+  title?: string;
+  state?: string;
+  assignees?: { login?: string }[];
+  labels?: ({ name?: string } | string)[];
+  body?: string | null;
+ } | null;
+ if (raw === null || typeof raw !== "object") return null;
+ // The node's kind is in its typed block, which the verbs write (#89-style
+ // `soma:work-graph-node` JSON in an HTML comment).
+ const block = /<!--\s*soma:work-graph-node\s*([\s\S]*?)-->/.exec(raw.body ?? "")?.[1];
+ let kind: string | null = null;
+ if (block !== undefined) {
+  try {
+   kind = (JSON.parse(block) as { kind?: string }).kind ?? null;
+  } catch {
+   kind = null;
   }
-  return {
-   title: raw.title ?? "",
-   state: raw.state ?? "unknown",
-   assignees: (raw.assignees ?? []).map((a) => a.login ?? "").filter(Boolean),
-   kind,
-  };
- } finally {
-  gated.cleanup();
  }
+ return {
+  title: raw.title ?? "",
+  state: raw.state ?? "unknown",
+  assignees: (raw.assignees ?? []).map((a) => a.login ?? "").filter(Boolean),
+  labels: (raw.labels ?? []).map((l) => (typeof l === "string" ? l : (l.name ?? ""))).filter(Boolean),
+  kind,
+ };
 }
 
 export function stateFromJournal(
@@ -1112,11 +1419,48 @@ export function stateFromJournal(
    );
   }
   const vetoed = journal?.listVetoes() ?? new Set<string>();
+  const workers = journal?.listWorkers() ?? [];
+  const needsYou = needsYouEntries({
+   maps,
+   workers,
+   events: (repo, nodeId) => journal?.listNodeEvents(repo, nodeId) ?? [],
+   labels: (repo, nodeId) => reader.labels.get(`${repo}#${nodeId}`) ?? null,
+   prs: (repo, pr) => reader.prs.get(`${repo}#${pr}`) ?? null,
+   prError: (repo, pr) => reader.detailErrors.get(`pr:${repo}#${pr}`) ?? null,
+   titleOf: (repo, nodeId) => {
+    for (const map of maps) {
+     if (map.repo !== repo) continue;
+     const hit = reports.get(map.key)?.frontier.find((n) => n.id === nodeId)?.title;
+     if (hit !== undefined) return hit;
+    }
+    return reader.titles.get(`${repo}#${nodeId}`) ?? null;
+   },
+   reviewRounds: config.workers.reviewRounds,
+   exists: existsSync,
+  });
+  const needsYouUnchecked = uncheckedNeedsEye({
+   maps,
+   workers,
+   labels: (repo, nodeId) => reader.labels.get(`${repo}#${nodeId}`) ?? null,
+  }).map((key) => ({ key, error: reader.detailErrors.get(`issue:${key}`) ?? null }));
+  // Details for every row that may need the principal: an awaiting-merge row
+  // shows only once its labels say needs-eye.
+  const candidates = workers.filter(
+   (w) =>
+    (w.status === "parked" || w.status === "failed" || w.status === "awaiting-merge") &&
+    maps.some((m) => m.repo === w.repo && m.root === w.root),
+  );
+  reader.wantDetails(
+   candidates.map((w) => `${w.repo}#${w.nodeId}`),
+   candidates.filter((w) => w.prNumber !== null).map((w) => `${w.repo}#${w.prNumber}`),
+  );
   const state = assembleState({
    maps,
    reports,
    titles: reader.titles,
-   workers: journal?.listWorkers() ?? [],
+   workers,
+   needsYou,
+   needsYouUnchecked,
    lastImplementMaps: lastImplementMaps(journal),
    laneHolders: { visual: journal?.laneHolder("visual") ?? null, headless: journal?.laneHolder("headless") ?? null },
    paused: journal?.isPaused() ?? false,
@@ -1127,7 +1471,14 @@ export function stateFromJournal(
    refreshing: reader.refreshing,
    refreshError: reader.lastError,
    now,
-   substrates: substrateViews(journal?.listSubstrateReadings() ?? [], config.substrates, now),
+   substrates: substrateUsageViews({
+    readings: journal?.listSubstrateReadings() ?? [],
+    sessions: journal?.listSubstrateSessions(new Date(now.getTime() - 7 * 24 * 60 * 60_000)) ?? null,
+    lastSession: (substrate) => journal?.lastSubstrateSession(substrate) ?? null,
+    live: liveSession(workers, defaultPidAlive),
+    config: config.substrates,
+    now,
+   }),
   });
   reader.want(
    state.current.filter((j) => j.title === null).map((j) => `${j.repo}#${j.nodeId}`),
@@ -1156,10 +1507,52 @@ export async function verifyGrillingLive(
  }
 }
 
+/**
+ * Run an action's child and wait for its exit, keeping the tail of its
+ * stderr for the page. `resume-node` returns once it has detached run-node,
+ * so waiting on it is short; the child is detached all the same, so a serve
+ * restart never takes a resume down with it.
+ */
+export const spawnAction: ActionRunner = (argv, env, opts) =>
+ new Promise((done) => {
+  const [command, ...args] = argv;
+  let stderr = "";
+  let settled = false;
+  let markExited: () => void = () => {};
+  const exited = new Promise<void>((resolve) => {
+   markExited = resolve;
+  });
+  const settle = (code: number | null, extra = "") => {
+   if (settled) return;
+   settled = true;
+   clearTimeout(timer);
+   done({ code, stderr: (stderr + extra).slice(-4000), exited });
+  };
+  const child = spawn(command, args, { env, stdio: ["ignore", "ignore", "pipe"], detached: opts.detached });
+  // The page is answered at the timeout; the child is not killed (a resume
+  // cut mid-journal-write is worse than a slow one), and `exited` keeps the
+  // node held until it really ends.
+  const timer = setTimeout(() => settle(null, `\n(no exit after ${ACTION_TIMEOUT_MS / 1000} s; still running)`), ACTION_TIMEOUT_MS);
+  child.stderr?.on("data", (chunk: Buffer) => {
+   stderr = (stderr + chunk.toString()).slice(-4000);
+  });
+  child.on("error", (error) => {
+   settle(null, `could not start ${command}: ${error.message}`);
+   markExited();
+  });
+  child.on("close", (code) => {
+   settle(code);
+   markExited();
+  });
+  if (opts.detached) child.unref();
+ });
+
+const ACTION_TIMEOUT_MS = 120_000;
+
 export function startServe(opts: {
  config: RangerConfig;
- /** The ranger.yaml the Build now verb is run with. */
- configPath: string;
+ /** The ranger.yaml this was loaded from; `resume-node` and `build-now` are run with the same one. */
+ configPath?: string;
  port?: number;
  open?: boolean;
 }): { url: string; stop: () => void } {
@@ -1177,13 +1570,34 @@ export function startServe(opts: {
  const handler = createHandler({
   port,
   token,
-  getState: () => stateFromJournal(opts.config, maps, reader),
+  getState: () => {
+   const state = stateFromJournal(opts.config, maps, reader);
+   // A row that newly needs the principal gets its PR and labels read now,
+   // not on the next timer.
+   if (reader.hasUnreadDetails()) void reader.refreshDetails();
+   return state;
+  },
   refresh: () => reader.refresh(),
   launch: spawnLaunch,
   verifyGrilling: (map, nodeId) => verifyGrillingLive(opts.config, map, nodeId),
-  buildNowCommand: (map, nodeId) =>
-   buildNowArgv({ bin: expandHome(RANGER_BIN), key: map.key, nodeId, configPath: opts.configPath }),
-  runVerb: (argv, env) => runVerb(argv, env),
+  buildNow: {
+   command: (map, nodeId) =>
+    opts.configPath === undefined
+     ? null
+     : buildNowArgv({ bin: expandHome(RANGER_BIN), key: map.key, nodeId, configPath: opts.configPath }),
+   runVerb: (argv, env) => runVerb(argv, env),
+  },
+  actions: {
+   run: spawnAction,
+   rangerBin: expandHome("~/bin/ranger"),
+   configPath: opts.configPath,
+   readPr: (repo, pr) => readPrLive(opts.config, repo, pr),
+   exists: existsSync,
+   after: (entry) => {
+    reader.forget(`${entry.repo}#${entry.nodeId}`, entry.pr === null ? null : `${entry.repo}#${entry.pr.number}`);
+    void reader.refreshDetails();
+   },
+  },
  });
  const server = Bun.serve({
   hostname: "127.0.0.1",
