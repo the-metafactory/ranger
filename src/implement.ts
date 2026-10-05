@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createReadStream, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { availableParallelism, loadavg, tmpdir } from "node:os";
 import { join } from "node:path";
 import { DiscordAnnouncer } from "./announce.ts";
@@ -1383,6 +1383,7 @@ async function supervisorTests(
  const untouched = async (): Promise<boolean> =>
   (await headSha(worktree)) === head &&
   (await dirtyFiles(worktree)).length === 0 &&
+  ignoredBefore !== null &&
   (await ignoredPaths(worktree)) === ignoredBefore;
  let tests = await runShell(testCommand, worktree, ctx, TEST_TIMEOUT_MS);
  if (tests.code === 0) return { tests, log: null };
@@ -1416,31 +1417,42 @@ async function supervisorTests(
 }
 
 /**
- * The gitignored paths git lists in the worktree, as one string to compare
- * (null when git cannot say). An ignored file git lists on its own is
- * compared by its content too, so a rewritten fixture counts; an ignored
- * directory is listed, and compared, by its name alone.
+ * The gitignored paths git lists in the worktree, as one string to compare.
+ * An ignored file git lists on its own is compared by its content too, so a
+ * rewritten fixture counts; an ignored directory is listed, and compared, by
+ * its name alone. Paths are read NUL-delimited (`-z`), so git's quoting of
+ * unusual names never reaches the file read. Null when git cannot say or a
+ * listed file cannot be read: no comparison can then be trusted.
  */
 async function ignoredPaths(worktree: string): Promise<string | null> {
- const r = await safeGit(["status", "--porcelain", "--ignored=matching", "--untracked-files=all"], {
+ const r = await safeGit(["status", "--porcelain", "-z", "--ignored=matching", "--untracked-files=all"], {
   cwd: worktree,
   timeoutMs: 60_000,
  });
  if (r.code !== 0) return null;
  const entries: string[] = [];
- for (const line of r.stdout.split("\n").filter((l) => l.startsWith("!! ")).sort()) {
-  const path = line.slice(3);
+ for (const record of r.stdout.split("\0").filter((e) => e.startsWith("!! ")).sort()) {
+  const path = record.slice(3);
   if (path.endsWith("/")) {
    entries.push(path);
    continue;
   }
-  try {
-   entries.push(`${path} ${createHash("sha256").update(readFileSync(join(worktree, path))).digest("hex")}`);
-  } catch {
-   entries.push(`${path} (unreadable)`);
-  }
+  const digest = await fileDigest(join(worktree, path));
+  if (digest === null) return null;
+  entries.push(`${path}\0${digest}`);
  }
  return entries.join("\n");
+}
+
+/** A file's sha256, streamed in chunks; null when it cannot be read. */
+async function fileDigest(path: string): Promise<string | null> {
+ const hash = createHash("sha256");
+ try {
+  for await (const chunk of createReadStream(path)) hash.update(chunk as Buffer);
+ } catch {
+  return null;
+ }
+ return hash.digest("hex");
 }
 
 /**
