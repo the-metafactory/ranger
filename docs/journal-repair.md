@@ -17,7 +17,7 @@ The live journal carried two migrations that were not on `main`:
 
 ## Steps
 
-Run every step from a `main` checkout (`~/work/mf/ranger`), never from a worktree.
+Run every step from a `main` checkout (`~/work/mf/ranger`), never from a worktree. Run steps 2 to 7 in one shell: `$J` and `schema` are defined there.
 
 1. **Stop ranger.** Unload the tick and the digest so nothing opens the journal mid-repair, and stop any `ranger serve`:
 
@@ -49,11 +49,11 @@ Run every step from a `main` checkout (`~/work/mf/ranger`), never from a worktre
 
    ```sh
    RANGER_JOURNAL_PATH=/tmp/ranger-fresh/state.sqlite bun src/cli.ts journal --config ranger.yaml > /dev/null
-   schema() { sqlite3 -readonly "$1" .schema | sed -e 's/IF NOT EXISTS //' -e 's/[`"]//g' | sort; }
+   schema() { sqlite3 -readonly "$1" "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY tbl_name, type DESC, name" | sed -e 's/[`"]//g'; }
    diff <(schema /tmp/ranger-fresh/state.sqlite) <(schema "$J")
    ```
 
-   `schema` drops quoting and sorts, so a rebuilt table compares equal: SQLite re-quotes a renamed table's `CREATE TABLE` and lists it in a new position.
+   `schema` drops quoting and orders statements by table (each table before its indexes), so a rebuilt table compares equal: SQLite re-quotes a renamed table's `CREATE TABLE` and stores it in a new position.
 
    Every table that differs needs a rebuild. Tables that only gained foreign columns or keys need one too: `main`'s upserts depend on the exact keys.
 
