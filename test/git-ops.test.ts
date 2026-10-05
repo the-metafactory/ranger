@@ -47,6 +47,18 @@ describe("gitConfigSnapshot: ranger's own node branches (node #63)", () => {
   expect(() => assertGitUntouched(canonical, before)).not.toThrow();
  });
 
+ // Git writes remote, then merge, as two config writes: a snapshot or an
+ // assert can land between them while another node's worktree is created.
+ test("a node branch caught between git's remote and merge writes leaves the snapshot unchanged", async () => {
+  const before = gitConfigSnapshot(canonical);
+  await config("branch.node/663-x.remote", "origin");
+  expect(gitConfigSnapshot(canonical)).toBe(before);
+  expect(() => assertGitUntouched(canonical, before)).not.toThrow();
+  await config("branch.node/663-x.merge", "refs/heads/main");
+  expect(gitConfigSnapshot(canonical)).toBe(before);
+  expect(() => assertGitUntouched(canonical, before)).not.toThrow();
+ });
+
  test("a branch tracking a non-main map base is left out under that base only", async () => {
   await git(["push", "origin", "HEAD:refs/heads/develop"]);
   await git(["fetch", "origin"]);
@@ -102,6 +114,9 @@ describe("gitConfigSnapshot: everything else stays in the hash", () => {
     await config("branch.node/663-x.merge", "refs/heads/main");
    },
   ],
+  ["a remote-only node-branch section with another remote", () => config("branch.node/663-x.remote", "evil")],
+  ["a merge-only node-branch section", () => config("branch.node/663-x.merge", "refs/heads/main")],
+  ["a remote-only non-node branch section", () => config("branch.feature/x.remote", "origin")],
   [
    "a node-branch merge target other than the map base",
    async () => {

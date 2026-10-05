@@ -91,7 +91,13 @@ function branchKey(key: string): { name: string; key: string } | null {
  * tripped the first one's tamper check (node #63: seelite #212 parked by
  * #663). Remove, don't select: every other record stays in the hash, and a
  * node-branch section is dropped only when it holds exactly `remote=origin`
- * and `merge=refs/heads/<base>`. Parsed by git without includes, so an
+ * and `merge=refs/heads/<base>`, or `remote=origin` alone. Git writes the
+ * two keys as separate config writes, remote first (branch.c
+ * `install_branch_config_multiple_remotes`), so a snapshot or an assert taken
+ * while another node's worktree is being created can see the remote-only
+ * section; it is a strict subset of the full one, so dropping it lets nothing
+ * through the full rule does not. Merge-only never comes from git's write
+ * order and stays in the hash. Parsed by git without includes, so an
  * include line is hashed as the line it is; a file git cannot parse is
  * hashed raw, never as an empty listing. Records keep git's file order, never
  * sorted: for a repeated single-value key the last one wins, so reordering
@@ -137,16 +143,14 @@ function configRecords(file: string, base: string): Buffer | string {
  for (const [name, entries] of sections) {
   const remote = entries.filter((e) => e.key === "remote");
   const merge = entries.filter((e) => e.key === "merge");
-  if (
-   NODE_BRANCH.test(name) &&
+  const tracksOrigin =
+   NODE_BRANCH.test(name) && remote.length === 1 && remote[0].value === MAP_REMOTE;
+  const midWrite = entries.length === 1;
+  const complete =
    entries.length === 2 &&
-   remote.length === 1 &&
    merge.length === 1 &&
-   remote[0].value === MAP_REMOTE &&
-   merge[0].value === `refs/heads/${base}`
-  ) {
-   own.add(name);
-  }
+   merge[0].value === `refs/heads/${base}`;
+  if (tracksOrigin && (midWrite || complete)) own.add(name);
  }
  return JSON.stringify(
   records
