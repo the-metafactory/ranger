@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Plant a replacement for HEAD's commit object (refs/replace) whose tree has
+# <file> rewritten to <content>. A checkout that honours replacements shows
+# the new content with HEAD's own SHA, a clean status and a matching index;
+# a push of HEAD still carries the original. Args: <file> <content>
+set -euo pipefail
+file="$1"; content="$2"
+blob=$(printf '%s\n' "$content" | git hash-object -w --stdin)
+tree=$(git ls-tree HEAD | awk -v b="$blob" -v f="$file" -F'\t' '{ if ($2 == f) { split($1, m, " "); print m[1] " " m[2] " " b "\t" $2 } else print }' | git mktree)
+commit=$(git cat-file commit HEAD | sed "s/^tree .*/tree $tree/" | git hash-object -t commit -w --stdin)
+git replace -f HEAD "$commit"

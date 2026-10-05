@@ -958,6 +958,7 @@ describe("implement lane (node #23)", () => {
   ["a rewritten ignored fixture", `${IGNORE_FIXTURES}; echo old > t.fixture`, `${IGNORE_FIXTURES}; if grep -qx new t.fixture; then exit 0; else echo new > t.fixture; exit 1; fi`],
   ["an ignored fixture whose name git quotes", `${IGNORE_FIXTURES}; echo old > "a ü.fixture"`, `${IGNORE_FIXTURES}; if grep -qx new "a ü.fixture"; then exit 0; else echo new > "a ü.fixture"; exit 1; fi`],
   ["a tracked file hidden by --skip-worktree", undefined, "if grep -qx new README.md; then exit 0; else git update-index --skip-worktree README.md; echo new > README.md; exit 1; fi"],
+  ["a replacement ref for the head commit", undefined, "if grep -qx replaced README.md; then exit 0; else plant-replace README.md replaced; exit 1; fi"],
  ] as const) {
   test(`a test retry on a busy host never sees ${what} the failed run left: it runs in a fresh checkout`, async () => {
    const r = await rig({ ...(install === undefined ? {} : { install }), test: cmd });
@@ -1015,6 +1016,19 @@ describe("implement lane (node #23)", () => {
   const head = await r.github.sha("node/20-add-the-feature-module");
   expect(r.journal.headSubstrate("acme/widgets", head)).toBe("claude");
   rmSync(flag, { force: true });
+ }, 60_000);
+
+ test("adoption tests the commit in a fresh clone: an ignored fixture the failed run left cannot make it pass", async () => {
+  const r = await rig({ test: `${IGNORE_FIXTURES}; if [ -f t.fixture ]; then exit 0; else touch t.fixture; exit 1; fi` });
+  cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("failed"); // the failed run leaves t.fixture behind
+  r.ctx.workerCommand = [implementWorker, "noop"];
+  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  expect((await runNode("20", r.ctx)).status).toBe("failed"); // not adopted; the worker has nothing to add
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.includes("on the work a previous run committed") && d.endsWith("— the worker continues"))).toBe(true);
+  expect(events.some((d) => d.startsWith("adopting "))).toBe(false);
+  expect(r.github.prs.size).toBe(0);
  }, 60_000);
 
  test("adopted work that fails the supervisor's tests goes to the worker, which fixes it", async () => {

@@ -1372,11 +1372,12 @@ function testsFailedDetail(testCommand: string, tests: RunResult, after: string)
  * the worker's run passed the same tree, and a rerun at normal load passed
  * it again, while the supervisor's ran at load 40–100 and failed.
  *
- * The retry runs in a fresh detached checkout of the committed head, with
- * its own install: nothing the failed run wrote into the node's worktree
- * (untracked or ignored fixtures, index flags, links) can reach it, so a
- * pass certifies exactly what gets pushed. The node's worktree is left as
- * it is.
+ * The retry runs in a fresh clone of the committed head, with its own
+ * install (testsInFreshCheckout): nothing the failed run wrote into the
+ * node's worktree or the shared repository (untracked or ignored fixtures,
+ * index flags, links, replacement refs) reaches it, and the pass counts only
+ * if install and the tests left the commit's tracked content as committed.
+ * The node's worktree is left as it is.
  */
 async function supervisorTests(
  ctx: ImplementContext,
@@ -1413,14 +1414,25 @@ async function supervisorTests(
  return { tests, log };
 }
 
-/** The map's install and test commands in a throwaway detached checkout of `sha`. */
+/**
+ * The map's install and test commands in a throwaway clone of the shared
+ * repository, checked out at `sha`. A clone, not a linked worktree: it
+ * shares no refs (refs/replace a failed run planted would make the files
+ * checked out differ from the commit that gets pushed), no config and no
+ * hooks with the node's repository. Every git call here also refuses
+ * replacement objects.
+ */
 async function testsInFreshCheckout(ctx: ImplementContext, testCommand: string, sha: string): Promise<RunResult> {
  const scratch = mkdtempSync(join(tmpdir(), "ranger-test-retry-"));
- const dir = join(scratch, "worktree");
+ const dir = join(scratch, "checkout");
  const failed = (why: string): RunResult => ({ code: 1, stdout: "", stderr: why });
+ const git = (args: string[], cwd: string, timeoutMs = 60_000) =>
+  safeGit(["--no-replace-objects", ...args], { cwd, timeoutMs });
  try {
-  const add = await safeGit(["worktree", "add", "--detach", dir, sha], { cwd: ctx.worktree, timeoutMs: 120_000 });
-  if (add.code !== 0) return failed(`could not check out ${sha.slice(0, 8)} for the retry: ${add.stderr.trim()}`);
+  const clone = await git(["clone", "--quiet", "--no-checkout", ctx.canonical, dir], scratch, 300_000);
+  if (clone.code !== 0) return failed(`could not clone for the retry: ${clone.stderr.trim()}`);
+  const checkout = await git(["-c", "advice.detachedHead=false", "checkout", "--quiet", "--detach", sha], dir, 120_000);
+  if (checkout.code !== 0) return failed(`could not check out ${sha.slice(0, 8)} for the retry: ${checkout.stderr.trim()}`);
   if (ctx.map.commands.install !== undefined) {
    const install = await runShell(ctx.map.commands.install, dir, ctx, INSTALL_TIMEOUT_MS);
    if (install.code !== 0) return { ...install, stderr: `install for the retry failed\n${install.stderr}` };
@@ -1429,9 +1441,9 @@ async function testsInFreshCheckout(ctx: ImplementContext, testCommand: string, 
   // The pass certifies `sha` only if install and the tests left its tracked
   // content as committed: no new HEAD, no modified tracked file, no index
   // flag hiding one (--skip-worktree, --assume-unchanged).
-  const now = await safeGit(["rev-parse", "HEAD"], { cwd: dir, timeoutMs: 10_000 });
-  const tracked = await safeGit(["status", "--porcelain", "--untracked-files=no"], { cwd: dir, timeoutMs: 60_000 });
-  const flags = await safeGit(["ls-files", "-v"], { cwd: dir, timeoutMs: 60_000 });
+  const now = await git(["rev-parse", "HEAD"], dir, 10_000);
+  const tracked = await git(["status", "--porcelain", "--untracked-files=no"], dir);
+  const flags = await git(["ls-files", "-v"], dir);
   const changed =
    now.stdout.trim() !== sha ||
    tracked.code !== 0 ||
@@ -1447,9 +1459,7 @@ async function testsInFreshCheckout(ctx: ImplementContext, testCommand: string, 
   }
   return tests;
  } finally {
-  await safeGit(["worktree", "remove", "--force", dir], { cwd: ctx.worktree, timeoutMs: 60_000 });
   rmSync(scratch, { recursive: true, force: true });
-  await safeGit(["worktree", "prune"], { cwd: ctx.worktree, timeoutMs: 30_000 });
  }
 }
 
@@ -1471,9 +1481,13 @@ async function adoptBuiltWork(ctx: ImplementContext, testCommand: string): Promi
  if ((await dirtyFiles(worktree)).length > 0) return null;
  const snapshot = gitConfigSnapshot(ctx.canonical);
  const sha = await headSha(worktree);
- const { tests } = await supervisorTests(ctx, testCommand, "adopted build");
+ // Tested in a fresh clone of the commit, not in the worktree: whatever the
+ // failed run left there (ignored fixtures, links, replacement refs) must
+ // not be what makes the adopted commit pass.
+ const tests = await testsInFreshCheckout(ctx, testCommand, sha);
  assertGitUntouched(ctx.canonical, snapshot);
  if (tests.code !== 0) {
+  saveWorkerLog(journal.path, map.repo, node.ref.id, ctx.generation, `adopted build: supervisor tests in a fresh checkout (${testCommand})`, tests);
   journal.recordEvent("reviewed", {
    nodeId: node.ref.id,
    repo: map.repo,
