@@ -1096,6 +1096,26 @@ describe("implement lane (node #23)", () => {
   expect(r.github.prs.size).toBe(0);
  }, 60_000);
 
+ test("install and tests run niced, the probe run at the walker's own priority", async () => {
+  const own = Number((await runCmd("/bin/sh", ["-c", "ps -o nice= -p $PPID"])).stdout.trim());
+  const r = await rig({
+   test: `[ $(ps -o nice= -p $$) -eq ${own + 10} ] && test -f src/feature.ts`,
+   probe: `[ $(ps -o nice= -p $$) -eq ${own} ]`,
+  });
+  cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+ }, 60_000);
+
+ test("a probe run killed partway retries only the selected probes it had not passed", async () => {
+  const r = await rig({ probe: "fake-probe dies {node}", probeRetry: "fake-probe ok {node} {failed}" });
+  cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events).toContain("probe run 1 failed (exit -1) — retrying only the 1 probe(s) it had not passed when it stopped");
+  const probe = (r.github.comments.get(1) ?? []).find((c) => c.body.includes("ranger:probes"));
+  expect(probe?.body).toContain("`fake-probe ok 20 probe-b.mjs`");
+ }, 60_000);
+
  test("a busy host delays the probe run until the load drops", async () => {
   const r = await rig({ probe: "fake-probe ok {node}" });
   cleanup.push(r.dir);

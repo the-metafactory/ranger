@@ -216,6 +216,14 @@ const WorkersSchema = z.object({
   * signals a decision is needed, not another patch).
   */
  reviewRounds: z.number().int().positive().default(2),
+ /**
+  * CPU priority for everything ranger runs except the browser probes: worker
+  * sessions, install and test commands, sage reviews (`nice -n`; 0 = none).
+  * The probes are timing-sensitive and keep normal priority (2026-10-05: load
+  * reached 118 on 10 cores while tests, sessions and reviews shared the host
+  * with a probe run, and the probes timed out and failed).
+  */
+ niceness: z.number().int().min(0).max(19).default(10),
 });
 
 const PiSubstrateSchema = z.object({
