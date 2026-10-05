@@ -171,13 +171,25 @@ function configRecords(file: string, base: string): Buffer | string {
 export function gitConfigSnapshot(canonical: string, base = "main"): string {
  const gitDir = join(canonical, ".git");
  const hash = createHash("sha256");
+ // Every part is length-framed, and a missing file is "-" where a length
+ // would be: bare concatenation let bytes move across a file boundary
+ // (hook B deleted, its path and body appended to hook A) and hash alike.
+ const part = (data: Buffer | string | null) => {
+  if (data === null) {
+   hash.update("-\0");
+   return;
+  }
+  const bytes = typeof data === "string" ? Buffer.from(data) : data;
+  hash.update(`${bytes.length}\0`);
+  hash.update(bytes);
+ };
  const add = (file: string) => {
-  hash.update(file);
-  hash.update(existsSync(file) ? readFileSync(file) : "(absent)");
+  part(file);
+  part(existsSync(file) ? readFileSync(file) : null);
  };
  const config = join(gitDir, "config");
- hash.update(config);
- hash.update(configRecords(config, base));
+ part(config);
+ part(configRecords(config, base));
  add(join(gitDir, "config.worktree"));
  const worktrees = join(gitDir, "worktrees");
  if (existsSync(worktrees)) {

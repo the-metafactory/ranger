@@ -207,6 +207,20 @@ describe("gitConfigSnapshot: everything else stays in the hash", () => {
   expect(() => assertGitUntouched(canonical, one)).toThrow(GitSafetyError);
  });
 
+ // Bare concatenation hashed path A, body A, path B, body B: deleting B and
+ // appending its path and body to A fed the hash the same bytes.
+ test("moving a hook's bytes across a file boundary changes the snapshot", () => {
+  const hooks = join(canonical, ".git", "hooks");
+  const [a, b] = [join(hooks, "zz-a"), join(hooks, "zz-b")];
+  writeFileSync(a, "#!/bin/sh\n");
+  writeFileSync(b, "exit 0\n");
+  const one = gitConfigSnapshot(canonical);
+  rmSync(b);
+  writeFileSync(a, `#!/bin/sh\n${b}exit 0\n`);
+  expect(gitConfigSnapshot(canonical)).not.toBe(one);
+  expect(() => assertGitUntouched(canonical, one)).toThrow(GitSafetyError);
+ });
+
  test("an unparseable config is hashed raw: two different broken files differ", () => {
   const file = join(canonical, ".git", "config");
   writeFileSync(file, "[core\n\tbare = false\n");
