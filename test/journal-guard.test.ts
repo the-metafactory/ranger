@@ -9,6 +9,7 @@ import { createHandler, ServeReader, servedMaps, stateFromJournal } from "../src
 import { Journal, openJournal } from "../src/journal.ts";
 import {
  assertNotLiveJournalUnderTest,
+ canonicalPath,
  defaultJournalPath,
  ForeignMigrationError,
  LIVE_JOURNAL_PATH,
@@ -153,6 +154,17 @@ describe("the live journal under test (node #66)", () => {
   expect(() => assertNotLiveJournalUnderTest(join(elsewhere, "j.sqlite"), { liveDir })).toThrow("under test");
   symlinkSync(join(liveDir, "not-yet.sqlite"), join(elsewhere, "dangling.sqlite"));
   expect(() => assertNotLiveJournalUnderTest(join(elsewhere, "dangling.sqlite"), { liveDir })).toThrow("under test");
+  // A relative dangling link whose `..` climbs from a linked directory: the
+  // kernel follows `logs` into the live directory first, then climbs to it.
+  mkdirSync(join(liveDir, "logs"));
+  symlinkSync(join(liveDir, "logs"), join(elsewhere, "logs-alias"));
+  symlinkSync("logs-alias/../fresh.sqlite", join(elsewhere, "climb.sqlite"));
+  expect(canonicalPath(join(elsewhere, "climb.sqlite"))).toBe(join(canonicalPath(liveDir), "fresh.sqlite"));
+  expect(() => assertNotLiveJournalUnderTest(join(elsewhere, "climb.sqlite"), { liveDir })).toThrow("under test");
+  // The same climb written straight into the path, not inside a link.
+  expect(() => assertNotLiveJournalUnderTest(join(elsewhere, "logs-alias") + "/../other.sqlite", { liveDir })).toThrow(
+   "under test",
+  );
   // A symlinked live directory: the real path behind it is refused.
   symlinkSync(liveDir, join(elsewhere, "live-link"));
   expect(() => assertNotLiveJournalUnderTest(join(liveDir, "state.sqlite"), { liveDir: join(elsewhere, "live-link") })).toThrow(

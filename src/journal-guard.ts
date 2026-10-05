@@ -2,7 +2,7 @@ import type { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
 import { lstatSync, mkdtempSync, readlinkSync, realpathSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, isAbsolute, join, sep } from "node:path";
+import { dirname, isAbsolute, join, sep } from "node:path";
 import { readMigrationFiles } from "drizzle-orm/migrator";
 
 /**
@@ -65,35 +65,44 @@ export function journalPathOverride(env: NodeJS.ProcessEnv = process.env): strin
 
 /**
  * Where `path` lands on disk once every symlink is followed, including a
- * symlinked ancestor or a dangling link SQLite would create through. The part
- * of the path that does not exist yet is appended to its deepest existing
- * ancestor's real path.
+ * symlinked ancestor or a dangling link SQLite would create through. When the
+ * whole path does not resolve, it is walked one component at a time the way
+ * the kernel walks it: a link's target is spliced in before the rest, so a
+ * `..` in a target (or after a link) climbs from the link's real target, never
+ * lexically from the link's own name. The part of the path that does not exist
+ * yet is kept as written.
  */
-export function canonicalPath(path: string, depth = 0): string {
- if (depth > 40) throw new Error(`too many symlinks resolving ${path}`);
- let current = isAbsolute(path) ? path : `${process.cwd()}${sep}${path}`;
- const missing: string[] = [];
- for (;;) {
-  try {
-   return join(realpathSync(current), ...missing);
-  } catch {
-   // Missing, or a dangling symlink: follow the link by hand, else walk up.
+export function canonicalPath(path: string): string {
+ const absolute = isAbsolute(path) ? path : `${process.cwd()}${sep}${path}`;
+ try {
+  return realpathSync(absolute);
+ } catch {
+  // Missing, or through a dangling symlink: resolve by hand.
+ }
+ const pending = absolute.split(sep);
+ let resolved: string = sep;
+ let links = 0;
+ while (pending.length > 0) {
+  const part = pending.shift() as string;
+  if (part === "" || part === ".") continue;
+  if (part === "..") {
+   resolved = dirname(resolved);
+   continue;
   }
+  const next = join(resolved, part);
   let link: string | undefined;
   try {
-   if (lstatSync(current).isSymbolicLink()) link = readlinkSync(current);
+   if (lstatSync(next).isSymbolicLink()) link = readlinkSync(next);
+   else resolved = realpathSync(next);
   } catch {
-   link = undefined;
+   resolved = next;
   }
-  if (link !== undefined) {
-   const target = isAbsolute(link) ? link : join(dirname(current), link);
-   return join(canonicalPath(target, depth + 1), ...missing);
-  }
-  const parent = dirname(current);
-  if (parent === current) return join(current, ...missing);
-  missing.unshift(basename(current));
-  current = parent;
+  if (link === undefined) continue;
+  if (++links > 40) throw new Error(`too many symlinks resolving ${path}`);
+  if (isAbsolute(link)) resolved = sep;
+  pending.unshift(...link.split(sep));
  }
+ return resolved;
 }
 
 /**
