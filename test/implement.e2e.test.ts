@@ -1115,7 +1115,7 @@ describe("implement lane (node #23)", () => {
   cleanup.push(r.dir);
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
   const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
-  expect(events).toContain("probe run 1 failed (exit -1) — retrying only the 1 probe(s) it had not passed when it stopped");
+  expect(events.some((d) => /^probe run 1 failed \(exit -?\d+\) — retrying only the 1 probe\(s\) it had not passed when it stopped$/.test(d))).toBe(true);
   const probe = (r.github.comments.get(1) ?? []).find((c) => c.body.includes("ranger:probes"));
   expect(probe?.body).toContain("`fake-probe ok 20 probe-b.mjs`");
  }, 60_000);

@@ -298,13 +298,14 @@ async function probeFinalHead(
  // The record names the selection of the first run: a narrowed retry selects only the failures.
  const summary = parseProbeSummary(result.stdout);
  if (result.code !== 0) {
-  // A run that named its failures (exit > 0) retries only those, when the map
-  // says how. A timeout or a kill (exit < 0) retries only the selected probes
-  // that had not passed when it stopped (2026-10-05: 88 probes selected on
-  // #491 hit the 30-minute limit, and the full rerun had to start over); one
-  // that says nothing usable reruns all.
+  // A run that named its failures (a FAILED line) retries only those, when
+  // the map says how. One that stopped without naming them (a timeout, a
+  // kill: exit < 0, or 128+signal when a shell sat between; a crash) retries
+  // only the selected probes it had not passed (2026-10-05: 88 probes selected
+  // on #491 hit the 30-minute limit, and the full rerun had to start over);
+  // one that says nothing usable reruns all.
   const failed = result.code > 0 ? parseFailedProbes(result.stdout) : [];
-  const unfinished = result.code < 0 ? unfinishedProbes(result.stdout) : [];
+  const unfinished = failed.length === 0 ? unfinishedProbes(result.stdout) : [];
   const narrowed = failed.length > 0 ? failed : unfinished;
   const retryTemplate = map.commands.probeRetry;
   if (retryTemplate !== undefined && narrowed.length > 0) {
