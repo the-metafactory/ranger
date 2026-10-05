@@ -77,6 +77,20 @@ function rig() {
  return { dir, configPath, config, journal, env, discord, frontier, close() { journal.close(); discord.stop(); rmSync(dir, { recursive: true, force: true }); } };
 }
 
+/** Run `fn` on a fresh rig with its env installed in-process (walk() reads it), then restore and close. */
+async function withRigEnv(fn: (r: ReturnType<typeof rig>) => Promise<void>): Promise<void> {
+ const r = rig();
+ const saved = { ...process.env };
+ try {
+  Object.assign(process.env, r.env);
+  await fn(r);
+ } finally {
+  for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
+  Object.assign(process.env, saved);
+  r.close();
+ }
+}
+
 /** A merge desk's fake forge: PR #7 for node 40, sage-clean at its head, conflicting with main. */
 function conflictingPrForge(): GitHubPort {
  const head = "a".repeat(40);
@@ -409,10 +423,7 @@ describe("node #47 — map identity", () => {
  });
 
  test("a merge-desk send-back takes its lane before a fresh claim (seelite #691 beat #491 to it, 2026-10-05)", async () => {
-  const r = rig();
-  const saved = { ...process.env };
-  try {
-   Object.assign(process.env, r.env);
+  await withRigEnv(async (r) => {
    // Node 40 waits for its merge on root 460; its PR now conflicts with main.
    // Both maps have a fresh candidate (20, 21) for the same headless lane.
    r.journal.upsertWorker({ root: 460, nodeId: "40", repo: REPO, status: "awaiting-merge", lane: "implement" });
@@ -428,18 +439,11 @@ describe("node #47 — map identity", () => {
    expect(r.journal.getWorker("20", REPO)).toBeNull();
    expect(r.journal.getWorker("21", REPO)).toBeNull();
    expect(result.maps.some((m) => (m.sweep?.mergeDesk?.resumed ?? []).includes("40"))).toBe(true);
-  } finally {
-   for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
-   Object.assign(process.env, saved);
-   r.close();
-  }
+  });
  });
 
  test("a crashed holder on a later map is released before an earlier map's desk asks for the lane", async () => {
-  const r = rig();
-  const saved = { ...process.env };
-  try {
-   Object.assign(process.env, r.env);
+  await withRigEnv(async (r) => {
    // The send-back is on root 1, walked first; root 460's crashed holder has used every attempt.
    r.journal.upsertWorker({ root: 1, nodeId: "40", repo: REPO, status: "awaiting-merge", lane: "implement" });
    r.journal.updateWorker("40", REPO, { phase: "awaiting-merge", prNumber: 7 });
@@ -455,18 +459,11 @@ describe("node #47 — map identity", () => {
    expect(spawned).toEqual(["40"]);
    expect(result.maps.flatMap((m) => m.claimed)).toEqual([]);
    expect(r.journal.getWorker("40", REPO)).toMatchObject({ status: "running", phase: "review" });
-  } finally {
-   for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
-   Object.assign(process.env, saved);
-   r.close();
-  }
+  });
  });
 
  test("a liveness sweep that throws still reports what the merge desk did", async () => {
-  const r = rig();
-  const saved = { ...process.env };
-  try {
-   Object.assign(process.env, r.env);
+  await withRigEnv(async (r) => {
    r.journal.upsertWorker({ root: 460, nodeId: "40", repo: REPO, status: "awaiting-merge", lane: "implement" });
    r.journal.updateWorker("40", REPO, { phase: "awaiting-merge", prNumber: 7 });
    // A crashed worker whose respawn throws: the liveness sweep fails, and the row keeps the lane.
@@ -482,11 +479,7 @@ describe("node #47 — map identity", () => {
    const map460 = result.maps.find((m) => m.repo === REPO && m.errors.some((e) => e.includes("spawn exploded")));
    expect(map460).toBeDefined();
    expect(map460?.sweep?.mergeDesk?.pending).toEqual(["40"]); // the desk ran, waited on the held lane, and says so
-  } finally {
-   for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
-   Object.assign(process.env, saved);
-   r.close();
-  }
+  });
  });
 
  test("starts in another resource lane do not starve sibling map rotation", async () => {
