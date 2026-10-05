@@ -209,6 +209,8 @@ async function rig(opts: {
  probeRetry?: string;
  /** commands.install for the map. */
  install?: string;
+ /** commands.test for the map (default: test -f src/feature.ts). */
+ test?: string;
  autoMerge?: boolean;
 }): Promise<Rig & { calls: number[]; announced: string[] }> {
  const nodeId = opts.nodeId ?? "20";
@@ -262,7 +264,7 @@ async function rig(opts: {
   map: [
    `    canonical: ${canonical}`,
    "    commands:",
-   "      test: test -f src/feature.ts",
+   `      test: '${opts.test ?? "test -f src/feature.ts"}'`,
    ...(opts.probe === undefined ? [] : [`      probe: '${opts.probe}'`]),
    ...(opts.probeRetry === undefined ? [] : [`      probeRetry: '${opts.probeRetry}'`]),
    ...(opts.install === undefined ? [] : [`      install: '${opts.install}'`]),
@@ -916,6 +918,60 @@ describe("implement lane (node #23)", () => {
   expect(events.some((d) => d.includes("conflicts with main") && d.includes("run-node resumes"))).toBe(true);
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
   expect((await r.github.getPr("acme/widgets", 1)).mergeable).toBe(true);
+ }, 60_000);
+
+ test("a failed supervisor test run names its failing test and keeps its whole output in the node's log", async () => {
+  const r = await rig({ test: "echo \"(fail) the hud draws [3.00ms]\" >&2; exit 1" });
+  cleanup.push(r.dir);
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("failed");
+  expect(outcome.detail).toContain("failed after the worker (exit 1) — failing: the hud draws:");
+  const log = /\(worker log: ([^)]+)\)/.exec(outcome.detail)?.[1] ?? "";
+  expect(readFileSync(log, "utf8")).toContain("build pass: supervisor tests");
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.includes("failed on a busy host"))).toBe(false); // a quiet host: no retry
+ }, 60_000);
+
+ test("supervisor tests that fail on a busy host are retried once it quiets, and pass", async () => {
+  const flag = join(tmpdir(), `ranger-flaky-tests-${Date.now()}`);
+  const r = await rig({ test: `if [ -f ${flag} ]; then test -f src/feature.ts; else touch ${flag}; exit 1; fi` });
+  cleanup.push(r.dir);
+  const loads = [14, 13, 2]; // at the failure, while waiting, then quiet
+  r.ctx.hostLoad = () => ({ load: loads.length > 1 ? (loads.shift() as number) : loads[0], cores: 10 });
+  r.ctx.quietHost = { pollMs: 1, maxMs: 60_000 };
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.includes("failed on a busy host (load 14.0 on 10 cores) — retrying once when it quiets"))).toBe(true);
+  expect(events.some((d) => d.endsWith("passed on the retry"))).toBe(true);
+  rmSync(flag, { force: true });
+ }, 60_000);
+
+ test("built and committed work a failed run left unpushed is adopted on resume, with no new worker session", async () => {
+  const flag = join(tmpdir(), `ranger-adopt-${Date.now()}`);
+  const r = await rig({ test: `test -f ${flag}` });
+  cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("failed"); // built and committed; the supervisor's tests fail
+  expect(r.github.prs.size).toBe(0);
+  writeFileSync(flag, ""); // whatever broke the tests is gone
+  r.ctx.workerCommand = [implementWorker, "noop"]; // a worker session would commit nothing and fail
+  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.startsWith("adopting ") && d.includes("no new worker session"))).toBe(true);
+  expect(r.github.prs.size).toBe(1);
+  rmSync(flag, { force: true });
+ }, 60_000);
+
+ test("adopted work that fails the supervisor's tests goes to the worker, which fixes it", async () => {
+  const r = await rig({ test: "test -f src/fixed.ts" });
+  cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("failed");
+  r.ctx.workerCommand = [implementWorker, "add-fixed"];
+  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.includes("on the work a previous run committed") && d.endsWith("— the worker continues"))).toBe(true);
+  expect(events.some((d) => d.startsWith("adopting "))).toBe(false);
  }, 60_000);
 
  test("a busy host delays the probe run until the load drops", async () => {

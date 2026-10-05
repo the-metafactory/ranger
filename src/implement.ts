@@ -610,7 +610,10 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
     };
    }
   }
-  const built = await workerPass(ctx, testCommand, { kind: "build" });
+  // Work an earlier run built and committed, but never pushed, is adopted
+  // when it passes the supervisor's checks (#691: its tests failed under
+  // load; a fresh worker would find nothing to commit and fail again).
+  const built = (await adoptBuiltWork(ctx, testCommand)) ?? (await workerPass(ctx, testCommand, { kind: "build" }));
   workerExit = built.workerExit;
   if (built.failure !== undefined) return built.failure;
 
@@ -1177,10 +1180,8 @@ async function checkedWorkerPass(
    `worker left ${dirty.length} uncommitted or untracked file(s) (${dirty.slice(0, 5).join("; ")}) — the tests would not test what gets pushed`,
   );
  }
- const tests = await runShell(testCommand, worktree, ctx, TEST_TIMEOUT_MS);
- if (tests.code !== 0) {
-  return fail(`tests (${testCommand}) failed after the worker (exit ${tests.code}): ${tail(tests)}`);
- }
+ const { tests } = await supervisorTests(ctx, testCommand, pass);
+ if (tests.code !== 0) return fail(testsFailedDetail(testCommand, tests, "after the worker"));
  await assertNoClosingKeywords(worktree, map.base);
  return { workerExit: result.code, snapshot, sha };
 }
@@ -1338,6 +1339,92 @@ function reviewComment(round: number, verdict: ReviewVerdict, substrate?: Substr
    ? verdict.body
    : `${verdict.body.slice(0, room - 80)}\n\n… (truncated by ranger; the full review is in the run log)`;
  return head + body;
+}
+
+/** The first three failing tests a run names, in bun's `(fail) <name> [12ms]` format. */
+export function failedTestNames(result: RunResult): string[] {
+ const names = new Set<string>();
+ for (const m of `${result.stdout}\n${result.stderr}`.matchAll(/^\(fail\) (.+?)(?: \[[\d.]+m?s\])?$/gm)) {
+  names.add(m[1].trim());
+ }
+ return [...names].slice(0, 3);
+}
+
+/** A failed supervisor test run, named: the failing tests first (the journal keeps 400 characters), then the tail. */
+function testsFailedDetail(testCommand: string, tests: RunResult, after: string): string {
+ const names = failedTestNames(tests);
+ return `tests (${testCommand}) failed ${after} (exit ${tests.code})${names.length > 0 ? ` — failing: ${names.join("; ")}` : ""}: ${tail(tests)}`;
+}
+
+/**
+ * The supervisor's own test run. A failure keeps its whole output in the
+ * node's log (2026-10-05: #691's failure kept only 400 characters of passing
+ * tests, so the failing one was lost). A failure on a busy host is retried
+ * once, after the host quiets: the worker's run passed the same tree, and a
+ * rerun at normal load passed it again, while the supervisor's ran at load
+ * 40–100 and failed.
+ */
+async function supervisorTests(
+ ctx: ImplementContext,
+ testCommand: string,
+ label: string,
+): Promise<{ tests: RunResult; log: string | null }> {
+ const { journal, map, node, worktree } = ctx;
+ let tests = await runShell(testCommand, worktree, ctx, TEST_TIMEOUT_MS);
+ if (tests.code === 0) return { tests, log: null };
+ const log = saveWorkerLog(journal.path, map.repo, node.ref.id, ctx.generation, `${label}: supervisor tests (${testCommand})`, tests);
+ const host = (ctx.hostLoad ?? realHostLoad)();
+ if (host.load < host.cores) return { tests, log };
+ journal.recordEvent("reviewed", {
+  nodeId: node.ref.id,
+  repo: map.repo,
+  detail: `tests (${testCommand}) failed on a busy host (load ${host.load.toFixed(1)} on ${host.cores} cores) — retrying once when it quiets`,
+ });
+ await awaitQuietHost(ctx, "the test retry");
+ tests = await runShell(testCommand, worktree, ctx, TEST_TIMEOUT_MS);
+ if (tests.code === 0) {
+  journal.recordEvent("reviewed", { nodeId: node.ref.id, repo: map.repo, detail: `tests (${testCommand}) passed on the retry` });
+  return { tests, log };
+ }
+ saveWorkerLog(journal.path, map.repo, node.ref.id, ctx.generation, `${label}: supervisor test retry (${testCommand})`, tests);
+ return { tests, log };
+}
+
+/**
+ * Work a previous run built and committed but never pushed (its supervisor
+ * tests failed, or it crashed before the push): when the branch is ahead of
+ * the base with a clean tree and passes the supervisor's checks, it is
+ * pushed as it stands, with no new worker session. One that fails them goes
+ * to the worker as before, which can fix what broke. Null when there is
+ * nothing to adopt or it does not pass.
+ *
+ * The git state is trusted exactly as on any resumed pass: the tamper
+ * snapshot is taken now, at the start of this run.
+ */
+async function adoptBuiltWork(ctx: ImplementContext, testCommand: string): Promise<PassResult | null> {
+ const { map, worktree, journal, node } = ctx;
+ if ((await commitsAhead(worktree, map.base)) === 0) return null;
+ if ((await dirtyFiles(worktree)).length > 0) return null;
+ const snapshot = gitConfigSnapshot(ctx.canonical);
+ const sha = await headSha(worktree);
+ const { tests } = await supervisorTests(ctx, testCommand, "adopted build");
+ assertGitUntouched(ctx.canonical, snapshot);
+ if (tests.code !== 0) {
+  journal.recordEvent("reviewed", {
+   nodeId: node.ref.id,
+   repo: map.repo,
+   detail: `${testsFailedDetail(testCommand, tests, "on the work a previous run committed")} — the worker continues`.slice(0, 400),
+  });
+  return null;
+ }
+ if ((await headSha(worktree)) !== sha || (await dirtyFiles(worktree)).length > 0) return null;
+ await assertNoClosingKeywords(worktree, map.base);
+ journal.recordEvent("reviewed", {
+  nodeId: node.ref.id,
+  repo: map.repo,
+  detail: `adopting ${sha.slice(0, 8)}: a previous run built and committed it, and it passes the supervisor's tests — no new worker session`,
+ });
+ return { workerExit: null, snapshot, sha };
 }
 
 function tail(result: RunResult): string {
