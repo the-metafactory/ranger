@@ -13,6 +13,7 @@ import { servedMaps, ServeReader, stateFromJournal } from "../src/serve.ts";
 import { sweepMap } from "../src/sweep.ts";
 import type { GitHubPort } from "../src/github.ts";
 import { walk } from "../src/walk.ts";
+import { implementLane } from "../src/lanes.ts";
 import { fakeDiscord, fixturesBin, runCli } from "./support.ts";
 
 const REPO = "acme/widgets";
@@ -74,6 +75,23 @@ function rig() {
   FAKE_SOMA_STATE: state, RANGER_WRITE_TEST: "ghp_write", RANGER_RO_TEST: "ghp_readonly", RANGER_NO_SPAWN: "1", RANGER_DISCORD_TOKEN: "test",
   RANGER_DISCORD_API_BASE: `http://127.0.0.1:${discord.port}`, RANGER_DISCORD_ALLOW_TEST_OVERRIDE: "1", RANGER_DISCORD_MIN_INTERVAL_MS: "5" };
  return { dir, configPath, config, journal, env, discord, frontier, close() { journal.close(); discord.stop(); rmSync(dir, { recursive: true, force: true }); } };
+}
+
+/** A merge desk's fake forge: PR #7 for node 40, sage-clean at its head, conflicting with main. */
+function conflictingPrForge(): GitHubPort {
+ const head = "a".repeat(40);
+ return {
+  getPr: async () => ({
+   number: 7, state: "open", merged: false, draft: false, title: "Node 40", headRef: "node/40-x", headSha: head,
+   baseRef: "main", mergeable: false, mergeableState: "dirty", mergeCommitSha: null, mergedBy: null,
+   url: "https://github.com/acme/widgets/pull/7", author: "ivy-bot",
+  }),
+  listComments: async () => [
+   { id: 1, author: "ivy-bot", body: `<!-- ranger:review round=5 sha=${head} blockers=0 majors=0 nits=1 -->\nclean` },
+  ],
+  checkRunsFor: async () => [],
+  issueLabels: async () => [],
+ } as unknown as GitHubPort;
 }
 
 describe("node #47 — map identity", () => {
@@ -399,36 +417,44 @@ describe("node #47 — map identity", () => {
    // Both maps have a fresh candidate (20, 21) for the same headless lane.
    r.journal.upsertWorker({ root: 460, nodeId: "40", repo: REPO, status: "awaiting-merge", lane: "implement" });
    r.journal.updateWorker("40", REPO, { phase: "awaiting-merge", prNumber: 7 });
-   const head = "a".repeat(40);
-   const github = {
-    getPr: async () => ({
-     number: 7, state: "open", merged: false, draft: false, title: "Node 40", headRef: "node/40-x", headSha: head,
-     baseRef: "main", mergeable: false, mergeableState: "dirty", mergeCommitSha: null, mergedBy: null,
-     url: "https://github.com/acme/widgets/pull/7", author: "ivy-bot",
-    }),
-    listComments: async () => [
-     { id: 1, author: "ivy-bot", body: `<!-- ranger:review round=5 sha=${head} blockers=0 majors=0 nits=1 -->\nclean` },
-    ],
-    checkRunsFor: async () => [],
-    issueLabels: async () => [],
-   } as unknown as GitHubPort;
    const spawned: string[] = [];
    const result = await walk({
-    config: r.config,
-    configPath: r.configPath,
-    journal: r.journal,
-    github,
-    spawnRunNode: async ({ nodeId }) => {
-     spawned.push(nodeId);
-     return process.pid;
-    },
+    config: r.config, configPath: r.configPath, journal: r.journal, github: conflictingPrForge(),
+    spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; },
    });
    expect(spawned).toEqual(["40"]); // the send-back, and no fresh worker
    expect(result.maps.flatMap((m) => m.claimed)).toEqual([]);
    expect(r.journal.getWorker("40", REPO)).toMatchObject({ status: "running", phase: "review" });
    expect(r.journal.getWorker("20", REPO)).toBeNull();
    expect(r.journal.getWorker("21", REPO)).toBeNull();
-   expect(result.maps.map((m) => m.repo + ":" + (m.sweep?.mergeDesk?.resumed ?? []).join(","))).toContain(REPO + ":40");
+   expect(result.maps.some((m) => (m.sweep?.mergeDesk?.resumed ?? []).includes("40"))).toBe(true);
+  } finally {
+   for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
+   Object.assign(process.env, saved);
+   r.close();
+  }
+ });
+
+ test("a crashed holder on a later map is released before an earlier map's desk asks for the lane", async () => {
+  const r = rig();
+  const saved = { ...process.env };
+  try {
+   Object.assign(process.env, r.env);
+   // The send-back is on root 1, walked first; root 460's crashed holder has used every attempt.
+   r.journal.upsertWorker({ root: 1, nodeId: "40", repo: REPO, status: "awaiting-merge", lane: "implement" });
+   r.journal.updateWorker("40", REPO, { phase: "awaiting-merge", prNumber: 7 });
+   r.journal.upsertWorker({ root: 460, nodeId: "45", repo: REPO, status: "running", lane: "implement" });
+   r.journal.updateWorker("45", REPO, { pid: 999_999, attempts: r.config.workers.maxAttempts, phase: "implement" });
+   expect(r.journal.laneHolder(implementLane(r.config.maps[0]))?.nodeId).toBe("45");
+   const spawned: string[] = [];
+   const result = await walk({
+    config: r.config, configPath: r.configPath, journal: r.journal, github: conflictingPrForge(),
+    spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; },
+   });
+   expect(r.journal.getWorker("45", REPO)?.status).not.toBe("running"); // parked or released
+   expect(spawned).toEqual(["40"]);
+   expect(result.maps.flatMap((m) => m.claimed)).toEqual([]);
+   expect(r.journal.getWorker("40", REPO)).toMatchObject({ status: "running", phase: "review" });
   } finally {
    for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
    Object.assign(process.env, saved);

@@ -292,13 +292,15 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
  const maps: WalkMapResult[] = [];
  const walked: { map: (typeof order)[number]; mapResult: WalkMapResult; token: string; botIdentity: string; errors: string[] }[] = [];
 
- // Pass 1 — every walked map's sweep, before any claim. The merge desk in the
- // sweep sends ready PRs back to run-node (rework, missing probes, a conflict
- // with the base), and a send-back needs its implement lane. Run after the
- // claims, it lost the lane to a fresh claim whenever the lane freed between
- // ticks (2026-10-05: seelite #691 took the visual lane one second before the
- // desk tried to send #491 back, and nothing stopped that repeating). The
- // sweep also releases crashed holders, which the claims then see.
+ // Pass 1 — every walked map's liveness sweep, then (1b) every map's merge
+ // desk, before any claim. The desk sends ready PRs back to run-node (rework,
+ // missing probes, a conflict with the base), and a send-back needs its
+ // implement lane. Run after the claims, it lost the lane to a fresh claim
+ // whenever the lane freed between ticks (2026-10-05: seelite #691 took the
+ // visual lane one second before the desk tried to send #491 back, and
+ // nothing stopped that repeating). Liveness goes first on every map: a
+ // crashed holder on a later map, released after an earlier map's desk ran,
+ // would otherwise hand its lane to a claim instead.
  for (const map of order) {
   const mapResult: WalkMapResult = {
    repo: map.repo,
@@ -352,6 +354,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
     token,
     botIdentity,
     github: ctx.github,
+    phase: "liveness",
     respawn: (nodeId, repo, root) =>
      (ctx.spawnRunNode ?? spawnRunNodeDetached)({
       nodeId,
@@ -371,7 +374,27 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
   walked.push({ map, mapResult, token, botIdentity, errors });
  }
 
- // Pass 2 — claims, in the same map order, against lanes the sweeps have settled.
+ // Pass 1b — the merge desks, against lanes every liveness sweep has settled.
+ for (const { map, mapResult, token, botIdentity, errors } of walked) {
+  try {
+   const desk = await sweepMap({
+    config,
+    journal,
+    map,
+    token,
+    botIdentity,
+    github: ctx.github,
+    phase: "desk",
+    respawn: (nodeId, repo, root) =>
+     (ctx.spawnRunNode ?? spawnRunNodeDetached)({ nodeId, repo, root, cliEntry, configPath: ctx.configPath }),
+   });
+   if (mapResult.sweep !== undefined && desk.mergeDesk !== undefined) mapResult.sweep.mergeDesk = desk.mergeDesk;
+  } catch (error) {
+   errors.push(`merge desk failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+ }
+
+ // Pass 2 — claims, in the same map order, against lanes the sweeps and desks have settled.
  for (const { map, mapResult, token, botIdentity, errors } of walked) {
   if (!mapResult.gated) {
    try {
