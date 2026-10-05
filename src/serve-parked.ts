@@ -232,6 +232,13 @@ export interface PrView {
   * PR is closed or merged, so its checks are not fetched).
   */
  ci: "none" | "pending" | "failed" | "no-success" | "green" | "unreadable" | "not-read";
+ /**
+  * Where `ci` came from: the check runs (every check, Actions and external
+  * apps alike), or only the Actions workflow runs when the token could not
+  * read checks. Actions-only evidence is shown, never merged on: a failing
+  * external check would not be in it.
+  */
+ ciSource?: "checks" | "actions";
  readAt: string;
 }
 
@@ -259,10 +266,11 @@ export function checkRunsFromPages(raw: unknown): { status: string; conclusion: 
 
 /**
  * The latest workflow run per workflow and event for `sha`, read off a
- * slurped `actions/runs?head_sha=` listing: the CI a fine-grained read-only
- * token can see on a private repository, which grants no Checks permission
- * (2026-10-05: seelite's dashboard read every PR's CI as unreadable). Null on
- * any malformed page or a run for another head.
+ * slurped `actions/runs?head_sha=` listing: what a read-only token that is
+ * refused check runs can still see (2026-10-05: seelite's fine-grained token
+ * was, and the dashboard read every PR's CI as unreadable). Actions runs
+ * only: an external app's checks are not in it. Null on any malformed page
+ * or a run for another head.
  */
 export function workflowRunsFromPages(raw: unknown, sha: string): { status: string; conclusion: string | null }[] | null {
  if (!Array.isArray(raw)) return null;
@@ -291,6 +299,7 @@ export function mergeRefusal(pr: PrView | null): string | null {
  if (!SHA_PATTERN.test(pr.headSha)) return "the PR head is unknown";
  if (pr.ci === "no-success") return "no check run concluded success (all neutral/skipped): the close has nothing to cite";
  if (pr.ci === "unreadable") return "the check runs could not be read";
+ if (pr.ciSource === "actions") return "only the Actions workflow runs could be read, not every check: merge it on GitHub or let the walker's gate do it";
  if (pr.ci !== "green") return `CI is ${pr.ci}`;
  return null;
 }

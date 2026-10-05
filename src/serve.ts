@@ -904,7 +904,7 @@ function prLifecycle(v) {
 function prFacts(pr) {
  const v = pr.view;
  const parts = ["PR #" + pr.number];
- if (v) parts.push(prLifecycle(v), "head " + short(v.headSha), ...(v.ci === "not-read" ? [] : ["CI " + v.ci]));
+ if (v) parts.push(prLifecycle(v), "head " + short(v.headSha), ...(v.ci === "not-read" ? [] : ["CI " + v.ci + (v.ciSource === "actions" ? " (Actions only)" : "")]));
  if (pr.error) parts.push(v ? "stale, read " + ago(v.readAt) + "; the last refresh failed: " + pr.error : "the read failed: " + pr.error);
  else if (!v) parts.push("not read yet");
  return parts.join(" · ");
@@ -1328,13 +1328,15 @@ export async function readPrLive(
      ]),
     )
   : null;
- // A fine-grained read-only token gets no Checks permission on a private
- // repository; its workflow runs (Actions: read) carry the same CI.
+ // A token refused check runs (seelite's fine-grained one is) may still read
+ // the Actions workflow runs: shown, marked as Actions-only, never merged on.
+ let ciSource: "checks" | "actions" | undefined = checks === null ? undefined : "checks";
  if (readable && checks === null) {
   checks = workflowRunsFromPages(
    await restRead(tokens, repo, `repos/${repo}/actions/runs?head_sha=${headSha}&per_page=100`, ["--paginate", "--slurp"]),
    headSha,
   );
+  if (checks !== null) ciSource = "actions";
  }
  return {
   number,
@@ -1345,6 +1347,7 @@ export async function readPrLive(
   headSha,
   mergeable: typeof raw.mergeable === "boolean" ? raw.mergeable : null,
   ci: terminal ? "not-read" : checks === null ? "unreadable" : ciState(checks),
+  ...(ciSource === undefined || terminal ? {} : { ciSource }),
   readAt: new Date().toISOString(),
  };
 }

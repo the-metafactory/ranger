@@ -326,6 +326,11 @@ describe("node #54 — CI, by the merge gate's rules", () => {
   expect(checkRunsFromPages({ check_runs: [] })).toBeNull();
   expect(checkRunsFromPages(null)).toBeNull();
  });
+ test("Actions-only CI is shown but never merged on: an external check could be failing", () => {
+  const view = { number: 7, url: "u", state: "open", merged: false, draft: false, headSha: "a".repeat(40), mergeable: true, ci: "green", readAt: "t" } as const;
+  expect(mergeRefusal({ ...view, ciSource: "actions" })).toContain("only the Actions workflow runs could be read");
+  expect(mergeRefusal({ ...view, ciSource: "checks" })).toBeNull();
+ });
  test("workflow runs stand in for check runs: latest per workflow and event, and only for the head asked about", () => {
   const sha = "a".repeat(40);
   const run = (id: number, workflow: number, conclusion: string | null, status = "completed", head = sha) =>
