@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { createReadStream, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { constants as fsConstants, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { open, readlink, type FileHandle } from "node:fs/promises";
 import { availableParallelism, loadavg, tmpdir } from "node:os";
 import { join } from "node:path";
 import { DiscordAnnouncer } from "./announce.ts";
@@ -1444,15 +1445,42 @@ async function ignoredPaths(worktree: string): Promise<string | null> {
  return entries.join("\n");
 }
 
-/** A file's sha256, streamed in chunks; null when it cannot be read. */
+/**
+ * What an ignored path is, for comparison: a symlink by its target (never
+ * followed), a regular file by the sha256 of exactly the bytes `fstat`
+ * reports (read in chunks, so a worker-planted link to /dev/zero or a
+ * growing file cannot stall the supervisor), anything else by its type.
+ * Null when it cannot be read.
+ */
 async function fileDigest(path: string): Promise<string | null> {
- const hash = createHash("sha256");
+ let handle: FileHandle | undefined;
  try {
-  for await (const chunk of createReadStream(path)) hash.update(chunk as Buffer);
+  handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+ } catch (error) {
+  if ((error as NodeJS.ErrnoException).code !== "ELOOP") return null;
+  try {
+   return `symlink:${await readlink(path)}`;
+  } catch {
+   return null;
+  }
+ }
+ try {
+  const stat = await handle.stat();
+  if (!stat.isFile()) return `type:${stat.mode & fsConstants.S_IFMT}`;
+  const hash = createHash("sha256");
+  const buffer = Buffer.alloc(64 * 1024);
+  for (let offset = 0; offset < stat.size; ) {
+   const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, stat.size - offset), offset);
+   if (bytesRead === 0) break;
+   hash.update(buffer.subarray(0, bytesRead));
+   offset += bytesRead;
+  }
+  return `${stat.size}:${hash.digest("hex")}`;
  } catch {
   return null;
+ } finally {
+  await handle.close();
  }
- return hash.digest("hex");
 }
 
 /**

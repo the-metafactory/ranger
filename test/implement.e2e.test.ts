@@ -971,34 +971,42 @@ describe("implement lane (node #23)", () => {
   expect(r.github.prs.size).toBe(0);
  }, 60_000);
 
- test("a failed test run that rewrote an existing ignored fixture is not retried", async () => {
-  // t.fixture exists (ignored) before the tests; the failed run rewrites it, and a retry would pass on the new content.
-  const setup = "x=\"$(git rev-parse --git-common-dir)/info\"; mkdir -p \"$x\"; grep -qx \"*.fixture\" \"$x/exclude\" 2>/dev/null || echo \"*.fixture\" >> \"$x/exclude\"";
-  const r = await rig({
-   install: `${setup}; echo old > t.fixture`,
-   test: `${setup}; test -z "$(git status --porcelain)" || exit 7; if grep -qx new t.fixture; then exit 0; else echo new > t.fixture; exit 1; fi`,
-  });
-  cleanup.push(r.dir);
-  r.ctx.hostLoad = () => ({ load: 14, cores: 10 });
-  r.ctx.quietHost = { pollMs: 1, maxMs: 5 };
-  expect((await runNode("20", r.ctx)).status).toBe("failed");
-  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
-  expect(events.some((d) => d.endsWith("failed on a busy host and changed the tree or HEAD — not retried"))).toBe(true);
-  expect(r.github.prs.size).toBe(0);
- }, 60_000);
+ /** Exclude *.fixture through the shared repo's info/exclude, so a fixture is ignored rather than untracked. */
+ const IGNORE_FIXTURES = "x=\"$(git rev-parse --git-common-dir)/info\"; mkdir -p \"$x\"; grep -qx \"*.fixture\" \"$x/exclude\" 2>/dev/null || echo \"*.fixture\" >> \"$x/exclude\"";
 
- test("an ignored fixture whose name git quotes is compared by content too", async () => {
-  const setup = "x=\"$(git rev-parse --git-common-dir)/info\"; mkdir -p \"$x\"; grep -qx \"*.fixture\" \"$x/exclude\" 2>/dev/null || echo \"*.fixture\" >> \"$x/exclude\"";
+ for (const [why, name] of [
+  ["an existing ignored fixture", "t.fixture"],
+  ["an ignored fixture whose name git quotes", "a ü.fixture"],
+ ]) {
+  test(`a failed test run that rewrote ${why} is not retried: the retry would pass on content the commit lacks`, async () => {
+   const r = await rig({
+    install: `${IGNORE_FIXTURES}; echo old > "${name}"`,
+    test: `${IGNORE_FIXTURES}; test -z "$(git status --porcelain)" || exit 7; if grep -qx new "${name}"; then exit 0; else echo new > "${name}"; exit 1; fi`,
+   });
+   cleanup.push(r.dir);
+   r.ctx.hostLoad = () => ({ load: 14, cores: 10 });
+   r.ctx.quietHost = { pollMs: 1, maxMs: 5 };
+   expect((await runNode("20", r.ctx)).status).toBe("failed");
+   const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+   expect(events.some((d) => d.endsWith("failed on a busy host and changed the tree or HEAD — not retried"))).toBe(true);
+   expect(r.github.prs.size).toBe(0);
+  }, 60_000);
+ }
+
+ test("an ignored symlink to /dev/zero is compared by its target and never read: the retry still runs", async () => {
+  const flag = join(tmpdir(), `ranger-zero-${Date.now()}`);
   const r = await rig({
-   install: `${setup}; echo old > "a ü.fixture"`,
-   test: `${setup}; test -z "$(git status --porcelain)" || exit 7; if grep -qx new "a ü.fixture"; then exit 0; else echo new > "a ü.fixture"; exit 1; fi`,
+   install: `${IGNORE_FIXTURES}; ln -sf /dev/zero z.fixture`,
+   test: `if [ -f ${flag} ]; then test -f src/feature.ts; else touch ${flag}; exit 1; fi`,
   });
   cleanup.push(r.dir);
-  r.ctx.hostLoad = () => ({ load: 14, cores: 10 });
-  r.ctx.quietHost = { pollMs: 1, maxMs: 5 };
-  expect((await runNode("20", r.ctx)).status).toBe("failed");
+  const loads = [14, 13, 2];
+  r.ctx.hostLoad = () => ({ load: loads.length > 1 ? (loads.shift() as number) : loads[0], cores: 10 });
+  r.ctx.quietHost = { pollMs: 1, maxMs: 60_000 };
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
   const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
-  expect(events.some((d) => d.endsWith("failed on a busy host and changed the tree or HEAD — not retried"))).toBe(true);
+  expect(events.some((d) => d.endsWith("passed on the retry"))).toBe(true);
+  rmSync(flag, { force: true });
  }, 60_000);
 
  test("built and committed work a failed run left unpushed is adopted on resume, with no new worker session", async () => {
