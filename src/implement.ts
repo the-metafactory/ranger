@@ -14,11 +14,11 @@ import {
  fastForwardCanonical,
  findClosingKeyword,
  GitSafetyError,
- gitConfigSnapshot,
  headSha,
  safeGit,
  vettedPush,
 } from "./git-ops.ts";
+import { recordKnownGood, trustedSnapshot } from "./git-trust.ts";
 import * as gh from "./github.ts";
 import type { CheckRun, IssueComment, PullRequest, GitHubPort } from "./github.ts";
 import { ParkSignal } from "./signals.ts";
@@ -619,7 +619,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
   if (built.failure !== undefined) return built.failure;
 
   fence("push");
-  await vettedPush({
+  const vetted = await vettedPush({
    worktree,
    canonical: ctx.canonical,
    branch,
@@ -627,6 +627,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
    configSnapshot: built.snapshot,
    base: ctx.map.base,
   });
+  recordKnownGood(journal, ctx.canonical, base, vetted, "vetted push");
   journal.recordEvent("pushed", { nodeId, repo, detail: `${branch} @ ${built.sha.slice(0, 8)}` });
   // Review selection reads who wrote a head. Every session records its own
   // commit as it makes it (checkedWorkerPass); an adopted build keeps that
@@ -890,7 +891,7 @@ async function publishPass(
  detail: string,
 ): Promise<void> {
  ctx.journal.assertGeneration(ctx.node.ref.id, ctx.map.repo, ctx.generation, action);
- await vettedPush({
+ const vetted = await vettedPush({
   worktree: ctx.worktree,
   canonical: ctx.canonical,
   branch: ctx.branch,
@@ -898,6 +899,7 @@ async function publishPass(
   configSnapshot: pass.snapshot,
   base: ctx.map.base,
  });
+ recordKnownGood(ctx.journal, ctx.canonical, ctx.map.base, vetted, "vetted push");
  ctx.journal.recordEvent("pushed", { nodeId: ctx.node.ref.id, repo: ctx.map.repo, detail });
  recordHead(ctx, pass.sha);
  await awaitHead(github, ctx.map.repo, prNumber, pass.sha, ctx.token, ctx.headPollMs);
@@ -954,6 +956,8 @@ async function baseMergePass(ctx: ImplementContext, testCommand: string, pushedH
   const r = await safeGit(args, { cwd: ctx.worktree, timeoutMs: 60_000 });
   if (r.code !== 0) throw new GitSafetyError(`cannot reset ${ctx.worktree} to ${pushedHead.slice(0, 8)} (git ${args[0]}): ${r.stderr.trim()}`);
  }
+ // The fetch carries the write credential: the state must still be the known-good one (node #81).
+ trustedSnapshot(ctx.journal, ctx.canonical, base, { repo: ctx.map.repo, nodeId: ctx.node.ref.id }, mapKey(ctx.map));
  await fastForwardCanonical(ctx.canonical, base, ctx.token);
  // The base's commit as the supervisor fetched it, read before the worker
  // runs: the worker shares the repository and could move the ref itself.
@@ -1098,7 +1102,9 @@ async function checkedWorkerPass(
 ): Promise<PassResult> {
  const { config, map, journal, node, worktree, branch, botIdentity } = ctx;
  const nodeId = node.ref.id;
- const snapshot = gitConfigSnapshot(ctx.canonical, ctx.map.base);
+ // Checked against the known-good state, not just read (node #81): a state
+ // changed since the supervisor last saw it clean is never this pass's baseline.
+ const snapshot = trustedSnapshot(journal, ctx.canonical, map.base, { repo: map.repo, nodeId }, mapKey(map));
  const before = await headSha(worktree);
  const prompt = assembleImplementPrompt({
   repo: map.repo,
@@ -1199,6 +1205,10 @@ async function checkedWorkerPass(
   const restored = await restoreWorktree(ctx, sha);
   if (restored !== null) return fail(restored);
  }
+ // The tests ran worker-written code: the state must still be the vetted one
+ // before it counts as seen clean.
+ const clean = assertGitUntouched(ctx.canonical, snapshot, map.base);
+ recordKnownGood(journal, ctx.canonical, map.base, clean, `passing ${pass}`);
  await assertNoClosingKeywords(worktree, map.base);
  return { workerExit: result.code, snapshot, sha };
 }

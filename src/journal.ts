@@ -161,7 +161,8 @@ export type EventKind =
  | "merged"
  | "orphan-killed"
  | "substrate-capped"
- | "transient";
+ | "transient"
+ | "git-trust";
 
 const rootFilter = (column: typeof workers.root | typeof escalations.root, root?: number) => root === undefined ? undefined : eq(column, root);
 

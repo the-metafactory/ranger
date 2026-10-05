@@ -36,7 +36,8 @@ import {
  resolveWriteToken,
  WriteGateError,
 } from "./identity.ts";
-import { runNode } from "./worker.ts";
+import { canonicalDir, runNode } from "./worker.ts";
+import { trustCurrentGitState } from "./git-trust.ts";
 import { sweepMap } from "./sweep.ts";
 import { spawnRunNodeDetached, walk } from "./walk.ts";
 import { holdAwake } from "./awake.ts";
@@ -314,6 +315,23 @@ async function runBuildNow(
   const { token, botIdentity } = await writeContext(config, map);
   const result = await buildNow(nodeId, { config, configPath, journal, map, token, botIdentity, force });
   return { result, out: JSON.stringify(result, null, 2) };
+ } finally {
+  journal.close();
+ }
+}
+
+/**
+ * Operator verb (node #81): adopt the canonical checkout's current git state
+ * as known-good, after the operator has vetted what changed. Run-nodes park
+ * on any other change.
+ */
+function runTrustGit(selector: string, configPath: string): string {
+ const { config, journal } = loadCtx(configPath);
+ try {
+  const map = pickMap(config, selector);
+  const canonical = canonicalDir(config, map);
+  const result = trustCurrentGitState(journal, canonical, map.base, map.repo);
+  return JSON.stringify({ map: mapKey(map), canonical, base: map.base, ...result }, null, 2);
  } finally {
   journal.close();
  }
@@ -607,6 +625,25 @@ program
  .action((options: { config: string }) => {
   const configPath = resolve(process.cwd(), options.config);
   process.stdout.write(runResumeRun(configPath) + "\n");
+ });
+
+program
+ .command("trust-git")
+ .description(
+  "Operator verb (node #81): record the canonical checkout's current git config and hooks as known-good — run-nodes park on any change since the last state ranger saw clean; vet the change first",
+ )
+ .requiredOption("-m, --map <owner/name#root>", "map repo#root (repo alone only when unique)")
+ .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
+ .action((options: { map: string; config: string }) => {
+  try {
+   const configPath = resolve(process.cwd(), options.config);
+   process.stdout.write(runTrustGit(options.map, configPath) + "\n");
+  } catch (error) {
+   process.stderr.write(
+    `ranger trust-git: ${error instanceof Error ? error.message : String(error)}\n`,
+   );
+   process.exit(1);
+  }
  });
 
 program

@@ -13,7 +13,9 @@ import { runCmd, type RunResult } from "./exec.ts";
  * off, and a minimal env — never the supervisor's own, which holds the write
  * PATs and the Discord token; the auth header is added only to the calls that
  * talk to the remote. Before any git call after a worker session, the git
- * config and hooks must match a pre-worker snapshot (`assertGitUntouched`).
+ * config and hooks must match a pre-worker snapshot (`assertGitUntouched`),
+ * and that snapshot must match the state the supervisor last saw clean in an
+ * earlier run (`git-trust.ts`, node #81).
  *
  * This is a tamper check, not a sandbox: a same-user process could still
  * write elsewhere on the machine. It closes the paths by which worker-written
@@ -103,8 +105,11 @@ function branchKey(key: string): { name: string; key: string } | null {
  * sorted: for a repeated single-value key the last one wins, so reordering
  * `http.sslVerify` or `core.sshCommand` entries changes what git runs.
  */
-function configRecords(file: string, base: string): Buffer | string {
- if (!existsSync(file)) return "(absent)";
+function configRecords(
+ file: string,
+ base: string,
+): { bytes: Buffer | string; records: [string, string | null][] | null } {
+ if (!existsSync(file)) return { bytes: "(absent)", records: null };
  const listed = spawnSync(
   "git",
   [
@@ -118,7 +123,7 @@ function configRecords(file: string, base: string): Buffer | string {
   { env: minimalGitEnv(), encoding: "latin1", timeout: 10_000 },
  );
  if (listed.status !== 0 || listed.error !== undefined) {
-  return Buffer.concat([Buffer.from("(unparsed)\0"), readFileSync(file)]);
+  return { bytes: Buffer.concat([Buffer.from("(unparsed)\0"), readFileSync(file)]), records: null };
  }
  // --null: each record ends in NUL; the key ends at the first newline, and a
  // valueless boolean key has none.
@@ -152,29 +157,42 @@ function configRecords(file: string, base: string): Buffer | string {
    merge[0].value === `refs/heads/${base}`;
   if (tracksOrigin && (midWrite || complete)) own.add(name);
  }
- return JSON.stringify(
-  records
-   .filter(({ key }) => {
-    const parsed = branchKey(key);
-    return parsed === null || !own.has(parsed.name);
-   })
-   // [key, value] tuples, never "key=value": a key may hold "=" (a url.<x>
-   // subsection), so a joined string lets two different records collide.
-   .map(({ key, value }) => [key, value]),
- );
+ const kept = records
+  .filter(({ key }) => {
+   const parsed = branchKey(key);
+   return parsed === null || !own.has(parsed.name);
+  })
+  // [key, value] tuples, never "key=value": a key may hold "=" (a url.<x>
+  // subsection), so a joined string lets two different records collide.
+  .map(({ key, value }): [string, string | null] => [key, value]);
+ return { bytes: JSON.stringify(kept), records: kept };
 }
 
 /**
- * Snapshot of the git state a worker could tamper with: the shared `config`
- * (less ranger's own node-branch tracking, see `configRecords`), per-worktree
- * `config.worktree` files, and the hooks directory. Taken before the worker
- * runs; `assertGitUntouched` compares it before any git call after. `base` is
- * the map's base branch, the merge target of those tracking entries: the
- * snapshot and its assert must be given the same one.
+ * The git state as the tamper check reads it: `hash` gates (order-sensitive,
+ * every byte), `entries` only names what moved. One digest per config key
+ * (its values in file order), per `config.worktree` file and per hook, so a
+ * mismatch can say `http.sslverify` without the journal ever holding a
+ * config value (a remote URL can carry a token).
  */
-export function gitConfigSnapshot(canonical: string, base = "main"): string {
+export interface GitState {
+ hash: string;
+ entries: Record<string, string>;
+}
+
+const digest = (data: Buffer | string): string => createHash("sha256").update(data).digest("hex");
+
+/**
+ * Read the git state a worker could tamper with: the shared `config` (less
+ * ranger's own node-branch tracking, see `configRecords`), per-worktree
+ * `config.worktree` files, and the hooks directory. `base` is the map's base
+ * branch, the merge target of those tracking entries: a state and the one it
+ * is compared with must be read with the same base.
+ */
+export function readGitState(canonical: string, base = "main"): GitState {
  const gitDir = join(canonical, ".git");
  const hash = createHash("sha256");
+ const entries: Record<string, string> = {};
  // Every part is length-framed, and a missing file is "-" where a length
  // would be: bare concatenation let bytes move across a file boundary
  // (hook B deleted, its path and body appended to hook A) and hash alike.
@@ -189,11 +207,21 @@ export function gitConfigSnapshot(canonical: string, base = "main"): string {
  };
  const add = (file: string) => {
   part(file);
-  part(existsSync(file) ? readFileSync(file) : null);
+  const body = existsSync(file) ? readFileSync(file) : null;
+  part(body);
+  if (body !== null) entries[file.slice(gitDir.length + 1)] = digest(body);
  };
  const config = join(gitDir, "config");
  part(config);
- part(configRecords(config, base));
+ const listed = configRecords(config, base);
+ part(listed.bytes);
+ if (listed.records === null) {
+  entries[`config ${typeof listed.bytes === "string" ? listed.bytes : "(unparsed)"}`] = digest(listed.bytes);
+ } else {
+  const byKey = new Map<string, (string | null)[]>();
+  for (const [key, value] of listed.records) byKey.set(key, [...(byKey.get(key) ?? []), value]);
+  for (const [key, values] of byKey) entries[key] = digest(JSON.stringify(values));
+ }
  add(join(gitDir, "config.worktree"));
  const worktrees = join(gitDir, "worktrees");
  if (existsSync(worktrees)) {
@@ -206,19 +234,45 @@ export function gitConfigSnapshot(canonical: string, base = "main"): string {
  if (existsSync(hooks)) {
   for (const entry of readdirSync(hooks).sort()) add(join(hooks, entry));
  }
- return hash.digest("hex");
+ return { hash: hash.digest("hex"), entries };
 }
 
+/**
+ * What differs between two states, by name: config keys, `config.worktree`
+ * files and hooks, each marked new or gone when only one side has it. Empty
+ * when the hashes differ only in record order, which still changes what git
+ * runs (`gitStateChanges` callers gate on the hash, never on this list).
+ */
+export function gitStateChanges(was: GitState["entries"], now: GitState["entries"]): string[] {
+ const names = [...new Set([...Object.keys(was), ...Object.keys(now)])].sort();
+ return names.flatMap((name) => {
+  if (!(name in was)) return [`${name} (new)`];
+  if (!(name in now)) return [`${name} (gone)`];
+  return was[name] === now[name] ? [] : [name];
+ });
+}
+
+/**
+ * The hash of `readGitState`: taken before the worker runs, compared by
+ * `assertGitUntouched` before any git call after.
+ */
+export function gitConfigSnapshot(canonical: string, base = "main"): string {
+ return readGitState(canonical, base).hash;
+}
+
+/** Throw unless the git state still hashes to `snapshot`; returns the state it read (the one it vetted). */
 export function assertGitUntouched(
  canonical: string,
  snapshot: string,
  base = "main",
-): void {
- if (gitConfigSnapshot(canonical, base) !== snapshot) {
+): GitState {
+ const state = readGitState(canonical, base);
+ if (state.hash !== snapshot) {
   throw new GitSafetyError(
    "the git config or hooks changed while the worker ran — refusing to run git against a tampered checkout",
   );
  }
+ return state;
 }
 
 /** GitHub's closing keywords followed by an issue reference (same repo, cross-repo, or URL). */
@@ -290,7 +344,7 @@ export async function assertNoClosingKeywords(
 
 /**
  * The vetted push: the supervisor's single credentialed write of exactly
- * `branch`, from an untampered checkout.
+ * `branch`, from an untampered checkout. Returns the state it vetted.
  */
 export async function vettedPush(opts: {
  worktree: string;
@@ -302,8 +356,8 @@ export async function vettedPush(opts: {
  base?: string;
  /** What to push (default HEAD); research pushes its named local branch. */
  source?: string;
-}): Promise<void> {
- assertGitUntouched(opts.canonical, opts.configSnapshot, opts.base);
+}): Promise<GitState> {
+ const vetted = assertGitUntouched(opts.canonical, opts.configSnapshot, opts.base);
  const push = await safeGit(
   ["push", "--no-verify", "origin", `${opts.source ?? "HEAD"}:refs/heads/${opts.branch}`],
   { cwd: opts.worktree, token: opts.token, timeoutMs: 120_000 },
@@ -311,6 +365,7 @@ export async function vettedPush(opts: {
  if (push.code !== 0) {
   throw new GitSafetyError(`push of ${opts.branch} failed: ${push.stderr.trim()}`);
  }
+ return vetted;
 }
 
 /**

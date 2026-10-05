@@ -20,7 +20,8 @@ import { openJournal, type Journal } from "../src/journal.ts";
 import { ReviewError, type ReviewVerdict } from "../src/review.ts";
 import { LAST_IMPLEMENT_MAP } from "../src/maps.ts";
 import { sweepMap } from "../src/sweep.ts";
-import { runNode, type RunNodeContext } from "../src/worker.ts";
+import { bootstrapWorktree, runNode, type RunNodeContext } from "../src/worker.ts";
+import { knownGoodKey, trustCurrentGitState } from "../src/git-trust.ts";
 import { baseConfigLines, createCanonicalRepo, GIT_ENV } from "./support.ts";
 import { saveViewsRecord, viewsDirectory } from "../src/views.ts";
 import { DiscordAnnouncer } from "../src/announce.ts";
@@ -554,6 +555,111 @@ describe("implement lane (node #23)", () => {
   expect(log).toBeDefined();
   expect(readFileSync(log as string, "utf8")).toContain("build pass — exit 0");
  }, 60_000);
+
+ // Node #81: the supervisor's tests run worker-written code. A failed run's
+ // change to the shared git config must not become the next run's trusted
+ // starting point.
+ describe("known-good git state across runs (node #81)", () => {
+  const TAMPER = "git config http.sslVerify false; exit 1";
+  const git = (args: string[], cwd: string) => runCmd("git", args, { cwd, env: { ...process.env, ...GIT_ENV } });
+  const fetchedMain = async (r: Rig) => (await git(["rev-parse", "refs/remotes/origin/main"], r.canonical)).stdout.trim();
+  /** Move origin main, so a credentialed fetch by the next run would show. */
+  const moveOriginMain = async (r: Rig) => {
+   const seed = join(r.dir, "seed");
+   writeFileSync(join(seed, "NOTES.md"), "later\n");
+   await git(["add", "-A"], seed);
+   await git(["commit", "-m", "later on main"], seed);
+   expect((await git(["push", r.origin, "HEAD:main"], seed)).code).toBe(0);
+  };
+
+  test("a failed test run that sets http.sslVerify parks the resume at the implement phase before any credentialed git call", async () => {
+   const r = await rig({});
+   cleanup.push(r.dir);
+   r.ctx.map.commands.test = TAMPER;
+   const first = await runNode("20", r.ctx);
+   expect(first.status).toBe("failed");
+   expect(first.detail).toContain("tests (");
+   expect((await git(["config", "--get", "http.sslVerify"], r.canonical)).stdout.trim()).toBe("false");
+
+   r.ctx.map.commands.test = "test -f src/feature.ts";
+   await moveOriginMain(r);
+   const fetched = await fetchedMain(r);
+   r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+   const resumed = await runNode("20", r.ctx);
+   expect(resumed.status).toBe("parked");
+   expect(resumed.detail).toContain("http.sslverify (new)");
+   expect(resumed.detail).toContain("ranger trust-git --map acme/widgets#1");
+   expect(r.journal.getWorker("20", "acme/widgets")?.status).toBe("parked");
+   expect(r.journal.getWorker("20", "acme/widgets")?.outcome).toContain("http.sslverify");
+   expect(r.journal.deadmanCount()).toBe(1); // the failed run only; a park is not a crash
+   // Nothing ran under the credential: no fetch, no push, no PR.
+   expect(await fetchedMain(r)).toBe(fetched);
+   expect(await r.github.sha("node/20-add-the-feature-module")).toBe("");
+   expect(r.github.prs.size).toBe(0);
+
+   // Parked again on the next resume: the changed state was not adopted.
+   r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+   expect((await runNode("20", r.ctx)).status).toBe("parked");
+
+   // The operator vets the change and trusts it; the node then runs (from a
+   // clean branch: the fake worker cannot commit the same build twice).
+   trustCurrentGitState(r.journal, r.canonical, "main", "acme/widgets");
+   await git(["reset", "--hard", "refs/remotes/origin/main"], join(r.canonical, ".worktrees", "node-20"));
+   r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+   expect(await fetchedMain(r)).not.toBe(fetched);
+  }, 60_000);
+
+  test("a failed fix-pass test run that sets http.sslVerify parks the resume at the review phase before its push", async () => {
+   const r = await rig({ blockers: [1, 0] });
+   cleanup.push(r.dir);
+   // Passes on the build; the fix pass's tests change the config and fail.
+   r.ctx.map.commands.test = `test -f src/feature.ts && if grep -q fixed src/feature.ts; then ${TAMPER}; fi`;
+   const first = await runNode("20", r.ctx);
+   expect(first.status).toBe("failed");
+   expect(first.detail).toContain("tests (");
+   const pushed = await r.github.sha("node/20-add-the-feature-module");
+   expect(pushed).not.toBe("");
+   expect(r.github.comments.get(1)).toHaveLength(1); // round 1
+
+   r.ctx.map.commands.test = "test -f src/feature.ts";
+   await moveOriginMain(r);
+   const fetched = await fetchedMain(r);
+   r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+   const resumed = await runNode("20", r.ctx);
+   expect(resumed.status).toBe("parked");
+   expect(resumed.detail).toContain("http.sslverify (new)");
+   expect(await fetchedMain(r)).toBe(fetched);
+   expect(await r.github.sha("node/20-add-the-feature-module")).toBe(pushed);
+   expect(r.github.comments.get(1)).toHaveLength(1);
+   expect(r.calls).toHaveLength(1);
+  }, 60_000);
+
+  test("a parallel node's worktree created between runs parks nothing", async () => {
+   const r = await rig({});
+   cleanup.push(r.dir);
+   r.ctx.workerCommand = [implementWorker, "noop"];
+   expect((await runNode("20", r.ctx)).status).toBe("failed");
+
+   await bootstrapWorktree(r.canonical, "21", "another-node", "tok");
+   expect((await git(["config", "--get", "branch.node/21-another-node.merge"], r.canonical)).stdout.trim()).toBe("refs/heads/main");
+
+   r.ctx.workerCommand = [implementWorker, "build"];
+   r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  }, 60_000);
+
+  test("a journal without a record keeps today's behaviour: the run records the state and says so", async () => {
+   const r = await rig({});
+   cleanup.push(r.dir);
+   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+   const trust = r.journal.listEvents("acme/widgets", 500).filter((e) => e.kind === "git-trust");
+   expect(trust).toHaveLength(1);
+   expect(trust[0].detail).toContain("no known-good git state recorded");
+   const record = JSON.parse(r.journal.getHealth(knownGoodKey(r.canonical, "main")) as string);
+   expect(record.source).toBe("vetted push");
+  }, 60_000);
+ });
 
  test("a transient GitHub error at review is not counted and leaves the row for the sweep (found live on #45)", async () => {
   const r = await rig({});
