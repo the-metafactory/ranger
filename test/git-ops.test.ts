@@ -176,6 +176,8 @@ describe("gitConfigSnapshot: everything else stays in the hash", () => {
   [
    "a per-worktree config.worktree",
    async () => {
+    // Git reads config.worktree only with the extension on (node #86).
+    await config("extensions.worktreeConfig", "true");
     await bootstrapWorktree(canonical, "663", "x", "tok");
     const [entry] = readdirSync(join(canonical, ".git", "worktrees"));
     // The snapshot taken after the worktree exists, then its config changes.

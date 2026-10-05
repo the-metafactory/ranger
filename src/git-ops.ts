@@ -134,13 +134,13 @@ function branchKey(key: string): { name: string; key: string } | null {
 function configRecords(
  file: string,
  read: ConfigReader,
-): { bytes: Buffer | string; records: Records | null } {
+): { bytes: Buffer | string; records: Records | null; worktreeConfig: boolean } {
  const body = readIfFile(file);
- if (body === null) return { bytes: "(absent)", records: null };
- if (body === NOT_A_FILE) return { bytes: NOT_A_FILE_ENTRY, records: null };
+ if (body === null) return { bytes: "(absent)", records: null, worktreeConfig: true };
+ if (body === NOT_A_FILE) return { bytes: NOT_A_FILE_ENTRY, records: null, worktreeConfig: true };
  const records = read.parse(body);
  if (records === null) {
-  return { bytes: Buffer.concat([Buffer.from("(unparsed)\0"), body]), records: null };
+  return { bytes: Buffer.concat([Buffer.from("(unparsed)\0"), body]), records: null, worktreeConfig: true };
  }
  const sections = new Map<string, { key: string; value: string | null }[]>();
  for (const [key, value] of records) {
@@ -172,7 +172,7 @@ function configRecords(
   });
  // [key, value] tuples, never "key=value": a key may hold "=" (a url.<x>
  // subsection), so a joined string lets two different records collide.
- return { bytes: JSON.stringify(kept), records: kept };
+ return { bytes: JSON.stringify(kept), records: kept, worktreeConfig: worktreeConfigEnabled(body) };
 }
 
 /** A tracking target ranger's node branches may carry: a branch under refs/heads/. */
@@ -229,6 +229,28 @@ function listConfig(body: Buffer): Records | null {
    const nl = r.indexOf("\n");
    return nl === -1 ? [r, null] : [r.slice(0, nl), r.slice(nl + 1)];
   });
+}
+
+/**
+ * Whether git reads `config.worktree` files in this repository: the shared
+ * config's `extensions.worktreeConfig`, read by git as a bool from the same
+ * bytes that are hashed (git takes the repository format from that file
+ * alone, never from global or system config). Unset is off; a value git
+ * cannot read as a bool, or a failed call, counts as on, so every
+ * `config.worktree` stays in the state (fails closed).
+ */
+function worktreeConfigEnabled(body: Buffer): boolean {
+ const got = spawnSync(
+  "git",
+  [
+   "-c", "core.hooksPath=/dev/null",
+   "-c", "core.fsmonitor=false",
+   "config", "--file", "-", "--no-includes", "--type=bool", "--get", "extensions.worktreeconfig",
+  ],
+  { env: minimalGitEnv(), encoding: "utf8", input: body, timeout: 10_000 },
+ );
+ if (got.error === undefined && got.status === 1) return false;
+ return !(got.error === undefined && got.status === 0 && got.stdout.trim() === "false");
 }
 
 /**
@@ -384,7 +406,8 @@ function linkedWorktreeConfigs(
  * Read the git state a worker could tamper with: the shared `config` (less
  * ranger's own node-branch tracking, see `configRecords`), the main
  * `config.worktree` and the linked ones that set something of their own
- * (`linkedWorktreeConfigs`), and the hooks directory. Include keys in any
+ * (`linkedWorktreeConfigs`) while `extensions.worktreeConfig` is on
+ * (`worktreeConfigEnabled`), and the hooks directory. Include keys in any
  * of those config files are listed in `includes`; the files they name are
  * never read.
  */
@@ -434,12 +457,22 @@ export function readGitState(canonical: string): GitState {
   for (const [key, values] of byKey) entries[keyLabel(key)] = digest(JSON.stringify(values));
  }
  const mainWorktreeConfig = join(gitDir, "config.worktree");
- const mainPresent = existsSync(mainWorktreeConfig);
- add(mainWorktreeConfig);
- const mainRecords = mainPresent ? readConfigFile(mainWorktreeConfig, read) : null;
- if (mainRecords !== null) noteIncludes(mainWorktreeConfig, mainRecords);
- const linked = linkedWorktreeConfigs(gitDir, { present: mainPresent, records: mainRecords }, noteIncludes, read);
- for (const file of linked) add(file, true);
+ if (listed.worktreeConfig) {
+  const mainPresent = existsSync(mainWorktreeConfig);
+  add(mainWorktreeConfig);
+  const mainRecords = mainPresent ? readConfigFile(mainWorktreeConfig, read) : null;
+  if (mainRecords !== null) noteIncludes(mainWorktreeConfig, mainRecords);
+  const linked = linkedWorktreeConfigs(gitDir, { present: mainPresent, records: mainRecords }, noteIncludes, read);
+  for (const file of linked) add(file, true);
+ } else {
+  // Git reads no config.worktree with the extension off, and copies none
+  // into a new worktree: the main file hashes as absent (as a state recorded
+  // before node #86 did), and no file is read, named or vetted for includes.
+  // A leftover main file is not flagged: turning the extension on is a
+  // shared-config change, which mismatches, and the file is judged then.
+  part(mainWorktreeConfig);
+  part(null);
+ }
  const hooks = join(gitDir, "hooks");
  if (existsSync(hooks)) {
   for (const entry of readdirSync(hooks).sort()) add(join(hooks, entry));

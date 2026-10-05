@@ -315,6 +315,67 @@ describe("per-worktree config: git's copy of the main config.worktree", () => {
 });
 
 /**
+ * Node #86: with `extensions.worktreeConfig` off git reads no
+ * `config.worktree` and copies none into a new worktree, so none is in the
+ * state; turning the extension on or off changes what git reads, and is.
+ */
+describe("per-worktree config with extensions.worktreeConfig off", () => {
+ const leftover = () =>
+  writeFileSync(join(canonical, ".git", "config.worktree"), "[http]\n\tsslVerify = false\n");
+ const linked = (name: string) => join(canonical, ".git", "worktrees", name, "config.worktree");
+
+ for (const [what, off] of [
+  ["set false", () => config("extensions.worktreeConfig", "false")],
+  ["unset", async () => {}],
+ ] as const) {
+  test(`a worktree ranger adds over a populated leftover main file matches (${what})`, async () => {
+   await off();
+   leftover();
+   await checkKnownGood(journal, canonical, at);
+   await bootstrapWorktree(canonical, "663", "stations-are-solid", "tok");
+   expect(await Bun.file(linked("node-663")).exists()).toBe(false);
+   expect((await checkKnownGood(journal, canonical, at)).kind).toBe("match");
+  });
+ }
+
+ test("a leftover main file, its change and an include in it are not in the state", async () => {
+  await config("extensions.worktreeConfig", "false");
+  const before = readGitState(canonical);
+  leftover();
+  appendFileSync(join(canonical, ".git", "config.worktree"), "[include]\n\tpath = /tmp/x.conf\n");
+  const after = readGitState(canonical);
+  expect(after.hash).toBe(before.hash);
+  expect(after.includes).toEqual([]);
+  expect(Object.keys(after.entries).filter((n) => n.includes("config.worktree"))).toEqual([]);
+ });
+
+ test("turning the extension on between runs is a mismatch naming it", async () => {
+  await config("extensions.worktreeConfig", "false");
+  leftover();
+  await checkKnownGood(journal, canonical, at);
+  await config("extensions.worktreeConfig", "true");
+  const check = await checkKnownGood(journal, canonical, at);
+  expect(check.kind === "mismatch" && check.changed).toEqual(["config.worktree (new)", "extensions.worktreeconfig"]);
+ });
+
+ test("turning the extension off between runs is a mismatch naming it", async () => {
+  await config("extensions.worktreeConfig", "true");
+  leftover();
+  await checkKnownGood(journal, canonical, at);
+  await config("extensions.worktreeConfig", "false");
+  const check = await checkKnownGood(journal, canonical, at);
+  expect(check.kind === "mismatch" && check.changed).toEqual(["config.worktree (gone)", "extensions.worktreeconfig"]);
+ });
+
+ test("a value git cannot read as a bool keeps every config.worktree in the state", async () => {
+  await config("extensions.worktreeConfig", "maybe");
+  const before = readGitState(canonical);
+  leftover();
+  expect(gitStateChanges(before.entries, readGitState(canonical).entries)).toEqual(["config.worktree (new)"]);
+ });
+});
+
+/**
  * Includes fail closed (node #81, decided 2026-10-05): any include key in the
  * shared config or a `config.worktree` refuses the state, named, and no code
  * follows the path it holds.
