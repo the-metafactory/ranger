@@ -946,6 +946,20 @@ describe("implement lane (node #23)", () => {
   rmSync(flag, { force: true });
  }, 60_000);
 
+ test("a failed test run that wrote into the tree is not retried: the retry would certify files the commit lacks", async () => {
+  // The failed run leaves src/fixed.ts behind; a retry would pass only because of it.
+  const r = await rig({ test: "if [ -f src/fixed.ts ]; then exit 0; else touch src/fixed.ts; exit 1; fi" });
+  cleanup.push(r.dir);
+  r.ctx.hostLoad = () => ({ load: 14, cores: 10 });
+  r.ctx.quietHost = { pollMs: 1, maxMs: 5 };
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("failed");
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.endsWith("failed on a busy host and changed the tree or HEAD — not retried"))).toBe(true);
+  expect(events.some((d) => d.endsWith("passed on the retry"))).toBe(false);
+  expect(r.github.prs.size).toBe(0);
+ }, 60_000);
+
  test("built and committed work a failed run left unpushed is adopted on resume, with no new worker session", async () => {
   const flag = join(tmpdir(), `ranger-adopt-${Date.now()}`);
   const r = await rig({ test: `test -f ${flag}` });

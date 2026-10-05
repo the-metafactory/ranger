@@ -1360,9 +1360,12 @@ function testsFailedDetail(testCommand: string, tests: RunResult, after: string)
  * The supervisor's own test run. A failure keeps its whole output in the
  * node's log (2026-10-05: #691's failure kept only 400 characters of passing
  * tests, so the failing one was lost). A failure on a busy host is retried
- * once, after the host quiets: the worker's run passed the same tree, and a
- * rerun at normal load passed it again, while the supervisor's ran at load
- * 40–100 and failed.
+ * once, after the host quiets or the quiet-host wait (20 minutes) runs out:
+ * the worker's run passed the same tree, and a rerun at normal load passed
+ * it again, while the supervisor's ran at load 40–100 and failed. Only a
+ * failed run that left HEAD and the tree as they were is retried, and a
+ * passing retry must leave them so too: the retry would otherwise certify
+ * files the failed run wrote that the pushed commit does not carry.
  */
 async function supervisorTests(
  ctx: ImplementContext,
@@ -1370,11 +1373,22 @@ async function supervisorTests(
  label: string,
 ): Promise<{ tests: RunResult; log: string | null }> {
  const { journal, map, node, worktree } = ctx;
+ const head = await headSha(worktree);
+ const untouched = async (): Promise<boolean> =>
+  (await headSha(worktree)) === head && (await dirtyFiles(worktree)).length === 0;
  let tests = await runShell(testCommand, worktree, ctx, TEST_TIMEOUT_MS);
  if (tests.code === 0) return { tests, log: null };
  const log = saveWorkerLog(journal.path, map.repo, node.ref.id, ctx.generation, `${label}: supervisor tests (${testCommand})`, tests);
  const host = (ctx.hostLoad ?? realHostLoad)();
  if (host.load < host.cores) return { tests, log };
+ if (!(await untouched())) {
+  journal.recordEvent("reviewed", {
+   nodeId: node.ref.id,
+   repo: map.repo,
+   detail: `tests (${testCommand}) failed on a busy host and changed the tree or HEAD — not retried`,
+  });
+  return { tests, log };
+ }
  journal.recordEvent("reviewed", {
   nodeId: node.ref.id,
   repo: map.repo,
@@ -1382,6 +1396,9 @@ async function supervisorTests(
  });
  await awaitQuietHost(ctx, "the test retry");
  tests = await runShell(testCommand, worktree, ctx, TEST_TIMEOUT_MS);
+ if (tests.code === 0 && !(await untouched())) {
+  tests = { ...tests, code: 1, stderr: `the retry passed, but it changed the tree or HEAD — its pass certifies nothing that gets pushed\n${tests.stderr}` };
+ }
  if (tests.code === 0) {
   journal.recordEvent("reviewed", { nodeId: node.ref.id, repo: map.repo, detail: `tests (${testCommand}) passed on the retry` });
   return { tests, log };
