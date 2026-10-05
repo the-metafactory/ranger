@@ -1,6 +1,4 @@
-import { createHash } from "node:crypto";
-import { constants as fsConstants, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { open, readlink, type FileHandle } from "node:fs/promises";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { availableParallelism, loadavg, tmpdir } from "node:os";
 import { join } from "node:path";
 import { DiscordAnnouncer } from "./announce.ts";
@@ -628,7 +626,10 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
    configSnapshot: built.snapshot,
   });
   journal.recordEvent("pushed", { nodeId, repo, detail: `${branch} @ ${built.sha.slice(0, 8)}` });
-  recordHead(ctx, built.sha);
+  // Review selection reads who wrote a head: an adopted build is the earlier
+  // session's work, never this run's substrate's.
+  if (built.adoptedFrom === undefined) recordHead(ctx, built.sha);
+  else if (built.adoptedFrom !== null) recordHead(ctx, built.sha, built.adoptedFrom);
 
   const title = prTitle(node);
   fence("open PR");
@@ -986,6 +987,11 @@ interface PassResult {
  snapshot: string;
  sha: string;
  failure?: ImplementOutcome;
+ /**
+  * Set when the commits were adopted, not written by this run's worker: the
+  * substrate whose build session wrote them (null when no session says).
+  */
+ adoptedFrom?: SubstrateName | null;
 }
 
 /**
@@ -1009,13 +1015,13 @@ async function selectReviewSubstrate(
 }
 
 /** Which substrate wrote a pushed SHA: the review of that head reads it back. */
-function recordHead(ctx: ImplementContext, sha: string): void {
- if (ctx.substrate === undefined) return;
+function recordHead(ctx: ImplementContext, sha: string, substrate = ctx.substrate): void {
+ if (substrate === undefined) return;
  ctx.journal.recordHeadSubstrate({
   sha,
   repo: ctx.map.repo,
   nodeId: ctx.node.ref.id,
-  substrate: ctx.substrate,
+  substrate,
  });
 }
 
@@ -1364,14 +1370,13 @@ function testsFailedDetail(testCommand: string, tests: RunResult, after: string)
  * tests, so the failing one was lost). A failure on a busy host is retried
  * once, after the host quiets or the quiet-host wait (20 minutes) runs out:
  * the worker's run passed the same tree, and a rerun at normal load passed
- * it again, while the supervisor's ran at load 40–100 and failed. Only a
- * failed run that left HEAD and the tree as they were is retried, and a
- * passing retry must leave them so too: the retry would otherwise certify
- * files the failed run wrote that the pushed commit does not carry. "The
- * tree" includes the gitignored files git lists, by path and content (a new
- * or rewritten ignored fixture counts); a file added or changed inside an
- * already-ignored directory (node_modules/, a cache) is not seen, because
- * git lists only the directory.
+ * it again, while the supervisor's ran at load 40–100 and failed.
+ *
+ * The retry runs in a fresh detached checkout of the committed head, with
+ * its own install: nothing the failed run wrote into the node's worktree
+ * (untracked or ignored fixtures, index flags, links) can reach it, so a
+ * pass certifies exactly what gets pushed. The node's worktree is left as
+ * it is.
  */
 async function supervisorTests(
  ctx: ImplementContext,
@@ -1380,106 +1385,51 @@ async function supervisorTests(
 ): Promise<{ tests: RunResult; log: string | null }> {
  const { journal, map, node, worktree } = ctx;
  const head = await headSha(worktree);
- const ignoredBefore = await ignoredPaths(worktree);
- const untouched = async (): Promise<boolean> =>
-  (await headSha(worktree)) === head &&
-  (await dirtyFiles(worktree)).length === 0 &&
-  ignoredBefore !== null &&
-  (await ignoredPaths(worktree)) === ignoredBefore;
  let tests = await runShell(testCommand, worktree, ctx, TEST_TIMEOUT_MS);
  if (tests.code === 0) return { tests, log: null };
  const log = saveWorkerLog(journal.path, map.repo, node.ref.id, ctx.generation, `${label}: supervisor tests (${testCommand})`, tests);
  const host = (ctx.hostLoad ?? realHostLoad)();
  if (host.load < host.cores) return { tests, log };
- if (!(await untouched())) {
+ if ((await headSha(worktree)) !== head) {
   journal.recordEvent("reviewed", {
    nodeId: node.ref.id,
    repo: map.repo,
-   detail: `tests (${testCommand}) failed on a busy host and changed the tree or HEAD — not retried`,
+   detail: `tests (${testCommand}) failed on a busy host and moved HEAD — not retried`,
   });
   return { tests, log };
  }
  journal.recordEvent("reviewed", {
   nodeId: node.ref.id,
   repo: map.repo,
-  detail: `tests (${testCommand}) failed on a busy host (load ${host.load.toFixed(1)} on ${host.cores} cores) — retrying once when it quiets`,
+  detail: `tests (${testCommand}) failed on a busy host (load ${host.load.toFixed(1)} on ${host.cores} cores) — retrying once, in a fresh checkout of ${head.slice(0, 8)}, when it quiets`,
  });
  await awaitQuietHost(ctx, "the test retry");
- tests = await runShell(testCommand, worktree, ctx, TEST_TIMEOUT_MS);
- if (tests.code === 0 && !(await untouched())) {
-  tests = { ...tests, code: 1, stderr: `the retry passed, but it changed the tree or HEAD — its pass certifies nothing that gets pushed\n${tests.stderr}` };
- }
+ tests = await testsInFreshCheckout(ctx, testCommand, head);
  if (tests.code === 0) {
-  journal.recordEvent("reviewed", { nodeId: node.ref.id, repo: map.repo, detail: `tests (${testCommand}) passed on the retry` });
+  journal.recordEvent("reviewed", { nodeId: node.ref.id, repo: map.repo, detail: `tests (${testCommand}) passed on the retry in a fresh checkout` });
   return { tests, log };
  }
- saveWorkerLog(journal.path, map.repo, node.ref.id, ctx.generation, `${label}: supervisor test retry (${testCommand})`, tests);
+ saveWorkerLog(journal.path, map.repo, node.ref.id, ctx.generation, `${label}: supervisor test retry in a fresh checkout (${testCommand})`, tests);
  return { tests, log };
 }
 
-/**
- * The gitignored paths git lists in the worktree, as one string to compare.
- * An ignored file git lists on its own is compared by its content too, so a
- * rewritten fixture counts; an ignored directory is listed, and compared, by
- * its name alone. Paths are read NUL-delimited (`-z`), so git's quoting of
- * unusual names never reaches the file read. Null when git cannot say or a
- * listed file cannot be read: no comparison can then be trusted.
- */
-async function ignoredPaths(worktree: string): Promise<string | null> {
- const r = await safeGit(["status", "--porcelain", "-z", "--ignored=matching", "--untracked-files=all"], {
-  cwd: worktree,
-  timeoutMs: 60_000,
- });
- if (r.code !== 0) return null;
- const entries: string[] = [];
- for (const record of r.stdout.split("\0").filter((e) => e.startsWith("!! ")).sort()) {
-  const path = record.slice(3);
-  if (path.endsWith("/")) {
-   entries.push(path);
-   continue;
-  }
-  const digest = await fileDigest(join(worktree, path));
-  if (digest === null) return null;
-  entries.push(`${path}\0${digest}`);
- }
- return entries.join("\n");
-}
-
-/**
- * What an ignored path is, for comparison: a symlink by its target (never
- * followed), a regular file by the sha256 of exactly the bytes `fstat`
- * reports (read in chunks, so a worker-planted link to /dev/zero or a
- * growing file cannot stall the supervisor), anything else by its type.
- * Null when it cannot be read.
- */
-async function fileDigest(path: string): Promise<string | null> {
- let handle: FileHandle | undefined;
+/** The map's install and test commands in a throwaway detached checkout of `sha`. */
+async function testsInFreshCheckout(ctx: ImplementContext, testCommand: string, sha: string): Promise<RunResult> {
+ const scratch = mkdtempSync(join(tmpdir(), "ranger-test-retry-"));
+ const dir = join(scratch, "worktree");
+ const failed = (why: string): RunResult => ({ code: 1, stdout: "", stderr: why });
  try {
-  handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
- } catch (error) {
-  if ((error as NodeJS.ErrnoException).code !== "ELOOP") return null;
-  try {
-   return `symlink:${await readlink(path)}`;
-  } catch {
-   return null;
+  const add = await safeGit(["worktree", "add", "--detach", dir, sha], { cwd: ctx.worktree, timeoutMs: 120_000 });
+  if (add.code !== 0) return failed(`could not check out ${sha.slice(0, 8)} for the retry: ${add.stderr.trim()}`);
+  if (ctx.map.commands.install !== undefined) {
+   const install = await runShell(ctx.map.commands.install, dir, ctx, INSTALL_TIMEOUT_MS);
+   if (install.code !== 0) return { ...install, stderr: `install for the retry failed\n${install.stderr}` };
   }
- }
- try {
-  const stat = await handle.stat();
-  if (!stat.isFile()) return `type:${stat.mode & fsConstants.S_IFMT}`;
-  const hash = createHash("sha256");
-  const buffer = Buffer.alloc(64 * 1024);
-  for (let offset = 0; offset < stat.size; ) {
-   const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, stat.size - offset), offset);
-   if (bytesRead === 0) break;
-   hash.update(buffer.subarray(0, bytesRead));
-   offset += bytesRead;
-  }
-  return `${stat.size}:${hash.digest("hex")}`;
- } catch {
-  return null;
+  return await runShell(testCommand, dir, ctx, TEST_TIMEOUT_MS);
  } finally {
-  await handle.close();
+  await safeGit(["worktree", "remove", "--force", dir], { cwd: ctx.worktree, timeoutMs: 60_000 });
+  rmSync(scratch, { recursive: true, force: true });
+  await safeGit(["worktree", "prune"], { cwd: ctx.worktree, timeoutMs: 30_000 });
  }
 }
 
@@ -1518,7 +1468,12 @@ async function adoptBuiltWork(ctx: ImplementContext, testCommand: string): Promi
   repo: map.repo,
   detail: `adopting ${sha.slice(0, 8)}: a previous run built and committed it, and it passes the supervisor's tests — no new worker session`,
  });
- return { workerExit: null, snapshot, sha };
+ // The substrate of the last build session for this node wrote these
+ // commits (sessions are kept within retention; none means unknown).
+ const builtBy = (journal.listSubstrateSessions(new Date(0)) ?? [])
+  .filter((s) => s.repo === map.repo && s.nodeId === node.ref.id && s.kind === "worker")
+  .at(-1);
+ return { workerExit: null, snapshot, sha, adoptedFrom: builtBy?.substrate ?? null };
 }
 
 function tail(result: RunResult): string {

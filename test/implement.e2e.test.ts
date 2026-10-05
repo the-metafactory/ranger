@@ -941,73 +941,38 @@ describe("implement lane (node #23)", () => {
   r.ctx.quietHost = { pollMs: 1, maxMs: 60_000 };
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
   const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
-  expect(events.some((d) => d.includes("failed on a busy host (load 14.0 on 10 cores) — retrying once when it quiets"))).toBe(true);
-  expect(events.some((d) => d.endsWith("passed on the retry"))).toBe(true);
+  expect(events.some((d) => d.includes("failed on a busy host (load 14.0 on 10 cores) — retrying once, in a fresh checkout of "))).toBe(true);
+  expect(events.some((d) => d.endsWith("passed on the retry in a fresh checkout"))).toBe(true);
   rmSync(flag, { force: true });
- }, 60_000);
-
- test("a failed test run that wrote into the tree is not retried: the retry would certify files the commit lacks", async () => {
-  // The failed run leaves src/fixed.ts behind; a retry would pass only because of it.
-  const r = await rig({ test: "if [ -f src/fixed.ts ]; then exit 0; else touch src/fixed.ts; exit 1; fi" });
-  cleanup.push(r.dir);
-  r.ctx.hostLoad = () => ({ load: 14, cores: 10 });
-  r.ctx.quietHost = { pollMs: 1, maxMs: 5 };
-  const outcome = await runNode("20", r.ctx);
-  expect(outcome.status).toBe("failed");
-  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
-  expect(events.some((d) => d.endsWith("failed on a busy host and changed the tree or HEAD — not retried"))).toBe(true);
-  expect(events.some((d) => d.endsWith("passed on the retry"))).toBe(false);
-  expect(r.github.prs.size).toBe(0);
- }, 60_000);
-
- test("a failed test run that wrote an ignored fixture is not retried either", async () => {
-  const r = await rig({ test: "x=\"$(git rev-parse --git-common-dir)/info\"; mkdir -p \"$x\"; grep -qx \"*.fixture\" \"$x/exclude\" 2>/dev/null || echo \"*.fixture\" >> \"$x/exclude\"; test -z \"$(git status --porcelain)\" || exit 7; if [ -f t.fixture ]; then exit 0; else touch t.fixture; exit 1; fi" });
-  cleanup.push(r.dir);
-  r.ctx.hostLoad = () => ({ load: 14, cores: 10 });
-  r.ctx.quietHost = { pollMs: 1, maxMs: 5 };
-  expect((await runNode("20", r.ctx)).status).toBe("failed");
-  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
-  expect(events.some((d) => d.endsWith("failed on a busy host and changed the tree or HEAD — not retried"))).toBe(true);
-  expect(r.github.prs.size).toBe(0);
  }, 60_000);
 
  /** Exclude *.fixture through the shared repo's info/exclude, so a fixture is ignored rather than untracked. */
  const IGNORE_FIXTURES = "x=\"$(git rev-parse --git-common-dir)/info\"; mkdir -p \"$x\"; grep -qx \"*.fixture\" \"$x/exclude\" 2>/dev/null || echo \"*.fixture\" >> \"$x/exclude\"";
 
- for (const [why, name] of [
-  ["an existing ignored fixture", "t.fixture"],
-  ["an ignored fixture whose name git quotes", "a ü.fixture"],
- ]) {
-  test(`a failed test run that rewrote ${why} is not retried: the retry would pass on content the commit lacks`, async () => {
-   const r = await rig({
-    install: `${IGNORE_FIXTURES}; echo old > "${name}"`,
-    test: `${IGNORE_FIXTURES}; test -z "$(git status --porcelain)" || exit 7; if grep -qx new "${name}"; then exit 0; else echo new > "${name}"; exit 1; fi`,
-   });
+ // Each failed run leaves something behind in the node's worktree that a
+ // retry there would pass on. The retry runs in a fresh checkout of the
+ // committed head instead, so none of it reaches the retry, which fails.
+ for (const [what, install, cmd] of [
+  ["an untracked fixture", undefined, "if [ -f src/fixed.ts ]; then exit 0; else touch src/fixed.ts; exit 1; fi"],
+  ["a new ignored fixture", IGNORE_FIXTURES, `${IGNORE_FIXTURES}; if [ -f t.fixture ]; then exit 0; else touch t.fixture; exit 1; fi`],
+  ["a rewritten ignored fixture", `${IGNORE_FIXTURES}; echo old > t.fixture`, `${IGNORE_FIXTURES}; if grep -qx new t.fixture; then exit 0; else echo new > t.fixture; exit 1; fi`],
+  ["an ignored fixture whose name git quotes", `${IGNORE_FIXTURES}; echo old > "a ü.fixture"`, `${IGNORE_FIXTURES}; if grep -qx new "a ü.fixture"; then exit 0; else echo new > "a ü.fixture"; exit 1; fi`],
+  ["a tracked file hidden by --skip-worktree", undefined, "if grep -qx new README.md; then exit 0; else git update-index --skip-worktree README.md; echo new > README.md; exit 1; fi"],
+ ] as const) {
+  test(`a test retry on a busy host never sees ${what} the failed run left: it runs in a fresh checkout`, async () => {
+   const r = await rig({ ...(install === undefined ? {} : { install }), test: cmd });
    cleanup.push(r.dir);
    r.ctx.hostLoad = () => ({ load: 14, cores: 10 });
    r.ctx.quietHost = { pollMs: 1, maxMs: 5 };
    expect((await runNode("20", r.ctx)).status).toBe("failed");
    const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
-   expect(events.some((d) => d.endsWith("failed on a busy host and changed the tree or HEAD — not retried"))).toBe(true);
+   expect(events.some((d) => d.includes("— retrying once, in a fresh checkout of "))).toBe(true);
+   expect(events.some((d) => d.includes("passed on the retry"))).toBe(false);
    expect(r.github.prs.size).toBe(0);
+   const worktrees = await runCmd("git", ["worktree", "list"], { cwd: r.canonical });
+   expect(worktrees.stdout).not.toContain("ranger-test-retry-");
   }, 60_000);
  }
-
- test("an ignored symlink to /dev/zero is compared by its target and never read: the retry still runs", async () => {
-  const flag = join(tmpdir(), `ranger-zero-${Date.now()}`);
-  const r = await rig({
-   install: `${IGNORE_FIXTURES}; ln -sf /dev/zero z.fixture`,
-   test: `if [ -f ${flag} ]; then test -f src/feature.ts; else touch ${flag}; exit 1; fi`,
-  });
-  cleanup.push(r.dir);
-  const loads = [14, 13, 2];
-  r.ctx.hostLoad = () => ({ load: loads.length > 1 ? (loads.shift() as number) : loads[0], cores: 10 });
-  r.ctx.quietHost = { pollMs: 1, maxMs: 60_000 };
-  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
-  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
-  expect(events.some((d) => d.endsWith("passed on the retry"))).toBe(true);
-  rmSync(flag, { force: true });
- }, 60_000);
 
  test("built and committed work a failed run left unpushed is adopted on resume, with no new worker session", async () => {
   const flag = join(tmpdir(), `ranger-adopt-${Date.now()}`);
@@ -1022,6 +987,28 @@ describe("implement lane (node #23)", () => {
   const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
   expect(events.some((d) => d.startsWith("adopting ") && d.includes("no new worker session"))).toBe(true);
   expect(r.github.prs.size).toBe(1);
+  rmSync(flag, { force: true });
+ }, 60_000);
+
+ test("an adopted head is credited to the substrate that built it, not the one that resumed", async () => {
+  const flag = join(tmpdir(), `ranger-adopt-author-${Date.now()}`);
+  const r = await rig({ test: `test -f ${flag}` });
+  cleanup.push(r.dir);
+  delete r.ctx.workerCommand;
+  let sessions = 0;
+  r.ctx.worker = async (prompt, opts) => {
+   sessions += 1;
+   return runCmd(implementWorker, ["build", prompt], opts);
+  };
+  r.ctx.substrate = "claude";
+  expect((await runNode("20", r.ctx)).status).toBe("failed"); // Claude built it; the tests fail
+  writeFileSync(flag, "");
+  r.ctx.substrate = "codex";
+  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  expect(sessions).toBe(1); // adopted: Codex ran no session
+  const head = await r.github.sha("node/20-add-the-feature-module");
+  expect(r.journal.headSubstrate("acme/widgets", head)).toBe("claude");
   rmSync(flag, { force: true });
  }, 60_000);
 
