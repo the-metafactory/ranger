@@ -34,6 +34,9 @@
 #     fixed here, never read from the caller;
 #   - bun reads ranger's own bunfig.toml (`--config`): its default is
 #     $cwd/bunfig.toml, whose `preload` would run the caller's code first;
+#   - bun loads no .env (`--no-env-file`): its default reads $cwd/.env*
+#     after this clean-up, and `SAGE_X=$GH_TOKEN` there would copy a token
+#     into a name the worker environment forwards (src/worker-env.ts);
 #   - every environment entry outside PASS_THROUGH and the pinned names is
 #     dropped, including entries bash cannot unset (readonly SHELLOPTS) or
 #     never imports (BASH_FUNC_*%%, which a child bash would): BUN_OPTIONS,
@@ -134,4 +137,4 @@ while IFS= read -r -d '' entry; do
   esac
 done < <(/usr/bin/env -0)
 
-exec /usr/bin/env ${drop[@]+"${drop[@]}"} "$BUN" --config="$RANGER_DIR/bunfig.toml" "$RANGER_CLI" "$@"
+exec /usr/bin/env ${drop[@]+"${drop[@]}"} "$BUN" --config="$RANGER_DIR/bunfig.toml" --no-env-file "$RANGER_CLI" "$@"

@@ -259,7 +259,7 @@ describe("state.journalPath (node #66)", () => {
 describe("the live wrapper (node #66)", () => {
  // The installed copy with its pinned programs swapped for stand-ins: a bun
  // that prints its argv and env, and a keychain that answers "kc-<service>".
- function stubbedWrapper(): { wrapper: string; home: string; evilBin: string } {
+ function stubbedWrapper(opts: { realBun?: boolean } = {}): { wrapper: string; home: string; evilBin: string } {
   const root = tempDir();
   const home = join(root, "home");
   const stubs = join(root, "stubs");
@@ -279,7 +279,7 @@ describe("the live wrapper (node #66)", () => {
    wrapper,
    source
     .replaceAll("/Users/__USER__", home)
-    .replaceAll("/opt/homebrew/bin/bun", join(stubs, "bun"))
+    .replaceAll("/opt/homebrew/bin/bun", opts.realBun ? bun : join(stubs, "bun"))
     .replaceAll("/usr/bin/security", join(stubs, "security")),
    { mode: 0o755 },
   );
@@ -315,7 +315,7 @@ describe("the live wrapper (node #66)", () => {
    cwd,
   );
   const ranger = join(home, "work", "mf", "ranger");
-  expect(out.argv).toBe(`ARGV --config=${join(ranger, "bunfig.toml")} ${join(ranger, "src", "cli.ts")} tick --config ranger.yaml`);
+  expect(out.argv).toBe(`ARGV --config=${join(ranger, "bunfig.toml")} --no-env-file ${join(ranger, "src", "cli.ts")} tick --config ranger.yaml`);
   expect(out.stdout).not.toContain("HIJACKED");
   expect(out.stdout).not.toContain("FUNC-HIJACK");
   expect(out.stderr).toBe(""); // no BASH_ENV, no xtrace of the token exports
@@ -326,6 +326,26 @@ describe("the live wrapper (node #66)", () => {
   expect(out.vars.get("RANGER_READONLY_GH_TOKEN_PERSONAL")).toBe("kc-ranger-ro-personal");
   expect([...out.vars.keys()].some((k) => k.startsWith("BASH_FUNC_"))).toBe(false);
   expect(out.vars.has("SHELLOPTS")).toBe(false);
+ });
+
+ test("real bun loads no .env from the caller's directory", async () => {
+  // A caller-controlled .env expands \$GH_TOKEN into a name the worker env
+  // forwards (SAGE_*): bun's dotenv loading runs after the wrapper's clean-up.
+  const { wrapper, home } = stubbedWrapper({ realBun: true });
+  const ranger = join(home, "work", "mf", "ranger");
+  mkdirSync(join(ranger, "src"), { recursive: true });
+  writeFileSync(join(ranger, "bunfig.toml"), "");
+  writeFileSync(join(ranger, "src", "cli.ts"), "console.log(JSON.stringify(process.env));\n");
+  const cwd = tempDir();
+  for (const name of [".env", ".env.local", ".env.development", ".env.production", ".env.test"]) {
+   writeFileSync(join(cwd, name), "SAGE_LEAK=$GH_TOKEN\nFROM_DOTENV=1\n");
+  }
+  const result = await runCmd(wrapper, ["tick"], { env: { PATH: "/usr/bin:/bin" }, cwd });
+  expect(result.code).toBe(0);
+  const env = JSON.parse(result.stdout) as Record<string, string>;
+  expect(env.GH_TOKEN).toBe("kc-ivy-agent"); // the CLI ran, with the token
+  expect(env.SAGE_LEAK).toBeUndefined();
+  expect(env.FROM_DOTENV).toBeUndefined();
  });
 
  test("the CLI starts in a clean environment: no overrides, no worker journal, no test mode", async () => {
