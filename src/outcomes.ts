@@ -60,6 +60,11 @@ export function parseFailedChecks(stdout: string): Map<string, FailedProbeRun> {
  return out;
 }
 
+/** The branch still conflicts with its base after every base merge pass it gets. */
+export function baseConflictOutcome(r: { pr: number; base: string; passes: number }): string {
+ return `PR #${r.pr} conflicts with ${r.base} again after ${r.passes} base merge pass(es) — the base keeps moving under it; resolving it is the principal's call`;
+}
+
 /** Sage rounds ran out with blockers or majors still open. */
 export function reviewCapOutcome(r: { blockers: number; majors: number; round: number; pr: number }): string {
  return `${r.blockers} blocker(s) and ${r.majors} major(s) remain after ${r.round} sage round(s) on PR #${r.pr} — good-enough is the principal's call (design §4/§7)`;

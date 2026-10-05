@@ -76,6 +76,11 @@ describe("merge gate (#23)", () => {
   expect(gate({ pr: pr({ mergeable: null }) }).status).toBe("pending");
   expect(gate({ pr: pr({ mergeable: false, mergeableState: "dirty" }) })).toMatchObject({ status: "fail", check: "mergeable" });
  });
+ test("a conflicting PR with no check runs fails on mergeability, not pending on CI (seelite #692)", () => {
+  // GitHub starts no pull_request workflow on a conflicting PR: waiting for CI would never end.
+  expect(gate({ checkRuns: [], pr: pr({ mergeable: false, mergeableState: "dirty" }) })).toMatchObject({ status: "fail", check: "mergeable" });
+  expect(gate({ checkRuns: [], pr: pr({ mergeable: null, mergeableState: "unknown" }) }).status).toBe("pending");
+ });
  test("wrong base fails", () => {
   expect(gate({ pr: pr({ baseRef: "develop" }) })).toMatchObject({ status: "fail", check: "base-branch" });
  });
