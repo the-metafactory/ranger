@@ -1,4 +1,11 @@
-import { GitSafetyError, gitStateChanges, readGitState, readGitStateSettled, type GitState } from "./git-ops.ts";
+import {
+ GitSafetyError,
+ gitStateChanges,
+ includeRefusal,
+ readGitState,
+ readGitStateSettled,
+ type GitState,
+} from "./git-ops.ts";
 import type { Journal } from "./journal.ts";
 
 /**
@@ -11,27 +18,28 @@ import type { Journal } from "./journal.ts";
  * pass, a vetted push) in the journal, and every run-node compares against
  * that record before its first credentialed git call. A mismatch parks;
  * the new state is never adopted on its own. Only the operator's `ranger
- * trust-git` adopts it.
+ * trust-git --hash` adopts it, and only the state its preview listed.
  *
  * One record per canonical checkout, whatever map or base runs in it: a
  * record per base let a base the checkout had not run before take the
  * current state on first sight, past the record another base had left. The
  * state is read the same for every base (`configRecords`, node #63). The
- * record holds digests only, never a config value.
+ * record holds digests only, never a config value. A state with an include
+ * key is never recorded, adopted or run against (`includeKeys`).
  */
 
-interface KnownGood extends GitState {
+interface KnownGood {
+ hash: string;
+ entries: GitState["entries"];
  /** When the supervisor last saw this state clean, and how. */
  at: string;
  source: string;
 }
 
-export function knownGoodKey(canonical: string): string {
- return `git.known-good.${canonical}`;
-}
+type Known = KnownGood | "unreadable" | null;
 
-function readKnownGood(journal: Journal, canonical: string): KnownGood | "unreadable" | null {
- const raw = journal.getHealth(knownGoodKey(canonical));
+function readKnownGood(journal: Journal, canonical: string): Known {
+ const raw = journal.knownGoodGitState(canonical);
  if (raw === null) return null;
  try {
   const parsed = JSON.parse(raw) as KnownGood;
@@ -44,37 +52,71 @@ function readKnownGood(journal: Journal, canonical: string): KnownGood | "unread
  }
 }
 
-/** Record `state` as known-good. Callers pass a state they verified, never a fresh read. */
+/** What a record says about `state`: the changes since it, and when it was seen clean (null: no record). */
+function againstKnown(known: Known, state: GitState): { changed: string[]; since: string | null } {
+ switch (known) {
+  case null:
+   return { changed: [], since: null };
+  case "unreadable":
+   return { changed: ["(the known-good record is unreadable)"], since: "unknown" };
+  default: {
+   const changed = gitStateChanges(known.entries, state.entries);
+   const reordered = known.hash !== state.hash && changed.length === 0;
+   return { changed: reordered ? ["(config record order)"] : changed, since: `${known.at}, ${known.source}` };
+  }
+ }
+}
+
+/** The current state, read again while another node's worktree add may be midway (`readGitStateSettled`). */
+function readAgainst(canonical: string, expected: string | null): Promise<GitState> | GitState {
+ return expected === null ? readGitState(canonical) : readGitStateSettled(canonical, expected);
+}
+
+/**
+ * Record `state` as known-good. Callers pass a state they verified, never a
+ * fresh read; a state with an include key is refused.
+ */
 export function recordKnownGood(
  journal: Journal,
  canonical: string,
  state: GitState,
  source: string,
 ): void {
+ if (state.includes.length > 0) throw new GitSafetyError(includeRefusal(state.includes));
  const record: KnownGood = { hash: state.hash, entries: state.entries, at: new Date().toISOString(), source };
- journal.setHealth(knownGoodKey(canonical), JSON.stringify(record));
+ journal.setKnownGoodGitState(canonical, JSON.stringify(record));
 }
 
 export type TrustCheck =
  | { kind: "match"; state: GitState }
  /** No record yet (a first run, or a journal from before node #81): the state read is now the record. */
  | { kind: "first"; state: GitState }
- | { kind: "mismatch"; state: GitState; changed: string[]; since: string };
+ | { kind: "mismatch"; state: GitState; changed: string[]; since: string }
+ /** The state holds include keys: refused whatever the record says. */
+ | { kind: "includes"; state: GitState };
+
+export type TrustRefusal = Extract<TrustCheck, { kind: "mismatch" | "includes" }>;
+
+export const isRefusal = (check: TrustCheck): check is TrustRefusal =>
+ check.kind === "mismatch" || check.kind === "includes";
 
 /**
  * Compare the current git state with the known-good record. With no record,
  * the current state becomes it and the journal says so: today's trust level
- * for a repo ranger has not seen before.
+ * for a repo ranger has not seen before. A state with an include key is
+ * refused before any of that, and so never becomes a record.
  */
-export function checkKnownGood(
+export async function checkKnownGood(
  journal: Journal,
  canonical: string,
  at: { repo: string; nodeId?: string },
-): TrustCheck {
+): Promise<TrustCheck> {
  const known = readKnownGood(journal, canonical);
- const state =
-  known === null || known === "unreadable" ? readGitState(canonical) : readGitStateSettled(canonical, known.hash);
- if (known === null) {
+ const state = await readAgainst(canonical, known === null || known === "unreadable" ? null : known.hash);
+ if (state.includes.length > 0) return { kind: "includes", state };
+ if (known !== null && known !== "unreadable" && known.hash === state.hash) return { kind: "match", state };
+ const { changed, since } = againstKnown(known, state);
+ if (since === null) {
   recordKnownGood(journal, canonical, state, "first sight");
   journal.recordEvent("git-trust", {
    ...at,
@@ -82,72 +124,96 @@ export function checkKnownGood(
   });
   return { kind: "first", state };
  }
- if (known === "unreadable") {
-  return { kind: "mismatch", state, changed: ["(the known-good record is unreadable)"], since: "unknown" };
- }
- if (known.hash === state.hash) return { kind: "match", state };
- const changed = gitStateChanges(known.entries, state.entries);
- return {
-  kind: "mismatch",
-  state,
-  changed: changed.length > 0 ? changed : ["(config record order)"],
-  since: `${known.at}, ${known.source}`,
- };
+ return { kind: "mismatch", state, changed, since };
 }
 
-/** The park outcome for a mismatch: the changed names first (outcomes are cut at 400 chars). */
-export function tamperOutcome(check: Extract<TrustCheck, { kind: "mismatch" }>, canonical: string, mapSelector: string): string {
+/**
+ * The check for a checkout this run just cloned: git's own fresh state
+ * becomes the record, unless it holds an include key.
+ */
+export function trustFreshClone(journal: Journal, canonical: string): TrustCheck {
+ const state = readGitState(canonical);
+ if (state.includes.length > 0) return { kind: "includes", state };
+ recordKnownGood(journal, canonical, state, "fresh clone");
+ return { kind: "match", state };
+}
+
+/**
+ * The park outcome for a refusal: the changed names first (outcomes are cut
+ * at 400 chars). `trust-git` without `--hash` lists every change.
+ */
+export function tamperOutcome(check: TrustRefusal, canonical: string, mapSelector: string): string {
+ if (check.kind === "includes") return `${includeRefusal(check.state.includes)} (in ${canonical})`;
  const names = check.changed.join(", ");
  const shown = names.length > 160 ? `${names.slice(0, 157)}…` : names;
- return `git state changed since it was last seen clean: ${shown} — in ${canonical} (known-good ${check.since}). Not adopted; once vetted, \`ranger trust-git --map ${mapSelector}\` records the current state, then resume the node.`;
+ return `git state changed since it was last seen clean: ${shown} — in ${canonical} (known-good ${check.since}). Not adopted; \`ranger trust-git --map ${mapSelector}\` lists every change, then adopt it with --hash and resume the node.`;
 }
 
 /**
  * The trusted pre-worker snapshot: the current state's hash, provided it
  * matches the known-good record (`GitSafetyError` naming the change if not).
  */
-export function trustedSnapshot(
+export async function trustedSnapshot(
  journal: Journal,
  canonical: string,
  at: { repo: string; nodeId?: string },
  mapSelector: string,
-): string {
- const check = checkKnownGood(journal, canonical, at);
- if (check.kind === "mismatch") throw new GitSafetyError(tamperOutcome(check, canonical, mapSelector));
+): Promise<string> {
+ const check = await checkKnownGood(journal, canonical, at);
+ if (isRefusal(check)) throw new GitSafetyError(tamperOutcome(check, canonical, mapSelector));
  return check.state.hash;
+}
+
+export interface TrustGitResult {
+ /** False for a preview: nothing was recorded. */
+ recorded: boolean;
+ /** The current state's hash: pass it as `--hash` to adopt exactly this state. */
+ hash: string;
+ /** Every change against the previous record, untruncated. */
+ changed: string[];
+ /** When the previous record was seen clean, and how (null: none). */
+ previous: string | null;
 }
 
 /**
  * Operator verb: adopt the current git state as known-good after vetting it.
- * Journals what changed against the previous record.
+ * Without `confirm` it only lists what changed and the state's hash. With
+ * `confirm` (that hash) it records the state only while it still hashes to
+ * it, so a change made after the preview, or one the operator never saw, is
+ * never adopted. A state with an include key is refused: remove it first.
  */
-export function trustCurrentGitState(
+export async function trustCurrentGitState(
  journal: Journal,
  canonical: string,
  repo: string,
-): { changed: string[]; previous: string | null } {
- const state = readGitState(canonical);
+ confirm?: string,
+): Promise<TrustGitResult> {
  const known = readKnownGood(journal, canonical);
- const changed =
-  known === null
-   ? []
-   : known === "unreadable"
-    ? ["(the known-good record was unreadable)"]
-    : gitStateChanges(known.entries, state.entries);
- const previous = known === null ? null : known === "unreadable" ? "unreadable" : `${known.at}, ${known.source}`;
+ const expected = confirm ?? (known === null || known === "unreadable" ? null : known.hash);
+ const state = await readAgainst(canonical, expected);
+ if (state.includes.length > 0) throw new GitSafetyError(includeRefusal(state.includes));
+ const { changed, since } = againstKnown(known, state);
+ const result = { hash: state.hash, changed, previous: since };
+ if (confirm === undefined) return { recorded: false, ...result };
+ if (state.hash !== confirm) {
+  throw new GitSafetyError(
+   `the git state of ${canonical} no longer hashes to ${confirm} (now ${state.hash}): run trust-git without --hash again and vet the new changes`,
+  );
+ }
  recordKnownGood(journal, canonical, state, "trusted by the operator");
  journal.recordEvent("git-trust", {
   repo,
   detail: `operator trusted the git state of ${canonical}${changed.length > 0 ? `; changed: ${changed.join(", ")}` : ""}`.slice(0, 400),
  });
- return { changed, previous };
+ return { recorded: true, ...result };
 }
 
 /**
  * Refresh the record after a supervisor step that should leave the state as
  * it was (a worktree add writes only what the state leaves out: node-branch
- * tracking, git's copy of the main `config.worktree`): recorded only when the state still hashes to the one the
- * supervisor verified, so a change in between is never adopted.
+ * tracking, git's copy of the main `config.worktree`): recorded only when
+ * the state still hashes to the one the supervisor verified, so a change in
+ * between is never adopted.
  */
 export function recordIfUnchanged(
  journal: Journal,

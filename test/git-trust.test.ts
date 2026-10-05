@@ -1,17 +1,17 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir, userInfo } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCmd } from "../src/exec.ts";
 import { gitConfigSnapshot, gitStateChanges, keyLabel, readGitState } from "../src/git-ops.ts";
 import {
  checkKnownGood,
- knownGoodKey,
  recordIfUnchanged,
  recordKnownGood,
  tamperOutcome,
  trustCurrentGitState,
  trustedSnapshot,
+ trustFreshClone,
 } from "../src/git-trust.ts";
 import { Journal } from "../src/journal.ts";
 import { bootstrapWorktree } from "../src/worker.ts";
@@ -44,7 +44,7 @@ afterEach(() => {
 });
 
 describe("readGitState: the hash gates, the entries name", () => {
- test("its hash is the tamper snapshot", () => {
+ test("its hash is the tamper snapshot", async () => {
   expect(readGitState(canonical).hash).toBe(gitConfigSnapshot(canonical));
  });
 
@@ -96,96 +96,96 @@ describe("readGitState: the hash gates, the entries name", () => {
 });
 
 describe("checkKnownGood", () => {
- test("no record: the current state becomes it, and the journal says so", () => {
-  const check = checkKnownGood(journal, canonical, at);
+ test("no record: the current state becomes it, and the journal says so", async () => {
+  const check = await checkKnownGood(journal, canonical, at);
   expect(check.kind).toBe("first");
-  expect(JSON.parse(journal.getHealth(knownGoodKey(canonical)) as string).hash).toBe(
+  expect(JSON.parse(journal.knownGoodGitState(canonical) as string).hash).toBe(
    gitConfigSnapshot(canonical),
   );
   const events = journal.listEvents("acme/widgets");
   expect(events[0].kind).toBe("git-trust");
   expect(events[0].detail).toContain("no known-good git state recorded");
-  expect(checkKnownGood(journal, canonical, at).kind).toBe("match");
+  expect((await checkKnownGood(journal, canonical, at)).kind).toBe("match");
  });
 
  test("a credential key present at first sight never reaches the journal", async () => {
   await config("url.https://bot:SECRETTOKEN@github.com/.insteadOf", "https://github.com/");
-  expect(checkKnownGood(journal, canonical, at).kind).toBe("first");
+  expect((await checkKnownGood(journal, canonical, at)).kind).toBe("first");
   await config("url.https://bot:SECRETTOKEN@github.com/.insteadOf", "https://evil.example/");
-  const check = checkKnownGood(journal, canonical, at);
+  const check = await checkKnownGood(journal, canonical, at);
   expect(check.kind).toBe("mismatch");
   expect(check.kind === "mismatch" && tamperOutcome(check, canonical, "acme/widgets#1")).toMatch(/url\.<[0-9a-f]{12}>\.insteadof/);
-  trustCurrentGitState(journal, canonical, "acme/widgets");
-  expect(journal.getHealth(knownGoodKey(canonical))).not.toContain("SECRETTOKEN");
+  const { hash } = await trustCurrentGitState(journal, canonical, "acme/widgets");
+  await trustCurrentGitState(journal, canonical, "acme/widgets", hash);
+  expect(journal.knownGoodGitState(canonical)).not.toContain("SECRETTOKEN");
   for (const event of journal.listEvents("acme/widgets", 500)) expect(JSON.stringify(event)).not.toContain("SECRETTOKEN");
  });
 
  test("a change since the record is a mismatch naming the key, and is not adopted", async () => {
-  checkKnownGood(journal, canonical, at);
+  await checkKnownGood(journal, canonical, at);
   await config("http.sslVerify", "false");
-  const check = checkKnownGood(journal, canonical, at);
+  const check = await checkKnownGood(journal, canonical, at);
   expect(check.kind).toBe("mismatch");
   expect(check.kind === "mismatch" && check.changed).toEqual(["http.sslverify (new)"]);
   // Still a mismatch on the next look: the record kept the vetted state.
-  expect(checkKnownGood(journal, canonical, at).kind).toBe("mismatch");
-  expect(() => trustedSnapshot(journal, canonical, at, "acme/widgets#1")).toThrow(/http\.sslverify/);
+  expect((await checkKnownGood(journal, canonical, at)).kind).toBe("mismatch");
+  expect(trustedSnapshot(journal, canonical, at, "acme/widgets#1")).rejects.toThrow(/http\.sslverify/);
  });
 
  test("another node's worktree between runs matches (node #63's tracking lines stay out)", async () => {
-  checkKnownGood(journal, canonical, at);
+  await checkKnownGood(journal, canonical, at);
   await addTrackedWorktree(canonical, "663", "stations-are-solid");
-  expect(checkKnownGood(journal, canonical, at).kind).toBe("match");
+  expect((await checkKnownGood(journal, canonical, at)).kind).toBe("match");
  });
 
  test("a worktree ranger adds under branch.autoSetupRebase=always between runs matches", async () => {
   await config("branch.autoSetupRebase", "always");
-  checkKnownGood(journal, canonical, at);
+  await checkKnownGood(journal, canonical, at);
   await bootstrapWorktree(canonical, "663", "stations-are-solid", "tok");
-  expect(checkKnownGood(journal, canonical, at).kind).toBe("match");
+  expect((await checkKnownGood(journal, canonical, at)).kind).toBe("match");
  });
 
  test("a worktree on a probe-named branch (not node/<N>-<slug>) between runs matches", async () => {
-  checkKnownGood(journal, canonical, at);
+  await checkKnownGood(journal, canonical, at);
   await bootstrapWorktree(canonical, "64", "x", "tok", "feature/other", "main");
-  expect(checkKnownGood(journal, canonical, at).kind).toBe("match");
+  expect((await checkKnownGood(journal, canonical, at)).kind).toBe("match");
  });
 
  test("records reordered across keys still mismatch, as record order", async () => {
   await config("aaa.one", "1");
   await config("zzz.two", "2");
-  checkKnownGood(journal, canonical, at);
+  await checkKnownGood(journal, canonical, at);
   const file = join(canonical, ".git", "config");
   const text = await Bun.file(file).text();
   const swapped = text.replace("[aaa]\n\tone = 1\n[zzz]\n\ttwo = 2\n", "[zzz]\n\ttwo = 2\n[aaa]\n\tone = 1\n");
   expect(swapped).not.toBe(text);
   writeFileSync(file, swapped);
-  const check = checkKnownGood(journal, canonical, at);
+  const check = await checkKnownGood(journal, canonical, at);
   expect(check.kind === "mismatch" && check.changed).toEqual(["(config record order)"]);
  });
 
- test("an unreadable record fails closed", () => {
-  journal.setHealth(knownGoodKey(canonical), "{not json");
-  expect(checkKnownGood(journal, canonical, at).kind).toBe("mismatch");
+ test("an unreadable record fails closed", async () => {
+  journal.setKnownGoodGitState(canonical, "{not json");
+  expect((await checkKnownGood(journal, canonical, at)).kind).toBe("mismatch");
  });
 
  // A record per base let a map whose base the checkout had not run before
  // take a changed state on first sight, past another map's record.
  test("the record is one per checkout: a change before another map's first run on it is a mismatch", async () => {
-  checkKnownGood(journal, canonical, at); // a map on main
+  await checkKnownGood(journal, canonical, at); // a map on main
   await config("remote.origin.url", "https://evil.example/acme/widgets.git");
-  const check = checkKnownGood(journal, canonical, { repo: "acme/widgets", nodeId: "90" }); // a map on develop
+  const check = await checkKnownGood(journal, canonical, { repo: "acme/widgets", nodeId: "90" }); // a map on develop
   expect(check.kind).toBe("mismatch");
   expect(check.kind === "mismatch" && check.changed).toEqual(["remote.origin.url"]);
-  expect(knownGoodKey(canonical)).toBe(`git.known-good.${canonical}`);
  });
 
  test("another map's tracked node branch between runs matches", async () => {
   const git = (args: string[]) => runCmd("git", args, { cwd: canonical, env: { ...process.env, ...GIT_ENV } });
   await git(["push", "origin", "HEAD:refs/heads/develop"]);
   await git(["fetch", "origin"]);
-  checkKnownGood(journal, canonical, at);
+  await checkKnownGood(journal, canonical, at);
   await addTrackedWorktree(canonical, "90", "on-develop", "develop");
-  expect(checkKnownGood(journal, canonical, at).kind).toBe("match");
+  expect((await checkKnownGood(journal, canonical, at)).kind).toBe("match");
  });
 });
 
@@ -210,22 +210,22 @@ describe("per-worktree config: git's copy of the main config.worktree", () => {
 
  test("a worktree ranger adds between runs matches", async () => {
   await worktreeConfig();
-  checkKnownGood(journal, canonical, at);
+  await checkKnownGood(journal, canonical, at);
   await bootstrapWorktree(canonical, "663", "stations-are-solid", "tok");
   expect(await Bun.file(copy("node-663")).text()).toContain("probe = kept");
-  expect(checkKnownGood(journal, canonical, at).kind).toBe("match");
+  expect((await checkKnownGood(journal, canonical, at)).kind).toBe("match");
  });
 
  test("a scratch worktree added from a linked one, then removed, matches throughout", async () => {
   await worktreeConfig();
   const worktree = await bootstrapWorktree(canonical, "663", "stations-are-solid", "tok");
-  checkKnownGood(journal, canonical, at);
+  await checkKnownGood(journal, canonical, at);
   const scratch = join(dir, "scratch");
   await git(["worktree", "add", "--detach", scratch, "HEAD"], worktree);
   expect(await Bun.file(copy("scratch")).exists()).toBe(true);
-  expect(checkKnownGood(journal, canonical, at).kind).toBe("match");
+  expect((await checkKnownGood(journal, canonical, at)).kind).toBe("match");
   await git(["worktree", "remove", "--force", scratch], worktree);
-  expect(checkKnownGood(journal, canonical, at).kind).toBe("match");
+  expect((await checkKnownGood(journal, canonical, at)).kind).toBe("match");
  });
 
  test("the copy git makes of a main file with core.bare=true and core.worktree is left out", async () => {
@@ -253,47 +253,47 @@ describe("per-worktree config: git's copy of the main config.worktree", () => {
   await config("http.sslVerify", "false");
   await git(["config", "--worktree", "http.sslVerify", "true"]);
   await bootstrapWorktree(canonical, "663", "stations-are-solid", "tok");
-  checkKnownGood(journal, canonical, at);
+  await checkKnownGood(journal, canonical, at);
   writeFileSync(copy("node-663"), "");
-  const check = checkKnownGood(journal, canonical, at);
+  const check = await checkKnownGood(journal, canonical, at);
   expect(check.kind === "mismatch" && check.changed).toEqual(["worktrees/node-663/config.worktree (new)"]);
  });
 
  test("a deleted copy is named", async () => {
   await worktreeConfig();
   await bootstrapWorktree(canonical, "663", "stations-are-solid", "tok");
-  checkKnownGood(journal, canonical, at);
+  await checkKnownGood(journal, canonical, at);
   rmSync(copy("node-663"));
-  const check = checkKnownGood(journal, canonical, at);
+  const check = await checkKnownGood(journal, canonical, at);
   expect(check.kind === "mismatch" && check.changed).toEqual(["worktrees/node-663/config.worktree (new)"]);
  });
 
  test("a worktree caught midway through git adding it settles to a match", async () => {
   await worktreeConfig();
-  checkKnownGood(journal, canonical, at);
+  await checkKnownGood(journal, canonical, at);
   mkdirSync(join(canonical, ".git", "worktrees", "w1"), { recursive: true });
   writeFileSync(copy("w1"), "");
   // Another process fills the copy while the check reads; the check blocks.
   const writer = Bun.spawn(["sh", "-c", `sleep 0.1 && cp "$0" "$1"`, join(canonical, ".git", "config.worktree"), copy("w1")]);
-  expect(checkKnownGood(journal, canonical, at).kind).toBe("match");
+  expect((await checkKnownGood(journal, canonical, at)).kind).toBe("match");
   expect(await writer.exited).toBe(0);
  });
 
  test("a copy with a key the main file lacks is named", async () => {
   await worktreeConfig();
-  checkKnownGood(journal, canonical, at);
+  await checkKnownGood(journal, canonical, at);
   await bootstrapWorktree(canonical, "663", "stations-are-solid", "tok");
   writeFileSync(copy("node-663"), `${await Bun.file(copy("node-663")).text()}[http]\n\tsslVerify = false\n`);
-  const check = checkKnownGood(journal, canonical, at);
+  const check = await checkKnownGood(journal, canonical, at);
   expect(check.kind === "mismatch" && check.changed).toEqual(["worktrees/node-663/config.worktree (new)"]);
  });
 
  test("a changed main file is named, and its old copies with it", async () => {
   await worktreeConfig();
   await bootstrapWorktree(canonical, "663", "stations-are-solid", "tok");
-  checkKnownGood(journal, canonical, at);
+  await checkKnownGood(journal, canonical, at);
   await git(["config", "--worktree", "http.sslVerify", "false"]);
-  const check = checkKnownGood(journal, canonical, at);
+  const check = await checkKnownGood(journal, canonical, at);
   expect(check.kind === "mismatch" && check.changed).toEqual([
    "config.worktree",
    "worktrees/node-663/config.worktree (new)",
@@ -315,99 +315,95 @@ describe("per-worktree config: git's copy of the main config.worktree", () => {
 });
 
 /**
- * Git reads the files a config includes as if their lines stood in it, so
- * an included file is part of the state (a worker editing one could set
- * http.sslVerify=false past an unchanged include line).
+ * Includes fail closed (node #81, decided 2026-10-05): any include key in the
+ * shared config or a `config.worktree` refuses the state, named, and no code
+ * follows the path it holds.
  */
-describe("included config files", () => {
+describe("include keys are refused", () => {
  const gitDir = () => join(canonical, ".git");
- const includeName = /^include <[0-9a-f]{12}>$/;
+ const git = async (args: string[], cwd = canonical) => {
+  const r = await runCmd("git", args, { cwd, env: { ...process.env, ...GIT_ENV } });
+  if (r.code !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
+ };
+ const includesOf = async () => {
+  const check = await checkKnownGood(journal, canonical, at);
+  expect(check.kind).toBe("includes");
+  return check.state.includes;
+ };
 
- test("an edited include target is named", async () => {
-  writeFileSync(join(gitDir(), "extra.conf"), "[core]\n\tfilemode = false\n");
+ test("an include.path in the shared config refuses the state on first sight, and nothing is recorded", async () => {
   await config("include.path", "extra.conf");
-  checkKnownGood(journal, canonical, at);
-  writeFileSync(join(gitDir(), "extra.conf"), "[http]\n\tsslVerify = false\n");
-  const check = checkKnownGood(journal, canonical, at);
-  expect(check.kind).toBe("mismatch");
-  expect(check.kind === "mismatch" && check.changed).toHaveLength(1);
-  expect(check.kind === "mismatch" && check.changed[0]).toMatch(includeName);
+  expect(await includesOf()).toEqual(["include.path in config"]);
+  expect(journal.knownGoodGitState(canonical)).toBeNull();
+  expect(journal.listEvents("acme/widgets")).toEqual([]);
  });
 
- test("a missing target that appears is new", async () => {
-  await config("include.path", "missing.conf");
-  checkKnownGood(journal, canonical, at);
-  writeFileSync(join(gitDir(), "missing.conf"), "[http]\n\tsslVerify = false\n");
-  const check = checkKnownGood(journal, canonical, at);
-  expect(check.kind === "mismatch" && check.changed[0]).toMatch(/^include <[0-9a-f]{12}> \(new\)$/);
+ test("an include added after the record refuses the state, naming the key", async () => {
+  await checkKnownGood(journal, canonical, at);
+  await config("includeIf.onbranch:main.path", "extra.conf");
+  expect(await includesOf()).toEqual([`${keyLabel("includeif.onbranch:main.path")} in config`]);
+  const check = await checkKnownGood(journal, canonical, at);
+  expect(check.kind === "includes" && tamperOutcome(check, canonical, "acme/widgets#1")).toMatch(
+   /^git config include refused: includeif\.<[0-9a-f]{12}>\.path in config/,
+  );
+  await expect(trustedSnapshot(journal, canonical, at, "acme/widgets#1")).rejects.toThrow(/include refused/);
  });
 
- test("an includeIf target is hashed whatever its condition, and so is a file it includes", async () => {
-  const outer = join(dir, "outer.conf");
-  const inner = join(dir, "inner.conf");
-  writeFileSync(outer, "[include]\n\tpath = inner.conf\n");
-  writeFileSync(inner, "[core]\n\tfilemode = false\n");
-  await config("includeIf.gitdir:/nowhere/.path", outer);
-  checkKnownGood(journal, canonical, at);
-  writeFileSync(inner, "[core]\n\tsshCommand = ssh -o ProxyCommand=evil\n");
-  const check = checkKnownGood(journal, canonical, at);
-  expect(check.kind === "mismatch" && check.changed).toHaveLength(1);
+ test("an include key of any variable counts, and no included file is ever read", async () => {
+  // A FIFO target: reading it would block the check forever.
+  const fifo = join(dir, "never-read.conf");
+  const made = Bun.spawnSync(["mkfifo", fifo]);
+  expect(made.exitCode).toBe(0);
+  appendFileSync(join(gitDir(), "config"), `[include]\n\tpath = ${fifo}\n\tother = x\n`);
+  expect(await includesOf()).toEqual(["include.other in config", "include.path in config"]);
  });
 
- test("a ~/ include resolves against HOME", async () => {
-  const home = process.env.HOME;
-  process.env.HOME = dir;
-  try {
-   writeFileSync(join(dir, "home.conf"), "[core]\n\tfilemode = false\n");
-   await config("include.path", "~/home.conf");
-   checkKnownGood(journal, canonical, at);
-   writeFileSync(join(dir, "home.conf"), "[http]\n\tsslVerify = false\n");
-   expect(checkKnownGood(journal, canonical, at).kind).toBe("mismatch");
-  } finally {
-   process.env.HOME = home;
-  }
- });
-
- test("a UTF-8 include path names the file git reads, and an edit to it is named", async () => {
-  writeFileSync(join(gitDir(), "vérifié.conf"), "[core]\n\tfilemode = false\n");
-  await config("include.path", "vérifié.conf");
-  checkKnownGood(journal, canonical, at);
-  writeFileSync(join(gitDir(), "vérifié.conf"), "[http]\n\tsslVerify = false\n");
-  const check = checkKnownGood(journal, canonical, at);
-  expect(check.kind).toBe("mismatch");
-  expect(check.kind === "mismatch" && check.changed).toHaveLength(1);
-  expect(check.kind === "mismatch" && check.changed[0]).toMatch(includeName);
- });
-
- test("a ~user/ include is resolved as git resolves it; one git cannot expand adds no target", () => {
-  const includes = () => Object.keys(readGitState(canonical).entries).filter((n) => includeName.test(n));
-  // Appended raw: git refuses to write a config holding either line.
-  const add = (line: string) => appendFileSync(join(gitDir(), "config"), `[include]\n\tpath = ${line}\n`);
-  expect(includes()).toEqual([]);
-  // The user's home directory: it exists, so it is a target (not a file, so hashed absent).
-  add(`~${userInfo().username}/`);
-  expect(includes()).toHaveLength(1);
-  const before = readGitState(canonical);
-  add("~no-such-ranger-user/x.conf");
-  const after = readGitState(canonical);
-  expect(Object.keys(after.entries).filter((n) => includeName.test(n))).toHaveLength(1);
-  expect(after.hash).not.toBe(before.hash);
- });
-
- test("a relative include in the main config.worktree:a worktree ranger adds matches, a target planted beside its copy does not", async () => {
+ test("an include in the main config.worktree, and in every worktree's copy, is named", async () => {
   await config("extensions.worktreeConfig", "true");
-  const r = await runCmd("git", ["config", "--worktree", "include.path", "wt.conf"], {
-   cwd: canonical,
-   env: { ...process.env, ...GIT_ENV },
-  });
-  expect(r.code).toBe(0);
-  writeFileSync(join(gitDir(), "wt.conf"), "[core]\n\tfilemode = false\n");
-  checkKnownGood(journal, canonical, at);
+  await git(["config", "--worktree", "include.path", "wt.conf"]);
   await bootstrapWorktree(canonical, "663", "stations-are-solid", "tok");
-  expect(checkKnownGood(journal, canonical, at).kind).toBe("match");
-  writeFileSync(join(gitDir(), "worktrees", "node-663", "wt.conf"), "[http]\n\tsslVerify = false\n");
-  const check = checkKnownGood(journal, canonical, at);
-  expect(check.kind === "mismatch" && check.changed[0]).toMatch(/^include <[0-9a-f]{12}> \(new\)$/);
+  expect(await includesOf()).toEqual([
+   "include.path in config.worktree",
+   "include.path in worktrees/node-663/config.worktree",
+  ]);
+ });
+
+ test("an include planted in a linked config.worktree alone is named", async () => {
+  await config("extensions.worktreeConfig", "true");
+  await bootstrapWorktree(canonical, "663", "stations-are-solid", "tok");
+  await checkKnownGood(journal, canonical, at);
+  writeFileSync(join(gitDir(), "worktrees", "node-663", "config.worktree"), "[includeIf \"gitdir:/x/\"]\n\tpath = /tmp/x.conf\n");
+  expect(await includesOf()).toEqual([`${keyLabel("includeif.gitdir:/x/.path")} in worktrees/node-663/config.worktree`]);
+ });
+
+ test("trust-git refuses while an include is present, and so does a fresh clone's record", async () => {
+  await checkKnownGood(journal, canonical, at);
+  const record = journal.knownGoodGitState(canonical);
+  await config("include.path", "extra.conf");
+  await expect(trustCurrentGitState(journal, canonical, "acme/widgets")).rejects.toThrow(/include refused/);
+  expect(trustFreshClone(journal, canonical).kind).toBe("includes");
+  expect(journal.knownGoodGitState(canonical)).toBe(record);
+ });
+});
+
+describe("a path that is not a regular file is never read", () => {
+ test("a FIFO in place of the shared config is hashed as not a file, and the check returns", async () => {
+  await checkKnownGood(journal, canonical, at);
+  const config = join(canonical, ".git", "config");
+  rmSync(config);
+  expect(Bun.spawnSync(["mkfifo", config]).exitCode).toBe(0);
+  const check = await checkKnownGood(journal, canonical, at);
+  expect(check.kind === "mismatch" && check.changed).toContain("config (not a file) (new)");
+ });
+
+ test("a FIFO or a directory among the hooks is named, not read", async () => {
+  const hooks = join(canonical, ".git", "hooks");
+  await checkKnownGood(journal, canonical, at);
+  expect(Bun.spawnSync(["mkfifo", join(hooks, "pre-push")]).exitCode).toBe(0);
+  mkdirSync(join(hooks, "post-checkout"));
+  const check = await checkKnownGood(journal, canonical, at);
+  expect(check.kind === "mismatch" && check.changed).toEqual(["hooks/post-checkout (new)", "hooks/pre-push (new)"]);
+  expect(readGitState(canonical).entries["hooks/pre-push"]).toBe("(not a file)");
  });
 });
 
@@ -417,15 +413,36 @@ describe("recording the known-good state", () => {
   recordKnownGood(journal, canonical, verified, "test");
   await config("http.sslVerify", "false");
   recordIfUnchanged(journal, canonical, verified, "worktree created");
-  expect(JSON.parse(journal.getHealth(knownGoodKey(canonical)) as string).hash).toBe(verified.hash);
+  expect(JSON.parse(journal.knownGoodGitState(canonical) as string).hash).toBe(verified.hash);
  });
 
- test("trust-git adopts the current state and journals what changed", async () => {
-  checkKnownGood(journal, canonical, at);
+ test("trust-git lists every change and the hash, and records nothing", async () => {
+  await checkKnownGood(journal, canonical, at);
+  const record = journal.knownGoodGitState(canonical);
   await config("http.sslVerify", "false");
-  const result = trustCurrentGitState(journal, canonical, "acme/widgets");
-  expect(result.changed).toEqual(["http.sslverify (new)"]);
+  const preview = await trustCurrentGitState(journal, canonical, "acme/widgets");
+  expect(preview).toMatchObject({ recorded: false, hash: readGitState(canonical).hash, changed: ["http.sslverify (new)"] });
+  expect(journal.knownGoodGitState(canonical)).toBe(record);
+  expect((await checkKnownGood(journal, canonical, at)).kind).toBe("mismatch");
+ });
+
+ test("trust-git --hash adopts exactly the previewed state and journals what changed", async () => {
+  await checkKnownGood(journal, canonical, at);
+  await config("http.sslVerify", "false");
+  const { hash } = await trustCurrentGitState(journal, canonical, "acme/widgets");
+  const result = await trustCurrentGitState(journal, canonical, "acme/widgets", hash);
+  expect(result).toMatchObject({ recorded: true, hash, changed: ["http.sslverify (new)"] });
   expect(journal.listEvents("acme/widgets")[0].detail).toContain("http.sslverify (new)");
-  expect(checkKnownGood(journal, canonical, at).kind).toBe("match");
+  expect((await checkKnownGood(journal, canonical, at)).kind).toBe("match");
+ });
+
+ test("trust-git --hash refuses a state that changed after the preview", async () => {
+  await checkKnownGood(journal, canonical, at);
+  const record = journal.knownGoodGitState(canonical);
+  await config("http.sslVerify", "false");
+  const { hash } = await trustCurrentGitState(journal, canonical, "acme/widgets");
+  await config("core.sshCommand", "ssh -o ProxyCommand=evil");
+  await expect(trustCurrentGitState(journal, canonical, "acme/widgets", hash)).rejects.toThrow(/no longer hashes to/);
+  expect(journal.knownGoodGitState(canonical)).toBe(record);
  });
 });

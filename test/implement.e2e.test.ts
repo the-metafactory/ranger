@@ -21,7 +21,8 @@ import { ReviewError, type ReviewVerdict } from "../src/review.ts";
 import { LAST_IMPLEMENT_MAP } from "../src/maps.ts";
 import { sweepMap } from "../src/sweep.ts";
 import { bootstrapWorktree, runNode, type RunNodeContext } from "../src/worker.ts";
-import { knownGoodKey, trustCurrentGitState } from "../src/git-trust.ts";
+import { keyLabel } from "../src/git-ops.ts";
+import { trustCurrentGitState } from "../src/git-trust.ts";
 import { baseConfigLines, createCanonicalRepo, GIT_ENV } from "./support.ts";
 import { saveViewsRecord, viewsDirectory } from "../src/views.ts";
 import { DiscordAnnouncer } from "../src/announce.ts";
@@ -603,7 +604,8 @@ describe("implement lane (node #23)", () => {
 
    // The operator vets the change and trusts it; the node then runs (from a
    // clean branch: the fake worker cannot commit the same build twice).
-   trustCurrentGitState(r.journal, r.canonical, "acme/widgets");
+   const { hash } = await trustCurrentGitState(r.journal, r.canonical, "acme/widgets");
+   await trustCurrentGitState(r.journal, r.canonical, "acme/widgets", hash);
    await git(["reset", "--hard", "refs/remotes/origin/main"], join(r.canonical, ".worktrees", "node-20"));
    r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
    expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
@@ -705,8 +707,45 @@ describe("implement lane (node #23)", () => {
    expect(parked.detail).toMatch(/url\.<[0-9a-f]{12}>\.insteadof \(new\)/);
    expect(parked.detail).not.toContain("SECRETTOKEN");
    expect(r.journal.getWorker("20", "acme/widgets")?.outcome).not.toContain("SECRETTOKEN");
-   expect(r.journal.getHealth(knownGoodKey(r.canonical))).not.toContain("SECRETTOKEN");
+   expect(r.journal.knownGoodGitState(r.canonical)).not.toContain("SECRETTOKEN");
    for (const event of r.journal.listEvents("acme/widgets", 500)) expect(JSON.stringify(event)).not.toContain("SECRETTOKEN");
+  }, 60_000);
+
+  // Includes fail closed: no code follows an include path, the key parks.
+  test("a failed test run that adds an include.path to the shared config parks the resume before any credentialed git call, naming the key", async () => {
+   const r = await rig({});
+   cleanup.push(r.dir);
+   r.ctx.map.commands.test = "git config include.path /tmp/evil.gitconfig; exit 1";
+   expect((await runNode("20", r.ctx)).status).toBe("failed");
+
+   r.ctx.map.commands.test = "test -f src/feature.ts";
+   await moveOriginMain(r);
+   const fetched = await fetchedMain(r);
+   r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+   const resumed = await runNode("20", r.ctx);
+   expect(resumed.status).toBe("parked");
+   expect(resumed.detail).toStartWith("git config include refused: include.path in config");
+   expect(await fetchedMain(r)).toBe(fetched);
+   expect(await r.github.sha("node/20-add-the-feature-module")).toBe("");
+   // trust-git cannot adopt it: the operator removes the line.
+   await expect(trustCurrentGitState(r.journal, r.canonical, "acme/widgets")).rejects.toThrow(/include refused/);
+  }, 60_000);
+
+  test("an includeIf.<cond>.path in the main config.worktree parks the next run before its push, naming the key", async () => {
+   const r = await rig({});
+   cleanup.push(r.dir);
+   expect((await git(["config", "extensions.worktreeConfig", "true"], r.canonical)).code).toBe(0);
+   r.ctx.workerCommand = [implementWorker, "noop"];
+   expect((await runNode("20", r.ctx)).status).toBe("failed");
+
+   expect((await git(["config", "--worktree", "includeIf.onbranch:main.path", "/tmp/evil.gitconfig"], r.canonical)).code).toBe(0);
+   r.ctx.workerCommand = [implementWorker, "build"];
+   r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+   const parked = await runNode("20", r.ctx);
+   expect(parked.status).toBe("parked");
+   expect(parked.detail).toContain(`${keyLabel("includeif.onbranch:main.path")} in config.worktree`);
+   expect(await r.github.sha("node/20-add-the-feature-module")).toBe("");
+   expect(r.github.prs.size).toBe(0);
   }, 60_000);
 
   test("a journal without a record keeps today's behaviour: the run records the state and says so", async () => {
@@ -716,7 +755,7 @@ describe("implement lane (node #23)", () => {
    const trust = r.journal.listEvents("acme/widgets", 500).filter((e) => e.kind === "git-trust");
    expect(trust).toHaveLength(1);
    expect(trust[0].detail).toContain("no known-good git state recorded");
-   const record = JSON.parse(r.journal.getHealth(knownGoodKey(r.canonical)) as string);
+   const record = JSON.parse(r.journal.knownGoodGitState(r.canonical) as string);
    expect(record.source).toBe("vetted push");
   }, 60_000);
  });

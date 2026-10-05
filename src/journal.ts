@@ -164,6 +164,9 @@ export type EventKind =
  | "transient"
  | "git-trust";
 
+/** The health-store key of a checkout's known-good git state (`knownGoodGitState`). */
+const knownGoodGitKey = (canonical: string): string => `git.known-good.${canonical}`;
+
 const rootFilter = (column: typeof workers.root | typeof escalations.root, root?: number) => root === undefined ? undefined : eq(column, root);
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -406,6 +409,21 @@ export class Journal {
    .values({ key, value })
    .onConflictDoUpdate({ target: health.key, set: { value } })
    .run();
+ }
+
+ // ---- known-good git state (node #81) ----
+
+ /**
+  * The canonical checkout's known-good git state record (`git-trust.ts`):
+  * the chain-of-trust anchor, one per checkout, opaque JSON. Its own
+  * accessor so the anchor is never read or pruned as a health counter.
+  */
+ knownGoodGitState(canonical: string): string | null {
+  return this.getHealth(knownGoodGitKey(canonical));
+ }
+
+ setKnownGoodGitState(canonical: string, record: string): void {
+  this.setHealth(knownGoodGitKey(canonical), record);
  }
 
  getInt(key: string): number {

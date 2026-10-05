@@ -9,18 +9,19 @@ import { runCmd, type RunOptions } from "./exec.ts";
 import {
  fastForwardCanonical,
  assertGitUntouched,
- readGitState,
  safeGit,
+ type GitState,
  GitSafetyError,
  vettedPush,
 } from "./git-ops.ts";
 import { GRAPH_CALL_TIMEOUT_MS, graphNode, type NodeResult } from "./graph.ts";
 import {
  checkKnownGood,
+ isRefusal,
  recordIfUnchanged,
  recordKnownGood,
  tamperOutcome,
- type TrustCheck,
+ trustFreshClone,
 } from "./git-trust.ts";
 import { graphClose, graphDecisions, type CloseResult } from "./graph-write.ts";
 import {
@@ -578,15 +579,14 @@ async function runImplementNode(
  const readOnlyToken = ctx.readOnlyToken ?? resolveReadOnlyToken(config, repo).token;
 
  const canonical = canonicalDir(config, map);
- const trust = startTrust(journal, map, canonical, nodeId, await bootstrapCanonical(canonical, repo, token));
- if (trust.kind === "mismatch") {
-  return parkRun(ctx, nodeId, node.node.title, tamperOutcome(trust, canonical, mapKey(map)));
- }
- await fastForwardCanonical(canonical, map.base, token);
  const slug = slugify(node.node.title);
  const branch = implementBranchFor(node.node, worktreeBranch(nodeId, slug));
- const worktree = await bootstrapWorktree(canonical, nodeId, slug, token, branch, map.base);
- recordIfUnchanged(journal, canonical, trust.state, "worktree created");
+ const start = await trustedStart(ctx, nodeId, node.node.title, canonical, async () => {
+  await fastForwardCanonical(canonical, map.base, token);
+  return bootstrapWorktree(canonical, nodeId, slug, token, branch, map.base);
+ });
+ if ("parked" in start) return start.parked;
+ const { worktree } = start;
  journal.updateWorker(nodeId, repo, { worktree, lane: "implement" });
 
  // Substrate selection (node #45), re-run at every session start. A session
@@ -682,21 +682,28 @@ async function parkRun(
 }
 
 /**
- * The run-node's git-state check against the known-good record (node #81),
- * before its first git call that carries the write credential. A checkout
- * this run cloned holds git's own fresh state, which becomes the record.
+ * The run-node's start (node #81): ensure the canonical checkout, check its
+ * git state against the known-good record before the first git call that
+ * carries the write credential, then add the node's worktree and refresh
+ * the record. A checkout this run cloned holds git's own fresh state, which
+ * becomes the record. Parks the run on a refusal.
  */
-function startTrust(
- journal: Journal,
- map: RangerMapConfig,
- canonical: string,
+async function trustedStart(
+ ctx: RunNodeContext,
  nodeId: string,
- cloned: boolean,
-): TrustCheck {
- if (!cloned) return checkKnownGood(journal, canonical, { repo: map.repo, nodeId });
- const state = readGitState(canonical);
- recordKnownGood(journal, canonical, state, "fresh clone");
- return { kind: "match", state };
+ title: string,
+ canonical: string,
+ addWorktree: () => Promise<string>,
+): Promise<{ state: GitState; worktree: string } | { parked: RunNodeOutcome }> {
+ const { journal, map, token } = ctx;
+ const cloned = await bootstrapCanonical(canonical, map.repo, token);
+ const trust = cloned
+  ? trustFreshClone(journal, canonical)
+  : await checkKnownGood(journal, canonical, { repo: map.repo, nodeId });
+ if (isRefusal(trust)) return { parked: await parkRun(ctx, nodeId, title, tamperOutcome(trust, canonical, mapKey(map))) };
+ const worktree = await addWorktree();
+ recordIfUnchanged(journal, canonical, trust.state, "worktree created");
+ return { state: trust.state, worktree };
 }
 
 /** Best-effort park card: the journal + digest still carry the park when Discord fails. */
@@ -752,13 +759,12 @@ async function runResearch(
   detail: "worktree bootstrap",
  });
  const canonical = canonicalDir(config, map);
- const trust = startTrust(journal, map, canonical, nodeId, await bootstrapCanonical(canonical, repo, token));
- if (trust.kind === "mismatch") {
-  return parkRun(ctx, nodeId, node.node.title, tamperOutcome(trust, canonical, mapKey(map)));
- }
  const slug = slugify(node.node.title);
- const worktree = await bootstrapWorktree(canonical, nodeId, slug, token, undefined, map.base);
- recordIfUnchanged(journal, canonical, trust.state, "worktree created");
+ const start = await trustedStart(ctx, nodeId, node.node.title, canonical, () =>
+  bootstrapWorktree(canonical, nodeId, slug, token, undefined, map.base),
+ );
+ if ("parked" in start) return start.parked;
+ const { worktree } = start;
  const branch = researchBranchFor(node.node);
 
  journal.recordEvent("worker-start", {
@@ -816,7 +822,7 @@ async function runResearch(
     runCmd(workerCmd[0], [...workerCmd.slice(1), p], opts));
 
   // The run-node start check vetted this state against the known-good one.
-  const snapshot = trust.state.hash;
+  const snapshot = start.state.hash;
   fence("spawn the worker");
   const workerResult = await workerRun(prompt, {
    cwd: worktree,
@@ -856,7 +862,7 @@ async function runResearch(
   // close gate probes, with hooks disabled and the git config checked against
   // the pre-worker snapshot (#23: the worker shares the canonical .git).
   try {
-   assertGitUntouched(canonical, snapshot);
+   await assertGitUntouched(canonical, snapshot);
    const head = await resolveBranchSha(canonical, branch);
    if (head === null) {
     throw new GitSafetyError(`research findings branch ${branch} is missing from the canonical checkout`);

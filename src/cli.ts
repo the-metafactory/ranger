@@ -321,17 +321,21 @@ async function runBuildNow(
 }
 
 /**
- * Operator verb (node #81): adopt the canonical checkout's current git state
- * as known-good, after the operator has vetted what changed. Run-nodes park
- * on any other change.
+ * Operator verb (node #81): list what changed in the canonical checkout's git
+ * state since ranger last saw it clean, with the state's hash; with that
+ * hash, adopt exactly that state as known-good. Run-nodes park on any other
+ * change.
  */
-function runTrustGit(selector: string, configPath: string): string {
+async function runTrustGit(selector: string, configPath: string, hash?: string): Promise<string> {
  const { config, journal } = loadCtx(configPath);
  try {
   const map = pickMap(config, selector);
   const canonical = canonicalDir(config, map);
-  const result = trustCurrentGitState(journal, canonical, map.repo);
-  return JSON.stringify({ map: mapKey(map), canonical, ...result }, null, 2);
+  const result = await trustCurrentGitState(journal, canonical, map.repo, hash);
+  const next = result.recorded
+   ? {}
+   : { next: `vet every change listed, then: ranger trust-git --map ${mapKey(map)} --hash ${result.hash}` };
+  return JSON.stringify({ map: mapKey(map), canonical, ...result, ...next }, null, 2);
  } finally {
   journal.close();
  }
@@ -630,14 +634,15 @@ program
 program
  .command("trust-git")
  .description(
-  "Operator verb (node #81): record the canonical checkout's current git config and hooks as known-good — run-nodes park on any change since the last state ranger saw clean; vet the change first",
+  "Operator verb (node #81): list every change to the canonical checkout's git config and hooks since ranger last saw them clean, with the current state's hash; --hash <it> records exactly that state as known-good (run-nodes park on any change)",
  )
  .requiredOption("-m, --map <owner/name#root>", "map repo#root (repo alone only when unique)")
+ .option("--hash <sha256>", "adopt the state only while it still hashes to this (from the listing)")
  .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
- .action((options: { map: string; config: string }) => {
+ .action(async (options: { map: string; config: string; hash?: string }) => {
   try {
    const configPath = resolve(process.cwd(), options.config);
-   process.stdout.write(runTrustGit(options.map, configPath) + "\n");
+   process.stdout.write((await runTrustGit(options.map, configPath, options.hash)) + "\n");
   } catch (error) {
    process.stderr.write(
     `ranger trust-git: ${error instanceof Error ? error.message : String(error)}\n`,

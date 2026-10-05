@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { dirname, isAbsolute, join } from "node:path";
+import { closeSync, constants, existsSync, fstatSync, openSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { join } from "node:path";
 import { runCmd, type RunResult } from "./exec.ts";
 
 /**
@@ -58,6 +58,7 @@ export function safeGit(
  args: string[],
  opts: { cwd: string; token?: string; timeoutMs?: number },
 ): Promise<RunResult> {
+ if (opts.token !== undefined) assertNamedRefs(args);
  const base = minimalGitEnv();
  return runCmd(
   "git",
@@ -67,6 +68,24 @@ export function safeGit(
    env: opts.token === undefined ? base : gitAuthEnv(opts.token, base),
    timeoutMs: opts.timeoutMs ?? 60_000,
   },
+ );
+}
+
+/**
+ * A git call that carries the write credential names its remote and refs:
+ * `fetch`/`push` take a remote and at least one refspec, and `clone` and
+ * `worktree add` reach no remote through a branch's upstream. The tamper
+ * state leaves out node branches' tracking lines (`configRecords`), which is
+ * safe only while no credentialed call falls back to an upstream: a bare
+ * `fetch`, `push` or any `pull` would.
+ */
+export function assertNamedRefs(args: string[]): void {
+ const [verb, ...rest] = args;
+ if (verb === "clone" || (verb === "worktree" && rest[0] === "add")) return;
+ const positional = rest.filter((a) => !a.startsWith("-"));
+ if ((verb === "fetch" || verb === "push") && positional.length >= 2) return;
+ throw new GitSafetyError(
+  `refusing a credentialed \`git ${args.join(" ")}\`: it must name its remote and refs, never fall back to a branch's upstream`,
  );
 }
 
@@ -97,18 +116,18 @@ function branchKey(key: string): { name: string; key: string } | null {
  * node-branch section is dropped only when it holds exactly `remote=origin`
  * and `merge=refs/heads/<branch>`, or `remote=origin` alone. Any branch
  * name, not only the map's base: the known-good record is one per checkout
- * (two maps on one repo can have two bases), and ranger's credentialed git
- * calls name their refs (`fetch origin <base>`, `push origin <src>:<dst>`),
- * so a tracking target never steers one. Git writes the
+ * (two maps on one repo can have two bases), and every git call that carries
+ * the write credential names its remote and refs (`assertNamedRefs`), so a
+ * tracking target never steers one. Git writes the
  * two keys as separate config writes, remote first (branch.c
  * `install_branch_config_multiple_remotes`), so a snapshot or an assert taken
  * while another node's worktree is being created can see the remote-only
  * section; it is a strict subset of the full one, so dropping it lets nothing
  * through the full rule does not. Merge-only never comes from git's write
- * order and stays in the hash. Parsed by git without includes, so an
- * include line is hashed as the line it is and the file it names is hashed
- * on its own (`includeTargets`); a file git cannot parse is
- * hashed raw, never as an empty listing. Records keep git's file order, never
+ * order and stays in the hash. Parsed by git without includes (an include
+ * line is refused, `includeKeys`); a file git cannot parse is hashed raw,
+ * never as an empty listing, and anything but a regular file is never read
+ * (`readIfFile`). Records keep git's file order, never
  * sorted: for a repeated single-value key the last one wins, so reordering
  * `http.sslVerify` or `core.sshCommand` entries changes what git runs.
  */
@@ -116,8 +135,9 @@ function configRecords(
  file: string,
  read: ConfigReader,
 ): { bytes: Buffer | string; records: Records | null } {
- if (!existsSync(file)) return { bytes: "(absent)", records: null };
- const body = readFileSync(file);
+ const body = readIfFile(file);
+ if (body === null) return { bytes: "(absent)", records: null };
+ if (body === NOT_A_FILE) return { bytes: NOT_A_FILE_ENTRY, records: null };
  const records = read.parse(body);
  if (records === null) {
   return { bytes: Buffer.concat([Buffer.from("(unparsed)\0"), body]), records: null };
@@ -162,29 +182,21 @@ const TRACKED_HEAD = /^refs\/heads\/[A-Za-z0-9_][A-Za-z0-9._/-]*$/;
 type Records = [string, string | null][];
 
 /**
- * Git, run once per distinct input within one `readGitState`: it reads
- * one `config.worktree` copy per worktree, mostly alike, and each copy
- * holds the main file's include lines.
+ * Git, run once per distinct config body within one `readGitState`: it
+ * reads one `config.worktree` copy per worktree, mostly alike.
  */
 interface ConfigReader {
  /** Config bytes to records, or null when git cannot parse them (`listConfig`). */
  parse(body: Buffer): Records | null;
- /** A `~user/` or `%(prefix)/` include value as git expands it (`expandPath`). */
- expand(value: string): string | null;
 }
 
 function configReader(): ConfigReader {
  const parsed = new Map<string, Records | null>();
- const expanded = new Map<string, string | null>();
  return {
   parse(body) {
    const key = digest(body);
    if (!parsed.has(key)) parsed.set(key, listConfig(body));
    return parsed.get(key) ?? null;
-  },
-  expand(value) {
-   if (!expanded.has(value)) expanded.set(value, expandPath(value));
-   return expanded.get(value) ?? null;
   },
  };
 }
@@ -195,7 +207,7 @@ function configReader(): ConfigReader {
  * re-encoded on the way. Keys and values are byte strings (latin1, not utf8:
  * one char per byte), so a value with bytes that are not valid UTF-8 (FF vs
  * FE in a command path) never collapses to the same replacement character
- * and hashes alike, and an include path keeps the bytes git opens.
+ * and hashes alike.
  */
 function listConfig(body: Buffer): Records | null {
  const listed = spawnSync(
@@ -219,94 +231,21 @@ function listConfig(body: Buffer): Records | null {
   });
 }
 
-/** Git's include nesting limit (config.c `MAX_INCLUDE_DEPTH`). */
-const MAX_INCLUDE_DEPTH = 10;
-
 /**
- * Include targets are byte strings, one latin1 char per byte, as
- * `listConfig` reads the path out of the config: decoding `café.conf` as
- * text and encoding it back would name a file git never opens. These turn a
- * path ranger holds as text into that form, and that form into the Buffer
- * every fs call on a target takes.
+ * The `include.*` and `includeIf.*` keys in `records` (git lists the section
+ * lowercased). Ranger never follows an include (decided 2026-10-05 for node
+ * #81): five review rounds each found a new way a hand-rolled walker missed
+ * the file git reads (unicode paths, `~user/`, symlinks, nesting). Any such
+ * key, whatever its variable or condition, refuses the state instead.
  */
-const toBytePath = (path: string): string => Buffer.from(path, "utf8").toString("latin1");
-const fsPath = (bytePath: string): Buffer => Buffer.from(bytePath, "latin1");
-
-/**
- * The file an `include.path` or `includeIf.<condition>.path` value names, as
- * git resolves it: `~/` against the HOME every supervisor git call runs with
- * (`minimalGitEnv`), a relative path against the directory of the file that
- * holds the line (`from`, a byte path). `~user/` and `%(prefix)/` are
- * expanded by git itself (`expandPath`). Null when git cannot expand the
- * value either. No file is read through such a line: once it applies (an
- * `include`, or an `includeIf` whose condition holds) git refuses to read
- * the config that holds it (`could not expand include path`), and until
- * then git skips it. The line itself is hashed.
- */
-function resolveInclude(value: string, from: string, expand: ConfigReader["expand"]): string | null {
- if (value === "~" || value.startsWith("~/")) {
-  const home = minimalGitEnv().HOME;
-  return home === undefined ? null : join(toBytePath(home), value.slice(2));
- }
- if (value.startsWith("~") || value.startsWith("%(prefix)/")) return expand(value);
- return isAbsolute(value) ? value : join(dirname(from), value);
-}
-
-/**
- * A `~user/` or `%(prefix)/` path as git expands it (`git config
- * --type=path`, the expansion its include handling uses), in the env every
- * supervisor git call runs with; null when git cannot. Byte strings in and
- * out, the value quoted into a one-key config on stdin.
- */
-function expandPath(value: string): string | null {
- const quoted = value.replace(/[\\"]/g, "\\$&").replace(/\n/g, "\\n").replace(/\t/g, "\\t");
- const expanded = spawnSync(
-  "git",
-  [
-   "-c", "core.hooksPath=/dev/null",
-   "-c", "core.fsmonitor=false",
-   "config", "--file", "-", "--no-includes", "--type=path", "--null", "--get", "include.path",
-  ],
-  {
-   env: minimalGitEnv(),
-   encoding: "latin1",
-   input: Buffer.from(`[include]\n\tpath = "${quoted}"\n`, "latin1"),
-   timeout: 10_000,
-  },
- );
- if (expanded.status !== 0 || expanded.error !== undefined) return null;
- const path = expanded.stdout.replace(/\0$/, "");
- return path.length === 0 ? null : path;
-}
-
-/**
- * Add to `into` every file `records` (read from `file`) includes, and every
- * file those include, whatever the condition of an `includeIf` (the
- * condition is in the hashed key; whether it holds can change without a
- * config write). A missing target sets nothing, as in git, and is left out:
- * the include line itself is hashed, and a target that appears later is new.
- */
-function includeTargets(
- file: string,
- records: Records,
- into: Set<string>,
- read: ConfigReader,
- depth = 0,
-): void {
- if (depth >= MAX_INCLUDE_DEPTH) return;
- for (const [key, value] of records) {
-  const first = key.indexOf(".");
-  const last = key.lastIndexOf(".");
-  if (first === -1 || value === null || key.slice(last + 1).toLowerCase() !== "path") continue;
-  const section = key.slice(0, first).toLowerCase();
-  if (!(section === "include" && last === first) && !(section === "includeif" && last > first)) continue;
-  const target = resolveInclude(value, file, read.expand);
-  if (target === null || into.has(target) || !existsSync(fsPath(target))) continue;
-  into.add(target);
-  if (statSync(fsPath(target), { throwIfNoEntry: false })?.isFile() !== true) continue;
-  const nested = read.parse(readFileSync(fsPath(target)));
-  if (nested !== null) includeTargets(target, nested, into, read, depth + 1);
- }
+function includeKeys(records: Records): string[] {
+ return records
+  .map(([key]) => key)
+  .filter((key) => {
+   const dot = key.indexOf(".");
+   const section = dot === -1 ? "" : key.slice(0, dot).toLowerCase();
+   return section === "include" || section === "includeif";
+  });
 }
 
 /**
@@ -328,19 +267,25 @@ function isWorktreeConfigCopy(main: Records, linked: Records): boolean {
  return same(linked, kept) || same(linked, kept.filter(([key]) => key !== "core.bare"));
 }
 
+/** A main `config.worktree` whose copy git would write empty: it sets only `core.worktree` / `core.bare`, or nothing. */
+const setsNothing = (main: Records): boolean => isWorktreeConfigCopy(main, []);
+
 /**
  * The git state as the tamper check reads it: `hash` gates (order-sensitive,
  * every byte of the files `readGitState` lists), `entries` only names what
  * moved. One digest per config key (its values in file order), per
- * `config.worktree` file, per included file and per hook, so a mismatch can
+ * `config.worktree` file and per hook, so a mismatch can
  * say `http.sslverify` without the journal ever holding a
  * config value (a remote URL can carry a token). A key can carry one too
  * (`url.https://bot:TOKEN@host/.insteadof`), so URL-keyed subsections are
- * named by digest (`keyLabel`), and so are included files (`include <…>`).
+ * named by digest (`keyLabel`). `includes` names every include key found
+ * (`includeKeys`), each with the file that holds it: a state with any is
+ * refused, never recorded or adopted.
  */
 export interface GitState {
  hash: string;
  entries: Record<string, string>;
+ includes: string[];
 }
 
 const digest = (data: Buffer | string): string => createHash("sha256").update(data).digest("hex");
@@ -371,37 +316,63 @@ const ABSENT = "(absent)";
 /** The entry value of an empty linked `config.worktree`. */
 const EMPTY_DIGEST = createHash("sha256").update("").digest("hex");
 
+/** A path that is there but not a regular file: a FIFO, a device, a directory. */
+const NOT_A_FILE = Symbol("not a file");
+const NOT_A_FILE_ENTRY = "(not a file)";
+
+/**
+ * A regular file's bytes; null when nothing is there; `NOT_A_FILE` for
+ * anything else, which is never read: a worker could swap the shared config
+ * for a FIFO and hang the supervisor's check. Opened non-blocking and
+ * checked on the open descriptor, so a swap between check and read cannot
+ * slip one in.
+ */
+function readIfFile(path: string): Buffer | null | typeof NOT_A_FILE {
+ let fd: number;
+ try {
+  fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
+ } catch (error) {
+  if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+  throw error;
+ }
+ try {
+  return fstatSync(fd).isFile() ? readFileSync(fd) : NOT_A_FILE;
+ } finally {
+  closeSync(fd);
+ }
+}
+
 /** A config file's records as git parses it; null when it is not a file or git cannot parse it. */
 function readConfigFile(file: string, read: ConfigReader): Records | null {
- return statSync(file, { throwIfNoEntry: false })?.isFile() === true ? read.parse(readFileSync(file)) : null;
+ const body = readIfFile(file);
+ return body instanceof Buffer ? read.parse(body) : null;
 }
 
 /**
  * The linked worktrees' `config.worktree` files `readGitState` hashes, with
- * every file each of them includes added to `included` (a copy's relative
- * include resolves against its own directory, so a left-out copy's targets
- * are still hashed). A linked file is left out when it is git's copy of the
- * main one (`isWorktreeConfigCopy`), and when it is empty or missing while
- * the main one sets nothing (so it sets what a copy would). Once the main
- * file sets something, an empty or missing linked file drops that for its
- * worktree (a main `http.sslVerify=true` over a shared `false`), so it is
- * kept: emptying or deleting a copy is a change.
+ * the include keys of every one of them added to `includes` (a left-out copy
+ * of the main file included). A linked file is left out when it is git's
+ * copy of the main one (`isWorktreeConfigCopy`), and when it is empty or
+ * missing while the main one sets nothing (so it sets what a copy would).
+ * Once the main file sets something, an empty or missing linked file drops
+ * that for its worktree (a main `http.sslVerify=true` over a shared
+ * `false`), so it is kept: emptying or deleting a copy is a change.
  */
 function linkedWorktreeConfigs(
  gitDir: string,
  main: { present: boolean; records: Records | null },
- included: Set<string>,
+ includes: (file: string, records: Records) => void,
  read: ConfigReader,
 ): string[] {
  const worktrees = join(gitDir, "worktrees");
  if (!existsSync(worktrees)) return [];
- const mainSetsNothing = !main.present || (main.records !== null && isWorktreeConfigCopy(main.records, []));
+ const mainSetsNothing = !main.present || (main.records !== null && setsNothing(main.records));
  const kept: string[] = [];
  for (const entry of readdirSync(worktrees).sort()) {
   if (statSync(join(worktrees, entry), { throwIfNoEntry: false })?.isDirectory() !== true) continue;
   const file = join(worktrees, entry, "config.worktree");
   const records = readConfigFile(file, read);
-  if (records !== null) includeTargets(toBytePath(file), records, included, read);
+  if (records !== null) includes(file, records);
   if (mainSetsNothing && (!existsSync(file) || records?.length === 0)) continue;
   if (records !== null && main.records !== null && isWorktreeConfigCopy(main.records, records)) continue;
   kept.push(file);
@@ -413,37 +384,43 @@ function linkedWorktreeConfigs(
  * Read the git state a worker could tamper with: the shared `config` (less
  * ranger's own node-branch tracking, see `configRecords`), the main
  * `config.worktree` and the linked ones that set something of their own
- * (`linkedWorktreeConfigs`), every file those configs include
- * (`includeTargets`), and the hooks directory.
+ * (`linkedWorktreeConfigs`), and the hooks directory. Include keys in any
+ * of those config files are listed in `includes`; the files they name are
+ * never read.
  */
 export function readGitState(canonical: string): GitState {
  const gitDir = join(canonical, ".git");
  const hash = createHash("sha256");
  const entries: Record<string, string> = {};
+ const includes = new Set<string>();
  const read = configReader();
- // Every part is length-framed, and a missing file is "-" where a length
- // would be: bare concatenation let bytes move across a file boundary
- // (hook B deleted, its path and body appended to hook A) and hash alike.
- const part = (data: Buffer | string | null) => {
-  if (data === null) {
-   hash.update("-\0");
+ const name = (file: string) => file.slice(gitDir.length + 1);
+ const noteIncludes = (file: string, records: Records) => {
+  for (const key of includeKeys(records)) includes.add(`${keyLabel(key)} in ${name(file)}`);
+ };
+ // Every part is length-framed, a missing file is "-" where a length would
+ // be, and a path that is not a file is "*": bare concatenation let bytes
+ // move across a file boundary (hook B deleted, its path and body appended
+ // to hook A) and hash alike.
+ const part = (data: Buffer | string | null | typeof NOT_A_FILE) => {
+  if (data === null || data === NOT_A_FILE) {
+   hash.update(data === null ? "-\0" : "*\0");
    return;
   }
   const bytes = typeof data === "string" ? Buffer.from(data) : data;
   hash.update(`${bytes.length}\0`);
   hash.update(bytes);
  };
- const add = (file: string): Buffer | null => {
+ const add = (file: string, nameAbsent = false): void => {
   part(file);
-  const body = existsSync(file) ? readFileSync(file) : null;
+  const body = readIfFile(file);
   part(body);
-  if (body !== null) entries[file.slice(gitDir.length + 1)] = digest(body);
-  return body;
+  if (body === null) {
+   if (nameAbsent) entries[name(file)] = ABSENT;
+  } else {
+   entries[name(file)] = body === NOT_A_FILE ? NOT_A_FILE_ENTRY : digest(body);
+  }
  };
- // One set across every config file: a copy's absolute or `~/` include names
- // the main file's target, and hashing it once per copy would make each new
- // worktree a change.
- const included = new Set<string>();
  const config = join(gitDir, "config");
  part(config);
  const listed = configRecords(config, read);
@@ -451,7 +428,7 @@ export function readGitState(canonical: string): GitState {
  if (listed.records === null) {
   entries[`config ${typeof listed.bytes === "string" ? listed.bytes : "(unparsed)"}`] = digest(listed.bytes);
  } else {
-  includeTargets(toBytePath(config), listed.records, included, read);
+  noteIncludes(config, listed.records);
   const byKey = new Map<string, (string | null)[]>();
   for (const [key, value] of listed.records) byKey.set(key, [...(byKey.get(key) ?? []), value]);
   for (const [key, values] of byKey) entries[keyLabel(key)] = digest(JSON.stringify(values));
@@ -460,24 +437,14 @@ export function readGitState(canonical: string): GitState {
  const mainPresent = existsSync(mainWorktreeConfig);
  add(mainWorktreeConfig);
  const mainRecords = mainPresent ? readConfigFile(mainWorktreeConfig, read) : null;
- if (mainRecords !== null) includeTargets(toBytePath(mainWorktreeConfig), mainRecords, included, read);
- const linked = linkedWorktreeConfigs(gitDir, { present: mainPresent, records: mainRecords }, included, read);
- for (const file of linked) {
-  if (add(file) === null) entries[file.slice(gitDir.length + 1)] = ABSENT;
- }
- // Byte paths: hashed as the bytes git opens.
- for (const target of [...included].sort()) {
-  part(fsPath(target));
-  const body =
-   statSync(fsPath(target), { throwIfNoEntry: false })?.isFile() === true ? readFileSync(fsPath(target)) : null;
-  part(body);
-  entries[`include <${digest(fsPath(target)).slice(0, 12)}>`] = body === null ? ABSENT : digest(body);
- }
+ if (mainRecords !== null) noteIncludes(mainWorktreeConfig, mainRecords);
+ const linked = linkedWorktreeConfigs(gitDir, { present: mainPresent, records: mainRecords }, noteIncludes, read);
+ for (const file of linked) add(file, true);
  const hooks = join(gitDir, "hooks");
  if (existsSync(hooks)) {
   for (const entry of readdirSync(hooks).sort()) add(join(hooks, entry));
  }
- return { hash: hash.digest("hex"), entries };
+ return { hash: hash.digest("hex"), entries, includes: [...includes].sort() };
 }
 
 /**
@@ -512,24 +479,34 @@ const LINKED_CONFIG = /^worktrees\/[^/]+\/config\.worktree$/;
  * worktree's directory before it writes git's copy into it, and creates the
  * copy empty before it fills it, so another node's `git worktree add` or
  * `remove` can be caught midway. Returns the last read; a change that stays
- * is still a change.
+ * is still a change. Waits without blocking the event loop.
  */
-export function readGitStateSettled(canonical: string, expected: string): GitState {
+export async function readGitStateSettled(canonical: string, expected: string): Promise<GitState> {
  let state = readGitState(canonical);
  for (let attempt = 0; attempt < 3 && state.hash !== expected; attempt++) {
   const midway = Object.entries(state.entries).some(
    ([name, value]) => LINKED_CONFIG.test(name) && (value === ABSENT || value === EMPTY_DIGEST),
   );
   if (!midway) break;
-  Bun.sleepSync(100);
+  await Bun.sleep(100);
   state = readGitState(canonical);
  }
  return state;
 }
 
-/** Throw unless the git state still hashes to `snapshot`; returns the state it read (the one it vetted). */
-export function assertGitUntouched(canonical: string, snapshot: string): GitState {
- const state = readGitStateSettled(canonical, snapshot);
+/** The refusal for a state that holds include keys (node #81), naming them. */
+export function includeRefusal(includes: string[]): string {
+ const names = includes.join(", ");
+ return `git config include refused: ${names.length > 200 ? `${names.slice(0, 197)}…` : names} — ranger never follows include paths. Remove the line, then resume the node.`;
+}
+
+/**
+ * Throw unless the git state still hashes to `snapshot` and holds no
+ * include key; returns the state it read (the one it vetted).
+ */
+export async function assertGitUntouched(canonical: string, snapshot: string): Promise<GitState> {
+ const state = await readGitStateSettled(canonical, snapshot);
+ if (state.includes.length > 0) throw new GitSafetyError(includeRefusal(state.includes));
  if (state.hash !== snapshot) {
   throw new GitSafetyError(
    "the git config or hooks changed while the worker ran — refusing to run git against a tampered checkout",
@@ -618,7 +595,7 @@ export async function vettedPush(opts: {
  /** What to push (default HEAD); research pushes its named local branch. */
  source?: string;
 }): Promise<GitState> {
- const vetted = assertGitUntouched(opts.canonical, opts.configSnapshot);
+ const vetted = await assertGitUntouched(opts.canonical, opts.configSnapshot);
  const push = await safeGit(
   ["push", "--no-verify", "origin", `${opts.source ?? "HEAD"}:refs/heads/${opts.branch}`],
   { cwd: opts.worktree, token: opts.token, timeoutMs: 120_000 },

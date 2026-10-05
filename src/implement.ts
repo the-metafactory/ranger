@@ -955,7 +955,7 @@ async function baseMergePass(ctx: ImplementContext, testCommand: string, pushedH
   if (r.code !== 0) throw new GitSafetyError(`cannot reset ${ctx.worktree} to ${pushedHead.slice(0, 8)} (git ${args[0]}): ${r.stderr.trim()}`);
  }
  // The fetch carries the write credential: the state must still be the known-good one (node #81).
- trustedSnapshot(ctx.journal, ctx.canonical, { repo: ctx.map.repo, nodeId: ctx.node.ref.id }, mapKey(ctx.map));
+ await trustedSnapshot(ctx.journal, ctx.canonical, { repo: ctx.map.repo, nodeId: ctx.node.ref.id }, mapKey(ctx.map));
  await fastForwardCanonical(ctx.canonical, base, ctx.token);
  // The base's commit as the supervisor fetched it, read before the worker
  // runs: the worker shares the repository and could move the ref itself.
@@ -1102,7 +1102,7 @@ async function checkedWorkerPass(
  const nodeId = node.ref.id;
  // Checked against the known-good state, not just read (node #81): a state
  // changed since the supervisor last saw it clean is never this pass's baseline.
- const snapshot = trustedSnapshot(journal, ctx.canonical, { repo: map.repo, nodeId }, mapKey(map));
+ const snapshot = await trustedSnapshot(journal, ctx.canonical, { repo: map.repo, nodeId }, mapKey(map));
  const before = await headSha(worktree);
  const prompt = assembleImplementPrompt({
   repo: map.repo,
@@ -1144,7 +1144,7 @@ async function checkedWorkerPass(
  const log = saveWorkerLog(journal.path, map.repo, nodeId, ctx.generation, pass, result);
  // Before ANY git call after the worker: a tampered config or hook would run
  // with whatever the next git call carries.
- assertGitUntouched(ctx.canonical, snapshot);
+ await assertGitUntouched(ctx.canonical, snapshot);
 
  const fail = (detail: string, substrateCapped?: CapSignal): PassResult => ({
   workerExit: result.code,
@@ -1205,7 +1205,7 @@ async function checkedWorkerPass(
  }
  // The tests ran worker-written code: the state must still be the vetted one
  // before it counts as seen clean.
- const clean = assertGitUntouched(ctx.canonical, snapshot);
+ const clean = await assertGitUntouched(ctx.canonical, snapshot);
  recordKnownGood(journal, ctx.canonical, clean, `passing ${pass}`);
  await assertNoClosingKeywords(worktree, map.base);
  return { workerExit: result.code, snapshot, sha };
@@ -1561,7 +1561,7 @@ async function adoptBuiltWork(ctx: ImplementContext, testCommand: string): Promi
  const { map, worktree, journal, node } = ctx;
  if ((await commitsAhead(worktree, map.base)) === 0) return null;
  if ((await dirtyFiles(worktree)).length > 0) return null;
- const snapshot = trustedSnapshot(journal, ctx.canonical, { repo: map.repo, nodeId: node.ref.id }, mapKey(map));
+ const snapshot = await trustedSnapshot(journal, ctx.canonical, { repo: map.repo, nodeId: node.ref.id }, mapKey(map));
  const sha = await headSha(worktree);
  // Tested in a fresh clone of the commit, not in the worktree: whatever the
  // failed run left there (ignored fixtures, links, replacement refs) must
@@ -1580,7 +1580,7 @@ async function adoptBuiltWork(ctx: ImplementContext, testCommand: string): Promi
    }
   }
  }
- const clean = assertGitUntouched(ctx.canonical, snapshot);
+ const clean = await assertGitUntouched(ctx.canonical, snapshot);
  if (tests.code !== 0) {
   journal.recordEvent("reviewed", {
    nodeId: node.ref.id,
