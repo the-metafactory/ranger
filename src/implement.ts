@@ -1,4 +1,5 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { availableParallelism, loadavg, tmpdir } from "node:os";
 import { join } from "node:path";
 import { DiscordAnnouncer } from "./announce.ts";
@@ -1366,9 +1367,10 @@ function testsFailedDetail(testCommand: string, tests: RunResult, after: string)
  * failed run that left HEAD and the tree as they were is retried, and a
  * passing retry must leave them so too: the retry would otherwise certify
  * files the failed run wrote that the pushed commit does not carry. "The
- * tree" includes the gitignored paths git lists (a new ignored fixture
- * counts); a file added inside an already-ignored directory (node_modules/,
- * a cache) is not seen, because git lists only the directory.
+ * tree" includes the gitignored files git lists, by path and content (a new
+ * or rewritten ignored fixture counts); a file added or changed inside an
+ * already-ignored directory (node_modules/, a cache) is not seen, because
+ * git lists only the directory.
  */
 async function supervisorTests(
  ctx: ImplementContext,
@@ -1413,14 +1415,32 @@ async function supervisorTests(
  return { tests, log };
 }
 
-/** The gitignored paths git lists in the worktree, one string to compare (null when git cannot say). */
+/**
+ * The gitignored paths git lists in the worktree, as one string to compare
+ * (null when git cannot say). An ignored file git lists on its own is
+ * compared by its content too, so a rewritten fixture counts; an ignored
+ * directory is listed, and compared, by its name alone.
+ */
 async function ignoredPaths(worktree: string): Promise<string | null> {
  const r = await safeGit(["status", "--porcelain", "--ignored=matching", "--untracked-files=all"], {
   cwd: worktree,
   timeoutMs: 60_000,
  });
  if (r.code !== 0) return null;
- return r.stdout.split("\n").filter((l) => l.startsWith("!! ")).sort().join("\n");
+ const entries: string[] = [];
+ for (const line of r.stdout.split("\n").filter((l) => l.startsWith("!! ")).sort()) {
+  const path = line.slice(3);
+  if (path.endsWith("/")) {
+   entries.push(path);
+   continue;
+  }
+  try {
+   entries.push(`${path} ${createHash("sha256").update(readFileSync(join(worktree, path))).digest("hex")}`);
+  } catch {
+   entries.push(`${path} (unreadable)`);
+  }
+ }
+ return entries.join("\n");
 }
 
 /**
@@ -1432,7 +1452,8 @@ async function ignoredPaths(worktree: string): Promise<string | null> {
  * nothing to adopt or it does not pass.
  *
  * The git state is trusted exactly as on any resumed pass: the tamper
- * snapshot is taken now, at the start of this run.
+ * snapshot is taken now, at the start of this run (node #81: a stored
+ * known-good snapshot instead).
  */
 async function adoptBuiltWork(ctx: ImplementContext, testCommand: string): Promise<PassResult | null> {
  const { map, worktree, journal, node } = ctx;
