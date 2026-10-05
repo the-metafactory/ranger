@@ -22,6 +22,7 @@ import type { CheckRun, IssueComment, PullRequest, GitHubPort } from "./github.t
 import { ParkSignal } from "./signals.ts";
 import {
  PROBE_FILE,
+ parseFailedChecks,
  parseFailedProbes,
  policyBlockedOutcome,
  probesFailedOutcome,
@@ -305,7 +306,7 @@ async function probeFinalHead(
  const failed = result.code > 0 ? parseFailedProbes(result.stdout) : [];
  // A failure the merge base shares is the base's, not this branch's
  // (2026-10-05: main went red on one probe and parked every later node).
- const base = result.code === 0 ? null : await probeMergeBase(ctx, failed);
+ const base = result.code === 0 ? null : await probeMergeBase(ctx, failed, result.stdout);
  if (base !== null) journal.recordEvent("reviewed", { nodeId, repo, detail: baseProbeDetail(base) });
  const baseRed = base !== null && base.red.length === failed.length ? base.red : undefined;
  if (baseRed !== undefined) await announceBaseRed(ctx, (base as BaseProbeResult).sha, baseRed);
@@ -384,8 +385,10 @@ async function awaitQuietHost(ctx: ImplementContext, run: string): Promise<void>
 interface BaseProbeResult {
  /** The merge base the probes ran at. */
  sha: string;
- /** Failed probes that fail at the merge base too. */
+ /** Failed probes that fail the same checks at the merge base: the base's failure, not this branch's. */
  red: string[];
+ /** Failed probes that fail at the merge base too, but not on every check they fail here, so they gate. */
+ differs: string[];
  /** Failed probes that pass at the merge base: the branch broke them. */
  passed: string[];
  /** Failed probes the branch added or edited: the base runs another probe under that name, so they gate. */
@@ -397,6 +400,7 @@ function baseProbeDetail(b: BaseProbeResult): string {
  const at = `the merge base ${b.sha.slice(0, 8)}`;
  return [
   b.red.length > 0 ? `${b.red.join(", ")} fail at ${at} too` : null,
+  b.differs.length > 0 ? `${b.differs.join(", ")} fail at ${at} too, but on other checks — they gate` : null,
   b.passed.length > 0 ? `${b.passed.join(", ")} pass at ${at} — the failure is this branch's` : null,
   b.changed.length > 0 ? `${b.changed.join(", ")} are new or changed on this branch — they gate` : null,
  ].filter((part) => part !== null).join("; ");
@@ -411,11 +415,18 @@ function fileNames(stdout: string): Set<string> {
  * Run the probes that failed at the head once more at the branch's merge base
  * with the map base, in a throwaway detached worktree. A probe the branch
  * added or edited is not compared: the base would run another probe under
- * its name, so it gates whatever the base says. Null when the answer is
+ * its name, so it gates whatever the base says. A probe file holds many
+ * checks, so one red at the base is the base's only when every check it
+ * fails here fails there too; a probe whose output names no check (a crash)
+ * cannot be compared and gates. Null when the answer is
  * unknown: no retry template to name exact probes, no named failures, or a
  * base run that could not be set up, timed out, or named nothing.
  */
-async function probeMergeBase(ctx: ImplementContext, failed: string[]): Promise<BaseProbeResult | null> {
+async function probeMergeBase(
+ ctx: ImplementContext,
+ failed: string[],
+ headStdout: string,
+): Promise<BaseProbeResult | null> {
  const { map, worktree } = ctx;
  const template = map.commands.probeRetry;
  if (template === undefined || failed.length === 0) return null;
@@ -429,7 +440,7 @@ async function probeMergeBase(ctx: ImplementContext, failed: string[]): Promise<
  const touched = fileNames(diff.stdout);
  const changed = failed.filter((n) => !atBase.has(n) || touched.has(n));
  const comparable = failed.filter((n) => !changed.includes(n));
- if (comparable.length === 0) return { sha, red: [], passed: [], changed };
+ if (comparable.length === 0) return { sha, red: [], differs: [], passed: [], changed };
  const command = probeRetryCommandFor(template, ctx.node.ref.id, comparable);
  const scratch = mkdtempSync(join(tmpdir(), "ranger-probe-base-"));
  const dir = join(scratch, "worktree");
@@ -442,12 +453,21 @@ async function probeMergeBase(ctx: ImplementContext, failed: string[]): Promise<
   }
   await awaitQuietHost(ctx, "the merge-base probe run");
   const run = await runShell(command, dir, ctx, map.commands.probeTimeoutMin * 60_000);
-  if (run.code === 0) return { sha, red: [], passed: comparable, changed };
+  if (run.code === 0) return { sha, red: [], differs: [], passed: comparable, changed };
   const named = run.code > 0 ? parseFailedProbes(run.stdout) : [];
   if (named.length === 0) return null;
+  const headChecks = parseFailedChecks(headStdout);
+  const baseChecks = parseFailedChecks(run.stdout);
+  const sameChecks = (probe: string): boolean => {
+   const here = headChecks.get(probe) ?? new Set<string>();
+   const there = baseChecks.get(probe) ?? new Set<string>();
+   return here.size > 0 && there.size > 0 && [...here].every((check) => there.has(check));
+  };
+  const redThere = comparable.filter((n) => named.includes(n));
   return {
    sha,
-   red: comparable.filter((n) => named.includes(n)),
+   red: redThere.filter(sameChecks),
+   differs: redThere.filter((n) => !sameChecks(n)),
    passed: comparable.filter((n) => !named.includes(n)),
    changed,
   };

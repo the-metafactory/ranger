@@ -729,6 +729,17 @@ describe("implement lane (node #23)", () => {
   expect(events.some((d) => d.includes("probe-hud.mjs are new or changed on this branch — they gate"))).toBe(true);
  }, 60_000);
 
+ test("a probe red at the merge base on other checks gates: the branch broke a check of its own", async () => {
+  const r = await rig({ probe: "fake-probe branch-other {node}", probeRetry: "fake-probe branch-other {node} {failed}" });
+  cleanup.push(r.dir);
+  await seedProbeOnBase(r);
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("parked");
+  expect(r.announced).toEqual([]);
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.includes("probe-hud.mjs fail at the merge base") && d.includes("but on other checks — they gate"))).toBe(true);
+ }, 60_000);
+
  test("a probe the base does not have gates: nothing to compare it with", async () => {
   const r = await rig({ probe: "fake-probe red {node}", probeRetry: "fake-probe red {node} {failed}" });
   cleanup.push(r.dir);

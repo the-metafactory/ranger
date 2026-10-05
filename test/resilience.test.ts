@@ -6,7 +6,7 @@ import { caffeinateArgs, holdAwake } from "../src/awake.ts";
 import { fastForwardCanonical } from "../src/git-ops.ts";
 import { isReadRequest } from "../src/github.ts";
 import { parseFailedProbes, probeMarker, probeRetryCommandFor, recordedProbes } from "../src/implement.ts";
-import { probesFailedOutcome } from "../src/outcomes.ts";
+import { parseFailedChecks, probesFailedOutcome } from "../src/outcomes.ts";
 import { isTransientGitHubError, runReadRetryingTransient } from "../src/transient.ts";
 import { runCmd } from "../src/exec.ts";
 import { createCanonicalRepo, GIT_ENV } from "./support.ts";
@@ -106,6 +106,25 @@ describe("a failed probe run retries only its failures", () => {
    { sha: "a".repeat(40), passed: true, selected: "87", mode: "all", baseRed: ["probe-traffic-engagement.mjs"] },
    { sha: "b".repeat(40), passed: false, selected: "86", mode: "all" },
   ]);
+ });
+ test("failed checks are read per failed probe, without their run-specific detail", () => {
+  const out = [
+   "ok   probe-music.mjs (3.0s)",
+   "FAIL probe-traffic-engagement.mjs (7.3s) exit=1 assert peak load 6.5",
+   "     │ [probe] hardware renderer: ANGLE",
+   "     │   ok   a Clean kill reads Wanted on both left tabs (H4, H7) — {}",
+   '     │  FAIL  an armed hull, struck, fires back (H3) — {"returned":false}',
+   "     │ 21/22 checks passed",
+   "FAIL probe-commander.mjs (42.6s) exit=1 crash peak load 9.0",
+   "     │ TypeError: boom",
+   "warn probe-reporter.mjs (1.0s) exit=1 assert peak load 2.0",
+   "     │  FAIL  a reporter line — x",
+   "FAILED: probe-traffic-engagement.mjs · probe-commander.mjs",
+  ].join("\n");
+  const checks = parseFailedChecks(out);
+  expect([...checks.keys()]).toEqual(["probe-traffic-engagement.mjs", "probe-commander.mjs"]);
+  expect([...(checks.get("probe-traffic-engagement.mjs") ?? [])]).toEqual(["an armed hull, struck, fires back (H3)"]);
+  expect(checks.get("probe-commander.mjs")?.size).toBe(0); // a crash names no check
  });
  test("a park names the failures the merge base shares on its own line, after FAILED", () => {
   const outcome = probesFailedOutcome({ sha: "545ce725ff", pr: 695, exit: 1, failed: ["probe-commander.mjs", "probe-traffic-engagement.mjs"], redOnBase: ["probe-traffic-engagement.mjs"], tail: "…" });

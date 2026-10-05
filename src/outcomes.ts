@@ -25,6 +25,32 @@ export function parseFailedProbes(stdout: string): string[] {
  return names.length > 0 && names.every((n) => PROBE_FILE.test(n)) ? names : [];
 }
 
+/**
+ * The checks each failed probe failed, by the seelite runner's layout: a
+ * `FAIL <file> (<n>s) …` header, then the probe's own output indented under
+ * `│`, where a failed check reads `FAIL  <check> — <detail>`. The detail
+ * carries run-specific values, so only the check's name is kept. A probe
+ * whose output names no failed check (a crash, a timeout) maps to an empty set.
+ */
+export function parseFailedChecks(stdout: string): Map<string, Set<string>> {
+ const out = new Map<string, Set<string>>();
+ let current: Set<string> | null = null;
+ for (const line of stdout.split("\n")) {
+  const header = /^(ok|FAIL|warn) +([\w.-]+\.m?js) \(/.exec(line);
+  if (header !== null) {
+   current = null;
+   if (header[1] === "FAIL" && PROBE_FILE.test(header[2])) {
+    current = new Set();
+    out.set(header[2], current);
+   }
+   continue;
+  }
+  const check = /^\s*│\s*FAIL\s+(.+?)(?:\s+—\s.*)?$/.exec(line);
+  if (check !== null && current !== null) current.add(check[1].trim());
+ }
+ return out;
+}
+
 /** Sage rounds ran out with blockers or majors still open. */
 export function reviewCapOutcome(r: { blockers: number; majors: number; round: number; pr: number }): string {
  return `${r.blockers} blocker(s) and ${r.majors} major(s) remain after ${r.round} sage round(s) on PR #${r.pr} — good-enough is the principal's call (design §4/§7)`;
