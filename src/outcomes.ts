@@ -25,28 +25,37 @@ export function parseFailedProbes(stdout: string): string[] {
  return names.length > 0 && names.every((n) => PROBE_FILE.test(n)) ? names : [];
 }
 
+/** How a failed probe failed, as the runner's header and the probe's own output say. */
+export interface FailedProbeRun {
+ /** The runner's failure kind (`assert`, `crash`, …); null when the header names none. */
+ kind: string | null;
+ /** The names of the checks it failed, without their run-specific detail. */
+ checks: Set<string>;
+}
+
 /**
- * The checks each failed probe failed, by the seelite runner's layout: a
- * `FAIL <file> (<n>s) …` header, then the probe's own output indented under
- * `│`, where a failed check reads `FAIL  <check> — <detail>`. The detail
- * carries run-specific values, so only the check's name is kept. A probe
- * whose output names no failed check (a crash, a timeout) maps to an empty set.
+ * The failed probes of a run, by the seelite runner's layout: a
+ * `FAIL <file> (<n>s) exit=<code> <kind> …` header, then the probe's own
+ * output indented under `│`, where a failed check reads
+ * `FAIL  <check> — <detail>`. The detail carries run-specific values, so only
+ * the check's name is kept. A probe that names no failed check (a crash, a
+ * timeout) has an empty set.
  */
-export function parseFailedChecks(stdout: string): Map<string, Set<string>> {
- const out = new Map<string, Set<string>>();
- let current: Set<string> | null = null;
+export function parseFailedChecks(stdout: string): Map<string, FailedProbeRun> {
+ const out = new Map<string, FailedProbeRun>();
+ let current: FailedProbeRun | null = null;
  for (const line of stdout.split("\n")) {
-  const header = /^(ok|FAIL|warn) +([\w.-]+\.m?js) \(/.exec(line);
+  const header = /^(ok|FAIL|warn) +([\w.-]+\.m?js) \([^)]*\)(?: exit=-?\d+ (\w+))?/.exec(line);
   if (header !== null) {
    current = null;
    if (header[1] === "FAIL" && PROBE_FILE.test(header[2])) {
-    current = new Set();
+    current = { kind: header[3] ?? null, checks: new Set() };
     out.set(header[2], current);
    }
    continue;
   }
   const check = /^\s*│\s*FAIL\s+(.+?)(?:\s+—\s.*)?$/.exec(line);
-  if (check !== null && current !== null) current.add(check[1].trim());
+  if (check !== null && current !== null) current.checks.add(check[1].trim());
  }
  return out;
 }

@@ -387,7 +387,7 @@ interface BaseProbeResult {
  sha: string;
  /** Failed probes that fail the same checks at the merge base: the base's failure, not this branch's. */
  red: string[];
- /** Failed probes that fail at the merge base too, but not on every check they fail here, so they gate. */
+ /** Failed probes that fail at the merge base too, but not the same way (another check, or a crash), so they gate. */
  differs: string[];
  /** Failed probes that pass at the merge base: the branch broke them. */
  passed: string[];
@@ -400,7 +400,7 @@ function baseProbeDetail(b: BaseProbeResult): string {
  const at = `the merge base ${b.sha.slice(0, 8)}`;
  return [
   b.red.length > 0 ? `${b.red.join(", ")} fail at ${at} too` : null,
-  b.differs.length > 0 ? `${b.differs.join(", ")} fail at ${at} too, but on other checks — they gate` : null,
+  b.differs.length > 0 ? `${b.differs.join(", ")} fail at ${at} too, but not the same way — they gate` : null,
   b.passed.length > 0 ? `${b.passed.join(", ")} pass at ${at} — the failure is this branch's` : null,
   b.changed.length > 0 ? `${b.changed.join(", ")} are new or changed on this branch — they gate` : null,
  ].filter((part) => part !== null).join("; ");
@@ -417,8 +417,8 @@ function fileNames(stdout: string): Set<string> {
  * added or edited is not compared: the base would run another probe under
  * its name, so it gates whatever the base says. A probe file holds many
  * checks, so one red at the base is the base's only when every check it
- * fails here fails there too; a probe whose output names no check (a crash)
- * cannot be compared and gates. Null when the answer is
+ * fails here fails there too, and both runs ended as assertion failures; a
+ * crash, kill or timeout cannot be compared and gates. Null when the answer is
  * unknown: no retry template to name exact probes, no named failures, or a
  * base run that could not be set up, timed out, or named nothing.
  */
@@ -458,10 +458,14 @@ async function probeMergeBase(
   if (named.length === 0) return null;
   const headChecks = parseFailedChecks(headStdout);
   const baseChecks = parseFailedChecks(run.stdout);
+  // Both runs must be completed assertion failures: a crash, kill or timeout
+  // after the inherited check is a failure of its own that names no check.
   const sameChecks = (probe: string): boolean => {
-   const here = headChecks.get(probe) ?? new Set<string>();
-   const there = baseChecks.get(probe) ?? new Set<string>();
-   return here.size > 0 && there.size > 0 && [...here].every((check) => there.has(check));
+   const here = headChecks.get(probe);
+   const there = baseChecks.get(probe);
+   if (here === undefined || there === undefined) return false;
+   if (here.kind !== "assert" || there.kind !== "assert") return false;
+   return here.checks.size > 0 && [...here.checks].every((check) => there.checks.has(check));
   };
   const redThere = comparable.filter((n) => named.includes(n));
   return {

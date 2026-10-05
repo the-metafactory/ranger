@@ -123,8 +123,8 @@ describe("a failed probe run retries only its failures", () => {
   ].join("\n");
   const checks = parseFailedChecks(out);
   expect([...checks.keys()]).toEqual(["probe-traffic-engagement.mjs", "probe-commander.mjs"]);
-  expect([...(checks.get("probe-traffic-engagement.mjs") ?? [])]).toEqual(["an armed hull, struck, fires back (H3)"]);
-  expect(checks.get("probe-commander.mjs")?.size).toBe(0); // a crash names no check
+  expect(checks.get("probe-traffic-engagement.mjs")).toEqual({ kind: "assert", checks: new Set(["an armed hull, struck, fires back (H3)"]) });
+  expect(checks.get("probe-commander.mjs")).toEqual({ kind: "crash", checks: new Set() }); // a crash names no check
  });
  test("a park names the failures the merge base shares on its own line, after FAILED", () => {
   const outcome = probesFailedOutcome({ sha: "545ce725ff", pr: 695, exit: 1, failed: ["probe-commander.mjs", "probe-traffic-engagement.mjs"], redOnBase: ["probe-traffic-engagement.mjs"], tail: "…" });

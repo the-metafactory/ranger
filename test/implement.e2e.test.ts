@@ -737,7 +737,17 @@ describe("implement lane (node #23)", () => {
   expect(outcome.status).toBe("parked");
   expect(r.announced).toEqual([]);
   const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
-  expect(events.some((d) => d.includes("probe-hud.mjs fail at the merge base") && d.includes("but on other checks — they gate"))).toBe(true);
+  expect(events.some((d) => d.includes("probe-hud.mjs fail at the merge base") && d.includes("but not the same way — they gate"))).toBe(true);
+ }, 60_000);
+
+ test("a probe that fails the inherited check and then crashes on the branch gates", async () => {
+  const r = await rig({ probe: "fake-probe branch-crash {node}", probeRetry: "fake-probe branch-crash {node} {failed}" });
+  cleanup.push(r.dir);
+  await seedProbeOnBase(r);
+  expect((await runNode("20", r.ctx)).status).toBe("parked");
+  expect(r.announced).toEqual([]);
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.includes("but not the same way — they gate"))).toBe(true);
  }, 60_000);
 
  test("a probe the base does not have gates: nothing to compare it with", async () => {
