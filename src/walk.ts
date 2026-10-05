@@ -1,7 +1,7 @@
 import { implementLane, type ImplementLane } from "./lanes.ts";
 import { lastImplementMaps, recordImplementStart, mapKey, implementMapOrder } from "./maps.ts";
 import { spawn } from "node:child_process";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { RangerConfig, RangerMapConfig, WalkMode } from "./config.ts";
 import { DiscordAnnouncer } from "./announce.ts";
 import { BudgetDeferral, budgetPolicy } from "./budget.ts";
@@ -66,6 +66,27 @@ export interface SpawnRunNodeArgs {
 }
 
 /**
+ * Bun arguments for a detached run-node. The child inherits the tokens and
+ * the caller's cwd, so bun reads ranger's own bunfig.toml (its default is
+ * $cwd/bunfig.toml, whose `preload` runs first) and no .env (whose
+ * `SAGE_X=$GH_TOKEN` would copy a token into a name the worker env
+ * forwards) — the same pins as ops/bin/ranger.example (node #66).
+ */
+export function runNodeArgv(args: SpawnRunNodeArgs): string[] {
+ return [
+  `--config=${join(dirname(args.cliEntry), "..", "bunfig.toml")}`,
+  "--no-env-file",
+  args.cliEntry,
+  "run-node",
+  args.nodeId,
+  "--map",
+  mapKey(args),
+  "--config",
+  args.configPath,
+ ];
+}
+
+/**
  * Launch a detached `ranger run-node` that outlives this tick (design §1).
  * Returns the child PID (null when no process was spawned).
  */
@@ -79,15 +100,7 @@ export async function spawnRunNodeDetached(
  }
  const child = spawn(
   process.execPath,
-  [
-   args.cliEntry,
-   "run-node",
-   args.nodeId,
-   "--map",
-   mapKey(args),
-   "--config",
-   args.configPath,
-  ],
+  runNodeArgv(args),
   {
    detached: true,
    stdio: "ignore",

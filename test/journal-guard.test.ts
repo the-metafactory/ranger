@@ -18,6 +18,7 @@ import {
  underTest,
 } from "../src/journal-guard.ts";
 import { runCmd } from "../src/exec.ts";
+import { runNodeArgv } from "../src/walk.ts";
 import { baseConfigLines, bun, runCli } from "./support.ts";
 
 const FOREIGN = ["f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0", "e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1"];
@@ -378,5 +379,34 @@ describe("the live wrapper (node #66)", () => {
   expect(out.vars.get("TERM")).toBe("xterm");
   expect(out.vars.get("GH_TOKEN")).toBe("ghp_caller");
   expect(out.vars.get("RANGER_WRITE_GH_TOKEN_METAFACTORY")).toBe("kc-ivy-agent");
+ });
+});
+
+describe("the detached run-node spawn (node #66)", () => {
+ test("bun reads ranger's bunfig and no .env from the caller's directory", async () => {
+  // The child inherits the tokens and the caller's cwd: a .env there must not
+  // copy \$GH_TOKEN into a forwarded name, nor a bunfig.toml preload run first.
+  const ranger = tempDir();
+  mkdirSync(join(ranger, "src"), { recursive: true });
+  writeFileSync(join(ranger, "bunfig.toml"), "");
+  const cliEntry = join(ranger, "src", "cli.ts");
+  writeFileSync(cliEntry, "console.log(JSON.stringify({ env: process.env, argv: process.argv.slice(2) }));\n");
+  const cwd = tempDir();
+  for (const name of [".env", ".env.local", ".env.development", ".env.production", ".env.test"]) {
+   writeFileSync(join(cwd, name), "SAGE_LEAK=$GH_TOKEN\nFROM_DOTENV=1\n");
+  }
+  writeFileSync(join(cwd, "evil.ts"), 'console.log("PRELOADED");\n');
+  writeFileSync(join(cwd, "bunfig.toml"), 'preload = ["./evil.ts"]\n');
+  const args = { nodeId: "7", repo: "o/r", root: 1, cliEntry, configPath: "/srv/ranger.yaml" };
+  const argv = runNodeArgv(args);
+  expect(argv.slice(0, 2)).toEqual([`--config=${join(ranger, "bunfig.toml")}`, "--no-env-file"]);
+  const result = await runCmd(bun, argv, { env: { PATH: "/usr/bin:/bin", GH_TOKEN: "ghp_live" }, cwd });
+  expect(result.code).toBe(0);
+  expect(result.stdout).not.toContain("PRELOADED");
+  const out = JSON.parse(result.stdout) as { env: Record<string, string>; argv: string[] };
+  expect(out.env.GH_TOKEN).toBe("ghp_live");
+  expect(out.env.SAGE_LEAK).toBeUndefined();
+  expect(out.env.FROM_DOTENV).toBeUndefined();
+  expect(out.argv).toEqual(["run-node", "7", "--map", "o/r#1", "--config", "/srv/ranger.yaml"]);
  });
 });
