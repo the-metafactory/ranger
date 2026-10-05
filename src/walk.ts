@@ -18,6 +18,7 @@ import type { Journal } from "./journal.ts";
 import { ClaimLockBusy, withClaimLock } from "./claim-lock.ts";
 import type { OwnedCheck } from "./lock.ts";
 import { classifyFrontier, loadProbeRegistry } from "./route.ts";
+import type { GitHubPort } from "./github.ts";
 import { sweepMap, type SweepMapResult } from "./sweep.ts";
 import {
  implementCandidates,
@@ -34,8 +35,10 @@ export { implementCandidates, planTick, researchCandidates, selectCandidates };
  * The headless tick (design §1, build-path step 3) — one bounded pass:
  *
  * per map → gate (write token + not-principal + walk mode + pause state) →
+ * sweep (liveness, merge desk and its send-backs); then, per map again →
  * derive + classify frontier → research-lane candidates → announce (fail-closed)
- * → claim (race-safe) → spawn a detached `ranger run-node` → then sweep.
+ * → claim (race-safe) → spawn a detached `ranger run-node`. Sweeps go first so
+ * a send-back takes its implement lane before a fresh claim can.
  *
  * Stateless over the graph: everything topological is re-derived per pass.
  */
@@ -111,6 +114,8 @@ export interface WalkContext {
  /** Detached run-node spawner — tests inject a recorder. Returns the child PID or null. */
  spawnRunNode?: (args: SpawnRunNodeArgs) => Promise<number | null>;
  now?: () => Date;
+ /** The merge desk's GitHub port (tests inject a fake; default: the real API). */
+ github?: GitHubPort;
 }
 
 /** Is this resource lane held? (awaiting-merge does not hold it.) */
@@ -283,7 +288,36 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
  // across maps: at most one new implement claim per resource lane per tick.
  const implementClaimed = new Set<ImplementLane>();
 
- for (const map of implementMapOrder(config.maps, lastImplementMaps(journal), implementLane)) {
+ const order = implementMapOrder(config.maps, lastImplementMaps(journal), implementLane);
+ // One sweep wiring for both phases; only the phase differs.
+ const sweepPhase = (
+  w: { map: RangerMapConfig; token: string; botIdentity: string },
+  phase: "liveness" | "desk",
+ ): Promise<SweepMapResult> =>
+  sweepMap({
+   config,
+   journal,
+   map: w.map,
+   token: w.token,
+   botIdentity: w.botIdentity,
+   github: ctx.github,
+   phase,
+   respawn: (nodeId, repo, root) =>
+    (ctx.spawnRunNode ?? spawnRunNodeDetached)({ nodeId, repo, root, cliEntry, configPath: ctx.configPath }),
+  });
+ const maps: WalkMapResult[] = [];
+ const walked: { map: (typeof order)[number]; mapResult: WalkMapResult; token: string; botIdentity: string; errors: string[] }[] = [];
+
+ // Pass 1 — every walked map's liveness sweep, then (1b) every map's merge
+ // desk, before any claim. The desk sends ready PRs back to run-node (rework,
+ // missing probes, a conflict with the base), and a send-back needs its
+ // implement lane. Run after the claims, it lost the lane to a fresh claim
+ // whenever the lane freed between ticks (2026-10-05: seelite #691 took the
+ // visual lane one second before the desk tried to send #491 back, and
+ // nothing stopped that repeating). Liveness goes first on every map: a
+ // crashed holder on a later map, released after an earlier map's desk ran,
+ // would otherwise hand its lane to a claim instead.
+ for (const map of order) {
   const mapResult: WalkMapResult = {
    repo: map.repo,
    walkMode: map.walk,
@@ -299,7 +333,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
   if (map.walk === "none") {
    mapResult.gated = true;
    mapResult.gateReason = "walk: none — this map is registered, not walked";
-   result.maps.push(mapResult);
+   maps.push(mapResult);
    continue;
   }
 
@@ -315,7 +349,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
    mapResult.gated = true;
    mapResult.gateReason =
     error instanceof WriteGateError ? error.message : String(error);
-   result.maps.push(mapResult);
+   maps.push(mapResult);
    continue;
   }
 
@@ -327,6 +361,34 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
   }
 
   const errors: string[] = [];
+  // Sweep always runs for a walked map (even paused — liveness/audit surface).
+  try {
+   mapResult.sweep = await sweepPhase({ map, token, botIdentity }, "liveness");
+  } catch (error) {
+   errors.push(
+    `sweep failed: ${error instanceof Error ? error.message : String(error)}`,
+   );
+  }
+
+  maps.push(mapResult);
+  walked.push({ map, mapResult, token, botIdentity, errors });
+ }
+
+ // Pass 1b — the merge desks, against lanes every liveness sweep has settled.
+ for (const { map, mapResult, token, botIdentity, errors } of walked) {
+  try {
+   const desk = await sweepPhase({ map, token, botIdentity }, "desk");
+   // A failed liveness sweep left no result: the desk's own stands in, so
+   // what the desk did (and its row errors) still reaches the report.
+   if (mapResult.sweep === undefined) mapResult.sweep = desk;
+   else if (desk.mergeDesk !== undefined) mapResult.sweep.mergeDesk = desk.mergeDesk;
+  } catch (error) {
+   errors.push(`merge desk failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+ }
+
+ // Pass 2 — claims, in the same map order, against lanes the sweeps and desks have settled.
+ for (const { map, mapResult, token, botIdentity, errors } of walked) {
   if (!mapResult.gated) {
    try {
     // The claim lock (node #58) spans the map's whole claim phase: a
@@ -425,31 +487,8 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
   }
 
   mapResult.errors = errors;
-  // Sweep always runs for a walked map (even paused — liveness/audit surface).
-  try {
-   mapResult.sweep = await sweepMap({
-    config,
-    journal,
-    map,
-    token,
-    botIdentity,
-    respawn: (nodeId, repo, root) =>
-     (ctx.spawnRunNode ?? spawnRunNodeDetached)({
-      nodeId,
-      repo,
-      root,
-      cliEntry,
-      configPath: ctx.configPath,
-     }),
-   });
-  } catch (error) {
-   errors.push(
-    `sweep failed: ${error instanceof Error ? error.message : String(error)}`,
-   );
-  }
-
-  result.maps.push(mapResult);
  }
 
+ result.maps = maps;
  return result;
 }
