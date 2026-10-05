@@ -5,12 +5,14 @@ import { join } from "node:path";
 import { runCmd } from "../src/exec.ts";
 import {
  assertGitUntouched,
+ assertNamedRefs,
  gitConfigSnapshot,
  GitSafetyError,
  NODE_BRANCH,
+ safeGit,
 } from "../src/git-ops.ts";
 import { bootstrapWorktree, slugify, worktreeBranch } from "../src/worker.ts";
-import { createCanonicalRepo, GIT_ENV } from "./support.ts";
+import { addTrackedWorktree, createCanonicalRepo, GIT_ENV } from "./support.ts";
 
 /**
  * Node #63: the tamper guard leaves out only the branch-tracking entries
@@ -40,11 +42,11 @@ afterEach(() => {
 describe("gitConfigSnapshot: ranger's own node branches (node #63)", () => {
  test("a second node's worktree branch leaves the snapshot unchanged (seelite #212/#663)", async () => {
   const before = gitConfigSnapshot(canonical);
-  await bootstrapWorktree(canonical, "663", "stations-are-solid", "tok");
+  await addTrackedWorktree(canonical, "663", "stations-are-solid");
   expect(await config("--get", "branch.node/663-stations-are-solid.remote")).toBe("origin");
   expect(await config("--get", "branch.node/663-stations-are-solid.merge")).toBe("refs/heads/main");
   expect(gitConfigSnapshot(canonical)).toBe(before);
-  expect(() => assertGitUntouched(canonical, before)).not.toThrow();
+  await expect(assertGitUntouched(canonical, before)).resolves.toBeDefined();
  });
 
  // Git writes remote, then merge, as two config writes: a snapshot or an
@@ -53,23 +55,48 @@ describe("gitConfigSnapshot: ranger's own node branches (node #63)", () => {
   const before = gitConfigSnapshot(canonical);
   await config("branch.node/663-x.remote", "origin");
   expect(gitConfigSnapshot(canonical)).toBe(before);
-  expect(() => assertGitUntouched(canonical, before)).not.toThrow();
+  await expect(assertGitUntouched(canonical, before)).resolves.toBeDefined();
   await config("branch.node/663-x.merge", "refs/heads/main");
   expect(gitConfigSnapshot(canonical)).toBe(before);
-  expect(() => assertGitUntouched(canonical, before)).not.toThrow();
+  await expect(assertGitUntouched(canonical, before)).resolves.toBeDefined();
  });
 
- test("a branch tracking a non-main map base is left out under that base only", async () => {
+ // Node #81: one known-good record per checkout, so the filter is the same
+ // for every map base on it.
+ test("a branch tracking another map base is left out too", async () => {
   await git(["push", "origin", "HEAD:refs/heads/develop"]);
   await git(["fetch", "origin"]);
-  const before = gitConfigSnapshot(canonical, "develop");
-  const beforeMain = gitConfigSnapshot(canonical);
-  await bootstrapWorktree(canonical, "70", "on-develop", "tok", undefined, "develop");
-  expect(gitConfigSnapshot(canonical, "develop")).toBe(before);
-  expect(gitConfigSnapshot(canonical)).not.toBe(beforeMain);
+  const before = gitConfigSnapshot(canonical);
+  await addTrackedWorktree(canonical, "70", "on-develop", "develop");
+  expect(await config("--get", "branch.node/70-on-develop.merge")).toBe("refs/heads/develop");
+  expect(gitConfigSnapshot(canonical)).toBe(before);
  });
 
- test("the node-branch pattern matches the branches the worktree code names", () => {
+ test("a node branch tracking anything but a branch under refs/heads stays in the hash", async () => {
+  for (const merge of ["refs/tags/v1", "refs/heads/../x", "main"]) {
+   const before = gitConfigSnapshot(canonical);
+   await config("branch.node/71-x.remote", "origin");
+   await config("branch.node/71-x.merge", merge);
+   expect(gitConfigSnapshot(canonical)).not.toBe(before);
+   await config("--remove-section", "branch.node/71-x");
+  }
+ });
+
+ // Node #81: ranger's own worktrees write no tracking lines, whatever the
+ // operator's branch.autoSetup* settings, so the state stays put.
+ test("bootstrapWorktree writes no tracking lines under autoSetupRebase and autoSetupMerge=always", async () => {
+  await config("branch.autoSetupRebase", "always");
+  await config("branch.autoSetupMerge", "always");
+  const before = gitConfigSnapshot(canonical);
+  await bootstrapWorktree(canonical, "663", "stations-are-solid", "tok");
+  await bootstrapWorktree(canonical, "64", "x", "tok", "feature/other");
+  const listed = await config("--list");
+  expect(listed).not.toContain("branch.node/");
+  expect(listed).not.toContain("branch.feature/");
+  expect(gitConfigSnapshot(canonical)).toBe(before);
+ });
+
+ test("the node-branch pattern matches the branches the worktree code names", async () => {
   for (const title of [
    "Tamper guard: ignore ranger's own node-branch tracking lines",
    "x",
@@ -86,7 +113,6 @@ describe("gitConfigSnapshot: ranger's own node branches (node #63)", () => {
 describe("gitConfigSnapshot: everything else stays in the hash", () => {
  const changes: [string, () => Promise<unknown>][] = [
   ["core.hooksPath", () => config("core.hooksPath", "/tmp/hooks")],
-  ["an include.path", () => config("include.path", "/tmp/evil.gitconfig")],
   ["a url.<x>.insteadOf", () => config("url.https://evil.example/.insteadOf", "https://github.com/")],
   ["a credential.helper", () => config("credential.helper", "!evil")],
   [
@@ -100,7 +126,7 @@ describe("gitConfigSnapshot: everything else stays in the hash", () => {
   [
    "a node-branch section that gains pushRemote",
    async () => {
-    await bootstrapWorktree(canonical, "663", "x", "tok");
+    await addTrackedWorktree(canonical, "663", "x");
     // The snapshot taken after the branch exists, then the section grows.
     const mid = gitConfigSnapshot(canonical);
     await config("branch.node/663-x.pushRemote", "origin");
@@ -118,10 +144,18 @@ describe("gitConfigSnapshot: everything else stays in the hash", () => {
   ["a merge-only node-branch section", () => config("branch.node/663-x.merge", "refs/heads/main")],
   ["a remote-only non-node branch section", () => config("branch.feature/x.remote", "origin")],
   [
-   "a node-branch merge target other than the map base",
+   "a node-branch merge target outside refs/heads",
    async () => {
     await config("branch.node/663-x.remote", "origin");
-    await config("branch.node/663-x.merge", "refs/heads/other");
+    await config("branch.node/663-x.merge", "refs/remotes/origin/main");
+   },
+  ],
+  [
+   "a node-branch section with a rebase line (autoSetupRebase)",
+   async () => {
+    await config("branch.node/663-x.remote", "origin");
+    await config("branch.node/663-x.merge", "refs/heads/main");
+    await config("branch.node/663-x.rebase", "true");
    },
   ],
   [
@@ -166,8 +200,8 @@ describe("gitConfigSnapshot: everything else stays in the hash", () => {
    const before = gitConfigSnapshot(canonical);
    await change();
    expect(gitConfigSnapshot(canonical)).not.toBe(before);
-   expect(() => assertGitUntouched(canonical, before)).toThrow(GitSafetyError);
-   expect(() => assertGitUntouched(canonical, before)).toThrow(
+   await expect(assertGitUntouched(canonical, before)).rejects.toThrow(GitSafetyError);
+   await expect(assertGitUntouched(canonical, before)).rejects.toThrow(
     "the git config or hooks changed while the worker ran — refusing to run git against a tampered checkout",
    );
   });
@@ -187,12 +221,12 @@ describe("gitConfigSnapshot: everything else stays in the hash", () => {
    await config("--add", key, first);
    expect(await config("--get", key)).toBe(first);
    expect(gitConfigSnapshot(canonical)).not.toBe(before);
-   expect(() => assertGitUntouched(canonical, before)).toThrow(GitSafetyError);
+   await expect(assertGitUntouched(canonical, before)).rejects.toThrow(GitSafetyError);
   });
  }
 
  // Values are bytes, not UTF-8: two invalid bytes must not hash alike.
- test("a core.sshCommand differing only in a non-UTF-8 byte changes the snapshot", () => {
+ test("a core.sshCommand differing only in a non-UTF-8 byte changes the snapshot", async () => {
   const file = join(canonical, ".git", "config");
   const original = readFileSync(file);
   const withByte = (byte: number) =>
@@ -201,12 +235,12 @@ describe("gitConfigSnapshot: everything else stays in the hash", () => {
   const one = gitConfigSnapshot(canonical);
   writeFileSync(file, withByte(0xfe));
   expect(gitConfigSnapshot(canonical)).not.toBe(one);
-  expect(() => assertGitUntouched(canonical, one)).toThrow(GitSafetyError);
+  await expect(assertGitUntouched(canonical, one)).rejects.toThrow(GitSafetyError);
  });
 
  // A subsection may hold "=": these two records join to the same
  // "key=value" string, yet only the second rewrites GitHub URLs.
- test("moving '=' between a url subsection and its insteadOf value changes the snapshot", () => {
+ test("moving '=' between a url subsection and its insteadOf value changes the snapshot", async () => {
   const file = join(canonical, ".git", "config");
   const original = readFileSync(file, "utf8");
   writeFileSync(
@@ -219,12 +253,12 @@ describe("gitConfigSnapshot: everything else stays in the hash", () => {
    `${original}[url "https://github.com.insteadof=@evil.example/"]\n\tinsteadOf = https://github.com/\n`,
   );
   expect(gitConfigSnapshot(canonical)).not.toBe(one);
-  expect(() => assertGitUntouched(canonical, one)).toThrow(GitSafetyError);
+  await expect(assertGitUntouched(canonical, one)).rejects.toThrow(GitSafetyError);
  });
 
  // Bare concatenation hashed path A, body A, path B, body B: deleting B and
  // appending its path and body to A fed the hash the same bytes.
- test("moving a hook's bytes across a file boundary changes the snapshot", () => {
+ test("moving a hook's bytes across a file boundary changes the snapshot", async () => {
   const hooks = join(canonical, ".git", "hooks");
   const [a, b] = [join(hooks, "zz-a"), join(hooks, "zz-b")];
   writeFileSync(a, "#!/bin/sh\n");
@@ -233,14 +267,63 @@ describe("gitConfigSnapshot: everything else stays in the hash", () => {
   rmSync(b);
   writeFileSync(a, `#!/bin/sh\n${b}exit 0\n`);
   expect(gitConfigSnapshot(canonical)).not.toBe(one);
-  expect(() => assertGitUntouched(canonical, one)).toThrow(GitSafetyError);
+  await expect(assertGitUntouched(canonical, one)).rejects.toThrow(GitSafetyError);
  });
 
- test("an unparseable config is hashed raw: two different broken files differ", () => {
+ test("an unparseable config is hashed raw: two different broken files differ", async () => {
   const file = join(canonical, ".git", "config");
   writeFileSync(file, "[core\n\tbare = false\n");
   const one = gitConfigSnapshot(canonical);
   writeFileSync(file, "[core\n\tbare = true\n");
   expect(gitConfigSnapshot(canonical)).not.toBe(one);
+ });
+});
+
+describe("assertGitUntouched: include keys (node #81)", () => {
+ test("an include added while the worker ran is refused by name", async () => {
+  const before = gitConfigSnapshot(canonical);
+  await config("include.path", "/tmp/evil.gitconfig");
+  await expect(assertGitUntouched(canonical, before)).rejects.toThrow(
+   /^git config include refused: include\.path in config/,
+  );
+ });
+
+ test("an include present in the snapshot itself is still refused", async () => {
+  await config("includeIf.gitdir:/x/.path", "/tmp/evil.gitconfig");
+  await expect(assertGitUntouched(canonical, gitConfigSnapshot(canonical))).rejects.toThrow(/include refused/);
+ });
+});
+
+/**
+ * The tamper state leaves node branches' tracking lines out, safe only while
+ * no credentialed git call falls back to a branch's upstream.
+ */
+describe("assertNamedRefs: credentialed git calls name their remote and refs", () => {
+ test("the calls ranger makes pass", () => {
+  for (const args of [
+   ["fetch", "origin", "main"],
+   ["push", "--no-verify", "origin", "HEAD:refs/heads/node/81-x"],
+   ["clone", "https://github.com/acme/widgets.git", "/tmp/x"],
+   ["worktree", "add", "--no-track", "/tmp/x", "-b", "node/81-x", "origin/main"],
+  ]) {
+   expect(() => assertNamedRefs(args)).not.toThrow();
+  }
+ });
+
+ test("an upstream fallback is refused", () => {
+  for (const args of [
+   ["fetch"],
+   ["fetch", "origin"],
+   ["push"],
+   ["push", "--no-verify", "origin"],
+   ["pull", "origin", "main"],
+   ["remote", "update"],
+  ]) {
+   expect(() => assertNamedRefs(args)).toThrow(GitSafetyError);
+  }
+ });
+
+ test("safeGit runs the guard on every call that carries the credential", () => {
+  expect(() => safeGit(["pull"], { cwd: canonical, token: "placeholder" })).toThrow(GitSafetyError);
  });
 });

@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, openSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { runCmd, type RunResult } from "./exec.ts";
 
@@ -13,7 +13,9 @@ import { runCmd, type RunResult } from "./exec.ts";
  * off, and a minimal env — never the supervisor's own, which holds the write
  * PATs and the Discord token; the auth header is added only to the calls that
  * talk to the remote. Before any git call after a worker session, the git
- * config and hooks must match a pre-worker snapshot (`assertGitUntouched`).
+ * config and hooks must match a pre-worker snapshot (`assertGitUntouched`),
+ * and that snapshot must match the state the supervisor last saw clean in an
+ * earlier run (`git-trust.ts`, node #81).
  *
  * This is a tamper check, not a sandbox: a same-user process could still
  * write elsewhere on the machine. It closes the paths by which worker-written
@@ -56,6 +58,7 @@ export function safeGit(
  args: string[],
  opts: { cwd: string; token?: string; timeoutMs?: number },
 ): Promise<RunResult> {
+ if (opts.token !== undefined) assertNamedRefs(args);
  const base = minimalGitEnv();
  return runCmd(
   "git",
@@ -65,6 +68,24 @@ export function safeGit(
    env: opts.token === undefined ? base : gitAuthEnv(opts.token, base),
    timeoutMs: opts.timeoutMs ?? 60_000,
   },
+ );
+}
+
+/**
+ * A git call that carries the write credential names its remote and refs:
+ * `fetch`/`push` take a remote and at least one refspec, and `clone` and
+ * `worktree add` reach no remote through a branch's upstream. The tamper
+ * state leaves out node branches' tracking lines (`configRecords`), which is
+ * safe only while no credentialed call falls back to an upstream: a bare
+ * `fetch`, `push` or any `pull` would.
+ */
+export function assertNamedRefs(args: string[]): void {
+ const [verb, ...rest] = args;
+ if (verb === "clone" || (verb === "worktree" && rest[0] === "add")) return;
+ const positional = rest.filter((a) => !a.startsWith("-"));
+ if ((verb === "fetch" || verb === "push") && positional.length >= 2) return;
+ throw new GitSafetyError(
+  `refusing a credentialed \`git ${args.join(" ")}\`: it must name its remote and refs, never fall back to a branch's upstream`,
  );
 }
 
@@ -85,54 +106,44 @@ function branchKey(key: string): { name: string; key: string } | null {
 
 /**
  * The shared `config` as hashable bytes, less the branch-tracking entries
- * ranger writes for its own node branches. Adding a node worktree off
- * origin/<base> writes `branch."node/…".remote` + `.merge` to the SHARED
+ * ranger wrote for its own node branches before node #81 (`bootstrapWorktree`
+ * now adds `--no-track`; branches from older builds keep theirs, and an
+ * operator's `git worktree add -b` writes them too). Adding a node worktree off
+ * origin/<base> wrote `branch."node/…".remote` + `.merge` to the SHARED
  * config, so a second node started in the same clone during a worker session
  * tripped the first one's tamper check (node #63: seelite #212 parked by
  * #663). Remove, don't select: every other record stays in the hash, and a
  * node-branch section is dropped only when it holds exactly `remote=origin`
- * and `merge=refs/heads/<base>`, or `remote=origin` alone. Git writes the
+ * and `merge=refs/heads/<branch>`, or `remote=origin` alone. Any branch
+ * name, not only the map's base: the known-good record is one per checkout
+ * (two maps on one repo can have two bases), and every git call that carries
+ * the write credential names its remote and refs (`assertNamedRefs`), so a
+ * tracking target never steers one. Git writes the
  * two keys as separate config writes, remote first (branch.c
  * `install_branch_config_multiple_remotes`), so a snapshot or an assert taken
  * while another node's worktree is being created can see the remote-only
  * section; it is a strict subset of the full one, so dropping it lets nothing
  * through the full rule does not. Merge-only never comes from git's write
- * order and stays in the hash. Parsed by git without includes, so an
- * include line is hashed as the line it is; a file git cannot parse is
- * hashed raw, never as an empty listing. Records keep git's file order, never
+ * order and stays in the hash. Parsed by git without includes (an include
+ * line is refused, `includeKeys`); a file git cannot parse is hashed raw,
+ * never as an empty listing, and anything but a regular file is never read
+ * (`readIfFile`). Records keep git's file order, never
  * sorted: for a repeated single-value key the last one wins, so reordering
  * `http.sslVerify` or `core.sshCommand` entries changes what git runs.
  */
-function configRecords(file: string, base: string): Buffer | string {
- if (!existsSync(file)) return "(absent)";
- const listed = spawnSync(
-  "git",
-  [
-   "-c", "core.hooksPath=/dev/null",
-   "-c", "core.fsmonitor=false",
-   "config", "--file", file, "--no-includes", "--list", "--null",
-  ],
-  // latin1, not utf8: one char per byte, so a value with bytes that are not
-  // valid UTF-8 (FF vs FE in a command path) never collapses to the same
-  // replacement character and hashes alike.
-  { env: minimalGitEnv(), encoding: "latin1", timeout: 10_000 },
- );
- if (listed.status !== 0 || listed.error !== undefined) {
-  return Buffer.concat([Buffer.from("(unparsed)\0"), readFileSync(file)]);
+function configRecords(
+ file: string,
+ read: ConfigReader,
+): { bytes: Buffer | string; records: Records | null } {
+ const body = readIfFile(file);
+ if (body === null) return { bytes: "(absent)", records: null };
+ if (body === NOT_A_FILE) return { bytes: NOT_A_FILE_ENTRY, records: null };
+ const records = read.parse(body);
+ if (records === null) {
+  return { bytes: Buffer.concat([Buffer.from("(unparsed)\0"), body]), records: null };
  }
- // --null: each record ends in NUL; the key ends at the first newline, and a
- // valueless boolean key has none.
- const records = listed.stdout
-  .split("\0")
-  .filter((r) => r.length > 0)
-  .map((r) => {
-   const nl = r.indexOf("\n");
-   return nl === -1
-    ? { key: r, value: null }
-    : { key: r.slice(0, nl), value: r.slice(nl + 1) };
-  });
  const sections = new Map<string, { key: string; value: string | null }[]>();
- for (const { key, value } of records) {
+ for (const [key, value] of records) {
   const parsed = branchKey(key);
   if (parsed === null) continue;
   const entries = sections.get(parsed.name) ?? [];
@@ -149,76 +160,359 @@ function configRecords(file: string, base: string): Buffer | string {
   const complete =
    entries.length === 2 &&
    merge.length === 1 &&
-   merge[0].value === `refs/heads/${base}`;
+   merge[0].value !== null &&
+   TRACKED_HEAD.test(merge[0].value) &&
+   !merge[0].value.includes("..");
   if (tracksOrigin && (midWrite || complete)) own.add(name);
  }
- return JSON.stringify(
-  records
-   .filter(({ key }) => {
-    const parsed = branchKey(key);
-    return parsed === null || !own.has(parsed.name);
-   })
-   // [key, value] tuples, never "key=value": a key may hold "=" (a url.<x>
-   // subsection), so a joined string lets two different records collide.
-   .map(({ key, value }) => [key, value]),
- );
+ const kept = records
+  .filter(([key]) => {
+   const parsed = branchKey(key);
+   return parsed === null || !own.has(parsed.name);
+  });
+ // [key, value] tuples, never "key=value": a key may hold "=" (a url.<x>
+ // subsection), so a joined string lets two different records collide.
+ return { bytes: JSON.stringify(kept), records: kept };
+}
+
+/** A tracking target ranger's node branches may carry: a branch under refs/heads/. */
+const TRACKED_HEAD = /^refs\/heads\/[A-Za-z0-9_][A-Za-z0-9._/-]*$/;
+
+/** A config file's `[key, value]` records; a valueless boolean key has a null value. */
+type Records = [string, string | null][];
+
+/**
+ * Git, run once per distinct config body within one `readGitState`: it
+ * reads one `config.worktree` copy per worktree, mostly alike.
+ */
+interface ConfigReader {
+ /** Config bytes to records, or null when git cannot parse them (`listConfig`). */
+ parse(body: Buffer): Records | null;
+}
+
+function configReader(): ConfigReader {
+ const parsed = new Map<string, Records | null>();
+ return {
+  parse(body) {
+   const key = digest(body);
+   if (!parsed.has(key)) parsed.set(key, listConfig(body));
+   return parsed.get(key) ?? null;
+  },
+ };
 }
 
 /**
- * Snapshot of the git state a worker could tamper with: the shared `config`
- * (less ranger's own node-branch tracking, see `configRecords`), per-worktree
- * `config.worktree` files, and the hooks directory. Taken before the worker
- * runs; `assertGitUntouched` compares it before any git call after. `base` is
- * the map's base branch, the merge target of those tracking entries: the
- * snapshot and its assert must be given the same one.
+ * Config bytes' records in file order, as git parses them (no includes), or
+ * null when git cannot parse them. The bytes go in on stdin, so no path is
+ * re-encoded on the way. Keys and values are byte strings (latin1, not utf8:
+ * one char per byte), so a value with bytes that are not valid UTF-8 (FF vs
+ * FE in a command path) never collapses to the same replacement character
+ * and hashes alike.
  */
-export function gitConfigSnapshot(canonical: string, base = "main"): string {
+function listConfig(body: Buffer): Records | null {
+ const listed = spawnSync(
+  "git",
+  [
+   "-c", "core.hooksPath=/dev/null",
+   "-c", "core.fsmonitor=false",
+   "config", "--file", "-", "--no-includes", "--list", "--null",
+  ],
+  { env: minimalGitEnv(), encoding: "latin1", input: body, timeout: 10_000 },
+ );
+ if (listed.status !== 0 || listed.error !== undefined) return null;
+ // --null: each record ends in NUL; the key ends at the first newline, and a
+ // valueless boolean key has none.
+ return listed.stdout
+  .split("\0")
+  .filter((r) => r.length > 0)
+  .map((r): Records[number] => {
+   const nl = r.indexOf("\n");
+   return nl === -1 ? [r, null] : [r.slice(0, nl), r.slice(nl + 1)];
+  });
+}
+
+/**
+ * The `include.*` and `includeIf.*` keys in `records` (git lists the section
+ * lowercased). Ranger never follows an include (decided 2026-10-05 for node
+ * #81): five review rounds each found a new way a hand-rolled walker missed
+ * the file git reads (unicode paths, `~user/`, symlinks, nesting). Any such
+ * key, whatever its variable or condition, refuses the state instead.
+ */
+function includeKeys(records: Records): string[] {
+ return records
+  .map(([key]) => key)
+  .filter((key) => {
+   const dot = key.indexOf(".");
+   const section = dot === -1 ? "" : key.slice(0, dot).toLowerCase();
+   return section === "include" || section === "includeif";
+  });
+}
+
+/**
+ * Whether a linked worktree's `config.worktree` is git's own copy of the
+ * main one. With `extensions.worktreeConfig` on, `git worktree add` copies
+ * the adding worktree's `config.worktree` into the new one, less
+ * `core.worktree` and a true `core.bare` (worktree.c
+ * `copy_filtered_worktree_config`). Every node worktree and every scratch
+ * worktree ranger adds would otherwise read as a change to the shared state.
+ * Only a copy of the main file counts, never of another linked one: two
+ * planted files that copy each other must not both drop out. The copy holds
+ * the main file's records in its order, so it sets nothing the main worktree
+ * does not already run with.
+ */
+function isWorktreeConfigCopy(main: Records, linked: Records): boolean {
+ const same = (a: Records, b: Records) =>
+  a.length === b.length && a.every(([k, v], i) => k === b[i][0] && v === b[i][1]);
+ const kept = main.filter(([key]) => key !== "core.worktree");
+ return same(linked, kept) || same(linked, kept.filter(([key]) => key !== "core.bare"));
+}
+
+/** A main `config.worktree` whose copy git would write empty: it sets only `core.worktree` / `core.bare`, or nothing. */
+const setsNothing = (main: Records): boolean => isWorktreeConfigCopy(main, []);
+
+/**
+ * The git state as the tamper check reads it: `hash` gates (order-sensitive,
+ * every byte of the files `readGitState` lists), `entries` only names what
+ * moved. One digest per config key (its values in file order), per
+ * `config.worktree` file and per hook, so a mismatch can
+ * say `http.sslverify` without the journal ever holding a
+ * config value (a remote URL can carry a token). A key can carry one too
+ * (`url.https://bot:TOKEN@host/.insteadof`), so URL-keyed subsections are
+ * named by digest (`keyLabel`). `includes` names every include key found
+ * (`includeKeys`), each with the file that holds it: a state with any is
+ * refused, never recorded or adopted.
+ */
+export interface GitState {
+ hash: string;
+ entries: Record<string, string>;
+ includes: string[];
+}
+
+const digest = (data: Buffer | string): string => createHash("sha256").update(data).digest("hex");
+
+/** Sections whose subsection is a URL, which can hold userinfo or a token in the query. */
+const URL_SECTIONS = new Set(["url", "http", "credential"]);
+
+/**
+ * The name a config key goes by in `GitState.entries`, and so in the
+ * journal, park outcomes and cards. A subsection that is a URL, or holds
+ * anything but ref-name characters, is replaced by a digest of the whole key:
+ * `url.<3f2a…>.insteadof`. Two keys never share a name, and a changed one is
+ * still named by section and variable; `git config --list` shows the rest.
+ */
+export function keyLabel(key: string): string {
+ const first = key.indexOf(".");
+ const last = key.lastIndexOf(".");
+ if (first === -1 || last === first) return key;
+ const section = key.slice(0, first).toLowerCase();
+ const subsection = key.slice(first + 1, last);
+ if (!URL_SECTIONS.has(section) && /^[A-Za-z0-9._/-]*$/.test(subsection)) return key;
+ return `${key.slice(0, first)}.<${digest(key).slice(0, 12)}>${key.slice(last)}`;
+}
+
+/** The entry value of a linked `config.worktree` that is not there. */
+const ABSENT = "(absent)";
+
+/** The entry value of an empty linked `config.worktree`. */
+const EMPTY_DIGEST = createHash("sha256").update("").digest("hex");
+
+/** A path that is there but not a regular file: a FIFO, a device, a directory. */
+const NOT_A_FILE = Symbol("not a file");
+const NOT_A_FILE_ENTRY = "(not a file)";
+
+/**
+ * A regular file's bytes; null when nothing is there; `NOT_A_FILE` for
+ * anything else, which is never read: a worker could swap the shared config
+ * for a FIFO and hang the supervisor's check. Opened non-blocking and
+ * checked on the open descriptor, so a swap between check and read cannot
+ * slip one in.
+ */
+function readIfFile(path: string): Buffer | null | typeof NOT_A_FILE {
+ let fd: number;
+ try {
+  fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
+ } catch (error) {
+  if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+  throw error;
+ }
+ try {
+  return fstatSync(fd).isFile() ? readFileSync(fd) : NOT_A_FILE;
+ } finally {
+  closeSync(fd);
+ }
+}
+
+/** A config file's records as git parses it; null when it is not a file or git cannot parse it. */
+function readConfigFile(file: string, read: ConfigReader): Records | null {
+ const body = readIfFile(file);
+ return body instanceof Buffer ? read.parse(body) : null;
+}
+
+/**
+ * The linked worktrees' `config.worktree` files `readGitState` hashes, with
+ * the include keys of every one of them added to `includes` (a left-out copy
+ * of the main file included). A linked file is left out when it is git's
+ * copy of the main one (`isWorktreeConfigCopy`), and when it is empty or
+ * missing while the main one sets nothing (so it sets what a copy would).
+ * Once the main file sets something, an empty or missing linked file drops
+ * that for its worktree (a main `http.sslVerify=true` over a shared
+ * `false`), so it is kept: emptying or deleting a copy is a change.
+ */
+function linkedWorktreeConfigs(
+ gitDir: string,
+ main: { present: boolean; records: Records | null },
+ includes: (file: string, records: Records) => void,
+ read: ConfigReader,
+): string[] {
+ const worktrees = join(gitDir, "worktrees");
+ if (!existsSync(worktrees)) return [];
+ const mainSetsNothing = !main.present || (main.records !== null && setsNothing(main.records));
+ const kept: string[] = [];
+ for (const entry of readdirSync(worktrees).sort()) {
+  if (statSync(join(worktrees, entry), { throwIfNoEntry: false })?.isDirectory() !== true) continue;
+  const file = join(worktrees, entry, "config.worktree");
+  const records = readConfigFile(file, read);
+  if (records !== null) includes(file, records);
+  if (mainSetsNothing && (!existsSync(file) || records?.length === 0)) continue;
+  if (records !== null && main.records !== null && isWorktreeConfigCopy(main.records, records)) continue;
+  kept.push(file);
+ }
+ return kept;
+}
+
+/**
+ * Read the git state a worker could tamper with: the shared `config` (less
+ * ranger's own node-branch tracking, see `configRecords`), the main
+ * `config.worktree` and the linked ones that set something of their own
+ * (`linkedWorktreeConfigs`), and the hooks directory. Include keys in any
+ * of those config files are listed in `includes`; the files they name are
+ * never read.
+ */
+export function readGitState(canonical: string): GitState {
  const gitDir = join(canonical, ".git");
  const hash = createHash("sha256");
- // Every part is length-framed, and a missing file is "-" where a length
- // would be: bare concatenation let bytes move across a file boundary
- // (hook B deleted, its path and body appended to hook A) and hash alike.
- const part = (data: Buffer | string | null) => {
-  if (data === null) {
-   hash.update("-\0");
+ const entries: Record<string, string> = {};
+ const includes = new Set<string>();
+ const read = configReader();
+ const name = (file: string) => file.slice(gitDir.length + 1);
+ const noteIncludes = (file: string, records: Records) => {
+  for (const key of includeKeys(records)) includes.add(`${keyLabel(key)} in ${name(file)}`);
+ };
+ // Every part is length-framed, a missing file is "-" where a length would
+ // be, and a path that is not a file is "*": bare concatenation let bytes
+ // move across a file boundary (hook B deleted, its path and body appended
+ // to hook A) and hash alike.
+ const part = (data: Buffer | string | null | typeof NOT_A_FILE) => {
+  if (data === null || data === NOT_A_FILE) {
+   hash.update(data === null ? "-\0" : "*\0");
    return;
   }
   const bytes = typeof data === "string" ? Buffer.from(data) : data;
   hash.update(`${bytes.length}\0`);
   hash.update(bytes);
  };
- const add = (file: string) => {
+ const add = (file: string, nameAbsent = false): void => {
   part(file);
-  part(existsSync(file) ? readFileSync(file) : null);
+  const body = readIfFile(file);
+  part(body);
+  if (body === null) {
+   if (nameAbsent) entries[name(file)] = ABSENT;
+  } else {
+   entries[name(file)] = body === NOT_A_FILE ? NOT_A_FILE_ENTRY : digest(body);
+  }
  };
  const config = join(gitDir, "config");
  part(config);
- part(configRecords(config, base));
- add(join(gitDir, "config.worktree"));
- const worktrees = join(gitDir, "worktrees");
- if (existsSync(worktrees)) {
-  for (const entry of readdirSync(worktrees).sort()) {
-   const file = join(worktrees, entry, "config.worktree");
-   if (existsSync(file)) add(file);
-  }
+ const listed = configRecords(config, read);
+ part(listed.bytes);
+ if (listed.records === null) {
+  entries[`config ${typeof listed.bytes === "string" ? listed.bytes : "(unparsed)"}`] = digest(listed.bytes);
+ } else {
+  noteIncludes(config, listed.records);
+  const byKey = new Map<string, (string | null)[]>();
+  for (const [key, value] of listed.records) byKey.set(key, [...(byKey.get(key) ?? []), value]);
+  for (const [key, values] of byKey) entries[keyLabel(key)] = digest(JSON.stringify(values));
  }
+ const mainWorktreeConfig = join(gitDir, "config.worktree");
+ const mainPresent = existsSync(mainWorktreeConfig);
+ add(mainWorktreeConfig);
+ const mainRecords = mainPresent ? readConfigFile(mainWorktreeConfig, read) : null;
+ if (mainRecords !== null) noteIncludes(mainWorktreeConfig, mainRecords);
+ const linked = linkedWorktreeConfigs(gitDir, { present: mainPresent, records: mainRecords }, noteIncludes, read);
+ for (const file of linked) add(file, true);
  const hooks = join(gitDir, "hooks");
  if (existsSync(hooks)) {
   for (const entry of readdirSync(hooks).sort()) add(join(hooks, entry));
  }
- return hash.digest("hex");
+ return { hash: hash.digest("hex"), entries, includes: [...includes].sort() };
 }
 
-export function assertGitUntouched(
- canonical: string,
- snapshot: string,
- base = "main",
-): void {
- if (gitConfigSnapshot(canonical, base) !== snapshot) {
+/**
+ * What differs between two states, by name: config keys, `config.worktree`
+ * files and hooks, each marked new or gone when only one side has it. Empty
+ * when the hashes differ only in record order, which still changes what git
+ * runs (`gitStateChanges` callers gate on the hash, never on this list).
+ */
+export function gitStateChanges(was: GitState["entries"], now: GitState["entries"]): string[] {
+ const names = [...new Set([...Object.keys(was), ...Object.keys(now)])].sort();
+ return names.flatMap((name) => {
+  if (!(name in was)) return [`${name} (new)`];
+  if (!(name in now)) return [`${name} (gone)`];
+  return was[name] === now[name] ? [] : [name];
+ });
+}
+
+/**
+ * The hash of `readGitState`: taken before the worker runs, compared by
+ * `assertGitUntouched` before any git call after.
+ */
+export function gitConfigSnapshot(canonical: string): string {
+ return readGitState(canonical).hash;
+}
+
+/** A linked worktree's file, read as missing or empty. */
+const LINKED_CONFIG = /^worktrees\/[^/]+\/config\.worktree$/;
+
+/**
+ * `readGitState`, read again a few times while it differs from `expected`
+ * and holds a missing or empty linked `config.worktree`: git creates a new
+ * worktree's directory before it writes git's copy into it, and creates the
+ * copy empty before it fills it, so another node's `git worktree add` or
+ * `remove` can be caught midway. Returns the last read; a change that stays
+ * is still a change. Waits without blocking the event loop.
+ */
+export async function readGitStateSettled(canonical: string, expected: string): Promise<GitState> {
+ let state = readGitState(canonical);
+ for (let attempt = 0; attempt < 3 && state.hash !== expected; attempt++) {
+  const midway = Object.entries(state.entries).some(
+   ([name, value]) => LINKED_CONFIG.test(name) && (value === ABSENT || value === EMPTY_DIGEST),
+  );
+  if (!midway) break;
+  await Bun.sleep(100);
+  state = readGitState(canonical);
+ }
+ return state;
+}
+
+/** The refusal for a state that holds include keys (node #81), naming them. */
+export function includeRefusal(includes: string[]): string {
+ const names = includes.join(", ");
+ return `git config include refused: ${names.length > 200 ? `${names.slice(0, 197)}…` : names} — ranger never follows include paths. Remove the line, then resume the node.`;
+}
+
+/**
+ * Throw unless the git state still hashes to `snapshot` and holds no
+ * include key; returns the state it read (the one it vetted).
+ */
+export async function assertGitUntouched(canonical: string, snapshot: string): Promise<GitState> {
+ const state = await readGitStateSettled(canonical, snapshot);
+ if (state.includes.length > 0) throw new GitSafetyError(includeRefusal(state.includes));
+ if (state.hash !== snapshot) {
   throw new GitSafetyError(
    "the git config or hooks changed while the worker ran — refusing to run git against a tampered checkout",
   );
  }
+ return state;
 }
 
 /** GitHub's closing keywords followed by an issue reference (same repo, cross-repo, or URL). */
@@ -290,7 +584,7 @@ export async function assertNoClosingKeywords(
 
 /**
  * The vetted push: the supervisor's single credentialed write of exactly
- * `branch`, from an untampered checkout.
+ * `branch`, from an untampered checkout. Returns the state it vetted.
  */
 export async function vettedPush(opts: {
  worktree: string;
@@ -298,12 +592,10 @@ export async function vettedPush(opts: {
  branch: string;
  token: string;
  configSnapshot: string;
- /** The map's base, as given to `gitConfigSnapshot` (default main). */
- base?: string;
  /** What to push (default HEAD); research pushes its named local branch. */
  source?: string;
-}): Promise<void> {
- assertGitUntouched(opts.canonical, opts.configSnapshot, opts.base);
+}): Promise<GitState> {
+ const vetted = await assertGitUntouched(opts.canonical, opts.configSnapshot);
  const push = await safeGit(
   ["push", "--no-verify", "origin", `${opts.source ?? "HEAD"}:refs/heads/${opts.branch}`],
   { cwd: opts.worktree, token: opts.token, timeoutMs: 120_000 },
@@ -311,6 +603,7 @@ export async function vettedPush(opts: {
  if (push.code !== 0) {
   throw new GitSafetyError(`push of ${opts.branch} failed: ${push.stderr.trim()}`);
  }
+ return vetted;
 }
 
 /**
