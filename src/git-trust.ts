@@ -145,8 +145,8 @@ export function trustFreshClone(journal: Journal, canonical: string): TrustCheck
 export function tamperOutcome(check: TrustRefusal, canonical: string, mapSelector: string): string {
  if (check.kind === "includes") return `${includeRefusal(check.state.includes)} (in ${canonical})`;
  const names = check.changed.join(", ");
- const shown = names.length > 160 ? `${names.slice(0, 157)}…` : names;
- return `git state changed since it was last seen clean: ${shown} — in ${canonical} (known-good ${check.since}). Not adopted; \`ranger trust-git --map ${mapSelector}\` lists every change, then adopt it with --hash and resume the node.`;
+ const shown = names.length > 100 ? `${names.slice(0, 97)}…` : names;
+ return `git state changed since it was last seen clean: ${shown} — in ${canonical} (known-good ${check.since}). Not adopted: vet it with \`ranger trust-git --map ${mapSelector}\`, then resume the node.`;
 }
 
 /**
