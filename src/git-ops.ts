@@ -114,11 +114,11 @@ function branchKey(key: string): { name: string; key: string } | null {
  */
 function configRecords(
  file: string,
- parse: ConfigParser,
+ read: ConfigReader,
 ): { bytes: Buffer | string; records: Records | null } {
  if (!existsSync(file)) return { bytes: "(absent)", records: null };
  const body = readFileSync(file);
- const records = parse(body);
+ const records = read.parse(body);
  if (records === null) {
   return { bytes: Buffer.concat([Buffer.from("(unparsed)\0"), body]), records: null };
  }
@@ -161,19 +161,31 @@ const TRACKED_HEAD = /^refs\/heads\/[A-Za-z0-9_][A-Za-z0-9._/-]*$/;
 /** A config file's `[key, value]` records; a valueless boolean key has a null value. */
 type Records = [string, string | null][];
 
-/** Config bytes to records, or null when git cannot parse them. */
-type ConfigParser = (body: Buffer) => Records | null;
-
 /**
- * A parser that runs git once per distinct content: a `readGitState` reads
- * one `config.worktree` copy per worktree, mostly alike.
+ * Git, run once per distinct input within one `readGitState`: it reads
+ * one `config.worktree` copy per worktree, mostly alike, and each copy
+ * holds the main file's include lines.
  */
-function configParser(): ConfigParser {
+interface ConfigReader {
+ /** Config bytes to records, or null when git cannot parse them (`listConfig`). */
+ parse(body: Buffer): Records | null;
+ /** A `~user/` or `%(prefix)/` include value as git expands it (`expandPath`). */
+ expand(value: string): string | null;
+}
+
+function configReader(): ConfigReader {
  const parsed = new Map<string, Records | null>();
- return (body) => {
-  const key = digest(body);
-  if (!parsed.has(key)) parsed.set(key, listConfig(body));
-  return parsed.get(key) ?? null;
+ const expanded = new Map<string, string | null>();
+ return {
+  parse(body) {
+   const key = digest(body);
+   if (!parsed.has(key)) parsed.set(key, listConfig(body));
+   return parsed.get(key) ?? null;
+  },
+  expand(value) {
+   if (!expanded.has(value)) expanded.set(value, expandPath(value));
+   return expanded.get(value) ?? null;
+  },
  };
 }
 
@@ -226,16 +238,17 @@ const fsPath = (bytePath: string): Buffer => Buffer.from(bytePath, "latin1");
  * (`minimalGitEnv`), a relative path against the directory of the file that
  * holds the line (`from`, a byte path). `~user/` and `%(prefix)/` are
  * expanded by git itself (`expandPath`). Null when git cannot expand the
- * value either: git then refuses to read the config that holds the line
- * (`could not expand include path`), so no file is read through it, and the
- * line itself is hashed.
+ * value either. No file is read through such a line: once it applies (an
+ * `include`, or an `includeIf` whose condition holds) git refuses to read
+ * the config that holds it (`could not expand include path`), and until
+ * then git skips it. The line itself is hashed.
  */
-function resolveInclude(value: string, from: string): string | null {
+function resolveInclude(value: string, from: string, expand: ConfigReader["expand"]): string | null {
  if (value === "~" || value.startsWith("~/")) {
   const home = minimalGitEnv().HOME;
   return home === undefined ? null : join(toBytePath(home), value.slice(2));
  }
- if (value.startsWith("~") || value.startsWith("%(prefix)/")) return expandPath(value);
+ if (value.startsWith("~") || value.startsWith("%(prefix)/")) return expand(value);
  return isAbsolute(value) ? value : join(dirname(from), value);
 }
 
@@ -277,7 +290,7 @@ function includeTargets(
  file: string,
  records: Records,
  into: Set<string>,
- parse: ConfigParser,
+ read: ConfigReader,
  depth = 0,
 ): void {
  if (depth >= MAX_INCLUDE_DEPTH) return;
@@ -287,12 +300,12 @@ function includeTargets(
   if (first === -1 || value === null || key.slice(last + 1).toLowerCase() !== "path") continue;
   const section = key.slice(0, first).toLowerCase();
   if (!(section === "include" && last === first) && !(section === "includeif" && last > first)) continue;
-  const target = resolveInclude(value, file);
+  const target = resolveInclude(value, file, read.expand);
   if (target === null || into.has(target) || !existsSync(fsPath(target))) continue;
   into.add(target);
   if (statSync(fsPath(target), { throwIfNoEntry: false })?.isFile() !== true) continue;
-  const nested = parse(readFileSync(fsPath(target)));
-  if (nested !== null) includeTargets(target, nested, into, parse, depth + 1);
+  const nested = read.parse(readFileSync(fsPath(target)));
+  if (nested !== null) includeTargets(target, nested, into, read, depth + 1);
  }
 }
 
@@ -359,8 +372,8 @@ const ABSENT = "(absent)";
 const EMPTY_DIGEST = createHash("sha256").update("").digest("hex");
 
 /** A config file's records as git parses it; null when it is not a file or git cannot parse it. */
-function readConfigFile(file: string, parse: ConfigParser): Records | null {
- return statSync(file, { throwIfNoEntry: false })?.isFile() === true ? parse(readFileSync(file)) : null;
+function readConfigFile(file: string, read: ConfigReader): Records | null {
+ return statSync(file, { throwIfNoEntry: false })?.isFile() === true ? read.parse(readFileSync(file)) : null;
 }
 
 /**
@@ -378,7 +391,7 @@ function linkedWorktreeConfigs(
  gitDir: string,
  main: { present: boolean; records: Records | null },
  included: Set<string>,
- parse: ConfigParser,
+ read: ConfigReader,
 ): string[] {
  const worktrees = join(gitDir, "worktrees");
  if (!existsSync(worktrees)) return [];
@@ -387,8 +400,8 @@ function linkedWorktreeConfigs(
  for (const entry of readdirSync(worktrees).sort()) {
   if (statSync(join(worktrees, entry), { throwIfNoEntry: false })?.isDirectory() !== true) continue;
   const file = join(worktrees, entry, "config.worktree");
-  const records = readConfigFile(file, parse);
-  if (records !== null) includeTargets(toBytePath(file), records, included, parse);
+  const records = readConfigFile(file, read);
+  if (records !== null) includeTargets(toBytePath(file), records, included, read);
   if (mainSetsNothing && (!existsSync(file) || records?.length === 0)) continue;
   if (records !== null && main.records !== null && isWorktreeConfigCopy(main.records, records)) continue;
   kept.push(file);
@@ -407,7 +420,7 @@ export function readGitState(canonical: string): GitState {
  const gitDir = join(canonical, ".git");
  const hash = createHash("sha256");
  const entries: Record<string, string> = {};
- const parse = configParser();
+ const read = configReader();
  // Every part is length-framed, and a missing file is "-" where a length
  // would be: bare concatenation let bytes move across a file boundary
  // (hook B deleted, its path and body appended to hook A) and hash alike.
@@ -433,12 +446,12 @@ export function readGitState(canonical: string): GitState {
  const included = new Set<string>();
  const config = join(gitDir, "config");
  part(config);
- const listed = configRecords(config, parse);
+ const listed = configRecords(config, read);
  part(listed.bytes);
  if (listed.records === null) {
   entries[`config ${typeof listed.bytes === "string" ? listed.bytes : "(unparsed)"}`] = digest(listed.bytes);
  } else {
-  includeTargets(toBytePath(config), listed.records, included, parse);
+  includeTargets(toBytePath(config), listed.records, included, read);
   const byKey = new Map<string, (string | null)[]>();
   for (const [key, value] of listed.records) byKey.set(key, [...(byKey.get(key) ?? []), value]);
   for (const [key, values] of byKey) entries[keyLabel(key)] = digest(JSON.stringify(values));
@@ -446,9 +459,9 @@ export function readGitState(canonical: string): GitState {
  const mainWorktreeConfig = join(gitDir, "config.worktree");
  const mainPresent = existsSync(mainWorktreeConfig);
  add(mainWorktreeConfig);
- const mainRecords = mainPresent ? readConfigFile(mainWorktreeConfig, parse) : null;
- if (mainRecords !== null) includeTargets(toBytePath(mainWorktreeConfig), mainRecords, included, parse);
- const linked = linkedWorktreeConfigs(gitDir, { present: mainPresent, records: mainRecords }, included, parse);
+ const mainRecords = mainPresent ? readConfigFile(mainWorktreeConfig, read) : null;
+ if (mainRecords !== null) includeTargets(toBytePath(mainWorktreeConfig), mainRecords, included, read);
+ const linked = linkedWorktreeConfigs(gitDir, { present: mainPresent, records: mainRecords }, included, read);
  for (const file of linked) {
   if (add(file) === null) entries[file.slice(gitDir.length + 1)] = ABSENT;
  }
