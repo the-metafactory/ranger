@@ -78,6 +78,9 @@ export function baseConfigLines(
   ...(opts.state ?? []),
   "workers:",
   "  spawnCapPerDay: 10",
+  // Fixture workers run at the test's own priority: niced, they starve under
+  // host load and trip the suite's timeouts (the priority tests set it).
+  "  niceness: 0",
   ...(opts.workers ?? []),
  ];
 }

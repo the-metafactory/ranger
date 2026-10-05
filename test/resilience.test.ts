@@ -6,7 +6,7 @@ import { caffeinateArgs, holdAwake } from "../src/awake.ts";
 import { fastForwardCanonical } from "../src/git-ops.ts";
 import { isReadRequest } from "../src/github.ts";
 import { parseFailedProbes, probeMarker, probeRetryCommandFor, recordedProbes } from "../src/implement.ts";
-import { parseFailedChecks, probesFailedOutcome } from "../src/outcomes.ts";
+import { parseFailedChecks, probesFailedOutcome, unfinishedProbes } from "../src/outcomes.ts";
 import { isTransientGitHubError, runReadRetryingTransient } from "../src/transient.ts";
 import { runCmd } from "../src/exec.ts";
 import { createCanonicalRepo, GIT_ENV } from "./support.ts";
@@ -107,6 +107,28 @@ describe("a failed probe run retries only its failures", () => {
    { sha: "b".repeat(40), passed: false, selected: "86", mode: "all" },
   ]);
  });
+ test("a stopped run's unfinished probes: the selection less what passed", () => {
+  const out = [
+   "probe selection: all",
+   "selected: 4",
+   "  measure-cruise-detour.mjs",
+   "  probe-a.mjs",
+   "  probe-b.mjs",
+   "  probe-c.mjs",
+   "ok   measure-cruise-detour.mjs (3.1s)",
+   "FAIL probe-a.mjs (2.0s) exit=1 assert peak load 9.0",
+   "warn probe-b.mjs (1.0s) exit=1 assert peak load 9.0",
+  ].join("\n");
+  expect(unfinishedProbes(out)).toEqual(["probe-a.mjs", "probe-c.mjs"]);
+  expect(unfinishedProbes("no selection here\n")).toEqual([]);
+ });
+ test("a semantic selection's probability suffix is read; a listing short of its count falls back to the full suite", () => {
+  const semantic = "selected: 2\n  probe-a.mjs (p=0.750)\n  probe-b.mjs (p=0.900)\nok   probe-a.mjs (1.0s)\n";
+  expect(unfinishedProbes(semantic)).toEqual(["probe-b.mjs"]);
+  // killed while printing the selection: probe-b was announced but never listed
+  expect(unfinishedProbes("selected: 2\n  probe-a.mjs\n  probe-b.m")).toEqual([]);
+  expect(unfinishedProbes("selected: 3\n  probe-a.mjs\n  probe-b.mjs\n")).toEqual([]);
+ });
  test("failed checks are read per failed probe, without their run-specific detail", () => {
   const out = [
    "ok   probe-music.mjs (3.0s)",
@@ -173,6 +195,18 @@ describe("two closes fast-forward the shared canonical checkout at once (#686/#6
    rmSync(dir, { recursive: true, force: true });
   }
  }, 30_000);
+});
+
+describe("ranger's own commands yield the CPU to the probes (2026-10-05)", () => {
+ test("runCmd runs a command at the niceness it is given, and at the caller's without one", async () => {
+  const niced = await runCmd("/bin/sh", ["-c", "ps -o nice= -p $$"], { nice: 10 });
+  const plain = await runCmd("/bin/sh", ["-c", "ps -o nice= -p $$"]);
+  const own = await runCmd("/bin/sh", ["-c", "ps -o nice= -p $PPID"]);
+  // The OS clamps at its own maximum (20 on macOS, 19 on Linux): ask it.
+  const max = await runCmd("/bin/sh", ["-c", "ps -o nice= -p $$"], { nice: 100 });
+  expect(Number(niced.stdout.trim())).toBe(Math.min(Number(own.stdout.trim()) + 10, Number(max.stdout.trim())));
+  expect(Number(plain.stdout.trim())).toBe(Number(own.stdout.trim()));
+ });
 });
 
 describe("the host stays awake while run-node lives (found live on #658)", () => {

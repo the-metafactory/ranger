@@ -21,6 +21,10 @@ echo "selected: 2"
 case "$mode" in
   ok) echo "node $node: 2 probes passed"; exit 0 ;;
   fail) echo "probe-hud failed" >&2; exit 1 ;;
+  dies)
+    # Lists the two selected probes (after the selected: line above), finishes the first, then dies like a timed-out run.
+    printf '  probe-a.mjs\n  probe-b.mjs\nok   probe-a.mjs (1.0s)\n'
+    kill -9 $$ ;;
   red)
     printf 'FAIL probe-hud.mjs (0.1s) exit=1 assert peak load 1.0\n     │   ok   the hud mounts\n     │  FAIL  the hud draws — {"drawn":false}\nFAILED: probe-hud.mjs\n'
     exit 1 ;;

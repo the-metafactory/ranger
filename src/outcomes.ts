@@ -65,6 +65,36 @@ export function baseConflictOutcome(r: { pr: number; base: string; passes: numbe
  return `PR #${r.pr} conflicts with ${r.base} again after ${r.passes} base merge pass(es) — the base keeps moving under it; resolving it is the principal's call`;
 }
 
+/**
+ * The probes a run selected (the seelite selector lists them, indented, after
+ * `selected: <n>`, a semantic pick with ` (p=0.750)` after the name) that
+ * had not passed when it stopped: no `ok` or `warn` line from the runner.
+ * Failed and never-started ones alike. Empty, so the caller falls back to
+ * the full suite, when the output names no selection or a listing shorter
+ * than the count it announced (a run killed while printing it): a narrowed
+ * retry must never certify probes that were not listed.
+ */
+export function unfinishedProbes(stdout: string): string[] {
+ const lines = stdout.split("\n");
+ const at = lines.findIndex((l) => /^selected: \d+$/.test(l));
+ if (at < 0) return [];
+ const count = Number(lines[at].slice("selected: ".length));
+ const selected: string[] = [];
+ for (const line of lines.slice(at + 1)) {
+  const m = /^ {2}([\w.-]+\.m?js)(?: \(p=[\d.]+\))?$/.exec(line);
+  if (m === null) break;
+  if (!PROBE_FILE.test(m[1])) return [];
+  selected.push(m[1]);
+ }
+ if (selected.length !== count) return [];
+ const passed = new Set<string>();
+ for (const line of lines) {
+  const m = /^(ok|warn) +([\w.-]+\.m?js) \(/.exec(line);
+  if (m !== null) passed.add(m[2]);
+ }
+ return selected.filter((n) => !passed.has(n));
+}
+
 /** Sage rounds ran out with blockers or majors still open. */
 export function reviewCapOutcome(r: { blockers: number; majors: number; round: number; pr: number }): string {
  return `${r.blockers} blocker(s) and ${r.majors} major(s) remain after ${r.round} sage round(s) on PR #${r.pr} — good-enough is the principal's call (design §4/§7)`;

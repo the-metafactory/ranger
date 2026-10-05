@@ -42,6 +42,12 @@ export interface RunOptions {
    * verbose stream (Claude stream-json) is never held whole in memory.
    */
   keepStdoutLine?: (line: string) => boolean;
+  /**
+   * Run the child at this lower CPU priority (`nice -n`), so timing-
+   * sensitive work on the same host (the browser probes) keeps the CPU.
+   * Undefined or 0: the caller's own priority.
+   */
+  nice?: number;
 }
 
 /**
@@ -55,7 +61,10 @@ export function runCmd(
   opts: RunOptions = {},
 ): Promise<RunResult> {
   return new Promise((resolvePromise, reject) => {
-    const child = spawn(bin, args, {
+    // `nice` execs the command in place: the PID (and so the process group)
+    // is the command's own.
+    const niced = opts.nice !== undefined && opts.nice > 0;
+    const child = spawn(niced ? "nice" : bin, niced ? ["-n", String(opts.nice), bin, ...args] : args, {
       env: opts.env ?? process.env,
       cwd: opts.cwd,
       stdio: ["ignore", "pipe", "pipe"],

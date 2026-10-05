@@ -24,6 +24,7 @@ import type { CheckRun, IssueComment, PullRequest, GitHubPort } from "./github.t
 import { ParkSignal } from "./signals.ts";
 import {
  PROBE_FILE,
+ unfinishedProbes,
  parseFailedChecks,
  parseFailedProbes,
  baseConflictOutcome,
@@ -81,7 +82,7 @@ export type Reviewer = (
  repo: string,
  prNumber: number,
  readOnlyToken: string,
- opts?: { substrate?: SubstrateName },
+ opts?: { substrate?: SubstrateName; nice?: number },
 ) => Promise<ReviewVerdict>;
 
 export type WorkerRun = (prompt: string, opts: RunOptions) => Promise<RunResult>;
@@ -291,23 +292,34 @@ async function probeFinalHead(
  const command = probeCommandFor(map.commands.probe as string, nodeId);
  const timeoutMs = map.commands.probeTimeoutMin * 60_000;
  await awaitQuietHost(ctx, "probe run 1");
- let result = await runShell(command, worktree, ctx, timeoutMs);
+ let result = await runShell(command, worktree, ctx, timeoutMs, "probe");
  let attempts = 1;
  let ranCommand = command;
  // The record names the selection of the first run: a narrowed retry selects only the failures.
  const summary = parseProbeSummary(result.stdout);
  if (result.code !== 0) {
-  // A run that named its failures (exit > 0) retries only those, when the map
-  // says how; a timeout or a runner crash (exit < 0, no FAILED line) reruns all.
+  // A run that named its failures (a FAILED line) retries only those, when
+  // the map says how. One that stopped without naming them (a timeout, a
+  // kill: exit < 0, or 128+signal when a shell sat between; a crash) retries
+  // only the selected probes it had not passed (2026-10-05: 88 probes selected
+  // on #491 hit the 30-minute limit, and the full rerun had to start over);
+  // one that says nothing usable reruns all.
   const failed = result.code > 0 ? parseFailedProbes(result.stdout) : [];
+  const unfinished = failed.length === 0 ? unfinishedProbes(result.stdout) : [];
+  const narrowed = failed.length > 0 ? failed : unfinished;
   const retryTemplate = map.commands.probeRetry;
-  if (retryTemplate !== undefined && failed.length > 0) {
-   ranCommand = probeRetryCommandFor(retryTemplate, nodeId, failed);
+  if (retryTemplate !== undefined && narrowed.length > 0) {
+   ranCommand = probeRetryCommandFor(retryTemplate, nodeId, narrowed);
   }
-  const what = ranCommand === command ? "the full suite" : `only ${failed.join(", ")}`;
-  journal.recordEvent("reviewed", { nodeId, repo, detail: `probe run 1 failed (exit ${result.code}) — retrying ${what}` });
+  const what =
+   ranCommand === command
+    ? "the full suite"
+    : failed.length > 0
+     ? `only ${failed.join(", ")}`
+     : `only the ${unfinished.length} probe(s) it had not passed when it stopped`;
+  journal.recordEvent("reviewed", { nodeId, repo, detail: `probe run 1 failed (exit ${result.code}) — retrying ${what}`.slice(0, 400) });
   await awaitQuietHost(ctx, "the probe retry");
-  result = await runShell(ranCommand, worktree, ctx, timeoutMs);
+  result = await runShell(ranCommand, worktree, ctx, timeoutMs, "probe");
   attempts = 2;
  }
  const failed = result.code > 0 ? parseFailedProbes(result.stdout) : [];
@@ -459,7 +471,7 @@ async function probeMergeBase(
    if (install.code !== 0) return null;
   }
   await awaitQuietHost(ctx, "the merge-base probe run");
-  const run = await runShell(command, dir, ctx, map.commands.probeTimeoutMin * 60_000);
+  const run = await runShell(command, dir, ctx, map.commands.probeTimeoutMin * 60_000, "probe");
   if (run.code === 0) return { sha, red: [], differs: [], passed: comparable, changed };
   const named = run.code > 0 ? parseFailedProbes(run.stdout) : [];
   if (named.length === 0) return null;
@@ -684,6 +696,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
       return {
        verdict: await (ctx.reviewer ?? sageReview)(repo, open.number, ctx.readOnlyToken, {
         substrate: reviewSubstrate,
+        nice: config.workers.niceness,
        }),
       };
      } catch (error) {
@@ -1125,6 +1138,7 @@ async function checkedWorkerPass(
  const raw = await ctx.workerRun(prompt, {
   cwd: worktree,
   timeoutMs: config.workers.wallClockMin * 60_000,
+  nice: config.workers.niceness,
   env: workerEnv(config, map.repo),
   ...output.runOptions,
   processGroup: true,
@@ -1212,12 +1226,15 @@ function runShell(
  cwd: string,
  ctx: ImplementContext,
  timeoutMs: number,
+ priority: "background" | "probe" = "background",
 ): Promise<RunResult> {
  return runCmd("/bin/sh", ["-c", command], {
   cwd,
   env: workerEnv(ctx.config, ctx.map.repo),
   timeoutMs,
   processGroup: true,
+  // Install and tests yield the CPU; the timing-sensitive probes do not.
+  ...(priority === "probe" ? {} : { nice: ctx.config.workers.niceness }),
  });
 }
 

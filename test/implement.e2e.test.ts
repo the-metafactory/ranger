@@ -1096,6 +1096,31 @@ describe("implement lane (node #23)", () => {
   expect(r.github.prs.size).toBe(0);
  }, 60_000);
 
+ test("install and tests run niced, the probe run at the walker's own priority", async () => {
+  const own = Number((await runCmd("/bin/sh", ["-c", "ps -o nice= -p $PPID"])).stdout.trim());
+  // The OS clamps at its own maximum (20 on macOS, 19 on Linux): ask it.
+  const max = Number((await runCmd("/bin/sh", ["-c", "ps -o nice= -p $$"], { nice: 100 })).stdout.trim());
+  const niced = Math.min(own + 10, max);
+  const r = await rig({
+   install: `[ $(ps -o nice= -p $$) -eq ${niced} ]`,
+   test: `[ $(ps -o nice= -p $$) -eq ${niced} ] && test -f src/feature.ts`,
+   probe: `[ $(ps -o nice= -p $$) -eq ${own} ]`,
+  });
+  cleanup.push(r.dir);
+  r.ctx.config.workers.niceness = 10; // the suite's fixtures run un-niced (support.ts)
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+ }, 60_000);
+
+ test("a probe run killed partway retries only the selected probes it had not passed", async () => {
+  const r = await rig({ probe: "fake-probe dies {node}", probeRetry: "fake-probe ok {node} {failed}" });
+  cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => /^probe run 1 failed \(exit -?\d+\) — retrying only the 1 probe\(s\) it had not passed when it stopped$/.test(d))).toBe(true);
+  const probe = (r.github.comments.get(1) ?? []).find((c) => c.body.includes("ranger:probes"));
+  expect(probe?.body).toContain("`fake-probe ok 20 probe-b.mjs`");
+ }, 60_000);
+
  test("a busy host delays the probe run until the load drops", async () => {
   const r = await rig({ probe: "fake-probe ok {node}" });
   cleanup.push(r.dir);

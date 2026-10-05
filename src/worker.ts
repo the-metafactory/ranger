@@ -770,6 +770,7 @@ async function runResearch(
   const workerResult = await workerRun(prompt, {
    cwd: worktree,
    timeoutMs: wallClockMs,
+   nice: config.workers.niceness,
    env: workerEnv(config, repo),
    processGroup: true,
    onSpawn: (pgid) => journal.updateWorker(nodeId, repo, { workerPgid: pgid }),
