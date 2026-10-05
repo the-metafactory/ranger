@@ -1,18 +1,22 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { runCmd } from "../src/exec.ts";
 import {
+ assertCheckoutOf,
  assertGitUntouched,
  assertNamedRefs,
+ fastForwardCanonical,
  gitConfigSnapshot,
  GitSafetyError,
  NODE_BRANCH,
  safeGit,
+ utf8Name,
+ vettedPush,
 } from "../src/git-ops.ts";
 import { bootstrapWorktree, slugify, worktreeBranch } from "../src/worker.ts";
-import { addTrackedWorktree, createCanonicalRepo, GIT_ENV } from "./support.ts";
+import { addTrackedWorktree, createCanonicalRepo, GIT_ENV, takesRawByteNames } from "./support.ts";
 
 /**
  * Node #63: the tamper guard leaves out only the branch-tracking entries
@@ -72,8 +76,38 @@ describe("gitConfigSnapshot: ranger's own node branches (node #63)", () => {
   expect(gitConfigSnapshot(canonical)).toBe(before);
  });
 
+ // Sage round 2 on node #86: git takes non-ASCII branch names.
+ test("a branch tracking a non-ASCII map base is left out too", async () => {
+  await git(["push", "origin", "HEAD:refs/heads/release/été"]);
+  await git(["fetch", "origin"]);
+  const before = gitConfigSnapshot(canonical);
+  await addTrackedWorktree(canonical, "72", "on-release", "release/été");
+  expect(await config("--get", "branch.node/72-on-release.merge")).toBe("refs/heads/release/été");
+  expect(gitConfigSnapshot(canonical)).toBe(before);
+ });
+
+ // Sage round 3 on node #86: only the whole refname `@` is refused, so
+ // refs/heads/@ is a branch git takes.
+ test("a branch tracking refs/heads/@ is left out too", async () => {
+  await git(["push", "origin", "HEAD:refs/heads/@"]);
+  await git(["fetch", "origin"]);
+  const before = gitConfigSnapshot(canonical);
+  await addTrackedWorktree(canonical, "73", "on-at", "@");
+  expect(await config("--get", "branch.node/73-on-at.merge")).toBe("refs/heads/@");
+  expect(gitConfigSnapshot(canonical)).toBe(before);
+ });
+
  test("a node branch tracking anything but a branch under refs/heads stays in the hash", async () => {
-  for (const merge of ["refs/tags/v1", "refs/heads/../x", "main"]) {
+  for (const merge of [
+   "refs/tags/v1",
+   "refs/heads/../x",
+   "main",
+   "refs/heads/.x",
+   "refs/heads/x.lock",
+   "refs/heads/a b",
+   "refs/heads/a//b",
+   "refs/heads/-x",
+  ]) {
    const before = gitConfigSnapshot(canonical);
    await config("branch.node/71-x.remote", "origin");
    await config("branch.node/71-x.merge", merge);
@@ -176,6 +210,8 @@ describe("gitConfigSnapshot: everything else stays in the hash", () => {
   [
    "a per-worktree config.worktree",
    async () => {
+    // Git reads config.worktree only with the extension on (node #86).
+    await config("extensions.worktreeConfig", "true");
     await bootstrapWorktree(canonical, "663", "x", "tok");
     const [entry] = readdirSync(join(canonical, ".git", "worktrees"));
     // The snapshot taken after the worktree exists, then its config changes.
@@ -323,7 +359,224 @@ describe("assertNamedRefs: credentialed git calls name their remote and refs", (
   }
  });
 
- test("safeGit runs the guard on every call that carries the credential", () => {
-  expect(() => safeGit(["pull"], { cwd: canonical, token: "placeholder" })).toThrow(GitSafetyError);
+ // Sage round 4 on node #86: submodules fetch from config the hash never vets.
+ test("a request for submodule recursion is refused", () => {
+  for (const args of [
+   ["fetch", "--recurse-submodules", "origin", "main"],
+   ["fetch", "--recurse-submodules=on-demand", "origin", "main"],
+   ["push", "--recurse-submodules=on-demand", "origin", "HEAD:refs/heads/node/81-x"],
+   ["clone", "--recurse-submodules", "https://github.com/acme/widgets.git", "/tmp/x"],
+  ]) {
+   expect(() => assertNamedRefs(args)).toThrow(/submodules/);
+  }
+ });
+
+ test("safeGit runs the guard on every call that carries the credential", async () => {
+  await expect(safeGit(["pull"], { cwd: canonical, token: "placeholder" })).rejects.toThrow(GitSafetyError);
+ });
+});
+
+/**
+ * Sage round 1 on node #86: the hash vets `<canonical>/.git`, so a
+ * credentialed call runs only where git resolves to that directory. A
+ * worktree's `.git` file or `commondir` pointed at another repository would
+ * otherwise read that repository's origin and send the credential there.
+ */
+describe("assertCheckoutOf: credentialed calls run only against the vetted .git", () => {
+ let origin: string;
+ let evil: string;
+ let attacker: string;
+
+ beforeEach(async () => {
+  origin = await git(["remote", "get-url", "origin"]);
+  evil = join(dir, "evil.git");
+  await git(["init", "--bare", evil], dir);
+  attacker = join(dir, "attacker");
+  await git(["clone", origin, attacker], dir);
+  await git(["remote", "set-url", "origin", evil], attacker);
+ });
+
+ const push = (worktree: string, snapshot: string) =>
+  vettedPush({ worktree, canonical, branch: "node/86-x", token: "placeholder", configSnapshot: snapshot });
+ const evilHeads = () => git(["for-each-ref", "refs/heads"], evil);
+
+ test("a clean node worktree pushes to the vetted origin", async () => {
+  const worktree = await bootstrapWorktree(canonical, "86", "x", "placeholder");
+  await push(worktree, gitConfigSnapshot(canonical));
+  expect(await git(["for-each-ref", "--format=%(refname)", "refs/heads/node/86-x"], origin)).toBe("refs/heads/node/86-x");
+ });
+
+ test("a worktree commondir pointed at another repository refuses the push", async () => {
+  const worktree = await bootstrapWorktree(canonical, "86", "x", "placeholder");
+  const snapshot = gitConfigSnapshot(canonical);
+  writeFileSync(join(canonical, ".git", "worktrees", "node-86", "commondir"), `${join(attacker, ".git")}\n`);
+  expect(gitConfigSnapshot(canonical)).toBe(snapshot);
+  await expect(push(worktree, snapshot)).rejects.toThrow(/not the vetted/);
+  expect(await evilHeads()).toBe("");
+ });
+
+ test("a worktree .git file pointed at another repository refuses the push", async () => {
+  const worktree = await bootstrapWorktree(canonical, "86", "x", "placeholder");
+  const snapshot = gitConfigSnapshot(canonical);
+  writeFileSync(join(worktree, ".git"), `gitdir: ${join(attacker, ".git")}\n`);
+  await expect(push(worktree, snapshot)).rejects.toThrow(/not the vetted/);
+  expect(await evilHeads()).toBe("");
+ });
+
+ test("a worktree with no .git file (git climbs to the canonical checkout) refuses the push", async () => {
+  const worktree = await bootstrapWorktree(canonical, "86", "x", "placeholder");
+  const snapshot = gitConfigSnapshot(canonical);
+  rmSync(join(worktree, ".git"));
+  await expect(push(worktree, snapshot)).rejects.toThrow(/not the vetted/);
+ });
+
+ test("a commondir planted in the canonical .git refuses the fetch and the worktree add", async () => {
+  writeFileSync(join(canonical, ".git", "commondir"), `${join(attacker, ".git")}\n`);
+  await expect(fastForwardCanonical(canonical, "main", "placeholder", { attempts: 1 })).rejects.toThrow(/not the vetted/);
+  await expect(bootstrapWorktree(canonical, "86", "x", "placeholder")).rejects.toThrow(/not the vetted/);
+ });
+
+ // Sage round 2 on node #86: a path may hold a newline, and the first line
+ // of a common dir named `<canonical>/.git\n<canonical>/.git` is the vetted one.
+ test("a commondir whose path embeds the vetted .git after a newline refuses the fetch", async () => {
+  const vetted = join(canonical, ".git");
+  const foreign = `${vetted}\n${vetted}`;
+  mkdirSync(dirname(foreign), { recursive: true });
+  renameSync(join(attacker, ".git"), foreign);
+  writeFileSync(join(vetted, "commondir"), `${foreign}\n`);
+  await expect(assertCheckoutOf(canonical, canonical)).rejects.toThrow(/not the vetted/);
+  await expect(fastForwardCanonical(canonical, "main", "placeholder", { attempts: 1 })).rejects.toThrow(/not the vetted/);
+ });
+
+ test("a worktree commondir whose path embeds the vetted lines after a newline refuses the push", async () => {
+  const worktree = await bootstrapWorktree(canonical, "86", "x", "placeholder");
+  const snapshot = gitConfigSnapshot(canonical);
+  const vetted = join(canonical, ".git");
+  const foreign = `${vetted}\n${join(vetted, "worktrees", "node-86")}`;
+  mkdirSync(dirname(foreign), { recursive: true });
+  renameSync(join(attacker, ".git"), foreign);
+  writeFileSync(join(vetted, "worktrees", "node-86", "commondir"), `${foreign}\n`);
+  expect(gitConfigSnapshot(canonical)).toBe(snapshot);
+  await expect(push(worktree, snapshot)).rejects.toThrow(/not the vetted/);
+  expect(await evilHeads()).toBe("");
+ });
+
+ test("a credentialed call that names no canonical checkout is refused", async () => {
+  await expect(safeGit(["fetch", "origin", "main"], { cwd: canonical, token: "placeholder" })).rejects.toThrow(
+   /names no canonical checkout/,
+  );
+  await expect(assertCheckoutOf(canonical, canonical)).resolves.toBeUndefined();
+ });
+
+ // Sage round 4 on node #86: node decodes `worktrees/raw\xff` as
+ // `worktrees/raw�`, so an empty decoy directory of that name was
+ // vetted while git read the raw-byte one. Only with
+ // extensions.worktreeConfig on: git reads no linked config.worktree
+ // otherwise, and `readGitState` lists no worktree names. APFS refuses names
+ // that are not UTF-8 (EILSEQ); ext4 (CI) takes them.
+ test.skipIf(!takesRawByteNames())("a worktree whose git dir name is not UTF-8 refuses the push", async () => {
+  await config("extensions.worktreeConfig", "true");
+  const worktree = await bootstrapWorktree(canonical, "86", "x", "placeholder");
+  const snapshot = gitConfigSnapshot(canonical);
+  const worktrees = join(canonical, ".git", "worktrees");
+  const raw = Buffer.concat([Buffer.from(`${worktrees}/raw`), Buffer.from([0xff])]);
+  renameSync(join(worktrees, "node-86"), raw);
+  mkdirSync(join(worktrees, "raw�"));
+  writeFileSync(join(worktree, ".git"), Buffer.concat([Buffer.from("gitdir: "), raw, Buffer.from("\n")]));
+  writeFileSync(Buffer.concat([raw, Buffer.from("/config.worktree")]), `[remote "origin"]\n\turl = ${evil}\n`);
+  expect(() => gitConfigSnapshot(canonical)).toThrow(/not UTF-8/);
+  await expect(push(worktree, snapshot)).rejects.toThrow(/not UTF-8/);
+  expect(await evilHeads()).toBe("");
+ });
+
+ test.skipIf(!takesRawByteNames())("a hook name that is not UTF-8 is refused, never read under a decoded name", () => {
+  const hooks = join(canonical, ".git", "hooks");
+  writeFileSync(Buffer.concat([Buffer.from(`${hooks}/pre-push`), Buffer.from([0xfe])]), "#!/bin/sh\n");
+  expect(() => gitConfigSnapshot(canonical)).toThrow(/not UTF-8/);
+ });
+});
+
+describe("utf8Name: entry names are judged as bytes (sage round 4 on node #86)", () => {
+ test("bytes that are not UTF-8 have no name", () => {
+  expect(utf8Name(new Uint8Array([0x72, 0x61, 0x77, 0xff]))).toBeNull();
+  // A UTF-16 surrogate encoded as UTF-8 (CESU-8) is not UTF-8 either.
+  expect(utf8Name(new Uint8Array([0xed, 0xa0, 0x80]))).toBeNull();
+ });
+
+ test("UTF-8 names keep every byte, a leading BOM included", () => {
+  expect(utf8Name(Buffer.from("été"))).toBe("été");
+  expect(utf8Name(Buffer.from("﻿node-86"))).toBe("﻿node-86");
+  expect(utf8Name(Buffer.from("raw�"))).toBe("raw�");
+ });
+});
+
+/**
+ * Sage round 4 on node #86: `git fetch` fetches submodules on demand, each
+ * from its own `.git/modules/<name>/config`, which the hash never covers,
+ * and the child fetch inherits the auth header. A credentialed fetch turns
+ * recursion off.
+ */
+describe("credentialed calls never recurse into submodules", () => {
+ let home: string | undefined;
+
+ beforeEach(() => {
+  home = process.env.HOME;
+  // Git 2.38.1+ refuses file:// submodule transport by default; the fixture
+  // remotes are local paths. minimalGitEnv passes HOME through.
+  const fakeHome = join(dir, "home");
+  mkdirSync(fakeHome);
+  writeFileSync(join(fakeHome, ".gitconfig"), "[protocol \"file\"]\n\tallow = always\n");
+  process.env.HOME = fakeHome;
+ });
+
+ afterEach(() => {
+  if (home === undefined) delete process.env.HOME;
+  else process.env.HOME = home;
+ });
+
+ test("a fetch that brings a new submodule commit leaves the submodule's remote alone", async () => {
+  const commit = async (repo: string, file: string) => {
+   writeFileSync(join(repo, file), `${file}\n`);
+   await git(["add", "-A"], repo);
+   await git(["commit", "-m", file], repo);
+   return git(["rev-parse", "HEAD"], repo);
+  };
+  // A submodule whose remote the worker repoints at a repository it owns.
+  const subSeed = join(dir, "sub-seed");
+  mkdirSync(subSeed);
+  await git(["init", "-b", "main"], subSeed);
+  await commit(subSeed, "a");
+  const subOrigin = join(dir, "sub.git");
+  await git(["clone", "--bare", subSeed, subOrigin], dir);
+  const super_ = join(dir, "super");
+  await git(["clone", await git(["remote", "get-url", "origin"]), super_], dir);
+  await git(["submodule", "add", subOrigin, "sub"], super_);
+  await git(["commit", "-m", "add sub"], super_);
+  await git(["push", "origin", "HEAD:main"], super_);
+  await git(["pull", "--ff-only", "origin", "main"]);
+  await git(["submodule", "update", "--init"]);
+  const evilSub = join(dir, "evil-sub.git");
+  await git(["clone", "--bare", subOrigin, evilSub], dir);
+  // Upstream moves the submodule to a commit only the worker's remote holds.
+  await git(["remote", "add", "evil", evilSub], subSeed);
+  const bumped = await commit(subSeed, "b");
+  await git(["push", "evil", "HEAD:main"], subSeed);
+  await git(["fetch", evilSub, "main"], join(super_, "sub"));
+  await git(["checkout", bumped], join(super_, "sub"));
+  await git(["commit", "-am", "bump sub"], super_);
+  await git(["push", "origin", "HEAD:main"], super_);
+  await git(["config", "--file", join(canonical, ".git", "modules", "sub", "config"), "remote.origin.url", evilSub]);
+
+  const snapshot = gitConfigSnapshot(canonical);
+  const modules = join(canonical, ".git", "modules", "sub");
+  const has = async (sha: string) => (await runCmd("git", ["cat-file", "-e", `${sha}^{commit}`], { cwd: modules })).code === 0;
+  await fastForwardCanonical(canonical, "main", "placeholder", { attempts: 1 });
+  expect(gitConfigSnapshot(canonical)).toBe(snapshot);
+  expect(await has(bumped)).toBe(false);
+  // The control: git's own default fetch does reach the submodule's remote.
+  await git(["reset", "--hard", "HEAD~1"]);
+  await git(["update-ref", "refs/remotes/origin/main", "HEAD"]);
+  await git(["fetch", "origin", "main:refs/remotes/origin/main"]);
+  expect(await has(bumped)).toBe(true);
  });
 });

@@ -1,7 +1,7 @@
-import { spawnSync } from "node:child_process";
+import { execFile, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { closeSync, constants, existsSync, fstatSync, openSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { closeSync, constants, existsSync, fstatSync, openSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { runCmd, type RunResult } from "./exec.ts";
 
 /**
@@ -50,19 +50,52 @@ function minimalGitEnv(): NodeJS.ProcessEnv {
  return env;
 }
 
+/** Config every supervisor git call runs with: no hooks, no fsmonitor (either runs a program the config names). */
+const GIT_SAFETY_ARGS = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"];
+
+/**
+ * Config every credentialed call runs with: no submodule recursion. A fetch
+ * defaults to fetching submodules on demand, each from its own
+ * `.git/modules/<name>/config`, which `readGitState` never vets, and the
+ * child git inherits the auth header (sage round 4 on node #86). Command-line
+ * `-c` outranks every config file; an explicit `--recurse-submodules` flag
+ * would outrank it, and `assertNamedRefs` refuses one.
+ */
+const NO_SUBMODULE_RECURSION = [
+ "-c", "fetch.recurseSubmodules=false",
+ "-c", "push.recurseSubmodules=no",
+ "-c", "submodule.recurse=false",
+];
+
 /**
  * Run git with hooks and fsmonitor disabled, in a minimal env. `token` adds
- * the auth header (remote calls only).
+ * the auth header (remote calls only) and turns submodule recursion off
+ * (`NO_SUBMODULE_RECURSION`); every such call but `clone` names the
+ * `canonical` checkout whose git state was vetted, and runs only where git
+ * resolves its repository to that one (`assertCheckoutOf`). Git's remote
+ * helper gets the header: that is what it is for.
  */
-export function safeGit(
+export async function safeGit(
  args: string[],
- opts: { cwd: string; token?: string; timeoutMs?: number },
+ opts: { cwd: string; token?: string; canonical?: string; timeoutMs?: number },
 ): Promise<RunResult> {
- if (opts.token !== undefined) assertNamedRefs(args);
+ if (opts.token !== undefined) {
+  assertNamedRefs(args);
+  if (args[0] !== "clone") {
+   if (opts.canonical === undefined) {
+    throw new GitSafetyError(`refusing a credentialed \`git ${args[0]}\`: it names no canonical checkout to check its repository against`);
+   }
+   await assertCheckoutOf(opts.cwd, opts.canonical);
+  }
+ }
  const base = minimalGitEnv();
  return runCmd(
   "git",
-  ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", ...args],
+  [
+   ...GIT_SAFETY_ARGS,
+   ...(opts.token === undefined ? [] : NO_SUBMODULE_RECURSION),
+   ...args,
+  ],
   {
    cwd: opts.cwd,
    env: opts.token === undefined ? base : gitAuthEnv(opts.token, base),
@@ -77,16 +110,111 @@ export function safeGit(
  * `worktree add` reach no remote through a branch's upstream. The tamper
  * state leaves out node branches' tracking lines (`configRecords`), which is
  * safe only while no credentialed call falls back to an upstream: a bare
- * `fetch`, `push` or any `pull` would.
+ * `fetch`, `push` or any `pull` would. No call asks for submodule recursion
+ * (`NO_SUBMODULE_RECURSION`).
  */
 export function assertNamedRefs(args: string[]): void {
  const [verb, ...rest] = args;
+ if (rest.some((a) => a.startsWith("--recurse-submodules"))) {
+  throw new GitSafetyError(
+   `refusing a credentialed \`git ${args.join(" ")}\`: submodules fetch from config the git state never vets`,
+  );
+ }
  if (verb === "clone" || (verb === "worktree" && rest[0] === "add")) return;
  const positional = rest.filter((a) => !a.startsWith("-"));
  if ((verb === "fetch" || verb === "push") && positional.length >= 2) return;
  throw new GitSafetyError(
   `refusing a credentialed \`git ${args.join(" ")}\`: it must name its remote and refs, never fall back to a branch's upstream`,
  );
+}
+
+/**
+ * Throw unless git, run in `cwd`, uses the canonical checkout's own `.git`:
+ * its common dir is `<canonical>/.git`, the directory `readGitState` vets,
+ * and its git dir is that one (`cwd` is the canonical checkout) or one of
+ * its `worktrees/<name>` (a linked worktree). A worker can rewrite its
+ * worktree's `.git` file or `worktrees/<name>/commondir`, or plant a
+ * `commondir` in the main `.git`: each points git at another repository,
+ * whose config (another origin) the hash never covered, and a credentialed
+ * call would send the write credential there. Git resolves the pointers
+ * itself (`rev-parse`, no credential, hooks off): ranger does not
+ * re-implement how git reads a gitfile. Paths are compared as bytes, never
+ * decoded: UTF-8 decoding maps every invalid byte to U+FFFD, so
+ * `worktrees/raw\xff` read as a decoy `worktrees/raw�` (sage round 4 on
+ * node #86). Which `worktrees/<name>` it is does not matter here: while
+ * `extensions.worktreeConfig` is on, every one is in the hash and
+ * `readGitState` refuses a name that is not UTF-8; while it is off, git reads
+ * no config from any of them.
+ */
+export async function assertCheckoutOf(cwd: string, canonical: string): Promise<void> {
+ const got = await gitBytes(
+  [
+   ...GIT_SAFETY_ARGS,
+   "rev-parse", "--path-format=absolute", "--git-common-dir", "--absolute-git-dir",
+  ],
+  cwd,
+ );
+ const [common, gitDir] = got === null ? [] : gitDirLines(got);
+ const vetted = realPath(join(canonical, ".git"));
+ const commonReal = realPath(common);
+ const gitDirReal = realPath(gitDir);
+ const ours =
+  vetted !== null &&
+  commonReal === vetted &&
+  gitDirReal !== null &&
+  (realPath(cwd) === realPath(canonical)
+   ? gitDirReal === vetted
+   : dirname(gitDirReal) === realPath(join(canonical, ".git", "worktrees")));
+ if (!ours) {
+  const shown = (p: string | null) => (p === null ? null : Buffer.from(p, "latin1").toString("utf8"));
+  throw new GitSafetyError(
+   `refusing a credentialed git call in ${cwd}: git there uses ${shown(gitDirReal) ?? "no repository"} (common dir ${shown(commonReal) ?? "none"}), not the vetted ${join(canonical, ".git")}`,
+  );
+ }
+}
+
+/**
+ * Git's stdout as bytes, or null when it fails, exits nonzero or runs past
+ * 10s. Awaited, so the supervisor's event loop keeps running meanwhile.
+ */
+function gitBytes(args: string[], cwd: string): Promise<Buffer | null> {
+ return new Promise((resolvePromise) => {
+  execFile(
+   "git",
+   args,
+   { cwd, env: minimalGitEnv(), encoding: "buffer", timeout: 10_000, maxBuffer: 1024 * 1024 },
+   (error, stdout) => resolvePromise(error === null ? stdout : null),
+  );
+ });
+}
+
+/**
+ * `rev-parse`'s two paths, or none unless the output is exactly two nonempty
+ * lines each ending in one newline. A path may hold a newline: a common dir
+ * named `<canonical>/.git\n<canonical>/.git` printed its first line as the
+ * vetted directory, so a split that kept the first two lines accepted a
+ * foreign repository (sage round 2 on node #86).
+ */
+function gitDirLines(stdout: Buffer): [Buffer, Buffer] | [] {
+ const first = stdout.indexOf(0x0a);
+ if (first <= 0) return [];
+ const second = stdout.indexOf(0x0a, first + 1);
+ if (second === first + 1 || second !== stdout.length - 1) return [];
+ return [stdout.subarray(0, first), stdout.subarray(first + 1, second)];
+}
+
+/**
+ * A path with every symlink resolved, as a latin1 string: one char per byte,
+ * so no two paths collide and `dirname` still splits on "/". Null when it is
+ * empty or not there.
+ */
+function realPath(path: Buffer | string | undefined): string | null {
+ if (path === undefined || path.length === 0) return null;
+ try {
+  return realpathSync(typeof path === "string" ? Buffer.from(path) : path, { encoding: "latin1" });
+ } catch {
+  return null;
+ }
 }
 
 /** Ranger's own node branches: `node/<N>-<slug>` (`worktreeBranch` + `slugify` in worker.ts). */
@@ -134,13 +262,13 @@ function branchKey(key: string): { name: string; key: string } | null {
 function configRecords(
  file: string,
  read: ConfigReader,
-): { bytes: Buffer | string; records: Records | null } {
+): { bytes: Buffer | string; records: Records | null; worktreeConfig: boolean } {
  const body = readIfFile(file);
- if (body === null) return { bytes: "(absent)", records: null };
- if (body === NOT_A_FILE) return { bytes: NOT_A_FILE_ENTRY, records: null };
+ if (body === null) return { bytes: "(absent)", records: null, worktreeConfig: true };
+ if (body === NOT_A_FILE) return { bytes: NOT_A_FILE_ENTRY, records: null, worktreeConfig: true };
  const records = read.parse(body);
  if (records === null) {
-  return { bytes: Buffer.concat([Buffer.from("(unparsed)\0"), body]), records: null };
+  return { bytes: Buffer.concat([Buffer.from("(unparsed)\0"), body]), records: null, worktreeConfig: true };
  }
  const sections = new Map<string, { key: string; value: string | null }[]>();
  for (const [key, value] of records) {
@@ -161,8 +289,7 @@ function configRecords(
    entries.length === 2 &&
    merge.length === 1 &&
    merge[0].value !== null &&
-   TRACKED_HEAD.test(merge[0].value) &&
-   !merge[0].value.includes("..");
+   isTrackedHead(merge[0].value);
   if (tracksOrigin && (midWrite || complete)) own.add(name);
  }
  const kept = records
@@ -172,11 +299,25 @@ function configRecords(
   });
  // [key, value] tuples, never "key=value": a key may hold "=" (a url.<x>
  // subsection), so a joined string lets two different records collide.
- return { bytes: JSON.stringify(kept), records: kept };
+ return { bytes: JSON.stringify(kept), records: kept, worktreeConfig: worktreeConfigEnabled(body) };
 }
 
-/** A tracking target ranger's node branches may carry: a branch under refs/heads/. */
-const TRACKED_HEAD = /^refs\/heads\/[A-Za-z0-9_][A-Za-z0-9._/-]*$/;
+/**
+ * A tracking target ranger's node branches may carry: a branch under
+ * refs/heads/ by git's own ref-name rules (`git check-ref-format --branch`,
+ * refs.c `check_refname_component`), so a base such as `release/été` is one.
+ * No control byte, space, `~^:?*[\`, `..` or `@{`; no empty component, none
+ * starting with `.` or ending in `.lock`; no trailing `.` and no leading `-`.
+ * `refs/heads/@` is a branch: only the whole refname `@` is refused.
+ */
+function isTrackedHead(ref: string): boolean {
+ const prefix = "refs/heads/";
+ if (!ref.startsWith(prefix)) return false;
+ const name = ref.slice(prefix.length);
+ if (name === "" || name.startsWith("-") || name.endsWith(".")) return false;
+ if (name.includes("..") || name.includes("@{") || /[\x00-\x20\x7f~^:?*[\\]/.test(name)) return false;
+ return name.split("/").every((c) => c !== "" && !c.startsWith(".") && !c.endsWith(".lock"));
+}
 
 /** A config file's `[key, value]` records; a valueless boolean key has a null value. */
 type Records = [string, string | null][];
@@ -207,19 +348,26 @@ function configReader(): ConfigReader {
  * re-encoded on the way. Keys and values are byte strings (latin1, not utf8:
  * one char per byte), so a value with bytes that are not valid UTF-8 (FF vs
  * FE in a command path) never collapses to the same replacement character
- * and hashes alike.
+ * and hashes alike. Null only when git rejects the bytes (it then refuses
+ * them on every call too); a call that fails or is cut short throws, never
+ * reads as unparsed: a listing past spawnSync's default 1 MiB output cap
+ * (ENOBUFS) once skipped the include check while git still followed it.
  */
 function listConfig(body: Buffer): Records | null {
  const listed = spawnSync(
   "git",
   [
-   "-c", "core.hooksPath=/dev/null",
-   "-c", "core.fsmonitor=false",
+   ...GIT_SAFETY_ARGS,
    "config", "--file", "-", "--no-includes", "--list", "--null",
   ],
-  { env: minimalGitEnv(), encoding: "latin1", input: body, timeout: 10_000 },
+  { env: minimalGitEnv(), encoding: "latin1", input: body, timeout: 10_000, maxBuffer: Infinity },
  );
- if (listed.status !== 0 || listed.error !== undefined) return null;
+ if (listed.error !== undefined || listed.status === null || listed.signal !== null) {
+  throw new GitSafetyError(
+   `cannot list a git config file to vet it (${listed.error?.message ?? `signal ${listed.signal}`}) — refusing to judge the git state`,
+  );
+ }
+ if (listed.status !== 0) return null;
  // --null: each record ends in NUL; the key ends at the first newline, and a
  // valueless boolean key has none.
  return listed.stdout
@@ -229,6 +377,27 @@ function listConfig(body: Buffer): Records | null {
    const nl = r.indexOf("\n");
    return nl === -1 ? [r, null] : [r.slice(0, nl), r.slice(nl + 1)];
   });
+}
+
+/**
+ * Whether git reads `config.worktree` files in this repository: the shared
+ * config's `extensions.worktreeConfig`, read by git as a bool from the same
+ * bytes that are hashed (git takes the repository format from that file
+ * alone, never from global or system config). Unset is off; a value git
+ * cannot read as a bool, or a failed call, counts as on, so every
+ * `config.worktree` stays in the state (fails closed).
+ */
+function worktreeConfigEnabled(body: Buffer): boolean {
+ const got = spawnSync(
+  "git",
+  [
+   ...GIT_SAFETY_ARGS,
+   "config", "--file", "-", "--no-includes", "--type=bool", "--get", "extensions.worktreeconfig",
+  ],
+  { env: minimalGitEnv(), encoding: "utf8", input: body, timeout: 10_000, maxBuffer: Infinity },
+ );
+ if (got.error === undefined && got.status === 1) return false;
+ return !(got.error === undefined && got.status === 0 && got.stdout.trim() === "false");
 }
 
 /**
@@ -358,6 +527,36 @@ function readConfigFile(file: string, read: ConfigReader): Records | null {
  * that for its worktree (a main `http.sslVerify=true` over a shared
  * `false`), so it is kept: emptying or deleting a copy is a change.
  */
+/**
+ * A directory's entry names, sorted; throws on a name that is not UTF-8.
+ * Node decodes names as UTF-8 by default, which maps every invalid byte to
+ * U+FFFD: `worktrees/raw\xff` read as `worktrees/raw�`, so a decoy
+ * directory of that name was vetted in place of the one git reads (sage
+ * round 4 on node #86). A name is UTF-8 when it survives the round trip
+ * byte for byte; `TextDecoder` would also drop a leading BOM.
+ */
+function entryNames(dir: string): string[] {
+ return readdirSync(dir, { encoding: "buffer" })
+  .map((bytes) => {
+   const name = utf8Name(bytes);
+   if (name === null) {
+    throw new GitSafetyError(
+     `${join(dir, Buffer.from(bytes).toString("utf8"))} has a name that is not UTF-8 (hex ${Buffer.from(bytes).toString("hex")}) — refusing to judge the git state. Remove it, then resume the node.`,
+    );
+   }
+   return name;
+  })
+  .sort();
+}
+
+/** A file name's bytes as a string, or null unless they are UTF-8 (they survive the round trip byte for byte). */
+export function utf8Name(bytes: Uint8Array): string | null {
+ // Bun's readdirSync hands back plain Uint8Arrays, whose toString lists the bytes.
+ const raw = Buffer.from(bytes);
+ const name = raw.toString("utf8");
+ return Buffer.from(name, "utf8").equals(raw) ? name : null;
+}
+
 function linkedWorktreeConfigs(
  gitDir: string,
  main: { present: boolean; records: Records | null },
@@ -368,7 +567,7 @@ function linkedWorktreeConfigs(
  if (!existsSync(worktrees)) return [];
  const mainSetsNothing = !main.present || (main.records !== null && setsNothing(main.records));
  const kept: string[] = [];
- for (const entry of readdirSync(worktrees).sort()) {
+ for (const entry of entryNames(worktrees)) {
   if (statSync(join(worktrees, entry), { throwIfNoEntry: false })?.isDirectory() !== true) continue;
   const file = join(worktrees, entry, "config.worktree");
   const records = readConfigFile(file, read);
@@ -384,7 +583,8 @@ function linkedWorktreeConfigs(
  * Read the git state a worker could tamper with: the shared `config` (less
  * ranger's own node-branch tracking, see `configRecords`), the main
  * `config.worktree` and the linked ones that set something of their own
- * (`linkedWorktreeConfigs`), and the hooks directory. Include keys in any
+ * (`linkedWorktreeConfigs`) while `extensions.worktreeConfig` is on
+ * (`worktreeConfigEnabled`), and the hooks directory. Include keys in any
  * of those config files are listed in `includes`; the files they name are
  * never read.
  */
@@ -430,19 +630,33 @@ export function readGitState(canonical: string): GitState {
  } else {
   noteIncludes(config, listed.records);
   const byKey = new Map<string, (string | null)[]>();
-  for (const [key, value] of listed.records) byKey.set(key, [...(byKey.get(key) ?? []), value]);
+  for (const [key, value] of listed.records) {
+   const values = byKey.get(key);
+   if (values === undefined) byKey.set(key, [value]);
+   else values.push(value);
+  }
   for (const [key, values] of byKey) entries[keyLabel(key)] = digest(JSON.stringify(values));
  }
  const mainWorktreeConfig = join(gitDir, "config.worktree");
- const mainPresent = existsSync(mainWorktreeConfig);
- add(mainWorktreeConfig);
- const mainRecords = mainPresent ? readConfigFile(mainWorktreeConfig, read) : null;
- if (mainRecords !== null) noteIncludes(mainWorktreeConfig, mainRecords);
- const linked = linkedWorktreeConfigs(gitDir, { present: mainPresent, records: mainRecords }, noteIncludes, read);
- for (const file of linked) add(file, true);
+ if (listed.worktreeConfig) {
+  const mainPresent = existsSync(mainWorktreeConfig);
+  add(mainWorktreeConfig);
+  const mainRecords = mainPresent ? readConfigFile(mainWorktreeConfig, read) : null;
+  if (mainRecords !== null) noteIncludes(mainWorktreeConfig, mainRecords);
+  const linked = linkedWorktreeConfigs(gitDir, { present: mainPresent, records: mainRecords }, noteIncludes, read);
+  for (const file of linked) add(file, true);
+ } else {
+  // Git reads no config.worktree with the extension off, and copies none
+  // into a new worktree: the main file hashes as absent (as a state recorded
+  // before node #86 did), and no file is read, named or vetted for includes.
+  // A leftover main file is not flagged: turning the extension on is a
+  // shared-config change, which mismatches, and the file is judged then.
+  part(mainWorktreeConfig);
+  part(null);
+ }
  const hooks = join(gitDir, "hooks");
  if (existsSync(hooks)) {
-  for (const entry of readdirSync(hooks).sort()) add(join(hooks, entry));
+  for (const entry of entryNames(hooks)) add(join(hooks, entry));
  }
  return { hash: hash.digest("hex"), entries, includes: [...includes].sort() };
 }
@@ -598,7 +812,7 @@ export async function vettedPush(opts: {
  const vetted = await assertGitUntouched(opts.canonical, opts.configSnapshot);
  const push = await safeGit(
   ["push", "--no-verify", "origin", `${opts.source ?? "HEAD"}:refs/heads/${opts.branch}`],
-  { cwd: opts.worktree, token: opts.token, timeoutMs: 120_000 },
+  { cwd: opts.worktree, token: opts.token, canonical: opts.canonical, timeoutMs: 120_000 },
  );
  if (push.code !== 0) {
   throw new GitSafetyError(`push of ${opts.branch} failed: ${push.stderr.trim()}`);
@@ -642,6 +856,7 @@ async function fastForwardOnce(canonical: string, base: string, token: string): 
  const fetch = await safeGit(["fetch", "origin", base], {
   cwd: canonical,
   token,
+  canonical,
   timeoutMs: 120_000,
  });
  if (fetch.code !== 0) {

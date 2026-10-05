@@ -23,7 +23,7 @@ import { sweepMap } from "../src/sweep.ts";
 import { bootstrapWorktree, runNode, type RunNodeContext } from "../src/worker.ts";
 import { keyLabel } from "../src/git-ops.ts";
 import { trustCurrentGitState } from "../src/git-trust.ts";
-import { baseConfigLines, createCanonicalRepo, GIT_ENV } from "./support.ts";
+import { baseConfigLines, createCanonicalRepo, GIT_ENV, takesRawByteNames } from "./support.ts";
 import { saveViewsRecord, viewsDirectory } from "../src/views.ts";
 import { DiscordAnnouncer } from "../src/announce.ts";
 
@@ -770,6 +770,27 @@ describe("implement lane (node #23)", () => {
    expect(parked.detail).toContain(`${keyLabel("includeif.onbranch:main.path")} in config.worktree`);
    expect(await r.github.sha("node/20-add-the-feature-module")).toBe("");
    expect(r.github.prs.size).toBe(0);
+  }, 60_000);
+
+  // Sage round 5 on node #86: a state ranger cannot read to vet threw past
+  // the park, so the run counted as a crash toward the dead-man pause.
+  // APFS refuses names that are not UTF-8 (EILSEQ); ext4 (CI) takes them.
+  test.skipIf(!takesRawByteNames())("a hook name that is not UTF-8 between runs parks the node, outside the dead-man", async () => {
+   const r = await rig({});
+   cleanup.push(r.dir);
+   r.ctx.workerCommand = [implementWorker, "noop"];
+   expect((await runNode("20", r.ctx)).status).toBe("failed");
+   const deadman = r.journal.deadmanCount();
+
+   writeFileSync(Buffer.concat([Buffer.from(join(r.canonical, ".git", "hooks", "pre-push")), Buffer.from([0xfe])]), "#!/bin/sh\n");
+   r.ctx.workerCommand = [implementWorker, "build"];
+   r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+   const parked = await runNode("20", r.ctx);
+   expect(parked.status).toBe("parked");
+   expect(parked.detail).toMatch(/not UTF-8/);
+   expect(r.journal.getWorker("20", "acme/widgets")?.status).toBe("parked");
+   expect(r.journal.deadmanCount()).toBe(deadman);
+   expect(await r.github.sha("node/20-add-the-feature-module")).toBe("");
   }, 60_000);
 
   test("a journal without a record keeps today's behaviour: the run records the state and says so", async () => {
