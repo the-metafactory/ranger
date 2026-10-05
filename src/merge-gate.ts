@@ -55,6 +55,18 @@ export function evaluateMergeGate(input: MergeGateInput): MergeGateResult {
   };
  }
 
+ // 0. A known conflict fails before CI is read: GitHub starts no pull_request
+ //    workflow on a conflicting PR, so "no check runs yet" would read as
+ //    pending forever (seelite #692, 2026-10-05: ready and sage-clean, never
+ //    carded, because #686/#687 landed while it was being built).
+ if (pr.mergeable === false || pr.mergeableState === "dirty") {
+  return {
+   status: "fail",
+   check: "mergeable",
+   reason: `mergeable=${pr.mergeable}, state=${pr.mergeableState} (conflicts with ${input.expectedBase})`,
+  };
+ }
+
  // 1. CI green on the live head, by the shared policy (`ci-policy.ts`).
  const ci = classifyCi(input.checkRuns);
  if (ci.state === "none") {

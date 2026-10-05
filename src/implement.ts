@@ -24,6 +24,7 @@ import {
  PROBE_FILE,
  parseFailedChecks,
  parseFailedProbes,
+ baseConflictOutcome,
  policyBlockedOutcome,
  probesFailedOutcome,
  reviewCapHeadMovedOutcome,
@@ -118,6 +119,8 @@ export interface ImplementContext {
  hostLoad?: HostLoad;
  /** How often and how long the probe tier waits for a quiet host. */
  quietHost?: { pollMs: number; maxMs: number };
+ /** How often and how many times to ask GitHub for a PR's mergeability (tests shorten it). */
+ mergeablePoll?: { pollMs: number; attempts: number };
  /** Posts to the map's channel (the base-red notice); tests capture it. */
  announce?: (text: string) => Promise<unknown>;
 }
@@ -636,12 +639,14 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
  // ---- review loop ----
  const open = pr as PullRequest;
  journal.updateWorker(nodeId, ctx.map.repo, { phase: "review", prNumber: open.number });
- const cap = config.workers.reviewRounds;
- let reviews = recordedReviews(
-  await github.listComments(repo, open.number, token),
-  botIdentity,
- );
+ const opening = await github.listComments(repo, open.number, token);
+ let reviews = recordedReviews(opening, botIdentity);
+ // A base merge pass moves the head without a finding to answer: each one
+ // recorded on the PR grants the round that reviews the merged branch.
+ let baseMerges = recordedBaseMerges(opening, botIdentity).length;
+ const capNow = () => config.workers.reviewRounds + baseMerges;
  for (;;) {
+  const cap = capNow();
   const live = await github.getPr(repo, open.number, token);
   let current = reviews.find((r) => r.sha === live.headSha);
   if (current === undefined) {
@@ -721,7 +726,39 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
   });
   // Blockers AND majors gate (principal, 2026-10-03): each is reworked and
   // re-reviewed. Suggestions and nits do not gate.
-  if (gatingFindings(current) === 0) break;
+  if (gatingFindings(current) === 0) {
+   // Sage-clean. Before the probes certify this head, it must merge: GitHub
+   // runs no CI on a conflicting PR, so a conflict found only at the merge
+   // desk waits forever (seelite #692).
+   if (!(await conflictsWithBase(ctx, github, open.number))) break;
+   if (baseMerges >= MAX_BASE_MERGES) {
+    throw new ParkSignal(baseConflictOutcome({ pr: open.number, base, passes: baseMerges }));
+   }
+   const merged = await baseMergePass(ctx, testCommand);
+   workerExit = merged.workerExit;
+   if (merged.failure !== undefined) return merged.failure;
+   // The marker first: a crash between it and the push costs one spare
+   // round, while the reverse would park the merged head at the cap.
+   fence("record the base merge");
+   await github.postComment(repo, open.number, baseMergeMarker(merged.sha, base), token);
+   baseMerges += 1;
+   fence("push base merge");
+   await vettedPush({
+    worktree,
+    canonical: ctx.canonical,
+    branch,
+    token,
+    configSnapshot: merged.snapshot,
+   });
+   journal.recordEvent("pushed", {
+    nodeId,
+    repo,
+    detail: `base merge pass ${baseMerges} @ ${merged.sha.slice(0, 8)}: origin/${base} merged in after a conflict`,
+   });
+   recordHead(ctx, merged.sha);
+   await awaitHead(github, repo, open.number, merged.sha, token, ctx.headPollMs);
+   continue;
+  }
   if (current.round >= cap) {
    throw new ParkSignal(
     reviewCapOutcome({ blockers: current.blockers, majors: current.majors, round: current.round, pr: open.number }),
@@ -814,6 +851,92 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
  };
 }
 
+/** Base merge passes one node gets before a still-conflicting branch parks. */
+const MAX_BASE_MERGES = 2;
+
+interface BaseMergeInput {
+ base: string;
+ /** The files a trial merge reported as conflicting (the worker's starting point). */
+ files: string[];
+}
+
+const BASE_MERGE_MARKER = /<!-- ranger:base-merge sha=([0-9a-f]{7,64}) base=([\w./-]+) -->/;
+
+export function baseMergeMarker(sha: string, base: string): string {
+ return `<!-- ranger:base-merge sha=${sha} base=${base} -->\n**Base merge** — \`origin/${base}\` conflicted with this branch, so a worker merged it in at \`${sha.slice(0, 8)}\`. The next sage round reviews the merged branch.`;
+}
+
+/** Base merge passes recorded on the PR by the MACHINE ACCOUNT (anyone else's markers are ignored). */
+export function recordedBaseMerges(comments: IssueComment[], botIdentity: string): { sha: string; base: string }[] {
+ const out: { sha: string; base: string }[] = [];
+ for (const c of comments) {
+  if (c.author !== botIdentity) continue;
+  const m = c.body.match(BASE_MERGE_MARKER);
+  if (m !== null) out.push({ sha: m[1], base: m[2] });
+ }
+ return out;
+}
+
+/**
+ * Whether GitHub says the PR conflicts with its base. GitHub computes
+ * mergeability lazily after a push, so an unknown answer is polled for a
+ * while; one that stays unknown reads as no conflict, and the merge gate
+ * asks again before any merge.
+ */
+async function conflictsWithBase(ctx: ImplementContext, github: GitHubPort, prNumber: number): Promise<boolean> {
+ const { pollMs, attempts } = ctx.mergeablePoll ?? { pollMs: 5_000, attempts: 12 };
+ for (let i = 0; i < attempts; i++) {
+  const pr = await github.getPr(ctx.map.repo, prNumber, ctx.token);
+  if (pr.mergeable !== null && pr.mergeableState !== "unknown") {
+   return pr.mergeable === false || pr.mergeableState === "dirty";
+  }
+  if (i < attempts - 1) await new Promise((r) => setTimeout(r, pollMs));
+ }
+ return false;
+}
+
+/**
+ * The files `git merge-tree` reports as conflicting between the branch and
+ * origin/<base>: a hint for the worker's prompt, empty when git cannot say.
+ */
+async function conflictingFiles(worktree: string, base: string): Promise<string[]> {
+ const trial = await safeGit(["merge-tree", "--write-tree", "--name-only", "--no-messages", "HEAD", `origin/${base}`], {
+  cwd: worktree,
+  timeoutMs: 60_000,
+ });
+ if (trial.code !== 1) return [];
+ return trial.stdout.split("\n").slice(1).map((l) => l.trim()).filter(Boolean).slice(0, 20);
+}
+
+/**
+ * One worker pass that merges the moved base into the branch. The supervisor
+ * fetches the base first (the worker holds no credential); the worker merges
+ * and resolves; the supervisor's own checks then require a clean tree,
+ * passing tests, and origin/<base> actually inside the branch.
+ */
+async function baseMergePass(ctx: ImplementContext, testCommand: string): Promise<PassResult> {
+ const base = ctx.map.base;
+ await fastForwardCanonical(ctx.canonical, base, ctx.token);
+ const files = await conflictingFiles(ctx.worktree, base);
+ ctx.journal.recordEvent("reviewed", {
+  nodeId: ctx.node.ref.id,
+  repo: ctx.map.repo,
+  detail: `PR conflicts with origin/${base}${files.length > 0 ? ` in ${files.join(", ")}` : ""} — a worker merges it in`,
+ });
+ const pass = await workerPass(ctx, testCommand, undefined, { base, files });
+ if (pass.failure !== undefined) return pass;
+ const inside = await safeGit(["merge-base", "--is-ancestor", `origin/${base}`, "HEAD"], {
+  cwd: ctx.worktree,
+  timeoutMs: 30_000,
+ });
+ if (inside.code !== 0) {
+  throw new ParkSignal(
+   `base merge pass committed, but origin/${base} is still not in ${ctx.branch} — the conflict stands; nothing was pushed`,
+  );
+ }
+ return pass;
+}
+
 interface PassResult {
  workerExit: number | null;
  snapshot: string;
@@ -862,24 +985,29 @@ async function workerPass(
  ctx: ImplementContext,
  testCommand: string,
  review: { round: number; body: string } | undefined,
+ baseMerge?: BaseMergeInput,
 ): Promise<PassResult> {
  const nodeId = ctx.node.ref.id;
  if (ctx.substrate === undefined) {
-  return checkedWorkerPass(ctx, testCommand, review, () =>
-   ctx.journal.assertGeneration(nodeId, ctx.map.repo, ctx.generation, "spawn the worker"),
+  return checkedWorkerPass(
+   ctx,
+   testCommand,
+   review,
+   () => ctx.journal.assertGeneration(nodeId, ctx.map.repo, ctx.generation, "spawn the worker"),
+   baseMerge,
   );
  }
  return recordSession(
   ctx.journal,
   {
    substrate: ctx.substrate,
-   kind: review === undefined ? "worker" : "fix-pass",
+   kind: review === undefined && baseMerge === undefined ? "worker" : "fix-pass",
    repo: ctx.map.repo,
    nodeId,
    generation: ctx.generation,
    model: ctx.model ?? null,
   },
-  (open) => checkedWorkerPass(ctx, testCommand, review, open),
+  (open) => checkedWorkerPass(ctx, testCommand, review, open, baseMerge),
   (pass) =>
    pass.failure === undefined ? "ok" : failedSessionOutcome(pass.failure.detail, pass.failure.substrateCapped),
  );
@@ -896,6 +1024,7 @@ async function checkedWorkerPass(
  testCommand: string,
  review: { round: number; body: string } | undefined,
  fenceSpawn: () => void,
+ baseMerge?: BaseMergeInput,
 ): Promise<PassResult> {
  const { config, map, journal, node, worktree, branch, botIdentity } = ctx;
  const nodeId = node.ref.id;
@@ -918,6 +1047,7 @@ async function checkedWorkerPass(
   botIdentity,
   testCommand,
   review,
+  baseMerge,
   probeTier: map.commands.probe !== undefined,
  });
  fenceSpawn();
@@ -936,7 +1066,8 @@ async function checkedWorkerPass(
  // quota readings are cached, and its signal lines feed the cap check.
  const { result, lines } = output.read(raw, journal);
 
- const pass = review === undefined ? "build pass" : `fix pass ${review.round}`;
+ const pass =
+  baseMerge !== undefined ? "base merge pass" : review === undefined ? "build pass" : `fix pass ${review.round}`;
  const log = saveWorkerLog(journal.path, map.repo, nodeId, ctx.generation, pass, result);
  // Before ANY git call after the worker: a tampered config or hook would run
  // with whatever the next git call carries.
@@ -968,9 +1099,11 @@ async function checkedWorkerPass(
  const sha = await headSha(worktree);
  if (sha === before || (await commitsAhead(worktree, map.base)) === 0) {
   return fail(
-   review === undefined
-    ? "worker exited 0 but committed nothing — nothing to push"
-    : `fix pass ${review.round} committed nothing — the blockers stand`,
+   baseMerge !== undefined
+    ? `base merge pass committed nothing — the conflict with origin/${baseMerge.base} stands`
+    : review === undefined
+     ? "worker exited 0 but committed nothing — nothing to push"
+     : `fix pass ${review.round} committed nothing — the blockers stand`,
   );
  }
  // The supervisor tests the working tree but pushes commits: a dirty tree

@@ -11,7 +11,9 @@
 # keyword; noop — commits nothing; dirty — commits but leaves an untracked file; sleep — starts a long-running grandchild
 # (for the process-group tests) then sleeps; hook-stop — prints what `claude -p` prints when a
 # prompt hook stops the session, and exits 0 having done nothing; probe-edit — builds and also edits
-# scripts/probe-hud.mjs (a branch that changes the probe it fails).
+# scripts/probe-hud.mjs (a branch that changes the probe it fails); merge-noop — builds, but a base
+# merge pass does nothing. Base merge pass (prompt carries "## Base merge pass"): merges
+# origin/main, resolving a conflict on src/feature.ts by keeping both sides.
 set -euo pipefail
 
 if [ -n "${GIT_CONFIG_VALUE_0:-}" ] || [ -n "${GH_TOKEN:-}" ]; then
@@ -44,6 +46,16 @@ if [ "$mode" = "sleep" ]; then
 fi
 
 mkdir -p src tests
+if printf '%s' "$prompt" | grep -q "## Base merge pass"; then
+  if [ "$mode" = "merge-noop" ]; then echo "fake worker: left the merge alone"; exit 0; fi
+  if ! git merge --no-edit -q origin/main >/dev/null 2>&1; then
+    printf 'export const feature = () => 1; // branch\nexport const fromMain = true; // main\n' > src/feature.ts
+    git add -A
+    git commit -q --no-edit
+  fi
+  echo "fake worker merged origin/main"
+  exit 0
+fi
 if printf '%s' "$prompt" | grep -q "Fix pass"; then
   echo "export const feature = () => 2; // fixed per review" > src/feature.ts
   git add -A

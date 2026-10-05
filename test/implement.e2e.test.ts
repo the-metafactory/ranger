@@ -80,12 +80,17 @@ class FakeGitHub implements GitHubPort {
    headRef: pr.head,
    headSha: pr.mergedSha ?? (await this.sha(pr.head)),
    baseRef: pr.base,
-   mergeable: true,
-   mergeableState: "clean",
+   ...(pr.merged ? { mergeable: true, mergeableState: "clean" } : await this.mergeability(pr.head)),
    mergeCommitSha: pr.mergedSha,
    url: `https://github.com/acme/widgets/pull/${n}`,
    author: BOT,
   };
+ }
+
+ /** Like GitHub: a trial merge of the head into origin main decides mergeability. */
+ private async mergeability(head: string): Promise<{ mergeable: boolean; mergeableState: string }> {
+  const trial = await runCmd("git", ["merge-tree", "--write-tree", "main", `refs/heads/${head}`], { cwd: this.origin });
+  return trial.code === 0 ? { mergeable: true, mergeableState: "clean" } : { mergeable: false, mergeableState: "dirty" };
  }
 
  async findPrByHead(_repo: string, branch: string) {
@@ -154,14 +159,14 @@ class FakeGitHub implements GitHubPort {
 function scriptedReviewer(
  github: FakeGitHub,
  blockers: number[],
- onReview?: (round: number) => void,
+ onReview?: (round: number) => void | Promise<void>,
  majors: number[] = [0],
 ) {
  const calls: number[] = [];
  const reviewer = async (_repo: string, pr: number): Promise<ReviewVerdict> => {
   const round = calls.length + 1;
   calls.push(pr);
-  onReview?.(round);
+  await onReview?.(round);
   const head = (await github.getPr("acme/widgets", pr)).headSha;
   const b = blockers[Math.min(round - 1, blockers.length - 1)];
   const m = majors[Math.min(round - 1, majors.length - 1)];
@@ -197,7 +202,7 @@ async function rig(opts: {
  author?: string;
  blockers?: number[];
  majors?: number[];
- onReview?: (round: number) => void;
+ onReview?: (round: number) => void | Promise<void>;
  /** commands.probe for the map (a fake-probe invocation). */
  probe?: string;
  /** commands.probeRetry for the map. */
@@ -314,6 +319,18 @@ async function seedProbeOnBase(r: Rig): Promise<void> {
  await git(["commit", "-m", "add the hud probe"], seed);
  expect((await git(["push", r.origin, "main"], seed)).code).toBe(0);
  expect((await git(["fetch", "origin"], r.canonical)).code).toBe(0);
+}
+
+/** Land a commit on origin's main that conflicts with the worker's src/feature.ts (the base moved under the node). */
+async function moveBaseUnder(r: Rig): Promise<void> {
+ const seed = join(r.dir, "seed");
+ const git = (args: string[]) => runCmd("git", args, { cwd: seed, env: { ...process.env, ...GIT_ENV } });
+ await git(["pull", "-q", r.origin, "main"]);
+ mkdirSync(join(seed, "src"), { recursive: true });
+ writeFileSync(join(seed, "src", "feature.ts"), "export const fromMain = true;\n");
+ await git(["add", "-A"]);
+ await git(["commit", "-m", "main lands its own feature.ts"]);
+ expect((await git(["push", r.origin, "HEAD:main"])).code).toBe(0);
 }
 
 /** The node's substrate sessions (node #56), oldest first: [substrate, kind, outcome]. */
@@ -757,6 +774,66 @@ describe("implement lane (node #23)", () => {
   expect((await runNode("20", r.ctx)).status).toBe("parked");
   const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
   expect(events.some((d) => d.includes("probe-hud.mjs are new or changed on this branch — they gate"))).toBe(true);
+ }, 60_000);
+
+ test("a PR that conflicts with its moved base gets a base merge pass, a new round, then goes ready (seelite #692)", async () => {
+  // The base moves while round 1 reads the branch: #686/#687 landed while 491 was in review.
+  let r!: Rig & { calls: number[]; announced: string[] };
+  r = await rig({ onReview: async (round) => { if (round === 1) await moveBaseUnder(r); } });
+  cleanup.push(r.dir);
+  r.ctx.mergeablePoll = { pollMs: 1, attempts: 2 };
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  expect(r.calls).toHaveLength(2); // round 1 on the conflicting head, round 2 on the merged one
+  const markers = (r.github.comments.get(1) ?? []).filter((c) => c.body.includes("ranger:base-merge"));
+  expect(markers).toHaveLength(1);
+  const head = await r.github.sha("node/20-add-the-feature-module");
+  const inside = await runCmd("git", ["merge-base", "--is-ancestor", "main", head], { cwd: r.origin });
+  expect(inside.code).toBe(0);
+  expect((await r.github.getPr("acme/widgets", 1)).mergeable).toBe(true);
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.startsWith("PR conflicts with origin/main in src/feature.ts"))).toBe(true);
+  expect(events.some((d) => d.startsWith("base merge pass 1 @"))).toBe(true);
+ }, 60_000);
+
+ test("a base merge pass that merges nothing fails without pushing or marking", async () => {
+  let r!: Rig & { calls: number[]; announced: string[] };
+  r = await rig({ onReview: async (round) => { if (round === 1) await moveBaseUnder(r); } });
+  cleanup.push(r.dir);
+  r.ctx.mergeablePoll = { pollMs: 1, attempts: 2 };
+  r.ctx.workerCommand = [implementWorker, "merge-noop"];
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("failed");
+  expect(outcome.detail).toContain("base merge pass committed nothing — the conflict with origin/main stands");
+  expect((r.github.comments.get(1) ?? []).some((c) => c.body.includes("ranger:base-merge"))).toBe(false);
+  expect((await r.github.getPr("acme/widgets", 1)).mergeable).toBe(false);
+ }, 60_000);
+
+ test("a ready PR whose base moves under it is sent back for a base merge, not left pending on CI", async () => {
+  const r = await rig({});
+  cleanup.push(r.dir);
+  r.ctx.mergeablePoll = { pollMs: 1, attempts: 2 };
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  await moveBaseUnder(r);
+  const spawned: string[] = [];
+  const tick = await sweepMap({
+   config: r.ctx.config,
+   journal: r.journal,
+   map: r.ctx.map,
+   token: "ghp_write",
+   botIdentity: BOT,
+   github: r.github,
+   post: async () => "msg",
+   respawn: async (nodeId) => {
+    spawned.push(nodeId);
+    return DEAD_PID;
+   },
+  });
+  expect(tick.mergeDesk?.resumed).toEqual(["20"]);
+  expect(spawned).toEqual(["20"]);
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.includes("conflicts with main") && d.includes("run-node resumes"))).toBe(true);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  expect((await r.github.getPr("acme/widgets", 1)).mergeable).toBe(true);
  }, 60_000);
 
  test("a busy host delays the probe run until the load drops", async () => {

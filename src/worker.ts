@@ -110,6 +110,7 @@ export interface RunNodeContext {
  hostLoad?: ImplementContext["hostLoad"];
  quietHost?: ImplementContext["quietHost"];
  announce?: ImplementContext["announce"];
+ mergeablePoll?: ImplementContext["mergeablePoll"];
 }
 
 /** The canonical checkout dir for a repo (design §4: probes run there). */
@@ -598,6 +599,7 @@ async function runImplementNode(
   hostLoad: ctx.hostLoad,
   quietHost: ctx.quietHost,
   announce: ctx.announce,
+  mergeablePoll: ctx.mergeablePoll,
   substrateReaders: resolveReaders(ctx),
  };
  const capped = new Set<SubstrateName>();
