@@ -960,6 +960,17 @@ describe("implement lane (node #23)", () => {
   expect(r.github.prs.size).toBe(0);
  }, 60_000);
 
+ test("a failed test run that wrote an ignored fixture is not retried either", async () => {
+  const r = await rig({ test: "x=\"$(git rev-parse --git-common-dir)/info\"; mkdir -p \"$x\"; grep -qx \"*.fixture\" \"$x/exclude\" 2>/dev/null || echo \"*.fixture\" >> \"$x/exclude\"; test -z \"$(git status --porcelain)\" || exit 7; if [ -f t.fixture ]; then exit 0; else touch t.fixture; exit 1; fi" });
+  cleanup.push(r.dir);
+  r.ctx.hostLoad = () => ({ load: 14, cores: 10 });
+  r.ctx.quietHost = { pollMs: 1, maxMs: 5 };
+  expect((await runNode("20", r.ctx)).status).toBe("failed");
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.endsWith("failed on a busy host and changed the tree or HEAD — not retried"))).toBe(true);
+  expect(r.github.prs.size).toBe(0);
+ }, 60_000);
+
  test("built and committed work a failed run left unpushed is adopted on resume, with no new worker session", async () => {
   const flag = join(tmpdir(), `ranger-adopt-${Date.now()}`);
   const r = await rig({ test: `test -f ${flag}` });

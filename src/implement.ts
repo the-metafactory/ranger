@@ -1365,7 +1365,10 @@ function testsFailedDetail(testCommand: string, tests: RunResult, after: string)
  * it again, while the supervisor's ran at load 40–100 and failed. Only a
  * failed run that left HEAD and the tree as they were is retried, and a
  * passing retry must leave them so too: the retry would otherwise certify
- * files the failed run wrote that the pushed commit does not carry.
+ * files the failed run wrote that the pushed commit does not carry. "The
+ * tree" includes the gitignored paths git lists (a new ignored fixture
+ * counts); a file added inside an already-ignored directory (node_modules/,
+ * a cache) is not seen, because git lists only the directory.
  */
 async function supervisorTests(
  ctx: ImplementContext,
@@ -1374,8 +1377,11 @@ async function supervisorTests(
 ): Promise<{ tests: RunResult; log: string | null }> {
  const { journal, map, node, worktree } = ctx;
  const head = await headSha(worktree);
+ const ignoredBefore = await ignoredPaths(worktree);
  const untouched = async (): Promise<boolean> =>
-  (await headSha(worktree)) === head && (await dirtyFiles(worktree)).length === 0;
+  (await headSha(worktree)) === head &&
+  (await dirtyFiles(worktree)).length === 0 &&
+  (await ignoredPaths(worktree)) === ignoredBefore;
  let tests = await runShell(testCommand, worktree, ctx, TEST_TIMEOUT_MS);
  if (tests.code === 0) return { tests, log: null };
  const log = saveWorkerLog(journal.path, map.repo, node.ref.id, ctx.generation, `${label}: supervisor tests (${testCommand})`, tests);
@@ -1405,6 +1411,16 @@ async function supervisorTests(
  }
  saveWorkerLog(journal.path, map.repo, node.ref.id, ctx.generation, `${label}: supervisor test retry (${testCommand})`, tests);
  return { tests, log };
+}
+
+/** The gitignored paths git lists in the worktree, one string to compare (null when git cannot say). */
+async function ignoredPaths(worktree: string): Promise<string | null> {
+ const r = await safeGit(["status", "--porcelain", "--ignored=matching", "--untracked-files=all"], {
+  cwd: worktree,
+  timeoutMs: 60_000,
+ });
+ if (r.code !== 0) return null;
+ return r.stdout.split("\n").filter((l) => l.startsWith("!! ")).sort().join("\n");
 }
 
 /**
