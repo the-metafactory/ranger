@@ -1098,8 +1098,12 @@ describe("implement lane (node #23)", () => {
 
  test("install and tests run niced, the probe run at the walker's own priority", async () => {
   const own = Number((await runCmd("/bin/sh", ["-c", "ps -o nice= -p $PPID"])).stdout.trim());
+  // The OS clamps at its own maximum (20 on macOS, 19 on Linux): ask it.
+  const max = Number((await runCmd("/bin/sh", ["-c", "ps -o nice= -p $$"], { nice: 100 })).stdout.trim());
+  const niced = Math.min(own + 10, max);
   const r = await rig({
-   test: `[ $(ps -o nice= -p $$) -eq ${own + 10} ] && test -f src/feature.ts`,
+   install: `[ $(ps -o nice= -p $$) -eq ${niced} ]`,
+   test: `[ $(ps -o nice= -p $$) -eq ${niced} ] && test -f src/feature.ts`,
    probe: `[ $(ps -o nice= -p $$) -eq ${own} ]`,
   });
   cleanup.push(r.dir);

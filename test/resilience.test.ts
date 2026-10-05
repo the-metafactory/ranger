@@ -202,7 +202,9 @@ describe("ranger's own commands yield the CPU to the probes (2026-10-05)", () =>
   const niced = await runCmd("/bin/sh", ["-c", "ps -o nice= -p $$"], { nice: 10 });
   const plain = await runCmd("/bin/sh", ["-c", "ps -o nice= -p $$"]);
   const own = await runCmd("/bin/sh", ["-c", "ps -o nice= -p $PPID"]);
-  expect(Number(niced.stdout.trim())).toBe(Number(own.stdout.trim()) + 10);
+  // The OS clamps at its own maximum (20 on macOS, 19 on Linux): ask it.
+  const max = await runCmd("/bin/sh", ["-c", "ps -o nice= -p $$"], { nice: 100 });
+  expect(Number(niced.stdout.trim())).toBe(Math.min(Number(own.stdout.trim()) + 10, Number(max.stdout.trim())));
   expect(Number(plain.stdout.trim())).toBe(Number(own.stdout.trim()));
  });
 });
