@@ -9,7 +9,6 @@ import { runCmd, type RunOptions } from "./exec.ts";
 import {
  fastForwardCanonical,
  assertGitUntouched,
- NODE_BRANCH,
  readGitState,
  safeGit,
  GitSafetyError,
@@ -216,16 +215,16 @@ export async function bootstrapWorktree(
   ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`],
   { cwd: canonical, timeoutMs: 10_000 },
  );
- // A branch a probe names (not `node/<N>-<slug>`) gets no tracking lines: the
- // tamper state leaves out only node branches' (node #63), so they would read
- // as a change to the shared config at the next known-good check (node #81).
+ // No tracking lines on a new branch: they land in the shared config, which
+ // the known-good check compares across runs (node #81). The tamper state
+ // leaves out only a node branch's plain remote + merge pair (node #63), and
+ // `branch.autoSetupRebase=always` adds a `rebase` line to it, a probe-named
+ // branch none at all. `--no-track` also overrides `branch.autoSetupMerge`.
  // Ranger's git calls name their refs and never use the upstream.
  const args =
   existing.code === 0
    ? ["worktree", "add", dir, branch]
-   : NODE_BRANCH.test(branch)
-    ? ["worktree", "add", dir, "-b", branch, `origin/${base}`]
-    : ["worktree", "add", "--no-track", dir, "-b", branch, `origin/${base}`];
+   : ["worktree", "add", "--no-track", dir, "-b", branch, `origin/${base}`];
  // worktree add fires post-checkout; safeGit keeps a planted hook from
  // running with the supervisor's credentials.
  const result = await safeGit(args, {

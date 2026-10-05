@@ -87,8 +87,10 @@ function branchKey(key: string): { name: string; key: string } | null {
 
 /**
  * The shared `config` as hashable bytes, less the branch-tracking entries
- * ranger writes for its own node branches. Adding a node worktree off
- * origin/<base> writes `branch."node/…".remote` + `.merge` to the SHARED
+ * ranger wrote for its own node branches before node #81 (`bootstrapWorktree`
+ * now adds `--no-track`; branches from older builds keep theirs, and an
+ * operator's `git worktree add -b` writes them too). Adding a node worktree off
+ * origin/<base> wrote `branch."node/…".remote` + `.merge` to the SHARED
  * config, so a second node started in the same clone during a worker session
  * tripped the first one's tamper check (node #63: seelite #212 parked by
  * #663). Remove, don't select: every other record stays in the hash, and a
@@ -173,7 +175,9 @@ function configRecords(
  * every byte), `entries` only names what moved. One digest per config key
  * (its values in file order), per `config.worktree` file and per hook, so a
  * mismatch can say `http.sslverify` without the journal ever holding a
- * config value (a remote URL can carry a token).
+ * config value (a remote URL can carry a token). A key can carry one too
+ * (`url.https://bot:TOKEN@host/.insteadof`), so URL-keyed subsections are
+ * named by digest (`keyLabel`).
  */
 export interface GitState {
  hash: string;
@@ -181,6 +185,26 @@ export interface GitState {
 }
 
 const digest = (data: Buffer | string): string => createHash("sha256").update(data).digest("hex");
+
+/** Sections whose subsection is a URL, which can hold userinfo or a token in the query. */
+const URL_SECTIONS = new Set(["url", "http", "credential"]);
+
+/**
+ * The name a config key goes by in `GitState.entries`, and so in the
+ * journal, park outcomes and cards. A subsection that is a URL, or holds
+ * anything but ref-name characters, is replaced by a digest of the whole key:
+ * `url.<3f2a…>.insteadof`. Two keys never share a name, and a changed one is
+ * still named by section and variable; `git config --list` shows the rest.
+ */
+export function keyLabel(key: string): string {
+ const first = key.indexOf(".");
+ const last = key.lastIndexOf(".");
+ if (first === -1 || last === first) return key;
+ const section = key.slice(0, first).toLowerCase();
+ const subsection = key.slice(first + 1, last);
+ if (!URL_SECTIONS.has(section) && /^[A-Za-z0-9._/-]*$/.test(subsection)) return key;
+ return `${key.slice(0, first)}.<${digest(key).slice(0, 12)}>${key.slice(last)}`;
+}
 
 /**
  * Read the git state a worker could tamper with: the shared `config` (less
@@ -220,7 +244,7 @@ export function readGitState(canonical: string, base = "main"): GitState {
  } else {
   const byKey = new Map<string, (string | null)[]>();
   for (const [key, value] of listed.records) byKey.set(key, [...(byKey.get(key) ?? []), value]);
-  for (const [key, values] of byKey) entries[key] = digest(JSON.stringify(values));
+  for (const [key, values] of byKey) entries[keyLabel(key)] = digest(JSON.stringify(values));
  }
  add(join(gitDir, "config.worktree"));
  const worktrees = join(gitDir, "worktrees");

@@ -638,15 +638,36 @@ describe("implement lane (node #23)", () => {
   test("a parallel node's worktree created between runs parks nothing", async () => {
    const r = await rig({});
    cleanup.push(r.dir);
+   // An operator setting under which a tracked branch gains a rebase line
+   // beside the remote + merge pair, which the node #63 filter keeps.
+   expect((await git(["config", "branch.autoSetupRebase", "always"], r.canonical)).code).toBe(0);
    r.ctx.workerCommand = [implementWorker, "noop"];
    expect((await runNode("20", r.ctx)).status).toBe("failed");
 
    await bootstrapWorktree(r.canonical, "21", "another-node", "tok");
-   expect((await git(["config", "--get", "branch.node/21-another-node.merge"], r.canonical)).stdout.trim()).toBe("refs/heads/main");
+   expect((await git(["config", "--get-regexp", "^branch\\.node/21-"], r.canonical)).stdout.trim()).toBe("");
 
    r.ctx.workerCommand = [implementWorker, "build"];
    r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
    expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  }, 60_000);
+
+  test("a credential-bearing key added between runs parks the node without its text reaching the outcome or the journal", async () => {
+   const r = await rig({});
+   cleanup.push(r.dir);
+   r.ctx.workerCommand = [implementWorker, "noop"];
+   expect((await runNode("20", r.ctx)).status).toBe("failed");
+
+   expect((await git(["config", "url.https://bot:SECRETTOKEN@github.com/.insteadOf", "https://github.com/"], r.canonical)).code).toBe(0);
+   r.ctx.workerCommand = [implementWorker, "build"];
+   r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+   const parked = await runNode("20", r.ctx);
+   expect(parked.status).toBe("parked");
+   expect(parked.detail).toMatch(/url\.<[0-9a-f]{12}>\.insteadof \(new\)/);
+   expect(parked.detail).not.toContain("SECRETTOKEN");
+   expect(r.journal.getWorker("20", "acme/widgets")?.outcome).not.toContain("SECRETTOKEN");
+   expect(r.journal.getHealth(knownGoodKey(r.canonical, "main"))).not.toContain("SECRETTOKEN");
+   for (const event of r.journal.listEvents("acme/widgets", 500)) expect(JSON.stringify(event)).not.toContain("SECRETTOKEN");
   }, 60_000);
 
   test("a journal without a record keeps today's behaviour: the run records the state and says so", async () => {

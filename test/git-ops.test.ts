@@ -10,7 +10,7 @@ import {
  NODE_BRANCH,
 } from "../src/git-ops.ts";
 import { bootstrapWorktree, slugify, worktreeBranch } from "../src/worker.ts";
-import { createCanonicalRepo, GIT_ENV } from "./support.ts";
+import { addTrackedWorktree, createCanonicalRepo, GIT_ENV } from "./support.ts";
 
 /**
  * Node #63: the tamper guard leaves out only the branch-tracking entries
@@ -40,7 +40,7 @@ afterEach(() => {
 describe("gitConfigSnapshot: ranger's own node branches (node #63)", () => {
  test("a second node's worktree branch leaves the snapshot unchanged (seelite #212/#663)", async () => {
   const before = gitConfigSnapshot(canonical);
-  await bootstrapWorktree(canonical, "663", "stations-are-solid", "tok");
+  await addTrackedWorktree(canonical, "663", "stations-are-solid");
   expect(await config("--get", "branch.node/663-stations-are-solid.remote")).toBe("origin");
   expect(await config("--get", "branch.node/663-stations-are-solid.merge")).toBe("refs/heads/main");
   expect(gitConfigSnapshot(canonical)).toBe(before);
@@ -64,9 +64,23 @@ describe("gitConfigSnapshot: ranger's own node branches (node #63)", () => {
   await git(["fetch", "origin"]);
   const before = gitConfigSnapshot(canonical, "develop");
   const beforeMain = gitConfigSnapshot(canonical);
-  await bootstrapWorktree(canonical, "70", "on-develop", "tok", undefined, "develop");
+  await addTrackedWorktree(canonical, "70", "on-develop", "develop");
   expect(gitConfigSnapshot(canonical, "develop")).toBe(before);
   expect(gitConfigSnapshot(canonical)).not.toBe(beforeMain);
+ });
+
+ // Node #81: ranger's own worktrees write no tracking lines, whatever the
+ // operator's branch.autoSetup* settings, so the state stays put.
+ test("bootstrapWorktree writes no tracking lines under autoSetupRebase and autoSetupMerge=always", async () => {
+  await config("branch.autoSetupRebase", "always");
+  await config("branch.autoSetupMerge", "always");
+  const before = gitConfigSnapshot(canonical);
+  await bootstrapWorktree(canonical, "663", "stations-are-solid", "tok");
+  await bootstrapWorktree(canonical, "64", "x", "tok", "feature/other");
+  const listed = await config("--list");
+  expect(listed).not.toContain("branch.node/");
+  expect(listed).not.toContain("branch.feature/");
+  expect(gitConfigSnapshot(canonical)).toBe(before);
  });
 
  test("the node-branch pattern matches the branches the worktree code names", () => {
@@ -100,7 +114,7 @@ describe("gitConfigSnapshot: everything else stays in the hash", () => {
   [
    "a node-branch section that gains pushRemote",
    async () => {
-    await bootstrapWorktree(canonical, "663", "x", "tok");
+    await addTrackedWorktree(canonical, "663", "x");
     // The snapshot taken after the branch exists, then the section grows.
     const mid = gitConfigSnapshot(canonical);
     await config("branch.node/663-x.pushRemote", "origin");
@@ -122,6 +136,14 @@ describe("gitConfigSnapshot: everything else stays in the hash", () => {
    async () => {
     await config("branch.node/663-x.remote", "origin");
     await config("branch.node/663-x.merge", "refs/heads/other");
+   },
+  ],
+  [
+   "a node-branch section with a rebase line (autoSetupRebase)",
+   async () => {
+    await config("branch.node/663-x.remote", "origin");
+    await config("branch.node/663-x.merge", "refs/heads/main");
+    await config("branch.node/663-x.rebase", "true");
    },
   ],
   [

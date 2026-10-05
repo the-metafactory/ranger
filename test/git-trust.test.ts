@@ -3,18 +3,19 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCmd } from "../src/exec.ts";
-import { gitConfigSnapshot, gitStateChanges, readGitState } from "../src/git-ops.ts";
+import { gitConfigSnapshot, gitStateChanges, keyLabel, readGitState } from "../src/git-ops.ts";
 import {
  checkKnownGood,
  knownGoodKey,
  recordIfUnchanged,
  recordKnownGood,
+ tamperOutcome,
  trustCurrentGitState,
  trustedSnapshot,
 } from "../src/git-trust.ts";
 import { Journal } from "../src/journal.ts";
 import { bootstrapWorktree } from "../src/worker.ts";
-import { createCanonicalRepo, GIT_ENV } from "./support.ts";
+import { addTrackedWorktree, createCanonicalRepo, GIT_ENV } from "./support.ts";
 
 /** Node #81: a known-good git state that every run compares against. */
 
@@ -61,6 +62,31 @@ describe("readGitState: the hash gates, the entries name", () => {
   expect(JSON.stringify(after.entries)).not.toContain("false");
  });
 
+ test("a key that carries a credential is named by digest, never by its text", async () => {
+  await config("url.https://bot:SECRETTOKEN@github.com/.insteadOf", "https://github.com/");
+  await config("http.https://host/?access_token=QUERYTOKEN.sslVerify", "false");
+  const state = readGitState(canonical);
+  const names = Object.keys(state.entries);
+  expect(JSON.stringify(state)).not.toContain("SECRETTOKEN");
+  expect(JSON.stringify(state)).not.toContain("QUERYTOKEN");
+  expect(names.filter((n) => /^url\.<[0-9a-f]{12}>\.insteadof$/.test(n))).toHaveLength(1);
+  expect(names.filter((n) => /^http\.<[0-9a-f]{12}>\.sslverify$/.test(n))).toHaveLength(1);
+  // Ref-name subsections stay readable.
+  expect(keyLabel("branch.feature/x.remote")).toBe("branch.feature/x.remote");
+  expect(keyLabel("remote.origin.url")).toBe("remote.origin.url");
+ });
+
+ test("two credential keys on one host stay two entries, and a change names exactly one", async () => {
+  await config("url.https://bot:TOKEN_A@github.com/.insteadOf", "https://github.com/a/");
+  await config("url.https://bot:TOKEN_B@github.com/.insteadOf", "https://github.com/b/");
+  const before = readGitState(canonical);
+  expect(Object.keys(before.entries).filter((n) => n.startsWith("url."))).toHaveLength(2);
+  await config("url.https://bot:TOKEN_B@github.com/.insteadOf", "https://evil.example/");
+  const changed = gitStateChanges(before.entries, readGitState(canonical).entries);
+  expect(changed).toEqual([keyLabel("url.https://bot:TOKEN_B@github.com/.insteadof")]);
+  expect(changed.join()).not.toContain("TOKEN");
+ });
+
  test("a removed key is named gone", async () => {
   await config("core.sshCommand", "ssh -i /tmp/k");
   const before = readGitState(canonical);
@@ -82,6 +108,18 @@ describe("checkKnownGood", () => {
   expect(checkKnownGood(journal, canonical, "main", at).kind).toBe("match");
  });
 
+ test("a credential key present at first sight never reaches the journal", async () => {
+  await config("url.https://bot:SECRETTOKEN@github.com/.insteadOf", "https://github.com/");
+  expect(checkKnownGood(journal, canonical, "main", at).kind).toBe("first");
+  await config("url.https://bot:SECRETTOKEN@github.com/.insteadOf", "https://evil.example/");
+  const check = checkKnownGood(journal, canonical, "main", at);
+  expect(check.kind).toBe("mismatch");
+  expect(check.kind === "mismatch" && tamperOutcome(check, canonical, "acme/widgets#1")).toMatch(/url\.<[0-9a-f]{12}>\.insteadof/);
+  trustCurrentGitState(journal, canonical, "main", "acme/widgets");
+  expect(journal.getHealth(knownGoodKey(canonical, "main"))).not.toContain("SECRETTOKEN");
+  for (const event of journal.listEvents("acme/widgets", 500)) expect(JSON.stringify(event)).not.toContain("SECRETTOKEN");
+ });
+
  test("a change since the record is a mismatch naming the key, and is not adopted", async () => {
   checkKnownGood(journal, canonical, "main", at);
   await config("http.sslVerify", "false");
@@ -94,6 +132,13 @@ describe("checkKnownGood", () => {
  });
 
  test("another node's worktree between runs matches (node #63's tracking lines stay out)", async () => {
+  checkKnownGood(journal, canonical, "main", at);
+  await addTrackedWorktree(canonical, "663", "stations-are-solid");
+  expect(checkKnownGood(journal, canonical, "main", at).kind).toBe("match");
+ });
+
+ test("a worktree ranger adds under branch.autoSetupRebase=always between runs matches", async () => {
+  await config("branch.autoSetupRebase", "always");
   checkKnownGood(journal, canonical, "main", at);
   await bootstrapWorktree(canonical, "663", "stations-are-solid", "tok");
   expect(checkKnownGood(journal, canonical, "main", at).kind).toBe("match");
