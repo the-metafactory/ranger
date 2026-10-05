@@ -245,7 +245,7 @@ export function keyLabel(key: string): string {
 /**
  * Read the git state a worker could tamper with: the shared `config` (less
  * ranger's own node-branch tracking, see `configRecords`), per-worktree
- * `config.worktree` files (less git's own copies of the main one, see
+ * `config.worktree` files (less empty ones and git's copies of the main one, see
  * `isWorktreeConfigCopy`), and the hooks directory.
  */
 export function readGitState(canonical: string): GitState {
@@ -289,10 +289,11 @@ export function readGitState(canonical: string): GitState {
   for (const entry of readdirSync(worktrees).sort()) {
    const file = join(worktrees, entry, "config.worktree");
    if (!existsSync(file)) continue;
-   if (mainRecords !== null) {
-    const records = listConfig(file);
-    if (records !== null && isWorktreeConfigCopy(mainRecords, records)) continue;
-   }
+   // An empty file sets what a missing one does; git creates the copy empty,
+   // then writes it, so a read between the two sees one.
+   const records = listConfig(file);
+   if (records !== null && records.length === 0) continue;
+   if (records !== null && mainRecords !== null && isWorktreeConfigCopy(mainRecords, records)) continue;
    add(file);
   }
  }

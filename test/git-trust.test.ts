@@ -237,6 +237,14 @@ describe("per-worktree config: git's copy of the main config.worktree", () => {
   expect(readGitState(canonical).hash).toBe(before.hash);
  });
 
+ test("a linked file caught between git creating it and writing it is left out", async () => {
+  await worktreeConfig();
+  const before = readGitState(canonical);
+  mkdirSync(join(canonical, ".git", "worktrees", "w1"), { recursive: true });
+  writeFileSync(copy("w1"), "");
+  expect(readGitState(canonical).hash).toBe(before.hash);
+ });
+
  test("a copy with a key the main file lacks is named", async () => {
   await worktreeConfig();
   checkKnownGood(journal, canonical, at);
