@@ -11,6 +11,8 @@ import { Journal, openJournal } from "../src/journal.ts";
 import { LAST_IMPLEMENT_MAP, mapKey, pickMap, resumeMap } from "../src/maps.ts";
 import { servedMaps, ServeReader, stateFromJournal } from "../src/serve.ts";
 import { sweepMap } from "../src/sweep.ts";
+import type { GitHubPort } from "../src/github.ts";
+import { walk } from "../src/walk.ts";
 import { fakeDiscord, fixturesBin, runCli } from "./support.ts";
 
 const REPO = "acme/widgets";
@@ -386,6 +388,52 @@ describe("node #47 — map identity", () => {
    expect((await tick()).code).toBe(0);
    expect(r.journal.getWorker("23", REPO)?.root).toBe(1); // empty sibling skipped
   } finally { r.close(); }
+ });
+
+ test("a merge-desk send-back takes its lane before a fresh claim (seelite #691 beat #491 to it, 2026-10-05)", async () => {
+  const r = rig();
+  const saved = { ...process.env };
+  try {
+   Object.assign(process.env, r.env);
+   // Node 40 waits for its merge on root 460; its PR now conflicts with main.
+   // Both maps have a fresh candidate (20, 21) for the same headless lane.
+   r.journal.upsertWorker({ root: 460, nodeId: "40", repo: REPO, status: "awaiting-merge", lane: "implement" });
+   r.journal.updateWorker("40", REPO, { phase: "awaiting-merge", prNumber: 7 });
+   const head = "a".repeat(40);
+   const github = {
+    getPr: async () => ({
+     number: 7, state: "open", merged: false, draft: false, title: "Node 40", headRef: "node/40-x", headSha: head,
+     baseRef: "main", mergeable: false, mergeableState: "dirty", mergeCommitSha: null, mergedBy: null,
+     url: "https://github.com/acme/widgets/pull/7", author: "ivy-bot",
+    }),
+    listComments: async () => [
+     { id: 1, author: "ivy-bot", body: `<!-- ranger:review round=5 sha=${head} blockers=0 majors=0 nits=1 -->\nclean` },
+    ],
+    checkRunsFor: async () => [],
+    issueLabels: async () => [],
+   } as unknown as GitHubPort;
+   const spawned: string[] = [];
+   const result = await walk({
+    config: r.config,
+    configPath: r.configPath,
+    journal: r.journal,
+    github,
+    spawnRunNode: async ({ nodeId }) => {
+     spawned.push(nodeId);
+     return process.pid;
+    },
+   });
+   expect(spawned).toEqual(["40"]); // the send-back, and no fresh worker
+   expect(result.maps.flatMap((m) => m.claimed)).toEqual([]);
+   expect(r.journal.getWorker("40", REPO)).toMatchObject({ status: "running", phase: "review" });
+   expect(r.journal.getWorker("20", REPO)).toBeNull();
+   expect(r.journal.getWorker("21", REPO)).toBeNull();
+   expect(result.maps.map((m) => m.repo + ":" + (m.sweep?.mergeDesk?.resumed ?? []).join(","))).toContain(REPO + ":40");
+  } finally {
+   for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
+   Object.assign(process.env, saved);
+   r.close();
+  }
  });
 
  test("starts in another resource lane do not starve sibling map rotation", async () => {
