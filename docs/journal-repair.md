@@ -104,6 +104,6 @@ Run every step from a `main` checkout (`~/work/mf/ranger`), never from a worktre
 
 ## Keeping it from happening again
 
-- The live wrapper `~/bin/ranger` must `unset RANGER_JOURNAL_PATH RANGER_UNDER_TEST`, and unset `NODE_ENV` when it is `test`, before it execs the CLI, so a live process never inherits a worker session's journal or either test-mode marker. `ops/bin/ranger.example` is the versioned copy.
+- The live wrapper `~/bin/ranger` must start the CLI in a clean environment: only locale, terminal and user names pass through, plus the tokens it resolves and its pinned `HOME`, `PATH` and `GH_CONFIG_DIR`. So a live process never inherits a worker session's `RANGER_JOURNAL_PATH`, `RANGER_UNDER_TEST` or `NODE_ENV`. The same pinning keeps a caller from choosing the bun, the bunfig or any other program that receives the tokens. `ops/bin/ranger.example` is the versioned copy; reinstall it over `~/bin/ranger` after it changes.
 - Run `bun test` from the repo root. Test mode comes from `RANGER_UNDER_TEST`, which the preload in `bunfig.toml` sets, or from `NODE_ENV=test`. Bun reads `bunfig.toml` from the working directory only and gives no other sign of a test run, so `NODE_ENV=production bun test` started elsewhere (or with `--config` pointing at another file) runs without the live-journal fence.
 - Never run `bun src/cli.ts …` from a worktree without `RANGER_JOURNAL_PATH` pointing at a scratch file. The tracked `ranger.yaml` sets no `state.journalPath`, so its default is the live journal.

@@ -1,7 +1,7 @@
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import { expandHome, loadConfig } from "../src/config.ts";
@@ -257,25 +257,106 @@ describe("state.journalPath (node #66)", () => {
 });
 
 describe("the live wrapper (node #66)", () => {
- test("drops the worker journal and both test-mode markers; any other NODE_ENV passes through", async () => {
-  const home = tempDir();
-  const bin = join(home, "bin");
-  mkdirSync(bin);
-  // A stand-in bun that prints the env the CLI would get, and a keychain with nothing in it.
-  const fakeBun = join(bin, "bun");
-  writeFileSync(fakeBun, "#!/bin/sh\nenv\n", { mode: 0o755 });
-  writeFileSync(join(bin, "security"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
-  const wrapper = join(import.meta.dir, "..", "ops", "bin", "ranger.example");
-  const run = async (extra: NodeJS.ProcessEnv) => {
-   const env: NodeJS.ProcessEnv = { HOME: home, PATH: `${bin}:/usr/bin:/bin`, BUN: fakeBun, ...extra };
-   const result = await runCmd("/bin/bash", [wrapper, "tick"], { env });
-   expect(result.code).toBe(0);
-   return result.stdout.split("\n");
-  };
-  const tested = await run({ NODE_ENV: "test", [UNDER_TEST_ENV]: "1", RANGER_JOURNAL_PATH: "/tmp/session/state.sqlite" });
-  expect(tested.some((l) => l.startsWith("NODE_ENV="))).toBe(false);
-  expect(tested.some((l) => l.startsWith(`${UNDER_TEST_ENV}=`))).toBe(false);
-  expect(tested.some((l) => l.startsWith("RANGER_JOURNAL_PATH="))).toBe(false);
-  expect(await run({ NODE_ENV: "production" })).toContain("NODE_ENV=production");
+ // The installed copy with its pinned programs swapped for stand-ins: a bun
+ // that prints its argv and env, and a keychain that answers "kc-<service>".
+ function stubbedWrapper(): { wrapper: string; home: string; evilBin: string } {
+  const root = tempDir();
+  const home = join(root, "home");
+  const stubs = join(root, "stubs");
+  const evilBin = join(root, "evil");
+  for (const dir of [home, stubs, evilBin]) mkdirSync(dir, { recursive: true });
+  writeFileSync(join(stubs, "bun"), '#!/bin/sh\necho "ARGV $*"\nenv\n', { mode: 0o755 });
+  writeFileSync(join(stubs, "security"), '#!/bin/sh\necho "kc-$3"\n', { mode: 0o755 });
+  for (const name of ["bun", "security", "env", "grep", "cut", "mkdir"]) {
+   writeFileSync(join(evilBin, name), "#!/bin/sh\necho HIJACKED\n", { mode: 0o755 });
+  }
+  const source = readFileSync(join(import.meta.dir, "..", "ops", "bin", "ranger.example"), "utf8");
+  for (const pinned of ["/Users/__USER__", "/opt/homebrew/bin/bun", "/usr/bin/security"]) {
+   expect(source).toContain(`"${pinned}`);
+  }
+  const wrapper = join(root, "ranger");
+  writeFileSync(
+   wrapper,
+   source
+    .replaceAll("/Users/__USER__", home)
+    .replaceAll("/opt/homebrew/bin/bun", join(stubs, "bun"))
+    .replaceAll("/usr/bin/security", join(stubs, "security")),
+   { mode: 0o755 },
+  );
+  return { wrapper, home, evilBin };
+ }
+
+ // Run through the shebang (`#!/bin/bash -p`), the way launchd and a worker would.
+ async function run(wrapper: string, env: NodeJS.ProcessEnv, cwd?: string) {
+  const result = await runCmd(wrapper, ["tick", "--config", "ranger.yaml"], { env, cwd });
+  expect(result.code).toBe(0);
+  const lines = result.stdout.split("\n");
+  const vars = new Map(lines.slice(1).filter((l) => l.includes("=")).map((l) => [l.slice(0, l.indexOf("=")), l.slice(l.indexOf("=") + 1)]));
+  return { argv: lines[0] ?? "", vars, stderr: result.stderr, stdout: result.stdout };
+ }
+
+ test("execs the pinned bun with ranger's own bunfig, whatever the caller sets", async () => {
+  const { wrapper, home, evilBin } = stubbedWrapper();
+  const cwd = tempDir();
+  writeFileSync(join(cwd, "bunfig.toml"), 'preload = ["./evil.ts"]\n');
+  const bashEnv = join(cwd, "bash-env.sh");
+  writeFileSync(bashEnv, "echo BASH_ENV-RAN >&2\n");
+  const out = await run(
+   wrapper,
+   {
+    HOME: join(cwd, "evil-home"),
+    PATH: `${evilBin}:/usr/bin:/bin`,
+    BUN: join(evilBin, "bun"),
+    SECURITY: join(evilBin, "security"),
+    BASH_ENV: bashEnv,
+    SHELLOPTS: "xtrace",
+    "BASH_FUNC_exec%%": "() { echo FUNC-HIJACK; }",
+   },
+   cwd,
+  );
+  const ranger = join(home, "work", "mf", "ranger");
+  expect(out.argv).toBe(`ARGV --config=${join(ranger, "bunfig.toml")} ${join(ranger, "src", "cli.ts")} tick --config ranger.yaml`);
+  expect(out.stdout).not.toContain("HIJACKED");
+  expect(out.stdout).not.toContain("FUNC-HIJACK");
+  expect(out.stderr).toBe(""); // no BASH_ENV, no xtrace of the token exports
+  expect(out.vars.get("HOME")).toBe(home);
+  expect(out.vars.get("PATH")?.split(":")).not.toContain(evilBin);
+  expect(out.vars.get("GH_CONFIG_DIR")).toBe(join(home, ".config", "ranger", "gh-config"));
+  expect(out.vars.get("GH_TOKEN")).toBe("kc-ivy-agent");
+  expect(out.vars.get("RANGER_READONLY_GH_TOKEN_PERSONAL")).toBe("kc-ranger-ro-personal");
+  expect([...out.vars.keys()].some((k) => k.startsWith("BASH_FUNC_"))).toBe(false);
+  expect(out.vars.has("SHELLOPTS")).toBe(false);
+ });
+
+ test("the CLI starts in a clean environment: no overrides, no worker journal, no test mode", async () => {
+  const { wrapper } = stubbedWrapper();
+  const out = await run(wrapper, {
+   PATH: "/usr/bin:/bin",
+   TERM: "xterm",
+   BUN_OPTIONS: "--preload=./evil.ts",
+   DYLD_INSERT_LIBRARIES: "/tmp/evil.dylib",
+   GIT_SSH_COMMAND: "evil",
+   CLAUDE_CONFIG_DIR: "/tmp/evil-claude",
+   XDG_CONFIG_HOME: "/tmp/evil-xdg",
+   RANGER_WORKER_CMD: "evil",
+   RANGER_SAGE_CMD: "evil",
+   RANGER_JOURNAL_PATH: "/tmp/session/state.sqlite",
+   [UNDER_TEST_ENV]: "1",
+   NODE_ENV: "production",
+   // The wrapper's own names: a caller-exported one must not survive into the CLI.
+   KEEP: " BUN_OPTIONS ",
+   PASS_THROUGH: " BUN_OPTIONS ",
+   gh_token: "caller",
+   GH_TOKEN: "ghp_caller", // a token the caller already holds still wins
+  });
+  const allowed = new Set([
+   "HOME", "PATH", "GH_CONFIG_DIR", "TERM", "PWD", "SHLVL", "_",
+   "GH_TOKEN", "RANGER_WRITE_GH_TOKEN_METAFACTORY", "RANGER_WRITE_GH_TOKEN_PERSONAL",
+   "RANGER_READONLY_GH_TOKEN_METAFACTORY", "RANGER_READONLY_GH_TOKEN_PERSONAL", "RANGER_DISCORD_TOKEN",
+  ]);
+  expect([...out.vars.keys()].filter((k) => !allowed.has(k))).toEqual([]);
+  expect(out.vars.get("TERM")).toBe("xterm");
+  expect(out.vars.get("GH_TOKEN")).toBe("ghp_caller");
+  expect(out.vars.get("RANGER_WRITE_GH_TOKEN_METAFACTORY")).toBe("kc-ivy-agent");
  });
 });
