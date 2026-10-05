@@ -62,7 +62,7 @@ import { type FrontierEntry, graphFrontier, RateLimitError } from "./graph.ts";
 import { runCmd } from "./exec.ts";
 import { classify, classifyFrontier, type ClassifiedNode, loadProbeRegistry } from "./route.ts";
 import { liveSession, substrateUsageViews, type SubstrateUsageView } from "./substrate-usage.ts";
-import { assertReadOnlyToken, gatedEnv, tokenBatch, type TokenBatch } from "./token-gate.ts";
+import { resolveReadOnlyToken, assertReadOnlyToken, gatedEnv, tokenBatch, type TokenBatch } from "./token-gate.ts";
 import { childEnv, itermArgv, shellQuote } from "./launch.ts";
 import {
  type ActionKind,
@@ -1549,17 +1549,58 @@ export const spawnAction: ActionRunner = (argv, env, opts) =>
 
 const ACTION_TIMEOUT_MS = 120_000;
 
+/**
+ * Every served repo's read-only token must be set before the dashboard
+ * listens. Started outside `~/bin/ranger` (which exports them from the
+ * keychain), a dashboard used to come up and show "the read failed" on every
+ * PR of a repo whose token was missing (2026-10-05); it now refuses to
+ * start, naming each missing token.
+ */
+export function assertReadOnlyTokens(
+ config: RangerConfig,
+ maps: { repo: string }[],
+ env: NodeJS.ProcessEnv = process.env,
+): void {
+ const unset = new Map<string, string[]>(); // token env -> the repos that need it
+ const other: string[] = [];
+ for (const repo of [...new Set(maps.map((m) => m.repo))]) {
+  try {
+   resolveReadOnlyToken(config, repo, env);
+  } catch (error) {
+   const message = error instanceof Error ? error.message : String(error);
+   const name = /read-only token env (\S+) is unset/.exec(message)?.[1];
+   if (name === undefined) other.push(message);
+   else unset.set(name, [...(unset.get(name) ?? []), repo]);
+  }
+ }
+ const lines = [
+  ...[...unset].map(
+   ([name, repos]) =>
+    `read-only token env ${name} is unset (needed for ${repos.join(", ")}) — refusing to fall back to the gh keyring, which is write-capable`,
+  ),
+  ...other,
+ ];
+ if (lines.length > 0) {
+  throw new Error(
+   `${lines.join("\n")}\nStart the dashboard through ~/bin/ranger serve, which exports the read-only tokens from the keychain.`,
+  );
+ }
+}
+
 export function startServe(opts: {
  config: RangerConfig;
  /** The ranger.yaml this was loaded from; `resume-node` and `build-now` are run with the same one. */
  configPath?: string;
  port?: number;
  open?: boolean;
+ /** The environment the read-only tokens are read from (tests pass their own). */
+ env?: NodeJS.ProcessEnv;
 }): { url: string; stop: () => void } {
  const serve = serveConfig(opts.config);
  const port = opts.port ?? serve.port;
  const token = randomBytes(24).toString("hex");
  const maps = servedMaps(opts.config);
+ assertReadOnlyTokens(opts.config, maps, opts.env);
  const reader = new ServeReader(
   opts.config,
   maps,
