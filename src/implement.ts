@@ -483,17 +483,18 @@ async function probeMergeBase(
 }
 
 /**
- * Tell the map's channel once per merge base and probe set that the base is
- * red: every later branch off it would otherwise fail the same probes. Best
+ * Tell the map's channel once per map, merge base and probe set that the base
+ * is red: every later branch off it would otherwise fail the same probes. The
+ * run was at the merge base, not the base's tip, so the notice says so. Best
  * effort; the probe record on the PR is the durable trace.
  */
 async function announceBaseRed(ctx: ImplementContext, sha: string, red: string[]): Promise<void> {
- const key = `base-red.${ctx.map.repo}.${sha}.${[...red].sort().join(",")}`;
+ const key = `base-red.${mapKey(ctx.map)}.${sha}.${[...red].sort().join(",")}`;
  if (ctx.journal.getHealth(key) !== null) return;
  const text = [
-  `:ranger: **${ctx.map.base} is red** at \`${sha.slice(0, 8)}\` on ${red.join(", ")}`,
+  `:ranger: **${ctx.map.base} was red** at \`${sha.slice(0, 8)}\` on ${red.join(", ")}`,
   `map: ${mapKey(ctx.map)}`,
-  `Node #${ctx.node.ref.id} failed these probes twice, and they fail at its merge base too. Branches off this base do not gate on them; ${ctx.map.base} needs a fix.`,
+  `Node #${ctx.node.ref.id} failed these probes twice, and they fail at its merge base too. Branches off this commit do not gate on them. Unless a later ${ctx.map.base} commit already fixed them, ${ctx.map.base} needs a fix.`,
  ].join("\n");
  try {
   await (ctx.announce ?? ((t: string) => DiscordAnnouncer.fromMap(ctx.map).post(t, "base-red notice")))(text);

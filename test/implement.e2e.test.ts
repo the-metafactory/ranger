@@ -694,7 +694,7 @@ describe("implement lane (node #23)", () => {
   expect(probe?.body).toContain("result=pass selected=2 mode=semantic base-red=probe-hud.mjs -->");
   expect(r.github.prs.get(1)?.body).toContain("Not gating: probe-hud.mjs failed here and fail at the merge base too.");
   expect(r.announced).toHaveLength(1);
-  expect(r.announced[0]).toContain("**main is red**");
+  expect(r.announced[0]).toContain("**main was red**");
   expect(r.announced[0]).toContain("probe-hud.mjs");
   const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
   expect(events.some((d) => d.includes("probe-hud.mjs fail at the merge base"))).toBe(true);
