@@ -99,6 +99,12 @@ describe("checkKnownGood", () => {
   expect(checkKnownGood(journal, canonical, "main", at).kind).toBe("match");
  });
 
+ test("a worktree on a probe-named branch (not node/<N>-<slug>) between runs matches", async () => {
+  checkKnownGood(journal, canonical, "main", at);
+  await bootstrapWorktree(canonical, "64", "x", "tok", "feature/other", "main");
+  expect(checkKnownGood(journal, canonical, "main", at).kind).toBe("match");
+ });
+
  test("records reordered across keys still mismatch, as record order", async () => {
   await config("aaa.one", "1");
   await config("zzz.two", "2");

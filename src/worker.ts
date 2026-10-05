@@ -9,6 +9,7 @@ import { runCmd, type RunOptions } from "./exec.ts";
 import {
  fastForwardCanonical,
  assertGitUntouched,
+ NODE_BRANCH,
  readGitState,
  safeGit,
  GitSafetyError,
@@ -215,10 +216,16 @@ export async function bootstrapWorktree(
   ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`],
   { cwd: canonical, timeoutMs: 10_000 },
  );
+ // A branch a probe names (not `node/<N>-<slug>`) gets no tracking lines: the
+ // tamper state leaves out only node branches' (node #63), so they would read
+ // as a change to the shared config at the next known-good check (node #81).
+ // Ranger's git calls name their refs and never use the upstream.
  const args =
   existing.code === 0
    ? ["worktree", "add", dir, branch]
-   : ["worktree", "add", dir, "-b", branch, `origin/${base}`];
+   : NODE_BRANCH.test(branch)
+    ? ["worktree", "add", dir, "-b", branch, `origin/${base}`]
+    : ["worktree", "add", "--no-track", dir, "-b", branch, `origin/${base}`];
  // worktree add fires post-checkout; safeGit keeps a planted hook from
  // running with the supervisor's credentials.
  const result = await safeGit(args, {
