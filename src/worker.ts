@@ -27,9 +27,12 @@ import { FencedError, type Journal } from "./journal.ts";
 import { assembleResearchPrompt } from "./prompt.ts";
 import { IMPLEMENT_KINDS } from "./route.ts";
 import {
+ hookStopReason,
  markSubstrateCapped,
+ describeWorkerModel,
  selectSubstrate,
  workerCommandFor,
+ workerModelFor,
  type CapSignal,
  type QuotaReading,
  type SubstrateName,
@@ -43,6 +46,7 @@ import { isTransientGitHubError } from "./transient.ts";
 import * as githubApi from "./github.ts";
 import type { GitHubPort } from "./github.ts";
 import { ParkSignal } from "./signals.ts";
+import { policyBlockedOutcome } from "./outcomes.ts";
 import { assertResearchFindingsOnly, researchCi, type ResearchCiTiming } from "./research-ci.ts";
 
 export { gitAuthEnv } from "./git-ops.ts";
@@ -102,6 +106,11 @@ export interface RunNodeContext {
  /** For tests: the quota readers (with an injected worker, reviewer or command and none injected, reads fail closed). */
  substrateReaders?: SubstrateReaders;
  viewsDependencies?: ImplementContext["viewsDependencies"];
+ /** Probe-tier host load, quiet-host wait and channel post (tests inject them). */
+ hostLoad?: ImplementContext["hostLoad"];
+ quietHost?: ImplementContext["quietHost"];
+ announce?: ImplementContext["announce"];
+ mergeablePoll?: ImplementContext["mergeablePoll"];
 }
 
 /** The canonical checkout dir for a repo (design §4: probes run there). */
@@ -493,7 +502,7 @@ function ratifyFor(
 }
 
 /** What every implement session of a node shares; runSession adds the substrate. */
-type SessionScope = Omit<ImplementContext, "workerRun" | "substrate" | "excludedSubstrates">;
+type SessionScope = Omit<ImplementContext, "workerRun" | "substrate" | "model" | "excludedSubstrates">;
 
 /**
  * One worker session (node #45): select its substrate (leaving out those
@@ -512,11 +521,17 @@ async function runSession(
    ? await selectBuildSubstrate(ctx, capped)
    : { substrate: undefined, chosenOn: "RANGER_WORKER_CMD override; its heads count as Pi-written" };
  const workerCmd = envCmd ?? resolveWorkerCommand(ctx, substrate as SubstrateName, session.canonical);
+ // The pinned model (node #60), only when ranger built the command from its
+ // config: an operator's or a test's command carries no model ranger knows.
+ const model =
+  envCmd === undefined && ctx.workerCommand === undefined && substrate !== undefined
+   ? workerModelFor(substrate, ctx.config)
+   : null;
  journal.updateWorker(nodeId, session.map.repo, { substrate: substrate ?? null });
  journal.recordEvent("worker-start", {
   nodeId,
   repo: session.map.repo,
-  detail: `substrate ${substrate ?? "unknown"} (${chosenOn}), command: ${workerCmd[0]}`.slice(0, 400),
+  detail: `substrate ${substrate ?? "unknown"}${model === null ? "" : ` (${describeWorkerModel(model)})`} (${chosenOn}), command: ${workerCmd[0]}`.slice(0, 400),
  });
  return runImplement({
   ...session,
@@ -524,6 +539,7 @@ async function runSession(
    ctx.worker ??
    ((p: string, opts: RunOptions) => runCmd(workerCmd[0], [...workerCmd.slice(1), p], opts)),
   substrate,
+  model: model?.model,
   excludedSubstrates: capped,
  });
 }
@@ -580,6 +596,10 @@ async function runImplementNode(
   github: ctx.github,
   reviewer: ctx.reviewer,
   viewsDependencies: ctx.viewsDependencies,
+  hostLoad: ctx.hostLoad,
+  quietHost: ctx.quietHost,
+  announce: ctx.announce,
+  mergeablePoll: ctx.mergeablePoll,
   substrateReaders: resolveReaders(ctx),
  };
  const capped = new Set<SubstrateName>();
@@ -756,6 +776,10 @@ async function runResearch(
   });
   journal.updateWorker(nodeId, repo, { workerPgid: null });
   const log = saveWorkerLog(journal.path, repo, nodeId, generation, "research pass", workerResult);
+  const stopped = hookStopReason(workerResult.stdout);
+  if (stopped !== null) {
+   throw new ParkSignal(policyBlockedOutcome({ pass: "research pass", reason: stopped, log }));
+  }
 
   if (workerResult.code !== 0) {
    const detail = `worker exited ${workerResult.code}: ${workerResult.stderr.trim() || workerResult.stdout.trim().slice(0, 500)} (worker log: ${log})`;

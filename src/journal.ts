@@ -815,7 +815,14 @@ export class Journal {
   * applies.
   */
  startSubstrateSession(
-  scope: { substrate: SubstrateName; kind: SessionKind; repo: string; nodeId: string; generation: number },
+  scope: {
+   substrate: SubstrateName;
+   kind: SessionKind;
+   repo: string;
+   nodeId: string;
+   generation: number;
+   model?: string | null;
+  },
   now = new Date(),
  ): number {
   const at = now.toISOString();
@@ -870,11 +877,11 @@ export class Journal {
  listSubstrateSessions(since: Date): SubstrateSessionRow[] | null {
   return withoutSessionsTable(() => {
    const recent = this.db
-    .select()
+    .select(SESSION_COLUMNS)
     .from(substrateSessions)
     .where(gt(substrateSessions.startedAt, since.toISOString()))
     .all();
-   const open = this.db.select().from(substrateSessions).where(isNull(substrateSessions.endedAt)).all();
+   const open = this.db.select(SESSION_COLUMNS).from(substrateSessions).where(isNull(substrateSessions.endedAt)).all();
    const byId = new Map([...recent, ...open].map((row) => [row.id, row]));
    return [...byId.values()].sort((a, b) => a.id - b.id);
   });
@@ -885,7 +892,7 @@ export class Journal {
   return (
    withoutSessionsTable(() =>
     this.db
-     .select()
+     .select(SESSION_COLUMNS)
      .from(substrateSessions)
      .where(eq(substrateSessions.substrate, substrate))
      .orderBy(desc(substrateSessions.startedAt), desc(substrateSessions.id))
@@ -915,6 +922,23 @@ export class Journal {
   this.closeDb();
  }
 }
+
+/**
+ * The columns a session read returns. Named rather than `select()`: `ranger
+ * serve` reads without migrating, and a journal from before the `model`
+ * column (node #60) still has every one of these.
+ */
+const SESSION_COLUMNS = {
+ id: substrateSessions.id,
+ substrate: substrateSessions.substrate,
+ kind: substrateSessions.kind,
+ repo: substrateSessions.repo,
+ nodeId: substrateSessions.nodeId,
+ generation: substrateSessions.generation,
+ startedAt: substrateSessions.startedAt,
+ endedAt: substrateSessions.endedAt,
+ outcome: substrateSessions.outcome,
+};
 
 /** Session rows are kept a month: the panel's widest window is 7 days. */
 const SESSION_RETENTION_DAYS = 30;

@@ -223,6 +223,18 @@ const PiSubstrateSchema = z.object({
  model: z.string().min(1).default("longctx-think"),
 });
 
+/** Plain model names only: nothing shell- or TOML-like reaches the argv. */
+const MODEL_NAME = /^[A-Za-z0-9._-]+$/;
+
+/**
+ * The model ranger's Codex sessions run (node #60): pinned here rather than
+ * inherited from the principal's own ~/.codex/config.toml.
+ */
+const CodexSubstrateSchema = z.object({
+ model: z.string().regex(MODEL_NAME, "a plain model name ([A-Za-z0-9._-])").default("gpt-6.1-sol"),
+ reasoningEffort: z.enum(["low", "medium", "high"]).default("high"),
+});
+
 /**
  * Substrate selection (node #45): which of Claude, Codex and Pi runs an
  * implement session, fix pass or sage review, by remaining 5h/7d quota.
@@ -236,6 +248,8 @@ const SubstratesSchema = z.object({
  claudeProbeMaxAgeMin: z.number().int().positive().default(15),
  /** Codex reading max age, minutes (default 5). */
  codexReadMaxAgeMin: z.number().int().positive().default(5),
+ /** Codex substrate configuration: the model and reasoning effort a worker runs. */
+ codex: CodexSubstrateSchema.default({}),
  /** Pi substrate configuration. */
  pi: PiSubstrateSchema.default({}),
 });

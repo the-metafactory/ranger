@@ -195,6 +195,29 @@ describe("node #57/#47 — root-aware resource lanes", () => {
   } finally { r.close(); }
  });
 
+ test("node #58: build-now claims one node through the CLI; a held lane needs --force", async () => {
+  const r = rig();
+  try {
+   // RANGER_NO_SPAWN: claimed, no run-node — exit 3, never reported as a start.
+   const first = await runCli(["build-now", "20", "--map", `${TOOL}#1`, "-c", r.configPath], r.env);
+   expect(first.code).toBe(3);
+   expect(first.stderr).toMatch(/claimed #20 but no run-node was started — `ranger run-node 20 --map /);
+   expect(JSON.parse(first.stdout)).toMatchObject({ nodeId: "20", lane: "implement", beside: null });
+   expect(r.journal.getWorker("20", TOOL)).toMatchObject({ status: "claimed", lane: "implement" });
+   expect(r.journal.spawnsToday()).toBe(1);
+   const held = await runCli(["build-now", "21", "--map", TOOL, "-c", r.configPath], r.env);
+   expect(held.code).toBe(1);
+   expect(held.stderr).toMatch(/headless implement lane is held by #20.*--force/);
+   expect(r.journal.getWorker("21", TOOL)).toBeNull();
+   const beside = await runCli(["build-now", "21", "--map", TOOL, "--force", "-c", r.configPath], r.env);
+   expect(beside.code).toBe(3);
+   expect(JSON.parse(beside.stdout).beside).toMatchObject({ nodeId: "20" });
+   const off = await runCli(["build-now", "99", "--map", TOOL, "-c", r.configPath], r.env);
+   expect(off.code).toBe(1);
+   expect(off.stderr).toMatch(/not on the map's frontier/);
+  } finally { r.close(); }
+ });
+
  test("merge desk waits only for the map's resource capacity", async () => {
   const r = rig();
   try {

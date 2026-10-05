@@ -10,7 +10,7 @@ import type { SubstrateName } from "./store/schema.ts";
 
 export const STRONG_SUBSTRATES: SubstrateName[] = ["claude", "codex"];
 
-export type SubstrateConfig = Omit<RangerConfig["substrates"], "pi">;
+export type SubstrateConfig = Omit<RangerConfig["substrates"], "pi" | "codex">;
 
 export interface SelectionInput {
  readings: SubstrateReading[];

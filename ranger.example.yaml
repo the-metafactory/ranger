@@ -162,6 +162,14 @@ substrates:
   claudeProbeMaxAgeMin: 15
   # Codex reading max age, minutes. A stale reading triggers an app-server read.
   codexReadMaxAgeMin: 5
+  # Codex worker model (node #60): pinned here, so a change to your own
+  # ~/.codex/config.toml never changes a ranger build. Passed as
+  # `codex exec --model <model> -c model_reasoning_effort="<effort>"`.
+  # Defaults apply when the block is left out. Sage's own Codex reviews read
+  # sage's config (~/.config/sage/config.json), not this block.
+  codex:
+    model: gpt-6.1-sol          # a plain model name: [A-Za-z0-9._-]
+    reasoningEffort: high       # low | medium | high
   # Pi substrate configuration.
   pi:
     provider: spark
