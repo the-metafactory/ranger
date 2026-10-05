@@ -154,7 +154,9 @@ function configRecords(file: string, base: string): Buffer | string {
     const parsed = branchKey(key);
     return parsed === null || !own.has(parsed.name);
    })
-   .map(({ key, value }) => (value === null ? key : `${key}=${value}`)),
+   // [key, value] tuples, never "key=value": a key may hold "=" (a url.<x>
+   // subsection), so a joined string lets two different records collide.
+   .map(({ key, value }) => [key, value]),
  );
 }
 

@@ -189,6 +189,24 @@ describe("gitConfigSnapshot: everything else stays in the hash", () => {
   expect(() => assertGitUntouched(canonical, one)).toThrow(GitSafetyError);
  });
 
+ // A subsection may hold "=": these two records join to the same
+ // "key=value" string, yet only the second rewrites GitHub URLs.
+ test("moving '=' between a url subsection and its insteadOf value changes the snapshot", () => {
+  const file = join(canonical, ".git", "config");
+  const original = readFileSync(file, "utf8");
+  writeFileSync(
+   file,
+   `${original}[url "https://github.com"]\n\tinsteadOf = @evil.example/.insteadof=https://github.com/\n`,
+  );
+  const one = gitConfigSnapshot(canonical);
+  writeFileSync(
+   file,
+   `${original}[url "https://github.com.insteadof=@evil.example/"]\n\tinsteadOf = https://github.com/\n`,
+  );
+  expect(gitConfigSnapshot(canonical)).not.toBe(one);
+  expect(() => assertGitUntouched(canonical, one)).toThrow(GitSafetyError);
+ });
+
  test("an unparseable config is hashed raw: two different broken files differ", () => {
   const file = join(canonical, ".git", "config");
   writeFileSync(file, "[core\n\tbare = false\n");
