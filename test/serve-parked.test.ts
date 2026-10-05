@@ -19,6 +19,7 @@ import { assembleState, createHandler, DETAIL_CONCURRENCY, renderPage, ServeRead
 import {
  type ActionRunner,
  checkRunsFromPages,
+ workflowRunsFromPages,
  ciState,
  classifyReason,
  mergeRefusal,
@@ -324,6 +325,17 @@ describe("node #54 — CI, by the merge gate's rules", () => {
   expect(checkRunsFromPages([{ check_runs: [done("success")] }, { message: "Bad gateway" }])).toBeNull();
   expect(checkRunsFromPages({ check_runs: [] })).toBeNull();
   expect(checkRunsFromPages(null)).toBeNull();
+ });
+ test("workflow runs stand in for check runs: latest per workflow and event, and only for the head asked about", () => {
+  const sha = "a".repeat(40);
+  const run = (id: number, workflow: number, conclusion: string | null, status = "completed", head = sha) =>
+   ({ id, workflow_id: workflow, event: "pull_request", head_sha: head, status, conclusion });
+  // workflow 10 failed, then a rerun passed; workflow 11 is still running
+  expect(workflowRunsFromPages([{ total_count: 3, workflow_runs: [run(1, 10, "failure"), run(2, 10, "success"), run(3, 11, null, "in_progress")] }], sha))
+   .toEqual([{ status: "completed", conclusion: "success" }, { status: "in_progress", conclusion: null }]);
+  expect(workflowRunsFromPages([{ workflow_runs: [run(1, 10, "success", "completed", "b".repeat(40))] }], sha)).toBeNull();
+  expect(workflowRunsFromPages([{ message: "Resource not accessible by personal access token" }], sha)).toBeNull();
+  expect(workflowRunsFromPages(null, sha)).toBeNull();
  });
 });
 

@@ -257,6 +257,30 @@ export function checkRunsFromPages(raw: unknown): { status: string; conclusion: 
  return runs;
 }
 
+/**
+ * The latest workflow run per workflow and event for `sha`, read off a
+ * slurped `actions/runs?head_sha=` listing: the CI a fine-grained read-only
+ * token can see on a private repository, which grants no Checks permission
+ * (2026-10-05: seelite's dashboard read every PR's CI as unreadable). Null on
+ * any malformed page or a run for another head.
+ */
+export function workflowRunsFromPages(raw: unknown, sha: string): { status: string; conclusion: string | null }[] | null {
+ if (!Array.isArray(raw)) return null;
+ const latest = new Map<string, { id: number; status: string; conclusion: string | null }>();
+ for (const page of raw) {
+  const list = (page as { workflow_runs?: unknown } | null)?.workflow_runs;
+  if (!Array.isArray(list)) return null;
+  for (const r of list as Record<string, unknown>[]) {
+   if (r?.head_sha !== sha) return null;
+   const run = { id: Number(r.id), status: String(r.status ?? ""), conclusion: typeof r.conclusion === "string" ? r.conclusion : null };
+   const key = `${String(r.workflow_id)}:${String(r.event)}`;
+   const seen = latest.get(key);
+   if (seen === undefined || seen.id < run.id) latest.set(key, run);
+  }
+ }
+ return [...latest.values()].map(({ status, conclusion }) => ({ status, conclusion }));
+}
+
 /** Why a PR cannot be merged from the dashboard, or null when it can. */
 export function mergeRefusal(pr: PrView | null): string | null {
  if (pr === null) return "the PR has not been read yet";

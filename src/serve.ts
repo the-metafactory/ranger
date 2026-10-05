@@ -68,6 +68,7 @@ import {
  type ActionKind,
  type ActionRunner,
  checkRunsFromPages,
+ workflowRunsFromPages,
  ciState,
  needsYouEntries,
  type NeedsYouEntry,
@@ -1318,7 +1319,8 @@ export async function readPrLive(
  const terminal = raw.state === "closed" || raw.merged === true;
  // Every page: a failure on page two must not read as green. A closed or
  // merged PR offers no action its checks could gate, so they are not read.
- const checks = !terminal && /^[0-9a-f]{40}$/.test(headSha)
+ const readable = !terminal && /^[0-9a-f]{40}$/.test(headSha);
+ let checks = readable
   ? checkRunsFromPages(
      await restRead(tokens, repo, `repos/${repo}/commits/${headSha}/check-runs?filter=latest&per_page=100`, [
       "--paginate",
@@ -1326,6 +1328,14 @@ export async function readPrLive(
      ]),
     )
   : null;
+ // A fine-grained read-only token gets no Checks permission on a private
+ // repository; its workflow runs (Actions: read) carry the same CI.
+ if (readable && checks === null) {
+  checks = workflowRunsFromPages(
+   await restRead(tokens, repo, `repos/${repo}/actions/runs?head_sha=${headSha}&per_page=100`, ["--paginate", "--slurp"]),
+   headSha,
+  );
+ }
  return {
   number,
   url: typeof raw.html_url === "string" ? raw.html_url : `https://github.com/${repo}/pull/${number}`,
