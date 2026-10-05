@@ -32,7 +32,7 @@ import {
  * It refuses everything the walk would not take, before any announce or
  * claim: a paused run, a node off the frontier, one that does not route to
  * the implement or research lane as walkable (HITL, provisioning, skip-listed,
- * off the allowlist, authored by the bot — node #9), a vetoed node, one
+ * off the allowlist, a `propose` node authored by the bot — node #9), a vetoed node, one
  * already in flight, an exhausted daily spawn cap, and, without `--force`, a
  * held implement lane. With `--force` it starts beside the holder; nothing
  * forces a HITL node.

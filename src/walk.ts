@@ -96,6 +96,10 @@ export async function spawnRunNodeDetached(
    env: process.env,
   },
  );
+ // A spawn that fails (ENOENT, EACCES) has no pid and emits `error` later;
+ // unhandled, that error would kill the caller after its `claimed` row.
+ // The null pid is the caller's signal that no worker started.
+ child.on("error", () => {});
  child.unref();
  return child.pid ?? null;
 }
