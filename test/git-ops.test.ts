@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { runCmd } from "../src/exec.ts";
 import {
  assertCheckoutOf,
@@ -75,8 +75,27 @@ describe("gitConfigSnapshot: ranger's own node branches (node #63)", () => {
   expect(gitConfigSnapshot(canonical)).toBe(before);
  });
 
+ // Sage round 2 on node #86: git takes non-ASCII branch names.
+ test("a branch tracking a non-ASCII map base is left out too", async () => {
+  await git(["push", "origin", "HEAD:refs/heads/release/été"]);
+  await git(["fetch", "origin"]);
+  const before = gitConfigSnapshot(canonical);
+  await addTrackedWorktree(canonical, "72", "on-release", "release/été");
+  expect(await config("--get", "branch.node/72-on-release.merge")).toBe("refs/heads/release/été");
+  expect(gitConfigSnapshot(canonical)).toBe(before);
+ });
+
  test("a node branch tracking anything but a branch under refs/heads stays in the hash", async () => {
-  for (const merge of ["refs/tags/v1", "refs/heads/../x", "main"]) {
+  for (const merge of [
+   "refs/tags/v1",
+   "refs/heads/../x",
+   "main",
+   "refs/heads/.x",
+   "refs/heads/x.lock",
+   "refs/heads/a b",
+   "refs/heads/a//b",
+   "refs/heads/-x",
+  ]) {
    const before = gitConfigSnapshot(canonical);
    await config("branch.node/71-x.remote", "origin");
    await config("branch.node/71-x.merge", merge);
@@ -391,6 +410,18 @@ describe("assertCheckoutOf: credentialed calls run only against the vetted .git"
   writeFileSync(join(canonical, ".git", "commondir"), `${join(attacker, ".git")}\n`);
   await expect(fastForwardCanonical(canonical, "main", "placeholder", { attempts: 1 })).rejects.toThrow(/not the vetted/);
   await expect(bootstrapWorktree(canonical, "86", "x", "placeholder")).rejects.toThrow(/not the vetted/);
+ });
+
+ // Sage round 2 on node #86: a path may hold a newline, and the first line
+ // of a common dir named `<canonical>/.git\n<canonical>/.git` is the vetted one.
+ test("a commondir whose path embeds the vetted .git after a newline refuses the fetch", async () => {
+  const vetted = join(canonical, ".git");
+  const foreign = `${vetted}\n${vetted}`;
+  mkdirSync(dirname(foreign), { recursive: true });
+  renameSync(join(attacker, ".git"), foreign);
+  writeFileSync(join(vetted, "commondir"), `${foreign}\n`);
+  expect(() => assertCheckoutOf(canonical, canonical)).toThrow(/not the vetted/);
+  await expect(fastForwardCanonical(canonical, "main", "placeholder", { attempts: 1 })).rejects.toThrow(/not the vetted/);
  });
 
  test("a credentialed call that names no canonical checkout is refused", () => {

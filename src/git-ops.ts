@@ -121,7 +121,7 @@ export function assertCheckoutOf(cwd: string, canonical: string): void {
   ],
   { cwd, env: minimalGitEnv(), encoding: "utf8", timeout: 10_000 },
  );
- const [common, gitDir] = got.error === undefined && got.status === 0 ? got.stdout.split("\n") : [];
+ const [common, gitDir] = got.error === undefined && got.status === 0 ? gitDirLines(got.stdout) : [];
  const vetted = realPath(join(canonical, ".git"));
  const commonReal = realPath(common);
  const gitDirReal = realPath(gitDir);
@@ -137,6 +137,19 @@ export function assertCheckoutOf(cwd: string, canonical: string): void {
    `refusing a credentialed git call in ${cwd}: git there uses ${gitDirReal ?? "no repository"} (common dir ${commonReal ?? "none"}), not the vetted ${join(canonical, ".git")}`,
   );
  }
+}
+
+/**
+ * `rev-parse`'s two paths, or none unless the output is exactly two nonempty
+ * lines each ending in one newline. A path may hold a newline: a common dir
+ * named `<canonical>/.git\n<canonical>/.git` printed its first line as the
+ * vetted directory, so a split that kept the first two lines accepted a
+ * foreign repository (sage round 2 on node #86).
+ */
+function gitDirLines(stdout: string): [string, string] | [] {
+ const lines = stdout.split("\n");
+ if (lines.length !== 3 || lines[2] !== "" || lines[0] === "" || lines[1] === "") return [];
+ return [lines[0], lines[1]];
 }
 
 /** A path with every symlink resolved; null when it is empty or not there. */
@@ -221,8 +234,7 @@ function configRecords(
    entries.length === 2 &&
    merge.length === 1 &&
    merge[0].value !== null &&
-   TRACKED_HEAD.test(merge[0].value) &&
-   !merge[0].value.includes("..");
+   isTrackedHead(merge[0].value);
   if (tracksOrigin && (midWrite || complete)) own.add(name);
  }
  const kept = records
@@ -235,8 +247,22 @@ function configRecords(
  return { bytes: JSON.stringify(kept), records: kept, worktreeConfig: worktreeConfigEnabled(body) };
 }
 
-/** A tracking target ranger's node branches may carry: a branch under refs/heads/. */
-const TRACKED_HEAD = /^refs\/heads\/[A-Za-z0-9_][A-Za-z0-9._/-]*$/;
+/**
+ * A tracking target ranger's node branches may carry: a branch under
+ * refs/heads/ by git's own ref-name rules (`git check-ref-format --branch`,
+ * refs.c `check_refname_component`), so a base such as `release/été` is one.
+ * No control byte, space, `~^:?*[\`, `..` or `@{`; no empty component, none
+ * starting with `.` or ending in `.lock`; no trailing `.`, not `@`, and no
+ * leading `-`.
+ */
+function isTrackedHead(ref: string): boolean {
+ const prefix = "refs/heads/";
+ if (!ref.startsWith(prefix)) return false;
+ const name = ref.slice(prefix.length);
+ if (name === "" || name === "@" || name.startsWith("-") || name.endsWith(".")) return false;
+ if (name.includes("..") || name.includes("@{") || /[\x00-\x20\x7f~^:?*[\\]/.test(name)) return false;
+ return name.split("/").every((c) => c !== "" && !c.startsWith(".") && !c.endsWith(".lock"));
+}
 
 /** A config file's `[key, value]` records; a valueless boolean key has a null value. */
 type Records = [string, string | null][];
@@ -521,7 +547,11 @@ export function readGitState(canonical: string): GitState {
  } else {
   noteIncludes(config, listed.records);
   const byKey = new Map<string, (string | null)[]>();
-  for (const [key, value] of listed.records) byKey.set(key, [...(byKey.get(key) ?? []), value]);
+  for (const [key, value] of listed.records) {
+   const values = byKey.get(key);
+   if (values === undefined) byKey.set(key, [value]);
+   else values.push(value);
+  }
   for (const [key, values] of byKey) entries[keyLabel(key)] = digest(JSON.stringify(values));
  }
  const mainWorktreeConfig = join(gitDir, "config.worktree");
