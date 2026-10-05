@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { runCmd } from "../src/exec.ts";
 import { gitConfigSnapshot, gitStateChanges, keyLabel, readGitState } from "../src/git-ops.ts";
@@ -368,7 +368,33 @@ describe("included config files", () => {
   }
  });
 
- test("a relative include in the main config.worktree: a worktree ranger adds matches, a target planted beside its copy does not", async () => {
+ test("a UTF-8 include path names the file git reads, and an edit to it is named", async () => {
+  writeFileSync(join(gitDir(), "vérifié.conf"), "[core]\n\tfilemode = false\n");
+  await config("include.path", "vérifié.conf");
+  checkKnownGood(journal, canonical, at);
+  writeFileSync(join(gitDir(), "vérifié.conf"), "[http]\n\tsslVerify = false\n");
+  const check = checkKnownGood(journal, canonical, at);
+  expect(check.kind).toBe("mismatch");
+  expect(check.kind === "mismatch" && check.changed).toHaveLength(1);
+  expect(check.kind === "mismatch" && check.changed[0]).toMatch(includeName);
+ });
+
+ test("a ~user/ include is resolved as git resolves it; one git cannot expand adds no target", () => {
+  const includes = () => Object.keys(readGitState(canonical).entries).filter((n) => includeName.test(n));
+  // Appended raw: git refuses to write a config holding either line.
+  const add = (line: string) => appendFileSync(join(gitDir(), "config"), `[include]\n\tpath = ${line}\n`);
+  expect(includes()).toEqual([]);
+  // The user's home directory: it exists, so it is a target (not a file, so hashed absent).
+  add(`~${userInfo().username}/`);
+  expect(includes()).toHaveLength(1);
+  const before = readGitState(canonical);
+  add("~no-such-ranger-user/x.conf");
+  const after = readGitState(canonical);
+  expect(Object.keys(after.entries).filter((n) => includeName.test(n))).toHaveLength(1);
+  expect(after.hash).not.toBe(before.hash);
+ });
+
+ test("a relative include in the main config.worktree:a worktree ranger adds matches, a target planted beside its copy does not", async () => {
   await config("extensions.worktreeConfig", "true");
   const r = await runCmd("git", ["config", "--worktree", "include.path", "wt.conf"], {
    cwd: canonical,
