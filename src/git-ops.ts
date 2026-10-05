@@ -537,17 +537,23 @@ function readConfigFile(file: string, read: ConfigReader): Records | null {
 function entryNames(dir: string): string[] {
  return readdirSync(dir, { encoding: "buffer" })
   .map((bytes) => {
-   // Bun hands back plain Uint8Arrays, whose toString lists the bytes.
-   const raw = Buffer.from(bytes);
-   const name = raw.toString("utf8");
-   if (!Buffer.from(name, "utf8").equals(raw)) {
+   const name = utf8Name(bytes);
+   if (name === null) {
     throw new GitSafetyError(
-     `${join(dir, name)} has a name that is not UTF-8 (hex ${raw.toString("hex")}) — refusing to judge the git state. Remove it, then resume the node.`,
+     `${join(dir, Buffer.from(bytes).toString("utf8"))} has a name that is not UTF-8 (hex ${Buffer.from(bytes).toString("hex")}) — refusing to judge the git state. Remove it, then resume the node.`,
     );
    }
    return name;
   })
   .sort();
+}
+
+/** A file name's bytes as a string, or null unless they are UTF-8 (they survive the round trip byte for byte). */
+export function utf8Name(bytes: Uint8Array): string | null {
+ // Bun's readdirSync hands back plain Uint8Arrays, whose toString lists the bytes.
+ const raw = Buffer.from(bytes);
+ const name = raw.toString("utf8");
+ return Buffer.from(name, "utf8").equals(raw) ? name : null;
 }
 
 function linkedWorktreeConfigs(

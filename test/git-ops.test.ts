@@ -12,6 +12,7 @@ import {
  GitSafetyError,
  NODE_BRANCH,
  safeGit,
+ utf8Name,
  vettedPush,
 } from "../src/git-ops.ts";
 import { bootstrapWorktree, slugify, worktreeBranch } from "../src/worker.ts";
@@ -492,14 +493,32 @@ describe("assertCheckoutOf: credentialed calls run only against the vetted .git"
  });
 });
 
-/** Whether the temp filesystem takes a file name that is not UTF-8 (APFS does not). */
+describe("utf8Name: entry names are judged as bytes (sage round 4 on node #86)", () => {
+ test("bytes that are not UTF-8 have no name", () => {
+  expect(utf8Name(new Uint8Array([0x72, 0x61, 0x77, 0xff]))).toBeNull();
+  // A UTF-16 surrogate encoded as UTF-8 (CESU-8) is not UTF-8 either.
+  expect(utf8Name(new Uint8Array([0xed, 0xa0, 0x80]))).toBeNull();
+ });
+
+ test("UTF-8 names keep every byte, a leading BOM included", () => {
+  expect(utf8Name(Buffer.from("été"))).toBe("été");
+  expect(utf8Name(Buffer.from("﻿node-86"))).toBe("﻿node-86");
+  expect(utf8Name(Buffer.from("raw�"))).toBe("raw�");
+ });
+});
+
+/**
+ * Whether the temp filesystem takes a file name that is not UTF-8. APFS
+ * refuses one (EILSEQ); any other error is a broken probe, never a skip.
+ */
 function takesRawByteNames(): boolean {
  const probe = mkdtempSync(join(tmpdir(), "ranger-raw-name-"));
  try {
   writeFileSync(Buffer.concat([Buffer.from(`${probe}/x`), Buffer.from([0xff])]), "");
   return true;
- } catch {
-  return false;
+ } catch (error) {
+  if ((error as NodeJS.ErrnoException).code === "EILSEQ") return false;
+  throw error;
  } finally {
   rmSync(probe, { recursive: true, force: true });
  }
