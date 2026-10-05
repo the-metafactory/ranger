@@ -959,6 +959,7 @@ describe("implement lane (node #23)", () => {
   ["an ignored fixture whose name git quotes", `${IGNORE_FIXTURES}; echo old > "a ü.fixture"`, `${IGNORE_FIXTURES}; if grep -qx new "a ü.fixture"; then exit 0; else echo new > "a ü.fixture"; exit 1; fi`],
   ["a tracked file hidden by --skip-worktree", undefined, "if grep -qx new README.md; then exit 0; else git update-index --skip-worktree README.md; echo new > README.md; exit 1; fi"],
   ["a replacement ref for the head commit", undefined, "if grep -qx replaced README.md; then exit 0; else plant-replace README.md replaced; exit 1; fi"],
+  ["a tag", undefined, "if git rev-parse -q --verify refs/tags/tests-ok >/dev/null; then exit 0; else git tag -f tests-ok; exit 1; fi"],
  ] as const) {
   test(`a test retry on a busy host never sees ${what} the failed run left: it runs in a fresh checkout`, async () => {
    const r = await rig({ ...(install === undefined ? {} : { install }), test: cmd });
@@ -974,6 +975,24 @@ describe("implement lane (node #23)", () => {
    expect(worktrees.stdout).not.toContain("ranger-test-retry-");
   }, 60_000);
  }
+
+ test("after a retry passes in a fresh clone, the worktree is restored before the probes run in it", async () => {
+  const flag = join(tmpdir(), `ranger-restore-${Date.now()}`);
+  // The failed run leaves src/leftover.ts behind; the probe fails while it is there.
+  const r = await rig({
+   test: `if [ -f ${flag} ]; then test -f src/feature.ts; else touch ${flag}; touch src/leftover.ts; exit 1; fi`,
+   probe: "test ! -e src/leftover.ts",
+  });
+  cleanup.push(r.dir);
+  const loads = [14, 13, 2];
+  r.ctx.hostLoad = () => ({ load: loads.length > 1 ? (loads.shift() as number) : loads[0], cores: 10 });
+  r.ctx.quietHost = { pollMs: 1, maxMs: 60_000 };
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.startsWith("restored the worktree to "))).toBe(true);
+  expect(existsSync(join(r.canonical, ".worktrees", "node-20", "src", "leftover.ts"))).toBe(false);
+  rmSync(flag, { force: true });
+ }, 60_000);
 
  test("built and committed work a failed run left unpushed is adopted on resume, with no new worker session", async () => {
   const flag = join(tmpdir(), `ranger-adopt-${Date.now()}`);
