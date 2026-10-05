@@ -424,6 +424,19 @@ describe("assertCheckoutOf: credentialed calls run only against the vetted .git"
   await expect(fastForwardCanonical(canonical, "main", "placeholder", { attempts: 1 })).rejects.toThrow(/not the vetted/);
  });
 
+ test("a worktree commondir whose path embeds the vetted lines after a newline refuses the push", async () => {
+  const worktree = await bootstrapWorktree(canonical, "86", "x", "placeholder");
+  const snapshot = gitConfigSnapshot(canonical);
+  const vetted = join(canonical, ".git");
+  const foreign = `${vetted}\n${join(vetted, "worktrees", "node-86")}`;
+  mkdirSync(dirname(foreign), { recursive: true });
+  renameSync(join(attacker, ".git"), foreign);
+  writeFileSync(join(vetted, "worktrees", "node-86", "commondir"), `${foreign}\n`);
+  expect(gitConfigSnapshot(canonical)).toBe(snapshot);
+  await expect(push(worktree, snapshot)).rejects.toThrow(/not the vetted/);
+  expect(await evilHeads()).toBe("");
+ });
+
  test("a credentialed call that names no canonical checkout is refused", () => {
   expect(() => safeGit(["fetch", "origin", "main"], { cwd: canonical, token: "placeholder" })).toThrow(
    /names no canonical checkout/,
