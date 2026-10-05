@@ -47,7 +47,10 @@
 #
 # This is an override and tamper guard, not a sandbox: a same-user process
 # can still read the keychain itself. It closes the paths by which this
-# wrapper would hand the tokens to a program the caller chose.
+# wrapper would hand the tokens to a program the caller chose. The pinned
+# locations (~/.local/bin, ~/bin, ranger's checkout) are the user's own and
+# writable by the same user by design; tamper with ranger's files is the git
+# tamper guard's job (src/git-ops.ts), not this wrapper's.
 
 set -euo pipefail
 
