@@ -1107,6 +1107,7 @@ describe("implement lane (node #23)", () => {
    probe: `[ $(ps -o nice= -p $$) -eq ${own} ]`,
   });
   cleanup.push(r.dir);
+  r.ctx.config.workers.niceness = 10; // the suite's fixtures run un-niced (support.ts)
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
  }, 60_000);
 

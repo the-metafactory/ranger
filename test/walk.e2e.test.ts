@@ -100,7 +100,7 @@ for (const [name, tamper] of [
   } finally {
    rmSync(dir, { recursive: true, force: true });
   }
- });
+ }, 30_000); // two real run-node CLI processes: under load they outlast 5s
 }
 
 test("research retry refuses an altered findings branch before citing CI", async () => {
@@ -137,7 +137,7 @@ test("research retry refuses an altered findings branch before citing CI", async
  } finally {
   rmSync(dir, { recursive: true, force: true });
  }
-});
+}, 30_000); // two real run-node CLI processes: under load they outlast 5s
 
 describe("ranger walk — claim phase (node #13)", () => {
  test("claims an auto+research frontier node: announce (fail-closed) → soma graph claim → journal", async () => {
@@ -512,7 +512,7 @@ describe("ranger run-node — research worker full loop (node #13 acceptance)", 
    } finally {
     rmSync(dir, { recursive: true, force: true });
    }
-  }, 10_000);
+  }, 30_000);
  }
 
  test("worker crash with no findings → refused, dead-man increments", async () => {
