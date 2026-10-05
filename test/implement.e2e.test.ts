@@ -839,6 +839,26 @@ describe("implement lane (node #23)", () => {
   expect(await r.github.sha("node/20-add-the-feature-module")).toBe(before);
  }, 60_000);
 
+ test("a worker that moves origin/<base> onto its own commit does not pass for a merge", async () => {
+  let r!: Rig & { calls: number[]; announced: string[] };
+  let before = "";
+  r = await rig({
+   onReview: async (round) => {
+    if (round !== 1) return;
+    before = await r.github.sha("node/20-add-the-feature-module");
+    await moveBaseUnder(r);
+   },
+  });
+  cleanup.push(r.dir);
+  r.ctx.mergeablePoll = { pollMs: 1, attempts: 2 };
+  r.ctx.workerCommand = [implementWorker, "merge-forge"];
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("parked");
+  expect(outcome.detail).toMatch(/^base merge pass committed, but origin\/main as fetched \([0-9a-f]{8}\) is not in node\/20-/);
+  expect(await r.github.sha("node/20-add-the-feature-module")).toBe(before);
+  expect((r.github.comments.get(1) ?? []).some((c) => c.body.includes("ranger:base-merge"))).toBe(false);
+ }, 60_000);
+
  test("a resumed run drops an unpushed merge from a crashed one, and its markers grant nothing", async () => {
   let r!: Rig & { calls: number[]; announced: string[] };
   r = await rig({ onReview: async (round) => { if (round === 1) await moveBaseUnder(r); } });

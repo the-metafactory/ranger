@@ -946,6 +946,16 @@ async function baseMergePass(ctx: ImplementContext, testCommand: string, pushedH
   if (r.code !== 0) throw new GitSafetyError(`cannot reset ${ctx.worktree} to ${pushedHead.slice(0, 8)} (git ${args[0]}): ${r.stderr.trim()}`);
  }
  await fastForwardCanonical(ctx.canonical, base, ctx.token);
+ // The base's commit as the supervisor fetched it, read before the worker
+ // runs: the worker shares the repository and could move the ref itself.
+ const fetched = await safeGit(["rev-parse", "--verify", `refs/remotes/origin/${base}^{commit}`], {
+  cwd: ctx.canonical,
+  timeoutMs: 10_000,
+ });
+ const baseSha = fetched.stdout.trim();
+ if (fetched.code !== 0 || !/^[0-9a-f]{40}$/.test(baseSha)) {
+  throw new GitSafetyError(`cannot resolve origin/${base} after the fetch: ${fetched.stderr.trim()}`);
+ }
  const files = await conflictingFiles(ctx.worktree, base);
  ctx.journal.recordEvent("reviewed", {
   nodeId: ctx.node.ref.id,
@@ -954,13 +964,13 @@ async function baseMergePass(ctx: ImplementContext, testCommand: string, pushedH
  });
  const pass = await workerPass(ctx, testCommand, { kind: "base-merge", base, files });
  if (pass.failure !== undefined) return pass;
- const inside = await safeGit(["merge-base", "--is-ancestor", `origin/${base}`, "HEAD"], {
+ const inside = await safeGit(["merge-base", "--is-ancestor", baseSha, "HEAD"], {
   cwd: ctx.worktree,
   timeoutMs: 30_000,
  });
  if (inside.code !== 0) {
   throw new ParkSignal(
-   `base merge pass committed, but origin/${base} is still not in ${ctx.branch} — the conflict stands; nothing was pushed`,
+   `base merge pass committed, but origin/${base} as fetched (${baseSha.slice(0, 8)}) is not in ${ctx.branch} — the conflict stands; nothing was pushed`,
   );
  }
  return pass;
