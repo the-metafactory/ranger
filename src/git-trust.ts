@@ -1,4 +1,4 @@
-import { GitSafetyError, gitStateChanges, readGitState, type GitState } from "./git-ops.ts";
+import { GitSafetyError, gitStateChanges, readGitState, readGitStateSettled, type GitState } from "./git-ops.ts";
 import type { Journal } from "./journal.ts";
 
 /**
@@ -71,8 +71,9 @@ export function checkKnownGood(
  canonical: string,
  at: { repo: string; nodeId?: string },
 ): TrustCheck {
- const state = readGitState(canonical);
  const known = readKnownGood(journal, canonical);
+ const state =
+  known === null || known === "unreadable" ? readGitState(canonical) : readGitStateSettled(canonical, known.hash);
  if (known === null) {
   recordKnownGood(journal, canonical, state, "first sight");
   journal.recordEvent("git-trust", {

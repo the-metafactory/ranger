@@ -237,12 +237,46 @@ describe("per-worktree config: git's copy of the main config.worktree", () => {
   expect(readGitState(canonical).hash).toBe(before.hash);
  });
 
- test("a linked file caught between git creating it and writing it is left out", async () => {
-  await worktreeConfig();
+ test("with a main file that sets nothing, an empty or missing linked file is left out", async () => {
+  await config("extensions.worktreeConfig", "true");
   const before = readGitState(canonical);
   mkdirSync(join(canonical, ".git", "worktrees", "w1"), { recursive: true });
+  mkdirSync(join(canonical, ".git", "worktrees", "w2"), { recursive: true });
   writeFileSync(copy("w1"), "");
   expect(readGitState(canonical).hash).toBe(before.hash);
+ });
+
+ // A main http.sslVerify=true over a shared false: emptying or deleting the
+ // copy turns TLS checks off for that worktree's push.
+ test("an emptied copy is named", async () => {
+  await worktreeConfig();
+  await config("http.sslVerify", "false");
+  await git(["config", "--worktree", "http.sslVerify", "true"]);
+  await bootstrapWorktree(canonical, "663", "stations-are-solid", "tok");
+  checkKnownGood(journal, canonical, at);
+  writeFileSync(copy("node-663"), "");
+  const check = checkKnownGood(journal, canonical, at);
+  expect(check.kind === "mismatch" && check.changed).toEqual(["worktrees/node-663/config.worktree (new)"]);
+ });
+
+ test("a deleted copy is named", async () => {
+  await worktreeConfig();
+  await bootstrapWorktree(canonical, "663", "stations-are-solid", "tok");
+  checkKnownGood(journal, canonical, at);
+  rmSync(copy("node-663"));
+  const check = checkKnownGood(journal, canonical, at);
+  expect(check.kind === "mismatch" && check.changed).toEqual(["worktrees/node-663/config.worktree (new)"]);
+ });
+
+ test("a worktree caught midway through git adding it settles to a match", async () => {
+  await worktreeConfig();
+  checkKnownGood(journal, canonical, at);
+  mkdirSync(join(canonical, ".git", "worktrees", "w1"), { recursive: true });
+  writeFileSync(copy("w1"), "");
+  // Another process fills the copy while the check reads; the check blocks.
+  const writer = Bun.spawn(["sh", "-c", `sleep 0.1 && cp "$0" "$1"`, join(canonical, ".git", "config.worktree"), copy("w1")]);
+  expect(checkKnownGood(journal, canonical, at).kind).toBe("match");
+  expect(await writer.exited).toBe(0);
  });
 
  test("a copy with a key the main file lacks is named", async () => {
@@ -277,6 +311,77 @@ describe("per-worktree config: git's copy of the main config.worktree", () => {
    "worktrees/a/config.worktree (new)",
    "worktrees/b/config.worktree (new)",
   ]);
+ });
+});
+
+/**
+ * Git reads the files a config includes as if their lines stood in it, so
+ * an included file is part of the state (a worker editing one could set
+ * http.sslVerify=false past an unchanged include line).
+ */
+describe("included config files", () => {
+ const gitDir = () => join(canonical, ".git");
+ const includeName = /^include <[0-9a-f]{12}>$/;
+
+ test("an edited include target is named", async () => {
+  writeFileSync(join(gitDir(), "extra.conf"), "[core]\n\tfilemode = false\n");
+  await config("include.path", "extra.conf");
+  checkKnownGood(journal, canonical, at);
+  writeFileSync(join(gitDir(), "extra.conf"), "[http]\n\tsslVerify = false\n");
+  const check = checkKnownGood(journal, canonical, at);
+  expect(check.kind).toBe("mismatch");
+  expect(check.kind === "mismatch" && check.changed).toHaveLength(1);
+  expect(check.kind === "mismatch" && check.changed[0]).toMatch(includeName);
+ });
+
+ test("a missing target that appears is new", async () => {
+  await config("include.path", "missing.conf");
+  checkKnownGood(journal, canonical, at);
+  writeFileSync(join(gitDir(), "missing.conf"), "[http]\n\tsslVerify = false\n");
+  const check = checkKnownGood(journal, canonical, at);
+  expect(check.kind === "mismatch" && check.changed[0]).toMatch(/^include <[0-9a-f]{12}> \(new\)$/);
+ });
+
+ test("an includeIf target is hashed whatever its condition, and so is a file it includes", async () => {
+  const outer = join(dir, "outer.conf");
+  const inner = join(dir, "inner.conf");
+  writeFileSync(outer, "[include]\n\tpath = inner.conf\n");
+  writeFileSync(inner, "[core]\n\tfilemode = false\n");
+  await config("includeIf.gitdir:/nowhere/.path", outer);
+  checkKnownGood(journal, canonical, at);
+  writeFileSync(inner, "[core]\n\tsshCommand = ssh -o ProxyCommand=evil\n");
+  const check = checkKnownGood(journal, canonical, at);
+  expect(check.kind === "mismatch" && check.changed).toHaveLength(1);
+ });
+
+ test("a ~/ include resolves against HOME", async () => {
+  const home = process.env.HOME;
+  process.env.HOME = dir;
+  try {
+   writeFileSync(join(dir, "home.conf"), "[core]\n\tfilemode = false\n");
+   await config("include.path", "~/home.conf");
+   checkKnownGood(journal, canonical, at);
+   writeFileSync(join(dir, "home.conf"), "[http]\n\tsslVerify = false\n");
+   expect(checkKnownGood(journal, canonical, at).kind).toBe("mismatch");
+  } finally {
+   process.env.HOME = home;
+  }
+ });
+
+ test("a relative include in the main config.worktree: a worktree ranger adds matches, a target planted beside its copy does not", async () => {
+  await config("extensions.worktreeConfig", "true");
+  const r = await runCmd("git", ["config", "--worktree", "include.path", "wt.conf"], {
+   cwd: canonical,
+   env: { ...process.env, ...GIT_ENV },
+  });
+  expect(r.code).toBe(0);
+  writeFileSync(join(gitDir(), "wt.conf"), "[core]\n\tfilemode = false\n");
+  checkKnownGood(journal, canonical, at);
+  await bootstrapWorktree(canonical, "663", "stations-are-solid", "tok");
+  expect(checkKnownGood(journal, canonical, at).kind).toBe("match");
+  writeFileSync(join(gitDir(), "worktrees", "node-663", "wt.conf"), "[http]\n\tsslVerify = false\n");
+  const check = checkKnownGood(journal, canonical, at);
+  expect(check.kind === "mismatch" && check.changed[0]).toMatch(/^include <[0-9a-f]{12}> \(new\)$/);
  });
 });
 
