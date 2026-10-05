@@ -57,7 +57,7 @@ Run every step from a `main` checkout (`~/work/mf/ranger`), never from a worktre
 
    Every table that differs needs a rebuild. Tables that only gained foreign columns or keys need one too: `main`'s upserts depend on the exact keys.
 
-5. **Rebuild the affected tables to `main`'s schema.** Do it in one transaction with foreign keys off, copying the columns both schemas share. Follow SQLite's own order (create the new table, copy, drop the old, rename the new): renaming the old table instead would keep its index names, so `main`'s `CREATE INDEX` statements would collide with them. For each affected table `<t>`:
+5. **Rebuild the affected tables to `main`'s schema.** Do it in one transaction with foreign keys off, copying the columns both schemas share. Follow SQLite's own order (create the new table, copy, drop the old, rename the new): renaming the old table instead would keep its index names, so `main`'s `CREATE INDEX` statements would collide with them. For each affected table `<t>`, feed this to `sqlite3 -bail "$J"`:
 
    ```sql
    PRAGMA foreign_keys = OFF;
@@ -65,12 +65,18 @@ Run every step from a `main` checkout (`~/work/mf/ranger`), never from a worktre
    -- main's CREATE TABLE <t> … from the fresh .schema, with the name changed to <t>_new
    CREATE TABLE <t>_new (…);
    INSERT INTO <t>_new (<shared columns>) SELECT <shared columns> FROM <t>;
+   -- fails unless every row was copied
+   CREATE TEMP TABLE copy_check (copied INTEGER CHECK (copied));
+   INSERT INTO copy_check SELECT (SELECT count(*) FROM <t>_new) = (SELECT count(*) FROM <t>);
+   DROP TABLE copy_check;
    DROP TABLE <t>;  -- drops <t>'s old indexes with it
    ALTER TABLE <t>_new RENAME TO <t>;
    -- main's CREATE INDEX … ON <t> statements from the fresh .schema, unchanged
    COMMIT;
    PRAGMA foreign_keys = ON;
    ```
+
+   `-bail` is required. Without it the `sqlite3` CLI carries on after a failed statement, so an `INSERT` that breaks one of `main`'s constraints copies nothing, and the `DROP` and `COMMIT` still run and delete the table's rows. With `-bail` the CLI stops at the first error and exits with the transaction still open, so SQLite rolls it back and `<t>` is left as it was. The `copy_check` row does the same if the copy came up short.
 
    Rows that collide under `main`'s keys (for example, one node on two map roots) have to be resolved by hand before the `INSERT`. Keep the newest row and record the dropped one.
 
