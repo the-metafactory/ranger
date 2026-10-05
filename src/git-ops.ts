@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { closeSync, constants, existsSync, fstatSync, openSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { closeSync, constants, existsSync, fstatSync, openSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { runCmd, type RunResult } from "./exec.ts";
 
 /**
@@ -52,13 +52,23 @@ function minimalGitEnv(): NodeJS.ProcessEnv {
 
 /**
  * Run git with hooks and fsmonitor disabled, in a minimal env. `token` adds
- * the auth header (remote calls only).
+ * the auth header (remote calls only); every such call but `clone` names the
+ * `canonical` checkout whose git state was vetted, and runs only where git
+ * resolves to it (`assertCheckoutOf`).
  */
 export function safeGit(
  args: string[],
- opts: { cwd: string; token?: string; timeoutMs?: number },
+ opts: { cwd: string; token?: string; canonical?: string; timeoutMs?: number },
 ): Promise<RunResult> {
- if (opts.token !== undefined) assertNamedRefs(args);
+ if (opts.token !== undefined) {
+  assertNamedRefs(args);
+  if (args[0] !== "clone") {
+   if (opts.canonical === undefined) {
+    throw new GitSafetyError(`refusing a credentialed \`git ${args[0]}\`: it names no canonical checkout to check its repository against`);
+   }
+   assertCheckoutOf(opts.cwd, opts.canonical);
+  }
+ }
  const base = minimalGitEnv();
  return runCmd(
   "git",
@@ -87,6 +97,56 @@ export function assertNamedRefs(args: string[]): void {
  throw new GitSafetyError(
   `refusing a credentialed \`git ${args.join(" ")}\`: it must name its remote and refs, never fall back to a branch's upstream`,
  );
+}
+
+/**
+ * Throw unless git, run in `cwd`, uses the canonical checkout's own `.git`:
+ * its common dir is `<canonical>/.git`, the directory `readGitState` vets,
+ * and its git dir is that one (`cwd` is the canonical checkout) or one of
+ * its `worktrees/<name>` (a linked worktree). A worker can rewrite its
+ * worktree's `.git` file or `worktrees/<name>/commondir`, or plant a
+ * `commondir` in the main `.git`: each points git at another repository,
+ * whose config (another origin) the hash never covered, and a credentialed
+ * call would send the write credential there. Git resolves the pointers
+ * itself (`rev-parse`, no credential, hooks off): ranger does not
+ * re-implement how git reads a gitfile.
+ */
+export function assertCheckoutOf(cwd: string, canonical: string): void {
+ const got = spawnSync(
+  "git",
+  [
+   "-c", "core.hooksPath=/dev/null",
+   "-c", "core.fsmonitor=false",
+   "rev-parse", "--path-format=absolute", "--git-common-dir", "--absolute-git-dir",
+  ],
+  { cwd, env: minimalGitEnv(), encoding: "utf8", timeout: 10_000 },
+ );
+ const [common, gitDir] = got.error === undefined && got.status === 0 ? got.stdout.split("\n") : [];
+ const vetted = realPath(join(canonical, ".git"));
+ const commonReal = realPath(common);
+ const gitDirReal = realPath(gitDir);
+ const ours =
+  vetted !== null &&
+  commonReal === vetted &&
+  gitDirReal !== null &&
+  (realPath(cwd) === realPath(canonical)
+   ? gitDirReal === vetted
+   : dirname(gitDirReal) === realPath(join(canonical, ".git", "worktrees")));
+ if (!ours) {
+  throw new GitSafetyError(
+   `refusing a credentialed git call in ${cwd}: git there uses ${gitDirReal ?? "no repository"} (common dir ${commonReal ?? "none"}), not the vetted ${join(canonical, ".git")}`,
+  );
+ }
+}
+
+/** A path with every symlink resolved; null when it is empty or not there. */
+function realPath(path: string | undefined): string | null {
+ if (path === undefined || path.length === 0) return null;
+ try {
+  return realpathSync(path);
+ } catch {
+  return null;
+ }
 }
 
 /** Ranger's own node branches: `node/<N>-<slug>` (`worktreeBranch` + `slugify` in worker.ts). */
@@ -207,7 +267,10 @@ function configReader(): ConfigReader {
  * re-encoded on the way. Keys and values are byte strings (latin1, not utf8:
  * one char per byte), so a value with bytes that are not valid UTF-8 (FF vs
  * FE in a command path) never collapses to the same replacement character
- * and hashes alike.
+ * and hashes alike. Null only when git rejects the bytes (it then refuses
+ * them on every call too); a call that fails or is cut short throws, never
+ * reads as unparsed: a listing past spawnSync's default 1 MiB output cap
+ * (ENOBUFS) once skipped the include check while git still followed it.
  */
 function listConfig(body: Buffer): Records | null {
  const listed = spawnSync(
@@ -217,9 +280,14 @@ function listConfig(body: Buffer): Records | null {
    "-c", "core.fsmonitor=false",
    "config", "--file", "-", "--no-includes", "--list", "--null",
   ],
-  { env: minimalGitEnv(), encoding: "latin1", input: body, timeout: 10_000 },
+  { env: minimalGitEnv(), encoding: "latin1", input: body, timeout: 10_000, maxBuffer: Infinity },
  );
- if (listed.status !== 0 || listed.error !== undefined) return null;
+ if (listed.error !== undefined || listed.status === null || listed.signal !== null) {
+  throw new GitSafetyError(
+   `cannot list a git config file to vet it (${listed.error?.message ?? `signal ${listed.signal}`}) — refusing to judge the git state`,
+  );
+ }
+ if (listed.status !== 0) return null;
  // --null: each record ends in NUL; the key ends at the first newline, and a
  // valueless boolean key has none.
  return listed.stdout
@@ -247,7 +315,7 @@ function worktreeConfigEnabled(body: Buffer): boolean {
    "-c", "core.fsmonitor=false",
    "config", "--file", "-", "--no-includes", "--type=bool", "--get", "extensions.worktreeconfig",
   ],
-  { env: minimalGitEnv(), encoding: "utf8", input: body, timeout: 10_000 },
+  { env: minimalGitEnv(), encoding: "utf8", input: body, timeout: 10_000, maxBuffer: Infinity },
  );
  if (got.error === undefined && got.status === 1) return false;
  return !(got.error === undefined && got.status === 0 && got.stdout.trim() === "false");
@@ -631,7 +699,7 @@ export async function vettedPush(opts: {
  const vetted = await assertGitUntouched(opts.canonical, opts.configSnapshot);
  const push = await safeGit(
   ["push", "--no-verify", "origin", `${opts.source ?? "HEAD"}:refs/heads/${opts.branch}`],
-  { cwd: opts.worktree, token: opts.token, timeoutMs: 120_000 },
+  { cwd: opts.worktree, token: opts.token, canonical: opts.canonical, timeoutMs: 120_000 },
  );
  if (push.code !== 0) {
   throw new GitSafetyError(`push of ${opts.branch} failed: ${push.stderr.trim()}`);
@@ -675,6 +743,7 @@ async function fastForwardOnce(canonical: string, base: string, token: string): 
  const fetch = await safeGit(["fetch", "origin", base], {
   cwd: canonical,
   token,
+  canonical,
   timeoutMs: 120_000,
  });
  if (fetch.code !== 0) {

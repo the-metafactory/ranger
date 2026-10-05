@@ -231,6 +231,7 @@ export async function bootstrapWorktree(
  const result = await safeGit(args, {
   cwd: canonical,
   token,
+  canonical,
   timeoutMs: 60_000,
  });
  if (result.code !== 0) {

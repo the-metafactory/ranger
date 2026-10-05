@@ -4,12 +4,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCmd } from "../src/exec.ts";
 import {
+ assertCheckoutOf,
  assertGitUntouched,
  assertNamedRefs,
+ fastForwardCanonical,
  gitConfigSnapshot,
  GitSafetyError,
  NODE_BRANCH,
  safeGit,
+ vettedPush,
 } from "../src/git-ops.ts";
 import { bootstrapWorktree, slugify, worktreeBranch } from "../src/worker.ts";
 import { addTrackedWorktree, createCanonicalRepo, GIT_ENV } from "./support.ts";
@@ -327,5 +330,73 @@ describe("assertNamedRefs: credentialed git calls name their remote and refs", (
 
  test("safeGit runs the guard on every call that carries the credential", () => {
   expect(() => safeGit(["pull"], { cwd: canonical, token: "placeholder" })).toThrow(GitSafetyError);
+ });
+});
+
+/**
+ * Sage round 1 on node #86: the hash vets `<canonical>/.git`, so a
+ * credentialed call runs only where git resolves to that directory. A
+ * worktree's `.git` file or `commondir` pointed at another repository would
+ * otherwise read that repository's origin and send the credential there.
+ */
+describe("assertCheckoutOf: credentialed calls run only against the vetted .git", () => {
+ let origin: string;
+ let evil: string;
+ let attacker: string;
+
+ beforeEach(async () => {
+  origin = await git(["remote", "get-url", "origin"]);
+  evil = join(dir, "evil.git");
+  await git(["init", "--bare", evil], dir);
+  attacker = join(dir, "attacker");
+  await git(["clone", origin, attacker], dir);
+  await git(["remote", "set-url", "origin", evil], attacker);
+ });
+
+ const push = (worktree: string, snapshot: string) =>
+  vettedPush({ worktree, canonical, branch: "node/86-x", token: "placeholder", configSnapshot: snapshot });
+ const evilHeads = () => git(["for-each-ref", "refs/heads"], evil);
+
+ test("a clean node worktree pushes to the vetted origin", async () => {
+  const worktree = await bootstrapWorktree(canonical, "86", "x", "placeholder");
+  await push(worktree, gitConfigSnapshot(canonical));
+  expect(await git(["for-each-ref", "--format=%(refname)", "refs/heads/node/86-x"], origin)).toBe("refs/heads/node/86-x");
+ });
+
+ test("a worktree commondir pointed at another repository refuses the push", async () => {
+  const worktree = await bootstrapWorktree(canonical, "86", "x", "placeholder");
+  const snapshot = gitConfigSnapshot(canonical);
+  writeFileSync(join(canonical, ".git", "worktrees", "node-86", "commondir"), `${join(attacker, ".git")}\n`);
+  expect(gitConfigSnapshot(canonical)).toBe(snapshot);
+  await expect(push(worktree, snapshot)).rejects.toThrow(/not the vetted/);
+  expect(await evilHeads()).toBe("");
+ });
+
+ test("a worktree .git file pointed at another repository refuses the push", async () => {
+  const worktree = await bootstrapWorktree(canonical, "86", "x", "placeholder");
+  const snapshot = gitConfigSnapshot(canonical);
+  writeFileSync(join(worktree, ".git"), `gitdir: ${join(attacker, ".git")}\n`);
+  await expect(push(worktree, snapshot)).rejects.toThrow(/not the vetted/);
+  expect(await evilHeads()).toBe("");
+ });
+
+ test("a worktree with no .git file (git climbs to the canonical checkout) refuses the push", async () => {
+  const worktree = await bootstrapWorktree(canonical, "86", "x", "placeholder");
+  const snapshot = gitConfigSnapshot(canonical);
+  rmSync(join(worktree, ".git"));
+  await expect(push(worktree, snapshot)).rejects.toThrow(/not the vetted/);
+ });
+
+ test("a commondir planted in the canonical .git refuses the fetch and the worktree add", async () => {
+  writeFileSync(join(canonical, ".git", "commondir"), `${join(attacker, ".git")}\n`);
+  await expect(fastForwardCanonical(canonical, "main", "placeholder", { attempts: 1 })).rejects.toThrow(/not the vetted/);
+  await expect(bootstrapWorktree(canonical, "86", "x", "placeholder")).rejects.toThrow(/not the vetted/);
+ });
+
+ test("a credentialed call that names no canonical checkout is refused", () => {
+  expect(() => safeGit(["fetch", "origin", "main"], { cwd: canonical, token: "placeholder" })).toThrow(
+   /names no canonical checkout/,
+  );
+  expect(() => assertCheckoutOf(canonical, canonical)).not.toThrow();
  });
 });

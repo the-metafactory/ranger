@@ -399,6 +399,14 @@ describe("include keys are refused", () => {
   expect(journal.listEvents("acme/widgets")).toEqual([]);
  });
 
+ test("an include beside a value past spawnSync's 1 MiB output cap is still found (sage round 1, node #86)", async () => {
+  // Appended, not `git config`: a 1.1 MB argument would pass ARG_MAX.
+  appendFileSync(join(canonical, ".git", "config"), `[big]\n\tvalue = ${"x".repeat(1_100_000)}\n[include]\n\tpath = extra.conf\n`);
+  expect(readGitState(canonical).includes).toEqual(["include.path in config"]);
+  expect((await checkKnownGood(journal, canonical, at)).kind).toBe("includes");
+  expect(journal.knownGoodGitState(canonical)).toBeNull();
+ });
+
  test("an include added after the record refuses the state, naming the key", async () => {
   await checkKnownGood(journal, canonical, at);
   await config("includeIf.onbranch:main.path", "extra.conf");
