@@ -818,6 +818,27 @@ describe("implement lane (node #23)", () => {
   expect((await r.github.getPr("acme/widgets", 1)).mergeable).toBe(false);
  }, 60_000);
 
+ test("an install after the base merge that rewrites a tracked file fails the pass before the tests, and nothing is pushed", async () => {
+  let r!: Rig & { calls: number[]; announced: string[] };
+  let before = "";
+  // Only the merged tree has src/feature.ts at install time: the build's install leaves the tree alone.
+  r = await rig({
+   install: "if [ -f src/feature.ts ]; then echo regenerated >> README.md; fi",
+   onReview: async (round) => {
+    if (round !== 1) return;
+    before = await r.github.sha("node/20-add-the-feature-module");
+    await moveBaseUnder(r);
+   },
+  });
+  cleanup.push(r.dir);
+  r.ctx.mergeablePoll = { pollMs: 1, attempts: 2 };
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("failed");
+  expect(outcome.detail).toContain("uncommitted or untracked file(s) ( M README.md)");
+  expect(before).not.toBe("");
+  expect(await r.github.sha("node/20-add-the-feature-module")).toBe(before);
+ }, 60_000);
+
  test("a resumed run drops an unpushed merge from a crashed one, and its markers grant nothing", async () => {
   let r!: Rig & { calls: number[]; announced: string[] };
   r = await rig({ onReview: async (round) => { if (round === 1) await moveBaseUnder(r); } });
