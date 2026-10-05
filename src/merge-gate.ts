@@ -96,16 +96,10 @@ export function evaluateMergeGate(input: MergeGateInput): MergeGateResult {
  }
  const success = ci.success;
 
- // 2. mergeable. GitHub computes this lazily; null means "ask again".
+ // 2. mergeable. GitHub computes this lazily; null means "ask again". A known
+ //    conflict already failed at step 0.
  if (pr.mergeable === null || pr.mergeableState === "unknown") {
   return { status: "pending", check: "mergeable", reason: "GitHub is still computing mergeability" };
- }
- if (!pr.mergeable || pr.mergeableState === "dirty") {
-  return {
-   status: "fail",
-   check: "mergeable",
-   reason: `mergeable=${pr.mergeable}, state=${pr.mergeableState} (conflicts with ${input.expectedBase})`,
-  };
  }
 
  // 3. base branch.

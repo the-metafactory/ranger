@@ -12,6 +12,7 @@ import {
  dirtyFiles,
  fastForwardCanonical,
  findClosingKeyword,
+ GitSafetyError,
  gitConfigSnapshot,
  headSha,
  safeGit,
@@ -642,8 +643,14 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
  const opening = await github.listComments(repo, open.number, token);
  let reviews = recordedReviews(opening, botIdentity);
  // A base merge pass moves the head without a finding to answer: each one
- // recorded on the PR grants the round that reviews the merged branch.
- let baseMerges = recordedBaseMerges(opening, botIdentity).length;
+ // that landed in the PR's head grants the round that reviews the merged
+ // branch. A marker whose merge was never pushed (a crash between the two)
+ // grants nothing and uses up none of the node's merge passes.
+ let baseMerges = await landedBaseMerges(
+  worktree,
+  recordedBaseMerges(opening, botIdentity),
+  (await github.getPr(repo, open.number, token)).headSha,
+ );
  const capNow = () => config.workers.reviewRounds + baseMerges;
  for (;;) {
   const cap = capNow();
@@ -734,29 +741,23 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
    if (baseMerges >= MAX_BASE_MERGES) {
     throw new ParkSignal(baseConflictOutcome({ pr: open.number, base, passes: baseMerges }));
    }
-   const merged = await baseMergePass(ctx, testCommand);
+   const merged = await baseMergePass(ctx, testCommand, live.headSha);
    workerExit = merged.workerExit;
    if (merged.failure !== undefined) return merged.failure;
-   // The marker first: a crash between it and the push costs one spare
-   // round, while the reverse would park the merged head at the cap.
+   // The marker first: a merged head pushed without one would read as an
+   // unreviewed head at the cap. A marker whose push never happens counts
+   // for nothing (landedBaseMerges), so a crash between them costs nothing.
    fence("record the base merge");
    await github.postComment(repo, open.number, baseMergeMarker(merged.sha, base), token);
+   await publishPass(
+    ctx,
+    github,
+    open.number,
+    merged,
+    "push base merge",
+    `base merge pass ${baseMerges + 1} @ ${merged.sha.slice(0, 8)}: origin/${base} merged in after a conflict`,
+   );
    baseMerges += 1;
-   fence("push base merge");
-   await vettedPush({
-    worktree,
-    canonical: ctx.canonical,
-    branch,
-    token,
-    configSnapshot: merged.snapshot,
-   });
-   journal.recordEvent("pushed", {
-    nodeId,
-    repo,
-    detail: `base merge pass ${baseMerges} @ ${merged.sha.slice(0, 8)}: origin/${base} merged in after a conflict`,
-   });
-   recordHead(ctx, merged.sha);
-   await awaitHead(github, repo, open.number, merged.sha, token, ctx.headPollMs);
    continue;
   }
   if (current.round >= cap) {
@@ -772,21 +773,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
   });
   workerExit = fixed.workerExit;
   if (fixed.failure !== undefined) return fixed.failure;
-  fence("push fix");
-  await vettedPush({
-   worktree,
-   canonical: ctx.canonical,
-   branch,
-   token,
-   configSnapshot: fixed.snapshot,
-  });
-  journal.recordEvent("pushed", {
-   nodeId,
-   repo,
-   detail: `fix pass ${current.round} @ ${fixed.sha.slice(0, 8)}`,
-  });
-  recordHead(ctx, fixed.sha);
-  await awaitHead(github, repo, open.number, fixed.sha, token, ctx.headPollMs);
+  await publishPass(ctx, github, open.number, fixed, "push fix", `fix pass ${current.round} @ ${fixed.sha.slice(0, 8)}`);
  }
 
  // ---- probe tier, once, on the final head ----
@@ -860,21 +847,54 @@ interface BaseMergeInput {
  files: string[];
 }
 
-const BASE_MERGE_MARKER = /<!-- ranger:base-merge sha=([0-9a-f]{7,64}) base=([\w./-]+) -->/;
+/** The base is informational: any ref name the config accepts must still parse. */
+const BASE_MERGE_MARKER = /<!-- ranger:base-merge sha=([0-9a-f]{7,64})(?: base=[^\s>]*)? -->/;
 
 export function baseMergeMarker(sha: string, base: string): string {
  return `<!-- ranger:base-merge sha=${sha} base=${base} -->\n**Base merge** — \`origin/${base}\` conflicted with this branch, so a worker merged it in at \`${sha.slice(0, 8)}\`. The next sage round reviews the merged branch.`;
 }
 
 /** Base merge passes recorded on the PR by the MACHINE ACCOUNT (anyone else's markers are ignored). */
-export function recordedBaseMerges(comments: IssueComment[], botIdentity: string): { sha: string; base: string }[] {
- const out: { sha: string; base: string }[] = [];
+export function recordedBaseMerges(comments: IssueComment[], botIdentity: string): { sha: string }[] {
+ const out: { sha: string }[] = [];
  for (const c of comments) {
   if (c.author !== botIdentity) continue;
   const m = c.body.match(BASE_MERGE_MARKER);
-  if (m !== null) out.push({ sha: m[1], base: m[2] });
+  if (m !== null) out.push({ sha: m[1] });
  }
  return out;
+}
+
+/** How many recorded base merges landed: their merge commit is in the PR's head. */
+async function landedBaseMerges(worktree: string, merges: { sha: string }[], head: string): Promise<number> {
+ let landed = 0;
+ for (const { sha } of new Map(merges.map((m) => [m.sha, m])).values()) {
+  const inside = await safeGit(["merge-base", "--is-ancestor", sha, head], { cwd: worktree, timeoutMs: 30_000 });
+  if (inside.code === 0) landed += 1;
+ }
+ return landed;
+}
+
+/** Push a pass's commits through the vetted push, record them, and wait for GitHub to show the head. */
+async function publishPass(
+ ctx: ImplementContext,
+ github: GitHubPort,
+ prNumber: number,
+ pass: PassResult,
+ action: string,
+ detail: string,
+): Promise<void> {
+ ctx.journal.assertGeneration(ctx.node.ref.id, ctx.map.repo, ctx.generation, action);
+ await vettedPush({
+  worktree: ctx.worktree,
+  canonical: ctx.canonical,
+  branch: ctx.branch,
+  token: ctx.token,
+  configSnapshot: pass.snapshot,
+ });
+ ctx.journal.recordEvent("pushed", { nodeId: ctx.node.ref.id, repo: ctx.map.repo, detail });
+ recordHead(ctx, pass.sha);
+ await awaitHead(github, ctx.map.repo, prNumber, pass.sha, ctx.token, ctx.headPollMs);
 }
 
 /**
@@ -914,8 +934,15 @@ async function conflictingFiles(worktree: string, base: string): Promise<string[
  * and resolves; the supervisor's own checks then require a clean tree,
  * passing tests, and origin/<base> actually inside the branch.
  */
-async function baseMergePass(ctx: ImplementContext, testCommand: string): Promise<PassResult> {
+async function baseMergePass(ctx: ImplementContext, testCommand: string, pushedHead: string): Promise<PassResult> {
  const base = ctx.map.base;
+ // Start from what GitHub has: an earlier run may have merged locally and
+ // crashed before its push, and that unpushed state is neither vetted nor
+ // reviewed. The pass redoes the merge on the pushed head.
+ for (const args of [["reset", "--hard", pushedHead], ["clean", "-fd"]]) {
+  const r = await safeGit(args, { cwd: ctx.worktree, timeoutMs: 60_000 });
+  if (r.code !== 0) throw new GitSafetyError(`cannot reset ${ctx.worktree} to ${pushedHead.slice(0, 8)} (git ${args[0]}): ${r.stderr.trim()}`);
+ }
  await fastForwardCanonical(ctx.canonical, base, ctx.token);
  const files = await conflictingFiles(ctx.worktree, base);
  ctx.journal.recordEvent("reviewed", {
@@ -1113,6 +1140,14 @@ async function checkedWorkerPass(
   return fail(
    `worker left ${dirty.length} uncommitted or untracked file(s) (${dirty.slice(0, 5).join("; ")}) — the tests would not test what gets pushed`,
   );
+ }
+ // A base merge brings in the base's manifests and lockfile: the tests must
+ // run on its dependencies, not the ones installed for the old base.
+ if (baseMerge !== undefined && map.commands.install !== undefined) {
+  const install = await runShell(map.commands.install, worktree, ctx, INSTALL_TIMEOUT_MS);
+  if (install.code !== 0) {
+   return fail(`install (${map.commands.install}) after the base merge exited ${install.code}: ${tail(install)}`);
+  }
  }
  const tests = await runShell(testCommand, worktree, ctx, TEST_TIMEOUT_MS);
  if (tests.code !== 0) {
