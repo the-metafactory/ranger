@@ -1,6 +1,5 @@
 import { implementLane } from "./lanes.ts";
 import { recordImplementStart, mapKey } from "./maps.ts";
-import { ClaimLeaseLost, ClaimLockBusy, withClaimLock } from "./claim-lock.ts";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import { DiscordAnnouncer } from "./announce.ts";
 import type { DiscordFile } from "./discord.ts";
@@ -192,42 +191,30 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    }
    // A send-back starts a worker session (fix pass or probes): it waits for
    // the implement lane like any other start. The stale card is already gone.
-   // The lane is read and taken under the claim lock (node #58), as the walk
-   // and `ranger build-now` take it, so a claim that read the lane empty is
-   // not joined by a send-back before its row holds it.
-   const spawnSendBack = ctx.spawn;
    const lane = implementLane(map);
-   try {
-    await withClaimLock(journal, async (owned) => {
-     const holder = journal.laneHolder(lane, { nodeId: row.nodeId, repo });
-     if (holder !== null) {
-      result.pending.push(row.nodeId);
-      journal.recordEvent("sweep", {
-       nodeId: row.nodeId,
-       repo,
-       detail: `PR #${pr.number}: ${why} — waiting for the ${lane} implement lane (held by #${holder.nodeId}, ${mapKey(holder)})`,
-      });
-      return;
-     }
-     owned();
-     const pid = await spawnSendBack(row.nodeId, repo, row.root);
-     if (pid === null) {
-      result.errors.push(`#${row.nodeId}: ${why}, but run-node did not spawn — retrying next tick`);
-      return;
-     }
-     journal.updateWorker(row.nodeId, repo, { status: "running", phase: "review", pid });
-     recordImplementStart(journal, map);
-     journal.recordEvent("sweep", {
-      nodeId: row.nodeId,
-      repo,
-      detail: `PR #${pr.number}: ${why} — run-node resumes (pid ${pid})`,
-     });
-     result.resumed.push(row.nodeId);
+   const holder = journal.laneHolder(lane, { nodeId: row.nodeId, repo });
+   if (holder !== null) {
+    result.pending.push(row.nodeId);
+    journal.recordEvent("sweep", {
+     nodeId: row.nodeId,
+     repo,
+     detail: `PR #${pr.number}: ${why} — waiting for the ${lane} implement lane (held by #${holder.nodeId}, ${mapKey(holder)})`,
     });
-   } catch (error) {
-    if (!(error instanceof ClaimLockBusy) && !(error instanceof ClaimLeaseLost)) throw error;
-    result.errors.push(`#${row.nodeId}: ${why}, but ${error.message} — retrying next tick`);
+    return;
    }
+   const pid = await ctx.spawn(row.nodeId, repo, row.root);
+   if (pid === null) {
+    result.errors.push(`#${row.nodeId}: ${why}, but run-node did not spawn — retrying next tick`);
+    return;
+   }
+   journal.updateWorker(row.nodeId, repo, { status: "running", phase: "review", pid });
+   recordImplementStart(journal, map);
+   journal.recordEvent("sweep", {
+    nodeId: row.nodeId,
+    repo,
+    detail: `PR #${pr.number}: ${why} — run-node resumes (pid ${pid})`,
+   });
+   result.resumed.push(row.nodeId);
    return;
   }
   const gate = evaluateMergeGate({

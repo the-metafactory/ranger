@@ -1,6 +1,5 @@
 import { describe, expect, test } from "bun:test";
 import {
- cpSync,
  mkdirSync,
  mkdtempSync,
  readFileSync,
@@ -11,14 +10,13 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Journal } from "../src/journal.ts";
-import { runCmd, type RunResult } from "../src/exec.ts";
+import { runCmd } from "../src/exec.ts";
 import {
  classify,
  loadProbeRegistry,
  type ClassifiedNode,
 } from "../src/route.ts";
 import { planTick, researchCandidates } from "../src/walk.ts";
-import { withClaimLock } from "../src/claim-lock.ts";
 import { bootstrapWorktree } from "../src/worker.ts";
 import type { FrontierEntry } from "../src/graph.ts";
 import {
@@ -754,115 +752,6 @@ describe("walk claims exactly planTick's take (#37)", () => {
    }
   });
  }
-});
-
-describe("walk claims under the claim lock build-now also takes (node #58)", () => {
- /**
-  * Starts a walk while this process holds the claim lock, runs `during` once
-  * the walk waits on it, then lets it go. The fake graph's fixtures are a
-  * copy `during` may rewrite.
-  */
- async function walkWhileLockHeld(during: (journal: Journal, somaDir: string) => void) {
-  const dir = mkdtempSync(join(tmpdir(), "ranger-walk-lock-"));
-  const discord = fakeDiscord();
-  const journal = new Journal(join(dir, "state.sqlite"));
-  const somaDir = join(dir, "soma-data");
-  cpSync(dataDir, somaDir, { recursive: true });
-  try {
-   const config = writeConfig(dir);
-   const statePath = writeState(dir, { "10": RESEARCH_NODE_STATE });
-   const assignees = () =>
-    (JSON.parse(readFileSync(statePath, "utf8")) as { nodes: Record<string, { assignees: string[] }> })
-     .nodes["10"].assignees;
-   let walking!: Promise<RunResult>;
-   await withClaimLock(journal, async () => {
-    walking = runCli(["walk", "-c", config], {
-     ...process.env,
-     ...GIT_ENV,
-     PATH: `${fixturesBin}:${process.env.PATH ?? ""}`,
-     FAKE_SOMA_DIR: somaDir,
-     FAKE_SOMA_STATE: statePath,
-     RANGER_DISCORD_API_BASE: `http://127.0.0.1:${discord.port}`,
-     RANGER_DISCORD_ALLOW_TEST_OVERRIDE: "1",
-     RANGER_DISCORD_MIN_INTERVAL_MS: "5",
-     RANGER_DISCORD_TOKEN: "fake-bot-token",
-     RANGER_WRITE_TEST: "ghp_write",
-     RANGER_NO_SPAWN: "1",
-    });
-    await Bun.sleep(2_000);
-    expect(assignees()).not.toContain("ivy-bot");
-    during(journal, somaDir);
-   });
-   const result = await walking;
-   return { result, output: `${result.stdout}${result.stderr}`, assignees: assignees(), announces: discord.posts.length };
-  } finally {
-   journal.close();
-   discord.stop();
-   rmSync(dir, { recursive: true, force: true });
-  }
- }
-
- test("a claim made elsewhere while the walk waits for the lock is re-read: the walk does not claim it again", async () => {
-  const { result, output, assignees } = await walkWhileLockHeld((journal) =>
-   // What build-now writes once it has claimed node 10 under the lock.
-   journal.upsertWorker({ nodeId: "10", repo: "acme/widgets", root: 1, status: "claimed", lane: "research" }),
-  );
-  expect(result.code).toBe(0);
-  expect(assignees).not.toContain("ivy-bot");
-  expect(output).toContain("#10 already in flight (claimed)");
- });
-
- test("a veto recorded while the walk waits for the lock is re-read: nothing is announced or claimed", async () => {
-  const { result, output, assignees, announces } = await walkWhileLockHeld((journal) =>
-   journal.recordVeto("10", "comment-1", "principal veto"),
-  );
-  expect(result.code).toBe(0);
-  expect(assignees).not.toContain("ivy-bot");
-  expect(announces).toBe(0);
-  expect(output).toContain("#10 vetoed — not claimed");
- });
-
- test("a node re-routed to HITL while the walk waits for the lock is re-read from the frontier: not announced or claimed", async () => {
-  const { result, output, assignees, announces } = await walkWhileLockHeld((_journal, somaDir) => {
-   // The principal edits node 10 to propose: the sentinel moves, the re-read sees it.
-   const file = join(somaDir, "acme__widgets-frontier.json");
-   const frontier = JSON.parse(readFileSync(file, "utf8")) as { frontier: FrontierEntry[] };
-   for (const entry of frontier.frontier) if (entry.node.id === "10") entry.node.autonomy = "propose";
-   writeFileSync(file, JSON.stringify(frontier));
-  });
-  expect(result.code).toBe(0);
-  expect(assignees).not.toContain("ivy-bot");
-  expect(announces).toBe(0);
-  expect(output).toContain("#10 routes escalate-hitl");
-  expect(output).toContain("not claimed");
- });
-
- test("a node gone from the frontier while the walk waits for the lock is not claimed", async () => {
-  const { result, output, assignees, announces } = await walkWhileLockHeld((_journal, somaDir) => {
-   const file = join(somaDir, "acme__widgets-frontier.json");
-   const frontier = JSON.parse(readFileSync(file, "utf8")) as { frontier: FrontierEntry[] };
-   frontier.frontier = frontier.frontier.filter((entry) => entry.node.id !== "10");
-   writeFileSync(file, JSON.stringify(frontier));
-  });
-  expect(result.code).toBe(0);
-  expect(assignees).not.toContain("ivy-bot");
-  expect(announces).toBe(0);
-  expect(output).toContain("#10 is no longer on the frontier — not claimed");
- });
-
- test("a pause recorded while the walk waits for the lock is re-read: the map stops claiming", async () => {
-  const { result, assignees, announces } = await walkWhileLockHeld((journal) => journal.setPaused(true));
-  expect(result.code).toBe(0);
-  expect(assignees).not.toContain("ivy-bot");
-  expect(announces).toBe(0);
-  const walked = JSON.parse(result.stdout) as { maps: { paused: boolean; gated: boolean; gateReason?: string }[] };
-  expect(walked.maps[0]).toMatchObject({
-   paused: true,
-   gated: true,
-   gateReason: expect.stringContaining("dead-man paused"),
-   claimed: [],
-  });
- });
 });
 
 describe("ranger walk — GitHub budget deferral (src/budget.ts)", () => {

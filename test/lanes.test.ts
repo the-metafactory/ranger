@@ -7,7 +7,6 @@ import { implementLane, workerLane } from "../src/lanes.ts";
 import { ConfigError, loadConfig } from "../src/config.ts";
 import { openJournal } from "../src/journal.ts";
 import { runMergeDesk } from "../src/merge-desk.ts";
-import { withClaimLock } from "../src/claim-lock.ts";
 import { realGitHub, type GitHubPort } from "../src/implement.ts";
 import type { PullRequest } from "../src/github.ts";
 import { servedMaps, ServeReader, stateFromJournal } from "../src/serve.ts";
@@ -199,8 +198,10 @@ describe("node #57/#47 — root-aware resource lanes", () => {
  test("node #58: build-now claims one node through the CLI; a held lane needs --force", async () => {
   const r = rig();
   try {
+   // RANGER_NO_SPAWN: claimed, no run-node — exit 3, never reported as a start.
    const first = await runCli(["build-now", "20", "--map", `${TOOL}#1`, "-c", r.configPath], r.env);
-   expect(first.code).toBe(0);
+   expect(first.code).toBe(3);
+   expect(first.stderr).toMatch(/claimed #20 but no run-node was started — `ranger run-node 20 --map /);
    expect(JSON.parse(first.stdout)).toMatchObject({ nodeId: "20", lane: "implement", beside: null });
    expect(r.journal.getWorker("20", TOOL)).toMatchObject({ status: "claimed", lane: "implement" });
    expect(r.journal.spawnsToday()).toBe(1);
@@ -209,7 +210,7 @@ describe("node #57/#47 — root-aware resource lanes", () => {
    expect(held.stderr).toMatch(/headless implement lane is held by #20.*--force/);
    expect(r.journal.getWorker("21", TOOL)).toBeNull();
    const beside = await runCli(["build-now", "21", "--map", TOOL, "--force", "-c", r.configPath], r.env);
-   expect(beside.code).toBe(0);
+   expect(beside.code).toBe(3);
    expect(JSON.parse(beside.stdout).beside).toMatchObject({ nodeId: "20" });
    const off = await runCli(["build-now", "99", "--map", TOOL, "-c", r.configPath], r.env);
    expect(off.code).toBe(1);
@@ -247,45 +248,6 @@ describe("node #57/#47 — root-aware resource lanes", () => {
    expect(spawned).toEqual(["20", "30"]);
    expect(posts).toHaveLength(3);
   } finally { r.close(); }
- });
-
- test("merge desk send-back takes the lane under the claim lock (node #58)", async () => {
-  const r = rig();
-  const other = openJournal(r.config);
-  try {
-   const head = "b".repeat(40);
-   const github: GitHubPort = {
-    ...realGitHub,
-    getPr: async (_repo, number) => ({ number, state: "open", merged: false, headSha: head, url: "" } as PullRequest),
-    listComments: async () => [{ id: 1, author: "ivy-bot", body: `<!-- ranger:review round=1 sha=${head} blockers=1 majors=0 nits=0 -->` }],
-   };
-   r.journal.upsertWorker({ root: 1, nodeId: "20", repo: TOOL, status: "awaiting-merge", lane: "implement", prNumber: 20 });
-   const spawned: string[] = [];
-   let release!: () => void;
-   const held = new Promise<void>((resolve) => (release = resolve));
-   let entered!: () => void;
-   const inside = new Promise<void>((resolve) => (entered = resolve));
-   // A claim in progress in another process: it takes the lane before it lets go.
-   const claim = withClaimLock(other, async () => {
-    entered();
-    await held;
-    other.upsertWorker({ root: 1, nodeId: "21", repo: TOOL, status: "claimed", lane: "implement" });
-   });
-   await inside;
-   const desk = runMergeDesk({
-    config: r.config, map: r.config.maps[1], journal: r.journal,
-    token: "unused", botIdentity: "ivy-bot", github,
-    post: async () => "new-card",
-    spawn: async (id) => { spawned.push(id); return 123; },
-   });
-   await Bun.sleep(300);
-   expect(spawned).toEqual([]);
-   release();
-   await claim;
-   expect(await desk).toMatchObject({ resumed: [], pending: ["20"], errors: [] });
-   expect(spawned).toEqual([]);
-   expect(r.journal.getWorker("20", TOOL)?.status).toBe("awaiting-merge");
-  } finally { other.close(); r.close(); }
  });
 
  test("read-only dashboard reads both resource holders", () => {

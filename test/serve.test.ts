@@ -2,8 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { type FrontierEntry, GRAPH_CALL_TIMEOUT_MS } from "../src/graph.ts";
-import { BUILD_NOW_CLAIM_START_BY_MS, BUILD_NOW_TIMEOUT_MS } from "../src/build-now-bounds.ts";
+import type { FrontierEntry } from "../src/graph.ts";
 import { Journal } from "../src/journal.ts";
 import type { WorkerRow } from "../src/journal.ts";
 import { classify, loadProbeRegistry } from "../src/route.ts";
@@ -13,7 +12,6 @@ import {
  buildNowArgv,
  childEnv,
  runVerb,
- VERB_TIMEOUT_CODE,
  servedMaps,
  createHandler,
  launchPlan,
@@ -468,8 +466,8 @@ describe("node #58 — the Build now endpoint", () => {
     launched.push(argv);
    },
    verifyGrilling: async () => null,
-   buildNowCommand: (map, nodeId, claimBy) =>
-    buildNowArgv({ bin: "/bin/ranger", key: map.key, nodeId, configPath: "/c/ranger.yaml", claimBy }),
+   buildNowCommand: (map, nodeId) =>
+    buildNowArgv({ bin: "/bin/ranger", key: map.key, nodeId, configPath: "/c/ranger.yaml" }),
    runVerb: async (argv, env) => {
     built.push({ argv, env });
     return { code: 1, tail: "ranger build-now: the headless implement lane is held by #663" };
@@ -502,21 +500,9 @@ describe("node #58 — the Build now endpoint", () => {
   });
   expect(built).toHaveLength(1);
   expect(built[0].argv).toEqual([
-   "/bin/ranger", "build-now", "10", "--map", `${REPO}#1`, "--force",
-   "--claim-by", expect.stringMatching(/^\d+$/), "--config", "/c/ranger.yaml",
+   "/bin/ranger", "build-now", "10", "--map", `${REPO}#1`, "--force", "--config", "/c/ranger.yaml",
   ]);
   expect(launched).toHaveLength(0);
- });
-
- test("the verb's claim must start early enough to end before the dashboard's kill", async () => {
-  const { handler, built } = setup();
-  const before = Date.now();
-  await handler(post(ok));
-  const claimBy = Number(built[0].argv[built[0].argv.indexOf("--claim-by") + 1]);
-  expect(claimBy).toBeGreaterThanOrEqual(before + BUILD_NOW_CLAIM_START_BY_MS);
-  expect(claimBy).toBeLessThanOrEqual(Date.now() + BUILD_NOW_CLAIM_START_BY_MS);
-  // The bounded claim (GRAPH_CALL_TIMEOUT_MS) started by then ends before runVerb's kill.
-  expect(BUILD_NOW_CLAIM_START_BY_MS + GRAPH_CALL_TIMEOUT_MS).toBeLessThan(BUILD_NOW_TIMEOUT_MS);
  });
 
  test("the verb runs with the launcher's allowlisted environment", async () => {
@@ -570,60 +556,9 @@ describe("node #58 — the Build now endpoint", () => {
   expect(built).toHaveLength(0);
  });
 
- // A real loopback server with a 1 s idle timeout and a verb silent for 3 s.
- const slowServer = async () => {
-  let handler: ReturnType<typeof createHandler> | undefined;
-  const server = Bun.serve({
-   hostname: "127.0.0.1",
-   port: 0,
-   idleTimeout: 1,
-   fetch: (req, srv) => handler!(req, srv),
-  });
-  handler = createHandler({
-   port: server.port!,
-   token: TOKEN,
-   getState: () => assembleState(inputs()),
-   refresh: () => {},
-   launch: () => {},
-   verifyGrilling: async () => null,
-   buildNowCommand: (map, nodeId, claimBy) =>
-    buildNowArgv({ bin: "/bin/ranger", key: map.key, nodeId, configPath: "/c/ranger.yaml", claimBy }),
-   runVerb: async () => {
-    await Bun.sleep(3_000);
-    return { code: 0, tail: "started" };
-   },
-  });
-  try {
-   const res = await fetch(`http://127.0.0.1:${server.port}/api/build-now`, {
-    method: "POST",
-    headers: { "x-ranger-token": TOKEN, "content-type": "application/json" },
-    body: JSON.stringify(ok),
-   });
-   return { status: res.status, body: await res.json() };
-  } finally {
-   server.stop(true);
-  }
- };
-
- test("a verb outlasting the server's idle timeout still returns its exit code", async () => {
-  expect(await slowServer()).toEqual({ status: 200, body: { nodeId: "10", exitCode: 0, tail: "started" } });
- }, 10_000);
-
- test("the handler lifts the idle timeout for a build-now run, and only for one", async () => {
-  const { handler } = setup();
-  const lifted: number[] = [];
-  const server = { timeout: (_req: Request, seconds: number) => void lifted.push(seconds) };
-  await handler(post({ ...ok, dryRun: true }), server);
-  await handler(post({ key: walked.key, id: "99" }), server);
-  expect(lifted).toEqual([]);
-  await handler(post(ok), server);
-  expect(lifted).toEqual([0]);
- });
-
- test("the argv refuses a bad id, map or deadline", () => {
-  expect(() => buildNowArgv({ bin: "b", key: `${REPO}#1`, nodeId: "1;x", configPath: "c", claimBy: 1 })).toThrow();
-  expect(() => buildNowArgv({ bin: "b", key: "bad repo#1", nodeId: "1", configPath: "c", claimBy: 1 })).toThrow();
-  expect(() => buildNowArgv({ bin: "b", key: `${REPO}#1`, nodeId: "1", configPath: "c", claimBy: 1.5 })).toThrow();
+ test("the argv refuses a bad id or map", () => {
+  expect(() => buildNowArgv({ bin: "b", key: `${REPO}#1`, nodeId: "1;x", configPath: "c" })).toThrow();
+  expect(() => buildNowArgv({ bin: "b", key: "bad repo#1", nodeId: "1", configPath: "c" })).toThrow();
  });
 
  test("runVerb returns the exit code and the last lines of output", async () => {
@@ -638,62 +573,21 @@ describe("node #58 — the Build now endpoint", () => {
   expect((await runVerb(["/nonexistent/ranger"], {})).code).toBe(-1);
  });
 
- test("runVerb kills a verb that ignores SIGTERM and reports a timeout, never success", async () => {
-  const started = Date.now();
-  const run = await runVerb(
-   ["/bin/sh", "-c", "trap \"\" TERM; echo started; while :; do sleep 0.05; done"],
-   childEnv(process.env),
-   300,
-   200,
-  );
-  expect(Date.now() - started).toBeLessThan(3_000);
-  expect(run.code).toBe(VERB_TIMEOUT_CODE);
-  expect(run.tail).toContain("started");
-  expect(run.tail).toContain("SIGKILL");
- });
-
- test("runVerb reports a timeout for a verb that exits 0 after SIGTERM", async () => {
-  const run = await runVerb(
-   ["/bin/sh", "-c", "trap \"exit 0\" TERM; while :; do sleep 0.05; done"],
-   childEnv(process.env),
-   200,
-   2_000,
-  );
-  expect(run.code).toBe(VERB_TIMEOUT_CODE);
-  expect(run.tail).toContain("timed out after");
- });
-
- test("runVerb still SIGKILLs the group when the verb exits on SIGTERM but a descendant ignores it", async () => {
+ test("runVerb stops waiting past its wait but never kills the verb", async () => {
   const dir = mkdtempSync(join(tmpdir(), "ranger-runverb-"));
-  const pidFile = join(dir, "descendant.pid");
+  const done = join(dir, "done");
   try {
-   // The descendant ignores SIGTERM and holds none of the verb's pipes, so the
-   // verb's close fires as soon as the verb itself exits.
    const run = await runVerb(
-    [
-     "/bin/sh",
-     "-c",
-     `sh -c 'trap "" TERM; while :; do sleep 0.05; done' </dev/null >/dev/null 2>&1 & echo $! > ${pidFile}; ` +
-      `trap "exit 0" TERM; while :; do sleep 0.05; done`,
-    ],
+    ["/bin/sh", "-c", `echo claiming; sleep 0.6; echo finished > ${done}`],
     childEnv(process.env),
-    300,
-    300,
+    150,
    );
-   expect(run.code).toBe(VERB_TIMEOUT_CODE);
-   const pid = Number(readFileSync(pidFile, "utf8").trim());
-   const alive = () => {
-    try {
-     process.kill(pid, 0);
-     return true;
-    } catch {
-     return false;
-    }
-   };
-   // Still alive after SIGTERM, gone once the grace period's SIGKILL lands.
-   expect(alive()).toBe(true);
-   await Bun.sleep(800);
-   expect(alive()).toBe(false);
+   expect(run.code).toBeNull();
+   expect(run.tail).toMatch(/^claiming\n\(still running after 0 s, pid \d+; not killed/);
+   expect(existsSync(done)).toBe(false);
+   await Bun.sleep(1000);
+   // The verb ran to its end after the answer: a kill could have cut a claim short.
+   expect(readFileSync(done, "utf8")).toBe("finished\n");
   } finally {
    rmSync(dir, { recursive: true, force: true });
   }

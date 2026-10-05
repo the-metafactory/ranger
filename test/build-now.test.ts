@@ -1,16 +1,15 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stringify } from "yaml";
 import { buildNow, BuildNowRefusal, type BuildNowContext } from "../src/build-now.ts";
+import { ClaimLeaseLost, withClaimLock } from "../src/claim-lock.ts";
 import { loadConfig } from "../src/config.ts";
 import type { FrontierEntry } from "../src/graph.ts";
 import { openJournal, type Journal } from "../src/journal.ts";
 import type { AnnounceContext } from "../src/announce.ts";
-import type { SpawnRunNodeArgs } from "../src/walk.ts";
-import { claimLockFile, withClaimLock } from "../src/claim-lock.ts";
-import { resumeNode } from "../src/resume-node.ts";
+import { claimNode, type SpawnRunNodeArgs } from "../src/walk.ts";
 
 /**
  * node #58 — `ranger build-now`: the walk's claim for one chosen node. The
@@ -44,7 +43,6 @@ const FRONTIER = [
  entry("13", "task"),
  entry("14", "task", "propose", BOT),
  entry("15", "task", "propose"),
- entry("16", "task"),
 ];
 
 let cleanup: (() => void)[] = [];
@@ -117,12 +115,6 @@ function rig(opts: { cap?: number } = {}) {
  return {
   config,
   journal,
-  /** A second journal on the same file: another process's view. */
-  otherJournal: () => {
-   const other = openJournal(config);
-   cleanup.unshift(() => other.close());
-   return other;
-  },
   ctx,
   announced,
   claimed,
@@ -285,50 +277,6 @@ describe("node #58 — build-now refuses", () => {
   expect(r.claimed).toHaveLength(0);
  });
 
- test("a pause recorded during the announce: no graph claim, no row, no spawn counted or started", async () => {
-  const r = rig();
-  const announce = r.ctx().announce!;
-  const message = await refusal(
-   buildNow(
-    "10",
-    r.ctx({
-     announce: async (map, a) => {
-      r.otherJournal().setPaused(true);
-      return announce(map, a);
-     },
-    }),
-   ),
-  );
-  expect(message).toMatch(/dead-man paused during the announce/);
-  expect(r.claimed).toHaveLength(0);
-  expect(r.spawned).toHaveLength(0);
-  expect(r.journal.getWorker("10", REPO)).toBeNull();
-  expect(r.journal.listEvents(REPO).map((e) => e.kind)).toEqual(["announced"]);
-  expect(r.journal.spawnsToday(new Date("2026-10-04T10:00:00Z"))).toBe(0);
- });
-
- test("a pause recorded during the graph claim: the row is parked, no worker spawned or counted", async () => {
-  const r = rig();
-  const claim = r.ctx().claim!;
-  const message = await refusal(
-   buildNow(
-    "10",
-    r.ctx({
-     claim: async (...args) => {
-      r.otherJournal().setPaused(true);
-      return claim(...args);
-     },
-    }),
-   ),
-  );
-  expect(message).toMatch(/claimed but parked: dead-man paused during the claim.*resume-node 10/);
-  expect(r.claimed).toEqual(["10"]);
-  expect(r.spawned).toHaveLength(0);
-  expect(r.journal.getWorker("10", REPO)).toMatchObject({ status: "parked", pid: null, lane: "implement", messageId: "msg-10" });
-  expect(r.journal.listEvents(REPO).map((e) => e.kind).reverse()).toEqual(["announced", "parked"]);
-  expect(r.journal.spawnsToday(new Date("2026-10-04T10:00:00Z"))).toBe(0);
- });
-
  test("a lost claim race is reported once, never retried, and writes no row", async () => {
   const r = rig();
   r.loseRace("someone-else");
@@ -339,293 +287,104 @@ describe("node #58 — build-now refuses", () => {
   expect(r.journal.listEvents(REPO).map((e) => e.kind)).toEqual(["announced"]);
   expect(r.journal.spawnsToday(new Date("2026-10-04T10:00:00Z"))).toBe(0);
  });
-
- test("a claim not started by its start-by time: nothing announced or claimed", async () => {
-  const r = rig();
-  const claimBy = new Date("2026-10-04T09:59:59Z");
-  expect(await refusal(buildNow("10", r.ctx({ claimBy })))).toMatch(/past its start-by time.*before the announce/);
-  untouched(r, "10");
- });
-
- test("a start-by time passing during the announce stops before the graph claim", async () => {
-  const r = rig();
-  let clock = new Date("2026-10-04T10:00:00Z");
-  const announce = r.ctx().announce!;
-  const message = await refusal(
-   buildNow(
-    "10",
-    r.ctx({
-     claimBy: new Date("2026-10-04T10:00:30Z"),
-     now: () => clock,
-     announce: async (map, a) => {
-      clock = new Date("2026-10-04T10:00:31Z");
-      return announce(map, a);
-     },
-    }),
-   ),
-  );
-  expect(message).toMatch(/past its start-by time.*before the graph claim/);
-  expect(r.claimed).toHaveLength(0);
-  expect(r.spawned).toHaveLength(0);
-  expect(r.journal.getWorker("10", REPO)).toBeNull();
-  expect(r.journal.listEvents(REPO).map((e) => e.kind)).toEqual(["announced"]);
-  expect(r.journal.spawnsToday(clock)).toBe(0);
- });
 });
 
-describe("node #58 — concurrent claims are serialized by the claim lock", () => {
- /** An announce slow enough that two unserialized calls would both pass every gate. */
- const slowAnnounce: BuildNowContext["announce"] = async (_map, a) => {
-  await Bun.sleep(40);
-  return { messageId: `msg-${a.nodeId}` };
- };
-
- async function both(calls: Promise<unknown>[]) {
-  const settled = await Promise.allSettled(calls);
-  const ok = settled.filter((s) => s.status === "fulfilled");
-  const refused = settled.flatMap((s) => (s.status === "rejected" ? [s.reason as Error] : []));
-  for (const error of refused) expect(error).toBeInstanceOf(BuildNowRefusal);
-  return { ok, refused: refused.map((e) => e.message) };
+describe("node #58 — the claim lock serializes claimers", () => {
+ /** A claim that waits for `release` before it answers, so two claimers overlap. */
+ function slowClaim(r: ReturnType<typeof rig>) {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  const claim: BuildNowContext["claim"] = async (repo, id, identity) => {
+   r.claimed.push(id);
+   await gate;
+   return { repo, node: id, held: true, assignees: [identity] };
+  };
+  return { claim, release };
  }
 
- test("the same node twice at once (two journals on one file): one start, one already in flight", async () => {
+ test("two build-nows of one node: the second waits, then sees it in flight", async () => {
   const r = rig();
-  const other = r.otherJournal();
-  const { ok, refused } = await both([
-   buildNow("10", r.ctx({ force: true, announce: slowAnnounce })),
-   buildNow("10", r.ctx({ force: true, announce: slowAnnounce, journal: other })),
-  ]);
-  expect(ok).toHaveLength(1);
-  expect(refused).toEqual([expect.stringMatching(/already in flight \(claimed\)/)]);
+  const slow = slowClaim(r);
+  const first = buildNow("10", r.ctx({ claim: slow.claim }));
+  await Bun.sleep(50);
+  const second = buildNow("10", r.ctx({ claim: slow.claim }));
+  await Bun.sleep(50);
+  slow.release();
+  await first;
+  expect(await refusal(second)).toMatch(/already in flight \(claimed\)/);
+  expect(r.claimed).toEqual(["10"]);
   expect(r.spawned).toHaveLength(1);
   expect(r.journal.spawnsToday(new Date("2026-10-04T10:00:00Z"))).toBe(1);
  });
 
- test("two nodes at once against a cap of one: one spawn, one refusal", async () => {
+ test("two build-nows against a cap of one: the second reads the first's spawn", async () => {
   const r = rig({ cap: 1 });
-  const { ok, refused } = await both([
-   buildNow("10", r.ctx({ force: true, announce: slowAnnounce })),
-   buildNow("11", r.ctx({ force: true, announce: slowAnnounce, journal: r.otherJournal() })),
-  ]);
-  expect(ok).toHaveLength(1);
-  expect(refused).toEqual([expect.stringMatching(/spawn cap is spent \(1\/1\)/)]);
-  expect(r.spawned).toHaveLength(1);
-  expect(r.journal.spawnsToday(new Date("2026-10-04T10:00:00Z"))).toBe(1);
+  const slow = slowClaim(r);
+  const first = buildNow("10", r.ctx({ claim: slow.claim }));
+  await Bun.sleep(50);
+  const second = buildNow("11", r.ctx({ claim: slow.claim }));
+  await Bun.sleep(50);
+  slow.release();
+  await first;
+  expect(await refusal(second)).toMatch(/daily spawn cap is spent \(1\/1\)/);
+  expect(r.spawned.map((s) => s.nodeId)).toEqual(["10"]);
  });
 
- test("two implement nodes at once without --force: the second finds the lane held", async () => {
-  const r = rig();
-  const { ok, refused } = await both([
-   buildNow("10", r.ctx({ announce: slowAnnounce })),
-   buildNow("16", r.ctx({ announce: slowAnnounce, journal: r.otherJournal() })),
-  ]);
-  expect(ok).toHaveLength(1);
-  expect(refused).toEqual([expect.stringMatching(/held by #(10|16) .*--force/)]);
-  expect(r.spawned).toHaveLength(1);
- });
-
- test("a claim in progress elsewhere (the walk) holds build-now before any gate or announce", async () => {
-  const r = rig({ cap: 1 });
-  let release!: () => void;
-  const held = new Promise<void>((resolve) => (release = resolve));
-  let entered!: () => void;
-  const inside = new Promise<void>((resolve) => (entered = resolve));
-  const walkClaim = withClaimLock(r.otherJournal(), async () => {
-   entered();
-   await held;
-   r.journal.recordSpawn(new Date("2026-10-04T10:00:00Z"));
-  });
-  await inside;
-  const build = buildNow("10", r.ctx({ force: true }));
-  await Bun.sleep(400);
-  expect(r.announced).toHaveLength(0);
-  release();
-  await walkClaim;
-  expect(await refusal(build)).toMatch(/spawn cap is spent \(1\/1\)/);
-  expect(r.announced).toHaveLength(0);
- });
-
- test("the frontier is read under the lock: a node blocked while build-now waited is refused, nothing touched", async () => {
+ test("a lock held past the wait is a refusal, and nothing is touched", async () => {
   const r = rig();
   let release!: () => void;
-  const held = new Promise<void>((resolve) => (release = resolve));
-  let entered!: () => void;
-  const inside = new Promise<void>((resolve) => (entered = resolve));
-  let frontier = FRONTIER;
-  const walkClaim = withClaimLock(r.otherJournal(), async () => {
-   entered();
-   await held;
-  });
-  await inside;
-  const build = buildNow("10", r.ctx({ force: true, readFrontier: async () => frontier }));
-  await Bun.sleep(200);
-  // Node 10 gains a blocker (off the frontier) while the walk holds the lock.
-  frontier = FRONTIER.filter((e) => e.node.id !== "10");
+  const held = withClaimLock(r.journal, () => new Promise<void>((resolve) => (release = resolve)));
+  await Bun.sleep(50);
+  const why = await refusal(buildNow("10", r.ctx({ lockWaitMs: 300 })));
   release();
-  await walkClaim;
-  expect(await refusal(build)).toMatch(/not on the map's frontier/);
+  await held;
+  expect(why).toMatch(/another claim \(a walk tick or a build-now\) is running; try again/);
   untouched(r, "10");
  });
 
- test("the frontier is read under the lock: a node edited to HITL while build-now waited is refused", async () => {
+ test("a lost lease stops the claim at its next fence", async () => {
   const r = rig();
-  let release!: () => void;
-  const held = new Promise<void>((resolve) => (release = resolve));
-  let entered!: () => void;
-  const inside = new Promise<void>((resolve) => (entered = resolve));
-  let frontier = FRONTIER;
-  const walkClaim = withClaimLock(r.otherJournal(), async () => {
-   entered();
-   await held;
-  });
-  await inside;
-  const build = buildNow("10", r.ctx({ force: true, readFrontier: async () => frontier }));
-  await Bun.sleep(200);
-  frontier = FRONTIER.map((e) => (e.node.id === "10" ? entry("10", "grilling", "propose") : e));
-  release();
-  await walkClaim;
-  expect(await refusal(build)).toMatch(/escalate-hitl.*never forced/);
-  untouched(r, "10");
- });
-
- test("a resume during build-now's announce waits for the lock, then finds the lane held", async () => {
-  const r = rig();
-  // A parked implement worker the operator resumes while build-now announces #10.
-  r.journal.upsertWorker({ nodeId: "20", repo: REPO, root: 1, status: "parked", lane: "implement", pid: null });
-  let release!: () => void;
-  const held = new Promise<void>((resolve) => (release = resolve));
-  let entered!: () => void;
-  const announcing = new Promise<void>((resolve) => (entered = resolve));
-  const build = buildNow(
-   "10",
-   r.ctx({
+  let fences = 0;
+  const owned = () => {
+   fences += 1;
+   if (fences === 2) throw new ClaimLeaseLost("claim lock lost mid-claim (test)");
+  };
+  await expect(
+   claimNode({
+    journal: r.journal,
+    map: r.config.maps[0],
+    node: { id: "10", title: "node 10" },
+    lane: "implement",
+    botIdentity: BOT,
+    token: "ghp_write",
+    cliEntry: "cli.ts",
+    configPath: "ranger.yaml",
     announce: async (_map, a) => {
-     entered();
-     await held;
-     return { messageId: `msg-${a.nodeId}` };
+     r.announced.push(a);
+     return { messageId: "msg-10" };
     },
+    claim: async (repo, id, identity) => {
+     r.claimed.push(id);
+     return { repo, node: id, held: true, assignees: [identity] };
+    },
+    spawnRunNode: async (args) => {
+     r.spawned.push(args);
+     return 1;
+    },
+    owned,
    }),
-  );
-  await announcing;
-  const resumed: SpawnRunNodeArgs[] = [];
-  const resume = resumeNode("20", {
-   journal: r.otherJournal(),
-   map: r.config.maps[0],
-   configPath: "/c/ranger.yaml",
-   spawnRunNode: async (args) => {
-    resumed.push(args);
-    return 4343;
-   },
-  });
-  const resumeOutcome = resume.then(
-   () => null,
-   (error: Error) => error.message,
-  );
-  await Bun.sleep(300);
-  expect(r.journal.getWorker("20", REPO)?.status).toBe("parked");
-  release();
-  expect((await build).nodeId).toBe("10");
-  expect(await resumeOutcome).toMatch(/held by #10 .*--force/);
-  expect(resumed).toHaveLength(0);
-  expect(r.journal.getWorker("20", REPO)?.status).toBe("parked");
- });
-
- test("a claim lock held past the wait is a refusal to press again, with nothing touched", async () => {
-  const r = rig();
-  let release!: () => void;
-  const held = new Promise<void>((resolve) => (release = resolve));
-  let entered!: () => void;
-  const inside = new Promise<void>((resolve) => (entered = resolve));
-  const walkClaim = withClaimLock(r.otherJournal(), async () => {
-   entered();
-   await held;
-  });
-  await inside;
-  expect(await refusal(buildNow("10", r.ctx({ force: true, claimLockWaitMs: 300 })))).toMatch(
-   /another claim is in progress.*press again/,
-  );
-  untouched(r, "10");
-  release();
-  await walkClaim;
- });
-});
-
-describe("node #58 — the claim lock's fence: a holder whose lease was lost stops at its next write", () => {
- /** Another process reclaimed the claim lock (our lease expired while we were stopped). */
- function reclaimElsewhere(journal: Journal) {
-  writeFileSync(
-   claimLockFile(journal),
-   JSON.stringify({ nonce: "other-process", pid: process.pid, startedAt: Date.now(), leaseUntil: Date.now() + 60_000 }),
-  );
- }
-
- test("lost during the announce: no claim, no row, no event, no spawn counted or started", async () => {
-  const r = rig();
-  const announce = r.ctx().announce!;
-  const message = await refusal(
-   buildNow(
-    "10",
-    r.ctx({
-     announce: async (map, a) => {
-      reclaimElsewhere(r.journal);
-      return announce(map, a);
-     },
-    }),
-   ),
-  );
-  expect(message).toMatch(
-   /stopped mid-claim — claim lock lost mid-claim \(another run owns the lock\) — stopped before the next write; only the announce was posted \(message msg-10\)/,
-  );
+  ).rejects.toBeInstanceOf(ClaimLeaseLost);
+  // The announce went out before the fence that failed; the claim, row and spawn did not.
   expect(r.announced).toHaveLength(1);
   expect(r.claimed).toHaveLength(0);
   expect(r.spawned).toHaveLength(0);
   expect(r.journal.getWorker("10", REPO)).toBeNull();
-  expect(r.journal.listEvents(REPO).filter((e) => e.nodeId === "10")).toEqual([]);
-  expect(r.journal.spawnsToday(new Date("2026-10-04T10:00:00Z"))).toBe(0);
  });
 
- test("lost during the graph claim: no row, no spawn counted or started, and the refusal names the graph claim left behind", async () => {
+ test("no run-node spawned: the result carries a null pid, the row stays claimed", async () => {
   const r = rig();
-  const claim = r.ctx().claim!;
-  const message = await refusal(
-   buildNow(
-    "10",
-    r.ctx({
-     claim: async (...args) => {
-      reclaimElsewhere(r.journal);
-      return claim(...args);
-     },
-    }),
-   ),
-  );
-  expect(message).toMatch(/stopped mid-claim/);
-  expect(message).toMatch(/#10 is claimed on the graph under ivy-bot with no journal row .*soma graph release 10/);
-  expect(r.claimed).toEqual(["10"]);
-  expect(r.spawned).toHaveLength(0);
-  expect(r.journal.getWorker("10", REPO)).toBeNull();
-  expect(r.journal.listEvents(REPO).filter((e) => e.nodeId === "10" && e.kind === "claimed")).toEqual([]);
-  expect(r.journal.spawnsToday(new Date("2026-10-04T10:00:00Z"))).toBe(0);
- });
-
- test("our own lease already expired: stopped before the claim, though no one has reclaimed it yet", async () => {
-  const r = rig();
-  const announce = r.ctx().announce!;
-  const message = await refusal(
-   buildNow(
-    "10",
-    r.ctx({
-     announce: async (map, a) => {
-      const file = claimLockFile(r.journal);
-      const lease = JSON.parse(readFileSync(file, "utf8")) as { leaseUntil: number };
-      writeFileSync(file, JSON.stringify({ ...lease, leaseUntil: Date.now() - 1 }));
-      return announce(map, a);
-     },
-    }),
-   ),
-  );
-  expect(message).toMatch(/our lease expired/);
-  expect(r.claimed).toHaveLength(0);
-  expect(r.spawned).toHaveLength(0);
-  expect(r.journal.getWorker("10", REPO)).toBeNull();
+  const result = await buildNow("10", r.ctx({ spawnRunNode: async () => null }));
+  expect(result.pid).toBeNull();
+  expect(r.journal.getWorker("10", REPO)).toMatchObject({ status: "claimed", pid: null });
  });
 });

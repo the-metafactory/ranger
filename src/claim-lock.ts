@@ -5,24 +5,21 @@ import type { Journal } from "./journal.ts";
 import { acquireLease, leaseOwnedCheck, type OwnedCheck, releaseLease, startHeartbeat } from "./lock.ts";
 
 /**
- * The claim lock (node #58): one cross-process lease over "check the claim
- * gates, then claim and write the journal". The walk and `ranger build-now`
- * both take it around each claim, so the gates they read (the node's row, the
- * daily spawn cap, the implement-lane holder) cannot change between the check
- * and the `claimed` row: while the lease holds, two concurrent claims are
- * serialized, and the second re-reads the gates after the first has written
- * its row and counted its spawn. Both claim under the same bot identity, so
- * the graph claim alone would let both through.
- * Both also read the frontier under it, so a node blocked or re-routed while
- * a claimer waited for the lease is seen before its claim.
+ * The claim lock (node #58): one cross-process lease that the walk and
+ * `ranger build-now` each hold while they claim. The walk holds it for a
+ * map's whole claim phase (the gate reads, the frontier read, the plan and
+ * every claim in it); build-now holds it from its gate reads through its
+ * spawn. Both claim under the same bot identity, so the graph claim alone
+ * lets two claimers of one node through; under the lock, the second reads
+ * the gates (the node's row, the daily spawn cap, the implement-lane holder)
+ * only after the first has written its `claimed` row and counted its spawn.
  *
- * The other paths that admit a new worker to an implement lane take it too,
- * around their lane read, row update and spawn: `ranger resume-node` and
- * the merge desk's send-back of a ready PR (`merge-desk.ts`). So a claim
- * that read the lane empty is not joined there before its `claimed` row
- * holds the lane. The sweep's respawn of a crashed worker takes no lock: that
- * row still holds the lane for every reader above, so the respawn admits no
- * one new.
+ * Only these two claimers take it. `ranger resume-node` and the merge desk's
+ * send-back of a ready PR start workers without it, as they did before
+ * build-now; a lane read under the lock can still be joined by one of those
+ * before the claim's row lands. Neither does a claimer re-read the pause or
+ * a veto after its gate check: one recorded during a claimer's announce is
+ * seen by the next claim, as in the walk before this lock.
  *
  * It is the announce-once lease (`lock.ts`): atomic create, renewed while
  * held, reclaimable once its lease expires. A holder stopped past the lease
@@ -40,11 +37,9 @@ import { acquireLease, leaseOwnedCheck, type OwnedCheck, releaseLease, startHear
  */
 
 /**
- * How long a claim waits for another claim to finish (the frontier read,
- * announce, claim and spawn are each bounded). A holder near every bound at
- * once (build-now: ~165 s, the sentinel and frontier reads 75 s, announce 30 s,
- * claim 60 s) outlasts it; the walk then stops claiming that map
- * for the tick, and the next tick claims.
+ * How long the walk waits for a build-now to finish its one claim (its
+ * frontier read, announce, claim and spawn are each bounded). Past it the
+ * walk leaves that map unclaimed for the tick, and the next tick claims.
  */
 export const CLAIM_LOCK_TIMEOUT_MS = 120_000;
 

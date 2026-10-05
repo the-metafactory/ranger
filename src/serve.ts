@@ -44,7 +44,6 @@ import { planTick, walkableCandidates } from "./candidates.ts";
 import { pidAlive as defaultPidAlive } from "./exec.ts";
 import { Journal, type WorkerRow } from "./journal.ts";
 import { implementLane, workerLane, type ImplementLane } from "./lanes.ts";
-import { BUILD_NOW_CLAIM_START_BY_MS, BUILD_NOW_TIMEOUT_MS } from "./build-now-bounds.ts";
 import { activeCooldown, readGraphqlBudget } from "./budget.ts";
 import { cachedFrontier } from "./frontier-cache.ts";
 import { type FrontierEntry, graphFrontier, RateLimitError } from "./graph.ts";
@@ -549,102 +548,61 @@ export function buildNowArgv(args: {
  key: string;
  nodeId: string;
  configPath: string;
- /** The latest the verb may start its graph claim (epoch ms): the dashboard's deadline. */
- claimBy: number;
 }): string[] {
  if (!ID_PATTERN.test(args.nodeId)) throw new Error(`bad node id: ${args.nodeId}`);
  const [repo, root] = args.key.split("#");
  if (!REPO_PATTERN.test(repo) || !ID_PATTERN.test(root ?? "")) throw new Error(`bad map: ${args.key}`);
- if (!Number.isSafeInteger(args.claimBy) || args.claimBy < 0) throw new Error(`bad deadline: ${args.claimBy}`);
- return [
-  args.bin, "build-now", args.nodeId, "--map", args.key, "--force",
-  "--claim-by", String(args.claimBy), "--config", args.configPath,
- ];
+ return [args.bin, "build-now", args.nodeId, "--map", args.key, "--force", "--config", args.configPath];
 }
 
 export interface VerbRun {
- code: number;
+ /** The verb's exit code; null while it still runs past the wait (it is never killed). */
+ code: number | null;
  /** The last lines of stdout and stderr together. */
  tail: string;
 }
 
 const TAIL_LINES = 20;
-/** How long a timed-out verb gets after SIGTERM before its group is SIGKILLed. */
-const KILL_GRACE_MS = 5_000;
-/** The exit code a timed-out verb reports (timeout(1)'s), whatever the child did. */
-export const VERB_TIMEOUT_CODE = 124;
+/** The verb's own reads, announce, claim and lock wait are each bounded; past this the page stops waiting. */
+const BUILD_NOW_WAIT_MS = 180_000;
 
 /**
- * Run a ranger verb detached in its own process group and wait for its exit.
- * The bound is the dashboard's (BUILD_NOW_TIMEOUT_MS); the verb refuses to
- * start a graph claim it could not finish before it (build-now-bounds.ts), so
- * a kill lands on a verb hung past its own bounds, not between a graph claim
- * and its journal row. The verb returns once its run-node is spawned, and
- * that worker (detached again, stdio ignored) outlives both. A verb still
- * running at the timeout gets SIGTERM, then SIGKILL after a grace period,
- * both to its group; it resolves as a timeout failure (code 124) no later
- * than the kill, whatever the child exits with. The SIGKILL stays scheduled
- * when the verb itself exits on SIGTERM: a descendant that ignored it is
- * still in the group.
+ * Run a ranger verb detached in its own process group and wait for its exit:
+ * the verb returns once its run-node is spawned, and that worker (detached
+ * again, stdio ignored) outlives both. A verb still running past the wait is
+ * left to finish: killing it could land between its graph claim and its
+ * `claimed` row. The answer then says it is still running, with no exit code,
+ * and the page re-reads state.
  */
-export function runVerb(
- argv: string[],
- env: Record<string, string>,
- timeoutMs = BUILD_NOW_TIMEOUT_MS,
- graceMs = KILL_GRACE_MS,
-): Promise<VerbRun> {
+export function runVerb(argv: string[], env: Record<string, string>, waitMs = BUILD_NOW_WAIT_MS): Promise<VerbRun> {
  return new Promise((resolveRun) => {
   const [command, ...args] = argv;
   let out = "";
   let settled = false;
-  let timedOut = false;
-  let killTimer: ReturnType<typeof setTimeout> | undefined;
-  const child = spawn(command, args, { env, stdio: ["ignore", "pipe", "pipe"], detached: true });
-  const take = (chunk: Buffer) => {
-   out = (out + chunk.toString()).slice(-16_000);
-  };
-  child.stdout?.on("data", take);
-  child.stderr?.on("data", take);
-  const tail = () => out.trimEnd().split("\n").slice(-TAIL_LINES).join("\n");
   const settle = (run: VerbRun) => {
    if (settled) return;
    settled = true;
    clearTimeout(timer);
-   // Past the timeout the group SIGKILL still lands: the verb exiting on
-   // SIGTERM says nothing of a descendant that ignored it.
-   if (!timedOut) clearTimeout(killTimer);
    resolveRun(run);
   };
-  const signalGroup = (signal: NodeJS.Signals): boolean => {
-   try {
-    if (child.pid !== undefined) process.kill(-child.pid, signal);
-    return true;
-   } catch {
-    return false; // the group is already gone
-   }
+  const child = spawn(command, args, { env, stdio: ["ignore", "pipe", "pipe"], detached: true });
+  const take = (chunk: Buffer) => {
+   out = (out + chunk.toString()).slice(-16_000);
   };
-  const timedOutRun = (how: string): VerbRun => ({
-   code: VERB_TIMEOUT_CODE,
-   tail: `${tail()}\n(timed out after ${Math.round(timeoutMs / 1000)} s: ${how})`.trimStart(),
-  });
+  // The pipes stay read after a timed-out answer, so the verb never blocks on a full one.
+  child.stdout?.on("data", take);
+  child.stderr?.on("data", take);
+  const tail = () => out.trimEnd().split("\n").slice(-TAIL_LINES).join("\n");
   const timer = setTimeout(() => {
-   timedOut = true;
-   signalGroup("SIGTERM");
-   killTimer = setTimeout(() => {
-    const killed = signalGroup("SIGKILL");
-    child.stdout?.destroy();
-    child.stderr?.destroy();
-    settle(timedOutRun(killed ? "SIGKILL sent after SIGTERM was ignored" : "exited after SIGTERM"));
-   }, graceMs);
-  }, timeoutMs);
+   settle({
+    code: null,
+    tail: `${tail()}\n(still running after ${Math.round(waitMs / 1000)} s, pid ${child.pid ?? "?"}; not killed: \`ranger journal\` shows how it ends)`.trimStart(),
+   });
+  }, waitMs);
   child.on("error", (error) => {
    settle({ code: -1, tail: `could not start ${command}: ${error.message}` });
   });
   child.on("close", (code, signal) => {
-   if (timedOut) {
-    settle(timedOutRun(`exited ${signal ?? code} after SIGTERM; its group gets SIGKILL after the grace period`));
-    return;
-   }
    settle({ code: code ?? (signal === null ? -1 : 128), tail: tail() });
   });
  });
@@ -674,8 +632,8 @@ export interface HandlerContext {
   * reason it is not.
   */
  verifyGrilling: (map: DashboardMap, nodeId: string) => Promise<string | null>;
- /** The `build-now --force` argv for a node (node #58), its claim to start by `claimBy` (epoch ms). */
- buildNowCommand: (map: DashboardMap, nodeId: string, claimBy: number) => string[];
+ /** The `build-now --force` argv for a node (node #58). */
+ buildNowCommand: (map: DashboardMap, nodeId: string) => string[];
  /** Run a verb and wait for its exit code and output tail. */
  runVerb: (argv: string[], env: Record<string, string>) => Promise<VerbRun>;
 }
@@ -695,17 +653,10 @@ function tokenMatches(given: string | null, token: string): boolean {
  return a.length === b.length && timingSafeEqual(a, b);
 }
 
-/** The part of Bun's server the handler uses: a per-request idle timeout. */
-export interface RequestTimeouts {
- timeout(req: Request, seconds: number): void;
-}
-
-export function createHandler(
- ctx: HandlerContext,
-): (req: Request, server?: RequestTimeouts) => Promise<Response> {
+export function createHandler(ctx: HandlerContext): (req: Request) => Promise<Response> {
  const hosts = [`127.0.0.1:${ctx.port}`, `localhost:${ctx.port}`];
  const origins = hosts.map((h) => `http://${h}`);
- return async (req: Request, server?: RequestTimeouts): Promise<Response> => {
+ return async (req: Request): Promise<Response> => {
   const url = new URL(req.url);
   // DNS rebinding: a page on another name must not read or drive this server.
   const host = req.headers.get("host") ?? url.host;
@@ -761,17 +712,8 @@ export function createHandler(
    if (node === undefined) {
     return refuse(404, `#${body.id} is not walkable on ${map.key}'s frontier`);
    }
-   // The verb's claim must start early enough to end before runVerb's kill,
-   // counted from here: the token wrapper's keychain reads come first.
-   const argv = ctx.buildNowCommand(map, node.id, Date.now() + BUILD_NOW_CLAIM_START_BY_MS);
+   const argv = ctx.buildNowCommand(map, node.id);
    if (body.dryRun === true) return json(200, { dryRun: true, argv });
-   // The verb runs for minutes at most, silent until it exits, so this
-   // request's idle timeout (Bun's default 10 s, 255 s at most) is lifted:
-   // the wait is bounded by `runVerb` instead. Bun 1.3.14 was seen to keep
-   // a pending response open past it anyway (idleTimeout 1–10 s, a handler
-   // silent for 5–14 s: 200 to fetch and curl); the explicit lift keeps the
-   // exit code from depending on that.
-   server?.timeout(req, 0);
    const run = await ctx.runVerb(argv, childEnv(process.env));
    return json(200, { nodeId: node.id, exitCode: run.code, tail: run.tail });
   }
@@ -887,6 +829,13 @@ function renderNext(s) {
   }
  }
 }
+// build-now's exit codes: 0 started, 3 claimed with no run-node (BUILD_NOW_NOT_STARTED), null still running.
+function buildOutcome(id, code) {
+ if (code === null) return "build-now #" + id + " is still running — the page shows how it ends.";
+ if (code === 0) return "build-now #" + id + " exited 0 — started.";
+ if (code === 3) return "build-now #" + id + " exited 3 — claimed, but no worker started.";
+ return "build-now #" + id + " exited " + code + " — refused or failed.";
+}
 function buildButton(s, m, n) {
  const b = el("button", { text: "Build now", title: "ranger build-now " + n.id + " --map " + m.key + " --force" });
  b.onclick = async () => {
@@ -898,7 +847,7 @@ function buildButton(s, m, n) {
   document.getElementById("out").textContent = "";
   try {
    const r = await post("/api/build-now", { key: m.key, id: n.id });
-   say("build-now #" + n.id + " exited " + r.exitCode + (r.exitCode === 0 ? " — started." : " — refused or failed."), r.exitCode !== 0);
+   say(buildOutcome(n.id, r.exitCode), r.exitCode !== 0);
    document.getElementById("out").textContent = r.tail;
   } catch (e) { say("Could not build #" + n.id + ": " + e.message, true); }
   finally { b.disabled = false; load(); }
@@ -1232,11 +1181,20 @@ export function startServe(opts: {
   refresh: () => reader.refresh(),
   launch: spawnLaunch,
   verifyGrilling: (map, nodeId) => verifyGrillingLive(opts.config, map, nodeId),
-  buildNowCommand: (map, nodeId, claimBy) =>
-   buildNowArgv({ bin: expandHome(RANGER_BIN), key: map.key, nodeId, configPath: opts.configPath, claimBy }),
+  buildNowCommand: (map, nodeId) =>
+   buildNowArgv({ bin: expandHome(RANGER_BIN), key: map.key, nodeId, configPath: opts.configPath }),
   runVerb: (argv, env) => runVerb(argv, env),
  });
- const server = Bun.serve({ hostname: "127.0.0.1", port, fetch: handler });
+ const server = Bun.serve({
+  hostname: "127.0.0.1",
+  port,
+  fetch: (req, srv) => {
+   // A build-now answer waits for the verb (BUILD_NOW_WAIT_MS), longer than
+   // Bun's default 10 s idle timeout would keep the connection open.
+   if (new URL(req.url).pathname === "/api/build-now") srv.timeout(req, 0);
+   return handler(req);
+  },
+ });
  const url = `http://127.0.0.1:${port}/`;
  if (opts.open === true) spawnLaunch(["open", url], childEnv(process.env));
  return {
