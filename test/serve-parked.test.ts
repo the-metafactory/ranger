@@ -326,10 +326,10 @@ describe("node #54 — CI, by the merge gate's rules", () => {
   expect(checkRunsFromPages({ check_runs: [] })).toBeNull();
   expect(checkRunsFromPages(null)).toBeNull();
  });
- test("Actions-only CI is shown but never merged on: an external check could be failing", () => {
+ test("Actions-only green CI offers the merge: the action re-reads every check before it merges", () => {
   const view = { number: 7, url: "u", state: "open", merged: false, draft: false, headSha: "a".repeat(40), mergeable: true, ci: "green", readAt: "t" } as const;
-  expect(mergeRefusal({ ...view, ciSource: "actions" })).toContain("only the Actions workflow runs could be read");
-  expect(mergeRefusal({ ...view, ciSource: "checks" })).toBeNull();
+  expect(mergeRefusal({ ...view, ciSource: "actions" })).toBeNull();
+  expect(mergeRefusal({ ...view, ciSource: "actions", ci: "pending" })).toBe("CI is pending");
  });
  test("workflow runs stand in for check runs: latest per workflow and event, and only for the head asked about", () => {
   const sha = "a".repeat(40);
@@ -438,7 +438,14 @@ describe("node #54 — the actions and their guards", () => {
   now: new Date("2026-10-04T15:00:00Z"),
  });
  const setup = (
-  opts: { rows?: WorkerRow[]; labels?: string[]; live?: PrView | null; pr?: PrView | null; exists?: (p: string) => boolean } = {},
+  opts: {
+   rows?: WorkerRow[];
+   labels?: string[];
+   live?: PrView | null;
+   pr?: PrView | null;
+   exists?: (p: string) => boolean;
+   verifyChecks?: (repo: string, sha: string, env: Record<string, string>) => Promise<PrView["ci"] | null>;
+  } = {},
  ) => {
   const runs: { argv: string[]; env: Record<string, string>; detached: boolean }[] = [];
   const run: ActionRunner = async (argv, env, o) => {
@@ -472,6 +479,7 @@ describe("node #54 — the actions and their guards", () => {
     rangerBin: "/Users/someone/bin/ranger",
     configPath: "/Users/someone/ranger/ranger.yaml",
     readPr: async () => (opts.live === undefined ? greenPr() : opts.live),
+    ...(opts.verifyChecks === undefined ? {} : { verifyChecks: opts.verifyChecks }),
     exists: opts.exists ?? (() => true),
     after: (e) => after.push(e.nodeId),
    },
@@ -530,6 +538,38 @@ describe("node #54 — the actions and their guards", () => {
   expect(Object.keys(runs[0].env).some((k) => /TOKEN/.test(k))).toBe(false);
   expect(runs[0].env.HOME).toBe("/Users/someone");
  });
+
+ test("an Actions-only green PR merges once every check, read under the principal's login, is green", async () => {
+  const seen: { repo: string; sha: string; env: Record<string, string> }[] = [];
+  const actionsOnly = greenPr({ ciSource: "actions" });
+  const { handler, runs } = setup({
+   pr: actionsOnly,
+   live: actionsOnly,
+   verifyChecks: async (repo, sha, env) => {
+    seen.push({ repo, sha, env });
+    return "green";
+   },
+  });
+  const res = await handler(post("/api/merge", { ...ok, sha: SHA }));
+  expect(res.status).toBe(200);
+  expect(runs).toHaveLength(1);
+  expect(seen).toEqual([{ repo: SEELITE, sha: SHA, env: runs[0].env }]); // the merge's own environment
+  for (const key of MACHINE_GH_KEYS) expect(seen[0].env[key]).toBeUndefined();
+ });
+
+ for (const [why, full, says] of [
+  ["a failing external check", "failed", "every check, read under your login: CI is failed"],
+  ["checks the principal cannot read either", null, "every check could not be read under your login"],
+ ] as const) {
+  test(`an Actions-only green PR is refused on ${why}`, async () => {
+   const actionsOnly = greenPr({ ciSource: "actions" });
+   const { handler, runs } = setup({ pr: actionsOnly, live: actionsOnly, verifyChecks: async () => full });
+   const res = await handler(post("/api/merge", { ...ok, sha: SHA }));
+   expect(res.status).toBe(409);
+   expect(JSON.stringify(await res.json())).toContain(says);
+   expect(runs).toHaveLength(0);
+  });
+ }
 
  test("the session prompt carries the repo, the id and the reason class only", async () => {
   const { handler, runs } = setup();
