@@ -55,6 +55,18 @@ export function evaluateMergeGate(input: MergeGateInput): MergeGateResult {
   };
  }
 
+ // 0. A known conflict fails before CI is read: GitHub starts no pull_request
+ //    workflow on a conflicting PR, so "no check runs yet" would read as
+ //    pending forever (seelite #692, 2026-10-05: ready and sage-clean, never
+ //    carded, because #686/#687 landed while it was being built).
+ if (pr.mergeable === false || pr.mergeableState === "dirty") {
+  return {
+   status: "fail",
+   check: "mergeable",
+   reason: `mergeable=${pr.mergeable}, state=${pr.mergeableState} (conflicts with ${input.expectedBase})`,
+  };
+ }
+
  // 1. CI green on the live head, by the shared policy (`ci-policy.ts`).
  const ci = classifyCi(input.checkRuns);
  if (ci.state === "none") {
@@ -84,16 +96,10 @@ export function evaluateMergeGate(input: MergeGateInput): MergeGateResult {
  }
  const success = ci.success;
 
- // 2. mergeable. GitHub computes this lazily; null means "ask again".
+ // 2. mergeable. GitHub computes this lazily; null means "ask again". A known
+ //    conflict already failed at step 0.
  if (pr.mergeable === null || pr.mergeableState === "unknown") {
   return { status: "pending", check: "mergeable", reason: "GitHub is still computing mergeability" };
- }
- if (!pr.mergeable || pr.mergeableState === "dirty") {
-  return {
-   status: "fail",
-   check: "mergeable",
-   reason: `mergeable=${pr.mergeable}, state=${pr.mergeableState} (conflicts with ${input.expectedBase})`,
-  };
  }
 
  // 3. base branch.

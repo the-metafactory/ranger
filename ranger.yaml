@@ -125,10 +125,10 @@ bot:
   identity: ivy-agent
 
 # Worker budgets. reviewRounds: sage rounds per implement-lane PR before ranger
-# parks it for the principal (principal, 2026-10-03: 5, up from the design §4
+# parks it for the principal (principal, 2026-10-05: 7, up from 5 on 2026-10-03 and the design §4
 # default of 2).
 workers:
-  reviewRounds: 5
+  reviewRounds: 7
   # New claims per UTC day across all maps (default 10). Raised to 20
   # (principal, 2026-10-04): two lanes and three walked maps used up 10 by midday.
   spawnCapPerDay: 20

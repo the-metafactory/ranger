@@ -40,7 +40,7 @@ export async function sageReview(
  repo: string,
  prNumber: number,
  readOnlyToken: string,
- opts: { command?: string; timeoutMs?: number; substrate?: SubstrateName } = {},
+ opts: { command?: string; timeoutMs?: number; substrate?: SubstrateName; nice?: number } = {},
 ): Promise<ReviewVerdict> {
  const gated = gatedEnv(readOnlyToken, {}, workerHostEnv());
  try {
@@ -58,6 +58,7 @@ export async function sageReview(
     env: gated.env,
     timeoutMs: opts.timeoutMs ?? REVIEW_TIMEOUT_MS,
     processGroup: true,
+    ...(opts.nice === undefined ? {} : { nice: opts.nice }),
    },
    // A verdict is never retried, whatever its text says; only a failed run
    // with no verdict block whose error is GitHub-side.

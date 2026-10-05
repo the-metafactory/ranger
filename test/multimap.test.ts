@@ -11,6 +11,9 @@ import { Journal, openJournal } from "../src/journal.ts";
 import { LAST_IMPLEMENT_MAP, mapKey, pickMap, resumeMap } from "../src/maps.ts";
 import { servedMaps, ServeReader, stateFromJournal } from "../src/serve.ts";
 import { sweepMap } from "../src/sweep.ts";
+import type { GitHubPort } from "../src/github.ts";
+import { walk } from "../src/walk.ts";
+import { implementLane } from "../src/lanes.ts";
 import { fakeDiscord, fixturesBin, runCli } from "./support.ts";
 
 const REPO = "acme/widgets";
@@ -72,6 +75,37 @@ function rig() {
   FAKE_SOMA_STATE: state, RANGER_WRITE_TEST: "ghp_write", RANGER_RO_TEST: "ghp_readonly", RANGER_NO_SPAWN: "1", RANGER_DISCORD_TOKEN: "test",
   RANGER_DISCORD_API_BASE: `http://127.0.0.1:${discord.port}`, RANGER_DISCORD_ALLOW_TEST_OVERRIDE: "1", RANGER_DISCORD_MIN_INTERVAL_MS: "5" };
  return { dir, configPath, config, journal, env, discord, frontier, close() { journal.close(); discord.stop(); rmSync(dir, { recursive: true, force: true }); } };
+}
+
+/** Run `fn` on a fresh rig with its env installed in-process (walk() reads it), then restore and close. */
+async function withRigEnv(fn: (r: ReturnType<typeof rig>) => Promise<void>): Promise<void> {
+ const r = rig();
+ const saved = { ...process.env };
+ try {
+  Object.assign(process.env, r.env);
+  await fn(r);
+ } finally {
+  for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
+  Object.assign(process.env, saved);
+  r.close();
+ }
+}
+
+/** A merge desk's fake forge: PR #7 for node 40, sage-clean at its head, conflicting with main. */
+function conflictingPrForge(): GitHubPort {
+ const head = "a".repeat(40);
+ return {
+  getPr: async () => ({
+   number: 7, state: "open", merged: false, draft: false, title: "Node 40", headRef: "node/40-x", headSha: head,
+   baseRef: "main", mergeable: false, mergeableState: "dirty", mergeCommitSha: null, mergedBy: null,
+   url: "https://github.com/acme/widgets/pull/7", author: "ivy-bot",
+  }),
+  listComments: async () => [
+   { id: 1, author: "ivy-bot", body: `<!-- ranger:review round=5 sha=${head} blockers=0 majors=0 nits=1 -->\nclean` },
+  ],
+  checkRunsFor: async () => [],
+  issueLabels: async () => [],
+ } as unknown as GitHubPort;
 }
 
 describe("node #47 — map identity", () => {
@@ -386,6 +420,66 @@ describe("node #47 — map identity", () => {
    expect((await tick()).code).toBe(0);
    expect(r.journal.getWorker("23", REPO)?.root).toBe(1); // empty sibling skipped
   } finally { r.close(); }
+ });
+
+ test("a merge-desk send-back takes its lane before a fresh claim (seelite #691 beat #491 to it, 2026-10-05)", async () => {
+  await withRigEnv(async (r) => {
+   // Node 40 waits for its merge on root 460; its PR now conflicts with main.
+   // Both maps have a fresh candidate (20, 21) for the same headless lane.
+   r.journal.upsertWorker({ root: 460, nodeId: "40", repo: REPO, status: "awaiting-merge", lane: "implement" });
+   r.journal.updateWorker("40", REPO, { phase: "awaiting-merge", prNumber: 7 });
+   const spawned: string[] = [];
+   const result = await walk({
+    config: r.config, configPath: r.configPath, journal: r.journal, github: conflictingPrForge(),
+    spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; },
+   });
+   expect(spawned).toEqual(["40"]); // the send-back, and no fresh worker
+   expect(result.maps.flatMap((m) => m.claimed)).toEqual([]);
+   expect(r.journal.getWorker("40", REPO)).toMatchObject({ status: "running", phase: "review" });
+   expect(r.journal.getWorker("20", REPO)).toBeNull();
+   expect(r.journal.getWorker("21", REPO)).toBeNull();
+   expect(result.maps.some((m) => (m.sweep?.mergeDesk?.resumed ?? []).includes("40"))).toBe(true);
+  });
+ });
+
+ test("a crashed holder on a later map is released before an earlier map's desk asks for the lane", async () => {
+  await withRigEnv(async (r) => {
+   // The send-back is on root 1, walked first; root 460's crashed holder has used every attempt.
+   r.journal.upsertWorker({ root: 1, nodeId: "40", repo: REPO, status: "awaiting-merge", lane: "implement" });
+   r.journal.updateWorker("40", REPO, { phase: "awaiting-merge", prNumber: 7 });
+   r.journal.upsertWorker({ root: 460, nodeId: "45", repo: REPO, status: "running", lane: "implement" });
+   r.journal.updateWorker("45", REPO, { pid: 999_999, attempts: r.config.workers.maxAttempts, phase: "implement" });
+   expect(r.journal.laneHolder(implementLane(r.config.maps[0]))?.nodeId).toBe("45");
+   const spawned: string[] = [];
+   const result = await walk({
+    config: r.config, configPath: r.configPath, journal: r.journal, github: conflictingPrForge(),
+    spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; },
+   });
+   expect(r.journal.getWorker("45", REPO)?.status).not.toBe("running"); // parked or released
+   expect(spawned).toEqual(["40"]);
+   expect(result.maps.flatMap((m) => m.claimed)).toEqual([]);
+   expect(r.journal.getWorker("40", REPO)).toMatchObject({ status: "running", phase: "review" });
+  });
+ });
+
+ test("a liveness sweep that throws still reports what the merge desk did", async () => {
+  await withRigEnv(async (r) => {
+   r.journal.upsertWorker({ root: 460, nodeId: "40", repo: REPO, status: "awaiting-merge", lane: "implement" });
+   r.journal.updateWorker("40", REPO, { phase: "awaiting-merge", prNumber: 7 });
+   // A crashed worker whose respawn throws: the liveness sweep fails, and the row keeps the lane.
+   r.journal.upsertWorker({ root: 460, nodeId: "45", repo: REPO, status: "running", lane: "implement" });
+   r.journal.updateWorker("45", REPO, { pid: 999_999, attempts: 0, phase: "implement" });
+   const result = await walk({
+    config: r.config, configPath: r.configPath, journal: r.journal, github: conflictingPrForge(),
+    spawnRunNode: async ({ nodeId }) => {
+     if (nodeId === "45") throw new Error("spawn exploded");
+     return process.pid;
+    },
+   });
+   const map460 = result.maps.find((m) => m.repo === REPO && m.errors.some((e) => e.includes("spawn exploded")));
+   expect(map460).toBeDefined();
+   expect(map460?.sweep?.mergeDesk?.pending).toEqual(["40"]); // the desk ran, waited on the held lane, and says so
+  });
  });
 
  test("starts in another resource lane do not starve sibling map rotation", async () => {

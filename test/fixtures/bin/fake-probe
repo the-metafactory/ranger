@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 # Fake probe tier for tests. Args: <mode> <node> [statefile]
 # Prints the selector's summary lines, then: ok → exit 0; fail → exit 1;
-# flaky → fail on the first run (creating statefile), pass on the next.
+# flaky → fail on the first run (creating statefile), pass on the next;
+# red → probe-hud.mjs fails its "the hud draws" check everywhere (a red base);
+# branch-red → probe-hud.mjs fails only where the worker's src/feature.ts exists
+# (the branch, not its base); branch-other → it fails everywhere, but on the
+# branch a different check fails too; branch-crash → it fails the same check
+# everywhere, but on the branch the probe then crashes. Failures print the
+# seelite runner's layout.
 # Refuses (exit 3) when a ranger credential leaked into its env.
 set -euo pipefail
 if [ -n "${GH_TOKEN:-}" ] || [ -n "${GIT_CONFIG_VALUE_0:-}" ] || [ -n "${RANGER_WRITE_TEST:-}" ]; then
@@ -15,6 +21,24 @@ echo "selected: 2"
 case "$mode" in
   ok) echo "node $node: 2 probes passed"; exit 0 ;;
   fail) echo "probe-hud failed" >&2; exit 1 ;;
+  dies)
+    # Lists the two selected probes (after the selected: line above), finishes the first, then dies like a timed-out run.
+    printf '  probe-a.mjs\n  probe-b.mjs\nok   probe-a.mjs (1.0s)\n'
+    kill -9 $$ ;;
+  red)
+    printf 'FAIL probe-hud.mjs (0.1s) exit=1 assert peak load 1.0\n     │   ok   the hud mounts\n     │  FAIL  the hud draws — {"drawn":false}\nFAILED: probe-hud.mjs\n'
+    exit 1 ;;
+  branch-other)
+    printf 'FAIL probe-hud.mjs (0.1s) exit=1 assert peak load 1.0\n     │  FAIL  the hud draws — {"drawn":false}\n'
+    if [ -f src/feature.ts ]; then printf '     │  FAIL  the hud scales — {"scale":0}\n'; fi
+    echo "FAILED: probe-hud.mjs"; exit 1 ;;
+  branch-crash)
+    kind=assert; if [ -f src/feature.ts ]; then kind=crash; fi
+    printf 'FAIL probe-hud.mjs (0.1s) exit=1 %s peak load 1.0\n     │  FAIL  the hud draws — {"drawn":false}\n' "$kind"
+    echo "FAILED: probe-hud.mjs"; exit 1 ;;
+  branch-red)
+    if [ -f src/feature.ts ]; then printf 'FAIL probe-hud.mjs (0.1s) exit=1 assert peak load 1.0\n     │  FAIL  the hud draws — {"drawn":false}\nFAILED: probe-hud.mjs\n'; exit 1; fi
+    echo "node $node: probe-hud.mjs passed"; exit 0 ;;
   flaky)
     if [ -f "$state" ]; then echo "passed on retry"; exit 0; fi
     touch "$state"; echo "flaked" >&2; exit 1 ;;

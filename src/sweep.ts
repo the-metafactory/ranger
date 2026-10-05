@@ -37,6 +37,13 @@ export interface SweepContext {
  respawn?: (nodeId: string, repo: string, root: number) => Promise<number | null>;
  /** Merge-desk seams (tests): the forge and the Discord post. */
  github?: GitHubPort;
+ /**
+  * Which half to run (default both): `liveness` reconciles crashed workers
+  * (respawn, park, release); `desk` runs only the merge desk. The tick runs
+  * every map's liveness before any map's desk, so a send-back sees the lanes
+  * that crashed holders released on any map.
+  */
+ phase?: "all" | "liveness" | "desk";
  post?: import("./merge-desk.ts").MergeDeskContext["post"];
 }
 
@@ -70,9 +77,11 @@ export async function sweepMap(ctx: SweepContext): Promise<SweepMapResult> {
   orphansKilled: [],
  };
 
- const inFlight = journal.listWorkers(repo, map.root).filter(
-  (w) => w.status === "claimed" || w.status === "running",
- );
+ const phase = ctx.phase ?? "all";
+ const inFlight =
+  phase === "desk"
+   ? []
+   : journal.listWorkers(repo, map.root).filter((w) => w.status === "claimed" || w.status === "running");
 
  for (const worker of inFlight) {
   // No observed PID = no supervisor yet (freshly claimed, spawn pending, or
@@ -160,7 +169,7 @@ export async function sweepMap(ctx: SweepContext): Promise<SweepMapResult> {
  }
 
  // Implement-lane rows waiting on (or parked before) the principal's merge (#23).
- if (journal.listWorkers(repo, map.root).some(watchedByMergeDesk)) {
+ if (phase !== "liveness" && journal.listWorkers(repo, map.root).some(watchedByMergeDesk)) {
   result.mergeDesk = await runMergeDesk({
    config,
    journal,

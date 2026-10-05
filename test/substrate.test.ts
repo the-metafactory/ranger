@@ -12,6 +12,7 @@ import {
  effectiveThreshold,
  extractClaudeResultText,
  freshReadings,
+ hookStopReason,
  isClaudeSignalLine,
  markSubstrateCapped,
  parseClaudeRateLimitEvent,
@@ -263,6 +264,27 @@ describe("parseClaudeRateLimitEvent", () => {
 });
 
 // ---- Claude result text extraction ----
+
+describe("hookStopReason", () => {
+ // The result event `claude -p --output-format stream-json` printed for the
+ // fix passes soma's prompt guard stopped on 2026-10-04 (trimmed).
+ const STOPPED =
+  '{"is_error":false,"num_turns":0,"subtype":"success","result":"Operation stopped by hook: Runtime policy denied this action: security-disable-request.","type":"result"}';
+
+ test("a Claude stream that ran no turn and carries the stop text is a hook stop", () => {
+  expect(hookStopReason("", ['{"type":"system"}', STOPPED])).toBe("Runtime policy denied this action: security-disable-request.");
+ });
+ test("a session that ran turns is not a stop, whatever its summary says", () => {
+  expect(hookStopReason("", [STOPPED.replace('"num_turns":0', '"num_turns":7')])).toBeNull();
+ });
+ test("a stream with no result event is not a stop", () => {
+  expect(hookStopReason("", ['{"type":"rate_limit_event"}'])).toBeNull();
+ });
+ test("plain output: only the bare stop line counts", () => {
+  expect(hookStopReason("Operation stopped by hook: blocked by policy\n")).toBe("blocked by policy");
+  expect(hookStopReason("Done. One tool call was refused:\nOperation stopped by hook: blocked")).toBeNull();
+ });
+});
 
 describe("extractClaudeResultText", () => {
  test("extracts the result event text from stream-json", () => {

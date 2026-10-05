@@ -14,13 +14,15 @@ import { join } from "node:path";
 import { loadConfig } from "../src/config.ts";
 import { runCmd } from "../src/exec.ts";
 import type { CheckRun, IssueComment, PullRequest } from "../src/github.ts";
-import type { GitHubPort } from "../src/implement.ts";
+import { baseMergeMarker, recordedBaseMerges, type GitHubPort } from "../src/implement.ts";
 import { Database } from "bun:sqlite";
 import { openJournal, type Journal } from "../src/journal.ts";
 import { ReviewError, type ReviewVerdict } from "../src/review.ts";
 import { LAST_IMPLEMENT_MAP } from "../src/maps.ts";
 import { sweepMap } from "../src/sweep.ts";
-import { runNode, type RunNodeContext } from "../src/worker.ts";
+import { bootstrapWorktree, runNode, type RunNodeContext } from "../src/worker.ts";
+import { keyLabel } from "../src/git-ops.ts";
+import { trustCurrentGitState } from "../src/git-trust.ts";
 import { baseConfigLines, createCanonicalRepo, GIT_ENV } from "./support.ts";
 import { saveViewsRecord, viewsDirectory } from "../src/views.ts";
 import { DiscordAnnouncer } from "../src/announce.ts";
@@ -80,12 +82,17 @@ class FakeGitHub implements GitHubPort {
    headRef: pr.head,
    headSha: pr.mergedSha ?? (await this.sha(pr.head)),
    baseRef: pr.base,
-   mergeable: true,
-   mergeableState: "clean",
+   ...(pr.merged ? { mergeable: true, mergeableState: "clean" } : await this.mergeability(pr.head)),
    mergeCommitSha: pr.mergedSha,
    url: `https://github.com/acme/widgets/pull/${n}`,
    author: BOT,
   };
+ }
+
+ /** Like GitHub: a trial merge of the head into origin main decides mergeability. */
+ private async mergeability(head: string): Promise<{ mergeable: boolean; mergeableState: string }> {
+  const trial = await runCmd("git", ["merge-tree", "--write-tree", "main", `refs/heads/${head}`], { cwd: this.origin });
+  return trial.code === 0 ? { mergeable: true, mergeableState: "clean" } : { mergeable: false, mergeableState: "dirty" };
  }
 
  async findPrByHead(_repo: string, branch: string) {
@@ -154,14 +161,14 @@ class FakeGitHub implements GitHubPort {
 function scriptedReviewer(
  github: FakeGitHub,
  blockers: number[],
- onReview?: (round: number) => void,
+ onReview?: (round: number) => void | Promise<void>,
  majors: number[] = [0],
 ) {
  const calls: number[] = [];
  const reviewer = async (_repo: string, pr: number): Promise<ReviewVerdict> => {
   const round = calls.length + 1;
   calls.push(pr);
-  onReview?.(round);
+  await onReview?.(round);
   const head = (await github.getPr("acme/widgets", pr)).headSha;
   const b = blockers[Math.min(round - 1, blockers.length - 1)];
   const m = majors[Math.min(round - 1, majors.length - 1)];
@@ -197,11 +204,17 @@ async function rig(opts: {
  author?: string;
  blockers?: number[];
  majors?: number[];
- onReview?: (round: number) => void;
+ onReview?: (round: number) => void | Promise<void>;
  /** commands.probe for the map (a fake-probe invocation). */
  probe?: string;
+ /** commands.probeRetry for the map. */
+ probeRetry?: string;
+ /** commands.install for the map. */
+ install?: string;
+ /** commands.test for the map (default: test -f src/feature.ts). */
+ test?: string;
  autoMerge?: boolean;
-}): Promise<Rig & { calls: number[] }> {
+}): Promise<Rig & { calls: number[]; announced: string[] }> {
  const nodeId = opts.nodeId ?? "20";
  const dir = mkdtempSync(join(tmpdir(), "ranger-implement-"));
  const { origin, canonical } = await createCanonicalRepo(dir);
@@ -253,8 +266,10 @@ async function rig(opts: {
   map: [
    `    canonical: ${canonical}`,
    "    commands:",
-   "      test: test -f src/feature.ts",
+   `      test: '${opts.test ?? "test -f src/feature.ts"}'`,
    ...(opts.probe === undefined ? [] : [`      probe: '${opts.probe}'`]),
+   ...(opts.probeRetry === undefined ? [] : [`      probeRetry: '${opts.probeRetry}'`]),
+   ...(opts.install === undefined ? [] : [`      install: '${opts.install}'`]),
    ...(opts.autoMerge === true ? ["    autoMerge: true"] : []),
   ],
   auth: ["  writeTokens:", '    "acme/*": RANGER_WRITE_TEST'],
@@ -284,9 +299,12 @@ async function rig(opts: {
  journal.upsertWorker({ root: opts.root ?? 1, nodeId, repo: "acme/widgets", status: "claimed", lane: "implement" });
  const github = new FakeGitHub(origin);
  const { reviewer, calls } = scriptedReviewer(github, opts.blockers ?? [0], opts.onReview, opts.majors ?? [0]);
+ const announced: string[] = [];
  const ctx: RunNodeContext = {
   config,
   map: config.maps.find(m => m.root === (opts.root ?? 1))!,
+  hostLoad: () => ({ load: 0, cores: 1 }), // a quiet host: the probe tier never waits
+  announce: async (text) => announced.push(text),
   token: "ghp_write",
   botIdentity: BOT,
   journal,
@@ -295,7 +313,31 @@ async function rig(opts: {
   reviewer,
   readOnlyToken: "ghp_readonly",
  };
- return { dir, origin, canonical, journal, statePath, ctx, github, calls };
+ return { dir, origin, canonical, journal, statePath, ctx, github, calls, announced };
+}
+
+/** Land scripts/probe-hud.mjs on origin's main and fetch it, so the merge base has that probe. */
+async function seedProbeOnBase(r: Rig): Promise<void> {
+ const seed = join(r.dir, "seed");
+ const git = (args: string[], cwd: string) => runCmd("git", args, { cwd, env: { ...process.env, ...GIT_ENV } });
+ mkdirSync(join(seed, "scripts"), { recursive: true });
+ writeFileSync(join(seed, "scripts", "probe-hud.mjs"), "// the hud probe\n");
+ await git(["add", "-A"], seed);
+ await git(["commit", "-m", "add the hud probe"], seed);
+ expect((await git(["push", r.origin, "main"], seed)).code).toBe(0);
+ expect((await git(["fetch", "origin"], r.canonical)).code).toBe(0);
+}
+
+/** Land a commit on origin's main that conflicts with the worker's src/feature.ts (the base moved under the node). */
+async function moveBaseUnder(r: Rig): Promise<void> {
+ const seed = join(r.dir, "seed");
+ const git = (args: string[]) => runCmd("git", args, { cwd: seed, env: { ...process.env, ...GIT_ENV } });
+ await git(["pull", "-q", r.origin, "main"]);
+ mkdirSync(join(seed, "src"), { recursive: true });
+ writeFileSync(join(seed, "src", "feature.ts"), "export const fromMain = true;\n");
+ await git(["add", "-A"]);
+ await git(["commit", "-m", "main lands its own feature.ts"]);
+ expect((await git(["push", r.origin, "HEAD:main"])).code).toBe(0);
 }
 
 /** The node's substrate sessions (node #56), oldest first: [substrate, kind, outcome]. */
@@ -539,6 +581,209 @@ describe("implement lane (node #23)", () => {
   expect(readFileSync(log as string, "utf8")).toContain("build pass — exit 0");
  }, 60_000);
 
+ // Node #81: the supervisor's tests run worker-written code. A failed run's
+ // change to the shared git config must not become the next run's trusted
+ // starting point.
+ describe("known-good git state across runs (node #81)", () => {
+  const TAMPER = "git config http.sslVerify false; exit 1";
+  const git = (args: string[], cwd: string) => runCmd("git", args, { cwd, env: { ...process.env, ...GIT_ENV } });
+  const fetchedMain = async (r: Rig) => (await git(["rev-parse", "refs/remotes/origin/main"], r.canonical)).stdout.trim();
+  /** Move origin main, so a credentialed fetch by the next run would show. */
+  const moveOriginMain = async (r: Rig) => {
+   const seed = join(r.dir, "seed");
+   writeFileSync(join(seed, "NOTES.md"), "later\n");
+   await git(["add", "-A"], seed);
+   await git(["commit", "-m", "later on main"], seed);
+   expect((await git(["push", r.origin, "HEAD:main"], seed)).code).toBe(0);
+  };
+
+  test("a failed test run that sets http.sslVerify parks the resume at the implement phase before any credentialed git call", async () => {
+   const r = await rig({});
+   cleanup.push(r.dir);
+   r.ctx.map.commands.test = TAMPER;
+   const first = await runNode("20", r.ctx);
+   expect(first.status).toBe("failed");
+   expect(first.detail).toContain("tests (");
+   expect((await git(["config", "--get", "http.sslVerify"], r.canonical)).stdout.trim()).toBe("false");
+
+   r.ctx.map.commands.test = "test -f src/feature.ts";
+   await moveOriginMain(r);
+   const fetched = await fetchedMain(r);
+   r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+   const resumed = await runNode("20", r.ctx);
+   expect(resumed.status).toBe("parked");
+   expect(resumed.detail).toContain("http.sslverify (new)");
+   expect(resumed.detail).toContain("ranger trust-git --map acme/widgets#1");
+   expect(r.journal.getWorker("20", "acme/widgets")?.status).toBe("parked");
+   expect(r.journal.getWorker("20", "acme/widgets")?.outcome).toContain("http.sslverify");
+   expect(r.journal.deadmanCount()).toBe(1); // the failed run only; a park is not a crash
+   // Nothing ran under the credential: no fetch, no push, no PR.
+   expect(await fetchedMain(r)).toBe(fetched);
+   expect(await r.github.sha("node/20-add-the-feature-module")).toBe("");
+   expect(r.github.prs.size).toBe(0);
+
+   // Parked again on the next resume: the changed state was not adopted.
+   r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+   expect((await runNode("20", r.ctx)).status).toBe("parked");
+
+   // The operator vets the change and trusts it; the node then runs (from a
+   // clean branch: the fake worker cannot commit the same build twice).
+   const { hash } = await trustCurrentGitState(r.journal, r.canonical, "acme/widgets");
+   await trustCurrentGitState(r.journal, r.canonical, "acme/widgets", hash);
+   await git(["reset", "--hard", "refs/remotes/origin/main"], join(r.canonical, ".worktrees", "node-20"));
+   r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+   expect(await fetchedMain(r)).not.toBe(fetched);
+  }, 60_000);
+
+  test("a failed test run that sets http.sslVerify parks the adoption of its committed work before any credentialed git call", async () => {
+   const r = await rig({});
+   cleanup.push(r.dir);
+   r.ctx.map.commands.test = TAMPER;
+   expect((await runNode("20", r.ctx)).status).toBe("failed"); // built and committed; the tests tamper and fail
+   expect((await git(["config", "--get", "http.sslVerify"], r.canonical)).stdout.trim()).toBe("false");
+
+   r.ctx.map.commands.test = "test -f src/feature.ts"; // the committed work would now pass adoption
+   r.ctx.workerCommand = [implementWorker, "noop"]; // a worker session would commit nothing and fail, not park
+   await moveOriginMain(r);
+   const fetched = await fetchedMain(r);
+   r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+   const resumed = await runNode("20", r.ctx);
+   expect(resumed.status).toBe("parked");
+   expect(resumed.detail).toContain("http.sslverify (new)");
+   const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+   expect(events.some((d) => d.startsWith("adopting "))).toBe(false);
+   expect(await fetchedMain(r)).toBe(fetched);
+   expect(await r.github.sha("node/20-add-the-feature-module")).toBe("");
+   expect(r.github.prs.size).toBe(0);
+  }, 60_000);
+
+  test("a failed fix-pass test run that sets http.sslVerify parks the resume at the review phase before its push", async () => {
+   const r = await rig({ blockers: [1, 0] });
+   cleanup.push(r.dir);
+   // Passes on the build; the fix pass's tests change the config and fail.
+   r.ctx.map.commands.test = `test -f src/feature.ts && if grep -q fixed src/feature.ts; then ${TAMPER}; fi`;
+   const first = await runNode("20", r.ctx);
+   expect(first.status).toBe("failed");
+   expect(first.detail).toContain("tests (");
+   const pushed = await r.github.sha("node/20-add-the-feature-module");
+   expect(pushed).not.toBe("");
+   expect(r.github.comments.get(1)).toHaveLength(1); // round 1
+
+   r.ctx.map.commands.test = "test -f src/feature.ts";
+   await moveOriginMain(r);
+   const fetched = await fetchedMain(r);
+   r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+   const resumed = await runNode("20", r.ctx);
+   expect(resumed.status).toBe("parked");
+   expect(resumed.detail).toContain("http.sslverify (new)");
+   expect(await fetchedMain(r)).toBe(fetched);
+   expect(await r.github.sha("node/20-add-the-feature-module")).toBe(pushed);
+   expect(r.github.comments.get(1)).toHaveLength(1);
+   expect(r.calls).toHaveLength(1);
+  }, 60_000);
+
+  test("a parallel node's worktree created between runs parks nothing", async () => {
+   const r = await rig({});
+   cleanup.push(r.dir);
+   // An operator setting under which a tracked branch gains a rebase line
+   // beside the remote + merge pair, which the node #63 filter keeps.
+   expect((await git(["config", "branch.autoSetupRebase", "always"], r.canonical)).code).toBe(0);
+   r.ctx.workerCommand = [implementWorker, "noop"];
+   expect((await runNode("20", r.ctx)).status).toBe("failed");
+
+   await bootstrapWorktree(r.canonical, "21", "another-node", "tok");
+   expect((await git(["config", "--get-regexp", "^branch\\.node/21-"], r.canonical)).stdout.trim()).toBe("");
+
+   r.ctx.workerCommand = [implementWorker, "build"];
+   r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  }, 60_000);
+
+  // Git copies the main config.worktree into each new worktree when
+  // extensions.worktreeConfig is on; the copy is not a change.
+  test("a checkout with per-worktree config runs through, and a parallel node's worktree between runs parks nothing", async () => {
+   const r = await rig({});
+   cleanup.push(r.dir);
+   expect((await git(["config", "extensions.worktreeConfig", "true"], r.canonical)).code).toBe(0);
+   expect((await git(["config", "--worktree", "ranger.probe", "kept"], r.canonical)).code).toBe(0);
+   r.ctx.workerCommand = [implementWorker, "noop"];
+   expect((await runNode("20", r.ctx)).status).toBe("failed");
+   expect(readFileSync(join(r.canonical, ".git", "worktrees", "node-20", "config.worktree"), "utf8")).toContain("probe = kept");
+
+   await bootstrapWorktree(r.canonical, "21", "another-node", "tok");
+   r.ctx.workerCommand = [implementWorker, "build"];
+   r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  }, 60_000);
+
+  test("a credential-bearing key added between runs parks the node without its text reaching the outcome or the journal", async () => {
+   const r = await rig({});
+   cleanup.push(r.dir);
+   r.ctx.workerCommand = [implementWorker, "noop"];
+   expect((await runNode("20", r.ctx)).status).toBe("failed");
+
+   expect((await git(["config", "url.https://bot:SECRETTOKEN@github.com/.insteadOf", "https://github.com/"], r.canonical)).code).toBe(0);
+   r.ctx.workerCommand = [implementWorker, "build"];
+   r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+   const parked = await runNode("20", r.ctx);
+   expect(parked.status).toBe("parked");
+   expect(parked.detail).toMatch(/url\.<[0-9a-f]{12}>\.insteadof \(new\)/);
+   expect(parked.detail).not.toContain("SECRETTOKEN");
+   expect(r.journal.getWorker("20", "acme/widgets")?.outcome).not.toContain("SECRETTOKEN");
+   expect(r.journal.knownGoodGitState(r.canonical)).not.toContain("SECRETTOKEN");
+   for (const event of r.journal.listEvents("acme/widgets", 500)) expect(JSON.stringify(event)).not.toContain("SECRETTOKEN");
+  }, 60_000);
+
+  // Includes fail closed: no code follows an include path, the key parks.
+  test("a failed test run that adds an include.path to the shared config parks the resume before any credentialed git call, naming the key", async () => {
+   const r = await rig({});
+   cleanup.push(r.dir);
+   r.ctx.map.commands.test = "git config include.path /tmp/evil.gitconfig; exit 1";
+   expect((await runNode("20", r.ctx)).status).toBe("failed");
+
+   r.ctx.map.commands.test = "test -f src/feature.ts";
+   await moveOriginMain(r);
+   const fetched = await fetchedMain(r);
+   r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+   const resumed = await runNode("20", r.ctx);
+   expect(resumed.status).toBe("parked");
+   expect(resumed.detail).toStartWith("git config include refused: include.path in config");
+   expect(await fetchedMain(r)).toBe(fetched);
+   expect(await r.github.sha("node/20-add-the-feature-module")).toBe("");
+   // trust-git cannot adopt it: the operator removes the line.
+   await expect(trustCurrentGitState(r.journal, r.canonical, "acme/widgets")).rejects.toThrow(/include refused/);
+  }, 60_000);
+
+  test("an includeIf.<cond>.path in the main config.worktree parks the next run before its push, naming the key", async () => {
+   const r = await rig({});
+   cleanup.push(r.dir);
+   expect((await git(["config", "extensions.worktreeConfig", "true"], r.canonical)).code).toBe(0);
+   r.ctx.workerCommand = [implementWorker, "noop"];
+   expect((await runNode("20", r.ctx)).status).toBe("failed");
+
+   expect((await git(["config", "--worktree", "includeIf.onbranch:main.path", "/tmp/evil.gitconfig"], r.canonical)).code).toBe(0);
+   r.ctx.workerCommand = [implementWorker, "build"];
+   r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+   const parked = await runNode("20", r.ctx);
+   expect(parked.status).toBe("parked");
+   expect(parked.detail).toContain(`${keyLabel("includeif.onbranch:main.path")} in config.worktree`);
+   expect(await r.github.sha("node/20-add-the-feature-module")).toBe("");
+   expect(r.github.prs.size).toBe(0);
+  }, 60_000);
+
+  test("a journal without a record keeps today's behaviour: the run records the state and says so", async () => {
+   const r = await rig({});
+   cleanup.push(r.dir);
+   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+   const trust = r.journal.listEvents("acme/widgets", 500).filter((e) => e.kind === "git-trust");
+   expect(trust).toHaveLength(1);
+   expect(trust[0].detail).toContain("no known-good git state recorded");
+   const record = JSON.parse(r.journal.knownGoodGitState(r.canonical) as string);
+   expect(record.source).toBe("vetted push");
+  }, 60_000);
+ });
+
  test("a transient GitHub error at review is not counted and leaves the row for the sweep (found live on #45)", async () => {
   const r = await rig({});
   cleanup.push(r.dir);
@@ -692,6 +937,442 @@ describe("implement lane (node #23)", () => {
   });
   expect(tick.mergeDesk?.cards ?? []).toEqual([]);
  }, 60_000);
+ test("probes red at the merge base too do not gate: the record passes, names them, and the channel hears once", async () => {
+  const r = await rig({ probe: "fake-probe red {node}", probeRetry: "fake-probe red {node} {failed}" });
+  cleanup.push(r.dir);
+  await seedProbeOnBase(r);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  const probe = (r.github.comments.get(1) ?? []).find((c) => c.body.includes("ranger:probes"));
+  expect(probe?.body).toContain("result=pass selected=2 mode=semantic base-red=probe-hud.mjs -->");
+  expect(r.github.prs.get(1)?.body).toContain("Not gating: probe-hud.mjs failed here and fail at the merge base too.");
+  expect(r.announced).toHaveLength(1);
+  expect(r.announced[0]).toContain("**main was red**");
+  expect(r.announced[0]).toContain("probe-hud.mjs");
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.includes("probe-hud.mjs fail at the merge base"))).toBe(true);
+  // The base worktree is gone again.
+  const worktrees = await runCmd("git", ["worktree", "list"], { cwd: r.canonical });
+  expect(worktrees.stdout).not.toContain("ranger-probe-base-");
+ }, 60_000);
+
+ test("a probe red only on the branch still parks, and the park says the base passes it", async () => {
+  const r = await rig({ probe: "fake-probe branch-red {node}", probeRetry: "fake-probe branch-red {node} {failed}" });
+  cleanup.push(r.dir);
+  await seedProbeOnBase(r);
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("parked");
+  expect(outcome.detail).toContain("FAILED: probe-hud.mjs");
+  expect(outcome.detail).not.toContain("red on the merge base too");
+  expect(r.announced).toEqual([]);
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.includes("pass at the merge base") && d.includes("the failure is this branch's"))).toBe(true);
+ }, 60_000);
+
+ test("a probe the branch edited gates even when the base fails it too: the base runs another probe under that name", async () => {
+  const r = await rig({ probe: "fake-probe red {node}", probeRetry: "fake-probe red {node} {failed}" });
+  cleanup.push(r.dir);
+  await seedProbeOnBase(r);
+  r.ctx.workerCommand = [implementWorker, "probe-edit"];
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("parked");
+  expect(outcome.detail).toContain("FAILED: probe-hud.mjs");
+  expect(r.announced).toEqual([]);
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.includes("probe-hud.mjs are new or changed on this branch — they gate"))).toBe(true);
+ }, 60_000);
+
+ test("a probe red at the merge base on other checks gates: the branch broke a check of its own", async () => {
+  const r = await rig({ probe: "fake-probe branch-other {node}", probeRetry: "fake-probe branch-other {node} {failed}" });
+  cleanup.push(r.dir);
+  await seedProbeOnBase(r);
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("parked");
+  expect(r.announced).toEqual([]);
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.includes("probe-hud.mjs fail at the merge base") && d.includes("but not the same way — they gate"))).toBe(true);
+ }, 60_000);
+
+ test("a probe that fails the inherited check and then crashes on the branch gates", async () => {
+  const r = await rig({ probe: "fake-probe branch-crash {node}", probeRetry: "fake-probe branch-crash {node} {failed}" });
+  cleanup.push(r.dir);
+  await seedProbeOnBase(r);
+  expect((await runNode("20", r.ctx)).status).toBe("parked");
+  expect(r.announced).toEqual([]);
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.includes("but not the same way — they gate"))).toBe(true);
+ }, 60_000);
+
+ test("a probe the base does not have gates: nothing to compare it with", async () => {
+  const r = await rig({ probe: "fake-probe red {node}", probeRetry: "fake-probe red {node} {failed}" });
+  cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("parked");
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.includes("probe-hud.mjs are new or changed on this branch — they gate"))).toBe(true);
+ }, 60_000);
+
+ test("a PR that conflicts with its moved base gets a base merge pass, a new round, then goes ready (seelite #692)", async () => {
+  // The base moves while round 1 reads the branch: #686/#687 landed while 491 was in review.
+  let r!: Rig & { calls: number[]; announced: string[] };
+  const installs = join(tmpdir(), `ranger-installs-${Date.now()}.log`);
+  r = await rig({
+   install: `echo install >> ${installs}`,
+   onReview: async (round) => { if (round === 1) await moveBaseUnder(r); },
+  });
+  cleanup.push(r.dir);
+  r.ctx.mergeablePoll = { pollMs: 1, attempts: 2 };
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  // Installed for the build, and again after the merge brought the base's lockfile in.
+  expect(readFileSync(installs, "utf8").trim().split("\n")).toHaveLength(2);
+  rmSync(installs, { force: true });
+  expect(r.calls).toHaveLength(2); // round 1 on the conflicting head, round 2 on the merged one
+  const markers = (r.github.comments.get(1) ?? []).filter((c) => c.body.includes("ranger:base-merge"));
+  expect(markers).toHaveLength(1);
+  const head = await r.github.sha("node/20-add-the-feature-module");
+  const inside = await runCmd("git", ["merge-base", "--is-ancestor", "main", head], { cwd: r.origin });
+  expect(inside.code).toBe(0);
+  expect((await r.github.getPr("acme/widgets", 1)).mergeable).toBe(true);
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.startsWith("PR conflicts with origin/main in src/feature.ts"))).toBe(true);
+  expect(events.some((d) => d.startsWith("base merge pass 1 @"))).toBe(true);
+ }, 60_000);
+
+ test("a base merge pass that merges nothing fails without pushing or marking", async () => {
+  let r!: Rig & { calls: number[]; announced: string[] };
+  r = await rig({ onReview: async (round) => { if (round === 1) await moveBaseUnder(r); } });
+  cleanup.push(r.dir);
+  r.ctx.mergeablePoll = { pollMs: 1, attempts: 2 };
+  r.ctx.workerCommand = [implementWorker, "merge-noop"];
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("failed");
+  expect(outcome.detail).toContain("base merge pass committed nothing — the conflict with origin/main stands");
+  expect((r.github.comments.get(1) ?? []).some((c) => c.body.includes("ranger:base-merge"))).toBe(false);
+  expect((await r.github.getPr("acme/widgets", 1)).mergeable).toBe(false);
+ }, 60_000);
+
+ test("an install after the base merge that rewrites a tracked file fails the pass before the tests, and nothing is pushed", async () => {
+  let r!: Rig & { calls: number[]; announced: string[] };
+  let before = "";
+  // Only the merged tree has src/feature.ts at install time: the build's install leaves the tree alone.
+  r = await rig({
+   install: "if [ -f src/feature.ts ]; then echo regenerated >> README.md; fi",
+   onReview: async (round) => {
+    if (round !== 1) return;
+    before = await r.github.sha("node/20-add-the-feature-module");
+    await moveBaseUnder(r);
+   },
+  });
+  cleanup.push(r.dir);
+  r.ctx.mergeablePoll = { pollMs: 1, attempts: 2 };
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("failed");
+  expect(outcome.detail).toContain("uncommitted or untracked file(s) ( M README.md)");
+  expect(before).not.toBe("");
+  expect(await r.github.sha("node/20-add-the-feature-module")).toBe(before);
+ }, 60_000);
+
+ test("a worker that moves origin/<base> onto its own commit does not pass for a merge", async () => {
+  let r!: Rig & { calls: number[]; announced: string[] };
+  let before = "";
+  r = await rig({
+   onReview: async (round) => {
+    if (round !== 1) return;
+    before = await r.github.sha("node/20-add-the-feature-module");
+    await moveBaseUnder(r);
+   },
+  });
+  cleanup.push(r.dir);
+  r.ctx.mergeablePoll = { pollMs: 1, attempts: 2 };
+  r.ctx.workerCommand = [implementWorker, "merge-forge"];
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("parked");
+  expect(outcome.detail).toMatch(/^base merge pass committed, but origin\/main as fetched \([0-9a-f]{8}\) is not in node\/20-/);
+  expect(await r.github.sha("node/20-add-the-feature-module")).toBe(before);
+  expect((r.github.comments.get(1) ?? []).some((c) => c.body.includes("ranger:base-merge"))).toBe(false);
+ }, 60_000);
+
+ test("a resumed run drops an unpushed merge from a crashed one, and its markers grant nothing", async () => {
+  let r!: Rig & { calls: number[]; announced: string[] };
+  r = await rig({ onReview: async (round) => { if (round === 1) await moveBaseUnder(r); } });
+  cleanup.push(r.dir);
+  r.ctx.mergeablePoll = { pollMs: 1, attempts: 2 };
+  r.ctx.workerCommand = [implementWorker, "merge-noop"];
+  expect((await runNode("20", r.ctx)).status).toBe("failed"); // round 1 clean, the PR conflicts, nothing merged
+
+  // The crashed run: it merged in the node's worktree and posted its markers, then died before the push.
+  const wt = join(r.canonical, ".worktrees", "node-20");
+  const git = (args: string[]) => runCmd("git", args, { cwd: wt, env: { ...process.env, ...GIT_ENV } });
+  await git(["merge", "--no-edit", "origin/main"]);
+  writeFileSync(join(wt, "src", "feature.ts"), "export const feature = () => 1; // crashed run\n");
+  await git(["add", "-A"]);
+  await git(["commit", "-q", "--no-edit"]);
+  const stranded = (await git(["rev-parse", "HEAD"])).stdout.trim();
+  await r.github.postComment("acme/widgets", 1, baseMergeMarker(stranded, "main"));
+  await r.github.postComment("acme/widgets", 1, baseMergeMarker("f".repeat(40), "release/1.0+hotfix"));
+
+  r.ctx.workerCommand = [implementWorker, "build"];
+  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  // Counted naively, two markers would use up both merge passes and park it.
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  const head = await r.github.sha("node/20-add-the-feature-module");
+  expect(head).not.toBe(stranded);
+  expect((await runCmd("git", ["merge-base", "--is-ancestor", "main", head], { cwd: r.origin })).code).toBe(0);
+  expect(r.calls).toHaveLength(2);
+  const markers = recordedBaseMerges(r.github.comments.get(1) ?? [], BOT);
+  expect(markers.map((m) => m.sha)).toEqual([stranded, "f".repeat(40), head]); // the release/… base still parses
+ }, 60_000);
+
+ test("a ready PR whose base moves under it is sent back for a base merge, not left pending on CI", async () => {
+  const r = await rig({});
+  cleanup.push(r.dir);
+  r.ctx.mergeablePoll = { pollMs: 1, attempts: 2 };
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  await moveBaseUnder(r);
+  const spawned: string[] = [];
+  const tick = await sweepMap({
+   config: r.ctx.config,
+   journal: r.journal,
+   map: r.ctx.map,
+   token: "ghp_write",
+   botIdentity: BOT,
+   github: r.github,
+   post: async () => "msg",
+   respawn: async (nodeId) => {
+    spawned.push(nodeId);
+    return DEAD_PID;
+   },
+  });
+  expect(tick.mergeDesk?.resumed).toEqual(["20"]);
+  expect(spawned).toEqual(["20"]);
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.includes("conflicts with main") && d.includes("run-node resumes"))).toBe(true);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  expect((await r.github.getPr("acme/widgets", 1)).mergeable).toBe(true);
+ }, 60_000);
+
+ test("a failed supervisor test run names its failing test and keeps its whole output in the node's log", async () => {
+  const r = await rig({ test: "echo \"(fail) the hud draws [3.00ms]\" >&2; exit 1" });
+  cleanup.push(r.dir);
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("failed");
+  expect(outcome.detail).toContain("failed after the worker (exit 1) — failing: the hud draws:");
+  const log = /\(worker log: ([^)]+)\)/.exec(outcome.detail)?.[1] ?? "";
+  expect(readFileSync(log, "utf8")).toContain("build pass: supervisor tests");
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.includes("failed on a busy host"))).toBe(false); // a quiet host: no retry
+ }, 60_000);
+
+ test("supervisor tests that fail on a busy host are retried once it quiets, and pass", async () => {
+  const flag = join(tmpdir(), `ranger-flaky-tests-${Date.now()}`);
+  const r = await rig({ test: `if [ -f ${flag} ]; then test -f src/feature.ts; else touch ${flag}; exit 1; fi` });
+  cleanup.push(r.dir);
+  const loads = [14, 13, 2]; // at the failure, while waiting, then quiet
+  r.ctx.hostLoad = () => ({ load: loads.length > 1 ? (loads.shift() as number) : loads[0], cores: 10 });
+  r.ctx.quietHost = { pollMs: 1, maxMs: 60_000 };
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.includes("failed on a busy host (load 14.0 on 10 cores) — retrying once, in a fresh checkout of "))).toBe(true);
+  expect(events.some((d) => d.endsWith("passed on the retry in a fresh checkout"))).toBe(true);
+  rmSync(flag, { force: true });
+ }, 60_000);
+
+ /** Exclude *.fixture through the shared repo's info/exclude, so a fixture is ignored rather than untracked. */
+ const IGNORE_FIXTURES = "x=\"$(git rev-parse --git-common-dir)/info\"; mkdir -p \"$x\"; grep -qx \"*.fixture\" \"$x/exclude\" 2>/dev/null || echo \"*.fixture\" >> \"$x/exclude\"";
+
+ // Each failed run leaves something behind in the node's worktree that a
+ // retry there would pass on. The retry runs in a fresh checkout of the
+ // committed head instead, so none of it reaches the retry, which fails.
+ for (const [what, install, cmd] of [
+  ["an untracked fixture", undefined, "if [ -f src/fixed.ts ]; then exit 0; else touch src/fixed.ts; exit 1; fi"],
+  ["a new ignored fixture", IGNORE_FIXTURES, `${IGNORE_FIXTURES}; if [ -f t.fixture ]; then exit 0; else touch t.fixture; exit 1; fi`],
+  ["a rewritten ignored fixture", `${IGNORE_FIXTURES}; echo old > t.fixture`, `${IGNORE_FIXTURES}; if grep -qx new t.fixture; then exit 0; else echo new > t.fixture; exit 1; fi`],
+  ["an ignored fixture whose name git quotes", `${IGNORE_FIXTURES}; echo old > "a ü.fixture"`, `${IGNORE_FIXTURES}; if grep -qx new "a ü.fixture"; then exit 0; else echo new > "a ü.fixture"; exit 1; fi`],
+  ["a tracked file hidden by --skip-worktree", undefined, "if grep -qx new README.md; then exit 0; else git update-index --skip-worktree README.md; echo new > README.md; exit 1; fi"],
+  ["a replacement ref for the head commit", undefined, "if grep -qx replaced README.md; then exit 0; else plant-replace README.md replaced; exit 1; fi"],
+  ["a tag", undefined, "if git rev-parse -q --verify refs/tags/tests-ok >/dev/null; then exit 0; else git tag -f tests-ok; exit 1; fi"],
+ ] as const) {
+  test(`a test retry on a busy host never sees ${what} the failed run left: it runs in a fresh checkout`, async () => {
+   const r = await rig({ ...(install === undefined ? {} : { install }), test: cmd });
+   cleanup.push(r.dir);
+   r.ctx.hostLoad = () => ({ load: 14, cores: 10 });
+   r.ctx.quietHost = { pollMs: 1, maxMs: 5 };
+   expect((await runNode("20", r.ctx)).status).toBe("failed");
+   const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+   expect(events.some((d) => d.includes("— retrying once, in a fresh checkout of "))).toBe(true);
+   expect(events.some((d) => d.includes("passed on the retry"))).toBe(false);
+   expect(r.github.prs.size).toBe(0);
+   const worktrees = await runCmd("git", ["worktree", "list"], { cwd: r.canonical });
+   expect(worktrees.stdout).not.toContain("ranger-test-retry-");
+  }, 60_000);
+ }
+
+ test("after a retry passes in a fresh clone, the worktree is restored before the probes run in it", async () => {
+  const flag = join(tmpdir(), `ranger-restore-${Date.now()}`);
+  // The failed run leaves src/leftover.ts behind; the probe fails while it is there.
+  const r = await rig({
+   test: `if [ -f ${flag} ]; then test -f src/feature.ts; else touch ${flag}; touch src/leftover.ts; exit 1; fi`,
+   probe: "test ! -e src/leftover.ts",
+  });
+  cleanup.push(r.dir);
+  const loads = [14, 13, 2];
+  r.ctx.hostLoad = () => ({ load: loads.length > 1 ? (loads.shift() as number) : loads[0], cores: 10 });
+  r.ctx.quietHost = { pollMs: 1, maxMs: 60_000 };
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.startsWith("restored the worktree to "))).toBe(true);
+  expect(existsSync(join(r.canonical, ".worktrees", "node-20", "src", "leftover.ts"))).toBe(false);
+  rmSync(flag, { force: true });
+ }, 60_000);
+
+ test("built and committed work a failed run left unpushed is adopted on resume, with no new worker session", async () => {
+  const flag = join(tmpdir(), `ranger-adopt-${Date.now()}`);
+  const r = await rig({ test: `test -f ${flag}` });
+  cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("failed"); // built and committed; the supervisor's tests fail
+  expect(r.github.prs.size).toBe(0);
+  writeFileSync(flag, ""); // whatever broke the tests is gone
+  r.ctx.workerCommand = [implementWorker, "noop"]; // a worker session would commit nothing and fail
+  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.startsWith("adopting ") && d.includes("no new worker session"))).toBe(true);
+  expect(r.github.prs.size).toBe(1);
+  rmSync(flag, { force: true });
+ }, 60_000);
+
+ test("an adopted head is credited to the substrate that wrote it, not to a later session that committed nothing", async () => {
+  const flag = join(tmpdir(), `ranger-adopt-author-${Date.now()}`);
+  const r = await rig({ test: `test -f ${flag}` });
+  cleanup.push(r.dir);
+  delete r.ctx.workerCommand;
+  let mode = "build";
+  let sessions = 0;
+  r.ctx.worker = async (prompt, opts) => {
+   sessions += 1;
+   return runCmd(implementWorker, [mode, prompt], opts);
+  };
+  r.ctx.substrate = "claude";
+  expect((await runNode("20", r.ctx)).status).toBe("failed"); // Claude built it; the tests fail
+  r.ctx.substrate = "codex";
+  mode = "noop";
+  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  expect((await runNode("20", r.ctx)).status).toBe("failed"); // still failing: Codex's session commits nothing
+  writeFileSync(flag, "");
+  r.ctx.substrate = "pi";
+  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  expect(sessions).toBe(2); // the third run adopted: no session
+  const head = await r.github.sha("node/20-add-the-feature-module");
+  expect(r.journal.headSubstrate("acme/widgets", head)).toBe("claude");
+  rmSync(flag, { force: true });
+ }, 60_000);
+
+ test("adoption tests the commit in a fresh clone: an ignored fixture the failed run left cannot make it pass", async () => {
+  const r = await rig({ test: `${IGNORE_FIXTURES}; if [ -f t.fixture ]; then exit 0; else touch t.fixture; exit 1; fi` });
+  cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("failed"); // the failed run leaves t.fixture behind
+  r.ctx.workerCommand = [implementWorker, "noop"];
+  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  expect((await runNode("20", r.ctx)).status).toBe("failed"); // not adopted; the worker has nothing to add
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.includes("on the work a previous run committed") && d.endsWith("— the worker continues"))).toBe(true);
+  expect(events.some((d) => d.startsWith("adopting "))).toBe(false);
+  expect(r.github.prs.size).toBe(0);
+ }, 60_000);
+
+ test("adoption tests that fail on a busy host get one retry, and the work is adopted", async () => {
+  const counter = join(tmpdir(), `ranger-adopt-busy-${Date.now()}`);
+  // Run 0 (the build's own) and run 1 (adoption) fail; run 2 (the adoption retry) passes.
+  const r = await rig({ test: `n=$(cat ${counter} 2>/dev/null || echo 0); echo $((n + 1)) > ${counter}; [ "$n" -ge 2 ]` });
+  cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("failed"); // quiet host: no retry
+  r.ctx.workerCommand = [implementWorker, "noop"];
+  const loads = [14, 13, 2];
+  r.ctx.hostLoad = () => ({ load: loads.length > 1 ? (loads.shift() as number) : loads[0], cores: 10 });
+  r.ctx.quietHost = { pollMs: 1, maxMs: 60_000 };
+  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.startsWith("adoption tests failed on a busy host (load 14.0 on 10 cores)"))).toBe(true);
+  expect(events.some((d) => d.startsWith("adopting "))).toBe(true);
+  rmSync(counter, { force: true });
+ }, 60_000);
+
+ test("adopted work that fails the supervisor's tests goes to the worker, which fixes it", async () => {
+  const r = await rig({ test: "test -f src/fixed.ts" });
+  cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("failed");
+  r.ctx.workerCommand = [implementWorker, "add-fixed"];
+  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.includes("on the work a previous run committed") && d.endsWith("— the worker continues"))).toBe(true);
+  expect(events.some((d) => d.startsWith("adopting "))).toBe(false);
+ }, 60_000);
+
+ test("a retry whose install rewrites tracked source certifies nothing: the repair is not in the pushed commit", async () => {
+  const r = await rig({
+   // Only the retry checkout gets "repaired"; the tests pass only on the repair.
+   install: "case \"$PWD\" in *ranger-test-retry-*) echo repaired >> README.md ;; esac",
+   test: "grep -q repaired README.md",
+  });
+  cleanup.push(r.dir);
+  r.ctx.hostLoad = () => ({ load: 14, cores: 10 });
+  r.ctx.quietHost = { pollMs: 1, maxMs: 5 };
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("failed");
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.includes("passed on the retry"))).toBe(false);
+  expect(r.github.prs.size).toBe(0);
+ }, 60_000);
+
+ test("install and tests run niced, the probe run at the walker's own priority", async () => {
+  const own = Number((await runCmd("/bin/sh", ["-c", "ps -o nice= -p $PPID"])).stdout.trim());
+  // The OS clamps at its own maximum (20 on macOS, 19 on Linux): ask it.
+  const max = Number((await runCmd("/bin/sh", ["-c", "ps -o nice= -p $$"], { nice: 100 })).stdout.trim());
+  const niced = Math.min(own + 10, max);
+  const r = await rig({
+   install: `[ $(ps -o nice= -p $$) -eq ${niced} ]`,
+   test: `[ $(ps -o nice= -p $$) -eq ${niced} ] && test -f src/feature.ts`,
+   probe: `[ $(ps -o nice= -p $$) -eq ${own} ]`,
+  });
+  cleanup.push(r.dir);
+  r.ctx.config.workers.niceness = 10; // the suite's fixtures run un-niced (support.ts)
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+ }, 60_000);
+
+ test("a probe run killed partway retries only the selected probes it had not passed", async () => {
+  const r = await rig({ probe: "fake-probe dies {node}", probeRetry: "fake-probe ok {node} {failed}" });
+  cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => /^probe run 1 failed \(exit -?\d+\) — retrying only the 1 probe\(s\) it had not passed when it stopped$/.test(d))).toBe(true);
+  const probe = (r.github.comments.get(1) ?? []).find((c) => c.body.includes("ranger:probes"));
+  expect(probe?.body).toContain("`fake-probe ok 20 probe-b.mjs`");
+ }, 60_000);
+
+ test("a busy host delays the probe run until the load drops", async () => {
+  const r = await rig({ probe: "fake-probe ok {node}" });
+  cleanup.push(r.dir);
+  const loads = [12, 11, 3];
+  r.ctx.hostLoad = () => ({ load: loads.length > 1 ? (loads.shift() as number) : loads[0], cores: 10 });
+  r.ctx.quietHost = { pollMs: 1, maxMs: 60_000 };
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events).toContain("probe run 1 waits for the host: load 12.0 on 10 cores");
+  expect(events.some((d) => /^probe run 1 starts after \d+s: load 3\.0 on 10 cores$/.test(d))).toBe(true);
+ }, 60_000);
+
+ test("a hook that stops the worker before its first turn parks the node as policy-blocked, outside the dead-man", async () => {
+  const r = await rig({});
+  cleanup.push(r.dir);
+  r.ctx.workerCommand = [implementWorker, "hook-stop"];
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("parked");
+  expect(outcome.detail).toMatch(/^policy-blocked: a hook stopped the build pass before its first turn \(Runtime policy denied this action: security-disable-request\.\)/);
+  expect(r.journal.deadmanCount()).toBe(0);
+  expect(r.github.prs.size).toBe(0);
+ }, 60_000);
+
  test("a PR that went ready before the map had a probe tier is sent back for probes, not parked", async () => {
   const r = await rig({});
   cleanup.push(r.dir);

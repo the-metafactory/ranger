@@ -9,12 +9,20 @@ import { runCmd, type RunOptions } from "./exec.ts";
 import {
  fastForwardCanonical,
  assertGitUntouched,
- gitConfigSnapshot,
  safeGit,
+ type GitState,
  GitSafetyError,
  vettedPush,
 } from "./git-ops.ts";
 import { GRAPH_CALL_TIMEOUT_MS, graphNode, type NodeResult } from "./graph.ts";
+import {
+ checkKnownGood,
+ isRefusal,
+ recordIfUnchanged,
+ recordKnownGood,
+ tamperOutcome,
+ trustFreshClone,
+} from "./git-trust.ts";
 import { graphClose, graphDecisions, type CloseResult } from "./graph-write.ts";
 import {
  implementBranchFor,
@@ -27,6 +35,7 @@ import { FencedError, type Journal } from "./journal.ts";
 import { assembleResearchPrompt } from "./prompt.ts";
 import { IMPLEMENT_KINDS } from "./route.ts";
 import {
+ hookStopReason,
  markSubstrateCapped,
  describeWorkerModel,
  selectSubstrate,
@@ -46,6 +55,7 @@ import { isTransientGitHubError } from "./transient.ts";
 import * as githubApi from "./github.ts";
 import type { GitHubPort } from "./github.ts";
 import { ParkSignal } from "./signals.ts";
+import { policyBlockedOutcome } from "./outcomes.ts";
 import { assertResearchFindingsOnly, researchCi, type ResearchCiTiming } from "./research-ci.ts";
 
 export { gitAuthEnv } from "./git-ops.ts";
@@ -107,6 +117,11 @@ export interface RunNodeContext {
  viewsDependencies?: ImplementContext["viewsDependencies"];
  /** For tests: the implement lane's repo-command runner (install/test/probe). */
  shellRun?: ImplementContext["shellRun"];
+ /** Probe-tier host load, quiet-host wait and channel post (tests inject them). */
+ hostLoad?: ImplementContext["hostLoad"];
+ quietHost?: ImplementContext["quietHost"];
+ announce?: ImplementContext["announce"];
+ mergeablePoll?: ImplementContext["mergeablePoll"];
 }
 
 /** The canonical checkout dir for a repo (design §4: probes run there). */
@@ -157,14 +172,14 @@ export function slugify(title: string): string {
  return slug.length === 0 ? "node" : slug;
 }
 
-/** Ensure the canonical checkout exists (clone on first use). Read-only ops only. */
+/** Ensure the canonical checkout exists (clone on first use; true when it cloned). Read-only ops only. */
 export async function bootstrapCanonical(
  dir: string,
  repo: string,
  token: string,
-): Promise<void> {
+): Promise<boolean> {
  if (existsSync(dir) && existsSync(join(dir, ".git"))) {
-  return;
+  return false;
  }
  const parent = resolve(dir, "..");
  const result = await safeGit(
@@ -176,6 +191,7 @@ export async function bootstrapCanonical(
    `cannot bootstrap canonical checkout ${dir} (git clone, exit ${result.code}): ${result.stderr.trim()}`,
   );
  }
+ return true;
 }
 
 /**
@@ -203,10 +219,16 @@ export async function bootstrapWorktree(
   ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`],
   { cwd: canonical, timeoutMs: 10_000 },
  );
+ // No tracking lines on a new branch: they land in the shared config, which
+ // the known-good check compares across runs (node #81). The tamper state
+ // leaves out only a node branch's plain remote + merge pair (node #63), and
+ // `branch.autoSetupRebase=always` adds a `rebase` line to it, a probe-named
+ // branch none at all. `--no-track` also overrides `branch.autoSetupMerge`.
+ // Ranger's git calls name their refs and never use the upstream.
  const args =
   existing.code === 0
    ? ["worktree", "add", dir, branch]
-   : ["worktree", "add", dir, "-b", branch, `origin/${base}`];
+   : ["worktree", "add", "--no-track", dir, "-b", branch, `origin/${base}`];
  // worktree add fires post-checkout; safeGit keeps a planted hook from
  // running with the supervisor's credentials.
  const result = await safeGit(args, {
@@ -560,11 +582,14 @@ async function runImplementNode(
  const readOnlyToken = ctx.readOnlyToken ?? resolveReadOnlyToken(config, repo).token;
 
  const canonical = canonicalDir(config, map);
- await bootstrapCanonical(canonical, repo, token);
- await fastForwardCanonical(canonical, map.base, token);
  const slug = slugify(node.node.title);
  const branch = implementBranchFor(node.node, worktreeBranch(nodeId, slug));
- const worktree = await bootstrapWorktree(canonical, nodeId, slug, token, branch, map.base);
+ const start = await trustedStart(ctx, nodeId, node.node.title, canonical, async () => {
+  await fastForwardCanonical(canonical, map.base, token);
+  return bootstrapWorktree(canonical, nodeId, slug, token, branch, map.base);
+ });
+ if ("parked" in start) return start.parked;
+ const { worktree } = start;
  journal.updateWorker(nodeId, repo, { worktree, lane: "implement" });
 
  // Substrate selection (node #45), re-run at every session start. A session
@@ -596,6 +621,10 @@ async function runImplementNode(
   github: ctx.github,
   reviewer: ctx.reviewer,
   viewsDependencies: ctx.viewsDependencies,
+  hostLoad: ctx.hostLoad,
+  quietHost: ctx.quietHost,
+  announce: ctx.announce,
+  mergeablePoll: ctx.mergeablePoll,
   substrateReaders: resolveReaders(ctx),
  };
  const capped = new Set<SubstrateName>();
@@ -608,11 +637,7 @@ async function runImplementNode(
    await handleSubstrateCap(ctx, { nodeId, generation, worktree, branch }, cap, outcome, capped);
   } catch (error) {
    if (error instanceof ParkSignal || error instanceof GitSafetyError) {
-    const detail = error.message;
-    journal.recordEvent("parked", { nodeId, repo, detail: detail.slice(0, 400) });
-    finish(journal, nodeId, repo, "parked", detail);
-    await parkCard(map, nodeId, node.node.title, detail);
-    return { ...base, status: "parked", detail };
+    return parkRun(ctx, nodeId, node.node.title, error.message);
    }
    throw error;
   }
@@ -647,6 +672,45 @@ async function runImplementNode(
   close: outcome.close,
   prNumber: outcome.prNumber,
  };
+}
+
+/** Park the run: the event, the terminal row, the card. The claim stays. */
+async function parkRun(
+ ctx: RunNodeContext,
+ nodeId: string,
+ title: string,
+ detail: string,
+): Promise<RunNodeOutcome> {
+ const repo = ctx.map.repo;
+ ctx.journal.recordEvent("parked", { nodeId, repo, detail: detail.slice(0, 400) });
+ finish(ctx.journal, nodeId, repo, "parked", detail);
+ await parkCard(ctx.map, nodeId, title, detail);
+ return { nodeId, repo, status: "parked", detail, workerExit: null };
+}
+
+/**
+ * The run-node's start (node #81): ensure the canonical checkout, check its
+ * git state against the known-good record before the first git call that
+ * carries the write credential, then add the node's worktree and refresh
+ * the record. A checkout this run cloned holds git's own fresh state, which
+ * becomes the record. Parks the run on a refusal.
+ */
+async function trustedStart(
+ ctx: RunNodeContext,
+ nodeId: string,
+ title: string,
+ canonical: string,
+ addWorktree: () => Promise<string>,
+): Promise<{ state: GitState; worktree: string } | { parked: RunNodeOutcome }> {
+ const { journal, map, token } = ctx;
+ const cloned = await bootstrapCanonical(canonical, map.repo, token);
+ const trust = cloned
+  ? trustFreshClone(journal, canonical)
+  : await checkKnownGood(journal, canonical, { repo: map.repo, nodeId });
+ if (isRefusal(trust)) return { parked: await parkRun(ctx, nodeId, title, tamperOutcome(trust, canonical, mapKey(map))) };
+ const worktree = await addWorktree();
+ recordIfUnchanged(journal, canonical, trust.state, "worktree created");
+ return { state: trust.state, worktree };
 }
 
 /** Best-effort park card: the journal + digest still carry the park when Discord fails. */
@@ -702,9 +766,12 @@ async function runResearch(
   detail: "worktree bootstrap",
  });
  const canonical = canonicalDir(config, map);
- await bootstrapCanonical(canonical, repo, token);
  const slug = slugify(node.node.title);
- const worktree = await bootstrapWorktree(canonical, nodeId, slug, token, undefined, map.base);
+ const start = await trustedStart(ctx, nodeId, node.node.title, canonical, () =>
+  bootstrapWorktree(canonical, nodeId, slug, token, undefined, map.base),
+ );
+ if ("parked" in start) return start.parked;
+ const { worktree } = start;
  const branch = researchBranchFor(node.node);
 
  journal.recordEvent("worker-start", {
@@ -761,17 +828,23 @@ async function runResearch(
    (async (p: string, opts: RunOptions) =>
     runCmd(workerCmd[0], [...workerCmd.slice(1), p], opts));
 
-  const snapshot = gitConfigSnapshot(canonical);
+  // The run-node start check vetted this state against the known-good one.
+  const snapshot = start.state.hash;
   fence("spawn the worker");
   const workerResult = await workerRun(prompt, {
    cwd: worktree,
    timeoutMs: wallClockMs,
+   nice: config.workers.niceness,
    env: workerEnv(config, repo, sessionJournalPath()),
    processGroup: true,
    onSpawn: (pgid) => journal.updateWorker(nodeId, repo, { workerPgid: pgid }),
   });
   journal.updateWorker(nodeId, repo, { workerPgid: null });
   const log = saveWorkerLog(journal.path, repo, nodeId, generation, "research pass", workerResult);
+  const stopped = hookStopReason(workerResult.stdout);
+  if (stopped !== null) {
+   throw new ParkSignal(policyBlockedOutcome({ pass: "research pass", reason: stopped, log }));
+  }
 
   if (workerResult.code !== 0) {
    const detail = `worker exited ${workerResult.code}: ${workerResult.stderr.trim() || workerResult.stdout.trim().slice(0, 500)} (worker log: ${log})`;
@@ -797,7 +870,7 @@ async function runResearch(
   // close gate probes, with hooks disabled and the git config checked against
   // the pre-worker snapshot (#23: the worker shares the canonical .git).
   try {
-   assertGitUntouched(canonical, snapshot);
+   await assertGitUntouched(canonical, snapshot);
    const head = await resolveBranchSha(canonical, branch);
    if (head === null) {
     throw new GitSafetyError(`research findings branch ${branch} is missing from the canonical checkout`);
@@ -805,7 +878,7 @@ async function runResearch(
    sha = head;
    await assertResearchFindingsOnly(canonical, baseSha, sha);
    fence("push");
-   await vettedPush({
+   const vetted = await vettedPush({
     worktree,
     canonical,
     branch,
@@ -813,6 +886,7 @@ async function runResearch(
     configSnapshot: snapshot,
     source: sha,
    });
+   recordKnownGood(journal, canonical, vetted, "vetted push");
   } catch (error) {
    if (error instanceof FencedError) throw error;
    const detail = `research branch push failed (${branch}): ${error instanceof Error ? error.message : String(error)}`;

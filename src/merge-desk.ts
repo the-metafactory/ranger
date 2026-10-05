@@ -6,6 +6,7 @@ import type { DiscordFile } from "./discord.ts";
 import { redactViewsReason, viewsCard, viewsCardMessage, viewsDirectory } from "./views.ts";
 import { NEEDS_EYE_LABEL } from "./labels.ts";
 import {
+ baseRedNote,
  gatingFindings,
  realGitHub,
  recordedProbes,
@@ -163,17 +164,23 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
 
   // Send a ready PR back to run-node when the rules it went ready under no
   // longer hold at its head: the review there still carries gating findings
-  // (majors started gating after the PR went ready), or the map now has a
-  // probe tier with no passing run recorded. run-node resumes in the review
-  // phase: a fix pass and a new round, or only the probe step. The round cap
-  // and a failing probe run still park it there. A posted merge card is
-  // withdrawn first, so a stale "merge needed" never stands.
+  // (majors started gating after the PR went ready), the map now has a
+  // probe tier with no passing run recorded, or the base moved and the PR
+  // now conflicts with it (GitHub runs no CI on it then, seelite #692).
+  // run-node resumes in the review phase: a fix pass and a new round, only
+  // the probe step, or a base merge pass and a new round. The round cap, a
+  // failing probe run and a conflict that outlasts its merge passes still
+  // park it there. A posted merge card is withdrawn first, so a stale
+  // "merge needed" never stands.
   const reworkFindings = last !== undefined && gatingFindings(last) > 0;
+  const conflicting = last !== undefined && (pr.mergeable === false || pr.mergeableState === "dirty");
   const missingProbes = probesRequired && probe === undefined && last !== undefined;
-  if ((reworkFindings || missingProbes) && ctx.spawn !== undefined) {
+  if ((reworkFindings || conflicting || missingProbes) && ctx.spawn !== undefined) {
    const why = reworkFindings
     ? `sage round ${last?.round} at ${pr.headSha.slice(0, 8)} has ${last?.blockers} blocker(s) and ${last?.majors} major(s) to rework`
-    : `no passing probe run at ${pr.headSha.slice(0, 8)}`;
+    : conflicting
+     ? `PR #${pr.number} conflicts with ${map.base} at ${pr.headSha.slice(0, 8)}`
+     : `no passing probe run at ${pr.headSha.slice(0, 8)}`;
    if (row.mergeMessageId !== null) {
     try {
      await post(
@@ -288,7 +295,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
     `map: ${mapKey(map)}`,
     `Gate passed at \`${gate.headSha.slice(0, 8)}\`: CI green, mergeable, base \`${map.base}\`, sage ${last?.round ?? "?"} round(s), the last with 0 blockers and 0 majors (machine evidence, not a sign-off).`,
     ...(probesRequired
-     ? [`Probes passed at \`${gate.headSha.slice(0, 8)}\` (selection ${probe?.mode ?? "?"}, ${probe?.selected ?? "?"} probe(s)). Only the selected probes ran, not the full suite.`]
+     ? [`Probes passed at \`${gate.headSha.slice(0, 8)}\` (selection ${probe?.mode ?? "?"}, ${probe?.selected ?? "?"} probe(s)). Only the selected probes ran, not the full suite.${baseRedNote(probe)}`]
      : ["No probe tier on this map: CI and the tests are the only automated checks."]),
     needsEye
      ? `Labelled \`${NEEDS_EYE_LABEL}\`: your eye is the check. Merge it by hand (squash); ranger closes the node after the merge.`

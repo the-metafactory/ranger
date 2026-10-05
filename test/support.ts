@@ -48,6 +48,26 @@ export async function createCanonicalRepo(
 }
 
 /**
+ * Add a node worktree the way ranger did before node #81: a `node/<N>-<slug>`
+ * branch that tracks origin/<base>, so the shared config gains its remote +
+ * merge lines. Branches from older builds and an operator's own
+ * `git worktree add -b` still write them; `bootstrapWorktree` no longer does.
+ */
+export async function addTrackedWorktree(
+ canonical: string,
+ nodeId: string,
+ slug: string,
+ base = "main",
+): Promise<void> {
+ const result = await runCmd(
+  "git",
+  ["worktree", "add", "--track", join(canonical, ".worktrees", `node-${nodeId}`), "-b", `node/${nodeId}-${slug}`, `origin/${base}`],
+  { cwd: canonical, env: { ...process.env, ...GIT_ENV } },
+ );
+ if (result.code !== 0) throw new Error(`git worktree add: ${result.stderr}`);
+}
+
+/**
  * The ranger.yaml skeleton shared by every e2e suite. Suites inject their
  * section-specific lines via `opts`, so schema or invocation changes land in
  * one place. Sections: `map` (inside the map stanza after `walk`), `auth`
@@ -89,6 +109,9 @@ export function baseConfigLines(
   ...(opts.state ?? []),
   "workers:",
   "  spawnCapPerDay: 10",
+  // Fixture workers run at the test's own priority: niced, they starve under
+  // host load and trip the suite's timeouts (the priority tests set it).
+  "  niceness: 0",
   ...(opts.workers ?? []),
  ];
 }

@@ -101,7 +101,7 @@ for (const [name, tamper] of [
   } finally {
    rmSync(dir, { recursive: true, force: true });
   }
- });
+ }, 30_000); // two real run-node CLI processes: under load they outlast 5s
 }
 
 test("research retry refuses an altered findings branch before citing CI", async () => {
@@ -138,7 +138,7 @@ test("research retry refuses an altered findings branch before citing CI", async
  } finally {
   rmSync(dir, { recursive: true, force: true });
  }
-});
+}, 30_000); // two real run-node CLI processes: under load they outlast 5s
 
 describe("ranger walk — claim phase (node #13)", () => {
  test("claims an auto+research frontier node: announce (fail-closed) → soma graph claim → journal", async () => {
@@ -415,6 +415,31 @@ describe("ranger run-node — research worker full loop (node #13 acceptance)", 
   }
  }, 10_000);
 
+ // Node #81: with extensions.worktreeConfig on, git copies the main
+ // config.worktree into the new worktree. The pre-worker snapshot is the
+ // state read before the add, so the post-worker check must not see the copy.
+ test("a checkout with per-worktree config runs its research node through", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ranger-run-worktree-config-"));
+  try {
+   const { origin, canonical } = await createCanonicalRepo(dir);
+   const git = (args: string[]) => runCmd("git", args, { cwd: canonical, env: { ...process.env, ...GIT_ENV } });
+   expect((await git(["config", "extensions.worktreeConfig", "true"])).code).toBe(0);
+   expect((await git(["config", "--worktree", "ranger.probe", "kept"])).code).toBe(0);
+   const config = writeConfig(dir);
+   const statePath = writeState(dir, { "10": { ...RESEARCH_NODE_STATE, assignees: ["ivy-bot"] } });
+   const result = await runCli(["run-node", "10", "--map", "acme/widgets", "-c", config], {
+    ...process.env, ...GIT_ENV, PATH: `${fixturesBin}:${process.env.PATH ?? ""}`,
+    FAKE_SOMA_DIR: dataDir, FAKE_SOMA_STATE: statePath, FAKE_SOMA_REPO_DIR: origin,
+    RANGER_WRITE_TEST: "ghp_write", RANGER_WORKER_CMD: join(fixturesBin, "worker"), RANGER_DISCORD_TOKEN: "unused",
+   });
+   expect(result.code).toBe(0);
+   expect(JSON.parse(result.stdout).status).toBe("success");
+   expect(readFileSync(join(canonical, ".git", "worktrees", "node-10", "config.worktree"), "utf8")).toContain("probe = kept");
+  } finally {
+   rmSync(dir, { recursive: true, force: true });
+  }
+ }, 10_000);
+
  for (const mode of ["failure", "skipped"]) {
   test(`research CI ${mode} preserves failure budget and resumes after ${mode === "failure" ? "base advancement" : "replace-ref tampering"}`, async () => {
    const dir = mkdtempSync(join(tmpdir(), "ranger-research-ci-"));
@@ -513,7 +538,7 @@ describe("ranger run-node — research worker full loop (node #13 acceptance)", 
    } finally {
     rmSync(dir, { recursive: true, force: true });
    }
-  }, 10_000);
+  }, 30_000);
  }
 
  test("worker crash with no findings → refused, dead-man increments", async () => {

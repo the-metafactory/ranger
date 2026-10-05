@@ -45,13 +45,20 @@ export function openDb(
   // BEFORE it, or a transient WAL-recovery lock (previous process's WAL not
   // yet checkpointed) returns an immediate SQLITE_BUSY "database is locked"
   // on open (observed flaking under test load).
-  sqlite.run("PRAGMA journal_mode = WAL;");
+  // Two processes switching a brand-new file to WAL at once: the loser can
+  // get SQLITE_BUSY without the busy handler being consulted. The mode is
+  // persistent, so a retry finds it set and is a no-op.
+  try {
+    retryLostRace(() => sqlite.run("PRAGMA journal_mode = WAL;"));
+  } catch (error) {
+    sqlite.close();
+    throw error;
+  }
   sqlite.run("PRAGMA foreign_keys = ON;");
 
   const db = drizzle(sqlite, { schema });
   try {
-    beforeMigrate?.(sqlite);
-    migrate(db, { migrationsFolder: MIGRATIONS_DIR });
+    migrateWithRetry(db, () => beforeMigrate?.(sqlite));
   } catch (error) {
     sqlite.close();
     throw new Error(
@@ -68,6 +75,49 @@ function refuseForeignMigrations(sqlite: Database, path: string): void {
   } catch (error) {
     sqlite.close();
     throw error;
+  }
+}
+
+/** Attempts at a step that can lose an open race before its error stands. */
+const RACE_ATTEMPTS = 5;
+
+/**
+ * Run the committed migrations, retrying a lost race with another process.
+ *
+ * drizzle's migrator reads the last applied migration OUTSIDE its
+ * transaction, then opens a deferred `BEGIN`. Two processes opening one
+ * journal at once (a fresh journal, or the first open after a new migration
+ * lands) both read "not applied" and both apply it. The loser fails: with
+ * `database is locked` when its stale read snapshot cannot take the write
+ * lock (busy_timeout does not wait out a stale WAL snapshot), or with
+ * "table already exists" once the winner has committed. Its transaction rolls
+ * back whole, so a retry re-reads `__drizzle_migrations`, finds the winner's
+ * rows, and applies only what is still missing. A migration that is broken on
+ * its own fails every attempt and its error stands.
+ *
+ * The `beforeMigrate` hook is retried with it: the legacy-roots seed
+ * (`legacy-roots.ts`) reads the schema then writes in a deferred transaction,
+ * so it loses the same race, and it is idempotent (`IF NOT EXISTS`,
+ * `INSERT OR REPLACE`, and nothing once the root column exists).
+ */
+function migrateWithRetry(db: RangerDb, beforeMigrate: () => void): void {
+  retryLostRace(() => {
+    beforeMigrate();
+    migrate(db, { migrationsFolder: MIGRATIONS_DIR });
+  });
+}
+
+/** Run `fn`, retrying it after a jittered pause; its last error stands. */
+function retryLostRace(fn: () => void): void {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      fn();
+      return;
+    } catch (error) {
+      if (attempt >= RACE_ATTEMPTS) throw error;
+      // Jittered, so two losers do not collide again in lockstep.
+      Bun.sleepSync(25 * attempt + Math.floor(Math.random() * 50));
+    }
   }
 }
 

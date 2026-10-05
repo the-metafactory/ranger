@@ -268,6 +268,27 @@ export function classify(
   return { ...base, route: { route: "escalate-hitl", reason: "untyped" } };
 }
 
+/**
+ * Classify a map's whole frontier with its walk scope: walk mode, allowlist
+ * and skip. The walk, `ranger build-now` (node #58) and `ranger serve` call
+ * this one copy, so a node the dashboard shows as walkable is one the walk
+ * would take.
+ */
+export function classifyFrontier(
+  entries: FrontierEntry[],
+  map: { repo: string; walk: WalkMode; nodes?: string[]; skip?: string[] },
+  registry: ProbeRegistry,
+  botIdentity: string | undefined,
+): ClassifiedNode[] {
+  return entries.map((entry) =>
+    classify(entry, map.repo, map.walk, registry, {
+      botIdentity,
+      allowlist: map.nodes,
+      skip: map.skip,
+    }),
+  );
+}
+
 /** HITL queue: frontier nodes whose route is escalate-hitl. */
 export function hitlWaiting(nodes: ClassifiedNode[]): ClassifiedNode[] {
   return nodes.filter((n) => n.route.route === "escalate-hitl");

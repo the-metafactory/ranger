@@ -1,6 +1,9 @@
-import { rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { rm } from "node:fs/promises";
+import { availableParallelism, loadavg, tmpdir } from "node:os";
 import { join } from "node:path";
+import { DiscordAnnouncer } from "./announce.ts";
+import { mapKey } from "./maps.ts";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import { runCmd, type RunOptions, type RunResult } from "./exec.ts";
 import {
@@ -10,17 +13,22 @@ import {
  dirtyFiles,
  fastForwardCanonical,
  findClosingKeyword,
- gitConfigSnapshot,
+ GitSafetyError,
  headSha,
  safeGit,
  vettedPush,
 } from "./git-ops.ts";
+import { recordKnownGood, trustedSnapshot } from "./git-trust.ts";
 import * as gh from "./github.ts";
 import type { CheckRun, IssueComment, PullRequest, GitHubPort } from "./github.ts";
 import { ParkSignal } from "./signals.ts";
 import {
  PROBE_FILE,
+ unfinishedProbes,
+ parseFailedChecks,
  parseFailedProbes,
+ baseConflictOutcome,
+ policyBlockedOutcome,
  probesFailedOutcome,
  reviewCapHeadMovedOutcome,
  reviewCapOutcome,
@@ -32,6 +40,7 @@ import { assembleImplementPrompt } from "./prompt.ts";
 import { ReviewError, sageReview, type ReviewVerdict } from "./review.ts";
 import {
  confirmCap,
+ hookStopReason,
  selectSubstrate,
  workerOutputFor,
  type CapSignal,
@@ -73,7 +82,7 @@ export type Reviewer = (
  repo: string,
  prNumber: number,
  readOnlyToken: string,
- opts?: { substrate?: SubstrateName },
+ opts?: { substrate?: SubstrateName; nice?: number },
 ) => Promise<ReviewVerdict>;
 
 export type WorkerRun = (prompt: string, opts: RunOptions) => Promise<RunResult>;
@@ -119,6 +128,14 @@ export interface ImplementContext {
  excludedSubstrates?: ReadonlySet<SubstrateName>;
  /** Capture shell/server injection; tests launch no browser. */
  viewsDependencies?: ViewsDependencies;
+ /** The host load the probe tier waits on (tests inject a quiet or busy host). */
+ hostLoad?: HostLoad;
+ /** How often and how long the probe tier waits for a quiet host. */
+ quietHost?: { pollMs: number; maxMs: number };
+ /** How often and how many times to ask GitHub for a PR's mergeability (tests shorten it). */
+ mergeablePoll?: { pollMs: number; attempts: number };
+ /** Posts to the map's channel (the base-red notice); tests capture it. */
+ announce?: (text: string) => Promise<unknown>;
 }
 
 export interface ImplementOutcome {
@@ -195,13 +212,20 @@ export interface RecordedProbe {
  /** Probes the selector chose ("?" when the output did not say). */
  selected: string;
  mode: string;
+ /**
+  * Probes that failed twice at this head and fail at its merge base too:
+  * the base is red on them, so they do not gate this branch. Undefined when
+  * every probe passed.
+  */
+ baseRed?: string[];
 }
 
 const PROBE_MARKER =
- /<!-- ranger:probes sha=([0-9a-f]{7,64}) result=(pass|fail) selected=(\d+|\?) mode=([\w-]+) -->/;
+ /<!-- ranger:probes sha=([0-9a-f]{7,64}) result=(pass|fail) selected=(\d+|\?) mode=([\w-]+)(?: base-red=([\w.,-]+))? -->/;
 
 export function probeMarker(p: RecordedProbe): string {
- return `<!-- ranger:probes sha=${p.sha} result=${p.passed ? "pass" : "fail"} selected=${p.selected} mode=${p.mode} -->`;
+ const baseRed = p.baseRed !== undefined && p.baseRed.length > 0 ? ` base-red=${p.baseRed.join(",")}` : "";
+ return `<!-- ranger:probes sha=${p.sha} result=${p.passed ? "pass" : "fail"} selected=${p.selected} mode=${p.mode}${baseRed} -->`;
 }
 
 /** Probe runs recorded on the PR by the MACHINE ACCOUNT (anyone else's markers are ignored). */
@@ -214,7 +238,14 @@ export function recordedProbes(
   if (c.author !== botIdentity) continue;
   const m = c.body.match(PROBE_MARKER);
   if (m === null) continue;
-  out.push({ sha: m[1], passed: m[2] === "pass", selected: m[3], mode: m[4] });
+  const baseRed = m[5]?.split(",").filter((n) => PROBE_FILE.test(n));
+  out.push({
+   sha: m[1],
+   passed: m[2] === "pass",
+   selected: m[3],
+   mode: m[4],
+   ...(baseRed !== undefined && baseRed.length > 0 ? { baseRed } : {}),
+  });
  }
  return out;
 }
@@ -270,35 +301,56 @@ async function probeFinalHead(
  }
  const command = probeCommandFor(map.commands.probe as string, nodeId);
  const timeoutMs = map.commands.probeTimeoutMin * 60_000;
- let result = await runShell(command, worktree, ctx, timeoutMs);
+ await awaitQuietHost(ctx, "probe run 1");
+ let result = await runShell(command, worktree, ctx, timeoutMs, "probe");
  let attempts = 1;
  let ranCommand = command;
  // The record names the selection of the first run: a narrowed retry selects only the failures.
  const summary = parseProbeSummary(result.stdout);
  if (result.code !== 0) {
-  // A run that named its failures (exit > 0) retries only those, when the map
-  // says how; a timeout or a runner crash (exit < 0, no FAILED line) reruns all.
+  // A run that named its failures (a FAILED line) retries only those, when
+  // the map says how. One that stopped without naming them (a timeout, a
+  // kill: exit < 0, or 128+signal when a shell sat between; a crash) retries
+  // only the selected probes it had not passed (2026-10-05: 88 probes selected
+  // on #491 hit the 30-minute limit, and the full rerun had to start over);
+  // one that says nothing usable reruns all.
   const failed = result.code > 0 ? parseFailedProbes(result.stdout) : [];
+  const unfinished = failed.length === 0 ? unfinishedProbes(result.stdout) : [];
+  const narrowed = failed.length > 0 ? failed : unfinished;
   const retryTemplate = map.commands.probeRetry;
-  if (retryTemplate !== undefined && failed.length > 0) {
-   ranCommand = probeRetryCommandFor(retryTemplate, nodeId, failed);
+  if (retryTemplate !== undefined && narrowed.length > 0) {
+   ranCommand = probeRetryCommandFor(retryTemplate, nodeId, narrowed);
   }
-  const what = ranCommand === command ? "the full suite" : `only ${failed.join(", ")}`;
-  journal.recordEvent("reviewed", { nodeId, repo, detail: `probe run 1 failed (exit ${result.code}) — retrying ${what}` });
-  result = await runShell(ranCommand, worktree, ctx, timeoutMs);
+  const what =
+   ranCommand === command
+    ? "the full suite"
+    : failed.length > 0
+     ? `only ${failed.join(", ")}`
+     : `only the ${unfinished.length} probe(s) it had not passed when it stopped`;
+  journal.recordEvent("reviewed", { nodeId, repo, detail: `probe run 1 failed (exit ${result.code}) — retrying ${what}`.slice(0, 400) });
+  await awaitQuietHost(ctx, "the probe retry");
+  result = await runShell(ranCommand, worktree, ctx, timeoutMs, "probe");
   attempts = 2;
  }
+ const failed = result.code > 0 ? parseFailedProbes(result.stdout) : [];
+ // A failure the merge base shares is the base's, not this branch's
+ // (2026-10-05: main went red on one probe and parked every later node).
+ const base = result.code === 0 ? null : await probeMergeBase(ctx, failed, result.stdout);
+ if (base !== null) journal.recordEvent("reviewed", { nodeId, repo, detail: baseProbeDetail(base) });
+ const baseRed = base !== null && base.red.length === failed.length ? base.red : undefined;
+ if (baseRed !== undefined) await announceBaseRed(ctx, (base as BaseProbeResult).sha, baseRed);
  const record: RecordedProbe = {
   sha: live.headSha,
-  passed: result.code === 0,
+  passed: result.code === 0 || baseRed !== undefined,
   ...summary,
+  ...(baseRed === undefined ? {} : { baseRed }),
  };
  ctx.journal.assertGeneration(nodeId, ctx.map.repo, ctx.generation, "post the probe record");
  await github.postComment(repo, prNumber, probeComment(ranCommand, record, attempts, result), token);
  journal.recordEvent("reviewed", {
   nodeId,
   repo,
-  detail: `probes ${record.passed ? "passed" : "FAILED"} at ${record.sha.slice(0, 8)} (${record.mode}, ${record.selected} selected, ${attempts} run(s))`,
+  detail: `probes ${record.passed ? "passed" : "FAILED"} at ${record.sha.slice(0, 8)} (${record.mode}, ${record.selected} selected, ${attempts} run(s))${baseRed === undefined ? "" : `; red on the merge base too, not gating: ${baseRed.join(", ")}`}`,
  });
  if (!record.passed) {
   throw new ParkSignal(
@@ -306,12 +358,179 @@ async function probeFinalHead(
     sha: record.sha,
     pr: prNumber,
     exit: result.code,
-    failed: result.code > 0 ? parseFailedProbes(result.stdout) : [],
+    failed,
+    redOnBase: base?.red ?? [],
     tail: tail(result),
    }),
   );
  }
  return record;
+}
+
+/** The host's 1-minute load and core count: the probe tier waits for a quiet host. */
+export type HostLoad = () => { load: number; cores: number };
+
+const realHostLoad: HostLoad = () => ({ load: loadavg()[0], cores: availableParallelism() });
+
+/** How long a probe run waits for the host to quiet down before running anyway. */
+const QUIET_HOST = { pollMs: 30_000, maxMs: 20 * 60_000 };
+
+/**
+ * Wait until the 1-minute load is below the core count before a probe run.
+ * The browser probes are timing-sensitive, and the headless lane's worker and
+ * test runs load the same host (2026-10-04: probe-gamepad failed at peak load
+ * 28.6 on 10 cores during node 58's fix pass, and the immediate retry ran
+ * under the same load; one quiet run passed the same head). After `maxMs`
+ * the run goes ahead anyway: a busy host delays the probe tier, never stops it.
+ */
+async function awaitQuietHost(ctx: ImplementContext, run: string): Promise<void> {
+ const read = ctx.hostLoad ?? realHostLoad;
+ const { pollMs, maxMs } = ctx.quietHost ?? QUIET_HOST;
+ let host = read();
+ if (host.load < host.cores) return;
+ const nodeId = ctx.node.ref.id;
+ const repo = ctx.map.repo;
+ const started = Date.now();
+ ctx.journal.recordEvent("reviewed", {
+  nodeId,
+  repo,
+  detail: `${run} waits for the host: load ${host.load.toFixed(1)} on ${host.cores} cores`,
+ });
+ while (host.load >= host.cores && Date.now() - started < maxMs) {
+  await new Promise((r) => setTimeout(r, pollMs));
+  host = read();
+ }
+ const waited = Math.round((Date.now() - started) / 1000);
+ ctx.journal.recordEvent("reviewed", {
+  nodeId,
+  repo,
+  detail:
+   host.load < host.cores
+    ? `${run} starts after ${waited}s: load ${host.load.toFixed(1)} on ${host.cores} cores`
+    : `${run} starts on a busy host after ${waited}s: load ${host.load.toFixed(1)} on ${host.cores} cores`,
+ });
+}
+
+interface BaseProbeResult {
+ /** The merge base the probes ran at. */
+ sha: string;
+ /** Failed probes that fail the same checks at the merge base: the base's failure, not this branch's. */
+ red: string[];
+ /** Failed probes that fail at the merge base too, but not the same way (another check, or a crash), so they gate. */
+ differs: string[];
+ /** Failed probes that pass at the merge base: the branch broke them. */
+ passed: string[];
+ /** Failed probes the branch added or edited: the base runs another probe under that name, so they gate. */
+ changed: string[];
+}
+
+/** The journal line for a merge-base probe check. */
+function baseProbeDetail(b: BaseProbeResult): string {
+ const at = `the merge base ${b.sha.slice(0, 8)}`;
+ return [
+  b.red.length > 0 ? `${b.red.join(", ")} fail at ${at} too` : null,
+  b.differs.length > 0 ? `${b.differs.join(", ")} fail at ${at} too, but not the same way — they gate` : null,
+  b.passed.length > 0 ? `${b.passed.join(", ")} pass at ${at} — the failure is this branch's` : null,
+  b.changed.length > 0 ? `${b.changed.join(", ")} are new or changed on this branch — they gate` : null,
+ ].filter((part) => part !== null).join("; ");
+}
+
+/** File names (no directory) in git's newline-separated path output. */
+function fileNames(stdout: string): Set<string> {
+ return new Set(stdout.split("\n").filter(Boolean).map((p) => p.slice(p.lastIndexOf("/") + 1)));
+}
+
+/**
+ * Run the probes that failed at the head once more at the branch's merge base
+ * with the map base, in a throwaway detached worktree. A probe the branch
+ * added or edited is not compared: the base would run another probe under
+ * its name, so it gates whatever the base says. A probe file holds many
+ * checks, so one red at the base is the base's only when every check it
+ * fails here fails there too, and both runs ended as assertion failures; a
+ * crash, kill or timeout cannot be compared and gates. Null when the answer is
+ * unknown: no retry template to name exact probes, no named failures, or a
+ * base run that could not be set up, timed out, or named nothing.
+ */
+async function probeMergeBase(
+ ctx: ImplementContext,
+ failed: string[],
+ headStdout: string,
+): Promise<BaseProbeResult | null> {
+ const { map, worktree } = ctx;
+ const template = map.commands.probeRetry;
+ if (template === undefined || failed.length === 0) return null;
+ const merged = await safeGit(["merge-base", "HEAD", `origin/${map.base}`], { cwd: worktree, timeoutMs: 30_000 });
+ const sha = merged.stdout.trim();
+ if (merged.code !== 0 || !/^[0-9a-f]{40}$/.test(sha)) return null;
+ const tree = await safeGit(["ls-tree", "-r", "--name-only", sha], { cwd: worktree, timeoutMs: 30_000 });
+ const diff = await safeGit(["diff", "--name-only", sha, "HEAD"], { cwd: worktree, timeoutMs: 30_000 });
+ if (tree.code !== 0 || diff.code !== 0) return null;
+ const atBase = fileNames(tree.stdout);
+ const touched = fileNames(diff.stdout);
+ const changed = failed.filter((n) => !atBase.has(n) || touched.has(n));
+ const comparable = failed.filter((n) => !changed.includes(n));
+ if (comparable.length === 0) return { sha, red: [], differs: [], passed: [], changed };
+ const command = probeRetryCommandFor(template, ctx.node.ref.id, comparable);
+ const scratch = mkdtempSync(join(tmpdir(), "ranger-probe-base-"));
+ const dir = join(scratch, "worktree");
+ try {
+  const add = await safeGit(["worktree", "add", "--detach", dir, sha], { cwd: worktree, timeoutMs: 120_000 });
+  if (add.code !== 0) return null;
+  if (map.commands.install !== undefined) {
+   const install = await runShell(map.commands.install, dir, ctx, INSTALL_TIMEOUT_MS);
+   if (install.code !== 0) return null;
+  }
+  await awaitQuietHost(ctx, "the merge-base probe run");
+  const run = await runShell(command, dir, ctx, map.commands.probeTimeoutMin * 60_000, "probe");
+  if (run.code === 0) return { sha, red: [], differs: [], passed: comparable, changed };
+  const named = run.code > 0 ? parseFailedProbes(run.stdout) : [];
+  if (named.length === 0) return null;
+  const headChecks = parseFailedChecks(headStdout);
+  const baseChecks = parseFailedChecks(run.stdout);
+  // Both runs must be completed assertion failures: a crash, kill or timeout
+  // after the inherited check is a failure of its own that names no check.
+  const sameChecks = (probe: string): boolean => {
+   const here = headChecks.get(probe);
+   const there = baseChecks.get(probe);
+   if (here === undefined || there === undefined) return false;
+   if (here.kind !== "assert" || there.kind !== "assert") return false;
+   return here.checks.size > 0 && [...here.checks].every((check) => there.checks.has(check));
+  };
+  const redThere = comparable.filter((n) => named.includes(n));
+  return {
+   sha,
+   red: redThere.filter(sameChecks),
+   differs: redThere.filter((n) => !sameChecks(n)),
+   passed: comparable.filter((n) => !named.includes(n)),
+   changed,
+  };
+ } finally {
+  await safeGit(["worktree", "remove", "--force", dir], { cwd: worktree, timeoutMs: 60_000 });
+  rmSync(scratch, { recursive: true, force: true });
+  await safeGit(["worktree", "prune"], { cwd: worktree, timeoutMs: 30_000 });
+ }
+}
+
+/**
+ * Tell the map's channel once per map, merge base and probe set that the base
+ * is red: every later branch off it would otherwise fail the same probes. The
+ * run was at the merge base, not the base's tip, so the notice says so. Best
+ * effort; the probe record on the PR is the durable trace.
+ */
+async function announceBaseRed(ctx: ImplementContext, sha: string, red: string[]): Promise<void> {
+ const key = `base-red.${mapKey(ctx.map)}.${sha}.${[...red].sort().join(",")}`;
+ if (ctx.journal.getHealth(key) !== null) return;
+ const text = [
+  `:ranger: **${ctx.map.base} was red** at \`${sha.slice(0, 8)}\` on ${red.join(", ")}`,
+  `map: ${mapKey(ctx.map)}`,
+  `Node #${ctx.node.ref.id} failed these probes twice, and they fail at its merge base too. Branches off this commit do not gate on them. Unless a later ${ctx.map.base} commit already fixed them, ${ctx.map.base} needs a fix.`,
+ ].join("\n");
+ try {
+  await (ctx.announce ?? ((t: string) => DiscordAnnouncer.fromMap(ctx.map).post(t, "base-red notice")))(text);
+  ctx.journal.setHealth(key, new Date().toISOString());
+ } catch {
+  /* best effort: the next node off this base tries again */
+ }
 }
 
 function probeComment(
@@ -324,7 +543,7 @@ function probeComment(
  const clipped = out.length > 20_000 ? `…${out.slice(-20_000)}` : out;
  return [
   probeMarker(p),
-  `**Probes — ${p.passed ? "passed" : "failed"}** at \`${p.sha.slice(0, 8)}\` (selection ${p.mode}, ${p.selected} probe(s); ${attempts} run(s))`,
+  `**Probes — ${p.passed ? "passed" : "failed"}** at \`${p.sha.slice(0, 8)}\` (selection ${p.mode}, ${p.selected} probe(s); ${attempts} run(s))${baseRedNote(p)}`,
   "",
   `\`${command}\``,
   "",
@@ -414,20 +633,27 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
     };
    }
   }
-  const built = await workerPass(ctx, testCommand, undefined);
+  // Work an earlier run built and committed, but never pushed, is adopted
+  // when it passes the supervisor's checks (#691: its tests failed under
+  // load; a fresh worker would find nothing to commit and fail again).
+  const built = (await adoptBuiltWork(ctx, testCommand)) ?? (await workerPass(ctx, testCommand, { kind: "build" }));
   workerExit = built.workerExit;
   if (built.failure !== undefined) return built.failure;
 
   fence("push");
-  await vettedPush({
+  const vetted = await vettedPush({
    worktree,
    canonical: ctx.canonical,
    branch,
    token,
    configSnapshot: built.snapshot,
   });
+  recordKnownGood(journal, ctx.canonical, vetted, "vetted push");
   journal.recordEvent("pushed", { nodeId, repo, detail: `${branch} @ ${built.sha.slice(0, 8)}` });
-  recordHead(ctx, built.sha);
+  // Review selection reads who wrote a head. Every session records its own
+  // commit as it makes it (checkedWorkerPass); an adopted build keeps that
+  // record and is never credited to this run's substrate.
+  if (built.adopted !== true) recordHead(ctx, built.sha);
 
   const title = prTitle(node);
   fence("open PR");
@@ -444,12 +670,20 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
  // ---- review loop ----
  const open = pr as PullRequest;
  journal.updateWorker(nodeId, ctx.map.repo, { phase: "review", prNumber: open.number });
- const cap = config.workers.reviewRounds;
- let reviews = recordedReviews(
-  await github.listComments(repo, open.number, token),
-  botIdentity,
+ const opening = await github.listComments(repo, open.number, token);
+ let reviews = recordedReviews(opening, botIdentity);
+ // A base merge pass moves the head without a finding to answer: each one
+ // that landed in the PR's head grants the round that reviews the merged
+ // branch. A marker whose merge was never pushed (a crash between the two)
+ // grants nothing and uses up none of the node's merge passes.
+ let baseMerges = await landedBaseMerges(
+  worktree,
+  recordedBaseMerges(opening, botIdentity),
+  (await github.getPr(repo, open.number, token)).headSha,
  );
+ const capNow = () => config.workers.reviewRounds + baseMerges;
  for (;;) {
+  const cap = capNow();
   const live = await github.getPr(repo, open.number, token);
   let current = reviews.find((r) => r.sha === live.headSha);
   if (current === undefined) {
@@ -472,6 +706,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
       return {
        verdict: await (ctx.reviewer ?? sageReview)(repo, open.number, ctx.readOnlyToken, {
         substrate: reviewSubstrate,
+        nice: config.workers.niceness,
        }),
       };
      } catch (error) {
@@ -529,7 +764,33 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
   });
   // Blockers AND majors gate (principal, 2026-10-03): each is reworked and
   // re-reviewed. Suggestions and nits do not gate.
-  if (gatingFindings(current) === 0) break;
+  if (gatingFindings(current) === 0) {
+   // Sage-clean. Before the probes certify this head, it must merge: GitHub
+   // runs no CI on a conflicting PR, so a conflict found only at the merge
+   // desk waits forever (seelite #692).
+   if (!(await conflictsWithBase(ctx, github, open.number))) break;
+   if (baseMerges >= MAX_BASE_MERGES) {
+    throw new ParkSignal(baseConflictOutcome({ pr: open.number, base, passes: baseMerges }));
+   }
+   const merged = await baseMergePass(ctx, testCommand, live.headSha);
+   workerExit = merged.workerExit;
+   if (merged.failure !== undefined) return merged.failure;
+   // The marker first: a merged head pushed without one would read as an
+   // unreviewed head at the cap. A marker whose push never happens counts
+   // for nothing (landedBaseMerges), so a crash between them costs nothing.
+   fence("record the base merge");
+   await github.postComment(repo, open.number, baseMergeMarker(merged.sha, base), token);
+   await publishPass(
+    ctx,
+    github,
+    open.number,
+    merged,
+    "push base merge",
+    `base merge pass ${baseMerges + 1} @ ${merged.sha.slice(0, 8)}: origin/${base} merged in after a conflict`,
+   );
+   baseMerges += 1;
+   continue;
+  }
   if (current.round >= cap) {
    throw new ParkSignal(
     reviewCapOutcome({ blockers: current.blockers, majors: current.majors, round: current.round, pr: open.number }),
@@ -537,27 +798,10 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
   }
   // One fix pass per review that found blockers or majors. On a resume the review is
   // re-read from its PR comment, so a crash between review and fix loses nothing.
-  const fixed = await workerPass(ctx, testCommand, {
-   round: current.round,
-   body: current.body,
-  });
+  const fixed = await workerPass(ctx, testCommand, { kind: "fix", round: current.round, body: current.body });
   workerExit = fixed.workerExit;
   if (fixed.failure !== undefined) return fixed.failure;
-  fence("push fix");
-  await vettedPush({
-   worktree,
-   canonical: ctx.canonical,
-   branch,
-   token,
-   configSnapshot: fixed.snapshot,
-  });
-  journal.recordEvent("pushed", {
-   nodeId,
-   repo,
-   detail: `fix pass ${current.round} @ ${fixed.sha.slice(0, 8)}`,
-  });
-  recordHead(ctx, fixed.sha);
-  await awaitHead(github, repo, open.number, fixed.sha, token, ctx.headPollMs);
+  await publishPass(ctx, github, open.number, fixed, "push fix", `fix pass ${current.round} @ ${fixed.sha.slice(0, 8)}`);
  }
 
  // ---- probe tier, once, on the final head ----
@@ -622,11 +866,157 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
  };
 }
 
+/** Base merge passes one node gets before a still-conflicting branch parks. */
+const MAX_BASE_MERGES = 2;
+
+interface BaseMergeInput {
+ base: string;
+ /** The files a trial merge reported as conflicting (the worker's starting point). */
+ files: string[];
+}
+
+/** The base is informational: any ref name the config accepts must still parse. */
+const BASE_MERGE_MARKER = /<!-- ranger:base-merge sha=([0-9a-f]{7,64})(?: base=[^\s>]*)? -->/;
+
+export function baseMergeMarker(sha: string, base: string): string {
+ return `<!-- ranger:base-merge sha=${sha} base=${base} -->\n**Base merge** — \`origin/${base}\` conflicted with this branch, so a worker merged it in at \`${sha.slice(0, 8)}\`. The next sage round reviews the merged branch.`;
+}
+
+/** Base merge passes recorded on the PR by the MACHINE ACCOUNT (anyone else's markers are ignored). */
+export function recordedBaseMerges(comments: IssueComment[], botIdentity: string): { sha: string }[] {
+ const out: { sha: string }[] = [];
+ for (const c of comments) {
+  if (c.author !== botIdentity) continue;
+  const m = c.body.match(BASE_MERGE_MARKER);
+  if (m !== null) out.push({ sha: m[1] });
+ }
+ return out;
+}
+
+/** How many recorded base merges landed: their merge commit is in the PR's head. */
+async function landedBaseMerges(worktree: string, merges: { sha: string }[], head: string): Promise<number> {
+ let landed = 0;
+ for (const { sha } of new Map(merges.map((m) => [m.sha, m])).values()) {
+  const inside = await safeGit(["merge-base", "--is-ancestor", sha, head], { cwd: worktree, timeoutMs: 30_000 });
+  if (inside.code === 0) landed += 1;
+ }
+ return landed;
+}
+
+/** Push a pass's commits through the vetted push, record them, and wait for GitHub to show the head. */
+async function publishPass(
+ ctx: ImplementContext,
+ github: GitHubPort,
+ prNumber: number,
+ pass: PassResult,
+ action: string,
+ detail: string,
+): Promise<void> {
+ ctx.journal.assertGeneration(ctx.node.ref.id, ctx.map.repo, ctx.generation, action);
+ const vetted = await vettedPush({
+  worktree: ctx.worktree,
+  canonical: ctx.canonical,
+  branch: ctx.branch,
+  token: ctx.token,
+  configSnapshot: pass.snapshot,
+ });
+ recordKnownGood(ctx.journal, ctx.canonical, vetted, "vetted push");
+ ctx.journal.recordEvent("pushed", { nodeId: ctx.node.ref.id, repo: ctx.map.repo, detail });
+ recordHead(ctx, pass.sha);
+ await awaitHead(github, ctx.map.repo, prNumber, pass.sha, ctx.token, ctx.headPollMs);
+}
+
+/**
+ * Whether GitHub says the PR conflicts with its base. GitHub computes
+ * mergeability lazily after a push, so an unknown answer is polled for a
+ * while; one that stays unknown reads as no conflict, and the merge gate
+ * asks again before any merge.
+ */
+async function conflictsWithBase(ctx: ImplementContext, github: GitHubPort, prNumber: number): Promise<boolean> {
+ const { pollMs, attempts } = ctx.mergeablePoll ?? { pollMs: 5_000, attempts: 12 };
+ for (let i = 0; i < attempts; i++) {
+  const pr = await github.getPr(ctx.map.repo, prNumber, ctx.token);
+  if (pr.mergeable !== null && pr.mergeableState !== "unknown") {
+   return pr.mergeable === false || pr.mergeableState === "dirty";
+  }
+  if (i < attempts - 1) await new Promise((r) => setTimeout(r, pollMs));
+ }
+ return false;
+}
+
+/**
+ * The files `git merge-tree` reports as conflicting between the branch and
+ * origin/<base>: a hint for the worker's prompt, empty when git cannot say.
+ */
+async function conflictingFiles(worktree: string, base: string): Promise<string[]> {
+ const trial = await safeGit(["merge-tree", "--write-tree", "--name-only", "--no-messages", "HEAD", `origin/${base}`], {
+  cwd: worktree,
+  timeoutMs: 60_000,
+ });
+ if (trial.code !== 1) return [];
+ return trial.stdout.split("\n").slice(1).map((l) => l.trim()).filter(Boolean).slice(0, 20);
+}
+
+/**
+ * One worker pass that merges the moved base into the branch. The supervisor
+ * fetches the base first (the worker holds no credential); the worker merges
+ * and resolves; the supervisor's own checks then require a clean tree,
+ * passing tests, and origin/<base> actually inside the branch.
+ */
+async function baseMergePass(ctx: ImplementContext, testCommand: string, pushedHead: string): Promise<PassResult> {
+ const base = ctx.map.base;
+ // Start from what GitHub has: an earlier run may have merged locally and
+ // crashed before its push, and that unpushed state is neither vetted nor
+ // reviewed. The pass redoes the merge on the pushed head — only while this
+ // supervisor still owns the node: a superseded one must not erase a newer
+ // run's work.
+ for (const args of [["reset", "--hard", pushedHead], ["clean", "-fd"]]) {
+  // Fenced before EACH destructive command: a replacement run can take the
+  // node over while the previous one awaits.
+  ctx.journal.assertGeneration(ctx.node.ref.id, ctx.map.repo, ctx.generation, `git ${args[0]} before a base merge`);
+  const r = await safeGit(args, { cwd: ctx.worktree, timeoutMs: 60_000 });
+  if (r.code !== 0) throw new GitSafetyError(`cannot reset ${ctx.worktree} to ${pushedHead.slice(0, 8)} (git ${args[0]}): ${r.stderr.trim()}`);
+ }
+ // The fetch carries the write credential: the state must still be the known-good one (node #81).
+ await trustedSnapshot(ctx.journal, ctx.canonical, { repo: ctx.map.repo, nodeId: ctx.node.ref.id }, mapKey(ctx.map));
+ await fastForwardCanonical(ctx.canonical, base, ctx.token);
+ // The base's commit as the supervisor fetched it, read before the worker
+ // runs: the worker shares the repository and could move the ref itself.
+ const fetched = await safeGit(["rev-parse", "--verify", `refs/remotes/origin/${base}^{commit}`], {
+  cwd: ctx.canonical,
+  timeoutMs: 10_000,
+ });
+ const baseSha = fetched.stdout.trim();
+ if (fetched.code !== 0 || !/^[0-9a-f]{40}$/.test(baseSha)) {
+  throw new GitSafetyError(`cannot resolve origin/${base} after the fetch: ${fetched.stderr.trim()}`);
+ }
+ const files = await conflictingFiles(ctx.worktree, base);
+ ctx.journal.recordEvent("reviewed", {
+  nodeId: ctx.node.ref.id,
+  repo: ctx.map.repo,
+  detail: `PR conflicts with origin/${base}${files.length > 0 ? ` in ${files.join(", ")}` : ""} — a worker merges it in`,
+ });
+ const pass = await workerPass(ctx, testCommand, { kind: "base-merge", base, files });
+ if (pass.failure !== undefined) return pass;
+ const inside = await safeGit(["merge-base", "--is-ancestor", baseSha, "HEAD"], {
+  cwd: ctx.worktree,
+  timeoutMs: 30_000,
+ });
+ if (inside.code !== 0) {
+  throw new ParkSignal(
+   `base merge pass committed, but origin/${base} as fetched (${baseSha.slice(0, 8)}) is not in ${ctx.branch} — the conflict stands; nothing was pushed`,
+  );
+ }
+ return pass;
+}
+
 interface PassResult {
  workerExit: number | null;
  snapshot: string;
  sha: string;
  failure?: ImplementOutcome;
+ /** The commits were adopted from an earlier run, not written by this run's worker. */
+ adopted?: boolean;
 }
 
 /**
@@ -660,20 +1050,46 @@ function recordHead(ctx: ImplementContext, sha: string): void {
  });
 }
 
+/** What a worker session is for: the build, a fix pass answering a sage round, or a base merge. */
+type WorkerPassSpec =
+ | { kind: "build" }
+ | { kind: "fix"; round: number; body: string }
+ | ({ kind: "base-merge" } & BaseMergeInput);
+
+/** The pass's name in logs, events and outcomes. */
+function passLabel(spec: WorkerPassSpec): string {
+ switch (spec.kind) {
+  case "build":
+   return "build pass";
+  case "fix":
+   return `fix pass ${spec.round}`;
+  case "base-merge":
+   return "base merge pass";
+ }
+}
+
+/** Why a pass that exited 0 without a new commit failed. */
+function nothingCommitted(spec: WorkerPassSpec): string {
+ switch (spec.kind) {
+  case "build":
+   return "worker exited 0 but committed nothing — nothing to push";
+  case "fix":
+   return `fix pass ${spec.round} committed nothing — the blockers stand`;
+  case "base-merge":
+   return `base merge pass committed nothing — the conflict with origin/${spec.base} stands`;
+ }
+}
+
 /**
- * One worker session (build or fix), recorded as a substrate session (node
- * #56) that ends once the supervisor's own checks have judged it. A
- * RANGER_WORKER_CMD session runs on a substrate ranger cannot know, so it is
- * not recorded.
+ * One worker session (build, fix or base merge), recorded as a substrate
+ * session (node #56) that ends once the supervisor's own checks have judged
+ * it. A RANGER_WORKER_CMD session runs on a substrate ranger cannot know, so
+ * it is not recorded.
  */
-async function workerPass(
- ctx: ImplementContext,
- testCommand: string,
- review: { round: number; body: string } | undefined,
-): Promise<PassResult> {
+async function workerPass(ctx: ImplementContext, testCommand: string, spec: WorkerPassSpec): Promise<PassResult> {
  const nodeId = ctx.node.ref.id;
  if (ctx.substrate === undefined) {
-  return checkedWorkerPass(ctx, testCommand, review, () =>
+  return checkedWorkerPass(ctx, testCommand, spec, () =>
    ctx.journal.assertGeneration(nodeId, ctx.map.repo, ctx.generation, "spawn the worker"),
   );
  }
@@ -681,13 +1097,13 @@ async function workerPass(
   ctx.journal,
   {
    substrate: ctx.substrate,
-   kind: review === undefined ? "worker" : "fix-pass",
+   kind: spec.kind === "build" ? "worker" : "fix-pass",
    repo: ctx.map.repo,
    nodeId,
    generation: ctx.generation,
    model: ctx.model ?? null,
   },
-  (open) => checkedWorkerPass(ctx, testCommand, review, open),
+  (open) => checkedWorkerPass(ctx, testCommand, spec, open),
   (pass) =>
    pass.failure === undefined ? "ok" : failedSessionOutcome(pass.failure.detail, pass.failure.substrateCapped),
  );
@@ -702,12 +1118,14 @@ async function workerPass(
 async function checkedWorkerPass(
  ctx: ImplementContext,
  testCommand: string,
- review: { round: number; body: string } | undefined,
+ spec: WorkerPassSpec,
  fenceSpawn: () => void,
 ): Promise<PassResult> {
  const { config, map, journal, node, worktree, branch, botIdentity } = ctx;
  const nodeId = node.ref.id;
- const snapshot = gitConfigSnapshot(ctx.canonical);
+ // Checked against the known-good state, not just read (node #81): a state
+ // changed since the supervisor last saw it clean is never this pass's baseline.
+ const snapshot = await trustedSnapshot(journal, ctx.canonical, { repo: map.repo, nodeId }, mapKey(map));
  const before = await headSha(worktree);
  const prompt = assembleImplementPrompt({
   repo: map.repo,
@@ -725,7 +1143,8 @@ async function checkedWorkerPass(
   worktree,
   botIdentity,
   testCommand,
-  review,
+  ...(spec.kind === "fix" ? { review: { round: spec.round, body: spec.body } } : {}),
+  ...(spec.kind === "base-merge" ? { baseMerge: { base: spec.base, files: spec.files } } : {}),
   probeTier: map.commands.probe !== undefined,
  });
  fenceSpawn();
@@ -733,6 +1152,7 @@ async function checkedWorkerPass(
  const raw = await ctx.workerRun(prompt, {
   cwd: worktree,
   timeoutMs: config.workers.wallClockMin * 60_000,
+  nice: config.workers.niceness,
   env: workerEnv(config, map.repo, ctx.sessionJournal),
   ...output.runOptions,
   processGroup: true,
@@ -744,17 +1164,11 @@ async function checkedWorkerPass(
  // quota readings are cached, and its signal lines feed the cap check.
  const { result, lines } = output.read(raw, journal);
 
- const log = saveWorkerLog(
-  journal.path,
-  map.repo,
-  nodeId,
-  ctx.generation,
-  review === undefined ? "build pass" : `fix pass ${review.round}`,
-  result,
- );
+ const pass = passLabel(spec);
+ const log = saveWorkerLog(journal.path, map.repo, nodeId, ctx.generation, pass, result);
  // Before ANY git call after the worker: a tampered config or hook would run
  // with whatever the next git call carries.
- assertGitUntouched(ctx.canonical, snapshot);
+ await assertGitUntouched(ctx.canonical, snapshot);
 
  const fail = (detail: string, substrateCapped?: CapSignal): PassResult => ({
   workerExit: result.code,
@@ -767,6 +1181,8 @@ async function checkedWorkerPass(
    ...(substrateCapped === undefined ? {} : { substrateCapped }),
   },
  });
+ const stopped = hookStopReason(result.stdout, lines);
+ if (stopped !== null) throw new ParkSignal(policyBlockedOutcome({ pass, reason: stopped, log }));
  if (result.code !== 0) {
   // Mid-session cap (node #45): only the substrate's own signal says so, and
   // only a failed run can be one. A capped failure does not count.
@@ -777,14 +1193,24 @@ async function checkedWorkerPass(
   if (capSignal !== null) return fail(`substrate ${capSignal.substrate} hit its rate limit`, capSignal);
   return fail(`worker exited ${result.code}: ${tail(result)}`);
  }
+ // A base merge brings in the base's manifests and lockfile: the tests must
+ // run on its dependencies, not the ones installed for the old base. It runs
+ // before the commit and clean-tree checks, so an install that rewrites a
+ // tracked file (a lockfile, generated source) fails the pass rather than
+ // letting the tests certify content that never gets pushed.
+ if (spec.kind === "base-merge" && map.commands.install !== undefined) {
+  const install = await runShell(map.commands.install, worktree, ctx, INSTALL_TIMEOUT_MS);
+  if (install.code !== 0) {
+   return fail(`install (${map.commands.install}) after the base merge exited ${install.code}: ${tail(install)}`);
+  }
+ }
  const sha = await headSha(worktree);
  if (sha === before || (await commitsAhead(worktree, map.base)) === 0) {
-  return fail(
-   review === undefined
-    ? "worker exited 0 but committed nothing — nothing to push"
-    : `fix pass ${review.round} committed nothing — the blockers stand`,
-  );
+  return fail(nothingCommitted(spec));
  }
+ // This session wrote `sha`: record it now, so a later run that adopts the
+ // commit unpushed still credits the substrate that actually wrote it.
+ recordHead(ctx, sha);
  // The supervisor tests the working tree but pushes commits: a dirty tree
  // would let a green test run cover code that never lands.
  const dirty = await dirtyFiles(worktree);
@@ -793,10 +1219,18 @@ async function checkedWorkerPass(
    `worker left ${dirty.length} uncommitted or untracked file(s) (${dirty.slice(0, 5).join("; ")}) — the tests would not test what gets pushed`,
   );
  }
- const tests = await runShell(testCommand, worktree, ctx, TEST_TIMEOUT_MS);
- if (tests.code !== 0) {
-  return fail(`tests (${testCommand}) failed after the worker (exit ${tests.code}): ${tail(tests)}`);
+ const { tests, retried } = await supervisorTests(ctx, testCommand, pass);
+ if (tests.code !== 0) return fail(testsFailedDetail(testCommand, tests, "after the worker"));
+ if (retried) {
+  // The pass was certified in a fresh clone: the worktree still holds what
+  // the failed run left, and the probes run there next.
+  const restored = await restoreWorktree(ctx, sha);
+  if (restored !== null) return fail(restored);
  }
+ // The tests ran worker-written code: the state must still be the vetted one
+ // before it counts as seen clean.
+ const clean = await assertGitUntouched(ctx.canonical, snapshot);
+ recordKnownGood(journal, ctx.canonical, clean, `passing ${pass}`);
  await assertNoClosingKeywords(worktree, map.base);
  return { workerExit: result.code, snapshot, sha };
 }
@@ -810,6 +1244,7 @@ function runShell(
  cwd: string,
  ctx: ImplementContext,
  timeoutMs: number,
+ priority: "background" | "probe" = "background",
 ): Promise<RunResult> {
  const run: ShellRun = ctx.shellRun ?? ((cmd, opts) => runCmd("/bin/sh", ["-c", cmd], opts));
  return run(command, {
@@ -817,6 +1252,8 @@ function runShell(
   env: workerEnv(ctx.config, ctx.map.repo, ctx.sessionJournal),
   timeoutMs,
   processGroup: true,
+  // Install and tests yield the CPU; the timing-sensitive probes do not.
+  ...(priority === "probe" ? {} : { nice: ctx.config.workers.niceness }),
  });
 }
 
@@ -957,6 +1394,244 @@ function reviewComment(round: number, verdict: ReviewVerdict, substrate?: Substr
  return head + body;
 }
 
+/** The first three failing tests a run names, in bun's `(fail) <name> [12ms]` format. */
+export function failedTestNames(result: RunResult): string[] {
+ const names = new Set<string>();
+ for (const m of `${result.stdout}\n${result.stderr}`.matchAll(/^\(fail\) (.+?)(?: \[[\d.]+m?s\])?$/gm)) {
+  names.add(m[1].trim());
+ }
+ return [...names].slice(0, 3);
+}
+
+/** A failed supervisor test run, named: the failing tests first (the journal keeps 400 characters), then the tail. */
+function testsFailedDetail(testCommand: string, tests: RunResult, after: string): string {
+ const names = failedTestNames(tests);
+ return `tests (${testCommand}) failed ${after} (exit ${tests.code})${names.length > 0 ? ` — failing: ${names.join("; ")}` : ""}: ${tail(tests)}`;
+}
+
+/**
+ * The supervisor's own test run. A failure keeps its whole output in the
+ * node's log (2026-10-05: #691's failure kept only 400 characters of passing
+ * tests, so the failing one was lost). A failure on a busy host is retried
+ * once, after the host quiets or the quiet-host wait (20 minutes) runs out:
+ * the worker's run passed the same tree, and a rerun at normal load passed
+ * it again, while the supervisor's ran at load 40–100 and failed.
+ *
+ * The retry runs in a fresh clone of the committed head, with its own
+ * install (testsInFreshCheckout): nothing the failed run wrote into the
+ * node's worktree or the shared repository (untracked or ignored fixtures,
+ * index flags, links, replacement refs) reaches it. The node's worktree is
+ * left as it is, and a retry whose pass ends with the worktree on another
+ * HEAD counts for nothing.
+ *
+ * What this guards against is leftovers: state outside the commit that a
+ * failed run produced. The commit's own install and test scripts are the
+ * commit; one that misreports itself (an `exit 0`, a redirected git
+ * worktree) is the commit's behaviour, which no re-run can catch, and the
+ * review reads that code.
+ */
+async function supervisorTests(
+ ctx: ImplementContext,
+ testCommand: string,
+ label: string,
+): Promise<{ tests: RunResult; log: string | null; retried: boolean }> {
+ const { journal, map, node, worktree } = ctx;
+ const head = await headSha(worktree);
+ let tests = await runShell(testCommand, worktree, ctx, TEST_TIMEOUT_MS);
+ if (tests.code === 0) return { tests, log: null, retried: false };
+ const log = saveWorkerLog(journal.path, map.repo, node.ref.id, ctx.generation, `${label}: supervisor tests (${testCommand})`, tests);
+ if ((await headSha(worktree)) !== head) {
+  journal.recordEvent("reviewed", {
+   nodeId: node.ref.id,
+   repo: map.repo,
+   detail: `tests (${testCommand}) failed and moved HEAD — not retried`,
+  });
+  return { tests, log, retried: false };
+ }
+ const retry = await retryOnBusyHost(ctx, testCommand, head, `tests (${testCommand})`, "the test retry");
+ if (retry === null) return { tests, log, retried: false };
+ tests = retry;
+ if (tests.code === 0 && (await headSha(worktree)) !== head) {
+  tests = { ...tests, code: 1, stderr: `the retry passed at ${head.slice(0, 8)}, but the worktree moved off it meanwhile\n${tests.stderr}` };
+ }
+ if (tests.code === 0) {
+  journal.recordEvent("reviewed", { nodeId: node.ref.id, repo: map.repo, detail: `tests (${testCommand}) passed on the retry in a fresh checkout` });
+  return { tests, log, retried: true };
+ }
+ saveWorkerLog(journal.path, map.repo, node.ref.id, ctx.generation, `${label}: supervisor test retry in a fresh checkout (${testCommand})`, tests);
+ return { tests, log, retried: false };
+}
+
+/**
+ * The one busy-host retry supervisor test runs and adoption share: on a
+ * loaded host, wait for it to quiet (or for the wait to run out) and run
+ * install and the tests once more in a fresh clone of `sha`. Null when the
+ * host is not busy: no retry.
+ */
+async function retryOnBusyHost(
+ ctx: ImplementContext,
+ testCommand: string,
+ sha: string,
+ what: string,
+ run: string,
+): Promise<RunResult | null> {
+ const host = (ctx.hostLoad ?? realHostLoad)();
+ if (host.load < host.cores) return null;
+ ctx.journal.recordEvent("reviewed", {
+  nodeId: ctx.node.ref.id,
+  repo: ctx.map.repo,
+  detail: `${what} failed on a busy host (load ${host.load.toFixed(1)} on ${host.cores} cores) — retrying once, in a fresh checkout of ${sha.slice(0, 8)}, when it quiets`,
+ });
+ await awaitQuietHost(ctx, run);
+ return testsInFreshCheckout(ctx, testCommand, sha);
+}
+
+/**
+ * Put the node's worktree back to exactly `sha` once a fresh clone has
+ * certified it (a test retry, or an adoption): whatever the failed run left
+ * in the worktree (fixtures, ignored files, index flags) must not reach the
+ * probes and views that run there next. Ignored files go too, so the
+ * install runs again. Returns why it could not, or null.
+ */
+async function restoreWorktree(ctx: ImplementContext, sha: string): Promise<string | null> {
+ const { worktree, map, node, journal } = ctx;
+ // read-tree writes fresh index entries (no --skip-worktree or
+ // --assume-unchanged flag survives); clean -x removes ignored leftovers.
+ for (const args of [["read-tree", "--reset", "-u", sha], ["reset", "--hard", sha], ["clean", "-ffdx"]]) {
+  journal.assertGeneration(node.ref.id, map.repo, ctx.generation, `git ${args[0]} to restore the worktree`);
+  const r = await safeGit(["--no-replace-objects", ...args], { cwd: worktree, timeoutMs: 120_000 });
+  if (r.code !== 0) return `could not restore the worktree to ${sha.slice(0, 8)} (git ${args[0]}): ${r.stderr.trim()}`;
+ }
+ if (map.commands.install !== undefined) {
+  const install = await runShell(map.commands.install, worktree, ctx, INSTALL_TIMEOUT_MS);
+  if (install.code !== 0) return `install (${map.commands.install}) after restoring the worktree exited ${install.code}: ${tail(install)}`;
+ }
+ if ((await headSha(worktree)) !== sha || (await dirtyFiles(worktree)).length > 0) {
+  return `the worktree is not at a clean ${sha.slice(0, 8)} after restoring it`;
+ }
+ journal.recordEvent("reviewed", {
+  nodeId: node.ref.id,
+  repo: map.repo,
+  detail: `restored the worktree to ${sha.slice(0, 8)} (reset, cleaned, reinstalled) before anything else runs in it`,
+ });
+ return null;
+}
+
+/**
+ * The map's install and test commands in a throwaway clone of the node's
+ * branch, checked out at `sha`. A clone, not a linked worktree, of that one
+ * branch without tags: it carries no other ref (refs/replace a failed run
+ * planted would make the files checked out differ from the commit that gets
+ * pushed; a tag it left could be what a test reads), no config and no hooks
+ * from the node's repository. Every git call here also refuses replacement
+ * objects.
+ */
+async function testsInFreshCheckout(ctx: ImplementContext, testCommand: string, sha: string): Promise<RunResult> {
+ const scratch = mkdtempSync(join(tmpdir(), "ranger-test-retry-"));
+ const dir = join(scratch, "checkout");
+ const failed = (why: string): RunResult => ({ code: 1, stdout: "", stderr: why });
+ const git = (args: string[], cwd: string, timeoutMs = 60_000) =>
+  safeGit(["--no-replace-objects", ...args], { cwd, timeoutMs });
+ try {
+  // Only the node's branch, no tags: a ref the failed run left is no input.
+  const clone = await git(
+   ["clone", "--quiet", "--no-checkout", "--no-tags", "--single-branch", "--branch", ctx.branch, ctx.canonical, dir],
+   scratch,
+   300_000,
+  );
+  if (clone.code !== 0) return failed(`could not clone for the retry: ${clone.stderr.trim()}`);
+  const checkout = await git(["-c", "advice.detachedHead=false", "checkout", "--quiet", "--detach", sha], dir, 120_000);
+  if (checkout.code !== 0) return failed(`could not check out ${sha.slice(0, 8)} for the retry: ${checkout.stderr.trim()}`);
+  if (ctx.map.commands.install !== undefined) {
+   const install = await runShell(ctx.map.commands.install, dir, ctx, INSTALL_TIMEOUT_MS);
+   if (install.code !== 0) return { ...install, stderr: `install for the retry failed\n${install.stderr}` };
+  }
+  const tests = await runShell(testCommand, dir, ctx, TEST_TIMEOUT_MS);
+  // A sanity check on the run, not proof against the commit's own scripts
+  // (see supervisorTests): install and the tests should leave the commit's
+  // tracked content as committed — no new HEAD, no modified tracked file,
+  // no index flag hiding one.
+  const now = await git(["rev-parse", "HEAD"], dir, 10_000);
+  const tracked = await git(["status", "--porcelain", "--untracked-files=no"], dir);
+  const flags = await git(["ls-files", "-v"], dir);
+  const changed =
+   now.stdout.trim() !== sha ||
+   tracked.code !== 0 ||
+   tracked.stdout.trim() !== "" ||
+   flags.code !== 0 ||
+   flags.stdout.split("\n").some((l) => l.length > 0 && !l.startsWith("H "));
+  if (changed) {
+   return {
+    ...tests,
+    code: tests.code === 0 ? 1 : tests.code,
+    stderr: `install or the tests changed ${sha.slice(0, 8)}'s tracked content or HEAD in the retry checkout — the retry certifies nothing that gets pushed\n${tests.stderr}`,
+   };
+  }
+  return tests;
+ } finally {
+  await rm(scratch, { recursive: true, force: true });
+ }
+}
+
+/**
+ * Work a previous run built and committed but never pushed (its supervisor
+ * tests failed, or it crashed before the push): when the branch is ahead of
+ * the base with a clean tree and passes the supervisor's checks, it is
+ * pushed as it stands, with no new worker session. One that fails them goes
+ * to the worker as before, which can fix what broke. Null when there is
+ * nothing to adopt or it does not pass.
+ *
+ * The git state is trusted exactly as on any resumed pass: checked against
+ * the known-good record (node #81), so a change the failed run's tests made
+ * parks here instead of becoming this run's baseline.
+ */
+async function adoptBuiltWork(ctx: ImplementContext, testCommand: string): Promise<PassResult | null> {
+ const { map, worktree, journal, node } = ctx;
+ if ((await commitsAhead(worktree, map.base)) === 0) return null;
+ if ((await dirtyFiles(worktree)).length > 0) return null;
+ const snapshot = await trustedSnapshot(journal, ctx.canonical, { repo: map.repo, nodeId: node.ref.id }, mapKey(map));
+ const sha = await headSha(worktree);
+ // Tested in a fresh clone of the commit, not in the worktree: whatever the
+ // failed run left there (ignored fixtures, links, replacement refs) must
+ // not be what makes the adopted commit pass. A failure on a busy host gets
+ // the same one retry as any supervisor test run, or a load flake would hand
+ // finished work back to a worker with nothing left to commit.
+ let tests = await testsInFreshCheckout(ctx, testCommand, sha);
+ if (tests.code !== 0) {
+  // Each failed attempt keeps its own output, the retry's included.
+  saveWorkerLog(journal.path, map.repo, node.ref.id, ctx.generation, `adopted build: supervisor tests in a fresh checkout (${testCommand})`, tests);
+  const retry = await retryOnBusyHost(ctx, testCommand, sha, "adoption tests", "the adoption test retry");
+  if (retry !== null) {
+   tests = retry;
+   if (tests.code !== 0) {
+    saveWorkerLog(journal.path, map.repo, node.ref.id, ctx.generation, `adopted build: supervisor test retry in a fresh checkout (${testCommand})`, tests);
+   }
+  }
+ }
+ const clean = await assertGitUntouched(ctx.canonical, snapshot);
+ if (tests.code !== 0) {
+  journal.recordEvent("reviewed", {
+   nodeId: node.ref.id,
+   repo: map.repo,
+   detail: `${testsFailedDetail(testCommand, tests, "on the work a previous run committed")} — the worker continues`.slice(0, 400),
+  });
+  return null;
+ }
+ if ((await headSha(worktree)) !== sha || (await dirtyFiles(worktree)).length > 0) return null;
+ recordKnownGood(journal, ctx.canonical, clean, "passing adoption tests");
+ await assertNoClosingKeywords(worktree, map.base);
+ const restored = await restoreWorktree(ctx, sha);
+ if (restored !== null) {
+  return { workerExit: null, snapshot, sha, failure: { status: "failed", detail: restored, workerExit: null } };
+ }
+ journal.recordEvent("reviewed", {
+  nodeId: node.ref.id,
+  repo: map.repo,
+  detail: `adopting ${sha.slice(0, 8)}: a previous run built and committed it, and it passes the supervisor's tests — no new worker session`,
+ });
+ return { workerExit: null, snapshot, sha, adopted: true };
+}
+
 function tail(result: RunResult): string {
  return (result.stderr.trim() || result.stdout.trim()).slice(-600);
 }
@@ -990,7 +1665,13 @@ function probeLine(ctx: ImplementContext, probe: RecordedProbe | undefined): str
  if (ctx.map.commands.probe === undefined) return [];
  return probe === undefined
   ? ["- Probes: not recorded at this head."]
-  : [`- Probes: passed at \`${probe.sha.slice(0, 8)}\` (selection ${probe.mode}, ${probe.selected} probe(s)). Only the selected probes ran, not the full suite.`];
+  : [`- Probes: passed at \`${probe.sha.slice(0, 8)}\` (selection ${probe.mode}, ${probe.selected} probe(s)). Only the selected probes ran, not the full suite.${baseRedNote(probe)}`];
+}
+
+/** The probes a passing record excuses because the merge base fails them too. */
+export function baseRedNote(probe: Pick<RecordedProbe, "baseRed"> | undefined): string {
+ const red = probe?.baseRed ?? [];
+ return red.length === 0 ? "" : ` Not gating: ${red.join(", ")} failed here and fail at the merge base too.`;
 }
 
 function readyBody(

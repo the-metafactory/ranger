@@ -1,8 +1,15 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { caffeinateArgs, holdAwake } from "../src/awake.ts";
+import { fastForwardCanonical } from "../src/git-ops.ts";
 import { isReadRequest } from "../src/github.ts";
-import { parseFailedProbes, probeRetryCommandFor } from "../src/implement.ts";
+import { parseFailedProbes, probeMarker, probeRetryCommandFor, recordedProbes } from "../src/implement.ts";
+import { parseFailedChecks, probesFailedOutcome, unfinishedProbes } from "../src/outcomes.ts";
 import { isTransientGitHubError, runReadRetryingTransient } from "../src/transient.ts";
+import { runCmd } from "../src/exec.ts";
+import { createCanonicalRepo, GIT_ENV } from "./support.ts";
 
 /** The two errors that ended #45 and #663 on 2026-10-03, verbatim in shape. */
 const GRAPHQL_TIMEOUT =
@@ -89,6 +96,116 @@ describe("a failed probe run retries only its failures", () => {
   expect(probeRetryCommandFor("PROBE_SELECTION=1 PROBE_FILES={failed} npm run probe # {node}", "433", ["probe-a.mjs", "probe-b.mjs"]))
    .toBe("PROBE_SELECTION=1 PROBE_FILES=probe-a.mjs,probe-b.mjs npm run probe # 433");
   expect(() => probeRetryCommandFor("x {failed}", "1", ["a;b.mjs"])).toThrow();
+ });
+ test("a base-red record round-trips through its marker; an old marker still reads", () => {
+  const marker = probeMarker({ sha: "a".repeat(40), passed: true, selected: "87", mode: "all", baseRed: ["probe-traffic-engagement.mjs"] });
+  expect(marker).toContain("result=pass selected=87 mode=all base-red=probe-traffic-engagement.mjs -->");
+  const old = `<!-- ranger:probes sha=${"b".repeat(40)} result=fail selected=86 mode=all -->`;
+  const read = recordedProbes([{ author: "bot", body: marker }, { author: "bot", body: old }, { author: "eve", body: marker }] as never, "bot");
+  expect(read).toEqual([
+   { sha: "a".repeat(40), passed: true, selected: "87", mode: "all", baseRed: ["probe-traffic-engagement.mjs"] },
+   { sha: "b".repeat(40), passed: false, selected: "86", mode: "all" },
+  ]);
+ });
+ test("a stopped run's unfinished probes: the selection less what passed", () => {
+  const out = [
+   "probe selection: all",
+   "selected: 4",
+   "  measure-cruise-detour.mjs",
+   "  probe-a.mjs",
+   "  probe-b.mjs",
+   "  probe-c.mjs",
+   "ok   measure-cruise-detour.mjs (3.1s)",
+   "FAIL probe-a.mjs (2.0s) exit=1 assert peak load 9.0",
+   "warn probe-b.mjs (1.0s) exit=1 assert peak load 9.0",
+  ].join("\n");
+  expect(unfinishedProbes(out)).toEqual(["probe-a.mjs", "probe-c.mjs"]);
+  expect(unfinishedProbes("no selection here\n")).toEqual([]);
+ });
+ test("a semantic selection's probability suffix is read; a listing short of its count falls back to the full suite", () => {
+  const semantic = "selected: 2\n  probe-a.mjs (p=0.750)\n  probe-b.mjs (p=0.900)\nok   probe-a.mjs (1.0s)\n";
+  expect(unfinishedProbes(semantic)).toEqual(["probe-b.mjs"]);
+  // killed while printing the selection: probe-b was announced but never listed
+  expect(unfinishedProbes("selected: 2\n  probe-a.mjs\n  probe-b.m")).toEqual([]);
+  expect(unfinishedProbes("selected: 3\n  probe-a.mjs\n  probe-b.mjs\n")).toEqual([]);
+ });
+ test("failed checks are read per failed probe, without their run-specific detail", () => {
+  const out = [
+   "ok   probe-music.mjs (3.0s)",
+   "FAIL probe-traffic-engagement.mjs (7.3s) exit=1 assert peak load 6.5",
+   "     │ [probe] hardware renderer: ANGLE",
+   "     │   ok   a Clean kill reads Wanted on both left tabs (H4, H7) — {}",
+   '     │  FAIL  an armed hull, struck, fires back (H3) — {"returned":false}',
+   "     │ 21/22 checks passed",
+   "FAIL probe-commander.mjs (42.6s) exit=1 crash peak load 9.0",
+   "     │ TypeError: boom",
+   "warn probe-reporter.mjs (1.0s) exit=1 assert peak load 2.0",
+   "     │  FAIL  a reporter line — x",
+   "FAILED: probe-traffic-engagement.mjs · probe-commander.mjs",
+  ].join("\n");
+  const checks = parseFailedChecks(out);
+  expect([...checks.keys()]).toEqual(["probe-traffic-engagement.mjs", "probe-commander.mjs"]);
+  expect(checks.get("probe-traffic-engagement.mjs")).toEqual({ kind: "assert", checks: new Set(["an armed hull, struck, fires back (H3)"]) });
+  expect(checks.get("probe-commander.mjs")).toEqual({ kind: "crash", checks: new Set() }); // a crash names no check
+ });
+ test("a park names the failures the merge base shares on its own line, after FAILED", () => {
+  const outcome = probesFailedOutcome({ sha: "545ce725ff", pr: 695, exit: 1, failed: ["probe-commander.mjs", "probe-traffic-engagement.mjs"], redOnBase: ["probe-traffic-engagement.mjs"], tail: "…" });
+  expect(outcome.split("\n").slice(0, 3)).toEqual([
+   "browser probes failed twice at 545ce725 on PR #695 (exit 1)",
+   "FAILED: probe-commander.mjs · probe-traffic-engagement.mjs",
+   "red on the merge base too: probe-traffic-engagement.mjs",
+  ]);
+  expect(parseFailedProbes(outcome)).toEqual(["probe-commander.mjs", "probe-traffic-engagement.mjs"]);
+ });
+});
+
+describe("two closes fast-forward the shared canonical checkout at once (#686/#687, 2026-10-04)", () => {
+ /** A merge lands on origin, so the next fetch must move refs/remotes/origin/main. */
+ async function mergeOnOrigin(dir: string): Promise<void> {
+  const git = (args: string[]) => runCmd("git", args, { cwd: join(dir, "seed"), env: { ...process.env, ...GIT_ENV } });
+  writeFileSync(join(dir, "seed", "merged.md"), "merged\n");
+  await git(["add", "-A"]);
+  await git(["commit", "-m", "merged"]);
+  expect((await git(["push", join(dir, "origin.git"), "main"])).code).toBe(0);
+ }
+
+ test("a held ref lock is waited out, then the fast-forward lands", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ranger-ff-"));
+  try {
+   const { canonical } = await createCanonicalRepo(dir);
+   await mergeOnOrigin(dir);
+   const lock = join(canonical, ".git", "refs", "remotes", "origin", "main.lock");
+   writeFileSync(lock, "");
+   setTimeout(() => rmSync(lock, { force: true }), 150);
+   await fastForwardCanonical(canonical, "main", "x", { attempts: 4, backoffMs: 100 });
+   const log = await runCmd("git", ["log", "-1", "--format=%s", "main"], { cwd: canonical });
+   expect(log.stdout.trim()).toBe("merged");
+  } finally {
+   rmSync(dir, { recursive: true, force: true });
+  }
+ }, 30_000);
+ test("a lock that never clears still fails, after the attempts", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ranger-ff-"));
+  try {
+   const { canonical } = await createCanonicalRepo(dir);
+   await mergeOnOrigin(dir);
+   writeFileSync(join(canonical, ".git", "refs", "remotes", "origin", "main.lock"), "");
+   await expect(fastForwardCanonical(canonical, "main", "x", { attempts: 2, backoffMs: 10 })).rejects.toThrow(/cannot lock ref|\.lock/);
+  } finally {
+   rmSync(dir, { recursive: true, force: true });
+  }
+ }, 30_000);
+});
+
+describe("ranger's own commands yield the CPU to the probes (2026-10-05)", () => {
+ test("runCmd runs a command at the niceness it is given, and at the caller's without one", async () => {
+  const niced = await runCmd("/bin/sh", ["-c", "ps -o nice= -p $$"], { nice: 10 });
+  const plain = await runCmd("/bin/sh", ["-c", "ps -o nice= -p $$"]);
+  const own = await runCmd("/bin/sh", ["-c", "ps -o nice= -p $PPID"]);
+  // The OS clamps at its own maximum (20 on macOS, 19 on Linux): ask it.
+  const max = await runCmd("/bin/sh", ["-c", "ps -o nice= -p $$"], { nice: 100 });
+  expect(Number(niced.stdout.trim())).toBe(Math.min(Number(own.stdout.trim()) + 10, Number(max.stdout.trim())));
+  expect(Number(plain.stdout.trim())).toBe(Number(own.stdout.trim()));
  });
 });
 
