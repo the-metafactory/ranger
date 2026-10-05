@@ -13,7 +13,7 @@ The live journal carried two migrations that were not on `main`:
 - node #47's: `workers` re-keyed to `(repo, node_id)` with a NOT NULL `root`, and `escalations` with a NOT NULL `root`;
 - node #25's `0017_research-base` (`workers.research_base_sha`).
 
-`main`'s `upsertWorker` then failed on every claim (`ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint`). The failure came after the GitHub claim, so claims leaked on #52 and #54. Since node #66 the refusal fires before any claim. A worktree's code can no longer reach the live journal: tests refuse the live directory, and worker sessions get a temp `RANGER_JOURNAL_PATH`.
+`main`'s `upsertWorker` then failed on every claim (`ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint`). The failure came after the GitHub claim, so claims leaked on #52 and #54. Since node #66 the refusal fires before any claim, and the two routes branch code took are closed: under `bun test` the live directory is refused (by real path, so a symlink does not get around it), and worker sessions and the supervisor's test command get a temp `RANGER_JOURNAL_PATH`. Branch code run by hand is not fenced: `bun src/cli.ts …` from a worktree without `RANGER_JOURNAL_PATH` still defaults to the live journal, and the refusal only catches it after it has applied a migration `main` lacks (see the last section).
 
 ## Steps
 
@@ -30,14 +30,16 @@ Run every step from a `main` checkout (`~/work/mf/ranger`), never from a worktre
 2. **Back up.** Use SQLite's online backup, not `cp`: a copy of the main file alone loses whatever still sits in `-wal`.
 
    ```sh
-   cd ~/.config/ranger
-   sqlite3 state.sqlite ".backup state.sqlite.bak-$(date +%Y%m%d)-pre-repair"
+   J=~/.config/ranger/state.sqlite
+   sqlite3 "$J" ".backup $J.bak-$(date +%Y%m%d)-pre-repair"
    ```
+
+   The later steps use `$J`. Stay in the `main` checkout: the migrations lookup and `bun src/cli.ts` resolve relative to it.
 
 3. **Name the foreign rows.** Compare the journal's migration hashes with the ones `main` ships:
 
    ```sh
-   sqlite3 -readonly state.sqlite "SELECT id, hash, created_at FROM __drizzle_migrations ORDER BY id"
+   sqlite3 -readonly "$J" "SELECT id, hash, created_at FROM __drizzle_migrations ORDER BY id"
    bun -e 'import {readMigrationFiles} from "drizzle-orm/migrator"; for (const m of readMigrationFiles({migrationsFolder: "drizzle"})) console.log(m.hash, m.folderMillis)'
    ```
 
@@ -47,20 +49,25 @@ Run every step from a `main` checkout (`~/work/mf/ranger`), never from a worktre
 
    ```sh
    RANGER_JOURNAL_PATH=/tmp/ranger-fresh/state.sqlite bun src/cli.ts journal --config ranger.yaml > /dev/null
-   diff <(sqlite3 -readonly /tmp/ranger-fresh/state.sqlite .schema) <(sqlite3 -readonly ~/.config/ranger/state.sqlite .schema)
+   schema() { sqlite3 -readonly "$1" .schema | sed -e 's/IF NOT EXISTS //' -e 's/[`"]//g' | sort; }
+   diff <(schema /tmp/ranger-fresh/state.sqlite) <(schema "$J")
    ```
+
+   `schema` drops quoting and sorts, so a rebuilt table compares equal: SQLite re-quotes a renamed table's `CREATE TABLE` and lists it in a new position.
 
    Every table that differs needs a rebuild. Tables that only gained foreign columns or keys need one too: `main`'s upserts depend on the exact keys.
 
-5. **Rebuild the affected tables to `main`'s schema.** Do it in one transaction with foreign keys off, copying the columns both schemas share. For each affected table `<t>`:
+5. **Rebuild the affected tables to `main`'s schema.** Do it in one transaction with foreign keys off, copying the columns both schemas share. Follow SQLite's own order (create the new table, copy, drop the old, rename the new): renaming the old table instead would keep its index names, so `main`'s `CREATE INDEX` statements would collide with them. For each affected table `<t>`:
 
    ```sql
    PRAGMA foreign_keys = OFF;
    BEGIN;
-   ALTER TABLE <t> RENAME TO <t>_foreign;
-   -- paste main's CREATE TABLE <t> … and its CREATE INDEX statements from the fresh .schema
-   INSERT INTO <t> (<shared columns>) SELECT <shared columns> FROM <t>_foreign;
-   DROP TABLE <t>_foreign;
+   -- main's CREATE TABLE <t> … from the fresh .schema, with the name changed to <t>_new
+   CREATE TABLE <t>_new (…);
+   INSERT INTO <t>_new (<shared columns>) SELECT <shared columns> FROM <t>;
+   DROP TABLE <t>;  -- drops <t>'s old indexes with it
+   ALTER TABLE <t>_new RENAME TO <t>;
+   -- main's CREATE INDEX … ON <t> statements from the fresh .schema, unchanged
    COMMIT;
    PRAGMA foreign_keys = ON;
    ```
@@ -76,8 +83,8 @@ Run every step from a `main` checkout (`~/work/mf/ranger`), never from a worktre
 7. **Check.**
 
    ```sh
-   sqlite3 ~/.config/ranger/state.sqlite "PRAGMA integrity_check; PRAGMA foreign_key_check;"
-   diff <(sqlite3 -readonly /tmp/ranger-fresh/state.sqlite .schema) <(sqlite3 -readonly ~/.config/ranger/state.sqlite .schema)
+   sqlite3 "$J" "PRAGMA integrity_check; PRAGMA foreign_key_check;"
+   diff <(schema /tmp/ranger-fresh/state.sqlite) <(schema "$J")
    ~/bin/ranger journal --config ranger.yaml > /dev/null && echo opens
    ```
 

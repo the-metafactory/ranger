@@ -1,8 +1,8 @@
 import type { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
-import { mkdtempSync } from "node:fs";
+import { lstatSync, mkdtempSync, readlinkSync, realpathSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, sep } from "node:path";
 import { readMigrationFiles } from "drizzle-orm/migrator";
 
 /**
@@ -54,8 +54,43 @@ export function journalPathOverride(env: NodeJS.ProcessEnv = process.env): strin
 }
 
 /**
+ * Where `path` lands on disk once every symlink is followed, including a
+ * symlinked ancestor or a dangling link SQLite would create through. The part
+ * of the path that does not exist yet is appended to its deepest existing
+ * ancestor's real path.
+ */
+export function canonicalPath(path: string, depth = 0): string {
+ if (depth > 40) throw new Error(`too many symlinks resolving ${path}`);
+ let current = isAbsolute(path) ? path : `${process.cwd()}${sep}${path}`;
+ const missing: string[] = [];
+ for (;;) {
+  try {
+   return join(realpathSync(current), ...missing);
+  } catch {
+   // Missing, or a dangling symlink: follow the link by hand, else walk up.
+  }
+  let link: string | undefined;
+  try {
+   if (lstatSync(current).isSymbolicLink()) link = readlinkSync(current);
+  } catch {
+   link = undefined;
+  }
+  if (link !== undefined) {
+   const target = isAbsolute(link) ? link : join(dirname(current), link);
+   return join(canonicalPath(target, depth + 1), ...missing);
+  }
+  const parent = dirname(current);
+  if (parent === current) return join(current, ...missing);
+  missing.unshift(basename(current));
+  current = parent;
+ }
+}
+
+/**
  * Under test, refuse a journal under the live directory unless the test opted
  * in with RANGER_TEST_ALLOW_LIVE_JOURNAL=1. `path` is already home-expanded.
+ * Both sides are compared by real path, so a symlink into the live directory
+ * (or a symlinked live directory) is refused too.
  */
 export function assertNotLiveJournalUnderTest(
  path: string,
@@ -63,8 +98,8 @@ export function assertNotLiveJournalUnderTest(
 ): void {
  const env = opts.env ?? process.env;
  if (path === ":memory:" || !underTest(env) || env[ALLOW_LIVE_JOURNAL_ENV] === "1") return;
- const liveDir = resolve(opts.liveDir ?? liveJournalDir());
- const target = resolve(path);
+ const liveDir = canonicalPath(opts.liveDir ?? liveJournalDir());
+ const target = canonicalPath(path);
  if (target === liveDir || target.startsWith(liveDir + sep)) {
   throw new Error(
    `refusing to open ${target} under test: it is in ranger's live journal directory (${liveDir}). ` +

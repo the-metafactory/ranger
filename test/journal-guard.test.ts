@@ -1,7 +1,7 @@
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import { expandHome, loadConfig } from "../src/config.ts";
@@ -135,6 +135,30 @@ describe("the live journal under test (node #66)", () => {
   expect(() => assertNotLiveJournalUnderTest(join(liveDir, "a", "b.sqlite"), { liveDir })).toThrow("under test");
   expect(() => assertNotLiveJournalUnderTest(join(tempDir(), "state.sqlite"), { liveDir })).not.toThrow();
   expect(() => assertNotLiveJournalUnderTest(":memory:", { liveDir })).not.toThrow();
+ });
+
+ test("a symlink into the live directory is refused under test", () => {
+  const liveDir = tempDir();
+  writeFileSync(join(liveDir, "state.sqlite"), "");
+  const elsewhere = tempDir();
+  // A directory symlink pointing at the live directory.
+  symlinkSync(liveDir, join(elsewhere, "alias"));
+  expect(() => assertNotLiveJournalUnderTest(join(elsewhere, "alias", "state.sqlite"), { liveDir })).toThrow("under test");
+  expect(() => assertNotLiveJournalUnderTest(join(elsewhere, "alias", "new", "x.sqlite"), { liveDir })).toThrow("under test");
+  // A file symlink to the live journal, and a dangling one SQLite would create through.
+  symlinkSync(join(liveDir, "state.sqlite"), join(elsewhere, "j.sqlite"));
+  expect(() => assertNotLiveJournalUnderTest(join(elsewhere, "j.sqlite"), { liveDir })).toThrow("under test");
+  symlinkSync(join(liveDir, "not-yet.sqlite"), join(elsewhere, "dangling.sqlite"));
+  expect(() => assertNotLiveJournalUnderTest(join(elsewhere, "dangling.sqlite"), { liveDir })).toThrow("under test");
+  // A symlinked live directory: the real path behind it is refused.
+  symlinkSync(liveDir, join(elsewhere, "live-link"));
+  expect(() => assertNotLiveJournalUnderTest(join(liveDir, "state.sqlite"), { liveDir: join(elsewhere, "live-link") })).toThrow(
+   "under test",
+  );
+  // A sibling directory whose name only starts like the live one is not refused.
+  mkdirSync(`${liveDir}-sibling`);
+  dirs.push(`${liveDir}-sibling`);
+  expect(() => assertNotLiveJournalUnderTest(join(`${liveDir}-sibling`, "state.sqlite"), { liveDir })).not.toThrow();
  });
 
  test("a test opts in explicitly; outside tests the guard is off", () => {
