@@ -27,6 +27,7 @@ import {
  NEEDS_EYE_LABEL,
  parseFailedProbes,
  PROBE_FILE,
+ POLICY_BLOCKED_OUTCOME,
  PROBES_FAILED_OUTCOME,
  REVIEW_CAP_HEAD_MOVED_OUTCOME,
  RESPAWNED_EVENT,
@@ -46,6 +47,7 @@ export type ReasonClass =
  | "needs-eye"
  | "transient"
  | "substrate capped"
+ | "policy blocked"
  | "worker failed"
  | "other";
 
@@ -127,7 +129,7 @@ const firstLine = (text: string): string => text.split("\n")[0].trim();
 
 /**
  * Why a row needs the principal, by ranger's rules, in this order: the review
- * cap, failed probes, a substrate limit, a GitHub-side transient error, then
+ * cap, failed probes, a policy-hook stop, a substrate limit, a GitHub-side transient error, then
  * any other failed worker; anything else parked is `other` with the outcome's
  * first line.
  */
@@ -183,6 +185,9 @@ export function classifyReason(
      : "the run named no failed probes",
    probes: first,
   };
+ }
+ if (POLICY_BLOCKED_OUTCOME.test(outcome)) {
+  return { class: "policy blocked", detail: firstLine(outcome).slice(0, 200) };
  }
  if (SUBSTRATE_CAPPED_OUTCOME.test(outcome)) {
   return { class: "substrate capped", detail: firstLine(outcome).slice(0, 200) };

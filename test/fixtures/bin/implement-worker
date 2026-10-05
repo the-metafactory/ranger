@@ -9,7 +9,9 @@
 #
 # Modes: build (default); keyword — the commit message carries a closing
 # keyword; noop — commits nothing; dirty — commits but leaves an untracked file; sleep — starts a long-running grandchild
-# (for the process-group tests) then sleeps.
+# (for the process-group tests) then sleeps; hook-stop — prints what `claude -p` prints when a
+# prompt hook stops the session, and exits 0 having done nothing; probe-edit — builds and also edits
+# scripts/probe-hud.mjs (a branch that changes the probe it fails).
 set -euo pipefail
 
 if [ -n "${GIT_CONFIG_VALUE_0:-}" ] || [ -n "${GH_TOKEN:-}" ]; then
@@ -23,6 +25,10 @@ prompt="${!#}"
 cd "$(git rev-parse --show-toplevel)"
 
 if [ "$mode" = "noop" ]; then exit 0; fi
+if [ "$mode" = "hook-stop" ]; then
+  echo "Operation stopped by hook: Runtime policy denied this action: security-disable-request."
+  exit 0
+fi
 if [ "$mode" = "dirty" ]; then
   mkdir -p src tests
   echo "export const feature = () => 1;" > src/feature.ts
@@ -48,6 +54,7 @@ fi
 
 echo "export const feature = () => 1;" > src/feature.ts
 echo "import { feature } from '../src/feature.ts';" > tests/feature.test.ts
+if [ "$mode" = "probe-edit" ]; then mkdir -p scripts; echo "// edited on the branch" >> scripts/probe-hud.mjs; fi
 git add -A
 msg="feat: implement node #20"
 if [ "$mode" = "keyword" ]; then msg="feat: implement the feature, closes #20"; fi

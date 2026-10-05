@@ -197,12 +197,35 @@ export async function vettedPush(opts: {
  * Fast-forward the canonical checkout's base to origin (design §4: "maintained
  * by ranger, fast-forwarded post-merge"), so `atRef: <base>` probes see the
  * merge. Refuses anything but a fast-forward.
+ *
+ * Run-nodes share the canonical checkout, and two closes after back-to-back
+ * merges fetch at the same moment (2026-10-04: #686 and #687, "cannot lock
+ * ref 'refs/remotes/origin/main'"). Git's own ref lock is the mutex: the
+ * loser waits and runs the whole fetch + fast-forward again, which is
+ * idempotent once the winner has moved the refs.
  */
 export async function fastForwardCanonical(
  canonical: string,
  base: string,
  token: string,
+ opts: { attempts?: number; backoffMs?: number } = {},
 ): Promise<void> {
+ const attempts = opts.attempts ?? 4;
+ for (let attempt = 1; ; attempt++) {
+  try {
+   return await fastForwardOnce(canonical, base, token);
+  } catch (error) {
+   const contended = error instanceof GitSafetyError && GIT_LOCK_CONTENTION.test(error.message);
+   if (!contended || attempt >= attempts) throw error;
+   await new Promise((r) => setTimeout(r, (opts.backoffMs ?? 2_000) * attempt));
+  }
+ }
+}
+
+/** Git refusing a ref update because another git process holds that ref's lock. */
+export const GIT_LOCK_CONTENTION = /cannot lock ref|Unable to create '[^']+\.lock'/;
+
+async function fastForwardOnce(canonical: string, base: string, token: string): Promise<void> {
  const fetch = await safeGit(["fetch", "origin", base], {
   cwd: canonical,
   token,

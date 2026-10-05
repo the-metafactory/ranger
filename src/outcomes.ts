@@ -25,6 +25,41 @@ export function parseFailedProbes(stdout: string): string[] {
  return names.length > 0 && names.every((n) => PROBE_FILE.test(n)) ? names : [];
 }
 
+/** How a failed probe failed, as the runner's header and the probe's own output say. */
+export interface FailedProbeRun {
+ /** The runner's failure kind (`assert`, `crash`, …); null when the header names none. */
+ kind: string | null;
+ /** The names of the checks it failed, without their run-specific detail. */
+ checks: Set<string>;
+}
+
+/**
+ * The failed probes of a run, by the seelite runner's layout: a
+ * `FAIL <file> (<n>s) exit=<code> <kind> …` header, then the probe's own
+ * output indented under `│`, where a failed check reads
+ * `FAIL  <check> — <detail>`. The detail carries run-specific values, so only
+ * the check's name is kept. A probe that names no failed check (a crash, a
+ * timeout) has an empty set.
+ */
+export function parseFailedChecks(stdout: string): Map<string, FailedProbeRun> {
+ const out = new Map<string, FailedProbeRun>();
+ let current: FailedProbeRun | null = null;
+ for (const line of stdout.split("\n")) {
+  const header = /^(ok|FAIL|warn) +([\w.-]+\.m?js) \([^)]*\)(?: exit=-?\d+ (\w+))?/.exec(line);
+  if (header !== null) {
+   current = null;
+   if (header[1] === "FAIL" && PROBE_FILE.test(header[2])) {
+    current = { kind: header[3] ?? null, checks: new Set() };
+    out.set(header[2], current);
+   }
+   continue;
+  }
+  const check = /^\s*│\s*FAIL\s+(.+?)(?:\s+—\s.*)?$/.exec(line);
+  if (check !== null && current !== null) current.checks.add(check[1].trim());
+ }
+ return out;
+}
+
 /** Sage rounds ran out with blockers or majors still open. */
 export function reviewCapOutcome(r: { blockers: number; majors: number; round: number; pr: number }): string {
  return `${r.blockers} blocker(s) and ${r.majors} major(s) remain after ${r.round} sage round(s) on PR #${r.pr} — good-enough is the principal's call (design §4/§7)`;
@@ -50,17 +85,34 @@ export function probesFailedOutcome(r: {
  pr: number;
  exit: number;
  failed: string[];
+ /** The failed probes that fail at the merge base too (the rest are this branch's). */
+ redOnBase?: string[];
  tail: string;
 }): string {
  const names = r.failed.filter((n) => PROBE_FILE.test(n));
+ const onBase = (r.redOnBase ?? []).filter((n) => PROBE_FILE.test(n));
  return [
   `browser probes failed twice at ${r.sha.slice(0, 8)} on PR #${r.pr} (exit ${r.exit})`,
   ...(names.length > 0 ? [`FAILED: ${names.join(" · ")}`] : []),
+  ...(onBase.length > 0 ? [`red on the merge base too: ${onBase.join(" · ")}`] : []),
   r.tail,
  ].join("\n");
 }
 
 export const PROBES_FAILED_OUTCOME = /^browser probes failed twice\b/;
+
+/**
+ * A hook (soma's runtime-policy guard, in practice) stopped a worker session
+ * before its first turn. The prompt is rebuilt from the same node and review
+ * text on a resume, so a resume stops again: the rule or the text must change
+ * first. A park, not a failure: it is no evidence against the node or the
+ * worker, so it does not count toward the dead-man.
+ */
+export function policyBlockedOutcome(r: { pass: string; reason: string; log: string }): string {
+ return `policy-blocked: a hook stopped the ${r.pass} before its first turn (${r.reason}) — a resume re-sends the same prompt and stops again; change the rule or the text it matched first (worker log: ${r.log})`;
+}
+
+export const POLICY_BLOCKED_OUTCOME = /^policy-blocked: /;
 
 /** A session or review that stopped on its substrate's limit (node #45). */
 export const SUBSTRATE_CAPPED_OUTCOME = /\bhit its rate limit\b/;

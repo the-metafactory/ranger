@@ -8,6 +8,7 @@ import {
  CRASH_PARK_OUTCOME,
  crashParkOutcome,
  parseFailedProbes,
+ policyBlockedOutcome,
  probesFailedOutcome,
  RESPAWNED_EVENT,
  respawnedEvent,
@@ -232,6 +233,12 @@ describe("node #54 — the reason class, by ranger's own rules", () => {
   expect(CRASH_PARK_OUTCOME.test(crashParkOutcome({ attempts: 3, released: false, assignees: [] }))).toBe(true);
   expect(RESPAWNED_EVENT.test(respawnedEvent(4))).toBe(true);
   expect(RESPAWNED_EVENT.test("respawn refused (spawn cap or no respawn hook) — claim kept for the next tick")).toBe(false);
+ });
+
+ test("policy blocked: a hook stopped the worker before its first turn", () => {
+  const outcome = policyBlockedOutcome({ pass: "fix pass 3", reason: "Runtime policy denied this action: security-disable-request.", log: "/x.log" });
+  const r = row({ status: "parked", outcome });
+  expect(classifyReason(r, [], null, 5)).toEqual({ class: "policy blocked", detail: outcome.split("\n")[0].slice(0, 200) });
  });
 
  test("substrate capped", () => {
