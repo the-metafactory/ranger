@@ -16,7 +16,7 @@ import {
  vettedPush,
 } from "../src/git-ops.ts";
 import { bootstrapWorktree, slugify, worktreeBranch } from "../src/worker.ts";
-import { addTrackedWorktree, createCanonicalRepo, GIT_ENV } from "./support.ts";
+import { addTrackedWorktree, createCanonicalRepo, GIT_ENV, takesRawByteNames } from "./support.ts";
 
 /**
  * Node #63: the tamper guard leaves out only the branch-tracking entries
@@ -470,9 +470,12 @@ describe("assertCheckoutOf: credentialed calls run only against the vetted .git"
 
  // Sage round 4 on node #86: node decodes `worktrees/raw\xff` as
  // `worktrees/raw�`, so an empty decoy directory of that name was
- // vetted while git read the raw-byte one. APFS refuses names that are not
- // UTF-8 (EILSEQ); ext4 (CI) takes them.
+ // vetted while git read the raw-byte one. Only with
+ // extensions.worktreeConfig on: git reads no linked config.worktree
+ // otherwise, and `readGitState` lists no worktree names. APFS refuses names
+ // that are not UTF-8 (EILSEQ); ext4 (CI) takes them.
  test.skipIf(!takesRawByteNames())("a worktree whose git dir name is not UTF-8 refuses the push", async () => {
+  await config("extensions.worktreeConfig", "true");
   const worktree = await bootstrapWorktree(canonical, "86", "x", "placeholder");
   const snapshot = gitConfigSnapshot(canonical);
   const worktrees = join(canonical, ".git", "worktrees");
@@ -506,23 +509,6 @@ describe("utf8Name: entry names are judged as bytes (sage round 4 on node #86)",
   expect(utf8Name(Buffer.from("raw�"))).toBe("raw�");
  });
 });
-
-/**
- * Whether the temp filesystem takes a file name that is not UTF-8. APFS
- * refuses one (EILSEQ); any other error is a broken probe, never a skip.
- */
-function takesRawByteNames(): boolean {
- const probe = mkdtempSync(join(tmpdir(), "ranger-raw-name-"));
- try {
-  writeFileSync(Buffer.concat([Buffer.from(`${probe}/x`), Buffer.from([0xff])]), "");
-  return true;
- } catch (error) {
-  if ((error as NodeJS.ErrnoException).code === "EILSEQ") return false;
-  throw error;
- } finally {
-  rmSync(probe, { recursive: true, force: true });
- }
-}
 
 /**
  * Sage round 4 on node #86: `git fetch` fetches submodules on demand, each

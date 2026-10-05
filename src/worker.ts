@@ -687,7 +687,11 @@ async function parkRun(
  * git state against the known-good record before the first git call that
  * carries the write credential, then add the node's worktree and refresh
  * the record. A checkout this run cloned holds git's own fresh state, which
- * becomes the record. Parks the run on a refusal.
+ * becomes the record. Parks the run on a refusal, and when the state cannot
+ * be read to vet it (`GitSafetyError`: an entry name that is not UTF-8, a
+ * config listing that fails): that is the checkout's state, not a crash, so
+ * it never counts toward the dead-man switch (sage round 5 on node #86).
+ * A failed fetch or worktree add stays a failure.
  */
 async function trustedStart(
  ctx: RunNodeContext,
@@ -697,13 +701,23 @@ async function trustedStart(
  addWorktree: () => Promise<string>,
 ): Promise<{ state: GitState; worktree: string } | { parked: RunNodeOutcome }> {
  const { journal, map, token } = ctx;
+ const vetting = async <T>(read: () => T | Promise<T>): Promise<T | { parked: RunNodeOutcome }> => {
+  try {
+   return await read();
+  } catch (error) {
+   if (!(error instanceof GitSafetyError)) throw error;
+   return { parked: await parkRun(ctx, nodeId, title, error.message) };
+  }
+ };
  const cloned = await bootstrapCanonical(canonical, map.repo, token);
- const trust = cloned
-  ? trustFreshClone(journal, canonical)
-  : await checkKnownGood(journal, canonical, { repo: map.repo, nodeId });
+ const trust = await vetting(() =>
+  cloned ? trustFreshClone(journal, canonical) : checkKnownGood(journal, canonical, { repo: map.repo, nodeId }),
+ );
+ if ("parked" in trust) return trust;
  if (isRefusal(trust)) return { parked: await parkRun(ctx, nodeId, title, tamperOutcome(trust, canonical, mapKey(map))) };
  const worktree = await addWorktree();
- recordIfUnchanged(journal, canonical, trust.state, "worktree created");
+ const recorded = await vetting(() => recordIfUnchanged(journal, canonical, trust.state, "worktree created"));
+ if (recorded !== undefined) return recorded;
  return { state: trust.state, worktree };
 }
 

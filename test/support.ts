@@ -1,4 +1,5 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ChildProcess } from "node:child_process";
 import { spawn } from "node:child_process";
@@ -191,4 +192,21 @@ export function fakeDiscord() {
   deleteMessage: (id: string) => deleted.add(id),
   stop: () => server.stop(true),
  };
+}
+
+/**
+ * Whether the temp filesystem takes a file name that is not UTF-8. APFS
+ * refuses one (EILSEQ); any other error is a broken probe, never a skip.
+ */
+export function takesRawByteNames(): boolean {
+ const probe = mkdtempSync(join(tmpdir(), "ranger-raw-name-"));
+ try {
+  writeFileSync(Buffer.concat([Buffer.from(`${probe}/x`), Buffer.from([0xff])]), "");
+  return true;
+ } catch (error) {
+  if ((error as NodeJS.ErrnoException).code === "EILSEQ") return false;
+  throw error;
+ } finally {
+  rmSync(probe, { recursive: true, force: true });
+ }
 }

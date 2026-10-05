@@ -50,6 +50,9 @@ function minimalGitEnv(): NodeJS.ProcessEnv {
  return env;
 }
 
+/** Config every supervisor git call runs with: no hooks, no fsmonitor (either runs a program the config names). */
+const GIT_SAFETY_ARGS = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"];
+
 /**
  * Config every credentialed call runs with: no submodule recursion. A fetch
  * defaults to fetching submodules on demand, each from its own
@@ -89,8 +92,7 @@ export async function safeGit(
  return runCmd(
   "git",
   [
-   "-c", "core.hooksPath=/dev/null",
-   "-c", "core.fsmonitor=false",
+   ...GIT_SAFETY_ARGS,
    ...(opts.token === undefined ? [] : NO_SUBMODULE_RECURSION),
    ...args,
   ],
@@ -139,14 +141,15 @@ export function assertNamedRefs(args: string[]): void {
  * re-implement how git reads a gitfile. Paths are compared as bytes, never
  * decoded: UTF-8 decoding maps every invalid byte to U+FFFD, so
  * `worktrees/raw\xff` read as a decoy `worktrees/raw�` (sage round 4 on
- * node #86). Which `worktrees/<name>` it is does not matter here: every one
- * is in the hash, and `readGitState` refuses a name that is not UTF-8.
+ * node #86). Which `worktrees/<name>` it is does not matter here: while
+ * `extensions.worktreeConfig` is on, every one is in the hash and
+ * `readGitState` refuses a name that is not UTF-8; while it is off, git reads
+ * no config from any of them.
  */
 export async function assertCheckoutOf(cwd: string, canonical: string): Promise<void> {
  const got = await gitBytes(
   [
-   "-c", "core.hooksPath=/dev/null",
-   "-c", "core.fsmonitor=false",
+   ...GIT_SAFETY_ARGS,
    "rev-parse", "--path-format=absolute", "--git-common-dir", "--absolute-git-dir",
   ],
   cwd,
@@ -354,8 +357,7 @@ function listConfig(body: Buffer): Records | null {
  const listed = spawnSync(
   "git",
   [
-   "-c", "core.hooksPath=/dev/null",
-   "-c", "core.fsmonitor=false",
+   ...GIT_SAFETY_ARGS,
    "config", "--file", "-", "--no-includes", "--list", "--null",
   ],
   { env: minimalGitEnv(), encoding: "latin1", input: body, timeout: 10_000, maxBuffer: Infinity },
@@ -389,8 +391,7 @@ function worktreeConfigEnabled(body: Buffer): boolean {
  const got = spawnSync(
   "git",
   [
-   "-c", "core.hooksPath=/dev/null",
-   "-c", "core.fsmonitor=false",
+   ...GIT_SAFETY_ARGS,
    "config", "--file", "-", "--no-includes", "--type=bool", "--get", "extensions.worktreeconfig",
   ],
   { env: minimalGitEnv(), encoding: "utf8", input: body, timeout: 10_000, maxBuffer: Infinity },
