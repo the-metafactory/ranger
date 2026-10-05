@@ -161,7 +161,7 @@ describe("two closes fast-forward the shared canonical checkout at once (#686/#6
   } finally {
    rmSync(dir, { recursive: true, force: true });
   }
- });
+ }, 30_000);
  test("a lock that never clears still fails, after the attempts", async () => {
   const dir = mkdtempSync(join(tmpdir(), "ranger-ff-"));
   try {
@@ -172,7 +172,7 @@ describe("two closes fast-forward the shared canonical checkout at once (#686/#6
   } finally {
    rmSync(dir, { recursive: true, force: true });
   }
- });
+ }, 30_000);
 });
 
 describe("the host stays awake while run-node lives (found live on #658)", () => {

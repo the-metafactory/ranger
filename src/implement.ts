@@ -1,4 +1,5 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { rm } from "node:fs/promises";
 import { availableParallelism, loadavg, tmpdir } from "node:os";
 import { join } from "node:path";
 import { DiscordAnnouncer } from "./announce.ts";
@@ -610,7 +611,10 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
     };
    }
   }
-  const built = await workerPass(ctx, testCommand, { kind: "build" });
+  // Work an earlier run built and committed, but never pushed, is adopted
+  // when it passes the supervisor's checks (#691: its tests failed under
+  // load; a fresh worker would find nothing to commit and fail again).
+  const built = (await adoptBuiltWork(ctx, testCommand)) ?? (await workerPass(ctx, testCommand, { kind: "build" }));
   workerExit = built.workerExit;
   if (built.failure !== undefined) return built.failure;
 
@@ -624,7 +628,10 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
    base: ctx.map.base,
   });
   journal.recordEvent("pushed", { nodeId, repo, detail: `${branch} @ ${built.sha.slice(0, 8)}` });
-  recordHead(ctx, built.sha);
+  // Review selection reads who wrote a head. Every session records its own
+  // commit as it makes it (checkedWorkerPass); an adopted build keeps that
+  // record and is never credited to this run's substrate.
+  if (built.adopted !== true) recordHead(ctx, built.sha);
 
   const title = prTitle(node);
   fence("open PR");
@@ -983,6 +990,8 @@ interface PassResult {
  snapshot: string;
  sha: string;
  failure?: ImplementOutcome;
+ /** The commits were adopted from an earlier run, not written by this run's worker. */
+ adopted?: boolean;
 }
 
 /**
@@ -1171,6 +1180,9 @@ async function checkedWorkerPass(
  if (sha === before || (await commitsAhead(worktree, map.base)) === 0) {
   return fail(nothingCommitted(spec));
  }
+ // This session wrote `sha`: record it now, so a later run that adopts the
+ // commit unpushed still credits the substrate that actually wrote it.
+ recordHead(ctx, sha);
  // The supervisor tests the working tree but pushes commits: a dirty tree
  // would let a green test run cover code that never lands.
  const dirty = await dirtyFiles(worktree);
@@ -1179,9 +1191,13 @@ async function checkedWorkerPass(
    `worker left ${dirty.length} uncommitted or untracked file(s) (${dirty.slice(0, 5).join("; ")}) — the tests would not test what gets pushed`,
   );
  }
- const tests = await runShell(testCommand, worktree, ctx, TEST_TIMEOUT_MS);
- if (tests.code !== 0) {
-  return fail(`tests (${testCommand}) failed after the worker (exit ${tests.code}): ${tail(tests)}`);
+ const { tests, retried } = await supervisorTests(ctx, testCommand, pass);
+ if (tests.code !== 0) return fail(testsFailedDetail(testCommand, tests, "after the worker"));
+ if (retried) {
+  // The pass was certified in a fresh clone: the worktree still holds what
+  // the failed run left, and the probes run there next.
+  const restored = await restoreWorktree(ctx, sha);
+  if (restored !== null) return fail(restored);
  }
  await assertNoClosingKeywords(worktree, map.base);
  return { workerExit: result.code, snapshot, sha };
@@ -1340,6 +1356,243 @@ function reviewComment(round: number, verdict: ReviewVerdict, substrate?: Substr
    ? verdict.body
    : `${verdict.body.slice(0, room - 80)}\n\n… (truncated by ranger; the full review is in the run log)`;
  return head + body;
+}
+
+/** The first three failing tests a run names, in bun's `(fail) <name> [12ms]` format. */
+export function failedTestNames(result: RunResult): string[] {
+ const names = new Set<string>();
+ for (const m of `${result.stdout}\n${result.stderr}`.matchAll(/^\(fail\) (.+?)(?: \[[\d.]+m?s\])?$/gm)) {
+  names.add(m[1].trim());
+ }
+ return [...names].slice(0, 3);
+}
+
+/** A failed supervisor test run, named: the failing tests first (the journal keeps 400 characters), then the tail. */
+function testsFailedDetail(testCommand: string, tests: RunResult, after: string): string {
+ const names = failedTestNames(tests);
+ return `tests (${testCommand}) failed ${after} (exit ${tests.code})${names.length > 0 ? ` — failing: ${names.join("; ")}` : ""}: ${tail(tests)}`;
+}
+
+/**
+ * The supervisor's own test run. A failure keeps its whole output in the
+ * node's log (2026-10-05: #691's failure kept only 400 characters of passing
+ * tests, so the failing one was lost). A failure on a busy host is retried
+ * once, after the host quiets or the quiet-host wait (20 minutes) runs out:
+ * the worker's run passed the same tree, and a rerun at normal load passed
+ * it again, while the supervisor's ran at load 40–100 and failed.
+ *
+ * The retry runs in a fresh clone of the committed head, with its own
+ * install (testsInFreshCheckout): nothing the failed run wrote into the
+ * node's worktree or the shared repository (untracked or ignored fixtures,
+ * index flags, links, replacement refs) reaches it. The node's worktree is
+ * left as it is, and a retry whose pass ends with the worktree on another
+ * HEAD counts for nothing.
+ *
+ * What this guards against is leftovers: state outside the commit that a
+ * failed run produced. The commit's own install and test scripts are the
+ * commit; one that misreports itself (an `exit 0`, a redirected git
+ * worktree) is the commit's behaviour, which no re-run can catch, and the
+ * review reads that code.
+ */
+async function supervisorTests(
+ ctx: ImplementContext,
+ testCommand: string,
+ label: string,
+): Promise<{ tests: RunResult; log: string | null; retried: boolean }> {
+ const { journal, map, node, worktree } = ctx;
+ const head = await headSha(worktree);
+ let tests = await runShell(testCommand, worktree, ctx, TEST_TIMEOUT_MS);
+ if (tests.code === 0) return { tests, log: null, retried: false };
+ const log = saveWorkerLog(journal.path, map.repo, node.ref.id, ctx.generation, `${label}: supervisor tests (${testCommand})`, tests);
+ if ((await headSha(worktree)) !== head) {
+  journal.recordEvent("reviewed", {
+   nodeId: node.ref.id,
+   repo: map.repo,
+   detail: `tests (${testCommand}) failed and moved HEAD — not retried`,
+  });
+  return { tests, log, retried: false };
+ }
+ const retry = await retryOnBusyHost(ctx, testCommand, head, `tests (${testCommand})`, "the test retry");
+ if (retry === null) return { tests, log, retried: false };
+ tests = retry;
+ if (tests.code === 0 && (await headSha(worktree)) !== head) {
+  tests = { ...tests, code: 1, stderr: `the retry passed at ${head.slice(0, 8)}, but the worktree moved off it meanwhile\n${tests.stderr}` };
+ }
+ if (tests.code === 0) {
+  journal.recordEvent("reviewed", { nodeId: node.ref.id, repo: map.repo, detail: `tests (${testCommand}) passed on the retry in a fresh checkout` });
+  return { tests, log, retried: true };
+ }
+ saveWorkerLog(journal.path, map.repo, node.ref.id, ctx.generation, `${label}: supervisor test retry in a fresh checkout (${testCommand})`, tests);
+ return { tests, log, retried: false };
+}
+
+/**
+ * The one busy-host retry supervisor test runs and adoption share: on a
+ * loaded host, wait for it to quiet (or for the wait to run out) and run
+ * install and the tests once more in a fresh clone of `sha`. Null when the
+ * host is not busy: no retry.
+ */
+async function retryOnBusyHost(
+ ctx: ImplementContext,
+ testCommand: string,
+ sha: string,
+ what: string,
+ run: string,
+): Promise<RunResult | null> {
+ const host = (ctx.hostLoad ?? realHostLoad)();
+ if (host.load < host.cores) return null;
+ ctx.journal.recordEvent("reviewed", {
+  nodeId: ctx.node.ref.id,
+  repo: ctx.map.repo,
+  detail: `${what} failed on a busy host (load ${host.load.toFixed(1)} on ${host.cores} cores) — retrying once, in a fresh checkout of ${sha.slice(0, 8)}, when it quiets`,
+ });
+ await awaitQuietHost(ctx, run);
+ return testsInFreshCheckout(ctx, testCommand, sha);
+}
+
+/**
+ * Put the node's worktree back to exactly `sha` once a fresh clone has
+ * certified it (a test retry, or an adoption): whatever the failed run left
+ * in the worktree (fixtures, ignored files, index flags) must not reach the
+ * probes and views that run there next. Ignored files go too, so the
+ * install runs again. Returns why it could not, or null.
+ */
+async function restoreWorktree(ctx: ImplementContext, sha: string): Promise<string | null> {
+ const { worktree, map, node, journal } = ctx;
+ // read-tree writes fresh index entries (no --skip-worktree or
+ // --assume-unchanged flag survives); clean -x removes ignored leftovers.
+ for (const args of [["read-tree", "--reset", "-u", sha], ["reset", "--hard", sha], ["clean", "-ffdx"]]) {
+  journal.assertGeneration(node.ref.id, map.repo, ctx.generation, `git ${args[0]} to restore the worktree`);
+  const r = await safeGit(["--no-replace-objects", ...args], { cwd: worktree, timeoutMs: 120_000 });
+  if (r.code !== 0) return `could not restore the worktree to ${sha.slice(0, 8)} (git ${args[0]}): ${r.stderr.trim()}`;
+ }
+ if (map.commands.install !== undefined) {
+  const install = await runShell(map.commands.install, worktree, ctx, INSTALL_TIMEOUT_MS);
+  if (install.code !== 0) return `install (${map.commands.install}) after restoring the worktree exited ${install.code}: ${tail(install)}`;
+ }
+ if ((await headSha(worktree)) !== sha || (await dirtyFiles(worktree)).length > 0) {
+  return `the worktree is not at a clean ${sha.slice(0, 8)} after restoring it`;
+ }
+ journal.recordEvent("reviewed", {
+  nodeId: node.ref.id,
+  repo: map.repo,
+  detail: `restored the worktree to ${sha.slice(0, 8)} (reset, cleaned, reinstalled) before anything else runs in it`,
+ });
+ return null;
+}
+
+/**
+ * The map's install and test commands in a throwaway clone of the node's
+ * branch, checked out at `sha`. A clone, not a linked worktree, of that one
+ * branch without tags: it carries no other ref (refs/replace a failed run
+ * planted would make the files checked out differ from the commit that gets
+ * pushed; a tag it left could be what a test reads), no config and no hooks
+ * from the node's repository. Every git call here also refuses replacement
+ * objects.
+ */
+async function testsInFreshCheckout(ctx: ImplementContext, testCommand: string, sha: string): Promise<RunResult> {
+ const scratch = mkdtempSync(join(tmpdir(), "ranger-test-retry-"));
+ const dir = join(scratch, "checkout");
+ const failed = (why: string): RunResult => ({ code: 1, stdout: "", stderr: why });
+ const git = (args: string[], cwd: string, timeoutMs = 60_000) =>
+  safeGit(["--no-replace-objects", ...args], { cwd, timeoutMs });
+ try {
+  // Only the node's branch, no tags: a ref the failed run left is no input.
+  const clone = await git(
+   ["clone", "--quiet", "--no-checkout", "--no-tags", "--single-branch", "--branch", ctx.branch, ctx.canonical, dir],
+   scratch,
+   300_000,
+  );
+  if (clone.code !== 0) return failed(`could not clone for the retry: ${clone.stderr.trim()}`);
+  const checkout = await git(["-c", "advice.detachedHead=false", "checkout", "--quiet", "--detach", sha], dir, 120_000);
+  if (checkout.code !== 0) return failed(`could not check out ${sha.slice(0, 8)} for the retry: ${checkout.stderr.trim()}`);
+  if (ctx.map.commands.install !== undefined) {
+   const install = await runShell(ctx.map.commands.install, dir, ctx, INSTALL_TIMEOUT_MS);
+   if (install.code !== 0) return { ...install, stderr: `install for the retry failed\n${install.stderr}` };
+  }
+  const tests = await runShell(testCommand, dir, ctx, TEST_TIMEOUT_MS);
+  // A sanity check on the run, not proof against the commit's own scripts
+  // (see supervisorTests): install and the tests should leave the commit's
+  // tracked content as committed — no new HEAD, no modified tracked file,
+  // no index flag hiding one.
+  const now = await git(["rev-parse", "HEAD"], dir, 10_000);
+  const tracked = await git(["status", "--porcelain", "--untracked-files=no"], dir);
+  const flags = await git(["ls-files", "-v"], dir);
+  const changed =
+   now.stdout.trim() !== sha ||
+   tracked.code !== 0 ||
+   tracked.stdout.trim() !== "" ||
+   flags.code !== 0 ||
+   flags.stdout.split("\n").some((l) => l.length > 0 && !l.startsWith("H "));
+  if (changed) {
+   return {
+    ...tests,
+    code: tests.code === 0 ? 1 : tests.code,
+    stderr: `install or the tests changed ${sha.slice(0, 8)}'s tracked content or HEAD in the retry checkout — the retry certifies nothing that gets pushed\n${tests.stderr}`,
+   };
+  }
+  return tests;
+ } finally {
+  await rm(scratch, { recursive: true, force: true });
+ }
+}
+
+/**
+ * Work a previous run built and committed but never pushed (its supervisor
+ * tests failed, or it crashed before the push): when the branch is ahead of
+ * the base with a clean tree and passes the supervisor's checks, it is
+ * pushed as it stands, with no new worker session. One that fails them goes
+ * to the worker as before, which can fix what broke. Null when there is
+ * nothing to adopt or it does not pass.
+ *
+ * The git state is trusted exactly as on any resumed pass: the tamper
+ * snapshot is taken now, at the start of this run (node #81: a stored
+ * known-good snapshot instead).
+ */
+async function adoptBuiltWork(ctx: ImplementContext, testCommand: string): Promise<PassResult | null> {
+ const { map, worktree, journal, node } = ctx;
+ if ((await commitsAhead(worktree, map.base)) === 0) return null;
+ if ((await dirtyFiles(worktree)).length > 0) return null;
+ const snapshot = gitConfigSnapshot(ctx.canonical);
+ const sha = await headSha(worktree);
+ // Tested in a fresh clone of the commit, not in the worktree: whatever the
+ // failed run left there (ignored fixtures, links, replacement refs) must
+ // not be what makes the adopted commit pass. A failure on a busy host gets
+ // the same one retry as any supervisor test run, or a load flake would hand
+ // finished work back to a worker with nothing left to commit.
+ let tests = await testsInFreshCheckout(ctx, testCommand, sha);
+ if (tests.code !== 0) {
+  // Each failed attempt keeps its own output, the retry's included.
+  saveWorkerLog(journal.path, map.repo, node.ref.id, ctx.generation, `adopted build: supervisor tests in a fresh checkout (${testCommand})`, tests);
+  const retry = await retryOnBusyHost(ctx, testCommand, sha, "adoption tests", "the adoption test retry");
+  if (retry !== null) {
+   tests = retry;
+   if (tests.code !== 0) {
+    saveWorkerLog(journal.path, map.repo, node.ref.id, ctx.generation, `adopted build: supervisor test retry in a fresh checkout (${testCommand})`, tests);
+   }
+  }
+ }
+ assertGitUntouched(ctx.canonical, snapshot);
+ if (tests.code !== 0) {
+  journal.recordEvent("reviewed", {
+   nodeId: node.ref.id,
+   repo: map.repo,
+   detail: `${testsFailedDetail(testCommand, tests, "on the work a previous run committed")} — the worker continues`.slice(0, 400),
+  });
+  return null;
+ }
+ if ((await headSha(worktree)) !== sha || (await dirtyFiles(worktree)).length > 0) return null;
+ await assertNoClosingKeywords(worktree, map.base);
+ const restored = await restoreWorktree(ctx, sha);
+ if (restored !== null) {
+  return { workerExit: null, snapshot, sha, failure: { status: "failed", detail: restored, workerExit: null } };
+ }
+ journal.recordEvent("reviewed", {
+  nodeId: node.ref.id,
+  repo: map.repo,
+  detail: `adopting ${sha.slice(0, 8)}: a previous run built and committed it, and it passes the supervisor's tests — no new worker session`,
+ });
+ return { workerExit: null, snapshot, sha, adopted: true };
 }
 
 function tail(result: RunResult): string {

@@ -28,6 +28,14 @@ prompt="${!#}"
 cd "$(git rev-parse --show-toplevel)"
 
 if [ "$mode" = "noop" ]; then exit 0; fi
+if [ "$mode" = "add-fixed" ]; then
+  # continues a build an earlier run committed: adds what its tests were missing
+  mkdir -p src
+  echo "export const fixed = true;" > src/fixed.ts
+  git add -A
+  git commit -q -m "fix: add what the tests need for node #20"
+  exit 0
+fi
 if [ "$mode" = "hook-stop" ]; then
   echo "Operation stopped by hook: Runtime policy denied this action: security-disable-request."
   exit 0
