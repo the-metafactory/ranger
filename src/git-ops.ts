@@ -252,14 +252,14 @@ function configRecords(
  * refs/heads/ by git's own ref-name rules (`git check-ref-format --branch`,
  * refs.c `check_refname_component`), so a base such as `release/été` is one.
  * No control byte, space, `~^:?*[\`, `..` or `@{`; no empty component, none
- * starting with `.` or ending in `.lock`; no trailing `.`, not `@`, and no
- * leading `-`.
+ * starting with `.` or ending in `.lock`; no trailing `.` and no leading `-`.
+ * `refs/heads/@` is a branch: only the whole refname `@` is refused.
  */
 function isTrackedHead(ref: string): boolean {
  const prefix = "refs/heads/";
  if (!ref.startsWith(prefix)) return false;
  const name = ref.slice(prefix.length);
- if (name === "" || name === "@" || name.startsWith("-") || name.endsWith(".")) return false;
+ if (name === "" || name.startsWith("-") || name.endsWith(".")) return false;
  if (name.includes("..") || name.includes("@{") || /[\x00-\x20\x7f~^:?*[\\]/.test(name)) return false;
  return name.split("/").every((c) => c !== "" && !c.startsWith(".") && !c.endsWith(".lock"));
 }

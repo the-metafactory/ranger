@@ -85,6 +85,17 @@ describe("gitConfigSnapshot: ranger's own node branches (node #63)", () => {
   expect(gitConfigSnapshot(canonical)).toBe(before);
  });
 
+ // Sage round 3 on node #86: only the whole refname `@` is refused, so
+ // refs/heads/@ is a branch git takes.
+ test("a branch tracking refs/heads/@ is left out too", async () => {
+  await git(["push", "origin", "HEAD:refs/heads/@"]);
+  await git(["fetch", "origin"]);
+  const before = gitConfigSnapshot(canonical);
+  await addTrackedWorktree(canonical, "73", "on-at", "@");
+  expect(await config("--get", "branch.node/73-on-at.merge")).toBe("refs/heads/@");
+  expect(gitConfigSnapshot(canonical)).toBe(before);
+ });
+
  test("a node branch tracking anything but a branch under refs/heads stays in the hash", async () => {
   for (const merge of [
    "refs/tags/v1",
