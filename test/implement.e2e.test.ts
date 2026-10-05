@@ -303,6 +303,18 @@ async function rig(opts: {
  return { dir, origin, canonical, journal, statePath, ctx, github, calls, announced };
 }
 
+/** Land scripts/probe-hud.mjs on origin's main and fetch it, so the merge base has that probe. */
+async function seedProbeOnBase(r: Rig): Promise<void> {
+ const seed = join(r.dir, "seed");
+ const git = (args: string[], cwd: string) => runCmd("git", args, { cwd, env: { ...process.env, ...GIT_ENV } });
+ mkdirSync(join(seed, "scripts"), { recursive: true });
+ writeFileSync(join(seed, "scripts", "probe-hud.mjs"), "// the hud probe\n");
+ await git(["add", "-A"], seed);
+ await git(["commit", "-m", "add the hud probe"], seed);
+ expect((await git(["push", r.origin, "main"], seed)).code).toBe(0);
+ expect((await git(["fetch", "origin"], r.canonical)).code).toBe(0);
+}
+
 /** The node's substrate sessions (node #56), oldest first: [substrate, kind, outcome]. */
 function sessions(journal: Journal): [string, string, string | null][] {
  return (journal.listSubstrateSessions(new Date(0)) ?? []).map((s) => {
@@ -676,6 +688,7 @@ describe("implement lane (node #23)", () => {
  test("probes red at the merge base too do not gate: the record passes, names them, and the channel hears once", async () => {
   const r = await rig({ probe: "fake-probe red {node}", probeRetry: "fake-probe red {node} {failed}" });
   cleanup.push(r.dir);
+  await seedProbeOnBase(r);
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
   const probe = (r.github.comments.get(1) ?? []).find((c) => c.body.includes("ranger:probes"));
   expect(probe?.body).toContain("result=pass selected=2 mode=semantic base-red=probe-hud.mjs -->");
@@ -693,6 +706,7 @@ describe("implement lane (node #23)", () => {
  test("a probe red only on the branch still parks, and the park says the base passes it", async () => {
   const r = await rig({ probe: "fake-probe branch-red {node}", probeRetry: "fake-probe branch-red {node} {failed}" });
   cleanup.push(r.dir);
+  await seedProbeOnBase(r);
   const outcome = await runNode("20", r.ctx);
   expect(outcome.status).toBe("parked");
   expect(outcome.detail).toContain("FAILED: probe-hud.mjs");
@@ -700,6 +714,27 @@ describe("implement lane (node #23)", () => {
   expect(r.announced).toEqual([]);
   const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
   expect(events.some((d) => d.includes("pass at the merge base") && d.includes("the failure is this branch's"))).toBe(true);
+ }, 60_000);
+
+ test("a probe the branch edited gates even when the base fails it too: the base runs another probe under that name", async () => {
+  const r = await rig({ probe: "fake-probe red {node}", probeRetry: "fake-probe red {node} {failed}" });
+  cleanup.push(r.dir);
+  await seedProbeOnBase(r);
+  r.ctx.workerCommand = [implementWorker, "probe-edit"];
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("parked");
+  expect(outcome.detail).toContain("FAILED: probe-hud.mjs");
+  expect(r.announced).toEqual([]);
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.includes("probe-hud.mjs are new or changed on this branch — they gate"))).toBe(true);
+ }, 60_000);
+
+ test("a probe the base does not have gates: nothing to compare it with", async () => {
+  const r = await rig({ probe: "fake-probe red {node}", probeRetry: "fake-probe red {node} {failed}" });
+  cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("parked");
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.includes("probe-hud.mjs are new or changed on this branch — they gate"))).toBe(true);
  }, 60_000);
 
  test("a busy host delays the probe run until the load drops", async () => {

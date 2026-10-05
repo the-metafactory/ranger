@@ -306,16 +306,7 @@ async function probeFinalHead(
  // A failure the merge base shares is the base's, not this branch's
  // (2026-10-05: main went red on one probe and parked every later node).
  const base = result.code === 0 ? null : await probeMergeBase(ctx, failed);
- if (base !== null) {
-  journal.recordEvent("reviewed", {
-   nodeId,
-   repo,
-   detail:
-    base.red.length === 0
-     ? `${failed.join(", ")} pass at the merge base ${base.sha.slice(0, 8)} — the failure is this branch's`
-     : `${base.red.join(", ")} fail at the merge base ${base.sha.slice(0, 8)} too`,
-  });
- }
+ if (base !== null) journal.recordEvent("reviewed", { nodeId, repo, detail: baseProbeDetail(base) });
  const baseRed = base !== null && base.red.length === failed.length ? base.red : undefined;
  if (baseRed !== undefined) await announceBaseRed(ctx, (base as BaseProbeResult).sha, baseRed);
  const record: RecordedProbe = {
@@ -393,13 +384,34 @@ async function awaitQuietHost(ctx: ImplementContext, run: string): Promise<void>
 interface BaseProbeResult {
  /** The merge base the probes ran at. */
  sha: string;
- /** Which of the probes asked about failed there too. */
+ /** Failed probes that fail at the merge base too. */
  red: string[];
+ /** Failed probes that pass at the merge base: the branch broke them. */
+ passed: string[];
+ /** Failed probes the branch added or edited: the base runs another probe under that name, so they gate. */
+ changed: string[];
+}
+
+/** The journal line for a merge-base probe check. */
+function baseProbeDetail(b: BaseProbeResult): string {
+ const at = `the merge base ${b.sha.slice(0, 8)}`;
+ return [
+  b.red.length > 0 ? `${b.red.join(", ")} fail at ${at} too` : null,
+  b.passed.length > 0 ? `${b.passed.join(", ")} pass at ${at} — the failure is this branch's` : null,
+  b.changed.length > 0 ? `${b.changed.join(", ")} are new or changed on this branch — they gate` : null,
+ ].filter((part) => part !== null).join("; ");
+}
+
+/** File names (no directory) in git's newline-separated path output. */
+function fileNames(stdout: string): Set<string> {
+ return new Set(stdout.split("\n").filter(Boolean).map((p) => p.slice(p.lastIndexOf("/") + 1)));
 }
 
 /**
  * Run the probes that failed at the head once more at the branch's merge base
- * with the map base, in a throwaway detached worktree. Null when the answer is
+ * with the map base, in a throwaway detached worktree. A probe the branch
+ * added or edited is not compared: the base would run another probe under
+ * its name, so it gates whatever the base says. Null when the answer is
  * unknown: no retry template to name exact probes, no named failures, or a
  * base run that could not be set up, timed out, or named nothing.
  */
@@ -407,10 +419,18 @@ async function probeMergeBase(ctx: ImplementContext, failed: string[]): Promise<
  const { map, worktree } = ctx;
  const template = map.commands.probeRetry;
  if (template === undefined || failed.length === 0) return null;
- const command = probeRetryCommandFor(template, ctx.node.ref.id, failed);
  const merged = await safeGit(["merge-base", "HEAD", `origin/${map.base}`], { cwd: worktree, timeoutMs: 30_000 });
  const sha = merged.stdout.trim();
  if (merged.code !== 0 || !/^[0-9a-f]{40}$/.test(sha)) return null;
+ const tree = await safeGit(["ls-tree", "-r", "--name-only", sha], { cwd: worktree, timeoutMs: 30_000 });
+ const diff = await safeGit(["diff", "--name-only", sha, "HEAD"], { cwd: worktree, timeoutMs: 30_000 });
+ if (tree.code !== 0 || diff.code !== 0) return null;
+ const atBase = fileNames(tree.stdout);
+ const touched = fileNames(diff.stdout);
+ const changed = failed.filter((n) => !atBase.has(n) || touched.has(n));
+ const comparable = failed.filter((n) => !changed.includes(n));
+ if (comparable.length === 0) return { sha, red: [], passed: [], changed };
+ const command = probeRetryCommandFor(template, ctx.node.ref.id, comparable);
  const scratch = mkdtempSync(join(tmpdir(), "ranger-probe-base-"));
  const dir = join(scratch, "worktree");
  try {
@@ -422,10 +442,15 @@ async function probeMergeBase(ctx: ImplementContext, failed: string[]): Promise<
   }
   await awaitQuietHost(ctx, "the merge-base probe run");
   const run = await runShell(command, dir, ctx, map.commands.probeTimeoutMin * 60_000);
-  if (run.code === 0) return { sha, red: [] };
+  if (run.code === 0) return { sha, red: [], passed: comparable, changed };
   const named = run.code > 0 ? parseFailedProbes(run.stdout) : [];
   if (named.length === 0) return null;
-  return { sha, red: failed.filter((n) => named.includes(n)) };
+  return {
+   sha,
+   red: comparable.filter((n) => named.includes(n)),
+   passed: comparable.filter((n) => !named.includes(n)),
+   changed,
+  };
  } finally {
   await safeGit(["worktree", "remove", "--force", dir], { cwd: worktree, timeoutMs: 60_000 });
   rmSync(scratch, { recursive: true, force: true });
