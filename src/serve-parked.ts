@@ -299,7 +299,6 @@ export function mergeRefusal(pr: PrView | null): string | null {
  if (!SHA_PATTERN.test(pr.headSha)) return "the PR head is unknown";
  if (pr.ci === "no-success") return "no check run concluded success (all neutral/skipped): the close has nothing to cite";
  if (pr.ci === "unreadable") return "the check runs could not be read";
- if (pr.ciSource === "actions") return "only the Actions workflow runs could be read, not every check: merge it on GitHub or let the walker's gate do it";
  if (pr.ci !== "green") return `CI is ${pr.ci}`;
  return null;
 }
@@ -542,6 +541,13 @@ export interface ActionDeps {
  configPath: string | undefined;
  /** Read the PR live before a merge; null when it cannot be read. */
  readPr: (repo: string, pr: number) => Promise<PrView | null>;
+ /**
+  * Every check run on `sha`, read under the merge's own environment (the
+  * `gh` account stored under HOME, machine credentials removed): the CI
+  * state, or null when it cannot be read. Used when the dashboard's
+  * read-only token saw only the Actions runs.
+  */
+ verifyChecks?: (repo: string, sha: string, env: Record<string, string>) => Promise<PrView["ci"] | null>;
  exists: (path: string) => boolean;
  /**
   * Nodes with an action running now (`repo#id`), owned by the server. Held
@@ -639,8 +645,18 @@ async function runHeldAction(
   if ((live as PrView).headSha !== body.sha) {
    return refusal(409, "the PR head moved since the page read it: reload and confirm again");
   }
-  argv = mergeArgv({ repo: entry.repo, pr: pr.number, sha: body.sha });
   env = mergeEnv(deps.env);
+  // The dashboard's token saw only the Actions runs: an external app's
+  // failing check would not be in them. Before merging, every check is read
+  // under the same gh account the merge itself runs as.
+  if ((live as PrView).ciSource === "actions") {
+   const full = deps.verifyChecks === undefined ? null : await deps.verifyChecks(entry.repo, body.sha, env);
+   if (full === null) {
+    return refusal(409, "only the Actions runs were readable, and every check could not be read under your login: merge it on GitHub");
+   }
+   if (full !== "green") return refusal(409, `every check, read under your login: CI is ${full}`);
+  }
+  argv = mergeArgv({ repo: entry.repo, pr: pr.number, sha: body.sha });
  } else {
   if (!entry.actions.session.offered) return refusal(409, entry.actions.session.why);
   const cwd = entry.actions.session.cwd;

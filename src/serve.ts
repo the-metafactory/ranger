@@ -597,6 +597,8 @@ export interface HandlerContext {
   /** The ranger.yaml serve was started with; `resume-node` gets the same one. */
   configPath?: string;
   readPr: (repo: string, pr: number) => Promise<PrView | null>;
+  /** Every check run on a head, read under the merge's environment (see ActionDeps). */
+  verifyChecks?: (repo: string, sha: string, env: Record<string, string>) => Promise<PrView["ci"] | null>;
   exists: (path: string) => boolean;
   /** Called after an action ran, to re-read what it changed. */
   after?: (entry: NeedsYouEntry) => void;
@@ -683,6 +685,7 @@ export function createHandler(ctx: HandlerContext): (req: Request) => Promise<Re
     rangerBin: actions.rangerBin,
     configPath: actions.configPath,
     readPr: actions.readPr,
+    verifyChecks: actions.verifyChecks,
     exists: actions.exists,
     inFlight,
    });
@@ -1352,6 +1355,31 @@ export async function readPrLive(
  };
 }
 
+/**
+ * Every check run on `sha`, read with `gh` under `env`: the merge's own
+ * environment, so whatever account `gh` has stored under HOME (the
+ * principal's, on this machine), with the machine account's credentials
+ * removed. Classified like the merge gate does. Null when the read fails or
+ * comes back malformed.
+ */
+async function verifyChecksAs(repo: string, sha: string, env: Record<string, string>): Promise<PrView["ci"] | null> {
+ if (!REPO_PATTERN.test(repo) || !/^[0-9a-f]{40}$/.test(sha)) return null;
+ const result = await runCmd(
+  "gh",
+  ["api", `repos/${repo}/commits/${sha}/check-runs?filter=latest&per_page=100`, "--paginate", "--slurp"],
+  { env, timeoutMs: 15_000 },
+ );
+ if (result.code !== 0) return null;
+ let raw: unknown;
+ try {
+  raw = JSON.parse(result.stdout);
+ } catch {
+  return null;
+ }
+ const checks = checkRunsFromPages(raw);
+ return checks === null ? null : ciState(checks);
+}
+
 /** One issue over REST under the read-only gate: no GraphQL. Null if unreadable. */
 async function readIssue(
  config: RangerConfig,
@@ -1646,6 +1674,7 @@ export function startServe(opts: {
    rangerBin: expandHome("~/bin/ranger"),
    configPath: opts.configPath,
    readPr: (repo, pr) => readPrLive(opts.config, repo, pr),
+   verifyChecks: verifyChecksAs,
    exists: existsSync,
    after: (entry) => {
     reader.forget(`${entry.repo}#${entry.nodeId}`, entry.pr === null ? null : `${entry.repo}#${entry.pr.number}`);
