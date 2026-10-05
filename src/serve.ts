@@ -1356,9 +1356,11 @@ export async function readPrLive(
 }
 
 /**
- * Every check run on `sha`, read with `gh` under `env` (the merge's: the
- * principal's own login, never a ranger token), classified like the merge
- * gate does. Null when the read fails or comes back malformed.
+ * Every check run on `sha`, read with `gh` under `env`: the merge's own
+ * environment, so whatever account `gh` has stored under HOME (the
+ * principal's, on this machine), with the machine account's credentials
+ * removed. Classified like the merge gate does. Null when the read fails or
+ * comes back malformed.
  */
 async function verifyChecksAs(repo: string, sha: string, env: Record<string, string>): Promise<PrView["ci"] | null> {
  if (!REPO_PATTERN.test(repo) || !/^[0-9a-f]{40}$/.test(sha)) return null;

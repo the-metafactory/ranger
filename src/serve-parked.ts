@@ -543,8 +543,9 @@ export interface ActionDeps {
  readPr: (repo: string, pr: number) => Promise<PrView | null>;
  /**
   * Every check run on `sha`, read under the merge's own environment (the
-  * principal's gh): the CI state, or null when it cannot be read. Used when
-  * the dashboard's read-only token saw only the Actions runs.
+  * `gh` account stored under HOME, machine credentials removed): the CI
+  * state, or null when it cannot be read. Used when the dashboard's
+  * read-only token saw only the Actions runs.
   */
  verifyChecks?: (repo: string, sha: string, env: Record<string, string>) => Promise<PrView["ci"] | null>;
  exists: (path: string) => boolean;
@@ -647,7 +648,7 @@ async function runHeldAction(
   env = mergeEnv(deps.env);
   // The dashboard's token saw only the Actions runs: an external app's
   // failing check would not be in them. Before merging, every check is read
-  // under the principal's own login, which the merge itself runs under.
+  // under the same gh account the merge itself runs as.
   if ((live as PrView).ciSource === "actions") {
    const full = deps.verifyChecks === undefined ? null : await deps.verifyChecks(entry.repo, body.sha, env);
    if (full === null) {
