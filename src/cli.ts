@@ -330,8 +330,8 @@ function runTrustGit(selector: string, configPath: string): string {
  try {
   const map = pickMap(config, selector);
   const canonical = canonicalDir(config, map);
-  const result = trustCurrentGitState(journal, canonical, map.base, map.repo);
-  return JSON.stringify({ map: mapKey(map), canonical, base: map.base, ...result }, null, 2);
+  const result = trustCurrentGitState(journal, canonical, map.repo);
+  return JSON.stringify({ map: mapKey(map), canonical, ...result }, null, 2);
  } finally {
   journal.close();
  }

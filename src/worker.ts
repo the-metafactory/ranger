@@ -586,7 +586,7 @@ async function runImplementNode(
  const slug = slugify(node.node.title);
  const branch = implementBranchFor(node.node, worktreeBranch(nodeId, slug));
  const worktree = await bootstrapWorktree(canonical, nodeId, slug, token, branch, map.base);
- recordIfUnchanged(journal, canonical, map.base, trust.state, "worktree created");
+ recordIfUnchanged(journal, canonical, trust.state, "worktree created");
  journal.updateWorker(nodeId, repo, { worktree, lane: "implement" });
 
  // Substrate selection (node #45), re-run at every session start. A session
@@ -693,9 +693,9 @@ function startTrust(
  nodeId: string,
  cloned: boolean,
 ): TrustCheck {
- if (!cloned) return checkKnownGood(journal, canonical, map.base, { repo: map.repo, nodeId });
- const state = readGitState(canonical, map.base);
- recordKnownGood(journal, canonical, map.base, state, "fresh clone");
+ if (!cloned) return checkKnownGood(journal, canonical, { repo: map.repo, nodeId });
+ const state = readGitState(canonical);
+ recordKnownGood(journal, canonical, state, "fresh clone");
  return { kind: "match", state };
 }
 
@@ -758,7 +758,7 @@ async function runResearch(
  }
  const slug = slugify(node.node.title);
  const worktree = await bootstrapWorktree(canonical, nodeId, slug, token, undefined, map.base);
- recordIfUnchanged(journal, canonical, map.base, trust.state, "worktree created");
+ recordIfUnchanged(journal, canonical, trust.state, "worktree created");
  const branch = researchBranchFor(node.node);
 
  journal.recordEvent("worker-start", {
@@ -856,7 +856,7 @@ async function runResearch(
   // close gate probes, with hooks disabled and the git config checked against
   // the pre-worker snapshot (#23: the worker shares the canonical .git).
   try {
-   assertGitUntouched(canonical, snapshot, map.base);
+   assertGitUntouched(canonical, snapshot);
    const head = await resolveBranchSha(canonical, branch);
    if (head === null) {
     throw new GitSafetyError(`research findings branch ${branch} is missing from the canonical checkout`);
@@ -870,10 +870,9 @@ async function runResearch(
     branch,
     token,
     configSnapshot: snapshot,
-    base: map.base,
     source: sha,
    });
-   recordKnownGood(journal, canonical, map.base, vetted, "vetted push");
+   recordKnownGood(journal, canonical, vetted, "vetted push");
   } catch (error) {
    if (error instanceof FencedError) throw error;
    const detail = `research branch push failed (${branch}): ${error instanceof Error ? error.message : String(error)}`;

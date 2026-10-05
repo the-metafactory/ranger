@@ -603,7 +603,7 @@ describe("implement lane (node #23)", () => {
 
    // The operator vets the change and trusts it; the node then runs (from a
    // clean branch: the fake worker cannot commit the same build twice).
-   trustCurrentGitState(r.journal, r.canonical, "main", "acme/widgets");
+   trustCurrentGitState(r.journal, r.canonical, "acme/widgets");
    await git(["reset", "--hard", "refs/remotes/origin/main"], join(r.canonical, ".worktrees", "node-20"));
    r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
    expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
@@ -652,6 +652,23 @@ describe("implement lane (node #23)", () => {
    expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
   }, 60_000);
 
+  // Git copies the main config.worktree into each new worktree when
+  // extensions.worktreeConfig is on; the copy is not a change.
+  test("a checkout with per-worktree config runs through, and a parallel node's worktree between runs parks nothing", async () => {
+   const r = await rig({});
+   cleanup.push(r.dir);
+   expect((await git(["config", "extensions.worktreeConfig", "true"], r.canonical)).code).toBe(0);
+   expect((await git(["config", "--worktree", "ranger.probe", "kept"], r.canonical)).code).toBe(0);
+   r.ctx.workerCommand = [implementWorker, "noop"];
+   expect((await runNode("20", r.ctx)).status).toBe("failed");
+   expect(readFileSync(join(r.canonical, ".git", "worktrees", "node-20", "config.worktree"), "utf8")).toContain("probe = kept");
+
+   await bootstrapWorktree(r.canonical, "21", "another-node", "tok");
+   r.ctx.workerCommand = [implementWorker, "build"];
+   r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  }, 60_000);
+
   test("a credential-bearing key added between runs parks the node without its text reaching the outcome or the journal", async () => {
    const r = await rig({});
    cleanup.push(r.dir);
@@ -666,7 +683,7 @@ describe("implement lane (node #23)", () => {
    expect(parked.detail).toMatch(/url\.<[0-9a-f]{12}>\.insteadof \(new\)/);
    expect(parked.detail).not.toContain("SECRETTOKEN");
    expect(r.journal.getWorker("20", "acme/widgets")?.outcome).not.toContain("SECRETTOKEN");
-   expect(r.journal.getHealth(knownGoodKey(r.canonical, "main"))).not.toContain("SECRETTOKEN");
+   expect(r.journal.getHealth(knownGoodKey(r.canonical))).not.toContain("SECRETTOKEN");
    for (const event of r.journal.listEvents("acme/widgets", 500)) expect(JSON.stringify(event)).not.toContain("SECRETTOKEN");
   }, 60_000);
 
@@ -677,7 +694,7 @@ describe("implement lane (node #23)", () => {
    const trust = r.journal.listEvents("acme/widgets", 500).filter((e) => e.kind === "git-trust");
    expect(trust).toHaveLength(1);
    expect(trust[0].detail).toContain("no known-good git state recorded");
-   const record = JSON.parse(r.journal.getHealth(knownGoodKey(r.canonical, "main")) as string);
+   const record = JSON.parse(r.journal.getHealth(knownGoodKey(r.canonical)) as string);
    expect(record.source).toBe("vetted push");
   }, 60_000);
  });

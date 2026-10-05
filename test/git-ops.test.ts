@@ -59,14 +59,25 @@ describe("gitConfigSnapshot: ranger's own node branches (node #63)", () => {
   expect(() => assertGitUntouched(canonical, before)).not.toThrow();
  });
 
- test("a branch tracking a non-main map base is left out under that base only", async () => {
+ // Node #81: one known-good record per checkout, so the filter is the same
+ // for every map base on it.
+ test("a branch tracking another map base is left out too", async () => {
   await git(["push", "origin", "HEAD:refs/heads/develop"]);
   await git(["fetch", "origin"]);
-  const before = gitConfigSnapshot(canonical, "develop");
-  const beforeMain = gitConfigSnapshot(canonical);
+  const before = gitConfigSnapshot(canonical);
   await addTrackedWorktree(canonical, "70", "on-develop", "develop");
-  expect(gitConfigSnapshot(canonical, "develop")).toBe(before);
-  expect(gitConfigSnapshot(canonical)).not.toBe(beforeMain);
+  expect(await config("--get", "branch.node/70-on-develop.merge")).toBe("refs/heads/develop");
+  expect(gitConfigSnapshot(canonical)).toBe(before);
+ });
+
+ test("a node branch tracking anything but a branch under refs/heads stays in the hash", async () => {
+  for (const merge of ["refs/tags/v1", "refs/heads/../x", "main"]) {
+   const before = gitConfigSnapshot(canonical);
+   await config("branch.node/71-x.remote", "origin");
+   await config("branch.node/71-x.merge", merge);
+   expect(gitConfigSnapshot(canonical)).not.toBe(before);
+   await config("--remove-section", "branch.node/71-x");
+  }
  });
 
  // Node #81: ranger's own worktrees write no tracking lines, whatever the
@@ -132,10 +143,10 @@ describe("gitConfigSnapshot: everything else stays in the hash", () => {
   ["a merge-only node-branch section", () => config("branch.node/663-x.merge", "refs/heads/main")],
   ["a remote-only non-node branch section", () => config("branch.feature/x.remote", "origin")],
   [
-   "a node-branch merge target other than the map base",
+   "a node-branch merge target outside refs/heads",
    async () => {
     await config("branch.node/663-x.remote", "origin");
-    await config("branch.node/663-x.merge", "refs/heads/other");
+    await config("branch.node/663-x.merge", "refs/remotes/origin/main");
    },
   ],
   [

@@ -13,9 +13,11 @@ import type { Journal } from "./journal.ts";
  * the new state is never adopted on its own. Only the operator's `ranger
  * trust-git` adopts it.
  *
- * One record per canonical checkout and base: the node-branch filter
- * (`configRecords`, node #63) depends on the base. The record holds digests
- * only, never a config value.
+ * One record per canonical checkout, whatever map or base runs in it: a
+ * record per base let a base the checkout had not run before take the
+ * current state on first sight, past the record another base had left. The
+ * state is read the same for every base (`configRecords`, node #63). The
+ * record holds digests only, never a config value.
  */
 
 interface KnownGood extends GitState {
@@ -24,12 +26,12 @@ interface KnownGood extends GitState {
  source: string;
 }
 
-export function knownGoodKey(canonical: string, base: string): string {
- return `git.known-good.${canonical}#${base}`;
+export function knownGoodKey(canonical: string): string {
+ return `git.known-good.${canonical}`;
 }
 
-function readKnownGood(journal: Journal, canonical: string, base: string): KnownGood | "unreadable" | null {
- const raw = journal.getHealth(knownGoodKey(canonical, base));
+function readKnownGood(journal: Journal, canonical: string): KnownGood | "unreadable" | null {
+ const raw = journal.getHealth(knownGoodKey(canonical));
  if (raw === null) return null;
  try {
   const parsed = JSON.parse(raw) as KnownGood;
@@ -46,12 +48,11 @@ function readKnownGood(journal: Journal, canonical: string, base: string): Known
 export function recordKnownGood(
  journal: Journal,
  canonical: string,
- base: string,
  state: GitState,
  source: string,
 ): void {
  const record: KnownGood = { hash: state.hash, entries: state.entries, at: new Date().toISOString(), source };
- journal.setHealth(knownGoodKey(canonical, base), JSON.stringify(record));
+ journal.setHealth(knownGoodKey(canonical), JSON.stringify(record));
 }
 
 export type TrustCheck =
@@ -68,16 +69,15 @@ export type TrustCheck =
 export function checkKnownGood(
  journal: Journal,
  canonical: string,
- base: string,
  at: { repo: string; nodeId?: string },
 ): TrustCheck {
- const state = readGitState(canonical, base);
- const known = readKnownGood(journal, canonical, base);
+ const state = readGitState(canonical);
+ const known = readKnownGood(journal, canonical);
  if (known === null) {
-  recordKnownGood(journal, canonical, base, state, "first sight");
+  recordKnownGood(journal, canonical, state, "first sight");
   journal.recordEvent("git-trust", {
    ...at,
-   detail: `no known-good git state recorded for ${canonical} (base ${base}): the current one is now the record`,
+   detail: `no known-good git state recorded for ${canonical}: the current one is now the record`,
   });
   return { kind: "first", state };
  }
@@ -108,11 +108,10 @@ export function tamperOutcome(check: Extract<TrustCheck, { kind: "mismatch" }>, 
 export function trustedSnapshot(
  journal: Journal,
  canonical: string,
- base: string,
  at: { repo: string; nodeId?: string },
  mapSelector: string,
 ): string {
- const check = checkKnownGood(journal, canonical, base, at);
+ const check = checkKnownGood(journal, canonical, at);
  if (check.kind === "mismatch") throw new GitSafetyError(tamperOutcome(check, canonical, mapSelector));
  return check.state.hash;
 }
@@ -124,11 +123,10 @@ export function trustedSnapshot(
 export function trustCurrentGitState(
  journal: Journal,
  canonical: string,
- base: string,
  repo: string,
 ): { changed: string[]; previous: string | null } {
- const state = readGitState(canonical, base);
- const known = readKnownGood(journal, canonical, base);
+ const state = readGitState(canonical);
+ const known = readKnownGood(journal, canonical);
  const changed =
   known === null
    ? []
@@ -136,27 +134,26 @@ export function trustCurrentGitState(
     ? ["(the known-good record was unreadable)"]
     : gitStateChanges(known.entries, state.entries);
  const previous = known === null ? null : known === "unreadable" ? "unreadable" : `${known.at}, ${known.source}`;
- recordKnownGood(journal, canonical, base, state, "trusted by the operator");
+ recordKnownGood(journal, canonical, state, "trusted by the operator");
  journal.recordEvent("git-trust", {
   repo,
-  detail: `operator trusted the git state of ${canonical} (base ${base})${changed.length > 0 ? `; changed: ${changed.join(", ")}` : ""}`.slice(0, 400),
+  detail: `operator trusted the git state of ${canonical}${changed.length > 0 ? `; changed: ${changed.join(", ")}` : ""}`.slice(0, 400),
  });
  return { changed, previous };
 }
 
 /**
  * Refresh the record after a supervisor step that should leave the state as
- * it was (a worktree add writes only node-branch tracking, which the state
- * leaves out): recorded only when the state still hashes to the one the
+ * it was (a worktree add writes only what the state leaves out: node-branch
+ * tracking, git's copy of the main `config.worktree`): recorded only when the state still hashes to the one the
  * supervisor verified, so a change in between is never adopted.
  */
 export function recordIfUnchanged(
  journal: Journal,
  canonical: string,
- base: string,
  verified: GitState,
  source: string,
 ): void {
- const now = readGitState(canonical, base);
- if (now.hash === verified.hash) recordKnownGood(journal, canonical, base, now, source);
+ const now = readGitState(canonical);
+ if (now.hash === verified.hash) recordKnownGood(journal, canonical, now, source);
 }
