@@ -60,7 +60,7 @@ Every verb dispatches to the store from `createGraphStore` (`work-graph-bridge.t
 - **The GitLab store.** It copies the two strings into `completion.ciCheckRunId` and `completion.ciHeadSha` (`:337`) and never looks them up.
 - **The GitHub store, for comparison.** It verifies the same fields live when it reads a closed node:
   - `readNode` → `hasCurrentCloseReceipt` → `fetchCheckRun`, which requires `conclusion === "success"` and a matching `head_sha` (`work-graph-github.ts:692-698`, `:1027-1047`).
-  - The GitLab `readNode` (`:263`) never sets `currentCloseReceipt`. So `readNodeForBridge` reports `hasCloseReceipt: false` for every closed GitLab node (`work-graph-bridge.ts:312`).
+  - The GitLab `readNode` (`:263`) does rebuild `completion`, CI strings included, from the persisted node block (`withPersistedCompletion`, `:191-195`). It never sets `currentCloseReceipt`, though: only the GitHub store does (`work-graph-github.ts:697-698`). So `readNodeForBridge` reports `hasCloseReceipt: false` for every closed GitLab node (`work-graph-bridge.ts:312`).
 - **Verdict.** Not supported yet. Any `x@y` passes the GitLab close, and nothing later checks it. soma has not decided what identifier GitLab should cite:
   - **pipeline:** `GET projects/:id/pipelines/:pipeline_id` → `status`, `sha`, `source`;
   - **job:** `GET projects/:id/jobs/:job_id` → `status`, `pipeline.sha`.
