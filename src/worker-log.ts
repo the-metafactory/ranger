@@ -2,6 +2,11 @@ import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { RunResult } from "./exec.ts";
 
+/** The node and generation's log file: one per node and generation, next to the journal. */
+export function workerLogFile(journalPath: string, repo: string, nodeId: string, generation: number): string {
+ return join(dirname(journalPath), "logs", "workers", `${repo.replace("/", "__")}-${nodeId}-g${generation}.log`);
+}
+
 /**
  * Keep each worker session's output (design §8 reading order: "journal row →
  * worker transcript log → PR/review → receipt"). Without it a worker that
@@ -16,9 +21,8 @@ export function saveWorkerLog(
  label: string,
  result: RunResult,
 ): string {
- const dir = join(dirname(journalPath), "logs", "workers");
- mkdirSync(dir, { recursive: true, mode: 0o700 });
- const file = join(dir, `${repo.replace("/", "__")}-${nodeId}-g${generation}.log`);
+ const file = workerLogFile(journalPath, repo, nodeId, generation);
+ mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
  appendFileSync(
   file,
   [
@@ -32,4 +36,23 @@ export function saveWorkerLog(
   { mode: 0o600 },
  );
  return file;
+}
+
+/**
+ * `saveWorkerLog` that never throws: the log is evidence, never a gate
+ * (node #107). Returns the file, or why it could not be written.
+ */
+export function tryWorkerLog(
+ journalPath: string,
+ repo: string,
+ nodeId: string,
+ generation: number,
+ label: string,
+ result: RunResult,
+): { file: string } | { error: string } {
+ try {
+  return { file: saveWorkerLog(journalPath, repo, nodeId, generation, label, result) };
+ } catch (error) {
+  return { error: error instanceof Error ? error.message : String(error) };
+ }
 }

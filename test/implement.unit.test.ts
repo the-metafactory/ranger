@@ -18,6 +18,7 @@ import {
  supersededNote,
 } from "../src/implement.ts";
 import { FencedError, openJournal } from "../src/journal.ts";
+import { probeFailureSummary, probesFailedOutcome } from "../src/outcomes.ts";
 import { evaluateMergeGate } from "../src/merge-gate.ts";
 import { parseVerdictBlock, ReviewError } from "../src/review.ts";
 import { classify } from "../src/route.ts";
@@ -501,5 +502,56 @@ describe("skip list", () => {
   });
   expect(classify(entry({}), "acme/widgets", "full", {}, opts).route.route).toBe("escalate-hitl");
   expect(classify(entry({}, "alice", "6"), "acme/widgets", "full", {}, opts).route).toMatchObject({ walkable: true, ratify: "merge" });
+ });
+});
+
+describe("failing probes lead the summary (node #107)", () => {
+ test("each failed probe is named with its kind and failed checks", () => {
+  const stdout = [
+   "probe selection: semantic",
+   "selected: 2",
+   "FAIL probe-hud.mjs (0.1s) exit=1 assert peak load 1.0",
+   "     │   ok   the hud mounts",
+   '     │  FAIL  the hud draws — {"drawn":false}',
+   "FAIL probe-weapon.mjs (0.1s) exit=1 crash peak load 1.0",
+   "FAILED: probe-hud.mjs · probe-weapon.mjs",
+  ].join("\n");
+  expect(probeFailureSummary(stdout, 1)).toEqual(["probe-hud.mjs (assert): the hud draws", "probe-weapon.mjs (crash)"]);
+ });
+
+ test("a probe named only on the FAILED line has no kind to report", () => {
+  expect(probeFailureSummary("FAILED: probe-hud.mjs\n", 1)).toEqual(["probe-hud.mjs (kind not printed)"]);
+ });
+
+ test("a run that names nothing says the names are unavailable rather than guessing", () => {
+  expect(probeFailureSummary("selected: 2\n12 assertions, 1 failed\n", 1)).toEqual([
+   "names unavailable: the run (exit 1) printed no failing probe names ranger reads",
+  ]);
+ });
+
+ test("a run killed before it named failures lists the selected probes it had not passed", () => {
+  const stdout = "selected: 2\n  probe-a.mjs\n  probe-b.mjs\nok   probe-a.mjs (1.0s)\n";
+  expect(probeFailureSummary(stdout, -9)).toEqual(["stopped (exit -9) before passing probe-b.mjs"]);
+ });
+
+ test("a passing run has nothing to summarise", () => {
+  expect(probeFailureSummary("FAIL probe-hud.mjs (0.1s) exit=1 assert\n", 0)).toEqual([]);
+ });
+
+ test("the park keeps its FAILED line and puts the kinds on their own line ahead of the tail", () => {
+  const outcome = probesFailedOutcome({
+   sha: SHA,
+   pr: 3,
+   exit: 1,
+   failed: ["probe-hud.mjs"],
+   summary: ["probe-hud.mjs (assert): the hud draws"],
+   tail: "ok   probe-filler.mjs (0.1s)",
+  });
+  expect(outcome.split("\n")).toEqual([
+   "browser probes failed twice at aaaaaaaa on PR #3 (exit 1)",
+   "FAILED: probe-hud.mjs",
+   "failing: probe-hud.mjs (assert): the hud draws",
+   "ok   probe-filler.mjs (0.1s)",
+  ]);
  });
 });

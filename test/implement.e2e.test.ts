@@ -4,13 +4,14 @@ import {
  existsSync,
  mkdirSync,
  mkdtempSync,
+ readdirSync,
  readFileSync,
  realpathSync,
  rmSync,
  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { loadConfig } from "../src/config.ts";
 import { runCmd } from "../src/exec.ts";
 import type { CheckRun, IssueComment, PullRequest } from "../src/github.ts";
@@ -1087,6 +1088,89 @@ describe("implement lane (node #23)", () => {
   expect((await runNode("20", r.ctx)).status).toBe("parked");
   const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
   expect(events.some((d) => d.includes("probe-hud.mjs are new or changed on this branch — they gate"))).toBe(true);
+ }, 60_000);
+
+ /** A failing probe run whose one failed check prints first, ahead of more than 20,000 characters of passing probes. */
+ const LONG_FAILURE = [
+  "probe selection: semantic",
+  "selected: 2",
+  "FAIL probe-hud.mjs (0.1s) exit=1 assert peak load 1.0",
+  '     │  FAIL  the hud draws — {"drawn":false}',
+  ...Array.from({ length: 600 }, (_, i) => `ok   probe-filler-${i}.mjs (0.1s) every check passed`),
+  "FAILED: probe-hud.mjs",
+ ].join("\n");
+
+ /** Probe commands answer with LONG_FAILURE at the head and pass at the merge base; the rest run for real. */
+ function longProbeOutput(r: Rig): void {
+  r.ctx.shellRun = (command, opts) => {
+   if (!command.startsWith("fake-probe ")) return runCmd("/bin/sh", ["-c", command], opts);
+   const atBase = (opts.cwd ?? "").includes("ranger-probe-base-");
+   return Promise.resolve(
+    atBase ? { code: 0, stdout: "ok   probe-hud.mjs (0.1s)\n", stderr: "" } : { code: 1, stdout: LONG_FAILURE, stderr: "" },
+   );
+  };
+ }
+
+ /** Every worker log the rig's journal directory holds, concatenated. */
+ function workerLogs(r: Rig): string {
+  const dir = join(dirname(r.journal.path), "logs", "workers");
+  return readdirSync(dir).map((f) => readFileSync(join(dir, f), "utf8")).join("\n");
+ }
+
+ test("a failing assertion early in long probe output is kept whole in the log, and the PR record names it before the tail (node #107)", async () => {
+  const r = await rig({ probe: "fake-probe red {node}", probeRetry: "fake-probe red {node} {failed}" });
+  cleanup.push(r.dir);
+  await seedProbeOnBase(r);
+  longProbeOutput(r);
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("parked");
+  expect(outcome.detail).toContain("FAILED: probe-hud.mjs\nfailing: probe-hud.mjs (assert): the hud draws\n");
+
+  // Both attempts and the merge-base run, labelled, each with its whole output.
+  const log = workerLogs(r);
+  const sections = log.split(/^===== /m).filter((s) => s.includes("fake-probe"));
+  expect(sections.map((s) => s.split("\n")[0].replace(/^\S+ /, ""))).toEqual([
+   "probe run 1 (fake-probe red 20) — exit 1",
+   "probe run 2 (the retry) (fake-probe red 20 probe-hud.mjs) — exit 1",
+   expect.stringMatching(/^merge base [0-9a-f]{8}: probe run \(fake-probe red 20 probe-hud\.mjs\) — exit 0$/),
+  ]);
+  for (const s of sections.slice(0, 2)) {
+   expect(s).toContain('FAIL  the hud draws — {"drawn":false}');
+   expect(s).toContain("ok   probe-filler-599.mjs");
+  }
+
+  // The record names the probe, its kind and the check before the output, whose tail no longer holds it.
+  const record = (r.github.comments.get(1) ?? []).find((c) => c.body.includes("ranger:probes"))?.body ?? "";
+  expect(record).toContain("result=fail");
+  const named = record.indexOf("probe-hud.mjs (assert): the hud draws");
+  const output = record.indexOf("<details><summary>output</summary>");
+  expect(named).toBeGreaterThan(-1);
+  expect(named).toBeLessThan(output);
+  expect(record.slice(output)).not.toContain("the hud draws");
+  expect(record).toContain("worker log `acme__widgets-20-g");
+
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => /^probes FAILED at [0-9a-f]{8} .* — failing: probe-hud\.mjs \(assert\): the hud draws$/.test(d))).toBe(true);
+  expect(events.some((d) => d.includes("could not write the worker log"))).toBe(false);
+ }, 60_000);
+
+ test("an unwritable log directory changes no gate: certification proceeds and the journal says the log was not written (node #107)", async () => {
+  const r = await rig({ probe: "fake-probe red {node}", probeRetry: "fake-probe red {node} {failed}" });
+  cleanup.push(r.dir);
+  await seedProbeOnBase(r);
+  longProbeOutput(r);
+  const logs = join(dirname(r.journal.path), "logs");
+  rmSync(logs, { recursive: true, force: true });
+  writeFileSync(logs, "a file where the log directory should be\n");
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("parked");
+  expect(outcome.detail).toContain("failing: probe-hud.mjs (assert): the hud draws");
+  const record = (r.github.comments.get(1) ?? []).find((c) => c.body.includes("ranger:probes"))?.body ?? "";
+  expect(record).toContain("result=fail");
+  const failed = r.journal.listEvents("acme/widgets", 200).filter((e) => e.kind === "log-failed").map((e) => e.detail ?? "");
+  expect(failed.some((d) => d.startsWith("could not write the worker log (build pass)"))).toBe(true);
+  expect(failed.some((d) => d.startsWith("could not write the worker log (probe run 1 (fake-probe red 20))"))).toBe(true);
+  expect(failed.some((d) => d.startsWith("could not write the worker log (probe run 2 (the retry)"))).toBe(true);
  }, 60_000);
 
  test("a PR that conflicts with its moved base gets a base merge pass, a new round, then goes ready (seelite #692)", async () => {
