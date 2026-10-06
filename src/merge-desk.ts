@@ -15,6 +15,7 @@ import {
 } from "./implement.ts";
 import type { Journal, WorkerRow } from "./journal.ts";
 import { evaluateMergeGate } from "./merge-gate.ts";
+import { CI_FAILED_PARK_OUTCOME, mergeGateFailedOutcome } from "./outcomes.ts";
 
 /**
  * The merge desk (design §4/§5, #23): each tick, every implement-lane row
@@ -29,8 +30,13 @@ import { evaluateMergeGate } from "./merge-gate.ts";
  *
  * A PARKED implement-lane PR is watched too, for one event only: the
  * principal merging it anyway (a review-cap park hands good-enough to the
- * principal). The merge resumes the close; nothing else about a parked row
- * changes on its own.
+ * principal). The merge resumes the close. One park moves on its own: a park
+ * on CI alone (node #104). Once the full gate passes at the live head, the row
+ * goes back to awaiting-merge and takes the ordinary merge path. That needs
+ * the review and probe certification recorded at that head, and no
+ * ranger:needs-eye label. A merge-only move starts no worker session, so the
+ * implement lane is never consulted. Anything short of that leaves it parked
+ * quietly, with no send-back, no spawn and no new park card.
  *
  * Ranger never merges: approver-bot is unprovisioned (node #6/#16), so the
  * principal merges by hand. The review evidence is read from the bot's own
@@ -65,6 +71,16 @@ export function watchedByMergeDesk(w: WorkerRow): boolean {
  return (
   w.status === "awaiting-merge" ||
   (w.status === "parked" && w.lane === "implement" && w.prNumber !== null)
+ );
+}
+
+/** A row the merge desk parked on CI alone, in its awaiting-merge phase (node #104). */
+export function ciOnlyPark(w: WorkerRow): boolean {
+ return (
+  w.status === "parked" &&
+  w.lane === "implement" &&
+  w.phase === "awaiting-merge" &&
+  CI_FAILED_PARK_OUTCOME.test(w.outcome ?? "")
  );
 }
 
@@ -146,8 +162,9 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    return;
   }
 
-  // A parked row moves only on a merge.
-  if (row.status === "parked") return;
+  // A parked row moves only on a merge, or (a CI-only park) on CI recovering.
+  const ciPark = row.status === "parked" && ciOnlyPark(row);
+  if (row.status === "parked" && (!ciPark || pr.state === "closed")) return;
 
   if (pr.state === "closed") {
    await park(row, `PR #${pr.number} was closed without merging — declined; ranger will not reopen or re-propose it`, title);
@@ -175,6 +192,8 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   const reworkFindings = last !== undefined && gatingFindings(last) > 0;
   const conflicting = last !== undefined && (pr.mergeable === false || pr.mergeableState === "dirty");
   const missingProbes = probesRequired && probe === undefined && last !== undefined;
+  // A send-back is a worker session; a CI-only park never starts one.
+  if (ciPark && (reworkFindings || conflicting || missingProbes)) return;
   if ((reworkFindings || conflicting || missingProbes) && ctx.spawn !== undefined) {
    const why = reworkFindings
     ? `sage round ${last?.round} at ${pr.headSha.slice(0, 8)} has ${last?.blockers} blocker(s) and ${last?.majors} major(s) to rework`
@@ -235,31 +254,44 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    probePassedSha: probe?.sha ?? null,
   });
 
+  // A CI-only park stays parked, quietly, until the whole gate passes.
+  if (ciPark && gate.status !== "pass") return;
   if (gate.status === "pending") {
    result.pending.push(row.nodeId);
    return;
   }
   if (gate.status === "fail") {
-   await park(row, `merge gate failed (${gate.check}): ${gate.reason}`, title);
+   await park(row, mergeGateFailedOutcome(gate), title);
    return;
   }
-  if (row.mergeMessageId !== null) return; // card already up — announce once
+  if (!ciPark && row.mergeMessageId !== null) return; // card already up — announce once
 
   // Auto-merge (principal, 2026-10-03): on a map that opts in, ranger
   // squash-merges the gate-passed PR itself, pinned to the gated head, unless
   // the node is labelled ranger:needs-eye. The close follows on this tick.
+  // A CI-only park always reads the labels: needs-eye keeps it parked.
   let needsEye = false;
-  if (map.autoMerge || map.commands.views) {
+  if (ciPark || map.autoMerge || map.commands.views) {
    try {
     needsEye = (await github.issueLabels(repo, Number(row.nodeId), token)).includes(NEEDS_EYE_LABEL);
    } catch (error) {
-    if (map.autoMerge) throw error;
+    if (ciPark || map.autoMerge) throw error;
     // On manual maps labels only select evidence; an outage must not suppress the card.
     journal.recordEvent("merge-card", {
      nodeId: row.nodeId, repo,
      detail: `label lookup failed (informational): ${redactViewsReason(String(error), process.env).slice(-500)}`,
     });
    }
+  }
+  if (ciPark) {
+   if (needsEye) return;
+   journal.updateWorker(row.nodeId, repo, { status: "awaiting-merge", finishedAt: null, outcome: null });
+   journal.recordEvent("sweep", {
+    nodeId: row.nodeId,
+    repo,
+    detail: `PR #${pr.number}: CI recovered at ${gate.headSha.slice(0, 8)}, the gate passes there — the CI-only park returns to awaiting-merge (no worker, no lane)`,
+   });
+   if (row.mergeMessageId !== null) return; // its card is still up
   }
   if (map.autoMerge && !needsEye) {
    await github.mergePr(repo, pr.number, gate.headSha, pr.title, token);
