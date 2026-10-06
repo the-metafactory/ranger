@@ -1520,8 +1520,8 @@ describe("implement lane (node #23)", () => {
    if (majors > 0) expect(outcome.detail).toContain("0 blocker(s) and 1 major(s) remain after 2 sage round(s)");
    expect(r.calls).toHaveLength(1); // round 2 was read back, not re-run
    expect(r.journal.getWorker("20", "acme/widgets")).toMatchObject({ reviewRound: 2, verdictSha: head });
-   // A clean round 2 that set round 1's major aside is named in the journal,
-   // once for the head however many passes the loop makes over it.
+   // A clean round 2 that set round 1's major aside is named once in the
+   // journal; a major standing in round 2 sets nothing aside.
    const setAside = r.journal.listNodeEvents("acme/widgets", "20")
     .filter((e) => e.kind === "reviewed" && (e.detail ?? "").includes("superseded by the clean round 2"));
    expect(setAside).toHaveLength(majors === 0 ? 1 : 0);
