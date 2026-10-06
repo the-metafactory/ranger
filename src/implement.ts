@@ -170,12 +170,14 @@ export interface RecordedReview {
  body: string;
 }
 
-const MARKER = /<!-- ranger:review round=(\d+) sha=([0-9a-f]{7,64}) blockers=(\d+) majors=(\d+) nits=(\d+)(?:\s+substrate=(\w+))? -->/;
+const MARKER = /^<!-- ranger:review round=(\d+) sha=([0-9a-f]{7,64}) blockers=(\d+) majors=(\d+) nits=(\d+)(?:\s+substrate=(\w+))? -->/;
 
 /**
  * The durable review record on the PR: markers in comments the MACHINE
  * ACCOUNT wrote. A marker in anyone else's comment is ignored — otherwise a
- * third party could forge a clean verdict or reset the round cap.
+ * third party could forge a clean verdict or reset the round cap. The marker
+ * counts only at the start of the comment, where reviewComment writes it, so
+ * a marker quoted inside review text never reads as a round.
  */
 export function recordedReviews(
  comments: IssueComment[],
@@ -202,14 +204,23 @@ export function recordedReviews(
 /**
  * The review that stands at `sha`: the one with the highest round among the
  * reviews of that head (a tied round falls to the later one in the input),
- * whatever the earlier rounds there found, a genuine major included. A round
- * on the same head re-reviews identical code, so the newest verdict is the
- * reviewer's current word on it; an errored round no longer pins the head.
- * The marker carries no error or completeness field, so this cannot tell an
- * errored lens from a real finding (the review-budget node's question). Only
- * the machine account's markers are recorded (recordedReviews), so a third
- * party cannot post the round that clears a head. Older reviews stay in the
- * record untouched.
+ * whatever the earlier rounds there found, a genuine major included (node
+ * #106). Once a newer round is posted at a head, an errored round there no
+ * longer pins it. Nothing in the implement loop posts that round: the loop
+ * reviews only a head with no review, so the newer round is a rerun posted
+ * under the machine account; a same-head retry belongs to the review-budget
+ * node.
+ *
+ * The risk this accepts: an LLM reviewer can flag a real major in one round
+ * and miss it in the next, and the newer, clean round then stands. The
+ * marker carries no error or completeness field, so this cannot tell an
+ * errored lens from a real finding. `supersededAtHead` names every major a
+ * clean round set aside, and the journal, the merge card and the merge
+ * notice carry it, so the principal sees each one.
+ *
+ * Only the machine account's markers are recorded (recordedReviews), so a
+ * third party cannot post the round that clears a head. Older reviews stay
+ * in the record untouched.
  */
 export function reviewAtHead<R extends { round: number; sha: string }>(reviews: R[], sha: string): R | undefined {
  let standing: R | undefined;
@@ -217,6 +228,34 @@ export function reviewAtHead<R extends { round: number; sha: string }>(reviews: 
   if (r.sha === sha && (standing === undefined || r.round >= standing.round)) standing = r;
  }
  return standing;
+}
+
+/**
+ * The older reviews at `sha` whose blockers or majors the clean review
+ * standing there sets aside, oldest first. Empty when the standing review
+ * gates itself, or when no older round at the head had a gating finding.
+ */
+export function supersededAtHead<R extends { round: number; sha: string; blockers: number; majors: number }>(
+ reviews: R[],
+ sha: string,
+): R[] {
+ const standing = reviewAtHead(reviews, sha);
+ if (standing === undefined || gatingFindings(standing) > 0) return [];
+ return reviews
+  .filter((r) => r !== standing && r.sha === sha && gatingFindings(r) > 0)
+  .sort((a, b) => a.round - b.round);
+}
+
+/** One line naming the gating findings a clean same-head round set aside; null when none. */
+export function supersededNote<R extends { round: number; sha: string; blockers: number; majors: number }>(
+ reviews: R[],
+ sha: string,
+): string | null {
+ const older = supersededAtHead(reviews, sha);
+ const standing = reviewAtHead(reviews, sha);
+ if (older.length === 0 || standing === undefined) return null;
+ const rounds = older.map((r) => `round ${r.round} (${r.blockers} blocker(s), ${r.majors} major(s))`).join(", ");
+ return `sage ${rounds} at ${sha.slice(0, 8)} superseded by the clean round ${standing.round} at the same head (no code change between them)`;
 }
 
 export { parseFailedProbes };
@@ -724,6 +763,8 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
   const cap = capNow();
   const live = await github.getPr(repo, open.number, token);
   let current = reviewAtHead(reviews, live.headSha);
+  const superseded = supersededNote(reviews, live.headSha);
+  if (superseded !== null) journal.recordEvent("reviewed", { nodeId, repo, detail: superseded });
   if (current === undefined) {
    if (reviews.length >= cap) {
     throw new ParkSignal(reviewCapHeadMovedOutcome({ rounds: reviews.length, pr: open.number }));

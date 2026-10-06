@@ -12,6 +12,7 @@ import {
  recordedProbes,
  recordedReviews,
  reviewAtHead,
+ supersededNote,
  type GitHubPort,
 } from "./implement.ts";
 import type { Journal, WorkerRow } from "./journal.ts";
@@ -175,6 +176,9 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   const comments = await github.listComments(repo, pr.number, token);
   const reviews = recordedReviews(comments, botIdentity);
   const last = reviewAtHead(reviews, pr.headSha);
+  // A clean round that set aside an older same-head major is named on the
+  // merge notice and card (node #106): the reviewer may have missed it.
+  const superseded = supersededNote(reviews, pr.headSha);
   const probe = recordedProbes(comments, botIdentity).find(
    (p) => p.sha === pr.headSha && p.passed,
   );
@@ -299,7 +303,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    journal.recordEvent("merged", {
     nodeId: row.nodeId,
     repo,
-    detail: `PR #${pr.number} squash-merged by ranger at ${gate.headSha.slice(0, 8)} (no ${NEEDS_EYE_LABEL} label; standing grant 2026-10-03)`,
+    detail: `PR #${pr.number} squash-merged by ranger at ${gate.headSha.slice(0, 8)} (no ${NEEDS_EYE_LABEL} label; standing grant 2026-10-03)${superseded !== null ? `; ${superseded}` : ""}`,
    });
    result.merged.push(row.nodeId);
    try {
@@ -307,6 +311,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
      [
       `:ranger: **merged** #${row.nodeId} — ${title}`,
       `Gate passed at \`${gate.headSha.slice(0, 8)}\` (CI, mergeable, sage 0 blockers / 0 majors${probesRequired ? ", probes" : ""}); squash-merged by ranger. The node closes through the gate next.`,
+      ...(superseded !== null ? [`Note: ${superseded}.`] : []),
      ].join("\n"),
      `merge notice for #${row.nodeId}`,
     );
@@ -327,6 +332,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
     `:ranger: **merge needed** #${row.nodeId} — ${title}`,
     `map: ${mapKey(map)}`,
     `Gate passed at \`${gate.headSha.slice(0, 8)}\`: CI green, mergeable, base \`${map.base}\`, sage ${last?.round ?? "?"} round(s), the last with 0 blockers and 0 majors (machine evidence, not a sign-off).`,
+    ...(superseded !== null ? [`Note: ${superseded}; the reviewer may have missed it, check before you merge.`] : []),
     ...(probesRequired
      ? [`Probes passed at \`${gate.headSha.slice(0, 8)}\` (selection ${probe?.mode ?? "?"}, ${probe?.selected ?? "?"} probe(s)). Only the selected probes ran, not the full suite.${baseRedNote(probe)}`]
      : ["No probe tier on this map: CI and the tests are the only automated checks."]),
@@ -356,7 +362,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    );
   }
   journal.updateWorker(row.nodeId, repo, { mergeMessageId: messageId });
-  journal.recordEvent("merge-card", { nodeId: row.nodeId, repo, detail: `PR #${pr.number}, message ${messageId}` });
+  journal.recordEvent("merge-card", { nodeId: row.nodeId, repo, detail: `PR #${pr.number}, message ${messageId}${superseded !== null ? `; ${superseded}` : ""}` });
   result.cards.push(row.nodeId);
  }
 }

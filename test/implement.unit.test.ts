@@ -14,6 +14,8 @@ import {
  resolvePhase,
  reviewAtHead,
  reviewMarker,
+ supersededAtHead,
+ supersededNote,
 } from "../src/implement.ts";
 import { FencedError, openJournal } from "../src/journal.ts";
 import { evaluateMergeGate } from "../src/merge-gate.ts";
@@ -173,11 +175,28 @@ describe("node #106 — newest-same-head-review-wins: the newest review at a hea
   const current = reviewAtHead(recordedReviews([at(12, SHA, 0), at(13, SHA, 1)], "ivy-bot"), SHA);
   expect(current).toMatchObject({ round: 13, majors: 1 });
  });
- test("by design, a genuine major in an older round is cleared by a newer clean review of the same head", () => {
-  // The marker cannot tell an errored lens from a real finding: the newer
-  // review read identical code, and its verdict is the one that stands.
-  const current = reviewAtHead(recordedReviews([at(12, SHA, 1), at(13, SHA, 0)], "ivy-bot"), SHA);
-  expect(current).toMatchObject({ round: 13, majors: 0 });
+ test("the accepted risk: a real major the newer clean round missed no longer gates, and is named as superseded", () => {
+  // The marker cannot tell an errored lens from a real finding, so a reviewer
+  // that misses in round 13 a major it found in round 12 clears the head.
+  // supersededNote names what was set aside, for the journal and the cards.
+  const reviews = recordedReviews([at(12, SHA, 1), at(13, SHA, 0)], "ivy-bot");
+  expect(reviewAtHead(reviews, SHA)).toMatchObject({ round: 13, majors: 0 });
+  expect(supersededAtHead(reviews, SHA).map((r) => r.round)).toEqual([12]);
+  expect(supersededNote(reviews, SHA)).toBe(
+   `sage round 12 (0 blocker(s), 1 major(s)) at ${SHA.slice(0, 8)} superseded by the clean round 13 at the same head (no code change between them)`,
+  );
+ });
+ test("nothing is named superseded when the standing round gates, no older round gated, or the major was on another head", () => {
+  for (const comments of [[at(12, SHA, 1), at(13, SHA, 1)], [at(12, SHA, 0), at(13, SHA, 0)], [at(12, OTHER, 1), at(13, SHA, 0)], [at(13, SHA, 0)]]) {
+   const reviews = recordedReviews(comments, "ivy-bot");
+   expect(supersededAtHead(reviews, SHA)).toEqual([]);
+   expect(supersededNote(reviews, SHA)).toBeNull();
+  }
+ });
+ test("a marker quoted inside a machine-account comment's text never reads as a round", () => {
+  const quoted = { id: 99, author: "ivy-bot", body: `**Sage review**\n> ${at(14, SHA, 0).body}` };
+  const current = reviewAtHead(recordedReviews([at(12, SHA, 1), quoted], "ivy-bot"), SHA);
+  expect(current).toMatchObject({ round: 12, majors: 1 });
  });
  test("a clean newer round posted by anyone but the machine account never clears the head", () => {
   const current = reviewAtHead(recordedReviews([at(12, SHA, 1), at(13, SHA, 0, "mallory")], "ivy-bot"), SHA);

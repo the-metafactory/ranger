@@ -1510,6 +1510,8 @@ describe("implement lane (node #23)", () => {
    r.ctx.config.workers.reviewRounds = 1;
    expect((await runNode("20", r.ctx)).status).toBe("parked");
    const head = await r.github.sha("node/20-add-the-feature-module");
+   // Round 2 stands in for a rerun posted under the machine account: the
+   // loop never reviews a head that already has a review.
    await r.github.postComment("acme/widgets", 1, `${reviewMarker(2, { verdict: "commented", summary: "", commitId: head, blockers: 0, majors, nits: 0, body: "" })}\nround two`);
 
    r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
@@ -1518,6 +1520,10 @@ describe("implement lane (node #23)", () => {
    if (majors > 0) expect(outcome.detail).toContain("0 blocker(s) and 1 major(s) remain after 2 sage round(s)");
    expect(r.calls).toHaveLength(1); // round 2 was read back, not re-run
    expect(r.journal.getWorker("20", "acme/widgets")).toMatchObject({ reviewRound: 2, verdictSha: head });
+   // A clean round 2 that set round 1's major aside is named in the journal.
+   const setAside = r.journal.listNodeEvents("acme/widgets", "20")
+    .filter((e) => e.kind === "reviewed" && (e.detail ?? "").includes("superseded by the clean round 2"));
+   expect(setAside.length > 0).toBe(majors === 0);
    // History intact: round 1 still stands on the PR, unchanged.
    const rounds = recordedReviews(r.github.comments.get(1) ?? [], BOT).map((x) => `${x.round}:${x.majors}`);
    expect(rounds).toEqual(["1:1", `2:${majors}`]);

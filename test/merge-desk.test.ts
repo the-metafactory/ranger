@@ -202,6 +202,7 @@ describe("node #104 — ci-only-park-merges-without-lane: a CI-only park merges 
 });
 
 describe("node #106 — newest-same-head-review-wins: the desk reads the newest review at the head", () => {
+ const SET_ASIDE = `sage round 12 (0 blocker(s), 1 major(s)) at ${CERTIFIED.slice(0, 8)} superseded by the clean round 13 at the same head (no code change between them)`;
  test("a CI-only park whose round 12 had a major and round 13 is clean merges on round 13", async () => {
   const r = rig();
   try {
@@ -209,6 +210,31 @@ describe("node #106 — newest-same-head-review-wins: the desk reads the newest 
    const result = await r.desk(gh.github);
    expect(result).toMatchObject({ merged: ["96"], parked: [], errors: [] });
    expect(gh.merges).toEqual([{ n: 709, sha: CERTIFIED }]);
+   // The set-aside major is named, so a reviewer's miss is never silent.
+   expect(r.events("merged").map((e) => e.detail)).toContainEqual(expect.stringContaining(SET_ASIDE));
+   expect(r.posts.join("\n")).toContain(`Note: ${SET_ASIDE}`);
+  } finally { r.close(); }
+ });
+
+ test("on a manual map the merge card names the major the clean round set aside", async () => {
+  const r = rig({ autoMerge: false });
+  try {
+   const gh = fakeGitHub({ comments: [review(CERTIFIED, 0, 1, 12), review(CERTIFIED, 0, 0, 13)], ci: GREEN });
+   const result = await r.desk(gh.github);
+   expect(result).toMatchObject({ cards: ["96"], merged: [] });
+   expect(r.posts).toHaveLength(1);
+   expect(r.posts[0]).toContain(`Note: ${SET_ASIDE}; the reviewer may have missed it, check before you merge.`);
+   expect(r.events("merge-card").map((e) => e.detail)).toContainEqual(expect.stringContaining(SET_ASIDE));
+  } finally { r.close(); }
+ });
+
+ test("a merge on a single clean round carries no superseded note", async () => {
+  const r = rig();
+  try {
+   const gh = fakeGitHub({ comments: [review(CERTIFIED, 0, 0, 13)], ci: GREEN });
+   expect((await r.desk(gh.github)).merged).toEqual(["96"]);
+   expect(r.posts.join("\n")).not.toContain("superseded");
+   expect(r.events("merged").map((e) => e.detail).join("\n")).not.toContain("superseded");
   } finally { r.close(); }
  });
 
