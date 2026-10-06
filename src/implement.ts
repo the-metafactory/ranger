@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { availableParallelism, loadavg, tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { DiscordAnnouncer } from "./announce.ts";
 import { mapKey } from "./maps.ts";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
@@ -28,6 +28,7 @@ import {
  parseFailedChecks,
  type FailedProbeRun,
  parseFailedProbes,
+ probeFailureSummary,
  baseConflictOutcome,
  policyBlockedOutcome,
  probesFailedOutcome,
@@ -51,7 +52,7 @@ import {
 import { selectForReview } from "./substrate-policy.ts";
 import { failedSessionOutcome, recordSession } from "./substrate-usage.ts";
 import { workerEnv } from "./worker-env.ts";
-import { saveWorkerLog } from "./worker-log.ts";
+import { tryWorkerLog, workerLogFile } from "./worker-log.ts";
 import { captureViews, redactViewsReason, saveViewsRecord, viewsComment, viewsDirectory, type ViewsDependencies, type ViewsRecord } from "./views.ts";
 import { NEEDS_EYE_LABEL } from "./labels.ts";
 
@@ -365,7 +366,8 @@ async function probeFinalHead(
  const command = probeCommandFor(map.commands.probe as string, nodeId);
  const timeoutMs = map.commands.probeTimeoutMin * 60_000;
  await awaitQuietHost(ctx, "probe run 1");
- let result = await runShell(command, worktree, ctx, timeoutMs, "probe");
+ const logFailuresBefore = logFailureCount(ctx);
+ let result = await runShell(command, worktree, ctx, { label: "probe run 1", timeoutMs, priority: "probe" });
  let attempts = 1;
  let ranCommand = command;
  // The record names the selection of the first run: a narrowed retry selects only the failures.
@@ -392,7 +394,7 @@ async function probeFinalHead(
      : `only the ${unfinished.length} probe(s) it had not passed when it stopped`;
   journal.recordEvent("reviewed", { nodeId, repo, detail: `probe run 1 failed (exit ${result.code}) — retrying ${what}`.slice(0, 400) });
   await awaitQuietHost(ctx, "the probe retry");
-  result = await runShell(ranCommand, worktree, ctx, timeoutMs, "probe");
+  result = await runShell(ranCommand, worktree, ctx, { label: "probe run 2 (the retry)", timeoutMs, priority: "probe" });
   attempts = 2;
  }
  const failed = result.code > 0 ? parseFailedProbes(result.stdout) : [];
@@ -409,11 +411,15 @@ async function probeFinalHead(
   ...(baseRed === undefined ? {} : { baseRed }),
  };
  ctx.journal.assertGeneration(nodeId, ctx.map.repo, ctx.generation, "post the probe record");
- await github.postComment(repo, prNumber, probeComment(ranCommand, record, attempts, result), token);
+ // Named failures lead the record, the event and the park: an output tail can hold only passing probes.
+ const failing = probeFailureSummary(result.stdout, result.code);
+ // Named only when every run here (both attempts, the merge base's) was written.
+ const log = logFailureCount(ctx) === logFailuresBefore ? basename(workerLogFile(journal.path, repo, nodeId, ctx.generation)) : null;
+ await github.postComment(repo, prNumber, probeComment(ranCommand, record, attempts, result, failing, log), token);
  journal.recordEvent("reviewed", {
   nodeId,
   repo,
-  detail: `probes ${record.passed ? "passed" : "FAILED"} at ${record.sha.slice(0, 8)} (${record.mode}, ${record.selected} selected, ${attempts} run(s))${baseRed === undefined ? "" : `; red on the merge base too, not gating: ${baseRed.join(", ")}`}`,
+  detail: `probes ${record.passed ? "passed" : "FAILED"} at ${record.sha.slice(0, 8)} (${record.mode}, ${record.selected} selected, ${attempts} run(s))${baseRed === undefined ? "" : `; red on the merge base too, not gating: ${baseRed.join(", ")}`}${record.passed ? "" : ` — failing: ${failing.join(" · ")}`}`.slice(0, 400),
  });
  if (!record.passed) {
   throw new ParkSignal(
@@ -423,6 +429,7 @@ async function probeFinalHead(
     exit: result.code,
     failed,
     redOnBase: base?.red ?? [],
+    summary: failing,
     tail: tail(result),
    }),
   );
@@ -558,11 +565,15 @@ async function probeMergeBase(
   const add = await safeGit(["worktree", "add", "--detach", dir, sha], { cwd: worktree, timeoutMs: 120_000 });
   if (add.code !== 0) return null;
   if (map.commands.install !== undefined) {
-   const install = await runShell(map.commands.install, dir, ctx, INSTALL_TIMEOUT_MS);
+   const install = await runShell(map.commands.install, dir, ctx, { label: `merge base ${sha.slice(0, 8)}: install`, timeoutMs: INSTALL_TIMEOUT_MS });
    if (install.code !== 0) return null;
   }
   await awaitQuietHost(ctx, "the merge-base probe run");
-  const run = await runShell(command, dir, ctx, map.commands.probeTimeoutMin * 60_000, "probe");
+  const run = await runShell(command, dir, ctx, {
+   label: `merge base ${sha.slice(0, 8)}: probe run`,
+   timeoutMs: map.commands.probeTimeoutMin * 60_000,
+   priority: "probe",
+  });
   if (run.code === 0) return { sha, red: [], differs: [], passed: comparable, changed, uncomparable };
   const named = run.code > 0 ? parseFailedProbes(run.stdout) : [];
   if (named.length === 0) return null;
@@ -613,11 +624,20 @@ async function announceBaseRed(ctx: ImplementContext, sha: string, red: string[]
  }
 }
 
+/**
+ * The probe record on the PR. A failed run's probes, kinds and checks come
+ * first, in a code block (probe output is the branch's text: no mentions or
+ * markup), then the output's tail. The whole output of every run, the retry
+ * and the merge-base run included, is in the worker log it names by file;
+ * `log` is null when a write failed, and the record says so instead.
+ */
 function probeComment(
  command: string,
  p: RecordedProbe,
  attempts: number,
  result: RunResult,
+ failing: string[],
+ log: string | null,
 ): string {
  const out = (result.stdout + (result.stderr ? `\n${result.stderr}` : "")).trim();
  const clipped = out.length > 20_000 ? `…${out.slice(-20_000)}` : out;
@@ -625,6 +645,20 @@ function probeComment(
   probeMarker(p),
   `**Probes — ${p.passed ? "passed" : "failed"}** at \`${p.sha.slice(0, 8)}\` (selection ${p.mode}, ${p.selected} probe(s); ${attempts} run(s))${baseRedNote(p)}`,
   "",
+  ...(failing.length === 0
+   ? []
+   : [
+      "Failing:",
+      "",
+      "```",
+      ...failing.map((line) => line.replaceAll("`", "'")),
+      "```",
+      "",
+      log === null
+       ? "Ranger could not write its worker log for every run (the journal's log-failed events say why): the tail below is all the record keeps."
+       : `The full output of every run is in ranger's worker log \`${log}\`.`,
+      "",
+     ]),
   `\`${command}\``,
   "",
   "<details><summary>output</summary>",
@@ -704,7 +738,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
  if (phase === "implement") {
   journal.updateWorker(nodeId, ctx.map.repo, { phase: "implement" });
   if (map.commands.install !== undefined) {
-   const install = await runShell(map.commands.install, worktree, ctx, INSTALL_TIMEOUT_MS);
+   const install = await runShell(map.commands.install, worktree, ctx, { label: "install", timeoutMs: INSTALL_TIMEOUT_MS });
    if (install.code !== 0) {
     return {
      status: "failed",
@@ -1253,7 +1287,7 @@ async function checkedWorkerPass(
  const { result, lines } = output.read(raw, journal);
 
  const pass = passLabel(spec);
- const log = saveWorkerLog(journal.path, map.repo, nodeId, ctx.generation, pass, result);
+ const log = logRun(ctx, pass, result) ?? "not written, see the journal";
  // Before ANY git call after the worker: a tampered config or hook would run
  // with whatever the next git call carries.
  await assertGitUntouched(ctx.canonical, snapshot);
@@ -1287,7 +1321,7 @@ async function checkedWorkerPass(
  // tracked file (a lockfile, generated source) fails the pass rather than
  // letting the tests certify content that never gets pushed.
  if (spec.kind === "base-merge" && map.commands.install !== undefined) {
-  const install = await runShell(map.commands.install, worktree, ctx, INSTALL_TIMEOUT_MS);
+  const install = await runShell(map.commands.install, worktree, ctx, { label: `${pass}: install`, timeoutMs: INSTALL_TIMEOUT_MS });
   if (install.code !== 0) {
    return fail(`install (${map.commands.install}) after the base merge exited ${install.code}: ${tail(install)}`);
   }
@@ -1324,25 +1358,53 @@ async function checkedWorkerPass(
 }
 
 /**
- * A repo command (install/test) — it executes worker-written code, so it runs
- * in the worker's env (no credential) and its own process group.
+ * A repo command (install/test/probe) — it executes worker-written code, so it
+ * runs in the worker's env (no credential) and its own process group. Its
+ * whole output goes to the node's worker log under `label`, pass or fail
+ * (node #107: #478 and #691 kept only a tail of passing tests, and the
+ * evidence took a 30-minute rerun to recover).
  */
-function runShell(
+async function runShell(
  command: string,
  cwd: string,
  ctx: ImplementContext,
- timeoutMs: number,
- priority: "background" | "probe" = "background",
+ opts: { label: string; timeoutMs: number; priority?: "background" | "probe" },
 ): Promise<RunResult> {
- const run: ShellRun = ctx.shellRun ?? ((cmd, opts) => runCmd("/bin/sh", ["-c", cmd], opts));
- return run(command, {
+ const run: ShellRun = ctx.shellRun ?? ((cmd, o) => runCmd("/bin/sh", ["-c", cmd], o));
+ const result = await run(command, {
   cwd,
   env: workerEnv(ctx.config, ctx.map.repo, ctx.sessionJournal),
-  timeoutMs,
+  timeoutMs: opts.timeoutMs,
   processGroup: true,
   // Install and tests yield the CPU; the timing-sensitive probes do not.
-  ...(priority === "probe" ? {} : { nice: ctx.config.workers.niceness }),
+  ...(opts.priority === "probe" ? {} : { nice: ctx.config.workers.niceness }),
  });
+ logRun(ctx, `${opts.label} (${command})`, result);
+ return result;
+}
+
+/** How many of a node run's log writes failed: a record names the log only when none did across its runs. */
+const logFailures = new WeakMap<ImplementContext, number>();
+
+/** The node run's failed log writes so far; compare two readings to learn whether runs between them were logged. */
+function logFailureCount(ctx: ImplementContext): number {
+ return logFailures.get(ctx) ?? 0;
+}
+
+/**
+ * Append a run's whole output to the node's worker log. A log that cannot be
+ * written is journaled and the run goes on: logging never changes a gate.
+ */
+function logRun(ctx: ImplementContext, label: string, result: RunResult): string | null {
+ const saved = tryWorkerLog(ctx.journal.path, ctx.map.repo, ctx.node.ref.id, ctx.generation, label, result);
+ if ("file" in saved) return saved.file;
+ logFailures.set(ctx, logFailureCount(ctx) + 1);
+ ctx.journal.recordEvent("log-failed", {
+  nodeId: ctx.node.ref.id,
+  repo: ctx.map.repo,
+  detail: `could not write the worker log (${label}): ${saved.error}`.slice(0, 400),
+ });
+ return null;
 }
 
 /** After the principal's merge: fast-forward, gated close citing CI, decisions --write. */
@@ -1494,7 +1556,7 @@ export function failedTestNames(result: RunResult): string[] {
 /** A failed supervisor test run, named: the failing tests first (the journal keeps 400 characters), then the tail. */
 function testsFailedDetail(testCommand: string, tests: RunResult, after: string): string {
  const names = failedTestNames(tests);
- return `tests (${testCommand}) failed ${after} (exit ${tests.code})${names.length > 0 ? ` — failing: ${names.join("; ")}` : ""}: ${tail(tests)}`;
+ return `tests (${testCommand}) failed ${after} (exit ${tests.code})${names.length > 0 ? ` — failing: ${names.join("; ")}` : " — failing test names unavailable"}: ${tail(tests)}`;
 }
 
 /**
@@ -1522,32 +1584,30 @@ async function supervisorTests(
  ctx: ImplementContext,
  testCommand: string,
  label: string,
-): Promise<{ tests: RunResult; log: string | null; retried: boolean }> {
+): Promise<{ tests: RunResult; retried: boolean }> {
  const { journal, map, node, worktree } = ctx;
  const head = await headSha(worktree);
- let tests = await runShell(testCommand, worktree, ctx, TEST_TIMEOUT_MS);
- if (tests.code === 0) return { tests, log: null, retried: false };
- const log = saveWorkerLog(journal.path, map.repo, node.ref.id, ctx.generation, `${label}: supervisor tests (${testCommand})`, tests);
+ let tests = await runShell(testCommand, worktree, ctx, { label: `${label}: supervisor tests`, timeoutMs: TEST_TIMEOUT_MS });
+ if (tests.code === 0) return { tests, retried: false };
  if ((await headSha(worktree)) !== head) {
   journal.recordEvent("reviewed", {
    nodeId: node.ref.id,
    repo: map.repo,
    detail: `tests (${testCommand}) failed and moved HEAD — not retried`,
   });
-  return { tests, log, retried: false };
+  return { tests, retried: false };
  }
- const retry = await retryOnBusyHost(ctx, testCommand, head, `tests (${testCommand})`, "the test retry");
- if (retry === null) return { tests, log, retried: false };
+ const retry = await retryOnBusyHost(ctx, testCommand, head, `tests (${testCommand})`, "the test retry", `${label}: supervisor test retry`);
+ if (retry === null) return { tests, retried: false };
  tests = retry;
  if (tests.code === 0 && (await headSha(worktree)) !== head) {
   tests = { ...tests, code: 1, stderr: `the retry passed at ${head.slice(0, 8)}, but the worktree moved off it meanwhile\n${tests.stderr}` };
  }
  if (tests.code === 0) {
   journal.recordEvent("reviewed", { nodeId: node.ref.id, repo: map.repo, detail: `tests (${testCommand}) passed on the retry in a fresh checkout` });
-  return { tests, log, retried: true };
+  return { tests, retried: true };
  }
- saveWorkerLog(journal.path, map.repo, node.ref.id, ctx.generation, `${label}: supervisor test retry in a fresh checkout (${testCommand})`, tests);
- return { tests, log, retried: false };
+ return { tests, retried: false };
 }
 
 /**
@@ -1562,6 +1622,7 @@ async function retryOnBusyHost(
  sha: string,
  what: string,
  run: string,
+ label: string,
 ): Promise<RunResult | null> {
  const host = (ctx.hostLoad ?? realHostLoad)();
  if (host.load < host.cores) return null;
@@ -1571,7 +1632,7 @@ async function retryOnBusyHost(
   detail: `${what} failed on a busy host (load ${host.load.toFixed(1)} on ${host.cores} cores) — retrying once, in a fresh checkout of ${sha.slice(0, 8)}, when it quiets`,
  });
  await awaitQuietHost(ctx, run);
- return testsInFreshCheckout(ctx, testCommand, sha);
+ return testsInFreshCheckout(ctx, testCommand, sha, label);
 }
 
 /**
@@ -1591,7 +1652,7 @@ async function restoreWorktree(ctx: ImplementContext, sha: string): Promise<stri
   if (r.code !== 0) return `could not restore the worktree to ${sha.slice(0, 8)} (git ${args[0]}): ${r.stderr.trim()}`;
  }
  if (map.commands.install !== undefined) {
-  const install = await runShell(map.commands.install, worktree, ctx, INSTALL_TIMEOUT_MS);
+  const install = await runShell(map.commands.install, worktree, ctx, { label: "restoring the worktree: install", timeoutMs: INSTALL_TIMEOUT_MS });
   if (install.code !== 0) return `install (${map.commands.install}) after restoring the worktree exited ${install.code}: ${tail(install)}`;
  }
  if ((await headSha(worktree)) !== sha || (await dirtyFiles(worktree)).length > 0) {
@@ -1614,7 +1675,7 @@ async function restoreWorktree(ctx: ImplementContext, sha: string): Promise<stri
  * from the node's repository. Every git call here also refuses replacement
  * objects.
  */
-async function testsInFreshCheckout(ctx: ImplementContext, testCommand: string, sha: string): Promise<RunResult> {
+async function testsInFreshCheckout(ctx: ImplementContext, testCommand: string, sha: string, label: string): Promise<RunResult> {
  const scratch = mkdtempSync(join(tmpdir(), "ranger-test-retry-"));
  const dir = join(scratch, "checkout");
  const failed = (why: string): RunResult => ({ code: 1, stdout: "", stderr: why });
@@ -1631,10 +1692,10 @@ async function testsInFreshCheckout(ctx: ImplementContext, testCommand: string, 
   const checkout = await git(["-c", "advice.detachedHead=false", "checkout", "--quiet", "--detach", sha], dir, 120_000);
   if (checkout.code !== 0) return failed(`could not check out ${sha.slice(0, 8)} for the retry: ${checkout.stderr.trim()}`);
   if (ctx.map.commands.install !== undefined) {
-   const install = await runShell(ctx.map.commands.install, dir, ctx, INSTALL_TIMEOUT_MS);
+   const install = await runShell(ctx.map.commands.install, dir, ctx, { label: `${label}: install in a fresh checkout`, timeoutMs: INSTALL_TIMEOUT_MS });
    if (install.code !== 0) return { ...install, stderr: `install for the retry failed\n${install.stderr}` };
   }
-  const tests = await runShell(testCommand, dir, ctx, TEST_TIMEOUT_MS);
+  const tests = await runShell(testCommand, dir, ctx, { label: `${label}: tests in a fresh checkout`, timeoutMs: TEST_TIMEOUT_MS });
   // A sanity check on the run, not proof against the commit's own scripts
   // (see supervisorTests): install and the tests should leave the commit's
   // tracked content as committed — no new HEAD, no modified tracked file,
@@ -1684,17 +1745,11 @@ async function adoptBuiltWork(ctx: ImplementContext, testCommand: string): Promi
  // not be what makes the adopted commit pass. A failure on a busy host gets
  // the same one retry as any supervisor test run, or a load flake would hand
  // finished work back to a worker with nothing left to commit.
- let tests = await testsInFreshCheckout(ctx, testCommand, sha);
+ // Each attempt keeps its own output in the worker log, the retry's included.
+ let tests = await testsInFreshCheckout(ctx, testCommand, sha, "adopted build: supervisor tests");
  if (tests.code !== 0) {
-  // Each failed attempt keeps its own output, the retry's included.
-  saveWorkerLog(journal.path, map.repo, node.ref.id, ctx.generation, `adopted build: supervisor tests in a fresh checkout (${testCommand})`, tests);
-  const retry = await retryOnBusyHost(ctx, testCommand, sha, "adoption tests", "the adoption test retry");
-  if (retry !== null) {
-   tests = retry;
-   if (tests.code !== 0) {
-    saveWorkerLog(journal.path, map.repo, node.ref.id, ctx.generation, `adopted build: supervisor test retry in a fresh checkout (${testCommand})`, tests);
-   }
-  }
+  const retry = await retryOnBusyHost(ctx, testCommand, sha, "adoption tests", "the adoption test retry", "adopted build: supervisor test retry");
+  if (retry !== null) tests = retry;
  }
  const clean = await assertGitUntouched(ctx.canonical, snapshot);
  if (tests.code !== 0) {

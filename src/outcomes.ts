@@ -122,19 +122,55 @@ export function probesFailedOutcome(r: {
  failed: string[];
  /** The failed probes that fail at the merge base too (the rest are this branch's). */
  redOnBase?: string[];
+ /** `probeFailureSummary` of the run: each failed probe's kind and checks, ahead of the tail. */
+ summary?: string[];
  tail: string;
 }): string {
  const names = r.failed.filter((n) => PROBE_FILE.test(n));
  const onBase = (r.redOnBase ?? []).filter((n) => PROBE_FILE.test(n));
+ const summary = r.summary ?? [];
  return [
   `browser probes failed twice at ${r.sha.slice(0, 8)} on PR #${r.pr} (exit ${r.exit})`,
   ...(names.length > 0 ? [`FAILED: ${names.join(" · ")}`] : []),
   ...(onBase.length > 0 ? [`red on the merge base too: ${onBase.join(" · ")}`] : []),
+  // After the names and the base line, and capped: the row keeps 400 characters of the outcome.
+  ...(summary.length > 0 ? [`failing: ${summary.join(" · ")}`.slice(0, 160)] : []),
   r.tail,
  ].join("\n");
 }
 
 export const PROBES_FAILED_OUTCOME = /^browser probes failed twice\b/;
+
+/** At most this many probes are named in a summary, each in at most this many characters. */
+const SUMMARY_PROBES = 20;
+const SUMMARY_LINE = 300;
+
+/**
+ * A failed probe run, named (node #107): each failed probe with its failure
+ * kind and the checks it failed, for the head of a PR record or journal line.
+ * A tail of the output can hold only passing probes (2026-10-05: seelite
+ * #702's record reached 113/114 and omitted the failing check). A run that
+ * stopped before naming failures lists the selected probes it had not passed;
+ * one that names nothing ranger reads says so rather than guessing. Empty on
+ * a passing run.
+ */
+export function probeFailureSummary(stdout: string, exit: number): string[] {
+ if (exit === 0) return [];
+ const runs = parseFailedChecks(stdout);
+ const names = [...new Set([...runs.keys(), ...parseFailedProbes(stdout)])];
+ if (names.length === 0) {
+  const unfinished = unfinishedProbes(stdout);
+  return unfinished.length > 0
+   ? [`stopped (exit ${exit}) before passing ${unfinished.slice(0, SUMMARY_PROBES).join(", ")}`.slice(0, SUMMARY_LINE)]
+   : [`names unavailable: the run (exit ${exit}) printed no failing probe names ranger reads`];
+ }
+ const lines = names.slice(0, SUMMARY_PROBES).map((name) => {
+  const run = runs.get(name);
+  const checks = run === undefined || run.checks.size === 0 ? "" : `: ${[...run.checks].join("; ")}`;
+  return `${name} (${run?.kind ?? "kind not printed"})${checks}`.slice(0, SUMMARY_LINE);
+ });
+ return names.length > SUMMARY_PROBES ? [...lines, `and ${names.length - SUMMARY_PROBES} more`] : lines;
+}
 
 /**
  * A hook (soma's runtime-policy guard, in practice) stopped a worker session
