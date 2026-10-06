@@ -971,27 +971,27 @@ async function runResearch(
   // with no terminal outcome (round-38 review): the node IS closed (the
   // graph binds the resolution), so the worker is finalized as terminal
   // success regardless, with the decisions failure surfaced loudly in the
-  // event log + worker outcome instead of silently dropping it.
-  let decisionsDetail = "decisions --write after confirmed close";
+  // event log instead of silently dropping it. A failed write records
+  // decisions-failed only, never decisions-written too (node #108).
   try {
    fence("write decisions");
    await graphDecisions(repo, String(map.root), token, {
     cwd: probeCwd,
     timeoutMs: GRAPH_CALL_TIMEOUT_MS,
    });
+   journal.recordEvent("decisions-written", {
+    nodeId,
+    repo,
+    detail: "decisions --write after confirmed close",
+   });
   } catch (decisionsError) {
-   decisionsDetail = `decisions --write FAILED after close: ${decisionsError instanceof Error ? decisionsError.message : String(decisionsError)}`;
+   const detail = `decisions --write FAILED after close: ${decisionsError instanceof Error ? decisionsError.message : String(decisionsError)}`;
    journal.recordEvent("decisions-failed", {
     nodeId,
     repo,
-    detail: decisionsDetail.slice(0, 400),
+    detail: detail.slice(0, 400),
    });
   }
-  journal.recordEvent("decisions-written", {
-   nodeId,
-   repo,
-   detail: decisionsDetail.slice(0, 400),
-  });
   finish(journal, nodeId, repo, "success", close.detail);
   return {
    ...base,

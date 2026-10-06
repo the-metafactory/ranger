@@ -406,9 +406,56 @@ describe("ranger run-node — research worker full loop (node #13 acceptance)", 
    const kinds = journal.listEvents("acme/widgets").map((e) => e.kind);
    expect(kinds).toContain("worker-start");
    expect(kinds).toContain("closed");
-   expect(kinds).toContain("decisions-written");
+   expect(kinds.filter((k) => k === "decisions-written")).toHaveLength(1);
+   expect(kinds).not.toContain("decisions-failed");
    expect(journal.getWorker("10", "acme/widgets")?.status).toBe("success");
    expect(journal.getWorker("10", "acme/widgets")?.prNumber).toBe(31);
+   journal.close();
+  } finally {
+   rmSync(dir, { recursive: true, force: true });
+  }
+ }, 10_000);
+
+ // Node #108: a failed map-index write records decisions-failed only; the
+ // close stands and the worker still finishes as success.
+ test("a failed decisions write after the close records decisions-failed and no decisions-written", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ranger-run-decisions-fail-"));
+  try {
+   const { origin } = await createCanonicalRepo(dir);
+   const config = writeConfig(dir);
+   const statePath = writeState(dir, {
+    "10": { ...RESEARCH_NODE_STATE, assignees: ["ivy-bot"] },
+   });
+   const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    ...GIT_ENV,
+    PATH: `${fixturesBin}:${process.env.PATH ?? ""}`,
+    FAKE_SOMA_DIR: dataDir,
+    FAKE_SOMA_STATE: statePath,
+    FAKE_SOMA_REPO_DIR: origin,
+    FAKE_SOMA_DECISIONS_FAIL: "1",
+    RANGER_WRITE_TEST: "ghp_write",
+    RANGER_WORKER_CMD: join(fixturesBin, "worker"),
+    RANGER_DISCORD_TOKEN: "unused",
+   };
+
+   const result = await runCli(
+    ["run-node", "10", "--map", "acme/widgets", "-c", config],
+    env,
+   );
+   expect(result.code).toBe(0);
+   expect(JSON.parse(result.stdout).status).toBe("success");
+   expect(JSON.parse(readFileSync(statePath, "utf8")).nodes["10"].status).toBe("closed");
+
+   const journal = new Journal(join(dir, "state.sqlite"));
+   const events = journal.listEvents("acme/widgets");
+   const kinds = events.map((e) => e.kind);
+   expect(kinds).toContain("closed");
+   expect(kinds).not.toContain("decisions-written");
+   const failed = events.filter((e) => e.kind === "decisions-failed");
+   expect(failed).toHaveLength(1);
+   expect(failed[0]?.detail).toContain("HTTP 504");
+   expect(journal.getWorker("10", "acme/widgets")?.status).toBe("success");
    journal.close();
   } finally {
    rmSync(dir, { recursive: true, force: true });

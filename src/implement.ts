@@ -1476,18 +1476,19 @@ async function closeAfterMerge(
  }
  journal.recordEvent("closed", { nodeId, repo, detail: close.detail.slice(0, 400) });
 
- let decisionsDetail = "decisions --write after confirmed close";
+ // Best-effort: a failed write records decisions-failed only, never
+ // decisions-written too (node #108), and the close outcome stands.
  try {
   journal.assertGeneration(nodeId, ctx.map.repo, ctx.generation, "write decisions");
   await graphDecisions(repo, String(map.root), token, {
    cwd: ctx.canonical,
    timeoutMs: GRAPH_CALL_TIMEOUT_MS,
   });
+  journal.recordEvent("decisions-written", { nodeId, repo, detail: "decisions --write after confirmed close" });
  } catch (error) {
-  decisionsDetail = `decisions --write FAILED after close: ${error instanceof Error ? error.message : String(error)}`;
-  journal.recordEvent("decisions-failed", { nodeId, repo, detail: decisionsDetail.slice(0, 400) });
+  const detail = `decisions --write FAILED after close: ${error instanceof Error ? error.message : String(error)}`;
+  journal.recordEvent("decisions-failed", { nodeId, repo, detail: detail.slice(0, 400) });
  }
- journal.recordEvent("decisions-written", { nodeId, repo, detail: decisionsDetail.slice(0, 400) });
 
  // The merged branch's worktree is ranger's scratch; drop it.
  await safeGit(["worktree", "remove", "--force", ctx.worktree], {
