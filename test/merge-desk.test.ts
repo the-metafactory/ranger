@@ -39,7 +39,7 @@ function fakeGitHub(opts: { head?: string; comments: IssueComment[]; ci: CheckRu
   getPr: async (_repo, number) => {
    calls.push("getPr");
    return {
-    number, state: "open", merged: false, draft: false, title: "Fix the deploy (node #96)",
+    number, state: "open", merged: false, draft: false, title: "Repair the deploy step (node #96)",
     headRef: "node/96", headSha: opts.head ?? CERTIFIED, baseRef: "main",
     mergeable: true, mergeableState: "clean", mergeCommitSha: null, mergedBy: null, url: "", author: BOT,
    } satisfies PullRequest;
@@ -117,12 +117,13 @@ describe("node #104 — ci-only-park-merges-without-lane: a CI-only park merges 
   } finally { r.close(); }
  });
 
- const stays: [string, Parameters<typeof fakeGitHub>[0], { probe?: boolean }?][] = [
+ const stays: [string, Parameters<typeof fakeGitHub>[0], Parameters<typeof rig>[0]?][] = [
   ["the head moved since certification", { head: MOVED, comments: [review(CERTIFIED)], ci: GREEN }],
   ["CI cancelled again", { comments: [review(CERTIFIED)], ci: [{ id: 8, name: "deploy", status: "completed", conclusion: "cancelled" } as CheckRun] }],
   ["CI failing", { comments: [review(CERTIFIED)], ci: [{ id: 9, name: "build", status: "completed", conclusion: "failure" } as CheckRun] }],
   ["CI rerun still running", { comments: [review(CERTIFIED)], ci: [{ id: 10, name: "deploy", status: "in_progress", conclusion: null } as CheckRun] }],
   ["the node is labelled ranger:needs-eye", { comments: [review(CERTIFIED)], ci: GREEN, labels: ["ranger:needs-eye"] }],
+  ["the node is labelled ranger:needs-eye on a manual map", { comments: [review(CERTIFIED)], ci: GREEN, labels: ["ranger:needs-eye"] }, { autoMerge: false }],
   ["no review recorded at the head", { comments: [], ci: GREEN }],
   ["the review at the head still has a major", { comments: [review(CERTIFIED, 0, 1)], ci: GREEN }],
   ["no probe certification at the head", { comments: [review(CERTIFIED)], ci: GREEN }, { probe: true }],
@@ -145,8 +146,8 @@ describe("node #104 — ci-only-park-merges-without-lane: a CI-only park merges 
   });
  }
 
- test("a failed label read leaves the row parked and reports the error", async () => {
-  const r = rig();
+ for (const autoMerge of [true, false]) test(`a failed label read leaves the row parked and reports the error (autoMerge=${autoMerge})`, async () => {
+  const r = rig({ autoMerge });
   try {
    const gh = fakeGitHub({ comments: [review(CERTIFIED)], ci: GREEN });
    gh.github.issueLabels = async () => { throw new Error("502 from GitHub"); };
