@@ -176,8 +176,9 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   const comments = await github.listComments(repo, pr.number, token);
   const reviews = recordedReviews(comments, botIdentity);
   const last = reviewAtHead(reviews, pr.headSha);
-  // A clean round that set aside an older same-head major is named on the
-  // merge notice and card (node #106): the reviewer may have missed it.
+  // A clean round that set aside an older same-head major (node #106): the
+  // reviewer may have missed it, so auto-merge holds and the manual card
+  // names it for the principal to check before merging.
   const superseded = supersededNote(reviews, pr.headSha);
   const probe = recordedProbes(comments, botIdentity).find(
    (p) => p.sha === pr.headSha && p.passed,
@@ -298,12 +299,12 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    });
    if (row.mergeMessageId !== null) return; // its card is still up
   }
-  if (map.autoMerge && !needsEye) {
+  if (map.autoMerge && !needsEye && superseded === null) {
    await github.mergePr(repo, pr.number, gate.headSha, pr.title, token);
    journal.recordEvent("merged", {
     nodeId: row.nodeId,
     repo,
-    detail: `PR #${pr.number} squash-merged by ranger at ${gate.headSha.slice(0, 8)} (no ${NEEDS_EYE_LABEL} label; standing grant 2026-10-03)${superseded !== null ? `; ${superseded}` : ""}`,
+    detail: `PR #${pr.number} squash-merged by ranger at ${gate.headSha.slice(0, 8)} (no ${NEEDS_EYE_LABEL} label; standing grant 2026-10-03)`,
    });
    result.merged.push(row.nodeId);
    try {
@@ -311,7 +312,6 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
      [
       `:ranger: **merged** #${row.nodeId} — ${title}`,
       `Gate passed at \`${gate.headSha.slice(0, 8)}\` (CI, mergeable, sage 0 blockers / 0 majors${probesRequired ? ", probes" : ""}); squash-merged by ranger. The node closes through the gate next.`,
-      ...(superseded !== null ? [`Note: ${superseded}.`] : []),
      ].join("\n"),
      `merge notice for #${row.nodeId}`,
     );
@@ -332,13 +332,15 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
     `:ranger: **merge needed** #${row.nodeId} — ${title}`,
     `map: ${mapKey(map)}`,
     `Gate passed at \`${gate.headSha.slice(0, 8)}\`: CI green, mergeable, base \`${map.base}\`, sage ${last?.round ?? "?"} round(s), the last with 0 blockers and 0 majors (machine evidence, not a sign-off).`,
-    ...(superseded !== null ? [`Note: ${superseded}; the reviewer may have missed it, check before you merge.`] : []),
+    ...(superseded !== null
+     ? [`Note: ${superseded}; the reviewer may have missed it, check before you merge.${map.autoMerge ? " Auto-merge is held on this head for that reason." : ""}`]
+     : []),
     ...(probesRequired
      ? [`Probes passed at \`${gate.headSha.slice(0, 8)}\` (selection ${probe?.mode ?? "?"}, ${probe?.selected ?? "?"} probe(s)). Only the selected probes ran, not the full suite.${baseRedNote(probe)}`]
      : ["No probe tier on this map: CI and the tests are the only automated checks."]),
     needsEye
      ? `Labelled \`${NEEDS_EYE_LABEL}\`: your eye is the check. Merge it by hand (squash); ranger closes the node after the merge.`
-     : "Merge it by hand (squash). For a `propose` node your merge is the ratification. Ranger closes the node after the merge; it never merges itself.",
+     : `Merge it by hand (squash). For a \`propose\` node your merge is the ratification. Ranger closes the node after the merge; ${map.autoMerge ? "it does not merge this one itself" : "it never merges itself"}.`,
    ].join("\n");
   let evidence: Awaited<ReturnType<typeof viewsCard>> | undefined;
   if (needsEye && map.commands.views) {

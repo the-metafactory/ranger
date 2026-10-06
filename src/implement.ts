@@ -215,8 +215,9 @@ export function recordedReviews(
  * and miss it in the next, and the newer, clean round then stands. The
  * marker carries no error or completeness field, so this cannot tell an
  * errored lens from a real finding. `supersededAtHead` names every major a
- * clean round set aside, and the journal, the merge card and the merge
- * notice carry it, so the principal sees each one.
+ * clean round set aside; the journal carries it, and the merge desk holds
+ * auto-merge on such a head and posts the manual merge card naming it, so
+ * the principal checks the set-aside major before the PR can merge.
  *
  * Only the machine account's markers are recorded (recordedReviews), so a
  * third party cannot post the round that clears a head. Older reviews stay
@@ -230,29 +231,31 @@ export function reviewAtHead<R extends { round: number; sha: string }>(reviews: 
  return standing;
 }
 
+/** The fields that decide whether a review gates its head. */
+type GatedReview = { round: number; sha: string; blockers: number; majors: number };
+
+/** The review standing at `sha` and the older gating ones a clean standing review sets aside, oldest first. */
+function setAsideAtHead<R extends GatedReview>(reviews: R[], sha: string): { standing: R | undefined; older: R[] } {
+ const standing = reviewAtHead(reviews, sha);
+ if (standing === undefined || gatingFindings(standing) > 0) return { standing, older: [] };
+ const older = reviews
+  .filter((r) => r !== standing && r.sha === sha && gatingFindings(r) > 0)
+  .sort((a, b) => a.round - b.round);
+ return { standing, older };
+}
+
 /**
  * The older reviews at `sha` whose blockers or majors the clean review
  * standing there sets aside, oldest first. Empty when the standing review
  * gates itself, or when no older round at the head had a gating finding.
  */
-export function supersededAtHead<R extends { round: number; sha: string; blockers: number; majors: number }>(
- reviews: R[],
- sha: string,
-): R[] {
- const standing = reviewAtHead(reviews, sha);
- if (standing === undefined || gatingFindings(standing) > 0) return [];
- return reviews
-  .filter((r) => r !== standing && r.sha === sha && gatingFindings(r) > 0)
-  .sort((a, b) => a.round - b.round);
+export function supersededAtHead<R extends GatedReview>(reviews: R[], sha: string): R[] {
+ return setAsideAtHead(reviews, sha).older;
 }
 
 /** One line naming the gating findings a clean same-head round set aside; null when none. */
-export function supersededNote<R extends { round: number; sha: string; blockers: number; majors: number }>(
- reviews: R[],
- sha: string,
-): string | null {
- const older = supersededAtHead(reviews, sha);
- const standing = reviewAtHead(reviews, sha);
+export function supersededNote<R extends GatedReview>(reviews: R[], sha: string): string | null {
+ const { standing, older } = setAsideAtHead(reviews, sha);
  if (older.length === 0 || standing === undefined) return null;
  const rounds = older.map((r) => `round ${r.round} (${r.blockers} blocker(s), ${r.majors} major(s))`).join(", ");
  return `sage ${rounds} at ${sha.slice(0, 8)} superseded by the clean round ${standing.round} at the same head (no code change between them)`;
@@ -759,12 +762,18 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
   (await github.getPr(repo, open.number, token)).headSha,
  );
  const capNow = () => config.workers.reviewRounds + baseMerges;
+ // The head whose set-aside major is already journaled: once per head per
+ // run, as the loop re-reads an unchanged head on every pass.
+ let notedSha: string | undefined;
  for (;;) {
   const cap = capNow();
   const live = await github.getPr(repo, open.number, token);
   let current = reviewAtHead(reviews, live.headSha);
   const superseded = supersededNote(reviews, live.headSha);
-  if (superseded !== null) journal.recordEvent("reviewed", { nodeId, repo, detail: superseded });
+  if (superseded !== null && notedSha !== live.headSha) {
+   journal.recordEvent("reviewed", { nodeId, repo, detail: superseded });
+   notedSha = live.headSha;
+  }
   if (current === undefined) {
    if (reviews.length >= cap) {
     throw new ParkSignal(reviewCapHeadMovedOutcome({ rounds: reviews.length, pr: open.number }));
