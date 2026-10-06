@@ -848,8 +848,15 @@ describe("implement lane (node #23)", () => {
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
   await r.github.merge(1);
   r.journal.updateWorker("20", "acme/widgets", { status: "running" });
+  // Scoped to this run: the finally removes it, and afterEach restores
+  // process.env from savedEnv besides, so no later test sees a failing write.
   process.env.FAKE_SOMA_DECISIONS_FAIL = "1";
-  const closed = await runNode("20", r.ctx);
+  let closed: Awaited<ReturnType<typeof runNode>>;
+  try {
+   closed = await runNode("20", r.ctx);
+  } finally {
+   delete process.env.FAKE_SOMA_DECISIONS_FAIL;
+  }
   expect(closed.status).toBe("success");
   expect(state(r.statePath).nodes["20"].status).toBe("closed");
   expect(r.journal.getWorker("20", "acme/widgets")?.status).toBe("success");
