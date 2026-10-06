@@ -159,9 +159,9 @@ describe("review markers (F2 resume record)", () => {
 });
 
 describe("node #106 — newest-same-head-review-wins: the newest review at a head is the one that stands", () => {
- const at = (round: number, sha: string, majors: number) => ({
+ const at = (round: number, sha: string, majors: number, author = "ivy-bot") => ({
   id: round,
-  author: "ivy-bot",
+  author,
   body: `${reviewMarker(round, { verdict: "commented", summary: "", commitId: sha, blockers: 0, majors, nits: 0, body: "" })}\nround ${round}`,
  });
  test("rounds 12 (1 major) and 13 (clean) on one head: round 13 stands, in either comment order", () => {
@@ -172,6 +172,23 @@ describe("node #106 — newest-same-head-review-wins: the newest review at a hea
  test("a genuine major in the newest review at the head still stands (the gate holds)", () => {
   const current = reviewAtHead(recordedReviews([at(12, SHA, 0), at(13, SHA, 1)], "ivy-bot"), SHA);
   expect(current).toMatchObject({ round: 13, majors: 1 });
+ });
+ test("by design, a genuine major in an older round is cleared by a newer clean review of the same head", () => {
+  // The marker cannot tell an errored lens from a real finding: the newer
+  // review read identical code, and its verdict is the one that stands.
+  const current = reviewAtHead(recordedReviews([at(12, SHA, 1), at(13, SHA, 0)], "ivy-bot"), SHA);
+  expect(current).toMatchObject({ round: 13, majors: 0 });
+ });
+ test("a clean newer round posted by anyone but the machine account never clears the head", () => {
+  const current = reviewAtHead(recordedReviews([at(12, SHA, 1), at(13, SHA, 0, "mallory")], "ivy-bot"), SHA);
+  expect(current).toMatchObject({ round: 12, majors: 1 });
+ });
+ test("unsorted input: the highest round at the head stands, whatever the array order", () => {
+  const reviews = [{ round: 13, sha: SHA }, { round: 11, sha: SHA }, { round: 12, sha: SHA }, { round: 14, sha: OTHER }];
+  expect(reviewAtHead(reviews, SHA)).toMatchObject({ round: 13 });
+  // A tied round falls to the later one in the input.
+  const tied = [{ round: 5, sha: SHA, tag: "first" }, { round: 5, sha: SHA, tag: "second" }];
+  expect(reviewAtHead(tied, SHA)?.tag).toBe("second");
  });
  test("selection by head is unchanged: another head's newer round never stands here", () => {
   const reviews = recordedReviews([at(1, OTHER, 1), at(2, SHA, 0), at(3, OTHER, 0)], "ivy-bot");

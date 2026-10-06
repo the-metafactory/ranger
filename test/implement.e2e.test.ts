@@ -14,7 +14,7 @@ import { join } from "node:path";
 import { loadConfig } from "../src/config.ts";
 import { runCmd } from "../src/exec.ts";
 import type { CheckRun, IssueComment, PullRequest } from "../src/github.ts";
-import { baseMergeMarker, recordedBaseMerges, reviewMarker, type GitHubPort } from "../src/implement.ts";
+import { baseMergeMarker, recordedBaseMerges, recordedReviews, reviewMarker, type GitHubPort } from "../src/implement.ts";
 import { Database } from "bun:sqlite";
 import { openJournal, type Journal } from "../src/journal.ts";
 import { ReviewError, type ReviewVerdict } from "../src/review.ts";
@@ -1519,7 +1519,7 @@ describe("implement lane (node #23)", () => {
    expect(r.calls).toHaveLength(1); // round 2 was read back, not re-run
    expect(r.journal.getWorker("20", "acme/widgets")).toMatchObject({ reviewRound: 2, verdictSha: head });
    // History intact: round 1 still stands on the PR, unchanged.
-   const rounds = (r.github.comments.get(1) ?? []).map((c) => c.body.match(/ranger:review round=(\d+) sha=\w+ blockers=0 majors=(\d)/)?.slice(1, 3).join(":")).filter(Boolean);
+   const rounds = recordedReviews(r.github.comments.get(1) ?? [], BOT).map((x) => `${x.round}:${x.majors}`);
    expect(rounds).toEqual(["1:1", `2:${majors}`]);
   }, 60_000);
  }

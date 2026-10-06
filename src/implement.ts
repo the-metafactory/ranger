@@ -200,17 +200,23 @@ export function recordedReviews(
 }
 
 /**
- * The review that stands at `sha`: the newest recorded one (highest round;
- * on a tied round the later comment, since the sort is stable). A later
- * complete review on the same head supersedes an earlier one, so an errored
- * round no longer pins the head to its findings. Older reviews stay in the
+ * The review that stands at `sha`: the one with the highest round among the
+ * reviews of that head (a tied round falls to the later one in the input),
+ * whatever the earlier rounds there found, a genuine major included. A round
+ * on the same head re-reviews identical code, so the newest verdict is the
+ * reviewer's current word on it; an errored round no longer pins the head.
+ * The marker carries no error or completeness field, so this cannot tell an
+ * errored lens from a real finding (the review-budget node's question). Only
+ * the machine account's markers are recorded (recordedReviews), so a third
+ * party cannot post the round that clears a head. Older reviews stay in the
  * record untouched.
  */
 export function reviewAtHead<R extends { round: number; sha: string }>(reviews: R[], sha: string): R | undefined {
- for (let i = reviews.length - 1; i >= 0; i -= 1) {
-  if (reviews[i].sha === sha) return reviews[i];
+ let standing: R | undefined;
+ for (const r of reviews) {
+  if (r.sha === sha && (standing === undefined || r.round >= standing.round)) standing = r;
  }
- return undefined;
+ return standing;
 }
 
 export { parseFailedProbes };
