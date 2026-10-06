@@ -1034,7 +1034,7 @@ describe("implement lane (node #23)", () => {
   expect(r.announced).toEqual([]);
   expect(calls.filter((c) => c.cwd.includes("ranger-probe-base-"))).toEqual([]);
   const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
-  expect(events.some((d) => d.includes("probe-hud.mjs crashed, were killed or timed out at the head") && d.includes("they gate"))).toBe(true);
+  expect(events.some((d) => d.includes("probe-hud.mjs ended in a crash, kill, timeout or an unreadable kind at the head") && d.includes("they gate"))).toBe(true);
   expect(events.some((d) => d.includes("the merge-base probe run"))).toBe(false);
  }, 60_000);
 
@@ -1050,7 +1050,7 @@ describe("implement lane (node #23)", () => {
   expect(r.announced).toEqual([]);
   expect(calls.filter((c) => c.cwd.includes("ranger-probe-base-"))).toEqual([]);
   const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
-  expect(events.some((d) => d.includes("probe-hud.mjs, probe-weapon.mjs crashed, were killed or timed out at the head"))).toBe(true);
+  expect(events.some((d) => d.includes("probe-hud.mjs, probe-weapon.mjs ended in a crash, kill, timeout or an unreadable kind at the head"))).toBe(true);
   expect(events.some((d) => d.includes("the merge-base probe run"))).toBe(false);
  }, 60_000);
 
@@ -1066,7 +1066,7 @@ describe("implement lane (node #23)", () => {
   const base = calls.filter((c) => c.cwd.includes("ranger-probe-base-")).map((c) => c.command);
   expect(base).toEqual(["fake-probe mixed 20 probe-hud.mjs"]);
   const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
-  expect(events.some((d) => d.includes("probe-hud.mjs fail at the merge base") && d.includes("probe-weapon.mjs crashed, were killed or timed out at the head"))).toBe(true);
+  expect(events.some((d) => d.includes("probe-hud.mjs fail at the merge base") && d.includes("probe-weapon.mjs ended in a crash, kill, timeout or an unreadable kind at the head"))).toBe(true);
  }, 60_000);
 
  test("a failure whose kind the runner did not print fails closed: it gates without a merge-base run", async () => {
@@ -1078,7 +1078,7 @@ describe("implement lane (node #23)", () => {
   expect(r.announced).toEqual([]);
   expect(calls.filter((c) => c.cwd.includes("ranger-probe-base-"))).toEqual([]);
   const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
-  expect(events.some((d) => d.includes("probe-hud.mjs crashed, were killed or timed out at the head"))).toBe(true);
+  expect(events.some((d) => d.includes("probe-hud.mjs ended in a crash, kill, timeout or an unreadable kind at the head"))).toBe(true);
  }, 60_000);
 
  test("a probe the base does not have gates: nothing to compare it with", async () => {

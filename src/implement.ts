@@ -436,18 +436,18 @@ function baseProbeDetail(b: BaseProbeResult): string {
   b.passed.length > 0 ? `${b.passed.join(", ")} pass at ${at} — the failure is this branch's` : null,
   b.changed.length > 0 ? `${b.changed.join(", ")} are new or changed on this branch — they gate` : null,
   b.uncomparable.length > 0
-   ? `${b.uncomparable.join(", ")} crashed, were killed or timed out at the head — not run at ${at}, they gate`
+   ? `${b.uncomparable.join(", ")} ended in a crash, kill, timeout or an unreadable kind at the head — not run at ${at}, they gate`
    : null,
  ].filter((part) => part !== null).join("; ");
 }
 
 /**
- * A head failure the merge base could share: a completed assertion failure
- * that names its checks. A crash, kill or timeout is a failure of its own, and
- * a kind the runner did not print or ranger does not know fails closed.
+ * A head failure the merge base could share: a completed assertion failure.
+ * A crash, kill or timeout is a failure of its own, and a kind the runner did
+ * not print or ranger does not know fails closed.
  */
 function inheritable(run: FailedProbeRun | undefined): run is FailedProbeRun {
- return run !== undefined && run.kind === "assert" && run.checks.size > 0;
+ return run !== undefined && run.kind === "assert";
 }
 
 /** File names (no directory) in git's newline-separated path output. */
@@ -511,7 +511,7 @@ async function probeMergeBase(
    const here = headChecks.get(probe);
    const there = baseChecks.get(probe);
    if (!inheritable(here) || there === undefined || there.kind !== "assert") return false;
-   return [...here.checks].every((check) => there.checks.has(check));
+   return here.checks.size > 0 && [...here.checks].every((check) => there.checks.has(check));
   };
   const redThere = comparable.filter((n) => named.includes(n));
   return {
