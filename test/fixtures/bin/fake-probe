@@ -6,8 +6,11 @@
 # branch-red → probe-hud.mjs fails only where the worker's src/feature.ts exists
 # (the branch, not its base); branch-other → it fails everywhere, but on the
 # branch a different check fails too; branch-crash → it fails the same check
-# everywhere, but on the branch the probe then crashes. Failures print the
-# seelite runner's layout.
+# everywhere, but on the branch the probe then crashes; crash → probe-hud.mjs
+# and probe-weapon.mjs crash everywhere; mixed → probe-hud.mjs fails the same
+# check everywhere and probe-weapon.mjs crashes; no-kind → probe-hud.mjs fails
+# under a header that names no failure kind. Failures print the seelite
+# runner's layout.
 # Refuses (exit 3) when a ranger credential leaked into its env.
 set -euo pipefail
 if [ -n "${GH_TOKEN:-}" ] || [ -n "${GIT_CONFIG_VALUE_0:-}" ] || [ -n "${RANGER_WRITE_TEST:-}" ]; then
@@ -36,6 +39,15 @@ case "$mode" in
     kind=assert; if [ -f src/feature.ts ]; then kind=crash; fi
     printf 'FAIL probe-hud.mjs (0.1s) exit=1 %s peak load 1.0\n     │  FAIL  the hud draws — {"drawn":false}\n' "$kind"
     echo "FAILED: probe-hud.mjs"; exit 1 ;;
+  crash)
+    printf 'FAIL probe-hud.mjs (0.1s) exit=1 crash peak load 1.0\nFAIL probe-weapon.mjs (0.1s) exit=1 crash peak load 1.0\nFAILED: probe-hud.mjs · probe-weapon.mjs\n'
+    exit 1 ;;
+  mixed)
+    printf 'FAIL probe-hud.mjs (0.1s) exit=1 assert peak load 1.0\n     │  FAIL  the hud draws — {"drawn":false}\nFAIL probe-weapon.mjs (0.1s) exit=1 crash peak load 1.0\nFAILED: probe-hud.mjs · probe-weapon.mjs\n'
+    exit 1 ;;
+  no-kind)
+    printf 'FAIL probe-hud.mjs (0.1s)\n     │  FAIL  the hud draws — {"drawn":false}\nFAILED: probe-hud.mjs\n'
+    exit 1 ;;
   branch-red)
     if [ -f src/feature.ts ]; then printf 'FAIL probe-hud.mjs (0.1s) exit=1 assert peak load 1.0\n     │  FAIL  the hud draws — {"drawn":false}\nFAILED: probe-hud.mjs\n'; exit 1; fi
     echo "node $node: probe-hud.mjs passed"; exit 0 ;;
