@@ -9,9 +9,9 @@ Moving it to `docs/research/` is a follow-up for a build node.
 
 Read at `main` 0c8c7d7 (ranger) and the local soma checkout (`~/work/mf/soma/src`), 2026-10-06.
 
-**Confidence tags.** Every ranger file:line was read this session.
-- **[soma]**: read in soma's source this session.
-- **[docs]**: checked against docs.gitlab.com this session.
+**Confidence tags.** Every ranger file:line was read at authoring (2026-10-06) and re-spot-checked against `main` 0c8c7d7.
+- **[soma]**: read in soma's source at authoring, 2026-10-06.
+- **[docs]**: checked against docs.gitlab.com at authoring, 2026-10-06.
 - **[unverified]**: from memory or inference. Check it before a build node relies on it.
 
 ---
@@ -79,7 +79,7 @@ These four change the shape of the seam. The tables below have the detail.
 | A4 | `src/serve.ts:83`, `src/serve-parked.ts:39` `ID_PATTERN = /^\d+$/`; `src/cli.ts:605` (build-now); `src/implement.ts:269` (`probeCommandFor` refuses non-numeric `{node}`); `src/views.ts:31` | Numeric id guard. It is also an injection guard, because ids reach shell templates and argv. | serve, implement, CLI | Keep a strict pattern, extended to `path#iid` with a strict path charset. Or keep the iid as the local id and add the project path separately. `{node}` substitution should stay digits-only (iid). |
 | A5 | `src/worker.ts:142-144` `worktreeBranch` → `node/<id>-<slug>`; `src/git-ops.ts:221` `NODE_BRANCH = /^node\/\d+-[a-z0-9-]+$/` | Branch naming, and the config-cleanup safety check | implement, research | A located id (`claw/crisis-simulator#12`) is not a valid ref component. Use the iid. Cross-project nodes in one GitLab graph (an epic spanning projects) would make iids collide in the journal (A6). |
 | A6 | journal keyed on `(repo, nodeId)`, e.g. `src/store/schema.ts:82,139`; `mapKey` / `buildNowArgv` split on `#` (`src/serve.ts:495-504`); temp files `ranger-close-${repo.replace("/", "__")}-${nodeId}.md` (`src/implement.ts:1287`, `src/worker.ts:936`) | Keys, cache keys (`frontier:<repo>#<root>`, `src/frontier-cache.ts:52`), file names | all | `#` is soma's GitLab node sigil, so `repo#root` splitting breaks on located ids. `replace("/", "__")` replaces only the first `/`, and a qualified repo adds `:`. Needs one encoding function. |
-| A7 | `src/implement.ts:816`, `src/merge-desk.ts:254` `issueLabels(repo, Number(nodeId))` | Reads the node issue's labels for `ranger:needs-eye` | implement, merge desk | `GET /projects/:id/issues/:iid`, field `labels` (string array). Node project = path part of the located id, which can differ from the MR's project (H2). [unverified: labels on Tasks/work items. Tasks are work items. REST `issues/:iid` covers type `issue`/`task` in recent GitLab. Probe on the GÉANT version.] |
+| A7 | `src/github.ts:286-299` `issueLabels` (`repos/{repo}/issues/{n}/labels`, one page of 100); called at `src/implement.ts:816`, `src/merge-desk.ts:254` `issueLabels(repo, Number(nodeId))` | Reads the node issue's labels for `ranger:needs-eye` | implement, merge desk | `GET /projects/:id/issues/:iid`, field `labels` (string array). Node project = path part of the located id, which can differ from the MR's project (H2). [unverified: labels on Tasks/work items. Tasks are work items. REST `issues/:iid` covers type `issue`/`task` in recent GitLab. Probe on the GÉANT version.] |
 | A8 | `src/serve.ts:474-489` `launchPlan` prompt `soma graph node <id> --repo <owner/name>` | Grilling launch in the principal's checkout | serve | Pass the qualified repo. Soma's `--repo` wants `<forge>:<host>/<path>` unless an origin remote resolves it. |
 | A9 | `src/serve-parked.ts:380` `https://github.com/${repo}/issues/${id}`; `:389`, `src/serve.ts:1357`, `src/implement.ts:1290`, `:1713` PR URL fallbacks | Hand-built URLs | serve, implement | `https://<host>/<path>/-/issues/<iid>`, `/-/merge_requests/<iid>`. Prefer the API's `web_url`. |
 
