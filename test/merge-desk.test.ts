@@ -16,8 +16,8 @@ const CERTIFIED = "a".repeat(40);
 const MOVED = "b".repeat(40);
 const CI_PARK = mergeGateFailedOutcome({ check: "ci-green", reason: "CI failed: deploy=cancelled" });
 
-const review = (sha: string, blockers = 0, majors = 0): IssueComment => ({
- id: 1, author: BOT, body: `<!-- ranger:review round=3 sha=${sha} blockers=${blockers} majors=${majors} nits=0 -->`,
+const review = (sha: string, blockers = 0, majors = 0, round = 3): IssueComment => ({
+ id: 10 + round, author: BOT, body: `<!-- ranger:review round=${round} sha=${sha} blockers=${blockers} majors=${majors} nits=0 -->`,
 });
 const probes = (sha: string): IssueComment => ({
  id: 2, author: BOT, body: probeMarker({ sha, passed: true, selected: "2", mode: "semantic" }),
@@ -199,4 +199,83 @@ describe("node #104 — ci-only-park-merges-without-lane: a CI-only park merges 
    expect(r.journal.getWorker("96", GAME)).toMatchObject({ status: "parked", outcome: CI_PARK });
   } finally { r.close(); }
  });
+});
+
+describe("node #106 — newest-same-head-review-wins: the desk reads the newest review at the head", () => {
+ const SET_ASIDE = `sage round 12 (0 blocker(s), 1 major(s)) at ${CERTIFIED.slice(0, 8)} superseded by the clean round 13 at the same head (no code change between them)`;
+ test("a CI-only park whose round 12 had a major and round 13 is clean goes ready on round 13, auto-merge held for the principal", async () => {
+  const r = rig();
+  try {
+   const gh = fakeGitHub({ comments: [review(CERTIFIED, 0, 1, 12), review(CERTIFIED, 0, 0, 13)], ci: GREEN });
+   const result = await r.desk(gh.github);
+   expect(result).toMatchObject({ cards: ["96"], merged: [], parked: [], errors: [] });
+   expect(gh.merges).toEqual([]);
+   expect(r.spawned).toEqual([]);
+   expect(r.journal.getWorker("96", GAME)?.status).toBe("awaiting-merge");
+   // The set-aside major is named on the card, before any merge.
+   expect(r.posts).toHaveLength(1);
+   expect(r.posts[0]).toContain(`Note: ${SET_ASIDE}; the reviewer may have missed it, check before you merge. Auto-merge is held on this head for that reason.`);
+   expect(r.posts[0]).toContain("it does not merge this one itself");
+   expect(r.events("merge-card").map((e) => e.detail)).toContainEqual(expect.stringContaining(SET_ASIDE));
+   expect(r.events("merged")).toEqual([]);
+  } finally { r.close(); }
+ });
+
+ test("on a manual map the merge card names the major the clean round set aside", async () => {
+  const r = rig({ autoMerge: false });
+  try {
+   const gh = fakeGitHub({ comments: [review(CERTIFIED, 0, 1, 12), review(CERTIFIED, 0, 0, 13)], ci: GREEN });
+   const result = await r.desk(gh.github);
+   expect(result).toMatchObject({ cards: ["96"], merged: [] });
+   expect(r.posts).toHaveLength(1);
+   expect(r.posts[0]).toContain(`Note: ${SET_ASIDE}; the reviewer may have missed it, check before you merge.`);
+   expect(r.posts[0]).not.toContain("Auto-merge is held");
+   expect(r.posts[0]).toContain("it never merges itself");
+   expect(r.events("merge-card").map((e) => e.detail)).toContainEqual(expect.stringContaining(SET_ASIDE));
+  } finally { r.close(); }
+ });
+
+ test("a merge on a single clean round carries no superseded note", async () => {
+  const r = rig();
+  try {
+   const gh = fakeGitHub({ comments: [review(CERTIFIED, 0, 0, 13)], ci: GREEN });
+   expect((await r.desk(gh.github)).merged).toEqual(["96"]);
+   expect(r.posts.join("\n")).not.toContain("superseded");
+   expect(r.events("merged").map((e) => e.detail).join("\n")).not.toContain("superseded");
+  } finally { r.close(); }
+ });
+
+ test("a CI-only park whose newest round at the head has a major stays parked", async () => {
+  const r = rig();
+  try {
+   const gh = fakeGitHub({ comments: [review(CERTIFIED, 0, 0, 12), review(CERTIFIED, 0, 1, 13)], ci: GREEN });
+   const result = await r.desk(gh.github);
+   expect(result).toMatchObject({ cards: [], merged: [], resumed: [], parked: [] });
+   expect(gh.merges).toEqual([]);
+   expect(r.spawned).toEqual([]);
+   expect(r.journal.getWorker("96", GAME)?.status).toBe("parked");
+  } finally { r.close(); }
+ });
+
+ for (const [why, newestMajors, sentBack] of [
+  ["is not sent back when round 13 cleared round 12's major (a card, auto-merge held)", 0, false],
+  ["is still sent back when round 13 has a major", 1, true],
+ ] as const) {
+  test(`an awaiting-merge row ${why}`, async () => {
+   const r = rig();
+   try {
+    r.journal.updateWorker("96", GAME, { status: "awaiting-merge", outcome: null });
+    const gh = fakeGitHub({ comments: [review(CERTIFIED, 0, 1 - newestMajors, 12), review(CERTIFIED, 0, newestMajors, 13)], ci: GREEN });
+    const result = await r.desk(gh.github);
+    // A send-back spawns the rework run; a set-aside major holds the merge
+    // for the principal's card, with no run spawned.
+    expect(result.merged).toEqual([]);
+    expect(gh.merges).toEqual([]);
+    expect(result.cards).toEqual(sentBack ? [] : ["96"]);
+    expect(r.spawned).toEqual(sentBack ? ["96"] : []);
+    expect(r.journal.getWorker("96", GAME)?.status).toBe(sentBack ? "running" : "awaiting-merge");
+    if (sentBack) expect(r.journal.getWorker("96", GAME)?.phase).toBe("review");
+   } finally { r.close(); }
+  });
+ }
 });

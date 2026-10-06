@@ -11,6 +11,8 @@ import {
  realGitHub,
  recordedProbes,
  recordedReviews,
+ reviewAtHead,
+ supersededNote,
  type GitHubPort,
 } from "./implement.ts";
 import type { Journal, WorkerRow } from "./journal.ts";
@@ -173,7 +175,11 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
 
   const comments = await github.listComments(repo, pr.number, token);
   const reviews = recordedReviews(comments, botIdentity);
-  const last = reviews.find((r) => r.sha === pr.headSha);
+  const last = reviewAtHead(reviews, pr.headSha);
+  // A clean round that set aside an older same-head major (node #106): the
+  // reviewer may have missed it, so auto-merge holds and the manual card
+  // names it for the principal to check before merging.
+  const superseded = supersededNote(reviews, pr.headSha);
   const probe = recordedProbes(comments, botIdentity).find(
    (p) => p.sha === pr.headSha && p.passed,
   );
@@ -293,7 +299,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    });
    if (row.mergeMessageId !== null) return; // its card is still up
   }
-  if (map.autoMerge && !needsEye) {
+  if (map.autoMerge && !needsEye && superseded === null) {
    await github.mergePr(repo, pr.number, gate.headSha, pr.title, token);
    journal.recordEvent("merged", {
     nodeId: row.nodeId,
@@ -326,12 +332,15 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
     `:ranger: **merge needed** #${row.nodeId} — ${title}`,
     `map: ${mapKey(map)}`,
     `Gate passed at \`${gate.headSha.slice(0, 8)}\`: CI green, mergeable, base \`${map.base}\`, sage ${last?.round ?? "?"} round(s), the last with 0 blockers and 0 majors (machine evidence, not a sign-off).`,
+    ...(superseded !== null
+     ? [`Note: ${superseded}; the reviewer may have missed it, check before you merge.${map.autoMerge ? " Auto-merge is held on this head for that reason." : ""}`]
+     : []),
     ...(probesRequired
      ? [`Probes passed at \`${gate.headSha.slice(0, 8)}\` (selection ${probe?.mode ?? "?"}, ${probe?.selected ?? "?"} probe(s)). Only the selected probes ran, not the full suite.${baseRedNote(probe)}`]
      : ["No probe tier on this map: CI and the tests are the only automated checks."]),
     needsEye
      ? `Labelled \`${NEEDS_EYE_LABEL}\`: your eye is the check. Merge it by hand (squash); ranger closes the node after the merge.`
-     : "Merge it by hand (squash). For a `propose` node your merge is the ratification. Ranger closes the node after the merge; it never merges itself.",
+     : `Merge it by hand (squash). For a \`propose\` node your merge is the ratification. Ranger closes the node after the merge; ${map.autoMerge ? "it does not merge this one itself" : "it never merges itself"}.`,
    ].join("\n");
   let evidence: Awaited<ReturnType<typeof viewsCard>> | undefined;
   if (needsEye && map.commands.views) {
@@ -355,7 +364,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    );
   }
   journal.updateWorker(row.nodeId, repo, { mergeMessageId: messageId });
-  journal.recordEvent("merge-card", { nodeId: row.nodeId, repo, detail: `PR #${pr.number}, message ${messageId}` });
+  journal.recordEvent("merge-card", { nodeId: row.nodeId, repo, detail: `PR #${pr.number}, message ${messageId}${superseded !== null ? `; ${superseded}` : ""}` });
   result.cards.push(row.nodeId);
  }
 }

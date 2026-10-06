@@ -12,7 +12,10 @@ import {
  implementBranchFor,
  recordedReviews,
  resolvePhase,
+ reviewAtHead,
  reviewMarker,
+ supersededAtHead,
+ supersededNote,
 } from "../src/implement.ts";
 import { FencedError, openJournal } from "../src/journal.ts";
 import { evaluateMergeGate } from "../src/merge-gate.ts";
@@ -154,6 +157,68 @@ describe("review markers (F2 resume record)", () => {
  test("a declared git-merged-into probe names the branch", () => {
   expect(implementBranchFor({ probes: [{ type: "git-merged-into", ref: "node/flight-sound-prune" }] }, "node/9-x")).toBe("node/flight-sound-prune");
   expect(implementBranchFor({ probes: [] }, "node/9-x")).toBe("node/9-x");
+ });
+});
+
+describe("node #106 — newest-same-head-review-wins: the newest review at a head is the one that stands", () => {
+ const at = (round: number, sha: string, majors: number, author = "ivy-bot") => ({
+  id: round,
+  author,
+  body: `${reviewMarker(round, { verdict: "commented", summary: "", commitId: sha, blockers: 0, majors, nits: 0, body: "" })}\nround ${round}`,
+ });
+ test("rounds 12 (1 major) and 13 (clean) on one head: round 13 stands, in either comment order", () => {
+  for (const comments of [[at(12, SHA, 1), at(13, SHA, 0)], [at(13, SHA, 0), at(12, SHA, 1)]]) {
+   expect(reviewAtHead(recordedReviews(comments, "ivy-bot"), SHA)).toMatchObject({ round: 13, majors: 0 });
+  }
+ });
+ test("a genuine major in the newest review at the head still stands (the gate holds)", () => {
+  const current = reviewAtHead(recordedReviews([at(12, SHA, 0), at(13, SHA, 1)], "ivy-bot"), SHA);
+  expect(current).toMatchObject({ round: 13, majors: 1 });
+ });
+ test("the accepted risk: a real major the newer clean round missed no longer gates, and is named as superseded", () => {
+  // The marker cannot tell an errored lens from a real finding, so a reviewer
+  // that misses in round 13 a major it found in round 12 clears the head.
+  // supersededNote names what was set aside, for the journal and the cards.
+  const reviews = recordedReviews([at(12, SHA, 1), at(13, SHA, 0)], "ivy-bot");
+  expect(reviewAtHead(reviews, SHA)).toMatchObject({ round: 13, majors: 0 });
+  expect(supersededAtHead(reviews, SHA).map((r) => r.round)).toEqual([12]);
+  expect(supersededNote(reviews, SHA)).toBe(
+   `sage round 12 (0 blocker(s), 1 major(s)) at ${SHA.slice(0, 8)} superseded by the clean round 13 at the same head (no code change between them)`,
+  );
+ });
+ test("nothing is named superseded when the standing round gates, no older round gated, or the major was on another head", () => {
+  for (const comments of [[at(12, SHA, 1), at(13, SHA, 1)], [at(12, SHA, 0), at(13, SHA, 0)], [at(12, OTHER, 1), at(13, SHA, 0)], [at(13, SHA, 0)]]) {
+   const reviews = recordedReviews(comments, "ivy-bot");
+   expect(supersededAtHead(reviews, SHA)).toEqual([]);
+   expect(supersededNote(reviews, SHA)).toBeNull();
+  }
+ });
+ test("a marker quoted inside a machine-account comment's text never reads as a round", () => {
+  const quoted = { id: 99, author: "ivy-bot", body: `**Sage review**\n> ${at(14, SHA, 0).body}` };
+  const current = reviewAtHead(recordedReviews([at(12, SHA, 1), quoted], "ivy-bot"), SHA);
+  expect(current).toMatchObject({ round: 12, majors: 1 });
+ });
+ test("a clean newer round posted by anyone but the machine account never clears the head", () => {
+  const current = reviewAtHead(recordedReviews([at(12, SHA, 1), at(13, SHA, 0, "mallory")], "ivy-bot"), SHA);
+  expect(current).toMatchObject({ round: 12, majors: 1 });
+ });
+ test("unsorted input: the highest round at the head stands, whatever the array order", () => {
+  const reviews = [{ round: 13, sha: SHA }, { round: 11, sha: SHA }, { round: 12, sha: SHA }, { round: 14, sha: OTHER }];
+  expect(reviewAtHead(reviews, SHA)).toMatchObject({ round: 13 });
+  // A tied round falls to the later one in the input.
+  const tied = [{ round: 5, sha: SHA, tag: "first" }, { round: 5, sha: SHA, tag: "second" }];
+  expect(reviewAtHead(tied, SHA)?.tag).toBe("second");
+ });
+ test("selection by head is unchanged: another head's newer round never stands here", () => {
+  const reviews = recordedReviews([at(1, OTHER, 1), at(2, SHA, 0), at(3, OTHER, 0)], "ivy-bot");
+  expect(reviewAtHead(reviews, SHA)).toMatchObject({ round: 2 });
+  expect(reviewAtHead(reviews, OTHER)).toMatchObject({ round: 3 });
+  expect(reviewAtHead(reviews, "c".repeat(40))).toBeUndefined();
+ });
+ test("history stays intact: every round is still recorded with its own findings", () => {
+  const reviews = recordedReviews([at(12, SHA, 1), at(13, SHA, 0)], "ivy-bot");
+  reviewAtHead(reviews, SHA);
+  expect(reviews.map((r) => [r.round, r.majors, r.body])).toEqual([[12, 1, "round 12"], [13, 0, "round 13"]]);
  });
 });
 
