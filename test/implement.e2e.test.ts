@@ -316,14 +316,14 @@ async function rig(opts: {
  return { dir, origin, canonical, journal, statePath, ctx, github, calls, announced };
 }
 
-/** Land scripts/probe-hud.mjs on origin's main and fetch it, so the merge base has that probe. */
-async function seedProbeOnBase(r: Rig): Promise<void> {
+/** Land the probes (default scripts/probe-hud.mjs) on origin's main and fetch them, so the merge base has them. */
+async function seedProbeOnBase(r: Rig, names: string[] = ["probe-hud.mjs"]): Promise<void> {
  const seed = join(r.dir, "seed");
  const git = (args: string[], cwd: string) => runCmd("git", args, { cwd, env: { ...process.env, ...GIT_ENV } });
  mkdirSync(join(seed, "scripts"), { recursive: true });
- writeFileSync(join(seed, "scripts", "probe-hud.mjs"), "// the hud probe\n");
+ for (const name of names) writeFileSync(join(seed, "scripts", name), `// ${name}\n`);
  await git(["add", "-A"], seed);
- await git(["commit", "-m", "add the hud probe"], seed);
+ await git(["commit", "-m", "add the probes"], seed);
  expect((await git(["push", r.origin, "main"], seed)).code).toBe(0);
  expect((await git(["fetch", "origin"], r.canonical)).code).toBe(0);
 }
@@ -1013,14 +1013,72 @@ describe("implement lane (node #23)", () => {
   expect(events.some((d) => d.includes("probe-hud.mjs fail at the merge base") && d.includes("but not the same way — they gate"))).toBe(true);
  }, 60_000);
 
- test("a probe that fails the inherited check and then crashes on the branch gates", async () => {
+ /** Record every repo command with its directory; on a busy host that never quiets, so any quiet-host wait shows in the journal. */
+ function watchBaseRuns(r: Rig): { command: string; cwd: string }[] {
+  const calls: { command: string; cwd: string }[] = [];
+  r.ctx.shellRun = (command, opts) => {
+   calls.push({ command, cwd: opts.cwd ?? "" });
+   return runCmd("/bin/sh", ["-c", command], opts);
+  };
+  r.ctx.hostLoad = () => ({ load: 14, cores: 10 });
+  r.ctx.quietHost = { pollMs: 1, maxMs: 5 };
+  return calls;
+ }
+
+ test("a probe that fails the inherited check and then crashes on the branch gates, without a merge-base run", async () => {
   const r = await rig({ probe: "fake-probe branch-crash {node}", probeRetry: "fake-probe branch-crash {node} {failed}" });
   cleanup.push(r.dir);
   await seedProbeOnBase(r);
+  const calls = watchBaseRuns(r);
   expect((await runNode("20", r.ctx)).status).toBe("parked");
   expect(r.announced).toEqual([]);
+  expect(calls.filter((c) => c.cwd.includes("ranger-probe-base-"))).toEqual([]);
   const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
-  expect(events.some((d) => d.includes("but not the same way — they gate"))).toBe(true);
+  expect(events.some((d) => d.includes("probe-hud.mjs ended in a crash, kill, timeout or an unreadable kind at the head") && d.includes("they gate"))).toBe(true);
+  expect(events.some((d) => d.includes("the merge-base probe run"))).toBe(false);
+ }, 60_000);
+
+ test("head failures that all crashed gate at once: no merge-base run, no quiet-host wait for one", async () => {
+  const r = await rig({ probe: "fake-probe crash {node}", probeRetry: "fake-probe crash {node} {failed}" });
+  cleanup.push(r.dir);
+  await seedProbeOnBase(r, ["probe-hud.mjs", "probe-weapon.mjs"]);
+  const calls = watchBaseRuns(r);
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("parked");
+  expect(outcome.detail).toContain("FAILED: probe-hud.mjs · probe-weapon.mjs");
+  expect(outcome.detail).not.toContain("red on the merge base too");
+  expect(r.announced).toEqual([]);
+  expect(calls.filter((c) => c.cwd.includes("ranger-probe-base-"))).toEqual([]);
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.includes("probe-hud.mjs, probe-weapon.mjs ended in a crash, kill, timeout or an unreadable kind at the head"))).toBe(true);
+  expect(events.some((d) => d.includes("the merge-base probe run"))).toBe(false);
+ }, 60_000);
+
+ test("a mix of assertion failures and crashes reruns only the assertion failures at the base; the crash gates though the rest is the base's", async () => {
+  const r = await rig({ probe: "fake-probe mixed {node}", probeRetry: "fake-probe mixed {node} {failed}" });
+  cleanup.push(r.dir);
+  await seedProbeOnBase(r, ["probe-hud.mjs", "probe-weapon.mjs"]);
+  const calls = watchBaseRuns(r);
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("parked");
+  expect(outcome.detail).toContain("red on the merge base too: probe-hud.mjs");
+  expect(r.announced).toEqual([]);
+  const base = calls.filter((c) => c.cwd.includes("ranger-probe-base-")).map((c) => c.command);
+  expect(base).toEqual(["fake-probe mixed 20 probe-hud.mjs"]);
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.includes("probe-hud.mjs fail at the merge base") && d.includes("probe-weapon.mjs ended in a crash, kill, timeout or an unreadable kind at the head"))).toBe(true);
+ }, 60_000);
+
+ test("a failure whose kind the runner did not print fails closed: it gates without a merge-base run", async () => {
+  const r = await rig({ probe: "fake-probe no-kind {node}", probeRetry: "fake-probe no-kind {node} {failed}" });
+  cleanup.push(r.dir);
+  await seedProbeOnBase(r);
+  const calls = watchBaseRuns(r);
+  expect((await runNode("20", r.ctx)).status).toBe("parked");
+  expect(r.announced).toEqual([]);
+  expect(calls.filter((c) => c.cwd.includes("ranger-probe-base-"))).toEqual([]);
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.includes("probe-hud.mjs ended in a crash, kill, timeout or an unreadable kind at the head"))).toBe(true);
  }, 60_000);
 
  test("a probe the base does not have gates: nothing to compare it with", async () => {

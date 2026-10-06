@@ -26,6 +26,7 @@ import {
  PROBE_FILE,
  unfinishedProbes,
  parseFailedChecks,
+ type FailedProbeRun,
  parseFailedProbes,
  baseConflictOutcome,
  policyBlockedOutcome,
@@ -422,6 +423,8 @@ interface BaseProbeResult {
  passed: string[];
  /** Failed probes the branch added or edited: the base runs another probe under that name, so they gate. */
  changed: string[];
+ /** Failed probes that crashed, were killed or timed out at the head (or whose kind is unreadable): never inherited, so they gate without a base run. */
+ uncomparable: string[];
 }
 
 /** The journal line for a merge-base probe check. */
@@ -432,7 +435,19 @@ function baseProbeDetail(b: BaseProbeResult): string {
   b.differs.length > 0 ? `${b.differs.join(", ")} fail at ${at} too, but not the same way — they gate` : null,
   b.passed.length > 0 ? `${b.passed.join(", ")} pass at ${at} — the failure is this branch's` : null,
   b.changed.length > 0 ? `${b.changed.join(", ")} are new or changed on this branch — they gate` : null,
+  b.uncomparable.length > 0
+   ? `${b.uncomparable.join(", ")} ended in a crash, kill, timeout or an unreadable kind at the head — not run at ${at}, they gate`
+   : null,
  ].filter((part) => part !== null).join("; ");
+}
+
+/**
+ * A head failure the merge base could share: a completed assertion failure.
+ * A crash, kill or timeout is a failure of its own, and a kind the runner did
+ * not print or ranger does not know fails closed.
+ */
+function inheritable(run: FailedProbeRun | undefined): run is FailedProbeRun {
+ return run !== undefined && run.kind === "assert";
 }
 
 /** File names (no directory) in git's newline-separated path output. */
@@ -446,8 +461,10 @@ function fileNames(stdout: string): Set<string> {
  * added or edited is not compared: the base would run another probe under
  * its name, so it gates whatever the base says. A probe file holds many
  * checks, so one red at the base is the base's only when every check it
- * fails here fails there too, and both runs ended as assertion failures; a
- * crash, kill or timeout cannot be compared and gates. Null when the answer is
+ * fails here fails there too, and both runs ended as assertion failures. A
+ * head crash, kill or timeout cannot be inherited, so it gates without a base
+ * run or a wait for a quiet host (2026-10-05: two crashed probes on seelite
+ * #702 waited 240 s for a base run that could not clear them). Null when the answer is
  * unknown: no retry template to name exact probes, no named failures, or a
  * base run that could not be set up, timed out, or named nothing.
  */
@@ -468,8 +485,10 @@ async function probeMergeBase(
  const atBase = fileNames(tree.stdout);
  const touched = fileNames(diff.stdout);
  const changed = failed.filter((n) => !atBase.has(n) || touched.has(n));
- const comparable = failed.filter((n) => !changed.includes(n));
- if (comparable.length === 0) return { sha, red: [], differs: [], passed: [], changed };
+ const headChecks = parseFailedChecks(headStdout);
+ const uncomparable = failed.filter((n) => !changed.includes(n) && !inheritable(headChecks.get(n)));
+ const comparable = failed.filter((n) => !changed.includes(n) && !uncomparable.includes(n));
+ if (comparable.length === 0) return { sha, red: [], differs: [], passed: [], changed, uncomparable };
  const command = probeRetryCommandFor(template, ctx.node.ref.id, comparable);
  const scratch = mkdtempSync(join(tmpdir(), "ranger-probe-base-"));
  const dir = join(scratch, "worktree");
@@ -482,18 +501,16 @@ async function probeMergeBase(
   }
   await awaitQuietHost(ctx, "the merge-base probe run");
   const run = await runShell(command, dir, ctx, map.commands.probeTimeoutMin * 60_000, "probe");
-  if (run.code === 0) return { sha, red: [], differs: [], passed: comparable, changed };
+  if (run.code === 0) return { sha, red: [], differs: [], passed: comparable, changed, uncomparable };
   const named = run.code > 0 ? parseFailedProbes(run.stdout) : [];
   if (named.length === 0) return null;
-  const headChecks = parseFailedChecks(headStdout);
   const baseChecks = parseFailedChecks(run.stdout);
   // Both runs must be completed assertion failures: a crash, kill or timeout
   // after the inherited check is a failure of its own that names no check.
   const sameChecks = (probe: string): boolean => {
    const here = headChecks.get(probe);
    const there = baseChecks.get(probe);
-   if (here === undefined || there === undefined) return false;
-   if (here.kind !== "assert" || there.kind !== "assert") return false;
+   if (!inheritable(here) || there === undefined || there.kind !== "assert") return false;
    return here.checks.size > 0 && [...here.checks].every((check) => there.checks.has(check));
   };
   const redThere = comparable.filter((n) => named.includes(n));
@@ -503,6 +520,7 @@ async function probeMergeBase(
    differs: redThere.filter((n) => !sameChecks(n)),
    passed: comparable.filter((n) => !named.includes(n)),
    changed,
+   uncomparable,
   };
  } finally {
   await safeGit(["worktree", "remove", "--force", dir], { cwd: worktree, timeoutMs: 60_000 });
