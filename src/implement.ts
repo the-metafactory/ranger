@@ -366,6 +366,7 @@ async function probeFinalHead(
  const command = probeCommandFor(map.commands.probe as string, nodeId);
  const timeoutMs = map.commands.probeTimeoutMin * 60_000;
  await awaitQuietHost(ctx, "probe run 1");
+ const logFailuresBefore = logFailureCount(ctx);
  let result = await runShell(command, worktree, ctx, { label: "probe run 1", timeoutMs, priority: "probe" });
  let attempts = 1;
  let ranCommand = command;
@@ -412,7 +413,8 @@ async function probeFinalHead(
  ctx.journal.assertGeneration(nodeId, ctx.map.repo, ctx.generation, "post the probe record");
  // Named failures lead the record, the event and the park: an output tail can hold only passing probes.
  const failing = probeFailureSummary(result.stdout, result.code);
- const log = basename(workerLogFile(journal.path, repo, nodeId, ctx.generation));
+ // Named only when every run here (both attempts, the merge base's) was written.
+ const log = logFailureCount(ctx) === logFailuresBefore ? basename(workerLogFile(journal.path, repo, nodeId, ctx.generation)) : null;
  await github.postComment(repo, prNumber, probeComment(ranCommand, record, attempts, result, failing, log), token);
  journal.recordEvent("reviewed", {
   nodeId,
@@ -626,7 +628,8 @@ async function announceBaseRed(ctx: ImplementContext, sha: string, red: string[]
  * The probe record on the PR. A failed run's probes, kinds and checks come
  * first, in a code block (probe output is the branch's text: no mentions or
  * markup), then the output's tail. The whole output of every run, the retry
- * and the merge-base run included, is in the worker log it names by file.
+ * and the merge-base run included, is in the worker log it names by file;
+ * `log` is null when a write failed, and the record says so instead.
  */
 function probeComment(
  command: string,
@@ -634,7 +637,7 @@ function probeComment(
  attempts: number,
  result: RunResult,
  failing: string[],
- log: string,
+ log: string | null,
 ): string {
  const out = (result.stdout + (result.stderr ? `\n${result.stderr}` : "")).trim();
  const clipped = out.length > 20_000 ? `…${out.slice(-20_000)}` : out;
@@ -651,7 +654,9 @@ function probeComment(
       ...failing.map((line) => line.replaceAll("`", "'")),
       "```",
       "",
-      `The full output of every run is in ranger's worker log \`${log}\`.`,
+      log === null
+       ? "Ranger could not write its worker log for every run (the journal's log-failed events say why): the tail below is all the record keeps."
+       : `The full output of every run is in ranger's worker log \`${log}\`.`,
       "",
      ]),
   `\`${command}\``,
@@ -1378,6 +1383,14 @@ async function runShell(
  return result;
 }
 
+/** How many of a node run's log writes failed: a record names the log only when none did across its runs. */
+const logFailures = new WeakMap<ImplementContext, number>();
+
+/** The node run's failed log writes so far; compare two readings to learn whether runs between them were logged. */
+function logFailureCount(ctx: ImplementContext): number {
+ return logFailures.get(ctx) ?? 0;
+}
+
 /**
  * Append a run's whole output to the node's worker log. A log that cannot be
  * written is journaled and the run goes on: logging never changes a gate.
@@ -1385,6 +1398,7 @@ async function runShell(
 function logRun(ctx: ImplementContext, label: string, result: RunResult): string | null {
  const saved = tryWorkerLog(ctx.journal.path, ctx.map.repo, ctx.node.ref.id, ctx.generation, label, result);
  if ("file" in saved) return saved.file;
+ logFailures.set(ctx, logFailureCount(ctx) + 1);
  ctx.journal.recordEvent("log-failed", {
   nodeId: ctx.node.ref.id,
   repo: ctx.map.repo,
@@ -1542,7 +1556,7 @@ export function failedTestNames(result: RunResult): string[] {
 /** A failed supervisor test run, named: the failing tests first (the journal keeps 400 characters), then the tail. */
 function testsFailedDetail(testCommand: string, tests: RunResult, after: string): string {
  const names = failedTestNames(tests);
- return `tests (${testCommand}) failed ${after} (exit ${tests.code})${names.length > 0 ? ` — failing: ${names.join("; ")}` : " — failing test names unavailable (the whole output is in the worker log)"}: ${tail(tests)}`;
+ return `tests (${testCommand}) failed ${after} (exit ${tests.code})${names.length > 0 ? ` — failing: ${names.join("; ")}` : " — failing test names unavailable"}: ${tail(tests)}`;
 }
 
 /**

@@ -27,6 +27,7 @@ import { trustCurrentGitState } from "../src/git-trust.ts";
 import { baseConfigLines, createCanonicalRepo, GIT_ENV, takesRawByteNames } from "./support.ts";
 import { saveViewsRecord, viewsDirectory } from "../src/views.ts";
 import { DiscordAnnouncer } from "../src/announce.ts";
+import { workerLogFile } from "../src/worker-log.ts";
 
 const fixturesBin = join(import.meta.dir, "fixtures", "bin");
 const dataDir = join(import.meta.dir, "fixtures", "data");
@@ -1113,7 +1114,7 @@ describe("implement lane (node #23)", () => {
 
  /** Every worker log the rig's journal directory holds, concatenated. */
  function workerLogs(r: Rig): string {
-  const dir = join(dirname(r.journal.path), "logs", "workers");
+  const dir = dirname(workerLogFile(r.journal.path, "acme/widgets", "20", 0));
   return readdirSync(dir).map((f) => readFileSync(join(dir, f), "utf8")).join("\n");
  }
 
@@ -1159,7 +1160,7 @@ describe("implement lane (node #23)", () => {
   cleanup.push(r.dir);
   await seedProbeOnBase(r);
   longProbeOutput(r);
-  const logs = join(dirname(r.journal.path), "logs");
+  const logs = dirname(dirname(workerLogFile(r.journal.path, "acme/widgets", "20", 0)));
   rmSync(logs, { recursive: true, force: true });
   writeFileSync(logs, "a file where the log directory should be\n");
   const outcome = await runNode("20", r.ctx);
@@ -1167,6 +1168,9 @@ describe("implement lane (node #23)", () => {
   expect(outcome.detail).toContain("failing: probe-hud.mjs (assert): the hud draws");
   const record = (r.github.comments.get(1) ?? []).find((c) => c.body.includes("ranger:probes"))?.body ?? "";
   expect(record).toContain("result=fail");
+  // The record names no log it could not write.
+  expect(record).not.toContain("The full output of every run is in ranger's worker log");
+  expect(record).toContain("Ranger could not write its worker log for every run");
   const failed = r.journal.listEvents("acme/widgets", 200).filter((e) => e.kind === "log-failed").map((e) => e.detail ?? "");
   expect(failed.some((d) => d.startsWith("could not write the worker log (build pass)"))).toBe(true);
   expect(failed.some((d) => d.startsWith("could not write the worker log (probe run 1 (fake-probe red 20))"))).toBe(true);
