@@ -149,6 +149,18 @@ export function policyBlockedOutcome(r: { pass: string; reason: string; log: str
 
 export const POLICY_BLOCKED_OUTCOME = /^policy-blocked: /;
 
+/** The merge desk parked an awaiting-merge row on a hard merge-gate failure; `check` is the gate's check name. */
+export function mergeGateFailedOutcome(r: { check: string; reason: string }): string {
+ return `merge gate failed (${r.check}): ${r.reason}`;
+}
+
+/**
+ * A merge-gate park on CI alone (node #104): the gate reads CI before the
+ * review, base and probe checks, so the row is reconsidered once CI recovers,
+ * with every check re-read at the live head.
+ */
+export const CI_FAILED_PARK_OUTCOME = /^merge gate failed \(ci-green\): /;
+
 /** A session or review that stopped on its substrate's limit (node #45). */
 export const SUBSTRATE_CAPPED_OUTCOME = /\bhit its rate limit\b/;
 
