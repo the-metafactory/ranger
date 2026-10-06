@@ -199,6 +199,20 @@ export function recordedReviews(
  return out.sort((a, b) => a.round - b.round);
 }
 
+/**
+ * The review that stands at `sha`: the newest recorded one (highest round;
+ * on a tied round the later comment, since the sort is stable). A later
+ * complete review on the same head supersedes an earlier one, so an errored
+ * round no longer pins the head to its findings. Older reviews stay in the
+ * record untouched.
+ */
+export function reviewAtHead<R extends { round: number; sha: string }>(reviews: R[], sha: string): R | undefined {
+ for (let i = reviews.length - 1; i >= 0; i -= 1) {
+  if (reviews[i].sha === sha) return reviews[i];
+ }
+ return undefined;
+}
+
 export { parseFailedProbes };
 export { NEEDS_EYE_LABEL } from "./labels.ts";
 
@@ -703,7 +717,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
  for (;;) {
   const cap = capNow();
   const live = await github.getPr(repo, open.number, token);
-  let current = reviews.find((r) => r.sha === live.headSha);
+  let current = reviewAtHead(reviews, live.headSha);
   if (current === undefined) {
    if (reviews.length >= cap) {
     throw new ParkSignal(reviewCapHeadMovedOutcome({ rounds: reviews.length, pr: open.number }));

@@ -11,6 +11,7 @@ import {
  realGitHub,
  recordedProbes,
  recordedReviews,
+ reviewAtHead,
  type GitHubPort,
 } from "./implement.ts";
 import type { Journal, WorkerRow } from "./journal.ts";
@@ -173,7 +174,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
 
   const comments = await github.listComments(repo, pr.number, token);
   const reviews = recordedReviews(comments, botIdentity);
-  const last = reviews.find((r) => r.sha === pr.headSha);
+  const last = reviewAtHead(reviews, pr.headSha);
   const probe = recordedProbes(comments, botIdentity).find(
    (p) => p.sha === pr.headSha && p.passed,
   );

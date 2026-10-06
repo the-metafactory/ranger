@@ -16,8 +16,8 @@ const CERTIFIED = "a".repeat(40);
 const MOVED = "b".repeat(40);
 const CI_PARK = mergeGateFailedOutcome({ check: "ci-green", reason: "CI failed: deploy=cancelled" });
 
-const review = (sha: string, blockers = 0, majors = 0): IssueComment => ({
- id: 1, author: BOT, body: `<!-- ranger:review round=3 sha=${sha} blockers=${blockers} majors=${majors} nits=0 -->`,
+const review = (sha: string, blockers = 0, majors = 0, round = 3): IssueComment => ({
+ id: 10 + round, author: BOT, body: `<!-- ranger:review round=${round} sha=${sha} blockers=${blockers} majors=${majors} nits=0 -->`,
 });
 const probes = (sha: string): IssueComment => ({
  id: 2, author: BOT, body: probeMarker({ sha, passed: true, selected: "2", mode: "semantic" }),
@@ -199,4 +199,47 @@ describe("node #104 — ci-only-park-merges-without-lane: a CI-only park merges 
    expect(r.journal.getWorker("96", GAME)).toMatchObject({ status: "parked", outcome: CI_PARK });
   } finally { r.close(); }
  });
+});
+
+describe("node #106 — newest-same-head-review-wins: the desk reads the newest review at the head", () => {
+ test("a CI-only park whose round 12 had a major and round 13 is clean merges on round 13", async () => {
+  const r = rig();
+  try {
+   const gh = fakeGitHub({ comments: [review(CERTIFIED, 0, 1, 12), review(CERTIFIED, 0, 0, 13)], ci: GREEN });
+   const result = await r.desk(gh.github);
+   expect(result).toMatchObject({ merged: ["96"], parked: [], errors: [] });
+   expect(gh.merges).toEqual([{ n: 709, sha: CERTIFIED }]);
+  } finally { r.close(); }
+ });
+
+ test("a CI-only park whose newest round at the head has a major stays parked", async () => {
+  const r = rig();
+  try {
+   const gh = fakeGitHub({ comments: [review(CERTIFIED, 0, 0, 12), review(CERTIFIED, 0, 1, 13)], ci: GREEN });
+   const result = await r.desk(gh.github);
+   expect(result).toMatchObject({ cards: [], merged: [], resumed: [], parked: [] });
+   expect(gh.merges).toEqual([]);
+   expect(r.spawned).toEqual([]);
+   expect(r.journal.getWorker("96", GAME)?.status).toBe("parked");
+  } finally { r.close(); }
+ });
+
+ for (const [why, newestMajors, sentBack] of [
+  ["is not sent back when round 13 cleared round 12's major", 0, false],
+  ["is still sent back when round 13 has a major", 1, true],
+ ] as const) {
+  test(`an awaiting-merge row ${why}`, async () => {
+   const r = rig();
+   try {
+    r.journal.updateWorker("96", GAME, { status: "awaiting-merge", outcome: null });
+    const gh = fakeGitHub({ comments: [review(CERTIFIED, 0, 1 - newestMajors, 12), review(CERTIFIED, 0, newestMajors, 13)], ci: GREEN });
+    const result = await r.desk(gh.github);
+    // A send-back spawns the rework run; a merge spawns only the close.
+    expect(result.merged).toEqual(sentBack ? [] : ["96"]);
+    expect(gh.merges).toEqual(sentBack ? [] : [{ n: 709, sha: CERTIFIED }]);
+    expect(r.spawned).toEqual(["96"]);
+    expect(r.journal.getWorker("96", GAME)?.phase).toBe(sentBack ? "review" : "close");
+   } finally { r.close(); }
+  });
+ }
 });

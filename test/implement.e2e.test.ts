@@ -14,7 +14,7 @@ import { join } from "node:path";
 import { loadConfig } from "../src/config.ts";
 import { runCmd } from "../src/exec.ts";
 import type { CheckRun, IssueComment, PullRequest } from "../src/github.ts";
-import { baseMergeMarker, recordedBaseMerges, type GitHubPort } from "../src/implement.ts";
+import { baseMergeMarker, recordedBaseMerges, reviewMarker, type GitHubPort } from "../src/implement.ts";
 import { Database } from "bun:sqlite";
 import { openJournal, type Journal } from "../src/journal.ts";
 import { ReviewError, type ReviewVerdict } from "../src/review.ts";
@@ -1498,6 +1498,31 @@ describe("implement lane (node #23)", () => {
   expect(outcome.status).toBe("parked");
   expect(outcome.detail).toContain("0 blocker(s) and 1 major(s) remain after 2 sage round(s)");
  }, 60_000);
+
+ for (const [why, majors, status] of [
+  ["a clean one is ready with no new sage round", 0, "awaiting-merge"],
+  ["one with a major still parks at the cap", 1, "parked"],
+ ] as const) {
+  test(`node #106 — newest-same-head-review-wins: a resume over a newer review on the parked head uses it; ${why}`, async () => {
+   // Round 1 parks at a cap of 1 on a major (an errored lens reads as one).
+   const r = await rig({ blockers: [0], majors: [1] });
+   cleanup.push(r.dir);
+   r.ctx.config.workers.reviewRounds = 1;
+   expect((await runNode("20", r.ctx)).status).toBe("parked");
+   const head = await r.github.sha("node/20-add-the-feature-module");
+   await r.github.postComment("acme/widgets", 1, `${reviewMarker(2, { verdict: "commented", summary: "", commitId: head, blockers: 0, majors, nits: 0, body: "" })}\nround two`);
+
+   r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+   const outcome = await runNode("20", r.ctx);
+   expect(outcome.status).toBe(status);
+   if (majors > 0) expect(outcome.detail).toContain("0 blocker(s) and 1 major(s) remain after 2 sage round(s)");
+   expect(r.calls).toHaveLength(1); // round 2 was read back, not re-run
+   expect(r.journal.getWorker("20", "acme/widgets")).toMatchObject({ reviewRound: 2, verdictSha: head });
+   // History intact: round 1 still stands on the PR, unchanged.
+   const rounds = (r.github.comments.get(1) ?? []).map((c) => c.body.match(/ranger:review round=(\d+) sha=\w+ blockers=0 majors=(\d)/)?.slice(1, 3).join(":")).filter(Boolean);
+   expect(rounds).toEqual(["1:1", `2:${majors}`]);
+  }, 60_000);
+ }
 
  test("a ready PR whose last review still has a major (it went ready under the old rule) is sent back, and its merge card withdrawn", async () => {
   const r = await rig({ blockers: [0], majors: [1, 0] });

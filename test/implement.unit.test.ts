@@ -12,6 +12,7 @@ import {
  implementBranchFor,
  recordedReviews,
  resolvePhase,
+ reviewAtHead,
  reviewMarker,
 } from "../src/implement.ts";
 import { FencedError, openJournal } from "../src/journal.ts";
@@ -154,6 +155,34 @@ describe("review markers (F2 resume record)", () => {
  test("a declared git-merged-into probe names the branch", () => {
   expect(implementBranchFor({ probes: [{ type: "git-merged-into", ref: "node/flight-sound-prune" }] }, "node/9-x")).toBe("node/flight-sound-prune");
   expect(implementBranchFor({ probes: [] }, "node/9-x")).toBe("node/9-x");
+ });
+});
+
+describe("node #106 — newest-same-head-review-wins: the newest review at a head is the one that stands", () => {
+ const at = (round: number, sha: string, majors: number) => ({
+  id: round,
+  author: "ivy-bot",
+  body: `${reviewMarker(round, { verdict: "commented", summary: "", commitId: sha, blockers: 0, majors, nits: 0, body: "" })}\nround ${round}`,
+ });
+ test("rounds 12 (1 major) and 13 (clean) on one head: round 13 stands, in either comment order", () => {
+  for (const comments of [[at(12, SHA, 1), at(13, SHA, 0)], [at(13, SHA, 0), at(12, SHA, 1)]]) {
+   expect(reviewAtHead(recordedReviews(comments, "ivy-bot"), SHA)).toMatchObject({ round: 13, majors: 0 });
+  }
+ });
+ test("a genuine major in the newest review at the head still stands (the gate holds)", () => {
+  const current = reviewAtHead(recordedReviews([at(12, SHA, 0), at(13, SHA, 1)], "ivy-bot"), SHA);
+  expect(current).toMatchObject({ round: 13, majors: 1 });
+ });
+ test("selection by head is unchanged: another head's newer round never stands here", () => {
+  const reviews = recordedReviews([at(1, OTHER, 1), at(2, SHA, 0), at(3, OTHER, 0)], "ivy-bot");
+  expect(reviewAtHead(reviews, SHA)).toMatchObject({ round: 2 });
+  expect(reviewAtHead(reviews, OTHER)).toMatchObject({ round: 3 });
+  expect(reviewAtHead(reviews, "c".repeat(40))).toBeUndefined();
+ });
+ test("history stays intact: every round is still recorded with its own findings", () => {
+  const reviews = recordedReviews([at(12, SHA, 1), at(13, SHA, 0)], "ivy-bot");
+  reviewAtHead(reviews, SHA);
+  expect(reviews.map((r) => [r.round, r.majors, r.body])).toEqual([[12, 1, "round 12"], [13, 0, "round 13"]]);
  });
 });
 
