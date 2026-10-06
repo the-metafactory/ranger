@@ -132,8 +132,9 @@ export function probesFailedOutcome(r: {
  return [
   `browser probes failed twice at ${r.sha.slice(0, 8)} on PR #${r.pr} (exit ${r.exit})`,
   ...(names.length > 0 ? [`FAILED: ${names.join(" · ")}`] : []),
-  ...(summary.length > 0 ? [`failing: ${summary.join(" · ")}`] : []),
   ...(onBase.length > 0 ? [`red on the merge base too: ${onBase.join(" · ")}`] : []),
+  // After the names and the base line, and capped: the row keeps 400 characters of the outcome.
+  ...(summary.length > 0 ? [`failing: ${summary.join(" · ")}`.slice(0, 160)] : []),
   r.tail,
  ].join("\n");
 }

@@ -538,7 +538,7 @@ describe("failing probes lead the summary (node #107)", () => {
   expect(probeFailureSummary("FAIL probe-hud.mjs (0.1s) exit=1 assert\n", 0)).toEqual([]);
  });
 
- test("the park keeps its FAILED line and puts the kinds on their own line ahead of the tail", () => {
+ test("the park keeps its FAILED line and puts the kinds on their own line, after the merge-base line and ahead of the tail", () => {
   const outcome = probesFailedOutcome({
    sha: SHA,
    pr: 3,
@@ -553,5 +553,18 @@ describe("failing probes lead the summary (node #107)", () => {
    "failing: probe-hud.mjs (assert): the hud draws",
    "ok   probe-filler.mjs (0.1s)",
   ]);
+ });
+
+ test("a long summary cannot push the merge-base line out of the 400 characters the row keeps", () => {
+  const outcome = probesFailedOutcome({
+   sha: SHA,
+   pr: 3,
+   exit: 1,
+   failed: ["probe-hud.mjs", "probe-weapon.mjs"],
+   redOnBase: ["probe-weapon.mjs"],
+   summary: [`probe-hud.mjs (assert): ${"a long check name ".repeat(20)}`, `probe-weapon.mjs (assert): ${"another ".repeat(30)}`],
+   tail: "x".repeat(600),
+  }).slice(0, 400);
+  expect(outcome).toContain("red on the merge base too: probe-weapon.mjs\nfailing: probe-hud.mjs (assert): a long check name");
  });
 });
