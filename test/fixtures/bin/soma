@@ -106,6 +106,12 @@ export FAKE_SOMA_STATE FAKE_SOMA_REPO_DIR FAKE_SOMA_IDENTITY="$identity" \
   FAKE_SOMA_GIST="$gist" FAKE_SOMA_CHECKPOINT="$checkpoint" FAKE_SOMA_RESOLUTION_FILE="${resolution_file:-}" \
   FAKE_SOMA_CI="$ci" FAKE_SOMA_EVIDENCE_FILE="$evidence_file"
 
+# A test can make the map-index write fail the way it did live (node #108).
+if [ "$verb" = "decisions" ] && [ -n "${FAKE_SOMA_DECISIONS_FAIL:-}" ]; then
+  echo "fake soma: HTTP 504 writing the map index" >&2
+  exit 1
+fi
+
 case "$verb" in
   claim|release|close|decisions)
     python3 - "$verb" "$root" "$repo" <<'PY'

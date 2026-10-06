@@ -837,6 +837,27 @@ describe("implement lane (node #23)", () => {
   const s = state(r.statePath);
   expect(s.lastClose.ci).toBe("");
   expect(s.lastClose.evidence.map((e: { kind: string }) => e.kind)).toEqual(["judged", "tested"]);
+  const kinds = r.journal.listEvents("acme/widgets", 500).map((e) => e.kind);
+  expect(kinds.filter((k) => k === "decisions-written")).toHaveLength(1);
+  expect(kinds).not.toContain("decisions-failed");
+ }, 60_000);
+
+ test("a failed decisions write after the close records decisions-failed only, and the close still succeeds (node #108)", async () => {
+  const r = await rig({ autonomy: "propose" });
+  cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  await r.github.merge(1);
+  r.journal.updateWorker("20", "acme/widgets", { status: "running" });
+  process.env.FAKE_SOMA_DECISIONS_FAIL = "1";
+  const closed = await runNode("20", r.ctx);
+  expect(closed.status).toBe("success");
+  expect(state(r.statePath).nodes["20"].status).toBe("closed");
+  expect(r.journal.getWorker("20", "acme/widgets")?.status).toBe("success");
+  const events = r.journal.listEvents("acme/widgets", 500);
+  expect(events.map((e) => e.kind)).not.toContain("decisions-written");
+  const failed = events.filter((e) => e.kind === "decisions-failed");
+  expect(failed).toHaveLength(1);
+  expect(failed[0]?.detail).toContain("HTTP 504");
  }, 60_000);
 
  test("propose node filed by the machine account is refused (node #9 ban)", async () => {
