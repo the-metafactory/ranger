@@ -55,7 +55,9 @@ import {
 import type { WalkMode } from "./config.ts";
 import { lstat, mkdir, readFile, rm } from "node:fs/promises";
 import { runBaseline, validateBaselineConfig, createCommandMetrics, localCommandAdapter, sshCommandAdapter, privateOperatorPath, writePrivateBaselineReport } from "./remote-test/baseline.ts";
-import { executeRemoteTest, validateExecutorConfig } from "./remote-test/executor.ts";
+import { executeRemoteTest, reconcileRemoteTests, validateExecutorConfig } from "./remote-test/executor.ts";
+import { ActiveRemoteTestJob, BusyRemoteTestExecutor, RevokedRemoteTestJob, openJobLedger } from "./remote-test/job-ledger.ts";
+import { validateRemoteTestJob } from "./remote-test/contract.ts";
 import { publishReceiptFile } from "./remote-test/artifacts.ts";
 import { runSshCommand, statusSshCommand, sshOutcomeExitCode, sshOutcomeMessage, type RunSshCommand } from "./remote-test/ssh-cli.ts";
 import { serveSshResponse } from "./remote-test/ssh-server.ts";
@@ -604,12 +606,50 @@ remoteTest.command("execute")
     process.stdout.write(`Remote-test ${receipt.status}; private receipt saved.\n`);
     process.exitCode = receipt.status === "passed" ? 0 : 1;
    } finally { await rm(reservation, { recursive: true }); }
-  } catch {
+  } catch (error) {
+   if (error instanceof ActiveRemoteTestJob) {
+    process.stderr.write(`Remote-test active (attempt ${error.status.attempt}); query status.\n`); process.exitCode = 1; return;
+   }
+   if (error instanceof RevokedRemoteTestJob) {
+    process.stderr.write("Remote-test observed passed outcome is revoked; no accepted success.\n"); process.exitCode = 1; return;
+   }
+   if (error instanceof BusyRemoteTestExecutor) {
+    process.stderr.write("Remote-test executor busy; this job was not admitted. Inspect the active attempt or recover with the executor stopped.\n"); process.exitCode = 1; return;
+   }
    process.stderr.write(receiptStored
-    ? "ranger remote-test execute: durable receipt stored; output export failed. Inspect the private artifact store before retrying export; do not rerun the job.\n"
-    : "ranger remote-test execute: configuration, admission, execution or receipt storage failed; inspect private operator inputs.\n");
+    ? "ranger remote-test execute: durable receipt stored; output export failed. Repeat execute with the identical job and a new output path, or query status; do not export loose artifacts.\n"
+    : "ranger remote-test execute: configuration, admission, execution or receipt storage failed; inspect private state and recover interrupted attempts with the executor stopped.\n");
    process.exitCode = 1;
   } finally { process.removeListener("SIGINT", cancel); process.removeListener("SIGTERM", cancel); }
+ });
+
+remoteTest.command("recover")
+ .description("Reconcile interrupted jobs; requires the former executor to be stopped")
+ .requiredOption("--config <path>", "reviewed private executor JSON configuration")
+ .requiredOption("--executor-stopped", "operator confirms the former executor is stopped")
+ .action(async (options: { config: string }) => {
+  try {
+   const config = JSON.parse(await readFile(await privateOperatorPath(options.config, true), "utf8"));
+   await reconcileRemoteTests(config);
+   process.stdout.write("Remote-test recovery complete; interrupted jobs have at most one infrastructure retry.\n");
+  } catch { process.stderr.write("Remote-test recovery failed; admission remains fenced. Inspect private executor state.\n"); process.exitCode = 1; }
+ });
+
+remoteTest.command("cancel")
+ .description("Durably cancel an exact remote-test job generation")
+ .requiredOption("--config <path>", "reviewed private executor JSON configuration")
+ .requiredOption("--job <path>", "V1 job identity JSON")
+ .action(async (options: { config: string; job: string }) => {
+  try {
+   const config = validateExecutorConfig(JSON.parse(await readFile(await privateOperatorPath(options.config, true), "utf8")));
+   const job = JSON.parse(await readFile(options.job, "utf8"));
+   const selected = config.profiles.find(p => p.profile.profileId === job?.profileId);
+   if (!selected) throw Error("Unapproved cancellation profile");
+   const validated = validateRemoteTestJob(job, selected.profile);
+   const ledger = await openJobLedger(config.jobsRoot, config.executorId);
+   try { ledger.cancel(validated); } finally { ledger.close(); }
+   process.stdout.write("Remote-test generation cancellation recorded.\n");
+  } catch { process.stderr.write("Remote-test cancellation failed; inspect private executor state.\n"); process.exitCode = 1; }
  });
 
 remoteTest.command("baseline")
