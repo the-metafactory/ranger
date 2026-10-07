@@ -22,7 +22,7 @@
         <string>/Users/__USER__/work/mf/ranger/ranger.yaml</string>
     </array>
     <key>StartInterval</key>
-    <integer>900</integer>
+    <integer>600</integer>
     <key>RunAtLoad</key>
     <false/>
     <key>StandardOutPath</key>

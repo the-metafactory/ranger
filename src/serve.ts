@@ -1013,7 +1013,7 @@ function renderGrill(s) {
   const body = n === 0 ? unavailable(m, "None open.")
    : el("ul", {},
     ...m.grillings.map((g) => el("li", {}, el("span", { class: "id", text: "#" + g.id }), el("span", { class: "t" }, link(g.url, g.title)), tags(tag("grilling"), grillButton(m, g)))),
-    ...decisions.map((d) => el("li", {}, el("span", { class: "id", text: "#" + d.id }), el("span", { class: "t" }, link(d.url, d.title), el("span", { class: "reason", text: d.reason })), tags(tag(d.kind + " · " + d.autonomy)))));
+    ...decisions.map((d) => el("li", {}, el("span", { class: "id", text: "#" + d.id }), el("span", { class: "t" }, link(d.url, d.title), el("span", { class: "reason", text: d.reason })), tags(tag((d.kind || "no kind") + " · " + (d.autonomy || "no autonomy"))))));
   return mapGroup("grill", m, m.servedOnly ? " (shown only)" : "", mapCount(m, n), mapMeta(m), body);
  }));
 }
