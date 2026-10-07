@@ -1,15 +1,16 @@
+import { githubCiVerdict } from "../src/github-ci.ts";
 import { expect, test } from "bun:test";
-import type { CheckRun, CommitStatus, WorkflowRun, PullRequest } from "../src/github.ts";
+import type { ChangeRequest } from "../src/forge.ts";
+import type { CheckRun, CommitStatus, WorkflowRun } from "../src/github.ts";
 import { FencedError } from "../src/journal.ts";
-import { researchCi, type ResearchGitHubPort } from "../src/research-ci.ts";
+import { researchCi, type ResearchForgePort } from "../src/research-ci.ts";
 
 const SHA = "a".repeat(40);
 const OTHER = "b".repeat(40);
-const PR: PullRequest = {
- number: 31, state: "open", merged: false, draft: true, title: "research",
- headRef: "research/survey", headSha: SHA, baseRef: "main", mergeable: null,
- mergeableState: "draft", mergeCommitSha: null, mergedBy: null,
- url: "https://github.com/acme/widgets/pull/31", author: "ivy-bot",
+const PR: ChangeRequest = {
+ iid: 31, state: "open", draft: true, title: "research",
+ headRef: "research/survey", headSha: SHA, baseRef: "main", mergeState: "pending", mergeCommitSha: null, mergedBy: null,
+ webUrl: "https://github.com/acme/widgets/pull/31", author: "ivy-bot",
 };
 const GREEN: CheckRun = { id: 901, name: "test", status: "completed", conclusion: "success" };
 
@@ -17,7 +18,7 @@ const WORKFLOW: WorkflowRun = { ...GREEN, id: 501, workflowId: 10, event: "pull_
 
 const seq = <T>(xs: T[]) => { let i = 0; return () => xs[Math.min(i++, xs.length - 1)]!; };
 
-function setup(opts: { runs?: CheckRun[][]; workflows?: WorkflowRun[][]; statuses?: CommitStatus[][]; prs?: PullRequest[]; existing?: boolean; timeoutMs?: number; settleMs?: number } = {}) {
+function setup(opts: { runs?: CheckRun[][]; workflows?: WorkflowRun[][]; statuses?: CommitStatus[][]; prs?: ChangeRequest[]; existing?: boolean; timeoutMs?: number; settleMs?: number } = {}) {
  let creates = 0;
  const nextPr = seq(opts.prs ?? [PR]);
  const nextRuns = seq(opts.runs ?? [[GREEN]]);
@@ -28,7 +29,7 @@ function setup(opts: { runs?: CheckRun[][]; workflows?: WorkflowRun[][]; statuse
  const queried: string[] = [];
  const fences: string[] = [];
  const recorded: number[] = [];
- const github: ResearchGitHubPort = {
+ const github: ResearchForgePort = {
   findPrByHead: async () => opts.existing ? PR : null,
   createDraftPr: async (_repo, body, token) => {
    expect(token).toBe("machine");
@@ -38,12 +39,12 @@ function setup(opts: { runs?: CheckRun[][]; workflows?: WorkflowRun[][]; statuse
    return PR;
   },
   getPr: async () => nextPr(),
-  checkRunsFor: async (_repo, sha) => {
+  ciVerdictFor: async (_repo, sha, token, purpose) => {
+   expect(token).toBe("machine");
+   expect(purpose).toBe("research");
    queried.push(sha);
-   return nextRuns();
+   return githubCiVerdict(nextRuns(), purpose, nextWorkflows(), nextStatuses());
   },
-  workflowRunsFor: async () => nextWorkflows(),
-  commitStatusesFor: async () => nextStatuses(),
  };
  const input: Parameters<typeof researchCi>[0] = {
   repo: "acme/widgets", branch: PR.headRef, base: "main", sha: SHA, nodeId: "25",
@@ -51,7 +52,7 @@ function setup(opts: { runs?: CheckRun[][]; workflows?: WorkflowRun[][]; statuse
   settleMs: opts.settleMs ?? 0,
   clock: { now: () => now, sleep: async (ms) => { sleeps.push(ms); now += ms; } },
   timeoutMs: opts.timeoutMs ?? 100,
-  fence: (action) => { fences.push(action); }, recordPr: (pr) => { recorded.push(pr.number); },
+  fence: (action) => { fences.push(action); }, recordPr: (pr) => { recorded.push(pr.iid); },
  };
  return { input, queried, fences, recorded, sleeps, creates: () => creates, elapsed: () => now };
 }
@@ -185,7 +186,7 @@ test("a head move during the CI read invalidates the evidence", async () => {
  await expect(researchCi(s.input)).rejects.toThrow("refusing stale evidence");
 });
 
-for (const patch of [{ state: "closed" as const }, { merged: true }, { draft: false }, { baseRef: "other" }, { headRef: "other" }]) {
+for (const patch of [{ state: "closed" as const }, { state: "merged" as const }, { draft: false }, { baseRef: "other" }, { headRef: "other" }]) {
  test(`declined or changed PR parks: ${JSON.stringify(patch)}`, async () => {
   const s = setup({ prs: [{ ...PR, ...patch }] });
   await expect(researchCi(s.input)).rejects.toThrow("must remain an open draft");

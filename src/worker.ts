@@ -54,7 +54,7 @@ import { sessionJournalPath } from "./journal-guard.ts";
 import { saveWorkerLog } from "./worker-log.ts";
 import { isTransientGitHubError } from "./transient.ts";
 import * as githubApi from "./github.ts";
-import type { GitHubPort } from "./github.ts";
+import type { ForgePort } from "./forge.ts";
 import { ParkSignal } from "./signals.ts";
 import { policyBlockedOutcome } from "./outcomes.ts";
 import { assertResearchFindingsOnly, researchCi, type ResearchCiTiming } from "./research-ci.ts";
@@ -105,7 +105,7 @@ export interface RunNodeContext {
   opts: RunOptions,
  ) => Promise<{ code: number; stdout: string; stderr: string }>;
  /** For tests: the supervisor's forge and implement lane's reviewer. */
- github?: GitHubPort;
+ github?: ForgePort;
  /** Injectable CI timing for tests; production uses the default settling window. */
  researchCiTiming?: ResearchCiTiming;
  reviewer?: Reviewer;
@@ -928,14 +928,14 @@ async function runResearch(
   ...ctx.researchCiTiming,
   repo, branch, base: map.base, sha, nodeId, token, pr: existingPr, github, fence,
   recordPr: (pr) => {
-   journal.updateWorker(nodeId, repo, { prNumber: pr.number });
+   journal.updateWorker(nodeId, repo, { prNumber: pr.iid });
    if (existingPr === null) {
-    journal.recordEvent("pr-opened", { nodeId, repo, detail: `research draft PR #${pr.number} ${pr.url}` });
+    journal.recordEvent("pr-opened", { nodeId, repo, detail: `research draft PR #${pr.iid} ${pr.webUrl}` });
    }
   },
  });
- journal.recordEvent("ci-passed", { nodeId, repo, detail: `research ${evidence.ci} (${evidence.check.name})` });
- const resolution = `${findings.stdout.trim()}\n\nResearch CI evidence: draft ${evidence.pr.url}, check run ${evidence.ci}.`;
+ journal.recordEvent("ci-passed", { nodeId, repo, detail: `research ${evidence.ci} (${evidence.check.runName})` });
+ const resolution = `${findings.stdout.trim()}\n\nResearch CI evidence: draft ${evidence.pr.webUrl}, check run ${evidence.ci}.`;
  const resolutionFile = join(tmpdir(), `ranger-close-${fileStemFor(repo, nodeId)}.md`);
  writeFileSync(resolutionFile, resolution, "utf8");
 

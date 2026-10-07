@@ -1,3 +1,5 @@
+import type { ChangeRequest, MergeState, CiPurpose, CiVerdict, IssueComment } from "./forge.ts";
+import { githubCiVerdict } from "./github-ci.ts";
 import { runCmd } from "./exec.ts";
 import { runReadRetryingTransient } from "./transient.ts";
 import { writeEnv } from "./identity.ts";
@@ -33,26 +35,6 @@ export function isReadRequest(args: string[]): boolean {
  return true;
 }
 
-export interface PullRequest {
- number: number;
- state: "open" | "closed";
- merged: boolean;
- draft: boolean;
- title: string;
- headRef: string;
- headSha: string;
- baseRef: string;
- /** GitHub's mergeability; null while GitHub is still computing it. */
- mergeable: boolean | null;
- /** clean | dirty | blocked | unstable | behind | draft | unknown | has_hooks */
- mergeableState: string;
- mergeCommitSha: string | null;
- /** Who merged it (null while unmerged) — the receipt names the actual merger. */
- mergedBy: string | null;
- url: string;
- author: string;
-}
-
 export interface CheckRun {
  id: number;
  name: string;
@@ -70,32 +52,6 @@ export interface CommitStatus {
  id: number;
  context: string;
  state: string;
-}
-
-export interface IssueComment {
- id: number;
- author: string;
- body: string;
-}
-
-/** The GitHub surface the supervisor lanes use — injectable without a forge. */
-export interface GitHubPort {
- findPrByHead(repo: string, branch: string, token: string): Promise<PullRequest | null>;
- getPr(repo: string, n: number, token: string): Promise<PullRequest>;
- createDraftPr(
-  repo: string,
-  pr: { head: string; base: string; title: string; body: string },
-  token: string,
- ): Promise<PullRequest>;
- updatePrBody(repo: string, n: number, body: string, token: string): Promise<void>;
- markReady(repo: string, pr: PullRequest, token: string): Promise<void>;
- checkRunsFor(repo: string, sha: string, token: string): Promise<CheckRun[]>;
- workflowRunsFor(repo: string, sha: string, token: string): Promise<WorkflowRun[]>;
- commitStatusesFor(repo: string, sha: string, token: string): Promise<CommitStatus[]>;
- mergePr(repo: string, n: number, sha: string, title: string, token: string): Promise<void>;
- issueLabels(repo: string, n: number, token: string): Promise<string[]>;
- postComment(repo: string, n: number, body: string, token: string): Promise<number>;
- listComments(repo: string, n: number, token: string): Promise<IssueComment[]>;
 }
 
 async function ghApi(
@@ -128,27 +84,26 @@ async function ghApi(
  }
 }
 
-function toPullRequest(raw: unknown): PullRequest {
+function toChangeRequest(raw: unknown): ChangeRequest {
  const r = raw as Record<string, unknown>;
  const head = (r.head ?? {}) as Record<string, unknown>;
  const base = (r.base ?? {}) as Record<string, unknown>;
  const user = (r.user ?? {}) as Record<string, unknown>;
  const mergedBy = (r.merged_by ?? null) as Record<string, unknown> | null;
  return {
-  number: Number(r.number),
-  state: r.state === "closed" ? "closed" : "open",
-  merged: r.merged === true || (typeof r.merged_at === "string" && r.merged_at.length > 0),
+  iid: Number(r.number),
+  state: r.merged === true || (typeof r.merged_at === "string" && r.merged_at.length > 0) ? "merged" : r.state === "closed" ? "closed" : "open",
   draft: r.draft === true,
   title: String(r.title ?? ""),
   headRef: String(head.ref ?? ""),
   headSha: String(head.sha ?? ""),
   baseRef: String(base.ref ?? ""),
-  mergeable: typeof r.mergeable === "boolean" ? r.mergeable : null,
-  mergeableState: String(r.mergeable_state ?? "unknown"),
+  mergeState: githubMergeState(r.mergeable, r.mergeable_state),
+  mergeDetail: githubMergeState(r.mergeable, r.mergeable_state) === "pending" ? "GitHub is still computing mergeability" : `mergeable=${typeof r.mergeable === "boolean" ? r.mergeable : null}, state=${String(r.mergeable_state ?? "unknown")}`,
   mergeCommitSha:
    typeof r.merge_commit_sha === "string" ? r.merge_commit_sha : null,
   mergedBy: mergedBy === null ? null : String(mergedBy.login ?? ""),
-  url: String(r.html_url ?? ""),
+  webUrl: String(r.html_url ?? ""),
   author: String(user.login ?? ""),
  };
 }
@@ -158,7 +113,7 @@ export async function findPrByHead(
  repo: string,
  branch: string,
  token: string,
-): Promise<PullRequest | null> {
+): Promise<ChangeRequest | null> {
  const owner = repo.split("/")[0];
  const raw = await ghApi(
   token,
@@ -169,7 +124,7 @@ export async function findPrByHead(
  );
  const list = Array.isArray(raw) ? raw : [];
  if (list.length === 0) return null;
- const prs = list.map(toPullRequest).sort((a, b) => b.number - a.number);
+ const prs = list.map(toChangeRequest).sort((a, b) => b.iid - a.iid);
  return prs[0];
 }
 
@@ -178,8 +133,8 @@ export async function getPr(
  repo: string,
  number: number,
  token: string,
-): Promise<PullRequest> {
- return toPullRequest(
+): Promise<ChangeRequest> {
+ return toChangeRequest(
   await ghApi(token, [`repos/${repo}/pulls/${number}`], `read PR #${number}`),
  );
 }
@@ -188,8 +143,8 @@ export async function createDraftPr(
  repo: string,
  pr: { head: string; base: string; title: string; body: string },
  token: string,
-): Promise<PullRequest> {
- return toPullRequest(
+): Promise<ChangeRequest> {
+ return toChangeRequest(
   await ghApi(
    token,
    [
@@ -228,18 +183,18 @@ export async function updatePrBody(
 /** Mark a draft ready for review (REST has no verb for it; GraphQL does). */
 export async function markReady(
  repo: string,
- pr: PullRequest,
+ pr: ChangeRequest,
  token: string,
 ): Promise<void> {
  if (!pr.draft) return;
  const raw = (await ghApi(
   token,
-  [`repos/${repo}/pulls/${pr.number}`, "--jq", "{node_id: .node_id}"],
-  `read PR #${pr.number} node id`,
+  [`repos/${repo}/pulls/${pr.iid}`, "--jq", "{node_id: .node_id}"],
+  `read PR #${pr.iid} node id`,
  )) as { node_id?: string } | null;
  const nodeId = raw?.node_id;
  if (typeof nodeId !== "string" || nodeId.length === 0) {
-  throw new GitHubError(`PR #${pr.number} has no node id`);
+  throw new GitHubError(`PR #${pr.iid} has no node id`);
  }
  await ghApi(
   token,
@@ -250,7 +205,7 @@ export async function markReady(
    "-f",
    `id=${nodeId}`,
   ],
-  `mark PR #${pr.number} ready`,
+  `mark PR #${pr.iid} ready`,
  );
 }
 
@@ -392,4 +347,21 @@ export async function listComments(
    body: String(r.body ?? ""),
   };
  });
+}
+
+/** Existing GitHub gate semantics: named non-conflict states were allowed. */
+export function githubMergeState(mergeable: unknown, state: unknown): MergeState {
+ if (mergeable === false || state === "dirty") return "conflict";
+ // New API states must never silently become mergeable, even while computing.
+ if (!["clean", "blocked", "unstable", "behind", "draft", "unknown", "has_hooks"].includes(String(state ?? "unknown"))) return "unknown";
+ if (typeof mergeable !== "boolean" || state === "unknown" || state == null) return "pending";
+ return "mergeable";
+}
+
+export async function ciVerdictFor(repo: string, sha: string, token: string, purpose: CiPurpose = "merge"): Promise<CiVerdict> {
+ if (purpose !== "research") return githubCiVerdict(await checkRunsFor(repo, sha, token), purpose);
+ const [runs, workflows, statuses] = await Promise.all([
+  checkRunsFor(repo, sha, token), workflowRunsFor(repo, sha, token), commitStatusesFor(repo, sha, token),
+ ]);
+ return githubCiVerdict(runs, purpose, workflows, statuses);
 }

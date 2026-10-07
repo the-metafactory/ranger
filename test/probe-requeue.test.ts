@@ -8,8 +8,8 @@ import { openJournal, type WorkerRow } from "../src/journal.ts";
 import { infrastructureProbeHead, probeFailureClass, probesFailedOutcome } from "../src/outcomes.ts";
 import { probeRequeueCandidates, requeueProbes } from "../src/probe-requeue.ts";
 import { walk } from "../src/walk.ts";
-import { realGitHub, type GitHubPort } from "../src/implement.ts";
-import type { PullRequest } from "../src/github.ts";
+import { realGitHub, type ForgePort } from "../src/implement.ts";
+import type { ChangeRequest } from "../src/forge.ts";
 import { fakeDiscord, fixturesBin } from "./support.ts";
 
 const A = "acme/game";
@@ -177,8 +177,8 @@ for (const failedSpawn of [false, true]) {
    r.park("20", B);
    r.journal.upsertWorker({ repo: A, root: 1, nodeId: "90", status: "running", lane: "implement", phase: "review", pid: deadPid, attempts: 0 });
    r.journal.upsertWorker({ repo: A, root: 1, nodeId: "91", status: "awaiting-merge", lane: "implement", phase: "awaiting-merge", prNumber: 91 });
-   const github: GitHubPort = { ...realGitHub,
-    getPr: async (_repo, number) => ({ number, state: "open", merged: false, headSha: SHA, url: "" } as PullRequest),
+   const github: ForgePort = { ...realGitHub,
+    getPr: async (_repo, number) => ({ iid: number, state: "open", headSha: SHA, webUrl: "" } as ChangeRequest),
     listComments: async () => [{ id: 1, author: "ivy-bot", body: `<!-- ranger:review round=1 sha=${SHA} blockers=1 majors=0 nits=0 -->` }],
    };
    const spawned: string[] = [];

@@ -5,7 +5,7 @@ import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import type { Journal } from "./journal.ts";
 import { killProcessGroup, pidAlive, processGroupCommands } from "./exec.ts";
 import { graphRelease } from "./graph-write.ts";
-import type { GitHubPort } from "./implement.ts";
+import type { ForgePort } from "./implement.ts";
 import {
  runMergeDesk,
  watchedByMergeDesk,
@@ -37,7 +37,7 @@ export interface SweepContext {
   */
  respawn?: (nodeId: string, repo: string, root: number) => Promise<number | null>;
  /** Merge-desk seams (tests): the forge and the Discord post. */
- github?: GitHubPort;
+ github?: ForgePort;
  /**
   * Which half to run (default both): `liveness` reconciles crashed workers
   * (respawn, park, release); `desk` runs only the merge desk. The tick runs

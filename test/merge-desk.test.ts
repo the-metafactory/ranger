@@ -1,3 +1,4 @@
+import { githubCiVerdict } from "../src/github-ci.ts";
 import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -6,8 +7,9 @@ import { stringify } from "yaml";
 import { loadConfig } from "../src/config.ts";
 import { openJournal } from "../src/journal.ts";
 import { mergeGateNow, runMergeDesk } from "../src/merge-desk.ts";
-import { probeMarker, type GitHubPort } from "../src/implement.ts";
-import type { CheckRun, IssueComment, PullRequest } from "../src/github.ts";
+import { probeMarker, type ForgePort } from "../src/implement.ts";
+import type { IssueComment, ChangeRequest } from "../src/forge.ts";
+import type { CheckRun } from "../src/github.ts";
 import { mergeGateFailedOutcome, reviewCapOutcome } from "../src/outcomes.ts";
 
 const GAME = "acme/seelite";
@@ -28,25 +30,23 @@ function fakeGitHub(opts: { head?: string; comments: IssueComment[]; ci: CheckRu
  const calls: string[] = [];
  const merges: { n: number; sha: string }[] = [];
  const forbidden = (name: string) => async () => { throw new Error(`unexpected GitHub call: ${name}`); };
- const github: GitHubPort = {
+ const github: ForgePort = {
   findPrByHead: forbidden("findPrByHead"),
   createDraftPr: forbidden("createDraftPr"),
   updatePrBody: forbidden("updatePrBody"),
   markReady: forbidden("markReady"),
-  workflowRunsFor: forbidden("workflowRunsFor"),
-  commitStatusesFor: forbidden("commitStatusesFor"),
   postComment: forbidden("postComment"),
   getPr: async (_repo, number) => {
    calls.push("getPr");
    opts.onGetPr?.();
    return {
-    number, state: opts.merged ? "closed" : "open", merged: opts.merged ?? false, draft: false, title: "Repair the deploy step (node #96)",
+    iid: number, state: opts.merged ? "merged" : "open", draft: false, title: "Repair the deploy step (node #96)",
     headRef: "node/96", headSha: opts.head ?? CERTIFIED, baseRef: "main",
-    mergeable: true, mergeableState: "clean", mergeCommitSha: null, mergedBy: null, url: "", author: BOT,
-   } satisfies PullRequest;
+    mergeState: "mergeable", mergeCommitSha: null, mergedBy: null, webUrl: "", author: BOT,
+   } satisfies ChangeRequest;
   },
   listComments: async () => { calls.push("listComments"); return opts.comments; },
-  checkRunsFor: async () => { calls.push("checkRunsFor"); return opts.ci; },
+  ciVerdictFor: async () => { calls.push("ciVerdictFor"); return githubCiVerdict(opts.ci); },
   issueLabels: async () => { calls.push("issueLabels"); return opts.labels ?? []; },
   mergePr: async (_repo, n, sha) => { calls.push("mergePr"); merges.push({ n, sha }); },
  };
@@ -77,7 +77,7 @@ function rig(map: { autoMerge?: boolean; probe?: boolean } = {}) {
  });
  const posts: string[] = [];
  const spawned: string[] = [];
- const desk = (github: GitHubPort) => runMergeDesk({
+ const desk = (github: ForgePort) => runMergeDesk({
   config, journal, map: config.maps[0], token: "unused", botIdentity: BOT, github,
   post: async (content) => { posts.push(content); return `msg-${posts.length}`; },
   spawn: async (id) => { spawned.push(id); return 4242; },
@@ -311,6 +311,20 @@ describe("one merge, one close: two desk passes on the same merged PR", () => {
 });
 
 describe("mergeGateNow — the desk's gate, for a dashboard merge", () => {
+ test("unknown merge state parks an auto-merge row without merging", async () => {
+  const r = rig();
+  try {
+   r.journal.updateWorker("96", GAME, { status: "awaiting-merge", outcome: null });
+   const gh = fakeGitHub({ comments: [review(CERTIFIED)], ci: GREEN });
+   const getPr = gh.github.getPr;
+   gh.github.getPr = async (...args) => ({ ...await getPr(...args), mergeState: "unknown" });
+   expect(await r.desk(gh.github)).toMatchObject({ parked: ["96"], merged: [], errors: [] });
+   expect(gh.merges).toEqual([]);
+   expect(r.spawned).toEqual([]);
+   expect(r.journal.getWorker("96", GAME)?.outcome).toContain("merge state is unknown");
+  } finally { r.close(); }
+ });
+
  test("passes at the head with a clean review, a passing probe run and green CI", async () => {
   const r = rig({ probe: true });
   try {

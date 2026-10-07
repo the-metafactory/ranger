@@ -291,7 +291,7 @@ async function settleMergeability(journal: Journal, map: RangerMapConfig, token:
   for (const n of waiting) {
    try {
     const pr = await realGitHub.getPr(map.repo, n, token);
-    if (pr.state === "open" && (pr.mergeable === null || pr.mergeableState === "unknown")) still.push(n);
+    if (pr.state === "open" && pr.mergeState === "pending") still.push(n);
    } catch {
     still.push(n);
    }

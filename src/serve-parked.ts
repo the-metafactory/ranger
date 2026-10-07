@@ -19,7 +19,7 @@ import { isGithubRepo, nodeKey } from "./forge-ref.ts";
  * reads when the request arrives, and the spawner is injected so no test runs
  * `gh`, `osascript` or ranger.
  */
-import { classifyCi } from "./ci-policy.ts";
+import { classifyCi } from "./github-ci.ts";
 import { REPO_PATTERN } from "./config.ts";
 import type { EventRow, WorkerRow } from "./journal.ts";
 import { childEnv, itermArgv, shellQuote } from "./launch.ts";
