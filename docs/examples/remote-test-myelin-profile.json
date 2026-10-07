@@ -1,0 +1,14 @@
+{
+  "profileId": "myelin-integration-v1",
+  "lockDigest": "sha256:<COMMITTED_BUN_LOCK_SHA256>",
+  "imageDigest": "sha256:<REVIEWED_LINUX_ARM64_BUN_IMAGE_SHA256>",
+  "reviewed": {
+    "recipe": "myelin-v1",
+    "cache": "disabled",
+    "install": "frozen-offline-copy",
+    "checks": ["unit", "integration", "typecheck", "lint"],
+    "sidecars": [
+      { "kind": "nats", "imageReference": "<REVIEWED_NATS_IMAGE>@sha256:<IMAGE_SHA256>" }
+    ]
+  }
+}

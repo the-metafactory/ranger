@@ -52,7 +52,7 @@ export async function assertTestEvidence(evidence: NonNullable<TestResult["evide
  const { job, receipt } = evidence;
  validateRemoteTestReceipt(receipt, job);
  const stored = validateRemoteTestReceipt(await readPrivateJson(evidence.path), job);
- if (stored.status !== receipt.status || stored.executorId !== receipt.executorId || stored.completedAt !== receipt.completedAt || stored.exitCode !== receipt.exitCode ||
+ if (stored.status !== receipt.status || stored.executorId !== receipt.executorId || stored.completedAt !== receipt.completedAt || stored.exitCode !== receipt.exitCode || stored.coverage?.requiredSkippedTests !== receipt.coverage?.requiredSkippedTests ||
      !Number.isSafeInteger(evidence.validUntil) || Date.now() > evidence.validUntil || receipt.completedAt > Date.now() ||
      job.commitDigest !== request.head || job.repositoryId !== request.repositoryId || job.generation !== request.generation || job.correlationId !== request.correlationId) throw Error("Wrong or stale test admission");
  const tree = await safeGit(["--no-replace-objects", "rev-parse", `${request.head}^{tree}`], { cwd: request.worktree, timeoutMs: 10_000 });
@@ -139,6 +139,7 @@ export function createSshTestBackend(selection: SshSelection, options: SshOption
    if (outcome.status !== "terminal") return failed(outcome.status === "revoked" ? "revoked" : outcome.reason);
    const job = selectSshJob(config, await readPrivateJson(jobPath));
    const receipt = validateRemoteTestReceipt(outcome.receipt, job);
+   if (profile.reviewed && receipt.status === "passed" && receipt.coverage?.requiredSkippedTests !== 0) return failed("incomplete_required_coverage");
    // The submission deadline bounds execution, not retrieval. The contract
    // already refuses a passed receipt completed after that deadline.
    return { result: { code: receipt.status === "passed" ? 0 : 1, stdout: `Remote supervisor tests: ${receipt.status}.`, stderr: receipt.status === "passed" ? "" : `Remote supervisor tests: ${receipt.status}; no local fallback.` }, evidence: { job, receipt, path, validUntil: receipt.completedAt + config.receiptMaxAgeMs } };

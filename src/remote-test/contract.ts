@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { MYELIN_REPOSITORY, ReviewedPolicySchema, validateReviewedManifest } from "./profiles.ts";
 
 /** V1 is deliberately limited to the first non-graphical Linux ARM64 lane. */
 const PlatformSchema = z.literal("linux-arm64");
@@ -49,6 +50,7 @@ const ProfileManifestSchema = z.object({
  ...ProfileBindingShape,
  /** Ordered argv vectors, never interpolated shell text supplied by a job. */
  commands: z.array(CommandSchema).min(1).max(32),
+ reviewed: ReviewedPolicySchema.optional(),
 }).strict();
 
 export const REMOTE_TEST_STATUSES = [
@@ -82,6 +84,8 @@ const ReceiptSchema = z.object({
  exitCode: z.number().int().min(0).max(255).nullable(),
  /** Older V1 producers remain readable; the durable executor always adds evidence. */
  evidence: EvidenceSchema.optional(),
+ /** Required-test skips are coverage failure, never accepted success. */
+ coverage: z.object({ requiredSkippedTests: z.number().int().nonnegative().safe().nullable() }).strict().optional(),
 }).strict().superRefine((value, ctx) => {
  if (value.evidence && value.evidence.startedAt + value.evidence.durationMs !== value.completedAt) {
   ctx.addIssue({ code: "custom", path: ["evidence"], message: "Receipt timing is inconsistent" });
@@ -89,6 +93,7 @@ const ReceiptSchema = z.object({
  if (value.status === "passed" && value.exitCode !== 0) {
   ctx.addIssue({ code: "custom", path: ["exitCode"], message: "Passed requires test exit zero" });
  }
+ if (value.status === "passed" && value.coverage && value.coverage.requiredSkippedTests !== 0) ctx.addIssue({ code: "custom", path: ["coverage"], message: "Passed requires complete required coverage" });
  if (value.status === "test_failed" && (value.exitCode === null || value.exitCode === 0)) {
   ctx.addIssue({ code: "custom", path: ["exitCode"], message: "Test failure requires a nonzero test exit" });
  }
@@ -109,7 +114,7 @@ export function validateJobIdentity(input: unknown): RemoteTestJob { return Iden
  * caller responsibilities: load this from an operator-owned allow-list, never
  * from the job or its submitter. A claimed digest does not authenticate content. */
 export function validateProfileManifest(input: unknown): ProfileManifest {
- return ProfileManifestSchema.parse(input);
+ return validateReviewedManifest(ProfileManifestSchema.parse(input));
 }
 
 /** Pure admission shape check against an already selected trusted profile.
@@ -118,6 +123,7 @@ export function validateProfileManifest(input: unknown): ProfileManifest {
 export function validateRemoteTestJob(input: unknown, operatorProfile: unknown): RemoteTestJob {
  const profile = validateProfileManifest(operatorProfile);
  const request = IdentitySchema.parse(input);
+ if (profile.reviewed && request.repositoryId !== MYELIN_REPOSITORY) throw Error("Reviewed recipe repository mismatch");
  const fields = Object.keys(ProfileBindingShape) as (keyof typeof ProfileBindingShape)[];
  for (const field of fields) {
   if (request[field] !== profile[field]) throw new Error(`Remote-test job does not match operator profile: ${field}`);

@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { submitSshRemoteTest, statusSshRemoteTest, validateSshConfig, type SshRunner } from "../src/remote-test/ssh-client.ts";
 import { sshOutcomeMessage, sshOutcomeExitCode } from "../src/remote-test/ssh-cli.ts";
+import { createReviewedProfile, MYELIN_REPOSITORY } from "../src/remote-test/profiles.ts";
 
 const roots: string[] = [];
 afterEach(async () => { for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
@@ -62,6 +63,16 @@ test("malformed, mismatched, stale, wrong-producer and future receipts refuse su
  const responses: unknown[] = ["partial JSON", { version: 1, receipt, extra: true }, { version: 1, receipt: { ...receipt, identity: { ...job, generation: 2 } } }, { version: 1, receipt: { ...receipt, executorId: "other" } }, { version: 1, receipt: { ...receipt, completedAt: now - 86_400_001 } }, { version: 1, receipt: { ...receipt, completedAt: now + 1 } }];
  for (const response of responses) { const f = fake(typeof response === "string" ? response : JSON.stringify(response)); let saved = false;
   expect((await statusSshRemoteTest({ config, job }, { runner: f.runner, now: () => now, receiptStore: async () => { saved = true; } })).status).toBe("infra_failed"); expect(saved).toBe(false);
+ }
+});
+test("reviewed profiles require explicit complete coverage from SSH receipt producers", async () => {
+ const reviewed = createReviewedProfile({ profileId: "myelin-v1", lockDigest: job.lockDigest, imageDigest: job.imageDigest, reviewed: { recipe: "myelin-v1", cache: "disabled", install: "frozen-offline-copy", checks: ["unit", "integration", "typecheck", "lint"], sidecars: [{ kind: "nats", imageReference: `localhost/nats@${sha("nats")}` }] } });
+ const request = { ...job, repositoryId: MYELIN_REPOSITORY, profileId: reviewed.profileId, profileDigest: reviewed.profileDigest };
+ for (const skipped of [undefined, null, 1, 0]) {
+  const response = { ...receipt, identity: request, ...(skipped !== undefined ? { coverage: { requiredSkippedTests: skipped } } : {}) };
+  const f = fake(JSON.stringify({ version: 2, receipt: response }));
+  const outcome = await statusSshRemoteTest({ config: { ...config, profiles: [reviewed] }, job: request }, { runner: f.runner, now: () => now });
+  expect(outcome.status).toBe(skipped === 0 ? "terminal" : "infra_failed");
  }
 });
 test("nonpassed terminal statuses retain their outcome; local receipt storage failure cannot expose success", async () => {

@@ -117,6 +117,11 @@ test("persisted receipt tampering and expiry refuse the pre-push validation", as
  const f = await fixture(), ssh = runner(), r = await runTestBackend(createSshTestBackend(f.selection, { runner: ssh.run }), f.request, noLocal);
  expect(r.result.code).toBe(0);
  await expect(assertTestEvidence({ ...r.evidence!, validUntil: Date.now() - 1 }, f.request)).rejects.toThrow();
+ const withCoverage = { ...r.evidence!, receipt: { ...r.evidence!.receipt, coverage: { requiredSkippedTests: 0 } } };
+ await writeFile(r.evidence!.path, JSON.stringify(withCoverage.receipt));
+ await assertTestEvidence(withCoverage, f.request);
+ await writeFile(r.evidence!.path, JSON.stringify(r.evidence!.receipt));
+ await expect(assertTestEvidence(withCoverage, f.request)).rejects.toThrow();
  await writeFile(r.evidence!.path, JSON.stringify({ ...r.evidence!.receipt, status: "test_failed", exitCode: 1 }));
  await expect(assertTestEvidence(r.evidence!, f.request)).rejects.toThrow();
 });
