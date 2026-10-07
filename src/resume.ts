@@ -8,7 +8,7 @@ import { implementLane, startsImplementSession, type ImplementLane } from "./lan
 import { graphNode, GRAPH_CALL_TIMEOUT_MS } from "./graph.ts";
 import type { GitHubPort } from "./github.ts";
 import type { OwnedCheck } from "./lock.ts";
-import { laneHeldMessage, mapKey, pickMap, recordImplementStart, resumeMap } from "./maps.ts";
+import { laneHeldMessage, mapKey, recordImplementStart, resumeMap } from "./maps.ts";
 import { spawnRunNodeDetached, type SpawnRunNodeArgs } from "./spawn.ts";
 
 export interface ResumeContext {
@@ -19,7 +19,7 @@ export interface ResumeContext {
  now?: () => Date;
 }
 
-async function identityGate(config: RangerConfig, map: RangerMapConfig): Promise<void> {
+async function identityGate(config: RangerConfig, map: Pick<RangerMapConfig, "repo">): Promise<void> {
  const refusal = executionRefusal(map.repo);
  if (refusal !== null) throw new WriteGateError(refusal);
  const { token } = resolveWriteToken(config, map.repo);
@@ -112,7 +112,7 @@ export async function resumeNode(nodeId: string, selector: string | undefined, c
     (selector === undefined || selector === e.repo || selector === mapKey(e)));
    if (entries.length !== 1) throw new Error(`no unique queued resume for node ${nodeId}`);
    const entry = entries[0];
-   await identityGate(config, pickMap(config, mapKey(entry)));
+   await identityGate(config, entry);
    owned();
    if (!journal.removeResume(entry, "resume-cancelled", "resume-node cancelled by operator")) throw new Error(`no queued resume for node ${nodeId}`);
    return { nodeId, repo: entry.repo, root: entry.root, cancelled: true };

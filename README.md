@@ -57,6 +57,8 @@ queued entries. Closed nodes, released or already active rows, merged or closed
 PRs and maps set to `walk: none` are removed with a reason. Moving a PR head
 keeps its entry valid. `ranger resume-node <id> --cancel` removes an entry and
 returns non-zero if none exists. Use `--map owner/name#root` to disambiguate.
+Cancellation remains available after a map is deregistered, using the queued
+repository's write-token mapping and the same machine-account identity gate.
 Starts by the walk count toward the daily spawn cap; immediate operator resumes
 do not. A queued entry never reserves a lane: if its head cannot start, fresh
 claims remain eligible that tick, while later queued entries in the lane wait.

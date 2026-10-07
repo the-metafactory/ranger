@@ -105,7 +105,7 @@ describe("resume-node CLI", () => {
  });
 
  for (const gate of ["pause", "cap"] as const) {
-  test(`${gate} queues a free-lane request, and later requests remain FIFO after the hold clears`, async () => {
+  test(`${gate} retains a held-lane request, and later requests remain FIFO after the hold clears`, async () => {
    await withRig(async r => {
     r.worker("40"); r.worker("41", 460, "running");
     if (gate === "pause") r.journal.setPaused(true);
@@ -224,6 +224,27 @@ describe("resume-node CLI", () => {
   });
  });
 
+ for (const removed of ["map", "repo"] as const) {
+  test(`cancel works after the queued ${removed} is deregistered, retaining the identity gate`, async () => {
+   await withRig(async r => {
+    r.queue("40"); r.queue("41", 460);
+    if (removed === "map") r.raw.maps.shift();
+    else for (const map of r.raw.maps) map.repo = "acme/other";
+    writeFileSync(r.configPath, stringify(r.raw));
+    const entries = r.journal.listResumeQueue();
+    for (const token of ["ghp_principal", ""]) {
+     expect((await r.cli("40", ["--cancel", "--map", REPO + "#1"], { RANGER_WRITE_TEST: token })).code).not.toBe(0);
+     expect(r.journal.listResumeQueue()).toEqual(entries);
+    }
+    expect((await r.cli("40", ["--cancel", "--map", REPO + "#1"])).code).toBe(0);
+    expect(r.journal.listResumeQueue()).toEqual([entries[1]]);
+    expect(r.journal.listEvents(REPO).find(e => e.kind === "resume-cancelled")?.nodeId).toBe("40");
+    expect(r.journal.getWorker("40", REPO)?.status).toBe("parked");
+    expect((await r.cli("40", ["--cancel"])).code).not.toBe(0);
+   });
+  });
+ }
+
  test("plain resume still refuses a held lane; force starts; conflicting flags refuse", async () => {
   await withRig(async r => {
    r.worker("40"); r.worker("41", 460, "running");
@@ -251,6 +272,26 @@ describe("resume-node CLI", () => {
 });
 
 describe("resume-queue-starts-when-lane-frees", () => {
+ test("deregistered head retains FIFO until cancellation allows the next entry to start", async () => {
+  await withRig(async r => {
+   const head = r.queue("40"); const next = r.queue("41", 460);
+   r.config.maps.shift();
+   r.raw.maps.shift(); writeFileSync(r.configPath, stringify(r.raw));
+   const spawned: string[] = [];
+   const ctx = { ...r, spawnRunNode: async ({ nodeId }: SpawnRunNodeArgs) => { spawned.push(nodeId); return process.pid; } };
+   for (let i = 0; i < 2; i++) {
+    await walk(ctx);
+    expect(spawned).toEqual([]);
+    expect(r.journal.listResumeQueue()).toEqual([head, next]);
+   }
+   expect(r.journal.listEvents(REPO).some(e => e.kind === "resume-dropped")).toBe(false);
+   expect((await r.cli("40", ["--cancel"])).code).toBe(0);
+   await walk(ctx);
+   expect(spawned).toEqual(["41"]);
+   expect(r.journal.listResumeQueue()).toEqual([]);
+  });
+ });
+
  test("transient reads and admission holds preserve prior failures until the third failed start", async () => {
   await withRig(async r => {
    const entry = r.queue("40");
@@ -534,6 +575,7 @@ describe("resume-queue-starts-when-lane-frees", () => {
    r.config.maps.unshift({ ...r.config.maps[0], repo });
    r.config.auth.writeTokens[repo] = "RANGER_QUEUE_UNAVAILABLE_TEST";
    delete process.env.RANGER_QUEUE_UNAVAILABLE_TEST;
+   r.journal.setHealth(LAST_IMPLEMENT_MAP, repo + "#1");
    r.journal.upsertWorker({ nodeId: "40", repo, root: 1, status: "parked", lane: "implement", phase: "review" });
    const entry = r.journal.enqueueResume({ nodeId: "40", repo, root: 1, lane: "headless" });
    r.worker("41", 460);
@@ -547,6 +589,8 @@ describe("resume-queue-starts-when-lane-frees", () => {
    expect(result.maps.flatMap(m => m.claimed)).toEqual(["20"]);
    expect(r.journal.listResumeQueue()).toEqual(independent ? [{ ...entry, failedStarts: 1 }] : [{ ...entry, failedStarts: 1 }, second]);
    expect(result.maps.find(m => m.repo === repo)?.errors.join(" ")).toContain("RANGER_QUEUE_UNAVAILABLE_TEST");
+   expect(result.maps.find(m => m.repo === repo)?.gateReason).toContain("RANGER_QUEUE_UNAVAILABLE_TEST");
+   expect(result.maps.filter(m => m.repo === REPO).flatMap(m => m.errors).join(" ")).not.toContain("RANGER_QUEUE_UNAVAILABLE_TEST");
    expect(r.journal.listEvents(repo).find(e => e.kind === "sweep")?.detail).toContain("queued resume #40 deferred");
   });
  });

@@ -1,4 +1,4 @@
-import { implementLane, startsImplementSession, type ImplementLane } from "./lanes.ts";
+import { implementLane, type ImplementLane } from "./lanes.ts";
 import { processResumeQueue } from "./resume.ts";
 import { executionRefusal } from "./forge-ref.ts";
 import { lastImplementMaps, recordImplementStart, mapKey, implementMapOrder } from "./maps.ts";
@@ -8,7 +8,7 @@ import type { RangerConfig, RangerMapConfig, WalkMode } from "./config.ts";
 import { DiscordAnnouncer, type AnnounceContext, type AnnounceResult } from "./announce.ts";
 import { BudgetDeferral, budgetPolicy } from "./budget.ts";
 import { readFrontier } from "./frontier-cache.ts";
-import { graphNode, GRAPH_CALL_TIMEOUT_MS } from "./graph.ts";
+import { GRAPH_CALL_TIMEOUT_MS } from "./graph.ts";
 import { graphClaim, type ClaimResult } from "./graph-write.ts";
 import {
  assertNotPrincipal,
@@ -288,6 +288,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
     (ctx.spawnRunNode ?? spawnRunNodeDetached)({ nodeId, repo, root, cliEntry, configPath: ctx.configPath }),
   });
  const maps: WalkMapResult[] = [];
+ const mapResults = new Map<RangerMapConfig, WalkMapResult>();
  const walked: { map: (typeof order)[number]; mapResult: WalkMapResult; token: string; botIdentity: string; errors: string[] }[] = [];
 
  // Pass 1 — authorize every walked map, sweep liveness, resume priority
@@ -311,6 +312,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
    paused: journal.isPaused(),
    errors: [],
   };
+  mapResults.set(map, mapResult);
 
   // Walk-mode gate (node #9): `none` registers the map, nothing more.
   if (map.walk === "none") {
@@ -412,9 +414,10 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
  if (journal.listResumeQueue().length > 0) {
   try {
    await withClaimLock(journal, owned => processResumeQueue({ ...ctx, github },
-    order.map((map, i) => {
+    order.map(map => {
      const w = walked.find(w => w.map === map);
-     return { map, token: w?.token, gateReason: maps[i].gateReason, errors: w?.errors ?? maps[i].errors };
+     const m = mapResults.get(map)!;
+     return { map, token: w?.token, gateReason: m.gateReason, errors: w?.errors ?? m.errors };
     }), implementClaimed, owned));
   } catch (error) {
    for (const w of walked) w.errors.push(`resume queue failed: ${error instanceof Error ? error.message : String(error)}`);
