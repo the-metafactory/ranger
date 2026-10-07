@@ -366,9 +366,9 @@ test("reviewed bootstrap copies private dependencies, performs frozen offline in
   const reviewed = createReviewedProfile({ profileId: "fixture", imageDigest: sha("runtime"), lockDigest: sha(lock.toString()), reviewed: { recipe: "myelin-v1", cache: "disabled", install: "frozen-offline-copy", checks: ["unit", "integration", "typecheck", "lint"], sidecars: [{ kind: "nats", imageReference: `localhost/nats@${sha("nats")}` }] } });
   const argv: [string, ...string[]][] = [reviewed.commands[0]!, [process.execPath, "--no-env-file", "test", "./fixture.test.ts"]];
   await writeFile(join(checkout, ".env"), "NATS_URL=nats://control-plane.invalid:4222\n");
-  const run = async (skip: boolean) => {
+  const run = async (skip: boolean | "todo") => {
    await rm(join(checkout, "node_modules"), { recursive: true, force: true });
-   await writeFile(join(checkout, "fixture.test.ts"), `import {expect,test} from 'bun:test'; test('required',()=>{expect(process.env.NATS_URL).toBe('nats://127.0.0.1:${broker.port}');}); ${skip ? "test.skip('missing required',()=>{});" : ""}`);
+   await writeFile(join(checkout, "fixture.test.ts"), `import {expect,test} from 'bun:test'; test('required',()=>{expect(process.env.NATS_URL).toBe('nats://127.0.0.1:${broker.port}');}); ${skip ? `test.${skip === "todo" ? "todo" : "skip"}('missing required',()=>{});` : ""}`);
    const program = containerProgram(argv, reviewed.reviewed, reviewed.lockDigest)
     .replaceAll('"/sys/fs/cgroup/', JSON.stringify(cgroup).slice(0, -1) + "/")
     .replaceAll("/opt/ranger-dependencies", image).replaceAll("/work", checkout)
@@ -380,6 +380,7 @@ test("reviewed bootstrap copies private dependencies, performs frozen offline in
   await writeFile(join(checkout, "node_modules", "canary"), "job-only");
   expect(await readFile(join(image, "node_modules", "canary"), "utf8")).toBe("immutable");
   expect(await run(true)).toMatchObject({ status: "infra_failed", coverage: { requiredSkippedTests: 1 } });
+  expect(await run("todo")).toMatchObject({ status: "infra_failed", coverage: { requiredSkippedTests: 1 } });
   expect(await readFile(join(checkout, "bun.lock"))).toEqual(lock);
  } finally { broker.stop(true); }
 });

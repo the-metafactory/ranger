@@ -5,6 +5,7 @@ import type { ProfileManifest } from "./contract.ts";
 /** Recipes are code-reviewed policy, not submitter-supplied commands or env. */
 export const ReviewedPolicySchema = z.object({
  recipe: z.literal("myelin-v1"),
+ runtime: z.literal("bun-1.3.14").default("bun-1.3.14"),
  cache: z.literal("disabled"),
  install: z.literal("frozen-offline-copy"),
  checks: z.array(z.enum(["unit", "integration", "typecheck", "lint"])).length(4)
@@ -50,7 +51,9 @@ export function validateReviewedManifest(profile: ProfileManifest): ProfileManif
  return profile;
 }
 export interface ContainerBudget { cpuCores: number; memoryBytes: number; pids: number }
+export const REMOTE_TEST_LIMITS = { cpuCores: 2, memoryBytes: 1610612736, pids: 256, timeoutMs: 600_000 } as const;
 export function profileBudgets(reviewed?: ReviewedPolicy): { test: ContainerBudget; nats?: ContainerBudget } {
- return reviewed ? { test: { cpuCores: 1.75, memoryBytes: 1342177280, pids: 224 }, nats: { cpuCores: 0.25, memoryBytes: 268435456, pids: 32 } }
-  : { test: { cpuCores: 2, memoryBytes: 1610612736, pids: 256 } };
+ const nats = { cpuCores: 0.25, memoryBytes: 268435456, pids: 32 };
+ return reviewed ? { test: { cpuCores: REMOTE_TEST_LIMITS.cpuCores - nats.cpuCores, memoryBytes: REMOTE_TEST_LIMITS.memoryBytes - nats.memoryBytes, pids: REMOTE_TEST_LIMITS.pids - nats.pids }, nats }
+  : { test: { cpuCores: REMOTE_TEST_LIMITS.cpuCores, memoryBytes: REMOTE_TEST_LIMITS.memoryBytes, pids: REMOTE_TEST_LIMITS.pids } };
 }

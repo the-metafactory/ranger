@@ -9,9 +9,9 @@ import { ResourceObservationSchema, validateProfileManifest, validateRemoteTestJ
 import { ArtifactPolicySchema, persistExecution, readExecutionReceipt, type ArtifactOptions } from "./artifacts.ts";
 import { restoreSource } from "./source.ts";
 import { ActiveRemoteTestJob, BusyRemoteTestExecutor, InterruptedRemoteTestJob, RevokedRemoteTestJob, openJobLedger, type JobLedger, type OwnedContainer } from "./job-ledger.ts";
-import { profileBudgets, type ReviewedPolicy, type ContainerBudget } from "./profiles.ts";
+import { REMOTE_TEST_LIMITS, profileBudgets, type ReviewedPolicy, type ContainerBudget } from "./profiles.ts";
 
-export const EXECUTOR_LIMITS = { cpuCores: 2, memoryBytes: 1610612736, pids: 256, timeoutMs: 600_000 } as const;
+export const EXECUTOR_LIMITS = REMOTE_TEST_LIMITS;
 export const CONTAINER_BOOTSTRAP_FLAGS = ["--config=/dev/null", "--no-env-file"] as const;
 const ConfigSchema = z.object({
  executorId: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/),
@@ -75,7 +75,7 @@ try {
    const clean = summary.replace(/\\x1b\\[[0-9;]*m/g, "");
    const passed = [...clean.matchAll(/^\\s*(\\d+) pass$/gm)].at(-1), failed = [...clean.matchAll(/^\\s*(\\d+) fail$/gm)].at(-1);
    if (!passed || !failed || Number(passed[1]) + Number(failed[1]) < 1) throw Error("Required test summary missing or empty");
-   skipped += [...clean.matchAll(/^\\s*(\\d+) skip$/gm)].reduce((sum, match) => sum + Number(match[1]), 0);
+   skipped += [...clean.matchAll(/^\\s*(\\d+) (?:skip|todo)$/gm)].reduce((sum, match) => sum + Number(match[1]), 0);
    result.coverage.requiredSkippedTests = skipped;
    if (skipped > 0) { result.status = "infra_failed"; break; }
   }` : ''}
@@ -98,6 +98,7 @@ process.exit(result.exitCode ?? 125);`;
  * The image's self-contained dependency snapshot is copied, never mounted RW. */
 function reviewedBootstrap(lockDigest: string): string {
  return `let skipped = 0;
+ if (Bun.version !== "1.3.14") throw Error("Reviewed recipe requires Bun 1.3.14");
  const crypto = await import("node:crypto");
  const digest = "sha256:"+crypto.createHash("sha256").update(await fs.readFile("/opt/ranger-dependencies/bun.lock")).digest("hex");
  if (digest !== ${JSON.stringify(lockDigest)}) throw Error("Image dependencies do not match lock");

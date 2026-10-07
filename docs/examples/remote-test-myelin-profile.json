@@ -4,6 +4,7 @@
   "imageDigest": "sha256:<REVIEWED_LINUX_ARM64_BUN_IMAGE_SHA256>",
   "reviewed": {
     "recipe": "myelin-v1",
+    "runtime": "bun-1.3.14",
     "cache": "disabled",
     "install": "frozen-offline-copy",
     "checks": ["unit", "integration", "typecheck", "lint"],
