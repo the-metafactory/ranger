@@ -415,7 +415,6 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
    await withClaimLock(journal, async owned => {
     const waiting = new Set<ImplementLane>();
     for (const entry of journal.listResumeQueue()) {
-     if (waiting.has(entry.lane) || implementClaimed.has(entry.lane)) continue;
      const map = config.maps.find(m => m.repo === entry.repo && m.root === entry.root);
      const w = walked.find(w => w.map === map);
      const drop = (reason: string) => {
@@ -426,6 +425,11 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
       drop(map === undefined ? "map is no longer registered" : "map is walk: none");
       continue;
      }
+     if (entry.lane !== implementLane(map)) {
+      drop(`map implement lane changed from ${entry.lane} to ${implementLane(map)}`);
+      continue;
+     }
+     if (waiting.has(entry.lane) || implementClaimed.has(entry.lane)) continue;
      const row = journal.getWorker(entry.nodeId, entry.repo);
      if (row === null || row.root !== entry.root || row.status === "released" || row.status === "claimed" || row.status === "running") {
       drop(row === null ? "worker row is missing" : row.root !== entry.root ? "worker map root changed" : `worker row is ${row.status}`);
@@ -437,7 +441,11 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
       owned();
       journal.recordEvent("sweep", { nodeId: entry.nodeId, repo: entry.repo, detail: message });
       mapResult.errors.push(message);
-      continue; // Retain the entry without reserving another map's capacity.
+      if (startsImplementSession(row)) {
+       waiting.add(entry.lane);
+       implementClaimed.add(entry.lane);
+      }
+      continue;
      }
      const takesLane = startsImplementSession(row);
      if (journal.isPaused() || journal.spawnsToday(ctx.now?.() ?? new Date()) >= config.workers.spawnCapPerDay) {
@@ -488,7 +496,10 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
      } catch (error) {
       waiting.add(entry.lane);
       implementClaimed.add(implementLane(map));
-      w.errors.push(`queued resume #${entry.nodeId}: ${error instanceof Error ? error.message : String(error)}`);
+      const reason = `start failed: ${error instanceof Error ? error.message : String(error)}`;
+      owned();
+      journal.recordEvent("sweep", { nodeId: entry.nodeId, repo: entry.repo, detail: `queued resume #${entry.nodeId} deferred: ${reason}` });
+      w.errors.push(`queued resume #${entry.nodeId}: ${reason}`);
      }
     }
    });

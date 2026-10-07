@@ -68,7 +68,7 @@ export async function startResumeNode(
  owned();
  if (options.queued !== undefined && pid === null) {
   restore();
-  return { ...result, queued: true };
+  throw new Error("run-node spawn returned no PID");
  }
  if (pid !== null) journal.updateWorker(nodeId, map.repo, { pid });
  if (takesLane) recordImplementStart(journal, map);
@@ -111,7 +111,7 @@ export async function resumeNode(nodeId: string, selector: string | undefined, c
    await identityGate(config, map);
    owned();
    const entry = journal.enqueueResume({ nodeId, repo: map.repo, root: map.root, lane }, now);
-   return { nodeId, repo: map.repo, root: map.root, queued: true, lane, queuedAt: entry.queuedAt };
+   return { nodeId, repo: map.repo, root: map.root, queued: true, lane: entry.lane, queuedAt: entry.queuedAt };
   }
   return startResumeNode(nodeId, map, ctx, owned, { force: options.force });
  });

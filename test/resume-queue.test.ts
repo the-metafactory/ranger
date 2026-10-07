@@ -165,6 +165,17 @@ describe("resume-node CLI", () => {
   });
  });
 
+ test("requeue reports the stored lane after the map's lane changes", async () => {
+  await withRig(async r => {
+   const entry = r.queue("40");
+   r.config.maps[0].lane = "visual";
+   r.journal.setPaused(true);
+   const result = await resumeNode("40", undefined, r, { whenFree: true });
+   expect(result).toMatchObject({ queued: true, lane: entry.lane, queuedAt: entry.queuedAt });
+   expect(r.journal.listResumeQueue()).toEqual([entry]);
+  });
+ });
+
  for (const [lane, phase] of [["research", null], ["implement", "close"]] as const) {
   test(`${lane}/${phase} resumes immediately despite backlog, pause and cap`, async () => {
    await withRig(async r => {
@@ -411,36 +422,64 @@ describe("resume-queue-starts-when-lane-frees", () => {
  });
  }
 
- test("unreachable queue head retains its entry without blocking an independent lane", async () => {
+ for (const failure of ["validation", "no PID"] as const) {
+ test(`${failure} failure retains its entry without blocking an independent lane`, async () => {
   await withRig(async r => {
    r.config.maps[1].lane = "visual";
-   const entry = r.queue("40"); rmSync(join(r.env.FAKE_SOMA_DIR!, "acme__widgets-node-40.json"));
+   const entry = r.queue("40");
+   if (failure === "validation") rmSync(join(r.env.FAKE_SOMA_DIR!, "acme__widgets-node-40.json"));
    r.frontier(460, ["21"]);
    const spawned: string[] = [];
-   const result = await walk({ ...r, spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; } });
+   const result = await walk({ ...r, spawnRunNode: async ({ nodeId }) => {
+    if (nodeId === "40") return null;
+    spawned.push(nodeId); return process.pid;
+   } });
    expect(spawned).toEqual(["21"]);
    expect(result.maps.flatMap(m => m.claimed)).toEqual(["21"]);
    expect(r.journal.listResumeQueue()).toEqual([entry]);
+   expect(result.maps.flatMap(m => m.errors).join(" ")).toContain(failure === "validation" ? "validation failed" : "run-node spawn returned no PID");
   });
  });
+ }
 
- test("credential-gated queue keeps its entry without reserving another map's shared lane", async () => {
+ for (const independent of [false, true]) {
+ test(`credential-gated queue preserves FIFO ${independent ? "without blocking an independent lane" : "and holds shared-lane claims"}`, async () => {
   await withRig(async r => {
+   if (independent) r.config.maps[1].lane = "visual";
    const repo = "acme/unavailable";
    r.config.maps.unshift({ ...r.config.maps[0], repo });
    r.config.auth.writeTokens[repo] = "RANGER_QUEUE_UNAVAILABLE_TEST";
    delete process.env.RANGER_QUEUE_UNAVAILABLE_TEST;
    r.journal.upsertWorker({ nodeId: "40", repo, root: 1, status: "parked", lane: "implement", phase: "review" });
    const entry = r.journal.enqueueResume({ nodeId: "40", repo, root: 1, lane: "headless" });
+   r.worker("41", 460);
+   const second = r.journal.enqueueResume({ nodeId: "41", repo: REPO, root: 460, lane: independent ? "visual" : "headless" });
+   r.frontier(1, ["20"]);
    r.frontier(460, ["21"]);
    const spawned: string[] = [];
    const tick = () => walk({ ...r, spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; } });
    const result = await tick();
-   expect(spawned).toEqual(["21"]);
-   expect(result.maps.flatMap(m => m.claimed)).toEqual(["21"]);
-   expect(r.journal.listResumeQueue()).toEqual([entry]);
+   expect(spawned).toEqual(independent ? ["41"] : []);
+   expect(result.maps.flatMap(m => m.claimed)).toEqual([]);
+   expect(r.journal.listResumeQueue()).toEqual(independent ? [entry] : [entry, second]);
    expect(result.maps.find(m => m.repo === repo)?.errors.join(" ")).toContain("RANGER_QUEUE_UNAVAILABLE_TEST");
    expect(r.journal.listEvents(repo).find(e => e.kind === "sweep")?.detail).toContain("queued resume #40 deferred");
+  });
+ });
+ }
+
+ test("a changed map lane drops the stale entry and considers the next entry", async () => {
+  await withRig(async r => {
+   r.queue("40"); const next = r.queue("41", 460);
+   r.config.maps[0].lane = "visual";
+   const spawned: string[] = [];
+   await walk({ ...r, spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; } });
+   expect(spawned).toEqual(["41"]);
+   expect(r.journal.listResumeQueue()).toEqual([]);
+   expect(r.journal.getWorker("40", REPO)?.status).toBe("parked");
+   expect(r.journal.listEvents(REPO).find(e => e.kind === "resume-dropped" && e.nodeId === "40")?.detail)
+    .toContain("map implement lane changed from headless to visual");
+   expect(r.journal.listEvents(REPO).find(e => e.kind === "resume-started")?.nodeId).toBe(next.nodeId);
   });
  });
 
@@ -483,17 +522,49 @@ describe("resume-queue-starts-when-lane-frees", () => {
   });
  });
 
- test("spawn failure or no PID retains the parked queue entry for retry", async () => {
+ for (const failure of ["no PID", "throws", "disabled"] as const) {
+ test(`${failure} reports failed queued starts, retains FIFO and restores rows until recovery`, async () => {
   await withRig(async r => {
-   r.queue("40");
-   for (const spawnRunNode of [async () => null, async () => { throw new Error("spawn failed"); }]) {
-    await walk({ ...r, spawnRunNode });
-    expect(r.journal.listResumeQueue()).toHaveLength(1);
-    expect(r.journal.getWorker("40", REPO)?.status).toBe("parked");
-    expect(r.journal.spawnsToday()).toBe(0);
+   r.queue("40"); r.queue("41", 460);
+   r.frontier(1, ["20"]); r.frontier(460, ["21"]);
+   const entries = r.journal.listResumeQueue();
+   const before = r.journal.getWorker("40", REPO);
+   const spawned: string[] = [];
+   const error = failure === "throws" ? "spawn failed" : "run-node spawn returned no PID";
+   const spawnRunNode = failure === "disabled" ? undefined : async ({ nodeId }: SpawnRunNodeArgs) => {
+    spawned.push(nodeId);
+    if (failure === "throws") throw new Error(error);
+    return null;
+   };
+   for (let attempt = 0; attempt < 2; attempt++) {
+    const result = await walk({ ...r, spawnRunNode, now: () => NOW });
+    expect(spawned).toEqual(failure === "disabled" ? [] : Array(attempt + 1).fill("40"));
+    expect(result.maps.flatMap(m => m.claimed)).toEqual([]);
+    expect(result.maps.flatMap(m => m.errors).join(" ")).toContain(`queued resume #40: start failed: ${error}`);
+    expect(r.journal.listResumeQueue()).toEqual(entries);
+    expect(r.journal.getWorker("40", REPO)).toEqual(before);
+    expect(r.journal.getWorker("41", REPO)?.status).toBe("parked");
+    expect(r.journal.spawnsToday(NOW)).toBe(0);
+    expect(r.journal.getHealth(LAST_IMPLEMENT_MAP + ".headless")).toBeNull();
    }
+   const events = r.journal.listEvents(REPO).filter(e => e.kind === "sweep" && e.detail?.includes("queued resume #40 deferred: start failed"));
+   expect(events).toHaveLength(2);
+   expect(events.every(e => e.detail?.includes(error))).toBe(true);
+   expect(r.journal.listEvents(REPO).some(e => e.kind === "resume-started")).toBe(false);
+   const recovered: string[] = [];
+   const tick = () => walk({ ...r, now: () => NOW,
+    spawnRunNode: async ({ nodeId }) => { recovered.push(nodeId); return process.pid; } });
+   await tick();
+   expect(recovered).toEqual(["40"]);
+   expect(r.journal.listResumeQueue()).toEqual([entries[1]]);
+   expect(r.journal.spawnsToday(NOW)).toBe(1);
+   r.journal.updateWorker("40", REPO, { status: "success" });
+   await tick();
+   expect(recovered).toEqual(["40", "41"]);
+   expect(r.journal.listResumeQueue()).toEqual([]);
   });
  });
+ }
 });
 
 test("resume queue migration appends to the prior journal and preserves worker state", () => {

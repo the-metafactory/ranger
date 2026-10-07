@@ -55,13 +55,16 @@ Research and close-only resumes start immediately. On each walk tick, queued
 resumes run after merge desks and before new claims; a started implement resume
 reserves its lane for that tick. The dead-man pause and daily spawn cap retain
 queued entries. Closed nodes, released or already active rows, merged or closed
-PRs, and maps set to `walk: none` are removed with a reason. Moving a PR head
+PRs, maps set to `walk: none`, and entries whose map changed implement lanes
+are removed with a reason. Moving a PR head
 keeps its entry valid. `ranger resume-node <id> --cancel` removes an entry and
 returns non-zero if none exists. Use `--map owner/name#root` to disambiguate.
-An entry whose node or PR cannot be validated stays queued and reports the
+An entry whose node or PR cannot be validated, or whose run-node fails to
+start (including a spawn returning no PID), stays queued and reports the
 error; later resumes and new claims in its implement lane wait for a retry.
-Credential/execution-gated maps
-retain entries and report the gate failure without reserving shared capacity.
+Credential/execution-gated maps retain entries and report the gate failure;
+later resumes and new claims in that implement lane wait for the gate to clear.
+Independent implement lanes can still start work.
 
 Parked infrastructure probe failures automatically requeue on the next `walk`
 when their lane is free, oldest first across maps. They take priority over
