@@ -129,6 +129,19 @@ test("cancel before admission is durable, fences the generation and never launch
   expect(reopened.admit({ ...j, jobId: randomUUID() }).kind).toBe("terminal");
  } finally { reopened.close(); }
 });
+test("a busy newer generation fences old work without consuming its own job identity", async () => {
+ const f = await fixture(), old = job(), next = { ...old, jobId: randomUUID(), generation: 2 };
+ const admitted = f.ledger.admit(old); if (admitted.kind !== "admitted") throw Error();
+ try {
+  f.ledger.launch(old, admitted.token);
+  expect(f.ledger.admit(next)).toEqual({ kind: "busy" });
+  expect(f.ledger.recorded(next)).toBe(false); expect(f.ledger.status(next)).toBeNull();
+  expect(f.ledger.allowed(old, admitted.token)).toBe(false);
+  expect(() => f.ledger.launch(old, admitted.token)).toThrow("launch fence");
+  expect(f.ledger.complete(old, admitted.token, { version: 1, identity: old, executorId: "fixture", status: "passed", exitCode: 0, completedAt: f.now() }).status).toBe("cancelled");
+  expect(f.ledger.admit(next).kind).toBe("admitted");
+ } finally { f.ledger.close(); }
+});
 test("cancellation, expiry and supersession fence launch and late success", async () => {
  for (const reason of ["cancel", "expire", "supersede"] as const) {
   const f = await fixture(), j = job(), a = f.ledger.admit(j); if (a.kind !== "admitted") throw Error();
