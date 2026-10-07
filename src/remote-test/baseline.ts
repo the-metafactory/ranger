@@ -202,7 +202,7 @@ done
 printf '%s\\n' "$available"`]))),
   controller: async c => {
    const p = shellQuote(c.cgroupRoot);
-   await checked(["sh", "-c", `set -eu; [ "$(stat -f -c %T ${p})" = cgroup2fs ]; test -w ${p}; test -r ${p}/memory.peak; test -w ${p}/cgroup.kill; grep -qw cpu ${p}/cgroup.subtree_control; grep -qw memory ${p}/cgroup.subtree_control; printf cgroup-v2`]);
+   await checked(["sh", "-c", `set -eu; [ "$(stat -f -c %T ${p})" = cgroup2fs ]; test -w ${p}; test -r ${p}/memory.peak; test -r ${p}/memory.swap.max; test -w ${p}/cgroup.kill; grep -qw cpu ${p}/cgroup.subtree_control; grep -qw memory ${p}/cgroup.subtree_control; printf cgroup-v2`]);
    return "cgroup-v2";
   },
   health: async h => { await checked(["sh", "-c", `${h.command.map(shellQuote).join(" ")} >/dev/null && printf healthy`]); return "healthy"; },

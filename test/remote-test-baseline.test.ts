@@ -37,7 +37,8 @@ describe("baseline handler", () => {
   test(`failed required ${name} probe is explicit, nonzero and blocks the workload`, async () => {
    const f = fixture(); f.metrics[name] = async () => { throw new Error("unavailable"); };
    const r = await runBaseline(config, { run: true, metrics: f.metrics });
-   expect(r.exitCode).toBe(1); expect(f.calls).not.toContain("workload"); expect(JSON.stringify(r.report)).toContain("failed");
+   expect(r.exitCode).toBe(1); expect(f.calls).not.toContain("workload");
+   expect(name === "health" ? r.report.preHealth[0]!.measurement.status : r.report[name === "availableMemory" ? "availableMemoryBefore" : name].status).toBe("failed");
   });
  }
  test("insufficient capacity yields without a job", async () => {
@@ -68,6 +69,22 @@ describe("baseline handler", () => {
   const f = fixture(); await expect(runBaseline({ ...config, profile: { ...config.profile, version: 2 } } as unknown as BaselineConfig, { metrics: f.metrics })).rejects.toThrow();
   expect(f.calls).toHaveLength(0);
  });
+});
+
+test("capacity controller probe rejects missing swap support without starting a workload (fake controller)", async () => {
+ const dir = await mkdtemp(join(tmpdir(), "ranger-baseline-controller-"));
+ try {
+  await writeFile(join(dir, "memory.peak"), "0"); await writeFile(join(dir, "cgroup.kill"), "");
+  await writeFile(join(dir, "cgroup.subtree_control"), "cpu memory");
+  const local = localCommandAdapter();
+  const m = createCommandMetrics(async (argv, timeout) => {
+   const script = argv[2]!.replaceAll(config.cgroupRoot, dir).replace(`stat -f -c %T ${shellQuote(dir)}`, "printf cgroup2fs");
+   return local(["sh", "-c", script], timeout);
+  });
+  await expect(m.controller(config)).rejects.toThrow();
+  await writeFile(join(dir, "memory.swap.max"), "max");
+  expect(await m.controller(config)).toBe("cgroup-v2");
+ } finally { await rm(dir, { recursive: true, force: true }); }
 });
 describe("command adapters (no live hosts)", () => {
  test("local adapter forwards argv and timeout with group cleanup", async () => {
