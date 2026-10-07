@@ -53,7 +53,7 @@ import {
  serveConfig,
  type WalkMode,
 } from "./config.ts";
-import { planTick, walkableCandidates } from "./candidates.ts";
+import { implementCandidates, planTick, walkableCandidates } from "./candidates.ts";
 import { pidAlive as defaultPidAlive } from "./exec.ts";
 import { Journal, type WorkerRow } from "./journal.ts";
 import { ForeignMigrationError } from "./journal-guard.ts";
@@ -265,6 +265,12 @@ export interface DashboardMap {
  source: "ranger" | "serve";
  localCheckout?: string;
  next: NextJob;
+ /**
+  * The implement nodes behind `next`, in the order the walk takes them
+  * (frontier order, one at a time per lane), vetoed ones left out. Other
+  * maps on the same lane take turns with these.
+  */
+ queued: NodeView[];
  autonomous: NodeView[];
  grillings: GrillingView[];
  decisions: DecisionView[];
@@ -447,6 +453,11 @@ export function assembleState(inputs: StateInputs): DashboardState {
    source: report?.source ?? (map.servedOnly ? "serve" : "ranger"),
    localCheckout: map.localCheckout,
    next: planned.get(map.key)!,
+   queued: walked
+    ? implementCandidates(frontier)
+       .filter((n) => n.id !== planned.get(map.key)!.nodeId && !inputs.vetoed(n.id))
+       .map(view)
+    : [],
    autonomous: walked ? walkableCandidates(frontier).map(view) : [],
    grillings: frontier
     .filter((n) => n.kind === "grilling")
@@ -948,6 +959,7 @@ function renderCurrent(s) {
   }))) };
  }));
 }
+const ordinal = (k) => k + (k % 10 === 1 && k % 100 !== 11 ? "st" : k % 10 === 2 && k % 100 !== 12 ? "nd" : k % 10 === 3 && k % 100 !== 13 ? "rd" : "th");
 function renderNext(s) {
  const box = document.getElementById("next"); box.replaceChildren();
  for (const lane of ["visual", "headless"]) {
@@ -955,10 +967,14 @@ function renderNext(s) {
   box.append(el("h3", { text: lane + " lane · " + (holder ? "held by #" + holder.nodeId + " (" + holder.repo + "#" + holder.root + ")" : "free") }));
   box.append(...byRepo("next/" + lane, s.maps.filter((m) => m.lane === lane), (m) => m.repo, (m) => {
    const n = m.next;
-   const body = n.nodeId
-    ? el("p", {}, el("span", { class: "id", text: "#" + n.nodeId + " " }), link(n.url, n.title), " ", buildButton(s, m, { id: n.nodeId, title: n.title, lane: n.lane }), el("span", { class: "reason", text: (n.lane ? n.lane + " lane · " : "") + n.reason }))
-    : empty(n.reason);
-   return mapGroup("next/" + lane, m, "", n.nodeId ? 1 : 0, mapMeta(m), body);
+   const queued = m.queued || [];
+   const head = n.nodeId
+    ? el("li", {}, el("span", { class: "id", text: "#" + n.nodeId }), el("span", { class: "t" }, link(n.url, n.title), el("span", { class: "reason", text: (n.lane ? n.lane + " lane · " : "") + n.reason })), tags(tag("next"), buildButton(s, m, { id: n.nodeId, title: n.title, lane: n.lane })))
+    : null;
+   const rest = queued.map((q, i) => el("li", {}, el("span", { class: "id", text: "#" + q.id }), el("span", { class: "t" }, link(q.url, q.title), el("span", { class: "reason", text: "then, " + ordinal(i + (n.nodeId ? 2 : 1)) + " in this map's queue" })), tags(tag(q.lane + " · " + q.kind), buildButton(s, m, q))));
+   // With no head (cap spent, paused, vetoed), say why before the queue that waits.
+   const body = el("div", {}, head ? null : empty(n.reason), head || rest.length > 0 ? el("ul", {}, head, ...rest) : null);
+   return mapGroup("next/" + lane, m, "", (n.nodeId ? 1 : 0) + queued.length, mapMeta(m), body);
   }));
  }
 }

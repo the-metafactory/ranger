@@ -157,6 +157,24 @@ describe("#37 — the state the dashboard shows", () => {
   expect(map.grillings.map((g) => g.id)).toEqual(["12", "13"]);
  });
 
+ test("the queue behind next is the rest of the implement nodes in walk order, vetoed ones left out", () => {
+  const frontier = [entry("30", "task"), entry("31", "task"), entry("32", "build"), entry("33", "task")];
+  const map = assembleState(
+   inputs({ reports: new Map([[walked.key, report(frontier)]]), vetoed: (id) => id === "32" }),
+  ).maps[0];
+  expect(map.next.nodeId).toBe("30");
+  expect(map.queued.map((n) => n.id)).toEqual(["31", "33"]);
+  // While the lane is held, next is the node that waits for it; the queue still follows it.
+  const held = assembleState(
+   inputs({
+    reports: new Map([[walked.key, report(frontier)]]),
+    laneHolders: { visual: null, headless: worker({ repo: "acme/other", nodeId: "99", status: "running" }) },
+   }),
+  ).maps[0];
+  expect([held.next.nodeId, held.next.waiting]).toEqual(["30", true]);
+  expect(held.queued.map((n) => n.id)).toEqual(["31", "32", "33"]);
+ });
+
  test("next is what the tick would take: the same selection walk makes", () => {
   const frontier = classified(FRONTIER, ["11"]);
   const tick = selectCandidates(frontier, false);
