@@ -1,3 +1,4 @@
+import { encodeForgeRef, parseForgeRef } from "./forge-ref.ts";
 import type { SubstrateName } from "./store/schema.ts";
 import { runReadRetryingTransient } from "./transient.ts";
 import { gatedEnv } from "./token-gate.ts";
@@ -44,7 +45,7 @@ export async function sageReview(
 ): Promise<ReviewVerdict> {
  const gated = gatedEnv(readOnlyToken, {}, workerHostEnv());
  try {
-  const args = ["review", `${repo}#${prNumber}`, "--emit-verdict-block"];
+  const args = ["review", encodeForgeRef(parseForgeRef(repo), prNumber).key, "--emit-verdict-block"];
   // The cross-model choice. Checked against sage 0.2.12 (a4f12c9,
   // src/cli/index.ts): `review` takes `--substrate <name>` with
   // {pi|claude|codex}; without it sage falls back to SAGE_SUBSTRATE / config.

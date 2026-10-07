@@ -1,3 +1,4 @@
+import { encodeForgeRef, parseForgeRef } from "./forge-ref.ts";
 import {
   type BudgetPolicy,
   assertNotThrottled,
@@ -49,7 +50,7 @@ interface CachedFrontier {
   frontier: FrontierResult;
 }
 
-const CACHE_KEY = (repo: string, root: number) => `frontier:${repo}#${root}`;
+export const frontierCacheKey = (repo: string, root: number) => encodeForgeRef(parseForgeRef(repo), root).cacheKey;
 
 /**
  * The repo's change sentinel: `<newest issue updated_at>|<newest issue-event
@@ -59,6 +60,8 @@ export async function readRepoSentinel(
   repo: string,
   token: string,
 ): Promise<string | null> {
+  // GitLab sentinel reads belong to the forge read seam, not gh's API.
+  if (parseForgeRef(repo).forge !== "github") return null;
   const gated = gatedEnv(token);
   try {
     const read = async (path: string, jq: string) => {
@@ -87,7 +90,7 @@ function readCache(
   repo: string,
   root: number,
 ): CachedFrontier | null {
-  const raw = journal.getHealth(CACHE_KEY(repo, root));
+  const raw = journal.getHealth(frontierCacheKey(repo, root));
   if (raw === null) return null;
   try {
     return JSON.parse(raw) as CachedFrontier;
@@ -151,7 +154,7 @@ export async function readFrontier(
       fetchedAt: now.toISOString(),
       frontier,
     };
-    journal.setHealth(CACHE_KEY(repo, root), JSON.stringify(entry));
+    journal.setHealth(frontierCacheKey(repo, root), JSON.stringify(entry));
   }
   return { frontier, source: "fresh" };
 }

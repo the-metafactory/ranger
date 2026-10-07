@@ -1,3 +1,4 @@
+import { encodeForgeRef, parseForgeRef } from "./forge-ref.ts";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { availableParallelism, loadavg, tmpdir } from "node:os";
@@ -1434,7 +1435,7 @@ async function closeAfterMerge(
   (p) => p.sha === pr.headSha && p.passed,
  );
  const resolution = closeResolution(ctx, pr, final, reviews.length, success, probe);
- const resolutionFile = join(tmpdir(), `ranger-close-${repo.replace("/", "__")}-${nodeId}.md`);
+ const resolutionFile = join(tmpdir(), `ranger-close-${encodeForgeRef(parseForgeRef(repo), nodeId).fileStem}.md`);
  writeFileSync(resolutionFile, resolution, "utf8");
 
  const prRef = `https://github.com/${repo}/pull/${pr.number}`;

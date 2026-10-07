@@ -1,3 +1,4 @@
+import { encodeForgeRef, parseForgeRef } from "./forge-ref.ts";
 import { mapKey } from "./maps.ts";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
@@ -933,7 +934,7 @@ async function runResearch(
  });
  journal.recordEvent("ci-passed", { nodeId, repo, detail: `research ${evidence.ci} (${evidence.check.name})` });
  const resolution = `${findings.stdout.trim()}\n\nResearch CI evidence: draft ${evidence.pr.url}, check run ${evidence.ci}.`;
- const resolutionFile = join(tmpdir(), `ranger-close-${repo.replace("/", "__")}-${nodeId}.md`);
+ const resolutionFile = join(tmpdir(), `ranger-close-${encodeForgeRef(parseForgeRef(repo), nodeId).fileStem}.md`);
  writeFileSync(resolutionFile, resolution, "utf8");
 
  // The close gate's ungated probes (git-ref-exists / artifact-exists) resolve
