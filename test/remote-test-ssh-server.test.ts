@@ -82,8 +82,10 @@ test("run command stages unpushed clean HEAD and saves private job before transp
  await writeFile(join(repo, "bun.lock"), "dirty"); await expect(runSshCommand({ ...options, output: join(f.root, "new-receipt"), jobOutput: join(f.root, "new-job") }, { runner })).rejects.toThrow("clean"); expect(calls).toBe(2);
 });
 test("CLI run and status expose truthful nonzero exit codes without leaking private input errors", async () => {
- const result = await runCmd("bun", ["src/cli.ts", "remote-test", "status", "--config", "/absent/private/config", "--job", "/absent/private/job", "--output", "/absent/private/receipt"]);
- expect(result.code).toBe(1); expect(result.stderr).toContain("private input"); expect(result.stderr).not.toContain("/absent/private");
+ for (const [command, extra] of [["status", ["--job", "/absent/private/job"]], ["run", ["--request", "/absent/private/request", "--worktree", "/absent/private/worktree", "--staging-root", "/absent/private/staging", "--job-output", "/absent/private/job"]]] as const) {
+  const result = await runCmd("bun", ["src/cli.ts", "remote-test", command, "--config", "/absent/private/config", ...extra, "--output", "/absent/private/receipt"]);
+  expect(result.code).toBe(1); expect(result.stderr).toContain("private input"); expect(result.stderr).not.toContain("/absent/private");
+ }
  expect(sshOutcomeExitCode({ status: "pending", reason: "no_terminal_receipt" })).toBe(1);
 });
 test("client wire roundtrip through receiver and real durable executor storage is retrievable without reexecution", async () => {

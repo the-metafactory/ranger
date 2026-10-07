@@ -6,7 +6,13 @@ import { sshRunner } from "../src/remote-test/ssh-client.ts";
 
 let root: string | undefined;
 const oldPath = process.env.PATH;
-afterEach(async () => { process.env.PATH = oldPath; if (root) await rm(root, { recursive: true, force: true }); root = undefined; });
+const secretKeys = ["GH_TOKEN", "NATS_TOKEN", "RANGER_JOURNAL_PATH"] as const;
+const originalSecrets = new Map(secretKeys.map(key => [key, process.env[key]]));
+afterEach(async () => {
+ process.env.PATH = oldPath;
+ for (const key of secretKeys) { const value = originalSecrets.get(key); if (value === undefined) delete process.env[key]; else process.env[key] = value; }
+ if (root) await rm(root, { recursive: true, force: true }); root = undefined;
+});
 async function executable(program: string) {
  root = await realpath(await mkdtemp(join(tmpdir(), "ranger-ssh-runner-")));
  await writeFile(join(root, "ssh"), `#!${process.execPath}\n${program}`, { mode: 0o700 });
@@ -14,6 +20,7 @@ async function executable(program: string) {
 }
 const input = (bytes = Buffer.from("bounded request")) => (async function* () { yield bytes; })();
 test("real SSH subprocess seam feeds stdin, drains stderr, and excludes inherited forge/bus secrets", async () => {
+ for (const key of secretKeys) process.env[key] = "test-only-credential-sentinel";
  await executable('for await (const _ of process.stdin) {} process.stderr.write("private diagnostic".repeat(10000)); console.log(JSON.stringify({ blocked: ["GH_TOKEN", "NATS_TOKEN", "RANGER_JOURNAL_PATH"].some(k => k in process.env) }));');
  const result = await sshRunner({ args: [], input: input(), timeoutMs: 3000 }); expect(result.code).toBe(0); expect(JSON.parse(result.stdout)).toEqual({ blocked: false });
 });
