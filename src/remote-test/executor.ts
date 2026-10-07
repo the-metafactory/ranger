@@ -8,6 +8,7 @@ import { killProcessGroup } from "../exec.ts";
 import { ResourceObservationSchema, validateProfileManifest, validateRemoteTestJob, validateRemoteTestReceipt, type RemoteTestReceipt, type ResourceObservation } from "./contract.ts";
 import { ArtifactPolicySchema, persistExecution, type ArtifactOptions } from "./artifacts.ts";
 import { restoreSource } from "./source.ts";
+import { ActiveRemoteTestJob, openJobLedger, type JobLedger, type OwnedContainer } from "./job-ledger.ts";
 
 export const EXECUTOR_LIMITS = { cpuCores: 2, memoryBytes: 1610612736, pids: 256, timeoutMs: 600_000 } as const;
 export const CONTAINER_BOOTSTRAP_FLAGS = ["--config=/dev/null", "--no-env-file"] as const;
@@ -82,17 +83,38 @@ process.exit(result.exitCode ?? 125);`;
 /** One operator-exclusive jobs root is one lane. Configuration is trusted and
  * reviewed, never supplied by the job; profile digest authentication belongs
  * to that admission layer. Source and lock bytes are verified here. */
-export async function executeRemoteTest(
- input: { job: unknown; bundlePath: string; config: unknown },
- options: { launcher?: ExecutorLauncher; signal?: AbortSignal; timeoutMs?: number; now?: () => number; uid?: number; gid?: number; artifactFault?: ArtifactOptions["fault"]; removeLane?: (path: string) => Promise<void> } = {},
+type ExecutionInput = { job: unknown; bundlePath: string; config: unknown };
+type ExecutionOptions = { launcher?: ExecutorLauncher; signal?: AbortSignal; timeoutMs?: number; now?: () => number; uid?: number; gid?: number; artifactFault?: ArtifactOptions["fault"]; removeLane?: (path: string) => Promise<void> };
+export async function executeRemoteTest(input: ExecutionInput, options: ExecutionOptions = {}): Promise<RemoteTestReceipt> {
+ const config = validateExecutorConfig(input.config);
+ const selected = config.profiles.find(p => p.profile.profileId === (input.job as { profileId?: unknown } | null)?.profileId);
+ if (!selected) throw Error("Job profile is not operator-approved");
+ const job = validateRemoteTestJob(input.job, selected.profile);
+ const ledger = await openJobLedger(config.jobsRoot, config.executorId, options.now);
+ const cancel = () => ledger.cancel(job);
+ try {
+  if (options.signal?.aborted) cancel();
+  const admitted = ledger.admit(job);
+  if (admitted.kind === "terminal") return admitted.receipt;
+  if (admitted.kind === "active") throw new ActiveRemoteTestJob(admitted);
+  options.signal?.addEventListener("abort", cancel, { once: true });
+  if (options.signal?.aborted) cancel();
+  const receipt = await executeAdmittedRemoteTest({ ...input, job, config }, options, ledger, admitted.token);
+  return ledger.complete(job, admitted.token, receipt);
+ } finally { options.signal?.removeEventListener("abort", cancel); ledger.close(); }
+}
+
+async function executeAdmittedRemoteTest(
+ input: ExecutionInput,
+ options: ExecutionOptions,
+ ledger: JobLedger, token: string,
 ): Promise<RemoteTestReceipt> {
  const config = validateExecutorConfig(input.config);
  const profileId = (input.job as { profileId?: unknown } | null)?.profileId;
  const selected = config.profiles.find(p => p.profile.profileId === profileId);
  if (!selected) throw new Error("Job profile is not operator-approved");
  const job = validateRemoteTestJob(input.job, selected.profile);
- // Retained terminal identities cannot be overwritten. This bounded store is
- // not a permanent deduplication ledger; admission owns attempt generation.
+ // Legacy artifacts and an interrupted publication cannot be overwritten.
  try { await lstat(join(config.jobsRoot, ".artifacts", job.jobId)); throw Error("Execution receipt already exists"); }
  catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e; }
  const now = options.now ?? Date.now;
@@ -123,6 +145,8 @@ export async function executeRemoteTest(
  const lane = join(root, ".executor-lane");
  try { await mkdir(lane, { mode: 0o700 }); }
  catch (error) { if ((error as NodeJS.ErrnoException).code === "EEXIST") return receipt(); throw error; }
+ const owner = await open(join(lane, "owner.json"), "wx", 0o600);
+ try { await owner.writeFile(JSON.stringify({ ledgerId: ledger.id, jobId: job.jobId, token })); await owner.sync(); } finally { await owner.close(); }
  const launcher = options.launcher ?? podmanLauncher;
  const controller = new AbortController();
  let interruption: "timed_out" | "cancelled" | undefined;
@@ -132,6 +156,10 @@ export async function executeRemoteTest(
  if (options.signal?.aborted) cancel();
  const end = Math.min(job.deadline, now() + timeoutMs);
  const timer = setTimeout(() => interrupt("timed_out"), Math.max(0, end - now()));
+ const fenceTimer = setInterval(() => {
+  try { if (!ledger.allowed(job, token)) interrupt("cancelled"); }
+  catch { interrupt("cancelled"); }
+ }, 100);
  const command = async (args: string[], cleanup = false): Promise<string> => {
   const signal = cleanup ? new AbortController().signal : controller.signal;
   if (signal.aborted) throw new Error("Interrupted");
@@ -159,8 +187,10 @@ export async function executeRemoteTest(
   const runtimeSeconds = Math.floor((end - now()) / 1000);
   if (runtimeSeconds < 1) interrupt("timed_out");
   if (controller.signal.aborted) throw new Error("Interrupted before launch");
+  ledger.launch(job, token);
   launchAttempted = true;
   const id = (await command(["create", "--cidfile", cidfile, `--name=ranger-test-${randomUUID()}`, "--pull=never",
+   `--label=ranger.remote-test.ledger=${ledger.id}`, `--label=ranger.remote-test.job=${job.jobId}`, `--label=ranger.remote-test.attempt=${token}`,
    "--network=none", "--pid=private", "--ipc=private", "--uts=private", "--cgroupns=private", "--cgroups=enabled",
    `--cpus=${EXECUTOR_LIMITS.cpuCores}`, `--memory=${EXECUTOR_LIMITS.memoryBytes}`, `--memory-swap=${EXECUTOR_LIMITS.memoryBytes}`, `--pids-limit=${EXECUTOR_LIMITS.pids}`,
    `--timeout=${runtimeSeconds}`, "--stop-timeout=0", "--restart=no", "--read-only", "--read-only-tmpfs=false",
@@ -180,6 +210,7 @@ export async function executeRemoteTest(
   const startedAt = now();
   resources = { state: "unavailable", cpuTimeMicros: null, peakMemoryBytes: null };
   outputState = "unavailable";
+  ledger.launch(job, token);
   const result = await launcher(["--remote=false", "start", "--attach", containerId], { signal: controller.signal, timeoutMs: Math.max(1, end - now()) + 5000, onLog: captureLog });
   if (result.logsAvailable) outputState = "captured";
   const state = JSON.parse(await command(["inspect", containerId]))[0]?.State;
@@ -194,7 +225,7 @@ export async function executeRemoteTest(
   }
  } catch { status = interruption ?? (launchAttempted ? "infra_failed" : "rejected"); }
  finally {
-  clearTimeout(timer); options.signal?.removeEventListener("abort", cancel);
+  clearTimeout(timer); clearInterval(fenceTimer); options.signal?.removeEventListener("abort", cancel);
   // A create interrupted after allocation can still leave a container. The
   // private cidfile is Podman's identity of that allocation, never a job name.
   if (!containerId && launchAttempted) {
@@ -221,4 +252,51 @@ export async function executeRemoteTest(
   catch { status = "infra_failed"; }
  }
  return receipt();
+}
+
+/** Operator restart seam. The old executor must be stopped; recovery never
+ * infers success from an engine exit or removes foreign/unlabelled containers. */
+export async function reconcileRemoteTests(input: unknown, options: { launcher?: ExecutorLauncher } = {}) {
+ const config = validateExecutorConfig(input), root = await realpath(config.jobsRoot);
+ const ledger = await openJobLedger(root, config.executorId), launcher = options.launcher ?? podmanLauncher;
+ const command = async (argv: string[]) => {
+  const result = await launcher(["--remote=false", ...argv], { signal: new AbortController().signal, timeoutMs: 30_000 });
+  if (result.code !== 0) throw Error("Remote-test recovery engine operation failed"); return result.stdout;
+ };
+ try {
+  await ledger.reconcile({
+   list: async () => {
+    const inventory = (await command(["ps", "--all", "--no-trunc", "--quiet", "--filter", `label=ranger.remote-test.ledger=${ledger.id}`])).trim();
+    const ids = inventory ? inventory.split(/\s+/) : [];
+    if (ids.length > 1024) throw Error("Invalid recovery container inventory");
+    const containers: OwnedContainer[] = [];
+    for (const id of ids) {
+     if (!/^[a-f0-9]{64}$/.test(id)) throw Error("Invalid recovery container ID");
+     const inspected = JSON.parse(await command(["inspect", id]));
+     if (!Array.isArray(inspected) || inspected.length !== 1 || inspected[0].Id !== id) throw Error("Invalid recovery container inspection");
+     const labels = inspected[0].Config?.Labels;
+     if (labels?.["ranger.remote-test.ledger"] !== ledger.id) throw Error("Recovery label mismatch");
+     containers.push({ id, ledgerId: labels["ranger.remote-test.ledger"], jobId: labels["ranger.remote-test.job"], token: labels["ranger.remote-test.attempt"] });
+    }
+    return containers;
+   },
+   remove: async id => { await command(["rm", "--force", "--volumes", id]); },
+   cleanup: async jobs => {
+    const lane = join(root, ".executor-lane");
+    const info = await lstat(lane).catch(e => { if (e.code === "ENOENT") return null; throw e; });
+    if (info) {
+     if (!info.isDirectory() || info.uid !== process.getuid?.() || (info.mode & 0o077)) throw Error("Unsafe recovery lane");
+     const owner = JSON.parse(await readFile(join(lane, "owner.json"), "utf8"));
+     if (owner.ledgerId !== ledger.id || !jobs.some(j => j.jobId === owner.jobId)) throw Error("Unknown recovery lane owner");
+     await rm(lane, { recursive: true });
+    }
+    const inbox = join(root, ".ssh-incoming"), inboxInfo = await lstat(inbox).catch(e => { if (e.code === "ENOENT") return null; throw e; });
+    if (inboxInfo && (!inboxInfo.isDirectory() || inboxInfo.uid !== process.getuid?.() || (inboxInfo.mode & 0o077))) throw Error("Unsafe recovery inbox");
+    for (const job of jobs) {
+     await rm(join(root, job.jobId), { recursive: true, force: true });
+     if (inboxInfo) await rm(join(inbox, job.jobId), { recursive: true, force: true });
+    }
+   },
+  });
+ } finally { ledger.close(); }
 }

@@ -7,8 +7,9 @@ import { serveSshRequest, serveSshResponse } from "../src/remote-test/ssh-server
 import { runSshCommand, statusSshCommand, sshOutcomeExitCode, sshOutcomeMessage } from "../src/remote-test/ssh-cli.ts";
 import { validateRemoteTestReceipt } from "../src/remote-test/contract.ts";
 import { submitSshRemoteTest, statusSshRemoteTest, type SshRunner } from "../src/remote-test/ssh-client.ts";
-import { executeRemoteTest } from "../src/remote-test/executor.ts";
+import { executeRemoteTest, reconcileRemoteTests } from "../src/remote-test/executor.ts";
 import { runCmd } from "../src/exec.ts";
+import { openJobLedger } from "../src/remote-test/job-ledger.ts";
 
 const roots: string[] = [];
 afterEach(async () => { for (const r of roots.splice(0)) await rm(r, { recursive: true, force: true }); });
@@ -56,6 +57,37 @@ test("expired requests and occupied upload paths refuse execution; failed upload
  await mkdir(join(f.jobsRoot, ".ssh-incoming"), { mode: 0o700 }); const occupied = join(f.jobsRoot, ".ssh-incoming", id); await mkdir(occupied, { mode: 0o700 });
  await writeFile(join(occupied, "keep"), "in flight");
  await expect(serveSshRequest(f.frame(), f.config, { execute: f.execute })).rejects.toThrow(); expect(await readFile(join(occupied, "keep"), "utf8")).toBe("in flight");
+});
+test("SSH duplicates report active and retrieval applies durable cancellation even to a passed artifact", async () => {
+ const f = await fixture(), ledger = await openJobLedger(f.jobsRoot, f.config.executorId);
+ try {
+  const admitted = ledger.admit(f.job); if (admitted.kind !== "admitted") throw Error();
+  expect(await serveSshResponse(f.frame("status", ""), f.config, { execute: f.execute })).toEqual({ version: 1, receipt: null, state: "active" });
+  expect(await serveSshResponse(f.frame(), f.config, { execute: f.execute })).toEqual({ version: 1, receipt: null, state: "active" });
+  ledger.launch(f.job, admitted.token); ledger.complete(f.job, admitted.token, f.receipt); ledger.cancel(f.job);
+  const store = join(f.jobsRoot, ".artifacts"), dir = join(store, id); await mkdir(store, { mode: 0o700 }); await mkdir(dir, { mode: 0o700 });
+  await writeFile(join(dir, "receipt.json"), JSON.stringify(f.receipt), { mode: 0o600 });
+  const response = await serveSshResponse(f.frame("status", ""), f.config, { execute: f.execute });
+  if (!("receipt" in response)) throw Error(); expect(response.receipt!.status).toBe("cancelled"); expect(f.calls()).toBe(0);
+ } finally { ledger.close(); }
+});
+test("restart recovery clears only known stale SSH uploads and lets an interrupted job retry through SSH", async () => {
+ const f = await fixture(), ledger = await openJobLedger(f.jobsRoot, f.config.executorId);
+ try {
+  const admitted = ledger.admit(f.job); if (admitted.kind !== "admitted") throw Error();
+  const inbox = join(f.jobsRoot, ".ssh-incoming"), stale = join(inbox, id), unknown = join(inbox, "unknown-upload");
+  await mkdir(inbox, { mode: 0o700 }); await mkdir(stale, { mode: 0o700 }); await mkdir(unknown, { mode: 0o700 });
+  await writeFile(join(stale, "source.bundle"), "partial", { mode: 0o600 });
+  await reconcileRemoteTests(f.config, { launcher: async () => ({ code: 0, stdout: "" }) });
+  expect(await stat(stale).catch(() => null)).toBeNull(); expect(await stat(unknown)).toBeDefined();
+  expect(await serveSshResponse(f.frame("status", ""), f.config)).toEqual({ version: 1, receipt: null, state: "interrupted" });
+  let calls = 0;
+  const response = await serveSshResponse(f.frame(), f.config, { execute: async (input, options) => {
+   calls++; return executeRemoteTest(input, { ...options, uid: 1000, gid: 1000, launcher: async () => ({ code: 0, stdout: JSON.stringify({ host: { os: "linux", arch: "unsupported" } }) }) });
+  } });
+  if (!("receipt" in response)) throw Error(); expect(response.receipt!.status).toBe("rejected"); expect(calls).toBe(1);
+  expect(await serveSshResponse(f.frame(), f.config, { execute: f.execute })).toEqual(response); expect(f.calls()).toBe(0);
+ } finally { ledger.close(); }
 });
 test("run command stages unpushed clean HEAD and saves private job before transport; status only retrieves", async () => {
  const f = await fixture(), repo = join(f.root, "repo"), staging = join(f.root, "staging");

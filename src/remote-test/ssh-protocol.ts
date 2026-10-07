@@ -7,7 +7,7 @@ export const SshRequestSchema = z.discriminatedUnion("operation", [
  z.object({ version: z.literal(1), operation: z.literal("status"), job: z.unknown() }).strict(),
 ]);
 export const SshResponseSchema = z.union([
- z.object({ version: z.literal(1), receipt: z.unknown().nullable() }).strict(),
+ z.object({ version: z.literal(1), receipt: z.unknown().nullable(), state: z.enum(["active", "interrupted"]).optional() }).strict().refine(r => !r.state || r.receipt === null),
  z.object({ version: z.literal(1), error: z.enum(["invalid_receipt", "receiver_failed"]) }).strict(),
 ]);
-export type SshResponse = { version: 1; receipt: RemoteTestReceipt | null } | { version: 1; error: "invalid_receipt" | "receiver_failed" };
+export type SshResponse = { version: 1; receipt: RemoteTestReceipt | null; state?: "active" | "interrupted" } | { version: 1; error: "invalid_receipt" | "receiver_failed" };

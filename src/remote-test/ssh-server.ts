@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { privateOperatorPath } from "./baseline.ts";
 import { validateRemoteTestJob, validateRemoteTestReceipt, type RemoteTestJob, type RemoteTestReceipt } from "./contract.ts";
 import { executeRemoteTest, validateExecutorConfig } from "./executor.ts";
+import { ActiveRemoteTestJob, InterruptedRemoteTestJob, openJobLedger } from "./job-ledger.ts";
 import { SSH_LIMITS, SshRequestSchema, type SshResponse } from "./ssh-protocol.ts";
 
 class InvalidSshReceipt extends Error {}
@@ -25,24 +26,40 @@ async function privateDirectory(path: string) {
  if (!info.isDirectory() || info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0) throw Error("SSH workspace must be private and operator-owned");
 }
 async function lookup(root: string, job: RemoteTestJob, executorId: string): Promise<RemoteTestReceipt | null> {
+ const ledger = await openJobLedger(root, executorId);
+ const state = () => {
+  let state;
+  try { state = ledger.status(job); } catch { throw new InvalidSshReceipt("Ledger identity conflict"); }
+  if (state?.kind === "active") throw new ActiveRemoteTestJob(state);
+  if (state?.kind === "interrupted") throw new InterruptedRemoteTestJob(state.attempt);
+  return state?.receipt ?? null;
+ };
+ // Legacy producers have no ledger entry. Still validate their private receipt;
+ // never import a loose artifact into a new admitted attempt after a restart.
  try {
-  const store = join(root, ".artifacts"), directory = join(store, job.jobId);
-  await privateDirectory(store); await privateDirectory(directory);
-  const file = await open(join(directory, "receipt.json"), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  state();
+  let legacy: RemoteTestReceipt | null = null;
   try {
-   const info = await file.stat();
-   if (!info.isFile() || info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0 || info.size > SSH_LIMITS.responseBytes) throw Error("Invalid private receipt");
-   let value: unknown;
-   try { value = JSON.parse(await file.readFile("utf8")); } catch { throw new InvalidSshReceipt("Invalid stored receipt JSON"); }
-   return producedReceipt(value, job, executorId);
-  } finally { await file.close(); }
- } catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return null; throw e; }
+   const store = join(root, ".artifacts"), directory = join(store, job.jobId);
+   await privateDirectory(store); await privateDirectory(directory);
+   const file = await open(join(directory, "receipt.json"), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+   try {
+    const info = await file.stat();
+    if (!info.isFile() || info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0 || info.size > SSH_LIMITS.responseBytes) throw Error("Invalid private receipt");
+    let value: unknown;
+    try { value = JSON.parse(await file.readFile("utf8")); } catch { throw new InvalidSshReceipt("Invalid stored receipt JSON"); }
+    legacy = producedReceipt(value, job, executorId);
+   } finally { await file.close(); }
+  } catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e; }
+  // No await after this final fence check: cancellation during file I/O wins.
+  return state() ?? legacy;
+ } finally { ledger.close(); }
 }
 
 /** Reviewed fixed command: one bounded JSON line followed by exact bundle
  * bytes and EOF, or a status request with no body. All paths and executable
  * policy come from private local configuration, never the request. */
-export async function serveSshRequest(input: AsyncIterable<Uint8Array>, operatorConfig: unknown, options: SshServerOptions = {}): Promise<{ version: 1; receipt: RemoteTestReceipt | null }> {
+export async function serveSshRequest(input: AsyncIterable<Uint8Array>, operatorConfig: unknown, options: SshServerOptions = {}): Promise<{ version: 1; receipt: RemoteTestReceipt | null; state?: "active" | "interrupted" }> {
  const config = validateExecutorConfig(operatorConfig);
  await privateOperatorPath(join(config.jobsRoot, "ssh-check"));
  const root = await realpath(config.jobsRoot);
@@ -70,6 +87,19 @@ export async function serveSshRequest(input: AsyncIterable<Uint8Array>, operator
   return { version: 1, receipt: await lookup(root, job, config.executorId) };
  }
  if (job.deadline <= Date.now()) throw Error("SSH submission deadline expired");
+ let existing: RemoteTestReceipt | null = null, active = false;
+ try { existing = await lookup(root, job, config.executorId); }
+ catch (e) { if (e instanceof ActiveRemoteTestJob) active = true; else if (!(e instanceof InterruptedRemoteTestJob)) throw e; }
+ if (existing || active) {
+  // Drain the bounded declared upload so SSH can finish normally. A duplicate
+  // never allocates another upload workspace or starts another execution.
+  let bytes = rest.length; if (bytes > request.bundleBytes) throw Error("Oversize duplicate upload");
+  for (;;) { const next = await iterator.next(); if (next.done) break; bytes += next.value.byteLength; if (bytes > request.bundleBytes) throw Error("Oversize duplicate upload"); }
+  if (bytes !== request.bundleBytes) throw Error("Incomplete duplicate upload");
+  // Upload drainage may have outlived the generation too.
+  try { return { version: 1, receipt: await lookup(root, job, config.executorId) }; }
+  catch (e) { if (e instanceof ActiveRemoteTestJob) return { version: 1, receipt: null, state: "active" }; throw e; }
+ }
  const inbox = join(root, ".ssh-incoming");
  try { await mkdir(inbox, { mode: 0o700 }); }
  catch (e) { if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e; }
@@ -102,5 +132,9 @@ export async function serveSshRequest(input: AsyncIterable<Uint8Array>, operator
  * No private error details enter the response. */
 export async function serveSshResponse(input: AsyncIterable<Uint8Array>, config: unknown, options: SshServerOptions = {}): Promise<SshResponse> {
  try { return await serveSshRequest(input, config, options); }
- catch (e) { return { version: 1, error: e instanceof InvalidSshReceipt ? "invalid_receipt" : "receiver_failed" }; }
+ catch (e) {
+  if (e instanceof ActiveRemoteTestJob) return { version: 1, receipt: null, state: "active" };
+  if (e instanceof InterruptedRemoteTestJob) return { version: 1, receipt: null, state: "interrupted" };
+  return { version: 1, error: e instanceof InvalidSshReceipt ? "invalid_receipt" : "receiver_failed" };
+ }
 }
