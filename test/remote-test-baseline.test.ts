@@ -41,7 +41,7 @@ describe("baseline handler", () => {
   });
  }
  test("insufficient capacity yields without a job", async () => {
-  const f = fixture(); f.metrics.availableMemory = async () => 10;
+  const f = fixture(); f.metrics.availableMemory = async () => 0;
   const r = await runBaseline(config, { run: true, metrics: f.metrics });
   expect(r.exitCode).toBe(1); expect(f.calls).not.toContain("workload");
  });
@@ -134,18 +134,23 @@ for (const failure of ["cleanup", "sidecar", "oom", "missing-peak", "timeout"] a
     let script = argv[2]!.replaceAll(config.cgroupRoot, dir).replace("watchdog=''", `${setup}\nwatchdog=''`);
     // The fake filesystem cannot actually kill processes. Model the kernel's
     // transition to empty when the job group's kill file is written.
-    script = script.replaceAll(`printf '1\\n' > "$cg/cgroup.kill"`, `printf '1\\n' > "$cg/cgroup.kill"; printf 'populated 0\\n' > "$cg/cgroup.events"`);
+    const kernelKill = failure === "timeout" ? `if [ -f "$cg/cgroup.procs" ]; then kill -KILL "$(cat "$cg/cgroup.procs")" 2>/dev/null || true; fi;` : "";
+    script = script.replaceAll(`printf '1\\n' > "$cg/cgroup.kill"`, `(printf '1\\n' > "$cg/cgroup.kill"; ${kernelKill} printf 'populated 0\\n' > "$cg/cgroup.events")`);
     script = script.replace('rmdir "$cg"', failure === "cleanup" ? "return 1" : 'rm -f "$cg/"*; rmdir "$cg"');
-    return local(["sh", "-c", script], timeout);
+    return local(["sh", "-c", script], failure === "timeout" ? 5000 : timeout);
    });
    const marker = join(dir, "ran");
-   const c = { ...config, cwd: dir, timeoutSeconds: failure === "timeout" ? 1 : 60, profile: { ...config.profile, commands: failure === "timeout" ? [["sleep", "1.2"]] : [["touch", marker]] } } as BaselineConfig;
+   // exec keeps the recorded cgroup.procs PID as the sleeper. The fake kernel
+   // kill models that cgroup operation, so a broken target watchdog cannot
+   // pass through the elapsed-time check: this workload would run for 30 s.
+   const c = { ...config, cwd: dir, timeoutSeconds: failure === "timeout" ? 1 : 60, profile: { ...config.profile, commands: failure === "timeout" ? [["exec", "sleep", "30"]] : [["touch", marker]] } } as BaselineConfig;
    if (failure === "cleanup" || failure === "missing-peak") {
     await expect(m.workload(c)).rejects.toThrow();
     if (failure === "missing-peak") await expect(stat(marker)).rejects.toThrow();
    } else {
-    const result = await m.workload(c);
+    const started = Date.now(); const result = await m.workload(c);
     expect(result.exitCode).toBe(failure === "timeout" ? 124 : 125);
+    if (failure === "timeout") expect(Date.now() - started).toBeLessThan(4000);
    }
   } finally { await rm(dir, { recursive: true, force: true }); }
  });

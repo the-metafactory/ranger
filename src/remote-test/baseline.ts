@@ -50,7 +50,7 @@ async function measure<T>(probe: () => Promise<T>): Promise<Measurement<T>> {
 const unavailable = (reason: string): Measurement<never> => ({ status: "unavailable", reason });
 function textValue(s: string): string { if (!s.trim()) throw new Error("Empty required measurement"); return s.trim(); }
 function memoryValue(n: number): number {
- if (!Number.isSafeInteger(n) || n <= 0) throw new Error("Unavailable or invalid available memory"); return n;
+ if (!Number.isSafeInteger(n) || n < 0) throw new Error("Unavailable or invalid available memory"); return n;
 }
 
 /** No effects until the reviewed operator config has been validated. An explicit
