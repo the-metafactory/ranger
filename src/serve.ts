@@ -1,4 +1,4 @@
-import { encodeForgeRef, parseForgeRef, decodeForgeKey } from "./forge-ref.ts";
+import { decodeForgeKey, isGithubRepo, readRefusal, nodeKey } from "./forge-ref.ts";
 import { lastImplementMaps, mapKey, implementMapOrder } from "./maps.ts";
 /**
  * `ranger serve` (#37) — a local dashboard of the walk: the job a worker is on
@@ -370,7 +370,7 @@ export function assembleState(inputs: StateInputs): DashboardState {
    const hit = report?.frontier.find((n) => n.id === id)?.title;
    if (hit !== undefined) return hit;
   }
-  return inputs.titles.get(encodeForgeRef(parseForgeRef(repo), id).key) ?? null;
+  return inputs.titles.get(nodeKey(repo, id)) ?? null;
  };
 
  const current: CurrentJob[] = inputs.workers
@@ -1237,6 +1237,11 @@ export class ServeReader {
      error,
     });
    };
+   const refusal = readRefusal(map.repo);
+   if (refusal !== null) {
+    keep(refusal);
+    continue;
+   }
    const token = await tokens(map.repo);
    const journal = Journal.openReadOnly(this.journalPath);
    const cooling = journal === null ? null : activeCooldown(journal, token.source, now);
@@ -1334,7 +1339,7 @@ export async function readPrLive(
  number: number,
  tokens: TokenBatch = tokenBatch(config),
 ): Promise<PrView | null> {
- if (!REPO_PATTERN.test(repo) || parseForgeRef(repo).forge !== "github" || !Number.isInteger(number) || number <= 0) return null;
+ if (!isGithubRepo(repo) || !Number.isInteger(number) || number <= 0) return null;
  const raw = (await restRead(tokens, repo, `repos/${repo}/pulls/${number}`)) as Record<string, unknown> | null;
  if (raw === null) return null;
  const head = (raw.head ?? {}) as { sha?: unknown };
@@ -1383,7 +1388,7 @@ export async function readPrLive(
  * comes back malformed.
  */
 async function verifyChecksAs(repo: string, sha: string, env: Record<string, string>): Promise<PrView["ci"] | null> {
- if (!REPO_PATTERN.test(repo) || parseForgeRef(repo).forge !== "github" || !/^[0-9a-f]{40}$/.test(sha)) return null;
+ if (!isGithubRepo(repo) || !/^[0-9a-f]{40}$/.test(sha)) return null;
  const result = await runCmd(
   "gh",
   ["api", `repos/${repo}/commits/${sha}/check-runs?filter=latest&per_page=100`, "--paginate", "--slurp"],
@@ -1407,7 +1412,7 @@ async function readIssue(
  id: string,
  tokens: TokenBatch = tokenBatch(config),
 ): Promise<IssueRead | null> {
- if (!REPO_PATTERN.test(repo) || parseForgeRef(repo).forge !== "github" || !ID_PATTERN.test(id)) return null;
+ if (!isGithubRepo(repo) || !ID_PATTERN.test(id)) return null;
  const raw = (await restRead(tokens, repo, `repos/${repo}/issues/${id}`)) as {
   title?: string;
   state?: string;
@@ -1485,16 +1490,16 @@ export function stateFromJournal(
    maps,
    workers,
    events: (repo, nodeId) => journal?.listNodeEvents(repo, nodeId) ?? [],
-   labels: (repo, nodeId) => reader.labels.get(encodeForgeRef(parseForgeRef(repo), nodeId).key) ?? null,
-   prs: (repo, pr) => reader.prs.get(encodeForgeRef(parseForgeRef(repo), pr).key) ?? null,
-   prError: (repo, pr) => reader.detailErrors.get(`pr:${encodeForgeRef(parseForgeRef(repo), pr).key}`) ?? null,
+   labels: (repo, nodeId) => reader.labels.get(nodeKey(repo, nodeId)) ?? null,
+   prs: (repo, pr) => reader.prs.get(nodeKey(repo, pr)) ?? null,
+   prError: (repo, pr) => reader.detailErrors.get(`pr:${nodeKey(repo, pr)}`) ?? null,
    titleOf: (repo, nodeId) => {
     for (const map of maps) {
      if (map.repo !== repo) continue;
      const hit = reports.get(map.key)?.frontier.find((n) => n.id === nodeId)?.title;
      if (hit !== undefined) return hit;
     }
-    return reader.titles.get(encodeForgeRef(parseForgeRef(repo), nodeId).key) ?? null;
+    return reader.titles.get(nodeKey(repo, nodeId)) ?? null;
    },
    reviewRounds: config.workers.reviewRounds,
    exists: existsSync,
@@ -1502,7 +1507,7 @@ export function stateFromJournal(
   const needsYouUnchecked = uncheckedNeedsEye({
    maps,
    workers,
-   labels: (repo, nodeId) => reader.labels.get(encodeForgeRef(parseForgeRef(repo), nodeId).key) ?? null,
+   labels: (repo, nodeId) => reader.labels.get(nodeKey(repo, nodeId)) ?? null,
   }).map((key) => ({ key, error: reader.detailErrors.get(`issue:${key}`) ?? null }));
   // Details for every row that may need the principal: an awaiting-merge row
   // shows only once its labels say needs-eye.
@@ -1512,8 +1517,8 @@ export function stateFromJournal(
     maps.some((m) => m.repo === w.repo && m.root === w.root),
   );
   reader.wantDetails(
-   candidates.map((w) => encodeForgeRef(parseForgeRef(w.repo), w.nodeId).key),
-   candidates.filter((w) => w.prNumber !== null).map((w) => encodeForgeRef(parseForgeRef(w.repo), w.prNumber!).key),
+   candidates.map((w) => nodeKey(w.repo, w.nodeId)),
+   candidates.filter((w) => w.prNumber !== null).map((w) => nodeKey(w.repo, w.prNumber!)),
   );
   const state = assembleState({
    maps,
@@ -1542,7 +1547,7 @@ export function stateFromJournal(
    }),
   });
   reader.want(
-   state.current.filter((j) => j.title === null).map((j) => encodeForgeRef(parseForgeRef(j.repo), j.nodeId).key),
+   state.current.filter((j) => j.title === null).map((j) => nodeKey(j.repo, j.nodeId)),
   );
   return state;
  } finally {
@@ -1625,6 +1630,7 @@ export function assertReadOnlyTokens(
  const unset = new Map<string, string[]>(); // token env -> the repos that need it
  const other: string[] = [];
  for (const repo of [...new Set(maps.map((m) => m.repo))]) {
+  if (readRefusal(repo) !== null) continue;
   try {
    resolveReadOnlyToken(config, repo, env);
   } catch (error) {
@@ -1700,7 +1706,7 @@ export function startServe(opts: {
    verifyChecks: verifyChecksAs,
    exists: existsSync,
    after: (entry) => {
-    reader.forget(encodeForgeRef(parseForgeRef(entry.repo), entry.nodeId).key, entry.pr === null ? null : encodeForgeRef(parseForgeRef(entry.repo), entry.pr.number).key);
+    reader.forget(nodeKey(entry.repo, entry.nodeId), entry.pr === null ? null : nodeKey(entry.repo, entry.pr.number));
     void reader.refreshDetails();
    },
   },

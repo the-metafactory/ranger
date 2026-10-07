@@ -1,4 +1,4 @@
-import { encodeForgeRef, parseForgeRef } from "./forge-ref.ts";
+import { encodeForgeRef, parseForgeRef, isGithubRepo } from "./forge-ref.ts";
 import {
   type BudgetPolicy,
   assertNotThrottled,
@@ -60,8 +60,9 @@ export async function readRepoSentinel(
   repo: string,
   token: string,
 ): Promise<string | null> {
-  // GitLab sentinel reads belong to the forge read seam, not gh's API.
-  if (parseForgeRef(repo).forge !== "github") return null;
+  // GitLab has no sentinel implementation yet: null forces a fresh graph
+  // read and prevents a cache write instead of issuing a GitHub API call.
+  if (!isGithubRepo(repo)) return null;
   const gated = gatedEnv(token);
   try {
     const read = async (path: string, jq: string) => {

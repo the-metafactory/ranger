@@ -232,13 +232,20 @@ export async function graphNode(
 export function normalizeGraphNode<T extends NodeResult | FrontierEntry>(repo: string, node: T): T {
   const ref = parseForgeRef(repo);
   const id = (value: string) => graphNodeId(ref, value);
+  // A foreign dependency is not a local actionable node. Preserve its located
+  // identity so routing can still see the blocker without truncating it.
+  const relationId = (value: string) => {
+    const hash = value.lastIndexOf("#");
+    if (hash >= 0 && value.slice(0, hash) !== ref.path) return value;
+    return id(value);
+  };
   try {
     return {
       ...node,
       ref: { ...node.ref, id: id(node.ref.id) },
       node: { ...node.node, id: id(node.node.id) },
-      blockedBy: node.blockedBy.map(n => ({ ...n, id: id(n.id) })),
-      ...(node.parent === undefined ? {} : { parent: { ...node.parent, id: id(node.parent.id) } }),
+      blockedBy: node.blockedBy.map(n => ({ ...n, id: relationId(n.id) })),
+      ...(node.parent === undefined ? {} : { parent: { ...node.parent, id: relationId(node.parent.id) } }),
     };
   } catch (error) { throw new GraphError((error as Error).message); }
 }

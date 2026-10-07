@@ -3,15 +3,21 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { loadConfig } from "../src/config.ts";
-import { parseForgeRef, encodeForgeRef, decodeForgeKey, normalizeNodeId } from "../src/forge-ref.ts";
-import { graphFrontier, graphNode, graphAudit, somaRepo, type FrontierEntry } from "../src/graph.ts";
-import { graphClaim, graphRelease } from "../src/graph-write.ts";
+import { parseForgeRef, encodeForgeRef, decodeForgeKey, normalizeNodeId, executionRefusal } from "../src/forge-ref.ts";
+import { graphFrontier, graphNode, graphAudit, somaRepo, normalizeGraphNode, type FrontierEntry } from "../src/graph.ts";
+import { graphClaim, graphRelease, GraphWriteError } from "../src/graph-write.ts";
+import { walk, claimNode } from "../src/walk.ts";
+import { runNode } from "../src/worker.ts";
+import { runImplement, type ImplementContext } from "../src/implement.ts";
+import { buildNow } from "../src/build-now.ts";
+import { sweepMap } from "../src/sweep.ts";
 import { mapKey } from "../src/maps.ts";
 import { workerLogFile } from "../src/worker-log.ts";
-import { buildNowArgv, launchPlan } from "../src/serve.ts";
+import { buildNowArgv, launchPlan, ServeReader, servedMaps, readPrLive, assertReadOnlyTokens } from "../src/serve.ts";
 import { resumeArgv, mergeArgv } from "../src/serve-parked.ts";
-import { frontierCacheKey, cachedFrontier } from "../src/frontier-cache.ts";
+import { frontierCacheKey, cachedFrontier, readRepoSentinel } from "../src/frontier-cache.ts";
 import { Journal } from "../src/journal.ts";
+import { runCli } from "./support.ts";
 
 const gitlab = "gitlab:gitlab.software.geant.org/claw/crisis-simulator";
 
@@ -82,11 +88,35 @@ describe("ForgeRef config and identity seam", () => {
   expect(parseForgeRef("acme/widgets")).toEqual(parseForgeRef("github:github.com/acme/widgets"));
   expect(parseForgeRef("acme/widgets")).toBe(parseForgeRef("github:github.com/acme/widgets"));
   expect(configWith("github:github.com/acme/widgets").maps[0].repo).toBe("acme/widgets");
+  expect(configWith("github:github.com/acme/widgets", "legacy").state.legacyMapRoots).toEqual({ "acme/widgets": 12 });
   expect(encodeForgeRef(parseForgeRef("acme/widgets"), "<@123>").journalKey).toBe("acme/widgets:<@123>");
   expect(() => decodeForgeKey("acme/widgets#<@123>")).toThrow();
   expect(encodeForgeRef(parseForgeRef("github:github.com/acme/widgets"), 12)).toEqual({
    key: "acme/widgets#12", journalKey: "acme/widgets:12", cacheKey: "frontier:acme/widgets#12", fileStem: "acme__widgets-12",
   });
+ });
+
+ test("GitHub graph ids retain every byte in arguments, graph results and persisted encodings", () => {
+  const ref = parseForgeRef("acme/widgets");
+  for (const id of ["12", "acme/widgets#12", "other/project#12", "<@123>", "display#text"]) {
+   expect(normalizeNodeId(ref, id)).toBe(id);
+   const encoded = encodeForgeRef(ref, id);
+   expect(encoded).toEqual({ key: `acme/widgets#${id}`, journalKey: `acme/widgets:${id}`,
+    cacheKey: `frontier:acme/widgets#${id}`, fileStem: `acme__widgets-${id}` });
+   const node = { ref: { id }, node: { id, title: "Build", kind: "task", autonomy: "auto" },
+    status: "open", assignees: [], blockedBy: [{ id, status: "open" }], parent: { id },
+    author: "bot", url: "https://example.test", typed: true };
+   expect(normalizeGraphNode("acme/widgets", node)).toEqual(node);
+  }
+ });
+
+ test("parse memo evicts old strings without changing identities or encodings", () => {
+  const old = parseForgeRef("memo/project");
+  for (let i = 0; i < 300; i++) parseForgeRef(`memo/project-${i}`);
+  const fresh = parseForgeRef("memo/project");
+  expect(fresh).not.toBe(old);
+  expect(fresh).toEqual(old);
+  expect(encodeForgeRef(fresh, 12)).toEqual(encodeForgeRef(old, 12));
  });
 
  test("GitLab encodings distinguish host and project, round-trip keys and make safe filenames", () => {
@@ -95,7 +125,7 @@ describe("ForgeRef config and identity seam", () => {
    const ref = parseForgeRef(repo);
    const encoded = encodeForgeRef(ref, 12);
    expect(encoded.key).toBe(`${repo}#12`);
-   expect(encoded.journalKey).toBe(`${repo}:12`);
+   expect(encoded.journalKey).toBe(`${repo}#12`);
    expect(decodeForgeKey(encoded.key)).toEqual({ repo, forgeRef: ref, iid: "12" });
    expect(encoded.fileStem).not.toMatch(/[/:#]/);
    expect(basename(workerLogFile("/tmp/state.sqlite", repo, "12", 2))).toBe(`${encoded.fileStem}-g2.log`);
@@ -125,13 +155,79 @@ describe("ForgeRef config and identity seam", () => {
   expect(() => mergeArgv({ repo: gitlab, pr: 12, sha: "a".repeat(40) })).toThrow("GitLab merge is not implemented");
  });
 
+ test("registered GitLab maps refuse all execution entry points before calls or journal writes", async () => {
+  const config = configWith(gitlab);
+  const map = config.maps[0];
+  map.walk = "full";
+  map.commands.test = "bun test";
+  const journal = new Journal(":memory:");
+  let calls = 0;
+  const forbidden = async (): Promise<never> => { calls++; throw new Error("unexpected side effect"); };
+  const node = { repo: gitlab, ref: { id: "12" }, node: { id: "12", title: "Build", kind: "task", autonomy: "auto" },
+   status: "open", assignees: [], blockedBy: [], author: "bot", url: "https://example.test", typed: true };
+  const base = { config, journal, map, token: "fixture", botIdentity: "bot" };
+  try {
+   expect(executionRefusal("acme/widgets")).toBeNull();
+   const result = await walk({ config, journal, configPath: "/unused", spawnRunNode: forbidden });
+   expect(result.maps[0]).toMatchObject({ gated: true, claimed: [], announced: [] });
+   expect(result.maps[0].gateReason).toContain("GitLab execution is not implemented");
+   expect(await claimNode({ ...base, node: node.node, lane: "implement", cliEntry: "/unused", configPath: "/unused",
+    announce: forbidden, claim: forbidden, spawnRunNode: forbidden })).toMatchObject({ claimed: false });
+   await expect(buildNow("12", { ...base, configPath: "/unused", readFrontier: forbidden, announce: forbidden, claim: forbidden,
+    spawnRunNode: forbidden })).rejects.toThrow("GitLab execution is not implemented");
+   expect(await runNode("12", { ...base })).toMatchObject({ status: "refused" });
+   const github = new Proxy({}, { get: () => forbidden }) as ImplementContext["github"];
+   expect(await runImplement({ ...base, node, rootNode: node, github, readOnlyToken: "fixture", canonical: "/unused",
+    worktree: "/unused", branch: "node/12-test", generation: 1, ratify: "auto", sessionJournal: "/unused",
+    workerRun: forbidden, shellRun: forbidden })).toMatchObject({ status: "refused" });
+   await expect(sweepMap({ ...base, respawn: forbidden })).rejects.toThrow("GitLab execution is not implemented");
+   expect(await readRepoSentinel(gitlab, "fixture")).toBeNull();
+   expect(calls).toBe(0);
+   expect(journal.listWorkers()).toEqual([]);
+   expect(journal.listEvents()).toEqual([]);
+  } finally { journal.close(); }
+ });
+
+ test("CLI gates registered GitLab refs before credentials or any forge process", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ranger-forge-gates-"));
+  const path = join(dir, "ranger.yaml");
+  const calls = join(dir, "calls");
+  writeFileSync(path, `maps:\n  - repo: ${gitlab}\n    root: 12\n    walk: full\nstate:\n  journalPath: ${join(dir, "state.sqlite")}\n`);
+  for (const bin of ["gh", "soma", "git"]) writeFileSync(join(dir, bin), `#!/bin/sh\nprintf unexpected >> "${calls}"\nexit 90\n`, { mode: 0o700 });
+  try {
+   for (const args of [["scout", "--json"], ["walk"], ["build-now", "13", "--map", `${gitlab}#12`],
+    ["run-node", "13", "--map", `${gitlab}#12`], ["sweep"], ["escalate", "--json"], ["escalate", "--digest", "--json"]]) {
+    const result = await runCli([...args, "--config", path], { ...process.env, PATH: `${dir}:${process.env.PATH}` });
+    expect(result.stdout + result.stderr).toContain("not implemented");
+   }
+   expect(() => readFileSync(calls)).toThrow();
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+ });
+
+ test("serve-only GitLab reads report unsupported without requesting credentials", async () => {
+  const config = configWith(gitlab, "serve");
+  const maps = servedMaps(config).filter(map => map.repo === gitlab);
+  expect(maps).toHaveLength(1);
+  expect(() => assertReadOnlyTokens(config, maps, {})).not.toThrow();
+  let calls = 0;
+  const tokens = async (): Promise<never> => { calls++; throw new Error("unexpected credentials"); };
+  expect(await readPrLive(config, gitlab, 12, tokens)).toBeNull();
+  const reader = new ServeReader(config, maps, "/unused");
+  reader.refresh();
+  // Await this refresh before the headless test returns.
+  while (reader.refreshing) await Bun.sleep(1);
+  expect(reader.extra.get(maps[0].key)?.error).toContain("GitLab read gate is not implemented");
+  expect(calls).toBe(0);
+ });
+
  test("journal and cache builders read existing GitHub keys and isolate qualified hosts", () => {
   const journal = new Journal(":memory:");
   try {
    for (const repo of ["acme/widgets", gitlab, "gitlab:other.host/claw/crisis-simulator"]) {
     const ref = parseForgeRef(repo);
-    // These rows use literal pre-existing keys, independent of the encoder.
-    journal.upsertEscalation({ key: `${repo}:12`, repo, root: 1, nodeId: "12", messageId: repo, createdAt: "2026-10-07" });
+    // GitHub's key is literal pre-existing data, independent of the encoder.
+    const key = repo === "acme/widgets" ? "acme/widgets:12" : `${repo}#12`;
+    journal.upsertEscalation({ key, repo, root: 1, nodeId: "12", messageId: repo, createdAt: "2026-10-07" });
     journal.upsertWorker({ repo, root: 1, nodeId: "12", status: "claimed" });
     const frontier = { repo, root: "1", frontier: [] };
     journal.setHealth(`frontier:${repo}#1`, JSON.stringify({ sentinel: "old", fetchedAt: repo, frontier }));
@@ -184,16 +280,46 @@ describe("ForgeRef config and identity seam", () => {
    expect(argv).toHaveLength(5);
    for (const args of argv) expect(args[args.indexOf("--repo") + 1]).toBe(gitlab);
    expect(argv[1][2]).toBe("12");
+   const githubId = "acme/widgets#12";
+   responses.node.node.id = githubId;
+   responses.claim.node = githubId;
+   writeFileSync(fixture, JSON.stringify(responses));
+   expect((await graphNode("acme/widgets", githubId, token)).node.id).toBe(githubId);
+   expect((await graphClaim("acme/widgets", githubId, "bot", "fixture-write")).node).toBe(githubId);
+   const githubCalls = readFileSync(calls, "utf8").trim().split("\n").slice(-2).map(line => JSON.parse(line) as string[]);
+   for (const args of githubCalls) {
+    expect(args[2]).toBe(githubId);
+    expect(args[args.indexOf("--repo") + 1]).toBe("github:github.com/acme/widgets");
+   }
    responses.node.node.id = "other/project#12";
    writeFileSync(fixture, JSON.stringify(responses));
    await expect(graphNode(gitlab, "12", token)).rejects.toThrow("different project");
    responses.node.node.id = locate("12");
    responses.frontier.frontier[0].parent = { id: "other/project#1" };
    writeFileSync(fixture, JSON.stringify(responses));
-   await expect(graphFrontier(gitlab, 1, token)).rejects.toThrow("different project");
+   responses.frontier.frontier[0].blockedBy = [{ id: "other/project#11", status: "open" }];
+   writeFileSync(fixture, JSON.stringify(responses));
+   const foreign = (await graphFrontier(gitlab, 1, token)).frontier[0];
+   expect(foreign.parent?.id).toBe("other/project#1");
+   expect(foreign.blockedBy[0]).toEqual({ id: "other/project#11", status: "open" });
    responses.claim.node = "other/project#12";
    writeFileSync(fixture, JSON.stringify(responses));
    await expect(graphClaim(gitlab, "12", "bot", "fixture-write")).rejects.toThrow("different project");
+   await expect(graphClaim(gitlab, "12", "bot", "fixture-write")).rejects.toBeInstanceOf(GraphWriteError);
+   responses.release.node = "other/project#12";
+   writeFileSync(fixture, JSON.stringify(responses));
+   await expect(graphRelease(gitlab, "12", "bot", "fixture-write")).rejects.toBeInstanceOf(GraphWriteError);
+   await expect(graphClaim(gitlab, "other/project#12", "bot", "fixture-write")).rejects.toBeInstanceOf(GraphWriteError);
+   // Exercise the exit-1 race path with missing/non-string nodes too.
+   writeFileSync(join(dir, "soma"), `#!${process.execPath}\n` +
+    `import { readFileSync } from "node:fs";\n` +
+    `console.error(readFileSync(${JSON.stringify(fixture)}, "utf8")); process.exit(1);\n`, { mode: 0o700 });
+   for (const node of [undefined, null, 12, "other/project#12", "claw/crisis-simulator#oops"]) {
+    writeFileSync(fixture, JSON.stringify({ repo: gitlab, held: false, node, assignees: [] }));
+    await expect(graphClaim(gitlab, "12", "bot", "fixture-write")).rejects.toBeInstanceOf(GraphWriteError);
+   }
+   writeFileSync(fixture, JSON.stringify({ repo: gitlab, held: false, node: locate("12"), assignees: [] }));
+   expect((await graphClaim(gitlab, "12", "bot", "fixture-write"))).toMatchObject({ held: false, node: "12" });
   } finally {
    if (oldPath === undefined) delete process.env.PATH; else process.env.PATH = oldPath;
    rmSync(dir, { recursive: true, force: true });

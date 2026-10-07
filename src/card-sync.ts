@@ -1,4 +1,4 @@
-import { encodeForgeRef, parseForgeRef } from "./forge-ref.ts";
+import { journalKeyFor } from "./forge-ref.ts";
 import { mapKey } from "./maps.ts";
 import { EscalationDiscord, DiscordMessageGoneError } from "./discord.ts";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
@@ -576,7 +576,7 @@ async function syncCard(
   const cardCtx: CardSyncContext = {
     ...ctx,
     node,
-    key: encodeForgeRef(parseForgeRef(map.repo), node.id).journalKey,
+    key: journalKeyFor(map.repo, node.id),
     ageDays,
     content,
   };
@@ -776,7 +776,7 @@ async function reconcileAbsentCard(
 ): Promise<AbsentOutcome> {
   const { clientFor, journal, map, now, budget, owned } = ctx;
   const nodeId = prior.nodeId;
-  const key = encodeForgeRef(parseForgeRef(map.repo), nodeId).journalKey;
+  const key = journalKeyFor(map.repo, nodeId);
   const content = queueExitContent(nodeId, prior.title, map.repo);
   const cursorKey = `escalate.reconcile.${key}`;
   try {

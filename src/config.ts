@@ -37,15 +37,17 @@ const DiscordSchema = z.object({
 });
 
 /** Keep bare GitHub arguments and qualified GitLab strings alongside their typed identity. */
-const RepoSchema = z.string().transform((repo, ctx) => {
+const ValidRepoString = z.string().superRefine((repo, ctx) => {
  try {
-  const forgeRef = parseForgeRef(repo);
-  return { repo: repoIdentity(forgeRef), forgeRef };
+  parseForgeRef(repo);
  }
  catch (error) {
   ctx.addIssue({ code: z.ZodIssueCode.custom, message: (error as Error).message });
-  return z.NEVER;
  }
+});
+const RepoSchema = ValidRepoString.transform(repo => {
+ const forgeRef = parseForgeRef(repo);
+ return { repo: repoIdentity(forgeRef), forgeRef };
 });
 
 const MapSchema = z.object({
@@ -206,10 +208,8 @@ const PrincipalSchema = z.object({
 
 const StateSchema = z.object({
  /** Migration-only: original roots for ambiguous or deregistered legacy repos; remove after cutover. */
- legacyMapRoots: z.record(z.string().superRefine((repo, ctx) => {
-  try { parseForgeRef(repo); }
-  catch (error) { ctx.addIssue({ code: z.ZodIssueCode.custom, message: (error as Error).message }); }
- }), z.number().int().positive()).default({}),
+ legacyMapRoots: z.record(ValidRepoString.transform(repo => repoIdentity(parseForgeRef(repo))),
+  z.number().int().positive()).default({}),
  /**
   * SQLite journal path (design §8): the live ~/.config/ranger/state.sqlite,
   * except under test, where an unset path is a fresh temp file (node #66).

@@ -1,4 +1,4 @@
-import { encodeForgeRef, parseForgeRef } from "./forge-ref.ts";
+import { journalKeyFor } from "./forge-ref.ts";
 import { and, asc, desc, eq, gt, inArray, isNull, lt, or, sql } from "drizzle-orm";
 import { openDb, openDbReadOnly, type RangerDb } from "./store/db.ts";
 import { seedLegacyRoots } from "./store/legacy-roots.ts";
@@ -634,7 +634,7 @@ export class Journal {
  getEscalation(repo: string, nodeId: string): EscalationRow | null {
   const row = this.db.query.escalations
    .findFirst({
-    where: eq(escalations.key, encodeForgeRef(parseForgeRef(repo), nodeId).journalKey),
+    where: eq(escalations.key, journalKeyFor(repo, nodeId)),
    })
    .sync();
   return row === undefined ? null : hydrateEscalation(row);

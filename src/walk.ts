@@ -1,4 +1,5 @@
 import { implementLane, type ImplementLane } from "./lanes.ts";
+import { executionRefusal } from "./forge-ref.ts";
 import { lastImplementMaps, recordImplementStart, mapKey, implementMapOrder } from "./maps.ts";
 import { spawn } from "node:child_process";
 import { dirname, join } from "node:path";
@@ -196,6 +197,8 @@ export type ClaimNodeOutcome =
  */
 export async function claimNode(args: ClaimNodeArgs): Promise<ClaimNodeOutcome> {
  const { journal, map, node, botIdentity, token } = args;
+ const refusal = executionRefusal(map.repo);
+ if (refusal !== null) return { claimed: false, messageId: null, error: refusal };
  const now = () => args.now?.() ?? new Date();
  const owned = args.owned ?? (() => {});
  owned();
@@ -346,6 +349,14 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
   if (map.walk === "none") {
    mapResult.gated = true;
    mapResult.gateReason = "walk: none — this map is registered, not walked";
+   maps.push(mapResult);
+   continue;
+  }
+
+  const refusal = executionRefusal(map.repo);
+  if (refusal !== null) {
+   mapResult.gated = true;
+   mapResult.gateReason = refusal;
    maps.push(mapResult);
    continue;
   }

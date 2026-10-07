@@ -1,4 +1,5 @@
 import { recordImplementStart, mapKey } from "./maps.ts";
+import { executionRefusal } from "./forge-ref.ts";
 import { implementLane, startsImplementSession } from "./lanes.ts";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import type { Journal } from "./journal.ts";
@@ -66,6 +67,8 @@ export { pidAlive };
 export async function sweepMap(ctx: SweepContext): Promise<SweepMapResult> {
  const { config, journal, map, token, botIdentity } = ctx;
  const repo = map.repo;
+ const refusal = executionRefusal(repo);
+ if (refusal !== null) throw new Error(refusal);
  const result: SweepMapResult = {
   repo,
   crashed: 0,

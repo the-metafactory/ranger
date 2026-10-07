@@ -1,4 +1,4 @@
-import { encodeForgeRef, parseForgeRef } from "./forge-ref.ts";
+import { executionRefusal, fileStemFor } from "./forge-ref.ts";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { availableParallelism, loadavg, tmpdir } from "node:os";
@@ -694,6 +694,8 @@ export function resolvePhase(pr: PullRequest | null): ImplementPhase | "pr-close
 }
 
 export async function runImplement(ctx: ImplementContext): Promise<ImplementOutcome> {
+ const refusal = executionRefusal(ctx.map.repo);
+ if (refusal !== null) return { status: "refused", detail: refusal, workerExit: null };
  const { config, map, journal, node, token, botIdentity, branch, worktree } = ctx;
  const github = ctx.github ?? realGitHub;
  const repo = map.repo;
@@ -1435,7 +1437,7 @@ async function closeAfterMerge(
   (p) => p.sha === pr.headSha && p.passed,
  );
  const resolution = closeResolution(ctx, pr, final, reviews.length, success, probe);
- const resolutionFile = join(tmpdir(), `ranger-close-${encodeForgeRef(parseForgeRef(repo), nodeId).fileStem}.md`);
+ const resolutionFile = join(tmpdir(), `ranger-close-${fileStemFor(repo, nodeId)}.md`);
  writeFileSync(resolutionFile, resolution, "utf8");
 
  const prRef = `https://github.com/${repo}/pull/${pr.number}`;
