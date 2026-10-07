@@ -482,7 +482,7 @@ export type ActionRunner = (
 /** Keys a human merge must never carry: machine credentials or forge overrides. */
 export { MACHINE_FORGE_KEYS } from "./forge-env.ts";
 import { MACHINE_FORGE_KEYS } from "./forge-env.ts";
-/** Legacy export name retained for dashboard consumers. */
+/** @deprecated Use MACHINE_FORGE_KEYS; this alias includes GitLab keys. */
 export const MACHINE_GH_KEYS = MACHINE_FORGE_KEYS;
 
 /**

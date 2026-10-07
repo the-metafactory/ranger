@@ -90,11 +90,12 @@ export function workerEnv(
  sessionJournal: string,
 ): NodeJS.ProcessEnv {
  const identity = config.bot.identity;
+ const principal = principalLoginForRepo(config, repo);
  return {
   ...workerHostEnv(),
   SOMA_GRAPH_REPO: somaRepo(repo),
   SAGE_STACK: "default",
-  ...(principalLoginForRepo(config, repo) === undefined ? {} : { PILOT_PRINCIPAL: principalLoginForRepo(config, repo) }),
+  ...(principal === undefined ? {} : { PILOT_PRINCIPAL: principal }),
   [JOURNAL_PATH_ENV]: sessionJournal,
   // The host's global git hooks are the principal's, not the walk's: they
   // can leave build caches in the worktree (a dirty tree the implement lane

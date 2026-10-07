@@ -201,12 +201,13 @@ const AuthSchema = z.object({
 
 /**
  * The machine account (design §2). `identity` is the login ranger labels
- * claims/closes with (`soma graph ... --identity <login>`); it defaults to the
- * login resolved from the write token. Graph-mutating ticks refuse when the
+ * GitHub claims/closes with (`soma graph ... --identity <login>`); it defaults
+ * to the login resolved from the write token. GitLab always resolves its
+ * host's project bot from the credential. Graph-mutating ticks refuse when the
  * resolved identity equals the principal's login.
  */
 const BotSchema = z.object({
- /** Machine-account login (e.g. `ivy-agent`). Optional — resolved from token. */
+ /** GitHub machine-account login (e.g. `ivy-agent`). Optional token identity pin. */
  identity: z.string().optional(),
 });
 

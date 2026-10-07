@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { parse } from "yaml";
-import type { RangerConfig } from "../src/config.ts";
+import type { RangerAuthConfig, RangerConfig } from "../src/config.ts";
 import { principalLoginForRepo } from "../src/config.ts";
 import { runCmd, type RunResult } from "../src/exec.ts";
 import {
@@ -25,7 +25,7 @@ const config = {
  bot: {},
 } as unknown as RangerConfig;
 const inherited: NodeJS.ProcessEnv = {
- PATH: process.env.PATH, HOME: process.env.HOME, [source]: secret, SOMA_GRAPH_READONLY: "1",
+ PATH: process.env.PATH, HOME: process.env.HOME, [source]: secret,
  ...Object.fromEntries(MACHINE_FORGE_KEYS.map(k => [k, "principal-secret-or-override"])),
  GLAB_ENABLE_CI_AUTOLOGIN: "true", GL_HOST: "wrong.host", NODE_OPTIONS: "injection",
 };
@@ -128,18 +128,58 @@ describe("GitLab write gate", () => {
   expect(existsSync(dir)).toBeFalse();
  });
 
- test("configured bot label must still match the resolved credential", async () => {
-  await expect(resolveBotIdentity({ ...config, bot: { identity: "other-bot" } }, secret, repo,
-   async () => result({ username: bot }), inherited)).rejects.toThrow(/does not match/);
+ test("a pinned GitHub bot coexists with GitLab project bots and still gates GitHub", async () => {
+  const pinned = { ...config, bot: { identity: "ivy-agent" } };
+  expect(await resolveBotIdentity(pinned, secret, repo,
+   async () => result({ username: bot }), inherited)).toBe(bot);
+  expect(await resolveBotIdentity(pinned, "gh-token", "team/project",
+   async () => ({ code: 0, stdout: "ivy-agent\n", stderr: "" }), {})).toBe("ivy-agent");
+  await expect(resolveBotIdentity(pinned, "gh-token", "team/project",
+   async () => ({ code: 0, stdout: "other-bot\n", stderr: "" }), {})).rejects.toThrow(/does not match/);
+  await expect(resolveBotIdentity(pinned, secret, repo,
+   async () => result({ username: "boss-gl" }), inherited)).rejects.toThrow(/principal's identity/);
+  await expect(resolveBotIdentity(pinned, secret, repo,
+   async () => result({ username: "human-maintainer" }), inherited)).rejects.toThrow(/not a project access-token bot/);
  });
 
- test("GitHub identity lookup and map principal remain compatible", async () => {
-  expect(await loginForToken("gh-token", {}, "team/project", async (bin, args, opts) => {
+ test("GitHub identity lookup remains compatible", async () => {
+  expect(await loginForToken("gh-token", "team/project", {}, async (bin, args, opts) => {
    expect(bin).toBe("gh");
    expect(args).toEqual(["api", "/user", "--jq", ".login"]);
    expect(opts?.env?.GH_TOKEN).toBe("gh-token");
    return { code: 0, stdout: "ivy-agent\n", stderr: "" };
   })).toBe("ivy-agent");
+ });
+
+ test.each(["1", "0"])("GitLab write env preserves inherited read-only policy %s", async policy => {
+  const base = { ...inherited, SOMA_GRAPH_READONLY: policy };
+  const gated = writeEnvForRepo(repo, secret, base);
+  try { expect(gated.env.SOMA_GRAPH_READONLY).toBe(policy); }
+  finally { gated.cleanup(); }
+  let dir = "";
+  await graphDecisions(repo, "1", secret, { env: base, runner: async (_bin, _args, opts) => {
+   expect(opts?.env?.SOMA_GRAPH_READONLY).toBe(policy);
+   dir = opts!.env!.GLAB_CONFIG_DIR!;
+   return result({});
+  } });
+  expect(existsSync(dir)).toBeFalse();
+ });
+
+ test("inherited read-only policy refuses direct GitLab API writes without spawning", async () => {
+  let calls = 0;
+  await expect(gitlabApiWrite(repo, secret, ["/projects/42/merge_requests", "--method", "POST"],
+   async () => { calls++; return result({}); },
+   { env: { ...inherited, SOMA_GRAPH_READONLY: "1" } })).rejects.toThrow(/read-only restriction/);
+  expect(calls).toBe(0);
+ });
+
+ test("qualified write prefixes match path segments, never sibling groups or projects", () => {
+  const auth: RangerAuthConfig = { readOnlyTokens: {}, writeTokens: { [`gitlab:${host}/team`]: source } };
+  expect(matchWriteTokenEnv(auth, repo)).toBe(source);
+  expect(matchWriteTokenEnv(auth, `gitlab:${host}/team-other/project`)).toBeUndefined();
+  auth.writeTokens = { [`gitlab:${host}/team/sub/project`]: source };
+  expect(matchWriteTokenEnv(auth, repo)).toBe(source);
+  expect(matchWriteTokenEnv(auth, `${repo}-other`)).toBeUndefined();
  });
 
  test("claim, release, close, decisions and MR API writes each isolate and remove their config", async () => {

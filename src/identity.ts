@@ -7,8 +7,6 @@ import { runCmd, type RunOptions } from "./exec.ts";
 import { parseForgeRef, qualifiedRepo } from "./forge-ref.ts";
 import { glabConfigEnv } from "./glab-config-dir.ts";
 
-const GITHUB_REPO = "github:github.com/ranger/identity";
-
 /**
  * The write-credential gate (design §2 identity model, node #11).
  *
@@ -18,8 +16,8 @@ const GITHUB_REPO = "github:github.com/ranger/identity";
  * GitHub pins `GH_TOKEN` and isolates `GH_CONFIG_DIR`. GitLab writes a single
  * host's credential into a per-call `GLAB_CONFIG_DIR`, shared with the read
  * gate's config helper. Neither CLI consults the principal's configuration.
- * Unlike the read-only gate, it does NOT set `SOMA_GRAPH_READONLY`: this path
- * is permitted to mutate the graph.
+ * Unlike the read-only gate, it does NOT set `SOMA_GRAPH_READONLY`, but
+ * preserves an inherited operator restriction.
  */
 
 export class WriteGateError extends Error {
@@ -72,7 +70,11 @@ export function matchWriteTokenEnv(
   const qualified = prefix.includes(":");
   if (!qualified && ref.forge !== "github") continue;
   const target = qualified ? qualifiedRepo(ref) : ref.path;
-  if (prefix === "*" || target.startsWith(prefix.replace(/\*$/, ""))) {
+  const path = prefix.replace(/\*$/, "");
+  const matches = qualified
+   ? target === path || target.startsWith(path.endsWith("/") ? path : `${path}/`)
+   : prefix === "*" || target.startsWith(path);
+  if (matches) {
    return auth.writeTokens[prefix];
   }
  }
@@ -114,11 +116,13 @@ export function writeEnvForRepo(
  const ref = parseForgeRef(repo);
  if (ref.forge === "github") return writeEnv(token, {}, base);
  const gated = glabConfigEnv(ref.host, token, base);
- delete gated.env.SOMA_GRAPH_READONLY;
+ // Remove only the read helper's forced policy; an operator's policy survives.
+ if (base.SOMA_GRAPH_READONLY === undefined) delete gated.env.SOMA_GRAPH_READONLY;
+ else gated.env.SOMA_GRAPH_READONLY = base.SOMA_GRAPH_READONLY;
  return gated;
 }
 
-/** GitLab MR/API writes use the same isolated credential boundary as graph writes. */
+/** Intended entry point for the GitLab implement lane's MR/API writes. */
 export async function gitlabApiWrite(
  repo: string,
  token: string,
@@ -135,6 +139,10 @@ export async function gitlabApiWrite(
  }
  const gated = writeEnvForRepo(repo, token, opts.env);
  try {
+  // glab itself does not enforce soma's graph policy.
+  if (gated.env.SOMA_GRAPH_READONLY === "1") {
+   throw new WriteGateError("read-only restriction forbids GitLab API writes");
+  }
   return await runner("glab", ["api", ...args, "--hostname", ref.host], {
    ...opts, timeoutMs: opts.timeoutMs ?? 60_000, env: gated.env,
   });
@@ -144,8 +152,8 @@ export async function gitlabApiWrite(
 /** Resolve GET /user's login (GitHub) or username (GitLab) under the pinned token. */
 export async function loginForToken(
  token: string,
+ repo: string,
  opts: RunOptions = {},
- repo: string = GITHUB_REPO,
  runner: typeof runCmd = runCmd,
 ): Promise<string> {
  const ref = parseForgeRef(repo);
@@ -168,7 +176,7 @@ export async function loginForToken(
    try { login = JSON.parse(result.stdout).username; }
    catch { throw new WriteGateError("cannot resolve GitLab write identity: invalid /user response"); }
   }
-  if (typeof login !== "string" || login.trim().length === 0 || login !== login.trim()) {
+  if (!isCleanIdentifier(login)) {
    throw new WriteGateError("cannot resolve write identity: missing login in /user response");
   }
   return login;
@@ -181,8 +189,8 @@ export async function loginForToken(
 }
 
 /**
- * The bot identity ranger labels graph operations with: `bot.identity` if
- * configured, else the login resolved from the write token. Never a static
+ * The bot identity ranger labels graph operations with: the login resolved
+ * from the write token. `bot.identity` pins GitHub only. Never a static
  * guess — the label must match the credential actually driving the write, so
  * the token's real login is always resolved and a configured `bot.identity`
  * that does not match it is refused (a mismatched label would let mutations
@@ -192,12 +200,13 @@ export async function loginForToken(
 export async function resolveBotIdentity(
  config: RangerConfig,
  token: string,
- repo: string = GITHUB_REPO,
+ repo: string,
  runner: typeof runCmd = runCmd,
  env: NodeJS.ProcessEnv = process.env,
 ): Promise<string> {
- const resolved = await loginForToken(token, { env }, repo, runner);
- if (config.bot.identity !== undefined && config.bot.identity.length > 0) {
+ const ref = parseForgeRef(repo);
+ const resolved = await loginForToken(token, repo, { env }, runner);
+ if (ref.forge === "github" && config.bot.identity !== undefined && config.bot.identity.length > 0) {
   if (resolved !== config.bot.identity) {
    throw new WriteGateError(
     `configured bot.identity '${config.bot.identity}' does not match the ` +
@@ -208,7 +217,7 @@ export async function resolveBotIdentity(
   }
  }
  assertNotPrincipal(config, resolved, repo);
- if (parseForgeRef(repo).forge === "gitlab" && !/^project_\d+_bot_[a-f0-9]+$/.test(resolved)) {
+ if (ref.forge === "gitlab" && !/^project_\d+_bot_[a-f0-9]+$/.test(resolved)) {
   throw new WriteGateError("GitLab write identity is not a project access-token bot — refusing to write (node #123)");
  }
  return resolved;
@@ -222,7 +231,7 @@ export async function resolveBotIdentity(
 export function assertNotPrincipal(
  config: RangerConfig,
  identity: string,
- repo: string = GITHUB_REPO,
+ repo: string,
 ): void {
  const principal = writePrincipal(config, repo);
  if (identity.trim().length === 0) throw new WriteGateError("empty write identity — refusing to write");
@@ -237,11 +246,15 @@ export function assertNotPrincipal(
 
 function writePrincipal(config: RangerConfig, repo: string): string {
  const principal = principalLoginForRepo(config, repo);
- if (principal === undefined || principal.trim().length === 0 || principal !== principal.trim()) {
+ if (!isCleanIdentifier(principal)) {
   const ref = parseForgeRef(repo);
   throw new WriteGateError(`no principal login configured for ${ref.forge}:${ref.host} — refusing to write`);
  }
  return principal;
+}
+
+function isCleanIdentifier(value: unknown): value is string {
+ return typeof value === "string" && value.trim().length > 0 && value === value.trim();
 }
 
 /** Resolve and verify before a tick enters any graph or forge mutation lane. */
