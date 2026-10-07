@@ -143,6 +143,20 @@ describe("#37 — the state the dashboard shows", () => {
   expect(bare.grillings[0].why).toMatch(/localCheckout/);
  });
 
+ test("decisions are the escalated nodes that are not grillings: approve tasks, decisions, prototypes", () => {
+  const frontier = [...FRONTIER, entry("20", "task", "approve"), entry("21", "decision"), entry("22", "prototype"), entry("23", "task", "auto")];
+  const map = assembleState(inputs({ reports: new Map([[walked.key, report(frontier)]]) })).maps[0];
+  expect(map.decisions.map((d) => [d.id, d.kind, d.autonomy])).toEqual([
+   ["20", "task", "approve"],
+   ["21", "decision", "propose"],
+   ["22", "prototype", "propose"],
+  ]);
+  expect(map.decisions[0].reason).toMatch(/approve/);
+  // Walkable work and grillings are listed elsewhere, never twice.
+  expect(map.autonomous.map((n) => n.id)).toEqual(["10", "11", "14", "23"]);
+  expect(map.grillings.map((g) => g.id)).toEqual(["12", "13"]);
+ });
+
  test("next is what the tick would take: the same selection walk makes", () => {
   const frontier = classified(FRONTIER, ["11"]);
   const tick = selectCandidates(frontier, false);

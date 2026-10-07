@@ -245,6 +245,13 @@ export interface GrillingView extends NodeView {
  why?: string;
 }
 
+/** A frontier node escalated to the principal that is not a grilling: an approve task, a decision, a prototype. */
+export interface DecisionView extends NodeView {
+ autonomy: string;
+ /** Why ranger does not take it. */
+ reason: string;
+}
+
 export interface DashboardMap {
  key: string;
  repo: string;
@@ -260,6 +267,7 @@ export interface DashboardMap {
  next: NextJob;
  autonomous: NodeView[];
  grillings: GrillingView[];
+ decisions: DecisionView[];
 }
 
 export interface DashboardState {
@@ -286,6 +294,15 @@ const laneOf = (n: ClassifiedNode): "implement" | "research" | undefined =>
  n.route.route === "implement" || n.route.route === "research"
   ? n.route.route
   : undefined;
+
+/** Why a node waits on the principal, in a few words; null when ranger can take it. */
+function escalation(n: ClassifiedNode): string | null {
+ if (n.route.route === "provisioning") return "its probes are not provisioned on this host";
+ if (n.route.route !== "escalate-hitl") return null;
+ if (n.route.reason === "untyped") return "its typed block is missing or broken";
+ if (n.route.reason === "hitl-kind-as-auto") return `a ${n.kind} declared auto (map hygiene)`;
+ return n.autonomy === "approve" ? "approve: yours to approve before work starts" : `propose: a ${n.kind} is yours to decide`;
+}
 
 const view = (n: ClassifiedNode): NodeView => ({
  id: n.id,
@@ -441,6 +458,10 @@ export function assembleState(inputs: StateInputs): DashboardState {
        ? undefined
        : (map.checkoutRefused ?? `no localCheckout for ${map.repo} in ranger.yaml`),
     })),
+   decisions: frontier.flatMap((n) => {
+    const reason = n.kind === "grilling" ? null : escalation(n);
+    return reason === null ? [] : [{ ...view(n), autonomy: n.autonomy, reason }];
+   }),
   };
  });
 
@@ -846,7 +867,7 @@ details.grp > :not(summary) { margin-left:14px; }
 <main>
 <section id="needs"><h2>Needs you</h2><div id="needsyou"></div></section>
 <div class="cols">
-<section><h2>Open grillings</h2><div id="grill"></div></section>
+<section><h2>Needs your decision</h2><div id="grill"></div></section>
 <section><h2>Autonomous — ranger can take these</h2><div id="auto"></div></section>
 <section><h2>Next in queue</h2><div id="next"></div></section>
 <section><h2>Current job</h2><div id="current"></div></section>
@@ -987,9 +1008,13 @@ function grillButton(m, g) {
 function renderGrill(s) {
  const box = document.getElementById("grill"); box.replaceChildren();
  box.append(...byRepo("grill", s.maps, (m) => m.repo, (m) => {
-  const body = m.grillings.length === 0 ? unavailable(m, "None open.")
-   : el("ul", {}, ...m.grillings.map((g) => el("li", {}, el("span", { class: "id", text: "#" + g.id }), el("span", { class: "t" }, link(g.url, g.title)), grillButton(m, g))));
-  return mapGroup("grill", m, m.servedOnly ? " (shown only)" : "", mapCount(m, m.grillings.length), mapMeta(m), body);
+  const decisions = m.decisions || [];
+  const n = m.grillings.length + decisions.length;
+  const body = n === 0 ? unavailable(m, "None open.")
+   : el("ul", {},
+    ...m.grillings.map((g) => el("li", {}, el("span", { class: "id", text: "#" + g.id }), el("span", { class: "t" }, link(g.url, g.title)), tags(tag("grilling"), grillButton(m, g)))),
+    ...decisions.map((d) => el("li", {}, el("span", { class: "id", text: "#" + d.id }), el("span", { class: "t" }, link(d.url, d.title), el("span", { class: "reason", text: d.reason })), tags(tag(d.kind + " · " + d.autonomy)))));
+  return mapGroup("grill", m, m.servedOnly ? " (shown only)" : "", mapCount(m, n), mapMeta(m), body);
  }));
 }
 const short = (sha) => (sha || "").slice(0, 8);

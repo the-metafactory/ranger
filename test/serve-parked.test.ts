@@ -842,10 +842,10 @@ describe("node #54 — the actions and their guards", () => {
   expect(await res.json()).toMatchObject({ ok: false, code: 1, stderr: expect.stringContaining("lane is held by #700") });
  });
 
- test("the page puts Needs you above Open grillings, and says to reload on a stale token", () => {
+ test("the page puts Needs you above Needs your decision, and says to reload on a stale token", () => {
   const page = renderPage(TOKEN);
   expect(page.indexOf("<h2>Needs you</h2>")).toBeGreaterThan(0);
-  expect(page.indexOf("<h2>Needs you</h2>")).toBeLessThan(page.indexOf("<h2>Open grillings</h2>"));
+  expect(page.indexOf("<h2>Needs you</h2>")).toBeLessThan(page.indexOf("<h2>Needs your decision</h2>"));
   expect(page).toContain("reload the page");
   const script = page.split("<script>")[1].split("</script>")[0];
   expect(() => new Function(script)).not.toThrow();
