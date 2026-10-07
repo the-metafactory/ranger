@@ -2,7 +2,7 @@ import type { RangerConfig } from "./config.ts";
 import { runCmd } from "./exec.ts";
 import { RateLimitError } from "./graph.ts";
 import type { Journal } from "./journal.ts";
-import { gatedEnv, type ResolvedToken } from "./token-gate.ts";
+import { gatedEnv, isGitLabReadToken, type ResolvedToken } from "./token-gate.ts";
 
 /**
  * The GitHub budget gate in front of every GraphQL-costing graph read.
@@ -201,6 +201,9 @@ export async function budgetedRead<T>(
   now: Date,
   read: () => Promise<T>,
 ): Promise<T> {
+  // GitLab reads use REST and must never send their credential to GitHub's
+  // budget endpoint. The GitLab read boundary still enforces its grant.
+  if (isGitLabReadToken(token)) return read();
   const budget = await assertGraphBudget(journal, token, policy, now);
   let value: T;
   try {

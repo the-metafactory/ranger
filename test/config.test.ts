@@ -16,6 +16,19 @@ function withConfig(content: string, fn: (path: string) => void) {
 }
 
 describe("loadConfig", () => {
+  test("accepts host-qualified read prefixes alongside existing GitHub keys", () => {
+    withConfig('maps:\n  - repo: acme/widgets\n    root: 1\nauth:\n  readOnlyTokens:\n    "*": GH\n    "github:github.com/acme/": GH_ACME\n    "gitlab:gitlab.example.org/team/": GL_TEAM\n', path => {
+      expect(loadConfig(path).config.auth.readOnlyTokens["gitlab:gitlab.example.org/team/"]).toBe("GL_TEAM");
+    });
+  });
+
+  test("rejects malformed qualified read prefixes", () => {
+    for (const prefix of ["gitlab:team", "gitlab:https://gitlab.example.org/team/", "gitlab:host/../", "gitlab:host:443/team/", "github:other.host/acme/", "gitlab:host/team/**"]) {
+      withConfig(`maps:\n  - repo: acme/widgets\n    root: 1\nauth:\n  readOnlyTokens:\n    "${prefix}": RO\n`, path => {
+        expect(() => loadConfig(path)).toThrow(ConfigError);
+      });
+    }
+  });
   test("parses a valid config and coerces numeric root", () => {
     withConfig(
       [

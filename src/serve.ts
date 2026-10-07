@@ -64,7 +64,7 @@ import { type FrontierEntry, graphFrontier, RateLimitError } from "./graph.ts";
 import { runCmd } from "./exec.ts";
 import { classify, classifyFrontier, type ClassifiedNode, loadProbeRegistry } from "./route.ts";
 import { liveSession, substrateUsageViews, type SubstrateUsageView } from "./substrate-usage.ts";
-import { resolveReadOnlyToken, assertReadOnlyToken, gatedEnv, tokenBatch, type TokenBatch } from "./token-gate.ts";
+import { resolveReadOnlyToken, assertReadOnlyToken, gatedEnv, tokenBatch, type TokenBatch, type ResolvedToken } from "./token-gate.ts";
 import { childEnv, itermArgv, shellQuote } from "./launch.ts";
 import {
  type ActionKind,
@@ -1369,7 +1369,13 @@ export class ServeReader {
     keep(refusal);
     continue;
    }
-   const token = await tokens(map.repo);
+   let token: ResolvedToken;
+   try { token = await tokens(map.repo); }
+   catch (error) {
+    if (isGithubRepo(map.repo)) throw error;
+    keep(error instanceof Error ? error.message : String(error));
+    continue;
+   }
    const journal = Journal.openReadOnly(this.journalPath);
    const cooling = journal === null ? null : activeCooldown(journal, token.source, now);
    journal?.close();
@@ -1377,7 +1383,7 @@ export class ServeReader {
     keep(`deferred: ${token.source} cooling down until ${cooling.until.toISOString()} (${cooling.reason})`);
     continue;
    }
-   const budget = await readGraphqlBudget(token.token);
+   const budget = isGithubRepo(map.repo) ? await readGraphqlBudget(token.token) : null;
    if (budget !== null && budget.remaining < this.config.budget.graphqlFloor) {
     keep(`deferred: GraphQL allowance ${budget.remaining}/${budget.limit} under the floor of ${this.config.budget.graphqlFloor}`);
     continue;

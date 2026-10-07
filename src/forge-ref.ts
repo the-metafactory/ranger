@@ -9,6 +9,9 @@ export interface ForgeRef {
 const SEGMENT = String.raw`(?!\.{1,2}(?:/|$))[A-Za-z0-9._-]+`;
 const LABEL = String.raw`[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?`;
 const HOST = `${LABEL}(?:\\.${LABEL})*`;
+const READ_TOKEN_PREFIX_PATTERN = new RegExp(
+ `^(?:github:github\\.com|gitlab:${HOST})/(?:${SEGMENT}(?:/${SEGMENT})*/?\\*?|\\*)?$` + String.raw`(?![\s\S])`,
+);
 export const REPO_PATTERN = new RegExp(
  `^(?:${SEGMENT}/${SEGMENT}|github:github\\.com/${SEGMENT}/${SEGMENT}|gitlab:${HOST}/${SEGMENT}(?:/${SEGMENT})+)$` + String.raw`(?![\s\S])`,
 );
@@ -71,7 +74,14 @@ export function executionRefusal(repo: string): string | null {
 }
 
 export function readRefusal(repo: string): string | null {
- return forgeCapabilities(parseForgeRef(repo)).githubApi ? null : `GitLab read gate is not implemented: ${repo}`;
+ parseForgeRef(repo);
+ return null; // Both graph read backends now have a credential gate.
+}
+
+/** Bare prefixes are legacy GitHub keys; qualified prefixes include the host. */
+export function validReadTokenPrefix(prefix: string): boolean {
+ if (!prefix.includes(":")) return prefix.length > 0 && !/\s/.test(prefix);
+ return READ_TOKEN_PREFIX_PATTERN.test(prefix);
 }
 
 /**
