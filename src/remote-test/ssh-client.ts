@@ -9,8 +9,8 @@ import { z } from "zod";
 import { killProcessGroup } from "../exec.ts";
 import { shellQuote } from "./baseline.ts";
 import { validateProfileManifest, validateRemoteTestJob, validateRemoteTestReceipt, type RemoteTestJob, type RemoteTestReceipt } from "./contract.ts";
+import { SSH_LIMITS, SshResponseSchema } from "./ssh-protocol.ts";
 
-export const SSH_LIMITS = { bundleBytes: 64 * 1024 ** 2, responseBytes: 65_536, headerBytes: 65_536 } as const;
 const operatorPath = z.string().max(4096).refine(p => isAbsolute(p) && !p.includes("\0") && !/[\r\n]/.test(p));
 const ConfigSchema = z.object({
  target: z.string().max(255).regex(/^[a-zA-Z0-9_][a-zA-Z0-9_.@-]*$/),
@@ -31,13 +31,12 @@ export function selectSshJob(config: SshConfig, input: unknown): RemoteTestJob {
 export interface SshInvocation { args: string[]; input: AsyncIterable<Uint8Array>; timeoutMs: number; signal?: AbortSignal }
 export type SshRunner = (invocation: SshInvocation) => Promise<{ code: number; stdout: string }>;
 export type SshOutcome = { status: "terminal"; receipt: RemoteTestReceipt } |
- { status: "pending" | "infra_failed"; reason: "no_terminal_receipt" | "absent_receipt" | "expired_job" | "invalid_receipt" | "receipt_store_failed" };
+ { status: "pending" | "infra_failed"; reason: "no_terminal_receipt" | "absent_receipt" | "expired_job" | "invalid_receipt" | "receiver_failed" | "receipt_store_failed" };
 export interface SshOptions {
  runner?: SshRunner; now?: () => number; signal?: AbortSignal;
  /** Persistence failure must not expose passed to a caller. */
  receiptStore?: (receipt: RemoteTestReceipt) => Promise<void>;
 }
-const ResponseSchema = z.object({ version: z.literal(1), receipt: z.unknown().nullable() }).strict();
 
 /** Bounded stdout, discarded diagnostics, bounded input supplied by the client.
  * SSH reads credentials/config locally. No Ranger, bus or forge secrets are
@@ -86,7 +85,8 @@ async function exchange(config: SshConfig, job: RemoteTestJob, operation: "submi
  let receipt: RemoteTestReceipt;
  try {
   if (Buffer.byteLength(result.stdout) > SSH_LIMITS.responseBytes) throw Error("Oversize SSH response");
-  const response = ResponseSchema.parse(JSON.parse(result.stdout));
+  const response = SshResponseSchema.parse(JSON.parse(result.stdout));
+  if ("error" in response) return { status: "infra_failed", reason: response.error };
   if (response.receipt === null) return missing("absent_receipt");
   receipt = validateRemoteTestReceipt(response.receipt, job);
   const age = clock() - receipt.completedAt;

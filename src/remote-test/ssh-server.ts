@@ -2,16 +2,19 @@ import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, mkdir, open, realpath, rm } from "node:fs/promises";
 import { join } from "node:path";
-import { z } from "zod";
 import { privateOperatorPath } from "./baseline.ts";
 import { validateRemoteTestJob, validateRemoteTestReceipt, type RemoteTestJob, type RemoteTestReceipt } from "./contract.ts";
 import { executeRemoteTest, validateExecutorConfig } from "./executor.ts";
-import { SSH_LIMITS } from "./ssh-client.ts";
+import { SSH_LIMITS, SshRequestSchema, type SshResponse } from "./ssh-protocol.ts";
 
-const RequestSchema = z.discriminatedUnion("operation", [
- z.object({ version: z.literal(1), operation: z.literal("submit"), job: z.unknown(), bundleBytes: z.number().int().min(1).max(SSH_LIMITS.bundleBytes) }).strict(),
- z.object({ version: z.literal(1), operation: z.literal("status"), job: z.unknown() }).strict(),
-]);
+class InvalidSshReceipt extends Error {}
+function producedReceipt(input: unknown, job: RemoteTestJob, executorId: string): RemoteTestReceipt {
+ try {
+  const receipt = validateRemoteTestReceipt(input, job);
+  if (receipt.executorId !== executorId) throw Error("Receipt producer mismatch");
+  return receipt;
+ } catch { throw new InvalidSshReceipt("Invalid stored or produced receipt"); }
+}
 export interface SshServerOptions {
  signal?: AbortSignal;
  /** Unit-test seam. Production always uses the bounded durable executor. */
@@ -29,9 +32,9 @@ async function lookup(root: string, job: RemoteTestJob, executorId: string): Pro
   try {
    const info = await file.stat();
    if (!info.isFile() || info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0 || info.size > SSH_LIMITS.responseBytes) throw Error("Invalid private receipt");
-   const receipt = validateRemoteTestReceipt(JSON.parse(await file.readFile("utf8")), job);
-   if (receipt.executorId !== executorId) throw Error("Receipt producer mismatch");
-   return receipt;
+   let value: unknown;
+   try { value = JSON.parse(await file.readFile("utf8")); } catch { throw new InvalidSshReceipt("Invalid stored receipt JSON"); }
+   return producedReceipt(value, job, executorId);
   } finally { await file.close(); }
  } catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return null; throw e; }
 }
@@ -56,7 +59,7 @@ export async function serveSshRequest(input: AsyncIterable<Uint8Array>, operator
   parts.push(part);
   if (newline >= 0) { rest = chunk.subarray(newline + 1); break; }
  }
- const request = RequestSchema.parse(JSON.parse(Buffer.concat(parts, headerBytes).toString("utf8")));
+ const request = SshRequestSchema.parse(JSON.parse(Buffer.concat(parts, headerBytes).toString("utf8")));
  const profileId = (request.job as { profileId?: unknown } | null)?.profileId;
  const selected = config.profiles.find(p => p.profile.profileId === profileId);
  if (!selected) throw Error("Job profile is not operator-approved");
@@ -89,8 +92,15 @@ export async function serveSshRequest(input: AsyncIterable<Uint8Array>, operator
    if (count !== request.bundleBytes || `sha256:${hash.digest("hex")}` !== job.bundleDigest) throw Error("SSH bundle identity mismatch");
    await file.sync();
   } finally { await file.close(); }
-  const receipt = validateRemoteTestReceipt(await (options.execute ?? executeRemoteTest)({ job, bundlePath, config }, { signal: options.signal }), job);
-  if (receipt.executorId !== config.executorId) throw Error("Executor producer mismatch");
+  const receipt = producedReceipt(await (options.execute ?? executeRemoteTest)({ job, bundlePath, config }, { signal: options.signal }), job, config.executorId);
   return { version: 1, receipt };
  } finally { await rm(directory, { recursive: true }); }
+}
+
+/** A completed, authenticated SSH command may report a typed failure without
+ * implying a terminal test result. Transport interruption remains uncertain.
+ * No private error details enter the response. */
+export async function serveSshResponse(input: AsyncIterable<Uint8Array>, config: unknown, options: SshServerOptions = {}): Promise<SshResponse> {
+ try { return await serveSshRequest(input, config, options); }
+ catch (e) { return { version: 1, error: e instanceof InvalidSshReceipt ? "invalid_receipt" : "receiver_failed" }; }
 }

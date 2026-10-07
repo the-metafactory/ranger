@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdtemp, mkdir, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { serveSshRequest } from "../src/remote-test/ssh-server.ts";
+import { serveSshRequest, serveSshResponse } from "../src/remote-test/ssh-server.ts";
 import { runSshCommand, statusSshCommand, sshOutcomeExitCode, sshOutcomeMessage } from "../src/remote-test/ssh-cli.ts";
 import { validateRemoteTestReceipt } from "../src/remote-test/contract.ts";
 import { submitSshRemoteTest, statusSshRemoteTest, type SshRunner } from "../src/remote-test/ssh-client.ts";
@@ -96,7 +96,7 @@ test("client wire roundtrip through receiver and real durable executor storage i
  const clientConfig = { target: "fixture", remoteCli: "/reviewed/ranger", remoteConfig: "/private/config.json", executorId: "fixture", profiles: [f.profile] };
  let executions = 0;
  const runner: SshRunner = async invocation => {
-  const response = await serveSshRequest(invocation.input, f.config, { execute: async (input, options) => {
+  const response = await serveSshResponse(invocation.input, f.config, { execute: async (input, options) => {
    executions++;
    // A real executor operational refusal still persists a terminal receipt.
    // No container or host provisioning is needed to couple the storage seam.
@@ -109,4 +109,23 @@ test("client wire roundtrip through receiver and real durable executor storage i
  const retrieved = await statusSshRemoteTest({ config: clientConfig, job: f.job }, { runner });
  expect(retrieved).toEqual(submitted); expect(executions).toBe(1);
  if (retrieved.status === "terminal") { expect(retrieved.receipt.status).toBe("rejected"); expect(retrieved.receipt.evidence).toBeDefined(); }
+ // The fixed receiver reports permanently corrupt evidence, rather than
+ // hiding it behind a nonzero SSH exit and a pending outcome.
+ await writeFile(join(f.jobsRoot, ".artifacts", id, "receipt.json"), JSON.stringify({ ...f.receipt, identity: { ...f.job, generation: 2 } }));
+ expect(await statusSshRemoteTest({ config: clientConfig, job: f.job }, { runner })).toEqual({ status: "infra_failed", reason: "invalid_receipt" });
+ await writeFile(join(f.jobsRoot, ".artifacts", id, "receipt.json"), "partial JSON");
+ expect(await statusSshRemoteTest({ config: clientConfig, job: f.job }, { runner })).toEqual({ status: "infra_failed", reason: "invalid_receipt" });
+ await writeFile(join(f.jobsRoot, ".artifacts", id, "receipt.json"), JSON.stringify({ ...f.receipt, executorId: "other" }));
+ expect(await statusSshRemoteTest({ config: clientConfig, job: f.job }, { runner })).toEqual({ status: "infra_failed", reason: "invalid_receipt" });
+ expect(executions).toBe(1);
+ const failedReceiver: SshRunner = async invocation => ({ code: 0, stdout: JSON.stringify(await serveSshResponse(invocation.input, { ...f.config, executorId: "invalid executor" })) });
+ expect(await statusSshRemoteTest({ config: clientConfig, job: f.job }, { runner: failedReceiver })).toEqual({ status: "infra_failed", reason: "receiver_failed" });
+ const configPath = join(f.root, "executor.json"); await writeFile(configPath, JSON.stringify(f.config), { mode: 0o600 });
+ const cliReceiver: SshRunner = async invocation => {
+  const child = Bun.spawn(["bun", "src/cli.ts", "remote-test", "serve-stdio", "--config", configPath], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+  for await (const bytes of invocation.input) child.stdin.write(bytes); child.stdin.end();
+  const [code, stdout] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+  return { code, stdout };
+ };
+ expect(await statusSshRemoteTest({ config: clientConfig, job: f.job }, { runner: cliReceiver })).toEqual({ status: "infra_failed", reason: "invalid_receipt" });
 });

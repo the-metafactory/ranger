@@ -56,7 +56,7 @@ import { runBaseline, validateBaselineConfig, createCommandMetrics, localCommand
 import { executeRemoteTest, validateExecutorConfig } from "./remote-test/executor.ts";
 import { publishReceiptFile } from "./remote-test/artifacts.ts";
 import { runSshCommand, statusSshCommand, sshOutcomeExitCode, sshOutcomeMessage, type RunSshCommand } from "./remote-test/ssh-cli.ts";
-import { serveSshRequest } from "./remote-test/ssh-server.ts";
+import { serveSshResponse } from "./remote-test/ssh-server.ts";
 
 /**
  * ranger — autonomous orienteer work-graph walker.
@@ -480,7 +480,7 @@ remoteTest.command("serve-stdio")
   const timer = setTimeout(cancel, 15 * 60_000);
   try {
    const config = JSON.parse(await readFile(await privateOperatorPath(options.config, true), "utf8"));
-   const response = await serveSshRequest(process.stdin, config, { signal: abort.signal });
+   const response = await serveSshResponse(process.stdin, config, { signal: abort.signal });
    process.stdout.write(JSON.stringify(response) + "\n");
   } catch { process.stderr.write("ranger remote-test serve-stdio: request, admission, execution or storage failed; inspect private operator state.\n"); process.exitCode = 1; }
   finally { clearTimeout(timer); process.removeListener("SIGINT", cancel); process.removeListener("SIGTERM", cancel); process.removeListener("SIGHUP", cancel); }
