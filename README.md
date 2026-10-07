@@ -48,6 +48,16 @@ close-only runs leave the cursor unchanged. Awaiting-merge releases capacity.
 The dashboard shows both holders and the same next choices as walk.
 Unknown or ambiguous worker maps conservatively hold both resource lanes.
 
+`ranger resume-node <id> --when-free` resumes immediately when its lane is
+free, or records a durable FIFO entry when another implement worker holds it.
+Research and close-only resumes start immediately. On each walk tick, queued
+resumes run after merge desks and before new claims; a started implement resume
+reserves its lane for that tick. The dead-man pause and daily spawn cap retain
+queued entries. Closed nodes, released or already active rows, merged or closed
+PRs, and maps set to `walk: none` are removed with a reason. Moving a PR head
+keeps its entry valid. `ranger resume-node <id> --cancel` removes an entry and
+returns non-zero if none exists. Use `--map owner/name#root` to disambiguate.
+
 Journal upgrades run through `openJournal`, which seeds the root inputs required
 by `drizzle/0009_worker-root.sql` before applying migrations. A legacy repo with
 one registered map inherits that root. For multiple maps or a deregistered repo,

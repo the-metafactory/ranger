@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
-import { implementLane, startsImplementSession } from "./lanes.ts";
 import { executionRefusal, isGithubRepo, readRefusal } from "./forge-ref.ts";
-import { laneHeldMessage, recordImplementStart, mapKey, pickMap, resumeMap } from "./maps.ts";
+import { mapKey, pickMap } from "./maps.ts";
+import { resumeNode } from "./resume.ts";
 import { Command } from "commander";
 import { join, resolve } from "node:path";
 import {
@@ -40,7 +40,7 @@ import {
 import { canonicalDir, runNode } from "./worker.ts";
 import { trustCurrentGitState } from "./git-trust.ts";
 import { sweepMap } from "./sweep.ts";
-import { spawnRunNodeDetached, walk } from "./walk.ts";
+import { walk } from "./walk.ts";
 import { holdAwake } from "./awake.ts";
 import { BUILD_NOW_NOT_STARTED, buildNow, type BuildNowResult } from "./build-now.ts";
 import { startServe } from "./serve.ts";
@@ -273,38 +273,11 @@ async function runResumeNode(
  nodeId: string,
  repo: string | undefined,
  configPath: string,
- force?: boolean,
+ options: { force?: boolean; whenFree?: boolean; cancel?: boolean },
 ): Promise<string> {
  const { config, journal } = loadCtx(configPath);
  try {
-  const map = resumeMap(config, journal.listWorkers(), nodeId, repo);
-  await writeContext(config, map); // the same identity gate as run-node
-  const row = journal.getWorker(nodeId, map.repo);
-  if (row === null || row.repo !== map.repo) {
-   throw new Error(`no journal row for node ${nodeId} on ${map.repo} — nothing to resume`);
-  }
-  if (row.status === "released") {
-   throw new Error(`node ${nodeId}'s claim was released — the walk re-claims it from the frontier`);
-  }
-  // A resume starts a worker session in this map's resource lane.
-  const lane = implementLane(map);
-  const takesLane = startsImplementSession(row);
-  const holder = takesLane ? journal.laneHolder(lane, { nodeId, repo: map.repo }) : null;
-  if (holder !== null && force !== true) {
-   throw new Error(laneHeldMessage(lane, holder, "resume", nodeId));
-  }
-  journal.updateWorker(nodeId, map.repo, { status: "claimed", pid: null, workerPgid: null, finishedAt: null });
-  if (takesLane) recordImplementStart(journal, map);
-  const pid = await spawnRunNodeDetached({
-   nodeId,
-   repo: map.repo,
-   root: map.root,
-   cliEntry: join(import.meta.dir, "cli.ts"),
-   configPath,
-  });
-  if (pid !== null) journal.updateWorker(nodeId, map.repo, { pid });
-  journal.recordEvent("sweep", { nodeId, repo: map.repo, detail: `resume-node by operator (was ${row.status}); run-node pid ${pid ?? "none"}` });
-  return JSON.stringify({ nodeId, repo: map.repo, root: map.root, was: row.status, pid }, null, 2);
+  return JSON.stringify(await resumeNode(nodeId, repo, { config, configPath, journal }, options), null, 2);
  } finally {
   journal.close();
  }
@@ -700,11 +673,13 @@ program
  .argument("<id>", "node id to resume")
  .option("-m, --map <owner/name#root>", "map repo or repo#root (optional; inferred from the journal row)")
  .option("--force", "resume even while another implement worker holds the lane")
+ .option("--when-free", "queue a resume FIFO when its implement lane is held")
+ .option("--cancel", "remove a queued resume")
  .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
- .action(async (id: string, options: { map?: string; config: string; force?: boolean }) => {
+ .action(async (id: string, options: { map?: string; config: string; force?: boolean; whenFree?: boolean; cancel?: boolean }) => {
   try {
    const configPath = resolve(process.cwd(), options.config);
-   process.stdout.write((await runResumeNode(id, options.map, configPath, options.force)) + "\n");
+   process.stdout.write((await runResumeNode(id, options.map, configPath, options)) + "\n");
   } catch (error) {
    process.stderr.write(
     `ranger resume-node: ${error instanceof Error ? error.message : String(error)}\n`,

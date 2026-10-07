@@ -1,0 +1,341 @@
+import { describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
+import { drizzle } from "drizzle-orm/bun-sqlite";
+import { migrate } from "drizzle-orm/bun-sqlite/migrator";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { stringify } from "yaml";
+import { loadConfig } from "../src/config.ts";
+import { Journal, openJournal, type WorkerStatus, type ImplementPhase } from "../src/journal.ts";
+import { LAST_IMPLEMENT_MAP } from "../src/maps.ts";
+import type { GitHubPort, PullRequest } from "../src/github.ts";
+import { walk, type SpawnRunNodeArgs } from "../src/walk.ts";
+import { fakeDiscord, fixturesBin, runCli } from "./support.ts";
+
+const REPO = "acme/widgets";
+const NOW = new Date("2026-10-07T10:00:00Z");
+
+function rig() {
+ const dir = mkdtempSync(join(tmpdir(), "ranger-resume-queue-"));
+ const discord = fakeDiscord();
+ const configPath = join(dir, "ranger.yaml");
+ const raw = { version: 1,
+  maps: [1, 460].map(root => ({ repo: REPO, root, walk: "full", commands: { test: "bun test" },
+   discord: { tokenEnv: "RANGER_DISCORD_TOKEN", channelId: String(root) } })),
+  auth: { defaultWriteTokenEnv: "RANGER_WRITE_TEST" }, bot: { identity: "ivy-bot" },
+  state: { journalPath: join(dir, "journal.sqlite") }, workers: { spawnCapPerDay: 10 },
+ };
+ writeFileSync(configPath, stringify(raw));
+ const config = loadConfig(configPath).config;
+ const journal = openJournal(config);
+ const data = join(dir, "data"); mkdirSync(data);
+ const frontier = (root: number, ids: string[]) => writeFileSync(join(data, `acme__widgets-frontier-${root}.json`), JSON.stringify({
+  repo: REPO, root: String(root), frontier: ids.map(id => ({ ref: { id }, node: { id, title: `Build ${id}`, kind: "task", autonomy: "auto", probes: [] },
+   status: "open", assignees: [], blockedBy: [], author: "alice", typed: true, url: `https://github.com/${REPO}/issues/${id}` })) }));
+ for (const root of [1, 460]) frontier(root, []);
+ const state = join(dir, "graph.json"); writeFileSync(state, JSON.stringify({ nodes: {}, decisions: [] }));
+ const env = { ...process.env, PATH: `${fixturesBin}:${process.env.PATH ?? ""}`, FAKE_SOMA_DIR: data,
+  FAKE_SOMA_STATE: state, RANGER_WRITE_TEST: "ghp_write", RANGER_NO_SPAWN: "1", RANGER_DISCORD_TOKEN: "test",
+  RANGER_DISCORD_API_BASE: `http://127.0.0.1:${discord.port}`, RANGER_DISCORD_ALLOW_TEST_OVERRIDE: "1", RANGER_DISCORD_MIN_INTERVAL_MS: "5" };
+ const node = (id: string, status = "open") => writeFileSync(join(data, `acme__widgets-node-${id}.json`), JSON.stringify({
+  repo: REPO, ref: { id }, node: { id, title: `Build ${id}`, kind: "task", autonomy: "auto" },
+  status, assignees: ["ivy-bot"], blockedBy: [], author: "alice", typed: true, url: "" }));
+ const worker = (id: string, root = 1, status: WorkerStatus = "parked", lane = "implement", phase: ImplementPhase | null = "review") => {
+  journal.upsertWorker({ nodeId: id, repo: REPO, root, status, lane, phase, finishedAt: "2026-10-06T00:00:00Z", workerPgid: 1234 });
+  node(id);
+ };
+ const queue = (id: string, root = 1) => {
+  worker(id, root);
+  return journal.enqueueResume({ nodeId: id, repo: REPO, root, lane: "headless" }, NOW);
+ };
+ return { dir, raw, configPath, config, journal, env, node, worker, queue, frontier,
+  cli: (id: string, flags: string[] = [], over: NodeJS.ProcessEnv = {}) => runCli(["resume-node", id, "-c", configPath, ...flags], { ...env, ...over }),
+  close() { journal.close(); discord.stop(); rmSync(dir, { recursive: true, force: true }); } };
+}
+
+async function withRig(fn: (r: ReturnType<typeof rig>) => Promise<void>) {
+ const r = rig();
+ const saved = { ...process.env };
+ try { Object.assign(process.env, r.env); await fn(r); }
+ finally {
+  for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
+  Object.assign(process.env, saved); r.close();
+ }
+}
+
+function pr(number = 7): PullRequest {
+ return { number, state: "open", merged: false, draft: false, title: "Build", headRef: "node/40-x", headSha: "b".repeat(40),
+  baseRef: "main", mergeable: true, mergeableState: "clean", mergeCommitSha: null, mergedBy: null, url: "", author: "ivy-bot" };
+}
+
+describe("resume-node CLI", () => {
+ test("held lane queues durably, records queued, and repeated requests keep FIFO position", async () => {
+  await withRig(async r => {
+   r.worker("40"); r.worker("41", 460, "running");
+   const result = await r.cli("40", ["--when-free"]);
+   expect(result.code).toBe(0);
+   expect(JSON.parse(result.stdout)).toMatchObject({ nodeId: "40", root: 1, queued: true, lane: "headless" });
+   const entry = r.journal.listResumeQueue()[0];
+   expect(r.journal.getWorker("40", REPO)).toMatchObject({ status: "parked", pid: null });
+   expect(r.journal.spawnsToday()).toBe(0);
+   expect((await r.cli("40", ["--when-free"])).code).toBe(0);
+   expect(r.journal.listResumeQueue()).toEqual([entry]);
+   expect(r.journal.listEvents(REPO).filter(e => e.kind === "queued")).toHaveLength(1);
+   expect(r.journal.listEvents(REPO).some(e => e.kind === "sweep")).toBe(false);
+   const reader = Journal.openReadOnly(r.config.state.journalPath)!;
+   expect(reader.listResumeQueue()).toEqual([entry]); reader.close();
+  });
+ });
+
+ for (const [name, lane, phase, held] of [
+  ["free implement lane", "implement", "review", false],
+  ["research resume", "research", null, true],
+  ["close-only resume", "implement", "close", true],
+ ] as const) {
+  test(`${name} resumes immediately through the ordinary resume path`, async () => {
+   await withRig(async r => {
+    r.worker("40", 460, "failed", lane, phase);
+    if (held) r.worker("41", 1, "running");
+    const result = await r.cli("40", ["--when-free"]);
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({ nodeId: "40", root: 460, was: "failed", pid: null });
+    expect(r.journal.listResumeQueue()).toEqual([]);
+    expect(r.journal.getWorker("40", REPO)).toMatchObject({ status: "claimed", workerPgid: null, finishedAt: null, phase });
+    expect(r.journal.getHealth(LAST_IMPLEMENT_MAP)).toBe(held ? null : REPO + "#460");
+   });
+  });
+ }
+
+ test("cancel removes only the selected queued node with an event; absent entry refuses", async () => {
+  await withRig(async r => {
+   r.queue("40"); r.queue("41", 460);
+   expect((await r.cli("40", ["--cancel"])).code).toBe(0);
+   expect(r.journal.listResumeQueue().map(e => e.nodeId)).toEqual(["41"]);
+   expect(r.journal.listEvents(REPO).find(e => e.kind === "resume-cancelled")?.nodeId).toBe("40");
+   expect((await r.cli("40", ["--cancel"])).code).not.toBe(0);
+   expect(r.journal.getWorker("40", REPO)?.status).toBe("parked");
+  });
+ });
+
+ test("plain resume still refuses a held lane; force starts; conflicting flags refuse", async () => {
+  await withRig(async r => {
+   r.worker("40"); r.worker("41", 460, "running");
+   expect((await r.cli("40")).code).not.toBe(0);
+   for (const flags of [["--cancel", "--when-free"], ["--when-free", "--force"], ["--cancel", "--force"]]) {
+    expect((await r.cli("40", flags)).code).not.toBe(0);
+   }
+   expect(r.journal.listResumeQueue()).toEqual([]);
+   expect((await r.cli("40", ["--force"])).code).toBe(0);
+   expect(r.journal.getWorker("40", REPO)?.status).toBe("claimed");
+  });
+ });
+
+ test("queueing and immediate startup retain the identity gate", async () => {
+  await withRig(async r => {
+   r.worker("40"); r.worker("41", 460, "running");
+   const result = await r.cli("40", ["--when-free"], { RANGER_WRITE_TEST: "ghp_principal" });
+   expect(result.code).not.toBe(0);
+   expect(r.journal.listResumeQueue()).toEqual([]);
+   r.journal.updateWorker("41", REPO, { status: "success" });
+   expect((await r.cli("40", ["--when-free"], { RANGER_WRITE_TEST: "ghp_principal" })).code).not.toBe(0);
+   expect(r.journal.getWorker("40", REPO)?.status).toBe("parked");
+  });
+ });
+});
+
+describe("resume-queue-starts-when-lane-frees", () => {
+ test("FIFO across maps: held queue waits, A alone starts, then B after A releases", async () => {
+  await withRig(async r => {
+   r.queue("40", 460); r.queue("41"); r.worker("42", 1, "running");
+   const spawned: string[] = [];
+   const launches: SpawnRunNodeArgs[] = [];
+   const tick = () => walk({ ...r, spawnRunNode: async (args) => { launches.push(args); spawned.push(args.nodeId); return process.pid; }, now: () => NOW });
+   await tick(); expect(spawned).toEqual([]);
+   r.journal.updateWorker("42", REPO, { status: "success" });
+   await tick(); expect(spawned).toEqual(["40"]);
+   expect(launches[0]).toMatchObject({ nodeId: "40", repo: REPO, root: 460, configPath: r.configPath });
+   expect(launches[0].cliEntry).toEndWith("/src/cli.ts");
+   expect(r.journal.listResumeQueue().map(e => e.nodeId)).toEqual(["41"]);
+   expect(r.journal.getWorker("40", REPO)).toMatchObject({ status: "claimed", pid: process.pid, workerPgid: null, finishedAt: null, phase: "review" });
+   expect(r.journal.getHealth(LAST_IMPLEMENT_MAP + ".headless")).toBe(REPO + "#460");
+   expect(r.journal.spawnsToday(NOW)).toBe(1);
+   await tick(); expect(spawned).toEqual(["40"]);
+   r.journal.updateWorker("40", REPO, { status: "success" });
+   await tick(); expect(spawned).toEqual(["40", "41"]);
+   expect(r.journal.listResumeQueue()).toEqual([]);
+   expect(r.journal.listEvents(REPO).filter(e => e.kind === "resume-started")).toHaveLength(2);
+  });
+ });
+
+ test("started resume prevents all same-lane fresh claims even when its worker finishes during the tick", async () => {
+  await withRig(async r => {
+   r.queue("40", 460); r.frontier(1, ["20"]); r.frontier(460, ["21"]);
+   const spawned: string[] = [];
+   const result = await walk({ ...r, spawnRunNode: async ({ nodeId }) => {
+    spawned.push(nodeId); r.journal.updateWorker(nodeId, REPO, { status: "success" }); return process.pid;
+   } });
+   expect(spawned).toEqual(["40"]);
+   expect(result.maps.flatMap(m => m.claimed)).toEqual([]);
+   expect(r.journal.getWorker("20", REPO)).toBeNull(); expect(r.journal.getWorker("21", REPO)).toBeNull();
+  });
+ });
+
+ test("independent implement lanes each start their first resume", async () => {
+  await withRig(async r => {
+   r.config.maps[1].lane = "visual";
+   r.queue("40"); r.worker("41", 460);
+   r.journal.enqueueResume({ nodeId: "41", repo: REPO, root: 460, lane: "visual" });
+   const spawned: string[] = [];
+   await walk({ ...r, spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; } });
+   expect(spawned).toEqual(["40", "41"]);
+  });
+ });
+
+ test("merge-desk send-back takes the lane before a queued resume", async () => {
+  await withRig(async r => {
+   r.queue("41"); r.worker("40", 460, "awaiting-merge", "implement", "awaiting-merge");
+   r.journal.updateWorker("40", REPO, { prNumber: 7 });
+   const github = { getPr: async () => ({ ...pr(), mergeable: false, mergeableState: "dirty" }),
+    listComments: async () => [{ id: 1, author: "ivy-bot", body: `<!-- ranger:review round=5 sha=${pr().headSha} blockers=0 majors=0 nits=1 -->\nclean` }],
+    checkRunsFor: async () => [], issueLabels: async () => [] } as unknown as GitHubPort;
+   const spawned: string[] = [];
+   await walk({ ...r, github, spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; } });
+   expect(spawned).toEqual(["40"]);
+   expect(r.journal.listResumeQueue().map(e => e.nodeId)).toEqual(["41"]);
+  });
+ });
+
+ for (const gate of ["pause", "cap"] as const) {
+  test(`${gate} retains the queue; clearing it permits a start`, async () => {
+   await withRig(async r => {
+    r.queue("40");
+    if (gate === "pause") r.journal.setPaused(true);
+    else for (let i = 0; i < r.config.workers.spawnCapPerDay; i++) r.journal.recordSpawn(NOW);
+    const spawned: string[] = [];
+    const tick = () => walk({ ...r, spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; }, now: () => NOW });
+    await tick(); expect(spawned).toEqual([]); expect(r.journal.listResumeQueue()).toHaveLength(1);
+    if (gate === "pause") r.journal.setPaused(false);
+    else r.config.workers.spawnCapPerDay++;
+    await tick(); expect(spawned).toEqual(["40"]); expect(r.journal.listResumeQueue()).toEqual([]);
+   });
+  });
+ }
+
+ for (const reason of ["node closed", "released", "PR merged", "PR closed", "claimed", "running", "walk none"] as const) {
+  test(`drops ${reason} with a reason and considers the next entry`, async () => {
+   await withRig(async r => {
+    r.queue("40"); r.queue("41", 460);
+    if (reason === "node closed") r.node("40", "closed");
+    if (["released", "claimed", "running"].includes(reason)) r.journal.updateWorker("40", REPO, { status: reason as WorkerStatus });
+    if (reason.startsWith("PR")) r.journal.updateWorker("40", REPO, { status: "failed", prNumber: 7 });
+    if (reason === "walk none") r.config.maps[0].walk = "none";
+    const github = { getPr: async () => ({ ...pr(), state: "closed", merged: reason === "PR merged" }) } as unknown as GitHubPort;
+    const spawned: string[] = [];
+    await walk({ ...r, github, spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; } });
+    // An in-flight implement row still holds the lane after its queue entry is dropped.
+    expect(spawned).toEqual(["claimed", "running"].includes(reason) ? [] : ["41"]);
+    expect(r.journal.listResumeQueue().some(e => e.nodeId === "40")).toBe(false);
+    const event = r.journal.listEvents(REPO).find(e => e.kind === "resume-dropped" && e.nodeId === "40");
+    expect(event?.detail).toContain(reason === "walk none" ? "walk: none" : reason.split(" ").at(-1)!);
+   });
+  });
+ }
+
+ test("a moved PR head still starts, using one PR read shared with the desk", async () => {
+  await withRig(async r => {
+   r.queue("40"); r.journal.updateWorker("40", REPO, { prNumber: 7, verdictSha: "a".repeat(40) });
+   let reads = 0;
+   const github = { getPr: async () => { reads++; return pr(); } } as unknown as GitHubPort;
+   const spawned: string[] = [];
+   await walk({ ...r, github, spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; } });
+   expect(reads).toBe(1); expect(spawned).toEqual(["40"]); expect(r.journal.listResumeQueue()).toEqual([]);
+  });
+ });
+
+ test("PR read failure retains FIFO and keeps fresh claims behind it", async () => {
+  await withRig(async r => {
+   r.queue("40"); r.queue("41", 460); r.journal.updateWorker("40", REPO, { status: "failed", prNumber: 7 });
+   r.frontier(460, ["21"]);
+   const github = { getPr: async () => { throw new Error("read failed"); } } as unknown as GitHubPort;
+   const spawned: string[] = [];
+   const result = await walk({ ...r, github, spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; } });
+   expect(spawned).toEqual([]); expect(r.journal.listResumeQueue()).toHaveLength(2);
+   expect(result.maps.flatMap(m => m.errors).join(" ")).toContain("read failed");
+  });
+ });
+
+ test("a row activated during validation is dropped rather than restarted", async () => {
+  await withRig(async r => {
+   r.queue("40"); r.queue("41", 460); r.journal.updateWorker("40", REPO, { status: "failed", prNumber: 7 });
+   const github = { getPr: async () => {
+    r.journal.updateWorker("40", REPO, { status: "running", phase: "close" }); return pr();
+   } } as unknown as GitHubPort;
+   const spawned: string[] = [];
+   await walk({ ...r, github, spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; } });
+   expect(spawned).toEqual(["41"]);
+   expect(r.journal.getWorker("40", REPO)?.status).toBe("running");
+   expect(r.journal.listResumeQueue()).toEqual([]);
+   expect(r.journal.listEvents(REPO).find(e => e.kind === "resume-dropped")?.detail).toContain("running");
+  });
+ });
+
+ test("one queued start spends the last spawn, retaining the other lane's entry", async () => {
+  await withRig(async r => {
+   r.config.maps[1].lane = "visual"; r.config.workers.spawnCapPerDay = 1;
+   r.queue("40"); r.worker("41", 460);
+   r.journal.enqueueResume({ nodeId: "41", repo: REPO, root: 460, lane: "visual" });
+   const spawned: string[] = [];
+   await walk({ ...r, now: () => NOW, spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; } });
+   expect(spawned).toEqual(["40"]); expect(r.journal.spawnsToday(NOW)).toBe(1);
+   expect(r.journal.listResumeQueue().map(e => e.nodeId)).toEqual(["41"]);
+  });
+ });
+
+ test("identity gate failure keeps entries queued without starting", async () => {
+  await withRig(async r => {
+   r.queue("40");
+   process.env.RANGER_WRITE_TEST = "ghp_principal";
+   const spawned: string[] = [];
+   const result = await walk({ ...r, spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; } });
+   expect(spawned).toEqual([]); expect(r.journal.listResumeQueue()).toHaveLength(1);
+   expect(result.maps.every(m => m.gated)).toBe(true);
+   expect(r.journal.getWorker("40", REPO)?.status).toBe("parked");
+  });
+ });
+
+ test("spawn failure or no PID retains the parked queue entry for retry", async () => {
+  await withRig(async r => {
+   r.queue("40");
+   for (const spawnRunNode of [async () => null, async () => { throw new Error("spawn failed"); }]) {
+    await walk({ ...r, spawnRunNode });
+    expect(r.journal.listResumeQueue()).toHaveLength(1);
+    expect(r.journal.getWorker("40", REPO)?.status).toBe("parked");
+    expect(r.journal.spawnsToday()).toBe(0);
+   }
+  });
+ });
+});
+
+test("resume queue migration appends to the prior journal and preserves worker state", () => {
+ const dir = mkdtempSync(join(tmpdir(), "ranger-resume-migration-"));
+ const folder = join(dir, "drizzle"); mkdirSync(join(folder, "meta"), { recursive: true });
+ const source = join(import.meta.dir, "../drizzle");
+ const manifest = JSON.parse(readFileSync(join(source, "meta/_journal.json"), "utf8"));
+ manifest.entries = manifest.entries.filter((e: { tag: string }) => e.tag !== "0022_resume-queue");
+ writeFileSync(join(folder, "meta/_journal.json"), JSON.stringify(manifest));
+ for (const e of manifest.entries) copyFileSync(join(source, `${e.tag}.sql`), join(folder, `${e.tag}.sql`));
+ const path = join(dir, "state.sqlite"); const sqlite = new Database(path);
+ try {
+  sqlite.run("CREATE TABLE ranger_legacy_roots (repo text PRIMARY KEY, root integer NOT NULL)");
+  migrate(drizzle(sqlite), { migrationsFolder: folder });
+  sqlite.run("INSERT INTO workers(repo,node_id,root,status,generation) VALUES('acme/widgets','40',460,'parked',7)");
+  sqlite.close();
+  const journal = new Journal(path);
+  try {
+   expect(journal.getWorker("40", REPO)).toMatchObject({ root: 460, status: "parked", generation: 7 });
+   const entry = journal.enqueueResume({ nodeId: "40", repo: REPO, root: 460, lane: "headless" });
+   expect(journal.listResumeQueue()).toEqual([entry]);
+  } finally { journal.close(); }
+ } finally { rmSync(dir, { recursive: true, force: true }); }
+});

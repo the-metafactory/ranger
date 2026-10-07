@@ -1,4 +1,5 @@
-import { implementLane, type ImplementLane } from "./lanes.ts";
+import { implementLane, startsImplementSession, type ImplementLane } from "./lanes.ts";
+import { startResumeNode } from "./resume.ts";
 import { executionRefusal } from "./forge-ref.ts";
 import { lastImplementMaps, recordImplementStart, mapKey, implementMapOrder } from "./maps.ts";
 import { spawn } from "node:child_process";
@@ -7,7 +8,7 @@ import type { RangerConfig, RangerMapConfig, WalkMode } from "./config.ts";
 import { DiscordAnnouncer, type AnnounceContext, type AnnounceResult } from "./announce.ts";
 import { BudgetDeferral, budgetPolicy } from "./budget.ts";
 import { readFrontier } from "./frontier-cache.ts";
-import { GRAPH_CALL_TIMEOUT_MS } from "./graph.ts";
+import { graphNode, GRAPH_CALL_TIMEOUT_MS } from "./graph.ts";
 import { graphClaim, type ClaimResult } from "./graph-write.ts";
 import {
  assertNotPrincipal,
@@ -20,6 +21,7 @@ import { ClaimLockBusy, withClaimLock } from "./claim-lock.ts";
 import type { OwnedCheck } from "./lock.ts";
 import { classifyFrontier, loadProbeRegistry } from "./route.ts";
 import type { GitHubPort } from "./github.ts";
+import * as realGitHub from "./github.ts";
 import { sweepMap, type SweepMapResult } from "./sweep.ts";
 import {
  implementCandidates,
@@ -36,10 +38,11 @@ export { implementCandidates, planTick, researchCandidates, selectCandidates };
  * The headless tick (design §1, build-path step 3) — one bounded pass:
  *
  * per map → gate (write token + not-principal + walk mode + pause state) →
- * sweep (liveness, merge desk and its send-backs); then, per map again →
+ * sweep (liveness, merge desk and its send-backs) → queued resumes;
+ * then, per map again →
  * derive + classify frontier → research-lane candidates → announce (fail-closed)
  * → claim (race-safe) → spawn a detached `ranger run-node`. Sweeps go first so
- * a send-back takes its implement lane before a fresh claim can.
+ * a send-back takes its implement lane before queued resumes or fresh claims.
  *
  * Stateless over the graph: everything topological is re-derived per pass.
  */
@@ -303,6 +306,21 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
  // Even a worker finishing during this tick must not allow a second claim
  // across maps: at most one new implement claim per resource lane per tick.
  const implementClaimed = new Set<ImplementLane>();
+ // Desks and queue validation share the PR read for this bounded tick.
+ const port = ctx.github ?? realGitHub;
+ const prReads = new Map<string, ReturnType<GitHubPort["getPr"]>>();
+ const getPr: GitHubPort["getPr"] = (repo, number, token) => {
+  const key = `${repo}#${number}`;
+  if (!prReads.has(key)) prReads.set(key, port.getPr(repo, number, token));
+  return prReads.get(key)!;
+ };
+ const github = new Proxy(port, {
+  get(target, key) {
+   if (key === "getPr") return getPr;
+   const value = Reflect.get(target, key);
+   return typeof value === "function" ? value.bind(target) : value;
+  },
+ });
 
  const order = implementMapOrder(config.maps, lastImplementMaps(journal), implementLane);
  // One sweep wiring for both phases; only the phase differs.
@@ -316,7 +334,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
    map: w.map,
    token: w.token,
    botIdentity: w.botIdentity,
-   github: ctx.github,
+   github,
    phase,
    respawn: (nodeId, repo, root) =>
     (ctx.spawnRunNode ?? spawnRunNodeDetached)({ nodeId, repo, root, cliEntry, configPath: ctx.configPath }),
@@ -411,7 +429,79 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
   }
  }
 
- // Pass 2 — claims, in the same map order, against lanes the sweeps and desks have settled.
+ // Pass 1c — queued resumes, FIFO within each implement lane, ahead of claims.
+ if (journal.listResumeQueue().length > 0) {
+  try {
+   await withClaimLock(journal, async owned => {
+    const waiting = new Set<ImplementLane>();
+    for (const entry of journal.listResumeQueue()) {
+     if (waiting.has(entry.lane) || implementClaimed.has(entry.lane)) continue;
+     const map = config.maps.find(m => m.repo === entry.repo && m.root === entry.root);
+     const w = walked.find(w => w.map === map);
+     const drop = (reason: string) => {
+      owned();
+      journal.removeResume(entry, "resume-dropped", reason);
+     };
+     if (map === undefined || map.walk === "none") {
+      drop(map === undefined ? "map is no longer registered" : "map is walk: none");
+      continue;
+     }
+     const row = journal.getWorker(entry.nodeId, entry.repo);
+     if (row === null || row.root !== entry.root || row.status === "released" || row.status === "claimed" || row.status === "running") {
+      drop(row === null ? "worker row is missing" : row.root !== entry.root ? "worker map root changed" : `worker row is ${row.status}`);
+      continue;
+     }
+     if (w === undefined) {
+      waiting.add(entry.lane);
+      implementClaimed.add(entry.lane);
+      continue; // The map's credential/execution gate failed; keep the entry.
+     }
+     try {
+      const node = await graphNode(entry.repo, entry.nodeId, { token: w.token, source: "write-token" }, { timeoutMs: GRAPH_CALL_TIMEOUT_MS });
+      if (node.status === "closed") {
+       drop("node is closed");
+       continue;
+      }
+      if (row.prNumber !== null) {
+       const pr = await github.getPr(entry.repo, row.prNumber, w.token);
+       if (pr.merged || pr.state === "closed") {
+        drop(pr.merged ? "PR is merged" : "PR is closed");
+        continue;
+       }
+      }
+      const takesLane = startsImplementSession(row);
+      if (journal.isPaused() || journal.spawnsToday(ctx.now?.() ?? new Date()) >= config.workers.spawnCapPerDay ||
+          (takesLane && implementLaneBusy(journal, implementLane(map)))) {
+       waiting.add(entry.lane);
+       continue;
+      }
+      const resumed = await startResumeNode(entry.nodeId, map, ctx, owned, { queued: entry });
+      if ("dropped" in resumed) continue;
+      if ("queued" in resumed) {
+       waiting.add(entry.lane);
+       implementClaimed.add(implementLane(map));
+       continue;
+      }
+      // Reserve it for this entire tick, even if run-node finishes immediately.
+      if (takesLane) {
+       implementClaimed.add(implementLane(map));
+       waiting.add(entry.lane);
+      }
+     } catch (error) {
+      waiting.add(entry.lane);
+      implementClaimed.add(implementLane(map));
+      w.errors.push(`queued resume #${entry.nodeId}: ${error instanceof Error ? error.message : String(error)}`);
+     }
+    }
+   });
+  } catch (error) {
+   // Never let claims overtake a queue whose pass could not finish.
+   for (const entry of journal.listResumeQueue()) implementClaimed.add(entry.lane);
+   for (const w of walked) w.errors.push(`resume queue failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+ }
+
+ // Pass 2 — claims, against lanes the sweeps, desks and queued resumes have settled.
  for (const { map, mapResult, token, botIdentity, errors } of walked) {
   if (!mapResult.gated) {
    try {
