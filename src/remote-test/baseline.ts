@@ -135,8 +135,8 @@ trap 'status=$?; trap - EXIT; cleanup || status=125; exit "$status"' EXIT
 trap 'exit 124' HUP INT TERM
 # Enumerate the newly-created child's kernel interfaces successfully before
 # declaring one absent (ENOENT). A failed stat/read cannot establish absence.
-# Cgroup interfaces are fixed for this child's lifetime. Any later read error,
-# including disappearance of a listed peak file, fails the measurement.
+# Any later read error, including disappearance of a listed peak file, fails
+# the measurement rather than being treated as optional telemetry.
 interfaces=$(LC_ALL=C ls -1a -- "$cg")
 peak_state=unavailable
 if printf '%s\\n' "$interfaces" | grep -qxF 'memory.peak'; then peak_state=observed; test -r "$cg/memory.peak"; fi
