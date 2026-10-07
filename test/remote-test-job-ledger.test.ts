@@ -39,6 +39,18 @@ test("terminal duplicates reuse the durable exact receipt after restart", async 
  const reopened = await openJobLedger(f.root, "fixture", f.now);
  try { expect(reopened.admit(j)).toEqual({ kind: "terminal", receipt }); } finally { reopened.close(); }
 });
+test("an abrupt death holds the single admission slot without consuming later job identities", async () => {
+ const f = await fixture(), old = job(), next = job();
+ expect(f.ledger.admit(old).kind).toBe("admitted"); f.ledger.close();
+ const restarted = await openJobLedger(f.root, "fixture", f.now);
+ try {
+  expect(restarted.admit(next)).toEqual({ kind: "busy" });
+  expect(restarted.status(next)).toBeNull();
+  expect(restarted.admit(next)).toEqual({ kind: "busy" });
+  await restarted.reconcile({ list: async () => [], remove: async () => {}, cleanup: async () => {} });
+  expect(restarted.admit(next).kind).toBe("admitted");
+ } finally { restarted.close(); }
+});
 test("completed outcomes retain their original status and time after the execution deadline", async () => {
  for (const status of ["passed", "test_failed"] as const) {
   const f = await fixture(), j = job(), a = f.ledger.admit(j); if (a.kind !== "admitted") throw Error();

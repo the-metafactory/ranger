@@ -39,10 +39,10 @@ test("status never uploads source or submits again, and handles absent and expir
  expect((await statusSshRemoteTest({ config, job }, { runner: f.runner, now: () => job.deadline + 1 })).status).toBe("infra_failed");
 });
 test("SSH consumers distinguish active ownership from interrupted work without retrying", async () => {
- for (const state of ["active", "interrupted"] as const) {
+ for (const state of ["active", "interrupted", "busy"] as const) {
   const f = fake(JSON.stringify({ version: 2, receipt: null, state }));
   const result = await statusSshRemoteTest({ config, job }, { runner: f.runner, now: () => now });
-  expect(result).toEqual({ status: "pending", reason: state === "active" ? "active_job" : "interrupted_job" });
+  expect(result).toEqual({ status: "pending", reason: state === "active" ? "active_job" : state === "busy" ? "executor_busy" : "interrupted_job" });
   expect(sshOutcomeMessage(result)).toContain(state); expect(f.calls).toHaveLength(1);
  }
 });

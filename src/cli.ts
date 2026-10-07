@@ -54,7 +54,7 @@ import type { WalkMode } from "./config.ts";
 import { lstat, mkdir, readFile, rm } from "node:fs/promises";
 import { runBaseline, validateBaselineConfig, createCommandMetrics, localCommandAdapter, sshCommandAdapter, privateOperatorPath, writePrivateBaselineReport } from "./remote-test/baseline.ts";
 import { executeRemoteTest, reconcileRemoteTests, validateExecutorConfig } from "./remote-test/executor.ts";
-import { ActiveRemoteTestJob, RevokedRemoteTestJob, openJobLedger } from "./remote-test/job-ledger.ts";
+import { ActiveRemoteTestJob, BusyRemoteTestExecutor, RevokedRemoteTestJob, openJobLedger } from "./remote-test/job-ledger.ts";
 import { validateRemoteTestJob } from "./remote-test/contract.ts";
 import { publishReceiptFile } from "./remote-test/artifacts.ts";
 import { runSshCommand, statusSshCommand, sshOutcomeExitCode, sshOutcomeMessage, type RunSshCommand } from "./remote-test/ssh-cli.ts";
@@ -522,6 +522,9 @@ remoteTest.command("execute")
    }
    if (error instanceof RevokedRemoteTestJob) {
     process.stderr.write("Remote-test observed passed outcome is revoked; no accepted success.\n"); process.exitCode = 1; return;
+   }
+   if (error instanceof BusyRemoteTestExecutor) {
+    process.stderr.write("Remote-test executor busy; this job was not admitted. Inspect the active attempt or recover with the executor stopped.\n"); process.exitCode = 1; return;
    }
    process.stderr.write(receiptStored
     ? "ranger remote-test execute: durable receipt stored; output export failed. Repeat execute with the identical job and a new output path, or query status; do not export loose artifacts.\n"

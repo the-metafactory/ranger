@@ -8,8 +8,8 @@ export const SshRequestSchema = z.discriminatedUnion("operation", [
 ]);
 export const SshResponseSchema = z.union([
  z.object({ version: z.literal(1), receipt: z.unknown().nullable() }).strict(),
- z.object({ version: z.literal(2), receipt: z.unknown().nullable(), state: z.enum(["active", "interrupted", "revoked"]).optional() }).strict()
+ z.object({ version: z.literal(2), receipt: z.unknown().nullable(), state: z.enum(["active", "interrupted", "revoked", "busy"]).optional() }).strict()
   .refine(r => !r.state || (r.state === "revoked" ? r.receipt !== null : r.receipt === null)),
  z.object({ version: z.union([z.literal(1), z.literal(2)]), error: z.enum(["invalid_receipt", "receiver_failed"]) }).strict(),
 ]);
-export type SshResponse = { version: 1 | 2; receipt: RemoteTestReceipt | null; state?: "active" | "interrupted" | "revoked" } | { version: 1 | 2; error: "invalid_receipt" | "receiver_failed" };
+export type SshResponse = { version: 1 | 2; receipt: RemoteTestReceipt | null; state?: "active" | "interrupted" | "revoked" | "busy" } | { version: 1 | 2; error: "invalid_receipt" | "receiver_failed" };

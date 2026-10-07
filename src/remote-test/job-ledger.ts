@@ -7,7 +7,7 @@ import { privateOperatorPath } from "./baseline.ts";
 import { validateJobIdentity, validateRemoteTestReceipt, type RemoteTestJob, type RemoteTestReceipt } from "./contract.ts";
 
 type Row = { job: string; state: "active" | "interrupted" | "terminal"; attempt: number; token: string; launched: number; receipt: string | null };
-export type Admission = { kind: "admitted"; token: string; attempt: number } | { kind: "active"; attempt: number; launched: boolean } | { kind: "terminal"; receipt: RemoteTestReceipt } | { kind: "revoked"; receipt: RemoteTestReceipt };
+export type Admission = { kind: "admitted"; token: string; attempt: number } | { kind: "active"; attempt: number; launched: boolean } | { kind: "terminal"; receipt: RemoteTestReceipt } | { kind: "revoked"; receipt: RemoteTestReceipt } | { kind: "busy" };
 export class ActiveRemoteTestJob extends Error {
  constructor(readonly status: Extract<Admission, { kind: "active" }>) { super("Remote-test job is active; query status instead of executing again"); }
 }
@@ -18,7 +18,10 @@ export class RemoteTestIdentityConflict extends Error {}
 export class RevokedRemoteTestJob extends Error {
  constructor(readonly receipt: RemoteTestReceipt) { super("Remote-test completed outcome is revoked; no accepted success"); }
 }
-export type JobStatus = Exclude<Admission, { kind: "admitted" }> | { kind: "interrupted"; attempt: number };
+export class BusyRemoteTestExecutor extends Error {
+ constructor() { super("Remote-test executor is busy; this job was not admitted"); }
+}
+export type JobStatus = Exclude<Admission, { kind: "admitted" | "busy" }> | { kind: "interrupted"; attempt: number };
 export interface OwnedContainer { id: string; ledgerId: string; jobId: string; token: string }
 export interface RecoveryAdapters {
  list(): Promise<OwnedContainer[]>;
@@ -120,12 +123,18 @@ export class JobLedger {
    const row = this.row(job); // Conflict check precedes every mutation.
    if (this.recovering()) throw Error("Remote-test recovery fence is active");
    if (row?.state === "terminal") return this.terminal(job, row);
-   if (row?.state === "active") return { kind: "active", attempt: row.attempt, launched: !!row.launched };
+   if (row?.state === "active") {
+    const reason = this.fence(job);
+    return reason ? { kind: "terminal", receipt: this.refusal(job, reason) } : { kind: "active", attempt: row.attempt, launched: !!row.launched };
+   }
    const current = this.db.query("SELECT generation FROM generations WHERE scope=?").get(scope(job)) as { generation: number } | null;
    if (!current || job.generation > current.generation) this.db.query("INSERT INTO generations VALUES(?,?,0,?) ON CONFLICT(scope) DO UPDATE SET generation=excluded.generation,cancelled=0,changed_at=excluded.changed_at").run(scope(job), job.generation, this.now());
    const reason = this.fence(job);
    const token = randomUUID(), attempt = (row?.attempt ?? 0) + 1;
    const receipt = reason ? this.refusal(job, reason) : attempt > 2 ? this.refusal(job, "infra_failed") : null;
+   // A retained active lease may be a live process or an abrupt death. Neither
+   // permits consuming another job before completion or explicit recovery.
+   if (!receipt && this.db.query("SELECT id FROM jobs WHERE state='active' AND id<>? LIMIT 1").get(job.jobId)) return { kind: "busy" };
    this.db.query("INSERT INTO jobs VALUES(?,?,?,?,?,0,?) ON CONFLICT(id) DO UPDATE SET state=excluded.state,attempt=excluded.attempt,token=excluded.token,launched=0,receipt=excluded.receipt")
     .run(job.jobId, encoded(job), receipt ? "terminal" : "active", attempt, token, receipt ? JSON.stringify(receipt) : null);
    return receipt ? { kind: "terminal", receipt } : { kind: "admitted", attempt, token };

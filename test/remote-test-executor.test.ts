@@ -82,10 +82,16 @@ test("concurrent executor duplicates report active and only one launches; comple
  };
  const first = f.execute({ launcher }); await started;
  await expect(f.execute()).rejects.toThrow("active");
+ const nextJob = { ...f.job, jobId: "7c7e8091-1234-4234-8234-123456789abc", correlationId: "7c7e8091-1234-4234-8234-123456789abc" };
+ await expect(executeRemoteTest({ job: nextJob, bundlePath: f.source.bundlePath, config: f.config }, { launcher: f.launcher, uid: 1000, gid: 1000 })).rejects.toThrow("busy");
+ const ledger = await openJobLedger(f.config.jobsRoot, f.config.executorId);
+ try { expect(ledger.status(nextJob)).toBeNull(); } finally { ledger.close(); }
  release(); const receipt = await first;
  expect(f.calls.filter(c => c[1] === "create")).toHaveLength(1);
  await rm(join(f.config.jobsRoot, ".artifacts", id), { recursive: true });
  const count = f.calls.length; expect(await f.execute()).toEqual(receipt); expect(f.calls.length).toBe(count);
+ const reopened = await openJobLedger(f.config.jobsRoot, f.config.executorId);
+ try { expect(reopened.admit(nextJob).kind).toBe("admitted"); } finally { reopened.close(); }
 });
 test("validated pre-ledger receipts upgrade without execution or a global recovery fence", async () => {
  const f = await fixture(), receipt = await f.execute();
@@ -284,23 +290,23 @@ test("neutral bootstrap does not load job Bun preloads or .env before controller
 });
 test("deadline rounding never disables the independent conmon timeout", async () => {
  const f = await fixture(); const base = Date.now(); f.job.deadline = base + 600_000;
- let staged = false, ticks = 0;
+ let staged = false;
  const launcher: ExecutorLauncher = async (argv, options) => {
   const result = await f.launcher(argv, options); if (argv[1] === "image") staged = true; return result;
  };
- await f.execute({ launcher, now: () => staged ? base + 598_990 + ticks++ : base });
+ await f.execute({ launcher, now: () => staged ? base + 599_000 : base });
  const create = f.calls.find(c => c[1] === "create")!; expect(create).toBeDefined();
  expect(Number(create.find(a => a.startsWith("--timeout="))!.split("=")[1])).toBeGreaterThan(0);
 });
 test("does not overwrite an occupied lane or falsely pass failed teardown", async () => {
- const f = await fixture(); await mkdir(join(f.config.jobsRoot, ".executor-lane")); expect((await f.execute()).status).toBe("rejected"); expect(f.calls).toHaveLength(0);
+ const f = await fixture(); await mkdir(join(f.config.jobsRoot, ".executor-lane")); await expect(f.execute()).rejects.toThrow("interrupted"); expect(f.calls).toHaveLength(0);
  const g = await fixture(); g.cleanupFail(); expect((await g.execute()).status).toBe("infra_failed");
  expect(await readFile(join(g.root, "jobs", id, "checkout", "bun.lock"), "utf8")).toBe("reviewed-lock\n");
  expect(await stat(join(g.config.jobsRoot, ".executor-lane"))).toBeDefined();
  expect((await g.execute()).status).toBe("infra_failed");
  const calls = g.calls.length;
  const nextJob = { ...g.job, jobId: "7c7e8091-1234-4234-8234-123456789abc", generation: 2 };
- expect((await executeRemoteTest({ job: nextJob, bundlePath: g.source.bundlePath, config: g.config }, { launcher: g.launcher, uid: 1000, gid: 1000 })).status).toBe("rejected");
+ await expect(executeRemoteTest({ job: nextJob, bundlePath: g.source.bundlePath, config: g.config }, { launcher: g.launcher, uid: 1000, gid: 1000 })).rejects.toThrow("interrupted");
  expect(g.calls.length).toBe(calls);
 });
 test("Podman launcher drains attached stderr separately from terminal stdout", async () => {

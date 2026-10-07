@@ -8,7 +8,7 @@ import { killProcessGroup } from "../exec.ts";
 import { ResourceObservationSchema, validateProfileManifest, validateRemoteTestJob, validateRemoteTestReceipt, type RemoteTestReceipt, type ResourceObservation } from "./contract.ts";
 import { ArtifactPolicySchema, persistExecution, readExecutionReceipt, type ArtifactOptions } from "./artifacts.ts";
 import { restoreSource } from "./source.ts";
-import { ActiveRemoteTestJob, RevokedRemoteTestJob, openJobLedger, type JobLedger, type OwnedContainer } from "./job-ledger.ts";
+import { ActiveRemoteTestJob, BusyRemoteTestExecutor, InterruptedRemoteTestJob, RevokedRemoteTestJob, openJobLedger, type JobLedger, type OwnedContainer } from "./job-ledger.ts";
 
 export const EXECUTOR_LIMITS = { cpuCores: 2, memoryBytes: 1610612736, pids: 256, timeoutMs: 600_000 } as const;
 export const CONTAINER_BOOTSTRAP_FLAGS = ["--config=/dev/null", "--no-env-file"] as const;
@@ -99,6 +99,7 @@ export async function executeRemoteTest(input: ExecutionInput, options: Executio
   const admitted = legacy ? ledger.adoptLegacy(job, legacy) : ledger.admit(job);
   if (admitted.kind === "terminal") return admitted.receipt;
   if (admitted.kind === "revoked") throw new RevokedRemoteTestJob(admitted.receipt);
+  if (admitted.kind === "busy") throw new BusyRemoteTestExecutor();
   if (admitted.kind === "active") throw new ActiveRemoteTestJob(admitted);
   options.signal?.addEventListener("abort", cancel, { once: true });
   if (options.signal?.aborted) cancel();
@@ -150,7 +151,7 @@ async function executeAdmittedRemoteTest(
  if (!rootInfo.isDirectory() || rootInfo.uid !== process.getuid?.() || (rootInfo.mode & 0o022) !== 0 || /[,:\n]/.test(root)) throw new Error("Jobs root must be operator-owned and not writable by others");
  const lane = join(root, ".executor-lane");
  try { await mkdir(lane, { mode: 0o700 }); }
- catch (error) { if ((error as NodeJS.ErrnoException).code === "EEXIST") return receipt(); throw error; }
+ catch (error) { if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new InterruptedRemoteTestJob(1); throw error; }
  try {
   const owner = await open(join(lane, "owner.json"), "wx", 0o600);
   try { await owner.writeFile(JSON.stringify({ ledgerId: ledger.id, jobId: job.jobId, token })); await owner.sync(); } finally { await owner.close(); }
@@ -165,7 +166,7 @@ async function executeAdmittedRemoteTest(
  const end = Math.min(job.deadline, now() + timeoutMs);
  const timer = setTimeout(() => interrupt("timed_out"), Math.max(0, end - now()));
  const fenceTimer = setInterval(() => {
-  try { if (!ledger.allowed(job, token)) interrupt("cancelled"); }
+  try { if (!ledger.allowed(job, token)) interrupt(now() >= job.deadline ? "timed_out" : "cancelled"); }
   catch { interrupt("infra_failed"); }
  }, 100);
  const command = async (args: string[], cleanup = false): Promise<string> => {

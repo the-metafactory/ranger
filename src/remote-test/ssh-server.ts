@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { privateOperatorPath } from "./baseline.ts";
 import { validateRemoteTestJob, validateRemoteTestReceipt, type RemoteTestJob, type RemoteTestReceipt } from "./contract.ts";
 import { executeRemoteTest, validateExecutorConfig } from "./executor.ts";
-import { ActiveRemoteTestJob, InterruptedRemoteTestJob, RemoteTestIdentityConflict, RevokedRemoteTestJob, openJobLedger } from "./job-ledger.ts";
+import { ActiveRemoteTestJob, BusyRemoteTestExecutor, InterruptedRemoteTestJob, RemoteTestIdentityConflict, RevokedRemoteTestJob, openJobLedger } from "./job-ledger.ts";
 import { InvalidStoredRemoteTestReceipt, readExecutionReceipt } from "./artifacts.ts";
 import { SSH_LIMITS, SshRequestSchema, type SshResponse } from "./ssh-protocol.ts";
 
@@ -125,9 +125,10 @@ export async function serveSshResponse(input: AsyncIterable<Uint8Array>, config:
  let version: 1 | 2 = 1;
  try { return await serveSshRequest(input, config, { ...options, onProtocolVersion: value => { version = value; options.onProtocolVersion?.(value); } }); }
  catch (e) {
-  if (e instanceof ActiveRemoteTestJob || e instanceof InterruptedRemoteTestJob || e instanceof RevokedRemoteTestJob) {
+  if (e instanceof ActiveRemoteTestJob || e instanceof InterruptedRemoteTestJob || e instanceof RevokedRemoteTestJob || e instanceof BusyRemoteTestExecutor) {
    if (version === 1) return { version: 1, receipt: null };
    if (e instanceof RevokedRemoteTestJob) return { version: 2, receipt: e.receipt, state: "revoked" };
+   if (e instanceof BusyRemoteTestExecutor) return { version: 2, receipt: null, state: "busy" };
    return { version: 2, receipt: null, state: e instanceof ActiveRemoteTestJob ? "active" : "interrupted" };
   }
   return { version, error: e instanceof InvalidSshReceipt || e instanceof InvalidStoredRemoteTestReceipt ? "invalid_receipt" : "receiver_failed" };
