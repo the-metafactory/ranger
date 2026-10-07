@@ -68,6 +68,7 @@ for (const kind of ["submodule", "lfs-attributes", "lfs-pointer"] as const) {
    await git(f.repo, "add", ".");
   }
   await git(f.repo, "commit", "-m", "unsupported");
+  if (kind === "lfs-pointer") await git(f.repo, "config", "grep.patternType", "fixed");
   await code(stageSource({ worktree: f.repo, stagingRoot: f.stagingRoot, jobId }), "unsupported_source");
   const bundlePath = join(f.root, "incoming.bundle");
   await git(f.repo, "bundle", "create", bundlePath, "HEAD");
@@ -100,7 +101,8 @@ test("rejects unsafe job IDs, revisions, extra manifest authority and existing j
  const f = await fixture();
  for (const unsafe of ["../escape", "--upload-pack=bad", "/absolute", "a/b", "x\0y"]) {
   await code(stageSource({ worktree: f.repo, stagingRoot: f.stagingRoot, jobId: unsafe }), "invalid_input");
-  await code(restoreSource({ bundlePath: "unused", manifest: {}, jobsRoot: f.jobsRoot, jobId: unsafe }), "invalid_input");
+  const manifest = { version: 1, commitDigest: "a".repeat(40), treeDigest: "b".repeat(40), bundleDigest: "sha256:" + "c".repeat(64) };
+  await code(restoreSource({ bundlePath: join(f.root, "incoming.bundle"), manifest, jobsRoot: f.jobsRoot, jobId: unsafe }), "invalid_input");
  }
  await code(stageSource({ worktree: f.repo, stagingRoot: f.stagingRoot, jobId, commitDigest: "--help" }), "invalid_input");
  const staged = await stageSource({ worktree: f.repo, stagingRoot: f.stagingRoot, jobId });

@@ -66,13 +66,13 @@ async function supported(repo: string, commit: string) {
  // filter or assume that a checked-out LFS payload is part of the Git bundle.
  for (const entry of entries) {
   const tab = entry.indexOf("\t"), meta = entry.slice(0, tab), name = entry.slice(tab + 1);
-  if (name === ".gitattributes" || name?.endsWith("/.gitattributes")) {
+  if (name === ".gitattributes" || name.endsWith("/.gitattributes")) {
    const oid = meta.split(" ")[2]!;
    const attributes = await git(repo, ["cat-file", "blob", oid]);
    if (/(?:^|\s)filter\s*=\s*lfs(?:\s|$)/m.test(attributes)) throw new SourceError("unsupported_source", "LFS attributes are unsupported in V1 source");
   }
  }
- const pointers = await git(repo, ["grep", "-I", "-l", "-e", "^version https://git-lfs.github.com/spec/v1$", commit, "--"], "source_io", [0, 1]);
+ const pointers = await git(repo, ["grep", "-G", "--no-textconv", "-I", "-l", "-e", "^version https://git-lfs.github.com/spec/v1$", commit, "--"], "source_io", [0, 1]);
  if (pointers) throw new SourceError("unsupported_source", "LFS pointers are unsupported in V1 source");
 }
 async function allocate(root: string, id: string) {
