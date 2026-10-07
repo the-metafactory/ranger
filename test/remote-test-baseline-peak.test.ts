@@ -137,7 +137,7 @@ for (const readError of ["EACCES", "EIO", "ENOENT"] as const) test(`listed peak 
  } finally { await f.dispose(); }
 });
 
-test("failed namespace enumeration cannot establish absence", async () => {
+test("failed cgroup interface enumeration cannot establish absence", async () => {
  const f = await fixture({ listingError: true });
  try {
   const r = await runBaseline(f.config, { run: true, metrics: f.metrics });
@@ -190,7 +190,12 @@ for (const missing of ["memory.max", "memory.swap.max", "cpu.max", "memory.oom.g
  try {
   const r = await runBaseline(f.config, { run: true, metrics: f.metrics });
   expect(r.exitCode).toBe(1);
-  if (missing === "cgroup.procs") expect(r.report.workload).toMatchObject({ status: "ok", value: { exitCode: 1 } });
+  // POSIX shells differ in the nonzero status of a failed redirection (macOS
+  // sh returns 1, Linux dash returns 2); both must refuse the workload.
+  if (missing === "cgroup.procs") {
+   expect(r.report.workload.status).toBe("ok");
+   if (r.report.workload.status === "ok") expect(r.report.workload.value.exitCode).not.toBe(0);
+  }
   else expect(r.report.workload.status).toBe("failed");
   await expect(stat(f.marker)).rejects.toThrow();
   expect(f.counts().healthCalls).toBe(2);
@@ -223,7 +228,7 @@ for (const file of ["memory.swap.max", "cgroup.kill"]) test(`absent peak does no
  } finally { await f.dispose(); }
 });
 
-test("absent peak does not excuse an unwritable mandatory root kill interface", async () => {
+test.skipIf(process.getuid?.() === 0)("absent peak does not excuse an unwritable mandatory root kill interface", async () => {
  const f = await fixture();
  try {
   await chmod(join(f.root, "cgroup.kill"), 0o400);
