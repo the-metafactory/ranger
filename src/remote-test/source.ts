@@ -36,6 +36,8 @@ async function guarded<T>(fn: () => Promise<T>): Promise<T> {
 // Inherit no GIT_* variables, global configuration, hooks, replacement objects,
 // credentials or caller-supplied config injection. Source paths are absolute;
 // all caller revisions are full hex IDs and every invocation is argv-based.
+// Local source repository config still loads: this API stages an operator-trusted
+// worktree, with the worktree/fsmonitor/hooks safety settings explicitly pinned.
 async function git(cwd: string, args: string[], error: SourceErrorCode = "source_io", allowed = [0]) {
  // init has no repository yet and refuses --work-tree without --git-dir.
  // Every subsequent operation pins the requested root over local core.worktree.

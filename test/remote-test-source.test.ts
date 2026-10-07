@@ -133,15 +133,10 @@ test("local core.worktree configuration cannot hide a dirty requested worktree",
  await writeFile(join(f.repo, "hello.txt"), "hidden dirty content\n");
  await code(stageSource({ worktree: f.repo, stagingRoot: f.stagingRoot, jobId }), "dirty_source");
 });
-test("ignores inherited Git repository/config injection and suppresses source hooks", async () => {
+test("ignores inherited Git repository/config injection", async () => {
  const f = await fixture(), other = await fixture();
  await writeFile(join(other.repo, "hello.txt"), "different repository identity\n");
  await git(other.repo, "commit", "-am", "distinct injection target");
- const hooks = join(f.root, "hooks"), marker = join(f.root, "hook-ran");
- await mkdir(hooks);
- await writeFile(join(hooks, "post-checkout"), `#!/bin/sh\ntouch '${marker}'\n`);
- await chmod(join(hooks, "post-checkout"), 0o700);
- await git(f.repo, "config", "core.hooksPath", join(f.root, "hooks"));
  const keys = ["GIT_DIR", "GIT_WORK_TREE", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"];
  const previous = keys.map(k => process.env[k]);
  const restoreEnv = () => keys.forEach((k, i) => { if (previous[i] === undefined) delete process.env[k]; else process.env[k] = previous[i]; });
@@ -154,8 +149,18 @@ test("ignores inherited Git repository/config injection and suppresses source ho
   restoreEnv();
   expect(await git(restored.checkoutPath, "rev-parse", "HEAD")).toBe(await git(f.repo, "rev-parse", "HEAD"));
   expect(await git(restored.checkoutPath, "rev-parse", "HEAD")).not.toBe(await git(other.repo, "rev-parse", "HEAD"));
-  expect(await stat(marker).then(() => true, () => false)).toBe(false);
  } finally { restoreEnv(); }
+});
+test("disables a configured source fsmonitor hook that would otherwise execute", async () => {
+ const f = await fixture(), hook = join(f.root, "fsmonitor"), marker = join(f.root, "hook-ran");
+ await writeFile(hook, `#!/bin/sh\ntouch '${marker}'\nprintf 'token\\0'\n`);
+ await chmod(hook, 0o700); await git(f.repo, "config", "core.fsmonitor", hook);
+ await git(f.repo, "status", "--porcelain");
+ expect((await stat(marker)).isFile()).toBe(true); // prove the hook is executable.
+ await rm(marker);
+ const staged = await stageSource({ worktree: f.repo, stagingRoot: f.stagingRoot, jobId });
+ await restoreSource({ bundlePath: staged.bundlePath, manifest: staged.manifest, jobsRoot: f.jobsRoot, jobId });
+ expect(await stat(marker).then(() => true, () => false)).toBe(false);
 });
 test("restores exact bytes from bundles spanning multiple copy chunks", async () => {
  const f = await fixture(), bytes = randomBytes(256 * 1024);
