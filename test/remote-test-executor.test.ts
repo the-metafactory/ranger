@@ -377,7 +377,8 @@ test("reviewed bootstrap copies private dependencies, performs frozen offline in
  const broker = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data(socket) { socket.write("PONG\r\n"); } } });
  try {
   const reviewed = createReviewedProfile({ profileId: "fixture", imageDigest: sha("runtime"), lockDigest: sha(lock.toString()), reviewed: { recipe: "myelin-v1", cache: "disabled", install: "frozen-offline-copy", checks: ["unit", "integration", "typecheck", "lint"], sidecars: [{ kind: "nats", imageReference: `localhost/nats@${sha("nats")}` }] } });
-  const argv: [string, ...string[]][] = [reviewed.commands[0]!, [process.execPath, "--no-env-file", "test", "./fixture.test.ts"]];
+  // Host fixture Bun may live outside the container's deliberately fixed PATH.
+  const argv: [string, ...string[]][] = [[process.execPath, ...reviewed.commands[0]!.slice(1)], [process.execPath, "--no-env-file", "test", "./fixture.test.ts"]];
   await writeFile(join(checkout, ".env"), "NATS_URL=nats://control-plane.invalid:4222\n");
   const run = async (skip: boolean | "todo", fail = false, crash = false) => {
    await rm(join(checkout, "node_modules"), { recursive: true, force: true });
