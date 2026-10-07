@@ -84,7 +84,7 @@ process.exit(result.exitCode ?? 125);`;
  * to that admission layer. Source and lock bytes are verified here. */
 export async function executeRemoteTest(
  input: { job: unknown; bundlePath: string; config: unknown },
- options: { launcher?: ExecutorLauncher; signal?: AbortSignal; timeoutMs?: number; now?: () => number; uid?: number; gid?: number; artifactFault?: ArtifactOptions["fault"] } = {},
+ options: { launcher?: ExecutorLauncher; signal?: AbortSignal; timeoutMs?: number; now?: () => number; uid?: number; gid?: number; artifactFault?: ArtifactOptions["fault"]; removeLane?: (path: string) => Promise<void> } = {},
 ): Promise<RemoteTestReceipt> {
  const config = validateExecutorConfig(input.config);
  const profileId = (input.job as { profileId?: unknown } | null)?.profileId;
@@ -214,6 +214,11 @@ export async function executeRemoteTest(
  }
  if (status !== "infra_failed" && interruption) status = interruption;
  if (status === "passed" && now() > end) status = "timed_out";
- try { return await receipt(); }
- finally { if (releaseLane) await rm(lane, { recursive: true }); }
+ // Container/source teardown already finished. Releasing the lane may still
+ // fail, so its outcome must be known before a terminal receipt is published.
+ if (releaseLane) {
+  try { await (options.removeLane ?? (path => rm(path, { recursive: true })))(lane); }
+  catch { status = "infra_failed"; }
+ }
+ return receipt();
 }

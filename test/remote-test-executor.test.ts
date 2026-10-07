@@ -65,7 +65,15 @@ test("executor storage failure and invalid clock cannot expose passed", async ()
  await expect(f.execute({ artifactFault: () => { throw Error("storage failure"); } })).rejects.toThrow();
  expect(await stat(join(f.config.jobsRoot, ".artifacts", id)).catch(() => null)).toBeNull();
  const g = await fixture(); let clock = Date.now();
- await expect(g.execute({ now: () => clock-- })).rejects.toThrow();
+ await expect(g.execute({ now: () => clock-- })).rejects.toThrow("durationMs");
+ expect(await stat(join(g.config.jobsRoot, ".artifacts", id)).catch(() => null)).toBeNull();
+});
+test("failed lane removal persists infra_failed and retains the lane before exposing a terminal result", async () => {
+ const f = await fixture();
+ const r = await f.execute({ removeLane: async () => { throw Error("filesystem permission failure"); } });
+ expect(r.status).toBe("infra_failed"); expect(r.exitCode).toBe(0);
+ expect((await stat(join(f.config.jobsRoot, ".executor-lane"))).isDirectory()).toBe(true);
+ expect(JSON.parse(await readFile(join(f.config.jobsRoot, ".artifacts", id, "receipt.json"), "utf8")).status).toBe("infra_failed");
 });
 test("runs only selected operator argv at the exact bundle identity with a bounded isolated launch", async () => {
  const f = await fixture(); const result = await f.execute(); expect(result.status).toBe("passed"); expect(result.exitCode).toBe(0); expect(result.identity.commitDigest).toBe(f.source.manifest.commitDigest);
