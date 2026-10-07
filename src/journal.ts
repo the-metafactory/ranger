@@ -391,6 +391,11 @@ export class Journal {
    .orderBy(asc(resumeQueue.id)).all();
  }
 
+ getResume(repo: string, nodeId: string): ResumeQueueRow | null {
+  return this.db.select().from(resumeQueue)
+   .where(and(eq(resumeQueue.repo, repo), eq(resumeQueue.nodeId, nodeId))).get() ?? null;
+ }
+
  removeResume(entry: ResumeQueueRow, kind: "resume-cancelled" | "resume-dropped" | "resume-started", reason: string): boolean {
   return this.db.transaction(() => {
    const removed = this.db.delete(resumeQueue).where(eq(resumeQueue.id, entry.id)).returning().get();

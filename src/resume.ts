@@ -3,7 +3,7 @@ import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import { withClaimLock } from "./claim-lock.ts";
 import { executionRefusal } from "./forge-ref.ts";
 import { assertNotPrincipal, resolveBotIdentity, resolveWriteToken, WriteGateError } from "./identity.ts";
-import type { Journal, ResumeQueueRow } from "./journal.ts";
+import type { Journal, ResumeQueueRow, WorkerStatus } from "./journal.ts";
 import { implementLane, startsImplementSession } from "./lanes.ts";
 import type { OwnedCheck } from "./lock.ts";
 import { laneHeldMessage, mapKey, pickMap, recordImplementStart, resumeMap } from "./maps.ts";
@@ -25,19 +25,24 @@ async function identityGate(config: RangerConfig, map: RangerMapConfig): Promise
 }
 
 const releasedError = (nodeId: string) => new Error(`node ${nodeId}'s claim was released — the walk re-claims it from the frontier`);
+const missingRowError = (nodeId: string, repo: string) => new Error(`no journal row for node ${nodeId} on ${repo} — nothing to resume`);
+
+export const queuedResumeStale = (status: WorkerStatus) => status === "released" || status === "claimed" || status === "running";
+export const spawnHeld = (journal: Journal, config: RangerConfig, now: Date) =>
+ journal.isPaused() || journal.spawnsToday(now) >= config.workers.spawnCapPerDay;
 
 /** Caller holds the claim lock. CLI and queued resumes use this same startup path. */
 export async function startResumeNode(
  nodeId: string, map: RangerMapConfig, ctx: ResumeContext, owned: OwnedCheck,
- options: { force?: boolean; queued?: ResumeQueueRow } = {},
+ options: { force?: boolean; queued?: ResumeQueueRow; whenFree?: boolean } = {},
 ) {
  const { journal } = ctx;
  await identityGate(ctx.config, map);
  const row = journal.getWorker(nodeId, map.repo);
- if (row === null) throw new Error(`no journal row for node ${nodeId} on ${map.repo} — nothing to resume`);
+ if (row === null) throw missingRowError(nodeId, map.repo);
  journal.assertWorkerRoot(nodeId, map.repo, map.root);
  const result = { nodeId, repo: map.repo, root: map.root, was: row.status, pid: null as number | null };
- if (options.queued !== undefined && (row.status === "released" || row.status === "claimed" || row.status === "running")) {
+ if (options.queued !== undefined && queuedResumeStale(row.status)) {
   owned();
   journal.removeResume(options.queued, "resume-dropped", `worker row is ${row.status}`);
   return { ...result, dropped: true };
@@ -47,7 +52,7 @@ export async function startResumeNode(
  const takesLane = startsImplementSession(row);
  const holder = takesLane ? journal.laneHolder(lane, { nodeId, repo: map.repo }) : null;
  const now = ctx.now?.() ?? new Date();
- if (options.queued !== undefined && (journal.isPaused() || journal.spawnsToday(now) >= ctx.config.workers.spawnCapPerDay || holder !== null)) {
+ if (options.queued !== undefined && (spawnHeld(journal, ctx.config, now) || holder !== null)) {
   return { ...result, queued: true };
  }
  if (holder !== null && options.force !== true) throw new Error(laneHeldMessage(lane, holder, "resume", nodeId));
@@ -57,8 +62,10 @@ export async function startResumeNode(
   status: row.status, pid: row.pid, workerPgid: row.workerPgid, finishedAt: row.finishedAt,
  });
  let pid: number | null;
+ const spawner = ctx.spawnRunNode ?? spawnRunNodeDetached;
+ const handDriven = spawner === spawnRunNodeDetached && process.env.RANGER_NO_SPAWN === "1";
  try {
-  pid = await (ctx.spawnRunNode ?? spawnRunNodeDetached)({ nodeId, repo: map.repo, root: map.root,
+  pid = await spawner({ nodeId, repo: map.repo, root: map.root,
    cliEntry: join(import.meta.dir, "cli.ts"), configPath: ctx.configPath });
  } catch (error) {
   owned();
@@ -66,16 +73,15 @@ export async function startResumeNode(
   throw error;
  }
  owned();
- if (options.queued !== undefined && pid === null) {
+ if ((options.queued !== undefined || options.whenFree) && pid === null && !handDriven) {
   restore();
   throw new Error("run-node spawn returned no PID");
  }
  if (pid !== null) journal.updateWorker(nodeId, map.repo, { pid });
  if (takesLane) recordImplementStart(journal, map);
- // Queued starts share the walk's daily spend bound with new claims.
- if (options.queued !== undefined) journal.recordSpawn(now);
- const entry = options.queued ?? journal.listResumeQueue().find(e => e.repo === map.repo && e.nodeId === nodeId);
- if (entry !== undefined) journal.removeResume(entry, "resume-started", `resume-node started; run-node pid ${pid ?? "none"}`);
+ if (options.queued !== undefined || options.whenFree) journal.recordSpawn(now);
+ const entry = options.queued ?? journal.getResume(map.repo, nodeId);
+ if (entry !== null) journal.removeResume(entry, "resume-started", `resume-node started; run-node pid ${pid ?? "none"}`);
  journal.recordEvent("sweep", { nodeId, repo: map.repo, detail: `resume-node by ${options.queued === undefined ? "operator" : "queue"} (was ${row.status}); run-node pid ${pid ?? "none"}` });
  return { ...result, pid };
 }
@@ -99,20 +105,20 @@ export async function resumeNode(nodeId: string, selector: string | undefined, c
   }
   const map = resumeMap(config, journal.listWorkers(), nodeId, selector);
   const row = journal.getWorker(nodeId, map.repo);
-  if (row === null) throw new Error(`no journal row for node ${nodeId} on ${map.repo} — nothing to resume`);
+  if (row === null) throw missingRowError(nodeId, map.repo);
   if (row.status === "released") throw releasedError(nodeId);
   const lane = implementLane(map);
   const now = ctx.now?.() ?? new Date();
   if (options.whenFree && startsImplementSession(row) && (
    journal.laneHolder(lane, { nodeId, repo: map.repo }) !== null ||
    journal.listResumeQueue(lane).some(entry => entry.repo !== map.repo || entry.nodeId !== nodeId) ||
-   journal.isPaused() || journal.spawnsToday(now) >= config.workers.spawnCapPerDay
+   spawnHeld(journal, config, now)
   )) {
    await identityGate(config, map);
    owned();
    const entry = journal.enqueueResume({ nodeId, repo: map.repo, root: map.root, lane }, now);
    return { nodeId, repo: map.repo, root: map.root, queued: true, lane: entry.lane, queuedAt: entry.queuedAt };
   }
-  return startResumeNode(nodeId, map, ctx, owned, { force: options.force });
+  return startResumeNode(nodeId, map, ctx, owned, { force: options.force, whenFree: options.whenFree });
  });
 }

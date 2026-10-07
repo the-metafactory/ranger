@@ -1,5 +1,5 @@
 import { implementLane, startsImplementSession, type ImplementLane } from "./lanes.ts";
-import { startResumeNode } from "./resume.ts";
+import { queuedResumeStale, spawnHeld, startResumeNode } from "./resume.ts";
 import { executionRefusal } from "./forge-ref.ts";
 import { lastImplementMaps, recordImplementStart, mapKey, implementMapOrder } from "./maps.ts";
 import { join } from "node:path";
@@ -431,7 +431,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
      }
      if (waiting.has(entry.lane) || implementClaimed.has(entry.lane)) continue;
      const row = journal.getWorker(entry.nodeId, entry.repo);
-     if (row === null || row.root !== entry.root || row.status === "released" || row.status === "claimed" || row.status === "running") {
+     if (row === null || row.root !== entry.root || queuedResumeStale(row.status)) {
       drop(row === null ? "worker row is missing" : row.root !== entry.root ? "worker map root changed" : `worker row is ${row.status}`);
       continue;
      }
@@ -448,7 +448,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
       continue;
      }
      const takesLane = startsImplementSession(row);
-     if (journal.isPaused() || journal.spawnsToday(ctx.now?.() ?? new Date()) >= config.workers.spawnCapPerDay) {
+     if (spawnHeld(journal, config, ctx.now?.() ?? new Date())) {
       waiting.add(entry.lane);
       continue;
      }
@@ -484,8 +484,10 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
       const resumed = await startResumeNode(entry.nodeId, map, ctx, owned, { queued: entry });
       if ("dropped" in resumed) continue;
       if ("queued" in resumed) {
-       waiting.add(entry.lane);
-       implementClaimed.add(implementLane(map));
+       if (takesLane) {
+        waiting.add(entry.lane);
+        implementClaimed.add(implementLane(map));
+       }
        continue;
       }
       // Reserve it for this entire tick, even if run-node finishes immediately.
@@ -494,8 +496,10 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
        waiting.add(entry.lane);
       }
      } catch (error) {
-      waiting.add(entry.lane);
-      implementClaimed.add(implementLane(map));
+      if (takesLane) {
+       waiting.add(entry.lane);
+       implementClaimed.add(implementLane(map));
+      }
       const reason = `start failed: ${error instanceof Error ? error.message : String(error)}`;
       owned();
       journal.recordEvent("sweep", { nodeId: entry.nodeId, repo: entry.repo, detail: `queued resume #${entry.nodeId} deferred: ${reason}` });

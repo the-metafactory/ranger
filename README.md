@@ -59,9 +59,14 @@ PRs, maps set to `walk: none`, and entries whose map changed implement lanes
 are removed with a reason. Moving a PR head
 keeps its entry valid. `ranger resume-node <id> --cancel` removes an entry and
 returns non-zero if none exists. Use `--map owner/name#root` to disambiguate.
+Immediate and queued `--when-free` starts count toward the daily spawn cap.
+With `RANGER_NO_SPAWN=1`, the default spawner consumes the queued entry and
+leaves its row claimed with no PID for the operator to drive `run-node` by hand.
+The claimed row holds its implement lane until the hand-driven run releases it.
 An entry whose node or PR cannot be validated, or whose run-node fails to
-start (including a spawn returning no PID), stays queued and reports the
-error; later resumes and new claims in its implement lane wait for a retry.
+start (including an unexpected missing PID), stays queued and reports the
+error. If the resume takes an implement lane, later resumes and new claims in
+that lane wait for a retry.
 Credential/execution-gated maps retain entries and report the gate failure;
 later resumes and new claims in that implement lane wait for the gate to clear.
 Independent implement lanes can still start work.
