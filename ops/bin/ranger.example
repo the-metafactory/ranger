@@ -19,6 +19,9 @@
 #   RANGER_READONLY_GH_TOKEN_METAFACTORY — fine-grained read-only PAT for
 #   RANGER_READONLY_GH_TOKEN_PERSONAL    the-metafactory/* and jcfischer/*
 #                                      (node #8 read-only gate; no keyring fallback).
+#   RANGER_WRITE_GL_TOKEN_GEANT       — project access-token bot (api, Maintainer).
+#   RANGER_READONLY_GL_TOKEN_GEANT    — read_api PAT; never used for writes.
+#                                      GitLab gates create per-call GLAB_CONFIG_DIR.
 #   RANGER_DISCORD_TOKEN             — reused grove Discord bot token (node #11
 #                                      reuse decision).
 #
@@ -66,7 +69,8 @@ set -euo pipefail
 unset PASS_THROUGH
 PASS_THROUGH=" USER LOGNAME SHELL TMPDIR LANG LC_ALL LC_CTYPE TERM TZ SSH_AUTH_SOCK __CF_USER_TEXT_ENCODING
   GH_TOKEN RANGER_WRITE_GH_TOKEN_METAFACTORY RANGER_WRITE_GH_TOKEN_PERSONAL
-  RANGER_READONLY_GH_TOKEN_METAFACTORY RANGER_READONLY_GH_TOKEN_PERSONAL RANGER_DISCORD_TOKEN "
+  RANGER_READONLY_GH_TOKEN_METAFACTORY RANGER_READONLY_GH_TOKEN_PERSONAL RANGER_DISCORD_TOKEN
+  RANGER_WRITE_GL_TOKEN_GEANT RANGER_READONLY_GL_TOKEN_GEANT "
 for name in $(compgen -e); do
   case "$PASS_THROUGH" in
     *[[:space:]]"$name"[[:space:]]*) ;;
@@ -114,6 +118,10 @@ write_personal="${RANGER_WRITE_GH_TOKEN_PERSONAL:-$IVY_TOKEN}"
 readonly_metafactory="${RANGER_READONLY_GH_TOKEN_METAFACTORY:-$(resolve_keychain ranger-ro-metafactory)}"
 readonly_personal="${RANGER_READONLY_GH_TOKEN_PERSONAL:-$(resolve_keychain ranger-ro-personal)}"
 
+# Separate GÉANT read and write credentials (node #123); no glab keyring fallback.
+write_geant="${RANGER_WRITE_GL_TOKEN_GEANT:-$(resolve_keychain ranger-write-gl-geant)}"
+readonly_geant="${RANGER_READONLY_GL_TOKEN_GEANT:-$(resolve_keychain ranger-readonly-gl-geant)}"
+
 # Discord bot token — reuse the grove bot (node #11 decision).
 discord_token="${RANGER_DISCORD_TOKEN:-$("$GREP" -m1 '^DISCORD_BOT_TOKEN=' "$HOME/.config/grove/bot.env" 2>/dev/null | "$CUT" -d= -f2- || true)}"
 
@@ -123,6 +131,8 @@ export RANGER_WRITE_GH_TOKEN_METAFACTORY="$write_metafactory"
 export RANGER_WRITE_GH_TOKEN_PERSONAL="$write_personal"
 export RANGER_READONLY_GH_TOKEN_METAFACTORY="$readonly_metafactory"
 export RANGER_READONLY_GH_TOKEN_PERSONAL="$readonly_personal"
+export RANGER_WRITE_GL_TOKEN_GEANT="$write_geant"
+export RANGER_READONLY_GL_TOKEN_GEANT="$readonly_geant"
 export RANGER_DISCORD_TOKEN="$discord_token"
 
 # Entries the loop above could not drop (readonly, or names bash never

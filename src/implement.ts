@@ -1,3 +1,4 @@
+import { principalLoginForRepo } from "./config.ts";
 import { executionRefusal, fileStemFor } from "./forge-ref.ts";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
@@ -2058,7 +2059,7 @@ function closeResolution(
  * need no visual judgment; a `ranger:needs-eye` node is merged by hand).
  */
 function ratificationText(ctx: ImplementContext, pr: ChangeRequest): string {
- return pr.mergedBy !== null && pr.mergedBy === ctx.config.principal.login
+ return pr.mergedBy !== null && pr.mergedBy === principalLoginForRepo(ctx.config, ctx.map.repo)
   ? `the principal merged PR #${pr.iid} (merge = ratification, #23 ruling)`
   : `${pr.mergedBy ?? "ranger"} merged PR #${pr.iid} under the principal's standing grant (2026-10-03: ranger merges nodes that need no visual judgment)`;
 }

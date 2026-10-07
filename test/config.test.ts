@@ -16,6 +16,30 @@ function withConfig(content: string, fn: (path: string) => void) {
 }
 
 describe("loadConfig", () => {
+  test("principal scalar stays unchanged; host map and qualified write prefixes parse", () => {
+    withConfig('maps:\n  - repo: acme/widgets\n    root: 1\nprincipal:\n  login: jcfischer\n', path => {
+      expect(loadConfig(path).config.principal.login).toBe("jcfischer");
+    });
+    withConfig('maps:\n  - repo: acme/widgets\n    root: 1\nprincipal:\n  login:\n    "github:github.com": jcfischer\n    "gitlab:gitlab.example.org": boss-gl\nauth:\n  writeTokens:\n    "acme/*": GH\n    "github:github.com/acme/": GH_ACME\n    "gitlab:gitlab.example.org/team/": GL\n', path => {
+      const cfg = loadConfig(path).config;
+      expect(cfg.principal.login).toEqual({ "github:github.com": "jcfischer", "gitlab:gitlab.example.org": "boss-gl" });
+      expect(cfg.auth.writeTokens["gitlab:gitlab.example.org/team/"]).toBe("GL");
+    });
+  });
+
+  test("rejects malformed qualified write prefixes and principal host keys", () => {
+    for (const key of ["gitlab:team", "gitlab:https://gitlab.example.org/team/", "github:other.host/acme/", "gitlab:host/team/**"]) {
+      withConfig(`maps:\n  - repo: acme/widgets\n    root: 1\nauth:\n  writeTokens:\n    "${key}": WRITE\n`, path => {
+        expect(() => loadConfig(path)).toThrow(ConfigError);
+      });
+    }
+    for (const key of ["gitlab", "gitlab:host/team", "github:other.host", "gitlab:https://host", "gitlab:host:443"]) {
+      withConfig(`maps:\n  - repo: acme/widgets\n    root: 1\nprincipal:\n  login:\n    "${key}": boss\n`, path => {
+        expect(() => loadConfig(path)).toThrow(ConfigError);
+      });
+    }
+  });
+
   test("accepts host-qualified read prefixes alongside existing GitHub keys", () => {
     withConfig('maps:\n  - repo: acme/widgets\n    root: 1\nauth:\n  readOnlyTokens:\n    "*": GH\n    "github:github.com/acme/": GH_ACME\n    "gitlab:gitlab.example.org/team/": GL_TEAM\n', path => {
       expect(loadConfig(path).config.auth.readOnlyTokens["gitlab:gitlab.example.org/team/"]).toBe("GL_TEAM");

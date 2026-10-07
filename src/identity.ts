@@ -2,7 +2,12 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RangerAuthConfig, RangerConfig } from "./config.ts";
+import { principalLoginForRepo } from "./config.ts";
 import { runCmd, type RunOptions } from "./exec.ts";
+import { parseForgeRef, qualifiedRepo } from "./forge-ref.ts";
+import { glabConfigEnv } from "./glab-config-dir.ts";
+
+const GITHUB_REPO = "github:github.com/ranger/identity";
 
 /**
  * The write-credential gate (design §2 identity model, node #11).
@@ -10,8 +15,9 @@ import { runCmd, type RunOptions } from "./exec.ts";
  * Graph-mutating ranger components (the walker's claim/close/decisions) run
  * under the machine account's write PAT — never the principal's credential —
  * and refuse to run when the resolved identity equals the principal's login.
- * The write env pins `GH_TOKEN` to the machine-account token and isolates
- * `GH_CONFIG_DIR` so gh never consults — or writes to — the real keyring.
+ * GitHub pins `GH_TOKEN` and isolates `GH_CONFIG_DIR`. GitLab writes a single
+ * host's credential into a per-call `GLAB_CONFIG_DIR`, shared with the read
+ * gate's config helper. Neither CLI consults the principal's configuration.
  * Unlike the read-only gate, it does NOT set `SOMA_GRAPH_READONLY`: this path
  * is permitted to mutate the graph.
  */
@@ -44,10 +50,10 @@ export function resolveWriteToken(
   );
  }
  const token = env[tokenEnv];
- if (token === undefined || token.length === 0) {
+ if (token === undefined || token.trim().length === 0) {
   throw new WriteGateError(
    `write-token env ${tokenEnv} is unset — refusing to run without the machine account's credential (node #11). ` +
-    `Set ${tokenEnv} to the machine account's classic repo-scoped PAT.`,
+    `Set ${tokenEnv} to the machine account's write credential.`,
   );
  }
  return { token, source: tokenEnv };
@@ -58,15 +64,19 @@ export function matchWriteTokenEnv(
  auth: RangerAuthConfig,
  repo: string,
 ): string | undefined {
+ const ref = parseForgeRef(repo);
  const prefixes = Object.keys(auth.writeTokens).sort(
   (a, b) => b.length - a.length,
  );
  for (const prefix of prefixes) {
-  if (prefix === "*" || repo.startsWith(prefix.replace(/\*$/, ""))) {
+  const qualified = prefix.includes(":");
+  if (!qualified && ref.forge !== "github") continue;
+  const target = qualified ? qualifiedRepo(ref) : ref.path;
+  if (prefix === "*" || target.startsWith(prefix.replace(/\*$/, ""))) {
    return auth.writeTokens[prefix];
   }
  }
- return auth.defaultWriteTokenEnv;
+ return ref.forge === "github" ? auth.defaultWriteTokenEnv : undefined;
 }
 
 /**
@@ -81,14 +91,9 @@ export function writeEnv(
  base: NodeJS.ProcessEnv = process.env,
 ): { env: NodeJS.ProcessEnv; cleanup: () => void } {
  const dir = mkdtempSync(join(tmpdir(), "ranger-write-"));
+ const env: NodeJS.ProcessEnv = { ...base, ...extra, GH_TOKEN: token, GITHUB_TOKEN: token, GH_CONFIG_DIR: dir };
  return {
-  env: {
-   ...base,
-   ...extra,
-   GH_TOKEN: token,
-   GITHUB_TOKEN: token,
-   GH_CONFIG_DIR: dir,
-  },
+  env,
   cleanup: () => {
    try {
     rmSync(dir, { recursive: true, force: true });
@@ -99,23 +104,77 @@ export function writeEnv(
  };
 }
 
-/** Resolve the login behind a token via `gh api /user --jq .login`. */
+/** Per-call credential isolation shared by soma writes and forge API writes. */
+export function writeEnvForRepo(
+ repo: string,
+ token: string,
+ base: NodeJS.ProcessEnv = process.env,
+): { env: NodeJS.ProcessEnv; cleanup: () => void } {
+ if (token.trim().length === 0) throw new WriteGateError("empty write credential — refusing to write");
+ const ref = parseForgeRef(repo);
+ if (ref.forge === "github") return writeEnv(token, {}, base);
+ const gated = glabConfigEnv(ref.host, token, base);
+ delete gated.env.SOMA_GRAPH_READONLY;
+ return gated;
+}
+
+/** GitLab MR/API writes use the same isolated credential boundary as graph writes. */
+export async function gitlabApiWrite(
+ repo: string,
+ token: string,
+ args: string[],
+ runner: typeof runCmd = runCmd,
+ opts: RunOptions = {},
+) {
+ const ref = parseForgeRef(repo);
+ if (ref.forge !== "gitlab") throw new WriteGateError("GitLab API write requires a GitLab repo");
+ const endpoint = args[0] ?? "";
+ if (!/^\/?[a-zA-Z0-9_]/.test(endpoint) || endpoint.includes(":") || endpoint.includes("#") ||
+  args.some(arg => arg === "--hostname" || arg.startsWith("--hostname="))) {
+  throw new WriteGateError("invalid GitLab write endpoint or host override");
+ }
+ const gated = writeEnvForRepo(repo, token, opts.env);
+ try {
+  return await runner("glab", ["api", ...args, "--hostname", ref.host], {
+   ...opts, timeoutMs: opts.timeoutMs ?? 60_000, env: gated.env,
+  });
+ } finally { gated.cleanup(); }
+}
+
+/** Resolve GET /user's login (GitHub) or username (GitLab) under the pinned token. */
 export async function loginForToken(
  token: string,
  opts: RunOptions = {},
+ repo: string = GITHUB_REPO,
+ runner: typeof runCmd = runCmd,
 ): Promise<string> {
- const gated = writeEnv(token);
+ const ref = parseForgeRef(repo);
+ const gated = writeEnvForRepo(repo, token, opts.env);
  try {
-  const result = await runCmd("gh", ["api", "/user", "--jq", ".login"], {
+  const result = await runner(ref.forge === "github" ? "gh" : "glab",
+   ref.forge === "github" ? ["api", "/user", "--jq", ".login"]
+    : ["api", "/user", "--hostname", ref.host, "--method", "GET"], {
    ...opts,
+   timeoutMs: opts.timeoutMs ?? 60_000,
    env: gated.env,
   });
   if (result.code !== 0) {
    throw new WriteGateError(
-    `cannot resolve the identity behind the write token (gh api user, exit ${result.code}): ${result.stderr.trim()}`,
+    `cannot resolve the identity behind the write token (${ref.forge} api user, exit ${result.code})`,
    );
   }
-  return result.stdout.trim();
+  let login: unknown = result.stdout.trim();
+  if (ref.forge === "gitlab") {
+   try { login = JSON.parse(result.stdout).username; }
+   catch { throw new WriteGateError("cannot resolve GitLab write identity: invalid /user response"); }
+  }
+  if (typeof login !== "string" || login.trim().length === 0 || login !== login.trim()) {
+   throw new WriteGateError("cannot resolve write identity: missing login in /user response");
+  }
+  return login;
+ } catch (error) {
+  if (error instanceof WriteGateError) throw error;
+  throw new WriteGateError(`cannot resolve the identity behind the write token (${ref.forge} api user failed)`);
  } finally {
   gated.cleanup();
  }
@@ -133,8 +192,11 @@ export async function loginForToken(
 export async function resolveBotIdentity(
  config: RangerConfig,
  token: string,
+ repo: string = GITHUB_REPO,
+ runner: typeof runCmd = runCmd,
+ env: NodeJS.ProcessEnv = process.env,
 ): Promise<string> {
- const resolved = await loginForToken(token);
+ const resolved = await loginForToken(token, { env }, repo, runner);
  if (config.bot.identity !== undefined && config.bot.identity.length > 0) {
   if (resolved !== config.bot.identity) {
    throw new WriteGateError(
@@ -144,7 +206,10 @@ export async function resolveBotIdentity(
      `Fix bot.identity or the write-token mapping.`,
    );
   }
-  return config.bot.identity;
+ }
+ assertNotPrincipal(config, resolved, repo);
+ if (parseForgeRef(repo).forge === "gitlab" && !/^project_\d+_bot_[a-f0-9]+$/.test(resolved)) {
+  throw new WriteGateError("GitLab write identity is not a project access-token bot — refusing to write (node #123)");
  }
  return resolved;
 }
@@ -157,12 +222,38 @@ export async function resolveBotIdentity(
 export function assertNotPrincipal(
  config: RangerConfig,
  identity: string,
+ repo: string = GITHUB_REPO,
 ): void {
- if (identity === config.principal.login) {
+ const principal = writePrincipal(config, repo);
+ if (identity.trim().length === 0) throw new WriteGateError("empty write identity — refusing to write");
+ if (identity.toLowerCase() === principal.toLowerCase()) {
   throw new WriteGateError(
    `refusing a graph-mutating tick under the principal's identity '${identity}' — ` +
     `autonomous graph-mutation never runs under the principal's credentials (design §2, node #11). ` +
     `The tick must run under the machine account (auth.writeTokens / bot.identity).`,
   );
  }
+}
+
+function writePrincipal(config: RangerConfig, repo: string): string {
+ const principal = principalLoginForRepo(config, repo);
+ if (principal === undefined || principal.trim().length === 0 || principal !== principal.trim()) {
+  const ref = parseForgeRef(repo);
+  throw new WriteGateError(`no principal login configured for ${ref.forge}:${ref.host} — refusing to write`);
+ }
+ return principal;
+}
+
+/** Resolve and verify before a tick enters any graph or forge mutation lane. */
+export async function assertWriteIdentity(
+ config: RangerConfig,
+ repo: string,
+ env: NodeJS.ProcessEnv = process.env,
+ runner: typeof runCmd = runCmd,
+): Promise<{ token: string; botIdentity: string }> {
+ // Missing host policy refuses even before attempting an identity read.
+ writePrincipal(config, repo);
+ const credential = resolveWriteToken(config, repo, env);
+ const botIdentity = await resolveBotIdentity(config, credential.token, repo, runner, env);
+ return { token: credential.token, botIdentity };
 }

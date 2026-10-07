@@ -1,6 +1,6 @@
 import { somaRepo } from "./graph.ts";
 import { runCmd, type RunOptions } from "./exec.ts";
-import { writeEnv } from "./identity.ts";
+import { writeEnvForRepo } from "./identity.ts";
 import { parseForgeRef, normalizeNodeId, type ForgeRef } from "./forge-ref.ts";
 
 /**
@@ -8,7 +8,7 @@ import { parseForgeRef, normalizeNodeId, type ForgeRef } from "./forge-ref.ts";
  * components (claim/run-node/sweep) — never from scout, whose read-only
  * surface lives in graph.ts and mechanically refuses every verb outside
  * `frontier`/`node`/`audit`. Callers pass the machine-account write token; this
- * module pins it via `writeEnv` (no `SOMA_GRAPH_READONLY`).
+ * module pins it via `writeEnvForRepo` (GitLab writes use per-call config).
  */
 
 export class GraphWriteError extends Error {
@@ -58,6 +58,10 @@ export interface DecisionsResult {
  detail: string;
 }
 
+export interface GraphWriteRunOptions extends RunOptions {
+ runner?: typeof runCmd;
+}
+
 interface CallWriteResult {
  code: number;
  stdout: string;
@@ -65,13 +69,14 @@ interface CallWriteResult {
 }
 
 async function callWrite(
+  repo: string,
   args: string[],
   token: string,
-  opts: RunOptions = {},
+  opts: GraphWriteRunOptions = {},
 ): Promise<CallWriteResult> {
-  const gated = writeEnv(token);
+  const gated = writeEnvForRepo(repo, token, opts.env);
   try {
-    return await runCmd("soma", args, { ...opts, env: gated.env });
+    return await (opts.runner ?? runCmd)("soma", args, { ...opts, env: gated.env });
   } finally {
     gated.cleanup();
   }
@@ -87,12 +92,12 @@ export async function graphClaim(
  id: string,
  identity: string,
  token: string,
- opts: RunOptions = {},
+ opts: GraphWriteRunOptions = {},
 ): Promise<ClaimResult> {
  const ref = parseForgeRef(repo);
  id = writeNodeId(ref, id);
  const args = ["graph", "claim", id, "--identity", identity, "--repo", somaRepo(ref), "--json"];
- const result = await callWrite(args, token, opts);
+ const result = await callWrite(repo, args, token, opts);
  const payload = parsePayload(result, "claim");
  if (result.code === 0) {
   const parsed = payload as unknown as ClaimResult;
@@ -115,12 +120,12 @@ export async function graphRelease(
  id: string,
  identity: string,
  token: string,
- opts: RunOptions = {},
+ opts: GraphWriteRunOptions = {},
 ): Promise<ReleaseResult> {
  const ref = parseForgeRef(repo);
  id = writeNodeId(ref, id);
  const args = ["graph", "release", id, "--identity", identity, "--repo", somaRepo(ref), "--json"];
- const result = await callWrite(args, token, opts);
+ const result = await callWrite(repo, args, token, opts);
  if (result.code !== 0) {
   throw new GraphWriteError(
    `soma graph release ${id} (${repo}) failed (exit ${result.code}): ${(result.stderr || result.stdout).trim()}`,
@@ -154,7 +159,7 @@ export async function graphClose(
  identity: string,
  token: string,
  options: CloseOptions,
- opts: RunOptions = {},
+ opts: GraphWriteRunOptions = {},
 ): Promise<CloseResult> {
  const ref = parseForgeRef(repo);
  id = writeNodeId(ref, id);
@@ -171,7 +176,7 @@ export async function graphClose(
   args.push("--evidence", JSON.stringify(entry));
  }
  if (options.dryRun === true) args.push("--dry-run");
- const result = await callWrite(args, token, opts);
+ const result = await callWrite(repo, args, token, opts);
  const detail = (result.stdout || result.stderr).trim();
  if (result.code === 0) {
   return { repo, node: id, closed: true, detail };
@@ -184,12 +189,12 @@ export async function graphDecisions(
  repo: string,
  root: string,
  token: string,
- opts: RunOptions = {},
+ opts: GraphWriteRunOptions = {},
 ): Promise<DecisionsResult> {
  const ref = parseForgeRef(repo);
  root = writeNodeId(ref, root);
  const args = ["graph", "decisions", root, "--write", "--repo", somaRepo(ref)];
- const result = await callWrite(args, token, opts);
+ const result = await callWrite(repo, args, token, opts);
  const detail = (result.stdout || result.stderr).trim();
  if (result.code !== 0) {
   throw new GraphWriteError(

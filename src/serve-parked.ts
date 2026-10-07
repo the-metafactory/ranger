@@ -479,18 +479,21 @@ export type ActionRunner = (
  opts: { detached: boolean },
 ) => Promise<ActionResult>;
 
-/** Keys a merge must never carry: they would make gh act as the machine account. */
-export const MACHINE_GH_KEYS = ["GH_TOKEN", "GITHUB_TOKEN", "GH_CONFIG_DIR"] as const;
+/** Keys a human merge must never carry: machine credentials or forge overrides. */
+export { MACHINE_FORGE_KEYS } from "./forge-env.ts";
+import { MACHINE_FORGE_KEYS } from "./forge-env.ts";
+/** Legacy export name retained for dashboard consumers. */
+export const MACHINE_GH_KEYS = MACHINE_FORGE_KEYS;
 
 /**
  * The merge's environment: the launch allowlist, and none of the machine
- * account's gh keys, so `gh` uses the login stored under HOME. What this
+ * account's forge keys, so the CLI uses the login stored under HOME. What this
  * proves is the absence of the machine account's credential, not whose login
  * HOME holds.
  */
 export function mergeEnv(env: Record<string, string | undefined>): Record<string, string> {
  const out = childEnv(env);
- for (const key of MACHINE_GH_KEYS) delete out[key];
+ for (const key of MACHINE_FORGE_KEYS) delete out[key];
  return out;
 }
 

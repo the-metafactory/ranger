@@ -1,3 +1,4 @@
+import { principalLoginForRepo } from "./config.ts";
 import { journalKeyFor } from "./forge-ref.ts";
 import { mapKey } from "./maps.ts";
 import { EscalationDiscord, DiscordMessageGoneError } from "./discord.ts";
@@ -570,7 +571,7 @@ async function syncCard(
     node,
     map,
     ageDays,
-    config.principal.login,
+    principalLoginForRepo(config, map.repo) ?? "principal",
     config.principal.discordId,
   );
   const cardCtx: CardSyncContext = {

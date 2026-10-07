@@ -69,6 +69,11 @@ describe("resolveWriteToken", () => {
 });
 
 describe("writeEnv", () => {
+ test("preserves an explicit inherited read-only restriction on the legacy GitHub path", () => {
+  const gated = writeEnv("ghp_x", {}, { SOMA_GRAPH_READONLY: "1" });
+  try { expect(gated.env.SOMA_GRAPH_READONLY).toBe("1"); }
+  finally { gated.cleanup(); }
+ });
  test("pins GH_TOKEN + isolates GH_CONFIG_DIR, but does NOT set SOMA_GRAPH_READONLY", () => {
   const { env, cleanup } = writeEnv("ghp_x");
   try {
