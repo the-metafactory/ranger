@@ -417,7 +417,6 @@ async function probeFinalHead(
  const base = result.code === 0 ? null : await probeMergeBase(ctx, failed, result.stdout);
  if (base !== null) journal.recordEvent("reviewed", { nodeId, repo, detail: baseProbeDetail(base) });
  const baseRed = base !== null && base.red.length === failed.length ? base.red : undefined;
- if (baseRed !== undefined) await announceBaseRed(ctx, (base as BaseProbeResult).sha, baseRed);
  const record: RecordedProbe = {
   sha: live.headSha,
   passed: result.code === 0 || baseRed !== undefined,
@@ -426,6 +425,7 @@ async function probeFinalHead(
   ...(base !== null && base.cached.length > 0 ? { baseRedCache: { sha: base.sha, probes: base.cached } } : {}),
   ...(base !== null && base.unconfirmed.length > 0 ? { baseRedUnconfirmed: { sha: base.sha, probes: base.unconfirmed, exit: base.confirmationExit! } } : {}),
  };
+ if (baseRed !== undefined) await announceBaseRed(ctx, base!.sha, record);
  ctx.journal.assertGeneration(nodeId, ctx.map.repo, ctx.generation, "post the probe record");
  // Named failures lead the record, the event and the park: an output tail can hold only passing probes.
  const failing = probeFailureSummary(result.stdout, result.code);
@@ -435,7 +435,7 @@ async function probeFinalHead(
  journal.recordEvent("reviewed", {
   nodeId,
   repo,
-  detail: `probes ${record.passed ? "passed" : "FAILED"} at ${record.sha.slice(0, 8)} (${record.mode}, ${record.selected} selected, ${attempts} run(s))${baseRed === undefined ? "" : `; red on the merge base too, not gating: ${baseRed.join(", ")}`}${record.passed ? "" : ` — failing: ${failing.join(" · ")}`}`.slice(0, 400),
+  detail: `probes ${record.passed ? "passed" : "FAILED"} at ${record.sha.slice(0, 8)} (${record.mode}, ${record.selected} selected, ${attempts} run(s))${baseRedNote(record)}${record.passed ? "" : ` — failing: ${failing.join(" · ")}`}`.slice(0, 400),
  });
  if (!record.passed) {
   throw new ParkSignal(
@@ -721,13 +721,15 @@ export async function probeMergeBase(
  * run was at the merge base, not the base's tip, so the notice says so. Best
  * effort; the probe record on the PR is the durable trace.
  */
-async function announceBaseRed(ctx: ImplementContext, sha: string, red: string[]): Promise<void> {
+async function announceBaseRed(ctx: ImplementContext, sha: string, probe: RecordedProbe): Promise<void> {
+ const red = probe.baseRed!;
  const key = `base-red.${mapKey(ctx.map)}.${sha}.${[...red].sort().join(",")}`;
  if (ctx.journal.getHealth(key) !== null) return;
  const text = [
   `:ranger: **${ctx.map.base} was red** at \`${sha.slice(0, 8)}\` on ${red.join(", ")}`,
   `map: ${mapKey(ctx.map)}`,
-  `Node #${ctx.node.ref.id} failed these probes twice, and they fail at its merge base too. Branches off this commit do not gate on them. Unless a later ${ctx.map.base} commit already fixed them, ${ctx.map.base} needs a fix.`,
+  `Node #${ctx.node.ref.id} failed these probes twice.${baseRedNote(probe)}`,
+  "Later PRs reuse only twice-confirmed cached checks; an unconfirmed comparison needs a fresh base run.",
  ].join("\n");
  try {
   await (ctx.announce ?? ((t: string) => DiscordAnnouncer.fromMap(ctx.map).post(t, "base-red notice")))(text);

@@ -118,6 +118,20 @@ describe("twice-confirmed base-red cache (node #151)", () => {
   expect(gitSpy.mock.calls.some(([args]) => args[0] === "worktree")).toBe(false);
  });
 
+ test("an unconfirmed comparison is not reused by a later PR on the same base", async () => {
+  answers = [failed(), pass];
+  expect(await compare()).toMatchObject({ red: [HUD], unconfirmed: [HUD] });
+  expect(ctx.journal.getHealth(key())).toBeNull();
+  calls = [];
+  hostReads = 0;
+  ctx.node = { ...ctx.node, ref: { id: "151" } };
+  answers = [pass];
+  expect(await compare()).toMatchObject({ red: [], cached: [], passed: [HUD] });
+  expect(calls).toHaveLength(1);
+  expect(hostReads).toBe(1);
+  expect(ctx.journal.getHealth(key())).toBeNull();
+ });
+
  test("a cache hit needs no retry template; uncached failures still gate without one", async () => {
   ctx.map.commands.probeRetry = undefined;
   expect(await compare()).toMatchObject({ red: [], cached: [], unresolved: [HUD] });

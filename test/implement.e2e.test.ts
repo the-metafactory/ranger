@@ -1047,6 +1047,7 @@ describe("implement lane (node #23)", () => {
    const observation = `Base confirmation at ${sha.slice(0, 8)} ${confirmation.code === 0 ? "passed" : "exited 1 without repeating identical assertion failures"}: probe-hud.mjs`;
    const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
    expect(events.some((d) => d.includes(observation))).toBe(true);
+   expect(events.some((d) => d.startsWith("probes passed") && d.includes("inheritance uses the first base comparison or confirmed cache"))).toBe(true);
    if (name === "different checks") expect(events.some((d) => d.includes("another check"))).toBe(true);
    const record = (r.github.comments.get(1) ?? []).find((c) => c.body.includes("ranger:probes"))?.body ?? "";
    expect(record).toContain("result=pass");
@@ -1054,6 +1055,10 @@ describe("implement lane (node #23)", () => {
    expect(record).toContain(observation);
    expect(record).toContain("this PR uses the first base comparison");
    expect(r.github.prs.get(1)?.body).toContain(observation);
+   expect(r.announced).toHaveLength(1);
+   expect(r.announced[0]).toContain(observation);
+   expect(r.announced[0]).toContain("this PR uses the first base comparison");
+   expect(r.announced[0]).not.toContain("Branches off this commit do not gate on them");
    const log = workerLogs(r);
    expect(log).toContain("probe confirmation");
    expect(log).toContain(confirmation.stdout.trim());
