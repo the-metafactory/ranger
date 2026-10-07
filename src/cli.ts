@@ -55,6 +55,8 @@ import { lstat, mkdir, readFile, rm } from "node:fs/promises";
 import { runBaseline, validateBaselineConfig, createCommandMetrics, localCommandAdapter, sshCommandAdapter, privateOperatorPath, writePrivateBaselineReport } from "./remote-test/baseline.ts";
 import { executeRemoteTest, validateExecutorConfig } from "./remote-test/executor.ts";
 import { publishReceiptFile } from "./remote-test/artifacts.ts";
+import { runSshCommand, statusSshCommand, sshOutcomeExitCode, sshOutcomeMessage, type RunSshCommand } from "./remote-test/ssh-cli.ts";
+import { serveSshResponse } from "./remote-test/ssh-server.ts";
 
 /**
  * ranger — autonomous orienteer work-graph walker.
@@ -438,6 +440,51 @@ program
 
 const remoteTest = program.command("remote-test")
  .description("Operator-only remote-test tooling; local verification remains the default");
+
+remoteTest.command("run")
+ .description("Stage a clean HEAD, save its exact job, then submit once over verified SSH")
+ .requiredOption("--config <path>", "private reviewed SSH endpoint/profile JSON")
+ .requiredOption("--request <path>", "private V1 request excluding commit/tree/bundle digests")
+ .requiredOption("--worktree <path>", "clean committed source worktree")
+ .requiredOption("--staging-root <path>", "existing private source staging root outside git")
+ .requiredOption("--job-output <path>", "new private exact job JSON for receipt lookup")
+ .requiredOption("--output <path>", "new private terminal receipt JSON")
+ .action(async (options: RunSshCommand) => {
+  const abort = new AbortController(), cancel = () => abort.abort();
+  process.once("SIGINT", cancel); process.once("SIGTERM", cancel);
+  try { const result = await runSshCommand(options, { signal: abort.signal }); process.stdout.write(sshOutcomeMessage(result)); process.exitCode = sshOutcomeExitCode(result); }
+  catch { process.stderr.write("ranger remote-test run: private input, staging or publication failed. If an exact job was saved, query status before any retry.\n"); process.exitCode = 1; }
+  finally { process.removeListener("SIGINT", cancel); process.removeListener("SIGTERM", cancel); }
+ });
+
+remoteTest.command("status")
+ .description("Retrieve only the saved exact job's terminal receipt; never resubmit")
+ .requiredOption("--config <path>", "private reviewed SSH endpoint/profile JSON")
+ .requiredOption("--job <path>", "saved exact V1 job JSON")
+ .requiredOption("--output <path>", "new private terminal receipt JSON")
+ .action(async (options: { config: string; job: string; output: string }) => {
+  const abort = new AbortController(), cancel = () => abort.abort();
+  process.once("SIGINT", cancel); process.once("SIGTERM", cancel);
+  try { const result = await statusSshCommand(options, { signal: abort.signal }); process.stdout.write(sshOutcomeMessage(result)); process.exitCode = sshOutcomeExitCode(result); }
+  catch { process.stderr.write("ranger remote-test status: private input or receipt publication failed.\n"); process.exitCode = 1; }
+  finally { process.removeListener("SIGINT", cancel); process.removeListener("SIGTERM", cancel); }
+ });
+
+remoteTest.command("serve-stdio")
+ .description("Fixed operator-only SSH entry point: receive one structured request on stdin")
+ .requiredOption("--config <path>", "reviewed private executor JSON configuration")
+ .action(async (options: { config: string }) => {
+  const abort = new AbortController(), cancel = () => { abort.abort(); process.stdin.destroy(Error("SSH input interrupted")); };
+  process.once("SIGINT", cancel); process.once("SIGTERM", cancel); process.once("SIGHUP", cancel);
+  // Includes upload idle time and bounded executor cleanup. No silent daemon.
+  const timer = setTimeout(cancel, 15 * 60_000);
+  try {
+   const config = JSON.parse(await readFile(await privateOperatorPath(options.config, true), "utf8"));
+   const response = await serveSshResponse(process.stdin, config, { signal: abort.signal });
+   process.stdout.write(JSON.stringify(response) + "\n");
+  } catch { process.stderr.write("ranger remote-test serve-stdio: request, admission, execution or storage failed; inspect private operator state.\n"); process.exitCode = 1; }
+  finally { clearTimeout(timer); process.removeListener("SIGINT", cancel); process.removeListener("SIGTERM", cancel); process.removeListener("SIGHUP", cancel); }
+ });
 
 remoteTest.command("execute")
  .description("Execute one admitted immutable job using an operator-owned profile and rootless Podman")
