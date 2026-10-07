@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { runBaseline, createCommandMetrics, localCommandAdapter, sshCommandAdapter, shellQuote, writePrivateBaselineReport, privateOperatorPath, type BaselineMetrics, type BaselineConfig } from "../src/remote-test/baseline.ts";
-import { mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile, chmod } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -60,8 +60,9 @@ describe("baseline handler", () => {
  test("malformed numeric metrics and mismatched platform fail explicitly", async () => {
   const f = fixture(); f.metrics.workload = async () => ({ cpuSeconds: NaN, peakMemoryBytes: -1, durationSeconds: 0, exitCode: 0 });
   expect((await runBaseline(config, { run: true, metrics: f.metrics })).report.workload.status).toBe("failed");
-  f.metrics.platform = async () => "Darwin arm64";
-  expect((await runBaseline(config, { run: true, metrics: f.metrics })).exitCode).toBe(1);
+  const platform = fixture(); platform.metrics.platform = async () => "Darwin arm64";
+  const r = await runBaseline(config, { run: true, metrics: platform.metrics });
+  expect(r.exitCode).toBe(1); expect(r.report.platform.status).toBe("failed"); expect(platform.calls).not.toContain("workload");
  });
  test("invalid profile is rejected before any command", async () => {
   const f = fixture(); await expect(runBaseline({ ...config, profile: { ...config.profile, version: 2 } } as unknown as BaselineConfig, { metrics: f.metrics })).rejects.toThrow();
@@ -112,6 +113,9 @@ describe("private report storage", () => {
    let invoked = false;
    await expect(writePrivateBaselineReport(path, async () => { invoked = true; return report; })).rejects.toThrow();
    expect(invoked).toBe(false);
+   await chmod(path, 0o666);
+   await expect(privateOperatorPath(path, true)).rejects.toThrow("operator-owned");
+   await chmod(path, 0o600);
    await mkdir(join(dir, "repo")); await mkdir(join(dir, "repo", ".git"));
    await symlink(join(dir, "repo"), join(dir, "link"));
    await expect(privateOperatorPath(join(dir, "link", "report.json"))).rejects.toThrow("outside git");
@@ -119,6 +123,33 @@ describe("private report storage", () => {
   } finally { await rm(dir, { recursive: true, force: true }); }
  });
 });
+
+for (const failure of ["cleanup", "sidecar", "oom", "missing-peak", "timeout"] as const) {
+ test(`shell wrapper fails visibly on ${failure} (fake controller)`, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ranger-baseline-failure-"));
+  try {
+   const setup = `printf 'populated ${failure === "sidecar" ? 1 : 0}\\n' > "$cg/cgroup.events"; printf 'oom_kill ${failure === "oom" ? 1 : 0}\\n' > "$cg/memory.events"; printf 'usage_usec 1000000\\n' > "$cg/cpu.stat"; ${failure === "missing-peak" ? "true" : "printf '1000\\n' > \"$cg/memory.peak\""}; touch "$cg/cgroup.kill"`;
+   const local = localCommandAdapter();
+   const m = createCommandMetrics(async (argv, timeout) => {
+    let script = argv[2]!.replaceAll(config.cgroupRoot, dir).replace("watchdog=''", `${setup}\nwatchdog=''`);
+    // The fake filesystem cannot actually kill processes. Model the kernel's
+    // transition to empty when the job group's kill file is written.
+    script = script.replaceAll(`printf '1\\n' > "$cg/cgroup.kill"`, `printf '1\\n' > "$cg/cgroup.kill"; printf 'populated 0\\n' > "$cg/cgroup.events"`);
+    script = script.replace('rmdir "$cg"', failure === "cleanup" ? "return 1" : 'rm -f "$cg/"*; rmdir "$cg"');
+    return local(["sh", "-c", script], timeout);
+   });
+   const marker = join(dir, "ran");
+   const c = { ...config, cwd: dir, timeoutSeconds: failure === "timeout" ? 1 : 60, profile: { ...config.profile, commands: failure === "timeout" ? [["sleep", "1.2"]] : [["touch", marker]] } } as BaselineConfig;
+   if (failure === "cleanup" || failure === "missing-peak") {
+    await expect(m.workload(c)).rejects.toThrow();
+    if (failure === "missing-peak") await expect(stat(marker)).rejects.toThrow();
+   } else {
+    const result = await m.workload(c);
+    expect(result.exitCode).toBe(failure === "timeout" ? 124 : 125);
+   }
+  } finally { await rm(dir, { recursive: true, force: true }); }
+ });
+}
 
 test("real shell wrapper runs quoted argv only after caps, preserves test failure, and cleans its exclusive lane (fake cgroup files)", async () => {
  const dir = await mkdtemp(join(tmpdir(), "ranger-baseline-shell-"));

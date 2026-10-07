@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { lstat, realpath, open } from "node:fs/promises";
+import { lstat, realpath, open, stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { runCmd, type RunResult, type RunOptions } from "../exec.ts";
 import { validateProfileManifest, type ProfileManifest } from "./contract.ts";
@@ -127,17 +127,17 @@ cleanup() {
  done
  rmdir "$cg"
 }
-trap 'cleanup' EXIT
+trap 'status=$?; trap - EXIT; cleanup || status=125; exit "$status"' EXIT
 trap 'exit 124' HUP INT TERM
 test -r "$cg/memory.peak"
 test -w "$cg/cgroup.kill"
-printf '1610612736\\n' > "$cg/memory.max"
+printf '${BASELINE_LIMITS.memoryBytes}\\n' > "$cg/memory.max"
 printf '0\\n' > "$cg/memory.swap.max"
-printf '200000 100000\\n' > "$cg/cpu.max"
+printf '${BASELINE_LIMITS.cpuCores * 100000} 100000\\n' > "$cg/cpu.max"
 printf '1\\n' > "$cg/memory.oom.group"
 start=$(date +%s%N)
 # Watchdog lives on the target, so a lost SSH connection cannot grant an unbounded run.
-(sleep ${config.timeoutSeconds} & sleeper=$!; trap 'kill "$sleeper" 2>/dev/null || true; wait "$sleeper" 2>/dev/null || true; exit' TERM INT HUP; wait "$sleeper"; printf '1\\n' > "$cg/cgroup.kill") >/dev/null 2>&1 &
+(sleep ${config.timeoutSeconds} & sleeper=$!; trap '' HUP; trap 'kill "$sleeper" 2>/dev/null || true; wait "$sleeper" 2>/dev/null || true; exit' TERM INT; wait "$sleeper"; printf '1\\n' > "$cg/cgroup.kill") >/dev/null 2>&1 &
 watchdog=$!
 code=0
 sh -c ${shellQuote(job)} >/dev/null 2>&1 || code=$?
@@ -164,6 +164,10 @@ export async function privateOperatorPath(path: string, existing = false): Promi
   try { await lstat(join(parent, ".git")); throw new Error("Operator configuration and reports must be outside git repositories"); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
   const next = dirname(parent); if (next === parent) break; parent = next;
+ }
+ if (existing) {
+  const info = await stat(candidate);
+  if (!info.isFile() || info.uid !== process.getuid?.() || (info.mode & 0o022) !== 0) throw new Error("Operator configuration must be an operator-owned regular file without group/world write access");
  }
  return candidate;
 }
