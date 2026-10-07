@@ -37,7 +37,10 @@ async function guarded<T>(fn: () => Promise<T>): Promise<T> {
 // credentials or caller-supplied config injection. Source paths are absolute;
 // all caller revisions are full hex IDs and every invocation is argv-based.
 async function git(cwd: string, args: string[], error: SourceErrorCode = "source_io", allowed = [0]) {
- const r = await runCmd("git", ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "submodule.recurse=false", ...args], {
+ // init has no repository yet and refuses --work-tree without --git-dir.
+ // Every subsequent operation pins the requested root over local core.worktree.
+ const rootArgs = args[0] === "init" ? [] : [`--work-tree=${cwd}`];
+ const r = await runCmd("git", [...rootArgs, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "submodule.recurse=false", ...args], {
   cwd, env: {
    PATH: process.env.PATH, LC_ALL: "C", GIT_CONFIG_NOSYSTEM: "1",
    GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null",
@@ -93,7 +96,14 @@ async function digest(file: string, snapshot?: string) {
     const { bytesRead } = await input.read(buffer, 0, buffer.length, null);
     if (!bytesRead) break;
     const chunk = buffer.subarray(0, bytesRead); hash.update(chunk);
-    if (output) await output.writeFile(chunk);
+    if (output) {
+     let offset = 0;
+     while (offset < chunk.length) {
+      const { bytesWritten } = await output.write(chunk, offset, chunk.length - offset, null);
+      if (bytesWritten === 0) throw new SourceError("source_io", "Bundle snapshot write made no progress");
+      offset += bytesWritten;
+     }
+    }
    }
    return `sha256:${hash.digest("hex")}`;
   } finally { await output?.close(); }

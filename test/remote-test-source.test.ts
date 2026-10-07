@@ -1,7 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtemp, mkdir, readFile, writeFile, rm, symlink, readdir } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, writeFile, rm, symlink, readdir, chmod, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { join } from "node:path";
 import { runCmd } from "../src/exec.ts";
 import { stageSource, restoreSource, SourceError, type SourceErrorCode } from "../src/remote-test/source.ts";
@@ -126,18 +126,43 @@ test("rejects shallow sources", async () => {
  await git(f.root, "clone", "--depth=1", `file://${f.repo}`, shallow);
  await code(stageSource({ worktree: shallow, stagingRoot: f.stagingRoot, jobId }), "unsupported_source");
 });
+test("local core.worktree configuration cannot hide a dirty requested worktree", async () => {
+ const f = await fixture(), alternate = join(f.root, "alternate");
+ await mkdir(alternate); await writeFile(join(alternate, "hello.txt"), "unpushed\n");
+ await git(f.repo, "config", "core.worktree", alternate);
+ await writeFile(join(f.repo, "hello.txt"), "hidden dirty content\n");
+ await code(stageSource({ worktree: f.repo, stagingRoot: f.stagingRoot, jobId }), "dirty_source");
+});
 test("ignores inherited Git repository/config injection and suppresses source hooks", async () => {
  const f = await fixture(), other = await fixture();
+ await writeFile(join(other.repo, "hello.txt"), "different repository identity\n");
+ await git(other.repo, "commit", "-am", "distinct injection target");
+ const hooks = join(f.root, "hooks"), marker = join(f.root, "hook-ran");
+ await mkdir(hooks);
+ await writeFile(join(hooks, "post-checkout"), `#!/bin/sh\ntouch '${marker}'\n`);
+ await chmod(join(hooks, "post-checkout"), 0o700);
  await git(f.repo, "config", "core.hooksPath", join(f.root, "hooks"));
  const keys = ["GIT_DIR", "GIT_WORK_TREE", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"];
  const previous = keys.map(k => process.env[k]);
+ const restoreEnv = () => keys.forEach((k, i) => { if (previous[i] === undefined) delete process.env[k]; else process.env[k] = previous[i]; });
  try {
   process.env.GIT_DIR = join(other.repo, ".git"); process.env.GIT_WORK_TREE = other.repo;
   process.env.GIT_CONFIG_COUNT = "1"; process.env.GIT_CONFIG_KEY_0 = "core.bare"; process.env.GIT_CONFIG_VALUE_0 = "true";
   const staged = await stageSource({ worktree: f.repo, stagingRoot: f.stagingRoot, jobId });
   const restored = await restoreSource({ bundlePath: staged.bundlePath, manifest: staged.manifest, jobsRoot: f.jobsRoot, jobId });
   // Our test helper still inherits injected Git vars, so restore them first.
-  keys.forEach((k, i) => { if (previous[i] === undefined) delete process.env[k]; else process.env[k] = previous[i]; });
+  restoreEnv();
   expect(await git(restored.checkoutPath, "rev-parse", "HEAD")).toBe(await git(f.repo, "rev-parse", "HEAD"));
- } finally { keys.forEach((k, i) => { if (previous[i] === undefined) delete process.env[k]; else process.env[k] = previous[i]; }); }
+  expect(await git(restored.checkoutPath, "rev-parse", "HEAD")).not.toBe(await git(other.repo, "rev-parse", "HEAD"));
+  expect(await stat(marker).then(() => true, () => false)).toBe(false);
+ } finally { restoreEnv(); }
+});
+test("restores exact bytes from bundles spanning multiple copy chunks", async () => {
+ const f = await fixture(), bytes = randomBytes(256 * 1024);
+ await writeFile(join(f.repo, "large.bin"), bytes);
+ await git(f.repo, "add", "."); await git(f.repo, "commit", "-m", "large blob");
+ const staged = await stageSource({ worktree: f.repo, stagingRoot: f.stagingRoot, jobId });
+ expect((await stat(staged.bundlePath)).size).toBeGreaterThan(64 * 1024);
+ const restored = await restoreSource({ bundlePath: staged.bundlePath, manifest: staged.manifest, jobsRoot: f.jobsRoot, jobId });
+ expect(await readFile(join(restored.checkoutPath, "large.bin"))).toEqual(bytes);
 });
