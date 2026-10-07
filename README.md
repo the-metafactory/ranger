@@ -48,6 +48,18 @@ close-only runs leave the cursor unchanged. Awaiting-merge releases capacity.
 The dashboard shows both holders and the same next choices as walk.
 Unknown or ambiguous worker maps conservatively hold both resource lanes.
 
+Parked infrastructure probe failures automatically requeue on the next `walk`
+when their lane is free, oldest first across maps. They take priority over
+crash respawns, merge-desk send-backs and fresh implement claims. The running
+worker is never interrupted. `workers.probeRequeues` bounds automatic requeues
+per node/head (default 2; 0 disables them); the count survives restarts. A failed
+child spawn keeps its place without spending a retry. Pause, veto, walk mode,
+map skip/allowlists and existing review/merge gates still apply. Assertion,
+page-error and unknown failures remain parked for investigation; a timeout
+cannot erase an assertion from the preceding probe attempt. Legacy parks
+without a failure class retry only when their outcome records a signal/timeout
+and no named probe failure. Operator `resume-node` remains available afterwards.
+
 Journal upgrades run through `openJournal`, which seeds the root inputs required
 by `drizzle/0009_worker-root.sql` before applying migrations. A legacy repo with
 one registered map inherits that root. For multiple maps or a deregistered repo,
