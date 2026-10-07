@@ -365,7 +365,7 @@ async function executeAdmittedRemoteTest(
    const peak = peakValue === "unavailable" ? null : Number(peakValue);
    const oom = Number(metrics.match(/^oom_kill\s+(\d+)$/m)?.[1]);
    if (!Number.isSafeInteger(cpu) || cpu < 0 || !Number.isSafeInteger(oom) || oom !== 0 ||
-    peakValue === undefined || peak !== null && (!Number.isSafeInteger(peak) || peak < 0)) throw Error("Sidecar metrics invalid or OOM");
+    peakValue === undefined || (peak !== null && (!Number.isSafeInteger(peak) || peak < 0))) throw Error("Sidecar metrics invalid or OOM");
    if (resources.state === "observed" && peak !== null) {
     resources = ResourceObservationSchema.parse({ state: "observed", cpuTimeMicros: resources.cpuTimeMicros! + cpu, peakMemoryBytes: resources.peakMemoryBytes! + peak });
    } else resources = { state: "unavailable", cpuTimeMicros: null, peakMemoryBytes: null };

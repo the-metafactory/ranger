@@ -472,7 +472,10 @@ test("sidecar metrics shell distinguishes absent peak from failed or malformed r
  let result=await run();expect(result.code).toBe(0);expect(result.stdout).toContain("ranger_peak unavailable");
  for (const value of ["0","512"]) {await writeFile(join(root,"memory.peak"),value);result=await run();expect(result.code).toBe(0);expect(result.stdout).toContain(`ranger_peak ${value}`);}
  for (const value of ["","bad","-1","1\n2"]) {await writeFile(join(root,"memory.peak"),value);expect((await run()).code).not.toBe(0);}
- await writeFile(join(root,"memory.peak"),"512");await chmod(join(root,"memory.peak"),0o000);expect((await run()).code).not.toBe(0);await chmod(join(root,"memory.peak"),0o600);
+ if (process.getuid?.() !== 0) {
+  await writeFile(join(root,"memory.peak"),"512");await chmod(join(root,"memory.peak"),0o000);
+  try { expect((await run()).code).not.toBe(0); } finally { await chmod(join(root,"memory.peak"),0o600); }
+ }
  await rm(join(root,"memory.peak"));await mkdir(join(root,"memory.peak"));expect((await run()).code).not.toBe(0);
  await rm(join(root,"memory.peak"),{recursive:true});await rm(join(root,"memory.events"));expect((await run()).code).not.toBe(0);
  expect((await runCmd("sh",["-ec",sidecarMetricsProgram().replaceAll("/sys/fs/cgroup",root+"/absent")])).code).not.toBe(0);
