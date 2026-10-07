@@ -250,6 +250,9 @@ export interface DecisionView extends NodeView {
  autonomy: string;
  /** Why ranger does not take it. */
  reason: string;
+ /** A `propose` node is the principal's to work: "Start session" opens one, as on a grilling. */
+ launchable: boolean;
+ why?: string;
 }
 
 export interface DashboardMap {
@@ -471,7 +474,14 @@ export function assembleState(inputs: StateInputs): DashboardState {
     })),
    decisions: frontier.flatMap((n) => {
     const reason = n.kind === "grilling" ? null : escalation(n);
-    return reason === null ? [] : [{ ...view(n), autonomy: n.autonomy, reason }];
+    if (reason === null) return [];
+    const why =
+     n.autonomy !== "propose"
+      ? `${n.autonomy || "no autonomy"}: only a propose node or a grilling opens a session here`
+      : map.localCheckout !== undefined
+       ? undefined
+       : (map.checkoutRefused ?? `no localCheckout for ${map.repo} in ranger.yaml`);
+    return [{ ...view(n), autonomy: n.autonomy, reason, launchable: why === undefined, why }];
    }),
   };
  });
@@ -517,14 +527,22 @@ export function launchPlan(args: {
  root: number;
  nodeId: string;
  cwd: string;
+ /** The node's kind; a grilling (the default) is worked with the grilling skill, anything else with orienteer. */
+ kind?: string;
 }): LaunchPlan {
  if (!REPO_PATTERN.test(args.repo)) throw new Error(`bad repo: ${args.repo}`);
  if (!ID_PATTERN.test(args.nodeId)) throw new Error(`bad node id: ${args.nodeId}`);
  if (!Number.isInteger(args.root) || args.root <= 0) throw new Error(`bad root: ${args.root}`);
+ const kind = args.kind ?? "grilling";
+ if (!/^[a-z-]+$/.test(kind)) throw new Error(`bad kind: ${kind}`);
  const prompt =
-  `Grill node #${args.nodeId} with me, on map #${args.root} of ${args.repo}. ` +
-  `Read it with \`soma graph node ${args.nodeId} --repo ${args.repo}\`, ` +
-  `then work it with the grilling skill.`;
+  kind === "grilling"
+   ? `Grill node #${args.nodeId} with me, on map #${args.root} of ${args.repo}. ` +
+     `Read it with \`soma graph node ${args.nodeId} --repo ${args.repo}\`, ` +
+     `then work it with the grilling skill.`
+   : `Work node #${args.nodeId} with me, a ${kind} waiting on me on map #${args.root} of ${args.repo}. ` +
+     `Read it with \`soma graph node ${args.nodeId} --repo ${args.repo}\`, ` +
+     `then work it with the orienteer skill.`;
  const shellCommand = `cd ${shellQuote(args.cwd)} && claude ${shellQuote(prompt)}`;
  return { prompt, shellCommand, argv: itermArgv(shellCommand) };
 }
@@ -621,7 +639,7 @@ export interface HandlerContext {
   * old. Resolves `null` when it is still an open, unclaimed grilling, or the
   * reason it is not.
   */
- verifyGrilling: (map: DashboardMap, nodeId: string) => Promise<string | null>;
+ verifyGrilling: (map: DashboardMap, nodeId: string, kind: string) => Promise<string | null>;
  /** Build now (node #58); unset refuses it. */
  buildNow?: {
   /** The `build-now --force` argv for a node; null when serve has no config path to run it with. */
@@ -770,20 +788,22 @@ export function createHandler(ctx: HandlerContext): (req: Request) => Promise<Re
    const run = await ctx.buildNow.runVerb(argv, childEnv(process.env));
    return json(200, { nodeId: node.id, exitCode: run.code, tail: run.tail });
   }
-  const grilling = map.grillings.find((g) => g.id === body.id);
+  const grilling: (GrillingView | DecisionView) | undefined =
+   map.grillings.find((g) => g.id === body.id) ?? map.decisions.find((d) => d.id === body.id);
   if (grilling === undefined) {
-   return refuse(404, `#${body.id} is not an open grilling on ${map.key}'s frontier`);
+   return refuse(404, `#${body.id} is not an open grilling or decision on ${map.key}'s frontier`);
   }
   if (!grilling.launchable || map.localCheckout === undefined) {
    return refuse(409, grilling.why ?? "no checkout configured");
   }
-  const stale = await ctx.verifyGrilling(map, grilling.id);
+  const stale = await ctx.verifyGrilling(map, grilling.id, grilling.kind);
   if (stale !== null) return refuse(409, stale);
   const plan = launchPlan({
    repo: map.repo,
    root: map.root,
    nodeId: grilling.id,
    cwd: map.localCheckout,
+   kind: grilling.kind,
   });
   if (body.dryRun === true) return json(200, { dryRun: true, ...plan });
   ctx.launch(plan.argv, childEnv(process.env));
@@ -1029,7 +1049,7 @@ function renderGrill(s) {
   const body = n === 0 ? unavailable(m, "None open.")
    : el("ul", {},
     ...m.grillings.map((g) => el("li", {}, el("span", { class: "id", text: "#" + g.id }), el("span", { class: "t" }, link(g.url, g.title)), tags(tag("grilling"), grillButton(m, g)))),
-    ...decisions.map((d) => el("li", {}, el("span", { class: "id", text: "#" + d.id }), el("span", { class: "t" }, link(d.url, d.title), el("span", { class: "reason", text: d.reason })), tags(tag((d.kind || "no kind") + " · " + (d.autonomy || "no autonomy"))))));
+    ...decisions.map((d) => el("li", {}, el("span", { class: "id", text: "#" + d.id }), el("span", { class: "t" }, link(d.url, d.title), el("span", { class: "reason", text: d.reason })), tags(tag((d.kind || "no kind") + " · " + (d.autonomy || "no autonomy")), d.autonomy === "propose" ? grillButton(m, d) : null))));
   return mapGroup("grill", m, m.servedOnly ? " (shown only)" : "", mapCount(m, n), mapMeta(m), body);
  }));
 }
@@ -1438,6 +1458,7 @@ interface IssueRead {
  assignees: string[];
  labels: string[];
  kind: string | null;
+ autonomy: string | null;
 }
 
 /** One `gh api` GET under the read-only gate; null on any failure. */
@@ -1553,9 +1574,12 @@ async function readIssue(
  // `soma:work-graph-node` JSON in an HTML comment).
  const block = /<!--\s*soma:work-graph-node\s*([\s\S]*?)-->/.exec(raw.body ?? "")?.[1];
  let kind: string | null = null;
+ let autonomy: string | null = null;
  if (block !== undefined) {
   try {
-   kind = (JSON.parse(block) as { kind?: string }).kind ?? null;
+   const typed = JSON.parse(block) as { kind?: string; autonomy?: string };
+   kind = typed.kind ?? null;
+   autonomy = typed.autonomy ?? null;
   } catch {
    kind = null;
   }
@@ -1566,6 +1590,7 @@ async function readIssue(
   assignees: (raw.assignees ?? []).map((a) => a.login ?? "").filter(Boolean),
   labels: (raw.labels ?? []).map((l) => (typeof l === "string" ? l : (l.name ?? ""))).filter(Boolean),
   kind,
+  autonomy,
  };
 }
 
@@ -1691,12 +1716,15 @@ export async function verifyGrillingLive(
  config: RangerConfig,
  map: DashboardMap,
  nodeId: string,
+ kind = "grilling",
 ): Promise<string | null> {
  try {
   const issue = await readIssue(config, map.repo, nodeId);
   if (issue === null) return `could not read #${nodeId} live`;
   if (issue.state !== "open") return `#${nodeId} is ${issue.state} now`;
-  if (issue.kind !== "grilling") return `#${nodeId} is a ${issue.kind ?? "untyped node"} now`;
+  if (issue.kind !== kind) return `#${nodeId} is a ${issue.kind ?? "untyped node"} now`;
+  // A decision opens a session only while it is still the principal's to propose.
+  if (kind !== "grilling" && issue.autonomy !== "propose") return `#${nodeId} is ${issue.autonomy ?? "untyped"} now, not propose`;
   if (issue.assignees.length > 0) return `#${nodeId} is claimed by ${issue.assignees.join(", ")}`;
   return null;
  } catch (error) {
@@ -1820,7 +1848,7 @@ export function startServe(opts: {
   },
   refresh: () => reader.refresh(),
   launch: spawnLaunch,
-  verifyGrilling: (map, nodeId) => verifyGrillingLive(opts.config, map, nodeId),
+  verifyGrilling: (map, nodeId, kind) => verifyGrillingLive(opts.config, map, nodeId, kind),
   buildNow: {
    command: (map, nodeId) =>
     opts.configPath === undefined
