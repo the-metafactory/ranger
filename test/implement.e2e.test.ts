@@ -1024,6 +1024,38 @@ describe("implement lane (node #23)", () => {
   expect(r.github.prs.get(1)?.body).toContain(`Base result from cache at ${sha}`);
  }, 60_000);
 
+ test("unresolved fresh base probes gate and remain visible alongside cache provenance", async () => {
+  const r = await rig({ probe: "fake-probe red {node}", probeRetry: "fake-probe red {node} {failed}" });
+  cleanup.push(r.dir);
+  await seedProbeOnBase(r, ["probe-hud.mjs", "probe-weapon.mjs"]);
+  const sha = await r.github.sha("main");
+  r.journal.setHealth(`base-red-checks.acme/widgets.${sha}.probe-hud.mjs`, JSON.stringify(["the hud draws"]));
+  r.ctx.shellRun = async (command, opts) => {
+   if (opts.cwd?.includes("ranger-probe-base-")) return { code: -1, stdout: "", stderr: "timeout" };
+   if (command.startsWith("fake-probe")) return {
+    code: 1, stderr: "",
+    stdout: [
+     "probe selection: semantic", "selected: 2",
+     "FAIL probe-hud.mjs (0.1s) exit=1 assert",
+     "     │  FAIL  the hud draws — detail",
+     "FAIL probe-weapon.mjs (0.1s) exit=1 assert",
+     "     │  FAIL  the weapon fires — detail",
+     "FAILED: probe-hud.mjs · probe-weapon.mjs",
+    ].join("\n"),
+   };
+   return runCmd("/bin/sh", ["-c", command], opts);
+  };
+  expect((await runNode("20", r.ctx)).status).toBe("parked");
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.includes(`base result from cache at ${sha}: probe-hud.mjs`) &&
+   d.includes("probe-weapon.mjs have no base result — they gate"))).toBe(true);
+  const record = (r.github.comments.get(1) ?? []).find((c) => c.body.includes("ranger:probes"))?.body ?? "";
+  expect(record).toContain("result=fail");
+  expect(record).toContain(`base-red-cache-sha=${sha} base-red-cache=probe-hud.mjs`);
+  expect(r.github.prs.get(1)?.draft).toBe(true);
+  expect(r.journal.getHealth(`base-red-checks.acme/widgets.${sha}.probe-weapon.mjs`)).toBeNull();
+ }, 60_000);
+
  test("a probe red only on the branch still parks, and the park says the base passes it", async () => {
   const r = await rig({ probe: "fake-probe branch-red {node}", probeRetry: "fake-probe branch-red {node} {failed}" });
   cleanup.push(r.dir);

@@ -13,6 +13,7 @@ import { baseConfigLines, createCanonicalRepo, GIT_ENV } from "./support.ts";
 
 const HUD = "probe-hud.mjs";
 const WEAPON = "probe-weapon.mjs";
+const realSafeGit = gitOps.safeGit;
 const failed = (checks = ["draws"], kind = "assert", probe = HUD): RunResult => ({
  code: 1,
  stdout: [`FAIL ${probe} (0.1s) exit=1 ${kind}`, ...checks.map((c) => `     │  FAIL  ${c} — detail`), `FAILED: ${probe}`].join("\n"),
@@ -110,12 +111,54 @@ describe("twice-confirmed base-red cache (node #151)", () => {
 
  test("a cache hit needs no retry template; uncached failures still gate without one", async () => {
   ctx.map.commands.probeRetry = undefined;
-  expect(await compare()).toMatchObject({ red: [], cached: [] });
+  expect(await compare()).toMatchObject({ red: [], cached: [], unresolved: [HUD] });
   ctx.journal.setHealth(key(), JSON.stringify(["draws"]));
-  expect(await compare()).toMatchObject({ red: [HUD], cached: [HUD] });
+  expect(await compare()).toMatchObject({ red: [HUD], cached: [HUD], unresolved: [] });
   expect(calls).toEqual([]);
   expect(hostReads).toBe(0);
  });
+
+ test("failed base worktree creation leaves fresh probes unresolved", async () => {
+  gitSpy.mockImplementation((args, opts) => args[0] === "worktree" && args[1] === "add"
+   ? Promise.resolve({ code: 1, stdout: "", stderr: "cannot create worktree" })
+   : realSafeGit(args, opts));
+  expect(await compare()).toMatchObject({ red: [], unresolved: [HUD] });
+  expect(calls).toEqual([]);
+  expect(hostReads).toBe(0);
+  expect(ctx.journal.getHealth(key())).toBeNull();
+ });
+
+ test("failed base install leaves fresh probes unresolved", async () => {
+  ctx.map.commands.install = "fake-install";
+  answers = [{ code: 1, stdout: "", stderr: "install failed" }];
+  expect(await compare()).toMatchObject({ red: [], unresolved: [HUD] });
+  expect(calls.map((c) => c.command)).toEqual(["fake-install"]);
+  expect(hostReads).toBe(0);
+  expect(ctx.journal.getHealth(key())).toBeNull();
+ });
+
+ for (const [name, answer] of [
+  ["unnamed failure", { code: 1, stdout: "runner failed", stderr: "" }],
+  ["timeout", { ...failed(), code: -1 }],
+ ] as const) {
+  test(`base ${name} leaves fresh probes unresolved alongside cached results`, async () => {
+   ctx.journal.setHealth(key(), JSON.stringify(["draws"]));
+   answers = [answer];
+   const head = `${failed().stdout}\n${failed(["fires"], "assert", WEAPON).stdout}`;
+   expect(await probeMergeBase(ctx, [HUD, WEAPON], head)).toMatchObject({
+    red: [HUD], cached: [HUD], unresolved: [WEAPON], differs: [], passed: [],
+   });
+   expect(calls).toHaveLength(1);
+   expect(ctx.journal.getHealth(key(WEAPON))).toBeNull();
+  });
+ }
+
+ for (const [name, answer] of [["pass", pass], ["inherited assertion", failed()], ["different assertion", failed(["other"])]] as const) {
+  test(`fresh comparison with ${name} clears unresolved probes`, async () => {
+   answers = [answer, failed()];
+   expect(await compare()).toMatchObject({ unresolved: [] });
+  });
+ }
 
  for (const [name, head] of [
   ["uncovered check", failed(["draws", "extra"])], ["no checks", failed([])],
