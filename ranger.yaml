@@ -200,6 +200,19 @@ maps:
     discord:
       tokenEnv: RANGER_DISCORD_TOKEN
       channelId: "1505550997764833444"
+  # Work-graph rules live in WorkGraph, not the CLI (principal, 2026-10-07):
+  # moved soma#758 onto a map as two build nodes (#767, then #768).
+  - repo: the-metafactory/soma
+    root: 766
+    walk: full
+    autoMerge: false
+    localCheckout: ~/work/mf/soma
+    commands:
+      install: bun install --frozen-lockfile
+      test: bun test && bun run typecheck
+    discord:
+      tokenEnv: RANGER_DISCORD_TOKEN
+      channelId: "1505550997764833444"
 
 # Read-only token gate (node #8 ruling). Only env var NAMES live here — never
 # tokens. Prefixes match longest-first against map.repo. Scout refuses to run a
