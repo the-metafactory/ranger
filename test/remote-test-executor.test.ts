@@ -131,6 +131,19 @@ test("CLI writes a private rejected receipt and refuses an existing output befor
  await rm(output); await writeFile(job, JSON.stringify({ ...f.job, profileId: "unapproved" }));
  expect((await invoke()).code).toBe(1); expect(await readFile(output, "utf8").catch(() => null)).toBeNull();
 });
+test("CLI export failure identifies the stored durable receipt and preserves existing output", async () => {
+ const f = await fixture(); const bin = join(f.root, "bin"); await mkdir(bin);
+ const output = join(f.root, "output.json"), engine = join(bin, "podman");
+ // Simulate a destination appearing after the pre-execution absence check.
+ await writeFile(engine, `#!/usr/bin/env bun\nawait Bun.write(${JSON.stringify(output)}, "existing-output");\nif (process.argv[3] === "info") console.log(JSON.stringify({host:{os:"linux",arch:"arm64",cgroupVersion:"v2",cgroupControllers:["cpu","memory","pids"],security:{rootless:true}}})); else process.exit(1);\n`, { mode: 0o700 });
+ const config = join(f.root, "config.json"), job = join(f.root, "job.json");
+ await writeFile(config, JSON.stringify(f.config), { mode: 0o600 }); await writeFile(job, JSON.stringify(f.job));
+ const r = await runCmd(process.execPath, ["src/cli.ts", "remote-test", "execute", "--config", config, "--job", job, "--bundle", f.source.bundlePath, "--output", output], { env: { ...process.env, PATH: `${bin}:${process.env.PATH}` } });
+ expect(r.code).toBe(1); expect(r.stderr).toContain("durable receipt stored; output export failed"); expect(r.stdout).toBe("");
+ expect(await readFile(output, "utf8")).toBe("existing-output");
+ expect(JSON.parse(await readFile(join(f.config.jobsRoot, ".artifacts", id, "receipt.json"), "utf8")).identity).toEqual(f.job);
+ expect(await stat(`${output}.reservation`).catch(() => null)).toBeNull();
+});
 
 test("Bun bootstrap checks controller files before executing profiles and detects child OOM", async () => {
  const root = await mkdtemp(join(tmpdir(), "ranger-bootstrap-")); roots.push(root);
