@@ -50,6 +50,8 @@ import {
  type DigestResult,
 } from "./escalate.ts";
 import type { WalkMode } from "./config.ts";
+import { readFile } from "node:fs/promises";
+import { runBaseline, validateBaselineConfig, createCommandMetrics, localCommandAdapter, sshCommandAdapter, privateOperatorPath, writePrivateBaselineReport } from "./remote-test/baseline.ts";
 
 /**
  * ranger — autonomous orienteer work-graph walker.
@@ -425,6 +427,34 @@ program
  .name("ranger")
  .description("Autonomous orienteer work-graph walker")
  .version("0.1.0");
+
+program.command("remote-test")
+ .description("Operator-only remote-test tooling; local verification remains the default")
+ .command("baseline")
+ .description("Inspect capacity; --run explicitly grants one bounded non-graphical workload")
+ .requiredOption("--profile <path>", "reviewed operator-local baseline JSON configuration")
+ .requiredOption("--output <path>", "new private JSON report outside git repositories")
+ .option("--ssh <target>", "configured SSH alias or user@host; otherwise inspect this host")
+ .option("--run", "explicitly grant the workload after successful capacity/health preflight", false)
+ .action(async (options: { profile: string; output: string; ssh?: string; run: boolean }) => {
+  try {
+   const profilePath = await privateOperatorPath(options.profile, true);
+   const config = validateBaselineConfig(JSON.parse(await readFile(profilePath, "utf8")));
+   const adapter = options.ssh ? sshCommandAdapter(options.ssh) : localCommandAdapter();
+   // Reserve an owner-only, exclusive destination before ANY probe or workload.
+   const outcome: { exitCode: 0 | 1 } = { exitCode: 1 };
+   await writePrivateBaselineReport(options.output, async () => {
+    const result = await runBaseline(config, { run: options.run, metrics: createCommandMetrics(adapter), transport: options.ssh ? { kind: "ssh", target: options.ssh } : { kind: "local" } });
+    outcome.exitCode = result.exitCode;
+    return result.report;
+   });
+   process.stdout.write(`Baseline report saved (${options.run ? "run" : "capacity"}; ${outcome.exitCode === 0 ? "complete" : "required measurements failed"}).\n`);
+   process.exitCode = outcome.exitCode;
+  } catch (error) {
+   process.stderr.write(`ranger remote-test baseline: ${error instanceof Error ? error.message : String(error)}\n`);
+   process.exitCode = 1;
+  }
+ });
 
 program
  .command("scout")
