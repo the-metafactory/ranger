@@ -9,6 +9,7 @@ import { validateProfileManifest, validateRemoteTestJob, validateRemoteTestRecei
 import { restoreSource } from "./source.ts";
 
 export const EXECUTOR_LIMITS = { cpuCores: 2, memoryBytes: 1610612736, pids: 256, timeoutMs: 600_000 } as const;
+export const CONTAINER_BOOTSTRAP_FLAGS = ["--config=/dev/null", "--no-env-file"] as const;
 const ConfigSchema = z.object({
  executorId: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/),
  jobsRoot: z.string().refine(s => isAbsolute(s) && !/[\0,:\n]/.test(s) && !s.split("/").includes("..")),
@@ -134,8 +135,8 @@ export async function executeRemoteTest(
    `--timeout=${runtimeSeconds}`, "--stop-timeout=0", "--restart=no", "--read-only", "--read-only-tmpfs=false",
    "--tmpfs=/tmp:rw,nosuid,nodev,size=67108864,mode=1777", "--cap-drop=ALL", "--security-opt=no-new-privileges",
    "--userns=keep-id", `--user=${uid}:${gid}`, "--http-proxy=false", "--unsetenv-all", "--env=PATH=/usr/local/bin:/usr/bin:/bin", "--env=HOME=/tmp",
-   "--image-volume=ignore", "--no-healthcheck", "--systemd=false", "--log-driver=none", "--workdir=/work",
-   "--mount", `type=bind,source=${checkout},destination=/work,rw`, "--entrypoint=bun", selected.imageReference, "-e", containerProgram(selected.profile.commands),
+   "--image-volume=ignore", "--no-healthcheck", "--systemd=false", "--log-driver=none", "--workdir=/tmp",
+   "--mount", `type=bind,source=${checkout},destination=/work,rw`, "--entrypoint=bun", selected.imageReference, ...CONTAINER_BOOTSTRAP_FLAGS, "-e", containerProgram(selected.profile.commands),
   ])).trim();
   if (!/^[a-f0-9]{64}$/.test(id)) throw new Error("Invalid container identity");
   containerId = id;

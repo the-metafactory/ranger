@@ -9,7 +9,7 @@ import { stageSource } from "../src/remote-test/source.ts";
 
 // Explicit operator opt-in; never contacts/provisions a host or pulls an image.
 const image = process.env.RANGER_EXECUTOR_INTEGRATION_IMAGE;
-test.skipIf(!image)("disposable rootless container enforces policy, reports test outcomes, and tears down", async () => {
+test.skipIf(!image)("disposable rootless container completes bootstrap, reports test outcomes, and tears down", async () => {
  if (!image || !/@sha256:[a-f0-9]{64}$/.test(image)) throw new Error("A preprovisioned image at its manifest digest is required");
  const root = await realpath(await mkdtemp(join(tmpdir(), "ranger-container-fixture-")));
  const jobsRoot = join(root, "jobs"), repo = join(root, "repo"), stagingRoot = join(root, "staging");

@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { runCmd } from "../src/exec.ts";
 import { stageSource } from "../src/remote-test/source.ts";
-import { containerProgram, executeRemoteTest, type ExecutorLauncher } from "../src/remote-test/executor.ts";
+import { CONTAINER_BOOTSTRAP_FLAGS, containerProgram, executeRemoteTest, type ExecutorLauncher } from "../src/remote-test/executor.ts";
 
 const roots: string[] = [];
 afterEach(async () => { for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
@@ -50,7 +50,7 @@ async function fixture() {
 test("runs only selected operator argv at the exact bundle identity with a bounded isolated launch", async () => {
  const f = await fixture(); const result = await f.execute(); expect(result.status).toBe("passed"); expect(result.exitCode).toBe(0); expect(result.identity.commitDigest).toBe(f.source.manifest.commitDigest);
  const args = f.calls.find(c => c[1] === "create")!;
- for (const flag of ["--cpus=2", "--memory=1610612736", "--memory-swap=1610612736", "--pids-limit=256", "--network=none", "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--user=1000:1000", "--userns=keep-id", "--http-proxy=false", "--unsetenv-all", "--image-volume=ignore", "--pull=never"]) expect(args).toContain(flag);
+ for (const flag of ["--cpus=2", "--memory=1610612736", "--memory-swap=1610612736", "--pids-limit=256", "--network=none", "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--user=1000:1000", "--userns=keep-id", "--http-proxy=false", "--unsetenv-all", "--image-volume=ignore", "--pull=never", "--workdir=/tmp", ...CONTAINER_BOOTSTRAP_FLAGS]) expect(args).toContain(flag);
  expect(args.some(a => a.startsWith("--timeout="))).toBe(true);
  expect(args.filter(a => a === "--mount")).toHaveLength(1); expect(args.join(" ")).not.toMatch(/--privileged|network=host|docker\.sock|state\.sqlite|NATS|GH_TOKEN/);
  expect(args.at(-1)).toContain(JSON.stringify(f.profile.commands));
@@ -67,6 +67,7 @@ test("refuses expired jobs and unsupported controllers before creating container
 test("rejects profile and bundle identity mismatches without executing source", async () => {
  const f = await fixture(); f.job.profileDigest = sha("unreviewed"); await expect(f.execute()).rejects.toThrow(); expect(f.calls).toHaveLength(0);
  f.job.profileDigest = f.profile.profileDigest; f.job.bundleDigest = sha("wrong bundle"); expect((await f.execute()).status).toBe("rejected"); expect(f.calls.some(c => c[1] === "create")).toBe(false);
+ expect(await stat(join(f.config.jobsRoot, id)).catch(() => null)).toBeNull();
 });
 test("enforces timeout and cancellation by killing the container and removing the workspace", async () => {
  for (const cancel of [false, true]) {
@@ -112,7 +113,7 @@ test("Bun bootstrap checks controller files before executing profiles and detect
   await rm(marker, { force: true }); for (const [name, content] of Object.entries({ ...valid, ...fields })) await writeFile(join(cgroup, name), content);
   // Only controller location and cwd differ from the real container program.
   const program = containerProgram(argv).replace('"/sys/fs/cgroup/"', JSON.stringify(cgroup + "/")).replace('cwd:"/work"', `cwd:${JSON.stringify(root)}`);
-  const result = await runCmd(process.execPath, ["-e", program]); return JSON.parse(result.stdout);
+  const result = await runCmd(process.execPath, [...CONTAINER_BOOTSTRAP_FLAGS, "-e", program]); return JSON.parse(result.stdout);
  };
  expect(await run({})).toEqual({ status: "passed", exitCode: 0 }); expect(await readFile(marker, "utf8")).toBe("ran");
  const invalidControls: Record<string, string>[] = [{ "cpu.max": "max 100000" }, { "memory.max": "max" }, { "memory.swap.max": "1024" }, { "pids.max": "max" }];
@@ -121,6 +122,23 @@ test("Bun bootstrap checks controller files before executing profiles and detect
  }
  expect((await run({ "memory.events": "oom_kill 1" })).status).toBe("infra_failed");
  expect((await run({}, [...commands, ["/missing-runtime"]])).status).toBe("infra_failed");
+});
+test("neutral bootstrap does not load job Bun preloads or .env before controller checks", async () => {
+ const root = await mkdtemp(join(tmpdir(), "ranger-bun-config-")); roots.push(root);
+ const source = join(root, "source"), neutral = join(root, "neutral"); await mkdir(source); await mkdir(neutral);
+ const marker = join(root, "preloaded");
+ await writeFile(join(source, "bunfig.toml"), 'preload = ["./preload.ts"]\n');
+ await writeFile(join(source, "preload.ts"), `await Bun.write(${JSON.stringify(marker)}, "preloaded")`);
+ await writeFile(join(source, ".env"), "RANGER_WRAPPER_CANARY=job-controlled\n");
+ const probe = 'console.log(process.env.RANGER_WRAPPER_CANARY ?? "unset")';
+ const unsafe = await runCmd(process.execPath, ["-e", probe], { cwd: source });
+ expect(unsafe.stdout.trim()).toBe("job-controlled");
+ await rm(marker, { force: true });
+ const safe = await runCmd(process.execPath, [...CONTAINER_BOOTSTRAP_FLAGS, "-e", probe], { cwd: neutral });
+ expect(safe.stdout.trim()).toBe("unset"); expect(await readFile(marker, "utf8").catch(() => null)).toBeNull();
+ // The cgroup failure still precedes any profile or job preload.
+ const wrapper = await runCmd(process.execPath, [...CONTAINER_BOOTSTRAP_FLAGS, "-e", containerProgram([[process.execPath, "-e", "process.exit(0)"]]).replace('"/sys/fs/cgroup/"', JSON.stringify(join(root, "missing") + "/"))], { cwd: neutral });
+ expect(JSON.parse(wrapper.stdout).status).toBe("infra_failed"); expect(await readFile(marker, "utf8").catch(() => null)).toBeNull();
 });
 test("does not overwrite an occupied lane or falsely pass failed teardown", async () => {
  const f = await fixture(); await mkdir(join(f.config.jobsRoot, ".executor-lane")); expect((await f.execute()).status).toBe("rejected"); expect(f.calls).toHaveLength(0);
