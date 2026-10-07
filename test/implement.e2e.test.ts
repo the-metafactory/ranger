@@ -401,6 +401,48 @@ describe("remote supervisor backend integration", () => {
   const requests = remoteBackend(r, { mutate: async request => { await runCmd("git", ["config", "http.sslVerify", "false"], { cwd: request.worktree }); } });
   expect((await runNode("20", r.ctx)).status).toBe("parked"); expect(requests).toHaveLength(1); expect(r.github.prs.size).toBe(0);
  }, 60_000);
+ test("remote fix pass tests its new commit and publishes it without local installs/tests", async () => {
+  const r = await rig({ blockers: [1, 0], install: "exit 91", test: "exit 92" }); cleanup.push(r.dir);
+  const requests = remoteBackend(r);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge"); expect(requests).toHaveLength(2);
+  expect(requests[0]!.head).not.toBe(requests[1]!.head);
+  expect((await r.github.getPr("acme/widgets", 1)).headSha).toBe(requests[1]!.head);
+  expect(r.calls).toHaveLength(2);
+ }, 60_000);
+ test("remote base-merge pass tests and publishes merged source without local reinstall", async () => {
+  let r!: Rig & { calls: number[]; announced: string[] };
+  r = await rig({ install: "exit 91", test: "exit 92", onReview: async round => { if (round === 1) await moveBaseUnder(r); } }); cleanup.push(r.dir);
+  r.ctx.mergeablePoll = { pollMs: 1, attempts: 2 };
+  const requests = remoteBackend(r);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge"); expect(requests).toHaveLength(2);
+  expect(requests[0]!.head).not.toBe(requests[1]!.head);
+  expect((await r.github.getPr("acme/widgets", 1)).headSha).toBe(requests[1]!.head);
+  expect((await r.github.getPr("acme/widgets", 1)).mergeable).toBe(true);
+  expect(r.calls).toHaveLength(2);
+ }, 60_000);
+ test("tampered persisted fix-pass receipt is refused by the second pre-push gate", async () => {
+  const r = await rig({ blockers: [1, 0] }); cleanup.push(r.dir);
+  const requests = remoteBackend(r), record = r.journal.recordEvent.bind(r.journal);
+  let accepted = 0;
+  const spy = spyOn(r.journal, "recordEvent").mockImplementation((kind, event) => {
+   const result = record(kind, event);
+   const prefix = "remote supervisor tests: passed; receipt ";
+   // This hook runs after backend validation, before publishPass. The
+   // ordinary build push succeeds; only the later fix receipt is changed.
+   const detail = event?.detail;
+   if (detail?.startsWith(prefix) && ++accepted === 2) {
+    const path = detail.slice(prefix.length), receipt = JSON.parse(readFileSync(path, "utf8"));
+    writeFileSync(path, JSON.stringify({ ...receipt, status: "test_failed", exitCode: 1 }));
+   }
+   return result;
+  });
+  try {
+   const outcome = await runNode("20", r.ctx);
+   expect(outcome.status).toBe("parked"); expect(outcome.detail).toContain("receipt is no longer current");
+   expect(requests).toHaveLength(2);
+   expect((await r.github.getPr("acme/widgets", 1)).headSha).toBe(requests[0]!.head);
+  } finally { spy.mockRestore(); }
+ }, 60_000);
 });
 
 /** Land the probes (default scripts/probe-hud.mjs) on origin's main and fetch them, so the merge base has them. */
