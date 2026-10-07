@@ -57,6 +57,7 @@ import { workerEnv } from "./worker-env.ts";
 import { tryWorkerLog, workerLogFile } from "./worker-log.ts";
 import { captureViews, redactViewsReason, saveViewsRecord, viewsComment, viewsDirectory, type ViewsDependencies, type ViewsRecord } from "./views.ts";
 import { NEEDS_EYE_LABEL } from "./labels.ts";
+import { createShadowTestBackend, runShadowMeasured } from "./remote-test/shadow.ts";
 import { assertTestEvidence, assertTestSource, createSshTestBackend, localTestBackend, runTestBackend, testCorrelationId, type TestBackend, type TestRequest, type TestResult } from "./remote-test/supervisor-backend.ts";
 
 /**
@@ -163,8 +164,9 @@ const remotePasses = new WeakMap<ImplementContext, TestResult & { request: TestR
 function testBackendFor(ctx: ImplementContext): TestBackend {
  let backend = backends.get(ctx);
  if (!backend) {
-  backend = ctx.testBackend ?? (ctx.map.testBackend ? createSshTestBackend(ctx.map.testBackend) : localTestBackend);
-  if (ctx.map.testBackend && backend.kind !== "ssh") throw new GitSafetyError("SSH map cannot use a local test backend");
+  backend = ctx.testBackend ?? (ctx.map.testBackend?.kind === "shadow" ? createShadowTestBackend(ctx.map.testBackend) : ctx.map.testBackend ? createSshTestBackend(ctx.map.testBackend) : localTestBackend);
+  if (ctx.map.testBackend?.kind === "ssh" && backend.kind !== "ssh") throw new GitSafetyError("SSH map cannot use a local test backend");
+  if (ctx.map.testBackend?.kind === "shadow" && backend.kind !== "local") throw new GitSafetyError("Shadow map requires a local-authoritative backend");
   backends.set(ctx, backend);
  }
  return backend;
@@ -175,11 +177,16 @@ function testRequest(ctx: ImplementContext, sha: string): TestRequest {
 }
 async function backendTests(ctx: ImplementContext, sha: string, local: () => Promise<RunResult>): Promise<RunResult> {
  const backend = testBackendFor(ctx), request = testRequest(ctx, sha);
- const snapshot = backend.kind === "ssh" ? await trustedSnapshot(ctx.journal, ctx.canonical, { repo: ctx.map.repo, nodeId: ctx.node.ref.id }, mapKey(ctx.map)) : undefined;
+ const snapshot = ctx.map.testBackend || backend.kind === "ssh" ? await trustedSnapshot(ctx.journal, ctx.canonical, { repo: ctx.map.repo, nodeId: ctx.node.ref.id }, mapKey(ctx.map)) : undefined;
  ctx.journal.assertGeneration(ctx.node.ref.id, ctx.map.repo, ctx.generation, "run supervisor tests");
  const tested = await runTestBackend(backend, request, local);
  if (snapshot !== undefined) await assertGitUntouched(ctx.canonical, snapshot);
  ctx.journal.assertGeneration(ctx.node.ref.id, ctx.map.repo, ctx.generation, "accept supervisor tests");
+ if (ctx.map.testBackend?.kind === "shadow") {
+  logRun(ctx, "shadow comparison (local gate authoritative)", tested.result);
+  const s = tested.shadow;
+  ctx.journal.recordEvent("reviewed", { nodeId: ctx.node.ref.id, repo: ctx.map.repo, detail: `shadow supervisor tests: local ${tested.result.code}; remote ${s?.state ?? "unavailable"}; outcome ${s?.parity ?? "pending"}; coverage ${s?.coverageParity ?? "pending"}; report ${s?.reportStored ? "saved" : "unavailable"}` });
+ }
  if (backend.kind === "ssh") {
   remotePasses.delete(ctx);
   if (tested.evidence) ctx.journal.recordEvent("reviewed", { nodeId: ctx.node.ref.id, repo: ctx.map.repo, detail: `remote supervisor tests: ${tested.evidence.receipt.status}; receipt ${tested.evidence.path}` });
@@ -1537,10 +1544,10 @@ async function runShell(
  command: string,
  cwd: string,
  ctx: ImplementContext,
- opts: { label: string; timeoutMs: number; priority?: "background" | "probe" },
+ opts: { label: string; timeoutMs: number; priority?: "background" | "probe"; measureCpu?: boolean },
 ): Promise<RunResult> {
  const run: ShellRun = ctx.shellRun ?? ((cmd, o) => runCmd("/bin/sh", ["-c", cmd], o));
- const result = await run(command, {
+ const execute = (cmd: string) => run(cmd, {
   cwd,
   env: workerEnv(ctx.config, ctx.map.repo, ctx.sessionJournal),
   timeoutMs: opts.timeoutMs,
@@ -1548,6 +1555,7 @@ async function runShell(
   // Install and tests yield the CPU; the timing-sensitive probes do not.
   ...(opts.priority === "probe" ? {} : { nice: ctx.config.workers.niceness }),
  });
+ const result = ctx.map.testBackend?.kind === "shadow" && opts.measureCpu ? await runShadowMeasured(command, execute) : await execute(command);
  logRun(ctx, `${opts.label} (${command})`, result);
  return result;
 }
@@ -1756,7 +1764,7 @@ async function supervisorTests(
 ): Promise<{ tests: RunResult; retried: boolean }> {
  const { journal, map, node, worktree } = ctx;
  const head = await headSha(worktree);
- let tests = await backendTests(ctx, head, () => runShell(testCommand, worktree, ctx, { label: `${label}: supervisor tests`, timeoutMs: TEST_TIMEOUT_MS }));
+ let tests = await backendTests(ctx, head, () => runShell(testCommand, worktree, ctx, { label: `${label}: supervisor tests`, timeoutMs: TEST_TIMEOUT_MS, measureCpu: true }));
  if (remoteTests(ctx)) return { tests, retried: false };
  if (tests.code === 0) return { tests, retried: false };
  if ((await headSha(worktree)) !== head) {
@@ -1802,7 +1810,8 @@ async function retryOnBusyHost(
   detail: `${what} failed on a busy host (load ${host.load.toFixed(1)} on ${host.cores} cores) — retrying once, in a fresh checkout of ${sha.slice(0, 8)}, when it quiets`,
  });
  await awaitQuietHost(ctx, run);
- return testsInFreshCheckout(ctx, testCommand, sha, label);
+ const local = () => testsInFreshCheckout(ctx, testCommand, sha, label);
+ return ctx.map.testBackend?.kind === "shadow" ? backendTests(ctx, sha, local) : local();
 }
 
 /**
@@ -1865,7 +1874,7 @@ async function testsInFreshCheckout(ctx: ImplementContext, testCommand: string, 
    const install = await runShell(ctx.map.commands.install, dir, ctx, { label: `${label}: install in a fresh checkout`, timeoutMs: INSTALL_TIMEOUT_MS });
    if (install.code !== 0) return { ...install, stderr: `install for the retry failed\n${install.stderr}` };
   }
-  const tests = await runShell(testCommand, dir, ctx, { label: `${label}: tests in a fresh checkout`, timeoutMs: TEST_TIMEOUT_MS });
+  const tests = await runShell(testCommand, dir, ctx, { label: `${label}: tests in a fresh checkout`, timeoutMs: TEST_TIMEOUT_MS, measureCpu: true });
   // A sanity check on the run, not proof against the commit's own scripts
   // (see supervisorTests): install and the tests should leave the commit's
   // tracked content as committed — no new HEAD, no modified tracked file,

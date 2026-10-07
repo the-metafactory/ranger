@@ -63,13 +63,14 @@ const MapSchema = z.object({
  lane: z.enum(IMPLEMENT_LANES).optional(),
  /** Explicit operator opt-in; private paths are never sent to a coding worker. */
  testBackend: z.object({
-  kind: z.literal("ssh"),
+  kind: z.enum(["ssh", "shadow"]),
   configFile: z.string().min(1).refine(isAbsolute),
   stateRoot: z.string().min(1).refine(isAbsolute),
   profileId: z.string().max(128).regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/),
   lockFile: z.string().max(255).regex(/^[a-zA-Z0-9_.-]+$/).refine(p => p !== "." && p !== ".."),
   deadlineSeconds: z.number().int().min(1).max(900).default(660),
- }).strict().optional(),
+  reportRoot: z.string().min(1).refine(isAbsolute).optional(),
+ }).strict().refine(s => s.kind !== "shadow" || s.reportRoot !== undefined, { message: "Shadow requires a private reportRoot" }).optional(),
  /** Optional per-run Discord escalation surface (node #7). */
  discord: DiscordSchema.optional(),
  /**

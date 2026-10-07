@@ -19,6 +19,9 @@ export interface TestRequest {
 }
 export interface TestResult {
  result: RunResult;
+ /** Fixed supervisor/transport refusal code, never raw diagnostics. */
+ refusal?: string;
+ shadow?: { state: "matched" | "missing" | "invalid" | "unavailable"; parity: "same" | "different" | "pending"; coverageParity: "same" | "different" | "pending"; reportStored: boolean };
  /** Kept in memory for validation. The journal receives only path and status. */
  evidence?: { job: RemoteTestJob; receipt: RemoteTestReceipt; path: string; validUntil: number };
 }
@@ -30,7 +33,7 @@ export const localTestBackend: TestBackend = {
  kind: "local",
  run: async (_request, local) => ({ result: await local() }),
 };
-const failed = (reason: string): TestResult => ({ result: { code: 1, stdout: "", stderr: `Remote supervisor tests refused (${reason}); no local fallback.` } });
+const failed = (reason: string): TestResult => ({ refusal: reason, result: { code: 1, stdout: "", stderr: `Remote supervisor tests refused (${reason}); no local fallback.` } });
 
 /** HEAD, tree and index must still denote the committed source. Git's status
  * alone misses assume-unchanged / skip-worktree flags and replacement refs. */
@@ -82,7 +85,7 @@ export function testCorrelationId(repo: string, root: number, nodeId: string): s
  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-5${hex.slice(13, 16)}-8${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
 }
 
-type SshSelection = NonNullable<RangerMapConfig["testBackend"]>;
+export type SshSelection = NonNullable<RangerMapConfig["testBackend"]>;
 async function privateDirectory(path: string): Promise<void> {
  const info = await lstat(path);
  if (!info.isDirectory() || info.isSymbolicLink() || info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0) throw Error("Invalid private supervisor directory");

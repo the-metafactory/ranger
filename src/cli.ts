@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import { readPrivateJson } from "./remote-test/ssh-cli.ts";
 import { implementLane, startsImplementSession } from "./lanes.ts";
 import { executionRefusal, isGithubRepo, readRefusal } from "./forge-ref.ts";
 import { laneHeldMessage, recordImplementStart, mapKey, pickMap, resumeMap } from "./maps.ts";
@@ -54,6 +55,7 @@ import {
 } from "./escalate.ts";
 import type { WalkMode } from "./config.ts";
 import { lstat, mkdir, readFile, rm } from "node:fs/promises";
+import { summarizeShadow, writeShadowReport } from "./remote-test/shadow.ts";
 import { runBaseline, validateBaselineConfig, createCommandMetrics, localCommandAdapter, sshCommandAdapter, privateOperatorPath, writePrivateBaselineReport } from "./remote-test/baseline.ts";
 import { executeRemoteTest, reconcileRemoteTests, validateExecutorConfig } from "./remote-test/executor.ts";
 import { ActiveRemoteTestJob, BusyRemoteTestExecutor, RevokedRemoteTestJob, openJobLedger } from "./remote-test/job-ledger.ts";
@@ -650,6 +652,20 @@ remoteTest.command("cancel")
    try { ledger.cancel(validated); } finally { ledger.close(); }
    process.stdout.write("Remote-test generation cancellation recorded.\n");
   } catch { process.stderr.write("Remote-test cancellation failed; inspect private executor state.\n"); process.exitCode = 1; }
+ });
+
+remoteTest.command("shadow-summary")
+ .description("Summarize up to ten private measured pilot jobs; missing/fixture metrics remain pending")
+ .requiredOption("--input <path>", "private V1 pilot measurements JSON outside git")
+ .requiredOption("--output <path>", "new private summary JSON outside git")
+ .action(async (options: { input: string; output: string }) => {
+  try {
+   const input = await readPrivateJson(options.input);
+   const report = summarizeShadow(input);
+   await writeShadowReport(options.output, report);
+   process.stdout.write(`Shadow pilot ${report.status}; ${report.jobCount}/10 jobs. Local gate remains authoritative. Private summary saved.\n`);
+   process.exitCode = report.status === "failed" ? 1 : 0;
+  } catch { process.stderr.write("Shadow summary failed; inspect private inputs/output.\n"); process.exitCode = 1; }
  });
 
 remoteTest.command("baseline")
