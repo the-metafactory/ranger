@@ -118,6 +118,7 @@ export interface RunNodeContext {
  viewsDependencies?: ImplementContext["viewsDependencies"];
  /** For tests: the implement lane's repo-command runner (install/test/probe). */
  shellRun?: ImplementContext["shellRun"];
+ testBackend?: ImplementContext["testBackend"];
  /** Probe-tier host load, quiet-host wait and channel post (tests inject them). */
  hostLoad?: ImplementContext["hostLoad"];
  quietHost?: ImplementContext["quietHost"];
@@ -622,6 +623,7 @@ async function runImplementNode(
   // repo commands share it, and it is never the live one.
   sessionJournal: sessionJournalPath(),
   shellRun: ctx.shellRun,
+  testBackend: ctx.testBackend,
   github: ctx.github,
   reviewer: ctx.reviewer,
   viewsDependencies: ctx.viewsDependencies,

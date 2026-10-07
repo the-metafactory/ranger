@@ -7,7 +7,7 @@ import { publishReceiptFile } from "./artifacts.ts";
 import { stageSource } from "./source.ts";
 import { selectSshJob, submitSshRemoteTest, statusSshRemoteTest, validateSshConfig, type SshOptions, type SshOutcome } from "./ssh-client.ts";
 
-async function readPrivateJson(path: string) {
+export async function readPrivateJson(path: string) {
  const file = await open(await privateOperatorPath(path, true), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
  try {
   const info = await file.stat(); if (!info.isFile() || info.size > 65_536) throw Error("Invalid private JSON input");
@@ -35,7 +35,7 @@ async function saveJob(path: string, job: unknown) {
  } catch (e) { if (published) await rm(path); throw e; }
  finally { await rm(temporary, { force: true }); }
 }
-export interface RunSshCommand { config: string; request: string; worktree: string; stagingRoot: string; jobOutput: string; output: string }
+export interface RunSshCommand { config: string; request: string; worktree: string; stagingRoot: string; jobOutput: string; output: string; expectedCommit?: string }
 
 /** Partial V1 request contains every non-source identity field. Source bindings
  * are derived from one clean committed HEAD, not caller-claimed digests. Exact
@@ -54,7 +54,7 @@ export async function runSshCommand(options: RunSshCommand, injected: SshOptions
  let source: Awaited<ReturnType<typeof stageSource>> | undefined;
  try {
   jobOutput = await reserve(options.jobOutput);
-  source = await stageSource({ worktree: resolve(options.worktree), stagingRoot: dirname(stagingRoot), jobId: request.jobId });
+  source = await stageSource({ worktree: resolve(options.worktree), stagingRoot: dirname(stagingRoot), jobId: request.jobId, ...(options.expectedCommit ? { commitDigest: options.expectedCommit } : {}) });
   const job = selectSshJob(config, { ...request, ...source.manifest });
   await saveJob(jobOutput.destination, job);
   return await submitSshRemoteTest({ config, job, bundlePath: source.bundlePath }, { ...injected, receiptStore: r => publishReceiptFile(receiptOutput.destination, r) });

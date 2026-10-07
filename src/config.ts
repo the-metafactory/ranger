@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { IMPLEMENT_LANES } from "./lanes.ts";
 import { defaultJournalPath, journalPathOverride } from "./journal-guard.ts";
-import { resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 import { parse } from "yaml";
 import { z } from "zod";
 import { parseForgeRef, repoIdentity } from "./forge-ref.ts";
@@ -61,6 +61,15 @@ const MapSchema = z.object({
  walk: WalkModeSchema,
  /** Machine-resource lane; defaults to visual with commands.probe, headless otherwise. */
  lane: z.enum(IMPLEMENT_LANES).optional(),
+ /** Explicit operator opt-in; private paths are never sent to a coding worker. */
+ testBackend: z.object({
+  kind: z.literal("ssh"),
+  configFile: z.string().min(1).refine(isAbsolute),
+  stateRoot: z.string().min(1).refine(isAbsolute),
+  profileId: z.string().max(128).regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/),
+  lockFile: z.string().max(255).regex(/^[a-zA-Z0-9_.-]+$/).refine(p => p !== "." && p !== ".."),
+  deadlineSeconds: z.number().int().min(1).max(900).default(660),
+ }).strict().optional(),
  /** Optional per-run Discord escalation surface (node #7). */
  discord: DiscordSchema.optional(),
  /**
