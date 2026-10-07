@@ -36,6 +36,33 @@ maps:
     discord:
       tokenEnv: RANGER_DISCORD_TOKEN
       channelId: "1505550997764833444"
+  # GitLab walking (principal, 2026-10-06): the map that teaches ranger to
+  # walk claw/crisis-simulator on GÉANT. Same commands and surface as root 1.
+  - repo: the-metafactory/ranger
+    root: 91
+    walk: full
+    autoMerge: true
+    commands:
+      install: bun install --frozen-lockfile
+      test: bun test && bunx tsc --noEmit
+    localCheckout: ~/work/mf/ranger
+    discord:
+      tokenEnv: RANGER_DISCORD_TOKEN
+      channelId: "1505550997764833444"
+  # Clawbox remote tests (principal, 2026-10-07): code builds use the
+  # headless lane; provisioning and promotion stay explicit map checkpoints.
+  - repo: the-metafactory/ranger
+    root: 133
+    walk: full
+    lane: headless
+    autoMerge: true
+    commands:
+      install: bun install --frozen-lockfile
+      test: bun test && bunx tsc --noEmit
+    localCheckout: ~/work/mf/ranger
+    discord:
+      tokenEnv: RANGER_DISCORD_TOKEN
+      channelId: "1505550997764833444"
   - repo: jcfischer/seekolous
     root: 26
     walk: none
@@ -153,6 +180,32 @@ maps:
     root: 533
     walk: full
     autoMerge: false
+    localCheckout: ~/work/mf/soma
+    commands:
+      install: bun install --frozen-lockfile
+      test: bun test && bun run typecheck
+    discord:
+      tokenEnv: RANGER_DISCORD_TOKEN
+      channelId: "1505550997764833444"
+  # Build-brief rules by construction (principal, 2026-10-06): moved soma#742
+  # onto a map; the build node waits on the kind-interpretation grilling.
+  - repo: the-metafactory/soma
+    root: 751
+    walk: full
+    autoMerge: false
+    localCheckout: ~/work/mf/soma
+    commands:
+      install: bun install --frozen-lockfile
+      test: bun test && bun run typecheck
+    discord:
+      tokenEnv: RANGER_DISCORD_TOKEN
+      channelId: "1505550997764833444"
+  # Work-graph rules live in WorkGraph, not the CLI (principal, 2026-10-07):
+  # moved soma#758 onto a map as two build nodes (#767, then #768).
+  - repo: the-metafactory/soma
+    root: 766
+    walk: full
+    autoMerge: true
     localCheckout: ~/work/mf/soma
     commands:
       install: bun install --frozen-lockfile

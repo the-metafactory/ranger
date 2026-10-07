@@ -53,7 +53,7 @@ import {
  serveConfig,
  type WalkMode,
 } from "./config.ts";
-import { planTick, walkableCandidates } from "./candidates.ts";
+import { implementCandidates, planTick, walkableCandidates } from "./candidates.ts";
 import { pidAlive as defaultPidAlive } from "./exec.ts";
 import { Journal, type WorkerRow } from "./journal.ts";
 import { ForeignMigrationError } from "./journal-guard.ts";
@@ -73,6 +73,7 @@ import {
  workflowRunsFromPages,
  ciState,
  needsYouEntries,
+ awaitingMergeEntries,
  type NeedsYouEntry,
  type PrView,
  runAction,
@@ -192,6 +193,8 @@ export interface StateInputs {
  needsYou?: NeedsYouEntry[];
  /** Awaiting-merge rows whose labels are not known yet, with the read's error. */
  needsYouUnchecked?: UncheckedRow[];
+ /** Every awaiting-merge row, needs-eye or not: the Current job's "Merge now". */
+ awaitingMerge?: NeedsYouEntry[];
 }
 
 /** An awaiting-merge row that may need the principal's eye; its labels are unknown. */
@@ -203,6 +206,8 @@ export interface UncheckedRow {
 
 export interface CurrentJob {
  repo: string;
+ /** The map the worker's node sits on. */
+ root: number;
  nodeId: string;
  title: string | null;
  status: WorkerRow["status"];
@@ -240,6 +245,13 @@ export interface GrillingView extends NodeView {
  why?: string;
 }
 
+/** A frontier node escalated to the principal that is not a grilling: an approve task, a decision, a prototype. */
+export interface DecisionView extends NodeView {
+ autonomy: string;
+ /** Why ranger does not take it. */
+ reason: string;
+}
+
 export interface DashboardMap {
  key: string;
  repo: string;
@@ -253,8 +265,15 @@ export interface DashboardMap {
  source: "ranger" | "serve";
  localCheckout?: string;
  next: NextJob;
+ /**
+  * The implement nodes behind `next`, in the order the walk takes them
+  * (frontier order, one at a time per lane), vetoed ones left out. Other
+  * maps on the same lane take turns with these.
+  */
+ queued: NodeView[];
  autonomous: NodeView[];
  grillings: GrillingView[];
+ decisions: DecisionView[];
 }
 
 export interface DashboardState {
@@ -272,6 +291,7 @@ export interface DashboardState {
  substrates: SubstrateUsageView[];
  needsYou: NeedsYouEntry[];
  needsYouUnchecked: UncheckedRow[];
+ awaitingMerge: NeedsYouEntry[];
 }
 
 const IN_FLIGHT = new Set<WorkerRow["status"]>(["claimed", "running", "awaiting-merge"]);
@@ -280,6 +300,15 @@ const laneOf = (n: ClassifiedNode): "implement" | "research" | undefined =>
  n.route.route === "implement" || n.route.route === "research"
   ? n.route.route
   : undefined;
+
+/** Why a node waits on the principal, in a few words; null when ranger can take it. */
+function escalation(n: ClassifiedNode): string | null {
+ if (n.route.route === "provisioning") return "its probes are not provisioned on this host";
+ if (n.route.route !== "escalate-hitl") return null;
+ if (n.route.reason === "untyped") return "its typed block is missing or broken";
+ if (n.route.reason === "hitl-kind-as-auto") return `a ${n.kind} declared auto (map hygiene)`;
+ return n.autonomy === "approve" ? "approve: yours to approve before work starts" : `propose: a ${n.kind} is yours to decide`;
+}
 
 const view = (n: ClassifiedNode): NodeView => ({
  id: n.id,
@@ -377,6 +406,7 @@ export function assembleState(inputs: StateInputs): DashboardState {
   .filter((w) => IN_FLIGHT.has(w.status))
   .map((w) => ({
    repo: w.repo,
+   root: w.root,
    nodeId: w.nodeId,
    title: titleOf(w.repo, w.nodeId),
    status: w.status,
@@ -423,6 +453,11 @@ export function assembleState(inputs: StateInputs): DashboardState {
    source: report?.source ?? (map.servedOnly ? "serve" : "ranger"),
    localCheckout: map.localCheckout,
    next: planned.get(map.key)!,
+   queued: walked
+    ? implementCandidates(frontier)
+       .filter((n) => n.id !== planned.get(map.key)!.nodeId && !inputs.vetoed(n.id))
+       .map(view)
+    : [],
    autonomous: walked ? walkableCandidates(frontier).map(view) : [],
    grillings: frontier
     .filter((n) => n.kind === "grilling")
@@ -434,6 +469,10 @@ export function assembleState(inputs: StateInputs): DashboardState {
        ? undefined
        : (map.checkoutRefused ?? `no localCheckout for ${map.repo} in ranger.yaml`),
     })),
+   decisions: frontier.flatMap((n) => {
+    const reason = n.kind === "grilling" ? null : escalation(n);
+    return reason === null ? [] : [{ ...view(n), autonomy: n.autonomy, reason }];
+   }),
   };
  });
 
@@ -456,6 +495,7 @@ export function assembleState(inputs: StateInputs): DashboardState {
   substrates: inputs.substrates ?? [],
   needsYou: inputs.needsYou ?? [],
   needsYouUnchecked: inputs.needsYouUnchecked ?? [],
+  awaitingMerge: inputs.awaitingMerge ?? [],
  };
 }
 
@@ -638,6 +678,15 @@ function tokenMatches(given: string | null, token: string): boolean {
  return a.length === b.length && timingSafeEqual(a, b);
 }
 
+/** What an action may name: a "Needs you" row, or any row awaiting a merge. */
+function actionEntries(state: DashboardState): NeedsYouEntry[] {
+ const out = [...state.needsYou];
+ for (const e of state.awaitingMerge ?? []) {
+  if (!out.some((n) => n.key === e.key && n.nodeId === e.nodeId)) out.push(e);
+ }
+ return out;
+}
+
 export function createHandler(ctx: HandlerContext): (req: Request) => Promise<Response> {
  const hosts = [`127.0.0.1:${ctx.port}`, `localhost:${ctx.port}`];
  const inFlight = new Set<string>();
@@ -681,7 +730,7 @@ export function createHandler(ctx: HandlerContext): (req: Request) => Promise<Re
    if (body === null) return refuse(400, "body is not a JSON object");
    const actions = ctx.actions;
    const result = await runAction(action, body, {
-    entries: ctx.getState().needsYou,
+    entries: actionEntries(ctx.getState()),
     run: actions.run,
     env: actions.env ?? process.env,
     rangerBin: actions.rangerBin,
@@ -771,18 +820,23 @@ header { display:flex; flex-wrap:wrap; gap:12px; align-items:baseline; padding:1
 header h1 { margin:0; font-size:18px; }
 header .meta { color:var(--muted); font-size:12px; }
 header button { margin-left:auto; }
-main { display:grid; grid-template-columns:repeat(auto-fit, minmax(340px, 1fr)); gap:16px; padding:16px 20px; }
+main { display:flex; flex-direction:column; gap:16px; padding:16px 20px; }
+.cols { display:grid; grid-template-columns:repeat(4, minmax(0, 1fr)); gap:16px; align-items:start; }
+@media (max-width:1200px) { .cols { grid-template-columns:repeat(2, minmax(0, 1fr)); } }
+@media (max-width:640px) { .cols { grid-template-columns:minmax(0, 1fr); } }
 section { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:12px 14px; min-width:0; }
 section h2 { margin:0 0 8px; font-size:13px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); }
 h3 { margin:12px 0 4px; font-size:13px; }
 ul { list-style:none; margin:0; padding:0; }
-li { padding:6px 0; border-top:1px solid var(--line); display:flex; gap:8px; align-items:baseline; }
+li { padding:6px 0; border-top:1px solid var(--line); display:flex; flex-wrap:wrap; gap:4px 8px; align-items:baseline; }
 li:first-child { border-top:0; }
-li .t { flex:1; min-width:0; overflow-wrap:anywhere; }
+li .t { flex:1 1 0; min-width:0; overflow-wrap:anywhere; }
+li .tags { flex-basis:100%; display:flex; flex-wrap:wrap; gap:4px 6px; align-items:center; padding-left:2.6em; }
+li pre { flex-basis:100%; }
 a { color:var(--accent); text-decoration:none; }
 a:hover { text-decoration:underline; }
 .id { font-variant-numeric:tabular-nums; color:var(--muted); white-space:nowrap; }
-.tag { font-size:11px; padding:1px 6px; border-radius:10px; border:1px solid var(--line); color:var(--muted); white-space:nowrap; }
+.tag { font-size:11px; padding:1px 6px; border-radius:10px; border:1px solid var(--line); color:var(--muted); white-space:nowrap; max-width:100%; overflow:hidden; text-overflow:ellipsis; }
 .stale { color:var(--warn); border-color:var(--warn); }
 .empty, .why { color:var(--muted); font-size:12px; }
 .reason { color:var(--muted); font-size:12px; display:block; }
@@ -793,7 +847,18 @@ button:disabled { opacity:.45; cursor:default; }
 #msg.err { color:var(--warn); }
 #out { margin:4px 20px 0; padding:8px 10px; font:12px/1.4 ui-monospace, Menlo, monospace; white-space:pre-wrap; overflow-wrap:anywhere; background:var(--card); border:1px solid var(--line); border-radius:6px; }
 #out:empty { display:none; }
-#needs { grid-column:1 / -1; }
+details.grp { border-top:1px solid var(--line); }
+details.grp:first-of-type { border-top:0; }
+details.grp > summary { cursor:pointer; padding:6px 0; display:flex; flex-wrap:wrap; gap:2px 8px; align-items:baseline; }
+details.grp > summary .t { flex:1 1 10em; min-width:0; font-weight:600; font-size:13px; overflow-wrap:anywhere; }
+details.grp > summary .why { flex-basis:100%; }
+details.grp[open] > summary { padding-bottom:2px; }
+details.grp details.grp > summary .t { font-weight:500; }
+details.grp > :not(summary) { margin-left:14px; }
+.count { font-size:11px; font-variant-numeric:tabular-nums; padding:0 7px; border-radius:10px; background:var(--line); color:var(--fg); }
+.count.zero { background:transparent; color:var(--muted); }
+#substrates ul { display:grid; grid-template-columns:repeat(auto-fit, minmax(300px, 1fr)); gap:12px; }
+#substrates li { border-top:0; }
 .card { border-top:1px solid var(--line); padding:8px 0; }
 .card:first-child { border-top:0; }
 .card .facts { color:var(--muted); font-size:12px; }
@@ -811,12 +876,14 @@ button:disabled { opacity:.45; cursor:default; }
 <div id="msg"></div>
 <pre id="out"></pre>
 <main>
-<section><h2>Current job</h2><div id="current"></div></section>
-<section><h2>Substrates</h2><div id="substrates"></div></section>
-<section><h2>Next in queue</h2><div id="next"></div></section>
-<section><h2>Autonomous — ranger can take these</h2><div id="auto"></div></section>
 <section id="needs"><h2>Needs you</h2><div id="needsyou"></div></section>
-<section><h2>Open grillings</h2><div id="grill"></div></section>
+<div class="cols">
+<section><h2>Needs your decision</h2><div id="grill"></div></section>
+<section><h2>Autonomous — ranger can take these</h2><div id="auto"></div></section>
+<section><h2>Next in queue</h2><div id="next"></div></section>
+<section><h2>Current job</h2><div id="current"></div></section>
+</div>
+<section><h2>Substrates</h2><div id="substrates"></div></section>
 </main>
 <script>
 const TOKEN = document.querySelector('meta[name="ranger-token"]').content;
@@ -830,32 +897,85 @@ const RELOAD = "the dashboard restarted and this page's token is stale: reload t
 function say(text, err) { const m = document.getElementById("msg"); m.textContent = text; m.className = err ? "err" : ""; }
 async function post(path, body) { const r = await fetch(path, { method: "POST", headers: { "content-type": "application/json", "x-ranger-token": TOKEN }, body: JSON.stringify(body || {}) }); const j = await r.json().catch(() => ({})); if (!r.ok) throw new Error(j.error === REFUSED ? RELOAD : (j.error || r.statusText)); return j; }
 const unavailable = (m, none) => empty(m.ok ? none : "Frontier unavailable: " + (m.error || "not read yet"));
-const mapHead = (m, extra) => el("h3", { text: m.repo + " · map #" + m.root + (extra || "") + " · read " + ago(m.readAt) + (m.source === "ranger" ? " by ranger" : " by this dashboard") });
+// Each map is a collapsed group showing its node count; which ones are open survives the 15 s re-render.
+const OPEN_KEY = "ranger.open";
+const opened = new Set();
+try { for (const k of JSON.parse(localStorage.getItem(OPEN_KEY) || "[]")) opened.add(k); } catch {}
+function group(id, title, count, meta, ...kids) {
+ const d = el("details", { class: "grp", open: opened.has(id) });
+ d.ontoggle = () => { if (d.open) opened.add(id); else opened.delete(id); try { localStorage.setItem(OPEN_KEY, JSON.stringify([...opened])); } catch {} };
+ d.append(el("summary", {}, el("span", { class: "t", text: title }), el("span", { class: count === 0 ? "count zero" : "count", text: String(count) }), meta ? el("span", { class: "why", text: meta }) : null), ...kids);
+ return d;
+}
+const mapTitle = (m, extra) => "map #" + m.root + (extra || "");
+const mapMeta = (m) => "read " + ago(m.readAt) + (m.source === "ranger" ? " by ranger" : " by this dashboard");
+const mapCount = (m, n) => m.ok ? n : "?";
+// Two stages: a repo group holding one group per map. The repo count sums its maps; "?" when any map is unread.
+function byRepo(prefix, items, repoOf, mapGroup) {
+ const out = [];
+ for (const repo of [...new Set(items.map(repoOf))]) {
+  const groups = items.filter((i) => repoOf(i) === repo).map(mapGroup);
+  const counts = groups.map((g) => g.count);
+  const total = counts.includes("?") ? "?" : counts.reduce((a, b) => a + b, 0);
+  out.push(group(prefix + "/" + repo, repo, total, "", ...groups.map((g) => g.el)));
+ }
+ return out;
+}
+const mapGroup = (id, m, extra, count, meta, body) => ({ count, el: group(id + "/" + m.key, mapTitle(m, extra), count, meta, body) });
 function renderMeta(s) {
  const g = s.gates;
  document.getElementById("meta").textContent = "maps read by ranger's tick, shown from its cache" + (s.refreshing ? " · dashboard reading…" : "") + (s.refreshError ? " · dashboard read: " + s.refreshError : "") + " · spawns today " + g.spawnsToday + "/" + g.spawnCap + (g.paused ? " · DEAD-MAN PAUSED" : "");
 }
-function jobTag(j) {
- if (j.stale) return el("span", { class: "tag stale", text: "stale: process gone" });
+const tag = (text, cls) => el("span", { class: "tag" + (cls ? " " + cls : ""), text, title: text });
+const tags = (...kids) => el("div", { class: "tags" }, ...kids);
+// When the job started and how long it has run; the page re-renders every 15 s.
+function jobTime(iso) {
+ if (!iso) return "start not recorded";
+ const start = new Date(iso);
+ const today = start.toDateString() === new Date().toDateString();
+ const clock = start.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+ const min = Math.max(0, Math.floor((Date.now() - start.getTime()) / 60000));
+ const so = min < 60 ? min + " min" : min < 1440 ? Math.floor(min / 60) + " h " + (min % 60) + " min" : Math.floor(min / 1440) + " d " + Math.floor((min % 1440) / 60) + " h";
+ return "started " + (today ? clock : start.toLocaleDateString([], { day: "numeric", month: "short" }) + " " + clock) + " · " + so + " so far";
+}
+// One pill per fact, each once: status and phase are often the same word.
+function jobTags(j) {
+ if (j.stale) return [tag("stale: process gone", "stale")];
  const parts = [j.resourceLane || j.lane, j.status, j.phase, j.prNumber ? "PR #" + j.prNumber : "", j.reviewRound ? "round " + j.reviewRound : ""];
- return el("span", { class: "tag", text: parts.filter(Boolean).join(" · ") });
+ return [...new Set(parts.filter(Boolean))].map((p) => tag(p));
 }
 function renderCurrent(s) {
  const box = document.getElementById("current"); box.replaceChildren();
  if (s.current.length === 0) { box.append(empty("No worker is running.")); return; }
- box.append(el("ul", {}, ...s.current.map((j) => el("li", {}, el("span", { class: "id", text: "#" + j.nodeId }), el("span", { class: "t", text: (j.title || "(title not in the frontier read)") + " — " + j.repo }), jobTag(j)))));
+ const maps = [...new Map(s.current.map((j) => [j.repo + "#" + j.root, { repo: j.repo, root: j.root }])).values()];
+ box.append(...byRepo("current", maps, (m) => m.repo, (m) => {
+  const jobs = s.current.filter((j) => j.repo === m.repo && j.root === m.root);
+  return { count: jobs.length, el: group("current/" + m.repo + "#" + m.root, "map #" + m.root, jobs.length, "", el("ul", {}, ...jobs.map((j) => {
+   const waiting = j.status === "awaiting-merge" ? (s.awaitingMerge || []).find((e) => e.repo === j.repo && e.nodeId === j.nodeId) : undefined;
+   const last = waiting ? results.get(waiting.key + "/" + waiting.nodeId) : undefined;
+   return el("li", {}, el("span", { class: "id", text: "#" + j.nodeId }), el("span", { class: "t" }, document.createTextNode(j.title || "(title not in the frontier read)"), el("span", { class: "reason", text: jobTime(j.startedAt) })),
+    tags(...jobTags(j), waiting ? mergeButton(waiting, "Merge now") : null, waiting && waiting.pr ? link(waiting.pr.url, "Open PR") : null),
+    last ? el("pre", { class: last.err ? "err" : "", text: last.text }) : null);
+  }))) };
+ }));
 }
+const ordinal = (k) => k + (k % 10 === 1 && k % 100 !== 11 ? "st" : k % 10 === 2 && k % 100 !== 12 ? "nd" : k % 10 === 3 && k % 100 !== 13 ? "rd" : "th");
 function renderNext(s) {
  const box = document.getElementById("next"); box.replaceChildren();
  for (const lane of ["visual", "headless"]) {
   const holder = s.gates.laneHolders[lane];
   box.append(el("h3", { text: lane + " lane · " + (holder ? "held by #" + holder.nodeId + " (" + holder.repo + "#" + holder.root + ")" : "free") }));
-  for (const m of s.maps.filter((m) => m.lane === lane)) {
-   box.append(mapHead(m));
+  box.append(...byRepo("next/" + lane, s.maps.filter((m) => m.lane === lane), (m) => m.repo, (m) => {
    const n = m.next;
-   if (!n.nodeId) { box.append(empty(n.reason)); continue; }
-   box.append(el("p", {}, el("span", { class: "id", text: "#" + n.nodeId + " " }), link(n.url, n.title), " ", buildButton(s, m, { id: n.nodeId, title: n.title, lane: n.lane }), el("span", { class: "reason", text: (n.lane ? n.lane + " lane · " : "") + n.reason })));
-  }
+   const queued = m.queued || [];
+   const head = n.nodeId
+    ? el("li", {}, el("span", { class: "id", text: "#" + n.nodeId }), el("span", { class: "t" }, link(n.url, n.title), el("span", { class: "reason", text: (n.lane ? n.lane + " lane · " : "") + n.reason })), tags(tag("next"), buildButton(s, m, { id: n.nodeId, title: n.title, lane: n.lane })))
+    : null;
+   const rest = queued.map((q, i) => el("li", {}, el("span", { class: "id", text: "#" + q.id }), el("span", { class: "t" }, link(q.url, q.title), el("span", { class: "reason", text: "then, " + ordinal(i + (n.nodeId ? 2 : 1)) + " in this map's queue" })), tags(tag(q.lane + " · " + q.kind), buildButton(s, m, q))));
+   // With no head (cap spent, paused, vetoed), say why before the queue that waits.
+   const body = el("div", {}, head ? null : empty(n.reason), head || rest.length > 0 ? el("ul", {}, head, ...rest) : null);
+   return mapGroup("next/" + lane, m, "", (n.nodeId ? 1 : 0) + queued.length, mapMeta(m), body);
+  }));
  }
 }
 // build-now's exit codes: 0 started, 3 claimed with no run-node (BUILD_NOW_NOT_STARTED), null still running.
@@ -885,12 +1005,11 @@ function buildButton(s, m, n) {
 }
 function renderAuto(s) {
  const box = document.getElementById("auto"); box.replaceChildren();
- for (const m of s.maps) {
-  if (m.servedOnly) continue;
-  box.append(mapHead(m, " (walk: " + m.walk + ")"));
-  if (m.autonomous.length === 0) { box.append(unavailable(m, "None.")); continue; }
-  box.append(el("ul", {}, ...m.autonomous.map((n) => el("li", {}, el("span", { class: "id", text: "#" + n.id }), el("span", { class: "t" }, link(n.url, n.title)), el("span", { class: "tag", text: n.lane + " · " + n.kind }), buildButton(s, m, n)))));
- }
+ box.append(...byRepo("auto", s.maps.filter((m) => !m.servedOnly), (m) => m.repo, (m) => {
+  const body = m.autonomous.length === 0 ? unavailable(m, "None.")
+   : el("ul", {}, ...m.autonomous.map((n) => el("li", {}, el("span", { class: "id", text: "#" + n.id }), el("span", { class: "t" }, link(n.url, n.title)), tags(tag(n.lane + " · " + n.kind), buildButton(s, m, n)))));
+  return mapGroup("auto", m, "", mapCount(m, m.autonomous.length), "walk: " + m.walk + " · " + mapMeta(m), body);
+ }));
 }
 function grillButton(m, g) {
  const b = el("button", { text: "Start session", disabled: !g.launchable, title: g.why || "Open iTerm2 in " + m.localCheckout + " and start claude on #" + g.id });
@@ -904,11 +1023,15 @@ function grillButton(m, g) {
 }
 function renderGrill(s) {
  const box = document.getElementById("grill"); box.replaceChildren();
- for (const m of s.maps) {
-  box.append(mapHead(m, m.servedOnly ? " (shown only)" : ""));
-  if (m.grillings.length === 0) { box.append(unavailable(m, "None open.")); continue; }
-  box.append(el("ul", {}, ...m.grillings.map((g) => el("li", {}, el("span", { class: "id", text: "#" + g.id }), el("span", { class: "t" }, link(g.url, g.title)), grillButton(m, g)))));
- }
+ box.append(...byRepo("grill", s.maps, (m) => m.repo, (m) => {
+  const decisions = m.decisions || [];
+  const n = m.grillings.length + decisions.length;
+  const body = n === 0 ? unavailable(m, "None open.")
+   : el("ul", {},
+    ...m.grillings.map((g) => el("li", {}, el("span", { class: "id", text: "#" + g.id }), el("span", { class: "t" }, link(g.url, g.title)), tags(tag("grilling"), grillButton(m, g)))),
+    ...decisions.map((d) => el("li", {}, el("span", { class: "id", text: "#" + d.id }), el("span", { class: "t" }, link(d.url, d.title), el("span", { class: "reason", text: d.reason })), tags(tag((d.kind || "no kind") + " · " + (d.autonomy || "no autonomy"))))));
+  return mapGroup("grill", m, m.servedOnly ? " (shown only)" : "", mapCount(m, n), mapMeta(m), body);
+ }));
 }
 const short = (sha) => (sha || "").slice(0, 8);
 function prLifecycle(v) {
@@ -943,10 +1066,18 @@ async function act(kind, n, extra) {
  const id = n.key + "/" + n.nodeId;
  try {
   const r = await post("/api/" + kind, Object.assign({ key: n.key, id: n.nodeId }, extra));
-  results.set(id, { err: !r.ok, text: kind + " #" + n.nodeId + ": exit " + (r.code === null ? "none" : r.code) + (r.stderr ? "\\n" + r.stderr : "") });
-  say(kind + " #" + n.nodeId + (r.ok ? " ran." : " failed: see its card."), !r.ok);
+  const close = r.close ? "\\nclose (merge desk): exit " + (r.close.code === null ? "none" : r.close.code) + (r.close.stderr ? "\\n" + r.close.stderr : "") : "";
+  results.set(id, { err: !r.ok || (r.close && !r.close.ok), text: kind + " #" + n.nodeId + ": exit " + (r.code === null ? "none" : r.code) + (r.stderr ? "\\n" + r.stderr : "") + close });
+  say(kind + " #" + n.nodeId + (!r.ok ? " failed: see its card." : r.close ? (r.close.ok ? " ran; the merge desk started its close." : " ran, but the merge desk failed: see its card.") : " ran."), !r.ok || (r.close && !r.close.ok));
  } catch (e) { results.set(id, { err: true, text: kind + " #" + n.nodeId + " refused: " + e.message }); say(e.message, true); }
  load(); setTimeout(load, 3000);
+}
+function mergeButton(n, text) {
+ const merge = n.actions.merge;
+ return actionButton(text, merge.offered ? "gh pr merge --squash, pinned to " + short(merge.headSha) + ", under gh's configured login (machine-account tokens stripped; the account is not checked), then the map's merge desk" + (n.status === "awaiting-merge" ? "; refused unless the merge desk's gate (CI, sage review, probes at the head) passes" : "") : merge.why, merge.offered, async () => {
+  if (!confirm("Squash-merge PR #" + n.pr.number + " on " + n.repo + " at head " + merge.headSha + "?\\n\\n" + (n.status === "awaiting-merge" ? "The merge desk's gate is checked first (CI, mergeable, base, sage review and probes at this head); the merge is refused unless it passes. " : "This is an override: only CI and mergeability are checked, not the review or probes. ") + "It runs under gh's configured login: the machine account's GH_TOKEN, GITHUB_TOKEN and GH_CONFIG_DIR are stripped, but the account itself is not checked. " + (n.status === "failed" ? "The merge desk watches only parked and awaiting-merge rows, so Resume it afterwards to run the close." : "Then the map's merge desk runs at once and starts the close; check that the node closed (a failed spawn or a refused close leaves it open)."))) return;
+  await act("merge", n, { sha: merge.headSha });
+ });
 }
 function needsCard(n) {
  const id = n.key + "/" + n.nodeId;
@@ -957,11 +1088,7 @@ function needsCard(n) {
   acts.append(actionButton("Resume", "ranger resume-node " + n.nodeId + " --map " + n.key, true, () => act("resume", n, { force: force.checked })));
   acts.append(el("label", {}, force, document.createTextNode(" run beside the lane holder")));
  }
- const merge = n.actions.merge;
- acts.append(actionButton("Merge", merge.offered ? "gh pr merge --squash, pinned to " + short(merge.headSha) + ", under gh's configured login (machine-account tokens stripped; the account is not checked)" : merge.why, merge.offered, async () => {
-  if (!confirm("Squash-merge PR #" + n.pr.number + " on " + n.repo + " at head " + merge.headSha + "?\\n\\nIt runs under gh's configured login: the machine account's GH_TOKEN, GITHUB_TOKEN and GH_CONFIG_DIR are stripped, but the account itself is not checked. " + (n.status === "failed" ? "The merge desk watches only parked and awaiting-merge rows, so Resume it afterwards to run the close." : "On its next tick the merge desk starts the close; check that the node closed (a failed spawn or a refused close leaves it open)."))) return;
-  await act("merge", n, { sha: merge.headSha });
- }));
+ acts.append(mergeButton(n, "Merge"));
  const session = n.actions.session;
  acts.append(actionButton("Open session", session.offered ? "Open iTerm2 in " + session.cwd + " and start claude on #" + n.nodeId : session.why, session.offered, () => act("session", n, {})));
  if (n.pr) acts.append(link(n.pr.url, "Open PR"));
@@ -1486,7 +1613,7 @@ export function stateFromJournal(
   }
   const vetoed = journal?.listVetoes() ?? new Set<string>();
   const workers = journal?.listWorkers() ?? [];
-  const needsYou = needsYouEntries({
+  const entryInputs: Parameters<typeof needsYouEntries>[0] = {
    maps,
    workers,
    events: (repo, nodeId) => journal?.listNodeEvents(repo, nodeId) ?? [],
@@ -1503,7 +1630,9 @@ export function stateFromJournal(
    },
    reviewRounds: config.workers.reviewRounds,
    exists: existsSync,
-  });
+  };
+  const needsYou = needsYouEntries(entryInputs);
+  const awaitingMerge = awaitingMergeEntries(entryInputs);
   const needsYouUnchecked = uncheckedNeedsEye({
    maps,
    workers,
@@ -1527,6 +1656,7 @@ export function stateFromJournal(
    workers,
    needsYou,
    needsYouUnchecked,
+   awaitingMerge,
    lastImplementMaps: lastImplementMaps(journal),
    laneHolders: { visual: journal?.laneHolder("visual") ?? null, headless: journal?.laneHolder("headless") ?? null },
    paused: journal?.isPaused() ?? false,

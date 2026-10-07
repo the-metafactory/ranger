@@ -1012,6 +1012,7 @@ describe("implement lane (node #23)", () => {
   await seedProbeOnBase(r);
   const outcome = await runNode("20", r.ctx);
   expect(outcome.status).toBe("parked");
+  expect(outcome.detail).toContain("probe failure class: assertion");
   expect(outcome.detail).toContain("FAILED: probe-hud.mjs");
   expect(outcome.detail).not.toContain("red on the merge base too");
   expect(r.announced).toEqual([]);
@@ -1075,6 +1076,7 @@ describe("implement lane (node #23)", () => {
   const calls = watchBaseRuns(r);
   const outcome = await runNode("20", r.ctx);
   expect(outcome.status).toBe("parked");
+  expect(outcome.detail).toContain("probe failure class: infrastructure");
   expect(outcome.detail).toContain("FAILED: probe-hud.mjs · probe-weapon.mjs");
   expect(outcome.detail).not.toContain("red on the merge base too");
   expect(r.announced).toEqual([]);

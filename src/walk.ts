@@ -23,6 +23,7 @@ import type { OwnedCheck } from "./lock.ts";
 import { classifyFrontier, loadProbeRegistry } from "./route.ts";
 import type { GitHubPort } from "./github.ts";
 import * as realGitHub from "./github.ts";
+import { probeRequeueCandidates, requeueProbes, type ProbeRequeueResult } from "./probe-requeue.ts";
 import { sweepMap, type SweepMapResult } from "./sweep.ts";
 import {
  implementCandidates,
@@ -39,7 +40,8 @@ export { implementCandidates, planTick, researchCandidates, selectCandidates };
  * The headless tick (design §1, build-path step 3) — one bounded pass:
  *
  * per map → gate (write token + not-principal + walk mode + pause state) →
- * sweep (liveness, merge desk and its send-backs) → queued resumes;
+ * sweep liveness → priority probe requeues → merge desk and its send-backs
+ * → queued resumes;
  * then, per map again →
  * derive + classify frontier → research-lane candidates → announce (fail-closed)
  * → claim (race-safe) → spawn a detached `ranger run-node`. Sweeps go first so
@@ -65,6 +67,7 @@ export interface WalkMapResult {
 export interface WalkResult {
  maps: WalkMapResult[];
  spawnCapPerDay: number;
+ probeRequeues: ProbeRequeueResult;
 }
 
 export interface WalkContext {
@@ -244,6 +247,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
  const result: WalkResult = {
   maps: [],
   spawnCapPerDay: config.workers.spawnCapPerDay,
+  probeRequeues: { resumed: [], pending: [], errors: [], lanes: [] },
  };
  const cliEntry = join(import.meta.dir, "cli.ts");
  // Even a worker finishing during this tick must not allow a second claim
@@ -264,6 +268,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
    return typeof value === "function" ? value.bind(target) : value;
   },
  });
+ const priorityLanes = new Set<ImplementLane>();
 
  const order = implementMapOrder(config.maps, lastImplementMaps(journal), implementLane);
  // One sweep wiring for both phases; only the phase differs.
@@ -279,14 +284,16 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
    botIdentity: w.botIdentity,
    github,
    phase,
+   reservedLanes: priorityLanes,
    respawn: (nodeId, repo, root) =>
     (ctx.spawnRunNode ?? spawnRunNodeDetached)({ nodeId, repo, root, cliEntry, configPath: ctx.configPath }),
   });
  const maps: WalkMapResult[] = [];
  const walked: { map: (typeof order)[number]; mapResult: WalkMapResult; token: string; botIdentity: string; errors: string[] }[] = [];
 
- // Pass 1 — every walked map's liveness sweep, then (1b) every map's merge
- // desk, before any claim. The desk sends ready PRs back to run-node (rework,
+ // Pass 1 — authorize every walked map, sweep liveness, resume priority
+ // probe parks, then (1b) every map's merge desk, before any claim.
+ // The desk sends ready PRs back to run-node (rework,
  // missing probes, a conflict with the base), and a send-back needs its
  // implement lane. Run after the claims, it lost the lane to a fresh claim
  // whenever the lane freed between ticks (2026-10-05: seelite #691 took the
@@ -346,6 +353,19 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
   }
 
   const errors: string[] = [];
+  maps.push(mapResult);
+  walked.push({ map, mapResult, token, botIdentity, errors });
+ }
+
+ // Retry parks outrank every other queued implement session, including
+ // crash respawns on a map visited earlier. Reserve across all authorized maps
+ // before any liveness sweep, then clean up dead holders and orphan groups.
+ const retryMaps = walked.filter((w) => !w.mapResult.gated).map((w) => w.map);
+ for (const row of probeRequeueCandidates(journal, retryMaps, config.workers.probeRequeues)) {
+  const map = retryMaps.find((m) => m.repo === row.repo && m.root === row.root) as RangerMapConfig;
+  priorityLanes.add(implementLane(map));
+ }
+ for (const { map, mapResult, token, botIdentity, errors } of walked) {
   // Sweep always runs for a walked map (even paused — liveness/audit surface).
   try {
    mapResult.sweep = await sweepPhase({ map, token, botIdentity }, "liveness");
@@ -354,13 +374,30 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
     `sweep failed: ${error instanceof Error ? error.message : String(error)}`,
    );
   }
-
-  maps.push(mapResult);
-  walked.push({ map, mapResult, token, botIdentity, errors });
  }
+
+ // Re-check parks under the same lease used by new claims. A failed spawn
+ // keeps its priority for this tick instead of handing capacity to new work.
+ try {
+  result.probeRequeues = await withClaimLock(journal, (owned) => requeueProbes({
+   journal, maps: retryMaps, limit: config.workers.probeRequeues, owned,
+   spawn: (nodeId, repo, root) => (ctx.spawnRunNode ?? spawnRunNodeDetached)({
+    nodeId, repo, root, cliEntry, configPath: ctx.configPath,
+   }),
+  }));
+  priorityLanes.clear();
+  for (const lane of result.probeRequeues.lanes) priorityLanes.add(lane);
+ } catch (error) {
+  result.probeRequeues.errors.push(String(error));
+  // Keep the pre-sweep reservations if the retry lease was unavailable.
+ }
+ for (const lane of priorityLanes) implementClaimed.add(lane);
 
  // Pass 1b — the merge desks, against lanes every liveness sweep has settled.
  for (const { map, mapResult, token, botIdentity, errors } of walked) {
+  // No child spawned (or it finished immediately): the retry still won this
+  // lane for this tick; queued send-backs wait until the next tick.
+  if (priorityLanes.has(implementLane(map)) && journal.laneHolder(implementLane(map)) === null) continue;
   try {
    const desk = await sweepPhase({ map, token, botIdentity }, "desk");
    // A failed liveness sweep left no result: the desk's own stands in, so

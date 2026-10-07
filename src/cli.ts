@@ -40,7 +40,9 @@ import {
 import { canonicalDir, runNode } from "./worker.ts";
 import { trustCurrentGitState } from "./git-trust.ts";
 import { sweepMap } from "./sweep.ts";
-import { walk } from "./walk.ts";
+import { mergeGateNow } from "./merge-desk.ts";
+import { realGitHub } from "./implement.ts";
+import { spawnRunNodeDetached, walk } from "./walk.ts";
 import { holdAwake } from "./awake.ts";
 import { BUILD_NOW_NOT_STARTED, buildNow, type BuildNowResult } from "./build-now.ts";
 import { startServe } from "./serve.ts";
@@ -53,7 +55,9 @@ import {
 import type { WalkMode } from "./config.ts";
 import { lstat, mkdir, readFile, rm } from "node:fs/promises";
 import { runBaseline, validateBaselineConfig, createCommandMetrics, localCommandAdapter, sshCommandAdapter, privateOperatorPath, writePrivateBaselineReport } from "./remote-test/baseline.ts";
-import { executeRemoteTest, validateExecutorConfig } from "./remote-test/executor.ts";
+import { executeRemoteTest, reconcileRemoteTests, validateExecutorConfig } from "./remote-test/executor.ts";
+import { ActiveRemoteTestJob, BusyRemoteTestExecutor, RevokedRemoteTestJob, openJobLedger } from "./remote-test/job-ledger.ts";
+import { validateRemoteTestJob } from "./remote-test/contract.ts";
 import { publishReceiptFile } from "./remote-test/artifacts.ts";
 import { runSshCommand, statusSshCommand, sshOutcomeExitCode, sshOutcomeMessage, type RunSshCommand } from "./remote-test/ssh-cli.ts";
 import { serveSshResponse } from "./remote-test/ssh-server.ts";
@@ -260,6 +264,94 @@ async function runSweep(configPath: string): Promise<string> {
  }
  journal.close();
  return JSON.stringify(results, null, 2);
+}
+
+/** How long `merge-desk --settle` waits for GitHub to compute mergeability, and how often it asks. */
+const SETTLE_MAX_MS = 90_000;
+const SETTLE_POLL_MS = 10_000;
+
+/**
+ * A merge moves the base under every other PR on the map, and GitHub
+ * recomputes their mergeability lazily: a desk pass right after the merge
+ * reads null ("still computing") and leaves a PR that now conflicts for the
+ * next tick. Wait until every awaiting-merge PR on the map has a computed
+ * answer (bounded), so the pass that follows sends a conflict back for its
+ * base merge now.
+ */
+async function settleMergeability(journal: Journal, map: RangerMapConfig, token: string): Promise<void> {
+ const prs = journal
+  .listWorkers(map.repo, map.root)
+  .filter((w) => w.status === "awaiting-merge" && w.prNumber !== null)
+  .map((w) => w.prNumber as number);
+ const deadline = Date.now() + SETTLE_MAX_MS;
+ let waiting = prs;
+ while (waiting.length > 0 && Date.now() < deadline) {
+  await new Promise((r) => setTimeout(r, SETTLE_POLL_MS));
+  const still: number[] = [];
+  for (const n of waiting) {
+   try {
+    const pr = await realGitHub.getPr(map.repo, n, token);
+    if (pr.state === "open" && (pr.mergeable === null || pr.mergeableState === "unknown")) still.push(n);
+   } catch {
+    still.push(n);
+   }
+  }
+  waiting = still;
+ }
+}
+
+/**
+ * Operator verb: the merge desk's gate for one node's PR, read live. Exits 0
+ * only when the gate passes at exactly `sha`; otherwise it names the check
+ * on stderr and exits 2. Reads only. `ranger serve` runs it before a
+ * dashboard merge of an awaiting-merge row.
+ */
+async function runMergeGate(nodeId: string, selector: string, sha: string, configPath: string): Promise<{ ok: boolean; text: string }> {
+ const { config, journal } = loadCtx(configPath);
+ try {
+  const map = pickMap(config, selector);
+  const row = journal.getWorker(nodeId, map.repo);
+  if (row === null || row.root !== map.root || row.prNumber === null) {
+   return { ok: false, text: `node ${nodeId} has no PR recorded on ${mapKey(map)}` };
+  }
+  const { token, botIdentity } = await writeContext(config, map);
+  const gate = await mergeGateNow(realGitHub, map, row.prNumber, token, botIdentity);
+  if (gate.status !== "pass") return { ok: false, text: `merge gate ${gate.status} (${gate.check}): ${gate.reason}` };
+  if (gate.headSha !== sha) {
+   return { ok: false, text: `the gate passes at ${gate.headSha.slice(0, 8)}, not at the confirmed head ${sha.slice(0, 8)}` };
+  }
+  return { ok: true, text: JSON.stringify({ nodeId, pr: row.prNumber, gate }, null, 2) };
+ } finally {
+  journal.close();
+ }
+}
+
+/**
+ * Operator verb: one map's merge desk, now — the tick's desk phase for that
+ * map alone. `ranger serve` runs it after a dashboard merge, so the merged
+ * node starts its close without waiting for the next tick. Like the tick it
+ * spawns the close (and any send-back) as a detached run-node.
+ */
+async function runMergeDeskNow(selector: string, configPath: string, settle = false): Promise<string> {
+ const { config, journal } = loadCtx(configPath);
+ try {
+  const map = pickMap(config, selector);
+  const { token, botIdentity } = await writeContext(config, map);
+  if (settle) await settleMergeability(journal, map, token);
+  const result = await sweepMap({
+   config,
+   journal,
+   map,
+   token,
+   botIdentity,
+   phase: "desk",
+   respawn: (nodeId, repo, root) =>
+    spawnRunNodeDetached({ nodeId, repo, root, cliEntry: join(import.meta.dir, "cli.ts"), configPath }),
+  });
+  return JSON.stringify(result.mergeDesk ?? { idle: "no row on this map waits on a merge" }, null, 2);
+ } finally {
+  journal.close();
+ }
 }
 
 /**
@@ -487,12 +579,50 @@ remoteTest.command("execute")
     process.stdout.write(`Remote-test ${receipt.status}; private receipt saved.\n`);
     process.exitCode = receipt.status === "passed" ? 0 : 1;
    } finally { await rm(reservation, { recursive: true }); }
-  } catch {
+  } catch (error) {
+   if (error instanceof ActiveRemoteTestJob) {
+    process.stderr.write(`Remote-test active (attempt ${error.status.attempt}); query status.\n`); process.exitCode = 1; return;
+   }
+   if (error instanceof RevokedRemoteTestJob) {
+    process.stderr.write("Remote-test observed passed outcome is revoked; no accepted success.\n"); process.exitCode = 1; return;
+   }
+   if (error instanceof BusyRemoteTestExecutor) {
+    process.stderr.write("Remote-test executor busy; this job was not admitted. Inspect the active attempt or recover with the executor stopped.\n"); process.exitCode = 1; return;
+   }
    process.stderr.write(receiptStored
-    ? "ranger remote-test execute: durable receipt stored; output export failed. Inspect the private artifact store before retrying export; do not rerun the job.\n"
-    : "ranger remote-test execute: configuration, admission, execution or receipt storage failed; inspect private operator inputs.\n");
+    ? "ranger remote-test execute: durable receipt stored; output export failed. Repeat execute with the identical job and a new output path, or query status; do not export loose artifacts.\n"
+    : "ranger remote-test execute: configuration, admission, execution or receipt storage failed; inspect private state and recover interrupted attempts with the executor stopped.\n");
    process.exitCode = 1;
   } finally { process.removeListener("SIGINT", cancel); process.removeListener("SIGTERM", cancel); }
+ });
+
+remoteTest.command("recover")
+ .description("Reconcile interrupted jobs; requires the former executor to be stopped")
+ .requiredOption("--config <path>", "reviewed private executor JSON configuration")
+ .requiredOption("--executor-stopped", "operator confirms the former executor is stopped")
+ .action(async (options: { config: string }) => {
+  try {
+   const config = JSON.parse(await readFile(await privateOperatorPath(options.config, true), "utf8"));
+   await reconcileRemoteTests(config);
+   process.stdout.write("Remote-test recovery complete; interrupted jobs have at most one infrastructure retry.\n");
+  } catch { process.stderr.write("Remote-test recovery failed; admission remains fenced. Inspect private executor state.\n"); process.exitCode = 1; }
+ });
+
+remoteTest.command("cancel")
+ .description("Durably cancel an exact remote-test job generation")
+ .requiredOption("--config <path>", "reviewed private executor JSON configuration")
+ .requiredOption("--job <path>", "V1 job identity JSON")
+ .action(async (options: { config: string; job: string }) => {
+  try {
+   const config = validateExecutorConfig(JSON.parse(await readFile(await privateOperatorPath(options.config, true), "utf8")));
+   const job = JSON.parse(await readFile(options.job, "utf8"));
+   const selected = config.profiles.find(p => p.profile.profileId === job?.profileId);
+   if (!selected) throw Error("Unapproved cancellation profile");
+   const validated = validateRemoteTestJob(job, selected.profile);
+   const ledger = await openJobLedger(config.jobsRoot, config.executorId);
+   try { ledger.cancel(validated); } finally { ledger.close(); }
+   process.stdout.write("Remote-test generation cancellation recorded.\n");
+  } catch { process.stderr.write("Remote-test cancellation failed; inspect private executor state.\n"); process.exitCode = 1; }
  });
 
 remoteTest.command("baseline")
@@ -660,6 +790,52 @@ program
   } catch (error) {
    process.stderr.write(
     `ranger sweep: ${error instanceof Error ? error.message : String(error)}\n`,
+   );
+   process.exit(1);
+  }
+ });
+
+program
+ .command("merge-gate")
+ .description(
+  "Operator verb: the merge desk's gate (CI, mergeable, base, sage review and probes at the live head) for one node's PR; exit 0 only when it passes at --sha, 2 otherwise. Reads only",
+ )
+ .argument("<id>", "node id")
+ .requiredOption("-m, --map <owner/name#root>", "map repo#root (repo alone only when unique)")
+ .requiredOption("--sha <sha>", "the head the merge is pinned to")
+ .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
+ .action(async (id: string, options: { map: string; sha: string; config: string }) => {
+  try {
+   const configPath = resolve(process.cwd(), options.config);
+   const result = await runMergeGate(id, options.map, options.sha, configPath);
+   if (!result.ok) {
+    process.stderr.write(result.text + "\n");
+    process.exit(2);
+   }
+   process.stdout.write(result.text + "\n");
+  } catch (error) {
+   process.stderr.write(
+    `ranger merge-gate: ${error instanceof Error ? error.message : String(error)}\n`,
+   );
+   process.exit(1);
+  }
+ });
+
+program
+ .command("merge-desk")
+ .description(
+  "Operator verb: run one map's merge desk now, as the tick's desk phase does — a merged PR's node starts its close, a passing PR gets its merge card",
+ )
+ .requiredOption("-m, --map <owner/name#root>", "map repo#root (repo alone only when unique)")
+ .option("--settle", "first wait (up to 90 s) until GitHub has computed mergeability for every awaiting-merge PR on the map, as after a merge moved the base")
+ .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
+ .action(async (options: { map: string; config: string; settle?: boolean }) => {
+  try {
+   const configPath = resolve(process.cwd(), options.config);
+   process.stdout.write((await runMergeDeskNow(options.map, configPath, options.settle === true)) + "\n");
+  } catch (error) {
+   process.stderr.write(
+    `ranger merge-desk: ${error instanceof Error ? error.message : String(error)}\n`,
    );
    process.exit(1);
   }

@@ -296,7 +296,11 @@ export function mergeRefusal(pr: PrView | null): string | null {
  if (pr.merged) return "the PR is already merged";
  if (pr.state !== "open") return "the PR is closed";
  if (pr.draft) return "the PR is a draft: mark it ready first";
- if (pr.mergeable !== true) return pr.mergeable === null ? "GitHub is still computing mergeability" : "the PR is not mergeable";
+ if (pr.mergeable !== true) {
+  return pr.mergeable === null
+   ? "GitHub is still computing mergeability"
+   : "the PR conflicts with its base: the merge desk sends it back for a base merge and a new review round";
+ }
  if (!SHA_PATTERN.test(pr.headSha)) return "the PR head is unknown";
  if (pr.ci === "no-success") return "no check run concluded success (all neutral/skipped): the close has nothing to cite";
  if (pr.ci === "unreadable") return "the check runs could not be read";
@@ -356,14 +360,32 @@ export interface NeedsYouInputs {
 
 /** The rows that wait on the principal, newest first. */
 export function needsYouEntries(inputs: NeedsYouInputs): NeedsYouEntry[] {
+ return rowEntries(inputs, (row, labels) =>
+  row.status === "parked" ||
+  row.status === "failed" ||
+  (row.status === "awaiting-merge" && labels?.includes(NEEDS_EYE_LABEL) === true));
+}
+
+/**
+ * Every awaiting-merge row on a served map, needs-eye or not: the Current
+ * job's "Merge now". The merge is the principal's either way; needs-eye only
+ * says the principal's eye is the check.
+ */
+export function awaitingMergeEntries(inputs: NeedsYouInputs): NeedsYouEntry[] {
+ return rowEntries(inputs, (row) => row.status === "awaiting-merge");
+}
+
+function rowEntries(
+ inputs: NeedsYouInputs,
+ include: (row: WorkerRow, labels: string[] | null) => boolean,
+): NeedsYouEntry[] {
  const out: NeedsYouEntry[] = [];
  for (const row of inputs.workers) {
   const map = inputs.maps.find((m) => m.repo === row.repo && m.root === row.root);
   if (map === undefined) continue;
   const labels = inputs.labels(row.repo, row.nodeId);
+  if (!include(row, labels)) continue;
   const waiting = row.status === "parked" || row.status === "failed";
-  const needsEye = row.status === "awaiting-merge" && labels?.includes(NEEDS_EYE_LABEL) === true;
-  if (!waiting && !needsEye) continue;
   const events = inputs.events(row.repo, row.nodeId);
   const view = row.prNumber === null ? null : inputs.prs(row.repo, row.prNumber);
   const sage = lastSageRound(events);
@@ -506,6 +528,30 @@ export function resumeArgv(args: {
 }
 
 /**
+ * The merge desk's own gate for one node, run before a dashboard merge of an
+ * awaiting-merge row: the dashboard reads CI and mergeability, but not
+ * ranger's review and probe records at the head, which the desk holds a
+ * merge card behind.
+ */
+export function gateArgv(args: { rangerBin: string; configPath: string; repo: string; root: number; nodeId: string; sha: string }): string[] {
+ if (!REPO_PATTERN.test(args.repo)) throw new Error(`bad repo: ${args.repo}`);
+ if (!ID_PATTERN.test(args.nodeId)) throw new Error(`bad node id: ${args.nodeId}`);
+ if (!Number.isInteger(args.root) || args.root <= 0) throw new Error(`bad root: ${args.root}`);
+ if (!SHA_PATTERN.test(args.sha)) throw new Error(`bad head SHA: ${args.sha}`);
+ return [args.rangerBin, "merge-gate", args.nodeId, "--map", `${args.repo}#${args.root}`, "--sha", args.sha, "-c", args.configPath];
+}
+
+/**
+ * One map's merge desk, run right after a dashboard merge: the merged node
+ * starts its close now instead of on the next tick.
+ */
+export function deskArgv(args: { rangerBin: string; configPath: string; repo: string; root: number; settle?: boolean }): string[] {
+ if (!REPO_PATTERN.test(args.repo)) throw new Error(`bad repo: ${args.repo}`);
+ if (!Number.isInteger(args.root) || args.root <= 0) throw new Error(`bad root: ${args.root}`);
+ return [args.rangerBin, "merge-desk", "--map", `${args.repo}#${args.root}`, ...(args.settle ? ["--settle"] : []), "-c", args.configPath];
+}
+
+/**
  * The session the principal opens on a parked node. The prompt carries the
  * repo, the id and the reason class only: the session reads the node, the
  * PR and the journal itself.
@@ -535,7 +581,7 @@ export interface ActionBody {
 }
 
 export interface ActionDeps {
- /** The entries as the journal reads now. */
+ /** The entries as the journal reads now: "Needs you", and every awaiting-merge row. */
  entries: NeedsYouEntry[];
  run: ActionRunner;
  env: Record<string, string | undefined>;
@@ -589,7 +635,7 @@ export async function runAction(
  if (!ID_PATTERN.test(body.id)) return refusal(400, "id must be numeric");
  const entry = deps.entries.find((e) => e.key === body.key && e.nodeId === body.id);
  if (entry === undefined) {
-  return refusal(404, `#${body.id} is not parked, failed or awaiting a needs-eye merge on ${body.key}`);
+  return refusal(404, `#${body.id} is not parked, failed or awaiting a merge on ${body.key}`);
  }
  const held = nodeKey(entry.repo, entry.nodeId);
  if (deps.inFlight.has(held)) return refusal(409, `an action on #${entry.nodeId} is already running: wait for it, then reload`);
@@ -616,6 +662,7 @@ async function runHeldAction(
  let argv: string[];
  let env: Record<string, string>;
  let detached = false;
+ let gate: string[] | null = null;
  if (kind === "resume") {
   if (!entry.actions.resume) return refusal(409, `#${entry.nodeId} is ${entry.status}, not parked or failed`);
   if (deps.configPath === undefined) return refusal(409, "serve was started without a config path to resume with");
@@ -643,6 +690,20 @@ async function runHeldAction(
    return refusal(502, `could not read PR #${pr.number} live: ${error instanceof Error ? error.message : String(error)}`);
   }
   const stale = mergeRefusal(live);
+  if (stale !== null && live?.mergeable === false && live.state === "open" && entry.status === "awaiting-merge" && deps.configPath !== undefined) {
+   // A conflict the page had not seen yet (another merge moved the base):
+   // the desk's send-back fixes it, so run the desk now, not on the next tick.
+   const desk = await deps.run(
+    deskArgv({ rangerBin: deps.rangerBin, configPath: deps.configPath, repo: entry.repo, root: entry.root }),
+    childEnv(deps.env),
+    { detached: true },
+   );
+   return {
+    ...refusal(409, `read live: ${stale}${desk.code === 0 ? " (the merge desk ran now)" : `; the merge desk failed (exit ${desk.code ?? "none"}): ${tailOf(desk.stderr)}`}`),
+    entry,
+    exited: desk.exited,
+   };
+  }
   if (stale !== null) return refusal(409, `read live: ${stale}`);
   if ((live as PrView).headSha !== body.sha) {
    return refusal(409, "the PR head moved since the page read it: reload and confirm again");
@@ -659,6 +720,13 @@ async function runHeldAction(
    if (full !== "green") return refusal(409, `every check, read under your login: CI is ${full}`);
   }
   argv = mergeArgv({ repo: entry.repo, pr: pr.number, sha: body.sha });
+  // An awaiting-merge row merges only past the desk's full gate. A parked or
+  // failed row is the principal's override (a review-cap park hands
+  // good-enough over), so it keeps the CI-and-mergeable check alone.
+  if (entry.status === "awaiting-merge") {
+   if (deps.configPath === undefined) return refusal(409, "serve was started without a config path: the merge desk's gate cannot run");
+   gate = gateArgv({ rangerBin: deps.rangerBin, configPath: deps.configPath, repo: entry.repo, root: entry.root, nodeId: entry.nodeId, sha: body.sha });
+  }
  } else {
   if (!entry.actions.session.offered) return refusal(409, entry.actions.session.why);
   const cwd = entry.actions.session.cwd;
@@ -666,12 +734,49 @@ async function runHeldAction(
   argv = sessionPlan({ repo: entry.repo, nodeId: entry.nodeId, reason: entry.reason.class, cwd }).argv;
   env = childEnv(deps.env);
  }
- if (body.dryRun === true) return { status: 200, body: { dryRun: true, argv, envKeys: Object.keys(env).sort() } };
+ // A merged PR closes through the merge desk, which watches awaiting-merge
+ // and parked rows: run it for this map now. A failed row is not watched;
+ // its close takes a Resume.
+ const close =
+  kind === "merge" && entry.status !== "failed" && deps.configPath !== undefined
+   ? deskArgv({ rangerBin: deps.rangerBin, configPath: deps.configPath, repo: entry.repo, root: entry.root })
+   : null;
+ if (body.dryRun === true) {
+  return {
+   status: 200,
+   body: { dryRun: true, argv, envKeys: Object.keys(env).sort(), ...(gate === null ? {} : { gateArgv: gate }), ...(close === null ? {} : { closeArgv: close }) },
+  };
+ }
+ if (gate !== null) {
+  // The wrapper resolves the machine account's read credential itself.
+  const checked = await deps.run(gate, childEnv(deps.env), { detached: false });
+  if (checked.code !== 0) {
+   return refusal(409, `the merge desk's gate holds it: ${tailOf(checked.stderr) || `merge-gate exit ${checked.code ?? "none"}`}`);
+  }
+ }
  const result = await deps.run(argv, env, { detached });
- return {
-  status: 200,
-  body: { action: kind, nodeId: entry.nodeId, ok: result.code === 0, code: result.code, stderr: tailOf(result.stderr) },
-  entry,
-  exited: result.exited,
+ const out: Record<string, unknown> = {
+  action: kind,
+  nodeId: entry.nodeId,
+  ok: result.code === 0,
+  code: result.code,
+  stderr: tailOf(result.stderr),
  };
+ let exited = result.exited;
+ if (close !== null && result.code === 0) {
+  // The wrapper resolves the machine account's tokens itself, as for a resume.
+  const desk = await deps.run(close, childEnv(deps.env), { detached: true });
+  out.close = { ok: desk.code === 0, code: desk.code, stderr: tailOf(desk.stderr) };
+  // The merge moved the base under the map's other waiting PRs, and GitHub
+  // recomputes their mergeability lazily: a second pass waits for it, so a
+  // PR that now conflicts goes back for its base merge without a tick. The
+  // page is not kept waiting for it; the node stays held until it ends.
+  const settle = deps.run(
+   deskArgv({ rangerBin: deps.rangerBin, configPath: deps.configPath as string, repo: entry.repo, root: entry.root, settle: true }),
+   childEnv(deps.env),
+   { detached: true },
+  );
+  exited = Promise.all([result.exited, desk.exited, settle.then((r) => r.exited)]).then(() => undefined);
+ }
+ return { status: 200, body: out, entry, exited };
 }

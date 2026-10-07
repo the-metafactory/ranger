@@ -14,9 +14,10 @@ import { acquireLease, leaseOwnedCheck, type OwnedCheck, releaseLease, startHear
  * the gates (the node's row, the daily spawn cap, the implement-lane holder)
  * only after the first has written its `claimed` row and counted its spawn.
  *
- * Operator resumes and the walk's queued-resume pass also take it. The merge
- * desk's send-back of a ready PR starts workers without it; a lane read
- * under the lock can still be joined by a send-back
+ * Operator resumes, the walk's queued-resume pass and automatic probe
+ * requeues also take it while reserving a lane and starting their child.
+ * The merge desk's send-back of a ready PR starts workers without it; a
+ * lane read under the lock can still be joined by a send-back
  * before the claim's row lands. Neither does a claimer re-read the pause or
  * a veto after its gate check: one recorded during a claimer's announce is
  * seen by the next claim, as in the walk before this lock.

@@ -102,6 +102,9 @@ export type ProfileManifest = z.infer<typeof ProfileManifestSchema>;
 export type RemoteTestReceipt = z.infer<typeof ReceiptSchema>;
 export type RemoteTestStatus = RemoteTestReceipt["status"];
 
+/** Structural validation for the private ledger; profile approval remains at admission. */
+export function validateJobIdentity(input: unknown): RemoteTestJob { return IdentitySchema.parse(input); }
+
 /** Structural validation only. Approval, digest verification and provenance are
  * caller responsibilities: load this from an operator-owned allow-list, never
  * from the job or its submitter. A claimed digest does not authenticate content. */

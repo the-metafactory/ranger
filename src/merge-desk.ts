@@ -16,7 +16,8 @@ import {
  type GitHubPort,
 } from "./implement.ts";
 import type { Journal, WorkerRow } from "./journal.ts";
-import { evaluateMergeGate } from "./merge-gate.ts";
+import { evaluateMergeGate, type MergeGateInput, type MergeGateResult } from "./merge-gate.ts";
+import type { CheckRun, IssueComment, PullRequest } from "./github.ts";
 import { CI_FAILED_PARK_OUTCOME, mergeGateFailedOutcome } from "./outcomes.ts";
 
 /**
@@ -66,6 +67,60 @@ export interface MergeDeskResult {
  parked: string[];
  pending: string[];
  errors: string[];
+}
+
+type Review = ReturnType<typeof recordedReviews>[number];
+type Probe = ReturnType<typeof recordedProbes>[number];
+
+/**
+ * Ranger's standing review and passing probe run recorded at exactly
+ * `headSha`. A clean round that set aside an older same-head major (node
+ * #106) is named in `superseded`: the reviewer may have missed it, so
+ * auto-merge holds and the manual card names it for the principal to check.
+ */
+function headEvidence(
+ comments: IssueComment[],
+ headSha: string,
+ botIdentity: string,
+): { last?: Review; probe?: Probe; superseded: string | null } {
+ const reviews = recordedReviews(comments, botIdentity);
+ return {
+  last: reviewAtHead(reviews, headSha),
+  probe: recordedProbes(comments, botIdentity).find((p) => p.sha === headSha && p.passed),
+  superseded: supersededNote(reviews, headSha),
+ };
+}
+
+function gateInput(map: RangerMapConfig, pr: PullRequest, checkRuns: CheckRun[], last?: Review, probe?: Probe): MergeGateInput {
+ return {
+  pr,
+  checkRuns,
+  expectedBase: map.base,
+  verdictSha: last?.sha ?? null,
+  verdictBlockers: last?.blockers ?? null,
+  verdictMajors: last?.majors ?? null,
+  probesRequired: map.commands.probe !== undefined,
+  probePassedSha: probe?.sha ?? null,
+ };
+}
+
+/**
+ * The desk's merge gate for one PR, read live: CI, mergeability, base, and
+ * ranger's review and probe run at the live head. `ranger merge-gate` runs
+ * it for the dashboard, so a dashboard merge of an awaiting-merge row passes
+ * the same gate the desk holds a merge card behind. Reads only.
+ */
+export async function mergeGateNow(
+ github: GitHubPort,
+ map: RangerMapConfig,
+ prNumber: number,
+ token: string,
+ botIdentity: string,
+): Promise<MergeGateResult> {
+ const pr = await github.getPr(map.repo, prNumber, token);
+ if (pr.state !== "open" || pr.merged) return evaluateMergeGate(gateInput(map, pr, []));
+ const { last, probe } = headEvidence(await github.listComments(map.repo, prNumber, token), pr.headSha, botIdentity);
+ return evaluateMergeGate(gateInput(map, pr, await github.checkRunsFor(map.repo, pr.headSha, token), last, probe));
 }
 
 /** Rows the desk watches: awaiting a merge, or parked with a PR the principal may still merge. */
@@ -147,6 +202,11 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
     result.pending.push(row.nodeId);
     return;
    }
+   // Another desk pass (the tick's, or the dashboard's `merge-desk` after a
+   // merge) may have started the close while the PR was read: read the row
+   // again, so one merge spawns one close.
+   const now = journal.getWorker(row.nodeId, repo);
+   if (now === null || !watchedByMergeDesk(now)) return;
    // The resume-for-close: no LLM session, so it neither counts an attempt
    // nor touches the dead-man counter.
    const pid = await ctx.spawn(row.nodeId, repo, row.root);
@@ -173,16 +233,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    return;
   }
 
-  const comments = await github.listComments(repo, pr.number, token);
-  const reviews = recordedReviews(comments, botIdentity);
-  const last = reviewAtHead(reviews, pr.headSha);
-  // A clean round that set aside an older same-head major (node #106): the
-  // reviewer may have missed it, so auto-merge holds and the manual card
-  // names it for the principal to check before merging.
-  const superseded = supersededNote(reviews, pr.headSha);
-  const probe = recordedProbes(comments, botIdentity).find(
-   (p) => p.sha === pr.headSha && p.passed,
-  );
+  const { last, probe, superseded } = headEvidence(await github.listComments(repo, pr.number, token), pr.headSha, botIdentity);
   const probesRequired = map.commands.probe !== undefined;
 
   // Send a ready PR back to run-node when the rules it went ready under no
@@ -249,16 +300,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    result.resumed.push(row.nodeId);
    return;
   }
-  const gate = evaluateMergeGate({
-   pr,
-   checkRuns: await github.checkRunsFor(repo, pr.headSha, token),
-   expectedBase: map.base,
-   verdictSha: last?.sha ?? null,
-   verdictBlockers: last?.blockers ?? null,
-   verdictMajors: last?.majors ?? null,
-   probesRequired,
-   probePassedSha: probe?.sha ?? null,
-  });
+  const gate = evaluateMergeGate(gateInput(map, pr, await github.checkRunsFor(repo, pr.headSha, token), last, probe));
 
   // A CI-only park stays parked, quietly, until the whole gate passes.
   if (ciPark && gate.status !== "pass") return;

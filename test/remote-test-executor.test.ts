@@ -6,7 +6,8 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { runCmd } from "../src/exec.ts";
 import { stageSource } from "../src/remote-test/source.ts";
-import { CONTAINER_BOOTSTRAP_FLAGS, containerProgram, executeRemoteTest, podmanLauncher, type ExecutorLauncher } from "../src/remote-test/executor.ts";
+import { CONTAINER_BOOTSTRAP_FLAGS, containerProgram, executeRemoteTest, podmanLauncher, reconcileRemoteTests, type ExecutorLauncher } from "../src/remote-test/executor.ts";
+import { openJobLedger } from "../src/remote-test/job-ledger.ts";
 
 const roots: string[] = [];
 afterEach(async () => { for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
@@ -58,15 +59,120 @@ test("executor stores attributed observations and bounded logs before returning 
  expect(JSON.parse(await readFile(join(f.config.jobsRoot, ".artifacts", id, "receipt.json"), "utf8"))).toEqual(r);
  expect(await readFile(join(f.config.jobsRoot, ".artifacts", id, "test.log"), "utf8")).toBe("test");
  expect(r.evidence!.output.truncated).toBe(true);
- const calls = f.calls.length; await expect(f.execute()).rejects.toThrow("already exists"); expect(f.calls.length).toBe(calls);
+ const calls = f.calls.length; expect(await f.execute()).toEqual(r); expect(f.calls.length).toBe(calls);
 });
 test("executor storage failure and invalid clock cannot expose passed", async () => {
  const f = await fixture();
  await expect(f.execute({ artifactFault: () => { throw Error("storage failure"); } })).rejects.toThrow();
  expect(await stat(join(f.config.jobsRoot, ".artifacts", id)).catch(() => null)).toBeNull();
+ const ledger = await openJobLedger(f.config.jobsRoot, f.config.executorId);
+ try { expect(ledger.status(f.job)?.kind).toBe("interrupted"); expect(() => ledger.admit(f.job)).toThrow("recovery fence"); } finally { ledger.close(); }
  const g = await fixture(); let clock = Date.now();
  await expect(g.execute({ now: () => clock-- })).rejects.toThrow("durationMs");
  expect(await stat(join(g.config.jobsRoot, ".artifacts", id)).catch(() => null)).toBeNull();
+});
+test("concurrent executor duplicates report active and only one launches; completed duplicates replay after artifact retention", async () => {
+ const f = await fixture();
+ let release!: () => void;
+ const ready = new Promise<void>(resolve => { release = resolve; });
+ let atStart!: () => void; const started = new Promise<void>(resolve => { atStart = resolve; });
+ const launcher: ExecutorLauncher = async (args, options) => {
+  if (args[1] === "start") { atStart(); await ready; }
+  return f.launcher(args, options);
+ };
+ const first = f.execute({ launcher }); await started;
+ await expect(f.execute()).rejects.toThrow("active");
+ const nextJob = { ...f.job, jobId: "7c7e8091-1234-4234-8234-123456789abc", correlationId: "7c7e8091-1234-4234-8234-123456789abc" };
+ await expect(executeRemoteTest({ job: nextJob, bundlePath: f.source.bundlePath, config: f.config }, { launcher: f.launcher, uid: 1000, gid: 1000 })).rejects.toThrow("busy");
+ const ledger = await openJobLedger(f.config.jobsRoot, f.config.executorId);
+ try { expect(ledger.status(nextJob)).toBeNull(); } finally { ledger.close(); }
+ release(); const receipt = await first;
+ expect(f.calls.filter(c => c[1] === "create")).toHaveLength(1);
+ await rm(join(f.config.jobsRoot, ".artifacts", id), { recursive: true });
+ const count = f.calls.length; expect(await f.execute()).toEqual(receipt); expect(f.calls.length).toBe(count);
+ const reopened = await openJobLedger(f.config.jobsRoot, f.config.executorId);
+ try { expect(reopened.admit(nextJob).kind).toBe("admitted"); } finally { reopened.close(); }
+});
+test("rowless passed evidence is retained as revoked without execution or a global recovery fence", async () => {
+ const f = await fixture(), receipt = await f.execute();
+ await rm(join(f.config.jobsRoot, ".execution"), { recursive: true }); // A previous producer left only its private artifact.
+ const count = f.calls.length;
+ await expect(f.execute()).rejects.toThrow("revoked"); expect(f.calls.length).toBe(count);
+ await rm(join(f.config.jobsRoot, ".artifacts", id), { recursive: true });
+ await expect(f.execute()).rejects.toThrow("revoked"); expect(f.calls.length).toBe(count);
+ const ledger = await openJobLedger(f.config.jobsRoot, f.config.executorId);
+ try {
+  expect(ledger.status(f.job)).toEqual({ kind: "revoked", receipt });
+  expect(ledger.admit({ ...f.job, jobId: "7c7e8091-1234-4234-8234-123456789abc", correlationId: "7c7e8091-1234-4234-8234-123456789abc" }).kind).toBe("admitted");
+ } finally { ledger.close(); }
+});
+test("an interrupted publication never adopts loose passed evidence and terminates after the retry allowance", async () => {
+ const f = await fixture(), historical = await f.execute();
+ const artifact = join(f.config.jobsRoot, ".artifacts", id, "receipt.json");
+ // Model the durable boundary: artifact bytes exist, but the attempt never
+ // committed a terminal ledger receipt before process death.
+ await rm(join(f.config.jobsRoot, ".execution"), { recursive: true });
+ const ledger = await openJobLedger(f.config.jobsRoot, f.config.executorId);
+ try {
+  ledger.admit(f.job);
+  const launcher: ExecutorLauncher = async () => ({ code: 0, stdout: "" });
+  await reconcileRemoteTests(f.config, { launcher });
+  const count = f.calls.length;
+  await expect(f.execute()).rejects.toThrow("receipt already exists");
+  expect(ledger.status(f.job)).toEqual({ kind: "interrupted", attempt: 2 });
+  expect(() => ledger.admit(f.job)).toThrow("recovery fence");
+  await reconcileRemoteTests(f.config, { launcher });
+  const final = await f.execute(); expect(final.status).toBe("infra_failed");
+  expect(f.calls.length).toBe(count);
+  expect(JSON.parse(await readFile(artifact, "utf8"))).toEqual(historical);
+ } finally { ledger.close(); }
+});
+test("durable cancellation before start and during artifact publication never exposes success", async () => {
+ for (const duringStorage of [false, true]) {
+  const f = await fixture(), ledger = await openJobLedger(f.config.jobsRoot, f.config.executorId);
+  try {
+   const launcher: ExecutorLauncher = async (args, options) => {
+    const result = await f.launcher(args, options);
+    if (!duringStorage && args[1] === "inspect" && !f.calls.some(c => c[1] === "start")) ledger.cancel(f.job);
+    return result;
+   };
+   const receipt = await f.execute({ launcher, artifactFault: (step: string) => { if (duringStorage && step === "publish") ledger.cancel(f.job); } });
+   expect(receipt.status).toBe("cancelled");
+   if (!duringStorage) expect(f.calls.some(c => c[1] === "start")).toBe(false);
+   expect((await f.execute()).status).toBe("cancelled");
+  } finally { ledger.close(); }
+ }
+});
+test("recovery adapter removes only labelled ledger containers and safely clears the interrupted workspace", async () => {
+ const f = await fixture(), ledger = await openJobLedger(f.config.jobsRoot, f.config.executorId);
+ const admitted = ledger.admit(f.job); if (admitted.kind !== "admitted") throw Error();
+ ledger.launch(f.job, admitted.token);
+ const lane = join(f.config.jobsRoot, ".executor-lane"); await mkdir(lane, { mode: 0o700 });
+ await writeFile(join(lane, "owner.json"), JSON.stringify({ ledgerId: ledger.id, jobId: id, token: admitted.token }), { mode: 0o600 });
+ let present = true; const calls: string[][] = [];
+ const launcher: ExecutorLauncher = async argv => {
+  calls.push([...argv]);
+  if (argv[1] === "ps") return { code: 0, stdout: present ? "a".repeat(64) + "\n" : "" };
+  if (argv[1] === "inspect") return { code: 0, stdout: JSON.stringify([{ Id: "a".repeat(64), Config: { Labels: { "ranger.remote-test.ledger": ledger.id, "ranger.remote-test.job": id, "ranger.remote-test.attempt": admitted.token } } }]) };
+  if (argv[1] === "rm") { present = false; return { code: 0, stdout: "" }; }
+  throw Error("Unexpected command");
+ };
+ try {
+  await reconcileRemoteTests(f.config, { launcher });
+  expect(calls.find(c => c[1] === "ps")).toContain(`label=ranger.remote-test.ledger=${ledger.id}`);
+  expect(calls.filter(c => c[1] === "rm")).toHaveLength(1);
+  expect(await stat(lane).catch(() => null)).toBeNull();
+  const receipt = await f.execute(); expect(receipt.status).toBe("passed");
+ } finally { ledger.close(); }
+});
+test("recovery refuses a retained lane without owner metadata and preserves admission fence", async () => {
+ const f = await fixture(), ledger = await openJobLedger(f.config.jobsRoot, f.config.executorId);
+ try {
+  ledger.admit(f.job);
+  const lane = join(f.config.jobsRoot, ".executor-lane"); await mkdir(lane, { mode: 0o700 });
+  await expect(reconcileRemoteTests(f.config, { launcher: async () => ({ code: 0, stdout: "" }) })).rejects.toThrow();
+  expect(await stat(lane)).toBeDefined(); expect(() => ledger.admit(f.job)).toThrow("recovery fence");
+ } finally { ledger.close(); }
 });
 test("failed lane removal persists infra_failed and retains the lane before exposing a terminal result", async () => {
  const f = await fixture();
@@ -89,7 +195,7 @@ test("distinguishes nonzero test exits including 125 from OOM", async () => {
  for (const [code, oom, expected] of [[125, false, "test_failed"], [137, true, "infra_failed"]] as const) { const f = await fixture(); f.setExit(code, oom); expect((await f.execute()).status).toBe(expected); }
 });
 test("refuses expired jobs and unsupported controllers before creating containers", async () => {
- const f = await fixture(); f.job.deadline = Date.now() - 1; expect((await f.execute()).status).toBe("rejected"); expect(f.calls).toHaveLength(0);
+ const f = await fixture(); f.job.deadline = Date.now() - 1; expect((await f.execute()).status).toBe("timed_out"); expect(f.calls).toHaveLength(0);
  const g = await fixture(); g.controllers(["cpu", "memory"]); expect((await g.execute()).status).toBe("rejected"); expect(g.calls.some(c => c[1] === "create")).toBe(false);
 });
 test("rejects profile and bundle identity mismatches without executing source", async () => {
@@ -187,23 +293,23 @@ test("neutral bootstrap does not load job Bun preloads or .env before controller
 });
 test("deadline rounding never disables the independent conmon timeout", async () => {
  const f = await fixture(); const base = Date.now(); f.job.deadline = base + 600_000;
- let staged = false, ticks = 0;
+ let staged = false;
  const launcher: ExecutorLauncher = async (argv, options) => {
   const result = await f.launcher(argv, options); if (argv[1] === "image") staged = true; return result;
  };
- await f.execute({ launcher, now: () => staged ? base + 599_000 + ticks++ : base });
+ await f.execute({ launcher, now: () => staged ? base + 599_000 : base });
  const create = f.calls.find(c => c[1] === "create")!; expect(create).toBeDefined();
  expect(Number(create.find(a => a.startsWith("--timeout="))!.split("=")[1])).toBeGreaterThan(0);
 });
 test("does not overwrite an occupied lane or falsely pass failed teardown", async () => {
- const f = await fixture(); await mkdir(join(f.config.jobsRoot, ".executor-lane")); expect((await f.execute()).status).toBe("rejected"); expect(f.calls).toHaveLength(0);
+ const f = await fixture(); await mkdir(join(f.config.jobsRoot, ".executor-lane")); await expect(f.execute()).rejects.toThrow("interrupted"); expect(f.calls).toHaveLength(0);
  const g = await fixture(); g.cleanupFail(); expect((await g.execute()).status).toBe("infra_failed");
  expect(await readFile(join(g.root, "jobs", id, "checkout", "bun.lock"), "utf8")).toBe("reviewed-lock\n");
  expect(await stat(join(g.config.jobsRoot, ".executor-lane"))).toBeDefined();
- await expect(g.execute()).rejects.toThrow("already exists");
+ expect((await g.execute()).status).toBe("infra_failed");
  const calls = g.calls.length;
  const nextJob = { ...g.job, jobId: "7c7e8091-1234-4234-8234-123456789abc", generation: 2 };
- expect((await executeRemoteTest({ job: nextJob, bundlePath: g.source.bundlePath, config: g.config }, { launcher: g.launcher, uid: 1000, gid: 1000 })).status).toBe("rejected");
+ await expect(executeRemoteTest({ job: nextJob, bundlePath: g.source.bundlePath, config: g.config }, { launcher: g.launcher, uid: 1000, gid: 1000 })).rejects.toThrow("interrupted");
  expect(g.calls.length).toBe(calls);
 });
 test("Podman launcher drains attached stderr separately from terminal stdout", async () => {

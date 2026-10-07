@@ -45,7 +45,7 @@ export function parseFailedChecks(stdout: string): Map<string, FailedProbeRun> {
  const out = new Map<string, FailedProbeRun>();
  let current: FailedProbeRun | null = null;
  for (const line of stdout.split("\n")) {
-  const header = /^(ok|FAIL|warn) +([\w.-]+\.m?js) \([^)]*\)(?: exit=-?\d+ (\w+))?/.exec(line);
+  const header = /^(ok|FAIL|warn) +([\w.-]+\.m?js) \([^)]*\)(?: exit=(?:-?\d+|killed:[\w]+) (\w+))?/.exec(line);
   if (header !== null) {
    current = null;
    if (header[1] === "FAIL" && PROBE_FILE.test(header[2])) {
@@ -110,6 +110,38 @@ export const REVIEW_CAP_HEAD_MOVED_OUTCOME = /^review cap reached: \d+ sage roun
 
 export const REVIEW_CAP_OUTCOME = /^(?:\d+ blocker\(s\) and \d+ major\(s\) remain after \d+ sage round\(s\)|review cap reached: )/;
 
+export type ProbeFailureClass = "infrastructure" | "assertion" | "unknown";
+
+/** Classify all attempts: a timeout must not erase an earlier assertion. */
+export function probeFailureClass(runs: readonly { code: number; stdout: string; stderr: string }[]): ProbeFailureClass {
+ const failed = runs.filter((run) => run.code !== 0);
+ if (failed.length === 0) return "unknown";
+ const kinds = failed.flatMap((run) => [...parseFailedChecks(run.stdout).values()]);
+ if (kinds.some((run) => run.kind === "assert" || run.kind === "pageerror" || run.checks.size > 0) ||
+  failed.some((run) => /(?:^\s*│\s*FAIL\s|^(?:PAGEERROR|SHADERERROR) |failed by kind:.*\b(?:assert|pageerror) \d+)/m.test(run.stdout))) {
+  return "assertion";
+ }
+ return failed.every((run) => {
+  if (run.code < 0 || (run.code >= 129 && run.code <= 192)) return true;
+  const failures = [...parseFailedChecks(run.stdout).values()];
+  return failures.length > 0 && failures.every((failure) => failure.kind === "crash" || failure.kind === "killed");
+ }) ? "infrastructure" : "unknown";
+}
+
+/** Explicit classes survive outcome truncation. Legacy signal-only parks can retry. */
+export function infrastructureProbeHead(outcome: string): string | null {
+ const head = /^browser probes failed twice at ([0-9a-f]{8}) on PR #\d+ \(exit (-?\d+)\)/.exec(outcome);
+ if (head === null) return null;
+ const classification = /^probe failure class: (\w+)$/m.exec(outcome)?.[1];
+ if (classification !== undefined) {
+  if (classification !== "infrastructure") return null;
+  const fullHead = /^probe failure head: ([0-9a-f]{40})$/m.exec(outcome)?.[1];
+  return fullHead?.startsWith(head[1]) ? fullHead : null;
+ }
+ const code = Number(head[2]);
+ return parseFailedProbes(outcome).length === 0 && (code < 0 || (code >= 129 && code <= 192)) ? head[1] : null;
+}
+
 /**
  * The probe tier failed twice. The failed names go on their own `FAILED:`
  * line ahead of the output's tail: the journal keeps 400 characters of an
@@ -120,6 +152,7 @@ export function probesFailedOutcome(r: {
  pr: number;
  exit: number;
  failed: string[];
+ failureClass?: ProbeFailureClass;
  /** The failed probes that fail at the merge base too (the rest are this branch's). */
  redOnBase?: string[];
  /** `probeFailureSummary` of the run: each failed probe's kind and checks, ahead of the tail. */
@@ -131,6 +164,8 @@ export function probesFailedOutcome(r: {
  const summary = r.summary ?? [];
  return [
   `browser probes failed twice at ${r.sha.slice(0, 8)} on PR #${r.pr} (exit ${r.exit})`,
+  ...(r.failureClass === undefined ? [] : [`probe failure class: ${r.failureClass}`]),
+  ...(r.failureClass === undefined ? [] : [`probe failure head: ${r.sha}`]),
   ...(names.length > 0 ? [`FAILED: ${names.join(" · ")}`] : []),
   ...(onBase.length > 0 ? [`red on the merge base too: ${onBase.join(" · ")}`] : []),
   // After the names and the base line, and capped: the row keeps 400 characters of the outcome.

@@ -143,6 +143,38 @@ describe("#37 — the state the dashboard shows", () => {
   expect(bare.grillings[0].why).toMatch(/localCheckout/);
  });
 
+ test("decisions are the escalated nodes that are not grillings: approve tasks, decisions, prototypes", () => {
+  const frontier = [...FRONTIER, entry("20", "task", "approve"), entry("21", "decision"), entry("22", "prototype"), entry("23", "task", "auto")];
+  const map = assembleState(inputs({ reports: new Map([[walked.key, report(frontier)]]) })).maps[0];
+  expect(map.decisions.map((d) => [d.id, d.kind, d.autonomy])).toEqual([
+   ["20", "task", "approve"],
+   ["21", "decision", "propose"],
+   ["22", "prototype", "propose"],
+  ]);
+  expect(map.decisions[0].reason).toMatch(/approve/);
+  // Walkable work and grillings are listed elsewhere, never twice.
+  expect(map.autonomous.map((n) => n.id)).toEqual(["10", "11", "14", "23"]);
+  expect(map.grillings.map((g) => g.id)).toEqual(["12", "13"]);
+ });
+
+ test("the queue behind next is the rest of the implement nodes in walk order, vetoed ones left out", () => {
+  const frontier = [entry("30", "task"), entry("31", "task"), entry("32", "build"), entry("33", "task")];
+  const map = assembleState(
+   inputs({ reports: new Map([[walked.key, report(frontier)]]), vetoed: (id) => id === "32" }),
+  ).maps[0];
+  expect(map.next.nodeId).toBe("30");
+  expect(map.queued.map((n) => n.id)).toEqual(["31", "33"]);
+  // While the lane is held, next is the node that waits for it; the queue still follows it.
+  const held = assembleState(
+   inputs({
+    reports: new Map([[walked.key, report(frontier)]]),
+    laneHolders: { visual: null, headless: worker({ repo: "acme/other", nodeId: "99", status: "running" }) },
+   }),
+  ).maps[0];
+  expect([held.next.nodeId, held.next.waiting]).toEqual(["30", true]);
+  expect(held.queued.map((n) => n.id)).toEqual(["31", "32", "33"]);
+ });
+
  test("next is what the tick would take: the same selection walk makes", () => {
   const frontier = classified(FRONTIER, ["11"]);
   const tick = selectCandidates(frontier, false);
@@ -155,6 +187,12 @@ describe("#37 — the state the dashboard shows", () => {
   const body = page.slice(page.indexOf("<script>") + "<script>".length, page.indexOf("</script>"));
   expect(body.length).toBeGreaterThan(0);
   expect(() => new Function(body)).not.toThrow();
+ });
+
+ test("an awaiting-merge job offers Merge now, wired to the guarded merge action", () => {
+  const page = renderPage("tok");
+  expect(page).toContain('mergeButton(waiting, "Merge now")');
+  expect(page).toContain('act("merge", n, { sha: merge.headSha })');
  });
 
  test("serve imports no graph write, directly or through another module", () => {
@@ -300,10 +338,10 @@ describe("#37 — the state the dashboard shows", () => {
   expect(map.next.reason).toMatch(/not walked/);
  });
 
- test("the current job carries its title; a dead pid reads stale", () => {
+ test("the current job carries its title and map; a dead pid reads stale", () => {
   const live = assembleState(inputs({ workers: [worker({})] })).current;
   expect(live).toHaveLength(1);
-  expect(live[0]).toMatchObject({ nodeId: "50", title: "the running one", stale: false });
+  expect(live[0]).toMatchObject({ root: 1, nodeId: "50", title: "the running one", stale: false });
   const dead = assembleState(
    inputs({ workers: [worker({})], pidAlive: () => false }),
   ).current[0];

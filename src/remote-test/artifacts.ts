@@ -4,7 +4,7 @@ import { link, lstat, mkdir, open, readdir, rename, rm } from "node:fs/promises"
 import { dirname, join } from "node:path";
 import { z } from "zod";
 import { privateOperatorPath } from "./baseline.ts";
-import { validateRemoteTestReceipt, type RemoteTestReceipt, type ResourceObservation } from "./contract.ts";
+import { validateRemoteTestReceipt, type RemoteTestJob, type RemoteTestReceipt, type ResourceObservation } from "./contract.ts";
 
 export const ARTIFACT_DEFAULTS = { retentionMs: 7 * 24 * 60 * 60 * 1000, maxArtifactBytes: 10 * 1024 ** 3, maxLogBytes: 1024 ** 2 } as const;
 export const ArtifactPolicySchema = z.object({
@@ -69,6 +69,23 @@ async function readReceipt(path: string): Promise<RemoteTestReceipt> {
   const value = JSON.parse(await file.readFile("utf8"));
   return validateRemoteTestReceipt(value, value.identity);
  } finally { await file.close(); }
+}
+export class InvalidStoredRemoteTestReceipt extends Error {}
+/** Bounded, private legacy/artifact lookup; never infers current eligibility. */
+export async function readExecutionReceipt(jobsRoot: string, job: RemoteTestJob, executorId: string): Promise<RemoteTestReceipt | null> {
+ try {
+  const store = join(jobsRoot, ".artifacts"), directory = join(store, job.jobId);
+  await privateDirectory(store); await privateDirectory(directory);
+  const file = await open(join(directory, "receipt.json"), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+   const info = await file.stat();
+   if (!info.isFile() || info.uid !== process.getuid?.() || (info.mode & 0o077) || info.size > 65_536) throw Error("Invalid private receipt");
+   try {
+    const receipt = validateRemoteTestReceipt(JSON.parse(await file.readFile("utf8")), job);
+    if (receipt.executorId !== executorId) throw Error("Receipt producer mismatch"); return receipt;
+   } catch { throw new InvalidStoredRemoteTestReceipt("Invalid stored receipt"); }
+  } finally { await file.close(); }
+ } catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return null; throw e; }
 }
 
 /** One private store, serialized publication/GC, immutable UUID directories.

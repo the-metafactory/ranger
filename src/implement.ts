@@ -30,6 +30,7 @@ import {
  type FailedProbeRun,
  parseFailedProbes,
  probeFailureSummary,
+ probeFailureClass,
  baseConflictOutcome,
  policyBlockedOutcome,
  probesFailedOutcome,
@@ -369,6 +370,7 @@ async function probeFinalHead(
  await awaitQuietHost(ctx, "probe run 1");
  const logFailuresBefore = logFailureCount(ctx);
  let result = await runShell(command, worktree, ctx, { label: "probe run 1", timeoutMs, priority: "probe" });
+ const runs = [result];
  let attempts = 1;
  let ranCommand = command;
  // The record names the selection of the first run: a narrowed retry selects only the failures.
@@ -396,6 +398,7 @@ async function probeFinalHead(
   journal.recordEvent("reviewed", { nodeId, repo, detail: `probe run 1 failed (exit ${result.code}) — retrying ${what}`.slice(0, 400) });
   await awaitQuietHost(ctx, "the probe retry");
   result = await runShell(ranCommand, worktree, ctx, { label: "probe run 2 (the retry)", timeoutMs, priority: "probe" });
+  runs.push(result);
   attempts = 2;
  }
  const failed = result.code > 0 ? parseFailedProbes(result.stdout) : [];
@@ -429,6 +432,7 @@ async function probeFinalHead(
     pr: prNumber,
     exit: result.code,
     failed,
+    failureClass: probeFailureClass(runs),
     redOnBase: base?.red ?? [],
     summary: failing,
     tail: tail(result),

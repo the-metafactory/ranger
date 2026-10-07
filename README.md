@@ -61,6 +61,18 @@ An entry whose node or PR cannot be validated is removed with the error as its
 reason; requeue it after correcting the error. Credential/execution-gated maps
 retain entries and report the gate failure without reserving shared capacity.
 
+Parked infrastructure probe failures automatically requeue on the next `walk`
+when their lane is free, oldest first across maps. They take priority over
+crash respawns, merge-desk send-backs and fresh implement claims. The running
+worker is never interrupted. `workers.probeRequeues` bounds automatic requeues
+per node/head (default 2; 0 disables them); the count survives restarts. A failed
+child spawn keeps its place without spending a retry. Pause, veto, walk mode,
+map skip/allowlists and existing review/merge gates still apply. Assertion,
+page-error and unknown failures remain parked for investigation; a timeout
+cannot erase an assertion from the preceding probe attempt. Legacy parks
+without a failure class retry only when their outcome records a signal/timeout
+and no named probe failure. Operator `resume-node` remains available afterwards.
+
 Journal upgrades run through `openJournal`, which seeds the root inputs required
 by `drizzle/0009_worker-root.sql` before applying migrations. A legacy repo with
 one registered map inherits that root. For multiple maps or a deregistered repo,
