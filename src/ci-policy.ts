@@ -1,6 +1,6 @@
 import type { CiVerdict } from "./forge.ts";
 
-/** Lanes consume a verdict; only the adapter interprets forge CI records. */
+/** The merge gate consumes a neutral verdict already classified by the adapter. */
 export function classifyCi(ci: CiVerdict):
  | { status: "pass"; runId: number }
  | { status: "fail" | "pending"; reason: string } {

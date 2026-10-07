@@ -43,7 +43,7 @@ function setup(opts: { runs?: CheckRun[][]; workflows?: WorkflowRun[][]; statuse
    expect(token).toBe("machine");
    expect(purpose).toBe("research");
    queried.push(sha);
-   return githubCiVerdict(nextRuns(), purpose, nextWorkflows(), nextStatuses());
+   return githubCiVerdict(_repo, nextRuns(), purpose, nextWorkflows(), nextStatuses());
   },
  };
  const input: Parameters<typeof researchCi>[0] = {

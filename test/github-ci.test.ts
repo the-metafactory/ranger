@@ -37,6 +37,14 @@ test("check runs include failures on later REST pages", async () => {
  expect(JSON.parse(r.stdout)[1].conclusion).toBe("failure");
 });
 
+test("the GitHub port includes the cited run URL in a green verdict", async () => {
+ const r = await readCi("ciVerdictFor", [
+  { check_runs: [{ id: 17, name: "test", status: "completed", conclusion: "success" }] },
+ ]);
+ expect(r.code).toBe(0);
+ expect(JSON.parse(r.stdout)).toMatchObject({ state: "green", runId: 17, runUrl: "https://github.com/acme/widgets/runs/17" });
+});
+
 test("commit statuses include pending external CI on later pages", async () => {
  const r = await readCi("commitStatusesFor", [
   { statuses: [{ id: 1, context: "test", state: "success" }] },

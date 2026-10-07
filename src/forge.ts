@@ -21,7 +21,7 @@ export interface ChangeRequest {
 /** Preserve each lane's existing evidence policy at the adapter boundary. */
 export type CiPurpose = "merge" | "close" | "research";
 export type CiVerdict =
- | { state: "green"; runId: number; runName: string; snapshot: string }
+ | { state: "green"; runId: number; runUrl: string; runName: string; snapshot: string }
  | { state: "red" | "pending"; reason: string };
 
 export interface IssueComment {

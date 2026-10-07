@@ -1443,7 +1443,7 @@ async function closeAfterMerge(
  const resolutionFile = join(tmpdir(), `ranger-close-${fileStemFor(repo, nodeId)}.md`);
  writeFileSync(resolutionFile, resolution, "utf8");
 
- const prRef = `https://github.com/${repo}/pull/${pr.iid}`;
+ const prRef = pr.webUrl;
  const evidence: { kind: string; summary: string; pointer: string }[] = [];
  if (final !== undefined) {
   evidence.push({
@@ -1458,7 +1458,7 @@ async function closeAfterMerge(
   evidence.push({
    kind: "tested",
    summary: `CI check run ${success.runName} succeeded at ${pr.headSha.slice(0, 8)}; ${ratificationText(ctx, pr)}`,
-   pointer: `https://github.com/${repo}/runs/${success.runId}`,
+   pointer: success.runUrl,
   });
  }
 

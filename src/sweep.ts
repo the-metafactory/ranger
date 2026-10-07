@@ -5,7 +5,7 @@ import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import type { Journal } from "./journal.ts";
 import { killProcessGroup, pidAlive, processGroupCommands } from "./exec.ts";
 import { graphRelease } from "./graph-write.ts";
-import type { ForgePort } from "./implement.ts";
+import type { ForgePort } from "./forge.ts";
 import {
  runMergeDesk,
  watchedByMergeDesk,

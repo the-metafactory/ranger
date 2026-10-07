@@ -13,11 +13,10 @@ import {
  recordedReviews,
  reviewAtHead,
  supersededNote,
- type ForgePort,
 } from "./implement.ts";
 import type { Journal, WorkerRow } from "./journal.ts";
 import { evaluateMergeGate, type MergeGateInput, type MergeGateResult } from "./merge-gate.ts";
-import type { IssueComment, ChangeRequest, CiVerdict } from "./forge.ts";
+import type { IssueComment, ChangeRequest, CiVerdict, ForgePort } from "./forge.ts";
 import { CI_FAILED_PARK_OUTCOME, mergeGateFailedOutcome } from "./outcomes.ts";
 
 /**

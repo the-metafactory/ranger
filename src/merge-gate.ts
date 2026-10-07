@@ -68,10 +68,10 @@ export function evaluateMergeGate(input: MergeGateInput): MergeGateResult {
  }
 
  if (["unknown", "blocked", "needs-rebase"].includes(pr.mergeState)) {
-  return { status: "fail", check: "mergeable", reason: `merge state is ${pr.mergeState}` };
+  return { status: "fail", check: "mergeable", reason: `merge state is ${pr.mergeState}${pr.mergeDetail ? ` (${pr.mergeDetail})` : ""}` };
  }
 
- // 1. CI green on the live head, by the shared policy (`ci-policy.ts`).
+ // 1. CI green on the live head, from the adapter's forge-neutral verdict.
  const ci = classifyCi(input.ci);
  if (ci.status !== "pass") return { status: ci.status, check: "ci-green", reason: ci.reason };
 

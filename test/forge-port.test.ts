@@ -13,7 +13,7 @@ import { loadConfig } from "../src/config.ts";
 import { baseConfigLines } from "./support.ts";
 
 const SHA = "a".repeat(40);
-const GREEN: CiVerdict = { state: "green", runId: 17, runName: "test", snapshot: "stable" };
+const GREEN: CiVerdict = { state: "green", runId: 17, runUrl: "https://example.test/jobs/17", runName: "test", snapshot: "stable" };
 const PR: ChangeRequest = {
  iid: 7, state: "open", draft: false, headRef: "node/121", headSha: SHA,
  baseRef: "main", mergeState: "mergeable", webUrl: "https://example.test/change/7",
@@ -87,12 +87,16 @@ test("GitHub CI classification order and the close citation policy stay unchange
  const success = { id: 17, name: "test", status: "completed", conclusion: "success" };
  const failed = { ...success, id: 18, conclusion: "failure" };
  const running = { ...success, id: 19, status: "queued", conclusion: null };
- expect(githubCiVerdict([failed, running]).state).toBe("pending");
- expect(githubCiVerdict([failed, running], "research").state).toBe("red");
- expect(githubCiVerdict([success, failed], "close")).toMatchObject({ state: "green", runId: 17 });
- expect(githubCiVerdict([success, failed], "merge").state).toBe("red");
- expect(githubCiVerdict([success, { ...success, conclusion: "neutral" }, { ...success, conclusion: "skipped" }]))
+ expect(githubCiVerdict("acme/widgets", [failed, running]).state).toBe("pending");
+ expect(githubCiVerdict("acme/widgets", [failed, running], "research").state).toBe("red");
+ expect(githubCiVerdict("acme/widgets", [success, failed], "close")).toMatchObject({ state: "green", runId: 17 });
+ expect(githubCiVerdict("acme/widgets", [success, failed], "merge").state).toBe("red");
+ expect(githubCiVerdict("acme/widgets", [success, { ...success, conclusion: "neutral" }, { ...success, conclusion: "skipped" }]))
   .toMatchObject({ state: "green", runId: 17 });
+ for (const purpose of ["merge", "close", "research"] as const) {
+  expect(githubCiVerdict("acme/widgets", [success], purpose))
+   .toMatchObject({ state: "green", runId: 17, runUrl: "https://github.com/acme/widgets/runs/17" });
+ }
 });
 
 test("real GitHub getPr maps an unfamiliar mergeable_state before the gate runs", async () => {
@@ -112,6 +116,6 @@ console.log(JSON.stringify(await getPr("acme/widgets", 7, "machine")));
   expect(pr).not.toHaveProperty("mergeableState");
   expect(pr).not.toHaveProperty("mergeable");
   expect(evaluateMergeGate({ pr, ci: GREEN, expectedBase: "main", verdictSha: SHA, verdictBlockers: 0 }))
-   .toEqual({ status: "fail", check: "mergeable", reason: "merge state is unknown" });
+   .toEqual({ status: "fail", check: "mergeable", reason: "merge state is unknown (mergeable=true, state=future-github-state)" });
  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

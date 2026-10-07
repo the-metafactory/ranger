@@ -121,7 +121,7 @@ class FakeGitHub implements ForgePort {
   if (stored) stored.draft = false;
  }
  async ciVerdictFor(_repo: string, _sha: string, _token: string, purpose?: CiPurpose) {
-  return githubCiVerdict(this.checkRuns, purpose);
+  return githubCiVerdict(_repo, this.checkRuns, purpose);
  }
  async postComment(_repo: string, n: number, body: string) {
   const list = this.comments.get(n) ?? [];
@@ -837,9 +837,36 @@ describe("implement lane (node #23)", () => {
   const s = state(r.statePath);
   expect(s.lastClose.ci).toBe("");
   expect(s.lastClose.evidence.map((e: { kind: string }) => e.kind)).toEqual(["judged", "tested"]);
+  expect(s.lastClose.evidence.map((e: { pointer: string }) => e.pointer)).toEqual([
+   "https://github.com/acme/widgets/pull/1", "https://github.com/acme/widgets/runs/101",
+  ]);
   const kinds = r.journal.listEvents("acme/widgets", 500).map((e) => e.kind);
   expect(kinds.filter((k) => k === "decisions-written")).toHaveLength(1);
   expect(kinds).not.toContain("decisions-failed");
+ }, 60_000);
+
+ test("propose close cites the forge's change-request and CI URLs", async () => {
+  const r = await rig({ autonomy: "propose" });
+  cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  await r.github.merge(1);
+  const changeUrl = "https://forge.example/group/widgets/changes/1";
+  const runUrl = "https://forge.example/group/widgets/jobs/101";
+  const getPr = r.github.getPr.bind(r.github);
+  const getCi = r.github.ciVerdictFor.bind(r.github);
+  const prSpy = spyOn(r.github, "getPr").mockImplementation(async (...args) => ({ ...await getPr(...args), webUrl: changeUrl }));
+  const ciSpy = spyOn(r.github, "ciVerdictFor").mockImplementation(async (...args) => {
+   const ci = await getCi(...args);
+   return ci.state === "green" ? { ...ci, runUrl } : ci;
+  });
+  try {
+   r.journal.updateWorker("20", "acme/widgets", { status: "running" });
+   expect((await runNode("20", r.ctx)).status).toBe("success");
+   expect(state(r.statePath).lastClose.evidence.map((e: { pointer: string }) => e.pointer)).toEqual([changeUrl, runUrl]);
+  } finally {
+   prSpy.mockRestore();
+   ciSpy.mockRestore();
+  }
  }, 60_000);
 
  test("a failed decisions write after the close records decisions-failed only, and the close still succeeds (node #108)", async () => {

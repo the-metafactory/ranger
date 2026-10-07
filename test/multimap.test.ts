@@ -104,7 +104,7 @@ function conflictingPrForge(): ForgePort {
   listComments: async () => [
    { id: 1, author: "ivy-bot", body: `<!-- ranger:review round=5 sha=${head} blockers=0 majors=0 nits=1 -->\nclean` },
   ],
-  ciVerdictFor: async () => githubCiVerdict([]),
+  ciVerdictFor: async () => githubCiVerdict("acme/widgets", []),
   issueLabels: async () => [],
  } as unknown as ForgePort;
 }

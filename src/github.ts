@@ -359,9 +359,9 @@ export function githubMergeState(mergeable: unknown, state: unknown): MergeState
 }
 
 export async function ciVerdictFor(repo: string, sha: string, token: string, purpose: CiPurpose = "merge"): Promise<CiVerdict> {
- if (purpose !== "research") return githubCiVerdict(await checkRunsFor(repo, sha, token), purpose);
+ if (purpose !== "research") return githubCiVerdict(repo, await checkRunsFor(repo, sha, token), purpose);
  const [runs, workflows, statuses] = await Promise.all([
   checkRunsFor(repo, sha, token), workflowRunsFor(repo, sha, token), commitStatusesFor(repo, sha, token),
  ]);
- return githubCiVerdict(runs, purpose, workflows, statuses);
+ return githubCiVerdict(repo, runs, purpose, workflows, statuses);
 }

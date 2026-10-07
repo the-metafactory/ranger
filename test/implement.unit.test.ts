@@ -53,7 +53,7 @@ const GREEN: CheckRun[] = [{ id: 9, name: "build", status: "completed", conclusi
 function gate(over: Partial<Parameters<typeof evaluateMergeGate>[0]> & { checkRuns?: CheckRun[] } = {}) {
  return evaluateMergeGate({
   pr: pr(),
-  ci: githubCiVerdict(over.checkRuns ?? GREEN),
+  ci: githubCiVerdict("acme/widgets", over.checkRuns ?? GREEN),
   expectedBase: "main",
   verdictSha: SHA,
   verdictBlockers: 0,

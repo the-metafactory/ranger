@@ -46,7 +46,7 @@ function fakeGitHub(opts: { head?: string; comments: IssueComment[]; ci: CheckRu
    } satisfies ChangeRequest;
   },
   listComments: async () => { calls.push("listComments"); return opts.comments; },
-  ciVerdictFor: async () => { calls.push("ciVerdictFor"); return githubCiVerdict(opts.ci); },
+  ciVerdictFor: async (repo) => { calls.push("ciVerdictFor"); return githubCiVerdict(repo, opts.ci); },
   issueLabels: async () => { calls.push("issueLabels"); return opts.labels ?? []; },
   mergePr: async (_repo, n, sha) => { calls.push("mergePr"); merges.push({ n, sha }); },
  };
