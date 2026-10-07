@@ -395,7 +395,7 @@ describe("node #54 — the entries", () => {
   expect(why(greenPr({ ci: "pending" }))).toMatch(/CI is pending/);
   expect(why(greenPr({ ci: "failed" }))).toMatch(/CI is failed/);
   expect(why(greenPr({ draft: true }))).toMatch(/draft/);
-  expect(why(greenPr({ mergeable: false }))).toMatch(/not mergeable/);
+  expect(why(greenPr({ mergeable: false }))).toMatch(/conflicts with its base/);
   expect(why(greenPr({ state: "closed" }))).toMatch(/closed/);
   expect(why(greenPr({ merged: true }))).toMatch(/merged/);
  });
@@ -533,7 +533,7 @@ describe("node #54 — the actions and their guards", () => {
   const { handler, runs } = setup();
   const res = await handler(post("/api/merge", { ...ok, sha: SHA }));
   expect(res.status).toBe(200);
-  expect(runs).toHaveLength(2);
+  expect(runs).toHaveLength(3);
   expect(runs[0].argv).toEqual(["gh", "pr", "merge", "687", "--repo", SEELITE, "--squash", "--match-head-commit", SHA]);
   for (const key of MACHINE_GH_KEYS) expect(runs[0].env[key]).toBeUndefined();
   expect(Object.keys(runs[0].env).some((k) => /TOKEN/.test(k))).toBe(false);
@@ -547,6 +547,34 @@ describe("node #54 — the actions and their guards", () => {
   expect(runs[1].argv).toEqual([expect.stringMatching(/\/bin\/ranger$/), "merge-desk", "--map", `${SEELITE}#1`, "-c", expect.stringMatching(/\/ranger\.yaml$/)]);
   expect(runs[1].detached).toBe(true);
   expect(Object.keys(runs[1].env).sort()).toEqual(["HOME", "PATH"]);
+  // Then a second pass that first waits for GitHub to recompute the other PRs' mergeability.
+  expect(runs[2].argv.slice(1)).toEqual(["merge-desk", "--map", `${SEELITE}#1`, "--settle", "-c", expect.stringMatching(/\/ranger\.yaml$/)]);
+ });
+
+ test("a merge refused because the PR now conflicts runs the merge desk, which sends it back for a base merge", async () => {
+  const waiting = row({ status: "awaiting-merge" });
+  const [e] = awaitingMergeEntries(entryInputs({ workers: [waiting], labels: () => [], prs: () => greenPr() }));
+  const runs: string[][] = [];
+  const handler = createHandler({
+   port: PORT,
+   token: TOKEN,
+   getState: () => assembleState({ ...baseInputs(), awaitingMerge: [e] }),
+   refresh: () => {},
+   launch: () => {},
+   verifyGrilling: async () => null,
+   actions: {
+    run: async (argv) => (runs.push(argv), { code: 0, stderr: "" }),
+    env: MACHINE_ENV,
+    rangerBin: "/r",
+    configPath: "/c",
+    readPr: async () => greenPr({ mergeable: false }),
+    exists: () => true,
+   },
+  });
+  const res = await handler(post("/api/merge", { ...ok, sha: SHA }));
+  expect(res.status).toBe(409);
+  expect(((await res.json()) as { error: string }).error).toMatch(/conflicts with its base.*the merge desk ran now/);
+  expect(runs).toEqual([["/r", "merge-desk", "--map", `${SEELITE}#1`, "-c", "/c"]]);
  });
 
  test("a dry-run merge names the desk it would run", async () => {
@@ -616,7 +644,8 @@ describe("node #54 — the actions and their guards", () => {
   expect(e.actions.merge).toEqual({ offered: true, headSha: SHA });
   const res = await handler(post("/api/merge", { ...ok, sha: SHA }));
   expect(res.status).toBe(200);
-  expect(runs.map((a) => (a[0] === "gh" ? "gh" : a[1]))).toEqual(["merge-gate", "gh", "merge-desk"]);
+  expect(runs.map((a) => (a[0] === "gh" ? "gh" : a[1]))).toEqual(["merge-gate", "gh", "merge-desk", "merge-desk"]);
+  expect(runs[3]).toContain("--settle");
   expect(runs[0]).toEqual(["/r", "merge-gate", "663", "--map", `${SEELITE}#1`, "--sha", SHA, "-c", "/c"]);
   const stale = await handler(post("/api/merge", { ...ok, sha: "f".repeat(40) }));
   expect(stale.status).toBe(409);
@@ -649,7 +678,7 @@ describe("node #54 — the actions and their guards", () => {
   });
   const res = await handler(post("/api/merge", { ...ok, sha: SHA }));
   expect(res.status).toBe(200);
-  expect(runs).toHaveLength(2);
+  expect(runs).toHaveLength(3);
   expect(seen).toEqual([{ repo: SEELITE, sha: SHA, env: runs[0].env }]); // the merge's own environment
   for (const key of MACHINE_GH_KEYS) expect(seen[0].env[key]).toBeUndefined();
  });

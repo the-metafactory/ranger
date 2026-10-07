@@ -227,6 +227,8 @@ const WorkersSchema = z.object({
  wallClockMin: z.number().int().positive().default(90),
  /** Respawn attempts before a crashed worker is parked (design §7). */
  maxAttempts: z.number().int().positive().default(2),
+ /** Automatic infrastructure-probe requeues per node/head; zero disables them. */
+ probeRequeues: z.number().int().nonnegative().default(2),
  /** Consecutive worker failures that trip the dead-man switch (design §7). */
  deadmanThreshold: z.number().int().positive().default(3),
  /**

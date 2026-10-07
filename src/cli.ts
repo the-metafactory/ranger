@@ -264,6 +264,40 @@ async function runSweep(configPath: string): Promise<string> {
  return JSON.stringify(results, null, 2);
 }
 
+/** How long `merge-desk --settle` waits for GitHub to compute mergeability, and how often it asks. */
+const SETTLE_MAX_MS = 90_000;
+const SETTLE_POLL_MS = 10_000;
+
+/**
+ * A merge moves the base under every other PR on the map, and GitHub
+ * recomputes their mergeability lazily: a desk pass right after the merge
+ * reads null ("still computing") and leaves a PR that now conflicts for the
+ * next tick. Wait until every awaiting-merge PR on the map has a computed
+ * answer (bounded), so the pass that follows sends a conflict back for its
+ * base merge now.
+ */
+async function settleMergeability(journal: Journal, map: RangerMapConfig, token: string): Promise<void> {
+ const prs = journal
+  .listWorkers(map.repo, map.root)
+  .filter((w) => w.status === "awaiting-merge" && w.prNumber !== null)
+  .map((w) => w.prNumber as number);
+ const deadline = Date.now() + SETTLE_MAX_MS;
+ let waiting = prs;
+ while (waiting.length > 0 && Date.now() < deadline) {
+  await new Promise((r) => setTimeout(r, SETTLE_POLL_MS));
+  const still: number[] = [];
+  for (const n of waiting) {
+   try {
+    const pr = await realGitHub.getPr(map.repo, n, token);
+    if (pr.state === "open" && (pr.mergeable === null || pr.mergeableState === "unknown")) still.push(n);
+   } catch {
+    still.push(n);
+   }
+  }
+  waiting = still;
+ }
+}
+
 /**
  * Operator verb: the merge desk's gate for one node's PR, read live. Exits 0
  * only when the gate passes at exactly `sha`; otherwise it names the check
@@ -296,11 +330,12 @@ async function runMergeGate(nodeId: string, selector: string, sha: string, confi
  * node starts its close without waiting for the next tick. Like the tick it
  * spawns the close (and any send-back) as a detached run-node.
  */
-async function runMergeDeskNow(selector: string, configPath: string): Promise<string> {
+async function runMergeDeskNow(selector: string, configPath: string, settle = false): Promise<string> {
  const { config, journal } = loadCtx(configPath);
  try {
   const map = pickMap(config, selector);
   const { token, botIdentity } = await writeContext(config, map);
+  if (settle) await settleMergeability(journal, map, token);
   const result = await sweepMap({
    config,
    journal,
@@ -779,11 +814,12 @@ program
   "Operator verb: run one map's merge desk now, as the tick's desk phase does — a merged PR's node starts its close, a passing PR gets its merge card",
  )
  .requiredOption("-m, --map <owner/name#root>", "map repo#root (repo alone only when unique)")
+ .option("--settle", "first wait (up to 90 s) until GitHub has computed mergeability for every awaiting-merge PR on the map, as after a merge moved the base")
  .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
- .action(async (options: { map: string; config: string }) => {
+ .action(async (options: { map: string; config: string; settle?: boolean }) => {
   try {
    const configPath = resolve(process.cwd(), options.config);
-   process.stdout.write((await runMergeDeskNow(options.map, configPath)) + "\n");
+   process.stdout.write((await runMergeDeskNow(options.map, configPath, options.settle === true)) + "\n");
   } catch (error) {
    process.stderr.write(
     `ranger merge-desk: ${error instanceof Error ? error.message : String(error)}\n`,

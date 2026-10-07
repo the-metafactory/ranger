@@ -296,7 +296,11 @@ export function mergeRefusal(pr: PrView | null): string | null {
  if (pr.merged) return "the PR is already merged";
  if (pr.state !== "open") return "the PR is closed";
  if (pr.draft) return "the PR is a draft: mark it ready first";
- if (pr.mergeable !== true) return pr.mergeable === null ? "GitHub is still computing mergeability" : "the PR is not mergeable";
+ if (pr.mergeable !== true) {
+  return pr.mergeable === null
+   ? "GitHub is still computing mergeability"
+   : "the PR conflicts with its base: the merge desk sends it back for a base merge and a new review round";
+ }
  if (!SHA_PATTERN.test(pr.headSha)) return "the PR head is unknown";
  if (pr.ci === "no-success") return "no check run concluded success (all neutral/skipped): the close has nothing to cite";
  if (pr.ci === "unreadable") return "the check runs could not be read";
@@ -541,10 +545,10 @@ export function gateArgv(args: { rangerBin: string; configPath: string; repo: st
  * One map's merge desk, run right after a dashboard merge: the merged node
  * starts its close now instead of on the next tick.
  */
-export function deskArgv(args: { rangerBin: string; configPath: string; repo: string; root: number }): string[] {
+export function deskArgv(args: { rangerBin: string; configPath: string; repo: string; root: number; settle?: boolean }): string[] {
  if (!REPO_PATTERN.test(args.repo)) throw new Error(`bad repo: ${args.repo}`);
  if (!Number.isInteger(args.root) || args.root <= 0) throw new Error(`bad root: ${args.root}`);
- return [args.rangerBin, "merge-desk", "--map", `${args.repo}#${args.root}`, "-c", args.configPath];
+ return [args.rangerBin, "merge-desk", "--map", `${args.repo}#${args.root}`, ...(args.settle ? ["--settle"] : []), "-c", args.configPath];
 }
 
 /**
@@ -686,6 +690,20 @@ async function runHeldAction(
    return refusal(502, `could not read PR #${pr.number} live: ${error instanceof Error ? error.message : String(error)}`);
   }
   const stale = mergeRefusal(live);
+  if (stale !== null && live?.mergeable === false && live.state === "open" && entry.status === "awaiting-merge" && deps.configPath !== undefined) {
+   // A conflict the page had not seen yet (another merge moved the base):
+   // the desk's send-back fixes it, so run the desk now, not on the next tick.
+   const desk = await deps.run(
+    deskArgv({ rangerBin: deps.rangerBin, configPath: deps.configPath, repo: entry.repo, root: entry.root }),
+    childEnv(deps.env),
+    { detached: true },
+   );
+   return {
+    ...refusal(409, `read live: ${stale}${desk.code === 0 ? " (the merge desk ran now)" : `; the merge desk failed (exit ${desk.code ?? "none"}): ${tailOf(desk.stderr)}`}`),
+    entry,
+    exited: desk.exited,
+   };
+  }
   if (stale !== null) return refusal(409, `read live: ${stale}`);
   if ((live as PrView).headSha !== body.sha) {
    return refusal(409, "the PR head moved since the page read it: reload and confirm again");
@@ -749,7 +767,16 @@ async function runHeldAction(
   // The wrapper resolves the machine account's tokens itself, as for a resume.
   const desk = await deps.run(close, childEnv(deps.env), { detached: true });
   out.close = { ok: desk.code === 0, code: desk.code, stderr: tailOf(desk.stderr) };
-  exited = Promise.all([result.exited, desk.exited]).then(() => undefined);
+  // The merge moved the base under the map's other waiting PRs, and GitHub
+  // recomputes their mergeability lazily: a second pass waits for it, so a
+  // PR that now conflicts goes back for its base merge without a tick. The
+  // page is not kept waiting for it; the node stays held until it ends.
+  const settle = deps.run(
+   deskArgv({ rangerBin: deps.rangerBin, configPath: deps.configPath as string, repo: entry.repo, root: entry.root, settle: true }),
+   childEnv(deps.env),
+   { detached: true },
+  );
+  exited = Promise.all([result.exited, desk.exited, settle.then((r) => r.exited)]).then(() => undefined);
  }
  return { status: 200, body: out, entry, exited };
 }

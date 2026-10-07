@@ -14,7 +14,8 @@ import { acquireLease, leaseOwnedCheck, type OwnedCheck, releaseLease, startHear
  * the gates (the node's row, the daily spawn cap, the implement-lane holder)
  * only after the first has written its `claimed` row and counted its spawn.
  *
- * Only these two claimers take it. `ranger resume-node` and the merge desk's
+ * Automatic probe requeues also take this lease while reserving a lane and
+ * starting their child. `ranger resume-node` and the merge desk's
  * send-back of a ready PR start workers without it, as they did before
  * build-now; a lane read under the lock can still be joined by one of those
  * before the claim's row lands. Neither does a claimer re-read the pause or

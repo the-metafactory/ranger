@@ -1,6 +1,6 @@
 import { recordImplementStart, mapKey } from "./maps.ts";
 import { executionRefusal } from "./forge-ref.ts";
-import { implementLane, startsImplementSession } from "./lanes.ts";
+import { implementLane, startsImplementSession, type ImplementLane } from "./lanes.ts";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import type { Journal } from "./journal.ts";
 import { killProcessGroup, pidAlive, processGroupCommands } from "./exec.ts";
@@ -45,6 +45,8 @@ export interface SweepContext {
   * that crashed holders released on any map.
   */
  phase?: "all" | "liveness" | "desk";
+ /** Parked probe retries reserve capacity before any crashed implement respawn. */
+ reservedLanes?: ReadonlySet<ImplementLane>;
  post?: import("./merge-desk.ts").MergeDeskContext["post"];
 }
 
@@ -120,6 +122,7 @@ export async function sweepMap(ctx: SweepContext): Promise<SweepMapResult> {
 
   if (worker.attempts < config.workers.maxAttempts) {
    if (startsImplementSession(worker)) {
+    if (ctx.reservedLanes?.has(implementLane(map))) continue;
     const holder = journal.laneHolder(implementLane(map), { nodeId: worker.nodeId, repo },
      row => row.pid === null || pidAlive(row.pid));
     if (holder !== null) {
