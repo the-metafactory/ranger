@@ -75,7 +75,7 @@ describe("twice-confirmed base-red cache (node #151)", () => {
 
  test("two equal base assertion sets are cached; same worktree, no second quiet-host wait", async () => {
   answers = [failed(["draws", "mounts"]), failed(["mounts", "draws"])];
-  expect(await compare()).toMatchObject({ sha, red: [HUD], cached: [] });
+  expect(await compare()).toMatchObject({ sha, red: [HUD], cached: [], unconfirmed: [] });
   expect(JSON.parse(ctx.journal.getHealth(key())!)).toEqual(["draws", "mounts"]);
   expect(calls.map((c) => c.command)).toEqual([`fake-probe 1 ${HUD}`, `fake-probe 1 ${HUD}`]);
   expect(calls[0].cwd).toBe(calls[1].cwd);
@@ -87,11 +87,19 @@ describe("twice-confirmed base-red cache (node #151)", () => {
   ["more checks", failed(["draws", "extra"])], ["crashes", failed(["draws"], "crash")],
   ["times out", { ...failed(), code: -1 }], ["no named failures", { ...failed(), stdout: "" }],
  ] as const) {
-  test(`confirmation ${name}: no cache, first comparison still inherits for this PR`, async () => {
+  test(`confirmation ${name}: evidence retained, no cache, first comparison still inherits for this PR`, async () => {
    answers = [failed(), confirmation];
-   expect(await compare()).toMatchObject({ red: [HUD], cached: [] });
+   expect(await compare()).toMatchObject({ red: [HUD], cached: [], unconfirmed: [HUD] });
    expect(ctx.journal.getHealth(key())).toBeNull();
    expect(calls).toHaveLength(2);
+   const evidence = ctx.journal.listEvents(ctx.map.repo).find((e) => e.detail?.includes("Base confirmation"))?.detail;
+   expect(evidence).toContain(`Base confirmation at ${sha.slice(0, 8)}`);
+   expect(evidence).toContain(HUD);
+   expect(evidence).toContain(`Confirmation exit ${confirmation.code}`);
+   expect(evidence).toContain("this PR uses the first base comparison");
+   if (name === "passes") expect(evidence).toContain("(passed)");
+   if (name === "different checks") expect(evidence).toContain("other");
+   if (name === "crashes") expect(evidence).toContain("crash");
   });
  }
 
@@ -104,6 +112,7 @@ describe("twice-confirmed base-red cache (node #151)", () => {
   ctx.node = { ...ctx.node, ref: { id: "151" } };
   const result = await compare();
   expect(result).toMatchObject({ sha, red: [HUD], cached: [HUD] });
+  expect(result!.red).not.toBe(result!.cached);
   expect(calls).toEqual([]);
   expect(hostReads).toBe(0);
   expect(gitSpy.mock.calls.some(([args]) => args[0] === "worktree")).toBe(false);
@@ -225,7 +234,7 @@ describe("twice-confirmed base-red cache (node #151)", () => {
    stdout: `${failed().stdout.replace(/^FAILED:.*$/m, "")}\n${failed(["fires"], "assert", WEAPON).stdout.replace(/^FAILED:.*$/m, "")}\nFAILED: ${HUD} · ${WEAPON}`,
   };
   answers = [both, failed()];
-  expect(await probeMergeBase(ctx, [HUD, WEAPON], both.stdout)).toMatchObject({ red: [HUD, WEAPON] });
+  expect(await probeMergeBase(ctx, [HUD, WEAPON], both.stdout)).toMatchObject({ red: [HUD, WEAPON], unconfirmed: [WEAPON] });
   expect(ctx.journal.getHealth(key())).toBe('["draws"]');
   expect(ctx.journal.getHealth(key(WEAPON))).toBeNull();
  });
@@ -242,6 +251,17 @@ describe("twice-confirmed base-red cache (node #151)", () => {
  test("cached provenance survives PR marker round trip and is visible in the note", () => {
   const record = { sha, passed: true, selected: "1", mode: "semantic", baseRed: [HUD], baseRedCache: { sha, probes: [HUD] } };
   expect(recordedProbes([{ id: 1, author: "ivy-agent", body: probeMarker(record) }], "ivy-agent")).toEqual([record]);
-  expect(baseRedNote(record)).toContain(`Base result from cache at ${sha}: ${HUD}`);
+  expect(baseRedNote(record)).toContain(`Base result from cache at ${sha.slice(0, 8)}: ${HUD}`);
+ });
+
+ test("unconfirmed base evidence survives PR marker round trip alongside cached evidence", () => {
+  const record = {
+   sha, passed: true, selected: "2", mode: "semantic", baseRed: [HUD, WEAPON],
+   baseRedCache: { sha, probes: [HUD] }, baseRedUnconfirmed: { sha, probes: [WEAPON], exit: 0 },
+  };
+  expect(recordedProbes([{ id: 1, author: "ivy-agent", body: probeMarker(record) }], "ivy-agent")).toEqual([record]);
+  expect(baseRedNote(record)).toContain("inheritance uses the first base comparison or confirmed cache");
+  expect(baseRedNote(record)).toContain(`Base confirmation at ${sha.slice(0, 8)} passed: ${WEAPON}`);
+  expect(baseRedNote(record)).toContain("No cache written for these probes; this PR uses the first base comparison.");
  });
 });

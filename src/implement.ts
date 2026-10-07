@@ -285,16 +285,21 @@ export interface RecordedProbe {
  baseRed?: string[];
  /** Base results reused from twice-confirmed assertion failures. */
  baseRedCache?: { sha: string; probes: string[] };
+ /** Probes whose second base run did not confirm the first run's assertions. */
+ baseRedUnconfirmed?: { sha: string; probes: string[]; exit: number };
 }
 
 const PROBE_MARKER =
- /<!-- ranger:probes sha=([0-9a-f]{7,64}) result=(pass|fail) selected=(\d+|\?) mode=([\w-]+)(?: base-red=([\w.,-]+))?(?: base-red-cache-sha=([0-9a-f]{40}) base-red-cache=([\w.,-]+))? -->/;
+ /<!-- ranger:probes sha=([0-9a-f]{7,64}) result=(pass|fail) selected=(\d+|\?) mode=([\w-]+)(?: base-red=([\w.,-]+))?(?: base-red-cache-sha=([0-9a-f]{40}) base-red-cache=([\w.,-]+))?(?: base-red-unconfirmed-sha=([0-9a-f]{40}) base-red-unconfirmed-exit=(-?\d+) base-red-unconfirmed=([\w.,-]+))? -->/;
 
 export function probeMarker(p: RecordedProbe): string {
  const baseRed = p.baseRed !== undefined && p.baseRed.length > 0 ? ` base-red=${p.baseRed.join(",")}` : "";
  const cache = p.baseRedCache;
  const cached = cache !== undefined && cache.probes.length > 0 ? ` base-red-cache-sha=${cache.sha} base-red-cache=${cache.probes.join(",")}` : "";
- return `<!-- ranger:probes sha=${p.sha} result=${p.passed ? "pass" : "fail"} selected=${p.selected} mode=${p.mode}${baseRed}${cached} -->`;
+ const confirmation = p.baseRedUnconfirmed;
+ const unconfirmed = confirmation !== undefined && confirmation.probes.length > 0
+  ? ` base-red-unconfirmed-sha=${confirmation.sha} base-red-unconfirmed-exit=${confirmation.exit} base-red-unconfirmed=${confirmation.probes.join(",")}` : "";
+ return `<!-- ranger:probes sha=${p.sha} result=${p.passed ? "pass" : "fail"} selected=${p.selected} mode=${p.mode}${baseRed}${cached}${unconfirmed} -->`;
 }
 
 /** Probe runs recorded on the PR by the MACHINE ACCOUNT (anyone else's markers are ignored). */
@@ -309,6 +314,7 @@ export function recordedProbes(
   if (m === null) continue;
   const baseRed = m[5]?.split(",").filter((n) => PROBE_FILE.test(n));
   const cached = m[7]?.split(",").filter((n) => PROBE_FILE.test(n));
+  const unconfirmed = m[10]?.split(",").filter((n) => PROBE_FILE.test(n));
   out.push({
    sha: m[1],
    passed: m[2] === "pass",
@@ -316,6 +322,7 @@ export function recordedProbes(
    mode: m[4],
    ...(baseRed !== undefined && baseRed.length > 0 ? { baseRed } : {}),
    ...(cached !== undefined && cached.length > 0 ? { baseRedCache: { sha: m[6], probes: cached } } : {}),
+   ...(unconfirmed !== undefined && unconfirmed.length > 0 ? { baseRedUnconfirmed: { sha: m[8], probes: unconfirmed, exit: Number(m[9]) } } : {}),
   });
  }
  return out;
@@ -417,6 +424,7 @@ async function probeFinalHead(
   ...summary,
   ...(baseRed === undefined ? {} : { baseRed }),
   ...(base !== null && base.cached.length > 0 ? { baseRedCache: { sha: base.sha, probes: base.cached } } : {}),
+  ...(base !== null && base.unconfirmed.length > 0 ? { baseRedUnconfirmed: { sha: base.sha, probes: base.unconfirmed, exit: base.confirmationExit! } } : {}),
  };
  ctx.journal.assertGeneration(nodeId, ctx.map.repo, ctx.generation, "post the probe record");
  // Named failures lead the record, the event and the park: an output tail can hold only passing probes.
@@ -489,13 +497,16 @@ async function awaitQuietHost(ctx: ImplementContext, run: string): Promise<void>
  });
 }
 
-interface BaseProbeResult {
+export interface BaseProbeResult {
  /** The merge base the probes ran at. */
  sha: string;
  /** Failed probes that fail the same checks at the merge base: the base's failure, not this branch's. */
  red: string[];
  /** Probes inherited from the twice-confirmed cache rather than a base run. */
  cached: string[];
+ /** First-run inherited probes whose confirmation did not repeat identical assertions; not cached. */
+ unconfirmed: string[];
+ confirmationExit?: number;
  /** Failed probes that fail at the merge base too, but not the same way (another check, or a crash), so they gate. */
  differs: string[];
  /** Failed probes that pass at the merge base: the branch broke them. */
@@ -508,8 +519,12 @@ interface BaseProbeResult {
  unresolved: string[];
 }
 
-function cacheProvenance(sha: string, probes: string[]): string {
- return `base result from cache at ${sha}: ${probes.join(", ")}`;
+function cacheProvenance(sha: string, probes: string[], capitalized = false): string {
+ return `${capitalized ? "Base" : "base"} result from cache at ${sha.slice(0, 8)}: ${probes.join(", ")}`;
+}
+
+function unconfirmedBaseNote(sha: string, probes: string[], exit: number): string {
+ return `Base confirmation at ${sha.slice(0, 8)} ${exit === 0 ? "passed" : `exited ${exit} without repeating identical assertion failures`}: ${probes.join(", ")}. No cache written for these probes; this PR uses the first base comparison.`;
 }
 
 /** The journal line for a merge-base probe check. */
@@ -518,6 +533,7 @@ function baseProbeDetail(b: BaseProbeResult): string {
  return [
   b.red.length > 0 ? `${b.red.join(", ")} fail at ${at} too` : null,
   b.cached.length > 0 ? cacheProvenance(b.sha, b.cached) : null,
+  b.unconfirmed.length > 0 ? unconfirmedBaseNote(b.sha, b.unconfirmed, b.confirmationExit!) : null,
   b.differs.length > 0 ? `${b.differs.join(", ")} fail at ${at} too, but not the same way — they gate` : null,
   b.passed.length > 0 ? `${b.passed.join(", ")} pass at ${at} — the failure is this branch's` : null,
   b.changed.length > 0 ? `${b.changed.join(", ")} are new or changed on this branch — they gate` : null,
@@ -569,6 +585,44 @@ function cachedBaseChecks(journal: Journal, key: string): Set<string> | null {
  }
 }
 
+function baseProbeRun(ctx: ImplementContext, dir: string, sha: string, probes: string[], label: string): Promise<RunResult> {
+ return runShell(probeRetryCommandFor(ctx.map.commands.probeRetry!, ctx.node.ref.id, probes), dir, ctx, {
+  label: `merge base ${sha.slice(0, 8)}: ${label}`,
+  timeoutMs: ctx.map.commands.probeTimeoutMin * 60_000,
+  priority: "probe",
+ });
+}
+
+async function confirmBaseRed(
+ ctx: ImplementContext,
+ dir: string,
+ sha: string,
+ red: string[],
+ baseChecks: Map<string, FailedProbeRun>,
+): Promise<{ unconfirmed: string[]; confirmationExit: number }> {
+ const confirmation = await baseProbeRun(ctx, dir, sha, red, "probe confirmation");
+ const names = confirmation.code > 0 ? parseFailedProbes(confirmation.stdout) : [];
+ const checks = parseFailedChecks(confirmation.stdout);
+ const unconfirmed: string[] = [];
+ for (const probe of red) {
+  const first = baseChecks.get(probe)!;
+  const second = checks.get(probe);
+  if (names.includes(probe) && inheritable(second) && sameCheckSet(first.checks, second.checks)) {
+   ctx.journal.setHealth(baseRedChecksKey(ctx.map.repo, sha, probe), JSON.stringify([...first.checks].sort()));
+  } else {
+   unconfirmed.push(probe);
+  }
+ }
+ if (unconfirmed.length > 0) {
+  ctx.journal.recordEvent("reviewed", {
+   repo: ctx.map.repo,
+   nodeId: ctx.node.ref.id,
+   detail: `${unconfirmedBaseNote(sha, unconfirmed, confirmation.code)} Confirmation exit ${confirmation.code}${confirmation.code === 0 ? " (passed)" : `: ${probeFailureSummary(confirmation.stdout, confirmation.code).join(" · ")}`}`,
+  });
+ }
+ return { unconfirmed, confirmationExit: confirmation.code };
+}
+
 /**
  * Compare failed probes with twice-confirmed cached checks at the merge base,
  * or run uncached probes in a throwaway detached worktree. Confirm matching
@@ -608,17 +662,15 @@ export async function probeMergeBase(
  const comparable = failed.filter((n) => !changed.includes(n) && !uncomparable.includes(n));
  const cached: string[] = [];
  const differs: string[] = [];
- const fresh = comparable.filter((probe) => {
+ const fresh: string[] = [];
+ for (const probe of comparable) {
   const checks = cachedBaseChecks(ctx.journal, baseRedChecksKey(map.repo, sha, probe));
-  if (checks === null) return true;
-  const here = headChecks.get(probe)!;
-  if (coversChecks(here.checks, checks)) cached.push(probe);
+  if (checks === null) fresh.push(probe);
+  else if (coversChecks(headChecks.get(probe)!.checks, checks)) cached.push(probe);
   else differs.push(probe);
-  return false;
- });
- const known: BaseProbeResult = { sha, red: cached, cached, differs, passed: [], changed, uncomparable, unresolved: fresh };
+ }
+ const known: BaseProbeResult = { sha, red: [...cached], cached, unconfirmed: [], differs, passed: [], changed, uncomparable, unresolved: fresh };
  if (fresh.length === 0 || template === undefined) return known;
- const command = probeRetryCommandFor(template, ctx.node.ref.id, fresh);
  const scratch = mkdtempSync(join(tmpdir(), "ranger-probe-base-"));
  const dir = join(scratch, "worktree");
  try {
@@ -629,11 +681,7 @@ export async function probeMergeBase(
    if (install.code !== 0) return known;
   }
   await awaitQuietHost(ctx, "the merge-base probe run");
-  const run = await runShell(command, dir, ctx, {
-   label: `merge base ${sha.slice(0, 8)}: probe run`,
-   timeoutMs: map.commands.probeTimeoutMin * 60_000,
-   priority: "probe",
-  });
+  const run = await baseProbeRun(ctx, dir, sha, fresh, "probe run");
   if (run.code === 0) return { ...known, passed: fresh, unresolved: [] };
   const named = run.code > 0 ? parseFailedProbes(run.stdout) : [];
   if (named.length === 0) return known;
@@ -656,21 +704,8 @@ export async function probeMergeBase(
    unresolved: [],
   };
   if (red.length > 0) {
-   // Confirm in the same worktree, without another quiet-host wait. Today's
-   // verdict stays the first comparison's even when confirmation differs.
-   const confirmation = await runShell(probeRetryCommandFor(template, ctx.node.ref.id, red), dir, ctx, {
-    label: `merge base ${sha.slice(0, 8)}: probe confirmation`,
-    timeoutMs: map.commands.probeTimeoutMin * 60_000,
-    priority: "probe",
-   });
-   const confirmedNames = confirmation.code > 0 ? parseFailedProbes(confirmation.stdout) : [];
-   const confirmedChecks = parseFailedChecks(confirmation.stdout);
-   for (const probe of red) {
-    const first = baseChecks.get(probe)!;
-    const second = confirmedChecks.get(probe);
-    if (!confirmedNames.includes(probe) || !inheritable(second) || !sameCheckSet(first.checks, second.checks)) continue;
-    ctx.journal.setHealth(baseRedChecksKey(map.repo, sha, probe), JSON.stringify([...first.checks].sort()));
-   }
+   // Confirmation uses this worktree without another quiet-host wait.
+   return { ...result, ...await confirmBaseRed(ctx, dir, sha, red, baseChecks) };
   }
   return result;
  } finally {
@@ -1893,12 +1928,16 @@ function probeLine(ctx: ImplementContext, probe: RecordedProbe | undefined): str
 }
 
 /** The probes a passing record excuses because the merge base fails them too. */
-export function baseRedNote(probe: Pick<RecordedProbe, "baseRed" | "baseRedCache"> | undefined): string {
+export function baseRedNote(probe: Pick<RecordedProbe, "baseRed" | "baseRedCache" | "baseRedUnconfirmed"> | undefined): string {
  const red = probe?.baseRed ?? [];
  const cache = probe?.baseRedCache;
- const provenance = cache === undefined ? "" : cacheProvenance(cache.sha, cache.probes);
- return (red.length === 0 ? "" : ` Not gating: ${red.join(", ")} failed here and fail at the merge base too.`) +
-  (provenance === "" ? "" : ` ${provenance[0].toUpperCase()}${provenance.slice(1)}.`);
+ const confirmation = probe?.baseRedUnconfirmed;
+ const provenance = cache === undefined ? "" : cacheProvenance(cache.sha, cache.probes, true);
+ return (red.length === 0 ? "" : confirmation === undefined
+  ? ` Not gating: ${red.join(", ")} failed here and fail at the merge base too.`
+  : ` Not gating: ${red.join(", ")} failed here; inheritance uses the first base comparison or confirmed cache.`) +
+  (provenance === "" ? "" : ` ${provenance}.`) +
+  (confirmation === undefined ? "" : ` ${unconfirmedBaseNote(confirmation.sha, confirmation.probes, confirmation.exit)}`);
 }
 
 function readyBody(
