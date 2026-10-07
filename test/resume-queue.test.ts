@@ -103,6 +103,83 @@ describe("resume-node CLI", () => {
   });
  });
 
+ for (const gate of ["pause", "cap"] as const) {
+  test(`${gate} queues a free-lane request, and later requests remain FIFO after the hold clears`, async () => {
+   await withRig(async r => {
+    r.worker("40"); r.worker("41", 460, "running");
+    if (gate === "pause") r.journal.setPaused(true);
+    else for (let i = 0; i < r.config.workers.spawnCapPerDay; i++) r.journal.recordSpawn(NOW);
+    expect((await r.cli("40", ["--when-free"])).code).toBe(0);
+    const first = r.journal.listResumeQueue()[0];
+    r.journal.updateWorker("41", REPO, { status: "parked" });
+    const spawned: string[] = [];
+    const ctx = { ...r, now: () => NOW, spawnRunNode: async ({ nodeId }: SpawnRunNodeArgs) => {
+     spawned.push(nodeId); return process.pid;
+    } };
+    const held = await resumeNode("41", undefined, ctx, { whenFree: true });
+    expect(held).toMatchObject({ nodeId: "41", queued: true });
+    const second = r.journal.listResumeQueue()[1];
+    expect(r.journal.listResumeQueue()).toEqual([first, second]);
+    if (gate === "pause") r.journal.setPaused(false);
+    else r.config.workers.spawnCapPerDay++;
+    expect(await resumeNode("41", undefined, ctx, { whenFree: true })).toMatchObject({ queued: true });
+    expect(await resumeNode("40", undefined, ctx, { whenFree: true })).toMatchObject({ queued: true });
+    expect(spawned).toEqual([]);
+    expect(r.journal.listResumeQueue()).toEqual([first, second]);
+    expect(r.journal.listEvents(REPO).filter(e => e.kind === "queued")).toHaveLength(2);
+    expect(r.journal.getWorker("40", REPO)?.status).toBe("parked");
+    expect(r.journal.getWorker("41", REPO)?.status).toBe("parked");
+    await walk(ctx);
+    expect(spawned).toEqual(["40"]);
+    expect(r.journal.listResumeQueue()).toEqual([second]);
+   });
+  });
+
+  test(`${gate} queues an implement resume on a free lane even with no backlog`, async () => {
+   await withRig(async r => {
+    r.worker("40");
+    if (gate === "pause") r.journal.setPaused(true);
+    else for (let i = 0; i < r.config.workers.spawnCapPerDay; i++) r.journal.recordSpawn(new Date());
+    const result = await r.cli("40", ["--when-free"]);
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({ nodeId: "40", queued: true });
+    expect(r.journal.listResumeQueue().map(e => e.nodeId)).toEqual(["40"]);
+    expect(r.journal.getWorker("40", REPO)?.status).toBe("parked");
+    expect(r.journal.listEvents(REPO).some(e => e.kind === "sweep")).toBe(false);
+   });
+  });
+ }
+
+ test("a backlog in another implement lane leaves a free-lane resume immediate", async () => {
+  await withRig(async r => {
+   r.queue("40");
+   r.config.maps[1].lane = "visual";
+   r.worker("41", 460);
+   const spawned: string[] = [];
+   const result = await resumeNode("41", undefined, { ...r, spawnRunNode: async ({ nodeId }) => {
+    spawned.push(nodeId); return process.pid;
+   } }, { whenFree: true });
+   expect(result).toMatchObject({ pid: process.pid });
+   expect(spawned).toEqual(["41"]);
+   expect(r.journal.listResumeQueue().map(e => e.nodeId)).toEqual(["40"]);
+  });
+ });
+
+ for (const [lane, phase] of [["research", null], ["implement", "close"]] as const) {
+  test(`${lane}/${phase} resumes immediately despite backlog, pause and cap`, async () => {
+   await withRig(async r => {
+    r.queue("40"); r.worker("41", 460, "parked", lane, phase);
+    r.journal.setPaused(true);
+    for (let i = 0; i < r.config.workers.spawnCapPerDay; i++) r.journal.recordSpawn(new Date());
+    const result = await r.cli("41", ["--when-free"]);
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({ nodeId: "41", was: "parked", pid: null });
+    expect(r.journal.getWorker("41", REPO)?.status).toBe("claimed");
+    expect(r.journal.listResumeQueue().map(e => e.nodeId)).toEqual(["40"]);
+   });
+  });
+ }
+
  for (const [name, lane, phase, held] of [
   ["free implement lane", "implement", "review", false],
   ["research resume", "research", null, true],

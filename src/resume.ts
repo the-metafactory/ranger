@@ -102,10 +102,15 @@ export async function resumeNode(nodeId: string, selector: string | undefined, c
   if (row === null) throw new Error(`no journal row for node ${nodeId} on ${map.repo} — nothing to resume`);
   if (row.status === "released") throw releasedError(nodeId);
   const lane = implementLane(map);
-  if (options.whenFree && startsImplementSession(row) && journal.laneHolder(lane, { nodeId, repo: map.repo }) !== null) {
+  const now = ctx.now?.() ?? new Date();
+  if (options.whenFree && startsImplementSession(row) && (
+   journal.laneHolder(lane, { nodeId, repo: map.repo }) !== null ||
+   journal.listResumeQueue(lane).some(entry => entry.repo !== map.repo || entry.nodeId !== nodeId) ||
+   journal.isPaused() || journal.spawnsToday(now) >= config.workers.spawnCapPerDay
+  )) {
    await identityGate(config, map);
    owned();
-   const entry = journal.enqueueResume({ nodeId, repo: map.repo, root: map.root, lane }, ctx.now?.());
+   const entry = journal.enqueueResume({ nodeId, repo: map.repo, root: map.root, lane }, now);
    return { nodeId, repo: map.repo, root: map.root, queued: true, lane, queuedAt: entry.queuedAt };
   }
   return startResumeNode(nodeId, map, ctx, owned, { force: options.force });

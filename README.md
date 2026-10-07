@@ -49,7 +49,8 @@ The dashboard shows both holders and the same next choices as walk.
 Unknown or ambiguous worker maps conservatively hold both resource lanes.
 
 `ranger resume-node <id> --when-free` resumes immediately when its lane is
-free, or records a durable FIFO entry when another implement worker holds it.
+free, no other resumes wait in that lane, and neither the dead-man pause nor
+the daily spawn cap holds it. Otherwise it records a durable FIFO entry.
 Research and close-only resumes start immediately. On each walk tick, queued
 resumes run after merge desks and before new claims; a started implement resume
 reserves its lane for that tick. The dead-man pause and daily spawn cap retain
