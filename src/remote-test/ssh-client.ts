@@ -91,6 +91,7 @@ async function exchange(config: SshConfig, job: RemoteTestJob, operation: "submi
   if ("state" in response && response.state && response.state !== "revoked") return { status: "pending", reason: response.state === "busy" ? "executor_busy" : response.state === "active" ? "active_job" : "interrupted_job" };
   if (response.receipt === null) return missing("absent_receipt");
   receipt = validateRemoteTestReceipt(response.receipt, job);
+  if (config.profiles.find(p => p.profileId === job.profileId)?.reviewed && receipt.status === "passed" && receipt.coverage?.requiredSkippedTests !== 0) throw Error("Reviewed profile requires complete coverage evidence");
   const age = clock() - receipt.completedAt;
   if (receipt.executorId !== config.executorId || age < 0 || age > config.receiptMaxAgeMs) throw Error("Untrusted or stale receipt");
   if ("state" in response && response.state === "revoked") return { status: "revoked", receipt };
