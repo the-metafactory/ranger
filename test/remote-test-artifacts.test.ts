@@ -63,13 +63,23 @@ test("retention removes expired terminal statuses while leaving active state unt
  for (const n of [1, 2, 3]) expect(await stat(join(f.root, id(n))).catch(() => null)).toBeNull();
  expect(await readFile(join(active, "state"), "utf8")).toBe("active");
 });
-test("aggregate cap evicts oldest completed jobs and refuses a single oversized receipt", async () => {
+test("aggregate cap preserves unexpired evidence and refuses new or individually oversized artifacts", async () => {
  const f = await fixture(); await persistExecution(f.root, receipt(), observation, { now: () => 1000 });
  const bytes = (await stat(join(f.root, id(), "receipt.json"))).size + observation.log.length;
- await persistExecution(f.root, receipt(2, 1001), observation, { maxArtifactBytes: bytes + 10, now: () => 1001 });
- expect(await stat(join(f.root, id())).catch(() => null)).toBeNull();
+ await expect(persistExecution(f.root, receipt(2, 1001), observation, { maxArtifactBytes: bytes + 10, now: () => 1001 })).rejects.toThrow("capacity");
+ expect(JSON.parse(await readFile(join(f.root, id(), "receipt.json"), "utf8")).identity).toEqual(receipt().identity);
+ expect(await stat(join(f.root, id(2))).catch(() => null)).toBeNull();
  await expect(persistExecution(f.root, receipt(3), observation, { maxArtifactBytes: 10, now: () => 1001 })).rejects.toThrow();
  expect(await stat(join(f.root, id(3))).catch(() => null)).toBeNull();
+});
+test("new publication IO failure preserves previously retained evidence", async () => {
+ for (const failure of ["log-write", "receipt-write", "file-sync", "publish", "root-sync"] as const) {
+  const f = await fixture(); await persistExecution(f.root, receipt(), observation, { now: () => 1000 });
+  const before = await readFile(join(f.root, id(), "receipt.json"));
+  await expect(persistExecution(f.root, receipt(2), observation, { now: () => 1000, fault: step => { if (step === failure) throw Error("failed"); } })).rejects.toThrow();
+  expect(await readFile(join(f.root, id(), "receipt.json"))).toEqual(before);
+  expect(await readFile(join(f.root, id(), "test.log"))).toEqual(observation.log);
+ }
 });
 test("active bytes count against the cap and are never evicted to admit a result", async () => {
  const f = await fixture(); await mkdir(f.root, { mode: 0o700 }); await mkdir(join(f.root, ".pending-active")); await writeFile(join(f.root, ".pending-active", "log"), Buffer.alloc(2000));

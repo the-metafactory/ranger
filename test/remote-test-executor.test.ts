@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { runCmd } from "../src/exec.ts";
 import { stageSource } from "../src/remote-test/source.ts";
-import { CONTAINER_BOOTSTRAP_FLAGS, containerProgram, executeRemoteTest, type ExecutorLauncher } from "../src/remote-test/executor.ts";
+import { CONTAINER_BOOTSTRAP_FLAGS, containerProgram, executeRemoteTest, podmanLauncher, type ExecutorLauncher } from "../src/remote-test/executor.ts";
 
 const roots: string[] = [];
 afterEach(async () => { for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
@@ -132,21 +132,20 @@ test("Bun bootstrap checks controller files before executing profiles and detect
  const run = async (fields: Record<string, string>, argv = commands) => {
   await rm(marker, { force: true }); for (const [name, content] of Object.entries({ ...valid, ...fields })) await writeFile(join(cgroup, name), content);
   // Only controller location and cwd differ from the real container program.
-  const program = containerProgram(argv).replace('"/sys/fs/cgroup/"', JSON.stringify(cgroup + "/")).replaceAll('"/sys/fs/cgroup/', JSON.stringify(cgroup).slice(0, -1) + "/").replace('cwd:"/work"', `cwd:${JSON.stringify(root)}`);
+  const program = containerProgram(argv).replaceAll('"/sys/fs/cgroup/', JSON.stringify(cgroup).slice(0, -1) + "/").replace('cwd:"/work"', `cwd:${JSON.stringify(root)}`);
   const result = await runCmd(process.execPath, [...CONTAINER_BOOTSTRAP_FLAGS, "-e", program]);
-  const terminal = JSON.parse(result.stdout);
-  if (argv[0]?.[2]?.includes("stdout-canary")) { expect(result.stderr).toContain("stdout-canary"); expect(result.stderr).toContain("stderr-canary"); }
-  return terminal;
+  return { terminal: JSON.parse(result.stdout), stderr: result.stderr };
  };
- expect(await run({})).toMatchObject({ status: "passed", exitCode: 0 }); expect(await readFile(marker, "utf8")).toBe("ran");
+ expect((await run({})).terminal).toMatchObject({ status: "passed", exitCode: 0 }); expect(await readFile(marker, "utf8")).toBe("ran");
  const invalidControls: Record<string, string>[] = [{ "cpu.max": "max 100000" }, { "memory.max": "max" }, { "memory.swap.max": "1024" }, { "pids.max": "max" }];
  for (const invalid of invalidControls) {
-  expect((await run(invalid)).status).toBe("infra_failed"); expect(await readFile(marker, "utf8").catch(() => null)).toBeNull();
+  expect((await run(invalid)).terminal.status).toBe("infra_failed"); expect(await readFile(marker, "utf8").catch(() => null)).toBeNull();
  }
- expect((await run({ "memory.events": "oom_kill 1" })).status).toBe("infra_failed");
- expect((await run({}, [...commands, ["/missing-runtime"]])).status).toBe("infra_failed");
+ expect((await run({ "memory.events": "oom_kill 1" })).terminal.status).toBe("infra_failed");
+ expect((await run({}, [...commands, ["/missing-runtime"]])).terminal.status).toBe("infra_failed");
  const logged = await run({}, [[process.execPath, "-e", 'console.log("stdout-canary"); console.error("stderr-canary")']]);
- expect(logged.resources).toEqual({ state: "observed", cpuTimeMicros: 100, peakMemoryBytes: 4096 });
+ expect(logged.terminal.resources).toEqual({ state: "observed", cpuTimeMicros: 100, peakMemoryBytes: 4096 });
+ expect(logged.stderr).toContain("stdout-canary"); expect(logged.stderr).toContain("stderr-canary");
 });
 test("neutral bootstrap does not load job Bun preloads or .env before controller checks", async () => {
  const root = await mkdtemp(join(tmpdir(), "ranger-bun-config-")); roots.push(root);
@@ -181,4 +180,20 @@ test("does not overwrite an occupied lane or falsely pass failed teardown", asyn
  expect(await readFile(join(g.root, "jobs", id, "checkout", "bun.lock"), "utf8")).toBe("reviewed-lock\n");
  expect(await stat(join(g.config.jobsRoot, ".executor-lane"))).toBeDefined();
  await expect(g.execute()).rejects.toThrow("already exists");
+ const calls = g.calls.length;
+ const nextJob = { ...g.job, jobId: "7c7e8091-1234-4234-8234-123456789abc", generation: 2 };
+ expect((await executeRemoteTest({ job: nextJob, bundlePath: g.source.bundlePath, config: g.config }, { launcher: g.launcher, uid: 1000, gid: 1000 })).status).toBe("rejected");
+ expect(g.calls.length).toBe(calls);
+});
+test("Podman launcher drains attached stderr separately from terminal stdout", async () => {
+ const root = await mkdtemp(join(tmpdir(), "ranger-podman-log-")); roots.push(root);
+ const engine = join(root, "podman");
+ await writeFile(engine, `#!/bin/sh\nprintf '%s\\n' '{"status":"passed","exitCode":0}'\nprintf '%s' 'attached-private-log' >&2\n`, { mode: 0o700 });
+ const priorPath = process.env.PATH; process.env.PATH = `${root}:${priorPath}`;
+ try {
+  const chunks: Buffer[] = [];
+  const result = await podmanLauncher(["--remote=false", "start", "--attach", "fixture"], { signal: new AbortController().signal, timeoutMs: 1000, onLog: chunk => chunks.push(Buffer.from(chunk)) });
+  expect(result.logsAvailable).toBe(true); expect(JSON.parse(result.stdout)).toEqual({ status: "passed", exitCode: 0 });
+  expect(Buffer.concat(chunks).toString()).toBe("attached-private-log");
+ } finally { process.env.PATH = priorPath; }
 });

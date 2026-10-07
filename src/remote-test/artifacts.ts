@@ -116,13 +116,14 @@ export async function persistExecution(rootPath: string, input: RemoteTestReceip
    }
   }
   if (!Number.isSafeInteger(total)) throw Error("Artifact accounting overflow");
-  completed.sort((a, b) => a.time - b.time);
+  // Age cleanup is independent of incoming publication. Capacity pressure must
+  // not destroy still-retained evidence to make room for a write that may fail.
   for (const old of completed) {
-   if (now - old.time >= policy.retentionMs || total + required > policy.maxArtifactBytes) {
+   if (now - old.time >= policy.retentionMs) {
     await rm(old.path, { recursive: true }); total -= old.bytes;
    }
   }
-  if (total + required > policy.maxArtifactBytes) throw Error("Active artifacts exhaust store capacity");
+  if (total + required > policy.maxArtifactBytes) throw Error("Retained or active artifacts exhaust store capacity");
   pending = join(root, `.pending-${receipt.identity.jobId}-${randomUUID()}`);
   await mkdir(pending, { mode: 0o700 });
   const write = async (name: string, content: Uint8Array, step: FaultStep) => {

@@ -91,7 +91,8 @@ export async function executeRemoteTest(
  const selected = config.profiles.find(p => p.profile.profileId === profileId);
  if (!selected) throw new Error("Job profile is not operator-approved");
  const job = validateRemoteTestJob(input.job, selected.profile);
- // Terminal job IDs are immutable. Refuse replay before touching the engine.
+ // Retained terminal identities cannot be overwritten. This bounded store is
+ // not a permanent deduplication ledger; admission owns attempt generation.
  try { await lstat(join(config.jobsRoot, ".artifacts", job.jobId)); throw Error("Execution receipt already exists"); }
  catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e; }
  const now = options.now ?? Date.now;
@@ -178,7 +179,7 @@ export async function executeRemoteTest(
   // A nonzero test exit is expected: do not confuse it with engine failure.
   const startedAt = now();
   resources = { state: "unavailable", cpuTimeMicros: null, peakMemoryBytes: null };
-  outputState = launcher === podmanLauncher ? "captured" : "unavailable";
+  outputState = "unavailable";
   const result = await launcher(["--remote=false", "start", "--attach", containerId], { signal: controller.signal, timeoutMs: Math.max(1, end - now()) + 5000, onLog: captureLog });
   if (result.logsAvailable) outputState = "captured";
   const state = JSON.parse(await command(["inspect", containerId]))[0]?.State;
