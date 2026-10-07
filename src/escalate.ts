@@ -142,8 +142,14 @@ async function escalateOneMap(
         now,
         budget: { remaining: ABSENT_RESERVE, deadline: passDeadline },
         owned,
-        readNode: id => budgetedRead(journal, map.repo, token, budgetPolicy(config), now,
-          () => graphNode(map.repo, id, token, { timeoutMs: Math.min(GRAPH_CALL_TIMEOUT_MS, Math.max(1, passDeadline - Date.now())) })),
+        readNode: id => {
+          if (Date.now() >= passDeadline) throw new BudgetDeferral("graph closure pass deadline reached");
+          return budgetedRead(journal, map.repo, token, budgetPolicy(config), now, () => {
+            const remaining = passDeadline - Date.now();
+            if (remaining <= 0) throw new BudgetDeferral("graph closure pass deadline reached");
+            return graphNode(map.repo, id, token, { timeoutMs: Math.min(GRAPH_CALL_TIMEOUT_MS, remaining) });
+          });
+        },
       },
       neededIds,
     );

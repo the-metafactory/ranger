@@ -53,7 +53,8 @@ import { workerEnv } from "./worker-env.ts";
 import { sessionJournalPath } from "./journal-guard.ts";
 import { saveWorkerLog } from "./worker-log.ts";
 import { isTransientGitHubError } from "./transient.ts";
-import { finishClosedElsewhere } from "./closed-elsewhere.ts";
+import { BudgetDeferral } from "./budget.ts";
+import { findNodePr, finishClosedElsewhere } from "./closed-elsewhere.ts";
 import * as githubApi from "./github.ts";
 import type { ForgePort } from "./forge.ts";
 import { ParkSignal } from "./signals.ts";
@@ -468,9 +469,7 @@ export async function runNode(
   );
   if (node.status === "closed") {
    const github = ctx.github ?? githubApi;
-   const pr = row?.prNumber == null
-    ? await github.findPrByHead(repo, implementBranchFor(node.node, worktreeBranch(nodeId, slugify(node.node.title))), token)
-    : await github.getPr(repo, row.prNumber, token);
+   const pr = await findNodePr(github, repo, node, row?.prNumber, token);
    return { ...base, ...await finishClosedElsewhere({ ...ctx, node, pr, generation }) };
   }
   const rootNode = await graphNode(
@@ -498,6 +497,10 @@ export async function runNode(
    // A newer occupant owns the row — leave it untouched.
    journal.recordEvent("fenced", { nodeId, repo, detail: detail.slice(0, 400) });
    return { ...base, status: "refused", detail };
+  }
+  if (error instanceof BudgetDeferral) {
+   journal.recordEvent("transient", { nodeId, repo, detail: detail.slice(0, 400) });
+   return { ...base, status: "failed", detail };
   }
   journal.recordEvent("refused", {
    nodeId,
@@ -656,6 +659,8 @@ async function runImplementNode(
    throw error;
   }
  }
+
+ if (outcome.graphClosureReconciled) return { ...base, ...outcome };
 
  switch (outcome.status) {
   case "released":

@@ -1,3 +1,4 @@
+import { mapPool } from "./pool.ts";
 import { journalKeyFor } from "./forge-ref.ts";
 import { mapKey } from "./maps.ts";
 import { EscalationDiscord, DiscordMessageGoneError } from "./discord.ts";
@@ -288,39 +289,6 @@ export function dayDiff(fromIso: string, now: Date): number {
     now.getUTCDate(),
   );
   return Math.floor((nowDay - fromDay) / 86_400_000);
-}
-
-/** Bounded-concurrency pool — preserves input order in the results array. */
-export async function mapPool<T, R>(
-  items: T[],
-  limit: number,
-  fn: (item: T, index: number) => Promise<R>,
-): Promise<R[]> {
-  const results: R[] = new Array(items.length);
-  let next = 0;
-  const workerCount = Math.max(1, Math.min(limit, items.length));
-  const workers: Promise<void>[] = [];
-  for (let w = 0; w < workerCount; w++) {
-    workers.push(
-      (async () => {
-        while (next < items.length) {
-          const index = next++;
-          results[index] = await fn(items[index], index);
-        }
-      })(),
-    );
-  }
-  // allSettled — wait for every in-flight worker before propagating a failure,
-  // so the caller never releases the announce-once lock while a sibling's
-  // journal write is still pending (a second run could otherwise post dupes).
-  const settled = await Promise.allSettled(workers);
-  const rejected = settled.find(
-    (s): s is PromiseRejectedResult => s.status === "rejected",
-  );
-  if (rejected !== undefined) {
-    throw rejected.reason;
-  }
-  return results;
 }
 
 /**
@@ -653,7 +621,13 @@ export async function markAbsentCards(
   neededIds: ReadonlySet<string>,
 ): Promise<{ keptOpen: string[]; deferred: string[]; errors: string[] }> {
   const { client, journal, map, now, budget, owned } = ctx;
-  const usable = selectAbsentCards(journal, map.repo, neededIds, budget, map.root);
+  const eligible = (prior: EscalationRow) => {
+    if (!ctx.onlyClosed || prior.notedAt !== null) return true;
+    const worker = journal.getWorker(prior.nodeId, map.repo);
+    return worker?.root === map.root && worker.phase === "close" &&
+      (worker.status === "success" || worker.status === "released");
+  };
+  const usable = selectAbsentCards(journal, map.repo, neededIds, budget, map.root, eligible);
   const clientFor = channelClientFor(client);
   const reconcileCtx = { clientFor, journal, map, now, budget, owned };
   const outcomes = await mapPool(usable, 3, async (prior): Promise<AbsentOutcome> => {
@@ -669,7 +643,7 @@ export async function markAbsentCards(
       journal.recordEvent("sweep", { nodeId: prior.nodeId, repo: map.repo, detail: `graph closure read deferred: ${String(error)}` });
     }
     if (!closed && closureOnly) return { action: "unchanged", id: prior.nodeId };
-    return reconcileAbsentCard(reconcileCtx, prior, closed);
+    return reconcileAbsentCard(reconcileCtx, prior, absentCardMode(prior, map.repo, closed));
   });
   const keptOpen: string[] = [];
   const deferred: string[] = [];
@@ -709,6 +683,7 @@ function selectAbsentCards(
   neededIds: ReadonlySet<string>,
   budget: CardBudget,
   root: number,
+  eligible: (prior: EscalationRow) => boolean,
 ): EscalationRow[] {
   const wanted = Math.max(budget.remaining, 0);
   const scanPage = 50;
@@ -745,7 +720,7 @@ function selectAbsentCards(
       scanned++;
       consumed++;
       after = { createdAt: row.createdAt, nodeId: row.nodeId };
-      if (!neededIds.has(row.nodeId)) openCards.push(row);
+      if (!neededIds.has(row.nodeId) && eligible(row)) openCards.push(row);
       if (openCards.length >= wanted || scanned >= MAX_ABSENT_SCAN) break;
     }
     if (consumed === batch.length && batch.length < scanPage) {
@@ -764,6 +739,21 @@ type AbsentOutcome =
   | { action: "keptOpen" | "closed" | "unchanged"; id: string }
   | { action: "deferred"; id: string }
   | { action: "error"; id: string; error: string };
+
+function absentCardMode(prior: EscalationRow, repo: string, closed: boolean): {
+  content: string;
+  cursorSuffix: string;
+  status: EscalationRow["status"];
+  action: "closed" | "keptOpen";
+} {
+  return closed ? {
+    content: closedGraphContent(prior.nodeId, prior.title, repo),
+    cursorSuffix: ".closed", status: "closed", action: "closed",
+  } : {
+    content: queueExitContent(prior.nodeId, prior.title, repo),
+    cursorSuffix: "", status: prior.status, action: "keptOpen",
+  };
+}
 
 /**
  * Reconcile ONE absent card: write the queue-exit note to EVERY destination's
@@ -784,13 +774,13 @@ async function reconcileAbsentCard(
     owned: OwnedCheck;
   },
   prior: EscalationRow,
-  closed = false,
+  mode: ReturnType<typeof absentCardMode>,
 ): Promise<AbsentOutcome> {
   const { clientFor, journal, map, now, budget, owned } = ctx;
   const nodeId = prior.nodeId;
   const key = journalKeyFor(map.repo, nodeId);
-  const content = closed ? closedGraphContent(nodeId, prior.title, map.repo) : queueExitContent(nodeId, prior.title, map.repo);
-  const cursorKey = `escalate.reconcile.${key}${closed ? ".closed" : ""}`;
+  const { content } = mode;
+  const cursorKey = `escalate.reconcile.${key}${mode.cursorSuffix}`;
   try {
     // Reconcile EVERY destination's card: a card that moved channels still
     // holds a live, actionable message in each visited channel — write the
@@ -801,11 +791,11 @@ async function reconcileAbsentCard(
     let destinations: { channelId: string; messageId: string }[];
     if (stored.length > 0) {
       destinations = stored;
-    } else if (prior.channelId === null && (!closed || map.discord === undefined)) {
+    } else if (prior.channelId === null) {
       destinations = [];
     } else {
       destinations = [
-        { channelId: prior.channelId ?? map.discord!.channelId, messageId: prior.messageId },
+        { channelId: prior.channelId, messageId: prior.messageId },
       ];
     }
     // A per-card destination cursor: with more destinations than the
@@ -857,11 +847,11 @@ async function reconcileAbsentCard(
       channelId: prior.channelId,
       createdAt: prior.createdAt,
       lastEditedAt: now.toISOString(),
-      status: closed ? "closed" : prior.status,
+      status: mode.status,
       notedAt: now.toISOString(),
     });
     return {
-      action: closed ? "closed" : anyEdit ? "keptOpen" : "unchanged",
+      action: mode.action === "closed" || anyEdit ? mode.action : "unchanged",
       id: nodeId,
     };
   } catch (cardError) {
@@ -879,11 +869,11 @@ async function reconcileAbsentCard(
 
 const CLOSED_CARD_DEADLINE_MS = 60_000;
 
-function outOfBandPass(map: RangerMapConfig) {
+function outOfBandPass(map: RangerMapConfig, budget?: CardBudget) {
   return {
     client: EscalationDiscord.fromMap(map),
     now: new Date(),
-    budget: { remaining: ABSENT_RESERVE, deadline: Date.now() + CLOSED_CARD_DEADLINE_MS },
+    budget: budget ?? { remaining: ABSENT_RESERVE, deadline: Date.now() + CLOSED_CARD_DEADLINE_MS },
   };
 }
 
@@ -894,6 +884,7 @@ export async function closeGraphEscalation(ctx: {
   map: RangerMapConfig;
   nodeId: string;
   owned: OwnedCheck;
+  budget?: CardBudget;
 }): Promise<void> {
   const prior = ctx.journal.getEscalation(ctx.map.repo, ctx.nodeId);
   if (prior === null || prior.status === "closed") return;
@@ -902,28 +893,29 @@ export async function closeGraphEscalation(ctx: {
     ctx.owned();
     const live = ctx.journal.getEscalation(ctx.map.repo, ctx.nodeId);
     if (live === null || live.status === "closed") return;
-    const pass = outOfBandPass(ctx.map);
+    const pass = outOfBandPass(ctx.map, ctx.budget);
     const outcome = await reconcileAbsentCard({
       ...ctx,
       ...pass,
       clientFor: channelClientFor(pass.client),
       owned: () => { owned(); ctx.owned(); },
-    }, live, true);
+    }, live, absentCardMode(live, ctx.map.repo, true));
     if (outcome.action === "error" || outcome.action === "deferred") throw new Error(`closed card ${outcome.action}${"error" in outcome ? `: ${outcome.error}` : ""}`);
   });
 }
 
-/** Sweep also serves graph-closed cards, even when their worker is already terminal. */
+/** Sweep retries noted cards and pending cards of finished close-phase workers. */
 export async function reconcileGraphClosedCards(ctx: {
   journal: Journal;
   map: RangerMapConfig;
   readNode: (id: string) => Promise<NodeResult>;
+  budget: CardBudget;
 }): Promise<void> {
   if (ctx.journal.listUnreconciledOpen(ctx.map.repo, { root: ctx.map.root, includeNoted: true, limit: 1 }).length === 0) return;
   await withEscalateLock(ctx.journal, async owned => {
     const result = await markAbsentCards({
       ...ctx,
-      ...outOfBandPass(ctx.map),
+      ...outOfBandPass(ctx.map, ctx.budget),
       owned,
       onlyClosed: true,
     }, new Set());

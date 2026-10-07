@@ -1038,6 +1038,29 @@ describe("implement lane (node #23)", () => {
   }
  }
 
+ test.each(["resume", "sweep"])("closed research node discovers its merged PR without a recorded number via %s", async via => {
+  const r = await rig({}); cleanup.push(r.dir);
+  const branch = "research/api-survey";
+  const worktree = await bootstrapWorktree(r.canonical, "20", "api-survey", r.ctx.token, branch);
+  expect((await runCmd("git", ["push", "origin", branch], { cwd: worktree })).code).toBe(0);
+  await r.github.createDraftPr("acme/widgets", { head: branch, base: "main", title: "Survey API", body: "Findings" });
+  await r.github.merge(1);
+  const file = join(r.dir, "data", "acme__widgets-node-20.json");
+  const node = JSON.parse(readFileSync(file, "utf8"));
+  node.status = "closed"; node.node.kind = "research";
+  node.node.probes = [{ type: "git-ref-exists", ref: branch }];
+  node.node.completion = { closer: "jcfischer", receiptCommentId: "900", closedAt: new Date().toISOString() };
+  writeFileSync(file, JSON.stringify(node));
+  r.journal.updateWorker("20", "acme/widgets", { status: "failed", phase: "close", lane: "research", worktree, prNumber: null });
+  const calls = join(r.dir, "graph-calls"); process.env.FAKE_SOMA_CALLS = calls;
+  r.ctx.worker = async () => { throw new Error("must not start another research session"); };
+  if (via === "resume") expect((await runNode("20", r.ctx)).status).toBe("success");
+  else await sweepMap({ ...r.ctx, phase: "liveness" });
+  expect(r.journal.getWorker("20", "acme/widgets")).toMatchObject({ status: "success", worktree: null });
+  expect(existsSync(worktree)).toBe(false);
+  expect(readFileSync(calls, "utf8")).not.toContain("close acme/widgets");
+ }, 60_000);
+
  test.each(["resume", "sweep"])("recovers ranger's own graph close honestly via %s", async via => {
   const r = await rig({}); cleanup.push(r.dir);
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
@@ -1057,14 +1080,16 @@ describe("implement lane (node #23)", () => {
   expect(existsSync(join(r.canonical, ".worktrees", "node-20"))).toBe(false);
  }, 60_000);
 
- test("close phase re-reads graph closure before CI when the node closed during resume", async () => {
+ test.each([undefined, "jcfischer", BOT])("close phase re-reads closure before CI and preserves external deadman (closer %s)", async closer => {
   const r = await rig({}); cleanup.push(r.dir);
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
   await r.github.merge(1);
+  r.journal.bumpDeadman(); r.journal.bumpDeadman();
   const file = join(r.dir, "data", "acme__widgets-node-20.json");
   const getPr = r.github.getPr.bind(r.github);
   const prSpy = spyOn(r.github, "getPr").mockImplementation(async (...args) => {
    const node = JSON.parse(readFileSync(file, "utf8")); node.status = "closed";
+   if (closer !== undefined) node.node.completion = { closer, receiptCommentId: "900", closedAt: new Date().toISOString() };
    writeFileSync(file, JSON.stringify(node));
    return getPr(...args);
   });
@@ -1073,8 +1098,26 @@ describe("implement lane (node #23)", () => {
   try {
    expect((await runNode("20", r.ctx)).status).toBe("success");
    expect(ciSpy).not.toHaveBeenCalled();
+   expect(r.journal.deadmanCount()).toBe(closer === BOT ? 0 : 2);
    expect(readFileSync(callsFile, "utf8")).not.toContain("close acme/widgets");
   } finally { prSpy.mockRestore(); ciSpy.mockRestore(); }
+ }, 60_000);
+
+ test("close-phase budget deferral retains the worker for retry without a deadman failure", async () => {
+  const r = await rig({}); cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  await r.github.merge(1);
+  process.env.FAKE_GH_GRAPHQL_REMAINING = "0";
+  r.journal.bumpDeadman();
+  const ci = spyOn(r.github, "ciVerdictFor").mockImplementation(async () => { throw new Error("must defer before CI"); });
+  try {
+   const outcome = await runNode("20", r.ctx);
+   expect(outcome.status).toBe("failed");
+   expect(outcome.detail).toContain("GraphQL");
+   expect(r.journal.getWorker("20", "acme/widgets")?.status).toBe("running");
+   expect(r.journal.deadmanCount()).toBe(1);
+   expect(ci).not.toHaveBeenCalled();
+  } finally { ci.mockRestore(); }
  }, 60_000);
 
  test.each([false, true])("sweep finishes a failed worker and closes its escalation card exactly once (Discord outage: %s)", async deferCard => {

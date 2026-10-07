@@ -39,6 +39,7 @@ import {
 } from "./outcomes.ts";
 import { GRAPH_CALL_TIMEOUT_MS, graphNode, somaRepo, type NodeResult } from "./graph.ts";
 import { finishClosedElsewhere } from "./closed-elsewhere.ts";
+import { budgetedRead, budgetPolicy } from "./budget.ts";
 import { graphClose, graphDecisions, type CloseResult } from "./graph-write.ts";
 import type { ImplementPhase, Journal } from "./journal.ts";
 import { assembleImplementPrompt } from "./prompt.ts";
@@ -153,6 +154,8 @@ export interface ImplementOutcome {
  workerExit: number | null;
  close?: CloseResult;
  prNumber?: number;
+ /** The closure reconciler has already finalized the worker and liveness state. */
+ graphClosureReconciled?: true;
  /** When the failure was caused by a substrate rate limit (node #45). */
  substrateCapped?: CapSignal;
 }
@@ -1597,7 +1600,9 @@ async function closeAfterMerge(
  const nodeId = node.ref.id;
  journal.updateWorker(nodeId, ctx.map.repo, { phase: "close", prNumber: pr.iid });
 
- const liveNode = await graphNode(repo, nodeId, { token, source: "write-token" }, { timeoutMs: GRAPH_CALL_TIMEOUT_MS });
+ const credential = { token, source: "write-token" };
+ const liveNode = await budgetedRead(journal, repo, credential, budgetPolicy(ctx.config), new Date(),
+  () => graphNode(repo, nodeId, credential, { timeoutMs: GRAPH_CALL_TIMEOUT_MS }));
  if (liveNode.status === "closed") return finishClosedElsewhere({ ...ctx, node: liveNode, pr });
 
  await fastForwardCanonical(ctx.canonical, map.base, token);

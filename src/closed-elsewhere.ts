@@ -2,13 +2,28 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { expandHome, type RangerConfig, type RangerMapConfig } from "./config.ts";
 import type { NodeResult } from "./graph.ts";
-import type { ChangeRequest } from "./forge.ts";
+import type { ChangeRequest, ForgePort } from "./forge.ts";
 import type { Journal } from "./journal.ts";
 import { safeGit } from "./git-ops.ts";
 import { trustedSnapshot } from "./git-trust.ts";
 import { mapKey } from "./maps.ts";
-import { closeGraphEscalation } from "./card-sync.ts";
+import { closeGraphEscalation, type CardBudget } from "./card-sync.ts";
 import { parseForgeRef } from "./forge-ref.ts";
+import { implementBranchFor } from "./implement.ts";
+import { researchBranchFor, slugify, worktreeBranch } from "./worker.ts";
+
+export async function findNodePr(
+  forge: ForgePort,
+  repo: string,
+  node: NodeResult,
+  prNumber: number | null | undefined,
+  token: string,
+): Promise<ChangeRequest | null> {
+  if (prNumber != null) return forge.getPr(repo, prNumber, token);
+  const branch = node.node.kind === "research" ? researchBranchFor(node.node) :
+    implementBranchFor(node.node, worktreeBranch(node.ref.id, slugify(node.node.title)));
+  return forge.findPrByHead(repo, branch, token);
+}
 
 /** Reconcile a tracker closure; this never makes a graph write. */
 export async function finishClosedElsewhere(ctx: {
@@ -21,18 +36,19 @@ export async function finishClosedElsewhere(ctx: {
   botIdentity: string;
   canonical?: string;
   worktree?: string | null;
-}): Promise<{ status: "success" | "released"; detail: string; workerExit: null; prNumber?: number }> {
+  cardBudget?: CardBudget;
+}): Promise<{ status: "success" | "released"; detail: string; workerExit: null; prNumber?: number; graphClosureReconciled: true }> {
   const { map, journal, node, pr, generation } = ctx;
   if (node.status !== "closed") throw new Error("closed-elsewhere reconciliation requires a closed graph node");
   const id = node.ref.id;
   const fence = () => journal.assertGeneration(id, map.repo, generation, "finish an externally closed node");
   const merged = pr?.state === "merged";
   const completion = node.node.completion;
-  const ownClose = completion?.closer === ctx.botIdentity;
+  const kind = completion === undefined ? "ungated" : completion.closer === ctx.botIdentity ? "own" : "external";
   const receipt = completion === undefined ? "not available" :
     `${node.url}${parseForgeRef(map.repo).forge === "github" ? "#issuecomment-" : "#note_"}${completion.receiptCommentId}`;
-  const attribution = completion === undefined ? "closed on the graph without a gated-close receipt; closer unknown" :
-    ownClose ? `recovered ranger close by ${completion.closer}` : `closed outside ranger by ${completion.closer}`;
+  const attribution = kind === "ungated" ? "closed on the graph without a gated-close receipt; closer unknown" :
+    kind === "own" ? `recovered ranger close by ${completion!.closer}` : `closed outside ranger by ${completion!.closer}`;
   const detail = `${attribution}; receipt: ${receipt}; ${pr === null ? "no PR" : `PR #${pr.iid} ${pr.state}`}`;
   const canonical = ctx.canonical ?? (map.canonical === undefined ? join(expandHome(ctx.config.state.canonicalRoot), map.repo) : expandHome(map.canonical));
   const worktree = ctx.worktree ?? journal.getWorker(id, map.repo)?.worktree;
@@ -49,13 +65,14 @@ export async function finishClosedElsewhere(ctx: {
     phase: "close", finishedAt: new Date().toISOString(), outcome: detail,
     ...(merged ? { worktree: null } : {}),
   });
-  if (merged) journal.resetDeadman();
-  journal.recordEvent(completion === undefined ? "closed-elsewhere-ungated" : ownClose ? "closed" : "closed-elsewhere", { nodeId: id, repo: map.repo, detail });
+  if (merged && kind === "own") journal.resetDeadman();
+  const eventKind = ({ ungated: "closed-elsewhere-ungated", own: "closed", external: "closed-elsewhere" } as const)[kind];
+  journal.recordEvent(eventKind, { nodeId: id, repo: map.repo, detail });
   try {
-    await closeGraphEscalation({ journal, map, nodeId: id, owned: fence });
+    await closeGraphEscalation({ journal, map, nodeId: id, owned: fence, budget: ctx.cardBudget });
   } catch (error) {
     fence();
     journal.recordEvent("sweep", { nodeId: id, repo: map.repo, detail: `closed graph card sync deferred: ${String(error)}` });
   }
-  return { status: merged ? "success" : "released", detail, workerExit: null, ...(pr === null ? {} : { prNumber: pr.iid }) };
+  return { status: merged ? "success" : "released", detail, workerExit: null, graphClosureReconciled: true, ...(pr === null ? {} : { prNumber: pr.iid }) };
 }
