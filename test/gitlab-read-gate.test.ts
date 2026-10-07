@@ -1,27 +1,30 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parse } from "yaml";
 import type { RangerConfig } from "../src/config.ts";
 import { runCmd, type RunResult } from "../src/exec.ts";
-import { callGraph } from "../src/graph.ts";
+import { callGraph, RateLimitError } from "../src/graph.ts";
 import { glabConfigEnv } from "../src/glab-config-dir.ts";
 import { assertReadOnlyToken, GateError, gitlabApiRead, matchTokenEnv, tokenBatch } from "../src/token-gate.ts";
 import { probeGlabKeyring } from "../scripts/probe-glab-keyring.ts";
-import { budgetedRead } from "../src/budget.ts";
+import { activeCooldown, BudgetDeferral, budgetedRead } from "../src/budget.ts";
 import { Journal } from "../src/journal.ts";
 
 const host = "gitlab.example.org";
 const repo = `gitlab:${host}/team/sub/project`;
 const source = "RANGER_RO_GITLAB";
 const secret = 'read-token: "quoted"\nvalue';
-const config = { auth: { readOnlyTokens: { [`gitlab:${host}/team/`]: source }, writeTokens: {} } } as unknown as RangerConfig;
+const config = { auth: { readOnlyTokens: { [`gitlab:${host}/team/`]: source },
+  writeTokens: { [`gitlab:${host}/team/`]: "CUSTOM_WRITE_SECRET" } } } as unknown as RangerConfig;
 const env = { [source]: secret, PATH: process.env.PATH, GLAB_CONFIG_DIR: "/principal/config",
   GITLAB_TOKEN: "principal-write", GITLAB_ACCESS_TOKEN: "principal-write", OAUTH_TOKEN: "principal-write",
   CI_JOB_TOKEN: "job-write", JOB_TOKEN: "job-write", GLAB_TOKEN: "principal-write", GITLAB_HOST: "other.host",
   GL_HOST: "other.host", GITLAB_API_HOST: "other.host", GITLAB_API_PROTOCOL: "http", API_PROTOCOL: "http",
   GITLAB_URI: "https://other.host", GITLAB_URL: "https://other.host", GLAB_ENABLE_CI_AUTOLOGIN: "true",
-  GLAB_SEND_TELEMETRY: "true", CHECK_UPDATE: "true" };
+  GLAB_SEND_TELEMETRY: "true", CHECK_UPDATE: "true", GH_TOKEN: "github-write", GITHUB_TOKEN: "github-write",
+  GH_ENTERPRISE_TOKEN: "github-write", CUSTOM_WRITE_SECRET: "write-token" };
 const response = (body: unknown, status = 200, code = status === 200 ? 0 : 1): RunResult => ({
   code, stdout: `HTTP/2.0 ${status} Response\r\nContent-Type: application/json\r\n\r\n${JSON.stringify(body)}`, stderr: "",
 });
@@ -39,7 +42,7 @@ function inspectConfig(childEnv: NodeJS.ProcessEnv | undefined, token = secret):
     check_update: false, telemetry: false,
     hosts: { [host]: { token, api_host: host, api_protocol: "https" } },
   });
-  for (const key of Object.keys(env).filter(k => ![source, "PATH", "GLAB_CONFIG_DIR"].includes(k))) {
+  for (const key of Object.keys(env).filter(k => !["PATH", "GLAB_CONFIG_DIR"].includes(k))) {
     expect(childEnv?.[key]).toBeUndefined();
   }
   return dir!;
@@ -79,6 +82,7 @@ describe("GitLab read gate", () => {
     };
     const { token, info } = await assertReadOnlyToken(config, repo, env, runner);
     expect(info.scopes).toEqual(["read_api", "read_repository"]);
+    expect(info).toEqual({ forge: "gitlab", scopes: ["read_api", "read_repository"], tokenType: "gitlab_pat" });
     expect(endpoints).toEqual(["/personal_access_tokens/self", "/projects/team%2Fsub%2Fproject"]);
     await gitlabApiRead(repo, token, "/projects/42/issues", runner, { env });
     await callGraph({ verb: "frontier", root: "1", repo, token, opts: { runner: async (bin, args, opts) => {
@@ -192,13 +196,50 @@ describe("GitLab read gate", () => {
     expect(calls).toBe(3);
   });
 
-  test("GitLab reads never call GitHub budget with the GitLab token", async () => {
+  test("GitLab forge dispatch never invokes gh, even for copied or cross-project tokens", async () => {
     const { token } = await assertReadOnlyToken(config, repo, env, async () => response({ scopes: ["read_api"] }));
     const journal = new Journal(":memory:");
+    const dir = mkdtempSync(join(tmpdir(), "ranger-gitlab-budget-"));
+    const calls = join(dir, "gh-called");
+    const oldPath = process.env.PATH;
+    writeFileSync(join(dir, "gh"), `#!${process.execPath}\nimport { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(calls)}, "called");\n`, { mode: 0o700 });
+    process.env.PATH = `${dir}:${oldPath ?? ""}`;
+    let reads = 0;
+    const read = async () => { reads++; return "read"; };
+    const policy = { floor: 1000, cooldownMs: 1 };
     try {
-      // If the GitHub budget ran it would refuse on this persisted cooldown.
-      journal.setHealth(`ratelimit:${source}`, JSON.stringify({ kind: "throttled", until: "2099-01-01", reason: "fixture" }));
-      expect(await budgetedRead(journal, token, { floor: 1000, cooldownMs: 1 }, new Date(), async () => "read")).toBe("read");
+      expect(await budgetedRead(journal, repo, token, policy, new Date(), read)).toBe("read");
+      await expect(budgetedRead(journal, repo, { ...token }, policy, new Date(), read)).rejects.toThrow(GateError);
+      await expect(budgetedRead(journal, `gitlab:${host}/team/other`, token, policy, new Date(), read)).rejects.toThrow(GateError);
+      expect(reads).toBe(1);
+      expect(existsSync(calls)).toBeFalse();
+    } finally {
+      if (oldPath === undefined) delete process.env.PATH; else process.env.PATH = oldPath;
+      rmSync(dir, { recursive: true, force: true });
+      journal.close();
+    }
+  });
+
+  test("GitLab throttles persist, defer without reading, back off and clear on success", async () => {
+    const { token } = await assertReadOnlyToken(config, repo, env, async () => response({ scopes: ["read_api"] }));
+    const journal = new Journal(":memory:");
+    const policy = { floor: 1000, cooldownMs: 1000 };
+    let reads = 0;
+    const throttle = async () => { reads++; throw new RateLimitError("GitLab rate limit"); };
+    const t0 = new Date("2026-10-07T10:00:00Z");
+    try {
+      await expect(budgetedRead(journal, repo, token, policy, t0, throttle)).rejects.toThrow(BudgetDeferral);
+      expect(activeCooldown(journal, source, t0)).toMatchObject({ strikes: 1, reason: "GitLab rate limit, throttle 1 in a row" });
+      await expect(budgetedRead(journal, repo, token, policy, t0, throttle)).rejects.toThrow(BudgetDeferral);
+      expect(reads).toBe(1);
+      const t1 = new Date(t0.getTime() + 1001);
+      await expect(budgetedRead(journal, repo, token, policy, t1, throttle)).rejects.toThrow(BudgetDeferral);
+      expect(activeCooldown(journal, source, t1)?.until.getTime()).toBe(t1.getTime() + 2000);
+      const t2 = new Date(t1.getTime() + 2001);
+      expect(await budgetedRead(journal, repo, token, policy, t2, async () => "ok")).toBe("ok");
+      expect(activeCooldown(journal, source, t2)).toBeNull();
+      await expect(budgetedRead(journal, repo, token, policy, t2, throttle)).rejects.toThrow(BudgetDeferral);
+      expect(activeCooldown(journal, source, t2)?.strikes).toBe(1);
     } finally { journal.close(); }
   });
 });
@@ -225,5 +266,13 @@ describe("principal keyring probe (stubbed only)", () => {
     const gated = glabConfigEnv(host, "", env);
     try { inspectConfig(gated.env, ""); } finally { gated.cleanup(); }
     expect(existsSync(gated.env.GLAB_CONFIG_DIR!)).toBeFalse();
+  });
+
+  test("config helper forwards only runtime variables from the parent", () => {
+    const runtime = { PATH: "/bin", HOME: "/home/worker", TMPDIR: "/tmp", LANG: "en_US.UTF-8", LC_ALL: "C", TZ: "UTC" };
+    const gated = glabConfigEnv(host, "", { ...env, ...runtime, NODE_OPTIONS: "--require injected.js", XDG_CONFIG_HOME: "/principal/config" });
+    try {
+      expect(gated.env).toEqual({ ...runtime, GLAB_CONFIG_DIR: gated.env.GLAB_CONFIG_DIR, SOMA_GRAPH_READONLY: "1" });
+    } finally { gated.cleanup(); }
   });
 });

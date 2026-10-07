@@ -3,8 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RangerAuthConfig, RangerConfig } from "./config.ts";
 import { runCmd, type RunOptions, type RunResult } from "./exec.ts";
-import { parseForgeRef, qualifiedRepo, repoIdentity } from "./forge-ref.ts";
-import { glabConfigEnv } from "./glab-config-dir.ts";
+import { parseForgeRef, qualifiedRepo, repoIdentity, type ForgeRef } from "./forge-ref.ts";
+import { glabConfigEnvAsync } from "./glab-config-dir.ts";
 
 /**
  * The read-only credential gate (node #8 ruling).
@@ -31,12 +31,13 @@ export interface ResolvedToken {
   source: string;
 }
 
-export interface TokenIntrospection {
+export type TokenIntrospection = {
+  forge: "github";
   /** Classic PAT scopes (`X-OAuth-Scopes`), empty for fine-grained / no-scope tokens. */
   scopes: string[];
   tokenType: "classic" | "fine-grained";
   login: string;
-}
+} | { forge: "gitlab"; scopes: string[]; tokenType: "gitlab_pat" };
 
 export class GateError extends Error {
   override readonly name = "GateError";
@@ -144,6 +145,7 @@ async function introspectToken(
     const { scopes } = parseGhHeaders(result.stdout);
     const login = extractLogin(result.stdout);
     return {
+      forge: "github",
       scopes,
       tokenType: scopes.length > 0 ? "classic" : "fine-grained",
       login,
@@ -207,10 +209,6 @@ async function assertRepoReadable(token: string, repo: string): Promise<void> {
 const gitlabReadGrants = new WeakMap<ResolvedToken, string>();
 const GITLAB_READ_SCOPES = new Set(["read_api", "read_repository"]);
 
-export function isGitLabReadToken(token: ResolvedToken): boolean {
-  return gitlabReadGrants.has(token);
-}
-
 export function assertGitLabReadGrant(repo: string, token: ResolvedToken): void {
   if (gitlabReadGrants.get(token) !== repoIdentity(parseForgeRef(repo))) {
     throw new GateError(`${token.source}: GitLab read credential has not passed the scope and project gate for ${repo}`);
@@ -219,23 +217,22 @@ export function assertGitLabReadGrant(repo: string, token: ResolvedToken): void 
 
 /** Internal bootstrap GET; never invoked without the private config env. */
 async function isolatedGitLabGet(
-  repo: string,
+  ref: ForgeRef,
   token: ResolvedToken,
   endpoint: string,
   runner: typeof runCmd,
   opts: RunOptions = {},
 ): Promise<RunResult> {
-  const ref = parseForgeRef(repo);
   if (ref.forge !== "gitlab" || !/^\/?[a-zA-Z0-9_]/.test(endpoint) || endpoint.includes(":") || endpoint.includes("#")) {
     throw new GateError(`${token.source}: invalid GitLab read endpoint`);
   }
-  const gated = glabConfigEnv(ref.host, token.token, opts.env);
+  const gated = await glabConfigEnvAsync(ref.host, token.token, opts.env);
   try {
     return await runner("glab", ["api", endpoint, "--hostname", ref.host, "--method", "GET", "--include"], {
       ...opts, timeoutMs: opts.timeoutMs ?? 15_000, env: gated.env,
     });
   } finally {
-    gated.cleanup();
+    await gated.cleanup();
   }
 }
 
@@ -251,30 +248,33 @@ export function parseGlabResponse(result: RunResult): { status: number; body: un
   return { status, body };
 }
 
+function expectGlabOk(result: RunResult, message: string): unknown {
+  const { status, body } = parseGlabResponse(result);
+  if (result.code !== 0 || status !== 200) {
+    throw new GateError(`${message} (HTTP ${status || "unknown"}, exit ${result.code})`);
+  }
+  return body;
+}
+
 async function assertGitLabReadOnlyToken(
   repo: string,
   token: ResolvedToken,
   env: NodeJS.ProcessEnv,
   runner: typeof runCmd,
 ): Promise<{ token: ResolvedToken; info: TokenIntrospection }> {
+  const ref = parseForgeRef(repo);
   try {
-    const self = await isolatedGitLabGet(repo, token, "/personal_access_tokens/self", runner, { env });
-    const { status, body } = parseGlabResponse(self);
-    if (self.code !== 0 || status !== 200) {
-      throw new GateError(`${token.source}: GitLab PAT introspection refused (HTTP ${status || "unknown"}, exit ${self.code})`);
-    }
+    const self = await isolatedGitLabGet(ref, token, "/personal_access_tokens/self", runner, { env });
+    const body = expectGlabOk(self, `${token.source}: GitLab PAT introspection refused`);
     const scopes = body !== null && typeof body === "object" ? (body as Record<string, unknown>).scopes : undefined;
     if (!Array.isArray(scopes) || scopes.some(scope => typeof scope !== "string" || !GITLAB_READ_SCOPES.has(scope))) {
       throw new GateError(`${token.source}: GitLab PAT scopes must be present and limited to read_api/read_repository`);
     }
-    const project = await isolatedGitLabGet(repo, token, `/projects/${encodeURIComponent(parseForgeRef(repo).path)}`, runner, { env });
-    const response = parseGlabResponse(project);
-    if (project.code !== 0 || response.status !== 200) {
-      throw new GateError(`${token.source}: token cannot read ${repo} (HTTP ${response.status || "unknown"}, exit ${project.code})`);
-    }
+    const project = await isolatedGitLabGet(ref, token, `/projects/${encodeURIComponent(ref.path)}`, runner, { env });
+    expectGlabOk(project, `${token.source}: token cannot read ${repo}`);
     Object.freeze(token);
-    gitlabReadGrants.set(token, repoIdentity(parseForgeRef(repo)));
-    return { token, info: { scopes, tokenType: "classic", login: "" } };
+    gitlabReadGrants.set(token, repoIdentity(ref));
+    return { token, info: { forge: "gitlab", scopes, tokenType: "gitlab_pat" } };
   } catch (error) {
     if (error instanceof GateError) throw error;
     // Do not echo subprocess output: errors may include credential material.
@@ -291,7 +291,7 @@ export async function gitlabApiRead(
   opts: RunOptions = {},
 ): Promise<RunResult> {
   assertGitLabReadGrant(repo, token);
-  return isolatedGitLabGet(repo, token, endpoint, runner, opts);
+  return isolatedGitLabGet(parseForgeRef(repo), token, endpoint, runner, opts);
 }
 
 /** Parse `gh api -i` output: the header block (up to the first blank line) → scope list + login. */

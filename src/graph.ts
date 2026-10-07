@@ -1,6 +1,6 @@
 import { runReadRetryingTransient } from "./transient.ts";
 import { gatedEnv, assertGitLabReadGrant, type ResolvedToken } from "./token-gate.ts";
-import { glabConfigEnv } from "./glab-config-dir.ts";
+import { glabConfigEnvAsync } from "./glab-config-dir.ts";
 import { runCmd } from "./exec.ts";
 import { parseForgeRef, qualifiedRepo, normalizeNodeId, type ForgeRef } from "./forge-ref.ts";
 
@@ -122,6 +122,18 @@ export interface GraphCallOptions {
  */
 export const GRAPH_CALL_TIMEOUT_MS = 60_000;
 
+async function graphReadBackend(ref: ForgeRef, token: ResolvedToken) {
+  if (ref.forge === "gitlab") {
+    assertGitLabReadGrant(qualifiedRepo(ref), token);
+    return {
+      ...await glabConfigEnvAsync(ref.host, token.token),
+      runner: runCmd,
+      timeoutMs: GRAPH_CALL_TIMEOUT_MS,
+    };
+  }
+  return { ...gatedEnv(token.token), runner: runReadRetryingTransient, timeoutMs: undefined };
+}
+
 interface CallGraphArgs {
   verb: ReadonlyVerb;
   root: string;
@@ -145,27 +157,24 @@ export async function callGraph(
     );
   }
   const ref = parseForgeRef(repo);
-  if (ref.forge === "gitlab") assertGitLabReadGrant(repo, token);
-  const gated = ref.forge === "gitlab"
-    ? glabConfigEnv(ref.host, token.token)
-    : gatedEnv(token.token);
+  const backend = await graphReadBackend(ref, token);
   try {
     const cliArgs = [
       "graph",
       verb,
-      graphNodeId(parseForgeRef(repo), String(root)),
+      graphNodeId(ref, String(root)),
       "--repo",
-      somaRepo(repo),
+      somaRepo(ref),
       "--json",
     ];
-    const runner = opts.runner ?? (ref.forge === "gitlab" ? runCmd : runReadRetryingTransient);
+    const runner = opts.runner ?? backend.runner;
     return await runner("soma", cliArgs, {
       cwd: opts.cwd,
-      timeoutMs: opts.timeoutMs ?? (ref.forge === "gitlab" ? GRAPH_CALL_TIMEOUT_MS : undefined),
-      env: gated.env,
+      timeoutMs: opts.timeoutMs ?? backend.timeoutMs,
+      env: backend.env,
     });
   } finally {
-    gated.cleanup();
+    await backend.cleanup();
   }
 }
 

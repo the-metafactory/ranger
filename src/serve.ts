@@ -1,4 +1,4 @@
-import { decodeForgeKey, isGithubRepo, readRefusal, nodeKey } from "./forge-ref.ts";
+import { decodeForgeKey, isGithubRepo, nodeKey } from "./forge-ref.ts";
 import { lastImplementMaps, mapKey, implementMapOrder } from "./maps.ts";
 /**
  * `ranger serve` (#37) — a local dashboard of the walk: the job a worker is on
@@ -1364,11 +1364,6 @@ export class ServeReader {
      error,
     });
    };
-   const refusal = readRefusal(map.repo);
-   if (refusal !== null) {
-    keep(refusal);
-    continue;
-   }
    let token: ResolvedToken;
    try { token = await tokens(map.repo); }
    catch (error) {
@@ -1766,7 +1761,6 @@ export function assertReadOnlyTokens(
  const unset = new Map<string, string[]>(); // token env -> the repos that need it
  const other: string[] = [];
  for (const repo of [...new Set(maps.map((m) => m.repo))]) {
-  if (readRefusal(repo) !== null) continue;
   try {
    resolveReadOnlyToken(config, repo, env);
   } catch (error) {

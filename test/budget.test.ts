@@ -93,7 +93,7 @@ describe("somaRepo — the forge-qualified --repo (launchd runs from /)", () => 
 
 describe("budgetedRead — the GraphQL floor and the rate-limit cooldown", () => {
   const frontier = (now: Date) =>
-    budgetedRead(journal, TOKEN, POLICY, now, () =>
+    budgetedRead(journal, REPO, TOKEN, POLICY, now, () =>
       graphFrontier(REPO, 1, TOKEN),
     );
 
@@ -137,7 +137,7 @@ describe("budgetedRead — the GraphQL floor and the rate-limit cooldown", () =>
     await expect(frontier(now)).rejects.toBeInstanceOf(BudgetDeferral);
     delete process.env.FAKE_SOMA_RATE_LIMITED;
     const other = { token: "ghp_write", source: "write-token" };
-    await budgetedRead(journal, other, POLICY, now, () =>
+    await budgetedRead(journal, REPO, other, POLICY, now, () =>
       graphFrontier(REPO, 1, other),
     );
     expect(somaCalls()).toBe(2);

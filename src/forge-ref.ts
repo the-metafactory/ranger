@@ -73,11 +73,6 @@ export function executionRefusal(repo: string): string | null {
   `GitLab execution is not implemented: ${repo} — registered refs cannot be walked until the forge gates and lanes are available`;
 }
 
-export function readRefusal(repo: string): string | null {
- parseForgeRef(repo);
- return null; // Both graph read backends now have a credential gate.
-}
-
 /** Bare prefixes are legacy GitHub keys; qualified prefixes include the host. */
 export function validReadTokenPrefix(prefix: string): boolean {
  if (!prefix.includes(":")) return prefix.length > 0 && !/\s/.test(prefix);

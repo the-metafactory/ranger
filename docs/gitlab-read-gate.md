@@ -14,11 +14,23 @@ Each new token batch checks `personal_access_tokens/self`, then proves
 project access before any graph read. A grant belongs to that token object
 and project; copying it or using it against another project refuses.
 
-Every glab GET and soma graph read receives a separate private config dir
-with only the selected host and credential. Inherited GitLab token and host
-overrides are removed. The dir is removed in `finally`, including spawn
-errors. GitLab reads bypass GitHub's GraphQL budget endpoint. GitLab write
-execution remains gated pending the separate write and lane nodes.
+Ranger creates a separate private config dir for each glab GET and soma
+graph read, and passes it as `GLAB_CONFIG_DIR`. On-disk tests assert the
+single host and credential, directory mode 0700, file mode 0600, and removal
+in `finally`, including spawn errors. The child environment allow-list keeps
+PATH, HOME, temporary-directory variables, locale variables and TZ; it
+excludes inherited credential variables (including GitHub and arbitrarily
+named write tokens) and CLI overrides. GitLab reads bypass GitHub's GraphQL
+budget endpoint and retain throttle cooldowns. GitLab write execution
+remains gated pending the separate write and lane nodes.
+
+These tests use a stubbed runner or a fixture executable. They prove what
+Ranger writes and passes to the child, **not** how a real Soma installation
+selects its credential, honors `SOMA_GRAPH_READONLY=1`, or accesses a
+keyring. That flag is a request to Soma, not verified confinement evidence.
+Soma confinement remains unverified here and requires the separate
+the-metafactory/soma#754 probe; this node does not implement that probe.
+Do not treat these passing tests as proof of end-to-end Soma confinement.
 
 ## Principal's Mac probe — required before rollout
 
@@ -41,4 +53,6 @@ reachable keyring entry; the Mac probe must settle that before rollout.
 
 Worker status: probe script verified with stubbed responses; **principal Mac
 probe not run by the machine-account worker**. No live result is claimed.
-The supervisor must obtain and record that evidence before the checkpoint.
+The supervisor must obtain and record the principal Mac output before the
+checkpoint. That glab probe alone also does not establish Soma confinement;
+the separate Soma probe is required before claiming confined live graph reads.
