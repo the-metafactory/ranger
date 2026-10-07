@@ -71,5 +71,7 @@ export async function statusSshCommand(options: { config: string; job: string; o
 }
 export function sshOutcomeExitCode(result: SshOutcome): number { return result.status === "terminal" && result.receipt.status === "passed" ? 0 : 1; }
 export function sshOutcomeMessage(result: SshOutcome): string {
+ if (result.status !== "terminal" && result.reason === "expired_job") return "Remote-test infra_failed (expired_job); this call made no submission. Inspect the request deadline and admission before a new attempt.\n";
+ if (result.status !== "terminal" && result.reason === "invalid_receipt") return "Remote-test infra_failed (invalid_receipt); inspect private endpoint, identity and freshness. Do not use the refused receipt or automatically resubmit.\n";
  return result.status === "terminal" ? `Remote-test ${result.receipt.status}; private receipt saved.\n` : `Remote-test ${result.status} (${result.reason}); retrieve status with the saved exact job, do not resubmit or run local fallback.\n`;
 }

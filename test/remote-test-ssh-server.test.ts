@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, readFile, realpath, rm, stat, symlink, writeFile } from
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { serveSshRequest } from "../src/remote-test/ssh-server.ts";
-import { runSshCommand, statusSshCommand, sshOutcomeExitCode } from "../src/remote-test/ssh-cli.ts";
+import { runSshCommand, statusSshCommand, sshOutcomeExitCode, sshOutcomeMessage } from "../src/remote-test/ssh-cli.ts";
 import { validateRemoteTestReceipt } from "../src/remote-test/contract.ts";
 import { submitSshRemoteTest, statusSshRemoteTest, type SshRunner } from "../src/remote-test/ssh-client.ts";
 import { executeRemoteTest } from "../src/remote-test/executor.ts";
@@ -87,6 +87,9 @@ test("CLI run and status expose truthful nonzero exit codes without leaking priv
   expect(result.code).toBe(1); expect(result.stderr).toContain("private input"); expect(result.stderr).not.toContain("/absent/private");
  }
  expect(sshOutcomeExitCode({ status: "pending", reason: "no_terminal_receipt" })).toBe(1);
+ expect(sshOutcomeMessage({ status: "infra_failed", reason: "expired_job" })).toContain("no submission");
+ expect(sshOutcomeMessage({ status: "infra_failed", reason: "invalid_receipt" })).toContain("Do not use the refused receipt");
+ expect(sshOutcomeMessage({ status: "infra_failed", reason: "invalid_receipt" })).not.toContain("retrieve status");
 });
 test("client wire roundtrip through receiver and real durable executor storage is retrievable without reexecution", async () => {
  const f = await fixture(), bundlePath = join(f.root, "source.bundle"); await writeFile(bundlePath, "bundle");
