@@ -6,9 +6,9 @@ import { isAbsolute, join } from "node:path";
 import { z } from "zod";
 import { killProcessGroup } from "../exec.ts";
 import { ResourceObservationSchema, validateProfileManifest, validateRemoteTestJob, validateRemoteTestReceipt, type RemoteTestReceipt, type ResourceObservation } from "./contract.ts";
-import { ArtifactPolicySchema, persistExecution, type ArtifactOptions } from "./artifacts.ts";
+import { ArtifactPolicySchema, persistExecution, readExecutionReceipt, type ArtifactOptions } from "./artifacts.ts";
 import { restoreSource } from "./source.ts";
-import { ActiveRemoteTestJob, openJobLedger, type JobLedger, type OwnedContainer } from "./job-ledger.ts";
+import { ActiveRemoteTestJob, RevokedRemoteTestJob, openJobLedger, type JobLedger, type OwnedContainer } from "./job-ledger.ts";
 
 export const EXECUTOR_LIMITS = { cpuCores: 2, memoryBytes: 1610612736, pids: 256, timeoutMs: 600_000 } as const;
 export const CONTAINER_BOOTSTRAP_FLAGS = ["--config=/dev/null", "--no-env-file"] as const;
@@ -91,16 +91,20 @@ export async function executeRemoteTest(input: ExecutionInput, options: Executio
  if (!selected) throw Error("Job profile is not operator-approved");
  const job = validateRemoteTestJob(input.job, selected.profile);
  const ledger = await openJobLedger(config.jobsRoot, config.executorId, options.now);
- const cancel = () => ledger.cancel(job);
+ let cancellationFailed = false;
+ const cancel = () => { try { ledger.cancel(job); } catch { cancellationFailed = true; } };
  try {
   if (options.signal?.aborted) cancel();
-  const admitted = ledger.admit(job);
+  const legacy = !ledger.recorded(job) ? await readExecutionReceipt(config.jobsRoot, job, config.executorId) : null;
+  const admitted = legacy ? ledger.adoptLegacy(job, legacy) : ledger.admit(job);
   if (admitted.kind === "terminal") return admitted.receipt;
+  if (admitted.kind === "revoked") throw new RevokedRemoteTestJob(admitted.receipt);
   if (admitted.kind === "active") throw new ActiveRemoteTestJob(admitted);
   options.signal?.addEventListener("abort", cancel, { once: true });
   if (options.signal?.aborted) cancel();
   try {
    const receipt = await executeAdmittedRemoteTest({ ...input, job, config }, options, ledger, admitted.token);
+   if (cancellationFailed) ledger.cancel(job); // Retry persistence after teardown; failure remains uncertain.
    return ledger.complete(job, admitted.token, receipt);
   } catch (error) { ledger.interrupt(job, admitted.token); throw error; }
  } finally { options.signal?.removeEventListener("abort", cancel); ledger.close(); }
@@ -147,11 +151,13 @@ async function executeAdmittedRemoteTest(
  const lane = join(root, ".executor-lane");
  try { await mkdir(lane, { mode: 0o700 }); }
  catch (error) { if ((error as NodeJS.ErrnoException).code === "EEXIST") return receipt(); throw error; }
- const owner = await open(join(lane, "owner.json"), "wx", 0o600);
- try { await owner.writeFile(JSON.stringify({ ledgerId: ledger.id, jobId: job.jobId, token })); await owner.sync(); } finally { await owner.close(); }
+ try {
+  const owner = await open(join(lane, "owner.json"), "wx", 0o600);
+  try { await owner.writeFile(JSON.stringify({ ledgerId: ledger.id, jobId: job.jobId, token })); await owner.sync(); } finally { await owner.close(); }
+ } catch (error) { await rm(lane, { recursive: true }); throw error; }
  const launcher = options.launcher ?? podmanLauncher;
  const controller = new AbortController();
- let interruption: "timed_out" | "cancelled" | undefined;
+ let interruption: "timed_out" | "cancelled" | "infra_failed" | undefined;
  const interrupt = (reason: typeof interruption) => { interruption ??= reason; controller.abort(); };
  const cancel = () => interrupt("cancelled");
  options.signal?.addEventListener("abort", cancel, { once: true });
@@ -160,7 +166,7 @@ async function executeAdmittedRemoteTest(
  const timer = setTimeout(() => interrupt("timed_out"), Math.max(0, end - now()));
  const fenceTimer = setInterval(() => {
   try { if (!ledger.allowed(job, token)) interrupt("cancelled"); }
-  catch { interrupt("cancelled"); }
+  catch { interrupt("infra_failed"); }
  }, 100);
  const command = async (args: string[], cleanup = false): Promise<string> => {
   const signal = cleanup ? new AbortController().signal : controller.signal;

@@ -46,7 +46,19 @@ test("completed outcomes retain their original status and time after the executi
   const receipt = f.ledger.complete(j, a.token, { version: 1, identity: j, executorId: "fixture", status, exitCode: status === "passed" ? 0 : 1, completedAt: f.now() });
   f.tick(j.deadline + 1);
   expect(f.ledger.status(j)).toEqual({ kind: "terminal", receipt }); expect(f.ledger.admit(j)).toEqual({ kind: "terminal", receipt });
-  f.ledger.cancel(j); const cancelled = f.ledger.status(j); if (cancelled?.kind !== "terminal") throw Error(); expect(cancelled.receipt.status).toBe("cancelled");
+  f.ledger.cancel(j); const cancelled = f.ledger.status(j);
+  expect(cancelled).toEqual({ kind: status === "passed" ? "revoked" : "terminal", receipt });
+  f.ledger.close();
+ }
+});
+test("supersession preserves completed outcomes and explicitly revokes success eligibility", async () => {
+ for (const status of ["passed", "test_failed"] as const) {
+  const f = await fixture(), j = job(), a = f.ledger.admit(j); if (a.kind !== "admitted") throw Error();
+  f.ledger.launch(j, a.token);
+  const receipt = f.ledger.complete(j, a.token, { version: 1, identity: j, executorId: "fixture", status, exitCode: status === "passed" ? 0 : 1, completedAt: f.now() });
+  f.tick(11_000); f.ledger.admit({ ...j, jobId: randomUUID(), generation: 2 });
+  const expected = { kind: status === "passed" ? "revoked" : "terminal", receipt } as const;
+  expect(f.ledger.status(j)).toEqual(expected); expect(f.ledger.admit(j)).toEqual(expected);
   f.ledger.close();
  }
 });

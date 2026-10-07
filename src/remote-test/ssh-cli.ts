@@ -71,6 +71,7 @@ export async function statusSshCommand(options: { config: string; job: string; o
 }
 export function sshOutcomeExitCode(result: SshOutcome): number { return result.status === "terminal" && result.receipt.status === "passed" ? 0 : 1; }
 export function sshOutcomeMessage(result: SshOutcome): string {
+ if (result.status === "revoked") return `Remote-test observed ${result.receipt.status} outcome is revoked; no accepted success.\n`;
  if (result.status !== "terminal" && result.reason === "active_job") return "Remote-test active; query status without resubmitting.\n";
  if (result.status !== "terminal" && result.reason === "interrupted_job") return "Remote-test interrupted; inspect executor recovery before any explicit retry. No accepted terminal receipt.\n";
  if (result.status !== "terminal" && result.reason === "expired_job") return "Remote-test infra_failed (expired_job); this call made no submission. Inspect the request deadline and admission before a new attempt.\n";

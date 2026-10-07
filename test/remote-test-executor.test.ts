@@ -87,6 +87,16 @@ test("concurrent executor duplicates report active and only one launches; comple
  await rm(join(f.config.jobsRoot, ".artifacts", id), { recursive: true });
  const count = f.calls.length; expect(await f.execute()).toEqual(receipt); expect(f.calls.length).toBe(count);
 });
+test("validated pre-ledger receipts upgrade without execution or a global recovery fence", async () => {
+ const f = await fixture(), receipt = await f.execute();
+ await rm(join(f.config.jobsRoot, ".execution"), { recursive: true }); // A previous producer left only its private artifact.
+ const count = f.calls.length;
+ expect(await f.execute()).toEqual(receipt); expect(f.calls.length).toBe(count);
+ await rm(join(f.config.jobsRoot, ".artifacts", id), { recursive: true });
+ expect(await f.execute()).toEqual(receipt); expect(f.calls.length).toBe(count);
+ const ledger = await openJobLedger(f.config.jobsRoot, f.config.executorId);
+ try { expect(ledger.admit({ ...f.job, jobId: "7c7e8091-1234-4234-8234-123456789abc", correlationId: "7c7e8091-1234-4234-8234-123456789abc" }).kind).toBe("admitted"); } finally { ledger.close(); }
+});
 test("durable cancellation before start and during artifact publication never exposes success", async () => {
  for (const duringStorage of [false, true]) {
   const f = await fixture(), ledger = await openJobLedger(f.config.jobsRoot, f.config.executorId);

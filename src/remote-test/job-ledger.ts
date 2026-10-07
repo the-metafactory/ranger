@@ -7,7 +7,7 @@ import { privateOperatorPath } from "./baseline.ts";
 import { validateJobIdentity, validateRemoteTestReceipt, type RemoteTestJob, type RemoteTestReceipt } from "./contract.ts";
 
 type Row = { job: string; state: "active" | "interrupted" | "terminal"; attempt: number; token: string; launched: number; receipt: string | null };
-export type Admission = { kind: "admitted"; token: string; attempt: number } | { kind: "active"; attempt: number; launched: boolean } | { kind: "terminal"; receipt: RemoteTestReceipt };
+export type Admission = { kind: "admitted"; token: string; attempt: number } | { kind: "active"; attempt: number; launched: boolean } | { kind: "terminal"; receipt: RemoteTestReceipt } | { kind: "revoked"; receipt: RemoteTestReceipt };
 export class ActiveRemoteTestJob extends Error {
  constructor(readonly status: Extract<Admission, { kind: "active" }>) { super("Remote-test job is active; query status instead of executing again"); }
 }
@@ -15,6 +15,9 @@ export class InterruptedRemoteTestJob extends Error {
  constructor(readonly attempt: number) { super("Remote-test job was interrupted; explicit recovery may permit one retry"); }
 }
 export class RemoteTestIdentityConflict extends Error {}
+export class RevokedRemoteTestJob extends Error {
+ constructor(readonly receipt: RemoteTestReceipt) { super("Remote-test completed outcome is revoked; no accepted success"); }
+}
 export type JobStatus = Exclude<Admission, { kind: "admitted" }> | { kind: "interrupted"; attempt: number };
 export interface OwnedContainer { id: string; ledgerId: string; jobId: string; token: string }
 export interface RecoveryAdapters {
@@ -71,18 +74,44 @@ export class JobLedger {
  }
  private terminal(job: RemoteTestJob, row: Row): Admission {
   const receipt = validateRemoteTestReceipt(JSON.parse(row.receipt!), job), reason = this.fence(job, false);
-  return { kind: "terminal", receipt: reason ? this.refusal(job, reason) : receipt };
+  return reason && receipt.status === "passed" ? { kind: "revoked", receipt } : { kind: "terminal", receipt };
  }
  status(input: unknown): JobStatus | null {
   const job = validateJobIdentity(input);
   return this.read(() => {
    const row = this.row(job);
    if (!row) { const reason = this.fence(job, false); return reason ? { kind: "terminal", receipt: this.refusal(job, reason) } : null; }
-   if (row.state === "terminal") return this.terminal(job, row) as Extract<Admission, { kind: "terminal" }>;
+   if (row.state === "terminal") return this.terminal(job, row) as Extract<Admission, { kind: "terminal" | "revoked" }>;
    const reason = this.fence(job);
    if (reason) return { kind: "terminal", receipt: this.refusal(job, reason) };
    if (row.state === "interrupted") return { kind: "interrupted", attempt: row.attempt };
    return { kind: "active", attempt: row.attempt, launched: !!row.launched };
+  });
+ }
+ recorded(input: unknown) {
+  const job = validateJobIdentity(input); return this.read(() => this.row(job) !== null);
+ }
+ inspectLegacy(input: unknown, value: unknown): JobStatus | null {
+  const job = validateJobIdentity(input), receipt = validateRemoteTestReceipt(value, job);
+  if (receipt.executorId !== this.executorId) throw Error("Execution ledger producer mismatch");
+  return this.read(() => {
+   if (this.row(job)) return this.status(job);
+   return this.fence(job, false) && receipt.status === "passed" ? { kind: "revoked", receipt } : { kind: "terminal", receipt };
+  });
+ }
+ /** Upgrade a validated private pre-ledger receipt only when there is no
+  * recorded attempt. Interrupted attempts can never adopt loose success. */
+ adoptLegacy(input: unknown, value: unknown): Admission {
+  const job = validateJobIdentity(input), receipt = validateRemoteTestReceipt(value, job);
+  if (receipt.executorId !== this.executorId) throw Error("Execution ledger producer mismatch");
+  return this.tx(() => {
+   const row = this.row(job);
+   if (this.recovering()) throw Error("Remote-test recovery fence is active");
+   if (row) { if (row.state !== "terminal") throw Error("Cannot adopt receipt for a recorded attempt"); return this.terminal(job, row); }
+   const current = this.db.query("SELECT generation FROM generations WHERE scope=?").get(scope(job)) as { generation: number } | null;
+   if (!current || job.generation > current.generation) this.db.query("INSERT INTO generations VALUES(?,?,0,?) ON CONFLICT(scope) DO UPDATE SET generation=excluded.generation,cancelled=0,changed_at=excluded.changed_at").run(scope(job), job.generation, this.now());
+   this.db.query("INSERT INTO jobs VALUES(?,?,'terminal',0,?,0,?)").run(job.jobId, encoded(job), randomUUID(), JSON.stringify(receipt));
+   return this.terminal(job, this.row(job)!);
   });
  }
  admit(input: unknown): Admission {

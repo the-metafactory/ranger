@@ -4,7 +4,7 @@ import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { submitSshRemoteTest, statusSshRemoteTest, validateSshConfig, type SshRunner } from "../src/remote-test/ssh-client.ts";
-import { sshOutcomeMessage } from "../src/remote-test/ssh-cli.ts";
+import { sshOutcomeMessage, sshOutcomeExitCode } from "../src/remote-test/ssh-cli.ts";
 
 const roots: string[] = [];
 afterEach(async () => { for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
@@ -29,22 +29,28 @@ test("uploads bound bytes over stdin and invokes only reviewed fixed argv with s
  expect(call.args).toContain("StrictHostKeyChecking=yes"); expect(call.args).toContain("BatchMode=yes"); expect(call.args).toContain("ForwardAgent=no"); expect(call.args).toContain("-T");
  expect(call.args.at(-1)).toBe("'/reviewed/ranger' 'remote-test' 'serve-stdio' '--config' '/private/executor.json'");
  const newline = call.bytes.indexOf(10), request = JSON.parse(call.bytes.subarray(0, newline).toString());
- expect(request).toEqual({ version: 1, operation: "submit", job, bundleBytes: 6 }); expect(call.bytes.subarray(newline + 1).toString()).toBe("bundle");
+ expect(request).toEqual({ version: 2, operation: "submit", job, bundleBytes: 6 }); expect(call.bytes.subarray(newline + 1).toString()).toBe("bundle");
  expect(call.bytes.toString()).not.toMatch(/remoteConfig|target|SSH_AUTH_SOCK|GH_TOKEN/);
 });
 test("status never uploads source or submits again, and handles absent and expired receipts truthfully", async () => {
  const f = fake(JSON.stringify({ version: 1, receipt: null }));
  expect((await statusSshRemoteTest({ config, job }, { runner: f.runner, now: () => now })).status).toBe("pending");
- expect(JSON.parse(f.calls[0]!.bytes.toString())).toEqual({ version: 1, operation: "status", job });
+ expect(JSON.parse(f.calls[0]!.bytes.toString())).toEqual({ version: 2, operation: "status", job });
  expect((await statusSshRemoteTest({ config, job }, { runner: f.runner, now: () => job.deadline + 1 })).status).toBe("infra_failed");
 });
 test("SSH consumers distinguish active ownership from interrupted work without retrying", async () => {
  for (const state of ["active", "interrupted"] as const) {
-  const f = fake(JSON.stringify({ version: 1, receipt: null, state }));
+  const f = fake(JSON.stringify({ version: 2, receipt: null, state }));
   const result = await statusSshRemoteTest({ config, job }, { runner: f.runner, now: () => now });
   expect(result).toEqual({ status: "pending", reason: state === "active" ? "active_job" : "interrupted_job" });
   expect(sshOutcomeMessage(result)).toContain(state); expect(f.calls).toHaveLength(1);
  }
+});
+test("a revoked historical passed receipt is retained as observed evidence but cannot succeed or be exported", async () => {
+ const f = fake(JSON.stringify({ version: 2, receipt, state: "revoked" })); let stored = false;
+ const result = await statusSshRemoteTest({ config, job }, { runner: f.runner, now: () => now, receiptStore: async () => { stored = true; } });
+ expect(result).toEqual({ status: "revoked", receipt }); expect(sshOutcomeExitCode(result)).toBe(1); expect(stored).toBe(false);
+ expect(sshOutcomeMessage(result)).toContain("revoked");
 });
 test("transport failure never trusts partial stdout or locally reruns tests", async () => {
  const f = fake(undefined, 255);
