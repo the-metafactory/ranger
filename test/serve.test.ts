@@ -300,10 +300,10 @@ describe("#37 — the state the dashboard shows", () => {
   expect(map.next.reason).toMatch(/not walked/);
  });
 
- test("the current job carries its title; a dead pid reads stale", () => {
+ test("the current job carries its title and map; a dead pid reads stale", () => {
   const live = assembleState(inputs({ workers: [worker({})] })).current;
   expect(live).toHaveLength(1);
-  expect(live[0]).toMatchObject({ nodeId: "50", title: "the running one", stale: false });
+  expect(live[0]).toMatchObject({ root: 1, nodeId: "50", title: "the running one", stale: false });
   const dead = assembleState(
    inputs({ workers: [worker({})], pidAlive: () => false }),
   ).current[0];
