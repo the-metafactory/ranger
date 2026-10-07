@@ -896,6 +896,16 @@ function renderMeta(s) {
 }
 const tag = (text, cls) => el("span", { class: "tag" + (cls ? " " + cls : ""), text, title: text });
 const tags = (...kids) => el("div", { class: "tags" }, ...kids);
+// When the job started and how long it has run; the page re-renders every 15 s.
+function jobTime(iso) {
+ if (!iso) return "start not recorded";
+ const start = new Date(iso);
+ const today = start.toDateString() === new Date().toDateString();
+ const clock = start.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+ const min = Math.max(0, Math.floor((Date.now() - start.getTime()) / 60000));
+ const so = min < 60 ? min + " min" : min < 1440 ? Math.floor(min / 60) + " h " + (min % 60) + " min" : Math.floor(min / 1440) + " d " + Math.floor((min % 1440) / 60) + " h";
+ return "started " + (today ? clock : start.toLocaleDateString([], { day: "numeric", month: "short" }) + " " + clock) + " · " + so + " so far";
+}
 // One pill per fact, each once: status and phase are often the same word.
 function jobTags(j) {
  if (j.stale) return [tag("stale: process gone", "stale")];
@@ -911,7 +921,7 @@ function renderCurrent(s) {
   return { count: jobs.length, el: group("current/" + m.repo + "#" + m.root, "map #" + m.root, jobs.length, "", el("ul", {}, ...jobs.map((j) => {
    const waiting = j.status === "awaiting-merge" ? (s.awaitingMerge || []).find((e) => e.repo === j.repo && e.nodeId === j.nodeId) : undefined;
    const last = waiting ? results.get(waiting.key + "/" + waiting.nodeId) : undefined;
-   return el("li", {}, el("span", { class: "id", text: "#" + j.nodeId }), el("span", { class: "t", text: j.title || "(title not in the frontier read)" }),
+   return el("li", {}, el("span", { class: "id", text: "#" + j.nodeId }), el("span", { class: "t" }, document.createTextNode(j.title || "(title not in the frontier read)"), el("span", { class: "reason", text: jobTime(j.startedAt) })),
     tags(...jobTags(j), waiting ? mergeButton(waiting, "Merge now") : null, waiting && waiting.pr ? link(waiting.pr.url, "Open PR") : null),
     last ? el("pre", { class: last.err ? "err" : "", text: last.text }) : null);
   }))) };
