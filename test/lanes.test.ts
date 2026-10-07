@@ -7,8 +7,8 @@ import { implementLane, workerLane } from "../src/lanes.ts";
 import { ConfigError, loadConfig } from "../src/config.ts";
 import { openJournal } from "../src/journal.ts";
 import { runMergeDesk } from "../src/merge-desk.ts";
-import { realGitHub, type GitHubPort } from "../src/implement.ts";
-import type { PullRequest } from "../src/github.ts";
+import { realGitHub, type ForgePort } from "../src/implement.ts";
+import type { ChangeRequest } from "../src/forge.ts";
 import { servedMaps, ServeReader, stateFromJournal } from "../src/serve.ts";
 import { fakeDiscord, fixturesBin, runCli } from "./support.ts";
 
@@ -222,9 +222,9 @@ describe("node #57/#47 — root-aware resource lanes", () => {
   const r = rig();
   try {
    const head = "a".repeat(40);
-   const github: GitHubPort = {
+   const github: ForgePort = {
     ...realGitHub,
-    getPr: async (_repo, number) => ({ number, state: "open", merged: false, headSha: head, url: "" } as PullRequest),
+    getPr: async (_repo, number) => ({ iid: number, state: "open", headSha: head, webUrl: "" } as ChangeRequest),
     listComments: async () => [{ id: 1, author: "ivy-bot", body: `<!-- ranger:review round=1 sha=${head} blockers=1 majors=0 nits=0 -->` }],
    };
    r.journal.upsertWorker({ root: 1, nodeId: "90", repo: GAME, status: "running", lane: "implement" });

@@ -1,5 +1,5 @@
 import { classifyCi } from "./ci-policy.ts";
-import type { CheckRun, PullRequest } from "./github.ts";
+import type { ChangeRequest, CiVerdict } from "./forge.ts";
 
 /**
  * The implement lane's merge gate (design §2/§4, #23 amendment). Pilot's
@@ -21,8 +21,8 @@ export type GateCheck =
  | "probes";
 
 export interface MergeGateInput {
- pr: PullRequest;
- checkRuns: CheckRun[];
+ pr: ChangeRequest;
+ ci: CiVerdict;
  expectedBase: string;
  /** Ranger's recorded sage verdict: the SHA it read and its blocker count. */
  verdictSha: string | null;
@@ -47,11 +47,11 @@ export type MergeGateResult =
 export function evaluateMergeGate(input: MergeGateInput): MergeGateResult {
  const { pr } = input;
 
- if (pr.state !== "open" || pr.merged) {
+ if (pr.state !== "open") {
   return {
    status: "fail",
    check: "open",
-   reason: pr.merged ? "PR is already merged" : "PR was closed without merging",
+   reason: pr.state === "merged" ? "PR is already merged" : "PR was closed without merging",
   };
  }
 
@@ -59,47 +59,25 @@ export function evaluateMergeGate(input: MergeGateInput): MergeGateResult {
  //    workflow on a conflicting PR, so "no check runs yet" would read as
  //    pending forever (seelite #692, 2026-10-05: ready and sage-clean, never
  //    carded, because #686/#687 landed while it was being built).
- if (pr.mergeable === false || pr.mergeableState === "dirty") {
+ if (pr.mergeState === "conflict") {
   return {
    status: "fail",
    check: "mergeable",
-   reason: `mergeable=${pr.mergeable}, state=${pr.mergeableState} (conflicts with ${input.expectedBase})`,
+   reason: `${pr.mergeDetail ?? "state=conflict"} (conflicts with ${input.expectedBase})`,
   };
  }
 
- // 1. CI green on the live head, by the shared policy (`ci-policy.ts`).
- const ci = classifyCi(input.checkRuns);
- if (ci.state === "none") {
-  return { status: "pending", check: "ci-green", reason: "no check runs on the head yet" };
+ if (["unknown", "blocked", "needs-rebase"].includes(pr.mergeState)) {
+  return { status: "fail", check: "mergeable", reason: `merge state is ${pr.mergeState}${pr.mergeDetail ? ` (${pr.mergeDetail})` : ""}` };
  }
- if (ci.state === "pending") {
-  return {
-   status: "pending",
-   check: "ci-green",
-   reason: `${ci.running.length} check run(s) still running: ${ci.running.map((c) => c.name).join(", ")}`,
-  };
- }
- if (ci.state === "failed") {
-  return {
-   status: "fail",
-   check: "ci-green",
-   reason: `CI failed: ${ci.failed.map((c) => `${c.name}=${c.conclusion}`).join(", ")}`,
-  };
- }
- // soma's auto close cites one successful check run (`--ci <id>@<sha>`).
- if (ci.state === "no-success") {
-  return {
-   status: "fail",
-   check: "ci-green",
-   reason: "no check run concluded success (all neutral/skipped) — nothing for the close to cite",
-  };
- }
- const success = ci.success;
 
- // 2. mergeable. GitHub computes this lazily; null means "ask again". A known
- //    conflict already failed at step 0.
- if (pr.mergeable === null || pr.mergeableState === "unknown") {
-  return { status: "pending", check: "mergeable", reason: "GitHub is still computing mergeability" };
+ // 1. CI green on the live head, from the adapter's forge-neutral verdict.
+ const ci = classifyCi(input.ci);
+ if (ci.status !== "pass") return { status: ci.status, check: "ci-green", reason: ci.reason };
+
+ // The adapter normalises computing states; unfamiliar states fail closed.
+ if (pr.mergeState === "pending") {
+  return { status: "pending", check: "mergeable", reason: pr.mergeDetail ?? "Forge is still computing mergeability" };
  }
 
  // 3. base branch.
@@ -142,5 +120,5 @@ export function evaluateMergeGate(input: MergeGateInput): MergeGateResult {
   };
  }
 
- return { status: "pass", ciCheckRunId: success.id, headSha: pr.headSha };
+ return { status: "pass", ciCheckRunId: ci.runId, headSha: pr.headSha };
 }

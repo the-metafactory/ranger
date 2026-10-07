@@ -1,3 +1,5 @@
+import { githubCiVerdict } from "../src/github-ci.ts";
+import type { CiPurpose, MergeState } from "../src/forge.ts";
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import {
  copyFileSync,
@@ -14,8 +16,9 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { loadConfig } from "../src/config.ts";
 import { runCmd } from "../src/exec.ts";
-import type { CheckRun, IssueComment, PullRequest } from "../src/github.ts";
-import { baseMergeMarker, recordedBaseMerges, recordedReviews, reviewMarker, type GitHubPort } from "../src/implement.ts";
+import type { IssueComment, ChangeRequest } from "../src/forge.ts";
+import type { CheckRun } from "../src/github.ts";
+import { baseMergeMarker, recordedBaseMerges, recordedReviews, reviewMarker, type ForgePort } from "../src/implement.ts";
 import { Database } from "bun:sqlite";
 import { openJournal, type Journal } from "../src/journal.ts";
 import { ReviewError, type ReviewVerdict } from "../src/review.ts";
@@ -39,9 +42,7 @@ const BOT = "ivy-bot";
 const DEAD_PID = 2_147_483_646;
 
 /** In-memory forge over the real bare origin: a PR's head is the origin branch's tip. */
-class FakeGitHub implements GitHubPort {
- async workflowRunsFor() { return []; }
- async commitStatusesFor() { return []; }
+class FakeGitHub implements ForgePort {
  prs = new Map<
   number,
   {
@@ -74,30 +75,29 @@ class FakeGitHub implements GitHubPort {
   return r.code === 0 ? r.stdout.trim() : "";
  }
 
- private async view(n: number): Promise<PullRequest> {
+ private async view(n: number): Promise<ChangeRequest> {
   const pr = this.prs.get(n);
   if (pr === undefined) throw new Error(`no PR #${n}`);
   return {
-   number: n,
-   state: pr.state,
-   merged: pr.merged,
+   iid: n,
+   state: pr.merged ? "merged" : pr.state,
    draft: pr.draft,
    title: pr.title,
    mergedBy: pr.mergedBy,
    headRef: pr.head,
    headSha: pr.mergedSha ?? (await this.sha(pr.head)),
    baseRef: pr.base,
-   ...(pr.merged ? { mergeable: true, mergeableState: "clean" } : await this.mergeability(pr.head)),
+   mergeState: pr.merged ? "mergeable" : await this.mergeability(pr.head),
    mergeCommitSha: pr.mergedSha,
-   url: `https://github.com/acme/widgets/pull/${n}`,
+   webUrl: `https://github.com/acme/widgets/pull/${n}`,
    author: BOT,
   };
  }
 
  /** Like GitHub: a trial merge of the head into origin main decides mergeability. */
- private async mergeability(head: string): Promise<{ mergeable: boolean; mergeableState: string }> {
+ private async mergeability(head: string): Promise<MergeState> {
   const trial = await runCmd("git", ["merge-tree", "--write-tree", "main", `refs/heads/${head}`], { cwd: this.origin });
-  return trial.code === 0 ? { mergeable: true, mergeableState: "clean" } : { mergeable: false, mergeableState: "dirty" };
+  return trial.code === 0 ? "mergeable" : "conflict";
  }
 
  async findPrByHead(_repo: string, branch: string) {
@@ -119,12 +119,12 @@ class FakeGitHub implements GitHubPort {
   const pr = this.prs.get(n);
   if (pr) pr.body = body;
  }
- async markReady(_repo: string, pr: PullRequest) {
-  const stored = this.prs.get(pr.number);
+ async markReady(_repo: string, pr: ChangeRequest) {
+  const stored = this.prs.get(pr.iid);
   if (stored) stored.draft = false;
  }
- async checkRunsFor() {
-  return this.checkRuns;
+ async ciVerdictFor(_repo: string, _sha: string, _token: string, purpose?: CiPurpose) {
+  return githubCiVerdict(_repo, this.checkRuns, purpose);
  }
  async postComment(_repo: string, n: number, body: string) {
   const list = this.comments.get(n) ?? [];
@@ -417,7 +417,7 @@ describe("remote supervisor backend integration", () => {
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge"); expect(requests).toHaveLength(2);
   expect(requests[0]!.head).not.toBe(requests[1]!.head);
   expect((await r.github.getPr("acme/widgets", 1)).headSha).toBe(requests[1]!.head);
-  expect((await r.github.getPr("acme/widgets", 1)).mergeable).toBe(true);
+  expect((await r.github.getPr("acme/widgets", 1)).mergeState).toBe("mergeable");
   expect(r.calls).toHaveLength(2);
  }, 60_000);
  test("tampered persisted fix-pass receipt is refused by the second pre-push gate", async () => {
@@ -964,9 +964,36 @@ describe("implement lane (node #23)", () => {
   const s = state(r.statePath);
   expect(s.lastClose.ci).toBe("");
   expect(s.lastClose.evidence.map((e: { kind: string }) => e.kind)).toEqual(["judged", "tested"]);
+  expect(s.lastClose.evidence.map((e: { pointer: string }) => e.pointer)).toEqual([
+   "https://github.com/acme/widgets/pull/1", "https://github.com/acme/widgets/runs/101",
+  ]);
   const kinds = r.journal.listEvents("acme/widgets", 500).map((e) => e.kind);
   expect(kinds.filter((k) => k === "decisions-written")).toHaveLength(1);
   expect(kinds).not.toContain("decisions-failed");
+ }, 60_000);
+
+ test("propose close cites the forge's change-request and CI URLs", async () => {
+  const r = await rig({ autonomy: "propose" });
+  cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  await r.github.merge(1);
+  const changeUrl = "https://forge.example/group/widgets/changes/1";
+  const runUrl = "https://forge.example/group/widgets/jobs/101";
+  const getPr = r.github.getPr.bind(r.github);
+  const getCi = r.github.ciVerdictFor.bind(r.github);
+  const prSpy = spyOn(r.github, "getPr").mockImplementation(async (...args) => ({ ...await getPr(...args), webUrl: changeUrl }));
+  const ciSpy = spyOn(r.github, "ciVerdictFor").mockImplementation(async (...args) => {
+   const ci = await getCi(...args);
+   return ci.state === "green" ? { ...ci, runUrl } : ci;
+  });
+  try {
+   r.journal.updateWorker("20", "acme/widgets", { status: "running" });
+   expect((await runNode("20", r.ctx)).status).toBe("success");
+   expect(state(r.statePath).lastClose.evidence.map((e: { pointer: string }) => e.pointer)).toEqual([changeUrl, runUrl]);
+  } finally {
+   prSpy.mockRestore();
+   ciSpy.mockRestore();
+  }
  }, 60_000);
 
  test("a failed decisions write after the close records decisions-failed only, and the close still succeeds (node #108)", async () => {
@@ -1354,7 +1381,7 @@ describe("implement lane (node #23)", () => {
   const head = await r.github.sha("node/20-add-the-feature-module");
   const inside = await runCmd("git", ["merge-base", "--is-ancestor", "main", head], { cwd: r.origin });
   expect(inside.code).toBe(0);
-  expect((await r.github.getPr("acme/widgets", 1)).mergeable).toBe(true);
+  expect((await r.github.getPr("acme/widgets", 1)).mergeState).toBe("mergeable");
   const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
   expect(events.some((d) => d.startsWith("PR conflicts with origin/main in src/feature.ts"))).toBe(true);
   expect(events.some((d) => d.startsWith("base merge pass 1 @"))).toBe(true);
@@ -1370,7 +1397,7 @@ describe("implement lane (node #23)", () => {
   expect(outcome.status).toBe("failed");
   expect(outcome.detail).toContain("base merge pass committed nothing — the conflict with origin/main stands");
   expect((r.github.comments.get(1) ?? []).some((c) => c.body.includes("ranger:base-merge"))).toBe(false);
-  expect((await r.github.getPr("acme/widgets", 1)).mergeable).toBe(false);
+  expect((await r.github.getPr("acme/widgets", 1)).mergeState).toBe("conflict");
  }, 60_000);
 
  test("an install after the base merge that rewrites a tracked file fails the pass before the tests, and nothing is pushed", async () => {
@@ -1470,7 +1497,7 @@ describe("implement lane (node #23)", () => {
   const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
   expect(events.some((d) => d.includes("conflicts with main") && d.includes("run-node resumes"))).toBe(true);
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
-  expect((await r.github.getPr("acme/widgets", 1)).mergeable).toBe(true);
+  expect((await r.github.getPr("acme/widgets", 1)).mergeState).toBe("mergeable");
  }, 60_000);
 
  test("a failed supervisor test run names its failing test and keeps its whole output in the node's log", async () => {

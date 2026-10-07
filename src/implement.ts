@@ -21,7 +21,7 @@ import {
 } from "./git-ops.ts";
 import { recordKnownGood, trustedSnapshot } from "./git-trust.ts";
 import * as gh from "./github.ts";
-import type { CheckRun, IssueComment, PullRequest, GitHubPort } from "./github.ts";
+import type { IssueComment, ChangeRequest, ForgePort, CiVerdict } from "./forge.ts";
 import { ParkSignal } from "./signals.ts";
 import {
  PROBE_FILE,
@@ -78,10 +78,10 @@ import { assertTestEvidence, assertTestSource, createSshTestBackend, localTestBa
  * outward action is fenced by the occupant generation (F1).
  */
 
-export type { GitHubPort } from "./github.ts";
+export type { ForgePort } from "./forge.ts";
 export { ParkSignal } from "./signals.ts";
 
-export const realGitHub: GitHubPort = gh;
+export const realGitHub: ForgePort = gh;
 
 export type Reviewer = (
  repo: string,
@@ -121,7 +121,7 @@ export interface ImplementContext {
  shellRun?: ShellRun;
  /** Supervisor-owned test boundary; never passed to the coding worker. */
  testBackend?: TestBackend;
- github?: GitHubPort;
+ github?: ForgePort;
  reviewer?: Reviewer;
  /** How long to wait for GitHub to show a pushed head (default 2 min; tests shorten it). */
  headPollMs?: number;
@@ -390,7 +390,7 @@ export function probeCommandFor(template: string, nodeId: string): string {
  */
 async function probeFinalHead(
  ctx: ImplementContext,
- github: GitHubPort,
+ github: ForgePort,
  prNumber: number,
 ): Promise<RecordedProbe> {
  const { map, journal, node, token, botIdentity, worktree } = ctx;
@@ -733,9 +733,9 @@ export function implementBranchFor(
 }
 
 /** Resolve where to pick up, from GitHub first (F2). */
-export function resolvePhase(pr: PullRequest | null): ImplementPhase | "pr-closed" {
+export function resolvePhase(pr: ChangeRequest | null): ImplementPhase | "pr-closed" {
  if (pr === null) return "implement";
- if (pr.merged) return "close";
+ if (pr.state === "merged") return "close";
  if (pr.state === "closed") return "pr-closed";
  return "review";
 }
@@ -771,16 +771,16 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
  journal.recordEvent("worker-start", {
   nodeId,
   repo,
-  detail: `implement lane resumes at phase ${phase} (branch ${branch}${pr === null ? "" : `, PR #${pr.number}`})`,
+  detail: `implement lane resumes at phase ${phase} (branch ${branch}${pr === null ? "" : `, PR #${pr.iid}`})`,
  });
 
  if (phase === "pr-closed") {
   throw new ParkSignal(
-   `PR #${pr?.number} for ${branch} was closed without merging — a human declined it; ranger will not reopen or re-propose it`,
+   `PR #${pr?.iid} for ${branch} was closed without merging — a human declined it; ranger will not reopen or re-propose it`,
   );
  }
  if (phase === "close") {
-  return closeAfterMerge(ctx, github, pr as PullRequest);
+  return closeAfterMerge(ctx, github, pr as ChangeRequest);
  }
 
  // ---- implement ----
@@ -828,15 +828,15 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
    { head: branch, base, title, body: draftBody(ctx) },
    token,
   );
-  journal.updateWorker(nodeId, ctx.map.repo, { phase: "review", prNumber: pr.number });
-  await awaitHead(github, repo, pr.number, built.sha, token, ctx.headPollMs);
-  journal.recordEvent("pr-opened", { nodeId, repo, detail: `PR #${pr.number} (draft) ${pr.url}` });
+  journal.updateWorker(nodeId, ctx.map.repo, { phase: "review", prNumber: pr.iid });
+  await awaitHead(github, repo, pr.iid, built.sha, token, ctx.headPollMs);
+  journal.recordEvent("pr-opened", { nodeId, repo, detail: `PR #${pr.iid} (draft) ${pr.webUrl}` });
  }
 
  // ---- review loop ----
- const open = pr as PullRequest;
- journal.updateWorker(nodeId, ctx.map.repo, { phase: "review", prNumber: open.number });
- const opening = await github.listComments(repo, open.number, token);
+ const open = pr as ChangeRequest;
+ journal.updateWorker(nodeId, ctx.map.repo, { phase: "review", prNumber: open.iid });
+ const opening = await github.listComments(repo, open.iid, token);
  let reviews = recordedReviews(opening, botIdentity);
  // A base merge pass moves the head without a finding to answer: each one
  // that landed in the PR's head grants the round that reviews the merged
@@ -845,7 +845,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
  let baseMerges = await landedBaseMerges(
   worktree,
   recordedBaseMerges(opening, botIdentity),
-  (await github.getPr(repo, open.number, token)).headSha,
+  (await github.getPr(repo, open.iid, token)).headSha,
  );
  const capNow = () => config.workers.reviewRounds + baseMerges;
  // The head whose set-aside major is already journaled: once per head per
@@ -853,7 +853,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
  let notedSha: string | undefined;
  for (;;) {
   const cap = capNow();
-  const live = await github.getPr(repo, open.number, token);
+  const live = await github.getPr(repo, open.iid, token);
   let current = reviewAtHead(reviews, live.headSha);
   const superseded = supersededNote(reviews, live.headSha);
   if (superseded !== null && notedSha !== live.headSha) {
@@ -862,7 +862,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
   }
   if (current === undefined) {
    if (reviews.length >= cap) {
-    throw new ParkSignal(reviewCapHeadMovedOutcome({ rounds: reviews.length, pr: open.number }));
+    throw new ParkSignal(reviewCapHeadMovedOutcome({ rounds: reviews.length, pr: open.iid }));
    }
    const round = reviews.length + 1;
    fence("review");
@@ -878,7 +878,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
      openSession();
      try {
       return {
-       verdict: await (ctx.reviewer ?? sageReview)(repo, open.number, ctx.readOnlyToken, {
+       verdict: await (ctx.reviewer ?? sageReview)(repo, open.iid, ctx.readOnlyToken, {
         substrate: reviewSubstrate,
         nice: config.workers.niceness,
        }),
@@ -898,20 +898,20 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
      status: "failed",
      detail: `sage review round ${round} on ${reviewSubstrate} hit its rate limit: ${reviewed.error.message.slice(0, 300)}`,
      workerExit,
-     prNumber: open.number,
+     prNumber: open.iid,
      substrateCapped: reviewed.cap,
     };
    }
    const verdict = reviewed.verdict;
    if (verdict.commitId !== live.headSha) {
     throw new ParkSignal(
-     `sage reviewed ${verdict.commitId.slice(0, 8)} but PR #${open.number}'s head is ${live.headSha.slice(0, 8)} — the head moved during review`,
+     `sage reviewed ${verdict.commitId.slice(0, 8)} but PR #${open.iid}'s head is ${live.headSha.slice(0, 8)} — the head moved during review`,
     );
    }
    fence("post review");
    await github.postComment(
     repo,
-    open.number,
+    open.iid,
     reviewComment(round, verdict, reviewSubstrate),
     token,
    );
@@ -942,9 +942,9 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
    // Sage-clean. Before the probes certify this head, it must merge: GitHub
    // runs no CI on a conflicting PR, so a conflict found only at the merge
    // desk waits forever (seelite #692).
-   if (!(await conflictsWithBase(ctx, github, open.number))) break;
+   if (!(await conflictsWithBase(ctx, github, open.iid))) break;
    if (baseMerges >= MAX_BASE_MERGES) {
-    throw new ParkSignal(baseConflictOutcome({ pr: open.number, base, passes: baseMerges }));
+    throw new ParkSignal(baseConflictOutcome({ pr: open.iid, base, passes: baseMerges }));
    }
    const merged = await baseMergePass(ctx, testCommand, live.headSha);
    workerExit = merged.workerExit;
@@ -953,11 +953,11 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
    // unreviewed head at the cap. A marker whose push never happens counts
    // for nothing (landedBaseMerges), so a crash between them costs nothing.
    fence("record the base merge");
-   await github.postComment(repo, open.number, baseMergeMarker(merged.sha, base), token);
+   await github.postComment(repo, open.iid, baseMergeMarker(merged.sha, base), token);
    await publishPass(
     ctx,
     github,
-    open.number,
+    open.iid,
     merged,
     "push base merge",
     `base merge pass ${baseMerges + 1} @ ${merged.sha.slice(0, 8)}: origin/${base} merged in after a conflict`,
@@ -967,7 +967,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
   }
   if (current.round >= cap) {
    throw new ParkSignal(
-    reviewCapOutcome({ blockers: current.blockers, majors: current.majors, round: current.round, pr: open.number }),
+    reviewCapOutcome({ blockers: current.blockers, majors: current.majors, round: current.round, pr: open.iid }),
    );
   }
   // One fix pass per review that found blockers or majors. On a resume the review is
@@ -975,13 +975,13 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
   const fixed = await workerPass(ctx, testCommand, { kind: "fix", round: current.round, body: current.body });
   workerExit = fixed.workerExit;
   if (fixed.failure !== undefined) return fixed.failure;
-  await publishPass(ctx, github, open.number, fixed, "push fix", `fix pass ${current.round} @ ${fixed.sha.slice(0, 8)}`);
+  await publishPass(ctx, github, open.iid, fixed, "push fix", `fix pass ${current.round} @ ${fixed.sha.slice(0, 8)}`);
  }
 
  // ---- probe tier, once, on the final head ----
  let probe: RecordedProbe | undefined;
  if (map.commands.probe !== undefined) {
-  probe = await probeFinalHead(ctx, github, open.number);
+  probe = await probeFinalHead(ctx, github, open.iid);
  }
 
  // The run-node awake hold covers this informational capture step too.
@@ -1007,10 +1007,10 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
   if (record !== undefined) {
    fence("post the views record");
    try {
-    const comments = await github.listComments(repo, open.number, token);
+    const comments = await github.listComments(repo, open.iid, token);
     const body = viewsComment(record, viewsDirectory(journal.path, repo, nodeId, final.sha));
     if (!comments.some(c => c.author === botIdentity && c.body === body)) {
-     await github.postComment(repo, open.number, body, token);
+     await github.postComment(repo, open.iid, body, token);
     }
    } catch (error) {
     journal.recordEvent("reviewed", { nodeId, repo, detail: `views comment failed (informational): ${String(error).slice(-500)}` });
@@ -1020,8 +1020,8 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
 
  // ---- ready → awaiting merge ----
  fence("mark ready");
- await github.updatePrBody(repo, open.number, readyBody(ctx, final, reviews.length, probe), token);
- await github.markReady(repo, await github.getPr(repo, open.number, token), token);
+ await github.updatePrBody(repo, open.iid, readyBody(ctx, final, reviews.length, probe), token);
+ await github.markReady(repo, await github.getPr(repo, open.iid, token), token);
  journal.updateWorker(nodeId, ctx.map.repo, {
   status: "awaiting-merge",
   phase: "awaiting-merge",
@@ -1030,13 +1030,13 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
  journal.recordEvent("awaiting-merge", {
   nodeId,
   repo,
-  detail: `PR #${open.number} ready; sage clean at ${final.sha.slice(0, 8)} — the merge card follows once CI is green`,
+  detail: `PR #${open.iid} ready; sage clean at ${final.sha.slice(0, 8)} — the merge card follows once CI is green`,
  });
  return {
   status: "awaiting-merge",
-  detail: `PR #${open.number} is ready and waits on the principal's merge`,
+  detail: `PR #${open.iid} is ready and waits on the principal's merge`,
   workerExit,
-  prNumber: open.number,
+  prNumber: open.iid,
  };
 }
 
@@ -1080,7 +1080,7 @@ async function landedBaseMerges(worktree: string, merges: { sha: string }[], hea
 /** Push a pass's commits through the vetted push, record them, and wait for GitHub to show the head. */
 async function publishPass(
  ctx: ImplementContext,
- github: GitHubPort,
+ github: ForgePort,
  prNumber: number,
  pass: PassResult,
  action: string,
@@ -1108,12 +1108,12 @@ async function publishPass(
  * while; one that stays unknown reads as no conflict, and the merge gate
  * asks again before any merge.
  */
-async function conflictsWithBase(ctx: ImplementContext, github: GitHubPort, prNumber: number): Promise<boolean> {
+async function conflictsWithBase(ctx: ImplementContext, github: ForgePort, prNumber: number): Promise<boolean> {
  const { pollMs, attempts } = ctx.mergeablePoll ?? { pollMs: 5_000, attempts: 12 };
  for (let i = 0; i < attempts; i++) {
   const pr = await github.getPr(ctx.map.repo, prNumber, ctx.token);
-  if (pr.mergeable !== null && pr.mergeableState !== "unknown") {
-   return pr.mergeable === false || pr.mergeableState === "dirty";
+  if (pr.mergeState !== "pending") {
+   return pr.mergeState === "conflict";
   }
   if (i < attempts - 1) await new Promise((r) => setTimeout(r, pollMs));
  }
@@ -1465,34 +1465,33 @@ function logRun(ctx: ImplementContext, label: string, result: RunResult): string
 /** After the principal's merge: fast-forward, gated close citing CI, decisions --write. */
 async function closeAfterMerge(
  ctx: ImplementContext,
- github: GitHubPort,
- pr: PullRequest,
+ github: ForgePort,
+ pr: ChangeRequest,
 ): Promise<ImplementOutcome> {
  const { map, journal, node, token, botIdentity } = ctx;
  const repo = map.repo;
  const nodeId = node.ref.id;
- journal.updateWorker(nodeId, ctx.map.repo, { phase: "close", prNumber: pr.number });
+ journal.updateWorker(nodeId, ctx.map.repo, { phase: "close", prNumber: pr.iid });
 
  await fastForwardCanonical(ctx.canonical, map.base, token);
 
- const runs = await github.checkRunsFor(repo, pr.headSha, token);
- const success = runs.find((r) => r.status === "completed" && r.conclusion === "success");
- if (success === undefined) {
+ const success = await github.ciVerdictFor(repo, pr.headSha, token, "close");
+ if (success.state !== "green") {
   throw new ParkSignal(
-   `PR #${pr.number} merged, but no successful check run on its head ${pr.headSha.slice(0, 8)} — nothing for the close to cite`,
+   `PR #${pr.iid} merged, but no successful check run on its head ${pr.headSha.slice(0, 8)} — nothing for the close to cite`,
   );
  }
- const reviews = recordedReviews(await github.listComments(repo, pr.number, token), botIdentity);
+ const reviews = recordedReviews(await github.listComments(repo, pr.iid, token), botIdentity);
  const final = reviews[reviews.length - 1];
 
- const probe = recordedProbes(await github.listComments(repo, pr.number, token), botIdentity).find(
+ const probe = recordedProbes(await github.listComments(repo, pr.iid, token), botIdentity).find(
   (p) => p.sha === pr.headSha && p.passed,
  );
  const resolution = closeResolution(ctx, pr, final, reviews.length, success, probe);
  const resolutionFile = join(tmpdir(), `ranger-close-${fileStemFor(repo, nodeId)}.md`);
  writeFileSync(resolutionFile, resolution, "utf8");
 
- const prRef = `https://github.com/${repo}/pull/${pr.number}`;
+ const prRef = pr.webUrl;
  const evidence: { kind: string; summary: string; pointer: string }[] = [];
  if (final !== undefined) {
   evidence.push({
@@ -1506,8 +1505,8 @@ async function closeAfterMerge(
   // it is informational, and the merged PR is the externally checkable pointer.
   evidence.push({
    kind: "tested",
-   summary: `CI check run ${success.name} succeeded at ${pr.headSha.slice(0, 8)}; ${ratificationText(ctx, pr)}`,
-   pointer: `https://github.com/${repo}/runs/${success.id}`,
+   summary: `CI check run ${success.runName} succeeded at ${pr.headSha.slice(0, 8)}; ${ratificationText(ctx, pr)}`,
+   pointer: success.runUrl,
   });
  }
 
@@ -1519,9 +1518,9 @@ async function closeAfterMerge(
   token,
   {
    resolutionFile,
-   gist: gistLine(node.node.title, pr.number),
+   gist: gistLine(node.node.title, pr.iid),
    checkpointId: node.node.checkpointId,
-   ...(ctx.ratify === "auto" ? { ci: `${success.id}@${pr.headSha}` } : {}),
+   ...(ctx.ratify === "auto" ? { ci: `${success.runId}@${pr.headSha}` } : {}),
    evidence,
   },
   { cwd: ctx.canonical, timeoutMs: GRAPH_CALL_TIMEOUT_MS },
@@ -1556,7 +1555,7 @@ async function closeAfterMerge(
   detail: close.detail.slice(0, 400),
   workerExit: null,
   close,
-  prNumber: pr.number,
+  prNumber: pr.iid,
  };
 }
 
@@ -1567,7 +1566,7 @@ async function closeAfterMerge(
  * mid-review push (a spurious park).
  */
 async function awaitHead(
- github: GitHubPort,
+ github: ForgePort,
  repo: string,
  prNumber: number,
  sha: string,
@@ -1900,10 +1899,10 @@ function readyBody(
 
 function closeResolution(
  ctx: ImplementContext,
- pr: PullRequest,
+ pr: ChangeRequest,
  final: RecordedReview | undefined,
  rounds: number,
- ci: CheckRun,
+ ci: Extract<CiVerdict, { state: "green" }>,
  probe?: RecordedProbe,
 ): string {
  const deferred =
@@ -1911,9 +1910,9 @@ function closeResolution(
    ? "None."
    : `${final.blockers} blocker(s), ${final.majors} major(s) and ${final.nits} nit(s) from the last sage round are on the PR and not filed back yet (the Scribe, design §6, is a follow-up).`;
  return [
-  `Implemented by ranger's implement lane in PR #${pr.number} (${pr.url || `https://github.com/${ctx.map.repo}/pull/${pr.number}`}), merged by ${pr.mergedBy ?? "an unknown login"}${pr.mergeCommitSha === null ? "" : ` as ${pr.mergeCommitSha.slice(0, 8)}`}.`,
+  `Implemented by ranger's implement lane in PR #${pr.iid} (${pr.webUrl || `https://github.com/${ctx.map.repo}/pull/${pr.iid}`}), merged by ${pr.mergedBy ?? "an unknown login"}${pr.mergeCommitSha === null ? "" : ` as ${pr.mergeCommitSha.slice(0, 8)}`}.`,
   "",
-  `- Tests: \`${ctx.map.commands.test}\` passed before every push; CI check run "${ci.name}" (${ci.id}) succeeded on the PR head ${pr.headSha.slice(0, 8)}.`,
+  `- Tests: \`${ctx.map.commands.test}\` passed before every push; CI check run "${ci.runName}" (${ci.runId}) succeeded on the PR head ${pr.headSha.slice(0, 8)}.`,
   final === undefined
    ? "- Sage: no recorded review round."
    : `- Sage: ${rounds} offline round(s); the last at ${final.sha.slice(0, 8)} found ${final.blockers} blockers, ${final.majors} majors, ${final.nits} nits (machine evidence).`,
@@ -1928,10 +1927,10 @@ function closeResolution(
  * under the principal's standing grant (2026-10-03: ranger merges nodes that
  * need no visual judgment; a `ranger:needs-eye` node is merged by hand).
  */
-function ratificationText(ctx: ImplementContext, pr: PullRequest): string {
+function ratificationText(ctx: ImplementContext, pr: ChangeRequest): string {
  return pr.mergedBy !== null && pr.mergedBy === ctx.config.principal.login
-  ? `the principal merged PR #${pr.number} (merge = ratification, #23 ruling)`
-  : `${pr.mergedBy ?? "ranger"} merged PR #${pr.number} under the principal's standing grant (2026-10-03: ranger merges nodes that need no visual judgment)`;
+  ? `the principal merged PR #${pr.iid} (merge = ratification, #23 ruling)`
+  : `${pr.mergedBy ?? "ranger"} merged PR #${pr.iid} under the principal's standing grant (2026-10-03: ranger merges nodes that need no visual judgment)`;
 }
 
 function gistLine(title: string, pr: number): string {

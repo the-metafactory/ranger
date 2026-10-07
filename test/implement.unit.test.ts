@@ -1,3 +1,4 @@
+import { githubCiVerdict } from "../src/github-ci.ts";
 import { describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -6,7 +7,8 @@ import { join } from "node:path";
 import { loadConfig } from "../src/config.ts";
 import { processGroupCommands, runCmd } from "../src/exec.ts";
 import { findClosingKeyword } from "../src/git-ops.ts";
-import type { CheckRun, PullRequest } from "../src/github.ts";
+import type { ChangeRequest } from "../src/forge.ts";
+import type { CheckRun } from "../src/github.ts";
 import type { FrontierEntry } from "../src/graph.ts";
 import {
  implementBranchFor,
@@ -28,21 +30,19 @@ import { baseConfigLines } from "./support.ts";
 const SHA = "a".repeat(40);
 const OTHER = "b".repeat(40);
 
-function pr(over: Partial<PullRequest> = {}): PullRequest {
+function pr(over: Partial<ChangeRequest> = {}): ChangeRequest {
  return {
-  number: 7,
+  iid: 7,
   state: "open",
-  merged: false,
   draft: false,
   title: "t",
   mergedBy: null,
   headRef: "node/20-x",
   headSha: SHA,
   baseRef: "main",
-  mergeable: true,
-  mergeableState: "clean",
+  mergeState: "mergeable",
   mergeCommitSha: null,
-  url: "https://github.com/acme/widgets/pull/7",
+  webUrl: "https://github.com/acme/widgets/pull/7",
   author: "ivy-bot",
   ...over,
  };
@@ -50,10 +50,10 @@ function pr(over: Partial<PullRequest> = {}): PullRequest {
 
 const GREEN: CheckRun[] = [{ id: 9, name: "build", status: "completed", conclusion: "success" }];
 
-function gate(over: Partial<Parameters<typeof evaluateMergeGate>[0]> = {}) {
+function gate(over: Partial<Parameters<typeof evaluateMergeGate>[0]> & { checkRuns?: CheckRun[] } = {}) {
  return evaluateMergeGate({
   pr: pr(),
-  checkRuns: GREEN,
+  ci: githubCiVerdict("acme/widgets", over.checkRuns ?? GREEN),
   expectedBase: "main",
   verdictSha: SHA,
   verdictBlockers: 0,
@@ -77,13 +77,13 @@ describe("merge gate (#23)", () => {
   expect(gate({ checkRuns: [{ id: 3, name: "x", status: "completed", conclusion: "skipped" }] })).toMatchObject({ status: "fail", check: "ci-green" });
  });
  test("mergeability: computing is pending, conflicts fail", () => {
-  expect(gate({ pr: pr({ mergeable: null }) }).status).toBe("pending");
-  expect(gate({ pr: pr({ mergeable: false, mergeableState: "dirty" }) })).toMatchObject({ status: "fail", check: "mergeable" });
+  expect(gate({ pr: pr({ mergeState: "pending" }) }).status).toBe("pending");
+  expect(gate({ pr: pr({ mergeState: "conflict" }) })).toMatchObject({ status: "fail", check: "mergeable" });
  });
  test("a conflicting PR with no check runs fails on mergeability, not pending on CI (seelite #692)", () => {
   // GitHub starts no pull_request workflow on a conflicting PR: waiting for CI would never end.
-  expect(gate({ checkRuns: [], pr: pr({ mergeable: false, mergeableState: "dirty" }) })).toMatchObject({ status: "fail", check: "mergeable" });
-  expect(gate({ checkRuns: [], pr: pr({ mergeable: null, mergeableState: "unknown" }) }).status).toBe("pending");
+  expect(gate({ checkRuns: [], pr: pr({ mergeState: "conflict" }) })).toMatchObject({ status: "fail", check: "mergeable" });
+  expect(gate({ checkRuns: [], pr: pr({ mergeState: "pending" }) }).status).toBe("pending");
  });
  test("wrong base fails", () => {
   expect(gate({ pr: pr({ baseRef: "develop" }) })).toMatchObject({ status: "fail", check: "base-branch" });
@@ -152,7 +152,7 @@ describe("review markers (F2 resume record)", () => {
  test("phase resolves from the PR: none → implement, open → review, merged → close, closed → pr-closed", () => {
   expect(resolvePhase(null)).toBe("implement");
   expect(resolvePhase(pr())).toBe("review");
-  expect(resolvePhase(pr({ merged: true, state: "closed" }))).toBe("close");
+  expect(resolvePhase(pr({ state: "merged" }))).toBe("close");
   expect(resolvePhase(pr({ state: "closed" }))).toBe("pr-closed");
  });
  test("a declared git-merged-into probe names the branch", () => {

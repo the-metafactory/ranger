@@ -19,7 +19,7 @@ import type { Journal } from "./journal.ts";
 import { ClaimLockBusy, withClaimLock } from "./claim-lock.ts";
 import type { OwnedCheck } from "./lock.ts";
 import { classifyFrontier, loadProbeRegistry } from "./route.ts";
-import type { GitHubPort } from "./github.ts";
+import type { ForgePort } from "./forge.ts";
 import { probeRequeueCandidates, requeueProbes, type ProbeRequeueResult } from "./probe-requeue.ts";
 import { sweepMap, type SweepMapResult } from "./sweep.ts";
 import {
@@ -132,7 +132,7 @@ export interface WalkContext {
  spawnRunNode?: (args: SpawnRunNodeArgs) => Promise<number | null>;
  now?: () => Date;
  /** The merge desk's GitHub port (tests inject a fake; default: the real API). */
- github?: GitHubPort;
+ github?: ForgePort;
 }
 
 /** Is this resource lane held? (awaiting-merge does not hold it.) */

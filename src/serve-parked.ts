@@ -19,7 +19,7 @@ import { isGithubRepo, nodeKey } from "./forge-ref.ts";
  * reads when the request arrives, and the spawner is injected so no test runs
  * `gh`, `osascript` or ranger.
  */
-import { classifyCi } from "./ci-policy.ts";
+import { classifyGithubCheckRuns } from "./github-ci.ts";
 import { REPO_PATTERN } from "./config.ts";
 import type { EventRow, WorkerRow } from "./journal.ts";
 import { childEnv, itermArgv, shellQuote } from "./launch.ts";
@@ -243,9 +243,9 @@ export interface PrView {
  readAt: string;
 }
 
-/** The CI state of a head from its check runs, by the merge gate's own policy (`ci-policy.ts`). */
+/** The CI display state from the GitHub classifier also used to build the port's merge verdict. */
 export function ciState(runs: { status: string; conclusion: string | null }[]): PrView["ci"] {
- return classifyCi(runs).state;
+ return classifyGithubCheckRuns(runs).state;
 }
 
 /**
