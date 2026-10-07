@@ -37,7 +37,7 @@ import {
  reviewCapHeadMovedOutcome,
  reviewCapOutcome,
 } from "./outcomes.ts";
-import { GRAPH_CALL_TIMEOUT_MS, type NodeResult } from "./graph.ts";
+import { GRAPH_CALL_TIMEOUT_MS, somaRepo, type NodeResult } from "./graph.ts";
 import { graphClose, graphDecisions, type CloseResult } from "./graph-write.ts";
 import type { ImplementPhase, Journal } from "./journal.ts";
 import { assembleImplementPrompt } from "./prompt.ts";
@@ -57,6 +57,7 @@ import { workerEnv } from "./worker-env.ts";
 import { tryWorkerLog, workerLogFile } from "./worker-log.ts";
 import { captureViews, redactViewsReason, saveViewsRecord, viewsComment, viewsDirectory, type ViewsDependencies, type ViewsRecord } from "./views.ts";
 import { NEEDS_EYE_LABEL } from "./labels.ts";
+import { assertTestEvidence, assertTestSource, createSshTestBackend, localTestBackend, runTestBackend, testCorrelationId, type TestBackend, type TestRequest, type TestResult } from "./remote-test/supervisor-backend.ts";
 
 /**
  * The implement lane (design §4 task/build SOP, build-path step 4, node #23).
@@ -118,6 +119,8 @@ export interface ImplementContext {
  sessionJournal: string;
  /** Repo-command runner (default `/bin/sh -c`); tests inject it. */
  shellRun?: ShellRun;
+ /** Supervisor-owned test boundary; never passed to the coding worker. */
+ testBackend?: TestBackend;
  github?: ForgePort;
  reviewer?: Reviewer;
  /** How long to wait for GitHub to show a pushed head (default 2 min; tests shorten it). */
@@ -154,6 +157,46 @@ export interface ImplementOutcome {
 
 const INSTALL_TIMEOUT_MS = 15 * 60 * 1000;
 const TEST_TIMEOUT_MS = 20 * 60 * 1000;
+
+const backends = new WeakMap<ImplementContext, TestBackend>();
+const remotePasses = new WeakMap<ImplementContext, TestResult & { request: TestRequest }>();
+function testBackendFor(ctx: ImplementContext): TestBackend {
+ let backend = backends.get(ctx);
+ if (!backend) {
+  backend = ctx.testBackend ?? (ctx.map.testBackend ? createSshTestBackend(ctx.map.testBackend) : localTestBackend);
+  if (ctx.map.testBackend && backend.kind !== "ssh") throw new GitSafetyError("SSH map cannot use a local test backend");
+  backends.set(ctx, backend);
+ }
+ return backend;
+}
+function remoteTests(ctx: ImplementContext): boolean { return testBackendFor(ctx).kind === "ssh"; }
+function testRequest(ctx: ImplementContext, sha: string): TestRequest {
+ return { worktree: ctx.worktree, head: sha, repositoryId: somaRepo(ctx.map.repo), generation: ctx.generation, correlationId: testCorrelationId(ctx.map.repo, ctx.map.root, ctx.node.ref.id) };
+}
+async function backendTests(ctx: ImplementContext, sha: string, local: () => Promise<RunResult>): Promise<RunResult> {
+ const backend = testBackendFor(ctx), request = testRequest(ctx, sha);
+ const snapshot = backend.kind === "ssh" ? await trustedSnapshot(ctx.journal, ctx.canonical, { repo: ctx.map.repo, nodeId: ctx.node.ref.id }, mapKey(ctx.map)) : undefined;
+ ctx.journal.assertGeneration(ctx.node.ref.id, ctx.map.repo, ctx.generation, "run supervisor tests");
+ const tested = await runTestBackend(backend, request, local);
+ if (snapshot !== undefined) await assertGitUntouched(ctx.canonical, snapshot);
+ ctx.journal.assertGeneration(ctx.node.ref.id, ctx.map.repo, ctx.generation, "accept supervisor tests");
+ if (backend.kind === "ssh") {
+  remotePasses.delete(ctx);
+  if (tested.evidence) ctx.journal.recordEvent("reviewed", { nodeId: ctx.node.ref.id, repo: ctx.map.repo, detail: `remote supervisor tests: ${tested.evidence.receipt.status}; receipt ${tested.evidence.path}` });
+  if (tested.result.code === 0) remotePasses.set(ctx, { ...tested, request });
+ }
+ return tested.result;
+}
+async function assertRemotePush(ctx: ImplementContext, sha: string): Promise<void> {
+ if (!remoteTests(ctx)) return;
+ const passed = remotePasses.get(ctx);
+ if (!passed?.evidence || passed.request.head !== sha || passed.request.generation !== ctx.generation) throw new GitSafetyError("No current remote supervisor receipt for push");
+ try {
+  await assertTestSource(testRequest(ctx, sha));
+  await assertTestEvidence(passed.evidence, testRequest(ctx, sha));
+ } catch { throw new GitSafetyError("Remote supervisor source or receipt is no longer current; refusing push"); }
+ ctx.journal.assertGeneration(ctx.node.ref.id, ctx.map.repo, ctx.generation, "push remotely tested commit");
+}
 
 /** The review-round marker ranger writes into each review comment it posts. */
 export function reviewMarker(round: number, v: ReviewVerdict, substrate?: SubstrateName): string {
@@ -744,7 +787,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
  let workerExit: number | null = null;
  if (phase === "implement") {
   journal.updateWorker(nodeId, ctx.map.repo, { phase: "implement" });
-  if (map.commands.install !== undefined) {
+  if (!remoteTests(ctx) && map.commands.install !== undefined) {
    const install = await runShell(map.commands.install, worktree, ctx, { label: "install", timeoutMs: INSTALL_TIMEOUT_MS });
    if (install.code !== 0) {
     return {
@@ -762,12 +805,14 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
   if (built.failure !== undefined) return built.failure;
 
   fence("push");
+  await assertRemotePush(ctx, built.sha);
   const vetted = await vettedPush({
    worktree,
    canonical: ctx.canonical,
    branch,
    token,
    configSnapshot: built.snapshot,
+   ...(remoteTests(ctx) ? { source: built.sha } : {}),
   });
   recordKnownGood(journal, ctx.canonical, vetted, "vetted push");
   journal.recordEvent("pushed", { nodeId, repo, detail: `${branch} @ ${built.sha.slice(0, 8)}` });
@@ -1042,12 +1087,14 @@ async function publishPass(
  detail: string,
 ): Promise<void> {
  ctx.journal.assertGeneration(ctx.node.ref.id, ctx.map.repo, ctx.generation, action);
+ await assertRemotePush(ctx, pass.sha);
  const vetted = await vettedPush({
   worktree: ctx.worktree,
   canonical: ctx.canonical,
   branch: ctx.branch,
   token: ctx.token,
   configSnapshot: pass.snapshot,
+  ...(remoteTests(ctx) ? { source: pass.sha } : {}),
  });
  recordKnownGood(ctx.journal, ctx.canonical, vetted, "vetted push");
  ctx.journal.recordEvent("pushed", { nodeId: ctx.node.ref.id, repo: ctx.map.repo, detail });
@@ -1275,6 +1322,7 @@ async function checkedWorkerPass(
   ...(spec.kind === "fix" ? { review: { round: spec.round, body: spec.body } } : {}),
   ...(spec.kind === "base-merge" ? { baseMerge: { base: spec.base, files: spec.files } } : {}),
   probeTier: map.commands.probe !== undefined,
+  remoteTests: remoteTests(ctx),
  });
  fenceSpawn();
  const output = workerOutputFor(ctx.substrate);
@@ -1327,7 +1375,7 @@ async function checkedWorkerPass(
  // before the commit and clean-tree checks, so an install that rewrites a
  // tracked file (a lockfile, generated source) fails the pass rather than
  // letting the tests certify content that never gets pushed.
- if (spec.kind === "base-merge" && map.commands.install !== undefined) {
+ if (!remoteTests(ctx) && spec.kind === "base-merge" && map.commands.install !== undefined) {
   const install = await runShell(map.commands.install, worktree, ctx, { label: `${pass}: install`, timeoutMs: INSTALL_TIMEOUT_MS });
   if (install.code !== 0) {
    return fail(`install (${map.commands.install}) after the base merge exited ${install.code}: ${tail(install)}`);
@@ -1594,7 +1642,8 @@ async function supervisorTests(
 ): Promise<{ tests: RunResult; retried: boolean }> {
  const { journal, map, node, worktree } = ctx;
  const head = await headSha(worktree);
- let tests = await runShell(testCommand, worktree, ctx, { label: `${label}: supervisor tests`, timeoutMs: TEST_TIMEOUT_MS });
+ let tests = await backendTests(ctx, head, () => runShell(testCommand, worktree, ctx, { label: `${label}: supervisor tests`, timeoutMs: TEST_TIMEOUT_MS }));
+ if (remoteTests(ctx)) return { tests, retried: false };
  if (tests.code === 0) return { tests, retried: false };
  if ((await headSha(worktree)) !== head) {
   journal.recordEvent("reviewed", {
@@ -1658,7 +1707,7 @@ async function restoreWorktree(ctx: ImplementContext, sha: string): Promise<stri
   const r = await safeGit(["--no-replace-objects", ...args], { cwd: worktree, timeoutMs: 120_000 });
   if (r.code !== 0) return `could not restore the worktree to ${sha.slice(0, 8)} (git ${args[0]}): ${r.stderr.trim()}`;
  }
- if (map.commands.install !== undefined) {
+ if (!remoteTests(ctx) && map.commands.install !== undefined) {
   const install = await runShell(map.commands.install, worktree, ctx, { label: "restoring the worktree: install", timeoutMs: INSTALL_TIMEOUT_MS });
   if (install.code !== 0) return `install (${map.commands.install}) after restoring the worktree exited ${install.code}: ${tail(install)}`;
  }
@@ -1753,13 +1802,14 @@ async function adoptBuiltWork(ctx: ImplementContext, testCommand: string): Promi
  // the same one retry as any supervisor test run, or a load flake would hand
  // finished work back to a worker with nothing left to commit.
  // Each attempt keeps its own output in the worker log, the retry's included.
- let tests = await testsInFreshCheckout(ctx, testCommand, sha, "adopted build: supervisor tests");
+ let tests = await backendTests(ctx, sha, () => testsInFreshCheckout(ctx, testCommand, sha, "adopted build: supervisor tests"));
  if (tests.code !== 0) {
-  const retry = await retryOnBusyHost(ctx, testCommand, sha, "adoption tests", "the adoption test retry", "adopted build: supervisor test retry");
+  const retry = remoteTests(ctx) ? null : await retryOnBusyHost(ctx, testCommand, sha, "adoption tests", "the adoption test retry", "adopted build: supervisor test retry");
   if (retry !== null) tests = retry;
  }
  const clean = await assertGitUntouched(ctx.canonical, snapshot);
  if (tests.code !== 0) {
+  if (remoteTests(ctx)) return { workerExit: null, snapshot, sha, failure: { status: "failed", detail: tests.stderr, workerExit: null } };
   journal.recordEvent("reviewed", {
    nodeId: node.ref.id,
    repo: map.repo,
@@ -1770,7 +1820,7 @@ async function adoptBuiltWork(ctx: ImplementContext, testCommand: string): Promi
  if ((await headSha(worktree)) !== sha || (await dirtyFiles(worktree)).length > 0) return null;
  recordKnownGood(journal, ctx.canonical, clean, "passing adoption tests");
  await assertNoClosingKeywords(worktree, map.base);
- const restored = await restoreWorktree(ctx, sha);
+ const restored = remoteTests(ctx) ? null : await restoreWorktree(ctx, sha);
  if (restored !== null) {
   return { workerExit: null, snapshot, sha, failure: { status: "failed", detail: restored, workerExit: null } };
  }

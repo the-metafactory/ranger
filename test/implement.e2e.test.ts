@@ -31,6 +31,9 @@ import { baseConfigLines, createCanonicalRepo, GIT_ENV, takesRawByteNames } from
 import { saveViewsRecord, viewsDirectory } from "../src/views.ts";
 import { DiscordAnnouncer } from "../src/announce.ts";
 import { workerLogFile } from "../src/worker-log.ts";
+import type { TestBackend, TestRequest } from "../src/remote-test/supervisor-backend.ts";
+import type { RemoteTestJob, RemoteTestStatus } from "../src/remote-test/contract.ts";
+import { randomUUID } from "node:crypto";
 
 const fixturesBin = join(import.meta.dir, "fixtures", "bin");
 const dataDir = join(import.meta.dir, "fixtures", "data");
@@ -317,6 +320,130 @@ async function rig(opts: {
  };
  return { dir, origin, canonical, journal, statePath, ctx, github, calls, announced };
 }
+
+/** Inject the backend contract at the real supervisor/adoption seam. */
+function remoteBackend(r: Rig, opts: { status?: RemoteTestStatus; mutate?: (request: TestRequest) => Promise<void>; wrongHead?: boolean; infra?: boolean } = {}) {
+ const requests: TestRequest[] = [];
+ const backend: TestBackend = { kind: "ssh", async run(request) {
+  requests.push(request);
+  if (opts.infra) return { result: { code: 1, stdout: "", stderr: "Remote infrastructure unavailable" } };
+  const tree = await runCmd("git", ["rev-parse", `${request.head}^{tree}`], { cwd: request.worktree });
+  const job: RemoteTestJob = { version: 1, jobId: randomUUID(), correlationId: request.correlationId, repositoryId: request.repositoryId, commitDigest: opts.wrongHead ? "f".repeat(40) : request.head, treeDigest: tree.stdout.trim(), bundleDigest: `sha256:${"b".repeat(64)}`, profileId: "fixture", profileDigest: `sha256:${"c".repeat(64)}`, lockDigest: `sha256:${"d".repeat(64)}`, imageDigest: `sha256:${"e".repeat(64)}`, platform: "linux-arm64", deadline: Date.now() + 60_000, generation: request.generation };
+  const status = opts.status ?? "passed", receipt = { version: 1 as const, identity: job, executorId: "fixture", status, completedAt: Date.now(), exitCode: status === "passed" ? 0 : 1 };
+  const path = join(r.dir, `receipt-${job.jobId}.json`); writeFileSync(path, JSON.stringify(receipt), { mode: 0o600 });
+  await opts.mutate?.(request);
+  return { result: { code: status === "passed" ? 0 : 1, stdout: "", stderr: `remote ${status}` }, evidence: { job, receipt, path, validUntil: job.deadline } };
+ } };
+ r.ctx.testBackend = backend;
+ return requests;
+}
+
+describe("remote supervisor backend integration", () => {
+ const cleanup: string[] = [];
+ afterEach(() => {
+  for (const d of cleanup.splice(0)) rmSync(d, { recursive: true, force: true });
+  for (const key of Object.keys(process.env)) if (!(key in savedEnv)) delete process.env[key];
+  Object.assign(process.env, savedEnv);
+ });
+ test("opt-in skips local install/test calls and pushes only the validated committed HEAD", async () => {
+  const r = await rig({ install: "exit 91", test: "exit 92" }); cleanup.push(r.dir);
+  r.ctx.map.testBackend = { kind: "ssh", configFile: join(r.dir, "private-ssh.json"), stateRoot: join(r.dir, "private-state"), profileId: "fixture", lockFile: "bun.lock", deadlineSeconds: 660 };
+  const prompts: string[] = [];
+  r.ctx.worker = async (prompt, options) => {
+   prompts.push(prompt);
+   expect(JSON.stringify(options.env)).not.toContain("private-ssh.json");
+   expect(JSON.stringify(options.env)).not.toContain("private-state");
+   return runCmd(implementWorker, ["build", prompt], options);
+  };
+  const requests = remoteBackend(r);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  expect(requests).toHaveLength(1);
+  expect(prompts[0]).toContain("Do not run those commands locally");
+  expect(prompts[0]).not.toContain("private-ssh.json");
+  expect((await r.github.getPr("acme/widgets", 1)).headSha).toBe(requests[0]!.head);
+  const events = r.journal.listEvents("acme/widgets", 200).map(e => e.detail ?? "");
+  expect(events.filter(d => d.startsWith("remote supervisor tests:")).length).toBe(1);
+  expect(events.find(d => d.startsWith("remote supervisor tests:"))).toMatch(/^remote supervisor tests: passed; receipt /);
+ }, 60_000);
+ for (const failure of ["wrong-head", "dirty", "moved-head", "infra", "test-failed"] as const) {
+  test(`${failure} refuses before push and never retries locally even on a busy host`, async () => {
+   const r = await rig({}); cleanup.push(r.dir); r.ctx.hostLoad = () => ({ load: 20, cores: 1 }); r.ctx.quietHost = { pollMs: 1, maxMs: 1 };
+   const requests = remoteBackend(r, { wrongHead: failure === "wrong-head", infra: failure === "infra", ...(failure === "test-failed" ? { status: "test_failed" as const } : {}),
+    mutate: failure === "dirty" ? async request => { writeFileSync(join(request.worktree, "dirty"), "x"); } : failure === "moved-head" ? async request => { await runCmd("git", ["commit", "--allow-empty", "-m", "HEAD moved"], { cwd: request.worktree, env: { ...process.env, ...GIT_ENV } }); } : undefined });
+   let local = 0; r.ctx.shellRun = async () => { local++; return { code: 0, stdout: "", stderr: "" }; };
+   expect((await runNode("20", r.ctx)).status).toBe("failed"); expect(r.github.prs.size).toBe(0); expect(requests).toHaveLength(1); expect(local).toBe(0);
+  }, 60_000);
+ }
+ test("resume adopts an existing clean commit with remote tests and no local install/retry/restore", async () => {
+  const r = await rig({ test: "exit 1" }); cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("failed");
+  r.ctx.map.commands.install = "exit 91";
+  const requests = remoteBackend(r);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge"); expect(requests).toHaveLength(1);
+  expect(r.journal.listEvents("acme/widgets", 200).some(e => e.detail?.startsWith("adopting "))).toBe(true);
+ }, 60_000);
+ test("an adoption infrastructure failure stops without a fresh coding session", async () => {
+  const r = await rig({ test: "exit 1" }); cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("failed");
+  const requests = remoteBackend(r, { infra: true }); let workers = 0;
+  r.ctx.worker = async () => { workers++; return { code: 0, stdout: "", stderr: "" }; };
+  expect((await runNode("20", r.ctx)).status).toBe("failed"); expect(requests).toHaveLength(1); expect(workers).toBe(0); expect(r.github.prs.size).toBe(0);
+ }, 60_000);
+ test("a superseded remote test generation cannot push or record success", async () => {
+  const r = await rig({}); cleanup.push(r.dir);
+  const requests = remoteBackend(r, { mutate: async () => { r.journal.beginGeneration("20", "acme/widgets"); } });
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("refused"); expect(requests).toHaveLength(1); expect(r.github.prs.size).toBe(0);
+  expect(r.journal.listEvents("acme/widgets", 200).some(e => e.detail?.startsWith("remote supervisor tests: passed"))).toBe(false);
+ }, 60_000);
+ test("remote tests cannot tamper with trusted Git config before push", async () => {
+  const r = await rig({}); cleanup.push(r.dir);
+  const requests = remoteBackend(r, { mutate: async request => { await runCmd("git", ["config", "http.sslVerify", "false"], { cwd: request.worktree }); } });
+  expect((await runNode("20", r.ctx)).status).toBe("parked"); expect(requests).toHaveLength(1); expect(r.github.prs.size).toBe(0);
+ }, 60_000);
+ test("remote fix pass tests its new commit and publishes it without local installs/tests", async () => {
+  const r = await rig({ blockers: [1, 0], install: "exit 91", test: "exit 92" }); cleanup.push(r.dir);
+  const requests = remoteBackend(r);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge"); expect(requests).toHaveLength(2);
+  expect(requests[0]!.head).not.toBe(requests[1]!.head);
+  expect((await r.github.getPr("acme/widgets", 1)).headSha).toBe(requests[1]!.head);
+  expect(r.calls).toHaveLength(2);
+ }, 60_000);
+ test("remote base-merge pass tests and publishes merged source without local reinstall", async () => {
+  let r!: Rig & { calls: number[]; announced: string[] };
+  r = await rig({ install: "exit 91", test: "exit 92", onReview: async round => { if (round === 1) await moveBaseUnder(r); } }); cleanup.push(r.dir);
+  r.ctx.mergeablePoll = { pollMs: 1, attempts: 2 };
+  const requests = remoteBackend(r);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge"); expect(requests).toHaveLength(2);
+  expect(requests[0]!.head).not.toBe(requests[1]!.head);
+  expect((await r.github.getPr("acme/widgets", 1)).headSha).toBe(requests[1]!.head);
+  expect((await r.github.getPr("acme/widgets", 1)).mergeState).toBe("mergeable");
+  expect(r.calls).toHaveLength(2);
+ }, 60_000);
+ test("tampered persisted fix-pass receipt is refused by the second pre-push gate", async () => {
+  const r = await rig({ blockers: [1, 0] }); cleanup.push(r.dir);
+  const requests = remoteBackend(r), record = r.journal.recordEvent.bind(r.journal);
+  let accepted = 0;
+  const spy = spyOn(r.journal, "recordEvent").mockImplementation((kind, event) => {
+   const result = record(kind, event);
+   const prefix = "remote supervisor tests: passed; receipt ";
+   // This hook runs after backend validation, before publishPass. The
+   // ordinary build push succeeds; only the later fix receipt is changed.
+   const detail = event?.detail;
+   if (detail?.startsWith(prefix) && ++accepted === 2) {
+    const path = detail.slice(prefix.length), receipt = JSON.parse(readFileSync(path, "utf8"));
+    writeFileSync(path, JSON.stringify({ ...receipt, status: "test_failed", exitCode: 1 }));
+   }
+   return result;
+  });
+  try {
+   const outcome = await runNode("20", r.ctx);
+   expect(outcome.status).toBe("parked"); expect(outcome.detail).toContain("receipt is no longer current");
+   expect(requests).toHaveLength(2);
+   expect((await r.github.getPr("acme/widgets", 1)).headSha).toBe(requests[0]!.head);
+  } finally { spy.mockRestore(); }
+ }, 60_000);
+});
 
 /** Land the probes (default scripts/probe-hud.mjs) on origin's main and fetch them, so the merge base has them. */
 async function seedProbeOnBase(r: Rig, names: string[] = ["probe-hud.mjs"]): Promise<void> {
