@@ -21,11 +21,12 @@ export type BaselineConfig = z.infer<typeof ConfigSchema>;
 export function validateBaselineConfig(input: unknown): BaselineConfig { return ConfigSchema.parse(input); }
 export const BASELINE_LIMITS = { cpuCores: 2, memoryBytes: 1610612736, jobs: 1 } as const;
 export type Measurement<T> = { status: "ok"; value: T } | { status: "failed" | "unavailable"; reason: string };
-export interface WorkloadMetrics { cpuSeconds: number; peakMemoryBytes: number; durationSeconds: number; exitCode: number }
+export interface WorkloadMetrics { cpuSeconds: number; peakMemoryBytes: number | null; peakMemoryState: "observed" | "unavailable"; durationSeconds: number; exitCode: number }
 const WorkloadSchema = z.object({
- cpuSeconds: z.number().finite().nonnegative(), peakMemoryBytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+ cpuSeconds: z.number().finite().nonnegative(), peakMemoryBytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
+ peakMemoryState: z.enum(["observed", "unavailable"]),
  durationSeconds: z.number().finite().nonnegative(), exitCode: z.number().int().min(0).max(255),
-}).strict();
+}).strict().refine(m => m.peakMemoryState === "observed" ? m.peakMemoryBytes !== null : m.peakMemoryBytes === null, { message: "Peak state and value disagree" });
 export interface BaselineMetrics {
  platform(): Promise<string>;
  runtime(config: BaselineConfig): Promise<string>;
@@ -36,7 +37,7 @@ export interface BaselineMetrics {
 }
 interface HealthEntry { name: string; measurement: Measurement<string> }
 export interface BaselineReport {
- version: 1; generatedAt: string; mode: "capacity" | "run";
+ version: 2; generatedAt: string; mode: "capacity" | "run";
  transport: { kind: "local" } | { kind: "ssh"; target: string };
  profile: ProfileManifest; configuration: BaselineConfig; limits: typeof BASELINE_LIMITS;
  platform: Measurement<string>; runtime: Measurement<string>; controller: Measurement<string>;
@@ -63,7 +64,7 @@ export async function runBaseline(input: BaselineConfig, opts: { run?: boolean; 
   return entries;
  };
  const report: BaselineReport = {
-  version: 1, generatedAt: (opts.now ?? (() => new Date()))().toISOString(), mode: opts.run ? "run" : "capacity",
+  version: 2, generatedAt: (opts.now ?? (() => new Date()))().toISOString(), mode: opts.run ? "run" : "capacity",
   transport: opts.transport ?? { kind: "local" },
   profile: config.profile, configuration: config, limits: BASELINE_LIMITS,
   platform: await measure(async () => {
@@ -129,7 +130,13 @@ cleanup() {
 }
 trap 'status=$?; trap - EXIT; cleanup || status=125; exit "$status"' EXIT
 trap 'exit 124' HUP INT TERM
-test -r "$cg/memory.peak"
+# Enumerate the newly-created child's kernel interfaces successfully before
+# declaring one absent (ENOENT). A failed stat/read cannot establish absence.
+# Cgroup interfaces are fixed for this child's lifetime. Any later read error,
+# including disappearance of a listed peak file, fails the measurement.
+interfaces=$(LC_ALL=C ls -1a -- "$cg")
+peak_state=unavailable
+if printf '%s\\n' "$interfaces" | grep -qx 'memory.peak'; then peak_state=observed; test -r "$cg/memory.peak"; fi
 test -w "$cg/cgroup.kill"
 printf '${BASELINE_LIMITS.memoryBytes}\\n' > "$cg/memory.max"
 printf '0\\n' > "$cg/memory.swap.max"
@@ -148,7 +155,13 @@ if grep -q '^populated 1$' "$cg/cgroup.events"; then code=125; fi
 if awk '/^oom_kill / { if ($2 > 0) exit 1 }' "$cg/memory.events"; then :; else code=125; fi
 printf '1\\n' > "$cg/cgroup.kill"
 awk '/^usage_usec / { printf "cpuSeconds=%.6f\\n", $2 / 1000000; found=1 } END { if (!found) exit 1 }' "$cg/cpu.stat"
-printf 'peakMemoryBytes=%s\\n' "$(cat "$cg/memory.peak")"
+peak=null
+if [ "$peak_state" = observed ]; then
+ peak=$(cat "$cg/memory.peak")
+ # Keep invalid values visible; never turn a malformed or empty file into null.
+ case "$peak" in ''|*[!0-9]*) echo 'Invalid kernel peak memory' >&2; exit 125;; esac
+fi
+printf 'peakMemoryState=%s\\npeakMemoryBytes=%s\\n' "$peak_state" "$peak"
 awk -v start="$start" -v end="$end" 'BEGIN { printf "durationSeconds=%.6f\\n", (end-start)/1000000000 }'
 printf 'exitCode=%s\\n' "$code"
 `;
@@ -202,17 +215,23 @@ done
 printf '%s\\n' "$available"`]))),
   controller: async c => {
    const p = shellQuote(c.cgroupRoot);
-   await checked(["sh", "-c", `set -eu; [ "$(stat -f -c %T ${p})" = cgroup2fs ]; test -w ${p}; test -r ${p}/memory.peak; test -r ${p}/memory.swap.max; test -w ${p}/cgroup.kill; grep -qw cpu ${p}/cgroup.subtree_control; grep -qw memory ${p}/cgroup.subtree_control; printf cgroup-v2`]);
+   await checked(["sh", "-c", `set -eu; [ "$(stat -f -c %T ${p})" = cgroup2fs ]; test -w ${p}; test -r ${p}/memory.swap.max; test -w ${p}/cgroup.kill; grep -qw cpu ${p}/cgroup.subtree_control; grep -qw memory ${p}/cgroup.subtree_control; printf cgroup-v2`]);
    return "cgroup-v2";
   },
   health: async h => { await checked(["sh", "-c", `${h.command.map(shellQuote).join(" ")} >/dev/null && printf healthy`]); return "healthy"; },
   workload: async c => {
    const output = await checked(["sh", "-c", workloadScript(c)], (c.timeoutSeconds + 30) * 1000);
-   const fields: Record<string, number> = {};
+   const fields: Record<string, number | string | null> = {};
    for (const line of output.split("\n")) {
-    const match = /^(cpuSeconds|peakMemoryBytes|durationSeconds|exitCode)=(\d+(?:\.\d+)?)$/.exec(line);
+    const match = /^(cpuSeconds|peakMemoryBytes|peakMemoryState|durationSeconds|exitCode)=(.*)$/.exec(line);
     if (!match || match[1]! in fields) throw new Error("Invalid or duplicate workload metric");
-    fields[match[1]!] = Number(match[2]);
+    const [, name, value] = match;
+    if (name === "peakMemoryState") fields[name] = value!;
+    else if (name === "peakMemoryBytes" && value === "null") fields[name] = null;
+    else {
+     if (!/^\d+(?:\.\d+)?$/.test(value!)) throw new Error("Invalid workload metric value");
+     fields[name!] = Number(value);
+    }
    }
    return WorkloadSchema.parse(fields);
   },
