@@ -7,7 +7,7 @@ import type { Journal, ResumeQueueRow } from "./journal.ts";
 import { implementLane, startsImplementSession } from "./lanes.ts";
 import type { OwnedCheck } from "./lock.ts";
 import { laneHeldMessage, mapKey, pickMap, recordImplementStart, resumeMap } from "./maps.ts";
-import { spawnRunNodeDetached, type SpawnRunNodeArgs } from "./walk.ts";
+import { spawnRunNodeDetached, type SpawnRunNodeArgs } from "./spawn.ts";
 
 export interface ResumeContext {
  config: RangerConfig;
@@ -23,6 +23,8 @@ async function identityGate(config: RangerConfig, map: RangerMapConfig): Promise
  const { token } = resolveWriteToken(config, map.repo);
  assertNotPrincipal(config, await resolveBotIdentity(config, token));
 }
+
+const releasedError = (nodeId: string) => new Error(`node ${nodeId}'s claim was released — the walk re-claims it from the frontier`);
 
 /** Caller holds the claim lock. CLI and queued resumes use this same startup path. */
 export async function startResumeNode(
@@ -40,7 +42,7 @@ export async function startResumeNode(
   journal.removeResume(options.queued, "resume-dropped", `worker row is ${row.status}`);
   return { ...result, dropped: true };
  }
- if (row.status === "released") throw new Error(`node ${nodeId}'s claim was released — the walk re-claims it from the frontier`);
+ if (row.status === "released") throw releasedError(nodeId);
  const lane = implementLane(map);
  const takesLane = startsImplementSession(row);
  const holder = takesLane ? journal.laneHolder(lane, { nodeId, repo: map.repo }) : null;
@@ -51,18 +53,21 @@ export async function startResumeNode(
  if (holder !== null && options.force !== true) throw new Error(laneHeldMessage(lane, holder, "resume", nodeId));
  owned();
  journal.updateWorker(nodeId, map.repo, { status: "claimed", pid: null, workerPgid: null, finishedAt: null });
+ const restore = () => journal.updateWorker(nodeId, map.repo, {
+  status: row.status, pid: row.pid, workerPgid: row.workerPgid, finishedAt: row.finishedAt,
+ });
  let pid: number | null;
  try {
   pid = await (ctx.spawnRunNode ?? spawnRunNodeDetached)({ nodeId, repo: map.repo, root: map.root,
    cliEntry: join(import.meta.dir, "cli.ts"), configPath: ctx.configPath });
  } catch (error) {
   owned();
-  journal.updateWorker(nodeId, map.repo, { status: row.status, pid: row.pid, workerPgid: row.workerPgid, finishedAt: row.finishedAt });
+  restore();
   throw error;
  }
  owned();
  if (options.queued !== undefined && pid === null) {
-  journal.updateWorker(nodeId, map.repo, { status: row.status, pid: row.pid, workerPgid: row.workerPgid, finishedAt: row.finishedAt });
+  restore();
   return { ...result, queued: true };
  }
  if (pid !== null) journal.updateWorker(nodeId, map.repo, { pid });
@@ -93,8 +98,9 @@ export async function resumeNode(nodeId: string, selector: string | undefined, c
    return { nodeId, repo: entry.repo, root: entry.root, cancelled: true };
   }
   const map = resumeMap(config, journal.listWorkers(), nodeId, selector);
-  const row = journal.getWorker(nodeId, map.repo)!;
-  if (row.status === "released") throw new Error(`node ${nodeId}'s claim was released — the walk re-claims it from the frontier`);
+  const row = journal.getWorker(nodeId, map.repo);
+  if (row === null) throw new Error(`no journal row for node ${nodeId} on ${map.repo} — nothing to resume`);
+  if (row.status === "released") throw releasedError(nodeId);
   const lane = implementLane(map);
   if (options.whenFree && startsImplementSession(row) && journal.laneHolder(lane, { nodeId, repo: map.repo }) !== null) {
    await identityGate(config, map);

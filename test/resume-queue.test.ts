@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import { migrate } from "drizzle-orm/bun-sqlite/migrator";
@@ -11,6 +11,7 @@ import { Journal, openJournal, type WorkerStatus, type ImplementPhase } from "..
 import { LAST_IMPLEMENT_MAP } from "../src/maps.ts";
 import type { GitHubPort, PullRequest } from "../src/github.ts";
 import { walk, type SpawnRunNodeArgs } from "../src/walk.ts";
+import { resumeNode } from "../src/resume.ts";
 import { fakeDiscord, fixturesBin, runCli } from "./support.ts";
 
 const REPO = "acme/widgets";
@@ -70,6 +71,20 @@ function pr(number = 7): PullRequest {
 }
 
 describe("resume-node CLI", () => {
+ test("explicit map without a row refuses clearly, including a row disappearing after map selection", async () => {
+  await withRig(async r => {
+   const result = await r.cli("40", ["--map", REPO + "#1", "--when-free"]);
+   expect(result.code).not.toBe(0);
+   expect(result.stderr).toContain("no unique journal row for node 40");
+   r.worker("40");
+   const getWorker = spyOn(r.journal, "getWorker").mockReturnValue(null);
+   try {
+    await expect(resumeNode("40", REPO + "#1", r, { whenFree: true }))
+     .rejects.toThrow(`no journal row for node 40 on ${REPO} — nothing to resume`);
+   } finally { getWorker.mockRestore(); }
+  });
+ });
+
  test("held lane queues durably, records queued, and repeated requests keep FIFO position", async () => {
   await withRig(async r => {
    r.worker("40"); r.worker("41", 460, "running");
@@ -212,9 +227,16 @@ describe("resume-queue-starts-when-lane-frees", () => {
     r.queue("40");
     if (gate === "pause") r.journal.setPaused(true);
     else for (let i = 0; i < r.config.workers.spawnCapPerDay; i++) r.journal.recordSpawn(NOW);
+    r.journal.updateWorker("40", REPO, { prNumber: 7 });
+    const calls = join(r.dir, "calls"); writeFileSync(calls, ""); process.env.FAKE_SOMA_CALLS = calls;
+    let reads = 0;
+    const github = { getPr: async () => { reads++; return pr(); } } as unknown as GitHubPort;
     const spawned: string[] = [];
-    const tick = () => walk({ ...r, spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; }, now: () => NOW });
+    const tick = () => walk({ ...r, github, spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; }, now: () => NOW });
     await tick(); expect(spawned).toEqual([]); expect(r.journal.listResumeQueue()).toHaveLength(1);
+    // The desk reads parked PRs even while paused/capped; the queue adds no read.
+    expect(reads).toBe(1);
+    expect(readFileSync(calls, "utf8")).not.toContain("node ");
     if (gate === "pause") r.journal.setPaused(false);
     else r.config.workers.spawnCapPerDay++;
     await tick(); expect(spawned).toEqual(["40"]); expect(r.journal.listResumeQueue()).toEqual([]);
@@ -253,15 +275,66 @@ describe("resume-queue-starts-when-lane-frees", () => {
   });
  });
 
- test("PR read failure retains FIFO and keeps fresh claims behind it", async () => {
+ test("closed node is dropped even while another worker holds its lane", async () => {
+  await withRig(async r => {
+   r.queue("40"); r.queue("41", 460); r.worker("42", 1, "running"); r.node("40", "closed");
+   const spawned: string[] = [];
+   await walk({ ...r, spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; } });
+   expect(spawned).toEqual([]);
+   expect(r.journal.listResumeQueue().map(e => e.nodeId)).toEqual(["41"]);
+   expect(r.journal.listEvents(REPO).find(e => e.kind === "resume-dropped")?.detail).toBe("node is closed");
+  });
+ });
+
+ for (const failure of ["node", "PR"] as const) {
+ test(`${failure} validation failure drops the head with a reason and starts the next resume`, async () => {
   await withRig(async r => {
    r.queue("40"); r.queue("41", 460); r.journal.updateWorker("40", REPO, { status: "failed", prNumber: 7 });
+   if (failure === "node") rmSync(join(r.env.FAKE_SOMA_DIR!, "acme__widgets-node-40.json"));
    r.frontier(460, ["21"]);
    const github = { getPr: async () => { throw new Error("read failed"); } } as unknown as GitHubPort;
    const spawned: string[] = [];
    const result = await walk({ ...r, github, spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; } });
-   expect(spawned).toEqual([]); expect(r.journal.listResumeQueue()).toHaveLength(2);
-   expect(result.maps.flatMap(m => m.errors).join(" ")).toContain("read failed");
+   expect(spawned).toEqual(["41"]); expect(r.journal.listResumeQueue()).toEqual([]);
+   expect(result.maps.flatMap(m => m.claimed)).toEqual([]);
+   const event = r.journal.listEvents(REPO).find(e => e.kind === "resume-dropped" && e.nodeId === "40");
+   expect(event?.detail).toContain("validation failed");
+   expect(event?.detail).toContain(failure === "node" ? "no fixture" : "read failed");
+   expect(result.maps.flatMap(m => m.errors).join(" ")).toContain("validation failed");
+   expect(r.journal.getWorker("40", REPO)?.status).toBe("failed");
+  });
+ });
+ }
+
+ test("unreachable queue head does not block a fresh claim on the shared lane", async () => {
+  await withRig(async r => {
+   r.queue("40"); rmSync(join(r.env.FAKE_SOMA_DIR!, "acme__widgets-node-40.json"));
+   r.frontier(460, ["21"]);
+   const spawned: string[] = [];
+   const result = await walk({ ...r, spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; } });
+   expect(spawned).toEqual(["21"]);
+   expect(result.maps.flatMap(m => m.claimed)).toEqual(["21"]);
+   expect(r.journal.listResumeQueue()).toEqual([]);
+  });
+ });
+
+ test("credential-gated queue keeps its entry without reserving another map's shared lane", async () => {
+  await withRig(async r => {
+   const repo = "acme/unavailable";
+   r.config.maps.unshift({ ...r.config.maps[0], repo });
+   r.config.auth.writeTokens[repo] = "RANGER_QUEUE_UNAVAILABLE_TEST";
+   delete process.env.RANGER_QUEUE_UNAVAILABLE_TEST;
+   r.journal.upsertWorker({ nodeId: "40", repo, root: 1, status: "parked", lane: "implement", phase: "review" });
+   const entry = r.journal.enqueueResume({ nodeId: "40", repo, root: 1, lane: "headless" });
+   r.frontier(460, ["21"]);
+   const spawned: string[] = [];
+   const tick = () => walk({ ...r, spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; } });
+   const result = await tick();
+   expect(spawned).toEqual(["21"]);
+   expect(result.maps.flatMap(m => m.claimed)).toEqual(["21"]);
+   expect(r.journal.listResumeQueue()).toEqual([entry]);
+   expect(result.maps.find(m => m.repo === repo)?.errors.join(" ")).toContain("RANGER_QUEUE_UNAVAILABLE_TEST");
+   expect(r.journal.listEvents(repo).find(e => e.kind === "sweep")?.detail).toContain("queued resume #40 deferred");
   });
  });
 
