@@ -142,7 +142,7 @@ async function escalateOneMap(
         now,
         budget: { remaining: ABSENT_RESERVE, deadline: passDeadline },
         owned,
-        readNode: id => budgetedRead(journal, token, budgetPolicy(config), now,
+        readNode: id => budgetedRead(journal, map.repo, token, budgetPolicy(config), now,
           () => graphNode(map.repo, id, token, { timeoutMs: Math.min(GRAPH_CALL_TIMEOUT_MS, Math.max(1, passDeadline - Date.now())) })),
       },
       neededIds,

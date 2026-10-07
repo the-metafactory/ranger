@@ -31,6 +31,7 @@ import { trustCurrentGitState } from "../src/git-trust.ts";
 import { baseConfigLines, createCanonicalRepo, fakeDiscord, GIT_ENV, takesRawByteNames } from "./support.ts";
 import { saveViewsRecord, viewsDirectory } from "../src/views.ts";
 import { DiscordAnnouncer } from "../src/announce.ts";
+import { EscalationDiscord } from "../src/discord.ts";
 import { workerLogFile } from "../src/worker-log.ts";
 import type { TestBackend, TestRequest } from "../src/remote-test/supervisor-backend.ts";
 import type { RemoteTestJob, RemoteTestStatus } from "../src/remote-test/contract.ts";
@@ -1056,7 +1057,7 @@ describe("implement lane (node #23)", () => {
   } finally { prSpy.mockRestore(); ciSpy.mockRestore(); }
  }, 60_000);
 
- test("sweep finishes a failed worker and closes its escalation card exactly once", async () => {
+ test.each([false, true])("sweep finishes a failed worker and closes its escalation card exactly once (Discord outage: %s)", async deferCard => {
   const r = await rig({}); cleanup.push(r.dir);
   const discord = fakeDiscord();
   try {
@@ -1072,6 +1073,15 @@ describe("implement lane (node #23)", () => {
    r.journal.upsertEscalation({ key: "acme/widgets:20", repo: "acme/widgets", root: 1, nodeId: "20", title: "Feature", channelId: r.ctx.map.discord!.channelId,
     messageId: "existing-card", createdAt: new Date().toISOString(), status: "open" });
    r.journal.updateWorker("20", "acme/widgets", { status: "failed", phase: "close" });
+   if (deferCard) {
+    const edit = spyOn(EscalationDiscord.prototype, "edit").mockImplementation(async () => { throw new Error("Discord unavailable"); });
+    try {
+     await sweepMap({ ...r.ctx, phase: "liveness" });
+     expect(r.journal.getWorker("20", "acme/widgets")?.status).toBe("success");
+     expect(r.journal.getEscalation("acme/widgets", "20")?.status).toBe("open");
+     expect(discord.edits).toHaveLength(0);
+    } finally { edit.mockRestore(); }
+   }
    await sweepMap({ ...r.ctx, phase: "liveness" });
    expect(r.journal.getWorker("20", "acme/widgets")?.status).toBe("success");
    expect(r.journal.getEscalation("acme/widgets", "20")?.status).toBe("closed");
@@ -1079,6 +1089,7 @@ describe("implement lane (node #23)", () => {
    expect(r.journal.getEscalation("acme/widgets", "20")?.lastContent).toContain("closed on the graph");
    await sweepMap({ ...r.ctx, phase: "liveness" });
    expect(discord.edits).toHaveLength(1);
+   expect(r.journal.listEvents("acme/widgets", 500).filter(e => e.kind === "closed-elsewhere")).toHaveLength(1);
   } finally { discord.stop(); }
  }, 60_000);
 
