@@ -118,6 +118,19 @@ test("changed repository scripts and uncovered test roots stop before container 
   expect(f.calls.some(c => c[1] === "create")).toBe(false);
  }
 });
+test("independent conmon timeout keeps timed_out even if NATS also expires", async () => {
+ const f = await fixture(true), base = Date.now(); let clock = base;
+ f.job.deadline = base + 60_000; f.setExit(137);
+ const launcher: ExecutorLauncher = async (argv, options) => {
+  const result = await f.launcher(argv, options);
+  if (argv[1] === "image") clock = base + 500;
+  if (argv[1] === "start" && argv.includes("--attach")) { clock = base + 2999; return { ...result, stdout: "" }; }
+  if (argv[1] === "inspect" && argv.at(-1) === "b".repeat(64) && f.calls.some(c => c[1] === "start" && c.includes("--attach"))) throw Error("Expired NATS");
+  return result;
+ };
+ expect((await f.execute({ launcher, now: () => clock, timeoutMs: 3000 })).status).toBe("timed_out");
+ expect(f.calls.filter(c => c[1] === "rm")).toHaveLength(2);
+});
 test("executor storage failure and invalid clock cannot expose passed", async () => {
  const f = await fixture();
  await expect(f.execute({ artifactFault: () => { throw Error("storage failure"); } })).rejects.toThrow();
@@ -366,21 +379,26 @@ test("reviewed bootstrap copies private dependencies, performs frozen offline in
   const reviewed = createReviewedProfile({ profileId: "fixture", imageDigest: sha("runtime"), lockDigest: sha(lock.toString()), reviewed: { recipe: "myelin-v1", cache: "disabled", install: "frozen-offline-copy", checks: ["unit", "integration", "typecheck", "lint"], sidecars: [{ kind: "nats", imageReference: `localhost/nats@${sha("nats")}` }] } });
   const argv: [string, ...string[]][] = [reviewed.commands[0]!, [process.execPath, "--no-env-file", "test", "./fixture.test.ts"]];
   await writeFile(join(checkout, ".env"), "NATS_URL=nats://control-plane.invalid:4222\n");
-  const run = async (skip: boolean | "todo") => {
+  const run = async (skip: boolean | "todo", fail = false, crash = false) => {
    await rm(join(checkout, "node_modules"), { recursive: true, force: true });
-   await writeFile(join(checkout, "fixture.test.ts"), `import {expect,test} from 'bun:test'; test('required',()=>{expect(process.env.NATS_URL).toBe('nats://127.0.0.1:${broker.port}');}); ${skip ? `test.${skip === "todo" ? "todo" : "skip"}('missing required',()=>{});` : ""}`);
+   await writeFile(join(checkout, "fixture.test.ts"), `import {expect,test} from 'bun:test'; ${crash ? 'process.exit(7);' : ''} test('required',()=>{${fail ? 'expect(true).toBe(false);' : `expect(process.env.NATS_URL).toBe('nats://127.0.0.1:${broker.port}');`}}); ${skip ? `test.${skip === "todo" ? "todo" : "skip"}('missing required',()=>{});` : ""}`);
    const program = containerProgram(argv, reviewed.reviewed, reviewed.lockDigest)
     .replaceAll('"/sys/fs/cgroup/', JSON.stringify(cgroup).slice(0, -1) + "/")
     .replaceAll("/opt/ranger-dependencies", image).replaceAll("/work", checkout)
-    .replaceAll("port:4222", `port:${broker.port}`).replaceAll(":4222", `:${broker.port}`);
+    .replaceAll("port:4222", `port:${broker.port}`).replaceAll(":4222", `:${broker.port}`)
+    .replace('} catch { result.status = "infra_failed"; }', '} catch (error) { console.error(error); result.status = "infra_failed"; }');
    const r = await runCmd(process.execPath, [...CONTAINER_BOOTSTRAP_FLAGS, "-e", program], { cwd: neutral });
-   return JSON.parse(r.stdout);
+   const terminal = JSON.parse(r.stdout);
+   if (terminal.status === "infra_failed" && terminal.exitCode === null) throw Error(`Fixture bootstrap failed: ${r.stderr}`);
+   return terminal;
   };
   expect(await run(false)).toMatchObject({ status: "passed", coverage: { requiredSkippedTests: 0 } });
   await writeFile(join(checkout, "node_modules", "canary"), "job-only");
   expect(await readFile(join(image, "node_modules", "canary"), "utf8")).toBe("immutable");
   expect(await run(true)).toMatchObject({ status: "infra_failed", coverage: { requiredSkippedTests: 1 } });
   expect(await run("todo")).toMatchObject({ status: "infra_failed", coverage: { requiredSkippedTests: 1 } });
+  expect(await run(true, true)).toMatchObject({ status: "test_failed", exitCode: 1, coverage: { requiredSkippedTests: 1 } });
+  expect(await run(false, false, true)).toMatchObject({ status: "test_failed", exitCode: 7, coverage: { requiredSkippedTests: null } });
   expect(await readFile(join(checkout, "bun.lock"))).toEqual(lock);
  } finally { broker.stop(true); }
 });

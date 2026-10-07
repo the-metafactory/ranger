@@ -56,7 +56,7 @@ export function containerProgram(commands: [string, ...string[]][], reviewed?: R
  return `const fs = await import("node:fs/promises");
 let result = {status:"infra_failed",exitCode:null};
 let ran = false;
-${reviewed ? 'result.coverage = {requiredSkippedTests:null};' : ''}
+${reviewed ? 'let skipped = 0; result.coverage = {requiredSkippedTests:null};' : ''}
 try {
  const value = async name => (await fs.readFile("/sys/fs/cgroup/"+name,"utf8")).trim();
  const cpu = (await value("cpu.max")).split(/\\s+/).map(Number);
@@ -65,19 +65,24 @@ try {
  ${reviewed ? reviewedBootstrap(lockDigest!) : ''}
  for (const argv of ${JSON.stringify(commands)}) {
   let summary = "";
+  const collectSummary = ${!!reviewed} && argv.includes("test");
   const child = Bun.spawn(argv,{cwd:"/work",stdin:"ignore",stdout:"pipe",stderr:"pipe"${reviewed ? ',env:{PATH:"/usr/local/bin:/usr/bin:/bin",HOME:"/tmp",NATS_URL:"nats://127.0.0.1:4222"}' : ''}});
   ran = true;
-  const drain = async stream => { for await (const chunk of stream) { summary = (summary + Buffer.from(chunk).toString()).slice(-65536); if (!process.stderr.write(chunk)) await new Promise(resolve => process.stderr.once("drain",resolve)); } };
+  const drain = async stream => { for await (const chunk of stream) { if (collectSummary) summary = (summary + Buffer.from(chunk).toString()).slice(-65536); if (!process.stderr.write(chunk)) await new Promise(resolve => process.stderr.once("drain",resolve)); } };
   const [code] = await Promise.all([child.exited, drain(child.stdout), drain(child.stderr)]);
   result = {status:code === 0 ? "passed" : "test_failed",exitCode:code};
   ${reviewed ? `result.coverage = {requiredSkippedTests:skipped};
   if (argv.includes("test")) {
    const clean = summary.replace(/\\x1b\\[[0-9;]*m/g, "");
    const passed = [...clean.matchAll(/^\\s*(\\d+) pass$/gm)].at(-1), failed = [...clean.matchAll(/^\\s*(\\d+) fail$/gm)].at(-1);
-   if (!passed || !failed || Number(passed[1]) + Number(failed[1]) < 1) throw Error("Required test summary missing or empty");
-   skipped += [...clean.matchAll(/^\\s*(\\d+) (?:skip|todo)$/gm)].reduce((sum, match) => sum + Number(match[1]), 0);
-   result.coverage.requiredSkippedTests = skipped;
-   if (skipped > 0) { result.status = "infra_failed"; break; }
+   if (!passed || !failed || Number(passed[1]) + Number(failed[1]) < 1) {
+    result.coverage.requiredSkippedTests = null;
+    if (code === 0) throw Error("Required test summary missing or empty");
+   } else {
+    skipped += [...clean.matchAll(/^\\s*(\\d+) (?:skip|todo)$/gm)].reduce((sum, match) => sum + Number(match[1]), 0);
+    result.coverage.requiredSkippedTests = skipped;
+    if (skipped > 0) { if (code === 0) result.status = "infra_failed"; break; }
+   }
   }` : ''}
   if (code !== 0) break;
  }
@@ -97,8 +102,7 @@ process.exit(result.exitCode ?? 125);`;
 /** No network, shared package cache, hooks or source-provided install commands.
  * The image's self-contained dependency snapshot is copied, never mounted RW. */
 function reviewedBootstrap(lockDigest: string): string {
- return `let skipped = 0;
- if (Bun.version !== "1.3.14") throw Error("Reviewed recipe requires Bun 1.3.14");
+ return `if (Bun.version !== "1.3.14") throw Error("Reviewed recipe requires Bun 1.3.14");
  const crypto = await import("node:crypto");
  const digest = "sha256:"+crypto.createHash("sha256").update(await fs.readFile("/opt/ranger-dependencies/bun.lock")).digest("hex");
  if (digest !== ${JSON.stringify(lockDigest)}) throw Error("Image dependencies do not match lock");
@@ -335,7 +339,7 @@ async function executeAdmittedRemoteTest(
     if (terminal.status === "passed" && coverage.requiredSkippedTests !== 0) throw Error("Incomplete required test coverage");
    }
   }
-  if (sidecarId) {
+  if (sidecarId && status !== "timed_out") {
    const sidecarState = JSON.parse(await command(["inspect", sidecarId]))[0]?.State;
    if (sidecarState?.Status !== "running" || sidecarState.OOMKilled !== false) throw Error("Sidecar interrupted");
    // Summing independent peaks is a conservative aggregate upper bound.
