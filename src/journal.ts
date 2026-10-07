@@ -131,10 +131,7 @@ export interface EscalationRow {
  messageId: string;
  createdAt: string;
  lastEditedAt: string | null;
- /** open | closed — the write-side (node #21) transitions a card to closed
-  *  on a principal response or operator verb; the desk only ever writes open.
-  *  (Unified vocabulary, round-27 review — the design contract is open →
-  *  closed.) */
+ /** A confirmed graph closure also resolves the card. */
  status: "open" | "closed";
  /** When the queue-exit note was written (bounds the absent-card scan). */
  notedAt: string | null;
@@ -146,6 +143,7 @@ export type EventKind =
  | "worker-start"
  | "worker-success"
  | "closed"
+ | "closed-elsewhere"
  | "decisions-written"
  | "decisions-failed"
  | "refused"
@@ -512,7 +510,7 @@ export class Journal {
   * with a new messageId on first post, or the existing messageId + an
   * `lastEditedAt` on an in-place edit. A card whose node leaves the
   * HITL/provisioning set is EDITED to a queue-exit note but KEPT OPEN — it
-  * stays open until a principal response or an operator verb resolves it
+  * stays open until a graph closure, principal response or operator verb resolves it
   * (design §5: cards persist; leaving the frontier is not a resolution).
   */
  upsertEscalation(
@@ -723,10 +721,8 @@ export class Journal {
   * Open cards whose queue-exit note has NOT yet been written — RAW keyset
   * pages (NO exclusion predicate, round-36 review). This is what the
   * absent-card pass reconciles: once a card is noted, `noted_at` is set and
-  * it drops out of the scan, so per-tick work stays bounded even as open
-  * (persisted) cards accumulate (design §5). The caller (selectAbsentCards)
-  * drops the current-frontier rows in JS and advances the cursor on the raw
-  * rows.
+  * it drops out of the default scan. includeNoted also serves confirmed
+  * graph closures. The caller pages with a cursor to bound both scans.
   */
  listUnreconciledOpen(
   repo: string,
@@ -734,6 +730,7 @@ export class Journal {
    limit?: number;
    root?: number;
    after?: { createdAt: string; nodeId: string };
+   includeNoted?: boolean;
   } = {},
  ): EscalationRow[] {
   const rows = this.db.query.escalations
@@ -742,7 +739,7 @@ export class Journal {
      eq(escalations.repo, repo),
      rootFilter(escalations.root, opts.root),
      eq(escalations.status, "open"),
-     isNull(escalations.notedAt),
+     ...(opts.includeNoted ? [] : [isNull(escalations.notedAt)]),
      // KEYSET pagination: resume strictly AFTER the last raw row seen —
      // O(page), not O(offset) (round-31 review: a 50k-row queue must not
      // skip ~50k indexed rows per 50-row batch). nodeId is the tiebreaker

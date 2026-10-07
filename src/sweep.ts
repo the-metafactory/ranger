@@ -12,6 +12,10 @@ import {
  type MergeDeskResult,
 } from "./merge-desk.ts";
 import { crashParkOutcome, respawnedEvent } from "./outcomes.ts";
+import { graphNode, GRAPH_CALL_TIMEOUT_MS } from "./graph.ts";
+import { finishClosedElsewhere } from "./closed-elsewhere.ts";
+import * as githubApi from "./github.ts";
+import { reconcileGraphClosedCards } from "./card-sync.ts";
 
 /**
  * Sweep (design §7) — reconcile the journal against reality, crash = no-op.
@@ -83,6 +87,22 @@ export async function sweepMap(ctx: SweepContext): Promise<SweepMapResult> {
  };
 
  const phase = ctx.phase ?? "all";
+ const readNode = (id: string) => graphNode(repo, id, { token, source: "write-token" }, { timeoutMs: GRAPH_CALL_TIMEOUT_MS });
+ if (phase !== "desk") {
+  for (const worker of journal.listWorkers(repo, map.root).filter(w => ["parked", "failed", "awaiting-merge"].includes(w.status))) {
+   try {
+    const node = await readNode(worker.nodeId);
+    if (node.status !== "closed") continue;
+    const pr = worker.prNumber === null ? null : await (ctx.github ?? githubApi).getPr(repo, worker.prNumber, token);
+    const outcome = await finishClosedElsewhere({ config, map, journal, node, pr, generation: worker.generation, worktree: worker.worktree });
+    if (outcome.status === "released") result.released.push(worker.nodeId);
+   } catch (error) {
+    journal.recordEvent("sweep", { nodeId: worker.nodeId, repo, detail: `graph closure reconciliation deferred: ${String(error)}` });
+   }
+  }
+  try { await reconcileGraphClosedCards({ journal, map, readNode }); }
+  catch (error) { journal.recordEvent("sweep", { repo, detail: `graph-closed cards deferred: ${String(error)}` }); }
+ }
  const inFlight =
   phase === "desk"
    ? []

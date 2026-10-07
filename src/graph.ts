@@ -55,6 +55,8 @@ export interface FrontierEntryNode {
   autonomy: string;
   checkpointId?: string;
   probes?: { type: string; [key: string]: unknown }[];
+  /** Soma's persisted binding for a gated close. */
+  completion?: { closer: string; receiptCommentId: string; closedAt: string };
 }
 
 export interface FrontierEntry {

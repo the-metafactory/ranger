@@ -4,8 +4,9 @@ import { EscalationDiscord, DiscordMessageGoneError } from "./discord.ts";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import type { Journal, EscalationRow } from "./journal.ts";
 import { ESCALATE_REASONS, type ClassifiedNode } from "./route.ts";
-import { LeaseLostError, type OwnedCheck } from "./lock.ts";
+import { LeaseLostError, withEscalateLock, type OwnedCheck } from "./lock.ts";
 import { assertReadOnlyToken, type ResolvedToken } from "./token-gate.ts";
+import type { NodeResult } from "./graph.ts";
 
 /** The per-tick request budget (round-21) — split into two lanes so NEITHER
  *  starves the other (round-33 review): the ACTIVE pass caps at
@@ -633,12 +634,9 @@ async function syncCard(
 }
 
 /**
- * Cards whose node left the HITL/provisioning queue are edited to a "no
- * longer on queue" note but KEPT OPEN — design §5 says cards persist until a
- * principal response or an operator verb resolves them; leaving the frontier
- * is not a resolution. Edit-on-change applies, so a re-run of an already-
- * noted card is a no-op. Bounded-pool like the active pass.
- * Returns the node ids kept open this pass.
+ * An absent card closes only on a confirmed graph closure. Otherwise its
+ * queue-exit note stays open. Noted cards are re-read in bounded pages so a
+ * later graph close is still seen, without repeating the queue-exit edit.
  */
 export async function markAbsentCards(
   ctx: {
@@ -648,23 +646,28 @@ export async function markAbsentCards(
     now: Date;
     budget: CardBudget;
     owned: OwnedCheck;
+    readNode: (id: string) => Promise<NodeResult>;
+    onlyClosed?: boolean;
   },
   neededIds: ReadonlySet<string>,
 ): Promise<{ keptOpen: string[]; deferred: string[]; errors: string[] }> {
   const { client, journal, map, now, budget, owned } = ctx;
-  // Reconcile ONLY open, un-noted cards ABSENT from the current frontier — a
-  // no-op tick never loads (or skips) the active cards (round-19 review), and
-  // a noted card drops out entirely. Closing resolved cards (which shrinks
-  // the open set) is the write-side resolution lifecycle (node #21). The
-  // candidate selection (bounded + cursor-swept past needed rows) is
-  // `selectAbsentCards`; the per-card destination reconciliation is
-  // `reconcileAbsentCard`.
   const usable = selectAbsentCards(journal, map.repo, neededIds, budget, map.root);
   const clientFor = channelClientFor(client);
   const reconcileCtx = { clientFor, journal, map, now, budget, owned };
-  const outcomes = await mapPool(usable, 3, (prior) =>
-    reconcileAbsentCard(reconcileCtx, prior),
-  );
+  const outcomes = await mapPool(usable, 3, async (prior): Promise<AbsentOutcome> => {
+    let closed = false;
+    try {
+      closed = (await ctx.readNode(prior.nodeId)).status === "closed";
+    } catch (error) {
+      // A failed read is never evidence of closure. Still retire the queue
+      // presentation for an unnoted absent card, as before.
+      if (ctx.onlyClosed || prior.notedAt !== null) return { action: "error", id: prior.nodeId, error: String(error) };
+      journal.recordEvent("sweep", { nodeId: prior.nodeId, repo: map.repo, detail: `graph closure read deferred: ${String(error)}` });
+    }
+    if (!closed && (ctx.onlyClosed || prior.notedAt !== null)) return { action: "unchanged", id: prior.nodeId };
+    return reconcileAbsentCard(reconcileCtx, prior, closed);
+  });
   const keptOpen: string[] = [];
   const deferred: string[] = [];
   const errors: string[] = [];
@@ -732,15 +735,20 @@ function selectAbsentCards(
       root,
       limit: scanPage,
       after,
+      includeNoted: true,
     });
-    scanned += batch.length;
-    openCards.push(...batch.filter((row) => !neededIds.has(row.nodeId)));
-    if (batch.length < scanPage) {
+    let consumed = 0;
+    for (const row of batch) {
+      scanned++;
+      consumed++;
+      after = { createdAt: row.createdAt, nodeId: row.nodeId };
+      if (!neededIds.has(row.nodeId)) openCards.push(row);
+      if (openCards.length >= wanted || scanned >= MAX_ABSENT_SCAN) break;
+    }
+    if (consumed === batch.length && batch.length < scanPage) {
       reachedEnd = true; // swept the whole raw set — reset the cursor next tick
       break;
     }
-    const last = batch[batch.length - 1]; // non-empty: length >= scanPage here
-    after = { createdAt: last.createdAt, nodeId: last.nodeId };
   }
   journal.setHealth(
     cursorKey,
@@ -750,7 +758,7 @@ function selectAbsentCards(
 }
 
 type AbsentOutcome =
-  | { action: "keptOpen" | "unchanged"; id: string }
+  | { action: "keptOpen" | "closed" | "unchanged"; id: string }
   | { action: "deferred"; id: string }
   | { action: "error"; id: string; error: string };
 
@@ -773,12 +781,13 @@ async function reconcileAbsentCard(
     owned: OwnedCheck;
   },
   prior: EscalationRow,
+  closed = false,
 ): Promise<AbsentOutcome> {
   const { clientFor, journal, map, now, budget, owned } = ctx;
   const nodeId = prior.nodeId;
   const key = journalKeyFor(map.repo, nodeId);
-  const content = queueExitContent(nodeId, prior.title, map.repo);
-  const cursorKey = `escalate.reconcile.${key}`;
+  const content = closed ? closedGraphContent(nodeId, prior.title, map.repo) : queueExitContent(nodeId, prior.title, map.repo);
+  const cursorKey = `escalate.reconcile.${key}${closed ? ".closed" : ""}`;
   try {
     // Reconcile EVERY destination's card: a card that moved channels still
     // holds a live, actionable message in each visited channel — write the
@@ -789,11 +798,11 @@ async function reconcileAbsentCard(
     let destinations: { channelId: string; messageId: string }[];
     if (stored.length > 0) {
       destinations = stored;
-    } else if (prior.channelId === null) {
+    } else if (prior.channelId === null && map.discord === undefined) {
       destinations = [];
     } else {
       destinations = [
-        { channelId: prior.channelId, messageId: prior.messageId },
+        { channelId: prior.channelId ?? map.discord!.channelId, messageId: prior.messageId },
       ];
     }
     // A per-card destination cursor: with more destinations than the
@@ -826,6 +835,7 @@ async function reconcileAbsentCard(
         if (!(destError instanceof DiscordMessageGoneError)) throw destError;
         // this destination's card is already gone — nothing to note there
       }
+      journal.setHealth(cursorKey, String(i + 1));
     }
     // All destinations reconciled (or a definitive 404 each) — clear the
     // cursor + set notedAt; a transient failure throws → retried next tick.
@@ -844,11 +854,11 @@ async function reconcileAbsentCard(
       channelId: prior.channelId,
       createdAt: prior.createdAt,
       lastEditedAt: now.toISOString(),
-      status: prior.status, // stays open — cards persist (design §5)
+      status: closed ? "closed" : prior.status,
       notedAt: now.toISOString(),
     });
     return {
-      action: (anyEdit ? "keptOpen" : "unchanged") as "keptOpen" | "unchanged",
+      action: closed ? "closed" : anyEdit ? "keptOpen" : "unchanged",
       id: nodeId,
     };
   } catch (cardError) {
@@ -862,6 +872,51 @@ async function reconcileAbsentCard(
       error: cardError instanceof Error ? cardError.message : String(cardError),
     };
   }
+}
+
+/** Called only after the caller has read a closed graph node. */
+export async function closeGraphEscalation(ctx: {
+ journal: Journal;
+ map: RangerMapConfig;
+ nodeId: string;
+ owned: OwnedCheck;
+}): Promise<void> {
+ const prior = ctx.journal.getEscalation(ctx.map.repo, ctx.nodeId);
+ if (prior === null || prior.status === "closed") return;
+ if (prior.root !== ctx.map.root) throw new Error(`escalation belongs to map ${ctx.map.repo}#${prior.root}, not ${mapKey(ctx.map)}`);
+ await withEscalateLock(ctx.journal, async owned => {
+  ctx.owned();
+  const live = ctx.journal.getEscalation(ctx.map.repo, ctx.nodeId);
+  if (live === null || live.status === "closed") return;
+  const outcome = await reconcileAbsentCard({
+   ...ctx,
+   clientFor: channelClientFor(EscalationDiscord.fromMap(ctx.map)),
+   now: new Date(),
+   budget: { remaining: ABSENT_RESERVE, deadline: Date.now() + 60_000 },
+   owned: () => { owned(); ctx.owned(); },
+  }, live, true);
+  if (outcome.action === "error" || outcome.action === "deferred") throw new Error(`closed card ${outcome.action}${"error" in outcome ? `: ${outcome.error}` : ""}`);
+ });
+}
+
+/** Sweep also serves graph-closed cards, even when their worker is already terminal. */
+export async function reconcileGraphClosedCards(ctx: {
+ journal: Journal;
+ map: RangerMapConfig;
+ readNode: (id: string) => Promise<NodeResult>;
+}): Promise<void> {
+ if (ctx.journal.listUnreconciledOpen(ctx.map.repo, { root: ctx.map.root, includeNoted: true, limit: 1 }).length === 0) return;
+ await withEscalateLock(ctx.journal, async owned => {
+  const result = await markAbsentCards({
+   ...ctx,
+   client: EscalationDiscord.fromMap(ctx.map),
+   now: new Date(),
+   budget: { remaining: ABSENT_RESERVE, deadline: Date.now() + 60_000 },
+   owned,
+   onlyClosed: true,
+  }, new Set());
+  for (const error of result.errors) ctx.journal.recordEvent("sweep", { repo: ctx.map.repo, detail: `closed graph card sync deferred: ${error}` });
+ });
 }
 
 /** One throttled client per channel, shared by a pass — edits to OTHER
@@ -926,6 +981,10 @@ function queueExitContent(
   ]
     .filter((l) => l.trim().length > 0)
     .join("\n");
+}
+
+function closedGraphContent(nodeId: string, title: string | null, repo: string): string {
+ return `~~**#${sanitizeGraphText(nodeId)}** ${truncate(sanitizeGraphText(title ?? ""), 200)}~~ closed on the graph\nmap: ${sanitizeGraphText(repo)}`;
 }
 
 export function ageText(

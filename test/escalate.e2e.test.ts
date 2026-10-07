@@ -158,6 +158,35 @@ function envFor(
   };
 }
 
+test("a graph-closed escalation closes once, including after a queue-exit note", async () => {
+ const dir = mkdtempSync(join(tmpdir(), "ranger-card-closed-"));
+ const discord = fakeDiscord();
+ try {
+  const config = writeConfig(dir);
+  writeFixtures(dir);
+  const env = envFor(dir, discord.port);
+  expect((await runCli(["escalate", "-c", config, "--json"], env)).code).toBe(0);
+  const frontier = JSON.parse(readFileSync(join(dir, "acme__widgets-frontier.json"), "utf8"));
+  const node = frontier.frontier.find((n: { ref: { id: string } }) => n.ref.id === "12");
+  const nodeFile = join(dir, "acme__widgets-node-12.json");
+  writeFileSync(nodeFile, JSON.stringify({ repo: "acme/widgets", ...node }));
+  writeFixtures(dir, ["12"]);
+  expect((await runCli(["escalate", "-c", config, "--json"], env)).code).toBe(0);
+  const before = discord.edits.length;
+  node.status = "closed";
+  writeFileSync(nodeFile, JSON.stringify({ repo: "acme/widgets", ...node }));
+  expect((await runCli(["escalate", "-c", config, "--json"], env)).code).toBe(0);
+  const journal = new Journal(join(dir, "state.sqlite"));
+  expect(journal.getEscalation("acme/widgets", "12")).toMatchObject({ status: "closed" });
+  expect(journal.getEscalation("acme/widgets", "12")?.lastContent).toContain("closed on the graph");
+  expect(journal.getEscalation("acme/widgets", "12")?.lastContent).toContain("~~");
+  journal.close();
+  expect(discord.edits).toHaveLength(before + 1);
+  expect((await runCli(["escalate", "-c", config, "--json"], env)).code).toBe(0);
+  expect(discord.edits).toHaveLength(before + 1);
+ } finally { discord.stop(); rmSync(dir, { recursive: true, force: true }); }
+});
+
 describe("ranger escalate — escalation desk (design §5, node #20)", () => {
   test("posts one card per HITL/provisioning node, edits-not-reposts on a second run, resolves a node that leaves the queue", async () => {
     const dir = mkdtempSync(join(tmpdir(), "ranger-escalate-"));

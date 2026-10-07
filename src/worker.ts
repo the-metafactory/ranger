@@ -53,6 +53,7 @@ import { workerEnv } from "./worker-env.ts";
 import { sessionJournalPath } from "./journal-guard.ts";
 import { saveWorkerLog } from "./worker-log.ts";
 import { isTransientGitHubError } from "./transient.ts";
+import { finishClosedElsewhere } from "./closed-elsewhere.ts";
 import * as githubApi from "./github.ts";
 import type { ForgePort } from "./forge.ts";
 import { ParkSignal } from "./signals.ts";
@@ -75,7 +76,7 @@ export { gitAuthEnv } from "./git-ops.ts";
 export interface RunNodeOutcome {
  nodeId: string;
  repo: string;
- status: "success" | "failed" | "refused" | "skipped" | "parked" | "awaiting-merge";
+ status: "success" | "released" | "failed" | "refused" | "skipped" | "parked" | "awaiting-merge";
  detail: string;
  workerExit: number | null;
  close?: CloseResult;
@@ -404,7 +405,7 @@ function finish(
  journal: Journal,
  nodeId: string,
  repo: string,
- status: "success" | "failed" | "parked",
+ status: "success" | "released" | "failed" | "parked",
  outcome: string,
 ): void {
  journal.updateWorker(nodeId, repo, {
@@ -465,6 +466,13 @@ export async function runNode(
     timeoutMs: GRAPH_CALL_TIMEOUT_MS,
    },
   );
+  if (node.status === "closed") {
+   const github = ctx.github ?? githubApi;
+   const pr = row?.prNumber == null
+    ? await github.findPrByHead(repo, implementBranchFor(node.node, worktreeBranch(nodeId, slugify(node.node.title))), token)
+    : await github.getPr(repo, row.prNumber, token);
+   return { ...base, ...await finishClosedElsewhere({ ...ctx, node, pr, generation }) };
+  }
   const rootNode = await graphNode(
    repo,
    String(map.root),
@@ -650,6 +658,9 @@ async function runImplementNode(
  }
 
  switch (outcome.status) {
+  case "released":
+   finish(journal, nodeId, repo, "released", outcome.detail);
+   break;
   case "success":
    journal.resetDeadman();
    finish(journal, nodeId, repo, "success", outcome.detail);
