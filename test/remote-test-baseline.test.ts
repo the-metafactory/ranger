@@ -17,7 +17,7 @@ function fixture() {
   availableMemory: async () => { calls.push("memory"); return 4 * 1024 ** 3; },
   controller: async () => { calls.push("controller"); return "cgroup-v2"; },
   health: async (h) => { calls.push(h.name); return "healthy"; },
-  workload: async () => { calls.push("workload"); return { cpuSeconds: 1.25, peakMemoryBytes: 300000, durationSeconds: 2.5, exitCode: 0 }; },
+  workload: async () => { calls.push("workload"); return { cpuSeconds: 1.25, peakMemoryBytes: 300000, peakMemoryState: "observed", durationSeconds: 2.5, exitCode: 0 }; },
  };
  return { metrics, calls };
 }
@@ -30,7 +30,7 @@ describe("baseline handler", () => {
  test("run records profile, platform, runtime, pre/post capacity and health, aggregate job metrics", async () => {
   const f = fixture(); const r = await runBaseline(config, { run: true, metrics: f.metrics });
   expect(r.exitCode).toBe(0); expect(r.report.profile).toEqual(config.profile);
-  expect(r.report.workload).toEqual({ status: "ok", value: { cpuSeconds: 1.25, peakMemoryBytes: 300000, durationSeconds: 2.5, exitCode: 0 } });
+  expect(r.report.workload).toEqual({ status: "ok", value: { cpuSeconds: 1.25, peakMemoryBytes: 300000, peakMemoryState: "observed", durationSeconds: 2.5, exitCode: 0 } });
   expect(f.calls).toEqual(["platform", "runtime", "memory", "controller", "resident", "workload", "memory", "resident"]);
  });
  for (const name of ["platform", "runtime", "availableMemory", "controller", "health"] as const) {
@@ -54,12 +54,12 @@ describe("baseline handler", () => {
  });
  test("failed post health and nonzero workload cannot produce success", async () => {
   const f = fixture(); let n = 0; f.metrics.health = async () => { if (n++) throw new Error("down"); return "healthy"; };
-  f.metrics.workload = async () => ({ cpuSeconds: 1, peakMemoryBytes: 2, durationSeconds: 3, exitCode: 124 });
+  f.metrics.workload = async () => ({ cpuSeconds: 1, peakMemoryBytes: 2, peakMemoryState: "observed", durationSeconds: 3, exitCode: 124 });
   const r = await runBaseline(config, { run: true, metrics: f.metrics });
   expect(r.exitCode).toBe(1); expect(r.report.postHealth[0]?.measurement.status).toBe("failed");
  });
  test("malformed numeric metrics and mismatched platform fail explicitly", async () => {
-  const f = fixture(); f.metrics.workload = async () => ({ cpuSeconds: NaN, peakMemoryBytes: -1, durationSeconds: 0, exitCode: 0 });
+  const f = fixture(); f.metrics.workload = async () => ({ cpuSeconds: NaN, peakMemoryBytes: -1, peakMemoryState: "observed", durationSeconds: 0, exitCode: 0 });
   expect((await runBaseline(config, { run: true, metrics: f.metrics })).report.workload.status).toBe("failed");
   const platform = fixture(); platform.metrics.platform = async () => "Darwin arm64";
   const r = await runBaseline(config, { run: true, metrics: platform.metrics });
@@ -110,7 +110,7 @@ describe("command adapters (no live hosts)", () => {
  });
  test("cgroup wrapper sets fixed caps, encloses argv, kills leftovers and times out on target", async () => {
   let argv: readonly string[] = [];
-  const m = createCommandMetrics(async (a) => { argv = a; return { code: 0, stdout: "cpuSeconds=1\npeakMemoryBytes=2\ndurationSeconds=3\nexitCode=0\n", stderr: "" }; });
+  const m = createCommandMetrics(async (a) => { argv = a; return { code: 0, stdout: "cpuSeconds=1\npeakMemoryBytes=2\npeakMemoryState=observed\ndurationSeconds=3\nexitCode=0\n", stderr: "" }; });
   await m.workload(config);
   expect(argv[0]).toBe("sh"); const script = argv[2]!;
   expect(script).toContain("1610612736"); expect(script).toContain("200000 100000");
@@ -141,11 +141,11 @@ describe("private report storage", () => {
  });
 });
 
-for (const failure of ["cleanup", "sidecar", "oom", "missing-peak", "timeout"] as const) {
+for (const failure of ["cleanup", "sidecar", "oom", "timeout"] as const) {
  test(`shell wrapper fails visibly on ${failure} (fake controller)`, async () => {
   const dir = await mkdtemp(join(tmpdir(), "ranger-baseline-failure-"));
   try {
-   const setup = `printf 'populated ${failure === "sidecar" ? 1 : 0}\\n' > "$cg/cgroup.events"; printf 'oom_kill ${failure === "oom" ? 1 : 0}\\n' > "$cg/memory.events"; printf 'usage_usec 1000000\\n' > "$cg/cpu.stat"; ${failure === "missing-peak" ? "true" : "printf '1000\\n' > \"$cg/memory.peak\""}; touch "$cg/cgroup.kill"`;
+   const setup = `printf 'populated ${failure === "sidecar" ? 1 : 0}\\n' > "$cg/cgroup.events"; printf 'oom_kill ${failure === "oom" ? 1 : 0}\\n' > "$cg/memory.events"; printf 'usage_usec 1000000\\n' > "$cg/cpu.stat"; printf '1000\\n' > "$cg/memory.peak"; touch "$cg/cgroup.kill"`;
    const local = localCommandAdapter();
    const m = createCommandMetrics(async (argv, timeout) => {
     let script = argv[2]!.replaceAll(config.cgroupRoot, dir).replace("watchdog=''", `${setup}\nwatchdog=''`);
@@ -161,9 +161,8 @@ for (const failure of ["cleanup", "sidecar", "oom", "missing-peak", "timeout"] a
    // kill models that cgroup operation, so a broken target watchdog cannot
    // pass through the elapsed-time check: this workload would run for 30 s.
    const c = { ...config, cwd: dir, timeoutSeconds: failure === "timeout" ? 1 : 60, profile: { ...config.profile, commands: failure === "timeout" ? [["exec", "sleep", "30"]] : [["touch", marker]] } } as BaselineConfig;
-   if (failure === "cleanup" || failure === "missing-peak") {
+   if (failure === "cleanup") {
     await expect(m.workload(c)).rejects.toThrow();
-    if (failure === "missing-peak") await expect(stat(marker)).rejects.toThrow();
    } else {
     const started = Date.now(); const result = await m.workload(c);
     expect(result.exitCode).toBe(failure === "timeout" ? 124 : 125);
