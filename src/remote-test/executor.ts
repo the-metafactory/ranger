@@ -144,6 +144,22 @@ test "$(cat /sys/fs/cgroup/pids.max)" = ${budget.pids}
 exec /nats-server --jetstream --store_dir=/data --addr=127.0.0.1 --port=4222`;
 }
 
+/** Absence of optional peak telemetry is established by successful enumeration.
+ * A listed but unreadable/malformed peak, or failed mandatory reads, still fails. */
+export function sidecarMetricsProgram(): string {
+ return `set -e
+interfaces=$(ls -1 /sys/fs/cgroup)
+cat /sys/fs/cgroup/cpu.stat
+if printf '%s\\n' "$interfaces" | grep -Fx memory.peak >/dev/null; then
+ peak=$(cat /sys/fs/cgroup/memory.peak)
+ case "$peak" in ''|*[!0-9]*) exit 1;; esac
+ printf 'ranger_peak %s\\n' "$peak"
+else
+ printf 'ranger_peak unavailable\\n'
+fi
+cat /sys/fs/cgroup/memory.events`;
+}
+
 /** One operator-exclusive jobs root is one lane. Configuration is trusted and
  * reviewed, never supplied by the job; profile digest authentication belongs
  * to that admission layer. Source and lock bytes are verified here. */
@@ -343,11 +359,14 @@ async function executeAdmittedRemoteTest(
    const sidecarState = JSON.parse(await command(["inspect", sidecarId]))[0]?.State;
    if (sidecarState?.Status !== "running" || sidecarState.OOMKilled !== false) throw Error("Sidecar interrupted");
    // Summing independent peaks is a conservative aggregate upper bound.
-   const metrics = await command(["exec", sidecarId, "/bin/sh", "-ec", "cat /sys/fs/cgroup/cpu.stat; cat /sys/fs/cgroup/memory.peak; cat /sys/fs/cgroup/memory.events"]);
+   const metrics = await command(["exec", sidecarId, "/bin/sh", "-ec", sidecarMetricsProgram()]);
    const cpu = Number(metrics.match(/^usage_usec\s+(\d+)$/m)?.[1]);
-   const peak = Number(metrics.match(/^([0-9]+)$/m)?.[1]);
-   if (/^oom_kill\s+[1-9][0-9]*$/m.test(metrics)) throw Error("Sidecar OOM");
-   if (resources.state === "observed" && Number.isSafeInteger(cpu) && cpu >= 0 && Number.isSafeInteger(peak) && peak >= 0) {
+   const peakValue = metrics.match(/^ranger_peak (unavailable|[0-9]+)$/m)?.[1];
+   const peak = peakValue === "unavailable" ? null : Number(peakValue);
+   const oom = Number(metrics.match(/^oom_kill\s+(\d+)$/m)?.[1]);
+   if (!Number.isSafeInteger(cpu) || cpu < 0 || !Number.isSafeInteger(oom) || oom !== 0 ||
+    peakValue === undefined || peak !== null && (!Number.isSafeInteger(peak) || peak < 0)) throw Error("Sidecar metrics invalid or OOM");
+   if (resources.state === "observed" && peak !== null) {
     resources = ResourceObservationSchema.parse({ state: "observed", cpuTimeMicros: resources.cpuTimeMicros! + cpu, peakMemoryBytes: resources.peakMemoryBytes! + peak });
    } else resources = { state: "unavailable", cpuTimeMicros: null, peakMemoryBytes: null };
   }
