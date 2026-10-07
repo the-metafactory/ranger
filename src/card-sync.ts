@@ -7,6 +7,7 @@ import { ESCALATE_REASONS, type ClassifiedNode } from "./route.ts";
 import { LeaseLostError, withEscalateLock, type OwnedCheck } from "./lock.ts";
 import { assertReadOnlyToken, type ResolvedToken } from "./token-gate.ts";
 import type { NodeResult } from "./graph.ts";
+import { BudgetDeferral } from "./budget.ts";
 
 /** The per-tick request budget (round-21) — split into two lanes so NEITHER
  *  starves the other (round-33 review): the ACTIVE pass caps at
@@ -290,7 +291,7 @@ export function dayDiff(fromIso: string, now: Date): number {
 }
 
 /** Bounded-concurrency pool — preserves input order in the results array. */
-async function mapPool<T, R>(
+export async function mapPool<T, R>(
   items: T[],
   limit: number,
   fn: (item: T, index: number) => Promise<R>,
@@ -656,16 +657,18 @@ export async function markAbsentCards(
   const clientFor = channelClientFor(client);
   const reconcileCtx = { clientFor, journal, map, now, budget, owned };
   const outcomes = await mapPool(usable, 3, async (prior): Promise<AbsentOutcome> => {
+    const closureOnly = ctx.onlyClosed || prior.notedAt !== null;
     let closed = false;
     try {
       closed = (await ctx.readNode(prior.nodeId)).status === "closed";
     } catch (error) {
+      if (error instanceof BudgetDeferral) return { action: "deferred", id: prior.nodeId };
       // A failed read is never evidence of closure. Still retire the queue
       // presentation for an unnoted absent card, as before.
-      if (ctx.onlyClosed || prior.notedAt !== null) return { action: "error", id: prior.nodeId, error: String(error) };
+      if (closureOnly) return { action: "error", id: prior.nodeId, error: String(error) };
       journal.recordEvent("sweep", { nodeId: prior.nodeId, repo: map.repo, detail: `graph closure read deferred: ${String(error)}` });
     }
-    if (!closed && (ctx.onlyClosed || prior.notedAt !== null)) return { action: "unchanged", id: prior.nodeId };
+    if (!closed && closureOnly) return { action: "unchanged", id: prior.nodeId };
     return reconcileAbsentCard(reconcileCtx, prior, closed);
   });
   const keptOpen: string[] = [];
@@ -798,7 +801,7 @@ async function reconcileAbsentCard(
     let destinations: { channelId: string; messageId: string }[];
     if (stored.length > 0) {
       destinations = stored;
-    } else if (prior.channelId === null && map.discord === undefined) {
+    } else if (prior.channelId === null && (!closed || map.discord === undefined)) {
       destinations = [];
     } else {
       destinations = [
@@ -874,49 +877,58 @@ async function reconcileAbsentCard(
   }
 }
 
-/** Called only after the caller has read a closed graph node. */
+const CLOSED_CARD_DEADLINE_MS = 60_000;
+
+function outOfBandPass(map: RangerMapConfig) {
+  return {
+    client: EscalationDiscord.fromMap(map),
+    now: new Date(),
+    budget: { remaining: ABSENT_RESERVE, deadline: Date.now() + CLOSED_CARD_DEADLINE_MS },
+  };
+}
+
+/** Confirmed graph closure resolves the cached card (design §5, node #171).
+ * Called only after the caller has read a closed graph node. */
 export async function closeGraphEscalation(ctx: {
- journal: Journal;
- map: RangerMapConfig;
- nodeId: string;
- owned: OwnedCheck;
+  journal: Journal;
+  map: RangerMapConfig;
+  nodeId: string;
+  owned: OwnedCheck;
 }): Promise<void> {
- const prior = ctx.journal.getEscalation(ctx.map.repo, ctx.nodeId);
- if (prior === null || prior.status === "closed") return;
- if (prior.root !== ctx.map.root) throw new Error(`escalation belongs to map ${ctx.map.repo}#${prior.root}, not ${mapKey(ctx.map)}`);
- await withEscalateLock(ctx.journal, async owned => {
-  ctx.owned();
-  const live = ctx.journal.getEscalation(ctx.map.repo, ctx.nodeId);
-  if (live === null || live.status === "closed") return;
-  const outcome = await reconcileAbsentCard({
-   ...ctx,
-   clientFor: channelClientFor(EscalationDiscord.fromMap(ctx.map)),
-   now: new Date(),
-   budget: { remaining: ABSENT_RESERVE, deadline: Date.now() + 60_000 },
-   owned: () => { owned(); ctx.owned(); },
-  }, live, true);
-  if (outcome.action === "error" || outcome.action === "deferred") throw new Error(`closed card ${outcome.action}${"error" in outcome ? `: ${outcome.error}` : ""}`);
- });
+  const prior = ctx.journal.getEscalation(ctx.map.repo, ctx.nodeId);
+  if (prior === null || prior.status === "closed") return;
+  if (prior.root !== ctx.map.root) throw new Error(`escalation belongs to map ${ctx.map.repo}#${prior.root}, not ${mapKey(ctx.map)}`);
+  await withEscalateLock(ctx.journal, async owned => {
+    ctx.owned();
+    const live = ctx.journal.getEscalation(ctx.map.repo, ctx.nodeId);
+    if (live === null || live.status === "closed") return;
+    const pass = outOfBandPass(ctx.map);
+    const outcome = await reconcileAbsentCard({
+      ...ctx,
+      ...pass,
+      clientFor: channelClientFor(pass.client),
+      owned: () => { owned(); ctx.owned(); },
+    }, live, true);
+    if (outcome.action === "error" || outcome.action === "deferred") throw new Error(`closed card ${outcome.action}${"error" in outcome ? `: ${outcome.error}` : ""}`);
+  });
 }
 
 /** Sweep also serves graph-closed cards, even when their worker is already terminal. */
 export async function reconcileGraphClosedCards(ctx: {
- journal: Journal;
- map: RangerMapConfig;
- readNode: (id: string) => Promise<NodeResult>;
+  journal: Journal;
+  map: RangerMapConfig;
+  readNode: (id: string) => Promise<NodeResult>;
 }): Promise<void> {
- if (ctx.journal.listUnreconciledOpen(ctx.map.repo, { root: ctx.map.root, includeNoted: true, limit: 1 }).length === 0) return;
- await withEscalateLock(ctx.journal, async owned => {
-  const result = await markAbsentCards({
-   ...ctx,
-   client: EscalationDiscord.fromMap(ctx.map),
-   now: new Date(),
-   budget: { remaining: ABSENT_RESERVE, deadline: Date.now() + 60_000 },
-   owned,
-   onlyClosed: true,
-  }, new Set());
-  for (const error of result.errors) ctx.journal.recordEvent("sweep", { repo: ctx.map.repo, detail: `closed graph card sync deferred: ${error}` });
- });
+  if (ctx.journal.listUnreconciledOpen(ctx.map.repo, { root: ctx.map.root, includeNoted: true, limit: 1 }).length === 0) return;
+  await withEscalateLock(ctx.journal, async owned => {
+    const result = await markAbsentCards({
+      ...ctx,
+      ...outOfBandPass(ctx.map),
+      owned,
+      onlyClosed: true,
+    }, new Set());
+    for (const error of result.errors) ctx.journal.recordEvent("sweep", { repo: ctx.map.repo, detail: `closed graph card sync deferred: ${error}` });
+  });
 }
 
 /** One throttled client per channel, shared by a pass — edits to OTHER
@@ -984,7 +996,7 @@ function queueExitContent(
 }
 
 function closedGraphContent(nodeId: string, title: string | null, repo: string): string {
- return `~~**#${sanitizeGraphText(nodeId)}** ${truncate(sanitizeGraphText(title ?? ""), 200)}~~ closed on the graph\nmap: ${sanitizeGraphText(repo)}`;
+  return `~~**#${sanitizeGraphText(nodeId)}** ${truncate(sanitizeGraphText(title ?? ""), 200)}~~ closed on the graph\nmap: ${sanitizeGraphText(repo)}`;
 }
 
 export function ageText(

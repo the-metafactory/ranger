@@ -144,6 +144,7 @@ export type EventKind =
  | "worker-success"
  | "closed"
  | "closed-elsewhere"
+ | "closed-elsewhere-ungated"
  | "decisions-written"
  | "decisions-failed"
  | "refused"
@@ -353,6 +354,15 @@ export class Journal {
        })
        .sync();
   return rows.map(hydrateWorker);
+ }
+
+ /** Bounded keyset page for graph-closure reconciliation, scoped to one map. */
+ listClosureCandidates(repo: string, root: number, limit: number, after?: string): WorkerRow[] {
+  return this.db.select().from(workers).where(and(
+   eq(workers.repo, repo), eq(workers.root, root),
+   inArray(workers.status, ["parked", "failed", "awaiting-merge"]),
+   after === undefined ? undefined : gt(workers.nodeId, after),
+  )).orderBy(asc(workers.nodeId)).limit(limit).all().map(hydrateWorker);
  }
 
  // ---- events ----

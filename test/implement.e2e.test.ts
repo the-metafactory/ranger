@@ -1015,6 +1015,7 @@ describe("implement lane (node #23)", () => {
     node.node.completion = { closer: "jcfischer", receiptCommentId: "900", closedAt: new Date().toISOString() };
     writeFileSync(file, JSON.stringify(node));
     r.journal.updateWorker("20", "acme/widgets", { status: startStatus === "resume" ? "failed" : startStatus, phase: "close", outcome: "HTTP 500" });
+    if (startStatus === "failed" && prState === "merged") r.journal.updateWorker("20", "acme/widgets", { prNumber: null });
     const callsFile = join(r.dir, "graph-calls"); process.env.FAKE_SOMA_CALLS = callsFile;
     const ci = spyOn(r.github, "ciVerdictFor").mockImplementation(async () => { throw new Error("HTTP 500"); });
     try {
@@ -1036,6 +1037,25 @@ describe("implement lane (node #23)", () => {
    }, 60_000);
   }
  }
+
+ test.each(["resume", "sweep"])("recovers ranger's own graph close honestly via %s", async via => {
+  const r = await rig({}); cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  await r.github.merge(1);
+  const file = join(r.dir, "data", "acme__widgets-node-20.json");
+  const node = JSON.parse(readFileSync(file, "utf8")); node.status = "closed";
+  node.node.completion = { closer: BOT, receiptCommentId: "901", closedAt: new Date().toISOString() };
+  writeFileSync(file, JSON.stringify(node));
+  r.journal.updateWorker("20", "acme/widgets", { status: "failed", phase: "close" });
+  const calls = join(r.dir, "calls"); process.env.FAKE_SOMA_CALLS = calls;
+  if (via === "resume") expect((await runNode("20", r.ctx)).status).toBe("success");
+  else await sweepMap({ ...r.ctx, phase: "liveness" });
+  expect(r.journal.getWorker("20", "acme/widgets")?.status).toBe("success");
+  expect(r.journal.listEvents("acme/widgets", 500).some(e => e.kind === "closed-elsewhere")).toBe(false);
+  expect(r.journal.listEvents("acme/widgets", 500).find(e => e.kind === "closed")?.detail).toContain(`recovered ranger close by ${BOT}`);
+  expect(readFileSync(calls, "utf8")).not.toContain("close acme/widgets");
+  expect(existsSync(join(r.canonical, ".worktrees", "node-20"))).toBe(false);
+ }, 60_000);
 
  test("close phase re-reads graph closure before CI when the node closed during resume", async () => {
   const r = await rig({}); cleanup.push(r.dir);
@@ -1065,6 +1085,7 @@ describe("implement lane (node #23)", () => {
    await r.github.merge(1);
    const file = join(r.dir, "data", "acme__widgets-node-20.json");
    const node = JSON.parse(readFileSync(file, "utf8")); node.status = "closed";
+   node.node.completion = { closer: "jcfischer", receiptCommentId: "900", closedAt: new Date().toISOString() };
    writeFileSync(file, JSON.stringify(node));
    process.env.RANGER_DISCORD_TOKEN = "fake-token";
    process.env.RANGER_DISCORD_API_BASE = `http://127.0.0.1:${discord.port}`;
