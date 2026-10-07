@@ -364,34 +364,63 @@ describe("resume-queue-starts-when-lane-frees", () => {
  });
 
  for (const failure of ["node", "PR"] as const) {
- test(`${failure} validation failure drops the head with a reason and starts the next resume`, async () => {
+ test(`${failure} validation failure retains FIFO entries and blocks shared-lane claims until recovery`, async () => {
   await withRig(async r => {
    r.queue("40"); r.queue("41", 460); r.journal.updateWorker("40", REPO, { status: "failed", prNumber: 7 });
+   const entries = r.journal.listResumeQueue();
    if (failure === "node") rmSync(join(r.env.FAKE_SOMA_DIR!, "acme__widgets-node-40.json"));
+   r.frontier(1, ["20"]);
    r.frontier(460, ["21"]);
-   const github = { getPr: async () => { throw new Error("read failed"); } } as unknown as GitHubPort;
+   let readFails = failure === "PR";
+   let reads = 0;
+   const github = { getPr: async () => {
+    reads++;
+    if (readFails) throw new Error("read failed");
+    return pr();
+   } } as unknown as GitHubPort;
    const spawned: string[] = [];
-   const result = await walk({ ...r, github, spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; } });
-   expect(spawned).toEqual(["41"]); expect(r.journal.listResumeQueue()).toEqual([]);
-   expect(result.maps.flatMap(m => m.claimed)).toEqual([]);
-   const event = r.journal.listEvents(REPO).find(e => e.kind === "resume-dropped" && e.nodeId === "40");
+   const tick = () => walk({ ...r, github, now: () => NOW,
+    spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; } });
+   for (let attempt = 0; attempt < 2; attempt++) {
+    const result = await tick();
+    expect(spawned).toEqual([]);
+    expect(r.journal.listResumeQueue()).toEqual(entries);
+    expect(result.maps.flatMap(m => m.claimed)).toEqual([]);
+    expect(result.maps.flatMap(m => m.errors).join(" ")).toContain("validation failed");
+    expect(r.journal.getWorker("40", REPO)?.status).toBe("failed");
+    expect(r.journal.getWorker("41", REPO)?.status).toBe("parked");
+    expect(r.journal.spawnsToday(NOW)).toBe(0);
+    expect(reads).toBe(failure === "PR" ? attempt + 1 : 0);
+   }
+   expect(r.journal.listEvents(REPO).some(e => e.kind === "resume-dropped")).toBe(false);
+   const event = r.journal.listEvents(REPO).find(e => e.kind === "sweep" && e.detail?.includes("queued resume #40 deferred"));
    expect(event?.detail).toContain("validation failed");
    expect(event?.detail).toContain(failure === "node" ? "no fixture" : "read failed");
-   expect(result.maps.flatMap(m => m.errors).join(" ")).toContain("validation failed");
-   expect(r.journal.getWorker("40", REPO)?.status).toBe("failed");
+   r.node("40"); readFails = false;
+   const recovered = await tick();
+   expect(spawned).toEqual(["40"]);
+   expect(r.journal.listResumeQueue()).toEqual([entries[1]]);
+   expect(recovered.maps.flatMap(m => m.claimed)).toEqual([]);
+   expect(r.journal.spawnsToday(NOW)).toBe(1);
+   r.journal.updateWorker("40", REPO, { status: "success" });
+   const next = await tick();
+   expect(spawned).toEqual(["40", "41"]);
+   expect(r.journal.listResumeQueue()).toEqual([]);
+   expect(next.maps.flatMap(m => m.claimed)).toEqual([]);
   });
  });
  }
 
- test("unreachable queue head does not block a fresh claim on the shared lane", async () => {
+ test("unreachable queue head retains its entry without blocking an independent lane", async () => {
   await withRig(async r => {
-   r.queue("40"); rmSync(join(r.env.FAKE_SOMA_DIR!, "acme__widgets-node-40.json"));
+   r.config.maps[1].lane = "visual";
+   const entry = r.queue("40"); rmSync(join(r.env.FAKE_SOMA_DIR!, "acme__widgets-node-40.json"));
    r.frontier(460, ["21"]);
    const spawned: string[] = [];
    const result = await walk({ ...r, spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; } });
    expect(spawned).toEqual(["21"]);
    expect(result.maps.flatMap(m => m.claimed)).toEqual(["21"]);
-   expect(r.journal.listResumeQueue()).toEqual([]);
+   expect(r.journal.listResumeQueue()).toEqual([entry]);
   });
  });
 

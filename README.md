@@ -58,8 +58,9 @@ queued entries. Closed nodes, released or already active rows, merged or closed
 PRs, and maps set to `walk: none` are removed with a reason. Moving a PR head
 keeps its entry valid. `ranger resume-node <id> --cancel` removes an entry and
 returns non-zero if none exists. Use `--map owner/name#root` to disambiguate.
-An entry whose node or PR cannot be validated is removed with the error as its
-reason; requeue it after correcting the error. Credential/execution-gated maps
+An entry whose node or PR cannot be validated stays queued and reports the
+error; later resumes and new claims in its implement lane wait for a retry.
+Credential/execution-gated maps
 retain entries and report the gate failure without reserving shared capacity.
 
 Parked infrastructure probe failures automatically requeue on the next `walk`

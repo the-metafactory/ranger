@@ -459,7 +459,12 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
       }
      } catch (error) {
       const reason = `validation failed: ${error instanceof Error ? error.message : String(error)}`;
-      drop(reason);
+      owned();
+      journal.recordEvent("sweep", { nodeId: entry.nodeId, repo: entry.repo, detail: `queued resume #${entry.nodeId} deferred: ${reason}` });
+      if (takesLane) {
+       waiting.add(entry.lane);
+       implementClaimed.add(implementLane(map));
+      }
       w.errors.push(`queued resume #${entry.nodeId}: ${reason}`);
       continue;
      }
