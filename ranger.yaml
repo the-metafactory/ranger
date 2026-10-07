@@ -205,7 +205,7 @@ maps:
   - repo: the-metafactory/soma
     root: 766
     walk: full
-    autoMerge: false
+    autoMerge: true
     localCheckout: ~/work/mf/soma
     commands:
       install: bun install --frozen-lockfile
