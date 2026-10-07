@@ -2,7 +2,9 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RangerAuthConfig, RangerConfig } from "./config.ts";
-import { runCmd, type RunOptions } from "./exec.ts";
+import { runCmd, type RunOptions, type RunResult } from "./exec.ts";
+import { parseForgeRef, qualifiedRepo, repoIdentity, type ForgeRef } from "./forge-ref.ts";
+import { glabConfigEnvAsync } from "./glab-config-dir.ts";
 
 /**
  * The read-only credential gate (node #8 ruling).
@@ -29,12 +31,13 @@ export interface ResolvedToken {
   source: string;
 }
 
-export interface TokenIntrospection {
+export type TokenIntrospection = {
+  forge: "github";
   /** Classic PAT scopes (`X-OAuth-Scopes`), empty for fine-grained / no-scope tokens. */
   scopes: string[];
   tokenType: "classic" | "fine-grained";
   login: string;
-}
+} | { forge: "gitlab"; scopes: string[]; tokenType: "gitlab_pat" };
 
 export class GateError extends Error {
   override readonly name = "GateError";
@@ -45,7 +48,7 @@ const READ_ONLY_SCOPE = /^read:/;
 
 /**
  * Resolve the read-only token for a repo from config + environment.
- * Prefixes match longest-first against `map.repo`.
+ * Qualified prefixes match forge and host; bare prefixes match GitHub only.
  */
 export function resolveReadOnlyToken(
   config: RangerConfig,
@@ -61,8 +64,8 @@ export function resolveReadOnlyToken(
   const token = env[tokenEnv];
   if (token === undefined || token.length === 0) {
     throw new GateError(
-      `read-only token env ${tokenEnv} is unset — refusing to fall back to the gh keyring (which is write-capable). ` +
-        `Set ${tokenEnv} to the ${repo} read-only fine-grained PAT.`,
+      `read-only token env ${tokenEnv} is unset — refusing to fall back to the ${parseForgeRef(repo).forge === "gitlab" ? "glab" : "gh"} keyring (which is write-capable). ` +
+        `Set ${tokenEnv} to the ${repo} read-only PAT.`,
     );
   }
   return { token, source: tokenEnv };
@@ -73,15 +76,19 @@ export function matchTokenEnv(
   auth: RangerAuthConfig,
   repo: string,
 ): string | undefined {
+  const ref = parseForgeRef(repo);
   const prefixes = Object.keys(auth.readOnlyTokens).sort(
     (a, b) => b.length - a.length,
   );
   for (const prefix of prefixes) {
-    if (prefix === "*" || repo.startsWith(prefix.replace(/\*$/, ""))) {
+    const qualified = prefix.includes(":");
+    if (!qualified && ref.forge !== "github") continue;
+    const target = qualified ? qualifiedRepo(ref) : ref.path;
+    if (prefix === "*" || target.startsWith(prefix.replace(/\*$/, ""))) {
       return auth.readOnlyTokens[prefix];
     }
   }
-  return auth.defaultTokenEnv;
+  return ref.forge === "github" ? auth.defaultTokenEnv : undefined;
 }
 
 /**
@@ -138,6 +145,7 @@ async function introspectToken(
     const { scopes } = parseGhHeaders(result.stdout);
     const login = extractLogin(result.stdout);
     return {
+      forge: "github",
       scopes,
       tokenType: scopes.length > 0 ? "classic" : "fine-grained",
       login,
@@ -149,14 +157,18 @@ async function introspectToken(
 
 /**
  * The full gate: resolve → introspect → abort-on-write-scopes → per-repo read.
+ * GitLab introspects PAT scopes and proves project access under per-call
+ * GLAB_CONFIG_DIR; its returned token object is authorized for that project.
  * Returns the resolved token plus introspection. Throws GateError.
  */
 export async function assertReadOnlyToken(
   config: RangerConfig,
   repo: string,
   env: NodeJS.ProcessEnv = process.env,
+  runner: typeof runCmd = runCmd,
 ): Promise<{ token: ResolvedToken; info: TokenIntrospection }> {
   const resolved = resolveReadOnlyToken(config, repo, env);
+  if (parseForgeRef(repo).forge === "gitlab") return assertGitLabReadOnlyToken(repo, resolved, env, runner);
   const info = await introspectToken(resolved.token);
 
   const writeScopes = info.scopes.filter(
@@ -190,6 +202,96 @@ async function assertRepoReadable(token: string, repo: string): Promise<void> {
   } finally {
     gated.cleanup();
   }
+}
+
+// Only the gate can authorize a GitLab token object. A copied/unvalidated token
+// or a token handed to another host/project cannot enter the read boundary.
+const gitlabReadGrants = new WeakMap<ResolvedToken, string>();
+const GITLAB_READ_SCOPES = new Set(["read_api", "read_repository"]);
+
+export function assertGitLabReadGrant(repo: string, token: ResolvedToken): void {
+  if (gitlabReadGrants.get(token) !== repoIdentity(parseForgeRef(repo))) {
+    throw new GateError(`${token.source}: GitLab read credential has not passed the scope and project gate for ${repo}`);
+  }
+}
+
+/** Internal bootstrap GET; never invoked without the private config env. */
+async function isolatedGitLabGet(
+  ref: ForgeRef,
+  token: ResolvedToken,
+  endpoint: string,
+  runner: typeof runCmd,
+  opts: RunOptions = {},
+): Promise<RunResult> {
+  if (ref.forge !== "gitlab" || !/^\/?[a-zA-Z0-9_]/.test(endpoint) || endpoint.includes(":") || endpoint.includes("#")) {
+    throw new GateError(`${token.source}: invalid GitLab read endpoint`);
+  }
+  const gated = await glabConfigEnvAsync(ref.host, token.token, opts.env);
+  try {
+    return await runner("glab", ["api", endpoint, "--hostname", ref.host, "--method", "GET", "--include"], {
+      ...opts, timeoutMs: opts.timeoutMs ?? 15_000, env: gated.env,
+    });
+  } finally {
+    await gated.cleanup();
+  }
+}
+
+/** glab --include prints the HTTP status, headers, then a JSON body. */
+export function parseGlabResponse(result: RunResult): { status: number; body: unknown } {
+  const match = /^HTTP\/\S+\s+(\d{3})[^\r\n]*\r?\n/.exec(result.stdout);
+  const status = match === null ? 0 : Number(match[1]);
+  const boundary = result.stdout.search(/\r?\n\r?\n/);
+  let body: unknown;
+  if (boundary >= 0) {
+    try { body = JSON.parse(result.stdout.slice(boundary).trim()); } catch { /* caller fails closed */ }
+  }
+  return { status, body };
+}
+
+function expectGlabOk(result: RunResult, message: string): unknown {
+  const { status, body } = parseGlabResponse(result);
+  if (result.code !== 0 || status !== 200) {
+    throw new GateError(`${message} (HTTP ${status || "unknown"}, exit ${result.code})`);
+  }
+  return body;
+}
+
+async function assertGitLabReadOnlyToken(
+  repo: string,
+  token: ResolvedToken,
+  env: NodeJS.ProcessEnv,
+  runner: typeof runCmd,
+): Promise<{ token: ResolvedToken; info: TokenIntrospection }> {
+  const ref = parseForgeRef(repo);
+  try {
+    const self = await isolatedGitLabGet(ref, token, "/personal_access_tokens/self", runner, { env });
+    const body = expectGlabOk(self, `${token.source}: GitLab PAT introspection refused`);
+    const scopes = body !== null && typeof body === "object" ? (body as Record<string, unknown>).scopes : undefined;
+    if (!Array.isArray(scopes) || scopes.some(scope => typeof scope !== "string" || !GITLAB_READ_SCOPES.has(scope))) {
+      throw new GateError(`${token.source}: GitLab PAT scopes must be present and limited to read_api/read_repository`);
+    }
+    const project = await isolatedGitLabGet(ref, token, `/projects/${encodeURIComponent(ref.path)}`, runner, { env });
+    expectGlabOk(project, `${token.source}: token cannot read ${repo}`);
+    Object.freeze(token);
+    gitlabReadGrants.set(token, repoIdentity(ref));
+    return { token, info: { forge: "gitlab", scopes, tokenType: "gitlab_pat" } };
+  } catch (error) {
+    if (error instanceof GateError) throw error;
+    // Do not echo subprocess output: errors may include credential material.
+    throw new GateError(`${token.source}: GitLab read gate failed before map reads`);
+  }
+}
+
+/** Ranger's own API reads use the same checked token and per-call confinement. */
+export async function gitlabApiRead(
+  repo: string,
+  token: ResolvedToken,
+  endpoint: string,
+  runner: typeof runCmd = runCmd,
+  opts: RunOptions = {},
+): Promise<RunResult> {
+  assertGitLabReadGrant(repo, token);
+  return isolatedGitLabGet(parseForgeRef(repo), token, endpoint, runner, opts);
 }
 
 /** Parse `gh api -i` output: the header block (up to the first blank line) → scope list + login. */

@@ -18,6 +18,7 @@ import { resumeArgv, mergeArgv } from "../src/serve-parked.ts";
 import { frontierCacheKey, cachedFrontier, readRepoSentinel } from "../src/frontier-cache.ts";
 import { Journal } from "../src/journal.ts";
 import { runCli } from "./support.ts";
+import { assertReadOnlyToken } from "../src/token-gate.ts";
 
 const gitlab = "gitlab:gitlab.software.geant.org/claw/crisis-simulator";
 
@@ -192,27 +193,27 @@ describe("ForgeRef config and identity seam", () => {
   } finally { journal.close(); }
  });
 
- test("CLI gates registered GitLab refs before credentials or any forge process", async () => {
+ test("CLI refuses GitLab reads without a mapped credential and keeps execution gated", async () => {
   const dir = mkdtempSync(join(tmpdir(), "ranger-forge-gates-"));
   const path = join(dir, "ranger.yaml");
   const calls = join(dir, "calls");
   writeFileSync(path, `maps:\n  - repo: ${gitlab}\n    root: 12\n    walk: full\nstate:\n  journalPath: ${join(dir, "state.sqlite")}\n`);
-  for (const bin of ["gh", "soma", "git"]) writeFileSync(join(dir, bin), `#!/bin/sh\nprintf unexpected >> "${calls}"\nexit 90\n`, { mode: 0o700 });
+  for (const bin of ["gh", "glab", "soma", "git"]) writeFileSync(join(dir, bin), `#!/bin/sh\nprintf unexpected >> "${calls}"\nexit 90\n`, { mode: 0o700 });
   try {
    for (const args of [["scout", "--json"], ["walk"], ["build-now", "13", "--map", `${gitlab}#12`],
     ["run-node", "13", "--map", `${gitlab}#12`], ["sweep"], ["escalate", "--json"], ["escalate", "--digest", "--json"]]) {
     const result = await runCli([...args, "--config", path], { ...process.env, PATH: `${dir}:${process.env.PATH}` });
-    expect(result.stdout + result.stderr).toContain("not implemented");
+    expect(result.stdout + result.stderr).toContain(["scout", "escalate"].includes(args[0]) ? "no read-only token mapping" : "not implemented");
    }
    expect(() => readFileSync(calls)).toThrow();
   } finally { rmSync(dir, { recursive: true, force: true }); }
  });
 
- test("serve-only GitLab reads report unsupported without requesting credentials", async () => {
+ test("serve-only GitLab graph reads require credentials; unsupported PR reads stay inert", async () => {
   const config = configWith(gitlab, "serve");
   const maps = servedMaps(config).filter(map => map.repo === gitlab);
   expect(maps).toHaveLength(1);
-  expect(() => assertReadOnlyTokens(config, maps, {})).not.toThrow();
+  expect(() => assertReadOnlyTokens(config, maps, {})).toThrow("no read-only token mapping");
   let calls = 0;
   const tokens = async (): Promise<never> => { calls++; throw new Error("unexpected credentials"); };
   expect(await readPrLive(config, gitlab, 12, tokens)).toBeNull();
@@ -220,7 +221,7 @@ describe("ForgeRef config and identity seam", () => {
   reader.refresh();
   // Await this refresh before the headless test returns.
   while (reader.refreshing) await Bun.sleep(1);
-  expect(reader.extra.get(maps[0].key)?.error).toContain("GitLab read gate is not implemented");
+  expect(reader.extra.get(maps[0].key)?.error).toContain("no read-only token mapping");
   expect(calls).toBe(0);
  });
 
@@ -269,7 +270,8 @@ describe("ForgeRef config and identity seam", () => {
   const oldPath = process.env.PATH;
   process.env.PATH = `${dir}:${oldPath ?? ""}`;
   try {
-   const token = { token: "fixture-read-only", source: "fixture" };
+   const { token } = await assertReadOnlyToken({ auth: { readOnlyTokens: { "gitlab:gitlab.software.geant.org/claw/": "fixture" } } } as unknown as import("../src/config.ts").RangerConfig,
+    gitlab, { fixture: "fixture-read-only" }, async () => ({ code: 0, stdout: 'HTTP/2.0 200 OK\n\n{"scopes":["read_api"]}', stderr: "" }));
    const frontier = await graphFrontier(gitlab, 1, token);
    expect(frontier.root).toBe("1");
    expect(frontier.frontier[0].ref.id).toBe("12");
@@ -328,5 +330,5 @@ describe("ForgeRef config and identity seam", () => {
    if (oldPath === undefined) delete process.env.PATH; else process.env.PATH = oldPath;
    rmSync(dir, { recursive: true, force: true });
   }
- });
+ }, 30_000);
 });

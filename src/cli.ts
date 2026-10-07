@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 import { readPrivateJson } from "./remote-test/ssh-cli.ts";
 import { implementLane, startsImplementSession } from "./lanes.ts";
-import { executionRefusal, isGithubRepo, readRefusal } from "./forge-ref.ts";
+import { executionRefusal, isGithubRepo } from "./forge-ref.ts";
 import { laneHeldMessage, recordImplementStart, mapKey, pickMap, resumeMap } from "./maps.ts";
 import { Command } from "commander";
 import { join, resolve } from "node:path";
@@ -103,8 +103,6 @@ async function scoutOneMap(
  };
 
  let token: ResolvedToken;
- const refusal = readRefusal(map.repo);
- if (refusal !== null) return { ...base, ok: false, error: refusal };
  try {
   ({ token } = await assertReadOnlyToken(config, map.repo));
  } catch (error) {
@@ -172,6 +170,7 @@ async function runScout(opts: ScoutOptions): Promise<ScoutReport> {
   if (!isGithubRepo(map.repo)) continue;
   try {
    const { info } = await assertReadOnlyToken(config, map.repo);
+   if (info.forge !== "github") continue;
    identity = { login: info.login, tokenType: info.tokenType };
    break;
   } catch {

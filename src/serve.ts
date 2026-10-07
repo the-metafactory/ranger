@@ -1,4 +1,4 @@
-import { decodeForgeKey, isGithubRepo, readRefusal, nodeKey } from "./forge-ref.ts";
+import { decodeForgeKey, isGithubRepo, nodeKey } from "./forge-ref.ts";
 import { lastImplementMaps, mapKey, implementMapOrder } from "./maps.ts";
 /**
  * `ranger serve` (#37) — a local dashboard of the walk: the job a worker is on
@@ -64,7 +64,7 @@ import { type FrontierEntry, graphFrontier, RateLimitError } from "./graph.ts";
 import { runCmd } from "./exec.ts";
 import { classify, classifyFrontier, type ClassifiedNode, loadProbeRegistry } from "./route.ts";
 import { liveSession, substrateUsageViews, type SubstrateUsageView } from "./substrate-usage.ts";
-import { resolveReadOnlyToken, assertReadOnlyToken, gatedEnv, tokenBatch, type TokenBatch } from "./token-gate.ts";
+import { resolveReadOnlyToken, assertReadOnlyToken, gatedEnv, tokenBatch, type TokenBatch, type ResolvedToken } from "./token-gate.ts";
 import { childEnv, itermArgv, shellQuote } from "./launch.ts";
 import {
  type ActionKind,
@@ -1364,12 +1364,13 @@ export class ServeReader {
      error,
     });
    };
-   const refusal = readRefusal(map.repo);
-   if (refusal !== null) {
-    keep(refusal);
+   let token: ResolvedToken;
+   try { token = await tokens(map.repo); }
+   catch (error) {
+    if (isGithubRepo(map.repo)) throw error;
+    keep(error instanceof Error ? error.message : String(error));
     continue;
    }
-   const token = await tokens(map.repo);
    const journal = Journal.openReadOnly(this.journalPath);
    const cooling = journal === null ? null : activeCooldown(journal, token.source, now);
    journal?.close();
@@ -1377,7 +1378,7 @@ export class ServeReader {
     keep(`deferred: ${token.source} cooling down until ${cooling.until.toISOString()} (${cooling.reason})`);
     continue;
    }
-   const budget = await readGraphqlBudget(token.token);
+   const budget = isGithubRepo(map.repo) ? await readGraphqlBudget(token.token) : null;
    if (budget !== null && budget.remaining < this.config.budget.graphqlFloor) {
     keep(`deferred: GraphQL allowance ${budget.remaining}/${budget.limit} under the floor of ${this.config.budget.graphqlFloor}`);
     continue;
@@ -1760,7 +1761,6 @@ export function assertReadOnlyTokens(
  const unset = new Map<string, string[]>(); // token env -> the repos that need it
  const other: string[] = [];
  for (const repo of [...new Set(maps.map((m) => m.repo))]) {
-  if (readRefusal(repo) !== null) continue;
   try {
    resolveReadOnlyToken(config, repo, env);
   } catch (error) {

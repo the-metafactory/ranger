@@ -1,5 +1,7 @@
 import { runReadRetryingTransient } from "./transient.ts";
-import { gatedEnv, type ResolvedToken } from "./token-gate.ts";
+import { gatedEnv, assertGitLabReadGrant, type ResolvedToken } from "./token-gate.ts";
+import { glabConfigEnvAsync } from "./glab-config-dir.ts";
+import { runCmd } from "./exec.ts";
 import { parseForgeRef, qualifiedRepo, normalizeNodeId, type ForgeRef } from "./forge-ref.ts";
 
 /**
@@ -108,6 +110,8 @@ function isReadonlyVerb(verb: string): verb is ReadonlyVerb {
 export interface GraphCallOptions {
   cwd?: string;
   timeoutMs?: number;
+  /** Stubbed subprocess seam; GitLab still creates and cleans the real config. */
+  runner?: typeof runCmd;
 }
 
 /** Hard timeout for every graph CLI call (round-29): a hung `soma` subprocess
@@ -118,6 +122,18 @@ export interface GraphCallOptions {
  */
 export const GRAPH_CALL_TIMEOUT_MS = 60_000;
 
+async function graphReadBackend(ref: ForgeRef, token: ResolvedToken) {
+  if (ref.forge === "gitlab") {
+    assertGitLabReadGrant(qualifiedRepo(ref), token);
+    return {
+      ...await glabConfigEnvAsync(ref.host, token.token),
+      runner: runCmd,
+      timeoutMs: GRAPH_CALL_TIMEOUT_MS,
+    };
+  }
+  return { ...gatedEnv(token.token), runner: runReadRetryingTransient, timeoutMs: undefined };
+}
+
 interface CallGraphArgs {
   verb: ReadonlyVerb;
   root: string;
@@ -127,11 +143,11 @@ interface CallGraphArgs {
 }
 
 /**
- * Run one read-only soma graph verb. `GH_TOKEN` is always pinned to the
- * resolved read-only token via the gated env, and the verb is refused unless
+ * Run one read-only soma graph verb under the forge's isolated credential.
+ * GitLab also requires a checked project grant. The verb is refused unless
  * it is on the fixed read-only surface.
  */
-async function callGraph(
+export async function callGraph(
   args: CallGraphArgs,
 ): Promise<{ code: number; stdout: string; stderr: string }> {
   const { verb, root, repo, token, opts = {} } = args;
@@ -140,23 +156,25 @@ async function callGraph(
       `refusing non-read-only verb '${verb}' — scout only calls ${READONLY_VERBS.join("/")}`,
     );
   }
-  const gated = gatedEnv(token.token);
+  const ref = parseForgeRef(repo);
+  const backend = await graphReadBackend(ref, token);
   try {
     const cliArgs = [
       "graph",
       verb,
-      graphNodeId(parseForgeRef(repo), String(root)),
+      graphNodeId(ref, String(root)),
       "--repo",
-      somaRepo(repo),
+      somaRepo(ref),
       "--json",
     ];
-    return await runReadRetryingTransient("soma", cliArgs, {
+    const runner = opts.runner ?? backend.runner;
+    return await runner("soma", cliArgs, {
       cwd: opts.cwd,
-      timeoutMs: opts.timeoutMs,
-      env: gated.env,
+      timeoutMs: opts.timeoutMs ?? backend.timeoutMs,
+      env: backend.env,
     });
   } finally {
-    gated.cleanup();
+    await backend.cleanup();
   }
 }
 

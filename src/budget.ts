@@ -2,7 +2,8 @@ import type { RangerConfig } from "./config.ts";
 import { runCmd } from "./exec.ts";
 import { RateLimitError } from "./graph.ts";
 import type { Journal } from "./journal.ts";
-import { gatedEnv, type ResolvedToken } from "./token-gate.ts";
+import { gatedEnv, assertGitLabReadGrant, type ResolvedToken } from "./token-gate.ts";
+import { parseForgeRef } from "./forge-ref.ts";
 
 /**
  * The GitHub budget gate in front of every GraphQL-costing graph read.
@@ -189,26 +190,36 @@ export async function assertGraphBudget(
 }
 
 /**
- * Run one GraphQL-costing read under the gate. A RateLimitError from the read
+ * Run one forge read under the gate. GitHub checks its GraphQL allowance;
+ * GitLab checks its read grant and throttle cooldown without a GitHub call.
+ * A RateLimitError from the read
  * sets a `throttled` cooldown that doubles per consecutive throttle, and
  * becomes a BudgetDeferral, so callers handle every kind of "not now" the
  * same way. A successful read clears the strikes.
  */
 export async function budgetedRead<T>(
   journal: Journal,
+  repo: string,
   token: ResolvedToken,
   policy: BudgetPolicy,
   now: Date,
   read: () => Promise<T>,
 ): Promise<T> {
-  const budget = await assertGraphBudget(journal, token, policy, now);
+  const ref = parseForgeRef(repo);
+  let budget: GraphqlBudget | null = null;
+  if (ref.forge === "gitlab") {
+    assertGitLabReadGrant(repo, token);
+    assertNotThrottled(journal, token, now);
+  } else {
+    budget = await assertGraphBudget(journal, token, policy, now);
+  }
   let value: T;
   try {
     value = await read();
   } catch (error) {
     if (!(error instanceof RateLimitError)) throw error;
-    // The gate just read the allowance above the floor, so a refusal now is
-    // a secondary limit — unless that read showed the allowance spent.
+    // GitHub's allowance distinguishes a spent window from a secondary
+    // limit. GitLab has no allowance probe and uses the throttle backoff.
     const spent = budget !== null && budget.remaining === 0;
     const strikes = (readCooldownRecord(journal, token.source)?.strikes ?? 0) + 1;
     const backoff = Math.min(
@@ -217,10 +228,10 @@ export async function budgetedRead<T>(
     );
     const throttled: Cooldown = {
       kind: "throttled",
-      until: spent ? budget.resetAt : new Date(now.getTime() + backoff),
+      until: spent && budget !== null ? budget.resetAt : new Date(now.getTime() + backoff),
       reason: spent
         ? "GraphQL allowance spent"
-        : `GitHub secondary rate limit, throttle ${strikes} in a row`,
+        : `${ref.forge === "github" ? "GitHub secondary" : "GitLab"} rate limit, throttle ${strikes} in a row`,
       strikes,
     };
     writeCooldown(journal, token.source, throttled);
