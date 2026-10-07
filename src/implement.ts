@@ -57,6 +57,8 @@ import { workerEnv } from "./worker-env.ts";
 import { tryWorkerLog, workerLogFile } from "./worker-log.ts";
 import { captureViews, redactViewsReason, saveViewsRecord, viewsComment, viewsDirectory, type ViewsDependencies, type ViewsRecord } from "./views.ts";
 import { NEEDS_EYE_LABEL } from "./labels.ts";
+import { createShadowTestBackend, readShadowCpu } from "./remote-test/shadow.ts";
+import { shellQuote } from "./remote-test/baseline.ts";
 import { assertTestEvidence, assertTestSource, createSshTestBackend, localTestBackend, runTestBackend, testCorrelationId, type TestBackend, type TestRequest, type TestResult } from "./remote-test/supervisor-backend.ts";
 
 /**
@@ -163,8 +165,9 @@ const remotePasses = new WeakMap<ImplementContext, TestResult & { request: TestR
 function testBackendFor(ctx: ImplementContext): TestBackend {
  let backend = backends.get(ctx);
  if (!backend) {
-  backend = ctx.testBackend ?? (ctx.map.testBackend ? createSshTestBackend(ctx.map.testBackend) : localTestBackend);
-  if (ctx.map.testBackend && backend.kind !== "ssh") throw new GitSafetyError("SSH map cannot use a local test backend");
+  backend = ctx.testBackend ?? (ctx.map.testBackend?.kind === "shadow" ? createShadowTestBackend(ctx.map.testBackend) : ctx.map.testBackend ? createSshTestBackend(ctx.map.testBackend) : localTestBackend);
+  if (ctx.map.testBackend?.kind === "ssh" && backend.kind !== "ssh") throw new GitSafetyError("SSH map cannot use a local test backend");
+  if (ctx.map.testBackend?.kind === "shadow" && backend.kind !== "local") throw new GitSafetyError("Shadow map requires a local-authoritative backend");
   backends.set(ctx, backend);
  }
  return backend;
@@ -175,11 +178,16 @@ function testRequest(ctx: ImplementContext, sha: string): TestRequest {
 }
 async function backendTests(ctx: ImplementContext, sha: string, local: () => Promise<RunResult>): Promise<RunResult> {
  const backend = testBackendFor(ctx), request = testRequest(ctx, sha);
- const snapshot = backend.kind === "ssh" ? await trustedSnapshot(ctx.journal, ctx.canonical, { repo: ctx.map.repo, nodeId: ctx.node.ref.id }, mapKey(ctx.map)) : undefined;
+ const snapshot = ctx.map.testBackend || backend.kind === "ssh" ? await trustedSnapshot(ctx.journal, ctx.canonical, { repo: ctx.map.repo, nodeId: ctx.node.ref.id }, mapKey(ctx.map)) : undefined;
  ctx.journal.assertGeneration(ctx.node.ref.id, ctx.map.repo, ctx.generation, "run supervisor tests");
  const tested = await runTestBackend(backend, request, local);
  if (snapshot !== undefined) await assertGitUntouched(ctx.canonical, snapshot);
  ctx.journal.assertGeneration(ctx.node.ref.id, ctx.map.repo, ctx.generation, "accept supervisor tests");
+ if (ctx.map.testBackend?.kind === "shadow") {
+  logRun(ctx, "shadow comparison (local gate authoritative)", tested.result);
+  const s = tested.shadow;
+  ctx.journal.recordEvent("reviewed", { nodeId: ctx.node.ref.id, repo: ctx.map.repo, detail: `shadow supervisor tests: local ${tested.result.code}; remote ${s?.state ?? "unavailable"}; outcome ${s?.parity ?? "pending"}; coverage ${s?.coverageParity ?? "pending"}; report ${s?.reportStored ? "saved" : "unavailable"}` });
+ }
  if (backend.kind === "ssh") {
   remotePasses.delete(ctx);
   if (tested.evidence) ctx.journal.recordEvent("reviewed", { nodeId: ctx.node.ref.id, repo: ctx.map.repo, detail: `remote supervisor tests: ${tested.evidence.receipt.status}; receipt ${tested.evidence.path}` });
@@ -1426,14 +1434,16 @@ async function runShell(
  opts: { label: string; timeoutMs: number; priority?: "background" | "probe" },
 ): Promise<RunResult> {
  const run: ShellRun = ctx.shellRun ?? ((cmd, o) => runCmd("/bin/sh", ["-c", cmd], o));
- const result = await run(command, {
+ const timed = ctx.map.testBackend?.kind === "shadow" && (opts.label.includes("supervisor tests") || opts.label.includes("tests in a fresh checkout"));
+ const raw = await run(timed ? `/usr/bin/time -p /bin/sh -c ${shellQuote(command)}` : command, {
   cwd,
-  env: workerEnv(ctx.config, ctx.map.repo, ctx.sessionJournal),
+  env: { ...workerEnv(ctx.config, ctx.map.repo, ctx.sessionJournal), ...(timed ? { LC_ALL: "C" } : {}) },
   timeoutMs: opts.timeoutMs,
   processGroup: true,
   // Install and tests yield the CPU; the timing-sensitive probes do not.
   ...(opts.priority === "probe" ? {} : { nice: ctx.config.workers.niceness }),
  });
+ const result = timed ? readShadowCpu(raw) : raw;
  logRun(ctx, `${opts.label} (${command})`, result);
  return result;
 }
@@ -1688,7 +1698,8 @@ async function retryOnBusyHost(
   detail: `${what} failed on a busy host (load ${host.load.toFixed(1)} on ${host.cores} cores) — retrying once, in a fresh checkout of ${sha.slice(0, 8)}, when it quiets`,
  });
  await awaitQuietHost(ctx, run);
- return testsInFreshCheckout(ctx, testCommand, sha, label);
+ const local = () => testsInFreshCheckout(ctx, testCommand, sha, label);
+ return ctx.map.testBackend?.kind === "shadow" ? backendTests(ctx, sha, local) : local();
 }
 
 /**

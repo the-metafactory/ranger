@@ -1,3 +1,4 @@
+import { createShadowTestBackend, type ShadowComparison } from "../src/remote-test/shadow.ts";
 import { githubCiVerdict } from "../src/github-ci.ts";
 import type { CiPurpose, MergeState } from "../src/forge.ts";
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
@@ -345,6 +346,44 @@ describe("remote supervisor backend integration", () => {
   for (const key of Object.keys(process.env)) if (!(key in savedEnv)) delete process.env[key];
   Object.assign(process.env, savedEnv);
  });
+ test("busy-host local retry records the final shadow parity without promoting remote authority", async () => {
+  const r = await rig({}); cleanup.push(r.dir);
+  const requests = remoteBackend(r), remote = r.ctx.testBackend!, reports: ShadowComparison[] = [];
+  const selection = { kind: "shadow" as const, configFile: join(r.dir,"private-ssh.json"), stateRoot: r.dir, reportRoot: r.dir, profileId: "fixture", lockFile: "bun.lock", deadlineSeconds: 660 };
+  r.ctx.map.testBackend = selection;
+  r.ctx.testBackend = createShadowTestBackend(selection, { remote, write: async report => { reports.push(report); } });
+  r.ctx.hostLoad = () => ({ load: 20, cores: 1 }); r.ctx.quietHost = { pollMs: 1, maxMs: 1 };
+  let localCalls = 0;
+  r.ctx.shellRun = async () => ({ code: ++localCalls === 1 ? 1 : 0, stdout: "", stderr: "real 1.0\nuser 0.5\nsys 0.1\n" });
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  expect(localCalls).toBe(2); expect(requests).toHaveLength(2);
+  expect(reports.map(r=>r.parity)).toEqual(["different","same"]);
+ }, 60_000);
+ test("shadow map refuses an injected SSH-authoritative backend", async () => {
+  const r = await rig({}); cleanup.push(r.dir);
+  remoteBackend(r);
+  r.ctx.map.testBackend = { kind: "shadow", configFile: join(r.dir,"private-ssh.json"), stateRoot: r.dir, reportRoot: r.dir, profileId: "fixture", lockFile: "bun.lock", deadlineSeconds: 660 };
+  expect((await runNode("20", r.ctx)).status).not.toBe("awaiting-merge");
+  expect(r.github.prs.size).toBe(0);
+ }, 60_000);
+ for (const localFails of [false, true]) {
+  test(`shadow keeps local ${localFails ? "failure" : "success"} authoritative through the real supervisor`, async () => {
+   const r = await rig({ test: localFails ? "exit 7" : "test -f src/feature.ts" }); cleanup.push(r.dir);
+   const requests = remoteBackend(r, { status: localFails ? "passed" : "test_failed" });
+   const remote = r.ctx.testBackend!, reports: ShadowComparison[] = [];
+   const selection = { kind: "shadow" as const, configFile: join(r.dir,"private-ssh.json"), stateRoot: r.dir, reportRoot: r.dir, profileId: "fixture", lockFile: "bun.lock", deadlineSeconds: 660 };
+   r.ctx.map.testBackend = selection;
+   r.ctx.testBackend = createShadowTestBackend(selection, { remote, write: async report => { reports.push(report); } });
+   const outcome = await runNode("20", r.ctx);
+   expect(outcome.status).toBe(localFails ? "failed" : "awaiting-merge");
+   expect(r.github.prs.size).toBe(localFails ? 0 : 1);
+   expect(requests).toHaveLength(1); expect(reports).toHaveLength(1);
+   expect(reports[0]!.parity).toBe("different");
+   expect(reports[0]!.local.laptopCpuSeconds).toBeGreaterThanOrEqual(0);
+   expect(r.journal.listEvents("acme/widgets",200).some(e=>e.detail?.includes("remote matched; outcome different; coverage pending; report saved"))).toBe(true);
+   expect(r.journal.listEvents("acme/widgets",200).some(e=>e.detail?.startsWith("remote supervisor tests: passed"))).toBe(false);
+  }, 60_000);
+ }
  test("opt-in skips local install/test calls and pushes only the validated committed HEAD", async () => {
   const r = await rig({ install: "exit 91", test: "exit 92" }); cleanup.push(r.dir);
   r.ctx.map.testBackend = { kind: "ssh", configFile: join(r.dir, "private-ssh.json"), stateRoot: join(r.dir, "private-state"), profileId: "fixture", lockFile: "bun.lock", deadlineSeconds: 660 };
