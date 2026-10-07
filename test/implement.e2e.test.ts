@@ -1006,6 +1006,24 @@ describe("implement lane (node #23)", () => {
   expect(worktrees.stdout).not.toContain("ranger-probe-base-");
  }, 60_000);
 
+ test("cached base-red assertions certify a later PR with journal and PR cache provenance", async () => {
+  const r = await rig({ probe: "fake-probe red {node}", probeRetry: "fake-probe red {node} {failed}" });
+  cleanup.push(r.dir);
+  await seedProbeOnBase(r);
+  const sha = await r.github.sha("main");
+  r.journal.setHealth(`base-red-checks.acme/widgets.${sha}.probe-hud.mjs`, JSON.stringify(["the hud draws"]));
+  const calls = watchBaseRuns(r);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  expect(calls.filter((c) => c.cwd.includes("ranger-probe-base-"))).toEqual([]);
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.includes(`base result from cache at ${sha}: probe-hud.mjs`))).toBe(true);
+  expect(events.some((d) => d.includes("the merge-base probe run"))).toBe(false);
+  const record = (r.github.comments.get(1) ?? []).find((c) => c.body.includes("ranger:probes"))?.body ?? "";
+  expect(record).toContain(`base-red-cache-sha=${sha} base-red-cache=probe-hud.mjs`);
+  expect(record).toContain(`Base result from cache at ${sha}: probe-hud.mjs.`);
+  expect(r.github.prs.get(1)?.body).toContain(`Base result from cache at ${sha}`);
+ }, 60_000);
+
  test("a probe red only on the branch still parks, and the park says the base passes it", async () => {
   const r = await rig({ probe: "fake-probe branch-red {node}", probeRetry: "fake-probe branch-red {node} {failed}" });
   cleanup.push(r.dir);
@@ -1094,7 +1112,7 @@ describe("implement lane (node #23)", () => {
   expect(outcome.detail).toContain("red on the merge base too: probe-hud.mjs");
   expect(r.announced).toEqual([]);
   const base = calls.filter((c) => c.cwd.includes("ranger-probe-base-")).map((c) => c.command);
-  expect(base).toEqual(["fake-probe mixed 20 probe-hud.mjs"]);
+  expect(base).toEqual(["fake-probe mixed 20 probe-hud.mjs", "fake-probe mixed 20 probe-hud.mjs"]);
   const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
   expect(events.some((d) => d.includes("probe-hud.mjs fail at the merge base") && d.includes("probe-weapon.mjs ended in a crash, kill, timeout or an unreadable kind at the head"))).toBe(true);
  }, 60_000);
