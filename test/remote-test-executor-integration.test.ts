@@ -24,7 +24,7 @@ test.skipIf(!image)("disposable rootless container completes bootstrap, reports 
    const profile = { version: 1 as const, profileId: "integration-v1", profileDigest: sha(`fixture-${code}`), lockDigest: sha("fixture\n"), imageDigest: image.split("@")[1]!, platform: "linux-arm64" as const, commands: [["bun", "-e", `process.exit(${code})`]] as [string, ...string[]][] };
    const job = { ...source.manifest, jobId, correlationId: jobId, repositoryId: "github:github.com/the-metafactory/ranger", profileId: profile.profileId, profileDigest: profile.profileDigest, lockDigest: profile.lockDigest, imageDigest: profile.imageDigest, platform: profile.platform, deadline: Date.now() + 60_000, generation: 1 };
    const receipt = await executeRemoteTest({ job, bundlePath: source.bundlePath, config: { executorId: "integration-fixture", jobsRoot, profiles: [{ profile, lockFile: "bun.lock", imageReference: image }] } });
-   expect(receipt.status).toBe(code ? "test_failed" : "passed"); expect(receipt.exitCode).toBe(code); expect(await readdir(jobsRoot)).toEqual([]);
+   expect(receipt.status).toBe(code ? "test_failed" : "passed"); expect(receipt.exitCode).toBe(code); expect(await readdir(jobsRoot)).toEqual([".artifacts"]);
   }
  } finally {
   // A retained lane means cleanup failed: keep private evidence for inspection.

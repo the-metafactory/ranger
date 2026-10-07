@@ -25,6 +25,7 @@ async function fixture() {
  const config = { executorId: "fixture", jobsRoot, profiles: [{ profile, lockFile: "bun.lock", imageReference: `localhost/runtime@${profile.imageDigest}` }] };
  const calls: string[][] = [];
  let exitCode = 0, oom = false, block = false, controllers = ["cpu", "memory", "pids"], cleanupFail = false, started = false, extraMount = false, missingImage = false, malformed = false;
+ let output = "";
  const launcher: ExecutorLauncher = async (args, options) => {
   calls.push([...args]); const command = args[1];
   if (command === "info") return { code: 0, stdout: JSON.stringify({ host: { os: "linux", arch: "arm64", cgroupVersion: "v2", cgroupControllers: controllers, security: { rootless: true } } }) };
@@ -32,8 +33,9 @@ async function fixture() {
   if (command === "create") { const index = args.indexOf("--cidfile"); await writeFile(args[index + 1]!, "a".repeat(64)); return { code: 0, stdout: "a".repeat(64) }; }
   if (command === "start") {
    started = true;
+   options.onLog?.(Buffer.from(output));
    if (block) await new Promise<void>((_, reject) => { options.signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true }); });
-   return { code: exitCode, stdout: malformed ? "" : JSON.stringify({ status: exitCode ? "test_failed" : "passed", exitCode }) + "\n" };
+   return { code: exitCode, logsAvailable: true, stdout: malformed ? "" : JSON.stringify({ status: exitCode ? "test_failed" : "passed", exitCode, resources: { state: "observed", cpuTimeMicros: 123, peakMemoryBytes: 456 } }) + "\n" };
   }
   if (command === "inspect") return { code: 0, stdout: JSON.stringify([{ Mounts: [{ Type: "bind", Source: join(jobsRoot, id, "checkout"), Destination: "/work" }, ...(extraMount ? [{ Type: "bind", Source: "/private/credentials", Destination: "/secret" }] : [])], State: { Status: started ? "exited" : "created", ExitCode: exitCode, OOMKilled: oom } }]) };
   if (command === "rm" && cleanupFail) return { code: 1, stdout: "" };
@@ -44,9 +46,27 @@ async function fixture() {
   block: () => { block = true; }, controllers: (c: string[]) => { controllers = c; }, cleanupFail: () => { cleanupFail = true; },
   extraMount: () => { extraMount = true; },
   missingImage: () => { missingImage = true; }, malformed: () => { malformed = true; },
+  log: (text: string) => { output = text; },
   execute: (options = {}) => executeRemoteTest({ job, bundlePath: source.bundlePath, config }, { launcher, uid: 1000, gid: 1000, ...options }),
  };
 }
+test("executor stores attributed observations and bounded logs before returning passed", async () => {
+ const f = await fixture(); f.log("test output is private");
+ Object.assign(f.config, { artifacts: { maxLogBytes: 4 } });
+ const r = await f.execute();
+ expect(r.evidence!.resources).toEqual({ state: "observed", cpuTimeMicros: 123, peakMemoryBytes: 456 });
+ expect(JSON.parse(await readFile(join(f.config.jobsRoot, ".artifacts", id, "receipt.json"), "utf8"))).toEqual(r);
+ expect(await readFile(join(f.config.jobsRoot, ".artifacts", id, "test.log"), "utf8")).toBe("test");
+ expect(r.evidence!.output.truncated).toBe(true);
+ const calls = f.calls.length; await expect(f.execute()).rejects.toThrow("already exists"); expect(f.calls.length).toBe(calls);
+});
+test("executor storage failure and invalid clock cannot expose passed", async () => {
+ const f = await fixture();
+ await expect(f.execute({ artifactFault: () => { throw Error("storage failure"); } })).rejects.toThrow();
+ expect(await stat(join(f.config.jobsRoot, ".artifacts", id)).catch(() => null)).toBeNull();
+ const g = await fixture(); let clock = Date.now();
+ await expect(g.execute({ now: () => clock-- })).rejects.toThrow();
+});
 test("runs only selected operator argv at the exact bundle identity with a bounded isolated launch", async () => {
  const f = await fixture(); const result = await f.execute(); expect(result.status).toBe("passed"); expect(result.exitCode).toBe(0); expect(result.identity.commitDigest).toBe(f.source.manifest.commitDigest);
  const args = f.calls.find(c => c[1] === "create")!;
@@ -62,7 +82,7 @@ test("distinguishes nonzero test exits including 125 from OOM", async () => {
 });
 test("refuses expired jobs and unsupported controllers before creating containers", async () => {
  const f = await fixture(); f.job.deadline = Date.now() - 1; expect((await f.execute()).status).toBe("rejected"); expect(f.calls).toHaveLength(0);
- f.job.deadline = Date.now() + 60_000; f.controllers(["cpu", "memory"]); expect((await f.execute()).status).toBe("rejected"); expect(f.calls.some(c => c[1] === "create")).toBe(false);
+ const g = await fixture(); g.controllers(["cpu", "memory"]); expect((await g.execute()).status).toBe("rejected"); expect(g.calls.some(c => c[1] === "create")).toBe(false);
 });
 test("rejects profile and bundle identity mismatches without executing source", async () => {
  const f = await fixture(); f.job.profileDigest = sha("unreviewed"); await expect(f.execute()).rejects.toThrow(); expect(f.calls).toHaveLength(0);
@@ -107,21 +127,26 @@ test("CLI writes a private rejected receipt and refuses an existing output befor
 test("Bun bootstrap checks controller files before executing profiles and detects child OOM", async () => {
  const root = await mkdtemp(join(tmpdir(), "ranger-bootstrap-")); roots.push(root);
  const marker = join(root, "executed"), cgroup = join(root, "cgroup"); await mkdir(cgroup);
- const valid: Record<string, string> = { "cpu.max": "200000 100000", "memory.max": "1610612736", "memory.swap.max": "0", "pids.max": "256", "memory.events": "oom_kill 0" };
+ const valid: Record<string, string> = { "cpu.max": "200000 100000", "memory.max": "1610612736", "memory.swap.max": "0", "pids.max": "256", "memory.events": "oom_kill 0", "cpu.stat": "usage_usec 100", "memory.peak": "4096" };
  const commands: [string, ...string[]][] = [[process.execPath, "-e", `await Bun.write(${JSON.stringify(marker)}, "ran")`]];
  const run = async (fields: Record<string, string>, argv = commands) => {
   await rm(marker, { force: true }); for (const [name, content] of Object.entries({ ...valid, ...fields })) await writeFile(join(cgroup, name), content);
   // Only controller location and cwd differ from the real container program.
-  const program = containerProgram(argv).replace('"/sys/fs/cgroup/"', JSON.stringify(cgroup + "/")).replace('cwd:"/work"', `cwd:${JSON.stringify(root)}`);
-  const result = await runCmd(process.execPath, [...CONTAINER_BOOTSTRAP_FLAGS, "-e", program]); return JSON.parse(result.stdout);
+  const program = containerProgram(argv).replace('"/sys/fs/cgroup/"', JSON.stringify(cgroup + "/")).replaceAll('"/sys/fs/cgroup/', JSON.stringify(cgroup).slice(0, -1) + "/").replace('cwd:"/work"', `cwd:${JSON.stringify(root)}`);
+  const result = await runCmd(process.execPath, [...CONTAINER_BOOTSTRAP_FLAGS, "-e", program]);
+  const terminal = JSON.parse(result.stdout);
+  if (argv[0]?.[2]?.includes("stdout-canary")) { expect(result.stderr).toContain("stdout-canary"); expect(result.stderr).toContain("stderr-canary"); }
+  return terminal;
  };
- expect(await run({})).toEqual({ status: "passed", exitCode: 0 }); expect(await readFile(marker, "utf8")).toBe("ran");
+ expect(await run({})).toMatchObject({ status: "passed", exitCode: 0 }); expect(await readFile(marker, "utf8")).toBe("ran");
  const invalidControls: Record<string, string>[] = [{ "cpu.max": "max 100000" }, { "memory.max": "max" }, { "memory.swap.max": "1024" }, { "pids.max": "max" }];
  for (const invalid of invalidControls) {
   expect((await run(invalid)).status).toBe("infra_failed"); expect(await readFile(marker, "utf8").catch(() => null)).toBeNull();
  }
  expect((await run({ "memory.events": "oom_kill 1" })).status).toBe("infra_failed");
  expect((await run({}, [...commands, ["/missing-runtime"]])).status).toBe("infra_failed");
+ const logged = await run({}, [[process.execPath, "-e", 'console.log("stdout-canary"); console.error("stderr-canary")']]);
+ expect(logged.resources).toEqual({ state: "observed", cpuTimeMicros: 100, peakMemoryBytes: 4096 });
 });
 test("neutral bootstrap does not load job Bun preloads or .env before controller checks", async () => {
  const root = await mkdtemp(join(tmpdir(), "ranger-bun-config-")); roots.push(root);
@@ -152,7 +177,8 @@ test("deadline rounding never disables the independent conmon timeout", async ()
 });
 test("does not overwrite an occupied lane or falsely pass failed teardown", async () => {
  const f = await fixture(); await mkdir(join(f.config.jobsRoot, ".executor-lane")); expect((await f.execute()).status).toBe("rejected"); expect(f.calls).toHaveLength(0);
- await rm(join(f.config.jobsRoot, ".executor-lane"), { recursive: true }); f.cleanupFail(); expect((await f.execute()).status).toBe("infra_failed");
- expect(await readFile(join(f.root, "jobs", id, "checkout", "bun.lock"), "utf8")).toBe("reviewed-lock\n");
- expect((await f.execute()).status).toBe("rejected");
+ const g = await fixture(); g.cleanupFail(); expect((await g.execute()).status).toBe("infra_failed");
+ expect(await readFile(join(g.root, "jobs", id, "checkout", "bun.lock"), "utf8")).toBe("reviewed-lock\n");
+ expect(await stat(join(g.config.jobsRoot, ".executor-lane"))).toBeDefined();
+ await expect(g.execute()).rejects.toThrow("already exists");
 });

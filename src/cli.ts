@@ -51,9 +51,10 @@ import {
  type DigestResult,
 } from "./escalate.ts";
 import type { WalkMode } from "./config.ts";
-import { open, readFile, rm } from "node:fs/promises";
+import { lstat, mkdir, readFile, rm } from "node:fs/promises";
 import { runBaseline, validateBaselineConfig, createCommandMetrics, localCommandAdapter, sshCommandAdapter, privateOperatorPath, writePrivateBaselineReport } from "./remote-test/baseline.ts";
 import { executeRemoteTest, validateExecutorConfig } from "./remote-test/executor.ts";
+import { publishReceiptFile } from "./remote-test/artifacts.ts";
 
 /**
  * ranger — autonomous orienteer work-graph walker.
@@ -454,14 +455,16 @@ remoteTest.command("execute")
    // Reject tracked operator state and reserve the receipt before any execution.
    await privateOperatorPath(`${config.jobsRoot}/receipt-check`);
    const destination = await privateOperatorPath(options.output);
-   const file = await open(destination, "wx", 0o600);
+   const reservation = `${destination}.reservation`;
+   await mkdir(reservation, { mode: 0o700 });
    try {
+    try { await lstat(destination); throw Error("Receipt output already exists"); }
+    catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e; }
     const receipt = await executeRemoteTest({ config, job, bundlePath: options.bundle }, { signal: abort.signal });
-    await file.writeFile(JSON.stringify(receipt, null, 2) + "\n");
+    await publishReceiptFile(destination, receipt);
     process.stdout.write(`Remote-test ${receipt.status}; private receipt saved.\n`);
     process.exitCode = receipt.status === "passed" ? 0 : 1;
-   } catch (error) { await rm(destination, { force: true }); throw error; }
-   finally { await file.close(); }
+   } finally { await rm(reservation, { recursive: true }); }
   } catch {
    process.stderr.write("ranger remote-test execute: configuration, admission or execution failed; inspect private operator inputs.\n");
    process.exitCode = 1;
