@@ -1160,6 +1160,97 @@ describe("implement lane (node #23)", () => {
   expect(worktrees.stdout).not.toContain("ranger-probe-base-");
  }, 60_000);
 
+ test("cached base-red assertions certify a later PR with journal and PR cache provenance", async () => {
+  const r = await rig({ probe: "fake-probe red {node}", probeRetry: "fake-probe red {node} {failed}" });
+  cleanup.push(r.dir);
+  await seedProbeOnBase(r);
+  const sha = await r.github.sha("main");
+  r.journal.setHealth(`base-red-checks.acme/widgets.${sha}.probe-hud.mjs`, JSON.stringify(["the hud draws"]));
+  const calls = watchBaseRuns(r);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  expect(calls.filter((c) => c.cwd.includes("ranger-probe-base-"))).toEqual([]);
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.includes(`base result from cache at ${sha.slice(0, 8)}: probe-hud.mjs`))).toBe(true);
+  expect(events.some((d) => d.includes("the merge-base probe run"))).toBe(false);
+  const record = (r.github.comments.get(1) ?? []).find((c) => c.body.includes("ranger:probes"))?.body ?? "";
+  expect(record).toContain(`base-red-cache-sha=${sha} base-red-cache=probe-hud.mjs`);
+  expect(record).toContain(`Base result from cache at ${sha.slice(0, 8)}: probe-hud.mjs.`);
+  expect(r.github.prs.get(1)?.body).toContain(`Base result from cache at ${sha.slice(0, 8)}`);
+ }, 60_000);
+
+ for (const [name, confirmation] of [
+  ["passes", { code: 0, stdout: "ok   probe-hud.mjs (0.1s)\n", stderr: "" }],
+  ["different checks", {
+   code: 1, stderr: "",
+   stdout: "FAIL probe-hud.mjs (0.1s) exit=1 assert\n     │  FAIL  another check — detail\nFAILED: probe-hud.mjs\n",
+  }],
+ ] as const) {
+  test(`base confirmation ${name} is retained in journal, PR record, body and log without changing this PR's verdict`, async () => {
+   const r = await rig({ probe: "fake-probe red {node}", probeRetry: "fake-probe red {node} {failed}" });
+   cleanup.push(r.dir);
+   await seedProbeOnBase(r);
+   const sha = await r.github.sha("main");
+   let baseRuns = 0;
+   r.ctx.shellRun = async (command, opts) => {
+    if (opts.cwd?.includes("ranger-probe-base-") && ++baseRuns === 2) return confirmation;
+    return runCmd("/bin/sh", ["-c", command], opts);
+   };
+   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+   expect(baseRuns).toBe(2);
+   expect(r.journal.getHealth(`base-red-checks.acme/widgets.${sha}.probe-hud.mjs`)).toBeNull();
+   const observation = `Base confirmation at ${sha.slice(0, 8)} ${confirmation.code === 0 ? "passed" : "exited 1 without repeating identical assertion failures"}: probe-hud.mjs`;
+   const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+   expect(events.some((d) => d.includes(observation))).toBe(true);
+   expect(events.some((d) => d.startsWith("probes passed") && d.includes("inheritance uses the first base comparison or confirmed cache"))).toBe(true);
+   if (name === "different checks") expect(events.some((d) => d.includes("another check"))).toBe(true);
+   const record = (r.github.comments.get(1) ?? []).find((c) => c.body.includes("ranger:probes"))?.body ?? "";
+   expect(record).toContain("result=pass");
+   expect(record).toContain(`base-red-unconfirmed-sha=${sha} base-red-unconfirmed-exit=${confirmation.code} base-red-unconfirmed=probe-hud.mjs`);
+   expect(record).toContain(observation);
+   expect(record).toContain("this PR uses the first base comparison");
+   expect(r.github.prs.get(1)?.body).toContain(observation);
+   expect(r.announced).toHaveLength(1);
+   expect(r.announced[0]).toContain(observation);
+   expect(r.announced[0]).toContain("this PR uses the first base comparison");
+   expect(r.announced[0]).not.toContain("Branches off this commit do not gate on them");
+   const log = workerLogs(r);
+   expect(log).toContain("probe confirmation");
+   expect(log).toContain(confirmation.stdout.trim());
+  }, 60_000);
+ }
+
+ test("unresolved fresh base probes gate and remain visible alongside cache provenance", async () => {
+  const r = await rig({ probe: "fake-probe red {node}", probeRetry: "fake-probe red {node} {failed}" });
+  cleanup.push(r.dir);
+  await seedProbeOnBase(r, ["probe-hud.mjs", "probe-weapon.mjs"]);
+  const sha = await r.github.sha("main");
+  r.journal.setHealth(`base-red-checks.acme/widgets.${sha}.probe-hud.mjs`, JSON.stringify(["the hud draws"]));
+  r.ctx.shellRun = async (command, opts) => {
+   if (opts.cwd?.includes("ranger-probe-base-")) return { code: -1, stdout: "", stderr: "timeout" };
+   if (command.startsWith("fake-probe")) return {
+    code: 1, stderr: "",
+    stdout: [
+     "probe selection: semantic", "selected: 2",
+     "FAIL probe-hud.mjs (0.1s) exit=1 assert",
+     "     │  FAIL  the hud draws — detail",
+     "FAIL probe-weapon.mjs (0.1s) exit=1 assert",
+     "     │  FAIL  the weapon fires — detail",
+     "FAILED: probe-hud.mjs · probe-weapon.mjs",
+    ].join("\n"),
+   };
+   return runCmd("/bin/sh", ["-c", command], opts);
+  };
+  expect((await runNode("20", r.ctx)).status).toBe("parked");
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.includes(`base result from cache at ${sha.slice(0, 8)}: probe-hud.mjs`) &&
+   d.includes("probe-weapon.mjs have no base result — they gate"))).toBe(true);
+  const record = (r.github.comments.get(1) ?? []).find((c) => c.body.includes("ranger:probes"))?.body ?? "";
+  expect(record).toContain("result=fail");
+  expect(record).toContain(`base-red-cache-sha=${sha} base-red-cache=probe-hud.mjs`);
+  expect(r.github.prs.get(1)?.draft).toBe(true);
+  expect(r.journal.getHealth(`base-red-checks.acme/widgets.${sha}.probe-weapon.mjs`)).toBeNull();
+ }, 60_000);
+
  test("a probe red only on the branch still parks, and the park says the base passes it", async () => {
   const r = await rig({ probe: "fake-probe branch-red {node}", probeRetry: "fake-probe branch-red {node} {failed}" });
   cleanup.push(r.dir);
@@ -1250,7 +1341,7 @@ describe("implement lane (node #23)", () => {
   expect(outcome.detail).toContain("red on the merge base too: probe-hud.mjs");
   expect(r.announced).toEqual([]);
   const base = calls.filter((c) => c.cwd.includes("ranger-probe-base-")).map((c) => c.command);
-  expect(base).toEqual(["fake-probe mixed 20 probe-hud.mjs"]);
+  expect(base).toEqual(["fake-probe mixed 20 probe-hud.mjs", "fake-probe mixed 20 probe-hud.mjs"]);
   const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
   expect(events.some((d) => d.includes("probe-hud.mjs fail at the merge base") && d.includes("probe-weapon.mjs ended in a crash, kill, timeout or an unreadable kind at the head"))).toBe(true);
  }, 60_000);
