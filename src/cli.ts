@@ -51,9 +51,10 @@ import {
  type DigestResult,
 } from "./escalate.ts";
 import type { WalkMode } from "./config.ts";
-import { open, readFile, rm } from "node:fs/promises";
+import { lstat, mkdir, readFile, rm } from "node:fs/promises";
 import { runBaseline, validateBaselineConfig, createCommandMetrics, localCommandAdapter, sshCommandAdapter, privateOperatorPath, writePrivateBaselineReport } from "./remote-test/baseline.ts";
 import { executeRemoteTest, validateExecutorConfig } from "./remote-test/executor.ts";
+import { publishReceiptFile } from "./remote-test/artifacts.ts";
 
 /**
  * ranger — autonomous orienteer work-graph walker.
@@ -447,6 +448,7 @@ remoteTest.command("execute")
  .action(async (options: { config: string; job: string; bundle: string; output: string }) => {
   const abort = new AbortController();
   const cancel = () => abort.abort();
+  let receiptStored = false;
   process.once("SIGINT", cancel); process.once("SIGTERM", cancel);
   try {
    const config = validateExecutorConfig(JSON.parse(await readFile(await privateOperatorPath(options.config, true), "utf8")));
@@ -454,16 +456,21 @@ remoteTest.command("execute")
    // Reject tracked operator state and reserve the receipt before any execution.
    await privateOperatorPath(`${config.jobsRoot}/receipt-check`);
    const destination = await privateOperatorPath(options.output);
-   const file = await open(destination, "wx", 0o600);
+   const reservation = `${destination}.reservation`;
+   await mkdir(reservation, { mode: 0o700 });
    try {
+    try { await lstat(destination); throw Error("Receipt output already exists"); }
+    catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e; }
     const receipt = await executeRemoteTest({ config, job, bundlePath: options.bundle }, { signal: abort.signal });
-    await file.writeFile(JSON.stringify(receipt, null, 2) + "\n");
+    receiptStored = true;
+    await publishReceiptFile(destination, receipt);
     process.stdout.write(`Remote-test ${receipt.status}; private receipt saved.\n`);
     process.exitCode = receipt.status === "passed" ? 0 : 1;
-   } catch (error) { await rm(destination, { force: true }); throw error; }
-   finally { await file.close(); }
+   } finally { await rm(reservation, { recursive: true }); }
   } catch {
-   process.stderr.write("ranger remote-test execute: configuration, admission or execution failed; inspect private operator inputs.\n");
+   process.stderr.write(receiptStored
+    ? "ranger remote-test execute: durable receipt stored; output export failed. Inspect the private artifact store before retrying export; do not rerun the job.\n"
+    : "ranger remote-test execute: configuration, admission, execution or receipt storage failed; inspect private operator inputs.\n");
    process.exitCode = 1;
   } finally { process.removeListener("SIGINT", cancel); process.removeListener("SIGTERM", cancel); }
  });

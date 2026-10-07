@@ -55,6 +55,22 @@ export const REMOTE_TEST_STATUSES = [
  "passed", "test_failed", "infra_failed", "timed_out", "cancelled", "rejected",
 ] as const;
 
+export const ResourceObservationSchema = z.object({
+ state: z.enum(["observed", "unavailable", "skipped"]),
+ cpuTimeMicros: z.number().int().nonnegative().safe().nullable(),
+ peakMemoryBytes: z.number().int().nonnegative().safe().nullable(),
+}).strict().refine(r => r.state === "observed" ? r.cpuTimeMicros !== null && r.peakMemoryBytes !== null : r.cpuTimeMicros === null && r.peakMemoryBytes === null);
+export type ResourceObservation = z.infer<typeof ResourceObservationSchema>;
+const EvidenceSchema = z.object({
+ startedAt: TimestampSchema,
+ durationMs: z.number().int().nonnegative().safe(),
+ resources: ResourceObservationSchema,
+ output: z.object({
+  state: z.enum(["captured", "unavailable", "skipped"]), truncated: z.boolean(),
+  artifact: z.object({ path: z.literal("test.log"), bytes: z.number().int().nonnegative().safe(), checksum: Sha256Schema }).strict().nullable(),
+ }).strict().refine(o => o.state === "captured" ? o.artifact !== null : o.artifact === null && !o.truncated),
+}).strict();
+
 const ReceiptSchema = z.object({
  version: VersionSchema,
  identity: IdentitySchema,
@@ -64,7 +80,12 @@ const ReceiptSchema = z.object({
  /** Observed test process exit; null when no test exit was obtained.
   * Infra failure or cancellation can still occur after a test exits zero. */
  exitCode: z.number().int().min(0).max(255).nullable(),
+ /** Older V1 producers remain readable; the durable executor always adds evidence. */
+ evidence: EvidenceSchema.optional(),
 }).strict().superRefine((value, ctx) => {
+ if (value.evidence && value.evidence.startedAt + value.evidence.durationMs !== value.completedAt) {
+  ctx.addIssue({ code: "custom", path: ["evidence"], message: "Receipt timing is inconsistent" });
+ }
  if (value.status === "passed" && value.exitCode !== 0) {
   ctx.addIssue({ code: "custom", path: ["exitCode"], message: "Passed requires test exit zero" });
  }
