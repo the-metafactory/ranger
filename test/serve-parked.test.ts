@@ -25,6 +25,7 @@ import {
  mergeRefusal,
  MACHINE_GH_KEYS,
  needsYouEntries,
+ awaitingMergeEntries,
  type NeedsYouInputs,
  type PrView,
  uncheckedNeedsEye,
@@ -532,11 +533,107 @@ describe("node #54 — the actions and their guards", () => {
   const { handler, runs } = setup();
   const res = await handler(post("/api/merge", { ...ok, sha: SHA }));
   expect(res.status).toBe(200);
-  expect(runs).toHaveLength(1);
+  expect(runs).toHaveLength(2);
   expect(runs[0].argv).toEqual(["gh", "pr", "merge", "687", "--repo", SEELITE, "--squash", "--match-head-commit", SHA]);
   for (const key of MACHINE_GH_KEYS) expect(runs[0].env[key]).toBeUndefined();
   expect(Object.keys(runs[0].env).some((k) => /TOKEN/.test(k))).toBe(false);
   expect(runs[0].env.HOME).toBe("/Users/someone");
+ });
+
+ test("a merge runs the map's merge desk at once, so the close starts without waiting for a tick", async () => {
+  const { handler, runs } = setup();
+  const res = await handler(post("/api/merge", { ...ok, sha: SHA }));
+  expect(await res.json()).toMatchObject({ ok: true, close: { ok: true, code: 0 } });
+  expect(runs[1].argv).toEqual([expect.stringMatching(/\/bin\/ranger$/), "merge-desk", "--map", `${SEELITE}#1`, "-c", expect.stringMatching(/\/ranger\.yaml$/)]);
+  expect(runs[1].detached).toBe(true);
+  expect(Object.keys(runs[1].env).sort()).toEqual(["HOME", "PATH"]);
+ });
+
+ test("a dry-run merge names the desk it would run", async () => {
+  const { handler, runs } = setup();
+  const res = await handler(post("/api/merge", { ...ok, sha: SHA, dryRun: true }));
+  expect(((await res.json()) as { closeArgv: string[] }).closeArgv).toEqual([expect.stringMatching(/\/bin\/ranger$/), "merge-desk", "--map", `${SEELITE}#1`, "-c", expect.stringMatching(/\/ranger\.yaml$/)]);
+  expect(runs).toHaveLength(0);
+ });
+
+ test("a failed merge runs no desk; a failed row's merge runs none either (the desk does not watch it)", async () => {
+  const failing = setup();
+  const failRun: ActionRunner = async (argv, env, o) => {
+   failing.runs.push({ argv, env, detached: o.detached });
+   return { code: 1, stderr: "merge refused" };
+  };
+  const h = createHandler({
+   port: PORT,
+   token: TOKEN,
+   getState: () => assembleState({ ...baseInputs(), needsYou: needsYouEntries(entryInputs({ prs: () => greenPr() })) }),
+   refresh: () => {},
+   launch: () => {},
+   verifyGrilling: async () => null,
+   actions: { run: failRun, env: MACHINE_ENV, rangerBin: "/r", configPath: "/c", readPr: async () => greenPr(), exists: () => true },
+  });
+  const res = await h(post("/api/merge", { ...ok, sha: SHA }));
+  expect(((await res.json()) as { close?: unknown }).close).toBeUndefined();
+  expect(failing.runs).toHaveLength(1);
+
+  const { handler, runs } = setup({ rows: [row({ status: "failed", outcome: "worker exited 1" })] });
+  await handler(post("/api/merge", { ...ok, sha: SHA }));
+  expect(runs).toHaveLength(1);
+  expect(runs[0].argv[0]).toBe("gh");
+ });
+
+ const mergeNow = (gateCode: number) => {
+  const waiting = row({ status: "awaiting-merge" });
+  const inputs = entryInputs({ workers: [waiting], labels: () => [], prs: () => greenPr() });
+  const [e] = awaitingMergeEntries(inputs);
+  const runs: string[][] = [];
+  const handler = createHandler({
+   port: PORT,
+   token: TOKEN,
+   getState: () => assembleState({ ...baseInputs(), awaitingMerge: [e] }),
+   refresh: () => {},
+   launch: () => {},
+   verifyGrilling: async () => null,
+   actions: {
+    run: async (argv) => {
+     runs.push(argv);
+     return argv[1] === "merge-gate" && gateCode !== 0
+      ? { code: gateCode, stderr: "merge gate fail (review-clean): sage verdict at 4b2109fa has 0 blocker(s) and 1 major(s)" }
+      : { code: 0, stderr: "" };
+    },
+    env: MACHINE_ENV,
+    rangerBin: "/r",
+    configPath: "/c",
+    readPr: async () => greenPr(),
+    exists: () => true,
+   },
+  });
+  return { inputs, e, runs, handler };
+ };
+
+ test("Merge now: a plain awaiting-merge row merges once the merge desk's gate passes at the confirmed head", async () => {
+  const { inputs, e, runs, handler } = mergeNow(0);
+  expect(needsYouEntries(inputs)).toHaveLength(0);
+  expect(e.actions.merge).toEqual({ offered: true, headSha: SHA });
+  const res = await handler(post("/api/merge", { ...ok, sha: SHA }));
+  expect(res.status).toBe(200);
+  expect(runs.map((a) => (a[0] === "gh" ? "gh" : a[1]))).toEqual(["merge-gate", "gh", "merge-desk"]);
+  expect(runs[0]).toEqual(["/r", "merge-gate", "663", "--map", `${SEELITE}#1`, "--sha", SHA, "-c", "/c"]);
+  const stale = await handler(post("/api/merge", { ...ok, sha: "f".repeat(40) }));
+  expect(stale.status).toBe(409);
+ });
+
+ test("Merge now: the merge desk's gate holding it refuses the merge, with its reason, and gh never runs", async () => {
+  const { runs, handler } = mergeNow(2);
+  const res = await handler(post("/api/merge", { ...ok, sha: SHA }));
+  expect(res.status).toBe(409);
+  expect(((await res.json()) as { error: string }).error).toMatch(/merge desk's gate holds it: merge gate fail \(review-clean\)/);
+  expect(runs.map((a) => a[1])).toEqual(["merge-gate"]);
+ });
+
+ test("a parked row's merge is the principal's override: no merge desk gate", async () => {
+  const { handler, runs } = setup();
+  await handler(post("/api/merge", { ...ok, sha: SHA }));
+  expect(runs.map((r) => r.argv[1])).not.toContain("merge-gate");
  });
 
  test("an Actions-only green PR merges once every check, read under the principal's login, is green", async () => {
@@ -552,7 +649,7 @@ describe("node #54 — the actions and their guards", () => {
   });
   const res = await handler(post("/api/merge", { ...ok, sha: SHA }));
   expect(res.status).toBe(200);
-  expect(runs).toHaveLength(1);
+  expect(runs).toHaveLength(2);
   expect(seen).toEqual([{ repo: SEELITE, sha: SHA, env: runs[0].env }]); // the merge's own environment
   for (const key of MACHINE_GH_KEYS) expect(seen[0].env[key]).toBeUndefined();
  });

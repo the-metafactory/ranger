@@ -157,6 +157,12 @@ describe("#37 — the state the dashboard shows", () => {
   expect(() => new Function(body)).not.toThrow();
  });
 
+ test("an awaiting-merge job offers Merge now, wired to the guarded merge action", () => {
+  const page = renderPage("tok");
+  expect(page).toContain('mergeButton(waiting, "Merge now")');
+  expect(page).toContain('act("merge", n, { sha: merge.headSha })');
+ });
+
  test("serve imports no graph write, directly or through another module", () => {
   const seen = new Set<string>();
   const src = join(import.meta.dir, "..", "src");

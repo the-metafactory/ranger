@@ -40,6 +40,8 @@ import {
 import { canonicalDir, runNode } from "./worker.ts";
 import { trustCurrentGitState } from "./git-trust.ts";
 import { sweepMap } from "./sweep.ts";
+import { mergeGateNow } from "./merge-desk.ts";
+import { realGitHub } from "./implement.ts";
 import { spawnRunNodeDetached, walk } from "./walk.ts";
 import { holdAwake } from "./awake.ts";
 import { BUILD_NOW_NOT_STARTED, buildNow, type BuildNowResult } from "./build-now.ts";
@@ -260,6 +262,59 @@ async function runSweep(configPath: string): Promise<string> {
  }
  journal.close();
  return JSON.stringify(results, null, 2);
+}
+
+/**
+ * Operator verb: the merge desk's gate for one node's PR, read live. Exits 0
+ * only when the gate passes at exactly `sha`; otherwise it names the check
+ * on stderr and exits 2. Reads only. `ranger serve` runs it before a
+ * dashboard merge of an awaiting-merge row.
+ */
+async function runMergeGate(nodeId: string, selector: string, sha: string, configPath: string): Promise<{ ok: boolean; text: string }> {
+ const { config, journal } = loadCtx(configPath);
+ try {
+  const map = pickMap(config, selector);
+  const row = journal.getWorker(nodeId, map.repo);
+  if (row === null || row.root !== map.root || row.prNumber === null) {
+   return { ok: false, text: `node ${nodeId} has no PR recorded on ${mapKey(map)}` };
+  }
+  const { token, botIdentity } = await writeContext(config, map);
+  const gate = await mergeGateNow(realGitHub, map, row.prNumber, token, botIdentity);
+  if (gate.status !== "pass") return { ok: false, text: `merge gate ${gate.status} (${gate.check}): ${gate.reason}` };
+  if (gate.headSha !== sha) {
+   return { ok: false, text: `the gate passes at ${gate.headSha.slice(0, 8)}, not at the confirmed head ${sha.slice(0, 8)}` };
+  }
+  return { ok: true, text: JSON.stringify({ nodeId, pr: row.prNumber, gate }, null, 2) };
+ } finally {
+  journal.close();
+ }
+}
+
+/**
+ * Operator verb: one map's merge desk, now — the tick's desk phase for that
+ * map alone. `ranger serve` runs it after a dashboard merge, so the merged
+ * node starts its close without waiting for the next tick. Like the tick it
+ * spawns the close (and any send-back) as a detached run-node.
+ */
+async function runMergeDeskNow(selector: string, configPath: string): Promise<string> {
+ const { config, journal } = loadCtx(configPath);
+ try {
+  const map = pickMap(config, selector);
+  const { token, botIdentity } = await writeContext(config, map);
+  const result = await sweepMap({
+   config,
+   journal,
+   map,
+   token,
+   botIdentity,
+   phase: "desk",
+   respawn: (nodeId, repo, root) =>
+    spawnRunNodeDetached({ nodeId, repo, root, cliEntry: join(import.meta.dir, "cli.ts"), configPath }),
+  });
+  return JSON.stringify(result.mergeDesk ?? { idle: "no row on this map waits on a merge" }, null, 2);
+ } finally {
+  journal.close();
+ }
 }
 
 /**
@@ -687,6 +742,51 @@ program
   } catch (error) {
    process.stderr.write(
     `ranger sweep: ${error instanceof Error ? error.message : String(error)}\n`,
+   );
+   process.exit(1);
+  }
+ });
+
+program
+ .command("merge-gate")
+ .description(
+  "Operator verb: the merge desk's gate (CI, mergeable, base, sage review and probes at the live head) for one node's PR; exit 0 only when it passes at --sha, 2 otherwise. Reads only",
+ )
+ .argument("<id>", "node id")
+ .requiredOption("-m, --map <owner/name#root>", "map repo#root (repo alone only when unique)")
+ .requiredOption("--sha <sha>", "the head the merge is pinned to")
+ .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
+ .action(async (id: string, options: { map: string; sha: string; config: string }) => {
+  try {
+   const configPath = resolve(process.cwd(), options.config);
+   const result = await runMergeGate(id, options.map, options.sha, configPath);
+   if (!result.ok) {
+    process.stderr.write(result.text + "\n");
+    process.exit(2);
+   }
+   process.stdout.write(result.text + "\n");
+  } catch (error) {
+   process.stderr.write(
+    `ranger merge-gate: ${error instanceof Error ? error.message : String(error)}\n`,
+   );
+   process.exit(1);
+  }
+ });
+
+program
+ .command("merge-desk")
+ .description(
+  "Operator verb: run one map's merge desk now, as the tick's desk phase does — a merged PR's node starts its close, a passing PR gets its merge card",
+ )
+ .requiredOption("-m, --map <owner/name#root>", "map repo#root (repo alone only when unique)")
+ .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
+ .action(async (options: { map: string; config: string }) => {
+  try {
+   const configPath = resolve(process.cwd(), options.config);
+   process.stdout.write((await runMergeDeskNow(options.map, configPath)) + "\n");
+  } catch (error) {
+   process.stderr.write(
+    `ranger merge-desk: ${error instanceof Error ? error.message : String(error)}\n`,
    );
    process.exit(1);
   }

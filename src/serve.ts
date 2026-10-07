@@ -73,6 +73,7 @@ import {
  workflowRunsFromPages,
  ciState,
  needsYouEntries,
+ awaitingMergeEntries,
  type NeedsYouEntry,
  type PrView,
  runAction,
@@ -192,6 +193,8 @@ export interface StateInputs {
  needsYou?: NeedsYouEntry[];
  /** Awaiting-merge rows whose labels are not known yet, with the read's error. */
  needsYouUnchecked?: UncheckedRow[];
+ /** Every awaiting-merge row, needs-eye or not: the Current job's "Merge now". */
+ awaitingMerge?: NeedsYouEntry[];
 }
 
 /** An awaiting-merge row that may need the principal's eye; its labels are unknown. */
@@ -274,6 +277,7 @@ export interface DashboardState {
  substrates: SubstrateUsageView[];
  needsYou: NeedsYouEntry[];
  needsYouUnchecked: UncheckedRow[];
+ awaitingMerge: NeedsYouEntry[];
 }
 
 const IN_FLIGHT = new Set<WorkerRow["status"]>(["claimed", "running", "awaiting-merge"]);
@@ -459,6 +463,7 @@ export function assembleState(inputs: StateInputs): DashboardState {
   substrates: inputs.substrates ?? [],
   needsYou: inputs.needsYou ?? [],
   needsYouUnchecked: inputs.needsYouUnchecked ?? [],
+  awaitingMerge: inputs.awaitingMerge ?? [],
  };
 }
 
@@ -641,6 +646,15 @@ function tokenMatches(given: string | null, token: string): boolean {
  return a.length === b.length && timingSafeEqual(a, b);
 }
 
+/** What an action may name: a "Needs you" row, or any row awaiting a merge. */
+function actionEntries(state: DashboardState): NeedsYouEntry[] {
+ const out = [...state.needsYou];
+ for (const e of state.awaitingMerge ?? []) {
+  if (!out.some((n) => n.key === e.key && n.nodeId === e.nodeId)) out.push(e);
+ }
+ return out;
+}
+
 export function createHandler(ctx: HandlerContext): (req: Request) => Promise<Response> {
  const hosts = [`127.0.0.1:${ctx.port}`, `localhost:${ctx.port}`];
  const inFlight = new Set<string>();
@@ -684,7 +698,7 @@ export function createHandler(ctx: HandlerContext): (req: Request) => Promise<Re
    if (body === null) return refuse(400, "body is not a JSON object");
    const actions = ctx.actions;
    const result = await runAction(action, body, {
-    entries: ctx.getState().needsYou,
+    entries: actionEntries(ctx.getState()),
     run: actions.run,
     env: actions.env ?? process.env,
     rangerBin: actions.rangerBin,
@@ -784,7 +798,9 @@ h3 { margin:12px 0 4px; font-size:13px; }
 ul { list-style:none; margin:0; padding:0; }
 li { padding:6px 0; border-top:1px solid var(--line); display:flex; flex-wrap:wrap; gap:4px 8px; align-items:baseline; }
 li:first-child { border-top:0; }
-li .t { flex:1 1 14em; min-width:0; overflow-wrap:anywhere; }
+li .t { flex:1 1 0; min-width:0; overflow-wrap:anywhere; }
+li .tags { flex-basis:100%; display:flex; flex-wrap:wrap; gap:4px 6px; align-items:center; padding-left:2.6em; }
+li pre { flex-basis:100%; }
 a { color:var(--accent); text-decoration:none; }
 a:hover { text-decoration:underline; }
 .id { font-variant-numeric:tabular-nums; color:var(--muted); white-space:nowrap; }
@@ -879,10 +895,12 @@ function renderMeta(s) {
  document.getElementById("meta").textContent = "maps read by ranger's tick, shown from its cache" + (s.refreshing ? " · dashboard reading…" : "") + (s.refreshError ? " · dashboard read: " + s.refreshError : "") + " · spawns today " + g.spawnsToday + "/" + g.spawnCap + (g.paused ? " · DEAD-MAN PAUSED" : "");
 }
 const tag = (text, cls) => el("span", { class: "tag" + (cls ? " " + cls : ""), text, title: text });
-function jobTag(j) {
- if (j.stale) return tag("stale: process gone", "stale");
+const tags = (...kids) => el("div", { class: "tags" }, ...kids);
+// One pill per fact, each once: status and phase are often the same word.
+function jobTags(j) {
+ if (j.stale) return [tag("stale: process gone", "stale")];
  const parts = [j.resourceLane || j.lane, j.status, j.phase, j.prNumber ? "PR #" + j.prNumber : "", j.reviewRound ? "round " + j.reviewRound : ""];
- return tag(parts.filter(Boolean).join(" · "));
+ return [...new Set(parts.filter(Boolean))].map((p) => tag(p));
 }
 function renderCurrent(s) {
  const box = document.getElementById("current"); box.replaceChildren();
@@ -890,7 +908,13 @@ function renderCurrent(s) {
  const maps = [...new Map(s.current.map((j) => [j.repo + "#" + j.root, { repo: j.repo, root: j.root }])).values()];
  box.append(...byRepo("current", maps, (m) => m.repo, (m) => {
   const jobs = s.current.filter((j) => j.repo === m.repo && j.root === m.root);
-  return { count: jobs.length, el: group("current/" + m.repo + "#" + m.root, "map #" + m.root, jobs.length, "", el("ul", {}, ...jobs.map((j) => el("li", {}, el("span", { class: "id", text: "#" + j.nodeId }), el("span", { class: "t", text: j.title || "(title not in the frontier read)" }), jobTag(j))))) };
+  return { count: jobs.length, el: group("current/" + m.repo + "#" + m.root, "map #" + m.root, jobs.length, "", el("ul", {}, ...jobs.map((j) => {
+   const waiting = j.status === "awaiting-merge" ? (s.awaitingMerge || []).find((e) => e.repo === j.repo && e.nodeId === j.nodeId) : undefined;
+   const last = waiting ? results.get(waiting.key + "/" + waiting.nodeId) : undefined;
+   return el("li", {}, el("span", { class: "id", text: "#" + j.nodeId }), el("span", { class: "t", text: j.title || "(title not in the frontier read)" }),
+    tags(...jobTags(j), waiting ? mergeButton(waiting, "Merge now") : null, waiting && waiting.pr ? link(waiting.pr.url, "Open PR") : null),
+    last ? el("pre", { class: last.err ? "err" : "", text: last.text }) : null);
+  }))) };
  }));
 }
 function renderNext(s) {
@@ -936,7 +960,7 @@ function renderAuto(s) {
  const box = document.getElementById("auto"); box.replaceChildren();
  box.append(...byRepo("auto", s.maps.filter((m) => !m.servedOnly), (m) => m.repo, (m) => {
   const body = m.autonomous.length === 0 ? unavailable(m, "None.")
-   : el("ul", {}, ...m.autonomous.map((n) => el("li", {}, el("span", { class: "id", text: "#" + n.id }), el("span", { class: "t" }, link(n.url, n.title)), tag(n.lane + " · " + n.kind), buildButton(s, m, n))));
+   : el("ul", {}, ...m.autonomous.map((n) => el("li", {}, el("span", { class: "id", text: "#" + n.id }), el("span", { class: "t" }, link(n.url, n.title)), tags(tag(n.lane + " · " + n.kind), buildButton(s, m, n)))));
   return mapGroup("auto", m, "", mapCount(m, m.autonomous.length), "walk: " + m.walk + " · " + mapMeta(m), body);
  }));
 }
@@ -991,10 +1015,18 @@ async function act(kind, n, extra) {
  const id = n.key + "/" + n.nodeId;
  try {
   const r = await post("/api/" + kind, Object.assign({ key: n.key, id: n.nodeId }, extra));
-  results.set(id, { err: !r.ok, text: kind + " #" + n.nodeId + ": exit " + (r.code === null ? "none" : r.code) + (r.stderr ? "\\n" + r.stderr : "") });
-  say(kind + " #" + n.nodeId + (r.ok ? " ran." : " failed: see its card."), !r.ok);
+  const close = r.close ? "\\nclose (merge desk): exit " + (r.close.code === null ? "none" : r.close.code) + (r.close.stderr ? "\\n" + r.close.stderr : "") : "";
+  results.set(id, { err: !r.ok || (r.close && !r.close.ok), text: kind + " #" + n.nodeId + ": exit " + (r.code === null ? "none" : r.code) + (r.stderr ? "\\n" + r.stderr : "") + close });
+  say(kind + " #" + n.nodeId + (!r.ok ? " failed: see its card." : r.close ? (r.close.ok ? " ran; the merge desk started its close." : " ran, but the merge desk failed: see its card.") : " ran."), !r.ok || (r.close && !r.close.ok));
  } catch (e) { results.set(id, { err: true, text: kind + " #" + n.nodeId + " refused: " + e.message }); say(e.message, true); }
  load(); setTimeout(load, 3000);
+}
+function mergeButton(n, text) {
+ const merge = n.actions.merge;
+ return actionButton(text, merge.offered ? "gh pr merge --squash, pinned to " + short(merge.headSha) + ", under gh's configured login (machine-account tokens stripped; the account is not checked), then the map's merge desk" + (n.status === "awaiting-merge" ? "; refused unless the merge desk's gate (CI, sage review, probes at the head) passes" : "") : merge.why, merge.offered, async () => {
+  if (!confirm("Squash-merge PR #" + n.pr.number + " on " + n.repo + " at head " + merge.headSha + "?\\n\\n" + (n.status === "awaiting-merge" ? "The merge desk's gate is checked first (CI, mergeable, base, sage review and probes at this head); the merge is refused unless it passes. " : "This is an override: only CI and mergeability are checked, not the review or probes. ") + "It runs under gh's configured login: the machine account's GH_TOKEN, GITHUB_TOKEN and GH_CONFIG_DIR are stripped, but the account itself is not checked. " + (n.status === "failed" ? "The merge desk watches only parked and awaiting-merge rows, so Resume it afterwards to run the close." : "Then the map's merge desk runs at once and starts the close; check that the node closed (a failed spawn or a refused close leaves it open)."))) return;
+  await act("merge", n, { sha: merge.headSha });
+ });
 }
 function needsCard(n) {
  const id = n.key + "/" + n.nodeId;
@@ -1005,11 +1037,7 @@ function needsCard(n) {
   acts.append(actionButton("Resume", "ranger resume-node " + n.nodeId + " --map " + n.key, true, () => act("resume", n, { force: force.checked })));
   acts.append(el("label", {}, force, document.createTextNode(" run beside the lane holder")));
  }
- const merge = n.actions.merge;
- acts.append(actionButton("Merge", merge.offered ? "gh pr merge --squash, pinned to " + short(merge.headSha) + ", under gh's configured login (machine-account tokens stripped; the account is not checked)" : merge.why, merge.offered, async () => {
-  if (!confirm("Squash-merge PR #" + n.pr.number + " on " + n.repo + " at head " + merge.headSha + "?\\n\\nIt runs under gh's configured login: the machine account's GH_TOKEN, GITHUB_TOKEN and GH_CONFIG_DIR are stripped, but the account itself is not checked. " + (n.status === "failed" ? "The merge desk watches only parked and awaiting-merge rows, so Resume it afterwards to run the close." : "On its next tick the merge desk starts the close; check that the node closed (a failed spawn or a refused close leaves it open)."))) return;
-  await act("merge", n, { sha: merge.headSha });
- }));
+ acts.append(mergeButton(n, "Merge"));
  const session = n.actions.session;
  acts.append(actionButton("Open session", session.offered ? "Open iTerm2 in " + session.cwd + " and start claude on #" + n.nodeId : session.why, session.offered, () => act("session", n, {})));
  if (n.pr) acts.append(link(n.pr.url, "Open PR"));
@@ -1534,7 +1562,7 @@ export function stateFromJournal(
   }
   const vetoed = journal?.listVetoes() ?? new Set<string>();
   const workers = journal?.listWorkers() ?? [];
-  const needsYou = needsYouEntries({
+  const entryInputs: Parameters<typeof needsYouEntries>[0] = {
    maps,
    workers,
    events: (repo, nodeId) => journal?.listNodeEvents(repo, nodeId) ?? [],
@@ -1551,7 +1579,9 @@ export function stateFromJournal(
    },
    reviewRounds: config.workers.reviewRounds,
    exists: existsSync,
-  });
+  };
+  const needsYou = needsYouEntries(entryInputs);
+  const awaitingMerge = awaitingMergeEntries(entryInputs);
   const needsYouUnchecked = uncheckedNeedsEye({
    maps,
    workers,
@@ -1575,6 +1605,7 @@ export function stateFromJournal(
    workers,
    needsYou,
    needsYouUnchecked,
+   awaitingMerge,
    lastImplementMaps: lastImplementMaps(journal),
    laneHolders: { visual: journal?.laneHolder("visual") ?? null, headless: journal?.laneHolder("headless") ?? null },
    paused: journal?.isPaused() ?? false,

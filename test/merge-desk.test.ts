@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { stringify } from "yaml";
 import { loadConfig } from "../src/config.ts";
 import { openJournal } from "../src/journal.ts";
-import { runMergeDesk } from "../src/merge-desk.ts";
+import { mergeGateNow, runMergeDesk } from "../src/merge-desk.ts";
 import { probeMarker, type GitHubPort } from "../src/implement.ts";
 import type { CheckRun, IssueComment, PullRequest } from "../src/github.ts";
 import { mergeGateFailedOutcome, reviewCapOutcome } from "../src/outcomes.ts";
@@ -24,7 +24,7 @@ const probes = (sha: string): IssueComment => ({
 });
 
 /** A forge with only the calls the merge desk may make; anything else throws. */
-function fakeGitHub(opts: { head?: string; comments: IssueComment[]; ci: CheckRun[]; labels?: string[] }) {
+function fakeGitHub(opts: { head?: string; comments: IssueComment[]; ci: CheckRun[]; labels?: string[]; merged?: boolean; onGetPr?: () => void }) {
  const calls: string[] = [];
  const merges: { n: number; sha: string }[] = [];
  const forbidden = (name: string) => async () => { throw new Error(`unexpected GitHub call: ${name}`); };
@@ -38,8 +38,9 @@ function fakeGitHub(opts: { head?: string; comments: IssueComment[]; ci: CheckRu
   postComment: forbidden("postComment"),
   getPr: async (_repo, number) => {
    calls.push("getPr");
+   opts.onGetPr?.();
    return {
-    number, state: "open", merged: false, draft: false, title: "Repair the deploy step (node #96)",
+    number, state: opts.merged ? "closed" : "open", merged: opts.merged ?? false, draft: false, title: "Repair the deploy step (node #96)",
     headRef: "node/96", headSha: opts.head ?? CERTIFIED, baseRef: "main",
     mergeable: true, mergeableState: "clean", mergeCommitSha: null, mergedBy: null, url: "", author: BOT,
    } satisfies PullRequest;
@@ -275,6 +276,60 @@ describe("node #106 — newest-same-head-review-wins: the desk reads the newest 
     expect(r.spawned).toEqual(sentBack ? ["96"] : []);
     expect(r.journal.getWorker("96", GAME)?.status).toBe(sentBack ? "running" : "awaiting-merge");
     if (sentBack) expect(r.journal.getWorker("96", GAME)?.phase).toBe("review");
+   } finally { r.close(); }
+  });
+ }
+});
+
+describe("one merge, one close: two desk passes on the same merged PR", () => {
+ test("a merged PR spawns its close", async () => {
+  const r = rig();
+  try {
+   r.journal.updateWorker("96", GAME, { status: "awaiting-merge", outcome: null });
+   const gh = fakeGitHub({ comments: [], ci: GREEN, merged: true });
+   await r.desk(gh.github);
+   expect(r.spawned).toEqual(["96"]);
+   expect(r.journal.getWorker("96", GAME)).toMatchObject({ status: "running", phase: "close" });
+  } finally { r.close(); }
+ });
+
+ test("a close another pass started while this one read the PR is not spawned again", async () => {
+  const r = rig();
+  try {
+   r.journal.updateWorker("96", GAME, { status: "awaiting-merge", outcome: null });
+   // The other pass (the tick's, or the dashboard's merge-desk) wins the race.
+   const gh = fakeGitHub({
+    comments: [], ci: GREEN, merged: true,
+    onGetPr: () => r.journal.updateWorker("96", GAME, { status: "running", phase: "close", pid: 999 }),
+   });
+   const result = await r.desk(gh.github);
+   expect(r.spawned).toEqual([]);
+   expect(result.errors).toEqual([]);
+   expect(r.journal.getWorker("96", GAME)).toMatchObject({ status: "running", phase: "close", pid: 999 });
+  } finally { r.close(); }
+ });
+});
+
+describe("mergeGateNow — the desk's gate, for a dashboard merge", () => {
+ test("passes at the head with a clean review, a passing probe run and green CI", async () => {
+  const r = rig({ probe: true });
+  try {
+   const gh = fakeGitHub({ comments: [review(CERTIFIED), probes(CERTIFIED)], ci: GREEN });
+   expect(await mergeGateNow(gh.github, r.config.maps[0], 709, "t", BOT)).toMatchObject({ status: "pass", headSha: CERTIFIED });
+   expect(gh.merges).toEqual([]);
+  } finally { r.close(); }
+ });
+
+ for (const [why, comments, check] of [
+  ["a major at the head", [review(CERTIFIED, 0, 1), probes(CERTIFIED)], "review-clean"],
+  ["the review read an earlier head", [review(MOVED), probes(CERTIFIED)], "review-clean"],
+  ["no passing probe run at the head", [review(CERTIFIED)], "probes"],
+ ] as const) {
+  test(`holds it: ${why}`, async () => {
+   const r = rig({ probe: true });
+   try {
+    const gh = fakeGitHub({ comments: [...comments], ci: GREEN });
+    expect(await mergeGateNow(gh.github, r.config.maps[0], 709, "t", BOT)).toMatchObject({ status: "fail", check });
    } finally { r.close(); }
   });
  }
