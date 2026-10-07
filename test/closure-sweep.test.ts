@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { loadConfig, type RangerConfig } from "../src/config.ts";
 import { Journal } from "../src/journal.ts";
 import type { NodeResult } from "../src/graph.ts";
+import * as graph from "../src/graph.ts";
 import { MAX_WORKER_CLOSURE_READS, reconcileGraphClosures } from "../src/closure-sweep.ts";
 import { finishClosedElsewhere } from "../src/closed-elsewhere.ts";
 import { sweepMap, type SweepMapResult } from "../src/sweep.ts";
@@ -154,6 +155,23 @@ test("sweep respects the GraphQL floor before reading workers or noted cards", a
  expect(journal.listEvents(repo)[0]?.detail).toContain("BudgetDeferral");
 });
 
+test("sweep handles crashed workers before graph closure reads", async () => {
+ journal.upsertWorker({ repo, root: 1, nodeId: "crashed", status: "running", pid: 2_000_000_000, attempts: 0 });
+ journal.upsertWorker({ repo, root: 1, nodeId: "20", status: "failed" });
+ const order: string[] = [];
+ const read = spyOn(graph, "graphNode").mockImplementation(async (_repo, id) => {
+  order.push(`read-${id}`);
+  return { ...node(id), status: "open" };
+ });
+ try {
+  const outcome = await sweepMap({ ...context(), phase: "liveness", respawn: async id => {
+   order.push(`respawn-${id}`); return null;
+  } });
+  expect(outcome.crashed).toBe(1);
+  expect(order).toEqual(["respawn-crashed", "read-20"]);
+ } finally { read.mockRestore(); }
+});
+
 test("a noted card's budget deferral is deferred, with no error or edit", async () => {
  journal.upsertEscalation({ key: `${repo}:20`, repo, root: 1, nodeId: "20", messageId: "card", createdAt: new Date().toISOString(), notedAt: new Date().toISOString() });
  const client = new EscalationDiscord("fake", "channel");
@@ -162,6 +180,52 @@ test("a noted card's budget deferral is deferred, with no error or edit", async 
  }, new Set());
  expect(outcome).toEqual({ keptOpen: [], deferred: ["20"], errors: [] });
  expect(journal.getEscalation(repo, "20")?.status).toBe("open");
+});
+
+test("noted backlog cannot spend the unnoted absent-card allowance", async () => {
+ const now = new Date();
+ for (let i = 0; i < 12; i++) {
+  const id = `noted-${String(i).padStart(2, "0")}`;
+  journal.upsertEscalation({ key: `${repo}:${id}`, repo, root: 1, nodeId: id,
+   channelId: "123", messageId: id, createdAt: "2026-01-01T00:00:00.000Z", notedAt: now.toISOString() });
+ }
+ const fresh = Array.from({ length: ABSENT_RESERVE }, (_, i) => `fresh-${i}`);
+ for (const id of fresh) journal.upsertEscalation({ key: `${repo}:${id}`, repo, root: 1, nodeId: id,
+  channelId: "123", messageId: id, createdAt: "2026-02-01T00:00:00.000Z" });
+ const reads: string[] = [], edits: string[] = [];
+ const edit = spyOn(EscalationDiscord.prototype, "edit").mockImplementation(async id => { edits.push(id); });
+ try {
+  const budget = { remaining: ABSENT_RESERVE, deadline: Date.now() + 60_000 };
+  const outcome = await markAbsentCards({ ...context(), client: new EscalationDiscord("fake", "123"), now, budget,
+   owned: () => {}, readNode: async id => { reads.push(id); return { ...node(id), status: "open" }; },
+  }, new Set());
+  expect(outcome.keptOpen).toEqual(fresh);
+  expect(edits).toEqual(fresh);
+  expect(budget.remaining).toBe(0);
+  expect(reads.filter(id => id.startsWith("noted-"))).toHaveLength(ABSENT_RESERVE);
+  for (const id of fresh) expect(journal.getEscalation(repo, id)?.notedAt).not.toBeNull();
+ } finally { edit.mockRestore(); }
+});
+
+test("noted closure scan resumes its own cursor after journal reopen", async () => {
+ const now = new Date();
+ const ids = Array.from({ length: 12 }, (_, i) => `noted-${String(i).padStart(2, "0")}`);
+ for (const id of ids) journal.upsertEscalation({ key: `${repo}:${id}`, repo, root: 1, nodeId: id,
+  channelId: "123", messageId: id, createdAt: now.toISOString(), notedAt: now.toISOString() });
+ const reads: string[] = [];
+ const edit = spyOn(EscalationDiscord.prototype, "edit").mockResolvedValue(undefined);
+ const tick = () => markAbsentCards({ ...context(), client: new EscalationDiscord("fake", "123"), now,
+  budget: { remaining: ABSENT_RESERVE, deadline: Date.now() + 60_000 }, owned: () => {},
+  readNode: async id => { reads.push(id); return { ...node(id), status: id === ids.at(-1) ? "closed" : "open" }; },
+ }, new Set());
+ try {
+  await tick();
+  journal.close(); journal = new Journal(join(dir, "journal.sqlite"));
+  await tick(); await tick();
+  expect(reads).toEqual(ids);
+  expect(journal.getEscalation(repo, ids.at(-1)!)?.status).toBe("closed");
+  expect(edit).toHaveBeenCalledTimes(1);
+ } finally { edit.mockRestore(); }
 });
 
 test("queue-exit keeps a null-channel legacy card open without editing the map channel", async () => {

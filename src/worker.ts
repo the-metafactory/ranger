@@ -499,7 +499,9 @@ export async function runNode(
    return { ...base, status: "refused", detail };
   }
   if (error instanceof BudgetDeferral) {
+   journal.assertGeneration(nodeId, repo, generation, "record a budget deferral");
    journal.recordEvent("transient", { nodeId, repo, detail: detail.slice(0, 400) });
+   finish(journal, nodeId, repo, "failed", detail);
    return { ...base, status: "failed", detail };
   }
   journal.recordEvent("refused", {

@@ -621,16 +621,16 @@ export async function markAbsentCards(
   neededIds: ReadonlySet<string>,
 ): Promise<{ keptOpen: string[]; deferred: string[]; errors: string[] }> {
   const { client, journal, map, now, budget, owned } = ctx;
-  const eligible = (prior: EscalationRow) => {
-    if (!ctx.onlyClosed || prior.notedAt !== null) return true;
-    const worker = journal.getWorker(prior.nodeId, map.repo);
-    return worker?.root === map.root && worker.phase === "close" &&
-      (worker.status === "success" || worker.status === "released");
-  };
-  const usable = selectAbsentCards(journal, map.repo, neededIds, budget, map.root, eligible);
+  const finished = ctx.onlyClosed ? new Set(journal.listWorkers(map.repo, map.root)
+    .filter(worker => worker.phase === "close" && (worker.status === "success" || worker.status === "released"))
+    .map(worker => worker.nodeId)) : undefined;
+  const eligible = (prior: EscalationRow) => finished === undefined || finished.has(prior.nodeId);
+  const wanted = Math.max(budget.remaining, 0);
+  const unnoted = selectAbsentCards(journal, map.repo, neededIds, wanted, map.root, "unnoted", eligible);
+  const noted = selectAbsentCards(journal, map.repo, neededIds, wanted, map.root, "noted", () => true);
   const clientFor = channelClientFor(client);
   const reconcileCtx = { clientFor, journal, map, now, budget, owned };
-  const outcomes = await mapPool(usable, 3, async (prior): Promise<AbsentOutcome> => {
+  const resolve = async (prior: EscalationRow): Promise<AbsentOutcome> => {
     const closureOnly = ctx.onlyClosed || prior.notedAt !== null;
     let closed = false;
     try {
@@ -644,7 +644,13 @@ export async function markAbsentCards(
     }
     if (!closed && closureOnly) return { action: "unchanged", id: prior.nodeId };
     return reconcileAbsentCard(reconcileCtx, prior, absentCardMode(prior, map.repo, closed));
-  });
+  };
+  // Queue-exit edits have first use of the shared Discord allowance. Select
+  // both pages before edits so newly noted cards are not read twice this tick.
+  const outcomes = [
+    ...await mapPool(unnoted, 3, resolve),
+    ...await mapPool(noted, 3, resolve),
+  ];
   const keptOpen: string[] = [];
   const deferred: string[] = [];
   const errors: string[] = [];
@@ -661,11 +667,9 @@ export async function markAbsentCards(
 }
 
 /**
- * Select up to budget.remaining USABLE (non-needed) open cards for absent-
- * card reconciliation. Cap the LOAD to the remaining request budget (oldest
- * exits first): each card needs ≥1 destination edit, so loading more than the
- * budget could never be fully processed this tick — and a large drain must
- * not walk every unnoted card after the budget is spent. The exclusion is
+ * Select up to wanted USABLE (non-needed) open cards in one scan. Unnoted
+ * queue exits and noted closure checks each get a bounded page and cursor.
+ * The exclusion is
  * applied in JS ONLY (round-36: no SQL NOT IN — an all-active queue must not
  * force SQLite to scan every row proving no results); the needed set is
  * filtered per raw row here, so a needed card is never treated as absent at
@@ -681,13 +685,13 @@ function selectAbsentCards(
   journal: Journal,
   repo: string,
   neededIds: ReadonlySet<string>,
-  budget: CardBudget,
+  wanted: number,
   root: number,
+  scan: "unnoted" | "noted",
   eligible: (prior: EscalationRow) => boolean,
 ): EscalationRow[] {
-  const wanted = Math.max(budget.remaining, 0);
   const scanPage = 50;
-  const cursorKey = `escalate.absentCursor.${mapKey({ repo, root })}`;
+  const cursorKey = `escalate.${scan === "noted" ? "notedCursor" : "absentCursor"}.${mapKey({ repo, root })}`;
   // KEYSET cursor (the last row seen: createdAt + nodeId tiebreak) — resumes
   // AFTER it, which is O(page) per tick instead of the O(offset) skip a
   // growing queue would incur (round-31 review).
@@ -713,7 +717,7 @@ function selectAbsentCards(
       root,
       limit: scanPage,
       after,
-      includeNoted: true,
+      notedOnly: scan === "noted",
     });
     let consumed = 0;
     for (const row of batch) {
@@ -869,11 +873,15 @@ async function reconcileAbsentCard(
 
 const CLOSED_CARD_DEADLINE_MS = 60_000;
 
+export function closedCardBudget(): CardBudget {
+  return { remaining: ABSENT_RESERVE, deadline: Date.now() + CLOSED_CARD_DEADLINE_MS };
+}
+
 function outOfBandPass(map: RangerMapConfig, budget?: CardBudget) {
   return {
     client: EscalationDiscord.fromMap(map),
     now: new Date(),
-    budget: budget ?? { remaining: ABSENT_RESERVE, deadline: Date.now() + CLOSED_CARD_DEADLINE_MS },
+    budget: budget ?? closedCardBudget(),
   };
 }
 

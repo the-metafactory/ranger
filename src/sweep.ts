@@ -86,21 +86,6 @@ export async function sweepMap(ctx: SweepContext): Promise<SweepMapResult> {
  };
 
  const phase = ctx.phase ?? "all";
- // Worker and card closure scans share a deadline. Each scan also has a
- // fixed row cap, so backlog growth cannot multiply graph-call timeouts.
- const deadline = Date.now() + GRAPH_CALL_TIMEOUT_MS;
- const credential = { token, source: "write-token" };
- const readNode = async (id: string) => {
-  if (Date.now() >= deadline) throw new BudgetDeferral("graph closure pass deadline reached");
-  return budgetedRead(journal, repo, credential, budgetPolicy(config), new Date(), () => {
-   const remaining = deadline - Date.now();
-   if (remaining <= 0) throw new BudgetDeferral("graph closure pass deadline reached");
-   return graphNode(repo, id, credential, { timeoutMs: remaining });
-  });
- };
- if (phase !== "desk") {
-  await reconcileGraphClosures(ctx, readNode, result);
- }
  const inFlight =
   phase === "desk"
    ? []
@@ -190,6 +175,22 @@ export async function sweepMap(ctx: SweepContext): Promise<SweepMapResult> {
     journal.recordEvent("released", { nodeId: worker.nodeId, repo, detail: "claim released after park" });
    }
   }
+ }
+
+ // Worker and card closure scans share a deadline after crash handling.
+ // Each scan also has a fixed row cap to bound its graph reads.
+ if (phase !== "desk") {
+  const deadline = Date.now() + GRAPH_CALL_TIMEOUT_MS;
+  const credential = { token, source: "write-token" };
+  const readNode = async (id: string) => {
+   if (Date.now() >= deadline) throw new BudgetDeferral("graph closure pass deadline reached");
+   return budgetedRead(journal, repo, credential, budgetPolicy(config), new Date(), () => {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new BudgetDeferral("graph closure pass deadline reached");
+    return graphNode(repo, id, credential, { timeoutMs: remaining });
+   });
+  };
+  await reconcileGraphClosures(ctx, readNode, result);
  }
 
  // Implement-lane rows waiting on (or parked before) the principal's merge (#23).

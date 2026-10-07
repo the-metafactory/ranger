@@ -1103,7 +1103,7 @@ describe("implement lane (node #23)", () => {
   } finally { prSpy.mockRestore(); ciSpy.mockRestore(); }
  }, 60_000);
 
- test("close-phase budget deferral retains the worker for retry without a deadman failure", async () => {
+ test("close-phase budget deferral records failed and allows sweep recovery without a deadman failure", async () => {
   const r = await rig({}); cleanup.push(r.dir);
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
   await r.github.merge(1);
@@ -1114,7 +1114,22 @@ describe("implement lane (node #23)", () => {
    const outcome = await runNode("20", r.ctx);
    expect(outcome.status).toBe("failed");
    expect(outcome.detail).toContain("GraphQL");
-   expect(r.journal.getWorker("20", "acme/widgets")?.status).toBe("running");
+   expect(r.journal.getWorker("20", "acme/widgets")).toMatchObject({
+    status: "failed", phase: "close", pid: null, workerPgid: null, outcome: outcome.detail,
+   });
+   expect(r.journal.getWorker("20", "acme/widgets")?.finishedAt).not.toBeNull();
+   expect(r.journal.deadmanCount()).toBe(1);
+   expect(ci).not.toHaveBeenCalled();
+   delete process.env.FAKE_GH_GRAPHQL_REMAINING;
+   const cooldown = JSON.parse(r.journal.getHealth("ratelimit:write-token")!);
+   cooldown.until = new Date(Date.now() - 1).toISOString();
+   r.journal.setHealth("ratelimit:write-token", JSON.stringify(cooldown));
+   const file = join(r.dir, "data", "acme__widgets-node-20.json");
+   const node = JSON.parse(readFileSync(file, "utf8")); node.status = "closed";
+   node.node.completion = { closer: "jcfischer", receiptCommentId: "900", closedAt: new Date().toISOString() };
+   writeFileSync(file, JSON.stringify(node));
+   await sweepMap({ ...r.ctx, phase: "liveness" });
+   expect(r.journal.getWorker("20", "acme/widgets")?.status).toBe("success");
    expect(r.journal.deadmanCount()).toBe(1);
    expect(ci).not.toHaveBeenCalled();
   } finally { ci.mockRestore(); }

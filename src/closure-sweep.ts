@@ -1,7 +1,7 @@
 import type { NodeResult } from "./graph.ts";
 import type { SweepContext, SweepMapResult } from "./sweep.ts";
 import { mapKey } from "./maps.ts";
-import { ABSENT_RESERVE, reconcileGraphClosedCards } from "./card-sync.ts";
+import { closedCardBudget, reconcileGraphClosedCards } from "./card-sync.ts";
 import { mapPool } from "./pool.ts";
 import { findNodePr, finishClosedElsewhere } from "./closed-elsewhere.ts";
 import * as githubApi from "./github.ts";
@@ -27,7 +27,7 @@ export async function reconcileGraphClosures(
    return { worker, node: null };
   }
  });
- const cardBudget = { remaining: ABSENT_RESERVE, deadline: Date.now() + 60_000 };
+ const cardBudget = closedCardBudget();
  // Git worktree removals affect shared canonical state: keep these sequential.
  for (const { worker, node } of observations) {
   if (node?.status !== "closed") continue;

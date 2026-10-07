@@ -1,5 +1,5 @@
 import { journalKeyFor } from "./forge-ref.ts";
-import { and, asc, desc, eq, gt, inArray, isNull, lt, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, lt, or, sql } from "drizzle-orm";
 import { openDb, openDbReadOnly, type RangerDb } from "./store/db.ts";
 import { seedLegacyRoots } from "./store/legacy-roots.ts";
 import {
@@ -731,8 +731,8 @@ export class Journal {
   * Open cards whose queue-exit note has NOT yet been written — RAW keyset
   * pages (NO exclusion predicate, round-36 review). This is what the
   * absent-card pass reconciles: once a card is noted, `noted_at` is set and
-  * it drops out of the default scan. includeNoted also serves confirmed
-  * graph closures. The caller pages with a cursor to bound both scans.
+  * it drops out of the default scan. notedOnly selects the separate closure
+  * scan; includeNoted selects both. The caller bounds each scan with a cursor.
   */
  listUnreconciledOpen(
   repo: string,
@@ -741,6 +741,7 @@ export class Journal {
    root?: number;
    after?: { createdAt: string; nodeId: string };
    includeNoted?: boolean;
+   notedOnly?: boolean;
   } = {},
  ): EscalationRow[] {
   const rows = this.db.query.escalations
@@ -749,7 +750,7 @@ export class Journal {
      eq(escalations.repo, repo),
      rootFilter(escalations.root, opts.root),
      eq(escalations.status, "open"),
-     ...(opts.includeNoted ? [] : [isNull(escalations.notedAt)]),
+     ...(opts.notedOnly ? [isNotNull(escalations.notedAt)] : opts.includeNoted ? [] : [isNull(escalations.notedAt)]),
      // KEYSET pagination: resume strictly AFTER the last raw row seen —
      // O(page), not O(offset) (round-31 review: a 50k-row queue must not
      // skip ~50k indexed rows per 50-row batch). nodeId is the tiebreaker
