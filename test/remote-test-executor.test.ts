@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { runCmd } from "../src/exec.ts";
 import { stageSource } from "../src/remote-test/source.ts";
-import { CONTAINER_BOOTSTRAP_FLAGS, containerProgram, executeRemoteTest, podmanLauncher, reconcileRemoteTests, type ExecutorLauncher } from "../src/remote-test/executor.ts";
+import { CONTAINER_BOOTSTRAP_FLAGS, containerProgram, sidecarMetricsProgram, executeRemoteTest, podmanLauncher, reconcileRemoteTests, type ExecutorLauncher } from "../src/remote-test/executor.ts";
 import { openJobLedger } from "../src/remote-test/job-ledger.ts";
 import { createReviewedProfile, MYELIN_REPOSITORY } from "../src/remote-test/profiles.ts";
 
@@ -37,7 +37,7 @@ async function fixture(reviewed = false, recipeChange?: "script" | "test-root") 
   if (command === "create") { const index = args.indexOf("--cidfile"), cid = args.includes("--entrypoint=/bin/sh") ? "b".repeat(64) : "a".repeat(64); await writeFile(args[index + 1]!, cid); return { code: 0, stdout: cid }; }
   if (command === "start" && args.at(-1) === "b".repeat(64)) return { code: 0, stdout: "b".repeat(64) };
   if (command === "inspect" && args.at(-1) === "b".repeat(64)) return { code: 0, stdout: JSON.stringify([{ Mounts: [{ Type: "tmpfs", Destination: "/data" }], State: { Status: "running", OOMKilled: false } }]) };
-  if (command === "exec") return { code: 0, stdout: "usage_usec 10\n512\noom_kill 0\n" };
+  if (command === "exec") return { code: 0, stdout: "usage_usec 10\nranger_peak 512\noom_kill 0\n" };
   if (command === "start") {
    started = true;
    options.onLog?.(Buffer.from(output));
@@ -438,4 +438,48 @@ test("Podman launcher drains attached stderr separately from terminal stdout", a
   expect(result.logsAvailable).toBe(true); expect(JSON.parse(result.stdout)).toEqual({ status: "passed", exitCode: 0 });
   expect(Buffer.concat(chunks).toString()).toBe("attached-private-log");
  } finally { process.env.PATH = priorPath; }
+});
+
+for (const outcome of [0, 1]) test(`reviewed exit ${outcome} survives absent sidecar peaks`, async () => {
+ const f = await fixture(true); f.setExit(outcome);
+ const launcher: ExecutorLauncher = async (argv, options) => argv[1] === "exec"
+  ? {code:0,stdout:"usage_usec 10\nranger_peak unavailable\noom_kill 0\n"} : f.launcher(argv,options);
+ const receipt = await f.execute({launcher});
+ expect(receipt.status).toBe(outcome ? "test_failed" : "passed");
+ expect(receipt.evidence!.resources).toEqual({state:"unavailable",cpuTimeMicros:null,peakMemoryBytes:null});
+ expect(f.calls.filter(c=>c[1]==="rm")).toHaveLength(2);
+});
+for (const [name, metrics] of Object.entries({
+ unsafePeak:"usage_usec 10\nranger_peak 9007199254740992\noom_kill 0",
+ malformedPeak:"usage_usec 10\nranger_peak bad\noom_kill 0",
+ oom:"usage_usec 10\nranger_peak unavailable\noom_kill 1",
+ missingEvents:"usage_usec 10\nranger_peak unavailable",
+ missingCpu:"ranger_peak unavailable\noom_kill 0",
+})) test(`sidecar ${name} cannot pass`, async () => {
+ const f=await fixture(true);
+ const launcher:ExecutorLauncher=async(argv,options)=>argv[1]==="exec" ? {code:0,stdout:metrics} : f.launcher(argv,options);
+ expect((await f.execute({launcher})).status).toBe("infra_failed");
+ expect(f.calls.filter(c=>c[1]==="rm")).toHaveLength(2);
+});
+test("sidecar metrics read failure cannot pass",async()=>{
+ const f=await fixture(true);
+ const launcher:ExecutorLauncher=async(argv,options)=>argv[1]==="exec" ? {code:1,stdout:""} : f.launcher(argv,options);
+ expect((await f.execute({launcher})).status).toBe("infra_failed");
+});
+
+test("sidecar metrics shell distinguishes absent peak from failed or malformed reads", async () => {
+ const root=await realpath(await mkdtemp(join(tmpdir(),"ranger-sidecar-metrics-")));roots.push(root);
+ await writeFile(join(root,"cpu.stat"),"usage_usec 10\n");await writeFile(join(root,"memory.events"),"oom_kill 0\n");
+ const program=sidecarMetricsProgram().replaceAll("/sys/fs/cgroup",root);
+ const run=()=>runCmd("sh",["-ec",program]);
+ let result=await run();expect(result.code).toBe(0);expect(result.stdout).toContain("ranger_peak unavailable");
+ for (const value of ["0","512"]) {await writeFile(join(root,"memory.peak"),value);result=await run();expect(result.code).toBe(0);expect(result.stdout).toContain(`ranger_peak ${value}`);}
+ for (const value of ["","bad","-1","1\n2"]) {await writeFile(join(root,"memory.peak"),value);expect((await run()).code).not.toBe(0);}
+ if (process.getuid?.() !== 0) {
+  await writeFile(join(root,"memory.peak"),"512");await chmod(join(root,"memory.peak"),0o000);
+  try { expect((await run()).code).not.toBe(0); } finally { await chmod(join(root,"memory.peak"),0o600); }
+ }
+ await rm(join(root,"memory.peak"));await mkdir(join(root,"memory.peak"));expect((await run()).code).not.toBe(0);
+ await rm(join(root,"memory.peak"),{recursive:true});await rm(join(root,"memory.events"));expect((await run()).code).not.toBe(0);
+ expect((await runCmd("sh",["-ec",sidecarMetricsProgram().replaceAll("/sys/fs/cgroup",root+"/absent")])).code).not.toBe(0);
 });
