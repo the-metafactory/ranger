@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { runCmd } from "../src/exec.ts";
 import { stageSource } from "../src/remote-test/source.ts";
-import { executeRemoteTest, type ExecutorLauncher } from "../src/remote-test/executor.ts";
+import { containerProgram, executeRemoteTest, type ExecutorLauncher } from "../src/remote-test/executor.ts";
 
 const roots: string[] = [];
 afterEach(async () => { for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
@@ -99,6 +99,28 @@ test("CLI writes a private rejected receipt and refuses an existing output befor
  const result = await invoke(); expect(result.code).toBe(1); expect(result.stdout).toContain("Remote-test rejected");
  expect(JSON.parse(await readFile(output, "utf8")).identity).toEqual(f.job); expect((await stat(output)).mode & 0o777).toBe(0o600);
  await rm(marker); const again = await invoke(); expect(again.code).toBe(1); expect(await readFile(marker, "utf8").catch(() => null)).toBeNull();
+ await rm(output); await writeFile(job, JSON.stringify({ ...f.job, profileId: "unapproved" }));
+ expect((await invoke()).code).toBe(1); expect(await readFile(output, "utf8").catch(() => null)).toBeNull();
+});
+
+test("Bun bootstrap checks controller files before executing profiles and detects child OOM", async () => {
+ const root = await mkdtemp(join(tmpdir(), "ranger-bootstrap-")); roots.push(root);
+ const marker = join(root, "executed"), cgroup = join(root, "cgroup"); await mkdir(cgroup);
+ const valid: Record<string, string> = { "cpu.max": "200000 100000", "memory.max": "1610612736", "memory.swap.max": "0", "pids.max": "256", "memory.events": "oom_kill 0" };
+ const commands: [string, ...string[]][] = [[process.execPath, "-e", `await Bun.write(${JSON.stringify(marker)}, "ran")`]];
+ const run = async (fields: Record<string, string>, argv = commands) => {
+  await rm(marker, { force: true }); for (const [name, content] of Object.entries({ ...valid, ...fields })) await writeFile(join(cgroup, name), content);
+  // Only controller location and cwd differ from the real container program.
+  const program = containerProgram(argv).replace('"/sys/fs/cgroup/"', JSON.stringify(cgroup + "/")).replace('cwd:"/work"', `cwd:${JSON.stringify(root)}`);
+  const result = await runCmd(process.execPath, ["-e", program]); return JSON.parse(result.stdout);
+ };
+ expect(await run({})).toEqual({ status: "passed", exitCode: 0 }); expect(await readFile(marker, "utf8")).toBe("ran");
+ const invalidControls: Record<string, string>[] = [{ "cpu.max": "max 100000" }, { "memory.max": "max" }, { "memory.swap.max": "1024" }, { "pids.max": "max" }];
+ for (const invalid of invalidControls) {
+  expect((await run(invalid)).status).toBe("infra_failed"); expect(await readFile(marker, "utf8").catch(() => null)).toBeNull();
+ }
+ expect((await run({ "memory.events": "oom_kill 1" })).status).toBe("infra_failed");
+ expect((await run({}, [...commands, ["/missing-runtime"]])).status).toBe("infra_failed");
 });
 test("does not overwrite an occupied lane or falsely pass failed teardown", async () => {
  const f = await fixture(); await mkdir(join(f.config.jobsRoot, ".executor-lane")); expect((await f.execute()).status).toBe("rejected"); expect(f.calls).toHaveLength(0);

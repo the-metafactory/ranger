@@ -42,7 +42,7 @@ export const podmanLauncher: ExecutorLauncher = (argv, options) => new Promise((
 });
 
 /** Only this wrapper writes stdout. Tests and descendants have stdout/stderr
- * discarded, so a test cannot impersonate the terminal result. Check actual
+ * discarded. Check actual
  * cgroup files before the first reviewed command, not just requested flags. */
 export function containerProgram(commands: [string, ...string[]][]): string {
  return `const fs = await import("node:fs/promises");
@@ -50,8 +50,8 @@ let result = {status:"infra_failed",exitCode:null};
 try {
  const value = async name => (await fs.readFile("/sys/fs/cgroup/"+name,"utf8")).trim();
  const cpu = (await value("cpu.max")).split(/\\s+/).map(Number);
- if (process.getuid() === 0 || cpu.length !== 2 || !cpu.every(Number.isFinite) || cpu[0] <= 0 || cpu[1] <= 0 || cpu[0]/cpu[1] > 2 ||
-     await value("memory.max") !== "1610612736" || await value("memory.swap.max") !== "0" || await value("pids.max") !== "256") throw Error("Required controller enforcement unavailable");
+ if (process.getuid() === 0 || cpu.length !== 2 || !cpu.every(Number.isFinite) || cpu[0] <= 0 || cpu[1] <= 0 || cpu[0]/cpu[1] > ${EXECUTOR_LIMITS.cpuCores} ||
+     await value("memory.max") !== "${EXECUTOR_LIMITS.memoryBytes}" || await value("memory.swap.max") !== "0" || await value("pids.max") !== "${EXECUTOR_LIMITS.pids}") throw Error("Required controller enforcement unavailable");
  for (const argv of ${JSON.stringify(commands)}) {
   const child = Bun.spawn(argv,{cwd:"/work",stdin:"ignore",stdout:"ignore",stderr:"ignore"});
   const code = await child.exited;
@@ -146,12 +146,13 @@ export async function executeRemoteTest(
        m.Type === "bind" ? m.Source === checkout && m.Destination === "/work" : m.Type === "tmpfs" && m.Destination === "/tmp")) throw new Error("Unexpected container mount policy");
   // A nonzero test exit is expected: do not confuse it with engine failure.
   const startedAt = now();
-  const result = await launcher(["--remote=false", "start", "--attach", containerId], { signal: controller.signal, timeoutMs: Math.max(1, end - now()) });
+  const result = await launcher(["--remote=false", "start", "--attach", containerId], { signal: controller.signal, timeoutMs: Math.max(1, end - now()) + 5000 });
   const state = JSON.parse(await command(["inspect", containerId]))[0]?.State;
   if (state?.OOMKilled === true) { status = "infra_failed"; exitCode = Number.isInteger(state.ExitCode) && state.ExitCode >= 0 && state.ExitCode <= 255 ? state.ExitCode : null; }
   else if (!result.stdout.trim() && state?.Status === "exited" && state.ExitCode === 137 && now() - startedAt >= runtimeSeconds * 1000) { status = "timed_out"; }
   else {
    const terminal = z.object({ status: z.enum(["passed", "test_failed", "infra_failed"]), exitCode: z.number().int().min(0).max(255).nullable() }).strict().parse(JSON.parse(result.stdout.trim()));
+   if (terminal.status === "passed" && terminal.exitCode !== 0 || terminal.status === "test_failed" && (terminal.exitCode === null || terminal.exitCode === 0)) throw new Error("Inconsistent test outcome");
    if (state?.Status !== "exited" || state.ExitCode !== (terminal.exitCode ?? 125) || result.code !== state.ExitCode) throw new Error("Incomplete terminal result");
    status = terminal.status; exitCode = terminal.exitCode;
   }

@@ -50,7 +50,7 @@ import {
  type DigestResult,
 } from "./escalate.ts";
 import type { WalkMode } from "./config.ts";
-import { open, readFile } from "node:fs/promises";
+import { open, readFile, rm } from "node:fs/promises";
 import { runBaseline, validateBaselineConfig, createCommandMetrics, localCommandAdapter, sshCommandAdapter, privateOperatorPath, writePrivateBaselineReport } from "./remote-test/baseline.ts";
 import { executeRemoteTest, validateExecutorConfig } from "./remote-test/executor.ts";
 
@@ -447,13 +447,15 @@ remoteTest.command("execute")
    const job = JSON.parse(await readFile(options.job, "utf8"));
    // Reject tracked operator state and reserve the receipt before any execution.
    await privateOperatorPath(`${config.jobsRoot}/receipt-check`);
-   const file = await open(await privateOperatorPath(options.output), "wx", 0o600);
+   const destination = await privateOperatorPath(options.output);
+   const file = await open(destination, "wx", 0o600);
    try {
     const receipt = await executeRemoteTest({ config, job, bundlePath: options.bundle }, { signal: abort.signal });
     await file.writeFile(JSON.stringify(receipt, null, 2) + "\n");
     process.stdout.write(`Remote-test ${receipt.status}; private receipt saved.\n`);
     process.exitCode = receipt.status === "passed" ? 0 : 1;
-   } finally { await file.close(); }
+   } catch (error) { await rm(destination, { force: true }); throw error; }
+   finally { await file.close(); }
   } catch {
    process.stderr.write("ranger remote-test execute: configuration, admission or execution failed; inspect private operator inputs.\n");
    process.exitCode = 1;
