@@ -5,7 +5,7 @@ import { defaultJournalPath, journalPathOverride } from "./journal-guard.ts";
 import { isAbsolute, resolve } from "node:path";
 import { parse } from "yaml";
 import { z } from "zod";
-import { parseForgeRef, repoIdentity } from "./forge-ref.ts";
+import { parseForgeRef, repoIdentity, validReadTokenPrefix } from "./forge-ref.ts";
 export { REPO_PATTERN } from "./forge-ref.ts";
 
 /**
@@ -181,12 +181,13 @@ const ServeSchema = z.object({
 
 const AuthSchema = z.object({
  /**
-  * Repo-prefix → env var name holding a read-only fine-grained PAT.
-  * Prefixes match longest-first against `map.repo`. Tokens are NEVER inlined
+  * Repo-prefix → env var name holding a read-only PAT. Bare keys match only
+  * GitHub. GitLab requires gitlab:host/path prefixes, matched longest-first.
+  * Tokens are NEVER inlined
   * here — only the env var name that holds them. (Node #8 token gate.)
   */
- readOnlyTokens: z.record(z.string(), z.string()).default({}),
- /** Fallback env var name for repos not matched by any prefix. */
+ readOnlyTokens: z.record(z.string().refine(validReadTokenPrefix, "expected a bare GitHub prefix or forge:host/path prefix"), z.string().min(1)).default({}),
+ /** GitHub fallback only; GitLab always requires an explicit qualified mapping. */
  defaultTokenEnv: z.string().optional(),
  /**
   * Repo-prefix → env var name holding the machine-account WRITE credential

@@ -383,7 +383,10 @@ test("reviewed bootstrap copies private dependencies, performs frozen offline in
   const run = async (skip: boolean | "todo", fail = false, crash = false) => {
    await rm(join(checkout, "node_modules"), { recursive: true, force: true });
    await writeFile(join(checkout, "fixture.test.ts"), `import {expect,test} from 'bun:test'; ${crash ? 'process.exit(7);' : ''} test('required',()=>{${fail ? 'expect(true).toBe(false);' : `expect(process.env.NATS_URL).toBe('nats://127.0.0.1:${broker.port}');`}}); ${skip ? `test.${skip === "todo" ? "todo" : "skip"}('missing required',()=>{});` : ""}`);
-   const program = containerProgram(argv, reviewed.reviewed, reviewed.lockDigest)
+   const pinned = containerProgram(argv, reviewed.reviewed, reviewed.lockDigest);
+   expect(pinned).toContain('Bun.version !== "1.3.14"');
+   // The pin targets the image's Bun; the fixture runs on the host's.
+   const program = pinned.replace('Bun.version !== "1.3.14"', `Bun.version !== ${JSON.stringify(Bun.version)}`)
     .replaceAll('"/sys/fs/cgroup/', JSON.stringify(cgroup).slice(0, -1) + "/")
     .replaceAll("/opt/ranger-dependencies", image).replaceAll("/work", checkout)
     .replaceAll("port:4222", `port:${broker.port}`).replaceAll(":4222", `:${broker.port}`)
