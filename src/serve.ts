@@ -1274,8 +1274,16 @@ export class ServeReader {
    }
   }
   for (const key of [...this.wantedTitles]) {
-   const { repo, iid: id } = decodeForgeKey(key);
-   const issue = await readIssue(this.config, repo, id, tokens);
+   let decoded: ReturnType<typeof decodeForgeKey>;
+   try {
+    decoded = decodeForgeKey(key);
+   } catch {
+    // Legacy GitHub scalar ids can be inert display text, not readable iids.
+    this.wantedTitles.delete(key);
+    continue;
+   }
+   const { repo, iid: id } = decoded;
+   const issue = await this.details.issue(repo, id, tokens);
    if (issue !== null) this.titles.set(key, issue.title);
    this.wantedTitles.delete(key);
   }
