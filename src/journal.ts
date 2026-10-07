@@ -148,6 +148,7 @@ export interface ResumeQueueRow {
  root: number;
  lane: ImplementLane;
  queuedAt: string;
+ failedStarts: number;
 }
 
 export type EventKind =
@@ -373,7 +374,7 @@ export class Journal {
 
  // ---- queued resumes ----
 
- enqueueResume(entry: Omit<ResumeQueueRow, "id" | "queuedAt">, now = new Date()): ResumeQueueRow {
+ enqueueResume(entry: Omit<ResumeQueueRow, "id" | "queuedAt" | "failedStarts">, now = new Date()): ResumeQueueRow {
   return this.db.transaction(() => {
    const inserted = this.db.insert(resumeQueue).values({ ...entry, queuedAt: now.toISOString() })
     .onConflictDoNothing({ target: [resumeQueue.repo, resumeQueue.nodeId] }).returning().get();
@@ -394,6 +395,18 @@ export class Journal {
  getResume(repo: string, nodeId: string): ResumeQueueRow | null {
   return this.db.select().from(resumeQueue)
    .where(and(eq(resumeQueue.repo, repo), eq(resumeQueue.nodeId, nodeId))).get() ?? null;
+ }
+
+ recordResumeStartFailure(entry: ResumeQueueRow, reason: string): boolean {
+  return this.db.transaction(() => {
+   const updated = this.db.update(resumeQueue)
+    .set({ failedStarts: sql`${resumeQueue.failedStarts} + 1` })
+    .where(eq(resumeQueue.id, entry.id)).returning().get();
+   if (updated === undefined) return true;
+   if (updated.failedStarts < 3) return false;
+   this.removeResume(updated, "resume-dropped", `3 consecutive failed starts; last error: ${reason}`);
+   return true;
+  });
  }
 
  removeResume(entry: ResumeQueueRow, kind: "resume-cancelled" | "resume-dropped" | "resume-started", reason: string): boolean {

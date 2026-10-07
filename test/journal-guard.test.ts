@@ -18,7 +18,7 @@ import {
  underTest,
 } from "../src/journal-guard.ts";
 import { runCmd } from "../src/exec.ts";
-import { runNodeArgv } from "../src/walk.ts";
+import { runNodeArgv } from "../src/spawn.ts";
 import { baseConfigLines, bun, runCli } from "./support.ts";
 
 const FOREIGN = ["f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0", "e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1"];

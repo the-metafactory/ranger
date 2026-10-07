@@ -1,10 +1,9 @@
 import { implementLane, startsImplementSession, type ImplementLane } from "./lanes.ts";
-import { queuedResumeStale, spawnHeld, startResumeNode } from "./resume.ts";
+import { processResumeQueue } from "./resume.ts";
 import { executionRefusal } from "./forge-ref.ts";
 import { lastImplementMaps, recordImplementStart, mapKey, implementMapOrder } from "./maps.ts";
 import { join } from "node:path";
 import { spawnRunNodeDetached, type SpawnRunNodeArgs } from "./spawn.ts";
-export { spawnRunNodeDetached, runNodeArgv, type SpawnRunNodeArgs } from "./spawn.ts";
 import type { RangerConfig, RangerMapConfig, WalkMode } from "./config.ts";
 import { DiscordAnnouncer, type AnnounceContext, type AnnounceResult } from "./announce.ts";
 import { BudgetDeferral, budgetPolicy } from "./budget.ts";
@@ -412,104 +411,12 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
  // Pass 1c — queued resumes, FIFO within each implement lane, ahead of claims.
  if (journal.listResumeQueue().length > 0) {
   try {
-   await withClaimLock(journal, async owned => {
-    const waiting = new Set<ImplementLane>();
-    for (const entry of journal.listResumeQueue()) {
-     const map = config.maps.find(m => m.repo === entry.repo && m.root === entry.root);
+   await withClaimLock(journal, owned => processResumeQueue({ ...ctx, github },
+    order.map((map, i) => {
      const w = walked.find(w => w.map === map);
-     const drop = (reason: string) => {
-      owned();
-      journal.removeResume(entry, "resume-dropped", reason);
-     };
-     if (map === undefined || map.walk === "none") {
-      drop(map === undefined ? "map is no longer registered" : "map is walk: none");
-      continue;
-     }
-     if (entry.lane !== implementLane(map)) {
-      drop(`map implement lane changed from ${entry.lane} to ${implementLane(map)}`);
-      continue;
-     }
-     if (waiting.has(entry.lane) || implementClaimed.has(entry.lane)) continue;
-     const row = journal.getWorker(entry.nodeId, entry.repo);
-     if (row === null || row.root !== entry.root || queuedResumeStale(row.status)) {
-      drop(row === null ? "worker row is missing" : row.root !== entry.root ? "worker map root changed" : `worker row is ${row.status}`);
-      continue;
-     }
-     if (w === undefined) {
-      const mapResult = maps[order.indexOf(map)];
-      const message = `queued resume #${entry.nodeId} deferred: ${mapResult.gateReason}`;
-      owned();
-      journal.recordEvent("sweep", { nodeId: entry.nodeId, repo: entry.repo, detail: message });
-      mapResult.errors.push(message);
-      if (startsImplementSession(row)) {
-       waiting.add(entry.lane);
-       implementClaimed.add(entry.lane);
-      }
-      continue;
-     }
-     const takesLane = startsImplementSession(row);
-     if (spawnHeld(journal, config, ctx.now?.() ?? new Date())) {
-      waiting.add(entry.lane);
-      continue;
-     }
-     try {
-      const node = await graphNode(entry.repo, entry.nodeId, { token: w.token, source: "write-token" }, { timeoutMs: GRAPH_CALL_TIMEOUT_MS });
-      if (node.status === "closed") {
-       drop("node is closed");
-       continue;
-      }
-      if (row.prNumber !== null) {
-       const pr = await github.getPr(entry.repo, row.prNumber, w.token);
-       if (pr.merged || pr.state === "closed") {
-        drop(pr.merged ? "PR is merged" : "PR is closed");
-        continue;
-       }
-      }
-     } catch (error) {
-      const reason = `validation failed: ${error instanceof Error ? error.message : String(error)}`;
-      owned();
-      journal.recordEvent("sweep", { nodeId: entry.nodeId, repo: entry.repo, detail: `queued resume #${entry.nodeId} deferred: ${reason}` });
-      if (takesLane) {
-       waiting.add(entry.lane);
-       implementClaimed.add(implementLane(map));
-      }
-      w.errors.push(`queued resume #${entry.nodeId}: ${reason}`);
-      continue;
-     }
-     if (takesLane && implementLaneBusy(journal, implementLane(map))) {
-      waiting.add(entry.lane);
-      continue;
-     }
-     try {
-      const resumed = await startResumeNode(entry.nodeId, map, ctx, owned, { queued: entry });
-      if ("dropped" in resumed) continue;
-      if ("queued" in resumed) {
-       if (takesLane) {
-        waiting.add(entry.lane);
-        implementClaimed.add(implementLane(map));
-       }
-       continue;
-      }
-      // Reserve it for this entire tick, even if run-node finishes immediately.
-      if (takesLane) {
-       implementClaimed.add(implementLane(map));
-       waiting.add(entry.lane);
-      }
-     } catch (error) {
-      if (takesLane) {
-       waiting.add(entry.lane);
-       implementClaimed.add(implementLane(map));
-      }
-      const reason = `start failed: ${error instanceof Error ? error.message : String(error)}`;
-      owned();
-      journal.recordEvent("sweep", { nodeId: entry.nodeId, repo: entry.repo, detail: `queued resume #${entry.nodeId} deferred: ${reason}` });
-      w.errors.push(`queued resume #${entry.nodeId}: ${reason}`);
-     }
-    }
-   });
+     return { map, token: w?.token, gateReason: maps[i].gateReason, errors: w?.errors ?? maps[i].errors };
+    }), implementClaimed, owned));
   } catch (error) {
-   // Never let claims overtake a queue whose pass could not finish.
-   for (const entry of journal.listResumeQueue()) implementClaimed.add(entry.lane);
    for (const w of walked) w.errors.push(`resume queue failed: ${error instanceof Error ? error.message : String(error)}`);
   }
  }

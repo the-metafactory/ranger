@@ -49,27 +49,24 @@ The dashboard shows both holders and the same next choices as walk.
 Unknown or ambiguous worker maps conservatively hold both resource lanes.
 
 `ranger resume-node <id> --when-free` resumes immediately when its lane is
-free, no other resumes wait in that lane, and neither the dead-man pause nor
-the daily spawn cap holds it. Otherwise it records a durable FIFO entry.
+free and no resumes wait in that lane. Otherwise it records a durable FIFO entry.
 Research and close-only resumes start immediately. On each walk tick, queued
 resumes run after merge desks and before new claims; a started implement resume
 reserves its lane for that tick. The dead-man pause and daily spawn cap retain
 queued entries. Closed nodes, released or already active rows, merged or closed
-PRs, maps set to `walk: none`, and entries whose map changed implement lanes
-are removed with a reason. Moving a PR head
+PRs and maps set to `walk: none` are removed with a reason. Moving a PR head
 keeps its entry valid. `ranger resume-node <id> --cancel` removes an entry and
 returns non-zero if none exists. Use `--map owner/name#root` to disambiguate.
-Immediate and queued `--when-free` starts count toward the daily spawn cap.
-With `RANGER_NO_SPAWN=1`, the default spawner consumes the queued entry and
-leaves its row claimed with no PID for the operator to drive `run-node` by hand.
-The claimed row holds its implement lane until the hand-driven run releases it.
-An entry whose node or PR cannot be validated, or whose run-node fails to
-start (including an unexpected missing PID), stays queued and reports the
-error. If the resume takes an implement lane, later resumes and new claims in
-that lane wait for a retry.
-Credential/execution-gated maps retain entries and report the gate failure;
-later resumes and new claims in that implement lane wait for the gate to clear.
-Independent implement lanes can still start work.
+Starts by the walk count toward the daily spawn cap; immediate operator resumes
+do not. A queued entry never reserves a lane: if its head cannot start, fresh
+claims remain eligible that tick, while later queued entries in the lane wait.
+Transient graph or GitHub read errors defer the head without counting a failure.
+Spawn errors, a null PID (including `RANGER_NO_SPAWN=1`), and identity gate
+refusals count as failed starts. Three consecutive failed starts drop the entry
+with an event naming the last error. A successful start removes the entry;
+queueing the node again starts its failure count at zero.
+Plain and immediate operator resumes retain the hand-driven mode where a row
+is claimed without spawning; this mode cannot successfully start a queued resume.
 
 Parked infrastructure probe failures automatically requeue on the next `walk`
 when their lane is free, oldest first across maps. They take priority over

@@ -162,6 +162,13 @@
       "when": 1791321600000,
       "tag": "0022_resume-queue",
       "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "6",
+      "when": 1791321600001,
+      "tag": "0023_resume-start-failures",
+      "breakpoints": true
     }
   ]
 }

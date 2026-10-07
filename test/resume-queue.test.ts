@@ -10,7 +10,8 @@ import { loadConfig } from "../src/config.ts";
 import { Journal, openJournal, type WorkerStatus, type ImplementPhase } from "../src/journal.ts";
 import { LAST_IMPLEMENT_MAP } from "../src/maps.ts";
 import type { GitHubPort, PullRequest } from "../src/github.ts";
-import { walk, type SpawnRunNodeArgs } from "../src/walk.ts";
+import { walk } from "../src/walk.ts";
+import type { SpawnRunNodeArgs } from "../src/spawn.ts";
 import { resumeNode } from "../src/resume.ts";
 import { fakeDiscord, fixturesBin, runCli } from "./support.ts";
 
@@ -135,17 +136,18 @@ describe("resume-node CLI", () => {
    });
   });
 
-  test(`${gate} queues an implement resume on a free lane even with no backlog`, async () => {
+  test(`${gate} does not hold an immediate operator resume on a free lane`, async () => {
    await withRig(async r => {
     r.worker("40");
     if (gate === "pause") r.journal.setPaused(true);
     else for (let i = 0; i < r.config.workers.spawnCapPerDay; i++) r.journal.recordSpawn(new Date());
+    const before = r.journal.spawnsToday();
     const result = await r.cli("40", ["--when-free"]);
     expect(result.code).toBe(0);
-    expect(JSON.parse(result.stdout)).toMatchObject({ nodeId: "40", queued: true });
-    expect(r.journal.listResumeQueue().map(e => e.nodeId)).toEqual(["40"]);
-    expect(r.journal.getWorker("40", REPO)?.status).toBe("parked");
-    expect(r.journal.listEvents(REPO).some(e => e.kind === "sweep")).toBe(false);
+    expect(JSON.parse(result.stdout)).toMatchObject({ nodeId: "40", kind: "started" });
+    expect(r.journal.listResumeQueue()).toEqual([]);
+    expect(r.journal.getWorker("40", REPO)?.status).toBe("claimed");
+    expect(r.journal.spawnsToday()).toBe(before);
    });
   });
  }
@@ -206,7 +208,7 @@ describe("resume-node CLI", () => {
     expect(r.journal.listResumeQueue()).toEqual([]);
     expect(r.journal.getWorker("40", REPO)).toMatchObject({ status: "claimed", workerPgid: null, finishedAt: null, phase });
     expect(r.journal.getHealth(LAST_IMPLEMENT_MAP)).toBe(held ? null : REPO + "#460");
-    expect(r.journal.spawnsToday()).toBe(1);
+    expect(r.journal.spawnsToday()).toBe(0);
    });
   });
  }
@@ -249,60 +251,82 @@ describe("resume-node CLI", () => {
 });
 
 describe("resume-queue-starts-when-lane-frees", () => {
- test("hand-driven mode consumes the queue head, holds its claimed lane, then advances after release", async () => {
+ test("transient reads and admission holds preserve prior failures until the third failed start", async () => {
   await withRig(async r => {
-   r.queue("40", 460); r.queue("41");
-   r.frontier(1, ["20"]); r.frontier(460, ["21"]);
-   const tick = () => walk({ ...r, now: () => NOW });
-   const result = await tick();
-   expect(result.maps.flatMap(m => m.claimed)).toEqual([]);
-   expect(result.maps.flatMap(m => m.errors)).toEqual([]);
-   expect(r.journal.listResumeQueue().map(e => e.nodeId)).toEqual(["41"]);
-   expect(r.journal.getWorker("40", REPO)).toMatchObject({ status: "claimed", pid: null, workerPgid: null, finishedAt: null });
-   expect(r.journal.getWorker("41", REPO)?.status).toBe("parked");
-   expect(r.journal.laneHolder("headless")?.nodeId).toBe("40");
-   expect(r.journal.spawnsToday(NOW)).toBe(1);
-   expect(r.journal.getHealth(LAST_IMPLEMENT_MAP + ".headless")).toBe(REPO + "#460");
-   expect(r.journal.listEvents(REPO).filter(e => e.kind === "resume-started").map(e => e.nodeId)).toEqual(["40"]);
+   const entry = r.queue("40");
+   const tick = () => walk({ ...r, now: () => NOW, spawnRunNode: async () => { throw new Error("spawn unavailable"); } });
+   await tick(); await tick();
+   expect(r.journal.getResume(REPO, "40")?.failedStarts).toBe(2);
+   rmSync(join(r.env.FAKE_SOMA_DIR!, "acme__widgets-node-40.json"));
+   for (let i = 0; i < 4; i++) await tick();
+   expect(r.journal.getResume(REPO, "40")).toEqual({ ...entry, failedStarts: 2 });
+   r.node("40"); r.journal.setPaused(true);
    await tick();
-   expect(r.journal.listResumeQueue().map(e => e.nodeId)).toEqual(["41"]);
-   r.journal.updateWorker("40", REPO, { status: "success" });
-   const next = await tick();
-   expect(next.maps.flatMap(m => m.claimed)).toEqual([]);
-   expect(r.journal.listResumeQueue()).toEqual([]);
-   expect(r.journal.getWorker("41", REPO)).toMatchObject({ status: "claimed", pid: null });
-   expect(r.journal.listEvents(REPO).filter(e => e.kind === "resume-started").reverse().map(e => e.nodeId)).toEqual(["40", "41"]);
-   expect(r.journal.spawnsToday(NOW)).toBe(2);
+   expect(r.journal.getResume(REPO, "40")?.failedStarts).toBe(2);
+   r.journal.setPaused(false); r.journal.recordSpawn(NOW); r.config.workers.spawnCapPerDay = 1;
+   await tick();
+   expect(r.journal.getResume(REPO, "40")?.failedStarts).toBe(2);
+   r.config.workers.spawnCapPerDay++;
+   await tick();
+   expect(r.journal.getResume(REPO, "40")).toBeNull();
+   expect(r.journal.listEvents(REPO).find(e => e.kind === "resume-dropped")?.detail)
+    .toContain("3 consecutive failed starts; last error: start failed: spawn unavailable");
+   expect(r.journal.getWorker("40", REPO)?.status).toBe("parked");
   });
  });
 
- test("an immediate when-free start spends the last spawn and holds another lane's queued resume", async () => {
+ test("RANGER_NO_SPAWN counts a failed queued start, permits fresh claims, and drops after three", async () => {
+  await withRig(async r => {
+   r.queue("40", 460); r.queue("41");
+   r.frontier(1, ["20"]);
+   const tick = () => walk({ ...r, now: () => NOW });
+   const first = await tick();
+   expect(first.maps.flatMap(m => m.claimed)).toEqual(["20"]);
+   expect(first.maps.flatMap(m => m.errors).join(" ")).toContain("run-node spawn returned no PID");
+   expect(r.journal.getWorker("40", REPO)?.status).toBe("parked");
+   expect(r.journal.getResume(REPO, "40")?.failedStarts).toBe(1);
+   expect(r.journal.getResume(REPO, "41")?.failedStarts).toBe(0);
+   r.frontier(1, []);
+   r.journal.updateWorker("20", REPO, { status: "success" });
+   await tick();
+   expect(r.journal.getResume(REPO, "40")?.failedStarts).toBe(2);
+   await tick();
+   expect(r.journal.getResume(REPO, "40")).toBeNull();
+   expect(r.journal.getResume(REPO, "41")?.failedStarts).toBe(1);
+   expect(r.journal.listEvents(REPO).find(e => e.kind === "resume-dropped")?.detail)
+    .toContain("3 consecutive failed starts; last error: start failed: run-node spawn returned no PID");
+   expect(r.journal.listEvents(REPO).some(e => e.kind === "resume-started")).toBe(false);
+   expect(r.journal.spawnsToday(NOW)).toBe(1); // Only the fresh claim spent budget.
+  });
+ });
+
+ test("an immediate when-free start spends no spawn and leaves another lane's queue eligible", async () => {
   await withRig(async r => {
    r.config.maps[1].lane = "visual"; r.config.workers.spawnCapPerDay = 1;
    r.worker("40"); r.worker("41", 460);
-   const entry = r.journal.enqueueResume({ nodeId: "41", repo: REPO, root: 460, lane: "visual" }, NOW);
+   r.journal.enqueueResume({ nodeId: "41", repo: REPO, root: 460, lane: "visual" }, NOW);
    const spawned: string[] = [];
    const ctx = { ...r, now: () => NOW, spawnRunNode: async ({ nodeId }: SpawnRunNodeArgs) => {
     spawned.push(nodeId); return process.pid;
    } };
-   expect(await resumeNode("40", undefined, ctx, { whenFree: true })).toMatchObject({ pid: process.pid });
-   expect(r.journal.spawnsToday(NOW)).toBe(1);
+   expect(await resumeNode("40", undefined, ctx, { whenFree: true })).toMatchObject({ kind: "started", pid: process.pid });
+   expect(r.journal.spawnsToday(NOW)).toBe(0);
    await walk(ctx);
-   expect(spawned).toEqual(["40"]);
-   expect(r.journal.listResumeQueue()).toEqual([entry]);
-   expect(r.journal.getWorker("41", REPO)?.status).toBe("parked");
+   expect(spawned).toEqual(["40", "41"]);
+   expect(r.journal.listResumeQueue()).toEqual([]);
+   expect(r.journal.spawnsToday(NOW)).toBe(1);
   });
  });
 
- test("an immediate when-free spawn failure restores the row and spends no budget", async () => {
+ test("an immediate when-free spawn error restores the row and spends no budget", async () => {
   await withRig(async r => {
    r.worker("40");
    const before = r.journal.getWorker("40", REPO);
-   await expect(resumeNode("40", undefined, { ...r, now: () => NOW, spawnRunNode: async () => null }, { whenFree: true }))
-    .rejects.toThrow("run-node spawn returned no PID");
+   await expect(resumeNode("40", undefined, { ...r, now: () => NOW,
+    spawnRunNode: async () => { throw new Error("spawn failed"); } }, { whenFree: true }))
+    .rejects.toThrow("spawn failed");
    expect(r.journal.getWorker("40", REPO)).toEqual(before);
    expect(r.journal.spawnsToday(NOW)).toBe(0);
-   expect(r.journal.getHealth(LAST_IMPLEMENT_MAP + ".headless")).toBeNull();
   });
  });
 
@@ -433,7 +457,7 @@ describe("resume-queue-starts-when-lane-frees", () => {
  });
 
  for (const failure of ["node", "PR"] as const) {
- test(`${failure} validation failure retains FIFO entries and blocks shared-lane claims until recovery`, async () => {
+ test(`${failure} validation failure retains FIFO without counting and permits shared-lane claims`, async () => {
   await withRig(async r => {
    r.queue("40"); r.queue("41", 460); r.journal.updateWorker("40", REPO, { status: "failed", prNumber: 7 });
    const entries = r.journal.listResumeQueue();
@@ -452,28 +476,30 @@ describe("resume-queue-starts-when-lane-frees", () => {
     spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; } });
    for (let attempt = 0; attempt < 2; attempt++) {
     const result = await tick();
-    expect(spawned).toEqual([]);
+    expect(spawned).toEqual(["20"]);
     expect(r.journal.listResumeQueue()).toEqual(entries);
-    expect(result.maps.flatMap(m => m.claimed)).toEqual([]);
+    expect(result.maps.flatMap(m => m.claimed)).toEqual(attempt === 0 ? ["20"] : []);
     expect(result.maps.flatMap(m => m.errors).join(" ")).toContain("validation failed");
     expect(r.journal.getWorker("40", REPO)?.status).toBe("failed");
     expect(r.journal.getWorker("41", REPO)?.status).toBe("parked");
-    expect(r.journal.spawnsToday(NOW)).toBe(0);
+    expect(r.journal.spawnsToday(NOW)).toBe(1);
     expect(reads).toBe(failure === "PR" ? attempt + 1 : 0);
    }
    expect(r.journal.listEvents(REPO).some(e => e.kind === "resume-dropped")).toBe(false);
    const event = r.journal.listEvents(REPO).find(e => e.kind === "sweep" && e.detail?.includes("queued resume #40 deferred"));
    expect(event?.detail).toContain("validation failed");
    expect(event?.detail).toContain(failure === "node" ? "no fixture" : "read failed");
+   r.journal.updateWorker("20", REPO, { status: "success" });
+   r.frontier(1, []); r.frontier(460, []);
    r.node("40"); readFails = false;
    const recovered = await tick();
-   expect(spawned).toEqual(["40"]);
+   expect(spawned).toEqual(["20", "40"]);
    expect(r.journal.listResumeQueue()).toEqual([entries[1]]);
    expect(recovered.maps.flatMap(m => m.claimed)).toEqual([]);
-   expect(r.journal.spawnsToday(NOW)).toBe(1);
+   expect(r.journal.spawnsToday(NOW)).toBe(2);
    r.journal.updateWorker("40", REPO, { status: "success" });
    const next = await tick();
-   expect(spawned).toEqual(["40", "41"]);
+   expect(spawned).toEqual(["20", "40", "41"]);
    expect(r.journal.listResumeQueue()).toEqual([]);
    expect(next.maps.flatMap(m => m.claimed)).toEqual([]);
   });
@@ -494,14 +520,14 @@ describe("resume-queue-starts-when-lane-frees", () => {
    } });
    expect(spawned).toEqual(["21"]);
    expect(result.maps.flatMap(m => m.claimed)).toEqual(["21"]);
-   expect(r.journal.listResumeQueue()).toEqual([entry]);
+   expect(r.journal.listResumeQueue()).toEqual([{ ...entry, failedStarts: failure === "no PID" ? 1 : 0 }]);
    expect(result.maps.flatMap(m => m.errors).join(" ")).toContain(failure === "validation" ? "validation failed" : "run-node spawn returned no PID");
   });
  });
  }
 
  for (const independent of [false, true]) {
- test(`credential-gated queue preserves FIFO ${independent ? "without blocking an independent lane" : "and holds shared-lane claims"}`, async () => {
+ test(`credential-gated queue preserves FIFO ${independent ? "without blocking an independent lane" : "and permits shared-lane claims"}`, async () => {
   await withRig(async r => {
    if (independent) r.config.maps[1].lane = "visual";
    const repo = "acme/unavailable";
@@ -517,27 +543,25 @@ describe("resume-queue-starts-when-lane-frees", () => {
    const spawned: string[] = [];
    const tick = () => walk({ ...r, spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; } });
    const result = await tick();
-   expect(spawned).toEqual(independent ? ["41"] : []);
-   expect(result.maps.flatMap(m => m.claimed)).toEqual([]);
-   expect(r.journal.listResumeQueue()).toEqual(independent ? [entry] : [entry, second]);
+   expect(spawned).toEqual(independent ? ["41", "20"] : ["20"]);
+   expect(result.maps.flatMap(m => m.claimed)).toEqual(["20"]);
+   expect(r.journal.listResumeQueue()).toEqual(independent ? [{ ...entry, failedStarts: 1 }] : [{ ...entry, failedStarts: 1 }, second]);
    expect(result.maps.find(m => m.repo === repo)?.errors.join(" ")).toContain("RANGER_QUEUE_UNAVAILABLE_TEST");
    expect(r.journal.listEvents(repo).find(e => e.kind === "sweep")?.detail).toContain("queued resume #40 deferred");
   });
  });
  }
 
- test("a changed map lane drops the stale entry and considers the next entry", async () => {
+ test("a changed map lane defers the head without a definitive drop or a lane reservation", async () => {
   await withRig(async r => {
-   r.queue("40"); const next = r.queue("41", 460);
+   const head = r.queue("40"); const next = r.queue("41", 460);
    r.config.maps[0].lane = "visual";
+   r.frontier(460, ["21"]);
    const spawned: string[] = [];
    await walk({ ...r, spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; } });
-   expect(spawned).toEqual(["41"]);
-   expect(r.journal.listResumeQueue()).toEqual([]);
-   expect(r.journal.getWorker("40", REPO)?.status).toBe("parked");
-   expect(r.journal.listEvents(REPO).find(e => e.kind === "resume-dropped" && e.nodeId === "40")?.detail)
-    .toContain("map implement lane changed from headless to visual");
-   expect(r.journal.listEvents(REPO).find(e => e.kind === "resume-started")?.nodeId).toBe(next.nodeId);
+   expect(spawned).toEqual(["21"]);
+   expect(r.journal.listResumeQueue()).toEqual([head, next]);
+   expect(r.journal.listEvents(REPO).some(e => e.kind === "resume-dropped")).toBe(false);
   });
  });
 
@@ -568,7 +592,7 @@ describe("resume-queue-starts-when-lane-frees", () => {
   });
  });
 
- test("identity gate failure keeps entries queued without starting", async () => {
+ test("identity refusal counts failed starts and drops after three without starting", async () => {
   await withRig(async r => {
    r.queue("40");
    process.env.RANGER_WRITE_TEST = "ghp_principal";
@@ -577,6 +601,14 @@ describe("resume-queue-starts-when-lane-frees", () => {
    expect(spawned).toEqual([]); expect(r.journal.listResumeQueue()).toHaveLength(1);
    expect(result.maps.every(m => m.gated)).toBe(true);
    expect(r.journal.getWorker("40", REPO)?.status).toBe("parked");
+   expect(r.journal.getResume(REPO, "40")?.failedStarts).toBe(1);
+   await walk({ ...r, spawnRunNode: async () => { throw new Error("must not spawn"); } });
+   expect(r.journal.getResume(REPO, "40")?.failedStarts).toBe(2);
+   await walk({ ...r, spawnRunNode: async () => { throw new Error("must not spawn"); } });
+   expect(r.journal.getResume(REPO, "40")).toBeNull();
+   expect(r.journal.listEvents(REPO).find(e => e.kind === "resume-dropped")?.detail)
+    .toContain("last error: start failed: configured bot.identity");
+   expect(r.journal.spawnsToday()).toBe(0);
   });
  });
 
@@ -596,7 +628,7 @@ describe("resume-queue-starts-when-lane-frees", () => {
     expect(spawned).toEqual(["40", "21"]);
     expect(result.maps.flatMap(m => m.claimed)).toEqual(["21"]);
     expect(result.maps.flatMap(m => m.errors).join(" ")).toContain("queued resume #40: start failed: spawn failed");
-    expect(r.journal.listResumeQueue()).toEqual([entry]);
+    expect(r.journal.listResumeQueue()).toEqual([{ ...entry, failedStarts: 1 }]);
     expect(r.journal.getWorker("40", REPO)).toEqual(before);
    });
   });
@@ -613,19 +645,20 @@ describe("resume-queue-starts-when-lane-frees", () => {
    const error = failure === "throws" ? "spawn failed" : "run-node spawn returned no PID";
    const spawnRunNode = async ({ nodeId }: SpawnRunNodeArgs) => {
     spawned.push(nodeId);
+    if (nodeId !== "40") return process.pid;
     if (failure === "throws") throw new Error(error);
     return null;
    };
    for (let attempt = 0; attempt < 2; attempt++) {
+    if (attempt > 0) { r.journal.updateWorker("20", REPO, { status: "success" }); r.frontier(1, []); r.frontier(460, []); }
     const result = await walk({ ...r, spawnRunNode, now: () => NOW });
-    expect(spawned).toEqual(Array(attempt + 1).fill("40"));
-    expect(result.maps.flatMap(m => m.claimed)).toEqual([]);
+    expect(spawned).toEqual(attempt === 0 ? ["40", "20"] : ["40", "20", "40"]);
+    expect(result.maps.flatMap(m => m.claimed)).toEqual(attempt === 0 ? ["20"] : []);
     expect(result.maps.flatMap(m => m.errors).join(" ")).toContain(`queued resume #40: start failed: ${error}`);
-    expect(r.journal.listResumeQueue()).toEqual(entries);
+    expect(r.journal.listResumeQueue()).toEqual([{ ...entries[0], failedStarts: attempt + 1 }, entries[1]]);
     expect(r.journal.getWorker("40", REPO)).toEqual(before);
     expect(r.journal.getWorker("41", REPO)?.status).toBe("parked");
-    expect(r.journal.spawnsToday(NOW)).toBe(0);
-    expect(r.journal.getHealth(LAST_IMPLEMENT_MAP + ".headless")).toBeNull();
+    expect(r.journal.spawnsToday(NOW)).toBe(1);
    }
    const events = r.journal.listEvents(REPO).filter(e => e.kind === "sweep" && e.detail?.includes("queued resume #40 deferred: start failed"));
    expect(events).toHaveLength(2);
@@ -637,7 +670,11 @@ describe("resume-queue-starts-when-lane-frees", () => {
    await tick();
    expect(recovered).toEqual(["40"]);
    expect(r.journal.listResumeQueue()).toEqual([entries[1]]);
-   expect(r.journal.spawnsToday(NOW)).toBe(1);
+   expect(r.journal.spawnsToday(NOW)).toBe(2);
+   r.journal.updateWorker("40", REPO, { status: "parked" });
+   const requeued = r.journal.enqueueResume({ nodeId: "40", repo: REPO, root: 1, lane: "headless" }, NOW);
+   expect(requeued.failedStarts).toBe(0);
+   r.journal.removeResume(requeued, "resume-cancelled", "test reset");
    r.journal.updateWorker("40", REPO, { status: "success" });
    await tick();
    expect(recovered).toEqual(["40", "41"]);
@@ -652,7 +689,7 @@ test("resume queue migration appends to the prior journal and preserves worker s
  const folder = join(dir, "drizzle"); mkdirSync(join(folder, "meta"), { recursive: true });
  const source = join(import.meta.dir, "../drizzle");
  const manifest = JSON.parse(readFileSync(join(source, "meta/_journal.json"), "utf8"));
- manifest.entries = manifest.entries.filter((e: { tag: string }) => e.tag !== "0022_resume-queue");
+ manifest.entries = manifest.entries.filter((e: { tag: string }) => !e.tag.startsWith("0022") && !e.tag.startsWith("0023"));
  writeFileSync(join(folder, "meta/_journal.json"), JSON.stringify(manifest));
  for (const e of manifest.entries) copyFileSync(join(source, `${e.tag}.sql`), join(folder, `${e.tag}.sql`));
  const path = join(dir, "state.sqlite"); const sqlite = new Database(path);
@@ -668,4 +705,34 @@ test("resume queue migration appends to the prior journal and preserves worker s
    expect(journal.listResumeQueue()).toEqual([entry]);
   } finally { journal.close(); }
  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("failed-start migration preserves existing FIFO entries and retry counts survive reopen", () => {
+ const dir = mkdtempSync(join(tmpdir(), "ranger-resume-failures-migration-"));
+ const folder = join(dir, "drizzle"); mkdirSync(join(folder, "meta"), { recursive: true });
+ const source = join(import.meta.dir, "../drizzle");
+ const manifest = JSON.parse(readFileSync(join(source, "meta/_journal.json"), "utf8"));
+ manifest.entries = manifest.entries.filter((e: { tag: string }) => e.tag !== "0023_resume-start-failures");
+ writeFileSync(join(folder, "meta/_journal.json"), JSON.stringify(manifest));
+ for (const e of manifest.entries) copyFileSync(join(source, `${e.tag}.sql`), join(folder, `${e.tag}.sql`));
+ const path = join(dir, "state.sqlite");
+ const sqlite = new Database(path);
+ sqlite.run("CREATE TABLE ranger_legacy_roots (repo text PRIMARY KEY, root integer NOT NULL)");
+ migrate(drizzle(sqlite), { migrationsFolder: folder });
+ sqlite.run("INSERT INTO resume_queue(id,repo,node_id,root,lane,queued_at) VALUES(8,'acme/widgets','40',1,'headless','2026-10-07T10:00:00Z'),(9,'acme/widgets','41',460,'headless','2026-10-07T10:00:00Z')");
+ sqlite.close();
+ let journal = new Journal(path);
+ try {
+  const [head, next] = journal.listResumeQueue();
+  expect(head).toMatchObject({ id: 8, nodeId: "40", failedStarts: 0 });
+  expect(next).toMatchObject({ id: 9, nodeId: "41", failedStarts: 0 });
+  expect(journal.recordResumeStartFailure(head, "first error")).toBe(false);
+  expect(journal.recordResumeStartFailure(head, "second error")).toBe(false);
+  journal.close(); journal = new Journal(path);
+  expect(journal.getResume(REPO, "40")?.failedStarts).toBe(2);
+  expect(journal.recordResumeStartFailure(head, "last error")).toBe(true);
+  expect(journal.listResumeQueue()).toEqual([next]);
+  expect(journal.listEvents(REPO).find(e => e.kind === "resume-dropped")?.detail)
+   .toBe("3 consecutive failed starts; last error: last error");
+ } finally { journal.close(); rmSync(dir, { recursive: true, force: true }); }
 });

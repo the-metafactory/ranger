@@ -20,8 +20,8 @@ import {
  claimNode,
  type AnnounceFn,
  type ClaimFn,
- type SpawnRunNodeArgs,
 } from "./walk.ts";
+import type { SpawnRunNodeArgs } from "./spawn.ts";
 
 /**
  * `ranger build-now <id>` (node #58) — the walk's claim for one chosen node,

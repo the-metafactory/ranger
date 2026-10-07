@@ -4,7 +4,9 @@ import { withClaimLock } from "./claim-lock.ts";
 import { executionRefusal } from "./forge-ref.ts";
 import { assertNotPrincipal, resolveBotIdentity, resolveWriteToken, WriteGateError } from "./identity.ts";
 import type { Journal, ResumeQueueRow, WorkerStatus } from "./journal.ts";
-import { implementLane, startsImplementSession } from "./lanes.ts";
+import { implementLane, startsImplementSession, type ImplementLane } from "./lanes.ts";
+import { graphNode, GRAPH_CALL_TIMEOUT_MS } from "./graph.ts";
+import type { GitHubPort } from "./github.ts";
 import type { OwnedCheck } from "./lock.ts";
 import { laneHeldMessage, mapKey, pickMap, recordImplementStart, resumeMap } from "./maps.ts";
 import { spawnRunNodeDetached, type SpawnRunNodeArgs } from "./spawn.ts";
@@ -31,11 +33,24 @@ export const queuedResumeStale = (status: WorkerStatus) => status === "released"
 export const spawnHeld = (journal: Journal, config: RangerConfig, now: Date) =>
  journal.isPaused() || journal.spawnsToday(now) >= config.workers.spawnCapPerDay;
 
+interface ResumeResult {
+ nodeId: string;
+ repo: string;
+ root: number;
+ was: WorkerStatus;
+ pid: number | null;
+}
+export type ResumeOutcome = ResumeResult & (
+ | { kind: "started" }
+ | { kind: "queued"; queued: true }
+ | { kind: "dropped"; dropped: true; reason: string }
+);
+
 /** Caller holds the claim lock. CLI and queued resumes use this same startup path. */
 export async function startResumeNode(
  nodeId: string, map: RangerMapConfig, ctx: ResumeContext, owned: OwnedCheck,
- options: { force?: boolean; queued?: ResumeQueueRow; whenFree?: boolean } = {},
-) {
+ options: { force?: boolean; queued?: ResumeQueueRow } = {},
+): Promise<ResumeOutcome> {
  const { journal } = ctx;
  await identityGate(ctx.config, map);
  const row = journal.getWorker(nodeId, map.repo);
@@ -45,7 +60,7 @@ export async function startResumeNode(
  if (options.queued !== undefined && queuedResumeStale(row.status)) {
   owned();
   journal.removeResume(options.queued, "resume-dropped", `worker row is ${row.status}`);
-  return { ...result, dropped: true };
+  return { ...result, kind: "dropped", dropped: true, reason: `worker row is ${row.status}` };
  }
  if (row.status === "released") throw releasedError(nodeId);
  const lane = implementLane(map);
@@ -53,7 +68,7 @@ export async function startResumeNode(
  const holder = takesLane ? journal.laneHolder(lane, { nodeId, repo: map.repo }) : null;
  const now = ctx.now?.() ?? new Date();
  if (options.queued !== undefined && (spawnHeld(journal, ctx.config, now) || holder !== null)) {
-  return { ...result, queued: true };
+  return { ...result, kind: "queued", queued: true };
  }
  if (holder !== null && options.force !== true) throw new Error(laneHeldMessage(lane, holder, "resume", nodeId));
  owned();
@@ -63,7 +78,6 @@ export async function startResumeNode(
  });
  let pid: number | null;
  const spawner = ctx.spawnRunNode ?? spawnRunNodeDetached;
- const handDriven = spawner === spawnRunNodeDetached && process.env.RANGER_NO_SPAWN === "1";
  try {
   pid = await spawner({ nodeId, repo: map.repo, root: map.root,
    cliEntry: join(import.meta.dir, "cli.ts"), configPath: ctx.configPath });
@@ -73,17 +87,17 @@ export async function startResumeNode(
   throw error;
  }
  owned();
- if ((options.queued !== undefined || options.whenFree) && pid === null && !handDriven) {
+ if (options.queued !== undefined && pid === null) {
   restore();
   throw new Error("run-node spawn returned no PID");
  }
  if (pid !== null) journal.updateWorker(nodeId, map.repo, { pid });
  if (takesLane) recordImplementStart(journal, map);
- if (options.queued !== undefined || options.whenFree) journal.recordSpawn(now);
+ if (options.queued !== undefined) journal.recordSpawn(now);
  const entry = options.queued ?? journal.getResume(map.repo, nodeId);
  if (entry !== null) journal.removeResume(entry, "resume-started", `resume-node started; run-node pid ${pid ?? "none"}`);
  journal.recordEvent("sweep", { nodeId, repo: map.repo, detail: `resume-node by ${options.queued === undefined ? "operator" : "queue"} (was ${row.status}); run-node pid ${pid ?? "none"}` });
- return { ...result, pid };
+ return { ...result, pid, kind: "started" };
 }
 
 export async function resumeNode(nodeId: string, selector: string | undefined, ctx: ResumeContext,
@@ -108,17 +122,96 @@ export async function resumeNode(nodeId: string, selector: string | undefined, c
   if (row === null) throw missingRowError(nodeId, map.repo);
   if (row.status === "released") throw releasedError(nodeId);
   const lane = implementLane(map);
-  const now = ctx.now?.() ?? new Date();
   if (options.whenFree && startsImplementSession(row) && (
    journal.laneHolder(lane, { nodeId, repo: map.repo }) !== null ||
-   journal.listResumeQueue(lane).some(entry => entry.repo !== map.repo || entry.nodeId !== nodeId) ||
-   spawnHeld(journal, config, now)
+   journal.getResume(map.repo, nodeId) !== null ||
+   journal.listResumeQueue(lane).length > 0
   )) {
    await identityGate(config, map);
    owned();
-   const entry = journal.enqueueResume({ nodeId, repo: map.repo, root: map.root, lane }, now);
+   const entry = journal.enqueueResume({ nodeId, repo: map.repo, root: map.root, lane }, ctx.now?.() ?? new Date());
    return { nodeId, repo: map.repo, root: map.root, queued: true, lane: entry.lane, queuedAt: entry.queuedAt };
   }
-  return startResumeNode(nodeId, map, ctx, owned, { force: options.force, whenFree: options.whenFree });
+  return startResumeNode(nodeId, map, ctx, owned, { force: options.force });
  });
+}
+
+export interface ResumeQueueMap {
+ map: RangerMapConfig;
+ token?: string;
+ gateReason?: string;
+ errors: string[];
+}
+
+/** Caller holds the claim lease; only successful starts reserve implement capacity. */
+export async function processResumeQueue(
+ ctx: ResumeContext & { github: GitHubPort }, maps: ResumeQueueMap[],
+ reservations: Set<ImplementLane>, owned: OwnedCheck,
+): Promise<void> {
+ const { journal, config } = ctx;
+ const waiting = new Set<ImplementLane>();
+ for (const entry of journal.listResumeQueue()) {
+  const state = maps.find(m => m.map.repo === entry.repo && m.map.root === entry.root);
+  const map = state?.map;
+  const drop = (reason: string) => {
+   owned();
+   journal.removeResume(entry, "resume-dropped", reason);
+  };
+  const defer = (reason: string, failedStart = false) => {
+   owned();
+   journal.recordEvent("sweep", { nodeId: entry.nodeId, repo: entry.repo,
+    detail: `queued resume #${entry.nodeId} deferred: ${reason}` });
+   state?.errors.push(`queued resume #${entry.nodeId}: ${reason}`);
+   if (failedStart && journal.recordResumeStartFailure(entry, reason)) return;
+   waiting.add(entry.lane);
+  };
+  if (map?.walk === "none") { drop("map is walk: none"); continue; }
+  if (waiting.has(entry.lane) || reservations.has(entry.lane)) continue;
+  const row = journal.getWorker(entry.nodeId, entry.repo);
+  if (row !== null && queuedResumeStale(row.status)) {
+   drop(`worker row is ${row.status}`);
+   continue;
+  }
+  if (state === undefined || map === undefined || row === null || row.root !== entry.root || entry.lane !== implementLane(map)) {
+   defer(map === undefined ? "map is no longer registered" : row === null ? "worker row is missing" :
+    row.root !== entry.root ? "worker map root changed" : `map implement lane changed from ${entry.lane} to ${implementLane(map)}`);
+   continue;
+  }
+  if (spawnHeld(journal, config, ctx.now?.() ?? new Date())) {
+   waiting.add(entry.lane);
+   continue;
+  }
+  if (state.token === undefined) {
+   defer(`start failed: ${state.gateReason ?? "identity gate unavailable"}`, true);
+   continue;
+  }
+  try {
+   const node = await graphNode(entry.repo, entry.nodeId, { token: state.token, source: "write-token" },
+    { timeoutMs: GRAPH_CALL_TIMEOUT_MS });
+   if (node.status === "closed") { drop("node is closed"); continue; }
+   if (row.prNumber !== null) {
+    const pr = await ctx.github.getPr(entry.repo, row.prNumber, state.token);
+    if (pr.merged || pr.state === "closed") {
+     drop(pr.merged ? "PR is merged" : "PR is closed");
+     continue;
+    }
+   }
+  } catch (error) {
+   defer(`validation failed: ${error instanceof Error ? error.message : String(error)}`);
+   continue;
+  }
+  try {
+   const resumed = await startResumeNode(entry.nodeId, map, ctx, owned, { queued: entry });
+   switch (resumed.kind) {
+    case "dropped": break;
+    case "queued": waiting.add(entry.lane); break;
+    case "started":
+     waiting.add(entry.lane);
+     if (startsImplementSession(row)) reservations.add(implementLane(map));
+     break;
+   }
+  } catch (error) {
+   defer(`start failed: ${error instanceof Error ? error.message : String(error)}`, true);
+  }
+ }
 }

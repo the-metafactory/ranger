@@ -73,6 +73,7 @@ export const resumeQueue = sqliteTable("resume_queue", {
  root: integer("root").notNull(),
  lane: text("lane", { enum: ["visual", "headless"] }).notNull(),
  queuedAt: text("queued_at").notNull(),
+ failedStarts: integer("failed_starts").notNull().default(0),
 }, table => [
  uniqueIndex("resume_queue_repo_node_idx").on(table.repo, table.nodeId),
  index("resume_queue_lane_id_idx").on(table.lane, table.id),
