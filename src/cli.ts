@@ -50,8 +50,9 @@ import {
  type DigestResult,
 } from "./escalate.ts";
 import type { WalkMode } from "./config.ts";
-import { readFile } from "node:fs/promises";
+import { open, readFile } from "node:fs/promises";
 import { runBaseline, validateBaselineConfig, createCommandMetrics, localCommandAdapter, sshCommandAdapter, privateOperatorPath, writePrivateBaselineReport } from "./remote-test/baseline.ts";
+import { executeRemoteTest, validateExecutorConfig } from "./remote-test/executor.ts";
 
 /**
  * ranger — autonomous orienteer work-graph walker.
@@ -428,9 +429,38 @@ program
  .description("Autonomous orienteer work-graph walker")
  .version("0.1.0");
 
-program.command("remote-test")
- .description("Operator-only remote-test tooling; local verification remains the default")
- .command("baseline")
+const remoteTest = program.command("remote-test")
+ .description("Operator-only remote-test tooling; local verification remains the default");
+
+remoteTest.command("execute")
+ .description("Execute one admitted immutable job using an operator-owned profile and rootless Podman")
+ .requiredOption("--config <path>", "reviewed private executor JSON configuration")
+ .requiredOption("--job <path>", "admitted V1 job identity JSON")
+ .requiredOption("--bundle <path>", "staged immutable Git bundle")
+ .requiredOption("--output <path>", "new private terminal receipt JSON")
+ .action(async (options: { config: string; job: string; bundle: string; output: string }) => {
+  const abort = new AbortController();
+  const cancel = () => abort.abort();
+  process.once("SIGINT", cancel); process.once("SIGTERM", cancel);
+  try {
+   const config = validateExecutorConfig(JSON.parse(await readFile(await privateOperatorPath(options.config, true), "utf8")));
+   const job = JSON.parse(await readFile(options.job, "utf8"));
+   // Reject tracked operator state and reserve the receipt before any execution.
+   await privateOperatorPath(`${config.jobsRoot}/receipt-check`);
+   const file = await open(await privateOperatorPath(options.output), "wx", 0o600);
+   try {
+    const receipt = await executeRemoteTest({ config, job, bundlePath: options.bundle }, { signal: abort.signal });
+    await file.writeFile(JSON.stringify(receipt, null, 2) + "\n");
+    process.stdout.write(`Remote-test ${receipt.status}; private receipt saved.\n`);
+    process.exitCode = receipt.status === "passed" ? 0 : 1;
+   } finally { await file.close(); }
+  } catch {
+   process.stderr.write("ranger remote-test execute: configuration, admission or execution failed; inspect private operator inputs.\n");
+   process.exitCode = 1;
+  } finally { process.removeListener("SIGINT", cancel); process.removeListener("SIGTERM", cancel); }
+ });
+
+remoteTest.command("baseline")
  .description("Inspect capacity; --run explicitly grants one bounded non-graphical workload")
  .requiredOption("--profile <path>", "reviewed operator-local baseline JSON configuration")
  .requiredOption("--output <path>", "new private JSON report outside git repositories")
