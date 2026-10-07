@@ -77,7 +77,9 @@ export class JobLedger {
  }
  private terminal(job: RemoteTestJob, row: Row): Admission {
   const receipt = validateRemoteTestReceipt(JSON.parse(row.receipt!), job), reason = this.fence(job, false);
-  return reason && receipt.status === "passed" ? { kind: "revoked", receipt } : { kind: "terminal", receipt };
+  // Attempt zero is historical evidence imported without an admission/launch
+  // commit. It can preserve replay protection, never establish accepted success.
+  return (reason || row.attempt === 0) && receipt.status === "passed" ? { kind: "revoked", receipt } : { kind: "terminal", receipt };
  }
  status(input: unknown): JobStatus | null {
   const job = validateJobIdentity(input);
@@ -99,7 +101,7 @@ export class JobLedger {
   if (receipt.executorId !== this.executorId) throw Error("Execution ledger producer mismatch");
   return this.read(() => {
    if (this.row(job)) return this.status(job);
-   return this.fence(job, false) && receipt.status === "passed" ? { kind: "revoked", receipt } : { kind: "terminal", receipt };
+   return receipt.status === "passed" ? { kind: "revoked", receipt } : { kind: "terminal", receipt };
   });
  }
  /** Upgrade a validated private pre-ledger receipt only when there is no

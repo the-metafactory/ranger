@@ -93,15 +93,18 @@ test("concurrent executor duplicates report active and only one launches; comple
  const reopened = await openJobLedger(f.config.jobsRoot, f.config.executorId);
  try { expect(reopened.admit(nextJob).kind).toBe("admitted"); } finally { reopened.close(); }
 });
-test("validated pre-ledger receipts upgrade without execution or a global recovery fence", async () => {
+test("rowless passed evidence is retained as revoked without execution or a global recovery fence", async () => {
  const f = await fixture(), receipt = await f.execute();
  await rm(join(f.config.jobsRoot, ".execution"), { recursive: true }); // A previous producer left only its private artifact.
  const count = f.calls.length;
- expect(await f.execute()).toEqual(receipt); expect(f.calls.length).toBe(count);
+ await expect(f.execute()).rejects.toThrow("revoked"); expect(f.calls.length).toBe(count);
  await rm(join(f.config.jobsRoot, ".artifacts", id), { recursive: true });
- expect(await f.execute()).toEqual(receipt); expect(f.calls.length).toBe(count);
+ await expect(f.execute()).rejects.toThrow("revoked"); expect(f.calls.length).toBe(count);
  const ledger = await openJobLedger(f.config.jobsRoot, f.config.executorId);
- try { expect(ledger.admit({ ...f.job, jobId: "7c7e8091-1234-4234-8234-123456789abc", correlationId: "7c7e8091-1234-4234-8234-123456789abc" }).kind).toBe("admitted"); } finally { ledger.close(); }
+ try {
+  expect(ledger.status(f.job)).toEqual({ kind: "revoked", receipt });
+  expect(ledger.admit({ ...f.job, jobId: "7c7e8091-1234-4234-8234-123456789abc", correlationId: "7c7e8091-1234-4234-8234-123456789abc" }).kind).toBe("admitted");
+ } finally { ledger.close(); }
 });
 test("an interrupted publication never adopts loose passed evidence and terminates after the retry allowance", async () => {
  const f = await fixture(), historical = await f.execute();

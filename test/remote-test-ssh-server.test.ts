@@ -44,7 +44,8 @@ test("status returns only matching private durable evidence, never executes, and
  const f = await fixture(); expect(await serveSshRequest(f.frame("status", ""), f.config, { execute: f.execute })).toEqual({ version: 2, receipt: null });
  const store = join(f.jobsRoot, ".artifacts"), dir = join(store, id); await mkdir(store, { mode: 0o700 }); await mkdir(dir, { mode: 0o700 });
  const path = join(dir, "receipt.json"); await writeFile(path, JSON.stringify(f.receipt), { mode: 0o600 });
- expect(await serveSshRequest(f.frame("status", ""), f.config, { execute: f.execute })).toEqual({ version: 2, receipt: f.receipt });
+ expect(await serveSshResponse(f.frame("status", ""), f.config, { execute: f.execute })).toEqual({ version: 2, receipt: f.receipt, state: "revoked" });
+ expect(await serveSshResponse(f.frame("status", "", { version: 1 }), f.config)).toEqual({ version: 1, receipt: null });
  await writeFile(path, JSON.stringify({ ...f.receipt, identity: { ...f.job, generation: 2 } }));
  await expect(serveSshRequest(f.frame("status", ""), f.config, { execute: f.execute })).rejects.toThrow();
  await rm(store, { recursive: true }); await symlink(f.root, store);
