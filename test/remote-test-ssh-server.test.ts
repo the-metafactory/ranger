@@ -88,7 +88,7 @@ test("legacy passed artifacts cannot bypass a newer generation's durable fence",
   await writeFile(join(dir, "receipt.json"), JSON.stringify(f.receipt), { mode: 0o600 });
   const response = await serveSshResponse(f.frame("status", ""), f.config);
   expect(response).toEqual({ version: 2, state: "revoked", receipt: f.receipt });
-  const failed = { ...f.receipt, status: "test_failed", exitCode: 1 };
+  const failed = { ...f.receipt, status: "test_failed" as const, exitCode: 1 };
   await writeFile(join(dir, "receipt.json"), JSON.stringify(failed), { mode: 0o600 });
   expect(await serveSshResponse(f.frame("status", ""), f.config)).toEqual({ version: 2, receipt: failed });
  } finally { ledger.close(); }

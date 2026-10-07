@@ -97,6 +97,27 @@ test("validated pre-ledger receipts upgrade without execution or a global recove
  const ledger = await openJobLedger(f.config.jobsRoot, f.config.executorId);
  try { expect(ledger.admit({ ...f.job, jobId: "7c7e8091-1234-4234-8234-123456789abc", correlationId: "7c7e8091-1234-4234-8234-123456789abc" }).kind).toBe("admitted"); } finally { ledger.close(); }
 });
+test("an interrupted publication never adopts loose passed evidence and terminates after the retry allowance", async () => {
+ const f = await fixture(), historical = await f.execute();
+ const artifact = join(f.config.jobsRoot, ".artifacts", id, "receipt.json");
+ // Model the durable boundary: artifact bytes exist, but the attempt never
+ // committed a terminal ledger receipt before process death.
+ await rm(join(f.config.jobsRoot, ".execution"), { recursive: true });
+ const ledger = await openJobLedger(f.config.jobsRoot, f.config.executorId);
+ try {
+  ledger.admit(f.job);
+  const launcher: ExecutorLauncher = async () => ({ code: 0, stdout: "" });
+  await reconcileRemoteTests(f.config, { launcher });
+  const count = f.calls.length;
+  await expect(f.execute()).rejects.toThrow("receipt already exists");
+  expect(ledger.status(f.job)).toEqual({ kind: "interrupted", attempt: 2 });
+  expect(() => ledger.admit(f.job)).toThrow("recovery fence");
+  await reconcileRemoteTests(f.config, { launcher });
+  const final = await f.execute(); expect(final.status).toBe("infra_failed");
+  expect(f.calls.length).toBe(count);
+  expect(JSON.parse(await readFile(artifact, "utf8"))).toEqual(historical);
+ } finally { ledger.close(); }
+});
 test("durable cancellation before start and during artifact publication never exposes success", async () => {
  for (const duringStorage of [false, true]) {
   const f = await fixture(), ledger = await openJobLedger(f.config.jobsRoot, f.config.executorId);
