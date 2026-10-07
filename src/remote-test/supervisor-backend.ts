@@ -139,7 +139,9 @@ export function createSshTestBackend(selection: SshSelection, options: SshOption
    if (outcome.status !== "terminal") return failed(outcome.status === "revoked" ? "revoked" : outcome.reason);
    const job = selectSshJob(config, await readPrivateJson(jobPath));
    const receipt = validateRemoteTestReceipt(outcome.receipt, job);
-   return { result: { code: receipt.status === "passed" ? 0 : 1, stdout: `Remote supervisor tests: ${receipt.status}.`, stderr: receipt.status === "passed" ? "" : `Remote supervisor tests: ${receipt.status}; no local fallback.` }, evidence: { job, receipt, path, validUntil: Math.min(job.deadline, receipt.completedAt + config.receiptMaxAgeMs) } };
+   // The submission deadline bounds execution, not retrieval. The contract
+   // already refuses a passed receipt completed after that deadline.
+   return { result: { code: receipt.status === "passed" ? 0 : 1, stdout: `Remote supervisor tests: ${receipt.status}.`, stderr: receipt.status === "passed" ? "" : `Remote supervisor tests: ${receipt.status}; no local fallback.` }, evidence: { job, receipt, path, validUntil: receipt.completedAt + config.receiptMaxAgeMs } };
   } catch { return failed("private_state_or_submission"); }
  } };
 }

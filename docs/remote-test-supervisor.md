@@ -47,11 +47,11 @@ supervisor. An unsuccessful remote adoption stops before spawning another coding
 session. Local execution retains its existing adoption and retry behavior.
 
 The graphical `commands.probe` tier, capture/view commands and merge-base probe
-comparison retain their separate local authority and dependency installs. SSH
-opt-in does not certify those checks or move coding/review sessions. Opting a map
-into remote tests may leave its worktree without installed dependencies; the
-operator must provide the local dependencies its separate graphical tier needs.
-No graphical result is inferred from an ARM64 receipt.
+comparison retain their separate local authority. The merge-base comparison
+keeps its existing local dependency install. SSH opt-in does not certify those
+checks or move coding/review sessions. The opted-in worktree has no automatic
+dependency install; the operator must provide the local dependencies its separate
+graphical tier needs. No graphical result is inferred from an ARM64 receipt.
 
 Only a validated terminal receipt pointer and status reach the internal journal;
 raw remote output, endpoint configuration and credentials do not. Before push,

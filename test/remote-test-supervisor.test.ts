@@ -72,8 +72,22 @@ test("mismatched stale wrong-producer and failed receipts never satisfy supervis
   const f = await fixture(), ssh = runner(change);
   const result = await runTestBackend(createSshTestBackend(f.selection, { runner: ssh.run }), f.request, noLocal);
   expect(result.result.code).not.toBe(0); expect(ssh.operations).toEqual(["submit"]);
-  if (result.evidence) expect(result.evidence.receipt.status).toBe("test_failed");
+  if (changes.indexOf(change) < 3) expect(result.evidence).toBeUndefined();
+  else expect(result.evidence?.receipt.status).toBe("test_failed");
  }
+});
+test("resume after submission deadline accepts a timely still-fresh saved receipt via status only", async () => {
+ const f = await fixture(), completedAt = Date.now() - 2_000;
+ let clock = completedAt;
+ f.selection.deadlineSeconds = 1;
+ const ssh = runner(r => ({ ...r, completedAt }));
+ const backend = createSshTestBackend(f.selection, { runner: ssh.run, now: () => clock });
+ const first = await runTestBackend(backend, f.request, noLocal);
+ expect(first.result.code).toBe(0);
+ expect(first.evidence!.job.deadline).toBeLessThan(Date.now());
+ clock += 2_000;
+ expect((await runTestBackend(backend, f.request, noLocal)).result.code).toBe(0);
+ expect(ssh.operations).toEqual(["submit", "status"]);
 });
 test("unsupported platform and unapproved profiles fail before SSH", async () => {
  for (const kind of ["platform", "profile"] as const) {
