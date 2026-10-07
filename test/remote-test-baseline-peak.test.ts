@@ -20,7 +20,7 @@ async function fixture(options: {
  peak?: string; readError?: "EACCES" | "EIO" | "ENOENT"; listingError?: boolean;
  failure?: "test" | "oom" | "timeout" | "sidecar" | "cleanup";
  missing?: string; controller?: string; ancestorHeadroom?: number;
- rootPeak?: string; postFailure?: "health" | "capacity";
+ rootPeak?: string; postFailure?: "health" | "capacity"; similarPeakName?: boolean;
 } = {}) {
  const dir = await mkdtemp(join(tmpdir(), "ranger-baseline-peak-"));
  const ancestor = join(dir, "ancestor"), root = join(ancestor, "delegated"), cg = join(root, "ranger-baseline"), marker = join(dir, "ran");
@@ -58,6 +58,7 @@ async function fixture(options: {
     `printf 'usage_usec 1250000\\n' > "$cg/cpu.stat"`,
     `touch "$cg/cgroup.kill"`,
     options.peak === undefined ? "true" : `printf '%s' ${shellQuote(options.peak)} > "$cg/memory.peak"`,
+    options.similarPeakName ? `touch "$cg/memoryXpeak"` : "true",
     // A directory simulates an interface the kernel cannot write, unlike an
     // ordinary absent fixture file that shell redirection would create.
     options.missing ? `mkdir "$cg/${options.missing}"` : "true",
@@ -114,6 +115,15 @@ test("root peak does not imply child peak availability", async () => {
  try {
   const r = await runBaseline(f.config, { run: true, metrics: f.metrics });
   expect(r.exitCode).toBe(0); expect(r.report.workload).toMatchObject({ status: "ok", value: { peakMemoryBytes: null, peakMemoryState: "unavailable" } });
+ } finally { await f.dispose(); }
+});
+
+test("interface probe compares the literal memory.peak filename", async () => {
+ const f = await fixture({ similarPeakName: true });
+ try {
+  const r = await runBaseline(f.config, { run: true, metrics: f.metrics });
+  expect(r.exitCode).toBe(0);
+  expect(r.report.workload).toMatchObject({ status: "ok", value: { peakMemoryBytes: null, peakMemoryState: "unavailable" } });
  } finally { await f.dispose(); }
 });
 

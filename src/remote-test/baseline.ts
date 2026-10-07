@@ -21,12 +21,15 @@ export type BaselineConfig = z.infer<typeof ConfigSchema>;
 export function validateBaselineConfig(input: unknown): BaselineConfig { return ConfigSchema.parse(input); }
 export const BASELINE_LIMITS = { cpuCores: 2, memoryBytes: 1610612736, jobs: 1 } as const;
 export type Measurement<T> = { status: "ok"; value: T } | { status: "failed" | "unavailable"; reason: string };
-export interface WorkloadMetrics { cpuSeconds: number; peakMemoryBytes: number | null; peakMemoryState: "observed" | "unavailable"; durationSeconds: number; exitCode: number }
-const WorkloadSchema = z.object({
- cpuSeconds: z.number().finite().nonnegative(), peakMemoryBytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
- peakMemoryState: z.enum(["observed", "unavailable"]),
+const CommonWorkloadSchema = z.object({
+ cpuSeconds: z.number().finite().nonnegative(),
  durationSeconds: z.number().finite().nonnegative(), exitCode: z.number().int().min(0).max(255),
-}).strict().refine(m => m.peakMemoryState === "observed" ? m.peakMemoryBytes !== null : m.peakMemoryBytes === null, { message: "Peak state and value disagree" });
+}).strict();
+const WorkloadSchema = z.discriminatedUnion("peakMemoryState", [
+ CommonWorkloadSchema.extend({ peakMemoryState: z.literal("observed"), peakMemoryBytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER) }),
+ CommonWorkloadSchema.extend({ peakMemoryState: z.literal("unavailable"), peakMemoryBytes: z.null() }),
+]);
+export type WorkloadMetrics = z.infer<typeof WorkloadSchema>;
 export interface BaselineMetrics {
  platform(): Promise<string>;
  runtime(config: BaselineConfig): Promise<string>;
@@ -136,7 +139,7 @@ trap 'exit 124' HUP INT TERM
 # including disappearance of a listed peak file, fails the measurement.
 interfaces=$(LC_ALL=C ls -1a -- "$cg")
 peak_state=unavailable
-if printf '%s\\n' "$interfaces" | grep -qx 'memory.peak'; then peak_state=observed; test -r "$cg/memory.peak"; fi
+if printf '%s\\n' "$interfaces" | grep -qxF 'memory.peak'; then peak_state=observed; test -r "$cg/memory.peak"; fi
 test -w "$cg/cgroup.kill"
 printf '${BASELINE_LIMITS.memoryBytes}\\n' > "$cg/memory.max"
 printf '0\\n' > "$cg/memory.swap.max"
