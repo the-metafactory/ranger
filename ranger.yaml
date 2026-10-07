@@ -160,6 +160,19 @@ maps:
     discord:
       tokenEnv: RANGER_DISCORD_TOKEN
       channelId: "1505550997764833444"
+  # Build-brief rules by construction (principal, 2026-10-06): moved soma#742
+  # onto a map; the build node waits on the kind-interpretation grilling.
+  - repo: the-metafactory/soma
+    root: 751
+    walk: full
+    autoMerge: false
+    localCheckout: ~/work/mf/soma
+    commands:
+      install: bun install --frozen-lockfile
+      test: bun test && bun run typecheck
+    discord:
+      tokenEnv: RANGER_DISCORD_TOKEN
+      channelId: "1505550997764833444"
 
 # Read-only token gate (node #8 ruling). Only env var NAMES live here — never
 # tokens. Prefixes match longest-first against map.repo. Scout refuses to run a
