@@ -140,6 +140,16 @@ test("neutral bootstrap does not load job Bun preloads or .env before controller
  const wrapper = await runCmd(process.execPath, [...CONTAINER_BOOTSTRAP_FLAGS, "-e", containerProgram([[process.execPath, "-e", "process.exit(0)"]]).replace('"/sys/fs/cgroup/"', JSON.stringify(join(root, "missing") + "/"))], { cwd: neutral });
  expect(JSON.parse(wrapper.stdout).status).toBe("infra_failed"); expect(await readFile(marker, "utf8").catch(() => null)).toBeNull();
 });
+test("deadline rounding never disables the independent conmon timeout", async () => {
+ const f = await fixture(); const base = Date.now(); f.job.deadline = base + 600_000;
+ let staged = false, ticks = 0;
+ const launcher: ExecutorLauncher = async (argv, options) => {
+  const result = await f.launcher(argv, options); if (argv[1] === "image") staged = true; return result;
+ };
+ await f.execute({ launcher, now: () => staged ? base + 599_000 + ticks++ : base });
+ const create = f.calls.find(c => c[1] === "create")!; expect(create).toBeDefined();
+ expect(Number(create.find(a => a.startsWith("--timeout="))!.split("=")[1])).toBeGreaterThan(0);
+});
 test("does not overwrite an occupied lane or falsely pass failed teardown", async () => {
  const f = await fixture(); await mkdir(join(f.config.jobsRoot, ".executor-lane")); expect((await f.execute()).status).toBe("rejected"); expect(f.calls).toHaveLength(0);
  await rm(join(f.config.jobsRoot, ".executor-lane"), { recursive: true }); f.cleanupFail(); expect((await f.execute()).status).toBe("infra_failed");

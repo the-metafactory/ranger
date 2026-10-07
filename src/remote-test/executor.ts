@@ -125,10 +125,10 @@ export async function executeRemoteTest(
   try {
    if (!(await lock.stat()).isFile() || `sha256:${createHash("sha256").update(await lock.readFile()).digest("hex")}` !== job.lockDigest) throw new Error("Lock identity mismatch");
   } finally { await lock.close(); }
-  if (end - now() < 1000) interrupt("timed_out");
+  const runtimeSeconds = Math.floor((end - now()) / 1000);
+  if (runtimeSeconds < 1) interrupt("timed_out");
   if (controller.signal.aborted) throw new Error("Interrupted before launch");
   launchAttempted = true;
-  const runtimeSeconds = Math.floor((end - now()) / 1000);
   const id = (await command(["create", "--cidfile", cidfile, `--name=ranger-test-${randomUUID()}`, "--pull=never",
    "--network=none", "--pid=private", "--ipc=private", "--uts=private", "--cgroupns=private", "--cgroups=enabled",
    `--cpus=${EXECUTOR_LIMITS.cpuCores}`, `--memory=${EXECUTOR_LIMITS.memoryBytes}`, `--memory-swap=${EXECUTOR_LIMITS.memoryBytes}`, `--pids-limit=${EXECUTOR_LIMITS.pids}`,
