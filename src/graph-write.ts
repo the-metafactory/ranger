@@ -1,6 +1,7 @@
 import { somaRepo } from "./graph.ts";
 import { runCmd, type RunOptions } from "./exec.ts";
 import { writeEnv } from "./identity.ts";
+import { parseForgeRef, normalizeNodeId, type ForgeRef } from "./forge-ref.ts";
 
 /**
  * The graph-MUTATING `soma graph` surface, reachable only from walker
@@ -12,6 +13,17 @@ import { writeEnv } from "./identity.ts";
 
 export class GraphWriteError extends Error {
  override readonly name = "GraphWriteError";
+}
+
+function writeNodeId(ref: ForgeRef, value: unknown): string {
+ try {
+  if (typeof value !== "string") throw new Error(`missing or non-string node id for ${somaRepo(ref)}`);
+  return normalizeNodeId(ref, value);
+ } catch (error) { throw new GraphWriteError((error as Error).message); }
+}
+
+function withNode<T extends { node: string }>(ref: ForgeRef, result: T): T {
+ return { ...result, node: writeNodeId(ref, result.node) };
 }
 
 export interface ClaimResult {
@@ -77,17 +89,20 @@ export async function graphClaim(
  token: string,
  opts: RunOptions = {},
 ): Promise<ClaimResult> {
- const args = ["graph", "claim", id, "--identity", identity, "--repo", somaRepo(repo), "--json"];
+ const ref = parseForgeRef(repo);
+ id = writeNodeId(ref, id);
+ const args = ["graph", "claim", id, "--identity", identity, "--repo", somaRepo(ref), "--json"];
  const result = await callWrite(args, token, opts);
  const payload = parsePayload(result, "claim");
  if (result.code === 0) {
-  return payload as unknown as ClaimResult;
+  const parsed = payload as unknown as ClaimResult;
+  return withNode(ref, parsed);
  }
  // Exit 1 = race lost (SomaCliError with JSON payload). Anything else is a real
  // failure worth surfacing.
  const parsed = payload as unknown as ClaimResult;
  if (result.code === 1 && typeof parsed.held === "boolean") {
-  return parsed;
+  return withNode(ref, parsed);
  }
  throw new GraphWriteError(
   `soma graph claim ${id} (${repo}) failed (exit ${result.code}): ${(result.stderr || result.stdout).trim()}`,
@@ -102,14 +117,17 @@ export async function graphRelease(
  token: string,
  opts: RunOptions = {},
 ): Promise<ReleaseResult> {
- const args = ["graph", "release", id, "--identity", identity, "--repo", somaRepo(repo), "--json"];
+ const ref = parseForgeRef(repo);
+ id = writeNodeId(ref, id);
+ const args = ["graph", "release", id, "--identity", identity, "--repo", somaRepo(ref), "--json"];
  const result = await callWrite(args, token, opts);
  if (result.code !== 0) {
   throw new GraphWriteError(
    `soma graph release ${id} (${repo}) failed (exit ${result.code}): ${(result.stderr || result.stdout).trim()}`,
   );
  }
- return parsePayload(result, "release") as unknown as ReleaseResult;
+ const parsed = parsePayload(result, "release") as unknown as ReleaseResult;
+ return withNode(ref, parsed);
 }
 
 export interface CloseOptions {
@@ -138,11 +156,13 @@ export async function graphClose(
  options: CloseOptions,
  opts: RunOptions = {},
 ): Promise<CloseResult> {
+ const ref = parseForgeRef(repo);
+ id = writeNodeId(ref, id);
  const args = [
   "graph", "close", id,
   "--resolution-file", options.resolutionFile,
   "--identity", identity,
-  "--repo", somaRepo(repo),
+  "--repo", somaRepo(ref),
  ];
  if (options.gist !== undefined) args.push("--gist", options.gist);
  if (options.checkpointId !== undefined) args.push("--checkpoint", options.checkpointId);
@@ -166,7 +186,9 @@ export async function graphDecisions(
  token: string,
  opts: RunOptions = {},
 ): Promise<DecisionsResult> {
- const args = ["graph", "decisions", root, "--write", "--repo", somaRepo(repo)];
+ const ref = parseForgeRef(repo);
+ root = writeNodeId(ref, root);
+ const args = ["graph", "decisions", root, "--write", "--repo", somaRepo(ref)];
  const result = await callWrite(args, token, opts);
  const detail = (result.stdout || result.stderr).trim();
  if (result.code !== 0) {
@@ -183,7 +205,9 @@ function parsePayload(
 ): Record<string, unknown> {
  const raw = (result.code === 0 ? result.stdout : result.stderr).trim();
  try {
-  return JSON.parse(raw) as Record<string, unknown>;
+  const payload: unknown = JSON.parse(raw);
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) throw new Error("not an object");
+  return payload as Record<string, unknown>;
  } catch {
   throw new GraphWriteError(
    `unparseable JSON from soma graph ${label} (exit ${result.code}): ${raw || "(empty)"}`,

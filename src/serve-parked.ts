@@ -1,3 +1,4 @@
+import { isGithubRepo, nodeKey } from "./forge-ref.ts";
 /**
  * `ranger serve`'s "Needs you" section (node #54): every journal worker row
  * that ended parked or failed, and every awaiting-merge row labelled
@@ -429,7 +430,7 @@ export function uncheckedNeedsEye(inputs: Pick<NeedsYouInputs, "maps" | "workers
     inputs.maps.some((m) => m.repo === row.repo && m.root === row.root) &&
     inputs.labels(row.repo, row.nodeId) === null,
   )
-  .map((row) => `${row.repo}#${row.nodeId}`);
+  .map((row) => nodeKey(row.repo, row.nodeId));
 }
 
 // ---- the actions ----
@@ -474,6 +475,7 @@ export function mergeEnv(env: Record<string, string | undefined>): Record<string
 /** `gh pr merge`, squash, pinned to the head the principal confirmed. */
 export function mergeArgv(args: { repo: string; pr: number; sha: string }): string[] {
  if (!REPO_PATTERN.test(args.repo)) throw new Error(`bad repo: ${args.repo}`);
+ if (!isGithubRepo(args.repo)) throw new Error(`GitLab merge is not implemented: ${args.repo}`);
  if (!Number.isInteger(args.pr) || args.pr <= 0) throw new Error(`bad PR: ${args.pr}`);
  if (!SHA_PATTERN.test(args.sha)) throw new Error(`bad head SHA: ${args.sha}`);
  return ["gh", "pr", "merge", String(args.pr), "--repo", args.repo, "--squash", "--match-head-commit", args.sha];
@@ -496,7 +498,7 @@ export function resumeArgv(args: {
   "resume-node",
   args.nodeId,
   "--map",
-  `${args.repo}#${args.root}`,
+  nodeKey(args.repo, args.root),
   "-c",
   args.configPath,
   ...(args.force ? ["--force"] : []),
@@ -589,7 +591,7 @@ export async function runAction(
  if (entry === undefined) {
   return refusal(404, `#${body.id} is not parked, failed or awaiting a needs-eye merge on ${body.key}`);
  }
- const held = `${entry.repo}#${entry.nodeId}`;
+ const held = nodeKey(entry.repo, entry.nodeId);
  if (deps.inFlight.has(held)) return refusal(409, `an action on #${entry.nodeId} is already running: wait for it, then reload`);
  deps.inFlight.add(held);
  let exited: Promise<void> | undefined;

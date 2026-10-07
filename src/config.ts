@@ -5,6 +5,8 @@ import { defaultJournalPath, journalPathOverride } from "./journal-guard.ts";
 import { resolve } from "node:path";
 import { parse } from "yaml";
 import { z } from "zod";
+import { parseForgeRef, repoIdentity } from "./forge-ref.ts";
+export { REPO_PATTERN } from "./forge-ref.ts";
 
 /**
  * ranger.yaml — per-run ranger configuration.
@@ -34,12 +36,23 @@ const DiscordSchema = z.object({
  channelId: z.string().regex(/^\d+$/, "channelId must be a Discord snowflake"),
 });
 
-/** `owner/name`: the one pattern config validation and `ranger serve`'s launch check share. */
-export const REPO_PATTERN = /^[\w.-]+\/[\w.-]+$/;
+/** Keep bare GitHub arguments and qualified GitLab strings alongside their typed identity. */
+const ValidRepoString = z.string().superRefine((repo, ctx) => {
+ try {
+  parseForgeRef(repo);
+ }
+ catch (error) {
+  ctx.addIssue({ code: z.ZodIssueCode.custom, message: (error as Error).message });
+ }
+});
+const RepoSchema = ValidRepoString.transform(repo => {
+ const forgeRef = parseForgeRef(repo);
+ return { repo: repoIdentity(forgeRef), forgeRef };
+});
 
 const MapSchema = z.object({
- /** `owner/name` — the repo whose issues hold the work graph. */
- repo: z.string().regex(REPO_PATTERN, "repo must be owner/name"),
+ /** Bare GitHub or forge-qualified ref — the repo whose issues hold the work graph. */
+ repo: RepoSchema,
  /** Root node id of the orienteer map (the `orienteer:map` issue). */
  root: z
   .union([z.number().int().positive(), z.string().regex(/^\d+$/)])
@@ -129,19 +142,19 @@ const MapSchema = z.object({
   * `servedMaps` and the dashboard says why. Unset means no session.
   */
  localCheckout: z.string().optional(),
-});
+}).transform(({ repo, ...map }) => ({ ...map, ...repo }));
 
 /**
  * A map `ranger serve` shows and nothing else reads (#37): no walk, no scout
  * report, no escalation cards. Roots that ranger walks belong in `maps`, not here.
  */
 const ServeMapSchema = z.object({
- repo: z.string().regex(REPO_PATTERN, "repo must be owner/name"),
+ repo: RepoSchema,
  root: z
   .union([z.number().int().positive(), z.string().regex(/^\d+$/)])
   .transform(Number),
  localCheckout: z.string().optional(),
-});
+}).transform(({ repo, ...map }) => ({ ...map, ...repo }));
 
 /** `ranger serve` (#37): the local dashboard. */
 const ServeSchema = z.object({
@@ -195,7 +208,8 @@ const PrincipalSchema = z.object({
 
 const StateSchema = z.object({
  /** Migration-only: original roots for ambiguous or deregistered legacy repos; remove after cutover. */
- legacyMapRoots: z.record(z.string().regex(REPO_PATTERN), z.number().int().positive()).default({}),
+ legacyMapRoots: z.record(ValidRepoString.transform(repo => repoIdentity(parseForgeRef(repo))),
+  z.number().int().positive()).default({}),
  /**
   * SQLite journal path (design §8): the live ~/.config/ranger/state.sqlite,
   * except under test, where an unset path is a fresh temp file (node #66).

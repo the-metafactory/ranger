@@ -1,5 +1,6 @@
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import type { Journal, WorkerRow } from "./journal.ts";
+import { nodeKey } from "./forge-ref.ts";
 import { implementLane, IMPLEMENT_LANES, type ImplementLane, type LaneMap } from "./lanes.ts";
 
 export const LAST_IMPLEMENT_MAP = "implement.lastMap";
@@ -14,7 +15,7 @@ export function recordImplementStart(journal: Journal, map: LaneMap): void {
  journal.setHealth(`${LAST_IMPLEMENT_MAP}.${implementLane(map)}`, mapKey(map));
 }
 export function mapKey(map: { repo: string; root: number }): string {
- return `${map.repo}#${map.root}`;
+ return nodeKey(map.repo, map.root);
 }
 
 /** The refusal `resume-node` and `build-now` (node #58) give while a lane is held. */

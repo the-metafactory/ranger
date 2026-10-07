@@ -1,5 +1,6 @@
 import { runReadRetryingTransient } from "./transient.ts";
 import { gatedEnv, type ResolvedToken } from "./token-gate.ts";
+import { parseForgeRef, qualifiedRepo, normalizeNodeId, type ForgeRef } from "./forge-ref.ts";
 
 /**
  * The read-only `soma graph` surface. Scout never calls any other verb —
@@ -28,12 +29,11 @@ export class RateLimitError extends GraphError {
  * The forge-qualified repo `soma graph --repo` needs. Soma resolves a bare
  * `owner/name` only from a checkout with an origin remote, and launchd runs
  * ranger from `/` — every scheduled tick from 2026-09-25 failed on it. Ranger
- * keeps `map.repo` bare (token prefixes, `gh api repos/…`, journal keys) and
- * qualifies at the soma boundary only. A value already carrying a forge
- * (`github:…`) passes through.
+ * keeps GitHub `map.repo` bare (token prefixes, `gh api repos/…`, journal
+ * keys). GitLab refs retain their forge and host at every boundary.
  */
-export function somaRepo(repo: string): string {
-  return repo.includes(":") ? repo : `github:github.com/${repo}`;
+export function somaRepo(repo: string | ForgeRef): string {
+  return qualifiedRepo(typeof repo === "string" ? parseForgeRef(repo) : repo);
 }
 
 const RATE_LIMITED = /rate limit/i;
@@ -145,7 +145,7 @@ async function callGraph(
     const cliArgs = [
       "graph",
       verb,
-      String(root),
+      graphNodeId(parseForgeRef(repo), String(root)),
       "--repo",
       somaRepo(repo),
       "--json",
@@ -187,7 +187,7 @@ export async function graphFrontier(
       result.stderr,
     );
   }
-  return parseJson<FrontierResult>("frontier", result.stdout);
+  return normalizeFrontier(repo, parseJson<FrontierResult>("frontier", result.stdout));
 }
 
 export async function graphAudit(
@@ -209,7 +209,7 @@ export async function graphAudit(
       result.stderr,
     );
   }
-  return parseJson<AuditResult>("audit", result.stdout);
+  return normalizeAudit(repo, parseJson<AuditResult>("audit", result.stdout));
 }
 
 export async function graphNode(
@@ -225,5 +225,51 @@ export async function graphNode(
       result.stderr,
     );
   }
-  return parseJson<NodeResult>("node", result.stdout);
+  return normalizeGraphNode(repo, parseJson<NodeResult>("node", result.stdout));
+}
+
+/** Normalize every graph id before it reaches routing, journal or commands. */
+export function normalizeGraphNode<T extends NodeResult | FrontierEntry>(repo: string, node: T): T {
+  const ref = parseForgeRef(repo);
+  const id = (value: string) => graphNodeId(ref, value);
+  // A foreign dependency is not a local actionable node. Preserve its located
+  // identity so routing can still see the blocker without truncating it.
+  const relationId = (value: string) => {
+    const hash = value.lastIndexOf("#");
+    if (hash >= 0 && value.slice(0, hash) !== ref.path) return value;
+    return id(value);
+  };
+  try {
+    return {
+      ...node,
+      ref: { ...node.ref, id: id(node.ref.id) },
+      node: { ...node.node, id: id(node.node.id) },
+      blockedBy: node.blockedBy.map(n => ({ ...n, id: relationId(n.id) })),
+      ...(node.parent === undefined ? {} : { parent: { ...node.parent, id: relationId(node.parent.id) } }),
+    };
+  } catch (error) { throw new GraphError((error as Error).message); }
+}
+
+export function normalizeFrontier(repo: string, result: FrontierResult): FrontierResult {
+  return {
+    ...result,
+    root: graphNodeId(parseForgeRef(repo), result.root),
+    frontier: result.frontier.map(node => normalizeGraphNode(repo, node)),
+  };
+}
+
+export function normalizeAudit(repo: string, result: AuditResult): AuditResult {
+  const ref = parseForgeRef(repo);
+  const id = (value: string) => graphNodeId(ref, value);
+  return {
+    ...result, root: id(result.root),
+    closedWithoutReceipt: result.closedWithoutReceipt.map(id),
+    openWithoutCheckpoint: result.openWithoutCheckpoint.map(id),
+    openClaimed: result.openClaimed.map(n => ({ ...n, id: id(n.id) })),
+  };
+}
+
+function graphNodeId(ref: ForgeRef, value: string): string {
+  try { return normalizeNodeId(ref, value); }
+  catch (error) { throw new GraphError((error as Error).message); }
 }

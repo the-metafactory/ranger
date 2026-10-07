@@ -1,4 +1,5 @@
 import { mapKey } from "./maps.ts";
+import { readRefusal } from "./forge-ref.ts";
 import { join } from "node:path";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import type { EscalationDiscord } from "./discord.ts";
@@ -74,6 +75,9 @@ async function escalateOneMap(
     cardErrors: [],
     cards: [],
   };
+
+  const refusal = readRefusal(map.repo);
+  if (refusal !== null) return { ...base, ok: false, error: refusal };
 
   // Pre-map deadline gate: if the tick-wide pass deadline has already passed
   // (a prior map consumed it), skip this map's graph calls entirely — its
@@ -236,6 +240,9 @@ async function digestOneMap(
     posted: false,
     action: "unchanged" as const,
   };
+
+  const refusal = readRefusal(map.repo);
+  if (refusal !== null) return { ...base, ok: false, error: refusal };
 
   // The digest is one logical op per map, but it must still not hold the
   // tick past a bound under rate-limiting — a generous per-digest deadline

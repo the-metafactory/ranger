@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import { executionRefusal } from "./forge-ref.ts";
 import { budgetPolicy } from "./budget.ts";
 import { ClaimLockBusy, withClaimLock } from "./claim-lock.ts";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
@@ -110,6 +111,8 @@ function notWalkable(node: ClassifiedNode): string | null {
 }
 
 export async function buildNow(nodeId: string, ctx: BuildNowContext): Promise<BuildNowResult> {
+ const refusal = executionRefusal(ctx.map.repo);
+ if (refusal !== null) throw new BuildNowRefusal(refusal);
  try {
   return await withClaimLock(ctx.journal, (owned) => buildUnderLock(nodeId, ctx, owned), ctx.lockWaitMs ?? BUILD_NOW_LOCK_WAIT_MS);
  } catch (error) {

@@ -7,6 +7,7 @@ import { Journal } from "../src/journal.ts";
 import type { WorkerRow } from "../src/journal.ts";
 import { classify, loadProbeRegistry } from "../src/route.ts";
 import type { RangerConfig } from "../src/config.ts";
+import { encodeForgeRef, parseForgeRef } from "../src/forge-ref.ts";
 import {
  assertReadOnlyTokens,
  assembleState,
@@ -721,6 +722,37 @@ describe("#37 — a registered map is shown from ranger's own cache, with no Git
   expect(map.ok).toBe(false);
   expect(map.error).toMatch(/next tick/);
   rmSync(dir, { recursive: true });
+ });
+
+ test("title refresh discards malformed keys and continues with valid titles", async () => {
+  const reads: string[] = [];
+  const reader = new ServeReader(cfg("/nonexistent"), [], "/nonexistent", {
+   issue: async (repo, id) => {
+    reads.push(`${repo}#${id}`);
+    return { title: `title ${id}`, labels: [] };
+   },
+   pr: async () => null,
+  });
+  const refresh = async () => {
+   reader.refresh();
+   for (let i = 0; i < 100 && reader.refreshing; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 1));
+   }
+   expect(reader.refreshing).toBe(false);
+   expect(reader.lastError).toBeNull();
+  };
+  const malformed = encodeForgeRef(parseForgeRef(REPO), "<@123>").key;
+  reader.want([malformed, "not-a-repo#12", `${REPO}#50`]);
+  await refresh();
+  expect(reader.titles.get(`${REPO}#50`)).toBe("title 50");
+  expect(reader.titles.has(malformed)).toBe(false);
+  expect(reads).toEqual([`${REPO}#50`]);
+
+  // A second refresh must not encounter the discarded keys again.
+  reader.want([`${REPO}#51`]);
+  await refresh();
+  expect(reader.titles.get(`${REPO}#51`)).toBe("title 51");
+  expect(reads).toEqual([`${REPO}#50`, `${REPO}#51`]);
  });
 });
 

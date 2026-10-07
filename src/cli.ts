@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 import { implementLane, startsImplementSession } from "./lanes.ts";
+import { executionRefusal, isGithubRepo, readRefusal } from "./forge-ref.ts";
 import { laneHeldMessage, recordImplementStart, mapKey, pickMap, resumeMap } from "./maps.ts";
 import { Command } from "commander";
 import { join, resolve } from "node:path";
@@ -92,6 +93,8 @@ async function scoutOneMap(
  };
 
  let token: ResolvedToken;
+ const refusal = readRefusal(map.repo);
+ if (refusal !== null) return { ...base, ok: false, error: refusal };
  try {
   ({ token } = await assertReadOnlyToken(config, map.repo));
  } catch (error) {
@@ -156,6 +159,7 @@ async function runScout(opts: ScoutOptions): Promise<ScoutReport> {
   tokenType: "fine-grained" as "classic" | "fine-grained",
  };
  for (const map of config.maps) {
+  if (!isGithubRepo(map.repo)) continue;
   try {
    const { info } = await assertReadOnlyToken(config, map.repo);
    identity = { login: info.login, tokenType: info.tokenType };
@@ -191,6 +195,8 @@ function loadCtx(configPath: string): {
 
 /** Resolve the write credential + bot identity for a map, gating the principal. */
 async function writeContext(config: RangerConfig, map: RangerMapConfig) {
+ const refusal = executionRefusal(map.repo);
+ if (refusal !== null) throw new WriteGateError(refusal);
  const credential = resolveWriteToken(config, map.repo);
  const botIdentity = await resolveBotIdentity(config, credential.token);
  assertNotPrincipal(config, botIdentity);
