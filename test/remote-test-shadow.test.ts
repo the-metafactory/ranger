@@ -4,7 +4,7 @@ import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCmd } from "../src/exec.ts";
-import { compareShadow, createShadowTestBackend, readShadowCpu, summarizeShadow, writeShadowReport, type ShadowComparison } from "../src/remote-test/shadow.ts";
+import { compareShadow, createShadowTestBackend, readShadowCpu, runShadowMeasured, summarizeShadow, writeShadowReport, type ShadowComparison } from "../src/remote-test/shadow.ts";
 import { ConfigError, loadConfig } from "../src/config.ts";
 import type { RemoteTestJob, RemoteTestReceipt } from "../src/remote-test/contract.ts";
 import type { TestBackend, TestRequest, TestResult } from "../src/remote-test/supervisor-backend.ts";
@@ -128,6 +128,18 @@ test("real timer preserves CPU after unterminated test diagnostics", async () =>
  const raw = await runCmd("/usr/bin/time", ["-p", "/bin/sh", "-c", "printf no-newline >&2; exit 7"], { env: { PATH: process.env.PATH, LC_ALL: "C" } });
  const result = readShadowCpu(raw);
  expect(result.code).toBe(7); expect(result.cpuTimeSeconds).toBeGreaterThanOrEqual(0); expect(result.stderr).toBe("no-newline");
+});
+test("optional CPU timing preserves original local results and environment when unavailable", async () => {
+ const run = (command: string) => runCmd("/bin/sh", ["-c", command], { env: { PATH: process.env.PATH, LC_ALL: "caller-locale", MARKER: "original" } });
+ const command = 'printf "%s:%s" "$LC_ALL" "$MARKER"; exit 7';
+ for (const available of [async () => false, async () => { throw Error("unavailable"); }]) {
+  const result = await runShadowMeasured(command, run, available);
+  expect(result.code).toBe(7); expect(result.stdout).toBe("caller-locale:original"); expect(result.cpuTimeSeconds).toBeUndefined();
+ }
+ const measured = await runShadowMeasured(command, run, async () => true);
+ expect(measured.code).toBe(7); expect(measured.stdout).toBe("caller-locale:original"); expect(measured.cpuTimeSeconds).toBeGreaterThanOrEqual(0);
+ const comma = readShadowCpu({ code: 3, stdout: "", stderr: "diagnosticsreal 1,5\nuser 0,5\nsys 0,1\n" });
+ expect(comma.cpuTimeSeconds).toBeCloseTo(0.6); expect(comma.code).toBe(3); expect(comma.stderr).toBe("diagnostics");
 });
 test("real child CPU timer footer is observed; missing data stays pending without changing exit", async () => {
  const raw=await runCmd("/usr/bin/time",["-p","/bin/sh","-c","exit 7"],{env:{PATH:process.env.PATH,LC_ALL:"C"}});

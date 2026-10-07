@@ -57,8 +57,7 @@ import { workerEnv } from "./worker-env.ts";
 import { tryWorkerLog, workerLogFile } from "./worker-log.ts";
 import { captureViews, redactViewsReason, saveViewsRecord, viewsComment, viewsDirectory, type ViewsDependencies, type ViewsRecord } from "./views.ts";
 import { NEEDS_EYE_LABEL } from "./labels.ts";
-import { createShadowTestBackend, readShadowCpu } from "./remote-test/shadow.ts";
-import { shellQuote } from "./remote-test/baseline.ts";
+import { createShadowTestBackend, runShadowMeasured } from "./remote-test/shadow.ts";
 import { assertTestEvidence, assertTestSource, createSshTestBackend, localTestBackend, runTestBackend, testCorrelationId, type TestBackend, type TestRequest, type TestResult } from "./remote-test/supervisor-backend.ts";
 
 /**
@@ -1431,19 +1430,18 @@ async function runShell(
  command: string,
  cwd: string,
  ctx: ImplementContext,
- opts: { label: string; timeoutMs: number; priority?: "background" | "probe" },
+ opts: { label: string; timeoutMs: number; priority?: "background" | "probe"; measureCpu?: boolean },
 ): Promise<RunResult> {
  const run: ShellRun = ctx.shellRun ?? ((cmd, o) => runCmd("/bin/sh", ["-c", cmd], o));
- const timed = ctx.map.testBackend?.kind === "shadow" && (opts.label.includes("supervisor tests") || opts.label.includes("tests in a fresh checkout"));
- const raw = await run(timed ? `/usr/bin/time -p /bin/sh -c ${shellQuote(command)}` : command, {
+ const execute = (cmd: string) => run(cmd, {
   cwd,
-  env: { ...workerEnv(ctx.config, ctx.map.repo, ctx.sessionJournal), ...(timed ? { LC_ALL: "C" } : {}) },
+  env: workerEnv(ctx.config, ctx.map.repo, ctx.sessionJournal),
   timeoutMs: opts.timeoutMs,
   processGroup: true,
   // Install and tests yield the CPU; the timing-sensitive probes do not.
   ...(opts.priority === "probe" ? {} : { nice: ctx.config.workers.niceness }),
  });
- const result = timed ? readShadowCpu(raw) : raw;
+ const result = ctx.map.testBackend?.kind === "shadow" && opts.measureCpu ? await runShadowMeasured(command, execute) : await execute(command);
  logRun(ctx, `${opts.label} (${command})`, result);
  return result;
 }
@@ -1652,7 +1650,7 @@ async function supervisorTests(
 ): Promise<{ tests: RunResult; retried: boolean }> {
  const { journal, map, node, worktree } = ctx;
  const head = await headSha(worktree);
- let tests = await backendTests(ctx, head, () => runShell(testCommand, worktree, ctx, { label: `${label}: supervisor tests`, timeoutMs: TEST_TIMEOUT_MS }));
+ let tests = await backendTests(ctx, head, () => runShell(testCommand, worktree, ctx, { label: `${label}: supervisor tests`, timeoutMs: TEST_TIMEOUT_MS, measureCpu: true }));
  if (remoteTests(ctx)) return { tests, retried: false };
  if (tests.code === 0) return { tests, retried: false };
  if ((await headSha(worktree)) !== head) {
@@ -1762,7 +1760,7 @@ async function testsInFreshCheckout(ctx: ImplementContext, testCommand: string, 
    const install = await runShell(ctx.map.commands.install, dir, ctx, { label: `${label}: install in a fresh checkout`, timeoutMs: INSTALL_TIMEOUT_MS });
    if (install.code !== 0) return { ...install, stderr: `install for the retry failed\n${install.stderr}` };
   }
-  const tests = await runShell(testCommand, dir, ctx, { label: `${label}: tests in a fresh checkout`, timeoutMs: TEST_TIMEOUT_MS });
+  const tests = await runShell(testCommand, dir, ctx, { label: `${label}: tests in a fresh checkout`, timeoutMs: TEST_TIMEOUT_MS, measureCpu: true });
   // A sanity check on the run, not proof against the commit's own scripts
   // (see supervisorTests): install and the tests should leave the commit's
   // tracked content as committed — no new HEAD, no modified tracked file,

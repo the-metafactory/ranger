@@ -359,6 +359,15 @@ describe("remote supervisor backend integration", () => {
   expect(localCalls).toBe(2); expect(requests).toHaveLength(2);
   expect(reports.map(r=>r.parity)).toEqual(["different","same"]);
  }, 60_000);
+ test("shadow source mutation refuses push through the real supervisor", async () => {
+  const r = await rig({}); cleanup.push(r.dir);
+  remoteBackend(r, { mutate: async request => { writeFileSync(join(request.worktree,"src/feature.ts"),"mutated source"); } });
+  const remote = r.ctx.testBackend!;
+  const selection = { kind: "shadow" as const, configFile: join(r.dir,"private-ssh.json"), stateRoot: r.dir, reportRoot: r.dir, profileId: "fixture", lockFile: "bun.lock", deadlineSeconds: 660 };
+  r.ctx.map.testBackend = selection;
+  r.ctx.testBackend = createShadowTestBackend(selection, { remote, write: async () => {} });
+  expect((await runNode("20", r.ctx)).status).toBe("failed"); expect(r.github.prs.size).toBe(0);
+ }, 60_000);
  test("shadow map refuses an injected SSH-authoritative backend", async () => {
   const r = await rig({}); cleanup.push(r.dir);
   remoteBackend(r);

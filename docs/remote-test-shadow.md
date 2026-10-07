@@ -16,7 +16,8 @@ CI and merge checks still apply.
 Each exclusive 0600 comparison file records the local observation, validated
 remote receipt and exact immutable identity tuple, outcome/coverage parity,
 local and SSH round-trip duration, remote job duration when present, and measured
-local test child CPU from POSIX `time`. Local observations are comparison records,
+local test child CPU from POSIX `time` when available (otherwise pending). The
+test environment is preserved. Local observations are comparison records,
 not authenticated remote receipts. Local required-test skips remain pending unless
 a measurement backend supplies them. SSH queue and transfer duration remain
 pending because the current transport does not expose them. Round-trip duration

@@ -1,10 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, open } from "node:fs/promises";
+import { access, lstat, open } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
 import type { RunResult } from "../exec.ts";
-import { privateOperatorPath } from "./baseline.ts";
+import { privateOperatorPath, shellQuote } from "./baseline.ts";
 import { validateJobIdentity, validateRemoteTestReceipt, type RemoteTestReceipt } from "./contract.ts";
 import { assertTestSource, createSshTestBackend, runTestBackend, type SshSelection, type TestBackend, type TestRequest, type TestResult } from "./supervisor-backend.ts";
 
@@ -137,8 +137,19 @@ export async function writeShadowReport(path: string, report: unknown): Promise<
 /** POSIX time supplies child-process CPU (including descendants), never wall-time
  * estimates or the supervisor process resourceUsage. Missing footer stays pending. */
 export function readShadowCpu(result: RunResult): RunResult {
- const footer = /real[ \t]+([0-9]+(?:\.[0-9]+)?)\nuser[ \t]+([0-9]+(?:\.[0-9]+)?)\nsys[ \t]+([0-9]+(?:\.[0-9]+)?)\s*$/.exec(result.stderr);
+ const footer = /real[ \t]+([0-9]+(?:[.,][0-9]+)?)\nuser[ \t]+([0-9]+(?:[.,][0-9]+)?)\nsys[ \t]+([0-9]+(?:[.,][0-9]+)?)\s*$/.exec(result.stderr);
  if (!footer) return result;
- const cpuTimeSeconds = Number(footer[2]) + Number(footer[3]);
+ const cpuTimeSeconds = Number(footer[2]!.replace(",", ".")) + Number(footer[3]!.replace(",", "."));
  return Number.isFinite(cpuTimeSeconds) ? { ...result, cpuTimeSeconds, stderr: result.stderr.slice(0, footer.index) } : result;
+}
+
+/** Timer absence yields the original command and result. Its locale and child
+ * environment are unchanged; measurement is optional, never a test dependency. */
+export async function runShadowMeasured(command: string, run: (command: string) => Promise<RunResult>, available: () => Promise<boolean> = async () => {
+ try { await access("/usr/bin/time", constants.X_OK); return true; } catch { return false; }
+}): Promise<RunResult> {
+ let timed = false;
+ try { timed = await available(); } catch { /* CPU remains pending. */ }
+ if (!timed) return run(command);
+ return readShadowCpu(await run(`/usr/bin/time -p /bin/sh -c ${shellQuote(command)}`));
 }
