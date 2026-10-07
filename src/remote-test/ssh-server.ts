@@ -45,17 +45,18 @@ export async function serveSshRequest(input: AsyncIterable<Uint8Array>, operator
  const root = await realpath(config.jobsRoot);
  await privateDirectory(root);
  const iterator = input[Symbol.asyncIterator]();
- let header = Buffer.alloc(0), rest = Buffer.alloc(0);
+ const parts: Buffer[] = []; let headerBytes = 0, rest = Buffer.alloc(0);
  for (;;) {
   if (options.signal?.aborted) throw Error("SSH request interrupted");
   const next = await iterator.next(); if (next.done) throw Error("Incomplete SSH header");
   const chunk = Buffer.from(next.value), newline = chunk.indexOf(10);
   const part = newline < 0 ? chunk : chunk.subarray(0, newline);
-  if (header.length + part.length > SSH_LIMITS.headerBytes) throw Error("SSH header exceeds limit");
-  header = Buffer.concat([header, part]);
+  headerBytes += part.length;
+  if (headerBytes > SSH_LIMITS.headerBytes) throw Error("SSH header exceeds limit");
+  parts.push(part);
   if (newline >= 0) { rest = chunk.subarray(newline + 1); break; }
  }
- const request = RequestSchema.parse(JSON.parse(header.toString("utf8")));
+ const request = RequestSchema.parse(JSON.parse(Buffer.concat(parts, headerBytes).toString("utf8")));
  const profileId = (request.job as { profileId?: unknown } | null)?.profileId;
  const selected = config.profiles.find(p => p.profile.profileId === profileId);
  if (!selected) throw Error("Job profile is not operator-approved");

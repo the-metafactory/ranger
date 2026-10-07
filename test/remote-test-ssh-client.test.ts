@@ -41,7 +41,7 @@ test("transport failure never trusts partial stdout or locally reruns tests", as
  const f = fake(undefined, 255);
  expect((await submitSshRemoteTest({ config, job, bundlePath: await bundle() }, { runner: f.runner, now: () => now })).status).toBe("pending"); expect(f.calls).toHaveLength(1);
  const runner: SshRunner = async () => { throw Error("connection secret"); };
- expect(await statusSshRemoteTest({ config, job }, { runner, now: () => job.deadline + 1 })).toEqual({ status: "infra_failed", reason: "transport_lost" });
+ expect(await statusSshRemoteTest({ config, job }, { runner, now: () => job.deadline + 1 })).toEqual({ status: "infra_failed", reason: "no_terminal_receipt" });
 });
 test("malformed, mismatched, stale, wrong-producer and future receipts refuse success and storage", async () => {
  const responses: unknown[] = ["partial JSON", { version: 1, receipt, extra: true }, { version: 1, receipt: { ...receipt, identity: { ...job, generation: 2 } } }, { version: 1, receipt: { ...receipt, executorId: "other" } }, { version: 1, receipt: { ...receipt, completedAt: now - 86_400_001 } }, { version: 1, receipt: { ...receipt, completedAt: now + 1 } }];

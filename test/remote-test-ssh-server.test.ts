@@ -1,12 +1,13 @@
 import { afterEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { chmod, mkdtemp, mkdir, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { serveSshRequest } from "../src/remote-test/ssh-server.ts";
 import { runSshCommand, statusSshCommand, sshOutcomeExitCode } from "../src/remote-test/ssh-cli.ts";
 import { validateRemoteTestReceipt } from "../src/remote-test/contract.ts";
-import type { SshRunner } from "../src/remote-test/ssh-client.ts";
+import { submitSshRemoteTest, statusSshRemoteTest, type SshRunner } from "../src/remote-test/ssh-client.ts";
+import { executeRemoteTest } from "../src/remote-test/executor.ts";
 import { runCmd } from "../src/exec.ts";
 
 const roots: string[] = [];
@@ -83,5 +84,24 @@ test("run command stages unpushed clean HEAD and saves private job before transp
 test("CLI run and status expose truthful nonzero exit codes without leaking private input errors", async () => {
  const result = await runCmd("bun", ["src/cli.ts", "remote-test", "status", "--config", "/absent/private/config", "--job", "/absent/private/job", "--output", "/absent/private/receipt"]);
  expect(result.code).toBe(1); expect(result.stderr).toContain("private input"); expect(result.stderr).not.toContain("/absent/private");
- expect(sshOutcomeExitCode({ status: "pending", reason: "transport_lost" })).toBe(1);
+ expect(sshOutcomeExitCode({ status: "pending", reason: "no_terminal_receipt" })).toBe(1);
+});
+test("client wire roundtrip through receiver and real durable executor storage is retrievable without reexecution", async () => {
+ const f = await fixture(), bundlePath = join(f.root, "source.bundle"); await writeFile(bundlePath, "bundle");
+ const clientConfig = { target: "fixture", remoteCli: "/reviewed/ranger", remoteConfig: "/private/config.json", executorId: "fixture", profiles: [f.profile] };
+ let executions = 0;
+ const runner: SshRunner = async invocation => {
+  const response = await serveSshRequest(invocation.input, f.config, { execute: async (input, options) => {
+   executions++;
+   // A real executor operational refusal still persists a terminal receipt.
+   // No container or host provisioning is needed to couple the storage seam.
+   return executeRemoteTest(input, { ...options, uid: 1000, gid: 1000, launcher: async () => ({ code: 0, stdout: JSON.stringify({ host: { os: "linux", arch: "x86_64" } }) }) });
+  } });
+  return { code: 0, stdout: JSON.stringify(response) };
+ };
+ const submitted = await submitSshRemoteTest({ config: clientConfig, job: f.job, bundlePath }, { runner });
+ expect(submitted.status).toBe("terminal"); expect(sshOutcomeExitCode(submitted)).toBe(1);
+ const retrieved = await statusSshRemoteTest({ config: clientConfig, job: f.job }, { runner });
+ expect(retrieved).toEqual(submitted); expect(executions).toBe(1);
+ if (retrieved.status === "terminal") { expect(retrieved.receipt.status).toBe("rejected"); expect(retrieved.receipt.evidence).toBeDefined(); }
 });

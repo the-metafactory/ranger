@@ -59,8 +59,8 @@ export async function runSshCommand(options: RunSshCommand, injected: SshOptions
   await saveJob(jobOutput.destination, job);
   return await submitSshRemoteTest({ config, job, bundlePath: source.bundlePath }, { ...injected, receiptStore: r => publishReceiptFile(receiptOutput.destination, r) });
  } finally {
-  if (source) await rm(dirname(source.bundlePath), { recursive: true });
-  await jobOutput?.release(); await receiptOutput.release();
+  try { if (source) await rm(dirname(source.bundlePath), { recursive: true }); }
+  finally { try { await jobOutput?.release(); } finally { await receiptOutput.release(); } }
  }
 }
 export async function statusSshCommand(options: { config: string; job: string; output: string }, injected: SshOptions = {}): Promise<SshOutcome> {

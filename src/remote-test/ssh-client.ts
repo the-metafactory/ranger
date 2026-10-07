@@ -31,7 +31,7 @@ export function selectSshJob(config: SshConfig, input: unknown): RemoteTestJob {
 export interface SshInvocation { args: string[]; input: AsyncIterable<Uint8Array>; timeoutMs: number; signal?: AbortSignal }
 export type SshRunner = (invocation: SshInvocation) => Promise<{ code: number; stdout: string }>;
 export type SshOutcome = { status: "terminal"; receipt: RemoteTestReceipt } |
- { status: "pending" | "infra_failed"; reason: "transport_lost" | "absent_receipt" | "expired_job" | "invalid_receipt" | "receipt_store_failed" };
+ { status: "pending" | "infra_failed"; reason: "no_terminal_receipt" | "absent_receipt" | "expired_job" | "invalid_receipt" | "receipt_store_failed" };
 export interface SshOptions {
  runner?: SshRunner; now?: () => number; signal?: AbortSignal;
  /** Persistence failure must not expose passed to a caller. */
@@ -49,26 +49,26 @@ export const sshRunner: SshRunner = async ({ args, input, timeoutMs, signal }) =
   PATH: process.env.PATH, HOME: process.env.HOME, USER: process.env.USER, LOGNAME: process.env.LOGNAME,
   SSH_AUTH_SOCK: process.env.SSH_AUTH_SOCK,
  } });
- let stdout = "", count = 0, failure = false;
+ const chunks: Buffer[] = []; let count = 0, failure = false;
  const stop = () => { failure = true; if (child.pid) killProcessGroup(child.pid); };
  // Attach completion before feeding stdin, including spawn and EPIPE failures.
  const completion = new Promise<number>((resolve, reject) => {
   child.once("error", reject); child.once("close", code => resolve(code ?? -1));
  });
  child.stdin.on("error", () => { failure = true; stop(); });
- child.stdout.on("data", (chunk: Buffer) => { count += chunk.length; if (count > SSH_LIMITS.responseBytes) { failure = true; stop(); } else stdout += chunk.toString("utf8"); });
+ child.stdout.on("data", (chunk: Buffer) => { count += chunk.length; if (count > SSH_LIMITS.responseBytes) { failure = true; stop(); } else chunks.push(chunk); });
  child.stderr.resume();
  signal?.addEventListener("abort", stop, { once: true });
  const timer = setTimeout(stop, timeoutMs);
  if (signal?.aborted) stop();
  const writer = pipeline(Readable.from(input), child.stdin).catch(() => { stop(); });
- try { const code = await completion; await writer; return { code: failure || signal?.aborted ? -1 : code, stdout }; }
+ try { const code = await completion; await writer; return { code: failure || signal?.aborted ? -1 : code, stdout: Buffer.concat(chunks).toString("utf8") }; }
  finally { clearTimeout(timer); signal?.removeEventListener("abort", stop); child.stdin.destroy(); }
 };
 
 async function exchange(config: SshConfig, job: RemoteTestJob, operation: "submit" | "status", bundle: Buffer | undefined, options: SshOptions): Promise<SshOutcome> {
  const clock = options.now ?? Date.now;
- const missing = (reason: "transport_lost" | "absent_receipt"): SshOutcome => ({ status: clock() >= job.deadline ? "infra_failed" : "pending", reason });
+ const missing = (reason: "no_terminal_receipt" | "absent_receipt"): SshOutcome => ({ status: clock() >= job.deadline ? "infra_failed" : "pending", reason });
  const header = Buffer.from(JSON.stringify({ version: 1, operation, job, ...(bundle ? { bundleBytes: bundle.length } : {}) }) + "\n");
  if (header.length > SSH_LIMITS.headerBytes) throw Error("SSH request exceeds header limit");
  const input = (async function* () { yield header; if (bundle) yield bundle; })();
@@ -78,9 +78,11 @@ async function exchange(config: SshConfig, job: RemoteTestJob, operation: "submi
  let result: Awaited<ReturnType<SshRunner>>;
  try {
   result = await (options.runner ?? sshRunner)({ args: ["-T", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "ForwardAgent=no", "-o", "ClearAllForwardings=yes", "-o", "ControlMaster=no", "-o", "ControlPath=none", "-o", "ConnectTimeout=10", "--", config.target, command], input, timeoutMs: config.timeoutSeconds * 1000, signal: options.signal });
- } catch { return missing("transport_lost"); }
+ } catch { return missing("no_terminal_receipt"); }
  // Nonzero transport cannot authenticate its partial output as a receipt.
- if (result.code !== 0) return missing("transport_lost");
+ // A nonzero exit may be a peer command refusal as well as a lost connection;
+ // neither establishes a terminal test result or permission to resubmit.
+ if (result.code !== 0) return missing("no_terminal_receipt");
  let receipt: RemoteTestReceipt;
  try {
   if (Buffer.byteLength(result.stdout) > SSH_LIMITS.responseBytes) throw Error("Oversize SSH response");
