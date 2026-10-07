@@ -3,7 +3,7 @@ import {
  validateProfileManifest,
  validateRemoteTestJob,
  validateRemoteTestReceipt,
- receiptMatchesRequest,
+ receiptMatchesJob,
  type ProfileManifest,
  type RemoteTestJob,
  type RemoteTestReceipt,
@@ -88,10 +88,10 @@ describe("V1 jobs and operator-selected profiles", () => {
    expect(() => validateRemoteTestJob({ ...job(), [field]: "override" }, profile())).toThrow();
   });
  }
- for (const field of ["profileId", "profileDigest", "lockDigest", "imageDigest", "platform"]) {
+ for (const field of ["profileId", "profileDigest", "lockDigest", "imageDigest"]) {
   test(`rejects a profile mismatch on ${field}`, () => {
-   const value = field === "profileId" ? "other-profile" : field === "platform" ? "linux-amd64" : digest("1");
-   expect(() => validateRemoteTestJob({ ...job(), [field]: value }, profile())).toThrow();
+   const value = field === "profileId" ? "other-profile" : digest("1");
+   expect(() => validateRemoteTestJob({ ...job(), [field]: value }, profile())).toThrow(/does not match operator profile/);
   });
  }
  test("does not mutate or coerce caller inputs", () => {
@@ -128,7 +128,7 @@ describe("profile manifest boundary", () => {
 
 describe("terminal receipt attribution and exact identity", () => {
  test("accepts a matching complete receipt", () => {
-  expect(receiptMatchesRequest(receipt(), job())).toBe(true);
+  expect(receiptMatchesJob(receipt(), job())).toBe(true);
   expect(validateRemoteTestReceipt(receipt(), job())).toEqual(receipt());
  });
  const changes: Record<string, unknown> = {
@@ -144,7 +144,7 @@ describe("terminal receipt attribution and exact identity", () => {
  for (const [field, value] of Object.entries(changes)) {
   test(`rejects receipt mismatch on ${field}`, () => {
    const input = { ...receipt(), identity: { ...job(), [field]: value } };
-   expect(receiptMatchesRequest(input, job())).toBe(false);
+   expect(receiptMatchesJob(input, job())).toBe(false);
    expect(() => validateRemoteTestReceipt(input, job())).toThrow();
   });
  }
@@ -153,19 +153,24 @@ describe("terminal receipt attribution and exact identity", () => {
    const identity: Record<string, unknown> = job();
    delete identity[field];
    const input = { ...receipt(), identity };
-   expect(receiptMatchesRequest(input, job())).toBe(false);
+   expect(receiptMatchesJob(input, job())).toBe(false);
    expect(() => validateRemoteTestReceipt(input, job())).toThrow();
   });
  }
  test("compares fields independent of object key insertion order", () => {
   const identity = Object.fromEntries(Object.entries(job()).reverse());
-  expect(receiptMatchesRequest({ ...receipt(), identity }, job())).toBe(true);
+  expect(receiptMatchesJob({ ...receipt(), identity }, job())).toBe(true);
  });
  test("identity comparison never implies success", () => {
   const input = { ...receipt(), status: "test_failed", exitCode: 1 };
-  expect(receiptMatchesRequest(input, job())).toBe(true);
+  expect(receiptMatchesJob(input, job())).toBe(true);
   expect(validateRemoteTestReceipt(input, job()).status).toBe("test_failed");
  });
+ for (const status of ["infra_failed", "cancelled"] as const) {
+  test(`${status} after a zero test exit is still failure`, () => {
+   expect(validateRemoteTestReceipt({ ...receipt(), status }, job()).status).toBe(status);
+  });
+ }
  for (const status of ["infra_failed", "timed_out", "cancelled", "rejected"] as const) {
   test(`preserves explicit ${status} with no test exit code`, () => {
    expect(validateRemoteTestReceipt({ ...receipt(), status, exitCode: null }, job()).status).toBe(status);
@@ -188,9 +193,9 @@ describe("terminal receipt attribution and exact identity", () => {
  });
  test("rejects extras inside receipt identity and malformed requests", () => {
   const input = { ...receipt(), identity: { ...job(), credentials: "secret" } };
-  expect(receiptMatchesRequest(input, job())).toBe(false);
+  expect(receiptMatchesJob(input, job())).toBe(false);
   expect(() => validateRemoteTestReceipt(input, job())).toThrow();
-  expect(receiptMatchesRequest(receipt(), { ...job(), generation: "1" })).toBe(false);
+  expect(receiptMatchesJob(receipt(), { ...job(), generation: "1" })).toBe(false);
   expect(() => validateRemoteTestReceipt(receipt(), {})).toThrow();
  });
  test("rejects every missing receipt field", () => {

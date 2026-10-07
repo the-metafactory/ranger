@@ -15,6 +15,14 @@ const RepositoryIdSchema = z.string().max(512).regex(
  /^(?:github|gitlab):[a-z0-9]+(?:[.-][a-z0-9]+)*(?::[1-9][0-9]{0,4})?\/[a-zA-Z0-9_-][a-zA-Z0-9._-]*(?:\/[a-zA-Z0-9_-][a-zA-Z0-9._-]*)+$/,
 );
 
+const ProfileBindingShape = {
+ profileId: NameSchema,
+ profileDigest: Sha256Schema,
+ lockDigest: Sha256Schema,
+ imageDigest: Sha256Schema,
+ platform: PlatformSchema,
+};
+
 const IdentitySchema = z.object({
  version: VersionSchema,
  jobId: UuidSchema,
@@ -23,14 +31,10 @@ const IdentitySchema = z.object({
  commitDigest: GitDigestSchema,
  treeDigest: GitDigestSchema,
  bundleDigest: Sha256Schema,
- profileId: NameSchema,
- profileDigest: Sha256Schema,
- lockDigest: Sha256Schema,
- imageDigest: Sha256Schema,
- platform: PlatformSchema,
+ ...ProfileBindingShape,
  /** Absolute Unix time in milliseconds. Admission checks expiry separately. */
  deadline: TimestampSchema,
- /** Positive attempt/fencing generation; changes invalidate prior receipts. */
+ /** Must match the current admitted attempt/fencing generation supplied by the caller. */
  generation: GenerationSchema,
 }).strict().refine((value) => value.commitDigest.length === value.treeDigest.length, {
  message: "Commit and tree must use the same Git object format",
@@ -42,11 +46,7 @@ const ArgumentSchema = z.string().max(4096).refine((value) => !value.includes("\
 const CommandSchema = z.tuple([ArgumentSchema.refine((value) => value.length > 0)]).rest(ArgumentSchema);
 const ProfileManifestSchema = z.object({
  version: VersionSchema,
- profileId: NameSchema,
- profileDigest: Sha256Schema,
- lockDigest: Sha256Schema,
- imageDigest: Sha256Schema,
- platform: PlatformSchema,
+ ...ProfileBindingShape,
  /** Ordered argv vectors, never interpolated shell text supplied by a job. */
  commands: z.array(CommandSchema).min(1).max(32),
 }).strict();
@@ -61,7 +61,8 @@ const ReceiptSchema = z.object({
  executorId: NameSchema,
  status: z.enum(REMOTE_TEST_STATUSES),
  completedAt: TimestampSchema,
- /** Null means no test exit was obtained (rejection, cancellation, infra failure). */
+ /** Observed test process exit; null when no test exit was obtained.
+  * Infra failure or cancellation can still occur after a test exits zero. */
  exitCode: z.number().int().min(0).max(255).nullable(),
 }).strict().superRefine((value, ctx) => {
  if (value.status === "passed" && value.exitCode !== 0) {
@@ -88,11 +89,12 @@ export function validateProfileManifest(input: unknown): ProfileManifest {
 }
 
 /** Pure admission shape check against an already selected trusted profile.
- * Returns a detached validated request; never executes commands or reads config. */
+ * Returns a detached validated job; never executes commands or reads config.
+ * Throws ZodError for malformed input, Error for profile mismatch. */
 export function validateRemoteTestJob(input: unknown, operatorProfile: unknown): RemoteTestJob {
  const profile = validateProfileManifest(operatorProfile);
  const request = IdentitySchema.parse(input);
- const fields = ["profileId", "profileDigest", "lockDigest", "imageDigest", "platform"] as const;
+ const fields = Object.keys(ProfileBindingShape) as (keyof typeof ProfileBindingShape)[];
  for (const field of fields) {
   if (request[field] !== profile[field]) throw new Error(`Remote-test job does not match operator profile: ${field}`);
  }
@@ -116,18 +118,19 @@ function sameIdentity(receipt: RemoteTestReceipt, request: RemoteTestJob): boole
 
 /** False for malformed or mismatched inputs. True only establishes attribution;
  * it says nothing about success, transport authentication or current gate state. */
-export function receiptMatchesRequest(input: unknown, request: unknown): boolean {
+export function receiptMatchesJob(input: unknown, expectedJob: unknown): boolean {
  const receipt = ReceiptSchema.safeParse(input);
- const job = IdentitySchema.safeParse(request);
+ const job = IdentitySchema.safeParse(expectedJob);
  return receipt.success && job.success && sameIdentity(receipt.data, job.data);
 }
 
 /** Validate a terminal receipt and bind it to the exact admitted request.
  * The caller must authenticate its producer and check current HEAD/generation
- * before using a passed receipt as gate evidence. Completion is never success. */
-export function validateRemoteTestReceipt(input: unknown, request: unknown): RemoteTestReceipt {
+ * before using a passed receipt as gate evidence. Completion is never success.
+ * Throws ZodError for malformed input, Error for identity mismatch. */
+export function validateRemoteTestReceipt(input: unknown, expectedJob: unknown): RemoteTestReceipt {
  const receipt = ReceiptSchema.parse(input);
- const job = IdentitySchema.parse(request);
+ const job = IdentitySchema.parse(expectedJob);
  if (!sameIdentity(receipt, job)) throw new Error("Remote-test receipt identity does not match request");
  return receipt;
 }
