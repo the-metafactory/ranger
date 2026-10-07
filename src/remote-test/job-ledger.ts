@@ -14,6 +14,7 @@ export class ActiveRemoteTestJob extends Error {
 export class InterruptedRemoteTestJob extends Error {
  constructor(readonly attempt: number) { super("Remote-test job was interrupted; explicit recovery may permit one retry"); }
 }
+export class RemoteTestIdentityConflict extends Error {}
 export type JobStatus = Exclude<Admission, { kind: "admitted" }> | { kind: "interrupted"; attempt: number };
 export interface OwnedContainer { id: string; ledgerId: string; jobId: string; token: string }
 export interface RecoveryAdapters {
@@ -33,10 +34,18 @@ export class JobLedger {
  readonly id: string;
  constructor(private db: Database, private directory: string, private executorId: string, private clock: () => number) {
   db.exec("PRAGMA busy_timeout=5000; PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;");
-  db.exec(`CREATE TABLE IF NOT EXISTS ledger_meta (singleton INTEGER PRIMARY KEY CHECK(singleton=1), id TEXT NOT NULL, executor TEXT NOT NULL, recovering INTEGER NOT NULL DEFAULT 0);
-   CREATE TABLE IF NOT EXISTS generations (scope TEXT PRIMARY KEY, generation INTEGER NOT NULL, cancelled INTEGER NOT NULL);
-   CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, job TEXT NOT NULL, state TEXT NOT NULL, attempt INTEGER NOT NULL, token TEXT NOT NULL, launched INTEGER NOT NULL, receipt TEXT);`);
-  this.tx(() => { db.query("INSERT OR IGNORE INTO ledger_meta(singleton,id,executor) VALUES(1,?,?)").run(randomUUID(), executorId); });
+  this.tx(() => {
+   const version = (db.query("PRAGMA user_version").get() as { user_version: number }).user_version;
+   if (version !== 0 && version !== 1) throw Error("Unsupported execution ledger schema version");
+   if (version === 0) {
+    if (db.query("SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'").get()) throw Error("Unversioned execution ledger schema");
+    db.exec(`CREATE TABLE ledger_meta (singleton INTEGER PRIMARY KEY CHECK(singleton=1), id TEXT NOT NULL, executor TEXT NOT NULL, recovering INTEGER NOT NULL DEFAULT 0);
+     CREATE TABLE generations (scope TEXT PRIMARY KEY, generation INTEGER NOT NULL, cancelled INTEGER NOT NULL, changed_at INTEGER NOT NULL);
+     CREATE TABLE jobs (id TEXT PRIMARY KEY, job TEXT NOT NULL, state TEXT NOT NULL, attempt INTEGER NOT NULL, token TEXT NOT NULL, launched INTEGER NOT NULL, receipt TEXT);
+     PRAGMA user_version=1;`);
+    db.query("INSERT INTO ledger_meta(singleton,id,executor) VALUES(1,?,?)").run(randomUUID(), executorId);
+   }
+  });
   const meta = db.query("SELECT id,executor FROM ledger_meta WHERE singleton=1").get() as { id: string; executor: string };
   if (meta.executor !== executorId) { db.close(); throw Error("Execution ledger producer mismatch"); }
   this.id = meta.id;
@@ -44,9 +53,10 @@ export class JobLedger {
  close() { this.db.close(); }
  private now() { const n = this.clock(); if (!Number.isSafeInteger(n) || n <= 0) throw Error("Invalid ledger clock"); return n; }
  private tx<T>(fn: () => T): T { return this.db.transaction(fn).immediate(); }
+ private read<T>(fn: () => T): T { return this.db.transaction(fn).deferred(); }
  private row(job: RemoteTestJob): Row | null {
   const row = this.db.query("SELECT * FROM jobs WHERE id=?").get(job.jobId) as Row | null;
-  if (row && row.job !== encoded(job)) throw Error("Remote-test identity conflict");
+  if (row && row.job !== encoded(job)) throw new RemoteTestIdentityConflict("Remote-test identity conflict");
   return row;
  }
  private fence(job: RemoteTestJob, checkExpiry = true): "cancelled" | "timed_out" | "rejected" | undefined {
@@ -56,7 +66,8 @@ export class JobLedger {
   if (checkExpiry && this.now() >= job.deadline) return "timed_out";
  }
  private refusal(job: RemoteTestJob, status: RemoteTestReceipt["status"]): RemoteTestReceipt {
-  return { version: 1, identity: job, executorId: this.executorId, status, exitCode: null, completedAt: this.now() };
+  const changed = status === "cancelled" ? (this.db.query("SELECT changed_at FROM generations WHERE scope=?").get(scope(job)) as { changed_at: number } | null)?.changed_at : undefined;
+  return { version: 1, identity: job, executorId: this.executorId, status, exitCode: null, completedAt: changed ?? (status === "timed_out" ? job.deadline : this.now()) };
  }
  private terminal(job: RemoteTestJob, row: Row): Admission {
   const receipt = validateRemoteTestReceipt(JSON.parse(row.receipt!), job), reason = this.fence(job, false);
@@ -64,8 +75,9 @@ export class JobLedger {
  }
  status(input: unknown): JobStatus | null {
   const job = validateJobIdentity(input);
-  return this.tx(() => {
-   const row = this.row(job); if (!row) return null;
+  return this.read(() => {
+   const row = this.row(job);
+   if (!row) { const reason = this.fence(job, false); return reason ? { kind: "terminal", receipt: this.refusal(job, reason) } : null; }
    if (row.state === "terminal") return this.terminal(job, row) as Extract<Admission, { kind: "terminal" }>;
    const reason = this.fence(job);
    if (reason) return { kind: "terminal", receipt: this.refusal(job, reason) };
@@ -81,7 +93,7 @@ export class JobLedger {
    if (row?.state === "terminal") return this.terminal(job, row);
    if (row?.state === "active") return { kind: "active", attempt: row.attempt, launched: !!row.launched };
    const current = this.db.query("SELECT generation FROM generations WHERE scope=?").get(scope(job)) as { generation: number } | null;
-   if (!current || job.generation > current.generation) this.db.query("INSERT INTO generations VALUES(?,?,0) ON CONFLICT(scope) DO UPDATE SET generation=excluded.generation,cancelled=0").run(scope(job), job.generation);
+   if (!current || job.generation > current.generation) this.db.query("INSERT INTO generations VALUES(?,?,0,?) ON CONFLICT(scope) DO UPDATE SET generation=excluded.generation,cancelled=0,changed_at=excluded.changed_at").run(scope(job), job.generation, this.now());
    const reason = this.fence(job);
    const token = randomUUID(), attempt = (row?.attempt ?? 0) + 1;
    const receipt = reason ? this.refusal(job, reason) : attempt > 2 ? this.refusal(job, "infra_failed") : null;
@@ -103,15 +115,26 @@ export class JobLedger {
  /** Pollable durable fence; callers abort their container when it changes. */
  allowed(input: unknown, token: string) {
   const job = validateJobIdentity(input);
-  return this.tx(() => { const row = this.row(job); return !this.recovering() && row?.state === "active" && row.token === token && !this.fence(job); });
+  return this.read(() => { const row = this.row(job); return !this.recovering() && row?.state === "active" && row.token === token && !this.fence(job); });
  }
  cancel(input: unknown) {
   const job = validateJobIdentity(input);
   this.tx(() => {
    const row = this.row(job);
-   const current = this.db.query("SELECT generation FROM generations WHERE scope=?").get(scope(job)) as { generation: number } | null;
-   if (!current || current.generation <= job.generation) this.db.query("INSERT INTO generations VALUES(?,?,1) ON CONFLICT(scope) DO UPDATE SET generation=excluded.generation,cancelled=1").run(scope(job), job.generation);
+   const current = this.db.query("SELECT generation,cancelled FROM generations WHERE scope=?").get(scope(job)) as { generation: number; cancelled: number } | null;
+   if (!current || current.generation < job.generation || current.generation === job.generation && !current.cancelled) this.db.query("INSERT INTO generations VALUES(?,?,1,?) ON CONFLICT(scope) DO UPDATE SET generation=excluded.generation,cancelled=1,changed_at=excluded.changed_at").run(scope(job), job.generation, this.now());
    if (!row) this.db.query("INSERT INTO jobs VALUES(?,?,'terminal',0,?,0,?)").run(job.jobId, encoded(job), randomUUID(), JSON.stringify(this.refusal(job, "cancelled")));
+  });
+ }
+ /** A thrown execution is uncertain, never still reported as a live owner.
+  * Cleanup must reconcile before another admission can use the retry allowance. */
+ interrupt(input: unknown, token: string) {
+  const job = validateJobIdentity(input);
+  this.tx(() => {
+   const row = this.row(job);
+   if (!row || row.state !== "active" || row.token !== token) return;
+   this.db.query("UPDATE jobs SET state='interrupted' WHERE id=?").run(job.jobId);
+   this.db.exec("UPDATE ledger_meta SET recovering=1");
   });
  }
  /** Artifact persistence must precede this commit. Historical artifact bytes

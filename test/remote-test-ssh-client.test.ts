@@ -4,6 +4,7 @@ import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { submitSshRemoteTest, statusSshRemoteTest, validateSshConfig, type SshRunner } from "../src/remote-test/ssh-client.ts";
+import { sshOutcomeMessage } from "../src/remote-test/ssh-cli.ts";
 
 const roots: string[] = [];
 afterEach(async () => { for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
@@ -36,6 +37,14 @@ test("status never uploads source or submits again, and handles absent and expir
  expect((await statusSshRemoteTest({ config, job }, { runner: f.runner, now: () => now })).status).toBe("pending");
  expect(JSON.parse(f.calls[0]!.bytes.toString())).toEqual({ version: 1, operation: "status", job });
  expect((await statusSshRemoteTest({ config, job }, { runner: f.runner, now: () => job.deadline + 1 })).status).toBe("infra_failed");
+});
+test("SSH consumers distinguish active ownership from interrupted work without retrying", async () => {
+ for (const state of ["active", "interrupted"] as const) {
+  const f = fake(JSON.stringify({ version: 1, receipt: null, state }));
+  const result = await statusSshRemoteTest({ config, job }, { runner: f.runner, now: () => now });
+  expect(result).toEqual({ status: "pending", reason: state === "active" ? "active_job" : "interrupted_job" });
+  expect(sshOutcomeMessage(result)).toContain(state); expect(f.calls).toHaveLength(1);
+ }
 });
 test("transport failure never trusts partial stdout or locally reruns tests", async () => {
  const f = fake(undefined, 255);

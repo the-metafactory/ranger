@@ -65,6 +65,8 @@ test("executor storage failure and invalid clock cannot expose passed", async ()
  const f = await fixture();
  await expect(f.execute({ artifactFault: () => { throw Error("storage failure"); } })).rejects.toThrow();
  expect(await stat(join(f.config.jobsRoot, ".artifacts", id)).catch(() => null)).toBeNull();
+ const ledger = await openJobLedger(f.config.jobsRoot, f.config.executorId);
+ try { expect(ledger.status(f.job)?.kind).toBe("interrupted"); expect(() => ledger.admit(f.job)).toThrow("recovery fence"); } finally { ledger.close(); }
  const g = await fixture(); let clock = Date.now();
  await expect(g.execute({ now: () => clock-- })).rejects.toThrow("durationMs");
  expect(await stat(join(g.config.jobsRoot, ".artifacts", id)).catch(() => null)).toBeNull();

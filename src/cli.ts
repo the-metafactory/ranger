@@ -521,8 +521,8 @@ remoteTest.command("execute")
     process.stderr.write(`Remote-test active (attempt ${error.status.attempt}); query status.\n`); process.exitCode = 1; return;
    }
    process.stderr.write(receiptStored
-    ? "ranger remote-test execute: durable receipt stored; output export failed. Inspect the private artifact store before retrying export; do not rerun the job.\n"
-    : "ranger remote-test execute: configuration, admission, execution or receipt storage failed; inspect private operator inputs.\n");
+    ? "ranger remote-test execute: durable receipt stored; output export failed. Repeat execute with the identical job and a new output path, or query status; do not export loose artifacts.\n"
+    : "ranger remote-test execute: configuration, admission, execution or receipt storage failed; inspect private state and recover interrupted attempts with the executor stopped.\n");
    process.exitCode = 1;
   } finally { process.removeListener("SIGINT", cancel); process.removeListener("SIGTERM", cancel); }
  });

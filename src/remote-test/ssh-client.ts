@@ -31,7 +31,7 @@ export function selectSshJob(config: SshConfig, input: unknown): RemoteTestJob {
 export interface SshInvocation { args: string[]; input: AsyncIterable<Uint8Array>; timeoutMs: number; signal?: AbortSignal }
 export type SshRunner = (invocation: SshInvocation) => Promise<{ code: number; stdout: string }>;
 export type SshOutcome = { status: "terminal"; receipt: RemoteTestReceipt } |
- { status: "pending" | "infra_failed"; reason: "no_terminal_receipt" | "absent_receipt" | "expired_job" | "invalid_receipt" | "receiver_failed" | "receipt_store_failed" };
+ { status: "pending" | "infra_failed"; reason: "no_terminal_receipt" | "absent_receipt" | "active_job" | "interrupted_job" | "expired_job" | "invalid_receipt" | "receiver_failed" | "receipt_store_failed" };
 export interface SshOptions {
  runner?: SshRunner; now?: () => number; signal?: AbortSignal;
  /** Persistence failure must not expose passed to a caller. */
@@ -87,6 +87,7 @@ async function exchange(config: SshConfig, job: RemoteTestJob, operation: "submi
   if (Buffer.byteLength(result.stdout) > SSH_LIMITS.responseBytes) throw Error("Oversize SSH response");
   const response = SshResponseSchema.parse(JSON.parse(result.stdout));
   if ("error" in response) return { status: "infra_failed", reason: response.error };
+  if (response.state) return { status: "pending", reason: response.state === "active" ? "active_job" : "interrupted_job" };
   if (response.receipt === null) return missing("absent_receipt");
   receipt = validateRemoteTestReceipt(response.receipt, job);
   const age = clock() - receipt.completedAt;

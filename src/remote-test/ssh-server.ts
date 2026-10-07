@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { privateOperatorPath } from "./baseline.ts";
 import { validateRemoteTestJob, validateRemoteTestReceipt, type RemoteTestJob, type RemoteTestReceipt } from "./contract.ts";
 import { executeRemoteTest, validateExecutorConfig } from "./executor.ts";
-import { ActiveRemoteTestJob, InterruptedRemoteTestJob, openJobLedger } from "./job-ledger.ts";
+import { ActiveRemoteTestJob, InterruptedRemoteTestJob, RemoteTestIdentityConflict, openJobLedger } from "./job-ledger.ts";
 import { SSH_LIMITS, SshRequestSchema, type SshResponse } from "./ssh-protocol.ts";
 
 class InvalidSshReceipt extends Error {}
@@ -29,7 +29,7 @@ async function lookup(root: string, job: RemoteTestJob, executorId: string): Pro
  const ledger = await openJobLedger(root, executorId);
  const state = () => {
   let state;
-  try { state = ledger.status(job); } catch { throw new InvalidSshReceipt("Ledger identity conflict"); }
+  try { state = ledger.status(job); } catch (e) { if (e instanceof RemoteTestIdentityConflict) throw new InvalidSshReceipt("Ledger identity conflict"); throw e; }
   if (state?.kind === "active") throw new ActiveRemoteTestJob(state);
   if (state?.kind === "interrupted") throw new InterruptedRemoteTestJob(state.attempt);
   return state?.receipt ?? null;

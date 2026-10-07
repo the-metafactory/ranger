@@ -71,6 +71,16 @@ test("SSH duplicates report active and retrieval applies durable cancellation ev
   if (!("receipt" in response)) throw Error(); expect(response.receipt!.status).toBe("cancelled"); expect(f.calls()).toBe(0);
  } finally { ledger.close(); }
 });
+test("legacy passed artifacts cannot bypass a newer generation's durable fence", async () => {
+ const f = await fixture(), ledger = await openJobLedger(f.jobsRoot, f.config.executorId);
+ try {
+  ledger.admit({ ...f.job, jobId: "7c7e8091-1234-4234-8234-123456789abc", generation: 2 });
+  const store = join(f.jobsRoot, ".artifacts"), dir = join(store, id); await mkdir(store, { mode: 0o700 }); await mkdir(dir, { mode: 0o700 });
+  await writeFile(join(dir, "receipt.json"), JSON.stringify(f.receipt), { mode: 0o600 });
+  const response = await serveSshResponse(f.frame("status", ""), f.config);
+  if (!("receipt" in response)) throw Error(); expect(response.receipt!.status).toBe("cancelled");
+ } finally { ledger.close(); }
+});
 test("restart recovery clears only known stale SSH uploads and lets an interrupted job retry through SSH", async () => {
  const f = await fixture(), ledger = await openJobLedger(f.jobsRoot, f.config.executorId);
  try {

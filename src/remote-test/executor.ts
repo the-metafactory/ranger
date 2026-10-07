@@ -99,8 +99,10 @@ export async function executeRemoteTest(input: ExecutionInput, options: Executio
   if (admitted.kind === "active") throw new ActiveRemoteTestJob(admitted);
   options.signal?.addEventListener("abort", cancel, { once: true });
   if (options.signal?.aborted) cancel();
-  const receipt = await executeAdmittedRemoteTest({ ...input, job, config }, options, ledger, admitted.token);
-  return ledger.complete(job, admitted.token, receipt);
+  try {
+   const receipt = await executeAdmittedRemoteTest({ ...input, job, config }, options, ledger, admitted.token);
+   return ledger.complete(job, admitted.token, receipt);
+  } catch (error) { ledger.interrupt(job, admitted.token); throw error; }
  } finally { options.signal?.removeEventListener("abort", cancel); ledger.close(); }
 }
 

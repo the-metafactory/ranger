@@ -6,6 +6,7 @@ import { randomUUID } from "node:crypto";
 import { openJobLedger } from "../src/remote-test/job-ledger.ts";
 import type { RemoteTestJob } from "../src/remote-test/contract.ts";
 import { runCmd } from "../src/exec.ts";
+import { Database } from "bun:sqlite";
 
 const roots: string[] = [];
 afterEach(async () => { for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
@@ -67,6 +68,34 @@ test("ledger refuses a linked database instead of opening an unrelated superviso
  await symlink(join(f.root, "supervisor.sqlite"), join(f.root, ".execution", "ledger.sqlite"));
  await expect(openJobLedger(f.root, "fixture", f.now)).rejects.toThrow();
  expect(await stat(join(f.root, "supervisor.sqlite")).catch(() => null)).toBeNull();
+});
+test("unknown and unversioned nonempty database schemas refuse without migration", async () => {
+ for (const version of [0, 999]) {
+  const f = await fixture(); f.ledger.close();
+  const path = join(f.root, ".execution", "ledger.sqlite"), db = new Database(path);
+  db.exec(`PRAGMA user_version=${version}`); const schema = db.query("SELECT sql FROM sqlite_master ORDER BY name").all(); db.close();
+  await expect(openJobLedger(f.root, "fixture", f.now)).rejects.toThrow("schema");
+  const check = new Database(path);
+  try { expect(check.query("PRAGMA user_version").get()).toEqual({ user_version: version }); expect(check.query("SELECT sql FROM sqlite_master ORDER BY name").all()).toEqual(schema); } finally { check.close(); }
+ }
+});
+test("a thrown attempt reports interrupted durably and cannot retry before recovery", async () => {
+ const f = await fixture(), j = job(), a = f.ledger.admit(j); if (a.kind !== "admitted") throw Error();
+ f.ledger.interrupt(j, a.token); f.ledger.close();
+ const reopened = await openJobLedger(f.root, "fixture", f.now);
+ try {
+  expect(reopened.status(j)).toEqual({ kind: "interrupted", attempt: 1 });
+  expect(() => reopened.admit(j)).toThrow("recovery fence");
+  await reopened.reconcile({ list: async () => [], remove: async () => {}, cleanup: async () => {} });
+  expect(reopened.admit(j).kind).toBe("admitted");
+ } finally { reopened.close(); }
+});
+test("cancelled receipt retrieval is stable rather than refreshing its timestamp", async () => {
+ const f = await fixture(), j = job();
+ try {
+  f.ledger.cancel(j); const first = f.ledger.status(j); f.tick(12_000);
+  f.ledger.cancel(j); expect(f.ledger.status(j)).toEqual(first);
+ } finally { f.ledger.close(); }
 });
 test("cancel before admission is durable, fences the generation and never launches", async () => {
  const f = await fixture(), j = job(); f.ledger.cancel(j); f.ledger.close();
