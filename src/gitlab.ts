@@ -1,8 +1,10 @@
-import type { ChangeRequest, CiPurpose, CiVerdict, ForgeReadPort, IssueComment, MergeState } from "./forge.ts";
+import type { ChangeRequest, CiPurpose, CiVerdict, ForgePort, ForgeReadPort, IssueComment, MergeState } from "./forge.ts";
+import type { RangerConfig } from "./config.ts";
 import { parseForgeRef } from "./forge-ref.ts";
 import { runCmd } from "./exec.ts";
 import { parseGlabResponse } from "./glab-transport.ts";
 import { GateError, gitlabApiRead, type ResolvedToken } from "./token-gate.ts";
+import { assertWriteIdentity, gitlabApiWrite, resolveWriteToken, WriteGateError } from "./identity.ts";
 
 /** Transport and schema failures never become a passing gate value. */
 export class GitLabReadError extends Error {
@@ -19,6 +21,7 @@ const BLOCKED = new Set([
  "title_regex", "commits_status", "jira_association_missing",
 ]);
 const MR_STATE: Record<string, ChangeRequest["state"]> = { opened: "open", closed: "closed", merged: "merged", locked: "closed" };
+const DRAFT_PREFIX = "Draft: ";
 
 export function gitlabMergeState(status: string): MergeState {
  if (status === "mergeable") return "mergeable";
@@ -100,11 +103,11 @@ function nextPage(next: string | undefined, page: number, endpoint: string): num
  return following;
 }
 
-/** Read half of the forge port; writes and lane routing belong to later nodes. */
+/** Read half of the forge port, usable without write configuration. */
 export class GitLabReadPort implements ForgeReadPort<ResolvedToken> {
- constructor(private readonly runner: typeof runCmd = runCmd) {}
+ constructor(protected readonly runner: typeof runCmd = runCmd) {}
 
- private project(repo: string): string {
+ protected project(repo: string): string {
   const ref = parseForgeRef(repo);
   if (ref.forge !== "gitlab") throw new GitLabReadError("expected a GitLab repo", repo);
   return `projects/${encodeURIComponent(ref.path)}`;
@@ -207,5 +210,88 @@ export class GitLabReadPort implements ForgeReadPort<ResolvedToken> {
   if (id(r.iid, endpoint, "iid") !== issue) invalid(endpoint, "iid differs from requested issue");
   if (!Array.isArray(r.labels) || r.labels.some(label => typeof label !== "string")) invalid(endpoint, "labels");
   return r.labels;
+ }
+}
+
+/** Write failures never echo subprocess output or retry an uncertain mutation. */
+export class GitLabWriteError extends Error {
+ override readonly name = "GitLabWriteError";
+ constructor(message: string, readonly endpoint: string, readonly status?: number) {
+  super(`${endpoint}: ${message}`);
+ }
+}
+
+/** GitLab forge operations; merge/rebase are supplied by their separate node. */
+export class GitLabPort extends GitLabReadPort implements Omit<ForgePort<ResolvedToken>, "mergePr"> {
+ constructor(
+  private readonly config: RangerConfig,
+  runner: typeof runCmd = runCmd,
+  private readonly env: NodeJS.ProcessEnv = process.env,
+ ) { super(runner); }
+
+ private mrEndpoint(repo: string, n: number): string {
+  return `${this.project(repo)}/merge_requests/${id(n, repo, "iid")}`;
+ }
+
+ private async write(repo: string, token: string, endpoint: string, method: "POST" | "PUT", fields: string[]): Promise<unknown> {
+  // Validate the exact credential used below, not merely another token from config.
+  const credential = resolveWriteToken(this.config, repo, this.env);
+  if (token !== credential.token) throw new WriteGateError("GitLab write credential differs from the configured machine credential");
+  await assertWriteIdentity(this.config, repo, this.env, this.runner);
+  let result;
+  try {
+   result = await gitlabApiWrite(repo, token, [endpoint, "--method", method, "--include", ...fields], this.runner, { env: this.env });
+  } catch (error) {
+   if (error instanceof WriteGateError) throw error;
+   throw new GitLabWriteError("write transport failed", endpoint);
+  }
+  if (result.code !== 0) throw new GitLabWriteError(`write failed (exit ${result.code})`, endpoint);
+  const { status, body } = parseGlabResponse(result);
+  if (status < 200 || status >= 300) {
+   throw new GitLabWriteError(`write failed (exit ${result.code})`, endpoint, status);
+  }
+  return body;
+ }
+
+ private decodeWrite<T>(endpoint: string, decode: () => T): T {
+  try { return decode(); }
+  catch (error) {
+   if (!(error instanceof GitLabReadError)) throw error;
+   throw new GitLabWriteError("invalid write response", endpoint);
+  }
+ }
+
+ async createDraftPr(repo: string, pr: { head: string; base: string; title: string; body: string }, token: string): Promise<ChangeRequest> {
+  const endpoint = `${this.project(repo)}/merge_requests`;
+  const title = pr.title.startsWith(DRAFT_PREFIX) ? pr.title : `${DRAFT_PREFIX}${pr.title}`;
+  const raw = await this.write(repo, token, endpoint, "POST", [
+   "-f", `source_branch=${pr.head}`, "-f", `target_branch=${pr.base}`, "-f", `title=${title}`,
+   "-f", `description=${pr.body}`, "-F", "remove_source_branch=false",
+  ]);
+  return this.decodeWrite(endpoint, () => {
+   const { mr, sameProject } = changeRequest(raw, endpoint);
+   if (!sameProject) invalid(endpoint, "source_project_id differs from target_project_id (fork MR)");
+   return mr;
+  });
+ }
+
+ async updatePrBody(repo: string, n: number, body: string, token: string): Promise<void> {
+  const endpoint = this.mrEndpoint(repo, n);
+  await this.write(repo, token, endpoint, "PUT", ["-f", `description=${body}`]);
+ }
+
+ async markReady(repo: string, pr: ChangeRequest, token: string): Promise<void> {
+  if (!pr.title.startsWith(DRAFT_PREFIX)) {
+   if (pr.draft) throw new GitLabWriteError("draft title lacks the supported Draft prefix", this.mrEndpoint(repo, pr.iid));
+   return;
+  }
+  const endpoint = this.mrEndpoint(repo, pr.iid);
+  await this.write(repo, token, endpoint, "PUT", ["-f", `title=${pr.title.slice(DRAFT_PREFIX.length)}`]);
+ }
+
+ async postComment(repo: string, n: number, body: string, token: string): Promise<number> {
+  const endpoint = `${this.mrEndpoint(repo, n)}/notes`;
+  const raw = await this.write(repo, token, endpoint, "POST", ["-f", `body=${body}`]);
+  return this.decodeWrite(endpoint, () => id(object(raw, endpoint).id, endpoint, "note.id"));
  }
 }
