@@ -4,6 +4,7 @@ import { implementLane, startsImplementSession } from "./lanes.ts";
 import { executionRefusal, isGithubRepo } from "./forge-ref.ts";
 import { laneHeldMessage, recordImplementStart, mapKey, pickMap, resumeMap } from "./maps.ts";
 import { Command } from "commander";
+import { pidAlive } from "./exec.ts";
 import { join, resolve } from "node:path";
 import {
  loadConfig,
@@ -378,6 +379,14 @@ async function runResumeNode(
   }
   if (row.status === "released") {
    throw new Error(`node ${nodeId}'s claim was released — the walk re-claims it from the frontier`);
+  }
+  // A live occupant keeps the node: a second run-node would race it through
+  // the same worktree and PR (2026-10-07, soma #753: two generations raced the
+  // close, and the loser's park was re-spawned 50 times).
+  if ((row.status === "running" || row.status === "claimed") && pidAlive(row.pid)) {
+   throw new Error(
+    `node ${nodeId}'s run-node (pid ${row.pid}) is still ${row.status} — resume only a parked, failed or dead worker`,
+   );
   }
   // A resume starts a worker session in this map's resource lane.
   const lane = implementLane(map);

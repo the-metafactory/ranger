@@ -1,7 +1,8 @@
 import { createShadowTestBackend, type ShadowComparison } from "../src/remote-test/shadow.ts";
 import { githubCiVerdict } from "../src/github-ci.ts";
 import type { CiPurpose, MergeState } from "../src/forge.ts";
-import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn } from "bun:test";
+import { test } from "./partition.ts";
 import {
  copyFileSync,
  existsSync,
@@ -2386,6 +2387,54 @@ describe("implement lane (node #23)", () => {
   expect(events.some((d) => d.startsWith("adoption tests failed on a busy host (load 14.0 on 10 cores)"))).toBe(true);
   expect(events.some((d) => d.startsWith("adopting "))).toBe(true);
   rmSync(counter, { force: true });
+ }, 60_000);
+
+ test("a fix pass a failed run committed but never pushed is adopted on resume, and the next round reviews it", async () => {
+  const flag = join(tmpdir(), `ranger-adopt-fix-${Date.now()}`);
+  // The build passes; the fix pass's commit fails the supervisor's tests until the flag exists.
+  const r = await rig({
+   blockers: [1, 0],
+   test: `if grep -q "fixed per review" src/feature.ts; then test -f ${flag}; else test -f src/feature.ts; fi`,
+  });
+  cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("failed");
+  expect(r.calls).toHaveLength(1);
+  const pushed = await r.github.sha("node/20-add-the-feature-module");
+  const unpushed = (await runCmd("git", ["rev-parse", "HEAD"], { cwd: join(r.canonical, ".worktrees", "node-20") })).stdout.trim();
+  expect(unpushed).not.toBe(pushed);
+  const writer = r.journal.headSubstrate("acme/widgets", unpushed);
+  writeFileSync(flag, ""); // whatever broke the tests is gone
+  r.ctx.workerCommand = [implementWorker, "noop"]; // a worker session would commit nothing and fail
+  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.startsWith("adopting ") && d.includes("as fix pass 1"))).toBe(true);
+  expect(r.calls).toHaveLength(2); // round 2 reviewed the adopted head
+  expect(await r.github.sha("node/20-add-the-feature-module")).toBe(unpushed); // the adopted commit, as it stood
+  expect(r.journal.headSubstrate("acme/widgets", unpushed)).toBe(writer); // still the session that wrote it
+  rmSync(flag, { force: true });
+ }, 60_000);
+
+ test("unpushed commits holding a merge are not adopted as a fix pass", async () => {
+  const flag = join(tmpdir(), `ranger-adopt-fix-merge-${Date.now()}`);
+  const r = await rig({
+   blockers: [1, 0],
+   test: `if grep -q "fixed per review" src/feature.ts; then test -f ${flag}; else test -f src/feature.ts; fi`,
+  });
+  cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("failed");
+  const worktree = join(r.canonical, ".worktrees", "node-20");
+  const side = await runCmd("git", ["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "side"], { cwd: worktree, env: { ...process.env, ...GIT_ENV } });
+  expect((await runCmd("git", ["merge", "--no-ff", "-q", "-m", "merge side", side.stdout.trim()], { cwd: worktree, env: { ...process.env, ...GIT_ENV } })).code).toBe(0);
+  writeFileSync(flag, "");
+  r.ctx.workerCommand = [implementWorker, "noop"];
+  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  const resumed = await runNode("20", r.ctx);
+  expect(resumed.status).toBe("failed");
+  expect(resumed.detail).toContain("fix pass 1 committed nothing");
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.startsWith("adopting "))).toBe(false);
+  rmSync(flag, { force: true });
  }, 60_000);
 
  test("adopted work that fails the supervisor's tests goes to the worker, which fixes it", async () => {
