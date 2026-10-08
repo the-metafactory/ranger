@@ -6,6 +6,7 @@ import { isAbsolute, resolve } from "node:path";
 import { parse } from "yaml";
 import { z } from "zod";
 import { parseForgeRef, repoIdentity, validReadTokenPrefix } from "./forge-ref.ts";
+import { workerEnvPasses } from "./untrusted-env.ts";
 export { REPO_PATTERN } from "./forge-ref.ts";
 
 /**
@@ -179,6 +180,12 @@ const ServeSchema = z.object({
  extraMaps: z.array(ServeMapSchema).default([]),
 });
 
+/** A credential env var name. Refused when workerHostEnv would pass it to
+ *  untrusted worker code (e.g. SOMA_*, GIT_*): naming a token there would hand
+ *  it to every worker session. */
+const credentialEnvName = z.string().min(1).refine(name => !workerEnvPasses(name),
+ name => ({ message: `credential env var ${name} would be inherited by worker sessions; use a RANGER_* name` }));
+
 const AuthSchema = z.object({
  /**
   * Repo-prefix → env var name holding a read-only PAT. Bare keys match only
@@ -186,17 +193,17 @@ const AuthSchema = z.object({
   * Tokens are NEVER inlined
   * here — only the env var name that holds them. (Node #8 token gate.)
   */
- readOnlyTokens: z.record(z.string().refine(validReadTokenPrefix, "expected a bare GitHub prefix or forge:host/path prefix"), z.string().min(1)).default({}),
+ readOnlyTokens: z.record(z.string().refine(validReadTokenPrefix, "expected a bare GitHub prefix or forge:host/path prefix"), credentialEnvName).default({}),
  /** GitHub fallback only; GitLab always requires an explicit qualified mapping. */
- defaultTokenEnv: z.string().optional(),
+ defaultTokenEnv: credentialEnvName.optional(),
  /**
   * Repo-prefix → env var name holding the machine-account WRITE credential
   * (classic `repo`-scoped PAT — node #11). Longest-prefix match, same shape as
   * readOnlyTokens. Graph-mutating ticks refuse to run without one.
   */
- writeTokens: z.record(z.string().refine(validReadTokenPrefix, "expected a bare GitHub prefix or forge:host/path prefix"), z.string().min(1)).default({}),
+ writeTokens: z.record(z.string().refine(validReadTokenPrefix, "expected a bare GitHub prefix or forge:host/path prefix"), credentialEnvName).default({}),
  /** GitHub fallback only; GitLab requires a qualified mapping. */
- defaultWriteTokenEnv: z.string().optional(),
+ defaultWriteTokenEnv: credentialEnvName.optional(),
 });
 
 /**

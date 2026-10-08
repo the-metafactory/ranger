@@ -40,6 +40,24 @@ describe("loadConfig", () => {
     }
   });
 
+  test("refuses credential env names a worker session would inherit", () => {
+    const base = "maps:\n  - repo: acme/widgets\n    root: 1\nauth:\n";
+    for (const auth of [
+      "  writeTokens:\n    \"gitlab:gitlab.example.org/team/\": SOMA_GL_WRITE_TOKEN\n",
+      "  writeTokens:\n    \"acme/*\": GIT_WRITE_TOKEN\n",
+      "  defaultWriteTokenEnv: CLAUDE_WRITE\n",
+      "  readOnlyTokens:\n    \"acme/*\": SAGE_READ_TOKEN\n",
+      "  defaultTokenEnv: HOME\n",
+    ]) {
+      withConfig(base + auth, path => {
+        expect(() => loadConfig(path)).toThrow(/would be inherited by worker sessions/);
+      });
+    }
+    withConfig(base + "  writeTokens:\n    \"gitlab:gitlab.example.org/team/\": RANGER_WRITE_GL_TOKEN_GEANT\n", path => {
+      expect(loadConfig(path).config.auth.writeTokens["gitlab:gitlab.example.org/team/"]).toBe("RANGER_WRITE_GL_TOKEN_GEANT");
+    });
+  });
+
   test("private shadow example substitutes into the current loader without changing authority", () => {
     const template = readFileSync(new URL("../docs/examples/remote-test-private-shadow.yaml", import.meta.url), "utf8");
     const replacements: Record<string, string> = {

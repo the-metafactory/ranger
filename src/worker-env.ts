@@ -3,6 +3,7 @@ import { somaRepo } from "./graph.ts";
 import type { RangerConfig } from "./config.ts";
 import { JOURNAL_PATH_ENV } from "./journal-guard.ts";
 import { MACHINE_FORGE_KEYS } from "./forge-env.ts";
+import { workerEnvPasses } from "./untrusted-env.ts";
 
 /**
  * The environments for code ranger runs but does not trust: the headless
@@ -21,58 +22,15 @@ import { MACHINE_FORGE_KEYS } from "./forge-env.ts";
 export function workerHostEnv(
  source: NodeJS.ProcessEnv = process.env,
 ): NodeJS.ProcessEnv {
- const allowedNames = new Set([
-  "PATH",
-  "HOME",
-  "USER",
-  "LOGNAME",
-  "LANG",
-  "LC_ALL",
-  "LC_CTYPE",
-  "LC_MESSAGES",
-  "LC_TIME",
-  "TERM",
-  "TZ",
-  "SHELL",
-  "PWD",
-  "TMPDIR",
-  "XDG_CONFIG_HOME",
-  "XDG_CACHE_HOME",
-  "XDG_STATE_HOME",
-  "SSH_AUTH_SOCK",
-  "GIT_ASKPASS",
-  "GIT_TERMINAL_PROMPT",
- ]);
- const allowedPrefixes = [
-  "ANTHROPIC_",
-  "CLAUDE_",
-  "CLAUDECODE_",
-  "CODEX_",
-  "OPENAI_",
-  "AZURE_",
-  "BEDROCK_",
-  "VERTEX_",
-  "GEMINI_",
-  "GOOGLE_",
-  "OPENROUTER_",
-  "LITELLM_",
-  "SOMA_",
-  "SAGE_",
-  "PILOT_",
-  "GIT_", // git identity + config passthrough (auth header is overridden below)
- ];
  const env: NodeJS.ProcessEnv = {};
  for (const [key, value] of Object.entries(source)) {
   if (value === undefined) continue;
-  if (
-   allowedNames.has(key) ||
-   allowedPrefixes.some((prefix) => key.startsWith(prefix))
-  ) {
-   env[key] = value;
-  }
+  if (workerEnvPasses(key)) env[key] = value;
  }
  // A forge token in the host env must never reach untrusted code, whatever
- // prefix rule it slipped through.
+ // prefix rule it slipped through. The fixed forge keys are stripped here;
+ // config-named credentials (auth.*Tokens) that would pass the allowlist are
+ // refused when the config loads (credentialEnvName in config.ts).
  for (const key of MACHINE_FORGE_KEYS) delete env[key];
  return env;
 }

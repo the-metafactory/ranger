@@ -102,6 +102,9 @@ describe("GitLab write gate", () => {
   await expect(assertWriteIdentity({ ...config, auth: { readOnlyTokens: {}, writeTokens: { "*": "GH" },
    defaultWriteTokenEnv: "GH" } }, repo, { GH: "principal" }, runner)).rejects.toThrow(/no write-token mapping/);
   await expect(assertWriteIdentity({ ...config, principal: { login: {} } }, repo, inherited, runner)).rejects.toThrow(/no principal login/);
+  // A worker-inherited name refuses even when the config skipped schema validation.
+  await expect(assertWriteIdentity({ ...config, auth: { readOnlyTokens: {}, writeTokens: { [`gitlab:${host}/team/`]: "SOMA_GL_WRITE_TOKEN" } } },
+   repo, { SOMA_GL_WRITE_TOKEN: secret }, runner)).rejects.toThrow(/inherited by worker sessions/);
   expect(calls).toBe(0);
  });
 

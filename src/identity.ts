@@ -6,6 +6,7 @@ import { principalLoginForRepo } from "./config.ts";
 import { runCmd, type RunOptions } from "./exec.ts";
 import { parseForgeRef, qualifiedRepo } from "./forge-ref.ts";
 import { glabConfigEnv } from "./glab-config-dir.ts";
+import { workerEnvPasses } from "./untrusted-env.ts";
 
 /**
  * The write-credential gate (design §2 identity model, node #11).
@@ -45,6 +46,12 @@ export function resolveWriteToken(
   throw new WriteGateError(
    `no write-token mapping for ${repo} — add an entry to auth.writeTokens (or auth.defaultWriteTokenEnv). ` +
     `Graph-mutating ticks refuse to run without the machine account's credential (node #11).`,
+  );
+ }
+ // Config load already refuses these; a config built without the schema must too.
+ if (workerEnvPasses(tokenEnv)) {
+  throw new WriteGateError(
+   `write-token env ${tokenEnv} would be inherited by worker sessions — refusing to use it; use a RANGER_* name.`,
   );
  }
  const token = env[tokenEnv];
