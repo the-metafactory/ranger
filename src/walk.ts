@@ -1,7 +1,7 @@
 import { implementLane, type ImplementLane } from "./lanes.ts";
 import { processResumeQueue } from "./resume.ts";
 import { executionRefusal } from "./forge-ref.ts";
-import { lastImplementMaps, recordImplementStart, mapKey, implementMapOrder } from "./maps.ts";
+import { lastImplementMaps, recordImplementStart, mapKey, implementMapOrder, readDrains } from "./maps.ts";
 import { join } from "node:path";
 import { spawnRunNodeDetached, type SpawnRunNodeArgs } from "./spawn.ts";
 import type { RangerConfig, RangerMapConfig, WalkMode } from "./config.ts";
@@ -23,6 +23,7 @@ import * as realGitHub from "./github.ts";
 import { probeRequeueCandidates, requeueProbes, type ProbeRequeueResult } from "./probe-requeue.ts";
 import { sweepMap, type SweepMapResult } from "./sweep.ts";
 import {
+ drainGate,
  implementCandidates,
  planTick,
  researchCandidates,
@@ -40,7 +41,8 @@ export { implementCandidates, planTick, researchCandidates, selectCandidates };
  * sweep liveness → priority probe requeues → merge desk and its send-backs
  * → queued resumes;
  * then, per map again →
- * derive + classify frontier → research-lane candidates → announce (fail-closed)
+ * pause and drain re-read under the claim lock → derive + classify frontier
+ * → research-lane candidates → announce (fail-closed)
  * → claim (race-safe) → spawn a detached `ranger run-node`. Sweeps go first so
  * a send-back takes its implement lane before queued resumes or fresh claims.
  *
@@ -57,6 +59,11 @@ export interface WalkMapResult {
  claimed: string[];
  spawnCapExhausted: boolean;
  paused: boolean;
+ /**
+  * Why a drain (node #165) held this map's claims: the visual-lane drain
+  * (implement only; research still claims) or this headless map's own.
+  */
+ drained?: string;
  errors: string[];
  sweep?: SweepMapResult;
 }
@@ -438,6 +445,18 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
       mapResult.gateReason = "dead-man paused — claiming stopped; human resume-run required";
       return;
      }
+     // So is a drain (node #165), read here the same way: sweeps, desks and
+     // queued resumes above ran regardless; only fresh claims stop.
+     const drain = drainGate(
+      { key: mapKey(map), lane: implementLane(map) },
+      readDrains(journal, [map]),
+     );
+     if (drain !== null) mapResult.drained = drain.reason;
+     if (drain?.scope === "map") {
+      mapResult.gated = true;
+      mapResult.gateReason = drain.reason;
+      return;
+     }
      // walk MUST classify from a frontier no older than the repo is NOW:
      // reusing the escalation pass's read (up to ~120s old) unchecked could
      // misroute claims — a node edited to HITL in that window would still be
@@ -461,6 +480,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
      const plan = planTick(classified, {
       laneBusy: implementClaimed.has(implementLane(map)) || implementLaneBusy(journal, implementLane(map)),
       vetoed: (id) => journal.hasVeto(id),
+      implementDrained: drain?.scope === "lane",
      });
      const candidates = plan.selected;
      const laneOf = (id: string) =>

@@ -4,6 +4,31 @@
  * dashboard (`serve.ts`, #37) read the same selection rather than two copies.
  */
 import type { ClassifiedNode } from "./route.ts";
+import type { ImplementLane } from "./lanes.ts";
+
+/** The drain switches one tick reads (node #165): the visual lane's, and each drained headless map's key. */
+export interface DrainState {
+ visual: boolean;
+ maps: ReadonlySet<string>;
+}
+
+export const VISUAL_DRAIN_REASON = "visual lane drained — no new implement claims; `ranger drain --lane visual --off` lifts it";
+
+/**
+ * What a drain stops on one map, for the walk and the dashboard alike.
+ * The visual lane is a machine singleton, so its drain covers every visual
+ * map and stops only implement claims (research does not take the lane).
+ * A visual map has no drain of its own. A drained headless map claims nothing new.
+ */
+export function drainGate(
+ map: { key: string; lane: ImplementLane },
+ drains: DrainState,
+): { scope: "lane" | "map"; reason: string } | null {
+ if (map.lane === "visual") return drains.visual ? { scope: "lane", reason: VISUAL_DRAIN_REASON } : null;
+ return drains.maps.has(map.key)
+  ? { scope: "map", reason: `map drained — no new claims; \`ranger drain --map ${map.key} --off\` lifts it` }
+  : null;
+}
 
 /** Research-lane candidates: routed research AND walkable on this map's walk mode. */
 export function researchCandidates(
@@ -73,17 +98,20 @@ export interface TickPlan {
  * One tick's plan for a classified frontier — the candidate order and the
  * veto rule. `walk` iterates `selected` and skips `vetoed`; `ranger serve`
  * (#37) names `take[0]` or `waiting` as the next job. The map gates (walk
- * mode, dead-man pause, spawn cap) are checked by each caller before this.
+ * mode, dead-man pause, map drain, spawn cap) are checked by each caller
+ * before this; `implementDrained` (the visual-lane drain) takes no
+ * implement node and waits for none.
  */
 export function planTick(
  frontier: ClassifiedNode[],
- opts: { laneBusy: boolean; vetoed: (nodeId: string) => boolean },
+ opts: { laneBusy: boolean; vetoed: (nodeId: string) => boolean; implementDrained?: boolean },
 ): TickPlan {
- const { implement, research } = selectCandidates(frontier, opts.laneBusy);
+ const drained = opts.implementDrained === true;
+ const { implement, research } = selectCandidates(frontier, opts.laneBusy || drained);
  const selected = [...implement, ...research];
  // One veto read per node: in walk the predicate is a journal query.
  const vetoed = selected.filter((n) => opts.vetoed(n.id));
- const head = opts.laneBusy ? implementCandidates(frontier)[0] : undefined;
+ const head = opts.laneBusy && !drained ? implementCandidates(frontier)[0] : undefined;
  return {
   selected,
   implement,
