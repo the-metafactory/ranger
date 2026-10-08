@@ -585,10 +585,14 @@ remoteTest.command("serve-stdio")
   const timer = setTimeout(cancel, 15 * 60_000);
   try {
    let config;
-   try { config = JSON.parse(await readFile(await privateOperatorPath(options.config, true), "utf8")); }
+   try {
+    const text = await readFile(await privateOperatorPath(options.config, true), "utf8");
+    try { config = JSON.parse(text); }
+    catch { throw new TaggedReceiverFailure("invalid_config", "Invalid private executor config"); }
+   }
    catch (error) {
     const failure = classifyReceiverFailure(error, "config");
-    await saveRefusalDiagnostic(diagnostics, { operation: null, job: null, primary: { stage: "config", code: failure.code === "unknown" ? "invalid_config" : failure.code } });
+    await saveRefusalDiagnostic(diagnostics, { operation: null, job: null, primary: failure });
     throw Error("Invalid private executor config");
    }
    const response = await serveSshResponse(process.stdin, config, { signal: abort.signal, diagnostics });

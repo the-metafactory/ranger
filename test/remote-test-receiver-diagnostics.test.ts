@@ -266,8 +266,13 @@ test("partially invalid operator config still excludes its jobs root from diagno
  expect(await fs.readdir(f.jobsRoot)).toEqual([]); expect(f.calls()).toBe(0);
 });
 
-test("canonical root spelling cannot bypass overlap on a case-insensitive filesystem", async () => {
+test("canonical overlap rejects resolved aliases and native case aliases where supported", async () => {
  const f = await fixture();
+ const caseAlias = join(f.root, "JOBS");
+ if (await fs.lstat(caseAlias).catch(() => null)) {
+  expect(await fs.realpath(caseAlias)).toBe(f.jobsRoot);
+  await expect(persistReceiverDiagnostic(caseAlias, refusal, [f.jobsRoot])).rejects.toThrow("Overlapping");
+ }
  const realpath = (async (path: string) => path === f.diagnosticsRoot ? f.jobsRoot : fs.realpath(path)) as typeof fs.realpath;
  await expect(persistReceiverDiagnostic(f.diagnosticsRoot, refusal, [f.jobsRoot], { fs: { realpath } })).rejects.toThrow("Overlapping");
  expect(await fs.readdir(f.diagnosticsRoot)).toEqual([]); expect(await fs.readdir(f.jobsRoot)).toEqual([]);
