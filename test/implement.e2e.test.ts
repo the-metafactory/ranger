@@ -85,6 +85,7 @@ class FakeGitHub implements ForgePort {
    state: pr.merged ? "merged" : pr.state,
    draft: pr.draft,
    title: pr.title,
+   body: pr.body,
    mergedBy: pr.mergedBy,
    headRef: pr.head,
    headSha: pr.mergedSha ?? (await this.sha(pr.head)),

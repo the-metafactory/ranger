@@ -1,4 +1,4 @@
-import { executionRefusal, fileStemFor } from "./forge-ref.ts";
+import { executionRefusal, fileStemFor, parseForgeRef } from "./forge-ref.ts";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { availableParallelism, loadavg, tmpdir } from "node:os";
@@ -10,6 +10,7 @@ import { runCmd, type RunOptions, type RunResult } from "./exec.ts";
 import {
  assertGitUntouched,
  assertNoClosingKeywords,
+ closingKeywordRefusal,
  commitsAhead,
  dirtyFiles,
  fastForwardCanonical,
@@ -947,11 +948,12 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
   // record and is never credited to this run's substrate.
   if (built.adopted !== true) recordHead(ctx, built.sha);
 
-  const title = prTitle(node);
+  const title = prTitle(ctx);
+  const body = refuseClosingKeyword(ctx, "the draft PR description", draftBody(ctx));
   fence("open PR");
   pr = await github.createDraftPr(
    repo,
-   { head: branch, base, title, body: draftBody(ctx) },
+   { head: branch, base, title, body },
    token,
   );
   journal.updateWorker(nodeId, ctx.map.repo, { phase: "review", prNumber: pr.iid });
@@ -1146,7 +1148,8 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
 
  // ---- ready → awaiting merge ----
  fence("mark ready");
- await github.updatePrBody(repo, open.iid, readyBody(ctx, final, reviews.length, probe), token);
+ const body = refuseClosingKeyword(ctx, "the ready PR description", readyBody(ctx, final, reviews.length, probe));
+ await github.updatePrBody(repo, open.iid, body, token);
  await github.markReady(repo, await github.getPr(repo, open.iid, token), token);
  journal.updateWorker(nodeId, ctx.map.repo, {
   status: "awaiting-merge",
@@ -1534,7 +1537,7 @@ async function checkedWorkerPass(
  // before it counts as seen clean.
  const clean = await assertGitUntouched(ctx.canonical, snapshot);
  recordKnownGood(journal, ctx.canonical, clean, `passing ${pass}`);
- await assertNoClosingKeywords(worktree, map.base);
+ await assertNoClosingKeywords(worktree, map.base, parseForgeRef(map.repo).forge);
  return { workerExit: result.code, snapshot, sha };
 }
 
@@ -1952,7 +1955,7 @@ async function adoptBuiltWork(ctx: ImplementContext, testCommand: string): Promi
  }
  if ((await headSha(worktree)) !== sha || (await dirtyFiles(worktree)).length > 0) return null;
  recordKnownGood(journal, ctx.canonical, clean, "passing adoption tests");
- await assertNoClosingKeywords(worktree, map.base);
+ await assertNoClosingKeywords(worktree, map.base, parseForgeRef(map.repo).forge);
  const restored = remoteTests(ctx) ? null : await restoreWorktree(ctx, sha);
  if (restored !== null) {
   return { workerExit: null, snapshot, sha, failure: { status: "failed", detail: restored, workerExit: null } };
@@ -1970,15 +1973,20 @@ function tail(result: RunResult): string {
 }
 
 /** The node title, refused if it would carry a closing keyword into the squash message. */
-function prTitle(node: NodeResult): string {
- const title = `${node.node.title} (node #${node.ref.id})`;
- const hit = findClosingKeyword(title);
- if (hit !== null) {
-  throw new ParkSignal(
-   `the node title carries a GitHub closing keyword ("${hit}") — as a PR title it would auto-close the node on merge (#588); retitle the node`,
-  );
- }
- return title;
+function prTitle(ctx: ImplementContext): string {
+ const { node } = ctx;
+ return refuseClosingKeyword(ctx, "the node title", `${node.node.title} (node #${node.ref.id})`, "; retitle the node");
+}
+
+/**
+ * Text ranger writes where the map's forge reads closing references (PR/MR
+ * title and description), refused with the offending text quoted (node #128).
+ */
+function refuseClosingKeyword(ctx: ImplementContext, what: string, text: string, remedy = ""): string {
+ const forge = parseForgeRef(ctx.map.repo).forge;
+ const hit = findClosingKeyword(text, forge);
+ if (hit !== null) throw new ParkSignal(`${closingKeywordRefusal(forge, what, hit)}${remedy}`);
+ return text;
 }
 
 function nodeLink(ctx: ImplementContext): string {

@@ -36,6 +36,7 @@ function pr(over: Partial<ChangeRequest> = {}): ChangeRequest {
   state: "open",
   draft: false,
   title: "t",
+  body: "",
   mergedBy: null,
   headRef: "node/20-x",
   headSha: SHA,
@@ -119,18 +120,93 @@ describe("sage verdict block (sage#83 contract)", () => {
  });
 });
 
-describe("closing keywords (#588 fail-open path)", () => {
- test.each([
-  "closes #12",
-  "Fixes #3",
-  "resolved: #9",
-  "fix acme/widgets#4",
-  "Closes https://github.com/acme/widgets/issues/5",
- ])("finds %p", (text) => {
-  expect(findClosingKeyword(`feat: thing\n\n${text}`)).not.toBeNull();
+describe("closing keywords (#588 fail-open path, node #128 per forge)", () => {
+ // [text, GitHub hit, GitLab hit]: null where the forge reads no closing reference.
+ const table: [string, string | null, string | null][] = [
+  ["closes #12", "closes #12", "closes #12"],
+  ["Fixes #3", "Fixes #3", "Fixes #3"],
+  ["resolved: #9", "resolved: #9", "resolved: #9"],
+  ["fix acme/widgets#4", "fix acme/widgets#4", "fix acme/widgets#4"],
+  // GitLab reads an issue URL on any host, with or without /-; refusing a foreign one costs nothing.
+  ["Closes https://github.com/acme/widgets/issues/5", "Closes https://github.com/acme/widgets/issues/5", "Closes https://github.com/acme/widgets/issues/5"],
+  // GitLab's grammar: every inflection, nested groups, issue and work-item URLs.
+  ["Implements #12", null, "Implements #12"],
+  ["closing claw/crisis-simulator#12", null, "closing claw/crisis-simulator#12"],
+  [
+   "Fixes: https://gitlab.software.geant.org/claw/crisis-simulator/-/issues/12",
+   null,
+   "Fixes: https://gitlab.software.geant.org/claw/crisis-simulator/-/issues/12",
+  ],
+  ["Resolving issue #7", null, "Resolving issue #7"],
+  ["implementing issues group/sub/project#8", null, "implementing issues group/sub/project#8"],
+  ["IMPLEMENTED https://gitlab.example.org/g/p/-/work_items/9", null, "IMPLEMENTED https://gitlab.example.org/g/p/-/work_items/9"],
+  ["fixing project#10", null, "fixing project#10"],
+  ["Closed #11", "Closed #11", "Closed #11"],
+  // GitLab's alternative issue prefixes and its URL forms without the /- segment.
+  ["Closes GL-128", null, "Closes GL-128"],
+  ["Closes [issue:128]", null, "Closes [issue:128]"],
+  ["fixes [issue:claw/crisis-simulator/128]", null, "fixes [issue:claw/crisis-simulator/128]"],
+  [
+   "Closes https://gitlab.example.org/g/p/issues/128",
+   null,
+   "Closes https://gitlab.example.org/g/p/issues/128",
+  ],
+  [
+   "Resolves https://gitlab.example.org/g/p/-/issues/incident/5",
+   null,
+   "Resolves https://gitlab.example.org/g/p/-/issues/incident/5",
+  ],
+  [
+   "closes https://gitlab.example.org/groups/g/-/work_items/6",
+   null,
+   "closes https://gitlab.example.org/groups/g/-/work_items/6",
+  ],
+  // GitLab closes an issue ref anywhere in a list led by other links or Jira-style items.
+  ["Closes https://example.com, #128", null, "Closes https://example.com, #128"],
+  [
+   "Fixes https://gitlab.example.org/g/p/-/merge_requests/12 and #128",
+   null,
+   "Fixes https://gitlab.example.org/g/p/-/merge_requests/12 and #128",
+  ],
+  ["Closes ABC-1, #128", null, "Closes ABC-1, #128"],
+  // GitLab's link keeps inner commas, so the list goes on after it.
+  ["Closes https://example.com/a,b #128", null, "Closes https://example.com/a,b #128"],
+  ["Fixes https://example.com/?ids=1,2 and #128", null, "Fixes https://example.com/?ids=1,2 and #128"],
+  // Neither forge reads these.
+  ["node #12", null, null],
+  ["fixed the flaky test", null, null],
+  ["see #12", null, null],
+  ["closer to #3 than before", null, null],
+  ["prefix #3", null, null],
+  ["unresolved #4", null, null],
+  ["Ranger closes the node after the merge", null, null],
+  ["fixtures/x#12", null, null],
+  ["Fixes https://gitlab.example.org/g/p/-/merge_requests/12", null, null],
+  ["Implemented by ranger's implement lane in MR !12 (https://gitlab.example.org/g/p/-/merge_requests/12)", null, null],
+ ];
+ for (const forge of ["github", "gitlab"] as const) {
+  test.each(table)(`${forge}: %p`, (text, github, gitlab) => {
+   const want = forge === "github" ? github : gitlab;
+   expect(findClosingKeyword(`feat: thing\n\n${text}`, forge)).toBe(want);
+  });
+ }
+ test("a crafted GitLab description is scanned in linear time, not backtracked", () => {
+  // A single list regex took 8 s on 64 KB of `AB-1AB-1…`; the item walk takes milliseconds.
+  const crafted = `Fixes ${"AB-1".repeat(16_000)}x`;
+  const started = performance.now();
+  expect(findClosingKeyword(crafted, "gitlab")).toBeNull();
+  expect(findClosingKeyword(`${crafted} closes ${"AB-1, ".repeat(16_000)}#128`, "gitlab")).toContain("#128");
+  expect(performance.now() - started).toBeLessThan(1_000);
  });
- test.each(["node #12", "fixed the flaky test", "see #12", "closer to #3 than before"])("ignores %p", (text) => {
-  expect(findClosingKeyword(text)).toBeNull();
+ test("ranger's own GitLab-shaped PR prose passes the GitLab guard", () => {
+  const prose = [
+   "Implements orienteer node gitlab:gitlab.example.org/g/p #128: Refuse closing references (node #128)",
+   "Draft by ranger's implement lane for orienteer node gitlab:gitlab.example.org/g/p #128.",
+   "Squash-merge keeps one commit per node. The node is not referenced with a closing keyword on purpose: the close goes through the graph's gate.",
+   "Ranger closes the node after the merge, through its declared probes and this PR's CI run.",
+   "Refuse closing references (node #128) (#12)",
+  ].join("\n");
+  expect(findClosingKeyword(prose, "gitlab")).toBeNull();
  });
 });
 
