@@ -97,7 +97,7 @@ bun src/cli.ts scout -c /path/ranger.yaml # explicit config
   (audit `openClaimed` — in-flight or stale), and receipt-less closes.
 
 ```bash
-bun test       # unit + e2e (fake soma/gh fixtures)
+bun run test   # unit + e2e (fake soma/gh fixtures), four files at a time
 bunx tsc --noEmit
 ```
 
