@@ -72,8 +72,12 @@ export async function persistReceiverDiagnostic(rootPath: string, input: Refusal
   const stickyTmp = ["/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp"].includes(path) && (s.mode & 0o1000) !== 0 && childUid === uid;
   if (path === root ? s.uid !== uid || (s.mode & 0o7777) !== 0o700 : (s.mode & 0o022) !== 0 && !stickyTmp) throw Error("Unsafe diagnostic permissions");
   childUid = s.uid;
-  try { await io.lstat(join(path, ".git")); throw Error("Diagnostic root inside git"); }
-  catch (error) { if (classifyReceiverFailure(error, "root").code !== "ENOENT") throw error; }
+  const exists = async (name: string) => {
+   try { await io.lstat(join(path, name)); return true; }
+   catch (error) { if (classifyReceiverFailure(error, "root").code !== "ENOENT") throw error; return false; }
+  };
+  // Linked worktrees use a .git file; bare repositories have no .git entry.
+  if (await exists(".git") || await exists("HEAD") && await exists("objects") && await exists("refs")) throw Error("Diagnostic root inside git");
   if (dirname(path) === path) break;
  }
  const record = ReceiverDiagnosticSchema.parse({ ...input, version: 1, id: (options.id ?? randomUUID)(), time: (options.now ?? Date.now)() });

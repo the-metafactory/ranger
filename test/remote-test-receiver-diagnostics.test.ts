@@ -181,6 +181,9 @@ test("store validates schema/record limit, git boundary, same uid and unwritable
  await expect(persistReceiverDiagnostic(f.diagnosticsRoot, { ...refusal, primary: { stage: "header", code: secret } } as unknown as RefusalDiagnostic)).rejects.toThrow();
  await expect(persistReceiverDiagnostic(f.diagnosticsRoot, refusal, [], { id: () => secret.repeat(100) })).rejects.toThrow();
  await fs.writeFile(join(f.root, ".git"), "gitdir: fixture"); await expect(persistReceiverDiagnostic(f.diagnosticsRoot, refusal)).rejects.toThrow("inside git"); await fs.unlink(join(f.root, ".git"));
+ await fs.mkdir(join(f.root, "objects")); await fs.mkdir(join(f.root, "refs")); await fs.writeFile(join(f.root, "HEAD"), "ref: refs/heads/main");
+ await expect(persistReceiverDiagnostic(f.diagnosticsRoot, refusal)).rejects.toThrow("inside git");
+ await fs.rmdir(join(f.root, "objects")); await fs.rmdir(join(f.root, "refs")); await fs.unlink(join(f.root, "HEAD"));
  await fs.chmod(f.root, 0o777); await expect(persistReceiverDiagnostic(f.diagnosticsRoot, refusal)).rejects.toThrow("permissions"); await fs.chmod(f.root, 0o700);
  const lstat = (async (path: string) => { const s = await fs.lstat(path); if (path === f.diagnosticsRoot) Object.defineProperty(s, "uid", { value: process.getuid!() + 1 }); return s; }) as typeof fs.lstat;
  await expect(persistReceiverDiagnostic(f.diagnosticsRoot, refusal, [], { fs: { lstat } })).rejects.toThrow("permissions");
