@@ -1097,8 +1097,11 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
    );
   }
   // One fix pass per review that found blockers or majors. On a resume the review is
-  // re-read from its PR comment, so a crash between review and fix loses nothing.
-  const fixed = await workerPass(ctx, testCommand, { kind: "fix", round: current.round, body: current.body });
+  // re-read from its PR comment, so a crash between review and fix loses nothing,
+  // and a fix an earlier run committed but never pushed is adopted, as a build is.
+  const fixed =
+   (await adoptBuiltWork(ctx, testCommand, { round: current.round, pushedHead: live.headSha })) ??
+   (await workerPass(ctx, testCommand, { kind: "fix", round: current.round, body: current.body }));
   workerExit = fixed.workerExit;
   if (fixed.failure !== undefined) return fixed.failure;
   await publishPass(ctx, github, open.iid, fixed, "push fix", `fix pass ${current.round} @ ${fixed.sha.slice(0, 8)}`);
@@ -1224,7 +1227,8 @@ async function publishPass(
  });
  recordKnownGood(ctx.journal, ctx.canonical, vetted, "vetted push");
  ctx.journal.recordEvent("pushed", { nodeId: ctx.node.ref.id, repo: ctx.map.repo, detail });
- recordHead(ctx, pass.sha);
+ // An adopted pass keeps the record of the session that wrote it.
+ if (pass.adopted !== true) recordHead(ctx, pass.sha);
  await awaitHead(github, ctx.map.repo, prNumber, pass.sha, ctx.token, ctx.headPollMs);
 }
 
@@ -1922,11 +1926,23 @@ async function testsInFreshCheckout(ctx: ImplementContext, testCommand: string, 
  * The git state is trusted exactly as on any resumed pass: checked against
  * the known-good record (node #81), so a change the failed run's tests made
  * parks here instead of becoming this run's baseline.
+ *
+ * With `fix`, the work is a fix pass answering the review at the PR's pushed
+ * head: only commits on top of that head, with no merge among them (a base
+ * merge is redone by its own pass), are adopted (2026-10-08: ranger #124 and
+ * #152 lost finished fix passes to a load flake in the supervisor's tests).
  */
-async function adoptBuiltWork(ctx: ImplementContext, testCommand: string): Promise<PassResult | null> {
+async function adoptBuiltWork(
+ ctx: ImplementContext,
+ testCommand: string,
+ fix?: { round: number; pushedHead: string },
+): Promise<PassResult | null> {
  const { map, worktree, journal, node } = ctx;
- if ((await commitsAhead(worktree, map.base)) === 0) return null;
+ if (fix === undefined ? (await commitsAhead(worktree, map.base)) === 0 : !(await fixCommitsOn(worktree, fix.pushedHead))) {
+  return null;
+ }
  if ((await dirtyFiles(worktree)).length > 0) return null;
+ const what = fix === undefined ? "build" : `fix pass ${fix.round}`;
  const snapshot = await trustedSnapshot(journal, ctx.canonical, { repo: map.repo, nodeId: node.ref.id }, mapKey(map));
  const sha = await headSha(worktree);
  // Tested in a fresh clone of the commit, not in the worktree: whatever the
@@ -1935,9 +1951,9 @@ async function adoptBuiltWork(ctx: ImplementContext, testCommand: string): Promi
  // the same one retry as any supervisor test run, or a load flake would hand
  // finished work back to a worker with nothing left to commit.
  // Each attempt keeps its own output in the worker log, the retry's included.
- let tests = await backendTests(ctx, sha, () => testsInFreshCheckout(ctx, testCommand, sha, "adopted build: supervisor tests"));
+ let tests = await backendTests(ctx, sha, () => testsInFreshCheckout(ctx, testCommand, sha, `adopted ${what}: supervisor tests`));
  if (tests.code !== 0) {
-  const retry = remoteTests(ctx) ? null : await retryOnBusyHost(ctx, testCommand, sha, "adoption tests", "the adoption test retry", "adopted build: supervisor test retry");
+  const retry = remoteTests(ctx) ? null : await retryOnBusyHost(ctx, testCommand, sha, "adoption tests", "the adoption test retry", `adopted ${what}: supervisor test retry`);
   if (retry !== null) tests = retry;
  }
  const clean = await assertGitUntouched(ctx.canonical, snapshot);
@@ -1960,9 +1976,19 @@ async function adoptBuiltWork(ctx: ImplementContext, testCommand: string): Promi
  journal.recordEvent("reviewed", {
   nodeId: node.ref.id,
   repo: map.repo,
-  detail: `adopting ${sha.slice(0, 8)}: a previous run built and committed it, and it passes the supervisor's tests — no new worker session`,
+  detail: `adopting ${sha.slice(0, 8)}${fix === undefined ? "" : ` as fix pass ${fix.round}`}: a previous run built and committed it, and it passes the supervisor's tests — no new worker session`,
  });
  return { workerExit: null, snapshot, sha, adopted: true };
+}
+
+/** Whether HEAD is commits on top of `pushedHead` with no merge among them. */
+async function fixCommitsOn(worktree: string, pushedHead: string): Promise<boolean> {
+ const git = (args: string[]) => safeGit(args, { cwd: worktree, timeoutMs: 10_000 });
+ if ((await git(["merge-base", "--is-ancestor", pushedHead, "HEAD"])).code !== 0) return false;
+ const ahead = await git(["rev-list", "--count", `${pushedHead}..HEAD`]);
+ const merges = await git(["rev-list", "--merges", "--count", `${pushedHead}..HEAD`]);
+ if (ahead.code !== 0 || merges.code !== 0) return false;
+ return Number(ahead.stdout.trim()) > 0 && Number(merges.stdout.trim()) === 0;
 }
 
 function tail(result: RunResult): string {
