@@ -36,6 +36,7 @@ function pr(over: Partial<ChangeRequest> = {}): ChangeRequest {
   state: "open",
   draft: false,
   title: "t",
+  body: "",
   mergedBy: null,
   headRef: "node/20-x",
   headSha: SHA,
@@ -126,7 +127,8 @@ describe("closing keywords (#588 fail-open path, node #128 per forge)", () => {
   ["Fixes #3", "Fixes #3", "Fixes #3"],
   ["resolved: #9", "resolved: #9", "resolved: #9"],
   ["fix acme/widgets#4", "fix acme/widgets#4", "fix acme/widgets#4"],
-  ["Closes https://github.com/acme/widgets/issues/5", "Closes https://github.com/acme/widgets/issues/5", null],
+  // GitLab reads an issue URL on any host, with or without /-; refusing a foreign one costs nothing.
+  ["Closes https://github.com/acme/widgets/issues/5", "Closes https://github.com/acme/widgets/issues/5", "Closes https://github.com/acme/widgets/issues/5"],
   // GitLab's grammar: every inflection, nested groups, issue and work-item URLs.
   ["Implements #12", null, "Implements #12"],
   ["closing claw/crisis-simulator#12", null, "closing claw/crisis-simulator#12"],
@@ -140,6 +142,25 @@ describe("closing keywords (#588 fail-open path, node #128 per forge)", () => {
   ["IMPLEMENTED https://gitlab.example.org/g/p/-/work_items/9", null, "IMPLEMENTED https://gitlab.example.org/g/p/-/work_items/9"],
   ["fixing project#10", null, "fixing project#10"],
   ["Closed #11", "Closed #11", "Closed #11"],
+  // GitLab's alternative issue prefixes and its URL forms without the /- segment.
+  ["Closes GL-128", null, "Closes GL-128"],
+  ["Closes [issue:128]", null, "Closes [issue:128]"],
+  ["fixes [issue:claw/crisis-simulator/128]", null, "fixes [issue:claw/crisis-simulator/128]"],
+  [
+   "Closes https://gitlab.example.org/g/p/issues/128",
+   null,
+   "Closes https://gitlab.example.org/g/p/issues/128",
+  ],
+  [
+   "Resolves https://gitlab.example.org/g/p/-/issues/incident/5",
+   null,
+   "Resolves https://gitlab.example.org/g/p/-/issues/incident/5",
+  ],
+  [
+   "closes https://gitlab.example.org/groups/g/-/work_items/6",
+   null,
+   "closes https://gitlab.example.org/groups/g/-/work_items/6",
+  ],
   // Neither forge reads these.
   ["node #12", null, null],
   ["fixed the flaky test", null, null],

@@ -46,7 +46,7 @@ const node = (id: string, closer?: string): NodeResult => ({
 const mergedPr: ChangeRequest = {
  iid: 1, state: "merged", draft: false, headRef: "node/20-feature", headSha: "a".repeat(40),
  baseRef: "main", mergeState: "mergeable", webUrl: `https://github.com/${repo}/pull/1`,
- author: botIdentity, title: "Feature", mergeCommitSha: "b".repeat(40), mergedBy: "jcfischer",
+ author: botIdentity, title: "Feature", body: "", mergeCommitSha: "b".repeat(40), mergedBy: "jcfischer",
 };
 
 test("closure sweep caps reads, runs three together and resumes its persisted cursor past an open prefix", async () => {

@@ -98,7 +98,7 @@ function conflictingPrForge(): ForgePort {
  return {
   getPr: async () => ({
    iid: 7, state: "open", draft: false, title: "Node 40", headRef: "node/40-x", headSha: head,
-   baseRef: "main", mergeState: "conflict", mergeCommitSha: null, mergedBy: null,
+   baseRef: "main", mergeState: "conflict", body: "", mergeCommitSha: null, mergedBy: null,
    webUrl: "https://github.com/acme/widgets/pull/7", author: "ivy-bot",
   }),
   listComments: async () => [

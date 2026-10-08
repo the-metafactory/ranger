@@ -12,6 +12,8 @@ export interface ChangeRequest {
  webUrl: string;
  author: string;
  title: string;
+ /** The live description; editable after the PR opened (node #128). */
+ body: string;
  mergeCommitSha: string | null;
  mergedBy: string | null;
  /** Adapter diagnostic text, kept for existing GitHub operator messages. */

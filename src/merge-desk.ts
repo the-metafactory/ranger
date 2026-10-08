@@ -344,12 +344,18 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    if (row.mergeMessageId !== null) return; // its card is still up
   }
   if (map.autoMerge && !needsEye && superseded === null) {
-   // The live title is editable after the PR opened: guard the squash
-   // message ranger would write, not the one it opened with (node #128).
+   // The live title and description are editable after the PR opened, and
+   // neither edit moves the gated head: guard the squash message ranger
+   // would write and the description the forge reads at merge (node #128).
    const forge = parseForgeRef(repo).forge;
-   const hit = findClosingKeyword(squashTitle(pr.title, pr.iid), forge);
-   if (hit !== null) {
-    await park(row, `${closingKeywordRefusal(forge, "the squash commit message", hit)}; retitle PR #${pr.iid} and merge it by hand`, title);
+   const titleHit = findClosingKeyword(squashTitle(pr.title, pr.iid), forge);
+   if (titleHit !== null) {
+    await park(row, `${closingKeywordRefusal(forge, "the squash commit message", titleHit)}; retitle PR #${pr.iid} and merge it by hand`, title);
+    return;
+   }
+   const bodyHit = findClosingKeyword(pr.body, forge);
+   if (bodyHit !== null) {
+    await park(row, `${closingKeywordRefusal(forge, `the PR #${pr.iid} description`, bodyHit)}; edit the description and merge it by hand`, title);
     return;
    }
    await github.mergePr(repo, pr.iid, gate.headSha, pr.title, token);

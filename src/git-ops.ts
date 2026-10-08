@@ -736,12 +736,14 @@ const CLOSING_KEYWORD =
 
 /**
  * GitLab's issue-closing grammar (node #128): a keyword stem, an optional
- * `:` and spaces, an optional `issue`/`issues`, then a ref — `#N`,
- * `path/with/groups#N`, or an issue or work-item URL on any host. The first
- * ref is enough to refuse; GitLab's `, and` lists add nothing to the verdict.
+ * `:` and spaces, an optional `issue`/`issues`, then a ref. The refs are
+ * GitLab's `Issue.reference_pattern` — `#N`, `path/with/groups#N`, `GL-N`,
+ * `[issue:N]`, `[issue:path/N]` — or an issue, incident or work-item URL on
+ * any host, with or without the `/-` segment. The first ref is enough to
+ * refuse; GitLab's `, and` lists add nothing to the verdict.
  */
 const GITLAB_CLOSING_KEYWORD =
- /\b(?:clos(?:e|es|ed|ing)|fix(?:es|ed|ing)?|resolv(?:e|es|ed|ing)|implement(?:s|ed|ing)?)\b:?\s+(?:issues?\s+)?(?:(?:[\w.-]+\/)*[\w.-]*#\d+|https?:\/\/\S+?\/-\/(?:issues|work_items)\/\d+)/i;
+ /\b(?:clos(?:e|es|ed|ing)|fix(?:es|ed|ing)?|resolv(?:e|es|ed|ing)|implement(?:s|ed|ing)?)\b:?\s+(?:issues?\s+)?(?:(?:[\w.-]+\/)*[\w.-]*#\d+|GL-\d+|\[issue:(?:[\w.-]+\/)*\d+\]|https?:\/\/\S+?\/(?:-\/)?(?:issues(?:\/incident)?|work_items)\/\d+)/i;
 
 const CLOSING_PATTERNS: Record<ForgeRef["forge"], RegExp> = {
  github: CLOSING_KEYWORD,

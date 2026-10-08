@@ -26,7 +26,7 @@ const probes = (sha: string): IssueComment => ({
 });
 
 /** A forge with only the calls the merge desk may make; anything else throws. */
-function fakeGitHub(opts: { head?: string; comments: IssueComment[]; ci: CheckRun[]; labels?: string[]; merged?: boolean; title?: string; onGetPr?: () => void }) {
+function fakeGitHub(opts: { head?: string; comments: IssueComment[]; ci: CheckRun[]; labels?: string[]; merged?: boolean; title?: string; body?: string; onGetPr?: () => void }) {
  const calls: string[] = [];
  const merges: { n: number; sha: string }[] = [];
  const forbidden = (name: string) => async () => { throw new Error(`unexpected GitHub call: ${name}`); };
@@ -42,7 +42,7 @@ function fakeGitHub(opts: { head?: string; comments: IssueComment[]; ci: CheckRu
    return {
     iid: number, state: opts.merged ? "merged" : "open", draft: false, title: opts.title ?? "Repair the deploy step (node #96)",
     headRef: "node/96", headSha: opts.head ?? CERTIFIED, baseRef: "main",
-    mergeState: "mergeable", mergeCommitSha: null, mergedBy: null, webUrl: "", author: BOT,
+    mergeState: "mergeable", body: opts.body ?? "", mergeCommitSha: null, mergedBy: null, webUrl: "", author: BOT,
    } satisfies ChangeRequest;
   },
   listComments: async () => { calls.push("listComments"); return opts.comments; },
@@ -214,6 +214,19 @@ describe("node #128 — the squash commit message is guarded at merge time", () 
    const outcome = r.journal.getWorker("96", GAME)?.outcome ?? "";
    expect(outcome).toContain('the squash commit message carries a GitHub closing keyword ("fixes acme/seelite#96")');
    expect(outcome).not.toMatch(CI_FAILED_PARK_OUTCOME);
+  } finally { r.close(); }
+ });
+ test("a description edited after ready to carry a closing keyword parks instead of merging", async () => {
+  const r = rig();
+  try {
+   r.journal.updateWorker("96", GAME, { status: "awaiting-merge", outcome: null });
+   const gh = fakeGitHub({ comments: [review(CERTIFIED)], ci: GREEN, body: "Draft by ranger.\n\nCloses #96" });
+   const result = await r.desk(gh.github);
+   expect(result).toMatchObject({ merged: [], parked: ["96"], errors: [] });
+   expect(gh.calls).not.toContain("mergePr");
+   const outcome = r.journal.getWorker("96", GAME)?.outcome ?? "";
+   expect(outcome).toContain('the PR #');
+   expect(outcome).toContain('description carries a GitHub closing keyword ("Closes #96")');
   } finally { r.close(); }
  });
 });

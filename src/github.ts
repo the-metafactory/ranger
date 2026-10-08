@@ -95,6 +95,7 @@ function toChangeRequest(raw: unknown): ChangeRequest {
   state: r.merged === true || (typeof r.merged_at === "string" && r.merged_at.length > 0) ? "merged" : r.state === "closed" ? "closed" : "open",
   draft: r.draft === true,
   title: String(r.title ?? ""),
+  body: String(r.body ?? ""),
   headRef: String(head.ref ?? ""),
   headSha: String(head.sha ?? ""),
   baseRef: String(base.ref ?? ""),
