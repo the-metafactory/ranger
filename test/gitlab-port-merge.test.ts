@@ -176,6 +176,14 @@ describe("node #126 — rebase on need_rebase, bounded wait, never a merge", () 
   expect(await port.rebasePr!(repo, 7, writeToken)).toEqual({ status: "not-mergeable", reason: "GitLab could not rebase !7: Rebase failed: conflict" });
  });
 
+ test("a finished rebase that left the head where it was is pending, not head-moved", async () => {
+  const { port } = setup({ write: accepted, read: script(state(false, gated), state(false, gated)) });
+  const outcome = await port.rebasePr!(repo, 7, writeToken);
+  expect(outcome).toMatchObject({ status: "pending" });
+  if (outcome.status !== "pending") throw new Error("expected pending");
+  expect(outcome.reason).toContain(gated.slice(0, 8));
+ });
+
  test("a stale merge_error beside a moved head is the rebase landing", async () => {
   const { port } = setup({ write: accepted, read: script(state(false, gated, "old merge failure"), state(false, rebased, "old merge failure")) });
   expect(await port.rebasePr!(repo, 7, writeToken)).toEqual({ status: "head-moved", headSha: rebased });

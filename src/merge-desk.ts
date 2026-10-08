@@ -16,7 +16,7 @@ import {
 } from "./implement.ts";
 import type { Journal, WorkerRow } from "./journal.ts";
 import { evaluateMergeGate, type MergeGateInput, type MergeGateResult } from "./merge-gate.ts";
-import type { IssueComment, ChangeRequest, CiVerdict, ForgePort } from "./forge.ts";
+import type { IssueComment, ChangeRequest, CiVerdict, ForgePort, RebaseOutcome } from "./forge.ts";
 import { parseForgeRef } from "./forge-ref.ts";
 import { gitlabForgePort } from "./gitlab.ts";
 import { CI_FAILED_PARK_OUTCOME, mergeGateFailedOutcome } from "./outcomes.ts";
@@ -108,12 +108,42 @@ export function deskPort(config: RangerConfig, map: RangerMapConfig): ForgePort 
  return parseForgeRef(map.repo).forge === "gitlab" ? gitlabForgePort(config) : realGitHub;
 }
 
+/**
+ * The `rebased` event's detail. It leads with `from=<gated head>`, which
+ * `lastRebaseFrom` reads back: the writer and the reader share this one format.
+ */
+function rebasedDetail(from: string, rebase: Exclude<RebaseOutcome, { status: "not-mergeable" }>, iid: number, base: string): string {
+ return rebase.status === "head-moved"
+  ? `from=${from} to=${rebase.headSha}: PR #${iid} rebased by ranger onto ${base}; the head moved, so it is re-gated there`
+  : `from=${from}: ranger asked for a rebase of PR #${iid} onto ${base}; the head has not moved yet (${rebase.reason})`;
+}
 const REBASED_FROM = /^from=([0-9a-f]{7,64})\b/;
 
 /** The head ranger last asked the forge to rebase this node's change request from, if any. */
 function lastRebaseFrom(journal: Journal, repo: string, nodeId: string): string | null {
  const event = journal.listNodeEvents(repo, nodeId).find((e) => e.kind === "rebased");
  return event === undefined ? null : (REBASED_FROM.exec(event.detail ?? "")?.[1] ?? null);
+}
+
+/**
+ * Why a ready change request goes back to run-node, or null when it does not.
+ * One cause per check, in priority order.
+ */
+function sendBackReason(
+ pr: ChangeRequest,
+ base: string,
+ last: Review | undefined,
+ missingProbes: boolean,
+ rebasedFrom: string | null,
+): string | null {
+ const head = pr.headSha.slice(0, 8);
+ if (last !== undefined && gatingFindings(last) > 0) {
+  return `sage round ${last.round} at ${head} has ${last.blockers} blocker(s) and ${last.majors} major(s) to rework`;
+ }
+ if (last !== undefined && pr.mergeState === "conflict") return `PR #${pr.iid} conflicts with ${base} at ${head}`;
+ if (rebasedFrom !== null) return `ranger rebased PR #${pr.iid} from ${rebasedFrom.slice(0, 8)}; the new head ${head} has no review yet`;
+ if (missingProbes) return `no passing probe run at ${head}`;
+ return null;
 }
 
 function gateInput(map: RangerMapConfig, pr: ChangeRequest, ci: CiVerdict, last?: Review, probe?: Probe): MergeGateInput {
@@ -214,6 +244,48 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   }
  }
 
+ /**
+  * Ranger's own merge of a gate-passed change at `headSha`: refuse an
+  * unsquashable project, rebase when the forge asks (and stop there: the new
+  * head is re-gated on a later pass, never merged in this one), else merge.
+  * Parks and pending rows are recorded here; the merged path is the caller's.
+  */
+ async function autoMerge(
+  row: WorkerRow,
+  pr: ChangeRequest,
+  headSha: string,
+  title: string,
+  rebasePr: ForgePort["rebasePr"],
+ ): Promise<"parked" | "pending" | "merged"> {
+  // Ranger merges only squashed: a project that forbids it escalates before any write.
+  const squashRefusal = github.squashRefusal === undefined ? null : await github.squashRefusal(repo, token);
+  if (squashRefusal !== null) {
+   await park(row, `${squashRefusal}. Merge it by hand, or allow squash on the project.`, title);
+   return "parked";
+  }
+  if (rebasePr !== undefined) {
+   const rebase = await rebasePr(repo, pr.iid, token);
+   if (rebase.status === "not-mergeable") {
+    await park(row, rebase.reason, title);
+    return "parked";
+   }
+   journal.recordEvent("rebased", { nodeId: row.nodeId, repo, detail: rebasedDetail(headSha, rebase, pr.iid, map.base) });
+   result.pending.push(row.nodeId);
+   return "pending";
+  }
+  const merge = await github.mergePr(repo, pr.iid, headSha, pr.title, token);
+  if (merge.status === "head-moved") {
+   journal.recordEvent("sweep", { nodeId: row.nodeId, repo, detail: `PR #${pr.iid}: nothing merged, ${merge.reason}; re-gating the new head` });
+   result.pending.push(row.nodeId);
+   return "pending";
+  }
+  if (merge.status !== "merged") {
+   await park(row, merge.reason, title);
+   return "parked";
+  }
+  return "merged";
+ }
+
  async function progress(row: WorkerRow): Promise<void> {
   if (row.prNumber === null) {
    await park(row, "awaiting merge with no PR recorded — journal and GitHub disagree", `node ${row.nodeId}`);
@@ -271,25 +343,16 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   // failing probe run and a conflict that outlasts its merge passes still
   // park it there. A posted merge card is withdrawn first, so a stale
   // "merge needed" never stands.
-  const reworkFindings = last !== undefined && gatingFindings(last) > 0;
-  const conflicting = last !== undefined && pr.mergeState === "conflict";
   const missingProbes = probesRequired && probe === undefined && last !== undefined;
   // Ranger rebased the reviewed head (a forge under rebase_merge asked): the
   // new head has no review, so it is re-gated by a fresh round, not parked.
   // The review never carries across the rebase: the gate binds to its head.
   const rebaseFrom = last === undefined ? lastRebaseFrom(journal, repo, row.nodeId) : null;
-  const rebased = rebaseFrom !== null && rebaseFrom === latestSha && rebaseFrom !== pr.headSha;
-  const sendBack = reworkFindings || conflicting || missingProbes || rebased;
+  const rebasedFrom = rebaseFrom !== null && rebaseFrom === latestSha && rebaseFrom !== pr.headSha ? rebaseFrom : null;
+  const why = sendBackReason(pr, map.base, last, missingProbes, rebasedFrom);
   // A send-back is a worker session; a CI-only park never starts one.
-  if (ciPark && sendBack) return;
-  if (sendBack && ctx.spawn !== undefined) {
-   const why = reworkFindings
-    ? `sage round ${last?.round} at ${pr.headSha.slice(0, 8)} has ${last?.blockers} blocker(s) and ${last?.majors} major(s) to rework`
-    : conflicting
-     ? `PR #${pr.iid} conflicts with ${map.base} at ${pr.headSha.slice(0, 8)}`
-     : rebased
-      ? `ranger rebased PR #${pr.iid} from ${rebaseFrom.slice(0, 8)}; the new head ${pr.headSha.slice(0, 8)} has no review yet`
-      : `no passing probe run at ${pr.headSha.slice(0, 8)}`;
+  if (ciPark && why !== null) return;
+  if (why !== null && ctx.spawn !== undefined) {
    if (row.mergeMessageId !== null) {
     try {
      await post(
@@ -335,7 +398,8 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   }
   // A forge that asks for a rebase (GitLab under rebase_merge) is gated on
   // everything else first: ranger rebases only a change it would merge.
-  const needsRebase = pr.mergeState === "needs-rebase" && github.rebasePr !== undefined;
+  const rebasePr = pr.mergeState === "needs-rebase" ? github.rebasePr?.bind(github) : undefined;
+  const needsRebase = rebasePr !== undefined;
   const gated = needsRebase ? { ...pr, mergeState: "mergeable" as const } : pr;
   const gate = evaluateMergeGate(gateInput(map, gated, await github.ciVerdictFor(repo, pr.headSha, token), last, probe));
 
@@ -379,37 +443,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    if (row.mergeMessageId !== null) return; // its card is still up
   }
   if (map.autoMerge && !needsEye && superseded === null) {
-   // Ranger merges only squashed: a project that forbids it escalates before any write.
-   const squashRefusal = github.squashRefusal === undefined ? null : await github.squashRefusal(repo, token);
-   if (squashRefusal !== null) {
-    await park(row, `${squashRefusal}. Merge it by hand, or allow squash on the project.`, title);
-    return;
-   }
-   if (needsRebase && github.rebasePr !== undefined) {
-    // Rebase, then stop: the new head is re-gated on a later pass, never merged in this one.
-    const rebase = await github.rebasePr(repo, pr.iid, token);
-    if (rebase.status === "not-mergeable") {
-     await park(row, rebase.reason, title);
-     return;
-    }
-    journal.recordEvent("rebased", {
-     nodeId: row.nodeId,
-     repo,
-     detail: `from=${gate.headSha} ${rebase.status === "head-moved" ? `to=${rebase.headSha}` : `(${rebase.reason})`}: PR #${pr.iid} rebased by ranger onto ${map.base}; the head moved, so it is re-gated there`,
-    });
-    result.pending.push(row.nodeId);
-    return;
-   }
-   const merge = (await github.mergePr(repo, pr.iid, gate.headSha, pr.title, token)) ?? { status: "merged" as const };
-   if (merge.status === "head-moved") {
-    journal.recordEvent("sweep", { nodeId: row.nodeId, repo, detail: `PR #${pr.iid}: nothing merged, ${merge.reason}; re-gating the new head` });
-    result.pending.push(row.nodeId);
-    return;
-   }
-   if (merge.status !== "merged") {
-    await park(row, merge.reason, title);
-    return;
-   }
+   if ((await autoMerge(row, pr, gate.headSha, title, rebasePr)) !== "merged") return;
    journal.recordEvent("merged", {
     nodeId: row.nodeId,
     repo,

@@ -29,13 +29,16 @@ gated head. It refuses when the project disallows squash.
   read credential. If a rebase is already running (an earlier pass started
   it), it waits on that rebase and sends no new request. Otherwise it sends
   `PUT …/merge_requests/:iid/rebase`. It then polls the same read, up to
-  10 checks at 2 s each. The results:
+  2 checks 1.5 s apart. The wait is short on purpose: the desk re-reads
+  the head next pass, and a long wait would hold up later rows. The
+  results:
   - A head that moved is `head-moved` with the new SHA, even beside a
     stale `merge_error`.
   - A `merge_error` on an unchanged head, or a refused request, is
     `not-mergeable`.
-  - A 409 on the request (GitLab could not enqueue it yet), or still
-    rebasing at the bound, is `pending`.
+  - A 409 on the request (GitLab could not enqueue it yet), still
+    rebasing at the bound, or a finished rebase that left the head where
+    it was, is `pending`.
 
   It never merges.
 
@@ -71,8 +74,10 @@ On a GitLab map, the desk acts in this order:
 4. If ranger merges, it reads `squashRefusal` first. On `never` it parks
    with a card, before any rebase or merge write.
 5. Under `needs-rebase`, ranger runs `rebasePr` and records a `rebased`
-   event (`from=<gated head> …`). The row stays pending, and nothing merges
-   in that pass.
+   event. Its detail leads with `from=<gated head>`, written by
+   `rebasedDetail` and read back by `lastRebaseFrom`. It says the head
+   moved only on `head-moved`; on `pending` it says the rebase was asked
+   for. The row stays pending, and nothing merges in that pass.
 6. Otherwise ranger runs `mergePr`:
    - `head-moved` stays pending and is re-gated next pass.
    - `not-mergeable` and `refused` park with the reason.

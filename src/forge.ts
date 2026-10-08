@@ -50,8 +50,8 @@ export interface ForgeReadPort<Credential = string> {
 }
 
 /**
- * What a merge attempt did. GitHub's adapter returns nothing on success and
- * throws otherwise (its historical contract), so `void` reads as merged.
+ * What a merge attempt did. GitHub's adapter answers only `merged` and throws
+ * on any refusal (its historical contract); GitLab's maps each refusal here.
  */
 export type MergeOutcome =
  | { status: "merged" }
@@ -66,7 +66,7 @@ export type MergeOutcome =
 export type RebaseOutcome =
  /** The forge rebased the source branch: the head moved to `headSha`. */
  | { status: "head-moved"; headSha: string }
- /** The rebase is still running after the bounded wait: re-read next pass. */
+ /** The head has not moved yet (still rebasing, or not started): re-read next pass. */
  | { status: "pending"; reason: string }
  /** The forge could not rebase (a conflict, a refusal); `reason` is its message. */
  | { status: "not-mergeable"; reason: string };
@@ -76,7 +76,7 @@ export interface ForgePort<ReadCredential = string, WriteCredential = string> ex
  updatePrBody(repo: string, n: number, body: string, token: WriteCredential): Promise<void>;
  markReady(repo: string, pr: ChangeRequest, token: WriteCredential): Promise<void>;
  /** Squash-merge pinned to `sha`, the head the merge gate passed at. */
- mergePr(repo: string, n: number, sha: string, title: string, token: WriteCredential): Promise<MergeOutcome | void>;
+ mergePr(repo: string, n: number, sha: string, title: string, token: WriteCredential): Promise<MergeOutcome>;
  /**
   * Rebase the source branch onto its target, for a forge that reports
   * `needs-rebase` (GitLab under `rebase_merge`). GitHub never reports it.

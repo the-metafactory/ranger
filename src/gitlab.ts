@@ -249,13 +249,17 @@ export class GitLabWriteError extends Error {
  }
 }
 
-/** How long `rebaseAndWait` polls `rebase_in_progress` before it reports pending. */
+/**
+ * How long `rebaseAndWait` polls `rebase_in_progress` before it reports
+ * pending. Kept short: the desk re-reads the head next pass anyway, and a
+ * long wait holds up every later row in this one.
+ */
 export interface RebaseWait {
  polls: number;
  intervalMs: number;
  sleep: (ms: number) => Promise<void>;
 }
-const REBASE_WAIT: RebaseWait = { polls: 10, intervalMs: 2_000, sleep: (ms) => new Promise((r) => setTimeout(r, ms)) };
+const REBASE_WAIT: RebaseWait = { polls: 2, intervalMs: 1_500, sleep: (ms) => new Promise((r) => setTimeout(r, ms)) };
 
 /** GitLab's own `message` from an error response, bounded; never subprocess output. */
 function forgeMessage(body: unknown, status: number): string {
@@ -355,8 +359,10 @@ export class GitLabPort extends GitLabReadPort implements ForgePort<ResolvedToke
    const state = await this.rebaseState(repo, n, token.read);
    if (state.inProgress) continue;
    // A moved head is the rebase landing; a merge_error left from an earlier attempt does not undo it.
-   if (state.headSha !== before.headSha) return { status: "head-moved", headSha: state.headSha };
-   if (state.mergeError !== null) return { status: "not-mergeable", reason: `GitLab could not rebase !${n}: ${state.mergeError}` };
+   if (state.headSha === before.headSha) {
+    if (state.mergeError !== null) return { status: "not-mergeable", reason: `GitLab could not rebase !${n}: ${state.mergeError}` };
+    return { status: "pending", reason: `GitLab finished rebasing !${n} but the head is still ${before.headSha.slice(0, 8)}` };
+   }
    return { status: "head-moved", headSha: state.headSha };
   }
   return { status: "pending", reason: `GitLab is still rebasing !${n} after ${this.wait.polls} checks` };
