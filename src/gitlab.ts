@@ -1,9 +1,9 @@
-import type { ChangeRequest, CiPurpose, CiVerdict, ForgePort, ForgeReadPort, IssueComment, MergeState } from "./forge.ts";
+import type { ChangeRequest, CiPurpose, CiVerdict, ForgePort, ForgeReadPort, IssueComment, MergeOutcome, MergeState, RebaseOutcome } from "./forge.ts";
 import type { RangerConfig } from "./config.ts";
 import { parseForgeRef } from "./forge-ref.ts";
 import { runCmd } from "./exec.ts";
 import { parseGlabResponse } from "./glab-transport.ts";
-import { GateError, gitlabApiRead, type ResolvedToken } from "./token-gate.ts";
+import { assertReadOnlyToken, GateError, gitlabApiRead, tokenBatch, type ResolvedToken } from "./token-gate.ts";
 import { assertWriteIdentity, gitlabApiWrite, resolveWriteToken, WriteGateError } from "./identity.ts";
 
 /** Transport and schema failures never become a passing gate value. */
@@ -22,6 +22,14 @@ const BLOCKED = new Set([
 ]);
 const MR_STATE: Record<string, ChangeRequest["state"]> = { opened: "open", closed: "closed", merged: "merged", locked: "closed" };
 const DRAFT_PREFIX = "Draft: ";
+/** `squash=true` is honoured under these project settings; `never` ignores it. */
+const SQUASH_ALLOWED = new Set(["always", "default_on", "default_off"]);
+
+/** Forge text surfaced to operators: one line, bounded. */
+function bounded(text: string): string {
+ const line = text.replace(/[\u0000-\u001f\u007f]+/g, " ").trim();
+ return line.length > 300 ? `${line.slice(0, 299)}…` : line;
+}
 
 export function gitlabMergeState(status: string): MergeState {
  if (status === "mergeable") return "mergeable";
@@ -113,7 +121,7 @@ export class GitLabReadPort implements ForgeReadPort<ResolvedToken> {
   return `projects/${encodeURIComponent(ref.path)}`;
  }
 
- private async read(repo: string, token: ResolvedToken, endpoint: string): Promise<{ body: unknown; next: string | undefined }> {
+ protected async read(repo: string, token: ResolvedToken, endpoint: string): Promise<{ body: unknown; next: string | undefined }> {
   let result;
   try {
    result = await gitlabApiRead(repo, token, endpoint, this.runner);
@@ -211,6 +219,26 @@ export class GitLabReadPort implements ForgeReadPort<ResolvedToken> {
   if (!Array.isArray(r.labels) || r.labels.some(label => typeof label !== "string")) invalid(endpoint, "labels");
   return r.labels;
  }
+
+ /** The project's squash policy (`GET projects/:id`); only `never` refuses, an unknown value fails closed. */
+ async squashRefusal(repo: string, token: ResolvedToken): Promise<string | null> {
+  const endpoint = this.project(repo);
+  const option = object((await this.read(repo, token, endpoint)).body, endpoint).squash_option;
+  if (option === "never") return `${repo} has squash_option "never": ranger merges only squashed, so it will not merge here`;
+  if (typeof option !== "string" || !SQUASH_ALLOWED.has(option)) invalid(endpoint, "squash_option");
+  return null;
+ }
+
+ /** Whether GitLab is still rebasing the MR, the error a finished rebase left, and the head now. */
+ async rebaseState(repo: string, n: number, token: ResolvedToken): Promise<{ inProgress: boolean; mergeError: string | null; headSha: string }> {
+  const endpoint = `${this.project(repo)}/merge_requests/${id(n, repo, "iid")}?include_rebase_in_progress=true`;
+  const r = object((await this.read(repo, token, endpoint)).body, endpoint);
+  if (id(r.iid, endpoint, "iid") !== n) invalid(endpoint, "iid differs from requested MR");
+  if (typeof r.rebase_in_progress !== "boolean") invalid(endpoint, "rebase_in_progress");
+  const mergeError = r.merge_error === null || r.merge_error === undefined || r.merge_error === "" ? null : r.merge_error;
+  if (mergeError !== null && typeof mergeError !== "string") invalid(endpoint, "merge_error");
+  return { inProgress: r.rebase_in_progress, mergeError: mergeError === null ? null : bounded(mergeError), headSha: string(r.sha, endpoint, "sha") };
+ }
 }
 
 /** Write failures never echo subprocess output or retry an uncertain mutation. */
@@ -221,19 +249,35 @@ export class GitLabWriteError extends Error {
  }
 }
 
-/** GitLab forge operations; merge/rebase are supplied by their separate node. */
-export class GitLabPort extends GitLabReadPort implements Omit<ForgePort<ResolvedToken>, "mergePr"> {
+/** How long `rebaseAndWait` polls `rebase_in_progress` before it reports pending. */
+export interface RebaseWait {
+ polls: number;
+ intervalMs: number;
+ sleep: (ms: number) => Promise<void>;
+}
+const REBASE_WAIT: RebaseWait = { polls: 10, intervalMs: 2_000, sleep: (ms) => new Promise((r) => setTimeout(r, ms)) };
+
+/** GitLab's own `message` from an error response, bounded; never subprocess output. */
+function forgeMessage(body: unknown, status: number): string {
+ const message = body !== null && typeof body === "object" ? (body as Record<string, unknown>).message : undefined;
+ const text = typeof message === "string" ? message : message === undefined ? "" : JSON.stringify(message);
+ return text.length > 0 ? `HTTP ${status}: ${bounded(text)}` : `HTTP ${status}`;
+}
+
+/** GitLab forge operations: MR writes, the squash merge at the gated head, and the rebase it may ask for first. */
+export class GitLabPort extends GitLabReadPort implements ForgePort<ResolvedToken> {
  constructor(
   private readonly config: RangerConfig,
   runner: typeof runCmd = runCmd,
   private readonly env: NodeJS.ProcessEnv = process.env,
+  private readonly wait: RebaseWait = REBASE_WAIT,
  ) { super(runner); }
 
  private mrEndpoint(repo: string, n: number): string {
   return `${this.project(repo)}/merge_requests/${id(n, repo, "iid")}`;
  }
 
- private async write(repo: string, token: string, endpoint: string, method: "POST" | "PUT", fields: string[]): Promise<unknown> {
+ private async send(repo: string, token: string, endpoint: string, method: "POST" | "PUT", fields: string[]) {
   // Validate the exact credential used below, not merely another token from config.
   const credential = resolveWriteToken(this.config, repo, this.env);
   if (token !== credential.token) throw new WriteGateError("GitLab write credential differs from the configured machine credential");
@@ -245,12 +289,69 @@ export class GitLabPort extends GitLabReadPort implements Omit<ForgePort<Resolve
    if (error instanceof WriteGateError) throw error;
    throw new GitLabWriteError("write transport failed", endpoint);
   }
-  if (result.code !== 0) throw new GitLabWriteError(`write failed (exit ${result.code})`, endpoint);
-  const { status, body } = parseGlabResponse(result);
+  return { code: result.code, ...parseGlabResponse(result) };
+ }
+
+ private async write(repo: string, token: string, endpoint: string, method: "POST" | "PUT", fields: string[]): Promise<unknown> {
+  const { code, status, body } = await this.send(repo, token, endpoint, method, fields);
+  if (code !== 0) throw new GitLabWriteError(`write failed (exit ${code})`, endpoint);
   if (status < 200 || status >= 300) {
-   throw new GitLabWriteError(`write failed (exit ${result.code})`, endpoint, status);
+   throw new GitLabWriteError(`write failed (exit ${code})`, endpoint, status);
   }
   return body;
+ }
+
+ /**
+  * A write whose HTTP refusals are answers, not faults. glab exits nonzero on
+  * an HTTP error but still prints the status line, so the status decides; a
+  * missing status or a nonzero exit on a success status stays a fault.
+  */
+ private async answer(repo: string, token: string, endpoint: string, fields: string[]): Promise<{ status: number; body: unknown }> {
+  const { code, status, body } = await this.send(repo, token, endpoint, "PUT", fields);
+  if (status === 0 || (code !== 0 && status < 400)) throw new GitLabWriteError(`write failed (exit ${code})`, endpoint, status || undefined);
+  return { status, body };
+ }
+
+ /**
+  * Squash-merge pinned to the gated head (ranger issue #97 ruling Q4: the
+  * project keeps `rebase_merge`, ranger passes `squash=true`). A 409 is GitLab
+  * saying the head is no longer `sha`; 405/406/422 is GitLab declining.
+  */
+ async mergePr(repo: string, n: number, sha: string, title: string, token: string): Promise<MergeOutcome> {
+  const endpoint = `${this.mrEndpoint(repo, n)}/merge`;
+  string(sha, endpoint, "gated head SHA");
+  const { status, body } = await this.answer(repo, token, endpoint, [
+   "-F", "squash=true", "-f", `sha=${sha}`, "-f", `squash_commit_message=${title} (!${n})`,
+  ]);
+  if (status === 409) return { status: "head-moved", reason: `!${n} is no longer at ${sha.slice(0, 8)} (${forgeMessage(body, status)})` };
+  if ([405, 406, 422].includes(status)) return { status: "not-mergeable", reason: `GitLab declined to merge !${n}: ${forgeMessage(body, status)}` };
+  if (status < 200 || status >= 300) throw new GitLabWriteError(`merge failed (${forgeMessage(body, status)})`, endpoint, status);
+  return this.decodeWrite(endpoint, () => {
+   const r = object(body, endpoint);
+   if (r.state !== "merged") invalid(endpoint, "state");
+   // The merge happened; a squash GitLab did not honour is escalated, not hidden.
+   if (r.squash !== true) return { status: "refused", reason: `GitLab merged !${n} without squashing (squash=${String(r.squash)}): check the project's squash option` };
+   return { status: "merged" };
+  });
+ }
+
+ /**
+  * Ask GitLab to rebase the MR's source branch onto its target, then poll
+  * `rebase_in_progress` (read credential) a bounded number of times. Never
+  * merges: a finished rebase moves the head, which the merge gate must see.
+  */
+ async rebaseAndWait(repo: string, n: number, token: { read: ResolvedToken; write: string }): Promise<RebaseOutcome> {
+  const endpoint = `${this.mrEndpoint(repo, n)}/rebase`;
+  const { status, body } = await this.answer(repo, token.write, endpoint, []);
+  if (status < 200 || status >= 300) return { status: "not-mergeable", reason: `GitLab declined to rebase !${n}: ${forgeMessage(body, status)}` };
+  for (let poll = 0; poll < this.wait.polls; poll++) {
+   await this.wait.sleep(this.wait.intervalMs);
+   const state = await this.rebaseState(repo, n, token.read);
+   if (state.inProgress) continue;
+   if (state.mergeError !== null) return { status: "not-mergeable", reason: `GitLab could not rebase !${n}: ${state.mergeError}` };
+   return { status: "head-moved", headSha: state.headSha };
+  }
+  return { status: "pending", reason: `GitLab is still rebasing !${n} after ${this.wait.polls} checks` };
  }
 
  private decodeWrite<T>(endpoint: string, decode: () => T): T {
@@ -294,4 +395,35 @@ export class GitLabPort extends GitLabReadPort implements Omit<ForgePort<Resolve
   const raw = await this.write(repo, token, endpoint, "POST", ["-f", `body=${body}`]);
   return this.decodeWrite(endpoint, () => id(object(raw, endpoint).id, endpoint, "note.id"));
  }
+}
+
+/**
+ * The GitLab port in the shape the supervisor lanes hold: one string
+ * credential per call, the machine write token. Writes pass it through to
+ * the write gate; reads ignore it and use the map's read-only credential,
+ * gated once per adapter. Make one per desk pass, never a long-lived one:
+ * the read gate must see a token revoked or re-scoped since.
+ */
+export function gitlabForgePort(
+ config: RangerConfig,
+ opts: { runner?: typeof runCmd; env?: NodeJS.ProcessEnv; wait?: RebaseWait } = {},
+): ForgePort {
+ const env = opts.env ?? process.env;
+ const runner = opts.runner ?? runCmd;
+ const port = new GitLabPort(config, runner, env, opts.wait);
+ const read = tokenBatch(config, (c, repo) => assertReadOnlyToken(c, repo, env, runner));
+ return {
+  findPrByHead: async (repo, branch) => port.findPrByHead(repo, branch, await read(repo)),
+  getPr: async (repo, n) => port.getPr(repo, n, await read(repo)),
+  ciVerdictFor: async (repo, sha, _token, purpose) => port.ciVerdictFor(repo, sha, await read(repo), purpose),
+  issueLabels: async (repo, issue) => port.issueLabels(repo, issue, await read(repo)),
+  listComments: async (repo, n) => port.listComments(repo, n, await read(repo)),
+  squashRefusal: async (repo) => port.squashRefusal(repo, await read(repo)),
+  createDraftPr: (repo, pr, token) => port.createDraftPr(repo, pr, token),
+  updatePrBody: (repo, n, body, token) => port.updatePrBody(repo, n, body, token),
+  markReady: (repo, pr, token) => port.markReady(repo, pr, token),
+  postComment: (repo, n, body, token) => port.postComment(repo, n, body, token),
+  mergePr: (repo, n, sha, title, token) => port.mergePr(repo, n, sha, title, token),
+  rebasePr: async (repo, n, token) => port.rebaseAndWait(repo, n, { read: await read(repo), write: token }),
+ };
 }

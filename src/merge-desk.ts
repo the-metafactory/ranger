@@ -17,6 +17,8 @@ import {
 import type { Journal, WorkerRow } from "./journal.ts";
 import { evaluateMergeGate, type MergeGateInput, type MergeGateResult } from "./merge-gate.ts";
 import type { IssueComment, ChangeRequest, CiVerdict, ForgePort } from "./forge.ts";
+import { parseForgeRef } from "./forge-ref.ts";
+import { gitlabForgePort } from "./gitlab.ts";
 import { CI_FAILED_PARK_OUTCOME, mergeGateFailedOutcome } from "./outcomes.ts";
 
 /**
@@ -39,6 +41,13 @@ import { CI_FAILED_PARK_OUTCOME, mergeGateFailedOutcome } from "./outcomes.ts";
  * ranger:needs-eye label. A merge-only move starts no worker session, so the
  * implement lane is never consulted. Anything short of that leaves it parked
  * quietly, with no send-back, no spawn and no new park card.
+ *
+ * On a GitLab map (node #126) the desk holds the GitLab port. A project under
+ * `rebase_merge` may answer `needs-rebase`: once the rest of the gate passes
+ * and ranger would merge, it rebases and stops, and the new head is re-gated
+ * (a fresh review round, since a review never carries across a rebase). The
+ * merge is squashed and pinned to the gated head, and a project whose squash
+ * option is `never` parks with a card before any write.
  *
  * Ranger never merges: approver-bot is unprovisioned (node #6/#16), so the
  * principal merges by hand. The review evidence is read from the bot's own
@@ -81,13 +90,30 @@ function headEvidence(
  comments: IssueComment[],
  headSha: string,
  botIdentity: string,
-): { last?: Review; probe?: Probe; superseded: string | null } {
+): { last?: Review; probe?: Probe; superseded: string | null; latestSha: string | null } {
  const reviews = recordedReviews(comments, botIdentity);
  return {
   last: reviewAtHead(reviews, headSha),
   probe: recordedProbes(comments, botIdentity).find((p) => p.sha === headSha && p.passed),
   superseded: supersededNote(reviews, headSha),
+  latestSha: reviews.at(-1)?.sha ?? null,
  };
+}
+
+/**
+ * The forge port for a map: GitLab's for `gitlab:` maps (made per pass, so
+ * its read gate runs fresh), GitHub's otherwise.
+ */
+export function deskPort(config: RangerConfig, map: RangerMapConfig): ForgePort {
+ return parseForgeRef(map.repo).forge === "gitlab" ? gitlabForgePort(config) : realGitHub;
+}
+
+const REBASED_FROM = /^from=([0-9a-f]{7,64})\b/;
+
+/** The head ranger last asked the forge to rebase this node's change request from, if any. */
+function lastRebaseFrom(journal: Journal, repo: string, nodeId: string): string | null {
+ const event = journal.listNodeEvents(repo, nodeId).find((e) => e.kind === "rebased");
+ return event === undefined ? null : (REBASED_FROM.exec(event.detail ?? "")?.[1] ?? null);
 }
 
 function gateInput(map: RangerMapConfig, pr: ChangeRequest, ci: CiVerdict, last?: Review, probe?: Probe): MergeGateInput {
@@ -142,7 +168,7 @@ export function ciOnlyPark(w: WorkerRow): boolean {
 
 export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResult> {
  const { journal, map, token, botIdentity } = ctx;
- const github = ctx.github ?? realGitHub;
+ const github = ctx.github ?? deskPort(ctx.config, map);
  const repo = map.repo;
  const result: MergeDeskResult = { cards: [], merged: [], resumed: [], parked: [], pending: [], errors: [] };
  let announcer: DiscordAnnouncer | undefined;
@@ -232,7 +258,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    return;
   }
 
-  const { last, probe, superseded } = headEvidence(await github.listComments(repo, pr.iid, token), pr.headSha, botIdentity);
+  const { last, probe, superseded, latestSha } = headEvidence(await github.listComments(repo, pr.iid, token), pr.headSha, botIdentity);
   const probesRequired = map.commands.probe !== undefined;
 
   // Send a ready PR back to run-node when the rules it went ready under no
@@ -248,14 +274,22 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   const reworkFindings = last !== undefined && gatingFindings(last) > 0;
   const conflicting = last !== undefined && pr.mergeState === "conflict";
   const missingProbes = probesRequired && probe === undefined && last !== undefined;
+  // Ranger rebased the reviewed head (a forge under rebase_merge asked): the
+  // new head has no review, so it is re-gated by a fresh round, not parked.
+  // The review never carries across the rebase: the gate binds to its head.
+  const rebaseFrom = last === undefined ? lastRebaseFrom(journal, repo, row.nodeId) : null;
+  const rebased = rebaseFrom !== null && rebaseFrom === latestSha && rebaseFrom !== pr.headSha;
+  const sendBack = reworkFindings || conflicting || missingProbes || rebased;
   // A send-back is a worker session; a CI-only park never starts one.
-  if (ciPark && (reworkFindings || conflicting || missingProbes)) return;
-  if ((reworkFindings || conflicting || missingProbes) && ctx.spawn !== undefined) {
+  if (ciPark && sendBack) return;
+  if (sendBack && ctx.spawn !== undefined) {
    const why = reworkFindings
     ? `sage round ${last?.round} at ${pr.headSha.slice(0, 8)} has ${last?.blockers} blocker(s) and ${last?.majors} major(s) to rework`
     : conflicting
      ? `PR #${pr.iid} conflicts with ${map.base} at ${pr.headSha.slice(0, 8)}`
-     : `no passing probe run at ${pr.headSha.slice(0, 8)}`;
+     : rebased
+      ? `ranger rebased PR #${pr.iid} from ${rebaseFrom.slice(0, 8)}; the new head ${pr.headSha.slice(0, 8)} has no review yet`
+      : `no passing probe run at ${pr.headSha.slice(0, 8)}`;
    if (row.mergeMessageId !== null) {
     try {
      await post(
@@ -299,7 +333,11 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    result.resumed.push(row.nodeId);
    return;
   }
-  const gate = evaluateMergeGate(gateInput(map, pr, await github.ciVerdictFor(repo, pr.headSha, token), last, probe));
+  // A forge that asks for a rebase (GitLab under rebase_merge) is gated on
+  // everything else first: ranger rebases only a change it would merge.
+  const needsRebase = pr.mergeState === "needs-rebase" && github.rebasePr !== undefined;
+  const gated = needsRebase ? { ...pr, mergeState: "mergeable" as const } : pr;
+  const gate = evaluateMergeGate(gateInput(map, gated, await github.ciVerdictFor(repo, pr.headSha, token), last, probe));
 
   // A CI-only park stays parked, quietly, until the whole gate passes.
   if (ciPark && gate.status !== "pass") return;
@@ -341,7 +379,37 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    if (row.mergeMessageId !== null) return; // its card is still up
   }
   if (map.autoMerge && !needsEye && superseded === null) {
-   await github.mergePr(repo, pr.iid, gate.headSha, pr.title, token);
+   // Ranger merges only squashed: a project that forbids it escalates before any write.
+   const squashRefusal = github.squashRefusal === undefined ? null : await github.squashRefusal(repo, token);
+   if (squashRefusal !== null) {
+    await park(row, `${squashRefusal}. Merge it by hand, or allow squash on the project.`, title);
+    return;
+   }
+   if (needsRebase && github.rebasePr !== undefined) {
+    // Rebase, then stop: the new head is re-gated on a later pass, never merged in this one.
+    const rebase = await github.rebasePr(repo, pr.iid, token);
+    if (rebase.status === "not-mergeable") {
+     await park(row, rebase.reason, title);
+     return;
+    }
+    journal.recordEvent("rebased", {
+     nodeId: row.nodeId,
+     repo,
+     detail: `from=${gate.headSha} ${rebase.status === "head-moved" ? `to=${rebase.headSha}` : `(${rebase.reason})`}: PR #${pr.iid} rebased by ranger onto ${map.base}; the head moved, so it is re-gated there`,
+    });
+    result.pending.push(row.nodeId);
+    return;
+   }
+   const merge = (await github.mergePr(repo, pr.iid, gate.headSha, pr.title, token)) ?? { status: "merged" as const };
+   if (merge.status === "head-moved") {
+    journal.recordEvent("sweep", { nodeId: row.nodeId, repo, detail: `PR #${pr.iid}: nothing merged, ${merge.reason}; re-gating the new head` });
+    result.pending.push(row.nodeId);
+    return;
+   }
+   if (merge.status !== "merged") {
+    await park(row, merge.reason, title);
+    return;
+   }
    journal.recordEvent("merged", {
     nodeId: row.nodeId,
     repo,
@@ -376,6 +444,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
     ...(superseded !== null
      ? [`Note: ${superseded}; the reviewer may have missed it, check before you merge.${map.autoMerge ? " Auto-merge is held on this head for that reason." : ""}`]
      : []),
+    ...(needsRebase ? [`The forge asks for a rebase first: rebase the MR onto \`${map.base}\`, then merge it.`] : []),
     ...(probesRequired
      ? [`Probes passed at \`${gate.headSha.slice(0, 8)}\` (selection ${probe?.mode ?? "?"}, ${probe?.selected ?? "?"} probe(s)). Only the selected probes ran, not the full suite.${baseRedNote(probe)}`]
      : ["No probe tier on this map: CI and the tests are the only automated checks."]),

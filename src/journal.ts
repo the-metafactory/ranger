@@ -176,6 +176,7 @@ export type EventKind =
  | "awaiting-merge"
  | "merge-card"
  | "merged"
+ | "rebased"
  | "orphan-killed"
  | "substrate-capped"
  | "transient"
