@@ -90,11 +90,13 @@ function pipeline(raw: unknown, endpoint: string): { id: number; source: string;
  };
 }
 
-function nextPage(next: string | undefined, page: number, rowCount: number, endpoint: string): number | null {
- if (next === "" || (next === undefined && rowCount < 100)) return null;
+function nextPage(next: string | undefined, page: number, endpoint: string): number | null {
+ // Row counts prove nothing: GitLab filters some lists (notes) after paginating,
+ // so a short page can sit mid-collection. Only an empty X-Next-Page ends a read.
+ if (next === "") return null;
  // Follow numeric pages only, never a server-provided URL or a backward loop.
- const following = next === undefined ? page + 1 : Number(next);
- if ((next !== undefined && !/^\d+$/.test(next)) || !Number.isSafeInteger(following) || following <= page) invalid(endpoint, "X-Next-Page");
+ const following = Number(next);
+ if (next === undefined || !/^\d+$/.test(next) || !Number.isSafeInteger(following) || following <= page) invalid(endpoint, "X-Next-Page");
  return following;
 }
 
@@ -129,7 +131,7 @@ export class GitLabReadPort implements ForgeReadPort<ResolvedToken> {
    const path = `${endpoint}${endpoint.includes("?") ? "&" : "?"}per_page=100&page=${page}`;
    const { body, next } = await this.read(repo, token, path);
    if (!Array.isArray(body)) invalid(path, "array");
-   const following = nextPage(next, page, body.length, path);
+   const following = nextPage(next, page, path);
    yield { endpoint: path, rows: body };
    if (following === null) return;
    page = following;

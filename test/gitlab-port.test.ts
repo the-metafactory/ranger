@@ -14,8 +14,9 @@ const repo = `gitlab:${host}/team/sub/project`;
 const project = "projects/team%2Fsub%2Fproject";
 const sha = fixture.mr.sha;
 const config = { auth: { readOnlyTokens: { [`gitlab:${host}/`]: "READ_GL" } } } as unknown as RangerConfig;
-const response = (body: unknown, next?: string, status = 200, code = status === 200 ? 0 : 1): RunResult => ({
- code, stderr: "", stdout: `HTTP/2.0 ${status} Response\r\nContent-Type: application/json\r\n${next === undefined ? "" : `X-Next-Page: ${next}\r\n`}\r\n${JSON.stringify(body)}`,
+// `next` defaults to GitLab's last-page header; `null` omits the header.
+const response = (body: unknown, next: string | null = "", status = 200, code = status === 200 ? 0 : 1): RunResult => ({
+ code, stderr: "", stdout: `HTTP/2.0 ${status} Response\r\nContent-Type: application/json\r\n${next === null ? "" : `X-Next-Page: ${next}\r\n`}\r\n${JSON.stringify(body)}`,
 });
 const mrPath = `${project}/merge_requests/7`;
 const findPath = `${project}/merge_requests?source_branch=node%2F124%20%26%20fixtures&state=all&per_page=100&page=1`;
@@ -193,12 +194,15 @@ describe("GitLab notes and issue labels", () => {
   expect(calls.every(path => path.includes("?order_by=created_at&sort=asc&"))).toBeTrue();
   for (const dir of dirs) expect(existsSync(dir)).toBeFalse();
  });
- test("without pagination headers full pages continue until short page", async () => {
-  const { port, token, calls } = await setup(path => response(path === notesPath ? Array.from({ length: 100 }, (_, i) => ({
-   id: i + 1, system: false, author: { username: "bot" }, body: "note",
-  })) : fixture.notes[1]));
-  expect(await port.listComments(repo, 7, token)).toHaveLength(101);
+ test("an empty page with a next page header keeps reading: GitLab filters notes after paginating", async () => {
+  const { port, token, calls } = await setup(path => path === notesPath ? response([], "2") : response(fixture.notes[1], ""));
+  expect(await port.listComments(repo, 7, token)).toEqual([{ id: 12, author: "ivy-bot", body: "" }]);
   expect(calls).toHaveLength(2);
+ });
+ test.each([0, 2, 3])("paginated read %i without X-Next-Page cannot establish completion, even with a Link header", async index => {
+  const bare = response([], null);
+  const { port, token } = await setup(() => ({ ...bare, stdout: bare.stdout.replace("\r\n\r\n", '\r\nLink: <https://gitlab.example.test/api/v4/x?page=2>; rel="next"\r\n\r\n') }));
+  expect((await rejection(reads[index]!(port, repo, token))).message).toContain("X-Next-Page");
  });
  test.each(["0", "1", "-1", "https://evil.test", "NaN", "9007199254740992"])("invalid next page %s throws", async next => {
   const { port, token } = await setup(() => response([], next));
@@ -233,11 +237,11 @@ const reads: Read[] = [
 ];
 describe("every GitLab read fails closed", () => {
  test.each([401, 403, 404, 500].flatMap(status => [0, 1].map(code => ({ status, code }))))("HTTP errors retain status for zero and nonzero glab exits %j", async ({ status, code }) => {
-  const { port, token, dirs } = await setup(() => response({ message: "denied" }, undefined, status, code));
+  const { port, token, dirs } = await setup(() => response({ message: "denied" }, null, status, code));
   for (const read of reads) expect((await rejection(read(port, repo, token))).status).toBe(status);
   for (const dir of dirs) expect(existsSync(dir)).toBeFalse();
  });
- test.each([response(null), response({}), { code: 0, stdout: "HTTP/2.0 200 OK\n\nnot JSON", stderr: "" }, response({}, undefined, 200, 1)])("malformed transport or schema %j cannot pass", async result => {
+ test.each([response(null), response({}), { code: 0, stdout: "HTTP/2.0 200 OK\n\nnot JSON", stderr: "" }, response({}, null, 200, 1)])("malformed transport or schema %j cannot pass", async result => {
   const { port, token } = await setup(() => result);
   for (const read of reads) await expect(read(port, repo, token)).rejects.toBeInstanceOf(GitLabReadError);
  });
@@ -251,7 +255,7 @@ describe("every GitLab read fails closed", () => {
   expect(calls).toHaveLength(0);
  });
  test("failure on a later notes page never returns partial notes", async () => {
-  const { port, token } = await setup(path => path === notesPath ? response(fixture.notes[0], "2") : response({}, undefined, 404));
+  const { port, token } = await setup(path => path === notesPath ? response(fixture.notes[0], "2") : response({}, null, 404));
   await expect(port.listComments(repo, 7, token)).rejects.toBeInstanceOf(GitLabReadError);
  });
  test("spawn failures are typed, sanitized, and clean private config directories", async () => {

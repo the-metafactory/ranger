@@ -40,8 +40,10 @@ requires a separate policy and is outside this node.
 
 `listComments` takes an MR iid, never an issue iid: GitLab numbers issues
 and MRs separately, and every current caller passes a PR/MR number.
-MR notes request `order_by=created_at&sort=asc` (oldest first) and follow numeric `X-Next-Page` headers to completion. If
-headers are absent, full pages continue until a short page. Invalid/backward page hints
+MR notes request `order_by=created_at&sort=asc` (oldest first) and follow numeric `X-Next-Page` headers to completion; only an empty
+`X-Next-Page` ends a read. Row counts never do: GitLab filters notes after
+paginating, so a short or empty page can sit mid-collection. A page without
+`X-Next-Page` (a `Link` header alone included) and invalid/backward page hints
 throw rather than return partial results. System notes are dropped;
 human/bot note authors use `author.username`. Unlike GitHub issue comments,
 the result still includes diff and discussion notes; only `system` is
