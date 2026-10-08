@@ -127,6 +127,8 @@ Absent/interrupted receipts and nonzero SSH exits are pending before the deadlin
 and `infra_failed` after it. A nonzero exit does not prove admission or refusal.
 Typed `receiver_failed`/`invalid_receipt`, stale/wrong-identity receipts, revoked
 success and incomplete required coverage cannot establish accepted success.
+The [default-off private refusal recorder](remote-test-ssh.md#private-receiver-refusal-diagnostics) is available for a later operator activation checkpoint. Its synthetic fixtures do not establish the original incident cause. Archive required incident diagnostics privately before write-triggered seven-day expiry; activation grants no promotion or retry authority.
+
 Retain the original saved job and private evidence; query `status` first and
 inspect the operator-owned ledger/active attempt if no terminal receipt is
 available. An incomplete attempt directory without a saved job needs private

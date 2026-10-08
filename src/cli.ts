@@ -63,6 +63,7 @@ import { ActiveRemoteTestJob, BusyRemoteTestExecutor, RevokedRemoteTestJob, open
 import { validateRemoteTestJob } from "./remote-test/contract.ts";
 import { publishReceiptFile } from "./remote-test/artifacts.ts";
 import { runSshCommand, statusSshCommand, sshOutcomeExitCode, sshOutcomeMessage, type RunSshCommand } from "./remote-test/ssh-cli.ts";
+import { saveRefusalDiagnostic } from "./remote-test/receiver-diagnostics.ts";
 import { serveSshResponse } from "./remote-test/ssh-server.ts";
 
 /**
@@ -575,14 +576,21 @@ remoteTest.command("status")
 remoteTest.command("serve-stdio")
  .description("Fixed operator-only SSH entry point: receive one structured request on stdin")
  .requiredOption("--config <path>", "reviewed private executor JSON configuration")
- .action(async (options: { config: string }) => {
+ .option("--diagnostics-root <absolute-directory>", "existing private operator-only refusal store (default off)")
+ .action(async (options: { config: string; diagnosticsRoot?: string }) => {
+  const diagnostics = options.diagnosticsRoot === undefined ? undefined : { root: options.diagnosticsRoot };
   const abort = new AbortController(), cancel = () => { abort.abort(); process.stdin.destroy(Error("SSH input interrupted")); };
   process.once("SIGINT", cancel); process.once("SIGTERM", cancel); process.once("SIGHUP", cancel);
   // Includes upload idle time and bounded executor cleanup. No silent daemon.
   const timer = setTimeout(cancel, 15 * 60_000);
   try {
-   const config = JSON.parse(await readFile(await privateOperatorPath(options.config, true), "utf8"));
-   const response = await serveSshResponse(process.stdin, config, { signal: abort.signal });
+   let config;
+   try { config = JSON.parse(await readFile(await privateOperatorPath(options.config, true), "utf8")); }
+   catch {
+    await saveRefusalDiagnostic(diagnostics, { operation: null, job: null, primary: { stage: "config", code: "invalid_config" } });
+    throw Error("Invalid private executor config");
+   }
+   const response = await serveSshResponse(process.stdin, config, { signal: abort.signal, diagnostics });
    process.stdout.write(JSON.stringify(response) + "\n");
   } catch { process.stderr.write("ranger remote-test serve-stdio: request, admission, execution or storage failed; inspect private operator state.\n"); process.exitCode = 1; }
   finally { clearTimeout(timer); process.removeListener("SIGINT", cancel); process.removeListener("SIGTERM", cancel); process.removeListener("SIGHUP", cancel); }

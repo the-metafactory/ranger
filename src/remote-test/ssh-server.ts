@@ -1,3 +1,4 @@
+import { classifyReceiverFailure, saveRefusalDiagnostic, TaggedReceiverFailure, type DiagnosticStage, type RefusalDiagnostic, type ReceiverDiagnostics } from "./receiver-diagnostics.ts";
 import { createHash } from "node:crypto";
 import { lstat, mkdir, open, realpath, rm } from "node:fs/promises";
 import { join } from "node:path";
@@ -22,10 +23,24 @@ export interface SshServerOptions {
  execute?: typeof executeRemoteTest;
  /** Internal response negotiation seam; job and receipt identities remain V1. */
  onProtocolVersion?: (version: 1 | 2) => void;
+ /** Fixed operator configuration only, never taken from JSON/job/environment. */
+ diagnostics?: ReceiverDiagnostics;
+ /** Narrow upload/cleanup fault seam. */
+ fs?: Partial<{ open: typeof open; rm: typeof rm }>;
+ /** Deterministic expiry fixture; production uses the server clock. */
+ now?: () => number;
+}
+interface RefusalContext {
+ stage: DiagnosticStage;
+ operation: "submit" | "status" | null;
+ job: RefusalDiagnostic["job"];
+ jobsRoot?: string;
+ primary?: RefusalDiagnostic["primary"];
+ cleanup?: RefusalDiagnostic["cleanup"];
 }
 async function privateDirectory(path: string) {
  const info = await lstat(path);
- if (!info.isDirectory() || info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0) throw Error("SSH workspace must be private and operator-owned");
+ if (!info.isDirectory() || info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0) throw new TaggedReceiverFailure("unsafe_path", "SSH workspace must be private and operator-owned");
 }
 async function lookup(root: string, job: RemoteTestJob, executorId: string): Promise<RemoteTestReceipt | null> {
  const ledger = await openJobLedger(root, executorId);
@@ -51,46 +66,77 @@ async function lookup(root: string, job: RemoteTestJob, executorId: string): Pro
  * bytes and EOF, or a status request with no body. All paths and executable
  * policy come from private local configuration, never the request. */
 export async function serveSshRequest(input: AsyncIterable<Uint8Array>, operatorConfig: unknown, options: SshServerOptions = {}): Promise<SshResponse> {
- const config = validateExecutorConfig(operatorConfig);
- await privateOperatorPath(join(config.jobsRoot, "ssh-check"));
+ return receive(input, operatorConfig, options, { stage: "config", operation: null, job: null });
+}
+function failureTag(error: unknown, stage: DiagnosticStage) {
+ if (error instanceof InvalidSshReceipt || error instanceof InvalidStoredRemoteTestReceipt) return { stage, code: "invalid_receipt" as const };
+ return classifyReceiverFailure(error, stage);
+}
+async function receive(input: AsyncIterable<Uint8Array>, operatorConfig: unknown, options: SshServerOptions, context: RefusalContext): Promise<SshResponse> {
+ const now = options.now ?? Date.now;
+ context.stage = "config";
+ let config;
+ try { config = validateExecutorConfig(operatorConfig); }
+ catch { throw new TaggedReceiverFailure("invalid_config", "Invalid executor configuration"); }
+ context.jobsRoot = config.jobsRoot;
+ context.stage = "root";
+ try { await privateOperatorPath(join(config.jobsRoot, "ssh-check")); }
+ catch (error) {
+  if (classifyReceiverFailure(error, "root").code === "unknown") throw new TaggedReceiverFailure("unsafe_path", "Unsafe SSH workspace");
+  throw error;
+ }
  const root = await realpath(config.jobsRoot);
  await privateDirectory(root);
+ context.jobsRoot = root;
+ context.stage = "header";
  const iterator = input[Symbol.asyncIterator]();
  const parts: Buffer[] = []; let headerBytes = 0, rest = Buffer.alloc(0);
  for (;;) {
-  if (options.signal?.aborted) throw Error("SSH request interrupted");
-  const next = await iterator.next(); if (next.done) throw Error("Incomplete SSH header");
+  if (options.signal?.aborted) throw new TaggedReceiverFailure("interrupted", "SSH request interrupted");
+  const next = await iterator.next(); if (next.done) throw new TaggedReceiverFailure("incomplete_header", "Incomplete SSH header");
   const chunk = Buffer.from(next.value), newline = chunk.indexOf(10);
   const part = newline < 0 ? chunk : chunk.subarray(0, newline);
   headerBytes += part.length;
-  if (headerBytes > SSH_LIMITS.headerBytes) throw Error("SSH header exceeds limit");
+  if (headerBytes > SSH_LIMITS.headerBytes) throw new TaggedReceiverFailure("header_limit", "SSH header exceeds limit");
   parts.push(part);
   if (newline >= 0) { rest = chunk.subarray(newline + 1); break; }
  }
- const request = SshRequestSchema.parse(JSON.parse(Buffer.concat(parts, headerBytes).toString("utf8")));
+ context.stage = "request";
+ let request;
+ try { request = SshRequestSchema.parse(JSON.parse(Buffer.concat(parts, headerBytes).toString("utf8"))); }
+ catch { throw new TaggedReceiverFailure("malformed_request", "Malformed SSH request"); }
+ context.operation = request.operation;
  options.onProtocolVersion?.(request.version);
  const profileId = (request.job as { profileId?: unknown } | null)?.profileId;
  const selected = config.profiles.find(p => p.profile.profileId === profileId);
- if (!selected) throw Error("Job profile is not operator-approved");
- const job = validateRemoteTestJob(request.job, selected.profile);
+ if (!selected) throw new TaggedReceiverFailure("profile_not_approved", "Job profile is not operator-approved");
+ let job;
+ try { job = validateRemoteTestJob(request.job, selected.profile); }
+ catch { throw new TaggedReceiverFailure("job_invalid", "Invalid SSH job"); }
+ context.job = { jobId: job.jobId, generation: job.generation };
  if (request.operation === "status") {
-  if (rest.length) throw Error("Unexpected SSH status payload");
-  for (;;) { const next = await iterator.next(); if (next.done) break; if (next.value.byteLength) throw Error("Unexpected SSH status payload"); }
+  if (rest.length) throw new TaggedReceiverFailure("unexpected_payload", "Unexpected SSH status payload");
+  for (;;) { const next = await iterator.next(); if (next.done) break; if (next.value.byteLength) throw new TaggedReceiverFailure("unexpected_payload", "Unexpected SSH status payload"); }
+  context.stage = "lookup";
   return { version: request.version, receipt: await lookup(root, job, config.executorId) };
  }
- if (job.deadline <= Date.now()) throw Error("SSH submission deadline expired");
+ if (job.deadline <= now()) throw new TaggedReceiverFailure("expired", "SSH submission deadline expired");
+ context.stage = "lookup";
  let existing: RemoteTestReceipt | null = null, active = false;
  try { existing = await lookup(root, job, config.executorId); }
  catch (e) { if (e instanceof ActiveRemoteTestJob || e instanceof RevokedRemoteTestJob) active = true; else if (!(e instanceof InterruptedRemoteTestJob)) throw e; }
  if (existing || active) {
+  context.stage = "upload";
   // Drain the bounded declared upload so SSH can finish normally. A duplicate
   // never allocates another upload workspace or starts another execution.
-  let bytes = rest.length; if (bytes > request.bundleBytes) throw Error("Oversize duplicate upload");
-  for (;;) { const next = await iterator.next(); if (next.done) break; bytes += next.value.byteLength; if (bytes > request.bundleBytes) throw Error("Oversize duplicate upload"); }
-  if (bytes !== request.bundleBytes) throw Error("Incomplete duplicate upload");
+  let bytes = rest.length; if (bytes > request.bundleBytes) throw new TaggedReceiverFailure("upload_size", "Oversize duplicate upload");
+  for (;;) { const next = await iterator.next(); if (next.done) break; bytes += next.value.byteLength; if (bytes > request.bundleBytes) throw new TaggedReceiverFailure("upload_size", "Oversize duplicate upload"); }
+  if (bytes !== request.bundleBytes) throw new TaggedReceiverFailure("upload_size", "Incomplete duplicate upload");
   // Upload drainage may have outlived the generation too.
+  context.stage = "lookup";
   return { version: request.version, receipt: await lookup(root, job, config.executorId) };
  }
+ context.stage = "upload";
  const inbox = join(root, ".ssh-incoming");
  try { await mkdir(inbox, { mode: 0o700 }); }
  catch (e) { if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e; }
@@ -99,23 +145,34 @@ export async function serveSshRequest(input: AsyncIterable<Uint8Array>, operator
  await mkdir(directory, { mode: 0o700 }); // Exclusive; a busy or stale upload refuses.
  const bundlePath = join(directory, "source.bundle");
  try {
-  const file = await open(bundlePath, "wx", 0o600), hash = createHash("sha256"); let count = 0;
+  const file = await (options.fs?.open ?? open)(bundlePath, "wx", 0o600), hash = createHash("sha256"); let count = 0;
   try {
    const write = async (bytes: Uint8Array) => {
-    if (options.signal?.aborted || Date.now() >= job.deadline) throw Error("SSH upload interrupted or expired");
-    count += bytes.byteLength; if (count > request.bundleBytes) throw Error("SSH bundle exceeds declared size");
+    if (options.signal?.aborted) throw new TaggedReceiverFailure("interrupted", "SSH upload interrupted or expired");
+    if (now() >= job.deadline) throw new TaggedReceiverFailure("expired", "SSH upload interrupted or expired");
+    count += bytes.byteLength; if (count > request.bundleBytes) throw new TaggedReceiverFailure("upload_size", "SSH bundle exceeds declared size");
     hash.update(bytes);
     let offset = 0;
-    while (offset < bytes.byteLength) { const { bytesWritten } = await file.write(bytes, offset, bytes.byteLength - offset, null); if (!bytesWritten) throw Error("SSH upload made no progress"); offset += bytesWritten; }
+    while (offset < bytes.byteLength) { const { bytesWritten } = await file.write(bytes, offset, bytes.byteLength - offset, null); if (!bytesWritten) throw new TaggedReceiverFailure("upload_no_progress", "SSH upload made no progress"); offset += bytesWritten; }
    };
    await write(rest);
    for (;;) { const next = await iterator.next(); if (next.done) break; await write(next.value); }
-   if (count !== request.bundleBytes || `sha256:${hash.digest("hex")}` !== job.bundleDigest) throw Error("SSH bundle identity mismatch");
+   if (count !== request.bundleBytes) throw new TaggedReceiverFailure("upload_size", "SSH bundle identity mismatch");
+   if (`sha256:${hash.digest("hex")}` !== job.bundleDigest) throw new TaggedReceiverFailure("upload_digest", "SSH bundle identity mismatch");
    await file.sync();
   } finally { await file.close(); }
-  const receipt = producedReceipt(await (options.execute ?? executeRemoteTest)({ job, bundlePath, config }, { signal: options.signal }), job, config.executorId);
+  context.stage = "executor_boundary";
+  const produced = await (options.execute ?? executeRemoteTest)({ job, bundlePath, config }, { signal: options.signal });
+  context.stage = "receipt";
+  const receipt = producedReceipt(produced, job, config.executorId);
   return { version: request.version, receipt };
- } finally { await rm(directory, { recursive: true }); }
+ } catch (error) {
+  context.primary = failureTag(error, context.stage); throw error;
+ } finally {
+  context.stage = "cleanup";
+  try { await (options.fs?.rm ?? rm)(directory, { recursive: true }); }
+  catch (error) { context.cleanup = failureTag(error, "cleanup"); throw error; }
+ }
 }
 
 /** A completed, authenticated SSH command may report a typed failure without
@@ -123,7 +180,8 @@ export async function serveSshRequest(input: AsyncIterable<Uint8Array>, operator
  * No private error details enter the response. */
 export async function serveSshResponse(input: AsyncIterable<Uint8Array>, config: unknown, options: SshServerOptions = {}): Promise<SshResponse> {
  let version: 1 | 2 = 1;
- try { return await serveSshRequest(input, config, { ...options, onProtocolVersion: value => { version = value; options.onProtocolVersion?.(value); } }); }
+ const context: RefusalContext = { stage: "config", operation: null, job: null };
+ try { return await receive(input, config, { ...options, onProtocolVersion: value => { version = value; options.onProtocolVersion?.(value); } }, context); }
  catch (e) {
   if (e instanceof ActiveRemoteTestJob || e instanceof InterruptedRemoteTestJob || e instanceof RevokedRemoteTestJob || e instanceof BusyRemoteTestExecutor) {
    if (version === 1) return { version: 1, receipt: null };
@@ -131,6 +189,11 @@ export async function serveSshResponse(input: AsyncIterable<Uint8Array>, config:
    if (e instanceof BusyRemoteTestExecutor) return { version: 2, receipt: null, state: "busy" };
    return { version: 2, receipt: null, state: e instanceof ActiveRemoteTestJob ? "active" : "interrupted" };
   }
+  await saveRefusalDiagnostic(options.diagnostics, {
+   operation: context.operation, job: context.job,
+   primary: context.primary ?? failureTag(e, context.stage),
+   ...(context.primary && context.cleanup ? { cleanup: context.cleanup } : {}),
+  }, context.jobsRoot);
   return { version, error: e instanceof InvalidSshReceipt || e instanceof InvalidStoredRemoteTestReceipt ? "invalid_receipt" : "receiver_failed" };
  }
 }
