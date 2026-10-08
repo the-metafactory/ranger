@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { writeFileSync, mkdtempSync, rmSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig, ConfigError } from "../src/config.ts";
@@ -16,6 +16,38 @@ function withConfig(content: string, fn: (path: string) => void) {
 }
 
 describe("loadConfig", () => {
+  test("private shadow example substitutes into the current loader without changing authority", () => {
+    const template = readFileSync(new URL("../docs/examples/remote-test-private-shadow.yaml", import.meta.url), "utf8");
+    const replacements: Record<string, string> = {
+      REPLACE_REPO: "acme/widgets",
+      REPLACE_MAP_ROOT: "1",
+      REPLACE_SSH_CONFIG_ABSOLUTE_PATH: "/example-private/ssh.json",
+      REPLACE_STATE_ROOT_ABSOLUTE_PATH: "/example-private/state",
+      REPLACE_APPROVED_PROFILE_ID: "reviewed-example-v1",
+      REPLACE_COMMITTED_LOCK_FILENAME: "bun.lock",
+      REPLACE_DEADLINE_SECONDS: "660",
+      REPLACE_REPORT_ROOT_ABSOLUTE_PATH: "/example-private/reports",
+    };
+    expect(() => withConfig(template, path => loadConfig(path, {}))).toThrow(ConfigError);
+    const substituted = template.replace(/REPLACE_[A-Z_]+/g, placeholder => {
+      expect(replacements[placeholder]).toBeDefined();
+      return replacements[placeholder];
+    });
+    withConfig(substituted, path => {
+      const map = loadConfig(path, {}).config.maps[0];
+      expect(map.testBackend).toEqual({
+        kind: "shadow", configFile: replacements.REPLACE_SSH_CONFIG_ABSOLUTE_PATH,
+        stateRoot: replacements.REPLACE_STATE_ROOT_ABSOLUTE_PATH,
+        profileId: replacements.REPLACE_APPROVED_PROFILE_ID,
+        lockFile: "bun.lock", deadlineSeconds: 660,
+        reportRoot: replacements.REPLACE_REPORT_ROOT_ABSOLUTE_PATH,
+      });
+      expect(map.walk).toBe("none");
+      expect(map.autoMerge).toBe(false);
+      expect(map.commands).toEqual({ probeTimeoutMin: 30 });
+    });
+  });
+
   test("accepts host-qualified read prefixes alongside existing GitHub keys", () => {
     withConfig('maps:\n  - repo: acme/widgets\n    root: 1\nauth:\n  readOnlyTokens:\n    "*": GH\n    "github:github.com/acme/": GH_ACME\n    "gitlab:gitlab.example.org/team/": GL_TEAM\n', path => {
       expect(loadConfig(path).config.auth.readOnlyTokens["gitlab:gitlab.example.org/team/"]).toBe("GL_TEAM");
