@@ -13,9 +13,10 @@ which checks the project-bound grant and creates its own private
 MR reads normalize `state`, `sha`, `draft`, and `detailed_merge_status`.
 Per the node's binding contract, `opened` becomes `open`, `merged` becomes
 `merged`, and both `closed` and `locked` become `closed`. GitLab's `locked`
-state is transient while merging: a normalized `closed` value alone does
-not establish that an MR was abandoned. This port does not expose a separate
-merging state.
+state is transient while merging, so a locked MR also carries
+`mergeInProgress: true` on its `ChangeRequest`. A consumer must check that
+flag before treating `closed` as abandoned; wiring it into
+`resolvePhase` belongs to the lane-routing node.
 Unrecognized merge statuses are `unknown`; missing fields throw
 `GitLabReadError`. MR lookup finds the highest iid for the source branch
 across all result pages where `source_project_id === target_project_id`.
@@ -37,12 +38,21 @@ head SHA. They cannot qualify for this head-only query; without a qualifying
 source-head pipeline the verdict remains pending. Merge-ref verification
 requires a separate policy and is outside this node.
 
-MR notes request `order_by=created_at&sort=asc`, matching GitHub's oldest-first
-comment order, and follow numeric `X-Next-Page` headers to completion. If
+`listComments` takes an MR iid, never an issue iid: GitLab numbers issues
+and MRs separately, and every current caller passes a PR/MR number.
+MR notes request `order_by=created_at&sort=asc` (oldest first) and follow numeric `X-Next-Page` headers to completion. If
 headers are absent, full pages continue until a short page. Invalid/backward page hints
 throw rather than return partial results. System notes are dropped;
-human/bot note authors use `author.username`. Issue labels are read from
+human/bot note authors use `author.username`. Unlike GitHub issue comments,
+the result still includes diff and discussion notes; only `system` is
+filtered, as the node specifies. Issue labels are read from
 the issue endpoint, checking the requested iid and preserving `ranger:needs-eye`.
+
+The pipeline query is by SHA only, as the node specifies, and is not scoped to
+the MR's ref: a `push` pipeline for the same SHA on another branch can decide
+the verdict. Ref scoping needs the head branch in `ciVerdictFor` and must
+keep `merge_request_event` pipelines (`refs/merge-requests/<iid>/head`); it
+is left to the soma-side CI verifier.
 
 HTTP errors, malformed JSON, missing/invalid required fields, and transport
 failures throw typed errors. Subprocess output is excluded from diagnostics

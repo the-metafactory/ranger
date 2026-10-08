@@ -1,7 +1,8 @@
 import type { ChangeRequest, CiPurpose, CiVerdict, ForgeReadPort, IssueComment, MergeState } from "./forge.ts";
 import { parseForgeRef } from "./forge-ref.ts";
 import { runCmd } from "./exec.ts";
-import { GateError, gitlabApiRead, parseGlabResponse, type ResolvedToken } from "./token-gate.ts";
+import { parseGlabResponse } from "./glab-transport.ts";
+import { GateError, gitlabApiRead, type ResolvedToken } from "./token-gate.ts";
 
 /** Transport and schema failures never become a passing gate value. */
 export class GitLabReadError extends Error {
@@ -59,13 +60,33 @@ function changeRequest(raw: unknown, endpoint: string): { mr: ChangeRequest; sam
  return {
   sameProject: id(r.source_project_id, endpoint, "source_project_id") === id(r.target_project_id, endpoint, "target_project_id"),
   mr: {
-   iid: id(r.iid, endpoint, "iid"), state: MR_STATE[state]!,
-   draft: r.draft, headRef: string(r.source_branch, endpoint, "source_branch"), headSha: string(r.sha, endpoint, "sha"),
-   baseRef: string(r.target_branch, endpoint, "target_branch"), mergeState: gitlabMergeState(detail), mergeDetail: detail,
-   webUrl: string(r.web_url, endpoint, "web_url"), author: username(r.author, endpoint, "author"),
-   title: string(r.title, endpoint, "title"), mergeCommitSha: nullableString(r.merge_commit_sha, endpoint, "merge_commit_sha"),
+   iid: id(r.iid, endpoint, "iid"),
+   state: MR_STATE[state]!,
+   draft: r.draft,
+   headRef: string(r.source_branch, endpoint, "source_branch"),
+   headSha: string(r.sha, endpoint, "sha"),
+   baseRef: string(r.target_branch, endpoint, "target_branch"),
+   mergeState: gitlabMergeState(detail),
+   mergeDetail: detail,
+   webUrl: string(r.web_url, endpoint, "web_url"),
+   author: username(r.author, endpoint, "author"),
+   title: string(r.title, endpoint, "title"),
+   mergeCommitSha: nullableString(r.merge_commit_sha, endpoint, "merge_commit_sha"),
    mergedBy: r.merge_user === null ? null : username(r.merge_user, endpoint, "merge_user"),
+   // `locked` reads closed by contract, but the MR is mid-merge, not abandoned.
+   ...(state === "locked" ? { mergeInProgress: true as const } : {}),
   },
+ };
+}
+
+function pipeline(raw: unknown, endpoint: string): { id: number; source: string; sha: string; status: string; url: string } {
+ const r = object(raw, endpoint);
+ return {
+  id: id(r.id, endpoint, "pipeline.id"),
+  source: string(r.source, endpoint, "pipeline.source"),
+  sha: string(r.sha, endpoint, "pipeline.sha"),
+  status: string(r.status, endpoint, "pipeline.status"),
+  url: string(r.web_url, endpoint, "pipeline.web_url"),
  };
 }
 
@@ -141,18 +162,13 @@ export class GitLabReadPort implements ForgeReadPort<ResolvedToken> {
  async ciVerdictFor(repo: string, sha: string, token: ResolvedToken, _purpose?: CiPurpose): Promise<CiVerdict> {
   string(sha, repo, "head SHA");
   const endpoint = `${this.project(repo)}/pipelines?sha=${encodeURIComponent(sha)}&order_by=id&sort=desc`;
-  let latest: { id: number; status: string; url: string } | undefined;
+  let latest: ReturnType<typeof pipeline> | undefined;
   for await (const page of this.pages(repo, token, endpoint)) {
    for (const raw of page.rows) {
-    const r = object(raw, page.endpoint);
-    const pipelineId = id(r.id, page.endpoint, "pipeline.id");
-    const source = string(r.source, page.endpoint, "pipeline.source");
-    const head = string(r.sha, page.endpoint, "pipeline.sha");
-    const status = string(r.status, page.endpoint, "pipeline.status");
-    const url = string(r.web_url, page.endpoint, "pipeline.web_url");
-    if (head !== sha) invalid(page.endpoint, "pipeline.sha differs from requested head");
-    if (!["push", "merge_request_event"].includes(source)) continue;
-    if (latest === undefined || pipelineId > latest.id) latest = { id: pipelineId, status, url };
+    const row = pipeline(raw, page.endpoint);
+    if (row.sha !== sha) invalid(page.endpoint, "pipeline.sha differs from requested head");
+    if (!["push", "merge_request_event"].includes(row.source)) continue;
+    if (latest === undefined || row.id > latest.id) latest = row;
    }
    // The API orders ids descending, so later pages cannot supersede this page.
    if (latest !== undefined) break;
@@ -167,8 +183,9 @@ export class GitLabReadPort implements ForgeReadPort<ResolvedToken> {
   };
  }
 
- async listComments(repo: string, n: number, token: ResolvedToken): Promise<IssueComment[]> {
-  const endpoint = `${this.project(repo)}/merge_requests/${id(n, repo, "iid")}/notes?order_by=created_at&sort=asc`;
+ /** MR notes: GitLab issue and MR iids are separate namespaces, so this never reads issue notes. */
+ async listComments(repo: string, changeRequest: number, token: ResolvedToken): Promise<IssueComment[]> {
+  const endpoint = `${this.project(repo)}/merge_requests/${id(changeRequest, repo, "iid")}/notes?order_by=created_at&sort=asc`;
   const comments: IssueComment[] = [];
   for await (const page of this.pages(repo, token, endpoint)) {
    for (const raw of page.rows) {
@@ -182,10 +199,10 @@ export class GitLabReadPort implements ForgeReadPort<ResolvedToken> {
   return comments;
  }
 
- async issueLabels(repo: string, n: number, token: ResolvedToken): Promise<string[]> {
-  const endpoint = `${this.project(repo)}/issues/${id(n, repo, "iid")}`;
+ async issueLabels(repo: string, issue: number, token: ResolvedToken): Promise<string[]> {
+  const endpoint = `${this.project(repo)}/issues/${id(issue, repo, "iid")}`;
   const r = object((await this.read(repo, token, endpoint)).body, endpoint);
-  if (id(r.iid, endpoint, "iid") !== n) invalid(endpoint, "iid differs from requested issue");
+  if (id(r.iid, endpoint, "iid") !== issue) invalid(endpoint, "iid differs from requested issue");
   if (!Array.isArray(r.labels) || r.labels.some(label => typeof label !== "string")) invalid(endpoint, "labels");
   return r.labels;
  }

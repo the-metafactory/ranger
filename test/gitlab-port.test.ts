@@ -89,7 +89,9 @@ describe("GitLab MR reads", () => {
    expect(path).toBe(mrPath);
    return response({ ...fixture.mr, state, merge_commit_sha: sha, merge_user: { username: "merge-bot" } });
   });
-  expect(await port.getPr(repo, 7, token)).toMatchObject({ state: expected, headSha: sha, mergedBy: "merge-bot", mergeCommitSha: sha });
+  const mr = await port.getPr(repo, 7, token);
+  expect(mr).toMatchObject({ state: expected, headSha: sha, mergedBy: "merge-bot", mergeCommitSha: sha });
+  expect(mr.mergeInProgress).toBe(state === "locked" ? true : undefined);
  });
  test.each(Object.keys(fixture.mr).filter(key => key !== "id"))("missing MR field %s throws on find and get", async field => {
   const raw: Record<string, unknown> = { ...fixture.mr };
@@ -106,7 +108,9 @@ describe("GitLab MR reads", () => {
 });
 
 describe("GitLab detailed merge status", () => {
- // Independent oracle from node #124's binding status table; do not derive it from the adapter.
+ // Mirrors the detailed_merge_status table in node #124's acceptance criteria; keep it literal rather than
+ // derived from the adapter. merge_time and external_status_checks are real GitLab values the table does not
+ // list, so they fall under its "any other value → unknown" rule.
  const mappings = {
   mergeable: ["mergeable"], conflict: ["conflict"], "needs-rebase": ["need_rebase"],
   pending: ["checking", "unchecked", "preparing", "approvals_syncing", "ci_still_running", "ci_must_pass"],
@@ -214,6 +218,11 @@ describe("GitLab notes and issue labels", () => {
  });
 });
 
+async function rejection(pending: Promise<unknown>): Promise<GitLabReadError> {
+ try { await pending; } catch (error) { expect(error).toBeInstanceOf(GitLabReadError); return error as GitLabReadError; }
+ throw new Error("unexpected success");
+}
+
 type Read = (p: ForgeReadPort<ResolvedToken>, r: string, t: ResolvedToken) => Promise<unknown>;
 const reads: Read[] = [
  (p, r, t) => p.findPrByHead(r, fixture.mr.source_branch, t),
@@ -225,10 +234,7 @@ const reads: Read[] = [
 describe("every GitLab read fails closed", () => {
  test.each([401, 403, 404, 500].flatMap(status => [0, 1].map(code => ({ status, code }))))("HTTP errors retain status for zero and nonzero glab exits %j", async ({ status, code }) => {
   const { port, token, dirs } = await setup(() => response({ message: "denied" }, undefined, status, code));
-  for (const read of reads) {
-   try { await read(port, repo, token); throw new Error("unexpected success"); }
-   catch (error) { expect(error).toBeInstanceOf(GitLabReadError); expect((error as GitLabReadError).status).toBe(status); }
-  }
+  for (const read of reads) expect((await rejection(read(port, repo, token))).status).toBe(status);
   for (const dir of dirs) expect(existsSync(dir)).toBeFalse();
  });
  test.each([response(null), response({}), { code: 0, stdout: "HTTP/2.0 200 OK\n\nnot JSON", stderr: "" }, response({}, undefined, 200, 1)])("malformed transport or schema %j cannot pass", async result => {
@@ -250,13 +256,7 @@ describe("every GitLab read fails closed", () => {
  });
  test("spawn failures are typed, sanitized, and clean private config directories", async () => {
   const { port, token, dirs } = await setup(() => { throw new Error("read-secret"); });
-  for (const read of reads) {
-   try { await read(port, repo, token); throw new Error("unexpected success"); }
-   catch (error) {
-    expect(error).toBeInstanceOf(GitLabReadError);
-    expect((error as Error).message).not.toContain("read-secret");
-   }
-  }
+  for (const read of reads) expect((await rejection(read(port, repo, token))).message).not.toContain("read-secret");
   for (const dir of dirs) expect(existsSync(dir)).toBeFalse();
  });
 });
