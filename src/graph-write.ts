@@ -196,10 +196,22 @@ export interface AddResult {
 }
 
 /**
+ * `soma graph add` created the node but did not attach it to its parent: it
+ * exists, on no frontier. `node` is its id, so the caller can finish the
+ * job with `graphLink` instead of adding a second node.
+ */
+export class GraphAddUnattached extends GraphWriteError {
+ constructor(message: string, readonly node: string, readonly parent: string) {
+  super(message);
+ }
+}
+
+/**
  * Create a node below `parent` (the spawning node, never the map root).
  * Exit 1 with `attached: false` means the node exists but hangs off no
- * parent; that is a failure, and the message names the created node so a
- * retry's duplicate can be traced.
+ * parent: that throws `GraphAddUnattached` naming the created node. Any
+ * other failure throws `GraphWriteError`; one without a payload (a killed
+ * or timed-out call included) cannot say whether a node was created.
  */
 export async function graphAdd(
  repo: string,
@@ -222,17 +234,46 @@ export async function graphAdd(
  args.push("--repo", somaRepo(ref), "--json");
  const result = await callWrite(args, token, opts);
  if (result.code !== 0) {
-  let created = "";
+  const message = (created: string) =>
+   `soma graph add below ${parent} (${repo}) failed (exit ${result.code})${created}: ${(result.stderr || result.stdout).trim()}`.slice(0, 600);
+  let node: string | null = null;
   try {
    const payload = parsePayload(result, "add");
-   if (typeof payload.node === "string") created = ` — created ${payload.node} but left it unattached`;
-  } catch { /* no payload: nothing was created */ }
-  throw new GraphWriteError(
-   `soma graph add below ${parent} (${repo}) failed (exit ${result.code})${created}: ${(result.stderr || result.stdout).trim()}`.slice(0, 600),
-  );
+   if (payload.attached === false && typeof payload.node === "string") node = writeNodeId(ref, payload.node);
+  } catch { /* no payload: whether a node was created is unknown */ }
+  if (node !== null) throw new GraphAddUnattached(message(` — created ${node} but left it unattached`), node, parent);
+  throw new GraphWriteError(message(""));
  }
  const payload = parsePayload(result, "add");
  return { repo, node: writeNodeId(ref, payload.node), parent };
+}
+
+/**
+ * Attach an existing node below `parent`: the repair for an add that left
+ * its node unattached. `soma graph link` skips a parent the node already
+ * has, so a re-run is safe; exit 1 (the attach failed) throws.
+ */
+export async function graphLink(
+ repo: string,
+ node: string,
+ parent: string,
+ token: string,
+ opts: RunOptions = {},
+): Promise<void> {
+ const ref = parseForgeRef(repo);
+ node = writeNodeId(ref, node);
+ parent = writeNodeId(ref, parent);
+ const args = ["graph", "link", node, "--parent", parent, "--repo", somaRepo(ref), "--json"];
+ const result = await callWrite(args, token, opts);
+ if (result.code !== 0) {
+  throw new GraphWriteError(
+   `soma graph link ${node} --parent ${parent} (${repo}) failed (exit ${result.code}): ${(result.stderr || result.stdout).trim()}`.slice(0, 600),
+  );
+ }
+ const status = parsePayload(result, "link").parentStatus;
+ if (status !== "attached" && status !== "already") {
+  throw new GraphWriteError(`soma graph link ${node} --parent ${parent} (${repo}) did not attach it: parentStatus ${String(status)}`);
+ }
 }
 
 /** Re-project the map's decision index from close receipts. */

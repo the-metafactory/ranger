@@ -40,7 +40,8 @@ import {
 import { GRAPH_CALL_TIMEOUT_MS, graphNode, somaRepo, type NodeResult } from "./graph.ts";
 import { finishClosedElsewhere } from "./closed-elsewhere.ts";
 import { budgetedRead, budgetPolicy } from "./budget.ts";
-import { graphAdd, graphClose, graphDecisions, type AddSpec, type CloseResult } from "./graph-write.ts";
+import { GraphAddUnattached, graphAdd, graphClose, graphDecisions, graphLink, type AddSpec, type CloseResult } from "./graph-write.ts";
+import { FixNodeLockBusy, withFixNodeLock } from "./fix-node-lock.ts";
 import type { ImplementPhase, Journal } from "./journal.ts";
 import { assembleImplementPrompt } from "./prompt.ts";
 import { ReviewError, sageReview, type ReviewVerdict } from "./review.ts";
@@ -152,7 +153,10 @@ export interface ImplementContext {
 
 /** The graph port the fix-the-base filer writes and reads through (node #152). */
 export interface FixNodeGraph {
+ /** Throws `GraphAddUnattached` when the node was created but not attached. */
  add(parent: string, spec: AddSpec): Promise<{ node: string }>;
+ /** Attach an existing node below `parent` (the repair for an unattached add). */
+ link(node: string, parent: string): Promise<void>;
  /** The node's status ("open", "closed"). */
  status(id: string): Promise<string>;
 }
@@ -819,13 +823,23 @@ export function baseRedFixKey(map: { repo: string; root: number }, probe: string
  return `base-red-fix.${mapKey(map)}.${probe}`;
 }
 
-function fixRecord(value: string | null): { node: string; sha?: string } | null {
+interface FixRecord {
+ node: string;
+ sha?: string;
+ /** Set while the node exists but is not attached below `parent`. */
+ unattached?: { parent: string };
+}
+
+function fixRecord(value: string | null): FixRecord | null {
  if (value === null) return null;
  try {
-  const record = JSON.parse(value) as { node?: unknown; sha?: unknown } | null;
+  const record = JSON.parse(value) as { node?: unknown; sha?: unknown; attached?: unknown; parent?: unknown } | null;
   const node = record?.node;
   if (typeof node !== "string" || node.length === 0) return null;
-  return typeof record?.sha === "string" ? { node, sha: record.sha } : { node };
+  const parsed: FixRecord = { node };
+  if (typeof record?.sha === "string") parsed.sha = record.sha;
+  if (record?.attached === false && typeof record.parent === "string") parsed.unattached = { parent: record.parent };
+  return parsed;
  } catch {
   return null;
  }
@@ -836,6 +850,7 @@ function machineFixNodeGraph(ctx: ImplementContext): FixNodeGraph {
  const credential = { token: ctx.token, source: "write-token" };
  return {
   add: (parent, spec) => graphAdd(repo, parent, spec, ctx.token, { timeoutMs: GRAPH_CALL_TIMEOUT_MS }),
+  link: (node, parent) => graphLink(repo, node, parent, ctx.token, { timeoutMs: GRAPH_CALL_TIMEOUT_MS }),
   status: async (id) => (await budgetedRead(ctx.journal, repo, credential, budgetPolicy(ctx.config), new Date(),
    () => graphNode(repo, id, credential, { timeoutMs: GRAPH_CALL_TIMEOUT_MS }))).status,
  };
@@ -891,11 +906,22 @@ function fixNodeSpec(ctx: ImplementContext, probe: string, checks: string[], sha
  * record skips a probe already filed for this merge base (open or closed,
  * without a read), and a probe whose fix node from an earlier base is still
  * open. The cache hit is what lets a second map on the same base file its
- * own node. The record is written only after the add succeeds, so a failed
- * add (or a failed status read) is journalled and retried the next time the
- * probe is found red at a merge base. Never throws: certification and the
- * inherited verdict do not depend on it. Writes and reads run under the
- * machine token.
+ * own node.
+ *
+ * Each (map, probe) is filed under a cross-process lease (`fix-node-lock.ts`)
+ * held from the record read to the record write, so two overlapping runs
+ * cannot both add; a run that waits past the lease journals the skip, and
+ * the holder writes the record. An add that created its node but left it
+ * unattached is recorded as such, and the next confirmation links that node
+ * below the parent it was filed under instead of adding another. Any other
+ * failed add (or failed status read or link) is journalled and retried the
+ * next time the probe is found red at a merge base.
+ *
+ * Two windows are left: a run that dies between a successful add and its
+ * record write, and an add killed or timed out with no payload (the node id
+ * is unknown). Either can leave one untracked node for the next
+ * confirmation to duplicate. Never throws: certification and the inherited
+ * verdict do not depend on it. Writes and reads run under the machine token.
  */
 export async function fileBaseRedFixNodes(
  ctx: ImplementContext,
@@ -909,22 +935,51 @@ export async function fileBaseRedFixNodes(
  for (const probe of [...base.confirmed, ...(base.cached ?? [])]) {
   const key = baseRedFixKey(map, probe);
   try {
-   const prior = fixRecord(journal.getHealth(key));
-   // Filed for this merge base already: a closed node there means the fix landed after it.
-   if (prior?.sha === base.sha) continue;
-   if (prior !== null) {
-    const status = await graph.status(prior.node);
-    if (status !== "closed") {
-     note(`fix-the-base node #${prior.node} for ${probe} is ${status} — not filing another`);
-     continue;
+   await withFixNodeLock(journal, key, async (owned) => {
+    const raw = journal.getHealth(key);
+    const prior = fixRecord(raw);
+    // Created but unattached: attach it where it was filed, never add a second.
+    if (prior?.unattached !== undefined) {
+     owned();
+     await graph.link(prior.node, prior.unattached.parent);
+     const { attached: _attached, parent: _parent, ...record } = JSON.parse(raw!) as Record<string, unknown>;
+     owned();
+     journal.setHealth(key, JSON.stringify(record));
+     note(`attached fix-the-base node #${prior.node} for ${probe} below #${prior.unattached.parent}`);
+     return;
     }
-   }
-   const checks = [...(cachedBaseChecks(journal, baseRedChecksKey(map.repo, base.sha, probe)) ?? [])].sort();
-   const filed = await graph.add(nodeId, fixNodeSpec(ctx, probe, checks, base.sha, pr));
-   journal.setHealth(key, JSON.stringify({ node: filed.node, sha: base.sha, detectedBy: nodeId, pr: pr.number }));
-   note(`filed fix-the-base node #${filed.node} below #${nodeId}: ${probe} red at the merge base ${base.sha.slice(0, 8)}`);
+    // Filed for this merge base already: a closed node there means the fix landed after it.
+    if (prior?.sha === base.sha) return;
+    if (prior !== null) {
+     const status = await graph.status(prior.node);
+     if (status !== "closed") {
+      note(`fix-the-base node #${prior.node} for ${probe} is ${status} — not filing another`);
+      return;
+     }
+    }
+    const checks = [...(cachedBaseChecks(journal, baseRedChecksKey(map.repo, base.sha, probe)) ?? [])].sort();
+    const record = { sha: base.sha, detectedBy: nodeId, pr: pr.number };
+    owned();
+    try {
+     const filed = await graph.add(nodeId, fixNodeSpec(ctx, probe, checks, base.sha, pr));
+     owned();
+     journal.setHealth(key, JSON.stringify({ node: filed.node, ...record }));
+     note(`filed fix-the-base node #${filed.node} below #${nodeId}: ${probe} red at the merge base ${base.sha.slice(0, 8)}`);
+    } catch (error) {
+     if (error instanceof GraphAddUnattached) {
+      owned();
+      journal.setHealth(key, JSON.stringify({ node: error.node, ...record, attached: false, parent: nodeId }));
+     }
+     throw error;
+    }
+   });
   } catch (error) {
-   note(`fix-the-base filing for ${probe} at ${base.sha.slice(0, 8)} failed (retried the next time it is found red at a merge base): ${error instanceof Error ? error.message : String(error)}`);
+   if (error instanceof FixNodeLockBusy) {
+    note(`fix-the-base filing for ${probe} at ${base.sha.slice(0, 8)} skipped: another run is filing it (${error.message})`);
+    continue;
+   }
+   const unattached = error instanceof GraphAddUnattached ? ` — node #${error.node} is recorded and is attached below #${error.parent} the next time, not filed again` : "";
+   note(`fix-the-base filing for ${probe} at ${base.sha.slice(0, 8)} failed (retried the next time it is found red at a merge base)${unattached}: ${error instanceof Error ? error.message : String(error)}`);
   }
  }
 }

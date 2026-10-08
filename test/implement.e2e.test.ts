@@ -1386,7 +1386,7 @@ describe("implement lane (node #23)", () => {
   await seedProbeOnBase(r);
   const sha = await r.github.sha("main");
   const added: { parent: string; spec: { autonomy: string; kind?: string; body?: string } }[] = [];
-  r.ctx.fixNode = { add: async (parent, spec) => { added.push({ parent, spec }); return { node: "99" }; }, status: async () => "open" };
+  r.ctx.fixNode = { add: async (parent, spec) => { added.push({ parent, spec }); return { node: "99" }; }, link: async () => {}, status: async () => "open" };
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
   expect(added).toHaveLength(1);
   expect(added[0].parent).toBe("20");
@@ -1401,7 +1401,7 @@ describe("implement lane (node #23)", () => {
   cleanup.push(r.dir);
   await seedProbeOnBase(r);
   const sha = await r.github.sha("main");
-  r.ctx.fixNode = { add: async () => { throw new Error("graph add refused"); }, status: async () => "open" };
+  r.ctx.fixNode = { add: async () => { throw new Error("graph add refused"); }, link: async () => {}, status: async () => "open" };
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
   const probe = (r.github.comments.get(1) ?? []).find((c) => c.body.includes("ranger:probes"));
   expect(probe?.body).toContain("result=pass selected=2 mode=semantic base-red=probe-hud.mjs -->");
@@ -1422,6 +1422,7 @@ describe("implement lane (node #23)", () => {
    const added: { parent: string; spec: { body?: string } }[] = [];
    r.ctx.fixNode = {
     add: async (parent, spec) => { added.push({ parent, spec }); return { node: "99" }; },
+    link: async () => { throw new Error("no link expected"); },
     status: async () => { throw new Error("no status read expected"); },
    };
    const calls = watchBaseRuns(r);

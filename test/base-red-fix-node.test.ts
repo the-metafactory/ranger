@@ -5,7 +5,8 @@ import { join } from "node:path";
 import { loadConfig } from "../src/config.ts";
 import * as exec from "../src/exec.ts";
 import { runCmd, type RunResult } from "../src/exec.ts";
-import { graphAdd, GraphWriteError, type AddSpec } from "../src/graph-write.ts";
+import { FixNodeLockBusy, withFixNodeLock } from "../src/fix-node-lock.ts";
+import { GraphAddUnattached, graphAdd, graphLink, GraphWriteError, type AddSpec } from "../src/graph-write.ts";
 import { baseRedFixKey, fileBaseRedFixNodes, probeMergeBase, type FixNodeGraph, type ImplementContext } from "../src/implement.ts";
 import { Journal } from "../src/journal.ts";
 import { openDb } from "../src/store/db.ts";
@@ -31,15 +32,23 @@ describe("fix-the-base node for a confirmed base-red probe (node #152)", () => {
  let statuses: Map<string, string>;
  let addFails: Error | null;
  let statusFails: Error | null;
+ let linkFails: Error | null;
+ let linked: { node: string; parent: string }[];
+ let addDelayMs: number;
  let nextNode: number;
 
  const fakeGraph: FixNodeGraph = {
   add: async (parent, spec) => {
    added.push({ parent, spec });
+   if (addDelayMs > 0) await Bun.sleep(addDelayMs);
    if (addFails !== null) throw addFails;
    const node = String(nextNode++);
    statuses.set(node, "open");
    return { node };
+  },
+  link: async (node, parent) => {
+   linked.push({ node, parent });
+   if (linkFails !== null) throw linkFails;
   },
   status: async (id) => {
    if (statusFails !== null) throw statusFails;
@@ -75,6 +84,9 @@ describe("fix-the-base node for a confirmed base-red probe (node #152)", () => {
   statuses = new Map();
   addFails = null;
   statusFails = null;
+  linkFails = null;
+  linked = [];
+  addDelayMs = 0;
   nextNode = 300;
   ctx = {
    config, map, node, rootNode: node, canonical, worktree: canonical,
@@ -224,8 +236,86 @@ describe("fix-the-base node for a confirmed base-red probe (node #152)", () => {
   });
   try {
    const add = graphAdd("acme/widgets", "1", { title: "t", autonomy: "propose", checkpoint: "c" }, "ghp_machine");
-   await expect(add).rejects.toThrow(GraphWriteError);
+   await expect(add).rejects.toThrow(GraphAddUnattached);
    await expect(add).rejects.toThrow("created 88 but left it unattached");
+   await expect(add).rejects.toMatchObject({ node: "88", parent: "1" });
+  } finally {
+   spy.mockRestore();
+  }
+ });
+
+ test("graphAdd: a failure without a payload is a plain write error", async () => {
+  const spy = spyOn(exec, "runCmd").mockResolvedValue({ code: 1, stdout: "", stderr: "boom" });
+  try {
+   const add = graphAdd("acme/widgets", "1", { title: "t", autonomy: "propose", checkpoint: "c" }, "ghp_machine");
+   await expect(add).rejects.toThrow(GraphWriteError);
+   await expect(add).rejects.not.toThrow(GraphAddUnattached);
+  } finally {
+   spy.mockRestore();
+  }
+ });
+
+ test("an add that leaves its node unattached is recorded, and the next confirmation links it instead of adding", async () => {
+  addFails = new GraphAddUnattached("soma graph add below 1 (acme/widgets) failed (exit 1) — created 300 but left it unattached", "300", "1");
+  await confirmAndFile();
+  expect(JSON.parse(ctx.journal.getHealth(baseRedFixKey(ctx.map, HUD))!)).toMatchObject({ node: "300", sha, attached: false, parent: "1" });
+  expect(events().some((d) => d.includes("node #300 is recorded and is attached below #1 the next time, not filed again"))).toBe(true);
+  addFails = null;
+  // A later detection by another node links the node below the parent it was filed under.
+  ctx.node = { ...ctx.node, ref: { ...ctx.node.ref, id: "7" } };
+  linkFails = new Error("link refused");
+  answers = [];
+  await confirmAndFile();
+  expect(linked).toEqual([{ node: "300", parent: "1" }]);
+  expect(JSON.parse(ctx.journal.getHealth(baseRedFixKey(ctx.map, HUD))!)).toMatchObject({ attached: false, parent: "1" });
+  linkFails = null;
+  await fileBaseRedFixNodes(ctx, { sha: LATER, confirmed: [HUD] }, PR);
+  expect(linked).toEqual([{ node: "300", parent: "1" }, { node: "300", parent: "1" }]);
+  expect(added).toHaveLength(1);
+  const record = JSON.parse(ctx.journal.getHealth(baseRedFixKey(ctx.map, HUD))!);
+  expect(record).toEqual({ node: "300", sha, detectedBy: "1", pr: 42 });
+  expect(events().some((d) => d.includes(`attached fix-the-base node #300 for ${HUD} below #1`))).toBe(true);
+  // Attached now: a cache hit at its base files and links nothing.
+  answers = [];
+  await confirmAndFile();
+  expect(added).toHaveLength(1);
+  expect(linked).toHaveLength(2);
+ });
+
+ test("two overlapping runs confirming the same probe file one node", async () => {
+  addDelayMs = 600;
+  await Promise.all([
+   fileBaseRedFixNodes(ctx, { sha, confirmed: [HUD] }, PR),
+   fileBaseRedFixNodes(ctx, { sha, confirmed: [HUD] }, PR),
+  ]);
+  expect(added).toHaveLength(1);
+  expect(JSON.parse(ctx.journal.getHealth(baseRedFixKey(ctx.map, HUD))!)).toMatchObject({ node: "300", sha });
+ });
+
+ test("the filing lock refuses past its wait while another run holds it", async () => {
+  const key = baseRedFixKey(ctx.map, HUD);
+  let release!: () => void;
+  const held = withFixNodeLock(ctx.journal, key, () => new Promise<void>((resolve) => { release = resolve; }));
+  await Bun.sleep(50);
+  await expect(withFixNodeLock(ctx.journal, key, async () => "second", 300)).rejects.toThrow(FixNodeLockBusy);
+  expect(await withFixNodeLock(ctx.journal, baseRedFixKey(ctx.map, "other.mjs"), async () => "other probe", 300)).toBe("other probe");
+  release();
+  await held;
+  expect(await withFixNodeLock(ctx.journal, key, async () => "after", 300)).toBe("after");
+ });
+
+ test("graphLink attaches under the machine account's token and fails on a refused attach", async () => {
+  const spy = spyOn(exec, "runCmd").mockImplementation(async (cmd, args, opts) => {
+   expect(cmd).toBe("soma");
+   expect(opts?.env?.GH_TOKEN).toBe("ghp_machine");
+   expect(args.slice(0, 5)).toEqual(["graph", "link", "300", "--parent", "1"]);
+   return { code: 0, stdout: JSON.stringify({ repo: "acme/widgets", node: "300", written: [], already: [], failed: [], parent: "1", parentStatus: "attached" }), stderr: "" };
+  });
+  try {
+   await graphLink("acme/widgets", "300", "1", "ghp_machine");
+   expect(spy).toHaveBeenCalledTimes(1);
+   spy.mockResolvedValue({ code: 1, stdout: "", stderr: JSON.stringify({ node: "300", parent: "1", parentStatus: "failed" }) });
+   await expect(graphLink("acme/widgets", "300", "1", "ghp_machine")).rejects.toThrow(GraphWriteError);
   } finally {
    spy.mockRestore();
   }
