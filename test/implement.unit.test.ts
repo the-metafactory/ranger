@@ -169,6 +169,9 @@ describe("closing keywords (#588 fail-open path, node #128 per forge)", () => {
    "Fixes https://gitlab.example.org/g/p/-/merge_requests/12 and #128",
   ],
   ["Closes ABC-1, #128", null, "Closes ABC-1, #128"],
+  // GitLab's link keeps inner commas, so the list goes on after it.
+  ["Closes https://example.com/a,b #128", null, "Closes https://example.com/a,b #128"],
+  ["Fixes https://example.com/?ids=1,2 and #128", null, "Fixes https://example.com/?ids=1,2 and #128"],
   // Neither forge reads these.
   ["node #12", null, null],
   ["fixed the flaky test", null, null],

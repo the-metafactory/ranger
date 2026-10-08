@@ -752,20 +752,36 @@ const GITLAB_KEYWORD =
  /\b(?:clos(?:e|es|ed|ing)|fix(?:es|ed|ing)?|resolv(?:e|es|ed|ing)|implement(?:s|ed|ing)?)\b:?\s+/gi;
 const GITLAB_ISSUE_REF =
  /(?:issues?\s+)?(?:(?:[\w.-]{1,255}\/){0,20}[\w.-]{0,255}#\d{1,20}|GL-\d{1,20}|\[issue:(?:[\w.-]{1,255}\/){0,20}\d{1,20}\]|https?:\/\/\S{1,300}?\/(?:-\/)?(?:issues(?:\/incident)?|work_items)\/\d{1,20})/iy;
-const GITLAB_LIST_FILLER =
- /(?:issues?\s+)?(?:https?:\/\/[^\s>,]{1,300}|[A-Z][A-Z0-9_]{0,255}-\d{1,20})(?: *,? +and +| *,? *)/iy;
+/**
+ * Two ways to skip a link item: GitLab's own link (`[^\s>]`, inner commas
+ * kept, no trailing `?!.,:`), and one split at every comma, for the case where
+ * GitLab's greedy link swallows a ref (`https://a.com,#N`). Each keyword's
+ * list is walked both ways; either finding a ref refuses.
+ */
+const GITLAB_LIST_FILLERS = [
+ /(?:issues?\s+)?(?:https?:\/\/[^\s>]{1,300}(?<![?!.,:])|[A-Z][A-Z0-9_]{0,255}-\d{1,20})(?: *,? +and +| *,? *)/iy,
+ /(?:issues?\s+)?(?:https?:\/\/[^\s>,]{1,300}|[A-Z][A-Z0-9_]{0,255}-\d{1,20})(?: *,? +and +| *,? *)/iy,
+];
+
+/** Walk one closing list from `start`; the end of the first issue ref, or -1. */
+function walkGitLabList(text: string, start: number, filler: RegExp): number {
+ let at = start;
+ for (;;) {
+  GITLAB_ISSUE_REF.lastIndex = at;
+  const ref = GITLAB_ISSUE_REF.exec(text);
+  if (ref !== null) return at + ref[0].length;
+  filler.lastIndex = at;
+  const item = filler.exec(text);
+  if (item === null) return -1;
+  at += item[0].length;
+ }
+}
 
 function findGitLabClosing(text: string): string | null {
  for (const keyword of text.matchAll(GITLAB_KEYWORD)) {
-  let at = keyword.index + keyword[0].length;
-  for (;;) {
-   GITLAB_ISSUE_REF.lastIndex = at;
-   const ref = GITLAB_ISSUE_REF.exec(text);
-   if (ref !== null) return text.slice(keyword.index, at + ref[0].length);
-   GITLAB_LIST_FILLER.lastIndex = at;
-   const filler = GITLAB_LIST_FILLER.exec(text);
-   if (filler === null) break;
-   at += filler[0].length;
+  for (const filler of GITLAB_LIST_FILLERS) {
+   const end = walkGitLabList(text, keyword.index + keyword[0].length, filler);
+   if (end !== -1) return text.slice(keyword.index, end);
   }
  }
  return null;
