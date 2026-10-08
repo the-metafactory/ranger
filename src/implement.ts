@@ -1856,7 +1856,8 @@ function testsFailedDetail(testCommand: string, tests: RunResult, after: string)
  * review reads that code.
  *
  * A failure that names its failing tests is then checked at the merge base
- * `baseTip` (testsRedAtBase): when every one of them fails there too, it is the base's,
+ * `baseTip` (testsRedAtBase): when the base run fails each of them, by file
+ * and title and as many times, with the same exit code, they are the base's,
  * and `baseRed` says the pass goes on as if the tests passed. `tests` is
  * always the branch's own run.
  */
