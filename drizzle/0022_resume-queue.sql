@@ -4,7 +4,8 @@ CREATE TABLE `resume_queue` (
  `node_id` text NOT NULL,
  `root` integer NOT NULL,
  `lane` text NOT NULL,
- `queued_at` text NOT NULL
+ `queued_at` text NOT NULL,
+ `failed_starts` integer DEFAULT 0 NOT NULL
 );
 --> statement-breakpoint
 CREATE UNIQUE INDEX `resume_queue_repo_node_idx` ON `resume_queue` (`repo`, `node_id`);

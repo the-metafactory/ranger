@@ -97,7 +97,7 @@ describe("resume-node CLI", () => {
    expect(r.journal.spawnsToday()).toBe(0);
    expect((await r.cli("40", ["--when-free"])).code).toBe(0);
    expect(r.journal.listResumeQueue()).toEqual([entry]);
-   expect(r.journal.listEvents(REPO).filter(e => e.kind === "queued")).toHaveLength(1);
+   expect(r.journal.listEvents(REPO).filter(e => e.kind === "resume-queued")).toHaveLength(1);
    expect(r.journal.listEvents(REPO).some(e => e.kind === "sweep")).toBe(false);
    const reader = Journal.openReadOnly(r.config.state.journalPath)!;
    expect(reader.listResumeQueue()).toEqual([entry]); reader.close();
@@ -127,7 +127,7 @@ describe("resume-node CLI", () => {
     expect(await resumeNode("40", undefined, ctx, { whenFree: true })).toMatchObject({ queued: true });
     expect(spawned).toEqual([]);
     expect(r.journal.listResumeQueue()).toEqual([first, second]);
-    expect(r.journal.listEvents(REPO).filter(e => e.kind === "queued")).toHaveLength(2);
+    expect(r.journal.listEvents(REPO).filter(e => e.kind === "resume-queued")).toHaveLength(2);
     expect(r.journal.getWorker("40", REPO)?.status).toBe("parked");
     expect(r.journal.getWorker("41", REPO)?.status).toBe("parked");
     await walk(ctx);
@@ -750,12 +750,12 @@ describe("resume-queue-starts-when-lane-frees", () => {
  }
 });
 
-test("resume queue migration appends to the prior journal and preserves worker state", () => {
+test("resume queue migration appends to the prior journal, preserves worker state and keeps retry counts across reopen", () => {
  const dir = mkdtempSync(join(tmpdir(), "ranger-resume-migration-"));
  const folder = join(dir, "drizzle"); mkdirSync(join(folder, "meta"), { recursive: true });
  const source = join(import.meta.dir, "../drizzle");
  const manifest = JSON.parse(readFileSync(join(source, "meta/_journal.json"), "utf8"));
- manifest.entries = manifest.entries.filter((e: { tag: string }) => !e.tag.startsWith("0022") && !e.tag.startsWith("0023"));
+ manifest.entries = manifest.entries.filter((e: { tag: string }) => !e.tag.startsWith("0022"));
  writeFileSync(join(folder, "meta/_journal.json"), JSON.stringify(manifest));
  for (const e of manifest.entries) copyFileSync(join(source, `${e.tag}.sql`), join(folder, `${e.tag}.sql`));
  const path = join(dir, "state.sqlite"); const sqlite = new Database(path);
@@ -764,41 +764,21 @@ test("resume queue migration appends to the prior journal and preserves worker s
   migrate(drizzle(sqlite), { migrationsFolder: folder });
   sqlite.run("INSERT INTO workers(repo,node_id,root,status,generation) VALUES('acme/widgets','40',460,'parked',7)");
   sqlite.close();
-  const journal = new Journal(path);
+  let journal = new Journal(path);
   try {
    expect(journal.getWorker("40", REPO)).toMatchObject({ root: 460, status: "parked", generation: 7 });
-   const entry = journal.enqueueResume({ nodeId: "40", repo: REPO, root: 460, lane: "headless" });
-   expect(journal.listResumeQueue()).toEqual([entry]);
+   const head = journal.enqueueResume({ nodeId: "40", repo: REPO, root: 460, lane: "headless" });
+   const next = journal.enqueueResume({ nodeId: "41", repo: REPO, root: 1, lane: "headless" });
+   expect(journal.listResumeQueue()).toEqual([head, next]);
+   expect(head.failedStarts).toBe(0);
+   expect(journal.recordResumeStartFailure(head, "first error")).toBe(false);
+   expect(journal.recordResumeStartFailure(head, "second error")).toBe(false);
+   journal.close(); journal = new Journal(path);
+   expect(journal.getResume(REPO, "40")?.failedStarts).toBe(2);
+   expect(journal.recordResumeStartFailure(head, "last error")).toBe(true);
+   expect(journal.listResumeQueue()).toEqual([next]);
+   expect(journal.listEvents(REPO).find(e => e.kind === "resume-dropped")?.detail)
+    .toBe("3 consecutive failed starts; last error: last error");
   } finally { journal.close(); }
  } finally { rmSync(dir, { recursive: true, force: true }); }
-});
-
-test("failed-start migration preserves existing FIFO entries and retry counts survive reopen", () => {
- const dir = mkdtempSync(join(tmpdir(), "ranger-resume-failures-migration-"));
- const folder = join(dir, "drizzle"); mkdirSync(join(folder, "meta"), { recursive: true });
- const source = join(import.meta.dir, "../drizzle");
- const manifest = JSON.parse(readFileSync(join(source, "meta/_journal.json"), "utf8"));
- manifest.entries = manifest.entries.filter((e: { tag: string }) => e.tag !== "0023_resume-start-failures");
- writeFileSync(join(folder, "meta/_journal.json"), JSON.stringify(manifest));
- for (const e of manifest.entries) copyFileSync(join(source, `${e.tag}.sql`), join(folder, `${e.tag}.sql`));
- const path = join(dir, "state.sqlite");
- const sqlite = new Database(path);
- sqlite.run("CREATE TABLE ranger_legacy_roots (repo text PRIMARY KEY, root integer NOT NULL)");
- migrate(drizzle(sqlite), { migrationsFolder: folder });
- sqlite.run("INSERT INTO resume_queue(id,repo,node_id,root,lane,queued_at) VALUES(8,'acme/widgets','40',1,'headless','2026-10-07T10:00:00Z'),(9,'acme/widgets','41',460,'headless','2026-10-07T10:00:00Z')");
- sqlite.close();
- let journal = new Journal(path);
- try {
-  const [head, next] = journal.listResumeQueue();
-  expect(head).toMatchObject({ id: 8, nodeId: "40", failedStarts: 0 });
-  expect(next).toMatchObject({ id: 9, nodeId: "41", failedStarts: 0 });
-  expect(journal.recordResumeStartFailure(head, "first error")).toBe(false);
-  expect(journal.recordResumeStartFailure(head, "second error")).toBe(false);
-  journal.close(); journal = new Journal(path);
-  expect(journal.getResume(REPO, "40")?.failedStarts).toBe(2);
-  expect(journal.recordResumeStartFailure(head, "last error")).toBe(true);
-  expect(journal.listResumeQueue()).toEqual([next]);
-  expect(journal.listEvents(REPO).find(e => e.kind === "resume-dropped")?.detail)
-   .toBe("3 consecutive failed starts; last error: last error");
- } finally { journal.close(); rmSync(dir, { recursive: true, force: true }); }
 });

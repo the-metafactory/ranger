@@ -149,7 +149,7 @@ export interface ResumeQueueRow {
 }
 
 export type EventKind =
- | "queued"
+ | "resume-queued"
  | "resume-cancelled"
  | "resume-dropped"
  | "resume-started"
@@ -378,7 +378,7 @@ export class Journal {
    const inserted = this.db.insert(resumeQueue).values({ ...entry, queuedAt: now.toISOString() })
     .onConflictDoNothing({ target: [resumeQueue.repo, resumeQueue.nodeId] }).returning().get();
    if (inserted !== undefined) {
-    this.recordEvent("queued", { nodeId: entry.nodeId, repo: entry.repo, detail: `resume-node queued for the ${entry.lane} implement lane (map root ${entry.root})` });
+    this.recordEvent("resume-queued", { nodeId: entry.nodeId, repo: entry.repo, detail: `resume-node queued for the ${entry.lane} implement lane (map root ${entry.root})` });
     return inserted;
    }
    return this.db.select().from(resumeQueue)
