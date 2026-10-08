@@ -2,6 +2,7 @@
 import { readPrivateJson } from "./remote-test/ssh-cli.ts";
 import { executionRefusal, isGithubRepo } from "./forge-ref.ts";
 import { mapKey, pickMap } from "./maps.ts";
+import { implementLane } from "./lanes.ts";
 import { resumeNode } from "./resume.ts";
 import { Command } from "commander";
 import { join, resolve } from "node:path";
@@ -72,6 +73,7 @@ import { serveSshResponse } from "./remote-test/ssh-server.ts";
  * - `run-node <id>` — the detached worker supervisor (research + implement lanes).
  * - `build-now <id>` (node #58) — the walk's claim for one chosen node, started now.
  * - `sweep` — reconcile the journal against reality.
+ * - `drain` (node #165) — stop new claims on the visual lane or one headless map.
  * - `journal` — inspect the journal.
  * - `serve` (node #37) — local read-only dashboard; launches the principal's
  *   own grilling sessions, never a graph write.
@@ -425,6 +427,47 @@ function runResumeRun(configPath: string): string {
  journal.recordEvent("sweep", { detail: `resume-run by operator (was paused=${was.paused}, dead-man ${was.deadmanCount})` });
  journal.close();
  return JSON.stringify({ resumed: true, was }, null, 2);
+}
+
+/**
+ * Operator verb (node #165): drain the visual lane (every visual map, one
+ * switch) or one headless map, so no new frontier work is claimed there;
+ * `off` lifts it. Every refusal is decided from the config alone, before
+ * the journal opens, so a refused drain writes nothing.
+ */
+function runDrain(
+ configPath: string,
+ opts: { lane?: string; map?: string; off?: boolean },
+): string {
+ if ((opts.lane === undefined) === (opts.map === undefined)) {
+  throw new Error("name exactly one of --lane visual or --map <owner/name#root>");
+ }
+ const drained = opts.off !== true;
+ const { config } = loadConfig(configPath);
+ let target: { scope: "lane"; lane: "visual" } | { scope: "map"; key: string };
+ if (opts.lane !== undefined) {
+  if (opts.lane !== "visual") {
+   throw new Error(`--lane '${opts.lane}' cannot be drained: only the visual lane is a machine-wide switch; drain a headless map with --map <owner/name#root>`);
+  }
+  target = { scope: "lane", lane: "visual" };
+ } else {
+  const map = pickMap(config, opts.map);
+  if (implementLane(map) === "visual") {
+   throw new Error(`${mapKey(map)} is on the visual lane, which drains as one switch for every visual map: \`ranger drain --lane visual${drained ? "" : " --off"}\``);
+  }
+  target = { scope: "map", key: mapKey(map) };
+ }
+ const journal = openJournal(config);
+ try {
+  const was = target.scope === "lane" ? journal.isVisualLaneDrained() : journal.isMapDrained(target.key);
+  if (target.scope === "lane") journal.setVisualLaneDrained(drained);
+  else journal.setMapDrained(target.key, drained);
+  const what = target.scope === "lane" ? "visual lane" : target.key;
+  journal.recordEvent("drain", { detail: `${what} ${drained ? "drained" : "drain lifted"} by operator (was ${was ? "drained" : "open"})` });
+  return JSON.stringify({ ...target, drained, was }, null, 2);
+ } finally {
+  journal.close();
+ }
 }
 
 async function runJournal(
@@ -926,6 +969,25 @@ program
  .action((options: { config: string }) => {
   const configPath = resolve(process.cwd(), options.config);
   process.stdout.write(runResumeRun(configPath) + "\n");
+ });
+
+program
+ .command("drain")
+ .description(
+  "Operator verb (node #165): stop new implement claims on every visual-lane map (--lane visual, one machine-wide switch), or every new claim on one headless map (--map); --off lifts it. Sweeps, the merge desk and queued resumes keep running",
+ )
+ .option("--lane <lane>", "drain the visual lane (the only lane drained as one switch)")
+ .option("-m, --map <owner/name#root>", "drain one headless-lane map")
+ .option("--off", "lift the drain")
+ .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
+ .action((options: { lane?: string; map?: string; off?: boolean; config: string }) => {
+  try {
+   const configPath = resolve(process.cwd(), options.config);
+   process.stdout.write(runDrain(configPath, options) + "\n");
+  } catch (error) {
+   process.stderr.write(`ranger drain: ${error instanceof Error ? error.message : String(error)}\n`);
+   process.exit(1);
+  }
  });
 
 program

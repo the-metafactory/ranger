@@ -1,5 +1,5 @@
 import { decodeForgeKey, isGithubRepo, nodeKey } from "./forge-ref.ts";
-import { lastImplementMaps, mapKey, implementMapOrder } from "./maps.ts";
+import { lastImplementMaps, mapKey, implementMapOrder, readDrains } from "./maps.ts";
 /**
  * `ranger serve` (#37) — a local dashboard of the walk: the job a worker is on
  * now, the next node a tick would take, every node ranger can take on its own,
@@ -53,7 +53,7 @@ import {
  serveConfig,
  type WalkMode,
 } from "./config.ts";
-import { implementCandidates, planTick, walkableCandidates } from "./candidates.ts";
+import { drainGate, implementCandidates, planTick, walkableCandidates, type DrainState } from "./candidates.ts";
 import { pidAlive as defaultPidAlive } from "./exec.ts";
 import { Journal, type WorkerRow } from "./journal.ts";
 import { ForeignMigrationError } from "./journal-guard.ts";
@@ -180,6 +180,8 @@ export interface StateInputs {
  workers: WorkerRow[];
  laneHolders: Record<ImplementLane, WorkerRow | null>;
  paused: boolean;
+ /** The drain switches (node #165); absent means none is set. */
+ drains?: DrainState;
  spawnsToday: number;
  spawnCap: number;
  vetoed: (nodeId: string) => boolean;
@@ -285,6 +287,10 @@ export interface DashboardState {
  refreshError: string | null;
  gates: {
   paused: boolean;
+  /** The visual lane's drain (node #165), shown once at lane level. */
+  visualDrained: boolean;
+  /** Drained headless maps by key, shown on their maps. */
+  drainedMaps: string[];
   spawnsToday: number;
   spawnCap: number;
   laneHolders: Record<ImplementLane, { repo: string; root: number; nodeId: string; status: string } | null>;
@@ -343,6 +349,9 @@ function nextFor(
  if (!report.ok) return none(`frontier unavailable: ${report.error ?? "unknown error"}`);
  if (map.walk === "none") return none("walk: none — registered, not walked");
  if (inputs.paused) return none("dead-man paused — claiming stopped until `ranger resume-run`");
+ // The walk's drain gate (node #165), from the same helper.
+ const drain = drainGate(map, inputs.drains ?? NO_DRAINS);
+ if (drain?.scope === "map") return none(drain.reason);
  if (tick.spawns >= inputs.spawnCap) {
   return none(
    tick.spawns > inputs.spawnsToday
@@ -355,6 +364,7 @@ function nextFor(
  const plan = planTick(report.frontier, {
   laneBusy: holder !== null,
   vetoed: inputs.vetoed,
+  implementDrained: drain?.scope === "lane",
  });
  // What this map spends of the tick, for the maps after it.
  const claims = plan.take.slice(0, inputs.spawnCap - tick.spawns);
@@ -390,10 +400,16 @@ function nextFor(
  if (vetoed.length > 0) {
   return none(`${vetoed.join(", ")} vetoed — the tick claims nothing else this pass`);
  }
+ if (drain !== null && implementCandidates(report.frontier).length > 0) {
+  return none(`no implement claim while the ${map.lane} lane is drained`);
+ }
  return none("nothing walkable on this map's frontier");
 }
 
+const NO_DRAINS: DrainState = { visual: false, maps: new Set() };
+
 export function assembleState(inputs: StateInputs): DashboardState {
+ const drains = inputs.drains ?? NO_DRAINS;
  const laneMaps = inputs.maps.filter((m) => !m.servedOnly).map((m) => ({ ...m, commands: {} }));
  const titleOf = (repo: string, id: string): string | null => {
   for (const map of inputs.maps) {
@@ -443,6 +459,8 @@ export function assembleState(inputs: StateInputs): DashboardState {
   const report = inputs.reports.get(map.key);
   const frontier = report?.ok ? report.frontier : [];
   const walked = !map.servedOnly && map.walk !== "none";
+  // A drain refuses this map's implement claims: none waits in its queue either.
+  const drained = drainGate(map, drains) !== null;
   return {
    key: map.key,
    repo: map.repo,
@@ -456,7 +474,7 @@ export function assembleState(inputs: StateInputs): DashboardState {
    source: report?.source ?? (map.servedOnly ? "serve" : "ranger"),
    localCheckout: map.localCheckout,
    next: planned.get(map.key)!,
-   queued: walked
+   queued: walked && !drained
     ? implementCandidates(frontier)
        .filter((n) => n.id !== planned.get(map.key)!.nodeId && !inputs.vetoed(n.id))
        .map(view)
@@ -496,6 +514,8 @@ export function assembleState(inputs: StateInputs): DashboardState {
   refreshError: inputs.refreshError,
   gates: {
    paused: inputs.paused,
+   visualDrained: drains.visual,
+   drainedMaps: inputs.maps.filter((m) => drainGate(m, drains)?.scope === "map").map((m) => m.key),
    spawnsToday: inputs.spawnsToday,
    spawnCap: inputs.spawnCap,
    laneHolders: { visual: holderView("visual"), headless: holderView("headless") },
@@ -984,7 +1004,8 @@ function renderNext(s) {
  const box = document.getElementById("next"); box.replaceChildren();
  for (const lane of ["visual", "headless"]) {
   const holder = s.gates.laneHolders[lane];
-  box.append(el("h3", { text: lane + " lane · " + (holder ? "held by #" + holder.nodeId + " (" + holder.repo + "#" + holder.root + ")" : "free") }));
+  const drained = lane === "visual" && s.gates.visualDrained ? " · DRAINED: no new implement claims on any visual map (ranger drain --lane visual --off)" : "";
+  box.append(el("h3", { text: lane + " lane · " + (holder ? "held by #" + holder.nodeId + " (" + holder.repo + "#" + holder.root + ")" : "free") + drained }));
   box.append(...byRepo("next/" + lane, s.maps.filter((m) => m.lane === lane), (m) => m.repo, (m) => {
    const n = m.next;
    const queued = m.queued || [];
@@ -994,7 +1015,7 @@ function renderNext(s) {
    const rest = queued.map((q, i) => el("li", {}, el("span", { class: "id", text: "#" + q.id }), el("span", { class: "t" }, link(q.url, q.title), el("span", { class: "reason", text: "then, " + ordinal(i + (n.nodeId ? 2 : 1)) + " in this map's queue" })), tags(tag(q.lane + " · " + q.kind), buildButton(s, m, q))));
    // With no head (cap spent, paused, vetoed), say why before the queue that waits.
    const body = el("div", {}, head ? null : empty(n.reason), head || rest.length > 0 ? el("ul", {}, head, ...rest) : null);
-   return mapGroup("next/" + lane, m, "", (n.nodeId ? 1 : 0) + queued.length, mapMeta(m), body);
+   return mapGroup("next/" + lane, m, (s.gates.drainedMaps || []).includes(m.key) ? " · DRAINED" : "", (n.nodeId ? 1 : 0) + queued.length, mapMeta(m), body);
   }));
  }
 }
@@ -1686,6 +1707,7 @@ export function stateFromJournal(
    lastImplementMaps: lastImplementMaps(journal),
    laneHolders: { visual: journal?.laneHolder("visual") ?? null, headless: journal?.laneHolder("headless") ?? null },
    paused: journal?.isPaused() ?? false,
+   drains: journal === null ? undefined : readDrains(journal, config.maps),
    spawnsToday: journal?.spawnsToday(now) ?? 0,
    spawnCap: config.workers.spawnCapPerDay,
    vetoed: (id) => vetoed.has(id),

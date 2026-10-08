@@ -86,7 +86,7 @@ export const events = sqliteTable(
   at: text("at").notNull(),
   nodeId: text("node_id"),
   repo: text("repo"),
-  /** claimed | announced | worker-start | worker-success | closed | decisions-written | refused | parked | released | sweep | deadman-paused | veto */
+  /** claimed | announced | worker-start | worker-success | closed | decisions-written | refused | parked | released | sweep | deadman-paused | drain | veto */
   kind: text("kind").notNull(),
   detail: text("detail"),
  },

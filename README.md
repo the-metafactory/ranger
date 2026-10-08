@@ -48,6 +48,14 @@ close-only runs leave the cursor unchanged. Awaiting-merge releases capacity.
 The dashboard shows both holders and the same next choices as walk.
 Unknown or ambiguous worker maps conservatively hold both resource lanes.
 
+`ranger drain --lane visual` (node #165) stops new implement claims on every
+visual-lane map: the visual lane is one per machine, so its drain is one switch.
+Research on a visual map still claims. `ranger drain --map owner/name#root`
+drains one headless map, which then claims nothing new. A visual map has no
+drain of its own. `--off` lifts either. Sweeps, merge desks (and their
+send-backs) and queued resumes keep running under a drain. The walk reads the
+drain under the claim lock, and the dashboard shows it from the same gate.
+
 `ranger resume-node <id> --when-free` resumes immediately when its lane is
 free and no resumes wait in that lane. Otherwise it records a durable FIFO entry.
 Research and close-only resumes start immediately. On each walk tick, queued

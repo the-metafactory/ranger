@@ -167,6 +167,7 @@ export type EventKind =
  | "released"
  | "sweep"
  | "deadman-paused"
+ | "drain"
  | "fenced"
  | "pushed"
  | "pr-opened"
@@ -183,6 +184,10 @@ export type EventKind =
 
 /** The health-store key of a checkout's known-good git state (`knownGoodGitState`). */
 const knownGoodGitKey = (canonical: string): string => `git.known-good.${canonical}`;
+
+/** The health-store keys of the drains (node #165), stored the way `paused` is. */
+const VISUAL_DRAIN_KEY = "drain.lane.visual";
+const mapDrainKey = (key: string): string => `drain.map.${key}`;
 
 const rootFilter = (column: typeof workers.root | typeof escalations.root, root?: number) => root === undefined ? undefined : eq(column, root);
 
@@ -528,6 +533,29 @@ export class Journal {
 
  setPaused(paused: boolean): void {
   this.setHealth("paused", paused ? "true" : "false");
+ }
+
+ // ---- drain (node #165) ----
+
+ /**
+  * The visual lane's drain: one switch for every visual-lane map, because
+  * the lane is a machine singleton (`laneHolder` scans this one journal).
+  */
+ isVisualLaneDrained(): boolean {
+  return this.getHealth(VISUAL_DRAIN_KEY) === "true";
+ }
+
+ setVisualLaneDrained(drained: boolean): void {
+  this.setHealth(VISUAL_DRAIN_KEY, drained ? "true" : "false");
+ }
+
+ /** One headless-lane map's drain, keyed `owner/name#root`. */
+ isMapDrained(key: string): boolean {
+  return this.getHealth(mapDrainKey(key)) === "true";
+ }
+
+ setMapDrained(key: string, drained: boolean): void {
+  this.setHealth(mapDrainKey(key), drained ? "true" : "false");
  }
 
  /** Day-keyed spawn counter — the global spend bound (§7). */
