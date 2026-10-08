@@ -312,7 +312,7 @@ describe("node #165 — the dashboard's next shares the walk's drain gate", () =
   const state = assembleState(inputs({ visual: true, maps: new Set() }));
   const [game, tool, second] = state.maps;
   for (const m of [game, second]) {
-   expect(m.next).toMatchObject({ waiting: false, reason: "no implement claim while the visual lane is drained" });
+   expect(m.next).toMatchObject({ waiting: false, reason: "no implement claim this tick — see the visual lane" });
    expect(m.next.nodeId).toBeUndefined();
    expect(m.queued).toEqual([]);
   }

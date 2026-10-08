@@ -401,7 +401,7 @@ function nextFor(
   return none(`${vetoed.join(", ")} vetoed — the tick claims nothing else this pass`);
  }
  if (drain !== null && implementCandidates(report.frontier).length > 0) {
-  return none(`no implement claim while the ${map.lane} lane is drained`);
+  return none(`no implement claim this tick — see the ${map.lane} lane`);
  }
  return none("nothing walkable on this map's frontier");
 }
