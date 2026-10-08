@@ -30,15 +30,19 @@ export interface IssueComment {
  body: string;
 }
 
-export interface ForgePort {
- findPrByHead(repo: string, branch: string, token: string): Promise<ChangeRequest | null>;
- getPr(repo: string, n: number, token: string): Promise<ChangeRequest>;
+/** Read credentials may carry a forge's checked, project-bound grant. */
+export interface ForgeReadPort<Credential = string> {
+ findPrByHead(repo: string, branch: string, token: Credential): Promise<ChangeRequest | null>;
+ getPr(repo: string, n: number, token: Credential): Promise<ChangeRequest>;
+ ciVerdictFor(repo: string, sha: string, token: Credential, purpose?: CiPurpose): Promise<CiVerdict>;
+ issueLabels(repo: string, n: number, token: Credential): Promise<string[]>;
+ listComments(repo: string, n: number, token: Credential): Promise<IssueComment[]>;
+}
+
+export interface ForgePort<ReadCredential = string> extends ForgeReadPort<ReadCredential> {
  createDraftPr(repo: string, pr: { head: string; base: string; title: string; body: string }, token: string): Promise<ChangeRequest>;
  updatePrBody(repo: string, n: number, body: string, token: string): Promise<void>;
  markReady(repo: string, pr: ChangeRequest, token: string): Promise<void>;
- ciVerdictFor(repo: string, sha: string, token: string, purpose?: CiPurpose): Promise<CiVerdict>;
  mergePr(repo: string, n: number, sha: string, title: string, token: string): Promise<void>;
- issueLabels(repo: string, n: number, token: string): Promise<string[]>;
  postComment(repo: string, n: number, body: string, token: string): Promise<number>;
- listComments(repo: string, n: number, token: string): Promise<IssueComment[]>;
 }

@@ -1,0 +1,20 @@
+{
+  "mr": {
+    "id": 401, "iid": 7, "state": "opened", "draft": false,
+    "source_branch": "node/124 & fixtures", "target_branch": "main",
+    "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "detailed_merge_status": "mergeable",
+    "web_url": "https://gitlab.example.test/team/sub/project/-/merge_requests/7",
+    "author": { "username": "ivy-bot", "name": "Display Name" }, "title": "GitLab reads",
+    "merge_commit_sha": null, "merge_user": null
+  },
+  "pipelines": [
+    { "id": 31, "source": "external", "status": "success", "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "web_url": "https://gitlab.example.test/team/sub/project/-/pipelines/31" },
+    { "id": 30, "source": "merge_request_event", "status": "success", "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "web_url": "https://gitlab.example.test/team/sub/project/-/pipelines/30" },
+    { "id": 29, "source": "push", "status": "failed", "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "web_url": "https://gitlab.example.test/team/sub/project/-/pipelines/29" }
+  ],
+  "notes": [
+    [{ "id": 10, "system": true, "body": "changed title", "author": { "username": "ivy-bot" } }, { "id": 11, "system": false, "body": "Review marker", "author": { "username": "sage-bot", "name": "Sage" } }],
+    [{ "id": 12, "system": false, "body": "", "author": { "username": "ivy-bot" } }]
+  ],
+  "issue": { "iid": 124, "labels": ["soma:work-graph-node", "ranger:needs-eye"] }
+}
