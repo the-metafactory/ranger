@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { loadConfig } from "../src/config.ts";
 import * as exec from "../src/exec.ts";
 import { runCmd, type RunResult } from "../src/exec.ts";
-import { FixNodeLockBusy, withFixNodeLock } from "../src/fix-node-lock.ts";
+import { fixNodeLockFile, FixNodeLockBusy, withFixNodeLock } from "../src/fix-node-lock.ts";
 import { GraphAddUnattached, graphAdd, graphLink, GraphWriteError, type AddSpec } from "../src/graph-write.ts";
 import { baseRedFixKey, fileBaseRedFixNodes, probeMergeBase, type FixNodeGraph, type ImplementContext } from "../src/implement.ts";
 import { Journal } from "../src/journal.ts";
@@ -35,12 +35,14 @@ describe("fix-the-base node for a confirmed base-red probe (node #152)", () => {
  let linkFails: Error | null;
  let linked: { node: string; parent: string }[];
  let addDelayMs: number;
+ let onAdd: (() => void) | null;
  let nextNode: number;
 
  const fakeGraph: FixNodeGraph = {
   add: async (parent, spec) => {
    added.push({ parent, spec });
    if (addDelayMs > 0) await Bun.sleep(addDelayMs);
+   onAdd?.();
    if (addFails !== null) throw addFails;
    const node = String(nextNode++);
    statuses.set(node, "open");
@@ -87,6 +89,7 @@ describe("fix-the-base node for a confirmed base-red probe (node #152)", () => {
   linkFails = null;
   linked = [];
   addDelayMs = 0;
+  onAdd = null;
   nextNode = 300;
   ctx = {
    config, map, node, rootNode: node, canonical, worktree: canonical,
@@ -290,6 +293,16 @@ describe("fix-the-base node for a confirmed base-red probe (node #152)", () => {
   ]);
   expect(added).toHaveLength(1);
   expect(JSON.parse(ctx.journal.getHealth(baseRedFixKey(ctx.map, HUD))!)).toMatchObject({ node: "300", sha });
+ });
+
+ test("a node added while the filing lock was lost is still recorded, and the note says so", async () => {
+  const key = baseRedFixKey(ctx.map, HUD);
+  onAdd = () => writeFileSync(fixNodeLockFile(ctx.journal, key), JSON.stringify({ nonce: "another-run", pid: process.pid, leaseUntil: Date.now() + 60_000 }));
+  await fileBaseRedFixNodes(ctx, { sha, confirmed: [HUD] }, PR);
+  expect(added).toHaveLength(1);
+  expect(JSON.parse(ctx.journal.getHealth(key)!)).toMatchObject({ node: "300", sha });
+  expect(events().some((d) => d.includes("filed fix-the-base node #300") && d.includes("lock was lost during the write; recorded anyway"))).toBe(true);
+  rmSync(fixNodeLockFile(ctx.journal, key), { force: true });
  });
 
  test("the filing lock refuses past its wait while another run holds it", async () => {

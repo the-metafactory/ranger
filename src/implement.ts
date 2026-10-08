@@ -899,6 +899,16 @@ function fixNodeSpec(ctx: ImplementContext, probe: string, checks: string[], sha
  };
 }
 
+/** The note's suffix when the filing lock was lost while a write ran. */
+function leaseLost(owned: () => void): string {
+ try {
+  owned();
+  return "";
+ } catch {
+  return " (the filing lock was lost during the write; recorded anyway, check for a duplicate fix node)";
+ }
+}
+
 /**
  * The narrow found-by-probe filer (node #109's ruling, ahead of the Scribe):
  * a probe confirmed red at the merge base, by this comparison or by the
@@ -910,12 +920,16 @@ function fixNodeSpec(ctx: ImplementContext, probe: string, checks: string[], sha
  *
  * Each (map, probe) is filed under a cross-process lease (`fix-node-lock.ts`)
  * held from the record read to the record write, so two overlapping runs
- * cannot both add; a run that waits past the lease journals the skip, and
- * the holder writes the record. An add that created its node but left it
- * unattached is recorded as such, and the next confirmation links that node
- * below the parent it was filed under instead of adding another. Any other
- * failed add (or failed status read or link) is journalled and retried the
- * next time the probe is found red at a merge base.
+ * do not both add (short of a holder suspended past its lease). A run that waits past FIX_NODE_LOCK_TIMEOUT_MS journals
+ * the skip and leaves the probe to the holder, or, if the holder's add
+ * failed, to the next confirmation. The lease is fenced before each add and
+ * link, not after: a node that exists is recorded even when the lease was
+ * lost during its write, and the note says so. An add that created its node
+ * but left it unattached is recorded as such, and the next confirmation
+ * links that node below the parent it was filed under instead of adding
+ * another. Any other failed add (or failed status read or link) is
+ * journalled and retried the next time the probe is found red at a merge
+ * base.
  *
  * Two windows are left: a run that dies between a successful add and its
  * record write, and an add killed or timed out with no payload (the node id
@@ -943,9 +957,8 @@ export async function fileBaseRedFixNodes(
      owned();
      await graph.link(prior.node, prior.unattached.parent);
      const { attached: _attached, parent: _parent, ...record } = JSON.parse(raw!) as Record<string, unknown>;
-     owned();
      journal.setHealth(key, JSON.stringify(record));
-     note(`attached fix-the-base node #${prior.node} for ${probe} below #${prior.unattached.parent}`);
+     note(`attached fix-the-base node #${prior.node} for ${probe} below #${prior.unattached.parent}${leaseLost(owned)}`);
      return;
     }
     // Filed for this merge base already: a closed node there means the fix landed after it.
@@ -962,12 +975,10 @@ export async function fileBaseRedFixNodes(
     owned();
     try {
      const filed = await graph.add(nodeId, fixNodeSpec(ctx, probe, checks, base.sha, pr));
-     owned();
      journal.setHealth(key, JSON.stringify({ node: filed.node, ...record }));
-     note(`filed fix-the-base node #${filed.node} below #${nodeId}: ${probe} red at the merge base ${base.sha.slice(0, 8)}`);
+     note(`filed fix-the-base node #${filed.node} below #${nodeId}: ${probe} red at the merge base ${base.sha.slice(0, 8)}${leaseLost(owned)}`);
     } catch (error) {
      if (error instanceof GraphAddUnattached) {
-      owned();
       journal.setHealth(key, JSON.stringify({ node: error.node, ...record, attached: false, parent: nodeId }));
      }
      throw error;
