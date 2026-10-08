@@ -81,6 +81,9 @@ export class FencedError extends Error {
  override readonly name = "FencedError";
 }
 
+/** The SHA prefix `recordRebase` writes and `listRebases` reads. */
+const REBASE_SHAS = /^from=([0-9a-f]{7,64})(?: to=([0-9a-f]{7,64}))?:/;
+
 export interface EventRow {
  id: number;
  at: string;
@@ -458,6 +461,27 @@ export class Journal {
     : base.where(eq(events.repo, repo)).orderBy(desc(events.id)).limit(limit);
   const rows = query.all();
   return rows.map(hydrateEvent);
+ }
+
+ /**
+  * Ranger asked the forge to rebase a node's change request from the gated
+  * head `from` (node #126); `to` is the new head once it moved, else null.
+  * The SHAs lead the detail in a fixed prefix that `listRebases` reads back,
+  * so `note` stays free prose.
+  */
+ recordRebase(opts: { nodeId: string; repo: string; from: string; to: string | null; note: string }): void {
+  const shas = opts.to === null ? `from=${opts.from}` : `from=${opts.from} to=${opts.to}`;
+  this.recordEvent("rebased", { nodeId: opts.nodeId, repo: opts.repo, detail: `${shas}: ${opts.note}` });
+ }
+
+ /** A node's recorded rebase requests, newest first. */
+ listRebases(repo: string, nodeId: string): { from: string; to: string | null }[] {
+  return this.listNodeEvents(repo, nodeId)
+   .filter((e) => e.kind === "rebased")
+   .flatMap((e) => {
+    const m = REBASE_SHAS.exec(e.detail ?? "");
+    return m === null ? [] : [{ from: m[1]!, to: m[2] ?? null }];
+   });
  }
 
  /** One node's events, newest first (node #54: the dashboard's reason class). */

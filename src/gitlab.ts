@@ -121,7 +121,7 @@ export class GitLabReadPort implements ForgeReadPort<ResolvedToken> {
   return `projects/${encodeURIComponent(ref.path)}`;
  }
 
- protected async read(repo: string, token: ResolvedToken, endpoint: string): Promise<{ body: unknown; next: string | undefined }> {
+ private async read(repo: string, token: ResolvedToken, endpoint: string): Promise<{ body: unknown; next: string | undefined }> {
   let result;
   try {
    result = await gitlabApiRead(repo, token, endpoint, this.runner);
@@ -334,7 +334,7 @@ export class GitLabPort extends GitLabReadPort implements ForgePort<ResolvedToke
    const r = object(body, endpoint);
    if (r.state !== "merged") invalid(endpoint, "state");
    // The merge happened; a squash GitLab did not honour is escalated, not hidden.
-   if (r.squash !== true) return { status: "refused", reason: `GitLab merged !${n} without squashing (squash=${String(r.squash)}): check the project's squash option` };
+   if (r.squash !== true) return { status: "merged", unsquashed: `GitLab merged !${n} without squashing (squash=${String(r.squash)}): check the project's squash option` };
    return { status: "merged" };
   });
  }

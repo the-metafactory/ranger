@@ -16,7 +16,7 @@ import {
 } from "./implement.ts";
 import type { Journal, WorkerRow } from "./journal.ts";
 import { evaluateMergeGate, type MergeGateInput, type MergeGateResult } from "./merge-gate.ts";
-import type { IssueComment, ChangeRequest, CiVerdict, ForgePort, RebaseOutcome } from "./forge.ts";
+import type { IssueComment, ChangeRequest, CiVerdict, ForgePort, MergeOutcome, RebaseOutcome } from "./forge.ts";
 import { parseForgeRef } from "./forge-ref.ts";
 import { gitlabForgePort } from "./gitlab.ts";
 import { CI_FAILED_PARK_OUTCOME, mergeGateFailedOutcome } from "./outcomes.ts";
@@ -109,20 +109,33 @@ export function deskPort(config: RangerConfig, map: RangerMapConfig): ForgePort 
 }
 
 /**
- * The `rebased` event's detail. It leads with `from=<gated head>`, which
- * `lastRebaseFrom` reads back: the writer and the reader share this one format.
+ * How many times ranger asks the forge to rebase from one head before it
+ * escalates: a forge that keeps answering `needs-rebase` at a head no rebase
+ * moves would otherwise be asked again every pass, forever.
  */
-function rebasedDetail(from: string, rebase: Exclude<RebaseOutcome, { status: "not-mergeable" }>, iid: number, base: string): string {
- return rebase.status === "head-moved"
-  ? `from=${from} to=${rebase.headSha}: PR #${iid} rebased by ranger onto ${base}; the head moved, so it is re-gated there`
-  : `from=${from}: ranger asked for a rebase of PR #${iid} onto ${base}; the head has not moved yet (${rebase.reason})`;
-}
-const REBASED_FROM = /^from=([0-9a-f]{7,64})\b/;
+const MAX_REBASES_AT_HEAD = 3;
 
-/** The head ranger last asked the forge to rebase this node's change request from, if any. */
-function lastRebaseFrom(journal: Journal, repo: string, nodeId: string): string | null {
- const event = journal.listNodeEvents(repo, nodeId).find((e) => e.kind === "rebased");
- return event === undefined ? null : (REBASED_FROM.exec(event.detail ?? "")?.[1] ?? null);
+/** The `rebased` event's prose; the SHAs are the journal's (`recordRebase`). */
+function rebasedNote(rebase: Exclude<RebaseOutcome, { status: "not-mergeable" }>, iid: number, base: string): string {
+ return rebase.status === "head-moved"
+  ? `PR #${iid} rebased by ranger onto ${base}; the head moved, so it is re-gated there`
+  : `ranger asked for a rebase of PR #${iid} onto ${base}; the head has not moved yet (${rebase.reason})`;
+}
+
+/**
+ * The reviewed head ranger itself rebased away from, when that explains a
+ * head with no review: ranger's latest rebase request started at the latest
+ * review's head, and the head has moved since. Null otherwise.
+ */
+function ownRebaseOfLatestReview(
+ journal: Journal,
+ repo: string,
+ nodeId: string,
+ latestReviewSha: string | null,
+ headSha: string,
+): string | null {
+ const from = journal.listRebases(repo, nodeId)[0]?.from ?? null;
+ return from !== null && from === latestReviewSha && from !== headSha ? from : null;
 }
 
 /**
@@ -211,6 +224,18 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   .listWorkers(repo, map.root)
   .filter(watchedByMergeDesk);
 
+ // The project's squash policy, read once per pass and only when ranger would
+ // merge; a failed read is not kept, so a later row reads it again.
+ let squashPolicy: Promise<string | null> | undefined;
+ const squashRefusal = (): Promise<string | null> => {
+  if (github.squashRefusal === undefined) return Promise.resolve(null);
+  squashPolicy ??= github.squashRefusal(repo, token).catch((error: unknown) => {
+   squashPolicy = undefined;
+   throw error;
+  });
+  return squashPolicy;
+ };
+
  for (const row of waiting) {
   try {
    await progress(row);
@@ -248,42 +273,55 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   * Ranger's own merge of a gate-passed change at `headSha`: refuse an
   * unsquashable project, rebase when the forge asks (and stop there: the new
   * head is re-gated on a later pass, never merged in this one), else merge.
-  * Parks and pending rows are recorded here; the merged path is the caller's.
+  * Parks and pending rows are recorded here, and null returned; the merged
+  * path is the caller's.
   */
  async function autoMerge(
   row: WorkerRow,
   pr: ChangeRequest,
   headSha: string,
-  title: string,
+  cardTitle: string,
   rebasePr: ForgePort["rebasePr"],
- ): Promise<"parked" | "pending" | "merged"> {
+ ): Promise<Extract<MergeOutcome, { status: "merged" }> | null> {
   // Ranger merges only squashed: a project that forbids it escalates before any write.
-  const squashRefusal = github.squashRefusal === undefined ? null : await github.squashRefusal(repo, token);
-  if (squashRefusal !== null) {
-   await park(row, `${squashRefusal}. Merge it by hand, or allow squash on the project.`, title);
-   return "parked";
+  const refusal = await squashRefusal();
+  if (refusal !== null) {
+   await park(row, `${refusal}. Merge it by hand, or allow squash on the project.`, cardTitle);
+   return null;
   }
   if (rebasePr !== undefined) {
+   const asked = journal.listRebases(repo, row.nodeId).filter((r) => r.from === headSha).length;
+   if (asked >= MAX_REBASES_AT_HEAD) {
+    await park(
+     row,
+     `ranger asked the forge ${asked} times to rebase PR #${pr.iid} from ${headSha.slice(0, 8)}, and it still asks for a rebase at that head. Rebase it by hand onto ${map.base}, then merge it.`,
+     cardTitle,
+    );
+    return null;
+   }
    const rebase = await rebasePr(repo, pr.iid, token);
    if (rebase.status === "not-mergeable") {
-    await park(row, rebase.reason, title);
-    return "parked";
+    await park(row, rebase.reason, cardTitle);
+    return null;
    }
-   journal.recordEvent("rebased", { nodeId: row.nodeId, repo, detail: rebasedDetail(headSha, rebase, pr.iid, map.base) });
+   journal.recordRebase({
+    nodeId: row.nodeId, repo, from: headSha, to: rebase.status === "head-moved" ? rebase.headSha : null,
+    note: rebasedNote(rebase, pr.iid, map.base),
+   });
    result.pending.push(row.nodeId);
-   return "pending";
+   return null;
   }
   const merge = await github.mergePr(repo, pr.iid, headSha, pr.title, token);
   if (merge.status === "head-moved") {
    journal.recordEvent("sweep", { nodeId: row.nodeId, repo, detail: `PR #${pr.iid}: nothing merged, ${merge.reason}; re-gating the new head` });
    result.pending.push(row.nodeId);
-   return "pending";
+   return null;
   }
-  if (merge.status !== "merged") {
-   await park(row, merge.reason, title);
-   return "parked";
+  if (merge.status === "not-mergeable") {
+   await park(row, merge.reason, cardTitle);
+   return null;
   }
-  return "merged";
+  return merge;
  }
 
  async function progress(row: WorkerRow): Promise<void> {
@@ -347,8 +385,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   // Ranger rebased the reviewed head (a forge under rebase_merge asked): the
   // new head has no review, so it is re-gated by a fresh round, not parked.
   // The review never carries across the rebase: the gate binds to its head.
-  const rebaseFrom = last === undefined ? lastRebaseFrom(journal, repo, row.nodeId) : null;
-  const rebasedFrom = rebaseFrom !== null && rebaseFrom === latestSha && rebaseFrom !== pr.headSha ? rebaseFrom : null;
+  const rebasedFrom = last === undefined ? ownRebaseOfLatestReview(journal, repo, row.nodeId, latestSha, pr.headSha) : null;
   const why = sendBackReason(pr, map.base, last, missingProbes, rebasedFrom);
   // A send-back is a worker session; a CI-only park never starts one.
   if (ciPark && why !== null) return;
@@ -443,18 +480,23 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    if (row.mergeMessageId !== null) return; // its card is still up
   }
   if (map.autoMerge && !needsEye && superseded === null) {
-   if ((await autoMerge(row, pr, gate.headSha, title, rebasePr)) !== "merged") return;
+   const merge = await autoMerge(row, pr, gate.headSha, title, rebasePr);
+   if (merge === null) return;
+   // A merge the forge did not squash is still a merge: record it and close,
+   // and let the notice escalate it, never claiming a squash that did not happen.
+   const how = merge.unsquashed === undefined ? "squash-merged" : "merged (NOT squashed)";
    journal.recordEvent("merged", {
     nodeId: row.nodeId,
     repo,
-    detail: `PR #${pr.iid} squash-merged by ranger at ${gate.headSha.slice(0, 8)} (no ${NEEDS_EYE_LABEL} label; standing grant 2026-10-03)`,
+    detail: `PR #${pr.iid} ${how} by ranger at ${gate.headSha.slice(0, 8)} (no ${NEEDS_EYE_LABEL} label; standing grant 2026-10-03)${merge.unsquashed === undefined ? "" : `: ${merge.unsquashed}`}`.slice(0, 400),
    });
    result.merged.push(row.nodeId);
    try {
     await post(
      [
       `:ranger: **merged** #${row.nodeId} — ${title}`,
-      `Gate passed at \`${gate.headSha.slice(0, 8)}\` (CI, mergeable, sage 0 blockers / 0 majors${probesRequired ? ", probes" : ""}); squash-merged by ranger. The node closes through the gate next.`,
+      `Gate passed at \`${gate.headSha.slice(0, 8)}\` (CI, mergeable, sage 0 blockers / 0 majors${probesRequired ? ", probes" : ""}); ${how} by ranger. The node closes through the gate next.`,
+      ...(merge.unsquashed === undefined ? [] : [`:warning: Needs your eye: ${merge.unsquashed}. The commits landed unsquashed on \`${map.base}\`.`]),
      ].join("\n"),
      `merge notice for #${row.nodeId}`,
     );

@@ -49,18 +49,18 @@ export interface ForgeReadPort<Credential = string> {
  listComments(repo: string, changeRequest: number, token: Credential): Promise<IssueComment[]>;
 }
 
-/**
- * What a merge attempt did. GitHub's adapter answers only `merged` and throws
- * on any refusal (its historical contract); GitLab's maps each refusal here.
- */
+/** What a merge attempt did. How each adapter reports a refusal is on `ForgePort.mergePr`. */
 export type MergeOutcome =
- | { status: "merged" }
+ /**
+  * The change request is merged. `unsquashed` is set when the forge merged
+  * without honouring the squash: still a merge (the close follows), and the
+  * note escalates it to the principal.
+  */
+ | { status: "merged"; unsquashed?: string }
  /** The head is no longer the gated SHA: nothing merged; re-gate the new head. */
  | { status: "head-moved"; reason: string }
  /** The forge declined the merge; `reason` carries its own message. */
- | { status: "not-mergeable"; reason: string }
- /** Ranger refuses (or the forge did not honour the squash): escalate to the principal. */
- | { status: "refused"; reason: string };
+ | { status: "not-mergeable"; reason: string };
 
 /** What a rebase request did. It never merges. */
 export type RebaseOutcome =
@@ -75,7 +75,13 @@ export interface ForgePort<ReadCredential = string, WriteCredential = string> ex
  createDraftPr(repo: string, pr: { head: string; base: string; title: string; body: string }, token: WriteCredential): Promise<ChangeRequest>;
  updatePrBody(repo: string, n: number, body: string, token: WriteCredential): Promise<void>;
  markReady(repo: string, pr: ChangeRequest, token: WriteCredential): Promise<void>;
- /** Squash-merge pinned to `sha`, the head the merge gate passed at. */
+ /**
+  * Squash-merge pinned to `sha`, the head the merge gate passed at. A caller
+  * handles refusals both ways: GitHub's adapter keeps its historical contract
+  * and throws on every refusal (a return is always `merged`); GitLab's answers
+  * `head-moved` (409) and `not-mergeable` (405/406/422) and throws only on a
+  * fault.
+  */
  mergePr(repo: string, n: number, sha: string, title: string, token: WriteCredential): Promise<MergeOutcome>;
  /**
   * Rebase the source branch onto its target, for a forge that reports

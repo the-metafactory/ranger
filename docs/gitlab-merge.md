@@ -19,7 +19,9 @@ gated head. It refuses when the project disallows squash.
   - 409 is `head-moved`.
   - 405, 406 and 422 are `not-mergeable`, carrying GitLab's own
     `message`, bounded to one line.
-  - A 200 that is not squashed is `refused`, for escalation.
+  - A 200 that is not squashed is still `merged`, with an `unsquashed`
+    note. The merge happened, so the desk records it and closes, and the
+    note escalates it.
   - Any other status throws.
 
   glab exits nonzero on an HTTP error but still prints the status line,
@@ -71,17 +73,25 @@ On a GitLab map, the desk acts in this order:
    node, a manual map, or a superseded-major hold posts the merge card, as
    on GitHub. Under `needs-rebase` the card adds a line asking the
    principal to rebase first.
-4. If ranger merges, it reads `squashRefusal` first. On `never` it parks
-   with a card, before any rebase or merge write.
+4. If ranger merges, it reads `squashRefusal` first, once per desk pass.
+   On `never` it parks with a card, before any rebase or merge write.
 5. Under `needs-rebase`, ranger runs `rebasePr` and records a `rebased`
-   event. Its detail leads with `from=<gated head>`, written by
-   `rebasedDetail` and read back by `lastRebaseFrom`. It says the head
-   moved only on `head-moved`; on `pending` it says the rebase was asked
-   for. The row stays pending, and nothing merges in that pass.
+   event through `journal.recordRebase`, which `journal.listRebases` reads
+   back as `{ from, to }`. Its prose says the head moved only on
+   `head-moved`; on `pending` it says the rebase was asked for. The row
+   stays pending, and nothing merges in that pass. After 3 requests from
+   one head, a forge still asking for a rebase there parks the row with a
+   card instead of being asked again. A moved head starts a new count.
 6. Otherwise ranger runs `mergePr`:
    - `head-moved` stays pending and is re-gated next pass.
-   - `not-mergeable` and `refused` park with the reason.
-   - `merged` takes the existing merged path.
+   - `not-mergeable` parks with the reason.
+   - `merged` takes the existing merged path. An `unsquashed` merge says
+     so in the `merged` event and the notice, which carries a warning
+     line for the principal.
+
+`mergePr` reports refusals per adapter, as its doc on `ForgePort` says.
+GitHub's throws on every refusal, unchanged. GitLab's answers
+`head-moved` and `not-mergeable` and throws only on a fault.
 
 GitLab's `auto_merge` and the dashboard tap merge are out of scope.
 GitLab execution stays refused by `executionRefusal` until the

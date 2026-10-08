@@ -92,9 +92,11 @@ describe("node #126 — GitLab squash merge at the gated head", () => {
   });
  }
 
- test("a merge GitLab did not squash is refused for escalation", async () => {
+ test("a merge GitLab did not squash is still a merge, carrying the note that escalates it", async () => {
   const { port } = setup({ write: () => response({ state: "merged", squash: false }) });
-  expect(await port.mergePr(repo, 7, gated, "T", writeToken)).toMatchObject({ status: "refused" });
+  expect(await port.mergePr(repo, 7, gated, "T", writeToken)).toEqual({
+   status: "merged", unsquashed: "GitLab merged !7 without squashing (squash=false): check the project's squash option",
+  });
  });
 
  test("a transport failure without a status line throws, never echoing the subprocess", async () => {

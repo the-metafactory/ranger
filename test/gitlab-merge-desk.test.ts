@@ -237,12 +237,61 @@ describe("node #126 — gitlab-rebase-squash-merge: the merge desk on a GitLab m
   } finally { r.close(); }
  });
 
- test("a merge GitLab did not squash is escalated with a park card, not announced as merged", async () => {
+ test("a merge GitLab did not squash is still journalled as merged and closes, and the notice escalates it", async () => {
   const r = rig();
   try {
-   const gl = fakeGitLab(needsRebase({ mergeState: "mergeable", merge: { status: "refused", reason: "GitLab merged !9 without squashing" } }));
-   expect(await r.desk(gl.port)).toMatchObject({ parked: ["96"], merged: [] });
-   expect(r.posts.at(-1)).toContain("without squashing");
+   const gl = fakeGitLab(needsRebase({ mergeState: "mergeable", merge: { status: "merged", unsquashed: "GitLab merged !9 without squashing (squash=false)" } }));
+   expect(await r.desk(gl.port)).toMatchObject({ merged: ["96"], resumed: ["96"], parked: [], errors: [] });
+   const [merged] = r.events("merged").map((e) => e.detail);
+   expect(merged).toContain("merged (NOT squashed) by ranger");
+   expect(merged).not.toContain("squash-merged");
+   expect(r.events("parked")).toEqual([]);
+   expect(r.row()).toMatchObject({ status: "running", phase: "close" });
+   expect(r.spawned).toEqual(["96"]);
+   const notice = r.posts.at(-1)!;
+   expect(notice).toContain("**merged** #96");
+   expect(notice).toContain(":warning: Needs your eye: GitLab merged !9 without squashing");
+   expect(notice).not.toContain("squash-merged");
+  } finally { r.close(); }
+ });
+
+ test("a forge that keeps asking for a rebase at one head is asked a bounded number of times, then escalated", async () => {
+  const r = rig();
+  try {
+   const mr = needsRebase({ rebase: { status: "pending", reason: "GitLab finished rebasing !9 but the head is still aaaaaaaa" } });
+   const gl = fakeGitLab(mr);
+   for (let pass = 0; pass < 3; pass++) expect(await r.desk(gl.port)).toMatchObject({ pending: ["96"], parked: [] });
+   gl.calls.length = 0;
+   expect(await r.desk(gl.port)).toMatchObject({ parked: ["96"], pending: [], merged: [] });
+   expect(gl.calls).not.toContain("rebasePr");
+   expect(gl.calls).not.toContain("mergePr");
+   expect(r.events("rebased")).toHaveLength(3);
+   expect(r.row()?.outcome).toContain(`3 times to rebase PR #9 from ${GATED.slice(0, 8)}`);
+   expect(r.posts.at(-1)).toContain("**parked** #96");
+  } finally { r.close(); }
+ });
+
+ test("the rebase bound counts per head: requests from an earlier head do not count against a new one", async () => {
+  const r = rig();
+  try {
+   for (let i = 0; i < 3; i++) r.journal.recordRebase({ nodeId: "96", repo: r.map.repo, from: REBASED, to: null, note: "earlier head" });
+   const gl = fakeGitLab(needsRebase());
+   expect(await r.desk(gl.port)).toMatchObject({ pending: ["96"], parked: [] });
+   expect(gl.calls).toContain("rebasePr");
+   expect(r.journal.listRebases(r.map.repo, "96")[0]).toEqual({ from: GATED, to: REBASED });
+  } finally { r.close(); }
+ });
+
+ test("the project's squash policy is read once per desk pass, however many rows would merge", async () => {
+  const r = rig();
+  try {
+   r.journal.upsertWorker({
+    root: 12, nodeId: "97", repo: r.map.repo, lane: "implement", status: "awaiting-merge", phase: "awaiting-merge",
+    prNumber: 10, verdictSha: GATED, verdictBlockers: 0,
+   });
+   const gl = fakeGitLab(needsRebase({ mergeState: "mergeable", squash: `${REPO} has squash_option "never"` }));
+   expect(await r.desk(gl.port)).toMatchObject({ parked: ["96", "97"] });
+   expect(gl.calls.filter((c) => c === "squashRefusal")).toHaveLength(1);
   } finally { r.close(); }
  });
 
