@@ -194,7 +194,7 @@ describe("GitLab notes and issue labels", () => {
   expect(calls.every(path => path.includes("?order_by=created_at&sort=asc&"))).toBeTrue();
   for (const dir of dirs) expect(existsSync(dir)).toBeFalse();
  });
- test("an empty page with a next page header keeps reading: GitLab filters notes after paginating", async () => {
+ test("an empty page with a next page header keeps reading: GitLab can filter notes after paginating", async () => {
   const { port, token, calls } = await setup(path => path === notesPath ? response([], "2") : response(fixture.notes[1], ""));
   expect(await port.listComments(repo, 7, token)).toEqual([{ id: 12, author: "ivy-bot", body: "" }]);
   expect(calls).toHaveLength(2);

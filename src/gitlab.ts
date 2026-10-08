@@ -91,7 +91,7 @@ function pipeline(raw: unknown, endpoint: string): { id: number; source: string;
 }
 
 function nextPage(next: string | undefined, page: number, endpoint: string): number | null {
- // Row counts prove nothing: GitLab filters some lists (notes) after paginating,
+ // Row counts prove nothing: GitLab can filter some lists (notes) after paginating,
  // so a short page can sit mid-collection. Only an empty X-Next-Page ends a read.
  if (next === "") return null;
  // Follow numeric pages only, never a server-provided URL or a backward loop.
