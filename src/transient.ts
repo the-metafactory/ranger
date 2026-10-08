@@ -26,6 +26,18 @@ export function isTransientGitHubError(text: string): boolean {
  return TRANSIENT.some((pattern) => pattern.test(text));
 }
 
+/**
+ * A bare HTTP 500 is retried on a read only (2026-10-07: one on seelite #482's
+ * close read of its merged head's check runs failed the node). It stays off
+ * `TRANSIENT`: that list also classifies worker outcomes, whose failing test
+ * names may well say "HTTP 500", and a test failure must still count.
+ */
+const READ_RETRYABLE = [/\bHTTP 500\b/, /\b500 Internal Server Error\b/i];
+
+function isRetryableRead(text: string): boolean {
+ return isTransientGitHubError(text) || READ_RETRYABLE.some((pattern) => pattern.test(text));
+}
+
 /** Delays between attempts: three attempts in all, about 40 s of waiting. */
 export const TRANSIENT_BACKOFF_MS = [10_000, 30_000];
 
@@ -56,7 +68,7 @@ export async function runReadRetryingTransient(
  const sleep = retry.sleep ?? defaultSleep;
  let result = await runCmd(bin, args, opts);
  for (let i = 0; i < backoff.length; i++) {
-  if (result.code === 0 || !isTransientGitHubError(`${result.stderr}\n${result.stdout}`)) break;
+  if (result.code === 0 || !isRetryableRead(`${result.stderr}\n${result.stdout}`)) break;
   if (retry.shouldRetry !== undefined && !retry.shouldRetry(result)) break;
   retry.onRetry?.(i + 2, result);
   await sleep(backoff[i]);

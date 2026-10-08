@@ -24,6 +24,9 @@ describe("transient GitHub errors (found live on #45 and #663)", () => {
   expect(isTransientGitHubError("gh: Server Error (HTTP 502)")).toBe(true);
   expect(isTransientGitHubError("read ECONNRESET")).toBe(true);
  });
+ test("a bare HTTP 500 is not transient as an outcome: a failing test may name it", () => {
+  expect(isTransientGitHubError("tests failed — failing: the API returns HTTP 500 on bad input")).toBe(false);
+ });
  test("node faults and auth failures are not", () => {
   expect(isTransientGitHubError("gh: Not Found (HTTP 404)")).toBe(false);
   expect(isTransientGitHubError("gh: Bad credentials (HTTP 401)")).toBe(false);
@@ -41,6 +44,17 @@ describe("transient GitHub errors (found live on #45 and #663)", () => {
   const r = await runReadRetryingTransient("/bin/sh", ["-c", script], {}, { ...noSleep, onRetry: (a) => retries.push(a) });
   expect(r.code).toBe(0);
   expect(r.stdout.trim()).toBe("ok");
+  expect(retries).toEqual([2, 3]);
+ });
+ test("a read that hits a bare HTTP 500 is retried (found live on seelite #482)", async () => {
+  const retries: number[] = [];
+  const r = await runReadRetryingTransient(
+   "/bin/sh",
+   ["-c", "echo 'gh: HTTP 500' >&2; exit 1"],
+   {},
+   { ...noSleep, onRetry: (a) => retries.push(a) },
+  );
+  expect(r.code).toBe(1);
   expect(retries).toEqual([2, 3]);
  });
  test("a non-transient failure returns at once", async () => {
