@@ -1541,6 +1541,8 @@ async function checkedWorkerPass(
  const clean = await assertGitUntouched(ctx.canonical, snapshot);
  recordKnownGood(journal, ctx.canonical, clean, `passing ${pass}`);
  await assertNoClosingKeywords(worktree, map.base);
+ // Only a pass that goes on to the push puts its waived tests in the receipts.
+ if (baseRed !== undefined) recordTestsBaseRed(journal, map.repo, ctx.node.ref.id, { head: sha, base: baseRed.sha, names: baseRed.names, rest: baseRed.rest });
  return { workerExit: result.code, snapshot, sha };
 }
 
@@ -1961,6 +1963,8 @@ async function supervisorTests(
 interface BaseRedTests {
  sha: string;
  names: string[];
+ /** The command's other steps, which passed on their own ("" when there are none). */
+ rest: string;
 }
 
 /** `{ baseRed }` when the branch's failures are all red at the base and HEAD stayed at `head` meanwhile; else nothing. */
@@ -2011,8 +2015,8 @@ async function baseRedAt(
  * ended (exit > 128), or one whose `(fail)` lines do not account for every
  * failure bun reports (failuresAllNamed) gets no base run; a base run a signal
  * ended is no base result. Every outcome of a base run, or why none ran, is a
- * `reviewed` event, and a waived run is recorded for the PR and close
- * receipts (testsReceipt).
+ * `reviewed` event; the lane records a waived run that goes on to the push
+ * for the PR and close receipts (testsReceipt).
  */
 async function testsRedAtBase(
  ctx: ImplementContext,
@@ -2077,9 +2081,8 @@ async function testsRedAtBase(
   }
  }
  const names = [...new Set(failed.map(testIdentity))];
- recordTestsBaseRed(journal, map.repo, node.ref.id, { head, base: sha, names, rest: chain.rest });
- event(`tests (${testCommand}) at the merge base ${sha}: red on the merge base too, not gating: ${names.join("; ")}${chain.rest === "" ? "" : ` (the other steps, ${chain.rest}, pass on their own)`}`);
- return { sha, names };
+ event(`tests (${testCommand}) at the merge base ${sha}${chain.rest === "" ? "" : ` (the other steps, ${chain.rest}, pass on their own)`}: red on the merge base too, not gating: ${names.join("; ")}`);
+ return { sha, names, rest: chain.rest };
 }
 
 /**
