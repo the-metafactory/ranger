@@ -1,7 +1,8 @@
 import { createShadowTestBackend, type ShadowComparison } from "../src/remote-test/shadow.ts";
 import { githubCiVerdict } from "../src/github-ci.ts";
 import type { CiPurpose, MergeState } from "../src/forge.ts";
-import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn } from "bun:test";
+import { test } from "./partition.ts";
 import {
  copyFileSync,
  existsSync,

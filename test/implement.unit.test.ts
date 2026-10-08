@@ -472,6 +472,30 @@ describe("the implement prompt leaves the full probe suite to the supervisor (fo
  });
 });
 
+describe("the implement prompt runs the full test command once (found live on ranger #164)", () => {
+ const base = {
+  repo: "acme/widgets",
+  node: { id: "9", title: "t", body: "b", kind: "task", autonomy: "auto", url: "u" },
+  map: { title: "m", body: "" },
+  branch: "node/9-t",
+  worktree: "/w",
+  botIdentity: "ivy-bot",
+  testCommand: "bun test && bunx tsc --noEmit",
+ };
+ test("a local test command is run focused while working, in full once before the final commit", async () => {
+  const { assembleImplementPrompt } = await import("../src/prompt.ts");
+  const prompt = assembleImplementPrompt(base);
+  expect(prompt).toContain("run only the test files that cover what you changed");
+  expect(prompt).toContain("full test command (bun test && bunx tsc --noEmit) ONCE, right before your final commit");
+ });
+ test("remote tests keep their own rule", async () => {
+  const { assembleImplementPrompt } = await import("../src/prompt.ts");
+  const prompt = assembleImplementPrompt({ ...base, remoteTests: true });
+  expect(prompt).toContain("Do not run those commands locally");
+  expect(prompt).not.toContain("run only the test files that cover what you changed");
+ });
+});
+
 describe("implement lane holder", () => {
  test("names the implement worker building or under review, except the asking node", () => {
   const dir = mkdtempSync(join(tmpdir(), "ranger-holder-"));

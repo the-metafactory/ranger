@@ -23,5 +23,5 @@ jobs:
           # Execute reviewed bootstrap regressions on their declared Bun version.
           bun-version: 1.3.14
       - run: bun install --frozen-lockfile
-      - run: bun test
+      - run: bun run test
       - run: bunx tsc --noEmit
