@@ -139,40 +139,61 @@ describe("node #126 — the project's squash option, read through the read gate"
 describe("node #126 — rebase on need_rebase, bounded wait, never a merge", () => {
  const state = (inProgress: boolean, sha = rebased, mergeError: string | null = null) =>
   response({ ...fixture.mr, sha, rebase_in_progress: inProgress, merge_error: mergeError });
+ const accepted = () => response({ rebase_in_progress: true }, 202);
+ /** Answer state reads in order, repeating the last one. */
+ const script = (...states: RunResult[]) => () => states.length > 1 ? states.shift()! : states[0]!;
 
  test("PUT rebase, then poll rebase_in_progress until false: head moved to the new SHA", async () => {
-  const states = [state(true, gated), state(false)];
-  const { port, writes, reads, sleeps } = setup({ write: () => response({ rebase_in_progress: true }, 202), read: () => states.shift()! });
+  const { port, writes, reads, sleeps } = setup({ write: accepted, read: script(state(false, gated), state(true, gated), state(false)) });
   expect(await port.rebasePr!(repo, 7, writeToken)).toEqual({ status: "head-moved", headSha: rebased });
   expect(writes).toEqual([[`${mrPath}/rebase`, "--method", "PUT", "--include", "--hostname", host]]);
-  expect(reads).toEqual([statePath, statePath]);
+  expect(reads).toEqual([statePath, statePath, statePath]);
   expect(sleeps).toEqual([5, 5]);
  });
 
  test("still rebasing after the bound is pending", async () => {
-  const { port, writes, reads } = setup({ polls: 3, write: () => response({ rebase_in_progress: true }, 202), read: () => state(true, gated) });
+  const { port, writes, reads } = setup({ polls: 3, write: accepted, read: script(state(false, gated), state(true, gated)) });
   expect(await port.rebasePr!(repo, 7, writeToken)).toMatchObject({ status: "pending" });
   expect(writes).toHaveLength(1);
-  expect(reads).toHaveLength(3);
+  expect(reads).toHaveLength(4);
  });
 
- test("a finished rebase that left a merge_error is not mergeable", async () => {
-  const { port } = setup({ write: () => response({ rebase_in_progress: true }, 202), read: () => state(false, gated, "Rebase failed: conflict") });
+ test("a rebase an earlier pass started is waited on, never requested again", async () => {
+  const { port, writes, reads } = setup({ write: accepted, read: script(state(true, gated), state(false)) });
+  expect(await port.rebasePr!(repo, 7, writeToken)).toEqual({ status: "head-moved", headSha: rebased });
+  expect(writes).toEqual([]);
+  expect(reads).toHaveLength(2);
+ });
+
+ test("409 on the rebase request (not enqueued yet) is pending, not a park", async () => {
+  const { port, reads } = setup({ write: () => response({ message: "Failed to enqueue the rebase operation" }, 409), read: () => state(false, gated) });
+  expect(await port.rebasePr!(repo, 7, writeToken)).toMatchObject({ status: "pending" });
+  expect(reads).toEqual([statePath]);
+ });
+
+ test("a finished rebase that left a merge_error on the same head is not mergeable", async () => {
+  const { port } = setup({ write: accepted, read: script(state(false, gated), state(false, gated, "Rebase failed: conflict")) });
   expect(await port.rebasePr!(repo, 7, writeToken)).toEqual({ status: "not-mergeable", reason: "GitLab could not rebase !7: Rebase failed: conflict" });
  });
 
+ test("a stale merge_error beside a moved head is the rebase landing", async () => {
+  const { port } = setup({ write: accepted, read: script(state(false, gated, "old merge failure"), state(false, rebased, "old merge failure")) });
+  expect(await port.rebasePr!(repo, 7, writeToken)).toEqual({ status: "head-moved", headSha: rebased });
+ });
+
  test("a refused rebase request is not mergeable, with GitLab's message", async () => {
-  const { port, reads } = setup({ write: () => response({ message: "403 Forbidden" }, 403) });
+  const { port, reads } = setup({ write: () => response({ message: "403 Forbidden" }, 403), read: () => state(false, gated) });
   const outcome = await port.rebasePr!(repo, 7, writeToken);
   expect(outcome).toMatchObject({ status: "not-mergeable" });
   if (outcome.status !== "not-mergeable") throw new Error("expected not-mergeable");
   expect(outcome.reason).toContain("HTTP 403: 403 Forbidden");
   expect(outcome.reason).not.toContain(writeToken);
-  expect(reads).toEqual([]);
+  expect(reads).toEqual([statePath]);
  });
 
- test("a rebase state without rebase_in_progress fails closed", async () => {
-  const { port } = setup({ write: () => response({}, 202), read: () => response({ ...fixture.mr }) });
+ test("a rebase state without rebase_in_progress fails closed, before any request", async () => {
+  const { port, writes } = setup({ write: accepted, read: () => response({ ...fixture.mr }) });
   await expect(port.rebasePr!(repo, 7, writeToken)).rejects.toBeInstanceOf(GitLabReadError);
+  expect(writes).toEqual([]);
  });
 });

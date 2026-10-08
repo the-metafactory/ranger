@@ -24,13 +24,18 @@ gated head. It refuses when the project disallows squash.
 
   glab exits nonzero on an HTTP error but still prints the status line,
   so the status decides the result. Subprocess output is never surfaced.
-- `rebaseAndWait(repo, iid, { read, write })` sends
-  `PUT …/merge_requests/:iid/rebase`. It then polls
+- `rebaseAndWait(repo, iid, { read, write })` first reads
   `GET …/merge_requests/:iid?include_rebase_in_progress=true` under the
-  read credential, up to 10 checks at 2 s each. The results:
-  - Finished with no `merge_error` is `head-moved` with the new SHA.
-  - A `merge_error` or a refused request is `not-mergeable`.
-  - Still rebasing at the bound is `pending`.
+  read credential. If a rebase is already running (an earlier pass started
+  it), it waits on that rebase and sends no new request. Otherwise it sends
+  `PUT …/merge_requests/:iid/rebase`. It then polls the same read, up to
+  10 checks at 2 s each. The results:
+  - A head that moved is `head-moved` with the new SHA, even beside a
+    stale `merge_error`.
+  - A `merge_error` on an unchanged head, or a refused request, is
+    `not-mergeable`.
+  - A 409 on the request (GitLab could not enqueue it yet), or still
+    rebasing at the bound, is `pending`.
 
   It never merges.
 

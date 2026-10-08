@@ -342,12 +342,20 @@ export class GitLabPort extends GitLabReadPort implements ForgePort<ResolvedToke
   */
  async rebaseAndWait(repo: string, n: number, token: { read: ResolvedToken; write: string }): Promise<RebaseOutcome> {
   const endpoint = `${this.mrEndpoint(repo, n)}/rebase`;
-  const { status, body } = await this.answer(repo, token.write, endpoint, []);
-  if (status < 200 || status >= 300) return { status: "not-mergeable", reason: `GitLab declined to rebase !${n}: ${forgeMessage(body, status)}` };
+  // A rebase an earlier pass started is waited on, never requested again.
+  const before = await this.rebaseState(repo, n, token.read);
+  if (!before.inProgress) {
+   const { status, body } = await this.answer(repo, token.write, endpoint, []);
+   // 409: GitLab could not enqueue the rebase yet ("try again later").
+   if (status === 409) return { status: "pending", reason: `GitLab did not start the rebase of !${n} yet: ${forgeMessage(body, status)}` };
+   if (status < 200 || status >= 300) return { status: "not-mergeable", reason: `GitLab declined to rebase !${n}: ${forgeMessage(body, status)}` };
+  }
   for (let poll = 0; poll < this.wait.polls; poll++) {
    await this.wait.sleep(this.wait.intervalMs);
    const state = await this.rebaseState(repo, n, token.read);
    if (state.inProgress) continue;
+   // A moved head is the rebase landing; a merge_error left from an earlier attempt does not undo it.
+   if (state.headSha !== before.headSha) return { status: "head-moved", headSha: state.headSha };
    if (state.mergeError !== null) return { status: "not-mergeable", reason: `GitLab could not rebase !${n}: ${state.mergeError}` };
    return { status: "head-moved", headSha: state.headSha };
   }

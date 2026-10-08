@@ -145,10 +145,19 @@ describe("node #126 — gitlab-rebase-squash-merge: the merge desk on a GitLab m
  test("a rebase still running after the bounded wait is pending, and never merges in the same pass", async () => {
   const r = rig();
   try {
-   const gl = fakeGitLab(needsRebase({ rebase: { status: "pending", reason: "GitLab is still rebasing !9 after 10 checks" } }));
+   const mr = needsRebase({ rebase: { status: "pending", reason: "GitLab is still rebasing !9 after 10 checks" } });
+   const gl = fakeGitLab(mr);
    expect(await r.desk(gl.port)).toMatchObject({ pending: ["96"], merged: [], parked: [] });
    expect(gl.calls).not.toContain("mergePr");
    expect(r.events("rebased").map((e) => e.detail)).toEqual([expect.stringMatching(new RegExp(`^from=${GATED} \\(GitLab is still rebasing`))]);
+
+   // Next pass: GitLab still reports need_rebase at the same head; the port waits on the running rebase.
+   mr.rebase = { status: "head-moved", headSha: REBASED };
+   gl.calls.length = 0;
+   expect(await r.desk(gl.port)).toMatchObject({ pending: ["96"], merged: [], parked: [], resumed: [] });
+   expect(gl.calls).toContain("rebasePr");
+   expect(gl.calls).not.toContain("mergePr");
+   expect(r.row()).toMatchObject({ status: "awaiting-merge" });
   } finally { r.close(); }
  });
 
