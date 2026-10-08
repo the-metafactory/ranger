@@ -256,3 +256,12 @@ test("maximal strict record remains below 1024 bytes; over-limit published-looki
  const published = (await fs.readdir(f.diagnosticsRoot)).filter(n => n !== `${id}.json`); expect(published.length).toBe(1);
  const text = await fs.readFile(join(f.diagnosticsRoot, published[0]), "utf8"); expect(Buffer.byteLength(text)).toBeLessThanOrEqual(1024); expect(text).not.toContain(secret);
 });
+
+test("partially invalid operator config still excludes its jobs root from diagnostic storage", async () => {
+ const f = await fixture(), invalid = { ...f.config, executorId: "invalid " + secret };
+ const response = await serveSshResponse(raw(""), invalid, { ...f.options, diagnostics: { ...f.options.diagnostics!, root: f.jobsRoot } });
+ expect(response).toEqual({ version: 1, error: "receiver_failed" }); expect(f.warnings()).toBe(1); expect(await fs.readdir(f.jobsRoot)).toEqual([]);
+ const child = await cli(f, "", ["--diagnostics-root", f.jobsRoot], invalid);
+ expect(child).toEqual({ code: 0, stdout: '{"version":1,"error":"receiver_failed"}\n', stderr: "ranger remote-test: private diagnostic unavailable.\n" });
+ expect(await fs.readdir(f.jobsRoot)).toEqual([]); expect(f.calls()).toBe(0);
+});

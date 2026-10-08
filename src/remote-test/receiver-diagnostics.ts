@@ -21,6 +21,16 @@ export const ReceiverDiagnosticSchema = z.object({
 export type ReceiverDiagnostic = z.infer<typeof ReceiverDiagnosticSchema>;
 export type RefusalDiagnostic = Omit<ReceiverDiagnostic, "version" | "id" | "time">;
 
+/** Only operator configuration supplies this exclusion. A partially invalid
+ * config can still name a syntactically valid jobs root; do not skip separation
+ * just because a different config field failed validation. */
+export function diagnosticJobsRoot(config: unknown): string | undefined {
+ if (!config || typeof config !== "object") return;
+ let path: unknown;
+ try { path = Object.getOwnPropertyDescriptor(config, "jobsRoot")?.value; } catch { return; }
+ if (typeof path === "string" && isAbsolute(path) && !/[\0,:\n]/.test(path) && !path.split(sep).includes("..")) return path;
+}
+
 /** Only explicit local tags and exact errno data properties are diagnostic
  * input. Never examine messages, stacks, causes or arbitrary string values. */
 export class TaggedReceiverFailure extends Error {

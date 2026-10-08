@@ -1,4 +1,4 @@
-import { classifyReceiverFailure, saveRefusalDiagnostic, TaggedReceiverFailure, type DiagnosticStage, type RefusalDiagnostic, type ReceiverDiagnostics } from "./receiver-diagnostics.ts";
+import { classifyReceiverFailure, diagnosticJobsRoot, saveRefusalDiagnostic, TaggedReceiverFailure, type DiagnosticStage, type RefusalDiagnostic, type ReceiverDiagnostics } from "./receiver-diagnostics.ts";
 import { createHash } from "node:crypto";
 import { lstat, mkdir, open, realpath, rm } from "node:fs/promises";
 import { join } from "node:path";
@@ -75,6 +75,7 @@ function failureTag(error: unknown, stage: DiagnosticStage) {
 async function receive(input: AsyncIterable<Uint8Array>, operatorConfig: unknown, options: SshServerOptions, context: RefusalContext): Promise<SshResponse> {
  const now = options.now ?? Date.now;
  context.stage = "config";
+ context.jobsRoot = diagnosticJobsRoot(operatorConfig);
  let config;
  try { config = validateExecutorConfig(operatorConfig); }
  catch { throw new TaggedReceiverFailure("invalid_config", "Invalid executor configuration"); }
