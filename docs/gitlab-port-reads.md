@@ -52,7 +52,7 @@ The pipeline query is by SHA only, as the node specifies, and is not scoped to
 the MR's ref: a `push` pipeline for the same SHA on another branch can decide
 the verdict. Ref scoping needs the head branch in `ciVerdictFor` and must
 keep `merge_request_event` pipelines (`refs/merge-requests/<iid>/head`); it
-is left to the soma-side CI verifier.
+is outside this node.
 
 HTTP errors, malformed JSON, missing/invalid required fields, and transport
 failures throw typed errors. Subprocess output is excluded from diagnostics
