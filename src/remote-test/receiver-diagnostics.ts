@@ -6,6 +6,7 @@ import { z } from "zod";
 
 export const DIAGNOSTIC_LIMITS = { recordBytes: 1024, fileBytes: 4 * 1024 ** 2, entries: 4096, retentionMs: 7 * 86400_000 } as const;
 const stages = ["config", "root", "header", "request", "lookup", "upload", "executor_boundary", "receipt", "cleanup"] as const;
+// Persisted record-version-1 vocabulary: append only; never remove or rename codes.
 const codes = ["invalid_config", "unsafe_path", "incomplete_header", "header_limit", "malformed_request", "profile_not_approved", "job_invalid", "expired", "unexpected_payload", "upload_size", "upload_digest", "upload_no_progress", "interrupted", "invalid_receipt", "unknown", "EACCES", "EPERM", "ENOENT", "EEXIST", "ENOSPC", "EDQUOT", "EIO", "EROFS", "EMFILE", "ENFILE"] as const;
 export type DiagnosticStage = typeof stages[number];
 export type DiagnosticCode = typeof codes[number];
