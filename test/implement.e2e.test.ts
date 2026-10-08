@@ -1813,7 +1813,7 @@ describe("implement lane (node #23)", () => {
 
  test("a failed supervisor test run names its failing test and keeps its whole output in the node's log", async () => {
   // Red on the branch only: the base has no src/feature.ts.
-  const r = await rig({ test: "if [ -f src/feature.ts ]; then echo \"(fail) the hud draws [3.00ms]\" >&2; exit 1; fi" });
+  const r = await rig({ test: "if [ -f src/feature.ts ]; then echo \"(fail) the hud draws [3.00ms]\" >&2; echo \" 1 fail\" >&2; exit 1; fi" });
   cleanup.push(r.dir);
   const outcome = await runNode("20", r.ctx);
   expect(outcome.status).toBe("failed");
@@ -1845,21 +1845,21 @@ describe("implement lane (node #23)", () => {
   const reviewed = (r: Rig) => r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
 
   test("every failing test red at the merge base too: not gating, the lane carries on and restores the worktree", async () => {
-   const r = await rig({ test: "echo \"(fail) claude-code install [5000.00ms]\"; echo \"(fail) git trust\" >&2; exit 1" });
+   const r = await rig({ test: "echo \"(fail) claude-code install [5000.00ms]\"; echo \"(fail) git trust\" >&2; echo \" 2 fail\" >&2; exit 1" });
    cleanup.push(r.dir);
    const calls = watchRuns(r);
    expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
    const sha = await mergeBase(r);
    expect(sha).toMatch(/^[0-9a-f]{40}$/);
    const events = reviewed(r);
-   expect(events).toContain(`tests (echo "(fail) claude-code install [5000.00ms]"; echo "(fail) git trust" >&2; exit 1) at the merge base ${sha}: red on the merge base too, not gating: claude-code install; git trust`);
+   expect(events).toContain(`tests (echo "(fail) claude-code install [5000.00ms]"; echo "(fail) git trust" >&2; echo " 2 fail" >&2; exit 1) at the merge base ${sha}: red on the merge base too, not gating: claude-code install; git trust`);
    expect(events.some((d) => d.startsWith("restored the worktree to "))).toBe(true);
    expect(baseRuns(calls).map((c) => c.command)).toEqual([r.ctx.map.commands.test!]);
    expect(r.github.prs.size).toBe(1);
   }, 60_000);
 
   test("after a failed busy-host retry the base run waits for a quiet host, then clears the shared failure", async () => {
-   const r = await rig({ test: "echo \"(fail) a flake at load\"; exit 1" });
+   const r = await rig({ test: "echo \"(fail) a flake at load\"; echo \" 1 fail\"; exit 1" });
    cleanup.push(r.dir);
    const calls = watchRuns(r);
    const loads = [14, 13, 2, 14, 13, 2]; // retry: at the failure, waiting, quiet; base run: busy, waiting, quiet
@@ -1880,7 +1880,7 @@ describe("implement lane (node #23)", () => {
   }, 60_000);
 
   test("a base that fails another set gates, naming the failures the base did not share", async () => {
-   const r = await rig({ test: "echo \"(fail) shared\"; if [ -f src/feature.ts ]; then echo \"(fail) branch only\"; fi; exit 1" });
+   const r = await rig({ test: "echo \"(fail) shared\"; if [ -f src/feature.ts ]; then echo \"(fail) branch only\"; echo \" 2 fail\"; fi; exit 1" });
    cleanup.push(r.dir);
    const outcome = await runNode("20", r.ctx);
    expect(outcome.status).toBe("failed");
@@ -1891,7 +1891,7 @@ describe("implement lane (node #23)", () => {
   }, 60_000);
 
   test("the comparison uses every failing name, not the three the journal line keeps", async () => {
-   const r = await rig({ test: "echo \"(fail) one\"; echo \"(fail) two\"; echo \"(fail) three\"; if [ -f src/feature.ts ]; then echo \"(fail) four\"; fi; exit 1" });
+   const r = await rig({ test: "echo \"(fail) one\"; echo \"(fail) two\"; echo \"(fail) three\"; if [ -f src/feature.ts ]; then echo \"(fail) four\"; echo \" 4 fail\"; fi; exit 1" });
    cleanup.push(r.dir);
    const outcome = await runNode("20", r.ctx);
    expect(outcome.status).toBe("failed");
@@ -1915,7 +1915,7 @@ describe("implement lane (node #23)", () => {
    const calls: { command: string; cwd: string }[] = [];
    r.ctx.shellRun = (command, opts) => {
     calls.push({ command, cwd: opts.cwd ?? "" });
-    if (command === r.ctx.map.commands.test) return Promise.resolve({ code: -1, stdout: "(fail) a shared flake\n", stderr: "timed out" });
+    if (command === r.ctx.map.commands.test) return Promise.resolve({ code: -1, stdout: "(fail) a shared flake\n 1 fail\n", stderr: "timed out" });
     return runCmd("/bin/sh", ["-c", command], opts);
    };
    expect((await runNode("20", r.ctx)).status).toBe("failed");
@@ -1923,23 +1923,78 @@ describe("implement lane (node #23)", () => {
    expect(reviewed(r).some((d) => d.includes("merge base") || d.includes("merge-base"))).toBe(false);
   }, 60_000);
 
+  test("a branch run a signal ended (exit 143) gets no base run, even with (fail) lines", async () => {
+   const r = await rig({ test: "echo \"(fail) shared\"; echo \" 1 fail\"; exit 143" });
+   cleanup.push(r.dir);
+   const calls = watchRuns(r);
+   expect((await runNode("20", r.ctx)).status).toBe("failed");
+   expect(baseRuns(calls)).toEqual([]);
+   expect(reviewed(r).some((d) => d.includes("merge base") || d.includes("merge-base"))).toBe(false);
+  }, 60_000);
+
+  test("a base run a signal ended (exit 143) is no base result: the failures gate", async () => {
+   const r = await rig({ test: "echo \"(fail) shared\"; echo \" 1 fail\"; if [ -f src/feature.ts ]; then exit 1; fi; exit 143" });
+   cleanup.push(r.dir);
+   const outcome = await runNode("20", r.ctx);
+   expect(outcome.status).toBe("failed");
+   const sha = await mergeBase(r);
+   expect(reviewed(r).some((d) => d.endsWith(`at the merge base ${sha} were ended by a signal (exit 143) — not a base result, the failures gate`))).toBe(true);
+   expect(reviewed(r).some((d) => d.includes("red on the merge base too"))).toBe(false);
+   expect(r.github.prs.size).toBe(0);
+  }, 60_000);
+
+  for (const [what, extra] of [
+   ["an unhandled error between tests", "echo \"# Unhandled error between tests\"; echo \" 1 fail\"; echo \" 1 error\""],
+   ["a file that does not load (counted, unnamed)", "echo \"error: Cannot find module ./nope\"; echo \" 2 fail\""],
+   ["no bun summary at all", "true"],
+  ] as const) {
+   test(`a shared named failure beside ${what} gets no base run: the failures gate`, async () => {
+    const r = await rig({ test: `echo "(fail) shared"; if [ -f src/feature.ts ]; then ${extra}; else echo " 1 fail"; fi; exit 1` });
+    cleanup.push(r.dir);
+    const calls = watchRuns(r);
+    expect((await runNode("20", r.ctx)).status).toBe("failed");
+    expect(baseRuns(calls)).toEqual([]);
+    expect(reviewed(r).some((d) => d.endsWith("failures no (fail) line names (an error outside a test, or a count the names do not cover); the merge-base check did not run — the failures gate"))).toBe(true);
+    expect(r.github.prs.size).toBe(0);
+   }, 60_000);
+  }
+
+  for (const [what, opts] of [
+   ["whose install failed", { install: "case \"$PWD\" in *ranger-test-retry-*) echo \"(fail) shared\"; echo \" 1 fail\"; exit 3 ;; esac", test: "echo \"(fail) shared\"; echo \" 1 fail\"; exit 1" }],
+   ["that changed tracked content", { test: "case \"$PWD\" in *ranger-test-retry-*) echo x >> src/feature.ts ;; esac; echo \"(fail) shared\"; echo \" 1 fail\"; exit 1" }],
+  ] as const) {
+   test(`a busy-host retry ${what} certifies nothing: its shared failures gate without a base run`, async () => {
+    const r = await rig(opts);
+    cleanup.push(r.dir);
+    const calls = watchRuns(r);
+    const loads = [14, 13, 2];
+    r.ctx.hostLoad = () => ({ load: loads.length > 1 ? (loads.shift() as number) : loads[0], cores: 10 });
+    r.ctx.quietHost = { pollMs: 1, maxMs: 60_000 };
+    expect((await runNode("20", r.ctx)).status).toBe("failed");
+    expect(calls.filter((c) => c.cwd.includes("ranger-test-retry-")).length).toBeGreaterThan(0);
+    expect(baseRuns(calls)).toEqual([]);
+    expect(reviewed(r).some((d) => d.includes("red on the merge base too"))).toBe(false);
+    expect(r.github.prs.size).toBe(0);
+   }, 60_000);
+  }
+
   test("a base install that fails gates, and says why the base check did not run", async () => {
    const r = await rig({
     install: "case \"$PWD\" in *ranger-test-base-*) exit 3 ;; esac",
-    test: "echo \"(fail) shared\"; exit 1",
+    test: "echo \"(fail) shared\"; echo \" 1 fail\"; exit 1",
    });
    cleanup.push(r.dir);
    const outcome = await runNode("20", r.ctx);
    expect(outcome.status).toBe("failed");
    expect(outcome.detail).toContain("failing: shared:");
    const sha = await mergeBase(r);
-   expect(reviewed(r)).toContain(`tests (echo "(fail) shared"; exit 1) failed; the merge-base check at ${sha} did not run: install for the merge-base run failed — the failures gate`);
+   expect(reviewed(r)).toContain(`tests (echo "(fail) shared"; echo " 1 fail"; exit 1) failed; the merge-base check at ${sha} did not run: install for the merge-base run failed — the failures gate`);
   }, 60_000);
 
   test("a run that moves origin/main onto the branch's own head cannot make its failures the base's", async () => {
    // The failed run points origin/main at HEAD: a base check read from that ref
    // would run the branch itself and call its failure the base's.
-   const r = await rig({ test: "git update-ref refs/remotes/origin/main HEAD; if [ -f src/feature.ts ]; then echo \"(fail) branch only\"; exit 1; fi" });
+   const r = await rig({ test: "git update-ref refs/remotes/origin/main HEAD; if [ -f src/feature.ts ]; then echo \"(fail) branch only\"; echo \" 1 fail\"; exit 1; fi" });
    cleanup.push(r.dir);
    const outcome = await runNode("20", r.ctx);
    expect(outcome.status).toBe("failed");
@@ -1950,7 +2005,7 @@ describe("implement lane (node #23)", () => {
 
   test("a merge base that cannot be resolved gates, and says why the base check did not run", async () => {
    // The branch shares no history with origin/main: no merge base to compare with.
-   const r = await rig({ test: "echo \"(fail) shared\"; exit 1" });
+   const r = await rig({ test: "echo \"(fail) shared\"; echo \" 1 fail\"; exit 1" });
    cleanup.push(r.dir);
    r.ctx.workerCommand = [implementWorker, "orphan"];
    const calls = watchRuns(r);

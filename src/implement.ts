@@ -1746,6 +1746,32 @@ export function allFailedTestNames(result: RunResult): string[] {
  return [...names];
 }
 
+/**
+ * Whether bun's `(fail)` lines account for every failure the run reports:
+ * its summary counts as many failing tests as there are `(fail)` lines, and
+ * no error outside a test (a file that does not load, an unhandled error
+ * between tests). bun counts a file that fails to load as a failing test
+ * with no `(fail)` line, so a shared named failure must not hide it. A run
+ * without bun's summary is not accounted for.
+ */
+export function failuresAllNamed(result: RunResult): boolean {
+ const out = `${result.stdout}\n${result.stderr}`;
+ const lines = [...out.matchAll(/^\(fail\) /gm)].length;
+ const counted = [...out.matchAll(/^\s*(\d+) fail$/gm)];
+ const errors = [...out.matchAll(/^\s*(\d+) errors?$/gm)].reduce((n, m) => n + Number(m[1]), 0);
+ return (
+  counted.length > 0 &&
+  counted.reduce((n, m) => n + Number(m[1]), 0) === lines &&
+  errors === 0 &&
+  !/^# Unhandled error/m.test(out)
+ );
+}
+
+/** An exit the shell reports for a signal (128 + N: 137 a kill, 143 a SIGTERM). */
+function signalExit(code: number): boolean {
+ return code > 128;
+}
+
 /** The first three failing tests a run names: what the journal line keeps. */
 export function failedTestNames(result: RunResult): string[] {
  return allFailedTestNames(result).slice(0, 3);
@@ -1804,7 +1830,10 @@ async function supervisorTests(
  }
  const retry = await retryOnBusyHost(ctx, testCommand, head, `tests (${testCommand})`, "the test retry", `${label}: supervisor test retry`);
  if (retry === null) return { tests, retried: false, ...await baseRedAt(ctx, testCommand, tests, head, label, baseTip) };
- tests = retry;
+ tests = retry.result;
+ // A retry that did not run validly (its clone, install or checkout check
+ // failed) certifies nothing: its (fail) lines are no evidence to waive.
+ if (!retry.ran) return { tests, retried: false };
  if (tests.code === 0 && (await headSha(worktree)) !== head) {
   tests = { ...tests, code: 1, stderr: `the retry passed at ${head.slice(0, 8)}, but the worktree moved off it meanwhile\n${tests.stderr}` };
  }
@@ -1855,8 +1884,10 @@ async function baseRedAt(
  * commit its failures are compared with. The result
  * is the base's red set when every failing name the branch run printed is a
  * `(fail)` line there too; null when they gate. A failure that names no test
- * (a typecheck after passing tests, a crash, a timeout, a kill) gets no base
- * run. Every outcome of a base run, or why none ran, is a `reviewed` event.
+ * (a typecheck after passing tests, a crash, a timeout, a kill), one a signal
+ * ended (exit > 128), or one whose `(fail)` lines do not account for every
+ * failure bun reports (failuresAllNamed) gets no base run; a base run a signal
+ * ended is no base result. Every outcome of a base run, or why none ran, is a `reviewed` event.
  * Whatever the command runs after a failing step (`bun test && tsc` never
  * reaches tsc) is not run by a base-red pass; CI runs it before the merge.
  */
@@ -1869,8 +1900,12 @@ async function testsRedAtBase(
 ): Promise<BaseRedTests | null> {
  const { journal, map, node, worktree } = ctx;
  const names = allFailedTestNames(tests);
- if (tests.code <= 0 || names.length === 0) return null;
+ if (tests.code <= 0 || signalExit(tests.code) || names.length === 0) return null;
  const event = (detail: string) => journal.recordEvent("reviewed", { nodeId: node.ref.id, repo: map.repo, detail });
+ if (!failuresAllNamed(tests)) {
+  event(`tests (${testCommand}) failed with failures no (fail) line names (an error outside a test, or a count the names do not cover); the merge-base check did not run — the failures gate`);
+  return null;
+ }
  if (baseTip === null) {
   event(`tests (${testCommand}) failed; the merge-base check did not run: origin/${map.base} did not resolve before the worker ran — the failures gate`);
   return null;
@@ -1885,6 +1920,10 @@ async function testsRedAtBase(
  const base = await freshCheckoutTests(ctx, testCommand, sha, `${label}: merge base ${sha.slice(0, 8)}`, "base");
  if (!base.ran) {
   event(`tests (${testCommand}) failed; the merge-base check at ${sha} did not run: ${base.result.stderr.trim().split("\n")[0]} — the failures gate`);
+  return null;
+ }
+ if (signalExit(base.result.code)) {
+  event(`tests (${testCommand}) at the merge base ${sha} were ended by a signal (exit ${base.result.code}) — not a base result, the failures gate`);
   return null;
  }
  const there = new Set(base.result.code > 0 ? allFailedTestNames(base.result) : []);
@@ -1902,7 +1941,9 @@ async function testsRedAtBase(
  * The one busy-host retry supervisor test runs and adoption share: on a
  * loaded host, wait for it to quiet (or for the wait to run out) and run
  * install and the tests once more in a fresh clone of `sha`. Null when the
- * host is not busy: no retry.
+ * host is not busy: no retry. `ran` is freshCheckoutTests' own: false when
+ * the retry's clone, install or checkout check failed (or the local run never
+ * happened), so its result is no evidence.
  */
 async function retryOnBusyHost(
  ctx: ImplementContext,
@@ -1911,7 +1952,7 @@ async function retryOnBusyHost(
  what: string,
  run: string,
  label: string,
-): Promise<RunResult | null> {
+): Promise<{ ran: boolean; result: RunResult } | null> {
  const host = (ctx.hostLoad ?? realHostLoad)();
  if (host.load < host.cores) return null;
  ctx.journal.recordEvent("reviewed", {
@@ -1920,8 +1961,14 @@ async function retryOnBusyHost(
   detail: `${what} failed on a busy host (load ${host.load.toFixed(1)} on ${host.cores} cores) — retrying once, in a fresh checkout of ${sha.slice(0, 8)}, when it quiets`,
  });
  await awaitQuietHost(ctx, run);
- const local = () => testsInFreshCheckout(ctx, testCommand, sha, label);
- return ctx.map.testBackend?.kind === "shadow" ? backendTests(ctx, sha, local) : local();
+ let ran = false;
+ const local = async () => {
+  const fresh = await freshCheckoutTests(ctx, testCommand, sha, label, "retry");
+  ran = fresh.ran;
+  return fresh.result;
+ };
+ const result = ctx.map.testBackend?.kind === "shadow" ? await backendTests(ctx, sha, local) : await local();
+ return { ran, result };
 }
 
 /**
@@ -2058,7 +2105,7 @@ async function adoptBuiltWork(ctx: ImplementContext, testCommand: string): Promi
  let tests = await backendTests(ctx, sha, () => testsInFreshCheckout(ctx, testCommand, sha, "adopted build: supervisor tests"));
  if (tests.code !== 0) {
   const retry = remoteTests(ctx) ? null : await retryOnBusyHost(ctx, testCommand, sha, "adoption tests", "the adoption test retry", "adopted build: supervisor test retry");
-  if (retry !== null) tests = retry;
+  if (retry !== null) tests = retry.result;
  }
  const clean = await assertGitUntouched(ctx.canonical, snapshot);
  if (tests.code !== 0) {
