@@ -57,16 +57,19 @@ export function resolveWriteToken(
  return { token, source: tokenEnv };
 }
 
-/** Longest-prefix match over `auth.writeTokens`, else the default. */
+/**
+ * Longest-prefix match over `auth.writeTokens`, else the default. Qualified and
+ * bare GitHub keys rank by the repo path they cover, not their raw length, so
+ * `acme/widgets` beats `github:github.com/acme/`; on a tie the qualified key wins.
+ */
 export function matchWriteTokenEnv(
  auth: RangerAuthConfig,
  repo: string,
 ): string | undefined {
  const ref = parseForgeRef(repo);
- const prefixes = Object.keys(auth.writeTokens).sort(
-  (a, b) => b.length - a.length,
- );
- for (const prefix of prefixes) {
+ const forgeHost = `${ref.forge}:${ref.host}/`;
+ let best: { env: string | undefined; specificity: number; qualified: boolean } | undefined;
+ for (const [prefix, env] of Object.entries(auth.writeTokens)) {
   const qualified = prefix.includes(":");
   if (!qualified && ref.forge !== "github") continue;
   const target = qualified ? qualifiedRepo(ref) : ref.path;
@@ -74,10 +77,14 @@ export function matchWriteTokenEnv(
   const matches = qualified
    ? target === path || target.startsWith(path.endsWith("/") ? path : `${path}/`)
    : prefix === "*" || target.startsWith(path);
-  if (matches) {
-   return auth.writeTokens[prefix];
+  if (!matches) continue;
+  const specificity = qualified ? Math.max(0, path.length - forgeHost.length) : path.length;
+  if (best === undefined || specificity > best.specificity ||
+   (specificity === best.specificity && qualified && !best.qualified)) {
+   best = { env, specificity, qualified };
   }
  }
+ if (best !== undefined) return best.env;
  return ref.forge === "github" ? auth.defaultWriteTokenEnv : undefined;
 }
 
@@ -157,11 +164,10 @@ export async function loginForToken(
  runner: typeof runCmd = runCmd,
 ): Promise<string> {
  const ref = parseForgeRef(repo);
+ if (ref.forge === "gitlab") return gitlabLogin(await gitlabGet(token, repo, "/user", runner, opts));
  const gated = writeEnvForRepo(repo, token, opts.env);
  try {
-  const result = await runner(ref.forge === "github" ? "gh" : "glab",
-   ref.forge === "github" ? ["api", "/user", "--jq", ".login"]
-    : ["api", "/user", "--hostname", ref.host, "--method", "GET"], {
+  const result = await runner("gh", ["api", "/user", "--jq", ".login"], {
    ...opts,
    timeoutMs: opts.timeoutMs ?? 60_000,
    env: gated.env,
@@ -171,11 +177,7 @@ export async function loginForToken(
     `cannot resolve the identity behind the write token (${ref.forge} api user, exit ${result.code})`,
    );
   }
-  let login: unknown = result.stdout.trim();
-  if (ref.forge === "gitlab") {
-   try { login = JSON.parse(result.stdout).username; }
-   catch { throw new WriteGateError("cannot resolve GitLab write identity: invalid /user response"); }
-  }
+  const login = result.stdout.trim();
   if (!isCleanIdentifier(login)) {
    throw new WriteGateError("cannot resolve write identity: missing login in /user response");
   }
@@ -205,8 +207,16 @@ export async function resolveBotIdentity(
  env: NodeJS.ProcessEnv = process.env,
 ): Promise<string> {
  const ref = parseForgeRef(repo);
+ if (ref.forge === "gitlab") {
+  // One /user read yields both the username and GitLab's own bot flag.
+  const user = await gitlabGet(token, repo, "/user", runner, { env });
+  const resolved = gitlabLogin(user);
+  assertNotPrincipal(config, resolved, repo);
+  await assertProjectBot(token, repo, user, runner, env);
+  return resolved;
+ }
  const resolved = await loginForToken(token, repo, { env }, runner);
- if (ref.forge === "github" && config.bot.identity !== undefined && config.bot.identity.length > 0) {
+ if (config.bot.identity !== undefined && config.bot.identity.length > 0) {
   if (resolved !== config.bot.identity) {
    throw new WriteGateError(
     `configured bot.identity '${config.bot.identity}' does not match the ` +
@@ -217,10 +227,65 @@ export async function resolveBotIdentity(
   }
  }
  assertNotPrincipal(config, resolved, repo);
- if (ref.forge === "gitlab" && !/^project_\d+_bot_[a-f0-9]+$/.test(resolved)) {
-  throw new WriteGateError("GitLab write identity is not a project access-token bot — refusing to write (node #123)");
- }
  return resolved;
+}
+
+function gitlabLogin(user: Record<string, unknown> | null): string {
+ const login = user?.username;
+ if (!isCleanIdentifier(login)) {
+  throw new WriteGateError("cannot resolve write identity: missing login in /user response");
+ }
+ return login;
+}
+
+/**
+ * A username alone does not prove a project access-token bot: a human may pick
+ * `project_123_bot_…`. Require GitLab's server-reported `bot: true` for the
+ * token's user, and require the project id GitLab encodes in a project bot's
+ * username to be this repo's project id, so the token belongs to this project.
+ */
+async function assertProjectBot(
+ token: string,
+ repo: string,
+ user: Record<string, unknown> | null,
+ runner: typeof runCmd,
+ env: NodeJS.ProcessEnv,
+): Promise<void> {
+ const refuse = (why: string) =>
+  new WriteGateError(`GitLab write identity is not this project's access-token bot (${why}) — refusing to write (node #123)`);
+ const projectId = /^project_(\d+)_bot_[a-f0-9]+$/.exec(String(user?.username))?.[1];
+ if (projectId === undefined) throw refuse("username is not a project bot's");
+ if (user?.bot !== true) throw refuse("GitLab does not report the user as a bot");
+ const ref = parseForgeRef(repo);
+ const project = await gitlabGet(token, repo, `/projects/${encodeURIComponent(ref.path)}`, runner, { env });
+ if (typeof project?.id !== "number" || String(project.id) !== projectId) {
+  throw refuse(`the bot belongs to project ${projectId}, not ${ref.path}`);
+ }
+}
+
+/** One read-only GET under the write credential's isolated config; parsed JSON or a refusal. */
+async function gitlabGet(
+ token: string,
+ repo: string,
+ endpoint: string,
+ runner: typeof runCmd,
+ opts: RunOptions,
+): Promise<Record<string, unknown> | null> {
+ const ref = parseForgeRef(repo);
+ const gated = writeEnvForRepo(repo, token, opts.env);
+ try {
+  const result = await runner("glab", ["api", endpoint, "--hostname", ref.host, "--method", "GET"], {
+   ...opts, timeoutMs: opts.timeoutMs ?? 60_000, env: gated.env,
+  });
+  if (result.code !== 0) throw new WriteGateError(`cannot verify the GitLab write identity (GET ${endpoint}, exit ${result.code})`);
+  const body: unknown = JSON.parse(result.stdout);
+  return typeof body === "object" && body !== null ? body as Record<string, unknown> : null;
+ } catch (error) {
+  if (error instanceof WriteGateError) throw error;
+  throw new WriteGateError(`cannot verify the GitLab write identity (GET ${endpoint} failed)`);
+ } finally {
+  gated.cleanup();
+ }
 }
 
 /**

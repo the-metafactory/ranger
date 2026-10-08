@@ -30,6 +30,10 @@ const inherited: NodeJS.ProcessEnv = {
  GLAB_ENABLE_CI_AUTOLOGIN: "true", GL_HOST: "wrong.host", NODE_OPTIONS: "injection",
 };
 const result = (body: unknown): RunResult => ({ code: 0, stdout: JSON.stringify(body), stderr: "" });
+const projectPath = `/projects/${encodeURIComponent("team/sub/project")}`;
+/** GitLab's answers for the project's own bot: /user flags it, the project id matches its username. */
+const botApi = (user: unknown = { username: bot, bot: true }, project: unknown = { id: 123 }) =>
+ async (_bin: string, args: string[]) => result(args[1] === "/user" ? user : project);
 
 function inspectEnv(env?: NodeJS.ProcessEnv): string {
  expect(env?.SOMA_GRAPH_READONLY).toBeUndefined();
@@ -76,13 +80,16 @@ describe("GitLab write gate", () => {
 
  test("GET /user resolves username from the write credential and cleans its config", async () => {
   let dir = "";
+  const endpoints: string[] = [];
   const authorized = await assertWriteIdentity(config, repo, inherited, async (bin, args, opts) => {
    expect(bin).toBe("glab");
-   expect(args).toEqual(["api", "/user", "--hostname", host, "--method", "GET"]);
+   expect(args).toEqual(["api", args[1], "--hostname", host, "--method", "GET"]);
+   endpoints.push(args[1]!);
    dir = inspectEnv(opts?.env);
-   return result({ username: bot, login: "wrong-field" });
+   return args[1] === "/user" ? result({ username: bot, login: "wrong-field", bot: true }) : result({ id: 123 });
   });
   expect(authorized).toEqual({ token: secret, botIdentity: bot });
+  expect(endpoints).toEqual(["/user", projectPath]);
   expect(existsSync(dir)).toBeFalse();
  });
 
@@ -100,6 +107,8 @@ describe("GitLab write gate", () => {
 
  test.each([
   { username: "boss-gl" }, { username: "human-maintainer" }, {}, { username: null },
+  { username: bot }, { username: bot, bot: false }, { username: bot, bot: "true" },
+  { username: "boss-gl", bot: true }, { username: "human-maintainer", bot: true },
   { username: "" }, { username: " " }, { username: 123 }, null,
  ])("refuses principal, non-project bot and malformed /user identities %j", async body => {
   let dir = "";
@@ -130,8 +139,7 @@ describe("GitLab write gate", () => {
 
  test("a pinned GitHub bot coexists with GitLab project bots and still gates GitHub", async () => {
   const pinned = { ...config, bot: { identity: "ivy-agent" } };
-  expect(await resolveBotIdentity(pinned, secret, repo,
-   async () => result({ username: bot }), inherited)).toBe(bot);
+  expect(await resolveBotIdentity(pinned, secret, repo, botApi(), inherited)).toBe(bot);
   expect(await resolveBotIdentity(pinned, "gh-token", "team/project",
    async () => ({ code: 0, stdout: "ivy-agent\n", stderr: "" }), {})).toBe("ivy-agent");
   await expect(resolveBotIdentity(pinned, "gh-token", "team/project",
@@ -139,7 +147,39 @@ describe("GitLab write gate", () => {
   await expect(resolveBotIdentity(pinned, secret, repo,
    async () => result({ username: "boss-gl" }), inherited)).rejects.toThrow(/principal's identity/);
   await expect(resolveBotIdentity(pinned, secret, repo,
-   async () => result({ username: "human-maintainer" }), inherited)).rejects.toThrow(/not a project access-token bot/);
+   async () => result({ username: "human-maintainer" }), inherited)).rejects.toThrow(/not this project's access-token bot/);
+ });
+
+ test("a project-bot username is not enough: GitLab must flag a bot owned by this project", async () => {
+  // A human may choose a project-bot-shaped username; GitLab's bot flag is not theirs to set.
+  await expect(resolveBotIdentity(config, secret, repo, botApi({ username: bot, bot: false }), inherited))
+   .rejects.toThrow(/does not report the user as a bot/);
+  await expect(resolveBotIdentity(config, secret, repo, botApi({ username: bot }), inherited))
+   .rejects.toThrow(/does not report the user as a bot/);
+  // Another project's bot token, mapped to this repo by mistake.
+  await expect(resolveBotIdentity(config, secret, repo, botApi(undefined, { id: 999 }), inherited))
+   .rejects.toThrow(/belongs to project 123/);
+  for (const project of [{}, { id: "123" }, null]) {
+   await expect(resolveBotIdentity(config, secret, repo, botApi(undefined, project), inherited))
+    .rejects.toThrow(WriteGateError);
+  }
+  await expect(resolveBotIdentity(config, secret, repo, async (_bin, args) =>
+   args[1] === "/user" ? result({ username: bot, bot: true }) : { code: 1, stdout: "", stderr: secret }, inherited))
+   .rejects.toThrow(/cannot verify/);
+ });
+
+ test("qualified and bare GitHub write keys rank by the repo path they cover", () => {
+  const auth: RangerAuthConfig = { readOnlyTokens: {}, writeTokens: {
+   "github:github.com/acme/": "ORG", "acme/widgets": "PROJECT",
+  } };
+  expect(matchWriteTokenEnv(auth, "acme/widgets")).toBe("PROJECT");
+  expect(matchWriteTokenEnv(auth, "github:github.com/acme/widgets")).toBe("PROJECT");
+  expect(matchWriteTokenEnv(auth, "acme/gadgets")).toBe("ORG");
+  auth.writeTokens = { "acme/": "BARE_ORG", "github:github.com/acme/widgets": "QUALIFIED_PROJECT", "*": "ALL" };
+  expect(matchWriteTokenEnv(auth, "acme/widgets")).toBe("QUALIFIED_PROJECT");
+  expect(matchWriteTokenEnv(auth, "acme/gadgets")).toBe("BARE_ORG");
+  auth.writeTokens = { "github:github.com/": "QUALIFIED_ALL", "*": "BARE_ALL" };
+  expect(matchWriteTokenEnv(auth, "acme/widgets")).toBe("QUALIFIED_ALL");
  });
 
  test("GitHub identity lookup remains compatible", async () => {
