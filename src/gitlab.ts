@@ -17,6 +17,7 @@ const BLOCKED = new Set([
  "status_checks_must_pass", "merge_request_blocked", "locked_paths", "locked_lfs_files", "security_policy_violations",
  "title_regex", "commits_status", "jira_association_missing",
 ]);
+const MR_STATE: Record<string, ChangeRequest["state"]> = { opened: "open", closed: "closed", merged: "merged", locked: "closed" };
 
 export function gitlabMergeState(status: string): MergeState {
  if (status === "mergeable") return "mergeable";
@@ -49,20 +50,31 @@ function nullableString(raw: unknown, endpoint: string, field: string): string |
  return raw === null ? null : string(raw, endpoint, field);
 }
 
-function changeRequest(raw: unknown, endpoint: string): ChangeRequest {
+function changeRequest(raw: unknown, endpoint: string): { mr: ChangeRequest; sameProject: boolean } {
  const r = object(raw, endpoint);
  const state = string(r.state, endpoint, "state");
- if (!["opened", "closed", "merged", "locked"].includes(state)) invalid(endpoint, "state");
+ if (!Object.hasOwn(MR_STATE, state)) invalid(endpoint, "state");
  if (typeof r.draft !== "boolean") invalid(endpoint, "draft");
  const detail = string(r.detailed_merge_status, endpoint, "detailed_merge_status");
  return {
-  iid: id(r.iid, endpoint, "iid"), state: state === "opened" ? "open" : state === "merged" ? "merged" : "closed",
-  draft: r.draft, headRef: string(r.source_branch, endpoint, "source_branch"), headSha: string(r.sha, endpoint, "sha"),
-  baseRef: string(r.target_branch, endpoint, "target_branch"), mergeState: gitlabMergeState(detail), mergeDetail: detail,
-  webUrl: string(r.web_url, endpoint, "web_url"), author: username(r.author, endpoint, "author"),
-  title: string(r.title, endpoint, "title"), mergeCommitSha: nullableString(r.merge_commit_sha, endpoint, "merge_commit_sha"),
-  mergedBy: r.merge_user === null ? null : username(r.merge_user, endpoint, "merge_user"),
+  sameProject: id(r.source_project_id, endpoint, "source_project_id") === id(r.target_project_id, endpoint, "target_project_id"),
+  mr: {
+   iid: id(r.iid, endpoint, "iid"), state: MR_STATE[state]!,
+   draft: r.draft, headRef: string(r.source_branch, endpoint, "source_branch"), headSha: string(r.sha, endpoint, "sha"),
+   baseRef: string(r.target_branch, endpoint, "target_branch"), mergeState: gitlabMergeState(detail), mergeDetail: detail,
+   webUrl: string(r.web_url, endpoint, "web_url"), author: username(r.author, endpoint, "author"),
+   title: string(r.title, endpoint, "title"), mergeCommitSha: nullableString(r.merge_commit_sha, endpoint, "merge_commit_sha"),
+   mergedBy: r.merge_user === null ? null : username(r.merge_user, endpoint, "merge_user"),
+  },
  };
+}
+
+function nextPage(next: string | undefined, page: number, rowCount: number, endpoint: string): number | null {
+ if (next === "" || (next === undefined && rowCount < 100)) return null;
+ // Follow numeric pages only, never a server-provided URL or a backward loop.
+ const following = next === undefined ? page + 1 : Number(next);
+ if ((next !== undefined && !/^\d+$/.test(next)) || !Number.isSafeInteger(following) || following <= page) invalid(endpoint, "X-Next-Page");
+ return following;
 }
 
 /** Read half of the forge port; writes and lane routing belong to later nodes. */
@@ -84,12 +96,10 @@ export class GitLabReadPort implements ForgeReadPort<ResolvedToken> {
    // A subprocess error can contain credentials; keep it outside diagnostics.
    throw new GitLabReadError("read transport failed", endpoint);
   }
-  const { status, body } = parseGlabResponse(result);
+  const { status, body, headers } = parseGlabResponse(result);
   if (result.code !== 0 || status !== 200) throw new GitLabReadError(`read failed (exit ${result.code})`, endpoint, status);
   if (body === undefined) invalid(endpoint, "JSON body");
-  const headers = result.stdout.split(/\r?\n\r?\n/, 1)[0]!;
-  const next = /^x-next-page:[ \t]*(.*)$/im.exec(headers)?.[1]?.trim();
-  return { body, next };
+  return { body, next: headers["x-next-page"] };
  }
 
  private async *pages(repo: string, token: ResolvedToken, endpoint: string): AsyncGenerator<{ endpoint: string; rows: unknown[] }> {
@@ -98,11 +108,9 @@ export class GitLabReadPort implements ForgeReadPort<ResolvedToken> {
    const path = `${endpoint}${endpoint.includes("?") ? "&" : "?"}per_page=100&page=${page}`;
    const { body, next } = await this.read(repo, token, path);
    if (!Array.isArray(body)) invalid(path, "array");
+   const following = nextPage(next, page, body.length, path);
    yield { endpoint: path, rows: body };
-   if (next === "" || (next === undefined && body.length < 100)) return;
-   // Follow numeric pages only, never a server-provided URL or a backward loop.
-   const following = next === undefined ? page + 1 : Number(next);
-   if ((next !== undefined && !/^\d+$/.test(next)) || !Number.isSafeInteger(following) || following <= page) invalid(path, "X-Next-Page");
+   if (following === null) return;
    page = following;
   }
  }
@@ -113,8 +121,9 @@ export class GitLabReadPort implements ForgeReadPort<ResolvedToken> {
   const endpoint = `${this.project(repo)}/merge_requests?source_branch=${encodeURIComponent(branch)}&state=all`;
   for await (const page of this.pages(repo, token, endpoint)) {
    for (const raw of page.rows) {
-    const mr = changeRequest(raw, page.endpoint);
+    const { mr, sameProject } = changeRequest(raw, page.endpoint);
     if (mr.headRef !== branch) invalid(page.endpoint, "source_branch differs from requested branch");
+    if (!sameProject) continue;
     if (newest === null || mr.iid > newest.iid) newest = mr;
    }
   }
@@ -123,7 +132,8 @@ export class GitLabReadPort implements ForgeReadPort<ResolvedToken> {
 
  async getPr(repo: string, n: number, token: ResolvedToken): Promise<ChangeRequest> {
   const endpoint = `${this.project(repo)}/merge_requests/${id(n, repo, "iid")}`;
-  const mr = changeRequest((await this.read(repo, token, endpoint)).body, endpoint);
+  const { mr, sameProject } = changeRequest((await this.read(repo, token, endpoint)).body, endpoint);
+  if (!sameProject) invalid(endpoint, "source_project_id differs from target_project_id (fork MR)");
   if (mr.iid !== n) invalid(endpoint, "iid differs from requested MR");
   return mr;
  }
@@ -144,6 +154,8 @@ export class GitLabReadPort implements ForgeReadPort<ResolvedToken> {
     if (!["push", "merge_request_event"].includes(source)) continue;
     if (latest === undefined || pipelineId > latest.id) latest = { id: pipelineId, status, url };
    }
+   // The API orders ids descending, so later pages cannot supersede this page.
+   if (latest !== undefined) break;
   }
   if (latest === undefined) return { state: "pending", reason: "no push or merge_request_event pipeline on the head" };
   if (latest.status === "success") return {
@@ -156,7 +168,7 @@ export class GitLabReadPort implements ForgeReadPort<ResolvedToken> {
  }
 
  async listComments(repo: string, n: number, token: ResolvedToken): Promise<IssueComment[]> {
-  const endpoint = `${this.project(repo)}/merge_requests/${id(n, repo, "iid")}/notes`;
+  const endpoint = `${this.project(repo)}/merge_requests/${id(n, repo, "iid")}/notes?order_by=created_at&sort=asc`;
   const comments: IssueComment[] = [];
   for await (const page of this.pages(repo, token, endpoint)) {
    for (const raw of page.rows) {
@@ -173,6 +185,7 @@ export class GitLabReadPort implements ForgeReadPort<ResolvedToken> {
  async issueLabels(repo: string, n: number, token: ResolvedToken): Promise<string[]> {
   const endpoint = `${this.project(repo)}/issues/${id(n, repo, "iid")}`;
   const r = object((await this.read(repo, token, endpoint)).body, endpoint);
+  if (id(r.iid, endpoint, "iid") !== n) invalid(endpoint, "iid differs from requested issue");
   if (!Array.isArray(r.labels) || r.labels.some(label => typeof label !== "string")) invalid(endpoint, "labels");
   return r.labels;
  }

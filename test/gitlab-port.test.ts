@@ -20,7 +20,7 @@ const response = (body: unknown, next?: string, status = 200, code = status === 
 const mrPath = `${project}/merge_requests/7`;
 const findPath = `${project}/merge_requests?source_branch=node%2F124%20%26%20fixtures&state=all&per_page=100&page=1`;
 const pipelinePath = `${project}/pipelines?sha=${sha}&order_by=id&sort=desc&per_page=100&page=1`;
-const notesPath = `${project}/merge_requests/7/notes?per_page=100&page=1`;
+const notesPath = `${project}/merge_requests/7/notes?order_by=created_at&sort=asc&per_page=100&page=1`;
 const issuePath = `${project}/issues/124`;
 
 async function setup(read: (endpoint: string) => RunResult | Promise<RunResult>) {
@@ -71,6 +71,19 @@ describe("GitLab MR reads", () => {
   const { port, token } = await setup(() => response([]));
   expect(await port.findPrByHead(repo, fixture.mr.source_branch, token)).toBeNull();
  });
+ test("same-named fork MR with a newer iid cannot replace the project's MR across pages", async () => {
+  const { port, token, calls } = await setup(path => path === findPath
+   ? response([fixture.mr], "2")
+   : response([{ ...fixture.mr, iid: 99, source_project_id: 2, sha: "b".repeat(40) }], ""));
+  expect(await port.findPrByHead(repo, fixture.mr.source_branch, token)).toMatchObject({ iid: 7, headSha: sha });
+  expect(calls).toHaveLength(2);
+ });
+ test("fork-only search is null and direct fork MR reads are refused", async () => {
+  const fork = { ...fixture.mr, source_project_id: 2 };
+  const { port, token } = await setup(path => response(path === mrPath ? fork : [fork]));
+  expect(await port.findPrByHead(repo, fixture.mr.source_branch, token)).toBeNull();
+  await expect(port.getPr(repo, 7, token)).rejects.toBeInstanceOf(GitLabReadError);
+ });
  test.each([ ["opened", "open"], ["closed", "closed"], ["merged", "merged"], ["locked", "closed"] ])("state %s maps to %s", async (state, expected) => {
   const { port, token } = await setup(path => {
    expect(path).toBe(mrPath);
@@ -85,19 +98,21 @@ describe("GitLab MR reads", () => {
   await expect(port.getPr(repo, 7, token)).rejects.toBeInstanceOf(GitLabReadError);
   await expect(port.findPrByHead(repo, fixture.mr.source_branch, token)).rejects.toBeInstanceOf(GitLabReadError);
  });
- test.each([{ iid: 8 }, { draft: "false" }, { state: "future-state" }, { author: {} }, { sha: null }])("invalid or mismatched MR data %j throws", async patch => {
+ test.each([{ iid: 8 }, { draft: "false" }, { state: "future-state" }, { author: {} }, { sha: null },
+  { source_project_id: null }, { target_project_id: "1" }])("invalid or mismatched MR data %j throws", async patch => {
   const { port, token } = await setup(() => response({ ...fixture.mr, ...patch }));
   await expect(port.getPr(repo, 7, token)).rejects.toBeInstanceOf(GitLabReadError);
  });
 });
 
 describe("GitLab detailed merge status", () => {
+ // Independent oracle from node #124's binding status table; do not derive it from the adapter.
  const mappings = {
   mergeable: ["mergeable"], conflict: ["conflict"], "needs-rebase": ["need_rebase"],
   pending: ["checking", "unchecked", "preparing", "approvals_syncing", "ci_still_running", "ci_must_pass"],
   blocked: ["not_approved", "discussions_not_resolved", "draft_status", "blocked_status", "not_open", "requested_changes",
    "status_checks_must_pass", "merge_request_blocked", "locked_paths", "locked_lfs_files", "security_policy_violations",
-   "title_regex", "commits_status", "jira_association_missing"], unknown: ["future-status"],
+   "title_regex", "commits_status", "jira_association_missing"], unknown: ["future-status", "broken_status", "merge_time", "external_status_checks"],
  };
  for (const [expected, values] of Object.entries(mappings) as [MergeState, string[]][]) {
   test.each(values)(`%s maps to ${expected} through get`, async value => {
@@ -136,6 +151,18 @@ describe("GitLab head pipeline trust", () => {
   expect(await port.ciVerdictFor(repo, sha, token)).toMatchObject({ state: "green", runId: 30 });
   expect(calls[1]).toBe(pipelinePath.replace("&page=1", "&page=2"));
  });
+ test("stops after the first page containing a qualifying pipeline", async () => {
+  const { port, token, calls } = await setup(path => {
+   expect(path).toBe(pipelinePath);
+   return response(fixture.pipelines, "2");
+  });
+  expect(await port.ciVerdictFor(repo, sha, token)).toMatchObject({ state: "green", runId: 30 });
+  expect(calls).toHaveLength(1);
+ });
+ test("still validates the entire deciding page before returning green", async () => {
+  const { port, token } = await setup(() => response([fixture.pipelines[1], { ...fixture.pipelines[2], sha: "b".repeat(40) }], "2"));
+  await expect(port.ciVerdictFor(repo, sha, token)).rejects.toBeInstanceOf(GitLabReadError);
+ });
  test.each(["id", "source", "status", "sha", "web_url"])("missing pipeline field %s throws", async field => {
   const raw: Record<string, unknown> = { ...fixture.pipelines[1] };
   delete raw[field];
@@ -149,7 +176,7 @@ describe("GitLab head pipeline trust", () => {
 });
 
 describe("GitLab notes and issue labels", () => {
- test("follows next-page to end, drops system notes, uses username and keeps empty bodies", async () => {
+ test("requests notes oldest-first across pages, drops system notes, uses username and keeps empty bodies", async () => {
   const { port, token, calls, dirs } = await setup(path => {
    if (path === notesPath) return response(fixture.notes[0], "2");
    expect(path).toBe(notesPath.replace("&page=1", "&page=2"));
@@ -159,6 +186,7 @@ describe("GitLab notes and issue labels", () => {
    { id: 11, author: "sage-bot", body: "Review marker" }, { id: 12, author: "ivy-bot", body: "" },
   ]);
   expect(calls).toHaveLength(2);
+  expect(calls.every(path => path.includes("?order_by=created_at&sort=asc&"))).toBeTrue();
   for (const dir of dirs) expect(existsSync(dir)).toBeFalse();
  });
  test("without pagination headers full pages continue until short page", async () => {
@@ -180,22 +208,23 @@ describe("GitLab notes and issue labels", () => {
   const { port, token } = await setup(path => { expect(path).toBe(issuePath); return response(fixture.issue); });
   expect(await port.issueLabels(repo, 124, token)).toEqual(fixture.issue.labels);
  });
- test.each([{}, { labels: null }, { labels: [1] }])("malformed labels %j throws", async raw => {
+ test.each([{}, { iid: 124, labels: null }, { iid: 124, labels: [1] }, { labels: [] }, { iid: 125, labels: [] }])("malformed labels or mismatched issue %j throws", async raw => {
   const { port, token } = await setup(() => response(raw));
   await expect(port.issueLabels(repo, 124, token)).rejects.toBeInstanceOf(GitLabReadError);
  });
 });
 
-const reads = [
- (p: ForgeReadPort<ResolvedToken>, r: string, t: ResolvedToken) => p.findPrByHead(r, fixture.mr.source_branch, t),
- (p: ForgeReadPort<ResolvedToken>, r: string, t: ResolvedToken) => p.getPr(r, 7, t),
- (p: ForgeReadPort<ResolvedToken>, r: string, t: ResolvedToken) => p.ciVerdictFor(r, sha, t),
- (p: ForgeReadPort<ResolvedToken>, r: string, t: ResolvedToken) => p.listComments(r, 7, t),
- (p: ForgeReadPort<ResolvedToken>, r: string, t: ResolvedToken) => p.issueLabels(r, 124, t),
+type Read = (p: ForgeReadPort<ResolvedToken>, r: string, t: ResolvedToken) => Promise<unknown>;
+const reads: Read[] = [
+ (p, r, t) => p.findPrByHead(r, fixture.mr.source_branch, t),
+ (p, r, t) => p.getPr(r, 7, t),
+ (p, r, t) => p.ciVerdictFor(r, sha, t),
+ (p, r, t) => p.listComments(r, 7, t),
+ (p, r, t) => p.issueLabels(r, 124, t),
 ];
 describe("every GitLab read fails closed", () => {
- test.each([401, 403, 404, 500])("HTTP %i yields typed errors and removes all private configs", async status => {
-  const { port, token, dirs } = await setup(() => response({ message: "denied" }, undefined, status, 0));
+ test.each([401, 403, 404, 500].flatMap(status => [0, 1].map(code => ({ status, code }))))("HTTP errors retain status for zero and nonzero glab exits %j", async ({ status, code }) => {
+  const { port, token, dirs } = await setup(() => response({ message: "denied" }, undefined, status, code));
   for (const read of reads) {
    try { await read(port, repo, token); throw new Error("unexpected success"); }
    catch (error) { expect(error).toBeInstanceOf(GitLabReadError); expect((error as GitLabReadError).status).toBe(status); }
