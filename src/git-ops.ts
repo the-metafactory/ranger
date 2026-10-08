@@ -736,23 +736,45 @@ const CLOSING_KEYWORD =
 
 /**
  * GitLab's issue-closing grammar (node #128): a keyword stem, an optional
- * `:` and spaces, an optional `issue`/`issues`, then a ref. The refs are
- * GitLab's `Issue.reference_pattern` — `#N`, `path/with/groups#N`, `GL-N`,
+ * `:` and spaces, then a `,`/`and` list of items, each with an optional
+ * `issue`/`issues`. GitLab closes every issue ref in the list, and its items
+ * may also be any link or a Jira-style `ABC-1`: those are skipped, so an
+ * issue ref anywhere in the list refuses. The refs are GitLab's
+ * `Issue.reference_pattern` — `#N`, `path/with/groups#N`, `GL-N`,
  * `[issue:N]`, `[issue:path/N]` — or an issue, incident or work-item URL on
- * any host, with or without the `/-` segment. The first ref is enough to
- * refuse; GitLab's `, and` lists add nothing to the verdict.
+ * any host, with or without the `/-` segment.
+ *
+ * One regex for the whole list backtracks super-linearly on a crafted MR
+ * description, so the list is walked item by item with sticky, bounded
+ * patterns (GitLab caps a link at 300 characters and an iid at 20 digits).
  */
-const GITLAB_CLOSING_KEYWORD =
- /\b(?:clos(?:e|es|ed|ing)|fix(?:es|ed|ing)?|resolv(?:e|es|ed|ing)|implement(?:s|ed|ing)?)\b:?\s+(?:issues?\s+)?(?:(?:[\w.-]+\/)*[\w.-]*#\d+|GL-\d+|\[issue:(?:[\w.-]+\/)*\d+\]|https?:\/\/\S+?\/(?:-\/)?(?:issues(?:\/incident)?|work_items)\/\d+)/i;
+const GITLAB_KEYWORD =
+ /\b(?:clos(?:e|es|ed|ing)|fix(?:es|ed|ing)?|resolv(?:e|es|ed|ing)|implement(?:s|ed|ing)?)\b:?\s+/gi;
+const GITLAB_ISSUE_REF =
+ /(?:issues?\s+)?(?:(?:[\w.-]{1,255}\/){0,20}[\w.-]{0,255}#\d{1,20}|GL-\d{1,20}|\[issue:(?:[\w.-]{1,255}\/){0,20}\d{1,20}\]|https?:\/\/\S{1,300}?\/(?:-\/)?(?:issues(?:\/incident)?|work_items)\/\d{1,20})/iy;
+const GITLAB_LIST_FILLER =
+ /(?:issues?\s+)?(?:https?:\/\/[^\s>,]{1,300}|[A-Z][A-Z0-9_]{0,255}-\d{1,20})(?: *,? +and +| *,? *)/iy;
 
-const CLOSING_PATTERNS: Record<ForgeRef["forge"], RegExp> = {
- github: CLOSING_KEYWORD,
- gitlab: GITLAB_CLOSING_KEYWORD,
-};
+function findGitLabClosing(text: string): string | null {
+ for (const keyword of text.matchAll(GITLAB_KEYWORD)) {
+  let at = keyword.index + keyword[0].length;
+  for (;;) {
+   GITLAB_ISSUE_REF.lastIndex = at;
+   const ref = GITLAB_ISSUE_REF.exec(text);
+   if (ref !== null) return text.slice(keyword.index, at + ref[0].length);
+   GITLAB_LIST_FILLER.lastIndex = at;
+   const filler = GITLAB_LIST_FILLER.exec(text);
+   if (filler === null) break;
+   at += filler[0].length;
+  }
+ }
+ return null;
+}
 
 /** The first text the forge would read as an issue-closing reference, or null. */
 export function findClosingKeyword(text: string, forge: ForgeRef["forge"]): string | null {
- const match = text.match(CLOSING_PATTERNS[forge]);
+ if (forge === "gitlab") return findGitLabClosing(text);
+ const match = text.match(CLOSING_KEYWORD);
  return match === null ? null : match[0];
 }
 

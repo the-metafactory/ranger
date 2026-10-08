@@ -161,6 +161,14 @@ describe("closing keywords (#588 fail-open path, node #128 per forge)", () => {
    null,
    "closes https://gitlab.example.org/groups/g/-/work_items/6",
   ],
+  // GitLab closes an issue ref anywhere in a list led by other links or Jira-style items.
+  ["Closes https://example.com, #128", null, "Closes https://example.com, #128"],
+  [
+   "Fixes https://gitlab.example.org/g/p/-/merge_requests/12 and #128",
+   null,
+   "Fixes https://gitlab.example.org/g/p/-/merge_requests/12 and #128",
+  ],
+  ["Closes ABC-1, #128", null, "Closes ABC-1, #128"],
   // Neither forge reads these.
   ["node #12", null, null],
   ["fixed the flaky test", null, null],
@@ -179,6 +187,14 @@ describe("closing keywords (#588 fail-open path, node #128 per forge)", () => {
    expect(findClosingKeyword(`feat: thing\n\n${text}`, forge)).toBe(want);
   });
  }
+ test("a crafted GitLab description is scanned in linear time, not backtracked", () => {
+  // A single list regex took 8 s on 64 KB of `AB-1AB-1…`; the item walk takes milliseconds.
+  const crafted = `Fixes ${"AB-1".repeat(16_000)}x`;
+  const started = performance.now();
+  expect(findClosingKeyword(crafted, "gitlab")).toBeNull();
+  expect(findClosingKeyword(`${crafted} closes ${"AB-1, ".repeat(16_000)}#128`, "gitlab")).toContain("#128");
+  expect(performance.now() - started).toBeLessThan(1_000);
+ });
  test("ranger's own GitLab-shaped PR prose passes the GitLab guard", () => {
   const prose = [
    "Implements orienteer node gitlab:gitlab.example.org/g/p #128: Refuse closing references (node #128)",
