@@ -179,6 +179,62 @@ export async function graphClose(
  return { repo, node: id, closed: false, detail };
 }
 
+export interface AddSpec {
+ title: string;
+ autonomy: "auto" | "propose" | "approve";
+ /** Minted at add time: no verb attaches a checkpoint later. */
+ checkpoint: string;
+ kind?: string;
+ labels?: string[];
+ body?: string;
+}
+
+export interface AddResult {
+ repo: string;
+ node: string;
+ parent: string;
+}
+
+/**
+ * Create a node below `parent` (the spawning node, never the map root).
+ * Exit 1 with `attached: false` means the node exists but hangs off no
+ * parent; that is a failure, and the message names the created node so a
+ * retry's duplicate can be traced.
+ */
+export async function graphAdd(
+ repo: string,
+ parent: string,
+ spec: AddSpec,
+ token: string,
+ opts: RunOptions = {},
+): Promise<AddResult> {
+ const ref = parseForgeRef(repo);
+ parent = writeNodeId(ref, parent);
+ const args = [
+  "graph", "add", parent,
+  "--title", spec.title,
+  "--autonomy", spec.autonomy,
+  "--checkpoint", spec.checkpoint,
+ ];
+ if (spec.kind !== undefined) args.push("--kind", spec.kind);
+ for (const label of spec.labels ?? []) args.push("--label", label);
+ if (spec.body !== undefined) args.push("--body", spec.body);
+ args.push("--repo", somaRepo(ref), "--json");
+ const result = await callWrite(args, token, opts);
+ if (result.code !== 0) {
+  let created = "";
+  try {
+   const payload = parsePayload(result, "add");
+   if (typeof payload.node === "string") created = ` — created ${payload.node} but left it unattached`;
+  } catch { /* no payload: nothing was created */ }
+  throw new GraphWriteError(
+   `soma graph add below ${parent} (${repo}) failed (exit ${result.code})${created}: ${(result.stderr || result.stdout).trim()}`.slice(0, 600),
+  );
+ }
+ const payload = parsePayload(result, "add");
+ return { repo, node: writeNodeId(ref, payload.node), parent };
+}
+
 /** Re-project the map's decision index from close receipts. */
 export async function graphDecisions(
  repo: string,

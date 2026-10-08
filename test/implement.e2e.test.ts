@@ -1380,6 +1380,37 @@ describe("implement lane (node #23)", () => {
   expect(worktrees.stdout).not.toContain("ranger-probe-base-");
  }, 60_000);
 
+ test("a probe confirmed red at the base files one propose build node below the detecting node (node #152)", async () => {
+  const r = await rig({ probe: "fake-probe red {node}", probeRetry: "fake-probe red {node} {failed}" });
+  cleanup.push(r.dir);
+  await seedProbeOnBase(r);
+  const sha = await r.github.sha("main");
+  const added: { parent: string; spec: { autonomy: string; kind?: string; body?: string } }[] = [];
+  r.ctx.fixNode = { add: async (parent, spec) => { added.push({ parent, spec }); return { node: "99" }; }, status: async () => "open" };
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  expect(added).toHaveLength(1);
+  expect(added[0].parent).toBe("20");
+  expect(added[0].spec).toMatchObject({ autonomy: "propose", kind: "build" });
+  expect(added[0].spec.body).toContain(sha);
+  expect(added[0].spec.body).toContain("PR #1");
+  expect(JSON.parse(r.journal.getHealth("base-red-fix.acme/widgets#1.probe-hud.mjs")!)).toMatchObject({ node: "99", sha, pr: 1 });
+ }, 60_000);
+
+ test("a failed fix-node add leaves the probe record and verdict as they were, and is journalled (node #152)", async () => {
+  const r = await rig({ probe: "fake-probe red {node}", probeRetry: "fake-probe red {node} {failed}" });
+  cleanup.push(r.dir);
+  await seedProbeOnBase(r);
+  const sha = await r.github.sha("main");
+  r.ctx.fixNode = { add: async () => { throw new Error("graph add refused"); }, status: async () => "open" };
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  const probe = (r.github.comments.get(1) ?? []).find((c) => c.body.includes("ranger:probes"));
+  expect(probe?.body).toContain("result=pass selected=2 mode=semantic base-red=probe-hud.mjs -->");
+  expect(r.journal.getHealth(`base-red-checks.acme/widgets.${sha}.probe-hud.mjs`)).not.toBeNull();
+  expect(r.journal.getHealth("base-red-fix.acme/widgets#1.probe-hud.mjs")).toBeNull();
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.includes("fix-the-base filing for probe-hud.mjs") && d.includes("graph add refused"))).toBe(true);
+ }, 60_000);
+
  test("cached base-red assertions certify a later PR with journal and PR cache provenance", async () => {
   const r = await rig({ probe: "fake-probe red {node}", probeRetry: "fake-probe red {node} {failed}" });
   cleanup.push(r.dir);

@@ -40,7 +40,7 @@ import {
 import { GRAPH_CALL_TIMEOUT_MS, graphNode, somaRepo, type NodeResult } from "./graph.ts";
 import { finishClosedElsewhere } from "./closed-elsewhere.ts";
 import { budgetedRead, budgetPolicy } from "./budget.ts";
-import { graphClose, graphDecisions, type CloseResult } from "./graph-write.ts";
+import { graphAdd, graphClose, graphDecisions, type AddSpec, type CloseResult } from "./graph-write.ts";
 import type { ImplementPhase, Journal } from "./journal.ts";
 import { assembleImplementPrompt } from "./prompt.ts";
 import { ReviewError, sageReview, type ReviewVerdict } from "./review.ts";
@@ -146,6 +146,15 @@ export interface ImplementContext {
  mergeablePoll?: { pollMs: number; attempts: number };
  /** Posts to the map's channel (the base-red notice); tests capture it. */
  announce?: (text: string) => Promise<unknown>;
+ /** Files and reads fix-the-base nodes (node #152); default is `soma graph` under the machine token. */
+ fixNode?: FixNodeGraph;
+}
+
+/** The graph port the fix-the-base filer writes and reads through (node #152). */
+export interface FixNodeGraph {
+ add(parent: string, spec: AddSpec): Promise<{ node: string }>;
+ /** The node's status ("open", "closed"). */
+ status(id: string): Promise<string>;
 }
 
 export interface ImplementOutcome {
@@ -484,6 +493,10 @@ async function probeFinalHead(
  };
  if (baseRed !== undefined) await announceBaseRed(ctx, base!.sha, record);
  ctx.journal.assertGeneration(nodeId, ctx.map.repo, ctx.generation, "post the probe record");
+ // Before the park: a probe confirmed red at base is the base's, whatever else this branch broke.
+ if (base !== null && base.confirmed.length > 0) {
+  await fileBaseRedFixNodes(ctx, base, { number: prNumber, url: live.webUrl || `https://github.com/${repo}/pull/${prNumber}` });
+ }
  // Named failures lead the record, the event and the park: an output tail can hold only passing probes.
  const failing = probeFailureSummary(result.stdout, result.code);
  // Named only when every run here (both attempts, the merge base's) was written.
@@ -564,6 +577,8 @@ export interface BaseProbeResult {
  cached: string[];
  /** First-run inherited probes whose confirmation did not repeat identical assertions; not cached. */
  unconfirmed: string[];
+ /** Probes this comparison confirmed and wrote to the cache: each may file a fix-the-base node. */
+ confirmed: string[];
  confirmationExit?: number;
  /** Failed probes that fail at the merge base too, but not the same way (another check, or a crash), so they gate. */
  differs: string[];
@@ -727,7 +742,7 @@ export async function probeMergeBase(
   else if (coversChecks(headChecks.get(probe)!.checks, checks)) cached.push(probe);
   else differs.push(probe);
  }
- const known: BaseProbeResult = { sha, red: [...cached], cached, unconfirmed: [], differs, passed: [], changed, uncomparable, unresolved: fresh };
+ const known: BaseProbeResult = { sha, red: [...cached], cached, unconfirmed: [], confirmed: [], differs, passed: [], changed, uncomparable, unresolved: fresh };
  if (fresh.length === 0 || template === undefined) return known;
  const scratch = mkdtempSync(join(tmpdir(), "ranger-probe-base-"));
  const dir = join(scratch, "worktree");
@@ -763,7 +778,8 @@ export async function probeMergeBase(
   };
   if (red.length > 0) {
    // Confirmation uses this worktree without another quiet-host wait.
-   return { ...result, ...await confirmBaseRed(ctx, dir, sha, red, baseChecks) };
+   const confirmation = await confirmBaseRed(ctx, dir, sha, red, baseChecks);
+   return { ...result, ...confirmation, confirmed: red.filter((n) => !confirmation.unconfirmed.includes(n)) };
   }
   return result;
  } finally {
@@ -794,6 +810,114 @@ async function announceBaseRed(ctx: ImplementContext, sha: string, probe: Record
   ctx.journal.setHealth(key, new Date().toISOString());
  } catch {
   /* best effort: the next node off this base tries again */
+ }
+}
+
+/** The journal's record of a map's fix-the-base node for one probe (node #152). */
+export function baseRedFixKey(map: { repo: string; root: number }, probe: string): string {
+ return `base-red-fix.${mapKey(map)}.${probe}`;
+}
+
+function fixRecord(value: string | null): { node: string } | null {
+ if (value === null) return null;
+ try {
+  const record: unknown = JSON.parse(value);
+  const node = (record as { node?: unknown } | null)?.node;
+  return typeof node === "string" && node.length > 0 ? { node } : null;
+ } catch {
+  return null;
+ }
+}
+
+function machineFixNodeGraph(ctx: ImplementContext): FixNodeGraph {
+ const repo = ctx.map.repo;
+ const credential = { token: ctx.token, source: "write-token" };
+ return {
+  add: (parent, spec) => graphAdd(repo, parent, spec, ctx.token, { timeoutMs: GRAPH_CALL_TIMEOUT_MS }),
+  status: async (id) => (await budgetedRead(ctx.journal, repo, credential, budgetPolicy(ctx.config), new Date(),
+   () => graphNode(repo, id, credential, { timeoutMs: GRAPH_CALL_TIMEOUT_MS }))).status,
+ };
+}
+
+/** A checkpoint id from the probe's stem and the base it was red at. */
+function fixCheckpoint(probe: string, sha: string): string {
+ const stem = probe.replace(/\.[^.]+$/, "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+ return `base-green-${stem}-${sha.slice(0, 8)}`;
+}
+
+function fixNodeSpec(ctx: ImplementContext, probe: string, checks: string[], sha: string, pr: { number: number; url: string }): AddSpec {
+ const base = ctx.map.base;
+ return {
+  title: `Make ${probe} pass on ${base} again`,
+  autonomy: "propose",
+  kind: "build",
+  labels: ["orienteer:build"],
+  checkpoint: fixCheckpoint(probe, sha),
+  body: [
+   "## Deliverable",
+   "",
+   `\`${probe}\` passes on \`${base}\` again.`,
+   "",
+   "## Found by probe",
+   "",
+   `Node #${ctx.node.ref.id} failed \`${probe}\` at its head, and two runs at the merge base failed the same checks: the base is red, not the branch. Every later branch off this base inherits the failure. Ranger filed this node; the checks below stay failing until the fix lands.`,
+   "",
+   `- Probe: \`${probe}\``,
+   `- Merge base: \`${sha}\``,
+   `- Detected by: node #${ctx.node.ref.id}, PR #${pr.number} (${pr.url})`,
+   "- Failing checks at the merge base:",
+   "",
+   "```",
+   ...checks.map((check) => check.replaceAll("`", "'")),
+   "```",
+   "",
+   "## Acceptance criteria",
+   "",
+   `- Given \`${base}\` with the fix, when \`${probe}\` runs, then every check above passes.`,
+   "",
+   "## Out of scope",
+   "",
+   "- Ranger does not close this node when the probe goes green.",
+  ].join("\n"),
+ };
+}
+
+/**
+ * The narrow found-by-probe filer (node #109's ruling, ahead of the Scribe):
+ * a probe this comparison confirmed red at the base files one `propose` build
+ * node below the detecting node, unless the map's last fix node for that
+ * probe is still open. The record is written only after the add succeeds, so
+ * a failed add (or a failed status read) is journalled and retried at the
+ * probe's next confirmation. Never throws: certification and the inherited
+ * verdict do not depend on it. Writes and reads run under the machine token.
+ */
+export async function fileBaseRedFixNodes(
+ ctx: ImplementContext,
+ base: Pick<BaseProbeResult, "sha" | "confirmed">,
+ pr: { number: number; url: string },
+): Promise<void> {
+ const { journal, map } = ctx;
+ const nodeId = ctx.node.ref.id;
+ const graph = ctx.fixNode ?? machineFixNodeGraph(ctx);
+ const note = (detail: string) => journal.recordEvent("reviewed", { nodeId, repo: map.repo, detail: detail.slice(0, 400) });
+ for (const probe of base.confirmed) {
+  const key = baseRedFixKey(map, probe);
+  try {
+   const prior = fixRecord(journal.getHealth(key));
+   if (prior !== null) {
+    const status = await graph.status(prior.node);
+    if (status !== "closed") {
+     note(`fix-the-base node #${prior.node} for ${probe} is ${status} — not filing another`);
+     continue;
+    }
+   }
+   const checks = [...(cachedBaseChecks(journal, baseRedChecksKey(map.repo, base.sha, probe)) ?? [])].sort();
+   const filed = await graph.add(nodeId, fixNodeSpec(ctx, probe, checks, base.sha, pr));
+   journal.setHealth(key, JSON.stringify({ node: filed.node, sha: base.sha, detectedBy: nodeId, pr: pr.number }));
+   note(`filed fix-the-base node #${filed.node} below #${nodeId}: ${probe} red at the merge base ${base.sha.slice(0, 8)}`);
+  } catch (error) {
+   note(`fix-the-base filing for ${probe} at ${base.sha.slice(0, 8)} failed (retried at its next confirmation): ${error instanceof Error ? error.message : String(error)}`);
+  }
  }
 }
 
