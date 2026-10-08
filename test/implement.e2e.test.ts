@@ -19,7 +19,7 @@ import { loadConfig } from "../src/config.ts";
 import { runCmd } from "../src/exec.ts";
 import type { IssueComment, ChangeRequest } from "../src/forge.ts";
 import type { CheckRun } from "../src/github.ts";
-import { baseMergeMarker, recordedBaseMerges, recordedReviews, reviewMarker, type ForgePort } from "../src/implement.ts";
+import { baseMergeMarker, failedTests, failuresAllNamed, failuresNotAtBase, recordedBaseMerges, recordedReviews, reviewMarker, type ForgePort } from "../src/implement.ts";
 import { Database } from "bun:sqlite";
 import { openJournal, type Journal } from "../src/journal.ts";
 import { ReviewError, type ReviewVerdict } from "../src/review.ts";
@@ -1954,13 +1954,99 @@ describe("implement lane (node #23)", () => {
     const calls = watchRuns(r);
     expect((await runNode("20", r.ctx)).status).toBe("failed");
     expect(baseRuns(calls)).toEqual([]);
-    expect(reviewed(r).some((d) => d.endsWith("failures no (fail) line names (an error outside a test, or a count the names do not cover); the merge-base check did not run — the failures gate"))).toBe(true);
+    expect(reviewed(r).some((d) => d.endsWith("failures no (fail) line names (an error outside a test, a TypeScript diagnostic, or a count the names do not cover); the merge-base check did not run — the failures gate"))).toBe(true);
     expect(r.github.prs.size).toBe(0);
    }, 60_000);
   }
 
+  test("a second failing test sharing a base-red test's title gates: failures count, not titles", async () => {
+   const r = await rig({ test: "echo \"(fail) shared\"; if [ -f src/feature.ts ]; then echo \"(fail) shared\"; echo \" 2 fail\"; else echo \" 1 fail\"; fi; exit 1" });
+   cleanup.push(r.dir);
+   expect((await runNode("20", r.ctx)).status).toBe("failed");
+   const sha = await mergeBase(r);
+   expect(reviewed(r).some((d) => d.endsWith(`at the merge base ${sha} fails another set (exit 1) — not red there, they gate: shared (2 on the branch, 1 at the base)`))).toBe(true);
+   expect(reviewed(r).some((d) => d.includes("red on the merge base too"))).toBe(false);
+   expect(r.github.prs.size).toBe(0);
+  }, 60_000);
+
+  test("a failing test titled like a base-red one in another file gates: the file is part of its identity", async () => {
+   const r = await rig({
+    test: "if [ -f src/feature.ts ]; then f=test/b.test.ts; else f=test/a.test.ts; fi; printf \"\\n%s:\\n(fail) grp > shared [2.06ms]\\n\\n 1 fail\\n\" \"$f\" >&2; exit 1",
+   });
+   cleanup.push(r.dir);
+   expect((await runNode("20", r.ctx)).status).toBe("failed");
+   expect(reviewed(r).some((d) => d.endsWith("fails another set (exit 1) — not red there, they gate: test/b.test.ts: grp > shared"))).toBe(true);
+   expect(r.github.prs.size).toBe(0);
+  }, 60_000);
+
+  test("the same file and title red at the base too: not gating, named with its file", async () => {
+   const r = await rig({ test: "printf \"\\ntest/a.test.ts:\\n(fail) grp > shared [2.06ms]\\n\\n 1 fail\\n\" >&2; exit 1" });
+   cleanup.push(r.dir);
+   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+   expect(reviewed(r).some((d) => d.endsWith("red on the merge base too, not gating: test/a.test.ts: grp > shared"))).toBe(true);
+  }, 60_000);
+
+  test("a shared failure with an exit the base run does not share gates: another step failed beside it", async () => {
+   // A compound command folding a second step's status into its exit.
+   const r = await rig({ test: "echo \"(fail) shared\"; echo \" 1 fail\"; if [ -f src/feature.ts ]; then exit 3; fi; exit 1" });
+   cleanup.push(r.dir);
+   expect((await runNode("20", r.ctx)).status).toBe("failed");
+   const sha = await mergeBase(r);
+   expect(reviewed(r).some((d) => d.endsWith(`at the merge base ${sha} exit 1, the branch run exited 3 — not the same failure, they gate`))).toBe(true);
+   expect(reviewed(r).some((d) => d.includes("red on the merge base too"))).toBe(false);
+   expect(r.github.prs.size).toBe(0);
+  }, 60_000);
+
+  test("a shared failure beside a TypeScript diagnostic gets no base run, though both exit 1", async () => {
+   const r = await rig({ test: "echo \"(fail) shared\"; echo \" 1 fail\"; if [ -f src/feature.ts ]; then echo \"src/feature.ts(1,7): error TS2322: Type string is not assignable to type number.\"; fi; exit 1" });
+   cleanup.push(r.dir);
+   const calls = watchRuns(r);
+   expect((await runNode("20", r.ctx)).status).toBe("failed");
+   expect(baseRuns(calls)).toEqual([]);
+   expect(reviewed(r).some((d) => d.includes("a TypeScript diagnostic") && d.endsWith("the merge-base check did not run — the failures gate"))).toBe(true);
+   expect(r.github.prs.size).toBe(0);
+  }, 60_000);
+
+  test("bun's real output: each (fail) line takes its file's header, repeats kept", () => {
+   // Captured from bun 1.3.14: two files, one title failing in each.
+   const stderr = [
+    "",
+    "test/b.test.ts:",
+    "1 | import { test, expect, describe } from \"bun:test\";",
+    "2 | describe(\"grp\", () => { test(\"shared\", () => { expect(1).toBe(2); }); });",
+    "                                                             ^",
+    "error: expect(received).toBe(expected)",
+    "",
+    "Expected: 2",
+    "Received: 1",
+    "",
+    "      at <anonymous> (/private/tmp/bunfmt.lTCo/test/b.test.ts:2:58)",
+    "(fail) grp > shared [2.06ms]",
+    "",
+    "test/a.test.ts:",
+    "1 | import { test, expect, describe } from \"bun:test\";",
+    "      at <anonymous> (/private/tmp/bunfmt.lTCo/test/a.test.ts:2:58)",
+    "(fail) grp > shared [0.11ms]",
+    "",
+    " 1 pass",
+    " 2 fail",
+    " 3 expect() calls",
+    "Ran 3 tests across 2 files. [20.00ms]",
+   ].join("\n");
+   const run = { code: 1, stdout: "bun test v1.3.14 (0d9b296a)\nhello out\n", stderr };
+   const tests = failedTests(run);
+   expect(tests).toEqual([
+    { file: "test/b.test.ts", name: "grp > shared" },
+    { file: "test/a.test.ts", name: "grp > shared" },
+   ]);
+   expect(failuresAllNamed(run)).toBe(true);
+   expect(failuresNotAtBase(tests, tests)).toEqual([]);
+   expect(failuresNotAtBase(tests, [tests[1]])).toEqual(["test/b.test.ts: grp > shared"]);
+   expect(failuresNotAtBase([tests[0], tests[0]], [tests[0]])).toEqual(["test/b.test.ts: grp > shared (2 on the branch, 1 at the base)"]);
+  });
+
   for (const [what, opts] of [
-   ["whose install failed", { install: "case \"$PWD\" in *ranger-test-retry-*) echo \"(fail) shared\"; echo \" 1 fail\"; exit 3 ;; esac", test: "echo \"(fail) shared\"; echo \" 1 fail\"; exit 1" }],
+   ["whose install failed",{ install: "case \"$PWD\" in *ranger-test-retry-*) echo \"(fail) shared\"; echo \" 1 fail\"; exit 3 ;; esac", test: "echo \"(fail) shared\"; echo \" 1 fail\"; exit 1" }],
    ["that changed tracked content", { test: "case \"$PWD\" in *ranger-test-retry-*) echo x >> src/feature.ts ;; esac; echo \"(fail) shared\"; echo \" 1 fail\"; exit 1" }],
   ] as const) {
    test(`a busy-host retry ${what} certifies nothing: its shared failures gate without a base run`, async () => {

@@ -1737,22 +1737,53 @@ function reviewComment(round: number, verdict: ReviewVerdict, substrate?: Substr
  return head + body;
 }
 
-/** Every failing test a run names, in bun's `(fail) <name> [12ms]` format. */
+/** Every failing test a run names, in bun's `(fail) <name> [12ms]` format, each once. */
 export function allFailedTestNames(result: RunResult): string[] {
- const names = new Set<string>();
- for (const m of `${result.stdout}\n${result.stderr}`.matchAll(/^\(fail\) (.+?)(?: \[[\d.]+m?s\])?$/gm)) {
-  names.add(m[1].trim());
- }
- return [...names];
+ return [...new Set(failedTests(result).map((t) => t.name))];
+}
+
+/** One `(fail)` line: its name, and the test file whose header preceded it ("" when none did). */
+export interface FailedTest {
+ file: string;
+ name: string;
 }
 
 /**
- * Whether bun's `(fail)` lines account for every failure the run reports:
- * its summary counts as many failing tests as there are `(fail)` lines, and
- * no error outside a test (a file that does not load, an unhandled error
- * between tests). bun counts a file that fails to load as a failing test
- * with no `(fail)` line, so a shared named failure must not hide it. A run
- * without bun's summary is not accounted for.
+ * Every `(fail)` line a run prints, in order and with repeats: two tests
+ * with one title are two failures. bun heads each file's results with its
+ * path relative to the checkout (`test/a.test.ts:`), the same in a fresh
+ * clone of the base; a `(fail)` line takes the last header in its stream.
+ */
+export function failedTests(result: RunResult): FailedTest[] {
+ const tests: FailedTest[] = [];
+ for (const stream of [result.stdout, result.stderr]) {
+  let file = "";
+  for (const line of stream.split("\n")) {
+   const header = /^(\S[^:]*\.[cm]?[jt]sx?):$/.exec(line);
+   if (header) file = header[1];
+   const m = /^\(fail\) (.+?)(?: \[[\d.]+m?s\])?$/.exec(line);
+   if (m) tests.push({ file, name: m[1].trim() });
+  }
+ }
+ return tests;
+}
+
+/** A failing test as an event names it: `file: name`, or the bare name when no header preceded it. */
+function testIdentity(t: FailedTest): string {
+ return t.file === "" ? t.name : `${t.file}: ${t.name}`;
+}
+
+/**
+ * Whether the run's failures are all bun's named ones, as far as the output
+ * shows: bun's summary counts as many failing tests as there are `(fail)`
+ * lines, no error is reported outside a test (a file that does not load, an
+ * unhandled error between tests), and no TypeScript diagnostic (`error
+ * TS2322:`) shows a typecheck failing beside the tests. bun counts a file
+ * that fails to load as a failing test with no `(fail)` line, so a shared
+ * named failure must not hide it. A run without bun's summary is not
+ * accounted for. Another tool's failure in a compound command that prints
+ * none of these is not seen here; the merge-base comparison also requires
+ * the base run to exit with the branch run's code (testsRedAtBase).
  */
 export function failuresAllNamed(result: RunResult): boolean {
  const out = `${result.stdout}\n${result.stderr}`;
@@ -1763,8 +1794,28 @@ export function failuresAllNamed(result: RunResult): boolean {
   counted.length > 0 &&
   counted.reduce((n, m) => n + Number(m[1]), 0) === lines &&
   errors === 0 &&
-  !/^# Unhandled error/m.test(out)
+  !/^# Unhandled error/m.test(out) &&
+  !/\berror TS\d+:/m.test(out)
  );
+}
+
+/**
+ * The branch's failing tests the base run does not fail as often, file and
+ * title alike: each identity counts once per `(fail)` line, so a second
+ * failing test sharing a title with a base-red one is not waived by it.
+ */
+export function failuresNotAtBase(branch: FailedTest[], base: FailedTest[]): string[] {
+ const count = (tests: FailedTest[]) => {
+  const n = new Map<string, number>();
+  for (const t of tests) n.set(testIdentity(t), (n.get(testIdentity(t)) ?? 0) + 1);
+  return n;
+ };
+ const there = count(base);
+ return [...count(branch)].flatMap(([id, n]) => {
+  const at = there.get(id) ?? 0;
+  if (n <= at) return [];
+  return [n === 1 && at === 0 ? id : `${id} (${n} on the branch, ${at} at the base)`];
+ });
 }
 
 /** An exit the shell reports for a signal (128 + N: 137 a kill, 143 a SIGTERM). */
@@ -1882,8 +1933,9 @@ async function baseRedAt(
  * is `baseTip`, read before the worker ran, and replacement refs are refused:
  * a failed run that moves the ref or plants a replacement cannot pick the
  * commit its failures are compared with. The result
- * is the base's red set when every failing name the branch run printed is a
- * `(fail)` line there too; null when they gate. A failure that names no test
+ * is the base's red set when every `(fail)` line the branch run printed is
+ * one there too, by file and title and as many times (failuresNotAtBase), and
+ * the base run exits with the branch run's code; null when they gate. A failure that names no test
  * (a typecheck after passing tests, a crash, a timeout, a kill), one a signal
  * ended (exit > 128), or one whose `(fail)` lines do not account for every
  * failure bun reports (failuresAllNamed) gets no base run; a base run a signal
@@ -1899,11 +1951,11 @@ async function testsRedAtBase(
  baseTip: string | null,
 ): Promise<BaseRedTests | null> {
  const { journal, map, node, worktree } = ctx;
- const names = allFailedTestNames(tests);
- if (tests.code <= 0 || signalExit(tests.code) || names.length === 0) return null;
+ const failed = failedTests(tests);
+ if (tests.code <= 0 || signalExit(tests.code) || failed.length === 0) return null;
  const event = (detail: string) => journal.recordEvent("reviewed", { nodeId: node.ref.id, repo: map.repo, detail });
  if (!failuresAllNamed(tests)) {
-  event(`tests (${testCommand}) failed with failures no (fail) line names (an error outside a test, or a count the names do not cover); the merge-base check did not run — the failures gate`);
+  event(`tests (${testCommand}) failed with failures no (fail) line names (an error outside a test, a TypeScript diagnostic, or a count the names do not cover); the merge-base check did not run — the failures gate`);
   return null;
  }
  if (baseTip === null) {
@@ -1926,13 +1978,19 @@ async function testsRedAtBase(
   event(`tests (${testCommand}) at the merge base ${sha} were ended by a signal (exit ${base.result.code}) — not a base result, the failures gate`);
   return null;
  }
- const there = new Set(base.result.code > 0 ? allFailedTestNames(base.result) : []);
- const unshared = names.filter((n) => !there.has(n));
+ const unshared = failuresNotAtBase(failed, base.result.code > 0 ? failedTests(base.result) : []);
  if (unshared.length > 0) {
   const how = base.result.code === 0 ? "passes" : `fails another set (exit ${base.result.code})`;
   event(`tests (${testCommand}) at the merge base ${sha} ${how} — not red there, they gate: ${unshared.join("; ")}`);
   return null;
  }
+ // A command that runs more than bun can fold another step's failure into
+ // its exit: the same red tests with a different exit is not the base's run.
+ if (base.result.code !== tests.code) {
+  event(`tests (${testCommand}) at the merge base ${sha} exit ${base.result.code}, the branch run exited ${tests.code} — not the same failure, they gate`);
+  return null;
+ }
+ const names = [...new Set(failed.map(testIdentity))];
  event(`tests (${testCommand}) at the merge base ${sha}: red on the merge base too, not gating: ${names.join("; ")}`);
  return { sha, names };
 }
