@@ -1776,9 +1776,12 @@ function failingCause(line: string): string {
  * with one title are two failures. bun heads each file's results with its
  * path relative to the checkout (`test/a.test.ts:`), the same in a fresh
  * clone of the base; a `(fail)` line takes the last header in its stream.
- * Its cause is the first error line (`error: …`, `TypeError: …`) printed
+ * Its cause is the last error line (`error: …`, `TypeError: …`) printed
  * since the previous result line or header, and a timeout note bun prints
- * after it (`  ^ this test timed out after 50ms.`).
+ * after it (`  ^ this test timed out after 50ms.`). The last, not the first:
+ * a test's own `console.error` output shares the stream and comes before
+ * the error bun prints for it, just above the `(fail)` line. bun 1.3.14
+ * prints no nested `cause`, only the outer error.
  *
  * bun's recap of the failures repeats each `(fail)` line after the last
  * file: a stream's lines stop counting at its recap header. A test that
@@ -1801,7 +1804,7 @@ export function failedTests(result: RunResult): FailedTest[] {
    } else if (last !== null && /^\s+\^ this test timed out/.test(line)) {
     last.cause = [last.cause, failingCause(line.replace(/^\s+\^\s*/, ""))].filter((c) => c !== "").join(" / ");
     continue;
-   } else if (cause === "" && /^(?:error|[A-Z]\w*Error)(?:: |$)/.test(line)) {
+   } else if (/^(?:error|[A-Z]\w*Error)(?:: |$)/.test(line)) {
     cause = failingCause(line);
    }
    if (header || m || /^\((?:pass|skip|todo)\) /.test(line)) {

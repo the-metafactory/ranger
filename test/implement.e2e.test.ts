@@ -2148,6 +2148,12 @@ describe("implement lane (node #23)", () => {
    // Paths and digits are masked: the same error from another checkout and another run is one cause.
    const at = (dir: string, ms: number) => failedTests({ code: 1, stdout: "", stderr: `error: ENOENT reading ${dir}/fixtures/a.json after ${ms}ms\n(fail) shared\n 1 fail\n` });
    expect(failuresNotAtBase(at("/Users/x/.worktrees/node-20", 12), at("/var/folders/T/ranger-test-base-ab12", 31))).toEqual([]);
+   // A test's own error-looking output before bun's error is not its cause: bun prints the error last, above (fail).
+   const noisy = (error: string) => failedTests({ code: 1, stdout: "", stderr: `test/a.test.ts:\nerror: retrying fetch\n2 | test("shared", () => {\n${error}\n      at <anonymous> (/tmp/a.test.ts:2:5)\n(fail) shared [0.17ms]\n 1 fail\n` });
+   expect(noisy("TypeError: x is not a function")[0].cause).toBe("TypeError: x is not a function");
+   expect(failuresNotAtBase(noisy("TypeError: x is not a function"), noisy("error: expect(received).toBe(expected)"))).toEqual([
+    'test/a.test.ts: shared (fails with "TypeError: x is not a function" on the branch, "error: expect(received).toBe(expected)" at the base)',
+   ]);
   });
 
   test("coverage is in play when bun prints its table or the command asks for it", () => {
