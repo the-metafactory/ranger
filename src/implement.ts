@@ -1781,9 +1781,9 @@ function testIdentity(t: FailedTest): string {
  * TS2322:`) shows a typecheck failing beside the tests. bun counts a file
  * that fails to load as a failing test with no `(fail)` line, so a shared
  * named failure must not hide it. A run without bun's summary is not
- * accounted for. Another tool's failure in a compound command that prints
- * none of these is not seen here; the merge-base comparison also requires
- * the base run to exit with the branch run's code (testsRedAtBase).
+ * accounted for. Another step's failure in the command that prints none of
+ * these is not seen here: testsRedAtBase waives only the `bun test` step
+ * (bunTestChain) and runs every other step on its own, which must pass.
  */
 export function failuresAllNamed(result: RunResult): boolean {
  const out = `${result.stdout}\n${result.stderr}`;
@@ -1816,6 +1816,66 @@ export function failuresNotAtBase(branch: FailedTest[], base: FailedTest[]): str
   if (n <= at) return [];
   return [n === 1 && at === 0 ? id : `${id} (${n} on the branch, ${at} at the base)`];
  });
+}
+
+/** One step of a test command: plain words, nothing the shell expands, redirects or chains. */
+const PLAIN_STEP = /^[\w./@:=+,%-]+(?: +[\w./@:=+,%-]+)*$/;
+
+/**
+ * A test command a base-red waiver can split: plain steps joined by `&&`,
+ * exactly one of them `bun test`. `rest` is every other step, in order,
+ * joined by `&&` ("" when the command is `bun test` alone). Null for any
+ * other shape (`;`, `||`, a pipe, quotes, an expansion, two bun steps, a
+ * script that runs bun inside): what failed beside bun cannot be told apart.
+ */
+export function bunTestChain(command: string): { rest: string } | null {
+ const steps = command.split("&&").map((s) => s.trim());
+ if (!steps.every((s) => PLAIN_STEP.test(s))) return null;
+ const bun = steps.filter((s) => /^bun test(?: |$)/.test(s));
+ if (bun.length !== 1) return null;
+ return { rest: steps.filter((s) => s !== bun[0]).join(" && ") };
+}
+
+/** One waived supervisor test run: the branch head, its merge base, the base-red tests, and the other steps that passed alone. */
+export interface TestsBaseRed {
+ head: string;
+ base: string;
+ names: string[];
+ rest: string;
+}
+
+function testsBaseRedKey(repo: string, nodeId: string): string {
+ return `tests-base-red.${repo}.${nodeId}`;
+}
+
+/** Every waived supervisor test run this journal recorded for the node, oldest first. */
+export function recordedTestsBaseRed(journal: Journal, repo: string, nodeId: string): TestsBaseRed[] {
+ try {
+  const v = JSON.parse(journal.getHealth(testsBaseRedKey(repo, nodeId)) ?? "[]");
+  return Array.isArray(v) ? v : [];
+ } catch {
+  return [];
+ }
+}
+
+function recordTestsBaseRed(journal: Journal, repo: string, nodeId: string, waived: TestsBaseRed): void {
+ journal.setHealth(testsBaseRedKey(repo, nodeId), JSON.stringify([...recordedTestsBaseRed(journal, repo, nodeId), waived]));
+}
+
+/**
+ * What the PR and close receipts say about the supervisor's tests: "passed"
+ * only when no run was waived; otherwise each waived run, by head, merge
+ * base and test (node #164: a base-red pass is not a passing run).
+ */
+export function testsReceipt(command: string | undefined, where: string, waived: TestsBaseRed[]): string {
+ if (waived.length === 0) return `\`${command}\` passed ${where} before every push.`;
+ const code = (s: string) => `\`${s.replaceAll("`", "'")}\``;
+ const runs = waived.map((w) => {
+  const names = w.names.slice(0, 10).map(code).join(", ") + (w.names.length > 10 ? ` and ${w.names.length - 10} more` : "");
+  const rest = w.rest === "" ? "" : `; the other steps, ${code(w.rest)}, passed on their own`;
+  return `at \`${w.head.slice(0, 8)}\` it failed only on tests its merge base \`${w.base.slice(0, 8)}\` fails too (${names})${rest}`;
+ });
+ return `\`${command}\` ran ${where} before every push. It passed every time but these, whose failures were not gating: ${runs.join("; ")}.`;
 }
 
 /** An exit the shell reports for a signal (128 + N: 137 a kill, 143 a SIGTERM). */
@@ -1855,11 +1915,12 @@ function testsFailedDetail(testCommand: string, tests: RunResult, after: string)
  * worktree) is the commit's behaviour, which no re-run can catch, and the
  * review reads that code.
  *
- * A failure that names its failing tests is then checked at the merge base
- * `baseTip` (testsRedAtBase): when the base run fails each of them, by file
- * and title and as many times, with the same exit code, they are the base's,
- * and `baseRed` says the pass goes on as if the tests passed. `tests` is
- * always the branch's own run.
+ * A failure that names its failing tests is then checked at its merge base
+ * with `baseTip` (testsRedAtBase): when the base run fails each of them, by file
+ * and title and as many times, with the same exit code, and the command's
+ * other steps pass on their own, they are the base's, and `baseRed` says the
+ * pass goes on as if the tests passed (the receipts say it did not). `tests`
+ * is always the branch's own run.
  */
 async function supervisorTests(
  ctx: ImplementContext,
@@ -1911,7 +1972,7 @@ async function baseRedAt(
  label: string,
  baseTip: string | null,
 ): Promise<{ baseRed?: BaseRedTests }> {
- const baseRed = await testsRedAtBase(ctx, testCommand, tests, label, baseTip);
+ const baseRed = await testsRedAtBase(ctx, testCommand, tests, head, label, baseTip);
  if (baseRed === null) return {};
  if ((await headSha(ctx.worktree)) !== head) {
   ctx.journal.recordEvent("reviewed", {
@@ -1930,31 +1991,46 @@ async function baseRedAt(
  * on tests their branches never touched, one passing 44/44 alone, the other a
  * timeout soma's main hits at the same base). When the failed run names its
  * failing tests, the map's whole test command runs once more in a fresh clone
- * at `git merge-base HEAD origin/<base>`, after the host quiets. origin/<base>
- * is `baseTip`, read before the worker ran, and replacement refs are refused:
- * a failed run that moves the ref or plants a replacement cannot pick the
- * commit its failures are compared with. The result
- * is the base's red set when every `(fail)` line the branch run printed is
- * one there too, by file and title and as many times (failuresNotAtBase), and
- * the base run exits with the branch run's code; null when they gate. A failure that names no test
- * (a typecheck after passing tests, a crash, a timeout, a kill), one a signal
+ * of the merge base of `head` and origin/<base>, after the host quiets.
+ * origin/<base> is `baseTip`, read before the worker ran, and the merge base
+ * is computed in a clone of its own (mergeBaseInFreshClone): a failed run
+ * that moves the ref, plants a replacement or writes grafts cannot pick the
+ * commit its failures are compared with.
+ *
+ * Only the `bun test` step is waived: the command must be plain steps joined
+ * by `&&`, one of them `bun test` (bunTestChain), and every other step then
+ * runs on its own in a fresh clone of `head` and must pass, so a lint or
+ * typecheck failure beside the shared tests (or one the failing bun step
+ * kept from running) still gates.
+ *
+ * The result is the base's red set when every `(fail)` line the branch run
+ * printed is one there too, by file and title and as many times
+ * (failuresNotAtBase), the base run exits with the branch run's code, and the
+ * other steps pass; null when they gate. A failure that names no test (a
+ * typecheck after passing tests, a crash, a timeout, a kill), one a signal
  * ended (exit > 128), or one whose `(fail)` lines do not account for every
  * failure bun reports (failuresAllNamed) gets no base run; a base run a signal
- * ended is no base result. Every outcome of a base run, or why none ran, is a `reviewed` event.
- * Whatever the command runs after a failing step (`bun test && tsc` never
- * reaches tsc) is not run by a base-red pass; CI runs it before the merge.
+ * ended is no base result. Every outcome of a base run, or why none ran, is a
+ * `reviewed` event, and a waived run is recorded for the PR and close
+ * receipts (testsReceipt).
  */
 async function testsRedAtBase(
  ctx: ImplementContext,
  testCommand: string,
  tests: RunResult,
+ head: string,
  label: string,
  baseTip: string | null,
 ): Promise<BaseRedTests | null> {
- const { journal, map, node, worktree } = ctx;
+ const { journal, map, node } = ctx;
  const failed = failedTests(tests);
  if (tests.code <= 0 || signalExit(tests.code) || failed.length === 0) return null;
  const event = (detail: string) => journal.recordEvent("reviewed", { nodeId: node.ref.id, repo: map.repo, detail });
+ const chain = bunTestChain(testCommand);
+ if (chain === null) {
+  event(`tests (${testCommand}) failed; the merge-base check did not run: the command is not plain steps joined by && with one \`bun test\` step, so a failure beside the tests could not be told apart — the failures gate`);
+  return null;
+ }
  if (!failuresAllNamed(tests)) {
   event(`tests (${testCommand}) failed with failures no (fail) line names (an error outside a test, a TypeScript diagnostic, or a count the names do not cover); the merge-base check did not run — the failures gate`);
   return null;
@@ -1963,12 +2039,12 @@ async function testsRedAtBase(
   event(`tests (${testCommand}) failed; the merge-base check did not run: origin/${map.base} did not resolve before the worker ran — the failures gate`);
   return null;
  }
- const merged = await safeGit(["--no-replace-objects", "merge-base", "HEAD", baseTip], { cwd: worktree, timeoutMs: 30_000 });
- const sha = merged.stdout.trim();
- if (merged.code !== 0 || !/^[0-9a-f]{40}$/.test(sha)) {
-  event(`tests (${testCommand}) failed; the merge-base check did not run: no merge base with origin/${map.base} at ${baseTip.slice(0, 8)} (${merged.stderr.trim() || `exit ${merged.code}`}) — the failures gate`);
+ const merged = await mergeBaseInFreshClone(ctx, head, baseTip);
+ if ("why" in merged) {
+  event(`tests (${testCommand}) failed; the merge-base check did not run: ${merged.why} — the failures gate`);
   return null;
  }
+ const { sha } = merged;
  await awaitQuietHost(ctx, "the merge-base test run");
  const base = await freshCheckoutTests(ctx, testCommand, sha, `${label}: merge base ${sha.slice(0, 8)}`, "base");
  if (!base.ran) {
@@ -1985,15 +2061,57 @@ async function testsRedAtBase(
   event(`tests (${testCommand}) at the merge base ${sha} ${how} — not red there, they gate: ${unshared.join("; ")}`);
   return null;
  }
- // A command that runs more than bun can fold another step's failure into
- // its exit: the same red tests with a different exit is not the base's run.
  if (base.result.code !== tests.code) {
   event(`tests (${testCommand}) at the merge base ${sha} exit ${base.result.code}, the branch run exited ${tests.code} — not the same failure, they gate`);
   return null;
  }
+ if (chain.rest !== "") {
+  const steps = await freshCheckoutTests(ctx, chain.rest, head, `${label}: the other test steps`, "steps");
+  if (!steps.ran) {
+   event(`tests (${testCommand}) are red at the merge base ${sha} too, but the other steps (${chain.rest}) did not run on their own at ${head.slice(0, 8)}: ${steps.result.stderr.trim().split("\n")[0]} — the failures gate`);
+   return null;
+  }
+  if (steps.result.code !== 0) {
+   event(`tests (${testCommand}) are red at the merge base ${sha} too, but the other steps (${chain.rest}) exit ${steps.result.code} on their own at ${head.slice(0, 8)} — they gate: ${tail(steps.result)}`);
+   return null;
+  }
+ }
  const names = [...new Set(failed.map(testIdentity))];
- event(`tests (${testCommand}) at the merge base ${sha}: red on the merge base too, not gating: ${names.join("; ")}`);
+ recordTestsBaseRed(journal, map.repo, node.ref.id, { head, base: sha, names, rest: chain.rest });
+ event(`tests (${testCommand}) at the merge base ${sha}: red on the merge base too, not gating: ${names.join("; ")}${chain.rest === "" ? "" : ` (the other steps, ${chain.rest}, pass on their own)`}`);
  return { sha, names };
+}
+
+/**
+ * `git merge-base head baseTip`, computed in a bare clone of the node's
+ * branch made for it: `--no-local`, so the commits arrive as objects (no
+ * commit-graph or alternates hardlinked from the shared repository), with
+ * `baseTip` and `head` fetched by sha. The clone has no grafts, replacement
+ * refs or config the failed run could have written; a shallow clone (the
+ * shared repository marked shallow) is refused. Grafts in the shared
+ * repository make the clone fail, which counts as no merge base.
+ */
+async function mergeBaseInFreshClone(ctx: ImplementContext, head: string, baseTip: string): Promise<{ sha: string } | { why: string }> {
+ const scratch = mkdtempSync(join(tmpdir(), "ranger-merge-base-"));
+ const dir = join(scratch, "repo.git");
+ const git = (args: string[], cwd: string, timeoutMs = 60_000) => safeGit(["--no-replace-objects", ...args], { cwd, timeoutMs });
+ const first = (r: RunResult) => r.stderr.trim().split("\n").filter((l) => !/^(?:remote: )?hint:/.test(l)).slice(-1)[0] ?? `exit ${r.code}`;
+ try {
+  const clone = await git(["clone", "--quiet", "--bare", "--no-local", "--no-tags", "--single-branch", "--branch", ctx.branch, ctx.canonical, dir], scratch, 300_000);
+  if (clone.code !== 0) return { why: `could not clone to compute the merge base (${first(clone)})` };
+  const fetch = await git(["fetch", "--quiet", "--no-tags", ctx.canonical, head, baseTip], dir, 300_000);
+  if (fetch.code !== 0) return { why: `could not fetch ${head.slice(0, 8)} and origin/${ctx.map.base} at ${baseTip.slice(0, 8)} to compute the merge base (${first(fetch)})` };
+  const shallow = await git(["rev-parse", "--is-shallow-repository"], dir, 10_000);
+  if (shallow.stdout.trim() !== "false") return { why: "the clone to compute the merge base is shallow" };
+  const merged = await git(["merge-base", head, baseTip], dir, 30_000);
+  const sha = merged.stdout.trim();
+  if (merged.code !== 0 || !/^[0-9a-f]{40}$/.test(sha)) {
+   return { why: `no merge base with origin/${ctx.map.base} at ${baseTip.slice(0, 8)} (${merged.stderr.trim() || `exit ${merged.code}`})` };
+  }
+  return { sha };
+ } finally {
+  await rm(scratch, { recursive: true, force: true });
+ }
 }
 
 /**
@@ -2075,20 +2193,21 @@ async function testsInFreshCheckout(ctx: ImplementContext, testCommand: string, 
 }
 
 /**
- * testsInFreshCheckout for a retry or a merge-base run. `ran` is false when
- * the clone, checkout or install failed, or the run changed the checkout's
- * tracked content or HEAD: the result then carries why, first.
+ * testsInFreshCheckout for a retry, a merge-base run, or the other steps of
+ * a base-red run. `ran` is false when the clone, checkout or install failed,
+ * or the run changed the checkout's tracked content or HEAD: the result then
+ * carries why, first.
  */
 async function freshCheckoutTests(
  ctx: ImplementContext,
  testCommand: string,
  sha: string,
  label: string,
- purpose: "retry" | "base",
+ purpose: "retry" | "base" | "steps",
 ): Promise<{ ran: boolean; result: RunResult }> {
  const scratch = mkdtempSync(join(tmpdir(), `ranger-test-${purpose}-`));
  const dir = join(scratch, "checkout");
- const forRun = purpose === "retry" ? "for the retry" : "for the merge-base run";
+ const forRun = { retry: "for the retry", base: "for the merge-base run", steps: "for the other test steps" }[purpose];
  const failed = (why: string) => ({ ran: false, result: { code: 1, stdout: "", stderr: why } });
  const git = (args: string[], cwd: string, timeoutMs = 60_000) =>
   safeGit(["--no-replace-objects", ...args], { cwd, timeoutMs });
@@ -2121,7 +2240,7 @@ async function freshCheckoutTests(
    flags.code !== 0 ||
    flags.stdout.split("\n").some((l) => l.length > 0 && !l.startsWith("H "));
   if (changed) {
-   const outcome = purpose === "retry" ? "the retry certifies nothing that gets pushed" : "its result is not the base's";
+   const outcome = { retry: "the retry certifies nothing that gets pushed", base: "its result is not the base's", steps: "the steps certify nothing" }[purpose];
    return {
     ran: false,
     result: {
@@ -2254,7 +2373,7 @@ function readyBody(
  return [
   `Implements ${nodeLink(ctx)}: ${ctx.node.node.title}`,
   "",
-  `- Tests: \`${ctx.map.commands.test}\` passed in the supervisor before every push.`,
+  `- Tests: ${testsReceipt(ctx.map.commands.test, "in the supervisor", recordedTestsBaseRed(ctx.journal, ctx.map.repo, ctx.node.ref.id))}`,
   `- Sage: ${rounds} offline round(s); the last, at \`${final.sha.slice(0, 8)}\`, found ${final.blockers} blockers, ${final.majors} majors, ${final.nits} nits. Machine review evidence, not a human sign-off.`,
   ...probeLine(ctx, probe),
   `- Merge: ranger never merges. ${ratify}`,
@@ -2278,7 +2397,7 @@ function closeResolution(
  return [
   `Implemented by ranger's implement lane in PR #${pr.iid} (${pr.webUrl || `https://github.com/${ctx.map.repo}/pull/${pr.iid}`}), merged by ${pr.mergedBy ?? "an unknown login"}${pr.mergeCommitSha === null ? "" : ` as ${pr.mergeCommitSha.slice(0, 8)}`}.`,
   "",
-  `- Tests: \`${ctx.map.commands.test}\` passed before every push; CI check run "${ci.runName}" (${ci.runId}) succeeded on the PR head ${pr.headSha.slice(0, 8)}.`,
+  `- Tests: ${testsReceipt(ctx.map.commands.test, "in the supervisor", recordedTestsBaseRed(ctx.journal, ctx.map.repo, ctx.node.ref.id))} CI check run "${ci.runName}" (${ci.runId}) succeeded on the PR head ${pr.headSha.slice(0, 8)}.`,
   final === undefined
    ? "- Sage: no recorded review round."
    : `- Sage: ${rounds} offline round(s); the last at ${final.sha.slice(0, 8)} found ${final.blockers} blockers, ${final.majors} majors, ${final.nits} nits (machine evidence).`,
