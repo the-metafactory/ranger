@@ -19,7 +19,7 @@ import { loadConfig } from "../src/config.ts";
 import { runCmd } from "../src/exec.ts";
 import type { IssueComment, ChangeRequest } from "../src/forge.ts";
 import type { CheckRun } from "../src/github.ts";
-import { baseMergeMarker, bunTestChain, failedTests, failuresAllNamed, failuresNotAtBase, testsReceipt, recordedBaseMerges, recordedReviews, reviewMarker, type ForgePort } from "../src/implement.ts";
+import { baseMergeMarker, bunTestChain, coverageInPlay, failedTests, failuresAllNamed, failuresNotAtBase, testsReceipt, recordedBaseMerges, recordedReviews, reviewMarker, type ForgePort } from "../src/implement.ts";
 import { Database } from "bun:sqlite";
 import { openJournal, type Journal } from "../src/journal.ts";
 import { ReviewError, type ReviewVerdict } from "../src/review.ts";
@@ -1861,7 +1861,7 @@ describe("implement lane (node #23)", () => {
    const sha = await mergeBase(r);
    expect(sha).toMatch(/^[0-9a-f]{40}$/);
    const events = reviewed(r);
-   expect(events).toContain(`tests (bun test) at the merge base ${sha}: red on the merge base too, not gating: claude-code install; git trust`);
+   expect(events).toContain(`tests (bun test) at the merge base ${sha}, failing the same way: red on the merge base too, not gating: claude-code install; git trust`);
    expect(events.some((d) => d.startsWith("restored the worktree to "))).toBe(true);
    expect(baseRuns(r.calls).map((c) => c.command)).toEqual(["bun test"]);
    expect(stepRuns(r.calls)).toEqual([]); // nothing beside bun test to run
@@ -2017,6 +2017,29 @@ describe("implement lane (node #23)", () => {
    expect(reviewed(r).some((d) => d.endsWith("red on the merge base too, not gating: test/a.test.ts: grp > shared"))).toBe(true);
   }, 60_000);
 
+  test("a shared failure recapped by bun after more than 20 passes is waived", async () => {
+   const r = await bunRig(`cat >&2 <<'EOF'\n${RECAP_STDERR}\nEOF\nexit 1\n`);
+   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+   expect(reviewed(r).some((d) => d.endsWith("red on the merge base too, not gating: test/a.test.ts: assert; test/b.test.ts: throws; test/b.test.ts: timeout"))).toBe(true);
+  }, 60_000);
+
+  test("a test failing an assertion at the base and a TypeError on the branch gates: same title, another failure", async () => {
+   const r = await bunRig("if [ -f src/feature.ts ]; then echo \"TypeError: x is not a function\" >&2; else echo \"error: expect(received).toBe(expected)\" >&2; fi; printf \"(fail) shared [1.00ms]\\n 1 fail\\n\" >&2; exit 1");
+   expect((await runNode("20", r.ctx)).status).toBe("failed");
+   const sha = await mergeBase(r);
+   expect(reviewed(r).some((d) => d.endsWith(`at the merge base ${sha} fails another set (exit 1) — not red there, they gate: shared (fails with "TypeError: x is not a function" on the branch, "error: expect(received).toBe(expected)" at the base)`))).toBe(true);
+   expect(reviewed(r).some((d) => d.includes("red on the merge base too"))).toBe(false);
+   expect(r.github.prs.size).toBe(0);
+  }, 60_000);
+
+  test("a shared failure beside bun's coverage table gets no base run: a missed threshold names no test", async () => {
+   const r = await bunRig("echo \"(fail) shared\" >&2; printf \"File       | %% Funcs | %% Lines | Uncovered Line #s\\n\" >&2; echo \" 1 fail\" >&2; exit 1");
+   expect((await runNode("20", r.ctx)).status).toBe("failed");
+   expect(baseRuns(r.calls)).toEqual([]);
+   expect(reviewed(r).some((d) => d.endsWith("failed with coverage reported, and a missed coverage threshold names no test; the merge-base check did not run — the failures gate"))).toBe(true);
+   expect(r.github.prs.size).toBe(0);
+  }, 60_000);
+
   test("a shared failure with an exit the base run does not share gates", async () => {
    const r = await bunRig("echo \"(fail) shared\"; echo \" 1 fail\"; if [ -f src/feature.ts ]; then exit 3; fi; exit 1");
    expect((await runNode("20", r.ctx)).status).toBe("failed");
@@ -2063,13 +2086,75 @@ describe("implement lane (node #23)", () => {
    const run = { code: 1, stdout: "bun test v1.3.14 (0d9b296a)\nhello out\n", stderr };
    const tests = failedTests(run);
    expect(tests).toEqual([
-    { file: "test/b.test.ts", name: "grp > shared" },
-    { file: "test/a.test.ts", name: "grp > shared" },
+    { file: "test/b.test.ts", name: "grp > shared", cause: "error: expect(received).toBe(expected)" },
+    { file: "test/a.test.ts", name: "grp > shared", cause: "" },
    ]);
    expect(failuresAllNamed(run)).toBe(true);
    expect(failuresNotAtBase(tests, tests)).toEqual([]);
    expect(failuresNotAtBase(tests, [tests[1]])).toEqual(["test/b.test.ts: grp > shared"]);
    expect(failuresNotAtBase([tests[0], tests[0]], [tests[0]])).toEqual(["test/b.test.ts: grp > shared (2 on the branch, 1 at the base)"]);
+  });
+
+  // bun 1.3.14's own stderr, outside AI mode: more than 20 passes, so it recaps the failures after the last file.
+  const RECAP_STDERR = [
+   "",
+   "test/a.test.ts:",
+   ...Array.from({ length: 25 }, (_, i) => `(pass) p${i}`),
+   "3 | test(\"assert\", () => { expect(1).toBe(2); });",
+   "                                     ^",
+   "error: expect(received).toBe(expected)",
+   "",
+   "Expected: 2",
+   "Received: 1",
+   "",
+   "      at <anonymous> (/private/tmp/bunexp164/test/a.test.ts:3:34)",
+   "(fail) assert [0.36ms]",
+   "",
+   "test/b.test.ts:",
+   "4 | test(\"throws\", () => { (undefined as any).foo(); });",
+   "                            ^",
+   "TypeError: undefined is not an object (evaluating '(void 0).foo')",
+   "      at <anonymous> (/private/tmp/bunexp164/test/b.test.ts:4:25)",
+   "(fail) throws [0.22ms]",
+   "(fail) timeout [51.03ms]",
+   "  ^ this test timed out after 50ms.",
+   "",
+   "3 tests failed:",
+   "(fail) assert [0.36ms]",
+   "(fail) throws [0.22ms]",
+   "(fail) timeout [51.03ms]",
+   "  ^ this test timed out after 50ms.",
+   "",
+   " 25 pass",
+   " 3 fail",
+   " 1 expect() calls",
+   "Ran 28 tests across 2 files. [68.00ms]",
+  ].join("\n");
+
+  test("bun's recap of the failures is not counted again, and each failure keeps its cause", () => {
+   const run = { code: 1, stdout: "bun test v1.3.14 (0d9b296a)\n", stderr: RECAP_STDERR };
+   expect(failedTests(run)).toEqual([
+    { file: "test/a.test.ts", name: "assert", cause: "error: expect(received).toBe(expected)" },
+    { file: "test/b.test.ts", name: "throws", cause: "TypeError: undefined is not an object (evaluating '(void N).foo')" },
+    { file: "test/b.test.ts", name: "timeout", cause: "this test timed out after Nms." },
+   ]);
+   expect(failuresAllNamed(run)).toBe(true);
+  });
+
+  test("a failing test with another cause at the base is not the base's", () => {
+   const branch = [{ file: "test/a.test.ts", name: "shared", cause: "TypeError: x is not a function" }];
+   const base = [{ file: "test/a.test.ts", name: "shared", cause: "error: expect(received).toBe(expected)" }];
+   expect(failuresNotAtBase(branch, base)).toEqual(['test/a.test.ts: shared (fails with "TypeError: x is not a function" on the branch, "error: expect(received).toBe(expected)" at the base)']);
+   // Paths and digits are masked: the same error from another checkout and another run is one cause.
+   const at = (dir: string, ms: number) => failedTests({ code: 1, stdout: "", stderr: `error: ENOENT reading ${dir}/fixtures/a.json after ${ms}ms\n(fail) shared\n 1 fail\n` });
+   expect(failuresNotAtBase(at("/Users/x/.worktrees/node-20", 12), at("/var/folders/T/ranger-test-base-ab12", 31))).toEqual([]);
+  });
+
+  test("coverage is in play when bun prints its table or the command asks for it", () => {
+   const table = "-----------|---------|---------|-------------------\nFile       | % Funcs | % Lines | Uncovered Line #s\n";
+   expect(coverageInPlay("bun test", { code: 1, stdout: "", stderr: table })).toBe(true);
+   expect(coverageInPlay("bun test --coverage", { code: 1, stdout: "", stderr: "" })).toBe(true);
+   expect(coverageInPlay("bun test", { code: 1, stdout: "", stderr: "(fail) shared\n 1 fail\n" })).toBe(false);
   });
 
   test("bunTestChain splits plain && chains with one bun test step, and nothing else", () => {

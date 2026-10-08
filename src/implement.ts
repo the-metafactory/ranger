@@ -1744,10 +1744,31 @@ export function allFailedTestNames(result: RunResult): string[] {
  return [...new Set(failedTests(result).map((t) => t.name))];
 }
 
-/** One `(fail)` line: its name, and the test file whose header preceded it ("" when none did). */
+/**
+ * One `(fail)` line: its name, the test file whose header preceded it (""
+ * when none did), and its cause: the error bun printed for it, as failingCause
+ * normalizes it ("" when bun printed none).
+ */
 export interface FailedTest {
  file: string;
  name: string;
+ cause: string;
+}
+
+/** bun's recap of the failures, printed after more than 20 passes outside AI mode: `4 tests failed:`. */
+const RECAP = /^\d+ tests? failed:$/;
+
+/**
+ * An error line as a cause: absolute paths and digits masked, so the same
+ * error in the node's worktree and in a fresh clone of the base (another
+ * directory, other timings) reads the same, while an assertion and a
+ * TypeError, or two different messages, do not.
+ */
+function failingCause(line: string): string {
+ return line
+  .trim()
+  .replace(/(?:\/[^\s'"`():,]+)+/g, "<path>")
+  .replace(/\d+/g, "N");
 }
 
 /**
@@ -1755,16 +1776,39 @@ export interface FailedTest {
  * with one title are two failures. bun heads each file's results with its
  * path relative to the checkout (`test/a.test.ts:`), the same in a fresh
  * clone of the base; a `(fail)` line takes the last header in its stream.
+ * Its cause is the first error line (`error: …`, `TypeError: …`) printed
+ * since the previous result line or header, and a timeout note bun prints
+ * after it (`  ^ this test timed out after 50ms.`).
+ *
+ * bun's recap of the failures repeats each `(fail)` line after the last
+ * file: a stream's lines stop counting at its recap header. A test that
+ * prints that header itself makes the count fall short of bun's summary,
+ * which gates (failuresAllNamed); it never waives.
  */
 export function failedTests(result: RunResult): FailedTest[] {
  const tests: FailedTest[] = [];
  for (const stream of [result.stdout, result.stderr]) {
   let file = "";
+  let cause = "";
+  let last: FailedTest | null = null;
   for (const line of stream.split("\n")) {
+   if (RECAP.test(line)) break;
    const header = /^(\S[^:]*\.[cm]?[jt]sx?):$/.exec(line);
-   if (header) file = header[1];
    const m = /^\(fail\) (.+?)(?: \[[\d.]+m?s\])?$/.exec(line);
-   if (m) tests.push({ file, name: m[1].trim() });
+   if (m) {
+    last = { file, name: m[1].trim(), cause };
+    tests.push(last);
+   } else if (last !== null && /^\s+\^ this test timed out/.test(line)) {
+    last.cause = [last.cause, failingCause(line.replace(/^\s+\^\s*/, ""))].filter((c) => c !== "").join(" / ");
+    continue;
+   } else if (cause === "" && /^(?:error|[A-Z]\w*Error)(?:: |$)/.test(line)) {
+    cause = failingCause(line);
+   }
+   if (header || m || /^\((?:pass|skip|todo)\) /.test(line)) {
+    if (header) file = header[1];
+    cause = "";
+    if (!m) last = null;
+   }
   }
  }
  return tests;
@@ -1786,10 +1830,11 @@ function testIdentity(t: FailedTest): string {
  * accounted for. Another step's failure in the command that prints none of
  * these is not seen here: testsRedAtBase waives only the `bun test` step
  * (bunTestChain) and runs every other step on its own, which must pass.
+ * The `(fail)` lines are failedTests', without bun's recap.
  */
 export function failuresAllNamed(result: RunResult): boolean {
  const out = `${result.stdout}\n${result.stderr}`;
- const lines = [...out.matchAll(/^\(fail\) /gm)].length;
+ const lines = failedTests(result).length;
  const counted = [...out.matchAll(/^\s*(\d+) fail$/gm)];
  const errors = [...out.matchAll(/^\s*(\d+) errors?$/gm)].reduce((n, m) => n + Number(m[1]), 0);
  return (
@@ -1802,22 +1847,40 @@ export function failuresAllNamed(result: RunResult): boolean {
 }
 
 /**
- * The branch's failing tests the base run does not fail as often, file and
- * title alike: each identity counts once per `(fail)` line, so a second
- * failing test sharing a title with a base-red one is not waived by it.
+ * The branch's failing tests the base run does not fail as often, file,
+ * title and cause alike: each counts once per `(fail)` line, so a second
+ * failing test sharing a title with a base-red one is not waived by it, and
+ * a test that fails another way at the base (an assertion there, a
+ * TypeError on the branch) is not the base's failure.
  */
 export function failuresNotAtBase(branch: FailedTest[], base: FailedTest[]): string[] {
+ const key = (t: FailedTest) => `${testIdentity(t)}\u0000${t.cause}`;
  const count = (tests: FailedTest[]) => {
   const n = new Map<string, number>();
-  for (const t of tests) n.set(testIdentity(t), (n.get(testIdentity(t)) ?? 0) + 1);
+  for (const t of tests) n.set(key(t), (n.get(key(t)) ?? 0) + 1);
   return n;
  };
+ const said = (cause: string) => (cause === "" ? "no error line" : `"${cause}"`);
  const there = count(base);
- return [...count(branch)].flatMap(([id, n]) => {
-  const at = there.get(id) ?? 0;
+ return [...count(branch)].flatMap(([k, n]) => {
+  const at = there.get(k) ?? 0;
   if (n <= at) return [];
+  const [id, cause] = k.split("\u0000");
+  const otherwise = [...new Set(base.filter((t) => testIdentity(t) === id && t.cause !== cause).map((t) => said(t.cause)))];
+  if (at === 0 && otherwise.length > 0) return [`${id} (fails with ${said(cause)} on the branch, ${otherwise.join(" / ")} at the base)`];
   return [n === 1 && at === 0 ? id : `${id} (${n} on the branch, ${at} at the base)`];
  });
+}
+
+/**
+ * Whether the run reports coverage the way bun enforces a threshold: its
+ * coverage table printed, or `--coverage` in the command. A missed
+ * threshold fails the run with no `(fail)` line and no failing count (bun
+ * 1.3.14 prints only the table and exits 1), so a shared failing test beside
+ * it cannot be told apart from a coverage regression.
+ */
+export function coverageInPlay(testCommand: string, result: RunResult): boolean {
+ return /(?:^|\s)--coverage(?:[\s=]|$)/.test(testCommand) || /^\s*File\s+\|\s+% (?:Funcs|Lines)/m.test(`${result.stdout}\n${result.stderr}`);
 }
 
 /** One step of a test command: plain words, nothing the shell expands, redirects or chains. */
@@ -1944,7 +2007,7 @@ async function supervisorTests(
   return { tests, retried: false };
  }
  const retry = await retryOnBusyHost(ctx, testCommand, head, `tests (${testCommand})`, "the test retry", `${label}: supervisor test retry`);
- if (retry === null) return { tests, retried: false, ...await baseRedAt(ctx, testCommand, tests, head, label, baseTip) };
+ if (retry === null) return { tests, retried: false, ...await baseRedAt(ctx, { testCommand, tests, head, label, baseTip }) };
  tests = retry.result;
  // A retry that did not run validly (its clone, install or checkout check
  // failed) certifies nothing: its (fail) lines are no evidence to waive.
@@ -1956,10 +2019,13 @@ async function supervisorTests(
   journal.recordEvent("reviewed", { nodeId: node.ref.id, repo: map.repo, detail: `tests (${testCommand}) passed on the retry in a fresh checkout` });
   return { tests, retried: true };
  }
- return { tests, retried: false, ...await baseRedAt(ctx, testCommand, tests, head, label, baseTip) };
+ return { tests, retried: false, ...await baseRedAt(ctx, { testCommand, tests, head, label, baseTip }) };
 }
 
-/** Failing tests that fail at the merge base too: the base's, not the branch's. */
+/**
+ * Failing tests that fail at the merge base too, by file, title, count,
+ * error and exit code: as far as the two runs show, the base's failures.
+ */
 interface BaseRedTests {
  sha: string;
  names: string[];
@@ -1967,16 +2033,19 @@ interface BaseRedTests {
  rest: string;
 }
 
+/** A failed supervisor test run at `head`, and the origin/<base> tip read before the worker ran. */
+interface FailedRun {
+ testCommand: string;
+ tests: RunResult;
+ head: string;
+ label: string;
+ baseTip: string | null;
+}
+
 /** `{ baseRed }` when the branch's failures are all red at the base and HEAD stayed at `head` meanwhile; else nothing. */
-async function baseRedAt(
- ctx: ImplementContext,
- testCommand: string,
- tests: RunResult,
- head: string,
- label: string,
- baseTip: string | null,
-): Promise<{ baseRed?: BaseRedTests }> {
- const baseRed = await testsRedAtBase(ctx, testCommand, tests, head, label, baseTip);
+async function baseRedAt(ctx: ImplementContext, run: FailedRun): Promise<{ baseRed?: BaseRedTests }> {
+ const { testCommand, head } = run;
+ const baseRed = await testsRedAtBase(ctx, run);
  if (baseRed === null) return {};
  if ((await headSha(ctx.worktree)) !== head) {
   ctx.journal.recordEvent("reviewed", {
@@ -2007,10 +2076,12 @@ async function baseRedAt(
  * typecheck failure beside the shared tests (or one the failing bun step
  * kept from running) still gates.
  *
- * The result is the base's red set when every `(fail)` line the branch run
- * printed is one there too, by file and title and as many times
- * (failuresNotAtBase), the base run exits with the branch run's code, and the
- * other steps pass; null when they gate. A failure that names no test (a
+ * "Shares" is what the two runs show: the result is the base's red set when
+ * every `(fail)` line the branch run printed is one there too, by file,
+ * title and error and as many times (failuresNotAtBase), the base run exits
+ * with the branch run's code, and the other steps pass; null when they gate.
+ * A run with coverage in play (coverageInPlay) gets no base run: a missed
+ * threshold names no test. A failure that names no test (a
  * typecheck after passing tests, a crash, a timeout, a kill), one a signal
  * ended (exit > 128), or one whose `(fail)` lines do not account for every
  * failure bun reports (failuresAllNamed) gets no base run; a base run a signal
@@ -2018,15 +2089,9 @@ async function baseRedAt(
  * `reviewed` event; the lane records a waived run that goes on to the push
  * for the PR and close receipts (testsReceipt).
  */
-async function testsRedAtBase(
- ctx: ImplementContext,
- testCommand: string,
- tests: RunResult,
- head: string,
- label: string,
- baseTip: string | null,
-): Promise<BaseRedTests | null> {
+async function testsRedAtBase(ctx: ImplementContext, run: FailedRun): Promise<BaseRedTests | null> {
  const { journal, map, node } = ctx;
+ const { testCommand, tests, head, label, baseTip } = run;
  const failed = failedTests(tests);
  if (tests.code <= 0 || signalExit(tests.code) || failed.length === 0) return null;
  const event = (detail: string) => journal.recordEvent("reviewed", { nodeId: node.ref.id, repo: map.repo, detail });
@@ -2037,6 +2102,10 @@ async function testsRedAtBase(
  }
  if (!failuresAllNamed(tests)) {
   event(`tests (${testCommand}) failed with failures no (fail) line names (an error outside a test, a TypeScript diagnostic, or a count the names do not cover); the merge-base check did not run — the failures gate`);
+  return null;
+ }
+ if (coverageInPlay(testCommand, tests)) {
+  event(`tests (${testCommand}) failed with coverage reported, and a missed coverage threshold names no test; the merge-base check did not run — the failures gate`);
   return null;
  }
  if (baseTip === null) {
@@ -2081,7 +2150,7 @@ async function testsRedAtBase(
   }
  }
  const names = [...new Set(failed.map(testIdentity))];
- event(`tests (${testCommand}) at the merge base ${sha}${chain.rest === "" ? "" : ` (the other steps, ${chain.rest}, pass on their own)`}: red on the merge base too, not gating: ${names.join("; ")}`);
+ event(`tests (${testCommand}) at the merge base ${sha}, failing the same way${chain.rest === "" ? "" : ` (the other steps, ${chain.rest}, pass on their own)`}: red on the merge base too, not gating: ${names.join("; ")}`);
  return { sha, names, rest: chain.rest };
 }
 
