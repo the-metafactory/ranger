@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { Journal } from "./journal.ts";
-import { acquireLease, leaseOwnedCheck, type OwnedCheck, releaseLease, startHeartbeat } from "./lock.ts";
+import { type OwnedCheck, withOwnedLease } from "./lock.ts";
 
 /**
  * The fix-the-base filing lock (node #152): one cross-process lease per
@@ -49,20 +49,15 @@ export async function withFixNodeLock<T>(
  timeoutMs = FIX_NODE_LOCK_TIMEOUT_MS,
 ): Promise<T> {
  const lockFile = fixNodeLockFile(journal, key);
- const lease = await acquireLease(lockFile, `${lockFile}.reclaiming`, {
-  timeoutMs,
-  contended: () => new FixNodeLockBusy(`another run holds the fix-the-base lock (${lockFile}) for over ${Math.round(timeoutMs / 1000)} s`),
- });
- const { heartbeat, lostOwnership } = startHeartbeat(lease);
- const owned = leaseOwnedCheck(
-  lease,
-  lostOwnership,
-  (why) => new FixNodeLeaseLost(`fix-the-base lock lost (${why}) — stopped before the next write`),
-  { rejectExpired: true },
+ return withOwnedLease(
+  lockFile,
+  {
+   timeoutMs,
+   contended: () => new FixNodeLockBusy(`another run holds the fix-the-base lock (${lockFile}) for over ${Math.round(timeoutMs / 1000)} s`),
+   lost: (why) => new FixNodeLeaseLost(`fix-the-base lock lost (${why}) — stopped before the next write`),
+   rejectExpired: true,
+   lostMessage: "[fix-node] fix-the-base lock was lost mid-filing — check for a duplicate fix node",
+  },
+  fn,
  );
- try {
-  return await fn(owned);
- } finally {
-  releaseLease(lease, heartbeat, lostOwnership, "[fix-node] fix-the-base lock was lost mid-filing — check for a duplicate fix node");
- }
 }

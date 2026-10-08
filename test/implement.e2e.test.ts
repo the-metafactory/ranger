@@ -1411,6 +1411,19 @@ describe("implement lane (node #23)", () => {
   expect(events.some((d) => d.includes("fix-the-base filing for probe-hud.mjs") && d.includes("graph add refused"))).toBe(true);
  }, 60_000);
 
+ test("a worker superseded while it files the fix node posts no probe record (node #152)", async () => {
+  const r = await rig({ probe: "fake-probe red {node}", probeRetry: "fake-probe red {node} {failed}" });
+  cleanup.push(r.dir);
+  await seedProbeOnBase(r);
+  r.ctx.fixNode = {
+   add: async () => { r.journal.beginGeneration("20", "acme/widgets"); return { node: "99" }; },
+   link: async () => {},
+   status: async () => "open",
+  };
+  expect((await runNode("20", r.ctx)).status).toBe("refused");
+  expect((r.github.comments.get(1) ?? []).some((c) => c.body.includes("ranger:probes"))).toBe(false);
+ }, 60_000);
+
  for (const filedHere of [false, true]) {
   test(`a cache hit ${filedHere ? "at a base the map already filed for files nothing" : "files the map's fix node"} (node #152)`, async () => {
    const r = await rig({ probe: "fake-probe red {node}", probeRetry: "fake-probe red {node} {failed}" });

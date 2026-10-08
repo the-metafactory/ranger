@@ -7,7 +7,7 @@ import * as exec from "../src/exec.ts";
 import { runCmd, type RunResult } from "../src/exec.ts";
 import { fixNodeLockFile, FixNodeLockBusy, withFixNodeLock } from "../src/fix-node-lock.ts";
 import { GraphAddUnattached, graphAdd, graphLink, GraphWriteError, type AddSpec } from "../src/graph-write.ts";
-import { baseRedFixKey, fileBaseRedFixNodes, probeMergeBase, type FixNodeGraph, type ImplementContext } from "../src/implement.ts";
+import { baseRedFixKey, fileBaseRedFixNodes, FIX_NODE_FILING_CONCURRENCY, probeMergeBase, type FixNodeGraph, type ImplementContext } from "../src/implement.ts";
 import { Journal } from "../src/journal.ts";
 import { openDb } from "../src/store/db.ts";
 import { seedLegacyRoots } from "../src/store/legacy-roots.ts";
@@ -36,6 +36,7 @@ describe("fix-the-base node for a confirmed base-red probe (node #152)", () => {
  let linked: { node: string; parent: string }[];
  let addDelayMs: number;
  let onAdd: (() => void) | null;
+ let onStatus: (() => void) | null;
  let nextNode: number;
 
  const fakeGraph: FixNodeGraph = {
@@ -53,9 +54,16 @@ describe("fix-the-base node for a confirmed base-red probe (node #152)", () => {
    if (linkFails !== null) throw linkFails;
   },
   status: async (id) => {
+   onStatus?.();
    if (statusFails !== null) throw statusFails;
    return statuses.get(id) ?? "open";
   },
+ };
+ /** The detecting node holds the worker row the filer fences on. */
+ const occupy = (id: string) => {
+  ctx.journal.upsertWorker({ root: ctx.map.root, nodeId: id, repo: ctx.map.repo, status: "claimed" });
+  ctx.node = { ...ctx.node, ref: { ...ctx.node.ref, id } };
+  ctx.generation = ctx.journal.beginGeneration(id, ctx.map.repo);
  };
  const events = () => ctx.journal.listEvents(ctx.map.repo, 200).map((e) => e.detail ?? "");
  /** The confirmation path: a fresh base comparison that confirms, then the filer. */
@@ -90,6 +98,7 @@ describe("fix-the-base node for a confirmed base-red probe (node #152)", () => {
   linked = [];
   addDelayMs = 0;
   onAdd = null;
+  onStatus = null;
   nextNode = 300;
   ctx = {
    config, map, node, rootNode: node, canonical, worktree: canonical,
@@ -105,6 +114,7 @@ describe("fix-the-base node for a confirmed base-red probe (node #152)", () => {
    hostLoad: () => ({ load: 0, cores: 1 }),
    fixNode: fakeGraph,
   };
+  occupy(node.ref.id);
  });
  afterEach(() => {
   ctx.journal.close();
@@ -265,7 +275,7 @@ describe("fix-the-base node for a confirmed base-red probe (node #152)", () => {
   expect(events().some((d) => d.includes("node #300 is recorded and is attached below #1 the next time, not filed again"))).toBe(true);
   addFails = null;
   // A later detection by another node links the node below the parent it was filed under.
-  ctx.node = { ...ctx.node, ref: { ...ctx.node.ref, id: "7" } };
+  occupy("7");
   linkFails = new Error("link refused");
   answers = [];
   await confirmAndFile();
@@ -315,6 +325,32 @@ describe("fix-the-base node for a confirmed base-red probe (node #152)", () => {
   release();
   await held;
   expect(await withFixNodeLock(ctx.journal, key, async () => "after", 300)).toBe("after");
+ });
+
+ test("a superseded worker files nothing: not after its lease wait, not after the status read", async () => {
+  ctx.journal.beginGeneration(ctx.node.ref.id, ctx.map.repo);
+  await fileBaseRedFixNodes(ctx, { sha, confirmed: [HUD, "probe-map.mjs"] }, PR);
+  expect(added).toEqual([]);
+  expect(ctx.journal.getHealth(baseRedFixKey(ctx.map, HUD))).toBeNull();
+  expect(events().some((d) => d.includes(`fix-the-base filing for ${HUD} at ${sha.slice(0, 8)} stopped`) && d.includes("superseded"))).toBe(true);
+  // A record from an earlier base: the generation moves while its status is read.
+  occupy(ctx.node.ref.id);
+  ctx.journal.setHealth(baseRedFixKey(ctx.map, HUD), JSON.stringify({ node: "250", sha: LATER }));
+  statuses.set("250", "closed");
+  onStatus = () => ctx.journal.beginGeneration(ctx.node.ref.id, ctx.map.repo);
+  await fileBaseRedFixNodes(ctx, { sha, confirmed: [HUD] }, PR);
+  expect(added).toEqual([]);
+  expect(JSON.parse(ctx.journal.getHealth(baseRedFixKey(ctx.map, HUD))!).node).toBe("250");
+ });
+
+ test("probes file side by side, each under its own lease: the wait is the slowest add, not the sum", async () => {
+  addDelayMs = 400;
+  const probes = Array.from({ length: FIX_NODE_FILING_CONCURRENCY }, (_, i) => `probe-${i}.mjs`);
+  const started = Date.now();
+  await fileBaseRedFixNodes(ctx, { sha, confirmed: probes }, PR);
+  expect(Date.now() - started).toBeLessThan(addDelayMs * 2);
+  expect(added).toHaveLength(probes.length);
+  for (const probe of probes) expect(JSON.parse(ctx.journal.getHealth(baseRedFixKey(ctx.map, probe))!)).toMatchObject({ sha });
  });
 
  test("graphLink attaches under the machine account's token and fails on a refused attach", async () => {

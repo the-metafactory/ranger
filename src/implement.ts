@@ -42,7 +42,7 @@ import { finishClosedElsewhere } from "./closed-elsewhere.ts";
 import { budgetedRead, budgetPolicy } from "./budget.ts";
 import { GraphAddUnattached, graphAdd, graphClose, graphDecisions, graphLink, type AddSpec, type CloseResult } from "./graph-write.ts";
 import { FixNodeLockBusy, withFixNodeLock } from "./fix-node-lock.ts";
-import type { ImplementPhase, Journal } from "./journal.ts";
+import { FencedError, type ImplementPhase, type Journal } from "./journal.ts";
 import { assembleImplementPrompt } from "./prompt.ts";
 import { ReviewError, sageReview, type ReviewVerdict } from "./review.ts";
 import {
@@ -506,6 +506,8 @@ async function probeFinalHead(
  const failing = probeFailureSummary(result.stdout, result.code);
  // Named only when every run here (both attempts, the merge base's) was written.
  const log = logFailureCount(ctx) === logFailuresBefore ? basename(workerLogFile(journal.path, repo, nodeId, ctx.generation)) : null;
+ // Again after the filing: its lease wait and graph writes can outlast this worker's generation.
+ ctx.journal.assertGeneration(nodeId, ctx.map.repo, ctx.generation, "post the probe record");
  await github.postComment(repo, prNumber, probeComment(ranCommand, record, attempts, result, failing, log), token);
  journal.recordEvent("reviewed", {
   nodeId,
@@ -920,10 +922,13 @@ function leaseLost(owned: () => void): string {
  *
  * Each (map, probe) is filed under a cross-process lease (`fix-node-lock.ts`)
  * held from the record read to the record write, so two overlapping runs
- * do not both add (short of a holder suspended past its lease). A run that waits past FIX_NODE_LOCK_TIMEOUT_MS journals
+ * do not both add (short of a holder suspended past its lease). Up to
+ * FIX_NODE_FILING_CONCURRENCY probes file at once, each under its own lease,
+ * so the wait is the slowest probe, not the sum. A run that waits past FIX_NODE_LOCK_TIMEOUT_MS journals
  * the skip and leaves the probe to the holder, or, if the holder's add
- * failed, to the next confirmation. The lease is fenced before each add and
- * link, not after: a node that exists is recorded even when the lease was
+ * failed, to the next confirmation. The lease and the worker generation are
+ * fenced before each add and link (a superseded worker journals the stop and
+ * files no further probe), not after: a node that exists is recorded even when the lease was
  * lost during its write, and the note says so. An add that created its node
  * but left it unattached is recorded as such, and the next confirmation
  * links that node below the parent it was filed under instead of adding
@@ -937,6 +942,9 @@ function leaseLost(owned: () => void): string {
  * confirmation to duplicate. Never throws: certification and the inherited
  * verdict do not depend on it. Writes and reads run under the machine token.
  */
+/** Probes filed at once: each holds its own lease, so one slow add does not hold up the rest. */
+export const FIX_NODE_FILING_CONCURRENCY = 4;
+
 export async function fileBaseRedFixNodes(
  ctx: ImplementContext,
  base: Pick<BaseProbeResult, "sha" | "confirmed"> & { cached?: string[] },
@@ -946,7 +954,10 @@ export async function fileBaseRedFixNodes(
  const nodeId = ctx.node.ref.id;
  const graph = ctx.fixNode ?? machineFixNodeGraph(ctx);
  const note = (detail: string) => journal.recordEvent("reviewed", { nodeId, repo: map.repo, detail: detail.slice(0, 400) });
- for (const probe of [...base.confirmed, ...(base.cached ?? [])]) {
+ // A superseded worker files nothing more: the lease wait and the status read both await.
+ const fence = () => journal.assertGeneration(nodeId, map.repo, ctx.generation, "file a fix-the-base node");
+ let superseded = false;
+ const fileOne = async (probe: string) => {
   const key = baseRedFixKey(map, probe);
   try {
    await withFixNodeLock(journal, key, async (owned) => {
@@ -955,6 +966,7 @@ export async function fileBaseRedFixNodes(
     // Created but unattached: attach it where it was filed, never add a second.
     if (prior?.unattached !== undefined) {
      owned();
+     fence();
      await graph.link(prior.node, prior.unattached.parent);
      const { attached: _attached, parent: _parent, ...record } = JSON.parse(raw!) as Record<string, unknown>;
      journal.setHealth(key, JSON.stringify(record));
@@ -973,6 +985,7 @@ export async function fileBaseRedFixNodes(
     const checks = [...(cachedBaseChecks(journal, baseRedChecksKey(map.repo, base.sha, probe)) ?? [])].sort();
     const record = { sha: base.sha, detectedBy: nodeId, pr: pr.number };
     owned();
+    fence();
     try {
      const filed = await graph.add(nodeId, fixNodeSpec(ctx, probe, checks, base.sha, pr));
      journal.setHealth(key, JSON.stringify({ node: filed.node, ...record }));
@@ -985,14 +998,25 @@ export async function fileBaseRedFixNodes(
     }
    });
   } catch (error) {
+   if (error instanceof FencedError) {
+    superseded = true;
+    note(`fix-the-base filing for ${probe} at ${base.sha.slice(0, 8)} stopped: ${error.message}`);
+    return;
+   }
    if (error instanceof FixNodeLockBusy) {
     note(`fix-the-base filing for ${probe} at ${base.sha.slice(0, 8)} skipped: another run is filing it (${error.message})`);
-    continue;
+    return;
    }
    const unattached = error instanceof GraphAddUnattached ? ` — node #${error.node} is recorded and is attached below #${error.parent} the next time, not filed again` : "";
    note(`fix-the-base filing for ${probe} at ${base.sha.slice(0, 8)} failed (retried the next time it is found red at a merge base)${unattached}: ${error instanceof Error ? error.message : String(error)}`);
   }
- }
+ };
+ const probes = [...new Set([...base.confirmed, ...(base.cached ?? [])])];
+ let next = 0;
+ const lane = async () => {
+  while (!superseded && next < probes.length) await fileOne(probes[next++]);
+ };
+ await Promise.all(Array.from({ length: Math.min(FIX_NODE_FILING_CONCURRENCY, probes.length) }, lane));
 }
 
 /**
