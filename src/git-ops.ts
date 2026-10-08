@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { closeSync, constants, existsSync, fstatSync, openSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { runCmd, type RunResult } from "./exec.ts";
+import type { ForgeRef } from "./forge-ref.ts";
 
 /**
  * Git operations the SUPERVISOR performs in the canonical checkout and in
@@ -733,9 +734,29 @@ export async function assertGitUntouched(canonical: string, snapshot: string): P
 const CLOSING_KEYWORD =
  /\b(close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b[\s:]+(?:[\w.-]+\/[\w.-]+)?#\d+|\b(close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b[\s:]+https?:\/\/github\.com\/[^\s]+\/issues\/\d+/i;
 
-export function findClosingKeyword(text: string): string | null {
- const match = text.match(CLOSING_KEYWORD);
+/**
+ * GitLab's issue-closing grammar (node #128): a keyword stem, an optional
+ * `:` and spaces, an optional `issue`/`issues`, then a ref — `#N`,
+ * `path/with/groups#N`, or an issue or work-item URL on any host. The first
+ * ref is enough to refuse; GitLab's `, and` lists add nothing to the verdict.
+ */
+const GITLAB_CLOSING_KEYWORD =
+ /\b(?:clos(?:e|es|ed|ing)|fix(?:es|ed|ing)?|resolv(?:e|es|ed|ing)|implement(?:s|ed|ing)?)\b:?\s+(?:issues?\s+)?(?:(?:[\w.-]+\/)*[\w.-]*#\d+|https?:\/\/\S+?\/-\/(?:issues|work_items)\/\d+)/i;
+
+const CLOSING_PATTERNS: Record<ForgeRef["forge"], RegExp> = {
+ github: CLOSING_KEYWORD,
+ gitlab: GITLAB_CLOSING_KEYWORD,
+};
+
+/** The first text the forge would read as an issue-closing reference, or null. */
+export function findClosingKeyword(text: string, forge: ForgeRef["forge"]): string | null {
+ const match = text.match(CLOSING_PATTERNS[forge]);
  return match === null ? null : match[0];
+}
+
+/** The forge-neutral refusal, quoting the offending text. */
+export function closingKeywordRefusal(forge: ForgeRef["forge"], what: string, hit: string): string {
+ return `${what} carries a ${forge === "github" ? "GitHub" : "GitLab"} closing keyword ("${hit}") — a merge would auto-close the node and skip its close gate (#588)`;
 }
 
 export async function headSha(worktree: string): Promise<string> {
@@ -780,6 +801,7 @@ export async function commitsAhead(
 export async function assertNoClosingKeywords(
  worktree: string,
  base: string,
+ forge: ForgeRef["forge"],
 ): Promise<void> {
  const log = await safeGit(["log", `origin/${base}..HEAD`, "--format=%B"], {
   cwd: worktree,
@@ -788,12 +810,8 @@ export async function assertNoClosingKeywords(
  if (log.code !== 0) {
   throw new GitSafetyError(`cannot read branch commit messages: ${log.stderr.trim()}`);
  }
- const hit = findClosingKeyword(log.stdout);
- if (hit !== null) {
-  throw new GitSafetyError(
-   `a commit message carries a GitHub closing keyword ("${hit}") — a squash merge would auto-close the node and skip the close gate (#588). Refusing to push.`,
-  );
- }
+ const hit = findClosingKeyword(log.stdout, forge);
+ if (hit !== null) throw new GitSafetyError(`${closingKeywordRefusal(forge, "a commit message", hit)}. Refusing to push.`);
 }
 
 /**

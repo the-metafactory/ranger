@@ -18,6 +18,9 @@ import type { Journal, WorkerRow } from "./journal.ts";
 import { evaluateMergeGate, type MergeGateInput, type MergeGateResult } from "./merge-gate.ts";
 import type { IssueComment, ChangeRequest, CiVerdict, ForgePort } from "./forge.ts";
 import { CI_FAILED_PARK_OUTCOME, mergeGateFailedOutcome } from "./outcomes.ts";
+import { closingKeywordRefusal, findClosingKeyword } from "./git-ops.ts";
+import { squashTitle } from "./github.ts";
+import { parseForgeRef } from "./forge-ref.ts";
 
 /**
  * The merge desk (design §4/§5, #23): each tick, every implement-lane row
@@ -341,6 +344,14 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    if (row.mergeMessageId !== null) return; // its card is still up
   }
   if (map.autoMerge && !needsEye && superseded === null) {
+   // The live title is editable after the PR opened: guard the squash
+   // message ranger would write, not the one it opened with (node #128).
+   const forge = parseForgeRef(repo).forge;
+   const hit = findClosingKeyword(squashTitle(pr.title, pr.iid), forge);
+   if (hit !== null) {
+    await park(row, `${closingKeywordRefusal(forge, "the squash commit message", hit)}; retitle PR #${pr.iid} and merge it by hand`, title);
+    return;
+   }
    await github.mergePr(repo, pr.iid, gate.headSha, pr.title, token);
    journal.recordEvent("merged", {
     nodeId: row.nodeId,

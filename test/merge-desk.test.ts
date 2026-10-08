@@ -10,7 +10,7 @@ import { mergeGateNow, runMergeDesk } from "../src/merge-desk.ts";
 import { probeMarker, type ForgePort } from "../src/implement.ts";
 import type { IssueComment, ChangeRequest } from "../src/forge.ts";
 import type { CheckRun } from "../src/github.ts";
-import { mergeGateFailedOutcome, reviewCapOutcome } from "../src/outcomes.ts";
+import { CI_FAILED_PARK_OUTCOME, mergeGateFailedOutcome, reviewCapOutcome } from "../src/outcomes.ts";
 
 const GAME = "acme/seelite";
 const BOT = "ivy-bot";
@@ -26,7 +26,7 @@ const probes = (sha: string): IssueComment => ({
 });
 
 /** A forge with only the calls the merge desk may make; anything else throws. */
-function fakeGitHub(opts: { head?: string; comments: IssueComment[]; ci: CheckRun[]; labels?: string[]; merged?: boolean; onGetPr?: () => void }) {
+function fakeGitHub(opts: { head?: string; comments: IssueComment[]; ci: CheckRun[]; labels?: string[]; merged?: boolean; title?: string; onGetPr?: () => void }) {
  const calls: string[] = [];
  const merges: { n: number; sha: string }[] = [];
  const forbidden = (name: string) => async () => { throw new Error(`unexpected GitHub call: ${name}`); };
@@ -40,7 +40,7 @@ function fakeGitHub(opts: { head?: string; comments: IssueComment[]; ci: CheckRu
    calls.push("getPr");
    opts.onGetPr?.();
    return {
-    iid: number, state: opts.merged ? "merged" : "open", draft: false, title: "Repair the deploy step (node #96)",
+    iid: number, state: opts.merged ? "merged" : "open", draft: false, title: opts.title ?? "Repair the deploy step (node #96)",
     headRef: "node/96", headSha: opts.head ?? CERTIFIED, baseRef: "main",
     mergeState: "mergeable", mergeCommitSha: null, mergedBy: null, webUrl: "", author: BOT,
    } satisfies ChangeRequest;
@@ -198,6 +198,22 @@ describe("node #104 — ci-only-park-merges-without-lane: a CI-only park merges 
    const result = await r.desk(gh.github);
    expect(result.parked).toEqual(["96"]);
    expect(r.journal.getWorker("96", GAME)).toMatchObject({ status: "parked", outcome: CI_PARK });
+  } finally { r.close(); }
+ });
+});
+
+describe("node #128 — the squash commit message is guarded at merge time", () => {
+ test("a PR retitled with a closing keyword parks instead of merging, the offending text quoted", async () => {
+  const r = rig();
+  try {
+   r.journal.updateWorker("96", GAME, { status: "awaiting-merge", outcome: null });
+   const gh = fakeGitHub({ comments: [review(CERTIFIED)], ci: GREEN, title: "Repair the deploy step, fixes acme/seelite#96" });
+   const result = await r.desk(gh.github);
+   expect(result).toMatchObject({ merged: [], parked: ["96"], errors: [] });
+   expect(gh.calls).not.toContain("mergePr");
+   const outcome = r.journal.getWorker("96", GAME)?.outcome ?? "";
+   expect(outcome).toContain('the squash commit message carries a GitHub closing keyword ("fixes acme/seelite#96")');
+   expect(outcome).not.toMatch(CI_FAILED_PARK_OUTCOME);
   } finally { r.close(); }
  });
 });

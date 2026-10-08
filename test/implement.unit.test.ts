@@ -119,18 +119,54 @@ describe("sage verdict block (sage#83 contract)", () => {
  });
 });
 
-describe("closing keywords (#588 fail-open path)", () => {
- test.each([
-  "closes #12",
-  "Fixes #3",
-  "resolved: #9",
-  "fix acme/widgets#4",
-  "Closes https://github.com/acme/widgets/issues/5",
- ])("finds %p", (text) => {
-  expect(findClosingKeyword(`feat: thing\n\n${text}`)).not.toBeNull();
- });
- test.each(["node #12", "fixed the flaky test", "see #12", "closer to #3 than before"])("ignores %p", (text) => {
-  expect(findClosingKeyword(text)).toBeNull();
+describe("closing keywords (#588 fail-open path, node #128 per forge)", () => {
+ // [text, GitHub hit, GitLab hit]: null where the forge reads no closing reference.
+ const table: [string, string | null, string | null][] = [
+  ["closes #12", "closes #12", "closes #12"],
+  ["Fixes #3", "Fixes #3", "Fixes #3"],
+  ["resolved: #9", "resolved: #9", "resolved: #9"],
+  ["fix acme/widgets#4", "fix acme/widgets#4", "fix acme/widgets#4"],
+  ["Closes https://github.com/acme/widgets/issues/5", "Closes https://github.com/acme/widgets/issues/5", null],
+  // GitLab's grammar: every inflection, nested groups, issue and work-item URLs.
+  ["Implements #12", null, "Implements #12"],
+  ["closing claw/crisis-simulator#12", null, "closing claw/crisis-simulator#12"],
+  [
+   "Fixes: https://gitlab.software.geant.org/claw/crisis-simulator/-/issues/12",
+   null,
+   "Fixes: https://gitlab.software.geant.org/claw/crisis-simulator/-/issues/12",
+  ],
+  ["Resolving issue #7", null, "Resolving issue #7"],
+  ["implementing issues group/sub/project#8", null, "implementing issues group/sub/project#8"],
+  ["IMPLEMENTED https://gitlab.example.org/g/p/-/work_items/9", null, "IMPLEMENTED https://gitlab.example.org/g/p/-/work_items/9"],
+  ["fixing project#10", null, "fixing project#10"],
+  ["Closed #11", "Closed #11", "Closed #11"],
+  // Neither forge reads these.
+  ["node #12", null, null],
+  ["fixed the flaky test", null, null],
+  ["see #12", null, null],
+  ["closer to #3 than before", null, null],
+  ["prefix #3", null, null],
+  ["unresolved #4", null, null],
+  ["Ranger closes the node after the merge", null, null],
+  ["fixtures/x#12", null, null],
+  ["Fixes https://gitlab.example.org/g/p/-/merge_requests/12", null, null],
+  ["Implemented by ranger's implement lane in MR !12 (https://gitlab.example.org/g/p/-/merge_requests/12)", null, null],
+ ];
+ for (const forge of ["github", "gitlab"] as const) {
+  test.each(table)(`${forge}: %p`, (text, github, gitlab) => {
+   const want = forge === "github" ? github : gitlab;
+   expect(findClosingKeyword(`feat: thing\n\n${text}`, forge)).toBe(want);
+  });
+ }
+ test("ranger's own GitLab-shaped PR prose passes the GitLab guard", () => {
+  const prose = [
+   "Implements orienteer node gitlab:gitlab.example.org/g/p #128: Refuse closing references (node #128)",
+   "Draft by ranger's implement lane for orienteer node gitlab:gitlab.example.org/g/p #128.",
+   "Squash-merge keeps one commit per node. The node is not referenced with a closing keyword on purpose: the close goes through the graph's gate.",
+   "Ranger closes the node after the merge, through its declared probes and this PR's CI run.",
+   "Refuse closing references (node #128) (#12)",
+  ].join("\n");
+  expect(findClosingKeyword(prose, "gitlab")).toBeNull();
  });
 });
 

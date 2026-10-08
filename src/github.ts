@@ -209,6 +209,11 @@ export async function markReady(
  );
 }
 
+/** The squash commit title ranger sends — the exact text the merge desk guards (node #128). */
+export function squashTitle(title: string, number: number): string {
+ return `${title} (#${number})`;
+}
+
 /**
  * Squash-merge a PR, pinned to the head SHA the gate passed: GitHub refuses
  * the merge if the head moved in between (409), so ranger never merges a
@@ -232,7 +237,7 @@ export async function mergePr(
    "-f",
    `sha=${sha}`,
    "-f",
-   `commit_title=${title} (#${number})`,
+   `commit_title=${squashTitle(title, number)}`,
   ],
   `merge PR #${number}`,
  );
