@@ -125,6 +125,8 @@ export interface RunNodeContext {
  hostLoad?: ImplementContext["hostLoad"];
  quietHost?: ImplementContext["quietHost"];
  announce?: ImplementContext["announce"];
+ /** Fix-the-base node filing (node #152); tests inject a fake graph port. */
+ fixNode?: ImplementContext["fixNode"];
  mergeablePoll?: ImplementContext["mergeablePoll"];
 }
 
@@ -643,6 +645,7 @@ async function runImplementNode(
   hostLoad: ctx.hostLoad,
   quietHost: ctx.quietHost,
   announce: ctx.announce,
+  fixNode: ctx.fixNode,
   mergeablePoll: ctx.mergeablePoll,
   substrateReaders: resolveReaders(ctx),
  };

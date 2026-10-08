@@ -368,22 +368,51 @@ export function leaseOwnedCheck(
   };
 }
 
+/**
+ * Hold an announce-once lease around `fn`: acquire (waiting up to
+ * `timeoutMs`, `contended` naming the refusal), renew it while `fn` runs,
+ * hand `fn` the owned fence (`lost` names a lost lease), and release only
+ * our own lock, `lostMessage` on stderr if it was lost. Each lock keeps its
+ * own paths, errors and messages in its wrapper.
+ */
+export async function withOwnedLease<T>(
+  lockFile: string,
+  opts: {
+    timeoutMs?: number;
+    contended?: () => Error;
+    lost: (why: string) => Error;
+    rejectExpired?: boolean;
+    lostMessage?: string;
+  },
+  fn: (owned: OwnedCheck) => Promise<T>,
+): Promise<T> {
+  const lease = await acquireLease(lockFile, `${lockFile}.reclaiming`, {
+    timeoutMs: opts.timeoutMs,
+    contended: opts.contended,
+  });
+  const { heartbeat, lostOwnership } = startHeartbeat(lease);
+  const owned = leaseOwnedCheck(lease, lostOwnership, opts.lost, {
+    rejectExpired: opts.rejectExpired,
+  });
+  try {
+    return await fn(owned);
+  } finally {
+    releaseLease(lease, heartbeat, lostOwnership, opts.lostMessage);
+  }
+}
+
 export async function withEscalateLock<T>(
   journal: Journal,
   fn: (owned: OwnedCheck) => Promise<T>,
 ): Promise<T> {
-  const lockFile = join(dirname(journal.path), ".escalate.lock");
-  const reclaimMarker = `${lockFile}.reclaiming`;
-  const lease = await acquireLease(lockFile, reclaimMarker);
-  const { heartbeat, lostOwnership } = startHeartbeat(lease);
-  const owned = leaseOwnedCheck(lease, lostOwnership, (why) =>
-    why === "another run owns the lock"
-      ? new LeaseLostError("announce-once lease lost: another run owns the desk")
-      : new LeaseLostError(`announce-once lease lost: ${why}`),
+  return withOwnedLease(
+    join(dirname(journal.path), ".escalate.lock"),
+    {
+      lost: (why) =>
+        why === "another run owns the lock"
+          ? new LeaseLostError("announce-once lease lost: another run owns the desk")
+          : new LeaseLostError(`announce-once lease lost: ${why}`),
+    },
+    fn,
   );
-  try {
-    return await fn(owned);
-  } finally {
-    releaseLease(lease, heartbeat, lostOwnership);
-  }
 }

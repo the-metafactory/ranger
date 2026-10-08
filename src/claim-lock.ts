@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { Journal } from "./journal.ts";
-import { acquireLease, leaseOwnedCheck, type OwnedCheck, releaseLease, startHeartbeat } from "./lock.ts";
+import { type OwnedCheck, withOwnedLease } from "./lock.ts";
 
 /**
  * The claim lock (node #58): one cross-process lease that the walk and
@@ -71,26 +71,17 @@ export async function withClaimLock<T>(
  timeoutMs = CLAIM_LOCK_TIMEOUT_MS,
 ): Promise<T> {
  const lockFile = claimLockFile(journal);
- const lease = await acquireLease(lockFile, `${lockFile}.reclaiming`, {
-  timeoutMs,
-  contended: () =>
-   new ClaimLockBusy(`another claim holds the claim lock (${lockFile}) for over ${Math.round(timeoutMs / 1000)} s`),
- });
- const { heartbeat, lostOwnership } = startHeartbeat(lease);
- const owned = leaseOwnedCheck(
-  lease,
-  lostOwnership,
-  (why) => new ClaimLeaseLost(`claim lock lost mid-claim (${why}) — stopped before the next write`),
-  { rejectExpired: true },
+ return withOwnedLease(
+  lockFile,
+  {
+   timeoutMs,
+   contended: () =>
+    new ClaimLockBusy(`another claim holds the claim lock (${lockFile}) for over ${Math.round(timeoutMs / 1000)} s`),
+   lost: (why) => new ClaimLeaseLost(`claim lock lost mid-claim (${why}) — stopped before the next write`),
+   rejectExpired: true,
+   lostMessage:
+    "[claim] claim lock was lost mid-claim (lease expired >60s) — the claim stopped at its next write; check for a write made before it",
+  },
+  fn,
  );
- try {
-  return await fn(owned);
- } finally {
-  releaseLease(
-   lease,
-   heartbeat,
-   lostOwnership,
-   "[claim] claim lock was lost mid-claim (lease expired >60s) — the claim stopped at its next write; check for a write made before it",
-  );
- }
 }

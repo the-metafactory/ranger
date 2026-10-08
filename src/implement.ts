@@ -41,8 +41,9 @@ import {
 import { GRAPH_CALL_TIMEOUT_MS, graphNode, somaRepo, type NodeResult } from "./graph.ts";
 import { finishClosedElsewhere } from "./closed-elsewhere.ts";
 import { budgetedRead, budgetPolicy } from "./budget.ts";
-import { graphClose, graphDecisions, type CloseResult } from "./graph-write.ts";
-import type { ImplementPhase, Journal } from "./journal.ts";
+import { GraphAddUnattached, graphAdd, graphClose, graphDecisions, graphLink, type AddSpec, type CloseResult } from "./graph-write.ts";
+import { FixNodeLockBusy, withFixNodeLock } from "./fix-node-lock.ts";
+import { FencedError, type ImplementPhase, type Journal } from "./journal.ts";
 import { assembleImplementPrompt } from "./prompt.ts";
 import { ReviewError, sageReview, type ReviewVerdict } from "./review.ts";
 import {
@@ -147,6 +148,18 @@ export interface ImplementContext {
  mergeablePoll?: { pollMs: number; attempts: number };
  /** Posts to the map's channel (the base-red notice); tests capture it. */
  announce?: (text: string) => Promise<unknown>;
+ /** Files and reads fix-the-base nodes (node #152); default is `soma graph` under the machine token. */
+ fixNode?: FixNodeGraph;
+}
+
+/** The graph port the fix-the-base filer writes and reads through (node #152). */
+export interface FixNodeGraph {
+ /** Throws `GraphAddUnattached` when the node was created but not attached. */
+ add(parent: string, spec: AddSpec): Promise<{ node: string }>;
+ /** Attach an existing node below `parent` (the repair for an unattached add). */
+ link(node: string, parent: string): Promise<void>;
+ /** The node's status ("open", "closed"). */
+ status(id: string): Promise<string>;
 }
 
 export interface ImplementOutcome {
@@ -485,10 +498,17 @@ async function probeFinalHead(
  };
  if (baseRed !== undefined) await announceBaseRed(ctx, base!.sha, record);
  ctx.journal.assertGeneration(nodeId, ctx.map.repo, ctx.generation, "post the probe record");
+ // Before the park: a probe confirmed red at base is the base's, whatever else this branch broke.
+ // A cache hit counts too: another map on this base, or an earlier failed add, files here.
+ if (base !== null && base.confirmed.length + base.cached.length > 0) {
+  await fileBaseRedFixNodes(ctx, base, { number: prNumber, url: live.webUrl || `https://github.com/${repo}/pull/${prNumber}` });
+ }
  // Named failures lead the record, the event and the park: an output tail can hold only passing probes.
  const failing = probeFailureSummary(result.stdout, result.code);
  // Named only when every run here (both attempts, the merge base's) was written.
  const log = logFailureCount(ctx) === logFailuresBefore ? basename(workerLogFile(journal.path, repo, nodeId, ctx.generation)) : null;
+ // Again after the filing: its lease wait and graph writes can outlast this worker's generation.
+ ctx.journal.assertGeneration(nodeId, ctx.map.repo, ctx.generation, "post the probe record");
  await github.postComment(repo, prNumber, probeComment(ranCommand, record, attempts, result, failing, log), token);
  journal.recordEvent("reviewed", {
   nodeId,
@@ -565,6 +585,8 @@ export interface BaseProbeResult {
  cached: string[];
  /** First-run inherited probes whose confirmation did not repeat identical assertions; not cached. */
  unconfirmed: string[];
+ /** Probes this comparison confirmed and wrote to the cache; with `cached`, the probes that may file a fix-the-base node. */
+ confirmed: string[];
  confirmationExit?: number;
  /** Failed probes that fail at the merge base too, but not the same way (another check, or a crash), so they gate. */
  differs: string[];
@@ -728,7 +750,7 @@ export async function probeMergeBase(
   else if (coversChecks(headChecks.get(probe)!.checks, checks)) cached.push(probe);
   else differs.push(probe);
  }
- const known: BaseProbeResult = { sha, red: [...cached], cached, unconfirmed: [], differs, passed: [], changed, uncomparable, unresolved: fresh };
+ const known: BaseProbeResult = { sha, red: [...cached], cached, unconfirmed: [], confirmed: [], differs, passed: [], changed, uncomparable, unresolved: fresh };
  if (fresh.length === 0 || template === undefined) return known;
  const scratch = mkdtempSync(join(tmpdir(), "ranger-probe-base-"));
  const dir = join(scratch, "worktree");
@@ -764,7 +786,8 @@ export async function probeMergeBase(
   };
   if (red.length > 0) {
    // Confirmation uses this worktree without another quiet-host wait.
-   return { ...result, ...await confirmBaseRed(ctx, dir, sha, red, baseChecks) };
+   const confirmation = await confirmBaseRed(ctx, dir, sha, red, baseChecks);
+   return { ...result, ...confirmation, confirmed: red.filter((n) => !confirmation.unconfirmed.includes(n)) };
   }
   return result;
  } finally {
@@ -796,6 +819,205 @@ async function announceBaseRed(ctx: ImplementContext, sha: string, probe: Record
  } catch {
   /* best effort: the next node off this base tries again */
  }
+}
+
+/** The journal's record of a map's fix-the-base node for one probe (node #152). */
+export function baseRedFixKey(map: { repo: string; root: number }, probe: string): string {
+ return `base-red-fix.${mapKey(map)}.${probe}`;
+}
+
+interface FixRecord {
+ node: string;
+ sha?: string;
+ /** Set while the node exists but is not attached below `parent`. */
+ unattached?: { parent: string };
+}
+
+function fixRecord(value: string | null): FixRecord | null {
+ if (value === null) return null;
+ try {
+  const record = JSON.parse(value) as { node?: unknown; sha?: unknown; attached?: unknown; parent?: unknown } | null;
+  const node = record?.node;
+  if (typeof node !== "string" || node.length === 0) return null;
+  const parsed: FixRecord = { node };
+  if (typeof record?.sha === "string") parsed.sha = record.sha;
+  if (record?.attached === false && typeof record.parent === "string") parsed.unattached = { parent: record.parent };
+  return parsed;
+ } catch {
+  return null;
+ }
+}
+
+function machineFixNodeGraph(ctx: ImplementContext): FixNodeGraph {
+ const repo = ctx.map.repo;
+ const credential = { token: ctx.token, source: "write-token" };
+ return {
+  add: (parent, spec) => graphAdd(repo, parent, spec, ctx.token, { timeoutMs: GRAPH_CALL_TIMEOUT_MS }),
+  link: (node, parent) => graphLink(repo, node, parent, ctx.token, { timeoutMs: GRAPH_CALL_TIMEOUT_MS }),
+  status: async (id) => (await budgetedRead(ctx.journal, repo, credential, budgetPolicy(ctx.config), new Date(),
+   () => graphNode(repo, id, credential, { timeoutMs: GRAPH_CALL_TIMEOUT_MS }))).status,
+ };
+}
+
+/** A checkpoint id from the probe's stem and the base it was red at. */
+function fixCheckpoint(probe: string, sha: string): string {
+ const stem = probe.replace(/\.[^.]+$/, "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+ return `base-green-${stem}-${sha.slice(0, 8)}`;
+}
+
+function fixNodeSpec(ctx: ImplementContext, probe: string, checks: string[], sha: string, pr: { number: number; url: string }): AddSpec {
+ const base = ctx.map.base;
+ return {
+  title: `Make ${probe} pass on ${base} again`,
+  autonomy: "propose",
+  kind: "build",
+  labels: ["orienteer:build"],
+  checkpoint: fixCheckpoint(probe, sha),
+  body: [
+   "## Deliverable",
+   "",
+   `\`${probe}\` passes on \`${base}\` again.`,
+   "",
+   "## Found by probe",
+   "",
+   `Node #${ctx.node.ref.id} failed \`${probe}\` at its head, and two runs at its merge base \`${sha.slice(0, 8)}\` failed the same checks: the failure was the base's, not the branch's. Later PRs off that merge base inherit these checks from ranger's cache instead of gating on them. The runs were at the merge base, not at \`${base}\`'s tip, which may have moved since. Ranger filed this node.`,
+   "",
+   `- Probe: \`${probe}\``,
+   `- Merge base: \`${sha}\``,
+   `- Detected by: node #${ctx.node.ref.id}, PR #${pr.number} (${pr.url})`,
+   "- Failing checks at the merge base:",
+   "",
+   "```",
+   ...checks.map((check) => check.replaceAll("`", "'")),
+   "```",
+   "",
+   "## Acceptance criteria",
+   "",
+   `- Given \`${base}\` with the fix, when \`${probe}\` runs, then every check above passes.`,
+   "",
+   "## Out of scope",
+   "",
+   "- Ranger does not close this node when the probe goes green.",
+  ].join("\n"),
+ };
+}
+
+/** The note's suffix when the filing lock was lost while a write ran. */
+function leaseLost(owned: () => void): string {
+ try {
+  owned();
+  return "";
+ } catch {
+  return " (the filing lock was lost during the write; recorded anyway, check for a duplicate fix node)";
+ }
+}
+
+/**
+ * The narrow found-by-probe filer (node #109's ruling, ahead of the Scribe):
+ * a probe confirmed red at the merge base, by this comparison or by the
+ * cache, files one `propose` build node below the detecting node. The map's
+ * record skips a probe already filed for this merge base (open or closed,
+ * without a read), and a probe whose fix node from an earlier base is still
+ * open. The cache hit is what lets a second map on the same base file its
+ * own node.
+ *
+ * Each (map, probe) is filed under a cross-process lease (`fix-node-lock.ts`)
+ * held from the record read to the record write, so two overlapping runs
+ * do not both add (short of a holder suspended past its lease). Up to
+ * FIX_NODE_FILING_CONCURRENCY probes file at once, each under its own lease,
+ * so the wait is the slowest probe, not the sum. A run that waits past FIX_NODE_LOCK_TIMEOUT_MS journals
+ * the skip and leaves the probe to the holder, or, if the holder's add
+ * failed, to the next confirmation. The lease and the worker generation are
+ * fenced before each add and link (a superseded worker journals the stop and
+ * files no further probe), not after: a node that exists is recorded even when the lease was
+ * lost during its write, and the note says so. An add that created its node
+ * but left it unattached is recorded as such, and the next confirmation
+ * links that node below the parent it was filed under instead of adding
+ * another. Any other failed add (or failed status read or link) is
+ * journalled and retried the next time the probe is found red at a merge
+ * base.
+ *
+ * Two windows are left: a run that dies between a successful add and its
+ * record write, and an add killed or timed out with no payload (the node id
+ * is unknown). Either can leave one untracked node for the next
+ * confirmation to duplicate. Never throws: certification and the inherited
+ * verdict do not depend on it. Writes and reads run under the machine token.
+ */
+/** Probes filed at once: each holds its own lease, so one slow add does not hold up the rest. */
+export const FIX_NODE_FILING_CONCURRENCY = 4;
+
+export async function fileBaseRedFixNodes(
+ ctx: ImplementContext,
+ base: Pick<BaseProbeResult, "sha" | "confirmed"> & { cached?: string[] },
+ pr: { number: number; url: string },
+): Promise<void> {
+ const { journal, map } = ctx;
+ const nodeId = ctx.node.ref.id;
+ const graph = ctx.fixNode ?? machineFixNodeGraph(ctx);
+ const note = (detail: string) => journal.recordEvent("reviewed", { nodeId, repo: map.repo, detail: detail.slice(0, 400) });
+ // A superseded worker files nothing more: the lease wait and the status read both await.
+ const fence = () => journal.assertGeneration(nodeId, map.repo, ctx.generation, "file a fix-the-base node");
+ let superseded = false;
+ const fileOne = async (probe: string) => {
+  const key = baseRedFixKey(map, probe);
+  try {
+   await withFixNodeLock(journal, key, async (owned) => {
+    const raw = journal.getHealth(key);
+    const prior = fixRecord(raw);
+    // Created but unattached: attach it where it was filed, never add a second.
+    if (prior?.unattached !== undefined) {
+     owned();
+     fence();
+     await graph.link(prior.node, prior.unattached.parent);
+     const { attached: _attached, parent: _parent, ...record } = JSON.parse(raw!) as Record<string, unknown>;
+     journal.setHealth(key, JSON.stringify(record));
+     note(`attached fix-the-base node #${prior.node} for ${probe} below #${prior.unattached.parent}${leaseLost(owned)}`);
+     return;
+    }
+    // Filed for this merge base already: a closed node there means the fix landed after it.
+    if (prior?.sha === base.sha) return;
+    if (prior !== null) {
+     const status = await graph.status(prior.node);
+     if (status !== "closed") {
+      note(`fix-the-base node #${prior.node} for ${probe} is ${status} — not filing another`);
+      return;
+     }
+    }
+    const checks = [...(cachedBaseChecks(journal, baseRedChecksKey(map.repo, base.sha, probe)) ?? [])].sort();
+    const record = { sha: base.sha, detectedBy: nodeId, pr: pr.number };
+    owned();
+    fence();
+    try {
+     const filed = await graph.add(nodeId, fixNodeSpec(ctx, probe, checks, base.sha, pr));
+     journal.setHealth(key, JSON.stringify({ node: filed.node, ...record }));
+     note(`filed fix-the-base node #${filed.node} below #${nodeId}: ${probe} red at the merge base ${base.sha.slice(0, 8)}${leaseLost(owned)}`);
+    } catch (error) {
+     if (error instanceof GraphAddUnattached) {
+      journal.setHealth(key, JSON.stringify({ node: error.node, ...record, attached: false, parent: nodeId }));
+     }
+     throw error;
+    }
+   });
+  } catch (error) {
+   if (error instanceof FencedError) {
+    superseded = true;
+    note(`fix-the-base filing for ${probe} at ${base.sha.slice(0, 8)} stopped: ${error.message}`);
+    return;
+   }
+   if (error instanceof FixNodeLockBusy) {
+    note(`fix-the-base filing for ${probe} at ${base.sha.slice(0, 8)} skipped: another run is filing it (${error.message})`);
+    return;
+   }
+   const unattached = error instanceof GraphAddUnattached ? ` — node #${error.node} is recorded and is attached below #${error.parent} the next time, not filed again` : "";
+   note(`fix-the-base filing for ${probe} at ${base.sha.slice(0, 8)} failed (retried the next time it is found red at a merge base)${unattached}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+ };
+ const probes = [...new Set([...base.confirmed, ...(base.cached ?? [])])];
+ let next = 0;
+ const lane = async () => {
+  while (!superseded && next < probes.length) await fileOne(probes[next++]);
+ };
+ await Promise.all(Array.from({ length: Math.min(FIX_NODE_FILING_CONCURRENCY, probes.length) }, lane));
 }
 
 /**
