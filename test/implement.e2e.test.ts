@@ -28,9 +28,10 @@ import { sweepMap } from "../src/sweep.ts";
 import { bootstrapWorktree, runNode, type RunNodeContext } from "../src/worker.ts";
 import { keyLabel } from "../src/git-ops.ts";
 import { trustCurrentGitState } from "../src/git-trust.ts";
-import { baseConfigLines, createCanonicalRepo, GIT_ENV, takesRawByteNames } from "./support.ts";
+import { baseConfigLines, createCanonicalRepo, fakeDiscord, GIT_ENV, takesRawByteNames } from "./support.ts";
 import { saveViewsRecord, viewsDirectory } from "../src/views.ts";
 import { DiscordAnnouncer } from "../src/announce.ts";
+import { EscalationDiscord } from "../src/discord.ts";
 import { workerLogFile } from "../src/worker-log.ts";
 import type { TestBackend, TestRequest } from "../src/remote-test/supervisor-backend.ts";
 import type { RemoteTestJob, RemoteTestStatus } from "../src/remote-test/contract.ts";
@@ -998,6 +999,177 @@ describe("implement lane (node #23)", () => {
   expect(r.journal.listEvents().some((e) => e.kind === "transient")).toBe(true);
   // The pushed work and the PR survive for the respawn to pick up.
   expect(r.github.prs.size).toBe(1);
+ }, 60_000);
+
+ for (const startStatus of ["resume", "failed", "parked", "awaiting-merge"] as const) {
+  const viaSweep = startStatus !== "resume";
+  for (const prState of ["merged", "open", "closed"] as const) {
+   test(`closed elsewhere: ${viaSweep ? `sweep ${startStatus} row` : "resume close"} with ${prState} PR finishes without graphClose`, async () => {
+    const r = await rig({}); cleanup.push(r.dir);
+    expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+    if (prState === "merged") await r.github.merge(1);
+    else if (prState === "closed") r.github.prs.get(1)!.state = "closed";
+    const file = join(r.dir, "data", "acme__widgets-node-20.json");
+    const node = JSON.parse(readFileSync(file, "utf8"));
+    node.status = "closed";
+    node.node.completion = { closer: "jcfischer", receiptCommentId: "900", closedAt: new Date().toISOString() };
+    writeFileSync(file, JSON.stringify(node));
+    r.journal.updateWorker("20", "acme/widgets", { status: startStatus === "resume" ? "failed" : startStatus, phase: "close", outcome: "HTTP 500" });
+    if (startStatus === "failed" && prState === "merged") r.journal.updateWorker("20", "acme/widgets", { prNumber: null });
+    const callsFile = join(r.dir, "graph-calls"); process.env.FAKE_SOMA_CALLS = callsFile;
+    const ci = spyOn(r.github, "ciVerdictFor").mockImplementation(async () => { throw new Error("HTTP 500"); });
+    try {
+     if (viaSweep) {
+      await sweepMap({ ...r.ctx, phase: "liveness", respawn: async () => { throw new Error("must not spawn"); } });
+     } else {
+      expect((await runNode("20", r.ctx)).status).toBe(prState === "merged" ? "success" : "released");
+     }
+     expect(r.journal.getWorker("20", "acme/widgets")).toMatchObject({ status: prState === "merged" ? "success" : "released", pid: null, workerPgid: null });
+     expect(r.journal.getWorker("20", "acme/widgets")?.finishedAt).not.toBeNull();
+     expect(readFileSync(callsFile, "utf8")).not.toContain("close acme/widgets");
+     expect(ci).not.toHaveBeenCalled();
+     const events = r.journal.listEvents("acme/widgets", 500).filter(e => e.kind === "closed-elsewhere");
+     expect(events).toHaveLength(1);
+     expect(events[0]?.detail).toContain("jcfischer");
+     expect(events[0]?.detail).toContain("https://github.com/acme/widgets/issues/20#issuecomment-900");
+     if (prState === "merged") expect(existsSync(join(r.canonical, ".worktrees", "node-20"))).toBe(false);
+    } finally { ci.mockRestore(); }
+   }, 60_000);
+  }
+ }
+
+ test.each(["resume", "sweep"])("closed research node discovers its merged PR without a recorded number via %s", async via => {
+  const r = await rig({}); cleanup.push(r.dir);
+  const branch = "research/api-survey";
+  const worktree = await bootstrapWorktree(r.canonical, "20", "api-survey", r.ctx.token, branch);
+  expect((await runCmd("git", ["push", "origin", branch], { cwd: worktree })).code).toBe(0);
+  await r.github.createDraftPr("acme/widgets", { head: branch, base: "main", title: "Survey API", body: "Findings" });
+  await r.github.merge(1);
+  const file = join(r.dir, "data", "acme__widgets-node-20.json");
+  const node = JSON.parse(readFileSync(file, "utf8"));
+  node.status = "closed"; node.node.kind = "research";
+  node.node.probes = [{ type: "git-ref-exists", ref: branch }];
+  node.node.completion = { closer: "jcfischer", receiptCommentId: "900", closedAt: new Date().toISOString() };
+  writeFileSync(file, JSON.stringify(node));
+  r.journal.updateWorker("20", "acme/widgets", { status: "failed", phase: "close", lane: "research", worktree, prNumber: null });
+  const calls = join(r.dir, "graph-calls"); process.env.FAKE_SOMA_CALLS = calls;
+  r.ctx.worker = async () => { throw new Error("must not start another research session"); };
+  if (via === "resume") expect((await runNode("20", r.ctx)).status).toBe("success");
+  else await sweepMap({ ...r.ctx, phase: "liveness" });
+  expect(r.journal.getWorker("20", "acme/widgets")).toMatchObject({ status: "success", worktree: null });
+  expect(existsSync(worktree)).toBe(false);
+  expect(readFileSync(calls, "utf8")).not.toContain("close acme/widgets");
+ }, 60_000);
+
+ test.each(["resume", "sweep"])("recovers ranger's own graph close honestly via %s", async via => {
+  const r = await rig({}); cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  await r.github.merge(1);
+  const file = join(r.dir, "data", "acme__widgets-node-20.json");
+  const node = JSON.parse(readFileSync(file, "utf8")); node.status = "closed";
+  node.node.completion = { closer: BOT, receiptCommentId: "901", closedAt: new Date().toISOString() };
+  writeFileSync(file, JSON.stringify(node));
+  r.journal.updateWorker("20", "acme/widgets", { status: "failed", phase: "close" });
+  const calls = join(r.dir, "calls"); process.env.FAKE_SOMA_CALLS = calls;
+  if (via === "resume") expect((await runNode("20", r.ctx)).status).toBe("success");
+  else await sweepMap({ ...r.ctx, phase: "liveness" });
+  expect(r.journal.getWorker("20", "acme/widgets")?.status).toBe("success");
+  expect(r.journal.listEvents("acme/widgets", 500).some(e => e.kind === "closed-elsewhere")).toBe(false);
+  expect(r.journal.listEvents("acme/widgets", 500).find(e => e.kind === "closed")?.detail).toContain(`recovered ranger close by ${BOT}`);
+  expect(readFileSync(calls, "utf8")).not.toContain("close acme/widgets");
+  expect(existsSync(join(r.canonical, ".worktrees", "node-20"))).toBe(false);
+ }, 60_000);
+
+ test.each([undefined, "jcfischer", BOT])("close phase re-reads closure before CI and preserves external deadman (closer %s)", async closer => {
+  const r = await rig({}); cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  await r.github.merge(1);
+  r.journal.bumpDeadman(); r.journal.bumpDeadman();
+  const file = join(r.dir, "data", "acme__widgets-node-20.json");
+  const getPr = r.github.getPr.bind(r.github);
+  const prSpy = spyOn(r.github, "getPr").mockImplementation(async (...args) => {
+   const node = JSON.parse(readFileSync(file, "utf8")); node.status = "closed";
+   if (closer !== undefined) node.node.completion = { closer, receiptCommentId: "900", closedAt: new Date().toISOString() };
+   writeFileSync(file, JSON.stringify(node));
+   return getPr(...args);
+  });
+  const ciSpy = spyOn(r.github, "ciVerdictFor").mockImplementation(async () => { throw new Error("HTTP 500"); });
+  const callsFile = join(r.dir, "calls"); process.env.FAKE_SOMA_CALLS = callsFile;
+  try {
+   expect((await runNode("20", r.ctx)).status).toBe("success");
+   expect(ciSpy).not.toHaveBeenCalled();
+   expect(r.journal.deadmanCount()).toBe(closer === BOT ? 0 : 2);
+   expect(readFileSync(callsFile, "utf8")).not.toContain("close acme/widgets");
+  } finally { prSpy.mockRestore(); ciSpy.mockRestore(); }
+ }, 60_000);
+
+ test("close-phase budget deferral records failed and allows sweep recovery without a deadman failure", async () => {
+  const r = await rig({}); cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  await r.github.merge(1);
+  process.env.FAKE_GH_GRAPHQL_REMAINING = "0";
+  r.journal.bumpDeadman();
+  const ci = spyOn(r.github, "ciVerdictFor").mockImplementation(async () => { throw new Error("must defer before CI"); });
+  try {
+   const outcome = await runNode("20", r.ctx);
+   expect(outcome.status).toBe("failed");
+   expect(outcome.detail).toContain("GraphQL");
+   expect(r.journal.getWorker("20", "acme/widgets")).toMatchObject({
+    status: "failed", phase: "close", pid: null, workerPgid: null, outcome: outcome.detail,
+   });
+   expect(r.journal.getWorker("20", "acme/widgets")?.finishedAt).not.toBeNull();
+   expect(r.journal.deadmanCount()).toBe(1);
+   expect(ci).not.toHaveBeenCalled();
+   delete process.env.FAKE_GH_GRAPHQL_REMAINING;
+   const cooldown = JSON.parse(r.journal.getHealth("ratelimit:write-token")!);
+   cooldown.until = new Date(Date.now() - 1).toISOString();
+   r.journal.setHealth("ratelimit:write-token", JSON.stringify(cooldown));
+   const file = join(r.dir, "data", "acme__widgets-node-20.json");
+   const node = JSON.parse(readFileSync(file, "utf8")); node.status = "closed";
+   node.node.completion = { closer: "jcfischer", receiptCommentId: "900", closedAt: new Date().toISOString() };
+   writeFileSync(file, JSON.stringify(node));
+   await sweepMap({ ...r.ctx, phase: "liveness" });
+   expect(r.journal.getWorker("20", "acme/widgets")?.status).toBe("success");
+   expect(r.journal.deadmanCount()).toBe(1);
+   expect(ci).not.toHaveBeenCalled();
+  } finally { ci.mockRestore(); }
+ }, 60_000);
+
+ test.each([false, true])("sweep finishes a failed worker and closes its escalation card exactly once (Discord outage: %s)", async deferCard => {
+  const r = await rig({}); cleanup.push(r.dir);
+  const discord = fakeDiscord();
+  try {
+   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+   await r.github.merge(1);
+   const file = join(r.dir, "data", "acme__widgets-node-20.json");
+   const node = JSON.parse(readFileSync(file, "utf8")); node.status = "closed";
+   node.node.completion = { closer: "jcfischer", receiptCommentId: "900", closedAt: new Date().toISOString() };
+   writeFileSync(file, JSON.stringify(node));
+   process.env.RANGER_DISCORD_TOKEN = "fake-token";
+   process.env.RANGER_DISCORD_API_BASE = `http://127.0.0.1:${discord.port}`;
+   process.env.RANGER_DISCORD_ALLOW_TEST_OVERRIDE = "1";
+   process.env.RANGER_DISCORD_MIN_INTERVAL_MS = "1";
+   r.journal.upsertEscalation({ key: "acme/widgets:20", repo: "acme/widgets", root: 1, nodeId: "20", title: "Feature", channelId: r.ctx.map.discord!.channelId,
+    messageId: "existing-card", createdAt: new Date().toISOString(), status: "open" });
+   r.journal.updateWorker("20", "acme/widgets", { status: "failed", phase: "close" });
+   if (deferCard) {
+    const edit = spyOn(EscalationDiscord.prototype, "edit").mockImplementation(async () => { throw new Error("Discord unavailable"); });
+    try {
+     await sweepMap({ ...r.ctx, phase: "liveness" });
+     expect(r.journal.getWorker("20", "acme/widgets")?.status).toBe("success");
+     expect(r.journal.getEscalation("acme/widgets", "20")?.status).toBe("open");
+     expect(discord.edits).toHaveLength(0);
+    } finally { edit.mockRestore(); }
+   }
+   await sweepMap({ ...r.ctx, phase: "liveness" });
+   expect(r.journal.getWorker("20", "acme/widgets")?.status).toBe("success");
+   expect(r.journal.getEscalation("acme/widgets", "20")?.status).toBe("closed");
+   expect(discord.edits).toHaveLength(1);
+   expect(r.journal.getEscalation("acme/widgets", "20")?.lastContent).toContain("closed on the graph");
+   await sweepMap({ ...r.ctx, phase: "liveness" });
+   expect(discord.edits).toHaveLength(1);
+   expect(r.journal.listEvents("acme/widgets", 500).filter(e => e.kind === "closed-elsewhere")).toHaveLength(1);
+  } finally { discord.stop(); }
  }, 60_000);
 
  test("propose node: merge is the ratification — the close carries tested evidence and no --ci", async () => {

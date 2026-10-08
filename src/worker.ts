@@ -53,6 +53,8 @@ import { workerEnv } from "./worker-env.ts";
 import { sessionJournalPath } from "./journal-guard.ts";
 import { saveWorkerLog } from "./worker-log.ts";
 import { isTransientGitHubError } from "./transient.ts";
+import { BudgetDeferral } from "./budget.ts";
+import { findNodePr, finishClosedElsewhere } from "./closed-elsewhere.ts";
 import * as githubApi from "./github.ts";
 import type { ForgePort } from "./forge.ts";
 import { ParkSignal } from "./signals.ts";
@@ -75,7 +77,7 @@ export { gitAuthEnv } from "./git-ops.ts";
 export interface RunNodeOutcome {
  nodeId: string;
  repo: string;
- status: "success" | "failed" | "refused" | "skipped" | "parked" | "awaiting-merge";
+ status: "success" | "released" | "failed" | "refused" | "skipped" | "parked" | "awaiting-merge";
  detail: string;
  workerExit: number | null;
  close?: CloseResult;
@@ -404,7 +406,7 @@ function finish(
  journal: Journal,
  nodeId: string,
  repo: string,
- status: "success" | "failed" | "parked",
+ status: "success" | "released" | "failed" | "parked",
  outcome: string,
 ): void {
  journal.updateWorker(nodeId, repo, {
@@ -465,6 +467,11 @@ export async function runNode(
     timeoutMs: GRAPH_CALL_TIMEOUT_MS,
    },
   );
+  if (node.status === "closed") {
+   const github = ctx.github ?? githubApi;
+   const pr = await findNodePr(github, repo, node, row?.prNumber, token);
+   return { ...base, ...await finishClosedElsewhere({ ...ctx, node, pr, generation }) };
+  }
   const rootNode = await graphNode(
    repo,
    String(map.root),
@@ -490,6 +497,12 @@ export async function runNode(
    // A newer occupant owns the row — leave it untouched.
    journal.recordEvent("fenced", { nodeId, repo, detail: detail.slice(0, 400) });
    return { ...base, status: "refused", detail };
+  }
+  if (error instanceof BudgetDeferral) {
+   journal.assertGeneration(nodeId, repo, generation, "record a budget deferral");
+   journal.recordEvent("transient", { nodeId, repo, detail: detail.slice(0, 400) });
+   finish(journal, nodeId, repo, "failed", detail);
+   return { ...base, status: "failed", detail };
   }
   journal.recordEvent("refused", {
    nodeId,
@@ -649,7 +662,12 @@ async function runImplementNode(
   }
  }
 
+ if (outcome.graphClosureReconciled) return { ...base, ...outcome };
+
  switch (outcome.status) {
+  case "released":
+   finish(journal, nodeId, repo, "released", outcome.detail);
+   break;
   case "success":
    journal.resetDeadman();
    finish(journal, nodeId, repo, "success", outcome.detail);
