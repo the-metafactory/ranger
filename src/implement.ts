@@ -1429,6 +1429,11 @@ async function checkedWorkerPass(
  // changed since the supervisor last saw it clean is never this pass's baseline.
  const snapshot = await trustedSnapshot(journal, ctx.canonical, { repo: map.repo, nodeId }, mapKey(map));
  const before = await headSha(worktree);
+ // origin/<base> as the supervisor holds it before the worker runs: the base
+ // a failing test is compared with (node #164) is never a ref the worker or
+ // its tests could have moved.
+ const baseRef = await safeGit(["rev-parse", "--verify", `refs/remotes/origin/${map.base}^{commit}`], { cwd: worktree, timeoutMs: 30_000 });
+ const baseTip = baseRef.code === 0 && /^[0-9a-f]{40}$/.test(baseRef.stdout.trim()) ? baseRef.stdout.trim() : null;
  const prompt = assembleImplementPrompt({
   repo: map.repo,
   node: {
@@ -1522,7 +1527,7 @@ async function checkedWorkerPass(
    `worker left ${dirty.length} uncommitted or untracked file(s) (${dirty.slice(0, 5).join("; ")}) — the tests would not test what gets pushed`,
   );
  }
- const { tests, retried, baseRed } = await supervisorTests(ctx, testCommand, pass);
+ const { tests, retried, baseRed } = await supervisorTests(ctx, testCommand, pass, baseTip);
  if (tests.code !== 0 && baseRed === undefined) return fail(testsFailedDetail(testCommand, tests, "after the worker"));
  if (retried || baseRed !== undefined) {
   // The pass was certified in a fresh clone, or its failures are the base's:
@@ -1774,7 +1779,7 @@ function testsFailedDetail(testCommand: string, tests: RunResult, after: string)
  * review reads that code.
  *
  * A failure that names its failing tests is then checked at the merge base
- * (testsRedAtBase): when every one of them fails there too, it is the base's,
+ * `baseTip` (testsRedAtBase): when every one of them fails there too, it is the base's,
  * and `baseRed` says the pass goes on as if the tests passed. `tests` is
  * always the branch's own run.
  */
@@ -1782,6 +1787,7 @@ async function supervisorTests(
  ctx: ImplementContext,
  testCommand: string,
  label: string,
+ baseTip: string | null,
 ): Promise<{ tests: RunResult; retried: boolean; baseRed?: BaseRedTests }> {
  const { journal, map, node, worktree } = ctx;
  const head = await headSha(worktree);
@@ -1797,7 +1803,7 @@ async function supervisorTests(
   return { tests, retried: false };
  }
  const retry = await retryOnBusyHost(ctx, testCommand, head, `tests (${testCommand})`, "the test retry", `${label}: supervisor test retry`);
- if (retry === null) return { tests, retried: false, ...await baseRedAt(ctx, testCommand, tests, head, label) };
+ if (retry === null) return { tests, retried: false, ...await baseRedAt(ctx, testCommand, tests, head, label, baseTip) };
  tests = retry;
  if (tests.code === 0 && (await headSha(worktree)) !== head) {
   tests = { ...tests, code: 1, stderr: `the retry passed at ${head.slice(0, 8)}, but the worktree moved off it meanwhile\n${tests.stderr}` };
@@ -1806,7 +1812,7 @@ async function supervisorTests(
   journal.recordEvent("reviewed", { nodeId: node.ref.id, repo: map.repo, detail: `tests (${testCommand}) passed on the retry in a fresh checkout` });
   return { tests, retried: true };
  }
- return { tests, retried: false, ...await baseRedAt(ctx, testCommand, tests, head, label) };
+ return { tests, retried: false, ...await baseRedAt(ctx, testCommand, tests, head, label, baseTip) };
 }
 
 /** Failing tests that fail at the merge base too: the base's, not the branch's. */
@@ -1822,8 +1828,9 @@ async function baseRedAt(
  tests: RunResult,
  head: string,
  label: string,
+ baseTip: string | null,
 ): Promise<{ baseRed?: BaseRedTests }> {
- const baseRed = await testsRedAtBase(ctx, testCommand, tests, label);
+ const baseRed = await testsRedAtBase(ctx, testCommand, tests, label, baseTip);
  if (baseRed === null) return {};
  if ((await headSha(ctx.worktree)) !== head) {
   ctx.journal.recordEvent("reviewed", {
@@ -1842,26 +1849,36 @@ async function baseRedAt(
  * on tests their branches never touched, one passing 44/44 alone, the other a
  * timeout soma's main hits at the same base). When the failed run names its
  * failing tests, the map's whole test command runs once more in a fresh clone
- * at `git merge-base HEAD origin/<base>`, after the host quiets. The result
+ * at `git merge-base HEAD origin/<base>`, after the host quiets. origin/<base>
+ * is `baseTip`, read before the worker ran, and replacement refs are refused:
+ * a failed run that moves the ref or plants a replacement cannot pick the
+ * commit its failures are compared with. The result
  * is the base's red set when every failing name the branch run printed is a
  * `(fail)` line there too; null when they gate. A failure that names no test
  * (a typecheck after passing tests, a crash, a timeout, a kill) gets no base
  * run. Every outcome of a base run, or why none ran, is a `reviewed` event.
+ * Whatever the command runs after a failing step (`bun test && tsc` never
+ * reaches tsc) is not run by a base-red pass; CI runs it before the merge.
  */
 async function testsRedAtBase(
  ctx: ImplementContext,
  testCommand: string,
  tests: RunResult,
  label: string,
+ baseTip: string | null,
 ): Promise<BaseRedTests | null> {
  const { journal, map, node, worktree } = ctx;
  const names = allFailedTestNames(tests);
  if (tests.code <= 0 || names.length === 0) return null;
  const event = (detail: string) => journal.recordEvent("reviewed", { nodeId: node.ref.id, repo: map.repo, detail });
- const merged = await safeGit(["merge-base", "HEAD", `origin/${map.base}`], { cwd: worktree, timeoutMs: 30_000 });
+ if (baseTip === null) {
+  event(`tests (${testCommand}) failed; the merge-base check did not run: origin/${map.base} did not resolve before the worker ran — the failures gate`);
+  return null;
+ }
+ const merged = await safeGit(["--no-replace-objects", "merge-base", "HEAD", baseTip], { cwd: worktree, timeoutMs: 30_000 });
  const sha = merged.stdout.trim();
  if (merged.code !== 0 || !/^[0-9a-f]{40}$/.test(sha)) {
-  event(`tests (${testCommand}) failed; the merge-base check did not run: no merge base with origin/${map.base} (${merged.stderr.trim() || `exit ${merged.code}`}) — the failures gate`);
+  event(`tests (${testCommand}) failed; the merge-base check did not run: no merge base with origin/${map.base} at ${baseTip.slice(0, 8)} (${merged.stderr.trim() || `exit ${merged.code}`}) — the failures gate`);
   return null;
  }
  await awaitQuietHost(ctx, "the merge-base test run");

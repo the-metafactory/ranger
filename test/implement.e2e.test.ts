@@ -1936,10 +1936,23 @@ describe("implement lane (node #23)", () => {
    expect(reviewed(r)).toContain(`tests (echo "(fail) shared"; exit 1) failed; the merge-base check at ${sha} did not run: install for the merge-base run failed — the failures gate`);
   }, 60_000);
 
-  test("a merge base that cannot be resolved gates, and says why the base check did not run", async () => {
-   // The failed run deletes origin/main: no merge base to compare with.
-   const r = await rig({ test: "git update-ref -d refs/remotes/origin/main; echo \"(fail) shared\"; exit 1" });
+  test("a run that moves origin/main onto the branch's own head cannot make its failures the base's", async () => {
+   // The failed run points origin/main at HEAD: a base check read from that ref
+   // would run the branch itself and call its failure the base's.
+   const r = await rig({ test: "git update-ref refs/remotes/origin/main HEAD; if [ -f src/feature.ts ]; then echo \"(fail) branch only\"; exit 1; fi" });
    cleanup.push(r.dir);
+   const outcome = await runNode("20", r.ctx);
+   expect(outcome.status).toBe("failed");
+   expect(reviewed(r).some((d) => d.includes("red on the merge base too"))).toBe(false);
+   expect(reviewed(r).some((d) => d.endsWith("passes — not red there, they gate: branch only"))).toBe(true);
+   expect(r.github.prs.size).toBe(0);
+  }, 60_000);
+
+  test("a merge base that cannot be resolved gates, and says why the base check did not run", async () => {
+   // The branch shares no history with origin/main: no merge base to compare with.
+   const r = await rig({ test: "echo \"(fail) shared\"; exit 1" });
+   cleanup.push(r.dir);
+   r.ctx.workerCommand = [implementWorker, "orphan"];
    const calls = watchRuns(r);
    const outcome = await runNode("20", r.ctx);
    expect(outcome.status).toBe("failed");
