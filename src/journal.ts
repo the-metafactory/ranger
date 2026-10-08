@@ -8,6 +8,7 @@ import {
  events,
  headSubstrates,
  health,
+ resumeQueue,
  substrateReadings,
  substrateSessions,
  type SessionKind,
@@ -137,7 +138,21 @@ export interface EscalationRow {
  notedAt: string | null;
 }
 
+export interface ResumeQueueRow {
+ id: number;
+ repo: string;
+ nodeId: string;
+ root: number;
+ lane: ImplementLane;
+ queuedAt: string;
+ failedStarts: number;
+}
+
 export type EventKind =
+ | "resume-queued"
+ | "resume-cancelled"
+ | "resume-dropped"
+ | "resume-started"
  | "announced"
  | "claimed"
  | "worker-start"
@@ -354,6 +369,52 @@ export class Journal {
        })
        .sync();
   return rows.map(hydrateWorker);
+ }
+
+ // ---- queued resumes ----
+
+ enqueueResume(entry: Omit<ResumeQueueRow, "id" | "queuedAt" | "failedStarts">, now = new Date()): ResumeQueueRow {
+  return this.db.transaction(() => {
+   const inserted = this.db.insert(resumeQueue).values({ ...entry, queuedAt: now.toISOString() })
+    .onConflictDoNothing({ target: [resumeQueue.repo, resumeQueue.nodeId] }).returning().get();
+   if (inserted !== undefined) {
+    this.recordEvent("resume-queued", { nodeId: entry.nodeId, repo: entry.repo, detail: `resume-node queued for the ${entry.lane} implement lane (map root ${entry.root})` });
+    return inserted;
+   }
+   return this.db.select().from(resumeQueue)
+    .where(and(eq(resumeQueue.repo, entry.repo), eq(resumeQueue.nodeId, entry.nodeId))).get()!;
+  });
+ }
+
+ listResumeQueue(lane?: ImplementLane): ResumeQueueRow[] {
+  return this.db.select().from(resumeQueue).where(lane === undefined ? undefined : eq(resumeQueue.lane, lane))
+   .orderBy(asc(resumeQueue.id)).all();
+ }
+
+ getResume(repo: string, nodeId: string): ResumeQueueRow | null {
+  return this.db.select().from(resumeQueue)
+   .where(and(eq(resumeQueue.repo, repo), eq(resumeQueue.nodeId, nodeId))).get() ?? null;
+ }
+
+ recordResumeStartFailure(entry: ResumeQueueRow, reason: string): boolean {
+  return this.db.transaction(() => {
+   const updated = this.db.update(resumeQueue)
+    .set({ failedStarts: sql`${resumeQueue.failedStarts} + 1` })
+    .where(eq(resumeQueue.id, entry.id)).returning().get();
+   if (updated === undefined) return true;
+   if (updated.failedStarts < 3) return false;
+   this.removeResume(updated, "resume-dropped", `3 consecutive failed starts; last error: ${reason}`);
+   return true;
+  });
+ }
+
+ removeResume(entry: ResumeQueueRow, kind: "resume-cancelled" | "resume-dropped" | "resume-started", reason: string): boolean {
+  return this.db.transaction(() => {
+   const removed = this.db.delete(resumeQueue).where(eq(resumeQueue.id, entry.id)).returning().get();
+   if (removed === undefined) return false;
+   this.recordEvent(kind, { nodeId: entry.nodeId, repo: entry.repo, detail: reason });
+   return true;
+  });
  }
 
  /** Bounded keyset page for graph-closure reconciliation, scoped to one map. */

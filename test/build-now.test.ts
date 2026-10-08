@@ -9,7 +9,8 @@ import { loadConfig } from "../src/config.ts";
 import type { FrontierEntry } from "../src/graph.ts";
 import { openJournal, type Journal } from "../src/journal.ts";
 import type { AnnounceContext } from "../src/announce.ts";
-import { claimNode, type SpawnRunNodeArgs } from "../src/walk.ts";
+import { claimNode } from "../src/walk.ts";
+import type { SpawnRunNodeArgs } from "../src/spawn.ts";
 
 /**
  * node #58 — `ranger build-now`: the walk's claim for one chosen node. The

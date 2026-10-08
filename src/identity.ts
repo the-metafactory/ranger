@@ -23,6 +23,15 @@ import { workerEnvPasses } from "./untrusted-env.ts";
 
 export class WriteGateError extends Error {
  override readonly name = "WriteGateError";
+ /**
+  * True when the gate could not be evaluated (the forge's identity read failed
+  * or timed out), as opposed to a definitive refusal (unmapped token, the
+  * principal's identity, a bot.identity mismatch). A queued resume defers on a
+  * transient gate without counting a failed start (node #158).
+  */
+ constructor(message: string, readonly transient = false) {
+  super(message);
+ }
 }
 
 export interface WriteCredential {
@@ -181,7 +190,7 @@ export async function loginForToken(
   });
   if (result.code !== 0) {
    throw new WriteGateError(
-    `cannot resolve the identity behind the write token (${ref.forge} api user, exit ${result.code})`,
+    `cannot resolve the identity behind the write token (${ref.forge} api user, exit ${result.code})`, true,
    );
   }
   const login = result.stdout.trim();
@@ -191,7 +200,7 @@ export async function loginForToken(
   return login;
  } catch (error) {
   if (error instanceof WriteGateError) throw error;
-  throw new WriteGateError(`cannot resolve the identity behind the write token (${ref.forge} api user failed)`);
+  throw new WriteGateError(`cannot resolve the identity behind the write token (${ref.forge} api user failed)`, true);
  } finally {
   gated.cleanup();
  }
@@ -284,12 +293,12 @@ async function gitlabGet(
   const result = await runner("glab", ["api", endpoint, "--hostname", ref.host, "--method", "GET"], {
    ...opts, timeoutMs: opts.timeoutMs ?? 60_000, env: gated.env,
   });
-  if (result.code !== 0) throw new WriteGateError(`cannot verify the GitLab write identity (GET ${endpoint}, exit ${result.code})`);
+  if (result.code !== 0) throw new WriteGateError(`cannot verify the GitLab write identity (GET ${endpoint}, exit ${result.code})`, true);
   const body: unknown = JSON.parse(result.stdout);
   return typeof body === "object" && body !== null ? body as Record<string, unknown> : null;
  } catch (error) {
   if (error instanceof WriteGateError) throw error;
-  throw new WriteGateError(`cannot verify the GitLab write identity (GET ${endpoint} failed)`);
+  throw new WriteGateError(`cannot verify the GitLab write identity (GET ${endpoint} failed)`, true);
  } finally {
   gated.cleanup();
  }

@@ -1,8 +1,9 @@
 import { implementLane, type ImplementLane } from "./lanes.ts";
+import { processResumeQueue } from "./resume.ts";
 import { executionRefusal } from "./forge-ref.ts";
 import { lastImplementMaps, recordImplementStart, mapKey, implementMapOrder } from "./maps.ts";
-import { spawn } from "node:child_process";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
+import { spawnRunNodeDetached, type SpawnRunNodeArgs } from "./spawn.ts";
 import type { RangerConfig, RangerMapConfig, WalkMode } from "./config.ts";
 import { DiscordAnnouncer, type AnnounceContext, type AnnounceResult } from "./announce.ts";
 import { BudgetDeferral, budgetPolicy } from "./budget.ts";
@@ -18,6 +19,7 @@ import { ClaimLockBusy, withClaimLock } from "./claim-lock.ts";
 import type { OwnedCheck } from "./lock.ts";
 import { classifyFrontier, loadProbeRegistry } from "./route.ts";
 import type { ForgePort } from "./forge.ts";
+import * as realGitHub from "./github.ts";
 import { probeRequeueCandidates, requeueProbes, type ProbeRequeueResult } from "./probe-requeue.ts";
 import { sweepMap, type SweepMapResult } from "./sweep.ts";
 import {
@@ -35,11 +37,12 @@ export { implementCandidates, planTick, researchCandidates, selectCandidates };
  * The headless tick (design §1, build-path step 3) — one bounded pass:
  *
  * per map → gate (write token + not-principal + walk mode + pause state) →
- * sweep liveness → priority probe requeues → merge desk and its send-backs;
+ * sweep liveness → priority probe requeues → merge desk and its send-backs
+ * → queued resumes;
  * then, per map again →
  * derive + classify frontier → research-lane candidates → announce (fail-closed)
  * → claim (race-safe) → spawn a detached `ranger run-node`. Sweeps go first so
- * a send-back takes its implement lane before a fresh claim can.
+ * a send-back takes its implement lane before queued resumes or fresh claims.
  *
  * Stateless over the graph: everything topological is re-derived per pass.
  */
@@ -62,64 +65,6 @@ export interface WalkResult {
  maps: WalkMapResult[];
  spawnCapPerDay: number;
  probeRequeues: ProbeRequeueResult;
-}
-
-export interface SpawnRunNodeArgs {
- nodeId: string;
- repo: string;
- root: number;
- cliEntry: string;
- configPath: string;
-}
-
-/**
- * Bun arguments for a detached run-node. The child inherits the tokens and
- * the caller's cwd, so bun reads ranger's own bunfig.toml (its default is
- * $cwd/bunfig.toml, whose `preload` runs first) and no .env (whose
- * `SAGE_X=$GH_TOKEN` would copy a token into a name the worker env
- * forwards) — the same pins as ops/bin/ranger.example (node #66).
- */
-export function runNodeArgv(args: SpawnRunNodeArgs): string[] {
- return [
-  `--config=${join(dirname(args.cliEntry), "..", "bunfig.toml")}`,
-  "--no-env-file",
-  args.cliEntry,
-  "run-node",
-  args.nodeId,
-  "--map",
-  mapKey(args),
-  "--config",
-  args.configPath,
- ];
-}
-
-/**
- * Launch a detached `ranger run-node` that outlives this tick (design §1).
- * Returns the child PID (null when no process was spawned).
- */
-export async function spawnRunNodeDetached(
- args: SpawnRunNodeArgs,
-): Promise<number | null> {
- // Test/operational seam: claim without spawning a worker (simulation, or a
- // run where the operator drives run-node by hand).
- if (process.env.RANGER_NO_SPAWN === "1") {
-  return null;
- }
- const child = spawn(
-  process.execPath,
-  runNodeArgv(args),
-  {
-   detached: true,
-   stdio: "ignore",
-   env: process.env,
-  },
- );
- // A spawn that fails (ENOENT, EACCES) has no pid and emits `error` later;
- // unhandled, that error would kill the caller after its `claimed` row.
- // The null pid is the caller's signal that no worker started.
- child.on("error", () => {});
- child.unref();
- return child.pid ?? null;
 }
 
 export interface WalkContext {
@@ -305,6 +250,24 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
  // Even a worker finishing during this tick must not allow a second claim
  // across maps: at most one new implement claim per resource lane per tick.
  const implementClaimed = new Set<ImplementLane>();
+ // Maps whose credential gate failed on a forge read this tick, not a refusal:
+ // a queued resume on such a map defers without counting a failed start.
+ const transientGates = new Set<RangerMapConfig>();
+ // Desks and queue validation share the PR read for this bounded tick.
+ const port: ForgePort = ctx.github ?? realGitHub;
+ const prReads = new Map<string, ReturnType<ForgePort["getPr"]>>();
+ const getPr: ForgePort["getPr"] = (repo, number, token) => {
+  const key = `${repo}#${number}`;
+  if (!prReads.has(key)) prReads.set(key, port.getPr(repo, number, token));
+  return prReads.get(key)!;
+ };
+ const github = new Proxy(port, {
+  get(target, key) {
+   if (key === "getPr") return getPr;
+   const value = Reflect.get(target, key);
+   return typeof value === "function" ? value.bind(target) : value;
+  },
+ });
  const priorityLanes = new Set<ImplementLane>();
 
  const order = implementMapOrder(config.maps, lastImplementMaps(journal), implementLane);
@@ -319,13 +282,14 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
    map: w.map,
    token: w.token,
    botIdentity: w.botIdentity,
-   github: ctx.github,
+   github,
    phase,
    reservedLanes: priorityLanes,
    respawn: (nodeId, repo, root) =>
     (ctx.spawnRunNode ?? spawnRunNodeDetached)({ nodeId, repo, root, cliEntry, configPath: ctx.configPath }),
   });
  const maps: WalkMapResult[] = [];
+ const mapResults = new Map<RangerMapConfig, WalkMapResult>();
  const walked: { map: (typeof order)[number]; mapResult: WalkMapResult; token: string; botIdentity: string; errors: string[] }[] = [];
 
  // Pass 1 — authorize every walked map, sweep liveness, resume priority
@@ -349,6 +313,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
    paused: journal.isPaused(),
    errors: [],
   };
+  mapResults.set(map, mapResult);
 
   // Walk-mode gate (node #9): `none` registers the map, nothing more.
   if (map.walk === "none") {
@@ -375,6 +340,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
    mapResult.gated = true;
    mapResult.gateReason =
     error instanceof WriteGateError ? error.message : String(error);
+   if (error instanceof WriteGateError && error.transient) transientGates.add(map);
    maps.push(mapResult);
    continue;
   }
@@ -443,7 +409,21 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
   }
  }
 
- // Pass 2 — claims, in the same map order, against lanes the sweeps and desks have settled.
+ // Pass 1c — queued resumes, FIFO within each implement lane, ahead of claims.
+ if (journal.listResumeQueue().length > 0) {
+  try {
+   await withClaimLock(journal, owned => processResumeQueue({ ...ctx, github },
+    order.map(map => {
+     const w = walked.find(w => w.map === map);
+     const m = mapResults.get(map)!;
+     return { map, token: w?.token, gateReason: m.gateReason, gateTransient: transientGates.has(map), errors: w?.errors ?? m.errors };
+    }), implementClaimed, owned));
+  } catch (error) {
+   for (const w of walked) w.errors.push(`resume queue failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+ }
+
+ // Pass 2 — claims, against lanes the sweeps, desks and queued resumes have settled.
  for (const { map, mapResult, token, botIdentity, errors } of walked) {
   if (!mapResult.gated) {
    try {

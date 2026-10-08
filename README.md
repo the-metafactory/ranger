@@ -48,6 +48,28 @@ close-only runs leave the cursor unchanged. Awaiting-merge releases capacity.
 The dashboard shows both holders and the same next choices as walk.
 Unknown or ambiguous worker maps conservatively hold both resource lanes.
 
+`ranger resume-node <id> --when-free` resumes immediately when its lane is
+free and no resumes wait in that lane. Otherwise it records a durable FIFO entry.
+Research and close-only resumes start immediately. On each walk tick, queued
+resumes run after merge desks and before new claims; a started implement resume
+reserves its lane for that tick. The dead-man pause and daily spawn cap retain
+queued entries. Closed nodes, released or already active rows, merged or closed
+PRs and maps set to `walk: none` are removed with a reason. Moving a PR head
+keeps its entry valid. `ranger resume-node <id> --cancel` removes an entry and
+returns non-zero if none exists. Use `--map owner/name#root` to disambiguate.
+Cancellation remains available after a map is deregistered, using the queued
+repository's write-token mapping and the same machine-account identity gate.
+Starts by the walk count toward the daily spawn cap; immediate operator resumes
+do not. A queued entry never reserves a lane: if its head cannot start, fresh
+claims remain eligible that tick, while later queued entries in the lane wait.
+Transient graph or GitHub read errors defer the head without counting a failure.
+Spawn errors, a null PID (including `RANGER_NO_SPAWN=1`), and identity gate
+refusals count as failed starts. Three consecutive failed starts drop the entry
+with an event naming the last error. A successful start removes the entry;
+queueing the node again starts its failure count at zero.
+Plain and immediate operator resumes retain the hand-driven mode where a row
+is claimed without spawning; this mode cannot successfully start a queued resume.
+
 Parked infrastructure probe failures automatically requeue on the next `walk`
 when their lane is free, oldest first across maps. They take priority over
 crash respawns, merge-desk send-backs and fresh implement claims. The running
