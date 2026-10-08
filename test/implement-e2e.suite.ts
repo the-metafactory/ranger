@@ -2331,6 +2331,23 @@ describe("implement lane (node #23)", () => {
   rmSync(flag, { force: true });
  }, 60_000);
 
+ test("a fresh checkout is named as the node's checkout and keeps its origin URL (found live on soma #767)", async () => {
+  const flag = join(tmpdir(), `ranger-fresh-like-${Date.now()}`);
+  // The worktree run fails on the missing flag; adoption's fresh clone must look like the checkout.
+  const r = await rig({
+   test: `test -f ${flag} && test "$(basename "$PWD")" = canonical && git remote get-url origin | grep -q "/origin.git$"`,
+  });
+  cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("failed");
+  writeFileSync(flag, "");
+  r.ctx.workerCommand = [implementWorker, "noop"]; // only adoption can pass it
+  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.startsWith("adopting "))).toBe(true);
+  rmSync(flag, { force: true });
+ }, 60_000);
+
  test("an adopted head is credited to the substrate that wrote it, not to a later session that committed nothing", async () => {
   const flag = join(tmpdir(), `ranger-adopt-author-${Date.now()}`);
   const r = await rig({ test: `test -f ${flag}` });

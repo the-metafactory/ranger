@@ -2285,7 +2285,11 @@ async function freshCheckoutTests(
  purpose: "retry" | "base" | "steps",
 ): Promise<{ ran: boolean; result: RunResult }> {
  const scratch = mkdtempSync(join(tmpdir(), `ranger-test-${purpose}-`));
- const dir = join(scratch, "checkout");
+ // Named as the node's checkout is, with its origin URL (below): a repo's
+ // tests may read either (2026-10-08: soma's install test wants "soma" in its
+ // path, and its graph bridge test parses origin's host), and a clone named
+ // `checkout` whose origin is a local path failed them every time.
+ const dir = join(scratch, basename(ctx.canonical));
  const forRun = { retry: "for the retry", base: "for the merge-base run", steps: "for the other test steps" }[purpose];
  const failed = (why: string) => ({ ran: false, result: { code: 1, stdout: "", stderr: why } });
  const git = (args: string[], cwd: string, timeoutMs = 60_000) =>
@@ -2298,6 +2302,11 @@ async function freshCheckoutTests(
    300_000,
   );
   if (clone.code !== 0) return failed(`could not clone ${forRun}: ${clone.stderr.trim()}`);
+  const originUrl = await git(["remote", "get-url", "origin"], ctx.canonical, 10_000);
+  if (originUrl.code === 0 && originUrl.stdout.trim() !== "") {
+   const set = await git(["remote", "set-url", "origin", originUrl.stdout.trim()], dir, 10_000);
+   if (set.code !== 0) return failed(`could not set origin ${forRun}: ${set.stderr.trim()}`);
+  }
   const checkout = await git(["-c", "advice.detachedHead=false", "checkout", "--quiet", "--detach", sha], dir, 120_000);
   if (checkout.code !== 0) return failed(`could not check out ${sha.slice(0, 8)} ${forRun}: ${checkout.stderr.trim()}`);
   if (ctx.map.commands.install !== undefined) {
