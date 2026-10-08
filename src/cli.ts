@@ -63,7 +63,7 @@ import { ActiveRemoteTestJob, BusyRemoteTestExecutor, RevokedRemoteTestJob, open
 import { validateRemoteTestJob } from "./remote-test/contract.ts";
 import { publishReceiptFile } from "./remote-test/artifacts.ts";
 import { runSshCommand, statusSshCommand, sshOutcomeExitCode, sshOutcomeMessage, type RunSshCommand } from "./remote-test/ssh-cli.ts";
-import { saveRefusalDiagnostic } from "./remote-test/receiver-diagnostics.ts";
+import { saveRefusalDiagnostic, TaggedReceiverFailure } from "./remote-test/receiver-diagnostics.ts";
 import { serveSshResponse } from "./remote-test/ssh-server.ts";
 
 /**
@@ -579,7 +579,7 @@ remoteTest.command("serve-stdio")
  .option("--diagnostics-root <absolute-directory>", "existing private operator-only refusal store (default off)")
  .action(async (options: { config: string; diagnosticsRoot?: string }) => {
   const diagnostics = options.diagnosticsRoot === undefined ? undefined : { root: options.diagnosticsRoot };
-  const abort = new AbortController(), cancel = () => { abort.abort(); process.stdin.destroy(Error("SSH input interrupted")); };
+  const abort = new AbortController(), cancel = () => { abort.abort(); process.stdin.destroy(new TaggedReceiverFailure("interrupted", "SSH input interrupted")); };
   process.once("SIGINT", cancel); process.once("SIGTERM", cancel); process.once("SIGHUP", cancel);
   // Includes upload idle time and bounded executor cleanup. No silent daemon.
   const timer = setTimeout(cancel, 15 * 60_000);

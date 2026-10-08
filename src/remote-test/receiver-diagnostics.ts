@@ -5,6 +5,7 @@ import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { z } from "zod";
 
 export const DIAGNOSTIC_LIMITS = { recordBytes: 1024, fileBytes: 4 * 1024 ** 2, entries: 4096, retentionMs: 7 * 86400_000 } as const;
+// Persisted record-version-1 stages are append-only too. Tightening pairs needs a new version.
 const stages = ["config", "root", "header", "request", "lookup", "upload", "executor_boundary", "receipt", "cleanup"] as const;
 // Persisted record-version-1 vocabulary: append only; never remove or rename codes.
 const codes = ["invalid_config", "unsafe_path", "incomplete_header", "header_limit", "malformed_request", "profile_not_approved", "job_invalid", "expired", "unexpected_payload", "upload_size", "upload_digest", "upload_no_progress", "interrupted", "invalid_receipt", "unknown", "EACCES", "EPERM", "ENOENT", "EEXIST", "ENOSPC", "EDQUOT", "EIO", "EROFS", "EMFILE", "ENFILE"] as const;
@@ -69,13 +70,7 @@ export async function saveRefusalDiagnostic(options: ReceiverDiagnostics | undef
 export async function persistReceiverDiagnostic(rootPath: string, input: RefusalDiagnostic, excluded: string[] = [], options: DiagnosticStoreOptions = {}): Promise<void> {
  const io = { ...fs, ...options.fs }, uid = process.getuid?.();
  if (uid === undefined || !isAbsolute(rootPath) || rootPath.includes("\0") || rootPath.split(sep).includes("..")) throw Error("Unsafe diagnostic root");
- const root = resolve(rootPath);
- for (const path of excluded) {
-  let other = resolve(path);
-  try { other = await io.realpath(other); }
-  catch (error) { if (classifyReceiverFailure(error, "root").code !== "ENOENT") throw error; }
-  if (root === other || root.startsWith(other + sep) || other.startsWith(root + sep)) throw Error("Overlapping diagnostic root");
- }
+ let root = resolve(rootPath);
  let childUid: number | undefined;
  for (let path = root;; path = dirname(path)) {
   const s = await io.lstat(path);
@@ -90,6 +85,14 @@ export async function persistReceiverDiagnostic(rootPath: string, input: Refusal
   // Linked worktrees use a .git file; bare repositories have no .git entry.
   if (await exists(".git") || await exists("HEAD") && await exists("objects") && await exists("refs")) throw Error("Diagnostic root inside git");
   if (dirname(path) === path) break;
+ }
+ // Compare canonical spellings after rejecting every symlink component.
+ root = await io.realpath(root);
+ for (const path of excluded) {
+  let other = resolve(path);
+  try { other = await io.realpath(other); }
+  catch (error) { if (classifyReceiverFailure(error, "root").code !== "ENOENT") throw error; }
+  if (root === other || root.startsWith(other + sep) || other.startsWith(root + sep)) throw Error("Overlapping diagnostic root");
  }
  const record = ReceiverDiagnosticSchema.parse({ ...input, version: 1, id: (options.id ?? randomUUID)(), time: (options.now ?? Date.now)() });
  const content = Buffer.from(JSON.stringify(record) + "\n");

@@ -265,3 +265,28 @@ test("partially invalid operator config still excludes its jobs root from diagno
  expect(child).toEqual({ code: 0, stdout: '{"version":1,"error":"receiver_failed"}\n', stderr: "ranger remote-test: private diagnostic unavailable.\n" });
  expect(await fs.readdir(f.jobsRoot)).toEqual([]); expect(f.calls()).toBe(0);
 });
+
+test("canonical root spelling cannot bypass overlap on a case-insensitive filesystem", async () => {
+ const f = await fixture();
+ const realpath = (async (path: string) => path === f.diagnosticsRoot ? f.jobsRoot : fs.realpath(path)) as typeof fs.realpath;
+ await expect(persistReceiverDiagnostic(f.diagnosticsRoot, refusal, [f.jobsRoot], { fs: { realpath } })).rejects.toThrow("Overlapping");
+ expect(await fs.readdir(f.diagnosticsRoot)).toEqual([]); expect(await fs.readdir(f.jobsRoot)).toEqual([]);
+});
+test("real CLI SIGINT/SIGTERM/SIGHUP during pending upload emits interrupted without leaking or admitting", async () => {
+ for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+  const f = await fixture(), configPath = join(f.root, "executor.json");
+  await fs.writeFile(configPath, JSON.stringify(f.config), { mode: 0o600 });
+  const child = Bun.spawn([process.execPath, "src/cli.ts", "remote-test", "serve-stdio", "--config", configPath, "--diagnostics-root", f.diagnosticsRoot], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+  const stdout = new Response(child.stdout).text(), stderr = new Response(child.stderr).text();
+  try {
+   child.stdin.write(JSON.stringify({ version: 2, operation: "submit", job: f.job, bundleBytes: secret.length + 10 }) + "\n" + secret);
+   const path = join(f.jobsRoot, ".ssh-incoming", f.job.jobId, "source.bundle"), deadline = Date.now() + 10_000;
+   while (!(await fs.lstat(path).catch(() => null))) { if (Date.now() > deadline || child.exitCode !== null) throw Error("CLI did not reach upload fixture"); await new Promise(r => setTimeout(r, 10)); }
+   child.kill(signal);
+   expect(await child.exited).toBe(0); expect(await stdout).toBe('{"version":2,"error":"receiver_failed"}\n'); expect(await stderr).toBe("");
+   const records = await f.records(); expect(records.length).toBe(1); expect(records[0].primary).toEqual({ stage: "upload", code: "interrupted" });
+   expect(await fs.lstat(path).catch(() => null)).toBeNull();
+   const ledger = await openJobLedger(f.jobsRoot, "fixture"); try { expect(ledger.status(f.job)).toBeNull(); } finally { ledger.close(); }
+  } finally { if (child.exitCode === null) child.kill(); await child.exited; }
+ }
+});
