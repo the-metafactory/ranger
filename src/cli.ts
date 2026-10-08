@@ -63,7 +63,7 @@ import { ActiveRemoteTestJob, BusyRemoteTestExecutor, RevokedRemoteTestJob, open
 import { validateRemoteTestJob } from "./remote-test/contract.ts";
 import { publishReceiptFile } from "./remote-test/artifacts.ts";
 import { runSshCommand, statusSshCommand, sshOutcomeExitCode, sshOutcomeMessage, type RunSshCommand } from "./remote-test/ssh-cli.ts";
-import { saveRefusalDiagnostic, TaggedReceiverFailure } from "./remote-test/receiver-diagnostics.ts";
+import { classifyReceiverFailure, saveRefusalDiagnostic, TaggedReceiverFailure } from "./remote-test/receiver-diagnostics.ts";
 import { serveSshResponse } from "./remote-test/ssh-server.ts";
 
 /**
@@ -586,8 +586,9 @@ remoteTest.command("serve-stdio")
   try {
    let config;
    try { config = JSON.parse(await readFile(await privateOperatorPath(options.config, true), "utf8")); }
-   catch {
-    await saveRefusalDiagnostic(diagnostics, { operation: null, job: null, primary: { stage: "config", code: "invalid_config" } });
+   catch (error) {
+    const failure = classifyReceiverFailure(error, "config");
+    await saveRefusalDiagnostic(diagnostics, { operation: null, job: null, primary: { stage: "config", code: failure.code === "unknown" ? "invalid_config" : failure.code } });
     throw Error("Invalid private executor config");
    }
    const response = await serveSshResponse(process.stdin, config, { signal: abort.signal, diagnostics });

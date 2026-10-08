@@ -120,13 +120,13 @@ test("upload no-progress, expiry and interruption clean owned upload and do not 
  }
 });
 test("executor/receipt plus cleanup preserve public precedence, primary reason and uncertainty without a retry", async () => {
- for (const failure of ["executor", "receipt", "cleanup", "both", "receipt-cleanup"] as const) {
+ for (const failure of ["executor", "receipt", "cleanup", "both", "receipt-cleanup", "busy-cleanup"] as const) {
   const f = await fixture(); let executions = 0;
-  const options: SshServerOptions = { ...f.options, execute: async () => { executions++; if (failure === "executor" || failure === "both") throw injectedError(); if (failure === "receipt" || failure === "receipt-cleanup") return { ...f.receipt, executorId: secret }; return f.receipt; } };
-  if (failure === "cleanup" || failure === "both" || failure === "receipt-cleanup") options.fs = { rm: async () => { throw injectedError("EACCES"); } };
+  const options: SshServerOptions = { ...f.options, execute: async () => { executions++; if (failure === "busy-cleanup") throw new BusyRemoteTestExecutor(); if (failure === "executor" || failure === "both") throw injectedError(); if (failure === "receipt" || failure === "receipt-cleanup") return { ...f.receipt, executorId: secret }; return f.receipt; } };
+  if (failure === "cleanup" || failure === "both" || failure === "receipt-cleanup" || failure === "busy-cleanup") options.fs = { rm: async () => { throw injectedError("EACCES"); } };
   expect(await serveSshResponse(f.frame(), f.config, options)).toEqual({ version: 2, error: failure === "receipt" ? "invalid_receipt" : "receiver_failed" });
   const [r] = await f.records(); expect((await f.records()).length).toBe(1); expect(executions).toBe(1);
-  expect(r.primary).toEqual({ stage: failure === "receipt" || failure === "receipt-cleanup" ? "receipt" : failure === "cleanup" ? "cleanup" : "executor_boundary", code: failure === "receipt" || failure === "receipt-cleanup" ? "invalid_receipt" : failure === "cleanup" ? "EACCES" : "unknown" });
+  expect(r.primary).toEqual({ stage: failure === "receipt" || failure === "receipt-cleanup" ? "receipt" : failure === "cleanup" || failure === "busy-cleanup" ? "cleanup" : "executor_boundary", code: failure === "receipt" || failure === "receipt-cleanup" ? "invalid_receipt" : failure === "cleanup" || failure === "busy-cleanup" ? "EACCES" : "unknown" });
   if (failure === "both" || failure === "receipt-cleanup") expect(r.cleanup).toEqual({ stage: "cleanup", code: "EACCES" });
   expect(Object.keys(r).sort()).toEqual(["version", "id", "time", "operation", "job", "primary", ...(failure === "both" || failure === "receipt-cleanup" ? ["cleanup"] : [])].sort());
  }
@@ -289,4 +289,10 @@ test("real CLI SIGINT/SIGTERM/SIGHUP during pending upload emits interrupted wit
    const ledger = await openJobLedger(f.jobsRoot, "fixture"); try { expect(ledger.status(f.job)).toBeNull(); } finally { ledger.close(); }
   } finally { if (child.exitCode === null) child.kill(); await child.exited; }
  }
+});
+
+test("real CLI config filesystem errno remains allowlisted rather than guessed from exception text", async () => {
+ const f = await fixture(), result = await cli(f, "", ["--config", join(f.root, "absent-" + secret), "--diagnostics-root", f.diagnosticsRoot]);
+ expect(result.code).toBe(1); expect(result.stdout).toBe(""); expect(result.stderr).toContain("inspect private operator state");
+ const [record] = await f.records(); expect(record.primary).toEqual({ stage: "config", code: "ENOENT" }); expect(record.operation).toBeNull(); expect(record.job).toBeNull();
 });

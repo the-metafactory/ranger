@@ -72,6 +72,9 @@ function failureTag(error: unknown, stage: DiagnosticStage) {
  if (error instanceof InvalidSshReceipt || error instanceof InvalidStoredRemoteTestReceipt) return { stage, code: "invalid_receipt" as const };
  return classifyReceiverFailure(error, stage);
 }
+function isStateOutcome(error: unknown): error is ActiveRemoteTestJob | InterruptedRemoteTestJob | RevokedRemoteTestJob | BusyRemoteTestExecutor {
+ return error instanceof ActiveRemoteTestJob || error instanceof InterruptedRemoteTestJob || error instanceof RevokedRemoteTestJob || error instanceof BusyRemoteTestExecutor;
+}
 async function receive(input: AsyncIterable<Uint8Array>, operatorConfig: unknown, options: SshServerOptions, context: RefusalContext): Promise<SshResponse> {
  const now = options.now ?? Date.now;
  context.stage = "config";
@@ -168,7 +171,8 @@ async function receive(input: AsyncIterable<Uint8Array>, operatorConfig: unknown
   const receipt = producedReceipt(produced, job, config.executorId);
   return { version: request.version, receipt };
  } catch (error) {
-  context.primary = failureTag(error, context.stage); throw error;
+  if (!isStateOutcome(error)) context.primary = failureTag(error, context.stage);
+  throw error;
  } finally {
   context.stage = "cleanup";
   try { await (options.fs?.rm ?? rm)(directory, { recursive: true }); }
@@ -184,7 +188,7 @@ export async function serveSshResponse(input: AsyncIterable<Uint8Array>, config:
  const context: RefusalContext = { stage: "config", operation: null, job: null };
  try { return await receive(input, config, { ...options, onProtocolVersion: value => { version = value; options.onProtocolVersion?.(value); } }, context); }
  catch (e) {
-  if (e instanceof ActiveRemoteTestJob || e instanceof InterruptedRemoteTestJob || e instanceof RevokedRemoteTestJob || e instanceof BusyRemoteTestExecutor) {
+  if (isStateOutcome(e)) {
    if (version === 1) return { version: 1, receipt: null };
    if (e instanceof RevokedRemoteTestJob) return { version: 2, receipt: e.receipt, state: "revoked" };
    if (e instanceof BusyRemoteTestExecutor) return { version: 2, receipt: null, state: "busy" };
