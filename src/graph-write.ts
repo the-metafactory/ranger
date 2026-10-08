@@ -237,7 +237,7 @@ export async function graphAdd(
  for (const label of spec.labels ?? []) args.push("--label", label);
  if (spec.body !== undefined) args.push("--body", spec.body);
  args.push("--repo", somaRepo(ref), "--json");
- const result = await callWrite(args, token, opts);
+ const result = await callWrite(repo, args, token, opts);
  if (result.code !== 0) {
   const message = (created: string) =>
    `soma graph add below ${parent} (${repo}) failed (exit ${result.code})${created}: ${(result.stderr || result.stdout).trim()}`.slice(0, 600);
@@ -269,7 +269,7 @@ export async function graphLink(
  node = writeNodeId(ref, node);
  parent = writeNodeId(ref, parent);
  const args = ["graph", "link", node, "--parent", parent, "--repo", somaRepo(ref), "--json"];
- const result = await callWrite(args, token, opts);
+ const result = await callWrite(repo, args, token, opts);
  if (result.code !== 0) {
   throw new GraphWriteError(
    `soma graph link ${node} --parent ${parent} (${repo}) failed (exit ${result.code}): ${(result.stderr || result.stdout).trim()}`.slice(0, 600),
