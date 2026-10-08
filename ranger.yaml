@@ -132,6 +132,9 @@ maps:
   # autoMerge off — ranger runs through soma's own close gate, so every
   # soma PR keeps the one-tap merge card. Walkable after soma #744 (legacy
   # receipts) and #745 (bun test left a pnpm lockfile in the checkout).
+  # `bun run test` carries soma's per-test timeout (its package.json); bare
+  # `bun test` gives each test 5 s, which soma's install tests overrun under
+  # load (2026-10-08, soma #767).
   - repo: the-metafactory/soma
     root: 604
     walk: full
@@ -139,7 +142,7 @@ maps:
     localCheckout: ~/work/mf/soma
     commands:
       install: bun install --frozen-lockfile
-      test: bun test && bun run typecheck
+      test: bun run test && bun run typecheck
     discord:
       tokenEnv: RANGER_DISCORD_TOKEN
       channelId: "1505550997764833444"
@@ -150,7 +153,7 @@ maps:
     localCheckout: ~/work/mf/soma
     commands:
       install: bun install --frozen-lockfile
-      test: bun test && bun run typecheck
+      test: bun run test && bun run typecheck
     discord:
       tokenEnv: RANGER_DISCORD_TOKEN
       channelId: "1505550997764833444"
@@ -161,7 +164,7 @@ maps:
     localCheckout: ~/work/mf/soma
     commands:
       install: bun install --frozen-lockfile
-      test: bun test && bun run typecheck
+      test: bun run test && bun run typecheck
     discord:
       tokenEnv: RANGER_DISCORD_TOKEN
       channelId: "1505550997764833444"
@@ -172,7 +175,7 @@ maps:
     localCheckout: ~/work/mf/soma
     commands:
       install: bun install --frozen-lockfile
-      test: bun test && bun run typecheck
+      test: bun run test && bun run typecheck
     discord:
       tokenEnv: RANGER_DISCORD_TOKEN
       channelId: "1505550997764833444"
@@ -183,7 +186,7 @@ maps:
     localCheckout: ~/work/mf/soma
     commands:
       install: bun install --frozen-lockfile
-      test: bun test && bun run typecheck
+      test: bun run test && bun run typecheck
     discord:
       tokenEnv: RANGER_DISCORD_TOKEN
       channelId: "1505550997764833444"
@@ -196,7 +199,7 @@ maps:
     localCheckout: ~/work/mf/soma
     commands:
       install: bun install --frozen-lockfile
-      test: bun test && bun run typecheck
+      test: bun run test && bun run typecheck
     discord:
       tokenEnv: RANGER_DISCORD_TOKEN
       channelId: "1505550997764833444"
@@ -209,7 +212,7 @@ maps:
     localCheckout: ~/work/mf/soma
     commands:
       install: bun install --frozen-lockfile
-      test: bun test && bun run typecheck
+      test: bun run test && bun run typecheck
     discord:
       tokenEnv: RANGER_DISCORD_TOKEN
       channelId: "1505550997764833444"
