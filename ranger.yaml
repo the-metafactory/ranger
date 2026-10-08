@@ -25,7 +25,7 @@ maps:
     autoMerge: true
     commands:
       install: bun install --frozen-lockfile
-      test: bun test && bunx tsc --noEmit
+      test: bun run test && bunx tsc --noEmit
     # The principal's checkout: `ranger serve` (#37) opens grilling
     # sessions here, never in the machine account's canonical clone.
     localCheckout: ~/work/mf/ranger
@@ -44,7 +44,7 @@ maps:
     autoMerge: true
     commands:
       install: bun install --frozen-lockfile
-      test: bun test && bunx tsc --noEmit
+      test: bun run test && bunx tsc --noEmit
     localCheckout: ~/work/mf/ranger
     discord:
       tokenEnv: RANGER_DISCORD_TOKEN
@@ -58,7 +58,7 @@ maps:
     autoMerge: true
     commands:
       install: bun install --frozen-lockfile
-      test: bun test && bunx tsc --noEmit
+      test: bun run test && bunx tsc --noEmit
     localCheckout: ~/work/mf/ranger
     discord:
       tokenEnv: RANGER_DISCORD_TOKEN

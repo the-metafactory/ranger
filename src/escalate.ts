@@ -6,7 +6,7 @@ import type { EscalationDiscord } from "./discord.ts";
 import { classify, hitlWaiting, loadProbeRegistry } from "./route.ts";
 import { BudgetDeferral, budgetPolicy, budgetedRead } from "./budget.ts";
 import { readFrontier } from "./frontier-cache.ts";
-import { GRAPH_CALL_TIMEOUT_MS, graphAudit } from "./graph.ts";
+import { GRAPH_CALL_TIMEOUT_MS, graphAudit, graphNode } from "./graph.ts";
 import { type OwnedCheck, withEscalateLock } from "./lock.ts";
 import type { ResolvedToken } from "./token-gate.ts";
 import type { Journal } from "./journal.ts";
@@ -143,6 +143,14 @@ async function escalateOneMap(
         now,
         budget: { remaining: ABSENT_RESERVE, deadline: passDeadline },
         owned,
+        readNode: id => {
+          if (Date.now() >= passDeadline) throw new BudgetDeferral("graph closure pass deadline reached");
+          return budgetedRead(journal, map.repo, token, budgetPolicy(config), now, () => {
+            const remaining = passDeadline - Date.now();
+            if (remaining <= 0) throw new BudgetDeferral("graph closure pass deadline reached");
+            return graphNode(map.repo, id, token, { timeoutMs: Math.min(GRAPH_CALL_TIMEOUT_MS, remaining) });
+          });
+        },
       },
       neededIds,
     );
