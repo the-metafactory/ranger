@@ -1411,6 +1411,33 @@ describe("implement lane (node #23)", () => {
   expect(events.some((d) => d.includes("fix-the-base filing for probe-hud.mjs") && d.includes("graph add refused"))).toBe(true);
  }, 60_000);
 
+ for (const filedHere of [false, true]) {
+  test(`a cache hit ${filedHere ? "at a base the map already filed for files nothing" : "files the map's fix node"} (node #152)`, async () => {
+   const r = await rig({ probe: "fake-probe red {node}", probeRetry: "fake-probe red {node} {failed}" });
+   cleanup.push(r.dir);
+   await seedProbeOnBase(r);
+   const sha = await r.github.sha("main");
+   r.journal.setHealth(`base-red-checks.acme/widgets.${sha}.probe-hud.mjs`, JSON.stringify(["the hud draws"]));
+   if (filedHere) r.journal.setHealth("base-red-fix.acme/widgets#1.probe-hud.mjs", JSON.stringify({ node: "98", sha }));
+   const added: { parent: string; spec: { body?: string } }[] = [];
+   r.ctx.fixNode = {
+    add: async (parent, spec) => { added.push({ parent, spec }); return { node: "99" }; },
+    status: async () => { throw new Error("no status read expected"); },
+   };
+   const calls = watchBaseRuns(r);
+   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+   expect(calls.filter((c) => c.cwd.includes("ranger-probe-base-"))).toEqual([]);
+   if (filedHere) {
+    expect(added).toEqual([]);
+   } else {
+    expect(added).toHaveLength(1);
+    expect(added[0].parent).toBe("20");
+    expect(added[0].spec.body).toContain(sha);
+    expect(JSON.parse(r.journal.getHealth("base-red-fix.acme/widgets#1.probe-hud.mjs")!)).toMatchObject({ node: "99", sha, pr: 1 });
+   }
+  }, 60_000);
+ }
+
  test("cached base-red assertions certify a later PR with journal and PR cache provenance", async () => {
   const r = await rig({ probe: "fake-probe red {node}", probeRetry: "fake-probe red {node} {failed}" });
   cleanup.push(r.dir);

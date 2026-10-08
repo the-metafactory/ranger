@@ -115,12 +115,30 @@ describe("fix-the-base node for a confirmed base-red probe (node #152)", () => {
   expect(events().some((d) => d.includes(`filed fix-the-base node #300 below #${ctx.node.ref.id}`))).toBe(true);
  });
 
- test("only a first cache write counts: a cache hit or an unconfirmed comparison files nothing", async () => {
+ test("a cache hit without the map's record files the node", async () => {
   ctx.journal.setHealth(`base-red-checks.acme/widgets.${sha}.${HUD}`, JSON.stringify(["draws"]));
-  expect(await confirmAndFile()).toMatchObject({ cached: [HUD], confirmed: [] });
-  ctx.journal.setHealth(`base-red-checks.acme/widgets.${sha}.${HUD}`, "{");
+  answers = [];
+  expect(await confirmAndFile(failed(["draws"]))).toMatchObject({ cached: [HUD], confirmed: [] });
+  expect(added).toHaveLength(1);
+  expect(added[0].spec.body).toContain("draws");
+  expect(JSON.parse(ctx.journal.getHealth(baseRedFixKey(ctx.map, HUD))!)).toMatchObject({ node: "300", sha });
+ });
+
+ test("a cache hit at the merge base the map already filed for files nothing and reads nothing, open or closed", async () => {
+  await confirmAndFile();
+  statusFails = new Error("no status read expected");
+  for (const status of ["open", "closed"]) {
+   statuses.set("300", status);
+   answers = [];
+   expect(await confirmAndFile()).toMatchObject({ cached: [HUD], confirmed: [] });
+  }
+  expect(added).toHaveLength(1);
+  expect(events().some((d) => d.includes("no status read expected"))).toBe(false);
+ });
+
+ test("an unconfirmed comparison files nothing", async () => {
   answers = [failed(), pass];
-  expect(await confirmAndFile()).toMatchObject({ unconfirmed: [HUD], confirmed: [] });
+  expect(await confirmAndFile()).toMatchObject({ unconfirmed: [HUD], confirmed: [], cached: [] });
   expect(added).toEqual([]);
  });
 
@@ -132,11 +150,13 @@ describe("fix-the-base node for a confirmed base-red probe (node #152)", () => {
   expect(events().some((d) => d.includes(`fix-the-base node #300 for ${HUD} is open — not filing another`))).toBe(true);
  });
 
- test("the record is per map: another map on the same repo files its own node", async () => {
+ test("the record is per map: another map on the same base files its own node from the cache hit", async () => {
   await confirmAndFile();
   ctx.map = { ...ctx.map, root: 460 };
-  await fileBaseRedFixNodes(ctx, { sha: LATER, confirmed: [HUD] }, PR);
+  answers = [];
+  expect(await confirmAndFile()).toMatchObject({ cached: [HUD], confirmed: [] });
   expect(added).toHaveLength(2);
+  expect(JSON.parse(ctx.journal.getHealth(baseRedFixKey(ctx.map, HUD))!)).toMatchObject({ node: "301", sha });
  });
 
  test("once the earlier fix node is closed, a later base confirmed red files a new node", async () => {
@@ -149,15 +169,16 @@ describe("fix-the-base node for a confirmed base-red probe (node #152)", () => {
   expect(JSON.parse(ctx.journal.getHealth(baseRedFixKey(ctx.map, HUD))!)).toMatchObject({ node: "301", sha: LATER });
  });
 
- test("a failed add leaves the verdict, journals the failure and is retried at the next confirmation", async () => {
+ test("a failed add leaves the verdict, journals the failure and is retried at the next cache hit", async () => {
   addFails = new GraphWriteError("soma graph add below 1 (acme/widgets) failed (exit 1): boom");
   const base = await confirmAndFile();
   expect(base).toMatchObject({ red: [HUD], confirmed: [HUD], unconfirmed: [] });
   expect(ctx.journal.getHealth(`base-red-checks.acme/widgets.${sha}.${HUD}`)).toBe('["draws","mounts"]');
   expect(ctx.journal.getHealth(baseRedFixKey(ctx.map, HUD))).toBeNull();
-  expect(events().some((d) => d.includes(`fix-the-base filing for ${HUD} at ${sha.slice(0, 8)} failed (retried at its next confirmation)`) && d.includes("boom"))).toBe(true);
+  expect(events().some((d) => d.includes(`fix-the-base filing for ${HUD} at ${sha.slice(0, 8)} failed (retried the next time it is found red at a merge base)`) && d.includes("boom"))).toBe(true);
   addFails = null;
-  await fileBaseRedFixNodes(ctx, { sha: LATER, confirmed: [HUD] }, PR);
+  answers = [];
+  expect(await confirmAndFile()).toMatchObject({ cached: [HUD], confirmed: [] });
   expect(added).toHaveLength(2);
   expect(JSON.parse(ctx.journal.getHealth(baseRedFixKey(ctx.map, HUD))!).node).toBe("300");
  });
@@ -168,7 +189,7 @@ describe("fix-the-base node for a confirmed base-red probe (node #152)", () => {
   await fileBaseRedFixNodes(ctx, { sha: LATER, confirmed: [HUD] }, PR);
   expect(added).toHaveLength(1);
   expect(JSON.parse(ctx.journal.getHealth(baseRedFixKey(ctx.map, HUD))!).node).toBe("300");
-  expect(events().some((d) => d.includes("failed (retried at its next confirmation): rate limited"))).toBe(true);
+  expect(events().some((d) => d.includes("failed (retried the next time it is found red at a merge base): rate limited"))).toBe(true);
  });
 
  test("the default port writes under the machine account's token, never the principal's", async () => {
