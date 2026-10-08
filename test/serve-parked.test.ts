@@ -23,7 +23,7 @@ import {
  ciState,
  classifyReason,
  mergeRefusal,
- MACHINE_GH_KEYS,
+ MACHINE_FORGE_KEYS,
  needsYouEntries,
  awaitingMergeEntries,
  type NeedsYouInputs,
@@ -535,7 +535,7 @@ describe("node #54 — the actions and their guards", () => {
   expect(res.status).toBe(200);
   expect(runs).toHaveLength(3);
   expect(runs[0].argv).toEqual(["gh", "pr", "merge", "687", "--repo", SEELITE, "--squash", "--match-head-commit", SHA]);
-  for (const key of MACHINE_GH_KEYS) expect(runs[0].env[key]).toBeUndefined();
+  for (const key of MACHINE_FORGE_KEYS) expect(runs[0].env[key]).toBeUndefined();
   expect(Object.keys(runs[0].env).some((k) => /TOKEN/.test(k))).toBe(false);
   expect(runs[0].env.HOME).toBe("/Users/someone");
  });
@@ -680,7 +680,7 @@ describe("node #54 — the actions and their guards", () => {
   expect(res.status).toBe(200);
   expect(runs).toHaveLength(3);
   expect(seen).toEqual([{ repo: SEELITE, sha: SHA, env: runs[0].env }]); // the merge's own environment
-  for (const key of MACHINE_GH_KEYS) expect(seen[0].env[key]).toBeUndefined();
+  for (const key of MACHINE_FORGE_KEYS) expect(seen[0].env[key]).toBeUndefined();
  });
 
  for (const [why, full, says] of [

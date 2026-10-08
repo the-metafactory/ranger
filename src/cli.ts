@@ -34,9 +34,7 @@ import {
 } from "./token-gate.ts";
 import { openJournal, type Journal } from "./journal.ts";
 import {
- assertNotPrincipal,
- resolveBotIdentity,
- resolveWriteToken,
+ assertWriteIdentity,
  WriteGateError,
 } from "./identity.ts";
 import { canonicalDir, runNode } from "./worker.ts";
@@ -207,10 +205,7 @@ function loadCtx(configPath: string): {
 async function writeContext(config: RangerConfig, map: RangerMapConfig) {
  const refusal = executionRefusal(map.repo);
  if (refusal !== null) throw new WriteGateError(refusal);
- const credential = resolveWriteToken(config, map.repo);
- const botIdentity = await resolveBotIdentity(config, credential.token);
- assertNotPrincipal(config, botIdentity);
- return { token: credential.token, botIdentity };
+ return assertWriteIdentity(config, map.repo);
 }
 
 async function runWalk(configPath: string): Promise<string> {

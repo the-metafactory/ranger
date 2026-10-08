@@ -1,3 +1,4 @@
+import { principalLoginForRepo } from "./config.ts";
 import { mapKey } from "./maps.ts";
 import { join } from "node:path";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
@@ -304,7 +305,7 @@ async function digestOneMap(
       ageCounts: openCards,
       audit,
       budget: base.budget,
-      principal: config.principal.login,
+      principal: principalLoginForRepo(config, map.repo) ?? "principal",
       principalDiscordId: config.principal.discordId,
       now,
     });
