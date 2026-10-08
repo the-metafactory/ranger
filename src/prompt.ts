@@ -130,8 +130,17 @@ const PROBE_TIER_RULE = `- Browser probes: run only the probes that cover what y
   probe you write. Do NOT run the full probe suite (for example \`npm run probe\`):
   the supervisor runs it once on the final reviewed head, and only that run counts.`;
 
-const LOCAL_TEST_RULE = `- Run the repo's tests ({{test}}) and make them pass. The supervisor runs the same
-  command after you exit and refuses to push on a failure.`;
+/**
+ * The supervisor runs the map's whole test command after every pass, so a
+ * worker that reruns it after each edit spends most of its wall clock
+ * certifying nothing (found live on ranger #164: four full ~10-minute suite
+ * runs in one 57-minute fix pass, then the supervisor's own 14-minute run).
+ */
+const LOCAL_TEST_RULE = `- Tests: while you work, run only the test files that cover what you changed, plus any
+  new test you write (and the typecheck, if the test command has one). Run the repo's
+  full test command ({{test}}) ONCE, right before your final commit, and make it pass:
+  the supervisor runs the same command after you exit and refuses to push on a failure,
+  so every earlier full run only repeats work.`;
 const REMOTE_TEST_RULE = `- Leave the map's dependency install and test command to the supervisor's reviewed
   remote profile. Do not run those commands locally. Commit clean source for testing;
   the supervisor refuses to push without a matching passed remote receipt.`;

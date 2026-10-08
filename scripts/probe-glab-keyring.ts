@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 import { glabConfigEnv } from "../src/glab-config-dir.ts";
 import { runCmd } from "../src/exec.ts";
-import { parseGlabResponse } from "../src/token-gate.ts";
+import { parseGlabResponse } from "../src/glab-transport.ts";
 
 /** Operator-only probe: run under the principal's Mac login, never in CI. */
 export async function probeGlabKeyring(host: string, runner: typeof runCmd = runCmd): Promise<number> {

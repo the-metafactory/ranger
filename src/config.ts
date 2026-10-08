@@ -6,6 +6,7 @@ import { isAbsolute, resolve } from "node:path";
 import { parse } from "yaml";
 import { z } from "zod";
 import { parseForgeRef, repoIdentity, validReadTokenPrefix } from "./forge-ref.ts";
+import { workerEnvPasses } from "./untrusted-env.ts";
 export { REPO_PATTERN } from "./forge-ref.ts";
 
 /**
@@ -179,6 +180,12 @@ const ServeSchema = z.object({
  extraMaps: z.array(ServeMapSchema).default([]),
 });
 
+/** A credential env var name. Refused when workerHostEnv would pass it to
+ *  untrusted worker code (e.g. SOMA_*, GIT_*): naming a token there would hand
+ *  it to every worker session. */
+const credentialEnvName = z.string().min(1).refine(name => !workerEnvPasses(name),
+ name => ({ message: `credential env var ${name} would be inherited by worker sessions; use a RANGER_* name` }));
+
 const AuthSchema = z.object({
  /**
   * Repo-prefix → env var name holding a read-only PAT. Bare keys match only
@@ -186,33 +193,42 @@ const AuthSchema = z.object({
   * Tokens are NEVER inlined
   * here — only the env var name that holds them. (Node #8 token gate.)
   */
- readOnlyTokens: z.record(z.string().refine(validReadTokenPrefix, "expected a bare GitHub prefix or forge:host/path prefix"), z.string().min(1)).default({}),
+ readOnlyTokens: z.record(z.string().refine(validReadTokenPrefix, "expected a bare GitHub prefix or forge:host/path prefix"), credentialEnvName).default({}),
  /** GitHub fallback only; GitLab always requires an explicit qualified mapping. */
- defaultTokenEnv: z.string().optional(),
+ defaultTokenEnv: credentialEnvName.optional(),
  /**
   * Repo-prefix → env var name holding the machine-account WRITE credential
   * (classic `repo`-scoped PAT — node #11). Longest-prefix match, same shape as
   * readOnlyTokens. Graph-mutating ticks refuse to run without one.
   */
- writeTokens: z.record(z.string(), z.string()).default({}),
- /** Fallback env var name for the write credential. */
- defaultWriteTokenEnv: z.string().optional(),
+ writeTokens: z.record(z.string().refine(validReadTokenPrefix, "expected a bare GitHub prefix or forge:host/path prefix"), credentialEnvName).default({}),
+ /** GitHub fallback only; GitLab requires a qualified mapping. */
+ defaultWriteTokenEnv: credentialEnvName.optional(),
 });
 
 /**
  * The machine account (design §2). `identity` is the login ranger labels
- * claims/closes with (`soma graph ... --identity <login>`); it defaults to the
- * login resolved from the write token. Graph-mutating ticks refuse when the
+ * GitHub claims/closes with (`soma graph ... --identity <login>`); it defaults
+ * to the login resolved from the write token. GitLab always resolves its
+ * host's project bot from the credential. Graph-mutating ticks refuse when the
  * resolved identity equals the principal's login.
  */
 const BotSchema = z.object({
- /** Machine-account login (e.g. `ivy-agent`). Optional — resolved from token. */
+ /** GitHub machine-account login (e.g. `ivy-agent`). Optional token identity pin. */
  identity: z.string().optional(),
 });
 
 const PrincipalSchema = z.object({
- /** The principal's login — the identity autonomous graph-mutation may never run under. */
- login: z.string().default("jcfischer"),
+ /** Scalar means GitHub; host maps are forge:host → login. Missing host policy refuses writes. */
+ login: z.union([
+  z.string().min(1),
+  z.record(z.string().refine(key => {
+   try {
+    const ref = parseForgeRef(`${key}/group/project`);
+    return key === `${ref.forge}:${ref.host}`;
+   } catch { return false; }
+  }, "expected forge:host"), z.string().min(1)),
+ ]).default("jcfischer"),
  /** Discord user id for the aged-card @-mention; absent → no pings. */
  discordId: z.string().optional(),
 });
@@ -327,6 +343,15 @@ export type RangerMapConfig = z.infer<typeof MapSchema>;
 export type RangerAuthConfig = z.infer<typeof AuthSchema>;
 export type RangerBotConfig = z.infer<typeof BotSchema>;
 export type RangerConfig = z.infer<typeof RangerConfigSchema>;
+
+/** The legacy scalar names GitHub only; no cross-host principal fallback. */
+export function principalLoginForRepo(config: RangerConfig, repo: string): string | undefined {
+ const ref = parseForgeRef(repo);
+ const login = config.principal.login;
+ return typeof login === "string"
+  ? (ref.forge === "github" ? login : undefined)
+  : login?.[`${ref.forge}:${ref.host}`];
+}
 export type RangerServeConfig = z.infer<typeof ServeSchema>;
 
 /** The `serve` block with its defaults filled, present or not. */

@@ -10,9 +10,7 @@ import { readFrontier } from "./frontier-cache.ts";
 import { GRAPH_CALL_TIMEOUT_MS } from "./graph.ts";
 import { graphClaim, type ClaimResult } from "./graph-write.ts";
 import {
- assertNotPrincipal,
- resolveBotIdentity,
- resolveWriteToken,
+ assertWriteIdentity,
  WriteGateError,
 } from "./identity.ts";
 import type { Journal } from "./journal.ts";
@@ -372,10 +370,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
   let token: string;
   let botIdentity: string;
   try {
-   const credential = resolveWriteToken(config, map.repo);
-   token = credential.token;
-   botIdentity = await resolveBotIdentity(config, token);
-   assertNotPrincipal(config, botIdentity);
+   ({ token, botIdentity } = await assertWriteIdentity(config, map.repo));
   } catch (error) {
    mapResult.gated = true;
    mapResult.gateReason =

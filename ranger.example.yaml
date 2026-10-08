@@ -83,9 +83,9 @@ maps:
       tokenEnv: RANGER_DISCORD_TOKEN
       channelId: "1487052222067118111"
 
-# The machine account (design §2). `identity` is the login ranger labels
-# claims/closes with (soma graph ... --identity <login>); it defaults to the
-# login resolved from the write token. Graph-mutating ticks REFUSE when the
+# The machine account (design §2). `identity` optionally pins the GitHub bot.
+# GitLab resolves each host's project bot from its write credential, so this
+# GitHub pin can stay in a mixed-forge config. Graph-mutating ticks REFUSE when the
 # resolved identity equals the principal's login.
 bot:
   identity: ivy-agent

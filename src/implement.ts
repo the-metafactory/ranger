@@ -1,3 +1,4 @@
+import { principalLoginForRepo } from "./config.ts";
 import { executionRefusal, fileStemFor } from "./forge-ref.ts";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
@@ -1319,8 +1320,11 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
    );
   }
   // One fix pass per review that found blockers or majors. On a resume the review is
-  // re-read from its PR comment, so a crash between review and fix loses nothing.
-  const fixed = await workerPass(ctx, testCommand, { kind: "fix", round: current.round, body: current.body });
+  // re-read from its PR comment, so a crash between review and fix loses nothing,
+  // and a fix an earlier run committed but never pushed is adopted, as a build is.
+  const fixed =
+   (await adoptBuiltWork(ctx, testCommand, { round: current.round, pushedHead: live.headSha })) ??
+   (await workerPass(ctx, testCommand, { kind: "fix", round: current.round, body: current.body }));
   workerExit = fixed.workerExit;
   if (fixed.failure !== undefined) return fixed.failure;
   await publishPass(ctx, github, open.iid, fixed, "push fix", `fix pass ${current.round} @ ${fixed.sha.slice(0, 8)}`);
@@ -1446,7 +1450,8 @@ async function publishPass(
  });
  recordKnownGood(ctx.journal, ctx.canonical, vetted, "vetted push");
  ctx.journal.recordEvent("pushed", { nodeId: ctx.node.ref.id, repo: ctx.map.repo, detail });
- recordHead(ctx, pass.sha);
+ // An adopted pass keeps the record of the session that wrote it.
+ if (pass.adopted !== true) recordHead(ctx, pass.sha);
  await awaitHead(github, ctx.map.repo, prNumber, pass.sha, ctx.token, ctx.headPollMs);
 }
 
@@ -1651,6 +1656,11 @@ async function checkedWorkerPass(
  // changed since the supervisor last saw it clean is never this pass's baseline.
  const snapshot = await trustedSnapshot(journal, ctx.canonical, { repo: map.repo, nodeId }, mapKey(map));
  const before = await headSha(worktree);
+ // origin/<base> as the supervisor holds it before the worker runs: the base
+ // a failing test is compared with (node #164) is never a ref the worker or
+ // its tests could have moved.
+ const baseRef = await safeGit(["rev-parse", "--verify", `refs/remotes/origin/${map.base}^{commit}`], { cwd: worktree, timeoutMs: 30_000 });
+ const baseTip = baseRef.code === 0 && /^[0-9a-f]{40}$/.test(baseRef.stdout.trim()) ? baseRef.stdout.trim() : null;
  const prompt = assembleImplementPrompt({
   repo: map.repo,
   node: {
@@ -1744,11 +1754,12 @@ async function checkedWorkerPass(
    `worker left ${dirty.length} uncommitted or untracked file(s) (${dirty.slice(0, 5).join("; ")}) — the tests would not test what gets pushed`,
   );
  }
- const { tests, retried } = await supervisorTests(ctx, testCommand, pass);
- if (tests.code !== 0) return fail(testsFailedDetail(testCommand, tests, "after the worker"));
- if (retried) {
-  // The pass was certified in a fresh clone: the worktree still holds what
-  // the failed run left, and the probes run there next.
+ const { tests, retried, baseRed } = await supervisorTests(ctx, testCommand, pass, baseTip);
+ if (tests.code !== 0 && baseRed === undefined) return fail(testsFailedDetail(testCommand, tests, "after the worker"));
+ if (retried || baseRed !== undefined) {
+  // The pass was certified in a fresh clone, or its failures are the base's:
+  // the worktree still holds what the failed run left, and the probes run
+  // there next.
   const restored = await restoreWorktree(ctx, sha);
   if (restored !== null) return fail(restored);
  }
@@ -1757,6 +1768,8 @@ async function checkedWorkerPass(
  const clean = await assertGitUntouched(ctx.canonical, snapshot);
  recordKnownGood(journal, ctx.canonical, clean, `passing ${pass}`);
  await assertNoClosingKeywords(worktree, map.base);
+ // Only a pass that goes on to the push puts its waived tests in the receipts.
+ if (baseRed !== undefined) recordTestsBaseRed(journal, map.repo, ctx.node.ref.id, { head: sha, base: baseRed.sha, names: baseRed.names, rest: baseRed.rest });
  return { workerExit: result.code, snapshot, sha };
 }
 
@@ -1953,13 +1966,221 @@ function reviewComment(round: number, verdict: ReviewVerdict, substrate?: Substr
  return head + body;
 }
 
-/** The first three failing tests a run names, in bun's `(fail) <name> [12ms]` format. */
-export function failedTestNames(result: RunResult): string[] {
- const names = new Set<string>();
- for (const m of `${result.stdout}\n${result.stderr}`.matchAll(/^\(fail\) (.+?)(?: \[[\d.]+m?s\])?$/gm)) {
-  names.add(m[1].trim());
+/** Every failing test a run names, in bun's `(fail) <name> [12ms]` format, each once. */
+export function allFailedTestNames(result: RunResult): string[] {
+ return [...new Set(failedTests(result).map((t) => t.name))];
+}
+
+/**
+ * One `(fail)` line: its name, the test file whose header preceded it (""
+ * when none did), and its cause: the error bun printed for it, as failingCause
+ * normalizes it ("" when bun printed none).
+ */
+export interface FailedTest {
+ file: string;
+ name: string;
+ cause: string;
+}
+
+/** bun's recap of the failures, printed after more than 20 passes outside AI mode: `4 tests failed:`. */
+const RECAP = /^\d+ tests? failed:$/;
+
+/**
+ * An error line as a cause: absolute paths and digits masked, so the same
+ * error in the node's worktree and in a fresh clone of the base (another
+ * directory, other timings) reads the same, while an assertion and a
+ * TypeError, or two different messages, do not.
+ */
+function failingCause(line: string): string {
+ return line
+  .trim()
+  .replace(/(?:\/[^\s'"`():,]+)+/g, "<path>")
+  .replace(/\d+/g, "N");
+}
+
+/**
+ * Every `(fail)` line a run prints, in order and with repeats: two tests
+ * with one title are two failures. bun heads each file's results with its
+ * path relative to the checkout (`test/a.test.ts:`), the same in a fresh
+ * clone of the base; a `(fail)` line takes the last header in its stream.
+ * Its cause is the last error line (`error: …`, `TypeError: …`) printed
+ * since the previous result line or header, and a timeout note bun prints
+ * after it (`  ^ this test timed out after 50ms.`). The last, not the first:
+ * a test's own `console.error` output shares the stream and comes before
+ * the error bun prints for it, just above the `(fail)` line. bun 1.3.14
+ * prints no nested `cause`, only the outer error.
+ *
+ * bun's recap of the failures repeats each `(fail)` line after the last
+ * file: a stream's lines stop counting at its recap header. A test that
+ * prints that header itself makes the count fall short of bun's summary,
+ * which gates (failuresAllNamed); it never waives.
+ */
+export function failedTests(result: RunResult): FailedTest[] {
+ const tests: FailedTest[] = [];
+ for (const stream of [result.stdout, result.stderr]) {
+  let file = "";
+  let cause = "";
+  let last: FailedTest | null = null;
+  for (const line of stream.split("\n")) {
+   if (RECAP.test(line)) break;
+   const header = /^(\S[^:]*\.[cm]?[jt]sx?):$/.exec(line);
+   const m = /^\(fail\) (.+?)(?: \[[\d.]+m?s\])?$/.exec(line);
+   if (m) {
+    last = { file, name: m[1].trim(), cause };
+    tests.push(last);
+   } else if (last !== null && /^\s+\^ this test timed out/.test(line)) {
+    last.cause = [last.cause, failingCause(line.replace(/^\s+\^\s*/, ""))].filter((c) => c !== "").join(" / ");
+    continue;
+   } else if (/^(?:error|[A-Z]\w*Error)(?:: |$)/.test(line)) {
+    cause = failingCause(line);
+   }
+   if (header || m || /^\((?:pass|skip|todo)\) /.test(line)) {
+    if (header) file = header[1];
+    cause = "";
+    if (!m) last = null;
+   }
+  }
  }
- return [...names].slice(0, 3);
+ return tests;
+}
+
+/** A failing test as an event names it: `file: name`, or the bare name when no header preceded it. */
+function testIdentity(t: FailedTest): string {
+ return t.file === "" ? t.name : `${t.file}: ${t.name}`;
+}
+
+/**
+ * Whether the run's failures are all bun's named ones, as far as the output
+ * shows: bun's summary counts as many failing tests as there are `(fail)`
+ * lines, no error is reported outside a test (a file that does not load, an
+ * unhandled error between tests), and no TypeScript diagnostic (`error
+ * TS2322:`) shows a typecheck failing beside the tests. bun counts a file
+ * that fails to load as a failing test with no `(fail)` line, so a shared
+ * named failure must not hide it. A run without bun's summary is not
+ * accounted for. Another step's failure in the command that prints none of
+ * these is not seen here: testsRedAtBase waives only the `bun test` step
+ * (bunTestChain) and runs every other step on its own, which must pass.
+ * The `(fail)` lines are failedTests', without bun's recap.
+ */
+export function failuresAllNamed(result: RunResult): boolean {
+ const out = `${result.stdout}\n${result.stderr}`;
+ const lines = failedTests(result).length;
+ const counted = [...out.matchAll(/^\s*(\d+) fail$/gm)];
+ const errors = [...out.matchAll(/^\s*(\d+) errors?$/gm)].reduce((n, m) => n + Number(m[1]), 0);
+ return (
+  counted.length > 0 &&
+  counted.reduce((n, m) => n + Number(m[1]), 0) === lines &&
+  errors === 0 &&
+  !/^# Unhandled error/m.test(out) &&
+  !/\berror TS\d+:/m.test(out)
+ );
+}
+
+/**
+ * The branch's failing tests the base run does not fail as often, file,
+ * title and cause alike: each counts once per `(fail)` line, so a second
+ * failing test sharing a title with a base-red one is not waived by it, and
+ * a test that fails another way at the base (an assertion there, a
+ * TypeError on the branch) is not the base's failure.
+ */
+export function failuresNotAtBase(branch: FailedTest[], base: FailedTest[]): string[] {
+ const key = (t: FailedTest) => `${testIdentity(t)}\u0000${t.cause}`;
+ const count = (tests: FailedTest[]) => {
+  const n = new Map<string, number>();
+  for (const t of tests) n.set(key(t), (n.get(key(t)) ?? 0) + 1);
+  return n;
+ };
+ const said = (cause: string) => (cause === "" ? "no error line" : `"${cause}"`);
+ const there = count(base);
+ return [...count(branch)].flatMap(([k, n]) => {
+  const at = there.get(k) ?? 0;
+  if (n <= at) return [];
+  const [id, cause] = k.split("\u0000");
+  const otherwise = [...new Set(base.filter((t) => testIdentity(t) === id && t.cause !== cause).map((t) => said(t.cause)))];
+  if (at === 0 && otherwise.length > 0) return [`${id} (fails with ${said(cause)} on the branch, ${otherwise.join(" / ")} at the base)`];
+  return [n === 1 && at === 0 ? id : `${id} (${n} on the branch, ${at} at the base)`];
+ });
+}
+
+/**
+ * Whether the run reports coverage the way bun enforces a threshold: its
+ * coverage table printed, or `--coverage` in the command. A missed
+ * threshold fails the run with no `(fail)` line and no failing count (bun
+ * 1.3.14 prints only the table and exits 1), so a shared failing test beside
+ * it cannot be told apart from a coverage regression.
+ */
+export function coverageInPlay(testCommand: string, result: RunResult): boolean {
+ return /(?:^|\s)--coverage(?:[\s=]|$)/.test(testCommand) || /^\s*File\s+\|\s+% (?:Funcs|Lines)/m.test(`${result.stdout}\n${result.stderr}`);
+}
+
+/** One step of a test command: plain words, nothing the shell expands, redirects or chains. */
+const PLAIN_STEP = /^[\w./@:=+,%-]+(?: +[\w./@:=+,%-]+)*$/;
+
+/**
+ * A test command a base-red waiver can split: plain steps joined by `&&`,
+ * exactly one of them `bun test`. `rest` is every other step, in order,
+ * joined by `&&` ("" when the command is `bun test` alone). Null for any
+ * other shape (`;`, `||`, a pipe, quotes, an expansion, two bun steps, a
+ * script that runs bun inside): what failed beside bun cannot be told apart.
+ */
+export function bunTestChain(command: string): { rest: string } | null {
+ const steps = command.split("&&").map((s) => s.trim());
+ if (!steps.every((s) => PLAIN_STEP.test(s))) return null;
+ const bun = steps.filter((s) => /^bun test(?: |$)/.test(s));
+ if (bun.length !== 1) return null;
+ return { rest: steps.filter((s) => s !== bun[0]).join(" && ") };
+}
+
+/** One waived supervisor test run: the branch head, its merge base, the base-red tests, and the other steps that passed alone. */
+export interface TestsBaseRed {
+ head: string;
+ base: string;
+ names: string[];
+ rest: string;
+}
+
+function testsBaseRedKey(repo: string, nodeId: string): string {
+ return `tests-base-red.${repo}.${nodeId}`;
+}
+
+/** Every waived supervisor test run this journal recorded for the node, oldest first. */
+export function recordedTestsBaseRed(journal: Journal, repo: string, nodeId: string): TestsBaseRed[] {
+ try {
+  const v = JSON.parse(journal.getHealth(testsBaseRedKey(repo, nodeId)) ?? "[]");
+  return Array.isArray(v) ? v : [];
+ } catch {
+  return [];
+ }
+}
+
+function recordTestsBaseRed(journal: Journal, repo: string, nodeId: string, waived: TestsBaseRed): void {
+ journal.setHealth(testsBaseRedKey(repo, nodeId), JSON.stringify([...recordedTestsBaseRed(journal, repo, nodeId), waived]));
+}
+
+/**
+ * What the PR and close receipts say about the supervisor's tests: "passed"
+ * only when no run was waived; otherwise each waived run, by head, merge
+ * base and test (node #164: a base-red pass is not a passing run).
+ */
+export function testsReceipt(command: string | undefined, where: string, waived: TestsBaseRed[]): string {
+ if (waived.length === 0) return `\`${command}\` passed ${where} before every push.`;
+ const code = (s: string) => `\`${s.replaceAll("`", "'")}\``;
+ const runs = waived.map((w) => {
+  const names = w.names.slice(0, 10).map(code).join(", ") + (w.names.length > 10 ? ` and ${w.names.length - 10} more` : "");
+  const rest = w.rest === "" ? "" : `; the other steps, ${code(w.rest)}, passed on their own`;
+  return `at \`${w.head.slice(0, 8)}\` it failed only on tests its merge base \`${w.base.slice(0, 8)}\` fails too (${names})${rest}`;
+ });
+ return `\`${command}\` ran ${where} before every push. It passed every time but these, whose failures were not gating: ${runs.join("; ")}.`;
+}
+
+/** An exit the shell reports for a signal (128 + N: 137 a kill, 143 a SIGTERM). */
+function signalExit(code: number): boolean {
+ return code > 128;
+}
+
+/** The first three failing tests a run names: what the journal line keeps. */
+export function failedTestNames(result: RunResult): string[] {
+ return allFailedTestNames(result).slice(0, 3);
 }
 
 /** A failed supervisor test run, named: the failing tests first (the journal keeps 400 characters), then the tail. */
@@ -1988,12 +2209,20 @@ function testsFailedDetail(testCommand: string, tests: RunResult, after: string)
  * commit; one that misreports itself (an `exit 0`, a redirected git
  * worktree) is the commit's behaviour, which no re-run can catch, and the
  * review reads that code.
+ *
+ * A failure that names its failing tests is then checked at its merge base
+ * with `baseTip` (testsRedAtBase): when the base run fails each of them, by file
+ * and title and as many times, with the same exit code, and the command's
+ * other steps pass on their own, they are the base's, and `baseRed` says the
+ * pass goes on as if the tests passed (the receipts say it did not). `tests`
+ * is always the branch's own run.
  */
 async function supervisorTests(
  ctx: ImplementContext,
  testCommand: string,
  label: string,
-): Promise<{ tests: RunResult; retried: boolean }> {
+ baseTip: string | null,
+): Promise<{ tests: RunResult; retried: boolean; baseRed?: BaseRedTests }> {
  const { journal, map, node, worktree } = ctx;
  const head = await headSha(worktree);
  let tests = await backendTests(ctx, head, () => runShell(testCommand, worktree, ctx, { label: `${label}: supervisor tests`, timeoutMs: TEST_TIMEOUT_MS, measureCpu: true }));
@@ -2008,8 +2237,11 @@ async function supervisorTests(
   return { tests, retried: false };
  }
  const retry = await retryOnBusyHost(ctx, testCommand, head, `tests (${testCommand})`, "the test retry", `${label}: supervisor test retry`);
- if (retry === null) return { tests, retried: false };
- tests = retry;
+ if (retry === null) return { tests, retried: false, ...await baseRedAt(ctx, { testCommand, tests, head, label, baseTip }) };
+ tests = retry.result;
+ // A retry that did not run validly (its clone, install or checkout check
+ // failed) certifies nothing: its (fail) lines are no evidence to waive.
+ if (!retry.ran) return { tests, retried: false };
  if (tests.code === 0 && (await headSha(worktree)) !== head) {
   tests = { ...tests, code: 1, stderr: `the retry passed at ${head.slice(0, 8)}, but the worktree moved off it meanwhile\n${tests.stderr}` };
  }
@@ -2017,14 +2249,180 @@ async function supervisorTests(
   journal.recordEvent("reviewed", { nodeId: node.ref.id, repo: map.repo, detail: `tests (${testCommand}) passed on the retry in a fresh checkout` });
   return { tests, retried: true };
  }
- return { tests, retried: false };
+ return { tests, retried: false, ...await baseRedAt(ctx, { testCommand, tests, head, label, baseTip }) };
+}
+
+/**
+ * Failing tests that fail at the merge base too, by file, title, count,
+ * error and exit code: as far as the two runs show, the base's failures.
+ */
+interface BaseRedTests {
+ sha: string;
+ names: string[];
+ /** The command's other steps, which passed on their own ("" when there are none). */
+ rest: string;
+}
+
+/** A failed supervisor test run at `head`, and the origin/<base> tip read before the worker ran. */
+interface FailedRun {
+ testCommand: string;
+ tests: RunResult;
+ head: string;
+ label: string;
+ baseTip: string | null;
+}
+
+/** `{ baseRed }` when the branch's failures are all red at the base and HEAD stayed at `head` meanwhile; else nothing. */
+async function baseRedAt(ctx: ImplementContext, run: FailedRun): Promise<{ baseRed?: BaseRedTests }> {
+ const { testCommand, head } = run;
+ const baseRed = await testsRedAtBase(ctx, run);
+ if (baseRed === null) return {};
+ if ((await headSha(ctx.worktree)) !== head) {
+  ctx.journal.recordEvent("reviewed", {
+   nodeId: ctx.node.ref.id,
+   repo: ctx.map.repo,
+   detail: `tests (${testCommand}): the worktree moved off ${head.slice(0, 8)} during the merge-base test run — the failures gate`,
+  });
+  return {};
+ }
+ return { baseRed };
+}
+
+/**
+ * The probe rule (node #109) for the supervisor's tests: a failure the merge
+ * base shares is the base's, not the branch's (2026-10-07: two nodes failed
+ * on tests their branches never touched, one passing 44/44 alone, the other a
+ * timeout soma's main hits at the same base). When the failed run names its
+ * failing tests, the map's whole test command runs once more in a fresh clone
+ * of the merge base of `head` and origin/<base>, after the host quiets.
+ * origin/<base> is `baseTip`, read before the worker ran, and the merge base
+ * is computed in a clone of its own (mergeBaseInFreshClone): a failed run
+ * that moves the ref, plants a replacement or writes grafts cannot pick the
+ * commit its failures are compared with.
+ *
+ * Only the `bun test` step is waived: the command must be plain steps joined
+ * by `&&`, one of them `bun test` (bunTestChain), and every other step then
+ * runs on its own in a fresh clone of `head` and must pass, so a lint or
+ * typecheck failure beside the shared tests (or one the failing bun step
+ * kept from running) still gates.
+ *
+ * "Shares" is what the two runs show: the result is the base's red set when
+ * every `(fail)` line the branch run printed is one there too, by file,
+ * title and error and as many times (failuresNotAtBase), the base run exits
+ * with the branch run's code, and the other steps pass; null when they gate.
+ * A run with coverage in play (coverageInPlay) gets no base run: a missed
+ * threshold names no test. A failure that names no test (a
+ * typecheck after passing tests, a crash, a timeout, a kill), one a signal
+ * ended (exit > 128), or one whose `(fail)` lines do not account for every
+ * failure bun reports (failuresAllNamed) gets no base run; a base run a signal
+ * ended is no base result. Every outcome of a base run, or why none ran, is a
+ * `reviewed` event; the lane records a waived run that goes on to the push
+ * for the PR and close receipts (testsReceipt).
+ */
+async function testsRedAtBase(ctx: ImplementContext, run: FailedRun): Promise<BaseRedTests | null> {
+ const { journal, map, node } = ctx;
+ const { testCommand, tests, head, label, baseTip } = run;
+ const failed = failedTests(tests);
+ if (tests.code <= 0 || signalExit(tests.code) || failed.length === 0) return null;
+ const event = (detail: string) => journal.recordEvent("reviewed", { nodeId: node.ref.id, repo: map.repo, detail });
+ const chain = bunTestChain(testCommand);
+ if (chain === null) {
+  event(`tests (${testCommand}) failed; the merge-base check did not run: the command is not plain steps joined by && with one \`bun test\` step, so a failure beside the tests could not be told apart — the failures gate`);
+  return null;
+ }
+ if (!failuresAllNamed(tests)) {
+  event(`tests (${testCommand}) failed with failures no (fail) line names (an error outside a test, a TypeScript diagnostic, or a count the names do not cover); the merge-base check did not run — the failures gate`);
+  return null;
+ }
+ if (coverageInPlay(testCommand, tests)) {
+  event(`tests (${testCommand}) failed with coverage reported, and a missed coverage threshold names no test; the merge-base check did not run — the failures gate`);
+  return null;
+ }
+ if (baseTip === null) {
+  event(`tests (${testCommand}) failed; the merge-base check did not run: origin/${map.base} did not resolve before the worker ran — the failures gate`);
+  return null;
+ }
+ const merged = await mergeBaseInFreshClone(ctx, head, baseTip);
+ if ("why" in merged) {
+  event(`tests (${testCommand}) failed; the merge-base check did not run: ${merged.why} — the failures gate`);
+  return null;
+ }
+ const { sha } = merged;
+ await awaitQuietHost(ctx, "the merge-base test run");
+ const base = await freshCheckoutTests(ctx, testCommand, sha, `${label}: merge base ${sha.slice(0, 8)}`, "base");
+ if (!base.ran) {
+  event(`tests (${testCommand}) failed; the merge-base check at ${sha} did not run: ${base.result.stderr.trim().split("\n")[0]} — the failures gate`);
+  return null;
+ }
+ if (signalExit(base.result.code)) {
+  event(`tests (${testCommand}) at the merge base ${sha} were ended by a signal (exit ${base.result.code}) — not a base result, the failures gate`);
+  return null;
+ }
+ const unshared = failuresNotAtBase(failed, base.result.code > 0 ? failedTests(base.result) : []);
+ if (unshared.length > 0) {
+  const how = base.result.code === 0 ? "passes" : `fails another set (exit ${base.result.code})`;
+  event(`tests (${testCommand}) at the merge base ${sha} ${how} — not red there, they gate: ${unshared.join("; ")}`);
+  return null;
+ }
+ if (base.result.code !== tests.code) {
+  event(`tests (${testCommand}) at the merge base ${sha} exit ${base.result.code}, the branch run exited ${tests.code} — not the same failure, they gate`);
+  return null;
+ }
+ if (chain.rest !== "") {
+  const steps = await freshCheckoutTests(ctx, chain.rest, head, `${label}: the other test steps`, "steps");
+  if (!steps.ran) {
+   event(`tests (${testCommand}) are red at the merge base ${sha} too, but the other steps (${chain.rest}) did not run on their own at ${head.slice(0, 8)}: ${steps.result.stderr.trim().split("\n")[0]} — the failures gate`);
+   return null;
+  }
+  if (steps.result.code !== 0) {
+   event(`tests (${testCommand}) are red at the merge base ${sha} too, but the other steps (${chain.rest}) exit ${steps.result.code} on their own at ${head.slice(0, 8)} — they gate: ${tail(steps.result)}`);
+   return null;
+  }
+ }
+ const names = [...new Set(failed.map(testIdentity))];
+ event(`tests (${testCommand}) at the merge base ${sha}, failing the same way${chain.rest === "" ? "" : ` (the other steps, ${chain.rest}, pass on their own)`}: red on the merge base too, not gating: ${names.join("; ")}`);
+ return { sha, names, rest: chain.rest };
+}
+
+/**
+ * `git merge-base head baseTip`, computed in a bare clone of the node's
+ * branch made for it: `--no-local`, so the commits arrive as objects (no
+ * commit-graph or alternates hardlinked from the shared repository), with
+ * `baseTip` and `head` fetched by sha. The clone has no grafts, replacement
+ * refs or config the failed run could have written; a shallow clone (the
+ * shared repository marked shallow) is refused. Grafts in the shared
+ * repository make the clone fail, which counts as no merge base.
+ */
+async function mergeBaseInFreshClone(ctx: ImplementContext, head: string, baseTip: string): Promise<{ sha: string } | { why: string }> {
+ const scratch = mkdtempSync(join(tmpdir(), "ranger-merge-base-"));
+ const dir = join(scratch, "repo.git");
+ const git = (args: string[], cwd: string, timeoutMs = 60_000) => safeGit(["--no-replace-objects", ...args], { cwd, timeoutMs });
+ const first = (r: RunResult) => r.stderr.trim().split("\n").filter((l) => !/^(?:remote: )?hint:/.test(l)).slice(-1)[0] ?? `exit ${r.code}`;
+ try {
+  const clone = await git(["clone", "--quiet", "--bare", "--no-local", "--no-tags", "--single-branch", "--branch", ctx.branch, ctx.canonical, dir], scratch, 300_000);
+  if (clone.code !== 0) return { why: `could not clone to compute the merge base (${first(clone)})` };
+  const fetch = await git(["fetch", "--quiet", "--no-tags", ctx.canonical, head, baseTip], dir, 300_000);
+  if (fetch.code !== 0) return { why: `could not fetch ${head.slice(0, 8)} and origin/${ctx.map.base} at ${baseTip.slice(0, 8)} to compute the merge base (${first(fetch)})` };
+  const shallow = await git(["rev-parse", "--is-shallow-repository"], dir, 10_000);
+  if (shallow.stdout.trim() !== "false") return { why: "the clone to compute the merge base is shallow" };
+  const merged = await git(["merge-base", head, baseTip], dir, 30_000);
+  const sha = merged.stdout.trim();
+  if (merged.code !== 0 || !/^[0-9a-f]{40}$/.test(sha)) {
+   return { why: `no merge base with origin/${ctx.map.base} at ${baseTip.slice(0, 8)} (${merged.stderr.trim() || `exit ${merged.code}`})` };
+  }
+  return { sha };
+ } finally {
+  await rm(scratch, { recursive: true, force: true });
+ }
 }
 
 /**
  * The one busy-host retry supervisor test runs and adoption share: on a
  * loaded host, wait for it to quiet (or for the wait to run out) and run
  * install and the tests once more in a fresh clone of `sha`. Null when the
- * host is not busy: no retry.
+ * host is not busy: no retry. `ran` is freshCheckoutTests' own: false when
+ * the retry's clone, install or checkout check failed (or the local run never
+ * happened), so its result is no evidence.
  */
 async function retryOnBusyHost(
  ctx: ImplementContext,
@@ -2033,7 +2431,7 @@ async function retryOnBusyHost(
  what: string,
  run: string,
  label: string,
-): Promise<RunResult | null> {
+): Promise<{ ran: boolean; result: RunResult } | null> {
  const host = (ctx.hostLoad ?? realHostLoad)();
  if (host.load < host.cores) return null;
  ctx.journal.recordEvent("reviewed", {
@@ -2042,8 +2440,14 @@ async function retryOnBusyHost(
   detail: `${what} failed on a busy host (load ${host.load.toFixed(1)} on ${host.cores} cores) — retrying once, in a fresh checkout of ${sha.slice(0, 8)}, when it quiets`,
  });
  await awaitQuietHost(ctx, run);
- const local = () => testsInFreshCheckout(ctx, testCommand, sha, label);
- return ctx.map.testBackend?.kind === "shadow" ? backendTests(ctx, sha, local) : local();
+ let ran = false;
+ const local = async () => {
+  const fresh = await freshCheckoutTests(ctx, testCommand, sha, label, "retry");
+  ran = fresh.ran;
+  return fresh.result;
+ };
+ const result = ctx.map.testBackend?.kind === "shadow" ? await backendTests(ctx, sha, local) : await local();
+ return { ran, result };
 }
 
 /**
@@ -2087,9 +2491,30 @@ async function restoreWorktree(ctx: ImplementContext, sha: string): Promise<stri
  * objects.
  */
 async function testsInFreshCheckout(ctx: ImplementContext, testCommand: string, sha: string, label: string): Promise<RunResult> {
- const scratch = mkdtempSync(join(tmpdir(), "ranger-test-retry-"));
- const dir = join(scratch, "checkout");
- const failed = (why: string): RunResult => ({ code: 1, stdout: "", stderr: why });
+ return (await freshCheckoutTests(ctx, testCommand, sha, label, "retry")).result;
+}
+
+/**
+ * testsInFreshCheckout for a retry, a merge-base run, or the other steps of
+ * a base-red run. `ran` is false when the clone, checkout or install failed,
+ * or the run changed the checkout's tracked content or HEAD: the result then
+ * carries why, first.
+ */
+async function freshCheckoutTests(
+ ctx: ImplementContext,
+ testCommand: string,
+ sha: string,
+ label: string,
+ purpose: "retry" | "base" | "steps",
+): Promise<{ ran: boolean; result: RunResult }> {
+ const scratch = mkdtempSync(join(tmpdir(), `ranger-test-${purpose}-`));
+ // Named as the node's checkout is, with its origin URL (below): a repo's
+ // tests may read either (2026-10-08: soma's install test wants "soma" in its
+ // path, and its graph bridge test parses origin's host), and a clone named
+ // `checkout` whose origin is a local path failed them every time.
+ const dir = join(scratch, basename(ctx.canonical));
+ const forRun = { retry: "for the retry", base: "for the merge-base run", steps: "for the other test steps" }[purpose];
+ const failed = (why: string) => ({ ran: false, result: { code: 1, stdout: "", stderr: why } });
  const git = (args: string[], cwd: string, timeoutMs = 60_000) =>
   safeGit(["--no-replace-objects", ...args], { cwd, timeoutMs });
  try {
@@ -2099,12 +2524,17 @@ async function testsInFreshCheckout(ctx: ImplementContext, testCommand: string, 
    scratch,
    300_000,
   );
-  if (clone.code !== 0) return failed(`could not clone for the retry: ${clone.stderr.trim()}`);
+  if (clone.code !== 0) return failed(`could not clone ${forRun}: ${clone.stderr.trim()}`);
+  const originUrl = await git(["remote", "get-url", "origin"], ctx.canonical, 10_000);
+  if (originUrl.code === 0 && originUrl.stdout.trim() !== "") {
+   const set = await git(["remote", "set-url", "origin", originUrl.stdout.trim()], dir, 10_000);
+   if (set.code !== 0) return failed(`could not set origin ${forRun}: ${set.stderr.trim()}`);
+  }
   const checkout = await git(["-c", "advice.detachedHead=false", "checkout", "--quiet", "--detach", sha], dir, 120_000);
-  if (checkout.code !== 0) return failed(`could not check out ${sha.slice(0, 8)} for the retry: ${checkout.stderr.trim()}`);
+  if (checkout.code !== 0) return failed(`could not check out ${sha.slice(0, 8)} ${forRun}: ${checkout.stderr.trim()}`);
   if (ctx.map.commands.install !== undefined) {
    const install = await runShell(ctx.map.commands.install, dir, ctx, { label: `${label}: install in a fresh checkout`, timeoutMs: INSTALL_TIMEOUT_MS });
-   if (install.code !== 0) return { ...install, stderr: `install for the retry failed\n${install.stderr}` };
+   if (install.code !== 0) return { ran: false, result: { ...install, stderr: `install ${forRun} failed\n${install.stderr}` } };
   }
   const tests = await runShell(testCommand, dir, ctx, { label: `${label}: tests in a fresh checkout`, timeoutMs: TEST_TIMEOUT_MS, measureCpu: true });
   // A sanity check on the run, not proof against the commit's own scripts
@@ -2121,13 +2551,17 @@ async function testsInFreshCheckout(ctx: ImplementContext, testCommand: string, 
    flags.code !== 0 ||
    flags.stdout.split("\n").some((l) => l.length > 0 && !l.startsWith("H "));
   if (changed) {
+   const outcome = { retry: "the retry certifies nothing that gets pushed", base: "its result is not the base's", steps: "the steps certify nothing" }[purpose];
    return {
-    ...tests,
-    code: tests.code === 0 ? 1 : tests.code,
-    stderr: `install or the tests changed ${sha.slice(0, 8)}'s tracked content or HEAD in the retry checkout — the retry certifies nothing that gets pushed\n${tests.stderr}`,
+    ran: false,
+    result: {
+     ...tests,
+     code: tests.code === 0 ? 1 : tests.code,
+     stderr: `install or the tests changed ${sha.slice(0, 8)}'s tracked content or HEAD in the ${purpose} checkout — ${outcome}\n${tests.stderr}`,
+    },
    };
   }
-  return tests;
+  return { ran: true, result: tests };
  } finally {
   await rm(scratch, { recursive: true, force: true });
  }
@@ -2144,11 +2578,23 @@ async function testsInFreshCheckout(ctx: ImplementContext, testCommand: string, 
  * The git state is trusted exactly as on any resumed pass: checked against
  * the known-good record (node #81), so a change the failed run's tests made
  * parks here instead of becoming this run's baseline.
+ *
+ * With `fix`, the work is a fix pass answering the review at the PR's pushed
+ * head: only commits on top of that head, with no merge among them (a base
+ * merge is redone by its own pass), are adopted (2026-10-08: ranger #124 and
+ * #152 lost finished fix passes to a load flake in the supervisor's tests).
  */
-async function adoptBuiltWork(ctx: ImplementContext, testCommand: string): Promise<PassResult | null> {
+async function adoptBuiltWork(
+ ctx: ImplementContext,
+ testCommand: string,
+ fix?: { round: number; pushedHead: string },
+): Promise<PassResult | null> {
  const { map, worktree, journal, node } = ctx;
- if ((await commitsAhead(worktree, map.base)) === 0) return null;
+ if (fix === undefined ? (await commitsAhead(worktree, map.base)) === 0 : !(await fixCommitsOn(worktree, fix.pushedHead))) {
+  return null;
+ }
  if ((await dirtyFiles(worktree)).length > 0) return null;
+ const what = fix === undefined ? "build" : `fix pass ${fix.round}`;
  const snapshot = await trustedSnapshot(journal, ctx.canonical, { repo: map.repo, nodeId: node.ref.id }, mapKey(map));
  const sha = await headSha(worktree);
  // Tested in a fresh clone of the commit, not in the worktree: whatever the
@@ -2157,10 +2603,10 @@ async function adoptBuiltWork(ctx: ImplementContext, testCommand: string): Promi
  // the same one retry as any supervisor test run, or a load flake would hand
  // finished work back to a worker with nothing left to commit.
  // Each attempt keeps its own output in the worker log, the retry's included.
- let tests = await backendTests(ctx, sha, () => testsInFreshCheckout(ctx, testCommand, sha, "adopted build: supervisor tests"));
+ let tests = await backendTests(ctx, sha, () => testsInFreshCheckout(ctx, testCommand, sha, `adopted ${what}: supervisor tests`));
  if (tests.code !== 0) {
-  const retry = remoteTests(ctx) ? null : await retryOnBusyHost(ctx, testCommand, sha, "adoption tests", "the adoption test retry", "adopted build: supervisor test retry");
-  if (retry !== null) tests = retry;
+  const retry = remoteTests(ctx) ? null : await retryOnBusyHost(ctx, testCommand, sha, "adoption tests", "the adoption test retry", `adopted ${what}: supervisor test retry`);
+  if (retry !== null) tests = retry.result;
  }
  const clean = await assertGitUntouched(ctx.canonical, snapshot);
  if (tests.code !== 0) {
@@ -2182,9 +2628,19 @@ async function adoptBuiltWork(ctx: ImplementContext, testCommand: string): Promi
  journal.recordEvent("reviewed", {
   nodeId: node.ref.id,
   repo: map.repo,
-  detail: `adopting ${sha.slice(0, 8)}: a previous run built and committed it, and it passes the supervisor's tests — no new worker session`,
+  detail: `adopting ${sha.slice(0, 8)}${fix === undefined ? "" : ` as fix pass ${fix.round}`}: a previous run built and committed it, and it passes the supervisor's tests — no new worker session`,
  });
  return { workerExit: null, snapshot, sha, adopted: true };
+}
+
+/** Whether HEAD is commits on top of `pushedHead` with no merge among them. */
+async function fixCommitsOn(worktree: string, pushedHead: string): Promise<boolean> {
+ const git = (args: string[]) => safeGit(args, { cwd: worktree, timeoutMs: 10_000 });
+ if ((await git(["merge-base", "--is-ancestor", pushedHead, "HEAD"])).code !== 0) return false;
+ const ahead = await git(["rev-list", "--count", `${pushedHead}..HEAD`]);
+ const merges = await git(["rev-list", "--merges", "--count", `${pushedHead}..HEAD`]);
+ if (ahead.code !== 0 || merges.code !== 0) return false;
+ return Number(ahead.stdout.trim()) > 0 && Number(merges.stdout.trim()) === 0;
 }
 
 function tail(result: RunResult): string {
@@ -2250,7 +2706,7 @@ function readyBody(
  return [
   `Implements ${nodeLink(ctx)}: ${ctx.node.node.title}`,
   "",
-  `- Tests: \`${ctx.map.commands.test}\` passed in the supervisor before every push.`,
+  `- Tests: ${testsReceipt(ctx.map.commands.test, "in the supervisor", recordedTestsBaseRed(ctx.journal, ctx.map.repo, ctx.node.ref.id))}`,
   `- Sage: ${rounds} offline round(s); the last, at \`${final.sha.slice(0, 8)}\`, found ${final.blockers} blockers, ${final.majors} majors, ${final.nits} nits. Machine review evidence, not a human sign-off.`,
   ...probeLine(ctx, probe),
   `- Merge: ranger never merges. ${ratify}`,
@@ -2274,7 +2730,7 @@ function closeResolution(
  return [
   `Implemented by ranger's implement lane in PR #${pr.iid} (${pr.webUrl || `https://github.com/${ctx.map.repo}/pull/${pr.iid}`}), merged by ${pr.mergedBy ?? "an unknown login"}${pr.mergeCommitSha === null ? "" : ` as ${pr.mergeCommitSha.slice(0, 8)}`}.`,
   "",
-  `- Tests: \`${ctx.map.commands.test}\` passed before every push; CI check run "${ci.runName}" (${ci.runId}) succeeded on the PR head ${pr.headSha.slice(0, 8)}.`,
+  `- Tests: ${testsReceipt(ctx.map.commands.test, "in the supervisor", recordedTestsBaseRed(ctx.journal, ctx.map.repo, ctx.node.ref.id))} CI check run "${ci.runName}" (${ci.runId}) succeeded on the PR head ${pr.headSha.slice(0, 8)}.`,
   final === undefined
    ? "- Sage: no recorded review round."
    : `- Sage: ${rounds} offline round(s); the last at ${final.sha.slice(0, 8)} found ${final.blockers} blockers, ${final.majors} majors, ${final.nits} nits (machine evidence).`,
@@ -2290,7 +2746,7 @@ function closeResolution(
  * need no visual judgment; a `ranger:needs-eye` node is merged by hand).
  */
 function ratificationText(ctx: ImplementContext, pr: ChangeRequest): string {
- return pr.mergedBy !== null && pr.mergedBy === ctx.config.principal.login
+ return pr.mergedBy !== null && pr.mergedBy === principalLoginForRepo(ctx.config, ctx.map.repo)
   ? `the principal merged PR #${pr.iid} (merge = ratification, #23 ruling)`
   : `${pr.mergedBy ?? "ranger"} merged PR #${pr.iid} under the principal's standing grant (2026-10-03: ranger merges nodes that need no visual judgment)`;
 }

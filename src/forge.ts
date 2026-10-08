@@ -16,6 +16,11 @@ export interface ChangeRequest {
  mergedBy: string | null;
  /** Adapter diagnostic text, kept for existing GitHub operator messages. */
  mergeDetail?: string;
+ /**
+  * The forge is merging this change request right now (GitLab `locked`). `state`
+  * still reads `closed` by contract; a consumer must not treat it as abandoned.
+  */
+ mergeInProgress?: true;
 }
 
 /** Preserve each lane's existing evidence policy at the adapter boundary. */
@@ -30,15 +35,24 @@ export interface IssueComment {
  body: string;
 }
 
-export interface ForgePort {
- findPrByHead(repo: string, branch: string, token: string): Promise<ChangeRequest | null>;
- getPr(repo: string, n: number, token: string): Promise<ChangeRequest>;
- createDraftPr(repo: string, pr: { head: string; base: string; title: string; body: string }, token: string): Promise<ChangeRequest>;
- updatePrBody(repo: string, n: number, body: string, token: string): Promise<void>;
- markReady(repo: string, pr: ChangeRequest, token: string): Promise<void>;
- ciVerdictFor(repo: string, sha: string, token: string, purpose?: CiPurpose): Promise<CiVerdict>;
- mergePr(repo: string, n: number, sha: string, title: string, token: string): Promise<void>;
- issueLabels(repo: string, n: number, token: string): Promise<string[]>;
- postComment(repo: string, n: number, body: string, token: string): Promise<number>;
- listComments(repo: string, n: number, token: string): Promise<IssueComment[]>;
+/** Read credentials may carry a forge's checked, project-bound grant. */
+export interface ForgeReadPort<Credential = string> {
+ findPrByHead(repo: string, branch: string, token: Credential): Promise<ChangeRequest | null>;
+ getPr(repo: string, n: number, token: Credential): Promise<ChangeRequest>;
+ ciVerdictFor(repo: string, sha: string, token: Credential, purpose?: CiPurpose): Promise<CiVerdict>;
+ /** Labels of a tracker issue (a graph node), by issue number. */
+ issueLabels(repo: string, issue: number, token: Credential): Promise<string[]>;
+ /**
+  * Conversation comments of a change request, by PR/MR number. GitHub shares one
+  * number space for issues and PRs; GitLab does not, so never pass an issue iid.
+  */
+ listComments(repo: string, changeRequest: number, token: Credential): Promise<IssueComment[]>;
+}
+
+export interface ForgePort<ReadCredential = string, WriteCredential = string> extends ForgeReadPort<ReadCredential> {
+ createDraftPr(repo: string, pr: { head: string; base: string; title: string; body: string }, token: WriteCredential): Promise<ChangeRequest>;
+ updatePrBody(repo: string, n: number, body: string, token: WriteCredential): Promise<void>;
+ markReady(repo: string, pr: ChangeRequest, token: WriteCredential): Promise<void>;
+ mergePr(repo: string, n: number, sha: string, title: string, token: WriteCredential): Promise<void>;
+ postComment(repo: string, n: number, body: string, token: WriteCredential): Promise<number>;
 }
