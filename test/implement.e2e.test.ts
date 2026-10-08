@@ -1812,7 +1812,8 @@ describe("implement lane (node #23)", () => {
  }, 60_000);
 
  test("a failed supervisor test run names its failing test and keeps its whole output in the node's log", async () => {
-  const r = await rig({ test: "echo \"(fail) the hud draws [3.00ms]\" >&2; exit 1" });
+  // Red on the branch only: the base has no src/feature.ts.
+  const r = await rig({ test: "if [ -f src/feature.ts ]; then echo \"(fail) the hud draws [3.00ms]\" >&2; exit 1; fi" });
   cleanup.push(r.dir);
   const outcome = await runNode("20", r.ctx);
   expect(outcome.status).toBe("failed");
@@ -1821,7 +1822,131 @@ describe("implement lane (node #23)", () => {
   expect(readFileSync(log, "utf8")).toContain("build pass: supervisor tests");
   const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
   expect(events.some((d) => d.includes("failed on a busy host"))).toBe(false); // a quiet host: no retry
+  expect(events.some((d) => /at the merge base [0-9a-f]{40} passes — not red there, they gate: the hud draws$/.test(d))).toBe(true);
  }, 60_000);
+
+ // node #164: a failing test the merge base fails too is the base's, not the branch's.
+ describe("supervisor tests red at the merge base", () => {
+  /** The merge base the node's branch shares with origin/main. */
+  async function mergeBase(r: Rig): Promise<string> {
+   const worktree = join(r.canonical, ".worktrees", "node-20");
+   return (await runCmd("git", ["merge-base", "HEAD", "origin/main"], { cwd: worktree })).stdout.trim();
+  }
+  /** Record every repo command with its directory, running it for real. */
+  function watchRuns(r: Rig): { command: string; cwd: string }[] {
+   const calls: { command: string; cwd: string }[] = [];
+   r.ctx.shellRun = (command, opts) => {
+    calls.push({ command, cwd: opts.cwd ?? "" });
+    return runCmd("/bin/sh", ["-c", command], opts);
+   };
+   return calls;
+  }
+  const baseRuns = (calls: { command: string; cwd: string }[]) => calls.filter((c) => c.cwd.includes("ranger-test-base-"));
+  const reviewed = (r: Rig) => r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+
+  test("every failing test red at the merge base too: not gating, the lane carries on and restores the worktree", async () => {
+   const r = await rig({ test: "echo \"(fail) claude-code install [5000.00ms]\"; echo \"(fail) git trust\" >&2; exit 1" });
+   cleanup.push(r.dir);
+   const calls = watchRuns(r);
+   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+   const sha = await mergeBase(r);
+   expect(sha).toMatch(/^[0-9a-f]{40}$/);
+   const events = reviewed(r);
+   expect(events).toContain(`tests (echo "(fail) claude-code install [5000.00ms]"; echo "(fail) git trust" >&2; exit 1) at the merge base ${sha}: red on the merge base too, not gating: claude-code install; git trust`);
+   expect(events.some((d) => d.startsWith("restored the worktree to "))).toBe(true);
+   expect(baseRuns(calls).map((c) => c.command)).toEqual([r.ctx.map.commands.test!]);
+   expect(r.github.prs.size).toBe(1);
+  }, 60_000);
+
+  test("after a failed busy-host retry the base run waits for a quiet host, then clears the shared failure", async () => {
+   const r = await rig({ test: "echo \"(fail) a flake at load\"; exit 1" });
+   cleanup.push(r.dir);
+   const calls = watchRuns(r);
+   const loads = [14, 13, 2, 14, 13, 2]; // retry: at the failure, waiting, quiet; base run: busy, waiting, quiet
+   r.ctx.hostLoad = () => ({ load: loads.length > 1 ? (loads.shift() as number) : loads[0], cores: 10 });
+   r.ctx.quietHost = { pollMs: 1, maxMs: 60_000 };
+   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+   const events = reviewed(r).reverse(); // oldest first
+   const retry = events.findIndex((d) => d.includes("failed on a busy host (load 14.0 on 10 cores) — retrying once"));
+   const wait = events.findIndex((d) => d.startsWith("the merge-base test run waits for the host"));
+   const starts = events.findIndex((d) => d.startsWith("the merge-base test run starts after"));
+   const red = events.findIndex((d) => d.endsWith("red on the merge base too, not gating: a flake at load"));
+   expect(retry).toBeGreaterThanOrEqual(0);
+   expect(wait).toBeGreaterThan(retry);
+   expect(starts).toBeGreaterThan(wait);
+   expect(red).toBeGreaterThan(starts);
+   expect(calls.filter((c) => c.cwd.includes("ranger-test-retry-")).length).toBeGreaterThan(0);
+   expect(baseRuns(calls).length).toBe(1);
+  }, 60_000);
+
+  test("a base that fails another set gates, naming the failures the base did not share", async () => {
+   const r = await rig({ test: "echo \"(fail) shared\"; if [ -f src/feature.ts ]; then echo \"(fail) branch only\"; fi; exit 1" });
+   cleanup.push(r.dir);
+   const outcome = await runNode("20", r.ctx);
+   expect(outcome.status).toBe("failed");
+   expect(outcome.detail).toContain("failing: shared; branch only:");
+   const sha = await mergeBase(r);
+   expect(reviewed(r).some((d) => d.endsWith(`at the merge base ${sha} fails another set (exit 1) — not red there, they gate: branch only`))).toBe(true);
+   expect(r.github.prs.size).toBe(0);
+  }, 60_000);
+
+  test("the comparison uses every failing name, not the three the journal line keeps", async () => {
+   const r = await rig({ test: "echo \"(fail) one\"; echo \"(fail) two\"; echo \"(fail) three\"; if [ -f src/feature.ts ]; then echo \"(fail) four\"; fi; exit 1" });
+   cleanup.push(r.dir);
+   const outcome = await runNode("20", r.ctx);
+   expect(outcome.status).toBe("failed");
+   expect(outcome.detail).toContain("failing: one; two; three:");
+   expect(reviewed(r).some((d) => d.endsWith("not red there, they gate: four"))).toBe(true);
+   expect(r.github.prs.size).toBe(0);
+  }, 60_000);
+
+  test("a failure that names no test gets no base run", async () => {
+   const r = await rig({ test: "test ! -f src/feature.ts" });
+   cleanup.push(r.dir);
+   const calls = watchRuns(r);
+   expect((await runNode("20", r.ctx)).status).toBe("failed");
+   expect(baseRuns(calls)).toEqual([]);
+   expect(reviewed(r).some((d) => d.includes("merge base") || d.includes("merge-base"))).toBe(false);
+  }, 60_000);
+
+  test("a killed or timed-out run gets no base run, even with (fail) lines", async () => {
+   const r = await rig({});
+   cleanup.push(r.dir);
+   const calls: { command: string; cwd: string }[] = [];
+   r.ctx.shellRun = (command, opts) => {
+    calls.push({ command, cwd: opts.cwd ?? "" });
+    if (command === r.ctx.map.commands.test) return Promise.resolve({ code: -1, stdout: "(fail) a shared flake\n", stderr: "timed out" });
+    return runCmd("/bin/sh", ["-c", command], opts);
+   };
+   expect((await runNode("20", r.ctx)).status).toBe("failed");
+   expect(baseRuns(calls)).toEqual([]);
+   expect(reviewed(r).some((d) => d.includes("merge base") || d.includes("merge-base"))).toBe(false);
+  }, 60_000);
+
+  test("a base install that fails gates, and says why the base check did not run", async () => {
+   const r = await rig({
+    install: "case \"$PWD\" in *ranger-test-base-*) exit 3 ;; esac",
+    test: "echo \"(fail) shared\"; exit 1",
+   });
+   cleanup.push(r.dir);
+   const outcome = await runNode("20", r.ctx);
+   expect(outcome.status).toBe("failed");
+   expect(outcome.detail).toContain("failing: shared:");
+   const sha = await mergeBase(r);
+   expect(reviewed(r)).toContain(`tests (echo "(fail) shared"; exit 1) failed; the merge-base check at ${sha} did not run: install for the merge-base run failed — the failures gate`);
+  }, 60_000);
+
+  test("a merge base that cannot be resolved gates, and says why the base check did not run", async () => {
+   // The failed run deletes origin/main: no merge base to compare with.
+   const r = await rig({ test: "git update-ref -d refs/remotes/origin/main; echo \"(fail) shared\"; exit 1" });
+   cleanup.push(r.dir);
+   const calls = watchRuns(r);
+   const outcome = await runNode("20", r.ctx);
+   expect(outcome.status).toBe("failed");
+   expect(baseRuns(calls)).toEqual([]);
+   expect(reviewed(r).some((d) => d.includes("the merge-base check did not run: no merge base with origin/main") && d.endsWith("— the failures gate"))).toBe(true);
+  }, 60_000);
+ });
 
  test("supervisor tests that fail on a busy host are retried once it quiets, and pass", async () => {
   const flag = join(tmpdir(), `ranger-flaky-tests-${Date.now()}`);

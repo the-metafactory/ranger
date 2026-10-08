@@ -1522,11 +1522,12 @@ async function checkedWorkerPass(
    `worker left ${dirty.length} uncommitted or untracked file(s) (${dirty.slice(0, 5).join("; ")}) — the tests would not test what gets pushed`,
   );
  }
- const { tests, retried } = await supervisorTests(ctx, testCommand, pass);
- if (tests.code !== 0) return fail(testsFailedDetail(testCommand, tests, "after the worker"));
- if (retried) {
-  // The pass was certified in a fresh clone: the worktree still holds what
-  // the failed run left, and the probes run there next.
+ const { tests, retried, baseRed } = await supervisorTests(ctx, testCommand, pass);
+ if (tests.code !== 0 && baseRed === undefined) return fail(testsFailedDetail(testCommand, tests, "after the worker"));
+ if (retried || baseRed !== undefined) {
+  // The pass was certified in a fresh clone, or its failures are the base's:
+  // the worktree still holds what the failed run left, and the probes run
+  // there next.
   const restored = await restoreWorktree(ctx, sha);
   if (restored !== null) return fail(restored);
  }
@@ -1731,13 +1732,18 @@ function reviewComment(round: number, verdict: ReviewVerdict, substrate?: Substr
  return head + body;
 }
 
-/** The first three failing tests a run names, in bun's `(fail) <name> [12ms]` format. */
-export function failedTestNames(result: RunResult): string[] {
+/** Every failing test a run names, in bun's `(fail) <name> [12ms]` format. */
+export function allFailedTestNames(result: RunResult): string[] {
  const names = new Set<string>();
  for (const m of `${result.stdout}\n${result.stderr}`.matchAll(/^\(fail\) (.+?)(?: \[[\d.]+m?s\])?$/gm)) {
   names.add(m[1].trim());
  }
- return [...names].slice(0, 3);
+ return [...names];
+}
+
+/** The first three failing tests a run names: what the journal line keeps. */
+export function failedTestNames(result: RunResult): string[] {
+ return allFailedTestNames(result).slice(0, 3);
 }
 
 /** A failed supervisor test run, named: the failing tests first (the journal keeps 400 characters), then the tail. */
@@ -1766,12 +1772,17 @@ function testsFailedDetail(testCommand: string, tests: RunResult, after: string)
  * commit; one that misreports itself (an `exit 0`, a redirected git
  * worktree) is the commit's behaviour, which no re-run can catch, and the
  * review reads that code.
+ *
+ * A failure that names its failing tests is then checked at the merge base
+ * (testsRedAtBase): when every one of them fails there too, it is the base's,
+ * and `baseRed` says the pass goes on as if the tests passed. `tests` is
+ * always the branch's own run.
  */
 async function supervisorTests(
  ctx: ImplementContext,
  testCommand: string,
  label: string,
-): Promise<{ tests: RunResult; retried: boolean }> {
+): Promise<{ tests: RunResult; retried: boolean; baseRed?: BaseRedTests }> {
  const { journal, map, node, worktree } = ctx;
  const head = await headSha(worktree);
  let tests = await backendTests(ctx, head, () => runShell(testCommand, worktree, ctx, { label: `${label}: supervisor tests`, timeoutMs: TEST_TIMEOUT_MS, measureCpu: true }));
@@ -1786,7 +1797,7 @@ async function supervisorTests(
   return { tests, retried: false };
  }
  const retry = await retryOnBusyHost(ctx, testCommand, head, `tests (${testCommand})`, "the test retry", `${label}: supervisor test retry`);
- if (retry === null) return { tests, retried: false };
+ if (retry === null) return { tests, retried: false, ...await baseRedAt(ctx, testCommand, tests, head, label) };
  tests = retry;
  if (tests.code === 0 && (await headSha(worktree)) !== head) {
   tests = { ...tests, code: 1, stderr: `the retry passed at ${head.slice(0, 8)}, but the worktree moved off it meanwhile\n${tests.stderr}` };
@@ -1795,7 +1806,79 @@ async function supervisorTests(
   journal.recordEvent("reviewed", { nodeId: node.ref.id, repo: map.repo, detail: `tests (${testCommand}) passed on the retry in a fresh checkout` });
   return { tests, retried: true };
  }
- return { tests, retried: false };
+ return { tests, retried: false, ...await baseRedAt(ctx, testCommand, tests, head, label) };
+}
+
+/** Failing tests that fail at the merge base too: the base's, not the branch's. */
+interface BaseRedTests {
+ sha: string;
+ names: string[];
+}
+
+/** `{ baseRed }` when the branch's failures are all red at the base and HEAD stayed at `head` meanwhile; else nothing. */
+async function baseRedAt(
+ ctx: ImplementContext,
+ testCommand: string,
+ tests: RunResult,
+ head: string,
+ label: string,
+): Promise<{ baseRed?: BaseRedTests }> {
+ const baseRed = await testsRedAtBase(ctx, testCommand, tests, label);
+ if (baseRed === null) return {};
+ if ((await headSha(ctx.worktree)) !== head) {
+  ctx.journal.recordEvent("reviewed", {
+   nodeId: ctx.node.ref.id,
+   repo: ctx.map.repo,
+   detail: `tests (${testCommand}): the worktree moved off ${head.slice(0, 8)} during the merge-base test run — the failures gate`,
+  });
+  return {};
+ }
+ return { baseRed };
+}
+
+/**
+ * The probe rule (node #109) for the supervisor's tests: a failure the merge
+ * base shares is the base's, not the branch's (2026-10-07: two nodes failed
+ * on tests their branches never touched, one passing 44/44 alone, the other a
+ * timeout soma's main hits at the same base). When the failed run names its
+ * failing tests, the map's whole test command runs once more in a fresh clone
+ * at `git merge-base HEAD origin/<base>`, after the host quiets. The result
+ * is the base's red set when every failing name the branch run printed is a
+ * `(fail)` line there too; null when they gate. A failure that names no test
+ * (a typecheck after passing tests, a crash, a timeout, a kill) gets no base
+ * run. Every outcome of a base run, or why none ran, is a `reviewed` event.
+ */
+async function testsRedAtBase(
+ ctx: ImplementContext,
+ testCommand: string,
+ tests: RunResult,
+ label: string,
+): Promise<BaseRedTests | null> {
+ const { journal, map, node, worktree } = ctx;
+ const names = allFailedTestNames(tests);
+ if (tests.code <= 0 || names.length === 0) return null;
+ const event = (detail: string) => journal.recordEvent("reviewed", { nodeId: node.ref.id, repo: map.repo, detail });
+ const merged = await safeGit(["merge-base", "HEAD", `origin/${map.base}`], { cwd: worktree, timeoutMs: 30_000 });
+ const sha = merged.stdout.trim();
+ if (merged.code !== 0 || !/^[0-9a-f]{40}$/.test(sha)) {
+  event(`tests (${testCommand}) failed; the merge-base check did not run: no merge base with origin/${map.base} (${merged.stderr.trim() || `exit ${merged.code}`}) — the failures gate`);
+  return null;
+ }
+ await awaitQuietHost(ctx, "the merge-base test run");
+ const base = await freshCheckoutTests(ctx, testCommand, sha, `${label}: merge base ${sha.slice(0, 8)}`, "base");
+ if (!base.ran) {
+  event(`tests (${testCommand}) failed; the merge-base check at ${sha} did not run: ${base.result.stderr.trim().split("\n")[0]} — the failures gate`);
+  return null;
+ }
+ const there = new Set(base.result.code > 0 ? allFailedTestNames(base.result) : []);
+ const unshared = names.filter((n) => !there.has(n));
+ if (unshared.length > 0) {
+  const how = base.result.code === 0 ? "passes" : `fails another set (exit ${base.result.code})`;
+  event(`tests (${testCommand}) at the merge base ${sha} ${how} — not red there, they gate: ${unshared.join("; ")}`);
+  return null;
+ }
+ event(`tests (${testCommand}) at the merge base ${sha}: red on the merge base too, not gating: ${names.join("; ")}`);
+ return { sha, names };
 }
 
 /**
@@ -1865,9 +1948,25 @@ async function restoreWorktree(ctx: ImplementContext, sha: string): Promise<stri
  * objects.
  */
 async function testsInFreshCheckout(ctx: ImplementContext, testCommand: string, sha: string, label: string): Promise<RunResult> {
- const scratch = mkdtempSync(join(tmpdir(), "ranger-test-retry-"));
+ return (await freshCheckoutTests(ctx, testCommand, sha, label, "retry")).result;
+}
+
+/**
+ * testsInFreshCheckout for a retry or a merge-base run. `ran` is false when
+ * the clone, checkout or install failed, or the run changed the checkout's
+ * tracked content or HEAD: the result then carries why, first.
+ */
+async function freshCheckoutTests(
+ ctx: ImplementContext,
+ testCommand: string,
+ sha: string,
+ label: string,
+ purpose: "retry" | "base",
+): Promise<{ ran: boolean; result: RunResult }> {
+ const scratch = mkdtempSync(join(tmpdir(), `ranger-test-${purpose}-`));
  const dir = join(scratch, "checkout");
- const failed = (why: string): RunResult => ({ code: 1, stdout: "", stderr: why });
+ const forRun = purpose === "retry" ? "for the retry" : "for the merge-base run";
+ const failed = (why: string) => ({ ran: false, result: { code: 1, stdout: "", stderr: why } });
  const git = (args: string[], cwd: string, timeoutMs = 60_000) =>
   safeGit(["--no-replace-objects", ...args], { cwd, timeoutMs });
  try {
@@ -1877,12 +1976,12 @@ async function testsInFreshCheckout(ctx: ImplementContext, testCommand: string, 
    scratch,
    300_000,
   );
-  if (clone.code !== 0) return failed(`could not clone for the retry: ${clone.stderr.trim()}`);
+  if (clone.code !== 0) return failed(`could not clone ${forRun}: ${clone.stderr.trim()}`);
   const checkout = await git(["-c", "advice.detachedHead=false", "checkout", "--quiet", "--detach", sha], dir, 120_000);
-  if (checkout.code !== 0) return failed(`could not check out ${sha.slice(0, 8)} for the retry: ${checkout.stderr.trim()}`);
+  if (checkout.code !== 0) return failed(`could not check out ${sha.slice(0, 8)} ${forRun}: ${checkout.stderr.trim()}`);
   if (ctx.map.commands.install !== undefined) {
    const install = await runShell(ctx.map.commands.install, dir, ctx, { label: `${label}: install in a fresh checkout`, timeoutMs: INSTALL_TIMEOUT_MS });
-   if (install.code !== 0) return { ...install, stderr: `install for the retry failed\n${install.stderr}` };
+   if (install.code !== 0) return { ran: false, result: { ...install, stderr: `install ${forRun} failed\n${install.stderr}` } };
   }
   const tests = await runShell(testCommand, dir, ctx, { label: `${label}: tests in a fresh checkout`, timeoutMs: TEST_TIMEOUT_MS, measureCpu: true });
   // A sanity check on the run, not proof against the commit's own scripts
@@ -1899,13 +1998,17 @@ async function testsInFreshCheckout(ctx: ImplementContext, testCommand: string, 
    flags.code !== 0 ||
    flags.stdout.split("\n").some((l) => l.length > 0 && !l.startsWith("H "));
   if (changed) {
+   const outcome = purpose === "retry" ? "the retry certifies nothing that gets pushed" : "its result is not the base's";
    return {
-    ...tests,
-    code: tests.code === 0 ? 1 : tests.code,
-    stderr: `install or the tests changed ${sha.slice(0, 8)}'s tracked content or HEAD in the retry checkout — the retry certifies nothing that gets pushed\n${tests.stderr}`,
+    ran: false,
+    result: {
+     ...tests,
+     code: tests.code === 0 ? 1 : tests.code,
+     stderr: `install or the tests changed ${sha.slice(0, 8)}'s tracked content or HEAD in the ${purpose} checkout — ${outcome}\n${tests.stderr}`,
+    },
    };
   }
-  return tests;
+  return { ran: true, result: tests };
  } finally {
   await rm(scratch, { recursive: true, force: true });
  }
