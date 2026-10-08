@@ -53,8 +53,10 @@ import { workerEnv } from "./worker-env.ts";
 import { sessionJournalPath } from "./journal-guard.ts";
 import { saveWorkerLog } from "./worker-log.ts";
 import { isTransientGitHubError } from "./transient.ts";
+import { BudgetDeferral } from "./budget.ts";
+import { findNodePr, finishClosedElsewhere } from "./closed-elsewhere.ts";
 import * as githubApi from "./github.ts";
-import type { GitHubPort } from "./github.ts";
+import type { ForgePort } from "./forge.ts";
 import { ParkSignal } from "./signals.ts";
 import { policyBlockedOutcome } from "./outcomes.ts";
 import { assertResearchFindingsOnly, researchCi, type ResearchCiTiming } from "./research-ci.ts";
@@ -75,7 +77,7 @@ export { gitAuthEnv } from "./git-ops.ts";
 export interface RunNodeOutcome {
  nodeId: string;
  repo: string;
- status: "success" | "failed" | "refused" | "skipped" | "parked" | "awaiting-merge";
+ status: "success" | "released" | "failed" | "refused" | "skipped" | "parked" | "awaiting-merge";
  detail: string;
  workerExit: number | null;
  close?: CloseResult;
@@ -105,7 +107,7 @@ export interface RunNodeContext {
   opts: RunOptions,
  ) => Promise<{ code: number; stdout: string; stderr: string }>;
  /** For tests: the supervisor's forge and implement lane's reviewer. */
- github?: GitHubPort;
+ github?: ForgePort;
  /** Injectable CI timing for tests; production uses the default settling window. */
  researchCiTiming?: ResearchCiTiming;
  reviewer?: Reviewer;
@@ -118,10 +120,13 @@ export interface RunNodeContext {
  viewsDependencies?: ImplementContext["viewsDependencies"];
  /** For tests: the implement lane's repo-command runner (install/test/probe). */
  shellRun?: ImplementContext["shellRun"];
+ testBackend?: ImplementContext["testBackend"];
  /** Probe-tier host load, quiet-host wait and channel post (tests inject them). */
  hostLoad?: ImplementContext["hostLoad"];
  quietHost?: ImplementContext["quietHost"];
  announce?: ImplementContext["announce"];
+ /** Fix-the-base node filing (node #152); tests inject a fake graph port. */
+ fixNode?: ImplementContext["fixNode"];
  mergeablePoll?: ImplementContext["mergeablePoll"];
 }
 
@@ -403,7 +408,7 @@ function finish(
  journal: Journal,
  nodeId: string,
  repo: string,
- status: "success" | "failed" | "parked",
+ status: "success" | "released" | "failed" | "parked",
  outcome: string,
 ): void {
  journal.updateWorker(nodeId, repo, {
@@ -464,6 +469,11 @@ export async function runNode(
     timeoutMs: GRAPH_CALL_TIMEOUT_MS,
    },
   );
+  if (node.status === "closed") {
+   const github = ctx.github ?? githubApi;
+   const pr = await findNodePr(github, repo, node, row?.prNumber, token);
+   return { ...base, ...await finishClosedElsewhere({ ...ctx, node, pr, generation }) };
+  }
   const rootNode = await graphNode(
    repo,
    String(map.root),
@@ -489,6 +499,12 @@ export async function runNode(
    // A newer occupant owns the row — leave it untouched.
    journal.recordEvent("fenced", { nodeId, repo, detail: detail.slice(0, 400) });
    return { ...base, status: "refused", detail };
+  }
+  if (error instanceof BudgetDeferral) {
+   journal.assertGeneration(nodeId, repo, generation, "record a budget deferral");
+   journal.recordEvent("transient", { nodeId, repo, detail: detail.slice(0, 400) });
+   finish(journal, nodeId, repo, "failed", detail);
+   return { ...base, status: "failed", detail };
   }
   journal.recordEvent("refused", {
    nodeId,
@@ -622,12 +638,14 @@ async function runImplementNode(
   // repo commands share it, and it is never the live one.
   sessionJournal: sessionJournalPath(),
   shellRun: ctx.shellRun,
+  testBackend: ctx.testBackend,
   github: ctx.github,
   reviewer: ctx.reviewer,
   viewsDependencies: ctx.viewsDependencies,
   hostLoad: ctx.hostLoad,
   quietHost: ctx.quietHost,
   announce: ctx.announce,
+  fixNode: ctx.fixNode,
   mergeablePoll: ctx.mergeablePoll,
   substrateReaders: resolveReaders(ctx),
  };
@@ -647,7 +665,12 @@ async function runImplementNode(
   }
  }
 
+ if (outcome.graphClosureReconciled) return { ...base, ...outcome };
+
  switch (outcome.status) {
+  case "released":
+   finish(journal, nodeId, repo, "released", outcome.detail);
+   break;
   case "success":
    journal.resetDeadman();
    finish(journal, nodeId, repo, "success", outcome.detail);
@@ -928,14 +951,14 @@ async function runResearch(
   ...ctx.researchCiTiming,
   repo, branch, base: map.base, sha, nodeId, token, pr: existingPr, github, fence,
   recordPr: (pr) => {
-   journal.updateWorker(nodeId, repo, { prNumber: pr.number });
+   journal.updateWorker(nodeId, repo, { prNumber: pr.iid });
    if (existingPr === null) {
-    journal.recordEvent("pr-opened", { nodeId, repo, detail: `research draft PR #${pr.number} ${pr.url}` });
+    journal.recordEvent("pr-opened", { nodeId, repo, detail: `research draft PR #${pr.iid} ${pr.webUrl}` });
    }
   },
  });
- journal.recordEvent("ci-passed", { nodeId, repo, detail: `research ${evidence.ci} (${evidence.check.name})` });
- const resolution = `${findings.stdout.trim()}\n\nResearch CI evidence: draft ${evidence.pr.url}, check run ${evidence.ci}.`;
+ journal.recordEvent("ci-passed", { nodeId, repo, detail: `research ${evidence.ci} (${evidence.check.runName})` });
+ const resolution = `${findings.stdout.trim()}\n\nResearch CI evidence: draft ${evidence.pr.webUrl}, check run ${evidence.ci}.`;
  const resolutionFile = join(tmpdir(), `ranger-close-${fileStemFor(repo, nodeId)}.md`);
  writeFileSync(resolutionFile, resolution, "utf8");
 

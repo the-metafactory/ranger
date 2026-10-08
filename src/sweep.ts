@@ -5,13 +5,16 @@ import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import type { Journal } from "./journal.ts";
 import { killProcessGroup, pidAlive, processGroupCommands } from "./exec.ts";
 import { graphRelease } from "./graph-write.ts";
-import type { GitHubPort } from "./implement.ts";
+import type { ForgePort } from "./forge.ts";
 import {
  runMergeDesk,
  watchedByMergeDesk,
  type MergeDeskResult,
 } from "./merge-desk.ts";
 import { crashParkOutcome, respawnedEvent } from "./outcomes.ts";
+import { graphNode, GRAPH_CALL_TIMEOUT_MS } from "./graph.ts";
+import { reconcileGraphClosures } from "./closure-sweep.ts";
+import { BudgetDeferral, budgetedRead, budgetPolicy } from "./budget.ts";
 
 /**
  * Sweep (design §7) — reconcile the journal against reality, crash = no-op.
@@ -37,7 +40,7 @@ export interface SweepContext {
   */
  respawn?: (nodeId: string, repo: string, root: number) => Promise<number | null>;
  /** Merge-desk seams (tests): the forge and the Discord post. */
- github?: GitHubPort;
+ github?: ForgePort;
  /**
   * Which half to run (default both): `liveness` reconciles crashed workers
   * (respawn, park, release); `desk` runs only the merge desk. The tick runs
@@ -172,6 +175,22 @@ export async function sweepMap(ctx: SweepContext): Promise<SweepMapResult> {
     journal.recordEvent("released", { nodeId: worker.nodeId, repo, detail: "claim released after park" });
    }
   }
+ }
+
+ // Worker and card closure scans share a deadline after crash handling.
+ // Each scan also has a fixed row cap to bound its graph reads.
+ if (phase !== "desk") {
+  const deadline = Date.now() + GRAPH_CALL_TIMEOUT_MS;
+  const credential = { token, source: "write-token" };
+  const readNode = async (id: string) => {
+   if (Date.now() >= deadline) throw new BudgetDeferral("graph closure pass deadline reached");
+   return budgetedRead(journal, repo, credential, budgetPolicy(config), new Date(), () => {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new BudgetDeferral("graph closure pass deadline reached");
+    return graphNode(repo, id, credential, { timeoutMs: remaining });
+   });
+  };
+  await reconcileGraphClosures(ctx, readNode, result);
  }
 
  // Implement-lane rows waiting on (or parked before) the principal's merge (#23).

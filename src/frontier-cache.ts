@@ -144,7 +144,7 @@ export async function readFrontier(
   // The sentinel was read BEFORE the walk, so a change landing between the
   // two is in the frontier but not the sentinel — the next read sees a new
   // sentinel and re-reads. Conservative, never stale.
-  const frontier = await budgetedRead(journal, token, policy, now, () =>
+  const frontier = await budgetedRead(journal, repo, token, policy, now, () =>
     graphFrontier(repo, root, token, {
       timeoutMs: args.timeoutMs ?? GRAPH_CALL_TIMEOUT_MS,
     }),

@@ -11,16 +11,14 @@ import { readFrontier } from "./frontier-cache.ts";
 import { GRAPH_CALL_TIMEOUT_MS } from "./graph.ts";
 import { graphClaim, type ClaimResult } from "./graph-write.ts";
 import {
- assertNotPrincipal,
- resolveBotIdentity,
- resolveWriteToken,
+ assertWriteIdentity,
  WriteGateError,
 } from "./identity.ts";
 import type { Journal } from "./journal.ts";
 import { ClaimLockBusy, withClaimLock } from "./claim-lock.ts";
 import type { OwnedCheck } from "./lock.ts";
 import { classifyFrontier, loadProbeRegistry } from "./route.ts";
-import type { GitHubPort } from "./github.ts";
+import type { ForgePort } from "./forge.ts";
 import * as realGitHub from "./github.ts";
 import { probeRequeueCandidates, requeueProbes, type ProbeRequeueResult } from "./probe-requeue.ts";
 import { sweepMap, type SweepMapResult } from "./sweep.ts";
@@ -77,7 +75,7 @@ export interface WalkContext {
  spawnRunNode?: (args: SpawnRunNodeArgs) => Promise<number | null>;
  now?: () => Date;
  /** The merge desk's GitHub port (tests inject a fake; default: the real API). */
- github?: GitHubPort;
+ github?: ForgePort;
 }
 
 /** Is this resource lane held? (awaiting-merge does not hold it.) */
@@ -252,10 +250,13 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
  // Even a worker finishing during this tick must not allow a second claim
  // across maps: at most one new implement claim per resource lane per tick.
  const implementClaimed = new Set<ImplementLane>();
+ // Maps whose credential gate failed on a forge read this tick, not a refusal:
+ // a queued resume on such a map defers without counting a failed start.
+ const transientGates = new Set<RangerMapConfig>();
  // Desks and queue validation share the PR read for this bounded tick.
- const port = ctx.github ?? realGitHub;
- const prReads = new Map<string, ReturnType<GitHubPort["getPr"]>>();
- const getPr: GitHubPort["getPr"] = (repo, number, token) => {
+ const port: ForgePort = ctx.github ?? realGitHub;
+ const prReads = new Map<string, ReturnType<ForgePort["getPr"]>>();
+ const getPr: ForgePort["getPr"] = (repo, number, token) => {
   const key = `${repo}#${number}`;
   if (!prReads.has(key)) prReads.set(key, port.getPr(repo, number, token));
   return prReads.get(key)!;
@@ -334,14 +335,12 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
   let token: string;
   let botIdentity: string;
   try {
-   const credential = resolveWriteToken(config, map.repo);
-   token = credential.token;
-   botIdentity = await resolveBotIdentity(config, token);
-   assertNotPrincipal(config, botIdentity);
+   ({ token, botIdentity } = await assertWriteIdentity(config, map.repo));
   } catch (error) {
    mapResult.gated = true;
    mapResult.gateReason =
     error instanceof WriteGateError ? error.message : String(error);
+   if (error instanceof WriteGateError && error.transient) transientGates.add(map);
    maps.push(mapResult);
    continue;
   }
@@ -417,7 +416,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
     order.map(map => {
      const w = walked.find(w => w.map === map);
      const m = mapResults.get(map)!;
-     return { map, token: w?.token, gateReason: m.gateReason, errors: w?.errors ?? m.errors };
+     return { map, token: w?.token, gateReason: m.gateReason, gateTransient: transientGates.has(map), errors: w?.errors ?? m.errors };
     }), implementClaimed, owned));
   } catch (error) {
    for (const w of walked) w.errors.push(`resume queue failed: ${error instanceof Error ? error.message : String(error)}`);

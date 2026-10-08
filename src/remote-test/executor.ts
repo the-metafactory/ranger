@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, mkdir, open, readFile, realpath, rm, stat } from "node:fs/promises";
+import { lstat, mkdir, open, readFile, readdir, realpath, rm, stat } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import { z } from "zod";
 import { killProcessGroup } from "../exec.ts";
@@ -9,8 +9,9 @@ import { ResourceObservationSchema, validateProfileManifest, validateRemoteTestJ
 import { ArtifactPolicySchema, persistExecution, readExecutionReceipt, type ArtifactOptions } from "./artifacts.ts";
 import { restoreSource } from "./source.ts";
 import { ActiveRemoteTestJob, BusyRemoteTestExecutor, InterruptedRemoteTestJob, RevokedRemoteTestJob, openJobLedger, type JobLedger, type OwnedContainer } from "./job-ledger.ts";
+import { REMOTE_TEST_LIMITS, profileBudgets, type ReviewedPolicy, type ContainerBudget } from "./profiles.ts";
 
-export const EXECUTOR_LIMITS = { cpuCores: 2, memoryBytes: 1610612736, pids: 256, timeoutMs: 600_000 } as const;
+export const EXECUTOR_LIMITS = REMOTE_TEST_LIMITS;
 export const CONTAINER_BOOTSTRAP_FLAGS = ["--config=/dev/null", "--no-env-file"] as const;
 const ConfigSchema = z.object({
  executorId: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/),
@@ -20,7 +21,7 @@ const ConfigSchema = z.object({
   profile: z.unknown().transform(validateProfileManifest),
   lockFile: z.string().regex(/^[a-zA-Z0-9_.-]+$/).refine(s => s !== "." && s !== ".."),
   imageReference: z.string().regex(/^[a-z0-9][a-z0-9./:_-]*@sha256:[a-f0-9]{64}$/),
- }).strict().refine(p => p.imageReference.endsWith(`@${p.profile.imageDigest}`))).min(1).max(32),
+ }).strict().refine(p => p.imageReference.endsWith(`@${p.profile.imageDigest}`) && (!p.profile.reviewed || p.lockFile === "bun.lock"))).min(1).max(32),
 }).strict().refine(c => new Set(c.profiles.map(p => p.profile.profileId)).size === c.profiles.length);
 export type ExecutorConfig = z.infer<typeof ConfigSchema>;
 export function validateExecutorConfig(input: unknown): ExecutorConfig { return ConfigSchema.parse(input); }
@@ -50,21 +51,39 @@ export const podmanLauncher: ExecutorLauncher = (argv, options) => new Promise((
 /** Only this wrapper writes stdout. Child output is drained onto stderr for
  * bounded private host capture. Check actual
  * cgroup files before the first reviewed command, not just requested flags. */
-export function containerProgram(commands: [string, ...string[]][]): string {
+export function containerProgram(commands: [string, ...string[]][], reviewed?: ReviewedPolicy, lockDigest?: string): string {
+ const budget = profileBudgets(reviewed).test;
  return `const fs = await import("node:fs/promises");
 let result = {status:"infra_failed",exitCode:null};
 let ran = false;
+${reviewed ? 'let skipped = 0; result.coverage = {requiredSkippedTests:null};' : ''}
 try {
  const value = async name => (await fs.readFile("/sys/fs/cgroup/"+name,"utf8")).trim();
  const cpu = (await value("cpu.max")).split(/\\s+/).map(Number);
- if (process.getuid() === 0 || cpu.length !== 2 || !cpu.every(Number.isFinite) || cpu[0] <= 0 || cpu[1] <= 0 || cpu[0]/cpu[1] > ${EXECUTOR_LIMITS.cpuCores} ||
-     await value("memory.max") !== "${EXECUTOR_LIMITS.memoryBytes}" || await value("memory.swap.max") !== "0" || await value("pids.max") !== "${EXECUTOR_LIMITS.pids}") throw Error("Required controller enforcement unavailable");
+ if (process.getuid() === 0 || cpu.length !== 2 || !cpu.every(Number.isFinite) || cpu[0] <= 0 || cpu[1] <= 0 || cpu[0]/cpu[1] > ${budget.cpuCores} ||
+     await value("memory.max") !== "${budget.memoryBytes}" || await value("memory.swap.max") !== "0" || await value("pids.max") !== "${budget.pids}") throw Error("Required controller enforcement unavailable");
+ ${reviewed ? reviewedBootstrap(lockDigest!) : ''}
  for (const argv of ${JSON.stringify(commands)}) {
-  const child = Bun.spawn(argv,{cwd:"/work",stdin:"ignore",stdout:"pipe",stderr:"pipe"});
+  let summary = "";
+  const collectSummary = ${!!reviewed} && argv.includes("test");
+  const child = Bun.spawn(argv,{cwd:"/work",stdin:"ignore",stdout:"pipe",stderr:"pipe"${reviewed ? ',env:{PATH:"/usr/local/bin:/usr/bin:/bin",HOME:"/tmp",NATS_URL:"nats://127.0.0.1:4222"}' : ''}});
   ran = true;
-  const drain = async stream => { for await (const chunk of stream) { if (!process.stderr.write(chunk)) await new Promise(resolve => process.stderr.once("drain",resolve)); } };
+  const drain = async stream => { for await (const chunk of stream) { if (collectSummary) summary = (summary + Buffer.from(chunk).toString()).slice(-65536); if (!process.stderr.write(chunk)) await new Promise(resolve => process.stderr.once("drain",resolve)); } };
   const [code] = await Promise.all([child.exited, drain(child.stdout), drain(child.stderr)]);
   result = {status:code === 0 ? "passed" : "test_failed",exitCode:code};
+  ${reviewed ? `result.coverage = {requiredSkippedTests:skipped};
+  if (argv.includes("test")) {
+   const clean = summary.replace(/\\x1b\\[[0-9;]*m/g, "");
+   const passed = [...clean.matchAll(/^\\s*(\\d+) pass$/gm)].at(-1), failed = [...clean.matchAll(/^\\s*(\\d+) fail$/gm)].at(-1);
+   if (!passed || !failed || Number(passed[1]) + Number(failed[1]) < 1) {
+    result.coverage.requiredSkippedTests = null;
+    if (code === 0) throw Error("Required test summary missing or empty");
+   } else {
+    skipped += [...clean.matchAll(/^\\s*(\\d+) (?:skip|todo)$/gm)].reduce((sum, match) => sum + Number(match[1]), 0);
+    result.coverage.requiredSkippedTests = skipped;
+    if (skipped > 0) { if (code === 0) result.status = "infra_failed"; break; }
+   }
+  }` : ''}
   if (code !== 0) break;
  }
  if (/^oom_kill\\s+[1-9][0-9]*$/m.test(await value("memory.events"))) result.status = "infra_failed";
@@ -78,6 +97,67 @@ if (ran) try {
 } catch {}
 console.log(JSON.stringify(result));
 process.exit(result.exitCode ?? 125);`;
+}
+
+/** No network, shared package cache, hooks or source-provided install commands.
+ * The image's self-contained dependency snapshot is copied, never mounted RW. */
+function reviewedBootstrap(lockDigest: string): string {
+ return `if (Bun.version !== "1.3.14") throw Error("Reviewed recipe requires Bun 1.3.14");
+ const crypto = await import("node:crypto");
+ const digest = "sha256:"+crypto.createHash("sha256").update(await fs.readFile("/opt/ranger-dependencies/bun.lock")).digest("hex");
+ if (digest !== ${JSON.stringify(lockDigest)}) throw Error("Image dependencies do not match lock");
+ try { await fs.lstat("/work/node_modules"); throw Error("Source contains node_modules"); } catch (e) { if (e.code !== "ENOENT") throw e; }
+ await fs.cp("/opt/ranger-dependencies/node_modules","/work/node_modules",{recursive:true,dereference:true,force:false,errorOnExist:true});
+ let ready = false;
+ for (let attempt = 0; attempt < 50 && !ready; attempt++) {
+  ready = await new Promise(resolve => {
+   let connection, received = "";
+   const timer = setTimeout(() => { connection?.terminate(); resolve(false); }, 200);
+   Bun.connect({hostname:"127.0.0.1",port:4222,socket:{
+    open(socket){connection=socket;socket.write("CONNECT {}\\r\\nPING\\r\\n");},
+    data(socket,data){received=(received+Buffer.from(data).toString()).slice(-4096);if(received.includes("PONG\\r\\n")){clearTimeout(timer);socket.end();resolve(true);}},
+    error(){clearTimeout(timer);resolve(false);},close(){clearTimeout(timer);resolve(received.includes("PONG\\r\\n"));}
+   }}).catch(() => {clearTimeout(timer);resolve(false);});
+  });
+  if (!ready) await Bun.sleep(100);
+ }
+ if (!ready) throw Error("Job-private NATS not ready");`;
+}
+
+function isolatedContainerFlags(budget: ContainerBudget, seconds: number, uid: number, gid: number): string[] {
+ return ["--pid=private", "--ipc=private", "--uts=private", "--cgroupns=private", "--cgroups=enabled",
+  `--cpus=${budget.cpuCores}`, `--memory=${budget.memoryBytes}`, `--memory-swap=${budget.memoryBytes}`, `--pids-limit=${budget.pids}`,
+  `--timeout=${seconds}`, "--stop-timeout=0", "--restart=no", "--read-only", "--read-only-tmpfs=false",
+  "--tmpfs=/tmp:rw,nosuid,nodev,size=67108864,mode=1777", "--cap-drop=ALL", "--security-opt=no-new-privileges",
+  "--userns=keep-id", `--user=${uid}:${gid}`, "--http-proxy=false", "--unsetenv-all", "--env=PATH=/usr/local/bin:/usr/bin:/bin", "--env=HOME=/tmp",
+  "--image-volume=ignore", "--no-healthcheck", "--systemd=false", "--log-driver=none", "--workdir=/tmp"];
+}
+
+/** Fixed shell text: no profile/job interpolation except validated numeric budgets. */
+function natsProgram(budget: ContainerBudget): string {
+ return `test "$(id -u)" != 0
+set -- $(cat /sys/fs/cgroup/cpu.max)
+test "$1" -gt 0; test "$2" -gt 0; test "$1" -le $(( $2 / 4 ))
+test "$(cat /sys/fs/cgroup/memory.max)" = ${budget.memoryBytes}
+test "$(cat /sys/fs/cgroup/memory.swap.max)" = 0
+test "$(cat /sys/fs/cgroup/pids.max)" = ${budget.pids}
+exec /nats-server --jetstream --store_dir=/data --addr=127.0.0.1 --port=4222`;
+}
+
+/** Absence of optional peak telemetry is established by successful enumeration.
+ * A listed but unreadable/malformed peak, or failed mandatory reads, still fails. */
+export function sidecarMetricsProgram(): string {
+ return `set -e
+interfaces=$(ls -1 /sys/fs/cgroup)
+cat /sys/fs/cgroup/cpu.stat
+if printf '%s\\n' "$interfaces" | grep -Fx memory.peak >/dev/null; then
+ peak=$(cat /sys/fs/cgroup/memory.peak)
+ case "$peak" in ''|*[!0-9]*) exit 1;; esac
+ printf 'ranger_peak %s\\n' "$peak"
+else
+ printf 'ranger_peak unavailable\\n'
+fi
+cat /sys/fs/cgroup/memory.events`;
 }
 
 /** One operator-exclusive jobs root is one lane. Configuration is trusted and
@@ -131,6 +211,8 @@ async function executeAdmittedRemoteTest(
  const uid = options.uid ?? process.getuid?.(), gid = options.gid ?? process.getgid?.();
  let status: RemoteTestReceipt["status"] = "rejected", exitCode: number | null = null;
  let resources: ResourceObservation = { state: "skipped", cpuTimeMicros: null, peakMemoryBytes: null };
+ let coverage = selected.profile.reviewed ? { requiredSkippedTests: null as number | null } : undefined;
+ const budgets = profileBudgets(selected.profile.reviewed);
  let outputState: "captured" | "unavailable" | "skipped" = "skipped", truncated = false, logBytes = 0;
  const logs: Buffer[] = [];
  const captureLog = (chunk: Uint8Array) => {
@@ -140,7 +222,7 @@ async function executeAdmittedRemoteTest(
   if (remaining > 0) { const retained = Buffer.from(chunk.subarray(0, remaining)); logs.push(retained); logBytes += retained.length; }
  };
  const receipt = () => persistExecution(join(config.jobsRoot, ".artifacts"),
-  validateRemoteTestReceipt({ version: 1, identity: job, executorId: config.executorId, status, exitCode, completedAt: now() }, job),
+  validateRemoteTestReceipt({ version: 1, identity: job, executorId: config.executorId, status, exitCode, completedAt: now(), ...(coverage ? { coverage } : {}) }, job),
   { startedAt: executionStartedAt, log: Buffer.concat(logs, logBytes), truncated, outputState, resources },
   { ...config.artifacts, now, fault: options.artifactFault });
  if (job.deadline - now() < 1000) return receipt();
@@ -180,12 +262,19 @@ async function executeAdmittedRemoteTest(
  };
  let checkout: string | undefined, containerId: string | undefined, launchAttempted = false, releaseLane = false;
  const cidfile = join(lane, "container-id");
+ let sidecarId: string | undefined, sidecarAttempted = false;
+ const sidecarCidfile = join(lane, "nats-id");
  try {
   const info = JSON.parse(await command(["info", "--format=json"]));
   if (info.host?.os !== "linux" || !["arm64", "aarch64"].includes(info.host.arch) || info.host.cgroupVersion !== "v2" || info.host.security?.rootless !== true ||
       !["cpu", "memory", "pids"].every(c => info.host.cgroupControllers?.includes(c))) throw new Error("Unsupported engine enforcement");
   const image = JSON.parse(await command(["image", "inspect", "--", selected.imageReference]));
   if (!Array.isArray(image) || image.length !== 1 || image[0].Digest !== job.imageDigest || image[0].Os !== "linux" || image[0].Architecture !== "arm64") throw new Error("Pinned runtime image unavailable");
+  const sidecar = selected.profile.reviewed?.sidecars[0];
+  if (sidecar) {
+   const inspected = JSON.parse(await command(["image", "inspect", "--", sidecar.imageReference]));
+   if (!Array.isArray(inspected) || inspected.length !== 1 || inspected[0].Digest !== sidecar.imageReference.split("@")[1] || inspected[0].Os !== "linux" || inspected[0].Architecture !== "arm64") throw Error("Pinned sidecar image unavailable");
+  }
   const restored = await restoreSource({ bundlePath: input.bundlePath, jobsRoot: root, jobId: job.jobId,
    manifest: { version: 1, commitDigest: job.commitDigest, treeDigest: job.treeDigest, bundleDigest: job.bundleDigest } });
   checkout = restored.checkoutPath;
@@ -193,20 +282,49 @@ async function executeAdmittedRemoteTest(
   try {
    if (!(await lock.stat()).isFile() || `sha256:${createHash("sha256").update(await lock.readFile()).digest("hex")}` !== job.lockDigest) throw new Error("Lock identity mismatch");
   } finally { await lock.close(); }
+  if (selected.profile.reviewed) {
+   const packageFile = await open(join(checkout, "package.json"), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+   try {
+    if (!(await packageFile.stat()).isFile()) throw Error("Invalid package file");
+    const pkg = JSON.parse(await packageFile.readFile("utf8"));
+    if (pkg.name !== "@the-metafactory/myelin" || pkg.scripts?.test !== "bun test" || pkg.scripts?.typecheck !== "bunx tsc --noEmit" || pkg.scripts?.lint !== "eslint .") throw Error("Repository recipe requires renewed review");
+   } finally { await packageFile.close(); }
+   // A new test root needs renewed review rather than silently losing coverage.
+   const pending = [checkout]; let entries = 0;
+   while (pending.length) {
+    const directory = pending.pop()!;
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+     if (++entries > 50_000) throw Error("Reviewed source inventory too large");
+     if (directory === checkout && entry.name === ".git") continue;
+     const path = join(directory, entry.name), relative = path.slice(checkout.length + 1);
+     if (entry.isSymbolicLink()) throw Error("Reviewed recipe does not support source symlinks");
+     if (entry.isDirectory()) { pending.push(path); continue; }
+     if (/(?:[._](?:test|spec))\.(?:[cm]?[jt]sx?)$/.test(entry.name) && !/^(?:src\/|scripts\/|tools\/|tests\/integration\/|tests\/package-exports\.smoke\.test\.ts$)/.test(relative)) throw Error("New test root requires recipe review");
+    }
+   }
+  }
   const runtimeSeconds = Math.floor((end - now()) / 1000);
   if (runtimeSeconds < 1) interrupt("timed_out");
   if (controller.signal.aborted) throw new Error("Interrupted before launch");
   ledger.launch(job, token);
+  if (sidecar) {
+   sidecarAttempted = true;
+   const id = (await command(["create", "--cidfile", sidecarCidfile, `--name=ranger-nats-${randomUUID()}`, "--pull=never",
+    `--label=ranger.remote-test.ledger=${ledger.id}`, `--label=ranger.remote-test.job=${job.jobId}`, `--label=ranger.remote-test.attempt=${token}`, "--label=ranger.remote-test.role=nats",
+    "--network=none", ...isolatedContainerFlags(budgets.nats!, runtimeSeconds, uid, gid),
+    "--tmpfs=/data:rw,nosuid,nodev,size=134217728,mode=1777", "--entrypoint=/bin/sh", sidecar.imageReference, "-ec", natsProgram(budgets.nats!),
+   ])).trim();
+   if (!/^[a-f0-9]{64}$/.test(id)) throw Error("Invalid sidecar identity");
+   sidecarId = id;
+   const created = JSON.parse(await command(["inspect", id]))[0];
+   if (!Array.isArray(created?.Mounts) || !created.Mounts.every((m: { Type: string; Destination: string }) => m.Type === "tmpfs" && ["/tmp", "/data"].includes(m.Destination))) throw Error("Unexpected sidecar mount policy");
+   await command(["start", sidecarId]);
+  }
   launchAttempted = true;
   const id = (await command(["create", "--cidfile", cidfile, `--name=ranger-test-${randomUUID()}`, "--pull=never",
    `--label=ranger.remote-test.ledger=${ledger.id}`, `--label=ranger.remote-test.job=${job.jobId}`, `--label=ranger.remote-test.attempt=${token}`,
-   "--network=none", "--pid=private", "--ipc=private", "--uts=private", "--cgroupns=private", "--cgroups=enabled",
-   `--cpus=${EXECUTOR_LIMITS.cpuCores}`, `--memory=${EXECUTOR_LIMITS.memoryBytes}`, `--memory-swap=${EXECUTOR_LIMITS.memoryBytes}`, `--pids-limit=${EXECUTOR_LIMITS.pids}`,
-   `--timeout=${runtimeSeconds}`, "--stop-timeout=0", "--restart=no", "--read-only", "--read-only-tmpfs=false",
-   "--tmpfs=/tmp:rw,nosuid,nodev,size=67108864,mode=1777", "--cap-drop=ALL", "--security-opt=no-new-privileges",
-   "--userns=keep-id", `--user=${uid}:${gid}`, "--http-proxy=false", "--unsetenv-all", "--env=PATH=/usr/local/bin:/usr/bin:/bin", "--env=HOME=/tmp",
-   "--image-volume=ignore", "--no-healthcheck", "--systemd=false", "--log-driver=none", "--workdir=/tmp",
-   "--mount", `type=bind,source=${checkout},destination=/work,rw`, "--entrypoint=bun", selected.imageReference, ...CONTAINER_BOOTSTRAP_FLAGS, "-e", containerProgram(selected.profile.commands),
+   sidecarId ? `--network=container:${sidecarId}` : "--network=none", ...isolatedContainerFlags(budgets.test, runtimeSeconds, uid, gid),
+   "--mount", `type=bind,source=${checkout},destination=/work,rw`, "--entrypoint=bun", selected.imageReference, ...CONTAINER_BOOTSTRAP_FLAGS, "-e", containerProgram(selected.profile.commands, selected.profile.reviewed, job.lockDigest),
   ])).trim();
   if (!/^[a-f0-9]{64}$/.test(id)) throw new Error("Invalid container identity");
   containerId = id;
@@ -226,13 +344,36 @@ async function executeAdmittedRemoteTest(
   if (state?.OOMKilled === true) { status = "infra_failed"; exitCode = Number.isInteger(state.ExitCode) && state.ExitCode >= 0 && state.ExitCode <= 255 ? state.ExitCode : null; }
   else if (!result.stdout.trim() && state?.Status === "exited" && state.ExitCode === 137 && now() - startedAt >= runtimeSeconds * 1000) { status = "timed_out"; }
   else {
-   const terminal = z.object({ status: z.enum(["passed", "test_failed", "infra_failed"]), exitCode: z.number().int().min(0).max(255).nullable(), resources: ResourceObservationSchema.optional() }).strict().parse(JSON.parse(result.stdout.trim()));
+   const terminal = z.object({ status: z.enum(["passed", "test_failed", "infra_failed"]), exitCode: z.number().int().min(0).max(255).nullable(), resources: ResourceObservationSchema.optional(), coverage: z.object({ requiredSkippedTests: z.number().int().nonnegative().safe().nullable() }).strict().optional() }).strict().parse(JSON.parse(result.stdout.trim()));
    if (terminal.status === "passed" && terminal.exitCode !== 0 || terminal.status === "test_failed" && (terminal.exitCode === null || terminal.exitCode === 0)) throw new Error("Inconsistent test outcome");
    if (state?.Status !== "exited" || state.ExitCode !== (terminal.exitCode ?? 125) || result.code !== state.ExitCode) throw new Error("Incomplete terminal result");
    status = terminal.status; exitCode = terminal.exitCode;
    if (terminal.resources) resources = terminal.resources;
+   if (coverage) {
+    if (!terminal.coverage) throw Error("Incomplete required test coverage");
+    coverage = terminal.coverage;
+    if (terminal.status === "passed" && coverage.requiredSkippedTests !== 0) throw Error("Incomplete required test coverage");
+   }
   }
- } catch { status = interruption ?? (launchAttempted ? "infra_failed" : "rejected"); }
+  if (sidecarId && status !== "timed_out") {
+   const sidecarState = JSON.parse(await command(["inspect", sidecarId]))[0]?.State;
+   if (sidecarState?.Status !== "running" || sidecarState.OOMKilled !== false) throw Error("Sidecar interrupted");
+   // Summing independent peaks is a conservative aggregate upper bound.
+   const metrics = await command(["exec", sidecarId, "/bin/sh", "-ec", sidecarMetricsProgram()]);
+   const cpu = Number(metrics.match(/^usage_usec\s+(\d+)$/m)?.[1]);
+   const peakValue = metrics.match(/^ranger_peak (unavailable|[0-9]+)$/m)?.[1];
+   const peak = peakValue === "unavailable" ? null : Number(peakValue);
+   const oom = Number(metrics.match(/^oom_kill\s+(\d+)$/m)?.[1]);
+   if (!Number.isSafeInteger(cpu) || cpu < 0 || !Number.isSafeInteger(oom) || oom !== 0 ||
+    peakValue === undefined || (peak !== null && (!Number.isSafeInteger(peak) || peak < 0))) throw Error("Sidecar metrics invalid or OOM");
+   if (resources.state === "observed" && peak !== null) {
+    resources = ResourceObservationSchema.parse({ state: "observed", cpuTimeMicros: resources.cpuTimeMicros! + cpu, peakMemoryBytes: resources.peakMemoryBytes! + peak });
+   } else resources = { state: "unavailable", cpuTimeMicros: null, peakMemoryBytes: null };
+  }
+ } catch {
+  status = interruption ?? (launchAttempted || sidecarAttempted ? "infra_failed" : "rejected");
+  if (sidecarAttempted && resources.state === "observed") resources = { state: "unavailable", cpuTimeMicros: null, peakMemoryBytes: null };
+ }
  finally {
   clearTimeout(timer); clearInterval(fenceTimer); options.signal?.removeEventListener("abort", cancel);
   // A create interrupted after allocation can still leave a container. The
@@ -245,6 +386,13 @@ async function executeAdmittedRemoteTest(
   if (containerId) {
    if (interruption) { try { await command(["kill", "--signal=KILL", containerId], true); } catch { /* rm --force is also a kill; its result gates cleanup. */ } }
    try { await command(["rm", "--force", "--volumes", containerId], true); } catch { safe = false; }
+  }
+  if (!sidecarId && sidecarAttempted) {
+   try { const id = (await readFile(sidecarCidfile, "utf8")).trim(); if (!/^[a-f0-9]{64}$/.test(id)) throw Error(); sidecarId = id; }
+   catch { safe = false; }
+  }
+  if (sidecarId) {
+   try { await command(["rm", "--force", "--volumes", sidecarId], true); } catch { safe = false; }
   }
   if (safe) {
    try { if (checkout) await rm(join(root, job.jobId), { recursive: true, force: true }); releaseLane = true; }
@@ -278,16 +426,19 @@ export async function reconcileRemoteTests(input: unknown, options: { launcher?:
     const inventory = (await command(["ps", "--all", "--no-trunc", "--quiet", "--filter", `label=ranger.remote-test.ledger=${ledger.id}`])).trim();
     const ids = inventory ? inventory.split(/\s+/) : [];
     if (ids.length > 1024) throw Error("Invalid recovery container inventory");
-    const containers: OwnedContainer[] = [];
+    const containers: (OwnedContainer & { sidecar: boolean })[] = [];
     for (const id of ids) {
      if (!/^[a-f0-9]{64}$/.test(id)) throw Error("Invalid recovery container ID");
      const inspected = JSON.parse(await command(["inspect", id]));
      if (!Array.isArray(inspected) || inspected.length !== 1 || inspected[0].Id !== id) throw Error("Invalid recovery container inspection");
      const labels = inspected[0].Config?.Labels;
      if (labels?.["ranger.remote-test.ledger"] !== ledger.id) throw Error("Recovery label mismatch");
-     containers.push({ id, ledgerId: labels["ranger.remote-test.ledger"], jobId: labels["ranger.remote-test.job"], token: labels["ranger.remote-test.attempt"] });
+     const role = labels["ranger.remote-test.role"];
+     if (role !== undefined && role !== "nats") throw Error("Unknown recovery container role");
+     containers.push({ id, ledgerId: labels["ranger.remote-test.ledger"], jobId: labels["ranger.remote-test.job"], token: labels["ranger.remote-test.attempt"], sidecar: role === "nats" });
     }
-    return containers;
+    // Network namespace dependants must go before their NATS owner.
+    return containers.sort((a, b) => Number(a.sidecar) - Number(b.sidecar));
    },
    remove: async id => { await command(["rm", "--force", "--volumes", id]); },
    cleanup: async jobs => {

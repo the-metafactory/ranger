@@ -1,12 +1,12 @@
+import { principalLoginForRepo } from "./config.ts";
 import { mapKey } from "./maps.ts";
-import { readRefusal } from "./forge-ref.ts";
 import { join } from "node:path";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import type { EscalationDiscord } from "./discord.ts";
 import { classify, hitlWaiting, loadProbeRegistry } from "./route.ts";
 import { BudgetDeferral, budgetPolicy, budgetedRead } from "./budget.ts";
 import { readFrontier } from "./frontier-cache.ts";
-import { GRAPH_CALL_TIMEOUT_MS, graphAudit } from "./graph.ts";
+import { GRAPH_CALL_TIMEOUT_MS, graphAudit, graphNode } from "./graph.ts";
 import { type OwnedCheck, withEscalateLock } from "./lock.ts";
 import type { ResolvedToken } from "./token-gate.ts";
 import type { Journal } from "./journal.ts";
@@ -76,9 +76,6 @@ async function escalateOneMap(
     cards: [],
   };
 
-  const refusal = readRefusal(map.repo);
-  if (refusal !== null) return { ...base, ok: false, error: refusal };
-
   // Pre-map deadline gate: if the tick-wide pass deadline has already passed
   // (a prior map consumed it), skip this map's graph calls entirely — its
   // cards are served next tick. This keeps the per-map overhead bounded so
@@ -146,6 +143,14 @@ async function escalateOneMap(
         now,
         budget: { remaining: ABSENT_RESERVE, deadline: passDeadline },
         owned,
+        readNode: id => {
+          if (Date.now() >= passDeadline) throw new BudgetDeferral("graph closure pass deadline reached");
+          return budgetedRead(journal, map.repo, token, budgetPolicy(config), now, () => {
+            const remaining = passDeadline - Date.now();
+            if (remaining <= 0) throw new BudgetDeferral("graph closure pass deadline reached");
+            return graphNode(map.repo, id, token, { timeoutMs: Math.min(GRAPH_CALL_TIMEOUT_MS, remaining) });
+          });
+        },
       },
       neededIds,
     );
@@ -241,9 +246,6 @@ async function digestOneMap(
     action: "unchanged" as const,
   };
 
-  const refusal = readRefusal(map.repo);
-  if (refusal !== null) return { ...base, ok: false, error: refusal };
-
   // The digest is one logical op per map, but it must still not hold the
   // tick past a bound under rate-limiting — a generous per-digest deadline
   // (round-27 review: the cooldown cap already bounds each wait).
@@ -269,6 +271,7 @@ async function digestOneMap(
     const remainingMs = Math.max(0, digestDeadline - Date.now());
     const audit = await budgetedRead(
       journal,
+      map.repo,
       token,
       budgetPolicy(config),
       now,
@@ -302,7 +305,7 @@ async function digestOneMap(
       ageCounts: openCards,
       audit,
       budget: base.budget,
-      principal: config.principal.login,
+      principal: principalLoginForRepo(config, map.repo) ?? "principal",
       principalDiscordId: config.principal.discordId,
       now,
     });

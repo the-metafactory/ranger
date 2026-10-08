@@ -1,3 +1,4 @@
+import { githubCiVerdict } from "../src/github-ci.ts";
 import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { drizzle } from "drizzle-orm/bun-sqlite";
@@ -11,7 +12,7 @@ import { Journal, openJournal } from "../src/journal.ts";
 import { LAST_IMPLEMENT_MAP, mapKey, pickMap, resumeMap } from "../src/maps.ts";
 import { servedMaps, ServeReader, stateFromJournal } from "../src/serve.ts";
 import { sweepMap } from "../src/sweep.ts";
-import type { GitHubPort } from "../src/github.ts";
+import type { ForgePort } from "../src/forge.ts";
 import { walk } from "../src/walk.ts";
 import { implementLane } from "../src/lanes.ts";
 import { fakeDiscord, fixturesBin, runCli } from "./support.ts";
@@ -92,20 +93,20 @@ async function withRigEnv(fn: (r: ReturnType<typeof rig>) => Promise<void>): Pro
 }
 
 /** A merge desk's fake forge: PR #7 for node 40, sage-clean at its head, conflicting with main. */
-function conflictingPrForge(): GitHubPort {
+function conflictingPrForge(): ForgePort {
  const head = "a".repeat(40);
  return {
   getPr: async () => ({
-   number: 7, state: "open", merged: false, draft: false, title: "Node 40", headRef: "node/40-x", headSha: head,
-   baseRef: "main", mergeable: false, mergeableState: "dirty", mergeCommitSha: null, mergedBy: null,
-   url: "https://github.com/acme/widgets/pull/7", author: "ivy-bot",
+   iid: 7, state: "open", draft: false, title: "Node 40", headRef: "node/40-x", headSha: head,
+   baseRef: "main", mergeState: "conflict", mergeCommitSha: null, mergedBy: null,
+   webUrl: "https://github.com/acme/widgets/pull/7", author: "ivy-bot",
   }),
   listComments: async () => [
    { id: 1, author: "ivy-bot", body: `<!-- ranger:review round=5 sha=${head} blockers=0 majors=0 nits=1 -->\nclean` },
   ],
-  checkRunsFor: async () => [],
+  ciVerdictFor: async () => githubCiVerdict("acme/widgets", []),
   issueLabels: async () => [],
- } as unknown as GitHubPort;
+ } as unknown as ForgePort;
 }
 
 describe("node #47 — map identity", () => {

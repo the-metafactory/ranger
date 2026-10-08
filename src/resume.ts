@@ -2,11 +2,12 @@ import { join } from "node:path";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import { withClaimLock } from "./claim-lock.ts";
 import { executionRefusal } from "./forge-ref.ts";
-import { assertNotPrincipal, resolveBotIdentity, resolveWriteToken, WriteGateError } from "./identity.ts";
+import { pidAlive } from "./exec.ts";
+import { assertWriteIdentity, WriteGateError } from "./identity.ts";
 import type { Journal, ResumeQueueRow, WorkerStatus } from "./journal.ts";
 import { implementLane, startsImplementSession, type ImplementLane } from "./lanes.ts";
 import { graphNode, GRAPH_CALL_TIMEOUT_MS } from "./graph.ts";
-import type { GitHubPort } from "./github.ts";
+import type { ForgePort } from "./forge.ts";
 import type { OwnedCheck } from "./lock.ts";
 import { laneHeldMessage, mapKey, recordImplementStart, resumeMap } from "./maps.ts";
 import { spawnRunNodeDetached, type SpawnRunNodeArgs } from "./spawn.ts";
@@ -19,12 +20,15 @@ export interface ResumeContext {
  now?: () => Date;
 }
 
+/** The same identity gate as run-node: an execution refusal, then the bot's write identity. */
 async function identityGate(config: RangerConfig, map: Pick<RangerMapConfig, "repo">): Promise<void> {
  const refusal = executionRefusal(map.repo);
  if (refusal !== null) throw new WriteGateError(refusal);
- const { token } = resolveWriteToken(config, map.repo);
- assertNotPrincipal(config, await resolveBotIdentity(config, token));
+ await assertWriteIdentity(config, map.repo);
 }
+
+/** A gate that could not be evaluated, as opposed to one that refused. */
+const transientGate = (error: unknown) => error instanceof WriteGateError && error.transient;
 
 const releasedError = (nodeId: string) => new Error(`node ${nodeId}'s claim was released — the walk re-claims it from the frontier`);
 const missingRowError = (nodeId: string, repo: string) => new Error(`no journal row for node ${nodeId} on ${repo} — nothing to resume`);
@@ -63,6 +67,14 @@ export async function startResumeNode(
   return { ...result, kind: "dropped", dropped: true, reason: `worker row is ${row.status}` };
  }
  if (row.status === "released") throw releasedError(nodeId);
+ // A live occupant keeps the node: a second run-node would race it through
+ // the same worktree and PR (2026-10-07, soma #753: two generations raced the
+ // close, and the loser's park was re-spawned 50 times).
+ if ((row.status === "running" || row.status === "claimed") && pidAlive(row.pid)) {
+  throw new Error(
+   `node ${nodeId}'s run-node (pid ${row.pid}) is still ${row.status} — resume only a parked, failed or dead worker`,
+  );
+ }
  const lane = implementLane(map);
  const takesLane = startsImplementSession(row);
  const holder = takesLane ? journal.laneHolder(lane, { nodeId, repo: map.repo }) : null;
@@ -140,12 +152,14 @@ export interface ResumeQueueMap {
  map: RangerMapConfig;
  token?: string;
  gateReason?: string;
+ /** The gate failed on a forge read, not a refusal; the entry defers without a count. */
+ gateTransient?: boolean;
  errors: string[];
 }
 
 /** Caller holds the claim lease; only successful starts reserve implement capacity. */
 export async function processResumeQueue(
- ctx: ResumeContext & { github: GitHubPort }, maps: ResumeQueueMap[],
+ ctx: ResumeContext & { github: ForgePort }, maps: ResumeQueueMap[],
  reservations: Set<ImplementLane>, owned: OwnedCheck,
 ): Promise<void> {
  const { journal, config } = ctx;
@@ -182,7 +196,9 @@ export async function processResumeQueue(
    continue;
   }
   if (state.token === undefined) {
-   defer(`start failed: ${state.gateReason ?? "identity gate unavailable"}`, true);
+   // A refusal (unmapped token, the principal's identity) is a failed start;
+   // a forge read that failed or timed out is a transient read error and is not.
+   defer(`start failed: ${state.gateReason ?? "identity gate unavailable"}`, state.gateTransient !== true);
    continue;
   }
   try {
@@ -191,8 +207,8 @@ export async function processResumeQueue(
    if (node.status === "closed") { drop("node is closed"); continue; }
    if (row.prNumber !== null) {
     const pr = await ctx.github.getPr(entry.repo, row.prNumber, state.token);
-    if (pr.merged || pr.state === "closed") {
-     drop(pr.merged ? "PR is merged" : "PR is closed");
+    if (pr.state === "merged" || pr.state === "closed") {
+     drop(pr.state === "merged" ? "PR is merged" : "PR is closed");
      continue;
     }
    }
@@ -211,7 +227,7 @@ export async function processResumeQueue(
      break;
    }
   } catch (error) {
-   defer(`start failed: ${error instanceof Error ? error.message : String(error)}`, true);
+   defer(`start failed: ${error instanceof Error ? error.message : String(error)}`, !transientGate(error));
   }
  }
 }

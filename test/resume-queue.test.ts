@@ -9,7 +9,7 @@ import { stringify } from "yaml";
 import { loadConfig } from "../src/config.ts";
 import { Journal, openJournal, type WorkerStatus, type ImplementPhase } from "../src/journal.ts";
 import { LAST_IMPLEMENT_MAP } from "../src/maps.ts";
-import type { GitHubPort, PullRequest } from "../src/github.ts";
+import type { ChangeRequest, ForgePort } from "../src/forge.ts";
 import { walk } from "../src/walk.ts";
 import type { SpawnRunNodeArgs } from "../src/spawn.ts";
 import { resumeNode } from "../src/resume.ts";
@@ -66,9 +66,9 @@ async function withRig(fn: (r: ReturnType<typeof rig>) => Promise<void>) {
  }
 }
 
-function pr(number = 7): PullRequest {
- return { number, state: "open", merged: false, draft: false, title: "Build", headRef: "node/40-x", headSha: "b".repeat(40),
-  baseRef: "main", mergeable: true, mergeableState: "clean", mergeCommitSha: null, mergedBy: null, url: "", author: "ivy-bot" };
+function pr(iid = 7): ChangeRequest {
+ return { iid, state: "open", draft: false, title: "Build", headRef: "node/40-x", headSha: "b".repeat(40),
+  baseRef: "main", mergeState: "mergeable", mergeCommitSha: null, mergedBy: null, webUrl: "", author: "ivy-bot" };
 }
 
 describe("resume-node CLI", () => {
@@ -422,9 +422,9 @@ describe("resume-queue-starts-when-lane-frees", () => {
   await withRig(async r => {
    r.queue("41"); r.worker("40", 460, "awaiting-merge", "implement", "awaiting-merge");
    r.journal.updateWorker("40", REPO, { prNumber: 7 });
-   const github = { getPr: async () => ({ ...pr(), mergeable: false, mergeableState: "dirty" }),
+   const github = { getPr: async () => ({ ...pr(), mergeState: "conflict" }),
     listComments: async () => [{ id: 1, author: "ivy-bot", body: `<!-- ranger:review round=5 sha=${pr().headSha} blockers=0 majors=0 nits=1 -->\nclean` }],
-    checkRunsFor: async () => [], issueLabels: async () => [] } as unknown as GitHubPort;
+    checkRunsFor: async () => [], issueLabels: async () => [] } as unknown as ForgePort;
    const spawned: string[] = [];
    await walk({ ...r, github, spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; } });
    expect(spawned).toEqual(["40"]);
@@ -441,13 +441,14 @@ describe("resume-queue-starts-when-lane-frees", () => {
     r.journal.updateWorker("40", REPO, { prNumber: 7 });
     const calls = join(r.dir, "calls"); writeFileSync(calls, ""); process.env.FAKE_SOMA_CALLS = calls;
     let reads = 0;
-    const github = { getPr: async () => { reads++; return pr(); } } as unknown as GitHubPort;
+    const github = { getPr: async () => { reads++; return pr(); } } as unknown as ForgePort;
     const spawned: string[] = [];
     const tick = () => walk({ ...r, github, spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; }, now: () => NOW });
     await tick(); expect(spawned).toEqual([]); expect(r.journal.listResumeQueue()).toHaveLength(1);
-    // The desk reads parked PRs even while paused/capped; the queue adds no read.
+    // The desk reads parked PRs even while paused/capped, and the sweep's closure
+    // pass reads the parked row's node once; the queue adds no read of either.
     expect(reads).toBe(1);
-    expect(readFileSync(calls, "utf8")).not.toContain("node ");
+    expect(readFileSync(calls, "utf8").split("\n").filter(line => line.startsWith("node ")).length).toBe(1);
     if (gate === "pause") r.journal.setPaused(false);
     else r.config.workers.spawnCapPerDay++;
     await tick(); expect(spawned).toEqual(["40"]); expect(r.journal.listResumeQueue()).toEqual([]);
@@ -463,7 +464,7 @@ describe("resume-queue-starts-when-lane-frees", () => {
     if (["released", "claimed", "running"].includes(reason)) r.journal.updateWorker("40", REPO, { status: reason as WorkerStatus });
     if (reason.startsWith("PR")) r.journal.updateWorker("40", REPO, { status: "failed", prNumber: 7 });
     if (reason === "walk none") r.config.maps[0].walk = "none";
-    const github = { getPr: async () => ({ ...pr(), state: "closed", merged: reason === "PR merged" }) } as unknown as GitHubPort;
+    const github = { getPr: async () => ({ ...pr(), state: reason === "PR merged" ? "merged" : "closed" }) } as unknown as ForgePort;
     const spawned: string[] = [];
     await walk({ ...r, github, spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; } });
     // An in-flight implement row still holds the lane after its queue entry is dropped.
@@ -479,7 +480,7 @@ describe("resume-queue-starts-when-lane-frees", () => {
   await withRig(async r => {
    r.queue("40"); r.journal.updateWorker("40", REPO, { prNumber: 7, verdictSha: "a".repeat(40) });
    let reads = 0;
-   const github = { getPr: async () => { reads++; return pr(); } } as unknown as GitHubPort;
+   const github = { getPr: async () => { reads++; return pr(); } } as unknown as ForgePort;
    const spawned: string[] = [];
    await walk({ ...r, github, spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; } });
    expect(reads).toBe(1); expect(spawned).toEqual(["40"]); expect(r.journal.listResumeQueue()).toEqual([]);
@@ -493,7 +494,10 @@ describe("resume-queue-starts-when-lane-frees", () => {
    await walk({ ...r, spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; } });
    expect(spawned).toEqual([]);
    expect(r.journal.listResumeQueue().map(e => e.nodeId)).toEqual(["41"]);
-   expect(r.journal.listEvents(REPO).find(e => e.kind === "resume-dropped")?.detail).toBe("node is closed");
+   // The sweep's closure pass (node #171) finishes the closed node's row before
+   // the queue runs, so the queue sees a released row rather than the closed node.
+   expect(r.journal.getWorker("40", REPO)?.status).toBe("released");
+   expect(r.journal.listEvents(REPO).find(e => e.kind === "resume-dropped")?.detail).toBe("worker row is released");
   });
  });
 
@@ -511,7 +515,7 @@ describe("resume-queue-starts-when-lane-frees", () => {
     reads++;
     if (readFails) throw new Error("read failed");
     return pr();
-   } } as unknown as GitHubPort;
+   } } as unknown as ForgePort;
    const spawned: string[] = [];
    const tick = () => walk({ ...r, github, now: () => NOW,
     spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; } });
@@ -614,7 +618,7 @@ describe("resume-queue-starts-when-lane-frees", () => {
    r.queue("40"); r.queue("41", 460); r.journal.updateWorker("40", REPO, { status: "failed", prNumber: 7 });
    const github = { getPr: async () => {
     r.journal.updateWorker("40", REPO, { status: "running", phase: "close" }); return pr();
-   } } as unknown as GitHubPort;
+   } } as unknown as ForgePort;
    const spawned: string[] = [];
    await walk({ ...r, github, spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; } });
    expect(spawned).toEqual(["41"]);
@@ -633,6 +637,24 @@ describe("resume-queue-starts-when-lane-frees", () => {
    await walk({ ...r, now: () => NOW, spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; } });
    expect(spawned).toEqual(["40"]); expect(r.journal.spawnsToday(NOW)).toBe(1);
    expect(r.journal.listResumeQueue().map(e => e.nodeId)).toEqual(["41"]);
+  });
+ });
+
+ test("a transient identity read defers the head without counting a failed start", async () => {
+  await withRig(async r => {
+   const entry = r.queue("40");
+   process.env.FAKE_GH_USER_FAIL = "1";
+   const spawned: string[] = [];
+   const result = await walk({ ...r, spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; } });
+   expect(spawned).toEqual([]);
+   expect(result.maps.every(m => m.gated)).toBe(true);
+   expect(result.maps[0].gateReason).toContain("cannot resolve the identity behind the write token");
+   expect(r.journal.listResumeQueue()).toEqual([entry]);
+   expect(r.journal.listEvents(REPO).find(e => e.kind === "sweep")?.detail).toContain("queued resume #40 deferred: start failed");
+   delete process.env.FAKE_GH_USER_FAIL;
+   await walk({ ...r, spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; } });
+   expect(spawned).toEqual(["40"]);
+   expect(r.journal.listResumeQueue()).toEqual([]);
   });
  });
 

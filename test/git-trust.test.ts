@@ -1,5 +1,5 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { appendFileSync, copyFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCmd } from "../src/exec.ts";
@@ -273,10 +273,17 @@ describe("per-worktree config: git's copy of the main config.worktree", () => {
   await checkKnownGood(journal, canonical, at);
   mkdirSync(join(canonical, ".git", "worktrees", "w1"), { recursive: true });
   writeFileSync(copy("w1"), "");
-  // Another process fills the copy while the check reads; the check blocks.
-  const writer = Bun.spawn(["sh", "-c", `sleep 0.1 && cp "$0" "$1"`, join(canonical, ".git", "config.worktree"), copy("w1")]);
-  expect((await checkKnownGood(journal, canonical, at)).kind).toBe("match");
-  expect(await writer.exited).toBe(0);
+  // git fills the copy while the check waits: on the check's first wait, not
+  // after a wall-clock delay that a loaded host can outlast.
+  const wait = spyOn(Bun, "sleep").mockImplementation(async () => {
+   copyFileSync(join(canonical, ".git", "config.worktree"), copy("w1"));
+  });
+  try {
+   expect((await checkKnownGood(journal, canonical, at)).kind).toBe("match");
+   expect(wait).toHaveBeenCalledTimes(1);
+  } finally {
+   wait.mockRestore();
+  }
  });
 
  test("a copy with a key the main file lacks is named", async () => {

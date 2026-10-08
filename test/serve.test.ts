@@ -392,7 +392,7 @@ describe("#37 — the launch endpoint refuses", () => {
  const setup = (
   over: {
    getState?: () => ReturnType<typeof assembleState>;
-   verifyGrilling?: () => Promise<string | null>;
+   verifyGrilling?: (map: unknown, nodeId: string, kind: string) => Promise<string | null>;
   } = {},
  ) => {
   const launched: string[][] = [];
@@ -459,6 +459,25 @@ describe("#37 — the launch endpoint refuses", () => {
    expect(launched).toHaveLength(0);
   });
  }
+
+ test("a propose decision opens a session too, checked live as its own kind and worked with orienteer; an approve one does not", async () => {
+  const frontier = [...FRONTIER, entry("21", "decision"), entry("22", "prototype"), entry("20", "task", "approve")];
+  const seen: string[] = [];
+  const { handler, launched } = setup({
+   getState: () => assembleState(inputs({ reports: new Map([[walked.key, report(frontier)]]) })),
+   verifyGrilling: async (_map, id, kind) => (seen.push(`${id}:${kind}`), null),
+  });
+  const map = assembleState(inputs({ reports: new Map([[walked.key, report(frontier)]]) })).maps[0];
+  expect(map.decisions.map((d) => [d.id, d.launchable])).toEqual([["21", true], ["22", true], ["20", false]]);
+  const dry = await handler(post({ key: walked.key, id: "22", dryRun: true }));
+  expect(((await dry.json()) as { prompt: string }).prompt).toMatch(/a prototype waiting on me.*orienteer skill/);
+  expect((await handler(post({ key: walked.key, id: "21" }))).status).toBe(200);
+  expect(launched).toHaveLength(1);
+  expect(seen).toEqual(["22:prototype", "21:decision"]);
+  const approve = await handler(post({ key: walked.key, id: "20" }));
+  expect(approve.status).toBe(409);
+  expect(launched).toHaveLength(1);
+ });
 
  test("refuses a map with no checkout", async () => {
   const { handler, launched } = setup({

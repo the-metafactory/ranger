@@ -13,11 +13,10 @@ import {
  recordedReviews,
  reviewAtHead,
  supersededNote,
- type GitHubPort,
 } from "./implement.ts";
 import type { Journal, WorkerRow } from "./journal.ts";
 import { evaluateMergeGate, type MergeGateInput, type MergeGateResult } from "./merge-gate.ts";
-import type { CheckRun, IssueComment, PullRequest } from "./github.ts";
+import type { IssueComment, ChangeRequest, CiVerdict, ForgePort } from "./forge.ts";
 import { CI_FAILED_PARK_OUTCOME, mergeGateFailedOutcome } from "./outcomes.ts";
 
 /**
@@ -52,7 +51,7 @@ export interface MergeDeskContext {
  map: RangerMapConfig;
  token: string;
  botIdentity: string;
- github?: GitHubPort;
+ github?: ForgePort;
  /** Post a message to the map's channel; returns the message id. */
  post?: (content: string, label: string, files?: readonly DiscordFile[], embeds?: readonly { description: string }[]) => Promise<string>;
  /** Spawn a detached run-node (the resume-for-close); returns its PID. */
@@ -91,10 +90,10 @@ function headEvidence(
  };
 }
 
-function gateInput(map: RangerMapConfig, pr: PullRequest, checkRuns: CheckRun[], last?: Review, probe?: Probe): MergeGateInput {
+function gateInput(map: RangerMapConfig, pr: ChangeRequest, ci: CiVerdict, last?: Review, probe?: Probe): MergeGateInput {
  return {
   pr,
-  checkRuns,
+  ci,
   expectedBase: map.base,
   verdictSha: last?.sha ?? null,
   verdictBlockers: last?.blockers ?? null,
@@ -111,16 +110,16 @@ function gateInput(map: RangerMapConfig, pr: PullRequest, checkRuns: CheckRun[],
  * the same gate the desk holds a merge card behind. Reads only.
  */
 export async function mergeGateNow(
- github: GitHubPort,
+ github: ForgePort,
  map: RangerMapConfig,
  prNumber: number,
  token: string,
  botIdentity: string,
 ): Promise<MergeGateResult> {
  const pr = await github.getPr(map.repo, prNumber, token);
- if (pr.state !== "open" || pr.merged) return evaluateMergeGate(gateInput(map, pr, []));
+ if (pr.state !== "open") return evaluateMergeGate(gateInput(map, pr, { state: "pending", reason: "not read" }));
  const { last, probe } = headEvidence(await github.listComments(map.repo, prNumber, token), pr.headSha, botIdentity);
- return evaluateMergeGate(gateInput(map, pr, await github.checkRunsFor(map.repo, pr.headSha, token), last, probe));
+ return evaluateMergeGate(gateInput(map, pr, await github.ciVerdictFor(map.repo, pr.headSha, token), last, probe));
 }
 
 /** Rows the desk watches: awaiting a merge, or parked with a PR the principal may still merge. */
@@ -195,9 +194,9 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    return;
   }
   const pr = await github.getPr(repo, row.prNumber, token);
-  const title = pr.url.length > 0 ? `PR #${pr.number} ${pr.url}` : `PR #${pr.number}`;
+  const title = pr.webUrl.length > 0 ? `PR #${pr.iid} ${pr.webUrl}` : `PR #${pr.iid}`;
 
-  if (pr.merged) {
+  if (pr.state === "merged") {
    if (ctx.spawn === undefined) {
     result.pending.push(row.nodeId);
     return;
@@ -218,7 +217,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    journal.recordEvent("sweep", {
     nodeId: row.nodeId,
     repo,
-    detail: `PR #${pr.number} merged — resuming at the close phase (pid ${pid})`,
+    detail: `PR #${pr.iid} merged — resuming at the close phase (pid ${pid})`,
    });
    result.resumed.push(row.nodeId);
    return;
@@ -229,11 +228,11 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   if (row.status === "parked" && (!ciPark || pr.state === "closed")) return;
 
   if (pr.state === "closed") {
-   await park(row, `PR #${pr.number} was closed without merging — declined; ranger will not reopen or re-propose it`, title);
+   await park(row, `PR #${pr.iid} was closed without merging — declined; ranger will not reopen or re-propose it`, title);
    return;
   }
 
-  const { last, probe, superseded } = headEvidence(await github.listComments(repo, pr.number, token), pr.headSha, botIdentity);
+  const { last, probe, superseded } = headEvidence(await github.listComments(repo, pr.iid, token), pr.headSha, botIdentity);
   const probesRequired = map.commands.probe !== undefined;
 
   // Send a ready PR back to run-node when the rules it went ready under no
@@ -247,7 +246,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   // park it there. A posted merge card is withdrawn first, so a stale
   // "merge needed" never stands.
   const reworkFindings = last !== undefined && gatingFindings(last) > 0;
-  const conflicting = last !== undefined && (pr.mergeable === false || pr.mergeableState === "dirty");
+  const conflicting = last !== undefined && pr.mergeState === "conflict";
   const missingProbes = probesRequired && probe === undefined && last !== undefined;
   // A send-back is a worker session; a CI-only park never starts one.
   if (ciPark && (reworkFindings || conflicting || missingProbes)) return;
@@ -255,7 +254,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    const why = reworkFindings
     ? `sage round ${last?.round} at ${pr.headSha.slice(0, 8)} has ${last?.blockers} blocker(s) and ${last?.majors} major(s) to rework`
     : conflicting
-     ? `PR #${pr.number} conflicts with ${map.base} at ${pr.headSha.slice(0, 8)}`
+     ? `PR #${pr.iid} conflicts with ${map.base} at ${pr.headSha.slice(0, 8)}`
      : `no passing probe run at ${pr.headSha.slice(0, 8)}`;
    if (row.mergeMessageId !== null) {
     try {
@@ -281,7 +280,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
     journal.recordEvent("sweep", {
      nodeId: row.nodeId,
      repo,
-     detail: `PR #${pr.number}: ${why} — waiting for the ${lane} implement lane (held by #${holder.nodeId}, ${mapKey(holder)})`,
+     detail: `PR #${pr.iid}: ${why} — waiting for the ${lane} implement lane (held by #${holder.nodeId}, ${mapKey(holder)})`,
     });
     return;
    }
@@ -295,12 +294,12 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    journal.recordEvent("sweep", {
     nodeId: row.nodeId,
     repo,
-    detail: `PR #${pr.number}: ${why} — run-node resumes (pid ${pid})`,
+    detail: `PR #${pr.iid}: ${why} — run-node resumes (pid ${pid})`,
    });
    result.resumed.push(row.nodeId);
    return;
   }
-  const gate = evaluateMergeGate(gateInput(map, pr, await github.checkRunsFor(repo, pr.headSha, token), last, probe));
+  const gate = evaluateMergeGate(gateInput(map, pr, await github.ciVerdictFor(repo, pr.headSha, token), last, probe));
 
   // A CI-only park stays parked, quietly, until the whole gate passes.
   if (ciPark && gate.status !== "pass") return;
@@ -337,16 +336,16 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    journal.recordEvent("sweep", {
     nodeId: row.nodeId,
     repo,
-    detail: `PR #${pr.number}: CI recovered at ${gate.headSha.slice(0, 8)}, the gate passes there — the CI-only park returns to awaiting-merge (no worker, no lane)`,
+    detail: `PR #${pr.iid}: CI recovered at ${gate.headSha.slice(0, 8)}, the gate passes there — the CI-only park returns to awaiting-merge (no worker, no lane)`,
    });
    if (row.mergeMessageId !== null) return; // its card is still up
   }
   if (map.autoMerge && !needsEye && superseded === null) {
-   await github.mergePr(repo, pr.number, gate.headSha, pr.title, token);
+   await github.mergePr(repo, pr.iid, gate.headSha, pr.title, token);
    journal.recordEvent("merged", {
     nodeId: row.nodeId,
     repo,
-    detail: `PR #${pr.number} squash-merged by ranger at ${gate.headSha.slice(0, 8)} (no ${NEEDS_EYE_LABEL} label; standing grant 2026-10-03)`,
+    detail: `PR #${pr.iid} squash-merged by ranger at ${gate.headSha.slice(0, 8)} (no ${NEEDS_EYE_LABEL} label; standing grant 2026-10-03)`,
    });
    result.merged.push(row.nodeId);
    try {
@@ -406,7 +405,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    );
   }
   journal.updateWorker(row.nodeId, repo, { mergeMessageId: messageId });
-  journal.recordEvent("merge-card", { nodeId: row.nodeId, repo, detail: `PR #${pr.number}, message ${messageId}${superseded !== null ? `; ${superseded}` : ""}` });
+  journal.recordEvent("merge-card", { nodeId: row.nodeId, repo, detail: `PR #${pr.iid}, message ${messageId}${superseded !== null ? `; ${superseded}` : ""}` });
   result.cards.push(row.nodeId);
  }
 }

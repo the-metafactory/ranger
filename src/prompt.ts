@@ -116,6 +116,8 @@ export interface ImplementPromptInput extends WorkerPromptInput {
  baseMerge?: { base: string; files: string[] };
  /** The map declares a probe tier (`commands.probe`) the supervisor runs itself. */
  probeTier?: boolean;
+ /** Remote install/tests belong to the supervisor; private config never enters this prompt. */
+ remoteTests?: boolean;
 }
 
 /**
@@ -128,12 +130,26 @@ const PROBE_TIER_RULE = `- Browser probes: run only the probes that cover what y
   probe you write. Do NOT run the full probe suite (for example \`npm run probe\`):
   the supervisor runs it once on the final reviewed head, and only that run counts.`;
 
+/**
+ * The supervisor runs the map's whole test command after every pass, so a
+ * worker that reruns it after each edit spends most of its wall clock
+ * certifying nothing (found live on ranger #164: four full ~10-minute suite
+ * runs in one 57-minute fix pass, then the supervisor's own 14-minute run).
+ */
+const LOCAL_TEST_RULE = `- Tests: while you work, run only the test files that cover what you changed, plus any
+  new test you write (and the typecheck, if the test command has one). Run the repo's
+  full test command ({{test}}) ONCE, right before your final commit, and make it pass:
+  the supervisor runs the same command after you exit and refuses to push on a failure,
+  so every earlier full run only repeats work.`;
+const REMOTE_TEST_RULE = `- Leave the map's dependency install and test command to the supervisor's reviewed
+  remote profile. Do not run those commands locally. Commit clean source for testing;
+  the supervisor refuses to push without a matching passed remote receipt.`;
+
 /** The task/build kind SOP (design §4), the worker's half of it. */
 const IMPLEMENT_SOP = `Task/build kind SOP (ranger implement lane):
 - Implement the node in this worktree, on the branch that is already checked out
   ({{branch}}). Do not create or switch branches.
-- Run the repo's tests ({{test}}) and make them pass. The supervisor runs the same
-  command after you exit and refuses to push on a failure.
+${LOCAL_TEST_RULE}
 - COMMIT your work on this branch. Do NOT push, open a pull request, merge, comment
   on GitHub, or touch any other branch: the supervisor does all of that, with a
   credential you never hold.
@@ -189,7 +205,7 @@ export function assembleImplementPrompt(input: ImplementPromptInput): string {
       "   Never rebase, reset or amend: the supervisor pushes fast-forward only.",
       "2. Resolve every conflict so both sides keep working. The base's changes are merged work and",
       "   stay; re-apply this branch's change on top of them. Do not drop either side to make it compile.",
-      `3. Run the tests (${testCommand}), fix what the merge broke, and commit: the merge commit, plus`,
+      input.remoteTests ? "3. Commit the merged source for the supervisor's remote tests: the merge commit, plus" : `3. Run the tests (${testCommand}), fix what the merge broke, and commit: the merge commit, plus`,
       "   follow-up commits if needed. Leave nothing unmerged or uncommitted.",
       "Do not start new work from the node: the next sage round reviews the merged branch.",
      ];
@@ -219,7 +235,7 @@ export function assembleImplementPrompt(input: ImplementPromptInput): string {
   mapSections.notes,
   "",
   "## Task/build kind SOP",
-  IMPLEMENT_SOP.replaceAll("{{branch}}", branch).replaceAll(
+  (input.remoteTests ? IMPLEMENT_SOP.replace(LOCAL_TEST_RULE, REMOTE_TEST_RULE) : IMPLEMENT_SOP).replaceAll("{{branch}}", branch).replaceAll(
    "{{test}}",
    testCommand,
   ),

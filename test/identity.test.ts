@@ -69,6 +69,11 @@ describe("resolveWriteToken", () => {
 });
 
 describe("writeEnv", () => {
+ test("preserves an explicit inherited read-only restriction on the legacy GitHub path", () => {
+  const gated = writeEnv("ghp_x", {}, { SOMA_GRAPH_READONLY: "1" });
+  try { expect(gated.env.SOMA_GRAPH_READONLY).toBe("1"); }
+  finally { gated.cleanup(); }
+ });
  test("pins GH_TOKEN + isolates GH_CONFIG_DIR, but does NOT set SOMA_GRAPH_READONLY", () => {
   const { env, cleanup } = writeEnv("ghp_x");
   try {
@@ -85,16 +90,16 @@ describe("writeEnv", () => {
 describe("assertNotPrincipal — design §2 mechanical invariant", () => {
  test("refuses a graph-mutating tick under the principal's login", () => {
   const cfg = config();
-  expect(() => assertNotPrincipal(cfg, "jcfischer")).toThrow(WriteGateError);
+  expect(() => assertNotPrincipal(cfg, "jcfischer", "acme/widgets")).toThrow(WriteGateError);
  });
 
  test("allows a distinct machine-account identity", () => {
   const cfg = config();
-  expect(() => assertNotPrincipal(cfg, "ivy-bot")).not.toThrow();
+  expect(() => assertNotPrincipal(cfg, "ivy-bot", "acme/widgets")).not.toThrow();
  });
 
  test("a configured principal login is honored", () => {
   const cfg = config({ principal: { login: "the-boss" } });
-  expect(() => assertNotPrincipal(cfg, "the-boss")).toThrow(WriteGateError);
+  expect(() => assertNotPrincipal(cfg, "the-boss", "acme/widgets")).toThrow(WriteGateError);
  });
 });

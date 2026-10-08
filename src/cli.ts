@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
-import { executionRefusal, isGithubRepo, readRefusal } from "./forge-ref.ts";
+import { readPrivateJson } from "./remote-test/ssh-cli.ts";
+import { executionRefusal, isGithubRepo } from "./forge-ref.ts";
 import { mapKey, pickMap } from "./maps.ts";
 import { resumeNode } from "./resume.ts";
 import { Command } from "commander";
@@ -32,9 +33,7 @@ import {
 } from "./token-gate.ts";
 import { openJournal, type Journal } from "./journal.ts";
 import {
- assertNotPrincipal,
- resolveBotIdentity,
- resolveWriteToken,
+ assertWriteIdentity,
  WriteGateError,
 } from "./identity.ts";
 import { canonicalDir, runNode } from "./worker.ts";
@@ -55,12 +54,14 @@ import {
 } from "./escalate.ts";
 import type { WalkMode } from "./config.ts";
 import { lstat, mkdir, readFile, rm } from "node:fs/promises";
+import { summarizeShadow, writeShadowReport } from "./remote-test/shadow.ts";
 import { runBaseline, validateBaselineConfig, createCommandMetrics, localCommandAdapter, sshCommandAdapter, privateOperatorPath, writePrivateBaselineReport } from "./remote-test/baseline.ts";
 import { executeRemoteTest, reconcileRemoteTests, validateExecutorConfig } from "./remote-test/executor.ts";
 import { ActiveRemoteTestJob, BusyRemoteTestExecutor, RevokedRemoteTestJob, openJobLedger } from "./remote-test/job-ledger.ts";
 import { validateRemoteTestJob } from "./remote-test/contract.ts";
 import { publishReceiptFile } from "./remote-test/artifacts.ts";
 import { runSshCommand, statusSshCommand, sshOutcomeExitCode, sshOutcomeMessage, type RunSshCommand } from "./remote-test/ssh-cli.ts";
+import { classifyReceiverFailure, saveRefusalDiagnostic, TaggedReceiverFailure } from "./remote-test/receiver-diagnostics.ts";
 import { serveSshResponse } from "./remote-test/ssh-server.ts";
 
 /**
@@ -102,8 +103,6 @@ async function scoutOneMap(
  };
 
  let token: ResolvedToken;
- const refusal = readRefusal(map.repo);
- if (refusal !== null) return { ...base, ok: false, error: refusal };
  try {
   ({ token } = await assertReadOnlyToken(config, map.repo));
  } catch (error) {
@@ -171,6 +170,7 @@ async function runScout(opts: ScoutOptions): Promise<ScoutReport> {
   if (!isGithubRepo(map.repo)) continue;
   try {
    const { info } = await assertReadOnlyToken(config, map.repo);
+   if (info.forge !== "github") continue;
    identity = { login: info.login, tokenType: info.tokenType };
    break;
   } catch {
@@ -206,10 +206,7 @@ function loadCtx(configPath: string): {
 async function writeContext(config: RangerConfig, map: RangerMapConfig) {
  const refusal = executionRefusal(map.repo);
  if (refusal !== null) throw new WriteGateError(refusal);
- const credential = resolveWriteToken(config, map.repo);
- const botIdentity = await resolveBotIdentity(config, credential.token);
- assertNotPrincipal(config, botIdentity);
- return { token: credential.token, botIdentity };
+ return assertWriteIdentity(config, map.repo);
 }
 
 async function runWalk(configPath: string): Promise<string> {
@@ -292,7 +289,7 @@ async function settleMergeability(journal: Journal, map: RangerMapConfig, token:
   for (const n of waiting) {
    try {
     const pr = await realGitHub.getPr(map.repo, n, token);
-    if (pr.state === "open" && (pr.mergeable === null || pr.mergeableState === "unknown")) still.push(n);
+    if (pr.state === "open" && pr.mergeState === "pending") still.push(n);
    } catch {
     still.push(n);
    }
@@ -539,14 +536,26 @@ remoteTest.command("status")
 remoteTest.command("serve-stdio")
  .description("Fixed operator-only SSH entry point: receive one structured request on stdin")
  .requiredOption("--config <path>", "reviewed private executor JSON configuration")
- .action(async (options: { config: string }) => {
-  const abort = new AbortController(), cancel = () => { abort.abort(); process.stdin.destroy(Error("SSH input interrupted")); };
+ .option("--diagnostics-root <absolute-directory>", "existing private operator-only refusal store (default off)")
+ .action(async (options: { config: string; diagnosticsRoot?: string }) => {
+  const diagnostics = options.diagnosticsRoot === undefined ? undefined : { root: options.diagnosticsRoot };
+  const abort = new AbortController(), cancel = () => { abort.abort(); process.stdin.destroy(new TaggedReceiverFailure("interrupted", "SSH input interrupted")); };
   process.once("SIGINT", cancel); process.once("SIGTERM", cancel); process.once("SIGHUP", cancel);
   // Includes upload idle time and bounded executor cleanup. No silent daemon.
   const timer = setTimeout(cancel, 15 * 60_000);
   try {
-   const config = JSON.parse(await readFile(await privateOperatorPath(options.config, true), "utf8"));
-   const response = await serveSshResponse(process.stdin, config, { signal: abort.signal });
+   let config;
+   try {
+    const text = await readFile(await privateOperatorPath(options.config, true), "utf8");
+    try { config = JSON.parse(text); }
+    catch { throw new TaggedReceiverFailure("invalid_config", "Invalid private executor config"); }
+   }
+   catch (error) {
+    const failure = classifyReceiverFailure(error, "config");
+    await saveRefusalDiagnostic(diagnostics, { operation: null, job: null, primary: failure });
+    throw Error("Invalid private executor config");
+   }
+   const response = await serveSshResponse(process.stdin, config, { signal: abort.signal, diagnostics });
    process.stdout.write(JSON.stringify(response) + "\n");
   } catch { process.stderr.write("ranger remote-test serve-stdio: request, admission, execution or storage failed; inspect private operator state.\n"); process.exitCode = 1; }
   finally { clearTimeout(timer); process.removeListener("SIGINT", cancel); process.removeListener("SIGTERM", cancel); process.removeListener("SIGHUP", cancel); }
@@ -624,6 +633,20 @@ remoteTest.command("cancel")
    try { ledger.cancel(validated); } finally { ledger.close(); }
    process.stdout.write("Remote-test generation cancellation recorded.\n");
   } catch { process.stderr.write("Remote-test cancellation failed; inspect private executor state.\n"); process.exitCode = 1; }
+ });
+
+remoteTest.command("shadow-summary")
+ .description("Summarize up to ten private measured pilot jobs; missing/fixture metrics remain pending")
+ .requiredOption("--input <path>", "private V1 pilot measurements JSON outside git")
+ .requiredOption("--output <path>", "new private summary JSON outside git")
+ .action(async (options: { input: string; output: string }) => {
+  try {
+   const input = await readPrivateJson(options.input);
+   const report = summarizeShadow(input);
+   await writeShadowReport(options.output, report);
+   process.stdout.write(`Shadow pilot ${report.status}; ${report.jobCount}/10 jobs. Local gate remains authoritative. Private summary saved.\n`);
+   process.exitCode = report.status === "failed" ? 1 : 0;
+  } catch { process.stderr.write("Shadow summary failed; inspect private inputs/output.\n"); process.exitCode = 1; }
  });
 
 remoteTest.command("baseline")

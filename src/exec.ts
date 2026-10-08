@@ -4,6 +4,8 @@ export interface RunResult {
   code: number;
   stdout: string;
   stderr: string;
+  /** Child user + system CPU observed by the opt-in shadow timer; absent if unavailable. */
+  cpuTimeSeconds?: number;
   /**
    * With `keepStdoutLine`: the last unfiltered stdout lines (each cut to a
    * bounded length), so a run that dies before its signal lines still leaves

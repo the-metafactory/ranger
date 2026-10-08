@@ -19,7 +19,7 @@ import { isGithubRepo, nodeKey } from "./forge-ref.ts";
  * reads when the request arrives, and the spawner is injected so no test runs
  * `gh`, `osascript` or ranger.
  */
-import { classifyCi } from "./ci-policy.ts";
+import { classifyGithubCheckRuns } from "./github-ci.ts";
 import { REPO_PATTERN } from "./config.ts";
 import type { EventRow, WorkerRow } from "./journal.ts";
 import { childEnv, itermArgv, shellQuote } from "./launch.ts";
@@ -243,9 +243,9 @@ export interface PrView {
  readAt: string;
 }
 
-/** The CI state of a head from its check runs, by the merge gate's own policy (`ci-policy.ts`). */
+/** The CI display state from the GitHub classifier also used to build the port's merge verdict. */
 export function ciState(runs: { status: string; conclusion: string | null }[]): PrView["ci"] {
- return classifyCi(runs).state;
+ return classifyGithubCheckRuns(runs).state;
 }
 
 /**
@@ -479,18 +479,21 @@ export type ActionRunner = (
  opts: { detached: boolean },
 ) => Promise<ActionResult>;
 
-/** Keys a merge must never carry: they would make gh act as the machine account. */
-export const MACHINE_GH_KEYS = ["GH_TOKEN", "GITHUB_TOKEN", "GH_CONFIG_DIR"] as const;
+/** Keys a human merge must never carry: machine credentials or forge overrides. */
+export { MACHINE_FORGE_KEYS } from "./forge-env.ts";
+import { MACHINE_FORGE_KEYS } from "./forge-env.ts";
+/** @deprecated Use MACHINE_FORGE_KEYS; this alias includes GitLab keys. */
+export const MACHINE_GH_KEYS = MACHINE_FORGE_KEYS;
 
 /**
  * The merge's environment: the launch allowlist, and none of the machine
- * account's gh keys, so `gh` uses the login stored under HOME. What this
+ * account's forge keys, so the CLI uses the login stored under HOME. What this
  * proves is the absence of the machine account's credential, not whose login
  * HOME holds.
  */
 export function mergeEnv(env: Record<string, string | undefined>): Record<string, string> {
  const out = childEnv(env);
- for (const key of MACHINE_GH_KEYS) delete out[key];
+ for (const key of MACHINE_FORGE_KEYS) delete out[key];
  return out;
 }
 
