@@ -21,6 +21,7 @@ const BLOCKED = new Set([
  "title_regex", "commits_status", "jira_association_missing",
 ]);
 const MR_STATE: Record<string, ChangeRequest["state"]> = { opened: "open", closed: "closed", merged: "merged", locked: "closed" };
+const DRAFT_PREFIX = "Draft: ";
 
 export function gitlabMergeState(status: string): MergeState {
  if (status === "mergeable") return "mergeable";
@@ -228,6 +229,10 @@ export class GitLabPort extends GitLabReadPort implements Omit<ForgePort<Resolve
   private readonly env: NodeJS.ProcessEnv = process.env,
  ) { super(runner); }
 
+ private mrEndpoint(repo: string, n: number): string {
+  return `${this.project(repo)}/merge_requests/${id(n, repo, "iid")}`;
+ }
+
  private async write(repo: string, token: string, endpoint: string, method: "POST" | "PUT", fields: string[]): Promise<unknown> {
   // Validate the exact credential used below, not merely another token from config.
   const credential = resolveWriteToken(this.config, repo, this.env);
@@ -240,8 +245,9 @@ export class GitLabPort extends GitLabReadPort implements Omit<ForgePort<Resolve
    if (error instanceof WriteGateError) throw error;
    throw new GitLabWriteError("write transport failed", endpoint);
   }
+  if (result.code !== 0) throw new GitLabWriteError(`write failed (exit ${result.code})`, endpoint);
   const { status, body } = parseGlabResponse(result);
-  if (result.code !== 0 || status < 200 || status >= 300) {
+  if (status < 200 || status >= 300) {
    throw new GitLabWriteError(`write failed (exit ${result.code})`, endpoint, status);
   }
   return body;
@@ -257,8 +263,9 @@ export class GitLabPort extends GitLabReadPort implements Omit<ForgePort<Resolve
 
  async createDraftPr(repo: string, pr: { head: string; base: string; title: string; body: string }, token: string): Promise<ChangeRequest> {
   const endpoint = `${this.project(repo)}/merge_requests`;
+  const title = pr.title.startsWith(DRAFT_PREFIX) ? pr.title : `${DRAFT_PREFIX}${pr.title}`;
   const raw = await this.write(repo, token, endpoint, "POST", [
-   "-f", `source_branch=${pr.head}`, "-f", `target_branch=${pr.base}`, "-f", `title=Draft: ${pr.title}`,
+   "-f", `source_branch=${pr.head}`, "-f", `target_branch=${pr.base}`, "-f", `title=${title}`,
    "-f", `description=${pr.body}`, "-F", "remove_source_branch=false",
   ]);
   return this.decodeWrite(endpoint, () => {
@@ -269,18 +276,21 @@ export class GitLabPort extends GitLabReadPort implements Omit<ForgePort<Resolve
  }
 
  async updatePrBody(repo: string, n: number, body: string, token: string): Promise<void> {
-  const endpoint = `${this.project(repo)}/merge_requests/${id(n, repo, "iid")}`;
+  const endpoint = this.mrEndpoint(repo, n);
   await this.write(repo, token, endpoint, "PUT", ["-f", `description=${body}`]);
  }
 
  async markReady(repo: string, pr: ChangeRequest, token: string): Promise<void> {
-  if (!pr.title.startsWith("Draft: ")) return;
-  const endpoint = `${this.project(repo)}/merge_requests/${id(pr.iid, repo, "iid")}`;
-  await this.write(repo, token, endpoint, "PUT", ["-f", `title=${pr.title.slice("Draft: ".length)}`]);
+  if (!pr.title.startsWith(DRAFT_PREFIX)) {
+   if (pr.draft) throw new GitLabWriteError("draft title lacks the supported Draft prefix", this.mrEndpoint(repo, pr.iid));
+   return;
+  }
+  const endpoint = this.mrEndpoint(repo, pr.iid);
+  await this.write(repo, token, endpoint, "PUT", ["-f", `title=${pr.title.slice(DRAFT_PREFIX.length)}`]);
  }
 
  async postComment(repo: string, n: number, body: string, token: string): Promise<number> {
-  const endpoint = `${this.project(repo)}/merge_requests/${id(n, repo, "iid")}/notes`;
+  const endpoint = `${this.mrEndpoint(repo, n)}/notes`;
   const raw = await this.write(repo, token, endpoint, "POST", ["-f", `body=${body}`]);
   return this.decodeWrite(endpoint, () => id(object(raw, endpoint).id, endpoint, "note.id"));
  }

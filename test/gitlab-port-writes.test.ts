@@ -63,7 +63,10 @@ function setup(options: {
   return options.write ? options.write(args) : response(created, 201);
  };
  const port: Omit<ForgePort<ResolvedToken>, "mergePr"> = new GitLabPort(options.config ?? config, runner, options.env ?? env);
- return { port, calls, writes, dirs };
+ const expectCleaned = () => {
+  for (const dir of dirs) expect(existsSync(dir)).toBeFalse();
+ };
+ return { port, calls, writes, expectCleaned };
 }
 
 const operations = ["createDraftPr", "updatePrBody", "markReady", "postComment"] as const;
@@ -79,14 +82,21 @@ function invoke(port: Omit<ForgePort<ResolvedToken>, "mergePr">, op: Operation, 
 
 describe("GitLab forge writes", () => {
  test("draft creation sends literal fields and boolean false, returning normalized ChangeRequest", async () => {
-  const { port, writes, dirs } = setup();
+  const { port, writes, expectCleaned } = setup();
   expect(await port.createDraftPr(repo, input, token)).toEqual({
    ...draft, headRef: input.head, mergeState: "mergeable", mergeDetail: "mergeable",
   });
   expect(writes).toEqual([["api", `${project}/merge_requests`, "--method", "POST", "--include",
    "-f", `source_branch=${input.head}`, "-f", "target_branch=main", "-f", `title=Draft: ${input.title}`,
    "-f", `description=${input.body}`, "-F", "remove_source_branch=false", "--hostname", host]]);
-  for (const dir of dirs) expect(existsSync(dir)).toBeFalse();
+  expectCleaned();
+ });
+ test("draft creation does not double an existing canonical prefix", async () => {
+  const { port, writes, expectCleaned } = setup();
+  await port.createDraftPr(repo, { ...input, title: `Draft: ${input.title}` }, token);
+  expect(writes[0]).toContain(`title=Draft: ${input.title}`);
+  expect(writes[0]).not.toContain(`title=Draft: Draft: ${input.title}`);
+  expectCleaned();
  });
  test("description update sends only description, including an empty description", async () => {
   const { port, writes } = setup({ write: () => response({}, 200) });
@@ -95,15 +105,20 @@ describe("GitLab forge writes", () => {
   expect(writes).toEqual([input.body, ""].map(body => ["api", `${project}/merge_requests/7`,
    "--method", "PUT", "--include", "-f", `description=${body}`, "--hostname", host]));
  });
- test("readiness strips only the leading Draft prefix, even if draft metadata is false", async () => {
+ test.each([true, false])("readiness strips the leading prefix and preserves inner text with draft=%s", async isDraft => {
   const { port, writes } = setup({ write: () => response({}, 200) });
-  await port.markReady(repo, { ...draft, draft: false, title: "Draft: Draft: Keep this" }, token);
+  await port.markReady(repo, { ...draft, draft: isDraft, title: "Draft: Keep Draft: text" }, token);
   expect(writes).toEqual([["api", `${project}/merge_requests/7`, "--method", "PUT", "--include",
-   "-f", "title=Draft: Keep this", "--hostname", host]]);
+   "-f", "title=Keep Draft: text", "--hostname", host]]);
  });
  test.each(["Write support", "Contains Draft: text", "Draft:support", "draft: support"])("title %s is a no-op", async title => {
   const { port, calls } = setup();
-  await port.markReady(repo, { ...draft, title }, token);
+  await port.markReady(repo, { ...draft, draft: false, title }, token);
+  expect(calls).toHaveLength(0);
+ });
+ test.each(["Write support", "Draft:support", "draft: support", "[Draft] support", "(Draft) support"])("draft title %s rejects unsupported readiness without any call", async title => {
+  const { port, calls } = setup();
+  await expect(port.markReady(repo, { ...draft, title }, token)).rejects.toBeInstanceOf(GitLabWriteError);
   expect(calls).toHaveLength(0);
  });
  test("comments post MR notes and return the note id", async () => {
@@ -131,26 +146,27 @@ describe("GitLab forge writes", () => {
   });
   test(`${op} refuses principal identity and other bots without a mutation`, async () => {
    for (const user of [{ username: "BOSS", bot: true }, { username: "human" }, { username: "project_2_bot_ab", bot: true }]) {
-    const { port, writes, dirs } = setup({ user });
+    const { port, writes, expectCleaned } = setup({ user });
     await expect(invoke(port, op)).rejects.toBeInstanceOf(WriteGateError);
     expect(writes).toHaveLength(0);
-    for (const dir of dirs) expect(existsSync(dir)).toBeFalse();
+    expectCleaned();
    }
   });
   test.each([199, 301, 400, 403, 409, 429, 500, 503])(`${op} HTTP %i throws once without retries`, async status => {
-   const { port, writes, dirs } = setup({ write: () => response({ error: token }, status) });
+   const { port, writes, expectCleaned } = setup({ write: () => response({ error: token }, status) });
    await expect(invoke(port, op)).rejects.toBeInstanceOf(GitLabWriteError);
    expect(writes).toHaveLength(1);
-   for (const dir of dirs) expect(existsSync(dir)).toBeFalse();
+   expectCleaned();
   });
   test(`${op} refuses inherited read-only policy`, async () => {
    const { port, writes } = setup({ env: { ...env, SOMA_GRAPH_READONLY: "1" } });
    await expect(invoke(port, op)).rejects.toBeInstanceOf(WriteGateError);
    expect(writes).toHaveLength(0);
   });
-  test.each(["exit", "spawn", "missing-status"])(`${op} %s failure is redacted, not retried, and cleans config`, async failure => {
-   const { port, writes, dirs } = setup({ write: () => {
+  test.each(["exit", "unparseable-exit", "spawn", "missing-status"])(`${op} %s failure is redacted, not retried, and cleans config`, async failure => {
+   const { port, writes, expectCleaned } = setup({ write: () => {
     if (failure === "spawn") throw new Error(token);
+    if (failure === "unparseable-exit") return { code: 1, stdout: token, stderr: token };
     if (failure === "missing-status") return { code: 0, stdout: token, stderr: token };
     return response(created, 201, 1);
    } });
@@ -160,7 +176,7 @@ describe("GitLab forge writes", () => {
     expect(String(error)).not.toContain(token);
    }
    expect(writes).toHaveLength(1);
-   for (const dir of dirs) expect(existsSync(dir)).toBeFalse();
+   expectCleaned();
   });
  }
  test("each mutation repeats the identity gate rather than reusing stale authorization", async () => {
