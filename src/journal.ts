@@ -474,10 +474,19 @@ export class Journal {
   this.recordEvent("rebased", { nodeId: opts.nodeId, repo: opts.repo, detail: `${shas}: ${opts.note}` });
  }
 
- /** A node's recorded rebase requests, newest first. */
- listRebases(repo: string, nodeId: string): { from: string; to: string | null }[] {
-  return this.listNodeEvents(repo, nodeId)
-   .filter((e) => e.kind === "rebased")
+ /**
+  * A node's recorded rebase requests, newest first. Queried by kind, so other
+  * events (a send-back waiting on the lane logs one per pass) never push a
+  * rebase out of the window.
+  */
+ listRebases(repo: string, nodeId: string, limit = 60): { from: string; to: string | null }[] {
+  return this.db
+   .select()
+   .from(events)
+   .where(and(eq(events.repo, repo), eq(events.nodeId, nodeId), eq(events.kind, "rebased")))
+   .orderBy(desc(events.id))
+   .limit(limit)
+   .all()
    .flatMap((e) => {
     const m = REBASE_SHAS.exec(e.detail ?? "");
     return m === null ? [] : [{ from: m[1]!, to: m[2] ?? null }];

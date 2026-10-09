@@ -181,6 +181,20 @@ describe("node #126 — gitlab-rebase-squash-merge: the merge desk on a GitLab m
   } finally { r.close(); }
  });
 
+ test("ranger's rebase is still recognised after many unrelated events: the row is sent back, not parked", async () => {
+  const r = rig();
+  try {
+   const mr = needsRebase();
+   const gl = fakeGitLab(mr);
+   await r.desk(gl.port);
+   for (let i = 0; i < 70; i++) r.journal.recordEvent("sweep", { nodeId: "96", repo: r.map.repo, detail: "waiting for the implement lane" });
+   mr.mergeState = "mergeable";
+   mr.ci = GREEN;
+   expect(await r.desk(gl.port)).toMatchObject({ resumed: ["96"], parked: [] });
+   expect(r.row()).toMatchObject({ status: "running", phase: "review" });
+  } finally { r.close(); }
+ });
+
  test("a head moved by anyone else, without a ranger rebase, still fails the gate and parks", async () => {
   const r = rig();
   try {
