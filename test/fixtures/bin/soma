@@ -124,6 +124,18 @@ if [ "$verb" = "decisions" ] && [ -n "${FAKE_SOMA_DECISIONS_FAIL:-}" ]; then
   exit 1
 fi
 
+# A test can make soma refuse chosen nodes' claims (comma-separated ids, or
+# "*" for every claim) the way soma 0.25.0 refuses a blocked node: exit 1 with
+# plain text, not JSON, on stderr (node #163).
+if [ "$verb" = "claim" ] && [ -n "${FAKE_SOMA_CLAIM_REFUSE:-}" ]; then
+  case ",${FAKE_SOMA_CLAIM_REFUSE}," in
+    *",${root},"*|",*,")
+      echo "Claim refused: node ${root} has an open blocker" >&2
+      exit 1
+      ;;
+  esac
+fi
+
 case "$verb" in
   claim|release|close|decisions)
     python3 - "$verb" "$root" "$repo" <<'PY'
