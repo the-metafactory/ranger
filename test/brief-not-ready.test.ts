@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { planTick } from "../src/candidates.ts";
@@ -244,3 +244,45 @@ describe("the escalation desk cards a not-ready build brief", () => {
   });
 });
 
+
+describe("ranger walk never claims a held build node", () => {
+  test("the tick claims the next build node and leaves the listed one unassigned", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ranger-brief-walk-"));
+    const fixtures = mkdtempSync(join(tmpdir(), "ranger-brief-walk-fx-"));
+    const discord = fakeDiscord();
+    try {
+      writeFrontier(fixtures);
+      writeAudit(fixtures, [MISSING_21]);
+      const node = { autonomy: "auto", assignees: [], status: "open", probes: [] };
+      const statePath = join(dir, "state.json");
+      writeFileSync(statePath, JSON.stringify({ nodes: { "21": { ...node, checkpoint: "cp-21" }, "22": { ...node, checkpoint: "cp-22" } }, decisions: [] }));
+      const config = join(dir, "ranger.yaml");
+      writeFileSync(
+        config,
+        baseConfigLines(dir, { auth: ["  writeTokens:", '    "acme/*": RANGER_WRITE_TEST'] })
+          .join("\n")
+          .replace("walk: research-only", "walk: full"),
+      );
+      const run = await runCli(["walk", "-c", config], {
+        ...process.env,
+        PATH: `${fixturesBin}:${process.env.PATH ?? ""}`,
+        FAKE_SOMA_DIR: fixtures,
+        FAKE_SOMA_STATE: statePath,
+        RANGER_DISCORD_API_BASE: `http://127.0.0.1:${discord.port}`,
+        RANGER_DISCORD_ALLOW_TEST_OVERRIDE: "1",
+        RANGER_DISCORD_MIN_INTERVAL_MS: "5",
+        RANGER_DISCORD_TOKEN: "fake-bot-token",
+        RANGER_WRITE_TEST: "ghp_write",
+        RANGER_NO_SPAWN: "1",
+      });
+      expect(run.code).toBe(0);
+      const state = JSON.parse(readFileSync(statePath, "utf8")) as { nodes: Record<string, { assignees: string[] }> };
+      expect(state.nodes["21"]!.assignees).toEqual([]);
+      expect(state.nodes["22"]!.assignees).toEqual(["ivy-bot"]);
+    } finally {
+      discord.stop();
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(fixtures, { recursive: true, force: true });
+    }
+  });
+});
