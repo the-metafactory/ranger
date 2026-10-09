@@ -267,6 +267,29 @@ describe("node #165 — ranger drain", () => {
   });
  });
 
+ test("a drain set after the gate read, as the claim is about to go out, still stops it", async () => {
+  await withRigEnv(async (r) => {
+   // spawnsToday runs in the claim loop just before the claim: the drain
+   // lands after the map's gate read, as the operator verb (no claim lock)
+   // can (2026-10-09: seelite #820, claimed 21s after the drain).
+   const spawnsToday = r.journal.spawnsToday.bind(r.journal);
+   r.journal.spawnsToday = (now?: Date) => {
+    r.journal.setVisualLaneDrained(true);
+    return spawnsToday(now);
+   };
+   const spawned: string[] = [];
+   const result = await walk({
+    config: r.config, configPath: r.configPath, journal: r.journal,
+    spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; },
+   });
+   // Undrained, the visual map claims 10 (see above); the headless map's 20
+   // is not the visual drain's to stop.
+   expect(result.maps.map((m) => m.claimed)).toEqual([[], ["20"], []]);
+   expect(spawned).toEqual(["20"]);
+   expect(result.maps[0]?.drained).toContain("visual lane drained");
+  });
+ });
+
  test("the dashboard reads both drains from the journal", () => {
   const r = rig();
   try {

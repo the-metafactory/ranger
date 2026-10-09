@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { planTick } from "../src/candidates.ts";
-import { cachedFrontier, readFrontier } from "../src/frontier-cache.ts";
+import { type AuditMode, cachedFrontier, readFrontier } from "../src/frontier-cache.ts";
 import { graphAudit, GraphError } from "../src/graph.ts";
 import { Journal } from "../src/journal.ts";
 import { classifyFrontier } from "../src/route.ts";
@@ -24,8 +24,9 @@ const POLICY = { floor: 1000, cooldownMs: 10 * 60_000 };
 const MAP = { repo: REPO, root: 1, walk: "full" as const };
 const REGISTRY = {};
 
-function entry(id: string, kind: string, title = `Node ${id}`) {
+function entry(id: string, kind: string, title = `Node ${id}`, body?: string) {
   return {
+    ...(body === undefined ? {} : { body }),
     ref: { id },
     node: { id, title, kind, checkpointId: `cp-${id}`, autonomy: "auto", probes: [] },
     status: "open",
@@ -38,14 +39,14 @@ function entry(id: string, kind: string, title = `Node ${id}`) {
   };
 }
 
-/** 21 and 22 are build nodes, 23 a task, 24 research. */
-function writeFrontier(dir: string): void {
+/** 21 and 22 are build nodes, 23 a task, 24 research; `body21` is #21's brief, `extra` more entries. */
+function writeFrontier(dir: string, body21?: string, extra: ReturnType<typeof entry>[] = []): void {
   writeFileSync(
     join(dir, "acme__widgets-frontier.json"),
     JSON.stringify({
       repo: REPO,
       root: "1",
-      frontier: [entry("21", "build", "Build the widget"), entry("22", "build"), entry("23", "task"), entry("24", "research")],
+      frontier: [entry("21", "build", "Build the widget", body21), entry("22", "build"), entry("23", "task"), entry("24", "research"), ...extra],
     }),
   );
 }
@@ -147,7 +148,9 @@ describe("the tick planner holds a build node soma's audit reports not ready", (
     const unchanged = await plan();
     expect(unchanged.read.source).toBe("cache");
     expect(ids(unchanged.plan.take)).not.toContain("21");
-    // The body edit bumps the issue's updated_at, so the tick re-reads both.
+    // The body edit bumps the issue's updated_at, so the tick re-reads the
+    // frontier, and the edited brief is audited again.
+    writeFrontier(dir, "## Acceptance criteria\n\nFixed.");
     process.env.FAKE_GH_ISSUES_UPDATED = "2026-01-02T00:00:00Z";
     const { read, plan: p } = await plan();
     expect(read.source).toBe("fresh");
@@ -228,6 +231,148 @@ describe("the tick planner holds a build node soma's audit reports not ready", (
   });
 });
 
+describe("the audit is cached on its own, keyed by the build briefs it saw", () => {
+  let dir: string;
+  let journal: Journal;
+  let calls: string;
+  const saved: Record<string, string | undefined> = {};
+  const KEYS = ["PATH", "FAKE_SOMA_DIR", "FAKE_SOMA_CALLS", "FAKE_SOMA_AUDIT_FAIL", "FAKE_GH_EVENTS_LATEST", "FAKE_GH_ISSUES_UPDATED", "FAKE_GH_SENTINEL_FAIL"];
+
+  beforeEach(() => {
+    for (const k of KEYS) saved[k] = process.env[k];
+    for (const k of KEYS) delete process.env[k];
+    dir = mkdtempSync(join(tmpdir(), "ranger-audit-cache-"));
+    calls = join(dir, "soma-calls.log");
+    writeFileSync(calls, "");
+    process.env.PATH = `${fixturesBin}:${saved.PATH ?? ""}`;
+    process.env.FAKE_SOMA_DIR = dir;
+    process.env.FAKE_SOMA_CALLS = calls;
+    // Pinned: only updated_at moves the sentinel, as a comment would.
+    process.env.FAKE_GH_EVENTS_LATEST = "1000";
+    journal = new Journal(join(dir, "state.sqlite"));
+    writeFrontier(dir, "## Deliverable\n\nThe widget.");
+    writeAudit(dir, [MISSING_21]);
+  });
+
+  afterEach(() => {
+    journal.close();
+    rmSync(dir, { recursive: true, force: true });
+    for (const k of KEYS) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+  });
+
+  const read = (audit?: AuditMode, now = new Date()) =>
+    readFrontier({ journal, repo: REPO, root: 1, token: TOKEN, policy: POLICY, maxAgeMs: 60 * 60_000, now, ...(audit === undefined ? {} : { audit }) });
+  const audits = () => readFileSync(calls, "utf8").split("\n").filter((l) => l.startsWith("audit ")).length;
+  /** A comment on the map: the sentinel moves, no brief changes. */
+  const comment = (n: number) => {
+    process.env.FAKE_GH_ISSUES_UPDATED = `2026-01-0${n}T00:00:00Z`;
+  };
+  const route = (r: Awaited<ReturnType<typeof read>>, id: string) =>
+    classifyFrontier(r.frontier.frontier, MAP, REGISTRY, "ivy-bot", r.briefs).find((n) => n.id === id)?.route;
+
+  test("a moved sentinel with no brief changed reuses the audit: a fresh frontier, no second audit", async () => {
+    const first = await read();
+    expect(first.auditMs).toBeGreaterThanOrEqual(0);
+    comment(2);
+    const second = await read();
+    expect(second.source).toBe("fresh");
+    expect(second.briefs).toEqual({ ok: true, notReady: [MISSING_21] });
+    expect(second.auditMs).toBeUndefined();
+    expect(audits()).toBe(1);
+  });
+
+  test("an edited build brief is audited again in refresh mode, and held unaudited in never mode", async () => {
+    await read();
+    writeFrontier(dir, "## Deliverable\n\nThe widget, edited.");
+    writeAudit(dir, []);
+    comment(2);
+    const locked = await read("never");
+    expect(locked.briefs).toEqual({ ok: true, notReady: [MISSING_21], unverified: ["21"] });
+    expect(route(locked, "21")).toEqual({ route: "brief-not-ready", missing: null });
+    expect(route(locked, "22")).toEqual(expect.objectContaining({ route: "implement" }));
+    expect(audits()).toBe(1);
+    const warm = await read("refresh");
+    expect(warm.briefs).toEqual({ ok: true, notReady: [] });
+    expect(audits()).toBe(2);
+    // The locked read after it serves the new audit, nothing held.
+    expect((await read("never")).briefs).toEqual({ ok: true, notReady: [] });
+  });
+
+  test("a build node new since the audit is held until an audit sees it", async () => {
+    await read();
+    writeFrontier(dir, "## Deliverable\n\nThe widget.", [entry("25", "build", "A new build")]);
+    comment(2);
+    const locked = await read("never");
+    expect(locked.briefs).toEqual({ ok: true, notReady: [MISSING_21], unverified: ["25"] });
+    expect(route(locked, "25")).toEqual({ route: "brief-not-ready", missing: null });
+  });
+
+  test("a failed audit keeps the last good one: it is served, the edited node held, the failure noted", async () => {
+    await read();
+    writeFrontier(dir, "## Deliverable\n\nThe widget, edited.");
+    comment(2);
+    process.env.FAKE_SOMA_AUDIT_FAIL = "1";
+    const failed = await read("refresh");
+    expect(failed.briefs).toEqual({ ok: true, notReady: [MISSING_21], unverified: ["21"] });
+    expect(failed.auditNote).toContain("audit failed");
+    expect(cachedFrontier(journal, REPO, 1)?.briefs).toEqual({ ok: true, notReady: [MISSING_21], unverified: ["21"] });
+    // Once soma reads again, the next refresh replaces it.
+    delete process.env.FAKE_SOMA_AUDIT_FAIL;
+    writeAudit(dir, []);
+    expect((await read("refresh")).briefs).toEqual({ ok: true, notReady: [] });
+  });
+
+  test("if-missing (the escalation pass) never re-audits while a good audit exists, and audits a map that has none", async () => {
+    const none = await read("if-missing");
+    expect(none.briefs).toEqual({ ok: true, notReady: [MISSING_21] });
+    expect(audits()).toBe(1);
+    writeFrontier(dir, "## Deliverable\n\nThe widget, edited.");
+    comment(2);
+    const served = await read("if-missing");
+    expect(served.briefs).toEqual({ ok: true, notReady: [MISSING_21], unverified: ["21"] });
+    expect(audits()).toBe(1);
+  });
+
+  test("if-missing serves a good audit past the max age rather than run one (the walk keeps it fresh)", async () => {
+    const t0 = new Date("2026-01-01T00:00:00Z");
+    await read("refresh", t0);
+    comment(2);
+    const late = await read("if-missing", new Date(t0.getTime() + 3 * 60 * 60_000));
+    expect(late.briefs).toEqual({ ok: true, notReady: [MISSING_21] });
+    expect(audits()).toBe(1);
+    // never mode does not serve one past the max age: build nodes are held.
+    expect((await read("never", new Date(t0.getTime() + 3 * 60 * 60_000))).briefs.ok).toBe(false);
+  });
+
+  test("a failed sentinel read keeps the audit: it needs no sentinel", async () => {
+    await read();
+    process.env.FAKE_GH_SENTINEL_FAIL = "1";
+    const r = await read("never");
+    expect(r.briefs).toEqual({ ok: true, notReady: [MISSING_21] });
+    expect(audits()).toBe(1);
+  });
+
+  test("never mode with no good audit holds every build node", async () => {
+    const r = await read("never");
+    expect(r.briefs).toEqual({ ok: false, error: "soma graph audit not read yet" });
+    expect(audits()).toBe(0);
+  });
+
+  test("an audit older than the max age is re-run even with every brief unchanged", async () => {
+    const t0 = new Date("2026-01-01T00:00:00Z");
+    await read("refresh", t0);
+    comment(2);
+    await read("refresh", new Date(t0.getTime() + 30 * 60_000));
+    expect(audits()).toBe(1);
+    comment(3);
+    await read("refresh", new Date(t0.getTime() + 61 * 60_000));
+    expect(audits()).toBe(2);
+  });
+});
+
 describe("graphAudit parses soma#753's buildBriefNotReady", () => {
   const audit = (body: unknown) =>
     graphAudit(REPO, 1, TOKEN, {
@@ -252,6 +397,23 @@ describe("graphAudit parses soma#753's buildBriefNotReady", () => {
  * that points ranger at both, and a `config` writer that walks the map in
  * full. Torn down whatever the test does.
  */
+/** The walk's audit, run before its claim lock: `readFrontier` in `refresh` mode on the rig's journal. */
+async function walkAudit(dir: string, fixtures: string, env: NodeJS.ProcessEnv): Promise<void> {
+  const saved = { PATH: process.env.PATH, FAKE_SOMA_DIR: process.env.FAKE_SOMA_DIR };
+  Object.assign(process.env, { PATH: env.PATH, FAKE_SOMA_DIR: fixtures });
+  const journal = new Journal(join(dir, "state.sqlite"));
+  try {
+    const read = await readFrontier({ journal, repo: REPO, root: 1, token: TOKEN, policy: POLICY, maxAgeMs: 60 * 60_000, now: new Date(), audit: "refresh" });
+    expect(read.briefs).toEqual({ ok: true, notReady: [] });
+  } finally {
+    journal.close();
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+}
+
 async function withCliRig(
   run: (rig: {
     dir: string;
@@ -317,16 +479,19 @@ describe("the escalation desk cards a not-ready build brief", () => {
       expect(second.edited).toEqual([]);
       expect(discord.posts).toHaveLength(1);
 
-      // An unreadable audit neither posts a card nor retires the open one.
+      // The brief is edited. The pass never re-runs the audit the walk owns
+      // (a broken soma changes nothing): the edited node is unverified, so it
+      // neither posts a card nor retires the open one.
+      writeFrontier(fixtures, "## Acceptance criteria\n\nFixed.");
       writeAudit(fixtures, "not-an-array");
       const unknown = await escalate();
       expect(unknown.posted).toEqual([]);
       expect(unknown.keptOpen).toEqual([]);
-      expect(unknown.cardErrors.join("\n")).toContain("build briefs unverified");
       expect(discord.edits).toHaveLength(0);
 
-      // The body is fixed: the audit stops listing it and its card leaves the queue.
+      // The walk's next audit reads the fixed body: its card leaves the queue.
       writeAudit(fixtures, []);
+      await walkAudit(dir, fixtures, env);
       const fixed = await escalate();
       expect(fixed.posted).toEqual([]);
       expect(fixed.keptOpen).toEqual(["21"]);

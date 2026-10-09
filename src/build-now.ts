@@ -116,6 +116,15 @@ function notWalkable(node: ClassifiedNode): string | null {
 export async function buildNow(nodeId: string, ctx: BuildNowContext): Promise<BuildNowResult> {
  const refusal = executionRefusal(ctx.map.repo);
  if (refusal !== null) throw new BuildNowRefusal(refusal);
+ // The audit (minutes on a large map) runs before the claim lock, as in the
+ // walk; the locked read serves it and holds a build node edited in between.
+ if (ctx.readFrontier === undefined && !ctx.journal.isPaused()) {
+  try {
+   await readFrontier({ ...frontierArgs(ctx), audit: "refresh" });
+  } catch {
+   // The locked read meets the same deferral or failure and refuses with it.
+  }
+ }
  try {
   return await withClaimLock(ctx.journal, (owned) => buildUnderLock(nodeId, ctx, owned), ctx.lockWaitMs ?? BUILD_NOW_LOCK_WAIT_MS);
  } catch (error) {
@@ -124,6 +133,20 @@ export async function buildNow(nodeId: string, ctx: BuildNowContext): Promise<Bu
   }
   throw error;
  }
+}
+
+/** The map's frontier read, as the walk takes it. */
+function frontierArgs(ctx: BuildNowContext) {
+ return {
+  journal: ctx.journal,
+  repo: ctx.map.repo,
+  root: ctx.map.root,
+  token: { token: ctx.token, source: "write-token" as const },
+  policy: budgetPolicy(ctx.config),
+  maxAgeMs: ctx.config.budget.frontierMaxAgeMin * 60_000,
+  now: ctx.now?.() ?? new Date(),
+  timeoutMs: GRAPH_CALL_TIMEOUT_MS,
+ };
 }
 
 async function buildUnderLock(nodeId: string, ctx: BuildNowContext, owned: OwnedCheck): Promise<BuildNowResult> {
@@ -138,16 +161,7 @@ async function buildUnderLock(nodeId: string, ctx: BuildNowContext, owned: Owned
 
  const { frontier: entries, briefs } = await (ctx.readFrontier ??
   (async () => {
-   const read = await readFrontier({
-    journal,
-    repo: map.repo,
-    root: map.root,
-    token: { token: ctx.token, source: "write-token" },
-    policy: budgetPolicy(config),
-    maxAgeMs: config.budget.frontierMaxAgeMin * 60_000,
-    now: now(),
-    timeoutMs: GRAPH_CALL_TIMEOUT_MS,
-   });
+   const read = await readFrontier({ ...frontierArgs(ctx), audit: "never" });
    return { frontier: read.frontier.frontier, briefs: read.briefs };
   }))();
  const classified = classifyFrontier(entries, map, ctx.registry ?? loadProbeRegistry(), ctx.botIdentity, briefs);

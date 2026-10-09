@@ -192,12 +192,15 @@ export function classify(
  * not ready (node #154; soma#752 D1/D4/D5). Only a walkable implement route
  * of kind `build` changes: other kinds, and nodes ranger would not take
  * anyway, keep their route. A failed audit holds every such node (readiness
- * unknown); an audit without the finding (an older soma) holds none.
+ * unknown), and a served audit holds each node new or edited since it ran;
+ * an audit without the finding (an older soma) holds none.
  */
 function holdUnreadyBrief(node: ClassifiedNode, briefs: BriefAudit | undefined): ClassifiedNode {
   if (briefs === undefined || node.kind !== "build") return node;
   if (node.route.route !== "implement" || !node.route.walkable) return node;
-  if (!briefs.ok) return { ...node, route: { route: "brief-not-ready", missing: null } };
+  if (!briefs.ok || briefs.unverified?.includes(node.id) === true) {
+    return { ...node, route: { route: "brief-not-ready", missing: null } };
+  }
   const finding = briefs.notReady.find((n) => n.id === node.id);
   return finding === undefined
     ? node
