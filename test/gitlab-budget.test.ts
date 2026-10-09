@@ -11,7 +11,7 @@ import {
   cooldownScope,
   setBudgetNoticeSink,
 } from "../src/budget.ts";
-import { frontierCacheKey, readFrontier } from "../src/frontier-cache.ts";
+import { auditCacheKey, frontierCacheKey, readFrontier } from "../src/frontier-cache.ts";
 import { GraphError, graphFailure, RateLimitError } from "../src/graph.ts";
 import { Journal } from "../src/journal.ts";
 import { assertReadOnlyToken, type ResolvedToken } from "../src/token-gate.ts";
@@ -106,9 +106,22 @@ describe("GitLab frontier reads", () => {
     journal.setHealth(frontierCacheKey(repo, 1), seeded);
     expect((await read(stub.runner, now)).source).toBe("fresh");
     expect((await read(stub.runner, now)).source).toBe("fresh");
-    expect(stub.verbs).toEqual(["frontier", "audit", "frontier", "audit"]);
+    // The frontier is read fresh each time; the young audit is reused (it
+    // keys on the build briefs, not on a sentinel).
+    expect(stub.verbs).toEqual(["frontier", "audit", "frontier"]);
     expect(existsSync(ghCalled)).toBeFalse();
     expect(journal.getHealth(frontierCacheKey(repo, 1))).toBe(seeded);
+  });
+
+  test("keep the last good audit under its own key: the walk's locked read serves it with no sentinel", async () => {
+    const stub = soma(ok);
+    const now = new Date();
+    await readFrontier({ journal, repo, root: 1, token, policy, maxAgeMs: HOUR, now, runner: stub.runner, audit: "refresh" });
+    const locked = await readFrontier({ journal, repo, root: 1, token, policy, maxAgeMs: HOUR, now, runner: stub.runner, audit: "never" });
+    expect(locked.briefs).toEqual({ ok: true, notReady: [] });
+    expect(stub.verbs).toEqual(["frontier", "audit", "frontier"]);
+    expect(journal.getHealth(auditCacheKey(repo, 1))).not.toBeNull();
+    expect(existsSync(ghCalled)).toBeFalse();
   });
 
   test("a soma 429 cools the map down per host and credential source", async () => {

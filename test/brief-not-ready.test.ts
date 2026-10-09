@@ -236,7 +236,7 @@ describe("the audit is cached on its own, keyed by the build briefs it saw", () 
   let journal: Journal;
   let calls: string;
   const saved: Record<string, string | undefined> = {};
-  const KEYS = ["PATH", "FAKE_SOMA_DIR", "FAKE_SOMA_CALLS", "FAKE_SOMA_AUDIT_FAIL", "FAKE_GH_EVENTS_LATEST", "FAKE_GH_ISSUES_UPDATED"];
+  const KEYS = ["PATH", "FAKE_SOMA_DIR", "FAKE_SOMA_CALLS", "FAKE_SOMA_AUDIT_FAIL", "FAKE_GH_EVENTS_LATEST", "FAKE_GH_ISSUES_UPDATED", "FAKE_GH_SENTINEL_FAIL"];
 
   beforeEach(() => {
     for (const k of KEYS) saved[k] = process.env[k];
@@ -333,6 +333,25 @@ describe("the audit is cached on its own, keyed by the build briefs it saw", () 
     comment(2);
     const served = await read("if-missing");
     expect(served.briefs).toEqual({ ok: true, notReady: [MISSING_21], unverified: ["21"] });
+    expect(audits()).toBe(1);
+  });
+
+  test("if-missing serves a good audit past the max age rather than run one (the walk keeps it fresh)", async () => {
+    const t0 = new Date("2026-01-01T00:00:00Z");
+    await read("refresh", t0);
+    comment(2);
+    const late = await read("if-missing", new Date(t0.getTime() + 3 * 60 * 60_000));
+    expect(late.briefs).toEqual({ ok: true, notReady: [MISSING_21] });
+    expect(audits()).toBe(1);
+    // never mode does not serve one past the max age: build nodes are held.
+    expect((await read("never", new Date(t0.getTime() + 3 * 60 * 60_000))).briefs.ok).toBe(false);
+  });
+
+  test("a failed sentinel read keeps the audit: it needs no sentinel", async () => {
+    await read();
+    process.env.FAKE_GH_SENTINEL_FAIL = "1";
+    const r = await read("never");
+    expect(r.briefs).toEqual({ ok: true, notReady: [MISSING_21] });
     expect(audits()).toBe(1);
   });
 
