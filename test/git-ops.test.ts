@@ -9,6 +9,7 @@ import {
  assertNamedRefs,
  fastForwardCanonical,
  gitConfigSnapshot,
+ gitCredential,
  GitSafetyError,
  NODE_BRANCH,
  safeGit,
@@ -122,8 +123,8 @@ describe("gitConfigSnapshot: ranger's own node branches (node #63)", () => {
   await config("branch.autoSetupRebase", "always");
   await config("branch.autoSetupMerge", "always");
   const before = gitConfigSnapshot(canonical);
-  await bootstrapWorktree(canonical, "663", "stations-are-solid", "tok");
-  await bootstrapWorktree(canonical, "64", "x", "tok", "feature/other");
+  await bootstrapWorktree(canonical, "663", "stations-are-solid", gitCredential("acme/widgets", "tok"));
+  await bootstrapWorktree(canonical, "64", "x", gitCredential("acme/widgets", "tok"), "feature/other");
   const listed = await config("--list");
   expect(listed).not.toContain("branch.node/");
   expect(listed).not.toContain("branch.feature/");
@@ -212,7 +213,7 @@ describe("gitConfigSnapshot: everything else stays in the hash", () => {
    async () => {
     // Git reads config.worktree only with the extension on (node #86).
     await config("extensions.worktreeConfig", "true");
-    await bootstrapWorktree(canonical, "663", "x", "tok");
+    await bootstrapWorktree(canonical, "663", "x", gitCredential("acme/widgets", "tok"));
     const [entry] = readdirSync(join(canonical, ".git", "worktrees"));
     // The snapshot taken after the worktree exists, then its config changes.
     const mid = gitConfigSnapshot(canonical);
@@ -372,7 +373,7 @@ describe("assertNamedRefs: credentialed git calls name their remote and refs", (
  });
 
  test("safeGit runs the guard on every call that carries the credential", async () => {
-  await expect(safeGit(["pull"], { cwd: canonical, token: "placeholder" })).rejects.toThrow(GitSafetyError);
+  await expect(safeGit(["pull"], { cwd: canonical, credential: gitCredential("acme/widgets", "placeholder") })).rejects.toThrow(GitSafetyError);
  });
 });
 
@@ -397,17 +398,17 @@ describe("assertCheckoutOf: credentialed calls run only against the vetted .git"
  });
 
  const push = (worktree: string, snapshot: string) =>
-  vettedPush({ worktree, canonical, branch: "node/86-x", token: "placeholder", configSnapshot: snapshot });
+  vettedPush({ worktree, canonical, branch: "node/86-x", credential: gitCredential("acme/widgets", "placeholder"), configSnapshot: snapshot });
  const evilHeads = () => git(["for-each-ref", "refs/heads"], evil);
 
  test("a clean node worktree pushes to the vetted origin", async () => {
-  const worktree = await bootstrapWorktree(canonical, "86", "x", "placeholder");
+  const worktree = await bootstrapWorktree(canonical, "86", "x", gitCredential("acme/widgets", "placeholder"));
   await push(worktree, gitConfigSnapshot(canonical));
   expect(await git(["for-each-ref", "--format=%(refname)", "refs/heads/node/86-x"], origin)).toBe("refs/heads/node/86-x");
  });
 
  test("a worktree commondir pointed at another repository refuses the push", async () => {
-  const worktree = await bootstrapWorktree(canonical, "86", "x", "placeholder");
+  const worktree = await bootstrapWorktree(canonical, "86", "x", gitCredential("acme/widgets", "placeholder"));
   const snapshot = gitConfigSnapshot(canonical);
   writeFileSync(join(canonical, ".git", "worktrees", "node-86", "commondir"), `${join(attacker, ".git")}\n`);
   expect(gitConfigSnapshot(canonical)).toBe(snapshot);
@@ -416,7 +417,7 @@ describe("assertCheckoutOf: credentialed calls run only against the vetted .git"
  });
 
  test("a worktree .git file pointed at another repository refuses the push", async () => {
-  const worktree = await bootstrapWorktree(canonical, "86", "x", "placeholder");
+  const worktree = await bootstrapWorktree(canonical, "86", "x", gitCredential("acme/widgets", "placeholder"));
   const snapshot = gitConfigSnapshot(canonical);
   writeFileSync(join(worktree, ".git"), `gitdir: ${join(attacker, ".git")}\n`);
   await expect(push(worktree, snapshot)).rejects.toThrow(/not the vetted/);
@@ -424,7 +425,7 @@ describe("assertCheckoutOf: credentialed calls run only against the vetted .git"
  });
 
  test("a worktree with no .git file (git climbs to the canonical checkout) refuses the push", async () => {
-  const worktree = await bootstrapWorktree(canonical, "86", "x", "placeholder");
+  const worktree = await bootstrapWorktree(canonical, "86", "x", gitCredential("acme/widgets", "placeholder"));
   const snapshot = gitConfigSnapshot(canonical);
   rmSync(join(worktree, ".git"));
   await expect(push(worktree, snapshot)).rejects.toThrow(/not the vetted/);
@@ -432,8 +433,8 @@ describe("assertCheckoutOf: credentialed calls run only against the vetted .git"
 
  test("a commondir planted in the canonical .git refuses the fetch and the worktree add", async () => {
   writeFileSync(join(canonical, ".git", "commondir"), `${join(attacker, ".git")}\n`);
-  await expect(fastForwardCanonical(canonical, "main", "placeholder", { attempts: 1 })).rejects.toThrow(/not the vetted/);
-  await expect(bootstrapWorktree(canonical, "86", "x", "placeholder")).rejects.toThrow(/not the vetted/);
+  await expect(fastForwardCanonical(canonical, "main", gitCredential("acme/widgets", "placeholder"), { attempts: 1 })).rejects.toThrow(/not the vetted/);
+  await expect(bootstrapWorktree(canonical, "86", "x", gitCredential("acme/widgets", "placeholder"))).rejects.toThrow(/not the vetted/);
  });
 
  // Sage round 2 on node #86: a path may hold a newline, and the first line
@@ -445,11 +446,11 @@ describe("assertCheckoutOf: credentialed calls run only against the vetted .git"
   renameSync(join(attacker, ".git"), foreign);
   writeFileSync(join(vetted, "commondir"), `${foreign}\n`);
   await expect(assertCheckoutOf(canonical, canonical)).rejects.toThrow(/not the vetted/);
-  await expect(fastForwardCanonical(canonical, "main", "placeholder", { attempts: 1 })).rejects.toThrow(/not the vetted/);
+  await expect(fastForwardCanonical(canonical, "main", gitCredential("acme/widgets", "placeholder"), { attempts: 1 })).rejects.toThrow(/not the vetted/);
  });
 
  test("a worktree commondir whose path embeds the vetted lines after a newline refuses the push", async () => {
-  const worktree = await bootstrapWorktree(canonical, "86", "x", "placeholder");
+  const worktree = await bootstrapWorktree(canonical, "86", "x", gitCredential("acme/widgets", "placeholder"));
   const snapshot = gitConfigSnapshot(canonical);
   const vetted = join(canonical, ".git");
   const foreign = `${vetted}\n${join(vetted, "worktrees", "node-86")}`;
@@ -462,7 +463,7 @@ describe("assertCheckoutOf: credentialed calls run only against the vetted .git"
  });
 
  test("a credentialed call that names no canonical checkout is refused", async () => {
-  await expect(safeGit(["fetch", "origin", "main"], { cwd: canonical, token: "placeholder" })).rejects.toThrow(
+  await expect(safeGit(["fetch", "origin", "main"], { cwd: canonical, credential: gitCredential("acme/widgets", "placeholder") })).rejects.toThrow(
    /names no canonical checkout/,
   );
   await expect(assertCheckoutOf(canonical, canonical)).resolves.toBeUndefined();
@@ -476,7 +477,7 @@ describe("assertCheckoutOf: credentialed calls run only against the vetted .git"
  // that are not UTF-8 (EILSEQ); ext4 (CI) takes them.
  test.skipIf(!takesRawByteNames())("a worktree whose git dir name is not UTF-8 refuses the push", async () => {
   await config("extensions.worktreeConfig", "true");
-  const worktree = await bootstrapWorktree(canonical, "86", "x", "placeholder");
+  const worktree = await bootstrapWorktree(canonical, "86", "x", gitCredential("acme/widgets", "placeholder"));
   const snapshot = gitConfigSnapshot(canonical);
   const worktrees = join(canonical, ".git", "worktrees");
   const raw = Buffer.concat([Buffer.from(`${worktrees}/raw`), Buffer.from([0xff])]);
@@ -570,7 +571,7 @@ describe("credentialed calls never recurse into submodules", () => {
   const snapshot = gitConfigSnapshot(canonical);
   const modules = join(canonical, ".git", "modules", "sub");
   const has = async (sha: string) => (await runCmd("git", ["cat-file", "-e", `${sha}^{commit}`], { cwd: modules })).code === 0;
-  await fastForwardCanonical(canonical, "main", "placeholder", { attempts: 1 });
+  await fastForwardCanonical(canonical, "main", gitCredential("acme/widgets", "placeholder"), { attempts: 1 });
   expect(gitConfigSnapshot(canonical)).toBe(snapshot);
   expect(await has(bumped)).toBe(false);
   // The control: git's own default fetch does reach the submodule's remote.

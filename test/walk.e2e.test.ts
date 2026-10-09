@@ -18,6 +18,7 @@ import {
 } from "../src/route.ts";
 import { planTick, researchCandidates } from "../src/walk.ts";
 import { bootstrapWorktree } from "../src/worker.ts";
+import { gitCredential } from "../src/git-ops.ts";
 import type { FrontierEntry } from "../src/graph.ts";
 import {
  baseConfigLines,
@@ -747,7 +748,7 @@ describe("bootstrapWorktree — orphaned branch (node #19 live finding)", () => 
     canonical,
     "10",
     "test-node",
-    "ghp_write",
+    gitCredential("acme/widgets", "ghp_write"),
    );
    expect(worktree).toBe(join(canonical, ".worktrees", "node-10"));
    const onBranch = await runCmd(
