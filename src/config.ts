@@ -277,6 +277,13 @@ const WorkersSchema = z.object({
 const PiSubstrateSchema = z.object({
  provider: z.string().min(1).default("spark"),
  model: z.string().min(1).default("longctx-think"),
+ /**
+  * Every Nth sage review round runs on Pi whatever the quota (principal,
+  * 2026-10-09: spread reviews onto the Spark cluster while Claude and Codex
+  * run low). 2 sends rounds 2, 4, 6… to Pi; the other rounds stay
+  * cross-model. 0 (the default) leaves Pi as the fallback only.
+  */
+ reviewEvery: z.number().int().min(0).default(0),
 });
 
 /** Plain model names only: nothing shell- or TOML-like reaches the argv. */

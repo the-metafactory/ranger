@@ -3220,6 +3220,38 @@ describe("implement lane (node #23)", () => {
   ]);
  }, 60_000);
 
+ test("substrates.pi.reviewEvery: 2 sends the second review round to Pi while Codex is eligible", async () => {
+  const r = await rig({ blockers: [1, 0] });
+  cleanup.push(r.dir);
+  r.ctx.config.substrates.pi.reviewEvery = 2;
+  r.ctx.substrate = "claude";
+  r.ctx.substrateReaders = {
+   claude: () => Promise.reject(new Error("probe down")),
+   codex: async () => ({
+    substrate: "codex",
+    readAt: new Date(),
+    windows: [{ kind: "five_hour", usedPct: 10, resetsAt: Math.floor(Date.now() / 1000) + 3600 }],
+    capped: false,
+    cappedUntil: null,
+   }),
+  };
+  const scripted = r.ctx.reviewer!;
+  const reviewSubstrates: (string | undefined)[] = [];
+  r.ctx.reviewer = async (repo, pr, token, opts) => {
+   reviewSubstrates.push(opts?.substrate);
+   return scripted(repo, pr, token, opts);
+  };
+
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("awaiting-merge");
+  // Round 1 stays cross-model (Claude wrote the head → Codex); round 2 is Pi's turn.
+  expect(reviewSubstrates).toEqual(["codex", "pi"]);
+  const reviewed = r.journal.listEvents("acme/widgets", 200).filter((e) => e.kind === "reviewed");
+  expect(reviewed.map((e) => e.detail?.match(/^round (\d+)/)?.[1])).toEqual(["2", "1"]);
+  expect(reviewed[0].detail).toContain("on pi (head by claude; Pi rotation (pi.reviewEvery 2);");
+  expect(reviewed[1].detail).toContain("on codex (head by claude; claude unread; codex");
+ }, 60_000);
+
  test("a RANGER_WORKER_CMD session runs unlabelled and its review still selects on real quota", async () => {
   const r = await rig({});
   cleanup.push(r.dir);

@@ -29,6 +29,7 @@ import {
  describeReadings,
  isEligible,
  selectForBuild,
+ isPiReviewTurn,
  selectForReview,
  type SubstrateConfig,
 } from "../src/substrate-policy.ts";
@@ -514,6 +515,20 @@ describe("selectForReview — cross-model selection", () => {
   const near = { ...early, sevenDayResetsAt: new Date(now.getTime() + 5 * 3_600_000).toISOString() };
   expect(selectForReview({ readings: [early], now, config: DEFAULT_CONFIG }, "codex")).toBe("pi");
   expect(selectForReview({ readings: [near], now, config: DEFAULT_CONFIG }, "codex")).toBe("claude");
+ });
+});
+
+describe("isPiReviewTurn — review rotation onto Pi", () => {
+ test("every 2 → the even rounds", () => {
+  expect([1, 2, 3, 4, 5, 6].map((round) => isPiReviewTurn(round, 2))).toEqual([false, true, false, true, false, true]);
+ });
+
+ test("0 → never (Pi stays the fallback only)", () => {
+  expect([1, 2, 3, 4].some((round) => isPiReviewTurn(round, 0))).toBe(false);
+ });
+
+ test("1 → every round", () => {
+  expect([1, 2, 3].every((round) => isPiReviewTurn(round, 1))).toBe(true);
  });
 });
 

@@ -57,7 +57,7 @@ import {
  type SubstrateName,
  type SubstrateReaders,
 } from "./substrate.ts";
-import { selectForReview } from "./substrate-policy.ts";
+import { isPiReviewTurn, selectForReview } from "./substrate-policy.ts";
 import { failedSessionOutcome, recordSession } from "./substrate-usage.ts";
 import { workerEnv } from "./worker-env.ts";
 import type { CommitAuthor } from "./identity.ts";
@@ -1222,7 +1222,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
    }
    const round = reviews.length + 1;
    fence("review");
-   const { substrate: reviewSubstrate, chosenOn } = await selectReviewSubstrate(ctx, live.headSha);
+   const { substrate: reviewSubstrate, chosenOn } = await selectReviewSubstrate(ctx, live.headSha, round);
    // The sage round is a substrate session (node #56): its row opens under
    // the generation fence once selection has settled (selection awaits, and
    // the generation can move meanwhile), and ends with the cap confirmation,
@@ -1560,20 +1560,25 @@ interface PassResult {
  * Cross-model review selection (node #45): prefer a substrate other than the
  * one that wrote the head; an unrecorded head counts as Pi's. Substrates
  * capped earlier in this run are left out, so a review never re-picks one
- * whose capped-until has lapsed meanwhile.
+ * whose capped-until has lapsed meanwhile. A round whose number is a multiple
+ * of substrates.pi.reviewEvery runs on Pi by rotation, whatever the quota.
  */
 async function selectReviewSubstrate(
  ctx: ImplementContext,
  headSha: string,
+ round: number,
 ): Promise<{ substrate: SubstrateName; chosenOn: string }> {
  const author = ctx.journal.headSubstrate(ctx.map.repo, headSha) ?? "pi";
+ const every = ctx.config.substrates.pi.reviewEvery;
+ const rotation = isPiReviewTurn(round, every);
  const { substrate, chosenOn } = await selectSubstrate(ctx.journal, {
   config: ctx.config.substrates,
   excluded: ctx.excludedSubstrates ?? new Set<SubstrateName>(),
   readers: ctx.substrateReaders,
-  pick: (input) => selectForReview(input, author),
+  pick: (input) => (rotation ? "pi" : selectForReview(input, author)),
  });
- return { substrate, chosenOn: ` on ${substrate} (head by ${author}; ${chosenOn})` };
+ const why = rotation ? `Pi rotation (pi.reviewEvery ${every}); ` : "";
+ return { substrate, chosenOn: ` on ${substrate} (head by ${author}; ${why}${chosenOn})` };
 }
 
 /** Which substrate wrote a pushed SHA: the review of that head reads it back. */
