@@ -2,6 +2,7 @@ import { join } from "node:path";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import { withClaimLock } from "./claim-lock.ts";
 import { executionRefusal } from "./forge-ref.ts";
+import { changeRequestNoun } from "./forge-text.ts";
 import { pidAlive } from "./exec.ts";
 import { assertWriteIdentity, WriteGateError } from "./identity.ts";
 import type { Journal, ResumeQueueRow, WorkerRow, WorkerStatus } from "./journal.ts";
@@ -267,7 +268,7 @@ export async function processResumeQueue(
    if (row.prNumber !== null) {
     const pr = await ctx.github.getPr(entry.repo, row.prNumber, state.token);
     if (pr.state === "merged" || pr.state === "closed") {
-     drop(pr.state === "merged" ? "PR is merged" : "PR is closed");
+     drop(`${changeRequestNoun(entry.repo)} is ${pr.state === "merged" ? "merged" : "closed"}`);
      continue;
     }
    }

@@ -163,7 +163,7 @@ describe("a failed probe run retries only its failures", () => {
   expect(checks.get("probe-commander.mjs")).toEqual({ kind: "crash", checks: new Set() }); // a crash names no check
  });
  test("a park names the failures the merge base shares on its own line, after FAILED", () => {
-  const outcome = probesFailedOutcome({ sha: "545ce725ff", pr: 695, exit: 1, failed: ["probe-commander.mjs", "probe-traffic-engagement.mjs"], redOnBase: ["probe-traffic-engagement.mjs"], tail: "…" });
+  const outcome = probesFailedOutcome({ repo: "acme/widgets", sha: "545ce725ff", pr: 695, exit: 1, failed: ["probe-commander.mjs", "probe-traffic-engagement.mjs"], redOnBase: ["probe-traffic-engagement.mjs"], tail: "…" });
   expect(outcome.split("\n").slice(0, 3)).toEqual([
    "browser probes failed twice at 545ce725 on PR #695 (exit 1)",
    "FAILED: probe-commander.mjs · probe-traffic-engagement.mjs",

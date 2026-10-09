@@ -1,10 +1,22 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stringify } from "yaml";
 import { loadConfig } from "../src/config.ts";
 import type { ChangeRequest, CiVerdict, IssueComment } from "../src/forge.ts";
+import {
+ changeRequestLabel,
+ changeRequestNoun,
+ changeRequestRef,
+ changeRequestUrl,
+ ciRunNoun,
+ ciRunText,
+ ciRunUrl,
+ forgeName,
+ nodeCommentUrl,
+ nodeUrl,
+} from "../src/forge-text.ts";
 import type { NodeResult } from "../src/graph.ts";
 import {
  closeResolution,
@@ -19,6 +31,15 @@ import {
 } from "../src/implement.ts";
 import { openJournal, type WorkerRow } from "../src/journal.ts";
 import { runMergeDesk } from "../src/merge-desk.ts";
+import {
+ baseConflictOutcome,
+ infrastructureProbeHead,
+ probesFailedOutcome,
+ REVIEW_CAP_HEAD_MOVED_OUTCOME,
+ REVIEW_CAP_OUTCOME,
+ reviewCapHeadMovedOutcome,
+ reviewCapOutcome,
+} from "../src/outcomes.ts";
 import { needsYouEntries, resumeQueueViews } from "../src/serve-parked.ts";
 
 /**
@@ -98,7 +119,7 @@ function implementTexts(repo: string): Record<string, string> {
    } finally { r.close(); }
   }
  }
- out.gist = gistLine("Name MRs and nodes the way their forge does", MR);
+ out.gist = gistLine(repo, "Name MRs and nodes the way their forge does", MR);
  const r = rig(repo);
  try {
   out.fixNode = fixNodeSpec(implementCtx(r, "auto"), "probe-hud.mjs", ["draws"], HEAD, { number: MR, url: change(repo).webUrl }).body ?? "";
@@ -455,5 +476,141 @@ describe("node #129 — GitHub renderings stay byte-identical", () => {
       ],
     }
   `);
+ });
+});
+
+/** Every string a GitLab render produced, flattened. */
+function strings(value: unknown): string[] {
+ if (typeof value === "string") return [value];
+ if (Array.isArray(value)) return value.flatMap(strings);
+ if (value !== null && typeof value === "object") return Object.values(value).flatMap(strings);
+ return [];
+}
+
+/** The MR is !42 and the node #129: a `#42` anywhere would name issue 42 on GitLab. */
+function expectGitLabNaming(texts: string[]): void {
+ expect(texts.length).toBeGreaterThan(0);
+ for (const text of texts) {
+  expect(text).not.toContain(`#${MR}`);
+  expect(text).not.toMatch(/\bPRs?\b/);
+  expect(text).not.toContain("github.com");
+  expect(text).not.toContain("GitHub");
+  expect(text).not.toContain("check run");
+ }
+}
+
+describe("node #129 — GitLab renderings name an MR !N with GitLab URLs", () => {
+ test("implement-lane bodies and receipts", () => {
+  const texts = implementTexts(GITLAB);
+  expectGitLabNaming(strings(texts));
+  expect(texts["close merge/manual"]).toContain(
+   "Implemented by ranger's implement lane in MR !42 (https://gitlab.example.org/claw/crisis-simulator/-/merge_requests/42), merged by ivy-bot",
+  );
+  expect(texts["close merge/manual"]).toContain("CI pipeline 901 succeeded on the MR head cccccccc.");
+  expect(texts["close merge/manual"]).toContain("ivy-bot merged MR !42 under the principal's standing grant");
+  expect(texts["close principal merge/manual"]).toContain("the principal merged MR !42 (merge = ratification");
+  expect(texts["close no url auto/manual"]).toContain("(https://gitlab.example.org/claw/crisis-simulator/-/merge_requests/42)");
+  expect(texts["ready merge/manual"]).toContain("**merging this MR is the ratification**");
+  expect(texts["ready auto/manual"]).toContain("this MR's CI run");
+  expect(texts.gist).toBe("Name MRs and nodes the way their forge does — MR !42");
+  expect(texts.fixNode).toContain("- Detected by: node #129, MR !42 (https://gitlab.example.org/claw/crisis-simulator/-/merge_requests/42)");
+  expect(texts.fixNode).toContain("Later MRs off that merge base");
+  // Nodes are issues on GitLab too: `#N` stays.
+  expect(texts["draft auto/manual"]).toContain(`orienteer node ${GITLAB} #129`);
+ });
+
+ test("merge-desk cards and journal lines", async () => {
+  const texts = await mergeDeskTexts(GITLAB);
+  expectGitLabNaming(strings(texts));
+  expect(texts["merge needed"]![0]).toStartWith(
+   ":ranger: **merge needed** #129 — MR !42 https://gitlab.example.org/claw/crisis-simulator/-/merge_requests/42\n",
+  );
+  expect(texts["merge needed, no url"]![0]).toStartWith(":ranger: **merge needed** #129 — MR !42\n");
+  expect(texts.merged).toContain("merged: MR !42 squash-merged by ranger at cccccccc (no ranger:needs-eye label; standing grant 2026-10-03)");
+  expect(texts.withdrawn![0]).toContain("Do not merge yet: MR !42 conflicts with main at cccccccc. Ranger reworks it; a new merge card follows when the MR is clean.");
+  expect(texts.declined![0]).toContain(`map: ${GITLAB}#97 · MR !42\nMR !42 was closed without merging`);
+  expect(texts["merged elsewhere"]).toEqual(["sweep: MR !42 merged — resuming at the close phase (pid 4242)"]);
+  expect(texts["no pr"]).toContain("parked: awaiting merge with no MR recorded — journal and GitLab disagree");
+ });
+
+ test("serve-parked links", () => {
+  expect(parkedTexts(GITLAB)).toEqual({
+   queue: ["https://gitlab.example.org/claw/crisis-simulator/-/issues/129"],
+   needsYou: [{
+    url: "https://gitlab.example.org/claw/crisis-simulator/-/issues/129",
+    pr: "https://gitlab.example.org/claw/crisis-simulator/-/merge_requests/42",
+   }],
+  });
+ });
+});
+
+describe("node #129 — the forge-text module", () => {
+ const GL = "https://gitlab.example.org/claw/crisis-simulator";
+ test("GitHub: PR #N, github.com URLs, check runs", () => {
+  expect([forgeName(GITHUB), changeRequestNoun(GITHUB), changeRequestRef(GITHUB, 7), changeRequestLabel(GITHUB, 7)])
+   .toEqual(["GitHub", "PR", "#7", "PR #7"]);
+  expect(changeRequestUrl(GITHUB, 7)).toBe("https://github.com/acme/widgets/pull/7");
+  expect(nodeUrl(GITHUB, "129")).toBe("https://github.com/acme/widgets/issues/129");
+  expect(ciRunUrl(GITHUB, 901)).toBe("https://github.com/acme/widgets/runs/901");
+  expect(nodeCommentUrl(GITHUB, "https://github.com/acme/widgets/issues/129", 5)).toBe("https://github.com/acme/widgets/issues/129#issuecomment-5");
+  expect(ciRunNoun(GITHUB)).toBe("check run");
+  expect(ciRunText(GITHUB, { runId: 901, runName: "build" }, "receipt")).toBe(`check run "build" (901)`);
+  expect(ciRunText(GITHUB, { runId: 901, runName: "build" }, "summary")).toBe("check run build");
+  // A qualified GitHub ref names the same repository the same way.
+  expect(changeRequestUrl("github:github.com/acme/widgets", 7)).toBe("https://github.com/acme/widgets/pull/7");
+ });
+
+ test("GitLab: MR !N, /-/ URLs on the map's host, pipelines", () => {
+  expect([forgeName(GITLAB), changeRequestNoun(GITLAB), changeRequestRef(GITLAB, 7), changeRequestLabel(GITLAB, 7)])
+   .toEqual(["GitLab", "MR", "!7", "MR !7"]);
+  expect(changeRequestUrl(GITLAB, 7)).toBe(`${GL}/-/merge_requests/7`);
+  expect(nodeUrl(GITLAB, "129")).toBe(`${GL}/-/issues/129`);
+  expect(ciRunUrl(GITLAB, 901)).toBe(`${GL}/-/pipelines/901`);
+  expect(nodeCommentUrl(GITLAB, `${GL}/-/issues/129`, 5)).toBe(`${GL}/-/issues/129#note_5`);
+  expect(ciRunNoun(GITLAB)).toBe("pipeline");
+  expect(ciRunText(GITLAB, { runId: 901, runName: "pipeline 901" }, "receipt")).toBe("pipeline 901");
+  expect(ciRunText(GITLAB, { runId: 901, runName: "pipeline 901" }, "summary")).toBe("pipeline 901");
+ });
+
+ test("an API web_url wins over the built URL; an empty one does not", () => {
+  for (const repo of [GITHUB, GITLAB]) {
+   expect(changeRequestUrl(repo, 7, "https://proxy.example/mr/7")).toBe("https://proxy.example/mr/7");
+   expect(nodeUrl(repo, 1, "https://proxy.example/i/1")).toBe("https://proxy.example/i/1");
+   expect(ciRunUrl(repo, 9, "https://proxy.example/p/9")).toBe("https://proxy.example/p/9");
+   expect(changeRequestUrl(repo, 7, "")).toBe(changeRequestUrl(repo, 7));
+  }
+ });
+
+ test("park outcomes name the MR !N on GitLab, and ranger's parsers still read them", () => {
+  const capMoved = reviewCapHeadMovedOutcome({ repo: GITLAB, rounds: 2, pr: MR });
+  expect(capMoved).toContain("on MR !42");
+  expect(capMoved).toMatch(REVIEW_CAP_HEAD_MOVED_OUTCOME);
+  expect(capMoved).toMatch(REVIEW_CAP_OUTCOME);
+  const cap = reviewCapOutcome({ repo: GITLAB, blockers: 1, majors: 0, round: 3, pr: MR });
+  expect(cap).toContain("on MR !42");
+  expect(cap).toMatch(REVIEW_CAP_OUTCOME);
+  expect(baseConflictOutcome({ repo: GITLAB, pr: MR, base: "main", passes: 2 })).toStartWith("MR !42 conflicts with main");
+  const probes = probesFailedOutcome({ repo: GITLAB, sha: HEAD, pr: MR, exit: -1, failed: [], failureClass: "infrastructure", tail: "lock" });
+  expect(probes).toStartWith("browser probes failed twice at cccccccc on MR !42 (exit -1)");
+  expect(infrastructureProbeHead(probes)).toBe(HEAD);
+  for (const text of [capMoved, cap, probes]) expect(text).not.toContain(`#${MR}`);
+  // GitHub keeps its bytes.
+  expect(reviewCapHeadMovedOutcome({ repo: GITHUB, rounds: 2, pr: MR })).toMatch(/^review cap reached: 2 sage round\(s\) on PR #42 and/);
+ });
+
+ test("no hand-built github.com URL remains outside the forge-text module", () => {
+  const src = join(import.meta.dir, "..", "src");
+  const files = (dir: string): string[] => readdirSync(dir).flatMap((name) => {
+   const path = join(dir, name);
+   return statSync(path).isDirectory() ? files(path) : path.endsWith(".ts") ? [path] : [];
+  });
+  // A forge web URL, hand-built: GitHub's host, or a change-request, issue or CI path segment.
+  const built = ["https://github.com", "github.com/${", "/pull/${", "/runs/${", "/-/merge_requests/", "/-/issues/", "/-/pipelines/"];
+  const hits = files(src).flatMap((path) => {
+   const text = readFileSync(path, "utf8");
+   return built.filter((pattern) => text.includes(pattern)).map((pattern) => `${path.slice(src.length + 1)}: ${pattern}`);
+  });
+  // The module itself builds every forge path, so the scan is not vacuous.
+  expect(hits).toEqual(["/pull/${", "/runs/${", "/-/merge_requests/", "/-/issues/", "/-/pipelines/"].map((pattern) => `forge-text.ts: ${pattern}`));
  });
 });

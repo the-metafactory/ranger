@@ -1,5 +1,6 @@
 import { principalLoginForRepo } from "./config.ts";
 import { executionRefusal, fileStemFor } from "./forge-ref.ts";
+import { changeRequestLabel, changeRequestNoun, changeRequestUrl, ciRunNoun, ciRunText, forgeName } from "./forge-text.ts";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { availableParallelism, loadavg, tmpdir } from "node:os";
@@ -447,7 +448,7 @@ async function probeFinalHead(
 
  if ((await headSha(worktree)) !== live.headSha) {
   throw new ParkSignal(
-   `the worktree is not at PR #${prNumber}'s head ${live.headSha.slice(0, 8)} — refusing to certify probes for a different tree`,
+   `the worktree is not at ${changeRequestLabel(repo, prNumber)}'s head ${live.headSha.slice(0, 8)} — refusing to certify probes for a different tree`,
   );
  }
  const command = probeCommandFor(map.commands.probe as string, nodeId);
@@ -490,7 +491,7 @@ async function probeFinalHead(
  // A failure the merge base shares is the base's, not this branch's
  // (2026-10-05: main went red on one probe and parked every later node).
  const base = result.code === 0 ? null : await probeMergeBase(ctx, failed, result.stdout);
- if (base !== null) journal.recordEvent("reviewed", { nodeId, repo, detail: baseProbeDetail(base) });
+ if (base !== null) journal.recordEvent("reviewed", { nodeId, repo, detail: baseProbeDetail(repo, base) });
  const baseRed = base !== null && base.red.length === failed.length ? base.red : undefined;
  const record: RecordedProbe = {
   sha: live.headSha,
@@ -505,7 +506,7 @@ async function probeFinalHead(
  // Before the park: a probe confirmed red at base is the base's, whatever else this branch broke.
  // A cache hit counts too: another map on this base, or an earlier failed add, files here.
  if (base !== null && base.confirmed.length + base.cached.length > 0) {
-  await fileBaseRedFixNodes(ctx, base, { number: prNumber, url: live.webUrl || `https://github.com/${repo}/pull/${prNumber}` });
+  await fileBaseRedFixNodes(ctx, base, { number: prNumber, url: changeRequestUrl(repo, prNumber, live.webUrl) });
  }
  // Named failures lead the record, the event and the park: an output tail can hold only passing probes.
  const failing = probeFailureSummary(result.stdout, result.code);
@@ -513,15 +514,16 @@ async function probeFinalHead(
  const log = logFailureCount(ctx) === logFailuresBefore ? basename(workerLogFile(journal.path, repo, nodeId, ctx.generation)) : null;
  // Again after the filing: its lease wait and graph writes can outlast this worker's generation.
  ctx.journal.assertGeneration(nodeId, ctx.map.repo, ctx.generation, "post the probe record");
- await github.postComment(repo, prNumber, probeComment(ranCommand, record, attempts, result, failing, log), token);
+ await github.postComment(repo, prNumber, probeComment(repo, ranCommand, record, attempts, result, failing, log), token);
  journal.recordEvent("reviewed", {
   nodeId,
   repo,
-  detail: `probes ${record.passed ? "passed" : "FAILED"} at ${record.sha.slice(0, 8)} (${record.mode}, ${record.selected} selected, ${attempts} run(s))${baseRedNote(record)}${record.passed ? "" : ` — failing: ${failing.join(" · ")}`}`.slice(0, 400),
+  detail: `probes ${record.passed ? "passed" : "FAILED"} at ${record.sha.slice(0, 8)} (${record.mode}, ${record.selected} selected, ${attempts} run(s))${baseRedNote(repo, record)}${record.passed ? "" : ` — failing: ${failing.join(" · ")}`}`.slice(0, 400),
  });
  if (!record.passed) {
   throw new ParkSignal(
    probesFailedOutcome({
+    repo,
     sha: record.sha,
     pr: prNumber,
     exit: result.code,
@@ -608,17 +610,17 @@ function cacheProvenance(sha: string, probes: string[], capitalized = false): st
  return `${capitalized ? "Base" : "base"} result from cache at ${sha.slice(0, 8)}: ${probes.join(", ")}`;
 }
 
-function unconfirmedBaseNote(sha: string, probes: string[], exit: number): string {
- return `Base confirmation at ${sha.slice(0, 8)} ${exit === 0 ? "passed" : `exited ${exit} without repeating identical assertion failures`}: ${probes.join(", ")}. No cache written for these probes; this PR uses the first base comparison.`;
+function unconfirmedBaseNote(repo: string, sha: string, probes: string[], exit: number): string {
+ return `Base confirmation at ${sha.slice(0, 8)} ${exit === 0 ? "passed" : `exited ${exit} without repeating identical assertion failures`}: ${probes.join(", ")}. No cache written for these probes; this ${changeRequestNoun(repo)} uses the first base comparison.`;
 }
 
 /** The journal line for a merge-base probe check. */
-function baseProbeDetail(b: BaseProbeResult): string {
+function baseProbeDetail(repo: string, b: BaseProbeResult): string {
  const at = `the merge base ${b.sha.slice(0, 8)}`;
  return [
   b.red.length > 0 ? `${b.red.join(", ")} fail at ${at} too` : null,
   b.cached.length > 0 ? cacheProvenance(b.sha, b.cached) : null,
-  b.unconfirmed.length > 0 ? unconfirmedBaseNote(b.sha, b.unconfirmed, b.confirmationExit!) : null,
+  b.unconfirmed.length > 0 ? unconfirmedBaseNote(repo, b.sha, b.unconfirmed, b.confirmationExit!) : null,
   b.differs.length > 0 ? `${b.differs.join(", ")} fail at ${at} too, but not the same way — they gate` : null,
   b.passed.length > 0 ? `${b.passed.join(", ")} pass at ${at} — the failure is this branch's` : null,
   b.changed.length > 0 ? `${b.changed.join(", ")} are new or changed on this branch — they gate` : null,
@@ -702,7 +704,7 @@ async function confirmBaseRed(
   ctx.journal.recordEvent("reviewed", {
    repo: ctx.map.repo,
    nodeId: ctx.node.ref.id,
-   detail: `${unconfirmedBaseNote(sha, unconfirmed, confirmation.code)} Confirmation exit ${confirmation.code}${confirmation.code === 0 ? " (passed)" : `: ${probeFailureSummary(confirmation.stdout, confirmation.code).join(" · ")}`}`,
+   detail: `${unconfirmedBaseNote(ctx.map.repo, sha, unconfirmed, confirmation.code)} Confirmation exit ${confirmation.code}${confirmation.code === 0 ? " (passed)" : `: ${probeFailureSummary(confirmation.stdout, confirmation.code).join(" · ")}`}`,
   });
  }
  return { unconfirmed, confirmationExit: confirmation.code };
@@ -814,8 +816,8 @@ async function announceBaseRed(ctx: ImplementContext, sha: string, probe: Record
  const text = [
   `:ranger: **${ctx.map.base} was red** at \`${sha.slice(0, 8)}\` on ${red.join(", ")}`,
   `map: ${mapKey(ctx.map)}`,
-  `Node #${ctx.node.ref.id} failed these probes twice.${baseRedNote(probe)}`,
-  "Later PRs reuse only twice-confirmed cached checks; an unconfirmed comparison needs a fresh base run.",
+  `Node #${ctx.node.ref.id} failed these probes twice.${baseRedNote(ctx.map.repo, probe)}`,
+  `Later ${changeRequestNoun(ctx.map.repo)}s reuse only twice-confirmed cached checks; an unconfirmed comparison needs a fresh base run.`,
  ].join("\n");
  try {
   await (ctx.announce ?? ((t: string) => DiscordAnnouncer.fromMap(ctx.map).post(t, "base-red notice")))(text);
@@ -884,11 +886,11 @@ export function fixNodeSpec(ctx: ImplementContext, probe: string, checks: string
    "",
    "## Found by probe",
    "",
-   `Node #${ctx.node.ref.id} failed \`${probe}\` at its head, and two runs at its merge base \`${sha.slice(0, 8)}\` failed the same checks: the failure was the base's, not the branch's. Later PRs off that merge base inherit these checks from ranger's cache instead of gating on them. The runs were at the merge base, not at \`${base}\`'s tip, which may have moved since. Ranger filed this node.`,
+   `Node #${ctx.node.ref.id} failed \`${probe}\` at its head, and two runs at its merge base \`${sha.slice(0, 8)}\` failed the same checks: the failure was the base's, not the branch's. Later ${changeRequestNoun(ctx.map.repo)}s off that merge base inherit these checks from ranger's cache instead of gating on them. The runs were at the merge base, not at \`${base}\`'s tip, which may have moved since. Ranger filed this node.`,
    "",
    `- Probe: \`${probe}\``,
    `- Merge base: \`${sha}\``,
-   `- Detected by: node #${ctx.node.ref.id}, PR #${pr.number} (${pr.url})`,
+   `- Detected by: node #${ctx.node.ref.id}, ${changeRequestLabel(ctx.map.repo, pr.number)} (${pr.url})`,
    "- Failing checks at the merge base:",
    "",
    "```",
@@ -1032,6 +1034,7 @@ export async function fileBaseRedFixNodes(
  * `log` is null when a write failed, and the record says so instead.
  */
 function probeComment(
+ repo: string,
  command: string,
  p: RecordedProbe,
  attempts: number,
@@ -1043,7 +1046,7 @@ function probeComment(
  const clipped = out.length > 20_000 ? `…${out.slice(-20_000)}` : out;
  return [
   probeMarker(p),
-  `**Probes — ${p.passed ? "passed" : "failed"}** at \`${p.sha.slice(0, 8)}\` (selection ${p.mode}, ${p.selected} probe(s); ${attempts} run(s))${baseRedNote(p)}`,
+  `**Probes — ${p.passed ? "passed" : "failed"}** at \`${p.sha.slice(0, 8)}\` (selection ${p.mode}, ${p.selected} probe(s); ${attempts} run(s))${baseRedNote(repo, p)}`,
   "",
   ...(failing.length === 0
    ? []
@@ -1124,12 +1127,12 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
  journal.recordEvent("worker-start", {
   nodeId,
   repo,
-  detail: `implement lane resumes at phase ${phase} (branch ${branch}${pr === null ? "" : `, PR #${pr.iid}`})`,
+  detail: `implement lane resumes at phase ${phase} (branch ${branch}${pr === null ? "" : `, ${changeRequestLabel(repo, pr.iid)}`})`,
  });
 
  if (phase === "pr-closed") {
   throw new ParkSignal(
-   `PR #${pr?.iid} for ${branch} was closed without merging — a human declined it; ranger will not reopen or re-propose it`,
+   `${changeRequestLabel(repo, pr?.iid ?? "?")} for ${branch} was closed without merging — a human declined it; ranger will not reopen or re-propose it`,
   );
  }
  if (phase === "close") {
@@ -1183,7 +1186,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
   );
   journal.updateWorker(nodeId, ctx.map.repo, { phase: "review", prNumber: pr.iid });
   await awaitHead(github, repo, pr.iid, built.sha, token, ctx.headPollMs);
-  journal.recordEvent("pr-opened", { nodeId, repo, detail: `PR #${pr.iid} (draft) ${pr.webUrl}` });
+  journal.recordEvent("pr-opened", { nodeId, repo, detail: `${changeRequestLabel(repo, pr.iid)} (draft) ${pr.webUrl}` });
  }
 
  // ---- review loop ----
@@ -1215,7 +1218,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
   }
   if (current === undefined) {
    if (reviews.length >= cap) {
-    throw new ParkSignal(reviewCapHeadMovedOutcome({ rounds: reviews.length, pr: open.iid }));
+    throw new ParkSignal(reviewCapHeadMovedOutcome({ repo, rounds: reviews.length, pr: open.iid }));
    }
    const round = reviews.length + 1;
    fence("review");
@@ -1258,7 +1261,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
    const verdict = reviewed.verdict;
    if (verdict.commitId !== live.headSha) {
     throw new ParkSignal(
-     `sage reviewed ${verdict.commitId.slice(0, 8)} but PR #${open.iid}'s head is ${live.headSha.slice(0, 8)} — the head moved during review`,
+     `sage reviewed ${verdict.commitId.slice(0, 8)} but ${changeRequestLabel(repo, open.iid)}'s head is ${live.headSha.slice(0, 8)} — the head moved during review`,
     );
    }
    fence("post review");
@@ -1297,7 +1300,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
    // desk waits forever (seelite #692).
    if (!(await conflictsWithBase(ctx, github, open.iid))) break;
    if (baseMerges >= MAX_BASE_MERGES) {
-    throw new ParkSignal(baseConflictOutcome({ pr: open.iid, base, passes: baseMerges }));
+    throw new ParkSignal(baseConflictOutcome({ repo, pr: open.iid, base, passes: baseMerges }));
    }
    const merged = await baseMergePass(ctx, testCommand, live.headSha);
    workerExit = merged.workerExit;
@@ -1320,7 +1323,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
   }
   if (current.round >= cap) {
    throw new ParkSignal(
-    reviewCapOutcome({ blockers: current.blockers, majors: current.majors, round: current.round, pr: open.iid }),
+    reviewCapOutcome({ repo, blockers: current.blockers, majors: current.majors, round: current.round, pr: open.iid }),
    );
   }
   // One fix pass per review that found blockers or majors. On a resume the review is
@@ -1386,11 +1389,11 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
  journal.recordEvent("awaiting-merge", {
   nodeId,
   repo,
-  detail: `PR #${open.iid} ready; sage clean at ${final.sha.slice(0, 8)} — the merge card follows once CI is green`,
+  detail: `${changeRequestLabel(repo, open.iid)} ready; sage clean at ${final.sha.slice(0, 8)} — the merge card follows once CI is green`,
  });
  return {
   status: "awaiting-merge",
-  detail: `PR #${open.iid} is ready and waits on the principal's merge`,
+  detail: `${changeRequestLabel(repo, open.iid)} is ready and waits on the principal's merge`,
   workerExit,
   prNumber: open.iid,
  };
@@ -1849,7 +1852,7 @@ async function closeAfterMerge(
  const success = await github.ciVerdictFor(repo, pr.headSha, token, "close");
  if (success.state !== "green") {
   throw new ParkSignal(
-   `PR #${pr.iid} merged, but no successful check run on its head ${pr.headSha.slice(0, 8)} — nothing for the close to cite`,
+   `${changeRequestLabel(repo, pr.iid)} merged, but no successful ${ciRunNoun(repo)} on its head ${pr.headSha.slice(0, 8)} — nothing for the close to cite`,
   );
  }
  const reviews = recordedReviews(await github.listComments(repo, pr.iid, token), botIdentity);
@@ -1876,7 +1879,7 @@ async function closeAfterMerge(
   // it is informational, and the merged PR is the externally checkable pointer.
   evidence.push({
    kind: "tested",
-   summary: `CI check run ${success.runName} succeeded at ${pr.headSha.slice(0, 8)}; ${ratificationText(ctx, pr)}`,
+   summary: `CI ${ciRunText(repo, success, "summary")} succeeded at ${pr.headSha.slice(0, 8)}; ${ratificationText(ctx, pr)}`,
    pointer: success.runUrl,
   });
  }
@@ -1889,7 +1892,7 @@ async function closeAfterMerge(
   token,
   {
    resolutionFile,
-   gist: gistLine(node.node.title, pr.iid),
+   gist: gistLine(repo, node.node.title, pr.iid),
    checkpointId: node.node.checkpointId,
    ...(ctx.ratify === "auto" ? { ci: `${success.runId}@${pr.headSha}` } : {}),
    evidence,
@@ -1950,7 +1953,7 @@ async function awaitHead(
   if (live.headSha === sha) return;
   if (Date.now() >= deadline) {
    throw new ParkSignal(
-    `GitHub still shows PR #${prNumber} at ${live.headSha.slice(0, 8)}, not the pushed ${sha.slice(0, 8)}, after ${Math.round(timeoutMs / 1000)}s`,
+    `${forgeName(repo)} still shows ${changeRequestLabel(repo, prNumber)} at ${live.headSha.slice(0, 8)}, not the pushed ${sha.slice(0, 8)}, after ${Math.round(timeoutMs / 1000)}s`,
    );
   }
   await Bun.sleep(3_000);
@@ -2680,11 +2683,11 @@ function probeLine(ctx: ImplementContext, probe: RecordedProbe | undefined): str
  if (ctx.map.commands.probe === undefined) return [];
  return probe === undefined
   ? ["- Probes: not recorded at this head."]
-  : [`- Probes: passed at \`${probe.sha.slice(0, 8)}\` (selection ${probe.mode}, ${probe.selected} probe(s)). Only the selected probes ran, not the full suite.${baseRedNote(probe)}`];
+  : [`- Probes: passed at \`${probe.sha.slice(0, 8)}\` (selection ${probe.mode}, ${probe.selected} probe(s)). Only the selected probes ran, not the full suite.${baseRedNote(ctx.map.repo, probe)}`];
 }
 
 /** The probes a passing record excuses because the merge base fails them too. */
-export function baseRedNote(probe: Pick<RecordedProbe, "baseRed" | "baseRedCache" | "baseRedUnconfirmed"> | undefined): string {
+export function baseRedNote(repo: string, probe: Pick<RecordedProbe, "baseRed" | "baseRedCache" | "baseRedUnconfirmed"> | undefined): string {
  const red = probe?.baseRed ?? [];
  const cache = probe?.baseRedCache;
  const confirmation = probe?.baseRedUnconfirmed;
@@ -2693,7 +2696,7 @@ export function baseRedNote(probe: Pick<RecordedProbe, "baseRed" | "baseRedCache
   ? ` Not gating: ${red.join(", ")} failed here and fail at the merge base too.`
   : ` Not gating: ${red.join(", ")} failed here; inheritance uses the first base comparison or confirmed cache.`) +
   (provenance === "" ? "" : ` ${provenance}.`) +
-  (confirmation === undefined ? "" : ` ${unconfirmedBaseNote(confirmation.sha, confirmation.probes, confirmation.exit)}`);
+  (confirmation === undefined ? "" : ` ${unconfirmedBaseNote(repo, confirmation.sha, confirmation.probes, confirmation.exit)}`);
 }
 
 export function readyBody(
@@ -2702,11 +2705,12 @@ export function readyBody(
  rounds: number,
  probe?: RecordedProbe,
 ): string {
+ const noun = changeRequestNoun(ctx.map.repo);
  const ratify = ctx.map.autoMerge
   ? `Ranger squash-merges this itself once the gate passes, unless the node is labelled \`${NEEDS_EYE_LABEL}\`; then the principal merges by hand.${ctx.ratify === "merge" ? " For this `propose` node the merge is the ratification." : ""} Ranger closes the node after the merge.`
   : ctx.ratify === "merge"
-   ? "This node is `propose`: **merging this PR is the ratification**. Ranger closes the node after the merge."
-   : "Ranger closes the node after the merge, through its declared probes and this PR's CI run.";
+   ? `This node is \`propose\`: **merging this ${noun} is the ratification**. Ranger closes the node after the merge.`
+   : `Ranger closes the node after the merge, through its declared probes and this ${noun}'s CI run.`;
  return [
   `Implements ${nodeLink(ctx)}: ${ctx.node.node.title}`,
   "",
@@ -2730,11 +2734,11 @@ export function closeResolution(
  const deferred =
   final === undefined || final.majors + final.nits === 0
    ? "None."
-   : `${final.blockers} blocker(s), ${final.majors} major(s) and ${final.nits} nit(s) from the last sage round are on the PR and not filed back yet (the Scribe, design §6, is a follow-up).`;
+   : `${final.blockers} blocker(s), ${final.majors} major(s) and ${final.nits} nit(s) from the last sage round are on the ${changeRequestNoun(ctx.map.repo)} and not filed back yet (the Scribe, design §6, is a follow-up).`;
  return [
-  `Implemented by ranger's implement lane in PR #${pr.iid} (${pr.webUrl || `https://github.com/${ctx.map.repo}/pull/${pr.iid}`}), merged by ${pr.mergedBy ?? "an unknown login"}${pr.mergeCommitSha === null ? "" : ` as ${pr.mergeCommitSha.slice(0, 8)}`}.`,
+  `Implemented by ranger's implement lane in ${changeRequestLabel(ctx.map.repo, pr.iid)} (${changeRequestUrl(ctx.map.repo, pr.iid, pr.webUrl)}), merged by ${pr.mergedBy ?? "an unknown login"}${pr.mergeCommitSha === null ? "" : ` as ${pr.mergeCommitSha.slice(0, 8)}`}.`,
   "",
-  `- Tests: ${testsReceipt(ctx.map.commands.test, "in the supervisor", recordedTestsBaseRed(ctx.journal, ctx.map.repo, ctx.node.ref.id))} CI check run "${ci.runName}" (${ci.runId}) succeeded on the PR head ${pr.headSha.slice(0, 8)}.`,
+  `- Tests: ${testsReceipt(ctx.map.commands.test, "in the supervisor", recordedTestsBaseRed(ctx.journal, ctx.map.repo, ctx.node.ref.id))} CI ${ciRunText(ctx.map.repo, ci, "receipt")} succeeded on the ${changeRequestNoun(ctx.map.repo)} head ${pr.headSha.slice(0, 8)}.`,
   final === undefined
    ? "- Sage: no recorded review round."
    : `- Sage: ${rounds} offline round(s); the last at ${final.sha.slice(0, 8)} found ${final.blockers} blockers, ${final.majors} majors, ${final.nits} nits (machine evidence).`,
@@ -2751,11 +2755,11 @@ export function closeResolution(
  */
 function ratificationText(ctx: ImplementContext, pr: ChangeRequest): string {
  return pr.mergedBy !== null && pr.mergedBy === principalLoginForRepo(ctx.config, ctx.map.repo)
-  ? `the principal merged PR #${pr.iid} (merge = ratification, #23 ruling)`
-  : `${pr.mergedBy ?? "ranger"} merged PR #${pr.iid} under the principal's standing grant (2026-10-03: ranger merges nodes that need no visual judgment)`;
+  ? `the principal merged ${changeRequestLabel(ctx.map.repo, pr.iid)} (merge = ratification, #23 ruling)`
+  : `${pr.mergedBy ?? "ranger"} merged ${changeRequestLabel(ctx.map.repo, pr.iid)} under the principal's standing grant (2026-10-03: ranger merges nodes that need no visual judgment)`;
 }
 
-export function gistLine(title: string, pr: number): string {
- const raw = `${title} — PR #${pr}`;
+export function gistLine(repo: string, title: string, pr: number): string {
+ const raw = `${title} — ${changeRequestLabel(repo, pr)}`;
  return raw.length > 140 ? `${raw.slice(0, 137)}…` : raw;
 }

@@ -1,4 +1,5 @@
 import { decodeForgeKey, isGithubRepo, nodeKey } from "./forge-ref.ts";
+import { changeRequestUrl } from "./forge-text.ts";
 import { lastImplementMaps, mapKey, implementMapOrder, readDrains } from "./maps.ts";
 /**
  * `ranger serve` (#37) — a local dashboard of the walk: the job a worker is on
@@ -1689,7 +1690,7 @@ export async function readPrLive(
  }
  return {
   number,
-  url: typeof raw.html_url === "string" ? raw.html_url : `https://github.com/${repo}/pull/${number}`,
+  url: changeRequestUrl(repo, number, typeof raw.html_url === "string" ? raw.html_url : undefined),
   state: raw.state === "closed" ? "closed" : "open",
   merged: raw.merged === true,
   draft: raw.draft === true,

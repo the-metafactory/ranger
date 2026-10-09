@@ -563,7 +563,7 @@ describe("failing probes lead the summary (node #107)", () => {
  });
 
  test("the park keeps its FAILED line and puts the kinds on their own line, after the merge-base line and ahead of the tail", () => {
-  const outcome = probesFailedOutcome({
+  const outcome = probesFailedOutcome({ repo: "acme/widgets",
    sha: SHA,
    pr: 3,
    exit: 1,
@@ -580,7 +580,7 @@ describe("failing probes lead the summary (node #107)", () => {
  });
 
  test("a long summary cannot push the merge-base line out of the 400 characters the row keeps", () => {
-  const outcome = probesFailedOutcome({
+  const outcome = probesFailedOutcome({ repo: "acme/widgets",
    sha: SHA,
    pr: 3,
    exit: 1,

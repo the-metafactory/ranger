@@ -118,12 +118,12 @@ describe("node #54 — the reason class, by ranger's own rules", () => {
  });
 
  test("review cap: the head-moved variant too", () => {
-  const r = row({ outcome: reviewCapHeadMovedOutcome({ rounds: 2, pr: 50 }) });
+  const r = row({ outcome: reviewCapHeadMovedOutcome({ repo: "acme/widgets", rounds: 2, pr: 50 }) });
   expect(classifyReason(r, [], null, 2).class).toBe("review cap");
  });
 
  test("review cap, head moved: the stop is the unreviewed head, never the earlier head's counts as current", () => {
-  const r = row({ outcome: reviewCapHeadMovedOutcome({ rounds: 5, pr: 687 }) });
+  const r = row({ outcome: reviewCapHeadMovedOutcome({ repo: "acme/widgets", rounds: 5, pr: 687 }) });
   const events = [ev("parked", r.outcome as string), ev("reviewed", "round 5 @ 4b2109fa: commented, 0 blocker(s), 0 major(s) on claude")];
   const reason = classifyReason(r, events, null, 5);
   expect(reason.class).toBe("review cap");
@@ -139,7 +139,7 @@ describe("node #54 — the reason class, by ranger's own rules", () => {
  });
 
  test("probes failed: the names from the run's FAILED: line, when the outcome kept it", () => {
-  const outcome = probesFailedOutcome({
+  const outcome = probesFailedOutcome({ repo: "acme/widgets",
    sha: "3c32cb24aa",
    pr: 686,
    exit: 1,
@@ -261,7 +261,7 @@ describe("node #54 — the reason class, by ranger's own rules", () => {
  });
 
  test("the builder and the classifier agree on the review-cap words", () => {
-  const outcome = reviewCapOutcome({ blockers: 1, majors: 2, round: 3, pr: 9 });
+  const outcome = reviewCapOutcome({ repo: "acme/widgets", blockers: 1, majors: 2, round: 3, pr: 9 });
   expect(classifyReason(row({ outcome }), [], null, 3).class).toBe("review cap");
  });
 });
