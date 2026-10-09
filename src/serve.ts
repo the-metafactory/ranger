@@ -59,6 +59,7 @@ import { Journal, type ResumeQueueRow, type WorkerRow } from "./journal.ts";
 import { ForeignMigrationError } from "./journal-guard.ts";
 import { IMPLEMENT_LANES, implementLane, workerLane, type ImplementLane } from "./lanes.ts";
 import { activeCooldown, readGraphqlBudget } from "./budget.ts";
+import { queueEntryGate } from "./resume.ts";
 import { cachedFrontier } from "./frontier-cache.ts";
 import { type FrontierEntry, graphFrontier, RateLimitError } from "./graph.ts";
 import { runCmd } from "./exec.ts";
@@ -79,9 +80,9 @@ import {
  type QueuedResumeView,
  resumeQueueViews,
  runAction,
- runDrainAction,
  uncheckedNeedsEye,
 } from "./serve-parked.ts";
+import { runDrainAction } from "./serve-drain.ts";
 
 export { childEnv };
 
@@ -204,11 +205,16 @@ export interface StateInputs {
  resumeQueue?: ResumeQueueRow[];
 }
 
-/** One lane's queued resumes, FIFO, and what the next tick does with the head. */
+/** One lane's queued resumes, FIFO, and what the next tick does with them. */
 export interface LaneQueue {
  entries: QueuedResumeView[];
- /** Null on an empty queue. `starts`: the next tick resumes the head ahead of any frontier claim. */
- head: { starts: boolean; reason: string } | null;
+ /**
+  * The entry the next tick reaches first; null when none is left to reach.
+  * `starts`: the tick resumes it ahead of any frontier claim.
+  */
+ head: { repo: string; nodeId: string; starts: boolean; reason: string } | null;
+ /** Entries the next tick drops from the queue; they hold nothing behind them. */
+ drops: { repo: string; nodeId: string; reason: string }[];
 }
 
 /** An awaiting-merge row that may need the principal's eye; its labels are unknown. */
@@ -357,7 +363,8 @@ interface TickSoFar {
  * starts before any map claims, taking the lane and one spawn, unless the
  * dead-man pause, a lane holder or the spent cap holds it. A drain does not:
  * it stops only fresh claims. Entries are visited in the journal's FIFO
- * order, so with one spawn left the earlier-queued head takes it.
+ * order, so with one spawn left the earlier-queued head takes it. Which
+ * entries drop, defer or wait behind is the walk's own `queueEntryGate`.
  */
 function planQueueHeads(
  queue: ResumeQueueRow[],
@@ -366,28 +373,34 @@ function planQueueHeads(
  tick: TickSoFar,
 ): Record<ImplementLane, LaneQueue> {
  const out = Object.fromEntries(
-  IMPLEMENT_LANES.map((lane) => [lane, { entries: views[lane], head: null }]),
+  IMPLEMENT_LANES.map((lane): [ImplementLane, LaneQueue] => [lane, { entries: views[lane], head: null, drops: [] }]),
  ) as Record<ImplementLane, LaneQueue>;
  for (const entry of queue) {
   const lane = out[entry.lane];
-  if (lane.head !== null) continue;
   const key = nodeKey(entry.repo, entry.root);
   const map = inputs.maps.find((m) => m.key === key && !m.servedOnly);
+  const row = inputs.workers.find((w) => w.repo === entry.repo && w.nodeId === entry.nodeId) ?? null;
+  const gate = queueEntryGate(entry, map, row, lane.head !== null);
+  if (gate?.kind === "behind") continue;
+  const at = { repo: entry.repo, nodeId: entry.nodeId };
+  if (gate?.kind === "drop") {
+   lane.drops.push({ ...at, reason: `the next tick drops it: ${gate.reason}` });
+   continue;
+  }
   const holder = tick.holders[entry.lane];
   const held =
-   map === undefined ? "its map is no longer registered: the tick holds it, and the lane's queue behind it"
-   : map.walk === "none" ? "its map is walk: none: the tick drops it"
+   gate !== null ? `the tick holds it, and the lane's queue behind it: ${gate.reason}`
    : inputs.paused ? "dead-man paused: queued resumes wait for `ranger resume-run`"
    : holder !== null ? `waits for the ${entry.lane} lane, held by #${holder.nodeId} (${holder.repo})`
    : tick.spawns >= inputs.spawnCap ? `waits: the daily spawn cap (${inputs.spawnCap}) is spent`
    : null;
   if (held !== null) {
-   lane.head = { starts: false, reason: held };
+   lane.head = { ...at, starts: false, reason: held };
    continue;
   }
   tick.holders[entry.lane] = { repo: key, nodeId: entry.nodeId, thisTick: true, resumed: true };
   tick.spawns += 1;
-  lane.head = { starts: true, reason: "the next tick resumes this, ahead of any frontier claim" };
+  lane.head = { ...at, starts: true, reason: "the next tick resumes this, ahead of any frontier claim" };
  }
  return out;
 }
@@ -1109,7 +1122,8 @@ async function pageVerb(path, body, label) {
  document.getElementById("out").textContent = "";
  try {
   const r = await post(path, body);
-  say(label + (r.ok ? " ran." : " failed (exit " + (r.code === null ? "none" : r.code) + "): nothing changed."), !r.ok);
+  // A null code is a verb that timed out or never started: it may have applied.
+  say(label + (r.ok ? " ran." : r.code === null ? " did not finish (timed out or could not start): it may have applied, so check the page once it reloads." : " failed (exit " + r.code + "): see its error."), !r.ok);
   if (!r.ok) document.getElementById("out").textContent = r.stderr || "";
  } catch (e) { say(label + " refused: " + e.message, true); }
  load(); setTimeout(load, 3000);
@@ -1133,8 +1147,10 @@ function laneQueue(s, lane) {
  if (!q || q.entries.length === 0) return null;
  return el("div", {}, el("span", { class: "reason", text: "Queued resumes, first in first out, ahead of any frontier claim:" }),
   el("ul", {}, ...q.entries.map((e, i) => {
-   const head = i === 0 ? q.head : null;
-   const facts = ordinal(e.position) + " in the " + lane + " resume queue · " + e.key + " · queued " + ago(e.queuedAt) + (e.failedStarts ? " · " + e.failedStarts + " failed start(s)" : "") + (head ? " · " + head.reason : "");
+   const head = q.head && q.head.repo === e.repo && q.head.nodeId === e.nodeId ? q.head : null;
+   const drop = (q.drops || []).find((d) => d.repo === e.repo && d.nodeId === e.nodeId);
+   const note = head ? head.reason : drop ? drop.reason : "";
+   const facts = ordinal(e.position) + " in the " + lane + " resume queue · " + e.key + " · queued " + ago(e.queuedAt) + (e.failedStarts ? " · " + e.failedStarts + " failed start(s)" : "") + (note ? " · " + note : "");
    // A queued node may have no Needs-you card, so its last cancel shows here.
    const last = results.get(e.key + "/" + e.nodeId);
    return el("li", {}, el("span", { class: "id", text: "#" + e.nodeId }), el("span", { class: "t" }, link(e.url, e.title || "(title not in the frontier read)"), el("span", { class: "reason", text: facts })),

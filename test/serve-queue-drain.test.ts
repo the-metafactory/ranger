@@ -64,13 +64,21 @@ const worker = (over: Partial<WorkerRow>): WorkerRow => ({
 });
 
 const MAPS = [map(GAME, "visual"), map(TOOL, "headless")];
+const postRequest = (path: string, body: unknown) =>
+ new Request(`http://127.0.0.1:${PORT}${path}`, {
+  method: "POST",
+  headers: { host: `127.0.0.1:${PORT}`, origin: `http://127.0.0.1:${PORT}`, "x-ranger-token": TOKEN, "content-type": "application/json" },
+  body: JSON.stringify(body),
+ });
+// Each queued node has its parked row, as resume-node --when-free requires.
 const inputs = (over: Partial<StateInputs> = {}): StateInputs => ({
+ workers: (over.resumeQueue ?? []).map((q) => worker({ repo: q.repo, nodeId: q.nodeId })),
  maps: MAPS,
  reports: new Map([
   [MAPS[0].key, read(GAME, [entry(GAME, "10"), entry(GAME, "11")])],
   [MAPS[1].key, read(TOOL, [entry(TOOL, "20")])],
  ]),
- titles: new Map(), workers: [], laneHolders: { visual: null, headless: null },
+ titles: new Map(), laneHolders: { visual: null, headless: null },
  paused: false, spawnsToday: 0, spawnCap: 10,
  vetoed: () => false, pidAlive: () => true, refreshing: false, refreshError: null, now: NOW,
  ...over,
@@ -83,7 +91,7 @@ describe("node #166 — the resume queue on the dashboard, and its head ahead of
   }));
   expect(state.resumeQueue.visual.entries.map((e) => [e.nodeId, e.position, e.key])).toEqual([["40", 1, `${GAME}#1`], ["41", 2, `${GAME}#1`]]);
   expect(state.resumeQueue.headless.entries.map((e) => [e.nodeId, e.position])).toEqual([["50", 1]]);
-  expect(state.resumeQueue.visual.head).toEqual({ starts: true, reason: expect.stringMatching(/ahead of any frontier claim/) });
+  expect(state.resumeQueue.visual.head).toEqual({ repo: GAME, nodeId: "40", starts: true, reason: expect.stringMatching(/ahead of any frontier claim/) });
   const [game, tool] = state.maps;
   expect(game.next).toMatchObject({ nodeId: "10", waiting: true, reason: `waits for the visual implement lane: this tick resumes queued #40 (${GAME}#1) first` });
   expect(tool.next).toMatchObject({ nodeId: "20", waiting: true, reason: expect.stringContaining("resumes queued #50") });
@@ -91,7 +99,7 @@ describe("node #166 — the resume queue on the dashboard, and its head ahead of
 
  test("an empty queue changes nothing: the frontier claim is next", () => {
   const state = assembleState(inputs());
-  expect(state.resumeQueue).toEqual({ visual: { entries: [], head: null }, headless: { entries: [], head: null } });
+  expect(state.resumeQueue).toEqual({ visual: { entries: [], head: null, drops: [] }, headless: { entries: [], head: null, drops: [] } });
   expect(state.maps[0].next).toMatchObject({ nodeId: "10", waiting: false });
  });
 
@@ -101,14 +109,14 @@ describe("node #166 — the resume queue on the dashboard, and its head ahead of
    laneHolders: { visual: holder, headless: null },
    resumeQueue: [queued(GAME, "40", "visual"), queued(TOOL, "50", "headless")],
   }));
-  expect(state.resumeQueue.visual.head).toEqual({ starts: false, reason: `waits for the visual lane, held by #60 (${GAME}#1)` });
+  expect(state.resumeQueue.visual.head).toMatchObject({ starts: false, reason: `waits for the visual lane, held by #60 (${GAME}#1)` });
   expect(state.resumeQueue.headless.head?.starts).toBe(true);
   expect(state.maps[0].next.reason).toContain("held by #60");
  });
 
  test("the dead-man pause holds every head", () => {
   const state = assembleState(inputs({ paused: true, resumeQueue: [queued(GAME, "40", "visual")] }));
-  expect(state.resumeQueue.visual.head).toEqual({ starts: false, reason: expect.stringMatching(/dead-man paused/) });
+  expect(state.resumeQueue.visual.head).toMatchObject({ starts: false, reason: expect.stringMatching(/dead-man paused/) });
  });
 
  test("a head takes a spawn: with one left, the earlier-queued head takes it and the rest wait on the cap", () => {
@@ -117,7 +125,7 @@ describe("node #166 — the resume queue on the dashboard, and its head ahead of
    resumeQueue: [queued(TOOL, "50", "headless"), queued(GAME, "40", "visual")],
   }));
   expect(state.resumeQueue.headless.head?.starts).toBe(true);
-  expect(state.resumeQueue.visual.head).toEqual({ starts: false, reason: expect.stringMatching(/daily spawn cap \(10\) is spent/) });
+  expect(state.resumeQueue.visual.head).toMatchObject({ starts: false, reason: expect.stringMatching(/daily spawn cap \(10\) is spent/) });
   expect(state.maps[0].next).toMatchObject({ reason: expect.stringMatching(/spent by earlier maps this tick/) });
  });
 
@@ -131,7 +139,34 @@ describe("node #166 — the resume queue on the dashboard, and its head ahead of
 
  test("a head whose map is no longer registered starts nothing and takes no lane", () => {
   const state = assembleState(inputs({ resumeQueue: [queued("acme/gone", "70", "visual")] }));
-  expect(state.resumeQueue.visual.head).toEqual({ starts: false, reason: expect.stringMatching(/no longer registered/) });
+  expect(state.resumeQueue.visual.head).toMatchObject({ starts: false, reason: expect.stringMatching(/no longer registered/) });
+  expect(state.maps[0].next).toMatchObject({ nodeId: "10", waiting: false });
+ });
+
+ test("a walk: none head is dropped, holds nothing, and the entry behind it is the head", () => {
+  const state = assembleState(inputs({
+   maps: [map(GAME, "visual", { walk: "none" }), map("acme/arcade", "visual"), MAPS[1]],
+   resumeQueue: [queued(GAME, "40", "visual"), queued("acme/arcade", "41", "visual")],
+  }));
+  expect(state.resumeQueue.visual.drops).toEqual([{ repo: GAME, nodeId: "40", reason: "the next tick drops it: map is walk: none" }]);
+  expect(state.resumeQueue.visual.head).toMatchObject({ repo: "acme/arcade", nodeId: "41", starts: true });
+ });
+
+ test("a head whose row went back to running is dropped, as the tick drops it", () => {
+  const state = assembleState(inputs({
+   resumeQueue: [queued(GAME, "40", "visual"), queued(GAME, "41", "visual")],
+   workers: [worker({ nodeId: "40", status: "running" }), worker({ nodeId: "41" })],
+  }));
+  expect(state.resumeQueue.visual.drops).toEqual([{ repo: GAME, nodeId: "40", reason: "the next tick drops it: worker row is running" }]);
+  expect(state.resumeQueue.visual.head).toMatchObject({ nodeId: "41", starts: true });
+ });
+
+ test("a head whose row is missing holds the lane's queue behind it", () => {
+  const state = assembleState(inputs({
+   resumeQueue: [queued(GAME, "40", "visual"), queued(GAME, "41", "visual")],
+   workers: [worker({ nodeId: "41" })],
+  }));
+  expect(state.resumeQueue.visual.head).toMatchObject({ nodeId: "40", starts: false, reason: expect.stringContaining("worker row is missing") });
   expect(state.maps[0].next).toMatchObject({ nodeId: "10", waiting: false });
  });
 });
@@ -185,12 +220,7 @@ describe("node #166 — queue resume and cancel on a Needs-you card", () => {
 });
 
 describe("node #166 — the action handlers run the CLI verbs, and refuse with nothing run", () => {
- const post = (path: string, body: unknown) =>
-  new Request(`http://127.0.0.1:${PORT}${path}`, {
-   method: "POST",
-   headers: { host: `127.0.0.1:${PORT}`, origin: `http://127.0.0.1:${PORT}`, "x-ranger-token": TOKEN, "content-type": "application/json" },
-   body: JSON.stringify(body),
-  });
+ const post = postRequest;
  const setup = (opts: { state?: Partial<StateInputs>; entries?: Partial<NeedsYouInputs>; code?: number; configPath?: string | null } = {}) => {
   const runs: { argv: string[]; env: Record<string, string>; detached: boolean }[] = [];
   const run: ActionRunner = async (argv, env, o) => {
@@ -352,11 +382,7 @@ function rig() {
   launch: () => { throw new Error("no launch"); }, verifyGrilling: async () => null,
   actions: { run, env, rangerBin: BIN, configPath, readPr: async () => null, exists: () => true },
  });
- const post = (path: string, body: unknown) => handler(new Request(`http://127.0.0.1:${PORT}${path}`, {
-  method: "POST",
-  headers: { host: `127.0.0.1:${PORT}`, origin: `http://127.0.0.1:${PORT}`, "x-ranger-token": TOKEN, "content-type": "application/json" },
-  body: JSON.stringify(body),
- }));
+ const post = (path: string, body: unknown) => handler(postRequest(path, body));
  const freeze = () => { frozen = state(); };
  return { config, journal, state, post, freeze, close() { journal.close(); discord.stop(); rmSync(dir, { recursive: true, force: true }); } };
 }

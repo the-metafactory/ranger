@@ -1,4 +1,4 @@
-import { decodeForgeKey, isGithubRepo, nodeKey } from "./forge-ref.ts";
+import { isGithubRepo, nodeKey } from "./forge-ref.ts";
 /**
  * `ranger serve`'s "Needs you" section (node #54): every journal worker row
  * that ended parked or failed, and every awaiting-merge row labelled
@@ -16,8 +16,8 @@ import { decodeForgeKey, isGithubRepo, nodeKey } from "./forge-ref.ts";
  * machine; nothing here checks which account that is), and a session opens
  * iTerm2 the way the grilling button does, in the map's `localCheckout` only:
  * the worker's worktree belongs to the machine-account clone. A queued resume
- * and its cancel run `ranger resume-node --when-free` / `--cancel`, and a
- * drain runs `ranger drain` (node #166). Every action is re-checked against the journal as it
+ * and its cancel run `ranger resume-node --when-free` / `--cancel` (node
+ * #166); the drain lives in serve-drain.ts. Every action is re-checked against the journal as it
  * reads when the request arrives, and the spawner is injected so no test runs
  * `gh`, `osascript` or ranger.
  */
@@ -25,6 +25,7 @@ import { classifyGithubCheckRuns } from "./github-ci.ts";
 import { REPO_PATTERN } from "./config.ts";
 import type { EventRow, ResumeQueueRow, WorkerRow } from "./journal.ts";
 import { startsImplementSession, type ImplementLane } from "./lanes.ts";
+import { whenFreeQueues } from "./resume.ts";
 import { childEnv, itermArgv, shellQuote } from "./launch.ts";
 import {
  CRASH_PARK_OUTCOME,
@@ -413,10 +414,9 @@ export function resumeQueueViews(
 }
 
 /**
- * Whether `resume-node --when-free` would queue this row, the verb's own
- * rule: an implement session, and its lane held or a queue already waiting
- * there. Anywhere else the verb starts the resume at once, so the button
- * would be a Resume under another name.
+ * Whether `resume-node --when-free` would queue this row, by the verb's own
+ * `whenFreeQueues`. Anywhere else the verb starts the resume at once, so the
+ * button would be a Resume under another name.
  */
 function queueOffer(
  row: WorkerRow,
@@ -428,9 +428,22 @@ function queueOffer(
  if (map.lane === undefined) return { offered: false, why: "the map's implement lane is unknown" };
  if (!startsImplementSession(row)) return { offered: false, why: "takes no implement lane: Resume starts it now" };
  const holder = inputs.laneHolders?.[map.lane] ?? null;
- const backlog = (inputs.resumeQueue ?? []).some((e) => e.lane === map.lane);
- if (holder === null && !backlog) return { offered: false, why: `the ${map.lane} lane is free: Resume starts it now` };
+ const lane = {
+  // The verb's lane read leaves the node itself out.
+  held: holder !== null && !(holder.repo === row.repo && holder.nodeId === row.nodeId),
+  queued: false,
+  backlog: (inputs.resumeQueue ?? []).filter((e) => e.lane === map.lane).length,
+ };
+ if (!whenFreeQueues(row, lane)) return { offered: false, why: `the ${map.lane} lane is free: Resume starts it now` };
  return { offered: true };
+}
+
+/** Each queued node's lane and FIFO place in it (1 = the head), by `repo#id`. */
+function queuePlaces(queue: ResumeQueueRow[]): Map<string, { lane: ImplementLane; position: number }> {
+ const places = new Map<string, { lane: ImplementLane; position: number }>();
+ const depth: Record<ImplementLane, number> = { visual: 0, headless: 0 };
+ for (const e of queue) places.set(nodeKey(e.repo, e.nodeId), { lane: e.lane, position: ++depth[e.lane] });
+ return places;
 }
 
 /** The rows that wait on the principal, newest first. */
@@ -455,7 +468,7 @@ function rowEntries(
  include: (row: WorkerRow, labels: string[] | null) => boolean,
 ): NeedsYouEntry[] {
  const out: NeedsYouEntry[] = [];
- const lanes = resumeQueueViews(inputs.resumeQueue ?? [], () => null);
+ const placeOf = queuePlaces(inputs.resumeQueue ?? []);
  for (const row of inputs.workers) {
   const map = inputs.maps.find((m) => m.repo === row.repo && m.root === row.root);
   if (map === undefined) continue;
@@ -470,7 +483,7 @@ function rowEntries(
   // worktree of the machine-account clone, whose files and git hooks the
   // worker controls (`servedMaps` refuses those clones for the same reason).
   const cwd = map.localCheckout !== undefined && inputs.exists(map.localCheckout) ? map.localCheckout : undefined;
-  const place = [...lanes.visual, ...lanes.headless].find((q) => q.repo === row.repo && q.nodeId === row.nodeId);
+  const place = placeOf.get(nodeKey(row.repo, row.nodeId));
   out.push({
    key: map.key,
    repo: row.repo,
@@ -493,7 +506,7 @@ function rowEntries(
    sage,
    sageOnHead: sage === null || view === null || view.headSha === "" ? null : view.headSha.startsWith(sage.sha),
    probe: lastProbe(events),
-   queued: place === undefined ? null : { lane: place.lane, position: place.position },
+   queued: place ?? null,
    actions: {
     resume: waiting,
     queueResume: waiting ? queueOffer(row, map, place !== undefined, inputs) : { offered: false, why: `#${row.nodeId} is ${row.status}, not parked or failed` },
@@ -617,23 +630,6 @@ export function resumeArgv(args: {
  ];
 }
 
-/** What a drain names: the visual lane (one machine-wide switch), or one headless map. */
-export type DrainTarget = { lane: "visual" } | { key: string };
-
-/** `ranger drain` (node #165), the operator verb; `off` lifts the drain. */
-export function drainArgv(args: { rangerBin: string; configPath: string; target: DrainTarget; off: boolean }): string[] {
- let selector: string[];
- if ("lane" in args.target) {
-  if (args.target.lane !== "visual") throw new Error(`bad lane: ${String(args.target.lane)}`);
-  selector = ["--lane", "visual"];
- } else {
-  const { repo } = decodeForgeKey(args.target.key);
-  if (!REPO_PATTERN.test(repo)) throw new Error(`bad map: ${args.target.key}`);
-  selector = ["--map", args.target.key];
- }
- return [args.rangerBin, "drain", ...selector, ...(args.off ? ["--off"] : []), "-c", args.configPath];
-}
-
 /**
  * The merge desk's own gate for one node, run before a dashboard merge of an
  * awaiting-merge row: the dashboard reads CI and mergeability, but not
@@ -724,7 +720,10 @@ export interface ActionResponse {
  exited?: Promise<void>;
 }
 
-const refusal = (status: number, error: string): ActionResponse => ({ status, body: { error } });
+export const refusal = (status: number, error: string): ActionResponse => ({ status, body: { error } });
+
+/** Serve has no config path to hand the verb. */
+export const noConfigPath = (what: string): ActionResponse => refusal(409, `serve was started without a config path to ${what} with`);
 
 const tailOf = (text: string): string => text.trim().slice(-1500);
 
@@ -746,24 +745,30 @@ export async function runAction(
   // A queued entry may outlive its row's parked state, so a cancel names the queue, not the card.
   const queued = deps.queue?.find((q) => q.key === body.key && q.nodeId === body.id);
   if (queued === undefined) return refusal(404, `#${body.id} has no queued resume on ${body.key}`);
-  return holding(deps, queued.repo, queued.nodeId, () => runCancel(queued, body, deps));
+  return holdingNode(deps, queued.repo, queued.nodeId, () => runCancel(queued, body, deps));
  }
  const entry = deps.entries.find((e) => e.key === body.key && e.nodeId === body.id);
  if (entry === undefined) {
   return refusal(404, `#${body.id} is not parked, failed or awaiting a merge on ${body.key}`);
  }
- return holding(deps, entry.repo, entry.nodeId, () => runHeldAction(kind, body, deps, entry));
+ return holdingNode(deps, entry.repo, entry.nodeId, () => runHeldAction(kind, body, deps, entry));
 }
 
-async function holding(
- deps: Pick<ActionDeps, "inFlight">,
- repo: string,
- nodeId: string,
+const holdingNode = (deps: Pick<ActionDeps, "inFlight">, repo: string, nodeId: string, act: () => Promise<ActionResponse>) =>
+ holding(deps.inFlight, nodeKey(repo, nodeId), `an action on #${nodeId} is already running: wait for it, then reload`, act);
+
+/**
+ * Runs `act` holding `held` in the server's in-flight set, or refuses with
+ * `busy` while another action holds it.
+ */
+export async function holding(
+ inFlight: Set<string>,
+ held: string,
+ busy: string,
  act: () => Promise<ActionResponse>,
 ): Promise<ActionResponse> {
- const held = nodeKey(repo, nodeId);
- if (deps.inFlight.has(held)) return refusal(409, `an action on #${nodeId} is already running: wait for it, then reload`);
- deps.inFlight.add(held);
+ if (inFlight.has(held)) return refusal(409, busy);
+ inFlight.add(held);
  let exited: Promise<void> | undefined;
  try {
   const response = await act();
@@ -772,13 +777,13 @@ async function holding(
  } finally {
   // Held until the child exits, not until the page is answered: a resume
   // that outlives the HTTP timeout must still refuse a second one.
-  if (exited === undefined) deps.inFlight.delete(held);
-  else void exited.finally(() => deps.inFlight.delete(held));
+  if (exited === undefined) inFlight.delete(held);
+  else void exited.finally(() => inFlight.delete(held));
  }
 }
 
 /** The page's view of a verb's exit: its code and the tail of its stderr. */
-const verbResult = (action: string, result: ActionResult, extra: Record<string, unknown> = {}): Record<string, unknown> => ({
+export const verbResult = (action: string, result: ActionResult, extra: Record<string, unknown> = {}): Record<string, unknown> => ({
  action,
  ...extra,
  ok: result.code === 0,
@@ -788,7 +793,7 @@ const verbResult = (action: string, result: ActionResult, extra: Record<string, 
 
 /** `resume-node <id> --cancel`: the verb drops the entry, or refuses and changes nothing. */
 async function runCancel(queued: QueuedResumeView, body: ActionBody, deps: ActionDeps): Promise<ActionResponse> {
- if (deps.configPath === undefined) return refusal(409, "serve was started without a config path to cancel with");
+ if (deps.configPath === undefined) return noConfigPath("cancel");
  const argv = resumeArgv({
   rangerBin: deps.rangerBin,
   configPath: deps.configPath,
@@ -798,64 +803,25 @@ async function runCancel(queued: QueuedResumeView, body: ActionBody, deps: Actio
   force: false,
   queue: "cancel",
  });
- const env = childEnv(deps.env);
- if (body.dryRun === true) return { status: 200, body: { dryRun: true, argv, envKeys: Object.keys(env).sort() } };
- const result = await deps.run(argv, env, { detached: false });
- return { status: 200, body: verbResult("cancel-resume", result, { nodeId: queued.nodeId }), exited: result.exited };
-}
-
-export interface DrainBody {
- lane?: unknown;
- key?: unknown;
- off?: unknown;
- dryRun?: unknown;
-}
-
-export interface DrainDeps {
- /** The maps as the dashboard reads them now. */
- maps: { key: string; lane: ImplementLane; servedOnly: boolean }[];
- run: ActionRunner;
- env: Record<string, string | undefined>;
- rangerBin: string;
- configPath: string | undefined;
- /** Drains with a verb running now, owned by the server. */
- inFlight: Set<string>;
+ return runVerb(argv, body.dryRun, deps, "cancel-resume", { nodeId: queued.nodeId });
 }
 
 /**
- * Drain or undrain (node #166): the visual lane as one switch, or one
- * headless map, by running `ranger drain`. A visual map has no drain of its
- * own, and a serve-only map is not ranger's to drain: both are refused here,
- * with nothing run, as the verb itself would refuse them.
+ * One operator verb for the page: a dry run answers with its argv and the
+ * env keys it would pass; otherwise it runs and answers with its exit.
  */
-export async function runDrainAction(body: DrainBody, deps: DrainDeps): Promise<ActionResponse> {
- if ((body.lane === undefined) === (body.key === undefined)) return refusal(400, "name exactly one of lane or key");
- let target: DrainTarget;
- if (body.lane !== undefined) {
-  if (body.lane !== "visual") return refusal(400, "only the visual lane drains as one switch; a headless map drains on its own");
-  target = { lane: "visual" };
- } else {
-  if (typeof body.key !== "string") return refusal(400, "key must be a string");
-  const map = deps.maps.find((m) => m.key === body.key);
-  if (map === undefined) return refusal(404, `no map ${body.key}`);
-  if (map.servedOnly) return refusal(409, `${map.key} is shown here only: ranger does not walk it, so there is nothing to drain`);
-  if (map.lane === "visual") return refusal(409, `${map.key} is on the visual lane, which drains as one switch for every visual map: use the visual lane's drain`);
-  target = { key: map.key };
- }
- if (deps.configPath === undefined) return refusal(409, "serve was started without a config path to drain with");
- const off = body.off === true;
- const argv = drainArgv({ rangerBin: deps.rangerBin, configPath: deps.configPath, target, off });
+export async function runVerb(
+ argv: string[],
+ dryRun: unknown,
+ deps: Pick<ActionDeps, "run" | "env">,
+ action: string,
+ extra: Record<string, unknown> = {},
+ detached = false,
+): Promise<ActionResponse> {
  const env = childEnv(deps.env);
- if (body.dryRun === true) return { status: 200, body: { dryRun: true, argv, envKeys: Object.keys(env).sort() } };
- const held = "lane" in target ? "drain:lane:visual" : `drain:map:${target.key}`;
- if (deps.inFlight.has(held)) return refusal(409, "a drain of this target is already running: wait for it, then reload");
- deps.inFlight.add(held);
- try {
-  const result = await deps.run(argv, env, { detached: false });
-  return { status: 200, body: verbResult("drain", result, { ...target, off }) };
- } finally {
-  deps.inFlight.delete(held);
- }
+ if (dryRun === true) return { status: 200, body: { dryRun: true, argv, envKeys: Object.keys(env).sort() } };
+ const result = await deps.run(argv, env, { detached });
+ return { status: 200, body: verbResult(action, result, extra), exited: result.exited };
 }
 
 async function runHeldAction(
@@ -884,7 +850,7 @@ async function runHeldAction(
   detached = true;
  } else if (kind === "queue-resume") {
   if (!entry.actions.queueResume.offered) return refusal(409, entry.actions.queueResume.why);
-  if (deps.configPath === undefined) return refusal(409, "serve was started without a config path to resume with");
+  if (deps.configPath === undefined) return noConfigPath("resume");
   argv = resumeArgv({
    rangerBin: deps.rangerBin,
    configPath: deps.configPath,

@@ -82,8 +82,11 @@ headless map (`--map`); a visual map shows no drain of its own. A parked or
 failed card offers "Queue resume" (`resume-node <id> --when-free`) where that
 verb would queue, and a queued node shows its place and a Cancel
 (`--cancel`). Each lane lists its queue FIFO, and a head the next tick starts
-shows as next, ahead of any frontier claim. A refused or failed verb shows its
-error, and changes nothing.
+shows as next, ahead of any frontier claim; an entry the tick will drop (a
+`walk: none` map, a row back in flight) shows why and holds nothing behind it.
+An action `serve` refuses (unknown map, no queued entry) shows its error and
+runs nothing. A verb that exits non-zero shows its exit and error. One that
+timed out or never started may already have applied, so reload the page to see.
 Plain and immediate operator resumes retain the hand-driven mode where a row
 is claimed without spawning; this mode cannot successfully start a queued resume.
 
