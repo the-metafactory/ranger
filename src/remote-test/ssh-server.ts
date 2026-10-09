@@ -195,11 +195,14 @@ async function receive(input: AsyncIterable<Uint8Array>, operatorConfig: unknown
  * implying a terminal test result. Transport interruption remains uncertain.
  * No private error details enter the response. */
 export async function serveSshResponse(input: AsyncIterable<Uint8Array>, config: unknown, options: SshServerOptions = {}): Promise<SshResponse | SshStageResponse> {
- let version = 1 as 1 | 2 | 3;
+ // Numbers legacy submit/status replies only; a stage reply is always V3.
+ let version = 1 as 1 | 2;
  const context: RefusalContext = { stage: "config", operation: null, job: null };
- try { return await receive(input, config, { ...options, onProtocolVersion: value => { version = value; options.onProtocolVersion?.(value); } }, context); }
+ try { return await receive(input, config, { ...options, onProtocolVersion: value => { if (value !== 3) version = value; options.onProtocolVersion?.(value); } }, context); }
  catch (e) {
-  if (isStateOutcome(e) && version !== 3) {
+  // A stage reply is never a receipt or test state, whatever its protocol version.
+  const staging = context.operation === "stage";
+  if (isStateOutcome(e) && !staging) {
    if (version === 1) return { version: 1, receipt: null };
    if (e instanceof RevokedRemoteTestJob) return { version: 2, receipt: e.receipt, state: "revoked" };
    if (e instanceof BusyRemoteTestExecutor) return { version: 2, receipt: null, state: "busy" };
@@ -210,7 +213,7 @@ export async function serveSshResponse(input: AsyncIterable<Uint8Array>, config:
    primary: context.primary ?? failureTag(e, context.stage),
    ...(context.primary && context.cleanup ? { cleanup: context.cleanup } : {}),
   }, context.jobsRoot);
-  if (version === 3) return { version, error: "receiver_failed" };
+  if (staging) return { version: 3, error: "receiver_failed" };
   return { version, error: e instanceof InvalidSshReceipt || e instanceof InvalidStoredRemoteTestReceipt ? "invalid_receipt" : "receiver_failed" };
  }
 }

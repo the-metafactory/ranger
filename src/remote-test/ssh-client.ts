@@ -8,7 +8,7 @@ import { pipeline } from "node:stream/promises";
 import { z } from "zod";
 import { killProcessGroup } from "../exec.ts";
 import { isPrivateDirectory, privateOperatorPath, shellQuote } from "./baseline.ts";
-import { validateProfileManifest, validateRemoteTestJob, validateRemoteTestReceipt, type RemoteTestJob, type RemoteTestReceipt } from "./contract.ts";
+import { sha256Reference, validateProfileManifest, validateRemoteTestJob, validateRemoteTestReceipt, type RemoteTestJob, type RemoteTestReceipt } from "./contract.ts";
 import { stageSource } from "./source.ts";
 import { SSH_LIMITS, SshResponseSchema, SshStageResponseSchema } from "./ssh-protocol.ts";
 
@@ -124,7 +124,7 @@ async function readBundleSnapshot(path: string, digest: string): Promise<Buffer>
   let offset = 0;
   while (offset < bundle.length) { const r = await file.read(bundle, offset, bundle.length - offset, null); if (!r.bytesRead) throw Error("Bundle changed during upload"); offset += r.bytesRead; }
   const extra = Buffer.alloc(1); if ((await file.read(extra, 0, 1, null)).bytesRead) throw Error("Bundle changed during upload");
-  if (`sha256:${createHash("sha256").update(bundle).digest("hex")}` !== digest) throw Error("Bundle digest does not match job");
+  if (sha256Reference(createHash("sha256").update(bundle)) !== digest) throw Error("Bundle digest does not match job");
   return bundle;
  } finally { await file.close(); }
 }

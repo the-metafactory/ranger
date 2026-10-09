@@ -5,8 +5,8 @@ import { lstat, mkdir, open, readdir, realpath, rename, rm } from "node:fs/promi
 import { join } from "node:path";
 import { z } from "zod";
 import { ArtifactPolicySchema } from "./artifacts.ts";
-import { isPrivateDirectory } from "./baseline.ts";
-import { Sha256Schema, validateRemoteTestJob, type RemoteTestJob } from "./contract.ts";
+import { isOperatorPrivate, isPrivateDirectory } from "./baseline.ts";
+import { Sha256Schema, sha256Reference, validateRemoteTestJob, type RemoteTestJob } from "./contract.ts";
 import { validateExecutorConfig } from "./executor.ts";
 import { TaggedReceiverFailure } from "./receiver-diagnostics.ts";
 import { restoreSource, SourceError } from "./source.ts";
@@ -82,7 +82,7 @@ async function size(path: string): Promise<number> {
 async function openPrivateFile(path: string, limit: number) {
  const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
  const info = await file.stat().catch(async e => { await file.close(); throw e; });
- if (!info.isFile() || info.uid !== process.getuid?.() || (info.mode & 0o077) || info.nlink !== 1 || info.size > limit) {
+ if (!info.isFile() || !isOperatorPrivate(info) || info.nlink !== 1 || info.size > limit) {
   await file.close(); throw new StagedSourceRefusal("unsafe_path", "Unsafe staged source file");
  }
  return { file, size: info.size };
@@ -107,7 +107,7 @@ async function verifyObject(directory: string, digest: string): Promise<Referenc
   if (bytes !== reference.bundleBytes) throw new StagedSourceRefusal("stage_conflict", "Stored source size mismatch");
   const hash = createHash("sha256"), buffer = Buffer.alloc(64 * 1024); let total = 0;
   for (;;) { const { bytesRead } = await file.read(buffer, 0, buffer.length, null); if (!bytesRead) break; total += bytesRead; hash.update(buffer.subarray(0, bytesRead)); }
-  if (total !== reference.bundleBytes || `sha256:${hash.digest("hex")}` !== digest) throw new StagedSourceRefusal("stage_conflict", "Stored source bytes mismatch");
+  if (total !== reference.bundleBytes || sha256Reference(hash) !== digest) throw new StagedSourceRefusal("stage_conflict", "Stored source bytes mismatch");
  } finally { await file.close(); }
  return reference;
 }
@@ -152,7 +152,7 @@ async function writePendingBundle(bundlePath: string, input: { job: RemoteTestJo
    while (offset < bytes.byteLength) { const { bytesWritten } = await file.write(bytes, offset, bytes.byteLength - offset, null); if (!bytesWritten) throw new StagedSourceRefusal("upload_no_progress", "Stage upload made no progress"); offset += bytesWritten; }
   }
   if (count !== input.declaredBytes) throw new StagedSourceRefusal("upload_size", "Truncated stage upload");
-  if (`sha256:${hash.digest("hex")}` !== input.job.bundleDigest) throw new StagedSourceRefusal("upload_digest", "Stage upload digest mismatch");
+  if (sha256Reference(hash) !== input.job.bundleDigest) throw new StagedSourceRefusal("upload_digest", "Stage upload digest mismatch");
   await options.fault?.("file-sync"); await file.sync();
  } finally { await file.close(); }
  return count;
@@ -250,8 +250,10 @@ export async function receiveStagedSource(
  input: { jobsRoot: string; job: RemoteTestJob; declaredBytes: number; chunks: AsyncIterable<Uint8Array>; policy?: unknown },
  options: StageStoreOptions = {},
 ): Promise<StagedSourceReference> {
- // The executor's artifact policy (seven days, 10 GiB by default) also bounds
- // this store, applied separately from the receipt/log store.
+ // The executor's artifact policy (seven days, 10 GiB by default), applied
+ // separately from the receipt/log store, bounds what is counted at
+ // publication. This stage's own upload and validation checkout are transient
+ // and uncounted until then.
  const policy = ArtifactPolicySchema.parse(input.policy ?? {}), now = options.now ?? Date.now, job = input.job;
  if (!Number.isSafeInteger(input.declaredBytes) || input.declaredBytes < 1 || input.declaredBytes > SSH_LIMITS.bundleBytes) throw new StagedSourceRefusal("upload_size", "Declared source size out of bounds");
  if (job.deadline <= now()) throw new StagedSourceRefusal("expired", "Stage request deadline expired");

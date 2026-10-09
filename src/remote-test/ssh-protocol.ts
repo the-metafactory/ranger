@@ -6,7 +6,8 @@ export const SSH_LIMITS = { bundleBytes: 64 * 1024 ** 2, responseBytes: 65_536, 
 export const SshRequestSchema = z.discriminatedUnion("operation", [
  z.object({ version: z.union([z.literal(1), z.literal(2)]), operation: z.literal("submit"), job: z.unknown(), bundleBytes: z.number().int().min(1).max(SSH_LIMITS.bundleBytes) }).strict(),
  z.object({ version: z.union([z.literal(1), z.literal(2)]), operation: z.literal("status"), job: z.unknown() }).strict(),
- // Additive V3: stage-only source transfer. V1/V2 never carry it, and V3 carries nothing else.
+ // Additive V3: V1/V2 never carry `stage`; V3 currently admits only `stage`. The
+ // receiver keys reply shapes on the operation, so later V3 operations stay additive.
  z.object({ version: z.literal(3), operation: z.literal("stage"), job: z.unknown(), bundleBytes: z.number().int().min(1).max(SSH_LIMITS.bundleBytes) }).strict(),
 ]);
 export const SshResponseSchema = z.union([
