@@ -5,7 +5,7 @@ import { mapKey } from "./maps.ts";
 import { EscalationDiscord, DiscordMessageGoneError } from "./discord.ts";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import type { Journal, EscalationRow } from "./journal.ts";
-import { briefHoldReason, ESCALATE_REASONS, type ClassifiedNode } from "./route.ts";
+import { briefHoldReason, ESCALATE_REASONS, type ClassifiedNode, type EscalateReason } from "./route.ts";
 import { LeaseLostError, withEscalateLock, type OwnedCheck } from "./lock.ts";
 import { assertReadOnlyToken, type ResolvedToken } from "./token-gate.ts";
 import type { NodeResult } from "./graph.ts";
@@ -47,19 +47,34 @@ const CARD_HEADS: Record<string, string> = {
   "brief-not-ready": "📝 **Build brief not ready**",
 };
 
-function cardHead(node: ClassifiedNode): string {
-  if (node.route.route === "provisioning") return CARD_HEADS.provisioning;
-  if (node.route.route === "brief-not-ready") return CARD_HEADS["brief-not-ready"];
-  if (node.route.route === "escalate-hitl") {
-    if (node.kind === "grilling") return CARD_HEADS.grilling;
-    if (node.kind === "prototype") return CARD_HEADS.prototype;
-    if (node.route.reason === "untyped") return CARD_HEADS.untyped;
-    if (node.route.reason === "hitl-kind-as-auto")
-      return CARD_HEADS["hitl-kind-as-auto"];
-    if (node.autonomy === "approve") return CARD_HEADS.approve;
-    return CARD_HEADS.propose;
+function hitlHead(node: ClassifiedNode, reason: EscalateReason): string {
+  if (node.kind === "grilling") return CARD_HEADS.grilling;
+  if (node.kind === "prototype") return CARD_HEADS.prototype;
+  if (reason === "untyped") return CARD_HEADS.untyped;
+  if (reason === "hitl-kind-as-auto") return CARD_HEADS["hitl-kind-as-auto"];
+  if (node.autonomy === "approve") return CARD_HEADS.approve;
+  return CARD_HEADS.propose;
+}
+
+const REGISTRY_BLOCKED = "auto node with registry-blocked probes — provisioning needed";
+
+/** Per-route card data in one place: the head, the reason line, and the journal row's reason. */
+function cardSpec(node: ClassifiedNode): { head: string; reason: string; journalReason: string } {
+  const route = node.route;
+  switch (route.route) {
+    case "escalate-hitl":
+      return { head: hitlHead(node, route.reason), reason: ESCALATE_REASONS[route.reason], journalReason: route.reason };
+    case "provisioning":
+      return { head: CARD_HEADS.provisioning, reason: REGISTRY_BLOCKED, journalReason: "registry-blocked" };
+    case "brief-not-ready":
+      return {
+        head: CARD_HEADS["brief-not-ready"],
+        reason: `${briefHoldReason(route.missing)} — ranger will not take it until soma's graph audit no longer lists it`,
+        journalReason: "brief-not-ready",
+      };
+    default:
+      return { head: "ℹ️", reason: REGISTRY_BLOCKED, journalReason: "registry-blocked" };
   }
-  return "ℹ️";
 }
 
 /** Age band (design §5): shown from day 1, louder at 3+, @-mention at 7+. */
@@ -137,13 +152,8 @@ function cardFraming(
   prefixLines: string[];
   probeLines: string[];
 } {
-  const reason = sanitizeGraphText(
-    node.route.route === "escalate-hitl"
-      ? ESCALATE_REASONS[node.route.reason]
-      : node.route.route === "brief-not-ready"
-        ? `${briefHoldReason(node.route.missing)} — ranger will not take it until soma's graph audit no longer lists it`
-        : "auto node with registry-blocked probes — provisioning needed",
-  );
+  const spec = cardSpec(node);
+  const reason = sanitizeGraphText(spec.reason);
   const probeLines =
     node.route.route === "provisioning" && node.blockedProbes !== undefined
       ? [
@@ -164,7 +174,7 @@ function cardFraming(
     // Every graph-derived interpolation is mention-inerted (a graph author
     // can set kind/autonomy/title/url to `<@principal-id>`), and the title
     // is capped so a giant title can't evict the decision body or the suffix.
-    `${cardHead(node)} — **#${sanitizeGraphText(node.id)}** ${truncate(sanitizeGraphText(node.title), 200)}`,
+    `${spec.head} — **#${sanitizeGraphText(node.id)}** ${truncate(sanitizeGraphText(node.title), 200)}`,
     `map: ${mapKey(map)} · ${sanitizeGraphText(node.kind)} · ${sanitizeGraphText(node.autonomy)}`,
     `url: ${sanitizeGraphText(node.url)}`,
     node.checkpointId !== undefined && node.checkpointId.length > 0
@@ -1041,12 +1051,7 @@ function cardFrom(
     url: node.url,
     checkpointId: node.checkpointId,
     route: node.route.route,
-    reason:
-      node.route.route === "escalate-hitl"
-        ? node.route.reason
-        : node.route.route === "brief-not-ready"
-          ? "brief-not-ready"
-          : "registry-blocked",
+    reason: cardSpec(node).journalReason,
     ageDays,
     status: "open",
     createdAt: row.createdAt,

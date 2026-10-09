@@ -103,6 +103,15 @@ export interface BuildBriefNotReady {
   missing: string[];
 }
 
+/**
+ * Soma's build-brief-not-ready finding for one frontier read. `ok: false`
+ * when the audit could not be read: the walk then holds every build node
+ * (src/route.ts). A soma without the field reads as `ok` with none listed.
+ */
+export type BriefAudit =
+  | { ok: true; notReady: BuildBriefNotReady[] }
+  | { ok: false; error: string };
+
 export interface NodeResult {
   repo: string;
   ref: { id: string };

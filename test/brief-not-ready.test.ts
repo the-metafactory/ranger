@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { planTick } from "../src/candidates.ts";
-import { readFrontier } from "../src/frontier-cache.ts";
+import { cachedFrontier, readFrontier } from "../src/frontier-cache.ts";
 import { graphAudit, GraphError } from "../src/graph.ts";
 import { Journal } from "../src/journal.ts";
 import { classifyFrontier } from "../src/route.ts";
@@ -71,14 +71,27 @@ const MISSING_21 = { id: "21", missing: ["## Acceptance criteria", "[NEEDS CLARI
 describe("the tick planner holds a build node soma's audit reports not ready", () => {
   let dir: string;
   let journal: Journal;
+  let calls: string;
   const saved: Record<string, string | undefined> = {};
-  const KEYS = ["PATH", "FAKE_SOMA_DIR"];
+  const KEYS = [
+    "PATH",
+    "FAKE_SOMA_DIR",
+    "FAKE_SOMA_CALLS",
+    "FAKE_SOMA_AUDIT_FAIL",
+    "FAKE_GH_EVENTS_LATEST",
+    "FAKE_GH_ISSUES_UPDATED",
+    "FAKE_GH_GRAPHQL_REMAINING",
+  ];
 
   beforeEach(() => {
     for (const k of KEYS) saved[k] = process.env[k];
+    for (const k of KEYS) delete process.env[k];
     dir = mkdtempSync(join(tmpdir(), "ranger-brief-"));
+    calls = join(dir, "soma-calls.log");
+    writeFileSync(calls, "");
     process.env.PATH = `${fixturesBin}:${saved.PATH ?? ""}`;
     process.env.FAKE_SOMA_DIR = dir;
+    process.env.FAKE_SOMA_CALLS = calls;
     journal = new Journal(join(dir, "state.sqlite"));
     writeFrontier(dir);
   });
@@ -101,6 +114,18 @@ describe("the tick planner holds a build node soma's audit reports not ready", (
     return { read, classified, plan: planTick(classified, { laneBusy, vetoed: () => false }) };
   };
   const ids = (nodes: { id: string }[]) => nodes.map((n) => n.id);
+  /** How many times the fake soma ran one verb. */
+  const somaCalls = (verb: string) =>
+    readFileSync(calls, "utf8").split("\n").filter((l) => l.startsWith(`${verb} `)).length;
+  /**
+   * The fake gh's issue-event half of the sentinel is a checksum of the
+   * fixtures, so rewriting one reads as a graph change. Pinning it leaves
+   * the sentinel to `updated_at` (FAKE_GH_ISSUES_UPDATED), which a body
+   * edit on GitHub bumps.
+   */
+  const pinEvents = () => {
+    process.env.FAKE_GH_EVENTS_LATEST = "1000";
+  };
 
   test("a listed build node is not claimed and not counted as taken: the next build node is", async () => {
     writeAudit(dir, [MISSING_21]);
@@ -113,10 +138,17 @@ describe("the tick planner holds a build node soma's audit reports not ready", (
   });
 
   test("once the body is fixed and the audit no longer lists it, the node is claimable", async () => {
+    pinEvents();
     writeAudit(dir, [MISSING_21]);
     expect(ids((await plan()).plan.take)).not.toContain("21");
-    // The fix changes the graph, so the sentinel moves and the tick re-reads.
+    // Soma's verdict changes, but the sentinel has not moved: the cached
+    // read, and its hold, stand.
     writeAudit(dir, []);
+    const unchanged = await plan();
+    expect(unchanged.read.source).toBe("cache");
+    expect(ids(unchanged.plan.take)).not.toContain("21");
+    // The body edit bumps the issue's updated_at, so the tick re-reads both.
+    process.env.FAKE_GH_ISSUES_UPDATED = "2026-01-02T00:00:00Z";
     const { read, plan: p } = await plan();
     expect(read.source).toBe("fresh");
     expect(ids(p.take)).toEqual(["21", "24"]);
@@ -147,13 +179,52 @@ describe("the tick planner holds a build node soma's audit reports not ready", (
     expect(classified).toEqual(without);
   });
 
-  test("an unreadable or malformed audit holds build nodes only, and is not cached", async () => {
-    writeAudit(dir, [{ id: 21, missing: "## Deliverable" }]);
-    const { read, plan: p } = await plan();
-    expect(read.briefs.ok).toBe(false);
+  test("an unreadable audit (soma fails) holds build nodes only", async () => {
+    writeAudit(dir, [MISSING_21]);
+    process.env.FAKE_SOMA_AUDIT_FAIL = "1";
+    const { read, classified, plan: p } = await plan();
+    expect(read.briefs).toEqual({ ok: false, error: expect.stringContaining("audit failed") });
+    expect(classified.find((n) => n.id === "22")?.route).toEqual({ route: "brief-not-ready", missing: null });
     // Both build nodes wait; the task node takes the implement slot.
     expect(ids(p.take)).toEqual(["23", "24"]);
-    expect((await plan()).read.source).toBe("fresh");
+  });
+
+  test("a malformed audit is cached as failed: the next tick keeps the frontier and re-runs only the audit", async () => {
+    pinEvents();
+    writeAudit(dir, [{ id: 21, missing: "## Deliverable" }]);
+    const first = await plan();
+    expect(first.read.source).toBe("fresh");
+    expect(first.read.briefs.ok).toBe(false);
+    expect(ids(first.plan.take)).toEqual(["23", "24"]);
+    // The dashboard's journal read shows the hold, not a pre-failure frontier.
+    expect(cachedFrontier(journal, REPO, 1)?.briefs?.ok).toBe(false);
+
+    const second = await plan();
+    expect(second.read.source).toBe("cache");
+    expect(second.read.briefs.ok).toBe(false);
+    expect(somaCalls("frontier")).toBe(1);
+    expect(somaCalls("audit")).toBe(2);
+
+    // Once the audit reads, the hold follows its finding; still one frontier read.
+    writeAudit(dir, [MISSING_21]);
+    const third = await plan();
+    expect(third.read.source).toBe("cache");
+    expect(third.read.briefs).toEqual({ ok: true, notReady: [MISSING_21] });
+    expect(ids(third.plan.take)).toEqual(["22", "24"]);
+    expect(somaCalls("frontier")).toBe(1);
+    expect(cachedFrontier(journal, REPO, 1)?.briefs).toEqual({ ok: true, notReady: [MISSING_21] });
+  });
+
+  test("an audit deferred under the floor holds build nodes and still serves the cached frontier", async () => {
+    pinEvents();
+    writeAudit(dir, [{ id: 21, missing: "## Deliverable" }]);
+    await plan();
+    process.env.FAKE_GH_GRAPHQL_REMAINING = "10";
+    const { read, plan: p } = await plan();
+    expect(read.source).toBe("cache");
+    expect(read.briefs.ok).toBe(false);
+    expect(ids(p.take)).toEqual(["23", "24"]);
+    expect(somaCalls("audit")).toBe(1);
   });
 });
 
@@ -176,29 +247,53 @@ describe("graphAudit parses soma#753's buildBriefNotReady", () => {
   });
 });
 
+/**
+ * One CLI run's rig: temp state and fixture dirs, the fake Discord, the env
+ * that points ranger at both, and a `config` writer that walks the map in
+ * full. Torn down whatever the test does.
+ */
+async function withCliRig(
+  run: (rig: {
+    dir: string;
+    fixtures: string;
+    env: NodeJS.ProcessEnv;
+    discord: ReturnType<typeof fakeDiscord>;
+    config: (lines: string[]) => string;
+  }) => Promise<void>,
+): Promise<void> {
+  const dir = mkdtempSync(join(tmpdir(), "ranger-brief-cli-"));
+  const fixtures = mkdtempSync(join(tmpdir(), "ranger-brief-cli-fx-"));
+  const discord = fakeDiscord();
+  try {
+    writeFrontier(fixtures);
+    writeAudit(fixtures, [MISSING_21]);
+    const env = {
+      ...process.env,
+      PATH: `${fixturesBin}:${process.env.PATH ?? ""}`,
+      FAKE_SOMA_DIR: fixtures,
+      RANGER_DISCORD_API_BASE: `http://127.0.0.1:${discord.port}`,
+      RANGER_DISCORD_ALLOW_TEST_OVERRIDE: "1",
+      RANGER_DISCORD_MIN_INTERVAL_MS: "5",
+      RANGER_DISCORD_TOKEN: "fake-bot-token",
+    };
+    const config = (lines: string[]) => {
+      const path = join(dir, "ranger.yaml");
+      writeFileSync(path, lines.join("\n").replace("walk: research-only", "walk: full"));
+      return path;
+    };
+    await run({ dir, fixtures, env, discord, config });
+  } finally {
+    discord.stop();
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(fixtures, { recursive: true, force: true });
+  }
+}
+
 describe("the escalation desk cards a not-ready build brief", () => {
-  test("one card names the missing items; a second tick does not repost; a fixed brief leaves the queue", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "ranger-brief-desk-"));
-    const fixtures = mkdtempSync(join(tmpdir(), "ranger-brief-desk-fx-"));
-    const discord = fakeDiscord();
-    try {
-      writeFrontier(fixtures);
-      writeAudit(fixtures, [MISSING_21]);
-      const config = join(dir, "ranger.yaml");
-      writeFileSync(
-        config,
-        [...baseConfigLines(dir), "principal:", "  login: jcfischer"].join("\n").replace("walk: research-only", "walk: full"),
-      );
-      const env = {
-        ...process.env,
-        PATH: `${fixturesBin}:${process.env.PATH ?? ""}`,
-        FAKE_SOMA_DIR: fixtures,
-        RANGER_DISCORD_API_BASE: `http://127.0.0.1:${discord.port}`,
-        RANGER_DISCORD_ALLOW_TEST_OVERRIDE: "1",
-        RANGER_DISCORD_MIN_INTERVAL_MS: "5",
-        RANGER_DISCORD_TOKEN: "fake-bot-token",
-        RANGER_RO_TEST: "ghp_ro",
-      };
+  test("one card names the missing items; a second tick does not repost; a fixed brief leaves the queue", () =>
+    withCliRig(async ({ dir, fixtures, env: rigEnv, discord, config: writeConfig }) => {
+      const config = writeConfig([...baseConfigLines(dir), "principal:", "  login: jcfischer"]);
+      const env = { ...rigEnv, RANGER_RO_TEST: "ghp_ro" };
       const escalate = async () => {
         const run = await runCli(["escalate", "-c", config, "--json"], env);
         expect(run.code).toBe(0);
@@ -236,42 +331,19 @@ describe("the escalation desk cards a not-ready build brief", () => {
       expect(fixed.posted).toEqual([]);
       expect(fixed.keptOpen).toEqual(["21"]);
       expect(discord.posts).toHaveLength(1);
-    } finally {
-      discord.stop();
-      rmSync(dir, { recursive: true, force: true });
-      rmSync(fixtures, { recursive: true, force: true });
-    }
-  });
+    }));
 });
 
-
 describe("ranger walk never claims a held build node", () => {
-  test("the tick claims the next build node and leaves the listed one unassigned", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "ranger-brief-walk-"));
-    const fixtures = mkdtempSync(join(tmpdir(), "ranger-brief-walk-fx-"));
-    const discord = fakeDiscord();
-    try {
-      writeFrontier(fixtures);
-      writeAudit(fixtures, [MISSING_21]);
+  test("the tick claims the next build node and leaves the listed one unassigned", () =>
+    withCliRig(async ({ dir, env, config: writeConfig }) => {
       const node = { autonomy: "auto", assignees: [], status: "open", probes: [] };
       const statePath = join(dir, "state.json");
       writeFileSync(statePath, JSON.stringify({ nodes: { "21": { ...node, checkpoint: "cp-21" }, "22": { ...node, checkpoint: "cp-22" } }, decisions: [] }));
-      const config = join(dir, "ranger.yaml");
-      writeFileSync(
-        config,
-        baseConfigLines(dir, { auth: ["  writeTokens:", '    "acme/*": RANGER_WRITE_TEST'] })
-          .join("\n")
-          .replace("walk: research-only", "walk: full"),
-      );
+      const config = writeConfig(baseConfigLines(dir, { auth: ["  writeTokens:", '    "acme/*": RANGER_WRITE_TEST'] }));
       const run = await runCli(["walk", "-c", config], {
-        ...process.env,
-        PATH: `${fixturesBin}:${process.env.PATH ?? ""}`,
-        FAKE_SOMA_DIR: fixtures,
+        ...env,
         FAKE_SOMA_STATE: statePath,
-        RANGER_DISCORD_API_BASE: `http://127.0.0.1:${discord.port}`,
-        RANGER_DISCORD_ALLOW_TEST_OVERRIDE: "1",
-        RANGER_DISCORD_MIN_INTERVAL_MS: "5",
-        RANGER_DISCORD_TOKEN: "fake-bot-token",
         RANGER_WRITE_TEST: "ghp_write",
         RANGER_NO_SPAWN: "1",
       });
@@ -279,10 +351,5 @@ describe("ranger walk never claims a held build node", () => {
       const state = JSON.parse(readFileSync(statePath, "utf8")) as { nodes: Record<string, { assignees: string[] }> };
       expect(state.nodes["21"]!.assignees).toEqual([]);
       expect(state.nodes["22"]!.assignees).toEqual(["ivy-bot"]);
-    } finally {
-      discord.stop();
-      rmSync(dir, { recursive: true, force: true });
-      rmSync(fixtures, { recursive: true, force: true });
-    }
-  });
+    }));
 });

@@ -1,12 +1,12 @@
 import { encodeForgeRef, parseForgeRef, isGithubRepo } from "./forge-ref.ts";
 import {
   type BudgetPolicy,
-  BudgetDeferral,
   assertNotThrottled,
   budgetedRead,
 } from "./budget.ts";
 import { runCmd } from "./exec.ts";
 import {
+  type BriefAudit,
   type BuildBriefNotReady,
   type FrontierResult,
   GRAPH_CALL_TIMEOUT_MS,
@@ -49,25 +49,37 @@ import { gatedEnv, type ResolvedToken } from "./token-gate.ts";
  * A fresh read also reads `soma graph audit` for its build-brief-not-ready
  * finding (node #154, soma#752 D4: soma's audit is the only definition), and
  * caches it beside the frontier under the same sentinel: a body fixed on the
- * graph bumps `updated_at`, so the next tick re-reads both.
+ * graph bumps `updated_at`, so the next tick re-reads both. A failed audit is
+ * cached as failed: a sentinel hit then serves the cached frontier and re-runs
+ * only the audit, so a soma whose audit keeps failing costs no frontier read.
+ * What the sentinel cannot see (an upgraded soma that newly lists a node, a
+ * changed readiness rule) waits for the max age, like any other blind spot.
  */
 
 interface CachedFrontier {
   sentinel: string;
   fetchedAt: string;
   frontier: FrontierResult;
-  /** The audit's finding at that read; absent in entries cached before node #154. */
+  /** The audit's finding at that read; absent when it failed, and in entries cached before node #154. */
   briefs?: BuildBriefNotReady[];
+  /** Why the audit at that read failed. */
+  briefsError?: string;
 }
 
-/**
- * Soma's build-brief-not-ready finding for one frontier read. `ok: false`
- * when the audit could not be read: the walk then holds every build node
- * (src/route.ts). A soma without the field reads as `ok` with none listed.
- */
-export type BriefAudit =
-  | { ok: true; notReady: BuildBriefNotReady[] }
-  | { ok: false; error: string };
+/** A cached entry's audit; undefined for an entry cached before node #154. */
+function cachedBriefs(cached: CachedFrontier): BriefAudit | undefined {
+  if (cached.briefs !== undefined) return { ok: true, notReady: cached.briefs };
+  if (cached.briefsError !== undefined) return { ok: false, error: cached.briefsError };
+  return undefined;
+}
+
+function writeCache(journal: Journal, repo: string, root: number, entry: CachedFrontier): void {
+  journal.setHealth(frontierCacheKey(repo, root), JSON.stringify(entry));
+}
+
+function withBriefs(entry: Omit<CachedFrontier, "briefs" | "briefsError">, briefs: BriefAudit): CachedFrontier {
+  return briefs.ok ? { ...entry, briefs: briefs.notReady } : { ...entry, briefsError: briefs.error };
+}
 
 export const frontierCacheKey = (repo: string, root: number) => encodeForgeRef(parseForgeRef(repo), root).cacheKey;
 
@@ -156,39 +168,42 @@ export async function readFrontier(
   if (
     sentinel !== null &&
     cached !== null &&
-    cached.briefs !== undefined &&
     cached.sentinel === sentinel &&
     now.getTime() - new Date(cached.fetchedAt).getTime() < maxAgeMs
   ) {
-    return { frontier: cached.frontier, briefs: { ok: true, notReady: cached.briefs }, source: "cache" };
+    const kept = cachedBriefs(cached);
+    if (kept?.ok === true) return { frontier: cached.frontier, briefs: kept, source: "cache" };
+    // The cached audit failed (or predates node #154): the frontier still
+    // stands, so re-run only the audit. The entry keeps its fetchedAt, so a
+    // re-audit never extends the frontier's max age.
+    const briefs = await readBriefs(args);
+    writeCache(journal, repo, root, withBriefs({ sentinel, fetchedAt: cached.fetchedAt, frontier: cached.frontier }, briefs));
+    return { frontier: cached.frontier, briefs, source: "cache" };
   }
   // The sentinel was read BEFORE the walk, so a change landing between the
   // two is in the frontier but not the sentinel — the next read sees a new
   // sentinel and re-reads. Conservative, never stale.
+  //
+  // The audit runs after the frontier, not beside it: under a rate limit two
+  // concurrent budgeted reads would each count the same throttle as a strike
+  // and double the backoff.
   const frontier = await budgetedRead(journal, repo, token, policy, now, () =>
     graphFrontier(repo, root, token, {
       timeoutMs: args.timeoutMs ?? GRAPH_CALL_TIMEOUT_MS,
     }),
   );
   const briefs = await readBriefs(args);
-  // A failed audit is not cached: the next tick reads both again.
-  if (sentinel !== null && briefs.ok) {
-    const entry: CachedFrontier = {
-      sentinel,
-      fetchedAt: now.toISOString(),
-      frontier,
-      briefs: briefs.notReady,
-    };
-    journal.setHealth(frontierCacheKey(repo, root), JSON.stringify(entry));
+  if (sentinel !== null) {
+    writeCache(journal, repo, root, withBriefs({ sentinel, fetchedAt: now.toISOString(), frontier }, briefs));
   }
   return { frontier, briefs, source: "fresh" };
 }
 
 /**
- * The audit's build-brief-not-ready finding. A budget deferral defers the
- * whole read like the frontier's own; any other failure (a soma error, a
- * malformed finding) is returned as `ok: false`, so research and task
- * nodes still walk while build nodes wait.
+ * The audit's build-brief-not-ready finding. Any failure (a soma error, a
+ * malformed finding, a budget deferral after the frontier was already read)
+ * is returned as `ok: false`, so research and task nodes still walk while
+ * build nodes wait.
  */
 async function readBriefs(args: ReadFrontierArgs): Promise<BriefAudit> {
   const { journal, repo, root, token, policy, now } = args;
@@ -200,7 +215,6 @@ async function readBriefs(args: ReadFrontierArgs): Promise<BriefAudit> {
     );
     return { ok: true, notReady: audit.buildBriefNotReady ?? [] };
   } catch (error) {
-    if (error instanceof BudgetDeferral) throw error;
     return { ok: false, error: error instanceof Error ? error.message : String(error) };
   }
 }
@@ -209,7 +223,8 @@ async function readBriefs(args: ReadFrontierArgs): Promise<BriefAudit> {
  * The last frontier the walk or the escalation pass cached for a map, or null.
  * A plain journal read, with no GitHub call and no sentinel check: `ranger
  * serve` (#37) shows it with its age rather than re-reading a map ranger reads
- * every tick on the principal's own budget.
+ * every tick on the principal's own budget. A failed audit comes back as
+ * `briefs.ok: false`, so the dashboard shows build nodes held as unverified.
  */
 export function cachedFrontier(
   journal: Journal,
@@ -217,11 +232,11 @@ export function cachedFrontier(
   root: number,
 ): { fetchedAt: string; frontier: FrontierResult; briefs?: BriefAudit } | null {
   const cached = readCache(journal, repo, root);
-  return cached === null
-    ? null
-    : {
-        fetchedAt: cached.fetchedAt,
-        frontier: cached.frontier,
-        ...(cached.briefs === undefined ? {} : { briefs: { ok: true as const, notReady: cached.briefs } }),
-      };
+  if (cached === null) return null;
+  const briefs = cachedBriefs(cached);
+  return {
+    fetchedAt: cached.fetchedAt,
+    frontier: cached.frontier,
+    ...(briefs === undefined ? {} : { briefs }),
+  };
 }

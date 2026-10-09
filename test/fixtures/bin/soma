@@ -71,6 +71,12 @@ if [ -n "${FAKE_SOMA_RATE_LIMITED:-}" ]; then
   esac
 fi
 
+# A test can make the audit alone fail, as a soma error or timeout does (node #154).
+if [ "$verb" = "audit" ] && [ -n "${FAKE_SOMA_AUDIT_FAIL:-}" ]; then
+  echo "fake soma: audit failed" >&2
+  exit 1
+fi
+
 if [ -n "${FAKE_SOMA_ROOT_CALLS:-}" ]; then
   printf "%s %s %s\n" "$verb" "$repo" "$root" >> "$FAKE_SOMA_ROOT_CALLS"
 fi

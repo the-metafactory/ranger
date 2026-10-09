@@ -121,10 +121,11 @@ async function escalateOneMap(
         briefs,
       }),
     );
+    const briefHeld = classified.filter((n) => n.route.route === "brief-not-ready");
     const needed = [
       ...hitlWaiting(classified),
       ...classified.filter((n) => n.route.route === "provisioning"),
-      ...classified.filter((n) => n.route.route === "brief-not-ready"),
+      ...briefHeld,
     ].filter(cardNeeded);
     if (!briefs.ok) base.cardErrors.push(`build briefs unverified: ${briefs.error}`);
 
@@ -139,10 +140,7 @@ async function escalateOneMap(
     // reserve).
     // A build node held only because the audit was unreadable gets no card,
     // and keeps any brief card it has: its readiness is unknown, not fixed.
-    const neededIds = new Set([
-      ...needed.map((n) => n.id),
-      ...classified.filter((n) => n.route.route === "brief-not-ready").map((n) => n.id),
-    ]);
+    const neededIds = new Set([...needed, ...briefHeld].map((n) => n.id));
     const absent = await markAbsentCards(
       {
         client,

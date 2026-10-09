@@ -1,7 +1,6 @@
 import { readFileSync } from "node:fs";
-import type { FrontierEntry } from "./graph.ts";
+import type { BriefAudit, FrontierEntry } from "./graph.ts";
 import type { WalkMode } from "./config.ts";
-import type { BriefAudit } from "./frontier-cache.ts";
 
 /**
  * Frontier classification — design §3 routing table, first match wins.
