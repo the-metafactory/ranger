@@ -1248,7 +1248,8 @@ async function act(kind, n, extra) {
   const r = await post("/api/" + kind, Object.assign({ key: n.key, id: n.nodeId }, extra));
   const close = r.close ? "\\nclose (merge desk): exit " + (r.close.code === null ? "none" : r.close.code) + (r.close.stderr ? "\\n" + r.close.stderr : "") : "";
   results.set(id, { err: !r.ok || (r.close && !r.close.ok), text: kind + " #" + n.nodeId + ": exit " + (r.code === null ? "none" : r.code) + (r.stderr ? "\\n" + r.stderr : "") + close });
-  say(kind + " #" + n.nodeId + (!r.ok ? " failed: see its card." : r.close ? (r.close.ok ? " ran; the merge desk started its close." : " ran, but the merge desk failed: see its card.") : " ran."), !r.ok || (r.close && !r.close.ok));
+  // A null code is a verb that timed out or never started: it may have applied.
+  say(kind + " #" + n.nodeId + (!r.ok ? (r.code === null ? " did not finish (timed out or could not start): it may have applied, so check its card once the page reloads." : " failed: see its card.") : r.close ? (r.close.ok ? " ran; the merge desk started its close." : " ran, but the merge desk failed: see its card.") : " ran."), !r.ok || (r.close && !r.close.ok));
  } catch (e) { results.set(id, { err: true, text: kind + " #" + n.nodeId + " refused: " + e.message }); say(e.message, true); }
  load(); setTimeout(load, 3000);
 }

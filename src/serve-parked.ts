@@ -803,14 +803,14 @@ async function runCancel(queued: QueuedResumeView, body: ActionBody, deps: Actio
   force: false,
   queue: "cancel",
  });
- return runVerb(argv, body.dryRun, deps, "cancel-resume", { nodeId: queued.nodeId });
+ return runOperatorVerb(argv, body.dryRun, deps, "cancel-resume", { nodeId: queued.nodeId });
 }
 
 /**
  * One operator verb for the page: a dry run answers with its argv and the
  * env keys it would pass; otherwise it runs and answers with its exit.
  */
-export async function runVerb(
+export async function runOperatorVerb(
  argv: string[],
  dryRun: unknown,
  deps: Pick<ActionDeps, "run" | "env">,

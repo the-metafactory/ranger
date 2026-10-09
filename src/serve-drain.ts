@@ -7,7 +7,7 @@
 import { REPO_PATTERN } from "./config.ts";
 import { decodeForgeKey } from "./forge-ref.ts";
 import type { ImplementLane } from "./lanes.ts";
-import { holding, noConfigPath, refusal, runVerb, type ActionResponse, type ActionRunner } from "./serve-parked.ts";
+import { holding, noConfigPath, refusal, runOperatorVerb, type ActionResponse, type ActionRunner } from "./serve-parked.ts";
 
 /** What a drain names: the visual lane (one machine-wide switch), or one headless map. */
 export type DrainTarget = { lane: "visual" } | { key: string };
@@ -69,5 +69,5 @@ export async function runDrainAction(body: DrainBody, deps: DrainDeps): Promise<
  const argv = drainArgv({ rangerBin: deps.rangerBin, configPath: deps.configPath, target, off });
  const held = "lane" in target ? "drain:lane:visual" : `drain:map:${target.key}`;
  return holding(deps.inFlight, held, "a drain of this target is already running: wait for it, then reload",
-  () => runVerb(argv, body.dryRun, deps, "drain", { ...target, off }));
+  () => runOperatorVerb(argv, body.dryRun, deps, "drain", { ...target, off }));
 }
