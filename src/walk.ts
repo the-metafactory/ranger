@@ -464,7 +464,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
      // re-reads the repo's sentinel here and serves the cached read only when
      // nothing changed since it was taken, so round-29 holds without paying
      // GraphQL for an unchanged map (src/frontier-cache.ts).
-     const { frontier: fetched } = await readFrontier({
+     const { frontier: fetched, briefs } = await readFrontier({
       journal,
       repo: map.repo,
       root: map.root,
@@ -475,7 +475,10 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
       timeoutMs: GRAPH_CALL_TIMEOUT_MS,
      });
      const frontierEntries = fetched.frontier;
-     const classified = classifyFrontier(frontierEntries, map, registry, botIdentity);
+     // A build node whose brief soma's audit reports not ready routes
+     // brief-not-ready, so the plan never takes it (node #154).
+     const classified = classifyFrontier(frontierEntries, map, registry, botIdentity, briefs);
+     if (!briefs.ok) errors.push(`build briefs unverified — build nodes held this tick: ${briefs.error}`);
      // The plan `ranger serve` (#37) also reads, so its "next" is this order.
      const plan = planTick(classified, {
       laneBusy: implementClaimed.has(implementLane(map)) || implementLaneBusy(journal, implementLane(map)),

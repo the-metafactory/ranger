@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import type { FrontierEntry } from "./graph.ts";
+import type { BriefAudit, FrontierEntry } from "./graph.ts";
 import type { WalkMode } from "./config.ts";
 
 /**
@@ -29,7 +29,13 @@ export type RouteClass =
        */
       ratify: "auto" | "merge";
     }
-  | { route: "provisioning" };
+  | { route: "provisioning" }
+  /**
+   * A build node ranger would walk, held because soma's audit reports its
+   * brief not ready (node #154). `missing` names what the brief lacks;
+   * null when the audit could not be read, so readiness is unknown.
+   */
+  | { route: "brief-not-ready"; missing: string[] | null };
 
 export interface ClassifiedNode {
   id: string;
@@ -56,6 +62,8 @@ export interface ClassifyOptions {
   allowlist?: string[];
   /** `ranger.yaml` map.skip: these ids are never walkable. */
   skip?: string[];
+  /** Soma's build-brief-not-ready finding; absent, no build node is held. */
+  briefs?: BriefAudit;
 }
 
 export interface ClassifyContext {
@@ -78,6 +86,7 @@ export const ROUTE_LABELS: Record<string, string> = {
   research: "research",
   implement: "implement",
   provisioning: "provisioning",
+  "brief-not-ready": "build brief not ready",
 };
 
 export const ESCALATE_REASONS: Record<EscalateReason, string> = {
@@ -174,6 +183,33 @@ export function classify(
   walkMode: WalkMode,
   registry: ProbeRegistry,
   opts: ClassifyOptions = {},
+): ClassifiedNode {
+  return holdUnreadyBrief(classifyRoute(node, repo, walkMode, registry, opts), opts.briefs);
+}
+
+/**
+ * Hold a build node the walk would take while soma's audit reports its brief
+ * not ready (node #154; soma#752 D1/D4/D5). Only a walkable implement route
+ * of kind `build` changes: other kinds, and nodes ranger would not take
+ * anyway, keep their route. A failed audit holds every such node (readiness
+ * unknown); an audit without the finding (an older soma) holds none.
+ */
+function holdUnreadyBrief(node: ClassifiedNode, briefs: BriefAudit | undefined): ClassifiedNode {
+  if (briefs === undefined || node.kind !== "build") return node;
+  if (node.route.route !== "implement" || !node.route.walkable) return node;
+  if (!briefs.ok) return { ...node, route: { route: "brief-not-ready", missing: null } };
+  const finding = briefs.notReady.find((n) => n.id === node.id);
+  return finding === undefined
+    ? node
+    : { ...node, route: { route: "brief-not-ready", missing: finding.missing } };
+}
+
+function classifyRoute(
+  node: FrontierEntry,
+  repo: string,
+  walkMode: WalkMode,
+  registry: ProbeRegistry,
+  opts: ClassifyOptions,
 ): ClassifiedNode {
   const { autonomy, kind } = node.node;
   const { typed } = node;
@@ -279,14 +315,23 @@ export function classifyFrontier(
   map: { repo: string; walk: WalkMode; nodes?: string[]; skip?: string[] },
   registry: ProbeRegistry,
   botIdentity: string | undefined,
+  briefs?: BriefAudit,
 ): ClassifiedNode[] {
   return entries.map((entry) =>
     classify(entry, map.repo, map.walk, registry, {
       botIdentity,
       allowlist: map.nodes,
       skip: map.skip,
+      briefs,
     }),
   );
+}
+
+/** Why a brief-not-ready node is held, in one line (cards, dashboard, build-now). */
+export function briefHoldReason(missing: string[] | null): string {
+  return missing === null
+    ? "build brief unverified — soma graph audit could not be read; held until it can"
+    : `build brief not ready — missing ${missing.map((m) => "`" + m + "`").join(", ")}`;
 }
 
 /** HITL queue: frontier nodes whose route is escalate-hitl. */

@@ -88,7 +88,29 @@ export interface AuditResult {
   closedWithoutReceipt: string[];
   openWithoutCheckpoint: string[];
   openClaimed: { id: string; assignees: string[] }[];
+  /**
+   * Soma's `build-brief-not-ready` finding (soma#753): open `kind: build`
+   * nodes whose body lacks a required section or carries a clarification
+   * marker, with the items `missing`. Absent from an older soma — absent
+   * refuses nothing.
+   */
+  buildBriefNotReady?: BuildBriefNotReady[];
 }
+
+/** One `buildBriefNotReady` entry: the node and what its brief lacks. */
+export interface BuildBriefNotReady {
+  id: string;
+  missing: string[];
+}
+
+/**
+ * Soma's build-brief-not-ready finding for one frontier read. `ok: false`
+ * when the audit could not be read: the walk then holds every build node
+ * (src/route.ts). A soma without the field reads as `ok` with none listed.
+ */
+export type BriefAudit =
+  | { ok: true; notReady: BuildBriefNotReady[] }
+  | { ok: false; error: string };
 
 export interface NodeResult {
   repo: string;
@@ -229,7 +251,27 @@ export async function graphAudit(
       result.stderr,
     );
   }
-  return normalizeAudit(repo, parseJson<AuditResult>("audit", result.stdout));
+  const audit = parseJson<AuditResult>("audit", result.stdout);
+  assertBriefShape(audit.buildBriefNotReady);
+  return normalizeAudit(repo, audit);
+}
+
+/**
+ * The finding's shape is soma#753's `[{ id, missing: string[] }]`. Anything
+ * else is refused, not adapted to: a malformed finding reads as an audit
+ * failure, which holds build nodes (src/frontier-cache.ts), never as "none
+ * listed".
+ */
+function assertBriefShape(value: unknown): void {
+  if (value === undefined) return;
+  const entryOk = (e: unknown) =>
+    typeof e === "object" && e !== null &&
+    typeof (e as BuildBriefNotReady).id === "string" &&
+    Array.isArray((e as BuildBriefNotReady).missing) &&
+    (e as BuildBriefNotReady).missing.every(m => typeof m === "string");
+  if (!Array.isArray(value) || !value.every(entryOk)) {
+    throw new GraphError("soma graph audit: buildBriefNotReady is not [{ id, missing: string[] }] (soma#753)");
+  }
 }
 
 export async function graphNode(
@@ -286,6 +328,9 @@ export function normalizeAudit(repo: string, result: AuditResult): AuditResult {
     closedWithoutReceipt: result.closedWithoutReceipt.map(id),
     openWithoutCheckpoint: result.openWithoutCheckpoint.map(id),
     openClaimed: result.openClaimed.map(n => ({ ...n, id: id(n.id) })),
+    ...(result.buildBriefNotReady === undefined
+      ? {}
+      : { buildBriefNotReady: result.buildBriefNotReady.map(n => ({ ...n, id: id(n.id) })) }),
   };
 }
 

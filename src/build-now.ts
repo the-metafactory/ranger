@@ -4,12 +4,13 @@ import { budgetPolicy } from "./budget.ts";
 import { ClaimLockBusy, withClaimLock } from "./claim-lock.ts";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import { readFrontier } from "./frontier-cache.ts";
-import { type FrontierEntry, GRAPH_CALL_TIMEOUT_MS } from "./graph.ts";
+import { type BriefAudit, type FrontierEntry, GRAPH_CALL_TIMEOUT_MS } from "./graph.ts";
 import type { Journal, WorkerRow } from "./journal.ts";
 import type { OwnedCheck } from "./lock.ts";
 import { implementLane } from "./lanes.ts";
 import { laneHeldMessage } from "./maps.ts";
 import {
+ briefHoldReason,
  classifyFrontier,
  ESCALATE_REASONS,
  loadProbeRegistry,
@@ -33,7 +34,8 @@ import type { SpawnRunNodeArgs } from "./spawn.ts";
  * It refuses everything the walk would not take, before any announce or
  * claim: a paused run, a node off the frontier, one that does not route to
  * the implement or research lane as walkable (HITL, provisioning, skip-listed,
- * off the allowlist, a `propose` node authored by the bot — node #9), a vetoed node, one
+ * off the allowlist, a `propose` node authored by the bot — node #9, a build
+ * node whose brief soma's audit reports not ready — node #154), a vetoed node, one
  * already in flight, an exhausted daily spawn cap, and, without `--force`, a
  * held implement lane. With `--force` it starts beside the holder; nothing
  * forces a HITL node.
@@ -68,8 +70,8 @@ export interface BuildNowContext {
  token: string;
  botIdentity: string;
  force?: boolean;
- /** The map's frontier: the walk's sentinel-checked read unless injected. */
- readFrontier?: () => Promise<FrontierEntry[]>;
+ /** The map's frontier and its audit's brief finding: the walk's sentinel-checked read unless injected. */
+ readFrontier?: () => Promise<{ frontier: FrontierEntry[]; briefs?: BriefAudit }>;
  registry?: ProbeRegistry;
  announce?: AnnounceFn;
  claim?: ClaimFn;
@@ -104,6 +106,7 @@ function notWalkable(node: ClassifiedNode): string | null {
  if (route.route === "provisioning") {
   return "routes provisioning: its probes are not in the probe registry";
  }
+ if (route.route === "brief-not-ready") return `routes brief-not-ready: ${briefHoldReason(route.missing)}`;
  if (!route.walkable) {
   return `routes ${route.route} but is not walkable on this map (walk mode, nodes allowlist or skip list)`;
  }
@@ -133,21 +136,21 @@ async function buildUnderLock(nodeId: string, ctx: BuildNowContext, owned: Owned
  // Dead-man gate (design §7): the walk claims nothing while paused, nor does this.
  if (journal.isPaused()) refuse("dead-man paused — claiming stopped; `ranger resume-run` first");
 
- const entries = await (ctx.readFrontier ??
-  (async () =>
-   (
-    await readFrontier({
-     journal,
-     repo: map.repo,
-     root: map.root,
-     token: { token: ctx.token, source: "write-token" },
-     policy: budgetPolicy(config),
-     maxAgeMs: config.budget.frontierMaxAgeMin * 60_000,
-     now: now(),
-     timeoutMs: GRAPH_CALL_TIMEOUT_MS,
-    })
-   ).frontier.frontier))();
- const classified = classifyFrontier(entries, map, ctx.registry ?? loadProbeRegistry(), ctx.botIdentity);
+ const { frontier: entries, briefs } = await (ctx.readFrontier ??
+  (async () => {
+   const read = await readFrontier({
+    journal,
+    repo: map.repo,
+    root: map.root,
+    token: { token: ctx.token, source: "write-token" },
+    policy: budgetPolicy(config),
+    maxAgeMs: config.budget.frontierMaxAgeMin * 60_000,
+    now: now(),
+    timeoutMs: GRAPH_CALL_TIMEOUT_MS,
+   });
+   return { frontier: read.frontier.frontier, briefs: read.briefs };
+  }))();
+ const classified = classifyFrontier(entries, map, ctx.registry ?? loadProbeRegistry(), ctx.botIdentity, briefs);
  const node = classified.find((n) => n.id === nodeId);
  if (node === undefined) refuse("not on the map's frontier (closed, blocked, or not under this root)");
  const why = notWalkable(node!);
