@@ -15,13 +15,17 @@ import { isGithubRepo, nodeKey } from "./forge-ref.ts";
  * login stored under this user's HOME (the principal's, on the principal's
  * machine; nothing here checks which account that is), and a session opens
  * iTerm2 the way the grilling button does, in the map's `localCheckout` only:
- * the worker's worktree belongs to the machine-account clone. Every action is re-checked against the journal as it
+ * the worker's worktree belongs to the machine-account clone. A queued resume
+ * and its cancel run `ranger resume-node --when-free` / `--cancel` (node
+ * #166); the drain lives in serve-drain.ts. Every action is re-checked against the journal as it
  * reads when the request arrives, and the spawner is injected so no test runs
  * `gh`, `osascript` or ranger.
  */
 import { classifyGithubCheckRuns } from "./github-ci.ts";
 import { REPO_PATTERN } from "./config.ts";
-import type { EventRow, WorkerRow } from "./journal.ts";
+import type { EventRow, ResumeQueueRow, WorkerRow } from "./journal.ts";
+import { startsImplementSession, type ImplementLane } from "./lanes.ts";
+import { whenFreeQueues } from "./resume.ts";
 import { childEnv, itermArgv, shellQuote } from "./launch.ts";
 import {
  CRASH_PARK_OUTCOME,
@@ -312,6 +316,8 @@ export interface NeedsYouMap {
  key: string;
  repo: string;
  root: number;
+ /** The map's implement lane; unset offers no queued resume. */
+ lane?: ImplementLane;
  localCheckout?: string;
 }
 
@@ -336,10 +342,16 @@ export interface NeedsYouEntry {
   */
  sageOnHead: boolean | null;
  probe: ProbeResult | null;
+ /** Its place in its lane's resume queue (node #166), 1 = the head; null when not queued. */
+ queued: { lane: ImplementLane; position: number } | null;
  actions: {
   resume: boolean;
   merge: { offered: true; headSha: string } | { offered: false; why: string };
   session: { offered: true; cwd: string } | { offered: false; why: string };
+  /** `resume-node --when-free`: offered only where that verb would queue rather than start. */
+  queueResume: { offered: true } | { offered: false; why: string };
+  /** `resume-node --cancel`: offered while the node is queued. */
+  cancelResume: boolean;
  };
 }
 
@@ -356,6 +368,83 @@ export interface NeedsYouInputs {
  titleOf: (repo: string, nodeId: string) => string | null;
  reviewRounds: number;
  exists: (path: string) => boolean;
+ /** The journal's resume queue, every lane, FIFO (node #166); absent means empty. */
+ resumeQueue?: ResumeQueueRow[];
+ /** Each implement lane's holder now; absent means both are free. */
+ laneHolders?: Partial<Record<ImplementLane, { repo: string; nodeId: string } | null>>;
+}
+
+/** One queued resume as the dashboard shows it, at its FIFO place in its lane. */
+export interface QueuedResumeView {
+ /** The map's `owner/name#root`. */
+ key: string;
+ repo: string;
+ root: number;
+ nodeId: string;
+ title: string | null;
+ url: string;
+ lane: ImplementLane;
+ /** 1 = the lane's head. */
+ position: number;
+ queuedAt: string;
+ failedStarts: number;
+}
+
+/** The resume queue per lane, each in FIFO order (the journal lists it by id). */
+export function resumeQueueViews(
+ queue: ResumeQueueRow[],
+ titleOf: (repo: string, nodeId: string) => string | null,
+): Record<ImplementLane, QueuedResumeView[]> {
+ const out: Record<ImplementLane, QueuedResumeView[]> = { visual: [], headless: [] };
+ for (const e of queue) {
+  out[e.lane].push({
+   key: nodeKey(e.repo, e.root),
+   repo: e.repo,
+   root: e.root,
+   nodeId: e.nodeId,
+   title: titleOf(e.repo, e.nodeId),
+   url: `https://github.com/${e.repo}/issues/${e.nodeId}`,
+   lane: e.lane,
+   position: out[e.lane].length + 1,
+   queuedAt: e.queuedAt,
+   failedStarts: e.failedStarts,
+  });
+ }
+ return out;
+}
+
+/**
+ * Whether `resume-node --when-free` would queue this row, by the verb's own
+ * `whenFreeQueues`. Anywhere else the verb starts the resume at once, so the
+ * button would be a Resume under another name.
+ */
+function queueOffer(
+ row: WorkerRow,
+ map: NeedsYouMap,
+ queued: boolean,
+ inputs: NeedsYouInputs,
+): NeedsYouEntry["actions"]["queueResume"] {
+ if (queued) return { offered: false, why: "already queued" };
+ if (map.lane === undefined) return { offered: false, why: "the map's implement lane is unknown" };
+ if (!startsImplementSession(row)) return { offered: false, why: "takes no implement lane: Resume starts it now" };
+ const holder = inputs.laneHolders?.[map.lane] ?? null;
+ const lane = {
+  // The verb's lane read leaves the node itself out.
+  held: holder !== null && !(holder.repo === row.repo && holder.nodeId === row.nodeId),
+  queued: false,
+  backlog: (inputs.resumeQueue ?? []).filter((e) => e.lane === map.lane).length,
+ };
+ if (!whenFreeQueues(row, lane)) return { offered: false, why: `the ${map.lane} lane is free: Resume starts it now` };
+ return { offered: true };
+}
+
+/** Each queued node's lane and FIFO place in it (1 = the head), by `repo#id`: the lane list's own places. */
+function queuePlaces(queue: ResumeQueueRow[]): Map<string, { lane: ImplementLane; position: number }> {
+ const places = new Map<string, { lane: ImplementLane; position: number }>();
+ for (const views of Object.values(resumeQueueViews(queue, () => null))) {
+  for (const v of views) places.set(nodeKey(v.repo, v.nodeId), { lane: v.lane, position: v.position });
+ }
+ return places;
 }
 
 /** The rows that wait on the principal, newest first. */
@@ -380,6 +469,7 @@ function rowEntries(
  include: (row: WorkerRow, labels: string[] | null) => boolean,
 ): NeedsYouEntry[] {
  const out: NeedsYouEntry[] = [];
+ const placeOf = queuePlaces(inputs.resumeQueue ?? []);
  for (const row of inputs.workers) {
   const map = inputs.maps.find((m) => m.repo === row.repo && m.root === row.root);
   if (map === undefined) continue;
@@ -394,6 +484,7 @@ function rowEntries(
   // worktree of the machine-account clone, whose files and git hooks the
   // worker controls (`servedMaps` refuses those clones for the same reason).
   const cwd = map.localCheckout !== undefined && inputs.exists(map.localCheckout) ? map.localCheckout : undefined;
+  const place = placeOf.get(nodeKey(row.repo, row.nodeId));
   out.push({
    key: map.key,
    repo: row.repo,
@@ -416,8 +507,11 @@ function rowEntries(
    sage,
    sageOnHead: sage === null || view === null || view.headSha === "" ? null : view.headSha.startsWith(sage.sha),
    probe: lastProbe(events),
+   queued: place ?? null,
    actions: {
     resume: waiting,
+    queueResume: waiting ? queueOffer(row, map, place !== undefined, inputs) : { offered: false, why: `#${row.nodeId} is ${row.status}, not parked or failed` },
+    cancelResume: place !== undefined,
     merge:
      refused === null && view !== null
       ? { offered: true, headSha: view.headSha }
@@ -457,7 +551,7 @@ export function uncheckedNeedsEye(inputs: Pick<NeedsYouInputs, "maps" | "workers
 
 // ---- the actions ----
 
-export type ActionKind = "resume" | "merge" | "session";
+export type ActionKind = "resume" | "merge" | "session" | "queue-resume" | "cancel-resume";
 
 export interface ActionResult {
  /** The child's exit code; null when it could not start or timed out. */
@@ -506,7 +600,11 @@ export function mergeArgv(args: { repo: string; pr: number; sha: string }): stri
  return ["gh", "pr", "merge", String(args.pr), "--repo", args.repo, "--squash", "--match-head-commit", args.sha];
 }
 
-/** `ranger resume-node`, the operator verb: it resets the row and detaches run-node itself. */
+/**
+ * `ranger resume-node`, the operator verb: it resets the row and detaches
+ * run-node itself. `queue` makes it `--when-free` (queue while the lane is
+ * held) or `--cancel` (drop the queued entry), node #166.
+ */
 export function resumeArgv(args: {
  rangerBin: string;
  configPath: string;
@@ -514,10 +612,12 @@ export function resumeArgv(args: {
  root: number;
  nodeId: string;
  force: boolean;
+ queue?: "when-free" | "cancel";
 }): string[] {
  if (!REPO_PATTERN.test(args.repo)) throw new Error(`bad repo: ${args.repo}`);
  if (!ID_PATTERN.test(args.nodeId)) throw new Error(`bad node id: ${args.nodeId}`);
  if (!Number.isInteger(args.root) || args.root <= 0) throw new Error(`bad root: ${args.root}`);
+ if (args.force && args.queue !== undefined) throw new Error(`--force and --${args.queue} are mutually exclusive`);
  return [
   args.rangerBin,
   "resume-node",
@@ -527,6 +627,7 @@ export function resumeArgv(args: {
   "-c",
   args.configPath,
   ...(args.force ? ["--force"] : []),
+  ...(args.queue === undefined ? [] : [`--${args.queue}`]),
  ];
 }
 
@@ -586,6 +687,8 @@ export interface ActionBody {
 export interface ActionDeps {
  /** The entries as the journal reads now: "Needs you", and every awaiting-merge row. */
  entries: NeedsYouEntry[];
+ /** Every queued resume as the journal reads now, all lanes: what a cancel may name. */
+ queue?: QueuedResumeView[];
  run: ActionRunner;
  env: Record<string, string | undefined>;
  rangerBin: string;
@@ -618,7 +721,10 @@ export interface ActionResponse {
  exited?: Promise<void>;
 }
 
-const refusal = (status: number, error: string): ActionResponse => ({ status, body: { error } });
+export const refusal = (status: number, error: string): ActionResponse => ({ status, body: { error } });
+
+/** Serve has no config path to hand the verb. */
+export const noConfigPath = (what: string): ActionResponse => refusal(409, `serve was started without a config path to ${what} with`);
 
 const tailOf = (text: string): string => text.trim().slice(-1500);
 
@@ -636,24 +742,97 @@ export async function runAction(
   return refusal(400, "key and id are required strings");
  }
  if (!ID_PATTERN.test(body.id)) return refusal(400, "id must be numeric");
+ if (kind === "cancel-resume") {
+  // A queued entry may outlive its row's parked state, so a cancel names the queue, not the card.
+  const queued = deps.queue?.find((q) => q.key === body.key && q.nodeId === body.id);
+  if (queued === undefined) return refusal(404, `#${body.id} has no queued resume on ${body.key}`);
+  return holdingNode(deps, queued.repo, queued.nodeId, () => runCancel(queued, body, deps));
+ }
  const entry = deps.entries.find((e) => e.key === body.key && e.nodeId === body.id);
  if (entry === undefined) {
   return refusal(404, `#${body.id} is not parked, failed or awaiting a merge on ${body.key}`);
  }
- const held = nodeKey(entry.repo, entry.nodeId);
- if (deps.inFlight.has(held)) return refusal(409, `an action on #${entry.nodeId} is already running: wait for it, then reload`);
- deps.inFlight.add(held);
+ return holdingNode(deps, entry.repo, entry.nodeId, () => runHeldAction(kind, body, deps, entry));
+}
+
+const holdingNode = (deps: Pick<ActionDeps, "inFlight">, repo: string, nodeId: string, act: () => Promise<ActionResponse>) =>
+ holding(deps.inFlight, nodeKey(repo, nodeId), `an action on #${nodeId} is already running: wait for it, then reload`, act);
+
+/**
+ * Runs `act` holding `held` in the server's in-flight set, or refuses with
+ * `busy` while another action holds it.
+ */
+export async function holding(
+ inFlight: Set<string>,
+ held: string,
+ busy: string,
+ act: () => Promise<ActionResponse>,
+): Promise<ActionResponse> {
+ if (inFlight.has(held)) return refusal(409, busy);
+ inFlight.add(held);
  let exited: Promise<void> | undefined;
  try {
-  const response = await runHeldAction(kind, body, deps, entry);
+  const response = await act();
   exited = response.exited;
   return response;
  } finally {
   // Held until the child exits, not until the page is answered: a resume
   // that outlives the HTTP timeout must still refuse a second one.
-  if (exited === undefined) deps.inFlight.delete(held);
-  else void exited.finally(() => deps.inFlight.delete(held));
+  if (exited === undefined) inFlight.delete(held);
+  else void exited.finally(() => inFlight.delete(held));
  }
+}
+
+/** The page's view of a verb's exit: its code and the tail of its stderr. */
+export const verbResult = (action: string, result: ActionResult, extra: Record<string, unknown> = {}): Record<string, unknown> => ({
+ action,
+ ...extra,
+ ok: result.code === 0,
+ code: result.code,
+ stderr: tailOf(result.stderr),
+});
+
+/** `resume-node <id> --when-free` or `--cancel`, or the refusal when serve has no config path. */
+function queuedResumeArgv(
+ deps: Pick<ActionDeps, "rangerBin" | "configPath">,
+ target: { repo: string; root: number; nodeId: string },
+ queue: "when-free" | "cancel",
+): string[] | ActionResponse {
+ if (deps.configPath === undefined) return noConfigPath(queue === "cancel" ? "cancel" : "resume");
+ return resumeArgv({
+  rangerBin: deps.rangerBin,
+  configPath: deps.configPath,
+  repo: target.repo,
+  root: target.root,
+  nodeId: target.nodeId,
+  force: false,
+  queue,
+ });
+}
+
+/** `resume-node <id> --cancel`: the verb drops the entry, or refuses and changes nothing. */
+async function runCancel(queued: QueuedResumeView, body: ActionBody, deps: ActionDeps): Promise<ActionResponse> {
+ const argv = queuedResumeArgv(deps, queued, "cancel");
+ if (!Array.isArray(argv)) return argv;
+ return runOperatorVerb(argv, body.dryRun, deps, "cancel-resume", { nodeId: queued.nodeId });
+}
+
+/**
+ * One operator verb for the page: a dry run answers with its argv and the
+ * env keys it would pass; otherwise it runs and answers with its exit.
+ */
+export async function runOperatorVerb(
+ argv: string[],
+ dryRun: unknown,
+ deps: Pick<ActionDeps, "run" | "env">,
+ action: string,
+ extra: Record<string, unknown> = {},
+ detached = false,
+): Promise<ActionResponse> {
+ const env = childEnv(deps.env);
+ if (dryRun === true) return { status: 200, body: { dryRun: true, argv, envKeys: Object.keys(env).sort() } };
+ const result = await deps.run(argv, env, { detached });
+ return { status: 200, body: verbResult(action, result, extra), exited: result.exited };
 }
 
 async function runHeldAction(
@@ -679,6 +858,14 @@ async function runHeldAction(
   });
   // The wrapper resolves the machine account's tokens itself; nothing ambient goes along.
   env = childEnv(deps.env);
+  detached = true;
+ } else if (kind === "queue-resume") {
+  if (!entry.actions.queueResume.offered) return refusal(409, entry.actions.queueResume.why);
+  const queued = queuedResumeArgv(deps, entry, "when-free");
+  if (!Array.isArray(queued)) return queued;
+  argv = queued;
+  env = childEnv(deps.env);
+  // The lane may have freed since the page read it: the verb then starts the resume, as a Resume does.
   detached = true;
  } else if (kind === "merge") {
   if (!entry.actions.merge.offered) return refusal(409, entry.actions.merge.why);
@@ -758,13 +945,7 @@ async function runHeldAction(
   }
  }
  const result = await deps.run(argv, env, { detached });
- const out: Record<string, unknown> = {
-  action: kind,
-  nodeId: entry.nodeId,
-  ok: result.code === 0,
-  code: result.code,
-  stderr: tailOf(result.stderr),
- };
+ const out = verbResult(kind, result, { nodeId: entry.nodeId });
  let exited = result.exited;
  if (close !== null && result.code === 0) {
   // The wrapper resolves the machine account's tokens itself, as for a resume.
