@@ -27,7 +27,7 @@ cat <<OUT
 ## Sage code review — $verdict
 
 \`\`\`json
-{"verdict":"$verdict","summary":"fake","github_review_id":0,"github_review_url":"","submitted_at":"2026-10-03T00:00:00Z","commit_id":"$(printf 'a%.0s' {1..40})","findings":{"blockers":$blockers,"majors":1,"nits":0},"inline_comments":0}
+{"verdict":"$verdict","summary":"fake author=${SAGE_REVIEW_AUTHOR_LOGIN:-none}","github_review_id":0,"github_review_url":"","submitted_at":"2026-10-03T00:00:00Z","commit_id":"$(printf 'a%.0s' {1..40})","findings":{"blockers":$blockers,"majors":1,"nits":0},"inline_comments":0}
 \`\`\`
 OUT
 echo "[sage] verdict: $verdict (posted=false)" >&2
