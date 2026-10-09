@@ -1530,7 +1530,7 @@ async function baseMergePass(ctx: ImplementContext, testCommand: string, pushedH
  ctx.journal.recordEvent("reviewed", {
   nodeId: ctx.node.ref.id,
   repo: ctx.map.repo,
-  detail: `PR conflicts with origin/${base}${files.length > 0 ? ` in ${files.join(", ")}` : ""} — a worker merges it in`,
+  detail: `${changeRequestNoun(ctx.map.repo)} conflicts with origin/${base}${files.length > 0 ? ` in ${files.join(", ")}` : ""} — a worker merges it in`,
  });
  const pass = await workerPass(ctx, testCommand, { kind: "base-merge", base, files });
  if (pass.failure !== undefined) return pass;
