@@ -75,6 +75,15 @@ Spawn errors, a null PID (including `RANGER_NO_SPAWN=1`), and identity gate
 refusals count as failed starts. Three consecutive failed starts drop the entry
 with an event naming the last error. A successful start removes the entry;
 queueing the node again starts its failure count at zero.
+
+`ranger serve` (node #166) runs these verbs for the principal: Drain/Undrain on
+the visual lane's header (`ranger drain --lane visual [--off]`) and on each
+headless map (`--map`); a visual map shows no drain of its own. A parked or
+failed card offers "Queue resume" (`resume-node <id> --when-free`) where that
+verb would queue, and a queued node shows its place and a Cancel
+(`--cancel`). Each lane lists its queue FIFO, and a head the next tick starts
+shows as next, ahead of any frontier claim. A refused or failed verb shows its
+error, and changes nothing.
 Plain and immediate operator resumes retain the hand-driven mode where a row
 is claimed without spawning; this mode cannot successfully start a queued resume.
 
