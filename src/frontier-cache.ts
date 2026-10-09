@@ -9,6 +9,7 @@ import {
   type BriefAudit,
   type BuildBriefNotReady,
   type FrontierResult,
+  type GraphCallOptions,
   GRAPH_CALL_TIMEOUT_MS,
   graphAudit,
   graphFrontier,
@@ -54,6 +55,12 @@ import { gatedEnv, type ResolvedToken } from "./token-gate.ts";
  * only the audit, so a soma whose audit keeps failing costs no frontier read.
  * What the sentinel cannot see (an upgraded soma that newly lists a node, a
  * changed readiness rule) waits for the max age, like any other blind spot.
+ *
+ * A GitLab map has no sentinel (node #130): GitLab has no repo-wide
+ * issue-event feed (research node #92), and whether link and child edits
+ * bump `updated_at` there is unmeasured. So a GitLab read never takes a
+ * sentinel and never reads or writes this cache: every scout reads the
+ * frontier fresh, under the budget gate's 429 cooldown.
  */
 
 interface CachedFrontier {
@@ -91,8 +98,8 @@ export async function readRepoSentinel(
   repo: string,
   token: string,
 ): Promise<string | null> {
-  // GitLab has no sentinel implementation yet: null forces a fresh graph
-  // read and prevents a cache write instead of issuing a GitHub API call.
+  // readFrontier never asks for a GitLab sentinel; null keeps any other
+  // caller off the GitHub API (null means "fresh read, no cache write").
   if (!isGithubRepo(repo)) return null;
   const gated = gatedEnv(token);
   try {
@@ -140,6 +147,8 @@ export interface ReadFrontierArgs {
   maxAgeMs: number;
   now: Date;
   timeoutMs?: number;
+  /** Stubbed soma subprocess seam (GraphCallOptions.runner). */
+  runner?: GraphCallOptions["runner"];
 }
 
 export interface FrontierRead {
@@ -154,15 +163,16 @@ export interface FrontierRead {
  * and the read is young enough, else a budgeted fresh read (src/budget.ts —
  * which may throw BudgetDeferral). Under a `floor` cooldown a valid cache is
  * still served (the sentinel is REST, a separate bucket); a `throttled` token
- * defers before any call.
+ * defers before any call. A GitLab map always reads fresh.
  */
 export async function readFrontier(
   args: ReadFrontierArgs,
 ): Promise<FrontierRead> {
-  const { journal, repo, root, token, policy, maxAgeMs, now } = args;
-  // A throttled token makes no GitHub call at all, the REST sentinel
+  const { journal, repo, root, token, maxAgeMs, now } = args;
+  // A throttled token makes no forge call at all, the REST sentinel
   // included: requests sent while limited can extend the limit.
-  assertNotThrottled(journal, token, now);
+  assertNotThrottled(journal, repo, token, now);
+  if (!isGithubRepo(repo)) return readFresh(args, null);
   const sentinel = await readRepoSentinel(repo, token.token);
   const cached = readCache(journal, repo, root);
   if (
@@ -180,6 +190,15 @@ export async function readFrontier(
     writeCache(journal, repo, root, withBriefs({ sentinel, fetchedAt: cached.fetchedAt, frontier: cached.frontier }, briefs));
     return { frontier: cached.frontier, briefs, source: "cache" };
   }
+  return readFresh(args, sentinel);
+}
+
+/**
+ * A budgeted fresh read of the frontier and its audit, cached under
+ * `sentinel` unless it is null.
+ */
+async function readFresh(args: ReadFrontierArgs, sentinel: string | null): Promise<FrontierRead> {
+  const { journal, repo, root, token, policy, now } = args;
   // The sentinel was read BEFORE the walk, so a change landing between the
   // two is in the frontier but not the sentinel — the next read sees a new
   // sentinel and re-reads. Conservative, never stale.
@@ -188,15 +207,20 @@ export async function readFrontier(
   // concurrent budgeted reads would each count the same throttle as a strike
   // and double the backoff.
   const frontier = await budgetedRead(journal, repo, token, policy, now, () =>
-    graphFrontier(repo, root, token, {
-      timeoutMs: args.timeoutMs ?? GRAPH_CALL_TIMEOUT_MS,
-    }),
+    graphFrontier(repo, root, token, graphOptions(args)),
   );
   const briefs = await readBriefs(args);
   if (sentinel !== null) {
     writeCache(journal, repo, root, withBriefs({ sentinel, fetchedAt: now.toISOString(), frontier }, briefs));
   }
   return { frontier, briefs, source: "fresh" };
+}
+
+function graphOptions(args: ReadFrontierArgs): GraphCallOptions {
+  return {
+    timeoutMs: args.timeoutMs ?? GRAPH_CALL_TIMEOUT_MS,
+    ...(args.runner === undefined ? {} : { runner: args.runner }),
+  };
 }
 
 /**
@@ -209,9 +233,7 @@ async function readBriefs(args: ReadFrontierArgs): Promise<BriefAudit> {
   const { journal, repo, root, token, policy, now } = args;
   try {
     const audit = await budgetedRead(journal, repo, token, policy, now, () =>
-      graphAudit(repo, root, token, {
-        timeoutMs: args.timeoutMs ?? GRAPH_CALL_TIMEOUT_MS,
-      }),
+      graphAudit(repo, root, token, graphOptions(args)),
     );
     return { ok: true, notReady: audit.buildBriefNotReady ?? [] };
   } catch (error) {

@@ -59,7 +59,7 @@ import { pidAlive as defaultPidAlive } from "./exec.ts";
 import { Journal, type ResumeQueueRow, type WorkerRow } from "./journal.ts";
 import { ForeignMigrationError } from "./journal-guard.ts";
 import { IMPLEMENT_LANES, implementLane, workerLane, type ImplementLane } from "./lanes.ts";
-import { activeCooldown, readGraphqlBudget } from "./budget.ts";
+import { activeCooldown, cooldownScope, readGraphqlBudget } from "./budget.ts";
 import { queueEntryGate, queueSpawnGate } from "./resume.ts";
 import { cachedFrontier } from "./frontier-cache.ts";
 import { type FrontierEntry, graphFrontier, RateLimitError } from "./graph.ts";
@@ -1565,7 +1565,7 @@ export class ServeReader {
     continue;
    }
    const journal = Journal.openReadOnly(this.journalPath);
-   const cooling = journal === null ? null : activeCooldown(journal, token.source, now);
+   const cooling = journal === null ? null : activeCooldown(journal, cooldownScope(map.repo, token.source), now);
    journal?.close();
    if (cooling !== null) {
     keep(`deferred: ${token.source} cooling down until ${cooling.until.toISOString()} (${cooling.reason})`);

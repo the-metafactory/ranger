@@ -1,4 +1,4 @@
-import { runReadRetryingTransient } from "./transient.ts";
+import { isGitLabRateLimit, runReadRetryingTransient } from "./transient.ts";
 import { gatedEnv, assertGitLabReadGrant, type ResolvedToken } from "./token-gate.ts";
 import { glabConfigEnvAsync } from "./glab-config-dir.ts";
 import { runCmd } from "./exec.ts";
@@ -19,9 +19,10 @@ export class GraphError extends Error {
 }
 
 /**
- * A graph read GitHub refused for rate limiting — the hourly allowance or a
- * secondary (burst/concurrency) limit. Distinct from GraphError so callers
- * can defer instead of failing (src/budget.ts sets a cooldown on it).
+ * A graph read the forge refused for rate limiting — GitHub's hourly
+ * allowance or a secondary (burst/concurrency) limit, or a GitLab 429.
+ * Distinct from GraphError so callers can defer instead of failing
+ * (src/budget.ts sets a cooldown on it).
  */
 export class RateLimitError extends GraphError {
   override readonly name = "RateLimitError";
@@ -40,12 +41,17 @@ export function somaRepo(repo: string | ForgeRef): string {
 
 const RATE_LIMITED = /rate limit/i;
 
-/** The error for a failed graph verb: RateLimitError when GitHub throttled it. */
+/**
+ * The error for a failed graph verb: RateLimitError when the forge throttled
+ * it. A GitLab 429 also counts (node #130); GitHub keeps its one pattern.
+ */
 export function graphFailure(
   message: string,
   stderr: string,
+  repo: string,
 ): GraphError {
-  return RATE_LIMITED.test(stderr)
+  const gitlab = parseForgeRef(repo).forge === "gitlab";
+  return RATE_LIMITED.test(stderr) || (gitlab && isGitLabRateLimit(stderr))
     ? new RateLimitError(message)
     : new GraphError(message);
 }
@@ -227,6 +233,7 @@ export async function graphFrontier(
     throw graphFailure(
       `soma graph frontier ${root} (${repo}) failed (exit ${result.code}): ${result.stderr.trim()}`,
       result.stderr,
+      repo,
     );
   }
   return normalizeFrontier(repo, parseJson<FrontierResult>("frontier", result.stdout));
@@ -249,6 +256,7 @@ export async function graphAudit(
     throw graphFailure(
       `soma graph audit ${root} (${repo}) failed (exit ${result.code}): ${result.stderr.trim()}`,
       result.stderr,
+      repo,
     );
   }
   const audit = parseJson<AuditResult>("audit", result.stdout);
@@ -285,6 +293,7 @@ export async function graphNode(
     throw graphFailure(
       `soma graph node ${id} (${repo}) failed (exit ${result.code}): ${result.stderr.trim()}`,
       result.stderr,
+      repo,
     );
   }
   return normalizeGraphNode(repo, parseJson<NodeResult>("node", result.stdout));

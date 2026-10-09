@@ -38,6 +38,23 @@ function isRetryableRead(text: string): boolean {
  return isTransientGitHubError(text) || READ_RETRYABLE.some((pattern) => pattern.test(text));
 }
 
+/**
+ * A GitLab refusal for rate limiting (node #130): glab and soma's GitLab
+ * backend report a 429 as its status line or reason phrase. Anchored to the
+ * HTTP status: a bare "429" may be a node or issue number. Never retried
+ * here: requests sent while limited can extend the limit, so it becomes a
+ * RateLimitError and a cooldown instead (src/graph.ts, src/budget.ts).
+ */
+const GITLAB_RATE_LIMITED = [
+ /\bHTTP(?:\/[\d.]+)?:?\s+429\b/i,
+ /\b429 Too Many Requests\b/i,
+ /\bToo Many Requests\b/i,
+];
+
+export function isGitLabRateLimit(text: string): boolean {
+ return GITLAB_RATE_LIMITED.some((pattern) => pattern.test(text));
+}
+
 /** Delays between attempts: three attempts in all, about 40 s of waiting. */
 export const TRANSIENT_BACKOFF_MS = [10_000, 30_000];
 
