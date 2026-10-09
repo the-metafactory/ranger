@@ -74,9 +74,12 @@ On a GitLab map, the desk acts in this order:
    - A head moved by anyone else still fails `review-clean` and parks, as
      on GitHub. That includes a push past ranger's rebase head.
    - A head that moved while ranger knew its rebase only as `pending`
-     (the rebase outlasted the 3 s wait and landed between passes) parks
-     too. Nothing ranger reads tells its rebase from another push there,
-     so the principal checks it.
+     (the rebase outlasted the 3 s wait and landed between passes) also
+     goes back for a fresh round. Nothing ranger reads tells its rebase
+     from another push there, so auto-merge is held: while the latest
+     `rebased` event is pending and its `from` is not the gated head,
+     the row ends at the merge card, with a note asking the principal to
+     confirm the moved head is ranger's rebase. Ranger never merges it.
 2. The gate is evaluated. For `needs-rebase` it treats the merge state as
    mergeable, so ranger rebases only a change it would merge.
 3. The `ranger:needs-eye` labels are read through the port. A labelled

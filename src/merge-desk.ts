@@ -127,23 +127,38 @@ function rebasedNote(rebase: Exclude<RebaseOutcome, { status: "not-mergeable" }>
 }
 
 /**
- * The reviewed head ranger itself rebased away from, when that explains a
- * head with no review: ranger's latest rebase started at the latest review's
- * head, and ranger saw it land at the current head. Null otherwise: a head
- * past ranger's rebase, or one that moved while ranger knew its rebase only
- * as pending, may be anyone's push, so it gets no attribution and fails
- * `review-clean` (it parks).
+ * The reviewed head ranger asked the forge to rebase away from, when that
+ * explains a head with no review: ranger's latest rebase started at the
+ * latest review's head and the head has moved. `seen` when ranger saw it
+ * land at the current head; unseen when ranger knew it only as pending (it
+ * outlasted the wait and landed between passes, or someone else pushed in
+ * that window). Null otherwise: a head past ranger's observed rebase head is
+ * anyone's push, gets no attribution and fails `review-clean` (it parks).
  */
-function ownRebaseOfLatestReview(
+function rebaseOfLatestReview(
  journal: Journal,
  repo: string,
  nodeId: string,
  latestReviewSha: string | null,
  headSha: string,
-): string | null {
+): { from: string; seen: boolean } | null {
  const latest = journal.listRebases(repo, nodeId, 1)[0];
- if (latest === undefined || latest.to !== headSha) return null;
- return latest.from === latestReviewSha && latest.from !== headSha ? latest.from : null;
+ if (latest === undefined || latest.from !== latestReviewSha || latest.from === headSha) return null;
+ if (latest.to === headSha) return { from: latest.from, seen: true };
+ return latest.to === null ? { from: latest.from, seen: false } : null;
+}
+
+/**
+ * Why auto-merge is held after a rebase ranger did not see land, or null:
+ * the latest rebase is still pending in the journal and the head has moved
+ * from where it started. Nothing ranger reads tells that landing from
+ * another push, so whatever head follows ends at the merge card. Stateless:
+ * the journal's latest rebase decides, every pass.
+ */
+function unseenRebaseHold(journal: Journal, repo: string, nodeId: string, headSha: string): string | null {
+ const latest = journal.listRebases(repo, nodeId, 1)[0];
+ if (latest === undefined || latest.to !== null || latest.from === headSha) return null;
+ return `the head moved from ${latest.from.slice(0, 8)} after ranger asked for a rebase, and ranger did not see the rebase land`;
 }
 
 /**
@@ -155,14 +170,17 @@ function sendBackReason(
  base: string,
  last: Review | undefined,
  missingProbes: boolean,
- rebasedFrom: string | null,
+ rebased: { from: string; seen: boolean } | null,
 ): string | null {
  const head = pr.headSha.slice(0, 8);
  if (last !== undefined && gatingFindings(last) > 0) {
   return `sage round ${last.round} at ${head} has ${last.blockers} blocker(s) and ${last.majors} major(s) to rework`;
  }
  if (last !== undefined && pr.mergeState === "conflict") return `PR #${pr.iid} conflicts with ${base} at ${head}`;
- if (rebasedFrom !== null) return `ranger rebased !${pr.iid} from ${rebasedFrom.slice(0, 8)}; the new head ${head} has no review yet`;
+ if (rebased?.seen === true) return `ranger rebased !${pr.iid} from ${rebased.from.slice(0, 8)}; the new head ${head} has no review yet`;
+ if (rebased?.seen === false) {
+  return `the head of !${pr.iid} moved from ${rebased.from.slice(0, 8)} to ${head} after ranger asked for a rebase, unseen; the new head has no review yet, and auto-merge is held on it`;
+ }
  if (missingProbes) return `no passing probe run at ${head}`;
  return null;
 }
@@ -394,8 +412,9 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   // Ranger rebased the reviewed head (a forge under rebase_merge asked): the
   // new head has no review, so it is re-gated by a fresh round, not parked.
   // The review never carries across the rebase: the gate binds to its head.
-  const rebasedFrom = last === undefined ? ownRebaseOfLatestReview(journal, repo, row.nodeId, latestSha, pr.headSha) : null;
-  const why = sendBackReason(pr, map.base, last, missingProbes, rebasedFrom);
+  // A landing ranger did not see is re-gated too, but never auto-merged.
+  const rebased = last === undefined ? rebaseOfLatestReview(journal, repo, row.nodeId, latestSha, pr.headSha) : null;
+  const why = sendBackReason(pr, map.base, last, missingProbes, rebased);
   // A send-back is a worker session; a CI-only park never starts one.
   if (ciPark && why !== null) return;
   if (why !== null && ctx.spawn !== undefined) {
@@ -488,7 +507,8 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    });
    if (row.mergeMessageId !== null) return; // its card is still up
   }
-  if (map.autoMerge && !needsEye && superseded === null) {
+  const rebaseHold = unseenRebaseHold(journal, repo, row.nodeId, gate.headSha);
+  if (map.autoMerge && !needsEye && superseded === null && rebaseHold === null) {
    const merge = await autoMerge(row, pr, gate.headSha, title, rebasePr);
    if (merge === null) return;
    // A merge the forge did not squash is still a merge: record it and close,
@@ -530,6 +550,9 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
     ...(superseded !== null
      ? [`Note: ${superseded}; the reviewer may have missed it, check before you merge.${map.autoMerge ? " Auto-merge is held on this head for that reason." : ""}`]
      : []),
+    ...(rebaseHold !== null
+     ? [`Note: ${rebaseHold}. Confirm the moved head is ranger's rebase before you merge.${map.autoMerge ? " Auto-merge is held for that reason." : ""}`]
+     : []),
     ...(needsRebase ? [`The forge asks for a rebase first: rebase the MR onto \`${map.base}\`, then merge it.`] : []),
     ...(probesRequired
      ? [`Probes passed at \`${gate.headSha.slice(0, 8)}\` (selection ${probe?.mode ?? "?"}, ${probe?.selected ?? "?"} probe(s)). Only the selected probes ran, not the full suite.${baseRedNote(probe)}`]
@@ -560,7 +583,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    );
   }
   journal.updateWorker(row.nodeId, repo, { mergeMessageId: messageId });
-  journal.recordEvent("merge-card", { nodeId: row.nodeId, repo, detail: `PR #${pr.iid}, message ${messageId}${superseded !== null ? `; ${superseded}` : ""}` });
+  journal.recordEvent("merge-card", { nodeId: row.nodeId, repo, detail: `PR #${pr.iid}, message ${messageId}${superseded !== null ? `; ${superseded}` : ""}${rebaseHold !== null ? `; ${rebaseHold}` : ""}` });
   result.cards.push(row.nodeId);
  }
 }

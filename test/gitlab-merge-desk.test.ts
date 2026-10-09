@@ -170,7 +170,7 @@ describe("node #126 — gitlab-rebase-squash-merge: the merge desk on a GitLab m
   } finally { r.close(); }
  });
 
- test("a head that moved while ranger knew its rebase only as pending is not attributed to ranger: it parks", async () => {
+ test("a head that moved while ranger knew its rebase only as pending is re-gated, then held at the card: never auto-merged", async () => {
   const r = rig();
   try {
    const mr = needsRebase({ rebase: { status: "pending", reason: "GitLab is still rebasing !9 after 2 checks", requested: true } });
@@ -179,9 +179,18 @@ describe("node #126 — gitlab-rebase-squash-merge: the merge desk on a GitLab m
    // Between passes the head moves, unobserved: ranger's rebase landing, or anyone's push.
    mr.head = REBASED;
    mr.mergeState = "mergeable";
-   expect(await r.desk(gl.port)).toMatchObject({ parked: ["96"], resumed: [] });
-   expect(r.row()?.outcome).toContain("review-clean");
-   expect(r.spawned).toEqual([]);
+   expect(await r.desk(gl.port)).toMatchObject({ resumed: ["96"], parked: [] });
+   expect(r.events("sweep").map((e) => e.detail)).toContainEqual(expect.stringContaining("after ranger asked for a rebase, unseen"));
+
+   // The fresh round passes at the moved head: the gate passes, but ranger does not merge it.
+   r.journal.updateWorker("96", r.map.repo, { status: "awaiting-merge", phase: "awaiting-merge", pid: null });
+   mr.comments.push(review(REBASED, 3));
+   gl.calls.length = 0;
+   expect(await r.desk(gl.port)).toMatchObject({ cards: ["96"], merged: [], parked: [] });
+   expect(gl.calls).not.toContain("mergePr");
+   expect(gl.calls).not.toContain("rebasePr");
+   expect(r.posts.at(-1)).toContain(`the head moved from ${GATED.slice(0, 8)} after ranger asked for a rebase, and ranger did not see the rebase land. Confirm the moved head is ranger's rebase`);
+   expect(r.posts.at(-1)).toContain("Auto-merge is held for that reason.");
   } finally { r.close(); }
  });
 
@@ -354,7 +363,7 @@ describe("node #126 — gitlab-rebase-squash-merge: the merge desk on a GitLab m
  test("the rebase bound counts per head: requests from an earlier head do not count against a new one", async () => {
   const r = rig();
   try {
-   for (let i = 0; i < 3; i++) r.journal.recordRebase({ nodeId: "96", repo: r.map.repo, from: REBASED, to: null, requested: true, note: "earlier head" });
+   for (let i = 0; i < 3; i++) r.journal.recordRebase({ nodeId: "96", repo: r.map.repo, from: REBASED, to: "e".repeat(40), requested: true, note: "earlier head" });
    const gl = fakeGitLab(needsRebase());
    expect(await r.desk(gl.port)).toMatchObject({ pending: ["96"], parked: [] });
    expect(gl.calls).toContain("rebasePr");
