@@ -1,13 +1,16 @@
 import { encodeForgeRef, parseForgeRef, isGithubRepo } from "./forge-ref.ts";
 import {
   type BudgetPolicy,
+  BudgetDeferral,
   assertNotThrottled,
   budgetedRead,
 } from "./budget.ts";
 import { runCmd } from "./exec.ts";
 import {
+  type BuildBriefNotReady,
   type FrontierResult,
   GRAPH_CALL_TIMEOUT_MS,
+  graphAudit,
   graphFrontier,
 } from "./graph.ts";
 import type { Journal } from "./journal.ts";
@@ -42,13 +45,29 @@ import { gatedEnv, type ResolvedToken } from "./token-gate.ts";
  *
  * The cache lives in the journal's `health` table (`frontier:<repo>#<root>`):
  * disposable derived state, so deleting it costs one fresh read.
+ *
+ * A fresh read also reads `soma graph audit` for its build-brief-not-ready
+ * finding (node #154, soma#752 D4: soma's audit is the only definition), and
+ * caches it beside the frontier under the same sentinel: a body fixed on the
+ * graph bumps `updated_at`, so the next tick re-reads both.
  */
 
 interface CachedFrontier {
   sentinel: string;
   fetchedAt: string;
   frontier: FrontierResult;
+  /** The audit's finding at that read; absent in entries cached before node #154. */
+  briefs?: BuildBriefNotReady[];
 }
+
+/**
+ * Soma's build-brief-not-ready finding for one frontier read. `ok: false`
+ * when the audit could not be read: the walk then holds every build node
+ * (src/route.ts). A soma without the field reads as `ok` with none listed.
+ */
+export type BriefAudit =
+  | { ok: true; notReady: BuildBriefNotReady[] }
+  | { ok: false; error: string };
 
 export const frontierCacheKey = (repo: string, root: number) => encodeForgeRef(parseForgeRef(repo), root).cacheKey;
 
@@ -113,6 +132,7 @@ export interface ReadFrontierArgs {
 
 export interface FrontierRead {
   frontier: FrontierResult;
+  briefs: BriefAudit;
   /** `cache` when the sentinel matched and no GraphQL was spent. */
   source: "cache" | "fresh";
 }
@@ -136,10 +156,11 @@ export async function readFrontier(
   if (
     sentinel !== null &&
     cached !== null &&
+    cached.briefs !== undefined &&
     cached.sentinel === sentinel &&
     now.getTime() - new Date(cached.fetchedAt).getTime() < maxAgeMs
   ) {
-    return { frontier: cached.frontier, source: "cache" };
+    return { frontier: cached.frontier, briefs: { ok: true, notReady: cached.briefs }, source: "cache" };
   }
   // The sentinel was read BEFORE the walk, so a change landing between the
   // two is in the frontier but not the sentinel — the next read sees a new
@@ -149,15 +170,39 @@ export async function readFrontier(
       timeoutMs: args.timeoutMs ?? GRAPH_CALL_TIMEOUT_MS,
     }),
   );
-  if (sentinel !== null) {
+  const briefs = await readBriefs(args);
+  // A failed audit is not cached: the next tick reads both again.
+  if (sentinel !== null && briefs.ok) {
     const entry: CachedFrontier = {
       sentinel,
       fetchedAt: now.toISOString(),
       frontier,
+      briefs: briefs.notReady,
     };
     journal.setHealth(frontierCacheKey(repo, root), JSON.stringify(entry));
   }
-  return { frontier, source: "fresh" };
+  return { frontier, briefs, source: "fresh" };
+}
+
+/**
+ * The audit's build-brief-not-ready finding. A budget deferral defers the
+ * whole read like the frontier's own; any other failure (a soma error, a
+ * malformed finding) is returned as `ok: false`, so research and task
+ * nodes still walk while build nodes wait.
+ */
+async function readBriefs(args: ReadFrontierArgs): Promise<BriefAudit> {
+  const { journal, repo, root, token, policy, now } = args;
+  try {
+    const audit = await budgetedRead(journal, repo, token, policy, now, () =>
+      graphAudit(repo, root, token, {
+        timeoutMs: args.timeoutMs ?? GRAPH_CALL_TIMEOUT_MS,
+      }),
+    );
+    return { ok: true, notReady: audit.buildBriefNotReady ?? [] };
+  } catch (error) {
+    if (error instanceof BudgetDeferral) throw error;
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
 }
 
 /**
@@ -170,9 +215,13 @@ export function cachedFrontier(
   journal: Journal,
   repo: string,
   root: number,
-): { fetchedAt: string; frontier: FrontierResult } | null {
+): { fetchedAt: string; frontier: FrontierResult; briefs?: BriefAudit } | null {
   const cached = readCache(journal, repo, root);
   return cached === null
     ? null
-    : { fetchedAt: cached.fetchedAt, frontier: cached.frontier };
+    : {
+        fetchedAt: cached.fetchedAt,
+        frontier: cached.frontier,
+        ...(cached.briefs === undefined ? {} : { briefs: { ok: true as const, notReady: cached.briefs } }),
+      };
 }

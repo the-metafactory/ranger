@@ -5,7 +5,7 @@ import { mapKey } from "./maps.ts";
 import { EscalationDiscord, DiscordMessageGoneError } from "./discord.ts";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import type { Journal, EscalationRow } from "./journal.ts";
-import { ESCALATE_REASONS, type ClassifiedNode } from "./route.ts";
+import { briefHoldReason, ESCALATE_REASONS, type ClassifiedNode } from "./route.ts";
 import { LeaseLostError, withEscalateLock, type OwnedCheck } from "./lock.ts";
 import { assertReadOnlyToken, type ResolvedToken } from "./token-gate.ts";
 import type { NodeResult } from "./graph.ts";
@@ -44,10 +44,12 @@ const CARD_HEADS: Record<string, string> = {
   untyped: "⚠️ **Needs typing**",
   "hitl-kind-as-auto": "🧹 **Map hygiene**",
   provisioning: "🔧 **Provisioning needed**",
+  "brief-not-ready": "📝 **Build brief not ready**",
 };
 
 function cardHead(node: ClassifiedNode): string {
   if (node.route.route === "provisioning") return CARD_HEADS.provisioning;
+  if (node.route.route === "brief-not-ready") return CARD_HEADS["brief-not-ready"];
   if (node.route.route === "escalate-hitl") {
     if (node.kind === "grilling") return CARD_HEADS.grilling;
     if (node.kind === "prototype") return CARD_HEADS.prototype;
@@ -138,7 +140,9 @@ function cardFraming(
   const reason = sanitizeGraphText(
     node.route.route === "escalate-hitl"
       ? ESCALATE_REASONS[node.route.reason]
-      : "auto node with registry-blocked probes — provisioning needed",
+      : node.route.route === "brief-not-ready"
+        ? `${briefHoldReason(node.route.missing)} — ranger will not take it until soma's graph audit no longer lists it`
+        : "auto node with registry-blocked probes — provisioning needed",
   );
   const probeLines =
     node.route.route === "provisioning" && node.blockedProbes !== undefined
@@ -1040,7 +1044,9 @@ function cardFrom(
     reason:
       node.route.route === "escalate-hitl"
         ? node.route.reason
-        : "registry-blocked",
+        : node.route.route === "brief-not-ready"
+          ? "brief-not-ready"
+          : "registry-blocked",
     ageDays,
     status: "open",
     createdAt: row.createdAt,
@@ -1050,7 +1056,10 @@ function cardFrom(
 
 export function cardNeeded(node: ClassifiedNode): boolean {
   return (
-    node.route.route === "escalate-hitl" || node.route.route === "provisioning"
+    node.route.route === "escalate-hitl" ||
+    node.route.route === "provisioning" ||
+    // An unread audit names nothing missing: no card until it is read.
+    (node.route.route === "brief-not-ready" && node.route.missing !== null)
   );
 }
 

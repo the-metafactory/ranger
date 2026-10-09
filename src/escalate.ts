@@ -102,7 +102,7 @@ async function escalateOneMap(
   }
 
   try {
-    const { frontier } = await readFrontier({
+    const { frontier, briefs } = await readFrontier({
       journal,
       repo: map.repo,
       root: map.root,
@@ -118,12 +118,15 @@ async function escalateOneMap(
         botIdentity: config.bot.identity,
         allowlist: map.nodes,
         skip: map.skip,
+        briefs,
       }),
     );
     const needed = [
       ...hitlWaiting(classified),
       ...classified.filter((n) => n.route.route === "provisioning"),
+      ...classified.filter((n) => n.route.route === "brief-not-ready"),
     ].filter(cardNeeded);
+    if (!briefs.ok) base.cardErrors.push(`build briefs unverified: ${briefs.error}`);
 
     // The absent-card reconciliation runs FIRST so its GUARANTEED reserved
     // ops also get a FRESH wall-clock window — if it ran after the active
@@ -134,7 +137,12 @@ async function escalateOneMap(
     // served next tick (only absent carries the hard guarantee). Total
     // per-tick bound is still MAX_CARDS_PER_TICK (active cap + absent
     // reserve).
-    const neededIds = new Set(needed.map((n) => n.id));
+    // A build node held only because the audit was unreadable gets no card,
+    // and keeps any brief card it has: its readiness is unknown, not fixed.
+    const neededIds = new Set([
+      ...needed.map((n) => n.id),
+      ...classified.filter((n) => n.route.route === "brief-not-ready").map((n) => n.id),
+    ]);
     const absent = await markAbsentCards(
       {
         client,

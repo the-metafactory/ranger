@@ -63,7 +63,7 @@ import { queueEntryGate, queueSpawnGate } from "./resume.ts";
 import { cachedFrontier } from "./frontier-cache.ts";
 import { type FrontierEntry, graphFrontier, RateLimitError } from "./graph.ts";
 import { runCmd } from "./exec.ts";
-import { classify, classifyFrontier, type ClassifiedNode, loadProbeRegistry } from "./route.ts";
+import { briefHoldReason, classify, classifyFrontier, type ClassifiedNode, loadProbeRegistry } from "./route.ts";
 import { liveSession, substrateUsageViews, type SubstrateUsageView } from "./substrate-usage.ts";
 import { resolveReadOnlyToken, assertReadOnlyToken, gatedEnv, tokenBatch, type TokenBatch, type ResolvedToken } from "./token-gate.ts";
 import { childEnv, itermArgv, shellQuote } from "./launch.ts";
@@ -333,6 +333,7 @@ const laneOf = (n: ClassifiedNode): "implement" | "research" | undefined =>
 /** Why a node waits on the principal, in a few words; null when ranger can take it. */
 function escalation(n: ClassifiedNode): string | null {
  if (n.route.route === "provisioning") return "its probes are not provisioned on this host";
+ if (n.route.route === "brief-not-ready") return briefHoldReason(n.route.missing);
  if (n.route.route !== "escalate-hitl") return null;
  if (n.route.reason === "untyped") return "its typed block is missing or broken";
  if (n.route.reason === "hitl-kind-as-auto") return `a ${n.kind} declared auto (map hygiene)`;
@@ -1802,7 +1803,7 @@ export function stateFromJournal(
        }
      : {
         ok: true,
-        frontier: classifyFrontier(cached.frontier.frontier, map, registry, config.bot.identity),
+        frontier: classifyFrontier(cached.frontier.frontier, map, registry, config.bot.identity, cached.briefs),
         readAt: cached.fetchedAt,
         source: "ranger",
        },

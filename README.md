@@ -167,6 +167,13 @@ bun src/cli.ts journal                    # inspect workers/events/health
   the claim.
 - **Race-safe claim:** `soma graph claim` re-reads and tie-breaks; a lost race
   is skipped, never fought.
+- **Build briefs (node #154):** a build node that `soma graph audit` lists
+  under `buildBriefNotReady` routes `brief-not-ready`: the tick does not take
+  it, and the escalation desk posts one card naming what is missing. The audit
+  is read with each fresh frontier read and cached beside it, so a fixed body
+  is re-checked on the next tick. An audit without the field (soma before
+  soma#753) holds nothing; an unreadable or malformed audit holds every build
+  node until it reads. `ranger build-now` does not consult the audit.
 - **Dead-man + spend bound (design §7):** N consecutive worker failures pause
   claiming; a daily spawn cap bounds spend. `RANGER_NO_SPAWN=1` claims without
   spawning (simulation).

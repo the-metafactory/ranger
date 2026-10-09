@@ -88,6 +88,12 @@ case "$verb" in
     if [ "$verb" != "node" ] && [ -f "${FAKE_SOMA_DIR}/${key}-${verb}-${root}.json" ]; then
       file="${FAKE_SOMA_DIR}/${key}-${verb}-${root}.json"
     fi
+    # The frontier read also audits (node #154). A test with no audit fixture
+    # gets a clean audit without buildBriefNotReady — today's installed soma.
+    if [ "$verb" = "audit" ] && [ ! -f "$file" ]; then
+      printf '{"repo":"%s","root":"%s","nodes":0,"closedWithoutReceipt":[],"openWithoutCheckpoint":[],"openClaimed":[]}\n' "$repo" "$root"
+      exit 0
+    fi
     if [ ! -f "$file" ]; then
       echo "fake soma: no fixture $file" >&2
       exit 93

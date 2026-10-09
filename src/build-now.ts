@@ -10,6 +10,7 @@ import type { OwnedCheck } from "./lock.ts";
 import { implementLane } from "./lanes.ts";
 import { laneHeldMessage } from "./maps.ts";
 import {
+ briefHoldReason,
  classifyFrontier,
  ESCALATE_REASONS,
  loadProbeRegistry,
@@ -104,6 +105,7 @@ function notWalkable(node: ClassifiedNode): string | null {
  if (route.route === "provisioning") {
   return "routes provisioning: its probes are not in the probe registry";
  }
+ if (route.route === "brief-not-ready") return `routes brief-not-ready: ${briefHoldReason(route.missing)}`;
  if (!route.walkable) {
   return `routes ${route.route} but is not walkable on this map (walk mode, nodes allowlist or skip list)`;
  }
