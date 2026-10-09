@@ -142,6 +142,17 @@ describe("node #126 — gitlab-rebase-squash-merge: the merge desk on a GitLab m
   } finally { r.close(); }
  });
 
+ test("the squash commit GitLab reports is named in the merged event and the notice", async () => {
+  const r = rig();
+  try {
+   const squashSha = "f".repeat(40);
+   const gl = fakeGitLab(needsRebase({ mergeState: "mergeable", merge: { status: "merged", squashSha } }));
+   expect(await r.desk(gl.port)).toMatchObject({ merged: ["96"], parked: [], errors: [] });
+   expect(r.events("merged")[0]?.detail).toContain(`squash-merged as ${squashSha.slice(0, 8)} by ranger at ${GATED.slice(0, 8)}`);
+   expect(r.posts.at(-1)).toContain(`squash-merged as ${squashSha.slice(0, 8)} by ranger`);
+  } finally { r.close(); }
+ });
+
  test("a rebase still running after the bounded wait is pending, and never merges in the same pass", async () => {
   const r = rig();
   try {
@@ -231,11 +242,12 @@ describe("node #126 — gitlab-rebase-squash-merge: the merge desk on a GitLab m
    mr.rebase = { status: "pending", reason, requested: false };
    for (let pass = 1; pass < 10; pass++) expect(await r.desk(gl.port)).toMatchObject({ pending: ["96"], parked: [] });
    expect(r.events("rebased")).toHaveLength(10);
-   expect(r.events("rebased").filter((e) => e.detail?.includes("ranger waited on a running rebase of !9"))).toHaveLength(9);
+   expect(r.events("rebased").filter((e) => e.detail?.includes("ranger waited on a running rebase of MR !9"))).toHaveLength(9);
    gl.calls.length = 0;
    expect(await r.desk(gl.port)).toMatchObject({ parked: ["96"], pending: [] });
    expect(gl.calls).not.toContain("rebasePr");
-   expect(r.row()?.outcome).toContain(`requested a rebase of !9 from ${GATED.slice(0, 8)} 1 time(s) over 10 pass(es)`);
+   expect(r.row()?.outcome).toContain(`requested a rebase of MR !9 from ${GATED.slice(0, 8)} 1 time(s) over 10 pass(es), and the rebase the forge started has not landed`);
+   expect(r.row()?.outcome).not.toContain("still asks for a rebase");
   } finally { r.close(); }
  });
 
@@ -252,7 +264,7 @@ describe("node #126 — gitlab-rebase-squash-merge: the merge desk on a GitLab m
    expect(result).toMatchObject({ resumed: ["96"], parked: [], merged: [] });
    expect(gl.calls).toEqual(["getPr", "listComments"]);
    expect(r.row()).toMatchObject({ status: "running", phase: "review" });
-   expect(r.events("sweep").map((e) => e.detail)).toContainEqual(expect.stringContaining(`ranger rebased !9 from ${GATED.slice(0, 8)}`));
+   expect(r.events("sweep").map((e) => e.detail)).toContainEqual(expect.stringContaining(`ranger rebased MR !9 from ${GATED.slice(0, 8)}`));
   } finally { r.close(); }
  });
 
@@ -355,7 +367,7 @@ describe("node #126 — gitlab-rebase-squash-merge: the merge desk on a GitLab m
    expect(gl.calls).not.toContain("rebasePr");
    expect(gl.calls).not.toContain("mergePr");
    expect(r.events("rebased")).toHaveLength(3);
-   expect(r.row()?.outcome).toContain(`requested a rebase of !9 from ${GATED.slice(0, 8)} 3 time(s) over 3 pass(es)`);
+   expect(r.row()?.outcome).toContain(`requested a rebase of MR !9 from ${GATED.slice(0, 8)} 3 time(s) over 3 pass(es), and the forge still asks for a rebase at that head`);
    expect(r.posts.at(-1)).toContain("**parked** #96");
   } finally { r.close(); }
  });

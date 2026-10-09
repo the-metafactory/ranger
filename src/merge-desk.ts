@@ -50,9 +50,12 @@ import { changeRequestLabel, changeRequestNoun, forgeName } from "./forge-text.t
  * merge is squashed and pinned to the gated head, and a project whose squash
  * option is `never` parks with a card before any write.
  *
- * Ranger never merges: approver-bot is unprovisioned (node #6/#16), so the
- * principal merges by hand. The review evidence is read from the bot's own
- * markers on the PR, not the journal (the journal is a cache).
+ * Who merges: on a map with `autoMerge` (principal, 2026-10-03), ranger
+ * merges a gate-passed change itself unless the node is labelled
+ * ranger:needs-eye. Everywhere else ranger never merges: approver-bot is
+ * unprovisioned (node #6/#16), so the principal merges by hand from the card.
+ * The review evidence is read from the bot's own markers on the PR, not the
+ * journal (the journal is a cache).
  */
 
 export interface MergeDeskContext {
@@ -80,6 +83,8 @@ export interface MergeDeskResult {
 
 type Review = ReturnType<typeof recordedReviews>[number];
 type Probe = ReturnType<typeof recordedProbes>[number];
+/** One recorded rebase pass (`journal.recordRebase`). */
+type RebaseRecord = ReturnType<Journal["listRebases"]>[number];
 
 /**
  * Ranger's standing review and passing probe run recorded at exactly
@@ -120,11 +125,12 @@ const MAX_REBASE_REQUESTS_AT_HEAD = 3;
 const MAX_REBASE_PASSES_AT_HEAD = 10;
 
 /** The `rebased` event's prose; the SHAs are the journal's (`recordRebase`). */
-function rebasedNote(rebase: Exclude<RebaseOutcome, { status: "not-mergeable" }>, iid: number, base: string): string {
- if (rebase.status === "head-moved") return `!${iid} rebased by ranger onto ${base}; the head moved, so it is re-gated there`;
+function rebasedNote(rebase: Exclude<RebaseOutcome, { status: "not-mergeable" }>, repo: string, iid: number, base: string): string {
+ const cr = changeRequestLabel(repo, iid);
+ if (rebase.status === "head-moved") return `${cr} rebased by ranger onto ${base}; the head moved, so it is re-gated there`;
  return rebase.requested
-  ? `ranger asked for a rebase of !${iid} onto ${base}; the head has not moved yet (${rebase.reason})`
-  : `ranger waited on a running rebase of !${iid} onto ${base}; the head has not moved yet (${rebase.reason})`;
+  ? `ranger asked for a rebase of ${cr} onto ${base}; the head has not moved yet (${rebase.reason})`
+  : `ranger waited on a running rebase of ${cr} onto ${base}; the head has not moved yet (${rebase.reason})`;
 }
 
 /**
@@ -137,13 +143,10 @@ function rebasedNote(rebase: Exclude<RebaseOutcome, { status: "not-mergeable" }>
  * anyone's push, gets no attribution and fails `review-clean` (it parks).
  */
 function rebaseOfLatestReview(
- journal: Journal,
- repo: string,
- nodeId: string,
+ latest: RebaseRecord | undefined,
  latestReviewSha: string | null,
  headSha: string,
 ): { from: string; seen: boolean } | null {
- const latest = journal.listRebases(repo, nodeId, 1)[0];
  if (latest === undefined || latest.from !== latestReviewSha || latest.from === headSha) return null;
  if (latest.to === headSha) return { from: latest.from, seen: true };
  return latest.to === null ? { from: latest.from, seen: false } : null;
@@ -156,8 +159,7 @@ function rebaseOfLatestReview(
  * another push, so whatever head follows ends at the merge card. Stateless:
  * the journal's latest rebase decides, every pass.
  */
-function unseenRebaseHold(journal: Journal, repo: string, nodeId: string, headSha: string): string | null {
- const latest = journal.listRebases(repo, nodeId, 1)[0];
+function unseenRebaseHold(latest: RebaseRecord | undefined, headSha: string): string | null {
  if (latest === undefined || latest.to !== null || latest.from === headSha) return null;
  return `the head moved from ${latest.from.slice(0, 8)} after ranger asked for a rebase, and ranger did not see the rebase land`;
 }
@@ -170,18 +172,18 @@ function sendBackReason(
  repo: string,
  pr: ChangeRequest,
  base: string,
- last: Review | undefined,
- missingProbes: boolean,
- rebased: { from: string; seen: boolean } | null,
+ evidence: { last: Review | undefined; missingProbes: boolean; rebased: { from: string; seen: boolean } | null },
 ): string | null {
+ const { last, missingProbes, rebased } = evidence;
  const head = pr.headSha.slice(0, 8);
+ const cr = changeRequestLabel(repo, pr.iid);
  if (last !== undefined && gatingFindings(last) > 0) {
   return `sage round ${last.round} at ${head} has ${last.blockers} blocker(s) and ${last.majors} major(s) to rework`;
  }
- if (last !== undefined && pr.mergeState === "conflict") return `${changeRequestLabel(repo, pr.iid)} conflicts with ${base} at ${head}`;
- if (rebased?.seen === true) return `ranger rebased !${pr.iid} from ${rebased.from.slice(0, 8)}; the new head ${head} has no review yet`;
+ if (last !== undefined && pr.mergeState === "conflict") return `${cr} conflicts with ${base} at ${head}`;
+ if (rebased?.seen === true) return `ranger rebased ${cr} from ${rebased.from.slice(0, 8)}; the new head ${head} has no review yet`;
  if (rebased?.seen === false) {
-  return `the head of !${pr.iid} moved from ${rebased.from.slice(0, 8)} to ${head} after ranger asked for a rebase, unseen; the new head has no review yet, and auto-merge is held on it`;
+  return `the head of ${cr} moved from ${rebased.from.slice(0, 8)} to ${head} after ranger asked for a rebase, unseen; the new head has no review yet, and auto-merge is held on it`;
  }
  if (missingProbes) return `no passing probe run at ${head}`;
  return null;
@@ -310,6 +312,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   headSha: string,
   cardTitle: string,
   rebasePr: ForgePort["rebasePr"],
+  rebases: RebaseRecord[],
  ): Promise<Extract<MergeOutcome, { status: "merged" }> | null> {
   // Ranger merges only squashed: a project that forbids it escalates before any write.
   const refusal = await squashRefusal();
@@ -318,26 +321,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    return null;
   }
   if (rebasePr !== undefined) {
-   const passes = journal.listRebases(repo, row.nodeId).filter((r) => r.from === headSha);
-   const asked = passes.filter((r) => r.requested).length;
-   if (asked >= MAX_REBASE_REQUESTS_AT_HEAD || passes.length >= MAX_REBASE_PASSES_AT_HEAD) {
-    await park(
-     row,
-     `ranger requested a rebase of !${pr.iid} from ${headSha.slice(0, 8)} ${asked} time(s) over ${passes.length} pass(es), and the forge still asks for a rebase at that head. Rebase it by hand onto ${map.base}, then merge it.`,
-     cardTitle,
-    );
-    return null;
-   }
-   const rebase = await rebasePr(repo, pr.iid, token);
-   if (rebase.status === "not-mergeable") {
-    await park(row, rebase.reason, cardTitle);
-    return null;
-   }
-   journal.recordRebase({
-    nodeId: row.nodeId, repo, from: headSha, to: rebase.status === "head-moved" ? rebase.headSha : null, requested: rebase.requested,
-    note: rebasedNote(rebase, pr.iid, map.base),
-   });
-   result.pending.push(row.nodeId);
+   await rebaseStep(row, pr, headSha, cardTitle, rebasePr, rebases);
    return null;
   }
   const merge = await github.mergePr(repo, pr.iid, headSha, pr.title, token);
@@ -351,6 +335,42 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    return null;
   }
   return merge;
+ }
+
+ /**
+  * One rebase pass on a change the forge asks to rebase: park once the bound
+  * from this head is spent, else request (or wait on) the rebase and record
+  * it. The row stays pending or parks; nothing merges in this pass.
+  */
+ async function rebaseStep(
+  row: WorkerRow,
+  pr: ChangeRequest,
+  headSha: string,
+  cardTitle: string,
+  rebasePr: NonNullable<ForgePort["rebasePr"]>,
+  rebases: RebaseRecord[],
+ ): Promise<void> {
+  const cr = changeRequestLabel(repo, pr.iid);
+  const passes = rebases.filter((r) => r.from === headSha);
+  const asked = passes.filter((r) => r.requested).length;
+  if (asked >= MAX_REBASE_REQUESTS_AT_HEAD || passes.length >= MAX_REBASE_PASSES_AT_HEAD) {
+   const at = `ranger requested a rebase of ${cr} from ${headSha.slice(0, 8)} ${asked} time(s) over ${passes.length} pass(es)`;
+   const cause = asked >= MAX_REBASE_REQUESTS_AT_HEAD
+    ? "and the forge still asks for a rebase at that head"
+    : "and the rebase the forge started has not landed";
+   await park(row, `${at}, ${cause}. Rebase it by hand onto ${map.base}, then merge it.`, cardTitle);
+   return;
+  }
+  const rebase = await rebasePr(repo, pr.iid, token);
+  if (rebase.status === "not-mergeable") {
+   await park(row, rebase.reason, cardTitle);
+   return;
+  }
+  journal.recordRebase({
+   nodeId: row.nodeId, repo, from: headSha, to: rebase.status === "head-moved" ? rebase.headSha : null, requested: rebase.requested,
+   note: rebasedNote(rebase, repo, pr.iid, map.base),
+  });
+  result.pending.push(row.nodeId);
  }
 
  async function progress(row: WorkerRow): Promise<void> {
@@ -416,8 +436,10 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   // new head has no review, so it is re-gated by a fresh round, not parked.
   // The review never carries across the rebase: the gate binds to its head.
   // A landing ranger did not see is re-gated too, but never auto-merged.
-  const rebased = last === undefined ? rebaseOfLatestReview(journal, repo, row.nodeId, latestSha, pr.headSha) : null;
-  const why = sendBackReason(repo, pr, map.base, last, missingProbes, rebased);
+  // Ranger's recorded rebases, newest first, read once for this row.
+  const rebases = journal.listRebases(repo, row.nodeId);
+  const rebased = last === undefined ? rebaseOfLatestReview(rebases[0], latestSha, pr.headSha) : null;
+  const why = sendBackReason(repo, pr, map.base, { last, missingProbes, rebased });
   // A send-back is a worker session; a CI-only park never starts one.
   if (ciPark && why !== null) return;
   if (why !== null && ctx.spawn !== undefined) {
@@ -510,14 +532,16 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    });
    if (row.mergeMessageId !== null) return; // its card is still up
   }
-  const rebaseHold = unseenRebaseHold(journal, repo, row.nodeId, gate.headSha);
+  const rebaseHold = unseenRebaseHold(rebases[0], gate.headSha);
   if (map.autoMerge && !needsEye && superseded === null && rebaseHold === null) {
-   const merge = await autoMerge(row, pr, gate.headSha, title, rebasePr);
+   const merge = await autoMerge(row, pr, gate.headSha, title, rebasePr, rebases);
    if (merge === null) return;
    // A merge the forge did not squash is still a merge: record it and close,
    // and let the notice escalate it, never claiming a squash that did not happen.
    const unsquashed = merge.unsquashed;
-   const how = unsquashed === undefined ? "squash-merged" : "merged (NOT squashed)";
+   const how = unsquashed !== undefined
+    ? "merged (NOT squashed)"
+    : merge.squashSha === undefined ? "squash-merged" : `squash-merged as ${merge.squashSha.slice(0, 8)}`;
    journal.recordEvent("merged", {
     nodeId: row.nodeId,
     repo,

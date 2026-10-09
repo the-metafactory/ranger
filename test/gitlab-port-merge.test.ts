@@ -92,6 +92,16 @@ describe("node #126 — GitLab squash merge at the gated head", () => {
   });
  }
 
+ test("the squash commit GitLab names is carried; a missing or malformed one never fails the merge", async () => {
+  const squash = "e".repeat(40);
+  expect(await setup({ write: () => response({ state: "merged", squash: true, squash_commit_sha: squash }) }).port.mergePr(repo, 7, gated, "T", writeToken))
+   .toEqual({ status: "merged", squashSha: squash });
+  for (const missing of [null, undefined, "", "not a sha"]) {
+   expect(await setup({ write: () => response({ state: "merged", squash: true, squash_commit_sha: missing }) }).port.mergePr(repo, 7, gated, "T", writeToken))
+    .toEqual({ status: "merged" });
+  }
+ });
+
  test("a merge GitLab did not squash is still a merge, carrying the note that escalates it", async () => {
   const { port } = setup({ write: () => response({ state: "merged", squash: false }) });
   expect(await port.mergePr(repo, 7, gated, "T", writeToken)).toEqual({
@@ -184,6 +194,19 @@ describe("node #126 — rebase on need_rebase, bounded wait, never a merge", () 
   expect(outcome).toMatchObject({ status: "pending" });
   if (outcome.status !== "pending") throw new Error("expected pending");
   expect(outcome.reason).toContain(gated.slice(0, 8));
+ });
+
+ test("a merge_error already there before the rebase, on an unchanged head, is stale: pending with GitLab's text, never a park", async () => {
+  const { port } = setup({ write: accepted, read: script(state(false, gated, "Rebase failed: conflict"), state(false, gated, "Rebase failed: conflict")) });
+  const outcome = await port.rebasePr!(repo, 7, writeToken);
+  expect(outcome).toMatchObject({ status: "pending", requested: true });
+  if (outcome.status !== "pending") throw new Error("expected pending");
+  expect(outcome.reason).toContain("GitLab still reports the error it had before: Rebase failed: conflict");
+ });
+
+ test("a new merge_error replacing an older one on an unchanged head is this rebase failing: not mergeable", async () => {
+  const { port } = setup({ write: accepted, read: script(state(false, gated, "old merge failure"), state(false, gated, "Rebase failed: conflict")) });
+  expect(await port.rebasePr!(repo, 7, writeToken)).toEqual({ status: "not-mergeable", reason: "GitLab could not rebase !7: Rebase failed: conflict" });
  });
 
  test("a stale merge_error beside a moved head is the rebase landing", async () => {

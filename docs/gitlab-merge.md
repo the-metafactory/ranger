@@ -5,6 +5,11 @@ setting and ranger adapts. Ranger rebases when GitLab asks it to, waits,
 re-gates the new head, and then merges with `squash=true` pinned to the
 gated head. It refuses when the project disallows squash.
 
+"One squashed commit" means the MR's commits land as one squash commit,
+which carries the whole change. Under `rebase_merge` (semi-linear
+history) GitLab's merge method also writes a merge commit beside it, and
+that merge commit carries no change. See "What lands on the target".
+
 ## Port
 
 `GitLabPort` (in `src/gitlab.ts`) adds three operations:
@@ -19,6 +24,10 @@ gated head. It refuses when the project disallows squash.
   - 409 is `head-moved`.
   - 405, 406 and 422 are `not-mergeable`, carrying GitLab's own
     `message`, bounded to one line.
+  - A 200 whose response says `squash: true` is `merged`. When the
+    response names the squash commit (`squash_commit_sha`), the outcome
+    carries it as `squashSha` and the desk records it. A missing SHA is
+    no evidence against the squash, so it never fails the merge.
   - A 200 that is not squashed is still `merged`, with an `unsquashed`
     note. The merge happened, so the desk records it and closes, and the
     note escalates it.
@@ -36,8 +45,11 @@ gated head. It refuses when the project disallows squash.
   results:
   - A head that moved is `head-moved` with the new SHA, even beside a
     stale `merge_error`.
-  - A `merge_error` on an unchanged head, or a request GitLab refuses
-    (403, 405, 422), is `not-mergeable`.
+  - A `merge_error` this rebase left on an unchanged head, or a request
+    GitLab refuses (403, 405, 422), is `not-mergeable`. A `merge_error`
+    that was already there before the call is stale: the result is
+    `pending`, and its reason carries GitLab's text. If it is a real
+    failure that repeats, the desk's rebase bound parks the row.
   - Any other failed request (a 5xx, a 429, a 401) throws
     `GitLabWriteError`. The desk records an error and retries next pass;
     it does not park.
@@ -96,14 +108,17 @@ On a GitLab map, the desk acts in this order:
    records `from`, `to` (only when ranger saw the head move) and `wait`
    (when no request was sent). From one head, ranger sends at most 3
    requests and spends at most 10 passes (requests plus waits), then
-   parks the row with a card that gives both counts. A moved head starts
+   parks the row with a card that gives both counts. The card names the
+   cause: the forge still asking for a rebase (the request bound), or a
+   started rebase that never landed (the pass bound). A moved head starts
    a new count.
 6. Otherwise ranger runs `mergePr`:
    - `head-moved` stays pending and is re-gated next pass.
    - `not-mergeable` parks with the reason.
-   - `merged` takes the existing merged path. An `unsquashed` merge says
-     so in the `merged` event and the notice, which carries a warning
-     line for the principal.
+   - `merged` takes the existing merged path. The `merged` event and
+     the notice name the squash commit when GitLab reported one. An
+     `unsquashed` merge says so in both, and the notice carries a
+     warning line for the principal.
 
 `mergePr` reports refusals per adapter, as its doc on `ForgePort` says.
 GitHub's throws on every refusal, unchanged. GitLab's answers
@@ -130,7 +145,18 @@ then records the merge and escalates it.
 
 ## What lands on the target
 
-The MR's commits land as one squash commit. Under `rebase_merge`
-(semi-linear history) GitLab also writes a merge commit beside it, so
-the target gains two commits, and only the squash commit carries the
-change. Neither the tests nor this node check the target's history.
+The MR's commits land as one squash commit, and that commit carries
+the whole change. Under `rebase_merge` (semi-linear history) GitLab
+also writes a merge commit beside it. The target therefore gains two
+commits, and only the squash commit carries the change.
+
+What ranger checks, all against GitLab's own answers:
+
+- The request sends `squash=true`.
+- The project's `squash_option` is not `never`.
+- The merge response reports `squash: true`. Otherwise the merge is
+  escalated as unsquashed.
+- The `squash_commit_sha` is recorded when the response carries it.
+
+Ranger does not walk the target branch's history afterwards. The tests
+cover these checks against a stubbed GitLab, not a live instance.

@@ -60,9 +60,10 @@ export type MergeOutcome =
  /**
   * The change request is merged. `unsquashed` is set when the forge merged
   * without honouring the squash: still a merge (the close follows), and the
-  * note escalates it to the principal.
+  * note escalates it to the principal. `squashSha` is the squash commit the
+  * forge reports, when its response names one.
   */
- | { status: "merged"; unsquashed?: string }
+ | { status: "merged"; unsquashed?: string; squashSha?: string }
  /** The head is no longer the gated SHA: nothing merged; re-gate the new head. */
  | { status: "head-moved"; reason: string }
  /** The forge declined the merge; `reason` carries its own message. */

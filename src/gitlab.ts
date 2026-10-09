@@ -271,6 +271,9 @@ const ok = (status: number): boolean => status >= 200 && status < 300;
  */
 const REBASE_REFUSED = [403, 405, 422];
 
+/** Merge statuses that are GitLab declining (not allowed, not acceptable, unprocessable): the row parks. */
+const MERGE_REFUSED = [405, 406, 422];
+
 /** GitLab's own `message` from an error response, bounded; never subprocess output. */
 function forgeMessage(body: unknown, status: number): string {
  const message = body !== null && typeof body === "object" ? (body as Record<string, unknown>).message : undefined;
@@ -338,14 +341,17 @@ export class GitLabPort extends GitLabReadPort implements ForgePort<ResolvedToke
    "-F", "squash=true", "-f", `sha=${sha}`, "-f", `squash_commit_message=${title} (!${n})`,
   ]);
   if (status === 409) return { status: "head-moved", reason: `!${n} is no longer at ${sha.slice(0, 8)} (${forgeMessage(body, status)})` };
-  if ([405, 406, 422].includes(status)) return { status: "not-mergeable", reason: `GitLab declined to merge !${n}: ${forgeMessage(body, status)}` };
+  if (MERGE_REFUSED.includes(status)) return { status: "not-mergeable", reason: `GitLab declined to merge !${n}: ${forgeMessage(body, status)}` };
   if (!ok(status)) throw new GitLabWriteError(`merge failed (${forgeMessage(body, status)})`, endpoint, status);
   return this.decodeWrite(endpoint, () => {
    const r = object(body, endpoint);
    if (r.state !== "merged") invalid(endpoint, "state");
    // The merge happened; a squash GitLab did not honour is escalated, not hidden.
    if (r.squash !== true) return { status: "merged", unsquashed: `GitLab merged !${n} without squashing (squash=${String(r.squash)}): check the project's squash option` };
-   return { status: "merged" };
+   // The squash commit GitLab names, when its response carries one: the record of
+   // what landed. Its absence is no evidence against the squash, so it never fails.
+   const squashSha = r.squash_commit_sha;
+   return typeof squashSha === "string" && /^[0-9a-f]{7,64}$/.test(squashSha) ? { status: "merged", squashSha } : { status: "merged" };
   });
  }
 
@@ -373,8 +379,12 @@ export class GitLabPort extends GitLabReadPort implements ForgePort<ResolvedToke
    if (state.inProgress) continue;
    // A moved head is the rebase landing; a merge_error left from an earlier attempt does not undo it.
    if (state.headSha === before.headSha) {
-    if (state.mergeError !== null) return { status: "not-mergeable", reason: `GitLab could not rebase !${n}: ${state.mergeError}` };
-    return { status: "pending", reason: `GitLab finished rebasing !${n} but the head is still ${before.headSha.slice(0, 8)}`, requested };
+    // Only an error this rebase left parks: one already there before it is
+    // stale, so the row stays pending (the desk's rebase bound still ends it),
+    // carrying GitLab's text in case the same failure repeated.
+    if (state.mergeError !== null && state.mergeError !== before.mergeError) return { status: "not-mergeable", reason: `GitLab could not rebase !${n}: ${state.mergeError}` };
+    const stale = state.mergeError === null ? "" : `; GitLab still reports the error it had before: ${state.mergeError}`;
+    return { status: "pending", reason: `GitLab finished rebasing !${n} but the head is still ${before.headSha.slice(0, 8)}${stale}`, requested };
    }
    return { status: "head-moved", headSha: state.headSha, requested };
   }
