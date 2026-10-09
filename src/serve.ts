@@ -55,9 +55,9 @@ import {
 } from "./config.ts";
 import { drainGate, implementCandidates, planTick, walkableCandidates, type DrainState } from "./candidates.ts";
 import { pidAlive as defaultPidAlive } from "./exec.ts";
-import { Journal, type WorkerRow } from "./journal.ts";
+import { Journal, type ResumeQueueRow, type WorkerRow } from "./journal.ts";
 import { ForeignMigrationError } from "./journal-guard.ts";
-import { implementLane, workerLane, type ImplementLane } from "./lanes.ts";
+import { IMPLEMENT_LANES, implementLane, workerLane, type ImplementLane } from "./lanes.ts";
 import { activeCooldown, readGraphqlBudget } from "./budget.ts";
 import { cachedFrontier } from "./frontier-cache.ts";
 import { type FrontierEntry, graphFrontier, RateLimitError } from "./graph.ts";
@@ -76,7 +76,10 @@ import {
  awaitingMergeEntries,
  type NeedsYouEntry,
  type PrView,
+ type QueuedResumeView,
+ resumeQueueViews,
  runAction,
+ runDrainAction,
  uncheckedNeedsEye,
 } from "./serve-parked.ts";
 
@@ -197,6 +200,15 @@ export interface StateInputs {
  needsYouUnchecked?: UncheckedRow[];
  /** Every awaiting-merge row, needs-eye or not: the Current job's "Merge now". */
  awaitingMerge?: NeedsYouEntry[];
+ /** The journal's resume queue, every lane, FIFO (node #166); absent means empty. */
+ resumeQueue?: ResumeQueueRow[];
+}
+
+/** One lane's queued resumes, FIFO, and what the next tick does with the head. */
+export interface LaneQueue {
+ entries: QueuedResumeView[];
+ /** Null on an empty queue. `starts`: the next tick resumes the head ahead of any frontier claim. */
+ head: { starts: boolean; reason: string } | null;
 }
 
 /** An awaiting-merge row that may need the principal's eye; its labels are unknown. */
@@ -301,6 +313,8 @@ export interface DashboardState {
  needsYou: NeedsYouEntry[];
  needsYouUnchecked: UncheckedRow[];
  awaitingMerge: NeedsYouEntry[];
+ /** Queued resumes per lane (node #166). */
+ resumeQueue: Record<ImplementLane, LaneQueue>;
 }
 
 const IN_FLIGHT = new Set<WorkerRow["status"]>(["claimed", "running", "awaiting-merge"]);
@@ -333,8 +347,49 @@ const view = (n: ClassifiedNode): NodeView => ({
  * count against the shared daily cap before a later map is planned.
  */
 interface TickSoFar {
- holders: Record<ImplementLane, { repo: string; nodeId: string; thisTick: boolean } | null>;
+ /** `resumed`: the holder is a queued resume this tick starts, not a claim. */
+ holders: Record<ImplementLane, { repo: string; nodeId: string; thisTick: boolean; resumed?: boolean } | null>;
  spawns: number;
+}
+
+/**
+ * The walk's Pass 1c, as the dashboard reads it: each lane's queue head
+ * starts before any map claims, taking the lane and one spawn, unless the
+ * dead-man pause, a lane holder or the spent cap holds it. A drain does not:
+ * it stops only fresh claims. Entries are visited in the journal's FIFO
+ * order, so with one spawn left the earlier-queued head takes it.
+ */
+function planQueueHeads(
+ queue: ResumeQueueRow[],
+ views: Record<ImplementLane, QueuedResumeView[]>,
+ inputs: StateInputs,
+ tick: TickSoFar,
+): Record<ImplementLane, LaneQueue> {
+ const out = Object.fromEntries(
+  IMPLEMENT_LANES.map((lane) => [lane, { entries: views[lane], head: null }]),
+ ) as Record<ImplementLane, LaneQueue>;
+ for (const entry of queue) {
+  const lane = out[entry.lane];
+  if (lane.head !== null) continue;
+  const key = nodeKey(entry.repo, entry.root);
+  const map = inputs.maps.find((m) => m.key === key && !m.servedOnly);
+  const holder = tick.holders[entry.lane];
+  const held =
+   map === undefined ? "its map is no longer registered: the tick holds it, and the lane's queue behind it"
+   : map.walk === "none" ? "its map is walk: none: the tick drops it"
+   : inputs.paused ? "dead-man paused: queued resumes wait for `ranger resume-run`"
+   : holder !== null ? `waits for the ${entry.lane} lane, held by #${holder.nodeId} (${holder.repo})`
+   : tick.spawns >= inputs.spawnCap ? `waits: the daily spawn cap (${inputs.spawnCap}) is spent`
+   : null;
+  if (held !== null) {
+   lane.head = { starts: false, reason: held };
+   continue;
+  }
+  tick.holders[entry.lane] = { repo: key, nodeId: entry.nodeId, thisTick: true, resumed: true };
+  tick.spawns += 1;
+  lane.head = { starts: true, reason: "the next tick resumes this, ahead of any frontier claim" };
+ }
+ return out;
 }
 
 function nextFor(
@@ -391,7 +446,9 @@ function nextFor(
    url: plan.waiting.url,
    lane: "implement",
    waiting: true,
-   reason: holder.thisTick
+   reason: holder.resumed === true
+    ? `waits for the ${map.lane} implement lane: this tick resumes queued #${holder.nodeId} (${holder.repo}) first`
+    : holder.thisTick
     ? `waits for the ${map.lane} implement lane: this tick claims #${holder.nodeId} (${holder.repo}) first`
     : `waits for the ${map.lane} implement lane, held by #${holder.nodeId} (${holder.repo})`,
   };
@@ -450,6 +507,9 @@ export function assembleState(inputs: StateInputs): DashboardState {
   holders: { visual: tickHolder("visual"), headless: tickHolder("headless") },
   spawns: inputs.spawnsToday,
  };
+ // Queued resumes start before any claim (walk Pass 1c, node #166).
+ const queue = inputs.resumeQueue ?? [];
+ const resumeQueue = planQueueHeads(queue, resumeQueueViews(queue, titleOf), inputs, tick);
  // Plan in the walk's rotation order; retain config order for display.
  const planned = new Map<string, NextJob>();
  for (const map of implementMapOrder(inputs.maps, inputs.lastImplementMaps ?? {}, m => m.lane)) {
@@ -526,6 +586,7 @@ export function assembleState(inputs: StateInputs): DashboardState {
   needsYou: inputs.needsYou ?? [],
   needsYouUnchecked: inputs.needsYouUnchecked ?? [],
   awaitingMerge: inputs.awaitingMerge ?? [],
+  resumeQueue,
  };
 }
 
@@ -689,6 +750,8 @@ const ACTION_PATHS: Record<string, ActionKind> = {
  "/api/resume": "resume",
  "/api/merge": "merge",
  "/api/session": "session",
+ "/api/queue-resume": "queue-resume",
+ "/api/cancel-resume": "cancel-resume",
 };
 
 const json = (status: number, body: unknown): Response =>
@@ -767,8 +830,10 @@ export function createHandler(ctx: HandlerContext): (req: Request) => Promise<Re
    const body = await readObject(req);
    if (body === null) return refuse(400, "body is not a JSON object");
    const actions = ctx.actions;
+   const state = ctx.getState();
    const result = await runAction(action, body, {
-    entries: actionEntries(ctx.getState()),
+    entries: actionEntries(state),
+    queue: IMPLEMENT_LANES.flatMap((lane) => state.resumeQueue?.[lane]?.entries ?? []),
     run: actions.run,
     env: actions.env ?? process.env,
     rangerBin: actions.rangerBin,
@@ -779,6 +844,20 @@ export function createHandler(ctx: HandlerContext): (req: Request) => Promise<Re
     inFlight,
    });
    if (result.entry !== undefined) actions.after?.(result.entry);
+   return json(result.status, result.body);
+  }
+  if (url.pathname === "/api/drain") {
+   if (ctx.actions === undefined) return refuse(501, "actions are not wired in this server");
+   const body = await readObject(req);
+   if (body === null) return refuse(400, "body is not a JSON object");
+   const result = await runDrainAction(body, {
+    maps: ctx.getState().maps,
+    run: ctx.actions.run,
+    env: ctx.actions.env ?? process.env,
+    rangerBin: ctx.actions.rangerBin,
+    configPath: ctx.actions.configPath,
+    inFlight,
+   });
    return json(result.status, result.body);
   }
   if (url.pathname !== "/api/grill" && url.pathname !== "/api/build-now") {
@@ -1006,6 +1085,10 @@ function renderNext(s) {
   const holder = s.gates.laneHolders[lane];
   const drained = lane === "visual" && s.gates.visualDrained ? " · DRAINED: no new implement claims on any visual map (ranger drain --lane visual --off)" : "";
   box.append(el("h3", { text: lane + " lane · " + (holder ? "held by #" + holder.nodeId + " (" + holder.repo + "#" + holder.root + ")" : "free") + drained }));
+  // The visual lane drains as one switch; a visual map has no drain of its own.
+  if (lane === "visual") box.append(el("div", { class: "acts" }, drainButton(s.gates.visualDrained, { lane: "visual" }, "the visual lane: no new implement claims on any visual map")));
+  const q = laneQueue(s, lane);
+  if (q) box.append(q);
   box.append(...byRepo("next/" + lane, s.maps.filter((m) => m.lane === lane), (m) => m.repo, (m) => {
    const n = m.next;
    const queued = m.queued || [];
@@ -1014,10 +1097,47 @@ function renderNext(s) {
     : null;
    const rest = queued.map((q, i) => el("li", {}, el("span", { class: "id", text: "#" + q.id }), el("span", { class: "t" }, link(q.url, q.title), el("span", { class: "reason", text: "then, " + ordinal(i + (n.nodeId ? 2 : 1)) + " in this map's queue" })), tags(tag(q.lane + " · " + q.kind), buildButton(s, m, q))));
    // With no head (cap spent, paused, vetoed), say why before the queue that waits.
-   const body = el("div", {}, head ? null : empty(n.reason), head || rest.length > 0 ? el("ul", {}, head, ...rest) : null);
-   return mapGroup("next/" + lane, m, (s.gates.drainedMaps || []).includes(m.key) ? " · DRAINED" : "", (n.nodeId ? 1 : 0) + queued.length, mapMeta(m), body);
+   const mapDrained = (s.gates.drainedMaps || []).includes(m.key);
+   const drain = m.lane === "headless" && !m.servedOnly ? el("div", { class: "acts" }, drainButton(mapDrained, { key: m.key }, m.key + ": no new claims on this map")) : null;
+   const body = el("div", {}, drain, head ? null : empty(n.reason), head || rest.length > 0 ? el("ul", {}, head, ...rest) : null);
+   return mapGroup("next/" + lane, m, mapDrained ? " · DRAINED" : "", (n.nodeId ? 1 : 0) + queued.length, mapMeta(m), body);
   }));
  }
+}
+// A verb run for the page (drain): its exit and stderr, shown on failure.
+async function pageVerb(path, body, label) {
+ document.getElementById("out").textContent = "";
+ try {
+  const r = await post(path, body);
+  say(label + (r.ok ? " ran." : " failed (exit " + (r.code === null ? "none" : r.code) + "): nothing changed."), !r.ok);
+  if (!r.ok) document.getElementById("out").textContent = r.stderr || "";
+ } catch (e) { say(label + " refused: " + e.message, true); }
+ load(); setTimeout(load, 3000);
+}
+function drainButton(drained, body, what) {
+ const cmd = "ranger drain " + (body.lane ? "--lane visual" : "--map " + body.key) + (drained ? " --off" : "");
+ return actionButton(drained ? "Undrain" : "Drain", cmd, true, async () => {
+  if (!confirm((drained ? "Lift the drain on " : "Drain ") + what + "?\\n\\nRuns " + cmd + ". Sweeps, the merge desk and queued resumes keep running either way.")) return;
+  await pageVerb("/api/drain", Object.assign({}, body, { off: drained }), cmd);
+ });
+}
+function cancelButton(n) {
+ return actionButton("Cancel", "ranger resume-node " + n.nodeId + " --map " + n.key + " --cancel", true, async () => {
+  if (!confirm("Cancel the queued resume of #" + n.nodeId + " (" + n.key + ")?")) return;
+  await act("cancel-resume", n, {});
+ });
+}
+// The lane's queued resumes, FIFO: the head starts before any frontier claim.
+function laneQueue(s, lane) {
+ const q = s.resumeQueue && s.resumeQueue[lane];
+ if (!q || q.entries.length === 0) return null;
+ return el("div", {}, el("span", { class: "reason", text: "Queued resumes, first in first out, ahead of any frontier claim:" }),
+  el("ul", {}, ...q.entries.map((e, i) => {
+   const head = i === 0 ? q.head : null;
+   const facts = ordinal(e.position) + " in the " + lane + " resume queue · " + e.key + " · queued " + ago(e.queuedAt) + (e.failedStarts ? " · " + e.failedStarts + " failed start(s)" : "") + (head ? " · " + head.reason : "");
+   return el("li", {}, el("span", { class: "id", text: "#" + e.nodeId }), el("span", { class: "t" }, link(e.url, e.title || "(title not in the frontier read)"), el("span", { class: "reason", text: facts })),
+    tags(tag(head && head.starts ? "next" : "queued"), cancelButton(e)));
+  })));
 }
 // build-now's exit codes: 0 started, 3 claimed with no run-node (BUILD_NOW_NOT_STARTED), null still running.
 function buildOutcome(id, code) {
@@ -1128,6 +1248,12 @@ function needsCard(n) {
  if (n.actions.resume) {
   acts.append(actionButton("Resume", "ranger resume-node " + n.nodeId + " --map " + n.key, true, () => act("resume", n, { force: force.checked })));
   acts.append(el("label", {}, force, document.createTextNode(" run beside the lane holder")));
+ }
+ if (n.queued) acts.append(tag(ordinal(n.queued.position) + " in the " + n.queued.lane + " resume queue"));
+ if (n.actions.cancelResume) acts.append(cancelButton(n));
+ else if (n.actions.resume) {
+  const qr = n.actions.queueResume;
+  acts.append(actionButton("Queue resume", qr.offered ? "ranger resume-node " + n.nodeId + " --map " + n.key + " --when-free" : qr.why, qr.offered, () => act("queue-resume", n, {})));
  }
  acts.append(mergeButton(n, "Merge"));
  const session = n.actions.session;
@@ -1660,7 +1786,11 @@ export function stateFromJournal(
   }
   const vetoed = journal?.listVetoes() ?? new Set<string>();
   const workers = journal?.listWorkers() ?? [];
+  const resumeQueue = journal?.listResumeQueue() ?? [];
+  const laneHolders = { visual: journal?.laneHolder("visual") ?? null, headless: journal?.laneHolder("headless") ?? null };
   const entryInputs: Parameters<typeof needsYouEntries>[0] = {
+   resumeQueue,
+   laneHolders,
    maps,
    workers,
    events: (repo, nodeId) => journal?.listNodeEvents(repo, nodeId) ?? [],
@@ -1705,7 +1835,8 @@ export function stateFromJournal(
    needsYouUnchecked,
    awaitingMerge,
    lastImplementMaps: lastImplementMaps(journal),
-   laneHolders: { visual: journal?.laneHolder("visual") ?? null, headless: journal?.laneHolder("headless") ?? null },
+   laneHolders,
+   resumeQueue,
    paused: journal?.isPaused() ?? false,
    drains: journal === null ? undefined : readDrains(journal, config.maps),
    spawnsToday: journal?.spawnsToday(now) ?? 0,
