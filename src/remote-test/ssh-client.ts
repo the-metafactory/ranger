@@ -1,13 +1,13 @@
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { constants } from "node:fs";
-import { lstat, open, rm } from "node:fs/promises";
+import { open, rm } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { z } from "zod";
 import { killProcessGroup } from "../exec.ts";
-import { privateOperatorPath, shellQuote } from "./baseline.ts";
+import { isPrivateDirectory, privateOperatorPath, shellQuote } from "./baseline.ts";
 import { validateProfileManifest, validateRemoteTestJob, validateRemoteTestReceipt, type RemoteTestJob, type RemoteTestReceipt } from "./contract.ts";
 import { stageSource } from "./source.ts";
 import { SSH_LIMITS, SshResponseSchema, SshStageResponseSchema } from "./ssh-protocol.ts";
@@ -18,7 +18,7 @@ const ConfigSchema = z.object({
  remoteCli: operatorPath, remoteConfig: operatorPath,
  executorId: z.string().max(128).regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/),
  profiles: z.array(z.unknown().transform(validateProfileManifest)).min(1).max(32),
- timeoutSeconds: z.number().int().min(1).max(900).default(660),
+ timeoutSeconds: z.number().int().min(1).max(SSH_LIMITS.timeoutSeconds).default(660),
  receiptMaxAgeMs: z.number().int().positive().safe().default(86_400_000),
 }).strict().refine(c => new Set(c.profiles.map(p => p.profileId)).size === c.profiles.length);
 export type SshConfig = z.infer<typeof ConfigSchema>;
@@ -136,7 +136,10 @@ export async function statusSshRemoteTest(input: { config: unknown; job: unknown
 
 /** `refused`: this request obtained no reference (never sent, or the receiver
  * answered with a refusal). `uncertain`: no authenticated answer, so the peer
- * may or may not hold the object; that is neither a reference nor a refusal. */
+ * may or may not hold the object; that is neither a reference nor a refusal.
+ * `staged` means the peer retains the object for its retention window from
+ * this response, not until the job deadline; a later load past that window
+ * refuses `expired`. */
 export type SshStageOutcome = { status: "staged"; job: RemoteTestJob; executorId: string; source: { bundleDigest: string; bundleBytes: number } } |
  { status: "refused"; reason: "expired_job" | "receiver_failed" } |
  { status: "uncertain"; reason: "no_response" | "invalid_response" };
@@ -172,11 +175,13 @@ export async function stageCommittedSource(
  for (const field of ["commitDigest", "treeDigest", "bundleDigest"]) if (Object.hasOwn(request, field)) throw Error("Source bindings must be derived from staging");
  selectSshJob(config, { ...request, commitDigest: "0".repeat(40), treeDigest: "0".repeat(40), bundleDigest: `sha256:${"0".repeat(64)}` });
  const stagingRoot = dirname(await privateOperatorPath(join(resolve(input.stagingRoot), "stage-check")));
- const info = await lstat(stagingRoot);
- if (!info.isDirectory() || info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0) throw Error("Staging root must be private and operator-owned");
+ if (!(await isPrivateDirectory(stagingRoot))) throw Error("Staging root must be private and operator-owned");
  const source = await stageSource({ worktree: resolve(input.worktree), stagingRoot, jobId: String(request.jobId), ...(input.expectedCommit ? { commitDigest: input.expectedCommit } : {}) });
  try {
   const job = selectSshJob(config, { ...request, ...source.manifest });
   return await stageSshSource({ config, job, bundlePath: source.bundlePath }, injected);
- } finally { await rm(dirname(source.bundlePath), { recursive: true }); }
+ } finally {
+  // Local cleanup never masks the remote outcome or the primary error.
+  await rm(dirname(source.bundlePath), { recursive: true, force: true }).catch(() => {});
+ }
 }

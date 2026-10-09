@@ -1,7 +1,8 @@
 import { z } from "zod";
 import { Sha256Schema, type RemoteTestJob, type RemoteTestReceipt } from "./contract.ts";
 
-export const SSH_LIMITS = { bundleBytes: 64 * 1024 ** 2, responseBytes: 65_536, headerBytes: 65_536 } as const;
+/** `timeoutSeconds` is the client SSH ceiling; the receiver sizes pending-upload expiry from it. */
+export const SSH_LIMITS = { bundleBytes: 64 * 1024 ** 2, responseBytes: 65_536, headerBytes: 65_536, timeoutSeconds: 900 } as const;
 export const SshRequestSchema = z.discriminatedUnion("operation", [
  z.object({ version: z.union([z.literal(1), z.literal(2)]), operation: z.literal("submit"), job: z.unknown(), bundleBytes: z.number().int().min(1).max(SSH_LIMITS.bundleBytes) }).strict(),
  z.object({ version: z.union([z.literal(1), z.literal(2)]), operation: z.literal("status"), job: z.unknown() }).strict(),

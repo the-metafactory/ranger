@@ -172,6 +172,11 @@ printf 'exitCode=%s\\n' "$code"
 
 /** Resolve existing parents before checking: a symlink must not turn a private
  * destination into a tracked deployment artifact. Refuse overwrites entirely. */
+/** lstat-based (never follows a symlink): an operator-owned directory without group/world access. */
+export async function isPrivateDirectory(path: string): Promise<boolean> {
+ const info = await lstat(path);
+ return info.isDirectory() && info.uid === process.getuid?.() && (info.mode & 0o077) === 0;
+}
 export async function privateOperatorPath(path: string, existing = false): Promise<string> {
  const absolute = resolve(path);
  const candidate = existing ? await realpath(absolute) : join(await realpath(dirname(absolute)), absolute.split("/").at(-1)!);

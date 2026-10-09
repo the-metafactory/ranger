@@ -13,6 +13,8 @@ export type DiagnosticStage = typeof stages[number];
 export type DiagnosticCode = typeof codes[number];
 const failureSchema = z.object({ stage: z.enum(stages), code: z.enum(codes) }).strict();
 export type DiagnosticFailure = z.infer<typeof failureSchema>;
+// `operation` is the request's wire operation ("stage" = V3 source storage);
+// `stage` in a failure is the receiver phase that failed (e.g. "upload").
 export const ReceiverDiagnosticSchema = z.object({
  version: z.literal(1), id: z.string().uuid(), time: z.number().int().positive().safe(),
  operation: z.enum(["submit", "status", "stage"]).nullable(),

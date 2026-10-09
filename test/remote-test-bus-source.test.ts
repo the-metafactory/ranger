@@ -8,8 +8,8 @@ import { runCmd } from "../src/exec.ts";
 import { loadStagedSource, PENDING_MS, STORE_LOCK, StagedSourceRefusal, type StageFaultStep, type StageRefusalCode } from "../src/remote-test/bus-source.ts";
 import { ReceiverDiagnosticSchema } from "../src/remote-test/receiver-diagnostics.ts";
 import { openJobLedger } from "../src/remote-test/job-ledger.ts";
-import { stageCommittedSource, stageSshSource, statusSshRemoteTest, type SshRunner } from "../src/remote-test/ssh-client.ts";
-import { SshRequestSchema } from "../src/remote-test/ssh-protocol.ts";
+import { stageCommittedSource, stageSshSource, statusSshRemoteTest, validateSshConfig, type SshRunner } from "../src/remote-test/ssh-client.ts";
+import { SSH_LIMITS, SshRequestSchema } from "../src/remote-test/ssh-protocol.ts";
 import { serveSshRequest, serveSshResponse, type SshServerOptions } from "../src/remote-test/ssh-server.ts";
 import { stageSource } from "../src/remote-test/source.ts";
 
@@ -72,17 +72,50 @@ test("stage stores exact validated bytes under their content address and returns
  expect(await f.leftovers()).toEqual([]);
 });
 
-test("restaging the same exact object returns the same reference without replacement", async () => {
+test("restaging the same exact object returns the same reference without replacing its bytes and restarts its retention", async () => {
  const f = await fixture();
  const first = await serve(f), object = f.object(f.job.bundleDigest);
- const before = await Promise.all(["reference.json", "source.bundle"].map(n => stat(join(object, n))));
+ const before = await stat(join(object, "source.bundle"));
  const again = await serve(f, f.bytes, { ...f.job, jobId: "7c7e8091-1234-4234-8234-123456789abc" }, { now: () => now + 1000 });
  if (!("staged" in first) || !("staged" in again)) throw Error("expected staged");
  expect({ ...again.staged, job: undefined }).toEqual({ ...first.staged, job: undefined });
- const after = await Promise.all(["reference.json", "source.bundle"].map(n => stat(join(object, n))));
- expect(after.map(s => [s.ino, s.mtimeMs])).toEqual(before.map(s => [s.ino, s.mtimeMs]));
- expect(JSON.parse(await readFile(join(object, "reference.json"), "utf8")).storedAt).toBe(now);
+ const after = await stat(join(object, "source.bundle"));
+ expect([after.ino, after.mtimeMs]).toEqual([before.ino, before.mtimeMs]);
+ expect(JSON.parse(await readFile(join(object, "reference.json"), "utf8"))).toEqual({ version: 1, bundleDigest: f.job.bundleDigest, bundleBytes: f.bytes.length, storedAt: now + 1000 });
+ expect((await readdir(object)).sort()).toEqual(["reference.json", "source.bundle"]);
  expect(await f.leftovers()).toEqual([]); expect(f.calls()).toBe(0);
+});
+
+test("a restage just before expiry keeps the object loadable for a full retention window; a failed renewal refuses", async () => {
+ const f = await fixture();
+ expect("staged" in await serve(f)).toBe(true);
+ const reference = () => readFile(join(f.object(f.job.bundleDigest), "reference.json"), "utf8");
+ // A renewal that cannot be made durable refuses; the old reference still stands.
+ for (const step of ["renew", "renew-sync"] as StageFaultStep[]) {
+  await expect(serve(f, f.bytes, f.job, { now: () => now + 1, sourceStore: { fault: s => { if (s === step) throw Error(`fault ${s}`); } } })).rejects.toThrow(`fault ${step}`);
+  expect(await f.leftovers()).toEqual([]);
+ }
+ expect(JSON.parse(await reference()).storedAt).toBeLessThanOrEqual(now + 1);
+ const late = now + 7 * DAY - 1;
+ expect("staged" in await serve(f, f.bytes, f.job, { now: () => late })).toBe(true);
+ expect(JSON.parse(await reference()).storedAt).toBe(late);
+ const restored = await loadStagedSource({ config: f.config, job: f.job }, { now: () => now + 7 * DAY + 1 });
+ expect(await git(restored.checkoutPath, "rev-parse", "HEAD")).toBe(f.job.commitDigest);
+ expect(f.calls()).toBe(0);
+});
+
+test("a corrupt object blocks its digest for at most one retention window", async () => {
+ const f = await fixture(), object = f.object(f.job.bundleDigest);
+ await mkdir(f.store, { mode: 0o700 }); await mkdir(object, { mode: 0o700 });
+ const forged = Buffer.alloc(f.bytes.length, 7);
+ await writeFile(join(object, "source.bundle"), forged, { mode: 0o600 });
+ await writeFile(join(object, "reference.json"), JSON.stringify({ version: 1, bundleDigest: f.job.bundleDigest, bundleBytes: forged.length, storedAt: now }), { mode: 0o600 });
+ expect(await refusal(serve(f, f.bytes, f.job, { now: () => now + 7 * DAY - 1 }))).toBe("stage_conflict");
+ expect(await readFile(join(object, "source.bundle"))).toEqual(forged);
+ expect("staged" in await serve(f, f.bytes, f.job, { now: () => now + 7 * DAY })).toBe(true);
+ expect(await readFile(join(object, "source.bundle"))).toEqual(f.bytes);
+ expect(await f.entries()).toEqual([f.job.bundleDigest.slice(7)]);
+ expect(f.calls()).toBe(0);
 });
 
 test("staging leaves admitted ledger generation state untouched", async () => {
@@ -101,8 +134,8 @@ test("truncated, oversized, mismatched, expired and Git-invalid uploads refuse w
  const flipped = Buffer.from(f.bytes); flipped[flipped.length - 1]! ^= 1;
  const garbage = Buffer.from("not a git bundle\n");
  const cases: [string, () => AsyncIterable<Uint8Array>, StageRefusalCode][] = [
-  ["truncated", () => (async function* () { yield Buffer.from(JSON.stringify({ version: 3, operation: "stage", job: f.job, bundleBytes: f.bytes.length }) + "\n"); yield f.bytes.subarray(1); })(), "upload_size"],
-  ["oversized", () => (async function* () { yield Buffer.from(JSON.stringify({ version: 3, operation: "stage", job: f.job, bundleBytes: f.bytes.length }) + "\n"); yield f.bytes; yield Buffer.from("x"); })(), "upload_size"],
+  ["truncated", () => f.frame(f.job, f.bytes.subarray(1), { bundleBytes: f.bytes.length }), "upload_size"],
+  ["oversized", () => f.frame(f.job, Buffer.concat([f.bytes, Buffer.from("x")]), { bundleBytes: f.bytes.length }), "upload_size"],
   ["digest", () => f.frame(f.job, flipped), "upload_digest"],
   ["expired", () => f.frame({ ...f.job, deadline: now }, f.bytes), "expired"],
   ["tree", () => f.frame({ ...f.job, treeDigest: f.ancestorTree }, f.bytes), "source_invalid"],
@@ -210,8 +243,15 @@ test("seven-day retention reclaims only expired objects; capacity pressure never
  expect(await f.entries()).toEqual([crashed.slice(f.store.length + 1), second.job.bundleDigest.slice(7)].sort());
  expect("staged" in await fits(now + 9 * DAY)).toBe(true);
  expect(await f.entries()).toEqual([f.job.bundleDigest.slice(7), second.job.bundleDigest.slice(7)].sort());
- expect(PENDING_MS).toBeGreaterThanOrEqual(2 * 900_000);
  expect(f.calls()).toBe(0);
+});
+
+test("pending uploads outlive twice the longest client SSH session the client config accepts", () => {
+ const profile = { version: 1, profileId: "unit-v1", profileDigest: sha("profile"), lockDigest: sha("lock\n"), imageDigest: sha("image"), platform: "linux-arm64", commands: [["bun", "test"]] };
+ const ssh = { target: "alias", remoteCli: "/reviewed/ranger", remoteConfig: "/private/executor.json", executorId: "fixture", profiles: [profile] };
+ expect(validateSshConfig({ ...ssh, timeoutSeconds: SSH_LIMITS.timeoutSeconds }).timeoutSeconds).toBe(SSH_LIMITS.timeoutSeconds);
+ expect(() => validateSshConfig({ ...ssh, timeoutSeconds: SSH_LIMITS.timeoutSeconds + 1 })).toThrow();
+ expect(PENDING_MS).toBeGreaterThanOrEqual(2 * SSH_LIMITS.timeoutSeconds * 1000);
 });
 
 test("loading a staged reference rechecks bytes and restores the exact detached commit; missing, corrupt or expired never becomes source", async () => {

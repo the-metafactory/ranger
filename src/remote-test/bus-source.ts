@@ -5,13 +5,16 @@ import { lstat, mkdir, open, readdir, realpath, rename, rm } from "node:fs/promi
 import { join } from "node:path";
 import { z } from "zod";
 import { ArtifactPolicySchema } from "./artifacts.ts";
+import { isPrivateDirectory } from "./baseline.ts";
 import { Sha256Schema, validateRemoteTestJob, type RemoteTestJob } from "./contract.ts";
 import { validateExecutorConfig } from "./executor.ts";
 import { TaggedReceiverFailure } from "./receiver-diagnostics.ts";
 import { restoreSource, SourceError } from "./source.ts";
 import { SSH_LIMITS } from "./ssh-protocol.ts";
 
-/** Content reference shared with the bus request: a digest and size, never a path or URL. */
+/** Content reference shared with the bus request: a digest and size, never a path or URL.
+ * Returning it (first stage or restage) starts a fresh retention window for
+ * the object; it is not a promise of availability until the job deadline. */
 export interface StagedSourceReference { bundleDigest: string; bundleBytes: number }
 export type StageRefusalCode = "expired" | "interrupted" | "upload_size" | "upload_digest" | "upload_no_progress" | "unsafe_path" |
  "source_invalid" | "stage_conflict" | "stage_capacity" | "stage_missing" | "stage_busy";
@@ -19,7 +22,7 @@ export type StageRefusalCode = "expired" | "interrupted" | "upload_size" | "uplo
 export class StagedSourceRefusal extends TaggedReceiverFailure {
  constructor(override readonly code: StageRefusalCode, message: string) { super(code, message); }
 }
-export type StageFaultStep = "bundle-write" | "file-sync" | "meta-write" | "meta-sync" | "dir-sync" | "publish" | "root-sync";
+export type StageFaultStep = "bundle-write" | "file-sync" | "meta-write" | "meta-sync" | "dir-sync" | "publish" | "root-sync" | "renew" | "renew-sync";
 export interface StageStoreOptions {
  now?: () => number; signal?: AbortSignal;
  /** Test seam for interrupted writes and unsupported durability operations. */
@@ -40,9 +43,9 @@ const lockFiles = new Set([STORE_LOCK, `${STORE_LOCK}-journal`, `${STORE_LOCK}-w
 const LOCK_WAIT_MS = 10_000;
 /** Each upload directory names its server-clock expiry. It never publishes
  * past it, so GC reclaims a crashed stager's directory once it has passed.
- * Twice the 900 s client SSH ceiling: within that ceiling a live upload is
- * never reclaimed; one that outlives its expiry refuses rather than publishing. */
-export const PENDING_MS = 30 * 60_000;
+ * Twice the client SSH ceiling: within that ceiling a live upload is never
+ * reclaimed; one that outlives its expiry refuses rather than publishing. */
+export const PENDING_MS = 2 * SSH_LIMITS.timeoutSeconds * 1000;
 const pendingName = /^\.pending-(\d{1,16})-[0-9a-f-]{36}$/;
 const objectName = /^[a-f0-9]{64}$/;
 const ReferenceFileSchema = z.object({
@@ -58,9 +61,10 @@ async function syncDirectory(path: string) {
  try { await file.sync(); } finally { await file.close(); }
 }
 async function privateDirectory(path: string) {
- const info = await lstat(path);
- if (!info.isDirectory() || info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0) throw new StagedSourceRefusal("unsafe_path", "Source store must be private and operator-owned");
+ if (!(await isPrivateDirectory(path))) throw new StagedSourceRefusal("unsafe_path", "Source store must be private and operator-owned");
 }
+/** The store name is the validated digest's hex, never a caller path. */
+const objectPath = (store: string, digest: string) => join(store, digest.slice("sha256:".length));
 /** Entries removed concurrently (another stager's GC or failed upload) count as zero. */
 async function size(path: string): Promise<number> {
  let info; try { info = await lstat(path); } catch (e) { if (missing(e)) return 0; throw e; }
@@ -162,7 +166,7 @@ async function writeReference(pending: string, reference: ReferenceFile, options
  * objects, then return either the same unexpired object or the retained total.
  * Unknown entries are counted and kept; unexpired objects are never evicted. */
 async function sweepStore(store: string, own: string, digest: string, now: number, retentionMs: number): Promise<{ existing: ReferenceFile } | { total: number }> {
- const name = digest.slice("sha256:".length);
+ const target = objectPath(store, digest);
  let total = 0;
  for (const entry of await readdir(store)) {
   if (lockFiles.has(entry) || entry === own) continue;
@@ -172,10 +176,13 @@ async function sweepStore(store: string, own: string, digest: string, now: numbe
    if (pending && Number(pending[1]) <= now) { await rm(path, { recursive: true, force: true }); continue; }
    if (objectName.test(entry)) {
     await privateDirectory(path);
-    if (entry === name) {
-     const stored = await verifyObject(path, digest);
-     if (!expired(stored, now, retentionMs)) return { existing: stored };
-     await rm(path, { recursive: true }); continue;
+    if (path === target) {
+     // An expired object is reclaimed whatever its bytes, so a corrupt one
+     // blocks its digest for at most one retention window. Only an
+     // unexpired object is re-hashed; a mismatch refuses and is kept.
+     const stored = await readReference(path).catch(() => null);
+     if (stored?.bundleDigest === digest && expired(stored, now, retentionMs)) { await rm(path, { recursive: true }); continue; }
+     return { existing: await verifyObject(path, digest) };
     }
     const stored = await readReference(path).catch(() => null);
     if (stored && stored.bundleDigest === `sha256:${entry}` && expired(stored, now, retentionMs)) { await rm(path, { recursive: true }); continue; }
@@ -187,28 +194,55 @@ async function sweepStore(store: string, own: string, digest: string, now: numbe
  return { total };
 }
 
-/** Receive one declared upload for an already validated job and store it under
- * its verified content address. Never consults the job ledger or executor.
- * Exact size, digest and immutable Git object/tree validation precede the
- * exclusive pending write's publication by rename; file, pending directory and
- * store root are fsynced. The same exact object is returned without replacement. */
-export async function receiveStagedSource(
- input: { jobsRoot: string; job: RemoteTestJob; declaredBytes: number; chunks: AsyncIterable<Uint8Array>; policy?: unknown },
- options: StageStoreOptions = {},
-): Promise<StagedSourceReference> {
- const policy = ArtifactPolicySchema.parse(input.policy ?? {}), now = options.now ?? Date.now, job = input.job;
- if (!Number.isSafeInteger(input.declaredBytes) || input.declaredBytes < 1 || input.declaredBytes > SSH_LIMITS.bundleBytes) throw new StagedSourceRefusal("upload_size", "Declared source size out of bounds");
- if (job.deadline <= now()) throw new StagedSourceRefusal("expired", "Stage request deadline expired");
- options.progress?.("upload");
- const root = await realpath(input.jobsRoot); await privateDirectory(root);
+/** Create or open the private store beside the other jobsRoot stores. */
+async function openStore(jobsRoot: string): Promise<string> {
+ const root = await realpath(jobsRoot); await privateDirectory(root);
  const store = join(root, STORE);
  try { await mkdir(store, { mode: 0o700 }); await syncDirectory(root); }
  catch (e) { if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e; }
  await privateDirectory(store);
+ return store;
+}
+/** Under the store lock: an existing object gets the pending reference (same
+ * digest and size, fresh storedAt) atomically renamed over its own. The bytes
+ * are never touched; a crash leaves the old or the new reference, both valid. */
+async function renewObject(pending: string, destination: string, options: StageStoreOptions) {
+ await options.fault?.("renew"); await rename(join(pending, "reference.json"), join(destination, "reference.json"));
+ await options.fault?.("renew-sync"); await syncDirectory(destination);
+}
+/** Under the store lock: rename the complete pending object to its content
+ * address and fsync the store. A publication without durable directory state
+ * is withdrawn, never returned; a failed withdrawal never masks the error. */
+async function publishPending(pending: string, destination: string, store: string, options: StageStoreOptions) {
+ // A directory rename silently replaces an empty directory: refuse any entry.
+ try { await lstat(destination); throw new StagedSourceRefusal("stage_conflict", "Source store entry already exists"); }
+ catch (e) { if (!missing(e)) throw e; }
+ await options.fault?.("publish"); await rename(pending, destination);
+ try { await options.fault?.("root-sync"); await syncDirectory(store); }
+ catch (error) { try { await rm(destination, { recursive: true }); await syncDirectory(store); } catch {} throw error; }
+}
+
+/** Receive one declared upload for an already validated job and store it under
+ * its verified content address. Never consults the job ledger or executor.
+ * Exact size, digest and immutable Git object/tree validation precede the
+ * exclusive pending write's publication by rename; file, pending directory and
+ * store root are fsynced. The same exact object is returned without replacing
+ * its bytes; its retention restarts from this stage. */
+export async function receiveStagedSource(
+ input: { jobsRoot: string; job: RemoteTestJob; declaredBytes: number; chunks: AsyncIterable<Uint8Array>; policy?: unknown },
+ options: StageStoreOptions = {},
+): Promise<StagedSourceReference> {
+ // The executor's artifact policy (seven days, 10 GiB by default) also bounds
+ // this store, applied separately from the receipt/log store.
+ const policy = ArtifactPolicySchema.parse(input.policy ?? {}), now = options.now ?? Date.now, job = input.job;
+ if (!Number.isSafeInteger(input.declaredBytes) || input.declaredBytes < 1 || input.declaredBytes > SSH_LIMITS.bundleBytes) throw new StagedSourceRefusal("upload_size", "Declared source size out of bounds");
+ if (job.deadline <= now()) throw new StagedSourceRefusal("expired", "Stage request deadline expired");
+ options.progress?.("upload");
+ const store = await openStore(input.jobsRoot);
  const pendingExpiry = Math.min(job.deadline, now() + PENDING_MS);
  const own = `.pending-${pendingExpiry}-${randomUUID()}`, pending = join(store, own);
  await mkdir(pending, { mode: 0o700 });
- let unlock: (() => void) | undefined, published: string | undefined;
+ let unlock: (() => void) | undefined;
  try {
   const bundlePath = join(pending, "source.bundle");
   const count = await writePendingBundle(bundlePath, input, now, options);
@@ -225,24 +259,16 @@ export async function receiveStagedSource(
   // Serialized GC/publication across processes.
   unlock = await lockStore(store, options.lockWaitMs ?? LOCK_WAIT_MS, options.signal);
   // The address is the digest just computed from received bytes (equal to the job's).
+  const destination = objectPath(store, job.bundleDigest);
   const swept = await sweepStore(store, own, job.bundleDigest, now(), policy.retentionMs);
-  if ("existing" in swept) return { bundleDigest: swept.existing.bundleDigest, bundleBytes: swept.existing.bundleBytes };
-  if (swept.total + count + metaBytes > policy.maxArtifactBytes) throw new StagedSourceRefusal("stage_capacity", "Retained sources exhaust store capacity");
   // Past its pending expiry another stager may already have reclaimed this upload.
   if (job.deadline <= now() || pendingExpiry <= now()) throw new StagedSourceRefusal("expired", "Stage request deadline expired");
-  const destination = join(store, job.bundleDigest.slice("sha256:".length));
-  // A directory rename silently replaces an empty directory: refuse any entry.
-  try { await lstat(destination); throw new StagedSourceRefusal("stage_conflict", "Source store entry already exists"); }
-  catch (e) { if (!missing(e)) throw e; }
-  await options.fault?.("publish"); await rename(pending, destination); published = destination;
-  await options.fault?.("root-sync"); await syncDirectory(store);
-  published = undefined;
+  if ("existing" in swept) await renewObject(pending, destination, options);
+  else {
+   if (swept.total + count + metaBytes > policy.maxArtifactBytes) throw new StagedSourceRefusal("stage_capacity", "Retained sources exhaust store capacity");
+   await publishPending(pending, destination, store, options);
+  }
   return { bundleDigest: reference.bundleDigest, bundleBytes: reference.bundleBytes };
- } catch (error) {
-  // A publication without durable directory state is withdrawn, never returned.
-  // A failed withdrawal never masks the primary error.
-  if (published) { try { await rm(published, { recursive: true }); await syncDirectory(store); } catch {} }
-  throw error;
  } finally {
   await rm(pending, { recursive: true, force: true }).catch(() => {});
   unlock?.();
@@ -259,7 +285,7 @@ export async function loadStagedSource(input: { config: unknown; job: unknown },
  if (!selected) throw Error("Job profile is not operator-approved");
  const job = validateRemoteTestJob(input.job, selected.profile);
  const root = await realpath(config.jobsRoot); await privateDirectory(root);
- const directory = join(root, STORE, job.bundleDigest.slice("sha256:".length));
+ const directory = objectPath(join(root, STORE), job.bundleDigest);
  try { await privateDirectory(join(root, STORE)); await privateDirectory(directory); }
  catch (e) { if (missing(e)) throw new StagedSourceRefusal("stage_missing", "No staged source for this job"); throw e; }
  const reference = await verifyObject(directory, job.bundleDigest);
