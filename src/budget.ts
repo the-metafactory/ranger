@@ -25,9 +25,14 @@ import { parseForgeRef } from "./forge-ref.ts";
  *   limit. Consecutive throttles double it (10, 20, 40… capped at an hour)
  *   so it spans the 15-minute tick; a successful read resets it.
  *
- * Both are persisted in the journal (`health` keys `ratelimit:<token source>`),
- * so the next map in the same pass, the next lane and the next tick all see
- * them. A deferral is not an error: the read is served by a later tick.
+ * Both are persisted in the journal (`health` keys `ratelimit:<scope>`, see
+ * cooldownScope), so the next map in the same pass, the next lane and the
+ * next tick all see them. A deferral is not an error: the read is served by a
+ * later tick.
+ *
+ * GitLab has neither half's probe: no `/rate_limit` endpoint (research node
+ * #92). A GitLab read skips the allowance read and the floor, and only a 429
+ * it gets back sets the same `throttled` cooldown (node #130).
  */
 
 export class BudgetDeferral extends Error {
@@ -67,10 +72,21 @@ export interface Cooldown {
   strikes: number;
 }
 
-const COOLDOWN_KEY = (source: string) => `ratelimit:${source}`;
+/**
+ * What a cooldown is keyed by: the token source on GitHub (the historical
+ * key, unchanged), the forge host and token source on GitLab. A GitLab host
+ * limits its own callers, so a 429 there cools neither another host read with
+ * the same env var nor a GitHub map.
+ */
+export function cooldownScope(repo: string, source: string): string {
+  const ref = parseForgeRef(repo);
+  return ref.forge === "github" ? source : `${ref.forge}:${ref.host}:${source}`;
+}
 
-function readCooldownRecord(journal: Journal, source: string): Cooldown | null {
-  const raw = journal.getHealth(COOLDOWN_KEY(source));
+const COOLDOWN_KEY = (scope: string) => `ratelimit:${scope}`;
+
+function readCooldownRecord(journal: Journal, scope: string): Cooldown | null {
+  const raw = journal.getHealth(COOLDOWN_KEY(scope));
   if (raw === null) return null;
   try {
     const parsed = JSON.parse(raw) as {
@@ -92,40 +108,63 @@ function readCooldownRecord(journal: Journal, source: string): Cooldown | null {
   }
 }
 
-function writeCooldown(journal: Journal, source: string, c: Cooldown): void {
+function writeCooldown(journal: Journal, scope: string, c: Cooldown): void {
   journal.setHealth(
-    COOLDOWN_KEY(source),
+    COOLDOWN_KEY(scope),
     JSON.stringify({ ...c, until: c.until.toISOString() }),
   );
 }
 
-/** The active cooldown on a token, or null once it has passed. */
+/** The active cooldown on a scope (cooldownScope), or null once it has passed. */
 export function activeCooldown(
   journal: Journal,
-  source: string,
+  scope: string,
   now: Date,
 ): Cooldown | null {
-  const record = readCooldownRecord(journal, source);
+  const record = readCooldownRecord(journal, scope);
   return record !== null && record.until > now ? record : null;
 }
 
-function deferral(source: string, c: Cooldown): BudgetDeferral {
+function deferral(scope: string, c: Cooldown): BudgetDeferral {
   return new BudgetDeferral(
-    `graph reads on ${source} deferred until ${c.until.toISOString()} (${c.reason})`,
+    `graph reads on ${scope} deferred until ${c.until.toISOString()} (${c.reason})`,
   );
 }
 
 /**
- * Throw a BudgetDeferral when the token is `throttled` — before ANY GitHub
- * call, the frontier cache's REST sentinel included.
+ * Throw a BudgetDeferral when the token is `throttled` on this repo's forge
+ * host — before ANY forge call, the frontier cache's REST sentinel included.
  */
 export function assertNotThrottled(
   journal: Journal,
+  repo: string,
   token: ResolvedToken,
   now: Date,
 ): void {
-  const cooling = activeCooldown(journal, token.source, now);
-  if (cooling?.kind === "throttled") throw deferral(token.source, cooling);
+  const scope = cooldownScope(repo, token.source);
+  const cooling = activeCooldown(journal, scope, now);
+  if (cooling?.kind === "throttled") throw deferral(scope, cooling);
+}
+
+const writeStderr = (line: string): void => { process.stderr.write(`${line}\n`); };
+let budgetNotice = writeStderr;
+let gitlabBudgetNoted = false;
+
+/**
+ * Test seam: route the once-per-process GitLab budget notice to `sink`
+ * (stderr when omitted) and re-arm it.
+ */
+export function setBudgetNoticeSink(sink?: (line: string) => void): void {
+  budgetNotice = sink ?? writeStderr;
+  gitlabBudgetNoted = false;
+}
+
+function noteGitLabBudget(): void {
+  if (gitlabBudgetNoted) return;
+  gitlabBudgetNoted = true;
+  budgetNotice(
+    "ranger: GitLab maps have no GraphQL allowance to read; their graph reads skip the budget floor and defer only on a 429 cooldown",
+  );
 }
 
 /**
@@ -191,7 +230,8 @@ export async function assertGraphBudget(
 
 /**
  * Run one forge read under the gate. GitHub checks its GraphQL allowance;
- * GitLab checks its read grant and throttle cooldown without a GitHub call.
+ * GitLab checks its read grant and throttle cooldown without a GitHub call,
+ * and says once per process that it skips the allowance and the floor.
  * A RateLimitError from the read
  * sets a `throttled` cooldown that doubles per consecutive throttle, and
  * becomes a BudgetDeferral, so callers handle every kind of "not now" the
@@ -206,10 +246,12 @@ export async function budgetedRead<T>(
   read: () => Promise<T>,
 ): Promise<T> {
   const ref = parseForgeRef(repo);
+  const scope = cooldownScope(repo, token.source);
   let budget: GraphqlBudget | null = null;
   if (ref.forge === "gitlab") {
     assertGitLabReadGrant(repo, token);
-    assertNotThrottled(journal, token, now);
+    assertNotThrottled(journal, repo, token, now);
+    noteGitLabBudget();
   } else {
     budget = await assertGraphBudget(journal, token, policy, now);
   }
@@ -221,7 +263,7 @@ export async function budgetedRead<T>(
     // GitHub's allowance distinguishes a spent window from a secondary
     // limit. GitLab has no allowance probe and uses the throttle backoff.
     const spent = budget !== null && budget.remaining === 0;
-    const strikes = (readCooldownRecord(journal, token.source)?.strikes ?? 0) + 1;
+    const strikes = (readCooldownRecord(journal, scope)?.strikes ?? 0) + 1;
     const backoff = Math.min(
       policy.cooldownMs * 2 ** (strikes - 1),
       MAX_THROTTLE_MS,
@@ -234,13 +276,13 @@ export async function budgetedRead<T>(
         : `${ref.forge === "github" ? "GitHub secondary" : "GitLab"} rate limit, throttle ${strikes} in a row`,
       strikes,
     };
-    writeCooldown(journal, token.source, throttled);
+    writeCooldown(journal, scope, throttled);
     throw new BudgetDeferral(
-      `graph reads on ${token.source} deferred until ${throttled.until.toISOString()} (${throttled.reason}): ${error.message}`,
+      `graph reads on ${scope} deferred until ${throttled.until.toISOString()} (${throttled.reason}): ${error.message}`,
     );
   }
-  if ((readCooldownRecord(journal, token.source)?.strikes ?? 0) > 0) {
-    writeCooldown(journal, token.source, {
+  if ((readCooldownRecord(journal, scope)?.strikes ?? 0) > 0) {
+    writeCooldown(journal, scope, {
       kind: "throttled",
       until: new Date(0),
       reason: "cleared by a successful read",
