@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { closeSync, constants, existsSync, fstatSync, openSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { runCmd, type RunResult } from "./exec.ts";
+import { parseForgeRef, type ForgeRef } from "./forge-ref.ts";
 
 /**
  * Git operations the SUPERVISOR performs in the canonical checkout and in
@@ -26,17 +27,53 @@ export class GitSafetyError extends Error {
  override readonly name = "GitSafetyError";
 }
 
-/** Basic-auth git header env (no credential persistence; the token never lands in .git/config). */
+/**
+ * The write credential for one map's git remote (node #127). Built from the
+ * map's repo, so the auth header follows the forge: GitHub's unscoped header
+ * is unchanged, and a GitLab credential is scoped to the map's host.
+ */
+export interface GitCredential {
+ readonly token: string;
+ readonly forge: ForgeRef;
+}
+
+/** The map's write credential for git; refuses an empty one before any git runs. */
+export function gitCredential(repo: string, token: string): GitCredential {
+ const credential = { token, forge: parseForgeRef(repo) };
+ assertCredential(credential, `the git remote of ${repo}`);
+ return Object.freeze(credential);
+}
+
+/** Clone, fetch and push refuse before invoking git when the map has no write credential. */
+function assertCredential(credential: GitCredential | undefined, what: string): asserts credential is GitCredential {
+ if (credential === undefined || typeof credential.token !== "string" || credential.token.trim().length === 0) {
+  throw new GitSafetyError(`no write credential for ${what} — refusing to run git against the remote`);
+ }
+}
+
+/** The canonical checkout's remote: `https://<host>/<path>.git` (GitHub's is unchanged). */
+export function cloneUrl(forge: ForgeRef): string {
+ return `https://${forge.host}/${forge.path}.git`;
+}
+
+/**
+ * Basic-auth git header env (no credential persistence; the token never lands
+ * in .git/config). GitHub keeps its historical unscoped header. GitLab's is
+ * keyed `http.https://<host>/.extraheader` with user `oauth2`, so git sends it
+ * to the map's host and no other.
+ */
 export function gitAuthEnv(
- token: string,
+ credential: GitCredential,
  base: NodeJS.ProcessEnv = process.env,
 ): NodeJS.ProcessEnv {
- const header = `AUTHORIZATION: basic ${Buffer.from(`${token}:x-oauth-basic`).toString("base64")}`;
+ const { token, forge } = credential;
+ const gitlab = forge.forge === "gitlab";
+ const userinfo = gitlab ? `oauth2:${token}` : `${token}:x-oauth-basic`;
  return {
   ...base,
   GIT_CONFIG_COUNT: "1",
-  GIT_CONFIG_KEY_0: "http.extraheader",
-  GIT_CONFIG_VALUE_0: header,
+  GIT_CONFIG_KEY_0: gitlab ? `http.https://${forge.host}/.extraheader` : "http.extraheader",
+  GIT_CONFIG_VALUE_0: `AUTHORIZATION: basic ${Buffer.from(userinfo).toString("base64")}`,
  };
 }
 
@@ -68,8 +105,8 @@ const NO_SUBMODULE_RECURSION = [
 ];
 
 /**
- * Run git with hooks and fsmonitor disabled, in a minimal env. `token` adds
- * the auth header (remote calls only) and turns submodule recursion off
+ * Run git with hooks and fsmonitor disabled, in a minimal env. `credential`
+ * adds the auth header (remote calls only) and turns submodule recursion off
  * (`NO_SUBMODULE_RECURSION`); every such call but `clone` names the
  * `canonical` checkout whose git state was vetted, and runs only where git
  * resolves its repository to that one (`assertCheckoutOf`). Git's remote
@@ -77,9 +114,10 @@ const NO_SUBMODULE_RECURSION = [
  */
 export async function safeGit(
  args: string[],
- opts: { cwd: string; token?: string; canonical?: string; timeoutMs?: number },
+ opts: { cwd: string; credential?: GitCredential; canonical?: string; timeoutMs?: number },
 ): Promise<RunResult> {
- if (opts.token !== undefined) {
+ if (opts.credential !== undefined) {
+  assertCredential(opts.credential, `\`git ${args[0]}\``);
   assertNamedRefs(args);
   if (args[0] !== "clone") {
    if (opts.canonical === undefined) {
@@ -93,12 +131,12 @@ export async function safeGit(
   "git",
   [
    ...GIT_SAFETY_ARGS,
-   ...(opts.token === undefined ? [] : NO_SUBMODULE_RECURSION),
+   ...(opts.credential === undefined ? [] : NO_SUBMODULE_RECURSION),
    ...args,
   ],
   {
    cwd: opts.cwd,
-   env: opts.token === undefined ? base : gitAuthEnv(opts.token, base),
+   env: opts.credential === undefined ? base : gitAuthEnv(opts.credential, base),
    timeoutMs: opts.timeoutMs ?? 60_000,
   },
  );
@@ -804,15 +842,16 @@ export async function vettedPush(opts: {
  worktree: string;
  canonical: string;
  branch: string;
- token: string;
+ credential: GitCredential;
  configSnapshot: string;
  /** What to push (default HEAD); research pushes its named local branch. */
  source?: string;
 }): Promise<GitState> {
+ assertCredential(opts.credential, `the push of ${opts.branch}`);
  const vetted = await assertGitUntouched(opts.canonical, opts.configSnapshot);
  const push = await safeGit(
   ["push", "--no-verify", "origin", `${opts.source ?? "HEAD"}:refs/heads/${opts.branch}`],
-  { cwd: opts.worktree, token: opts.token, canonical: opts.canonical, timeoutMs: 120_000 },
+  { cwd: opts.worktree, credential: opts.credential, canonical: opts.canonical, timeoutMs: 120_000 },
  );
  if (push.code !== 0) {
   throw new GitSafetyError(`push of ${opts.branch} failed: ${push.stderr.trim()}`);
@@ -834,13 +873,14 @@ export async function vettedPush(opts: {
 export async function fastForwardCanonical(
  canonical: string,
  base: string,
- token: string,
+ credential: GitCredential,
  opts: { attempts?: number; backoffMs?: number } = {},
 ): Promise<void> {
+ assertCredential(credential, `the fetch of ${base} into ${canonical}`);
  const attempts = opts.attempts ?? 4;
  for (let attempt = 1; ; attempt++) {
   try {
-   return await fastForwardOnce(canonical, base, token);
+   return await fastForwardOnce(canonical, base, credential);
   } catch (error) {
    const contended = error instanceof GitSafetyError && GIT_LOCK_CONTENTION.test(error.message);
    if (!contended || attempt >= attempts) throw error;
@@ -852,10 +892,10 @@ export async function fastForwardCanonical(
 /** Git refusing a ref update because another git process holds that ref's lock. */
 export const GIT_LOCK_CONTENTION = /cannot lock ref|Unable to create '[^']+\.lock'/;
 
-async function fastForwardOnce(canonical: string, base: string, token: string): Promise<void> {
+async function fastForwardOnce(canonical: string, base: string, credential: GitCredential): Promise<void> {
  const fetch = await safeGit(["fetch", "origin", base], {
   cwd: canonical,
-  token,
+  credential,
   canonical,
   timeoutMs: 120_000,
  });

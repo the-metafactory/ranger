@@ -3,7 +3,7 @@ import { appendFileSync, copyFileSync, mkdirSync, mkdtempSync, rmSync, writeFile
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCmd } from "../src/exec.ts";
-import { gitConfigSnapshot, gitStateChanges, keyLabel, readGitState } from "../src/git-ops.ts";
+import { gitConfigSnapshot, gitCredential, gitStateChanges, keyLabel, readGitState } from "../src/git-ops.ts";
 import {
  checkKnownGood,
  recordIfUnchanged,
@@ -141,13 +141,13 @@ describe("checkKnownGood", () => {
  test("a worktree ranger adds under branch.autoSetupRebase=always between runs matches", async () => {
   await config("branch.autoSetupRebase", "always");
   await checkKnownGood(journal, canonical, at);
-  await bootstrapWorktree(canonical, "663", "stations-are-solid", "tok");
+  await bootstrapWorktree(canonical, "663", "stations-are-solid", gitCredential("acme/widgets", "tok"));
   expect((await checkKnownGood(journal, canonical, at)).kind).toBe("match");
  });
 
  test("a worktree on a probe-named branch (not node/<N>-<slug>) between runs matches", async () => {
   await checkKnownGood(journal, canonical, at);
-  await bootstrapWorktree(canonical, "64", "x", "tok", "feature/other", "main");
+  await bootstrapWorktree(canonical, "64", "x", gitCredential("acme/widgets", "tok"), "feature/other", "main");
   expect((await checkKnownGood(journal, canonical, at)).kind).toBe("match");
  });
 
@@ -211,14 +211,14 @@ describe("per-worktree config: git's copy of the main config.worktree", () => {
  test("a worktree ranger adds between runs matches", async () => {
   await worktreeConfig();
   await checkKnownGood(journal, canonical, at);
-  await bootstrapWorktree(canonical, "663", "stations-are-solid", "tok");
+  await bootstrapWorktree(canonical, "663", "stations-are-solid", gitCredential("acme/widgets", "tok"));
   expect(await Bun.file(copy("node-663")).text()).toContain("probe = kept");
   expect((await checkKnownGood(journal, canonical, at)).kind).toBe("match");
  });
 
  test("a scratch worktree added from a linked one, then removed, matches throughout", async () => {
   await worktreeConfig();
-  const worktree = await bootstrapWorktree(canonical, "663", "stations-are-solid", "tok");
+  const worktree = await bootstrapWorktree(canonical, "663", "stations-are-solid", gitCredential("acme/widgets", "tok"));
   await checkKnownGood(journal, canonical, at);
   const scratch = join(dir, "scratch");
   await git(["worktree", "add", "--detach", scratch, "HEAD"], worktree);
@@ -252,7 +252,7 @@ describe("per-worktree config: git's copy of the main config.worktree", () => {
   await worktreeConfig();
   await config("http.sslVerify", "false");
   await git(["config", "--worktree", "http.sslVerify", "true"]);
-  await bootstrapWorktree(canonical, "663", "stations-are-solid", "tok");
+  await bootstrapWorktree(canonical, "663", "stations-are-solid", gitCredential("acme/widgets", "tok"));
   await checkKnownGood(journal, canonical, at);
   writeFileSync(copy("node-663"), "");
   const check = await checkKnownGood(journal, canonical, at);
@@ -261,7 +261,7 @@ describe("per-worktree config: git's copy of the main config.worktree", () => {
 
  test("a deleted copy is named", async () => {
   await worktreeConfig();
-  await bootstrapWorktree(canonical, "663", "stations-are-solid", "tok");
+  await bootstrapWorktree(canonical, "663", "stations-are-solid", gitCredential("acme/widgets", "tok"));
   await checkKnownGood(journal, canonical, at);
   rmSync(copy("node-663"));
   const check = await checkKnownGood(journal, canonical, at);
@@ -289,7 +289,7 @@ describe("per-worktree config: git's copy of the main config.worktree", () => {
  test("a copy with a key the main file lacks is named", async () => {
   await worktreeConfig();
   await checkKnownGood(journal, canonical, at);
-  await bootstrapWorktree(canonical, "663", "stations-are-solid", "tok");
+  await bootstrapWorktree(canonical, "663", "stations-are-solid", gitCredential("acme/widgets", "tok"));
   writeFileSync(copy("node-663"), `${await Bun.file(copy("node-663")).text()}[http]\n\tsslVerify = false\n`);
   const check = await checkKnownGood(journal, canonical, at);
   expect(check.kind === "mismatch" && check.changed).toEqual(["worktrees/node-663/config.worktree (new)"]);
@@ -297,7 +297,7 @@ describe("per-worktree config: git's copy of the main config.worktree", () => {
 
  test("a changed main file is named, and its old copies with it", async () => {
   await worktreeConfig();
-  await bootstrapWorktree(canonical, "663", "stations-are-solid", "tok");
+  await bootstrapWorktree(canonical, "663", "stations-are-solid", gitCredential("acme/widgets", "tok"));
   await checkKnownGood(journal, canonical, at);
   await git(["config", "--worktree", "http.sslVerify", "false"]);
   const check = await checkKnownGood(journal, canonical, at);
@@ -339,7 +339,7 @@ describe("per-worktree config with extensions.worktreeConfig off", () => {
    await off();
    leftover();
    await checkKnownGood(journal, canonical, at);
-   await bootstrapWorktree(canonical, "663", "stations-are-solid", "tok");
+   await bootstrapWorktree(canonical, "663", "stations-are-solid", gitCredential("acme/widgets", "tok"));
    expect(await Bun.file(linked("node-663")).exists()).toBe(false);
    expect((await checkKnownGood(journal, canonical, at)).kind).toBe("match");
   });
@@ -437,7 +437,7 @@ describe("include keys are refused", () => {
  test("an include in the main config.worktree, and in every worktree's copy, is named", async () => {
   await config("extensions.worktreeConfig", "true");
   await git(["config", "--worktree", "include.path", "wt.conf"]);
-  await bootstrapWorktree(canonical, "663", "stations-are-solid", "tok");
+  await bootstrapWorktree(canonical, "663", "stations-are-solid", gitCredential("acme/widgets", "tok"));
   expect(await includesOf()).toEqual([
    "include.path in config.worktree",
    "include.path in worktrees/node-663/config.worktree",
@@ -446,7 +446,7 @@ describe("include keys are refused", () => {
 
  test("an include planted in a linked config.worktree alone is named", async () => {
   await config("extensions.worktreeConfig", "true");
-  await bootstrapWorktree(canonical, "663", "stations-are-solid", "tok");
+  await bootstrapWorktree(canonical, "663", "stations-are-solid", gitCredential("acme/widgets", "tok"));
   await checkKnownGood(journal, canonical, at);
   writeFileSync(join(gitDir(), "worktrees", "node-663", "config.worktree"), "[includeIf \"gitdir:/x/\"]\n\tpath = /tmp/x.conf\n");
   expect(await includesOf()).toEqual([`${keyLabel("includeif.gitdir:/x/.path")} in worktrees/node-663/config.worktree`]);

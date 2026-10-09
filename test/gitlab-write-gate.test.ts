@@ -6,7 +6,7 @@ import type { RangerAuthConfig, RangerConfig } from "../src/config.ts";
 import { principalLoginForRepo } from "../src/config.ts";
 import { runCmd, type RunResult } from "../src/exec.ts";
 import {
- assertNotPrincipal, assertWriteIdentity, gitlabApiWrite, loginForToken,
+ assertCommitIdentity, assertNotPrincipal, assertWriteIdentity, gitlabApiWrite, loginForToken,
  matchWriteTokenEnv, resolveBotIdentity, writeEnvForRepo, WriteGateError,
 } from "../src/identity.ts";
 import { graphClaim, graphClose, graphDecisions, graphRelease } from "../src/graph-write.ts";
@@ -86,11 +86,25 @@ describe("GitLab write gate", () => {
    expect(args).toEqual(["api", args[1], "--hostname", host, "--method", "GET"]);
    endpoints.push(args[1]!);
    dir = inspectEnv(opts?.env);
-   return args[1] === "/user" ? result({ username: bot, login: "wrong-field", bot: true }) : result({ id: 123 });
+   return args[1] === "/user" ? result({ id: 456, username: bot, login: "wrong-field", bot: true }) : result({ id: 123 });
   });
   expect(authorized).toEqual({ token: secret, botIdentity: bot });
   expect(endpoints).toEqual(["/user", projectPath]);
   expect(existsSync(dir)).toBeFalse();
+ });
+
+ test("a run-node's gate adds the bot's commit identity from the same GET /user (node #127)", async () => {
+  const endpoints: string[] = [];
+  const user = { id: 456, username: bot, bot: true };
+  const runner: typeof runCmd = async (_bin, args) => {
+   endpoints.push(args[1]!);
+   return result(args[1] === "/user" ? user : { id: 123 });
+  };
+  expect(await assertCommitIdentity(config, repo, inherited, runner)).toEqual({
+   token: secret, botIdentity: bot, commitAuthor: { name: bot, email: `456-${bot}@users.noreply.${host}` },
+  });
+  expect(endpoints).toEqual(["/user", projectPath]);
+  await expect(assertCommitIdentity(config, repo, inherited, botApi({ username: bot, bot: true }))).rejects.toThrow(/missing user id/);
  });
 
  test("missing credential or principal policy spawns nothing", async () => {
@@ -275,7 +289,7 @@ describe("GitLab write gate", () => {
    expect(humanEnv[name]).toBeUndefined();
   }
   expect(hostEnv.GIT_AUTHOR_NAME).toBe("worker");
-  const worker = workerEnv(config, repo, "/tmp/session-journal");
+  const worker = workerEnv(config, repo, "/tmp/session-journal", { name: bot, email: `456-${bot}@users.noreply.${host}` });
   expect(worker.PILOT_PRINCIPAL).toBe("boss-gl");
   expect(worker.SOMA_GRAPH_REPO).toBe(repo);
   expect(workerEnv(config, "team/project", "/tmp/session-journal").PILOT_PRINCIPAL).toBe("boss-gh");

@@ -15,6 +15,7 @@ import {
  dirtyFiles,
  fastForwardCanonical,
  findClosingKeyword,
+ gitCredential,
  GitSafetyError,
  headSha,
  safeGit,
@@ -58,6 +59,7 @@ import {
 import { selectForReview } from "./substrate-policy.ts";
 import { failedSessionOutcome, recordSession } from "./substrate-usage.ts";
 import { workerEnv } from "./worker-env.ts";
+import type { CommitAuthor } from "./identity.ts";
 import { tryWorkerLog, workerLogFile } from "./worker-log.ts";
 import { captureViews, redactViewsReason, saveViewsRecord, viewsComment, viewsDirectory, type ViewsDependencies, type ViewsRecord } from "./views.ts";
 import { NEEDS_EYE_LABEL } from "./labels.ts";
@@ -107,6 +109,8 @@ export interface ImplementContext {
  /** The map's read-only token — the reviewer reads the PR under it (node #8). */
  readOnlyToken: string;
  botIdentity: string;
+ /** A GitLab map's commit identity (node #127); `workerEnv` refuses a GitLab map without one. */
+ commitAuthor?: CommitAuthor;
  journal: Journal;
  node: NodeResult;
  rootNode: NodeResult;
@@ -1159,7 +1163,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
    worktree,
    canonical: ctx.canonical,
    branch,
-   token,
+   credential: gitCredential(repo, token),
    configSnapshot: built.snapshot,
    ...(remoteTests(ctx) ? { source: built.sha } : {}),
   });
@@ -1350,10 +1354,10 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
     map, nodeId, sha: final.sha, labels,
     probePassed: probe?.passed === true && probe.sha === final.sha,
     journalPath: journal.path, worktree,
-    env: workerEnv(config, repo, ctx.sessionJournal), dependencies: ctx.viewsDependencies,
+    env: workerEnv(config, repo, ctx.sessionJournal, ctx.commitAuthor), dependencies: ctx.viewsDependencies,
    });
   } catch (error) {
-   record = { sha: final.sha, status: "failed", reason: redactViewsReason(String(error), workerEnv(config, repo, ctx.sessionJournal)) };
+   record = { sha: final.sha, status: "failed", reason: redactViewsReason(String(error), workerEnv(config, repo, ctx.sessionJournal, ctx.commitAuthor)) };
    try { saveViewsRecord(viewsDirectory(journal.path, repo, nodeId, final.sha), record); } catch { /* best effort */ }
   }
   if (record !== undefined) {
@@ -1444,7 +1448,7 @@ async function publishPass(
   worktree: ctx.worktree,
   canonical: ctx.canonical,
   branch: ctx.branch,
-  token: ctx.token,
+  credential: gitCredential(ctx.map.repo, ctx.token),
   configSnapshot: pass.snapshot,
   ...(remoteTests(ctx) ? { source: pass.sha } : {}),
  });
@@ -1508,7 +1512,7 @@ async function baseMergePass(ctx: ImplementContext, testCommand: string, pushedH
  }
  // The fetch carries the write credential: the state must still be the known-good one (node #81).
  await trustedSnapshot(ctx.journal, ctx.canonical, { repo: ctx.map.repo, nodeId: ctx.node.ref.id }, mapKey(ctx.map));
- await fastForwardCanonical(ctx.canonical, base, ctx.token);
+ await fastForwardCanonical(ctx.canonical, base, gitCredential(ctx.map.repo, ctx.token));
  // The base's commit as the supervisor fetched it, read before the worker
  // runs: the worker shares the repository and could move the ref itself.
  const fetched = await safeGit(["rev-parse", "--verify", `refs/remotes/origin/${base}^{commit}`], {
@@ -1688,7 +1692,7 @@ async function checkedWorkerPass(
   cwd: worktree,
   timeoutMs: config.workers.wallClockMin * 60_000,
   nice: config.workers.niceness,
-  env: workerEnv(config, map.repo, ctx.sessionJournal),
+  env: workerEnv(config, map.repo, ctx.sessionJournal, ctx.commitAuthor),
   ...output.runOptions,
   processGroup: true,
   onSpawn: (pgid) => journal.updateWorker(nodeId, ctx.map.repo, { workerPgid: pgid }),
@@ -1789,7 +1793,7 @@ async function runShell(
  const run: ShellRun = ctx.shellRun ?? ((cmd, o) => runCmd("/bin/sh", ["-c", cmd], o));
  const execute = (cmd: string) => run(cmd, {
   cwd,
-  env: workerEnv(ctx.config, ctx.map.repo, ctx.sessionJournal),
+  env: workerEnv(ctx.config, ctx.map.repo, ctx.sessionJournal, ctx.commitAuthor),
   timeoutMs: opts.timeoutMs,
   processGroup: true,
   // Install and tests yield the CPU; the timing-sensitive probes do not.
@@ -1840,7 +1844,7 @@ async function closeAfterMerge(
   () => graphNode(repo, nodeId, credential, { timeoutMs: GRAPH_CALL_TIMEOUT_MS }));
  if (liveNode.status === "closed") return finishClosedElsewhere({ ...ctx, node: liveNode, pr });
 
- await fastForwardCanonical(ctx.canonical, map.base, token);
+ await fastForwardCanonical(ctx.canonical, map.base, gitCredential(repo, token));
 
  const success = await github.ciVerdictFor(repo, pr.headSha, token, "close");
  if (success.state !== "green") {

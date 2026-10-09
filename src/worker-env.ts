@@ -1,5 +1,7 @@
 import { principalLoginForRepo } from "./config.ts";
 import { somaRepo } from "./graph.ts";
+import { parseForgeRef } from "./forge-ref.ts";
+import type { CommitAuthor } from "./identity.ts";
 import type { RangerConfig } from "./config.ts";
 import { JOURNAL_PATH_ENV } from "./journal-guard.ts";
 import { MACHINE_FORGE_KEYS } from "./forge-env.ts";
@@ -46,8 +48,8 @@ export function workerEnv(
  config: RangerConfig,
  repo: string,
  sessionJournal: string,
+ commitAuthor?: CommitAuthor,
 ): NodeJS.ProcessEnv {
- const identity = config.bot.identity;
  const principal = principalLoginForRepo(config, repo);
  return {
   ...workerHostEnv(),
@@ -62,13 +64,31 @@ export function workerEnv(
   GIT_CONFIG_PARAMETERS: "'core.hooksPath'='/dev/null'",
   // The machine account authors the work (design §2), not whoever the host's
   // global git identity is.
-  ...(identity === undefined
-   ? {}
-   : {
-      GIT_AUTHOR_NAME: identity,
-      GIT_AUTHOR_EMAIL: `${identity}@users.noreply.github.com`,
-      GIT_COMMITTER_NAME: identity,
-      GIT_COMMITTER_EMAIL: `${identity}@users.noreply.github.com`,
-     }),
+  ...authorEnv(config, repo, commitAuthor),
  };
+}
+
+/**
+ * The commit identity: GitHub's from `bot.identity` (unchanged), a GitLab
+ * map's from the project bot's `GET /user` (`gitlabCommitAuthor`, node #127).
+ * A GitLab map without one refuses: it would commit as the host's identity.
+ */
+function authorEnv(config: RangerConfig, repo: string, commitAuthor: CommitAuthor | undefined): NodeJS.ProcessEnv {
+ let author = commitAuthor;
+ if (parseForgeRef(repo).forge === "gitlab") {
+  if (author === undefined) {
+   throw new Error(`no GitLab commit identity for ${repo} — refusing to build the worker env (node #127)`);
+  }
+ } else {
+  const identity = config.bot.identity;
+  author = identity === undefined ? undefined : { name: identity, email: `${identity}@users.noreply.github.com` };
+ }
+ return author === undefined
+  ? {}
+  : {
+     GIT_AUTHOR_NAME: author.name,
+     GIT_AUTHOR_EMAIL: author.email,
+     GIT_COMMITTER_NAME: author.name,
+     GIT_COMMITTER_EMAIL: author.email,
+    };
 }
