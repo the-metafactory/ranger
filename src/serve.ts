@@ -1,5 +1,8 @@
 import { decodeForgeKey, isGithubRepo, nodeKey } from "./forge-ref.ts";
-import { changeRequestUrl } from "./forge-text.ts";
+import { changeRequestLabel, changeRequestUrl } from "./forge-text.ts";
+import type { CiVerdict, ForgeReadPort } from "./forge.ts";
+import { gitlabIssueEndpoint, gitlabLoginCiVerdict, GitLabReadPort, parseGitLabIssue } from "./gitlab.ts";
+import { parseGlabResponse } from "./glab-transport.ts";
 import { lastImplementMaps, mapKey, implementMapOrder, readDrains } from "./maps.ts";
 /**
  * `ranger serve` (#37) — a local dashboard of the walk: the job a worker is on
@@ -29,7 +32,9 @@ import { lastImplementMaps, mapKey, implementMapOrder, readDrains } from "./maps
  * failed and needs-eye rows (`serve-parked.ts`) carry buttons, and each one
  * only spawns an existing CLI verb (`ranger resume-node`), `gh pr merge` with
  * no machine-account token or gh config in its environment (gh uses the login
- * stored under HOME; which account that is goes unchecked), or
+ * stored under HOME; which account that is goes unchecked), on a GitLab map
+ * `glab api` on the MR's merge endpoint the same way (node #132: glab uses the
+ * principal's login, and the pipeline is re-read under it first), or
  * the iTerm2 launch above. The process itself still writes nothing: the
  * journal stays read-only here and no graph write is imported. Each action is
  * guarded like the launch — Host, Origin, page token, a numeric id — and the
@@ -66,7 +71,7 @@ import { type FrontierEntry, graphFrontier, RateLimitError } from "./graph.ts";
 import { runCmd } from "./exec.ts";
 import { briefHoldReason, classify, classifyFrontier, type ClassifiedNode, loadProbeRegistry } from "./route.ts";
 import { liveSession, substrateUsageViews, type SubstrateUsageView } from "./substrate-usage.ts";
-import { resolveReadOnlyToken, assertReadOnlyToken, gatedEnv, tokenBatch, type TokenBatch, type ResolvedToken } from "./token-gate.ts";
+import { resolveReadOnlyToken, assertReadOnlyToken, gatedEnv, gitlabApiRead, tokenBatch, type TokenBatch, type ResolvedToken } from "./token-gate.ts";
 import { childEnv, itermArgv, shellQuote } from "./launch.ts";
 import {
  type ActionKind,
@@ -236,6 +241,8 @@ export interface CurrentJob {
  lane: string | null;
  resourceLane: ImplementLane | null;
  prNumber: number | null;
+ /** "PR #N" on GitHub, "MR !N" on GitLab (node #132). */
+ prLabel: string | null;
  reviewRound: number;
  startedAt: string | null;
  pid: number | null;
@@ -505,6 +512,7 @@ export function assembleState(inputs: StateInputs): DashboardState {
    lane: w.lane,
    resourceLane: w.lane === "implement" ? workerLane(w, laneMaps) : null,
    prNumber: w.prNumber,
+   prLabel: w.prNumber === null ? null : changeRequestLabel(w.repo, w.prNumber),
    reviewRound: w.reviewRound,
    startedAt: w.startedAt,
    pid: w.pid,
@@ -1075,7 +1083,7 @@ function jobTime(iso) {
 // One pill per fact, each once: status and phase are often the same word.
 function jobTags(j) {
  if (j.stale) return [tag("stale: process gone", "stale")];
- const parts = [j.resourceLane || j.lane, j.status, j.phase, j.prNumber ? "PR #" + j.prNumber : "", j.reviewRound ? "round " + j.reviewRound : ""];
+ const parts = [j.resourceLane || j.lane, j.status, j.phase, j.prLabel || "", j.reviewRound ? "round " + j.reviewRound : ""];
  return [...new Set(parts.filter(Boolean))].map((p) => tag(p));
 }
 function renderCurrent(s) {
@@ -1088,7 +1096,7 @@ function renderCurrent(s) {
    const waiting = j.status === "awaiting-merge" ? (s.awaitingMerge || []).find((e) => e.repo === j.repo && e.nodeId === j.nodeId) : undefined;
    const last = waiting ? results.get(waiting.key + "/" + waiting.nodeId) : undefined;
    return el("li", {}, el("span", { class: "id", text: "#" + j.nodeId }), el("span", { class: "t" }, document.createTextNode(j.title || "(title not in the frontier read)"), el("span", { class: "reason", text: jobTime(j.startedAt) })),
-    tags(...jobTags(j), waiting ? mergeButton(waiting, "Merge now") : null, waiting && waiting.pr ? link(waiting.pr.url, "Open PR") : null),
+    tags(...jobTags(j), waiting ? mergeButton(waiting, "Merge now") : null, waiting && waiting.pr ? link(waiting.pr.url, openText(waiting)) : null),
     last ? el("pre", { class: last.err ? "err" : "", text: last.text }) : null);
   }))) };
  }));
@@ -1227,8 +1235,9 @@ function prLifecycle(v) {
 }
 function prFacts(pr) {
  const v = pr.view;
- const parts = ["PR #" + pr.number];
- if (v) parts.push(prLifecycle(v), "head " + short(v.headSha), ...(v.ci === "not-read" ? [] : ["CI " + v.ci + (v.ciSource === "actions" ? " (Actions only)" : "")]));
+ const parts = [pr.label];
+ // A GitLab MR shows its merge state: anything but mergeable offers no tap.
+ if (v) parts.push(prLifecycle(v), ...(v.mergeState ? ["merge state " + v.mergeState + (v.mergeDetail ? " (" + v.mergeDetail + ")" : "")] : []), "head " + short(v.headSha), ...(v.ci === "not-read" ? [] : [(v.mergeState ? "pipeline " : "CI ") + v.ci + (v.ciSource === "actions" ? " (Actions only)" : "")]));
  if (pr.error) parts.push(v ? "stale, read " + ago(v.readAt) + "; the last refresh failed: " + pr.error : "the read failed: " + pr.error);
  else if (!v) parts.push("not read yet");
  return parts.join(" · ");
@@ -1259,7 +1268,18 @@ async function act(kind, n, extra) {
  } catch (e) { results.set(id, { err: true, text: kind + " #" + n.nodeId + " refused: " + e.message }); say(e.message, true); }
  load(); setTimeout(load, 3000);
 }
+// GitHub cards keep "Merge" and "Open PR"; a GitLab card names its MR (node #132).
+const openText = (n) => n.forge === "gitlab" ? "Open " + n.pr.label : "Open PR";
+function mrMergeButton(n) {
+ const merge = n.actions.merge;
+ const gated = n.status === "awaiting-merge";
+ return actionButton("Merge " + n.pr.label, merge.offered ? "glab api PUT the MR's merge, squash, pinned to " + short(merge.headSha) + ", under your glab login (machine-account tokens and GLAB_CONFIG_DIR stripped; the account is not checked); the pipeline is re-read under that login first and must be green; then the map's merge desk" + (gated ? "; refused unless the merge desk's gate (pipeline, sage review, probes at the head) passes" : "") : merge.why, merge.offered, async () => {
+  if (!confirm("Squash-merge " + n.pr.label + " on " + n.repo + " at head " + merge.headSha + "?\\n\\n" + (gated ? "The merge desk's gate is checked first (pipeline, merge state, sage review and probes at this head); the merge is refused unless it passes. " : "This is an override: only the pipeline and the merge state are checked, not the review or probes. ") + "It runs under your glab login: the machine account's GitLab tokens and GLAB_CONFIG_DIR are stripped, but the account itself is not checked. The pipeline at this head is re-read under that login first, and the merge is refused unless it is green. " + (n.status === "failed" ? "The merge desk watches only parked and awaiting-merge rows, so Resume it afterwards to run the close." : "Then the map's merge desk runs at once and starts the close; check that the node closed (a failed spawn or a refused close leaves it open)."))) return;
+  await act("merge", n, { sha: merge.headSha });
+ });
+}
 function mergeButton(n, text) {
+ if (n.forge === "gitlab" && n.pr) return mrMergeButton(n);
  const merge = n.actions.merge;
  return actionButton(text, merge.offered ? "gh pr merge --squash, pinned to " + short(merge.headSha) + ", under gh's configured login (machine-account tokens stripped; the account is not checked), then the map's merge desk" + (n.status === "awaiting-merge" ? "; refused unless the merge desk's gate (CI, sage review, probes at the head) passes" : "") : merge.why, merge.offered, async () => {
   if (!confirm("Squash-merge PR #" + n.pr.number + " on " + n.repo + " at head " + merge.headSha + "?\\n\\n" + (n.status === "awaiting-merge" ? "The merge desk's gate is checked first (CI, mergeable, base, sage review and probes at this head); the merge is refused unless it passes. " : "This is an override: only CI and mergeability are checked, not the review or probes. ") + "It runs under gh's configured login: the machine account's GH_TOKEN, GITHUB_TOKEN and GH_CONFIG_DIR are stripped, but the account itself is not checked. " + (n.status === "failed" ? "The merge desk watches only parked and awaiting-merge rows, so Resume it afterwards to run the close." : "Then the map's merge desk runs at once and starts the close; check that the node closed (a failed spawn or a refused close leaves it open)."))) return;
@@ -1284,7 +1304,7 @@ function needsCard(n) {
  acts.append(mergeButton(n, "Merge"));
  const session = n.actions.session;
  acts.append(actionButton("Open session", session.offered ? "Open iTerm2 in " + session.cwd + " and start claude on #" + n.nodeId : session.why, session.offered, () => act("session", n, {})));
- if (n.pr) acts.append(link(n.pr.url, "Open PR"));
+ if (n.pr) acts.append(link(n.pr.url, openText(n)));
  const last = results.get(id);
  return el("div", { class: "card" },
   el("div", {}, el("span", { class: "id", text: "#" + n.nodeId + " " }), link(n.url, n.title || "(title not read yet)"), document.createTextNode(" "), el("span", { class: "tag stale", text: n.reason.class })),
@@ -1374,7 +1394,9 @@ load(); setInterval(load, 15000);
  *   (`/repos/{repo}/issues/{id}`), a separate bucket from GraphQL;
  * - the "Needs you" issues and PRs (node #54) are REST too, read on every
  *   refresh whatever the frontier's backoff, with the read-only gate run once
- *   per repo per batch (`tokenBatch`).
+ *   per repo per batch (`tokenBatch`). On a GitLab map (node #132) the same
+ *   gate checks the `read_api` token, and issues, MRs and pipelines are read
+ *   with glab through the GitLab port's transport and rules.
  */
 export class ServeReader {
  extra = new Map<string, MapRead>();
@@ -1634,12 +1656,29 @@ interface IssueRead {
  autonomy: string | null;
 }
 
-/** One `gh api` GET under the read-only gate; null on any failure. */
-async function restRead(tokens: TokenBatch, repo: string, path: string, flags: string[] = []): Promise<unknown> {
+/**
+ * One REST GET under the read-only gate; null on any failure. `gh api` on
+ * GitHub; on GitLab, `glab api` under the gate's per-call GLAB_CONFIG_DIR
+ * with the checked `read_api` credential (`gitlabApiRead`), where `flags`
+ * (gh's pagination) have no meaning.
+ */
+async function restRead(
+ tokens: TokenBatch,
+ repo: string,
+ path: string,
+ flags: string[] = [],
+ runner: typeof runCmd = runCmd,
+): Promise<unknown> {
  const token = await tokens(repo);
+ if (!isGithubRepo(repo)) {
+  if (flags.length > 0) throw new Error(`gh flags on a GitLab read: ${flags.join(" ")}`);
+  const result = await gitlabApiRead(repo, token, path, runner);
+  const { status, body } = parseGlabResponse(result);
+  return result.code === 0 && status === 200 ? (body ?? null) : null;
+ }
  const gated = gatedEnv(token.token);
  try {
-  const result = await runCmd("gh", ["api", path, ...flags], { env: gated.env, timeoutMs: 15_000 });
+  const result = await runner("gh", ["api", path, ...flags], { env: gated.env, timeoutMs: 15_000 });
   if (result.code !== 0) return null;
   try {
    return JSON.parse(result.stdout) as unknown;
@@ -1654,14 +1693,17 @@ async function restRead(tokens: TokenBatch, repo: string, path: string, flags: s
 /**
  * A PR and the CI state of its head, over REST under the read-only gate: run
  * once for both reads, or once for a whole refresh batch when `tokens` is given.
+ * A GitLab MR is read through the GitLab port (`readMrLive`).
  */
 export async function readPrLive(
  config: RangerConfig,
  repo: string,
  number: number,
  tokens: TokenBatch = tokenBatch(config),
+ gitlab?: ForgeReadPort<ResolvedToken>,
 ): Promise<PrView | null> {
- if (!isGithubRepo(repo) || !Number.isInteger(number) || number <= 0) return null;
+ if (!Number.isInteger(number) || number <= 0) return null;
+ if (!isGithubRepo(repo)) return readMrLive(repo, number, tokens, gitlab);
  const raw = (await restRead(tokens, repo, `repos/${repo}/pulls/${number}`)) as Record<string, unknown> | null;
  if (raw === null) return null;
  const head = (raw.head ?? {}) as { sha?: unknown };
@@ -1702,16 +1744,76 @@ export async function readPrLive(
  };
 }
 
+/** The dashboard's CI word for a port verdict. */
+const ciOfVerdict = (verdict: CiVerdict): PrView["ci"] =>
+ verdict.state === "green" ? "green" : verdict.state === "red" ? "failed" : "pending";
+
+/**
+ * A GitLab MR, its merge state and the pipeline verdict at its head, through
+ * the GitLab port under the read gate (node #132): the token the batch's
+ * gate checked for this project, never a glab login. A closed or merged MR
+ * offers nothing its pipeline could gate, so that is not read; a failed
+ * pipeline read is `unreadable`, never green. A failed MR read throws, with
+ * the port's reason.
+ */
+export async function readMrLive(
+ repo: string,
+ number: number,
+ tokens: TokenBatch,
+ port: ForgeReadPort<ResolvedToken> = new GitLabReadPort(),
+): Promise<PrView> {
+ const token = await tokens(repo);
+ const mr = await port.getPr(repo, number, token);
+ const terminal = mr.state !== "open";
+ let ci: PrView["ci"] = "not-read";
+ if (!terminal) {
+  try {
+   ci = ciOfVerdict(await port.ciVerdictFor(repo, mr.headSha, token, "merge"));
+  } catch {
+   ci = "unreadable";
+  }
+ }
+ return {
+  number,
+  url: changeRequestUrl(repo, number, mr.webUrl),
+  state: mr.state === "open" ? "open" : "closed",
+  merged: mr.state === "merged",
+  draft: mr.draft,
+  headSha: mr.headSha,
+  mergeable: mr.mergeState === "mergeable" ? true : mr.mergeState === "pending" ? null : false,
+  mergeState: mr.mergeState,
+  ...(mr.mergeDetail === undefined ? {} : { mergeDetail: mr.mergeDetail }),
+  ...(mr.mergeInProgress ? { merging: true as const } : {}),
+  ci,
+  readAt: new Date().toISOString(),
+ };
+}
+
 /**
  * Every check run on `sha`, read with `gh` under `env`: the merge's own
  * environment, so whatever account `gh` has stored under HOME (the
  * principal's, on this machine), with the machine account's credentials
- * removed. Classified like the merge gate does. Null when the read fails or
- * comes back malformed.
+ * removed. Classified like the merge gate does. On GitLab, the pipeline
+ * verdict read with `glab` the same way. Null when the read fails or comes
+ * back malformed.
  */
-async function verifyChecksAs(repo: string, sha: string, env: Record<string, string>): Promise<PrView["ci"] | null> {
- if (!isGithubRepo(repo) || !/^[0-9a-f]{40}$/.test(sha)) return null;
- const result = await runCmd(
+export async function verifyChecksAs(
+ repo: string,
+ sha: string,
+ env: Record<string, string>,
+ runner: typeof runCmd = runCmd,
+): Promise<PrView["ci"] | null> {
+ if (!/^[0-9a-f]{40}$/.test(sha)) return null;
+ if (!isGithubRepo(repo)) {
+  // GitLab: the pipeline verdict, by the port's own rules, under the glab
+  // login `env` leads to (the principal's: the merge's environment).
+  try {
+   return ciOfVerdict(await gitlabLoginCiVerdict(repo, sha, env, runner));
+  } catch {
+   return null;
+  }
+ }
+ const result = await runner(
   "gh",
   ["api", `repos/${repo}/commits/${sha}/check-runs?filter=latest&per_page=100`, "--paginate", "--slurp"],
   { env, timeoutMs: 15_000 },
@@ -1727,22 +1829,40 @@ async function verifyChecksAs(repo: string, sha: string, env: Record<string, str
  return checks === null ? null : ciState(checks);
 }
 
-/** One issue over REST under the read-only gate: no GraphQL. Null if unreadable. */
-async function readIssue(
+/**
+ * One issue over REST under the read-only gate: no GraphQL. Null if
+ * unreadable. A GitLab issue (`projects/:id/issues/:iid`) is read through
+ * the same gated transport and checked by the GitLab port's parser.
+ */
+export async function readIssue(
  config: RangerConfig,
  repo: string,
  id: string,
  tokens: TokenBatch = tokenBatch(config),
+ runner: typeof runCmd = runCmd,
 ): Promise<IssueRead | null> {
- if (!isGithubRepo(repo) || !ID_PATTERN.test(id)) return null;
- const raw = (await restRead(tokens, repo, `repos/${repo}/issues/${id}`)) as {
-  title?: string;
-  state?: string;
-  assignees?: { login?: string }[];
-  labels?: ({ name?: string } | string)[];
-  body?: string | null;
- } | null;
- if (raw === null || typeof raw !== "object") return null;
+ if (!ID_PATTERN.test(id)) return null;
+ let raw: { title?: string; state?: string; assignees?: string[]; labels?: string[]; body?: string | null };
+ if (isGithubRepo(repo)) {
+  const gh = (await restRead(tokens, repo, `repos/${repo}/issues/${id}`, [], runner)) as {
+   title?: string;
+   state?: string;
+   assignees?: { login?: string }[];
+   labels?: ({ name?: string } | string)[];
+   body?: string | null;
+  } | null;
+  if (gh === null || typeof gh !== "object") return null;
+  raw = {
+   ...gh,
+   assignees: (gh.assignees ?? []).map((a) => a.login ?? ""),
+   labels: (gh.labels ?? []).map((l) => (typeof l === "string" ? l : (l.name ?? ""))),
+  };
+ } else {
+  const endpoint = gitlabIssueEndpoint(repo, Number(id));
+  const gl = await restRead(tokens, repo, endpoint, [], runner);
+  if (gl === null) return null;
+  raw = parseGitLabIssue(gl, Number(id), endpoint);
+ }
  // The node's kind is in its typed block, which the verbs write (#89-style
  // `soma:work-graph-node` JSON in an HTML comment).
  const block = /<!--\s*soma:work-graph-node\s*([\s\S]*?)-->/.exec(raw.body ?? "")?.[1];
@@ -1760,8 +1880,8 @@ async function readIssue(
  return {
   title: raw.title ?? "",
   state: raw.state ?? "unknown",
-  assignees: (raw.assignees ?? []).map((a) => a.login ?? "").filter(Boolean),
-  labels: (raw.labels ?? []).map((l) => (typeof l === "string" ? l : (l.name ?? ""))).filter(Boolean),
+  assignees: (raw.assignees ?? []).filter(Boolean),
+  labels: (raw.labels ?? []).filter(Boolean),
   kind,
   autonomy,
  };

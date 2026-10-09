@@ -157,7 +157,11 @@ describe("ForgeRef config and identity seam", () => {
   expect(resumeArgv({ rangerBin: "ranger", repo: gitlab, root: 12, nodeId: "13", configPath: "/tmp/ranger.yaml", force: false })).toContain(key);
   expect(launchPlan({ repo: gitlab, root: 12, nodeId: "13", cwd: "/tmp" }).prompt).toContain(gitlab);
   expect(() => buildNowArgv({ bin: "ranger", key: `${key}#14`, nodeId: "13", configPath: "/tmp/ranger.yaml" })).toThrow();
-  expect(() => mergeArgv({ repo: gitlab, pr: 12, sha: "a".repeat(40) })).toThrow("GitLab merge is not implemented");
+  // Node #132: the principal's tap merge on GitLab is glab's merge endpoint, squashed and pinned.
+  expect(mergeArgv({ repo: gitlab, pr: 12, sha: "a".repeat(40) })).toEqual([
+   "glab", "api", "--hostname", "gitlab.software.geant.org", "-X", "PUT",
+   "projects/claw%2Fcrisis-simulator/merge_requests/12/merge", "-f", "squash=true", "-f", `sha=${"a".repeat(40)}`,
+  ]);
  });
 
  test("registered GitLab maps refuse all execution entry points before calls or journal writes", async () => {
@@ -209,14 +213,17 @@ describe("ForgeRef config and identity seam", () => {
   } finally { rmSync(dir, { recursive: true, force: true }); }
  });
 
- test("serve-only GitLab graph reads require credentials; unsupported PR reads stay inert", async () => {
+ test("serve-only GitLab graph reads require credentials; MR reads ask the read gate first", async () => {
   const config = configWith(gitlab, "serve");
   const maps = servedMaps(config).filter(map => map.repo === gitlab);
   expect(maps).toHaveLength(1);
   expect(() => assertReadOnlyTokens(config, maps, {})).toThrow("no read-only token mapping");
   let calls = 0;
   const tokens = async (): Promise<never> => { calls++; throw new Error("unexpected credentials"); };
-  expect(await readPrLive(config, gitlab, 12, tokens)).toBeNull();
+  // Node #132: an MR read goes through the read gate, which refuses here before any read.
+  await expect(readPrLive(config, gitlab, 12, tokens)).rejects.toThrow("unexpected credentials");
+  expect(calls).toBe(1);
+  calls = 0;
   const reader = new ServeReader(config, maps, "/unused");
   reader.refresh();
   // Await this refresh before the headless test returns.

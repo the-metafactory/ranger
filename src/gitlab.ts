@@ -1,7 +1,7 @@
 import type { ChangeRequest, CiPurpose, CiVerdict, ForgePort, ForgeReadPort, IssueComment, MergeOutcome, MergeState, RebaseOutcome } from "./forge.ts";
 import type { RangerConfig } from "./config.ts";
 import { parseForgeRef } from "./forge-ref.ts";
-import { runCmd } from "./exec.ts";
+import { runCmd, type RunResult } from "./exec.ts";
 import { parseGlabResponse } from "./glab-transport.ts";
 import { assertReadOnlyToken, GateError, gitlabApiRead, tokenBatch, type ResolvedToken } from "./token-gate.ts";
 import { assertWriteIdentity, gitlabApiWrite, resolveWriteToken, WriteGateError } from "./identity.ts";
@@ -111,20 +111,65 @@ function nextPage(next: string | undefined, page: number, endpoint: string): num
  return following;
 }
 
+/** A GitLab repo's API path, `projects/<url-encoded path>`. */
+export function gitlabProject(repo: string): string {
+ const ref = parseForgeRef(repo);
+ if (ref.forge !== "gitlab") throw new GitLabReadError("expected a GitLab repo", repo);
+ return `projects/${encodeURIComponent(ref.path)}`;
+}
+
+/** `GET projects/:id/issues/:iid`, for `parseGitLabIssue`. */
+export const gitlabIssueEndpoint = (repo: string, issue: number): string => `${gitlabProject(repo)}/issues/${id(issue, repo, "iid")}`;
+
+export interface GitLabIssue {
+ title: string;
+ /** `open`, `closed`, or GitLab's own word for any other state. */
+ state: string;
+ assignees: string[];
+ labels: string[];
+ body: string;
+}
+
+/**
+ * A tracker issue (a graph node) as the dashboard shows and re-checks it:
+ * GitLab's `opened` reads `open`, assignees by username, the description
+ * as the body that carries the typed block. Throws `GitLabReadError` on a
+ * body that is not that issue.
+ */
+export function parseGitLabIssue(raw: unknown, issue: number, endpoint: string): GitLabIssue {
+ const r = object(raw, endpoint);
+ if (id(r.iid, endpoint, "iid") !== issue) invalid(endpoint, "iid differs from requested issue");
+ if (typeof r.title !== "string") invalid(endpoint, "title");
+ const state = string(r.state, endpoint, "state");
+ if (!Array.isArray(r.labels) || r.labels.some(label => typeof label !== "string")) invalid(endpoint, "labels");
+ if (!Array.isArray(r.assignees)) invalid(endpoint, "assignees");
+ if (r.description !== null && r.description !== undefined && typeof r.description !== "string") invalid(endpoint, "description");
+ return {
+  title: r.title,
+  state: state === "opened" ? "open" : state,
+  assignees: r.assignees.map((a) => username(a, endpoint, "assignee")),
+  labels: r.labels,
+  body: typeof r.description === "string" ? r.description : "",
+ };
+}
+
 /** Read half of the forge port, usable without write configuration. */
 export class GitLabReadPort implements ForgeReadPort<ResolvedToken> {
  constructor(protected readonly runner: typeof runCmd = runCmd) {}
 
  protected project(repo: string): string {
-  const ref = parseForgeRef(repo);
-  if (ref.forge !== "gitlab") throw new GitLabReadError("expected a GitLab repo", repo);
-  return `projects/${encodeURIComponent(ref.path)}`;
+  return gitlabProject(repo);
+ }
+
+ /** One GET of `endpoint` with `--include`: the gated read-only credential here, another login in a subclass. */
+ protected get(repo: string, token: ResolvedToken, endpoint: string): Promise<RunResult> {
+  return gitlabApiRead(repo, token, endpoint, this.runner);
  }
 
  private async read(repo: string, token: ResolvedToken, endpoint: string): Promise<{ body: unknown; next: string | undefined }> {
   let result;
   try {
-   result = await gitlabApiRead(repo, token, endpoint, this.runner);
+   result = await this.get(repo, token, endpoint);
   } catch (error) {
    if (error instanceof GateError) throw error;
    // A subprocess error can contain credentials; keep it outside diagnostics.
@@ -266,6 +311,29 @@ export class GitLabReadPort implements ForgeReadPort<ResolvedToken> {
 
 /** The commit fields a rebase keeps: what `mrCommits` compares across one. */
 const AUTHORED = ["message", "author_name", "author_email", "authored_date"] as const;
+
+/** Stands in for the read credential: a login read carries none of ranger's. */
+const LOGIN: ResolvedToken = Object.freeze({ token: "", source: "the glab login under HOME" });
+
+/**
+ * Reads under whatever glab login `env` leads to: the principal's own, when
+ * `env` is the dashboard merge's (machine keys and `GLAB_CONFIG_DIR`
+ * stripped, ranger issue #97 ruling Q6). No read gate runs: the login is not
+ * ranger's to check. The verdict rules are the port's own.
+ */
+class GitLabLoginReadPort extends GitLabReadPort {
+ constructor(private readonly env: Record<string, string>, runner: typeof runCmd) { super(runner); }
+
+ protected override get(repo: string, _token: ResolvedToken, endpoint: string): Promise<RunResult> {
+  const { host } = parseForgeRef(repo);
+  return this.runner("glab", ["api", endpoint, "--hostname", host, "--method", "GET", "--include"], { env: this.env, timeoutMs: 15_000 });
+ }
+}
+
+/** The pipeline verdict at `sha`, read under the glab login `env` leads to (see `GitLabLoginReadPort`). */
+export function gitlabLoginCiVerdict(repo: string, sha: string, env: Record<string, string>, runner: typeof runCmd = runCmd): Promise<CiVerdict> {
+ return new GitLabLoginReadPort(env, runner).ciVerdictFor(repo, sha, LOGIN, "merge");
+}
 
 /** Write failures never echo subprocess output or retry an uncertain mutation. */
 export class GitLabWriteError extends Error {
