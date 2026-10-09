@@ -40,7 +40,8 @@ const lockFiles = new Set([STORE_LOCK, `${STORE_LOCK}-journal`, `${STORE_LOCK}-w
 const LOCK_WAIT_MS = 10_000;
 /** Each upload directory names its server-clock expiry. It never publishes
  * past it, so GC reclaims a crashed stager's directory once it has passed.
- * Twice the 900 s client SSH ceiling, so a live upload is never cut off. */
+ * Twice the 900 s client SSH ceiling: within that ceiling a live upload is
+ * never reclaimed; one that outlives its expiry refuses rather than publishing. */
 export const PENDING_MS = 30 * 60_000;
 const pendingName = /^\.pending-(\d{1,16})-[0-9a-f-]{36}$/;
 const objectName = /^[a-f0-9]{64}$/;

@@ -1,5 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -166,8 +167,14 @@ test("a live lock holder yields stage_busy; a killed holder's lock and expired u
   expect(await refusal(serve(f, f.bytes, f.job, { sourceStore: { lockWaitMs: 0 } }))).toBe("stage_busy");
   expect(await f.entries()).toEqual([]);
   // A waiting stager proceeds once the holder dies mid-critical-section (SIGKILL, no cleanup).
-  const waiting = serve(f);
-  await Bun.sleep(200); holder.kill("SIGKILL"); await holder.exited;
+  let settled = false;
+  const waiting = serve(f).finally(() => { settled = true; });
+  // reference.json is the last write before the lock attempt.
+  const ready = async () => (await f.entries()).some(n => n.startsWith(".pending-") && existsSync(join(f.store, n, "reference.json")));
+  for (let i = 0; !(await ready()); i++) { if (i > 400 || settled) throw Error("stager never reached the lock"); await Bun.sleep(25); }
+  await Bun.sleep(150);
+  expect(settled).toBe(false);
+  holder.kill("SIGKILL"); await holder.exited;
   expect("staged" in await waiting).toBe(true);
  } finally { holder.kill("SIGKILL"); }
  expect(await f.entries()).toEqual([f.job.bundleDigest.slice(7)]);
