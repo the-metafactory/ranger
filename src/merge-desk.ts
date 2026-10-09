@@ -49,8 +49,9 @@ import { changeRequestLabel, changeRequestNoun, forgeName } from "./forge-text.t
  * (a fresh review round, since a review never carries across a rebase). A
  * head move counts as ranger's rebase only when ranger asked for a rebase
  * from the gated head and the forge lists the same commits after the move;
- * any other move parks. The
- * merge is squashed and pinned to the gated head, and a project whose squash
+ * any other move the rebase pass sees parks. A move between passes, after a
+ * rebase ranger knew only as pending, is re-gated and held at the card:
+ * never auto-merged. The merge is squashed and pinned to the gated head, and a project whose squash
  * option is `never` parks with a card before any write.
  *
  * Who merges: on a map with `autoMerge` (principal, 2026-10-03), ranger
@@ -368,7 +369,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   * it. The row stays pending or parks; nothing merges in this pass. A head
   * move is recorded as ranger's rebase (`to`) only when the forge confirmed
   * it and ranger asked for a rebase from this head, in this pass or an
-  * earlier one; any other move parks.
+  * earlier one; any other move this pass sees parks.
   */
  async function rebaseStep(
   { row, pr, headSha, cardTitle, rebases }: MergeAttempt,

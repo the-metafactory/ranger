@@ -93,9 +93,11 @@ On a GitLab map, the desk acts in this order:
    ranger's own rebase, so the row goes back to run-node for a fresh
    round. It is not parked.
    - A review never carries across a rebase.
-   - A head moved by anyone else still fails `review-clean` and parks, as
-     on GitHub. That includes a push past ranger's rebase head, and a head
-     that moved after ranger only waited on a rebase it never asked for.
+   - A head moved by anyone else fails `review-clean` and parks, as on
+     GitHub, except in the one window ranger cannot tell apart (next
+     bullet), where it is re-gated and never auto-merged. Parking includes
+     a push past ranger's rebase head, and a head that moved after ranger
+     only waited on a rebase it never asked for.
    - A head that moved while ranger knew its rebase only as `pending`
      (the rebase outlasted the 3 s wait and landed between passes) also
      goes back for a fresh round. Nothing ranger reads tells its rebase
