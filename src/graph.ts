@@ -113,9 +113,11 @@ export interface BuildBriefNotReady {
  * Soma's build-brief-not-ready finding for one frontier read. `ok: false`
  * when the audit could not be read: the walk then holds every build node
  * (src/route.ts). A soma without the field reads as `ok` with none listed.
+ * `unverified` names build nodes new or edited since the audit that is
+ * served (src/frontier-cache.ts): each is held as if its audit had failed.
  */
 export type BriefAudit =
-  | { ok: true; notReady: BuildBriefNotReady[] }
+  | { ok: true; notReady: BuildBriefNotReady[]; unverified?: string[] }
   | { ok: false; error: string };
 
 export interface NodeResult {
@@ -151,6 +153,14 @@ export interface GraphCallOptions {
  *  walk.ts's re-fetch was previously unbounded).
  */
 export const GRAPH_CALL_TIMEOUT_MS = 60_000;
+
+/**
+ * `soma graph audit` reads every node of the map, not just the frontier: on
+ * jcfischer/seelite (401 nodes, 2026-10-09) it took 83s and every tick's
+ * 60s-bounded audit failed. It runs outside the claim lock and the escalation
+ * pass (src/frontier-cache.ts), so a longer bound holds neither up.
+ */
+export const AUDIT_CALL_TIMEOUT_MS = 180_000;
 
 async function graphReadBackend(ref: ForgeRef, token: ResolvedToken) {
   if (ref.forge === "gitlab") {

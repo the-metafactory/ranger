@@ -64,6 +64,8 @@ export interface WalkMapResult {
   * (implement only; research still claims) or this headless map's own.
   */
  drained?: string;
+ /** Wall-clock of the soma audit this map's read ran, before the claim lock; absent when none ran. */
+ auditMs?: number;
  errors: string[];
  sweep?: SweepMapResult;
 }
@@ -433,6 +435,32 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
  // Pass 2 — claims, against lanes the sweeps, desks and queued resumes have settled.
  for (const { map, mapResult, token, botIdentity, errors } of walked) {
   if (!mapResult.gated) {
+   const readArgs = {
+    journal,
+    repo: map.repo,
+    root: map.root,
+    token: { token, source: "write-token" as const },
+    policy: budgetPolicy(config),
+    maxAgeMs: config.budget.frontierMaxAgeMin * 60_000,
+    timeoutMs: GRAPH_CALL_TIMEOUT_MS,
+   };
+   // The audit runs here, before the claim lock: on a large map it takes
+   // minutes, and under the lock it held the lock that long and widened the
+   // gap between the drain read and the claims (2026-10-09: seelite #820 was
+   // claimed 21s after the visual lane was drained). The locked read below
+   // serves this audit and holds any build node edited in between.
+   // Not a gate (the gates are read under the lock): a paused walk or a
+   // drained headless map claims nothing, so it skips the audit.
+   const idle = journal.isPaused() || (implementLane(map) === "headless" && journal.isMapDrained(mapKey(map)));
+   if (!idle) {
+    try {
+     const warm = await readFrontier({ ...readArgs, now: ctx.now?.() ?? new Date(), audit: "refresh" });
+     if (warm.auditMs !== undefined) mapResult.auditMs = warm.auditMs;
+     if (warm.auditNote !== undefined) errors.push(`build briefs: ${warm.auditNote}`);
+    } catch {
+     // The locked read meets the same deferral or failure and reports it.
+    }
+   }
    try {
     // The claim lock (node #58) spans the map's whole claim phase: a
     // `ranger build-now` claims before or after it, never between this
@@ -463,17 +491,9 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
      // announced+claimed as auto+research (round-29 review). readFrontier
      // re-reads the repo's sentinel here and serves the cached read only when
      // nothing changed since it was taken, so round-29 holds without paying
-     // GraphQL for an unchanged map (src/frontier-cache.ts).
-     const { frontier: fetched, briefs } = await readFrontier({
-      journal,
-      repo: map.repo,
-      root: map.root,
-      token: { token, source: "write-token" },
-      policy: budgetPolicy(config),
-      maxAgeMs: config.budget.frontierMaxAgeMin * 60_000,
-      now: ctx.now?.() ?? new Date(),
-      timeoutMs: GRAPH_CALL_TIMEOUT_MS,
-     });
+     // GraphQL for an unchanged map (src/frontier-cache.ts). It never runs
+     // the audit: the read before the lock did.
+     const { frontier: fetched, briefs } = await readFrontier({ ...readArgs, now: ctx.now?.() ?? new Date(), audit: "never" });
      const frontierEntries = fetched.frontier;
      // A build node whose brief soma's audit reports not ready routes
      // brief-not-ready, so the plan never takes it (node #154).
@@ -506,6 +526,14 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
        journal.assertWorkerRoot(node.id, map.repo, map.root);
       } catch (error) {
        errors.push(error instanceof Error ? error.message : String(error));
+       continue;
+      }
+      // A drain set since the gate read above (the operator verb takes no
+      // claim lock) still stops this claim: re-read it at the last moment.
+      const late = drainGate({ key: mapKey(map), lane: implementLane(map) }, readDrains(journal, [map]));
+      if (late !== null && (late.scope === "map" || laneOf(node.id) === "implement")) {
+       mapResult.drained = late.reason;
+       if (late.scope === "map") break;
        continue;
       }
 

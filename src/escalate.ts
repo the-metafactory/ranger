@@ -6,7 +6,7 @@ import type { EscalationDiscord } from "./discord.ts";
 import { classify, hitlWaiting, loadProbeRegistry } from "./route.ts";
 import { BudgetDeferral, budgetPolicy, budgetedRead } from "./budget.ts";
 import { readFrontier } from "./frontier-cache.ts";
-import { GRAPH_CALL_TIMEOUT_MS, graphAudit, graphNode } from "./graph.ts";
+import { AUDIT_CALL_TIMEOUT_MS, GRAPH_CALL_TIMEOUT_MS, graphAudit, graphNode } from "./graph.ts";
 import { type OwnedCheck, withEscalateLock } from "./lock.ts";
 import type { ResolvedToken } from "./token-gate.ts";
 import type { Journal } from "./journal.ts";
@@ -111,6 +111,11 @@ async function escalateOneMap(
       maxAgeMs: config.budget.frontierMaxAgeMin * 60_000,
       now,
       timeoutMs: GRAPH_CALL_TIMEOUT_MS,
+      // The walk runs the audit (minutes on a large map); the pass serves its
+      // cached result and audits only a map that has none, within the
+      // graph-call bound, so it fits its 120s budget.
+      audit: "if-missing",
+      auditTimeoutMs: GRAPH_CALL_TIMEOUT_MS,
     });
 
     const classified = frontier.frontier.map((entry) =>
@@ -284,8 +289,8 @@ async function digestOneMap(
       () =>
         graphAudit(map.repo, map.root, token, {
           timeoutMs: Math.min(
-            GRAPH_CALL_TIMEOUT_MS,
-            remainingMs || GRAPH_CALL_TIMEOUT_MS,
+            AUDIT_CALL_TIMEOUT_MS,
+            remainingMs || AUDIT_CALL_TIMEOUT_MS,
           ),
         }),
     );
