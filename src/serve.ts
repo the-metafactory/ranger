@@ -1135,8 +1135,11 @@ function laneQueue(s, lane) {
   el("ul", {}, ...q.entries.map((e, i) => {
    const head = i === 0 ? q.head : null;
    const facts = ordinal(e.position) + " in the " + lane + " resume queue · " + e.key + " · queued " + ago(e.queuedAt) + (e.failedStarts ? " · " + e.failedStarts + " failed start(s)" : "") + (head ? " · " + head.reason : "");
+   // A queued node may have no Needs-you card, so its last cancel shows here.
+   const last = results.get(e.key + "/" + e.nodeId);
    return el("li", {}, el("span", { class: "id", text: "#" + e.nodeId }), el("span", { class: "t" }, link(e.url, e.title || "(title not in the frontier read)"), el("span", { class: "reason", text: facts })),
-    tags(tag(head && head.starts ? "next" : "queued"), cancelButton(e)));
+    tags(tag(head && head.starts ? "next" : "queued"), cancelButton(e)),
+    last ? el("pre", { class: last.err ? "err" : "", text: last.text }) : null);
   })));
 }
 // build-now's exit codes: 0 started, 3 claimed with no run-node (BUILD_NOW_NOT_STARTED), null still running.
