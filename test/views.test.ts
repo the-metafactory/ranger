@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "../src/config.ts";
-import { captureViews, chooseViews, compareViews, fillViewsTemplate, freeViewsPort, loadViewsRecord, parseViewsDiff, redactViewsReason, saveViewsRecord, startViewsServer, viewsCard, viewsCardMessage, viewsComment, viewsDirectory, type CaptureViewsContext, type ViewsDependencies } from "../src/views.ts";
+import { captureViews, chooseViews, compareViews, fillViewsTemplate, freeViewsPort, loadViewsRecord, parseViewsDiff, redactViewsReason, saveViewsRecord, startViewsServer, viewsCard, viewsCardMessage, viewsComment, viewsDirectory, VIEWS_FAILURE_LOG, type CaptureViewsContext, type ViewsDependencies } from "../src/views.ts";
 import { pidAlive, processGroupCommands, runCmd } from "../src/exec.ts";
 import { baseConfigLines } from "./support.ts";
 
@@ -202,6 +202,76 @@ describe("capture orchestration", () => {
    expect(text).toContain("[redacted]");
   }
   expect(redactViewsReason(`refused ${secret}`, { PASSWORD: secret })).toBe("refused [redacted]");
+  const log = readFileSync(join(r.out, VIEWS_FAILURE_LOG), "utf8");
+  expect(log).not.toContain(secret);
+  expect(log).not.toContain(token);
+ });
+ test("a failed after2 capture names its step, exit and stderr ahead of a long stdout, and saves the full output", async () => {
+  const r = rig();
+  const run = r.ctx.dependencies!.run!;
+  const listing = Array.from({ length: 60 }, (_, i) => `pit  station-trade · overhead-deep view-${i}`).join("\n");
+  expect(listing.length).toBeGreaterThan(2048);
+  r.ctx.dependencies!.run = async (bin, args, opts) => args[1].startsWith("capture 'after2'")
+   ? { code: 1, stdout: listing, stderr: "Error: page crashed at npc-arrival\n" }
+   : run(bin, args, opts);
+  const record = await captureViews(r.ctx);
+  expect(record).toMatchObject({ status: "failed", output: VIEWS_FAILURE_LOG });
+  if (record?.status !== "failed") throw new Error("expected a failed record");
+  expect(record.reason).toStartWith("after2 capture failed (exit 1): Error: page crashed at npc-arrival\nstdout: …");
+  expect(record.reason.length).toBeLessThanOrEqual(1000);
+  expect(record.reason).toEndWith("view-59");
+  expect(loadViewsRecord(r.out, SHA)).toEqual(record);
+  const log = readFileSync(join(r.out, VIEWS_FAILURE_LOG), "utf8");
+  expect(log).toContain("step: after2 capture\nexit: 1\n");
+  expect(log).toContain("Error: page crashed at npc-arrival");
+  expect(log).toContain(listing);
+  expect(viewsComment(record, r.out)).toContain(`Full output of the failed step: \`${join(r.out, VIEWS_FAILURE_LOG)}\``);
+  expect((await viewsCard(r.out, SHA)).summary).toContain(join(r.out, VIEWS_FAILURE_LOG));
+  // A retry that passes leaves no failure log behind for the new record.
+  r.ctx.dependencies!.run = run;
+  expect(await captureViews(r.ctx)).toMatchObject({ status: "ok" });
+  expect(existsSync(join(r.out, VIEWS_FAILURE_LOG))).toBe(false);
+ });
+ test("a killed step leads with it even when stderr alone exceeds the limit", async () => {
+  const r = rig();
+  r.ctx.dependencies!.run = async () => ({ code: -1, stdout: "listing ".repeat(500), stderr: `${"noise ".repeat(400)}final error` });
+  const record = await captureViews(r.ctx);
+  if (record?.status !== "failed") throw new Error("expected a failed record");
+  expect(record.reason).toStartWith("before dependency install timed out or was killed: …");
+  expect(record.reason).toEndWith("final error");
+  expect(record.reason).not.toContain("listing");
+  expect(record.reason.length).toBeLessThanOrEqual(1000);
+  expect(readFileSync(join(r.out, VIEWS_FAILURE_LOG), "utf8")).toContain("exit: timed out or was killed");
+ });
+ test("a secret where the cut lands is redacted before shortening", async () => {
+  const r = rig();
+  const secret = "s3cr3t-".repeat(20);
+  r.ctx.env.SESSION_TOKEN = secret;
+  const token = "ghp_" + "Z".repeat(60);
+  for (let pad = 0; pad < 40; pad += 7) {
+   // stdout's tail is cut mid-way through each secret at some padding.
+   const stdout = `${secret} ${token} ${"x".repeat(pad)}\n${"y".repeat(800)}`;
+   r.ctx.dependencies!.run = async () => ({ code: 1, stdout, stderr: "refused" });
+   const record = await captureViews(r.ctx);
+   if (record?.status !== "failed") throw new Error("expected a failed record");
+   const published = [record.reason, viewsComment(record, r.out), readFileSync(join(r.out, VIEWS_FAILURE_LOG), "utf8")];
+   for (const text of published) {
+    expect(text).not.toContain(secret.slice(-16));
+    expect(text).not.toContain(token.slice(-16));
+   }
+  }
+ });
+ test("non-step reasons keep their start when shortened", () => {
+  const reason = redactViewsReason(`views server failed: ${"z".repeat(3000)} end`, {});
+  expect(reason).toStartWith("views server failed: ");
+  expect(reason).toEndWith(" end");
+  expect(reason.length).toBeLessThanOrEqual(1000);
+ });
+ test("a record naming any other output file is not trusted", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ranger-views-"));
+  dirs.push(dir);
+  writeFileSync(join(dir, "ranger-views.json"), JSON.stringify({ sha: SHA, status: "failed", reason: "x", output: "../../etc/passwd" }));
+  expect(loadViewsRecord(dir, SHA)).toBeUndefined();
  });
  test("without needs-eye runs nothing, even with missing configuration", async () => {
   const r = rig();

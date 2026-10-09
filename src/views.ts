@@ -25,7 +25,11 @@ export interface ViewDiff { view: string; change: number; noise: number }
 const byMostChanged = (a: ViewDiff, b: ViewDiff): number => b.change - a.change || a.view.localeCompare(b.view);
 export type ViewsRecord =
  | { sha: string; status: "ok"; rows: ViewDiff[] }
- | { sha: string; status: "failed"; reason: string };
+ | { sha: string; status: "failed"; reason: string; output?: typeof VIEWS_FAILURE_LOG };
+
+/** A failed step's full stdout and stderr, redacted, beside the record (node #195). */
+export const VIEWS_FAILURE_LOG = "views-failure.log";
+const REASON_LIMIT = 1000;
 
 export function viewsDirectory(journalPath: string, repo: string, nodeId: string, sha: string): string {
  if (!/^[\w.-]+\/[\w.-]+$/.test(repo) || repo.split("/").some(p => p === "." || p === "..") || !/^\d+$/.test(nodeId) || !SHA.test(sha)) {
@@ -109,6 +113,7 @@ export function viewsComment(record: ViewsRecord, out: string): string {
   `<!-- ranger:views sha=${record.sha} -->`,
   "## Visual evidence (principal's eye is the gate)",
   record.status === "ok" ? viewsTable(record.rows) : `Sheet could not be made: ${record.reason}`,
+  ...(record.status === "failed" && record.output ? [`Full output of the failed step: \`${join(out, record.output)}\``] : []),
   `Full local sheet: \`${join(out, "index.html")}\``,
  ].join("\n\n");
 }
@@ -124,7 +129,9 @@ export function loadViewsRecord(out: string, sha: string): ViewsRecord | undefin
  try {
   const record = JSON.parse(readFileSync(join(out, "ranger-views.json"), "utf8"));
   if (record.sha !== sha) return undefined;
-  if (record.status === "failed" && typeof record.reason === "string") return record;
+  if (record.status === "failed" && typeof record.reason === "string") {
+   return record.output === undefined || record.output === VIEWS_FAILURE_LOG ? record : undefined;
+  }
   if (record.status !== "ok" || !Array.isArray(record.rows) || record.rows.length === 0) return undefined;
   if (new Set(record.rows.map((r: ViewDiff) => r.view)).size !== record.rows.length) return undefined;
   if (record.rows.some((r: ViewDiff) => typeof r.view !== "string" || !VIEW_NAME.test(r.view) ||
@@ -153,7 +160,10 @@ function verifyCaptureSet(out: string, rows: readonly ViewDiff[]): void {
 export async function viewsCard(out: string, sha: string): Promise<{ summary: string; files: DiscordFile[] }> {
  const record = loadViewsRecord(out, sha);
  if (record === undefined) return { summary: "Sheet could not be made: no capture record for this head.", files: [] };
- if (record.status === "failed") return { summary: `Sheet could not be made: ${record.reason}`, files: [] };
+ if (record.status === "failed") {
+  const output = record.output ? `\nFull output of the failed step: ${join(out, record.output)}` : "";
+  return { summary: `Sheet could not be made: ${record.reason}${output}`, files: [] };
+ }
  const sizes = (view: string): [number, number] => [pngSize(out, "before", view), pngSize(out, "after", view)];
  let selection = chooseViews(record.rows, sizes);
  const summaryFor = (selected: ViewsSelection) => [
@@ -198,16 +208,74 @@ export function viewsCardMessage(content: string, evidence?: Awaited<ReturnType<
  };
 }
 
-export function redactViewsReason(reason: string, env: NodeJS.ProcessEnv): string {
+/** Redacts the whole text; callers shorten only afterwards, so no secret survives a cut. */
+export function redactViewsText(text: string, env: NodeJS.ProcessEnv): string {
  for (const [key, value] of Object.entries(env)) {
   if (value && /token|secret|password|passwd|credential|api_?key|private_?key/i.test(key)) {
-   reason = reason.replaceAll(value, "[redacted]");
+   text = text.replaceAll(value, "[redacted]");
   }
  }
- return reason
+ return text
   .replace(/\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]{20,})\b/g, "[redacted]")
-  .replace(/\b(?:mfa\.[\w-]{20,}|[\w-]{24,}\.[\w-]{6}\.[\w-]{27,})\b/g, "[redacted]")
-  .slice(-1000);
+  .replace(/\b(?:mfa\.[\w-]{20,}|[\w-]{24,}\.[\w-]{6}\.[\w-]{27,})\b/g, "[redacted]");
+}
+
+/** Keeps the start, which names what failed, and the end, where the output usually says why. */
+export function redactViewsReason(reason: string, env: NodeJS.ProcessEnv): string {
+ const text = redactViewsText(reason, env);
+ return text.length <= REASON_LIMIT ? text : `${text.slice(0, 300)} … ${text.slice(-(REASON_LIMIT - 303))}`;
+}
+
+/** A views command that exited non-zero, timed out or was killed. */
+export class ViewsStepError extends Error {
+ constructor(readonly step: string, readonly result: RunResult) {
+  super(`${stepHeadline(step, result.code)}: ${result.stderr + result.stdout}`);
+ }
+}
+
+function stepHeadline(step: string, code: number): string {
+ return `${step} ${code === -1 ? "timed out or was killed" : `failed (exit ${code})`}`;
+}
+
+const tail = (text: string, room: number): string => text.length <= room ? text : `…${text.slice(-(room - 1))}`;
+
+/**
+ * The step and its exit always lead, the command's stderr comes next and
+ * stdout last, so stdout is shortened first (node #195: a long capture listing
+ * used to push the step, the exit and the error out of the record).
+ */
+export function viewsStepReason(error: ViewsStepError, env: NodeJS.ProcessEnv): string {
+ const head = `${stepHeadline(error.step, error.result.code)}: `;
+ const stderr = redactViewsText(error.result.stderr, env).trim();
+ const stdout = redactViewsText(error.result.stdout, env).trim();
+ let room = REASON_LIMIT - head.length;
+ const parts: string[] = [];
+ if (stderr !== "") {
+  parts.push(tail(stderr, room));
+  room -= parts[0].length + 1;
+ }
+ const label = "stdout: ";
+ if (stdout !== "" && room > label.length + 20) parts.push(label + tail(stdout, room - label.length));
+ return head + (parts.join("\n") || "no output");
+}
+
+/** The failed step's full output, redacted, 0600 beside the record. Evidence, never a gate. */
+function saveViewsFailureLog(out: string, error: ViewsStepError, env: NodeJS.ProcessEnv): typeof VIEWS_FAILURE_LOG | undefined {
+ try {
+  mkdirSync(out, { recursive: true });
+  const file = join(out, VIEWS_FAILURE_LOG);
+  rmSync(file, { force: true });
+  writeFileSync(file, redactViewsText([
+   `step: ${error.step}`,
+   `exit: ${error.result.code === -1 ? "timed out or was killed" : error.result.code}`,
+   "----- stderr",
+   error.result.stderr,
+   "----- stdout",
+   error.result.stdout,
+   "",
+  ].join("\n"), env), { mode: 0o600 });
+  return VIEWS_FAILURE_LOG;
+ } catch { return undefined; }
 }
 
 export interface ViewsServer { stop(): Promise<void> }
@@ -290,7 +358,7 @@ export async function captureViews(ctx: CaptureViewsContext): Promise<ViewsRecor
   const result: RunResult = await run("/bin/sh", ["-c", command], {
    cwd, env: { ...ctx.env, ...(origin ? { PROBE_ORIGIN: origin } : {}) }, timeoutMs: TIMEOUT_MS, processGroup: true,
   });
-  if (result.code !== 0) throw new Error(`${step} ${result.code === -1 ? "timed out or was killed" : `failed (exit ${result.code})`}: ${result.stderr + result.stdout}`);
+  if (result.code !== 0) throw new ViewsStepError(step, result);
   return result.stdout;
  };
  const checkedGit = async (args: string[]): Promise<string> => {
@@ -311,7 +379,7 @@ export async function captureViews(ctx: CaptureViewsContext): Promise<ViewsRecor
   if (!SHA.test(base)) throw new Error("invalid merge base");
   mkdirSync(out, { recursive: true });
   // A retry must not inherit partial frames from a prior crashed capture.
-  for (const label of ["before", "after", "after2", "index.html"]) rmSync(join(out, label), { recursive: true, force: true });
+  for (const label of ["before", "after", "after2", "index.html", VIEWS_FAILURE_LOG]) rmSync(join(out, label), { recursive: true, force: true });
   scratch = mkdtempSync(join(dirname(out), "before-"));
   before = join(scratch, "worktree");
   await checkedGit(["worktree", "add", "--detach", before, base]);
@@ -334,7 +402,12 @@ export async function captureViews(ctx: CaptureViewsContext): Promise<ViewsRecor
   verifyCaptureSet(out, rows);
   record = { sha, status: "ok", rows };
  } catch (error) {
-  record = { sha, status: "failed", reason: redactViewsReason(error instanceof Error ? error.message : String(error), ctx.env) };
+  if (error instanceof ViewsStepError) {
+   const output = saveViewsFailureLog(out, error, ctx.env);
+   record = { sha, status: "failed", reason: viewsStepReason(error, ctx.env), ...(output ? { output } : {}) };
+  } else {
+   record = { sha, status: "failed", reason: redactViewsReason(error instanceof Error ? error.message : String(error), ctx.env) };
+  }
  } finally {
   if (before !== undefined) {
    try { await checkedGit(["worktree", "remove", "--force", before]); } catch { /* best-effort after an incomplete add */ }
