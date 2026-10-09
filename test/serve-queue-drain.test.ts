@@ -384,7 +384,13 @@ function rig() {
  });
  const post = (path: string, body: unknown) => handler(postRequest(path, body));
  const freeze = () => { frozen = state(); };
- return { config, journal, state, post, freeze, close() { journal.close(); discord.stop(); rmSync(dir, { recursive: true, force: true }); } };
+ // Parked implement rows on the game map, in review: each one a resume would take the visual lane for.
+ const parkWorkers = (...ids: string[]) => {
+  for (const id of ids) {
+   journal.upsertWorker({ nodeId: id, repo: GAME, root: 1, status: "parked", lane: "implement", phase: "review", finishedAt: "2026-10-09T09:00:00Z" });
+  }
+ };
+ return { config, journal, state, post, freeze, parkWorkers, close() { journal.close(); discord.stop(); rmSync(dir, { recursive: true, force: true }); } };
 }
 
 describe("node #166 — through the real CLI: the same effect as the verb, or an error and no change", () => {
@@ -408,9 +414,7 @@ describe("node #166 — through the real CLI: the same effect as the verb, or an
  test("a queued node shows its place; cancel drops it; a cancel the verb refuses shows its error and changes nothing", async () => {
   const r = rig();
   try {
-   for (const id of ["40", "41"]) {
-    r.journal.upsertWorker({ nodeId: id, repo: GAME, root: 1, status: "parked", lane: "implement", phase: "review", finishedAt: "2026-10-09T09:00:00Z" });
-   }
+   r.parkWorkers("40", "41");
    const first = r.journal.enqueueResume({ nodeId: "41", repo: GAME, root: 1, lane: "visual" }, NOW);
    r.journal.enqueueResume({ nodeId: "40", repo: GAME, root: 1, lane: "visual" }, NOW);
    const state = r.state();
@@ -439,9 +443,7 @@ describe("node #166 — through the real CLI: the same effect as the verb, or an
  test("queue resume behind a waiting queue queues it FIFO, as resume-node --when-free does", async () => {
   const r = rig();
   try {
-   for (const id of ["40", "41"]) {
-    r.journal.upsertWorker({ nodeId: id, repo: GAME, root: 1, status: "parked", lane: "implement", phase: "review", finishedAt: "2026-10-09T09:00:00Z" });
-   }
+   r.parkWorkers("40", "41");
    r.journal.enqueueResume({ nodeId: "41", repo: GAME, root: 1, lane: "visual" }, NOW);
    const res = await (await r.post("/api/queue-resume", { key: `${GAME}#1`, id: "40" })).json();
    expect(res).toMatchObject({ ok: true, code: 0 });

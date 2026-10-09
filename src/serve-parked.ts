@@ -438,11 +438,12 @@ function queueOffer(
  return { offered: true };
 }
 
-/** Each queued node's lane and FIFO place in it (1 = the head), by `repo#id`. */
+/** Each queued node's lane and FIFO place in it (1 = the head), by `repo#id`: the lane list's own places. */
 function queuePlaces(queue: ResumeQueueRow[]): Map<string, { lane: ImplementLane; position: number }> {
  const places = new Map<string, { lane: ImplementLane; position: number }>();
- const depth: Record<ImplementLane, number> = { visual: 0, headless: 0 };
- for (const e of queue) places.set(nodeKey(e.repo, e.nodeId), { lane: e.lane, position: ++depth[e.lane] });
+ for (const views of Object.values(resumeQueueViews(queue, () => null))) {
+  for (const v of views) places.set(nodeKey(v.repo, v.nodeId), { lane: v.lane, position: v.position });
+ }
  return places;
 }
 
@@ -791,18 +792,28 @@ export const verbResult = (action: string, result: ActionResult, extra: Record<s
  stderr: tailOf(result.stderr),
 });
 
-/** `resume-node <id> --cancel`: the verb drops the entry, or refuses and changes nothing. */
-async function runCancel(queued: QueuedResumeView, body: ActionBody, deps: ActionDeps): Promise<ActionResponse> {
- if (deps.configPath === undefined) return noConfigPath("cancel");
- const argv = resumeArgv({
+/** `resume-node <id> --when-free` or `--cancel`, or the refusal when serve has no config path. */
+function queuedResumeArgv(
+ deps: Pick<ActionDeps, "rangerBin" | "configPath">,
+ target: { repo: string; root: number; nodeId: string },
+ queue: "when-free" | "cancel",
+): string[] | ActionResponse {
+ if (deps.configPath === undefined) return noConfigPath(queue === "cancel" ? "cancel" : "resume");
+ return resumeArgv({
   rangerBin: deps.rangerBin,
   configPath: deps.configPath,
-  repo: queued.repo,
-  root: queued.root,
-  nodeId: queued.nodeId,
+  repo: target.repo,
+  root: target.root,
+  nodeId: target.nodeId,
   force: false,
-  queue: "cancel",
+  queue,
  });
+}
+
+/** `resume-node <id> --cancel`: the verb drops the entry, or refuses and changes nothing. */
+async function runCancel(queued: QueuedResumeView, body: ActionBody, deps: ActionDeps): Promise<ActionResponse> {
+ const argv = queuedResumeArgv(deps, queued, "cancel");
+ if (!Array.isArray(argv)) return argv;
  return runOperatorVerb(argv, body.dryRun, deps, "cancel-resume", { nodeId: queued.nodeId });
 }
 
@@ -850,16 +861,9 @@ async function runHeldAction(
   detached = true;
  } else if (kind === "queue-resume") {
   if (!entry.actions.queueResume.offered) return refusal(409, entry.actions.queueResume.why);
-  if (deps.configPath === undefined) return noConfigPath("resume");
-  argv = resumeArgv({
-   rangerBin: deps.rangerBin,
-   configPath: deps.configPath,
-   repo: entry.repo,
-   root: entry.root,
-   nodeId: entry.nodeId,
-   force: false,
-   queue: "when-free",
-  });
+  const queued = queuedResumeArgv(deps, entry, "when-free");
+  if (!Array.isArray(queued)) return queued;
+  argv = queued;
   env = childEnv(deps.env);
   // The lane may have freed since the page read it: the verb then starts the resume, as a Resume does.
   detached = true;

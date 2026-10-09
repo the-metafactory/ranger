@@ -59,7 +59,7 @@ import { Journal, type ResumeQueueRow, type WorkerRow } from "./journal.ts";
 import { ForeignMigrationError } from "./journal-guard.ts";
 import { IMPLEMENT_LANES, implementLane, workerLane, type ImplementLane } from "./lanes.ts";
 import { activeCooldown, readGraphqlBudget } from "./budget.ts";
-import { queueEntryGate } from "./resume.ts";
+import { queueEntryGate, queueSpawnGate } from "./resume.ts";
 import { cachedFrontier } from "./frontier-cache.ts";
 import { type FrontierEntry, graphFrontier, RateLimitError } from "./graph.ts";
 import { runCmd } from "./exec.ts";
@@ -364,7 +364,10 @@ interface TickSoFar {
  * dead-man pause, a lane holder or the spent cap holds it. A drain does not:
  * it stops only fresh claims. Entries are visited in the journal's FIFO
  * order, so with one spawn left the earlier-queued head takes it. Which
- * entries drop, defer or wait behind is the walk's own `queueEntryGate`.
+ * entries drop, defer or wait behind is the walk's own `queueEntryGate`,
+ * and what holds a head is its `queueSpawnGate`. The walk's forge checks
+ * (a closed node, a merged PR) and its identity gate are past what the
+ * dashboard reads, so a head it shows as starting may still drop or defer.
  */
 function planQueueHeads(
  queue: ResumeQueueRow[],
@@ -390,17 +393,14 @@ function planQueueHeads(
   const holder = tick.holders[entry.lane];
   const held =
    gate !== null ? `the tick holds it, and the lane's queue behind it: ${gate.reason}`
-   : inputs.paused ? "dead-man paused: queued resumes wait for `ranger resume-run`"
-   : holder !== null ? `waits for the ${entry.lane} lane, held by #${holder.nodeId} (${holder.repo})`
-   : tick.spawns >= inputs.spawnCap ? `waits: the daily spawn cap (${inputs.spawnCap}) is spent`
-   : null;
+   : queueSpawnGate({ paused: inputs.paused, lane: entry.lane, holder, spawns: tick.spawns, cap: inputs.spawnCap });
   if (held !== null) {
    lane.head = { ...at, starts: false, reason: held };
    continue;
   }
   tick.holders[entry.lane] = { repo: key, nodeId: entry.nodeId, thisTick: true, resumed: true };
   tick.spawns += 1;
-  lane.head = { ...at, starts: true, reason: "the next tick resumes this, ahead of any frontier claim" };
+  lane.head = { ...at, starts: true, reason: "the next tick starts this ahead of any frontier claim, unless its forge check (a closed node, a merged PR) or the identity gate stops it" };
  }
  return out;
 }
@@ -1117,13 +1117,17 @@ function renderNext(s) {
   }));
  }
 }
+// A verb's exit for the status line, pointing at where its detail shows.
+// A null code is a verb that timed out or never started: it may have applied.
+function outcome(label, r, where) {
+ return label + (r.ok ? " ran." : r.code === null ? " did not finish (timed out or could not start): it may have applied, so check " + where + " once the page reloads." : " failed (exit " + r.code + "): see " + where + ".");
+}
 // A verb run for the page (drain): its exit and stderr, shown on failure.
 async function pageVerb(path, body, label) {
  document.getElementById("out").textContent = "";
  try {
   const r = await post(path, body);
-  // A null code is a verb that timed out or never started: it may have applied.
-  say(label + (r.ok ? " ran." : r.code === null ? " did not finish (timed out or could not start): it may have applied, so check the page once it reloads." : " failed (exit " + r.code + "): see its error."), !r.ok);
+  say(outcome(label, r, "the page"), !r.ok);
   if (!r.ok) document.getElementById("out").textContent = r.stderr || "";
  } catch (e) { say(label + " refused: " + e.message, true); }
  load(); setTimeout(load, 3000);
@@ -1248,8 +1252,8 @@ async function act(kind, n, extra) {
   const r = await post("/api/" + kind, Object.assign({ key: n.key, id: n.nodeId }, extra));
   const close = r.close ? "\\nclose (merge desk): exit " + (r.close.code === null ? "none" : r.close.code) + (r.close.stderr ? "\\n" + r.close.stderr : "") : "";
   results.set(id, { err: !r.ok || (r.close && !r.close.ok), text: kind + " #" + n.nodeId + ": exit " + (r.code === null ? "none" : r.code) + (r.stderr ? "\\n" + r.stderr : "") + close });
-  // A null code is a verb that timed out or never started: it may have applied.
-  say(kind + " #" + n.nodeId + (!r.ok ? (r.code === null ? " did not finish (timed out or could not start): it may have applied, so check its card once the page reloads." : " failed: see its card.") : r.close ? (r.close.ok ? " ran; the merge desk started its close." : " ran, but the merge desk failed: see its card.") : " ran."), !r.ok || (r.close && !r.close.ok));
+  const label = kind + " #" + n.nodeId;
+  say(!r.ok || !r.close ? outcome(label, r, "its card") : label + (r.close.ok ? " ran; the merge desk started its close." : " ran, but the merge desk failed: see its card."), !r.ok || (r.close && !r.close.ok));
  } catch (e) { results.set(id, { err: true, text: kind + " #" + n.nodeId + " refused: " + e.message }); say(e.message, true); }
  load(); setTimeout(load, 3000);
 }

@@ -34,8 +34,30 @@ const releasedError = (nodeId: string) => new Error(`node ${nodeId}'s claim was 
 const missingRowError = (nodeId: string, repo: string) => new Error(`no journal row for node ${nodeId} on ${repo} — nothing to resume`);
 
 export const queuedResumeStale = (status: WorkerStatus) => status === "released" || status === "claimed" || status === "running";
-export const spawnHeld = (journal: Journal, config: RangerConfig, now: Date) =>
- journal.isPaused() || journal.spawnsToday(now) >= config.workers.spawnCapPerDay;
+
+/**
+ * Pass 1c's spawn gates for a queue head, in the walk's order: the dead-man
+ * pause, a holder of the entry's lane, the spent daily spawn cap. Why the
+ * head waits, or null when it may start. `ranger serve` reads its "next"
+ * head through this same gate (node #166).
+ */
+export function queueSpawnGate(g: {
+ paused: boolean;
+ lane: ImplementLane;
+ holder: { nodeId: string; repo: string } | null;
+ spawns: number;
+ cap: number;
+}): string | null {
+ if (g.paused) return "dead-man paused: queued resumes wait for `ranger resume-run`";
+ if (g.holder !== null) return `waits for the ${g.lane} lane, held by #${g.holder.nodeId} (${g.holder.repo})`;
+ if (g.spawns >= g.cap) return `waits: the daily spawn cap (${g.cap}) is spent`;
+ return null;
+}
+
+/** The journal's spawn gates for a queued start; the lane holder, when it matters, is the caller's. */
+const spawnGate = (journal: Journal, config: RangerConfig, now: Date, lane: ImplementLane,
+ holder: { nodeId: string; repo: string } | null = null) =>
+ queueSpawnGate({ paused: journal.isPaused(), lane, holder, spawns: journal.spawnsToday(now), cap: config.workers.spawnCapPerDay });
 
 /**
  * Whether `resume-node --when-free` queues the row rather than starting it:
@@ -114,7 +136,7 @@ export async function startResumeNode(
  const takesLane = startsImplementSession(row);
  const holder = takesLane ? journal.laneHolder(lane, { nodeId, repo: map.repo }) : null;
  const now = ctx.now?.() ?? new Date();
- if (options.queued !== undefined && (spawnHeld(journal, ctx.config, now) || holder !== null)) {
+ if (options.queued !== undefined && spawnGate(journal, ctx.config, now, lane, holder) !== null) {
   return { ...result, kind: "queued", queued: true };
  }
  if (holder !== null && options.force !== true) throw new Error(laneHeldMessage(lane, holder, "resume", nodeId));
@@ -220,9 +242,15 @@ export async function processResumeQueue(
   if (gate?.kind === "behind") continue;
   if (gate?.kind === "drop") { drop(gate.reason); continue; }
   if (gate?.kind === "defer") { defer(gate.reason); continue; }
-  // The gate passed only with a registered map and its row.
-  if (state === undefined || map === undefined || row === null) continue;
-  if (spawnHeld(journal, config, ctx.now?.() ?? new Date())) {
+  // The gate passes only with a registered map and its row; should it ever
+  // not, the entry still defers and holds its lane, never skips silently.
+  if (state === undefined || map === undefined || row === null) {
+   defer(state === undefined ? "map state is unavailable" : "map or worker row is unavailable");
+   continue;
+  }
+  // The lane holder is read at the start itself (startResumeNode), after the
+  // forge checks, so a held lane still drops a closed node or merged PR.
+  if (spawnGate(journal, config, ctx.now?.() ?? new Date(), entry.lane) !== null) {
    waiting.add(entry.lane);
    continue;
   }

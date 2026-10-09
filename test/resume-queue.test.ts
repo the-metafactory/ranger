@@ -787,9 +787,11 @@ test("resume queue migration appends to the prior journal, preserves worker stat
 // Node #166: `ranger serve` reads the queue head the next tick starts; the
 // real walk must start that head and nothing else. Forge-read drops (a closed
 // node, a merged PR) are past what the dashboard reads, so they stay out.
+// A drain stops only fresh claims: with every map and the visual lane
+// drained, the queue head still starts.
 describe("the dashboard's queue head is the one the walk starts", () => {
- const starts = { free: "40", "walk none": "41", running: null, pause: null, cap: null } as const;
- for (const scenario of ["free", "walk none", "running", "pause", "cap"] as const) {
+ const starts = { free: "40", "walk none": "41", running: null, pause: null, cap: null, drain: "40" } as const;
+ for (const scenario of ["free", "walk none", "running", "pause", "cap", "drain"] as const) {
   test(`${scenario}: ${starts[scenario] === null ? "nothing starts" : "#" + starts[scenario] + " starts"}`, async () => {
    await withRig(async r => {
     r.queue("40"); r.queue("41", 460);
@@ -797,9 +799,14 @@ describe("the dashboard's queue head is the one the walk starts", () => {
     if (scenario === "running") r.journal.updateWorker("40", REPO, { status: "running" });
     if (scenario === "pause") r.journal.setPaused(true);
     if (scenario === "cap") for (let i = 0; i < r.config.workers.spawnCapPerDay; i++) r.journal.recordSpawn(NOW);
+    if (scenario === "drain") {
+     for (const m of r.config.maps) r.journal.setMapDrained(`${m.repo}#${m.root}`, true);
+     r.journal.setVisualLaneDrained(true);
+    }
     const maps = servedMaps(r.config);
     const state = stateFromJournal(r.config, maps, new ServeReader(r.config, maps, r.config.state.journalPath), NOW);
     const head = state.resumeQueue.headless.head;
+    if (scenario === "drain") expect(state.gates.drainedMaps).toEqual(r.config.maps.map(m => `${m.repo}#${m.root}`));
     expect(head?.starts ? head.nodeId : null).toBe(starts[scenario]);
     const spawned: string[] = [];
     await walk({ ...r, now: () => NOW, spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; } });
