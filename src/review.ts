@@ -42,9 +42,15 @@ export async function sageReview(
  repo: string,
  prNumber: number,
  readOnlyToken: string,
- opts: { command?: string; timeoutMs?: number; substrate?: SubstrateName; nice?: number } = {},
+ opts: { command?: string; timeoutMs?: number; substrate?: SubstrateName; nice?: number; reviewAuthor?: string } = {},
 ): Promise<ReviewVerdict> {
- const gated = gatedEnv(readOnlyToken, {}, workerHostEnv());
+ // Ranger posts each round as a PR comment under its machine account, not as
+ // a review under the read-only token's login. Naming that account is what lets
+ // sage read its own earlier rounds back (sage#134): without it every
+ // round is a first round, so sage re-reviews the whole PR, re-raises what it
+ // already said, and never scopes a lens to the delta.
+ const extra = opts.reviewAuthor === undefined ? {} : { SAGE_REVIEW_AUTHOR_LOGIN: opts.reviewAuthor };
+ const gated = gatedEnv(readOnlyToken, extra, workerHostEnv());
  try {
   const args = ["review", nodeKey(repo, prNumber), "--emit-verdict-block"];
   // The cross-model choice. Checked against sage 0.2.12 (a4f12c9,

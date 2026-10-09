@@ -95,7 +95,7 @@ export type Reviewer = (
  repo: string,
  prNumber: number,
  readOnlyToken: string,
- opts?: { substrate?: SubstrateName; nice?: number },
+ opts?: { substrate?: SubstrateName; nice?: number; reviewAuthor?: string },
 ) => Promise<ReviewVerdict>;
 
 export type WorkerRun = (prompt: string, opts: RunOptions) => Promise<RunResult>;
@@ -1237,6 +1237,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
        verdict: await (ctx.reviewer ?? sageReview)(repo, open.iid, ctx.readOnlyToken, {
         substrate: reviewSubstrate,
         nice: config.workers.niceness,
+        reviewAuthor: botIdentity,
        }),
       };
      } catch (error) {

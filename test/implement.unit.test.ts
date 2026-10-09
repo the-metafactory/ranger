@@ -430,6 +430,18 @@ describe("sage exit codes (live finding on seelite #667)", () => {
   expect(await run("approved")).toMatchObject({ verdict: "approved", blockers: 0 });
   await expect(run("crash")).rejects.toThrow(ReviewError);
  });
+ test("the posting account reaches sage as its review author, so earlier rounds read back", async () => {
+  const { sageReview } = await import("../src/review.ts");
+  const named = await sageReview("acme/widgets", 7, "ghp_readonly", { command: fake, reviewAuthor: "ivy-bot" });
+  expect(named.summary).toBe("fake author=ivy-bot");
+  const saved = process.env.SAGE_REVIEW_AUTHOR_LOGIN;
+  delete process.env.SAGE_REVIEW_AUTHOR_LOGIN;
+  try {
+   expect((await sageReview("acme/widgets", 7, "ghp_readonly", { command: fake })).summary).toBe("fake author=none");
+  } finally {
+   if (saved !== undefined) process.env.SAGE_REVIEW_AUTHOR_LOGIN = saved;
+  }
+ });
 });
 
 describe("worker prompts are headless-aware (found live on seelite #669)", () => {
