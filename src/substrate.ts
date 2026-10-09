@@ -373,12 +373,25 @@ export async function probeClaudeQuota(opts: { timeoutMs?: number } = {}): Promi
 // ---- reading persistence ----
 
 /**
- * Persist a fresh reading. A capped-until still in the future survives a
- * fresh reading: it is its own eligibility condition (node #45 brief).
+ * Persist a fresh reading. A future cap survives lagging uncapped reads
+ * (node #45), unless the window carrying that cap demonstrably rolled.
  */
 export function persistReading(journal: Journal, reading: QuotaReading): void {
  const prior = journal.getSubstrateReading(reading.substrate);
- const priorUntil = prior === null ? null : activeCappedUntil(prior, reading.readAt);
+ let priorUntil = prior === null ? null : activeCappedUntil(prior, reading.readAt);
+ if (!reading.capped && priorUntil !== null && prior !== null) {
+  const untilMs = Date.parse(priorUntil);
+  const cappedWindows = (["five_hour", "seven_day"] as const).filter((kind) => {
+   const reset = kind === "five_hour" ? prior.fiveHourResetsAt : prior.sevenDayResetsAt;
+   return reset !== null && Date.parse(reset) === untilMs;
+  });
+  // An unrelated window's later reset cannot release this cap. If both
+  // windows match, require both to roll because either could carry it.
+  if (cappedWindows.length > 0 && cappedWindows.every((kind) => {
+   const reset = reading.windows.find((w) => w.kind === kind)?.resetsAt;
+   return reset !== undefined && reset * 1000 > untilMs;
+  })) priorUntil = null;
+ }
  const fiveHour = reading.windows.find((w) => w.kind === "five_hour");
  const sevenDay = reading.windows.find((w) => w.kind === "seven_day");
  const resets = earliestReset(reading.windows);

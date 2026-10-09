@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "../src/config.ts";
-import { openJournal, type Journal, type SubstrateReading } from "../src/journal.ts";
+import { Journal, openJournal, type SubstrateReading } from "../src/journal.ts";
 import {
  confirmCap,
  describeWorkerModel,
@@ -828,6 +828,139 @@ describe("window-less readings never bypass the reserve", () => {
  });
 });
 
+describe("persistReading cap rollover", () => {
+ const now = new Date("2026-10-09T07:00:00.000Z");
+ const until = Date.parse("2026-10-15T16:34:00.000Z") / 1000;
+ const rolled = Date.parse("2026-10-16T06:37:00.000Z") / 1000;
+ const iso = (seconds: number) => new Date(seconds * 1000).toISOString();
+
+ function withCappedJournal(
+  substrate: "codex" | "claude",
+  kind: "five_hour" | "seven_day",
+  fn: (journal: Journal) => Promise<void> | void,
+ ): Promise<void> {
+  const journal = new Journal(":memory:");
+  journal.upsertSubstrateReading(reading(substrate, {
+   readAt: new Date(now.getTime() - 20 * 60_000).toISOString(),
+   capped: true,
+   cappedUntil: iso(until),
+   fiveHourResetsAt: iso(kind === "five_hour" ? until : until - 3600),
+   sevenDayResetsAt: iso(kind === "seven_day" ? until : rolled),
+  }));
+  return Promise.resolve().then(() => fn(journal)).finally(() => journal.close());
+ }
+
+ for (const substrate of ["codex", "claude"] as const) {
+  for (const kind of ["five_hour", "seven_day"] as const) {
+   test(`${substrate}: a rolled ${kind} cap restores selection`, async () => {
+    await withCappedJournal(substrate, kind, (journal) => {
+     persistReading(journal, {
+      substrate, readAt: now, capped: false, cappedUntil: null,
+      windows: [{ kind, usedPct: 49, resetsAt: rolled }],
+     });
+     const stored = journal.getSubstrateReading(substrate)!;
+     expect(stored.cappedUntil).toBeNull();
+     expect(stored.capped).toBe(false);
+     expect(selectForBuild({ readings: [stored], now, config: DEFAULT_CONFIG })).toBe(substrate);
+    });
+   });
+
+   for (const scenario of [
+    { name: "same reset", resetsAt: until },
+    { name: "earlier reset", resetsAt: until - 60 },
+    { name: "no reset", resetsAt: undefined },
+    { name: "missing capped window", missing: true, resetsAt: rolled },
+   ]) {
+    test(`${substrate}: ${kind} ${scenario.name} keeps the cap despite another window's later reset`, async () => {
+     await withCappedJournal(substrate, kind, (journal) => {
+      const otherKind = kind === "five_hour" ? "seven_day" : "five_hour";
+      persistReading(journal, {
+       substrate, readAt: now, capped: false, cappedUntil: null,
+       windows: [
+        ...(scenario.missing ? [] : [{ kind, usedPct: 10, resetsAt: scenario.resetsAt }]),
+        { kind: otherKind, usedPct: 10, resetsAt: rolled },
+       ],
+      });
+      const stored = journal.getSubstrateReading(substrate)!;
+      expect(stored.cappedUntil).toBe(iso(until));
+      expect(stored.capped).toBe(false);
+      expect(isEligible(stored, DEFAULT_CONFIG, now)).toBeNull();
+     });
+    });
+   }
+
+   for (const cappedUntil of [rolled, null]) {
+    test(`${substrate}: a fresh capped ${kind} reading ${cappedUntil === null ? "retains the prior cap" : "uses its own cap"}`, async () => {
+     await withCappedJournal(substrate, kind, (journal) => {
+      persistReading(journal, {
+       substrate, readAt: now, capped: true, cappedUntil,
+       windows: [{ kind, usedPct: 100, resetsAt: rolled }],
+      });
+      const stored = journal.getSubstrateReading(substrate)!;
+      expect(stored.cappedUntil).toBe(iso(cappedUntil ?? until));
+      expect(stored.capped).toBe(true);
+      expect(isEligible(stored, DEFAULT_CONFIG, now)).toBeNull();
+     });
+    });
+   }
+  }
+ }
+
+ for (const bothRolled of [false, true]) {
+  test(`a cap matching both window resets ${bothRolled ? "clears after both roll" : "survives when only one rolls"}`, async () => {
+   await withCappedJournal("codex", "seven_day", (journal) => {
+    const prior = journal.getSubstrateReading("codex")!;
+    journal.upsertSubstrateReading({ ...prior, fiveHourResetsAt: iso(until) });
+    persistReading(journal, {
+     substrate: "codex", readAt: now, capped: false, cappedUntil: null,
+     windows: [
+      { kind: "five_hour", usedPct: 10, resetsAt: rolled },
+      { kind: "seven_day", usedPct: 49, resetsAt: bothRolled ? rolled : until },
+     ],
+    });
+    expect(journal.getSubstrateReading("codex")!.cappedUntil).toBe(bothRolled ? null : iso(until));
+   });
+  });
+ }
+
+ test("Codex account reading clears the observed seven-day stale cap", async () => {
+  await withCappedJournal("codex", "seven_day", (journal) => {
+   persistReading(journal, parseCodexQuota({ rateLimits: {
+    primary: { usedPercent: 49, windowDurationMins: 10080, resetsAt: rolled },
+    secondary: { usedPercent: 10, windowDurationMins: 300, resetsAt: until - 3600 },
+    rateLimitReachedType: null,
+   } }, now));
+   const stored = journal.getSubstrateReading("codex")!;
+   expect(stored.cappedUntil).toBeNull();
+   expect(selectForBuild({ readings: [stored], now, config: DEFAULT_CONFIG })).toBe("codex");
+  });
+ });
+
+ test("a Claude stream cap survives a lagging probe, then a rolled probe clears it", async () => {
+  await withCappedJournal("claude", "seven_day", async (journal) => {
+   const capEvent: ClaudeRateLimitEvent = { type: "rate_limit_event", rate_limit_info: {
+    status: "rejected", resetsAt: until,
+    unifiedWindows: { seven_day: { utilization: 1, resetsAt: until } },
+   } };
+   workerOutputFor("claude").read({ code: 1, stdout: JSON.stringify(capEvent), stderr: "" }, journal);
+   const lagging = parseClaudeRateLimitEvent({ type: "rate_limit_event", rate_limit_info: {
+    status: "allowed", unifiedWindows: { seven_day: { utilization: 0.49, resetsAt: until } },
+   } }, new Date(now.getTime() - 20 * 60_000));
+   persistReading(journal, lagging);
+   expect(journal.getSubstrateReading("claude")!.cappedUntil).toBe(iso(until));
+   const probe = parseClaudeRateLimitEvent({ type: "rate_limit_event", rate_limit_info: {
+    status: "allowed", unifiedWindows: { seven_day: { utilization: 0.49, resetsAt: rolled } },
+   } }, now);
+   const readings = await freshReadings(journal, DEFAULT_CONFIG, now, {
+    claude: async () => probe,
+    codex: async () => { throw new Error("unavailable"); },
+   });
+   expect(journal.getSubstrateReading("claude")!.cappedUntil).toBeNull();
+   expect(selectForBuild({ readings, now, config: DEFAULT_CONFIG })).toBe("claude");
+  });
+ });
+});
+
 describe("markSubstrateCapped", () => {
  test("marks a substrate as capped until its reported reset", async () => {
   await withJournal((journal) => {
@@ -849,7 +982,7 @@ describe("markSubstrateCapped", () => {
   });
  });
 
- test("a fresh uncapped reading keeps a capped-until still in the future", async () => {
+ test("a fresh uncapped reading keeps a cap whose carrying window is unknown", async () => {
   await withJournal((journal) => {
    const now = new Date();
    const until = Math.floor(now.getTime() / 1000) + 3600;
