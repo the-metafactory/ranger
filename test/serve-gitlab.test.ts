@@ -439,6 +439,24 @@ describe("node #132 — the principal's tap merge on a GitLab MR", () => {
   expect(runs).toHaveLength(0);
  });
 
+ test("chained from the fake port: a mergeable MR merges with glab; a needs-rebase or blocked one offers no tap and runs nothing", async () => {
+  const live = (change: ChangeRequest) => readMrLive(REPO, 5, tokens, fakePort(change, GREEN).port);
+  const green = setup({ live: await live(mr()) });
+  expect((await green.handler(post("/api/merge", { key: KEY, id: "42", sha: SHA }))).status).toBe(200);
+  expect(green.runs[0].argv).toEqual(GLAB_MERGE);
+  for (const [mergeState, detail] of [["needs-rebase", "need_rebase"], ["blocked", "not_approved"]] as const) {
+   const view = await live(mr({ mergeState, mergeDetail: detail }));
+   const [card] = needsYouEntries(inputs({ prs: () => view }));
+   expect(card.actions.merge.offered).toBe(false);
+   expect(card.actions.merge.offered ? "" : card.actions.merge.why).toContain(`(${detail})`);
+   const held = setup({ live: view });
+   const res = await held.handler(post("/api/merge", { key: KEY, id: "42", sha: SHA }));
+   expect(res.status).toBe(409);
+   expect(((await res.json()) as { error: string }).error).toContain(`(${detail})`);
+   expect(held.runs).toHaveLength(0);
+  }
+ });
+
  test("a dry run names the glab argv and the env keys it would pass", async () => {
   const { handler, runs } = setup();
   const body = (await (await handler(post("/api/merge", { key: KEY, id: "42", sha: SHA, dryRun: true }))).json()) as { argv: string[]; envKeys: string[] };
