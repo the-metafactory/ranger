@@ -358,7 +358,9 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    const cause = asked >= MAX_REBASE_REQUESTS_AT_HEAD
     ? "and the forge still asks for a rebase at that head"
     : "and the rebase the forge started has not landed";
-   await park(row, `${at}, ${cause}. Rebase it by hand onto ${map.base}, then merge it.`, cardTitle);
+   // The latest pass's note carries the forge's own text (a stale merge_error, say).
+   const last = passes[0]?.note ? ` Last pass: ${passes[0].note}` : "";
+   await park(row, `${at}, ${cause}. Rebase it by hand onto ${map.base}, then merge it.${last}`, cardTitle);
    return;
   }
   const rebase = await rebasePr(repo, pr.iid, token);

@@ -81,8 +81,8 @@ export class FencedError extends Error {
  override readonly name = "FencedError";
 }
 
-/** The fixed prefix `recordRebase` writes and `listRebases` reads: the SHAs, and ` wait` when no request was sent. */
-const REBASE_PREFIX = /^from=([0-9a-f]{7,64})(?: to=([0-9a-f]{7,64}))?( wait)?:/;
+/** The fixed prefix `recordRebase` writes and `listRebases` reads: the SHAs, and ` wait` when no request was sent; the note follows. */
+const REBASE_PREFIX = /^from=([0-9a-f]{7,64})(?: to=([0-9a-f]{7,64}))?( wait)?: ?([\s\S]*)$/;
 
 export interface EventRow {
  id: number;
@@ -480,7 +480,7 @@ export class Journal {
   * events (a send-back waiting on the lane logs one per pass) never push a
   * rebase out of the window.
   */
- listRebases(repo: string, nodeId: string, limit = 60): { from: string; to: string | null; requested: boolean }[] {
+ listRebases(repo: string, nodeId: string, limit = 60): { from: string; to: string | null; requested: boolean; note: string }[] {
   return this.db
    .select()
    .from(events)
@@ -490,7 +490,7 @@ export class Journal {
    .all()
    .flatMap((e) => {
     const m = REBASE_PREFIX.exec(e.detail ?? "");
-    return m === null ? [] : [{ from: m[1]!, to: m[2] ?? null, requested: m[3] === undefined }];
+    return m === null ? [] : [{ from: m[1]!, to: m[2] ?? null, requested: m[3] === undefined, note: m[4] ?? "" }];
    });
  }
 

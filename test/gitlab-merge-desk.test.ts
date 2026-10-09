@@ -172,7 +172,7 @@ describe("node #126 — gitlab-rebase-squash-merge: the merge desk on a GitLab m
    expect(gl.calls).toContain("rebasePr");
    expect(gl.calls).not.toContain("mergePr");
    expect(r.row()).toMatchObject({ status: "awaiting-merge" });
-   expect(r.journal.listRebases(r.map.repo, "96")[0]).toEqual({ from: GATED, to: REBASED, requested: false });
+   expect(r.journal.listRebases(r.map.repo, "96")[0]).toMatchObject({ from: GATED, to: REBASED, requested: false });
 
    // Ranger saw that landing, so the unreviewed new head is its rebase: a fresh round, not a park.
    mr.mergeState = "mergeable";
@@ -359,7 +359,8 @@ describe("node #126 — gitlab-rebase-squash-merge: the merge desk on a GitLab m
  test("a forge that keeps asking for a rebase at one head is asked a bounded number of times, then escalated", async () => {
   const r = rig();
   try {
-   const mr = needsRebase({ rebase: { status: "pending", reason: "GitLab finished rebasing !9 but the head is still aaaaaaaa", requested: true } });
+   const reason = "GitLab finished rebasing !9 but the head is still aaaaaaaa; GitLab still reports the error it had before: Rebase failed: conflict";
+   const mr = needsRebase({ rebase: { status: "pending", reason, requested: true } });
    const gl = fakeGitLab(mr);
    for (let pass = 0; pass < 3; pass++) expect(await r.desk(gl.port)).toMatchObject({ pending: ["96"], parked: [] });
    gl.calls.length = 0;
@@ -368,6 +369,9 @@ describe("node #126 — gitlab-rebase-squash-merge: the merge desk on a GitLab m
    expect(gl.calls).not.toContain("mergePr");
    expect(r.events("rebased")).toHaveLength(3);
    expect(r.row()?.outcome).toContain(`requested a rebase of MR !9 from ${GATED.slice(0, 8)} 3 time(s) over 3 pass(es), and the forge still asks for a rebase at that head`);
+   // GitLab's own error reaches the card, not only the journal.
+   expect(r.posts.at(-1)).toContain("Last pass: ranger asked for a rebase of MR !9 onto main; the head has not moved yet");
+   expect(r.posts.at(-1)).toContain("Rebase failed: conflict");
    expect(r.posts.at(-1)).toContain("**parked** #96");
   } finally { r.close(); }
  });
@@ -379,7 +383,7 @@ describe("node #126 — gitlab-rebase-squash-merge: the merge desk on a GitLab m
    const gl = fakeGitLab(needsRebase());
    expect(await r.desk(gl.port)).toMatchObject({ pending: ["96"], parked: [] });
    expect(gl.calls).toContain("rebasePr");
-   expect(r.journal.listRebases(r.map.repo, "96")[0]).toEqual({ from: GATED, to: REBASED, requested: true });
+   expect(r.journal.listRebases(r.map.repo, "96")[0]).toMatchObject({ from: GATED, to: REBASED, requested: true });
   } finally { r.close(); }
  });
 

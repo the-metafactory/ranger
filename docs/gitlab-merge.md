@@ -102,7 +102,7 @@ On a GitLab map, the desk acts in this order:
    On `never` it parks with a card, before any rebase or merge write.
 5. Under `needs-rebase`, ranger runs `rebasePr` and records a `rebased`
    event through `journal.recordRebase`, which `journal.listRebases` reads
-   back as `{ from, to, requested }`. Its prose says the head moved only on
+   back as `{ from, to, requested, note }`. Its prose says the head moved only on
    `head-moved`; on `pending` it says the rebase was asked for. The row
    stays pending, and nothing merges in that pass. The event's prefix
    records `from`, `to` (only when ranger saw the head move) and `wait`
@@ -110,7 +110,9 @@ On a GitLab map, the desk acts in this order:
    requests and spends at most 10 passes (requests plus waits), then
    parks the row with a card that gives both counts. The card names the
    cause: the forge still asking for a rebase (the request bound), or a
-   started rebase that never landed (the pass bound). A moved head starts
+   started rebase that never landed (the pass bound). It also quotes the
+   latest pass's note, so GitLab's own text (a repeated `merge_error`,
+   say) reaches the principal. A moved head starts
    a new count.
 6. Otherwise ranger runs `mergePr`:
    - `head-moved` stays pending and is re-gated next pass.
