@@ -74,7 +74,7 @@ function fakeGitLab(mr: Mr) {
 function needsRebase(over: Partial<Mr> = {}): Mr {
  return {
   state: "open", head: GATED, mergeState: "needs-rebase", ci: GREEN, comments: [review(GATED, 2)], labels: [],
-  squash: null, rebase: { status: "head-moved", headSha: REBASED }, merge: { status: "merged" }, ...over,
+  squash: null, rebase: { status: "head-moved", headSha: REBASED, requested: true }, merge: { status: "merged" }, ...over,
  };
 }
 
@@ -145,7 +145,7 @@ describe("node #126 — gitlab-rebase-squash-merge: the merge desk on a GitLab m
  test("a rebase still running after the bounded wait is pending, and never merges in the same pass", async () => {
   const r = rig();
   try {
-   const mr = needsRebase({ rebase: { status: "pending", reason: "GitLab is still rebasing !9 after 2 checks" } });
+   const mr = needsRebase({ rebase: { status: "pending", reason: "GitLab is still rebasing !9 after 2 checks", requested: true } });
    const gl = fakeGitLab(mr);
    expect(await r.desk(gl.port)).toMatchObject({ pending: ["96"], merged: [], parked: [] });
    expect(gl.calls).not.toContain("mergePr");
@@ -155,12 +155,78 @@ describe("node #126 — gitlab-rebase-squash-merge: the merge desk on a GitLab m
    expect(pending).not.toContain("the head moved");
 
    // Next pass: GitLab still reports need_rebase at the same head; the port waits on the running rebase.
-   mr.rebase = { status: "head-moved", headSha: REBASED };
+   mr.rebase = { status: "head-moved", headSha: REBASED, requested: false };
    gl.calls.length = 0;
    expect(await r.desk(gl.port)).toMatchObject({ pending: ["96"], merged: [], parked: [], resumed: [] });
    expect(gl.calls).toContain("rebasePr");
    expect(gl.calls).not.toContain("mergePr");
    expect(r.row()).toMatchObject({ status: "awaiting-merge" });
+   expect(r.journal.listRebases(r.map.repo, "96")[0]).toEqual({ from: GATED, to: REBASED, requested: false });
+
+   // Ranger saw that landing, so the unreviewed new head is its rebase: a fresh round, not a park.
+   mr.mergeState = "mergeable";
+   mr.ci = GREEN;
+   expect(await r.desk(gl.port)).toMatchObject({ resumed: ["96"], parked: [] });
+  } finally { r.close(); }
+ });
+
+ test("a head that moved while ranger knew its rebase only as pending is not attributed to ranger: it parks", async () => {
+  const r = rig();
+  try {
+   const mr = needsRebase({ rebase: { status: "pending", reason: "GitLab is still rebasing !9 after 2 checks", requested: true } });
+   const gl = fakeGitLab(mr);
+   expect(await r.desk(gl.port)).toMatchObject({ pending: ["96"], parked: [] });
+   // Between passes the head moves, unobserved: ranger's rebase landing, or anyone's push.
+   mr.head = REBASED;
+   mr.mergeState = "mergeable";
+   expect(await r.desk(gl.port)).toMatchObject({ parked: ["96"], resumed: [] });
+   expect(r.row()?.outcome).toContain("review-clean");
+   expect(r.spawned).toEqual([]);
+  } finally { r.close(); }
+ });
+
+ test("a push past ranger's observed rebase head is not ranger's: it parks", async () => {
+  const r = rig();
+  try {
+   const mr = needsRebase();
+   const gl = fakeGitLab(mr);
+   expect(await r.desk(gl.port)).toMatchObject({ pending: ["96"] });
+   mr.head = "c".repeat(40);
+   mr.mergeState = "mergeable";
+   mr.ci = GREEN;
+   expect(await r.desk(gl.port)).toMatchObject({ parked: ["96"], resumed: [] });
+   expect(r.row()?.outcome).toContain("review-clean");
+  } finally { r.close(); }
+ });
+
+ test("a fault on the rebase request is an error retried next pass, never a park", async () => {
+  const r = rig();
+  try {
+   const gl = fakeGitLab(needsRebase());
+   gl.port.rebasePr = async () => { throw new Error("projects/1/merge_requests/9/rebase: rebase request failed (HTTP 502)"); };
+   const result = await r.desk(gl.port);
+   expect(result).toMatchObject({ parked: [], merged: [] });
+   expect(result.errors).toHaveLength(1);
+   expect(r.row()).toMatchObject({ status: "awaiting-merge" });
+   expect(r.events("rebased")).toEqual([]);
+  } finally { r.close(); }
+ });
+
+ test("waits on a running rebase do not count as requests; a rebase that never lands parks at the pass bound", async () => {
+  const r = rig();
+  try {
+   const reason = "GitLab is still rebasing !9 after 2 checks";
+   const mr = needsRebase({ rebase: { status: "pending", reason, requested: true } });
+   const gl = fakeGitLab(mr);
+   expect(await r.desk(gl.port)).toMatchObject({ pending: ["96"], parked: [] });
+   mr.rebase = { status: "pending", reason, requested: false };
+   for (let pass = 1; pass < 10; pass++) expect(await r.desk(gl.port)).toMatchObject({ pending: ["96"], parked: [] });
+   expect(r.events("rebased")).toHaveLength(10);
+   expect(r.events("rebased").filter((e) => e.detail?.includes("ranger waited on a running rebase of !9"))).toHaveLength(9);
+   gl.calls.length = 0;
+   expect(await r.desk(gl.port)).toMatchObject({ parked: ["96"], pending: [] });
+   expect(gl.calls).not.toContain("rebasePr");
+   expect(r.row()?.outcome).toContain(`requested a rebase of !9 from ${GATED.slice(0, 8)} 1 time(s) over 10 pass(es)`);
   } finally { r.close(); }
  });
 
@@ -177,7 +243,7 @@ describe("node #126 — gitlab-rebase-squash-merge: the merge desk on a GitLab m
    expect(result).toMatchObject({ resumed: ["96"], parked: [], merged: [] });
    expect(gl.calls).toEqual(["getPr", "listComments"]);
    expect(r.row()).toMatchObject({ status: "running", phase: "review" });
-   expect(r.events("sweep").map((e) => e.detail)).toContainEqual(expect.stringContaining(`ranger rebased PR #9 from ${GATED.slice(0, 8)}`));
+   expect(r.events("sweep").map((e) => e.detail)).toContainEqual(expect.stringContaining(`ranger rebased !9 from ${GATED.slice(0, 8)}`));
   } finally { r.close(); }
  });
 
@@ -272,7 +338,7 @@ describe("node #126 — gitlab-rebase-squash-merge: the merge desk on a GitLab m
  test("a forge that keeps asking for a rebase at one head is asked a bounded number of times, then escalated", async () => {
   const r = rig();
   try {
-   const mr = needsRebase({ rebase: { status: "pending", reason: "GitLab finished rebasing !9 but the head is still aaaaaaaa" } });
+   const mr = needsRebase({ rebase: { status: "pending", reason: "GitLab finished rebasing !9 but the head is still aaaaaaaa", requested: true } });
    const gl = fakeGitLab(mr);
    for (let pass = 0; pass < 3; pass++) expect(await r.desk(gl.port)).toMatchObject({ pending: ["96"], parked: [] });
    gl.calls.length = 0;
@@ -280,7 +346,7 @@ describe("node #126 — gitlab-rebase-squash-merge: the merge desk on a GitLab m
    expect(gl.calls).not.toContain("rebasePr");
    expect(gl.calls).not.toContain("mergePr");
    expect(r.events("rebased")).toHaveLength(3);
-   expect(r.row()?.outcome).toContain(`3 times to rebase PR #9 from ${GATED.slice(0, 8)}`);
+   expect(r.row()?.outcome).toContain(`requested a rebase of !9 from ${GATED.slice(0, 8)} 3 time(s) over 3 pass(es)`);
    expect(r.posts.at(-1)).toContain("**parked** #96");
   } finally { r.close(); }
  });
@@ -288,11 +354,11 @@ describe("node #126 — gitlab-rebase-squash-merge: the merge desk on a GitLab m
  test("the rebase bound counts per head: requests from an earlier head do not count against a new one", async () => {
   const r = rig();
   try {
-   for (let i = 0; i < 3; i++) r.journal.recordRebase({ nodeId: "96", repo: r.map.repo, from: REBASED, to: null, note: "earlier head" });
+   for (let i = 0; i < 3; i++) r.journal.recordRebase({ nodeId: "96", repo: r.map.repo, from: REBASED, to: null, requested: true, note: "earlier head" });
    const gl = fakeGitLab(needsRebase());
    expect(await r.desk(gl.port)).toMatchObject({ pending: ["96"], parked: [] });
    expect(gl.calls).toContain("rebasePr");
-   expect(r.journal.listRebases(r.map.repo, "96")[0]).toEqual({ from: GATED, to: REBASED });
+   expect(r.journal.listRebases(r.map.repo, "96")[0]).toEqual({ from: GATED, to: REBASED, requested: true });
   } finally { r.close(); }
  });
 

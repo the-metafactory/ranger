@@ -109,23 +109,30 @@ export function deskPort(config: RangerConfig, map: RangerMapConfig): ForgePort 
 }
 
 /**
- * How many times ranger asks the forge to rebase from one head before it
- * escalates: a forge that keeps answering `needs-rebase` at a head no rebase
- * moves would otherwise be asked again every pass, forever.
+ * How many rebase requests ranger sends from one head, and how many passes it
+ * spends on a rebase from that head (requests plus waits on a running one),
+ * before it escalates: a forge that keeps answering `needs-rebase` at a head
+ * no rebase moves, or a rebase that never finishes, would otherwise hold the
+ * row forever.
  */
-const MAX_REBASES_AT_HEAD = 3;
+const MAX_REBASE_REQUESTS_AT_HEAD = 3;
+const MAX_REBASE_PASSES_AT_HEAD = 10;
 
 /** The `rebased` event's prose; the SHAs are the journal's (`recordRebase`). */
 function rebasedNote(rebase: Exclude<RebaseOutcome, { status: "not-mergeable" }>, iid: number, base: string): string {
- return rebase.status === "head-moved"
-  ? `PR #${iid} rebased by ranger onto ${base}; the head moved, so it is re-gated there`
-  : `ranger asked for a rebase of PR #${iid} onto ${base}; the head has not moved yet (${rebase.reason})`;
+ if (rebase.status === "head-moved") return `!${iid} rebased by ranger onto ${base}; the head moved, so it is re-gated there`;
+ return rebase.requested
+  ? `ranger asked for a rebase of !${iid} onto ${base}; the head has not moved yet (${rebase.reason})`
+  : `ranger waited on a running rebase of !${iid} onto ${base}; the head has not moved yet (${rebase.reason})`;
 }
 
 /**
  * The reviewed head ranger itself rebased away from, when that explains a
- * head with no review: ranger's latest rebase request started at the latest
- * review's head, and the head has moved since. Null otherwise.
+ * head with no review: ranger's latest rebase started at the latest review's
+ * head, and ranger saw it land at the current head. Null otherwise: a head
+ * past ranger's rebase, or one that moved while ranger knew its rebase only
+ * as pending, may be anyone's push, so it gets no attribution and fails
+ * `review-clean` (it parks).
  */
 function ownRebaseOfLatestReview(
  journal: Journal,
@@ -134,8 +141,9 @@ function ownRebaseOfLatestReview(
  latestReviewSha: string | null,
  headSha: string,
 ): string | null {
- const from = journal.listRebases(repo, nodeId)[0]?.from ?? null;
- return from !== null && from === latestReviewSha && from !== headSha ? from : null;
+ const latest = journal.listRebases(repo, nodeId, 1)[0];
+ if (latest === undefined || latest.to !== headSha) return null;
+ return latest.from === latestReviewSha && latest.from !== headSha ? latest.from : null;
 }
 
 /**
@@ -154,7 +162,7 @@ function sendBackReason(
   return `sage round ${last.round} at ${head} has ${last.blockers} blocker(s) and ${last.majors} major(s) to rework`;
  }
  if (last !== undefined && pr.mergeState === "conflict") return `PR #${pr.iid} conflicts with ${base} at ${head}`;
- if (rebasedFrom !== null) return `ranger rebased PR #${pr.iid} from ${rebasedFrom.slice(0, 8)}; the new head ${head} has no review yet`;
+ if (rebasedFrom !== null) return `ranger rebased !${pr.iid} from ${rebasedFrom.slice(0, 8)}; the new head ${head} has no review yet`;
  if (missingProbes) return `no passing probe run at ${head}`;
  return null;
 }
@@ -290,11 +298,12 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    return null;
   }
   if (rebasePr !== undefined) {
-   const asked = journal.listRebases(repo, row.nodeId).filter((r) => r.from === headSha).length;
-   if (asked >= MAX_REBASES_AT_HEAD) {
+   const passes = journal.listRebases(repo, row.nodeId).filter((r) => r.from === headSha);
+   const asked = passes.filter((r) => r.requested).length;
+   if (asked >= MAX_REBASE_REQUESTS_AT_HEAD || passes.length >= MAX_REBASE_PASSES_AT_HEAD) {
     await park(
      row,
-     `ranger asked the forge ${asked} times to rebase PR #${pr.iid} from ${headSha.slice(0, 8)}, and it still asks for a rebase at that head. Rebase it by hand onto ${map.base}, then merge it.`,
+     `ranger requested a rebase of !${pr.iid} from ${headSha.slice(0, 8)} ${asked} time(s) over ${passes.length} pass(es), and the forge still asks for a rebase at that head. Rebase it by hand onto ${map.base}, then merge it.`,
      cardTitle,
     );
     return null;
@@ -305,7 +314,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
     return null;
    }
    journal.recordRebase({
-    nodeId: row.nodeId, repo, from: headSha, to: rebase.status === "head-moved" ? rebase.headSha : null,
+    nodeId: row.nodeId, repo, from: headSha, to: rebase.status === "head-moved" ? rebase.headSha : null, requested: rebase.requested,
     note: rebasedNote(rebase, pr.iid, map.base),
    });
    result.pending.push(row.nodeId);
@@ -484,11 +493,12 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    if (merge === null) return;
    // A merge the forge did not squash is still a merge: record it and close,
    // and let the notice escalate it, never claiming a squash that did not happen.
-   const how = merge.unsquashed === undefined ? "squash-merged" : "merged (NOT squashed)";
+   const unsquashed = merge.unsquashed;
+   const how = unsquashed === undefined ? "squash-merged" : "merged (NOT squashed)";
    journal.recordEvent("merged", {
     nodeId: row.nodeId,
     repo,
-    detail: `PR #${pr.iid} ${how} by ranger at ${gate.headSha.slice(0, 8)} (no ${NEEDS_EYE_LABEL} label; standing grant 2026-10-03)${merge.unsquashed === undefined ? "" : `: ${merge.unsquashed}`}`.slice(0, 400),
+    detail: `PR #${pr.iid} ${how} by ranger at ${gate.headSha.slice(0, 8)} (no ${NEEDS_EYE_LABEL} label; standing grant 2026-10-03)${unsquashed === undefined ? "" : `: ${unsquashed}`}`.slice(0, 400),
    });
    result.merged.push(row.nodeId);
    try {
@@ -496,7 +506,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
      [
       `:ranger: **merged** #${row.nodeId} — ${title}`,
       `Gate passed at \`${gate.headSha.slice(0, 8)}\` (CI, mergeable, sage 0 blockers / 0 majors${probesRequired ? ", probes" : ""}); ${how} by ranger. The node closes through the gate next.`,
-      ...(merge.unsquashed === undefined ? [] : [`:warning: Needs your eye: ${merge.unsquashed}. The commits landed unsquashed on \`${map.base}\`.`]),
+      ...(unsquashed === undefined ? [] : [`:warning: Needs your eye: ${unsquashed}. The commits landed unsquashed on \`${map.base}\`.`]),
      ].join("\n"),
      `merge notice for #${row.nodeId}`,
     );

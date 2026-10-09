@@ -261,6 +261,16 @@ export interface RebaseWait {
 }
 const REBASE_WAIT: RebaseWait = { polls: 2, intervalMs: 1_500, sleep: (ms) => new Promise((r) => setTimeout(r, ms)) };
 
+/** An HTTP success status. */
+const ok = (status: number): boolean => status >= 200 && status < 300;
+
+/**
+ * Rebase-request statuses that are GitLab declining (no push access, the
+ * request refused or unprocessable): the row parks. Any other non-success
+ * status is a fault and throws.
+ */
+const REBASE_REFUSED = [403, 405, 422];
+
 /** GitLab's own `message` from an error response, bounded; never subprocess output. */
 function forgeMessage(body: unknown, status: number): string {
  const message = body !== null && typeof body === "object" ? (body as Record<string, unknown>).message : undefined;
@@ -299,7 +309,7 @@ export class GitLabPort extends GitLabReadPort implements ForgePort<ResolvedToke
  private async write(repo: string, token: string, endpoint: string, method: "POST" | "PUT", fields: string[]): Promise<unknown> {
   const { code, status, body } = await this.send(repo, token, endpoint, method, fields);
   if (code !== 0) throw new GitLabWriteError(`write failed (exit ${code})`, endpoint);
-  if (status < 200 || status >= 300) {
+  if (!ok(status)) {
    throw new GitLabWriteError(`write failed (exit ${code})`, endpoint, status);
   }
   return body;
@@ -329,7 +339,7 @@ export class GitLabPort extends GitLabReadPort implements ForgePort<ResolvedToke
   ]);
   if (status === 409) return { status: "head-moved", reason: `!${n} is no longer at ${sha.slice(0, 8)} (${forgeMessage(body, status)})` };
   if ([405, 406, 422].includes(status)) return { status: "not-mergeable", reason: `GitLab declined to merge !${n}: ${forgeMessage(body, status)}` };
-  if (status < 200 || status >= 300) throw new GitLabWriteError(`merge failed (${forgeMessage(body, status)})`, endpoint, status);
+  if (!ok(status)) throw new GitLabWriteError(`merge failed (${forgeMessage(body, status)})`, endpoint, status);
   return this.decodeWrite(endpoint, () => {
    const r = object(body, endpoint);
    if (r.state !== "merged") invalid(endpoint, "state");
@@ -348,11 +358,14 @@ export class GitLabPort extends GitLabReadPort implements ForgePort<ResolvedToke
   const endpoint = `${this.mrEndpoint(repo, n)}/rebase`;
   // A rebase an earlier pass started is waited on, never requested again.
   const before = await this.rebaseState(repo, n, token.read);
-  if (!before.inProgress) {
+  const requested = !before.inProgress;
+  if (requested) {
    const { status, body } = await this.answer(repo, token.write, endpoint, []);
    // 409: GitLab could not enqueue the rebase yet ("try again later").
-   if (status === 409) return { status: "pending", reason: `GitLab did not start the rebase of !${n} yet: ${forgeMessage(body, status)}` };
-   if (status < 200 || status >= 300) return { status: "not-mergeable", reason: `GitLab declined to rebase !${n}: ${forgeMessage(body, status)}` };
+   if (status === 409) return { status: "pending", reason: `GitLab did not start the rebase of !${n} yet: ${forgeMessage(body, status)}`, requested };
+   if (REBASE_REFUSED.includes(status)) return { status: "not-mergeable", reason: `GitLab declined to rebase !${n}: ${forgeMessage(body, status)}` };
+   // Anything else (a 5xx, a 429, a revoked token) is a fault: the desk records it and retries next pass.
+   if (!ok(status)) throw new GitLabWriteError(`rebase request failed (${forgeMessage(body, status)})`, endpoint, status);
   }
   for (let poll = 0; poll < this.wait.polls; poll++) {
    await this.wait.sleep(this.wait.intervalMs);
@@ -361,11 +374,11 @@ export class GitLabPort extends GitLabReadPort implements ForgePort<ResolvedToke
    // A moved head is the rebase landing; a merge_error left from an earlier attempt does not undo it.
    if (state.headSha === before.headSha) {
     if (state.mergeError !== null) return { status: "not-mergeable", reason: `GitLab could not rebase !${n}: ${state.mergeError}` };
-    return { status: "pending", reason: `GitLab finished rebasing !${n} but the head is still ${before.headSha.slice(0, 8)}` };
+    return { status: "pending", reason: `GitLab finished rebasing !${n} but the head is still ${before.headSha.slice(0, 8)}`, requested };
    }
-   return { status: "head-moved", headSha: state.headSha };
+   return { status: "head-moved", headSha: state.headSha, requested };
   }
-  return { status: "pending", reason: `GitLab is still rebasing !${n} after ${this.wait.polls} checks` };
+  return { status: "pending", reason: `GitLab is still rebasing !${n} after ${this.wait.polls} checks`, requested };
  }
 
  private decodeWrite<T>(endpoint: string, decode: () => T): T {

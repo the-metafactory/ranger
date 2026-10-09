@@ -35,7 +35,13 @@ export interface IssueComment {
  body: string;
 }
 
-/** Read credentials may carry a forge's checked, project-bound grant. */
+/**
+ * Read credentials may carry a forge's checked, project-bound grant. An
+ * adapter in the lanes' string-credential shape may ignore the credential a
+ * caller passes to a read and use its own gated read-only one instead
+ * (GitLab's does: `gitlabForgePort`); a caller never relies on its token
+ * reaching a read.
+ */
 export interface ForgeReadPort<Credential = string> {
  findPrByHead(repo: string, branch: string, token: Credential): Promise<ChangeRequest | null>;
  getPr(repo: string, n: number, token: Credential): Promise<ChangeRequest>;
@@ -62,12 +68,15 @@ export type MergeOutcome =
  /** The forge declined the merge; `reason` carries its own message. */
  | { status: "not-mergeable"; reason: string };
 
-/** What a rebase request did. It never merges. */
+/**
+ * What a rebase request did. It never merges. `requested` says whether this
+ * call sent a rebase request, or only waited on one an earlier pass started.
+ */
 export type RebaseOutcome =
  /** The forge rebased the source branch: the head moved to `headSha`. */
- | { status: "head-moved"; headSha: string }
+ | { status: "head-moved"; headSha: string; requested: boolean }
  /** The head has not moved yet (still rebasing, or not started): re-read next pass. */
- | { status: "pending"; reason: string }
+ | { status: "pending"; reason: string; requested: boolean }
  /** The forge could not rebase (a conflict, a refusal); `reason` is its message. */
  | { status: "not-mergeable"; reason: string };
 

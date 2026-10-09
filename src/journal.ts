@@ -81,8 +81,8 @@ export class FencedError extends Error {
  override readonly name = "FencedError";
 }
 
-/** The SHA prefix `recordRebase` writes and `listRebases` reads. */
-const REBASE_SHAS = /^from=([0-9a-f]{7,64})(?: to=([0-9a-f]{7,64}))?:/;
+/** The fixed prefix `recordRebase` writes and `listRebases` reads: the SHAs, and ` wait` when no request was sent. */
+const REBASE_PREFIX = /^from=([0-9a-f]{7,64})(?: to=([0-9a-f]{7,64}))?( wait)?:/;
 
 export interface EventRow {
  id: number;
@@ -464,22 +464,23 @@ export class Journal {
  }
 
  /**
-  * Ranger asked the forge to rebase a node's change request from the gated
-  * head `from` (node #126); `to` is the new head once it moved, else null.
-  * The SHAs lead the detail in a fixed prefix that `listRebases` reads back,
-  * so `note` stays free prose.
+  * A rebase pass on a node's change request from the gated head `from`
+  * (node #126): `to` is the new head once ranger saw it move, else null;
+  * `requested` is false when the pass only waited on a running rebase. These
+  * lead the detail in a fixed prefix that `listRebases` reads back, so
+  * `note` stays free prose.
   */
- recordRebase(opts: { nodeId: string; repo: string; from: string; to: string | null; note: string }): void {
-  const shas = opts.to === null ? `from=${opts.from}` : `from=${opts.from} to=${opts.to}`;
-  this.recordEvent("rebased", { nodeId: opts.nodeId, repo: opts.repo, detail: `${shas}: ${opts.note}` });
+ recordRebase(opts: { nodeId: string; repo: string; from: string; to: string | null; requested: boolean; note: string }): void {
+  const prefix = `from=${opts.from}${opts.to === null ? "" : ` to=${opts.to}`}${opts.requested ? "" : " wait"}`;
+  this.recordEvent("rebased", { nodeId: opts.nodeId, repo: opts.repo, detail: `${prefix}: ${opts.note}` });
  }
 
  /**
-  * A node's recorded rebase requests, newest first. Queried by kind, so other
+  * A node's recorded rebase passes, newest first. Queried by kind, so other
   * events (a send-back waiting on the lane logs one per pass) never push a
   * rebase out of the window.
   */
- listRebases(repo: string, nodeId: string, limit = 60): { from: string; to: string | null }[] {
+ listRebases(repo: string, nodeId: string, limit = 60): { from: string; to: string | null; requested: boolean }[] {
   return this.db
    .select()
    .from(events)
@@ -488,8 +489,8 @@ export class Journal {
    .limit(limit)
    .all()
    .flatMap((e) => {
-    const m = REBASE_SHAS.exec(e.detail ?? "");
-    return m === null ? [] : [{ from: m[1]!, to: m[2] ?? null }];
+    const m = REBASE_PREFIX.exec(e.detail ?? "");
+    return m === null ? [] : [{ from: m[1]!, to: m[2] ?? null, requested: m[3] === undefined }];
    });
  }
 

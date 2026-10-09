@@ -36,13 +36,18 @@ gated head. It refuses when the project disallows squash.
   results:
   - A head that moved is `head-moved` with the new SHA, even beside a
     stale `merge_error`.
-  - A `merge_error` on an unchanged head, or a refused request, is
-    `not-mergeable`.
+  - A `merge_error` on an unchanged head, or a request GitLab refuses
+    (403, 405, 422), is `not-mergeable`.
+  - Any other failed request (a 5xx, a 429, a 401) throws
+    `GitLabWriteError`. The desk records an error and retries next pass;
+    it does not park.
   - A 409 on the request (GitLab could not enqueue it yet), still
     rebasing at the bound, or a finished rebase that left the head where
     it was, is `pending`.
 
-  It never merges.
+  Every outcome but `not-mergeable` carries `requested`: whether this
+  call sent the rebase request, or only waited on a running one. It never
+  merges.
 
 `gitlabForgePort(config)` wraps the port in the lanes' string-credential
 `ForgePort` shape:
@@ -61,12 +66,17 @@ gated head. It refuses when the project disallows squash.
 On a GitLab map, the desk acts in this order:
 
 1. The send-back checks run first. One check is GitLab-specific: no review
-   at the head, and the latest `rebased` journal event comes from the head
-   of the latest review. That case is ranger's own rebase, so the row goes
-   back to run-node for a fresh round. It is not parked.
+   at the head, and the latest `rebased` journal event goes from the head
+   of the latest review to the current head, a landing ranger saw itself.
+   That case is ranger's own rebase, so the row goes back to run-node for
+   a fresh round. It is not parked.
    - A review never carries across a rebase.
    - A head moved by anyone else still fails `review-clean` and parks, as
-     on GitHub.
+     on GitHub. That includes a push past ranger's rebase head.
+   - A head that moved while ranger knew its rebase only as `pending`
+     (the rebase outlasted the 3 s wait and landed between passes) parks
+     too. Nothing ranger reads tells its rebase from another push there,
+     so the principal checks it.
 2. The gate is evaluated. For `needs-rebase` it treats the merge state as
    mergeable, so ranger rebases only a change it would merge.
 3. The `ranger:needs-eye` labels are read through the port. A labelled
@@ -77,11 +87,14 @@ On a GitLab map, the desk acts in this order:
    On `never` it parks with a card, before any rebase or merge write.
 5. Under `needs-rebase`, ranger runs `rebasePr` and records a `rebased`
    event through `journal.recordRebase`, which `journal.listRebases` reads
-   back as `{ from, to }`. Its prose says the head moved only on
+   back as `{ from, to, requested }`. Its prose says the head moved only on
    `head-moved`; on `pending` it says the rebase was asked for. The row
-   stays pending, and nothing merges in that pass. After 3 requests from
-   one head, a forge still asking for a rebase there parks the row with a
-   card instead of being asked again. A moved head starts a new count.
+   stays pending, and nothing merges in that pass. The event's prefix
+   records `from`, `to` (only when ranger saw the head move) and `wait`
+   (when no request was sent). From one head, ranger sends at most 3
+   requests and spends at most 10 passes (requests plus waits), then
+   parks the row with a card that gives both counts. A moved head starts
+   a new count.
 6. Otherwise ranger runs `mergePr`:
    - `head-moved` stays pending and is re-gated next pass.
    - `not-mergeable` parks with the reason.
@@ -107,5 +120,14 @@ lane-routing node lands, so the desk tests call `runMergeDesk` directly.
   each refusal path, the needs-eye hold-back, and port selection.
 
 Neither test makes a live call. The assumption that crisis-simulator's
-squash option permits `squash=true` is checked at run time by
-`squashRefusal` and by the `squash` field of the merge response.
+squash option permits `squash=true` has one pre-merge check:
+`squashRefusal`. The `squash` field of the merge response only detects,
+after the merge has landed, a squash GitLab did not honour; the desk
+then records the merge and escalates it.
+
+## What lands on the target
+
+The MR's commits land as one squash commit. Under `rebase_merge`
+(semi-linear history) GitLab also writes a merge commit beside it, so
+the target gains two commits, and only the squash commit carries the
+change. Neither the tests nor this node check the target's history.
