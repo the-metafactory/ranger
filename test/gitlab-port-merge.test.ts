@@ -1,0 +1,297 @@
+import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { parse } from "yaml";
+import fixture from "./fixtures/gitlab-reads.json";
+import { GitLabReadError, GitLabWriteError, gitlabForgePort } from "../src/gitlab.ts";
+import type { RangerConfig } from "../src/config.ts";
+import type { runCmd, RunResult } from "../src/exec.ts";
+
+const host = "gitlab.example.test";
+const repo = `gitlab:${host}/team/sub/project`;
+const project = "projects/team%2Fsub%2Fproject";
+const mrPath = `${project}/merge_requests/7`;
+const statePath = `${mrPath}?include_rebase_in_progress=true`;
+const readToken = "read-secret";
+const writeToken = "write-secret";
+const bot = "project_1_bot_a1b2";
+const gated = "c".repeat(40);
+const rebased = "d".repeat(40);
+const config = {
+ auth: { readOnlyTokens: { [`gitlab:${host}/`]: "READ_GL" }, writeTokens: { [repo]: "WRITE_GL" } },
+ principal: { login: { [`gitlab:${host}`]: "boss" } }, bot: {},
+} as unknown as RangerConfig;
+const env = { PATH: process.env.PATH, HOME: process.env.HOME, READ_GL: readToken, WRITE_GL: writeToken };
+// glab exits 1 on an HTTP error status and still prints the response; stderr carries the token on purpose.
+const response = (body: unknown, status = 200, code = status < 400 ? 0 : 1): RunResult => ({
+ code, stderr: writeToken, stdout: `HTTP/2.0 ${status} Response\r\nContent-Type: application/json\r\nX-Next-Page: \r\n\r\n${JSON.stringify(body)}`,
+});
+const raw = (body: unknown): RunResult => ({ code: 0, stderr: "", stdout: JSON.stringify(body) });
+
+function setup(options: {
+ read?: (endpoint: string) => RunResult;
+ write?: (args: string[]) => RunResult;
+ polls?: number;
+} = {}) {
+ const reads: string[] = [];
+ const writes: string[][] = [];
+ const sleeps: number[] = [];
+ const runner: typeof runCmd = async (bin, args, opts) => {
+  expect(bin).toBe("glab");
+  const credential = parse(readFileSync(join(opts?.env?.GLAB_CONFIG_DIR!, "config.yml"), "utf8")).hosts[host].token;
+  const method = args[args.indexOf("--method") + 1];
+  if (method === "GET" && !args.includes("--include")) {
+   // The write gate's identity check, under the write credential.
+   expect(credential).toBe(writeToken);
+   return raw(args[1] === "/user" ? { username: bot, bot: true } : { id: 1 });
+  }
+  if (method === "GET") {
+   expect(credential).toBe(readToken);
+   expect(opts?.env?.SOMA_GRAPH_READONLY).toBe("1");
+   if (args[1] === "/personal_access_tokens/self") return response({ scopes: ["read_api"] });
+   if (args[1] === `/${project}`) return response({ id: 1 });
+   reads.push(args[1]);
+   return options.read ? options.read(args[1]) : response({});
+  }
+  expect(credential).toBe(writeToken);
+  writes.push(args.slice(1));
+  return options.write ? options.write(args) : response({ state: "merged", squash: true });
+ };
+ const port = gitlabForgePort(config, {
+  runner, env, wait: { polls: options.polls ?? 3, intervalMs: 5, sleep: async (ms) => { sleeps.push(ms); } },
+ });
+ return { port, reads, writes, sleeps };
+}
+
+describe("node #126 — GitLab squash merge at the gated head", () => {
+ test("merges with squash=true, sha=<gated head> and the '<title> (!<iid>)' squash message", async () => {
+  const { port, writes } = setup();
+  expect(await port.mergePr(repo, 7, gated, "Merge desk on GitLab", writeToken)).toEqual({ status: "merged" });
+  expect(writes).toEqual([[
+   `${mrPath}/merge`, "--method", "PUT", "--include",
+   "-F", "squash=true", "-f", `sha=${gated}`, "-f", "squash_commit_message=Merge desk on GitLab (!7)",
+   "--hostname", host,
+  ]]);
+ });
+
+ test("409 (SHA does not match HEAD) is head moved, and nothing merged", async () => {
+  const { port, writes } = setup({ write: () => response({ message: "SHA does not match HEAD of source branch" }, 409) });
+  const outcome = await port.mergePr(repo, 7, gated, "T", writeToken);
+  expect(outcome).toMatchObject({ status: "head-moved" });
+  expect(writes).toHaveLength(1);
+ });
+
+ for (const status of [405, 406, 422]) {
+  test(`${status} is not mergeable, with GitLab's message and no credential`, async () => {
+   const { port } = setup({ write: () => response({ message: `Branch cannot be merged ${status}` }, status) });
+   const outcome = await port.mergePr(repo, 7, gated, "T", writeToken);
+   expect(outcome).toMatchObject({ status: "not-mergeable" });
+   if (outcome === undefined || outcome.status === "merged") throw new Error("expected a refusal");
+   expect(outcome.reason).toContain(`HTTP ${status}: Branch cannot be merged ${status}`);
+   expect(outcome.reason).not.toContain(writeToken);
+  });
+ }
+
+ test("the squash commit GitLab names is carried; a missing or malformed one never fails the merge", async () => {
+  const squash = "e".repeat(40);
+  expect(await setup({ write: () => response({ state: "merged", squash: true, squash_commit_sha: squash }) }).port.mergePr(repo, 7, gated, "T", writeToken))
+   .toEqual({ status: "merged", squashSha: squash });
+  for (const missing of [null, undefined, "", "not a sha"]) {
+   expect(await setup({ write: () => response({ state: "merged", squash: true, squash_commit_sha: missing }) }).port.mergePr(repo, 7, gated, "T", writeToken))
+    .toEqual({ status: "merged" });
+  }
+ });
+
+ test("a merge GitLab did not squash is still a merge, carrying the note that escalates it", async () => {
+  const { port } = setup({ write: () => response({ state: "merged", squash: false }) });
+  expect(await port.mergePr(repo, 7, gated, "T", writeToken)).toEqual({
+   status: "merged", unsquashed: "GitLab merged !7 without squashing (squash=false): check the project's squash option",
+  });
+ });
+
+ test("a transport failure without a status line throws, never echoing the subprocess", async () => {
+  const { port } = setup({ write: () => ({ code: 1, stderr: writeToken, stdout: writeToken }) });
+  const error = await port.mergePr(repo, 7, gated, "T", writeToken).catch((e: unknown) => e);
+  expect(error).toBeInstanceOf(GitLabWriteError);
+  expect(String(error)).not.toContain(writeToken);
+ });
+
+ test("any other HTTP error throws (nothing is assumed merged)", async () => {
+  const { port } = setup({ write: () => response({ message: "forbidden" }, 403) });
+  await expect(port.mergePr(repo, 7, gated, "T", writeToken)).rejects.toBeInstanceOf(GitLabWriteError);
+ });
+
+ test("a write under any other credential is refused before a mutation", async () => {
+  const { port, writes } = setup();
+  await expect(port.mergePr(repo, 7, gated, "T", readToken)).rejects.toThrow();
+  expect(writes).toEqual([]);
+ });
+});
+
+describe("node #126 — the project's squash option, read through the read gate", () => {
+ for (const option of ["always", "default_on", "default_off"]) {
+  test(`squash_option ${option} permits the merge`, async () => {
+   const { port, reads } = setup({ read: () => response({ id: 1, squash_option: option }) });
+   expect(await port.squashRefusal!(repo, writeToken)).toBeNull();
+   expect(reads).toEqual([project]);
+  });
+ }
+ test("squash_option never refuses", async () => {
+  const { port } = setup({ read: () => response({ id: 1, squash_option: "never" }) });
+  expect(await port.squashRefusal!(repo, writeToken)).toContain(`squash_option "never"`);
+ });
+ for (const option of [undefined, "sometimes", 1]) {
+  test(`an unknown squash_option (${String(option)}) fails closed`, async () => {
+   const { port } = setup({ read: () => response({ id: 1, squash_option: option }) });
+   await expect(port.squashRefusal!(repo, writeToken)).rejects.toBeInstanceOf(GitLabReadError);
+  });
+ }
+});
+
+describe("node #126 — rebase on need_rebase, bounded wait, never a merge", () => {
+ const state = (inProgress: boolean, sha = rebased, mergeError: string | null = null) =>
+  response({ ...fixture.mr, sha, rebase_in_progress: inProgress, merge_error: mergeError });
+ const accepted = () => response({ rebase_in_progress: true }, 202);
+ /** Answer reads in order, repeating the last one. */
+ const script = (...states: RunResult[]) => () => states.length > 1 ? states.shift()! : states[0]!;
+ const commitsPath = `${mrPath}/commits?per_page=100&page=1`;
+ const commit = (sha: string, message = "Merge desk on GitLab") =>
+  ({ id: sha, message, author_name: "Ivy", author_email: "ivy@example.test", authored_date: "2026-10-08T10:00:00.000+02:00" });
+ /** State reads from `states`; commit reads from `lists`, by default the gated head's commit, then the same commit rebased. */
+ const route = (states: () => RunResult, lists = script(response([commit(gated)]), response([commit(rebased)]))) =>
+  (endpoint: string) => endpoint.startsWith(`${mrPath}/commits`) ? lists() : states();
+
+ test("PUT rebase, then poll rebase_in_progress until false: head moved to the new SHA", async () => {
+  const { port, writes, reads, sleeps } = setup({ write: accepted, read: route(script(state(false, gated), state(true, gated), state(false))) });
+  expect(await port.rebasePr!(repo, 7, gated, writeToken)).toEqual({ status: "head-moved", headSha: rebased, requested: true });
+  expect(writes).toEqual([[`${mrPath}/rebase`, "--method", "PUT", "--include", "--hostname", host]]);
+  expect(reads).toEqual([statePath, commitsPath, statePath, statePath, commitsPath]);
+  expect(sleeps).toEqual([5, 5]);
+ });
+
+ test("still rebasing after the bound is pending", async () => {
+  const { port, writes, reads } = setup({ polls: 3, write: accepted, read: route(script(state(false, gated), state(true, gated))) });
+  expect(await port.rebasePr!(repo, 7, gated, writeToken)).toMatchObject({ status: "pending" });
+  expect(writes).toHaveLength(1);
+  expect(reads).toHaveLength(5);
+ });
+
+ test("a rebase an earlier pass started is waited on, never requested again", async () => {
+  const { port, writes, reads } = setup({ write: accepted, read: route(script(state(true, gated), state(false))) });
+  expect(await port.rebasePr!(repo, 7, gated, writeToken)).toEqual({ status: "head-moved", headSha: rebased, requested: false });
+  expect(writes).toEqual([]);
+  expect(reads).toHaveLength(4);
+ });
+
+ test("409 on the rebase request (not enqueued yet) is pending, not a park", async () => {
+  const { port, reads } = setup({ write: () => response({ message: "Failed to enqueue the rebase operation" }, 409), read: route(() => state(false, gated)) });
+  expect(await port.rebasePr!(repo, 7, gated, writeToken)).toMatchObject({ status: "pending" });
+  expect(reads).toEqual([statePath, commitsPath]);
+ });
+
+ test("a finished rebase that left a merge_error on the same head is not mergeable", async () => {
+  const { port } = setup({ write: accepted, read: route(script(state(false, gated), state(false, gated, "Rebase failed: conflict"))) });
+  expect(await port.rebasePr!(repo, 7, gated, writeToken)).toEqual({ status: "not-mergeable", reason: "GitLab could not rebase !7: Rebase failed: conflict" });
+ });
+
+ test("a finished rebase that left the head where it was is pending, not head-moved", async () => {
+  const { port } = setup({ write: accepted, read: route(script(state(false, gated), state(false, gated))) });
+  const outcome = await port.rebasePr!(repo, 7, gated, writeToken);
+  expect(outcome).toMatchObject({ status: "pending" });
+  if (outcome.status !== "pending") throw new Error("expected pending");
+  expect(outcome.reason).toContain(gated.slice(0, 8));
+ });
+
+ test("a merge_error already there before the rebase, on an unchanged head, is stale: pending with GitLab's text, never a park", async () => {
+  const { port } = setup({ write: accepted, read: route(script(state(false, gated, "Rebase failed: conflict"), state(false, gated, "Rebase failed: conflict"))) });
+  const outcome = await port.rebasePr!(repo, 7, gated, writeToken);
+  expect(outcome).toMatchObject({ status: "pending", requested: true });
+  if (outcome.status !== "pending") throw new Error("expected pending");
+  expect(outcome.reason).toContain("GitLab still reports the error it had before: Rebase failed: conflict");
+ });
+
+ test("a new merge_error replacing an older one on an unchanged head is this rebase failing: not mergeable", async () => {
+  const { port } = setup({ write: accepted, read: route(script(state(false, gated, "old merge failure"), state(false, gated, "Rebase failed: conflict"))) });
+  expect(await port.rebasePr!(repo, 7, gated, writeToken)).toEqual({ status: "not-mergeable", reason: "GitLab could not rebase !7: Rebase failed: conflict" });
+ });
+
+ test("a stale merge_error beside a moved head is the rebase landing", async () => {
+  const { port } = setup({ write: accepted, read: route(script(state(false, gated, "old merge failure"), state(false, rebased, "old merge failure"))) });
+  expect(await port.rebasePr!(repo, 7, gated, writeToken)).toEqual({ status: "head-moved", headSha: rebased, requested: true });
+ });
+
+ test("a refused rebase request is not mergeable, with GitLab's message", async () => {
+  const { port, reads } = setup({ write: () => response({ message: "403 Forbidden" }, 403), read: route(() => state(false, gated)) });
+  const outcome = await port.rebasePr!(repo, 7, gated, writeToken);
+  expect(outcome).toMatchObject({ status: "not-mergeable" });
+  if (outcome.status !== "not-mergeable") throw new Error("expected not-mergeable");
+  expect(outcome.reason).toContain("HTTP 403: 403 Forbidden");
+  expect(outcome.reason).not.toContain(writeToken);
+  expect(reads).toEqual([statePath, commitsPath]);
+ });
+
+ for (const status of [500, 502, 503, 429, 401]) {
+  test(`a ${status} on the rebase request is a fault: it throws, never a not-mergeable park`, async () => {
+   const { port, reads } = setup({ write: () => response({ message: "upstream trouble" }, status), read: route(() => state(false, gated)) });
+   const error = await port.rebasePr!(repo, 7, gated, writeToken).then(() => null, (e: unknown) => e);
+   expect(error).toBeInstanceOf(GitLabWriteError);
+   expect((error as GitLabWriteError).status).toBe(status);
+   expect(String(error)).not.toContain(writeToken);
+   expect(reads).toEqual([statePath, commitsPath]);
+  });
+ }
+
+ test("a wait that ends pending says no request was sent", async () => {
+  const { port, writes } = setup({ write: accepted, read: route(script(state(true, gated))) });
+  expect(await port.rebasePr!(repo, 7, gated, writeToken)).toMatchObject({ status: "pending", requested: false });
+  expect(writes).toEqual([]);
+ });
+
+ test("a head already past the gated SHA is unconfirmed: no rebase request, nothing attributed", async () => {
+  const { port, writes, reads } = setup({ write: accepted, read: route(() => state(false, rebased)) });
+  const outcome = await port.rebasePr!(repo, 7, gated, writeToken);
+  expect(outcome).toMatchObject({ status: "unconfirmed" });
+  if (outcome.status !== "unconfirmed") throw new Error("expected unconfirmed");
+  expect(outcome.reason).toContain(`moved from ${gated.slice(0, 8)} to ${rebased.slice(0, 8)} before ranger asked for a rebase`);
+  expect(writes).toEqual([]);
+  expect(reads).toEqual([statePath]);
+ });
+
+ test("a commit list not at the gated head is unconfirmed, before any request", async () => {
+  const { port, writes } = setup({ write: accepted, read: route(() => state(false, gated), () => response([commit(rebased)])) });
+  expect(await port.rebasePr!(repo, 7, gated, writeToken)).toMatchObject({ status: "unconfirmed" });
+  expect(writes).toEqual([]);
+ });
+
+ test("a push landing during the wait (a commit added) is unconfirmed, not the rebase", async () => {
+  const lists = script(response([commit(gated)]), response([commit(rebased, "fixup"), commit("e".repeat(40))]));
+  const { port, writes } = setup({ write: accepted, read: route(script(state(false, gated), state(false)), lists) });
+  const outcome = await port.rebasePr!(repo, 7, gated, writeToken);
+  expect(outcome).toMatchObject({ status: "unconfirmed" });
+  if (outcome.status !== "unconfirmed") throw new Error("expected unconfirmed");
+  expect(outcome.reason).toContain("GitLab does not list the same commits there");
+  expect(writes).toHaveLength(1);
+ });
+
+ test("a moved head whose one commit changed its message is unconfirmed; one at another head than the poll read is too", async () => {
+  const changed = script(response([commit(gated)]), response([commit(rebased, "amended")]));
+  expect(await setup({ write: accepted, read: route(script(state(false, gated), state(false)), changed) }).port.rebasePr!(repo, 7, gated, writeToken))
+   .toMatchObject({ status: "unconfirmed" });
+  const elsewhere = script(response([commit(gated)]), response([commit("e".repeat(40))]));
+  expect(await setup({ write: accepted, read: route(script(state(false, gated), state(false)), elsewhere) }).port.rebasePr!(repo, 7, gated, writeToken))
+   .toMatchObject({ status: "unconfirmed" });
+ });
+
+ test("a commit without its author date fails closed", async () => {
+  const { author_email, message, author_name, id } = commit(gated);
+  const { port, writes } = setup({ write: accepted, read: route(() => state(false, gated), () => response([{ id, message, author_name, author_email }])) });
+  await expect(port.rebasePr!(repo, 7, gated, writeToken)).rejects.toBeInstanceOf(GitLabReadError);
+  expect(writes).toEqual([]);
+ });
+
+ test("a rebase state without rebase_in_progress fails closed, before any request", async () => {
+  const { port, writes } = setup({ write: accepted, read: () => response({ ...fixture.mr }) });
+  await expect(port.rebasePr!(repo, 7, gated, writeToken)).rejects.toBeInstanceOf(GitLabReadError);
+  expect(writes).toEqual([]);
+ });
+});

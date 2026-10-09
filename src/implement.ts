@@ -2717,9 +2717,11 @@ export function readyBody(
   `- Tests: ${testsReceipt(ctx.map.commands.test, "in the supervisor", recordedTestsBaseRed(ctx.journal, ctx.map.repo, ctx.node.ref.id))}`,
   `- Sage: ${rounds} offline round(s); the last, at \`${final.sha.slice(0, 8)}\`, found ${final.blockers} blockers, ${final.majors} majors, ${final.nits} nits. Machine review evidence, not a human sign-off.`,
   ...probeLine(ctx, probe),
-  `- Merge: ranger never merges. ${ratify}`,
+  // An autoMerge map's ranger does merge: never say otherwise beside it.
+  `- Merge: ${ctx.map.autoMerge ? "" : "ranger never merges. "}${ratify}`,
   "",
-  "Squash-merge keeps one commit per node. The node is not referenced with a closing keyword on purpose: the close goes through the graph's gate.",
+  // GitLab's merge method may add its own merge commit beside the squash one.
+  `${forgeName(ctx.map.repo) === "GitLab" ? "Squash-merge lands the node's commits as one squash commit; the project's merge method may add a merge commit beside it." : "Squash-merge keeps one commit per node."} The node is not referenced with a closing keyword on purpose: the close goes through the graph's gate.`,
  ].join("\n");
 }
 

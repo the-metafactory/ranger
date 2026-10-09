@@ -4,9 +4,9 @@
 `createDraftPr`, `updatePrBody`, `markReady`, and `postComment`, using the
 existing `ForgePort` names. Its read methods still require the exact
 project-bound `ResolvedToken` from the read gate. Writes take a string
-credential matching the configured machine token. Merge/rebase and lane
-selection belong to separate nodes; the class currently implements
-`Omit<ForgePort<ResolvedToken>, "mergePr">`.
+credential matching the configured machine token. The squash merge and
+the rebase it may need are described in [gitlab-merge.md](gitlab-merge.md)
+(node #126); lane selection belongs to a separate node.
 
 Every mutation rechecks `assertWriteIdentity`: the credential must resolve
 from the configured mapping, differ from the host's principal, and identify

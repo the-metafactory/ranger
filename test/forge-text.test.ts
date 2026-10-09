@@ -45,7 +45,9 @@ import { needsYouEntries, resumeQueueViews } from "../src/serve-parked.ts";
 /**
  * Node #129: ranger names a change request the way its forge does. The
  * GitHub renderings below were pinned against the code before the forge-text
- * module existed; they must stay byte-identical.
+ * module existed, and only a deliberate wording fix may change them. One has
+ * (node #126): an autoMerge ready body no longer says "ranger never merges."
+ * beside "Ranger squash-merges this itself", which contradicted it.
  */
 
 const GITHUB = "acme/widgets";
@@ -140,7 +142,7 @@ function fakeForge(repo: string, over: Partial<ChangeRequest>, comments: IssueCo
   listComments: async () => comments,
   ciVerdictFor: async () => greenCi(repo),
   issueLabels: async () => [],
-  mergePr: async () => {},
+  mergePr: async () => ({ status: "merged" as const }),
  };
 }
 
@@ -195,7 +197,7 @@ function parkedTexts(repo: string): { queue: string[]; needsYou: unknown[] } {
  return { queue, needsYou };
 }
 
-describe("node #129 — GitHub renderings stay byte-identical", () => {
+describe("node #129 — GitHub renderings stay pinned (one wording fix, node #126)", () => {
  test("implement-lane bodies and receipts", () => {
   expect(implementTexts(GITHUB)).toMatchInlineSnapshot(`
     {
@@ -364,7 +366,7 @@ describe("node #129 — GitHub renderings stay byte-identical", () => {
     - Tests: \`bun test\` passed in the supervisor before every push.
     - Sage: 2 offline round(s); the last, at \`cccccccc\`, found 0 blockers, 0 majors, 1 nits. Machine review evidence, not a human sign-off.
     - Probes: passed at \`cccccccc\` (selection semantic, 3 probe(s)). Only the selected probes ran, not the full suite.
-    - Merge: ranger never merges. Ranger squash-merges this itself once the gate passes, unless the node is labelled \`ranger:needs-eye\`; then the principal merges by hand. Ranger closes the node after the merge.
+    - Merge: Ranger squash-merges this itself once the gate passes, unless the node is labelled \`ranger:needs-eye\`; then the principal merges by hand. Ranger closes the node after the merge.
 
     Squash-merge keeps one commit per node. The node is not referenced with a closing keyword on purpose: the close goes through the graph's gate."
     ,
@@ -384,7 +386,7 @@ describe("node #129 — GitHub renderings stay byte-identical", () => {
     - Tests: \`bun test\` passed in the supervisor before every push.
     - Sage: 2 offline round(s); the last, at \`cccccccc\`, found 0 blockers, 0 majors, 1 nits. Machine review evidence, not a human sign-off.
     - Probes: passed at \`cccccccc\` (selection semantic, 3 probe(s)). Only the selected probes ran, not the full suite.
-    - Merge: ranger never merges. Ranger squash-merges this itself once the gate passes, unless the node is labelled \`ranger:needs-eye\`; then the principal merges by hand. For this \`propose\` node the merge is the ratification. Ranger closes the node after the merge.
+    - Merge: Ranger squash-merges this itself once the gate passes, unless the node is labelled \`ranger:needs-eye\`; then the principal merges by hand. For this \`propose\` node the merge is the ratification. Ranger closes the node after the merge.
 
     Squash-merge keeps one commit per node. The node is not referenced with a closing keyword on purpose: the close goes through the graph's gate."
     ,
@@ -512,6 +514,8 @@ describe("node #129 — GitLab renderings name an MR !N with GitLab URLs", () =>
   expect(texts["close no url auto/manual"]).toContain("(https://gitlab.example.org/claw/crisis-simulator/-/merge_requests/42)");
   expect(texts["ready merge/manual"]).toContain("**merging this MR is the ratification**");
   expect(texts["ready auto/manual"]).toContain("this MR's CI run");
+  expect(texts["ready auto/manual"]).toContain("Squash-merge lands the node's commits as one squash commit; the project's merge method may add a merge commit beside it.");
+  expect(texts["ready auto/autoMerge"]).not.toContain("ranger never merges");
   expect(texts.gist).toBe("Name MRs and nodes the way their forge does — MR !42");
   expect(texts.fixNode).toContain("- Detected by: node #129, MR !42 (https://gitlab.example.org/claw/crisis-simulator/-/merge_requests/42)");
   expect(texts.fixNode).toContain("Later MRs off that merge base");

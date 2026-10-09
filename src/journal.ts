@@ -81,6 +81,9 @@ export class FencedError extends Error {
  override readonly name = "FencedError";
 }
 
+/** The fixed prefix `recordRebase` writes and `listRebases` reads: the SHAs, and ` wait` when no request was sent; the note follows. */
+const REBASE_PREFIX = /^from=([0-9a-f]{7,64})(?: to=([0-9a-f]{7,64}))?( wait)?: ?([\s\S]*)$/;
+
 export interface EventRow {
  id: number;
  at: string;
@@ -176,6 +179,7 @@ export type EventKind =
  | "awaiting-merge"
  | "merge-card"
  | "merged"
+ | "rebased"
  | "orphan-killed"
  | "substrate-capped"
  | "transient"
@@ -457,6 +461,37 @@ export class Journal {
     : base.where(eq(events.repo, repo)).orderBy(desc(events.id)).limit(limit);
   const rows = query.all();
   return rows.map(hydrateEvent);
+ }
+
+ /**
+  * A rebase pass on a node's change request from the gated head `from`
+  * (node #126): `to` is the new head once ranger saw it move, else null;
+  * `requested` is false when the pass only waited on a running rebase. These
+  * lead the detail in a fixed prefix that `listRebases` reads back, so
+  * `note` stays free prose.
+  */
+ recordRebase(opts: { nodeId: string; repo: string; from: string; to: string | null; requested: boolean; note: string }): void {
+  const prefix = `from=${opts.from}${opts.to === null ? "" : ` to=${opts.to}`}${opts.requested ? "" : " wait"}`;
+  this.recordEvent("rebased", { nodeId: opts.nodeId, repo: opts.repo, detail: `${prefix}: ${opts.note}` });
+ }
+
+ /**
+  * A node's recorded rebase passes, newest first. Queried by kind, so other
+  * events (a send-back waiting on the lane logs one per pass) never push a
+  * rebase out of the window.
+  */
+ listRebases(repo: string, nodeId: string, limit = 60): { from: string; to: string | null; requested: boolean; note: string }[] {
+  return this.db
+   .select()
+   .from(events)
+   .where(and(eq(events.repo, repo), eq(events.nodeId, nodeId), eq(events.kind, "rebased")))
+   .orderBy(desc(events.id))
+   .limit(limit)
+   .all()
+   .flatMap((e) => {
+    const m = REBASE_PREFIX.exec(e.detail ?? "");
+    return m === null ? [] : [{ from: m[1]!, to: m[2] ?? null, requested: m[3] === undefined, note: m[4] ?? "" }];
+   });
  }
 
  /** One node's events, newest first (node #54: the dashboard's reason class). */

@@ -149,6 +149,7 @@ class FakeGitHub implements ForgePort {
   if ((await this.sha(pr.head)) !== sha) throw new Error("409 head moved");
   this.merges.push({ n, sha, title });
   await this.merge(n, BOT);
+  return { status: "merged" as const };
  }
 
  /** A merge (the principal's by default): fast-forward origin main to the PR head. */
