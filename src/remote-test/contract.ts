@@ -4,15 +4,15 @@ import { MYELIN_REPOSITORY, ReviewedPolicySchema, validateReviewedManifest } fro
 /** V1 is deliberately limited to the first non-graphical Linux ARM64 lane. */
 const PlatformSchema = z.literal("linux-arm64");
 const VersionSchema = z.literal(1);
-const Sha256Schema = z.string().regex(/^sha256:[0-9a-f]{64}$/);
+export const Sha256Schema = z.string().regex(/^sha256:[0-9a-f]{64}$/);
 // Full Git object IDs: SHA-1 or SHA-256, never an abbreviated revision.
 const GitDigestSchema = z.string().regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/);
 const UuidSchema = z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
-const NameSchema = z.string().min(1).max(128).regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/);
+export const NameSchema = z.string().min(1).max(128).regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/);
 const TimestampSchema = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 const GenerationSchema = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 // Located repository identity, without URLs, credentials, refs or path traversal.
-const RepositoryIdSchema = z.string().max(512).regex(
+export const RepositoryIdSchema = z.string().max(512).regex(
  /^(?:github|gitlab):[a-z0-9]+(?:[.-][a-z0-9]+)*(?::[1-9][0-9]{0,4})?\/[a-zA-Z0-9_-][a-zA-Z0-9._-]*(?:\/[a-zA-Z0-9_-][a-zA-Z0-9._-]*)+$/,
 );
 
@@ -24,7 +24,7 @@ const ProfileBindingShape = {
  platform: PlatformSchema,
 };
 
-const IdentitySchema = z.object({
+export const RemoteTestJobSchema = z.object({
  version: VersionSchema,
  jobId: UuidSchema,
  correlationId: UuidSchema,
@@ -75,7 +75,7 @@ const EvidenceSchema = z.object({
 
 const ReceiptSchema = z.object({
  version: VersionSchema,
- identity: IdentitySchema,
+ identity: RemoteTestJobSchema,
  executorId: NameSchema,
  status: z.enum(REMOTE_TEST_STATUSES),
  completedAt: TimestampSchema,
@@ -102,13 +102,13 @@ const ReceiptSchema = z.object({
  }
 });
 
-export type RemoteTestJob = z.infer<typeof IdentitySchema>;
+export type RemoteTestJob = z.infer<typeof RemoteTestJobSchema>;
 export type ProfileManifest = z.infer<typeof ProfileManifestSchema>;
 export type RemoteTestReceipt = z.infer<typeof ReceiptSchema>;
 export type RemoteTestStatus = RemoteTestReceipt["status"];
 
 /** Structural validation for the private ledger; profile approval remains at admission. */
-export function validateJobIdentity(input: unknown): RemoteTestJob { return IdentitySchema.parse(input); }
+export function validateJobIdentity(input: unknown): RemoteTestJob { return RemoteTestJobSchema.parse(input); }
 
 /** Structural validation only. Approval, digest verification and provenance are
  * caller responsibilities: load this from an operator-owned allow-list, never
@@ -122,7 +122,7 @@ export function validateProfileManifest(input: unknown): ProfileManifest {
  * Throws ZodError for malformed input, Error for profile mismatch. */
 export function validateRemoteTestJob(input: unknown, operatorProfile: unknown): RemoteTestJob {
  const profile = validateProfileManifest(operatorProfile);
- const request = IdentitySchema.parse(input);
+ const request = RemoteTestJobSchema.parse(input);
  if (profile.reviewed && request.repositoryId !== MYELIN_REPOSITORY) throw Error("Reviewed recipe repository mismatch");
  const fields = Object.keys(ProfileBindingShape) as (keyof typeof ProfileBindingShape)[];
  for (const field of fields) {
@@ -150,7 +150,7 @@ function sameIdentity(receipt: RemoteTestReceipt, request: RemoteTestJob): boole
  * it says nothing about success, transport authentication or current gate state. */
 export function receiptMatchesJob(input: unknown, expectedJob: unknown): boolean {
  const receipt = ReceiptSchema.safeParse(input);
- const job = IdentitySchema.safeParse(expectedJob);
+ const job = RemoteTestJobSchema.safeParse(expectedJob);
  return receipt.success && job.success && sameIdentity(receipt.data, job.data);
 }
 
@@ -160,7 +160,7 @@ export function receiptMatchesJob(input: unknown, expectedJob: unknown): boolean
  * Throws ZodError for malformed input, Error for identity mismatch. */
 export function validateRemoteTestReceipt(input: unknown, expectedJob: unknown): RemoteTestReceipt {
  const receipt = ReceiptSchema.parse(input);
- const job = IdentitySchema.parse(expectedJob);
+ const job = RemoteTestJobSchema.parse(expectedJob);
  if (!sameIdentity(receipt, job)) throw new Error("Remote-test receipt identity does not match request");
  return receipt;
 }
