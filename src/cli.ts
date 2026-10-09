@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { readPrivateJson } from "./remote-test/ssh-cli.ts";
 import { executionRefusal, isGithubRepo } from "./forge-ref.ts";
+import { changeRequestNoun } from "./forge-text.ts";
 import { mapKey, pickMap } from "./maps.ts";
 import { implementLane } from "./lanes.ts";
 import { resumeNode } from "./resume.ts";
@@ -321,7 +322,7 @@ async function runMergeGate(nodeId: string, selector: string, sha: string, confi
   const map = pickMap(config, selector);
   const row = journal.getWorker(nodeId, map.repo);
   if (row === null || row.root !== map.root || row.prNumber === null) {
-   return { ok: false, text: `node ${nodeId} has no PR recorded on ${mapKey(map)}` };
+   return { ok: false, text: `node ${nodeId} has no ${changeRequestNoun(map.repo)} recorded on ${mapKey(map)}` };
   }
   const { token, botIdentity } = await writeContext(config, map);
   const gate = await mergeGateNow(realGitHub, map, row.prNumber, token, botIdentity);

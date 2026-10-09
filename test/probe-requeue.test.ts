@@ -18,7 +18,7 @@ const SHA = "a".repeat(40);
 const deadPid = 2_147_483_647;
 const run = (code: number, stdout = "") => ({ code, stdout, stderr: "" });
 const failure = (kind: string) => `FAIL probe-site.mjs (1.0s) exit=${kind === "killed" ? "killed:SIGKILL" : "1"} ${kind}\nFAILED: probe-site.mjs`;
-const outcome = (head = SHA) => probesFailedOutcome({ sha: head, pr: 1, exit: -1, failed: [], failureClass: "infrastructure", tail: "probe lock: waiting 1795s" });
+const outcome = (head = SHA) => probesFailedOutcome({ repo: "acme/widgets", sha: head, pr: 1, exit: -1, failed: [], failureClass: "infrastructure", tail: "probe lock: waiting 1795s" });
 
 function rig() {
  const dir = mkdtempSync(join(tmpdir(), "ranger-probe-requeue-"));
@@ -62,7 +62,7 @@ describe("probe failure classification", () => {
  });
  test("class survives journal truncation and legacy fallback stays narrow", () => {
   expect(infrastructureProbeHead(outcome().slice(0, 400))).toBe(SHA);
-  const legacy = probesFailedOutcome({ sha: SHA, pr: 1, exit: -1, failed: [], tail: "lock wait" });
+  const legacy = probesFailedOutcome({ repo: "acme/widgets", sha: SHA, pr: 1, exit: -1, failed: [], tail: "lock wait" });
   expect(infrastructureProbeHead(legacy)).toBe(SHA.slice(0, 8));
   expect(infrastructureProbeHead(legacy + "\nFAILED: probe-site.mjs")).toBeNull();
   expect(infrastructureProbeHead(legacy.replace("exit -1", "exit 1"))).toBeNull();
@@ -108,7 +108,7 @@ describe("automatic probe requeue", () => {
  test("legacy short-head retry counts toward the full-head budget", async () => {
   const r = rig();
   try {
-   r.park("10", A, { outcome: probesFailedOutcome({ sha: SHA, pr: 1, exit: -1, failed: [], tail: "lock wait" }) });
+   r.park("10", A, { outcome: probesFailedOutcome({ repo: "acme/widgets", sha: SHA, pr: 1, exit: -1, failed: [], tail: "lock wait" }) });
    expect((await r.retry()).resumed).toEqual([`${A}#10`]);
    r.park("10");
    expect((await r.retry()).resumed).toEqual([`${A}#10`]);

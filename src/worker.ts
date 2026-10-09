@@ -1,4 +1,5 @@
 import { executionRefusal, fileStemFor, parseForgeRef, qualifiedRepo } from "./forge-ref.ts";
+import { changeRequestLabel, ciRunNoun } from "./forge-text.ts";
 import { mapKey } from "./maps.ts";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
@@ -969,12 +970,12 @@ async function runResearch(
   recordPr: (pr) => {
    journal.updateWorker(nodeId, repo, { prNumber: pr.iid });
    if (existingPr === null) {
-    journal.recordEvent("pr-opened", { nodeId, repo, detail: `research draft PR #${pr.iid} ${pr.webUrl}` });
+    journal.recordEvent("pr-opened", { nodeId, repo, detail: `research draft ${changeRequestLabel(repo, pr.iid)} ${pr.webUrl}` });
    }
   },
  });
  journal.recordEvent("ci-passed", { nodeId, repo, detail: `research ${evidence.ci} (${evidence.check.runName})` });
- const resolution = `${findings.stdout.trim()}\n\nResearch CI evidence: draft ${evidence.pr.webUrl}, check run ${evidence.ci}.`;
+ const resolution = `${findings.stdout.trim()}\n\nResearch CI evidence: draft ${evidence.pr.webUrl}, ${ciRunNoun(repo)} ${evidence.ci}.`;
  const resolutionFile = join(tmpdir(), `ranger-close-${fileStemFor(repo, nodeId)}.md`);
  writeFileSync(resolutionFile, resolution, "utf8");
 

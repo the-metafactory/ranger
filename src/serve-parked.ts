@@ -1,4 +1,5 @@
 import { isGithubRepo, nodeKey } from "./forge-ref.ts";
+import { changeRequestUrl, nodeUrl } from "./forge-text.ts";
 /**
  * `ranger serve`'s "Needs you" section (node #54): every journal worker row
  * that ended parked or failed, and every awaiting-merge row labelled
@@ -403,7 +404,7 @@ export function resumeQueueViews(
    root: e.root,
    nodeId: e.nodeId,
    title: titleOf(e.repo, e.nodeId),
-   url: `https://github.com/${e.repo}/issues/${e.nodeId}`,
+   url: nodeUrl(e.repo, e.nodeId),
    lane: e.lane,
    position: out[e.lane].length + 1,
    queuedAt: e.queuedAt,
@@ -491,7 +492,7 @@ function rowEntries(
    root: row.root,
    nodeId: row.nodeId,
    title: inputs.titleOf(row.repo, row.nodeId),
-   url: `https://github.com/${row.repo}/issues/${row.nodeId}`,
+   url: nodeUrl(row.repo, row.nodeId),
    status: row.status as NeedsYouEntry["status"],
    endedAt: row.finishedAt,
    reason: classifyReason(row, events, labels, inputs.reviewRounds),
@@ -500,7 +501,7 @@ function rowEntries(
      ? null
      : {
         number: row.prNumber,
-        url: view?.url || `https://github.com/${row.repo}/pull/${row.prNumber}`,
+        url: changeRequestUrl(row.repo, row.prNumber, view?.url),
         view,
         error: inputs.prError?.(row.repo, row.prNumber) ?? null,
        },

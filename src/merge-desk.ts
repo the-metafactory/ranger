@@ -18,6 +18,7 @@ import type { Journal, WorkerRow } from "./journal.ts";
 import { evaluateMergeGate, type MergeGateInput, type MergeGateResult } from "./merge-gate.ts";
 import type { IssueComment, ChangeRequest, CiVerdict, ForgePort } from "./forge.ts";
 import { CI_FAILED_PARK_OUTCOME, mergeGateFailedOutcome } from "./outcomes.ts";
+import { changeRequestLabel, changeRequestNoun, forgeName } from "./forge-text.ts";
 
 /**
  * The merge desk (design §4/§5, #23): each tick, every implement-lane row
@@ -178,7 +179,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    await post(
     [
      `:ranger: **parked** #${row.nodeId} — ${title}`,
-     `map: ${mapKey(map)}${row.prNumber === null ? "" : ` · PR #${row.prNumber}`}`,
+     `map: ${mapKey(map)}${row.prNumber === null ? "" : ` · ${changeRequestLabel(repo, row.prNumber)}`}`,
      detail.slice(0, 1500),
     ].join("\n"),
     `park card for #${row.nodeId}`,
@@ -190,11 +191,12 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
 
  async function progress(row: WorkerRow): Promise<void> {
   if (row.prNumber === null) {
-   await park(row, "awaiting merge with no PR recorded — journal and GitHub disagree", `node ${row.nodeId}`);
+   await park(row, `awaiting merge with no ${changeRequestNoun(repo)} recorded — journal and ${forgeName(repo)} disagree`, `node ${row.nodeId}`);
    return;
   }
   const pr = await github.getPr(repo, row.prNumber, token);
-  const title = pr.webUrl.length > 0 ? `PR #${pr.iid} ${pr.webUrl}` : `PR #${pr.iid}`;
+  const cr = changeRequestLabel(repo, pr.iid);
+  const title = pr.webUrl.length > 0 ? `${cr} ${pr.webUrl}` : cr;
 
   if (pr.state === "merged") {
    if (ctx.spawn === undefined) {
@@ -217,7 +219,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    journal.recordEvent("sweep", {
     nodeId: row.nodeId,
     repo,
-    detail: `PR #${pr.iid} merged — resuming at the close phase (pid ${pid})`,
+    detail: `${cr} merged — resuming at the close phase (pid ${pid})`,
    });
    result.resumed.push(row.nodeId);
    return;
@@ -228,7 +230,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   if (row.status === "parked" && (!ciPark || pr.state === "closed")) return;
 
   if (pr.state === "closed") {
-   await park(row, `PR #${pr.iid} was closed without merging — declined; ranger will not reopen or re-propose it`, title);
+   await park(row, `${cr} was closed without merging — declined; ranger will not reopen or re-propose it`, title);
    return;
   }
 
@@ -254,14 +256,14 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    const why = reworkFindings
     ? `sage round ${last?.round} at ${pr.headSha.slice(0, 8)} has ${last?.blockers} blocker(s) and ${last?.majors} major(s) to rework`
     : conflicting
-     ? `PR #${pr.iid} conflicts with ${map.base} at ${pr.headSha.slice(0, 8)}`
+     ? `${cr} conflicts with ${map.base} at ${pr.headSha.slice(0, 8)}`
      : `no passing probe run at ${pr.headSha.slice(0, 8)}`;
    if (row.mergeMessageId !== null) {
     try {
      await post(
       [
        `:ranger: **merge card withdrawn** #${row.nodeId} — ${title}`,
-       `Do not merge yet: ${why}. Ranger reworks it; a new merge card follows when the PR is clean.`,
+       `Do not merge yet: ${why}. Ranger reworks it; a new merge card follows when the ${changeRequestNoun(repo)} is clean.`,
       ].join("\n"),
       `merge card withdrawal for #${row.nodeId}`,
      );
@@ -280,7 +282,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
     journal.recordEvent("sweep", {
      nodeId: row.nodeId,
      repo,
-     detail: `PR #${pr.iid}: ${why} — waiting for the ${lane} implement lane (held by #${holder.nodeId}, ${mapKey(holder)})`,
+     detail: `${cr}: ${why} — waiting for the ${lane} implement lane (held by #${holder.nodeId}, ${mapKey(holder)})`,
     });
     return;
    }
@@ -294,7 +296,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    journal.recordEvent("sweep", {
     nodeId: row.nodeId,
     repo,
-    detail: `PR #${pr.iid}: ${why} — run-node resumes (pid ${pid})`,
+    detail: `${cr}: ${why} — run-node resumes (pid ${pid})`,
    });
    result.resumed.push(row.nodeId);
    return;
@@ -336,7 +338,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    journal.recordEvent("sweep", {
     nodeId: row.nodeId,
     repo,
-    detail: `PR #${pr.iid}: CI recovered at ${gate.headSha.slice(0, 8)}, the gate passes there — the CI-only park returns to awaiting-merge (no worker, no lane)`,
+    detail: `${cr}: CI recovered at ${gate.headSha.slice(0, 8)}, the gate passes there — the CI-only park returns to awaiting-merge (no worker, no lane)`,
    });
    if (row.mergeMessageId !== null) return; // its card is still up
   }
@@ -345,7 +347,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    journal.recordEvent("merged", {
     nodeId: row.nodeId,
     repo,
-    detail: `PR #${pr.iid} squash-merged by ranger at ${gate.headSha.slice(0, 8)} (no ${NEEDS_EYE_LABEL} label; standing grant 2026-10-03)`,
+    detail: `${cr} squash-merged by ranger at ${gate.headSha.slice(0, 8)} (no ${NEEDS_EYE_LABEL} label; standing grant 2026-10-03)`,
    });
    result.merged.push(row.nodeId);
    try {
@@ -377,7 +379,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
      ? [`Note: ${superseded}; the reviewer may have missed it, check before you merge.${map.autoMerge ? " Auto-merge is held on this head for that reason." : ""}`]
      : []),
     ...(probesRequired
-     ? [`Probes passed at \`${gate.headSha.slice(0, 8)}\` (selection ${probe?.mode ?? "?"}, ${probe?.selected ?? "?"} probe(s)). Only the selected probes ran, not the full suite.${baseRedNote(probe)}`]
+     ? [`Probes passed at \`${gate.headSha.slice(0, 8)}\` (selection ${probe?.mode ?? "?"}, ${probe?.selected ?? "?"} probe(s)). Only the selected probes ran, not the full suite.${baseRedNote(repo, probe)}`]
      : ["No probe tier on this map: CI and the tests are the only automated checks."]),
     needsEye
      ? `Labelled \`${NEEDS_EYE_LABEL}\`: your eye is the check. Merge it by hand (squash); ranger closes the node after the merge.`
@@ -400,12 +402,12 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
     nodeId: row.nodeId, repo, detail: `views delivery failed (informational): ${reason}`,
    });
    messageId = await post(
-    `${content}\nVisual evidence could not be delivered: ${reason}. See the PR views comment for the diff and full local sheet.`.slice(0, 2000),
+    `${content}\nVisual evidence could not be delivered: ${reason}. See the ${changeRequestNoun(repo)} views comment for the diff and full local sheet.`.slice(0, 2000),
     label,
    );
   }
   journal.updateWorker(row.nodeId, repo, { mergeMessageId: messageId });
-  journal.recordEvent("merge-card", { nodeId: row.nodeId, repo, detail: `PR #${pr.iid}, message ${messageId}${superseded !== null ? `; ${superseded}` : ""}` });
+  journal.recordEvent("merge-card", { nodeId: row.nodeId, repo, detail: `${cr}, message ${messageId}${superseded !== null ? `; ${superseded}` : ""}` });
   result.cards.push(row.nodeId);
  }
 }

@@ -160,7 +160,7 @@ describe("node #104 — ci-only-park-merges-without-lane: a CI-only park merges 
  });
 
  const otherParks = [
-  reviewCapOutcome({ blockers: 1, majors: 0, round: 7, pr: 709 }),
+  reviewCapOutcome({ repo: "acme/widgets", blockers: 1, majors: 0, round: 7, pr: 709 }),
   mergeGateFailedOutcome({ check: "probes", reason: "no passing probe run recorded at head aaaaaaaa" }),
   mergeGateFailedOutcome({ check: "review-clean", reason: "no sage verdict recorded for head aaaaaaaa" }),
   mergeGateFailedOutcome({ check: "mergeable", reason: "mergeable=false, state=dirty (conflicts with main)" }),
