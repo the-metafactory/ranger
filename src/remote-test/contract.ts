@@ -1,3 +1,4 @@
+import type { Hash } from "node:crypto";
 import { z } from "zod";
 import { MYELIN_REPOSITORY, ReviewedPolicySchema, validateReviewedManifest } from "./profiles.ts";
 
@@ -5,6 +6,8 @@ import { MYELIN_REPOSITORY, ReviewedPolicySchema, validateReviewedManifest } fro
 const PlatformSchema = z.literal("linux-arm64");
 const VersionSchema = z.literal(1);
 export const Sha256Schema = z.string().regex(/^sha256:[0-9a-f]{64}$/);
+/** The content-address form every Sha256Schema comparison expects. */
+export const sha256Reference = (hash: Hash) => `sha256:${hash.digest("hex")}`;
 // Full Git object IDs: SHA-1 or SHA-256, never an abbreviated revision.
 const GitDigestSchema = z.string().regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/);
 const UuidSchema = z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
