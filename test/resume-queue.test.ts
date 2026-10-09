@@ -816,4 +816,20 @@ describe("the dashboard's queue head is the one the walk starts", () => {
    });
   });
  }
+
+ test("visual drain: the visual lane's queue head still starts", async () => {
+  await withRig(async r => {
+   r.config.maps[1].lane = "visual";
+   r.worker("41", 460);
+   r.journal.enqueueResume({ nodeId: "41", repo: REPO, root: 460, lane: "visual" }, NOW);
+   r.journal.setVisualLaneDrained(true);
+   const maps = servedMaps(r.config);
+   const state = stateFromJournal(r.config, maps, new ServeReader(r.config, maps, r.config.state.journalPath), NOW);
+   expect(state.gates.visualDrained).toBe(true);
+   expect(state.resumeQueue.visual.head).toMatchObject({ nodeId: "41", starts: true });
+   const spawned: string[] = [];
+   await walk({ ...r, now: () => NOW, spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; } });
+   expect(spawned).toEqual(["41"]);
+  });
+ });
 });

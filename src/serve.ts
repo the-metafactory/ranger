@@ -1120,14 +1120,14 @@ function renderNext(s) {
 // A verb's exit for the status line, pointing at where its detail shows.
 // A null code is a verb that timed out or never started: it may have applied.
 function outcome(label, r, where) {
- return label + (r.ok ? " ran." : r.code === null ? " did not finish (timed out or could not start): it may have applied, so check " + where + " once the page reloads." : " failed (exit " + r.code + "): see " + where + ".");
+ return label + (r.ok ? " ran." : r.code === null ? " did not finish (timed out or could not start): it may have applied, so check once the page reloads." : " failed (exit " + r.code + "): see " + where + ".");
 }
 // A verb run for the page (drain): its exit and stderr, shown on failure.
 async function pageVerb(path, body, label) {
  document.getElementById("out").textContent = "";
  try {
   const r = await post(path, body);
-  say(outcome(label, r, "the page"), !r.ok);
+  say(outcome(label, r, "its error below"), !r.ok);
   if (!r.ok) document.getElementById("out").textContent = r.stderr || "";
  } catch (e) { say(label + " refused: " + e.message, true); }
  load(); setTimeout(load, 3000);
