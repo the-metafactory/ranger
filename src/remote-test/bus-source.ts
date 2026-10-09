@@ -47,6 +47,9 @@ const LOCK_WAIT_MS = 10_000;
  * reclaimed; one that outlives its expiry refuses rather than publishing. */
 export const PENDING_MS = 2 * SSH_LIMITS.timeoutSeconds * 1000;
 const pendingName = /^\.pending-(\d{1,16})-[0-9a-f-]{36}$/;
+/** A quarantined object (unreadable or misaddressed reference) names its
+ * server-clock expiry: kept as evidence and counted for one retention window. */
+const invalidName = /^\.invalid-(\d{1,16})-[0-9a-f-]{36}$/;
 const objectName = /^[a-f0-9]{64}$/;
 const ReferenceFileSchema = z.object({
  version: z.literal(1), bundleDigest: Sha256Schema,
@@ -162,30 +165,45 @@ async function writeReference(pending: string, reference: ReferenceFile, options
  await options.fault?.("dir-sync"); await syncDirectory(pending);
  return json.length;
 }
-/** Under the store lock: reclaim expired pending uploads and expired validated
- * objects, then return either the same unexpired object or the retained total.
- * Unknown entries are counted and kept; unexpired objects are never evicted. */
+/** A malformed, unsafe, missing or symlinked reference is invalid; any other
+ * I/O error is rethrown so a transient failure never quarantines a good object. */
+function invalidReference(e: unknown): null {
+ if (e instanceof StagedSourceRefusal) return null;
+ const code = (e as NodeJS.ErrnoException).code;
+ if (code === undefined || code === "ENOENT" || code === "ELOOP") return null;
+ throw e;
+}
+/** Under the store lock: reclaim expired pending uploads, quarantines and
+ * validated objects; quarantine objects whose reference is unreadable or names
+ * another address; then return either the same unexpired object or the
+ * retained total. Unknown entries are counted and kept; unexpired objects are
+ * never evicted. An invalid object at the requested address refuses this
+ * stage once; the next stage publishes. */
 async function sweepStore(store: string, own: string, digest: string, now: number, retentionMs: number): Promise<{ existing: ReferenceFile } | { total: number }> {
  const target = objectPath(store, digest);
  let total = 0;
  for (const entry of await readdir(store)) {
   if (lockFiles.has(entry) || entry === own) continue;
-  const path = join(store, entry);
+  let path = join(store, entry);
   try {
-   const pending = pendingName.exec(entry);
-   if (pending && Number(pending[1]) <= now) { await rm(path, { recursive: true, force: true }); continue; }
+   const timed = pendingName.exec(entry) ?? invalidName.exec(entry);
+   if (timed && Number(timed[1]) <= now) { await rm(path, { recursive: true, force: true }); continue; }
    if (objectName.test(entry)) {
     await privateDirectory(path);
-    if (path === target) {
-     // An expired object is reclaimed whatever its bytes, so a corrupt one
-     // blocks its digest for at most one retention window. Only an
-     // unexpired object is re-hashed; a mismatch refuses and is kept.
-     const stored = await readReference(path).catch(() => null);
-     if (stored?.bundleDigest === digest && expired(stored, now, retentionMs)) { await rm(path, { recursive: true }); continue; }
+    const stored = await readReference(path).catch(invalidReference);
+    if (stored?.bundleDigest !== `sha256:${entry}`) {
+     const quarantine = join(store, `.invalid-${now + retentionMs}-${randomUUID()}`);
+     await rename(path, quarantine); await syncDirectory(store);
+     if (path === target) throw new StagedSourceRefusal("stage_conflict", "Stored source reference is invalid");
+     path = quarantine;
+    } else if (expired(stored, now, retentionMs)) {
+     // Reclaimed whatever its bytes: a corrupt object blocks its digest for
+     // at most one retention window.
+     await rm(path, { recursive: true }); continue;
+    } else if (path === target) {
+     // Only an unexpired object is re-hashed; a mismatch refuses and is kept.
      return { existing: await verifyObject(path, digest) };
     }
-    const stored = await readReference(path).catch(() => null);
-    if (stored && stored.bundleDigest === `sha256:${entry}` && expired(stored, now, retentionMs)) { await rm(path, { recursive: true }); continue; }
    }
    total += await size(path);
   } catch (e) { if (!missing(e)) throw e; }

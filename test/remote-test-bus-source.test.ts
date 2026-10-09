@@ -104,6 +104,24 @@ test("a restage just before expiry keeps the object loadable for a full retentio
  expect(f.calls()).toBe(0);
 });
 
+test("an object with an unreadable or misaddressed reference is quarantined, counted for one retention window, then reclaimed", async () => {
+ const f = await fixture(), tight = { ...f.config, artifacts: { maxArtifactBytes: 2 * f.bytes.length } };
+ await mkdir(f.store, { mode: 0o700 });
+ const garbled = f.object(sha("other")), misaddressed = f.object(sha("another"));
+ for (const dir of [garbled, misaddressed]) { await mkdir(dir, { mode: 0o700 }); await writeFile(join(dir, "source.bundle"), Buffer.alloc(f.bytes.length), { mode: 0o600 }); }
+ await writeFile(join(garbled, "reference.json"), "{ not json", { mode: 0o600 });
+ await writeFile(join(misaddressed, "reference.json"), JSON.stringify({ version: 1, bundleDigest: f.job.bundleDigest, bundleBytes: f.bytes.length, storedAt: now }), { mode: 0o600 });
+ const at = (time: number) => serveSshRequest(f.frame(f.job, f.bytes), tight, { execute: f.execute, now: () => time });
+ expect(await refusal(at(now))).toBe("stage_capacity");
+ const quarantined = await f.entries();
+ expect(quarantined).toHaveLength(2);
+ for (const name of quarantined) expect(name).toMatch(new RegExp(`^\\.invalid-${now + 7 * DAY}-`));
+ expect(await refusal(at(now + 7 * DAY - 1))).toBe("stage_capacity");
+ expect("staged" in await at(now + 7 * DAY)).toBe(true);
+ expect(await f.entries()).toEqual([f.job.bundleDigest.slice(7)]);
+ expect(f.calls()).toBe(0);
+});
+
 test("a corrupt object blocks its digest for at most one retention window", async () => {
  const f = await fixture(), object = f.object(f.job.bundleDigest);
  await mkdir(f.store, { mode: 0o700 }); await mkdir(object, { mode: 0o700 });
@@ -158,9 +176,16 @@ test("a colliding stored object, unsafe store or busy lock refuses and is never 
  await writeFile(join(object, "reference.json"), JSON.stringify({ version: 1, bundleDigest: f.job.bundleDigest, bundleBytes: forged.length, storedAt: now }), { mode: 0o600 });
  expect(await refusal(serve(f))).toBe("stage_conflict");
  expect(await readFile(join(object, "source.bundle"))).toEqual(forged);
- // An empty directory would be silently replaced by rename; it must refuse instead.
+ // An empty directory (no reference) is never replaced: it is quarantined and
+ // this stage refuses; the next stage publishes the validated bytes.
  await rm(object, { recursive: true }); await mkdir(object, { mode: 0o700 });
  expect(await refusal(serve(f))).toBe("stage_conflict");
+ expect(existsSync(object)).toBe(false);
+ const [quarantined] = await f.leftovers();
+ expect(quarantined).toMatch(new RegExp(`^\\.invalid-${now + 7 * DAY}-`));
+ expect(await readdir(join(f.store, quarantined!))).toEqual([]);
+ expect("staged" in await serve(f)).toBe(true);
+ expect(await readFile(join(object, "source.bundle"))).toEqual(f.bytes);
  await rm(object, { recursive: true });
  // A lock file another user could open or swap is unsafe, never used.
  await chmod(join(f.store, STORE_LOCK), 0o644);
