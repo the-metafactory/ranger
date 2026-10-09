@@ -9,7 +9,7 @@ import { DiscordAnnouncer, type AnnounceContext, type AnnounceResult } from "./a
 import { BudgetDeferral, budgetPolicy } from "./budget.ts";
 import { readFrontier } from "./frontier-cache.ts";
 import { GRAPH_CALL_TIMEOUT_MS } from "./graph.ts";
-import { graphClaim, type ClaimResult } from "./graph-write.ts";
+import { GraphWriteError, graphClaim, type ClaimResult } from "./graph-write.ts";
 import {
  assertWriteIdentity,
  WriteGateError,
@@ -509,19 +509,31 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
        continue;
       }
 
-      const outcome = await claimNode({
-       journal,
-       map,
-       node,
-       lane: laneOf(node.id),
-       botIdentity,
-       token,
-       cliEntry,
-       configPath: ctx.configPath,
-       spawnRunNode: ctx.spawnRunNode,
-       now: ctx.now,
-       owned,
-      });
+      let outcome: ClaimNodeOutcome;
+      try {
+       outcome = await claimNode({
+        journal,
+        map,
+        node,
+        lane: laneOf(node.id),
+        botIdentity,
+        token,
+        cliEntry,
+        configPath: ctx.configPath,
+        spawnRunNode: ctx.spawnRunNode,
+        now: ctx.now,
+        owned,
+       });
+      } catch (error) {
+       // A failed claim is this node's error, not the map's (node #163): soma
+       // refuses a blocked node with plain text, indistinguishable from any
+       // other claim failure, so the next candidate is still claimed. Lock,
+       // lease and budget failures are not GraphWriteErrors and still end
+       // the map's claim phase.
+       if (!(error instanceof GraphWriteError)) throw error;
+       errors.push(`#${node.id} claim failed (${error.message}) — skipped`);
+       continue;
+      }
       if (outcome.messageId !== null) mapResult.announced.push(node.id);
       if (!outcome.claimed) {
        errors.push(outcome.error);
