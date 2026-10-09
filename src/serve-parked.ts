@@ -1,5 +1,6 @@
-import { isGithubRepo, nodeKey } from "./forge-ref.ts";
-import { changeRequestUrl, nodeUrl } from "./forge-text.ts";
+import { isGithubRepo, nodeKey, parseForgeRef } from "./forge-ref.ts";
+import { changeRequestLabel, changeRequestNoun, changeRequestUrl, nodeUrl } from "./forge-text.ts";
+import type { MergeState } from "./forge.ts";
 /**
  * `ranger serve`'s "Needs you" section (node #54): every journal worker row
  * that ended parked or failed, and every awaiting-merge row labelled
@@ -12,9 +13,10 @@ import { changeRequestUrl, nodeUrl } from "./forge-text.ts";
  *
  * **Actions stay out of process.** Nothing here writes the journal or the
  * graph: a resume spawns the existing `ranger resume-node` verb, a merge runs
- * `gh` with the machine account's token and config dropped, so gh uses the
- * login stored under this user's HOME (the principal's, on the principal's
- * machine; nothing here checks which account that is), and a session opens
+ * `gh` (`glab api` on a GitLab map, node #132) with the machine account's
+ * tokens and config dropped, so the CLI uses the login stored under this
+ * user's HOME (the principal's, on the principal's machine; nothing here
+ * checks which account that is), and a session opens
  * iTerm2 the way the grilling button does, in the map's `localCheckout` only:
  * the worker's worktree belongs to the machine-account clone. A queued resume
  * and its cancel run `ranger resume-node --when-free` / `--cancel` (node
@@ -221,7 +223,7 @@ export function classifyReason(
 
 // ---- the entries ----
 
-/** A PR as the dashboard last read it (REST, under the read-only gate). */
+/** A PR or MR as the dashboard last read it (REST, under the read-only gate). */
 export interface PrView {
  number: number;
  url: string;
@@ -229,8 +231,13 @@ export interface PrView {
  merged: boolean;
  draft: boolean;
  headSha: string;
- /** GitHub's mergeability; null while it is still computing. */
+ /** GitHub's mergeability; null while it is still computing. On GitLab, read off `mergeState`. */
  mergeable: boolean | null;
+ /** GitLab only: the port's merge state, and GitLab's own word for it. Absent on GitHub. */
+ mergeState?: MergeState;
+ mergeDetail?: string;
+ /** GitLab only: the MR is `locked`, being merged right now. */
+ merging?: true;
  /**
   * Check runs on the head: none yet, still running, any failed, all passed
   * but none concluded success, green (all passed, at least one success),
@@ -295,9 +302,27 @@ export function workflowRunsFromPages(raw: unknown, sha: string): { status: stri
  return [...latest.values()].map(({ status, conclusion }) => ({ status, conclusion }));
 }
 
-/** Why a PR cannot be merged from the dashboard, or null when it can. */
-export function mergeRefusal(pr: PrView | null): string | null {
- if (pr === null) return "the PR has not been read yet";
+/** Why GitLab's merge state offers no tap, or null when it is `mergeable`. */
+function mergeStateRefusal(state: MergeState, detail: string | undefined): string | null {
+ const said = detail === undefined ? "" : ` (${detail})`;
+ switch (state) {
+  case "mergeable": return null;
+  case "needs-rebase": return `GitLab needs the MR rebased onto its target${said}: the merge desk rebases it, not the dashboard`;
+  case "conflict": return `the MR conflicts with its target${said}: the merge desk sends it back for a base merge and a new review round`;
+  case "blocked": return `GitLab blocks the merge${said}`;
+  case "pending": return `GitLab is still checking whether the MR can merge${said}`;
+  case "unknown": return `GitLab's merge status is unknown${said}`;
+ }
+}
+
+/**
+ * Why a PR (an MR on GitLab) cannot be merged from the dashboard, or null
+ * when it can. `noun` names an unread one; a read GitLab MR carries its
+ * merge state and says MR itself.
+ */
+export function mergeRefusal(pr: PrView | null, noun: "PR" | "MR" = "PR"): string | null {
+ if (pr === null) return `the ${noun} has not been read yet`;
+ if (pr.mergeState !== undefined) return mrRefusal(pr, pr.mergeState);
  if (pr.merged) return "the PR is already merged";
  if (pr.state !== "open") return "the PR is closed";
  if (pr.draft) return "the PR is a draft: mark it ready first";
@@ -312,6 +337,23 @@ export function mergeRefusal(pr: PrView | null): string | null {
  if (pr.ci !== "green") return `CI is ${pr.ci}`;
  return null;
 }
+
+/** `mergeRefusal` for a GitLab MR: any merge state but `mergeable` offers no tap. */
+function mrRefusal(mr: PrView, state: MergeState): string | null {
+ if (mr.merged) return "the MR is already merged";
+ if (mr.merging) return "GitLab is merging the MR now";
+ if (mr.state !== "open") return "the MR is closed";
+ if (mr.draft) return "the MR is a draft: mark it ready first";
+ const held = mergeStateRefusal(state, mr.mergeDetail);
+ if (held !== null) return held;
+ if (!SHA_PATTERN.test(mr.headSha)) return "the MR head is unknown";
+ if (mr.ci === "unreadable") return "the pipeline could not be read";
+ if (mr.ci !== "green") return `the pipeline is ${mr.ci}`;
+ return null;
+}
+
+/** The GitLab merge states the merge desk acts on: a send-back, or a rebase. */
+export const DESK_MERGE_STATES: readonly MergeState[] = ["conflict", "needs-rebase"];
 
 export interface NeedsYouMap {
  key: string;
@@ -333,8 +375,13 @@ export interface NeedsYouEntry {
  status: "parked" | "failed" | "awaiting-merge";
  endedAt: string | null;
  reason: Reason;
- /** `error`: the last failed read of the PR, while `view` is unread. */
- pr: { number: number; url: string; view: PrView | null; error: string | null } | null;
+ /**
+  * `error`: the last failed read of the PR, while `view` is unread.
+  * `label` names it in its forge's words, "PR #N" or "MR !N" (node #132).
+  */
+ pr: { number: number; url: string; label: string; noun: "PR" | "MR"; view: PrView | null; error: string | null } | null;
+ /** The map's forge: the page words a GitLab card's merge and link by it. */
+ forge: "github" | "gitlab";
  sage: SageRound | null;
  /**
   * Whether the last sage round read the PR's current head: false when the
@@ -480,7 +527,8 @@ function rowEntries(
   const events = inputs.events(row.repo, row.nodeId);
   const view = row.prNumber === null ? null : inputs.prs(row.repo, row.prNumber);
   const sage = lastSageRound(events);
-  const refused = row.prNumber === null ? "no PR" : mergeRefusal(view);
+  const noun = changeRequestNoun(row.repo);
+  const refused = row.prNumber === null ? `no ${noun}` : mergeRefusal(view, noun);
   // Only the principal's checkout, never the worker's worktree: that is a
   // worktree of the machine-account clone, whose files and git hooks the
   // worker controls (`servedMaps` refuses those clones for the same reason).
@@ -502,9 +550,12 @@ function rowEntries(
      : {
         number: row.prNumber,
         url: changeRequestUrl(row.repo, row.prNumber, view?.url),
+        label: changeRequestLabel(row.repo, row.prNumber),
+        noun,
         view,
         error: inputs.prError?.(row.repo, row.prNumber) ?? null,
        },
+   forge: parseForgeRef(row.repo).forge,
    sage,
    sageOnHead: sage === null || view === null || view.headSha === "" ? null : view.headSha.startsWith(sage.sha),
    probe: lastProbe(events),
@@ -516,7 +567,7 @@ function rowEntries(
     merge:
      refused === null && view !== null
       ? { offered: true, headSha: view.headSha }
-      : { offered: false, why: refused ?? "no PR" },
+      : { offered: false, why: refused ?? `no ${noun}` },
     session:
      cwd === undefined
       ? {
@@ -592,12 +643,24 @@ export function mergeEnv(env: Record<string, string | undefined>): Record<string
  return out;
 }
 
-/** `gh pr merge`, squash, pinned to the head the principal confirmed. */
+/**
+ * `gh pr merge`, squash, pinned to the head the principal confirmed. On
+ * GitLab, the merge endpoint under the principal's glab login (ranger issue
+ * #97 ruling Q6), squashed and pinned the same way: `sha` makes GitLab refuse
+ * a head that moved.
+ */
 export function mergeArgv(args: { repo: string; pr: number; sha: string }): string[] {
  if (!REPO_PATTERN.test(args.repo)) throw new Error(`bad repo: ${args.repo}`);
- if (!isGithubRepo(args.repo)) throw new Error(`GitLab merge is not implemented: ${args.repo}`);
  if (!Number.isInteger(args.pr) || args.pr <= 0) throw new Error(`bad PR: ${args.pr}`);
  if (!SHA_PATTERN.test(args.sha)) throw new Error(`bad head SHA: ${args.sha}`);
+ if (!isGithubRepo(args.repo)) {
+  const ref = parseForgeRef(args.repo);
+  return [
+   "glab", "api", "--hostname", ref.host, "-X", "PUT",
+   `projects/${encodeURIComponent(ref.path)}/merge_requests/${args.pr}/merge`,
+   "-f", "squash=true", "-f", `sha=${args.sha}`,
+  ];
+ }
  return ["gh", "pr", "merge", String(args.pr), "--repo", args.repo, "--squash", "--match-head-commit", args.sha];
 }
 
@@ -700,7 +763,8 @@ export interface ActionDeps {
   * Every check run on `sha`, read under the merge's own environment (the
   * `gh` account stored under HOME, machine credentials removed): the CI
   * state, or null when it cannot be read. Used when the dashboard's
-  * read-only token saw only the Actions runs.
+  * read-only token saw only the Actions runs, and before every GitLab merge
+  * (the pipeline verdict, under the principal's glab login).
   */
  verifyChecks?: (repo: string, sha: string, env: Record<string, string>) => Promise<PrView["ci"] | null>;
  exists: (path: string) => boolean;
@@ -870,18 +934,20 @@ async function runHeldAction(
   detached = true;
  } else if (kind === "merge") {
   if (!entry.actions.merge.offered) return refusal(409, entry.actions.merge.why);
-  if (typeof body.sha !== "string" || body.sha !== entry.actions.merge.headSha) {
-   return refusal(409, "the confirmed head SHA is not the PR's head: reload and confirm again");
-  }
   const pr = entry.pr as NonNullable<NeedsYouEntry["pr"]>;
+  if (typeof body.sha !== "string" || body.sha !== entry.actions.merge.headSha) {
+   return refusal(409, `the confirmed head SHA is not the ${pr.noun}'s head: reload and confirm again`);
+  }
   let live: PrView | null;
   try {
    live = await deps.readPr(entry.repo, pr.number);
   } catch (error) {
-   return refusal(502, `could not read PR #${pr.number} live: ${error instanceof Error ? error.message : String(error)}`);
+   return refusal(502, `could not read ${pr.label} live: ${error instanceof Error ? error.message : String(error)}`);
   }
-  const stale = mergeRefusal(live);
-  if (stale !== null && live?.mergeable === false && live.state === "open" && entry.status === "awaiting-merge" && deps.configPath !== undefined) {
+  const stale = mergeRefusal(live, pr.noun);
+  // GitLab's blocked or unknown is nothing the desk fixes; a conflict or a rebase is.
+  const deskFixes = live?.mergeState === undefined || DESK_MERGE_STATES.includes(live.mergeState);
+  if (stale !== null && live?.mergeable === false && deskFixes && live.state === "open" && entry.status === "awaiting-merge" && deps.configPath !== undefined) {
    // A conflict the page had not seen yet (another merge moved the base):
    // the desk's send-back fixes it, so run the desk now, not on the next tick.
    const desk = await deps.run(
@@ -897,13 +963,20 @@ async function runHeldAction(
   }
   if (stale !== null) return refusal(409, `read live: ${stale}`);
   if ((live as PrView).headSha !== body.sha) {
-   return refusal(409, "the PR head moved since the page read it: reload and confirm again");
+   return refusal(409, `the ${pr.noun} head moved since the page read it: reload and confirm again`);
   }
   env = mergeEnv(deps.env);
-  // The dashboard's token saw only the Actions runs: an external app's
-  // failing check would not be in them. Before merging, every check is read
-  // under the same gh account the merge itself runs as.
-  if ((live as PrView).ciSource === "actions") {
+  if (entry.forge === "gitlab") {
+   // The merge runs under the principal's glab login, not the read token the
+   // card was built with: the pipeline verdict at this head is re-read under
+   // that same login first, and only green merges.
+   const pipeline = deps.verifyChecks === undefined ? null : await deps.verifyChecks(entry.repo, body.sha, env);
+   if (pipeline === null) return refusal(409, "the pipeline could not be read under your glab login: merge it on GitLab");
+   if (pipeline !== "green") return refusal(409, `the pipeline at ${body.sha.slice(0, 8)}, read under your glab login, is ${pipeline}`);
+  } else if ((live as PrView).ciSource === "actions") {
+   // The dashboard's token saw only the Actions runs: an external app's
+   // failing check would not be in them. Before merging, every check is read
+   // under the same gh account the merge itself runs as.
    const full = deps.verifyChecks === undefined ? null : await deps.verifyChecks(entry.repo, body.sha, env);
    if (full === null) {
     return refusal(409, "only the Actions runs were readable, and every check could not be read under your login: merge it on GitHub");
