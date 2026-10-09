@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "../src/config.ts";
-import { captureViews, chooseViews, compareViews, fillViewsTemplate, freeViewsPort, loadViewsRecord, parseViewsDiff, redactViewsReason, saveViewsRecord, startViewsServer, viewsCard, viewsCardMessage, viewsComment, viewsDirectory, VIEWS_FAILURE_LOG, type CaptureViewsContext, type ViewsDependencies } from "../src/views.ts";
+import { captureViews, chooseViews, compareViews, fillViewsTemplate, freeViewsPort, loadViewsRecord, parseViewsDiff, redactViewsReason, redactViewsText, saveViewsRecord, startViewsServer, viewsCard, viewsCardMessage, viewsComment, viewsDirectory, VIEWS_FAILURE_LOG, type CaptureViewsContext, type ViewsDependencies } from "../src/views.ts";
 import { pidAlive, processGroupCommands, runCmd } from "../src/exec.ts";
 import { baseConfigLines } from "./support.ts";
 
@@ -222,7 +222,7 @@ describe("capture orchestration", () => {
   expect(record.reason).toEndWith("view-59");
   expect(loadViewsRecord(r.out, SHA)).toEqual(record);
   const log = readFileSync(join(r.out, VIEWS_FAILURE_LOG), "utf8");
-  expect(log).toContain("step: after2 capture\nexit: 1\n");
+  expect(log).toContain("step: after2 capture\nended: exit 1\n");
   expect(log).toContain("Error: page crashed at npc-arrival");
   expect(log).toContain(listing);
   expect(viewsComment(record, r.out)).toContain(`Full output of the failed step: \`${join(r.out, VIEWS_FAILURE_LOG)}\``);
@@ -241,21 +241,33 @@ describe("capture orchestration", () => {
   expect(record.reason).toEndWith("final error");
   expect(record.reason).not.toContain("listing");
   expect(record.reason.length).toBeLessThanOrEqual(1000);
-  expect(readFileSync(join(r.out, VIEWS_FAILURE_LOG), "utf8")).toContain("exit: timed out or was killed");
+  expect(readFileSync(join(r.out, VIEWS_FAILURE_LOG), "utf8")).toContain("ended: timed out or was killed");
  });
  test("a secret where the cut lands is redacted before shortening", async () => {
   const r = rig();
   const secret = "s3cr3t-".repeat(20);
   r.ctx.env.SESSION_TOKEN = secret;
   const token = "ghp_" + "Z".repeat(60);
-  for (let pad = 0; pad < 40; pad += 7) {
-   // stdout's tail is cut mid-way through each secret at some padding.
-   const stdout = `${secret} ${token} ${"x".repeat(pad)}\n${"y".repeat(800)}`;
+  // How much of stdout's end the reason keeps, measured on output with no secret in it.
+  r.ctx.dependencies!.run = async () => ({ code: 1, stdout: "y".repeat(3000), stderr: "refused" });
+  const probe = await captureViews(r.ctx);
+  if (probe?.status !== "failed") throw new Error("expected a failed record");
+  const kept = probe.reason.length - probe.reason.indexOf("stdout: …") - "stdout: …".length;
+  // secret fills offsets 0-139, token 141-204; each cut lands inside one of them, past the ghp_ prefix.
+  for (const cut of [5, 60, 120, 146, 170, 188]) {
+   const stdout = `${secret} ${token}\n${"y".repeat(kept + cut - 206)}`;
+   const fragment = stdout.slice(-kept).split(/[ \n]/)[0];
+   expect(stdout.length - kept).toBe(cut);
+   expect(fragment.length).toBeGreaterThanOrEqual(16);
+   expect(fragment).not.toStartWith("ghp_");
+   // Cut first and redact after, and the fragment would survive: this is what the test guards.
+   expect(redactViewsText(stdout.slice(-kept), r.ctx.env)).toContain(fragment);
    r.ctx.dependencies!.run = async () => ({ code: 1, stdout, stderr: "refused" });
    const record = await captureViews(r.ctx);
    if (record?.status !== "failed") throw new Error("expected a failed record");
    const published = [record.reason, viewsComment(record, r.out), readFileSync(join(r.out, VIEWS_FAILURE_LOG), "utf8")];
    for (const text of published) {
+    expect(text).not.toContain(fragment.slice(0, 16));
     expect(text).not.toContain(secret.slice(-16));
     expect(text).not.toContain(token.slice(-16));
    }

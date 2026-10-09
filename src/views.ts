@@ -30,6 +30,11 @@ export type ViewsRecord =
 /** A failed step's full stdout and stderr, redacted, beside the record (node #195). */
 export const VIEWS_FAILURE_LOG = "views-failure.log";
 const REASON_LIMIT = 1000;
+/** A shortened non-step reason keeps this much of its start, then the ellipsis, then its end. */
+const REASON_HEAD = 300;
+const ELLIPSIS = " … ";
+/** Below this much room a stdout tail says nothing, so the reason leaves it out. */
+const MIN_STDOUT_ROOM = 20;
 
 export function viewsDirectory(journalPath: string, repo: string, nodeId: string, sha: string): string {
  if (!/^[\w.-]+\/[\w.-]+$/.test(repo) || repo.split("/").some(p => p === "." || p === "..") || !/^\d+$/.test(nodeId) || !SHA.test(sha)) {
@@ -108,12 +113,18 @@ export function viewsTable(rows: readonly ViewDiff[]): string {
  ].join("\n");
 }
 
+/** Where a failed record's saved step output lives, when it has one. */
+export function failureLogPath(record: ViewsRecord, out: string): string | undefined {
+ return record.status === "failed" && record.output ? join(out, record.output) : undefined;
+}
+
 export function viewsComment(record: ViewsRecord, out: string): string {
+ const log = failureLogPath(record, out);
  return [
   `<!-- ranger:views sha=${record.sha} -->`,
   "## Visual evidence (principal's eye is the gate)",
   record.status === "ok" ? viewsTable(record.rows) : `Sheet could not be made: ${record.reason}`,
-  ...(record.status === "failed" && record.output ? [`Full output of the failed step: \`${join(out, record.output)}\``] : []),
+  ...(log !== undefined ? [`Full output of the failed step: \`${log}\``] : []),
   `Full local sheet: \`${join(out, "index.html")}\``,
  ].join("\n\n");
 }
@@ -161,7 +172,8 @@ export async function viewsCard(out: string, sha: string): Promise<{ summary: st
  const record = loadViewsRecord(out, sha);
  if (record === undefined) return { summary: "Sheet could not be made: no capture record for this head.", files: [] };
  if (record.status === "failed") {
-  const output = record.output ? `\nFull output of the failed step: ${join(out, record.output)}` : "";
+  const log = failureLogPath(record, out);
+  const output = log !== undefined ? `\nFull output of the failed step: ${log}` : "";
   return { summary: `Sheet could not be made: ${record.reason}${output}`, files: [] };
  }
  const sizes = (view: string): [number, number] => [pngSize(out, "before", view), pngSize(out, "after", view)];
@@ -223,7 +235,8 @@ export function redactViewsText(text: string, env: NodeJS.ProcessEnv): string {
 /** Keeps the start, which names what failed, and the end, where the output usually says why. */
 export function redactViewsReason(reason: string, env: NodeJS.ProcessEnv): string {
  const text = redactViewsText(reason, env);
- return text.length <= REASON_LIMIT ? text : `${text.slice(0, 300)} … ${text.slice(-(REASON_LIMIT - 303))}`;
+ if (text.length <= REASON_LIMIT) return text;
+ return `${text.slice(0, REASON_HEAD)}${ELLIPSIS}${text.slice(-(REASON_LIMIT - REASON_HEAD - ELLIPSIS.length))}`;
 }
 
 /** A views command that exited non-zero, timed out or was killed. */
@@ -233,8 +246,13 @@ export class ViewsStepError extends Error {
  }
 }
 
+/** How a step ended: its exit code, or that it never exited on its own. */
+function exitText(code: number): string {
+ return code === -1 ? "timed out or was killed" : `exit ${code}`;
+}
+
 function stepHeadline(step: string, code: number): string {
- return `${step} ${code === -1 ? "timed out or was killed" : `failed (exit ${code})`}`;
+ return `${step} ${code === -1 ? exitText(code) : `failed (${exitText(code)})`}`;
 }
 
 const tail = (text: string, room: number): string => text.length <= room ? text : `…${text.slice(-(room - 1))}`;
@@ -255,7 +273,7 @@ export function viewsStepReason(error: ViewsStepError, env: NodeJS.ProcessEnv): 
   room -= parts[0].length + 1;
  }
  const label = "stdout: ";
- if (stdout !== "" && room > label.length + 20) parts.push(label + tail(stdout, room - label.length));
+ if (stdout !== "" && room > label.length + MIN_STDOUT_ROOM) parts.push(label + tail(stdout, room - label.length));
  return head + (parts.join("\n") || "no output");
 }
 
@@ -267,7 +285,7 @@ function saveViewsFailureLog(out: string, error: ViewsStepError, env: NodeJS.Pro
   rmSync(file, { force: true });
   writeFileSync(file, redactViewsText([
    `step: ${error.step}`,
-   `exit: ${error.result.code === -1 ? "timed out or was killed" : error.result.code}`,
+   `ended: ${exitText(error.result.code)}`,
    "----- stderr",
    error.result.stderr,
    "----- stdout",
