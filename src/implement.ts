@@ -869,7 +869,7 @@ function fixCheckpoint(probe: string, sha: string): string {
  return `base-green-${stem}-${sha.slice(0, 8)}`;
 }
 
-function fixNodeSpec(ctx: ImplementContext, probe: string, checks: string[], sha: string, pr: { number: number; url: string }): AddSpec {
+export function fixNodeSpec(ctx: ImplementContext, probe: string, checks: string[], sha: string, pr: { number: number; url: string }): AddSpec {
  const base = ctx.map.base;
  return {
   title: `Make ${probe} pass on ${base} again`,
@@ -2652,7 +2652,7 @@ function tail(result: RunResult): string {
 }
 
 /** The node title, refused if it would carry a closing keyword into the squash message. */
-function prTitle(node: NodeResult): string {
+export function prTitle(node: NodeResult): string {
  const title = `${node.node.title} (node #${node.ref.id})`;
  const hit = findClosingKeyword(title);
  if (hit !== null) {
@@ -2667,7 +2667,7 @@ function nodeLink(ctx: ImplementContext): string {
  return `orienteer node ${ctx.map.repo} #${ctx.node.ref.id}`;
 }
 
-function draftBody(ctx: ImplementContext): string {
+export function draftBody(ctx: ImplementContext): string {
  return [
   `Draft by ranger's implement lane for ${nodeLink(ctx)}.`,
   "",
@@ -2696,7 +2696,7 @@ export function baseRedNote(probe: Pick<RecordedProbe, "baseRed" | "baseRedCache
   (confirmation === undefined ? "" : ` ${unconfirmedBaseNote(confirmation.sha, confirmation.probes, confirmation.exit)}`);
 }
 
-function readyBody(
+export function readyBody(
  ctx: ImplementContext,
  final: RecordedReview,
  rounds: number,
@@ -2719,7 +2719,7 @@ function readyBody(
  ].join("\n");
 }
 
-function closeResolution(
+export function closeResolution(
  ctx: ImplementContext,
  pr: ChangeRequest,
  final: RecordedReview | undefined,
@@ -2755,7 +2755,7 @@ function ratificationText(ctx: ImplementContext, pr: ChangeRequest): string {
   : `${pr.mergedBy ?? "ranger"} merged PR #${pr.iid} under the principal's standing grant (2026-10-03: ranger merges nodes that need no visual judgment)`;
 }
 
-function gistLine(title: string, pr: number): string {
+export function gistLine(title: string, pr: number): string {
  const raw = `${title} — PR #${pr}`;
  return raw.length > 140 ? `${raw.slice(0, 137)}…` : raw;
 }
