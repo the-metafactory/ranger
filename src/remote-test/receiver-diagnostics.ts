@@ -6,16 +6,16 @@ import { z } from "zod";
 
 export const DIAGNOSTIC_LIMITS = { recordBytes: 1024, fileBytes: 4 * 1024 ** 2, entries: 4096, retentionMs: 7 * 86400_000 } as const;
 // Persisted record-version-1 stages are append-only too. Tightening pairs needs a new version.
-const stages = ["config", "root", "header", "request", "lookup", "upload", "executor_boundary", "receipt", "cleanup"] as const;
+const stages = ["config", "root", "header", "request", "lookup", "upload", "executor_boundary", "receipt", "cleanup", "source_store"] as const;
 // Persisted record-version-1 vocabulary: append only; never remove or rename codes.
-const codes = ["invalid_config", "unsafe_path", "incomplete_header", "header_limit", "malformed_request", "profile_not_approved", "job_invalid", "expired", "unexpected_payload", "upload_size", "upload_digest", "upload_no_progress", "interrupted", "invalid_receipt", "unknown", "EACCES", "EPERM", "ENOENT", "EEXIST", "ENOSPC", "EDQUOT", "EIO", "EROFS", "EMFILE", "ENFILE"] as const;
+const codes = ["invalid_config", "unsafe_path", "incomplete_header", "header_limit", "malformed_request", "profile_not_approved", "job_invalid", "expired", "unexpected_payload", "upload_size", "upload_digest", "upload_no_progress", "interrupted", "invalid_receipt", "unknown", "EACCES", "EPERM", "ENOENT", "EEXIST", "ENOSPC", "EDQUOT", "EIO", "EROFS", "EMFILE", "ENFILE", "source_invalid", "stage_conflict", "stage_capacity", "stage_missing"] as const;
 export type DiagnosticStage = typeof stages[number];
 export type DiagnosticCode = typeof codes[number];
 const failureSchema = z.object({ stage: z.enum(stages), code: z.enum(codes) }).strict();
 export type DiagnosticFailure = z.infer<typeof failureSchema>;
 export const ReceiverDiagnosticSchema = z.object({
  version: z.literal(1), id: z.string().uuid(), time: z.number().int().positive().safe(),
- operation: z.enum(["submit", "status"]).nullable(),
+ operation: z.enum(["submit", "status", "stage"]).nullable(),
  job: z.object({ jobId: z.string().uuid(), generation: z.number().int().positive().safe() }).strict().nullable(),
  primary: failureSchema, cleanup: failureSchema.optional(),
 }).strict();
