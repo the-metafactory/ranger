@@ -37,6 +37,8 @@ interface Mr {
 function fakeGitLab(mr: Mr) {
  const calls: string[] = [];
  const merges: { n: number; sha: string; title: string }[] = [];
+ /** The gated head each rebase was asked from. */
+ const rebasedFrom: string[] = [];
  const forbidden = (name: string) => async () => { throw new Error(`unexpected GitLab call: ${name}`); };
  const port: ForgePort = {
   findPrByHead: forbidden("findPrByHead"),
@@ -56,8 +58,9 @@ function fakeGitLab(mr: Mr) {
   ciVerdictFor: async () => { calls.push("ciVerdictFor"); return mr.ci; },
   issueLabels: async (_repo, issue) => { calls.push(`issueLabels:${issue}`); return mr.labels; },
   squashRefusal: async () => { calls.push("squashRefusal"); return mr.squash; },
-  rebasePr: async () => {
+  rebasePr: async (_repo, _n, sha) => {
    calls.push("rebasePr");
+   rebasedFrom.push(sha);
    if (mr.rebase.status === "head-moved") { mr.head = mr.rebase.headSha; mr.mergeState = "pending"; mr.ci = RUNNING; }
    return mr.rebase;
   },
@@ -68,7 +71,7 @@ function fakeGitLab(mr: Mr) {
    return mr.merge;
   },
  };
- return { port, calls, merges };
+ return { port, calls, merges, rebasedFrom };
 }
 
 function needsRebase(over: Partial<Mr> = {}): Mr {
@@ -121,6 +124,7 @@ describe("node #126 — gitlab-rebase-squash-merge: the merge desk on a GitLab m
    expect(await r.desk(gl.port)).toMatchObject({ pending: ["96"], merged: [], parked: [], errors: [] });
    expect(gl.calls).toEqual(["getPr", "listComments", "ciVerdictFor", "issueLabels:96", "squashRefusal", "rebasePr"]);
    expect(gl.merges).toEqual([]);
+   expect(gl.rebasedFrom).toEqual([GATED]);
    expect(r.events("rebased").map((e) => e.detail)).toEqual([expect.stringMatching(new RegExp(`^from=${GATED} to=${REBASED}`))]);
    expect(r.row()).toMatchObject({ status: "awaiting-merge" });
 
@@ -214,6 +218,41 @@ describe("node #126 — gitlab-rebase-squash-merge: the merge desk on a GitLab m
    mr.head = "c".repeat(40);
    mr.mergeState = "mergeable";
    mr.ci = GREEN;
+   expect(await r.desk(gl.port)).toMatchObject({ parked: ["96"], resumed: [] });
+   expect(r.row()?.outcome).toContain("review-clean");
+  } finally { r.close(); }
+ });
+
+ test("a head move the forge does not confirm as the rebase parks: nothing recorded as ranger's, nothing merged", async () => {
+  const r = rig();
+  try {
+   const reason = `the head of !9 moved from ${GATED.slice(0, 8)} to ${REBASED.slice(0, 8)}, but GitLab does not list the same commits there (message, author, author date): not counted as the rebase`;
+   const gl = fakeGitLab(needsRebase({ rebase: { status: "unconfirmed", reason } }));
+   expect(await r.desk(gl.port)).toMatchObject({ parked: ["96"], merged: [], pending: [] });
+   expect(gl.merges).toEqual([]);
+   expect(r.events("rebased")).toEqual([]);
+   expect(r.row()?.outcome).toContain(`${reason}. Ranger does not take the moved head for its rebase`);
+  } finally { r.close(); }
+ });
+
+ test("a landing of a rebase ranger never asked for parks, even when the forge lists the same commits", async () => {
+  const r = rig();
+  try {
+   const gl = fakeGitLab(needsRebase({ rebase: { status: "head-moved", headSha: REBASED, requested: false } }));
+   expect(await r.desk(gl.port)).toMatchObject({ parked: ["96"], merged: [], pending: [] });
+   expect(r.events("rebased")).toEqual([]);
+   expect(r.row()?.outcome).toContain(`a rebase ranger did not ask for moved the head of MR !9 from ${GATED.slice(0, 8)} to ${REBASED.slice(0, 8)}`);
+  } finally { r.close(); }
+ });
+
+ test("a head that moved after ranger only waited on somebody else's rebase is not ranger's: it parks", async () => {
+  const r = rig();
+  try {
+   const mr = needsRebase({ rebase: { status: "pending", reason: "GitLab is still rebasing !9 after 2 checks", requested: false } });
+   const gl = fakeGitLab(mr);
+   expect(await r.desk(gl.port)).toMatchObject({ pending: ["96"], parked: [] });
+   mr.head = REBASED;
+   mr.mergeState = "mergeable";
    expect(await r.desk(gl.port)).toMatchObject({ parked: ["96"], resumed: [] });
    expect(r.row()?.outcome).toContain("review-clean");
   } finally { r.close(); }

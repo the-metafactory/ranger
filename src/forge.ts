@@ -71,11 +71,22 @@ export type MergeOutcome =
 
 /**
  * What a rebase request did. It never merges. `requested` says whether this
- * call sent a rebase request, or only waited on one an earlier pass started.
+ * call sent a rebase request, or only waited on a rebase already running
+ * (which the call cannot tell apart from one somebody else started).
  */
 export type RebaseOutcome =
- /** The forge rebased the source branch: the head moved to `headSha`. */
+ /**
+  * The head moved from the gated SHA to `headSha`, and the forge shows the
+  * same commits there (message, author, author date, in order): a rebase,
+  * not new work.
+  */
  | { status: "head-moved"; headSha: string; requested: boolean }
+ /**
+  * The head is not where a rebase of the gated SHA would leave it: it had
+  * already moved before the call, or the commits differ after the move (a
+  * push). Nothing is attributed to the rebase.
+  */
+ | { status: "unconfirmed"; reason: string }
  /** The head has not moved yet (still rebasing, or not started): re-read next pass. */
  | { status: "pending"; reason: string; requested: boolean }
  /** The forge could not rebase (a conflict, a refusal); `reason` is its message. */
@@ -95,9 +106,10 @@ export interface ForgePort<ReadCredential = string, WriteCredential = string> ex
  mergePr(repo: string, n: number, sha: string, title: string, token: WriteCredential): Promise<MergeOutcome>;
  /**
   * Rebase the source branch onto its target, for a forge that reports
-  * `needs-rebase` (GitLab under `rebase_merge`). GitHub never reports it.
+  * `needs-rebase` (GitLab under `rebase_merge`), from `sha`, the head the
+  * merge gate passed at. GitHub never reports it.
   */
- rebasePr?(repo: string, n: number, token: WriteCredential): Promise<RebaseOutcome>;
+ rebasePr?(repo: string, n: number, sha: string, token: WriteCredential): Promise<RebaseOutcome>;
  /** Why this forge project cannot take a squash merge, or null when it can. Read before any merge write. */
  squashRefusal?(repo: string, token: ReadCredential): Promise<string | null>;
  postComment(repo: string, n: number, body: string, token: WriteCredential): Promise<number>;

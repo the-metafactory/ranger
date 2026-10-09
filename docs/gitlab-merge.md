@@ -35,16 +35,26 @@ that merge commit carries no change. See "What lands on the target".
 
   glab exits nonzero on an HTTP error but still prints the status line,
   so the status decides the result. Subprocess output is never surfaced.
-- `rebaseAndWait(repo, iid, { read, write })` first reads
+- `rebaseAndWait(repo, iid, sha, { read, write })` takes `sha`, the head
+  the merge gate passed at. It first reads
   `GET …/merge_requests/:iid?include_rebase_in_progress=true` under the
-  read credential. If a rebase is already running (an earlier pass started
-  it), it waits on that rebase and sends no new request. Otherwise it sends
-  `PUT …/merge_requests/:iid/rebase`. It then polls the same read, up to
-  2 checks 1.5 s apart. The wait is short on purpose: the desk re-reads
-  the head next pass, and a long wait would hold up later rows. The
-  results:
+  read credential. A head that is no longer `sha` is `unconfirmed`, and
+  nothing is sent. Otherwise it reads the MR's commits
+  (`GET …/merge_requests/:iid/commits`) as they stand at `sha`. If a
+  rebase is already running, it waits on that rebase and sends no new
+  request; it cannot tell whether an earlier ranger pass or somebody else
+  started it. Otherwise it sends `PUT …/merge_requests/:iid/rebase`. It
+  then polls the state read, up to 2 checks 1.5 s apart. The wait is
+  short on purpose: the desk re-reads the head next pass, and a long wait
+  would hold up later rows. The results:
   - A head that moved is `head-moved` with the new SHA, even beside a
-    stale `merge_error`.
+    stale `merge_error`, but only when GitLab lists the same commits at
+    the new head as at `sha`: the same count, and each commit's message,
+    author name, author email and author date, in order. A server-side
+    rebase keeps those and rewrites only ids and committer. Any other moved
+    head (a commit added or changed, or a commit list at another head) is
+    `unconfirmed`. The check proves no more than that: an amend that keeps
+    a commit's message and author date passes it.
   - A `merge_error` this rebase left on an unchanged head, or a request
     GitLab refuses (403, 405, 422), is `not-mergeable`. A `merge_error`
     that was already there before the call is stale: the result is
@@ -57,9 +67,8 @@ that merge commit carries no change. See "What lands on the target".
     rebasing at the bound, or a finished rebase that left the head where
     it was, is `pending`.
 
-  Every outcome but `not-mergeable` carries `requested`: whether this
-  call sent the rebase request, or only waited on a running one. It never
-  merges.
+  `head-moved` and `pending` carry `requested`: whether this call sent
+  the rebase request, or only waited on a running one. It never merges.
 
 `gitlabForgePort(config)` wraps the port in the lanes' string-credential
 `ForgePort` shape:
@@ -78,13 +87,15 @@ that merge commit carries no change. See "What lands on the target".
 On a GitLab map, the desk acts in this order:
 
 1. The send-back checks run first. One check is GitLab-specific: no review
-   at the head, and the latest `rebased` journal event goes from the head
-   of the latest review to the current head, a landing ranger saw itself.
-   That case is ranger's own rebase, so the row goes back to run-node for
-   a fresh round. It is not parked.
+   at the head, ranger requested a rebase from the latest review's head,
+   and the latest `rebased` journal event goes from that head to the
+   current head (a landing ranger saw and confirmed, step 5). That case is
+   ranger's own rebase, so the row goes back to run-node for a fresh
+   round. It is not parked.
    - A review never carries across a rebase.
    - A head moved by anyone else still fails `review-clean` and parks, as
-     on GitHub. That includes a push past ranger's rebase head.
+     on GitHub. That includes a push past ranger's rebase head, and a head
+     that moved after ranger only waited on a rebase it never asked for.
    - A head that moved while ranger knew its rebase only as `pending`
      (the rebase outlasted the 3 s wait and landed between passes) also
      goes back for a fresh round. Nothing ranger reads tells its rebase
@@ -104,7 +115,11 @@ On a GitLab map, the desk acts in this order:
    event through `journal.recordRebase`, which `journal.listRebases` reads
    back as `{ from, to, requested, note }`. Its prose says the head moved only on
    `head-moved`; on `pending` it says the rebase was asked for. The row
-   stays pending, and nothing merges in that pass. The event's prefix
+   stays pending, and nothing merges in that pass. `to` is recorded only
+   for a `head-moved` landing of a rebase ranger asked for from that head,
+   in this pass or an earlier one. An `unconfirmed` move, or a landing of a
+   rebase ranger never asked for, parks with a card and records no
+   `rebased` event. The event's prefix
    records `from`, `to` (only when ranger saw the head move) and `wait`
    (when no request was sent). From one head, ranger sends at most 3
    requests and spends at most 10 passes (requests plus waits), then
@@ -134,10 +149,11 @@ lane-routing node lands, so the desk tests call `runMergeDesk` directly.
 
 - `test/gitlab-port-merge.test.ts` uses a stubbed glab boundary. It covers
   the merge arguments, status mapping, squash option, bounded rebase poll,
-  credential separation, and that no credential is echoed.
+  the commit check on a moved head, credential separation, and that no credential is echoed.
 - `test/gitlab-merge-desk.test.ts` drives the desk with a fake GitLab
   port through needs-rebase → pending → mergeable → merged. It also covers
-  each refusal path, the needs-eye hold-back, and port selection.
+  each refusal path, a head move ranger cannot attribute (it parks), the
+  needs-eye hold-back, and port selection.
 
 Neither test makes a live call. The assumption that crisis-simulator's
 squash option permits `squash=true` has one pre-merge check:

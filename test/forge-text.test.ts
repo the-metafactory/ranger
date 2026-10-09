@@ -45,7 +45,9 @@ import { needsYouEntries, resumeQueueViews } from "../src/serve-parked.ts";
 /**
  * Node #129: ranger names a change request the way its forge does. The
  * GitHub renderings below were pinned against the code before the forge-text
- * module existed; they must stay byte-identical.
+ * module existed, and only a deliberate wording fix may change them. One has
+ * (node #126): an autoMerge ready body no longer says "ranger never merges."
+ * beside "Ranger squash-merges this itself", which contradicted it.
  */
 
 const GITHUB = "acme/widgets";
@@ -195,7 +197,7 @@ function parkedTexts(repo: string): { queue: string[]; needsYou: unknown[] } {
  return { queue, needsYou };
 }
 
-describe("node #129 — GitHub renderings stay byte-identical", () => {
+describe("node #129 — GitHub renderings stay pinned (one wording fix, node #126)", () => {
  test("implement-lane bodies and receipts", () => {
   expect(implementTexts(GITHUB)).toMatchInlineSnapshot(`
     {

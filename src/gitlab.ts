@@ -239,7 +239,33 @@ export class GitLabReadPort implements ForgeReadPort<ResolvedToken> {
   if (mergeError !== null && typeof mergeError !== "string") invalid(endpoint, "merge_error");
   return { inProgress: r.rebase_in_progress, mergeError: mergeError === null ? null : bounded(mergeError), headSha: string(r.sha, endpoint, "sha") };
  }
+
+ /**
+  * The MR's commits as GitLab lists them, newest first: the head they end
+  * at, and each commit's message and authorship. A server-side rebase keeps
+  * the authorship and rewrites only ids and committer; a push changes the list.
+  */
+ async mrCommits(repo: string, n: number, token: ResolvedToken): Promise<{ head: string | null; authored: string[] }> {
+  const endpoint = `${this.project(repo)}/merge_requests/${id(n, repo, "iid")}/commits`;
+  let head: string | null = null;
+  const authored: string[] = [];
+  for await (const page of this.pages(repo, token, endpoint)) {
+   for (const raw of page.rows) {
+    const r = object(raw, page.endpoint);
+    head ??= string(r.id, page.endpoint, "commit.id");
+    authored.push(JSON.stringify(AUTHORED.map((field) => {
+     // A commit message may be empty; a missing field still fails closed.
+     if (typeof r[field] !== "string") invalid(page.endpoint, `commit.${field}`);
+     return r[field];
+    })));
+   }
+  }
+  return { head, authored };
+ }
 }
+
+/** The commit fields a rebase keeps: what `mrCommits` compares across one. */
+const AUTHORED = ["message", "author_name", "author_email", "authored_date"] as const;
 
 /** Write failures never echo subprocess output or retry an uncertain mutation. */
 export class GitLabWriteError extends Error {
@@ -273,6 +299,17 @@ const REBASE_REFUSED = [403, 405, 422];
 
 /** Merge statuses that are GitLab declining (not allowed, not acceptable, unprocessable): the row parks. */
 const MERGE_REFUSED = [405, 406, 422];
+
+/**
+ * How GitLab answered a write: 409 is its conflict, a status in `refused`
+ * its refusal, a success "ok"; any other status is a fault and throws.
+ */
+function answered(status: number, refused: readonly number[], fault: () => Error): "conflict" | "refused" | "ok" {
+ if (status === 409) return "conflict";
+ if (refused.includes(status)) return "refused";
+ if (!ok(status)) throw fault();
+ return "ok";
+}
 
 /** GitLab's own `message` from an error response, bounded; never subprocess output. */
 function forgeMessage(body: unknown, status: number): string {
@@ -340,9 +377,9 @@ export class GitLabPort extends GitLabReadPort implements ForgePort<ResolvedToke
   const { status, body } = await this.answer(repo, token, endpoint, [
    "-F", "squash=true", "-f", `sha=${sha}`, "-f", `squash_commit_message=${title} (!${n})`,
   ]);
-  if (status === 409) return { status: "head-moved", reason: `!${n} is no longer at ${sha.slice(0, 8)} (${forgeMessage(body, status)})` };
-  if (MERGE_REFUSED.includes(status)) return { status: "not-mergeable", reason: `GitLab declined to merge !${n}: ${forgeMessage(body, status)}` };
-  if (!ok(status)) throw new GitLabWriteError(`merge failed (${forgeMessage(body, status)})`, endpoint, status);
+  const answer = answered(status, MERGE_REFUSED, () => new GitLabWriteError(`merge failed (${forgeMessage(body, status)})`, endpoint, status));
+  if (answer === "conflict") return { status: "head-moved", reason: `!${n} is no longer at ${sha.slice(0, 8)} (${forgeMessage(body, status)})` };
+  if (answer === "refused") return { status: "not-mergeable", reason: `GitLab declined to merge !${n}: ${forgeMessage(body, status)}` };
   return this.decodeWrite(endpoint, () => {
    const r = object(body, endpoint);
    if (r.state !== "merged") invalid(endpoint, "state");
@@ -356,22 +393,38 @@ export class GitLabPort extends GitLabReadPort implements ForgePort<ResolvedToke
  }
 
  /**
-  * Ask GitLab to rebase the MR's source branch onto its target, then poll
-  * `rebase_in_progress` (read credential) a bounded number of times. Never
-  * merges: a finished rebase moves the head, which the merge gate must see.
+  * Ask GitLab to rebase the MR's source branch from `sha`, the gated head,
+  * onto its target, then poll `rebase_in_progress` (read credential) a
+  * bounded number of times. Never merges: a finished rebase moves the head,
+  * which the merge gate must see.
+  *
+  * A rebase already running is waited on, not requested again. Whose it is
+  * this call cannot tell: `requested: false` says so, and the desk decides.
+  * A moved head counts as the rebase only when GitLab lists the same commits
+  * there (message, author, author date, in order) as at `sha`; anything else
+  * is `unconfirmed`. The check proves no more than that: an amend that keeps
+  * a commit's message and author date passes it.
   */
- async rebaseAndWait(repo: string, n: number, token: { read: ResolvedToken; write: string }): Promise<RebaseOutcome> {
+ async rebaseAndWait(repo: string, n: number, sha: string, token: { read: ResolvedToken; write: string }): Promise<RebaseOutcome> {
   const endpoint = `${this.mrEndpoint(repo, n)}/rebase`;
-  // A rebase an earlier pass started is waited on, never requested again.
+  string(sha, endpoint, "gated head SHA");
   const before = await this.rebaseState(repo, n, token.read);
+  if (before.headSha !== sha) {
+   return { status: "unconfirmed", reason: `the head of !${n} moved from ${sha.slice(0, 8)} to ${before.headSha.slice(0, 8)} before ranger asked for a rebase` };
+  }
+  // The commits at the gated head, read before any rebase can move it.
+  const gated = await this.mrCommits(repo, n, token.read);
+  if (gated.head !== sha) {
+   return { status: "unconfirmed", reason: `GitLab lists the commits of !${n} at ${gated.head?.slice(0, 8) ?? "no commit"}, not at the gated head ${sha.slice(0, 8)}` };
+  }
   const requested = !before.inProgress;
   if (requested) {
    const { status, body } = await this.answer(repo, token.write, endpoint, []);
+   // Anything but a 409 or a refusal (a 5xx, a 429, a revoked token) is a fault: the desk records it and retries next pass.
+   const answer = answered(status, REBASE_REFUSED, () => new GitLabWriteError(`rebase request failed (${forgeMessage(body, status)})`, endpoint, status));
    // 409: GitLab could not enqueue the rebase yet ("try again later").
-   if (status === 409) return { status: "pending", reason: `GitLab did not start the rebase of !${n} yet: ${forgeMessage(body, status)}`, requested };
-   if (REBASE_REFUSED.includes(status)) return { status: "not-mergeable", reason: `GitLab declined to rebase !${n}: ${forgeMessage(body, status)}` };
-   // Anything else (a 5xx, a 429, a revoked token) is a fault: the desk records it and retries next pass.
-   if (!ok(status)) throw new GitLabWriteError(`rebase request failed (${forgeMessage(body, status)})`, endpoint, status);
+   if (answer === "conflict") return { status: "pending", reason: `GitLab did not start the rebase of !${n} yet: ${forgeMessage(body, status)}`, requested };
+   if (answer === "refused") return { status: "not-mergeable", reason: `GitLab declined to rebase !${n}: ${forgeMessage(body, status)}` };
   }
   for (let poll = 0; poll < this.wait.polls; poll++) {
    await this.wait.sleep(this.wait.intervalMs);
@@ -385,6 +438,14 @@ export class GitLabPort extends GitLabReadPort implements ForgePort<ResolvedToke
     if (state.mergeError !== null && state.mergeError !== before.mergeError) return { status: "not-mergeable", reason: `GitLab could not rebase !${n}: ${state.mergeError}` };
     const stale = state.mergeError === null ? "" : `; GitLab still reports the error it had before: ${state.mergeError}`;
     return { status: "pending", reason: `GitLab finished rebasing !${n} but the head is still ${before.headSha.slice(0, 8)}${stale}`, requested };
+   }
+   // The head moved: the rebase landing only if GitLab lists the same commits there.
+   const after = await this.mrCommits(repo, n, token.read);
+   if (after.head !== state.headSha || after.authored.length !== gated.authored.length || after.authored.some((c, i) => c !== gated.authored[i])) {
+    return {
+     status: "unconfirmed",
+     reason: `the head of !${n} moved from ${sha.slice(0, 8)} to ${state.headSha.slice(0, 8)}, but GitLab does not list the same commits there (message, author, author date): not counted as the rebase`,
+    };
    }
    return { status: "head-moved", headSha: state.headSha, requested };
   }
@@ -461,6 +522,6 @@ export function gitlabForgePort(
   markReady: (repo, pr, token) => port.markReady(repo, pr, token),
   postComment: (repo, n, body, token) => port.postComment(repo, n, body, token),
   mergePr: (repo, n, sha, title, token) => port.mergePr(repo, n, sha, title, token),
-  rebasePr: async (repo, n, token) => port.rebaseAndWait(repo, n, { read: await read(repo), write: token }),
+  rebasePr: async (repo, n, sha, token) => port.rebaseAndWait(repo, n, sha, { read: await read(repo), write: token }),
  };
 }
