@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { readPrivateJson } from "./remote-test/ssh-cli.ts";
 import { executionRefusal, isGithubRepo } from "./forge-ref.ts";
+import { changeRequestNoun } from "./forge-text.ts";
 import { mapKey, pickMap } from "./maps.ts";
 import { implementLane } from "./lanes.ts";
 import { resumeNode } from "./resume.ts";
@@ -34,6 +35,7 @@ import {
 } from "./token-gate.ts";
 import { openJournal, type Journal } from "./journal.ts";
 import {
+ assertCommitIdentity,
  assertWriteIdentity,
  WriteGateError,
 } from "./identity.ts";
@@ -211,6 +213,13 @@ async function writeContext(config: RangerConfig, map: RangerMapConfig) {
  return assertWriteIdentity(config, map.repo);
 }
 
+/** `writeContext` for a run-node, plus a GitLab map's commit identity (node #127). */
+async function runNodeContext(config: RangerConfig, map: RangerMapConfig) {
+ const refusal = executionRefusal(map.repo);
+ if (refusal !== null) throw new WriteGateError(refusal);
+ return assertCommitIdentity(config, map.repo);
+}
+
 async function runWalk(configPath: string): Promise<string> {
  const { config, journal } = loadCtx(configPath);
  const result = await walk({ config, configPath, journal });
@@ -224,12 +233,13 @@ async function runRunNode(
 ): Promise<string> {
  const { config, journal } = loadCtx(configPath);
  const map = pickMap(config, repo);
- const { token, botIdentity } = await writeContext(config, map);
+ const { token, botIdentity, commitAuthor } = await runNodeContext(config, map);
  const outcome = await runNode(nodeId, {
   config,
   map,
   token,
   botIdentity,
+  commitAuthor,
   journal,
  });
  journal.close();
@@ -312,7 +322,7 @@ async function runMergeGate(nodeId: string, selector: string, sha: string, confi
   const map = pickMap(config, selector);
   const row = journal.getWorker(nodeId, map.repo);
   if (row === null || row.root !== map.root || row.prNumber === null) {
-   return { ok: false, text: `node ${nodeId} has no PR recorded on ${mapKey(map)}` };
+   return { ok: false, text: `node ${nodeId} has no ${changeRequestNoun(map.repo)} recorded on ${mapKey(map)}` };
   }
   const { token, botIdentity } = await writeContext(config, map);
   const gate = await mergeGateNow(realGitHub, map, row.prNumber, token, botIdentity);

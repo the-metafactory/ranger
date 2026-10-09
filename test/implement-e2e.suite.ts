@@ -27,7 +27,7 @@ import { ReviewError, type ReviewVerdict } from "../src/review.ts";
 import { LAST_IMPLEMENT_MAP } from "../src/maps.ts";
 import { sweepMap } from "../src/sweep.ts";
 import { bootstrapWorktree, runNode, type RunNodeContext } from "../src/worker.ts";
-import { keyLabel } from "../src/git-ops.ts";
+import { gitCredential, keyLabel } from "../src/git-ops.ts";
 import { trustCurrentGitState } from "../src/git-trust.ts";
 import { baseConfigLines, createCanonicalRepo, fakeDiscord, GIT_ENV, takesRawByteNames } from "./support.ts";
 import { saveViewsRecord, viewsDirectory } from "../src/views.ts";
@@ -872,7 +872,7 @@ describe("implement lane (node #23)", () => {
    r.ctx.workerCommand = [implementWorker, "noop"];
    expect((await runNode("20", r.ctx)).status).toBe("failed");
 
-   await bootstrapWorktree(r.canonical, "21", "another-node", "tok");
+   await bootstrapWorktree(r.canonical, "21", "another-node", gitCredential("acme/widgets", "tok"));
    expect((await git(["config", "--get-regexp", "^branch\\.node/21-"], r.canonical)).stdout.trim()).toBe("");
 
    r.ctx.workerCommand = [implementWorker, "build"];
@@ -891,7 +891,7 @@ describe("implement lane (node #23)", () => {
    expect((await runNode("20", r.ctx)).status).toBe("failed");
    expect(readFileSync(join(r.canonical, ".git", "worktrees", "node-20", "config.worktree"), "utf8")).toContain("probe = kept");
 
-   await bootstrapWorktree(r.canonical, "21", "another-node", "tok");
+   await bootstrapWorktree(r.canonical, "21", "another-node", gitCredential("acme/widgets", "tok"));
    r.ctx.workerCommand = [implementWorker, "build"];
    r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
    expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
@@ -1043,7 +1043,7 @@ describe("implement lane (node #23)", () => {
  test.each(["resume", "sweep"])("closed research node discovers its merged PR without a recorded number via %s", async via => {
   const r = await rig({}); cleanup.push(r.dir);
   const branch = "research/api-survey";
-  const worktree = await bootstrapWorktree(r.canonical, "20", "api-survey", r.ctx.token, branch);
+  const worktree = await bootstrapWorktree(r.canonical, "20", "api-survey", gitCredential(r.ctx.map.repo, r.ctx.token), branch);
   expect((await runCmd("git", ["push", "origin", branch], { cwd: worktree })).code).toBe(0);
   await r.github.createDraftPr("acme/widgets", { head: branch, base: "main", title: "Survey API", body: "Findings" });
   await r.github.merge(1);

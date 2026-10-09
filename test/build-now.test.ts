@@ -93,7 +93,7 @@ function rig(opts: { cap?: number } = {}) {
   map: config.maps[0],
   token: "ghp_write",
   botIdentity: BOT,
-  readFrontier: async () => FRONTIER,
+  readFrontier: async () => ({ frontier: FRONTIER }),
   registry: {},
   announce: async (_map, a) => {
    announced.push(a);
@@ -230,6 +230,18 @@ describe("node #58 — build-now refuses", () => {
    untouched(r, id);
   });
  }
+
+ test("a build node whose brief soma's audit reports not ready, even with --force (node #154)", async () => {
+  const r = rig();
+  const readFrontier = async () => ({
+   frontier: [...FRONTIER, entry("16", "build")],
+   briefs: { ok: true as const, notReady: [{ id: "16", missing: ["## Deliverable"] }] },
+  });
+  expect(await refusal(buildNow("16", r.ctx({ readFrontier, force: true })))).toMatch(
+   /brief-not-ready: build brief not ready — missing `## Deliverable`/,
+  );
+  untouched(r, "16");
+ });
 
  test("a HITL node even with --force", async () => {
   const r = rig();

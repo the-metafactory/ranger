@@ -223,14 +223,7 @@ export async function resolveBotIdentity(
  env: NodeJS.ProcessEnv = process.env,
 ): Promise<string> {
  const ref = parseForgeRef(repo);
- if (ref.forge === "gitlab") {
-  // One /user read yields both the username and GitLab's own bot flag.
-  const user = await gitlabGet(token, repo, "/user", runner, { env });
-  const resolved = gitlabLogin(user);
-  assertNotPrincipal(config, resolved, repo);
-  await assertProjectBot(token, repo, user, runner, env);
-  return resolved;
- }
+ if (ref.forge === "gitlab") return (await resolveGitLabBot(config, token, repo, runner, env)).login;
  const resolved = await loginForToken(token, repo, { env }, runner);
  if (config.bot.identity !== undefined && config.bot.identity.length > 0) {
   if (resolved !== config.bot.identity) {
@@ -244,6 +237,55 @@ export async function resolveBotIdentity(
  }
  assertNotPrincipal(config, resolved, repo);
  return resolved;
+}
+
+/**
+ * The GitLab project bot behind the write token. One /user read yields the
+ * username, GitLab's own bot flag and the fields of the commit identity.
+ */
+async function resolveGitLabBot(
+ config: RangerConfig,
+ token: string,
+ repo: string,
+ runner: typeof runCmd,
+ env: NodeJS.ProcessEnv,
+): Promise<{ login: string; user: Record<string, unknown> | null }> {
+ const user = await gitlabGet(token, repo, "/user", runner, { env });
+ const login = gitlabLogin(user);
+ assertNotPrincipal(config, login, repo);
+ await assertProjectBot(token, repo, user, runner, env);
+ return { login, user };
+}
+
+/** The git author and committer a map's commits carry. */
+export interface CommitAuthor {
+ name: string;
+ email: string;
+}
+
+// One line, no spaces or angle brackets: git writes it between `<` and `>`.
+const COMMIT_EMAIL = /^[^\s<>@]+@[^\s<>@]+$(?![\s\S])/;
+
+/**
+ * The GitLab bot's commit identity from its own `GET /user` (node #127): its
+ * `commit_email` when GitLab reports one, else GitLab's private noreply
+ * address `<id>-<username>@users.noreply.<host>`. The name is the username.
+ */
+export function gitlabCommitAuthor(user: Record<string, unknown> | null, host: string): CommitAuthor {
+ const name = gitlabLogin(user);
+ if (/[\s<>@]/.test(name)) throw new WriteGateError("cannot build the GitLab commit identity: unusable username");
+ const commitEmail = user?.commit_email;
+ if (typeof commitEmail === "string" && commitEmail.trim().length > 0) {
+  if (!COMMIT_EMAIL.test(commitEmail)) {
+   throw new WriteGateError("cannot build the GitLab commit identity: commit_email is not one plain address");
+  }
+  return { name, email: commitEmail };
+ }
+ const id = user?.id;
+ if (typeof id !== "number" || !Number.isSafeInteger(id) || id <= 0) {
+  throw new WriteGateError("cannot build the GitLab commit identity: missing user id in /user response");
+ }
+ return { name, email: `${id}-${name}@users.noreply.${host}` };
 }
 
 function gitlabLogin(user: Record<string, unknown> | null): string {
@@ -345,9 +387,40 @@ export async function assertWriteIdentity(
  env: NodeJS.ProcessEnv = process.env,
  runner: typeof runCmd = runCmd,
 ): Promise<{ token: string; botIdentity: string }> {
+ const { token, botIdentity } = await writeIdentity(config, repo, env, runner);
+ return { token, botIdentity };
+}
+
+/**
+ * The write gate for a run-node, whose worker commits (node #127): a GitLab
+ * map also gets the bot's commit identity from the same `GET /user`. A
+ * GitHub map's comes from `bot.identity` in `workerEnv`, as before.
+ */
+export async function assertCommitIdentity(
+ config: RangerConfig,
+ repo: string,
+ env: NodeJS.ProcessEnv = process.env,
+ runner: typeof runCmd = runCmd,
+): Promise<{ token: string; botIdentity: string; commitAuthor?: CommitAuthor }> {
+ const { token, botIdentity, gitlabUser } = await writeIdentity(config, repo, env, runner);
+ return gitlabUser === undefined
+  ? { token, botIdentity }
+  : { token, botIdentity, commitAuthor: gitlabCommitAuthor(gitlabUser, parseForgeRef(repo).host) };
+}
+
+async function writeIdentity(
+ config: RangerConfig,
+ repo: string,
+ env: NodeJS.ProcessEnv,
+ runner: typeof runCmd,
+): Promise<{ token: string; botIdentity: string; gitlabUser?: Record<string, unknown> | null }> {
  // Missing host policy refuses even before attempting an identity read.
  writePrincipal(config, repo);
  const credential = resolveWriteToken(config, repo, env);
+ if (parseForgeRef(repo).forge === "gitlab") {
+  const bot = await resolveGitLabBot(config, credential.token, repo, runner, env);
+  return { token: credential.token, botIdentity: bot.login, gitlabUser: bot.user };
+ }
  const botIdentity = await resolveBotIdentity(config, credential.token, repo, runner, env);
  return { token: credential.token, botIdentity };
 }

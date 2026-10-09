@@ -1,5 +1,6 @@
 import type { CheckRun, WorkflowRun, CommitStatus } from "./github.ts";
 import type { CiPurpose, CiVerdict } from "./forge.ts";
+import { ciRunUrl } from "./forge-text.ts";
 
 /**
  * The GitHub adapter's check-run classification. The merge gate receives
@@ -63,7 +64,7 @@ export function classifyResearchCi(runs: CheckRun[], workflows: WorkflowRun[], s
 /** GitHub classifications, translated once before crossing the port. */
 export function githubCiVerdict(repo: string, runs: CheckRun[], purpose: CiPurpose = "merge", workflows: WorkflowRun[] = [], statuses: CommitStatus[] = []): CiVerdict {
  const green = (success: CheckRun, snapshot: string): CiVerdict => ({
-  state: "green", runId: success.id, runUrl: `https://github.com/${repo}/runs/${success.id}`, runName: success.name, snapshot,
+  state: "green", runId: success.id, runUrl: ciRunUrl(repo, success.id), runName: success.name, snapshot,
  });
  if (purpose === "research") {
   const ci = classifyResearchCi(runs, workflows, statuses);

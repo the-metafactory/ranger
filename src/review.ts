@@ -1,4 +1,5 @@
 import { nodeKey } from "./forge-ref.ts";
+import { changeRequestRef } from "./forge-text.ts";
 import type { SubstrateName } from "./store/schema.ts";
 import { runReadRetryingTransient } from "./transient.ts";
 import { gatedEnv } from "./token-gate.ts";
@@ -79,7 +80,7 @@ export async function sageReview(
    }
    if (verdict?.verdict === "changes-requested") return verdict;
    throw new ReviewError(
-    `sage review ${repo}#${prNumber} exited ${result.code}: ${(result.stderr || result.stdout).trim().slice(-400)}`,
+    `sage review ${repo}${changeRequestRef(repo, prNumber)} exited ${result.code}: ${(result.stderr || result.stdout).trim().slice(-400)}`,
    );
   }
   return parseVerdictBlock(result.stdout);

@@ -9,7 +9,7 @@ import { DiscordAnnouncer, type AnnounceContext, type AnnounceResult } from "./a
 import { BudgetDeferral, budgetPolicy } from "./budget.ts";
 import { readFrontier } from "./frontier-cache.ts";
 import { GRAPH_CALL_TIMEOUT_MS } from "./graph.ts";
-import { graphClaim, type ClaimResult } from "./graph-write.ts";
+import { GraphWriteError, graphClaim, type ClaimResult } from "./graph-write.ts";
 import {
  assertWriteIdentity,
  WriteGateError,
@@ -464,7 +464,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
      // re-reads the repo's sentinel here and serves the cached read only when
      // nothing changed since it was taken, so round-29 holds without paying
      // GraphQL for an unchanged map (src/frontier-cache.ts).
-     const { frontier: fetched } = await readFrontier({
+     const { frontier: fetched, briefs } = await readFrontier({
       journal,
       repo: map.repo,
       root: map.root,
@@ -475,7 +475,10 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
       timeoutMs: GRAPH_CALL_TIMEOUT_MS,
      });
      const frontierEntries = fetched.frontier;
-     const classified = classifyFrontier(frontierEntries, map, registry, botIdentity);
+     // A build node whose brief soma's audit reports not ready routes
+     // brief-not-ready, so the plan never takes it (node #154).
+     const classified = classifyFrontier(frontierEntries, map, registry, botIdentity, briefs);
+     if (!briefs.ok) errors.push(`build briefs unverified — build nodes held this tick: ${briefs.error}`);
      // The plan `ranger serve` (#37) also reads, so its "next" is this order.
      const plan = planTick(classified, {
       laneBusy: implementClaimed.has(implementLane(map)) || implementLaneBusy(journal, implementLane(map)),
@@ -506,19 +509,31 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
        continue;
       }
 
-      const outcome = await claimNode({
-       journal,
-       map,
-       node,
-       lane: laneOf(node.id),
-       botIdentity,
-       token,
-       cliEntry,
-       configPath: ctx.configPath,
-       spawnRunNode: ctx.spawnRunNode,
-       now: ctx.now,
-       owned,
-      });
+      let outcome: ClaimNodeOutcome;
+      try {
+       outcome = await claimNode({
+        journal,
+        map,
+        node,
+        lane: laneOf(node.id),
+        botIdentity,
+        token,
+        cliEntry,
+        configPath: ctx.configPath,
+        spawnRunNode: ctx.spawnRunNode,
+        now: ctx.now,
+        owned,
+       });
+      } catch (error) {
+       // A failed claim is this node's error, not the map's (node #163): soma
+       // refuses a blocked node with plain text, indistinguishable from any
+       // other claim failure, so the next candidate is still claimed. Lock,
+       // lease and budget failures are not GraphWriteErrors and still end
+       // the map's claim phase.
+       if (!(error instanceof GraphWriteError)) throw error;
+       errors.push(`#${node.id} claim failed (${error.message}) — skipped`);
+       continue;
+      }
       if (outcome.messageId !== null) mapResult.announced.push(node.id);
       if (!outcome.claimed) {
        errors.push(outcome.error);
