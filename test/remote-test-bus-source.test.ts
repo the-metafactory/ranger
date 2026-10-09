@@ -4,10 +4,10 @@ import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, sy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCmd } from "../src/exec.ts";
-import { loadStagedSource, stageCommittedSource, StagedSourceRefusal, type StageFaultStep, type StageRefusalCode } from "../src/remote-test/bus-source.ts";
+import { loadStagedSource, PENDING_MS, STORE_LOCK, StagedSourceRefusal, type StageFaultStep, type StageRefusalCode } from "../src/remote-test/bus-source.ts";
 import { ReceiverDiagnosticSchema } from "../src/remote-test/receiver-diagnostics.ts";
 import { openJobLedger } from "../src/remote-test/job-ledger.ts";
-import { stageSshSource, statusSshRemoteTest, type SshRunner } from "../src/remote-test/ssh-client.ts";
+import { stageCommittedSource, stageSshSource, statusSshRemoteTest, type SshRunner } from "../src/remote-test/ssh-client.ts";
 import { SshRequestSchema } from "../src/remote-test/ssh-protocol.ts";
 import { serveSshRequest, serveSshResponse, type SshServerOptions } from "../src/remote-test/ssh-server.ts";
 import { stageSource } from "../src/remote-test/source.ts";
@@ -44,8 +44,9 @@ async function fixture(artifacts: Record<string, number> = {}) {
   yield Buffer.from(JSON.stringify({ version: 3, operation: "stage", job, bundleBytes: body.length, ...fields }) + "\n"); yield Buffer.from(body);
  })();
  const store = join(jobsRoot, ".source-store"), object = (digest: string) => join(store, digest.slice(7));
- const leftovers = async () => (await readdir(store).catch(() => [])).filter(n => n.startsWith("."));
- return { root, repo, staging, jobsRoot, diagnosticsRoot, ancestorTree, profile, config, sshConfig, request, stage, ...first, execute, frame, store, object, leftovers, calls: () => calls };
+ const entries = async () => (await readdir(store).catch(() => [])).filter(n => !n.startsWith(STORE_LOCK)).sort();
+ const leftovers = async () => (await entries()).filter(n => n.startsWith("."));
+ return { root, repo, staging, jobsRoot, diagnosticsRoot, ancestorTree, profile, config, sshConfig, request, stage, ...first, execute, frame, store, object, entries, leftovers, calls: () => calls };
 }
 type Fixture = Awaited<ReturnType<typeof fixture>>;
 async function refusal(promise: Promise<unknown>): Promise<StageRefusalCode> {
@@ -127,9 +128,10 @@ test("a colliding stored object, unsafe store or busy lock refuses and is never 
  await rm(object, { recursive: true }); await mkdir(object, { mode: 0o700 });
  expect(await refusal(serve(f))).toBe("stage_conflict");
  await rm(object, { recursive: true });
- await mkdir(join(f.store, ".store-lock"));
- expect(await serve(f).catch(e => (e as NodeJS.ErrnoException).code)).toBe("EEXIST");
- await rm(join(f.store, ".store-lock"), { recursive: true }); await chmod(f.store, 0o755);
+ // A lock file another user could open or swap is unsafe, never used.
+ await chmod(join(f.store, STORE_LOCK), 0o644);
+ expect(await refusal(serve(f))).toBe("unsafe_path");
+ await chmod(join(f.store, STORE_LOCK), 0o600); await chmod(f.store, 0o755);
  expect(await refusal(serve(f))).toBe("unsafe_path");
  await rm(f.store, { recursive: true }); await mkdir(join(f.root, "elsewhere"), { mode: 0o700 }); await symlink(join(f.root, "elsewhere"), f.store);
  expect(await refusal(serve(f))).toBe("unsafe_path");
@@ -137,13 +139,39 @@ test("a colliding stored object, unsafe store or busy lock refuses and is never 
 });
 
 test("each durability failure refuses, withdraws publication and leaves no pending state", async () => {
- for (const step of ["bundle-write", "file-sync", "meta-write", "dir-sync", "publish", "root-sync"] as StageFaultStep[]) {
-  const f = await fixture();
-  await expect(serve(f, f.bytes, f.job, { sourceStore: { fault: s => { if (s === step) throw Error(`fault ${s}`); } } })).rejects.toThrow(`fault ${step}`);
-  expect(await readdir(f.store)).toEqual([]);
+ for (const step of ["bundle-write", "file-sync", "meta-write", "meta-sync", "dir-sync", "publish", "root-sync"] as StageFaultStep[]) {
+  const f = await fixture(), seen: StageFaultStep[] = [];
+  await expect(serve(f, f.bytes, f.job, { sourceStore: { fault: s => { seen.push(s); if (s === step) throw Error(`fault ${s}`); } } })).rejects.toThrow(`fault ${step}`);
+  expect(seen.at(-1)).toBe(step);
+  expect(await f.entries()).toEqual([]);
   expect(await serveSshResponse(f.frame(f.job, f.bytes), f.config, { execute: f.execute, now: () => now, sourceStore: { fault: s => { if (s === step) throw Error("fault"); } } })).toEqual({ version: 3, error: "receiver_failed" });
-  expect(await readdir(f.store)).toEqual([]);
+  expect(await f.entries()).toEqual([]);
  }
+}, 30_000);
+
+/** A real separate process holds the store lock until it is killed. */
+async function holdStoreLock(store: string) {
+ const script = `const { Database } = require("bun:sqlite"); const db = new Database(${JSON.stringify(join(store, STORE_LOCK))}, { strict: true }); db.exec("PRAGMA busy_timeout=0"); db.exec("BEGIN EXCLUSIVE"); console.log("held"); setInterval(() => {}, 1000);`;
+ const child = Bun.spawn([process.execPath, "-e", script], { stdout: "pipe", stderr: "ignore" });
+ const reader = child.stdout.getReader(), { value } = await reader.read(); reader.releaseLock();
+ if (!new TextDecoder().decode(value).includes("held")) { child.kill("SIGKILL"); throw Error("Lock holder failed"); }
+ return child;
+}
+
+test("a live lock holder yields stage_busy; a killed holder's lock and expired uploads never block later stages", async () => {
+ const f = await fixture();
+ await mkdir(f.store, { mode: 0o700 }); await writeFile(join(f.store, STORE_LOCK), "", { mode: 0o600 });
+ const holder = await holdStoreLock(f.store);
+ try {
+  expect(await refusal(serve(f, f.bytes, f.job, { sourceStore: { lockWaitMs: 0 } }))).toBe("stage_busy");
+  expect(await f.entries()).toEqual([]);
+  // A waiting stager proceeds once the holder dies mid-critical-section (SIGKILL, no cleanup).
+  const waiting = serve(f);
+  await Bun.sleep(200); holder.kill("SIGKILL"); await holder.exited;
+  expect("staged" in await waiting).toBe(true);
+ } finally { holder.kill("SIGKILL"); }
+ expect(await f.entries()).toEqual([f.job.bundleDigest.slice(7)]);
+ expect(f.calls()).toBe(0);
 });
 
 test("seven-day retention reclaims only expired objects; capacity pressure never evicts unexpired ones", async () => {
@@ -155,14 +183,27 @@ test("seven-day retention reclaims only expired objects; capacity pressure never
  const at = (job: unknown, bytes: Buffer, time: number) => serveSshRequest(f.frame(job, bytes), tight, { execute: f.execute, now: () => time });
  // Unexpired first object stays; insufficient capacity refuses the second.
  expect(await refusal(at(second.job, second.bytes, now + DAY))).toBe("stage_capacity");
- expect(await readdir(f.store)).toEqual([f.job.bundleDigest.slice(7)]);
+ expect(await f.entries()).toEqual([f.job.bundleDigest.slice(7)]);
  // After the retention window the first object is reclaimed and the second fits.
  expect("staged" in await at(second.job, second.bytes, now + 7 * DAY)).toBe(true);
- expect(await readdir(f.store)).toEqual([second.job.bundleDigest.slice(7)]);
+ expect(await f.entries()).toEqual([second.job.bundleDigest.slice(7)]);
+ // Exact room for both objects with their references, and nothing more.
+ const referenceBytes = (await stat(join(f.object(second.job.bundleDigest), "reference.json"))).size;
+ const roomy = { ...f.config, artifacts: { maxArtifactBytes: capacity + 2 * referenceBytes } };
+ const fits = (time: number) => serveSshRequest(f.frame(f.job, f.bytes), roomy, { execute: f.execute, now: () => time });
  // Unknown store entries are counted and kept, never reclaimed.
  await writeFile(join(f.store, ".pending-stale"), Buffer.alloc(f.bytes.length));
- expect(await refusal(at(f.job, f.bytes, now + 8 * DAY))).toBe("stage_capacity");
- expect((await readdir(f.store)).sort()).toEqual([".pending-stale", second.job.bundleDigest.slice(7)].sort());
+ expect(await refusal(fits(now + 8 * DAY))).toBe("stage_capacity");
+ expect(await f.entries()).toEqual([".pending-stale", second.job.bundleDigest.slice(7)].sort());
+ await rm(join(f.store, ".pending-stale"));
+ // A crashed stager's upload is counted until its named expiry, then reclaimed.
+ const crashed = join(f.store, `.pending-${now + 9 * DAY}-0b7e8091-1234-4234-8234-123456789abc`);
+ await mkdir(crashed, { mode: 0o700 }); await writeFile(join(crashed, "source.bundle"), Buffer.alloc(f.bytes.length), { mode: 0o600 });
+ expect(await refusal(fits(now + 9 * DAY - 1))).toBe("stage_capacity");
+ expect(await f.entries()).toEqual([crashed.slice(f.store.length + 1), second.job.bundleDigest.slice(7)].sort());
+ expect("staged" in await fits(now + 9 * DAY)).toBe(true);
+ expect(await f.entries()).toEqual([f.job.bundleDigest.slice(7), second.job.bundleDigest.slice(7)].sort());
+ expect(PENDING_MS).toBeGreaterThanOrEqual(2 * 900_000);
  expect(f.calls()).toBe(0);
 });
 
@@ -207,7 +248,7 @@ test("the stage client reuses stageSource, sends only the V3 stage operation ove
  await expect(stageCommittedSource({ config: f.sshConfig, request: { ...f.request, bundleDigest: f.job.bundleDigest }, worktree: f.repo, stagingRoot: f.staging }, { runner: loopback })).rejects.toThrow("derived");
 });
 
-test("stage replies that do not bind this job, executor and bundle are refused without a reference", async () => {
+test("stage replies that do not bind this job, executor and bundle never yield a reference", async () => {
  const f = await fixture(), path = join(f.staging, "source.bundle"); await writeFile(path, f.bytes);
  const staged = { job: f.job, executorId: "fixture", bundleDigest: f.job.bundleDigest, bundleBytes: f.bytes.length };
  const reply = (stdout: string, code = 0): SshRunner => async ({ input }) => { for await (const _ of input) { /* drain */ } return { code, stdout }; };
@@ -220,10 +261,11 @@ test("stage replies that do not bind this job, executor and bundle are refused w
   { version: 3, staged: { ...staged, job: { ...f.job, generation: 2 } } },
   { version: 3, staged: { ...staged, path: "/tmp/x" } },
   { version: 2, receipt: null },
- ]) expect(await run(reply(JSON.stringify(bad)))).toEqual({ status: "refused", reason: "invalid_response" });
+ ]) expect(await run(reply(JSON.stringify(bad)))).toEqual({ status: "uncertain", reason: "invalid_response" });
  expect(await run(reply(JSON.stringify({ version: 3, error: "receiver_failed" })))).toEqual({ status: "refused", reason: "receiver_failed" });
- expect(await run(reply(JSON.stringify({ version: 3, staged }), 255))).toEqual({ status: "refused", reason: "no_response" });
- expect(await run(async () => { throw Error("lost"); })).toEqual({ status: "refused", reason: "no_response" });
+ // Lost or nonzero transport is uncertain, never a refusal: the peer may hold the object.
+ expect(await run(reply(JSON.stringify({ version: 3, staged }), 255))).toEqual({ status: "uncertain", reason: "no_response" });
+ expect(await run(async () => { throw Error("lost"); })).toEqual({ status: "uncertain", reason: "no_response" });
  expect(await run(reply(JSON.stringify({ version: 3, staged })), f.job.deadline)).toEqual({ status: "refused", reason: "expired_job" });
  // A legacy status client never accepts a stage reply as a receipt.
  expect(await statusSshRemoteTest({ config: f.sshConfig, job: f.job }, { runner: reply(JSON.stringify({ version: 3, staged })), now: () => now })).toEqual({ status: "infra_failed", reason: "invalid_receipt" });

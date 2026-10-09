@@ -30,8 +30,8 @@ export interface SshServerOptions {
  fs?: Partial<{ open: typeof open; rm: typeof rm }>;
  /** Deterministic expiry fixture; production uses the server clock. */
  now?: () => number;
- /** Source-store durability fault seam for stage-only requests. */
- sourceStore?: Pick<StageStoreOptions, "fault">;
+ /** Source-store durability fault and lock-wait seams for stage-only requests. */
+ sourceStore?: Pick<StageStoreOptions, "fault" | "lockWaitMs">;
 }
 interface RefusalContext {
  stage: DiagnosticStage;
@@ -126,7 +126,7 @@ async function receive(input: AsyncIterable<Uint8Array>, operatorConfig: unknown
   // admission, no inbox, no executor; the reference is not a test outcome.
   const chunks = (async function* () { if (rest.length) yield rest; for (;;) { const next = await iterator.next(); if (next.done) return; yield next.value; } })();
   const source = await receiveStagedSource({ jobsRoot: root, job, declaredBytes: request.bundleBytes, chunks, policy: config.artifacts },
-   { now, signal: options.signal, fault: options.sourceStore?.fault, progress: stage => { context.stage = stage; } });
+   { now, signal: options.signal, fault: options.sourceStore?.fault, lockWaitMs: options.sourceStore?.lockWaitMs, progress: stage => { context.stage = stage; } });
   return { version: 3, staged: { job, executorId: config.executorId, ...source } };
  }
  if (request.operation === "status") {

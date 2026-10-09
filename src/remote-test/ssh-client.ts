@@ -1,14 +1,15 @@
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { constants } from "node:fs";
-import { open } from "node:fs/promises";
-import { isAbsolute } from "node:path";
+import { lstat, open, rm } from "node:fs/promises";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { z } from "zod";
 import { killProcessGroup } from "../exec.ts";
-import { shellQuote } from "./baseline.ts";
+import { privateOperatorPath, shellQuote } from "./baseline.ts";
 import { validateProfileManifest, validateRemoteTestJob, validateRemoteTestReceipt, type RemoteTestJob, type RemoteTestReceipt } from "./contract.ts";
+import { stageSource } from "./source.ts";
 import { SSH_LIMITS, SshResponseSchema, SshStageResponseSchema } from "./ssh-protocol.ts";
 
 const operatorPath = z.string().max(4096).refine(p => isAbsolute(p) && !p.includes("\0") && !/[\r\n]/.test(p));
@@ -133,8 +134,12 @@ export async function statusSshRemoteTest(input: { config: unknown; job: unknown
  return exchange(config, job, "status", undefined, options);
 }
 
+/** `refused`: this request obtained no reference (never sent, or the receiver
+ * answered with a refusal). `uncertain`: no authenticated answer, so the peer
+ * may or may not hold the object; that is neither a reference nor a refusal. */
 export type SshStageOutcome = { status: "staged"; job: RemoteTestJob; executorId: string; source: { bundleDigest: string; bundleBytes: number } } |
- { status: "refused"; reason: "expired_job" | "no_response" | "receiver_failed" | "invalid_response" };
+ { status: "refused"; reason: "expired_job" | "receiver_failed" } |
+ { status: "uncertain"; reason: "no_response" | "invalid_response" };
 /** Stage-only V3 transfer: the peer stores the exact bytes and returns their
  * content reference. Never a receipt, test outcome or admission. Staging is
  * content-addressed, so an uncertain transport may be repeated safely. */
@@ -143,7 +148,8 @@ export async function stageSshSource(input: { config: unknown; job: unknown; bun
  if ((options.now ?? Date.now)() >= job.deadline) return { status: "refused", reason: "expired_job" };
  const bundle = await readBundleSnapshot(input.bundlePath, job.bundleDigest);
  const result = await invoke(config, Buffer.from(JSON.stringify({ version: 3, operation: "stage", job, bundleBytes: bundle.length }) + "\n"), bundle, options);
- if (!result || result.code !== 0) return { status: "refused", reason: "no_response" };
+ // A lost connection or nonzero exit cannot authenticate the peer's outcome.
+ if (!result || result.code !== 0) return { status: "uncertain", reason: "no_response" };
  try {
   if (Buffer.byteLength(result.stdout) > SSH_LIMITS.responseBytes) throw Error("Oversize SSH response");
   const response = SshStageResponseSchema.parse(JSON.parse(result.stdout));
@@ -152,5 +158,25 @@ export async function stageSshSource(input: { config: unknown; job: unknown; bun
   if (JSON.stringify(echoed) !== JSON.stringify(job) || staged.executorId !== config.executorId ||
    staged.bundleDigest !== job.bundleDigest || staged.bundleBytes !== bundle.length) throw Error("Staged reference does not bind this job");
   return { status: "staged", job, executorId: staged.executorId, source: { bundleDigest: staged.bundleDigest, bundleBytes: staged.bundleBytes } };
- } catch { return { status: "refused", reason: "invalid_response" }; }
+ } catch { return { status: "uncertain", reason: "invalid_response" }; }
+}
+
+/** Stage the clean committed HEAD with stageSource, bind it to the partial V1
+ * request and transfer it with the V3 stage operation. Source bindings are
+ * derived, never caller-claimed. Local staging is removed after. */
+export async function stageCommittedSource(
+ input: { config: unknown; request: Record<string, unknown>; worktree: string; stagingRoot: string; expectedCommit?: string },
+ injected: Omit<SshOptions, "receiptStore"> = {},
+): Promise<SshStageOutcome> {
+ const config = validateSshConfig(input.config), request = input.request;
+ for (const field of ["commitDigest", "treeDigest", "bundleDigest"]) if (Object.hasOwn(request, field)) throw Error("Source bindings must be derived from staging");
+ selectSshJob(config, { ...request, commitDigest: "0".repeat(40), treeDigest: "0".repeat(40), bundleDigest: `sha256:${"0".repeat(64)}` });
+ const stagingRoot = dirname(await privateOperatorPath(join(resolve(input.stagingRoot), "stage-check")));
+ const info = await lstat(stagingRoot);
+ if (!info.isDirectory() || info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0) throw Error("Staging root must be private and operator-owned");
+ const source = await stageSource({ worktree: resolve(input.worktree), stagingRoot, jobId: String(request.jobId), ...(input.expectedCommit ? { commitDigest: input.expectedCommit } : {}) });
+ try {
+  const job = selectSshJob(config, { ...request, ...source.manifest });
+  return await stageSshSource({ config, job, bundlePath: source.bundlePath }, injected);
+ } finally { await rm(dirname(source.bundlePath), { recursive: true }); }
 }
