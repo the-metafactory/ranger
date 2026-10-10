@@ -581,3 +581,63 @@ describe("credentialed calls never recurse into submodules", () => {
   expect(await has(bumped)).toBe(true);
  });
 });
+
+describe("gitConfigSnapshot: benign git-lfs and push config (2026-10-10)", () => {
+ const LFS_URL = "https://github.com/acme/widgets.git/info/lfs";
+
+ test("what `git lfs install` and a push retry write leaves the snapshot unchanged", async () => {
+  const before = gitConfigSnapshot(canonical);
+  await config("filter.lfs.clean", "git-lfs clean -- %f");
+  await config("filter.lfs.smudge", "git-lfs smudge -- %f");
+  await config("filter.lfs.process", "git-lfs filter-process");
+  await config("filter.lfs.required", "true");
+  await config("lfs.repositoryformatversion", "0");
+  await config(`lfs.${LFS_URL}.access`, "basic");
+  await config("http.postBuffer", "524288000");
+  expect(gitConfigSnapshot(canonical)).toBe(before);
+  await expect(assertGitUntouched(canonical, before)).resolves.toBeDefined();
+ });
+
+ const changes: [string, () => Promise<unknown>][] = [
+  ["a smudge filter that runs something else", () => config("filter.lfs.smudge", "/tmp/evil -- %f")],
+  ["a clean filter with an extra command", () => config("filter.lfs.clean", "git-lfs clean -- %f; /tmp/evil")],
+  ["a filter.LFS driver (another subsection)", () => config("filter.LFS.process", "git-lfs filter-process")],
+  ["another filter driver with git-lfs values", () => config("filter.x.process", "git-lfs filter-process")],
+  ["a non-numeric postBuffer", () => config("http.postBuffer", "$(evil)")],
+  ["a URL-scoped postBuffer", () => config("http.https://evil.example/.postBuffer", "524288000")],
+  ["an lfs access mode other than basic", () => config(`lfs.${LFS_URL}.access`, "negotiate")],
+  ["an lfs url key", () => config("lfs.url", "https://evil.example/lfs")],
+  ["filter.lfs.required=false", () => config("filter.lfs.required", "false")],
+  [
+   "a repeated smudge key, the standard value last",
+   async () => {
+    await config("filter.lfs.smudge", "/tmp/evil -- %f");
+    await config("--add", "filter.lfs.smudge", "git-lfs smudge -- %f");
+   },
+  ],
+  [
+   "a repeated smudge key, the standard value first",
+   async () => {
+    await config("filter.lfs.smudge", "git-lfs smudge -- %f");
+    await config("--add", "filter.lfs.smudge", "/tmp/evil -- %f");
+   },
+  ],
+  [
+   "a hook git-lfs installs",
+   async () => {
+    const hook = join(canonical, ".git", "hooks", "pre-push");
+    writeFileSync(hook, "#!/bin/sh\ngit lfs pre-push \"$@\"\n");
+    chmodSync(hook, 0o755);
+   },
+  ],
+ ];
+
+ for (const [what, change] of changes) {
+  test(`${what} changes the snapshot`, async () => {
+   const before = gitConfigSnapshot(canonical);
+   await change();
+   expect(gitConfigSnapshot(canonical)).not.toBe(before);
+   await expect(assertGitUntouched(canonical, before)).rejects.toThrow(GitSafetyError);
+  });
+ }
+});

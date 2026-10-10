@@ -2,6 +2,7 @@ import {
  GitSafetyError,
  gitStateChanges,
  includeRefusal,
+ isBenignEntry,
  readGitState,
  readGitStateSettled,
  type GitState,
@@ -116,6 +117,16 @@ export async function checkKnownGood(
  if (state.includes.length > 0) return { kind: "includes", state };
  if (known !== null && known !== "unreadable" && known.hash === state.hash) return { kind: "match", state };
  const { changed, since } = againstKnown(known, state);
+ // A record from before a key joined the benign list still names it: its
+ // leaving the hash is the only change, so the current state takes its place.
+ if (since !== null && changed.length > 0 && changed.every((c) => c.endsWith(" (gone)") && isBenignEntry(c.slice(0, -7)))) {
+  recordKnownGood(journal, canonical, state, "benign config keys left the hash");
+  journal.recordEvent("git-trust", {
+   ...at,
+   detail: `known-good git state for ${canonical} re-recorded: ${changed.join(", ")} no longer hashed (benign git-lfs/push config)`,
+  });
+  return { kind: "match", state };
+ }
  if (since === null) {
   recordKnownGood(journal, canonical, state, "first sight");
   journal.recordEvent("git-trust", {

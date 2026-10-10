@@ -132,6 +132,45 @@ describe("checkKnownGood", () => {
   expect(trustedSnapshot(journal, canonical, at, "acme/widgets#1")).rejects.toThrow(/http\.sslverify/);
  });
 
+ // A record taken while git-lfs and push keys were still hashed names them:
+ // their leaving the hash is the only change, so the current state replaces it.
+ const legacyRecord = (extra: Record<string, string>) => {
+  const state = readGitState(canonical);
+  recordKnownGood(journal, canonical, { ...state, hash: "0".repeat(64), entries: { ...state.entries, ...extra } }, "worktree created");
+ };
+ const BENIGN = { "filter.lfs.clean": "a", "http.postbuffer": "b", "lfs.<0123456789ab>.access": "c", "lfs.repositoryformatversion": "d" };
+
+ test("a record whose only changes are benign keys gone matches and is re-recorded", async () => {
+  await config("http.postBuffer", "524288000");
+  await config("lfs.https://github.com/acme/widgets.git/info/lfs.access", "basic");
+  legacyRecord(BENIGN);
+  const check = await checkKnownGood(journal, canonical, at);
+  expect(check.kind).toBe("match");
+  expect(JSON.parse(journal.knownGoodGitState(canonical) as string).hash).toBe(gitConfigSnapshot(canonical));
+  expect(journal.listEvents("acme/widgets")[0].detail).toContain("no longer hashed");
+ });
+
+ test("benign keys gone plus any other change still mismatches", async () => {
+  legacyRecord(BENIGN);
+  await config("http.sslVerify", "false");
+  const check = await checkKnownGood(journal, canonical, at);
+  expect(check.kind).toBe("mismatch");
+  expect(check.kind === "mismatch" && check.changed).toContain("http.sslverify (new)");
+ });
+
+ test("a benign key whose value is no longer benign shows as changed, not gone", async () => {
+  legacyRecord({ "http.postbuffer": "b" });
+  await config("http.postBuffer", "$(evil)");
+  const check = await checkKnownGood(journal, canonical, at);
+  expect(check.kind === "mismatch" && check.changed).toEqual(["http.postbuffer"]);
+ });
+
+ test("a non-benign key gone still mismatches", async () => {
+  legacyRecord({ "core.sshcommand": "x" });
+  const check = await checkKnownGood(journal, canonical, at);
+  expect(check.kind === "mismatch" && check.changed).toEqual(["core.sshcommand (gone)"]);
+ });
+
  test("another node's worktree between runs matches (node #63's tracking lines stay out)", async () => {
   await checkKnownGood(journal, canonical, at);
   await addTrackedWorktree(canonical, "663", "stations-are-solid");
