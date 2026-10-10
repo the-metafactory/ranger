@@ -261,6 +261,46 @@ export const NODE_BRANCH = /^node\/\d+-[a-z0-9-]+$/;
 /** The remote ranger's node branches track (`worktree add -b … origin/<base>`). */
 const MAP_REMOTE = "origin";
 
+/**
+ * Records git-lfs and a push retry write to the shared config, each with the
+ * only values that pass: they steer no command, remote or credential, so
+ * they leave the tamper hash (2026-10-10: seelite #640, #500, #747, #755,
+ * #843, #819 and ranger #158 parked on `filter.lfs.*`, `lfs.<url>.access`
+ * and `http.postbuffer`, none of them a tamper). The filter commands are the
+ * ones `git lfs install` writes, byte for byte; any other value, a
+ * `filter.LFS` driver (git keeps the subsection's case) or an `http.<url>.*`
+ * key stays in the hash. Judged per record, never per key: a repeated key
+ * whose other copy is not one of these keeps that copy hashed, whichever
+ * one git reads last.
+ */
+const BENIGN_VALUES: Record<string, (value: string) => boolean> = {
+ "filter.lfs.clean": (v) => v === "git-lfs clean -- %f",
+ "filter.lfs.smudge": (v) => v === "git-lfs smudge -- %f" || v === "git-lfs smudge --skip -- %f",
+ "filter.lfs.process": (v) => v === "git-lfs filter-process" || v === "git-lfs filter-process --skip",
+ "filter.lfs.required": (v) => v === "true",
+ "lfs.repositoryformatversion": (v) => v === "0",
+ "http.postbuffer": (v) => /^[0-9]{1,12}[kmg]?$/i.test(v),
+};
+
+/** `lfs.<url>.access=basic`: git-lfs records that the LFS endpoint took basic auth. */
+const LFS_ACCESS = /^lfs\.https:\/\/[^\s]+\/info\/lfs\.access$/;
+
+export function isBenignRecord(key: string, value: string | null): boolean {
+ if (value === null) return false;
+ if (LFS_ACCESS.test(key)) return value === "basic";
+ return BENIGN_VALUES[key]?.(value) ?? false;
+}
+
+/**
+ * Whether a `GitState.entries` name is one `isBenignRecord` can drop: a
+ * known-good record taken before a key joined that list still names it, and
+ * its "(gone)" is no change (`checkKnownGood`). A record with any other
+ * value is still hashed and still named, so it shows as changed, never gone.
+ */
+export function isBenignEntry(name: string): boolean {
+ return name in BENIGN_VALUES || /^lfs\.<[0-9a-f]{12}>\.access$/.test(name);
+}
+
 /** `branch.<name>.<key>` → name and key (subsection split on the first and last dot; names may hold dots). */
 function branchKey(key: string): { name: string; key: string } | null {
  const first = key.indexOf(".");
@@ -331,7 +371,8 @@ function configRecords(
   if (tracksOrigin && (midWrite || complete)) own.add(name);
  }
  const kept = records
-  .filter(([key]) => {
+  .filter(([key, value]) => {
+   if (isBenignRecord(key, value)) return false;
    const parsed = branchKey(key);
    return parsed === null || !own.has(parsed.name);
   });
