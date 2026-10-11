@@ -280,6 +280,35 @@ export function recordedReviews(
  return out.sort((a, b) => a.round - b.round);
 }
 
+/** The hidden markers ranger and sage write into their own PR comments. */
+const TOOL_MARKER = /<!--\s*(?:ranger|sage):/;
+
+/** How many principal rulings a fix pass carries, newest kept, and how long each may be. */
+export const MAX_RULINGS = 20;
+export const MAX_RULING_CHARS = 4000;
+
+/**
+ * The principal's comments on the change request, oldest first: rulings the
+ * fix pass takes as binding, ahead of the sage review (ranger issue #230).
+ * A ruling is a plain PR comment, so the author is the only proof: the
+ * principal's login for the repo's forge, never a marker anyone could type.
+ * No configured login, no rulings.
+ *
+ * A comment carrying a tool's marker is not a ruling, whoever posted it: a
+ * `sage review --post` the principal runs by hand lands under the
+ * principal's login, and it quotes untrusted diff and PR text (sage round 1
+ * on PR #233).
+ */
+export function principalRulings(comments: IssueComment[], principal: string | undefined): string[] {
+ if (principal === undefined || principal === "") return [];
+ return comments
+  .filter((c) => c.author === principal && !TOOL_MARKER.test(c.body))
+  .map((c) => c.body.trim())
+  .filter((body) => body !== "")
+  .slice(-MAX_RULINGS)
+  .map((body) => (body.length > MAX_RULING_CHARS ? `${body.slice(0, MAX_RULING_CHARS)}\n[… cut at ${MAX_RULING_CHARS} characters]` : body));
+}
+
 /**
  * The review that stands at `sha`: the one with the highest round among the
  * reviews of that head (a tied round falls to the later one in the input),
@@ -1383,9 +1412,13 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
   // One fix pass per review that found blockers or majors. On a resume the review is
   // re-read from its PR comment, so a crash between review and fix loses nothing,
   // and a fix an earlier run committed but never pushed is adopted, as a build is.
+  // The principal's rulings are read right before a worker runs: one posted
+  // during the review binds this pass, not the next (ranger issue #230).
+  const readRulings = async (): Promise<string[]> =>
+   principalRulings(await github.listComments(repo, open.iid, token), principalLoginForRepo(config, repo));
   const fixed =
    (await adoptBuiltWork(ctx, testCommand, { round: current.round, pushedHead: live.headSha })) ??
-   (await workerPass(ctx, testCommand, { kind: "fix", round: current.round, body: current.body }));
+   (await workerPass(ctx, testCommand, { kind: "fix", round: current.round, body: current.body, rulings: await readRulings() }));
   workerExit = fixed.workerExit;
   if (fixed.failure !== undefined) return fixed.failure;
   await publishPass(ctx, github, open.iid, fixed, "push fix", `fix pass ${current.round} @ ${fixed.sha.slice(0, 8)}`);
@@ -1745,7 +1778,7 @@ function recordHead(ctx: ImplementContext, sha: string): void {
 /** What a worker session is for: the build, a fix pass answering a sage round, or a base merge. */
 type WorkerPassSpec =
  | { kind: "build" }
- | { kind: "fix"; round: number; body: string }
+ | { kind: "fix"; round: number; body: string; rulings: string[] }
  | ({ kind: "base-merge" } & BaseMergeInput);
 
 /** The pass's name in logs, events and outcomes. */
@@ -1840,7 +1873,7 @@ async function checkedWorkerPass(
   worktree,
   botIdentity,
   testCommand,
-  ...(spec.kind === "fix" ? { review: { round: spec.round, body: spec.body } } : {}),
+  ...(spec.kind === "fix" ? { review: { round: spec.round, body: spec.body }, rulings: spec.rulings } : {}),
   ...(spec.kind === "base-merge" ? { baseMerge: { base: spec.base, files: spec.files, ...(spec.stale === undefined ? {} : { stale: spec.stale }) } } : {}),
   probeTier: map.commands.probe !== undefined,
   remoteTests: remoteTests(ctx),
