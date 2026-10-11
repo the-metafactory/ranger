@@ -742,6 +742,19 @@ describe("node #54 — the actions and their guards", () => {
   expect(asked).toEqual([[SEELITE, ROW_663.prNumber as number]]);
  });
 
+ test("a worker-log read that throws leaves its line out and still opens the session", async () => {
+  const { handler } = setup({
+   workerLog: () => {
+    throw new Error("database is locked");
+   },
+  });
+  const res = await handler(post("/api/session", { ...ok, dryRun: true }));
+  expect(res.status).toBe(200);
+  const script = ((await res.json()) as { argv: string[] }).argv.join(" ");
+  expect(script).toContain("#663");
+  expect(script).not.toContain("log is");
+ });
+
  test("a behind-base read that fails leaves its line out and still opens the session", async () => {
   const { handler } = setup({
    behindBase: async () => {

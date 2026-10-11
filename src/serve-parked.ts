@@ -1025,13 +1025,19 @@ async function runHeldAction(
    entry.pr === null || deps.behindBase === undefined
     ? null
     : await deps.behindBase(entry.repo, entry.pr.number).catch(() => null);
+  let workerLog: string | null = null;
+  try {
+   workerLog = deps.workerLog?.(entry.repo, entry.nodeId) ?? null;
+  } catch {
+   /* a journal that cannot be read leaves the line out */
+  }
   argv = sessionPlan({
    repo: entry.repo,
    nodeId: entry.nodeId,
    reason: entry.reason,
    cwd,
    ...(deps.configPath === undefined ? {} : { configPath: deps.configPath }),
-   workerLog: deps.workerLog?.(entry.repo, entry.nodeId) ?? null,
+   workerLog,
    behind,
   }).argv;
   env = childEnv(deps.env);
