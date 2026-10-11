@@ -1525,8 +1525,23 @@ async function syncWorktreeToHead(ctx: ImplementContext, prNumber: number, prHea
  }
  const haveHead = async () =>
   (await safeGit(["cat-file", "-e", `${prHead}^{commit}`], { cwd: worktree, timeoutMs: 10_000 })).code === 0;
- // Unpushed work on top of the head needs no fetch: the head is already here.
- if ((await haveHead()) && (await isAncestor(worktree, prHead, here))) return;
+ // The head inside the worktree's HEAD needs no fetch: the head is already
+ // here. It is unpushed work on top of the head (adoptBuiltWork judges it),
+ // unless HEAD was itself pushed and the branch then rewound under it: then
+ // origin/<branch>, as ranger's last push left it (nothing fetched yet),
+ // still holds HEAD, and pushing it again would undo the rewind (sage round
+ // 2 on PR #234).
+ if ((await haveHead()) && (await isAncestor(worktree, prHead, here))) {
+  const tracked = await safeGit(["rev-parse", "--verify", "--quiet", `refs/remotes/origin/${branch}^{commit}`], { cwd: worktree, timeoutMs: 10_000 });
+  const pushedTip = tracked.stdout.trim();
+  if (tracked.code === 0 && /^[0-9a-f]{40}$/.test(pushedTip) && (await isAncestor(worktree, here, pushedTip))) {
+   throw new ParkSignal(
+    `${label}'s head went back to ${prHead.slice(0, 8)}, behind the worktree (${here.slice(0, 8)}), which ranger had pushed: someone rewound ${branch}. ` +
+     `Nothing was changed and nothing is pushed over the rewind; reset the worktree or the branch, then resume`,
+   );
+  }
+  return;
+ }
  // The fetch carries the write credential: the state must still be the known-good one (node #81).
  await trustedSnapshot(journal, ctx.canonical, { repo, nodeId }, mapKey(ctx.map));
  await fetchBranch(ctx.canonical, branch, gitCredential(repo, ctx.token));
