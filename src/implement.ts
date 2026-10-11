@@ -15,10 +15,12 @@ import {
  commitsAhead,
  dirtyFiles,
  fastForwardCanonical,
+ fetchBranch,
  findClosingKeyword,
  gitCredential,
  GitSafetyError,
  headSha,
+ isAncestor,
  safeGit,
  vettedPush,
 } from "./git-ops.ts";
@@ -1210,6 +1212,8 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
  for (;;) {
   const cap = capNow();
   const live = await github.getPr(repo, open.iid, token);
+  // Whatever reviews or fixes this head works on a tree at it (ranger issue #228).
+  await syncWorktreeToHead(ctx, open.iid, live.headSha);
   let current = reviewAtHead(reviews, live.headSha);
   const superseded = supersededNote(reviews, live.headSha);
   if (superseded !== null && notedSha !== live.headSha) {
@@ -1479,6 +1483,67 @@ async function conflictsWithBase(ctx: ImplementContext, github: ForgePort, prNum
   if (i < attempts - 1) await new Promise((r) => setTimeout(r, pollMs));
  }
  return false;
+}
+
+/**
+ * Bring the worktree to the change request's live head before anything
+ * reviews or works on it (ranger issue #228). A principal's session or
+ * another agent can push to the branch while the node is parked; a resumed
+ * worker on the old tree would answer a review of the new head by editing
+ * code that head no longer has.
+ *
+ * - At the head already: nothing to do, and no fetch.
+ * - The head is inside the worktree's HEAD (an earlier run committed and
+ *   never pushed): left as it is, for `adoptBuiltWork` to judge.
+ * - The worktree's HEAD is inside the head and the tree is clean: fetched
+ *   and fast-forwarded, and the journal records both SHAs.
+ * - Anything else (the worktree has commits the head lacks, or uncommitted
+ *   changes): parks naming both SHAs and the dirty paths, and changes
+ *   nothing in the worktree.
+ */
+async function syncWorktreeToHead(ctx: ImplementContext, prNumber: number, prHead: string): Promise<void> {
+ const { worktree, journal, branch } = ctx;
+ const repo = ctx.map.repo;
+ const nodeId = ctx.node.ref.id;
+ const here = await headSha(worktree);
+ if (here === prHead) return;
+ const label = changeRequestLabel(repo, prNumber);
+ if (!/^[0-9a-f]{40}$/.test(prHead)) {
+  throw new ParkSignal(`${label}'s head is unknown ("${prHead}"), and the worktree is at ${here.slice(0, 8)}: ranger will not work on a tree it cannot match to the head`);
+ }
+ // The fetch carries the write credential: the state must still be the known-good one (node #81).
+ await trustedSnapshot(journal, ctx.canonical, { repo, nodeId }, mapKey(ctx.map));
+ await fetchBranch(ctx.canonical, branch, gitCredential(repo, ctx.token));
+ const known = await safeGit(["cat-file", "-e", `${prHead}^{commit}`], { cwd: worktree, timeoutMs: 10_000 });
+ if (known.code !== 0) {
+  throw new ParkSignal(
+   `${label}'s head ${prHead.slice(0, 8)} is not on origin/${branch} after a fetch, and the worktree is at ${here.slice(0, 8)}: nothing was changed`,
+  );
+ }
+ if (await isAncestor(worktree, prHead, here)) return;
+ const dirty = await dirtyFiles(worktree);
+ const dirtyNote = dirty.length === 0 ? "" : `; uncommitted: ${dirty.slice(0, 20).map((l) => l.trim()).join(", ")}${dirty.length > 20 ? ` (+${dirty.length - 20} more)` : ""}`;
+ if (!(await isAncestor(worktree, here, prHead))) {
+  throw new ParkSignal(
+   `the worktree (${here.slice(0, 8)}) has commits ${label}'s head (${prHead.slice(0, 8)}) does not contain: someone pushed to ${branch} while this tree held unpushed work${dirtyNote}. ` +
+    `Nothing was changed; merge or drop one side, then resume`,
+  );
+ }
+ if (dirty.length > 0) {
+  throw new ParkSignal(
+   `${label}'s head moved to ${prHead.slice(0, 8)}, past the worktree (${here.slice(0, 8)}), but the worktree has uncommitted changes${dirtyNote}. Nothing was changed; commit or discard them, then resume`,
+  );
+ }
+ journal.assertGeneration(nodeId, repo, ctx.generation, "fast-forward the worktree to the PR head");
+ const ff = await safeGit(["merge", "--ff-only", prHead], { cwd: worktree, timeoutMs: 60_000 });
+ if (ff.code !== 0) {
+  throw new GitSafetyError(`cannot fast-forward ${worktree} from ${here.slice(0, 8)} to ${prHead.slice(0, 8)}: ${ff.stderr.trim()}`);
+ }
+ journal.recordEvent("worktree-synced", {
+  nodeId,
+  repo,
+  detail: `worktree fast-forwarded from ${here} to ${label}'s head ${prHead}: pushed to ${branch} from outside this run`,
+ });
 }
 
 /**

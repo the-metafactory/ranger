@@ -957,3 +957,37 @@ async function fastForwardOnce(canonical: string, base: string, credential: GitC
   );
  }
 }
+
+/**
+ * Fetch one branch from origin into the canonical checkout, so a head
+ * someone else pushed to it (a principal's session, another agent) is
+ * there to bring a worktree to (ranger issue #228). The fetch only adds
+ * objects and moves `refs/remotes/origin/<branch>`: no local branch or
+ * worktree changes. A held ref lock is retried, as `fastForwardCanonical`.
+ */
+export async function fetchBranch(
+ canonical: string,
+ branch: string,
+ credential: GitCredential,
+ opts: { attempts?: number; backoffMs?: number } = {},
+): Promise<void> {
+ assertCredential(credential, `the fetch of ${branch} into ${canonical}`);
+ const attempts = opts.attempts ?? 4;
+ for (let attempt = 1; ; attempt++) {
+  const fetch = await safeGit(["fetch", "origin", branch], { cwd: canonical, credential, canonical, timeoutMs: 120_000 });
+  if (fetch.code === 0) return;
+  const message = fetch.stderr.trim();
+  if (!GIT_LOCK_CONTENTION.test(message) || attempt >= attempts) {
+   throw new GitSafetyError(`fetch origin ${branch} failed: ${message}`);
+  }
+  await new Promise((r) => setTimeout(r, (opts.backoffMs ?? 2_000) * attempt));
+ }
+}
+
+/** Whether `ancestor` is reachable from `descendant` (`git merge-base --is-ancestor`); throws when git cannot say. */
+export async function isAncestor(cwd: string, ancestor: string, descendant: string): Promise<boolean> {
+ const r = await safeGit(["merge-base", "--is-ancestor", ancestor, descendant], { cwd, timeoutMs: 30_000 });
+ if (r.code === 0) return true;
+ if (r.code === 1) return false;
+ throw new GitSafetyError(`cannot compare ${ancestor.slice(0, 8)} with ${descendant.slice(0, 8)}: ${r.stderr.trim()}`);
+}
