@@ -41,6 +41,7 @@ import {
 } from "./identity.ts";
 import { canonicalDir, runNode } from "./worker.ts";
 import { trustCurrentGitState } from "./git-trust.ts";
+import { workerLogFile } from "./worker-log.ts";
 import { sweepMap } from "./sweep.ts";
 import { mergeGateNow } from "./merge-desk.ts";
 import { realGitHub } from "./implement.ts";
@@ -480,20 +481,33 @@ function runDrain(
  }
 }
 
+/**
+ * The journal as JSON. `nodeId` keeps one node's rows only (ranger issue
+ * #229), and names each of its workers' log file: the session the
+ * principal opens on a parked node reads its reason there.
+ */
 async function runJournal(
  repo: string | undefined,
  configPath: string,
+ nodeId?: string,
 ): Promise<string> {
  const { config, journal } = loadCtx(configPath);
  const target = repo === undefined ? undefined : normalizeRepo(repo, config);
+ const journalPath = expandHome(config.state.journalPath);
+ const ofNode = <T extends { nodeId: string | null }>(rows: T[]): T[] =>
+  nodeId === undefined ? rows : rows.filter((r) => r.nodeId === nodeId);
+ const workers = ofNode(journal.listWorkers(target));
  const rows = {
-  journalPath: expandHome(config.state.journalPath),
+  journalPath,
   paused: journal.isPaused(),
   deadmanCount: journal.deadmanCount(),
   spawnsToday: journal.spawnsToday(),
-  workers: journal.listWorkers(target),
-  escalations: journal.listEscalations(target),
-  events: journal.listEvents(target, 50),
+  workers:
+   nodeId === undefined
+    ? workers
+    : workers.map((w) => ({ ...w, workerLog: workerLogFile(journalPath, w.repo, w.nodeId, w.generation) })),
+  escalations: ofNode(journal.listEscalations(target)),
+  events: journal.listEvents(target, 50, nodeId),
  };
  journal.close();
  return JSON.stringify(rows, null, 2);
@@ -1024,11 +1038,13 @@ program
  .command("journal")
  .description("Inspect the journal (workers, events, health)")
  .option("--repo <repo>", "filter by map repo")
+ .option("--node <id>", "one node's workers, escalations and events only, with each worker's log file")
  .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
- .action(async (options: { repo?: string; config: string }) => {
+ .action(async (options: { repo?: string; node?: string; config: string }) => {
   try {
+   if (options.node !== undefined && !/^\d+$/.test(options.node)) throw new Error(`--node must be a numeric id, got ${options.node}`);
    const configPath = resolve(process.cwd(), options.config);
-   process.stdout.write((await runJournal(options.repo, configPath)) + "\n");
+   process.stdout.write((await runJournal(options.repo, configPath, options.node)) + "\n");
   } catch (error) {
    process.stderr.write(
     `ranger journal: ${error instanceof Error ? error.message : String(error)}\n`,

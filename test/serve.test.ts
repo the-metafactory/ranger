@@ -211,7 +211,8 @@ describe("#37 — the state the dashboard shows", () => {
   expect(local).toContain("frontier-cache.ts");
   // Node #54: the "Needs you" actions are walked too, and import no write either.
   expect(local).toContain("serve-parked.ts");
-  expect(local.filter((f) => /graph-write|walk|sweep|worker|implement/.test(f))).toEqual([]);
+  // worker-log.ts only names a log file's path (ranger issue #229: the session prompt cites it); it reaches no graph.
+  expect(local.filter((f) => f !== "worker-log.ts" && /graph-write|walk|sweep|worker|implement/.test(f))).toEqual([]);
  });
 
  test("an earlier map's implement claim takes the lane for a later map in the same tick", () => {

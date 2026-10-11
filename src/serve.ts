@@ -76,6 +76,7 @@ import { childEnv, itermArgv, shellQuote } from "./launch.ts";
 import {
  type ActionKind,
  type ActionRunner,
+ type BehindBase,
  checkRunsFromPages,
  workflowRunsFromPages,
  ciState,
@@ -89,6 +90,7 @@ import {
  uncheckedNeedsEye,
 } from "./serve-parked.ts";
 import { runDrainAction } from "./serve-drain.ts";
+import { workerLogFile } from "./worker-log.ts";
 
 export { childEnv };
 
@@ -764,6 +766,9 @@ export interface HandlerContext {
   /** Every check run on a head, read under the merge's environment (see ActionDeps). */
   verifyChecks?: (repo: string, sha: string, env: Record<string, string>) => Promise<PrView["ci"] | null>;
   exists: (path: string) => boolean;
+  /** The session prompt's facts (see ActionDeps). */
+  workerLog?: (repo: string, nodeId: string) => string | null;
+  behindBase?: (repo: string, pr: number) => Promise<BehindBase | null>;
   /** Called after an action ran, to re-read what it changed. */
   after?: (entry: NeedsYouEntry) => void;
  };
@@ -864,6 +869,8 @@ export function createHandler(ctx: HandlerContext): (req: Request) => Promise<Re
     readPr: actions.readPr,
     verifyChecks: actions.verifyChecks,
     exists: actions.exists,
+    workerLog: actions.workerLog,
+    behindBase: actions.behindBase,
     inFlight,
    });
    if (result.entry !== undefined) actions.after?.(result.entry);
@@ -1744,6 +1751,45 @@ export async function readPrLive(
  };
 }
 
+/** The node's current worker log file, by the journal's row, or null with no row. */
+function workerLogOf(config: RangerConfig, repo: string, nodeId: string): string | null {
+ const journalPath = expandHome(config.state.journalPath);
+ const journal = Journal.openReadOnly(journalPath, config.maps);
+ if (journal === null) return null;
+ try {
+  const row = journal.getWorker(nodeId, repo);
+  return row === null ? null : workerLogFile(journalPath, repo, nodeId, row.generation);
+ } finally {
+  journal.close();
+ }
+}
+
+/**
+ * How many commits the PR's head is behind its base branch (ranger issue
+ * #229), by GitHub's compare under the read gate. Null on GitLab or on any
+ * failed read: the session prompt then leaves the line out.
+ */
+export async function readBehindBase(
+ config: RangerConfig,
+ repo: string,
+ number: number,
+ tokens: TokenBatch = tokenBatch(config),
+): Promise<BehindBase | null> {
+ if (!Number.isInteger(number) || number <= 0 || !isGithubRepo(repo)) return null;
+ const pr = (await restRead(tokens, repo, `repos/${repo}/pulls/${number}`)) as Record<string, unknown> | null;
+ const base = (pr?.base ?? {}) as { ref?: unknown };
+ const head = (pr?.head ?? {}) as { sha?: unknown };
+ if (typeof base.ref !== "string" || !/^[\w./-]+$/.test(base.ref)) return null;
+ if (typeof head.sha !== "string" || !/^[0-9a-f]{40}$/.test(head.sha)) return null;
+ const compare = (await restRead(
+  tokens,
+  repo,
+  `repos/${repo}/compare/${encodeURIComponent(base.ref)}...${head.sha}?per_page=1`,
+ )) as { behind_by?: unknown } | null;
+ const behind = compare?.behind_by;
+ return typeof behind === "number" && Number.isInteger(behind) && behind >= 0 ? { base: base.ref, behind } : null;
+}
+
 /** The dashboard's CI word for a port verdict. */
 const ciOfVerdict = (verdict: CiVerdict): PrView["ci"] =>
  verdict.state === "green" ? "green" : verdict.state === "red" ? "failed" : "pending";
@@ -2162,6 +2208,8 @@ export function startServe(opts: {
    readPr: (repo, pr) => readPrLive(opts.config, repo, pr),
    verifyChecks: verifyChecksAs,
    exists: existsSync,
+   workerLog: (repo, nodeId) => workerLogOf(opts.config, repo, nodeId),
+   behindBase: (repo, pr) => readBehindBase(opts.config, repo, pr),
    after: (entry) => {
     reader.forget(nodeKey(entry.repo, entry.nodeId), entry.pr === null ? null : nodeKey(entry.repo, entry.pr.number));
     void reader.refreshDetails();
