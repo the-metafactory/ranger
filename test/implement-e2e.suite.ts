@@ -725,6 +725,116 @@ describe("implement lane (node #23)", () => {
   expect(rounds).toEqual(["1", "2"]);
  }, 60_000);
 
+ // ranger issue #228: a resume after someone else pushed to the PR branch.
+ const BRANCH = "node/20-add-the-feature-module";
+ const git = (args: string[], cwd: string) => runCmd("git", args, { cwd, env: { ...process.env, ...GIT_ENV } });
+ /** A push to the PR branch from outside the run (a principal's session): returns the new head. */
+ const pushFromOutside = async (r: Rig, file: string): Promise<string> => {
+  const clone = join(r.dir, `outside-${file}`);
+  expect((await git(["clone", "--branch", BRANCH, r.origin, clone], r.dir)).code).toBe(0);
+  writeFileSync(join(clone, file), "the principal's change\n");
+  await git(["add", file], clone);
+  await git(["commit", "-m", `principal: ${file}`], clone);
+  expect((await git(["push", "origin", `HEAD:refs/heads/${BRANCH}`], clone)).code).toBe(0);
+  return (await git(["rev-parse", "HEAD"], clone)).stdout.trim();
+ };
+ /** Round 1 finds a blocker and its fix pass commits nothing: the node fails with an open PR, as a crash leaves it. */
+ const failAfterRoundOne = async () => {
+  const mode: string[] = [];
+  const r = await rig({ blockers: [1, 0], onReview: (round) => { if (round === 1) mode[1] = "noop"; } });
+  cleanup.push(r.dir);
+  mode.push(...(r.ctx.workerCommand as string[]));
+  r.ctx.workerCommand = mode;
+  expect((await runNode("20", r.ctx)).status).toBe("failed");
+  mode[1] = "build";
+  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  const worktree = r.journal.getWorker("20", "acme/widgets")?.worktree as string;
+  const head = async () => (await runCmd("git", ["rev-parse", "HEAD"], { cwd: worktree })).stdout.trim();
+  return { r, worktree, head };
+ };
+
+ test("a resume after someone else pushed to the PR branch fast-forwards the worktree to the PR head first (ranger issue #228)", async () => {
+  const { r, head } = await failAfterRoundOne();
+  const was = await head();
+  const pushed = await pushFromOutside(r, "principal.txt");
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  expect(await head()).toBe(pushed);
+  const synced = r.journal.listEvents("acme/widgets", 200).filter((e) => e.kind === "worktree-synced");
+  expect(synced).toHaveLength(1);
+  expect(synced[0]?.detail).toContain(was);
+  expect(synced[0]?.detail).toContain(pushed);
+  // Round 2 read the pushed head, the tree the run then held.
+  expect(r.calls).toHaveLength(2);
+  expect((await r.github.getPr("acme/widgets", 1)).headSha).toBe(pushed);
+ }, 60_000);
+
+ test("a resume whose worktree has uncommitted changes parks naming both SHAs and the paths, and changes nothing (ranger issue #228)", async () => {
+  const { r, worktree, head } = await failAfterRoundOne();
+  const was = await head();
+  writeFileSync(join(worktree, "scratch.txt"), "half-done\n");
+  const pushed = await pushFromOutside(r, "principal.txt");
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("parked");
+  expect(outcome.detail).toContain(was.slice(0, 8));
+  expect(outcome.detail).toContain(pushed.slice(0, 8));
+  expect(outcome.detail).toContain("scratch.txt");
+  expect(await head()).toBe(was);
+  expect(readFileSync(join(worktree, "scratch.txt"), "utf8")).toBe("half-done\n");
+  expect(r.calls).toHaveLength(1); // no review of a head the tree does not hold
+ }, 60_000);
+
+ test("a resume whose worktree holds commits the moved PR head lacks parks and changes nothing (ranger issue #228)", async () => {
+  const { r, worktree, head } = await failAfterRoundOne();
+  writeFileSync(join(worktree, "local.txt"), "unpushed\n");
+  await git(["add", "local.txt"], worktree);
+  await git(["commit", "-m", "unpushed local work"], worktree);
+  const local = await head();
+  const pushed = await pushFromOutside(r, "principal.txt");
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("parked");
+  expect(outcome.detail).toContain(`the worktree (${local.slice(0, 8)}) has commits`);
+  expect(outcome.detail).toContain(pushed.slice(0, 8));
+  expect(await head()).toBe(local);
+  expect((await r.github.getPr("acme/widgets", 1)).headSha).toBe(pushed);
+ }, 60_000);
+
+ test("a resume after someone rewound the PR branch below the pushed worktree parks and pushes nothing over it (sage round 2 on PR #234)", async () => {
+  const { r, head } = await failAfterRoundOne();
+  const pushedHead = await head();
+  expect(await r.github.sha(BRANCH)).toBe(pushedHead);
+  // Someone resets the branch on the forge to an older commit (a force push back).
+  const older = (await git(["rev-parse", `${pushedHead}~1`], r.origin)).stdout.trim();
+  expect((await git(["update-ref", `refs/heads/${BRANCH}`, older], r.origin)).code).toBe(0);
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("parked");
+  expect(outcome.detail).toContain(`went back to ${older.slice(0, 8)}`);
+  expect(outcome.detail).toContain(pushedHead.slice(0, 8));
+  expect(await r.github.sha(BRANCH)).toBe(older);
+  expect(await head()).toBe(pushedHead);
+ }, 60_000);
+
+ test("a push that lands after a review read the head sends the loop round again: no fix pass answers the old head (ranger issue #228)", async () => {
+  const r = await rig({ blockers: [1, 0] });
+  cleanup.push(r.dir);
+  let pushed = "";
+  const post = r.github.postComment.bind(r.github);
+  r.github.postComment = async (repo: string, n: number, body: string) => {
+   const id = await post(repo, n, body);
+   if (/round=1\b/.test(body)) pushed = await pushFromOutside(r, "principal.txt");
+   return id;
+  };
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  const worktree = r.journal.getWorker("20", "acme/widgets")?.worktree as string;
+  expect((await git(["rev-parse", "HEAD"], worktree)).stdout.trim()).toBe(pushed);
+  const events = r.journal.listEvents("acme/widgets", 200);
+  expect(events.some((e) => e.detail?.includes(`head moved from`) && e.detail.includes(pushed.slice(0, 8)))).toBe(true);
+  expect(events.filter((e) => e.kind === "worktree-synced")).toHaveLength(1);
+  expect(events.some((e) => e.detail?.startsWith("fix pass 1 @"))).toBe(false);
+  // Round 2 reviewed the pushed head, and the branch is that head: nothing of the run's was pushed over it.
+  expect(r.calls).toHaveLength(2);
+  expect(await r.github.sha(BRANCH)).toBe(pushed);
+ }, 60_000);
+
  test("blockers after the round cap park the node, keeping the claim", async () => {
   const r = await rig({ blockers: [2, 1] });
   cleanup.push(r.dir);

@@ -184,7 +184,8 @@ export type EventKind =
  | "substrate-capped"
  | "transient"
  | "git-trust"
- | "log-failed";
+ | "log-failed"
+ | "worktree-synced";
 
 /** The health-store key of a checkout's known-good git state (`knownGoodGitState`). */
 const knownGoodGitKey = (canonical: string): string => `git.known-good.${canonical}`;
