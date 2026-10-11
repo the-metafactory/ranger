@@ -28,6 +28,7 @@ import {
  awaitingMergeEntries,
  type NeedsYouInputs,
  type PrView,
+ type ActionDeps,
  uncheckedNeedsEye,
 } from "../src/serve-parked.ts";
 
@@ -446,7 +447,7 @@ describe("node #54 — the actions and their guards", () => {
    pr?: PrView | null;
    exists?: (p: string) => boolean;
    verifyChecks?: (repo: string, sha: string, env: Record<string, string>) => Promise<PrView["ci"] | null>;
-  } = {},
+  } & Pick<ActionDeps, "workerLog" | "behindBase"> = {},
  ) => {
   const runs: { argv: string[]; env: Record<string, string>; detached: boolean }[] = [];
   const run: ActionRunner = async (argv, env, o) => {
@@ -481,6 +482,8 @@ describe("node #54 — the actions and their guards", () => {
     configPath: "/Users/someone/ranger/ranger.yaml",
     readPr: async () => (opts.live === undefined ? greenPr() : opts.live),
     ...(opts.verifyChecks === undefined ? {} : { verifyChecks: opts.verifyChecks }),
+    ...(opts.workerLog === undefined ? {} : { workerLog: opts.workerLog }),
+    ...(opts.behindBase === undefined ? {} : { behindBase: opts.behindBase }),
     exists: opts.exists ?? (() => true),
     after: (e) => after.push(e.nodeId),
    },
@@ -697,7 +700,7 @@ describe("node #54 — the actions and their guards", () => {
   });
  }
 
- test("the session prompt carries the repo, the id and the reason class only", async () => {
+ test("the session prompt carries the repo, the id, ranger's own reason and a journal command that names the config, never prose", async () => {
   const { handler, runs } = setup();
   const res = await handler(post("/api/session", { ...ok, dryRun: true }));
   expect(res.status).toBe(200);
@@ -706,12 +709,61 @@ describe("node #54 — the actions and their guards", () => {
   expect(script).toContain("#663");
   expect(script).toContain(SEELITE);
   expect(script).toContain("review cap");
+  // ranger's one-line detail, built from its own numbers (ranger issue #229).
+  expect(script).toMatch(/major\(s\) and \d+ blocker\(s\) still open/);
+  expect(script).toContain(`ranger journal --repo ${SEELITE} --node 663 -c`);
+  expect(script).toContain("ranger/ranger.yaml");
+  // No log or behind count was wired: neither line is guessed.
+  expect(script).not.toContain("worker's log");
+  expect(script).not.toContain("behind");
   expect(script).not.toContain("good-enough");
   expect(script).not.toContain("Stations are solid");
   expect(runs).toHaveLength(0);
   await handler(post("/api/session", ok));
   expect(runs[0].argv[0]).toBe("osascript");
   expect(Object.keys(runs[0].env).sort()).toEqual(["HOME", "PATH"]);
+ });
+
+ test("the session prompt names the worker's log and how far the PR is behind its base, read when it opens", async () => {
+  const asked: [string, number][] = [];
+  const { handler } = setup({
+   workerLog: (repo, id) => `/logs/workers/${repo.replace("/", "_")}-${id}-g3.log`,
+   behindBase: async (repo, pr) => {
+    asked.push([repo, pr]);
+    return { base: "main", behind: 39 };
+   },
+  });
+  const res = await handler(post("/api/session", { ...ok, dryRun: true }));
+  const script = ((await res.json()) as { argv: string[] }).argv.join(" ");
+  expect(script).toContain("log is /logs/workers/jcfischer_seelite-663-g3.log.");
+  expect(script).toContain("The PR branch is 39 commit(s) behind main.");
+  expect(asked).toEqual([[SEELITE, ROW_663.prNumber as number]]);
+ });
+
+ test("a worker-log read that throws leaves its line out and still opens the session", async () => {
+  const { handler } = setup({
+   workerLog: () => {
+    throw new Error("database is locked");
+   },
+  });
+  const res = await handler(post("/api/session", { ...ok, dryRun: true }));
+  expect(res.status).toBe(200);
+  const script = ((await res.json()) as { argv: string[] }).argv.join(" ");
+  expect(script).toContain("#663");
+  expect(script).not.toContain("log is");
+ });
+
+ test("a behind-base read that fails leaves its line out and still opens the session", async () => {
+  const { handler } = setup({
+   behindBase: async () => {
+    throw new Error("gh api: 502");
+   },
+  });
+  const res = await handler(post("/api/session", { ...ok, dryRun: true }));
+  expect(res.status).toBe(200);
+  const script = ((await res.json()) as { argv: string[] }).argv.join(" ");
+  expect(script).toContain("#663");
+  expect(script).not.toContain("behind");
  });
 
  const refusals: [string, string, Request, Parameters<typeof setup>[0]?][] = [

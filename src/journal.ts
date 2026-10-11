@@ -454,13 +454,13 @@ export class Journal {
    .run();
  }
 
- listEvents(repo?: string, limit = 50): EventRow[] {
-  const base = this.db.select().from(events);
-  const query =
-   repo === undefined
-    ? base.orderBy(desc(events.id)).limit(limit)
-    : base.where(eq(events.repo, repo)).orderBy(desc(events.id)).limit(limit);
-  const rows = query.all();
+ /** The newest `limit` events, of one repo and, with `nodeId`, one node of it. */
+ listEvents(repo?: string, limit = 50, nodeId?: string): EventRow[] {
+  const where = and(
+   repo === undefined ? undefined : eq(events.repo, repo),
+   nodeId === undefined ? undefined : eq(events.nodeId, nodeId),
+  );
+  const rows = this.db.select().from(events).where(where).orderBy(desc(events.id)).limit(limit).all();
   return rows.map(hydrateEvent);
  }
 
