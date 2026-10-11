@@ -727,10 +727,10 @@ describe("implement lane (node #23)", () => {
 
  // ranger issue #228: a resume after someone else pushed to the PR branch.
  const BRANCH = "node/20-add-the-feature-module";
+ const git = (args: string[], cwd: string) => runCmd("git", args, { cwd, env: { ...process.env, ...GIT_ENV } });
  /** A push to the PR branch from outside the run (a principal's session): returns the new head. */
  const pushFromOutside = async (r: Rig, file: string, branch = BRANCH): Promise<string> => {
   const clone = join(r.dir, `outside-${file}`);
-  const git = (args: string[], cwd: string) => runCmd("git", args, { cwd, env: { ...process.env, ...GIT_ENV } });
   expect((await git(["clone", "--branch", branch, r.origin, clone], r.dir)).code).toBe(0);
   writeFileSync(join(clone, file), "the principal's change\n");
   await git(["add", file], clone);
@@ -786,8 +786,8 @@ describe("implement lane (node #23)", () => {
  test("a resume whose worktree holds commits the moved PR head lacks parks and changes nothing (ranger issue #228)", async () => {
   const { r, worktree, head } = await failAfterRoundOne();
   writeFileSync(join(worktree, "local.txt"), "unpushed\n");
-  await runCmd("git", ["add", "local.txt"], { cwd: worktree, env: { ...process.env, ...GIT_ENV } });
-  await runCmd("git", ["commit", "-m", "unpushed local work"], { cwd: worktree, env: { ...process.env, ...GIT_ENV } });
+  await git(["add", "local.txt"], worktree);
+  await git(["commit", "-m", "unpushed local work"], worktree);
   const local = await head();
   const pushed = await pushFromOutside(r, "principal.txt");
   const outcome = await runNode("20", r.ctx);
@@ -823,6 +823,28 @@ describe("implement lane (node #23)", () => {
   r.ctx.config.workers.maxBehindBase = 2;
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
   expect((r.github.comments.get(1) ?? []).some((c) => c.body.includes("ranger:base-merge"))).toBe(false);
+ }, 60_000);
+
+ test("a push that lands after a review read the head sends the loop round again: no fix pass answers the old head (ranger issue #228)", async () => {
+  const r = await rig({ blockers: [1, 0] });
+  cleanup.push(r.dir);
+  let pushed = "";
+  const post = r.github.postComment.bind(r.github);
+  r.github.postComment = async (repo: string, n: number, body: string) => {
+   const id = await post(repo, n, body);
+   if (/round=1\b/.test(body)) pushed = await pushFromOutside(r, "principal.txt");
+   return id;
+  };
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  const worktree = r.journal.getWorker("20", "acme/widgets")?.worktree as string;
+  expect((await git(["rev-parse", "HEAD"], worktree)).stdout.trim()).toBe(pushed);
+  const events = r.journal.listEvents("acme/widgets", 200);
+  expect(events.some((e) => e.detail?.includes(`head moved from`) && e.detail.includes(pushed.slice(0, 8)))).toBe(true);
+  expect(events.filter((e) => e.kind === "worktree-synced")).toHaveLength(1);
+  expect(events.some((e) => e.detail?.startsWith("fix pass 1 @"))).toBe(false);
+  // Round 2 reviewed the pushed head, and the branch is that head: nothing of the run's was pushed over it.
+  expect(r.calls).toHaveLength(2);
+  expect(await r.github.sha(BRANCH)).toBe(pushed);
  }, 60_000);
 
  test("blockers after the round cap park the node, keeping the claim", async () => {

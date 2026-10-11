@@ -1358,6 +1358,18 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
     reviewCapOutcome({ repo, blockers: current.blockers, majors: current.majors, round: current.round, pr: open.iid }),
    );
   }
+  // A push that landed after the review read the head (a principal's session)
+  // makes the review answer a tree the branch no longer has: the loop goes
+  // round again, syncs, and reviews the new head (ranger issue #228).
+  const after = await github.getPr(repo, open.iid, token);
+  if (after.headSha !== live.headSha) {
+   journal.recordEvent("reviewed", {
+    nodeId,
+    repo,
+    detail: `${changeRequestLabel(repo, open.iid)}'s head moved from ${live.headSha.slice(0, 8)} to ${after.headSha.slice(0, 8)} after round ${current.round} read it: no fix pass answers a review of a head the branch no longer has`,
+   });
+   continue;
+  }
   // One fix pass per review that found blockers or majors. On a resume the review is
   // re-read from its PR comment, so a crash between review and fix loses nothing,
   // and a fix an earlier run committed but never pushed is adopted, as a build is.
@@ -1550,11 +1562,14 @@ async function syncWorktreeToHead(ctx: ImplementContext, prNumber: number, prHea
  if (!/^[0-9a-f]{40}$/.test(prHead)) {
   throw new ParkSignal(`${label}'s head is unknown ("${prHead}"), and the worktree is at ${here.slice(0, 8)}: ranger will not work on a tree it cannot match to the head`);
  }
+ const haveHead = async () =>
+  (await safeGit(["cat-file", "-e", `${prHead}^{commit}`], { cwd: worktree, timeoutMs: 10_000 })).code === 0;
+ // Unpushed work on top of the head needs no fetch: the head is already here.
+ if ((await haveHead()) && (await isAncestor(worktree, prHead, here))) return;
  // The fetch carries the write credential: the state must still be the known-good one (node #81).
  await trustedSnapshot(journal, ctx.canonical, { repo, nodeId }, mapKey(ctx.map));
  await fetchBranch(ctx.canonical, branch, gitCredential(repo, ctx.token));
- const known = await safeGit(["cat-file", "-e", `${prHead}^{commit}`], { cwd: worktree, timeoutMs: 10_000 });
- if (known.code !== 0) {
+ if (!(await haveHead())) {
   throw new ParkSignal(
    `${label}'s head ${prHead.slice(0, 8)} is not on origin/${branch} after a fetch, and the worktree is at ${here.slice(0, 8)}: nothing was changed`,
   );

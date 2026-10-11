@@ -933,10 +933,20 @@ export async function fastForwardCanonical(
  opts: { attempts?: number; backoffMs?: number } = {},
 ): Promise<void> {
  assertCredential(credential, `the fetch of ${base} into ${canonical}`);
+ return retryOnRefLock(() => fastForwardOnce(canonical, base, credential), opts);
+}
+
+/**
+ * Run `once` again while it fails on a ref lock another git process holds,
+ * with a linear backoff: git's own lock is the mutex between run-nodes that
+ * share the canonical checkout. Any other failure, or the last attempt's,
+ * is thrown.
+ */
+async function retryOnRefLock<T>(once: () => Promise<T>, opts: { attempts?: number; backoffMs?: number }): Promise<T> {
  const attempts = opts.attempts ?? 4;
  for (let attempt = 1; ; attempt++) {
   try {
-   return await fastForwardOnce(canonical, base, credential);
+   return await once();
   } catch (error) {
    const contended = error instanceof GitSafetyError && GIT_LOCK_CONTENTION.test(error.message);
    if (!contended || attempt >= attempts) throw error;
@@ -987,16 +997,10 @@ export async function fetchBranch(
  opts: { attempts?: number; backoffMs?: number } = {},
 ): Promise<void> {
  assertCredential(credential, `the fetch of ${branch} into ${canonical}`);
- const attempts = opts.attempts ?? 4;
- for (let attempt = 1; ; attempt++) {
+ return retryOnRefLock(async () => {
   const fetch = await safeGit(["fetch", "origin", branch], { cwd: canonical, credential, canonical, timeoutMs: 120_000 });
-  if (fetch.code === 0) return;
-  const message = fetch.stderr.trim();
-  if (!GIT_LOCK_CONTENTION.test(message) || attempt >= attempts) {
-   throw new GitSafetyError(`fetch origin ${branch} failed: ${message}`);
-  }
-  await new Promise((r) => setTimeout(r, (opts.backoffMs ?? 2_000) * attempt));
- }
+  if (fetch.code !== 0) throw new GitSafetyError(`fetch origin ${branch} failed: ${fetch.stderr.trim()}`);
+ }, opts);
 }
 
 /** Whether `ancestor` is reachable from `descendant` (`git merge-base --is-ancestor`); throws when git cannot say. */
