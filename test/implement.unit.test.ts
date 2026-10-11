@@ -617,14 +617,14 @@ describe("a branch far behind its base is merged up (ranger issue #231)", () => 
    worktree: "/w",
    botIdentity: "ivy-bot",
    testCommand: "bun test",
-   baseMerge: { base: "main", files: [], behind: 39 },
+   baseMerge: { base: "main", files: [], stale: { behind: 39, limit: 20 } },
   });
   expect(prompt).toContain("## Base merge pass");
   expect(prompt).toContain("This branch is 39 commit(s) behind `origin/main`");
   expect(prompt).not.toContain("now conflicts with it");
   expect(prompt).toContain("git merge --no-edit origin/main");
   const marker = baseMergeMarker("a".repeat(40), "main", { behind: 39, limit: 20 });
-  expect(marker).toContain("this branch was 39 commit(s) behind `origin/main` (limit 20)");
+  expect(marker).toContain("the branch was 39 commit(s) behind origin/main (limit 20), so a worker merged it in");
   expect(marker.startsWith(`<!-- ranger:base-merge sha=${"a".repeat(40)} base=main -->`)).toBe(true);
  });
 });

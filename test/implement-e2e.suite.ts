@@ -808,13 +808,27 @@ describe("implement lane (node #23)", () => {
   expect(await head()).toBe(merged);
   const markers = (r.github.comments.get(1) ?? []).filter((c) => c.body.includes("ranger:base-merge"));
   expect(markers).toHaveLength(1);
-  expect(markers[0]?.body).toContain("3 commit(s) behind `origin/main` (limit 2)");
+  expect(markers[0]?.body).toContain("the branch was 3 commit(s) behind origin/main (limit 2)");
   const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
-  expect(events.some((d) => d.startsWith(`${BRANCH} is 3 commit(s) behind origin/main (limit 2)`))).toBe(true);
-  expect(events.some((d) => d.includes("merged in with the branch 3 commit(s) behind it (limit 2)"))).toBe(true);
+  expect(events.some((d) => d.startsWith(`${BRANCH}: the branch was 3 commit(s) behind origin/main (limit 2)`))).toBe(true);
+  expect(events.some((d) => /^base merge pass 1 @ [0-9a-f]{8}: the branch was 3 commit\(s\) behind origin\/main \(limit 2\)$/.test(d))).toBe(true);
   // Round 1 read the stale head; round 2 reads the merged one, and no fix pass answered round 1 on the stale tree.
   expect(r.calls).toHaveLength(2);
   expect(events.some((d) => d.startsWith("fix pass 1 @"))).toBe(false);
+ }, 60_000);
+
+ test("a branch far behind its base past the base merge budget goes on as it is, and the journal says so (ranger issue #231)", async () => {
+  const { r } = await failAfterRoundOne();
+  for (const file of ["base-1.txt", "base-2.txt", "base-3.txt"]) await pushFromOutside(r, file, "main");
+  r.ctx.config.workers.maxBehindBase = 2;
+  // Two base merges already landed in the head (their markers on the PR): the budget is spent.
+  const head = await r.github.sha(BRANCH);
+  const parent = (await git(["rev-parse", `${head}~1`], r.origin)).stdout.trim();
+  for (const sha of [head, parent]) await r.github.postComment("acme/widgets", 1, baseMergeMarker(sha, "main"));
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  expect((r.github.comments.get(1) ?? []).filter((c) => c.body.includes("ranger:base-merge"))).toHaveLength(2);
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.includes("is 3 commit(s) behind origin/main (limit 2), but the node has used its 2 base merge pass(es)"))).toBe(true);
  }, 60_000);
 
  test("a branch within maxBehindBase of its base is not merged up (ranger issue #231)", async () => {

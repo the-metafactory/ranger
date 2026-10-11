@@ -1231,7 +1231,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
    open.iid,
    merged,
    "push base merge",
-   `base merge pass ${baseMerges + 1} @ ${merged.sha.slice(0, 8)}: origin/${base} merged in ${stale === undefined ? "after a conflict" : `with the branch ${stale.behind} commit(s) behind it (limit ${stale.limit})`}`,
+   `base merge pass ${baseMerges + 1} @ ${merged.sha.slice(0, 8)}: ${baseMergeWhy(base, stale)}`,
   );
   baseMerges += 1;
   return undefined;
@@ -1251,9 +1251,19 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
    const limit = config.workers.maxBehindBase;
    if (behind > limit) {
     staleMerged = true;
-    const failed = await mergeBaseIn(live.headSha, { behind, limit });
-    if (failed !== undefined) return failed;
-    continue;
+    // A merge up counts against the same budget as a conflict's: past it,
+    // the branch is reviewed as it is, and the journal says how far behind.
+    if (baseMerges >= MAX_BASE_MERGES) {
+     journal.recordEvent("reviewed", {
+      nodeId,
+      repo,
+      detail: `${branch} is ${behind} commit(s) behind origin/${base} (limit ${limit}), but the node has used its ${MAX_BASE_MERGES} base merge pass(es): it goes on as it is`,
+     });
+    } else {
+     const failed = await mergeBaseIn(live.headSha, { behind, limit });
+     if (failed !== undefined) return failed;
+     continue;
+    }
    }
   }
   let current = reviewAtHead(reviews, live.headSha);
@@ -1451,7 +1461,7 @@ interface BaseMergeInput {
  /** The files a trial merge reported as conflicting (the worker's starting point). */
  files: string[];
  /** Set when the branch is merged up for trailing its base, not for a conflict (ranger issue #231). */
- behind?: number;
+ stale?: StaleBase;
 }
 
 /** The base is informational: any ref name the config accepts must still parse. */
@@ -1463,12 +1473,15 @@ export interface StaleBase {
  limit: number;
 }
 
+/** Why a base merge pass ran, in the words the marker, the journal and the push detail share. */
+export function baseMergeWhy(base: string, stale?: StaleBase): string {
+ return stale === undefined
+  ? `origin/${base} conflicted with the branch`
+  : `the branch was ${stale.behind} commit(s) behind origin/${base} (limit ${stale.limit})`;
+}
+
 export function baseMergeMarker(sha: string, base: string, stale?: StaleBase): string {
- const why =
-  stale === undefined
-   ? `\`origin/${base}\` conflicted with this branch`
-   : `this branch was ${stale.behind} commit(s) behind \`origin/${base}\` (limit ${stale.limit})`;
- return `<!-- ranger:base-merge sha=${sha} base=${base} -->\n**Base merge** — ${why}, so a worker merged it in at \`${sha.slice(0, 8)}\`. The next sage round reviews the merged branch.`;
+ return `<!-- ranger:base-merge sha=${sha} base=${base} -->\n**Base merge** — ${baseMergeWhy(base, stale)}, so a worker merged it in at \`${sha.slice(0, 8)}\`. The next sage round reviews the merged branch.`;
 }
 
 /** Base merge passes recorded on the PR by the MACHINE ACCOUNT (anyone else's markers are ignored). */
@@ -1653,9 +1666,9 @@ async function baseMergePass(ctx: ImplementContext, testCommand: string, pushedH
   detail:
    stale === undefined
     ? `${changeRequestNoun(ctx.map.repo)} conflicts with origin/${base}${files.length > 0 ? ` in ${files.join(", ")}` : ""} — a worker merges it in`
-    : `${ctx.branch} is ${stale.behind} commit(s) behind origin/${base} (limit ${stale.limit})${files.length > 0 ? `, conflicting in ${files.join(", ")}` : ""} — a worker merges it in before any review or probe run`,
+    : `${ctx.branch}: ${baseMergeWhy(base, stale)}${files.length > 0 ? `, conflicting in ${files.join(", ")}` : ""} — a worker merges it in before any review or probe run`,
  });
- const pass = await workerPass(ctx, testCommand, { kind: "base-merge", base, files, ...(stale === undefined ? {} : { behind: stale.behind }) });
+ const pass = await workerPass(ctx, testCommand, { kind: "base-merge", base, files, ...(stale === undefined ? {} : { stale }) });
  if (pass.failure !== undefined) return pass;
  const inside = await safeGit(["merge-base", "--is-ancestor", baseSha, "HEAD"], {
   cwd: ctx.worktree,
@@ -1813,7 +1826,7 @@ async function checkedWorkerPass(
   botIdentity,
   testCommand,
   ...(spec.kind === "fix" ? { review: { round: spec.round, body: spec.body } } : {}),
-  ...(spec.kind === "base-merge" ? { baseMerge: { base: spec.base, files: spec.files, ...(spec.behind === undefined ? {} : { behind: spec.behind }) } } : {}),
+  ...(spec.kind === "base-merge" ? { baseMerge: { base: spec.base, files: spec.files, ...(spec.stale === undefined ? {} : { stale: spec.stale }) } } : {}),
   probeTier: map.commands.probe !== undefined,
   remoteTests: remoteTests(ctx),
  });

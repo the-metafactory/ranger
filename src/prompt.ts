@@ -114,9 +114,9 @@ export interface ImplementPromptInput extends WorkerPromptInput {
  review?: { round: number; body: string };
  /**
   * Set on a base merge pass: the branch conflicts with origin/<base>, or
-  * trails it by `behind` commits (ranger issue #231), and the worker merges it in.
+  * trails it by `stale.behind` commits (ranger issue #231), and the worker merges it in.
   */
- baseMerge?: { base: string; files: string[]; behind?: number };
+ baseMerge?: { base: string; files: string[]; stale?: { behind: number; limit: number } };
  /** The map declares a probe tier (`commands.probe`) the supervisor runs itself. */
  probeTier?: boolean;
  /** Remote install/tests belong to the supervisor; private config never enters this prompt. */
@@ -200,11 +200,11 @@ export function assembleImplementPrompt(input: ImplementPromptInput): string {
    : [
       "",
       "## Base merge pass",
-      baseMerge.behind === undefined
+      baseMerge.stale === undefined
        ? `\`origin/${baseMerge.base}\` moved after this branch was cut, and the branch now conflicts with it${
           baseMerge.files.length > 0 ? ` in: ${baseMerge.files.map((f) => `\`${f}\``).join(", ")}` : ""
          }.`
-       : `This branch is ${baseMerge.behind} commit(s) behind \`origin/${baseMerge.base}\`: too far to review and probe as it is, since` +
+       : `This branch is ${baseMerge.stale.behind} commit(s) behind \`origin/${baseMerge.base}\`: too far to review and probe as it is, since` +
          ` the base may have changed how the tests and probes run${
           baseMerge.files.length > 0 ? `. A trial merge conflicts in: ${baseMerge.files.map((f) => `\`${f}\``).join(", ")}` : ""
          }.`,
