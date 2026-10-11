@@ -855,6 +855,21 @@ export async function commitsAhead(
  return Number(result.stdout.trim()) || 0;
 }
 
+/** Commits on origin/<base> that the branch's HEAD does not have (ranger issue #231). */
+export async function commitsBehind(
+ worktree: string,
+ base: string,
+): Promise<number> {
+ const result = await safeGit(["rev-list", "--count", `HEAD..origin/${base}`], {
+  cwd: worktree,
+  timeoutMs: 10_000,
+ });
+ if (result.code !== 0) {
+  throw new GitSafetyError(`cannot count commits behind origin/${base}: ${result.stderr.trim()}`);
+ }
+ return Number(result.stdout.trim()) || 0;
+}
+
 /** Refuse the push when any branch commit message carries a closing keyword. */
 export async function assertNoClosingKeywords(
  worktree: string,

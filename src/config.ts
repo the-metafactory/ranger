@@ -265,6 +265,14 @@ const WorkersSchema = z.object({
   */
  reviewRounds: z.number().int().positive().default(2),
  /**
+  * How many commits an implement PR's branch may trail origin/<base> before
+  * the review loop merges the base in, ahead of any review or probe run
+  * (ranger issue #231: seelite #769 ran 100 probes on a head 39 commits
+  * behind, and reds main had already fixed parked it again). The merge is
+  * a base merge pass, and the next sage round reviews the merged branch.
+  */
+ maxBehindBase: z.number().int().nonnegative().default(20),
+ /**
   * CPU priority for everything ranger runs except the browser probes: worker
   * sessions, install and test commands, sage reviews (`nice -n`; 0 = none).
   * The probes are timing-sensitive and keep normal priority (2026-10-05: load
