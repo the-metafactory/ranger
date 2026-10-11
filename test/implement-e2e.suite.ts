@@ -839,6 +839,21 @@ describe("implement lane (node #23)", () => {
   expect((r.github.comments.get(1) ?? []).some((c) => c.body.includes("ranger:base-merge"))).toBe(false);
  }, 60_000);
 
+ test("a resume after someone rewound the PR branch below the pushed worktree parks and pushes nothing over it (sage round 2 on PR #234)", async () => {
+  const { r, head } = await failAfterRoundOne();
+  const pushedHead = await head();
+  expect(await r.github.sha(BRANCH)).toBe(pushedHead);
+  // Someone resets the branch on the forge to an older commit (a force push back).
+  const older = (await git(["rev-parse", `${pushedHead}~1`], r.origin)).stdout.trim();
+  expect((await git(["update-ref", `refs/heads/${BRANCH}`, older], r.origin)).code).toBe(0);
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("parked");
+  expect(outcome.detail).toContain(`went back to ${older.slice(0, 8)}`);
+  expect(outcome.detail).toContain(pushedHead.slice(0, 8));
+  expect(await r.github.sha(BRANCH)).toBe(older);
+  expect(await head()).toBe(pushedHead);
+ }, 60_000);
+
  test("a push that lands after a review read the head sends the loop round again: no fix pass answers the old head (ranger issue #228)", async () => {
   const r = await rig({ blockers: [1, 0] });
   cleanup.push(r.dir);
