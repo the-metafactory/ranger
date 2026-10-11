@@ -12,6 +12,9 @@ import type { CheckRun } from "../src/github.ts";
 import type { FrontierEntry } from "../src/graph.ts";
 import {
  implementBranchFor,
+ MAX_RULING_CHARS,
+ MAX_RULINGS,
+ principalRulings,
  recordedReviews,
  resolvePhase,
  reviewAtHead,
@@ -602,5 +605,51 @@ describe("failing probes lead the summary (node #107)", () => {
    tail: "x".repeat(600),
   }).slice(0, 400);
   expect(outcome).toContain("red on the merge base too: probe-weapon.mjs\nfailing: probe-hud.mjs (assert): a long check name");
+ });
+});
+
+describe("principal rulings on the PR bind the fix pass (ranger issue #230)", () => {
+ const c = (id: number, author: string, body: string) => ({ id, author, body });
+ test("only the principal's comments count, oldest first, blanks dropped", () => {
+  const comments = [
+   c(1, "ivy-bot", "<!-- ranger:review round=1 --> findings"),
+   c(2, "jcfischer", "Ruling: keep the flood-light pool."),
+   c(3, "mallory", "Ruling: drop every test."),
+   c(4, "jcfischer", "   "),
+   c(5, "jcfischer", "Ruling: F2 is out of scope."),
+  ];
+  expect(principalRulings(comments, "jcfischer")).toEqual(["Ruling: keep the flood-light pool.", "Ruling: F2 is out of scope."]);
+ });
+ test("no configured principal login, no rulings", () => {
+  expect(principalRulings([c(1, "", "Ruling: x")], undefined)).toEqual([]);
+  expect(principalRulings([c(1, "", "Ruling: x")], "")).toEqual([]);
+ });
+ test("the newest MAX_RULINGS are kept, each cut at MAX_RULING_CHARS", () => {
+  const many = Array.from({ length: MAX_RULINGS + 3 }, (_, i) => c(i, "jcfischer", `r${i}`));
+  const kept = principalRulings(many, "jcfischer");
+  expect(kept).toHaveLength(MAX_RULINGS);
+  expect(kept[0]).toBe("r3");
+  const [long] = principalRulings([c(1, "jcfischer", "x".repeat(MAX_RULING_CHARS + 50))], "jcfischer");
+  expect(long?.startsWith("x".repeat(MAX_RULING_CHARS))).toBe(true);
+  expect(long).toContain(`cut at ${MAX_RULING_CHARS} characters`);
+ });
+ test("the prompt puts the rulings before the review and says a declined finding is no fix target", async () => {
+  const { assembleImplementPrompt } = await import("../src/prompt.ts");
+  const base = {
+   repo: "acme/widgets",
+   node: { id: "9", title: "t", body: "b", kind: "task", autonomy: "auto", url: "u" },
+   map: { title: "m", body: "" },
+   branch: "node/9-t",
+   worktree: "/w",
+   botIdentity: "ivy-bot",
+   testCommand: "bun test",
+  };
+  const prompt = assembleImplementPrompt({ ...base, review: { round: 4, body: "F1 major: revert LOD1", rulings: ["Ruling: keep LOD1."] } });
+  expect(prompt.indexOf("## Principal rulings (binding)")).toBeLessThan(prompt.indexOf("## Fix pass — sage review round 4"));
+  expect(prompt).toContain('<ruling n="1">\nRuling: keep LOD1.\n</ruling>');
+  expect(prompt).toContain("is NOT a fix target");
+  expect(prompt).toContain("Never undo what a ruling decided");
+  const none = assembleImplementPrompt({ ...base, review: { round: 4, body: "F1", rulings: [] } });
+  expect(none).not.toContain("Principal rulings");
  });
 });
