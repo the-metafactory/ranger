@@ -661,3 +661,27 @@ describe("principal rulings on the PR bind the fix pass (ranger issue #230)", ()
   expect(none).not.toContain("Principal rulings");
  });
 });
+
+describe("a branch far behind its base is merged up (ranger issue #231)", () => {
+ test("the base merge prompt and marker name how far behind, not a conflict", async () => {
+  const { assembleImplementPrompt } = await import("../src/prompt.ts");
+  const { baseMergeMarker } = await import("../src/implement.ts");
+  const prompt = assembleImplementPrompt({
+   repo: "acme/widgets",
+   node: { id: "9", title: "t", body: "b", kind: "task", autonomy: "auto", url: "u" },
+   map: { title: "m", body: "" },
+   branch: "node/9-t",
+   worktree: "/w",
+   botIdentity: "ivy-bot",
+   testCommand: "bun test",
+   baseMerge: { base: "main", files: [], stale: { behind: 39, limit: 20 } },
+  });
+  expect(prompt).toContain("## Base merge pass");
+  expect(prompt).toContain("This branch is 39 commit(s) behind `origin/main`");
+  expect(prompt).not.toContain("now conflicts with it");
+  expect(prompt).toContain("git merge --no-edit origin/main");
+  const marker = baseMergeMarker("a".repeat(40), "main", { behind: 39, limit: 20 });
+  expect(marker).toContain("the branch was 39 commit(s) behind origin/main (limit 20), so a worker merged it in");
+  expect(marker.startsWith(`<!-- ranger:base-merge sha=${"a".repeat(40)} base=main -->`)).toBe(true);
+ });
+});

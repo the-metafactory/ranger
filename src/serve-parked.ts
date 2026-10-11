@@ -719,23 +719,44 @@ export function deskArgv(args: { rangerBin: string; configPath: string; repo: st
  return [args.rangerBin, "merge-desk", "--map", `${args.repo}#${args.root}`, ...(args.settle ? ["--settle"] : []), "-c", args.configPath];
 }
 
+/** How far a PR's head is behind its base branch, as a compare read it. */
+export interface BehindBase {
+ base: string;
+ behind: number;
+}
+
 /**
  * The session the principal opens on a parked node. The prompt carries the
- * repo, the id and the reason class only: the session reads the node, the
- * PR and the journal itself.
+ * repo, the id, the reason ranger built from its own numbers, and where the
+ * rest is: a journal command that runs from the session's checkout (it
+ * names the config, ranger issue #229), the worker's log, and how far the
+ * PR is behind its base. Never the node's title or the PR's prose: the
+ * session reads those itself.
  */
 export function sessionPlan(args: {
  repo: string;
  nodeId: string;
- reason: ReasonClass;
+ reason: Pick<Reason, "class" | "detail">;
  cwd: string;
+ configPath?: string;
+ workerLog?: string | null;
+ behind?: BehindBase | null;
 }): { prompt: string; shellCommand: string; argv: string[] } {
  if (!REPO_PATTERN.test(args.repo)) throw new Error(`bad repo: ${args.repo}`);
  if (!ID_PATTERN.test(args.nodeId)) throw new Error(`bad node id: ${args.nodeId}`);
+ const detail = args.reason.detail.replace(/\s+/g, " ").trim().slice(0, 300);
+ const config = args.configPath === undefined ? "" : ` -c ${shellQuote(args.configPath)}`;
+ const facts = [
+  args.workerLog == null ? null : `The worker's log is ${args.workerLog}.`,
+  args.behind == null ? null : `The PR branch is ${args.behind.behind} commit(s) behind ${args.behind.base}.`,
+ ].filter((f) => f !== null);
  const prompt =
-  `Node #${args.nodeId} on ${args.repo} stopped and needs me (ranger's reason: ${args.reason}). ` +
+  `Node #${args.nodeId} on ${args.repo} stopped and needs me (ranger's reason: ${args.reason.class}` +
+  `${detail === "" ? "" : `: ${detail}`}). ` +
   `Read the node with \`soma graph node ${args.nodeId} --repo ${args.repo}\`, its PR, and ranger's ` +
-  `journal for it (\`ranger journal --repo ${args.repo}\`), then tell me what the next step is.`;
+  `journal for it (\`ranger journal --repo ${args.repo} --node ${args.nodeId}${config}\`). ` +
+  (facts.length === 0 ? "" : `${facts.join(" ")} `) +
+  `Then tell me what the next step is.`;
  const shellCommand = `cd ${shellQuote(args.cwd)} && claude ${shellQuote(prompt)}`;
  return { prompt, shellCommand, argv: itermArgv(shellCommand) };
 }
@@ -768,6 +789,10 @@ export interface ActionDeps {
   */
  verifyChecks?: (repo: string, sha: string, env: Record<string, string>) => Promise<PrView["ci"] | null>;
  exists: (path: string) => boolean;
+ /** The node's current worker log file, named in the session prompt; null or absent leaves it out. */
+ workerLog?: (repo: string, nodeId: string) => string | null;
+ /** How far the PR is behind its base, read when a session opens; null or absent leaves it out. */
+ behindBase?: (repo: string, pr: number) => Promise<BehindBase | null>;
  /**
   * Nodes with an action running now (`repo#id`), owned by the server. Held
   * from the row check until the child returns: the journal only shows a
@@ -995,7 +1020,26 @@ async function runHeldAction(
   if (!entry.actions.session.offered) return refusal(409, entry.actions.session.why);
   const cwd = entry.actions.session.cwd;
   if (!deps.exists(cwd)) return refusal(409, `${cwd} no longer exists`);
-  argv = sessionPlan({ repo: entry.repo, nodeId: entry.nodeId, reason: entry.reason.class, cwd }).argv;
+  // Facts for the prompt, read now: a read that fails leaves its line out, never the session.
+  const behind =
+   entry.pr === null || deps.behindBase === undefined
+    ? null
+    : await deps.behindBase(entry.repo, entry.pr.number).catch(() => null);
+  let workerLog: string | null = null;
+  try {
+   workerLog = deps.workerLog?.(entry.repo, entry.nodeId) ?? null;
+  } catch {
+   /* a journal that cannot be read leaves the line out */
+  }
+  argv = sessionPlan({
+   repo: entry.repo,
+   nodeId: entry.nodeId,
+   reason: entry.reason,
+   cwd,
+   ...(deps.configPath === undefined ? {} : { configPath: deps.configPath }),
+   workerLog,
+   behind,
+  }).argv;
   env = childEnv(deps.env);
  }
  // A merged PR closes through the merge desk, which watches awaiting-merge

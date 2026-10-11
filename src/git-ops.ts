@@ -840,19 +840,23 @@ export async function dirtyFiles(worktree: string): Promise<string[]> {
  return result.stdout.split("\n").filter((l) => l.trim().length > 0);
 }
 
-/** Commits on the branch that are not on origin/<base>. */
-export async function commitsAhead(
- worktree: string,
- base: string,
-): Promise<number> {
- const result = await safeGit(["rev-list", "--count", `origin/${base}..HEAD`], {
-  cwd: worktree,
-  timeoutMs: 10_000,
- });
+/** How many commits `range` holds (`git rev-list --count`); `what` names it in the error. */
+async function countRevs(worktree: string, range: string, what: string): Promise<number> {
+ const result = await safeGit(["rev-list", "--count", range], { cwd: worktree, timeoutMs: 10_000 });
  if (result.code !== 0) {
-  throw new GitSafetyError(`cannot count commits ahead of origin/${base}: ${result.stderr.trim()}`);
+  throw new GitSafetyError(`cannot count ${what}: ${result.stderr.trim()}`);
  }
  return Number(result.stdout.trim()) || 0;
+}
+
+/** Commits on the branch that are not on origin/<base>. */
+export async function commitsAhead(worktree: string, base: string): Promise<number> {
+ return countRevs(worktree, `origin/${base}..HEAD`, `commits ahead of origin/${base}`);
+}
+
+/** Commits on origin/<base> that the branch's HEAD does not have (ranger issue #231). */
+export async function commitsBehind(worktree: string, base: string): Promise<number> {
+ return countRevs(worktree, `HEAD..origin/${base}`, `commits behind origin/${base}`);
 }
 
 /** Refuse the push when any branch commit message carries a closing keyword. */
@@ -918,10 +922,20 @@ export async function fastForwardCanonical(
  opts: { attempts?: number; backoffMs?: number } = {},
 ): Promise<void> {
  assertCredential(credential, `the fetch of ${base} into ${canonical}`);
+ return retryOnRefLock(() => fastForwardOnce(canonical, base, credential), opts);
+}
+
+/**
+ * Run `once` again while it fails on a ref lock another git process holds,
+ * with a linear backoff: git's own lock is the mutex between run-nodes that
+ * share the canonical checkout. Any other failure, or the last attempt's,
+ * is thrown.
+ */
+async function retryOnRefLock<T>(once: () => Promise<T>, opts: { attempts?: number; backoffMs?: number }): Promise<T> {
  const attempts = opts.attempts ?? 4;
  for (let attempt = 1; ; attempt++) {
   try {
-   return await fastForwardOnce(canonical, base, credential);
+   return await once();
   } catch (error) {
    const contended = error instanceof GitSafetyError && GIT_LOCK_CONTENTION.test(error.message);
    if (!contended || attempt >= attempts) throw error;
@@ -956,4 +970,32 @@ async function fastForwardOnce(canonical: string, base: string, credential: GitC
    `cannot fast-forward ${base} in the canonical checkout ${canonical}: ${result.stderr.trim()}`,
   );
  }
+}
+
+/**
+ * Fetch one branch from origin into the canonical checkout, so a head
+ * someone else pushed to it (a principal's session, another agent) is
+ * there to bring a worktree to (ranger issue #228). The fetch only adds
+ * objects and moves `refs/remotes/origin/<branch>`: no local branch or
+ * worktree changes. A held ref lock is retried, as `fastForwardCanonical`.
+ */
+export async function fetchBranch(
+ canonical: string,
+ branch: string,
+ credential: GitCredential,
+ opts: { attempts?: number; backoffMs?: number } = {},
+): Promise<void> {
+ assertCredential(credential, `the fetch of ${branch} into ${canonical}`);
+ return retryOnRefLock(async () => {
+  const fetch = await safeGit(["fetch", "origin", branch], { cwd: canonical, credential, canonical, timeoutMs: 120_000 });
+  if (fetch.code !== 0) throw new GitSafetyError(`fetch origin ${branch} failed: ${fetch.stderr.trim()}`);
+ }, opts);
+}
+
+/** Whether `ancestor` is reachable from `descendant` (`git merge-base --is-ancestor`); throws when git cannot say. */
+export async function isAncestor(cwd: string, ancestor: string, descendant: string): Promise<boolean> {
+ const r = await safeGit(["merge-base", "--is-ancestor", ancestor, descendant], { cwd, timeoutMs: 30_000 });
+ if (r.code === 0) return true;
+ if (r.code === 1) return false;
+ throw new GitSafetyError(`cannot compare ${ancestor.slice(0, 8)} with ${descendant.slice(0, 8)}: ${r.stderr.trim()}`);
 }

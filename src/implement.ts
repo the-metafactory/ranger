@@ -14,11 +14,14 @@ import {
  assertNoClosingKeywords,
  commitsAhead,
  dirtyFiles,
+ commitsBehind,
  fastForwardCanonical,
+ fetchBranch,
  findClosingKeyword,
  gitCredential,
  GitSafetyError,
  headSha,
+ isAncestor,
  safeGit,
  vettedPush,
 } from "./git-ops.ts";
@@ -1236,9 +1239,62 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
  // The head whose set-aside major is already journaled: once per head per
  // run, as the loop re-reads an unchanged head on every pass.
  let notedSha: string | undefined;
+ let staleMerged = false;
+ /**
+  * One base merge pass on the pushed head, then its marker and its push. A
+  * failed pass is the run's outcome. `stale` says the branch was merged up
+  * for being far behind its base, not for a conflict.
+  */
+ const mergeBaseIn = async (pushedHead: string, stale?: StaleBase): Promise<ImplementOutcome | undefined> => {
+  const merged = await baseMergePass(ctx, testCommand, pushedHead, stale);
+  workerExit = merged.workerExit;
+  if (merged.failure !== undefined) return merged.failure;
+  // The marker first: a merged head pushed without one would read as an
+  // unreviewed head at the cap. A marker whose push never happens counts
+  // for nothing (landedBaseMerges), so a crash between them costs nothing.
+  fence("record the base merge");
+  await github.postComment(repo, open.iid, baseMergeMarker(merged.sha, base, stale), token);
+  await publishPass(
+   ctx,
+   github,
+   open.iid,
+   merged,
+   "push base merge",
+   `base merge pass ${baseMerges + 1} @ ${merged.sha.slice(0, 8)}: ${baseMergeWhy(base, stale)}`,
+  );
+  baseMerges += 1;
+  return undefined;
+ };
  for (;;) {
   const cap = capNow();
   const live = await github.getPr(repo, open.iid, token);
+  // Whatever reviews or fixes this head works on a tree at it (ranger issue #228).
+  await syncWorktreeToHead(ctx, open.iid, live.headSha);
+  // A branch far behind its base is merged up before anything reviews or
+  // probes it (ranger issue #231): reds the base already fixed would park it
+  // again. Once per run, and only on the pushed head: unpushed work in the
+  // worktree is adoptBuiltWork's to judge first, and the merge pass resets
+  // to the pushed head.
+  if (!staleMerged && (await headSha(worktree)) === live.headSha) {
+   const behind = await commitsBehind(worktree, base);
+   const limit = config.workers.maxBehindBase;
+   if (behind > limit) {
+    staleMerged = true;
+    // A merge up counts against the same budget as a conflict's: past it,
+    // the branch is reviewed as it is, and the journal says how far behind.
+    if (baseMerges >= MAX_BASE_MERGES) {
+     journal.recordEvent("reviewed", {
+      nodeId,
+      repo,
+      detail: `${branch} is ${behind} commit(s) behind origin/${base} (limit ${limit}), but the node has used its ${MAX_BASE_MERGES} base merge pass(es): it goes on as it is`,
+     });
+    } else {
+     const failed = await mergeBaseIn(live.headSha, { behind, limit });
+     if (failed !== undefined) return failed;
+     continue;
+    }
+   }
+  }
   let current = reviewAtHead(reviews, live.headSha);
   const superseded = supersededNote(reviews, live.headSha);
   if (superseded !== null && notedSha !== live.headSha) {
@@ -1332,29 +1388,26 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
    if (baseMerges >= MAX_BASE_MERGES) {
     throw new ParkSignal(baseConflictOutcome({ repo, pr: open.iid, base, passes: baseMerges }));
    }
-   const merged = await baseMergePass(ctx, testCommand, live.headSha);
-   workerExit = merged.workerExit;
-   if (merged.failure !== undefined) return merged.failure;
-   // The marker first: a merged head pushed without one would read as an
-   // unreviewed head at the cap. A marker whose push never happens counts
-   // for nothing (landedBaseMerges), so a crash between them costs nothing.
-   fence("record the base merge");
-   await github.postComment(repo, open.iid, baseMergeMarker(merged.sha, base), token);
-   await publishPass(
-    ctx,
-    github,
-    open.iid,
-    merged,
-    "push base merge",
-    `base merge pass ${baseMerges + 1} @ ${merged.sha.slice(0, 8)}: origin/${base} merged in after a conflict`,
-   );
-   baseMerges += 1;
+   const failed = await mergeBaseIn(live.headSha);
+   if (failed !== undefined) return failed;
    continue;
   }
   if (current.round >= cap) {
    throw new ParkSignal(
     reviewCapOutcome({ repo, blockers: current.blockers, majors: current.majors, round: current.round, pr: open.iid }),
    );
+  }
+  // A push that landed after the review read the head (a principal's session)
+  // makes the review answer a tree the branch no longer has: the loop goes
+  // round again, syncs, and reviews the new head (ranger issue #228).
+  const after = await github.getPr(repo, open.iid, token);
+  if (after.headSha !== live.headSha) {
+   journal.recordEvent("reviewed", {
+    nodeId,
+    repo,
+    detail: `${changeRequestLabel(repo, open.iid)}'s head moved from ${live.headSha.slice(0, 8)} to ${after.headSha.slice(0, 8)} after round ${current.round} read it: no fix pass answers a review of a head the branch no longer has`,
+   });
+   continue;
   }
   // One fix pass per review that found blockers or majors. On a resume the review is
   // re-read from its PR comment, so a crash between review and fix loses nothing,
@@ -1440,13 +1493,28 @@ interface BaseMergeInput {
  base: string;
  /** The files a trial merge reported as conflicting (the worker's starting point). */
  files: string[];
+ /** Set when the branch is merged up for trailing its base, not for a conflict (ranger issue #231). */
+ stale?: StaleBase;
 }
 
 /** The base is informational: any ref name the config accepts must still parse. */
 const BASE_MERGE_MARKER = /<!-- ranger:base-merge sha=([0-9a-f]{7,64})(?: base=[^\s>]*)? -->/;
 
-export function baseMergeMarker(sha: string, base: string): string {
- return `<!-- ranger:base-merge sha=${sha} base=${base} -->\n**Base merge** — \`origin/${base}\` conflicted with this branch, so a worker merged it in at \`${sha.slice(0, 8)}\`. The next sage round reviews the merged branch.`;
+/** A branch merged up for trailing its base (ranger issue #231): how far, and the configured limit. */
+export interface StaleBase {
+ behind: number;
+ limit: number;
+}
+
+/** Why a base merge pass ran, in the words the marker, the journal and the push detail share. */
+export function baseMergeWhy(base: string, stale?: StaleBase): string {
+ return stale === undefined
+  ? `origin/${base} conflicted with the branch`
+  : `the branch was ${stale.behind} commit(s) behind origin/${base} (limit ${stale.limit})`;
+}
+
+export function baseMergeMarker(sha: string, base: string, stale?: StaleBase): string {
+ return `<!-- ranger:base-merge sha=${sha} base=${base} -->\n**Base merge** — ${baseMergeWhy(base, stale)}, so a worker merged it in at \`${sha.slice(0, 8)}\`. The next sage round reviews the merged branch.`;
 }
 
 /** Base merge passes recorded on the PR by the MACHINE ACCOUNT (anyone else's markers are ignored). */
@@ -1515,6 +1583,85 @@ async function conflictsWithBase(ctx: ImplementContext, github: ForgePort, prNum
 }
 
 /**
+ * Bring the worktree to the change request's live head before anything
+ * reviews or works on it (ranger issue #228). A principal's session or
+ * another agent can push to the branch while the node is parked; a resumed
+ * worker on the old tree would answer a review of the new head by editing
+ * code that head no longer has.
+ *
+ * - At the head already: nothing to do, and no fetch.
+ * - The head is inside the worktree's HEAD (an earlier run committed and
+ *   never pushed): left as it is, for `adoptBuiltWork` to judge.
+ * - The worktree's HEAD is inside the head and the tree is clean: fetched
+ *   and fast-forwarded, and the journal records both SHAs.
+ * - Anything else (the worktree has commits the head lacks, or uncommitted
+ *   changes): parks naming both SHAs and the dirty paths, and changes
+ *   nothing in the worktree.
+ */
+async function syncWorktreeToHead(ctx: ImplementContext, prNumber: number, prHead: string): Promise<void> {
+ const { worktree, journal, branch } = ctx;
+ const repo = ctx.map.repo;
+ const nodeId = ctx.node.ref.id;
+ const here = await headSha(worktree);
+ if (here === prHead) return;
+ const label = changeRequestLabel(repo, prNumber);
+ if (!/^[0-9a-f]{40}$/.test(prHead)) {
+  throw new ParkSignal(`${label}'s head is unknown ("${prHead}"), and the worktree is at ${here.slice(0, 8)}: ranger will not work on a tree it cannot match to the head`);
+ }
+ const haveHead = async () =>
+  (await safeGit(["cat-file", "-e", `${prHead}^{commit}`], { cwd: worktree, timeoutMs: 10_000 })).code === 0;
+ // The head inside the worktree's HEAD needs no fetch: the head is already
+ // here. It is unpushed work on top of the head (adoptBuiltWork judges it),
+ // unless HEAD was itself pushed and the branch then rewound under it: then
+ // origin/<branch>, as ranger's last push left it (nothing fetched yet),
+ // still holds HEAD, and pushing it again would undo the rewind (sage round
+ // 2 on PR #234).
+ if ((await haveHead()) && (await isAncestor(worktree, prHead, here))) {
+  const tracked = await safeGit(["rev-parse", "--verify", "--quiet", `refs/remotes/origin/${branch}^{commit}`], { cwd: worktree, timeoutMs: 10_000 });
+  const pushedTip = tracked.stdout.trim();
+  if (tracked.code === 0 && /^[0-9a-f]{40}$/.test(pushedTip) && (await isAncestor(worktree, here, pushedTip))) {
+   throw new ParkSignal(
+    `${label}'s head went back to ${prHead.slice(0, 8)}, behind the worktree (${here.slice(0, 8)}), which ranger had pushed: someone rewound ${branch}. ` +
+     `Nothing was changed and nothing is pushed over the rewind; reset the worktree or the branch, then resume`,
+   );
+  }
+  return;
+ }
+ // The fetch carries the write credential: the state must still be the known-good one (node #81).
+ await trustedSnapshot(journal, ctx.canonical, { repo, nodeId }, mapKey(ctx.map));
+ await fetchBranch(ctx.canonical, branch, gitCredential(repo, ctx.token));
+ if (!(await haveHead())) {
+  throw new ParkSignal(
+   `${label}'s head ${prHead.slice(0, 8)} is not on origin/${branch} after a fetch, and the worktree is at ${here.slice(0, 8)}: nothing was changed`,
+  );
+ }
+ if (await isAncestor(worktree, prHead, here)) return;
+ const dirty = await dirtyFiles(worktree);
+ const dirtyNote = dirty.length === 0 ? "" : `; uncommitted: ${dirty.slice(0, 20).map((l) => l.trim()).join(", ")}${dirty.length > 20 ? ` (+${dirty.length - 20} more)` : ""}`;
+ if (!(await isAncestor(worktree, here, prHead))) {
+  throw new ParkSignal(
+   `the worktree (${here.slice(0, 8)}) has commits ${label}'s head (${prHead.slice(0, 8)}) does not contain: someone pushed to ${branch} while this tree held unpushed work${dirtyNote}. ` +
+    `Nothing was changed; merge or drop one side, then resume`,
+  );
+ }
+ if (dirty.length > 0) {
+  throw new ParkSignal(
+   `${label}'s head moved to ${prHead.slice(0, 8)}, past the worktree (${here.slice(0, 8)}), but the worktree has uncommitted changes${dirtyNote}. Nothing was changed; commit or discard them, then resume`,
+  );
+ }
+ journal.assertGeneration(nodeId, repo, ctx.generation, "fast-forward the worktree to the PR head");
+ const ff = await safeGit(["merge", "--ff-only", prHead], { cwd: worktree, timeoutMs: 60_000 });
+ if (ff.code !== 0) {
+  throw new GitSafetyError(`cannot fast-forward ${worktree} from ${here.slice(0, 8)} to ${prHead.slice(0, 8)}: ${ff.stderr.trim()}`);
+ }
+ journal.recordEvent("worktree-synced", {
+  nodeId,
+  repo,
+  detail: `worktree fast-forwarded from ${here} to ${label}'s head ${prHead}: pushed to ${branch} from outside this run`,
+ });
+}
+
+/**
  * The files `git merge-tree` reports as conflicting between the branch and
  * origin/<base>: a hint for the worker's prompt, empty when git cannot say.
  */
@@ -1533,7 +1680,7 @@ async function conflictingFiles(worktree: string, base: string): Promise<string[
  * and resolves; the supervisor's own checks then require a clean tree,
  * passing tests, and origin/<base> actually inside the branch.
  */
-async function baseMergePass(ctx: ImplementContext, testCommand: string, pushedHead: string): Promise<PassResult> {
+async function baseMergePass(ctx: ImplementContext, testCommand: string, pushedHead: string, stale?: StaleBase): Promise<PassResult> {
  const base = ctx.map.base;
  // Start from what GitHub has: an earlier run may have merged locally and
  // crashed before its push, and that unpushed state is neither vetted nor
@@ -1564,9 +1711,12 @@ async function baseMergePass(ctx: ImplementContext, testCommand: string, pushedH
  ctx.journal.recordEvent("reviewed", {
   nodeId: ctx.node.ref.id,
   repo: ctx.map.repo,
-  detail: `${changeRequestNoun(ctx.map.repo)} conflicts with origin/${base}${files.length > 0 ? ` in ${files.join(", ")}` : ""} — a worker merges it in`,
+  detail:
+   stale === undefined
+    ? `${changeRequestNoun(ctx.map.repo)} conflicts with origin/${base}${files.length > 0 ? ` in ${files.join(", ")}` : ""} — a worker merges it in`
+    : `${ctx.branch}: ${baseMergeWhy(base, stale)}${files.length > 0 ? `, conflicting in ${files.join(", ")}` : ""} — a worker merges it in before any review or probe run`,
  });
- const pass = await workerPass(ctx, testCommand, { kind: "base-merge", base, files });
+ const pass = await workerPass(ctx, testCommand, { kind: "base-merge", base, files, ...(stale === undefined ? {} : { stale }) });
  if (pass.failure !== undefined) return pass;
  const inside = await safeGit(["merge-base", "--is-ancestor", baseSha, "HEAD"], {
   cwd: ctx.worktree,
@@ -1724,7 +1874,7 @@ async function checkedWorkerPass(
   botIdentity,
   testCommand,
   ...(spec.kind === "fix" ? { review: { round: spec.round, body: spec.body }, rulings: spec.rulings } : {}),
-  ...(spec.kind === "base-merge" ? { baseMerge: { base: spec.base, files: spec.files } } : {}),
+  ...(spec.kind === "base-merge" ? { baseMerge: { base: spec.base, files: spec.files, ...(spec.stale === undefined ? {} : { stale: spec.stale }) } } : {}),
   probeTier: map.commands.probe !== undefined,
   remoteTests: remoteTests(ctx),
  });

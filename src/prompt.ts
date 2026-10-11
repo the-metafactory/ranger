@@ -114,8 +114,11 @@ export interface ImplementPromptInput extends WorkerPromptInput {
  review?: { round: number; body: string };
  /** The principal's rulings on the PR, oldest first: binding, and ahead of any review (ranger issue #230). */
  rulings?: string[];
- /** Set on a base merge pass: the branch conflicts with origin/<base>, and the worker merges it in. */
- baseMerge?: { base: string; files: string[] };
+ /**
+  * Set on a base merge pass: the branch conflicts with origin/<base>, or
+  * trails it by `stale.behind` commits (ranger issue #231), and the worker merges it in.
+  */
+ baseMerge?: { base: string; files: string[]; stale?: { behind: number; limit: number } };
  /** The map declares a probe tier (`commands.probe`) the supervisor runs itself. */
  probeTier?: boolean;
  /** Remote install/tests belong to the supervisor; private config never enters this prompt. */
@@ -222,9 +225,14 @@ export function assembleImplementPrompt(input: ImplementPromptInput): string {
    : [
       "",
       "## Base merge pass",
-      `\`origin/${baseMerge.base}\` moved after this branch was cut, and the branch now conflicts with it${
-       baseMerge.files.length > 0 ? ` in: ${baseMerge.files.map((f) => `\`${f}\``).join(", ")}` : ""
-      }.`,
+      baseMerge.stale === undefined
+       ? `\`origin/${baseMerge.base}\` moved after this branch was cut, and the branch now conflicts with it${
+          baseMerge.files.length > 0 ? ` in: ${baseMerge.files.map((f) => `\`${f}\``).join(", ")}` : ""
+         }.`
+       : `This branch is ${baseMerge.stale.behind} commit(s) behind \`origin/${baseMerge.base}\`: too far to review and probe as it is, since` +
+         ` the base may have changed how the tests and probes run${
+          baseMerge.files.length > 0 ? `. A trial merge conflicts in: ${baseMerge.files.map((f) => `\`${f}\``).join(", ")}` : ""
+         }.`,
       "This pass is the one exception to the SOP's no-merge rule. Your job is only to bring the base in:",
       `1. Run \`git merge --no-edit origin/${baseMerge.base}\`. Do not fetch: the supervisor already did.`,
       "   Never rebase, reset or amend: the supervisor pushes fast-forward only.",
