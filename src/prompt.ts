@@ -110,11 +110,10 @@ export function assembleResearchPrompt(input: WorkerPromptInput): string {
 export interface ImplementPromptInput extends WorkerPromptInput {
  /** The repo's test command the supervisor will run before pushing. */
  testCommand: string;
- /**
-  * Set on a fix pass: the sage review the worker must answer (untrusted),
-  * and the principal's rulings on the PR, oldest first, which bind it.
-  */
- review?: { round: number; body: string; rulings?: string[] };
+ /** Set on a fix pass: the sage review the worker must answer (untrusted). */
+ review?: { round: number; body: string };
+ /** The principal's rulings on the PR, oldest first: binding, and ahead of any review (ranger issue #230). */
+ rulings?: string[];
  /** Set on a base merge pass: the branch conflicts with origin/<base>, and the worker merges it in. */
  baseMerge?: { base: string; files: string[] };
  /** The map declares a probe tier (`commands.probe`) the supervisor runs itself. */
@@ -204,7 +203,6 @@ export function assembleImplementPrompt(input: ImplementPromptInput): string {
   review === undefined
    ? []
    : [
-      ...rulingsSection(review.rulings ?? []),
       "",
       `## Fix pass — sage review round ${review.round}`,
       "Your previous commits are on this branch. A reviewer read them and wrote the review",
@@ -267,6 +265,7 @@ export function assembleImplementPrompt(input: ImplementPromptInput): string {
    testCommand,
   ),
   ...(probeTier === true ? [PROBE_TIER_RULE] : []),
+  ...rulingsSection(input.rulings ?? []),
   ...fixPass,
   ...mergePass,
   "",

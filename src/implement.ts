@@ -277,6 +277,9 @@ export function recordedReviews(
  return out.sort((a, b) => a.round - b.round);
 }
 
+/** The hidden markers ranger and sage write into their own PR comments. */
+const TOOL_MARKER = /<!--\s*(?:ranger|sage):/;
+
 /** How many principal rulings a fix pass carries, newest kept, and how long each may be. */
 export const MAX_RULINGS = 20;
 export const MAX_RULING_CHARS = 4000;
@@ -287,11 +290,16 @@ export const MAX_RULING_CHARS = 4000;
  * A ruling is a plain PR comment, so the author is the only proof: the
  * principal's login for the repo's forge, never a marker anyone could type.
  * No configured login, no rulings.
+ *
+ * A comment carrying a tool's marker is not a ruling, whoever posted it: a
+ * `sage review --post` the principal runs by hand lands under the
+ * principal's login, and it quotes untrusted diff and PR text (sage round 1
+ * on PR #233).
  */
 export function principalRulings(comments: IssueComment[], principal: string | undefined): string[] {
  if (principal === undefined || principal === "") return [];
  return comments
-  .filter((c) => c.author === principal)
+  .filter((c) => c.author === principal && !TOOL_MARKER.test(c.body))
   .map((c) => c.body.trim())
   .filter((body) => body !== "")
   .slice(-MAX_RULINGS)
@@ -1351,16 +1359,13 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
   // One fix pass per review that found blockers or majors. On a resume the review is
   // re-read from its PR comment, so a crash between review and fix loses nothing,
   // and a fix an earlier run committed but never pushed is adopted, as a build is.
-  // The principal's rulings are read now, right before the worker: one posted
+  // The principal's rulings are read right before a worker runs: one posted
   // during the review binds this pass, not the next (ranger issue #230).
+  const readRulings = async (): Promise<string[]> =>
+   principalRulings(await github.listComments(repo, open.iid, token), principalLoginForRepo(config, repo));
   const fixed =
    (await adoptBuiltWork(ctx, testCommand, { round: current.round, pushedHead: live.headSha })) ??
-   (await workerPass(ctx, testCommand, {
-    kind: "fix",
-    round: current.round,
-    body: current.body,
-    rulings: principalRulings(await github.listComments(repo, open.iid, token), principalLoginForRepo(config, repo)),
-   }));
+   (await workerPass(ctx, testCommand, { kind: "fix", round: current.round, body: current.body, rulings: await readRulings() }));
   workerExit = fixed.workerExit;
   if (fixed.failure !== undefined) return fixed.failure;
   await publishPass(ctx, github, open.iid, fixed, "push fix", `fix pass ${current.round} @ ${fixed.sha.slice(0, 8)}`);
@@ -1718,7 +1723,7 @@ async function checkedWorkerPass(
   worktree,
   botIdentity,
   testCommand,
-  ...(spec.kind === "fix" ? { review: { round: spec.round, body: spec.body, rulings: spec.rulings } } : {}),
+  ...(spec.kind === "fix" ? { review: { round: spec.round, body: spec.body }, rulings: spec.rulings } : {}),
   ...(spec.kind === "base-merge" ? { baseMerge: { base: spec.base, files: spec.files } } : {}),
   probeTier: map.commands.probe !== undefined,
   remoteTests: remoteTests(ctx),

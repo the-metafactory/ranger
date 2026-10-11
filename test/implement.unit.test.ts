@@ -620,6 +620,14 @@ describe("principal rulings on the PR bind the fix pass (ranger issue #230)", ()
   ];
   expect(principalRulings(comments, "jcfischer")).toEqual(["Ruling: keep the flood-light pool.", "Ruling: F2 is out of scope."]);
  });
+ test("a tool's own comment is no ruling, even under the principal's login (sage round 1 on PR #233)", () => {
+  const comments = [
+   c(1, "jcfischer", "## Sage code review — commented\n- [suggestion] drop the cache\n<!-- sage:reviewed-commit:abc -->"),
+   c(2, "jcfischer", "<!-- ranger:review round=1 sha=abc -->\nfindings"),
+   c(3, "jcfischer", "Ruling: keep the cache."),
+  ];
+  expect(principalRulings(comments, "jcfischer")).toEqual(["Ruling: keep the cache."]);
+ });
  test("no configured principal login, no rulings", () => {
   expect(principalRulings([c(1, "", "Ruling: x")], undefined)).toEqual([]);
   expect(principalRulings([c(1, "", "Ruling: x")], "")).toEqual([]);
@@ -644,12 +652,12 @@ describe("principal rulings on the PR bind the fix pass (ranger issue #230)", ()
    botIdentity: "ivy-bot",
    testCommand: "bun test",
   };
-  const prompt = assembleImplementPrompt({ ...base, review: { round: 4, body: "F1 major: revert LOD1", rulings: ["Ruling: keep LOD1."] } });
+  const prompt = assembleImplementPrompt({ ...base, review: { round: 4, body: "F1 major: revert LOD1" }, rulings: ["Ruling: keep LOD1."] });
   expect(prompt.indexOf("## Principal rulings (binding)")).toBeLessThan(prompt.indexOf("## Fix pass — sage review round 4"));
   expect(prompt).toContain('<ruling n="1">\nRuling: keep LOD1.\n</ruling>');
   expect(prompt).toContain("is NOT a fix target");
   expect(prompt).toContain("Never undo what a ruling decided");
-  const none = assembleImplementPrompt({ ...base, review: { round: 4, body: "F1", rulings: [] } });
+  const none = assembleImplementPrompt({ ...base, review: { round: 4, body: "F1" }, rulings: [] });
   expect(none).not.toContain("Principal rulings");
  });
 });
