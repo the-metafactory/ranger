@@ -75,6 +75,7 @@ import { resolveReadOnlyToken, assertReadOnlyToken, gatedEnv, gitlabApiRead, tok
 import { childEnv, itermArgv, shellQuote } from "./launch.ts";
 import {
  type ActionKind,
+ type ActionDeps,
  type ActionRunner,
  type BehindBase,
  checkRunsFromPages,
@@ -766,12 +767,9 @@ export interface HandlerContext {
   /** Every check run on a head, read under the merge's environment (see ActionDeps). */
   verifyChecks?: (repo: string, sha: string, env: Record<string, string>) => Promise<PrView["ci"] | null>;
   exists: (path: string) => boolean;
-  /** The session prompt's facts (see ActionDeps). */
-  workerLog?: (repo: string, nodeId: string) => string | null;
-  behindBase?: (repo: string, pr: number) => Promise<BehindBase | null>;
   /** Called after an action ran, to re-read what it changed. */
   after?: (entry: NeedsYouEntry) => void;
- };
+ } & Pick<ActionDeps, "workerLog" | "behindBase">;
 }
 
 const ACTION_PATHS: Record<string, ActionKind> = {

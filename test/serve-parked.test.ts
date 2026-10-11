@@ -28,7 +28,7 @@ import {
  awaitingMergeEntries,
  type NeedsYouInputs,
  type PrView,
- type BehindBase,
+ type ActionDeps,
  uncheckedNeedsEye,
 } from "../src/serve-parked.ts";
 
@@ -447,9 +447,7 @@ describe("node #54 — the actions and their guards", () => {
    pr?: PrView | null;
    exists?: (p: string) => boolean;
    verifyChecks?: (repo: string, sha: string, env: Record<string, string>) => Promise<PrView["ci"] | null>;
-   workerLog?: (repo: string, nodeId: string) => string | null;
-   behindBase?: (repo: string, pr: number) => Promise<BehindBase | null>;
-  } = {},
+  } & Pick<ActionDeps, "workerLog" | "behindBase"> = {},
  ) => {
   const runs: { argv: string[]; env: Record<string, string>; detached: boolean }[] = [];
   const run: ActionRunner = async (argv, env, o) => {
