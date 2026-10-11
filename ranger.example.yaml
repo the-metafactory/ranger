@@ -116,6 +116,9 @@ workers:
   deadmanThreshold: 3
   # Sage review rounds per implement-lane PR before ranger parks + escalates.
   reviewRounds: 2
+  # Commits a PR branch may trail origin/<base> before a base merge pass
+  # brings the base in, ahead of the next review or probe run.
+  maxBehindBase: 20
 
 auth:
   readOnlyTokens:

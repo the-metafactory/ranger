@@ -840,19 +840,23 @@ export async function dirtyFiles(worktree: string): Promise<string[]> {
  return result.stdout.split("\n").filter((l) => l.trim().length > 0);
 }
 
-/** Commits on the branch that are not on origin/<base>. */
-export async function commitsAhead(
- worktree: string,
- base: string,
-): Promise<number> {
- const result = await safeGit(["rev-list", "--count", `origin/${base}..HEAD`], {
-  cwd: worktree,
-  timeoutMs: 10_000,
- });
+/** How many commits `range` holds (`git rev-list --count`); `what` names it in the error. */
+async function countRevs(worktree: string, range: string, what: string): Promise<number> {
+ const result = await safeGit(["rev-list", "--count", range], { cwd: worktree, timeoutMs: 10_000 });
  if (result.code !== 0) {
-  throw new GitSafetyError(`cannot count commits ahead of origin/${base}: ${result.stderr.trim()}`);
+  throw new GitSafetyError(`cannot count ${what}: ${result.stderr.trim()}`);
  }
  return Number(result.stdout.trim()) || 0;
+}
+
+/** Commits on the branch that are not on origin/<base>. */
+export async function commitsAhead(worktree: string, base: string): Promise<number> {
+ return countRevs(worktree, `origin/${base}..HEAD`, `commits ahead of origin/${base}`);
+}
+
+/** Commits on origin/<base> that the branch's HEAD does not have (ranger issue #231). */
+export async function commitsBehind(worktree: string, base: string): Promise<number> {
+ return countRevs(worktree, `HEAD..origin/${base}`, `commits behind origin/${base}`);
 }
 
 /** Refuse the push when any branch commit message carries a closing keyword. */
