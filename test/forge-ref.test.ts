@@ -3,14 +3,13 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { loadConfig } from "../src/config.ts";
-import { parseForgeRef, encodeForgeRef, decodeForgeKey, normalizeNodeId, executionRefusal } from "../src/forge-ref.ts";
+import { parseForgeRef, encodeForgeRef, decodeForgeKey, normalizeNodeId } from "../src/forge-ref.ts";
+import { laneCredentialRefusal } from "../src/forge-lanes.ts";
 import { graphFrontier, graphNode, graphAudit, somaRepo, normalizeGraphNode, type FrontierEntry } from "../src/graph.ts";
 import { graphClaim, graphRelease, GraphWriteError } from "../src/graph-write.ts";
-import { walk, claimNode } from "../src/walk.ts";
+import { walk } from "../src/walk.ts";
 import { runNode } from "../src/worker.ts";
-import { runImplement, type ImplementContext } from "../src/implement.ts";
 import { buildNow } from "../src/build-now.ts";
-import { sweepMap } from "../src/sweep.ts";
 import { mapKey } from "../src/maps.ts";
 import { workerLogFile } from "../src/worker-log.ts";
 import { buildNowArgv, launchPlan, ServeReader, servedMaps, readPrLive, assertReadOnlyTokens } from "../src/serve.ts";
@@ -163,7 +162,7 @@ describe("ForgeRef config and identity seam", () => {
   ]);
  });
 
- test("registered GitLab maps refuse all execution entry points before calls or journal writes", async () => {
+ test("a GitLab map with no GitLab credentials refuses every lane entry point before calls or journal writes", async () => {
   const config = configWith(gitlab);
   const map = config.maps[0];
   map.walk = "full";
@@ -171,24 +170,16 @@ describe("ForgeRef config and identity seam", () => {
   const journal = new Journal(":memory:");
   let calls = 0;
   const forbidden = async (): Promise<never> => { calls++; throw new Error("unexpected side effect"); };
-  const node = { repo: gitlab, ref: { id: "12" }, node: { id: "12", title: "Build", kind: "task", autonomy: "auto" },
-   status: "open", assignees: [], blockedBy: [], author: "bot", url: "https://example.test", typed: true };
   const base = { config, journal, map, token: "fixture", botIdentity: "bot" };
   try {
-   expect(executionRefusal("acme/widgets")).toBeNull();
-   const result = await walk({ config, journal, configPath: "/unused", spawnRunNode: forbidden });
+   expect(laneCredentialRefusal(config, "acme/widgets", {})).toBeNull();
+   expect(laneCredentialRefusal(config, gitlab, {})).toContain("no GitLab credentials for");
+   const result = await walk({ config, journal, configPath: "/unused", spawnRunNode: forbidden, readGate: forbidden });
    expect(result.maps[0]).toMatchObject({ gated: true, claimed: [], announced: [] });
-   expect(result.maps[0].gateReason).toContain("GitLab execution is not implemented");
-   expect(await claimNode({ ...base, node: node.node, lane: "implement", cliEntry: "/unused", configPath: "/unused",
-    announce: forbidden, claim: forbidden, spawnRunNode: forbidden })).toMatchObject({ claimed: false });
+   expect(result.maps[0].gateReason).toContain("no GitLab credentials for");
    await expect(buildNow("12", { ...base, configPath: "/unused", readFrontier: forbidden, announce: forbidden, claim: forbidden,
-    spawnRunNode: forbidden })).rejects.toThrow("GitLab execution is not implemented");
-   expect(await runNode("12", { ...base })).toMatchObject({ status: "refused" });
-   const github = new Proxy({}, { get: () => forbidden }) as ImplementContext["github"];
-   expect(await runImplement({ ...base, node, rootNode: node, github, readOnlyToken: "fixture", canonical: "/unused",
-    worktree: "/unused", branch: "node/12-test", generation: 1, ratify: "auto", sessionJournal: "/unused",
-    workerRun: forbidden, shellRun: forbidden })).toMatchObject({ status: "refused" });
-   await expect(sweepMap({ ...base, respawn: forbidden })).rejects.toThrow("GitLab execution is not implemented");
+    spawnRunNode: forbidden })).rejects.toThrow("no GitLab credentials for");
+   expect(await runNode("12", { ...base, readGate: forbidden })).toMatchObject({ status: "refused" });
    expect(await readRepoSentinel(gitlab, "fixture")).toBeNull();
    expect(calls).toBe(0);
    expect(journal.listWorkers()).toEqual([]);
@@ -196,7 +187,7 @@ describe("ForgeRef config and identity seam", () => {
   } finally { journal.close(); }
  });
 
- test("CLI refuses GitLab reads without a mapped credential and keeps execution gated", async () => {
+ test("CLI refuses GitLab reads and lanes without a mapped credential", async () => {
   const dir = mkdtempSync(join(tmpdir(), "ranger-forge-gates-"));
   const path = join(dir, "ranger.yaml");
   const calls = join(dir, "calls");
@@ -206,7 +197,7 @@ describe("ForgeRef config and identity seam", () => {
    for (const args of [["scout", "--json"], ["walk"], ["build-now", "13", "--map", `${gitlab}#12`],
     ["run-node", "13", "--map", `${gitlab}#12`], ["sweep"], ["escalate", "--json"], ["escalate", "--digest", "--json"]]) {
     const result = await runCli([...args, "--config", path], { ...process.env, PATH: `${dir}:${process.env.PATH}` });
-    expect(result.stdout + result.stderr).toContain(["scout", "escalate"].includes(args[0]) ? "no read-only token mapping" : "not implemented");
+    expect(result.stdout + result.stderr).toContain(["scout", "escalate"].includes(args[0]) ? "no read-only token mapping" : "no GitLab credentials for");
    }
    expect(() => readFileSync(calls)).toThrow();
   } finally { rmSync(dir, { recursive: true, force: true }); }

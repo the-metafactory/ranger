@@ -1,7 +1,7 @@
 import { join } from "node:path";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import { withClaimLock } from "./claim-lock.ts";
-import { executionRefusal } from "./forge-ref.ts";
+import { laneCredentialRefusal } from "./forge-lanes.ts";
 import { changeRequestNoun } from "./forge-text.ts";
 import { pidAlive } from "./exec.ts";
 import { assertWriteIdentity, WriteGateError } from "./identity.ts";
@@ -9,6 +9,7 @@ import type { Journal, ResumeQueueRow, WorkerRow, WorkerStatus } from "./journal
 import { implementLane, startsImplementSession, type ImplementLane } from "./lanes.ts";
 import { graphNode, GRAPH_CALL_TIMEOUT_MS } from "./graph.ts";
 import type { ForgePort } from "./forge.ts";
+import type { ResolvedToken } from "./token-gate.ts";
 import type { OwnedCheck } from "./lock.ts";
 import { laneHeldMessage, mapKey, recordImplementStart, resumeMap } from "./maps.ts";
 import { spawnRunNodeDetached, type SpawnRunNodeArgs } from "./spawn.ts";
@@ -21,9 +22,9 @@ export interface ResumeContext {
  now?: () => Date;
 }
 
-/** The same identity gate as run-node: an execution refusal, then the bot's write identity. */
+/** The same identity gate as run-node: the forge credential refusal, then the bot's write identity. */
 async function identityGate(config: RangerConfig, map: Pick<RangerMapConfig, "repo">): Promise<void> {
- const refusal = executionRefusal(map.repo);
+ const refusal = laneCredentialRefusal(config, map.repo);
  if (refusal !== null) throw new WriteGateError(refusal);
  await assertWriteIdentity(config, map.repo);
 }
@@ -209,6 +210,8 @@ export async function resumeNode(nodeId: string, selector: string | undefined, c
 export interface ResumeQueueMap {
  map: RangerMapConfig;
  token?: string;
+ /** The credential graph reads run under (`graphReadToken`); the write token when unset. */
+ graphToken?: ResolvedToken;
  gateReason?: string;
  /** The gate failed on a forge read, not a refusal; the entry defers without a count. */
  gateTransient?: boolean;
@@ -217,7 +220,7 @@ export interface ResumeQueueMap {
 
 /** Caller holds the claim lease; only successful starts reserve implement capacity. */
 export async function processResumeQueue(
- ctx: ResumeContext & { github: ForgePort }, maps: ResumeQueueMap[],
+ ctx: ResumeContext & { github: Pick<ForgePort, "getPr"> }, maps: ResumeQueueMap[],
  reservations: Set<ImplementLane>, owned: OwnedCheck,
 ): Promise<void> {
  const { journal, config } = ctx;
@@ -262,7 +265,7 @@ export async function processResumeQueue(
    continue;
   }
   try {
-   const node = await graphNode(entry.repo, entry.nodeId, { token: state.token, source: "write-token" },
+   const node = await graphNode(entry.repo, entry.nodeId, state.graphToken ?? { token: state.token, source: "write-token" },
     { timeoutMs: GRAPH_CALL_TIMEOUT_MS });
    if (node.status === "closed") { drop("node is closed"); continue; }
    if (row.prNumber !== null) {

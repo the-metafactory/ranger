@@ -1,11 +1,11 @@
 import { recordImplementStart, mapKey } from "./maps.ts";
-import { executionRefusal } from "./forge-ref.ts";
 import { implementLane, startsImplementSession, type ImplementLane } from "./lanes.ts";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import type { Journal } from "./journal.ts";
 import { killProcessGroup, pidAlive, processGroupCommands } from "./exec.ts";
 import { graphRelease } from "./graph-write.ts";
 import type { ForgePort } from "./forge.ts";
+import type { ResolvedToken } from "./token-gate.ts";
 import {
  runMergeDesk,
  watchedByMergeDesk,
@@ -32,6 +32,8 @@ export interface SweepContext {
  map: RangerMapConfig;
  token: string;
  botIdentity: string;
+ /** The credential graph reads run under (`graphReadToken`); the write token when unset. */
+ graphToken?: ResolvedToken;
  /**
   * Called to (re)spawn a detached run-node: a crashed worker's respawn, and
   * the merge desk's resume-for-close. Returns the new supervisor's PID, or
@@ -72,8 +74,6 @@ export { pidAlive };
 export async function sweepMap(ctx: SweepContext): Promise<SweepMapResult> {
  const { config, journal, map, token, botIdentity } = ctx;
  const repo = map.repo;
- const refusal = executionRefusal(repo);
- if (refusal !== null) throw new Error(refusal);
  const result: SweepMapResult = {
   repo,
   crashed: 0,
@@ -181,7 +181,7 @@ export async function sweepMap(ctx: SweepContext): Promise<SweepMapResult> {
  // Each scan also has a fixed row cap to bound its graph reads.
  if (phase !== "desk") {
   const deadline = Date.now() + GRAPH_CALL_TIMEOUT_MS;
-  const credential = { token, source: "write-token" };
+  const credential = ctx.graphToken ?? { token, source: "write-token" };
   const readNode = async (id: string) => {
    if (Date.now() >= deadline) throw new BudgetDeferral("graph closure pass deadline reached");
    return budgetedRead(journal, repo, credential, budgetPolicy(config), new Date(), () => {

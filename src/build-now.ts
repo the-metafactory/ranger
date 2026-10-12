@@ -1,5 +1,6 @@
 import { join } from "node:path";
-import { executionRefusal } from "./forge-ref.ts";
+import { graphReadToken, laneCredentialRefusal, type ReadGate } from "./forge-lanes.ts";
+import type { ResolvedToken } from "./token-gate.ts";
 import { budgetPolicy } from "./budget.ts";
 import { ClaimLockBusy, withClaimLock } from "./claim-lock.ts";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
@@ -69,6 +70,10 @@ export interface BuildNowContext {
  /** The machine account's write token and login (the caller gates the principal). */
  token: string;
  botIdentity: string;
+ /** The credential the map's graph reads run under; `buildNow` resolves it (`graphReadToken`) when unset. */
+ graphToken?: ResolvedToken;
+ /** The read gate a GitLab map's graph reads run under (tests inject a fake). */
+ readGate?: ReadGate;
  force?: boolean;
  /** The map's frontier and its audit's brief finding: the walk's sentinel-checked read unless injected. */
  readFrontier?: () => Promise<{ frontier: FrontierEntry[]; briefs?: BriefAudit }>;
@@ -114,8 +119,11 @@ function notWalkable(node: ClassifiedNode): string | null {
 }
 
 export async function buildNow(nodeId: string, ctx: BuildNowContext): Promise<BuildNowResult> {
- const refusal = executionRefusal(ctx.map.repo);
+ const refusal = laneCredentialRefusal(ctx.config, ctx.map.repo);
  if (refusal !== null) throw new BuildNowRefusal(refusal);
+ if (ctx.readFrontier === undefined && ctx.graphToken === undefined) {
+  ctx = { ...ctx, graphToken: await graphReadToken(ctx.config, ctx.map.repo, ctx.token, ctx.readGate) };
+ }
  // The audit (minutes on a large map) runs before the claim lock, as in the
  // walk; the locked read serves it and holds a build node edited in between.
  if (ctx.readFrontier === undefined && !ctx.journal.isPaused()) {
@@ -141,7 +149,7 @@ function frontierArgs(ctx: BuildNowContext) {
   journal: ctx.journal,
   repo: ctx.map.repo,
   root: ctx.map.root,
-  token: { token: ctx.token, source: "write-token" as const },
+  token: ctx.graphToken ?? { token: ctx.token, source: "write-token" },
   policy: budgetPolicy(ctx.config),
   maxAgeMs: ctx.config.budget.frontierMaxAgeMin * 60_000,
   now: ctx.now?.() ?? new Date(),

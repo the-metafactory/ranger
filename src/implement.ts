@@ -1,5 +1,7 @@
 import { principalLoginForRepo } from "./config.ts";
-import { executionRefusal, fileStemFor, parseForgeRef } from "./forge-ref.ts";
+import { fileStemFor, parseForgeRef } from "./forge-ref.ts";
+import { lanePort } from "./forge-lanes.ts";
+import type { ResolvedToken } from "./token-gate.ts";
 import { changeRequestLabel, changeRequestNoun, changeRequestUrl, ciRunNoun, ciRunText, forgeName } from "./forge-text.ts";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
@@ -41,6 +43,7 @@ import {
  baseConflictOutcome,
  policyBlockedOutcome,
  probesFailedOutcome,
+ gitlabReviewHoldOutcome,
  reviewCapHeadMovedOutcome,
  reviewCapOutcome,
 } from "./outcomes.ts";
@@ -113,6 +116,8 @@ export interface ImplementContext {
  token: string;
  /** The map's read-only token — the reviewer reads the PR under it (node #8). */
  readOnlyToken: string;
+ /** The credential graph reads run under (`graphReadToken`); the write token when unset, GitHub's path. */
+ graphToken?: ResolvedToken;
  botIdentity: string;
  /** A GitLab map's commit identity (node #127); `workerEnv` refuses a GitLab map without one. */
  commitAuthor?: CommitAuthor;
@@ -889,7 +894,7 @@ function fixRecord(value: string | null): FixRecord | null {
 
 function machineFixNodeGraph(ctx: ImplementContext): FixNodeGraph {
  const repo = ctx.map.repo;
- const credential = { token: ctx.token, source: "write-token" };
+ const credential = graphCredential(ctx);
  return {
   add: (parent, spec) => graphAdd(repo, parent, spec, ctx.token, { timeoutMs: GRAPH_CALL_TIMEOUT_MS }),
   link: (node, parent) => graphLink(repo, node, parent, ctx.token, { timeoutMs: GRAPH_CALL_TIMEOUT_MS }),
@@ -1120,6 +1125,23 @@ export function implementBranchFor(
  return merged?.ref ?? fallback;
 }
 
+/** The credential the lane's graph reads run under: the gated one a GitLab map needs, else the write token. */
+function graphCredential(ctx: ImplementContext): ResolvedToken {
+ return ctx.graphToken ?? { token: ctx.token, source: "write-token" };
+}
+
+/**
+ * The review gate a change request passes before ranger readies it: sage on
+ * GitHub. GitLab has none until *Settle the review gate a ranger-built GitLab
+ * MR must pass before ranger merges it* (ranger#96) lands its build (ranger
+ * issue #97, "Review"), so null, and the lane holds the node at
+ * awaiting-review. An injected reviewer is the test seam on either forge.
+ */
+function reviewGate(ctx: ImplementContext): Reviewer | null {
+ if (ctx.reviewer !== undefined) return ctx.reviewer;
+ return parseForgeRef(ctx.map.repo).forge === "github" ? sageReview : null;
+}
+
 /** Resolve where to pick up, from GitHub first (F2). */
 export function resolvePhase(pr: ChangeRequest | null): ImplementPhase | "pr-closed" {
  if (pr === null) return "implement";
@@ -1129,10 +1151,9 @@ export function resolvePhase(pr: ChangeRequest | null): ImplementPhase | "pr-clo
 }
 
 export async function runImplement(ctx: ImplementContext): Promise<ImplementOutcome> {
- const refusal = executionRefusal(ctx.map.repo);
- if (refusal !== null) return { status: "refused", detail: refusal, workerExit: null };
  const { config, map, journal, node, token, botIdentity, branch, worktree } = ctx;
- const github = ctx.github ?? realGitHub;
+ const github = ctx.github ?? lanePort(config, map.repo);
+ const reviewer = reviewGate(ctx);
  const repo = map.repo;
  const nodeId = node.ref.id;
  const base = map.base;
@@ -1304,6 +1325,12 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
    notedSha = live.headSha;
   }
   if (current === undefined) {
+   // No review gate on this forge yet: the change request stays a draft,
+   // off the merge desk, and the park card is the escalation.
+   if (reviewer === null) {
+    journal.updateWorker(nodeId, ctx.map.repo, { phase: "awaiting-review" });
+    throw new ParkSignal(gitlabReviewHoldOutcome({ repo, pr: open.iid }));
+   }
    if (reviews.length >= cap) {
     throw new ParkSignal(reviewCapHeadMovedOutcome({ repo, rounds: reviews.length, pr: open.iid }));
    }
@@ -1321,7 +1348,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
      openSession();
      try {
       return {
-       verdict: await (ctx.reviewer ?? sageReview)(repo, open.iid, ctx.readOnlyToken, {
+       verdict: await reviewer(repo, open.iid, ctx.readOnlyToken, {
         substrate: reviewSubstrate,
         nice: config.workers.niceness,
         reviewAuthor: botIdentity,
@@ -2034,7 +2061,7 @@ async function closeAfterMerge(
  const nodeId = node.ref.id;
  journal.updateWorker(nodeId, ctx.map.repo, { phase: "close", prNumber: pr.iid });
 
- const credential = { token, source: "write-token" };
+ const credential = graphCredential(ctx);
  const liveNode = await budgetedRead(journal, repo, credential, budgetPolicy(ctx.config), new Date(),
   () => graphNode(repo, nodeId, credential, { timeoutMs: GRAPH_CALL_TIMEOUT_MS }));
  if (liveNode.status === "closed") return finishClosedElsewhere({ ...ctx, node: liveNode, pr });

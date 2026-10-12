@@ -8,7 +8,6 @@ import { NEEDS_EYE_LABEL } from "./labels.ts";
 import {
  baseRedNote,
  gatingFindings,
- realGitHub,
  recordedProbes,
  recordedReviews,
  reviewAtHead,
@@ -18,7 +17,8 @@ import type { Journal, WorkerRow } from "./journal.ts";
 import { evaluateMergeGate, type MergeGateInput, type MergeGateResult } from "./merge-gate.ts";
 import type { IssueComment, ChangeRequest, CiVerdict, ForgePort, MergeOutcome, RebaseOutcome } from "./forge.ts";
 import { parseForgeRef } from "./forge-ref.ts";
-import { gitlabForgePort, squashMessage as gitlabSquashMessage } from "./gitlab.ts";
+import { squashMessage as gitlabSquashMessage } from "./gitlab.ts";
+import { lanePort } from "./forge-lanes.ts";
 import { CI_FAILED_PARK_OUTCOME, mergeGateFailedOutcome } from "./outcomes.ts";
 import { changeRequestLabel, changeRequestNoun, forgeName } from "./forge-text.ts";
 import { closingKeywordRefusal, findClosingKeyword } from "./git-ops.ts";
@@ -136,12 +136,9 @@ function headEvidence(
  };
 }
 
-/**
- * The forge port for a map: GitLab's for `gitlab:` maps (made per pass, so
- * its read gate runs fresh), GitHub's otherwise.
- */
+/** The forge port for a map, made per pass so a GitLab read gate runs fresh (`lanePort`). */
 export function deskPort(config: RangerConfig, map: RangerMapConfig): ForgePort {
- return parseForgeRef(map.repo).forge === "gitlab" ? gitlabForgePort(config) : realGitHub;
+ return lanePort(config, map.repo);
 }
 
 /**

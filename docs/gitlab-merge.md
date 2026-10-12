@@ -144,8 +144,8 @@ GitHub's throws on every refusal, unchanged. GitLab's answers
 `head-moved` and `not-mergeable` and throws only on a fault.
 
 GitLab's `auto_merge` and the dashboard tap merge are out of scope.
-GitLab execution stays refused by `executionRefusal` until the
-lane-routing node lands, so the desk tests call `runMergeDesk` directly.
+The desk tests call `runMergeDesk` directly. The lanes reach the desk on
+a GitLab map since node #131 (`docs/gitlab-lanes.md`).
 
 ## Tests
 

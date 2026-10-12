@@ -38,8 +38,12 @@ export type WorkerStatus =
  /** Implement lane: PR ready, waiting on the principal's one-tap merge. */
  | "awaiting-merge";
 
-/** Implement-lane phases (F2, #23 amendment) — GitHub wins on resume. */
-export type ImplementPhase = "implement" | "review" | "awaiting-merge" | "close";
+/**
+ * Implement-lane phases (F2, #23 amendment) — the forge wins on resume.
+ * `awaiting-review` is a parked GitLab change request with no review gate yet
+ * (node #131): its row is never on the merge desk.
+ */
+export type ImplementPhase = "implement" | "review" | "awaiting-review" | "awaiting-merge" | "close";
 
 export interface WorkerRow {
  nodeId: string;
