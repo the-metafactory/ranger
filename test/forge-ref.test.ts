@@ -49,6 +49,11 @@ describe("ForgeRef config and identity seam", () => {
    ["the-metafactory/soma", 751, "the-metafactory__soma"],
    ["the-metafactory/soma", 766, "the-metafactory__soma"],
    ["the-metafactory/soma", 781, "the-metafactory__soma"],
+   ["the-metafactory/myelin", 319, "the-metafactory__myelin"],
+   ["the-metafactory/cortex", 2556, "the-metafactory__cortex"],
+   ["the-metafactory/reflex", 33, "the-metafactory__reflex"],
+   ["the-metafactory/pulse", 83, "the-metafactory__pulse"],
+   ["the-metafactory/ranger", 257, "the-metafactory__ranger"],
   ] as const;
   expect(config.maps.map(m => [m.repo, m.root])).toEqual(expected.map(([repo, root]) => [repo, root]));
   for (const [index, [repo, root, fileRepo]] of expected.entries()) {
