@@ -66,6 +66,10 @@ import type { ForgePort } from "./forge.ts";
 import { ParkSignal } from "./signals.ts";
 import { policyBlockedOutcome } from "./outcomes.ts";
 import { assertResearchFindingsOnly, researchCi, type ResearchCiTiming } from "./research-ci.ts";
+import { proposalMarker } from "./ratify.ts";
+import { closeGraphEscalation } from "./card-sync.ts";
+
+export { proposalMarker };
 
 export { gitAuthEnv } from "./git-ops.ts";
 
@@ -464,8 +468,9 @@ export async function runNode(
  };
 
  // A proposed node waits for the principal's 👍 on its proposal comment
- // (node #246): a second run would post a second proposal.
- if (row?.status === "proposed") {
+ // (node #246): a second run would post a second proposal. One the ratify
+ // phase is resuming at the close (node #250) goes on to the close.
+ if (row?.status === "proposed" && row.phase !== "close") {
   return { ...base, status: "refused", detail: `node #${nodeId} is proposed (comment ${row.proposalCommentId ?? "id unknown"}) — it waits for the principal's ratification` };
  }
 
@@ -511,6 +516,11 @@ export async function runNode(
    },
   );
 
+  // A ratified proposal resumes at the close (node #250): the walk's ratify
+  // phase saw the principal's 👍 and set the phase; no worker runs again.
+  if (node.node.kind === "research" && row?.lane === "research" && row.phase === "close" && row.proposalCommentId !== null) {
+   return await closeRatified(ctx, node, row.proposalCommentId, generation);
+  }
   if (node.node.kind === "research") {
    return await runResearch(nodeId, ctx, node, rootNode, generation);
   }
@@ -1136,6 +1146,62 @@ async function runResearch(
  };
 }
 
+/**
+ * The resume-for-close of a ratified proposal (node #250, ruling D9): `soma
+ * graph close --proposal-comment` under the machine account, from the
+ * canonical checkout so the probes resolve there, with no LLM session. Soma
+ * reuses the proposal's body as the resolution and records the principal's
+ * 👍 as `approved` evidence. A refused close parks, as the research close does.
+ */
+async function closeRatified(
+ ctx: RunNodeContext,
+ node: NodeResult,
+ commentId: string,
+ generation: number,
+): Promise<RunNodeOutcome> {
+ const { config, map, token, botIdentity, journal } = ctx;
+ const repo = map.repo;
+ const nodeId = node.ref.id;
+ const base: RunNodeOutcome = { nodeId, repo, status: "skipped", detail: "", workerExit: null };
+ // run-node's write gate already refused the principal; the close is checked again (D4).
+ assertNotPrincipal(config, botIdentity, repo);
+ const canonical = canonicalDir(config, map);
+ journal.assertGeneration(nodeId, repo, generation, "close the ratified proposal");
+ const close = await graphClose(repo, nodeId, botIdentity, token, {
+  proposalComment: commentId,
+  checkpointId: node.node.checkpointId,
+ }, { cwd: canonical, timeoutMs: GRAPH_CALL_TIMEOUT_MS });
+ if (!close.closed) {
+  journal.recordEvent("refused", { nodeId, repo, detail: close.detail.slice(0, 400) });
+  countFailure(config, journal, repo);
+  finish(journal, nodeId, repo, "parked", close.detail);
+  return { ...base, status: "refused", detail: close.detail, close };
+ }
+ journal.recordEvent("closed", { nodeId, repo, detail: `ratified proposal comment ${commentId}: ${close.detail}`.slice(0, 400) });
+ try {
+  journal.assertGeneration(nodeId, repo, generation, "write decisions");
+  await graphDecisions(repo, String(map.root), token, { cwd: canonical, timeoutMs: GRAPH_CALL_TIMEOUT_MS });
+  journal.recordEvent("decisions-written", { nodeId, repo, detail: "decisions --write after the ratified close" });
+ } catch (error) {
+  if (error instanceof FencedError) throw error;
+  journal.recordEvent("decisions-failed", {
+   nodeId,
+   repo,
+   detail: `decisions --write FAILED after close: ${error instanceof Error ? error.message : String(error)}`.slice(0, 400),
+  });
+ }
+ finish(journal, nodeId, repo, "success", close.detail);
+ // The proposal card closes with the node; a failed edit is retried by the
+ // closure sweep, which picks up finished close-phase rows.
+ try {
+  await closeGraphEscalation({ journal, map, nodeId, node: { ...node, status: "closed" }, owned: () => journal.assertGeneration(nodeId, repo, generation, "close the proposal card") });
+ } catch (error) {
+  if (error instanceof FencedError) throw error;
+  journal.recordEvent("sweep", { nodeId, repo, detail: `closed graph card sync deferred: ${String(error)}`.slice(0, 400) });
+ }
+ return { ...base, status: "success", detail: close.detail.slice(0, 400), close };
+}
+
 /** First non-empty line of the resolution, truncated — the receipt's one-line form. */
 function gistFrom(resolution: string): string {
  const first = resolution
@@ -1179,10 +1245,6 @@ function researchRatifyFor(
 /** GitHub's comment body limit, less room for the links and the marker. */
 const PROPOSAL_FINDINGS_MAX = 60_000;
 
-/** The HTML marker binding a proposal comment to its node (ruling D8). */
-export function proposalMarker(nodeId: string): string {
- return `<!-- ranger:proposal node=${nodeId} -->`;
-}
 
 /**
  * The proposal comment (node #246): the findings, which soma takes as the

@@ -12,6 +12,7 @@ import { assertReadOnlyToken, type ResolvedToken } from "./token-gate.ts";
 import type { NodeResult } from "./graph.ts";
 import { BudgetDeferral } from "./budget.ts";
 import { code, renderCard, sanitizeGraphText } from "./card-render.ts";
+import { PROPOSAL_MISSING } from "./ratify.ts";
 
 /** The per-tick request budget (round-21) — split into two lanes so NEITHER
  *  starves the other (round-33 review): the ACTIVE pass caps at
@@ -82,7 +83,9 @@ function cardSpec(node: ClassifiedNode): { head: CardHead; reason: string; journ
     case "proposal":
       return {
         head: CARD_HEADS.proposal!,
-        reason: route.commentUrl === null
+        reason: route.missing === true
+          ? "The proposal comment is missing: ranger found no comment on the node by the machine account that carries the proposal marker, so nothing can be ratified and the node stays open."
+          : route.commentUrl === null
           ? "Ranger posted the research findings as a proposal comment, but the proposal comment id is unknown — find ranger's proposal comment on the node and react 👍 there to ratify it."
           : `Ranger posted the research findings as a proposal comment: ${route.commentUrl} — react 👍 there to ratify it.`,
         journalReason: "proposal",
@@ -1102,7 +1105,8 @@ function cardFrom(
 /**
  * The card of a `proposed` research node (node #246): claimed, so off the
  * frontier, and built from its worker row. It links the proposal comment
- * when the row holds its id, and says the id is unknown when it does not.
+ * when the row holds its id, says the id is unknown when it does not, and
+ * says the comment is missing once the ratify phase found none (node #250).
  */
 export function proposalNode(row: WorkerRow, title: string): ClassifiedNode {
   const url = nodeUrl(row.repo, row.nodeId);
@@ -1118,6 +1122,7 @@ export function proposalNode(row: WorkerRow, title: string): ClassifiedNode {
       route: "proposal",
       commentId: row.proposalCommentId,
       commentUrl: row.proposalCommentId === null ? null : nodeCommentUrl(row.repo, url, row.proposalCommentId),
+      ...(row.proposalCommentId === null && (row.outcome ?? "").startsWith(PROPOSAL_MISSING) ? { missing: true as const } : {}),
     },
   };
 }

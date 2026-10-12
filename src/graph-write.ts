@@ -136,7 +136,14 @@ export async function graphRelease(
 }
 
 export interface CloseOptions {
- resolutionFile: string;
+ /** Required unless `proposalComment` names the proposal whose body is the resolution. */
+ resolutionFile?: string;
+ /**
+  * A ratified proposal (node #250): soma reads the comment's reactions and
+  * records `approved` evidence for a non-proposer 👍; the comment's body
+  * is the resolution.
+  */
+ proposalComment?: string;
  gist?: string;
  checkpointId?: string;
  dryRun?: boolean;
@@ -163,12 +170,16 @@ export async function graphClose(
 ): Promise<CloseResult> {
  const ref = parseForgeRef(repo);
  id = writeNodeId(ref, id);
- const args = [
-  "graph", "close", id,
-  "--resolution-file", options.resolutionFile,
-  "--identity", identity,
-  "--repo", somaRepo(ref),
- ];
+ if (options.resolutionFile === undefined && options.proposalComment === undefined) {
+  throw new GraphWriteError(`soma graph close ${id} (${repo}): no resolution file and no proposal comment`);
+ }
+ if (options.proposalComment !== undefined && !/^\d+$/.test(options.proposalComment)) {
+  throw new GraphWriteError(`soma graph close ${id} (${repo}): proposal comment id ${JSON.stringify(options.proposalComment)} is not numeric`);
+ }
+ const args = ["graph", "close", id];
+ if (options.resolutionFile !== undefined) args.push("--resolution-file", options.resolutionFile);
+ if (options.proposalComment !== undefined) args.push("--proposal-comment", options.proposalComment);
+ args.push("--identity", identity, "--repo", somaRepo(ref));
  if (options.gist !== undefined) args.push("--gist", options.gist);
  if (options.checkpointId !== undefined) args.push("--checkpoint", options.checkpointId);
  if (options.ci !== undefined) args.push("--ci", options.ci);

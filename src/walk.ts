@@ -24,6 +24,7 @@ import type { ForgePort } from "./forge.ts";
 import { probeRequeueCandidates, requeueProbes, type ProbeRequeueResult } from "./probe-requeue.ts";
 import { sweepMap, type SweepMapResult } from "./sweep.ts";
 import { intakePass, type IntakeContext, type IntakeResult } from "./intake.ts";
+import { ratifyPass, type RatifyResult } from "./ratify.ts";
 import {
  drainGate,
  implementCandidates,
@@ -41,7 +42,7 @@ export { implementCandidates, planTick, researchCandidates, selectCandidates };
  *
  * per map → gate (write token + not-principal + walk mode + pause state) →
  * sweep liveness → priority probe requeues → merge desk and its send-backs
- * → queued resumes;
+ * → ratify open proposals (node #250) → queued resumes;
  * then, per map again →
  * pause and drain re-read under the claim lock → derive + classify frontier
  * → research-lane candidates → announce (fail-closed)
@@ -80,6 +81,8 @@ export interface WalkResult {
  probeRequeues: ProbeRequeueResult;
  /** The human-observation intake pass (node #247). */
  intake: IntakeResult;
+ /** The ratify phase (node #250): proposals read, ratified closes started. */
+ ratify: RatifyResult;
 }
 
 export interface WalkContext {
@@ -264,6 +267,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
   spawnCapPerDay: config.workers.spawnCapPerDay,
   probeRequeues: { resumed: [], pending: [], errors: [], lanes: [] },
   intake: { threads: [] },
+  ratify: { read: [], closing: [], deferred: [], errors: [] },
  };
  const cliEntry = join(import.meta.dir, "cli.ts");
  // Even a worker finishing during this tick must not allow a second claim
@@ -450,7 +454,24 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
   }
  }
 
- // Pass 1c — queued resumes, FIFO within each implement lane, ahead of claims.
+ // Pass 1c — the ratify phase (node #250): one paged reactions read per open
+ // proposal, capped per tick; the principal's 👍 resumes it at the close.
+ // It holds no lane, so it runs beside the desks, before any claim.
+ try {
+  result.ratify = await ratifyPass({
+   config,
+   journal,
+   maps: walked.map(({ map, token, botIdentity }) => ({ map, token, botIdentity })),
+   portFor: targetFor,
+   spawn: (nodeId, repo, root) =>
+    (ctx.spawnRunNode ?? spawnRunNodeDetached)({ nodeId, repo, root, cliEntry, configPath: ctx.configPath }),
+   ...(ctx.now === undefined ? {} : { now: ctx.now }),
+  });
+ } catch (error) {
+  result.ratify.errors.push(`ratify phase failed: ${error instanceof Error ? error.message : String(error)}`);
+ }
+
+ // Pass 1d — queued resumes, FIFO within each implement lane, ahead of claims.
  if (journal.listResumeQueue().length > 0) {
   try {
    await withClaimLock(journal, owned => processResumeQueue({ ...ctx, github: { getPr } },

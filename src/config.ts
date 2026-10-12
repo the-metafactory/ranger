@@ -341,6 +341,15 @@ const BudgetSchema = z.object({
  frontierMaxAgeMin: z.number().int().positive().default(60),
 });
 
+/** The ratify phase of the walk tick (node #250, #21 ruling D9). */
+const RatifySchema = z.object({
+ /**
+  * Open proposals whose reactions one tick reads (one paged GitHub read
+  * each); the rest wait for the next tick.
+  */
+ readsPerTick: z.number().int().positive().default(10),
+});
+
 const RangerConfigSchema = z.object({
  version: z.literal(1).default(1),
  maps: z.array(MapSchema).min(1, "at least one map must be registered"),
@@ -350,6 +359,7 @@ const RangerConfigSchema = z.object({
  state: StateSchema.default({}),
  workers: WorkersSchema.default({}),
  budget: BudgetSchema.default({}),
+ ratify: RatifySchema.default({}),
  substrates: SubstratesSchema.default({}),
  serve: ServeSchema.optional(),
 });

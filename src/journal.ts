@@ -209,6 +209,10 @@ export type EventKind =
  | "reviewed"
  | "awaiting-merge"
  | "proposed"
+ /** Ratify phase (node #250): a proposal bound from the node's comments, one not found, one ratified. */
+ | "proposal-bound"
+ | "proposal-missing"
+ | "ratified"
  | "merge-card"
  | "merged"
  | "rebased"
