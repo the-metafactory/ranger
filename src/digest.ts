@@ -3,12 +3,9 @@ import type { Journal } from "./journal.ts";
 import type { OwnedCheck } from "./lock.ts";
 import type { RangerMapConfig } from "./config.ts";
 import type { AuditResult } from "./graph.ts";
-import {
-  ageBand,
-  ageText,
-  localDateKey,
-  sanitizeGraphText,
-} from "./card-sync.ts";
+import { ageBand, ageText, localDateKey } from "./card-sync.ts";
+import { code, DISCORD_MESSAGE_LIMIT, oneLine, renderCard, sanitizeGraphText } from "./card-render.ts";
+import { mapKey } from "./maps.ts";
 
 /**
  * Daily digest delivery + rendering (design §5) — extracted from escalate.ts
@@ -83,55 +80,55 @@ export function digestContent(inputs: DigestInputs): string {
     principalDiscordId,
     now,
   } = inputs;
-  const header = [
-    `:newspaper: **ranger digest** — ${map.repo} (root ${map.root}, walk: ${map.walk}) · ${localDateKey(now)}`,
-    "",
-    `**Cards: ${openCount}**${ageCounts.aged > 0 ? ` (${ageCounts.aged} aged 3+d, ${ageCounts.overdue} 7+d${principalDiscordId ? " @-mentioned" : " no ping"})` : ""}`,
-  ];
+  const frame = {
+    emoji: "📰",
+    status: "ranger digest",
+    title: mapKey(map),
+    meta: [`walk: ${map.walk}`, localDateKey(now)],
+  };
+  const cardsLine = `Cards: ${openCount}${ageCounts.aged > 0 ? ` (${ageCounts.aged} aged 3+d, ${ageCounts.overdue} 7+d${principalDiscordId ? " @-mentioned" : " no ping"})` : ""}`;
   const summarize = (items: string[], max: number): string => {
     if (items.length === 0) return "";
     // Every item is graph-derived — sanitize so a crafted `<@principal-id>`
     // audit value can't ping the principal before the 7-day policy
     // (round-26 review).
-    const inert = items.map(sanitizeGraphText);
+    const inert = items.map((item) => code(`#${item}`));
     const head = inert.slice(0, max).join(", ");
     return items.length > max ? `${head}, …+${items.length - max}` : head;
   };
   const auditLines: string[] = [
-    `**Audit:** receipt-less closes ${audit.closedWithoutReceipt.length}${audit.closedWithoutReceipt.length > 0 ? ` (${summarize(audit.closedWithoutReceipt, 8)})` : ""} · open w/o checkpoint ${audit.openWithoutCheckpoint.length}${audit.openWithoutCheckpoint.length > 0 ? ` (${summarize(audit.openWithoutCheckpoint, 8)})` : ""} · open claims ${audit.openClaimed.length}`,
+    `Audit: receipt-less closes ${audit.closedWithoutReceipt.length}${audit.closedWithoutReceipt.length > 0 ? ` (${summarize(audit.closedWithoutReceipt, 8)})` : ""} · open w/o checkpoint ${audit.openWithoutCheckpoint.length}${audit.openWithoutCheckpoint.length > 0 ? ` (${summarize(audit.openWithoutCheckpoint, 8)})` : ""} · open claims ${audit.openClaimed.length}`,
   ];
   if (audit.openClaimed.length > 0) {
     for (const c of audit.openClaimed.slice(0, 8)) {
       auditLines.push(
-        `    #${sanitizeGraphText(c.id)} [${c.assignees.map(sanitizeGraphText).join(", ")}]`,
+        `- ${code(`#${c.id}`)} [${c.assignees.map(sanitizeGraphText).join(", ")}]`,
       );
     }
     if (audit.openClaimed.length > 8) {
       auditLines.push(
-        `    … and ${audit.openClaimed.length - 8} more open claims`,
+        `- … and ${audit.openClaimed.length - 8} more open claims`,
       );
     }
   }
-  const budgetLine = `**Budget:** spawns today ${budget.spawnsToday}/${budget.spawnCapPerDay} · dead-man ${budget.deadman} · ${budget.paused ? "PAUSED" : "running"}`;
+  const budgetLine = `Budget: spawns today ${budget.spawnsToday}/${budget.spawnCapPerDay} · dead-man ${budget.deadman} · ${budget.paused ? "PAUSED" : "running"}`;
   // Reserve room for the audit + budget sections so a long card list can
   // never evict the promised parts of a "cards + audit + budget" digest —
   // the card list is capped to fit, not the tail sliced off.
-  const reserved =
-    header.join("\n").length +
-    2 +
-    auditLines.join("\n").length +
-    1 +
-    budgetLine.length;
-  const cardBudget = 1950 - reserved - 80; // +80 slack for the "… N more" line
+  const reserved = renderCard({
+    ...frame,
+    lines: [cardsLine, "", ...auditLines, budgetLine],
+  }).length;
+  const cardBudget = DISCORD_MESSAGE_LIMIT - 50 - reserved - 80; // +80 slack for the "… N more" line
   const cardLines: string[] = [];
   if (cards.length === 0) {
-    cardLines.push("  none open — clean");
+    cardLines.push("none open — clean");
   } else {
     let shown = 0;
     for (const card of cards) {
       if (shown >= 15) break; // hard cap on per-message card count
       const band = ageBand(card.ageDays);
-      const line = `  #${sanitizeGraphText(card.nodeId)} ${sanitizeGraphText(card.title)} — ${card.route} · ${ageText(
+      const line = `- ${code(`#${card.nodeId}`)} ${oneLine(sanitizeGraphText(card.title))} — ${card.route} · ${ageText(
         band,
         card.ageDays,
         principal,
@@ -152,15 +149,16 @@ export function digestContent(inputs: DigestInputs): string {
     const skipped = openCount - shown;
     if (skipped > 0) {
       cardLines.push(
-        `  … and ${skipped} more open cards (full list in the thread)`,
+        `- … and ${skipped} more open cards (full list in the thread)`,
       );
     }
   }
-  const joined = [...header, ...cardLines, "", ...auditLines, budgetLine].join(
-    "\n",
-  );
-  // Final guard (should not trigger — audit/budget are reserved above).
-  return joined.length > 1950 ? `${joined.slice(0, 1949)}…` : joined;
+  // The renderer's cap is the final guard (should not trigger — audit and
+  // budget are reserved above).
+  return renderCard({
+    ...frame,
+    lines: [cardsLine, ...cardLines, "", ...auditLines, budgetLine],
+  });
 }
 
 /** The daily digest's cached post/edit/repost delivery state machine —

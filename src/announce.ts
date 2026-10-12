@@ -1,6 +1,7 @@
 import { mapKey } from "./maps.ts";
 import type { RangerMapConfig } from "./config.ts";
 import { EscalationDiscord, resolveDiscordApiBase, type DiscordFile } from "./discord.ts";
+import { renderCard } from "./card-render.ts";
 
 /**
  * Claim-announce, fail-closed (design §5, node #7).
@@ -75,10 +76,13 @@ export class DiscordAnnouncer implements Announcer {
  }
 
  async announce(ctx: AnnounceContext): Promise<AnnounceResult> {
-  const content = [
-   `:ranger: **claim** #${ctx.nodeId} — ${ctx.nodeTitle}`,
-   `map: ${mapKey(ctx)}${ctx.mapTitle === undefined ? "" : ` (${ctx.mapTitle})`}`,
-  ].join("\n");
+  const content = renderCard({
+   emoji: "🙋",
+   status: "claim",
+   nodeId: ctx.nodeId,
+   title: ctx.nodeTitle,
+   meta: [`map: ${mapKey(ctx)}${ctx.mapTitle === undefined ? "" : ` (${ctx.mapTitle})`}`],
+  });
   return { messageId: await this.post(content, `claim announce for #${ctx.nodeId}`) };
  }
 

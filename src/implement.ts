@@ -8,6 +8,7 @@ import { rm } from "node:fs/promises";
 import { availableParallelism, loadavg, tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { DiscordAnnouncer } from "./announce.ts";
+import { code, renderCard } from "./card-render.ts";
 import { mapKey } from "./maps.ts";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import { runCmd, type RunOptions, type RunResult } from "./exec.ts";
@@ -854,12 +855,16 @@ async function announceBaseRed(ctx: ImplementContext, sha: string, probe: Record
  const red = probe.baseRed!;
  const key = `base-red.${mapKey(ctx.map)}.${sha}.${[...red].sort().join(",")}`;
  if (ctx.journal.getHealth(key) !== null) return;
- const text = [
-  `:ranger: **${ctx.map.base} was red** at \`${sha.slice(0, 8)}\` on ${red.join(", ")}`,
-  `map: ${mapKey(ctx.map)}`,
-  `Node #${ctx.node.ref.id} failed these probes twice.${baseRedNote(ctx.map.repo, probe)}`,
-  `Later ${changeRequestNoun(ctx.map.repo)}s reuse only twice-confirmed cached checks; an unconfirmed comparison needs a fresh base run.`,
- ].join("\n");
+ const text = renderCard({
+  emoji: "🔴",
+  status: `${ctx.map.base} was red`,
+  title: `at ${code(sha.slice(0, 8))} on ${red.map(code).join(", ")}`,
+  meta: [`map: ${mapKey(ctx.map)}`, `base ${code(ctx.map.base)}`, `found by node ${code(`#${ctx.node.ref.id}`)}`],
+  lines: [
+   `Node ${code(`#${ctx.node.ref.id}`)} failed these probes twice.${baseRedNote(ctx.map.repo, probe)}`,
+   `Later ${changeRequestNoun(ctx.map.repo)}s reuse only twice-confirmed cached checks; an unconfirmed comparison needs a fresh base run.`,
+  ],
+ });
  try {
   await (ctx.announce ?? ((t: string) => DiscordAnnouncer.fromMap(ctx.map).post(t, "base-red notice")))(text);
   ctx.journal.setHealth(key, new Date().toISOString());

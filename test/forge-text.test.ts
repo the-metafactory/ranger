@@ -486,16 +486,16 @@ describe("node #129 — GitHub renderings stay pinned (one wording fix, node #12
     {
       "declined": [
         
-    ":ranger: **parked** #129 — PR #42 https://github.com/acme/widgets/pull/42
-    map: acme/widgets#97 · PR #42
+    "⏸️ parked · **#129** PR #42 <https://github.com/acme/widgets/pull/42>
+    -# map: acme/widgets#97 · PR #42
     PR #42 was closed without merging — declined; ranger will not reopen or re-propose it"
     ,
         "parked: PR #42 was closed without merging — declined; ranger will not reopen or re-propose it",
       ],
       "merge needed": [
         
-    ":ranger: **merge needed** #129 — PR #42 https://github.com/acme/widgets/pull/42
-    map: acme/widgets#97
+    "🔀 merge needed · **#129** PR #42 <https://github.com/acme/widgets/pull/42>
+    -# map: acme/widgets#97
     Gate passed at \`cccccccc\`: CI green, mergeable, base \`main\`, sage 3 round(s), the last with 0 blockers and 0 majors (machine evidence, not a sign-off).
     No probe tier on this map: CI and the tests are the only automated checks.
     Merge it by hand (squash). For a \`propose\` node your merge is the ratification. Ranger closes the node after the merge; it never merges itself."
@@ -504,8 +504,8 @@ describe("node #129 — GitHub renderings stay pinned (one wording fix, node #12
       ],
       "merge needed, no url": [
         
-    ":ranger: **merge needed** #129 — PR #42
-    map: acme/widgets#97
+    "🔀 merge needed · **#129** PR #42
+    -# map: acme/widgets#97
     Gate passed at \`cccccccc\`: CI green, mergeable, base \`main\`, sage 3 round(s), the last with 0 blockers and 0 majors (machine evidence, not a sign-off).
     No probe tier on this map: CI and the tests are the only automated checks.
     Merge it by hand (squash). For a \`propose\` node your merge is the ratification. Ranger closes the node after the merge; it never merges itself."
@@ -514,7 +514,8 @@ describe("node #129 — GitHub renderings stay pinned (one wording fix, node #12
       ],
       "merged": [
         
-    ":ranger: **merged** #129 — PR #42 https://github.com/acme/widgets/pull/42
+    "✅ merged · **#129** PR #42 <https://github.com/acme/widgets/pull/42>
+    -# map: acme/widgets#97
     Gate passed at \`cccccccc\` (CI, mergeable, sage 0 blockers / 0 majors); squash-merged by ranger. The node closes through the gate next."
     ,
         "merged: PR #42 squash-merged by ranger at cccccccc (no ranger:needs-eye label; standing grant 2026-10-03)",
@@ -524,15 +525,16 @@ describe("node #129 — GitHub renderings stay pinned (one wording fix, node #12
       ],
       "no pr": [
         
-    ":ranger: **parked** #129 — node 129
-    map: acme/widgets#97
+    "⏸️ parked · **#129** node 129
+    -# map: acme/widgets#97
     awaiting merge with no PR recorded — journal and GitHub disagree"
     ,
         "parked: awaiting merge with no PR recorded — journal and GitHub disagree",
       ],
       "withdrawn": [
         
-    ":ranger: **merge card withdrawn** #129 — PR #42 https://github.com/acme/widgets/pull/42
+    "↩️ merge card withdrawn · **#129** PR #42 <https://github.com/acme/widgets/pull/42>
+    -# map: acme/widgets#97
     Do not merge yet: PR #42 conflicts with main at cccccccc. Ranger reworks it; a new merge card follows when the PR is clean."
     ,
         "sweep: PR #42: PR #42 conflicts with main at cccccccc — run-node resumes (pid 4242)",
@@ -604,12 +606,12 @@ describe("node #129 — GitLab renderings name an MR !N with GitLab URLs", () =>
   const texts = await mergeDeskTexts(GITLAB);
   expectGitLabNaming(strings(texts));
   expect(texts["merge needed"]![0]).toStartWith(
-   ":ranger: **merge needed** #129 — MR !42 https://gitlab.example.org/claw/crisis-simulator/-/merge_requests/42\n",
+   "🔀 merge needed · **#129** MR !42 <https://gitlab.example.org/claw/crisis-simulator/-/merge_requests/42>\n-# ",
   );
-  expect(texts["merge needed, no url"]![0]).toStartWith(":ranger: **merge needed** #129 — MR !42\n");
+  expect(texts["merge needed, no url"]![0]).toStartWith("🔀 merge needed · **#129** MR !42\n-# ");
   expect(texts.merged).toContain("merged: MR !42 squash-merged by ranger at cccccccc (no ranger:needs-eye label; standing grant 2026-10-03)");
   expect(texts.withdrawn![0]).toContain("Do not merge yet: MR !42 conflicts with main at cccccccc. Ranger reworks it; a new merge card follows when the MR is clean.");
-  expect(texts.declined![0]).toContain(`map: ${GITLAB}#97 · MR !42\nMR !42 was closed without merging`);
+  expect(texts.declined![0]).toContain(`-# map: ${GITLAB}#97 · MR !42\nMR !42 was closed without merging`);
   expect(texts["merged elsewhere"]).toEqual(["sweep: MR !42 merged — resuming at the close phase (pid 4242)"]);
   expect(texts["no pr"]).toContain("parked: awaiting merge with no MR recorded — journal and GitLab disagree");
  });

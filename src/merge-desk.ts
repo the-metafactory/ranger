@@ -2,6 +2,7 @@ import { implementLane } from "./lanes.ts";
 import { recordImplementStart, mapKey } from "./maps.ts";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import { DiscordAnnouncer } from "./announce.ts";
+import { renderCard } from "./card-render.ts";
 import type { DiscordFile } from "./discord.ts";
 import { redactViewsReason, viewsCard, viewsCardMessage, viewsDirectory } from "./views.ts";
 import { NEEDS_EYE_LABEL } from "./labels.ts";
@@ -318,11 +319,14 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   result.parked.push(row.nodeId);
   try {
    await post(
-    [
-     `:ranger: **parked** #${row.nodeId} — ${title}`,
-     `map: ${mapKey(map)}${row.prNumber === null ? "" : ` · ${changeRequestLabel(repo, row.prNumber)}`}`,
-     detail.slice(0, 1500),
-    ].join("\n"),
+    renderCard({
+     emoji: "⏸️",
+     status: "parked",
+     nodeId: row.nodeId,
+     title,
+     meta: [`map: ${mapKey(map)}`, row.prNumber === null ? null : changeRequestLabel(repo, row.prNumber)],
+     body: detail,
+    }),
     `park card for #${row.nodeId}`,
    );
   } catch {
@@ -495,10 +499,14 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    if (row.mergeMessageId !== null) {
     try {
      await post(
-      [
-       `:ranger: **merge card withdrawn** #${row.nodeId} — ${title}`,
-       `Do not merge yet: ${why}. Ranger reworks it; a new merge card follows when the ${changeRequestNoun(repo)} is clean.`,
-      ].join("\n"),
+      renderCard({
+       emoji: "↩️",
+       status: "merge card withdrawn",
+       nodeId: row.nodeId,
+       title,
+       meta: [`map: ${mapKey(map)}`],
+       lines: [`Do not merge yet: ${why}. Ranger reworks it; a new merge card follows when the ${changeRequestNoun(repo)} is clean.`],
+      }),
       `merge card withdrawal for #${row.nodeId}`,
      );
     } catch {
@@ -592,11 +600,17 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    result.merged.push(row.nodeId);
    try {
     await post(
-     [
-      `:ranger: **merged** #${row.nodeId} — ${title}`,
-      `Gate passed at \`${gate.headSha.slice(0, 8)}\` (CI, mergeable, sage 0 blockers / 0 majors${probesRequired ? ", probes" : ""}); ${how} by ranger. The node closes through the gate next.`,
-      ...warnings,
-     ].join("\n"),
+     renderCard({
+      emoji: "✅",
+      status: "merged",
+      nodeId: row.nodeId,
+      title,
+      meta: [`map: ${mapKey(map)}`],
+      lines: [
+       `Gate passed at \`${gate.headSha.slice(0, 8)}\` (CI, mergeable, sage 0 blockers / 0 majors${probesRequired ? ", probes" : ""}); ${how} by ranger. The node closes through the gate next.`,
+       ...warnings,
+      ],
+     }),
      `merge notice for #${row.nodeId}`,
     );
    } catch {
@@ -612,9 +626,13 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    return;
   }
 
-  const content = [
-    `:ranger: **merge needed** #${row.nodeId} — ${title}`,
-    `map: ${mapKey(map)}`,
+  const content = renderCard({
+   emoji: "🔀",
+   status: "merge needed",
+   nodeId: row.nodeId,
+   title,
+   meta: [`map: ${mapKey(map)}`],
+   lines: [
     `Gate passed at \`${gate.headSha.slice(0, 8)}\`: CI green, mergeable, base \`${map.base}\`, sage ${last?.round ?? "?"} round(s), the last with 0 blockers and 0 majors (machine evidence, not a sign-off).`,
     ...(superseded !== null
      ? [`Note: ${superseded}; the reviewer may have missed it, check before you merge.${map.autoMerge ? " Auto-merge is held on this head for that reason." : ""}`]
@@ -629,7 +647,8 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
     needsEye
      ? `Labelled \`${NEEDS_EYE_LABEL}\`: your eye is the check. Merge it by hand (squash); ranger closes the node after the merge.`
      : `Merge it by hand (squash). For a \`propose\` node your merge is the ratification. Ranger closes the node after the merge; ${map.autoMerge ? "it does not merge this one itself" : "it never merges itself"}.`,
-   ].join("\n");
+   ],
+  });
   let evidence: Awaited<ReturnType<typeof viewsCard>> | undefined;
   if (needsEye && map.commands.views) {
    try { evidence = await viewsCard(viewsDirectory(journal.path, repo, row.nodeId, gate.headSha), gate.headSha); }

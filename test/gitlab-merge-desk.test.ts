@@ -340,7 +340,7 @@ describe("node #126 — gitlab-rebase-squash-merge: the merge desk on a GitLab m
    expect(await r.desk(gl.port)).toMatchObject({ parked: ["96"], merged: [] });
    expect(gl.merges).toEqual([]);
    expect(r.row()?.outcome).toContain("Rebase failed: conflict");
-   expect(r.posts.at(-1)).toContain("**parked** #96");
+   expect(r.posts.at(-1)).toContain("⏸️ parked · **#96**");
   } finally { r.close(); }
  });
 
@@ -353,7 +353,7 @@ describe("node #126 — gitlab-rebase-squash-merge: the merge desk on a GitLab m
     expect(gl.calls).not.toContain("rebasePr");
     expect(gl.calls).not.toContain("mergePr");
     expect(r.row()?.outcome).toContain(`squash_option "never"`);
-    expect(r.posts.at(-1)).toContain("**parked** #96");
+    expect(r.posts.at(-1)).toContain("⏸️ parked · **#96**");
    } finally { r.close(); }
   });
  }
@@ -392,7 +392,7 @@ describe("node #126 — gitlab-rebase-squash-merge: the merge desk on a GitLab m
    expect(r.row()).toMatchObject({ status: "running", phase: "close" });
    expect(r.spawned).toEqual(["96"]);
    const notice = r.posts.at(-1)!;
-   expect(notice).toContain("**merged** #96");
+   expect(notice).toContain("✅ merged · **#96**");
    expect(notice).toContain(":warning: Needs your eye: GitLab merged !9 without squashing");
    expect(notice).not.toContain("squash-merged");
   } finally { r.close(); }
@@ -414,7 +414,7 @@ describe("node #126 — gitlab-rebase-squash-merge: the merge desk on a GitLab m
    // GitLab's own error reaches the card, not only the journal.
    expect(r.posts.at(-1)).toContain("Last pass: ranger asked for a rebase of MR !9 onto main; the head has not moved yet");
    expect(r.posts.at(-1)).toContain("Rebase failed: conflict");
-   expect(r.posts.at(-1)).toContain("**parked** #96");
+   expect(r.posts.at(-1)).toContain("⏸️ parked · **#96**");
   } finally { r.close(); }
  });
 
