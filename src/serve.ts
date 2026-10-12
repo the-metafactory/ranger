@@ -54,6 +54,7 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 import { resolve, sep } from "node:path";
 import {
  expandHome,
+ principalLoginForRepo,
  type RangerConfig,
  REPO_PATTERN,
  serveConfig,
@@ -67,6 +68,7 @@ import { IMPLEMENT_LANES, implementLane, workerLane, type ImplementLane } from "
 import { activeCooldown, cooldownScope, readGraphqlBudget } from "./budget.ts";
 import { queueEntryGate, queueSpawnGate } from "./resume.ts";
 import { cachedFrontier } from "./frontier-cache.ts";
+import { cachedRootAuthor } from "./root-author.ts";
 import { type FrontierEntry, graphFrontier, RateLimitError } from "./graph.ts";
 import { runCmd } from "./exec.ts";
 import { briefHoldReason, classify, classifyFrontier, type ClassifiedNode, loadProbeRegistry } from "./route.ts";
@@ -1968,7 +1970,10 @@ export function stateFromJournal(
        }
      : {
         ok: true,
-        frontier: classifyFrontier(cached.frontier.frontier, map, registry, config.bot.identity, cached.briefs),
+        frontier: classifyFrontier(cached.frontier.frontier, map, registry, config.bot.identity, cached.briefs, {
+         principal: principalLoginForRepo(config, map.repo),
+         rootAuthor: journal === null ? undefined : cachedRootAuthor(journal, map.repo, map.root),
+        }),
         readAt: cached.fetchedAt,
         source: "ranger",
        },

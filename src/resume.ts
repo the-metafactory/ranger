@@ -126,6 +126,11 @@ export async function startResumeNode(
   return { ...result, kind: "dropped", dropped: true, reason: `worker row is ${row.status}` };
  }
  if (row.status === "released") throw releasedError(nodeId);
+ // A proposed node waits for the principal's ratification (node #246); a
+ // resumed run would post a second proposal.
+ if (row.status === "proposed") {
+  throw new Error(`node ${nodeId} is proposed (comment ${row.proposalCommentId ?? "id unknown"}) — it waits for the principal's 👍, not a resume`);
+ }
  // A live occupant keeps the node: a second run-node would race it through
  // the same worktree and PR (2026-10-07, soma #753: two generations raced the
  // close, and the loser's park was re-spawned 50 times).

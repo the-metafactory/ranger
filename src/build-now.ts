@@ -3,7 +3,8 @@ import { graphReadToken, laneCredentialRefusal, type ReadGate } from "./forge-la
 import type { ResolvedToken } from "./token-gate.ts";
 import { budgetPolicy } from "./budget.ts";
 import { ClaimLockBusy, withClaimLock } from "./claim-lock.ts";
-import type { RangerConfig, RangerMapConfig } from "./config.ts";
+import { principalLoginForRepo, type RangerConfig, type RangerMapConfig } from "./config.ts";
+import { cachedRootAuthor } from "./root-author.ts";
 import { readFrontier } from "./frontier-cache.ts";
 import { type BriefAudit, type FrontierEntry, GRAPH_CALL_TIMEOUT_MS } from "./graph.ts";
 import type { Journal, WorkerRow } from "./journal.ts";
@@ -100,7 +101,7 @@ export interface BuildNowResult {
  pid: number | null;
 }
 
-const IN_FLIGHT = new Set<WorkerRow["status"]>(["claimed", "running", "awaiting-merge"]);
+const IN_FLIGHT = new Set<WorkerRow["status"]>(["claimed", "running", "awaiting-merge", "proposed"]);
 
 /** Why a classified node is not one the walk takes, or null when it is. */
 function notWalkable(node: ClassifiedNode): string | null {
@@ -112,6 +113,7 @@ function notWalkable(node: ClassifiedNode): string | null {
   return "routes provisioning: its probes are not in the probe registry";
  }
  if (route.route === "brief-not-ready") return `routes brief-not-ready: ${briefHoldReason(route.missing)}`;
+ if (route.route === "proposal") return "is proposed — it waits for the principal's 👍 on its proposal comment";
  if (!route.walkable) {
   return `routes ${route.route} but is not walkable on this map (walk mode, nodes allowlist or skip list)`;
  }
@@ -172,7 +174,11 @@ async function buildUnderLock(nodeId: string, ctx: BuildNowContext, owned: Owned
    const read = await readFrontier({ ...frontierArgs(ctx), audit: "never" });
    return { frontier: read.frontier.frontier, briefs: read.briefs };
   }))();
- const classified = classifyFrontier(entries, map, ctx.registry ?? loadProbeRegistry(), ctx.botIdentity, briefs);
+ // The walk keeps the root's author (node #246, D6); build-now reads only that.
+ const classified = classifyFrontier(entries, map, ctx.registry ?? loadProbeRegistry(), ctx.botIdentity, briefs, {
+  principal: principalLoginForRepo(config, map.repo),
+  rootAuthor: cachedRootAuthor(journal, map.repo, map.root),
+ });
  const node = classified.find((n) => n.id === nodeId);
  if (node === undefined) refuse("not on the map's frontier (closed, blocked, or not under this root)");
  const why = notWalkable(node!);

@@ -27,6 +27,8 @@ resolution_file=""
 gist=""
 checkpoint=""
 ci=""
+propose=""
+body_file=""
 evidence_file="$(mktemp)"
 i=4
 while [ $i -le $# ]; do
@@ -39,6 +41,8 @@ while [ $i -le $# ]; do
     --gist) i=$((i+1)); gist="${!i}" ;;
     --checkpoint) i=$((i+1)); checkpoint="${!i}" ;;
     --ci) i=$((i+1)); ci="${!i}" ;;
+    --propose) propose=1 ;;
+    --body-file) i=$((i+1)); body_file="${!i}" ;;
     --evidence) i=$((i+1)); printf "%s\n" "${!i}" >> "$evidence_file" ;;
     --write) : ;;
     --dry-run) : ;;
@@ -132,7 +136,8 @@ fi
 
 export FAKE_SOMA_STATE FAKE_SOMA_REPO_DIR FAKE_SOMA_IDENTITY="$identity" \
   FAKE_SOMA_GIST="$gist" FAKE_SOMA_CHECKPOINT="$checkpoint" FAKE_SOMA_RESOLUTION_FILE="${resolution_file:-}" \
-  FAKE_SOMA_CI="$ci" FAKE_SOMA_EVIDENCE_FILE="$evidence_file"
+  FAKE_SOMA_CI="$ci" FAKE_SOMA_EVIDENCE_FILE="$evidence_file" \
+  FAKE_SOMA_PROPOSE="$propose" FAKE_SOMA_BODY_FILE="$body_file"
 
 # A test can make the map-index write fail the way it did live (node #108).
 if [ "$verb" = "decisions" ] && [ -n "${FAKE_SOMA_DECISIONS_FAIL:-}" ]; then
@@ -189,6 +194,32 @@ if verb == "release":
         print(json.dumps({"repo": repo, "node": nid, "released": True, "assignees": node["assignees"]}))
     else:
         print(json.dumps({"repo": repo, "node": nid, "released": False, "assignees": node.get("assignees", [])}))
+    sys.exit(0)
+
+if verb == "close" and os.environ.get("FAKE_SOMA_PROPOSE") == "1":
+    # `close --propose` (node #246): posts the body as a proposal comment and
+    # closes nothing. Faithful to soma: no --resolution-file beside it.
+    if os.environ.get("FAKE_SOMA_RESOLUTION_FILE", ""):
+        print("soma graph close --propose cannot be combined with --resolution-file: the proposal body is the resolution.", file=sys.stderr)
+        sys.exit(1)
+    with open(os.environ.get("FAKE_SOMA_BODY_FILE", "")) as fh:
+        body = fh.read()
+    proposals = s.setdefault("proposals", [])
+    cid = 9001 + len(proposals)
+    proposals.append({"node": nid, "body": body, "identity": identity, "commentId": cid, "cwd": os.getcwd()})
+    save()
+    url = f"https://github.com/{repo}/issues/{nid}#issuecomment-{cid}"
+    # FAKE_SOMA_PROPOSE_OUTPUT: text (soma today), json (ruling D18), garbled (no id).
+    mode = os.environ.get("FAKE_SOMA_PROPOSE_OUTPUT", "text")
+    if mode == "json":
+        print(json.dumps({"repo": repo, "node": nid, "commentId": cid + 100, "url": url.replace(str(cid), str(cid + 100))}))
+    elif mode == "garbled":
+        print("Proposal posted.")
+    else:
+        print(f"Posted proposal comment {cid} on node {nid} ({repo}).")
+        print(f"url: {url}")
+        print("")
+        print("The receipt is a thumbs-up on THIS comment from the graph root's author.")
     sys.exit(0)
 
 if verb == "close":

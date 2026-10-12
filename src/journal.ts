@@ -36,7 +36,13 @@ export type WorkerStatus =
  | "parked"
  | "released"
  /** Implement lane: PR ready, waiting on the principal's one-tap merge. */
- | "awaiting-merge";
+ | "awaiting-merge"
+ /**
+  * A `propose` research node whose findings are posted as a proposal comment
+  * (node #246, ruling D10): the claim stays, no worker runs, no lane slot is
+  * held, and the node waits for the principal's 👍.
+  */
+ | "proposed";
 
 /**
  * Implement-lane phases (F2, #23 amendment) — the forge wins on resume.
@@ -69,6 +75,8 @@ export interface WorkerRow {
  mergeMessageId: string | null;
  /** The substrate the worker ran on (claude | codex | pi). */
  substrate: SubstrateName | null;
+ /** The proposal comment `close --propose` posted (node #246, D8); null when unknown. */
+ proposalCommentId: string | null;
 }
 
 /** Fields a supervisor may update in place on its own row. */
@@ -181,6 +189,7 @@ export type EventKind =
  | "ci-passed"
  | "reviewed"
  | "awaiting-merge"
+ | "proposed"
  | "merge-card"
  | "merged"
  | "rebased"
@@ -270,6 +279,7 @@ export class Journal {
     verdictBlockers: row.verdictBlockers ?? null,
     mergeMessageId: row.mergeMessageId ?? null,
     substrate: row.substrate ?? null,
+    proposalCommentId: row.proposalCommentId ?? null,
    })
    .onConflictDoUpdate({
     target: [workers.repo, workers.nodeId],
@@ -292,6 +302,7 @@ export class Journal {
      verdictBlockers: row.verdictBlockers,
      mergeMessageId: row.mergeMessageId,
      substrate: row.substrate,
+     proposalCommentId: row.proposalCommentId,
     },
    })
    .run();
@@ -436,7 +447,7 @@ export class Journal {
  listClosureCandidates(repo: string, root: number, limit: number, after?: string): WorkerRow[] {
   return this.db.select().from(workers).where(and(
    eq(workers.repo, repo), eq(workers.root, root),
-   inArray(workers.status, ["parked", "failed", "awaiting-merge"]),
+   inArray(workers.status, ["parked", "failed", "awaiting-merge", "proposed"]),
    after === undefined ? undefined : gt(workers.nodeId, after),
   )).orderBy(asc(workers.nodeId)).limit(limit).all().map(hydrateWorker);
  }
@@ -1142,6 +1153,7 @@ function hydrateWorker(row: {
  verdictBlockers: number | null;
  mergeMessageId: string | null;
  substrate: SubstrateName | null;
+ proposalCommentId: string | null;
 }): WorkerRow {
  return {
   nodeId: row.nodeId,
@@ -1166,6 +1178,7 @@ function hydrateWorker(row: {
   verdictBlockers: row.verdictBlockers,
   mergeMessageId: row.mergeMessageId,
   substrate: row.substrate,
+  proposalCommentId: row.proposalCommentId,
  };
 }
 

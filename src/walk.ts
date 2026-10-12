@@ -5,7 +5,8 @@ import { GateError, tokenBatch, type ResolvedToken } from "./token-gate.ts";
 import { lastImplementMaps, recordImplementStart, mapKey, implementMapOrder, readDrains } from "./maps.ts";
 import { join } from "node:path";
 import { spawnRunNodeDetached, type SpawnRunNodeArgs } from "./spawn.ts";
-import type { RangerConfig, RangerMapConfig, WalkMode } from "./config.ts";
+import { principalLoginForRepo, type RangerConfig, type RangerMapConfig, type WalkMode } from "./config.ts";
+import { cachedRootAuthor, needsRootAuthor, readRootAuthor } from "./root-author.ts";
 import { DiscordAnnouncer, type AnnounceContext, type AnnounceResult } from "./announce.ts";
 import { BudgetDeferral, budgetPolicy } from "./budget.ts";
 import { readFrontier } from "./frontier-cache.ts";
@@ -230,6 +231,7 @@ export async function claimNode(args: ClaimNodeArgs): Promise<ClaimNodeOutcome> 
   outcome: null,
   finishedAt: null,
   substrate: null,
+  proposalCommentId: null,
  });
  const pid = await (args.spawnRunNode ?? spawnRunNodeDetached)({
   nodeId: node.id,
@@ -474,11 +476,18 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
    // Not a gate (the gates are read under the lock): a paused walk or a
    // drained headless map claims nothing, so it skips the audit.
    const idle = journal.isPaused() || (implementLane(map) === "headless" && journal.isMapDrained(mapKey(map)));
+   // The root's author gates the propose research lane (node #246, D6): read
+   // once per map, only when this read shows a node it gates, then kept, so
+   // the locked plan below reads no GitHub for it.
+   let rootAuthor = cachedRootAuthor(journal, map.repo, map.root);
    if (!idle) {
     try {
      const warm = await readFrontier({ ...readArgs, now: ctx.now?.() ?? new Date(), audit: "refresh" });
      if (warm.auditMs !== undefined) mapResult.auditMs = warm.auditMs;
      if (warm.auditNote !== undefined) errors.push(`build briefs: ${warm.auditNote}`);
+     if (rootAuthor === undefined && needsRootAuthor(warm.frontier.frontier)) {
+      rootAuthor = await readRootAuthor({ ...readArgs, now: ctx.now?.() ?? new Date() });
+     }
     } catch {
      // The locked read meets the same deferral or failure and reports it.
     }
@@ -519,7 +528,10 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
      const frontierEntries = fetched.frontier;
      // A build node whose brief soma's audit reports not ready routes
      // brief-not-ready, so the plan never takes it (node #154).
-     const classified = classifyFrontier(frontierEntries, map, registry, botIdentity, briefs);
+     const classified = classifyFrontier(frontierEntries, map, registry, botIdentity, briefs, {
+      principal: principalLoginForRepo(config, map.repo),
+      rootAuthor,
+     });
      if (!briefs.ok) errors.push(`build briefs unverified — build nodes held this tick: ${briefs.error}`);
      // The plan `ranger serve` (#37) also reads, so its "next" is this order.
      const plan = planTick(classified, {

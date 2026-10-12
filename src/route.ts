@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { parseForgeRef } from "./forge-ref.ts";
 import type { BriefAudit, FrontierEntry } from "./graph.ts";
 import type { WalkMode } from "./config.ts";
 
@@ -18,7 +19,16 @@ export type EscalateReason =
 
 export type RouteClass =
   | { route: "escalate-hitl"; reason: EscalateReason }
-  | { route: "research"; walkable: boolean }
+  | {
+      route: "research";
+      walkable: boolean;
+      /**
+       * `propose`: the work ends in `soma graph close --propose`, a proposal
+       * comment the principal ratifies (node #246, ruling D10). Absent, the
+       * node is `auto` and closes on its probes and CI.
+       */
+      ratify?: "propose";
+    }
   | {
       route: "implement";
       walkable: boolean;
@@ -35,7 +45,13 @@ export type RouteClass =
    * brief not ready (node #154). `missing` names what the brief lacks;
    * null when the audit could not be read, so readiness is unknown.
    */
-  | { route: "brief-not-ready"; missing: string[] | null };
+  | { route: "brief-not-ready"; missing: string[] | null }
+  /**
+   * Not a frontier class: a claimed `propose` research node whose proposal
+   * comment waits for the principal's 👍 (node #246). Its card is built from
+   * the `proposed` worker row; `commentId` is null when soma named none.
+   */
+  | { route: "proposal"; commentId: string | null; commentUrl: string | null };
 
 export interface ClassifiedNode {
   id: string;
@@ -64,6 +80,13 @@ export interface ClassifyOptions {
   skip?: string[];
   /** Soma's build-brief-not-ready finding; absent, no build node is held. */
   briefs?: BriefAudit;
+  /**
+   * The principal's login on this map's forge and the map root's author
+   * (node #246, ruling D6). A `propose` research node is walked only when both
+   * are known and equal; otherwise it escalates.
+   */
+  principal?: string;
+  rootAuthor?: string;
 }
 
 export interface ClassifyContext {
@@ -87,6 +110,8 @@ export const ROUTE_LABELS: Record<string, string> = {
   implement: "implement",
   provisioning: "provisioning",
   "brief-not-ready": "build brief not ready",
+  "research (propose)": "research (propose — ends in a proposal comment)",
+  proposal: "proposal (waits for the principal's 👍)",
 };
 
 export const ESCALATE_REASONS: Record<EscalateReason, string> = {
@@ -255,6 +280,29 @@ function classifyRoute(
       route: { route: "implement", walkable: true, ratify: "merge" },
     };
   }
+  // Class 2r (node #246, rulings D6 + D10) — a `propose` research node is
+  // researched like an auto one and ends in a proposal comment for the
+  // principal to ratify. Only on a GitHub map the principal rooted (so soma's
+  // receipt names the principal as ratifier), on `walk: full` or
+  // `research-only`, and never for a node ranger filed (node #9).
+  if (
+    autonomy === "propose" &&
+    kind === "research" &&
+    (walkMode === "full" || walkMode === "research-only") &&
+    allowed &&
+    parseForgeRef(repo).forge === "github" &&
+    opts.botIdentity !== undefined &&
+    node.author !== opts.botIdentity &&
+    opts.principal !== undefined &&
+    opts.rootAuthor !== undefined &&
+    opts.rootAuthor.toLowerCase() === opts.principal.toLowerCase() &&
+    blockedProbeSpecs(node.node, repo, registry).length === 0
+  ) {
+    return {
+      ...base,
+      route: { route: "research", walkable: true, ratify: "propose" },
+    };
+  }
   // Class 2 — HITL autonomy, any kind.
   if (autonomy === "propose" || autonomy === "approve") {
     return {
@@ -319,6 +367,7 @@ export function classifyFrontier(
   registry: ProbeRegistry,
   botIdentity: string | undefined,
   briefs?: BriefAudit,
+  proposer?: { principal?: string; rootAuthor?: string },
 ): ClassifiedNode[] {
   return entries.map((entry) =>
     classify(entry, map.repo, map.walk, registry, {
@@ -326,6 +375,7 @@ export function classifyFrontier(
       allowlist: map.nodes,
       skip: map.skip,
       briefs,
+      ...proposer,
     }),
   );
 }
@@ -360,7 +410,7 @@ function routeKey(route: RouteClass): string {
   if (route.route === "implement")
     return route.walkable ? "implement" : "implement (not walk:full)";
   if (route.route === "research")
-    return route.walkable ? "research" : "research (not walked)";
+    return !route.walkable ? "research (not walked)" : route.ratify === "propose" ? "research (propose)" : "research";
   if (route.route === "escalate-hitl") return "escalate-hitl";
   return route.route;
 }

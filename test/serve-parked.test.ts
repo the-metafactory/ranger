@@ -76,6 +76,7 @@ const row = (over: Partial<WorkerRow>): WorkerRow => ({
  verdictBlockers: 0,
  mergeMessageId: null,
  substrate: "codex",
+ proposalCommentId: null,
  ...over,
 });
 

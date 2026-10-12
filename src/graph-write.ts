@@ -184,6 +184,80 @@ export async function graphClose(
  return { repo, node: id, closed: false, detail };
 }
 
+export interface ProposeResult {
+ repo: string;
+ node: string;
+ /** Exit 0: soma posted the proposal comment. */
+ posted: boolean;
+ /**
+  * The proposal comment's id: soma's `--json` payload when it has one
+  * (ruling D18), else parsed from `Posted proposal comment <id>`. Null when
+  * neither names it; ranger never guesses an id.
+  */
+ commentId: string | null;
+ /** The comment's URL when soma printed one. */
+ commentUrl: string | null;
+ /** Stdout (or the refusal on stderr) from the verb. */
+ detail: string;
+}
+
+const POSTED_PROPOSAL = /Posted proposal comment (\d+)/;
+const PROPOSAL_URL = /^url: (https:\/\/\S+)$/m;
+
+/**
+ * The proposal comment id and URL from `close --propose` output. Soma prints
+ * text today and ignores `--json` on close; once it answers in JSON (ruling
+ * D18) a numeric id there wins, and the text parse stays the fallback.
+ */
+export function parseProposal(stdout: string): { commentId: string | null; commentUrl: string | null } {
+ try {
+  const payload: unknown = JSON.parse(stdout);
+  if (payload !== null && typeof payload === "object" && !Array.isArray(payload)) {
+   const record = payload as Record<string, unknown>;
+   const comment = record.comment !== null && typeof record.comment === "object" ? record.comment as Record<string, unknown> : {};
+   const id = [record.commentId, record.proposalComment, record.proposalCommentId, comment.id]
+    .map((value) => typeof value === "number" ? String(value) : value)
+    .find((value): value is string => typeof value === "string" && /^\d+$/.test(value));
+   const url = [record.url, record.commentUrl, comment.url].find((value): value is string => typeof value === "string" && value.startsWith("https://"));
+   if (id !== undefined) return { commentId: id, commentUrl: url ?? null };
+  }
+ } catch { /* text output: parse it below */ }
+ return {
+  commentId: POSTED_PROPOSAL.exec(stdout)?.[1] ?? null,
+  commentUrl: PROPOSAL_URL.exec(stdout)?.[1] ?? null,
+ };
+}
+
+/**
+ * Propose a close under the bot identity (node #246, design §5): `soma graph
+ * close --propose --body-file` posts the body as a proposal comment and
+ * closes nothing. Soma refuses `--resolution-file` and `--dry-run` with
+ * `--propose` (the body is the resolution). A refusal (non-zero exit)
+ * returns `posted: false` with the reason in `detail`.
+ */
+export async function graphPropose(
+ repo: string,
+ id: string,
+ identity: string,
+ token: string,
+ options: { bodyFile: string },
+ opts: GraphWriteRunOptions = {},
+): Promise<ProposeResult> {
+ const ref = parseForgeRef(repo);
+ id = writeNodeId(ref, id);
+ const args = [
+  "graph", "close", id,
+  "--propose", "--body-file", options.bodyFile,
+  "--identity", identity,
+  "--repo", somaRepo(ref),
+  "--json",
+ ];
+ const result = await callWrite(repo, args, token, opts);
+ const detail = (result.stdout || result.stderr).trim();
+ if (result.code !== 0) return { repo, node: id, posted: false, commentId: null, commentUrl: null, detail };
+ return { repo, node: id, posted: true, ...parseProposal(result.stdout.trim()), detail };
+}
+
 export interface AddSpec {
  title: string;
  autonomy: "auto" | "propose" | "approve";

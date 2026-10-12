@@ -4,7 +4,8 @@ import { journalKeyFor } from "./forge-ref.ts";
 import { mapKey } from "./maps.ts";
 import { EscalationDiscord, DiscordMessageGoneError } from "./discord.ts";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
-import type { Journal, EscalationRow } from "./journal.ts";
+import type { Journal, EscalationRow, WorkerRow } from "./journal.ts";
+import { nodeCommentUrl, nodeUrl } from "./forge-text.ts";
 import { briefHoldReason, ESCALATE_REASONS, type ClassifiedNode, type EscalateReason } from "./route.ts";
 import { LeaseLostError, withEscalateLock, type OwnedCheck } from "./lock.ts";
 import { assertReadOnlyToken, type ResolvedToken } from "./token-gate.ts";
@@ -47,6 +48,7 @@ export const CARD_HEADS: Record<string, { emoji: string; status: string }> = {
   "hitl-kind-as-auto": { emoji: "🧹", status: "map hygiene" },
   provisioning: { emoji: "🔧", status: "provisioning needed" },
   "brief-not-ready": { emoji: "📝", status: "build brief not ready" },
+  proposal: { emoji: "🗳️", status: "proposal — react 👍 to ratify" },
 };
 
 type CardHead = (typeof CARD_HEADS)[string];
@@ -75,6 +77,14 @@ function cardSpec(node: ClassifiedNode): { head: CardHead; reason: string; journ
         head: CARD_HEADS["brief-not-ready"]!,
         reason: `${briefHoldReason(route.missing)} — ranger will not take it until soma's graph audit no longer lists it`,
         journalReason: "brief-not-ready",
+      };
+    case "proposal":
+      return {
+        head: CARD_HEADS.proposal!,
+        reason: route.commentUrl === null
+          ? "Ranger posted the research findings as a proposal comment, but the proposal comment id is unknown — find ranger's proposal comment on the node and react 👍 there to ratify it."
+          : `Ranger posted the research findings as a proposal comment: ${route.commentUrl} — react 👍 there to ratify it.`,
+        journalReason: "proposal",
       };
     default:
       return { head: { emoji: "ℹ️", status: "notice" }, reason: REGISTRY_BLOCKED, journalReason: "registry-blocked" };
@@ -1058,9 +1068,33 @@ function cardFrom(
   };
 }
 
+/**
+ * The card of a `proposed` research node (node #246): claimed, so off the
+ * frontier, and built from its worker row. It links the proposal comment
+ * when the row holds its id, and says the id is unknown when it does not.
+ */
+export function proposalNode(row: WorkerRow, title: string): ClassifiedNode {
+  const url = nodeUrl(row.repo, row.nodeId);
+  return {
+    id: row.nodeId,
+    title,
+    kind: "research",
+    autonomy: "propose",
+    typed: true,
+    url,
+    registryBlocked: false,
+    route: {
+      route: "proposal",
+      commentId: row.proposalCommentId,
+      commentUrl: row.proposalCommentId === null ? null : nodeCommentUrl(row.repo, url, row.proposalCommentId),
+    },
+  };
+}
+
 export function cardNeeded(node: ClassifiedNode): boolean {
   return (
     node.route.route === "escalate-hitl" ||
+    node.route.route === "proposal" ||
     node.route.route === "provisioning" ||
     // An unread audit names nothing missing: no card until it is read.
     (node.route.route === "brief-not-ready" && node.route.missing !== null)
