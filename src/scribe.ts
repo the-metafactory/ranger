@@ -367,20 +367,26 @@ const MARKER = /^(TODO|FIXME|XXX|HACK)\b/;
 /**
  * How one family of languages writes comments: line leaders, block openers
  * with their closers, and the quotes that open a string literal. A leader
- * inside a string is text, not a comment.
+ * inside a string is text, not a comment. `spaced` marks a language whose
+ * line leader can sit inside a word (shell `a#b`, YAML `url#frag`, INI
+ * `key=a;b`): there it starts a comment only at line start or after
+ * whitespace. Everywhere else the leader starts one wherever it stands.
  */
 export interface CommentSyntax {
  line: string[];
  block: [open: string, close: string][];
  quotes: string[];
+ spaced?: boolean;
 }
 
 const C_LIKE: CommentSyntax = { line: ["//"], block: [["/*", "*/"]], quotes: ['"', "'", "`"] };
 const RUST: CommentSyntax = { line: ["//"], block: [["/*", "*/"]], quotes: ['"'] };
 const CSS: CommentSyntax = { line: [], block: [["/*", "*/"]], quotes: ['"', "'"] };
 const HASH: CommentSyntax = { line: ["#"], block: [], quotes: ['"', "'"] };
+const SHELL: CommentSyntax = { ...HASH, spaced: true };
 const DASH: CommentSyntax = { line: ["--"], block: [], quotes: ['"', "'"] };
 const SEMI: CommentSyntax = { line: [";"], block: [], quotes: ['"'] };
+const INI: CommentSyntax = { ...SEMI, spaced: true };
 const MARKUP: CommentSyntax = { line: [], block: [["<!--", "-->"]], quotes: [] };
 const COMPONENT: CommentSyntax = { line: ["//"], block: [["/*", "*/"], ["<!--", "-->"]], quotes: ['"', "'", "`"] };
 
@@ -390,14 +396,16 @@ const SYNTAX_BY_EXT: Record<string, CommentSyntax> = {
  ),
  rs: RUST,
  ...Object.fromEntries(["css", "scss", "less"].map((e) => [e, CSS])),
- ...Object.fromEntries(["py", "rb", "sh", "bash", "zsh", "fish", "yaml", "yml", "toml", "pl", "r", "nix", "ex", "exs", "conf", "mk"].map((e) => [e, HASH])),
+ ...Object.fromEntries(["py", "rb", "toml", "pl", "r", "nix", "ex", "exs", "mk"].map((e) => [e, HASH])),
+ ...Object.fromEntries(["sh", "bash", "zsh", "fish", "yaml", "yml", "conf"].map((e) => [e, SHELL])),
  ...Object.fromEntries(["sql", "lua", "hs", "elm"].map((e) => [e, DASH])),
- ...Object.fromEntries(["el", "lisp", "clj", "cljs", "scm", "ini", "asm"].map((e) => [e, SEMI])),
+ ...Object.fromEntries(["el", "lisp", "clj", "cljs", "scm", "asm"].map((e) => [e, SEMI])),
+ ini: INI,
  ...Object.fromEntries(["md", "mdx", "html", "htm", "xml", "svg"].map((e) => [e, MARKUP])),
  ...Object.fromEntries(["vue", "svelte", "astro"].map((e) => [e, COMPONENT])),
 };
 
-const SYNTAX_BY_NAME: Record<string, CommentSyntax> = { Makefile: HASH, Dockerfile: HASH, Containerfile: HASH };
+const SYNTAX_BY_NAME: Record<string, CommentSyntax> = { Makefile: HASH, Dockerfile: SHELL, Containerfile: SHELL };
 
 /** The comment syntax a path's language uses; null when ranger does not know it. */
 export function commentSyntax(path: string): CommentSyntax | null {
@@ -408,10 +416,9 @@ export function commentSyntax(path: string): CommentSyntax | null {
  return dot > 0 ? (SYNTAX_BY_EXT[name.slice(dot + 1).toLowerCase()] ?? null) : null;
 }
 
-/** A leader that also appears in code (`x--`, `a#b`, `f();`) starts a comment only after whitespace. */
-function leaderStartsHere(text: string, at: number, leader: string): boolean {
- if (leader === "//" || leader === "/*" || leader === "<!--") return true;
- return at === 0 || /\s/.test(text[at - 1]);
+/** Whether a line leader at `at` starts a comment: anywhere, or in a `spaced` language only at line start or after whitespace. */
+function leaderStartsHere(text: string, at: number, syntax: CommentSyntax): boolean {
+ return !syntax.spaced || at === 0 || /\s/.test(text[at - 1]);
 }
 
 /** Whether a comment body (the text right after its leader) opens with a marker word. */
@@ -451,7 +458,7 @@ export function lineHasMarkerComment(text: string, syntax: CommentSyntax): boole
    i += 1;
    continue;
   }
-  const leader = syntax.line.find((l) => text.startsWith(l, i) && leaderStartsHere(text, i, l));
+  const leader = syntax.line.find((l) => text.startsWith(l, i) && leaderStartsHere(text, i, syntax));
   if (leader !== undefined) return bodyHasMarker(text.slice(i + leader.length), leader);
   const block = syntax.block.find(([open]) => text.startsWith(open, i));
   if (block !== undefined) {

@@ -239,20 +239,33 @@ describe("lineHasMarkerComment: comments only, read in the file's language", () 
   expect(lineHasMarkerComment("* TODO item", md)).toBe(false);
   expect(lineHasMarkerComment("Use `// TODO` to mark work", md)).toBe(false);
  });
- test("hash, dash and semicolon languages need whitespace before the leader", () => {
+ test("hash, dash and semicolon leaders start a comment right after code", () => {
   const py = commentSyntax("a/b.py")!;
   expect(lineHasMarkerComment("x = 1  # TODO: real", py)).toBe(true);
+  expect(lineHasMarkerComment("x = 1#TODO: remove temporary default", py)).toBe(true);
   expect(lineHasMarkerComment('s = "# TODO in a string"', py)).toBe(false);
-  expect(lineHasMarkerComment("a#TODO", py)).toBe(false);
+  expect(lineHasMarkerComment("x = 1#TODO", commentSyntax("a.rb")!)).toBe(true);
+  expect(lineHasMarkerComment("all:#TODO", commentSyntax("Makefile")!)).toBe(true);
   expect(lineHasMarkerComment("-- HACK", commentSyntax("q.sql")!)).toBe(true);
-  expect(lineHasMarkerComment("x--TODO", commentSyntax("q.sql")!)).toBe(false);
+  expect(lineHasMarkerComment("x--TODO", commentSyntax("q.sql")!)).toBe(true);
   expect(lineHasMarkerComment(";; FIXME", commentSyntax("init.el")!)).toBe(true);
+  expect(lineHasMarkerComment("(f x);TODO", commentSyntax("a.clj")!)).toBe(true);
+ });
+ test("shell, YAML and INI leaders inside a word are text, not a comment", () => {
+  const sh = commentSyntax("x.sh")!;
+  expect(lineHasMarkerComment("echo a#TODO", sh)).toBe(false);
+  expect(lineHasMarkerComment("echo a # TODO: real", sh)).toBe(true);
+  expect(lineHasMarkerComment("# FIXME", sh)).toBe(true);
+  expect(lineHasMarkerComment("url: http://x/#TODO", commentSyntax("c.yaml")!)).toBe(false);
+  expect(lineHasMarkerComment("RUN make a#TODO", commentSyntax("Dockerfile")!)).toBe(false);
+  expect(lineHasMarkerComment("key=a;TODO", commentSyntax("c.ini")!)).toBe(false);
+  expect(lineHasMarkerComment("; TODO", commentSyntax("c.ini")!)).toBe(true);
  });
  test("Rust lifetimes do not read as an unterminated string", () => {
   expect(lineHasMarkerComment("fn f(x: &'static str) {} // TODO", commentSyntax("lib.rs")!)).toBe(true);
  });
  test("a file name maps to its syntax; an unknown language has none", () => {
-  expect(commentSyntax("Makefile")).toBe(commentSyntax("x.sh"));
+  expect(commentSyntax("Makefile")).toBe(commentSyntax("x.py"));
   expect(commentSyntax("sub/Dockerfile")).toBe(commentSyntax("x.sh"));
   expect(commentSyntax("notes.txt")).toBeNull();
   expect(commentSyntax("LICENSE")).toBeNull();
