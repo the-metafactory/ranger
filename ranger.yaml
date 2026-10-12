@@ -287,3 +287,12 @@ serve:
 state:
   legacyMapRoots:
     jcfischer/seelite: 1
+
+# Run-ledger producer (soma#787 amendment 1, soma#819). Read once ranger#258
+# lands; until then the parser ignores it. Creds may publish only on
+# local.jc.default.execution.run.finished (user `ranger`, JC_DEFAULT_AGENTS).
+bus:
+  principal: jc
+  stack: default
+  url: nats://127.0.0.1:4222
+  creds: ~/.config/nats/creds/ranger.creds
