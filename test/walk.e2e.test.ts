@@ -385,6 +385,16 @@ describe("ranger run-node — research worker full loop (node #13 acceptance)", 
    );
    expect(refCheck.code).toBe(0);
 
+   // The supervisor cut the findings branch with --no-track: no tracking lines
+   // reached the shared config, where the tamper check refuses them at the
+   // vetted push (soma #782, #783: a worker branched off origin/main).
+   const tracking = await runCmd(
+    "git",
+    ["--git-dir", join(canonical, ".git"), "config", "--get-regexp", "^branch\\.research/"],
+    { env: { ...process.env, ...GIT_ENV } },
+   );
+   expect(tracking.stdout).toBe("");
+
    // The node was closed with a gist, decisions re-projected.
    const state = JSON.parse(readFileSync(statePath, "utf8"));
    expect(state.nodes["10"].status).toBe("closed");

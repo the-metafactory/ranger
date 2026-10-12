@@ -825,12 +825,20 @@ async function runResearch(
  });
  const canonical = canonicalDir(config, map);
  const slug = slugify(node.node.title);
- const start = await trustedStart(ctx, nodeId, node.node.title, canonical, () =>
-  bootstrapWorktree(canonical, nodeId, slug, gitCredential(repo, token), undefined, map.base),
- );
+ const branch = researchBranchFor(node.node);
+ // The supervisor cuts the findings branch itself (`--no-track`), as the
+ // implement lane does: a worker that ran `git checkout -b <branch>
+ // origin/<base>` wrote `branch.<branch>.remote` + `.merge` into the SHARED
+ // config, which the tamper check refuses at the vetted push (soma #782, #783).
+ // A findings branch that already exists before any base is recorded is
+ // unexplained state, read before the worktree add can create it.
+ let preexisting: string | null = null;
+ const start = await trustedStart(ctx, nodeId, node.node.title, canonical, async () => {
+  if (journal.getWorker(nodeId, repo)?.researchBaseSha == null) preexisting = await resolveBranchSha(canonical, branch);
+  return bootstrapWorktree(canonical, nodeId, slug, gitCredential(repo, token), branch, map.base);
+ });
  if ("parked" in start) return start.parked;
  const { worktree } = start;
- const branch = researchBranchFor(node.node);
 
  journal.recordEvent("worker-start", {
   nodeId,
@@ -846,10 +854,10 @@ async function runResearch(
   : await github.getPr(repo, recorded, token);
  let baseSha = journal.getWorker(nodeId, repo)?.researchBaseSha ?? null;
  if (baseSha === null) {
-  if (existingPr !== null || await resolveBranchSha(canonical, branch) !== null) {
+  if (existingPr !== null || preexisting !== null) {
    throw new ParkSignal(`research pre-worker base is missing for ${branch}; operator intervention required`);
   }
-  baseSha = await resolveCommit(canonical, `refs/heads/${worktreeBranch(nodeId, slug)}`);
+  baseSha = await resolveBranchSha(canonical, branch);
   if (baseSha === null) {
    throw new GitSafetyError(`cannot resolve research pre-worker base for node #${nodeId}`);
   }

@@ -49,9 +49,11 @@ const HEADLESS_RULE = `- This is a HEADLESS session: when you end your turn, the
 /** The orienteer research kind SOP, quoted into every research worker prompt. */
 const RESEARCH_SOP = `Research kind SOP (orienteer):
 - Investigate the node's question. Findings go to \`findings.md\` at the worktree root.
-- Create the throwaway branch \`{{branch}}\` and COMMIT the findings on it — do NOT push:
-  the supervisor performs the single vetted push, and the worker never holds the write
-  credential. The close gate probes that exact ref, so the branch name is not negotiable.
+- COMMIT the findings on the throwaway branch \`{{branch}}\`, already checked out. Do not
+  create or switch branches. Do NOT push: the supervisor performs the single vetted push,
+  and the worker never holds the write credential. The close gate probes that exact ref.
+- Do not fetch, pull, merge or rebase: the branch was cut at the base the supervisor
+  recorded, and a push whose diff from it touches anything but findings.md is refused.
 - Do NOT open a pull request, do NOT merge anything, do NOT touch the map body,
   do NOT claim or close any other node. This is research; it is read + write
   only on your findings branch.
@@ -73,8 +75,8 @@ export function assembleResearchPrompt(input: WorkerPromptInput): string {
   "",
   `## Worktree`,
   `You are in a git worktree at: ${worktree}`,
-  `Create branch \`${branch}\` (from the current main), write your findings to findings.md`,
-  `in this directory, and COMMIT them on that branch. Do NOT push — the supervisor`,
+  `Branch \`${branch}\` is checked out. Write your findings to findings.md in this`,
+  `directory and COMMIT them there; do not create or switch branches. Do NOT push — the supervisor`,
   `pushes your branch with the machine credential, which the worker never sees.`,
   `The close gate probes that ref.`,
   "",
