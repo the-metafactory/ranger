@@ -155,19 +155,61 @@ export function runCliSpawn(
  return { child, result };
 }
 
+/** The fake Discord's own bot user id and guild (intake, node #247). */
+export const FAKE_BOT_ID = "900000000000000001";
+export const FAKE_GUILD_ID = "700000000000000007";
+
+/** A thread message as Discord's REST API returns it (intake, node #247). */
+export interface FakeThreadMessage {
+ id: string;
+ content: string;
+ author: { id: string; bot?: boolean };
+ mentions: { id: string }[];
+ message_reference?: { message_id: string };
+}
+
 /**
  * Fake Discord API: POST /channels/:id → post, PATCH /channels/:id/messages/:m
  * → edit. Message ids carry a `discord-msg-` prefix so callers can tell a
- * posted id from a fake one.
+ * posted id from a fake one. Thread reads (GET /users/@me, /channels/:id and
+ * /channels/:id/messages) serve the messages `say` added (intake, node #247).
  */
 export function fakeDiscord() {
  const posts: { url: string; messageId: string; content: string }[] = [];
  const edits: { messageId: string; content: string }[] = [];
  const deleted = new Set<string>(); // messages removed — GET returns 404
+ // Thread messages per channel, and every thread read (`after` cursor).
+ const threads = new Map<string, FakeThreadMessage[]>();
+ const threadReads: { channelId: string; after: string | null }[] = [];
+ const meReads: number[] = [];
+ let threadReadStatus = 200;
  const server = Bun.serve({
   port: 0,
   async fetch(req) {
    const url = new URL(req.url);
+   if (req.method === "GET" && url.pathname === "/users/@me") {
+    meReads.push(Date.now());
+    return Response.json({ id: FAKE_BOT_ID, bot: true });
+   }
+   const listMatch = url.pathname.match(/^\/channels\/([^/]+)\/messages$/);
+   if (req.method === "GET" && listMatch) {
+    const channelId = listMatch[1]!;
+    const after = url.searchParams.get("after");
+    threadReads.push({ channelId, after });
+    if (threadReadStatus !== 200) return new Response("refused", { status: threadReadStatus });
+    const limit = Number(url.searchParams.get("limit") ?? 50);
+    // Like Discord: the messages nearest after the cursor, newest first.
+    const newer = (threads.get(channelId) ?? [])
+     .filter((m) => after === null || BigInt(m.id) > BigInt(after))
+     .sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? -1 : 1))
+     .slice(0, limit)
+     .reverse();
+    return Response.json(newer);
+   }
+   const channelMatch = url.pathname.match(/^\/channels\/([^/]+)$/);
+   if (req.method === "GET" && channelMatch) {
+    return Response.json({ id: channelMatch[1], guild_id: FAKE_GUILD_ID });
+   }
    if (req.method === "POST" && url.pathname.startsWith("/channels/")) {
     const parsed = (await req.json()) as { content?: string };
     const messageId = `discord-msg-${posts.length + 1}`;
@@ -201,6 +243,14 @@ export function fakeDiscord() {
   posts,
   edits,
   deleteMessage: (id: string) => deleted.add(id),
+  /** Add a message to a thread (ids must grow with time, as snowflakes do). */
+  say: (channelId: string, message: FakeThreadMessage) => {
+   threads.set(channelId, [...(threads.get(channelId) ?? []), message]);
+  },
+  threadReads,
+  meReads,
+  /** Answer every thread read with this HTTP status (200 = serve normally). */
+  failThreadReads: (status: number) => { threadReadStatus = status; },
   stop: () => server.stop(true),
  };
 }

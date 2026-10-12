@@ -49,6 +49,7 @@ export const CARD_HEADS: Record<string, { emoji: string; status: string }> = {
   provisioning: { emoji: "🔧", status: "provisioning needed" },
   "brief-not-ready": { emoji: "📝", status: "build brief not ready" },
   proposal: { emoji: "🗳️", status: "proposal — react 👍 to ratify" },
+  draft: { emoji: "📥", status: "draft node" },
 };
 
 type CardHead = (typeof CARD_HEADS)[string];
@@ -1039,6 +1040,36 @@ export function ageText(
     return `⚠️ ${ageDays}d`;
   }
   return `${ageDays}d`;
+}
+
+/**
+ * The draft node card of a principal observation (node #247, ruling D12): the
+ * proposed spec on the subtext line, which drafter wrote it, the principal's
+ * message as the body, and a link back to it. Nothing is filed yet.
+ */
+export function draftCardContent(
+  map: { repo: string; root: number },
+  draft: { title: string; parent: number; checkpoint: string; autonomy: string; drafter: string; body: string; messageUrl: string },
+): string {
+  return renderCard({
+    ...CARD_HEADS.draft!,
+    title: draft.title,
+    meta: [
+      `map: ${mapKey(map)}`,
+      `parent #${draft.parent}`,
+      `checkpoint ${code(draft.checkpoint)}`,
+      `autonomy ${draft.autonomy}`,
+      `${draft.drafter} draft`,
+    ],
+    lines: [
+      draft.drafter === "deterministic"
+        ? "Deterministic draft: the title is the first line of your message, the checkpoint is slugged from it, and the body is your message verbatim. Not filed yet."
+        : `${sanitizeGraphText(draft.drafter)} draft. Not filed yet.`,
+    ],
+    body: draft.body,
+    // The tail survives every cut, so the link back always shows.
+    tail: `From your message: <${draft.messageUrl}>`,
+  });
 }
 
 /** Build the card + journal-row inputs for a node in one place (no drift). */

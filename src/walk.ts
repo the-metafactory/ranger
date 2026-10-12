@@ -23,6 +23,7 @@ import { classifyFrontier, loadProbeRegistry } from "./route.ts";
 import type { ForgePort } from "./forge.ts";
 import { probeRequeueCandidates, requeueProbes, type ProbeRequeueResult } from "./probe-requeue.ts";
 import { sweepMap, type SweepMapResult } from "./sweep.ts";
+import { intakePass, type IntakeContext, type IntakeResult } from "./intake.ts";
 import {
  drainGate,
  implementCandidates,
@@ -46,6 +47,8 @@ export { implementCandidates, planTick, researchCandidates, selectCandidates };
  * → research-lane candidates → announce (fail-closed)
  * → claim (race-safe) → spawn a detached `ranger run-node`. Sweeps go first so
  * a send-back takes its implement lane before queued resumes or fresh claims.
+ * Last, the intake pass (node #247) drafts a card for each principal
+ * @-mention in a map thread; it files nothing.
  *
  * Stateless over the graph: everything topological is re-derived per pass.
  */
@@ -75,6 +78,8 @@ export interface WalkResult {
  maps: WalkMapResult[];
  spawnCapPerDay: number;
  probeRequeues: ProbeRequeueResult;
+ /** The human-observation intake pass (node #247). */
+ intake: IntakeResult;
 }
 
 export interface WalkContext {
@@ -88,6 +93,8 @@ export interface WalkContext {
  github?: ForgePort;
  /** The read gate a GitLab map's graph reads run under (tests inject a fake; default: `assertReadOnlyToken`). */
  readGate?: ReadGate;
+ /** The intake pass's thread client (tests inject one; default: each map's Discord surface). */
+ intakeClient?: IntakeContext["clientFor"];
 }
 
 /** Is this resource lane held? (awaiting-merge does not hold it.) */
@@ -256,6 +263,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
   maps: [],
   spawnCapPerDay: config.workers.spawnCapPerDay,
   probeRequeues: { resumed: [], pending: [], errors: [], lanes: [] },
+  intake: { threads: [] },
  };
  const cliEntry = join(import.meta.dir, "cli.ts");
  // Even a worker finishing during this tick must not allow a second claim
@@ -621,6 +629,16 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
 
   mapResult.errors = errors;
  }
+
+ // Intake runs on every map with a thread but `walk: none` (D17), whatever
+ // the gates above decided: it reads Discord and posts draft cards, and an
+ // intake add is never on ranger's initiative. Last, so it never delays a claim.
+ result.intake = await intakePass({
+  config,
+  journal,
+  ...(ctx.now === undefined ? {} : { now: ctx.now }),
+  ...(ctx.intakeClient === undefined ? {} : { clientFor: ctx.intakeClient }),
+ });
 
  result.maps = maps;
  return result;

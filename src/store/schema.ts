@@ -279,3 +279,43 @@ export const headSubstrates = sqliteTable(
   index("head_substrates_recorded_at_idx").on(table.recordedAt),
  ],
 );
+
+/**
+ * Human-observation intake (node #247, #21 rulings D3, D11, D17): how far
+ * ranger has read each map's Discord thread. One row per thread, holding the
+ * newest message id read; the next read asks for messages after it.
+ */
+export const intakeCursors = sqliteTable("intake_cursors", {
+ channelId: text("channel_id").primaryKey(),
+ lastMessageId: text("last_message_id").notNull(),
+ updatedAt: text("updated_at").notNull(),
+});
+
+/**
+ * One draft node card per principal message (node #247, ruling D12), keyed by
+ * the Discord message id: a message read twice finds its draft here and posts
+ * no second card. Nothing is filed yet; filing on 👍 is node #251's.
+ */
+export const intakeDrafts = sqliteTable(
+ "intake_drafts",
+ {
+  messageId: text("message_id").primaryKey(),
+  channelId: text("channel_id").notNull(),
+  repo: text("repo").notNull(),
+  root: integer("root").notNull(),
+  authorId: text("author_id").notNull(),
+  title: text("title").notNull(),
+  checkpoint: text("checkpoint").notNull(),
+  /** The principal's message, verbatim as Discord returned it. */
+  body: text("body").notNull(),
+  messageUrl: text("message_url").notNull(),
+  /** Which drafter wrote the spec: `deterministic` (D12's fallback). */
+  drafter: text("drafter").notNull(),
+  /** The draft card ranger posted in the thread. */
+  cardMessageId: text("card_message_id").notNull(),
+  /** draft — node #251 adds filed and discarded. */
+  status: text("status").notNull().default("draft"),
+  createdAt: text("created_at").notNull(),
+ },
+ (table) => [index("intake_drafts_repo_root_idx").on(table.repo, table.root)],
+);

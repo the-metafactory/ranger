@@ -521,6 +521,116 @@ export class EscalationDiscord {
     // 2xx / 401 / 403 / persistent 5xx — NOT a definitive delete.
     return true;
   }
+
+  // ---- thread reads (human-observation intake, node #247) ----
+
+  /** One GET, parsed; any non-2xx, network error or bad body throws. */
+  private async getJson(path: string, label: string, deadline?: number): Promise<unknown> {
+    let response: DiscordHttpResult;
+    try {
+      response = await this.fetchOnce(path, { method: "GET" }, deadline);
+    } catch (error) {
+      throw new EscalateError(
+        `discord ${label} failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    if (response.status < 200 || response.status >= 300) {
+      throw new EscalateError(`discord ${label} returned HTTP ${response.status}`);
+    }
+    try {
+      return JSON.parse(response.bodyText);
+    } catch {
+      throw new EscalateError(`discord ${label} returned an unparseable body`);
+    }
+  }
+
+  /** The bot's own user id (`GET /users/@me`): the id an @-mention names. */
+  async currentUserId(deadline?: number): Promise<string> {
+    const body = (await this.getJson("/users/@me", "read of the bot user", deadline)) as { id?: unknown } | null;
+    if (typeof body?.id !== "string" || body.id.length === 0) {
+      throw new EscalateError("discord read of the bot user returned no id");
+    }
+    return body.id;
+  }
+
+  /** The guild this channel belongs to, for a message link; null outside a guild. */
+  async guildId(deadline?: number): Promise<string | null> {
+    const body = (await this.getJson(`/channels/${this.channelId}`, `read of channel ${this.channelId}`, deadline)) as
+      | { guild_id?: unknown }
+      | null;
+    return typeof body?.guild_id === "string" && body.guild_id.length > 0 ? body.guild_id : null;
+  }
+
+  /**
+   * Up to `limit` messages after `after` in this channel, oldest first. Over
+   * REST a bot gets the content of a message that mentions it without the
+   * privileged Message Content intent; other messages may come back empty.
+   */
+  async messagesAfter(after: string, limit = THREAD_PAGE_SIZE, deadline?: number): Promise<ThreadMessage[]> {
+    const label = `read of channel ${this.channelId} messages`;
+    const body = await this.getJson(
+      `/channels/${this.channelId}/messages?after=${encodeURIComponent(after)}&limit=${limit}`,
+      label,
+      deadline,
+    );
+    if (!Array.isArray(body)) throw new EscalateError(`discord ${label} returned no message list`);
+    const messages = body.map((raw): ThreadMessage => {
+      const m = raw as {
+        id?: unknown;
+        content?: unknown;
+        author?: { id?: unknown };
+        mentions?: { id?: unknown }[];
+        message_reference?: unknown;
+      };
+      if (typeof m?.id !== "string" || !SNOWFLAKE.test(m.id)) {
+        throw new EscalateError(`discord ${label} returned a message without an id`);
+      }
+      return {
+        id: m.id,
+        content: typeof m.content === "string" ? m.content : "",
+        authorId: typeof m.author?.id === "string" ? m.author.id : "",
+        mentionIds: Array.isArray(m.mentions)
+          ? m.mentions.flatMap((u) => (typeof u?.id === "string" ? [u.id] : []))
+          : [],
+        isReply: m.message_reference !== undefined && m.message_reference !== null,
+      };
+    });
+    // Discord lists newest first; intake walks oldest first.
+    return messages.sort((a, b) => compareSnowflakes(a.id, b.id));
+  }
+}
+
+/** The page size of a thread read: Discord's maximum. */
+export const THREAD_PAGE_SIZE = 100;
+
+const SNOWFLAKE = /^\d{1,20}$/;
+
+/** One message read from a map thread: only the fields intake reads. */
+export interface ThreadMessage {
+  id: string;
+  /** Empty when Discord withheld it (no mention, no Message Content intent). */
+  content: string;
+  authorId: string;
+  /** Users the message mentions, by id. */
+  mentionIds: string[];
+  /** A reply: Discord lists the replied-to author as mentioned when it pings. */
+  isReply: boolean;
+}
+
+/** Order two Discord snowflakes (ids grow with time). */
+export function compareSnowflakes(a: string, b: string): number {
+  const x = BigInt(a);
+  const y = BigInt(b);
+  return x < y ? -1 : x > y ? 1 : 0;
+}
+
+/** Discord's epoch (2015-01-01T00:00:00Z) in ms. */
+const DISCORD_EPOCH_MS = 1_420_070_400_000n;
+
+/** The smallest snowflake Discord could mint at `at`: messages after it are newer. */
+export function snowflakeAt(at: Date): string {
+  const ms = BigInt(Math.max(0, at.getTime())) - DISCORD_EPOCH_MS;
+  return (ms < 0n ? 0n : ms << 22n).toString();
 }
 
 export function sleep(ms: number): Promise<void> {
