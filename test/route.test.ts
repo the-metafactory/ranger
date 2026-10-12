@@ -278,6 +278,67 @@ describe("loadProbeRegistry", () => {
   });
 });
 
+describe("classify — propose research lane (node #246, rulings D6 + D10)", () => {
+  const propose = (over: EntryOverrides = {}, author = "alice"): FrontierEntry => ({
+    ...entry({ ...over, node: { autonomy: "propose", kind: "research", ...over.node } }),
+    author,
+  });
+  const gates = { botIdentity: "ivy-agent", principal: "jcfischer", rootAuthor: "jcfischer" };
+  const PROPOSE_APPROVE = { route: "escalate-hitl", reason: "propose-approve" } as const;
+
+  test("principal-rooted GitHub map, walk full or research-only → research lane, ratified by proposal", () => {
+    for (const walk of ["full", "research-only"] as const) {
+      const node = classify(propose(), "acme/widgets", walk, EMPTY_REGISTRY, gates);
+      expect(node.route).toEqual({ route: "research", walkable: true, ratify: "propose" });
+    }
+  });
+
+  test("the principal's login matches the root author case-insensitively", () => {
+    const node = classify(propose(), "acme/widgets", "full", EMPTY_REGISTRY, { ...gates, rootAuthor: "JCFischer" });
+    expect(node.route).toEqual({ route: "research", walkable: true, ratify: "propose" });
+  });
+
+  test("a root the principal did not author → escalates as propose-approve", () => {
+    const node = classify(propose(), "acme/widgets", "full", EMPTY_REGISTRY, { ...gates, rootAuthor: "alice" });
+    expect(node.route).toEqual(PROPOSE_APPROVE);
+  });
+
+  test("an unknown root author or principal → escalates", () => {
+    for (const opts of [{ ...gates, rootAuthor: undefined }, { ...gates, principal: undefined }]) {
+      expect(classify(propose(), "acme/widgets", "full", EMPTY_REGISTRY, opts).route).toEqual(PROPOSE_APPROVE);
+    }
+  });
+
+  test("a node the machine account filed, or an unknown machine account → escalates", () => {
+    expect(classify(propose({}, "ivy-agent"), "acme/widgets", "full", EMPTY_REGISTRY, gates).route).toEqual(PROPOSE_APPROVE);
+    expect(classify(propose(), "acme/widgets", "full", EMPTY_REGISTRY, { ...gates, botIdentity: undefined }).route).toEqual(PROPOSE_APPROVE);
+  });
+
+  test("a GitLab map → escalates", () => {
+    const node = classify(propose(), "gitlab:gitlab.example.test/claw/sim", "full", EMPTY_REGISTRY, gates);
+    expect(node.route).toEqual(PROPOSE_APPROVE);
+  });
+
+  test("walk: none, off the allowlist or on the skip list → escalates", () => {
+    expect(classify(propose(), "acme/widgets", "none", EMPTY_REGISTRY, gates).route).toEqual(PROPOSE_APPROVE);
+    expect(classify(propose(), "acme/widgets", "full", EMPTY_REGISTRY, { ...gates, allowlist: ["99"] }).route).toEqual(PROPOSE_APPROVE);
+    expect(classify(propose(), "acme/widgets", "full", EMPTY_REGISTRY, { ...gates, skip: ["1"] }).route).toEqual(PROPOSE_APPROVE);
+  });
+
+  test("unregistered probes → escalates", () => {
+    const node = classify(
+      propose({ node: { probes: [{ type: "command", run: "bun test", cwd: "/tmp/x" }] } }),
+      "acme/widgets", "full", EMPTY_REGISTRY, gates,
+    );
+    expect(node.route).toEqual(PROPOSE_APPROVE);
+  });
+
+  test("propose task/build and approve research keep their routes", () => {
+    expect(classify(propose({ node: { kind: "task" } }), "acme/widgets", "research-only", EMPTY_REGISTRY, gates).route).toEqual(PROPOSE_APPROVE);
+    expect(classify(propose({ node: { autonomy: "approve" } }), "acme/widgets", "full", EMPTY_REGISTRY, gates).route).toEqual(PROPOSE_APPROVE);
+  });
+});
+
 describe("probe registry keys (soma registry v2)", () => {
   const SOMA = "/Users/x/soma";
   const probe = { type: "command", run: "bun test", cwd: SOMA } as const;

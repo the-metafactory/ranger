@@ -3,7 +3,8 @@ import { mapKey } from "./maps.ts";
 import { join } from "node:path";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import type { EscalationDiscord } from "./discord.ts";
-import { classify, hitlWaiting, loadProbeRegistry } from "./route.ts";
+import { classify, hitlWaiting, loadProbeRegistry, type ClassifiedNode } from "./route.ts";
+import { cachedRootAuthor, needsRootAuthor, readRootAuthor } from "./root-author.ts";
 import { BudgetDeferral, budgetPolicy, budgetedRead } from "./budget.ts";
 import { readFrontier } from "./frontier-cache.ts";
 import { AUDIT_CALL_TIMEOUT_MS, GRAPH_CALL_TIMEOUT_MS, graphAudit, graphNode } from "./graph.ts";
@@ -18,6 +19,7 @@ import {
   dayDiff,
   digestAction,
   markAbsentCards,
+  proposalNode,
   resolveDeskContext,
   sanitizeGraphText,
   syncActivePage,
@@ -118,19 +120,42 @@ async function escalateOneMap(
       auditTimeoutMs: GRAPH_CALL_TIMEOUT_MS,
     });
 
+    // A `propose` research node the walk takes gets no HITL card (node #246, D6).
+    // Read once, only when the frontier holds a node it gates.
+    const rootAuthor = cachedRootAuthor(journal, map.repo, map.root) ?? (!needsRootAuthor(frontier.frontier) ? undefined : await readRootAuthor({
+      journal,
+      repo: map.repo,
+      root: map.root,
+      token,
+      policy: budgetPolicy(config),
+      now,
+      timeoutMs: Math.max(1, Math.min(GRAPH_CALL_TIMEOUT_MS, passDeadline - Date.now())),
+    }));
     const classified = frontier.frontier.map((entry) =>
       classify(entry, map.repo, map.walk, registry, {
         botIdentity: config.bot.identity,
         allowlist: map.nodes,
         skip: map.skip,
         briefs,
+        principal: principalLoginForRepo(config, map.repo),
+        rootAuthor,
       }),
     );
+    const readNode = (id: string) => {
+      if (Date.now() >= passDeadline) throw new BudgetDeferral("graph closure pass deadline reached");
+      return budgetedRead(journal, map.repo, token, budgetPolicy(config), now, () => {
+        const remaining = passDeadline - Date.now();
+        if (remaining <= 0) throw new BudgetDeferral("graph closure pass deadline reached");
+        return graphNode(map.repo, id, token, { timeoutMs: Math.min(GRAPH_CALL_TIMEOUT_MS, remaining) });
+      });
+    };
+    const proposals = await proposalCards(journal, map, readNode, base);
     const briefHeld = classified.filter((n) => n.route.route === "brief-not-ready");
     const needed = [
       ...hitlWaiting(classified),
       ...classified.filter((n) => n.route.route === "provisioning"),
       ...briefHeld,
+      ...proposals,
     ].filter(cardNeeded);
     if (!briefs.ok) base.cardErrors.push(`build briefs unverified: ${briefs.error}`);
 
@@ -154,14 +179,7 @@ async function escalateOneMap(
         now,
         budget: { remaining: ABSENT_RESERVE, deadline: passDeadline },
         owned,
-        readNode: id => {
-          if (Date.now() >= passDeadline) throw new BudgetDeferral("graph closure pass deadline reached");
-          return budgetedRead(journal, map.repo, token, budgetPolicy(config), now, () => {
-            const remaining = passDeadline - Date.now();
-            if (remaining <= 0) throw new BudgetDeferral("graph closure pass deadline reached");
-            return graphNode(map.repo, id, token, { timeoutMs: Math.min(GRAPH_CALL_TIMEOUT_MS, remaining) });
-          });
-        },
+        readNode,
       },
       neededIds,
     );
@@ -196,6 +214,36 @@ async function escalateOneMap(
       error: error instanceof Error ? error.message : String(error),
     };
   }
+}
+
+/**
+ * The cards of this map's `proposed` research nodes (node #246). They are
+ * claimed, so off the frontier: each card comes from the worker row. The
+ * title is the card's own when it has one (the node's HITL card before the
+ * claim, or an earlier proposal card), else one node read.
+ */
+async function proposalCards(
+  journal: Journal,
+  map: RangerMapConfig,
+  readNode: (id: string) => Promise<{ node: { title: string } }>,
+  base: EscalateMapResult,
+): Promise<ClassifiedNode[]> {
+  const cards: ClassifiedNode[] = [];
+  for (const row of journal.listWorkers(map.repo, map.root)) {
+    if (row.status !== "proposed") continue;
+    let title = journal.getEscalation(map.repo, row.nodeId)?.title ?? null;
+    if (title === null) {
+      try {
+        title = (await readNode(row.nodeId)).node.title;
+      } catch (error) {
+        if (error instanceof BudgetDeferral) base.deferred.push(row.nodeId);
+        else base.cardErrors.push(`#${row.nodeId}: proposal card title read failed: ${error instanceof Error ? error.message : String(error)}`);
+        continue;
+      }
+    }
+    cards.push(proposalNode(row, title));
+  }
+  return cards;
 }
 
 /** The cards run across every registered map. */

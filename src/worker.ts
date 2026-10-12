@@ -1,12 +1,12 @@
 import { fileStemFor, parseForgeRef, qualifiedRepo } from "./forge-ref.ts";
 import { graphReadToken, laneCredentialRefusal, lanePort, type ReadGate } from "./forge-lanes.ts";
-import { changeRequestLabel, ciRunNoun } from "./forge-text.ts";
+import { branchUrl, changeRequestLabel, ciRunNoun, nodeCommentUrl } from "./forge-text.ts";
 import { mapKey } from "./maps.ts";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
-import { expandHome } from "./config.ts";
+import { expandHome, principalLoginForRepo } from "./config.ts";
 import { DiscordAnnouncer } from "./announce.ts";
 import { renderCard } from "./card-render.ts";
 import { runCmd, type RunOptions } from "./exec.ts";
@@ -30,7 +30,7 @@ import {
  tamperOutcome,
  trustFreshClone,
 } from "./git-trust.ts";
-import { graphClose, graphDecisions, type CloseResult } from "./graph-write.ts";
+import { graphClose, graphDecisions, graphPropose, type CloseResult, type ProposeResult } from "./graph-write.ts";
 import {
  implementBranchFor,
  runImplement,
@@ -56,7 +56,7 @@ import {
 import { selectForBuild } from "./substrate-policy.ts";
 import { resolveReadOnlyToken, type ResolvedToken } from "./token-gate.ts";
 import { workerEnv } from "./worker-env.ts";
-import type { CommitAuthor } from "./identity.ts";
+import { assertNotPrincipal, type CommitAuthor } from "./identity.ts";
 import { sessionJournalPath } from "./journal-guard.ts";
 import { saveWorkerLog } from "./worker-log.ts";
 import { isTransientGitHubError } from "./transient.ts";
@@ -83,10 +83,12 @@ export { gitAuthEnv } from "./git-ops.ts";
 export interface RunNodeOutcome {
  nodeId: string;
  repo: string;
- status: "success" | "released" | "failed" | "refused" | "skipped" | "parked" | "awaiting-merge";
+ status: "success" | "released" | "failed" | "refused" | "skipped" | "parked" | "awaiting-merge" | "proposed";
  detail: string;
  workerExit: number | null;
  close?: CloseResult;
+ /** A `propose` research node's `close --propose` (node #246). */
+ proposal?: ProposeResult;
  prNumber?: number;
 }
 
@@ -460,6 +462,12 @@ export async function runNode(
   detail: "",
   workerExit: null,
  };
+
+ // A proposed node waits for the principal's 👍 on its proposal comment
+ // (node #246): a second run would post a second proposal.
+ if (row?.status === "proposed") {
+  return { ...base, status: "refused", detail: `node #${nodeId} is proposed (comment ${row.proposalCommentId ?? "id unknown"}) — it waits for the principal's ratification` };
+ }
 
  // Take the node as a new occupant. A run-node with no claim row (an
  // operator's manual run) gets a running row first.
@@ -838,6 +846,13 @@ async function runResearch(
  const base: RunNodeOutcome = { nodeId, repo, status: "skipped", detail: "", workerExit: null };
  const fence = (action: string) => journal.assertGeneration(nodeId, repo, generation, action);
 
+ const ratify = researchRatifyFor(node, rootNode, ctx);
+ if (ratify !== "auto" && ratify !== "propose") {
+  journal.recordEvent("refused", { nodeId, repo, detail: ratify });
+  finish(journal, nodeId, repo, "parked", ratify);
+  return { ...base, status: "refused", detail: ratify };
+ }
+
  journal.recordEvent("worker-start", {
   nodeId,
   repo,
@@ -1019,6 +1034,22 @@ async function runResearch(
   },
  });
  journal.recordEvent("ci-passed", { nodeId, repo, detail: `research ${evidence.ci} (${evidence.check.runName})` });
+ if (ratify === "propose") {
+  return await proposeResearch(ctx, node, {
+   base: { ...base, workerExit: existingPr === null ? 0 : null },
+   fence,
+   canonical,
+   body: proposalBody({
+    repo,
+    nodeId,
+    findings: findings.stdout.trim(),
+    branch,
+    sha,
+    draftUrl: evidence.pr.webUrl,
+    ci: `${ciRunNoun(repo)} ${evidence.ci}`,
+   }),
+  });
+ }
  const resolution = `${findings.stdout.trim()}\n\nResearch CI evidence: draft ${evidence.pr.webUrl}, ${ciRunNoun(repo)} ${evidence.ci}.`;
  const resolutionFile = join(tmpdir(), `ranger-close-${fileStemFor(repo, nodeId)}.md`);
  writeFileSync(resolutionFile, resolution, "utf8");
@@ -1113,4 +1144,122 @@ function gistFrom(resolution: string): string {
   .find((l) => l.length > 0);
  const raw = first ?? "ranger research close";
  return raw.length > 140 ? `${raw.slice(0, 137)}…` : raw;
+}
+
+/**
+ * How a research node's work ends (node #246): `auto` closes on its probes
+ * and CI; `propose` posts a proposal comment for the principal to ratify,
+ * on the same gates the walk routed it by (ruling D6/D10), re-read here
+ * because run-node may be started by hand. A string is the refusal.
+ */
+function researchRatifyFor(
+ node: NodeResult,
+ rootNode: NodeResult,
+ ctx: RunNodeContext,
+): "auto" | "propose" | string {
+ if (node.node.autonomy !== "propose") return "auto";
+ const { map, config, botIdentity } = ctx;
+ const id = node.ref.id;
+ if (map.walk !== "full" && map.walk !== "research-only") {
+  return `map ${map.repo} is walk: ${map.walk} — a propose research node needs walk: full or research-only (node #246)`;
+ }
+ if (parseForgeRef(map.repo).forge !== "github") {
+  return `node #${id} is a propose research node on a GitLab map — ranger proposes only on GitHub maps (node #246)`;
+ }
+ if (node.author === botIdentity) {
+  return `node #${id} was filed by ${botIdentity} — ranger never walks work it minted (node #9)`;
+ }
+ const principal = principalLoginForRepo(config, map.repo);
+ if (principal === undefined || rootNode.author.toLowerCase() !== principal.toLowerCase()) {
+  return `map root #${map.root} was authored by ${rootNode.author}, not the principal — ranger proposes only on maps the principal rooted (node #246, D6)`;
+ }
+ return "propose";
+}
+
+/** GitHub's comment body limit, less room for the links and the marker. */
+const PROPOSAL_FINDINGS_MAX = 60_000;
+
+/** The HTML marker binding a proposal comment to its node (ruling D8). */
+export function proposalMarker(nodeId: string): string {
+ return `<!-- ranger:proposal node=${nodeId} -->`;
+}
+
+/**
+ * The proposal comment (node #246): the findings, which soma takes as the
+ * resolution once ratified, the pushed findings branch and the CI draft,
+ * what the principal does next, and the binding marker.
+ */
+export function proposalBody(args: {
+ repo: string;
+ nodeId: string;
+ findings: string;
+ branch: string;
+ sha: string;
+ draftUrl: string;
+ ci: string;
+}): string {
+ const cut = args.findings.length > PROPOSAL_FINDINGS_MAX;
+ const findings = cut ? `${args.findings.slice(0, PROPOSAL_FINDINGS_MAX)}\n\n…` : args.findings;
+ return [
+  findings,
+  "",
+  "---",
+  "",
+  `Findings branch: ${branchUrl(args.repo, args.branch)} (head \`${args.sha.slice(0, 12)}\`)${cut ? ", which holds the full findings" : ""}.`,
+  `Research CI evidence: draft ${args.draftUrl}, ${args.ci}.`,
+  "",
+  `React 👍 on this comment to ratify it; ranger then closes node #${args.nodeId} citing it.`,
+  "",
+  proposalMarker(args.nodeId),
+ ].join("\n");
+}
+
+/**
+ * End a `propose` research node (node #246, rulings D8/D10): post the body
+ * with `soma graph close --propose` under the machine account, and journal
+ * the comment's id. The row goes to `proposed`: the claim stays, no worker
+ * runs and no lane slot is held. An id soma did not name stays null; ranger
+ * never guesses one. A refused post parks the node, as a refused close does.
+ */
+async function proposeResearch(
+ ctx: RunNodeContext,
+ node: NodeResult,
+ args: { base: RunNodeOutcome; fence: (action: string) => void; canonical: string; body: string },
+): Promise<RunNodeOutcome> {
+ const { config, map, token, botIdentity, journal } = ctx;
+ const repo = map.repo;
+ const nodeId = args.base.nodeId;
+ // run-node's write gate already refused the principal; a post is the one
+ // write this lane makes on the node, so the rule is checked again here.
+ assertNotPrincipal(config, botIdentity, repo);
+ const bodyFile = join(tmpdir(), `ranger-propose-${fileStemFor(repo, nodeId)}.md`);
+ writeFileSync(bodyFile, args.body, "utf8");
+ args.fence("propose the close");
+ const proposal = await graphPropose(repo, nodeId, botIdentity, token, { bodyFile }, {
+  cwd: args.canonical,
+  timeoutMs: GRAPH_CALL_TIMEOUT_MS,
+ });
+ if (!proposal.posted) {
+  journal.recordEvent("refused", { nodeId, repo, detail: proposal.detail.slice(0, 400) });
+  countFailure(config, journal, repo);
+  finish(journal, nodeId, repo, "parked", proposal.detail);
+  return { ...args.base, status: "refused", detail: proposal.detail, proposal };
+ }
+ const url = proposal.commentId === null
+  ? null
+  : proposal.commentUrl ?? nodeCommentUrl(repo, node.url, proposal.commentId);
+ const detail = proposal.commentId === null
+  ? `proposal posted, but its comment id is unknown — soma printed: ${proposal.detail}`
+  : `proposal comment ${proposal.commentId} ${url} — waiting for the principal's 👍`;
+ args.fence("record the proposal");
+ journal.updateWorker(nodeId, repo, {
+  status: "proposed",
+  pid: null,
+  workerPgid: null,
+  finishedAt: new Date().toISOString(),
+  outcome: detail.slice(0, 400),
+  proposalCommentId: proposal.commentId,
+ });
+ journal.recordEvent("proposed", { nodeId, repo, detail: detail.slice(0, 400) });
+ return { ...args.base, status: "proposed", detail: detail.slice(0, 400), proposal };
 }

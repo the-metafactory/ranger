@@ -60,7 +60,7 @@ const worker = (over: Partial<WorkerRow>): WorkerRow => ({
  startedAt: "2026-10-09T08:00:00Z", finishedAt: "2026-10-09T09:00:00Z", outcome: "parked for the test",
  messageId: null, lane: "implement", generation: 1, workerPgid: null, phase: "review", prNumber: null,
  researchBaseSha: null, reviewRound: 0, verdictSha: null, verdictBlockers: 0, mergeMessageId: null,
- substrate: null, ...over,
+ substrate: null, proposalCommentId: null, ...over,
 });
 
 const MAPS = [map(GAME, "visual"), map(TOOL, "headless")];

@@ -29,6 +29,11 @@ export function startsImplementSession(row: { lane: string | null; phase?: strin
  return row.lane === "implement" && row.phase !== "close";
 }
 
+/**
+ * Only a claimed or running implement session holds its lane. A `proposed`
+ * row (node #246) keeps its GitHub claim but holds no slot: it waits for the
+ * principal's 👍, and the walk keeps claiming beside it.
+ */
 export function holdsImplementLane(row: { lane: string | null; status: string; phase?: string | null }): boolean {
  return startsImplementSession(row) && (row.status === "claimed" || row.status === "running");
 }

@@ -203,6 +203,21 @@ bun src/cli.ts journal                    # inspect workers/events/health
   for operator intervention.
   A closed draft needs operator intervention.
   The PR stays draft and unmerged.
+- **Propose research (node #246, #21 rulings D6/D8/D10/D18):** a `propose`
+  research node is walked too, when the map is a GitHub map whose root the
+  principal (`principal.login`) authored, on `walk: research-only` or `full`,
+  and the machine account did not file the node. Otherwise it escalates as
+  `propose-approve`. The root's author is read once per map and kept in the
+  journal. The work runs the research SOP above (findings branch, draft, CI),
+  then ends with `soma graph close --propose --body-file …` instead of a
+  close: the body is the findings, a link to the findings branch and draft,
+  and `<!-- ranger:proposal node=N -->`. The comment id comes from soma's
+  `--json` payload when it has one, else from `Posted proposal comment <id>`;
+  when neither names it the row keeps no id and the card says so. The row
+  becomes `proposed`: the claim stays, no worker runs, no lane slot is held,
+  and `run-node`, `resume-node` and `build-now` refuse it. The escalation desk
+  posts its card, which links the proposal comment and says to react 👍 there.
+  Ratifying (reading the reaction, closing) is node #250.
 - **Acceptance (e2e):** an auto research node walked end-to-end against fake
   soma/gh/worker fixtures — claim → worktree → findings branch pushed → draft
   PR → successful CI citation → gated close → `decisions --write`. Live close

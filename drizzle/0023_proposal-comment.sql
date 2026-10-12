@@ -1,0 +1,1 @@
+ALTER TABLE `workers` ADD `proposal_comment_id` text;

@@ -26,7 +26,7 @@ export const workers = sqliteTable("workers", {
  root: integer("root").notNull(),
  repo: text("repo").notNull(),
  pid: integer("pid"),
- /** claimed | running | success | failed | parked | released */
+ /** claimed | running | success | failed | parked | released | awaiting-merge | proposed */
  status: text("status").notNull().default("claimed"),
  /** Respawn attempts for this node (design §7: attempt < max → respawn). */
  attempts: integer("attempts").notNull().default(0),
@@ -64,6 +64,12 @@ export const workers = sqliteTable("workers", {
  verdictBlockers: integer("verdict_blockers"),
  /** Discord message id of the merge-request card (posted once, idempotent). */
  mergeMessageId: text("merge_message_id"),
+ /**
+  * The GitHub comment a `propose` research node's `soma graph close --propose`
+  * posted (node #246, ruling D8): the comment the principal reacts 👍 on.
+  * Null on a `proposed` row when soma's output named no id; ranger never guesses one.
+  */
+ proposalCommentId: text("proposal_comment_id"),
 }, (table) => [primaryKey({ columns: [table.repo, table.nodeId] })]);
 
 export const resumeQueue = sqliteTable("resume_queue", {

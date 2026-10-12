@@ -45,6 +45,12 @@ export function nodeUrl(repo: Repo, iid: number | string, webUrl?: string): stri
  return prefer(webUrl, () => ref.forge === "github" ? `${base(ref)}/issues/${iid}` : `${base(ref)}/-/issues/${iid}`);
 }
 
+/** A branch's tree view. */
+export function branchUrl(repo: Repo, branch: string): string {
+ const ref = refOf(repo);
+ return `${base(ref)}${ref.forge === "github" ? "/tree/" : "/-/tree/"}${branch}`;
+}
+
 /** A comment on a node, under the node's URL: GitHub's issue-comment anchor, GitLab's note anchor. */
 export function nodeCommentUrl(repo: Repo, nodeWebUrl: string, commentId: number | string): string {
  return `${nodeWebUrl}${refOf(repo).forge === "github" ? "#issuecomment-" : "#note_"}${commentId}`;

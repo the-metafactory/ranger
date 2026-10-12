@@ -756,7 +756,7 @@ test("resume queue migration appends to the prior journal, preserves worker stat
  const folder = join(dir, "drizzle"); mkdirSync(join(folder, "meta"), { recursive: true });
  const source = join(import.meta.dir, "../drizzle");
  const manifest = JSON.parse(readFileSync(join(source, "meta/_journal.json"), "utf8"));
- manifest.entries = manifest.entries.filter((e: { tag: string }) => !e.tag.startsWith("0022"));
+ manifest.entries = manifest.entries.filter((e: { idx: number }) => e.idx < 22);
  writeFileSync(join(folder, "meta/_journal.json"), JSON.stringify(manifest));
  for (const e of manifest.entries) copyFileSync(join(source, `${e.tag}.sql`), join(folder, `${e.tag}.sql`));
  const path = join(dir, "state.sqlite"); const sqlite = new Database(path);
