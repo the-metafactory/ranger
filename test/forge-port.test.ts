@@ -17,7 +17,7 @@ const GREEN: CiVerdict = { state: "green", runId: 17, runUrl: "https://example.t
 const PR: ChangeRequest = {
  iid: 7, state: "open", draft: false, headRef: "node/121", headSha: SHA,
  baseRef: "main", mergeState: "mergeable", webUrl: "https://example.test/change/7",
- author: "ivy-bot", title: "Node 121", mergeCommitSha: null, mergedBy: null,
+ author: "ivy-bot", title: "Node 121", body: "", mergeCommitSha: null, mergedBy: null,
 };
 
 describe("GitHub merge-state normalisation", () => {

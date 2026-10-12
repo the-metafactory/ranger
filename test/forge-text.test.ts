@@ -81,7 +81,7 @@ function change(repo: string, over: Partial<ChangeRequest> = {}): ChangeRequest 
  return {
   iid: MR, state: "merged", draft: false, title: "Name MRs the way their forge does (node #129)",
   headRef: "node/129-x", headSha: HEAD, baseRef: "main", mergeState: "mergeable",
-  mergeCommitSha: "d".repeat(40), mergedBy: BOT, author: BOT,
+  body: "", mergeCommitSha: "d".repeat(40), mergedBy: BOT, author: BOT,
   webUrl: repo === GITHUB ? `https://github.com/${repo}/pull/${MR}` : `https://gitlab.example.org/claw/crisis-simulator/-/merge_requests/${MR}`,
   ...over,
  };

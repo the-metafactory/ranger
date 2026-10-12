@@ -812,9 +812,82 @@ export async function assertGitUntouched(canonical: string, snapshot: string): P
 const CLOSING_KEYWORD =
  /\b(close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b[\s:]+(?:[\w.-]+\/[\w.-]+)?#\d+|\b(close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b[\s:]+https?:\/\/github\.com\/[^\s]+\/issues\/\d+/i;
 
-export function findClosingKeyword(text: string): string | null {
+/**
+ * GitLab's issue-closing grammar (node #128): a keyword stem, an optional
+ * `:` and spaces, then a `,`/`and` list of items, each with an optional
+ * `issue`/`issues`. GitLab closes every issue ref in the list, and its items
+ * may also be any link or a Jira-style `ABC-1`: those are skipped, so an
+ * issue ref anywhere in the list refuses. The refs are GitLab's
+ * `Issue.reference_pattern` — `#N`, `path/with/groups#N`, `GL-N`,
+ * `[issue:N]`, `[issue:path/N]`, a project path also absolute (`/path#N`) — or an issue, incident or work-item URL on
+ * any host, with or without the `/-` segment.
+ *
+ * One regex for the whole list backtracks super-linearly on a crafted MR
+ * description, so the list is walked item by item with sticky, bounded
+ * patterns (GitLab caps a link at 300 characters and an iid at 20 digits).
+ * A walk is a function of its position alone, so a position whose walk found
+ * no ref is remembered: a later keyword whose list runs into it stops there,
+ * and overlapping lists (`https://a/fixes AB-1, ` repeated) stay linear.
+ */
+const GITLAB_KEYWORD =
+ /\b(?:clos(?:e|es|ed|ing)|fix(?:es|ed|ing)?|resolv(?:e|es|ed|ing)|implement(?:s|ed|ing)?)\b:?\s+/gi;
+const GITLAB_ISSUE_REF =
+ /(?:issues?\s+)?(?:\/?(?:[\w.-]{1,255}\/){0,20}[\w.-]{0,255}#\d{1,20}|GL-\d{1,20}|\[issue:\/?(?:[\w.-]{1,255}\/){0,20}\d{1,20}\]|https?:\/\/\S{1,300}?\/(?:-\/)?(?:issues(?:\/incident)?|work_items)\/\d{1,20})/iy;
+/**
+ * Two ways to skip a link item: GitLab's own link (`[^\s>]`, inner commas
+ * kept, no trailing `?!.,:`), and one split at every comma, for the case where
+ * GitLab's greedy link swallows a ref (`https://a.com,#N`). Each keyword's
+ * list is walked both ways; either finding a ref refuses.
+ */
+const GITLAB_LIST_FILLERS = [
+ /(?:issues?\s+)?(?:https?:\/\/[^\s>]{1,300}(?<![?!.,:])|[A-Z][A-Z0-9_]{0,255}-\d{1,20})(?: *,? +and +| *,? *)/iy,
+ /(?:issues?\s+)?(?:https?:\/\/[^\s>,]{1,300}|[A-Z][A-Z0-9_]{0,255}-\d{1,20})(?: *,? +and +| *,? *)/iy,
+];
+
+/**
+ * Walk one closing list from `start`; the end of the first issue ref, or -1.
+ * `dead` holds the positions this filler's walks already left without a ref;
+ * every position this walk passes joins it when the walk finds none.
+ */
+function walkGitLabList(text: string, start: number, filler: RegExp, dead: Set<number>): number {
+ const passed: number[] = [];
+ let at = start;
+ for (;;) {
+  if (dead.has(at)) break;
+  passed.push(at);
+  GITLAB_ISSUE_REF.lastIndex = at;
+  const ref = GITLAB_ISSUE_REF.exec(text);
+  if (ref !== null) return at + ref[0].length;
+  filler.lastIndex = at;
+  const item = filler.exec(text);
+  if (item === null) break;
+  at += item[0].length;
+ }
+ for (const position of passed) dead.add(position);
+ return -1;
+}
+
+function findGitLabClosing(text: string): string | null {
+ const dead = GITLAB_LIST_FILLERS.map(() => new Set<number>());
+ for (const keyword of text.matchAll(GITLAB_KEYWORD)) {
+  for (const [mode, filler] of GITLAB_LIST_FILLERS.entries()) {
+   const end = walkGitLabList(text, keyword.index + keyword[0].length, filler, dead[mode]!);
+   if (end !== -1) return text.slice(keyword.index, end);
+  }
+ }
+ return null;
+}
+
+/** The first text the forge would read as an issue-closing reference, or null. */
+export function findClosingKeyword(text: string, forge: ForgeRef["forge"]): string | null {
+ if (forge === "gitlab") return findGitLabClosing(text);
  const match = text.match(CLOSING_KEYWORD);
  return match === null ? null : match[0];
+}
+
+/** The forge-neutral refusal, quoting the offending text. */
+export function closingKeywordRefusal(forge: ForgeRef["forge"], what: string, hit: string): string {
+ return `${what} carries a ${forge === "github" ? "GitHub" : "GitLab"} closing keyword ("${hit}") — a merge would auto-close the node and skip its close gate (#588)`;
 }
 
 export async function headSha(worktree: string): Promise<string> {
@@ -863,6 +936,7 @@ export async function commitsBehind(worktree: string, base: string): Promise<num
 export async function assertNoClosingKeywords(
  worktree: string,
  base: string,
+ forge: ForgeRef["forge"],
 ): Promise<void> {
  const log = await safeGit(["log", `origin/${base}..HEAD`, "--format=%B"], {
   cwd: worktree,
@@ -871,12 +945,8 @@ export async function assertNoClosingKeywords(
  if (log.code !== 0) {
   throw new GitSafetyError(`cannot read branch commit messages: ${log.stderr.trim()}`);
  }
- const hit = findClosingKeyword(log.stdout);
- if (hit !== null) {
-  throw new GitSafetyError(
-   `a commit message carries a GitHub closing keyword ("${hit}") — a squash merge would auto-close the node and skip the close gate (#588). Refusing to push.`,
-  );
- }
+ const hit = findClosingKeyword(log.stdout, forge);
+ if (hit !== null) throw new GitSafetyError(`${closingKeywordRefusal(forge, "a commit message", hit)}. Refusing to push.`);
 }
 
 /**

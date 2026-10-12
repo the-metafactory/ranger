@@ -31,6 +31,9 @@ interface Mr {
  squash: string | null;
  rebase: RebaseOutcome;
  merge: MergeOutcome;
+ /** The live title and description (default: ranger's own title, no description). */
+ title?: string;
+ body?: string;
 }
 
 /** A GitLab port fake with only the calls the merge desk may make; anything else throws. */
@@ -49,9 +52,9 @@ function fakeGitLab(mr: Mr) {
   getPr: async (_repo, n) => {
    calls.push("getPr");
    return {
-    iid: n, state: mr.state, draft: false, title: "Merge desk on GitLab (node #96)", headRef: "node/96",
+    iid: n, state: mr.state, draft: false, title: mr.title ?? "Merge desk on GitLab (node #96)", headRef: "node/96",
     headSha: mr.head, baseRef: "main", mergeState: mr.mergeState, webUrl: "https://gitlab.example.test/claw/sim/-/merge_requests/9",
-    author: BOT, mergeCommitSha: null, mergedBy: null,
+    author: BOT, body: mr.body ?? "", mergeCommitSha: null, mergedBy: null,
    };
   },
   listComments: async () => { calls.push("listComments"); return mr.comments; },
@@ -462,6 +465,30 @@ describe("node #126 — gitlab-rebase-squash-merge: the merge desk on a GitLab m
    expect(gitlab.rebasePr).toBeFunction();
    expect(gitlab.squashRefusal).toBeFunction();
    expect(deskPort(r.config, { ...r.map, repo: "acme/seelite" })).toBe(realGitHub);
+  } finally { r.close(); }
+ });
+});
+
+describe("node #128 — the merge desk guards GitLab's squash message and MR description", () => {
+ test.each([
+  ["a retitled MR", { title: "Score the inject, implements claw/sim#12" }, 'the squash commit message carries a GitLab closing keyword ("implements claw/sim#12")'],
+  ["an edited description", { body: "Fixes: https://gitlab.example.test/claw/sim/-/issues/12" }, 'the MR !9 description carries a GitLab closing keyword ("Fixes: https://gitlab.example.test/claw/sim/-/issues/12")'],
+ ])("%s with a closing reference parks before any write, the text quoted", async (_name, over, quoted) => {
+  const r = rig();
+  try {
+   const gl = fakeGitLab(needsRebase({ mergeState: "mergeable", ...over }));
+   expect(await r.desk(gl.port)).toMatchObject({ merged: [], parked: ["96"], errors: [] });
+   expect(gl.calls).not.toContain("rebasePr");
+   expect(gl.calls).not.toContain("mergePr");
+   expect(r.row()?.outcome).toContain(quoted);
+  } finally { r.close(); }
+ });
+ test("ranger's own prose names the MR without closing anything, and merges", async () => {
+  const r = rig();
+  try {
+   const gl = fakeGitLab(needsRebase({ mergeState: "mergeable", body: "Implemented by ranger for orienteer node #96 in MR !9." }));
+   expect(await r.desk(gl.port)).toMatchObject({ merged: ["96"], parked: [], errors: [] });
+   expect(gl.merges).toEqual([{ n: 9, sha: GATED, title: "Merge desk on GitLab (node #96)" }]);
   } finally { r.close(); }
  });
 });

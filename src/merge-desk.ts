@@ -18,9 +18,11 @@ import type { Journal, WorkerRow } from "./journal.ts";
 import { evaluateMergeGate, type MergeGateInput, type MergeGateResult } from "./merge-gate.ts";
 import type { IssueComment, ChangeRequest, CiVerdict, ForgePort, MergeOutcome, RebaseOutcome } from "./forge.ts";
 import { parseForgeRef } from "./forge-ref.ts";
-import { gitlabForgePort } from "./gitlab.ts";
+import { gitlabForgePort, squashMessage as gitlabSquashMessage } from "./gitlab.ts";
 import { CI_FAILED_PARK_OUTCOME, mergeGateFailedOutcome } from "./outcomes.ts";
 import { changeRequestLabel, changeRequestNoun, forgeName } from "./forge-text.ts";
+import { closingKeywordRefusal, findClosingKeyword } from "./git-ops.ts";
+import { squashTitle } from "./github.ts";
 
 /**
  * The merge desk (design §4/§5, #23): each tick, every implement-lane row
@@ -340,6 +342,21 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   */
  async function autoMerge(attempt: MergeAttempt): Promise<Extract<MergeOutcome, { status: "merged" }> | null> {
   const { row, pr, headSha, cardTitle, rebasePr } = attempt;
+  // The live title and description are editable after the change request
+  // opened, and neither edit moves the gated head: guard the squash message
+  // ranger would write and the description the forge reads at merge (node #128).
+  const forge = parseForgeRef(repo).forge;
+  const cr = changeRequestLabel(repo, pr.iid);
+  const titleHit = findClosingKeyword(forge === "gitlab" ? gitlabSquashMessage(pr.title, pr.iid) : squashTitle(pr.title, pr.iid), forge);
+  if (titleHit !== null) {
+   await park(row, `${closingKeywordRefusal(forge, "the squash commit message", titleHit)}; retitle ${cr} and merge it by hand`, cardTitle);
+   return null;
+  }
+  const bodyHit = findClosingKeyword(pr.body, forge);
+  if (bodyHit !== null) {
+   await park(row, `${closingKeywordRefusal(forge, `the ${cr} description`, bodyHit)}; edit the description and merge it by hand`, cardTitle);
+   return null;
+  }
   // Ranger merges only squashed: a project that forbids it escalates before any write.
   const refusal = await squashRefusal();
   if (refusal !== null) {

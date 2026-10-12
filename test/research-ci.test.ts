@@ -9,7 +9,7 @@ const SHA = "a".repeat(40);
 const OTHER = "b".repeat(40);
 const PR: ChangeRequest = {
  iid: 31, state: "open", draft: true, title: "research",
- headRef: "research/survey", headSha: SHA, baseRef: "main", mergeState: "pending", mergeCommitSha: null, mergedBy: null,
+ headRef: "research/survey", headSha: SHA, baseRef: "main", mergeState: "pending", body: "", mergeCommitSha: null, mergedBy: null,
  webUrl: "https://github.com/acme/widgets/pull/31", author: "ivy-bot",
 };
 const GREEN: CheckRun = { id: 901, name: "test", status: "completed", conclusion: "success" };

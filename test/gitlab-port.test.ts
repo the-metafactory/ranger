@@ -64,7 +64,7 @@ describe("GitLab MR reads", () => {
   expect(await port.findPrByHead(repo, fixture.mr.source_branch, token)).toEqual({
    iid: 7, state: "open", draft: false, headRef: fixture.mr.source_branch, headSha: sha, baseRef: "main",
    mergeState: "mergeable", mergeDetail: "mergeable", webUrl: fixture.mr.web_url,
-   author: "ivy-bot", title: fixture.mr.title, mergeCommitSha: null, mergedBy: null,
+   author: "ivy-bot", title: fixture.mr.title, body: "", mergeCommitSha: null, mergedBy: null,
   });
   expect(calls).toHaveLength(2);
  });
@@ -94,6 +94,12 @@ describe("GitLab MR reads", () => {
   expect(mr).toMatchObject({ state: expected, headSha: sha, mergedBy: "merge-bot", mergeCommitSha: sha });
   expect(mr.mergeInProgress).toBe(state === "locked" ? true : undefined);
  });
+ test("the live description reads as the body the merge desk guards (node #128)", async () => {
+  const { port, token } = await setup(() => response({ ...fixture.mr, description: "Implements #12" }));
+  expect((await port.getPr(repo, 7, token)).body).toBe("Implements #12");
+  const { port: blank, token: t2 } = await setup(() => response({ ...fixture.mr, description: null }));
+  expect((await blank.getPr(repo, 7, t2)).body).toBe("");
+ });
  test.each(Object.keys(fixture.mr).filter(key => key !== "id"))("missing MR field %s throws on find and get", async field => {
   const raw: Record<string, unknown> = { ...fixture.mr };
   delete raw[field];
@@ -102,7 +108,7 @@ describe("GitLab MR reads", () => {
   await expect(port.findPrByHead(repo, fixture.mr.source_branch, token)).rejects.toBeInstanceOf(GitLabReadError);
  });
  test.each([{ iid: 8 }, { draft: "false" }, { state: "future-state" }, { author: {} }, { sha: null },
-  { source_project_id: null }, { target_project_id: "1" }])("invalid or mismatched MR data %j throws", async patch => {
+  { source_project_id: null }, { target_project_id: "1" }, { description: 7 }])("invalid or mismatched MR data %j throws", async patch => {
   const { port, token } = await setup(() => response({ ...fixture.mr, ...patch }));
   await expect(port.getPr(repo, 7, token)).rejects.toBeInstanceOf(GitLabReadError);
  });

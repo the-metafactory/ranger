@@ -96,6 +96,7 @@ const mr = (over: Partial<ChangeRequest> = {}): ChangeRequest => ({
  webUrl: MR_URL,
  author: "project_7_bot",
  title: "Score the inject",
+ body: "",
  mergeCommitSha: null,
  mergedBy: null,
  ...over,

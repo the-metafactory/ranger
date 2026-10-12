@@ -68,7 +68,7 @@ async function withRig(fn: (r: ReturnType<typeof rig>) => Promise<void>) {
 }
 
 function pr(iid = 7): ChangeRequest {
- return { iid, state: "open", draft: false, title: "Build", headRef: "node/40-x", headSha: "b".repeat(40),
+ return { iid, state: "open", draft: false, title: "Build", body: "", headRef: "node/40-x", headSha: "b".repeat(40),
   baseRef: "main", mergeState: "mergeable", mergeCommitSha: null, mergedBy: null, webUrl: "", author: "ivy-bot" };
 }
 

@@ -23,7 +23,7 @@ const env = { PATH: process.env.PATH, HOME: process.env.HOME, RANGER_TEST_WRITE_
 const draft: ChangeRequest = {
  iid: 7, state: "open", draft: true, headRef: "node/125", headSha: fixture.mr.sha,
  baseRef: "main", mergeState: "blocked", webUrl: fixture.mr.web_url, author: bot,
- title: "Draft: Write support", mergeCommitSha: null, mergedBy: null,
+ title: "Draft: Write support", body: "", mergeCommitSha: null, mergedBy: null,
 };
 const input = { head: "node/125 & writes", base: "main", title: "Write support", body: "@literal\n{description}=true & more" };
 const created = { ...fixture.mr, source_branch: input.head, draft: true, title: `Draft: ${input.title}`, author: { username: bot } };

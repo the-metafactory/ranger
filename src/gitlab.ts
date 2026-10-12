@@ -25,6 +25,11 @@ const DRAFT_PREFIX = "Draft: ";
 /** `squash=true` is honoured under these project settings; `never` ignores it. */
 const SQUASH_ALLOWED = new Set(["always", "default_on", "default_off"]);
 
+/** The squash commit message ranger sends — the exact text the merge desk guards (node #128). */
+export function squashMessage(title: string, n: number): string {
+ return `${title} (!${n})`;
+}
+
 /** Forge text surfaced to operators: one line, bounded. */
 function bounded(text: string): string {
  const line = text.replace(/[\u0000-\u001f\u007f]+/g, " ").trim();
@@ -68,6 +73,7 @@ function changeRequest(raw: unknown, endpoint: string): { mr: ChangeRequest; sam
  if (!Object.hasOwn(MR_STATE, state)) invalid(endpoint, "state");
  if (typeof r.draft !== "boolean") invalid(endpoint, "draft");
  const detail = string(r.detailed_merge_status, endpoint, "detailed_merge_status");
+ if (r.description !== null && r.description !== undefined && typeof r.description !== "string") invalid(endpoint, "description");
  return {
   sameProject: id(r.source_project_id, endpoint, "source_project_id") === id(r.target_project_id, endpoint, "target_project_id"),
   mr: {
@@ -82,6 +88,7 @@ function changeRequest(raw: unknown, endpoint: string): { mr: ChangeRequest; sam
    webUrl: string(r.web_url, endpoint, "web_url"),
    author: username(r.author, endpoint, "author"),
    title: string(r.title, endpoint, "title"),
+   body: typeof r.description === "string" ? r.description : "",
    mergeCommitSha: nullableString(r.merge_commit_sha, endpoint, "merge_commit_sha"),
    mergedBy: r.merge_user === null ? null : username(r.merge_user, endpoint, "merge_user"),
    // `locked` reads closed by contract, but the MR is mid-merge, not abandoned.
@@ -443,7 +450,7 @@ export class GitLabPort extends GitLabReadPort implements ForgePort<ResolvedToke
   const endpoint = `${this.mrEndpoint(repo, n)}/merge`;
   string(sha, endpoint, "gated head SHA");
   const { status, body } = await this.answer(repo, token, endpoint, [
-   "-F", "squash=true", "-f", `sha=${sha}`, "-f", `squash_commit_message=${title} (!${n})`,
+   "-F", "squash=true", "-f", `sha=${sha}`, "-f", `squash_commit_message=${squashMessage(title, n)}`,
   ]);
   const answer = answered(status, MERGE_REFUSED, () => new GitLabWriteError(`merge failed (${forgeMessage(body, status)})`, endpoint, status));
   if (answer === "conflict") return { status: "head-moved", reason: `!${n} is no longer at ${sha.slice(0, 8)} (${forgeMessage(body, status)})` };
