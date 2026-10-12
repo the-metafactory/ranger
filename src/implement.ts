@@ -49,6 +49,7 @@ import { finishClosedElsewhere } from "./closed-elsewhere.ts";
 import { budgetedRead, budgetPolicy } from "./budget.ts";
 import { GraphAddUnattached, graphAdd, graphClose, graphDecisions, graphLink, type AddSpec, type CloseResult } from "./graph-write.ts";
 import { FixNodeLockBusy, withFixNodeLock } from "./fix-node-lock.ts";
+import { assertFilable, codeCommentSpec, foundByProbeSpec, landminesInDiff, scribeFile, splitOutOfReviewSpec, type Provenance, type ScribeGraph } from "./scribe.ts";
 import { FencedError, type ImplementPhase, type Journal } from "./journal.ts";
 import { assembleImplementPrompt } from "./prompt.ts";
 import { ReviewError, sageReview, type ReviewVerdict } from "./review.ts";
@@ -159,6 +160,8 @@ export interface ImplementContext {
  announce?: (text: string) => Promise<unknown>;
  /** Files and reads fix-the-base nodes (node #152); default is `soma graph` under the machine token. */
  fixNode?: FixNodeGraph;
+ /** The Scribe's graph port (design §6, node #24); default is `soma graph` under the machine token. */
+ scribe?: ScribeGraph;
 }
 
 /** The graph port the fix-the-base filer writes and reads through (node #152). */
@@ -898,47 +901,98 @@ function machineFixNodeGraph(ctx: ImplementContext): FixNodeGraph {
  };
 }
 
-/** A checkpoint id from the probe's stem and the base it was red at. */
-function fixCheckpoint(probe: string, sha: string): string {
- const stem = probe.replace(/\.[^.]+$/, "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
- return `base-green-${stem}-${sha.slice(0, 8)}`;
+function machineScribeGraph(ctx: ImplementContext): ScribeGraph {
+ const repo = ctx.map.repo;
+ const credential = { token: ctx.token, source: "write-token" };
+ return {
+  add: (parent, spec) => graphAdd(repo, parent, spec, ctx.token, { timeoutMs: GRAPH_CALL_TIMEOUT_MS }),
+  link: (node, parent, blockedBy) => graphLink(repo, node, parent, ctx.token, { timeoutMs: GRAPH_CALL_TIMEOUT_MS, blockedBy }),
+  node: (id) => budgetedRead(ctx.journal, repo, credential, budgetPolicy(ctx.config), new Date(),
+   () => graphNode(repo, id, credential, { timeoutMs: GRAPH_CALL_TIMEOUT_MS })),
+ };
 }
 
-export function fixNodeSpec(ctx: ImplementContext, probe: string, checks: string[], sha: string, pr: { number: number; url: string }): AddSpec {
- const base = ctx.map.base;
- return {
-  title: `Make ${probe} pass on ${base} again`,
-  autonomy: "propose",
-  kind: "build",
-  labels: ["orienteer:build"],
-  checkpoint: fixCheckpoint(probe, sha),
-  body: [
-   "## Deliverable",
-   "",
-   `\`${probe}\` passes on \`${base}\` again.`,
-   "",
-   "## Found by probe",
-   "",
-   `Node #${ctx.node.ref.id} failed \`${probe}\` at its head, and two runs at its merge base \`${sha.slice(0, 8)}\` failed the same checks: the failure was the base's, not the branch's. Later ${changeRequestNoun(ctx.map.repo)}s off that merge base inherit these checks from ranger's cache instead of gating on them. The runs were at the merge base, not at \`${base}\`'s tip, which may have moved since. Ranger filed this node.`,
-   "",
-   `- Probe: \`${probe}\``,
-   `- Merge base: \`${sha}\``,
-   `- Detected by: node #${ctx.node.ref.id}, ${changeRequestLabel(ctx.map.repo, pr.number)} (${pr.url})`,
-   "- Failing checks at the merge base:",
-   "",
-   "```",
-   ...checks.map((check) => check.replaceAll("`", "'")),
-   "```",
-   "",
-   "## Acceptance criteria",
-   "",
-   `- Given \`${base}\` with the fix, when \`${probe}\` runs, then every check above passes.`,
-   "",
-   "## Out of scope",
-   "",
-   "- Ranger does not close this node when the probe goes green.",
-  ].join("\n"),
+/** What one Scribe filing after a merge came to: the filed node, or why it failed. */
+export type ScribeOutcome = { node: string } | { error: string };
+
+/** The Scribe's filings after a merge; a key is absent when there was nothing to file. */
+export interface ScribeFilings {
+ review?: ScribeOutcome;
+ /** `unread` when the merge's diff could not be read: nothing was scanned. */
+ landmines?: (ScribeOutcome & { count: number }) | { unread: string };
+}
+
+/** The findings a review round left: every severity sage counts. */
+function leftFindings(r: { blockers: number; majors: number; nits: number }): number {
+ return r.blockers + r.majors + r.nits;
+}
+
+/**
+ * The Scribe's pass after a merge (design §6, node #24), before the close so
+ * the receipt can cite what it filed: the last sage round's findings
+ * (split-out-of-review) and the marker comments the merge commit added
+ * (code-comment-graduated), each one `propose` node below this node. Best
+ * effort: a failed filing is journalled and named in the receipt, and the
+ * close goes on. A superseded supervisor stops here (FencedError).
+ */
+export async function scribeAfterMerge(
+ ctx: ImplementContext,
+ pr: Pick<ChangeRequest, "iid" | "webUrl" | "mergeCommitSha">,
+ final: RecordedReview | undefined,
+): Promise<ScribeFilings> {
+ const { journal, map } = ctx;
+ const nodeId = ctx.node.ref.id;
+ const graph = ctx.scribe ?? machineScribeGraph(ctx);
+ const fence = () => journal.assertGeneration(nodeId, map.repo, ctx.generation, "file discovered work");
+ const spawning = { id: nodeId, title: ctx.node.node.title };
+ const change = { number: pr.iid, url: changeRequestUrl(map.repo, pr.iid, pr.webUrl) };
+ const file = async (provenance: Provenance, what: string, spec: () => AddSpec): Promise<ScribeOutcome> => {
+  try {
+   const filed = await scribeFile(graph, journal, { map, parent: nodeId, provenance, spec: spec() }, fence);
+   journal.recordEvent("filed", {
+    nodeId, repo: map.repo,
+    detail: `${filed.added ? "filed" : "already filed"} ${what} as node #${filed.node} below #${nodeId} (${provenance})`.slice(0, 400),
+   });
+   return { node: filed.node };
+  } catch (error) {
+   if (error instanceof FencedError) throw error;
+   const message = error instanceof Error ? error.message : String(error);
+   journal.recordEvent("filed", { nodeId, repo: map.repo, detail: `filing ${what} (${provenance}) FAILED: ${message}`.slice(0, 400) });
+   return { error: message.slice(0, 300) };
+  }
  };
+ const filings: ScribeFilings = {};
+ if (final !== undefined && leftFindings(final) > 0) {
+  filings.review = await file("split-out-of-review", "the last review's findings", () => splitOutOfReviewSpec(map.repo, spawning, change, final));
+ }
+ const merge = pr.mergeCommitSha;
+ if (merge !== null) {
+  let landmines;
+  try {
+   landmines = await landminesInMerge(ctx.canonical, merge);
+  } catch (error) {
+   const message = error instanceof Error ? error.message : String(error);
+   journal.recordEvent("filed", { nodeId, repo: map.repo, detail: `reading the merge's marker comments FAILED: ${message}`.slice(0, 400) });
+   return { ...filings, landmines: { unread: message.slice(0, 300) } };
+  }
+  if (landmines.length > 0) {
+   const outcome = await file("code-comment-graduated", `${landmines.length} marker comment(s)`, () => codeCommentSpec(map.repo, spawning, change, merge, landmines));
+   filings.landmines = { ...outcome, count: landmines.length };
+  }
+ }
+ return filings;
+}
+
+/** The marker comments a merge commit added over its first parent (the base before the merge). */
+async function landminesInMerge(canonical: string, sha: string): Promise<ReturnType<typeof landminesInDiff>> {
+ const diff = await safeGit(["diff", "--unified=0", "--no-color", "--no-ext-diff", "--no-textconv", `${sha}^1`, sha, "--"], { cwd: canonical });
+ if (diff.code !== 0) throw new Error(`git diff ${sha.slice(0, 8)}^1 exited ${diff.code}: ${diff.stderr.trim().slice(0, 200)}`);
+ return landminesInDiff(diff.stdout);
+}
+
+/** The found-by-probe filing for one probe: the Scribe's template (design §6). */
+export function fixNodeSpec(ctx: ImplementContext, probe: string, checks: string[], sha: string, pr: { number: number; url: string }): AddSpec {
+ return foundByProbeSpec(ctx.map.repo, ctx.map.base, ctx.node.ref, probe, checks, sha, pr);
 }
 
 /** The note's suffix when the filing lock was lost while a write ran. */
@@ -1027,7 +1081,9 @@ export async function fileBaseRedFixNodes(
     owned();
     fence();
     try {
-     const filed = await graph.add(nodeId, fixNodeSpec(ctx, probe, checks, base.sha, pr));
+     const spec = fixNodeSpec(ctx, probe, checks, base.sha, pr);
+     assertFilable(map, nodeId, spec);
+     const filed = await graph.add(nodeId, spec);
      journal.setHealth(key, JSON.stringify({ node: filed.node, ...record }));
      note(`filed fix-the-base node #${filed.node} below #${nodeId}: ${probe} red at the merge base ${base.sha.slice(0, 8)}${leaseLost(owned)}`);
     } catch (error) {
@@ -2053,7 +2109,8 @@ async function closeAfterMerge(
  const probe = recordedProbes(await github.listComments(repo, pr.iid, token), botIdentity).find(
   (p) => p.sha === pr.headSha && p.passed,
  );
- const resolution = closeResolution(ctx, pr, final, reviews.length, success, probe);
+ const filings = await scribeAfterMerge(ctx, pr, final);
+ const resolution = closeResolution(ctx, pr, final, reviews.length, success, probe, filings);
  const resolutionFile = join(tmpdir(), `ranger-close-${fileStemFor(repo, nodeId)}.md`);
  writeFileSync(resolutionFile, resolution, "utf8");
 
@@ -2929,11 +2986,26 @@ export function closeResolution(
  rounds: number,
  ci: Extract<CiVerdict, { state: "green" }>,
  probe?: RecordedProbe,
+ filings: ScribeFilings = {},
 ): string {
+ const counts = final === undefined ? "" : `${final.blockers} blocker(s), ${final.majors} major(s) and ${final.nits} nit(s) from the last sage round`;
+ const review = filings.review;
  const deferred =
-  final === undefined || final.majors + final.nits === 0
+  final === undefined || leftFindings(final) === 0
    ? "None."
-   : `${final.blockers} blocker(s), ${final.majors} major(s) and ${final.nits} nit(s) from the last sage round are on the ${changeRequestNoun(ctx.map.repo)} and not filed back yet (the Scribe, design §6, is a follow-up).`;
+   : review === undefined
+    ? `${counts} are on the ${changeRequestNoun(ctx.map.repo)}, not filed back.`
+    : "node" in review
+     ? `${counts}, split out as node #${review.node} below this node.`
+     : `${counts} are on the ${changeRequestNoun(ctx.map.repo)}; filing them back failed (${review.error}).`;
+ const landmines = filings.landmines;
+ const landmineLine = landmines === undefined
+  ? []
+  : ["unread" in landmines
+   ? `- Marker comments: the merge's diff could not be read, so none were filed (${landmines.unread}).`
+   : "node" in landmines
+    ? `- Marker comments: the merge added ${landmines.count}, filed as node #${landmines.node} below this node.`
+    : `- Marker comments: the merge added ${landmines.count}; filing them back failed (${landmines.error}).`];
  return [
   `Implemented by ranger's implement lane in ${changeRequestLabel(ctx.map.repo, pr.iid)} (${changeRequestUrl(ctx.map.repo, pr.iid, pr.webUrl)}), merged by ${pr.mergedBy ?? "an unknown login"}${pr.mergeCommitSha === null ? "" : ` as ${pr.mergeCommitSha.slice(0, 8)}`}.`,
   "",
@@ -2944,6 +3016,7 @@ export function closeResolution(
   ...probeLine(ctx, probe),
   `- Ratification: ${ctx.ratify === "merge" ? `${ratificationText(ctx, pr)}.` : "auto node; declared probes and CI."}`,
   `- Unfixed review findings: ${deferred}`,
+  ...landmineLine,
  ].join("\n");
 }
 

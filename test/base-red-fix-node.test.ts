@@ -87,6 +87,8 @@ describe("fix-the-base node for a confirmed base-red probe (node #152)", () => {
   writeFileSync(configPath, baseConfigLines(dir).join("\n"));
   const { config } = loadConfig(configPath);
   const map = config.maps[0];
+  // The detecting node sits below the map root: the Scribe never files on the root (design §6).
+  map.root = 9;
   map.commands.probeRetry = "fake-probe {node} {failed}";
   const node = JSON.parse(readFileSync(join(import.meta.dir, "fixtures/data/acme__widgets-node-1.json"), "utf8"));
   answers = [failed(["draws", "mounts"]), failed(["mounts", "draws"])];
