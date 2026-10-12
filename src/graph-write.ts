@@ -192,6 +192,8 @@ export interface AddSpec {
  kind?: string;
  labels?: string[];
  body?: string;
+ /** Blocking edges, wired before the node is attached to its parent. */
+ blockedBy?: string[];
 }
 
 export interface AddResult {
@@ -236,6 +238,7 @@ export async function graphAdd(
  if (spec.kind !== undefined) args.push("--kind", spec.kind);
  for (const label of spec.labels ?? []) args.push("--label", label);
  if (spec.body !== undefined) args.push("--body", spec.body);
+ for (const blocker of spec.blockedBy ?? []) args.push("--blocked-by", writeNodeId(ref, blocker));
  args.push("--repo", somaRepo(ref), "--json");
  const result = await callWrite(repo, args, token, opts);
  if (result.code !== 0) {
@@ -254,22 +257,24 @@ export async function graphAdd(
 }
 
 /**
- * Attach an existing node below `parent`: the repair for an add that left
- * its node unattached. `soma graph link` skips a parent the node already
- * has, so a re-run is safe; exit 1 (the attach failed) throws.
+ * Attach an existing node below `parent`, wiring `blockedBy` edges first:
+ * the repair for an add that left its node unattached or an edge missing.
+ * `soma graph link` skips a parent or edge the node already has, so a
+ * re-run is safe; exit 1 (the attach failed) throws.
  */
 export async function graphLink(
  repo: string,
  node: string,
  parent: string,
  token: string,
- opts: RunOptions = {},
+ opts: RunOptions & { blockedBy?: string[] } = {},
 ): Promise<void> {
  const ref = parseForgeRef(repo);
  node = writeNodeId(ref, node);
  parent = writeNodeId(ref, parent);
- const args = ["graph", "link", node, "--parent", parent, "--repo", somaRepo(ref), "--json"];
- const result = await callWrite(repo, args, token, opts);
+ const { blockedBy = [], ...run } = opts;
+ const args = ["graph", "link", node, ...blockedBy.flatMap((id) => ["--blocked-by", writeNodeId(ref, id)]), "--parent", parent, "--repo", somaRepo(ref), "--json"];
+ const result = await callWrite(repo, args, token, run);
  if (result.code !== 0) {
   throw new GraphWriteError(
    `soma graph link ${node} --parent ${parent} (${repo}) failed (exit ${result.code}): ${(result.stderr || result.stdout).trim()}`.slice(0, 600),
