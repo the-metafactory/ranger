@@ -50,8 +50,10 @@ export type RouteClass =
    * Not a frontier class: a claimed `propose` research node whose proposal
    * comment waits for the principal's 👍 (node #246). Its card is built from
    * the `proposed` worker row; `commentId` is null when soma named none.
+   * `missing`: the ratify phase found no comment carrying the proposal
+   * marker either (node #250, ruling D8), so nothing can be ratified.
    */
-  | { route: "proposal"; commentId: string | null; commentUrl: string | null };
+  | { route: "proposal"; commentId: string | null; commentUrl: string | null; missing?: true };
 
 export interface ClassifiedNode {
   id: string;

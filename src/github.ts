@@ -1,4 +1,4 @@
-import type { ChangeRequest, MergeState, MergeOutcome, CiPurpose, CiVerdict, IssueComment } from "./forge.ts";
+import type { ChangeRequest, MergeState, MergeOutcome, CiPurpose, CiVerdict, CommentReaction, IssueComment } from "./forge.ts";
 import { githubCiVerdict } from "./github-ci.ts";
 import { runCmd } from "./exec.ts";
 import { runReadRetryingTransient } from "./transient.ts";
@@ -354,6 +354,50 @@ export async function listComments(
    body: String(r.body ?? ""),
   };
  });
+}
+
+/**
+ * A `--paginate --slurp` read: one array per page. Anything else (a page that
+ * is not a list) throws, so a caller never decides on part of the answer.
+ */
+function pagedList(raw: unknown, label: string): Record<string, unknown>[] {
+ if (!Array.isArray(raw) || raw.some((page) => !Array.isArray(page))) {
+  throw new GitHubError(`${label}: invalid paged response`);
+ }
+ return (raw as unknown[][]).flat().map((item) => (item ?? {}) as Record<string, unknown>);
+}
+
+/** Every comment on an issue (a graph node), every page, oldest first (node #250, D8). */
+export async function issueComments(
+ repo: string,
+ issue: number,
+ token: string,
+): Promise<IssueComment[]> {
+ const label = `comments on #${issue}`;
+ const raw = await ghApi(token, [`repos/${repo}/issues/${issue}/comments?per_page=100`, "--paginate", "--slurp"], label);
+ return pagedList(raw, label).map((r) => ({
+  id: Number(r.id),
+  author: String(((r.user ?? {}) as Record<string, unknown>).login ?? ""),
+  body: String(r.body ?? ""),
+ }));
+}
+
+/**
+ * Every reaction on an issue comment, every page (node #250, ruling D9): the
+ * reacting login and GitHub's content. Any failed page throws.
+ */
+export async function commentReactions(
+ repo: string,
+ commentId: string,
+ token: string,
+): Promise<CommentReaction[]> {
+ if (!/^\d+$/.test(commentId)) throw new GitHubError(`reactions: comment id ${JSON.stringify(commentId)} is not numeric`);
+ const label = `reactions on comment ${commentId}`;
+ const raw = await ghApi(token, [`repos/${repo}/issues/comments/${commentId}/reactions?per_page=100`, "--paginate", "--slurp"], label);
+ return pagedList(raw, label).map((r) => ({
+  author: String(((r.user ?? {}) as Record<string, unknown>).login ?? ""),
+  content: String(r.content ?? ""),
+ }));
 }
 
 /** Existing GitHub gate semantics: named non-conflict states were allowed. */

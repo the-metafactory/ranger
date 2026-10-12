@@ -15,6 +15,9 @@ if [ -n "${FAKE_GH_CALLS:-}" ]; then
   printf "%s\n" "$path" >> "$FAKE_GH_CALLS"
 fi
 case "$path" in
+  repos/*/issues/comments/*/reactions\?*|repos/*/issues/*/comments\?*)
+    exec bun "$(dirname "$0")/ratify-gh.ts" "$path" "${@:3}"
+    ;;
   repos/*/pulls*|repos/*/commits/*/check-runs\?*|repos/*/actions/runs\?*|repos/*/commits/*/status\?*)
     exec bun "$(dirname "$0")/research-gh.ts" "$path" "${@:3}"
     ;;

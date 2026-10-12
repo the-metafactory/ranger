@@ -217,7 +217,22 @@ bun src/cli.ts journal                    # inspect workers/events/health
   becomes `proposed`: the claim stays, no worker runs, no lane slot is held,
   and `run-node`, `resume-node` and `build-now` refuse it. The escalation desk
   posts its card, which links the proposal comment and says to react 👍 there.
-  Ratifying (reading the reaction, closing) is node #250.
+- **Ratify (node #250, #21 rulings D4/D6/D8/D9):** each walk tick reads the
+  reactions on every open proposal (one `GET issues/comments/{id}/reactions`,
+  all pages, under the machine write token), at most `ratify.readsPerTick`
+  (default 10) per tick: least recently read first, then oldest proposal.
+  Soma counts any non-proposer 👍, so the pin is ranger's: only a `+1` from
+  the principal login for the map's forge host, with no `-1` from that login,
+  ratifies; every other reaction is ignored. A ratified proposal resumes at
+  the close: a detached `run-node` runs `soma graph close N
+  --proposal-comment <id>` from the canonical checkout (probes run there; no
+  LLM session; soma records `approved` evidence), writes the decisions and
+  closes the card. A failed read closes nothing and is read again next tick.
+  A row with no comment id takes the newest comment on the node that the bot
+  wrote and that carries the marker; with none, nothing closes, the card says
+  the proposal comment is missing, and the row is not read again. A write
+  identity that resolves to the principal closes nothing. The 👎 veto is
+  node #240.
 - **Observation intake (node #247, #21 rulings D3/D11/D12/D17):** each walk
   tick reads the Discord thread of every map that has one and is not
   `walk: none`, over REST (no gateway). A message counts only when

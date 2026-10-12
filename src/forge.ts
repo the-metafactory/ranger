@@ -37,6 +37,12 @@ export interface IssueComment {
  body: string;
 }
 
+/** One reaction on a comment: who reacted, and GitHub's content (`+1`, `-1`, `heart`, …). */
+export interface CommentReaction {
+ author: string;
+ content: string;
+}
+
 /**
  * Read credentials may carry a forge's checked, project-bound grant. An
  * adapter in the lanes' string-credential shape may ignore the credential a
@@ -55,6 +61,13 @@ export interface ForgeReadPort<Credential = string> {
   * number space for issues and PRs; GitLab does not, so never pass an issue iid.
   */
  listComments(repo: string, changeRequest: number, token: Credential): Promise<IssueComment[]>;
+ /**
+  * Every comment on a tracker issue (a graph node), every page (node #250).
+  * GitHub only: the ratify phase walks only GitHub maps.
+  */
+ issueComments?(repo: string, issue: number, token: Credential): Promise<IssueComment[]>;
+ /** Every reaction on an issue comment, every page (node #250). GitHub only. */
+ commentReactions?(repo: string, commentId: string, token: Credential): Promise<CommentReaction[]>;
 }
 
 /** What a merge attempt did. How each adapter reports a refusal is on `ForgePort.mergePr`. */

@@ -29,6 +29,7 @@ checkpoint=""
 ci=""
 propose=""
 body_file=""
+proposal_comment=""
 evidence_file="$(mktemp)"
 i=4
 while [ $i -le $# ]; do
@@ -43,6 +44,7 @@ while [ $i -le $# ]; do
     --ci) i=$((i+1)); ci="${!i}" ;;
     --propose) propose=1 ;;
     --body-file) i=$((i+1)); body_file="${!i}" ;;
+    --proposal-comment) i=$((i+1)); proposal_comment="${!i}" ;;
     --evidence) i=$((i+1)); printf "%s\n" "${!i}" >> "$evidence_file" ;;
     --write) : ;;
     --dry-run) : ;;
@@ -137,7 +139,8 @@ fi
 export FAKE_SOMA_STATE FAKE_SOMA_REPO_DIR FAKE_SOMA_IDENTITY="$identity" \
   FAKE_SOMA_GIST="$gist" FAKE_SOMA_CHECKPOINT="$checkpoint" FAKE_SOMA_RESOLUTION_FILE="${resolution_file:-}" \
   FAKE_SOMA_CI="$ci" FAKE_SOMA_EVIDENCE_FILE="$evidence_file" \
-  FAKE_SOMA_PROPOSE="$propose" FAKE_SOMA_BODY_FILE="$body_file"
+  FAKE_SOMA_PROPOSE="$propose" FAKE_SOMA_BODY_FILE="$body_file" \
+  FAKE_SOMA_PROPOSAL_COMMENT="$proposal_comment"
 
 # A test can make the map-index write fail the way it did live (node #108).
 if [ "$verb" = "decisions" ] && [ -n "${FAKE_SOMA_DECISIONS_FAIL:-}" ]; then
@@ -224,9 +227,33 @@ if verb == "close" and os.environ.get("FAKE_SOMA_PROPOSE") == "1":
 
 if verb == "close":
     resolution_file = os.environ.get("FAKE_SOMA_RESOLUTION_FILE", "")
-    if not resolution_file or not os.path.isfile(resolution_file):
+    proposal_comment = os.environ.get("FAKE_SOMA_PROPOSAL_COMMENT", "")
+    # Faithful to soma: a close naming --proposal-comment reuses that body as
+    # the resolution, so it needs no --resolution-file.
+    if not proposal_comment and (not resolution_file or not os.path.isfile(resolution_file)):
         print(f"fake soma: close --resolution-file {resolution_file} not readable", file=sys.stderr)
         sys.exit(1)
+    proposal_evidence = []
+    if proposal_comment:
+        # Faithful to soma (cli/graph.ts): the comment's reactions (every page of
+        # state.reactions[id]); a root-author 👎 refuses; a 👍 from anyone but
+        # the proposer is the `approved` evidence, the root author's preferred.
+        # Soma pins nothing else.
+        pages = s.get("reactions", {}).get(proposal_comment, [])
+        reactions = [r for page in pages for r in page]
+        proposer = next((p["identity"] for p in s.get("proposals", []) if str(p["commentId"]) == proposal_comment), "")
+        root_author = s.get("rootAuthor", "jcfischer")
+        if any(r["content"] == "-1" and r["user"]["login"] == root_author for r in reactions):
+            print(f"Node {nid} was refused: {root_author} left a 👎 on proposal comment {proposal_comment}.", file=sys.stderr)
+            sys.exit(1)
+        approvals = sorted(r["user"]["login"] for r in reactions if r["content"] == "+1" and r["user"]["login"] != proposer)
+        ratifier = root_author if root_author in approvals else (approvals[0] if approvals else None)
+        if ratifier is not None:
+            proposal_evidence.append({
+                "kind": "approved",
+                "summary": f"ratified by {ratifier} via thumbs-up on proposal comment {proposal_comment}",
+                "pointer": f"https://github.com/{repo}/issues/{nid}#issuecomment-{proposal_comment}",
+            })
     bare = os.environ.get("FAKE_SOMA_REPO_DIR", "")
     # Faithful to the real gate (DD-16 Amendment A containment): an ungated
     # git-ref-exists probe resolves against the close runner's cwd — the probe
@@ -237,8 +264,9 @@ if verb == "close":
     s["lastCloseCwd"] = probe_cwd
     ci = os.environ.get("FAKE_SOMA_CI", "")
     with open(os.environ["FAKE_SOMA_EVIDENCE_FILE"]) as fh:
-        evidence = [json.loads(line) for line in fh if line.strip()]
-    s["lastClose"] = {"ci": ci, "evidence": evidence, "checkpoint": os.environ.get("FAKE_SOMA_CHECKPOINT", "")}
+        evidence = [json.loads(line) for line in fh if line.strip()] + proposal_evidence
+    s["lastClose"] = {"ci": ci, "evidence": evidence, "checkpoint": os.environ.get("FAKE_SOMA_CHECKPOINT", ""),
+                      "proposalComment": proposal_comment, "resolutionFile": resolution_file}
     # Faithful to the installed gate: an auto node must cite a CI check run.
     if node.get("autonomy") == "auto" and not ci:
         print(f"Close refused: node {nid} (auto) must cite a successful CI check run (checkRunId and headSha) to close", file=sys.stderr)
