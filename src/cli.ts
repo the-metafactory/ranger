@@ -838,7 +838,9 @@ program
    const failed =
     escalateError !== undefined ||
     (escalateResult?.maps.some((m) => !m.ok) ?? false) ||
-    walkResult.maps.some((m) => m.errors.length > 0);
+    walkResult.maps.some((m) => m.errors.length > 0) ||
+    walkResult.intake.error !== undefined ||
+    walkResult.intake.threads.some((t) => t.error !== undefined);
    process.exit(failed ? 2 : 0);
   } catch (error) {
    journal.close();

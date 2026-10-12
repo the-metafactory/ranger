@@ -218,6 +218,20 @@ bun src/cli.ts journal                    # inspect workers/events/health
   and `run-node`, `resume-node` and `build-now` refuse it. The escalation desk
   posts its card, which links the proposal comment and says to react 👍 there.
   Ratifying (reading the reaction, closing) is node #250.
+- **Observation intake (node #247, #21 rulings D3/D11/D12/D17):** each walk
+  tick reads the Discord thread of every map that has one and is not
+  `walk: none`, over REST (no gateway). A message counts only when
+  `principal.discordId` wrote it and its text @-mentions the bot (the bot's
+  id is read once per tick from `GET /users/@me`); without
+  `principal.discordId` no thread is read. Each one gets a draft node card in
+  its thread from the deterministic drafter: the message verbatim and a link
+  to it, title from its first line, parent the map root, checkpoint slugged
+  from the title, autonomy `propose`. Nothing is filed; 👍/❌ is node #251.
+  The journal keeps a cursor per thread (the first read starts it at now) and
+  one draft per message id, so a re-read posts no second card. A failed read
+  moves no cursor; a mention whose content Discord withheld stops the thread
+  there and reports it. A thread two walked maps share is skipped, not read:
+  a draft's parent is its map's root, and a shared thread names no one map.
 - **Acceptance (e2e):** an auto research node walked end-to-end against fake
   soma/gh/worker fixtures — claim → worktree → findings branch pushed → draft
   PR → successful CI citation → gated close → `decisions --write`. Live close

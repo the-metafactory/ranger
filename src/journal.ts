@@ -8,6 +8,8 @@ import {
  events,
  headSubstrates,
  health,
+ intakeCursors,
+ intakeDrafts,
  resumeQueue,
  substrateReadings,
  substrateSessions,
@@ -153,6 +155,23 @@ export interface EscalationRow {
  notedAt: string | null;
 }
 
+/** One intake draft card (node #247): a principal message ranger drafted a node from. */
+export interface IntakeDraftRow {
+ messageId: string;
+ channelId: string;
+ repo: string;
+ root: number;
+ authorId: string;
+ title: string;
+ checkpoint: string;
+ body: string;
+ messageUrl: string;
+ drafter: string;
+ cardMessageId: string;
+ status: string;
+ createdAt: string;
+}
+
 export interface ResumeQueueRow {
  id: number;
  repo: string;
@@ -199,7 +218,8 @@ export type EventKind =
  | "git-trust"
  | "log-failed"
  | "worktree-synced"
- | "filed";
+ | "filed"
+ | "intake-draft";
 
 /** The health-store key of a checkout's known-good git state (`knownGoodGitState`). */
 const knownGoodGitKey = (canonical: string): string => `git.known-good.${canonical}`;
@@ -1089,6 +1109,38 @@ export class Journal {
   for (const row of stale) {
    this.db.delete(health).where(eq(health.key, row.key)).run();
   }
+ }
+
+ // ---- human-observation intake (node #247) ----
+
+ /** The newest message id read from a map thread, or null before the first read. */
+ intakeCursor(channelId: string): string | null {
+  const row = this.db.select().from(intakeCursors).where(eq(intakeCursors.channelId, channelId)).get();
+  return row?.lastMessageId ?? null;
+ }
+
+ setIntakeCursor(channelId: string, lastMessageId: string, now = new Date()): void {
+  const values = { lastMessageId, updatedAt: now.toISOString() };
+  this.db
+   .insert(intakeCursors)
+   .values({ channelId, ...values })
+   .onConflictDoUpdate({ target: intakeCursors.channelId, set: values })
+   .run();
+ }
+
+ /** The draft posted for a principal message, or null when none was. */
+ getIntakeDraft(messageId: string): IntakeDraftRow | null {
+  return this.db.select().from(intakeDrafts).where(eq(intakeDrafts.messageId, messageId)).get() ?? null;
+ }
+
+ /** Record a posted draft card; a second record for one message is refused. */
+ recordIntakeDraft(row: Omit<IntakeDraftRow, "status">): void {
+  this.db.insert(intakeDrafts).values({ ...row, status: "draft" }).run();
+ }
+
+ listIntakeDrafts(repo?: string): IntakeDraftRow[] {
+  const query = this.db.select().from(intakeDrafts);
+  return (repo === undefined ? query : query.where(eq(intakeDrafts.repo, repo))).orderBy(asc(intakeDrafts.createdAt)).all();
  }
 
  close(): void {
