@@ -5,7 +5,9 @@ import { join } from "node:path";
 import { loadConfig } from "../src/config.ts";
 import { openJournal, type Journal } from "../src/journal.ts";
 import { runCmd } from "../src/exec.ts";
-import { boundProposalComment, boundVeto, principalRatified, principalVetoed, ratifyReadKey, vetoMarker } from "../src/ratify.ts";
+import { boundProposalComment, boundVeto, gateProposeReads, principalRatified, principalVetoed, ratifyReadKey, vetoMarker } from "../src/ratify.ts";
+import type { TickPlan } from "../src/candidates.ts";
+import type { ClassifiedNode } from "../src/route.ts";
 import { walk, type WalkResult } from "../src/walk.ts";
 import { auditCacheKey } from "../src/frontier-cache.ts";
 import { baseConfigLines, bun, cliPath, createCanonicalRepo, fakeDiscord, GIT_ENV, testCliEnv } from "./support.ts";
@@ -676,6 +678,43 @@ describe("veto rebuild reads (node #240)", () => {
    f.stop();
   }
  }, 60_000);
+});
+
+describe("propose read gate (node #240)", () => {
+ const node = (id: string, ratify?: "propose"): ClassifiedNode => ({
+  id, title: `node ${id}`, kind: "research", autonomy: ratify ?? "auto", typed: true, url: "",
+  route: { route: "research", walkable: true, ...(ratify === undefined ? {} : { ratify }) },
+  registryBlocked: false,
+ } as ClassifiedNode);
+ const planOf = (take: ClassifiedNode[], vetoed: ClassifiedNode[] = []): TickPlan =>
+  ({ selected: [...vetoed, ...take], implement: [], vetoed, take, waiting: null });
+
+ test("a propose node the replan brings in after a rebuilt veto is not claimable: its comments were never read", async () => {
+  const [a, b, auto] = [node("10", "propose"), node("11", "propose"), node("12")];
+  const read: string[][] = [];
+  const gate = await gateProposeReads({
+   plan: planOf([a]),
+   replan: () => planOf([b, auto], [a]),
+   room: 1,
+   readsPerTick: 5,
+   rebuild: async (ids) => { read.push([...ids]); return { rebuilt: ["10"], error: null }; },
+  });
+  expect(read).toEqual([["10"]]);
+  expect(gate.plan.take).toEqual([b, auto]);
+  expect(gate.claimable(b)).toBe(false);
+  expect(gate.claimable(auto)).toBe(true);
+ });
+
+ test("a failed read leaves no propose node claimable, read or not", async () => {
+  const [a, b] = [node("10", "propose"), node("11", "propose")];
+  const gate = await gateProposeReads({
+   plan: planOf([a, b]), replan: () => planOf([a, b]), room: 5, readsPerTick: 5,
+   rebuild: async () => ({ rebuilt: [], error: "#11: boom" }),
+  });
+  expect(gate.claimable(a)).toBe(false);
+  expect(gate.claimable(b)).toBe(false);
+  expect(gate.errors.join("\n")).toContain("veto rebuild failed (#11: boom)");
+ });
 });
 
 describe("veto pins (node #240, ruling D7)", () => {

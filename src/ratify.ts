@@ -1,4 +1,5 @@
 import { principalLoginForRepo, type RangerConfig, type RangerMapConfig } from "./config.ts";
+import type { TickPlan } from "./candidates.ts";
 import type { CommentReaction, ForgePort, IssueComment } from "./forge.ts";
 import { parseForgeRef } from "./forge-ref.ts";
 import { nodeCommentUrl, nodeUrl } from "./forge-text.ts";
@@ -8,6 +9,7 @@ import { graphRelease, type ReleaseResult } from "./graph-write.ts";
 import { assertNotPrincipal } from "./identity.ts";
 import type { Journal, VetoRow, WorkerRow } from "./journal.ts";
 import { mapKey } from "./maps.ts";
+import type { ClassifiedNode } from "./route.ts";
 
 /**
  * The ratify phase of the walk tick (node #250, #21 rulings D4, D6, D8, D9).
@@ -220,7 +222,7 @@ export async function ratifyPass(ctx: RatifyContext): Promise<RatifyResult> {
 
    let commentId = row.proposalCommentId;
    if (commentId === null) {
-    commentId = boundProposalComment(await port.issueComments(map.repo, Number(row.nodeId), token), botIdentity, row.nodeId);
+    commentId = boundProposalComment(await readComments(port, map.repo, row.nodeId, token), botIdentity, row.nodeId);
     const current = journal.getWorker(row.nodeId, row.repo);
     if (current?.status !== "proposed" || current.proposalCommentId !== null) continue;
     if (commentId === null) {
@@ -295,7 +297,7 @@ async function vetoProposal(
  const { journal } = ctx;
  const { map, token, botIdentity } = m;
  const port = ctx.portFor(map.repo);
- const landed = boundVeto(await port.issueComments!(map.repo, Number(row.nodeId), token), botIdentity, row.nodeId);
+ const landed = boundVeto(await readComments(port, map.repo, row.nodeId, token), botIdentity, row.nodeId);
  let vetoCommentId: string;
  if (landed !== null && landed.proposalCommentId === proposalCommentId) {
   vetoCommentId = landed.commentId;
@@ -392,8 +394,7 @@ async function recoverLost(
   }
   budget.left -= 1;
   try {
-   if (port.issueComments === undefined) throw new Error(`the forge port for ${map.repo} reads no comments`);
-   const comments = await port.issueComments(map.repo, Number(claim.id), token);
+   const comments = await readComments(port, map.repo, claim.id, token);
    const proposal = boundProposalComment(comments, botIdentity, claim.id);
    const veto = boundVeto(comments, botIdentity, claim.id);
    // A claim took the node while its comments were read: the row is its.
@@ -425,6 +426,12 @@ async function recoverLost(
    result.errors.push(`#${claim.id}: proposal recovery read failed (${message(error)}) — read again next tick`);
   }
  }
+}
+
+/** One node's comments, from a port that may read none. */
+function readComments(port: Pick<ForgePort, "issueComments">, repo: string, nodeId: string, token: string): Promise<IssueComment[]> {
+ if (port.issueComments === undefined) throw new Error(`the forge port for ${repo} reads no comments`);
+ return port.issueComments(repo, Number(nodeId), token);
 }
 
 /** Record a veto read back from the node's comments (ruling D1): the row and its event. */
@@ -464,8 +471,7 @@ export async function rebuildVetoes(args: {
   if (journal.hasVeto(nodeId, map.repo)) continue;
   let veto: ReturnType<typeof boundVeto>;
   try {
-   if (port.issueComments === undefined) throw new Error(`the forge port for ${map.repo} reads no comments`);
-   veto = boundVeto(await port.issueComments(map.repo, Number(nodeId), token), botIdentity, nodeId);
+   veto = boundVeto(await readComments(port, map.repo, nodeId, token), botIdentity, nodeId);
   } catch (error) {
    return { rebuilt, error: `#${nodeId}: ${message(error)}` };
   }
@@ -474,4 +480,41 @@ export async function rebuildVetoes(args: {
   rebuilt.push(nodeId);
  }
  return { rebuilt, error: null };
+}
+
+/** A propose research node: its claim waits on a veto read (node #240). */
+export const isProposeResearch = (node: ClassifiedNode): boolean =>
+ node.route.route === "research" && node.route.ratify === "propose";
+
+/**
+ * Gate a tick's propose research claims on a veto read (node #240, rulings
+ * D1, D7). Only the propose nodes the tick can reach are read: those the
+ * plan takes within the spawn cap's `room`, at most `readsPerTick`. A
+ * rebuilt veto lands in the journal, so the plan is made again; a propose
+ * node is claimable only if its comments were read this tick and every read
+ * answered. A node the second plan brings in, a node past the bounds and
+ * every node after a failed read waits for a later tick.
+ */
+export async function gateProposeReads(args: {
+ plan: TickPlan;
+ replan: () => TickPlan;
+ room: number;
+ readsPerTick: number;
+ rebuild: (nodeIds: readonly string[]) => Promise<{ rebuilt: string[]; error: string | null }>;
+}): Promise<{ plan: TickPlan; claimable: (node: ClassifiedNode) => boolean; errors: string[] }> {
+ const reachable = args.plan.take.slice(0, Math.max(0, args.room)).filter(isProposeResearch);
+ const toRead = reachable.slice(0, Math.max(0, args.readsPerTick));
+ const vetoes = await args.rebuild(toRead.map((n) => n.id));
+ const errors: string[] = [];
+ if (vetoes.error !== null) {
+  errors.push(`veto rebuild failed (${vetoes.error}) — no propose research node claimed this tick`);
+ } else if (reachable.length > toRead.length) {
+  errors.push(`${reachable.slice(toRead.length).map((n) => `#${n.id}`).join(", ")} past ratify.readsPerTick — veto read and claim deferred to the next tick`);
+ }
+ const read = new Set(vetoes.error === null ? toRead.map((n) => n.id) : []);
+ return {
+  plan: vetoes.rebuilt.length === 0 ? args.plan : args.replan(),
+  claimable: (node) => !isProposeResearch(node) || read.has(node.id),
+  errors,
+ };
 }
