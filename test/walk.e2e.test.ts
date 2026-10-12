@@ -141,6 +141,55 @@ test("research retry refuses an altered findings branch before citing CI", async
  }
 }, 30_000); // two real run-node CLI processes: under load they outlast 5s
 
+test("a PR lookup outage after the findings branch is cut does not park the retry", async () => {
+ const dir = mkdtempSync(join(tmpdir(), "ranger-research-lookup-"));
+ try {
+  const { origin } = await createCanonicalRepo(dir);
+  const config = writeConfig(dir);
+  const statePath = writeState(dir, { "10": { ...RESEARCH_NODE_STATE, assignees: ["ivy-bot"] } });
+  const env = {
+   ...process.env, ...GIT_ENV, PATH: `${fixturesBin}:${process.env.PATH ?? ""}`,
+   FAKE_SOMA_DIR: dataDir, FAKE_SOMA_STATE: statePath, FAKE_SOMA_REPO_DIR: origin,
+   RANGER_WRITE_TEST: "ghp_write", RANGER_WORKER_CMD: join(fixturesBin, "worker"),
+   FAKE_RESEARCH_PR_LOOKUP_FAIL_ONCE: join(dir, "lookup-spent"),
+  };
+  const args = ["run-node", "10", "--map", "acme/widgets", "-c", config];
+  const first = await runCli(args, env);
+  expect(first.stdout).not.toContain("pre-worker base is missing");
+  const retry = await runCli(args, env);
+  expect(retry.code).toBe(0);
+  expect(JSON.parse(retry.stdout).status).toBe("success");
+  expect(JSON.parse(readFileSync(statePath, "utf8")).nodes["10"].status).toBe("closed");
+ } finally {
+  rmSync(dir, { recursive: true, force: true });
+ }
+}, 30_000); // two real run-node CLI processes: under load they outlast 5s
+
+test("an adopted worktree on another branch parks before the worker runs", async () => {
+ const dir = mkdtempSync(join(tmpdir(), "ranger-research-adopted-"));
+ try {
+  const { origin, canonical } = await createCanonicalRepo(dir);
+  const config = writeConfig(dir);
+  const statePath = writeState(dir, { "10": { ...RESEARCH_NODE_STATE, assignees: ["ivy-bot"] } });
+  // A worktree cut before the supervisor owned the findings branch.
+  const worktree = join(canonical, ".worktrees", "node-10");
+  const add = await runCmd("git", ["worktree", "add", "--no-track", worktree, "-b", "node/10-legacy", "origin/main"], { cwd: canonical, env: { ...process.env, ...GIT_ENV } });
+  expect(add.code).toBe(0);
+  const env = {
+   ...process.env, ...GIT_ENV, PATH: `${fixturesBin}:${process.env.PATH ?? ""}`,
+   FAKE_SOMA_DIR: dataDir, FAKE_SOMA_STATE: statePath, FAKE_SOMA_REPO_DIR: origin,
+   RANGER_WRITE_TEST: "ghp_write", RANGER_WORKER_CMD: join(fixturesBin, "worker"),
+  };
+  const run = await runCli(["run-node", "10", "--map", "acme/widgets", "-c", config], env);
+  const outcome = JSON.parse(run.stdout);
+  expect(outcome.status).toBe("parked");
+  expect(outcome.detail).toContain("node/10-legacy checked out, not research/api-survey");
+  expect(outcome.workerExit).toBeNull();
+ } finally {
+  rmSync(dir, { recursive: true, force: true });
+ }
+}, 30_000);
+
 describe("ranger walk — claim phase (node #13)", () => {
  test("claims an auto+research frontier node: announce (fail-closed) → soma graph claim → journal", async () => {
   const dir = mkdtempSync(join(tmpdir(), "ranger-walk-"));
@@ -384,6 +433,16 @@ describe("ranger run-node — research worker full loop (node #13 acceptance)", 
     { env: { ...process.env, ...GIT_ENV } },
    );
    expect(refCheck.code).toBe(0);
+
+   // The supervisor cut the findings branch with --no-track: no tracking lines
+   // reached the shared config, where the tamper check refuses them at the
+   // vetted push (soma #782, #783: a worker branched off origin/main).
+   const tracking = await runCmd(
+    "git",
+    ["--git-dir", join(canonical, ".git"), "config", "--get-regexp", "^branch\\.research/"],
+    { env: { ...process.env, ...GIT_ENV } },
+   );
+   expect(tracking.stdout).toBe("");
 
    // The node was closed with a gist, decisions re-projected.
    const state = JSON.parse(readFileSync(statePath, "utf8"));

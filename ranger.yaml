@@ -73,61 +73,6 @@ maps:
       tokenEnv: RANGER_DISCORD_TOKEN
       channelId: "1487052222067118111"
 
-  - repo: jcfischer/seelite
-    root: 1
-    walk: full
-    localCheckout: ~/work/cyphr/spark/seelite
-    # Shares seekolous's private grove channel rather than opening a second
-    # personal surface. walk: full since 2026-10-03 (ivy-agent has write
-    # access). Every eligible task is walked (principal, 2026-10-03: grillings
-    # are the principal's, ranger builds what they spawn) except the skip
-    # list: #559 needs the principal's ear and a squash-safe probe first.
-    skip: [559]
-    # Ranger merges a gate-passed PR itself (principal, 2026-10-03), except
-    # nodes labelled ranger:needs-eye, which keep the one-tap merge card.
-    autoMerge: true
-    commands:
-      install: npm ci --no-audit --no-fund
-      test: npm test
-      # The browser tier (principal, 2026-10-03): the TypeSafe-selected probes
-      # for the branch diff, once on the final sage-clean head; a passing run
-      # gates the merge card. The selector reads TYPESAFE_API_KEY from ~/.env
-      # itself. The intent is ranger-authored: only the node id is templated
-      # (seelite CLAUDE.md: never paste tracker or PR text into --intent).
-      # GPU lane: headed Chromium opens on the host screen while it runs.
-      probe: 'npm run probe:pr -- --base origin/main --head HEAD --intent "Ranger implement lane: the diff on this branch implements orienteer node #{node}; select every browser probe the changed files can affect."'
-      # A failed run retries only the probes it named (2026-10-04: one
-      # load-induced crash cost a 25-minute full rerun). The runner takes an
-      # exact list through PROBE_SELECTION/PROBE_FILES.
-      probeRetry: PROBE_SELECTION=1 PROBE_FILES={failed} npm run probe
-      probeTimeoutMin: 30
-      views: PROBE_ORIGIN={origin} npm run views -- --label {label} --out {out}
-      viewsServe: npx vite --port {port} --strictPort
-      viewsDiff: node scripts/diff-view-set.mjs {out} {a} {b}
-    discord:
-      tokenEnv: RANGER_DISCORD_TOKEN
-      channelId: "1487052222067118111"
-
-  # Node #38: register gameplay with walk: full and the same commands and
-  # autoMerge as platform. Node #47 omits platform's map-specific skip list.
-  - repo: jcfischer/seelite
-    root: 460
-    walk: full
-    localCheckout: ~/work/cyphr/spark/seelite
-    autoMerge: true
-    commands:
-      install: npm ci --no-audit --no-fund
-      test: npm test
-      probe: 'npm run probe:pr -- --base origin/main --head HEAD --intent "Ranger implement lane: the diff on this branch implements orienteer node #{node}; select every browser probe the changed files can affect."'
-      probeRetry: PROBE_SELECTION=1 PROBE_FILES={failed} npm run probe
-      probeTimeoutMin: 30
-      views: PROBE_ORIGIN={origin} npm run views -- --label {label} --out {out}
-      viewsServe: npx vite --port {port} --strictPort
-      viewsDiff: node scripts/diff-view-set.mjs {out} {a} {b}
-    discord:
-      tokenEnv: RANGER_DISCORD_TOKEN
-      channelId: "1487052222067118111"
-
   # Soma (principal, 2026-10-05): all five orienteer maps, walk: full,
   # autoMerge off — ranger runs through soma's own close gate, so every
   # soma PR keeps the one-tap merge card. Walkable after soma #744 (legacy
@@ -216,6 +161,21 @@ maps:
     discord:
       tokenEnv: RANGER_DISCORD_TOKEN
       channelId: "1505550997764833444"
+  # MetaFactory pursues (principal, 2026-10-12): the LifeOS-gap walking
+  # skeleton. Charted on soma, not meta-factory: ivy-agent cannot be added to
+  # the private repo without a paid seat. Soma builds file below their
+  # decision here; reflex/cortex/myelin builds go on maps in those repos.
+  - repo: the-metafactory/soma
+    root: 781
+    walk: full
+    autoMerge: false
+    localCheckout: ~/work/mf/soma
+    commands:
+      install: bun install --frozen-lockfile
+      test: bun run test && bun run typecheck
+    discord:
+      tokenEnv: RANGER_DISCORD_TOKEN
+      channelId: "1505550997764833444"
 
 # Read-only token gate (node #8 ruling). Only env var NAMES live here — never
 # tokens. Prefixes match longest-first against map.repo. Scout refuses to run a
@@ -244,7 +204,7 @@ bot:
 # parks it for the principal (principal, 2026-10-05: 7, up from 5 on 2026-10-03 and the design §4
 # default of 2).
 workers:
-  reviewRounds: 7
+  reviewRounds: 8
   # New claims per UTC day across all maps (default 10). Raised to 20
   # (principal, 2026-10-04): two lanes and three walked maps used up 10 by midday.
   spawnCapPerDay: 20
