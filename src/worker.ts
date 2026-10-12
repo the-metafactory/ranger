@@ -847,14 +847,20 @@ async function runResearch(
  });
  journal.updateWorker(nodeId, repo, { worktree, lane: "research" });
 
- const github = ctx.github ?? githubApi;
- const recorded = journal.getWorker(nodeId, repo)?.prNumber ?? null;
- const existingPr = recorded === null
-  ? await github.findPrByHead(repo, branch, token)
-  : await github.getPr(repo, recorded, token);
+ // An adopted worktree (a crashed run's, or one cut before the supervisor
+ // owned the findings branch) can sit on another branch; the prompt promises
+ // the findings branch is checked out, so anything else parks.
+ const checkedOut = await safeGit(["symbolic-ref", "--short", "HEAD"], { cwd: worktree, timeoutMs: 10_000 });
+ if (checkedOut.code !== 0 || checkedOut.stdout.trim() !== branch) {
+  throw new ParkSignal(`research worktree ${worktree} has ${checkedOut.code === 0 ? checkedOut.stdout.trim() : "a detached HEAD"} checked out, not ${branch}; operator intervention required`);
+ }
+
+ // Record the base before any network call: the branch now exists, and a
+ // retry after a failed PR lookup must not read it as unexplained state.
  let baseSha = journal.getWorker(nodeId, repo)?.researchBaseSha ?? null;
+ const freshBase = baseSha === null;
  if (baseSha === null) {
-  if (existingPr !== null || preexisting !== null) {
+  if (preexisting !== null) {
    throw new ParkSignal(`research pre-worker base is missing for ${branch}; operator intervention required`);
   }
   baseSha = await resolveBranchSha(canonical, branch);
@@ -863,6 +869,16 @@ async function runResearch(
   }
   fence("record research base");
   journal.updateWorker(nodeId, repo, { researchBaseSha: baseSha });
+ }
+
+ const github = ctx.github ?? githubApi;
+ const recorded = journal.getWorker(nodeId, repo)?.prNumber ?? null;
+ const existingPr = recorded === null
+  ? await github.findPrByHead(repo, branch, token)
+  : await github.getPr(repo, recorded, token);
+ // A draft for a branch cut only now was opened by something else.
+ if (freshBase && existingPr !== null) {
+  throw new ParkSignal(`research pre-worker base is missing for ${branch}; operator intervention required`);
  }
  let sha: string;
 

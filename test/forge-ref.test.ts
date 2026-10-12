@@ -42,8 +42,6 @@ describe("ForgeRef config and identity seam", () => {
    ["the-metafactory/ranger", 91, "the-metafactory__ranger"],
    ["the-metafactory/ranger", 133, "the-metafactory__ranger"],
    ["jcfischer/seekolous", 26, "jcfischer__seekolous"],
-   ["jcfischer/seelite", 1, "jcfischer__seelite"],
-   ["jcfischer/seelite", 460, "jcfischer__seelite"],
    ["the-metafactory/soma", 604, "the-metafactory__soma"],
    ["the-metafactory/soma", 645, "the-metafactory__soma"],
    ["the-metafactory/soma", 565, "the-metafactory__soma"],
@@ -51,6 +49,7 @@ describe("ForgeRef config and identity seam", () => {
    ["the-metafactory/soma", 533, "the-metafactory__soma"],
    ["the-metafactory/soma", 751, "the-metafactory__soma"],
    ["the-metafactory/soma", 766, "the-metafactory__soma"],
+   ["the-metafactory/soma", 781, "the-metafactory__soma"],
   ] as const;
   expect(config.maps.map(m => [m.repo, m.root])).toEqual(expected.map(([repo, root]) => [repo, root]));
   for (const [index, [repo, root, fileRepo]] of expected.entries()) {
