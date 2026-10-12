@@ -568,10 +568,27 @@ describe("node #47 — map identity", () => {
   } finally { r.close(); }
  });
 
- test("production config registers gameplay once with its own policy", () => {
-  const config = loadConfig(join(import.meta.dir, "../ranger.yaml")).config;
+ // Seelite's two maps left the production config (2026-10-12), so the shape
+ // node #47 registered is pinned here: platform with its skip list, gameplay
+ // with none, the same commands and surface.
+ test("a second map on one repo registers once with its own policy", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ranger-multimap-prod-"));
+  const commands = { install: "npm ci", test: "npm test", probe: "npm run probe:pr" };
+  const discord = { tokenEnv: "RANGER_DISCORD_TOKEN", channelId: "111" };
+  const configPath = join(dir, "ranger.yaml");
+  writeFileSync(configPath, stringify({ version: 1,
+   maps: [
+    { repo: "jcfischer/seelite", root: 1, walk: "full", skip: [559], autoMerge: true, commands, discord },
+    { repo: "jcfischer/seelite", root: 460, walk: "full", autoMerge: true, commands, discord },
+   ],
+   auth: { defaultWriteTokenEnv: "RANGER_WRITE_TEST", defaultTokenEnv: "RANGER_RO_TEST" },
+   bot: { identity: "ivy-bot" }, state: { journalPath: join(dir, "journal.sqlite") },
+  }));
+  const config = loadConfig(configPath).config;
+  rmSync(dir, { recursive: true, force: true });
   const platform = pickMap(config, "jcfischer/seelite#1");
   const gameplay = pickMap(config, "jcfischer/seelite#460");
+  expect(platform.skip).toEqual(["559"]);
   expect(gameplay.walk).toBe("full"); expect(gameplay.skip).toEqual([]); expect(gameplay.autoMerge).toBe(true);
   expect(gameplay.commands).toEqual(platform.commands); expect(gameplay.discord).toEqual(platform.discord);
   expect(servedMaps(config).filter(m => mapKey(m) === "jcfischer/seelite#460")).toHaveLength(1);

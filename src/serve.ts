@@ -1,5 +1,9 @@
 import { decodeForgeKey, isGithubRepo, nodeKey } from "./forge-ref.ts";
-import { lastImplementMaps, mapKey, implementMapOrder } from "./maps.ts";
+import { changeRequestLabel, changeRequestUrl } from "./forge-text.ts";
+import type { CiVerdict, ForgeReadPort } from "./forge.ts";
+import { gitlabIssueEndpoint, gitlabLoginCiVerdict, GitLabReadPort, parseGitLabIssue } from "./gitlab.ts";
+import { parseGlabResponse } from "./glab-transport.ts";
+import { lastImplementMaps, mapKey, implementMapOrder, readDrains } from "./maps.ts";
 /**
  * `ranger serve` (#37) — a local dashboard of the walk: the job a worker is on
  * now, the next node a tick would take, every node ranger can take on its own,
@@ -28,7 +32,9 @@ import { lastImplementMaps, mapKey, implementMapOrder } from "./maps.ts";
  * failed and needs-eye rows (`serve-parked.ts`) carry buttons, and each one
  * only spawns an existing CLI verb (`ranger resume-node`), `gh pr merge` with
  * no machine-account token or gh config in its environment (gh uses the login
- * stored under HOME; which account that is goes unchecked), or
+ * stored under HOME; which account that is goes unchecked), on a GitLab map
+ * `glab api` on the MR's merge endpoint the same way (node #132: glab uses the
+ * principal's login, and the pipeline is re-read under it first), or
  * the iTerm2 launch above. The process itself still writes nothing: the
  * journal stays read-only here and no graph write is imported. Each action is
  * guarded like the launch — Host, Origin, page token, a numeric id — and the
@@ -53,22 +59,25 @@ import {
  serveConfig,
  type WalkMode,
 } from "./config.ts";
-import { implementCandidates, planTick, walkableCandidates } from "./candidates.ts";
+import { drainGate, implementCandidates, planTick, walkableCandidates, type DrainState } from "./candidates.ts";
 import { pidAlive as defaultPidAlive } from "./exec.ts";
-import { Journal, type WorkerRow } from "./journal.ts";
+import { Journal, type ResumeQueueRow, type WorkerRow } from "./journal.ts";
 import { ForeignMigrationError } from "./journal-guard.ts";
-import { implementLane, workerLane, type ImplementLane } from "./lanes.ts";
-import { activeCooldown, readGraphqlBudget } from "./budget.ts";
+import { IMPLEMENT_LANES, implementLane, workerLane, type ImplementLane } from "./lanes.ts";
+import { activeCooldown, cooldownScope, readGraphqlBudget } from "./budget.ts";
+import { queueEntryGate, queueSpawnGate } from "./resume.ts";
 import { cachedFrontier } from "./frontier-cache.ts";
 import { type FrontierEntry, graphFrontier, RateLimitError } from "./graph.ts";
 import { runCmd } from "./exec.ts";
-import { classify, classifyFrontier, type ClassifiedNode, loadProbeRegistry } from "./route.ts";
+import { briefHoldReason, classify, classifyFrontier, type ClassifiedNode, loadProbeRegistry } from "./route.ts";
 import { liveSession, substrateUsageViews, type SubstrateUsageView } from "./substrate-usage.ts";
-import { resolveReadOnlyToken, assertReadOnlyToken, gatedEnv, tokenBatch, type TokenBatch, type ResolvedToken } from "./token-gate.ts";
+import { resolveReadOnlyToken, assertReadOnlyToken, gatedEnv, gitlabApiRead, tokenBatch, type TokenBatch, type ResolvedToken } from "./token-gate.ts";
 import { childEnv, itermArgv, shellQuote } from "./launch.ts";
 import {
  type ActionKind,
+ type ActionDeps,
  type ActionRunner,
+ type BehindBase,
  checkRunsFromPages,
  workflowRunsFromPages,
  ciState,
@@ -76,9 +85,13 @@ import {
  awaitingMergeEntries,
  type NeedsYouEntry,
  type PrView,
+ type QueuedResumeView,
+ resumeQueueViews,
  runAction,
  uncheckedNeedsEye,
 } from "./serve-parked.ts";
+import { runDrainAction } from "./serve-drain.ts";
+import { workerLogFile } from "./worker-log.ts";
 
 export { childEnv };
 
@@ -180,6 +193,8 @@ export interface StateInputs {
  workers: WorkerRow[];
  laneHolders: Record<ImplementLane, WorkerRow | null>;
  paused: boolean;
+ /** The drain switches (node #165); absent means none is set. */
+ drains?: DrainState;
  spawnsToday: number;
  spawnCap: number;
  vetoed: (nodeId: string) => boolean;
@@ -195,6 +210,20 @@ export interface StateInputs {
  needsYouUnchecked?: UncheckedRow[];
  /** Every awaiting-merge row, needs-eye or not: the Current job's "Merge now". */
  awaitingMerge?: NeedsYouEntry[];
+ /** The journal's resume queue, every lane, FIFO (node #166); absent means empty. */
+ resumeQueue?: ResumeQueueRow[];
+}
+
+/** One lane's queued resumes, FIFO, and what the next tick does with them. */
+export interface LaneQueue {
+ entries: QueuedResumeView[];
+ /**
+  * The entry the next tick reaches first; null when none is left to reach.
+  * `starts`: the tick resumes it ahead of any frontier claim.
+  */
+ head: { repo: string; nodeId: string; starts: boolean; reason: string } | null;
+ /** Entries the next tick drops from the queue; they hold nothing behind them. */
+ drops: { repo: string; nodeId: string; reason: string }[];
 }
 
 /** An awaiting-merge row that may need the principal's eye; its labels are unknown. */
@@ -215,6 +244,8 @@ export interface CurrentJob {
  lane: string | null;
  resourceLane: ImplementLane | null;
  prNumber: number | null;
+ /** "PR #N" on GitHub, "MR !N" on GitLab (node #132). */
+ prLabel: string | null;
  reviewRound: number;
  startedAt: string | null;
  pid: number | null;
@@ -285,6 +316,10 @@ export interface DashboardState {
  refreshError: string | null;
  gates: {
   paused: boolean;
+  /** The visual lane's drain (node #165), shown once at lane level. */
+  visualDrained: boolean;
+  /** Drained headless maps by key, shown on their maps. */
+  drainedMaps: string[];
   spawnsToday: number;
   spawnCap: number;
   laneHolders: Record<ImplementLane, { repo: string; root: number; nodeId: string; status: string } | null>;
@@ -295,6 +330,8 @@ export interface DashboardState {
  needsYou: NeedsYouEntry[];
  needsYouUnchecked: UncheckedRow[];
  awaitingMerge: NeedsYouEntry[];
+ /** Queued resumes per lane (node #166). */
+ resumeQueue: Record<ImplementLane, LaneQueue>;
 }
 
 const IN_FLIGHT = new Set<WorkerRow["status"]>(["claimed", "running", "awaiting-merge"]);
@@ -307,6 +344,7 @@ const laneOf = (n: ClassifiedNode): "implement" | "research" | undefined =>
 /** Why a node waits on the principal, in a few words; null when ranger can take it. */
 function escalation(n: ClassifiedNode): string | null {
  if (n.route.route === "provisioning") return "its probes are not provisioned on this host";
+ if (n.route.route === "brief-not-ready") return briefHoldReason(n.route.missing);
  if (n.route.route !== "escalate-hitl") return null;
  if (n.route.reason === "untyped") return "its typed block is missing or broken";
  if (n.route.reason === "hitl-kind-as-auto") return `a ${n.kind} declared auto (map hygiene)`;
@@ -327,8 +365,56 @@ const view = (n: ClassifiedNode): NodeView => ({
  * count against the shared daily cap before a later map is planned.
  */
 interface TickSoFar {
- holders: Record<ImplementLane, { repo: string; nodeId: string; thisTick: boolean } | null>;
+ /** `resumed`: the holder is a queued resume this tick starts, not a claim. */
+ holders: Record<ImplementLane, { repo: string; nodeId: string; thisTick: boolean; resumed?: boolean } | null>;
  spawns: number;
+}
+
+/**
+ * The walk's Pass 1c, as the dashboard reads it: each lane's queue head
+ * starts before any map claims, taking the lane and one spawn, unless the
+ * dead-man pause, a lane holder or the spent cap holds it. A drain does not:
+ * it stops only fresh claims. Entries are visited in the journal's FIFO
+ * order, so with one spawn left the earlier-queued head takes it. Which
+ * entries drop, defer or wait behind is the walk's own `queueEntryGate`,
+ * and what holds a head is its `queueSpawnGate`. The walk's forge checks
+ * (a closed node, a merged PR) and its identity gate are past what the
+ * dashboard reads, so a head it shows as starting may still drop or defer.
+ */
+function planQueueHeads(
+ queue: ResumeQueueRow[],
+ views: Record<ImplementLane, QueuedResumeView[]>,
+ inputs: StateInputs,
+ tick: TickSoFar,
+): Record<ImplementLane, LaneQueue> {
+ const out = Object.fromEntries(
+  IMPLEMENT_LANES.map((lane): [ImplementLane, LaneQueue] => [lane, { entries: views[lane], head: null, drops: [] }]),
+ ) as Record<ImplementLane, LaneQueue>;
+ for (const entry of queue) {
+  const lane = out[entry.lane];
+  const key = nodeKey(entry.repo, entry.root);
+  const map = inputs.maps.find((m) => m.key === key && !m.servedOnly);
+  const row = inputs.workers.find((w) => w.repo === entry.repo && w.nodeId === entry.nodeId) ?? null;
+  const gate = queueEntryGate(entry, map, row, lane.head !== null);
+  if (gate?.kind === "behind") continue;
+  const at = { repo: entry.repo, nodeId: entry.nodeId };
+  if (gate?.kind === "drop") {
+   lane.drops.push({ ...at, reason: `the next tick drops it: ${gate.reason}` });
+   continue;
+  }
+  const holder = tick.holders[entry.lane];
+  const held =
+   gate !== null ? `the tick holds it, and the lane's queue behind it: ${gate.reason}`
+   : queueSpawnGate({ paused: inputs.paused, lane: entry.lane, holder, spawns: tick.spawns, cap: inputs.spawnCap });
+  if (held !== null) {
+   lane.head = { ...at, starts: false, reason: held };
+   continue;
+  }
+  tick.holders[entry.lane] = { repo: key, nodeId: entry.nodeId, thisTick: true, resumed: true };
+  tick.spawns += 1;
+  lane.head = { ...at, starts: true, reason: "the next tick starts this ahead of any frontier claim, unless its forge check (a closed node, a merged PR) or the identity gate stops it" };
+ }
+ return out;
 }
 
 function nextFor(
@@ -343,6 +429,9 @@ function nextFor(
  if (!report.ok) return none(`frontier unavailable: ${report.error ?? "unknown error"}`);
  if (map.walk === "none") return none("walk: none — registered, not walked");
  if (inputs.paused) return none("dead-man paused — claiming stopped until `ranger resume-run`");
+ // The walk's drain gate (node #165), from the same helper.
+ const drain = drainGate(map, inputs.drains ?? NO_DRAINS);
+ if (drain?.scope === "map") return none(drain.reason);
  if (tick.spawns >= inputs.spawnCap) {
   return none(
    tick.spawns > inputs.spawnsToday
@@ -355,6 +444,7 @@ function nextFor(
  const plan = planTick(report.frontier, {
   laneBusy: holder !== null,
   vetoed: inputs.vetoed,
+  implementDrained: drain?.scope === "lane",
  });
  // What this map spends of the tick, for the maps after it.
  const claims = plan.take.slice(0, inputs.spawnCap - tick.spawns);
@@ -381,7 +471,9 @@ function nextFor(
    url: plan.waiting.url,
    lane: "implement",
    waiting: true,
-   reason: holder.thisTick
+   reason: holder.resumed === true
+    ? `waits for the ${map.lane} implement lane: this tick resumes queued #${holder.nodeId} (${holder.repo}) first`
+    : holder.thisTick
     ? `waits for the ${map.lane} implement lane: this tick claims #${holder.nodeId} (${holder.repo}) first`
     : `waits for the ${map.lane} implement lane, held by #${holder.nodeId} (${holder.repo})`,
   };
@@ -390,10 +482,16 @@ function nextFor(
  if (vetoed.length > 0) {
   return none(`${vetoed.join(", ")} vetoed — the tick claims nothing else this pass`);
  }
+ if (drain !== null && implementCandidates(report.frontier).length > 0) {
+  return none(`no implement claim this tick — see the ${map.lane} lane`);
+ }
  return none("nothing walkable on this map's frontier");
 }
 
+const NO_DRAINS: DrainState = { visual: false, maps: new Set() };
+
 export function assembleState(inputs: StateInputs): DashboardState {
+ const drains = inputs.drains ?? NO_DRAINS;
  const laneMaps = inputs.maps.filter((m) => !m.servedOnly).map((m) => ({ ...m, commands: {} }));
  const titleOf = (repo: string, id: string): string | null => {
   for (const map of inputs.maps) {
@@ -417,6 +515,7 @@ export function assembleState(inputs: StateInputs): DashboardState {
    lane: w.lane,
    resourceLane: w.lane === "implement" ? workerLane(w, laneMaps) : null,
    prNumber: w.prNumber,
+   prLabel: w.prNumber === null ? null : changeRequestLabel(w.repo, w.prNumber),
    reviewRound: w.reviewRound,
    startedAt: w.startedAt,
    pid: w.pid,
@@ -434,6 +533,9 @@ export function assembleState(inputs: StateInputs): DashboardState {
   holders: { visual: tickHolder("visual"), headless: tickHolder("headless") },
   spawns: inputs.spawnsToday,
  };
+ // Queued resumes start before any claim (walk Pass 1c, node #166).
+ const queue = inputs.resumeQueue ?? [];
+ const resumeQueue = planQueueHeads(queue, resumeQueueViews(queue, titleOf), inputs, tick);
  // Plan in the walk's rotation order; retain config order for display.
  const planned = new Map<string, NextJob>();
  for (const map of implementMapOrder(inputs.maps, inputs.lastImplementMaps ?? {}, m => m.lane)) {
@@ -443,6 +545,8 @@ export function assembleState(inputs: StateInputs): DashboardState {
   const report = inputs.reports.get(map.key);
   const frontier = report?.ok ? report.frontier : [];
   const walked = !map.servedOnly && map.walk !== "none";
+  // A drain refuses this map's implement claims: none waits in its queue either.
+  const drained = drainGate(map, drains) !== null;
   return {
    key: map.key,
    repo: map.repo,
@@ -456,7 +560,7 @@ export function assembleState(inputs: StateInputs): DashboardState {
    source: report?.source ?? (map.servedOnly ? "serve" : "ranger"),
    localCheckout: map.localCheckout,
    next: planned.get(map.key)!,
-   queued: walked
+   queued: walked && !drained
     ? implementCandidates(frontier)
        .filter((n) => n.id !== planned.get(map.key)!.nodeId && !inputs.vetoed(n.id))
        .map(view)
@@ -496,6 +600,8 @@ export function assembleState(inputs: StateInputs): DashboardState {
   refreshError: inputs.refreshError,
   gates: {
    paused: inputs.paused,
+   visualDrained: drains.visual,
+   drainedMaps: inputs.maps.filter((m) => drainGate(m, drains)?.scope === "map").map((m) => m.key),
    spawnsToday: inputs.spawnsToday,
    spawnCap: inputs.spawnCap,
    laneHolders: { visual: holderView("visual"), headless: holderView("headless") },
@@ -506,6 +612,7 @@ export function assembleState(inputs: StateInputs): DashboardState {
   needsYou: inputs.needsYou ?? [],
   needsYouUnchecked: inputs.needsYouUnchecked ?? [],
   awaitingMerge: inputs.awaitingMerge ?? [],
+  resumeQueue,
  };
 }
 
@@ -662,13 +769,15 @@ export interface HandlerContext {
   exists: (path: string) => boolean;
   /** Called after an action ran, to re-read what it changed. */
   after?: (entry: NeedsYouEntry) => void;
- };
+ } & Pick<ActionDeps, "workerLog" | "behindBase">;
 }
 
 const ACTION_PATHS: Record<string, ActionKind> = {
  "/api/resume": "resume",
  "/api/merge": "merge",
  "/api/session": "session",
+ "/api/queue-resume": "queue-resume",
+ "/api/cancel-resume": "cancel-resume",
 };
 
 const json = (status: number, body: unknown): Response =>
@@ -747,8 +856,10 @@ export function createHandler(ctx: HandlerContext): (req: Request) => Promise<Re
    const body = await readObject(req);
    if (body === null) return refuse(400, "body is not a JSON object");
    const actions = ctx.actions;
+   const state = ctx.getState();
    const result = await runAction(action, body, {
-    entries: actionEntries(ctx.getState()),
+    entries: actionEntries(state),
+    queue: IMPLEMENT_LANES.flatMap((lane) => state.resumeQueue?.[lane]?.entries ?? []),
     run: actions.run,
     env: actions.env ?? process.env,
     rangerBin: actions.rangerBin,
@@ -756,9 +867,25 @@ export function createHandler(ctx: HandlerContext): (req: Request) => Promise<Re
     readPr: actions.readPr,
     verifyChecks: actions.verifyChecks,
     exists: actions.exists,
+    workerLog: actions.workerLog,
+    behindBase: actions.behindBase,
     inFlight,
    });
    if (result.entry !== undefined) actions.after?.(result.entry);
+   return json(result.status, result.body);
+  }
+  if (url.pathname === "/api/drain") {
+   if (ctx.actions === undefined) return refuse(501, "actions are not wired in this server");
+   const body = await readObject(req);
+   if (body === null) return refuse(400, "body is not a JSON object");
+   const result = await runDrainAction(body, {
+    maps: ctx.getState().maps,
+    run: ctx.actions.run,
+    env: ctx.actions.env ?? process.env,
+    rangerBin: ctx.actions.rangerBin,
+    configPath: ctx.actions.configPath,
+    inFlight,
+   });
    return json(result.status, result.body);
   }
   if (url.pathname !== "/api/grill" && url.pathname !== "/api/build-now") {
@@ -961,7 +1088,7 @@ function jobTime(iso) {
 // One pill per fact, each once: status and phase are often the same word.
 function jobTags(j) {
  if (j.stale) return [tag("stale: process gone", "stale")];
- const parts = [j.resourceLane || j.lane, j.status, j.phase, j.prNumber ? "PR #" + j.prNumber : "", j.reviewRound ? "round " + j.reviewRound : ""];
+ const parts = [j.resourceLane || j.lane, j.status, j.phase, j.prLabel || "", j.reviewRound ? "round " + j.reviewRound : ""];
  return [...new Set(parts.filter(Boolean))].map((p) => tag(p));
 }
 function renderCurrent(s) {
@@ -974,7 +1101,7 @@ function renderCurrent(s) {
    const waiting = j.status === "awaiting-merge" ? (s.awaitingMerge || []).find((e) => e.repo === j.repo && e.nodeId === j.nodeId) : undefined;
    const last = waiting ? results.get(waiting.key + "/" + waiting.nodeId) : undefined;
    return el("li", {}, el("span", { class: "id", text: "#" + j.nodeId }), el("span", { class: "t" }, document.createTextNode(j.title || "(title not in the frontier read)"), el("span", { class: "reason", text: jobTime(j.startedAt) })),
-    tags(...jobTags(j), waiting ? mergeButton(waiting, "Merge now") : null, waiting && waiting.pr ? link(waiting.pr.url, "Open PR") : null),
+    tags(...jobTags(j), waiting ? mergeButton(waiting, "Merge now") : null, waiting && waiting.pr ? link(waiting.pr.url, openText(waiting)) : null),
     last ? el("pre", { class: last.err ? "err" : "", text: last.text }) : null);
   }))) };
  }));
@@ -984,7 +1111,12 @@ function renderNext(s) {
  const box = document.getElementById("next"); box.replaceChildren();
  for (const lane of ["visual", "headless"]) {
   const holder = s.gates.laneHolders[lane];
-  box.append(el("h3", { text: lane + " lane · " + (holder ? "held by #" + holder.nodeId + " (" + holder.repo + "#" + holder.root + ")" : "free") }));
+  const drained = lane === "visual" && s.gates.visualDrained ? " · DRAINED: no new implement claims on any visual map (ranger drain --lane visual --off)" : "";
+  box.append(el("h3", { text: lane + " lane · " + (holder ? "held by #" + holder.nodeId + " (" + holder.repo + "#" + holder.root + ")" : "free") + drained }));
+  // The visual lane drains as one switch; a visual map has no drain of its own.
+  if (lane === "visual") box.append(el("div", { class: "acts" }, drainButton(s.gates.visualDrained, { lane: "visual" }, "the visual lane: no new implement claims on any visual map")));
+  const q = laneQueue(s, lane);
+  if (q) box.append(q);
   box.append(...byRepo("next/" + lane, s.maps.filter((m) => m.lane === lane), (m) => m.repo, (m) => {
    const n = m.next;
    const queued = m.queued || [];
@@ -993,10 +1125,57 @@ function renderNext(s) {
     : null;
    const rest = queued.map((q, i) => el("li", {}, el("span", { class: "id", text: "#" + q.id }), el("span", { class: "t" }, link(q.url, q.title), el("span", { class: "reason", text: "then, " + ordinal(i + (n.nodeId ? 2 : 1)) + " in this map's queue" })), tags(tag(q.lane + " · " + q.kind), buildButton(s, m, q))));
    // With no head (cap spent, paused, vetoed), say why before the queue that waits.
-   const body = el("div", {}, head ? null : empty(n.reason), head || rest.length > 0 ? el("ul", {}, head, ...rest) : null);
-   return mapGroup("next/" + lane, m, "", (n.nodeId ? 1 : 0) + queued.length, mapMeta(m), body);
+   const mapDrained = (s.gates.drainedMaps || []).includes(m.key);
+   const drain = m.lane === "headless" && !m.servedOnly ? el("div", { class: "acts" }, drainButton(mapDrained, { key: m.key }, m.key + ": no new claims on this map")) : null;
+   const body = el("div", {}, drain, head ? null : empty(n.reason), head || rest.length > 0 ? el("ul", {}, head, ...rest) : null);
+   return mapGroup("next/" + lane, m, mapDrained ? " · DRAINED" : "", (n.nodeId ? 1 : 0) + queued.length, mapMeta(m), body);
   }));
  }
+}
+// A verb's exit for the status line, pointing at where its detail shows.
+// A null code is a verb that timed out or never started: it may have applied.
+function outcome(label, r, where) {
+ return label + (r.ok ? " ran." : r.code === null ? " did not finish (timed out or could not start): it may have applied, so check once the page reloads." : " failed (exit " + r.code + "): see " + where + ".");
+}
+// A verb run for the page (drain): its exit and stderr, shown on failure.
+async function pageVerb(path, body, label) {
+ document.getElementById("out").textContent = "";
+ try {
+  const r = await post(path, body);
+  say(outcome(label, r, "its error below"), !r.ok);
+  if (!r.ok) document.getElementById("out").textContent = r.stderr || "";
+ } catch (e) { say(label + " refused: " + e.message, true); }
+ load(); setTimeout(load, 3000);
+}
+function drainButton(drained, body, what) {
+ const cmd = "ranger drain " + (body.lane ? "--lane visual" : "--map " + body.key) + (drained ? " --off" : "");
+ return actionButton(drained ? "Undrain" : "Drain", cmd, true, async () => {
+  if (!confirm((drained ? "Lift the drain on " : "Drain ") + what + "?\\n\\nRuns " + cmd + ". Sweeps, the merge desk and queued resumes keep running either way.")) return;
+  await pageVerb("/api/drain", Object.assign({}, body, { off: drained }), cmd);
+ });
+}
+function cancelButton(n) {
+ return actionButton("Cancel", "ranger resume-node " + n.nodeId + " --map " + n.key + " --cancel", true, async () => {
+  if (!confirm("Cancel the queued resume of #" + n.nodeId + " (" + n.key + ")?")) return;
+  await act("cancel-resume", n, {});
+ });
+}
+// The lane's queued resumes, FIFO: the head starts before any frontier claim.
+function laneQueue(s, lane) {
+ const q = s.resumeQueue && s.resumeQueue[lane];
+ if (!q || q.entries.length === 0) return null;
+ return el("div", {}, el("span", { class: "reason", text: "Queued resumes, first in first out, ahead of any frontier claim:" }),
+  el("ul", {}, ...q.entries.map((e, i) => {
+   const head = q.head && q.head.repo === e.repo && q.head.nodeId === e.nodeId ? q.head : null;
+   const drop = (q.drops || []).find((d) => d.repo === e.repo && d.nodeId === e.nodeId);
+   const note = head ? head.reason : drop ? drop.reason : "";
+   const facts = ordinal(e.position) + " in the " + lane + " resume queue · " + e.key + " · queued " + ago(e.queuedAt) + (e.failedStarts ? " · " + e.failedStarts + " failed start(s)" : "") + (note ? " · " + note : "");
+   // A queued node may have no Needs-you card, so its last cancel shows here.
+   const last = results.get(e.key + "/" + e.nodeId);
+   return el("li", {}, el("span", { class: "id", text: "#" + e.nodeId }), el("span", { class: "t" }, link(e.url, e.title || "(title not in the frontier read)"), el("span", { class: "reason", text: facts })),
+    tags(tag(head && head.starts ? "next" : "queued"), cancelButton(e)),
+    last ? el("pre", { class: last.err ? "err" : "", text: last.text }) : null);
+  })));
 }
 // build-now's exit codes: 0 started, 3 claimed with no run-node (BUILD_NOW_NOT_STARTED), null still running.
 function buildOutcome(id, code) {
@@ -1061,8 +1240,9 @@ function prLifecycle(v) {
 }
 function prFacts(pr) {
  const v = pr.view;
- const parts = ["PR #" + pr.number];
- if (v) parts.push(prLifecycle(v), "head " + short(v.headSha), ...(v.ci === "not-read" ? [] : ["CI " + v.ci + (v.ciSource === "actions" ? " (Actions only)" : "")]));
+ const parts = [pr.label];
+ // A GitLab MR shows its merge state: anything but mergeable offers no tap.
+ if (v) parts.push(prLifecycle(v), ...(v.mergeState ? ["merge state " + v.mergeState + (v.mergeDetail ? " (" + v.mergeDetail + ")" : "")] : []), "head " + short(v.headSha), ...(v.ci === "not-read" ? [] : [(v.mergeState ? "pipeline " : "CI ") + v.ci + (v.ciSource === "actions" ? " (Actions only)" : "")]));
  if (pr.error) parts.push(v ? "stale, read " + ago(v.readAt) + "; the last refresh failed: " + pr.error : "the read failed: " + pr.error);
  else if (!v) parts.push("not read yet");
  return parts.join(" · ");
@@ -1088,11 +1268,23 @@ async function act(kind, n, extra) {
   const r = await post("/api/" + kind, Object.assign({ key: n.key, id: n.nodeId }, extra));
   const close = r.close ? "\\nclose (merge desk): exit " + (r.close.code === null ? "none" : r.close.code) + (r.close.stderr ? "\\n" + r.close.stderr : "") : "";
   results.set(id, { err: !r.ok || (r.close && !r.close.ok), text: kind + " #" + n.nodeId + ": exit " + (r.code === null ? "none" : r.code) + (r.stderr ? "\\n" + r.stderr : "") + close });
-  say(kind + " #" + n.nodeId + (!r.ok ? " failed: see its card." : r.close ? (r.close.ok ? " ran; the merge desk started its close." : " ran, but the merge desk failed: see its card.") : " ran."), !r.ok || (r.close && !r.close.ok));
+  const label = kind + " #" + n.nodeId;
+  say(!r.ok || !r.close ? outcome(label, r, "its card") : label + (r.close.ok ? " ran; the merge desk started its close." : " ran, but the merge desk failed: see its card."), !r.ok || (r.close && !r.close.ok));
  } catch (e) { results.set(id, { err: true, text: kind + " #" + n.nodeId + " refused: " + e.message }); say(e.message, true); }
  load(); setTimeout(load, 3000);
 }
+// GitHub cards keep "Merge" and "Open PR"; a GitLab card names its MR (node #132).
+const openText = (n) => n.forge === "gitlab" ? "Open " + n.pr.label : "Open PR";
+function mrMergeButton(n) {
+ const merge = n.actions.merge;
+ const gated = n.status === "awaiting-merge";
+ return actionButton("Merge " + n.pr.label, merge.offered ? "glab api PUT the MR's merge, squash, pinned to " + short(merge.headSha) + ", under your glab login (machine-account tokens and GLAB_CONFIG_DIR stripped; the account is not checked); the pipeline is re-read under that login first and must be green; then the map's merge desk" + (gated ? "; refused unless the merge desk's gate (pipeline, sage review, probes at the head) passes" : "") : merge.why, merge.offered, async () => {
+  if (!confirm("Squash-merge " + n.pr.label + " on " + n.repo + " at head " + merge.headSha + "?\\n\\n" + (gated ? "The merge desk's gate is checked first (pipeline, merge state, sage review and probes at this head); the merge is refused unless it passes. " : "This is an override: only the pipeline and the merge state are checked, not the review or probes. ") + "It runs under your glab login: the machine account's GitLab tokens and GLAB_CONFIG_DIR are stripped, but the account itself is not checked. The pipeline at this head is re-read under that login first, and the merge is refused unless it is green. " + (n.status === "failed" ? "The merge desk watches only parked and awaiting-merge rows, so Resume it afterwards to run the close." : "Then the map's merge desk runs at once and starts the close; check that the node closed (a failed spawn or a refused close leaves it open)."))) return;
+  await act("merge", n, { sha: merge.headSha });
+ });
+}
 function mergeButton(n, text) {
+ if (n.forge === "gitlab" && n.pr) return mrMergeButton(n);
  const merge = n.actions.merge;
  return actionButton(text, merge.offered ? "gh pr merge --squash, pinned to " + short(merge.headSha) + ", under gh's configured login (machine-account tokens stripped; the account is not checked), then the map's merge desk" + (n.status === "awaiting-merge" ? "; refused unless the merge desk's gate (CI, sage review, probes at the head) passes" : "") : merge.why, merge.offered, async () => {
   if (!confirm("Squash-merge PR #" + n.pr.number + " on " + n.repo + " at head " + merge.headSha + "?\\n\\n" + (n.status === "awaiting-merge" ? "The merge desk's gate is checked first (CI, mergeable, base, sage review and probes at this head); the merge is refused unless it passes. " : "This is an override: only CI and mergeability are checked, not the review or probes. ") + "It runs under gh's configured login: the machine account's GH_TOKEN, GITHUB_TOKEN and GH_CONFIG_DIR are stripped, but the account itself is not checked. " + (n.status === "failed" ? "The merge desk watches only parked and awaiting-merge rows, so Resume it afterwards to run the close." : "Then the map's merge desk runs at once and starts the close; check that the node closed (a failed spawn or a refused close leaves it open)."))) return;
@@ -1108,10 +1300,16 @@ function needsCard(n) {
   acts.append(actionButton("Resume", "ranger resume-node " + n.nodeId + " --map " + n.key, true, () => act("resume", n, { force: force.checked })));
   acts.append(el("label", {}, force, document.createTextNode(" run beside the lane holder")));
  }
+ if (n.queued) acts.append(tag(ordinal(n.queued.position) + " in the " + n.queued.lane + " resume queue"));
+ if (n.actions.cancelResume) acts.append(cancelButton(n));
+ else if (n.actions.resume) {
+  const qr = n.actions.queueResume;
+  acts.append(actionButton("Queue resume", qr.offered ? "ranger resume-node " + n.nodeId + " --map " + n.key + " --when-free" : qr.why, qr.offered, () => act("queue-resume", n, {})));
+ }
  acts.append(mergeButton(n, "Merge"));
  const session = n.actions.session;
  acts.append(actionButton("Open session", session.offered ? "Open iTerm2 in " + session.cwd + " and start claude on #" + n.nodeId : session.why, session.offered, () => act("session", n, {})));
- if (n.pr) acts.append(link(n.pr.url, "Open PR"));
+ if (n.pr) acts.append(link(n.pr.url, openText(n)));
  const last = results.get(id);
  return el("div", { class: "card" },
   el("div", {}, el("span", { class: "id", text: "#" + n.nodeId + " " }), link(n.url, n.title || "(title not read yet)"), document.createTextNode(" "), el("span", { class: "tag stale", text: n.reason.class })),
@@ -1201,7 +1399,9 @@ load(); setInterval(load, 15000);
  *   (`/repos/{repo}/issues/{id}`), a separate bucket from GraphQL;
  * - the "Needs you" issues and PRs (node #54) are REST too, read on every
  *   refresh whatever the frontier's backoff, with the read-only gate run once
- *   per repo per batch (`tokenBatch`).
+ *   per repo per batch (`tokenBatch`). On a GitLab map (node #132) the same
+ *   gate checks the `read_api` token, and issues, MRs and pipelines are read
+ *   with glab through the GitLab port's transport and rules.
  */
 export class ServeReader {
  extra = new Map<string, MapRead>();
@@ -1392,7 +1592,7 @@ export class ServeReader {
     continue;
    }
    const journal = Journal.openReadOnly(this.journalPath);
-   const cooling = journal === null ? null : activeCooldown(journal, token.source, now);
+   const cooling = journal === null ? null : activeCooldown(journal, cooldownScope(map.repo, token.source), now);
    journal?.close();
    if (cooling !== null) {
     keep(`deferred: ${token.source} cooling down until ${cooling.until.toISOString()} (${cooling.reason})`);
@@ -1461,12 +1661,29 @@ interface IssueRead {
  autonomy: string | null;
 }
 
-/** One `gh api` GET under the read-only gate; null on any failure. */
-async function restRead(tokens: TokenBatch, repo: string, path: string, flags: string[] = []): Promise<unknown> {
+/**
+ * One REST GET under the read-only gate; null on any failure. `gh api` on
+ * GitHub; on GitLab, `glab api` under the gate's per-call GLAB_CONFIG_DIR
+ * with the checked `read_api` credential (`gitlabApiRead`), where `flags`
+ * (gh's pagination) have no meaning.
+ */
+async function restRead(
+ tokens: TokenBatch,
+ repo: string,
+ path: string,
+ flags: string[] = [],
+ runner: typeof runCmd = runCmd,
+): Promise<unknown> {
  const token = await tokens(repo);
+ if (!isGithubRepo(repo)) {
+  if (flags.length > 0) throw new Error(`gh flags on a GitLab read: ${flags.join(" ")}`);
+  const result = await gitlabApiRead(repo, token, path, runner);
+  const { status, body } = parseGlabResponse(result);
+  return result.code === 0 && status === 200 ? (body ?? null) : null;
+ }
  const gated = gatedEnv(token.token);
  try {
-  const result = await runCmd("gh", ["api", path, ...flags], { env: gated.env, timeoutMs: 15_000 });
+  const result = await runner("gh", ["api", path, ...flags], { env: gated.env, timeoutMs: 15_000 });
   if (result.code !== 0) return null;
   try {
    return JSON.parse(result.stdout) as unknown;
@@ -1481,14 +1698,17 @@ async function restRead(tokens: TokenBatch, repo: string, path: string, flags: s
 /**
  * A PR and the CI state of its head, over REST under the read-only gate: run
  * once for both reads, or once for a whole refresh batch when `tokens` is given.
+ * A GitLab MR is read through the GitLab port (`readMrLive`).
  */
 export async function readPrLive(
  config: RangerConfig,
  repo: string,
  number: number,
  tokens: TokenBatch = tokenBatch(config),
+ gitlab?: ForgeReadPort<ResolvedToken>,
 ): Promise<PrView | null> {
- if (!isGithubRepo(repo) || !Number.isInteger(number) || number <= 0) return null;
+ if (!Number.isInteger(number) || number <= 0) return null;
+ if (!isGithubRepo(repo)) return readMrLive(repo, number, tokens, gitlab);
  const raw = (await restRead(tokens, repo, `repos/${repo}/pulls/${number}`)) as Record<string, unknown> | null;
  if (raw === null) return null;
  const head = (raw.head ?? {}) as { sha?: unknown };
@@ -1517,7 +1737,7 @@ export async function readPrLive(
  }
  return {
   number,
-  url: typeof raw.html_url === "string" ? raw.html_url : `https://github.com/${repo}/pull/${number}`,
+  url: changeRequestUrl(repo, number, typeof raw.html_url === "string" ? raw.html_url : undefined),
   state: raw.state === "closed" ? "closed" : "open",
   merged: raw.merged === true,
   draft: raw.draft === true,
@@ -1529,16 +1749,115 @@ export async function readPrLive(
  };
 }
 
+/** The node's current worker log file, by the journal's row, or null with no row. */
+function workerLogOf(config: RangerConfig, repo: string, nodeId: string): string | null {
+ const journalPath = expandHome(config.state.journalPath);
+ const journal = Journal.openReadOnly(journalPath, config.maps);
+ if (journal === null) return null;
+ try {
+  const row = journal.getWorker(nodeId, repo);
+  return row === null ? null : workerLogFile(journalPath, repo, nodeId, row.generation);
+ } finally {
+  journal.close();
+ }
+}
+
+/**
+ * How many commits the PR's head is behind its base branch (ranger issue
+ * #229), by GitHub's compare under the read gate. Null on GitLab or on any
+ * failed read: the session prompt then leaves the line out.
+ */
+export async function readBehindBase(
+ config: RangerConfig,
+ repo: string,
+ number: number,
+ tokens: TokenBatch = tokenBatch(config),
+): Promise<BehindBase | null> {
+ if (!Number.isInteger(number) || number <= 0 || !isGithubRepo(repo)) return null;
+ const pr = (await restRead(tokens, repo, `repos/${repo}/pulls/${number}`)) as Record<string, unknown> | null;
+ const base = (pr?.base ?? {}) as { ref?: unknown };
+ const head = (pr?.head ?? {}) as { sha?: unknown };
+ if (typeof base.ref !== "string" || !/^[\w./-]+$/.test(base.ref)) return null;
+ if (typeof head.sha !== "string" || !/^[0-9a-f]{40}$/.test(head.sha)) return null;
+ const compare = (await restRead(
+  tokens,
+  repo,
+  `repos/${repo}/compare/${encodeURIComponent(base.ref)}...${head.sha}?per_page=1`,
+ )) as { behind_by?: unknown } | null;
+ const behind = compare?.behind_by;
+ return typeof behind === "number" && Number.isInteger(behind) && behind >= 0 ? { base: base.ref, behind } : null;
+}
+
+/** The dashboard's CI word for a port verdict. */
+const ciOfVerdict = (verdict: CiVerdict): PrView["ci"] =>
+ verdict.state === "green" ? "green" : verdict.state === "red" ? "failed" : "pending";
+
+/**
+ * A GitLab MR, its merge state and the pipeline verdict at its head, through
+ * the GitLab port under the read gate (node #132): the token the batch's
+ * gate checked for this project, never a glab login. A closed or merged MR
+ * offers nothing its pipeline could gate, so that is not read; a failed
+ * pipeline read is `unreadable`, never green. A failed MR read throws, with
+ * the port's reason.
+ */
+export async function readMrLive(
+ repo: string,
+ number: number,
+ tokens: TokenBatch,
+ port: ForgeReadPort<ResolvedToken> = new GitLabReadPort(),
+): Promise<PrView> {
+ const token = await tokens(repo);
+ const mr = await port.getPr(repo, number, token);
+ const terminal = mr.state !== "open";
+ let ci: PrView["ci"] = "not-read";
+ if (!terminal) {
+  try {
+   ci = ciOfVerdict(await port.ciVerdictFor(repo, mr.headSha, token, "merge"));
+  } catch {
+   ci = "unreadable";
+  }
+ }
+ return {
+  number,
+  url: changeRequestUrl(repo, number, mr.webUrl),
+  state: mr.state === "open" ? "open" : "closed",
+  merged: mr.state === "merged",
+  draft: mr.draft,
+  headSha: mr.headSha,
+  mergeable: mr.mergeState === "mergeable" ? true : mr.mergeState === "pending" ? null : false,
+  mergeState: mr.mergeState,
+  ...(mr.mergeDetail === undefined ? {} : { mergeDetail: mr.mergeDetail }),
+  ...(mr.mergeInProgress ? { merging: true as const } : {}),
+  ci,
+  readAt: new Date().toISOString(),
+ };
+}
+
 /**
  * Every check run on `sha`, read with `gh` under `env`: the merge's own
  * environment, so whatever account `gh` has stored under HOME (the
  * principal's, on this machine), with the machine account's credentials
- * removed. Classified like the merge gate does. Null when the read fails or
- * comes back malformed.
+ * removed. Classified like the merge gate does. On GitLab, the pipeline
+ * verdict read with `glab` the same way. Null when the read fails or comes
+ * back malformed.
  */
-async function verifyChecksAs(repo: string, sha: string, env: Record<string, string>): Promise<PrView["ci"] | null> {
- if (!isGithubRepo(repo) || !/^[0-9a-f]{40}$/.test(sha)) return null;
- const result = await runCmd(
+export async function verifyChecksAs(
+ repo: string,
+ sha: string,
+ env: Record<string, string>,
+ runner: typeof runCmd = runCmd,
+): Promise<PrView["ci"] | null> {
+ if (!/^[0-9a-f]{40}$/.test(sha)) return null;
+ if (!isGithubRepo(repo)) {
+  // GitLab: the pipeline verdict, by the port's own rules, under the glab
+  // login `env` leads to (the principal's: the merge's environment).
+  try {
+   return ciOfVerdict(await gitlabLoginCiVerdict(repo, sha, env, runner));
+  } catch {
+   return null;
+  }
+ }
+ const result = await runner(
   "gh",
   ["api", `repos/${repo}/commits/${sha}/check-runs?filter=latest&per_page=100`, "--paginate", "--slurp"],
   { env, timeoutMs: 15_000 },
@@ -1554,22 +1873,40 @@ async function verifyChecksAs(repo: string, sha: string, env: Record<string, str
  return checks === null ? null : ciState(checks);
 }
 
-/** One issue over REST under the read-only gate: no GraphQL. Null if unreadable. */
-async function readIssue(
+/**
+ * One issue over REST under the read-only gate: no GraphQL. Null if
+ * unreadable. A GitLab issue (`projects/:id/issues/:iid`) is read through
+ * the same gated transport and checked by the GitLab port's parser.
+ */
+export async function readIssue(
  config: RangerConfig,
  repo: string,
  id: string,
  tokens: TokenBatch = tokenBatch(config),
+ runner: typeof runCmd = runCmd,
 ): Promise<IssueRead | null> {
- if (!isGithubRepo(repo) || !ID_PATTERN.test(id)) return null;
- const raw = (await restRead(tokens, repo, `repos/${repo}/issues/${id}`)) as {
-  title?: string;
-  state?: string;
-  assignees?: { login?: string }[];
-  labels?: ({ name?: string } | string)[];
-  body?: string | null;
- } | null;
- if (raw === null || typeof raw !== "object") return null;
+ if (!ID_PATTERN.test(id)) return null;
+ let raw: { title?: string; state?: string; assignees?: string[]; labels?: string[]; body?: string | null };
+ if (isGithubRepo(repo)) {
+  const gh = (await restRead(tokens, repo, `repos/${repo}/issues/${id}`, [], runner)) as {
+   title?: string;
+   state?: string;
+   assignees?: { login?: string }[];
+   labels?: ({ name?: string } | string)[];
+   body?: string | null;
+  } | null;
+  if (gh === null || typeof gh !== "object") return null;
+  raw = {
+   ...gh,
+   assignees: (gh.assignees ?? []).map((a) => a.login ?? ""),
+   labels: (gh.labels ?? []).map((l) => (typeof l === "string" ? l : (l.name ?? ""))),
+  };
+ } else {
+  const endpoint = gitlabIssueEndpoint(repo, Number(id));
+  const gl = await restRead(tokens, repo, endpoint, [], runner);
+  if (gl === null) return null;
+  raw = parseGitLabIssue(gl, Number(id), endpoint);
+ }
  // The node's kind is in its typed block, which the verbs write (#89-style
  // `soma:work-graph-node` JSON in an HTML comment).
  const block = /<!--\s*soma:work-graph-node\s*([\s\S]*?)-->/.exec(raw.body ?? "")?.[1];
@@ -1587,8 +1924,8 @@ async function readIssue(
  return {
   title: raw.title ?? "",
   state: raw.state ?? "unknown",
-  assignees: (raw.assignees ?? []).map((a) => a.login ?? "").filter(Boolean),
-  labels: (raw.labels ?? []).map((l) => (typeof l === "string" ? l : (l.name ?? ""))).filter(Boolean),
+  assignees: (raw.assignees ?? []).filter(Boolean),
+  labels: (raw.labels ?? []).filter(Boolean),
   kind,
   autonomy,
  };
@@ -1631,7 +1968,7 @@ export function stateFromJournal(
        }
      : {
         ok: true,
-        frontier: classifyFrontier(cached.frontier.frontier, map, registry, config.bot.identity),
+        frontier: classifyFrontier(cached.frontier.frontier, map, registry, config.bot.identity, cached.briefs),
         readAt: cached.fetchedAt,
         source: "ranger",
        },
@@ -1639,7 +1976,11 @@ export function stateFromJournal(
   }
   const vetoed = journal?.listVetoes() ?? new Set<string>();
   const workers = journal?.listWorkers() ?? [];
+  const resumeQueue = journal?.listResumeQueue() ?? [];
+  const laneHolders = { visual: journal?.laneHolder("visual") ?? null, headless: journal?.laneHolder("headless") ?? null };
   const entryInputs: Parameters<typeof needsYouEntries>[0] = {
+   resumeQueue,
+   laneHolders,
    maps,
    workers,
    events: (repo, nodeId) => journal?.listNodeEvents(repo, nodeId) ?? [],
@@ -1684,8 +2025,10 @@ export function stateFromJournal(
    needsYouUnchecked,
    awaitingMerge,
    lastImplementMaps: lastImplementMaps(journal),
-   laneHolders: { visual: journal?.laneHolder("visual") ?? null, headless: journal?.laneHolder("headless") ?? null },
+   laneHolders,
+   resumeQueue,
    paused: journal?.isPaused() ?? false,
+   drains: journal === null ? undefined : readDrains(journal, config.maps),
    spawnsToday: journal?.spawnsToday(now) ?? 0,
    spawnCap: config.workers.spawnCapPerDay,
    vetoed: (id) => vetoed.has(id),
@@ -1863,6 +2206,8 @@ export function startServe(opts: {
    readPr: (repo, pr) => readPrLive(opts.config, repo, pr),
    verifyChecks: verifyChecksAs,
    exists: existsSync,
+   workerLog: (repo, nodeId) => workerLogOf(opts.config, repo, nodeId),
+   behindBase: (repo, pr) => readBehindBase(opts.config, repo, pr),
    after: (entry) => {
     reader.forget(nodeKey(entry.repo, entry.nodeId), entry.pr === null ? null : nodeKey(entry.repo, entry.pr.number));
     void reader.refreshDetails();

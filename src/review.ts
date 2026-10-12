@@ -1,4 +1,5 @@
 import { nodeKey } from "./forge-ref.ts";
+import { changeRequestRef } from "./forge-text.ts";
 import type { SubstrateName } from "./store/schema.ts";
 import { runReadRetryingTransient } from "./transient.ts";
 import { gatedEnv } from "./token-gate.ts";
@@ -41,9 +42,15 @@ export async function sageReview(
  repo: string,
  prNumber: number,
  readOnlyToken: string,
- opts: { command?: string; timeoutMs?: number; substrate?: SubstrateName; nice?: number } = {},
+ opts: { command?: string; timeoutMs?: number; substrate?: SubstrateName; nice?: number; reviewAuthor?: string } = {},
 ): Promise<ReviewVerdict> {
- const gated = gatedEnv(readOnlyToken, {}, workerHostEnv());
+ // Ranger posts each round as a PR comment under its machine account, not as
+ // a review under the read-only token's login. Naming that account is what lets
+ // sage read its own earlier rounds back (sage#134): without it every
+ // round is a first round, so sage re-reviews the whole PR, re-raises what it
+ // already said, and never scopes a lens to the delta.
+ const extra = opts.reviewAuthor === undefined ? {} : { SAGE_REVIEW_AUTHOR_LOGIN: opts.reviewAuthor };
+ const gated = gatedEnv(readOnlyToken, extra, workerHostEnv());
  try {
   const args = ["review", nodeKey(repo, prNumber), "--emit-verdict-block"];
   // The cross-model choice. Checked against sage 0.2.12 (a4f12c9,
@@ -79,7 +86,7 @@ export async function sageReview(
    }
    if (verdict?.verdict === "changes-requested") return verdict;
    throw new ReviewError(
-    `sage review ${repo}#${prNumber} exited ${result.code}: ${(result.stderr || result.stdout).trim().slice(-400)}`,
+    `sage review ${repo}${changeRequestRef(repo, prNumber)} exited ${result.code}: ${(result.stderr || result.stdout).trim().slice(-400)}`,
    );
   }
   return parseVerdictBlock(result.stdout);

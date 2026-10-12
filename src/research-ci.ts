@@ -1,6 +1,7 @@
 import * as githubApi from "./github.ts";
 import type { ChangeRequest, ForgePort, CiVerdict } from "./forge.ts";
 import { ParkSignal } from "./signals.ts";
+import { changeRequestLabel, changeRequestNoun } from "./forge-text.ts";
 import { GitSafetyError, safeGit } from "./git-ops.ts";
 
 export type ResearchForgePort = Pick<ForgePort,
@@ -61,12 +62,12 @@ export async function researchCi(opts: {
  let previousSnapshot: string | null = null;
  let pollMs = opts.pollMs ?? 10_000;
  const isOurDraft = (p: ChangeRequest) => p.state === "open" && p.draft && p.headRef === opts.branch && p.baseRef === opts.base;
- let reason = "PR head has not caught up to the findings push";
+ let reason = `${changeRequestNoun(opts.repo)} head has not caught up to the findings push`;
  for (;;) {
   opts.fence("read research CI");
   const live = await github.getPr(opts.repo, pr.iid, opts.token);
   if (!isOurDraft(live)) {
-   throw new ParkSignal(`research PR #${pr.iid} must remain an open draft for ${opts.branch} against ${opts.base}`);
+   throw new ParkSignal(`research ${changeRequestLabel(opts.repo, pr.iid)} must remain an open draft for ${opts.branch} against ${opts.base}`);
   }
   if (live.headSha === opts.sha) {
    const state = await github.ciVerdictFor(opts.repo, opts.sha, opts.token, "research");
@@ -82,9 +83,9 @@ export async function researchCi(opts: {
      opts.fence("confirm research head");
      const final = await github.getPr(opts.repo, pr.iid, opts.token);
      if (final.headSha !== opts.sha || !isOurDraft(final)) {
-      throw new ParkSignal(`research PR #${pr.iid} changed while checking CI — refusing stale evidence`);
+      throw new ParkSignal(`research ${changeRequestLabel(opts.repo, pr.iid)} changed while checking CI — refusing stale evidence`);
      }
-     if (clock.now() > deadline) throw new ParkSignal(`research CI wait expired for PR #${pr.iid}: final head confirmation`);
+     if (clock.now() > deadline) throw new ParkSignal(`research CI wait expired for ${changeRequestLabel(opts.repo, pr.iid)}: final head confirmation`);
      return { pr: final, ci: `${state.runId}@${opts.sha}`, check: state };
     }
     reason = "completed CI snapshot still settling";
@@ -94,10 +95,10 @@ export async function researchCi(opts: {
    }
   } else {
    previousSnapshot = null;
-   reason = "PR head has not caught up to the findings push";
+   reason = `${changeRequestNoun(opts.repo)} head has not caught up to the findings push`;
   }
   const remaining = deadline - clock.now();
-  if (remaining <= 0) throw new ParkSignal(`research CI wait expired for PR #${pr.iid}: ${reason}`);
+  if (remaining <= 0) throw new ParkSignal(`research CI wait expired for ${changeRequestLabel(opts.repo, pr.iid)}: ${reason}`);
   const settlingRemaining = previousSnapshot === null ? remaining : settleMs - (clock.now() - settledSince);
   await clock.sleep(Math.min(pollMs, remaining, settlingRemaining));
   if (previousSnapshot === null) pollMs = Math.min(pollMs * 2, 60_000);

@@ -265,7 +265,7 @@ describe("twice-confirmed base-red cache (node #151)", () => {
  test("cached provenance survives PR marker round trip and is visible in the note", () => {
   const record = { sha, passed: true, selected: "1", mode: "semantic", baseRed: [HUD], baseRedCache: { sha, probes: [HUD] } };
   expect(recordedProbes([{ id: 1, author: "ivy-agent", body: probeMarker(record) }], "ivy-agent")).toEqual([record]);
-  expect(baseRedNote(record)).toContain(`Base result from cache at ${sha.slice(0, 8)}: ${HUD}`);
+  expect(baseRedNote("acme/widgets", record)).toContain(`Base result from cache at ${sha.slice(0, 8)}: ${HUD}`);
  });
 
  test("unconfirmed base evidence survives PR marker round trip alongside cached evidence", () => {
@@ -274,8 +274,8 @@ describe("twice-confirmed base-red cache (node #151)", () => {
    baseRedCache: { sha, probes: [HUD] }, baseRedUnconfirmed: { sha, probes: [WEAPON], exit: 0 },
   };
   expect(recordedProbes([{ id: 1, author: "ivy-agent", body: probeMarker(record) }], "ivy-agent")).toEqual([record]);
-  expect(baseRedNote(record)).toContain("inheritance uses the first base comparison or confirmed cache");
-  expect(baseRedNote(record)).toContain(`Base confirmation at ${sha.slice(0, 8)} passed: ${WEAPON}`);
-  expect(baseRedNote(record)).toContain("No cache written for these probes; this PR uses the first base comparison.");
+  expect(baseRedNote("acme/widgets", record)).toContain("inheritance uses the first base comparison or confirmed cache");
+  expect(baseRedNote("acme/widgets", record)).toContain(`Base confirmation at ${sha.slice(0, 8)} passed: ${WEAPON}`);
+  expect(baseRedNote("acme/widgets", record)).toContain("No cache written for these probes; this PR uses the first base comparison.");
  });
 });

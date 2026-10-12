@@ -1,4 +1,6 @@
-import { isGithubRepo, nodeKey } from "./forge-ref.ts";
+import { isGithubRepo, nodeKey, parseForgeRef } from "./forge-ref.ts";
+import { changeRequestLabel, changeRequestNoun, changeRequestUrl, nodeUrl } from "./forge-text.ts";
+import type { MergeState } from "./forge.ts";
 /**
  * `ranger serve`'s "Needs you" section (node #54): every journal worker row
  * that ended parked or failed, and every awaiting-merge row labelled
@@ -11,17 +13,22 @@ import { isGithubRepo, nodeKey } from "./forge-ref.ts";
  *
  * **Actions stay out of process.** Nothing here writes the journal or the
  * graph: a resume spawns the existing `ranger resume-node` verb, a merge runs
- * `gh` with the machine account's token and config dropped, so gh uses the
- * login stored under this user's HOME (the principal's, on the principal's
- * machine; nothing here checks which account that is), and a session opens
+ * `gh` (`glab api` on a GitLab map, node #132) with the machine account's
+ * tokens and config dropped, so the CLI uses the login stored under this
+ * user's HOME (the principal's, on the principal's machine; nothing here
+ * checks which account that is), and a session opens
  * iTerm2 the way the grilling button does, in the map's `localCheckout` only:
- * the worker's worktree belongs to the machine-account clone. Every action is re-checked against the journal as it
+ * the worker's worktree belongs to the machine-account clone. A queued resume
+ * and its cancel run `ranger resume-node --when-free` / `--cancel` (node
+ * #166); the drain lives in serve-drain.ts. Every action is re-checked against the journal as it
  * reads when the request arrives, and the spawner is injected so no test runs
  * `gh`, `osascript` or ranger.
  */
 import { classifyGithubCheckRuns } from "./github-ci.ts";
 import { REPO_PATTERN } from "./config.ts";
-import type { EventRow, WorkerRow } from "./journal.ts";
+import type { EventRow, ResumeQueueRow, WorkerRow } from "./journal.ts";
+import { startsImplementSession, type ImplementLane } from "./lanes.ts";
+import { whenFreeQueues } from "./resume.ts";
 import { childEnv, itermArgv, shellQuote } from "./launch.ts";
 import {
  CRASH_PARK_OUTCOME,
@@ -216,7 +223,7 @@ export function classifyReason(
 
 // ---- the entries ----
 
-/** A PR as the dashboard last read it (REST, under the read-only gate). */
+/** A PR or MR as the dashboard last read it (REST, under the read-only gate). */
 export interface PrView {
  number: number;
  url: string;
@@ -224,8 +231,13 @@ export interface PrView {
  merged: boolean;
  draft: boolean;
  headSha: string;
- /** GitHub's mergeability; null while it is still computing. */
+ /** GitHub's mergeability; null while it is still computing. On GitLab, read off `mergeState`. */
  mergeable: boolean | null;
+ /** GitLab only: the port's merge state, and GitLab's own word for it. Absent on GitHub. */
+ mergeState?: MergeState;
+ mergeDetail?: string;
+ /** GitLab only: the MR is `locked`, being merged right now. */
+ merging?: true;
  /**
   * Check runs on the head: none yet, still running, any failed, all passed
   * but none concluded success, green (all passed, at least one success),
@@ -290,9 +302,27 @@ export function workflowRunsFromPages(raw: unknown, sha: string): { status: stri
  return [...latest.values()].map(({ status, conclusion }) => ({ status, conclusion }));
 }
 
-/** Why a PR cannot be merged from the dashboard, or null when it can. */
-export function mergeRefusal(pr: PrView | null): string | null {
- if (pr === null) return "the PR has not been read yet";
+/** Why GitLab's merge state offers no tap, or null when it is `mergeable`. */
+function mergeStateRefusal(state: MergeState, detail: string | undefined): string | null {
+ const said = detail === undefined ? "" : ` (${detail})`;
+ switch (state) {
+  case "mergeable": return null;
+  case "needs-rebase": return `GitLab needs the MR rebased onto its target${said}: the merge desk rebases it, not the dashboard`;
+  case "conflict": return `the MR conflicts with its target${said}: the merge desk sends it back for a base merge and a new review round`;
+  case "blocked": return `GitLab blocks the merge${said}`;
+  case "pending": return `GitLab is still checking whether the MR can merge${said}`;
+  case "unknown": return `GitLab's merge status is unknown${said}`;
+ }
+}
+
+/**
+ * Why a PR (an MR on GitLab) cannot be merged from the dashboard, or null
+ * when it can. `noun` names an unread one; a read GitLab MR carries its
+ * merge state and says MR itself.
+ */
+export function mergeRefusal(pr: PrView | null, noun: "PR" | "MR" = "PR"): string | null {
+ if (pr === null) return `the ${noun} has not been read yet`;
+ if (pr.mergeState !== undefined) return mrRefusal(pr, pr.mergeState);
  if (pr.merged) return "the PR is already merged";
  if (pr.state !== "open") return "the PR is closed";
  if (pr.draft) return "the PR is a draft: mark it ready first";
@@ -308,10 +338,29 @@ export function mergeRefusal(pr: PrView | null): string | null {
  return null;
 }
 
+/** `mergeRefusal` for a GitLab MR: any merge state but `mergeable` offers no tap. */
+function mrRefusal(mr: PrView, state: MergeState): string | null {
+ if (mr.merged) return "the MR is already merged";
+ if (mr.merging) return "GitLab is merging the MR now";
+ if (mr.state !== "open") return "the MR is closed";
+ if (mr.draft) return "the MR is a draft: mark it ready first";
+ const held = mergeStateRefusal(state, mr.mergeDetail);
+ if (held !== null) return held;
+ if (!SHA_PATTERN.test(mr.headSha)) return "the MR head is unknown";
+ if (mr.ci === "unreadable") return "the pipeline could not be read";
+ if (mr.ci !== "green") return `the pipeline is ${mr.ci}`;
+ return null;
+}
+
+/** The GitLab merge states the merge desk acts on: a send-back, or a rebase. */
+export const DESK_MERGE_STATES: readonly MergeState[] = ["conflict", "needs-rebase"];
+
 export interface NeedsYouMap {
  key: string;
  repo: string;
  root: number;
+ /** The map's implement lane; unset offers no queued resume. */
+ lane?: ImplementLane;
  localCheckout?: string;
 }
 
@@ -326,8 +375,13 @@ export interface NeedsYouEntry {
  status: "parked" | "failed" | "awaiting-merge";
  endedAt: string | null;
  reason: Reason;
- /** `error`: the last failed read of the PR, while `view` is unread. */
- pr: { number: number; url: string; view: PrView | null; error: string | null } | null;
+ /**
+  * `error`: the last failed read of the PR, while `view` is unread.
+  * `label` names it in its forge's words, "PR #N" or "MR !N" (node #132).
+  */
+ pr: { number: number; url: string; label: string; noun: "PR" | "MR"; view: PrView | null; error: string | null } | null;
+ /** The map's forge: the page words a GitLab card's merge and link by it. */
+ forge: "github" | "gitlab";
  sage: SageRound | null;
  /**
   * Whether the last sage round read the PR's current head: false when the
@@ -336,10 +390,16 @@ export interface NeedsYouEntry {
   */
  sageOnHead: boolean | null;
  probe: ProbeResult | null;
+ /** Its place in its lane's resume queue (node #166), 1 = the head; null when not queued. */
+ queued: { lane: ImplementLane; position: number } | null;
  actions: {
   resume: boolean;
   merge: { offered: true; headSha: string } | { offered: false; why: string };
   session: { offered: true; cwd: string } | { offered: false; why: string };
+  /** `resume-node --when-free`: offered only where that verb would queue rather than start. */
+  queueResume: { offered: true } | { offered: false; why: string };
+  /** `resume-node --cancel`: offered while the node is queued. */
+  cancelResume: boolean;
  };
 }
 
@@ -356,6 +416,83 @@ export interface NeedsYouInputs {
  titleOf: (repo: string, nodeId: string) => string | null;
  reviewRounds: number;
  exists: (path: string) => boolean;
+ /** The journal's resume queue, every lane, FIFO (node #166); absent means empty. */
+ resumeQueue?: ResumeQueueRow[];
+ /** Each implement lane's holder now; absent means both are free. */
+ laneHolders?: Partial<Record<ImplementLane, { repo: string; nodeId: string } | null>>;
+}
+
+/** One queued resume as the dashboard shows it, at its FIFO place in its lane. */
+export interface QueuedResumeView {
+ /** The map's `owner/name#root`. */
+ key: string;
+ repo: string;
+ root: number;
+ nodeId: string;
+ title: string | null;
+ url: string;
+ lane: ImplementLane;
+ /** 1 = the lane's head. */
+ position: number;
+ queuedAt: string;
+ failedStarts: number;
+}
+
+/** The resume queue per lane, each in FIFO order (the journal lists it by id). */
+export function resumeQueueViews(
+ queue: ResumeQueueRow[],
+ titleOf: (repo: string, nodeId: string) => string | null,
+): Record<ImplementLane, QueuedResumeView[]> {
+ const out: Record<ImplementLane, QueuedResumeView[]> = { visual: [], headless: [] };
+ for (const e of queue) {
+  out[e.lane].push({
+   key: nodeKey(e.repo, e.root),
+   repo: e.repo,
+   root: e.root,
+   nodeId: e.nodeId,
+   title: titleOf(e.repo, e.nodeId),
+   url: nodeUrl(e.repo, e.nodeId),
+   lane: e.lane,
+   position: out[e.lane].length + 1,
+   queuedAt: e.queuedAt,
+   failedStarts: e.failedStarts,
+  });
+ }
+ return out;
+}
+
+/**
+ * Whether `resume-node --when-free` would queue this row, by the verb's own
+ * `whenFreeQueues`. Anywhere else the verb starts the resume at once, so the
+ * button would be a Resume under another name.
+ */
+function queueOffer(
+ row: WorkerRow,
+ map: NeedsYouMap,
+ queued: boolean,
+ inputs: NeedsYouInputs,
+): NeedsYouEntry["actions"]["queueResume"] {
+ if (queued) return { offered: false, why: "already queued" };
+ if (map.lane === undefined) return { offered: false, why: "the map's implement lane is unknown" };
+ if (!startsImplementSession(row)) return { offered: false, why: "takes no implement lane: Resume starts it now" };
+ const holder = inputs.laneHolders?.[map.lane] ?? null;
+ const lane = {
+  // The verb's lane read leaves the node itself out.
+  held: holder !== null && !(holder.repo === row.repo && holder.nodeId === row.nodeId),
+  queued: false,
+  backlog: (inputs.resumeQueue ?? []).filter((e) => e.lane === map.lane).length,
+ };
+ if (!whenFreeQueues(row, lane)) return { offered: false, why: `the ${map.lane} lane is free: Resume starts it now` };
+ return { offered: true };
+}
+
+/** Each queued node's lane and FIFO place in it (1 = the head), by `repo#id`: the lane list's own places. */
+function queuePlaces(queue: ResumeQueueRow[]): Map<string, { lane: ImplementLane; position: number }> {
+ const places = new Map<string, { lane: ImplementLane; position: number }>();
+ for (const views of Object.values(resumeQueueViews(queue, () => null))) {
+  for (const v of views) places.set(nodeKey(v.repo, v.nodeId), { lane: v.lane, position: v.position });
+ }
+ return places;
 }
 
 /** The rows that wait on the principal, newest first. */
@@ -380,6 +517,7 @@ function rowEntries(
  include: (row: WorkerRow, labels: string[] | null) => boolean,
 ): NeedsYouEntry[] {
  const out: NeedsYouEntry[] = [];
+ const placeOf = queuePlaces(inputs.resumeQueue ?? []);
  for (const row of inputs.workers) {
   const map = inputs.maps.find((m) => m.repo === row.repo && m.root === row.root);
   if (map === undefined) continue;
@@ -389,18 +527,20 @@ function rowEntries(
   const events = inputs.events(row.repo, row.nodeId);
   const view = row.prNumber === null ? null : inputs.prs(row.repo, row.prNumber);
   const sage = lastSageRound(events);
-  const refused = row.prNumber === null ? "no PR" : mergeRefusal(view);
+  const noun = changeRequestNoun(row.repo);
+  const refused = row.prNumber === null ? `no ${noun}` : mergeRefusal(view, noun);
   // Only the principal's checkout, never the worker's worktree: that is a
   // worktree of the machine-account clone, whose files and git hooks the
   // worker controls (`servedMaps` refuses those clones for the same reason).
   const cwd = map.localCheckout !== undefined && inputs.exists(map.localCheckout) ? map.localCheckout : undefined;
+  const place = placeOf.get(nodeKey(row.repo, row.nodeId));
   out.push({
    key: map.key,
    repo: row.repo,
    root: row.root,
    nodeId: row.nodeId,
    title: inputs.titleOf(row.repo, row.nodeId),
-   url: `https://github.com/${row.repo}/issues/${row.nodeId}`,
+   url: nodeUrl(row.repo, row.nodeId),
    status: row.status as NeedsYouEntry["status"],
    endedAt: row.finishedAt,
    reason: classifyReason(row, events, labels, inputs.reviewRounds),
@@ -409,19 +549,25 @@ function rowEntries(
      ? null
      : {
         number: row.prNumber,
-        url: view?.url || `https://github.com/${row.repo}/pull/${row.prNumber}`,
+        url: changeRequestUrl(row.repo, row.prNumber, view?.url),
+        label: changeRequestLabel(row.repo, row.prNumber),
+        noun,
         view,
         error: inputs.prError?.(row.repo, row.prNumber) ?? null,
        },
+   forge: parseForgeRef(row.repo).forge,
    sage,
    sageOnHead: sage === null || view === null || view.headSha === "" ? null : view.headSha.startsWith(sage.sha),
    probe: lastProbe(events),
+   queued: place ?? null,
    actions: {
     resume: waiting,
+    queueResume: waiting ? queueOffer(row, map, place !== undefined, inputs) : { offered: false, why: `#${row.nodeId} is ${row.status}, not parked or failed` },
+    cancelResume: place !== undefined,
     merge:
      refused === null && view !== null
       ? { offered: true, headSha: view.headSha }
-      : { offered: false, why: refused ?? "no PR" },
+      : { offered: false, why: refused ?? `no ${noun}` },
     session:
      cwd === undefined
       ? {
@@ -457,7 +603,7 @@ export function uncheckedNeedsEye(inputs: Pick<NeedsYouInputs, "maps" | "workers
 
 // ---- the actions ----
 
-export type ActionKind = "resume" | "merge" | "session";
+export type ActionKind = "resume" | "merge" | "session" | "queue-resume" | "cancel-resume";
 
 export interface ActionResult {
  /** The child's exit code; null when it could not start or timed out. */
@@ -479,31 +625,50 @@ export type ActionRunner = (
  opts: { detached: boolean },
 ) => Promise<ActionResult>;
 
-/** Keys a merge must never carry: they would make gh act as the machine account. */
-export const MACHINE_GH_KEYS = ["GH_TOKEN", "GITHUB_TOKEN", "GH_CONFIG_DIR"] as const;
+/** Keys a human merge must never carry: machine credentials or forge overrides. */
+export { MACHINE_FORGE_KEYS } from "./forge-env.ts";
+import { MACHINE_FORGE_KEYS } from "./forge-env.ts";
+/** @deprecated Use MACHINE_FORGE_KEYS; this alias includes GitLab keys. */
+export const MACHINE_GH_KEYS = MACHINE_FORGE_KEYS;
 
 /**
  * The merge's environment: the launch allowlist, and none of the machine
- * account's gh keys, so `gh` uses the login stored under HOME. What this
+ * account's forge keys, so the CLI uses the login stored under HOME. What this
  * proves is the absence of the machine account's credential, not whose login
  * HOME holds.
  */
 export function mergeEnv(env: Record<string, string | undefined>): Record<string, string> {
  const out = childEnv(env);
- for (const key of MACHINE_GH_KEYS) delete out[key];
+ for (const key of MACHINE_FORGE_KEYS) delete out[key];
  return out;
 }
 
-/** `gh pr merge`, squash, pinned to the head the principal confirmed. */
+/**
+ * `gh pr merge`, squash, pinned to the head the principal confirmed. On
+ * GitLab, the merge endpoint under the principal's glab login (ranger issue
+ * #97 ruling Q6), squashed and pinned the same way: `sha` makes GitLab refuse
+ * a head that moved.
+ */
 export function mergeArgv(args: { repo: string; pr: number; sha: string }): string[] {
  if (!REPO_PATTERN.test(args.repo)) throw new Error(`bad repo: ${args.repo}`);
- if (!isGithubRepo(args.repo)) throw new Error(`GitLab merge is not implemented: ${args.repo}`);
  if (!Number.isInteger(args.pr) || args.pr <= 0) throw new Error(`bad PR: ${args.pr}`);
  if (!SHA_PATTERN.test(args.sha)) throw new Error(`bad head SHA: ${args.sha}`);
+ if (!isGithubRepo(args.repo)) {
+  const ref = parseForgeRef(args.repo);
+  return [
+   "glab", "api", "--hostname", ref.host, "-X", "PUT",
+   `projects/${encodeURIComponent(ref.path)}/merge_requests/${args.pr}/merge`,
+   "-f", "squash=true", "-f", `sha=${args.sha}`,
+  ];
+ }
  return ["gh", "pr", "merge", String(args.pr), "--repo", args.repo, "--squash", "--match-head-commit", args.sha];
 }
 
-/** `ranger resume-node`, the operator verb: it resets the row and detaches run-node itself. */
+/**
+ * `ranger resume-node`, the operator verb: it resets the row and detaches
+ * run-node itself. `queue` makes it `--when-free` (queue while the lane is
+ * held) or `--cancel` (drop the queued entry), node #166.
+ */
 export function resumeArgv(args: {
  rangerBin: string;
  configPath: string;
@@ -511,10 +676,12 @@ export function resumeArgv(args: {
  root: number;
  nodeId: string;
  force: boolean;
+ queue?: "when-free" | "cancel";
 }): string[] {
  if (!REPO_PATTERN.test(args.repo)) throw new Error(`bad repo: ${args.repo}`);
  if (!ID_PATTERN.test(args.nodeId)) throw new Error(`bad node id: ${args.nodeId}`);
  if (!Number.isInteger(args.root) || args.root <= 0) throw new Error(`bad root: ${args.root}`);
+ if (args.force && args.queue !== undefined) throw new Error(`--force and --${args.queue} are mutually exclusive`);
  return [
   args.rangerBin,
   "resume-node",
@@ -524,6 +691,7 @@ export function resumeArgv(args: {
   "-c",
   args.configPath,
   ...(args.force ? ["--force"] : []),
+  ...(args.queue === undefined ? [] : [`--${args.queue}`]),
  ];
 }
 
@@ -551,23 +719,44 @@ export function deskArgv(args: { rangerBin: string; configPath: string; repo: st
  return [args.rangerBin, "merge-desk", "--map", `${args.repo}#${args.root}`, ...(args.settle ? ["--settle"] : []), "-c", args.configPath];
 }
 
+/** How far a PR's head is behind its base branch, as a compare read it. */
+export interface BehindBase {
+ base: string;
+ behind: number;
+}
+
 /**
  * The session the principal opens on a parked node. The prompt carries the
- * repo, the id and the reason class only: the session reads the node, the
- * PR and the journal itself.
+ * repo, the id, the reason ranger built from its own numbers, and where the
+ * rest is: a journal command that runs from the session's checkout (it
+ * names the config, ranger issue #229), the worker's log, and how far the
+ * PR is behind its base. Never the node's title or the PR's prose: the
+ * session reads those itself.
  */
 export function sessionPlan(args: {
  repo: string;
  nodeId: string;
- reason: ReasonClass;
+ reason: Pick<Reason, "class" | "detail">;
  cwd: string;
+ configPath?: string;
+ workerLog?: string | null;
+ behind?: BehindBase | null;
 }): { prompt: string; shellCommand: string; argv: string[] } {
  if (!REPO_PATTERN.test(args.repo)) throw new Error(`bad repo: ${args.repo}`);
  if (!ID_PATTERN.test(args.nodeId)) throw new Error(`bad node id: ${args.nodeId}`);
+ const detail = args.reason.detail.replace(/\s+/g, " ").trim().slice(0, 300);
+ const config = args.configPath === undefined ? "" : ` -c ${shellQuote(args.configPath)}`;
+ const facts = [
+  args.workerLog == null ? null : `The worker's log is ${args.workerLog}.`,
+  args.behind == null ? null : `The PR branch is ${args.behind.behind} commit(s) behind ${args.behind.base}.`,
+ ].filter((f) => f !== null);
  const prompt =
-  `Node #${args.nodeId} on ${args.repo} stopped and needs me (ranger's reason: ${args.reason}). ` +
+  `Node #${args.nodeId} on ${args.repo} stopped and needs me (ranger's reason: ${args.reason.class}` +
+  `${detail === "" ? "" : `: ${detail}`}). ` +
   `Read the node with \`soma graph node ${args.nodeId} --repo ${args.repo}\`, its PR, and ranger's ` +
-  `journal for it (\`ranger journal --repo ${args.repo}\`), then tell me what the next step is.`;
+  `journal for it (\`ranger journal --repo ${args.repo} --node ${args.nodeId}${config}\`). ` +
+  (facts.length === 0 ? "" : `${facts.join(" ")} `) +
+  `Then tell me what the next step is.`;
  const shellCommand = `cd ${shellQuote(args.cwd)} && claude ${shellQuote(prompt)}`;
  return { prompt, shellCommand, argv: itermArgv(shellCommand) };
 }
@@ -583,6 +772,8 @@ export interface ActionBody {
 export interface ActionDeps {
  /** The entries as the journal reads now: "Needs you", and every awaiting-merge row. */
  entries: NeedsYouEntry[];
+ /** Every queued resume as the journal reads now, all lanes: what a cancel may name. */
+ queue?: QueuedResumeView[];
  run: ActionRunner;
  env: Record<string, string | undefined>;
  rangerBin: string;
@@ -593,10 +784,15 @@ export interface ActionDeps {
   * Every check run on `sha`, read under the merge's own environment (the
   * `gh` account stored under HOME, machine credentials removed): the CI
   * state, or null when it cannot be read. Used when the dashboard's
-  * read-only token saw only the Actions runs.
+  * read-only token saw only the Actions runs, and before every GitLab merge
+  * (the pipeline verdict, under the principal's glab login).
   */
  verifyChecks?: (repo: string, sha: string, env: Record<string, string>) => Promise<PrView["ci"] | null>;
  exists: (path: string) => boolean;
+ /** The node's current worker log file, named in the session prompt; null or absent leaves it out. */
+ workerLog?: (repo: string, nodeId: string) => string | null;
+ /** How far the PR is behind its base, read when a session opens; null or absent leaves it out. */
+ behindBase?: (repo: string, pr: number) => Promise<BehindBase | null>;
  /**
   * Nodes with an action running now (`repo#id`), owned by the server. Held
   * from the row check until the child returns: the journal only shows a
@@ -615,7 +811,10 @@ export interface ActionResponse {
  exited?: Promise<void>;
 }
 
-const refusal = (status: number, error: string): ActionResponse => ({ status, body: { error } });
+export const refusal = (status: number, error: string): ActionResponse => ({ status, body: { error } });
+
+/** Serve has no config path to hand the verb. */
+export const noConfigPath = (what: string): ActionResponse => refusal(409, `serve was started without a config path to ${what} with`);
 
 const tailOf = (text: string): string => text.trim().slice(-1500);
 
@@ -633,24 +832,97 @@ export async function runAction(
   return refusal(400, "key and id are required strings");
  }
  if (!ID_PATTERN.test(body.id)) return refusal(400, "id must be numeric");
+ if (kind === "cancel-resume") {
+  // A queued entry may outlive its row's parked state, so a cancel names the queue, not the card.
+  const queued = deps.queue?.find((q) => q.key === body.key && q.nodeId === body.id);
+  if (queued === undefined) return refusal(404, `#${body.id} has no queued resume on ${body.key}`);
+  return holdingNode(deps, queued.repo, queued.nodeId, () => runCancel(queued, body, deps));
+ }
  const entry = deps.entries.find((e) => e.key === body.key && e.nodeId === body.id);
  if (entry === undefined) {
   return refusal(404, `#${body.id} is not parked, failed or awaiting a merge on ${body.key}`);
  }
- const held = nodeKey(entry.repo, entry.nodeId);
- if (deps.inFlight.has(held)) return refusal(409, `an action on #${entry.nodeId} is already running: wait for it, then reload`);
- deps.inFlight.add(held);
+ return holdingNode(deps, entry.repo, entry.nodeId, () => runHeldAction(kind, body, deps, entry));
+}
+
+const holdingNode = (deps: Pick<ActionDeps, "inFlight">, repo: string, nodeId: string, act: () => Promise<ActionResponse>) =>
+ holding(deps.inFlight, nodeKey(repo, nodeId), `an action on #${nodeId} is already running: wait for it, then reload`, act);
+
+/**
+ * Runs `act` holding `held` in the server's in-flight set, or refuses with
+ * `busy` while another action holds it.
+ */
+export async function holding(
+ inFlight: Set<string>,
+ held: string,
+ busy: string,
+ act: () => Promise<ActionResponse>,
+): Promise<ActionResponse> {
+ if (inFlight.has(held)) return refusal(409, busy);
+ inFlight.add(held);
  let exited: Promise<void> | undefined;
  try {
-  const response = await runHeldAction(kind, body, deps, entry);
+  const response = await act();
   exited = response.exited;
   return response;
  } finally {
   // Held until the child exits, not until the page is answered: a resume
   // that outlives the HTTP timeout must still refuse a second one.
-  if (exited === undefined) deps.inFlight.delete(held);
-  else void exited.finally(() => deps.inFlight.delete(held));
+  if (exited === undefined) inFlight.delete(held);
+  else void exited.finally(() => inFlight.delete(held));
  }
+}
+
+/** The page's view of a verb's exit: its code and the tail of its stderr. */
+export const verbResult = (action: string, result: ActionResult, extra: Record<string, unknown> = {}): Record<string, unknown> => ({
+ action,
+ ...extra,
+ ok: result.code === 0,
+ code: result.code,
+ stderr: tailOf(result.stderr),
+});
+
+/** `resume-node <id> --when-free` or `--cancel`, or the refusal when serve has no config path. */
+function queuedResumeArgv(
+ deps: Pick<ActionDeps, "rangerBin" | "configPath">,
+ target: { repo: string; root: number; nodeId: string },
+ queue: "when-free" | "cancel",
+): string[] | ActionResponse {
+ if (deps.configPath === undefined) return noConfigPath(queue === "cancel" ? "cancel" : "resume");
+ return resumeArgv({
+  rangerBin: deps.rangerBin,
+  configPath: deps.configPath,
+  repo: target.repo,
+  root: target.root,
+  nodeId: target.nodeId,
+  force: false,
+  queue,
+ });
+}
+
+/** `resume-node <id> --cancel`: the verb drops the entry, or refuses and changes nothing. */
+async function runCancel(queued: QueuedResumeView, body: ActionBody, deps: ActionDeps): Promise<ActionResponse> {
+ const argv = queuedResumeArgv(deps, queued, "cancel");
+ if (!Array.isArray(argv)) return argv;
+ return runOperatorVerb(argv, body.dryRun, deps, "cancel-resume", { nodeId: queued.nodeId });
+}
+
+/**
+ * One operator verb for the page: a dry run answers with its argv and the
+ * env keys it would pass; otherwise it runs and answers with its exit.
+ */
+export async function runOperatorVerb(
+ argv: string[],
+ dryRun: unknown,
+ deps: Pick<ActionDeps, "run" | "env">,
+ action: string,
+ extra: Record<string, unknown> = {},
+ detached = false,
+): Promise<ActionResponse> {
+ const env = childEnv(deps.env);
+ if (dryRun === true) return { status: 200, body: { dryRun: true, argv, envKeys: Object.keys(env).sort() } };
+ const result = await deps.run(argv, env, { detached });
+ return { status: 200, body: verbResult(action, result, extra), exited: result.exited };
 }
 
 async function runHeldAction(
@@ -677,20 +949,30 @@ async function runHeldAction(
   // The wrapper resolves the machine account's tokens itself; nothing ambient goes along.
   env = childEnv(deps.env);
   detached = true;
+ } else if (kind === "queue-resume") {
+  if (!entry.actions.queueResume.offered) return refusal(409, entry.actions.queueResume.why);
+  const queued = queuedResumeArgv(deps, entry, "when-free");
+  if (!Array.isArray(queued)) return queued;
+  argv = queued;
+  env = childEnv(deps.env);
+  // The lane may have freed since the page read it: the verb then starts the resume, as a Resume does.
+  detached = true;
  } else if (kind === "merge") {
   if (!entry.actions.merge.offered) return refusal(409, entry.actions.merge.why);
-  if (typeof body.sha !== "string" || body.sha !== entry.actions.merge.headSha) {
-   return refusal(409, "the confirmed head SHA is not the PR's head: reload and confirm again");
-  }
   const pr = entry.pr as NonNullable<NeedsYouEntry["pr"]>;
+  if (typeof body.sha !== "string" || body.sha !== entry.actions.merge.headSha) {
+   return refusal(409, `the confirmed head SHA is not the ${pr.noun}'s head: reload and confirm again`);
+  }
   let live: PrView | null;
   try {
    live = await deps.readPr(entry.repo, pr.number);
   } catch (error) {
-   return refusal(502, `could not read PR #${pr.number} live: ${error instanceof Error ? error.message : String(error)}`);
+   return refusal(502, `could not read ${pr.label} live: ${error instanceof Error ? error.message : String(error)}`);
   }
-  const stale = mergeRefusal(live);
-  if (stale !== null && live?.mergeable === false && live.state === "open" && entry.status === "awaiting-merge" && deps.configPath !== undefined) {
+  const stale = mergeRefusal(live, pr.noun);
+  // GitLab's blocked or unknown is nothing the desk fixes; a conflict or a rebase is.
+  const deskFixes = live?.mergeState === undefined || DESK_MERGE_STATES.includes(live.mergeState);
+  if (stale !== null && live?.mergeable === false && deskFixes && live.state === "open" && entry.status === "awaiting-merge" && deps.configPath !== undefined) {
    // A conflict the page had not seen yet (another merge moved the base):
    // the desk's send-back fixes it, so run the desk now, not on the next tick.
    const desk = await deps.run(
@@ -706,13 +988,20 @@ async function runHeldAction(
   }
   if (stale !== null) return refusal(409, `read live: ${stale}`);
   if ((live as PrView).headSha !== body.sha) {
-   return refusal(409, "the PR head moved since the page read it: reload and confirm again");
+   return refusal(409, `the ${pr.noun} head moved since the page read it: reload and confirm again`);
   }
   env = mergeEnv(deps.env);
-  // The dashboard's token saw only the Actions runs: an external app's
-  // failing check would not be in them. Before merging, every check is read
-  // under the same gh account the merge itself runs as.
-  if ((live as PrView).ciSource === "actions") {
+  if (entry.forge === "gitlab") {
+   // The merge runs under the principal's glab login, not the read token the
+   // card was built with: the pipeline verdict at this head is re-read under
+   // that same login first, and only green merges.
+   const pipeline = deps.verifyChecks === undefined ? null : await deps.verifyChecks(entry.repo, body.sha, env);
+   if (pipeline === null) return refusal(409, "the pipeline could not be read under your glab login: merge it on GitLab");
+   if (pipeline !== "green") return refusal(409, `the pipeline at ${body.sha.slice(0, 8)}, read under your glab login, is ${pipeline}`);
+  } else if ((live as PrView).ciSource === "actions") {
+   // The dashboard's token saw only the Actions runs: an external app's
+   // failing check would not be in them. Before merging, every check is read
+   // under the same gh account the merge itself runs as.
    const full = deps.verifyChecks === undefined ? null : await deps.verifyChecks(entry.repo, body.sha, env);
    if (full === null) {
     return refusal(409, "only the Actions runs were readable, and every check could not be read under your login: merge it on GitHub");
@@ -731,7 +1020,26 @@ async function runHeldAction(
   if (!entry.actions.session.offered) return refusal(409, entry.actions.session.why);
   const cwd = entry.actions.session.cwd;
   if (!deps.exists(cwd)) return refusal(409, `${cwd} no longer exists`);
-  argv = sessionPlan({ repo: entry.repo, nodeId: entry.nodeId, reason: entry.reason.class, cwd }).argv;
+  // Facts for the prompt, read now: a read that fails leaves its line out, never the session.
+  const behind =
+   entry.pr === null || deps.behindBase === undefined
+    ? null
+    : await deps.behindBase(entry.repo, entry.pr.number).catch(() => null);
+  let workerLog: string | null = null;
+  try {
+   workerLog = deps.workerLog?.(entry.repo, entry.nodeId) ?? null;
+  } catch {
+   /* a journal that cannot be read leaves the line out */
+  }
+  argv = sessionPlan({
+   repo: entry.repo,
+   nodeId: entry.nodeId,
+   reason: entry.reason,
+   cwd,
+   ...(deps.configPath === undefined ? {} : { configPath: deps.configPath }),
+   workerLog,
+   behind,
+  }).argv;
   env = childEnv(deps.env);
  }
  // A merged PR closes through the merge desk, which watches awaiting-merge
@@ -755,13 +1063,7 @@ async function runHeldAction(
   }
  }
  const result = await deps.run(argv, env, { detached });
- const out: Record<string, unknown> = {
-  action: kind,
-  nodeId: entry.nodeId,
-  ok: result.code === 0,
-  code: result.code,
-  stderr: tailOf(result.stderr),
- };
+ const out = verbResult(kind, result, { nodeId: entry.nodeId });
  let exited = result.exited;
  if (close !== null && result.code === 0) {
   // The wrapper resolves the machine account's tokens itself, as for a resume.

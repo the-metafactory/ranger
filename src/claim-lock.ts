@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { Journal } from "./journal.ts";
-import { acquireLease, leaseOwnedCheck, type OwnedCheck, releaseLease, startHeartbeat } from "./lock.ts";
+import { type OwnedCheck, withOwnedLease } from "./lock.ts";
 
 /**
  * The claim lock (node #58): one cross-process lease that the walk and
@@ -14,10 +14,10 @@ import { acquireLease, leaseOwnedCheck, type OwnedCheck, releaseLease, startHear
  * the gates (the node's row, the daily spawn cap, the implement-lane holder)
  * only after the first has written its `claimed` row and counted its spawn.
  *
- * Automatic probe requeues also take this lease while reserving a lane and
- * starting their child. `ranger resume-node` and the merge desk's
- * send-back of a ready PR start workers without it, as they did before
- * build-now; a lane read under the lock can still be joined by one of those
+ * Operator resumes, the walk's queued-resume pass and automatic probe
+ * requeues also take it while reserving a lane and starting their child.
+ * The merge desk's send-back of a ready PR starts workers without it; a
+ * lane read under the lock can still be joined by a send-back
  * before the claim's row lands. Neither does a claimer re-read the pause or
  * a veto after its gate check: one recorded during a claimer's announce is
  * seen by the next claim, as in the walk before this lock.
@@ -71,26 +71,17 @@ export async function withClaimLock<T>(
  timeoutMs = CLAIM_LOCK_TIMEOUT_MS,
 ): Promise<T> {
  const lockFile = claimLockFile(journal);
- const lease = await acquireLease(lockFile, `${lockFile}.reclaiming`, {
-  timeoutMs,
-  contended: () =>
-   new ClaimLockBusy(`another claim holds the claim lock (${lockFile}) for over ${Math.round(timeoutMs / 1000)} s`),
- });
- const { heartbeat, lostOwnership } = startHeartbeat(lease);
- const owned = leaseOwnedCheck(
-  lease,
-  lostOwnership,
-  (why) => new ClaimLeaseLost(`claim lock lost mid-claim (${why}) — stopped before the next write`),
-  { rejectExpired: true },
+ return withOwnedLease(
+  lockFile,
+  {
+   timeoutMs,
+   contended: () =>
+    new ClaimLockBusy(`another claim holds the claim lock (${lockFile}) for over ${Math.round(timeoutMs / 1000)} s`),
+   lost: (why) => new ClaimLeaseLost(`claim lock lost mid-claim (${why}) — stopped before the next write`),
+   rejectExpired: true,
+   lostMessage:
+    "[claim] claim lock was lost mid-claim (lease expired >60s) — the claim stopped at its next write; check for a write made before it",
+  },
+  fn,
  );
- try {
-  return await fn(owned);
- } finally {
-  releaseLease(
-   lease,
-   heartbeat,
-   lostOwnership,
-   "[claim] claim lock was lost mid-claim (lease expired >60s) — the claim stopped at its next write; check for a write made before it",
-  );
- }
 }

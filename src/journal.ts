@@ -8,6 +8,7 @@ import {
  events,
  headSubstrates,
  health,
+ resumeQueue,
  substrateReadings,
  substrateSessions,
  type SessionKind,
@@ -80,6 +81,9 @@ export class FencedError extends Error {
  override readonly name = "FencedError";
 }
 
+/** The fixed prefix `recordRebase` writes and `listRebases` reads: the SHAs, and ` wait` when no request was sent; the note follows. */
+const REBASE_PREFIX = /^from=([0-9a-f]{7,64})(?: to=([0-9a-f]{7,64}))?( wait)?: ?([\s\S]*)$/;
+
 export interface EventRow {
  id: number;
  at: string;
@@ -137,7 +141,21 @@ export interface EscalationRow {
  notedAt: string | null;
 }
 
+export interface ResumeQueueRow {
+ id: number;
+ repo: string;
+ nodeId: string;
+ root: number;
+ lane: ImplementLane;
+ queuedAt: string;
+ failedStarts: number;
+}
+
 export type EventKind =
+ | "resume-queued"
+ | "resume-cancelled"
+ | "resume-dropped"
+ | "resume-started"
  | "announced"
  | "claimed"
  | "worker-start"
@@ -152,6 +170,7 @@ export type EventKind =
  | "released"
  | "sweep"
  | "deadman-paused"
+ | "drain"
  | "fenced"
  | "pushed"
  | "pr-opened"
@@ -160,14 +179,20 @@ export type EventKind =
  | "awaiting-merge"
  | "merge-card"
  | "merged"
+ | "rebased"
  | "orphan-killed"
  | "substrate-capped"
  | "transient"
  | "git-trust"
- | "log-failed";
+ | "log-failed"
+ | "worktree-synced";
 
 /** The health-store key of a checkout's known-good git state (`knownGoodGitState`). */
 const knownGoodGitKey = (canonical: string): string => `git.known-good.${canonical}`;
+
+/** The health-store keys of the drains (node #165), stored the way `paused` is. */
+const VISUAL_DRAIN_KEY = "drain.lane.visual";
+const mapDrainKey = (key: string): string => `drain.map.${key}`;
 
 const rootFilter = (column: typeof workers.root | typeof escalations.root, root?: number) => root === undefined ? undefined : eq(column, root);
 
@@ -356,6 +381,52 @@ export class Journal {
   return rows.map(hydrateWorker);
  }
 
+ // ---- queued resumes ----
+
+ enqueueResume(entry: Omit<ResumeQueueRow, "id" | "queuedAt" | "failedStarts">, now = new Date()): ResumeQueueRow {
+  return this.db.transaction(() => {
+   const inserted = this.db.insert(resumeQueue).values({ ...entry, queuedAt: now.toISOString() })
+    .onConflictDoNothing({ target: [resumeQueue.repo, resumeQueue.nodeId] }).returning().get();
+   if (inserted !== undefined) {
+    this.recordEvent("resume-queued", { nodeId: entry.nodeId, repo: entry.repo, detail: `resume-node queued for the ${entry.lane} implement lane (map root ${entry.root})` });
+    return inserted;
+   }
+   return this.db.select().from(resumeQueue)
+    .where(and(eq(resumeQueue.repo, entry.repo), eq(resumeQueue.nodeId, entry.nodeId))).get()!;
+  });
+ }
+
+ listResumeQueue(lane?: ImplementLane): ResumeQueueRow[] {
+  return this.db.select().from(resumeQueue).where(lane === undefined ? undefined : eq(resumeQueue.lane, lane))
+   .orderBy(asc(resumeQueue.id)).all();
+ }
+
+ getResume(repo: string, nodeId: string): ResumeQueueRow | null {
+  return this.db.select().from(resumeQueue)
+   .where(and(eq(resumeQueue.repo, repo), eq(resumeQueue.nodeId, nodeId))).get() ?? null;
+ }
+
+ recordResumeStartFailure(entry: ResumeQueueRow, reason: string): boolean {
+  return this.db.transaction(() => {
+   const updated = this.db.update(resumeQueue)
+    .set({ failedStarts: sql`${resumeQueue.failedStarts} + 1` })
+    .where(eq(resumeQueue.id, entry.id)).returning().get();
+   if (updated === undefined) return true;
+   if (updated.failedStarts < 3) return false;
+   this.removeResume(updated, "resume-dropped", `3 consecutive failed starts; last error: ${reason}`);
+   return true;
+  });
+ }
+
+ removeResume(entry: ResumeQueueRow, kind: "resume-cancelled" | "resume-dropped" | "resume-started", reason: string): boolean {
+  return this.db.transaction(() => {
+   const removed = this.db.delete(resumeQueue).where(eq(resumeQueue.id, entry.id)).returning().get();
+   if (removed === undefined) return false;
+   this.recordEvent(kind, { nodeId: entry.nodeId, repo: entry.repo, detail: reason });
+   return true;
+  });
+ }
+
  /** Bounded keyset page for graph-closure reconciliation, scoped to one map. */
  listClosureCandidates(repo: string, root: number, limit: number, after?: string): WorkerRow[] {
   return this.db.select().from(workers).where(and(
@@ -383,14 +454,45 @@ export class Journal {
    .run();
  }
 
- listEvents(repo?: string, limit = 50): EventRow[] {
-  const base = this.db.select().from(events);
-  const query =
-   repo === undefined
-    ? base.orderBy(desc(events.id)).limit(limit)
-    : base.where(eq(events.repo, repo)).orderBy(desc(events.id)).limit(limit);
-  const rows = query.all();
+ /** The newest `limit` events, of one repo and, with `nodeId`, one node of it. */
+ listEvents(repo?: string, limit = 50, nodeId?: string): EventRow[] {
+  const where = and(
+   repo === undefined ? undefined : eq(events.repo, repo),
+   nodeId === undefined ? undefined : eq(events.nodeId, nodeId),
+  );
+  const rows = this.db.select().from(events).where(where).orderBy(desc(events.id)).limit(limit).all();
   return rows.map(hydrateEvent);
+ }
+
+ /**
+  * A rebase pass on a node's change request from the gated head `from`
+  * (node #126): `to` is the new head once ranger saw it move, else null;
+  * `requested` is false when the pass only waited on a running rebase. These
+  * lead the detail in a fixed prefix that `listRebases` reads back, so
+  * `note` stays free prose.
+  */
+ recordRebase(opts: { nodeId: string; repo: string; from: string; to: string | null; requested: boolean; note: string }): void {
+  const prefix = `from=${opts.from}${opts.to === null ? "" : ` to=${opts.to}`}${opts.requested ? "" : " wait"}`;
+  this.recordEvent("rebased", { nodeId: opts.nodeId, repo: opts.repo, detail: `${prefix}: ${opts.note}` });
+ }
+
+ /**
+  * A node's recorded rebase passes, newest first. Queried by kind, so other
+  * events (a send-back waiting on the lane logs one per pass) never push a
+  * rebase out of the window.
+  */
+ listRebases(repo: string, nodeId: string, limit = 60): { from: string; to: string | null; requested: boolean; note: string }[] {
+  return this.db
+   .select()
+   .from(events)
+   .where(and(eq(events.repo, repo), eq(events.nodeId, nodeId), eq(events.kind, "rebased")))
+   .orderBy(desc(events.id))
+   .limit(limit)
+   .all()
+   .flatMap((e) => {
+    const m = REBASE_PREFIX.exec(e.detail ?? "");
+    return m === null ? [] : [{ from: m[1]!, to: m[2] ?? null, requested: m[3] === undefined, note: m[4] ?? "" }];
+   });
  }
 
  /** One node's events, newest first (node #54: the dashboard's reason class). */
@@ -467,6 +569,29 @@ export class Journal {
 
  setPaused(paused: boolean): void {
   this.setHealth("paused", paused ? "true" : "false");
+ }
+
+ // ---- drain (node #165) ----
+
+ /**
+  * The visual lane's drain: one switch for every visual-lane map, because
+  * the lane is a machine singleton (`laneHolder` scans this one journal).
+  */
+ isVisualLaneDrained(): boolean {
+  return this.getHealth(VISUAL_DRAIN_KEY) === "true";
+ }
+
+ setVisualLaneDrained(drained: boolean): void {
+  this.setHealth(VISUAL_DRAIN_KEY, drained ? "true" : "false");
+ }
+
+ /** One headless-lane map's drain, keyed `owner/name#root`. */
+ isMapDrained(key: string): boolean {
+  return this.getHealth(mapDrainKey(key)) === "true";
+ }
+
+ setMapDrained(key: string, drained: boolean): void {
+  this.setHealth(mapDrainKey(key), drained ? "true" : "false");
  }
 
  /** Day-keyed spawn counter — the global spend bound (§7). */

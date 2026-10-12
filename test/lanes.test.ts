@@ -195,6 +195,20 @@ describe("node #57/#47 — root-aware resource lanes", () => {
   } finally { r.close(); }
  });
 
+ test("resume refuses a node whose own run-node is still alive; a dead one resumes", async () => {
+  const r = rig();
+  try {
+   r.journal.upsertWorker({ root: 1, nodeId: "20", repo: TOOL, status: "running", lane: "implement", pid: process.pid });
+   const live = await runCli(["resume-node", "20", "--map", TOOL, "--force", "-c", r.configPath], r.env);
+   expect(live.code).toBe(1);
+   expect(live.stderr).toMatch(new RegExp(`pid ${process.pid}\\) is still running`));
+   expect(r.journal.getWorker("20", TOOL)?.status).toBe("running");
+   r.journal.updateWorker("20", TOOL, { pid: 2 ** 22 + 1 });
+   expect((await runCli(["resume-node", "20", "--map", TOOL, "-c", r.configPath], r.env)).code).toBe(0);
+   expect(r.journal.getWorker("20", TOOL)?.status).toBe("claimed");
+  } finally { r.close(); }
+ });
+
  test("node #58: build-now claims one node through the CLI; a held lane needs --force", async () => {
   const r = rig();
   try {

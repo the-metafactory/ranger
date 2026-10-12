@@ -1,8 +1,10 @@
 #!/usr/bin/env bun
 import { readPrivateJson } from "./remote-test/ssh-cli.ts";
-import { implementLane, startsImplementSession } from "./lanes.ts";
 import { executionRefusal, isGithubRepo } from "./forge-ref.ts";
-import { laneHeldMessage, recordImplementStart, mapKey, pickMap, resumeMap } from "./maps.ts";
+import { changeRequestNoun } from "./forge-text.ts";
+import { mapKey, pickMap } from "./maps.ts";
+import { implementLane } from "./lanes.ts";
+import { resumeNode } from "./resume.ts";
 import { Command } from "commander";
 import { join, resolve } from "node:path";
 import {
@@ -33,17 +35,18 @@ import {
 } from "./token-gate.ts";
 import { openJournal, type Journal } from "./journal.ts";
 import {
- assertNotPrincipal,
- resolveBotIdentity,
- resolveWriteToken,
+ assertCommitIdentity,
+ assertWriteIdentity,
  WriteGateError,
 } from "./identity.ts";
 import { canonicalDir, runNode } from "./worker.ts";
 import { trustCurrentGitState } from "./git-trust.ts";
+import { workerLogFile } from "./worker-log.ts";
 import { sweepMap } from "./sweep.ts";
 import { mergeGateNow } from "./merge-desk.ts";
 import { realGitHub } from "./implement.ts";
-import { spawnRunNodeDetached, walk } from "./walk.ts";
+import { walk } from "./walk.ts";
+import { spawnRunNodeDetached } from "./spawn.ts";
 import { holdAwake } from "./awake.ts";
 import { BUILD_NOW_NOT_STARTED, buildNow, type BuildNowResult } from "./build-now.ts";
 import { startServe } from "./serve.ts";
@@ -62,6 +65,7 @@ import { ActiveRemoteTestJob, BusyRemoteTestExecutor, RevokedRemoteTestJob, open
 import { validateRemoteTestJob } from "./remote-test/contract.ts";
 import { publishReceiptFile } from "./remote-test/artifacts.ts";
 import { runSshCommand, statusSshCommand, sshOutcomeExitCode, sshOutcomeMessage, type RunSshCommand } from "./remote-test/ssh-cli.ts";
+import { classifyReceiverFailure, saveRefusalDiagnostic, TaggedReceiverFailure } from "./remote-test/receiver-diagnostics.ts";
 import { serveSshResponse } from "./remote-test/ssh-server.ts";
 
 /**
@@ -72,6 +76,7 @@ import { serveSshResponse } from "./remote-test/ssh-server.ts";
  * - `run-node <id>` — the detached worker supervisor (research + implement lanes).
  * - `build-now <id>` (node #58) — the walk's claim for one chosen node, started now.
  * - `sweep` — reconcile the journal against reality.
+ * - `drain` (node #165) — stop new claims on the visual lane or one headless map.
  * - `journal` — inspect the journal.
  * - `serve` (node #37) — local read-only dashboard; launches the principal's
  *   own grilling sessions, never a graph write.
@@ -206,10 +211,14 @@ function loadCtx(configPath: string): {
 async function writeContext(config: RangerConfig, map: RangerMapConfig) {
  const refusal = executionRefusal(map.repo);
  if (refusal !== null) throw new WriteGateError(refusal);
- const credential = resolveWriteToken(config, map.repo);
- const botIdentity = await resolveBotIdentity(config, credential.token);
- assertNotPrincipal(config, botIdentity);
- return { token: credential.token, botIdentity };
+ return assertWriteIdentity(config, map.repo);
+}
+
+/** `writeContext` for a run-node, plus a GitLab map's commit identity (node #127). */
+async function runNodeContext(config: RangerConfig, map: RangerMapConfig) {
+ const refusal = executionRefusal(map.repo);
+ if (refusal !== null) throw new WriteGateError(refusal);
+ return assertCommitIdentity(config, map.repo);
 }
 
 async function runWalk(configPath: string): Promise<string> {
@@ -225,12 +234,13 @@ async function runRunNode(
 ): Promise<string> {
  const { config, journal } = loadCtx(configPath);
  const map = pickMap(config, repo);
- const { token, botIdentity } = await writeContext(config, map);
+ const { token, botIdentity, commitAuthor } = await runNodeContext(config, map);
  const outcome = await runNode(nodeId, {
   config,
   map,
   token,
   botIdentity,
+  commitAuthor,
   journal,
  });
  journal.close();
@@ -313,7 +323,7 @@ async function runMergeGate(nodeId: string, selector: string, sha: string, confi
   const map = pickMap(config, selector);
   const row = journal.getWorker(nodeId, map.repo);
   if (row === null || row.root !== map.root || row.prNumber === null) {
-   return { ok: false, text: `node ${nodeId} has no PR recorded on ${mapKey(map)}` };
+   return { ok: false, text: `node ${nodeId} has no ${changeRequestNoun(map.repo)} recorded on ${mapKey(map)}` };
   }
   const { token, botIdentity } = await writeContext(config, map);
   const gate = await mergeGateNow(realGitHub, map, row.prNumber, token, botIdentity);
@@ -366,38 +376,11 @@ async function runResumeNode(
  nodeId: string,
  repo: string | undefined,
  configPath: string,
- force?: boolean,
+ options: { force?: boolean; whenFree?: boolean; cancel?: boolean },
 ): Promise<string> {
  const { config, journal } = loadCtx(configPath);
  try {
-  const map = resumeMap(config, journal.listWorkers(), nodeId, repo);
-  await writeContext(config, map); // the same identity gate as run-node
-  const row = journal.getWorker(nodeId, map.repo);
-  if (row === null || row.repo !== map.repo) {
-   throw new Error(`no journal row for node ${nodeId} on ${map.repo} — nothing to resume`);
-  }
-  if (row.status === "released") {
-   throw new Error(`node ${nodeId}'s claim was released — the walk re-claims it from the frontier`);
-  }
-  // A resume starts a worker session in this map's resource lane.
-  const lane = implementLane(map);
-  const takesLane = startsImplementSession(row);
-  const holder = takesLane ? journal.laneHolder(lane, { nodeId, repo: map.repo }) : null;
-  if (holder !== null && force !== true) {
-   throw new Error(laneHeldMessage(lane, holder, "resume", nodeId));
-  }
-  journal.updateWorker(nodeId, map.repo, { status: "claimed", pid: null, workerPgid: null, finishedAt: null });
-  if (takesLane) recordImplementStart(journal, map);
-  const pid = await spawnRunNodeDetached({
-   nodeId,
-   repo: map.repo,
-   root: map.root,
-   cliEntry: join(import.meta.dir, "cli.ts"),
-   configPath,
-  });
-  if (pid !== null) journal.updateWorker(nodeId, map.repo, { pid });
-  journal.recordEvent("sweep", { nodeId, repo: map.repo, detail: `resume-node by operator (was ${row.status}); run-node pid ${pid ?? "none"}` });
-  return JSON.stringify({ nodeId, repo: map.repo, root: map.root, was: row.status, pid }, null, 2);
+  return JSON.stringify(await resumeNode(nodeId, repo, { config, configPath, journal }, options), null, 2);
  } finally {
   journal.close();
  }
@@ -457,20 +440,74 @@ function runResumeRun(configPath: string): string {
  return JSON.stringify({ resumed: true, was }, null, 2);
 }
 
+/**
+ * Operator verb (node #165): drain the visual lane (every visual map, one
+ * switch) or one headless map, so no new frontier work is claimed there;
+ * `off` lifts it. Every refusal is decided from the config alone, before
+ * the journal opens, so a refused drain writes nothing.
+ */
+function runDrain(
+ configPath: string,
+ opts: { lane?: string; map?: string; off?: boolean },
+): string {
+ if ((opts.lane === undefined) === (opts.map === undefined)) {
+  throw new Error("name exactly one of --lane visual or --map <owner/name#root>");
+ }
+ const drained = opts.off !== true;
+ const { config } = loadConfig(configPath);
+ let target: { scope: "lane"; lane: "visual" } | { scope: "map"; key: string };
+ if (opts.lane !== undefined) {
+  if (opts.lane !== "visual") {
+   throw new Error(`--lane '${opts.lane}' cannot be drained: only the visual lane is a machine-wide switch; drain a headless map with --map <owner/name#root>`);
+  }
+  target = { scope: "lane", lane: "visual" };
+ } else {
+  const map = pickMap(config, opts.map);
+  if (implementLane(map) === "visual") {
+   throw new Error(`${mapKey(map)} is on the visual lane, which drains as one switch for every visual map: \`ranger drain --lane visual${drained ? "" : " --off"}\``);
+  }
+  target = { scope: "map", key: mapKey(map) };
+ }
+ const journal = openJournal(config);
+ try {
+  const was = target.scope === "lane" ? journal.isVisualLaneDrained() : journal.isMapDrained(target.key);
+  if (target.scope === "lane") journal.setVisualLaneDrained(drained);
+  else journal.setMapDrained(target.key, drained);
+  const what = target.scope === "lane" ? "visual lane" : target.key;
+  journal.recordEvent("drain", { detail: `${what} ${drained ? "drained" : "drain lifted"} by operator (was ${was ? "drained" : "open"})` });
+  return JSON.stringify({ ...target, drained, was }, null, 2);
+ } finally {
+  journal.close();
+ }
+}
+
+/**
+ * The journal as JSON. `nodeId` keeps one node's rows only (ranger issue
+ * #229), and names each of its workers' log file: the session the
+ * principal opens on a parked node reads its reason there.
+ */
 async function runJournal(
  repo: string | undefined,
  configPath: string,
+ nodeId?: string,
 ): Promise<string> {
  const { config, journal } = loadCtx(configPath);
  const target = repo === undefined ? undefined : normalizeRepo(repo, config);
+ const journalPath = expandHome(config.state.journalPath);
+ const ofNode = <T extends { nodeId: string | null }>(rows: T[]): T[] =>
+  nodeId === undefined ? rows : rows.filter((r) => r.nodeId === nodeId);
+ const workers = ofNode(journal.listWorkers(target));
  const rows = {
-  journalPath: expandHome(config.state.journalPath),
+  journalPath,
   paused: journal.isPaused(),
   deadmanCount: journal.deadmanCount(),
   spawnsToday: journal.spawnsToday(),
-  workers: journal.listWorkers(target),
-  escalations: journal.listEscalations(target),
-  events: journal.listEvents(target, 50),
+  workers:
+   nodeId === undefined
+    ? workers
+    : workers.map((w) => ({ ...w, workerLog: workerLogFile(journalPath, w.repo, w.nodeId, w.generation) })),
+  escalations: ofNode(journal.listEscalations(target)),
+  events: journal.listEvents(target, 50, nodeId),
  };
  journal.close();
  return JSON.stringify(rows, null, 2);
@@ -566,14 +603,26 @@ remoteTest.command("status")
 remoteTest.command("serve-stdio")
  .description("Fixed operator-only SSH entry point: receive one structured request on stdin")
  .requiredOption("--config <path>", "reviewed private executor JSON configuration")
- .action(async (options: { config: string }) => {
-  const abort = new AbortController(), cancel = () => { abort.abort(); process.stdin.destroy(Error("SSH input interrupted")); };
+ .option("--diagnostics-root <absolute-directory>", "existing private operator-only refusal store (default off)")
+ .action(async (options: { config: string; diagnosticsRoot?: string }) => {
+  const diagnostics = options.diagnosticsRoot === undefined ? undefined : { root: options.diagnosticsRoot };
+  const abort = new AbortController(), cancel = () => { abort.abort(); process.stdin.destroy(new TaggedReceiverFailure("interrupted", "SSH input interrupted")); };
   process.once("SIGINT", cancel); process.once("SIGTERM", cancel); process.once("SIGHUP", cancel);
   // Includes upload idle time and bounded executor cleanup. No silent daemon.
   const timer = setTimeout(cancel, 15 * 60_000);
   try {
-   const config = JSON.parse(await readFile(await privateOperatorPath(options.config, true), "utf8"));
-   const response = await serveSshResponse(process.stdin, config, { signal: abort.signal });
+   let config;
+   try {
+    const text = await readFile(await privateOperatorPath(options.config, true), "utf8");
+    try { config = JSON.parse(text); }
+    catch { throw new TaggedReceiverFailure("invalid_config", "Invalid private executor config"); }
+   }
+   catch (error) {
+    const failure = classifyReceiverFailure(error, "config");
+    await saveRefusalDiagnostic(diagnostics, { operation: null, job: null, primary: failure });
+    throw Error("Invalid private executor config");
+   }
+   const response = await serveSshResponse(process.stdin, config, { signal: abort.signal, diagnostics });
    process.stdout.write(JSON.stringify(response) + "\n");
   } catch { process.stderr.write("ranger remote-test serve-stdio: request, admission, execution or storage failed; inspect private operator state.\n"); process.exitCode = 1; }
   finally { clearTimeout(timer); process.removeListener("SIGINT", cancel); process.removeListener("SIGTERM", cancel); process.removeListener("SIGHUP", cancel); }
@@ -891,11 +940,13 @@ program
  .argument("<id>", "node id to resume")
  .option("-m, --map <owner/name#root>", "map repo or repo#root (optional; inferred from the journal row)")
  .option("--force", "resume even while another implement worker holds the lane")
+ .option("--when-free", "queue a resume FIFO when its implement lane is held")
+ .option("--cancel", "remove a queued resume")
  .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
- .action(async (id: string, options: { map?: string; config: string; force?: boolean }) => {
+ .action(async (id: string, options: { map?: string; config: string; force?: boolean; whenFree?: boolean; cancel?: boolean }) => {
   try {
    const configPath = resolve(process.cwd(), options.config);
-   process.stdout.write((await runResumeNode(id, options.map, configPath, options.force)) + "\n");
+   process.stdout.write((await runResumeNode(id, options.map, configPath, options)) + "\n");
   } catch (error) {
    process.stderr.write(
     `ranger resume-node: ${error instanceof Error ? error.message : String(error)}\n`,
@@ -945,6 +996,25 @@ program
  });
 
 program
+ .command("drain")
+ .description(
+  "Operator verb (node #165): stop new implement claims on every visual-lane map (--lane visual, one machine-wide switch), or every new claim on one headless map (--map); --off lifts it. Sweeps, the merge desk and queued resumes keep running",
+ )
+ .option("--lane <lane>", "drain the visual lane (the only lane drained as one switch)")
+ .option("-m, --map <owner/name#root>", "drain one headless-lane map")
+ .option("--off", "lift the drain")
+ .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
+ .action((options: { lane?: string; map?: string; off?: boolean; config: string }) => {
+  try {
+   const configPath = resolve(process.cwd(), options.config);
+   process.stdout.write(runDrain(configPath, options) + "\n");
+  } catch (error) {
+   process.stderr.write(`ranger drain: ${error instanceof Error ? error.message : String(error)}\n`);
+   process.exit(1);
+  }
+ });
+
+program
  .command("trust-git")
  .description(
   "Operator verb (node #81): list every change to the canonical checkout's git config and hooks since ranger last saw them clean, with the current state's hash; --hash <it> records exactly that state as known-good (run-nodes park on any change)",
@@ -968,11 +1038,13 @@ program
  .command("journal")
  .description("Inspect the journal (workers, events, health)")
  .option("--repo <repo>", "filter by map repo")
+ .option("--node <id>", "one node's workers, escalations and events only, with each worker's log file")
  .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
- .action(async (options: { repo?: string; config: string }) => {
+ .action(async (options: { repo?: string; node?: string; config: string }) => {
   try {
+   if (options.node !== undefined && !/^\d+$/.test(options.node)) throw new Error(`--node must be a numeric id, got ${options.node}`);
    const configPath = resolve(process.cwd(), options.config);
-   process.stdout.write((await runJournal(options.repo, configPath)) + "\n");
+   process.stdout.write((await runJournal(options.repo, configPath, options.node)) + "\n");
   } catch (error) {
    process.stderr.write(
     `ranger journal: ${error instanceof Error ? error.message : String(error)}\n`,

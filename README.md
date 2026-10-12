@@ -48,6 +48,50 @@ close-only runs leave the cursor unchanged. Awaiting-merge releases capacity.
 The dashboard shows both holders and the same next choices as walk.
 Unknown or ambiguous worker maps conservatively hold both resource lanes.
 
+`ranger drain --lane visual` (node #165) stops new implement claims on every
+visual-lane map: the visual lane is one per machine, so its drain is one switch.
+Research on a visual map still claims. `ranger drain --map owner/name#root`
+drains one headless map, which then claims nothing new. A visual map has no
+drain of its own. `--off` lifts either. Sweeps, merge desks (and their
+send-backs) and queued resumes keep running under a drain. The walk reads the
+drain under the claim lock, and the dashboard shows it from the same gate.
+
+`ranger resume-node <id> --when-free` resumes immediately when its lane is
+free and no resumes wait in that lane. Otherwise it records a durable FIFO entry.
+Research and close-only resumes start immediately. On each walk tick, queued
+resumes run after merge desks and before new claims; a started implement resume
+reserves its lane for that tick. The dead-man pause and daily spawn cap retain
+queued entries. Closed nodes, released or already active rows, merged or closed
+PRs and maps set to `walk: none` are removed with a reason. Moving a PR head
+keeps its entry valid. `ranger resume-node <id> --cancel` removes an entry and
+returns non-zero if none exists. Use `--map owner/name#root` to disambiguate.
+Cancellation remains available after a map is deregistered, using the queued
+repository's write-token mapping and the same machine-account identity gate.
+Starts by the walk count toward the daily spawn cap; immediate operator resumes
+do not. A queued entry never reserves a lane: if its head cannot start, fresh
+claims remain eligible that tick, while later queued entries in the lane wait.
+Transient graph or GitHub read errors defer the head without counting a failure.
+Spawn errors, a null PID (including `RANGER_NO_SPAWN=1`), and identity gate
+refusals count as failed starts. Three consecutive failed starts drop the entry
+with an event naming the last error. A successful start removes the entry;
+queueing the node again starts its failure count at zero.
+
+`ranger serve` (node #166) runs these verbs for the principal: Drain/Undrain on
+the visual lane's header (`ranger drain --lane visual [--off]`) and on each
+headless map (`--map`); a visual map shows no drain of its own. A parked or
+failed card offers "Queue resume" (`resume-node <id> --when-free`) where that
+verb would queue, and a queued node shows its place and a Cancel
+(`--cancel`). Each lane lists its queue FIFO, and a head the journal lets start
+shows as next, ahead of any frontier claim; the walk's forge check (a closed
+node, a merged PR) and identity gate come after and may still drop or defer it.
+An entry the tick will drop (a `walk: none` map, a row back in flight) shows
+why and holds nothing behind it.
+An action `serve` refuses (unknown map, no queued entry) shows its error and
+runs nothing. A verb that exits non-zero shows its exit and error. One that
+timed out or never started may already have applied, so reload the page to see.
+Plain and immediate operator resumes retain the hand-driven mode where a row
+is claimed without spawning; this mode cannot successfully start a queued resume.
+
 Parked infrastructure probe failures automatically requeue on the next `walk`
 when their lane is free, oldest first across maps. They take priority over
 crash respawns, merge-desk send-backs and fresh implement claims. The running
@@ -97,7 +141,7 @@ bun src/cli.ts scout -c /path/ranger.yaml # explicit config
   (audit `openClaimed` — in-flight or stale), and receipt-less closes.
 
 ```bash
-bun test       # unit + e2e (fake soma/gh fixtures)
+bun run test   # unit + e2e (fake soma/gh fixtures), four files at a time
 bunx tsc --noEmit
 ```
 
@@ -123,6 +167,16 @@ bun src/cli.ts journal                    # inspect workers/events/health
   the claim.
 - **Race-safe claim:** `soma graph claim` re-reads and tie-breaks; a lost race
   is skipped, never fought.
+- **Build briefs (node #154):** a build node that `soma graph audit` lists
+  under `buildBriefNotReady` routes `brief-not-ready`: the tick does not take
+  it, and the escalation desk posts one card naming what is missing. The audit
+  is read with each fresh frontier read and cached beside it, so a fixed body
+  (which bumps the issue's `updated_at`) is re-checked on the next tick. An
+  audit without the field (soma before soma#753) holds nothing; an unreadable
+  or malformed audit holds every build node, and the next tick re-runs only
+  the audit until it reads. A verdict change the sentinel cannot see (a soma
+  upgrade, a changed readiness rule) lands within `budget.frontierMaxAgeMin`.
+  `ranger build-now` refuses a held node the same way.
 - **Dead-man + spend bound (design §7):** N consecutive worker failures pause
   claiming; a daily spawn cap bounds spend. `RANGER_NO_SPAWN=1` claims without
   spawning (simulation).

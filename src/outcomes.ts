@@ -3,9 +3,12 @@
  * lane writes its review-cap and probe outcomes with these builders, and
  * `ranger serve` reads a parked row's reason class back with the matching
  * patterns, so the dashboard classifies by ranger's own rules rather than by
- * guessing at prose. No imports: `serve.ts` reaches this module, and its
- * import graph must stay free of graph writes (`test/serve.test.ts`).
+ * guessing at prose. Text-only imports: `serve.ts` reaches this module, and
+ * its import graph must stay free of graph writes (`test/serve.test.ts`).
+ * `forge-text.ts` names the change request the way its forge does (node #129).
  */
+
+import { changeRequestLabel } from "./forge-text.ts";
 
 /** Defined once in labels.ts; re-exported for the outcome texts that name it. */
 export { NEEDS_EYE_LABEL } from "./labels.ts";
@@ -61,8 +64,8 @@ export function parseFailedChecks(stdout: string): Map<string, FailedProbeRun> {
 }
 
 /** The branch still conflicts with its base after every base merge pass it gets. */
-export function baseConflictOutcome(r: { pr: number; base: string; passes: number }): string {
- return `PR #${r.pr} conflicts with ${r.base} again after ${r.passes} base merge pass(es) — the base keeps moving under it; resolving it is the principal's call`;
+export function baseConflictOutcome(r: { repo: string; pr: number; base: string; passes: number }): string {
+ return `${changeRequestLabel(r.repo, r.pr)} conflicts with ${r.base} again after ${r.passes} base merge pass(es) — the base keeps moving under it; resolving it is the principal's call`;
 }
 
 /**
@@ -96,17 +99,17 @@ export function unfinishedProbes(stdout: string): string[] {
 }
 
 /** Sage rounds ran out with blockers or majors still open. */
-export function reviewCapOutcome(r: { blockers: number; majors: number; round: number; pr: number }): string {
- return `${r.blockers} blocker(s) and ${r.majors} major(s) remain after ${r.round} sage round(s) on PR #${r.pr} — good-enough is the principal's call (design §4/§7)`;
+export function reviewCapOutcome(r: { repo: string; blockers: number; majors: number; round: number; pr: number }): string {
+ return `${r.blockers} blocker(s) and ${r.majors} major(s) remain after ${r.round} sage round(s) on ${changeRequestLabel(r.repo, r.pr)} — good-enough is the principal's call (design §4/§7)`;
 }
 
 /** Sage rounds ran out and the head moved after the last one. */
-export function reviewCapHeadMovedOutcome(r: { rounds: number; pr: number }): string {
- return `review cap reached: ${r.rounds} sage round(s) on PR #${r.pr} and the head moved since the last one — a further round is the principal's call (design §4)`;
+export function reviewCapHeadMovedOutcome(r: { repo: string; rounds: number; pr: number }): string {
+ return `review cap reached: ${r.rounds} sage round(s) on ${changeRequestLabel(r.repo, r.pr)} and the head moved since the last one — a further round is the principal's call (design §4)`;
 }
 
 /** The head-moved variant alone: the last sage round read an earlier head. */
-export const REVIEW_CAP_HEAD_MOVED_OUTCOME = /^review cap reached: \d+ sage round\(s\) on PR #\d+ and the head moved since the last one/;
+export const REVIEW_CAP_HEAD_MOVED_OUTCOME = /^review cap reached: \d+ sage round\(s\) on (?:PR #|MR !)\d+ and the head moved since the last one/;
 
 export const REVIEW_CAP_OUTCOME = /^(?:\d+ blocker\(s\) and \d+ major\(s\) remain after \d+ sage round\(s\)|review cap reached: )/;
 
@@ -130,7 +133,7 @@ export function probeFailureClass(runs: readonly { code: number; stdout: string;
 
 /** Explicit classes survive outcome truncation. Legacy signal-only parks can retry. */
 export function infrastructureProbeHead(outcome: string): string | null {
- const head = /^browser probes failed twice at ([0-9a-f]{8}) on PR #\d+ \(exit (-?\d+)\)/.exec(outcome);
+ const head = /^browser probes failed twice at ([0-9a-f]{8}) on (?:PR #|MR !)\d+ \(exit (-?\d+)\)/.exec(outcome);
  if (head === null) return null;
  const classification = /^probe failure class: (\w+)$/m.exec(outcome)?.[1];
  if (classification !== undefined) {
@@ -148,6 +151,7 @@ export function infrastructureProbeHead(outcome: string): string | null {
  * outcome, and a tail that ends the run's output cuts the runner's own line.
  */
 export function probesFailedOutcome(r: {
+ repo: string;
  sha: string;
  pr: number;
  exit: number;
@@ -163,7 +167,7 @@ export function probesFailedOutcome(r: {
  const onBase = (r.redOnBase ?? []).filter((n) => PROBE_FILE.test(n));
  const summary = r.summary ?? [];
  return [
-  `browser probes failed twice at ${r.sha.slice(0, 8)} on PR #${r.pr} (exit ${r.exit})`,
+  `browser probes failed twice at ${r.sha.slice(0, 8)} on ${changeRequestLabel(r.repo, r.pr)} (exit ${r.exit})`,
   ...(r.failureClass === undefined ? [] : [`probe failure class: ${r.failureClass}`]),
   ...(r.failureClass === undefined ? [] : [`probe failure head: ${r.sha}`]),
   ...(names.length > 0 ? [`FAILED: ${names.join(" · ")}`] : []),

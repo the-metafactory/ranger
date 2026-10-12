@@ -1,4 +1,4 @@
-import { runReadRetryingTransient } from "./transient.ts";
+import { isGitLabRateLimit, runReadRetryingTransient } from "./transient.ts";
 import { gatedEnv, assertGitLabReadGrant, type ResolvedToken } from "./token-gate.ts";
 import { glabConfigEnvAsync } from "./glab-config-dir.ts";
 import { runCmd } from "./exec.ts";
@@ -19,9 +19,10 @@ export class GraphError extends Error {
 }
 
 /**
- * A graph read GitHub refused for rate limiting — the hourly allowance or a
- * secondary (burst/concurrency) limit. Distinct from GraphError so callers
- * can defer instead of failing (src/budget.ts sets a cooldown on it).
+ * A graph read the forge refused for rate limiting — GitHub's hourly
+ * allowance or a secondary (burst/concurrency) limit, or a GitLab 429.
+ * Distinct from GraphError so callers can defer instead of failing
+ * (src/budget.ts sets a cooldown on it).
  */
 export class RateLimitError extends GraphError {
   override readonly name = "RateLimitError";
@@ -40,12 +41,17 @@ export function somaRepo(repo: string | ForgeRef): string {
 
 const RATE_LIMITED = /rate limit/i;
 
-/** The error for a failed graph verb: RateLimitError when GitHub throttled it. */
+/**
+ * The error for a failed graph verb: RateLimitError when the forge throttled
+ * it. A GitLab 429 also counts (node #130); GitHub keeps its one pattern.
+ */
 export function graphFailure(
   message: string,
   stderr: string,
+  repo: string,
 ): GraphError {
-  return RATE_LIMITED.test(stderr)
+  const gitlab = parseForgeRef(repo).forge === "gitlab";
+  return RATE_LIMITED.test(stderr) || (gitlab && isGitLabRateLimit(stderr))
     ? new RateLimitError(message)
     : new GraphError(message);
 }
@@ -88,7 +94,31 @@ export interface AuditResult {
   closedWithoutReceipt: string[];
   openWithoutCheckpoint: string[];
   openClaimed: { id: string; assignees: string[] }[];
+  /**
+   * Soma's `build-brief-not-ready` finding (soma#753): open `kind: build`
+   * nodes whose body lacks a required section or carries a clarification
+   * marker, with the items `missing`. Absent from an older soma — absent
+   * refuses nothing.
+   */
+  buildBriefNotReady?: BuildBriefNotReady[];
 }
+
+/** One `buildBriefNotReady` entry: the node and what its brief lacks. */
+export interface BuildBriefNotReady {
+  id: string;
+  missing: string[];
+}
+
+/**
+ * Soma's build-brief-not-ready finding for one frontier read. `ok: false`
+ * when the audit could not be read: the walk then holds every build node
+ * (src/route.ts). A soma without the field reads as `ok` with none listed.
+ * `unverified` names build nodes new or edited since the audit that is
+ * served (src/frontier-cache.ts): each is held as if its audit had failed.
+ */
+export type BriefAudit =
+  | { ok: true; notReady: BuildBriefNotReady[]; unverified?: string[] }
+  | { ok: false; error: string };
 
 export interface NodeResult {
   repo: string;
@@ -123,6 +153,14 @@ export interface GraphCallOptions {
  *  walk.ts's re-fetch was previously unbounded).
  */
 export const GRAPH_CALL_TIMEOUT_MS = 60_000;
+
+/**
+ * `soma graph audit` reads every node of the map, not just the frontier: on
+ * jcfischer/seelite (401 nodes, 2026-10-09) it took 83s and every tick's
+ * 60s-bounded audit failed. It runs outside the claim lock and the escalation
+ * pass (src/frontier-cache.ts), so a longer bound holds neither up.
+ */
+export const AUDIT_CALL_TIMEOUT_MS = 180_000;
 
 async function graphReadBackend(ref: ForgeRef, token: ResolvedToken) {
   if (ref.forge === "gitlab") {
@@ -205,6 +243,7 @@ export async function graphFrontier(
     throw graphFailure(
       `soma graph frontier ${root} (${repo}) failed (exit ${result.code}): ${result.stderr.trim()}`,
       result.stderr,
+      repo,
     );
   }
   return normalizeFrontier(repo, parseJson<FrontierResult>("frontier", result.stdout));
@@ -227,9 +266,30 @@ export async function graphAudit(
     throw graphFailure(
       `soma graph audit ${root} (${repo}) failed (exit ${result.code}): ${result.stderr.trim()}`,
       result.stderr,
+      repo,
     );
   }
-  return normalizeAudit(repo, parseJson<AuditResult>("audit", result.stdout));
+  const audit = parseJson<AuditResult>("audit", result.stdout);
+  assertBriefShape(audit.buildBriefNotReady);
+  return normalizeAudit(repo, audit);
+}
+
+/**
+ * The finding's shape is soma#753's `[{ id, missing: string[] }]`. Anything
+ * else is refused, not adapted to: a malformed finding reads as an audit
+ * failure, which holds build nodes (src/frontier-cache.ts), never as "none
+ * listed".
+ */
+function assertBriefShape(value: unknown): void {
+  if (value === undefined) return;
+  const entryOk = (e: unknown) =>
+    typeof e === "object" && e !== null &&
+    typeof (e as BuildBriefNotReady).id === "string" &&
+    Array.isArray((e as BuildBriefNotReady).missing) &&
+    (e as BuildBriefNotReady).missing.every(m => typeof m === "string");
+  if (!Array.isArray(value) || !value.every(entryOk)) {
+    throw new GraphError("soma graph audit: buildBriefNotReady is not [{ id, missing: string[] }] (soma#753)");
+  }
 }
 
 export async function graphNode(
@@ -243,6 +303,7 @@ export async function graphNode(
     throw graphFailure(
       `soma graph node ${id} (${repo}) failed (exit ${result.code}): ${result.stderr.trim()}`,
       result.stderr,
+      repo,
     );
   }
   return normalizeGraphNode(repo, parseJson<NodeResult>("node", result.stdout));
@@ -286,6 +347,9 @@ export function normalizeAudit(repo: string, result: AuditResult): AuditResult {
     closedWithoutReceipt: result.closedWithoutReceipt.map(id),
     openWithoutCheckpoint: result.openWithoutCheckpoint.map(id),
     openClaimed: result.openClaimed.map(n => ({ ...n, id: id(n.id) })),
+    ...(result.buildBriefNotReady === undefined
+      ? {}
+      : { buildBriefNotReady: result.buildBriefNotReady.map(n => ({ ...n, id: id(n.id) })) }),
   };
 }
 

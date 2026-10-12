@@ -18,7 +18,7 @@ const SHA = "a".repeat(40);
 const deadPid = 2_147_483_647;
 const run = (code: number, stdout = "") => ({ code, stdout, stderr: "" });
 const failure = (kind: string) => `FAIL probe-site.mjs (1.0s) exit=${kind === "killed" ? "killed:SIGKILL" : "1"} ${kind}\nFAILED: probe-site.mjs`;
-const outcome = (head = SHA) => probesFailedOutcome({ sha: head, pr: 1, exit: -1, failed: [], failureClass: "infrastructure", tail: "probe lock: waiting 1795s" });
+const outcome = (head = SHA) => probesFailedOutcome({ repo: "acme/widgets", sha: head, pr: 1, exit: -1, failed: [], failureClass: "infrastructure", tail: "probe lock: waiting 1795s" });
 
 function rig() {
  const dir = mkdtempSync(join(tmpdir(), "ranger-probe-requeue-"));
@@ -62,7 +62,7 @@ describe("probe failure classification", () => {
  });
  test("class survives journal truncation and legacy fallback stays narrow", () => {
   expect(infrastructureProbeHead(outcome().slice(0, 400))).toBe(SHA);
-  const legacy = probesFailedOutcome({ sha: SHA, pr: 1, exit: -1, failed: [], tail: "lock wait" });
+  const legacy = probesFailedOutcome({ repo: "acme/widgets", sha: SHA, pr: 1, exit: -1, failed: [], tail: "lock wait" });
   expect(infrastructureProbeHead(legacy)).toBe(SHA.slice(0, 8));
   expect(infrastructureProbeHead(legacy + "\nFAILED: probe-site.mjs")).toBeNull();
   expect(infrastructureProbeHead(legacy.replace("exit -1", "exit 1"))).toBeNull();
@@ -108,7 +108,7 @@ describe("automatic probe requeue", () => {
  test("legacy short-head retry counts toward the full-head budget", async () => {
   const r = rig();
   try {
-   r.park("10", A, { outcome: probesFailedOutcome({ sha: SHA, pr: 1, exit: -1, failed: [], tail: "lock wait" }) });
+   r.park("10", A, { outcome: probesFailedOutcome({ repo: "acme/widgets", sha: SHA, pr: 1, exit: -1, failed: [], tail: "lock wait" }) });
    expect((await r.retry()).resumed).toEqual([`${A}#10`]);
    r.park("10");
    expect((await r.retry()).resumed).toEqual([`${A}#10`]);
@@ -158,7 +158,7 @@ describe("automatic probe requeue", () => {
 });
 
 for (const failedSpawn of [false, true]) {
- test(`walk gives probe retries priority over crash respawns, desk send-backs and new claims (failedSpawn=${failedSpawn})`, async () => {
+ test(`walk gives probe retries priority over crash respawns, desk send-backs, queued resumes and new claims (failedSpawn=${failedSpawn})`, async () => {
   const r = rig();
   const discord = fakeDiscord();
   const keys = ["PATH", "FAKE_SOMA_DIR", "FAKE_SOMA_STATE", "RANGER_WRITE_TEST", "RANGER_DISCORD_TOKEN", "RANGER_DISCORD_API_BASE", "RANGER_DISCORD_ALLOW_TEST_OVERRIDE", "RANGER_DISCORD_MIN_INTERVAL_MS"];
@@ -177,6 +177,8 @@ for (const failedSpawn of [false, true]) {
    r.park("20", B);
    r.journal.upsertWorker({ repo: A, root: 1, nodeId: "90", status: "running", lane: "implement", phase: "review", pid: deadPid, attempts: 0 });
    r.journal.upsertWorker({ repo: A, root: 1, nodeId: "91", status: "awaiting-merge", lane: "implement", phase: "awaiting-merge", prNumber: 91 });
+   r.park("92", A, { outcome: "manual resume" });
+   const queued = r.journal.enqueueResume({ repo: A, root: 1, nodeId: "92", lane: "visual" });
    const github: ForgePort = { ...realGitHub,
     getPr: async (_repo, number) => ({ iid: number, state: "open", headSha: SHA, webUrl: "" } as ChangeRequest),
     listComments: async () => [{ id: 1, author: "ivy-bot", body: `<!-- ranger:review round=1 sha=${SHA} blockers=1 majors=0 nits=0 -->` }],
@@ -190,6 +192,8 @@ for (const failedSpawn of [false, true]) {
    expect(result.probeRequeues.resumed).toEqual(failedSpawn ? [] : [`${B}#20`]);
    expect(r.journal.getWorker("90", A)?.attempts).toBe(0);
    expect(r.journal.getWorker("91", A)?.status).toBe("awaiting-merge");
+   expect(r.journal.getWorker("92", A)?.status).toBe("parked");
+   expect(r.journal.listResumeQueue()).toEqual([queued]);
    expect(r.journal.spawnsToday()).toBe(0); // resumes are existing claims, as with operator resumes
   } finally {
    for (const key of keys) { if (saved[key] === undefined) delete process.env[key]; else process.env[key] = saved[key]; }

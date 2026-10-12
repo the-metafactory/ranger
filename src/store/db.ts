@@ -107,16 +107,28 @@ function migrateWithRetry(db: RangerDb, beforeMigrate: () => void): void {
   });
 }
 
+/**
+ * How long a loser still waiting on the lock keeps retrying, however many
+ * attempts that takes. On a starved CPU the winner's migrations can hold the
+ * write lock past five quick attempts (2026-10-08: CI running four test files
+ * at once failed the open-race test with "database is locked"). Any other
+ * error stands after the five.
+ */
+const RACE_WINDOW_MS = 10_000;
+const LOCKED = /database is locked|SQLITE_BUSY/i;
+
 /** Run `fn`, retrying it after a jittered pause; its last error stands. */
 function retryLostRace(fn: () => void): void {
+  const started = Date.now();
   for (let attempt = 1; ; attempt++) {
     try {
       fn();
       return;
     } catch (error) {
-      if (attempt >= RACE_ATTEMPTS) throw error;
+      const waiting = LOCKED.test(String(error)) && Date.now() - started < RACE_WINDOW_MS;
+      if (attempt >= RACE_ATTEMPTS && !waiting) throw error;
       // Jittered, so two losers do not collide again in lockstep.
-      Bun.sleepSync(25 * attempt + Math.floor(Math.random() * 50));
+      Bun.sleepSync(Math.min(25 * attempt, 250) + Math.floor(Math.random() * 50));
     }
   }
 }

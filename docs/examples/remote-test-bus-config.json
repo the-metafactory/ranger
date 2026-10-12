@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "target": { "domain": "REPLACE_JETSTREAM_DOMAIN", "account": "REPLACE_NATS_ACCOUNT" },
+  "routing": { "classification": "local", "principal": "REPLACE_PRINCIPAL_TOKEN", "stack": "REPLACE_STACK_TOKEN" },
+  "streams": {
+    "request": { "stream": "REPLACE_REQUEST_STREAM", "durable": "REPLACE_REQUEST_DURABLE" },
+    "result": { "stream": "REPLACE_RESULT_STREAM" }
+  },
+  "transport": {
+    "servers": ["REPLACE_NATS_SERVER_URL"],
+    "credentialsFile": "REPLACE_NATS_CREDENTIALS_ABSOLUTE_PATH"
+  },
+  "ssh": { "configFile": "REPLACE_SSH_CONFIG_ABSOLUTE_PATH" },
+  "execution": {
+    "maxAckPending": 1,
+    "maxConcurrentJobs": 1,
+    "ackWaitSeconds": "REPLACE_ACK_WAIT_SECONDS",
+    "progressIntervalSeconds": "REPLACE_PROGRESS_INTERVAL_SECONDS",
+    "maxDeliver": "REPLACE_MAX_DELIVER"
+  },
+  "registry": { "file": "REPLACE_IDENTITY_REGISTRY_ABSOLUTE_PATH" },
+  "issuers": [
+    {
+      "issuer": "REPLACE_RANGER_ISSUER_DID",
+      "bindings": [
+        {
+          "repositoryId": "REPLACE_REPOSITORY_ID",
+          "profileId": "REPLACE_APPROVED_PROFILE_ID",
+          "profileDigest": "REPLACE_PROFILE_DIGEST"
+        }
+      ]
+    }
+  ]
+}

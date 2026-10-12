@@ -83,9 +83,9 @@ maps:
       tokenEnv: RANGER_DISCORD_TOKEN
       channelId: "1487052222067118111"
 
-# The machine account (design §2). `identity` is the login ranger labels
-# claims/closes with (soma graph ... --identity <login>); it defaults to the
-# login resolved from the write token. Graph-mutating ticks REFUSE when the
+# The machine account (design §2). `identity` optionally pins the GitHub bot.
+# GitLab resolves each host's project bot from its write credential, so this
+# GitHub pin can stay in a mixed-forge config. Graph-mutating ticks REFUSE when the
 # resolved identity equals the principal's login.
 bot:
   identity: ivy-agent
@@ -116,6 +116,9 @@ workers:
   deadmanThreshold: 3
   # Sage review rounds per implement-lane PR before ranger parks + escalates.
   reviewRounds: 2
+  # Commits a PR branch may trail origin/<base> before a base merge pass
+  # brings the base in, ahead of the next review or probe run.
+  maxBehindBase: 20
 
 auth:
   readOnlyTokens:
@@ -174,6 +177,10 @@ substrates:
   pi:
     provider: spark
     model: longctx-think
+    # Every Nth sage review round runs on Pi whatever the quota: 2 sends
+    # rounds 2, 4, 6… to Pi, the others stay cross-model. 0 (default) = Pi
+    # is the fallback only.
+    reviewEvery: 0
 
 # Provision the two read-only fine-grained PATs (node #8) and store them in the
 # macOS keychain (the durable store the ~/bin/ranger wrapper resolves):

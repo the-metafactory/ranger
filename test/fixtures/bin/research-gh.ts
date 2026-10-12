@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 
 const path = process.argv[2]!;
@@ -10,6 +10,9 @@ const field = (name: string) => args.find((a) => a.startsWith(`${name}=`))?.slic
 
 if (process.env.GH_TOKEN !== "ghp_write") throw new Error("research forge call must use machine write token");
 if (path.includes("/pulls?")) {
+ // A one-shot outage on the PR lookup (the flag file marks it spent).
+ const once = process.env.FAKE_RESEARCH_PR_LOOKUP_FAIL_ONCE;
+ if (once !== undefined && !existsSync(once)) { writeFileSync(once, "spent"); throw new Error("fake gh: PR lookup down"); }
  console.log(JSON.stringify(state.researchPr ? [state.researchPr] : []));
 } else if (path.endsWith("/pulls")) {
  const sha = spawnSync("git", ["--git-dir", process.env.FAKE_SOMA_REPO_DIR!, "rev-parse", `refs/heads/${field("head")}`], { encoding: "utf8" });

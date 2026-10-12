@@ -130,6 +130,11 @@ export function selectForReview(input: SelectionInput, authorSubstrate: Substrat
  );
 }
 
+/** A review round that runs on Pi by rotation (substrates.pi.reviewEvery), not by quota. */
+export function isPiReviewTurn(round: number, every: number): boolean {
+ return every > 0 && round % every === 0;
+}
+
 /** One line per reading for journal events: what a selection was made on. */
 export function describeReadings(readings: SubstrateReading[], now: Date, config: SubstrateConfig): string {
  const parts = STRONG_SUBSTRATES.map((name) => {

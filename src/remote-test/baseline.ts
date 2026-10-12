@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { lstat, realpath, open, stat } from "node:fs/promises";
+import type { Stats } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { runCmd, type RunResult, type RunOptions } from "../exec.ts";
 import { validateProfileManifest, type ProfileManifest } from "./contract.ts";
@@ -170,6 +171,13 @@ printf 'exitCode=%s\\n' "$code"
 `;
 }
 
+/** Owned by the operator, without any group/world access. */
+export const isOperatorPrivate = (info: Stats) => info.uid === process.getuid?.() && (info.mode & 0o077) === 0;
+/** lstat-based (never follows a symlink): an operator-owned directory without group/world access. */
+export async function isPrivateDirectory(path: string): Promise<boolean> {
+ const info = await lstat(path);
+ return info.isDirectory() && isOperatorPrivate(info);
+}
 /** Resolve existing parents before checking: a symlink must not turn a private
  * destination into a tracked deployment artifact. Refuse overwrites entirely. */
 export async function privateOperatorPath(path: string, existing = false): Promise<string> {

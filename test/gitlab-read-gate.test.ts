@@ -9,7 +9,7 @@ import { callGraph, RateLimitError } from "../src/graph.ts";
 import { glabConfigEnv } from "../src/glab-config-dir.ts";
 import { assertReadOnlyToken, GateError, gitlabApiRead, matchTokenEnv, tokenBatch } from "../src/token-gate.ts";
 import { probeGlabKeyring } from "../scripts/probe-glab-keyring.ts";
-import { activeCooldown, BudgetDeferral, budgetedRead } from "../src/budget.ts";
+import { activeCooldown, BudgetDeferral, budgetedRead, cooldownScope } from "../src/budget.ts";
 import { Journal } from "../src/journal.ts";
 
 const host = "gitlab.example.org";
@@ -229,17 +229,17 @@ describe("GitLab read gate", () => {
     const t0 = new Date("2026-10-07T10:00:00Z");
     try {
       await expect(budgetedRead(journal, repo, token, policy, t0, throttle)).rejects.toThrow(BudgetDeferral);
-      expect(activeCooldown(journal, source, t0)).toMatchObject({ strikes: 1, reason: "GitLab rate limit, throttle 1 in a row" });
+      expect(activeCooldown(journal, cooldownScope(repo, source), t0)).toMatchObject({ strikes: 1, reason: "GitLab rate limit, throttle 1 in a row" });
       await expect(budgetedRead(journal, repo, token, policy, t0, throttle)).rejects.toThrow(BudgetDeferral);
       expect(reads).toBe(1);
       const t1 = new Date(t0.getTime() + 1001);
       await expect(budgetedRead(journal, repo, token, policy, t1, throttle)).rejects.toThrow(BudgetDeferral);
-      expect(activeCooldown(journal, source, t1)?.until.getTime()).toBe(t1.getTime() + 2000);
+      expect(activeCooldown(journal, cooldownScope(repo, source), t1)?.until.getTime()).toBe(t1.getTime() + 2000);
       const t2 = new Date(t1.getTime() + 2001);
       expect(await budgetedRead(journal, repo, token, policy, t2, async () => "ok")).toBe("ok");
-      expect(activeCooldown(journal, source, t2)).toBeNull();
+      expect(activeCooldown(journal, cooldownScope(repo, source), t2)).toBeNull();
       await expect(budgetedRead(journal, repo, token, policy, t2, throttle)).rejects.toThrow(BudgetDeferral);
-      expect(activeCooldown(journal, source, t2)?.strikes).toBe(1);
+      expect(activeCooldown(journal, cooldownScope(repo, source), t2)?.strikes).toBe(1);
     } finally { journal.close(); }
   });
 });

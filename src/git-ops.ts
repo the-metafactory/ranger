@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { closeSync, constants, existsSync, fstatSync, openSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { runCmd, type RunResult } from "./exec.ts";
-import type { ForgeRef } from "./forge-ref.ts";
+import { parseForgeRef, type ForgeRef } from "./forge-ref.ts";
 
 /**
  * Git operations the SUPERVISOR performs in the canonical checkout and in
@@ -27,17 +27,53 @@ export class GitSafetyError extends Error {
  override readonly name = "GitSafetyError";
 }
 
-/** Basic-auth git header env (no credential persistence; the token never lands in .git/config). */
+/**
+ * The write credential for one map's git remote (node #127). Built from the
+ * map's repo, so the auth header follows the forge: GitHub's unscoped header
+ * is unchanged, and a GitLab credential is scoped to the map's host.
+ */
+export interface GitCredential {
+ readonly token: string;
+ readonly forge: ForgeRef;
+}
+
+/** The map's write credential for git; refuses an empty one before any git runs. */
+export function gitCredential(repo: string, token: string): GitCredential {
+ const credential = { token, forge: parseForgeRef(repo) };
+ assertCredential(credential, `the git remote of ${repo}`);
+ return Object.freeze(credential);
+}
+
+/** Clone, fetch and push refuse before invoking git when the map has no write credential. */
+function assertCredential(credential: GitCredential | undefined, what: string): asserts credential is GitCredential {
+ if (credential === undefined || typeof credential.token !== "string" || credential.token.trim().length === 0) {
+  throw new GitSafetyError(`no write credential for ${what} — refusing to run git against the remote`);
+ }
+}
+
+/** The canonical checkout's remote: `https://<host>/<path>.git` (GitHub's is unchanged). */
+export function cloneUrl(forge: ForgeRef): string {
+ return `https://${forge.host}/${forge.path}.git`;
+}
+
+/**
+ * Basic-auth git header env (no credential persistence; the token never lands
+ * in .git/config). GitHub keeps its historical unscoped header. GitLab's is
+ * keyed `http.https://<host>/.extraheader` with user `oauth2`, so git sends it
+ * to the map's host and no other.
+ */
 export function gitAuthEnv(
- token: string,
+ credential: GitCredential,
  base: NodeJS.ProcessEnv = process.env,
 ): NodeJS.ProcessEnv {
- const header = `AUTHORIZATION: basic ${Buffer.from(`${token}:x-oauth-basic`).toString("base64")}`;
+ const { token, forge } = credential;
+ const gitlab = forge.forge === "gitlab";
+ const userinfo = gitlab ? `oauth2:${token}` : `${token}:x-oauth-basic`;
  return {
   ...base,
   GIT_CONFIG_COUNT: "1",
-  GIT_CONFIG_KEY_0: "http.extraheader",
-  GIT_CONFIG_VALUE_0: header,
+  GIT_CONFIG_KEY_0: gitlab ? `http.https://${forge.host}/.extraheader` : "http.extraheader",
+  GIT_CONFIG_VALUE_0: `AUTHORIZATION: basic ${Buffer.from(userinfo).toString("base64")}`,
  };
 }
 
@@ -69,8 +105,8 @@ const NO_SUBMODULE_RECURSION = [
 ];
 
 /**
- * Run git with hooks and fsmonitor disabled, in a minimal env. `token` adds
- * the auth header (remote calls only) and turns submodule recursion off
+ * Run git with hooks and fsmonitor disabled, in a minimal env. `credential`
+ * adds the auth header (remote calls only) and turns submodule recursion off
  * (`NO_SUBMODULE_RECURSION`); every such call but `clone` names the
  * `canonical` checkout whose git state was vetted, and runs only where git
  * resolves its repository to that one (`assertCheckoutOf`). Git's remote
@@ -78,9 +114,10 @@ const NO_SUBMODULE_RECURSION = [
  */
 export async function safeGit(
  args: string[],
- opts: { cwd: string; token?: string; canonical?: string; timeoutMs?: number },
+ opts: { cwd: string; credential?: GitCredential; canonical?: string; timeoutMs?: number },
 ): Promise<RunResult> {
- if (opts.token !== undefined) {
+ if (opts.credential !== undefined) {
+  assertCredential(opts.credential, `\`git ${args[0]}\``);
   assertNamedRefs(args);
   if (args[0] !== "clone") {
    if (opts.canonical === undefined) {
@@ -94,12 +131,12 @@ export async function safeGit(
   "git",
   [
    ...GIT_SAFETY_ARGS,
-   ...(opts.token === undefined ? [] : NO_SUBMODULE_RECURSION),
+   ...(opts.credential === undefined ? [] : NO_SUBMODULE_RECURSION),
    ...args,
   ],
   {
    cwd: opts.cwd,
-   env: opts.token === undefined ? base : gitAuthEnv(opts.token, base),
+   env: opts.credential === undefined ? base : gitAuthEnv(opts.credential, base),
    timeoutMs: opts.timeoutMs ?? 60_000,
   },
  );
@@ -224,6 +261,46 @@ export const NODE_BRANCH = /^node\/\d+-[a-z0-9-]+$/;
 /** The remote ranger's node branches track (`worktree add -b … origin/<base>`). */
 const MAP_REMOTE = "origin";
 
+/**
+ * Records git-lfs and a push retry write to the shared config, each with the
+ * only values that pass: they steer no command, remote or credential, so
+ * they leave the tamper hash (2026-10-10: seelite #640, #500, #747, #755,
+ * #843, #819 and ranger #158 parked on `filter.lfs.*`, `lfs.<url>.access`
+ * and `http.postbuffer`, none of them a tamper). The filter commands are the
+ * ones `git lfs install` writes, byte for byte; any other value, a
+ * `filter.LFS` driver (git keeps the subsection's case) or an `http.<url>.*`
+ * key stays in the hash. Judged per record, never per key: a repeated key
+ * whose other copy is not one of these keeps that copy hashed, whichever
+ * one git reads last.
+ */
+const BENIGN_VALUES: Record<string, (value: string) => boolean> = {
+ "filter.lfs.clean": (v) => v === "git-lfs clean -- %f",
+ "filter.lfs.smudge": (v) => v === "git-lfs smudge -- %f" || v === "git-lfs smudge --skip -- %f",
+ "filter.lfs.process": (v) => v === "git-lfs filter-process" || v === "git-lfs filter-process --skip",
+ "filter.lfs.required": (v) => v === "true",
+ "lfs.repositoryformatversion": (v) => v === "0",
+ "http.postbuffer": (v) => /^[0-9]{1,12}[kmg]?$/i.test(v),
+};
+
+/** `lfs.<url>.access=basic`: git-lfs records that the LFS endpoint took basic auth. */
+const LFS_ACCESS = /^lfs\.https:\/\/[^\s]+\/info\/lfs\.access$/;
+
+export function isBenignRecord(key: string, value: string | null): boolean {
+ if (value === null) return false;
+ if (LFS_ACCESS.test(key)) return value === "basic";
+ return BENIGN_VALUES[key]?.(value) ?? false;
+}
+
+/**
+ * Whether a `GitState.entries` name is one `isBenignRecord` can drop: a
+ * known-good record taken before a key joined that list still names it, and
+ * its "(gone)" is no change (`checkKnownGood`). A record with any other
+ * value is still hashed and still named, so it shows as changed, never gone.
+ */
+export function isBenignEntry(name: string): boolean {
+ return name in BENIGN_VALUES || /^lfs\.<[0-9a-f]{12}>\.access$/.test(name);
+}
+
 /** `branch.<name>.<key>` → name and key (subsection split on the first and last dot; names may hold dots). */
 function branchKey(key: string): { name: string; key: string } | null {
  const first = key.indexOf(".");
@@ -294,7 +371,8 @@ function configRecords(
   if (tracksOrigin && (midWrite || complete)) own.add(name);
  }
  const kept = records
-  .filter(([key]) => {
+  .filter(([key, value]) => {
+   if (isBenignRecord(key, value)) return false;
    const parsed = branchKey(key);
    return parsed === null || !own.has(parsed.name);
   });
@@ -822,19 +900,23 @@ export async function dirtyFiles(worktree: string): Promise<string[]> {
  return result.stdout.split("\n").filter((l) => l.trim().length > 0);
 }
 
-/** Commits on the branch that are not on origin/<base>. */
-export async function commitsAhead(
- worktree: string,
- base: string,
-): Promise<number> {
- const result = await safeGit(["rev-list", "--count", `origin/${base}..HEAD`], {
-  cwd: worktree,
-  timeoutMs: 10_000,
- });
+/** How many commits `range` holds (`git rev-list --count`); `what` names it in the error. */
+async function countRevs(worktree: string, range: string, what: string): Promise<number> {
+ const result = await safeGit(["rev-list", "--count", range], { cwd: worktree, timeoutMs: 10_000 });
  if (result.code !== 0) {
-  throw new GitSafetyError(`cannot count commits ahead of origin/${base}: ${result.stderr.trim()}`);
+  throw new GitSafetyError(`cannot count ${what}: ${result.stderr.trim()}`);
  }
  return Number(result.stdout.trim()) || 0;
+}
+
+/** Commits on the branch that are not on origin/<base>. */
+export async function commitsAhead(worktree: string, base: string): Promise<number> {
+ return countRevs(worktree, `origin/${base}..HEAD`, `commits ahead of origin/${base}`);
+}
+
+/** Commits on origin/<base> that the branch's HEAD does not have (ranger issue #231). */
+export async function commitsBehind(worktree: string, base: string): Promise<number> {
+ return countRevs(worktree, `HEAD..origin/${base}`, `commits behind origin/${base}`);
 }
 
 /** Refuse the push when any branch commit message carries a closing keyword. */
@@ -862,15 +944,16 @@ export async function vettedPush(opts: {
  worktree: string;
  canonical: string;
  branch: string;
- token: string;
+ credential: GitCredential;
  configSnapshot: string;
  /** What to push (default HEAD); research pushes its named local branch. */
  source?: string;
 }): Promise<GitState> {
+ assertCredential(opts.credential, `the push of ${opts.branch}`);
  const vetted = await assertGitUntouched(opts.canonical, opts.configSnapshot);
  const push = await safeGit(
   ["push", "--no-verify", "origin", `${opts.source ?? "HEAD"}:refs/heads/${opts.branch}`],
-  { cwd: opts.worktree, token: opts.token, canonical: opts.canonical, timeoutMs: 120_000 },
+  { cwd: opts.worktree, credential: opts.credential, canonical: opts.canonical, timeoutMs: 120_000 },
  );
  if (push.code !== 0) {
   throw new GitSafetyError(`push of ${opts.branch} failed: ${push.stderr.trim()}`);
@@ -892,13 +975,24 @@ export async function vettedPush(opts: {
 export async function fastForwardCanonical(
  canonical: string,
  base: string,
- token: string,
+ credential: GitCredential,
  opts: { attempts?: number; backoffMs?: number } = {},
 ): Promise<void> {
+ assertCredential(credential, `the fetch of ${base} into ${canonical}`);
+ return retryOnRefLock(() => fastForwardOnce(canonical, base, credential), opts);
+}
+
+/**
+ * Run `once` again while it fails on a ref lock another git process holds,
+ * with a linear backoff: git's own lock is the mutex between run-nodes that
+ * share the canonical checkout. Any other failure, or the last attempt's,
+ * is thrown.
+ */
+async function retryOnRefLock<T>(once: () => Promise<T>, opts: { attempts?: number; backoffMs?: number }): Promise<T> {
  const attempts = opts.attempts ?? 4;
  for (let attempt = 1; ; attempt++) {
   try {
-   return await fastForwardOnce(canonical, base, token);
+   return await once();
   } catch (error) {
    const contended = error instanceof GitSafetyError && GIT_LOCK_CONTENTION.test(error.message);
    if (!contended || attempt >= attempts) throw error;
@@ -910,10 +1004,10 @@ export async function fastForwardCanonical(
 /** Git refusing a ref update because another git process holds that ref's lock. */
 export const GIT_LOCK_CONTENTION = /cannot lock ref|Unable to create '[^']+\.lock'/;
 
-async function fastForwardOnce(canonical: string, base: string, token: string): Promise<void> {
+async function fastForwardOnce(canonical: string, base: string, credential: GitCredential): Promise<void> {
  const fetch = await safeGit(["fetch", "origin", base], {
   cwd: canonical,
-  token,
+  credential,
   canonical,
   timeoutMs: 120_000,
  });
@@ -933,4 +1027,32 @@ async function fastForwardOnce(canonical: string, base: string, token: string): 
    `cannot fast-forward ${base} in the canonical checkout ${canonical}: ${result.stderr.trim()}`,
   );
  }
+}
+
+/**
+ * Fetch one branch from origin into the canonical checkout, so a head
+ * someone else pushed to it (a principal's session, another agent) is
+ * there to bring a worktree to (ranger issue #228). The fetch only adds
+ * objects and moves `refs/remotes/origin/<branch>`: no local branch or
+ * worktree changes. A held ref lock is retried, as `fastForwardCanonical`.
+ */
+export async function fetchBranch(
+ canonical: string,
+ branch: string,
+ credential: GitCredential,
+ opts: { attempts?: number; backoffMs?: number } = {},
+): Promise<void> {
+ assertCredential(credential, `the fetch of ${branch} into ${canonical}`);
+ return retryOnRefLock(async () => {
+  const fetch = await safeGit(["fetch", "origin", branch], { cwd: canonical, credential, canonical, timeoutMs: 120_000 });
+  if (fetch.code !== 0) throw new GitSafetyError(`fetch origin ${branch} failed: ${fetch.stderr.trim()}`);
+ }, opts);
+}
+
+/** Whether `ancestor` is reachable from `descendant` (`git merge-base --is-ancestor`); throws when git cannot say. */
+export async function isAncestor(cwd: string, ancestor: string, descendant: string): Promise<boolean> {
+ const r = await safeGit(["merge-base", "--is-ancestor", ancestor, descendant], { cwd, timeoutMs: 30_000 });
+ if (r.code === 0) return true;
+ if (r.code === 1) return false;
+ throw new GitSafetyError(`cannot compare ${ancestor.slice(0, 8)} with ${descendant.slice(0, 8)}: ${r.stderr.trim()}`);
 }

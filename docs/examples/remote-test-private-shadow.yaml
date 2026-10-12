@@ -1,0 +1,18 @@
+# Inert private configuration skeleton: replace every REPLACE_* value outside Git.
+# This file deliberately fails validation until substituted; it activates no work.
+# Preserve the existing map's walk, commands, review, CI and merge policy when
+# adopting only testBackend. See ../remote-test-pilot.md for operator prerequisites.
+version: 1
+maps:
+  - repo: REPLACE_REPO
+    root: REPLACE_MAP_ROOT
+    walk: none
+    autoMerge: false
+    testBackend:
+      kind: shadow
+      configFile: REPLACE_SSH_CONFIG_ABSOLUTE_PATH
+      stateRoot: REPLACE_STATE_ROOT_ABSOLUTE_PATH
+      profileId: REPLACE_APPROVED_PROFILE_ID
+      lockFile: REPLACE_COMMITTED_LOCK_FILENAME
+      deadlineSeconds: REPLACE_DEADLINE_SECONDS
+      reportRoot: REPLACE_REPORT_ROOT_ABSOLUTE_PATH

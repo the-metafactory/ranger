@@ -42,8 +42,6 @@ describe("ForgeRef config and identity seam", () => {
    ["the-metafactory/ranger", 91, "the-metafactory__ranger"],
    ["the-metafactory/ranger", 133, "the-metafactory__ranger"],
    ["jcfischer/seekolous", 26, "jcfischer__seekolous"],
-   ["jcfischer/seelite", 1, "jcfischer__seelite"],
-   ["jcfischer/seelite", 460, "jcfischer__seelite"],
    ["the-metafactory/soma", 604, "the-metafactory__soma"],
    ["the-metafactory/soma", 645, "the-metafactory__soma"],
    ["the-metafactory/soma", 565, "the-metafactory__soma"],
@@ -51,6 +49,7 @@ describe("ForgeRef config and identity seam", () => {
    ["the-metafactory/soma", 533, "the-metafactory__soma"],
    ["the-metafactory/soma", 751, "the-metafactory__soma"],
    ["the-metafactory/soma", 766, "the-metafactory__soma"],
+   ["the-metafactory/soma", 781, "the-metafactory__soma"],
   ] as const;
   expect(config.maps.map(m => [m.repo, m.root])).toEqual(expected.map(([repo, root]) => [repo, root]));
   for (const [index, [repo, root, fileRepo]] of expected.entries()) {
@@ -157,7 +156,11 @@ describe("ForgeRef config and identity seam", () => {
   expect(resumeArgv({ rangerBin: "ranger", repo: gitlab, root: 12, nodeId: "13", configPath: "/tmp/ranger.yaml", force: false })).toContain(key);
   expect(launchPlan({ repo: gitlab, root: 12, nodeId: "13", cwd: "/tmp" }).prompt).toContain(gitlab);
   expect(() => buildNowArgv({ bin: "ranger", key: `${key}#14`, nodeId: "13", configPath: "/tmp/ranger.yaml" })).toThrow();
-  expect(() => mergeArgv({ repo: gitlab, pr: 12, sha: "a".repeat(40) })).toThrow("GitLab merge is not implemented");
+  // Node #132: the principal's tap merge on GitLab is glab's merge endpoint, squashed and pinned.
+  expect(mergeArgv({ repo: gitlab, pr: 12, sha: "a".repeat(40) })).toEqual([
+   "glab", "api", "--hostname", "gitlab.software.geant.org", "-X", "PUT",
+   "projects/claw%2Fcrisis-simulator/merge_requests/12/merge", "-f", "squash=true", "-f", `sha=${"a".repeat(40)}`,
+  ]);
  });
 
  test("registered GitLab maps refuse all execution entry points before calls or journal writes", async () => {
@@ -209,14 +212,17 @@ describe("ForgeRef config and identity seam", () => {
   } finally { rmSync(dir, { recursive: true, force: true }); }
  });
 
- test("serve-only GitLab graph reads require credentials; unsupported PR reads stay inert", async () => {
+ test("serve-only GitLab graph reads require credentials; MR reads ask the read gate first", async () => {
   const config = configWith(gitlab, "serve");
   const maps = servedMaps(config).filter(map => map.repo === gitlab);
   expect(maps).toHaveLength(1);
   expect(() => assertReadOnlyTokens(config, maps, {})).toThrow("no read-only token mapping");
   let calls = 0;
   const tokens = async (): Promise<never> => { calls++; throw new Error("unexpected credentials"); };
-  expect(await readPrLive(config, gitlab, 12, tokens)).toBeNull();
+  // Node #132: an MR read goes through the read gate, which refuses here before any read.
+  await expect(readPrLive(config, gitlab, 12, tokens)).rejects.toThrow("unexpected credentials");
+  expect(calls).toBe(1);
+  calls = 0;
   const reader = new ServeReader(config, maps, "/unused");
   reader.refresh();
   // Await this refresh before the headless test returns.

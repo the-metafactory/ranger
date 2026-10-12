@@ -8,7 +8,7 @@ import { safeGit } from "./git-ops.ts";
 import { trustedSnapshot } from "./git-trust.ts";
 import { mapKey } from "./maps.ts";
 import { closeGraphEscalation, type CardBudget } from "./card-sync.ts";
-import { parseForgeRef } from "./forge-ref.ts";
+import { changeRequestLabel, changeRequestNoun, nodeCommentUrl } from "./forge-text.ts";
 import { implementBranchFor } from "./implement.ts";
 import { researchBranchFor, slugify, worktreeBranch } from "./worker.ts";
 
@@ -46,10 +46,10 @@ export async function finishClosedElsewhere(ctx: {
   const completion = node.node.completion;
   const kind = completion === undefined ? "ungated" : completion.closer === ctx.botIdentity ? "own" : "external";
   const receipt = completion === undefined ? "not available" :
-    `${node.url}${parseForgeRef(map.repo).forge === "github" ? "#issuecomment-" : "#note_"}${completion.receiptCommentId}`;
+    nodeCommentUrl(map.repo, node.url, completion.receiptCommentId);
   const attribution = kind === "ungated" ? "closed on the graph without a gated-close receipt; closer unknown" :
     kind === "own" ? `recovered ranger close by ${completion!.closer}` : `closed outside ranger by ${completion!.closer}`;
-  const detail = `${attribution}; receipt: ${receipt}; ${pr === null ? "no PR" : `PR #${pr.iid} ${pr.state}`}`;
+  const detail = `${attribution}; receipt: ${receipt}; ${pr === null ? `no ${changeRequestNoun(map.repo)}` : `${changeRequestLabel(map.repo, pr.iid)} ${pr.state}`}`;
   const canonical = ctx.canonical ?? (map.canonical === undefined ? join(expandHome(ctx.config.state.canonicalRoot), map.repo) : expandHome(map.canonical));
   const worktree = ctx.worktree ?? journal.getWorker(id, map.repo)?.worktree;
   fence();

@@ -23,11 +23,12 @@ import {
  ciState,
  classifyReason,
  mergeRefusal,
- MACHINE_GH_KEYS,
+ MACHINE_FORGE_KEYS,
  needsYouEntries,
  awaitingMergeEntries,
  type NeedsYouInputs,
  type PrView,
+ type ActionDeps,
  uncheckedNeedsEye,
 } from "../src/serve-parked.ts";
 
@@ -118,12 +119,12 @@ describe("node #54 — the reason class, by ranger's own rules", () => {
  });
 
  test("review cap: the head-moved variant too", () => {
-  const r = row({ outcome: reviewCapHeadMovedOutcome({ rounds: 2, pr: 50 }) });
+  const r = row({ outcome: reviewCapHeadMovedOutcome({ repo: "acme/widgets", rounds: 2, pr: 50 }) });
   expect(classifyReason(r, [], null, 2).class).toBe("review cap");
  });
 
  test("review cap, head moved: the stop is the unreviewed head, never the earlier head's counts as current", () => {
-  const r = row({ outcome: reviewCapHeadMovedOutcome({ rounds: 5, pr: 687 }) });
+  const r = row({ outcome: reviewCapHeadMovedOutcome({ repo: "acme/widgets", rounds: 5, pr: 687 }) });
   const events = [ev("parked", r.outcome as string), ev("reviewed", "round 5 @ 4b2109fa: commented, 0 blocker(s), 0 major(s) on claude")];
   const reason = classifyReason(r, events, null, 5);
   expect(reason.class).toBe("review cap");
@@ -139,7 +140,7 @@ describe("node #54 — the reason class, by ranger's own rules", () => {
  });
 
  test("probes failed: the names from the run's FAILED: line, when the outcome kept it", () => {
-  const outcome = probesFailedOutcome({
+  const outcome = probesFailedOutcome({ repo: "acme/widgets",
    sha: "3c32cb24aa",
    pr: 686,
    exit: 1,
@@ -261,7 +262,7 @@ describe("node #54 — the reason class, by ranger's own rules", () => {
  });
 
  test("the builder and the classifier agree on the review-cap words", () => {
-  const outcome = reviewCapOutcome({ blockers: 1, majors: 2, round: 3, pr: 9 });
+  const outcome = reviewCapOutcome({ repo: "acme/widgets", blockers: 1, majors: 2, round: 3, pr: 9 });
   expect(classifyReason(row({ outcome }), [], null, 3).class).toBe("review cap");
  });
 });
@@ -446,7 +447,7 @@ describe("node #54 — the actions and their guards", () => {
    pr?: PrView | null;
    exists?: (p: string) => boolean;
    verifyChecks?: (repo: string, sha: string, env: Record<string, string>) => Promise<PrView["ci"] | null>;
-  } = {},
+  } & Pick<ActionDeps, "workerLog" | "behindBase"> = {},
  ) => {
   const runs: { argv: string[]; env: Record<string, string>; detached: boolean }[] = [];
   const run: ActionRunner = async (argv, env, o) => {
@@ -481,6 +482,8 @@ describe("node #54 — the actions and their guards", () => {
     configPath: "/Users/someone/ranger/ranger.yaml",
     readPr: async () => (opts.live === undefined ? greenPr() : opts.live),
     ...(opts.verifyChecks === undefined ? {} : { verifyChecks: opts.verifyChecks }),
+    ...(opts.workerLog === undefined ? {} : { workerLog: opts.workerLog }),
+    ...(opts.behindBase === undefined ? {} : { behindBase: opts.behindBase }),
     exists: opts.exists ?? (() => true),
     after: (e) => after.push(e.nodeId),
    },
@@ -535,7 +538,7 @@ describe("node #54 — the actions and their guards", () => {
   expect(res.status).toBe(200);
   expect(runs).toHaveLength(3);
   expect(runs[0].argv).toEqual(["gh", "pr", "merge", "687", "--repo", SEELITE, "--squash", "--match-head-commit", SHA]);
-  for (const key of MACHINE_GH_KEYS) expect(runs[0].env[key]).toBeUndefined();
+  for (const key of MACHINE_FORGE_KEYS) expect(runs[0].env[key]).toBeUndefined();
   expect(Object.keys(runs[0].env).some((k) => /TOKEN/.test(k))).toBe(false);
   expect(runs[0].env.HOME).toBe("/Users/someone");
  });
@@ -680,7 +683,7 @@ describe("node #54 — the actions and their guards", () => {
   expect(res.status).toBe(200);
   expect(runs).toHaveLength(3);
   expect(seen).toEqual([{ repo: SEELITE, sha: SHA, env: runs[0].env }]); // the merge's own environment
-  for (const key of MACHINE_GH_KEYS) expect(seen[0].env[key]).toBeUndefined();
+  for (const key of MACHINE_FORGE_KEYS) expect(seen[0].env[key]).toBeUndefined();
  });
 
  for (const [why, full, says] of [
@@ -697,7 +700,7 @@ describe("node #54 — the actions and their guards", () => {
   });
  }
 
- test("the session prompt carries the repo, the id and the reason class only", async () => {
+ test("the session prompt carries the repo, the id, ranger's own reason and a journal command that names the config, never prose", async () => {
   const { handler, runs } = setup();
   const res = await handler(post("/api/session", { ...ok, dryRun: true }));
   expect(res.status).toBe(200);
@@ -706,12 +709,61 @@ describe("node #54 — the actions and their guards", () => {
   expect(script).toContain("#663");
   expect(script).toContain(SEELITE);
   expect(script).toContain("review cap");
+  // ranger's one-line detail, built from its own numbers (ranger issue #229).
+  expect(script).toMatch(/major\(s\) and \d+ blocker\(s\) still open/);
+  expect(script).toContain(`ranger journal --repo ${SEELITE} --node 663 -c`);
+  expect(script).toContain("ranger/ranger.yaml");
+  // No log or behind count was wired: neither line is guessed.
+  expect(script).not.toContain("worker's log");
+  expect(script).not.toContain("behind");
   expect(script).not.toContain("good-enough");
   expect(script).not.toContain("Stations are solid");
   expect(runs).toHaveLength(0);
   await handler(post("/api/session", ok));
   expect(runs[0].argv[0]).toBe("osascript");
   expect(Object.keys(runs[0].env).sort()).toEqual(["HOME", "PATH"]);
+ });
+
+ test("the session prompt names the worker's log and how far the PR is behind its base, read when it opens", async () => {
+  const asked: [string, number][] = [];
+  const { handler } = setup({
+   workerLog: (repo, id) => `/logs/workers/${repo.replace("/", "_")}-${id}-g3.log`,
+   behindBase: async (repo, pr) => {
+    asked.push([repo, pr]);
+    return { base: "main", behind: 39 };
+   },
+  });
+  const res = await handler(post("/api/session", { ...ok, dryRun: true }));
+  const script = ((await res.json()) as { argv: string[] }).argv.join(" ");
+  expect(script).toContain("log is /logs/workers/jcfischer_seelite-663-g3.log.");
+  expect(script).toContain("The PR branch is 39 commit(s) behind main.");
+  expect(asked).toEqual([[SEELITE, ROW_663.prNumber as number]]);
+ });
+
+ test("a worker-log read that throws leaves its line out and still opens the session", async () => {
+  const { handler } = setup({
+   workerLog: () => {
+    throw new Error("database is locked");
+   },
+  });
+  const res = await handler(post("/api/session", { ...ok, dryRun: true }));
+  expect(res.status).toBe(200);
+  const script = ((await res.json()) as { argv: string[] }).argv.join(" ");
+  expect(script).toContain("#663");
+  expect(script).not.toContain("log is");
+ });
+
+ test("a behind-base read that fails leaves its line out and still opens the session", async () => {
+  const { handler } = setup({
+   behindBase: async () => {
+    throw new Error("gh api: 502");
+   },
+  });
+  const res = await handler(post("/api/session", { ...ok, dryRun: true }));
+  expect(res.status).toBe(200);
+  const script = ((await res.json()) as { argv: string[] }).argv.join(" ");
+  expect(script).toContain("#663");
+  expect(script).not.toContain("behind");
  });
 
  const refusals: [string, string, Request, Parameters<typeof setup>[0]?][] = [

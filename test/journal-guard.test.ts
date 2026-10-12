@@ -18,7 +18,7 @@ import {
  underTest,
 } from "../src/journal-guard.ts";
 import { runCmd } from "../src/exec.ts";
-import { runNodeArgv } from "../src/walk.ts";
+import { runNodeArgv } from "../src/spawn.ts";
 import { baseConfigLines, bun, runCli } from "./support.ts";
 
 const FOREIGN = ["f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0", "e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1"];
@@ -374,6 +374,7 @@ describe("the live wrapper (node #66)", () => {
    "HOME", "PATH", "GH_CONFIG_DIR", "TERM", "PWD", "SHLVL", "_",
    "GH_TOKEN", "RANGER_WRITE_GH_TOKEN_METAFACTORY", "RANGER_WRITE_GH_TOKEN_PERSONAL",
    "RANGER_READONLY_GH_TOKEN_METAFACTORY", "RANGER_READONLY_GH_TOKEN_PERSONAL", "RANGER_DISCORD_TOKEN",
+   "RANGER_WRITE_GL_TOKEN_GEANT", "RANGER_READONLY_GL_TOKEN_GEANT",
   ]);
   expect([...out.vars.keys()].filter((k) => !allowed.has(k))).toEqual([]);
   expect(out.vars.get("TERM")).toBe("xterm");

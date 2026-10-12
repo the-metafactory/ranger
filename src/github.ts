@@ -1,4 +1,4 @@
-import type { ChangeRequest, MergeState, CiPurpose, CiVerdict, IssueComment } from "./forge.ts";
+import type { ChangeRequest, MergeState, MergeOutcome, CiPurpose, CiVerdict, IssueComment } from "./forge.ts";
 import { githubCiVerdict } from "./github-ci.ts";
 import { runCmd } from "./exec.ts";
 import { runReadRetryingTransient } from "./transient.ts";
@@ -218,7 +218,7 @@ export function squashTitle(title: string, number: number): string {
 /**
  * Squash-merge a PR, pinned to the head SHA the gate passed: GitHub refuses
  * the merge if the head moved in between (409), so ranger never merges a
- * commit its gate did not see.
+ * commit its gate did not see. Any refusal throws, so a return is a merge.
  */
 export async function mergePr(
  repo: string,
@@ -226,7 +226,7 @@ export async function mergePr(
  sha: string,
  title: string,
  token: string,
-): Promise<void> {
+): Promise<MergeOutcome> {
  await ghApi(
   token,
   [
@@ -242,6 +242,7 @@ export async function mergePr(
   ],
   `merge PR #${number}`,
  );
+ return { status: "merged" };
 }
 
 export async function issueLabels(

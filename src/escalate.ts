@@ -1,3 +1,4 @@
+import { principalLoginForRepo } from "./config.ts";
 import { mapKey } from "./maps.ts";
 import { join } from "node:path";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
@@ -5,7 +6,7 @@ import type { EscalationDiscord } from "./discord.ts";
 import { classify, hitlWaiting, loadProbeRegistry } from "./route.ts";
 import { BudgetDeferral, budgetPolicy, budgetedRead } from "./budget.ts";
 import { readFrontier } from "./frontier-cache.ts";
-import { GRAPH_CALL_TIMEOUT_MS, graphAudit, graphNode } from "./graph.ts";
+import { AUDIT_CALL_TIMEOUT_MS, GRAPH_CALL_TIMEOUT_MS, graphAudit, graphNode } from "./graph.ts";
 import { type OwnedCheck, withEscalateLock } from "./lock.ts";
 import type { ResolvedToken } from "./token-gate.ts";
 import type { Journal } from "./journal.ts";
@@ -101,7 +102,7 @@ async function escalateOneMap(
   }
 
   try {
-    const { frontier } = await readFrontier({
+    const { frontier, briefs } = await readFrontier({
       journal,
       repo: map.repo,
       root: map.root,
@@ -110,6 +111,11 @@ async function escalateOneMap(
       maxAgeMs: config.budget.frontierMaxAgeMin * 60_000,
       now,
       timeoutMs: GRAPH_CALL_TIMEOUT_MS,
+      // The walk runs the audit (minutes on a large map); the pass serves its
+      // cached result and audits only a map that has none, within the
+      // graph-call bound, so it fits its 120s budget.
+      audit: "if-missing",
+      auditTimeoutMs: GRAPH_CALL_TIMEOUT_MS,
     });
 
     const classified = frontier.frontier.map((entry) =>
@@ -117,12 +123,16 @@ async function escalateOneMap(
         botIdentity: config.bot.identity,
         allowlist: map.nodes,
         skip: map.skip,
+        briefs,
       }),
     );
+    const briefHeld = classified.filter((n) => n.route.route === "brief-not-ready");
     const needed = [
       ...hitlWaiting(classified),
       ...classified.filter((n) => n.route.route === "provisioning"),
+      ...briefHeld,
     ].filter(cardNeeded);
+    if (!briefs.ok) base.cardErrors.push(`build briefs unverified: ${briefs.error}`);
 
     // The absent-card reconciliation runs FIRST so its GUARANTEED reserved
     // ops also get a FRESH wall-clock window — if it ran after the active
@@ -133,7 +143,9 @@ async function escalateOneMap(
     // served next tick (only absent carries the hard guarantee). Total
     // per-tick bound is still MAX_CARDS_PER_TICK (active cap + absent
     // reserve).
-    const neededIds = new Set(needed.map((n) => n.id));
+    // A build node held only because the audit was unreadable gets no card,
+    // and keeps any brief card it has: its readiness is unknown, not fixed.
+    const neededIds = new Set([...needed, ...briefHeld].map((n) => n.id));
     const absent = await markAbsentCards(
       {
         client,
@@ -277,8 +289,8 @@ async function digestOneMap(
       () =>
         graphAudit(map.repo, map.root, token, {
           timeoutMs: Math.min(
-            GRAPH_CALL_TIMEOUT_MS,
-            remainingMs || GRAPH_CALL_TIMEOUT_MS,
+            AUDIT_CALL_TIMEOUT_MS,
+            remainingMs || AUDIT_CALL_TIMEOUT_MS,
           ),
         }),
     );
@@ -304,7 +316,7 @@ async function digestOneMap(
       ageCounts: openCards,
       audit,
       budget: base.budget,
-      principal: config.principal.login,
+      principal: principalLoginForRepo(config, map.repo) ?? "principal",
       principalDiscordId: config.principal.discordId,
       now,
     });

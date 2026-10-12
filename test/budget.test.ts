@@ -70,6 +70,9 @@ afterEach(() => {
 
 const somaCalls = () =>
   readFileSync(calls, "utf8").split("\n").filter(Boolean).length;
+/** Fresh frontier reads; each also audits (node #154), which somaCalls counts. */
+const frontierReads = () =>
+  readFileSync(calls, "utf8").split("\n").filter((l) => l.startsWith("frontier ")).length;
 
 const read = (now: Date, maxAgeMs = HOUR) =>
   readFrontier({
@@ -151,7 +154,10 @@ describe("readFrontier — skip GraphQL while the repo's sentinel is unchanged",
     const second = await read(new Date(now.getTime() + 15 * 60_000));
     expect(second.source).toBe("cache");
     expect(second.frontier.frontier.length).toBeGreaterThan(0);
-    expect(somaCalls()).toBe(1);
+    expect(frontierReads()).toBe(1);
+    // A fresh read audits beside the frontier (node #154); the cache serves both.
+    expect(somaCalls()).toBe(2);
+    expect(second.briefs).toEqual({ ok: true, notReady: [] });
   });
 
   test("an issue edit (newer updated_at) re-reads", async () => {
@@ -159,7 +165,7 @@ describe("readFrontier — skip GraphQL while the repo's sentinel is unchanged",
     await read(now);
     process.env.FAKE_GH_ISSUES_UPDATED = "2026-01-02T00:00:00Z";
     expect((await read(now)).source).toBe("fresh");
-    expect(somaCalls()).toBe(2);
+    expect(frontierReads()).toBe(2);
   });
 
   test("a new blocked-by edge (newer issue event, same updated_at) re-reads", async () => {
@@ -169,7 +175,7 @@ describe("readFrontier — skip GraphQL while the repo's sentinel is unchanged",
     await read(now);
     process.env.FAKE_GH_EVENTS_LATEST = "1001";
     expect((await read(now)).source).toBe("fresh");
-    expect(somaCalls()).toBe(2);
+    expect(frontierReads()).toBe(2);
   });
 
   test("a cached read older than the max age re-reads", async () => {
@@ -178,7 +184,7 @@ describe("readFrontier — skip GraphQL while the repo's sentinel is unchanged",
     expect((await read(new Date(now.getTime() + HOUR), HOUR)).source).toBe(
       "fresh",
     );
-    expect(somaCalls()).toBe(2);
+    expect(frontierReads()).toBe(2);
   });
 
   test("an unreadable sentinel always reads fresh and never writes the cache", async () => {
@@ -187,7 +193,7 @@ describe("readFrontier — skip GraphQL while the repo's sentinel is unchanged",
     expect((await read(now)).source).toBe("fresh");
     delete process.env.FAKE_GH_SENTINEL_FAIL;
     expect((await read(now)).source).toBe("fresh");
-    expect(somaCalls()).toBe(2);
+    expect(frontierReads()).toBe(2);
   });
 
   test("under the floor a valid cache is still served; a stale one defers", async () => {
@@ -202,7 +208,7 @@ describe("readFrontier — skip GraphQL while the repo's sentinel is unchanged",
     // sentinel matches again is still served from the cache.
     delete process.env.FAKE_GH_EVENTS_LATEST;
     expect((await read(now)).source).toBe("cache");
-    expect(somaCalls()).toBe(1);
+    expect(frontierReads()).toBe(1);
   });
 });
 

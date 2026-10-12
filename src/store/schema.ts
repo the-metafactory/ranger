@@ -1,5 +1,6 @@
 import {
  index,
+ uniqueIndex,
  integer,
  primaryKey,
  sqliteTable,
@@ -65,6 +66,19 @@ export const workers = sqliteTable("workers", {
  mergeMessageId: text("merge_message_id"),
 }, (table) => [primaryKey({ columns: [table.repo, table.nodeId] })]);
 
+export const resumeQueue = sqliteTable("resume_queue", {
+ id: integer("id").primaryKey({ autoIncrement: true }),
+ repo: text("repo").notNull(),
+ nodeId: text("node_id").notNull(),
+ root: integer("root").notNull(),
+ lane: text("lane", { enum: ["visual", "headless"] }).notNull(),
+ queuedAt: text("queued_at").notNull(),
+ failedStarts: integer("failed_starts").notNull().default(0),
+}, table => [
+ uniqueIndex("resume_queue_repo_node_idx").on(table.repo, table.nodeId),
+ index("resume_queue_lane_id_idx").on(table.lane, table.id),
+]);
+
 export const events = sqliteTable(
  "events",
  {
@@ -72,7 +86,7 @@ export const events = sqliteTable(
   at: text("at").notNull(),
   nodeId: text("node_id"),
   repo: text("repo"),
-  /** claimed | announced | worker-start | worker-success | closed | decisions-written | refused | parked | released | sweep | deadman-paused | veto */
+  /** claimed | announced | worker-start | worker-success | closed | decisions-written | refused | parked | released | sweep | deadman-paused | drain | veto */
   kind: text("kind").notNull(),
   detail: text("detail"),
  },

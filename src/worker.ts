@@ -1,4 +1,5 @@
-import { executionRefusal, fileStemFor } from "./forge-ref.ts";
+import { executionRefusal, fileStemFor, parseForgeRef, qualifiedRepo } from "./forge-ref.ts";
+import { changeRequestLabel, ciRunNoun } from "./forge-text.ts";
 import { mapKey } from "./maps.ts";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
@@ -8,9 +9,12 @@ import { expandHome } from "./config.ts";
 import { DiscordAnnouncer } from "./announce.ts";
 import { runCmd, type RunOptions } from "./exec.ts";
 import {
+ cloneUrl,
  fastForwardCanonical,
  assertGitUntouched,
+ gitCredential,
  safeGit,
+ type GitCredential,
  type GitState,
  GitSafetyError,
  vettedPush,
@@ -50,6 +54,7 @@ import {
 import { selectForBuild } from "./substrate-policy.ts";
 import { resolveReadOnlyToken } from "./token-gate.ts";
 import { workerEnv } from "./worker-env.ts";
+import type { CommitAuthor } from "./identity.ts";
 import { sessionJournalPath } from "./journal-guard.ts";
 import { saveWorkerLog } from "./worker-log.ts";
 import { isTransientGitHubError } from "./transient.ts";
@@ -90,6 +95,8 @@ export interface RunNodeContext {
  /** Machine-account write token (resolved + principal-checked by the caller). */
  token: string;
  botIdentity: string;
+ /** A GitLab map's commit identity, from the write gate (`assertWriteIdentity`, node #127). */
+ commitAuthor?: CommitAuthor;
  journal: Journal;
  /**
   * Worker command + leading args; the prompt is appended as the final arg.
@@ -125,6 +132,8 @@ export interface RunNodeContext {
  hostLoad?: ImplementContext["hostLoad"];
  quietHost?: ImplementContext["quietHost"];
  announce?: ImplementContext["announce"];
+ /** Fix-the-base node filing (node #152); tests inject a fake graph port. */
+ fixNode?: ImplementContext["fixNode"];
  mergeablePoll?: ImplementContext["mergeablePoll"];
 }
 
@@ -176,19 +185,27 @@ export function slugify(title: string): string {
  return slug.length === 0 ? "node" : slug;
 }
 
-/** Ensure the canonical checkout exists (clone on first use; true when it cloned). Read-only ops only. */
+/**
+ * Ensure the canonical checkout exists (clone on first use; true when it
+ * cloned). Read-only ops only. The clone URL is the map's forge host, and the
+ * credential must be the map's own (node #127).
+ */
 export async function bootstrapCanonical(
  dir: string,
  repo: string,
- token: string,
+ credential: GitCredential,
 ): Promise<boolean> {
+ const forge = parseForgeRef(repo);
+ if (credential === undefined || credential.token.trim().length === 0 || qualifiedRepo(credential.forge) !== qualifiedRepo(forge)) {
+  throw new GitSafetyError(`no write credential for ${repo} — refusing to clone its canonical checkout`);
+ }
  if (existsSync(dir) && existsSync(join(dir, ".git"))) {
   return false;
  }
  const parent = resolve(dir, "..");
  const result = await safeGit(
-  ["clone", `https://github.com/${repo}.git`, dir],
-  { cwd: parent, token, timeoutMs: 120_000 },
+  ["clone", cloneUrl(forge), dir],
+  { cwd: parent, credential, timeoutMs: 120_000 },
  );
  if (result.code !== 0) {
   throw new Error(
@@ -207,7 +224,7 @@ export async function bootstrapWorktree(
  canonical: string,
  nodeId: string,
  slug: string,
- token: string,
+ credential: GitCredential,
  branchOverride?: string,
  base = "main",
 ): Promise<string> {
@@ -237,7 +254,7 @@ export async function bootstrapWorktree(
  // running with the supervisor's credentials.
  const result = await safeGit(args, {
   cwd: canonical,
-  token,
+  credential,
   canonical,
   timeoutMs: 60_000,
  });
@@ -603,8 +620,9 @@ async function runImplementNode(
  const slug = slugify(node.node.title);
  const branch = implementBranchFor(node.node, worktreeBranch(nodeId, slug));
  const start = await trustedStart(ctx, nodeId, node.node.title, canonical, async () => {
-  await fastForwardCanonical(canonical, map.base, token);
-  return bootstrapWorktree(canonical, nodeId, slug, token, branch, map.base);
+  const credential = gitCredential(repo, token);
+  await fastForwardCanonical(canonical, map.base, credential);
+  return bootstrapWorktree(canonical, nodeId, slug, credential, branch, map.base);
  });
  if ("parked" in start) return start.parked;
  const { worktree } = start;
@@ -624,6 +642,7 @@ async function runImplementNode(
   token,
   readOnlyToken,
   botIdentity,
+  commitAuthor: ctx.commitAuthor,
   journal,
   node,
   rootNode,
@@ -643,6 +662,7 @@ async function runImplementNode(
   hostLoad: ctx.hostLoad,
   quietHost: ctx.quietHost,
   announce: ctx.announce,
+  fixNode: ctx.fixNode,
   mergeablePoll: ctx.mergeablePoll,
   substrateReaders: resolveReaders(ctx),
  };
@@ -739,7 +759,7 @@ async function trustedStart(
    return { parked: await parkRun(ctx, nodeId, title, error.message) };
   }
  };
- const cloned = await bootstrapCanonical(canonical, map.repo, token);
+ const cloned = await bootstrapCanonical(canonical, map.repo, gitCredential(map.repo, token));
  const trust = await vetting(() =>
   cloned ? trustFreshClone(journal, canonical) : checkKnownGood(journal, canonical, { repo: map.repo, nodeId }),
  );
@@ -805,12 +825,20 @@ async function runResearch(
  });
  const canonical = canonicalDir(config, map);
  const slug = slugify(node.node.title);
- const start = await trustedStart(ctx, nodeId, node.node.title, canonical, () =>
-  bootstrapWorktree(canonical, nodeId, slug, token, undefined, map.base),
- );
+ const branch = researchBranchFor(node.node);
+ // The supervisor cuts the findings branch itself (`--no-track`), as the
+ // implement lane does: a worker that ran `git checkout -b <branch>
+ // origin/<base>` wrote `branch.<branch>.remote` + `.merge` into the SHARED
+ // config, which the tamper check refuses at the vetted push (soma #782, #783).
+ // A findings branch that already exists before any base is recorded is
+ // unexplained state, read before the worktree add can create it.
+ let preexisting: string | null = null;
+ const start = await trustedStart(ctx, nodeId, node.node.title, canonical, async () => {
+  if (journal.getWorker(nodeId, repo)?.researchBaseSha == null) preexisting = await resolveBranchSha(canonical, branch);
+  return bootstrapWorktree(canonical, nodeId, slug, gitCredential(repo, token), branch, map.base);
+ });
  if ("parked" in start) return start.parked;
  const { worktree } = start;
- const branch = researchBranchFor(node.node);
 
  journal.recordEvent("worker-start", {
   nodeId,
@@ -819,22 +847,38 @@ async function runResearch(
  });
  journal.updateWorker(nodeId, repo, { worktree, lane: "research" });
 
- const github = ctx.github ?? githubApi;
- const recorded = journal.getWorker(nodeId, repo)?.prNumber ?? null;
- const existingPr = recorded === null
-  ? await github.findPrByHead(repo, branch, token)
-  : await github.getPr(repo, recorded, token);
+ // An adopted worktree (a crashed run's, or one cut before the supervisor
+ // owned the findings branch) can sit on another branch; the prompt promises
+ // the findings branch is checked out, so anything else parks.
+ const checkedOut = await safeGit(["symbolic-ref", "--short", "HEAD"], { cwd: worktree, timeoutMs: 10_000 });
+ if (checkedOut.code !== 0 || checkedOut.stdout.trim() !== branch) {
+  throw new ParkSignal(`research worktree ${worktree} has ${checkedOut.code === 0 ? checkedOut.stdout.trim() : "a detached HEAD"} checked out, not ${branch}; operator intervention required`);
+ }
+
+ // Record the base before any network call: the branch now exists, and a
+ // retry after a failed PR lookup must not read it as unexplained state.
  let baseSha = journal.getWorker(nodeId, repo)?.researchBaseSha ?? null;
+ const freshBase = baseSha === null;
  if (baseSha === null) {
-  if (existingPr !== null || await resolveBranchSha(canonical, branch) !== null) {
+  if (preexisting !== null) {
    throw new ParkSignal(`research pre-worker base is missing for ${branch}; operator intervention required`);
   }
-  baseSha = await resolveCommit(canonical, `refs/heads/${worktreeBranch(nodeId, slug)}`);
+  baseSha = await resolveBranchSha(canonical, branch);
   if (baseSha === null) {
    throw new GitSafetyError(`cannot resolve research pre-worker base for node #${nodeId}`);
   }
   fence("record research base");
   journal.updateWorker(nodeId, repo, { researchBaseSha: baseSha });
+ }
+
+ const github = ctx.github ?? githubApi;
+ const recorded = journal.getWorker(nodeId, repo)?.prNumber ?? null;
+ const existingPr = recorded === null
+  ? await github.findPrByHead(repo, branch, token)
+  : await github.getPr(repo, recorded, token);
+ // A draft for a branch cut only now was opened by something else.
+ if (freshBase && existingPr !== null) {
+  throw new ParkSignal(`research pre-worker base is missing for ${branch}; operator intervention required`);
  }
  let sha: string;
 
@@ -873,7 +917,7 @@ async function runResearch(
    cwd: worktree,
    timeoutMs: wallClockMs,
    nice: config.workers.niceness,
-   env: workerEnv(config, repo, sessionJournalPath()),
+   env: workerEnv(config, repo, sessionJournalPath(), ctx.commitAuthor),
    processGroup: true,
    onSpawn: (pgid) => journal.updateWorker(nodeId, repo, { workerPgid: pgid }),
   });
@@ -920,7 +964,7 @@ async function runResearch(
     worktree,
     canonical,
     branch,
-    token,
+    credential: gitCredential(repo, token),
     configSnapshot: snapshot,
     source: sha,
    });
@@ -950,12 +994,12 @@ async function runResearch(
   recordPr: (pr) => {
    journal.updateWorker(nodeId, repo, { prNumber: pr.iid });
    if (existingPr === null) {
-    journal.recordEvent("pr-opened", { nodeId, repo, detail: `research draft PR #${pr.iid} ${pr.webUrl}` });
+    journal.recordEvent("pr-opened", { nodeId, repo, detail: `research draft ${changeRequestLabel(repo, pr.iid)} ${pr.webUrl}` });
    }
   },
  });
  journal.recordEvent("ci-passed", { nodeId, repo, detail: `research ${evidence.ci} (${evidence.check.runName})` });
- const resolution = `${findings.stdout.trim()}\n\nResearch CI evidence: draft ${evidence.pr.webUrl}, check run ${evidence.ci}.`;
+ const resolution = `${findings.stdout.trim()}\n\nResearch CI evidence: draft ${evidence.pr.webUrl}, ${ciRunNoun(repo)} ${evidence.ci}.`;
  const resolutionFile = join(tmpdir(), `ranger-close-${fileStemFor(repo, nodeId)}.md`);
  writeFileSync(resolutionFile, resolution, "utf8");
 

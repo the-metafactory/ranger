@@ -2,6 +2,7 @@ import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import type { Journal, WorkerRow } from "./journal.ts";
 import { nodeKey } from "./forge-ref.ts";
 import { implementLane, IMPLEMENT_LANES, type ImplementLane, type LaneMap } from "./lanes.ts";
+import type { DrainState } from "./candidates.ts";
 
 export const LAST_IMPLEMENT_MAP = "implement.lastMap";
 export function lastImplementMaps(journal: Pick<Journal, "getHealth"> | null): Record<ImplementLane, string | null> {
@@ -62,4 +63,15 @@ export function implementMapOrder<T extends { repo: string; root: number }>(
   lane, mapOrder(maps.filter(m => laneOf(m) === lane), lastByLane[lane] ?? null),
  ])) as Record<ImplementLane, T[]>;
  return maps.map(map => queues[laneOf(map)].shift()!);
+}
+
+/** The drain switches (node #165) for these maps, read fresh from the journal. */
+export function readDrains(
+ journal: Pick<Journal, "isVisualLaneDrained" | "isMapDrained">,
+ maps: readonly LaneMap[],
+): DrainState {
+ return {
+  visual: journal.isVisualLaneDrained(),
+  maps: new Set(maps.filter(m => implementLane(m) === "headless" && journal.isMapDrained(mapKey(m))).map(mapKey)),
+ };
 }

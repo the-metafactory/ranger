@@ -19,6 +19,8 @@ case "$path" in
     exec bun "$(dirname "$0")/research-gh.ts" "$path" "${@:3}"
     ;;
   /user)
+    # A forge read that fails: the identity gate is transient, not a refusal.
+    [ -n "${FAKE_GH_USER_FAIL:-}" ] && { echo "fake gh: user down" >&2; exit 1; }
     # login depends on the credential: write token → machine account, a
     # principal-token sentinel → the principal, else the read account.
     login="scout-test"

@@ -5,6 +5,7 @@ import type { RangerAuthConfig, RangerConfig } from "./config.ts";
 import { runCmd, type RunOptions, type RunResult } from "./exec.ts";
 import { parseForgeRef, qualifiedRepo, repoIdentity, type ForgeRef } from "./forge-ref.ts";
 import { glabConfigEnvAsync } from "./glab-config-dir.ts";
+import { parseGlabResponse } from "./glab-transport.ts";
 
 /**
  * The read-only credential gate (node #8 ruling).
@@ -234,18 +235,6 @@ async function isolatedGitLabGet(
   } finally {
     await gated.cleanup();
   }
-}
-
-/** glab --include prints the HTTP status, headers, then a JSON body. */
-export function parseGlabResponse(result: RunResult): { status: number; body: unknown } {
-  const match = /^HTTP\/\S+\s+(\d{3})[^\r\n]*\r?\n/.exec(result.stdout);
-  const status = match === null ? 0 : Number(match[1]);
-  const boundary = result.stdout.search(/\r?\n\r?\n/);
-  let body: unknown;
-  if (boundary >= 0) {
-    try { body = JSON.parse(result.stdout.slice(boundary).trim()); } catch { /* caller fails closed */ }
-  }
-  return { status, body };
 }
 
 function expectGlabOk(result: RunResult, message: string): unknown {

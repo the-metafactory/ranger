@@ -10,7 +10,7 @@
   "scripts": {
     "scout": "bun src/cli.ts scout",
     "walk": "bun src/cli.ts walk",
-    "test": "bun test",
+    "test": "bun test --parallel=4 --timeout=60000",
     "typecheck": "bunx tsc --noEmit"
   },
   "dependencies": {

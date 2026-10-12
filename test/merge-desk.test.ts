@@ -48,7 +48,7 @@ function fakeGitHub(opts: { head?: string; comments: IssueComment[]; ci: CheckRu
   listComments: async () => { calls.push("listComments"); return opts.comments; },
   ciVerdictFor: async (repo) => { calls.push("ciVerdictFor"); return githubCiVerdict(repo, opts.ci); },
   issueLabels: async () => { calls.push("issueLabels"); return opts.labels ?? []; },
-  mergePr: async (_repo, n, sha) => { calls.push("mergePr"); merges.push({ n, sha }); },
+  mergePr: async (_repo, n, sha) => { calls.push("mergePr"); merges.push({ n, sha }); return { status: "merged" as const }; },
  };
  return { github, calls, merges };
 }
@@ -160,7 +160,7 @@ describe("node #104 — ci-only-park-merges-without-lane: a CI-only park merges 
  });
 
  const otherParks = [
-  reviewCapOutcome({ blockers: 1, majors: 0, round: 7, pr: 709 }),
+  reviewCapOutcome({ repo: "acme/widgets", blockers: 1, majors: 0, round: 7, pr: 709 }),
   mergeGateFailedOutcome({ check: "probes", reason: "no passing probe run recorded at head aaaaaaaa" }),
   mergeGateFailedOutcome({ check: "review-clean", reason: "no sage verdict recorded for head aaaaaaaa" }),
   mergeGateFailedOutcome({ check: "mergeable", reason: "mergeable=false, state=dirty (conflicts with main)" }),

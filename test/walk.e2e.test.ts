@@ -18,6 +18,7 @@ import {
 } from "../src/route.ts";
 import { planTick, researchCandidates } from "../src/walk.ts";
 import { bootstrapWorktree } from "../src/worker.ts";
+import { gitCredential } from "../src/git-ops.ts";
 import type { FrontierEntry } from "../src/graph.ts";
 import {
  baseConfigLines,
@@ -139,6 +140,55 @@ test("research retry refuses an altered findings branch before citing CI", async
   rmSync(dir, { recursive: true, force: true });
  }
 }, 30_000); // two real run-node CLI processes: under load they outlast 5s
+
+test("a PR lookup outage after the findings branch is cut does not park the retry", async () => {
+ const dir = mkdtempSync(join(tmpdir(), "ranger-research-lookup-"));
+ try {
+  const { origin } = await createCanonicalRepo(dir);
+  const config = writeConfig(dir);
+  const statePath = writeState(dir, { "10": { ...RESEARCH_NODE_STATE, assignees: ["ivy-bot"] } });
+  const env = {
+   ...process.env, ...GIT_ENV, PATH: `${fixturesBin}:${process.env.PATH ?? ""}`,
+   FAKE_SOMA_DIR: dataDir, FAKE_SOMA_STATE: statePath, FAKE_SOMA_REPO_DIR: origin,
+   RANGER_WRITE_TEST: "ghp_write", RANGER_WORKER_CMD: join(fixturesBin, "worker"),
+   FAKE_RESEARCH_PR_LOOKUP_FAIL_ONCE: join(dir, "lookup-spent"),
+  };
+  const args = ["run-node", "10", "--map", "acme/widgets", "-c", config];
+  const first = await runCli(args, env);
+  expect(first.stdout).not.toContain("pre-worker base is missing");
+  const retry = await runCli(args, env);
+  expect(retry.code).toBe(0);
+  expect(JSON.parse(retry.stdout).status).toBe("success");
+  expect(JSON.parse(readFileSync(statePath, "utf8")).nodes["10"].status).toBe("closed");
+ } finally {
+  rmSync(dir, { recursive: true, force: true });
+ }
+}, 30_000); // two real run-node CLI processes: under load they outlast 5s
+
+test("an adopted worktree on another branch parks before the worker runs", async () => {
+ const dir = mkdtempSync(join(tmpdir(), "ranger-research-adopted-"));
+ try {
+  const { origin, canonical } = await createCanonicalRepo(dir);
+  const config = writeConfig(dir);
+  const statePath = writeState(dir, { "10": { ...RESEARCH_NODE_STATE, assignees: ["ivy-bot"] } });
+  // A worktree cut before the supervisor owned the findings branch.
+  const worktree = join(canonical, ".worktrees", "node-10");
+  const add = await runCmd("git", ["worktree", "add", "--no-track", worktree, "-b", "node/10-legacy", "origin/main"], { cwd: canonical, env: { ...process.env, ...GIT_ENV } });
+  expect(add.code).toBe(0);
+  const env = {
+   ...process.env, ...GIT_ENV, PATH: `${fixturesBin}:${process.env.PATH ?? ""}`,
+   FAKE_SOMA_DIR: dataDir, FAKE_SOMA_STATE: statePath, FAKE_SOMA_REPO_DIR: origin,
+   RANGER_WRITE_TEST: "ghp_write", RANGER_WORKER_CMD: join(fixturesBin, "worker"),
+  };
+  const run = await runCli(["run-node", "10", "--map", "acme/widgets", "-c", config], env);
+  const outcome = JSON.parse(run.stdout);
+  expect(outcome.status).toBe("parked");
+  expect(outcome.detail).toContain("node/10-legacy checked out, not research/api-survey");
+  expect(outcome.workerExit).toBeNull();
+ } finally {
+  rmSync(dir, { recursive: true, force: true });
+ }
+}, 30_000);
 
 describe("ranger walk — claim phase (node #13)", () => {
  test("claims an auto+research frontier node: announce (fail-closed) → soma graph claim → journal", async () => {
@@ -383,6 +433,16 @@ describe("ranger run-node — research worker full loop (node #13 acceptance)", 
     { env: { ...process.env, ...GIT_ENV } },
    );
    expect(refCheck.code).toBe(0);
+
+   // The supervisor cut the findings branch with --no-track: no tracking lines
+   // reached the shared config, where the tamper check refuses them at the
+   // vetted push (soma #782, #783: a worker branched off origin/main).
+   const tracking = await runCmd(
+    "git",
+    ["--git-dir", join(canonical, ".git"), "config", "--get-regexp", "^branch\\.research/"],
+    { env: { ...process.env, ...GIT_ENV } },
+   );
+   expect(tracking.stdout).toBe("");
 
    // The node was closed with a gist, decisions re-projected.
    const state = JSON.parse(readFileSync(statePath, "utf8"));
@@ -747,7 +807,7 @@ describe("bootstrapWorktree — orphaned branch (node #19 live finding)", () => 
     canonical,
     "10",
     "test-node",
-    "ghp_write",
+    gitCredential("acme/widgets", "ghp_write"),
    );
    expect(worktree).toBe(join(canonical, ".worktrees", "node-10"));
    const onBranch = await runCmd(
@@ -864,4 +924,107 @@ describe("ranger walk — GitHub budget deferral (src/budget.ts)", () => {
    rmSync(dir, { recursive: true, force: true });
   }
  });
+});
+
+/**
+ * Node #163: a failed claim is its own node's error. soma refuses a blocked
+ * node's claim with plain text on stderr (exit 1), which ranger cannot tell
+ * from any other claim failure — so the walk records it against that node
+ * and goes on to the next candidate in the same tick.
+ */
+describe("ranger walk — a failed claim skips its own node (node #163)", () => {
+ const second = (entry: Record<string, any>) => ({
+  ...entry,
+  ref: { id: "20" },
+  node: { ...entry.node, id: "20", title: "Survey the second API", checkpointId: "second-surveyed", probes: [{ type: "git-ref-exists", ref: "research/second-survey" }] },
+  url: "https://github.com/acme/widgets/issues/20",
+ });
+
+ async function walkTwo(dir: string, opts: { refuse?: string; nodes?: Record<string, unknown> } = {}) {
+  const data = join(dir, "data");
+  mkdirSync(data);
+  const fixture = JSON.parse(readFileSync(join(dataDir, "acme__widgets-frontier.json"), "utf8"));
+  const research = fixture.frontier.find((e: { ref: { id: string } }) => e.ref.id === "10");
+  writeFileSync(join(data, "acme__widgets-frontier.json"), JSON.stringify({ ...fixture, frontier: [research, second(research)] }));
+  const config = writeConfig(dir);
+  const statePath = writeState(dir, opts.nodes ?? {
+   "10": RESEARCH_NODE_STATE,
+   "20": { ...RESEARCH_NODE_STATE, checkpoint: "second-surveyed" },
+  });
+  const calls = join(dir, "calls.log");
+  const discord = fakeDiscord();
+  try {
+   const result = await runCli(["walk", "-c", config], {
+    ...process.env,
+    ...GIT_ENV,
+    PATH: `${fixturesBin}:${process.env.PATH ?? ""}`,
+    FAKE_SOMA_DIR: data,
+    FAKE_SOMA_STATE: statePath,
+    FAKE_SOMA_CALLS: calls,
+    ...(opts.refuse === undefined ? {} : { FAKE_SOMA_CLAIM_REFUSE: opts.refuse }),
+    RANGER_DISCORD_API_BASE: `http://127.0.0.1:${discord.port}`,
+    RANGER_DISCORD_ALLOW_TEST_OVERRIDE: "1",
+    RANGER_DISCORD_MIN_INTERVAL_MS: "5",
+    RANGER_DISCORD_TOKEN: "fake-bot-token",
+    RANGER_WRITE_TEST: "ghp_write",
+    RANGER_NO_SPAWN: "1",
+   });
+   const state = JSON.parse(readFileSync(statePath, "utf8")) as { nodes: Record<string, { assignees: string[] }> };
+   const claimCalls = readFileSync(calls, "utf8").split("\n").filter((l) => l.startsWith("claim ")).length;
+   return { result, report: result.code === 0 ? JSON.parse(result.stdout) : null, state, claimCalls };
+  } finally {
+   discord.stop();
+  }
+ }
+
+ test("A's claim refused with plain text: B is still claimed in the same tick", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ranger-walk-claim-fail-"));
+  try {
+   const { result, report, state } = await walkTwo(dir, { refuse: "10" });
+   expect(result.code).toBe(0);
+   expect(report.maps[0].claimed).toEqual(["20"]);
+   expect(report.maps[0].errors).toHaveLength(1);
+   expect(report.maps[0].errors[0]).toStartWith("#10 claim failed");
+   expect(report.maps[0].errors[0]).toContain("Claim refused: node 10 has an open blocker");
+   expect(state.nodes["10"].assignees).toEqual([]);
+   expect(state.nodes["20"].assignees).toEqual(["ivy-bot"]);
+  } finally {
+   rmSync(dir, { recursive: true, force: true });
+  }
+ }, 30_000);
+
+ test("a lost claim race is unchanged: skipped as race lost, B claimed", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ranger-walk-claim-race-"));
+  try {
+   const { result, report, state } = await walkTwo(dir, {
+    nodes: {
+     "10": { ...RESEARCH_NODE_STATE, assignees: ["someone-else"] },
+     "20": { ...RESEARCH_NODE_STATE, checkpoint: "second-surveyed" },
+    },
+   });
+   expect(result.code).toBe(0);
+   expect(report.maps[0].claimed).toEqual(["20"]);
+   expect(report.maps[0].errors).toEqual(["#10 claim race lost to someone-else — skipped"]);
+   expect(state.nodes["20"].assignees).toEqual(["ivy-bot"]);
+  } finally {
+   rmSync(dir, { recursive: true, force: true });
+  }
+ }, 30_000);
+
+ test("every claim fails: one error per candidate, nothing claimed, no retry, exit 0", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ranger-walk-claim-fail-all-"));
+  try {
+   const { result, report, state, claimCalls } = await walkTwo(dir, { refuse: "*" });
+   expect(result.code).toBe(0);
+   expect(report.maps[0].claimed).toEqual([]);
+   expect(report.maps[0].errors).toHaveLength(2);
+   expect(report.maps[0].errors[0]).toStartWith("#10 claim failed");
+   expect(report.maps[0].errors[1]).toStartWith("#20 claim failed");
+   expect(claimCalls).toBe(2);
+   expect(state.nodes["10"].assignees).toEqual([]);
+   expect(state.nodes["20"].assignees).toEqual([]);
+  } finally {
+   rmSync(dir, { recursive: true, force: true });
+  }
+ }, 30_000);
 });
