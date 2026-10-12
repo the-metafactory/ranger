@@ -11,7 +11,9 @@ import { FencedError, Journal } from "../src/journal.ts";
 import {
  assertFilable,
  codeCommentSpec,
+ commentSyntax,
  landminesInDiff,
+ lineHasMarkerComment,
  scribeFile,
  scribeKey,
  ScribeError,
@@ -190,7 +192,9 @@ describe("landminesInDiff", () => {
    await git(["commit", "-m", "base"]);
    writeFileSync(join(dir, "a.ts"), "one\n// FIXME: new one\ntwo\n// TODO: old one\nconst s = \"TODO not a comment\";\n");
    writeFileSync(join(dir, "b.py"), "x = 1\n# HACK until the API lands\n");
-   writeFileSync(join(dir, "c.md"), "++ text\n<!-- XXX: check this -->\n");
+   writeFileSync(join(dir, "c.md"), "++ text\n<!-- XXX: check this -->\n# TODO\n* FIXME the list item\n");
+   writeFileSync(join(dir, "d.ts"), 'const help = "Use // TODO to mark pending work";\nconst example = " // TODO: example only";\n');
+   writeFileSync(join(dir, "notes.txt"), "// TODO: unknown language\n");
    rmSync(join(dir, "gone.ts"));
    await git(["add", "-A"]);
    await git(["commit", "-m", "change"]);
@@ -203,6 +207,56 @@ describe("landminesInDiff", () => {
   } finally {
    rmSync(dir, { recursive: true, force: true });
   }
+ });
+});
+
+describe("lineHasMarkerComment: comments only, read in the file's language", () => {
+ const ts = commentSyntax("src/a.ts")!;
+ test.each([
+  "// TODO: real",
+  "/// FIXME doc comment",
+  "foo(); // HACK after code",
+  "foo();// XXX no space",
+  "/* TODO block */",
+  " * FIXME continuation of a block",
+  "/* a */ x = 1; // TODO after a closed block",
+  'const s = "a \\" b"; // TODO after an escaped quote',
+ ])("finds %p in TypeScript", (line) => expect(lineHasMarkerComment(line, ts)).toBe(true));
+ test.each([
+  'const help = "Use // TODO to mark pending work";',
+  'const example = " // TODO: example only";',
+  "const t = `/* FIXME */`;",
+  "const c = '// XXX';",
+  "// see TODO later",
+  "*/ TODO",
+  "# TODO not a TS comment",
+ ])("ignores %p in TypeScript", (line) => expect(lineHasMarkerComment(line, ts)).toBe(false));
+ test("Markdown: only an HTML comment counts, never a heading or list item", () => {
+  const md = commentSyntax("docs/README.md")!;
+  expect(lineHasMarkerComment("<!-- TODO: fill in -->", md)).toBe(true);
+  expect(lineHasMarkerComment("# TODO", md)).toBe(false);
+  expect(lineHasMarkerComment("## FIXME list", md)).toBe(false);
+  expect(lineHasMarkerComment("* TODO item", md)).toBe(false);
+  expect(lineHasMarkerComment("Use `// TODO` to mark work", md)).toBe(false);
+ });
+ test("hash, dash and semicolon languages need whitespace before the leader", () => {
+  const py = commentSyntax("a/b.py")!;
+  expect(lineHasMarkerComment("x = 1  # TODO: real", py)).toBe(true);
+  expect(lineHasMarkerComment('s = "# TODO in a string"', py)).toBe(false);
+  expect(lineHasMarkerComment("a#TODO", py)).toBe(false);
+  expect(lineHasMarkerComment("-- HACK", commentSyntax("q.sql")!)).toBe(true);
+  expect(lineHasMarkerComment("x--TODO", commentSyntax("q.sql")!)).toBe(false);
+  expect(lineHasMarkerComment(";; FIXME", commentSyntax("init.el")!)).toBe(true);
+ });
+ test("Rust lifetimes do not read as an unterminated string", () => {
+  expect(lineHasMarkerComment("fn f(x: &'static str) {} // TODO", commentSyntax("lib.rs")!)).toBe(true);
+ });
+ test("a file name maps to its syntax; an unknown language has none", () => {
+  expect(commentSyntax("Makefile")).toBe(commentSyntax("x.sh"));
+  expect(commentSyntax("sub/Dockerfile")).toBe(commentSyntax("x.sh"));
+  expect(commentSyntax("notes.txt")).toBeNull();
+  expect(commentSyntax("LICENSE")).toBeNull();
+  expect(commentSyntax(".bashrc")).toBeNull();
  });
 });
 

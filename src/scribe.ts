@@ -361,8 +361,113 @@ export function codeCommentSpec(
  };
 }
 
-/** A marker after a comment leader: `// TODO`, `# FIXME:`, `/* XXX`, `-- HACK`, `<!-- TODO`. */
-const LANDMINE = /(?:^|\s)(?:\/\/+|#+|\/\*+|\*|--|<!--|;+)\s*(TODO|FIXME|XXX|HACK)\b/;
+/** The marker words a comment carries. */
+const MARKER = /^(TODO|FIXME|XXX|HACK)\b/;
+
+/**
+ * How one family of languages writes comments: line leaders, block openers
+ * with their closers, and the quotes that open a string literal. A leader
+ * inside a string is text, not a comment.
+ */
+export interface CommentSyntax {
+ line: string[];
+ block: [open: string, close: string][];
+ quotes: string[];
+}
+
+const C_LIKE: CommentSyntax = { line: ["//"], block: [["/*", "*/"]], quotes: ['"', "'", "`"] };
+const RUST: CommentSyntax = { line: ["//"], block: [["/*", "*/"]], quotes: ['"'] };
+const CSS: CommentSyntax = { line: [], block: [["/*", "*/"]], quotes: ['"', "'"] };
+const HASH: CommentSyntax = { line: ["#"], block: [], quotes: ['"', "'"] };
+const DASH: CommentSyntax = { line: ["--"], block: [], quotes: ['"', "'"] };
+const SEMI: CommentSyntax = { line: [";"], block: [], quotes: ['"'] };
+const MARKUP: CommentSyntax = { line: [], block: [["<!--", "-->"]], quotes: [] };
+const COMPONENT: CommentSyntax = { line: ["//"], block: [["/*", "*/"], ["<!--", "-->"]], quotes: ['"', "'", "`"] };
+
+const SYNTAX_BY_EXT: Record<string, CommentSyntax> = {
+ ...Object.fromEntries(
+  ["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs", "java", "c", "h", "cc", "cpp", "hpp", "cs", "go", "swift", "kt", "kts", "scala", "dart", "php", "glsl", "wgsl", "frag", "vert", "jsonc"].map((e) => [e, C_LIKE]),
+ ),
+ rs: RUST,
+ ...Object.fromEntries(["css", "scss", "less"].map((e) => [e, CSS])),
+ ...Object.fromEntries(["py", "rb", "sh", "bash", "zsh", "fish", "yaml", "yml", "toml", "pl", "r", "nix", "ex", "exs", "conf", "mk"].map((e) => [e, HASH])),
+ ...Object.fromEntries(["sql", "lua", "hs", "elm"].map((e) => [e, DASH])),
+ ...Object.fromEntries(["el", "lisp", "clj", "cljs", "scm", "ini", "asm"].map((e) => [e, SEMI])),
+ ...Object.fromEntries(["md", "mdx", "html", "htm", "xml", "svg"].map((e) => [e, MARKUP])),
+ ...Object.fromEntries(["vue", "svelte", "astro"].map((e) => [e, COMPONENT])),
+};
+
+const SYNTAX_BY_NAME: Record<string, CommentSyntax> = { Makefile: HASH, Dockerfile: HASH, Containerfile: HASH };
+
+/** The comment syntax a path's language uses; null when ranger does not know it. */
+export function commentSyntax(path: string): CommentSyntax | null {
+ const name = path.slice(path.lastIndexOf("/") + 1);
+ const byName = SYNTAX_BY_NAME[name];
+ if (byName !== undefined) return byName;
+ const dot = name.lastIndexOf(".");
+ return dot > 0 ? (SYNTAX_BY_EXT[name.slice(dot + 1).toLowerCase()] ?? null) : null;
+}
+
+/** A leader that also appears in code (`x--`, `a#b`, `f();`) starts a comment only after whitespace. */
+function leaderStartsHere(text: string, at: number, leader: string): boolean {
+ if (leader === "//" || leader === "/*" || leader === "<!--") return true;
+ return at === 0 || /\s/.test(text[at - 1]);
+}
+
+/** Whether a comment body (the text right after its leader) opens with a marker word. */
+function bodyHasMarker(body: string, leader: string): boolean {
+ // Repeated leader characters (`///`, `##`, `/**`, `;;`) belong to the leader.
+ const repeat = leader[leader.length - 1];
+ let i = 0;
+ while (i < body.length && body[i] === repeat) i += 1;
+ return MARKER.test(body.slice(i).trimStart());
+}
+
+/**
+ * Whether one added line carries a marker comment, read with its language's
+ * comment syntax: the first leader outside a string literal starts the
+ * comment, and the marker must open it. A block comment's continuation line
+ * (` * TODO`) counts when the language has `/* *\/` blocks. A line inside a
+ * multi-line string the diff does not show can still read as a comment.
+ */
+export function lineHasMarkerComment(text: string, syntax: CommentSyntax): boolean {
+ if (syntax.block.some(([open]) => open === "/*") && /^\s*\*(?!\/)/.test(text)) {
+  if (bodyHasMarker(text.trimStart().slice(1), "*")) return true;
+ }
+ let quote: string | null = null;
+ let i = 0;
+ while (i < text.length) {
+  const ch = text[i];
+  if (quote !== null) {
+   if (ch === "\\") i += 2;
+   else {
+    if (ch === quote) quote = null;
+    i += 1;
+   }
+   continue;
+  }
+  if (syntax.quotes.includes(ch)) {
+   quote = ch;
+   i += 1;
+   continue;
+  }
+  const leader = syntax.line.find((l) => text.startsWith(l, i) && leaderStartsHere(text, i, l));
+  if (leader !== undefined) return bodyHasMarker(text.slice(i + leader.length), leader);
+  const block = syntax.block.find(([open]) => text.startsWith(open, i));
+  if (block !== undefined) {
+   const [open, close] = block;
+   const bodyStart = i + open.length;
+   const end = text.indexOf(close, bodyStart);
+   if (bodyHasMarker(text.slice(bodyStart, end < 0 ? undefined : end), open)) return true;
+   // The rest of the line is code again only after the block closes.
+   if (end < 0) return false;
+   i = end + close.length;
+   continue;
+  }
+  i += 1;
+ }
+ return false;
+}
 
 /** The longest landmine text a node quotes. */
 const LANDMINE_TEXT_MAX = 200;
@@ -370,7 +475,8 @@ const LANDMINE_TEXT_MAX = 200;
 /**
  * The marker comments a unified diff (`git diff --unified=0`) adds, with the
  * new file's path and line. Removed and context lines never count, and a
- * deleted file has no new path to name.
+ * deleted file has no new path to name. A file in a language ranger has no
+ * comment syntax for adds none: an unread file never schedules work.
  */
 export function landminesInDiff(diff: string): Landmine[] {
  const found: Landmine[] = [];
@@ -398,7 +504,8 @@ export function landminesInDiff(diff: string): Landmine[] {
   }
   if (!header && raw.startsWith("+")) {
    const text = raw.slice(1);
-   if (path !== null && LANDMINE.test(text)) {
+   const syntax = path === null ? null : commentSyntax(path);
+   if (path !== null && syntax !== null && lineHasMarkerComment(text, syntax)) {
     const trimmed = text.trim();
     found.push({ path, line, text: trimmed.length > LANDMINE_TEXT_MAX ? `${trimmed.slice(0, LANDMINE_TEXT_MAX)}…` : trimmed });
    }
