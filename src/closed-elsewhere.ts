@@ -69,7 +69,7 @@ export async function finishClosedElsewhere(ctx: {
   const eventKind = ({ ungated: "closed-elsewhere-ungated", own: "closed", external: "closed-elsewhere" } as const)[kind];
   journal.recordEvent(eventKind, { nodeId: id, repo: map.repo, detail });
   try {
-    await closeGraphEscalation({ journal, map, nodeId: id, owned: fence, budget: ctx.cardBudget });
+    await closeGraphEscalation({ journal, map, nodeId: id, node, owned: fence, budget: ctx.cardBudget });
   } catch (error) {
     fence();
     journal.recordEvent("sweep", { nodeId: id, repo: map.repo, detail: `closed graph card sync deferred: ${String(error)}` });

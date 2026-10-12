@@ -179,7 +179,7 @@ test("a graph-closed escalation closes once, including after a queue-exit note",
   const journal = new Journal(join(dir, "state.sqlite"));
   expect(journal.getEscalation("acme/widgets", "12")).toMatchObject({ status: "closed" });
   expect(journal.getEscalation("acme/widgets", "12")?.lastContent).toContain("closed on the graph");
-  expect(journal.getEscalation("acme/widgets", "12")?.lastContent).toContain("~~");
+  expect(journal.getEscalation("acme/widgets", "12")?.lastContent).toStartWith("✅ closed on the graph · **#12** ");
   journal.close();
   expect(discord.edits).toHaveLength(before + 1);
   expect((await runCli(["escalate", "-c", config, "--json"], env)).code).toBe(0);
@@ -206,11 +206,11 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
       expect(discord.posts).toHaveLength(4);
       // Cards carry the right heads + age + principal mention on content.
       const joined = discord.posts.map((p) => p.content).join("\n");
-      expect(joined).toContain("**Decision needed**");
-      expect(joined).toContain("**HITL decision**");
-      expect(joined).toContain("**Needs typing**");
-      expect(joined).toContain("**Provisioning needed**");
-      expect(joined).toContain("· 0d");
+      expect(joined).toContain("🧭 decision needed · **#12**");
+      expect(joined).toContain("🤔 HITL decision · **#11**");
+      expect(joined).toContain("⚠️ needs typing · **#13**");
+      expect(joined).toContain("🔧 provisioning needed · **#14**");
+      expect(joined).toContain("· age 0d");
       // Grilling cards carry the question body (design §5 decision payload).
       expect(joined).toContain(
         "Should we ship the copy now or wait for the brand refresh?",
@@ -331,9 +331,9 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
       expect(content).toContain("receipt-less closes 2");
       expect(content).toContain("spawns today 0/10");
       // The digest renders the persisted route, not the node id (review fix).
-      expect(content).toContain("#14 Provision the staging env — provisioning");
+      expect(content).toContain("`#14` Provision the staging env — provisioning");
       expect(content).toContain(
-        "#12 Draft UX copy ‹@1234567890> — escalate-hitl",
+        "`#12` Draft UX copy ‹@1234567890> — escalate-hitl",
       );
 
       const postsBefore = discord.posts.length;
@@ -434,8 +434,8 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
       expect(digest.code).toBe(0);
       const content = discord.posts.at(-1)?.content ?? "";
       // The promised sections survive a long card list.
-      expect(content).toContain("**Audit:** receipt-less closes");
-      expect(content).toContain("**Budget:** spawns today");
+      expect(content).toContain("\nAudit: receipt-less closes");
+      expect(content).toContain("\nBudget: spawns today");
       // The card list was capped to fit (not the tail sliced off).
       expect(content).toMatch(/more open cards \(full list in the thread\)/);
       expect(content.length).toBeLessThanOrEqual(1950);
@@ -822,10 +822,10 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
       expect(content).not.toContain("<@1234567890>");
       expect(content).toContain("‹@1234567890");
       // The overdue suffix — including the `<@id>` ping — survives the
-      // 1950-char front-cap (round-13 review fix).
+      // 2000-char cap (round-13 review fix).
       expect(content).toContain("📣 <@999>");
-      expect(content.endsWith("**7d** — needs your attention")).toBe(true);
-      expect(content.length).toBeLessThanOrEqual(1950);
+      expect(content.endsWith("\n📣 <@999> 7d old — needs your attention")).toBe(true);
+      expect(content.length).toBeLessThanOrEqual(2000);
     } finally {
       discord.stop();
       rmSync(dir, { recursive: true, force: true });
@@ -1056,7 +1056,8 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
       // The reposted B card shows the card's TRUE age (8d overdue + ping),
       // not age 0 — a channel move must not erase escalation state.
       const bPost = discord.posts[postsBefore]; // first B card (node 11)
-      expect(bPost.content).toContain("**8d**");
+      expect(bPost.content).toContain("· age 8d ·");
+      expect(bPost.content).toContain("8d old — needs your attention");
       expect(bPost.content).toContain("<@285727653603049472>");
       // The row's createdAt is IMMUTABLE across the move.
       expect(j.getEscalation("acme/widgets", "11")?.createdAt).toBe(created);
@@ -1306,4 +1307,59 @@ describe("ranger escalate — GitHub budget deferral (src/budget.ts)", () => {
       rmSync(fixtureDir, { recursive: true, force: true });
     }
   });
+});
+
+test("a card posted in the old italic format is edited in place to the plain format, never reposted (node #239)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ranger-escalate-reformat-"));
+  const fixtureDir = mkdtempSync(join(tmpdir(), "ranger-escalate-reformat-fx-"));
+  const discord = fakeDiscord();
+  try {
+    writeFixtures(fixtureDir);
+    const config = writeConfig(dir);
+    const env = envFor(fixtureDir, discord.port);
+    // Node 12's card as the pre-#239 renderer posted it: bold head, italic
+    // reason and body.
+    const journal = new Journal(join(dir, "state.sqlite"));
+    journal.upsertEscalation({ root: 1,
+      key: "acme/widgets:12",
+      repo: "acme/widgets",
+      nodeId: "12",
+      title: "Draft UX copy",
+      route: "escalate-hitl",
+      lastContent: [
+        "🧭 **Decision needed** — **#12** Draft UX copy",
+        "map: acme/widgets#1 · grilling · auto",
+        "url: https://github.com/acme/widgets/issues/12",
+        "_HITL kind (grilling/prototype) declared auto — map hygiene_",
+        "_Should we ship the copy now or wait for the brand refresh?_",
+        "· 0d",
+      ].join("\n"),
+      messageId: "discord-msg-old-12",
+      channelId: "1234567890",
+      createdAt: new Date().toISOString(),
+      status: "open",
+      notedAt: null,
+    });
+    journal.setEscalationDestination("acme/widgets:12", "1234567890", "discord-msg-old-12", new Date().toISOString());
+    journal.close();
+
+    const run = await runCli(["escalate", "-c", config, "--json"], env);
+    expect(run.code).toBe(0);
+    const report = JSON.parse(run.stdout);
+    expect(report.maps[0].edited).toEqual(["12"]);
+    expect(report.maps[0].posted.sort()).toEqual(["11", "13", "14"]);
+    // No new message for node 12: the old one is edited in place.
+    expect(discord.posts.some((p) => p.content.includes("**#12**"))).toBe(false);
+    const edit = discord.edits.find((e) => e.messageId === "discord-msg-old-12");
+    expect(edit?.content).toStartWith("🧭 decision needed · **#12** ");
+    expect(edit?.content.split("\n")[1]).toStartWith("-# map: acme/widgets#1 · grilling · auto");
+    expect(edit?.content).not.toMatch(/^_.*_$/m);
+    const after = new Journal(join(dir, "state.sqlite"));
+    expect(after.getEscalation("acme/widgets", "12")?.messageId).toBe("discord-msg-old-12");
+    after.close();
+  } finally {
+    discord.stop();
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(fixtureDir, { recursive: true, force: true });
+  }
 });

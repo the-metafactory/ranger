@@ -1573,7 +1573,8 @@ describe("implement lane (node #23)", () => {
   expect(probe?.body).toContain("result=pass selected=2 mode=semantic base-red=probe-hud.mjs -->");
   expect(r.github.prs.get(1)?.body).toContain("Not gating: probe-hud.mjs failed here and fail at the merge base too.");
   expect(r.announced).toHaveLength(1);
-  expect(r.announced[0]).toContain("**main was red**");
+  expect(r.announced[0]).toStartWith("🔴 main was red · ");
+  expect(r.announced[0]!.split("\n")[1]).toStartWith("-# map: acme/widgets#1 · base `main` · found by node `#20`");
   expect(r.announced[0]).toContain("probe-hud.mjs");
   const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
   expect(events.some((d) => d.includes("probe-hud.mjs fail at the merge base"))).toBe(true);
@@ -2989,7 +2990,7 @@ describe("implement lane (node #23)", () => {
   expect(spawned).toEqual(["20"]);
   const head = r.github.prs.get(1)?.mergedSha;
   expect(r.github.merges).toEqual([{ n: 1, sha: head as string, title: "Add the feature module (node #20)" }]);
-  expect(posts[0]).toContain("**merged** #20");
+  expect(posts[0]).toStartWith("✅ merged · **#20** ");
 
   const closed = await runNode("20", r.ctx);
   expect(closed.status).toBe("success");
@@ -3106,7 +3107,7 @@ describe("implement lane (node #23)", () => {
   } else {
    expect(tick.mergeDesk?.cards).toEqual(["20"]);
    expect(tick.mergeDesk?.errors).toEqual([]);
-   expect(posts[0]).toContain("**merge needed**");
+   expect(posts[0]).toStartWith("🔀 merge needed · **#");
    expect(posts[0]).not.toContain("Visual evidence");
    expect(r.journal.getWorker("20", r.ctx.map.repo)?.mergeMessageId).toBe("label-outage-card");
    expect(r.journal.listEvents().some(e => e.kind === "merge-card" && e.detail?.includes("label lookup failed (informational): Error: labels unavailable"))).toBe(true);
@@ -3142,7 +3143,7 @@ describe("implement lane (node #23)", () => {
    const body = JSON.parse(init!.body as string);
    expect(body.attachments).toBeUndefined();
    expect(body.embeds).toBeUndefined();
-   expect(body.content).toContain("**merge needed**");
+   expect(body.content).toStartWith("🔀 merge needed · **#");
    expect(body.content).toContain("your eye is the check");
    expect(body.content).toContain("Visual evidence could not be delivered:");
    expect(body.content).toContain(`discord post returned HTTP ${status}`);

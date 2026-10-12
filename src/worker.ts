@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import { expandHome } from "./config.ts";
 import { DiscordAnnouncer } from "./announce.ts";
+import { renderCard } from "./card-render.ts";
 import { runCmd, type RunOptions } from "./exec.ts";
 import {
  cloneUrl,
@@ -777,6 +778,24 @@ async function trustedStart(
  return { state: trust.state, worktree };
 }
 
+/** The park card's text, through the shared card renderer (node #239). */
+export function parkCardText(
+ map: { repo: string; root: number },
+ nodeId: string,
+ title: string,
+ detail: string,
+): string {
+ return renderCard({
+  emoji: "⏸️",
+  status: "parked",
+  nodeId,
+  title,
+  meta: [`map: ${mapKey(map)}`],
+  body: detail,
+  footer: ["Parked work waits for you: `ranger resume-node`, or take it in a session."],
+ });
+}
+
 /** Best-effort park card: the journal + digest still carry the park when Discord fails. */
 async function parkCard(
  map: RangerMapConfig,
@@ -786,12 +805,7 @@ async function parkCard(
 ): Promise<void> {
  try {
   await DiscordAnnouncer.fromMap(map).post(
-   [
-    `:ranger: **parked** #${nodeId} — ${title}`,
-    `map: ${mapKey(map)}`,
-    detail.slice(0, 1500),
-    "Parked work waits for you: `ranger resume-node`, or take it in a session.",
-   ].join("\n"),
+   parkCardText(map, nodeId, title, detail),
    `park card for #${nodeId}`,
   );
  } catch {

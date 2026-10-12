@@ -466,7 +466,7 @@ describe("the escalation desk cards a not-ready build brief", () => {
       expect(first.posted).toEqual(["21"]);
       expect(discord.posts).toHaveLength(1);
       const card = discord.posts[0]!.content;
-      expect(card).toContain("**Build brief not ready**");
+      expect(card).toStartWith("📝 build brief not ready · **#21** ");
       expect(card).toContain("**#21** Build the widget");
       expect(card).toContain("missing `## Acceptance criteria`, `[NEEDS CLARIFICATION]`");
       const journal = new Journal(join(dir, "state.sqlite"));

@@ -10,6 +10,7 @@ import { LeaseLostError, withEscalateLock, type OwnedCheck } from "./lock.ts";
 import { assertReadOnlyToken, type ResolvedToken } from "./token-gate.ts";
 import type { NodeResult } from "./graph.ts";
 import { BudgetDeferral } from "./budget.ts";
+import { code, renderCard, sanitizeGraphText } from "./card-render.ts";
 
 /** The per-tick request budget (round-21) — split into two lanes so NEITHER
  *  starves the other (round-33 review): the ACTIVE pass caps at
@@ -36,44 +37,47 @@ export const MAX_ABSENT_SCAN = 500;
 
 // ---- card content ----
 
-const CARD_HEADS: Record<string, string> = {
-  grilling: "🧭 **Decision needed**",
-  prototype: "🖼️ **Handoff**",
-  propose: "🤔 **HITL decision**",
-  approve: "🔔 **Approve** (notification)",
-  untyped: "⚠️ **Needs typing**",
-  "hitl-kind-as-auto": "🧹 **Map hygiene**",
-  provisioning: "🔧 **Provisioning needed**",
-  "brief-not-ready": "📝 **Build brief not ready**",
+/** Each card head's status emoji and plain status words (line 1). */
+export const CARD_HEADS: Record<string, { emoji: string; status: string }> = {
+  grilling: { emoji: "🧭", status: "decision needed" },
+  prototype: { emoji: "🖼️", status: "handoff" },
+  propose: { emoji: "🤔", status: "HITL decision" },
+  approve: { emoji: "🔔", status: "approve (notification)" },
+  untyped: { emoji: "⚠️", status: "needs typing" },
+  "hitl-kind-as-auto": { emoji: "🧹", status: "map hygiene" },
+  provisioning: { emoji: "🔧", status: "provisioning needed" },
+  "brief-not-ready": { emoji: "📝", status: "build brief not ready" },
 };
 
-function hitlHead(node: ClassifiedNode, reason: EscalateReason): string {
-  if (node.kind === "grilling") return CARD_HEADS.grilling;
-  if (node.kind === "prototype") return CARD_HEADS.prototype;
-  if (reason === "untyped") return CARD_HEADS.untyped;
-  if (reason === "hitl-kind-as-auto") return CARD_HEADS["hitl-kind-as-auto"];
-  if (node.autonomy === "approve") return CARD_HEADS.approve;
-  return CARD_HEADS.propose;
+type CardHead = (typeof CARD_HEADS)[string];
+
+function hitlHead(node: ClassifiedNode, reason: EscalateReason): CardHead {
+  if (node.kind === "grilling") return CARD_HEADS.grilling!;
+  if (node.kind === "prototype") return CARD_HEADS.prototype!;
+  if (reason === "untyped") return CARD_HEADS.untyped!;
+  if (reason === "hitl-kind-as-auto") return CARD_HEADS["hitl-kind-as-auto"]!;
+  if (node.autonomy === "approve") return CARD_HEADS.approve!;
+  return CARD_HEADS.propose!;
 }
 
 const REGISTRY_BLOCKED = "auto node with registry-blocked probes — provisioning needed";
 
 /** Per-route card data in one place: the head, the reason line, and the journal row's reason. */
-function cardSpec(node: ClassifiedNode): { head: string; reason: string; journalReason: string } {
+function cardSpec(node: ClassifiedNode): { head: CardHead; reason: string; journalReason: string } {
   const route = node.route;
   switch (route.route) {
     case "escalate-hitl":
       return { head: hitlHead(node, route.reason), reason: ESCALATE_REASONS[route.reason], journalReason: route.reason };
     case "provisioning":
-      return { head: CARD_HEADS.provisioning, reason: REGISTRY_BLOCKED, journalReason: "registry-blocked" };
+      return { head: CARD_HEADS.provisioning!, reason: REGISTRY_BLOCKED, journalReason: "registry-blocked" };
     case "brief-not-ready":
       return {
-        head: CARD_HEADS["brief-not-ready"],
+        head: CARD_HEADS["brief-not-ready"]!,
         reason: `${briefHoldReason(route.missing)} — ranger will not take it until soma's graph audit no longer lists it`,
         journalReason: "brief-not-ready",
       };
     default:
-      return { head: "ℹ️", reason: REGISTRY_BLOCKED, journalReason: "registry-blocked" };
+      return { head: { emoji: "ℹ️", status: "notice" }, reason: REGISTRY_BLOCKED, journalReason: "registry-blocked" };
   }
 }
 
@@ -105,135 +109,97 @@ export function digestAction(
   return "unchanged";
 }
 
-/** Collapse prose to one line, truncating at `max` chars. */
-function truncate(text: string, max: number): string {
-  const oneLine = text.replace(/\s+/g, " ").trim();
-  return oneLine.length > max ? `${oneLine.slice(0, max - 1)}…` : oneLine;
-}
+export { sanitizeGraphText };
 
-/**
- * Inert a `<` in graph-derived text so Discord cannot parse mention/emoji
- * tokens out of it (a node title could otherwise embed `<@principal-id>` and
- * force a ping outside the 7-day policy, or `<@&role>`). `‹` reads like `<`
- * but is not mention syntax.
- */
-export function sanitizeGraphText(text: string | null | undefined): string {
-  return (text ?? "").replace(/</g, "\u2039");
-}
-
-function ageSuffix(
+/** The card's last line: louder at 3+ days, the principal's ping at 7+. The
+ *  age itself is on the subtext line; a fresh card has no tail. */
+function ageTail(
   ageDays: number,
   principal: string,
   principalDiscordId?: string,
-): string {
+): string | null {
   if (ageBand(ageDays) === "overdue") {
     // A real Discord ping needs `<@id>` in content; the id is allow-listed
     // in allowed_mentions. Without a configured id, the mention is inert text.
     return principalDiscordId === undefined
-      ? `📣 @${principal} **${ageDays}d** — needs your attention ` +
-          "(no ping — configure principal.discordId)"
-      : `📣 <@${principalDiscordId}> **${ageDays}d** — needs your attention`;
+      ? `📣 @${principal} ${ageDays}d old — needs your attention ` +
+          "(no ping — configure `principal.discordId`)"
+      : `📣 <@${principalDiscordId}> ${ageDays}d old — needs your attention`;
   }
   if (ageBand(ageDays) === "aging") {
     return (
-      `⚠️ **${ageDays}d** — aging; blocked-descendant count unavailable ` +
+      `⚠️ ${ageDays}d old — aging; blocked-descendant count unavailable ` +
       "(read-only surface can't enumerate blocked nodes)"
     );
   }
-  return `· ${ageDays}d`;
+  return null;
 }
 
-/** Route-specific card framing: the mention-inerted head/map/url/checkpoint
- *  prefix plus (for provisioning cards) the blocked-probe registration lines. */
-function cardFraming(
-  node: ClassifiedNode,
+/** The subtext metadata every node card carries: map, kind, autonomy, checkpoint, age, link. */
+function nodeMeta(
   map: { repo: string; root: number },
-): {
-  prefixLines: string[];
-  probeLines: string[];
-} {
-  const spec = cardSpec(node);
-  const reason = sanitizeGraphText(spec.reason);
-  const probeLines =
-    node.route.route === "provisioning" && node.blockedProbes !== undefined
-      ? [
-          "register these in the probe registry (run + cwd must match exactly):",
-          ...node.blockedProbes
-            .slice(0, 6)
-            .map((p) =>
-              p.type === "command"
-                ? `  · command: run \`${sanitizeGraphText(p.run)}\` · cwd \`${sanitizeGraphText(p.cwd)}\``
-                : `  · url host: \`${sanitizeGraphText(p.host)}\` (target \`${sanitizeGraphText(p.target)}\`)`,
-            ),
-          ...(node.blockedProbes.length > 6
-            ? [`  · … and ${node.blockedProbes.length - 6} more probes`]
-            : []),
-        ]
-      : [];
-  const prefixLines = [
-    // Every graph-derived interpolation is mention-inerted (a graph author
-    // can set kind/autonomy/title/url to `<@principal-id>`), and the title
-    // is capped so a giant title can't evict the decision body or the suffix.
-    `${spec.head} — **#${sanitizeGraphText(node.id)}** ${truncate(sanitizeGraphText(node.title), 200)}`,
-    `map: ${mapKey(map)} · ${sanitizeGraphText(node.kind)} · ${sanitizeGraphText(node.autonomy)}`,
-    `url: ${sanitizeGraphText(node.url)}`,
-    node.checkpointId !== undefined && node.checkpointId.length > 0
-      ? `checkpoint: \`${sanitizeGraphText(node.checkpointId)}\``
+  node: { kind?: string; autonomy?: string; checkpointId?: string; url?: string } | undefined,
+  ageDays: number,
+): (string | null)[] {
+  return [
+    `map: ${mapKey(map)}`,
+    node?.kind ?? null,
+    node?.autonomy ?? null,
+    node?.checkpointId !== undefined && node.checkpointId.length > 0
+      ? `checkpoint ${code(node.checkpointId)}`
       : null,
-    reason ? `_${reason}_` : null,
-  ].filter((line): line is string => line !== null);
-  return { prefixLines, probeLines };
+    `age ${ageDays}d`,
+    node?.url ?? null,
+  ];
 }
 
-/** The decision body, budgeted to the room the rest of the card leaves up to
- *  Discord's 2000-char message cap (an arbitrary small cap would drop options
- *  sooner) and truncated with an explicit `…` — never silently. The `url:`
- *  line is the graph node's reference; whether it renders the full body is
- *  the graph surface's job, not ranger's. */
-function renderBoundedBody(
-  bodyText: string | null,
-  prefixLines: string[],
-  suffix: string,
-  kind: string,
-): string | null {
-  if (bodyText === null) return null;
-  const bodyBudget = 1950 - prefixLines.join("\n").length - suffix.length - 8;
-  return `_${truncate(
-    bodyText,
-    kind === "grilling" ? Math.max(120, bodyBudget) : 140,
-  )}_`;
+/** The provisioning card's blocked-probe registration lines. */
+function probeLines(node: ClassifiedNode): string[] {
+  if (node.route.route !== "provisioning" || node.blockedProbes === undefined) return [];
+  return [
+    "Register these in the probe registry (run + cwd must match exactly):",
+    ...node.blockedProbes
+      .slice(0, 6)
+      .map((p) =>
+        p.type === "command"
+          ? `- command: run ${code(p.run)} · cwd ${code(p.cwd)}`
+          : `- url host: ${code(p.host)} (target ${code(p.target)})`,
+      ),
+    ...(node.blockedProbes.length > 6
+      ? [`- … and ${node.blockedProbes.length - 6} more probes`]
+      : []),
+  ];
 }
 
-function cardContent(
+/** One escalation card, through the shared renderer (node #239): the status
+ *  line, the subtext metadata, the reason, the plain body, the probe lines
+ *  and the age tail. Every graph-derived interpolation is mention-inerted. */
+export function cardContent(
   node: ClassifiedNode,
   map: { repo: string; root: number },
   ageDays: number,
   principal: string,
   principalDiscordId?: string,
 ): string {
-  const { prefixLines, probeLines } = cardFraming(node, map);
-  const bodyText =
+  const spec = cardSpec(node);
+  const body =
     node.route.route === "escalate-hitl" &&
     node.body !== undefined &&
     node.body.trim().length > 0
-      ? sanitizeGraphText(node.body)
+      ? node.body
       : null;
-  const suffix = ageSuffix(ageDays, principal, principalDiscordId);
-  const bodyLine = renderBoundedBody(bodyText, prefixLines, suffix, node.kind);
-  const lines = [...prefixLines, bodyLine, ...probeLines, suffix].filter(
-    (line): line is string => line !== null,
-  );
-  // Discord rejects >2000-char messages. Cap the FRONT of the card (graph
-  // fields + body) so the trailing suffix — which carries the 7-day `<@id>`
-  // mention — always survives: a long graph title can never strip the ping.
-  const joined = lines.join("\n");
-  const suffixLength = suffix.length;
-  const front = joined.slice(0, joined.length - suffixLength);
-  const maxFront = 1949 - suffixLength - 1;
-  if (joined.length <= 1950) return joined;
-  const frontCapped =
-    front.length > maxFront ? `${front.slice(0, maxFront - 1)}…` : front;
-  return `${frontCapped}\n${suffix}`;
+  return renderCard({
+    ...spec.head,
+    nodeId: node.id,
+    title: node.title,
+    meta: nodeMeta(map, node, ageDays),
+    lines: spec.reason ? [sanitizeGraphText(spec.reason)] : [],
+    body,
+    // A grilling card carries the question in full room; the others a gist.
+    ...(node.kind === "grilling" ? {} : { bodyMax: 140 }),
+    footer: probeLines(node),
+    tail: ageTail(ageDays, principal, principalDiscordId),
+  });
 }
 
 // ---- the cards run ----
@@ -509,7 +475,7 @@ async function noteMoved(
   try {
     await clientFor(priorChannelId).edit(
       priorMessageId,
-      movedCardNote(node.id, node.title, client.channel),
+      movedCardNote(ctx.map, node.id, node.title, client.channel),
       budget.deadline,
     );
     return "noted";
@@ -648,8 +614,10 @@ export async function markAbsentCards(
   const resolve = async (prior: EscalationRow): Promise<AbsentOutcome> => {
     const closureOnly = ctx.onlyClosed || prior.notedAt !== null;
     let closed = false;
+    let read: NodeResult | undefined;
     try {
-      closed = (await ctx.readNode(prior.nodeId)).status === "closed";
+      read = await ctx.readNode(prior.nodeId);
+      closed = read.status === "closed";
     } catch (error) {
       if (error instanceof BudgetDeferral) return { action: "deferred", id: prior.nodeId };
       // A failed read is never evidence of closure. Still retire the queue
@@ -658,7 +626,7 @@ export async function markAbsentCards(
       journal.recordEvent("sweep", { nodeId: prior.nodeId, repo: map.repo, detail: `graph closure read deferred: ${String(error)}` });
     }
     if (!closed && closureOnly) return { action: "unchanged", id: prior.nodeId };
-    return reconcileAbsentCard(reconcileCtx, prior, absentCardMode(prior, map.repo, closed));
+    return reconcileAbsentCard(reconcileCtx, prior, absentCardMode(prior, map, closed, now, read));
   };
   // Queue-exit edits have first use of the shared Discord allowance. Select
   // both pages before edits so newly noted cards are not read twice this tick.
@@ -759,17 +727,23 @@ type AbsentOutcome =
   | { action: "deferred"; id: string }
   | { action: "error"; id: string; error: string };
 
-function absentCardMode(prior: EscalationRow, repo: string, closed: boolean): {
+function absentCardMode(
+  prior: EscalationRow,
+  map: { repo: string; root: number },
+  closed: boolean,
+  now: Date,
+  node?: NodeResult,
+): {
   content: string;
   cursorSuffix: string;
   status: EscalationRow["status"];
   action: "closed" | "keptOpen";
 } {
   return closed ? {
-    content: closedGraphContent(prior.nodeId, prior.title, repo),
+    content: closedGraphContent(map, prior, node, now),
     cursorSuffix: ".closed", status: "closed", action: "closed",
   } : {
-    content: queueExitContent(prior.nodeId, prior.title, repo),
+    content: queueExitContent(map, prior.nodeId, prior.title),
     cursorSuffix: "", status: prior.status, action: "keptOpen",
   };
 }
@@ -908,6 +882,8 @@ export async function closeGraphEscalation(ctx: {
   nodeId: string;
   owned: OwnedCheck;
   budget?: CardBudget;
+  /** The closed node as read, for the closed card's metadata. */
+  node?: NodeResult;
 }): Promise<void> {
   const prior = ctx.journal.getEscalation(ctx.map.repo, ctx.nodeId);
   if (prior === null || prior.status === "closed") return;
@@ -922,7 +898,7 @@ export async function closeGraphEscalation(ctx: {
       ...pass,
       clientFor: channelClientFor(pass.client),
       owned: () => { owned(); ctx.owned(); },
-    }, live, absentCardMode(live, ctx.map.repo, true));
+    }, live, absentCardMode(live, ctx.map, true, pass.now, ctx.node));
     if (outcome.action === "error" || outcome.action === "deferred") throw new Error(`closed card ${outcome.action}${"error" in outcome ? `: ${outcome.error}` : ""}`);
   });
 }
@@ -982,36 +958,59 @@ function charge(budget: CardBudget): boolean {
 /** The deterministic "card moved channels" note — one source of truth for
  *  the reconciliation a channel move leaves behind (round-25 review). */
 function movedCardNote(
+  map: { repo: string; root: number },
   nodeId: string,
   title: string | null,
   channelId: string,
 ): string {
-  // Mention-inert (a graph id/title can't ping), non-actionable, and title-
-  // CAPPED: a graph title over Discord's 2000-char message limit would fail
-  // the PATCH and leave the old card active-looking — the note must always
-  // fit (round-30 review).
-  return `~~**#${sanitizeGraphText(nodeId)}** ${truncate(sanitizeGraphText(title ?? ""), 200)}~~ moved to channel ${channelId} — the active card is in the new channel`;
+  // Mention-inert (a graph id/title can't ping), non-actionable, and inside
+  // the 2000-char cap: a note over Discord's limit would fail the PATCH and
+  // leave the old card active-looking — the note must always fit (round-30).
+  return renderCard({
+    emoji: "↪️",
+    status: "moved",
+    nodeId,
+    title,
+    meta: [`map: ${mapKey(map)}`],
+    lines: [`moved to channel ${channelId} — the active card is in the new channel`],
+  });
 }
 
 /** The deterministic queue-exit note — one source of truth for card content. */
 function queueExitContent(
+  map: { repo: string; root: number },
   nodeId: string,
   title: string | null,
-  repo: string,
 ): string {
-  // Title is CAPPED (like movedCardNote): a graph title over Discord's
-  // 2000-char limit would fail the PATCH and leave the card actionable
-  // (round-30 review).
-  return [
-    `~~**#${sanitizeGraphText(nodeId)}** ${truncate(sanitizeGraphText(title ?? ""), 200)}~~ no longer on the HITL/provisioning queue`,
-    `map: ${repo} — card kept open; resolves on a principal response or operator verb`,
-  ]
-    .filter((l) => l.trim().length > 0)
-    .join("\n");
+  return renderCard({
+    emoji: "📤",
+    status: "off the queue",
+    nodeId,
+    title,
+    meta: [`map: ${mapKey(map)}`],
+    lines: ["no longer on the HITL/provisioning queue — card kept open; resolves on a principal response or operator verb"],
+  });
 }
 
-function closedGraphContent(nodeId: string, title: string | null, repo: string): string {
-  return `~~**#${sanitizeGraphText(nodeId)}** ${truncate(sanitizeGraphText(title ?? ""), 200)}~~ closed on the graph\nmap: ${sanitizeGraphText(repo)}`;
+/** The closed-on-the-graph card: the same metadata as the live card, when the
+ *  closure read carried the node. */
+export function closedGraphContent(
+  map: { repo: string; root: number },
+  prior: EscalationRow,
+  node: NodeResult | undefined,
+  now: Date,
+): string {
+  return renderCard({
+    emoji: "✅",
+    status: "closed on the graph",
+    nodeId: prior.nodeId,
+    title: prior.title,
+    meta: nodeMeta(
+      map,
+      node === undefined ? undefined : { ...node.node, url: node.url },
+      dayDiff(prior.createdAt, now),
+    ),
+  });
 }
 
 export function ageText(
