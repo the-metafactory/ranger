@@ -185,7 +185,7 @@ async function buildUnderLock(nodeId: string, ctx: BuildNowContext, owned: Owned
  if (why !== null) refuse(why);
  const lane = node!.route.route as "implement" | "research";
 
- if (journal.hasVeto(nodeId)) refuse("vetoed — the walk never claims a vetoed node");
+ if (journal.hasVeto(nodeId, map.repo)) refuse("vetoed — the walk never claims a vetoed node");
  const row = journal.getWorker(nodeId, map.repo);
  if (row !== null && IN_FLIGHT.has(row.status)) {
   refuse(`already in flight (${row.status}) — \`ranger resume-node\` puts a stuck worker back in motion`);

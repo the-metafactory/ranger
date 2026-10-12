@@ -50,6 +50,7 @@ export const CARD_HEADS: Record<string, { emoji: string; status: string }> = {
   provisioning: { emoji: "🔧", status: "provisioning needed" },
   "brief-not-ready": { emoji: "📝", status: "build brief not ready" },
   proposal: { emoji: "🗳️", status: "proposal — react 👍 to ratify" },
+  refused: { emoji: "🚫", status: "refused, yours to take" },
   draft: { emoji: "📥", status: "draft node" },
 };
 
@@ -81,6 +82,13 @@ function cardSpec(node: ClassifiedNode): { head: CardHead; reason: string; journ
         journalReason: "brief-not-ready",
       };
     case "proposal":
+      if (route.refused === true) {
+        return {
+          head: CARD_HEADS.refused!,
+          reason: `The principal 👎'd ranger's proposal${route.commentUrl === null ? "" : ` (${route.commentUrl})`}: ranger posted a veto comment on the node, released its claim and will never propose it again. The node stays open and is yours to take.`,
+          journalReason: "refused",
+        };
+      }
       return {
         head: CARD_HEADS.proposal!,
         reason: route.missing === true
@@ -1125,6 +1133,62 @@ export function proposalNode(row: WorkerRow, title: string): ClassifiedNode {
       ...(row.proposalCommentId === null && (row.outcome ?? "").startsWith(PROPOSAL_MISSING) ? { missing: true as const } : {}),
     },
   };
+}
+
+/**
+ * The card of a vetoed node (node #240, ruling D7): released, back on the
+ * frontier, and never proposed again. Built from the veto alone, so the
+ * ratify phase's edit and the desk's pass render the same card.
+ */
+export function refusedNode(veto: { repo: string; nodeId: string; proposalCommentId: string | null }, title: string): ClassifiedNode {
+  const url = nodeUrl(veto.repo, veto.nodeId);
+  return {
+    id: veto.nodeId,
+    title,
+    kind: "research",
+    autonomy: "propose",
+    typed: true,
+    url,
+    registryBlocked: false,
+    route: {
+      route: "proposal",
+      commentId: veto.proposalCommentId,
+      commentUrl: veto.proposalCommentId === null ? null : nodeCommentUrl(veto.repo, url, veto.proposalCommentId),
+      refused: true,
+    },
+  };
+}
+
+/**
+ * A principal 👎 on a proposal (node #240, ruling D7): the node's card, when
+ * it has one, is edited at once to "refused, yours to take". The desk renders
+ * the same card for the vetoed node while it stands on the frontier, so its
+ * next pass leaves the card as it is. A card that is not yet posted is the
+ * desk's to post.
+ */
+export async function refuseProposalCard(ctx: {
+  config: RangerConfig;
+  journal: Journal;
+  map: RangerMapConfig;
+  veto: { repo: string; nodeId: string; proposalCommentId: string | null };
+}): Promise<void> {
+  const { journal, map, veto } = ctx;
+  const prior = journal.getEscalation(map.repo, veto.nodeId);
+  if (prior === null || prior.status === "closed") return;
+  if (prior.root !== map.root) throw new Error(`escalation belongs to map ${map.repo}#${prior.root}, not ${mapKey(map)}`);
+  await withEscalateLock(journal, async (owned) => {
+    const live = journal.getEscalation(map.repo, veto.nodeId);
+    if (live === null || live.status === "closed") return;
+    const pass = outOfBandPass(map);
+    const outcome = await syncCard(
+      { client: pass.client, clientFor: channelClientFor(pass.client), journal, map, config: ctx.config, now: pass.now, budget: pass.budget, owned },
+      refusedNode(veto, live.title ?? `#${veto.nodeId}`),
+      live,
+    );
+    if (outcome.action === "error" || outcome.action === "deferred") {
+      throw new Error(`refused card ${outcome.action}${"error" in outcome ? `: ${outcome.error}` : ""}`);
+    }
+  });
 }
 
 export function cardNeeded(node: ClassifiedNode): boolean {

@@ -20,6 +20,7 @@ import {
   digestAction,
   markAbsentCards,
   proposalNode,
+  refusedNode,
   resolveDeskContext,
   sanitizeGraphText,
   syncActivePage,
@@ -131,16 +132,21 @@ async function escalateOneMap(
       now,
       timeoutMs: Math.max(1, Math.min(GRAPH_CALL_TIMEOUT_MS, passDeadline - Date.now())),
     }));
-    const classified = frontier.frontier.map((entry) =>
-      classify(entry, map.repo, map.walk, registry, {
+    // A vetoed node back on the frontier carries the refused card, whatever
+    // its route (node #240, ruling D7): the principal's to take.
+    const vetoes = new Map(journal.listVetoes(map.repo).map((veto) => [veto.nodeId, veto]));
+    const classified = frontier.frontier.map((entry) => {
+      const veto = vetoes.get(entry.ref.id);
+      if (veto !== undefined) return refusedNode(veto, entry.node.title);
+      return classify(entry, map.repo, map.walk, registry, {
         botIdentity: config.bot.identity,
         allowlist: map.nodes,
         skip: map.skip,
         briefs,
         principal: principalLoginForRepo(config, map.repo),
         rootAuthor,
-      }),
-    );
+      });
+    });
     const readNode = (id: string) => {
       if (Date.now() >= passDeadline) throw new BudgetDeferral("graph closure pass deadline reached");
       return budgetedRead(journal, map.repo, token, budgetPolicy(config), now, () => {
@@ -155,6 +161,7 @@ async function escalateOneMap(
       ...hitlWaiting(classified),
       ...classified.filter((n) => n.route.route === "provisioning"),
       ...briefHeld,
+      ...classified.filter((n) => n.route.route === "proposal"),
       ...proposals,
     ].filter(cardNeeded);
     if (!briefs.ok) base.cardErrors.push(`build briefs unverified: ${briefs.error}`);

@@ -826,9 +826,9 @@ describe("#37 — the journal is read, never written", () => {
 
  test("the veto set is one read", () => {
   const j = new Journal(":memory:");
-  j.recordVeto("10", "c1");
-  j.recordVeto("14", "c2");
-  expect([...j.listVetoes()].sort()).toEqual(["10", "14"]);
+  j.recordVeto({ repo: "acme/widgets", nodeId: "10", commentId: "c1" });
+  j.recordVeto({ repo: "acme/gadgets", nodeId: "14", commentId: "c2" });
+  expect(j.listVetoes().map((v) => `${v.repo}#${v.nodeId}`).sort()).toEqual(["acme/gadgets#14", "acme/widgets#10"]);
   j.close();
  });
 

@@ -107,6 +107,20 @@ export interface EventRow {
  detail: string | null;
 }
 
+/** One vetoed node (node #240). */
+export interface VetoRow {
+ /** '' on a row from before node #240: it vetoes the node on every repo. */
+ repo: string;
+ nodeId: string;
+ root: number | null;
+ /** Ranger's veto comment on the node. */
+ commentId: string;
+ /** The proposal comment the principal 👎'd; null when unknown. */
+ proposalCommentId: string | null;
+ at: string;
+ detail: string | null;
+}
+
 export interface SubstrateReading {
  substrate: SubstrateName;
  readAt: string;
@@ -213,6 +227,10 @@ export type EventKind =
  | "proposal-bound"
  | "proposal-missing"
  | "ratified"
+ /** Node #240: a principal 👎 vetoed a proposal; a lost journal recovered a proposal or a veto from GitHub. */
+ | "vetoed"
+ | "proposal-recovered"
+ | "veto-recovered"
  | "merge-card"
  | "merged"
  | "rebased"
@@ -646,33 +664,61 @@ export class Journal {
 
  // ---- vetoes ----
 
- recordVeto(nodeId: string, commentId: string, detail?: string): void {
+ /**
+  * Record a veto (node #240): idempotent per (repo, node). `commentId` is
+  * ranger's veto comment, the record a lost journal is rebuilt from.
+  */
+ recordVeto(veto: {
+  repo: string;
+  nodeId: string;
+  root?: number;
+  commentId: string;
+  proposalCommentId?: string | null;
+  detail?: string;
+ }): void {
+  const at = new Date().toISOString();
+  const fields = {
+   root: veto.root ?? null,
+   commentId: veto.commentId,
+   proposalCommentId: veto.proposalCommentId ?? null,
+   at,
+   detail: veto.detail ?? null,
+  };
   this.db
    .insert(vetoes)
-   .values({
-    nodeId,
-    commentId,
-    at: new Date().toISOString(),
-    detail: detail ?? null,
-   })
-   .onConflictDoUpdate({
-    target: vetoes.nodeId,
-    set: { commentId, at: new Date().toISOString(), detail: detail ?? null },
-   })
+   .values({ repo: veto.repo, nodeId: veto.nodeId, ...fields })
+   .onConflictDoUpdate({ target: [vetoes.repo, vetoes.nodeId], set: fields })
    .run();
  }
 
- /** Every vetoed node id, in one query (#37: `ranger serve` reads them per poll). */
- listVetoes(): Set<string> {
-  return new Set(
-   this.db.query.vetoes.findMany({ columns: { nodeId: true } }).sync().map((v) => v.nodeId),
-  );
+ /** Every veto, in one query (#37: `ranger serve` reads them per poll). */
+ listVetoes(repo?: string, root?: number): VetoRow[] {
+  const rows = this.db.query.vetoes
+   .findMany({
+    where: repo === undefined ? undefined : and(eq(vetoes.repo, repo), root === undefined ? undefined : eq(vetoes.root, root)),
+   })
+   .sync();
+  return rows.map((v) => ({
+   repo: v.repo,
+   nodeId: v.nodeId,
+   root: v.root,
+   commentId: v.commentId,
+   proposalCommentId: v.proposalCommentId,
+   at: v.at,
+   detail: v.detail,
+  }));
  }
 
- hasVeto(nodeId: string): boolean {
+ /** This repo's veto on the node, or null (a row from before node #240 is not this repo's). */
+ getVeto(nodeId: string, repo: string): VetoRow | null {
+  return this.listVetoes(repo).find((veto) => veto.nodeId === nodeId) ?? null;
+ }
+
+ /** Is this node vetoed on this repo? A row from before node #240 (repo '') vetoes it on every repo. */
+ hasVeto(nodeId: string, repo: string): boolean {
   const row = this.db.query.vetoes
    .findFirst({
-    where: eq(vetoes.nodeId, nodeId),
+    where: and(eq(vetoes.nodeId, nodeId), or(eq(vetoes.repo, repo), eq(vetoes.repo, ""))),
    })
    .sync();
   return row !== undefined;

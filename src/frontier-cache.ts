@@ -82,6 +82,12 @@ interface CachedAudit {
   fetchedAt: string;
   notReady: BuildBriefNotReady[];
   prints: Record<string, string>;
+  /**
+   * The map's open, claimed nodes as the audit saw them (node #240): how the
+   * ratify phase finds a proposal whose worker row a lost journal took with
+   * it. Absent on an entry cached before node #240.
+   */
+  openClaimed?: { id: string; assignees: string[] }[];
 }
 
 /** The audit cache entry. */
@@ -331,10 +337,10 @@ async function settleAudit(
     return { briefs: { ok: false, error: record?.error ?? "soma graph audit not read yet" } };
   }
   const started = Date.now();
-  const briefs = await readBriefs(args);
+  const { briefs, openClaimed } = await readBriefs(args);
   const ms = Date.now() - started;
   if (briefs.ok) {
-    return { briefs, record: { good: { fetchedAt: now.toISOString(), notReady: briefs.notReady, prints } }, ms };
+    return { briefs, record: { good: { fetchedAt: now.toISOString(), notReady: briefs.notReady, prints, openClaimed } }, ms };
   }
   const failed: AuditRecord = { ...(kept === undefined ? {} : { good: kept }), error: briefs.error };
   if (young) {
@@ -354,7 +360,7 @@ async function settleAudit(
  * is returned as `ok: false`, so research and task nodes still walk while
  * build nodes wait.
  */
-async function readBriefs(args: ReadFrontierArgs): Promise<BriefAudit> {
+async function readBriefs(args: ReadFrontierArgs): Promise<{ briefs: BriefAudit; openClaimed?: { id: string; assignees: string[] }[] }> {
   const { journal, repo, root, token, policy, now } = args;
   try {
     const audit = await budgetedRead(journal, repo, token, policy, now, () =>
@@ -363,10 +369,27 @@ async function readBriefs(args: ReadFrontierArgs): Promise<BriefAudit> {
         ...(args.runner === undefined ? {} : { runner: args.runner }),
       }),
     );
-    return { ok: true, notReady: audit.buildBriefNotReady ?? [] };
+    return {
+      briefs: { ok: true, notReady: audit.buildBriefNotReady ?? [] },
+      ...(Array.isArray(audit.openClaimed) ? { openClaimed: audit.openClaimed } : {}),
+    };
   } catch (error) {
-    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    return { briefs: { ok: false, error: error instanceof Error ? error.message : String(error) } };
   }
+}
+
+/**
+ * The open, claimed nodes of a map as the last good audit saw them (node
+ * #240), or null when no audit cached them. A plain journal read.
+ */
+export function cachedOpenClaims(
+  journal: Journal,
+  repo: string,
+  root: number,
+): { fetchedAt: string; claims: { id: string; assignees: string[] }[] } | null {
+  const good = readAuditRecord(journal, repo, root)?.good;
+  if (good?.openClaimed === undefined) return null;
+  return { fetchedAt: good.fetchedAt, claims: good.openClaimed };
 }
 
 /**

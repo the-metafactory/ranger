@@ -277,7 +277,7 @@ describe("node #58 — build-now refuses", () => {
 
  test("a vetoed node", async () => {
   const r = rig();
-  r.journal.recordVeto("10", "c1");
+  r.journal.recordVeto({ repo: REPO, nodeId: "10", commentId: "c1" });
   expect(await refusal(buildNow("10", r.ctx()))).toMatch(/vetoed/);
   untouched(r, "10");
  });

@@ -85,9 +85,15 @@ describe("Journal — SQLite state (design §8)", () => {
 
  test("vetoes are durable (journal is a cache of the node comment record)", () => {
   const j = new Journal(":memory:");
-  expect(j.hasVeto("5")).toBe(false);
-  j.recordVeto("5", "comment-123", "principal 👎");
-  expect(j.hasVeto("5")).toBe(true);
+  expect(j.hasVeto("5", "acme/widgets")).toBe(false);
+  j.recordVeto({ repo: "acme/widgets", nodeId: "5", root: 1, commentId: "comment-123", proposalCommentId: "9001", detail: "principal 👎" });
+  expect(j.hasVeto("5", "acme/widgets")).toBe(true);
+  // Per repo (node #240): node ids collide across maps on different repos.
+  expect(j.hasVeto("5", "acme/gadgets")).toBe(false);
+  // Idempotent per (repo, node).
+  j.recordVeto({ repo: "acme/widgets", nodeId: "5", root: 1, commentId: "comment-123" });
+  expect(j.listVetoes("acme/widgets", 1)).toHaveLength(1);
+  expect(j.listVetoes("acme/widgets", 2)).toEqual([]);
   j.close();
  });
 });

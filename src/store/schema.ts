@@ -108,12 +108,21 @@ export const health = sqliteTable("health", {
  value: text("value").notNull(),
 });
 
+/**
+ * The veto cache (design §5, node #240): one row per vetoed node, keyed
+ * (repo, node). `commentId` is ranger's veto comment, the GitHub record a
+ * lost journal is rebuilt from; `root` and `proposalCommentId` are null on a
+ * row from before node #240, whose repo is '' (it vetoes the node on every repo).
+ */
 export const vetoes = sqliteTable("vetoes", {
- nodeId: text("node_id").primaryKey(),
+ repo: text("repo").notNull(),
+ nodeId: text("node_id").notNull(),
+ root: integer("root"),
  commentId: text("comment_id").notNull(),
+ proposalCommentId: text("proposal_comment_id"),
  at: text("at").notNull(),
  detail: text("detail"),
-});
+}, (table) => [primaryKey({ columns: [table.repo, table.nodeId] })]);
 
 /**
  * Escalation cards (design §5, build-path step 2) — one row per HITL/

@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { loadConfig } from "../src/config.ts";
 import { openJournal, type Journal } from "../src/journal.ts";
 import { runCmd } from "../src/exec.ts";
-import { boundProposalComment, principalRatified, ratifyReadKey } from "../src/ratify.ts";
+import { boundProposalComment, boundVeto, principalRatified, principalVetoed, ratifyReadKey } from "../src/ratify.ts";
 import { walk, type WalkResult } from "../src/walk.ts";
 import { baseConfigLines, bun, cliPath, createCanonicalRepo, fakeDiscord, GIT_ENV, testCliEnv } from "./support.ts";
 
@@ -229,7 +229,11 @@ describe("ratify phase (node #250)", () => {
    const { result, spawned } = await f.tick();
    expect(result.ratify.read).toEqual([`${REPO}#10`]);
    expect(spawned).toEqual([]);
-   expect(f.journal((j) => j.getWorker("10", REPO))?.status).toBe("proposed");
+   // The 👎 vetoes it (node #240): released, never closed.
+   expect(result.ratify.vetoed).toEqual([`${REPO}#10`]);
+   expect(f.journal((j) => j.getWorker("10", REPO))?.status).toBe("released");
+   expect(f.state().nodes["10"].status).toBe("open");
+   expect(f.state().lastClose).toBeUndefined();
   } finally {
    f.stop();
   }
@@ -396,5 +400,241 @@ describe("ratify pins (node #250, ruling D6)", () => {
   expect(boundProposalComment([c(1, "ivy-bot", marker("10")), c(3, "ivy-bot", marker("10")), c(2, "ivy-bot", marker("10"))], "ivy-bot", "10")).toBe("3");
   expect(boundProposalComment([c(1, "alice", marker("10")), c(2, "ivy-bot", marker("100"))], "ivy-bot", "10")).toBeNull();
   expect(boundProposalComment([], "ivy-bot", "10")).toBeNull();
+ });
+});
+
+const vetoMarker = (id: string, proposal: string) => `<!-- ranger:veto node=${id} proposal=${proposal} -->`;
+
+/** Every comment on a node in the fake GitHub state, flattened. */
+const commentsOn = (f: Fixture, id: string): { id: number; user: { login: string }; body: string }[] =>
+ (f.state().comments?.[id] ?? []).flat();
+
+/** The journal file and its WAL, gone: a lost journal (ruling D1). */
+function loseJournal(f: Fixture): void {
+ for (const suffix of ["", "-wal", "-shm"]) rmSync(join(f.dir, `state.sqlite${suffix}`), { force: true });
+}
+
+/** The audit the walk caches: the machine account's open claim on node 10. */
+function auditClaims(f: Fixture, claims: { id: string; assignees: string[] }[]): void {
+ writeFileSync(join(f.dir, "data", "acme__widgets-audit.json"), JSON.stringify({
+  repo: REPO, root: "1", nodes: 2, closedWithoutReceipt: [], openWithoutCheckpoint: [], openClaimed: claims,
+ }));
+}
+
+describe("veto (node #240)", () => {
+ test("propose → the principal's 👎 beside a 👍 → veto comment, release, refused card, no close, never re-proposed", async () => {
+  const f = await fixture();
+  try {
+   await propose(f);
+   expect(f.state().nodes["10"].assignees).toEqual(["ivy-bot"]);
+   expect((await f.cli(["escalate", "--json"])).code).toBe(0);
+   const card = f.discord.posts.find((p) => p.content.startsWith("🗳️ proposal"))!;
+   expect(card).toBeDefined();
+
+   f.patchState((s) => { s.reactions = { "9001": [[r("jcfischer", "+1"), r("alice", "+1")], [r("jcfischer", "-1")]] }; });
+   const { result, spawned } = await f.tick();
+   expect(result.ratify.vetoed).toEqual([`${REPO}#10`]);
+   expect(result.ratify.closing).toEqual([]);
+   expect(spawned).toEqual([]);
+
+   // The veto comment, under the machine account, with the marker.
+   const veto = commentsOn(f, "10").find((c) => c.body.includes(vetoMarker("10", "9001")))!;
+   expect(veto.user.login).toBe("ivy-bot");
+   expect(veto.body).toContain("jcfischer reacted 👎");
+   expect(veto.body).toContain(`https://github.com/${REPO}/issues/10#issuecomment-9001`);
+   // Released, not closed.
+   const state = f.state();
+   expect(state.nodes["10"]).toMatchObject({ status: "open", assignees: [] });
+   expect(state.lastClose).toBeUndefined();
+   const row = f.journal((j) => j.getWorker("10", REPO))!;
+   expect(row.status).toBe("released");
+   expect(row.outcome).toStartWith("vetoed: jcfischer 👎 on proposal comment 9001 — claim released");
+   expect(f.journal((j) => j.getVeto("10", REPO))).toMatchObject({ commentId: String(veto.id), proposalCommentId: "9001", root: 1 });
+   expect(f.journal((j) => j.listEvents(REPO)).map((e) => e.kind)).toContain("vetoed");
+   // The card, edited in place.
+   const refused = f.discord.edits.filter((e) => e.messageId === card.messageId).at(-1)!;
+   expect(refused.content).toStartWith("🚫 refused, yours to take");
+   expect(refused.content).toContain("will never propose it again");
+
+   // Back on the frontier: never claimed into the propose research lane again.
+   f.writeFrontier([frontierEntry("10")]);
+   const again = await f.tick();
+   expect(again.result.maps[0]!.claimed).toEqual([]);
+   expect(again.result.maps[0]!.errors.join("\n")).toContain("#10 vetoed — not claimed");
+   expect(f.state().nodes["10"].assignees).toEqual([]);
+   // One veto comment, however many ticks.
+   expect(commentsOn(f, "10").filter((c) => c.body.includes("ranger:veto"))).toHaveLength(1);
+
+   // The desk keeps the refused card as the ratify phase left it.
+   const edits = f.discord.edits.length;
+   expect((await f.cli(["escalate", "--json"])).code).toBe(0);
+   expect(f.discord.edits.length).toBe(edits);
+   expect(f.discord.posts.filter((p) => p.content.startsWith("🚫"))).toEqual([]);
+  } finally {
+   f.stop();
+  }
+ }, 120_000);
+
+ test("a principal 👎 alone vetoes too", async () => {
+  const f = await fixture();
+  try {
+   seedProposal(f, "10", "9001", "2026-10-01T00:00:00.000Z");
+   f.writeFrontier([]);
+   f.patchState((s) => { s.nodes["10"].assignees = ["ivy-bot"]; s.reactions = { "9001": [[r("jcfischer", "-1")]] }; });
+   const { result } = await f.tick();
+   expect(result.ratify.vetoed).toEqual([`${REPO}#10`]);
+   expect(commentsOn(f, "10").some((c) => c.body.includes(vetoMarker("10", "9001")))).toBe(true);
+   expect(f.state().nodes["10"]).toMatchObject({ status: "open", assignees: [] });
+  } finally {
+   f.stop();
+  }
+ }, 60_000);
+
+ test("a failed veto comment POST leaves the proposal as it was; the next tick vetoes", async () => {
+  const f = await fixture();
+  try {
+   seedProposal(f, "10", "9001", "2026-10-01T00:00:00.000Z");
+   f.writeFrontier([]);
+   f.patchState((s) => { s.nodes["10"].assignees = ["ivy-bot"]; s.reactions = { "9001": [[r("jcfischer", "-1")]] }; });
+   const failed = await f.tick({ FAKE_GH_COMMENT_FAIL: "1" });
+   expect(failed.result.ratify.vetoed).toEqual([]);
+   expect(failed.result.ratify.errors.join("\n")).toContain("#10:");
+   expect(f.journal((j) => [j.getWorker("10", REPO)?.status, j.hasVeto("10", REPO)])).toEqual(["proposed", false]);
+   expect(f.state().nodes["10"].assignees).toEqual(["ivy-bot"]);
+   const next = await f.tick();
+   expect(next.result.ratify.vetoed).toEqual([`${REPO}#10`]);
+   expect(f.state().nodes["10"].assignees).toEqual([]);
+  } finally {
+   f.stop();
+  }
+ }, 60_000);
+
+ test("a write identity that resolves to the principal posts no veto and releases nothing", async () => {
+  const f = await fixture({ pinBot: false });
+  try {
+   seedProposal(f, "10", "9001", "2026-10-01T00:00:00.000Z");
+   f.writeFrontier([]);
+   f.patchState((s) => { s.nodes["10"].assignees = ["ivy-bot"]; s.reactions = { "9001": [[r("jcfischer", "-1")]] }; });
+   const tick = await f.tick({ RANGER_WRITE_TEST: "ghp_principal" });
+   expect(tick.result.maps[0]!.gateReason).toContain("principal's identity");
+   expect(tick.result.ratify.vetoed).toEqual([]);
+   expect(commentsOn(f, "10")).toEqual([]);
+   expect(f.state().nodes["10"].assignees).toEqual(["ivy-bot"]);
+   expect(f.journal((j) => [j.getWorker("10", REPO)?.status, j.hasVeto("10", REPO)])).toEqual(["proposed", false]);
+  } finally {
+   f.stop();
+  }
+ }, 60_000);
+
+ test("journal lost after a veto: the veto is rebuilt from the bot's veto comment before any claim", async () => {
+  const f = await fixture();
+  try {
+   seedProposal(f, "10", "9001", "2026-10-01T00:00:00.000Z");
+   f.writeFrontier([]);
+   f.patchState((s) => { s.nodes["10"].assignees = ["ivy-bot"]; s.reactions = { "9001": [[r("jcfischer", "-1")]] }; });
+   expect((await f.tick()).result.ratify.vetoed).toEqual([`${REPO}#10`]);
+   const vetoId = commentsOn(f, "10").find((c) => c.body.includes("ranger:veto"))!.id;
+   // Someone else's copy of the marker binds nothing.
+   f.patchState((s) => { s.comments["10"][0].unshift({ id: 1, user: { login: "alice" }, body: vetoMarker("10", "1") }); });
+
+   loseJournal(f);
+   f.writeFrontier([frontierEntry("10")]);
+   const { result } = await f.tick();
+   expect(result.maps[0]!.claimed).toEqual([]);
+   expect(result.maps[0]!.errors.join("\n")).toContain("#10 vetoed — not claimed");
+   expect(f.state().nodes["10"].assignees).toEqual([]);
+   expect(f.journal((j) => j.getVeto("10", REPO))).toMatchObject({ commentId: String(vetoId), proposalCommentId: "9001" });
+   expect(f.journal((j) => j.listEvents(REPO)).map((e) => e.kind)).toContain("veto-recovered");
+  } finally {
+   f.stop();
+  }
+ }, 60_000);
+
+ test("a failed veto rebuild read claims no propose research node on the map that tick", async () => {
+  const f = await fixture();
+  try {
+   const failed = await f.tick({ FAKE_GH_RATIFY_FAIL: "exit" });
+   expect(failed.result.maps[0]!.claimed).toEqual([]);
+   expect(failed.result.maps[0]!.errors.join("\n")).toContain("veto rebuild failed");
+   expect(f.state().nodes["10"].assignees).toEqual([]);
+   // No veto on GitHub: once the read answers, the node is claimed.
+   const next = await f.tick();
+   expect(next.result.maps[0]!.claimed).toEqual(["10"]);
+  } finally {
+   f.stop();
+  }
+ }, 60_000);
+
+ test("journal lost while a proposal is open: the comment id is recovered from GitHub and the 👍 ratifies", async () => {
+  const f = await fixture();
+  try {
+   await propose(f);
+   // The proposal comment soma posted, as GitHub has it.
+   f.patchState((s) => {
+    s.comments = { "10": [[{ id: 9001, user: { login: "ivy-bot" }, body: `findings\n${marker("10")}` }]] };
+    s.reactions = { "9001": [[r("jcfischer", "+1")]] };
+   });
+   auditClaims(f, [{ id: "10", assignees: ["ivy-bot"] }, { id: "16", assignees: ["alice"] }]);
+   loseJournal(f);
+
+   // The first tick after the loss caches the audit; the ratify phase reads it from then on.
+   await f.tick();
+   const { result, spawned } = await f.tick();
+   expect(result.ratify.recovered).toEqual([`${REPO}#10`]);
+   expect(result.ratify.closing).toEqual([`${REPO}#10`]);
+   expect(spawned).toEqual(["10"]);
+   expect(f.journal((j) => j.getWorker("10", REPO))).toMatchObject({ proposalCommentId: "9001", status: "running", phase: "close", root: 1 });
+   expect(f.journal((j) => j.listEvents(REPO)).map((e) => e.kind)).toContain("proposal-recovered");
+   // Someone else's claim is not ranger's to recover.
+   expect(f.journal((j) => j.getWorker("16", REPO))).toBeNull();
+  } finally {
+   f.stop();
+  }
+ }, 120_000);
+
+ test("journal lost after a veto whose release failed: the veto is recovered and the claim released", async () => {
+  const f = await fixture();
+  try {
+   seedProposal(f, "10", "9001", "2026-10-01T00:00:00.000Z");
+   f.writeFrontier([]);
+   f.patchState((s) => {
+    s.nodes["10"].assignees = ["ivy-bot"];
+    s.comments = { "10": [[
+     { id: 9001, user: { login: "ivy-bot" }, body: `findings\n${marker("10")}` },
+     { id: 9100, user: { login: "ivy-bot" }, body: `vetoed\n${vetoMarker("10", "9001")}` },
+    ]] };
+   });
+   auditClaims(f, [{ id: "10", assignees: ["ivy-bot"] }]);
+   loseJournal(f);
+   await f.tick();
+   const { result } = await f.tick();
+   expect(result.ratify.recovered).toEqual([`${REPO}#10`]);
+   expect(result.ratify.vetoed).toEqual([`${REPO}#10`]);
+   expect(f.state().nodes["10"].assignees).toEqual([]);
+   expect(f.journal((j) => j.getVeto("10", REPO))).toMatchObject({ commentId: "9100", proposalCommentId: "9001" });
+   expect(f.journal((j) => j.getWorker("10", REPO))?.status).toBe("released");
+   // No second veto comment.
+   expect(commentsOn(f, "10").filter((c) => c.body.includes("ranger:veto"))).toHaveLength(1);
+  } finally {
+   f.stop();
+  }
+ }, 120_000);
+});
+
+describe("veto pins (node #240, ruling D7)", () => {
+ const reactions = (...list: [string, string][]) => list.map(([author, content]) => ({ author, content }));
+ test("any principal -1 vetoes; nobody else's does", () => {
+  expect(principalVetoed(reactions(["jcfischer", "-1"]), "jcfischer")).toBe(true);
+  expect(principalVetoed(reactions(["jcfischer", "+1"], ["JCFischer", "-1"]), "jcfischer")).toBe(true);
+  expect(principalVetoed(reactions(["alice", "-1"], ["jcfischer", "+1"]), "jcfischer")).toBe(false);
+  expect(principalVetoed([], "jcfischer")).toBe(false);
+ });
+
+ test("the bound veto is the newest bot comment carrying this node's veto marker", () => {
+  const c = (id: number, author: string, body: string) => ({ id, author, body });
+  expect(boundVeto([c(1, "ivy-bot", vetoMarker("10", "5")), c(3, "ivy-bot", vetoMarker("10", "7"))], "ivy-bot", "10"))
+   .toEqual({ commentId: "3", proposalCommentId: "7" });
+  expect(boundVeto([c(1, "alice", vetoMarker("10", "5")), c(2, "ivy-bot", vetoMarker("100", "5"))], "ivy-bot", "10")).toBeNull();
+  expect(boundVeto([c(2, "ivy-bot", "<!-- ranger:veto node=10 proposal=x -->")], "ivy-bot", "10")).toBeNull();
  });
 });

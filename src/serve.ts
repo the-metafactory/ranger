@@ -199,7 +199,8 @@ export interface StateInputs {
  drains?: DrainState;
  spawnsToday: number;
  spawnCap: number;
- vetoed: (nodeId: string) => boolean;
+ /** Is this node vetoed on this repo (node #240: vetoes are per repo)? */
+ vetoed: (nodeId: string, repo: string) => boolean;
  pidAlive: (pid: number | null) => boolean;
  refreshing: boolean;
  refreshError: string | null;
@@ -445,7 +446,7 @@ function nextFor(
  const holder = tick.holders[map.lane];
  const plan = planTick(report.frontier, {
   laneBusy: holder !== null,
-  vetoed: inputs.vetoed,
+  vetoed: (id) => inputs.vetoed(id, map.repo),
   implementDrained: drain?.scope === "lane",
  });
  // What this map spends of the tick, for the maps after it.
@@ -564,7 +565,7 @@ export function assembleState(inputs: StateInputs): DashboardState {
    next: planned.get(map.key)!,
    queued: walked && !drained
     ? implementCandidates(frontier)
-       .filter((n) => n.id !== planned.get(map.key)!.nodeId && !inputs.vetoed(n.id))
+       .filter((n) => n.id !== planned.get(map.key)!.nodeId && !inputs.vetoed(n.id, map.repo))
        .map(view)
     : [],
    autonomous: walked ? walkableCandidates(frontier).map(view) : [],
@@ -1979,7 +1980,7 @@ export function stateFromJournal(
        },
    );
   }
-  const vetoed = journal?.listVetoes() ?? new Set<string>();
+  const vetoes = journal?.listVetoes() ?? [];
   const workers = journal?.listWorkers() ?? [];
   const resumeQueue = journal?.listResumeQueue() ?? [];
   const laneHolders = { visual: journal?.laneHolder("visual") ?? null, headless: journal?.laneHolder("headless") ?? null };
@@ -2036,7 +2037,7 @@ export function stateFromJournal(
    drains: journal === null ? undefined : readDrains(journal, config.maps),
    spawnsToday: journal?.spawnsToday(now) ?? 0,
    spawnCap: config.workers.spawnCapPerDay,
-   vetoed: (id) => vetoed.has(id),
+   vetoed: (id, repo) => vetoes.some((v) => v.nodeId === id && (v.repo === repo || v.repo === "")),
    pidAlive: defaultPidAlive,
    refreshing: reader.refreshing,
    refreshError: reader.lastError,
