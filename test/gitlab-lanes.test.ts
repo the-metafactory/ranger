@@ -9,6 +9,7 @@ import type { ChangeRequest, CiPurpose, CiVerdict, ForgePort, IssueComment } fro
 import { graphReadToken, laneCredentialRefusal, lanePort } from "../src/forge-lanes.ts";
 import * as github from "../src/github.ts";
 import { openJournal, type Journal } from "../src/journal.ts";
+import { implementLane } from "../src/lanes.ts";
 import { runMergeDesk } from "../src/merge-desk.ts";
 import { GITLAB_REVIEW_GATE_NODE } from "../src/outcomes.ts";
 import type { ReviewVerdict } from "../src/review.ts";
@@ -369,6 +370,30 @@ describe("node #131 — the lanes route a gitlab: map to the GitLab port and gat
    expect(r.journal.getWorker("20", REPO)).toMatchObject({ status: "claimed", lane: "research" });
   } finally { discord.stop(); }
  }, 30_000);
+
+ test("a read gate the forge cannot answer keeps a queued resume; a refusal counts a failed start", async () => {
+  const r = await rig();
+  dirs.push(r.dir);
+  r.journal.upsertWorker({ nodeId: "20", repo: REPO, root: 1, status: "parked", lane: "implement", phase: "review",
+   finishedAt: "2026-10-06T00:00:00Z", workerPgid: 1234 });
+  const entry = r.journal.enqueueResume({ nodeId: "20", repo: REPO, root: 1, lane: implementLane(r.map) });
+  const forbidden = async (): Promise<never> => { throw new Error("unexpected spawn"); };
+  // The real read gate over a glab whose introspection answers with `status`.
+  const gateAnswering = (status: number) => (config: RangerConfig, repo: string) =>
+   assertReadOnlyToken(config, repo, process.env, async (): Promise<RunResult> =>
+    ({ code: 1, stdout: `HTTP/2.0 ${status} Response\r\nContent-Type: application/json\r\n\r\n{}`, stderr: "" }));
+  for (let tick = 0; tick < 4; tick++) {
+   const result = await walk({ config: r.config, configPath: "/unused", journal: r.journal, github: r.forge,
+    readGate: gateAnswering(503), spawnRunNode: forbidden });
+   expect(result.maps[0]).toMatchObject({ gated: true, claimed: [] });
+   expect(result.maps[0]!.gateReason).toContain("HTTP 503");
+  }
+  expect(r.journal.listResumeQueue()).toEqual([entry]);
+
+  await walk({ config: r.config, configPath: "/unused", journal: r.journal, github: r.forge,
+   readGate: gateAnswering(403), spawnRunNode: forbidden });
+  expect(r.journal.getResume(REPO, "20")?.failedStarts).toBe(1);
+ });
 
  test("with no GitLab credentials the tick refuses the map at start and claims nothing", async () => {
   const r = await rig();

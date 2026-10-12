@@ -1,7 +1,7 @@
 import { implementLane, type ImplementLane } from "./lanes.ts";
 import { processResumeQueue } from "./resume.ts";
 import { graphReadToken, laneCredentialRefusal, lanePort, type ReadGate } from "./forge-lanes.ts";
-import { tokenBatch, type ResolvedToken } from "./token-gate.ts";
+import { GateError, tokenBatch, type ResolvedToken } from "./token-gate.ts";
 import { lastImplementMaps, recordImplementStart, mapKey, implementMapOrder, readDrains } from "./maps.ts";
 import { join } from "node:path";
 import { spawnRunNodeDetached, type SpawnRunNodeArgs } from "./spawn.ts";
@@ -370,7 +370,8 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
   } catch (error) {
    mapResult.gated = true;
    mapResult.gateReason = error instanceof Error ? error.message : String(error);
-   if (error instanceof WriteGateError && error.transient) transientGates.add(map);
+   // A forge that did not answer either gate (a timeout, a 5xx) is transient.
+   if ((error instanceof WriteGateError || error instanceof GateError) && error.transient) transientGates.add(map);
    maps.push(mapResult);
    continue;
   }

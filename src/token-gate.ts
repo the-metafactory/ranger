@@ -42,6 +42,15 @@ export type TokenIntrospection = {
 
 export class GateError extends Error {
   override readonly name = "GateError";
+  /**
+   * True when the gate could not be evaluated (no response, a timeout, a 429 or
+   * a 5xx from the forge), as opposed to a definitive refusal (no mapping, an
+   * unset env, write scopes, no project access). A queued resume defers on a
+   * transient gate without counting a failed start, as with `WriteGateError`.
+   */
+  constructor(message: string, readonly transient = false) {
+    super(message);
+  }
 }
 
 /** Scopes a classic PAT may carry while still being read-only. Everything else is write-capable. */
@@ -240,7 +249,8 @@ async function isolatedGitLabGet(
 function expectGlabOk(result: RunResult, message: string): unknown {
   const { status, body } = parseGlabResponse(result);
   if (result.code !== 0 || status !== 200) {
-    throw new GateError(`${message} (HTTP ${status || "unknown"}, exit ${result.code})`);
+    const unreachable = status === 0 || status === 429 || status >= 500;
+    throw new GateError(`${message} (HTTP ${status || "unknown"}, exit ${result.code})`, unreachable);
   }
   return body;
 }
@@ -267,7 +277,7 @@ async function assertGitLabReadOnlyToken(
   } catch (error) {
     if (error instanceof GateError) throw error;
     // Do not echo subprocess output: errors may include credential material.
-    throw new GateError(`${token.source}: GitLab read gate failed before map reads`);
+    throw new GateError(`${token.source}: GitLab read gate failed before map reads`, true);
   }
 }
 
