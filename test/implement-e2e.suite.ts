@@ -770,9 +770,9 @@ describe("implement lane (node #23)", () => {
   return (await git(["rev-parse", "HEAD"], clone)).stdout.trim();
  };
  /** Round 1 finds a blocker and its fix pass commits nothing: the node fails with an open PR, as a crash leaves it. */
- const failAfterRoundOne = async () => {
+ const failAfterRoundOne = async (blockers = [1, 0]) => {
   const mode: string[] = [];
-  const r = await rig({ blockers: [1, 0], onReview: (round) => { if (round === 1) mode[1] = "noop"; } });
+  const r = await rig({ blockers, onReview: (round) => { if (round === 1) mode[1] = "noop"; } });
   cleanup.push(r.dir);
   mode.push(...(r.ctx.workerCommand as string[]));
   r.ctx.workerCommand = mode;
@@ -797,6 +797,23 @@ describe("implement lane (node #23)", () => {
   // Round 2 read the pushed head, the tree the run then held.
   expect(r.calls).toHaveLength(2);
   expect((await r.github.getPr("acme/widgets", 1)).headSha).toBe(pushed);
+ }, 60_000);
+
+ test("the fix pass that answers a review of the pushed head runs on a tree at that head (node #228)", async () => {
+  const { r, worktree } = await failAfterRoundOne([1, 1, 0]);
+  r.ctx.config.workers.reviewRounds = 3;
+  const pushed = await pushFromOutside(r, "principal.txt");
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  // Sage round 2 reviewed the pushed head, and fix pass 2 committed on top of it, with its files in the tree.
+  expect(events.some((d) => d.startsWith(`round 2 @ ${pushed.slice(0, 8)}:`))).toBe(true);
+  const fix = events.find((d) => d.startsWith("fix pass 2 @"))?.match(/^fix pass 2 @ ([0-9a-f]{8})/)?.[1];
+  expect(fix).toBeDefined();
+  const fixSha = (await git(["rev-parse", fix as string], worktree)).stdout.trim();
+  expect((await git(["rev-parse", `${fixSha}~1`], worktree)).stdout.trim()).toBe(pushed);
+  expect((await git(["cat-file", "-e", `${fixSha}:principal.txt`], worktree)).code).toBe(0);
+  expect(r.calls).toHaveLength(3);
+  expect(await r.github.sha(BRANCH)).not.toBe(pushed);
  }, 60_000);
 
  test("a resume whose worktree has uncommitted changes parks naming both SHAs and the paths, and changes nothing (ranger issue #228)", async () => {
