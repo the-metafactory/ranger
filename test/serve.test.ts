@@ -381,6 +381,16 @@ describe("#37 — the session the dashboard may launch", () => {
   expect(plan.shellCommand).toContain("cd '/Users/someone/acme'");
  });
 
+ test("a grilling prompt points filed build nodes at orienteer's build brief; an orienteer prompt does not repeat it", () => {
+  const grill = launchPlan({ repo: REPO, root: 1, nodeId: "12", cwd: "/tmp" });
+  expect(grill.prompt).toContain("grilling skill");
+  expect(grill.prompt).toContain("`references/build-brief.md`");
+  expect(grill.prompt).toContain("`## Deliverable`, `## Acceptance criteria`");
+  const proto = launchPlan({ repo: REPO, root: 1, nodeId: "12", cwd: "/tmp", kind: "prototype" });
+  expect(proto.prompt).toContain("orienteer skill");
+  expect(proto.prompt).not.toContain("build-brief.md");
+ });
+
  test("a checkout path with a quote is quoted, not executed", () => {
   const plan = launchPlan({ repo: REPO, root: 1, nodeId: "12", cwd: "/tmp/it's here" });
   expect(plan.shellCommand).toContain(`cd '/tmp/it'\\''s here'`);
