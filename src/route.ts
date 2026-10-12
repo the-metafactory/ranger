@@ -157,6 +157,21 @@ export interface BlockedProbe {
   host?: string;
 }
 
+/**
+ * The registry key for a map's repo. soma's registry v2 keys every repo as
+ * `host/path` (`github.com/owner/name`, `gitlab.example.org/group/project`)
+ * and rejects host-less keys, so a bare `owner/name` lookup never matches.
+ * An unparseable repo has no key: every probe then reads as blocked.
+ */
+export function probeRegistryKey(repo: string): string | null {
+  try {
+    const ref = parseForgeRef(repo);
+    return `${ref.host}/${ref.path}`;
+  } catch {
+    return null;
+  }
+}
+
 /** The declared probes that are not satisfiable by the registry on this host. */
 export function blockedProbeSpecs(
   node: FrontierEntry["node"],
@@ -165,7 +180,8 @@ export function blockedProbeSpecs(
 ): BlockedProbe[] {
   const probes = node.probes ?? [];
   if (probes.length === 0) return [];
-  const repoEntry = registry.repos?.[repo];
+  const key = probeRegistryKey(repo);
+  const repoEntry = key === null ? undefined : registry.repos?.[key];
   const declaredCommands = new Set(
     (repoEntry?.commands ?? []).map((c) => `${c.run}\u0000${c.cwd}`),
   );
@@ -200,7 +216,8 @@ export function blockedProbeSpecs(
 
 /**
  * Classify a frontier node per the §3 routing table. `registryBlocked` is
- * computed for auto nodes with command/url probes (class 5 preflight).
+ * computed for auto nodes, and for propose task/build nodes the walk would
+ * take, with command/url probes (class 5 preflight).
  */
 export function classify(
   node: FrontierEntry,
@@ -266,15 +283,26 @@ function classifyRoute(
   // the ratification. Never for nodes ranger itself filed (node #9: ranger
   // never walks work it minted), never when the bot identity is unknown,
   // and never off the allowlist — an unwalked node keeps its HITL card.
+  // A node that qualifies except for unregistered probes gets the
+  // provisioning card (class 5), which names the exact run + cwd to
+  // register, rather than a HITL card that hides why it was not taken.
   if (
     autonomy === "propose" &&
     IMPLEMENT_KINDS.has(kind) &&
     walkMode === "full" &&
     allowed &&
     opts.botIdentity !== undefined &&
-    node.author !== opts.botIdentity &&
-    blockedProbeSpecs(node.node, repo, registry).length === 0
+    node.author !== opts.botIdentity
   ) {
+    const blockedProbes = blockedProbeSpecs(node.node, repo, registry);
+    if (blockedProbes.length > 0) {
+      return {
+        ...base,
+        registryBlocked: true,
+        blockedProbes,
+        route: { route: "provisioning" },
+      };
+    }
     return {
       ...base,
       route: { route: "implement", walkable: true, ratify: "merge" },

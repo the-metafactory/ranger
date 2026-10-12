@@ -62,7 +62,7 @@ function hitlHead(node: ClassifiedNode, reason: EscalateReason): CardHead {
   return CARD_HEADS.propose!;
 }
 
-const REGISTRY_BLOCKED = "auto node with registry-blocked probes — provisioning needed";
+const REGISTRY_BLOCKED = "node with registry-blocked probes — provisioning needed";
 
 /** Per-route card data in one place: the head, the reason line, and the journal row's reason. */
 function cardSpec(node: ClassifiedNode): { head: CardHead; reason: string; journalReason: string } {
