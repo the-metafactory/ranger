@@ -7,7 +7,9 @@
 # $FAKE_SOMA_REPO_DIR (a bare origin, so a pushed branch shows up directly).
 set -euo pipefail
 
-if [ -z "${GH_TOKEN:-}" ]; then
+# A GitHub repo reads and writes under GH_TOKEN; a GitLab repo under the
+# per-call glab config ranger writes (GLAB_CONFIG_DIR). Either way, no keyring.
+if [ -z "${GH_TOKEN:-}" ] && [ -z "${GLAB_CONFIG_DIR:-}" ]; then
   echo "fake soma: GH_TOKEN not set — refusing (no keyring fallback)" >&2
   exit 90
 fi
@@ -49,7 +51,21 @@ done
 # stricter than soma: it refuses a bare repo wherever it runs, so a call site
 # that forgets to qualify fails here instead of only in production.
 case "$repo" in
-  github:github.com/*) repo="${repo#github:github.com/}" ;;
+  github:github.com/*)
+    if [ -z "${GH_TOKEN:-}" ]; then
+      echo "fake soma: GH_TOKEN not set — refusing (no keyring fallback)" >&2
+      exit 90
+    fi
+    repo="${repo#github:github.com/}"
+    ;;
+  # A GitLab repo keeps its host: its fixtures are <host>__<group>__<project>-*.json.
+  gitlab:*)
+    if [ -z "${GLAB_CONFIG_DIR:-}" ]; then
+      echo "fake soma: GLAB_CONFIG_DIR not set — refusing (no keyring fallback)" >&2
+      exit 90
+    fi
+    repo="${repo#gitlab:}"
+    ;;
   "") ;;
   *)
     echo "fake soma: \"$repo\" names no forge or host — pass --repo github:github.com/<owner/name>" >&2

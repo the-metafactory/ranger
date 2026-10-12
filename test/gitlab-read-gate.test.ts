@@ -132,6 +132,21 @@ describe("GitLab read gate", () => {
     for (const dir of dirs) expect(existsSync(dir)).toBeFalse();
   });
 
+  test.each([
+    { at: 1, status: 503, code: 1, transient: true }, { at: 2, status: 500, code: 1, transient: true },
+    { at: 1, status: 429, code: 1, transient: true }, { at: 2, status: 0, code: -1, transient: true },
+    { at: 1, status: 401, code: 1, transient: false }, { at: 2, status: 403, code: 1, transient: false },
+    { at: 2, status: 404, code: 1, transient: false },
+  ])("a gate the forge could not answer is transient, a refusal is not %j", async ({ at, status, code, transient }) => {
+    let calls = 0;
+    const error = await assertReadOnlyToken(config, repo, env, async () => {
+      if (++calls < at) return response({ scopes: ["read_api"] });
+      return status === 0 ? { code, stdout: "", stderr: "timed out" } : response({}, status, code);
+    }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(GateError);
+    expect((error as GateError).transient).toBe(transient);
+  });
+
   test("spawn errors clean config and do not echo token material", async () => {
     let dir = "";
     await expect(assertReadOnlyToken(config, repo, env, async (_bin, _args, opts) => {

@@ -1,4 +1,5 @@
-import { executionRefusal, fileStemFor, parseForgeRef, qualifiedRepo } from "./forge-ref.ts";
+import { fileStemFor, parseForgeRef, qualifiedRepo } from "./forge-ref.ts";
+import { graphReadToken, laneCredentialRefusal, lanePort, type ReadGate } from "./forge-lanes.ts";
 import { changeRequestLabel, ciRunNoun } from "./forge-text.ts";
 import { mapKey } from "./maps.ts";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
@@ -52,7 +53,7 @@ import {
  type SubstrateReaders,
 } from "./substrate.ts";
 import { selectForBuild } from "./substrate-policy.ts";
-import { resolveReadOnlyToken } from "./token-gate.ts";
+import { resolveReadOnlyToken, type ResolvedToken } from "./token-gate.ts";
 import { workerEnv } from "./worker-env.ts";
 import type { CommitAuthor } from "./identity.ts";
 import { sessionJournalPath } from "./journal-guard.ts";
@@ -60,7 +61,6 @@ import { saveWorkerLog } from "./worker-log.ts";
 import { isTransientGitHubError } from "./transient.ts";
 import { BudgetDeferral } from "./budget.ts";
 import { findNodePr, finishClosedElsewhere } from "./closed-elsewhere.ts";
-import * as githubApi from "./github.ts";
 import type { ForgePort } from "./forge.ts";
 import { ParkSignal } from "./signals.ts";
 import { policyBlockedOutcome } from "./outcomes.ts";
@@ -120,6 +120,8 @@ export interface RunNodeContext {
  reviewer?: Reviewer;
  /** For tests: the read-only token (defaults to the map's `auth.readOnlyTokens` env). */
  readOnlyToken?: string;
+ /** For tests: the read gate a GitLab map's graph reads run under (default: `assertReadOnlyToken`). */
+ readGate?: ReadGate;
  /** For tests: the first session's substrate (later sessions after a cap are selected). */
  substrate?: SubstrateName;
  /** For tests: the quota readers (with an injected worker, reviewer or command and none injected, reads fail closed). */
@@ -446,7 +448,7 @@ export async function runNode(
  const { config, token, journal } = ctx;
  const map = ctx.map;
  const repo = map.repo;
- const refusal = executionRefusal(repo);
+ const refusal = laneCredentialRefusal(config, repo);
  if (refusal !== null) return { nodeId, repo, status: "refused", detail: refusal, workerExit: null };
  const row = journal.getWorker(nodeId, repo);
  journal.assertWorkerRoot(nodeId, repo, map.root);
@@ -473,10 +475,12 @@ export async function runNode(
  });
 
  try {
+  // A GitLab map's graph reads run under its read gate (node #122).
+  const graphToken = await graphReadToken(config, repo, token, ctx.readGate);
   const node = await graphNode(
    repo,
    nodeId,
-   { token, source: "write-token" },
+   graphToken,
    {
     // Every graph CLI call is timeout-bound — a hung soma must not leave a
     // detached worker alive holding its claim forever (round-36: the worker's
@@ -485,14 +489,14 @@ export async function runNode(
    },
   );
   if (node.status === "closed") {
-   const github = ctx.github ?? githubApi;
+   const github = ctx.github ?? lanePort(config, repo);
    const pr = await findNodePr(github, repo, node, row?.prNumber, token);
    return { ...base, ...await finishClosedElsewhere({ ...ctx, node, pr, generation }) };
   }
   const rootNode = await graphNode(
    repo,
    String(map.root),
-   { token, source: "write-token" },
+   graphToken,
    {
     timeoutMs: GRAPH_CALL_TIMEOUT_MS,
    },
@@ -502,7 +506,7 @@ export async function runNode(
    return await runResearch(nodeId, ctx, node, rootNode, generation);
   }
   if (IMPLEMENT_KINDS.has(node.node.kind)) {
-   return await runImplementNode(nodeId, ctx, node, rootNode, generation);
+   return await runImplementNode(nodeId, ctx, node, rootNode, generation, graphToken);
   }
   const detail = `node #${nodeId} is kind '${node.node.kind}' — ranger walks research and task/build nodes only (design §3).`;
   journal.recordEvent("refused", { nodeId, repo, detail });
@@ -603,6 +607,7 @@ async function runImplementNode(
  node: NodeResult,
  rootNode: NodeResult,
  generation: number,
+ graphToken: ResolvedToken,
 ): Promise<RunNodeOutcome> {
  const { config, map, token, botIdentity, journal } = ctx;
  const repo = map.repo;
@@ -641,6 +646,7 @@ async function runImplementNode(
   map,
   token,
   readOnlyToken,
+  graphToken,
   botIdentity,
   commitAuthor: ctx.commitAuthor,
   journal,
@@ -871,7 +877,7 @@ async function runResearch(
   journal.updateWorker(nodeId, repo, { researchBaseSha: baseSha });
  }
 
- const github = ctx.github ?? githubApi;
+ const github = ctx.github ?? lanePort(config, repo);
  const recorded = journal.getWorker(nodeId, repo)?.prNumber ?? null;
  const existingPr = recorded === null
   ? await github.findPrByHead(repo, branch, token)

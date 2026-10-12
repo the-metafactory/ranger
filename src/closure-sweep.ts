@@ -4,7 +4,7 @@ import { mapKey } from "./maps.ts";
 import { closedCardBudget, reconcileGraphClosedCards } from "./card-sync.ts";
 import { mapPool } from "./pool.ts";
 import { findNodePr, finishClosedElsewhere } from "./closed-elsewhere.ts";
-import * as githubApi from "./github.ts";
+import { lanePort } from "./forge-lanes.ts";
 
 /** Fixed work per tick; the keyset cursor prevents an open prefix starving the tail. */
 export const MAX_WORKER_CLOSURE_READS = 5;
@@ -28,11 +28,11 @@ export async function reconcileGraphClosures(
   }
  });
  const cardBudget = closedCardBudget();
+ const forge = ctx.github ?? lanePort(ctx.config, map.repo);
  // Git worktree removals affect shared canonical state: keep these sequential.
  for (const { worker, node } of observations) {
   if (node?.status !== "closed") continue;
   try {
-   const forge = ctx.github ?? githubApi;
    const pr = await findNodePr(forge, map.repo, node, worker.prNumber, ctx.token);
    const outcome = await finishClosedElsewhere({ ...ctx, node, pr, generation: worker.generation, worktree: worker.worktree, cardBudget });
    if (outcome.status === "released") result.released.push(worker.nodeId);

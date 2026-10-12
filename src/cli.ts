@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { readPrivateJson } from "./remote-test/ssh-cli.ts";
-import { executionRefusal, isGithubRepo } from "./forge-ref.ts";
+import { isGithubRepo } from "./forge-ref.ts";
+import { graphReadToken, laneCredentialRefusal, lanePort } from "./forge-lanes.ts";
 import { changeRequestNoun } from "./forge-text.ts";
 import { mapKey, pickMap } from "./maps.ts";
 import { implementLane } from "./lanes.ts";
@@ -44,7 +45,6 @@ import { trustCurrentGitState } from "./git-trust.ts";
 import { workerLogFile } from "./worker-log.ts";
 import { sweepMap } from "./sweep.ts";
 import { mergeGateNow } from "./merge-desk.ts";
-import { realGitHub } from "./implement.ts";
 import { walk } from "./walk.ts";
 import { spawnRunNodeDetached } from "./spawn.ts";
 import { holdAwake } from "./awake.ts";
@@ -207,16 +207,17 @@ function loadCtx(configPath: string): {
  return { config, journal };
 }
 
-/** Resolve the write credential + bot identity for a map, gating the principal. */
+/** Resolve the write credential + bot identity for a map, gating the principal, and the credential its graph reads run under. */
 async function writeContext(config: RangerConfig, map: RangerMapConfig) {
- const refusal = executionRefusal(map.repo);
+ const refusal = laneCredentialRefusal(config, map.repo);
  if (refusal !== null) throw new WriteGateError(refusal);
- return assertWriteIdentity(config, map.repo);
+ const identity = await assertWriteIdentity(config, map.repo);
+ return { ...identity, graphToken: await graphReadToken(config, map.repo, identity.token) };
 }
 
 /** `writeContext` for a run-node, plus a GitLab map's commit identity (node #127). */
 async function runNodeContext(config: RangerConfig, map: RangerMapConfig) {
- const refusal = executionRefusal(map.repo);
+ const refusal = laneCredentialRefusal(config, map.repo);
  if (refusal !== null) throw new WriteGateError(refusal);
  return assertCommitIdentity(config, map.repo);
 }
@@ -261,8 +262,8 @@ async function runSweep(configPath: string): Promise<string> {
    continue;
   }
   try {
-   const { token, botIdentity } = await writeContext(config, map);
-   const result = await sweepMap({ config, journal, map, token, botIdentity });
+   const { token, botIdentity, graphToken } = await writeContext(config, map);
+   const result = await sweepMap({ config, journal, map, token, botIdentity, graphToken });
    results.push({ repo: map.repo, walk: map.walk, swept: true, result });
   } catch (error) {
    results.push({
@@ -289,7 +290,8 @@ const SETTLE_POLL_MS = 10_000;
  * answer (bounded), so the pass that follows sends a conflict back for its
  * base merge now.
  */
-async function settleMergeability(journal: Journal, map: RangerMapConfig, token: string): Promise<void> {
+async function settleMergeability(config: RangerConfig, journal: Journal, map: RangerMapConfig, token: string): Promise<void> {
+ const port = lanePort(config, map.repo);
  const prs = journal
   .listWorkers(map.repo, map.root)
   .filter((w) => w.status === "awaiting-merge" && w.prNumber !== null)
@@ -301,7 +303,7 @@ async function settleMergeability(journal: Journal, map: RangerMapConfig, token:
   const still: number[] = [];
   for (const n of waiting) {
    try {
-    const pr = await realGitHub.getPr(map.repo, n, token);
+    const pr = await port.getPr(map.repo, n, token);
     if (pr.state === "open" && pr.mergeState === "pending") still.push(n);
    } catch {
     still.push(n);
@@ -326,7 +328,7 @@ async function runMergeGate(nodeId: string, selector: string, sha: string, confi
    return { ok: false, text: `node ${nodeId} has no ${changeRequestNoun(map.repo)} recorded on ${mapKey(map)}` };
   }
   const { token, botIdentity } = await writeContext(config, map);
-  const gate = await mergeGateNow(realGitHub, map, row.prNumber, token, botIdentity);
+  const gate = await mergeGateNow(lanePort(config, map.repo), map, row.prNumber, token, botIdentity);
   if (gate.status !== "pass") return { ok: false, text: `merge gate ${gate.status} (${gate.check}): ${gate.reason}` };
   if (gate.headSha !== sha) {
    return { ok: false, text: `the gate passes at ${gate.headSha.slice(0, 8)}, not at the confirmed head ${sha.slice(0, 8)}` };
@@ -347,14 +349,15 @@ async function runMergeDeskNow(selector: string, configPath: string, settle = fa
  const { config, journal } = loadCtx(configPath);
  try {
   const map = pickMap(config, selector);
-  const { token, botIdentity } = await writeContext(config, map);
-  if (settle) await settleMergeability(journal, map, token);
+  const { token, botIdentity, graphToken } = await writeContext(config, map);
+  if (settle) await settleMergeability(config, journal, map, token);
   const result = await sweepMap({
    config,
    journal,
    map,
    token,
    botIdentity,
+   graphToken,
    phase: "desk",
    respawn: (nodeId, repo, root) =>
     spawnRunNodeDetached({ nodeId, repo, root, cliEntry: join(import.meta.dir, "cli.ts"), configPath }),
@@ -400,8 +403,8 @@ async function runBuildNow(
  try {
   const map = pickMap(config, selector);
   if (map.walk === "none") throw new Error(`${mapKey(map)} is walk: none — registered, not walked`);
-  const { token, botIdentity } = await writeContext(config, map);
-  const result = await buildNow(nodeId, { config, configPath, journal, map, token, botIdentity, force });
+  const { token, botIdentity, graphToken } = await writeContext(config, map);
+  const result = await buildNow(nodeId, { config, configPath, journal, map, token, botIdentity, graphToken, force });
   return { result, out: JSON.stringify(result, null, 2) };
  } finally {
   journal.close();

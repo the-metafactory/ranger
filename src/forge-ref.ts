@@ -53,10 +53,10 @@ export function qualifiedRepo(ref: ForgeRef): string {
  return `${ref.forge}:${ref.host}/${ref.path}`;
 }
 
-/** Registration is independent of operational support, added by later forge slices. */
+/** What each forge supports beyond the lanes, which run on both (node #131). */
 const CAPABILITIES = {
- github: Object.freeze({ execution: true, githubApi: true }),
- gitlab: Object.freeze({ execution: false, githubApi: false }),
+ github: Object.freeze({ githubApi: true }),
+ gitlab: Object.freeze({ githubApi: false }),
 } as const;
 export function forgeCapabilities(ref: ForgeRef) {
  return CAPABILITIES[ref.forge];
@@ -65,12 +65,6 @@ export function forgeCapabilities(ref: ForgeRef) {
 /** Safe for untrusted string boundaries; invalid refs have no GitHub capability. */
 export function isGithubRepo(repo: string): boolean {
  return REPO_PATTERN.test(repo) && forgeCapabilities(parseForgeRef(repo)).githubApi;
-}
-
-export function executionRefusal(repo: string): string | null {
- const ref = parseForgeRef(repo);
- return forgeCapabilities(ref).execution ? null :
-  `GitLab execution is not implemented: ${repo} — registered refs cannot be walked until the forge gates and lanes are available`;
 }
 
 /** Bare prefixes are legacy GitHub keys; qualified prefixes include the host. */

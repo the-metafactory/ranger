@@ -113,6 +113,20 @@ export const REVIEW_CAP_HEAD_MOVED_OUTCOME = /^review cap reached: \d+ sage roun
 
 export const REVIEW_CAP_OUTCOME = /^(?:\d+ blocker\(s\) and \d+ major\(s\) remain after \d+ sage round\(s\)|review cap reached: )/;
 
+/** The node that settles the review gate a GitLab change request must pass (ranger issue #97, "Review"). */
+export const GITLAB_REVIEW_GATE_NODE = "Settle the review gate a ranger-built GitLab MR must pass before ranger merges it (ranger#96)";
+
+/**
+ * A GitLab change request held before its first review: ranger has no review
+ * gate there until that node's build lands, and never readies or merges an
+ * unreviewed one.
+ */
+export function gitlabReviewHoldOutcome(r: { repo: string; pr: number }): string {
+ return `awaiting review: ${changeRequestLabel(r.repo, r.pr)} has no review gate on GitLab yet, so ranger holds it here and never merges it unreviewed — waiting on *${GITLAB_REVIEW_GATE_NODE}*`;
+}
+
+export const GITLAB_REVIEW_HOLD_OUTCOME = /^awaiting review: MR !\d+ has no review gate on GitLab yet/;
+
 export type ProbeFailureClass = "infrastructure" | "assertion" | "unknown";
 
 /** Classify all attempts: a timeout must not erase an earlier assertion. */

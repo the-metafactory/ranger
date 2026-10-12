@@ -1,6 +1,7 @@
 import { implementLane, type ImplementLane } from "./lanes.ts";
 import { processResumeQueue } from "./resume.ts";
-import { executionRefusal } from "./forge-ref.ts";
+import { graphReadToken, laneCredentialRefusal, lanePort, type ReadGate } from "./forge-lanes.ts";
+import { GateError, tokenBatch, type ResolvedToken } from "./token-gate.ts";
 import { lastImplementMaps, recordImplementStart, mapKey, implementMapOrder, readDrains } from "./maps.ts";
 import { join } from "node:path";
 import { spawnRunNodeDetached, type SpawnRunNodeArgs } from "./spawn.ts";
@@ -19,7 +20,6 @@ import { ClaimLockBusy, withClaimLock } from "./claim-lock.ts";
 import type { OwnedCheck } from "./lock.ts";
 import { classifyFrontier, loadProbeRegistry } from "./route.ts";
 import type { ForgePort } from "./forge.ts";
-import * as realGitHub from "./github.ts";
 import { probeRequeueCandidates, requeueProbes, type ProbeRequeueResult } from "./probe-requeue.ts";
 import { sweepMap, type SweepMapResult } from "./sweep.ts";
 import {
@@ -83,8 +83,10 @@ export interface WalkContext {
  /** Detached run-node spawner — tests inject a recorder. Returns the child PID or null. */
  spawnRunNode?: (args: SpawnRunNodeArgs) => Promise<number | null>;
  now?: () => Date;
- /** The merge desk's GitHub port (tests inject a fake; default: the real API). */
+ /** The forge port for every map (tests inject a fake; default: each map's own, `lanePort`). */
  github?: ForgePort;
+ /** The read gate a GitLab map's graph reads run under (tests inject a fake; default: `assertReadOnlyToken`). */
+ readGate?: ReadGate;
 }
 
 /** Is this resource lane held? (awaiting-merge does not hold it.) */
@@ -152,8 +154,6 @@ export type ClaimNodeOutcome =
  */
 export async function claimNode(args: ClaimNodeArgs): Promise<ClaimNodeOutcome> {
  const { journal, map, node, botIdentity, token } = args;
- const refusal = executionRefusal(map.repo);
- if (refusal !== null) return { claimed: false, messageId: null, error: refusal };
  const now = () => args.now?.() ?? new Date();
  const owned = args.owned ?? (() => {});
  owned();
@@ -262,27 +262,44 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
  // Maps whose credential gate failed on a forge read this tick, not a refusal:
  // a queued resume on such a map defers without counting a failed start.
  const transientGates = new Set<RangerMapConfig>();
- // Desks and queue validation share the PR read for this bounded tick.
- const port: ForgePort = ctx.github ?? realGitHub;
+ // Each map's forge port (ranger issue #97 ruling Q8), one per repo for this
+ // bounded tick. Desks and queue validation share the PR read.
+ const targets = new Map<string, ForgePort>();
+ const targetFor = (repo: string): ForgePort => {
+  let target = targets.get(repo);
+  if (target === undefined) targets.set(repo, target = ctx.github ?? lanePort(config, repo));
+  return target;
+ };
+ const ports = new Map<string, ForgePort>();
  const prReads = new Map<string, ReturnType<ForgePort["getPr"]>>();
  const getPr: ForgePort["getPr"] = (repo, number, token) => {
   const key = `${repo}#${number}`;
-  if (!prReads.has(key)) prReads.set(key, port.getPr(repo, number, token));
+  if (!prReads.has(key)) prReads.set(key, targetFor(repo).getPr(repo, number, token));
   return prReads.get(key)!;
  };
- const github = new Proxy(port, {
-  get(target, key) {
-   if (key === "getPr") return getPr;
-   const value = Reflect.get(target, key);
-   return typeof value === "function" ? value.bind(target) : value;
-  },
- });
+ const portFor = (repo: string): ForgePort => {
+  let port = ports.get(repo);
+  if (port === undefined) {
+   port = new Proxy(targetFor(repo), {
+    get(target, key) {
+     if (key === "getPr") return getPr;
+     const value = Reflect.get(target, key);
+     return typeof value === "function" ? value.bind(target) : value;
+    },
+   });
+   ports.set(repo, port);
+  }
+  return port;
+ };
+ // A GitLab map's graph reads run under its read gate, checked once per map this tick.
+ const reads = tokenBatch(config, ctx.readGate);
+ const readGate: ReadGate = async (_config, repo) => ({ token: await reads(repo) });
  const priorityLanes = new Set<ImplementLane>();
 
  const order = implementMapOrder(config.maps, lastImplementMaps(journal), implementLane);
  // One sweep wiring for both phases; only the phase differs.
  const sweepPhase = (
-  w: { map: RangerMapConfig; token: string; botIdentity: string },
+  w: { map: RangerMapConfig; token: string; botIdentity: string; graphToken: ResolvedToken },
   phase: "liveness" | "desk",
  ): Promise<SweepMapResult> =>
   sweepMap({
@@ -291,7 +308,8 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
    map: w.map,
    token: w.token,
    botIdentity: w.botIdentity,
-   github,
+   graphToken: w.graphToken,
+   github: portFor(w.map.repo),
    phase,
    reservedLanes: priorityLanes,
    respawn: (nodeId, repo, root) =>
@@ -299,7 +317,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
   });
  const maps: WalkMapResult[] = [];
  const mapResults = new Map<RangerMapConfig, WalkMapResult>();
- const walked: { map: (typeof order)[number]; mapResult: WalkMapResult; token: string; botIdentity: string; errors: string[] }[] = [];
+ const walked: { map: (typeof order)[number]; mapResult: WalkMapResult; token: string; botIdentity: string; graphToken: ResolvedToken; errors: string[] }[] = [];
 
  // Pass 1 — authorize every walked map, sweep liveness, resume priority
  // probe parks, then (1b) every map's merge desk, before any claim.
@@ -332,7 +350,8 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
    continue;
   }
 
-  const refusal = executionRefusal(map.repo);
+  // A GitLab map without its credentials refuses before any forge or graph call.
+  const refusal = laneCredentialRefusal(config, map.repo);
   if (refusal !== null) {
    mapResult.gated = true;
    mapResult.gateReason = refusal;
@@ -340,16 +359,19 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
    continue;
   }
 
-  // Credential gate (node #11 + design §2).
+  // Credential gate (node #11 + design §2), and the read gate a GitLab map's
+  // graph reads run under (node #122).
   let token: string;
   let botIdentity: string;
+  let graphToken: ResolvedToken;
   try {
    ({ token, botIdentity } = await assertWriteIdentity(config, map.repo));
+   graphToken = await graphReadToken(config, map.repo, token, readGate);
   } catch (error) {
    mapResult.gated = true;
-   mapResult.gateReason =
-    error instanceof WriteGateError ? error.message : String(error);
-   if (error instanceof WriteGateError && error.transient) transientGates.add(map);
+   mapResult.gateReason = error instanceof Error ? error.message : String(error);
+   // A forge that did not answer either gate (a timeout, a 5xx) is transient.
+   if ((error instanceof WriteGateError || error instanceof GateError) && error.transient) transientGates.add(map);
    maps.push(mapResult);
    continue;
   }
@@ -363,7 +385,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
 
   const errors: string[] = [];
   maps.push(mapResult);
-  walked.push({ map, mapResult, token, botIdentity, errors });
+  walked.push({ map, mapResult, token, botIdentity, graphToken, errors });
  }
 
  // Retry parks outrank every other queued implement session, including
@@ -374,10 +396,10 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
   const map = retryMaps.find((m) => m.repo === row.repo && m.root === row.root) as RangerMapConfig;
   priorityLanes.add(implementLane(map));
  }
- for (const { map, mapResult, token, botIdentity, errors } of walked) {
+ for (const { map, mapResult, token, botIdentity, graphToken, errors } of walked) {
   // Sweep always runs for a walked map (even paused — liveness/audit surface).
   try {
-   mapResult.sweep = await sweepPhase({ map, token, botIdentity }, "liveness");
+   mapResult.sweep = await sweepPhase({ map, token, botIdentity, graphToken }, "liveness");
   } catch (error) {
    errors.push(
     `sweep failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -403,12 +425,12 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
  for (const lane of priorityLanes) implementClaimed.add(lane);
 
  // Pass 1b — the merge desks, against lanes every liveness sweep has settled.
- for (const { map, mapResult, token, botIdentity, errors } of walked) {
+ for (const { map, mapResult, token, botIdentity, graphToken, errors } of walked) {
   // No child spawned (or it finished immediately): the retry still won this
   // lane for this tick; queued send-backs wait until the next tick.
   if (priorityLanes.has(implementLane(map)) && journal.laneHolder(implementLane(map)) === null) continue;
   try {
-   const desk = await sweepPhase({ map, token, botIdentity }, "desk");
+   const desk = await sweepPhase({ map, token, botIdentity, graphToken }, "desk");
    // A failed liveness sweep left no result: the desk's own stands in, so
    // what the desk did (and its row errors) still reaches the report.
    if (mapResult.sweep === undefined) mapResult.sweep = desk;
@@ -421,11 +443,11 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
  // Pass 1c — queued resumes, FIFO within each implement lane, ahead of claims.
  if (journal.listResumeQueue().length > 0) {
   try {
-   await withClaimLock(journal, owned => processResumeQueue({ ...ctx, github },
+   await withClaimLock(journal, owned => processResumeQueue({ ...ctx, github: { getPr } },
     order.map(map => {
      const w = walked.find(w => w.map === map);
      const m = mapResults.get(map)!;
-     return { map, token: w?.token, gateReason: m.gateReason, gateTransient: transientGates.has(map), errors: w?.errors ?? m.errors };
+     return { map, token: w?.token, graphToken: w?.graphToken, gateReason: m.gateReason, gateTransient: transientGates.has(map), errors: w?.errors ?? m.errors };
     }), implementClaimed, owned));
   } catch (error) {
    for (const w of walked) w.errors.push(`resume queue failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -433,13 +455,13 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
  }
 
  // Pass 2 — claims, against lanes the sweeps, desks and queued resumes have settled.
- for (const { map, mapResult, token, botIdentity, errors } of walked) {
+ for (const { map, mapResult, token, botIdentity, graphToken, errors } of walked) {
   if (!mapResult.gated) {
    const readArgs = {
     journal,
     repo: map.repo,
     root: map.root,
-    token: { token, source: "write-token" as const },
+    token: graphToken,
     policy: budgetPolicy(config),
     maxAgeMs: config.budget.frontierMaxAgeMin * 60_000,
     timeoutMs: GRAPH_CALL_TIMEOUT_MS,
