@@ -121,6 +121,15 @@ export interface VetoRow {
  detail: string | null;
 }
 
+/**
+ * Does this veto stop the node on this repo? Its own repo's row does, and a
+ * row from before node #240 (repo '') does on every repo. The one rule every
+ * "is it vetoed" reader applies (`Journal.hasVeto`, `ranger serve`).
+ */
+export function vetoApplies(veto: Pick<VetoRow, "repo" | "nodeId">, nodeId: string, repo: string): boolean {
+ return veto.nodeId === nodeId && (veto.repo === repo || veto.repo === "");
+}
+
 export interface SubstrateReading {
  substrate: SubstrateName;
  readAt: string;
@@ -709,19 +718,21 @@ export class Journal {
   }));
  }
 
- /** This repo's veto on the node, or null (a row from before node #240 is not this repo's). */
+ /**
+  * This repo's veto record on the node, or null: the veto comment ranger
+  * posted and the proposal it refused. A row from before node #240 has
+  * neither, so it is not returned; `hasVeto` still counts it.
+  */
  getVeto(nodeId: string, repo: string): VetoRow | null {
   return this.listVetoes(repo).find((veto) => veto.nodeId === nodeId) ?? null;
  }
 
- /** Is this node vetoed on this repo? A row from before node #240 (repo '') vetoes it on every repo. */
+ /** Is this node vetoed on this repo (`vetoApplies`)? */
  hasVeto(nodeId: string, repo: string): boolean {
-  const row = this.db.query.vetoes
-   .findFirst({
-    where: and(eq(vetoes.nodeId, nodeId), or(eq(vetoes.repo, repo), eq(vetoes.repo, ""))),
-   })
-   .sync();
-  return row !== undefined;
+  return this.db.query.vetoes
+   .findMany({ where: eq(vetoes.nodeId, nodeId) })
+   .sync()
+   .some((row) => vetoApplies(row, nodeId, repo));
  }
 
  // ---- escalations (design §5 escalation desk) ----

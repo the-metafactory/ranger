@@ -5,8 +5,9 @@ import { join } from "node:path";
 import { loadConfig } from "../src/config.ts";
 import { openJournal, type Journal } from "../src/journal.ts";
 import { runCmd } from "../src/exec.ts";
-import { boundProposalComment, boundVeto, principalRatified, principalVetoed, ratifyReadKey } from "../src/ratify.ts";
+import { boundProposalComment, boundVeto, principalRatified, principalVetoed, ratifyReadKey, vetoMarker } from "../src/ratify.ts";
 import { walk, type WalkResult } from "../src/walk.ts";
+import { auditCacheKey } from "../src/frontier-cache.ts";
 import { baseConfigLines, bun, cliPath, createCanonicalRepo, fakeDiscord, GIT_ENV, testCliEnv } from "./support.ts";
 
 /**
@@ -54,7 +55,7 @@ interface Fixture {
  stop(): void;
 }
 
-async function fixture(opts: { pinBot?: boolean; readsPerTick?: number } = {}): Promise<Fixture> {
+async function fixture(opts: { pinBot?: boolean; readsPerTick?: number; spawnCapPerDay?: number } = {}): Promise<Fixture> {
  const dir = mkdtempSync(join(tmpdir(), "ranger-ratify-"));
  const { origin, canonical } = await createCanonicalRepo(dir);
  const data = join(dir, "data");
@@ -73,7 +74,8 @@ async function fixture(opts: { pinBot?: boolean; readsPerTick?: number } = {}): 
   workers: ["  wallClockMin: 1", "  maxAttempts: 2", "  deadmanThreshold: 3"],
  })
   .filter((line) => opts.pinBot !== false || line !== "  identity: ivy-bot")
-  .map((line) => opts.pinBot === false && line === "bot:" ? "bot: {}" : line);
+  .map((line) => opts.pinBot === false && line === "bot:" ? "bot: {}" : line)
+  .map((line) => opts.spawnCapPerDay !== undefined && line === "  spawnCapPerDay: 10" ? `  spawnCapPerDay: ${opts.spawnCapPerDay}` : line);
  if (opts.readsPerTick !== undefined) lines.push("ratify:", `  readsPerTick: ${opts.readsPerTick}`);
  const config = join(dir, "ranger.yaml");
  writeFileSync(config, lines.join("\n"));
@@ -160,6 +162,10 @@ function seedProposal(f: Fixture, nodeId: string, commentId: string | null, prop
   outcome: commentId === null ? "proposal posted, but its comment id is unknown" : `proposal comment ${commentId}`,
  }));
 }
+
+/** The comment-list reads fake gh logged for one node. */
+const commentReads = (f: Fixture, id: string) =>
+ existsSync(f.calls) ? readFileSync(f.calls, "utf8").split("\n").filter((l) => l.includes(`/issues/${id}/comments`)) : [];
 
 const reactionReads = (f: Fixture) =>
  existsSync(f.calls) ? readFileSync(f.calls, "utf8").split("\n").filter((l) => l.includes("/reactions?")) : [];
@@ -403,8 +409,6 @@ describe("ratify pins (node #250, ruling D6)", () => {
  });
 });
 
-const vetoMarker = (id: string, proposal: string) => `<!-- ranger:veto node=${id} proposal=${proposal} -->`;
-
 /** Every comment on a node in the fake GitHub state, flattened. */
 const commentsOn = (f: Fixture, id: string): { id: number; user: { login: string }; body: string }[] =>
  (f.state().comments?.[id] ?? []).flat();
@@ -621,6 +625,59 @@ describe("veto (node #240)", () => {
  }, 120_000);
 });
 
+describe("veto rebuild reads (node #240)", () => {
+ const second = () => ({ ...frontierEntry("11"), url: `https://github.com/${REPO}/issues/11`, node: { ...frontierEntry("11").node, title: "Survey a second API" } });
+
+ test("at most ratify.readsPerTick propose nodes are read a tick; an unread one waits for the next", async () => {
+  const f = await fixture({ readsPerTick: 1 });
+  try {
+   f.writeFrontier([frontierEntry("10"), second()]);
+   const { result } = await f.tick();
+   expect(result.maps[0]!.claimed).toEqual(["10"]);
+   expect(result.maps[0]!.errors.join("\n")).toContain("#11 past ratify.readsPerTick");
+   expect(commentReads(f, "10").length).toBeGreaterThan(0);
+   expect(commentReads(f, "11")).toEqual([]);
+   expect(f.state().nodes["11"]?.assignees ?? []).toEqual([]);
+   f.writeFrontier([second()]);
+   expect((await f.tick()).result.maps[0]!.claimed).toEqual(["11"]);
+  } finally {
+   f.stop();
+  }
+ }, 60_000);
+
+ test("a propose node past the spawn cap's room is not read", async () => {
+  const f = await fixture({ spawnCapPerDay: 1 });
+  try {
+   f.writeFrontier([frontierEntry("10"), second()]);
+   const { result } = await f.tick();
+   expect(result.maps[0]!.claimed).toEqual(["10"]);
+   expect(result.maps[0]!.spawnCapExhausted).toBe(true);
+   expect(commentReads(f, "11")).toEqual([]);
+  } finally {
+   f.stop();
+  }
+ }, 60_000);
+
+ test("an audit cached before node #240, without openClaimed, is reported: lost proposals are not looked for", async () => {
+  const f = await fixture();
+  try {
+   f.writeFrontier([]);
+   await f.tick();
+   // soma's audit always carries openClaimed; a record cached by an older ranger does not.
+   f.journal((j) => {
+    const key = auditCacheKey(REPO, 1);
+    const record = JSON.parse(j.getHealth(key)!);
+    delete record.good.openClaimed;
+    j.setHealth(key, JSON.stringify(record));
+   });
+   const { result } = await f.tick();
+   expect(result.ratify.errors.join("\n")).toContain("carries no openClaimed");
+  } finally {
+   f.stop();
+  }
+ }, 60_000);
+});
+
 describe("veto pins (node #240, ruling D7)", () => {
  const reactions = (...list: [string, string][]) => list.map(([author, content]) => ({ author, content }));
  test("any principal -1 vetoes; nobody else's does", () => {
@@ -636,5 +693,13 @@ describe("veto pins (node #240, ruling D7)", () => {
    .toEqual({ commentId: "3", proposalCommentId: "7" });
   expect(boundVeto([c(1, "alice", vetoMarker("10", "5")), c(2, "ivy-bot", vetoMarker("100", "5"))], "ivy-bot", "10")).toBeNull();
   expect(boundVeto([c(2, "ivy-bot", "<!-- ranger:veto node=10 proposal=x -->")], "ivy-bot", "10")).toBeNull();
+ });
+
+ test("only a marker on the comment's final line binds: a bot comment quoting it mid-body records no veto", () => {
+  const c = (id: number, author: string, body: string) => ({ id, author, body });
+  expect(boundVeto([c(4, "ivy-bot", `relayed: ${vetoMarker("10", "5")}\nmore text`)], "ivy-bot", "10")).toBeNull();
+  expect(boundVeto([c(4, "ivy-bot", `relayed: ${vetoMarker("10", "5")}`)], "ivy-bot", "10")).toBeNull();
+  expect(boundVeto([c(4, "ivy-bot", `vetoed\n${vetoMarker("10", "5")}\n\n`)], "ivy-bot", "10"))
+   .toEqual({ commentId: "4", proposalCommentId: "5" });
  });
 });

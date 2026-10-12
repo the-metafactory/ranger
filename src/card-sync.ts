@@ -81,14 +81,13 @@ function cardSpec(node: ClassifiedNode): { head: CardHead; reason: string; journ
         reason: `${briefHoldReason(route.missing)} — ranger will not take it until soma's graph audit no longer lists it`,
         journalReason: "brief-not-ready",
       };
+    case "refused":
+      return {
+        head: CARD_HEADS.refused!,
+        reason: `The principal 👎'd ranger's proposal${route.commentUrl === null ? "" : ` (${route.commentUrl})`}: ranger posted a veto comment on the node, released its claim and will never propose it again. The node stays open and is yours to take.`,
+        journalReason: "refused",
+      };
     case "proposal":
-      if (route.refused === true) {
-        return {
-          head: CARD_HEADS.refused!,
-          reason: `The principal 👎'd ranger's proposal${route.commentUrl === null ? "" : ` (${route.commentUrl})`}: ranger posted a veto comment on the node, released its claim and will never propose it again. The node stays open and is yours to take.`,
-          journalReason: "refused",
-        };
-      }
       return {
         head: CARD_HEADS.proposal!,
         reason: route.missing === true
@@ -1151,10 +1150,9 @@ export function refusedNode(veto: { repo: string; nodeId: string; proposalCommen
     url,
     registryBlocked: false,
     route: {
-      route: "proposal",
+      route: "refused",
       commentId: veto.proposalCommentId,
       commentUrl: veto.proposalCommentId === null ? null : nodeCommentUrl(veto.repo, url, veto.proposalCommentId),
-      refused: true,
     },
   };
 }
@@ -1195,6 +1193,7 @@ export function cardNeeded(node: ClassifiedNode): boolean {
   return (
     node.route.route === "escalate-hitl" ||
     node.route.route === "proposal" ||
+    node.route.route === "refused" ||
     node.route.route === "provisioning" ||
     // An unread audit names nothing missing: no card until it is read.
     (node.route.route === "brief-not-ready" && node.route.missing !== null)

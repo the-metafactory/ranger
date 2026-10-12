@@ -161,7 +161,7 @@ async function escalateOneMap(
       ...hitlWaiting(classified),
       ...classified.filter((n) => n.route.route === "provisioning"),
       ...briefHeld,
-      ...classified.filter((n) => n.route.route === "proposal"),
+      ...classified.filter((n) => n.route.route === "proposal" || n.route.route === "refused"),
       ...proposals,
     ].filter(cardNeeded);
     if (!briefs.ok) base.cardErrors.push(`build briefs unverified: ${briefs.error}`);

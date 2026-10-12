@@ -52,10 +52,14 @@ export type RouteClass =
    * the `proposed` worker row; `commentId` is null when soma named none.
    * `missing`: the ratify phase found no comment carrying the proposal
    * marker either (node #250, ruling D8), so nothing can be ratified.
-   * `refused`: the principal 👎'd the proposal (node #240, ruling D7); the
-   * node is released and back on the frontier, the principal's to take.
    */
-  | { route: "proposal"; commentId: string | null; commentUrl: string | null; missing?: true; refused?: true };
+  | { route: "proposal"; commentId: string | null; commentUrl: string | null; missing?: true }
+  /**
+   * Not a frontier class either: a node the principal 👎'd (node #240,
+   * ruling D7). Released, back on the frontier, never proposed again: the
+   * principal's to take. `commentId` is the refused proposal comment.
+   */
+  | { route: "refused"; commentId: string | null; commentUrl: string | null };
 
 export interface ClassifiedNode {
   id: string;

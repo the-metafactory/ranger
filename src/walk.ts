@@ -565,24 +565,37 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
       rootAuthor,
      });
      if (!briefs.ok) errors.push(`build briefs unverified — build nodes held this tick: ${briefs.error}`);
-     // A veto is rebuilt from GitHub before a propose research node is
-     // claimed (node #240, rulings D1, D7): the journal is a cache, and a
-     // lost one must not re-propose a node the principal refused. A failed
-     // read holds every propose research node on this map this tick.
-     const proposing = classified.filter((n) => n.route.route === "research" && n.route.walkable && n.route.ratify === "propose");
-     const vetoes = await rebuildVetoes({
-      journal, map, botIdentity, token, port: portFor(map.repo),
-      nodeIds: proposing.map((n) => n.id),
-     });
-     if (vetoes.error !== null) errors.push(`veto rebuild failed (${vetoes.error}) — no propose research node claimed this tick`);
-     const plannable = vetoes.error === null ? classified : classified.filter((n) => !proposing.includes(n));
-     owned();
      // The plan `ranger serve` (#37) also reads, so its "next" is this order.
-     const plan = planTick(plannable, {
+     const planOf = (nodes: typeof classified) => planTick(nodes, {
       laneBusy: implementClaimed.has(implementLane(map)) || implementLaneBusy(journal, implementLane(map)),
       vetoed: (id) => journal.hasVeto(id, map.repo),
       implementDrained: drain?.scope === "lane",
      });
+     // A veto is rebuilt from GitHub before a propose research node is
+     // claimed (node #240, rulings D1, D7): the journal is a cache, and a
+     // lost one must not re-propose a node the principal refused. Only the
+     // propose nodes this tick can reach are read: those the plan takes
+     // within the spawn cap's room, at most `ratify.readsPerTick`. An unread
+     // one is not claimed this tick, and a failed read holds every propose
+     // research node on this map this tick.
+     const first = planOf(classified);
+     const room = Math.max(0, config.workers.spawnCapPerDay - journal.spawnsToday(ctx.now?.() ?? new Date()));
+     const proposing = first.take.filter((n) => n.route.route === "research" && n.route.ratify === "propose");
+     const reachable = first.take.slice(0, room).filter((n) => proposing.includes(n));
+     const toRead = reachable.slice(0, config.ratify.readsPerTick);
+     const vetoes = await rebuildVetoes({
+      journal, map, botIdentity, token, port: portFor(map.repo),
+      nodeIds: toRead.map((n) => n.id),
+     });
+     if (vetoes.error !== null) {
+      errors.push(`veto rebuild failed (${vetoes.error}) — no propose research node claimed this tick`);
+     } else if (reachable.length > toRead.length) {
+      errors.push(`${reachable.slice(toRead.length).map((n) => `#${n.id}`).join(", ")} past ratify.readsPerTick — veto read and claim deferred to the next tick`);
+     }
+     const unverified = new Set(proposing.filter((n) => vetoes.error !== null || !toRead.includes(n)).map((n) => n.id));
+     owned();
+     // A rebuilt veto lands in the journal, so the plan made now skips its node.
+     const plan = vetoes.rebuilt.length === 0 ? first : planOf(classified);
      const candidates = plan.selected;
      const laneOf = (id: string) =>
       plan.implement.some((n) => n.id === id) ? "implement" : "research";
@@ -600,6 +613,8 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
        errors.push(`#${node.id} vetoed — not claimed`);
        continue;
       }
+      // A propose research node whose veto was not read this tick (node #240).
+      if (unverified.has(node.id)) continue;
       try {
        journal.assertWorkerRoot(node.id, map.repo, map.root);
       } catch (error) {

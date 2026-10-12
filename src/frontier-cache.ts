@@ -380,16 +380,18 @@ async function readBriefs(args: ReadFrontierArgs): Promise<{ briefs: BriefAudit;
 
 /**
  * The open, claimed nodes of a map as the last good audit saw them (node
- * #240), or null when no audit cached them. A plain journal read.
+ * #240), or null when no audit is cached. `claims` is null when the cached
+ * audit carries no `openClaimed` (soma's `graph audit --json` emits it; a
+ * record cached before node #240 does not). A plain journal read.
  */
 export function cachedOpenClaims(
   journal: Journal,
   repo: string,
   root: number,
-): { fetchedAt: string; claims: { id: string; assignees: string[] }[] } | null {
+): { fetchedAt: string; claims: { id: string; assignees: string[] }[] | null } | null {
   const good = readAuditRecord(journal, repo, root)?.good;
-  if (good?.openClaimed === undefined) return null;
-  return { fetchedAt: good.fetchedAt, claims: good.openClaimed };
+  if (good === undefined) return null;
+  return { fetchedAt: good.fetchedAt, claims: good.openClaimed ?? null };
 }
 
 /**

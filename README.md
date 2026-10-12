@@ -240,11 +240,15 @@ bun src/cli.ts journal                    # inspect workers/events/health
   closed. The desk shows the same card while the node stands on the
   frontier. A vetoed node is never claimed again. The journal is a cache:
   before the walk claims a propose research node, it reads the node's
-  comments and rebuilds a veto from one the bot wrote with the marker; a
-  failed read claims no propose research node on that map that tick. A
-  proposal whose row a lost journal took with it is found from the bot's
-  open claims in the last cached audit, and its comment id (or its veto) is
-  recovered from the node's comments. A write identity that resolves to the
+  comments and rebuilds a veto from a bot comment whose final line is the
+  marker. Only the propose nodes the tick can claim are read (within the
+  spawn cap's room, at most `ratify.readsPerTick`); an unread one waits for
+  the next tick, and a failed read claims no propose research node on that
+  map that tick. A proposal whose row a lost journal took with it is found
+  from the bot's open claims in the last cached audit (soma's `graph audit
+  --json` `openClaimed`; an audit cached without it is reported until the
+  walk caches a fresh one), and its comment id (or its veto) is recovered
+  from the node's comments. A write identity that resolves to the
   principal posts no veto and releases nothing. Migration 0025 keys the
   veto cache by repo.
 - **Observation intake (node #247, #21 rulings D3/D11/D12/D17):** each walk

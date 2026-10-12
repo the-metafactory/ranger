@@ -114,6 +114,7 @@ function notWalkable(node: ClassifiedNode): string | null {
  }
  if (route.route === "brief-not-ready") return `routes brief-not-ready: ${briefHoldReason(route.missing)}`;
  if (route.route === "proposal") return "is proposed — it waits for the principal's 👍 on its proposal comment";
+ if (route.route === "refused") return "was refused — the principal 👎'd ranger's proposal, so ranger never takes it";
  if (!route.walkable) {
   return `routes ${route.route} but is not walkable on this map (walk mode, nodes allowlist or skip list)`;
  }

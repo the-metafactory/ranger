@@ -62,7 +62,7 @@ import {
 } from "./config.ts";
 import { drainGate, implementCandidates, planTick, walkableCandidates, type DrainState } from "./candidates.ts";
 import { pidAlive as defaultPidAlive } from "./exec.ts";
-import { Journal, type ResumeQueueRow, type WorkerRow } from "./journal.ts";
+import { Journal, vetoApplies, type ResumeQueueRow, type WorkerRow } from "./journal.ts";
 import { ForeignMigrationError } from "./journal-guard.ts";
 import { IMPLEMENT_LANES, implementLane, workerLane, type ImplementLane } from "./lanes.ts";
 import { activeCooldown, cooldownScope, readGraphqlBudget } from "./budget.ts";
@@ -2037,7 +2037,7 @@ export function stateFromJournal(
    drains: journal === null ? undefined : readDrains(journal, config.maps),
    spawnsToday: journal?.spawnsToday(now) ?? 0,
    spawnCap: config.workers.spawnCapPerDay,
-   vetoed: (id, repo) => vetoes.some((v) => v.nodeId === id && (v.repo === repo || v.repo === "")),
+   vetoed: (id, repo) => vetoes.some((v) => vetoApplies(v, id, repo)),
    pidAlive: defaultPidAlive,
    refreshing: reader.refreshing,
    refreshError: reader.lastError,

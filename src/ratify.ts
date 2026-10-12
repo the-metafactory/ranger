@@ -42,9 +42,14 @@ export function proposalMarker(nodeId: string): string {
  */
 export const PROPOSAL_MISSING = "proposal comment missing";
 
+/** The start of a node's veto marker, up to the proposal id. */
+export function vetoMarkerPrefix(nodeId: string): string {
+ return `<!-- ranger:veto node=${nodeId} proposal=`;
+}
+
 /** The veto comment's marker (node #240): the record a lost journal rebuilds a veto from. */
 export function vetoMarker(nodeId: string, proposalCommentId: string): string {
- return `<!-- ranger:veto node=${nodeId} proposal=${proposalCommentId} -->`;
+ return `${vetoMarkerPrefix(nodeId)}${proposalCommentId} -->`;
 }
 
 /** The `outcome` prefix of a vetoed row (node #240). */
@@ -104,20 +109,21 @@ const validId = (c: IssueComment) => Number.isSafeInteger(c.id) && c.id > 0;
 
 /**
  * The veto from the node's comments (node #240): the newest comment the
- * machine account wrote that carries this node's veto marker, and the
- * proposal it vetoed; else null.
+ * machine account wrote that ends with this node's veto marker, and the
+ * proposal it vetoed; else null. Only the final line counts: a bot comment
+ * that quotes outside text carrying the marker mid-body records no veto.
  */
 export function boundVeto(
  comments: readonly IssueComment[],
  botIdentity: string,
  nodeId: string,
 ): { commentId: string; proposalCommentId: string } | null {
- const prefix = `<!-- ranger:veto node=${nodeId} proposal=`;
+ const prefix = vetoMarkerPrefix(nodeId);
  for (const c of [...comments].sort((a, b) => b.id - a.id)) {
   if (!sameLogin(c.author, botIdentity) || !validId(c)) continue;
-  const at = c.body.indexOf(prefix);
-  if (at < 0) continue;
-  const match = /^(\d+) -->/.exec(c.body.slice(at + prefix.length));
+  const last = c.body.trimEnd().split("\n").at(-1)!.trim();
+  if (!last.startsWith(prefix)) continue;
+  const match = /^(\d+) -->$/.exec(last.slice(prefix.length));
   if (match !== null) return { commentId: String(c.id), proposalCommentId: match[1]! };
  }
  return null;
@@ -348,6 +354,8 @@ async function finishVeto(
  * (or the vetoed one, when a veto comment stands, which the loop then
  * finishes). The open claims come from the last audit the walk cached, at
  * most `budget` comment reads per tick; a node with no marker is not read again.
+ * A cached audit without `openClaimed` is reported, not passed over: no lost
+ * proposal can be found until the walk caches a fresh audit.
  */
 async function recoverLost(
  ctx: RatifyContext,
@@ -360,6 +368,10 @@ async function recoverLost(
  const { map, token, botIdentity } = m;
  const open = cachedOpenClaims(journal, map.repo, map.root);
  if (open === null) return;
+ if (open.claims === null) {
+  result.errors.push(`${mapKey(map)}: the audit cached at ${open.fetchedAt} carries no openClaimed — lost proposals are not looked for until the walk caches a fresh audit`);
+  return;
+ }
  const lost = open.claims.filter((claim) =>
   claim.assignees.some((a) => sameLogin(a, botIdentity)) &&
   journal.getWorker(claim.id, map.repo) === null &&
@@ -390,13 +402,7 @@ async function recoverLost(
     journal.setHealth(recoverReadKey(map.repo, claim.id), now().toISOString());
     continue;
    }
-   if (veto !== null) {
-    journal.recordVeto({
-     repo: map.repo, nodeId: claim.id, root: map.root, commentId: veto.commentId, proposalCommentId: veto.proposalCommentId,
-     detail: `veto comment ${veto.commentId} on proposal comment ${veto.proposalCommentId}, rebuilt from GitHub`,
-    });
-    journal.recordEvent("veto-recovered", { nodeId: claim.id, repo: map.repo, detail: `veto comment ${veto.commentId} by ${botIdentity}` });
-   }
+   if (veto !== null) recordRecoveredVeto(journal, map, claim.id, veto, botIdentity);
    const commentId = veto?.proposalCommentId ?? proposal!;
    journal.upsertWorker({
     nodeId: claim.id,
@@ -419,6 +425,21 @@ async function recoverLost(
    result.errors.push(`#${claim.id}: proposal recovery read failed (${message(error)}) — read again next tick`);
   }
  }
+}
+
+/** Record a veto read back from the node's comments (ruling D1): the row and its event. */
+function recordRecoveredVeto(
+ journal: Journal,
+ map: RangerMapConfig,
+ nodeId: string,
+ veto: { commentId: string; proposalCommentId: string },
+ botIdentity: string,
+): void {
+ journal.recordVeto({
+  repo: map.repo, nodeId, root: map.root, commentId: veto.commentId, proposalCommentId: veto.proposalCommentId,
+  detail: `veto comment ${veto.commentId} on proposal comment ${veto.proposalCommentId}, rebuilt from GitHub`,
+ });
+ journal.recordEvent("veto-recovered", { nodeId, repo: map.repo, detail: `veto comment ${veto.commentId} by ${botIdentity}` });
 }
 
 /**
@@ -449,11 +470,7 @@ export async function rebuildVetoes(args: {
    return { rebuilt, error: `#${nodeId}: ${message(error)}` };
   }
   if (veto === null) continue;
-  journal.recordVeto({
-   repo: map.repo, nodeId, root: map.root, commentId: veto.commentId, proposalCommentId: veto.proposalCommentId,
-   detail: `veto comment ${veto.commentId} on proposal comment ${veto.proposalCommentId}, rebuilt from GitHub`,
-  });
-  journal.recordEvent("veto-recovered", { nodeId, repo: map.repo, detail: `veto comment ${veto.commentId} by ${botIdentity}` });
+  recordRecoveredVeto(journal, map, nodeId, veto, botIdentity);
   rebuilt.push(nodeId);
  }
  return { rebuilt, error: null };
