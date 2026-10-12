@@ -819,17 +819,20 @@ const CLOSING_KEYWORD =
  * may also be any link or a Jira-style `ABC-1`: those are skipped, so an
  * issue ref anywhere in the list refuses. The refs are GitLab's
  * `Issue.reference_pattern` — `#N`, `path/with/groups#N`, `GL-N`,
- * `[issue:N]`, `[issue:path/N]` — or an issue, incident or work-item URL on
+ * `[issue:N]`, `[issue:path/N]`, a project path also absolute (`/path#N`) — or an issue, incident or work-item URL on
  * any host, with or without the `/-` segment.
  *
  * One regex for the whole list backtracks super-linearly on a crafted MR
  * description, so the list is walked item by item with sticky, bounded
  * patterns (GitLab caps a link at 300 characters and an iid at 20 digits).
+ * A walk is a function of its position alone, so a position whose walk found
+ * no ref is remembered: a later keyword whose list runs into it stops there,
+ * and overlapping lists (`https://a/fixes AB-1, ` repeated) stay linear.
  */
 const GITLAB_KEYWORD =
  /\b(?:clos(?:e|es|ed|ing)|fix(?:es|ed|ing)?|resolv(?:e|es|ed|ing)|implement(?:s|ed|ing)?)\b:?\s+/gi;
 const GITLAB_ISSUE_REF =
- /(?:issues?\s+)?(?:(?:[\w.-]{1,255}\/){0,20}[\w.-]{0,255}#\d{1,20}|GL-\d{1,20}|\[issue:(?:[\w.-]{1,255}\/){0,20}\d{1,20}\]|https?:\/\/\S{1,300}?\/(?:-\/)?(?:issues(?:\/incident)?|work_items)\/\d{1,20})/iy;
+ /(?:issues?\s+)?(?:\/?(?:[\w.-]{1,255}\/){0,20}[\w.-]{0,255}#\d{1,20}|GL-\d{1,20}|\[issue:\/?(?:[\w.-]{1,255}\/){0,20}\d{1,20}\]|https?:\/\/\S{1,300}?\/(?:-\/)?(?:issues(?:\/incident)?|work_items)\/\d{1,20})/iy;
 /**
  * Two ways to skip a link item: GitLab's own link (`[^\s>]`, inner commas
  * kept, no trailing `?!.,:`), and one split at every comma, for the case where
@@ -841,24 +844,34 @@ const GITLAB_LIST_FILLERS = [
  /(?:issues?\s+)?(?:https?:\/\/[^\s>,]{1,300}|[A-Z][A-Z0-9_]{0,255}-\d{1,20})(?: *,? +and +| *,? *)/iy,
 ];
 
-/** Walk one closing list from `start`; the end of the first issue ref, or -1. */
-function walkGitLabList(text: string, start: number, filler: RegExp): number {
+/**
+ * Walk one closing list from `start`; the end of the first issue ref, or -1.
+ * `dead` holds the positions this filler's walks already left without a ref;
+ * every position this walk passes joins it when the walk finds none.
+ */
+function walkGitLabList(text: string, start: number, filler: RegExp, dead: Set<number>): number {
+ const passed: number[] = [];
  let at = start;
  for (;;) {
+  if (dead.has(at)) break;
+  passed.push(at);
   GITLAB_ISSUE_REF.lastIndex = at;
   const ref = GITLAB_ISSUE_REF.exec(text);
   if (ref !== null) return at + ref[0].length;
   filler.lastIndex = at;
   const item = filler.exec(text);
-  if (item === null) return -1;
+  if (item === null) break;
   at += item[0].length;
  }
+ for (const position of passed) dead.add(position);
+ return -1;
 }
 
 function findGitLabClosing(text: string): string | null {
+ const dead = GITLAB_LIST_FILLERS.map(() => new Set<number>());
  for (const keyword of text.matchAll(GITLAB_KEYWORD)) {
-  for (const filler of GITLAB_LIST_FILLERS) {
-   const end = walkGitLabList(text, keyword.index + keyword[0].length, filler);
+  for (const [mode, filler] of GITLAB_LIST_FILLERS.entries()) {
+   const end = walkGitLabList(text, keyword.index + keyword[0].length, filler, dead[mode]!);
    if (end !== -1) return text.slice(keyword.index, end);
   }
  }

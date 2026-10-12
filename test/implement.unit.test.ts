@@ -149,6 +149,9 @@ describe("closing keywords (#588 fail-open path, node #128 per forge)", () => {
   ["Closes GL-128", null, "Closes GL-128"],
   ["Closes [issue:128]", null, "Closes [issue:128]"],
   ["fixes [issue:claw/crisis-simulator/128]", null, "fixes [issue:claw/crisis-simulator/128]"],
+  // GitLab also reads an absolute project path, with a leading slash.
+  ["Closes /claw/sim#128", null, "Closes /claw/sim#128"],
+  ["Closes [issue:/claw/sim/128]", null, "Closes [issue:/claw/sim/128]"],
   [
    "Closes https://gitlab.example.org/g/p/issues/128",
    null,
@@ -199,6 +202,16 @@ describe("closing keywords (#588 fail-open path, node #128 per forge)", () => {
   const started = performance.now();
   expect(findClosingKeyword(crafted, "gitlab")).toBeNull();
   expect(findClosingKeyword(`${crafted} closes ${"AB-1, ".repeat(16_000)}#128`, "gitlab")).toContain("#128");
+  expect(performance.now() - started).toBeLessThan(1_000);
+ });
+ test("overlapping GitLab closing lists are walked once, not once per keyword", () => {
+  // Every filler URL holds a keyword whose list runs to the end: a fresh walk per keyword took 3.5 s on 88 KB.
+  const crafted = "https://a/fixes AB-1, ".repeat(4_000);
+  const started = performance.now();
+  expect(findClosingKeyword(crafted, "gitlab")).toBeNull();
+  const hit = findClosingKeyword(`${crafted}#128`, "gitlab");
+  expect(hit?.startsWith("fixes AB-1, ")).toBe(true);
+  expect(hit?.endsWith(", #128")).toBe(true);
   expect(performance.now() - started).toBeLessThan(1_000);
  });
  test("ranger's own GitLab-shaped PR prose passes the GitLab guard", () => {
