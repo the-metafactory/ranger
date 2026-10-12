@@ -1,9 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import {
+  blockedProbeSpecs,
   byRoute,
   classify,
   hitlWaiting,
   loadProbeRegistry,
+  probeRegistryKey,
   probesRegistryBlocked,
   type ClassifiedNode,
   type ProbeRegistry,
@@ -147,7 +149,7 @@ describe("classify — design §3 routing table", () => {
   test("auto + declared command probe → NOT provisioning", () => {
     const registry: ProbeRegistry = {
       repos: {
-        "acme/widgets": {
+        "github.com/acme/widgets": {
           commands: [{ run: "bun test", cwd: "/tmp/x" }],
           urlHosts: [],
         },
@@ -193,7 +195,7 @@ describe("probesRegistryBlocked", () => {
   test("url probe with undeclared host → blocked", () => {
     const registry: ProbeRegistry = {
       repos: {
-        "acme/widgets": { commands: [], urlHosts: ["status.example.com"] },
+        "github.com/acme/widgets": { commands: [], urlHosts: ["status.example.com"] },
       },
     };
     expect(
@@ -273,5 +275,73 @@ describe("hitlWaiting + byRoute", () => {
 describe("loadProbeRegistry", () => {
   test("missing file → empty registry", () => {
     expect(loadProbeRegistry("/nonexistent/probe-registry.json")).toEqual({});
+  });
+});
+
+describe("probe registry keys (soma registry v2)", () => {
+  const SOMA = "/Users/x/soma";
+  const probe = { type: "command", run: "bun test", cwd: SOMA } as const;
+  const v2: ProbeRegistry = {
+    version: 2,
+    repos: { "github.com/acme/widgets": { commands: [{ run: "bun test", cwd: SOMA }], urlHosts: [] } },
+  };
+  const proposeBuild = (author = "alice") => {
+    const e = entry({ node: { autonomy: "propose", kind: "build", probes: [probe] } });
+    e.author = author;
+    return e;
+  };
+
+  test("probeRegistryKey qualifies GitHub and GitLab repos with their host", () => {
+    expect(probeRegistryKey("acme/widgets")).toBe("github.com/acme/widgets");
+    expect(probeRegistryKey("github:github.com/acme/widgets")).toBe("github.com/acme/widgets");
+    expect(probeRegistryKey("gitlab:gitlab.example.org/group/project")).toBe("gitlab.example.org/group/project");
+  });
+
+  test("an unparseable repo has no key, so every probe reads as blocked", () => {
+    expect(probeRegistryKey("not a repo")).toBeNull();
+    expect(blockedProbeSpecs(proposeBuild().node, "not a repo", v2)).toHaveLength(1);
+  });
+
+  test("a host-qualified registry entry satisfies a bare owner/name map repo", () => {
+    expect(blockedProbeSpecs(proposeBuild().node, "acme/widgets", v2)).toEqual([]);
+  });
+
+  test("a bare owner/name registry key no longer authorises a probe", () => {
+    const legacy: ProbeRegistry = {
+      repos: { "acme/widgets": { commands: [{ run: "bun test", cwd: SOMA }], urlHosts: [] } },
+    };
+    expect(blockedProbeSpecs(proposeBuild().node, "acme/widgets", legacy)).toEqual([
+      { type: "command", run: "bun test", cwd: SOMA },
+    ]);
+  });
+
+  test("a GitLab map reads its own host's entry, never github.com's", () => {
+    const repo = "gitlab:gitlab.example.org/acme/widgets";
+    expect(blockedProbeSpecs(proposeBuild().node, repo, v2)).toHaveLength(1);
+    const gitlab: ProbeRegistry = {
+      version: 2,
+      repos: { "gitlab.example.org/acme/widgets": { commands: [{ run: "bun test", cwd: SOMA }], urlHosts: [] } },
+    };
+    expect(blockedProbeSpecs(proposeBuild().node, repo, gitlab)).toEqual([]);
+  });
+
+  test("propose build with registered probes on a walk: full map → implement, merge-ratified", () => {
+    const node = classify(proposeBuild(), "acme/widgets", "full", v2, { botIdentity: "bot" });
+    expect(node.route).toEqual({ route: "implement", walkable: true, ratify: "merge" });
+    expect(node.registryBlocked).toBe(false);
+  });
+
+  test("propose build with unregistered probes → provisioning card naming them, not a HITL card", () => {
+    const node = classify(proposeBuild(), "acme/widgets", "full", EMPTY_REGISTRY, { botIdentity: "bot" });
+    expect(node.route).toEqual({ route: "provisioning" });
+    expect(node.registryBlocked).toBe(true);
+    expect(node.blockedProbes).toEqual([{ type: "command", run: "bun test", cwd: SOMA }]);
+  });
+
+  test("a bot-authored propose build still escalates, probes or not (node #9 ban)", () => {
+    for (const registry of [v2, EMPTY_REGISTRY]) {
+      const node = classify(proposeBuild("bot"), "acme/widgets", "full", registry, { botIdentity: "bot" });
+      expect(node.route).toEqual({ route: "escalate-hitl", reason: "propose-approve" });
+    }
   });
 });
