@@ -249,7 +249,7 @@ bun src/cli.ts journal                    # inspect workers/events/health
   --json` `openClaimed`; an audit cached without it is reported until the
   walk caches a fresh one), and its comment id (or its veto) is recovered
   from the node's comments. A write identity that resolves to the
-  principal posts no veto and releases nothing. Migration 0025 keys the
+  principal posts no veto and releases nothing. Migration 0027 keys the
   veto cache by repo.
 - **Observation intake (node #247, #21 rulings D3/D11/D12/D17):** each walk
   tick reads the Discord thread of every map that has one and is not

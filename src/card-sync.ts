@@ -4,7 +4,7 @@ import { journalKeyFor } from "./forge-ref.ts";
 import { mapKey } from "./maps.ts";
 import { EscalationDiscord, DiscordMessageGoneError } from "./discord.ts";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
-import type { Journal, EscalationRow, WorkerRow } from "./journal.ts";
+import type { Journal, EscalationRow, VetoRow, WorkerRow } from "./journal.ts";
 import { nodeCommentUrl, nodeUrl } from "./forge-text.ts";
 import { briefHoldReason, ESCALATE_REASONS, type ClassifiedNode, type EscalateReason } from "./route.ts";
 import { LeaseLostError, withEscalateLock, type OwnedCheck } from "./lock.ts";
@@ -1197,7 +1197,7 @@ export function proposalNode(row: WorkerRow, title: string): ClassifiedNode {
  * frontier, and never proposed again. Built from the veto alone, so the
  * ratify phase's edit and the desk's pass render the same card.
  */
-export function refusedNode(veto: { repo: string; nodeId: string; proposalCommentId: string | null }, title: string): ClassifiedNode {
+export function refusedNode(veto: Pick<VetoRow, "repo" | "nodeId" | "proposalCommentId">, title: string): ClassifiedNode {
   const url = nodeUrl(veto.repo, veto.nodeId);
   return {
     id: veto.nodeId,
@@ -1226,7 +1226,7 @@ export async function refuseProposalCard(ctx: {
   config: RangerConfig;
   journal: Journal;
   map: RangerMapConfig;
-  veto: { repo: string; nodeId: string; proposalCommentId: string | null };
+  veto: Pick<VetoRow, "repo" | "nodeId" | "proposalCommentId">;
 }): Promise<void> {
   const { journal, map, veto } = ctx;
   const prior = journal.getEscalation(map.repo, veto.nodeId);

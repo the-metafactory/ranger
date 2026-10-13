@@ -177,6 +177,13 @@ export const recoverReadKey = (repo: string, nodeId: string) => `ratify-recover.
 
 const message = (error: unknown) => error instanceof Error ? error.message : String(error);
 
+/** One ratify pass's state, shared by the helpers it calls. */
+interface RatifyTick {
+ ctx: RatifyContext;
+ result: RatifyResult;
+ now: () => Date;
+}
+
 const defaultRelease = (repo: string, nodeId: string, identity: string, token: string) =>
  graphRelease(repo, nodeId, identity, token, { timeoutMs: GRAPH_CALL_TIMEOUT_MS });
 
@@ -184,12 +191,13 @@ export async function ratifyPass(ctx: RatifyContext): Promise<RatifyResult> {
  const { config, journal } = ctx;
  const now = () => ctx.now?.() ?? new Date();
  const result: RatifyResult = { read: [], closing: [], vetoed: [], recovered: [], deferred: [], errors: [] };
+ const tick: RatifyTick = { ctx, result, now };
  // Proposals exist only on GitHub maps (node #246).
  const walked = ctx.maps.filter((m) => parseForgeRef(m.map.repo).forge === "github");
  // A lost journal (ruling D1): the bot's open claims with no row, from the
  // last audit, are read for a proposal first, so a recovered one is read this tick.
  const recoverBudget = { left: config.ratify.readsPerTick };
- for (const m of walked) await recoverLost(ctx, m, recoverBudget, result, now);
+ for (const m of walked) await recoverLost(tick, m, recoverBudget);
  const rowsOf = new Map<WorkerRow, RatifyMap>();
  for (const m of walked) {
   for (const row of journal.listWorkers(m.map.repo, m.map.root)) rowsOf.set(row, m);
@@ -215,7 +223,7 @@ export async function ratifyPass(ctx: RatifyContext): Promise<RatifyResult> {
    // A veto already stands (a release that failed, a recovered veto): finish it, read nothing.
    const standing = journal.getVeto(row.nodeId, row.repo);
    if (standing !== null) {
-    await finishVeto(ctx, m, standing, result, now);
+    await finishVeto(tick, m, standing);
     continue;
    }
    result.read.push(id);
@@ -249,7 +257,7 @@ export async function ratifyPass(ctx: RatifyContext): Promise<RatifyResult> {
    const current = journal.getWorker(row.nodeId, row.repo);
    if (current?.status !== "proposed" || current.proposalCommentId !== commentId) continue;
    if (vetoed) {
-    await vetoProposal(ctx, m, row, commentId, principal, result, now);
+    await vetoProposal(tick, m, row, commentId, principal);
     continue;
    }
    // The close phase is set before the spawn, so the child never reads a
@@ -286,14 +294,13 @@ export async function ratifyPass(ctx: RatifyContext): Promise<RatifyResult> {
  * a node vetoed once is never claimed again.
  */
 async function vetoProposal(
- ctx: RatifyContext,
+ tick: RatifyTick,
  m: RatifyMap,
  row: WorkerRow,
  proposalCommentId: string,
  principal: string,
- result: RatifyResult,
- now: () => Date,
 ): Promise<void> {
+ const { ctx } = tick;
  const { journal } = ctx;
  const { map, token, botIdentity } = m;
  const port = ctx.portFor(map.repo);
@@ -314,17 +321,12 @@ async function vetoProposal(
   repo: row.repo,
   detail: `${detail} — veto comment ${vetoCommentId}; never proposed again`,
  });
- await finishVeto(ctx, m, journal.getVeto(row.nodeId, row.repo)!, result, now);
+ await finishVeto(tick, m, journal.getVeto(row.nodeId, row.repo)!);
 }
 
 /** Release the vetoed node's claim, settle its row and edit its card (ruling D7). */
-async function finishVeto(
- ctx: RatifyContext,
- m: RatifyMap,
- veto: VetoRow,
- result: RatifyResult,
- now: () => Date,
-): Promise<void> {
+async function finishVeto(tick: RatifyTick, m: RatifyMap, veto: VetoRow): Promise<void> {
+ const { ctx, result, now } = tick;
  const { journal } = ctx;
  const { map, token, botIdentity } = m;
  const released = await (ctx.release ?? defaultRelease)(map.repo, veto.nodeId, botIdentity, token);
@@ -359,13 +361,8 @@ async function finishVeto(
  * A cached audit without `openClaimed` is reported, not passed over: no lost
  * proposal can be found until the walk caches a fresh audit.
  */
-async function recoverLost(
- ctx: RatifyContext,
- m: RatifyMap,
- budget: { left: number },
- result: RatifyResult,
- now: () => Date,
-): Promise<void> {
+async function recoverLost(tick: RatifyTick, m: RatifyMap, budget: { left: number }): Promise<void> {
+ const { ctx, result, now } = tick;
  const { journal } = ctx;
  const { map, token, botIdentity } = m;
  const open = cachedOpenClaims(journal, map.repo, map.root);
