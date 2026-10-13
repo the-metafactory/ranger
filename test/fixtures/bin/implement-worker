@@ -15,7 +15,8 @@
 # merge pass does nothing; merge-forge — a base merge pass commits without merging and moves
 # refs/remotes/origin/main onto its own parent (one commit ahead, base "inside"); orphan — builds on a
 # root commit of its own, sharing no history with origin/main. Base merge pass (prompt carries "## Base merge pass"): merges
-# origin/main, resolving a conflict on src/feature.ts by keeping both sides.
+# origin/main, resolving a conflict on src/feature.ts by keeping both sides. CI fix pass (prompt
+# carries "## CI fix pass"): commits a CI fix; in mode ci-noop it commits nothing (a flaky red).
 set -euo pipefail
 
 if [ -n "${GIT_CONFIG_VALUE_0:-}" ] || [ -n "${GH_TOKEN:-}" ]; then
@@ -72,6 +73,15 @@ if printf '%s' "$prompt" | grep -q "## Base merge pass"; then
     git commit -q --no-edit
   fi
   echo "fake worker merged origin/main"
+  exit 0
+fi
+if printf '%s' "$prompt" | grep -q "## CI fix pass"; then
+  if [ "$mode" = "ci-noop" ]; then echo "fake worker: the red is not this branch's"; exit 0; fi
+  echo "export const feature = () => 3; // fixed for CI" > src/feature.ts
+  echo "// one more CI fix" >> src/ci-fixes.ts
+  git add -A
+  git commit -q -m "fix: make CI pass for node #20"
+  echo "fake worker CI fix pass done"
   exit 0
 fi
 if printf '%s' "$prompt" | grep -q "Fix pass"; then

@@ -8,11 +8,15 @@ import { redactViewsReason, viewsCard, viewsCardMessage, viewsDirectory } from "
 import { NEEDS_EYE_LABEL } from "./labels.ts";
 import {
  baseRedNote,
+ ciFixState,
  gatingFindings,
+ MAX_CI_FIXES,
+ recordedCiFixes,
  recordedProbes,
  recordedReviews,
  reviewAtHead,
  supersededNote,
+ workerFixableCi,
 } from "./implement.ts";
 import type { Journal, WorkerRow } from "./journal.ts";
 import { evaluateMergeGate, type MergeGateInput, type MergeGateResult } from "./merge-gate.ts";
@@ -20,7 +24,7 @@ import type { IssueComment, ChangeRequest, CiVerdict, ForgePort, MergeOutcome, R
 import { parseForgeRef } from "./forge-ref.ts";
 import { squashMessage as gitlabSquashMessage } from "./gitlab.ts";
 import { lanePort } from "./forge-lanes.ts";
-import { CI_FAILED_PARK_OUTCOME, mergeGateFailedOutcome } from "./outcomes.ts";
+import { CI_FAILED_PARK_OUTCOME, ciNotSentBackOutcome, mergeGateFailedOutcome } from "./outcomes.ts";
 import { changeRequestLabel, changeRequestNoun, forgeName } from "./forge-text.ts";
 import { closingKeywordRefusal, findClosingKeyword } from "./git-ops.ts";
 import { squashTitle } from "./github.ts";
@@ -44,7 +48,16 @@ import { squashTitle } from "./github.ts";
  * the review and probe certification recorded at that head, and no
  * ranger:needs-eye label. A merge-only move starts no worker session, so the
  * implement lane is never consulted. Anything short of that leaves it parked
- * quietly, with no send-back, no spawn and no new park card.
+ * quietly, with no new park card.
+ *
+ * A red CI with a run concluded `failure` is not left to recover by itself
+ * (soma #795/#796 sat parked on a deterministic red: their branches trailed a
+ * base that broke the check each PR added). The row, awaiting merge or
+ * CI-only parked, goes back to run-node like any send-back: it merges the
+ * base in if the base moved, else a CI fix pass reads the failed logs. The
+ * node gets MAX_CI_FIXES of them; once they are spent, or a pass at this head
+ * found nothing to change, the row parks on CI as before, and a rerun that
+ * turns CI green still moves it on.
  *
  * On a GitLab map (node #126) the desk holds the GitLab port. A project under
  * `rebase_merge` may answer `needs-rebase`: once the rest of the gate passes
@@ -335,6 +348,64 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
  }
 
  /**
+  * Send a ready (or CI-parked) change request back to run-node, which
+  * resumes in the review phase: a fix pass and a new round, only the probe
+  * step, a base merge pass and a new round, or a CI fix pass. A posted merge
+  * card is withdrawn first, so a stale "merge needed" never stands.
+  */
+ async function sendBack(row: WorkerRow, why: string, title: string): Promise<void> {
+  if (ctx.spawn === undefined || row.prNumber === null) return;
+  const cr = changeRequestLabel(repo, row.prNumber);
+  if (row.mergeMessageId !== null) {
+   try {
+    await post(
+     renderCard({
+      emoji: "↩️",
+      status: "merge card withdrawn",
+      nodeId: row.nodeId,
+      title,
+      meta: [`map: ${mapKey(map)}`],
+      lines: [`Do not merge yet: ${why}. Ranger reworks it; a new merge card follows when the ${changeRequestNoun(repo)} is clean.`],
+     }),
+     `merge card withdrawal for #${row.nodeId}`,
+    );
+   } catch {
+    result.errors.push(`#${row.nodeId}: could not post the card withdrawal — retrying next tick`);
+    return;
+   }
+   journal.updateWorker(row.nodeId, repo, { mergeMessageId: null });
+  }
+  // A send-back starts a worker session (a fix, CI fix or base merge pass, or
+  // probes): it waits for the implement lane like any other start. The stale
+  // card is already gone.
+  const lane = implementLane(map);
+  const holder = journal.laneHolder(lane, { nodeId: row.nodeId, repo });
+  if (holder !== null) {
+   result.pending.push(row.nodeId);
+   journal.recordEvent("sweep", {
+    nodeId: row.nodeId,
+    repo,
+    detail: `${cr}: ${why} — waiting for the ${lane} implement lane (held by #${holder.nodeId}, ${mapKey(holder)})`,
+   });
+   return;
+  }
+  const pid = await ctx.spawn(row.nodeId, repo, row.root);
+  if (pid === null) {
+   result.errors.push(`#${row.nodeId}: ${why}, but run-node did not spawn — retrying next tick`);
+   return;
+  }
+  // A CI-only park's outcome goes with it: the row is running again.
+  journal.updateWorker(row.nodeId, repo, { status: "running", phase: "review", pid, outcome: null, finishedAt: null });
+  recordImplementStart(journal, map);
+  journal.recordEvent("sweep", {
+   nodeId: row.nodeId,
+   repo,
+   detail: `${cr}: ${why} — run-node resumes (pid ${pid})`,
+  });
+  result.resumed.push(row.nodeId);
+ }
+
+ /**
   * Ranger's own merge of a gate-passed change at `headSha`: refuse an
   * unsquashable project, rebase when the forge asks (and stop there: the new
   * head is re-gated on a later pass, never merged in this one), else merge.
@@ -471,7 +542,8 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    return;
   }
 
-  const { last, probe, superseded, latestSha } = headEvidence(await github.listComments(repo, pr.iid, token), pr.headSha, botIdentity);
+  const comments = await github.listComments(repo, pr.iid, token);
+  const { last, probe, superseded, latestSha } = headEvidence(comments, pr.headSha, botIdentity);
   const probesRequired = map.commands.probe !== undefined;
 
   // Send a ready PR back to run-node when the rules it went ready under no
@@ -493,54 +565,10 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   const rebases = journal.listRebases(repo, row.nodeId);
   const rebased = last === undefined ? rebaseOfLatestReview(rebases, latestSha, pr.headSha) : null;
   const why = sendBackReason(repo, pr, map.base, { last, missingProbes, rebased });
-  // A send-back is a worker session; a CI-only park never starts one.
+  // A send-back is a worker session; a CI-only park starts one only for its red CI, below.
   if (ciPark && why !== null) return;
   if (why !== null && ctx.spawn !== undefined) {
-   if (row.mergeMessageId !== null) {
-    try {
-     await post(
-      renderCard({
-       emoji: "↩️",
-       status: "merge card withdrawn",
-       nodeId: row.nodeId,
-       title,
-       meta: [`map: ${mapKey(map)}`],
-       lines: [`Do not merge yet: ${why}. Ranger reworks it; a new merge card follows when the ${changeRequestNoun(repo)} is clean.`],
-      }),
-      `merge card withdrawal for #${row.nodeId}`,
-     );
-    } catch {
-     result.errors.push(`#${row.nodeId}: could not post the card withdrawal — retrying next tick`);
-     return;
-    }
-    journal.updateWorker(row.nodeId, repo, { mergeMessageId: null });
-   }
-   // A send-back starts a worker session (fix pass or probes): it waits for
-   // the implement lane like any other start. The stale card is already gone.
-   const lane = implementLane(map);
-   const holder = journal.laneHolder(lane, { nodeId: row.nodeId, repo });
-   if (holder !== null) {
-    result.pending.push(row.nodeId);
-    journal.recordEvent("sweep", {
-     nodeId: row.nodeId,
-     repo,
-     detail: `${cr}: ${why} — waiting for the ${lane} implement lane (held by #${holder.nodeId}, ${mapKey(holder)})`,
-    });
-    return;
-   }
-   const pid = await ctx.spawn(row.nodeId, repo, row.root);
-   if (pid === null) {
-    result.errors.push(`#${row.nodeId}: ${why}, but run-node did not spawn — retrying next tick`);
-    return;
-   }
-   journal.updateWorker(row.nodeId, repo, { status: "running", phase: "review", pid });
-   recordImplementStart(journal, map);
-   journal.recordEvent("sweep", {
-    nodeId: row.nodeId,
-    repo,
-    detail: `${cr}: ${why} — run-node resumes (pid ${pid})`,
-   });
-   result.resumed.push(row.nodeId);
+   await sendBack(row, why, title);
    return;
   }
   // A forge that asks for a rebase (GitLab under rebase_merge) is gated on
@@ -548,8 +576,21 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   const rebasePr = pr.mergeState === "needs-rebase" ? github.rebasePr?.bind(github) : undefined;
   const needsRebase = rebasePr !== undefined;
   const gated = needsRebase ? { ...pr, mergeState: "mergeable" as const } : pr;
-  const gate = evaluateMergeGate(gateInput(map, gated, await github.ciVerdictFor(repo, pr.headSha, token), last, probe));
+  const ci = await github.ciVerdictFor(repo, pr.headSha, token);
+  const gate = evaluateMergeGate(gateInput(map, gated, ci, last, probe));
 
+  // A red CI a worker may fix goes back to run-node while the node has CI fix
+  // passes left and none already found nothing at this head; else it parks
+  // on CI (a CI-only park stays parked, quietly).
+  if (gate.status === "fail" && gate.check === "ci-green" && workerFixableCi(ci) && ctx.spawn !== undefined) {
+   const { used, foundNothing } = ciFixState(recordedCiFixes(comments, botIdentity), pr.headSha);
+   if (!foundNothing && used < MAX_CI_FIXES) {
+    await sendBack(row, `CI is red at ${pr.headSha.slice(0, 8)} (${gate.reason})`, title);
+    return;
+   }
+   if (!ciPark) await park(row, ciNotSentBackOutcome({ reason: gate.reason, head: pr.headSha, ...(foundNothing ? {} : { spent: used }) }), title);
+   return;
+  }
   // A CI-only park stays parked, quietly, until the whole gate passes.
   if (ciPark && gate.status !== "pass") return;
   if (gate.status === "pending") {

@@ -7,10 +7,10 @@ import { stringify } from "yaml";
 import { loadConfig } from "../src/config.ts";
 import { openJournal } from "../src/journal.ts";
 import { mergeGateNow, runMergeDesk } from "../src/merge-desk.ts";
-import { probeMarker, type ForgePort } from "../src/implement.ts";
+import { ciFixMarker, probeMarker, type ForgePort } from "../src/implement.ts";
 import type { IssueComment, ChangeRequest } from "../src/forge.ts";
 import type { CheckRun } from "../src/github.ts";
-import { CI_FAILED_PARK_OUTCOME, mergeGateFailedOutcome, reviewCapOutcome } from "../src/outcomes.ts";
+import { CI_FAILED_PARK_OUTCOME, ciNotSentBackOutcome, mergeGateFailedOutcome, reviewCapOutcome } from "../src/outcomes.ts";
 
 const GAME = "acme/seelite";
 const BOT = "ivy-bot";
@@ -54,6 +54,11 @@ function fakeGitHub(opts: { head?: string; comments: IssueComment[]; ci: CheckRu
 }
 
 const GREEN: CheckRun[] = [{ id: 7, name: "deploy", status: "completed", conclusion: "success" } as CheckRun];
+const FAILING: CheckRun[] = [{ id: 9, name: "build", status: "completed", conclusion: "failure" } as CheckRun];
+/** A CI fix marker: `sha` the fix commit, `red` the head it answered (one hex char repeated, or a full SHA). */
+const ciFix = (sha: string, red: string): IssueComment => ({
+ id: 30, author: BOT, body: ciFixMarker({ sha: sha.length === 1 ? sha.repeat(40) : sha, red: red.length === 1 ? red.repeat(40) : red, reason: "CI failed: build=failure" }),
+});
 
 function rig(map: { autoMerge?: boolean; probe?: boolean } = {}) {
  const dir = mkdtempSync(join(tmpdir(), "ranger-merge-desk-"));
@@ -121,7 +126,8 @@ describe("node #104 — ci-only-park-merges-without-lane: a CI-only park merges 
  const stays: [string, Parameters<typeof fakeGitHub>[0], Parameters<typeof rig>[0]?][] = [
   ["the head moved since certification", { head: MOVED, comments: [review(CERTIFIED)], ci: GREEN }],
   ["CI cancelled again", { comments: [review(CERTIFIED)], ci: [{ id: 8, name: "deploy", status: "completed", conclusion: "cancelled" } as CheckRun] }],
-  ["CI failing", { comments: [review(CERTIFIED)], ci: [{ id: 9, name: "build", status: "completed", conclusion: "failure" } as CheckRun] }],
+  ["CI failing with its CI fix passes spent", { comments: [review(CERTIFIED), ciFix("c", "d"), ciFix("e", "f")], ci: FAILING }],
+  ["CI failing where a CI fix pass found nothing at the head", { comments: [review(CERTIFIED), ciFix(CERTIFIED, CERTIFIED)], ci: FAILING }],
   ["CI rerun still running", { comments: [review(CERTIFIED)], ci: [{ id: 10, name: "deploy", status: "in_progress", conclusion: null } as CheckRun] }],
   ["the node is labelled ranger:needs-eye", { comments: [review(CERTIFIED)], ci: GREEN, labels: ["ranger:needs-eye"] }],
   ["the node is labelled ranger:needs-eye on a manual map", { comments: [review(CERTIFIED)], ci: GREEN, labels: ["ranger:needs-eye"] }, { autoMerge: false }],
@@ -198,6 +204,84 @@ describe("node #104 — ci-only-park-merges-without-lane: a CI-only park merges 
    const result = await r.desk(gh.github);
    expect(result.parked).toEqual(["96"]);
    expect(r.journal.getWorker("96", GAME)).toMatchObject({ status: "parked", outcome: CI_PARK });
+  } finally { r.close(); }
+ });
+});
+
+describe("a red CI a worker may fix goes back to run-node (soma #795/#796)", () => {
+ test("a CI-only park whose CI fails at the head goes back to run-node, its park outcome cleared", async () => {
+  const r = rig();
+  try {
+   const gh = fakeGitHub({ comments: [review(CERTIFIED)], ci: FAILING });
+   const result = await r.desk(gh.github);
+   expect(result).toMatchObject({ resumed: ["96"], parked: [], merged: [], errors: [] });
+   expect(r.spawned).toEqual(["96"]);
+   expect(r.journal.getWorker("96", GAME)).toMatchObject({ status: "running", phase: "review", outcome: null, finishedAt: null });
+   expect(r.events("sweep").map((e) => e.detail)).toContainEqual(expect.stringContaining(`CI is red at ${CERTIFIED.slice(0, 8)} (CI failed: build=failure) — run-node resumes`));
+  } finally { r.close(); }
+ });
+
+ test("an awaiting-merge row whose CI fails goes back to run-node, its merge card withdrawn first", async () => {
+  const r = rig();
+  try {
+   r.journal.updateWorker("96", GAME, { status: "awaiting-merge", outcome: null, mergeMessageId: "card-1" });
+   const gh = fakeGitHub({ comments: [review(CERTIFIED), ciFix("c", "d")], ci: FAILING });
+   const result = await r.desk(gh.github);
+   expect(result).toMatchObject({ resumed: ["96"], parked: [] });
+   expect(r.posts[0]).toContain("merge card withdrawn");
+   expect(r.journal.getWorker("96", GAME)).toMatchObject({ status: "running", phase: "review", mergeMessageId: null });
+  } finally { r.close(); }
+ });
+
+ test("a send-back for CI waits for a held implement lane", async () => {
+  const r = rig();
+  try {
+   r.journal.upsertWorker({ root: 460, nodeId: "64", repo: GAME, lane: "implement", status: "running", phase: "review" });
+   const result = await r.desk(fakeGitHub({ comments: [review(CERTIFIED)], ci: FAILING }).github);
+   expect(result).toMatchObject({ resumed: [], pending: ["96"] });
+   expect(r.spawned).toEqual([]);
+   expect(r.journal.getWorker("96", GAME)).toMatchObject({ status: "parked", outcome: CI_PARK });
+  } finally { r.close(); }
+ });
+
+ test("an unpushed CI fix (its marker answers the live head) does not use the budget", async () => {
+  const r = rig();
+  try {
+   const gh = fakeGitHub({ comments: [review(CERTIFIED), ciFix("c", "d"), ciFix("e", CERTIFIED)], ci: FAILING });
+   expect((await r.desk(gh.github)).resumed).toEqual(["96"]);
+  } finally { r.close(); }
+ });
+
+ for (const [why, comments, outcome] of [
+  ["its CI fix passes are spent", [review(CERTIFIED), ciFix("c", "d"), ciFix("e", "f")], ciNotSentBackOutcome({ reason: "CI failed: build=failure", head: CERTIFIED, spent: 2 })],
+  ["a CI fix pass at the head found nothing", [review(CERTIFIED), ciFix(CERTIFIED, CERTIFIED)], ciNotSentBackOutcome({ reason: "CI failed: build=failure", head: CERTIFIED })],
+ ] as const) {
+  test(`an awaiting-merge row whose CI fails parks on CI when ${why}, and stays a CI-only park`, async () => {
+   const r = rig();
+   try {
+    r.journal.updateWorker("96", GAME, { status: "awaiting-merge", outcome: null });
+    const result = await r.desk(fakeGitHub({ comments: [...comments], ci: FAILING }).github);
+    expect(result).toMatchObject({ parked: ["96"], resumed: [] });
+    expect(r.spawned).toEqual([]);
+    expect(r.journal.getWorker("96", GAME)).toMatchObject({ status: "parked", outcome });
+    expect(outcome).toMatch(CI_FAILED_PARK_OUTCOME);
+    // A rerun that turns CI green moves it on, as any CI-only park.
+    const green = await r.desk(fakeGitHub({ comments: [...comments], ci: GREEN }).github);
+    expect(green.merged).toEqual(["96"]);
+   } finally { r.close(); }
+  });
+ }
+
+ test("a desk with no spawn (the dashboard's) parks a failing awaiting-merge row as before", async () => {
+  const r = rig();
+  try {
+   r.journal.updateWorker("96", GAME, { status: "awaiting-merge", outcome: null });
+   const result = await runMergeDesk({
+    config: r.config, journal: r.journal, map: r.config.maps[0], token: "unused", botIdentity: BOT,
+    github: fakeGitHub({ comments: [review(CERTIFIED)], ci: FAILING }).github, post: async () => "msg",
+   });
+   expect(result.parked).toEqual(["96"]);
+   expect(r.journal.getWorker("96", GAME)?.outcome).toBe(mergeGateFailedOutcome({ check: "ci-green", reason: "CI failed: build=failure" }));
   } finally { r.close(); }
  });
 });

@@ -11,16 +11,20 @@ import type { ChangeRequest } from "../src/forge.ts";
 import type { CheckRun } from "../src/github.ts";
 import type { FrontierEntry } from "../src/graph.ts";
 import {
+ ciFixMarker,
+ ciFixState,
  implementBranchFor,
  MAX_RULING_CHARS,
  MAX_RULINGS,
  principalRulings,
+ recordedCiFixes,
  recordedReviews,
  resolvePhase,
  reviewAtHead,
  reviewMarker,
  supersededAtHead,
  supersededNote,
+ workerFixableCi,
 } from "../src/implement.ts";
 import { FencedError, openJournal } from "../src/journal.ts";
 import { probeFailureSummary, probesFailedOutcome } from "../src/outcomes.ts";
@@ -772,5 +776,28 @@ describe("a branch far behind its base is merged up (ranger issue #231)", () => 
   const marker = baseMergeMarker("a".repeat(40), "main", { behind: 39, limit: 20 });
   expect(marker).toContain("the branch was 39 commit(s) behind origin/main (limit 20), so a worker merged it in");
   expect(marker.startsWith(`<!-- ranger:base-merge sha=${"a".repeat(40)} base=main -->`)).toBe(true);
+ });
+});
+
+describe("CI fix passes (soma #795/#796)", () => {
+ const RED = "c".repeat(40);
+ const FIX = "d".repeat(40);
+ test("only a run concluded failure is a worker's to fix", () => {
+  const red = (conclusion: string) => githubCiVerdict("acme/widgets", [...GREEN, { id: 4, name: "lint", status: "completed", conclusion }]);
+  expect(red("failure")).toMatchObject({ state: "red", failed: [{ id: 4, name: "lint", conclusion: "failure" }] });
+  expect(workerFixableCi(red("failure"))).toBe(true);
+  for (const c of ["cancelled", "timed_out", "action_required"]) expect(workerFixableCi(red(c))).toBe(false);
+  expect(workerFixableCi(githubCiVerdict("acme/widgets", GREEN))).toBe(false);
+  expect(workerFixableCi({ state: "red", reason: "pipeline 30 is failed" })).toBe(false); // no named runs (GitLab)
+ });
+ test("markers are read from the machine account only, and count fixes that moved the head off a red one", () => {
+  const marker = (sha: string, red: string, author = "ivy-bot") => ({ id: 1, author, body: ciFixMarker({ sha, red, reason: "CI failed: lint=failure" }) });
+  const fixes = recordedCiFixes([marker(FIX, RED), marker(SHA, SHA, "drive-by")], "ivy-bot");
+  expect(fixes).toEqual([{ sha: FIX, red: RED }]);
+  expect(ciFixState(fixes, FIX)).toEqual({ used: 1, foundNothing: false });
+  // A fix whose red head is still the head was never pushed: it counts for nothing.
+  expect(ciFixState(fixes, RED)).toEqual({ used: 0, foundNothing: false });
+  expect(ciFixState([...fixes, { sha: FIX, red: FIX }], FIX)).toEqual({ used: 1, foundNothing: true });
+  expect(marker(FIX, FIX).body).toContain("found nothing in the branch to change");
  });
 });
