@@ -2216,7 +2216,7 @@ describe("implement lane (node #23)", () => {
   const fix = c.prompts[1] as string;
   expect(fix).toContain("## CI fix pass");
   expect(fix).toContain(`CI failed at this branch's head \`${red.slice(0, 8)}\`: CI failed: lint=failure.`);
-  expect(fix).toContain("<ci-log>\n### lint (failure)\nsrc/feature.ts:1:1 error  no-unused-vars\n</ci-log>");
+  expect(fix).toMatch(/<ci-log-([0-9a-f-]{36})>\n### lint \(failure\)\nsrc\/feature\.ts:1:1 error  no-unused-vars\n<\/ci-log-\1>/);
   expect(c.r.github.logReads).toEqual([[202]]);
   const head = await c.r.github.sha(BRANCH);
   expect(c.markers().map((m) => m.body.split("\n")[0])).toEqual([`<!-- ranger:ci-fix sha=${head} red=${red} -->`]);
