@@ -242,11 +242,23 @@ bun src/cli.ts journal                    # inspect workers/events/health
   its thread from the deterministic drafter: the message verbatim and a link
   to it, title from its first line, parent the map root, checkpoint slugged
   from the title, autonomy `propose`, and the hash of that spec.
-  The journal keeps a cursor per thread (the first read starts it at now) and
-  one draft per message id, so a re-read posts no second card. A failed read
-  moves no cursor; a mention whose content Discord withheld stops the thread
-  there and reports it. A thread two walked maps share is skipped, not read:
+  Each card is a reply to the mention it answers. The journal keeps a cursor
+  per thread and one draft per message id, so a re-read posts no second card.
+  A failed read posts nothing and moves no cursor; a mention whose content
+  Discord withheld stops the thread there and reports it; the mentions ahead
+  of it are still drafted. A thread two walked maps share is skipped, not read:
   a draft's parent is its map's root, and a shared thread names no one map.
+- **Journal loss (node #249, #21 ruling D14, D1):** a thread with no cursor
+  is read from its oldest message, five pages per tick. A mention with no
+  journaled draft is drafted unless a ranger card replying to it says
+  "filed as #N" or "discarded"; a card still in draft does not count. A
+  mention is decided once the read saw the thread's end or a whole page run
+  past it; until then the cursor parks just before it. The worst case is a
+  visible duplicate draft, and a 👍 on it finds the intake marker and edits
+  that card to "filed as #N" without a second add. The journal cannot tell
+  a lost cursor from a thread never read, so turning intake on for a thread
+  that already holds the principal's @-mentions of the bot drafts each one no
+  ranger card has answered: one card per past mention, filed only on a 👍.
 - **Claude drafter (node #252, #21 ruling D12):** with spawn budget left, one
   tool-less `claude -p` call on `intake.model` (default `haiku`) drafts the
   title, parent, checkpoint, kind, autonomy and probes from the message and
