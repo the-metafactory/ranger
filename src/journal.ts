@@ -310,6 +310,7 @@ export class Journal {
   opened?: { db: RangerDb; close: () => void },
   private readonly maps: readonly LaneMap[] = [],
   legacyMapRoots: Readonly<Record<string, number>> = {},
+  private readonly laneSlots: Partial<Record<ImplementLane, number>> = {},
  ) {
   // Under test, the live journal is out of reach (node #66).
   assertNotLiveJournalUnderTest(expandHome(path));
@@ -324,9 +325,13 @@ export class Journal {
   * `null` when no journal exists yet. Calling a write method on it throws
   * SQLITE_READONLY rather than touching the file.
   */
- static openReadOnly(path: string, maps: readonly LaneMap[] = []): Journal | null {
+ static openReadOnly(
+  path: string,
+  maps: readonly LaneMap[] = [],
+  laneSlots: Partial<Record<ImplementLane, number>> = {},
+ ): Journal | null {
   const opened = openDbReadOnly(path);
-  return opened === null ? null : new Journal(path, opened, maps);
+  return opened === null ? null : new Journal(path, opened, maps, {}, laneSlots);
  }
 
  // ---- workers ----
@@ -443,7 +448,9 @@ export class Journal {
  }
 
  /**
-  * One claimed/running implement worker per resource lane across all maps.
+  * A resource lane holds `workers.laneSlots` claimed/running implement
+  * workers across all maps (default one). Returns the first occupant once
+  * every slot is taken, null while one is free.
   * Excluding an occupant requires its repo as well as node id.
   * Unknown or ambiguous maps conservatively hold both resource lanes.
   */
@@ -452,15 +459,14 @@ export class Journal {
   except?: { nodeId: string; repo: string },
   isActive: (worker: WorkerRow) => boolean = () => true,
  ): WorkerRow | null {
-  return (
-   this.listWorkers().find((w) => {
-    if (w.nodeId === except?.nodeId && w.repo === except?.repo) return false;
-    if (!holdsImplementLane(w)) return false;
-    if (!isActive(w)) return false;
-    const resource = workerLane(w, this.maps);
-    return resource === lane || resource === null;
-   }) ?? null
-  );
+  const occupants = this.listWorkers().filter((w) => {
+   if (w.nodeId === except?.nodeId && w.repo === except?.repo) return false;
+   if (!holdsImplementLane(w)) return false;
+   if (!isActive(w)) return false;
+   const resource = workerLane(w, this.maps);
+   return resource === lane || resource === null;
+  });
+  return occupants.length >= (this.laneSlots[lane] ?? 1) ? occupants[0] : null;
  }
 
  getWorker(nodeId: string, repo: string): WorkerRow | null {
@@ -1481,5 +1487,5 @@ function hydrateSubstrateReading(row: {
 
 /** Open the configured journal (default from config.state.journalPath). */
 export function openJournal(config: RangerConfig): Journal {
- return new Journal(expandHome(config.state.journalPath), undefined, config.maps, config.state.legacyMapRoots);
+ return new Journal(expandHome(config.state.journalPath), undefined, config.maps, config.state.legacyMapRoots, config.workers.laneSlots);
 }

@@ -108,6 +108,11 @@ state:
 workers:
   # Daily worker-spawn cap — the global spend bound (design §7).
   spawnCapPerDay: 10
+  # Concurrent implement workers per resource lane, across all maps. The
+  # walk claims at most one per lane per tick, so a second slot fills next tick.
+  laneSlots:
+    visual: 1
+    headless: 1
   # Hard wall-clock kill per worker, minutes (design §4 NodeBudget).
   wallClockMin: 90
   # Respawn attempts before a crashed worker is parked + claim released.

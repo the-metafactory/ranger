@@ -1755,7 +1755,7 @@ export async function readPrLive(
 /** The node's current worker log file, by the journal's row, or null with no row. */
 function workerLogOf(config: RangerConfig, repo: string, nodeId: string): string | null {
  const journalPath = expandHome(config.state.journalPath);
- const journal = Journal.openReadOnly(journalPath, config.maps);
+ const journal = Journal.openReadOnly(journalPath, config.maps, config.workers.laneSlots);
  if (journal === null) return null;
  try {
   const row = journal.getWorker(nodeId, repo);
@@ -1940,7 +1940,7 @@ export function stateFromJournal(
  reader: ServeReader,
  now = new Date(),
 ): DashboardState {
- const journal = Journal.openReadOnly(expandHome(config.state.journalPath), config.maps);
+ const journal = Journal.openReadOnly(expandHome(config.state.journalPath), config.maps, config.workers.laneSlots);
  try {
   const registry = loadProbeRegistry();
   const reports = new Map<string, MapRead>();
