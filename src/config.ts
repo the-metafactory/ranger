@@ -350,6 +350,12 @@ const RatifySchema = z.object({
  readsPerTick: z.number().int().positive().default(10),
 });
 
+/** Human-observation intake (node #252, #21 ruling D12). */
+const IntakeSchema = z.object({
+ /** The model the drafter's one-shot `claude -p` call runs (default haiku). */
+ model: z.string().regex(MODEL_NAME, "a plain model name ([A-Za-z0-9._-])").default("haiku"),
+});
+
 const RangerConfigSchema = z.object({
  version: z.literal(1).default(1),
  maps: z.array(MapSchema).min(1, "at least one map must be registered"),
@@ -360,6 +366,7 @@ const RangerConfigSchema = z.object({
  workers: WorkersSchema.default({}),
  budget: BudgetSchema.default({}),
  ratify: RatifySchema.default({}),
+ intake: IntakeSchema.default({}),
  substrates: SubstratesSchema.default({}),
  serve: ServeSchema.optional(),
 });

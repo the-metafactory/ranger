@@ -30,6 +30,13 @@ ci=""
 propose=""
 body_file=""
 proposal_comment=""
+title=""
+autonomy=""
+body=""
+parent=""
+labels=""
+kind=""
+probes=""
 evidence_file="$(mktemp)"
 i=4
 while [ $i -le $# ]; do
@@ -46,6 +53,13 @@ while [ $i -le $# ]; do
     --body-file) i=$((i+1)); body_file="${!i}" ;;
     --proposal-comment) i=$((i+1)); proposal_comment="${!i}" ;;
     --evidence) i=$((i+1)); printf "%s\n" "${!i}" >> "$evidence_file" ;;
+    --title) i=$((i+1)); title="${!i}" ;;
+    --autonomy) i=$((i+1)); autonomy="${!i}" ;;
+    --body) i=$((i+1)); body="${!i}" ;;
+    --parent) i=$((i+1)); parent="${!i}" ;;
+    --label) i=$((i+1)); labels="${labels}${!i}"$'\n' ;;
+    --kind) i=$((i+1)); kind="${!i}" ;;
+    --probe) i=$((i+1)); probes="${probes}${!i}"$'\n' ;;
     --write) : ;;
     --dry-run) : ;;
   esac
@@ -140,7 +154,9 @@ export FAKE_SOMA_STATE FAKE_SOMA_REPO_DIR FAKE_SOMA_IDENTITY="$identity" \
   FAKE_SOMA_GIST="$gist" FAKE_SOMA_CHECKPOINT="$checkpoint" FAKE_SOMA_RESOLUTION_FILE="${resolution_file:-}" \
   FAKE_SOMA_CI="$ci" FAKE_SOMA_EVIDENCE_FILE="$evidence_file" \
   FAKE_SOMA_PROPOSE="$propose" FAKE_SOMA_BODY_FILE="$body_file" \
-  FAKE_SOMA_PROPOSAL_COMMENT="$proposal_comment"
+  FAKE_SOMA_PROPOSAL_COMMENT="$proposal_comment" \
+  FAKE_SOMA_TITLE="$title" FAKE_SOMA_AUTONOMY="$autonomy" FAKE_SOMA_BODY="$body" \
+  FAKE_SOMA_PARENT="$parent" FAKE_SOMA_LABELS="$labels" FAKE_SOMA_KIND="$kind" FAKE_SOMA_PROBES="$probes"
 
 # A test can make the map-index write fail the way it did live (node #108).
 if [ "$verb" = "decisions" ] && [ -n "${FAKE_SOMA_DECISIONS_FAIL:-}" ]; then
@@ -161,7 +177,7 @@ if [ "$verb" = "claim" ] && [ -n "${FAKE_SOMA_CLAIM_REFUSE:-}" ]; then
 fi
 
 case "$verb" in
-  claim|release|close|decisions)
+  claim|release|close|decisions|add|link)
     python3 - "$verb" "$root" "$repo" <<'PY'
 import json, os, subprocess, sys
 
@@ -171,12 +187,64 @@ identity = os.environ.get("FAKE_SOMA_IDENTITY", "")
 
 with open(state_path) as fh:
     s = json.load(fh)
-nodes = s.setdefault("nodes", {})
-node = nodes.setdefault(nid, {"assignees": [], "status": "open", "probes": []})
 
 def save():
     with open(state_path, "w") as fh:
         json.dump(s, fh, indent=2)
+
+if verb == "add":
+    # `graph add <parent>` (node #251): a new issue in state.issues, listed by
+    # fake gh's labelled-issue read. FAKE_SOMA_ADD_FAIL=exit fails with no
+    # payload; =unattached creates the node and leaves it below no parent.
+    fail = os.environ.get("FAKE_SOMA_ADD_FAIL", "")
+    if fail == "exit":
+        print("fake soma: add failed (HTTP 502)", file=sys.stderr)
+        sys.exit(1)
+    issues = s.setdefault("issues", {})
+    number = s.get("nextIssue", 100)
+    s["nextIssue"] = number + 1
+    issues[str(number)] = {
+        "number": number,
+        "parent": nid if fail != "unattached" else None,
+        "title": os.environ.get("FAKE_SOMA_TITLE", ""),
+        "autonomy": os.environ.get("FAKE_SOMA_AUTONOMY", ""),
+        "checkpoint": os.environ.get("FAKE_SOMA_CHECKPOINT", ""),
+        "labels": [l for l in os.environ.get("FAKE_SOMA_LABELS", "").split("\n") if l],
+        "body": os.environ.get("FAKE_SOMA_BODY", ""),
+        "machineAccount": os.environ.get("GH_TOKEN", "") == "ghp_write",
+    }
+    # Kind and probes (node #252) are recorded only when the add passed them.
+    if os.environ.get("FAKE_SOMA_KIND", ""):
+        issues[str(number)]["kind"] = os.environ["FAKE_SOMA_KIND"]
+    probes = [json.loads(p) for p in os.environ.get("FAKE_SOMA_PROBES", "").split("\n") if p]
+    if probes:
+        issues[str(number)]["probes"] = probes
+    save()
+    if fail == "unattached":
+        print(json.dumps({"repo": repo, "node": str(number), "parent": nid, "attached": False}), file=sys.stderr)
+        sys.exit(1)
+    print(json.dumps({"repo": repo, "node": str(number), "parent": nid, "attached": True}))
+    sys.exit(0)
+
+if verb == "link":
+    # FAKE_SOMA_LINK_FAIL=exit fails the attach (node #251's unattached repair).
+    if os.environ.get("FAKE_SOMA_LINK_FAIL", "") == "exit":
+        print("fake soma: link failed (HTTP 502)", file=sys.stderr)
+        sys.exit(1)
+    issue = s.setdefault("issues", {}).get(nid)
+    if issue is None:
+        print(f"fake soma: no node {nid}", file=sys.stderr)
+        sys.exit(1)
+    parent = os.environ.get("FAKE_SOMA_PARENT", "")
+    status = "already" if issue.get("parent") == parent else "attached"
+    issue["parent"] = parent
+    s.setdefault("links", []).append({"node": nid, "parent": parent})
+    save()
+    print(json.dumps({"repo": repo, "node": nid, "parent": parent, "parentStatus": status}))
+    sys.exit(0)
+
+nodes = s.setdefault("nodes", {})
+node = nodes.setdefault(nid, {"assignees": [], "status": "open", "probes": []})
 
 if verb == "claim":
     if node.get("assignees"):

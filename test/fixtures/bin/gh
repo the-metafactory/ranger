@@ -71,6 +71,10 @@ EOF
     fi
     exit 0
     ;;
+  repos/*/issues\?labels=*)
+    # The intake gate's marker lookup (node #251): issues by label, every page.
+    exec bun "$(dirname "$0")/intake-gh.ts" "$path" "${@:3}"
+    ;;
   repos/*/issues\?*)
     # The frontier cache's sentinel, first half: the newest issue updated_at.
     [ -n "${FAKE_GH_SENTINEL_FAIL:-}" ] && { echo "fake gh: sentinel down" >&2; exit 1; }
