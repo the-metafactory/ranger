@@ -247,6 +247,20 @@ bun src/cli.ts journal                    # inspect workers/events/health
   moves no cursor; a mention whose content Discord withheld stops the thread
   there and reports it. A thread two walked maps share is skipped, not read:
   a draft's parent is its map's root, and a shared thread names no one map.
+- **Claude drafter (node #252, #21 ruling D12):** with spawn budget left, one
+  tool-less `claude -p` call on `intake.model` (default `haiku`) drafts the
+  title, parent, checkpoint, kind, autonomy and probes from the message and
+  the map's open nodes (the root and the frontier the walk cached), charged to
+  the spawn ledger. The message and node titles reach the model only as JSON
+  data; the answer is parsed, never run. The parent must be one of those open
+  nodes, autonomy `auto`/`propose`/`approve`, kind one of
+  research/prototype/grilling/task/build, the checkpoint a slug, and each
+  probe a soma probe. A spent budget, a call that fails, times out or returns
+  non-JSON, or any field that fails falls back to the whole deterministic
+  draft; the card says "drafted by claude" or "deterministic draft" and why.
+  With too little of the pass left for a call, the rest of the thread waits
+  for the next tick. The journal records the whole drafted spec (migration
+  0025).
 - **Acceptance (e2e):** an auto research node walked end-to-end against fake
   soma/gh/worker fixtures — claim → worktree → findings branch pushed → draft
   PR → successful CI citation → gated close → `decisions --write`. Live close

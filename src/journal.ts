@@ -167,6 +167,12 @@ export interface IntakeDraftRow {
  body: string;
  messageUrl: string;
  drafter: string;
+ /** The drafted spec beyond title and checkpoint (node #252); null on rows before it. */
+ parent: number | null;
+ autonomy: string | null;
+ kind: string | null;
+ /** JSON array of soma probes. */
+ probes: string | null;
  cardMessageId: string;
  status: string;
  createdAt: string;

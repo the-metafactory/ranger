@@ -11,7 +11,7 @@ import { LeaseLostError, withEscalateLock, type OwnedCheck } from "./lock.ts";
 import { assertReadOnlyToken, type ResolvedToken } from "./token-gate.ts";
 import type { NodeResult } from "./graph.ts";
 import { BudgetDeferral } from "./budget.ts";
-import { code, renderCard, sanitizeGraphText } from "./card-render.ts";
+import { code, oneLine, renderCard, sanitizeGraphText } from "./card-render.ts";
 import { PROPOSAL_MISSING } from "./ratify.ts";
 
 /** The per-tick request budget (round-21) — split into two lanes so NEITHER
@@ -1047,13 +1047,30 @@ export function ageText(
 
 /**
  * The draft node card of a principal observation (node #247, ruling D12): the
- * proposed spec on the subtext line, which drafter wrote it, the principal's
- * message as the body, and a link back to it. Nothing is filed yet.
+ * proposed spec on the subtext line, which drafter wrote it ("drafted by
+ * claude" or "deterministic draft", node #252), the principal's message as
+ * the body, and a link back to it. Nothing is filed yet.
  */
 export function draftCardContent(
   map: { repo: string; root: number },
-  draft: { title: string; parent: number; checkpoint: string; autonomy: string; drafter: string; body: string; messageUrl: string },
+  draft: {
+    title: string;
+    parent: number;
+    checkpoint: string;
+    autonomy: string;
+    drafter: string;
+    kind?: string;
+    probes?: readonly unknown[];
+    /** The model a claude draft ran on. */
+    model?: string;
+    /** Why claude did not draft it, on a deterministic draft that fell back. */
+    fallback?: string;
+    body: string;
+    messageUrl: string;
+  },
 ): string {
+  const deterministic = draft.drafter === "deterministic";
+  const probes = draft.probes ?? [];
   return renderCard({
     ...CARD_HEADS.draft!,
     title: draft.title,
@@ -1061,14 +1078,19 @@ export function draftCardContent(
       `map: ${mapKey(map)}`,
       `parent #${draft.parent}`,
       `checkpoint ${code(draft.checkpoint)}`,
+      draft.kind === undefined ? null : `kind ${draft.kind}`,
       `autonomy ${draft.autonomy}`,
-      `${draft.drafter} draft`,
+      deterministic ? "deterministic draft" : `drafted by ${draft.drafter}`,
     ],
-    lines: [
-      draft.drafter === "deterministic"
-        ? "Deterministic draft: the title is the first line of your message, the checkpoint is slugged from it, and the body is your message verbatim. Not filed yet."
-        : `${sanitizeGraphText(draft.drafter)} draft. Not filed yet.`,
-    ],
+    lines: deterministic
+      ? [
+          "Deterministic draft: the title is the first line of your message, the checkpoint is slugged from it, and the body is your message verbatim. Not filed yet.",
+          ...(draft.fallback === undefined ? [] : [`Claude did not draft it: ${sanitizeGraphText(draft.fallback)}.`]),
+        ]
+      : [
+          `Drafted by ${sanitizeGraphText(draft.drafter)}${draft.model === undefined ? "" : ` (${sanitizeGraphText(draft.model)})`} from your message and the map's open nodes. Not filed yet.`,
+          probes.length === 0 ? "No probes." : `Probes: ${probes.map((probe) => code(oneLine(JSON.stringify(probe), 200))).join(", ")}`,
+        ],
     body: draft.body,
     // The tail survives every cut, so the link back always shows.
     tail: `From your message: <${draft.messageUrl}>`,

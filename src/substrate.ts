@@ -370,6 +370,39 @@ export async function probeClaudeQuota(opts: { timeoutMs?: number } = {}): Promi
  );
 }
 
+/** A one-shot `claude -p` turn: the prompt in, the exit and output back (tests inject a fake). */
+export type ClaudeOneShot = (prompt: string, opts: { model: string; timeoutMs: number }) => Promise<RunResult>;
+
+/**
+ * One tool-less `claude -p` turn (node #252, the intake drafter). Like the
+ * quota probe it runs in a fresh private scratch dir with the worker host env,
+ * and it loads no user settings or hooks, no MCP servers, no skills and no
+ * tools: the turn can only answer in text, which the caller parses and never
+ * runs. `--output-format json` wraps that text in a result envelope.
+ */
+export async function claudeOneShot(prompt: string, opts: { model: string; timeoutMs: number }): Promise<RunResult> {
+ const scratch = mkdtempSync(join(tmpdir(), "ranger-oneshot-"));
+ try {
+  return await runCmd(
+   "claude",
+   [
+    // The prompt follows -p at once: `--tools` takes a list and would swallow a later positional.
+    "-p", prompt,
+    "--model", opts.model,
+    "--output-format", "json",
+    "--tools", "",
+    "--strict-mcp-config",
+    "--disable-slash-commands",
+    "--no-session-persistence",
+    "--setting-sources", "project",
+   ],
+   { cwd: scratch, env: workerHostEnv(), timeoutMs: opts.timeoutMs },
+  );
+ } finally {
+  rmSync(scratch, { recursive: true, force: true });
+ }
+}
+
 // ---- reading persistence ----
 
 /**
