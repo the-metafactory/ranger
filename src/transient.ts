@@ -23,8 +23,11 @@ const TRANSIENT = [
  // gh's own "no network" message (2026-10-13: soma #795 and #796 parked their
  // closes on it). Anchored to GitHub's host: a test may say "error connecting to".
  /\berror connecting to (?:api\.)?github\.com\b/i,
- // Go's dial errors, as gh and glab print them: the forge did not answer.
- /\bdial tcp\b[^\n]*\b(?:connection refused|no such host|network is unreachable|connection reset by peer)\b/i,
+ // Go's dial errors as gh and glab print them, after the forge URL they asked
+ // for: GitHub's hosts, or a GitLab API path on any host. Bare, a dial error
+ // is a test's too (an integration test's local NATS refusing), and counts.
+ /"https:\/\/(?:(?:api\.)?github\.com\/|[\w.-]+(?::\d+)?\/api\/v4\/)[^"\s]*":\s*dial tcp\b[^\n]*\b(?:connection refused|no such host|network is unreachable|connection reset by peer)\b/i,
+ /\bdial tcp: lookup (?:api\.)?github\.com\b/i,
 ];
 
 export function isTransientGitHubError(text: string): boolean {

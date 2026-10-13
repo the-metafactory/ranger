@@ -29,7 +29,11 @@ export interface ChangeRequest {
 export type CiPurpose = "merge" | "close" | "research";
 export type CiVerdict =
  | { state: "green"; runId: number; runUrl: string; runName: string; snapshot: string }
- /** `noRuns`: pending only because no CI run exists on the head at all (the merge desk's no-CI send-back). */
+ /**
+  * `noRuns`: pending only because no CI run exists on the head at all (no
+  * check run on GitHub, no push or merge_request_event pipeline on GitLab);
+  * the merge desk's no-CI send-back reads it.
+  */
  | { state: "red" | "pending"; reason: string; noRuns?: true };
 
 export interface IssueComment {

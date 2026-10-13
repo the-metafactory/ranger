@@ -254,24 +254,29 @@ export async function mergeGateNow(
  return evaluateMergeGate(gateInput(map, pr, await github.ciVerdictFor(map.repo, pr.headSha, token), last, probe));
 }
 
-/** Rows the desk watches: awaiting a merge, or parked with a PR the principal may still merge. */
+/**
+ * Rows the desk watches: awaiting a merge, or parked or failed with a PR the
+ * principal may still merge. A failed row moves on the merge alone
+ * (2026-10-13: myelin #324 failed, the principal merged its PR, and with the
+ * queued resume dropped as "PR is merged" nothing ran the close).
+ */
 export function watchedByMergeDesk(w: WorkerRow): boolean {
  return (
   w.status === "awaiting-merge" ||
-  (w.status === "parked" && w.lane === "implement" && w.prNumber !== null && !closeRefusedPark(w))
+  ((w.status === "parked" || w.status === "failed") && w.lane === "implement" && w.prNumber !== null && !closeRefused(w))
  );
 }
 
 /**
- * A row whose close already ran on its merge and was refused for a reason a
+ * A row whose close already ran on its merge and stopped for a reason a
  * re-run repeats: a probe outside the probe tree, a probe that fails, no CI
- * to cite. The desk leaves it parked; only an operator resume re-runs the
- * close (2026-10-13: soma #795 and #796 and reflex #35 re-ran their closes,
- * and soma's test suite, every tick). A close parked on a transient forge
- * error is still re-run on the next tick.
+ * to cite. The desk leaves it be; only an operator resume re-runs the close
+ * (2026-10-13: soma #795 and #796 and reflex #35 re-ran their closes, and
+ * soma's test suite, every tick). A close stopped by a transient forge error
+ * is still re-run on the next tick.
  */
-export function closeRefusedPark(w: WorkerRow): boolean {
- return w.status === "parked" && w.phase === "close" && !isTransientGitHubError(w.outcome ?? "");
+export function closeRefused(w: WorkerRow): boolean {
+ return (w.status === "parked" || w.status === "failed") && w.phase === "close" && !isTransientGitHubError(w.outcome ?? "");
 }
 
 /** A row the merge desk parked on CI alone, in its awaiting-merge phase (node #104). */
@@ -484,6 +489,30 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   return null;
  }
 
+ /**
+  * Why a ready change request goes back to run-node: sendBackReason's cause,
+  * else a head no CI ran on (noCiStep). That one is asked only of a row that
+  * is no CI-only park, nothing else sends back, and whose gate would wait on
+  * CI alone; its CI read is returned for the gate to reuse.
+  */
+ async function sendBackFor(
+  row: WorkerRow,
+  pr: ChangeRequest,
+  title: string,
+  at: { reason: string | null; ciPark: boolean; last: Review | undefined; probe: Probe | undefined },
+ ): Promise<{ why: string | null; ci?: CiVerdict; noCi: boolean }> {
+  if (at.reason !== null || at.ciPark) return { why: at.reason, noCi: false };
+  const ci = await github.ciVerdictFor(repo, pr.headSha, token);
+  // As the gate below reads it: a rebase the forge asks for waits on the rest of the gate.
+  const gated = pr.mergeState === "needs-rebase" && github.rebasePr !== undefined ? { ...pr, mergeState: "mergeable" as const } : pr;
+  const waits = evaluateMergeGate(gateInput(map, gated, ci, at.last, at.probe));
+  if (ci.state !== "pending" || ci.noRuns !== true || waits.status !== "pending" || waits.check !== "ci-green") {
+   return { why: null, ci, noCi: false };
+  }
+  const why = await noCiStep(row, pr, title);
+  return { why, ci, noCi: why !== null };
+ }
+
  async function progress(row: WorkerRow): Promise<void> {
   if (row.prNumber === null) {
    await park(row, `awaiting merge with no ${changeRequestNoun(repo)} recorded — journal and ${forgeName(repo)} disagree`, `node ${row.nodeId}`);
@@ -520,7 +549,9 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    return;
   }
 
-  // A parked row moves only on a merge, or (a CI-only park) on CI recovering.
+  // A parked row moves only on a merge, or (a CI-only park) on CI recovering;
+  // a failed row only on a merge.
+  if (row.status === "failed") return;
   const ciPark = row.status === "parked" && ciOnlyPark(row);
   if (row.status === "parked" && (!ciPark || pr.state === "closed")) return;
 
@@ -550,21 +581,10 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   // Ranger's recorded rebases, newest first, read once for this row.
   const rebases = journal.listRebases(repo, row.nodeId);
   const rebased = last === undefined ? rebaseOfLatestReview(rebases, latestSha, pr.headSha) : null;
-  let why = sendBackReason(repo, pr, map.base, { last, missingProbes, rebased });
+  const reason = sendBackReason(repo, pr, map.base, { last, missingProbes, rebased });
   // A send-back is a worker session; a CI-only park never starts one.
-  if (ciPark && why !== null) return;
-  // A head no CI ran on at all goes back too, once nothing else sends it back
-  // and the gate would wait on that alone (noCiStep). The gate reuses the read.
-  let ci: CiVerdict | undefined;
-  let noCi = false;
-  if (why === null && !ciPark) {
-   ci = await github.ciVerdictFor(repo, pr.headSha, token);
-   const waits = evaluateMergeGate(gateInput(map, pr, ci, last, probe));
-   if (ci.state === "pending" && ci.noRuns === true && waits.status === "pending" && waits.check === "ci-green") {
-    why = await noCiStep(row, pr, title);
-    noCi = why !== null;
-   }
-  }
+  if (ciPark && reason !== null) return;
+  const { why, ci, noCi } = await sendBackFor(row, pr, title, { reason, ciPark, last, probe });
   if (why !== null && ctx.spawn !== undefined) {
    if (row.mergeMessageId !== null) {
     try {

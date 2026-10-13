@@ -238,7 +238,7 @@ export class GitLabReadPort implements ForgeReadPort<ResolvedToken> {
    // The API orders ids descending, so later pages cannot supersede this page.
    if (latest !== undefined) break;
   }
-  if (latest === undefined) return { state: "pending", reason: "no push or merge_request_event pipeline on the head" };
+  if (latest === undefined) return { state: "pending", reason: "no push or merge_request_event pipeline on the head", noRuns: true };
   if (latest.status === "success") return {
    state: "green", runId: latest.id, runUrl: latest.url, runName: `pipeline ${latest.id}`, snapshot: `${latest.id}@${sha}`,
   };

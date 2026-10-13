@@ -469,10 +469,12 @@ describe("resume-queue-starts-when-lane-frees", () => {
     const spawned: string[] = [];
     await walk({ ...r, github, spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; } });
     // An in-flight implement row still holds the lane after its queue entry is dropped.
-    expect(spawned).toEqual(["claimed", "running"].includes(reason) ? [] : ["41"]);
+    // A failed row whose PR merged gets its close from the merge desk (myelin #324).
+    expect(spawned).toEqual(["claimed", "running"].includes(reason) ? [] : reason === "PR merged" ? ["40", "41"] : ["41"]);
     expect(r.journal.listResumeQueue().some(e => e.nodeId === "40")).toBe(false);
     const event = r.journal.listEvents(REPO).find(e => e.kind === "resume-dropped" && e.nodeId === "40");
-    expect(event?.detail).toContain(reason === "walk none" ? "walk: none" : reason.split(" ").at(-1)!);
+    // The desk runs first, so the merged row's close is already running when the queue reads it.
+    expect(event?.detail).toContain(reason === "walk none" ? "walk: none" : reason === "PR merged" ? "running" : reason.split(" ").at(-1)!);
    });
   });
  }
@@ -529,7 +531,9 @@ describe("resume-queue-starts-when-lane-frees", () => {
     expect(r.journal.getWorker("40", REPO)?.status).toBe("failed");
     expect(r.journal.getWorker("41", REPO)?.status).toBe("parked");
     expect(r.journal.spawnsToday(NOW)).toBe(1);
-    expect(reads).toBe(failure === "PR" ? attempt + 1 : 0);
+    // The desk reads the failed row's PR each tick (it may yet be merged), and
+    // the queue's validation shares that read.
+    expect(reads).toBe(attempt + 1);
    }
    expect(r.journal.listEvents(REPO).some(e => e.kind === "resume-dropped")).toBe(false);
    const event = r.journal.listEvents(REPO).find(e => e.kind === "sweep" && e.detail?.includes("queued resume #40 deferred"));
