@@ -1,5 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { Database } from "bun:sqlite";
+import { drizzle } from "drizzle-orm/bun-sqlite";
+import { migrate } from "drizzle-orm/bun-sqlite/migrator";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig, type RangerConfig } from "../src/config.ts";
@@ -9,7 +12,7 @@ import type { FrontierEntry } from "../src/graph.ts";
 import { buildDraft, draftPrompt, openSubtree, parseClaudeDraft, type DraftSpec, type SubtreeNode } from "../src/intake.ts";
 import { Journal } from "../src/journal.ts";
 import type { ClaudeOneShot } from "../src/substrate.ts";
-import { baseConfigLines, FAKE_BOT_ID } from "./support.ts";
+import { baseConfigLines, claudeEnvelope as envelope, FAKE_BOT_ID } from "./support.ts";
 
 /**
  * The intake draft builder (node #252, #21 ruling D12): one `claude -p` call
@@ -69,11 +72,6 @@ function cacheFrontier(entries: FrontierEntry[]): void {
   frontierCacheKey(MAP.repo, MAP.root),
   JSON.stringify({ sentinel: "s", fetchedAt: new Date().toISOString(), frontier: { repo: MAP.repo, root: "1", frontier: entries } }),
  );
-}
-
-/** The `--output-format json` envelope around a model answer. */
-function envelope(answer: unknown): string {
- return JSON.stringify({ type: "result", subtype: "success", is_error: false, result: typeof answer === "string" ? answer : JSON.stringify(answer) });
 }
 
 const GOOD: Omit<DraftSpec, "drafter"> = {
@@ -275,5 +273,37 @@ describe("the open subtree", () => {
 
  test("no cached frontier: only the root", () => {
   expect(openSubtree(journal, MAP)).toEqual([{ id: 1, title: "(the map root)" }]);
+ });
+});
+
+describe("migration 0026 (node #252)", () => {
+ test("a journal migrated through main's 0025_intake-gate gains kind and probes, its drafts kept", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ranger-intake-migration-"));
+  try {
+   // The journal as main left it: every migration up to and including 0025_intake-gate.
+   const source = join(import.meta.dir, "../drizzle");
+   const partial = join(dir, "drizzle"); mkdirSync(join(partial, "meta"), { recursive: true });
+   const manifest = JSON.parse(readFileSync(join(source, "meta/_journal.json"), "utf8"));
+   const upTo = manifest.entries.findIndex((e: { tag: string }) => e.tag === "0025_intake-gate");
+   expect(upTo).toBeGreaterThan(0);
+   expect(manifest.entries[upTo + 1].tag).toBe("0026_intake-draft-spec");
+   manifest.entries = manifest.entries.slice(0, upTo + 1);
+   writeFileSync(join(partial, "meta/_journal.json"), JSON.stringify(manifest));
+   for (const entry of manifest.entries) copyFileSync(join(source, `${entry.tag}.sql`), join(partial, `${entry.tag}.sql`));
+   const sqlite = new Database(join(dir, "journal.sqlite"));
+   // A new journal seeds this (empty) before migrating; 0009_worker-root requires it.
+   sqlite.run("CREATE TABLE ranger_legacy_roots (repo text PRIMARY KEY, root integer NOT NULL)");
+   migrate(drizzle(sqlite), { migrationsFolder: partial });
+   sqlite.run(`INSERT INTO intake_drafts (message_id, channel_id, repo, root, author_id, title, checkpoint, body, message_url,
+    drafter, card_message_id, created_at, parent, autonomy) VALUES ('m1', 'c1', 'acme/widgets', 1, 'a1', 't', 'c', 'b', 'u',
+    'deterministic', 'card1', '2026-10-13T00:00:00Z', 1, 'propose')`);
+
+   // This code's migrations run on top: only 0026's two columns are new.
+   migrate(drizzle(sqlite), { migrationsFolder: source });
+   const columns = (sqlite.query("PRAGMA table_info(intake_drafts)").all() as { name: string }[]).map(c => c.name);
+   expect(columns).toEqual(expect.arrayContaining(["spec_hash", "filed_node", "gate_read_at", "parent", "autonomy", "kind", "probes"]));
+   expect(sqlite.query("SELECT message_id, kind, probes FROM intake_drafts").all()).toEqual([{ message_id: "m1", kind: null, probes: null }]);
+   sqlite.close();
+  } finally { rmSync(dir, { recursive: true, force: true }); }
  });
 });

@@ -35,6 +35,8 @@ autonomy=""
 body=""
 parent=""
 labels=""
+kind=""
+probes=""
 evidence_file="$(mktemp)"
 i=4
 while [ $i -le $# ]; do
@@ -56,6 +58,8 @@ while [ $i -le $# ]; do
     --body) i=$((i+1)); body="${!i}" ;;
     --parent) i=$((i+1)); parent="${!i}" ;;
     --label) i=$((i+1)); labels="${labels}${!i}"$'\n' ;;
+    --kind) i=$((i+1)); kind="${!i}" ;;
+    --probe) i=$((i+1)); probes="${probes}${!i}"$'\n' ;;
     --write) : ;;
     --dry-run) : ;;
   esac
@@ -152,7 +156,7 @@ export FAKE_SOMA_STATE FAKE_SOMA_REPO_DIR FAKE_SOMA_IDENTITY="$identity" \
   FAKE_SOMA_PROPOSE="$propose" FAKE_SOMA_BODY_FILE="$body_file" \
   FAKE_SOMA_PROPOSAL_COMMENT="$proposal_comment" \
   FAKE_SOMA_TITLE="$title" FAKE_SOMA_AUTONOMY="$autonomy" FAKE_SOMA_BODY="$body" \
-  FAKE_SOMA_PARENT="$parent" FAKE_SOMA_LABELS="$labels"
+  FAKE_SOMA_PARENT="$parent" FAKE_SOMA_LABELS="$labels" FAKE_SOMA_KIND="$kind" FAKE_SOMA_PROBES="$probes"
 
 # A test can make the map-index write fail the way it did live (node #108).
 if [ "$verb" = "decisions" ] && [ -n "${FAKE_SOMA_DECISIONS_FAIL:-}" ]; then
@@ -209,6 +213,12 @@ if verb == "add":
         "body": os.environ.get("FAKE_SOMA_BODY", ""),
         "machineAccount": os.environ.get("GH_TOKEN", "") == "ghp_write",
     }
+    # Kind and probes (node #252) are recorded only when the add passed them.
+    if os.environ.get("FAKE_SOMA_KIND", ""):
+        issues[str(number)]["kind"] = os.environ["FAKE_SOMA_KIND"]
+    probes = [json.loads(p) for p in os.environ.get("FAKE_SOMA_PROBES", "").split("\n") if p]
+    if probes:
+        issues[str(number)]["probes"] = probes
     save()
     if fail == "unattached":
         print(json.dumps({"repo": repo, "node": str(number), "parent": nid, "attached": False}), file=sys.stderr)

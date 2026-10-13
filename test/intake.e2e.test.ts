@@ -11,6 +11,7 @@ import type { ClaudeOneShot } from "../src/substrate.ts";
 import { walk } from "../src/walk.ts";
 import {
  baseConfigLines,
+ claudeEnvelope,
  FAKE_BOT_ID,
  FAKE_GUILD_ID,
  fakeDiscord,
@@ -283,7 +284,7 @@ describe("the claude drafter on the walk tick (node #252, D12)", () => {
  };
  const claudeAnswering = (calls: string[]): ClaudeOneShot => async (prompt) => {
   calls.push(prompt);
-  return { code: 0, stdout: JSON.stringify({ type: "result", is_error: false, result: JSON.stringify(answer) }), stderr: "" };
+  return { code: 0, stdout: claudeEnvelope(answer), stderr: "" };
  };
 
  test("a claude draft is posted as drafted by claude, charged to the spawn ledger, and its whole spec recorded", async () => {

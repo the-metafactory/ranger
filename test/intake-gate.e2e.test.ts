@@ -19,7 +19,7 @@ import {
 import { Journal } from "../src/journal.ts";
 import type { ClaudeOneShot } from "../src/substrate.ts";
 import { walk } from "../src/walk.ts";
-import { baseConfigLines, FAKE_BOT_ID, FAKE_GUILD_ID, fakeDiscord, fixturesBin, type FakeThreadMessage } from "./support.ts";
+import { baseConfigLines, claudeEnvelope, FAKE_BOT_ID, FAKE_GUILD_ID, fakeDiscord, fixturesBin, type FakeThreadMessage } from "./support.ts";
 
 /**
  * The intake gate (node #251): the principal's 👍 on a draft card files the
@@ -47,7 +47,7 @@ function msg(id: string, author: string, content: string): FakeThreadMessage {
  return { id, content, author: { id: author }, mentions };
 }
 
-interface Issue { number: number; parent: string | null; title: string; autonomy: string; checkpoint: string; labels: string[]; body: string; machineAccount: boolean }
+interface Issue { number: number; parent: string | null; title: string; autonomy: string; checkpoint: string; labels: string[]; body: string; machineAccount: boolean; kind?: string; probes?: unknown[] }
 
 interface Rig {
  dir: string;
@@ -460,7 +460,7 @@ describe("intake gate on a claude draft (node #252 beside node #251)", () => {
    probes: [{ type: "git-ref-exists", ref: "main" }],
   };
   const claude: ClaudeOneShot = async () =>
-   ({ code: 0, stdout: JSON.stringify({ type: "result", is_error: false, result: JSON.stringify(answer) }), stderr: "" });
+   ({ code: 0, stdout: claudeEnvelope(answer), stderr: "" });
   const r = await rig({ claude });
   try {
    const draft = r.journal.getIntakeDraft(MESSAGE)!;
@@ -471,7 +471,9 @@ describe("intake gate on a claude draft (node #252 beside node #251)", () => {
    r.discord.react(r.card(), "👍", PRINCIPAL);
    const result = await r.tick();
    expect(gateOf(result).filed).toEqual([{ messageId: MESSAGE, node: "100", added: true }]);
-   expect(r.issues()[0]).toMatchObject({ parent: "1", title: answer.title, autonomy: "approve", checkpoint: answer.checkpoint });
+   expect(r.issues()[0]).toMatchObject({
+    parent: "1", title: answer.title, autonomy: "approve", checkpoint: answer.checkpoint, kind: "task", probes: answer.probes,
+   });
   } finally { r.close(); }
  });
 });

@@ -979,6 +979,9 @@ async function fileDraft(args: GateArgs, row: IntakeDraftRow): Promise<void> {
       title: row.title,
       autonomy,
       checkpoint: row.checkpoint,
+      // A claude draft's kind and probes, as the card showed them (node #252).
+      ...(row.kind === null ? {} : { kind: row.kind }),
+      ...(row.probes === null ? {} : { probes: JSON.parse(row.probes) as unknown[] }),
       labels: [PRINCIPAL_INTAKE_LABEL],
       body: intakeNodeBody(row),
     }, token, write.opts)).node;

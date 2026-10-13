@@ -275,6 +275,8 @@ export interface AddSpec {
  /** Minted at add time: no verb attaches a checkpoint later. */
  checkpoint: string;
  kind?: string;
+ /** Each one is passed as its own `--probe <json>`. */
+ probes?: readonly unknown[];
  labels?: string[];
  body?: string;
  /** Blocking edges, wired before the node is attached to its parent. */
@@ -321,6 +323,7 @@ export async function graphAdd(
   "--checkpoint", spec.checkpoint,
  ];
  if (spec.kind !== undefined) args.push("--kind", spec.kind);
+ for (const probe of spec.probes ?? []) args.push("--probe", JSON.stringify(probe));
  for (const label of spec.labels ?? []) args.push("--label", label);
  if (spec.body !== undefined) args.push("--body", spec.body);
  for (const blocker of spec.blockedBy ?? []) args.push("--blocked-by", writeNodeId(ref, blocker));
