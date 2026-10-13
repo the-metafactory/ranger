@@ -49,7 +49,8 @@ export { implementCandidates, planTick, researchCandidates, selectCandidates };
  * → claim (race-safe) → spawn a detached `ranger run-node`. Sweeps go first so
  * a send-back takes its implement lane before queued resumes or fresh claims.
  * Last, the intake pass (node #247) drafts a card for each principal
- * @-mention in a map thread; it files nothing.
+ * @-mention in a map thread, and its gate (node #251) files a draft on the
+ * principal's 👍 and discards one on the principal's ❌.
  *
  * Stateless over the graph: everything topological is re-derived per pass.
  */
@@ -653,10 +654,12 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
 
  // Intake runs on every map with a thread but `walk: none` (D17), whatever
  // the gates above decided: it reads Discord and posts draft cards, and an
- // intake add is never on ranger's initiative. Last, so it never delays a claim.
+ // intake add is never on ranger's initiative: it runs on the principal's 👍,
+ // through its own write gate (node #251). Last, so it never delays a claim.
  result.intake = await intakePass({
   config,
   journal,
+  portFor: targetFor,
   ...(ctx.now === undefined ? {} : { now: ctx.now }),
   ...(ctx.intakeClient === undefined ? {} : { clientFor: ctx.intakeClient }),
  });

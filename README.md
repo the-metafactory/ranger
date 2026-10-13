@@ -241,12 +241,31 @@ bun src/cli.ts journal                    # inspect workers/events/health
   `principal.discordId` no thread is read. Each one gets a draft node card in
   its thread from the deterministic drafter: the message verbatim and a link
   to it, title from its first line, parent the map root, checkpoint slugged
-  from the title, autonomy `propose`. Nothing is filed; 👍/❌ is node #251.
+  from the title, autonomy `propose`, and the hash of that spec.
   The journal keeps a cursor per thread (the first read starts it at now) and
   one draft per message id, so a re-read posts no second card. A failed read
   moves no cursor; a mention whose content Discord withheld stops the thread
   there and reports it. A thread two walked maps share is skipped, not read:
   a draft's parent is its map's root, and a shared thread names no one map.
+- **Intake gate (node #251, #21 rulings D4/D5/D13/D14, D1):** the same tick
+  reads the 👍 and ❌ reactions on each open draft card (at most 10 per
+  thread, least recently read first). A ❌ from `principal.discordId`
+  discards the draft and edits the card to "discarded"; it wins over a 👍.
+  A 👍 from the principal files it: the journaled spec must still hash to
+  the hash the card shows, the write identity must pass
+  `assertWriteIdentity`, the autonomy must be propose or approve, and no
+  issue the machine account wrote labelled `ranger:principal-intake` may
+  already end in `<!-- ranger:intake discord=<msgId> -->` (the labelled
+  issues are listed once per thread per tick). Then `soma graph add
+  <parent> --json` below the journaled parent, as the machine account,
+  labelled `ranger:principal-intake`, with the message verbatim, a link to
+  it and the marker as the body's last line, and the card is edited to
+  "filed as #N". The row goes to `filing` before the add, so a tick that
+  dies after the add finds the node by its marker next time, links it below
+  its parent (a no-op when attached) and adds no second. A failed reaction read,
+  identity check or marker lookup files nothing that tick; a 👍 from anyone
+  else is ignored. The tracker's node and marker are the binding record; the
+  journal is a cache.
 - **Acceptance (e2e):** an auto research node walked end-to-end against fake
   soma/gh/worker fixtures — claim → worktree → findings branch pushed → draft
   PR → successful CI citation → gated close → `decisions --write`. Live close

@@ -51,6 +51,7 @@ export const CARD_HEADS: Record<string, { emoji: string; status: string }> = {
   "brief-not-ready": { emoji: "📝", status: "build brief not ready" },
   proposal: { emoji: "🗳️", status: "proposal — react 👍 to ratify" },
   draft: { emoji: "📥", status: "draft node" },
+  discarded: { emoji: "🗑️", status: "discarded" },
 };
 
 type CardHead = (typeof CARD_HEADS)[string];
@@ -1045,32 +1046,75 @@ export function ageText(
   return `${ageDays}d`;
 }
 
+/** What every intake card (draft, filed, discarded) is built from. */
+export interface IntakeCardDraft {
+  title: string;
+  parent: number;
+  checkpoint: string;
+  autonomy: string;
+  drafter: string;
+  body: string;
+  messageUrl: string;
+  /** The spec hash the 👍 binds to (ruling D13); absent on a pre-#251 draft. */
+  specHash?: string | null;
+}
+
+function intakeMeta(map: { repo: string; root: number }, draft: IntakeCardDraft): string[] {
+  return [
+    `map: ${mapKey(map)}`,
+    `parent #${draft.parent}`,
+    `checkpoint ${code(draft.checkpoint)}`,
+    `autonomy ${draft.autonomy}`,
+    `${draft.drafter} draft`,
+    ...(draft.specHash === undefined || draft.specHash === null ? [] : [`spec ${code(draft.specHash.slice(0, 12))}`]),
+  ];
+}
+
 /**
  * The draft node card of a principal observation (node #247, ruling D12): the
  * proposed spec on the subtext line, which drafter wrote it, the principal's
- * message as the body, and a link back to it. Nothing is filed yet.
+ * message as the body, and a link back to it. The principal's 👍 files it,
+ * the ❌ discards it (node #251); the spec hash on the subtext line is what
+ * the 👍 binds to (ruling D13).
  */
-export function draftCardContent(
-  map: { repo: string; root: number },
-  draft: { title: string; parent: number; checkpoint: string; autonomy: string; drafter: string; body: string; messageUrl: string },
-): string {
+export function draftCardContent(map: { repo: string; root: number }, draft: IntakeCardDraft): string {
+  const ask = "React 👍 to file it, ❌ to discard it.";
   return renderCard({
     ...CARD_HEADS.draft!,
     title: draft.title,
-    meta: [
-      `map: ${mapKey(map)}`,
-      `parent #${draft.parent}`,
-      `checkpoint ${code(draft.checkpoint)}`,
-      `autonomy ${draft.autonomy}`,
-      `${draft.drafter} draft`,
-    ],
+    meta: intakeMeta(map, draft),
     lines: [
       draft.drafter === "deterministic"
-        ? "Deterministic draft: the title is the first line of your message, the checkpoint is slugged from it, and the body is your message verbatim. Not filed yet."
-        : `${sanitizeGraphText(draft.drafter)} draft. Not filed yet.`,
+        ? `Deterministic draft: the title is the first line of your message, the checkpoint is slugged from it, and the body is your message verbatim. Not filed yet. ${ask}`
+        : `${sanitizeGraphText(draft.drafter)} draft. Not filed yet. ${ask}`,
     ],
     body: draft.body,
     // The tail survives every cut, so the link back always shows.
+    tail: `From your message: <${draft.messageUrl}>`,
+  });
+}
+
+/** The intake card once the principal's 👍 filed it (node #251, ruling D14). */
+export function filedCardContent(map: { repo: string; root: number }, draft: IntakeCardDraft, node: string): string {
+  return renderCard({
+    emoji: "✅",
+    status: `filed as #${sanitizeGraphText(node)}`,
+    title: draft.title,
+    meta: [...intakeMeta(map, draft), nodeUrl(map.repo, node)],
+    lines: ["Filed on your 👍 under the machine account, labelled `ranger:principal-intake`."],
+    body: draft.body,
+    tail: `From your message: <${draft.messageUrl}>`,
+  });
+}
+
+/** The intake card once the principal's ❌ discarded it (node #251, ruling D14). */
+export function discardedCardContent(map: { repo: string; root: number }, draft: IntakeCardDraft): string {
+  return renderCard({
+    ...CARD_HEADS.discarded!,
+    title: draft.title,
+    meta: intakeMeta(map, draft),
+    lines: ["Discarded on your ❌: nothing was filed."],
+    body: draft.body,
     tail: `From your message: <${draft.messageUrl}>`,
   });
 }
