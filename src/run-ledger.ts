@@ -5,12 +5,17 @@ import {
  createExecutionRunFinished,
  NATSTransport,
  type ExecutionRunFinishedEvent,
+ type ExecutionRunFinishedPayloadInput,
+ type RunOutcome,
  type Sovereignty,
  type TransportPublisher,
 } from "@the-metafactory/myelin";
 import { createOutbox } from "@the-metafactory/myelin/outbox";
 import { expandHome, type RangerConfig } from "./config.ts";
 import type { Journal } from "./journal.ts";
+import { nodeKey } from "./forge-ref.ts";
+import { workerLogFile } from "./worker-log.ts";
+import type { RunNodeOutcome } from "./worker.ts";
 
 const SOVEREIGNTY: Sovereignty = {
  classification: "local",
@@ -70,12 +75,70 @@ export function runLedgerPath(config: RangerConfig): string {
  return join(dirname(expandHome(config.state.journalPath)), "run-ledger", "outbox.jsonl");
 }
 
-/** One fail-open funnel for the job represented by a configured ranger tick. */
+/** The settled run-node status mapping; skipped generations have no envelope. */
+export function runNodeRunOutcome(status: RunNodeOutcome["status"]): RunOutcome | null {
+ const outcomes: Record<RunNodeOutcome["status"], RunOutcome | null> = {
+  success: "succeeded",
+  failed: "failed",
+  parked: "blocked",
+  released: "cancelled",
+  "awaiting-merge": "succeeded",
+  proposed: "succeeded",
+  refused: "blocked",
+  skipped: null,
+ };
+ return outcomes[status];
+}
+
 export async function emitTickRunFinished(
  config: RangerConfig,
  journal: Pick<Journal, "recordEvent">,
  run: { startedAt: string; endedAt: string; exitCode: number },
  deps: RunLedgerDeps = {},
+): Promise<void> {
+ return emitRunFinished(config, journal, env => {
+  const goal = env.MF_SERVES_GOAL || undefined;
+  const node = env.MF_SERVES_NODE || undefined;
+  return {
+   run_id: randomUUID(),
+   producer: "ranger",
+   ran: { kind: "job", ref: "ranger:tick" },
+   outcome: run.exitCode === 0 ? "succeeded" : "failed",
+   started_at: run.startedAt,
+   ended_at: run.endedAt,
+   detail_ref: config.state.journalPath,
+   ...(goal || node ? { serves: { ...(goal ? { goal } : {}), ...(node ? { node } : {}) } } : {}),
+  };
+ }, deps);
+}
+
+export async function emitNodeRunFinished(
+ config: RangerConfig,
+ journal: Pick<Journal, "recordEvent" | "path">,
+ run: { repo: string; nodeId: string; generation: number; startedAt: string; endedAt: string; outcome: RunOutcome },
+ deps: RunLedgerDeps = {},
+): Promise<void> {
+ return emitRunFinished(config, journal, env => {
+  const node = nodeKey(run.repo, run.nodeId);
+  return {
+   run_id: randomUUID(),
+   producer: "ranger",
+   ran: { kind: "node", ref: node },
+   serves: { node, ...(env.MF_SERVES_GOAL ? { goal: env.MF_SERVES_GOAL } : {}) },
+   outcome: run.outcome,
+   started_at: run.startedAt,
+   ended_at: run.endedAt,
+   detail_ref: workerLogFile(journal.path, run.repo, run.nodeId, run.generation),
+  };
+ }, deps);
+}
+
+/** One fail-open funnel, with payload construction deferred until bus is configured. */
+async function emitRunFinished(
+ config: RangerConfig,
+ journal: Pick<Journal, "recordEvent">,
+ payload: (env: NodeJS.ProcessEnv) => ExecutionRunFinishedPayloadInput,
+ deps: RunLedgerDeps,
 ): Promise<void> {
  const bus = config.bus;
  if (bus === undefined) return;
@@ -97,23 +160,14 @@ export async function emitTickRunFinished(
  const emit = (async () => {
   try {
    const env = deps.env ?? process.env;
-   const goal = env.MF_SERVES_GOAL || undefined;
-   const node = env.MF_SERVES_NODE || undefined;
    const event = createExecutionRunFinished({
     source: `${bus.principal}.ranger.run`,
     principal: bus.principal,
     stack: bus.stack,
     sovereignty: SOVEREIGNTY,
     payload: {
-     run_id: randomUUID(),
-     producer: "ranger",
-     ran: { kind: "job", ref: "ranger:tick" },
-     outcome: run.exitCode === 0 ? "succeeded" : "failed",
-     started_at: run.startedAt,
-     ended_at: run.endedAt,
-     detail_ref: config.state.journalPath,
+     ...payload(env),
      ...(env.MF_CORRELATION_ID ? { correlation_id: env.MF_CORRELATION_ID } : {}),
-     ...(goal || node ? { serves: { ...(goal ? { goal } : {}), ...(node ? { node } : {}) } } : {}),
     },
    });
    if (deps.publisher !== undefined) {
@@ -138,8 +192,8 @@ export async function emitTickRunFinished(
     close: () => inner.close(),
    } });
    try {
-    // Spool this tick before waiting for replay. Its inner publish awaits
-    // drained, so a stalled replay retains this tick too. NATS connects lazily
+    // Spool this run before waiting for replay. Its inner publish awaits
+    // drained, so a stalled replay retains this run too. NATS connects lazily
     // and once per emit, including a failed connection or missing credentials.
     await outbox.publish(event.subject, envelope);
    } finally {
@@ -156,7 +210,7 @@ export async function emitTickRunFinished(
   active = false;
   if (failure !== undefined) {
    try { journal.recordEvent("ledger-failed", { detail: failure }); }
-   catch {} // Neither delivery nor its diagnostic may change the tick's result.
+   catch {} // Neither delivery nor its diagnostic may change the run's result.
   }
  }
 }
