@@ -165,10 +165,12 @@ maps:
   # skeleton. Charted on soma, not meta-factory: ivy-agent cannot be added to
   # the private repo without a paid seat. Soma builds file below their
   # decision here; reflex/cortex/myelin builds go on maps in those repos.
+  # Ranger merges its gate-passed PRs here (principal, 2026-10-13), unlike
+  # soma's other maps.
   - repo: the-metafactory/soma
     root: 781
     walk: full
-    autoMerge: false
+    autoMerge: true
     localCheckout: ~/work/mf/soma
     commands:
       install: bun install --frozen-lockfile
@@ -178,7 +180,7 @@ maps:
       channelId: "1505550997764833444"
   # MetaFactory pursues, per-repo build maps (principal, 2026-10-12): the
   # build work soma#787 (Vigil contract) settled, one map per repo, wired
-  # cross-repo by blocked-by edges. Same merge policy as soma#781, except
+  # cross-repo by blocked-by edges. Ranger never merges here, except on
   # myelin and reflex: ranger merges their gate-passed PRs (principal,
   # 2026-10-13).
   - repo: the-metafactory/myelin
