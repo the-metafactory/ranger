@@ -363,6 +363,20 @@ const IntakeSchema = z.object({
  model: z.string().regex(MODEL_NAME, "a plain model name ([A-Za-z0-9._-])").default("haiku"),
 });
 
+const BusSchema = z.object({
+ principal: z.string().regex(/^[A-Za-z0-9_-]+$/, "must be a single NATS subject token"),
+ stack: z.string().regex(/^[A-Za-z0-9_-]+$/, "must be a single NATS subject token").default("default"),
+ url: z.string().url().default("nats://127.0.0.1:4222"),
+ creds: z.string().min(1).optional(),
+}).superRefine((bus, ctx) => {
+ let host: string;
+ try { host = new URL(bus.url).hostname; }
+ catch { return; } // The url schema already records the validation error.
+ if (bus.creds === undefined && !["localhost", "127.0.0.1", "::1", "[::1]"].includes(host)) {
+  ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["creds"], message: "bus.creds is required for a non-loopback bus.url" });
+ }
+});
+
 const RangerConfigSchema = z.object({
  version: z.literal(1).default(1),
  maps: z.array(MapSchema).min(1, "at least one map must be registered"),
@@ -376,6 +390,7 @@ const RangerConfigSchema = z.object({
  intake: IntakeSchema.default({}),
  substrates: SubstratesSchema.default({}),
  serve: ServeSchema.optional(),
+ bus: BusSchema.optional(),
 });
 
 export type RangerMapConfig = z.infer<typeof MapSchema>;

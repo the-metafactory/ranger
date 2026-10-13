@@ -2,6 +2,16 @@
 ---
 version: 1
 
+# Optional tick run ledger. Without bus, ticks do not open NATS or touch a spool.
+# bus:
+#   principal: jc                      # one NATS subject token [A-Za-z0-9_-]+
+#   stack: default                     # default: default; same token rule
+#   url: nats://127.0.0.1:4222          # default; no creds allowed only on loopback
+#   creds: ~/.config/nats/creds/ranger.creds # required for a remote host
+# MF_CORRELATION_ID: any nonempty string, passed through; otherwise generated.
+# MF_SERVES_GOAL / MF_SERVES_NODE: optional IDs; never put goal wording here.
+# Emit is fail-open and capped at 2 s; spool: <journal dir>/run-ledger/outbox.jsonl.
+
 maps:
   - repo: the-metafactory/ranger
     root: 1

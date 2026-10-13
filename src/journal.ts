@@ -235,6 +235,7 @@ export interface ResumeQueueRow {
 }
 
 export type EventKind =
+ | "ledger-failed"
  | "resume-queued"
  | "resume-cancelled"
  | "resume-dropped"
