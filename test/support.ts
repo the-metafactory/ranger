@@ -179,7 +179,7 @@ export interface FakeThreadMessage {
  * posted id from a fake one. Thread reads (GET /users/@me, /channels/:id and
  * /channels/:id/messages) serve the messages `say` added (intake, node #247).
  */
-export function fakeDiscord() {
+export function fakeDiscord(opts: { echo?: boolean } = {}) {
  // `replyTo`: the message a reply post answers (`message_reference`, node #249).
  const posts: { url: string; messageId: string; content: string; replyTo?: string }[] = [];
  const edits: { messageId: string; content: string }[] = [];
@@ -198,6 +198,23 @@ export function fakeDiscord() {
  const reactionReads: { messageId: string; emoji: string; after: string | null }[] = [];
  let reactionReadStatus = 200;
  let editStatus = 200;
+ // Echo (node #241): a post gets the next snowflake and lands in its thread as
+ // the bot's reply, so a later read sees the card and a reply can name it.
+ let lastEchoed = 0n;
+ const echo = (channelId: string, content: string, replyTo: string | undefined): string => {
+  const thread = threads.get(channelId) ?? [];
+  const id = [lastEchoed, ...thread.map((m) => BigInt(m.id))].reduce((a, b) => (a > b ? a : b), 0n) + 1n;
+  lastEchoed = id;
+  thread.push({
+   id: String(id),
+   content,
+   author: { id: FAKE_BOT_ID, bot: true },
+   mentions: [],
+   ...(replyTo === undefined ? {} : { message_reference: { message_id: replyTo } }),
+  });
+  threads.set(channelId, thread);
+  return String(id);
+ };
  const server = Bun.serve({
   port: 0,
   async fetch(req) {
@@ -243,8 +260,9 @@ export function fakeDiscord() {
    }
    if (req.method === "POST" && url.pathname.startsWith("/channels/")) {
     const parsed = (await req.json()) as { content?: string; message_reference?: { message_id?: string } };
-    const messageId = `discord-msg-${posts.length + 1}`;
     const replyTo = parsed?.message_reference?.message_id;
+    const channelId = url.pathname.split("/")[2]!;
+    const messageId = opts.echo ? echo(channelId, parsed?.content ?? "", replyTo) : `discord-msg-${posts.length + 1}`;
     posts.push({ url: req.url, messageId, content: parsed?.content ?? "", ...(replyTo === undefined ? {} : { replyTo }) });
     return Response.json({ id: messageId });
    }
@@ -256,6 +274,7 @@ export function fakeDiscord() {
     if (editStatus !== 200) return new Response("refused", { status: editStatus });
     const parsed = (await req.json()) as { content?: string };
     edits.push({ messageId, content: parsed?.content ?? "" });
+    for (const thread of threads.values()) for (const m of thread) if (m.id === messageId) m.content = parsed?.content ?? "";
     return Response.json({ id: messageId });
    }
    if (req.method === "GET" && editMatch) {

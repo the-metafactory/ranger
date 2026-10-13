@@ -319,7 +319,8 @@ export const intakeDrafts = sqliteTable(
   cardMessageId: text("card_message_id").notNull(),
   /**
    * draft → filing (written before `graph add`) → filed; or draft →
-   * discarded (node #251, ruling D14).
+   * discarded (node #251, ruling D14); or draft → superseding (the
+   * correction's card posted) → superseded (the old card edited, node #241).
    */
   status: text("status").notNull().default("draft"),
   createdAt: text("created_at").notNull(),
@@ -340,6 +341,14 @@ export const intakeDrafts = sqliteTable(
    */
   parent: integer("parent").notNull(),
   autonomy: text("autonomy").notNull(),
+  /**
+   * The supersede chain (node #241, ruling D13; migration 0027). A row keyed
+   * by a correction reply names the draft it replaced; the replaced row goes
+   * superseding → superseded. Null on a draft of the mention itself.
+   */
+  supersedes: text("supersedes"),
+  /** The @-mention a corrected draft traces back to: its marker and link. Null on the mention's own draft. */
+  originMessageId: text("origin_message_id"),
  },
  (table) => [
   index("intake_drafts_repo_root_idx").on(table.repo, table.root),
