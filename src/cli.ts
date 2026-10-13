@@ -40,13 +40,13 @@ import {
  assertWriteIdentity,
  WriteGateError,
 } from "./identity.ts";
-import { canonicalDir, runNode } from "./worker.ts";
+import { canonicalDir, runNode, type RunNodeContext, type RunNodeOutcome } from "./worker.ts";
 import { trustCurrentGitState } from "./git-trust.ts";
 import { workerLogFile } from "./worker-log.ts";
 import { sweepMap } from "./sweep.ts";
 import { mergeGateNow } from "./merge-desk.ts";
 import { walk } from "./walk.ts";
-import { emitTickRunFinished, type RunLedgerDeps } from "./run-ledger.ts";
+import { emitTickRunFinished, emitNodeRunFinished, runNodeRunOutcome, type RunLedgerDeps } from "./run-ledger.ts";
 import { spawnRunNodeDetached } from "./spawn.ts";
 import { holdAwake } from "./awake.ts";
 import { BUILD_NOW_NOT_STARTED, buildNow, type BuildNowResult } from "./build-now.ts";
@@ -294,24 +294,50 @@ async function runWalk(configPath: string): Promise<string> {
  return renderWalkJson(result);
 }
 
-async function runRunNode(
+export interface RunRunNodeDeps {
+ loadCtx?: typeof loadCtx;
+ runNodeContext?: typeof runNodeContext;
+ runNode?: typeof runNode;
+ worker?: Partial<Omit<RunNodeContext, "config" | "map" | "token" | "botIdentity" | "commitAuthor" | "journal">>;
+ now?: () => Date;
+ ledger?: RunLedgerDeps;
+}
+
+export async function runRunNode(
  nodeId: string,
  repo: string | undefined,
  configPath: string,
+ deps: RunRunNodeDeps = {},
 ): Promise<string> {
- const { config, journal } = loadCtx(configPath);
- const map = pickMap(config, repo);
- const { token, botIdentity, commitAuthor } = await runNodeContext(config, map);
- const outcome = await runNode(nodeId, {
-  config,
-  map,
-  token,
-  botIdentity,
-  commitAuthor,
-  journal,
- });
- journal.close();
- return JSON.stringify(outcome, null, 2);
+ const now = deps.now ?? (() => new Date());
+ const startedAt = now().toISOString();
+ const { config, journal } = (deps.loadCtx ?? loadCtx)(configPath);
+ try {
+  const map = pickMap(config, repo);
+  const { token, botIdentity, commitAuthor } = await (deps.runNodeContext ?? runNodeContext)(config, map);
+  const before = journal.getWorker(nodeId, map.repo)?.generation ?? 0;
+  let outcome: RunNodeOutcome | undefined;
+  try {
+   outcome = await (deps.runNode ?? runNode)(nodeId, {
+    ...deps.worker,
+    config, map, token, botIdentity, commitAuthor, journal,
+   });
+   return JSON.stringify(outcome, null, 2);
+  } finally {
+   const after = journal.getWorker(nodeId, map.repo)?.generation ?? 0;
+   const mapped = outcome === undefined ? "failed" : runNodeRunOutcome(outcome.status);
+   if (config.bus !== undefined && after !== before && mapped !== null) {
+    await emitNodeRunFinished(config, journal, {
+     repo: map.repo, nodeId,
+     // beginGeneration increments once; a fenced successor may own `after`.
+     generation: before + 1,
+     startedAt, endedAt: now().toISOString(), outcome: mapped,
+    }, deps.ledger);
+   }
+  }
+ } finally {
+  journal.close();
+ }
 }
 
 async function runSweep(configPath: string): Promise<string> {
