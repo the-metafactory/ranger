@@ -283,7 +283,12 @@ export function mergeGateFailedOutcome(r: { check: string; reason: string }): st
 export const CI_FAILED_PARK_OUTCOME = /^merge gate failed \(ci-green\): /;
 
 /** A session or review that stopped on its substrate's limit (node #45). */
-export const SUBSTRATE_CAPPED_OUTCOME = /\bhit its rate limit\b/;
+export const SUBSTRATE_CAPPED_OUTCOME = /\bhit its (?:rate|capacity) limit\b/;
+
+/** A worker session's substrate limit: its quota, or the provider's capacity for the model. */
+export function substrateCappedOutcome(cap: { substrate: string; reason?: "capacity" }): string {
+ return `substrate ${cap.substrate} hit its ${cap.reason === "capacity" ? "capacity" : "rate"} limit`;
+}
 
 /** The sweep parked a row whose worker crashed `attempts` times. */
 export function crashParkOutcome(r: { attempts: number; released: boolean; assignees: string[] }): string {

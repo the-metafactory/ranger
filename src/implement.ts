@@ -33,6 +33,7 @@ import { recordKnownGood, trustedSnapshot } from "./git-trust.ts";
 import * as gh from "./github.ts";
 import type { IssueComment, ChangeRequest, ForgePort, CiVerdict } from "./forge.ts";
 import { ParkSignal } from "./signals.ts";
+import { isTransientGitHubError } from "./transient.ts";
 import {
  PROBE_FILE,
  unfinishedProbes,
@@ -48,6 +49,7 @@ import {
  gitlabReviewHoldOutcome,
  reviewCapHeadMovedOutcome,
  reviewCapOutcome,
+ substrateCappedOutcome,
 } from "./outcomes.ts";
 import { GRAPH_CALL_TIMEOUT_MS, graphNode, somaRepo, type NodeResult } from "./graph.ts";
 import { finishClosedElsewhere } from "./closed-elsewhere.ts";
@@ -1363,7 +1365,10 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
   // to the pushed head.
   if (!staleMerged && (await headSha(worktree)) === live.headSha) {
    const behind = await commitsBehind(worktree, base);
-   const limit = config.workers.maxBehindBase;
+   // A head the merge desk sent back because no CI ran on it merges in any
+   // base commit it lacks: the push is what starts CI (noCiStep).
+   const noCi = journal.listCiAbsent(repo, nodeId).some((s) => s.head === live.headSha && s.step === "sent-back");
+   const limit = noCi ? 0 : config.workers.maxBehindBase;
    if (behind > limit) {
     staleMerged = true;
     // A merge up counts against the same budget as a conflict's: past it,
@@ -2019,8 +2024,8 @@ async function checkedWorkerPass(
   const capSignal: CapSignal | null =
    ctx.substrate === undefined
     ? null
-    : await confirmCap(ctx.substrate, journal, { lines, readers: ctx.substrateReaders });
-  if (capSignal !== null) return fail(`substrate ${capSignal.substrate} hit its rate limit`, capSignal);
+    : await confirmCap(ctx.substrate, journal, { lines, stderr: result.stderr, readers: ctx.substrateReaders });
+  if (capSignal !== null) return fail(substrateCappedOutcome(capSignal), capSignal);
   return fail(`worker exited ${result.code}: ${tail(result)}`);
  }
  // A base merge brings in the base's manifests and lockfile: the tests must
@@ -2217,6 +2222,13 @@ async function closeAfterMerge(
   { cwd: ctx.canonical, timeoutMs: GRAPH_CALL_TIMEOUT_MS },
  );
  if (!close.closed) {
+  // A forge read inside the close that got no answer says nothing about the
+  // node: thrown plain, failNode leaves the row for the sweep to respawn,
+  // uncounted, and the respawn's first read finds the node closed if the
+  // close landed after all.
+  if (isTransientGitHubError(close.detail)) {
+   throw new Error(`close after merge hit a transient forge error: ${close.detail.slice(0, 600)}`);
+  }
   throw new ParkSignal(`close refused after merge: ${close.detail.slice(0, 600)}`);
  }
  journal.recordEvent("closed", { nodeId, repo, detail: close.detail.slice(0, 400) });

@@ -273,6 +273,13 @@ const WorkersSchema = z.object({
   */
  maxBehindBase: z.number().int().nonnegative().default(20),
  /**
+  * Minutes a ready PR's head may sit with no check run at all before the
+  * merge desk sends it back for a base merge pass, whose push starts CI
+  * (2026-10-13: reflex #43's head predated the repo's CI workflow, and the
+  * gate waited on "no check runs on the head yet" with nothing to start one).
+  */
+ noCiGraceMin: z.number().int().positive().default(30),
+ /**
   * CPU priority for everything ranger runs except the browser probes: worker
   * sessions, install and test commands, sage reviews (`nice -n`; 0 = none).
   * The probes are timing-sensitive and keep normal priority (2026-10-05: load
