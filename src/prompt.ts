@@ -9,7 +9,7 @@
  * forked.
  */
 
-import { BLOCKED_REPORT_FILE } from "./blocked-report.ts";
+import { BLOCKED_REPORT_FILE } from "./outcomes.ts";
 
 export interface PromptNode {
  id: string;

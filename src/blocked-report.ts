@@ -16,12 +16,12 @@
  * and folded to one line before it reaches the journal or a card.
  */
 
-import { closeSync, constants, fstatSync, openSync, readSync, rmSync } from "node:fs";
+import { closeSync, constants, fstatSync, lstatSync, openSync, readSync, rmSync } from "node:fs";
 import { basename, join } from "node:path";
 import { safeGit } from "./git-ops.ts";
+import { BLOCKED_REPORT_FILE } from "./outcomes.ts";
 
-/** Where the worker writes its blocked report, relative to the worktree root. */
-export const BLOCKED_REPORT_FILE = ".ranger-blocked.md";
+export { BLOCKED_REPORT_FILE };
 
 /** Bytes of a report or note read; the rest is never read. */
 const MAX_REPORT_BYTES = 16_384;
@@ -66,11 +66,17 @@ export function parseBlockedReport(text: string): BlockedReport {
  return { reason: fold(lines.slice(0, at)), resume: fold(rest) };
 }
 
-/** A regular file's first bytes, or null: a link, a directory or a missing file is no report. */
+/**
+ * A regular file's first bytes, or null: a link, a directory, a FIFO or a
+ * missing file is no report. A FIFO would block a plain open until a writer
+ * came, so the open never waits (O_NONBLOCK) and the type is checked before
+ * it and again on the open descriptor.
+ */
 function readRegularFile(path: string): string | null {
  let fd: number;
  try {
-  fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  if (!lstatSync(path).isFile()) return null;
+  fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
  } catch {
   return null;
  }

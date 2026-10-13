@@ -31,9 +31,9 @@ import { startsImplementSession, type ImplementLane } from "./lanes.ts";
 import { whenFreeQueues } from "./resume.ts";
 import { childEnv, itermArgv, shellQuote } from "./launch.ts";
 import {
- BLOCKED_OUTCOME,
  CRASH_PARK_OUTCOME,
  NEEDS_EYE_LABEL,
+ parseBlockedOutcome,
  parseFailedProbes,
  PROBE_FILE,
  POLICY_BLOCKED_OUTCOME,
@@ -136,8 +136,6 @@ function lastAttempt(recent: EventRow[]): EventRow[] {
 }
 
 const firstLine = (text: string): string => text.split("\n")[0].trim();
-/** Where blockedOutcome's resume condition starts. */
-const RESUME_MARK = " — resume condition: ";
 
 /**
  * Why a row needs the principal, by ranger's rules, in this order: the review
@@ -201,13 +199,11 @@ export function classifyReason(
  if (POLICY_BLOCKED_OUTCOME.test(outcome)) {
   return { class: "policy blocked", detail: firstLine(outcome).slice(0, 200) };
  }
- if (BLOCKED_OUTCOME.test(outcome)) {
+ const blocked = parseBlockedOutcome(outcome);
+ if (blocked !== null) {
   // The resume condition is what the principal acts on: it leads, and the
   // worker's reason (worker-written, capped by the builder) follows.
-  const line = firstLine(outcome);
-  const at = line.lastIndexOf(RESUME_MARK);
-  const resume = at === -1 ? "" : line.slice(at + RESUME_MARK.length).replace(/ \([^()]*\)$/, "");
-  const reason = (at === -1 ? line : line.slice(0, at)).replace(BLOCKED_OUTCOME, "");
+  const { reason, resume } = blocked;
   return { class: "blocked", detail: (resume ? `resume once: ${resume} — ${reason}` : reason).slice(0, 300) };
  }
  if (SUBSTRATE_CAPPED_OUTCOME.test(outcome)) {

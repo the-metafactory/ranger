@@ -247,10 +247,28 @@ export const POLICY_BLOCKED_OUTCOME = /^policy-blocked: /;
  */
 export function blockedOutcome(r: { pass: string; reason: string; resume: string; log?: string }): string {
  const resume = r.resume.length > 0 ? r.resume : "none given, read the worker log";
- return `blocked: ${r.reason} — resume condition: ${resume} (${r.pass}${r.log === undefined ? "" : `; worker log: ${r.log}`})`;
+ return `blocked: ${r.reason}${RESUME_MARK}${resume} (${r.pass}${r.log === undefined ? "" : `; worker log: ${r.log}`})`;
 }
 
 export const BLOCKED_OUTCOME = /^blocked: /;
+
+/** Where the worker writes its blocked report, relative to the worktree root. */
+export const BLOCKED_REPORT_FILE = ".ranger-blocked.md";
+
+const RESUME_MARK = " — resume condition: ";
+
+/**
+ * A blocked outcome's reason and resume condition, as blockedOutcome wrote
+ * them (the trailing pass and log dropped), or null for any other outcome.
+ */
+export function parseBlockedOutcome(outcome: string): { reason: string; resume: string } | null {
+ const line = outcome.split("\n")[0].trim();
+ if (!BLOCKED_OUTCOME.test(line)) return null;
+ const at = line.lastIndexOf(RESUME_MARK);
+ const reason = (at === -1 ? line : line.slice(0, at)).replace(BLOCKED_OUTCOME, "");
+ const resume = at === -1 ? "" : line.slice(at + RESUME_MARK.length).replace(/ \([^()]*\)$/, "");
+ return { reason, resume };
+}
 
 /** The merge desk parked an awaiting-merge row on a hard merge-gate failure; `check` is the gate's check name. */
 export function mergeGateFailedOutcome(r: { check: string; reason: string }): string {

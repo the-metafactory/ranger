@@ -10,6 +10,8 @@ import {
  readBlockedReport,
 } from "../src/blocked-report.ts";
 import { assembleImplementPrompt } from "../src/prompt.ts";
+import { blockedOutcome, parseBlockedOutcome } from "../src/outcomes.ts";
+import { runCmd } from "../src/exec.ts";
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -63,6 +65,28 @@ describe("readBlockedReport", () => {
   writeFileSync(secret, "token=abc\n");
   symlinkSync(secret, join(d, BLOCKED_REPORT_FILE));
   expect(readBlockedReport(d)).toBeNull();
+ });
+});
+
+test("a FIFO is no report, and reading it never waits for a writer", async () => {
+ const d = scratch();
+ expect((await runCmd("mkfifo", [join(d, BLOCKED_REPORT_FILE)], { cwd: d })).code).toBe(0);
+ const started = Date.now();
+ expect(readBlockedReport(d)).toBeNull();
+ expect(Date.now() - started).toBeLessThan(1_000);
+}, 5_000);
+
+describe("parseBlockedOutcome", () => {
+ test("reads back what blockedOutcome wrote, without the pass and log", () => {
+  expect(parseBlockedOutcome(blockedOutcome({ pass: "build pass", reason: "no SDK release (yet)", resume: "publish one", log: "/x.log" }))).toEqual({
+   reason: "no SDK release (yet)",
+   resume: "publish one",
+  });
+  expect(parseBlockedOutcome(blockedOutcome({ pass: "adopted build", reason: "waiting", resume: "" }))).toEqual({
+   reason: "waiting",
+   resume: "none given, read the worker log",
+  });
+  expect(parseBlockedOutcome("policy-blocked: a hook stopped the build pass")).toBeNull();
  });
 });
 

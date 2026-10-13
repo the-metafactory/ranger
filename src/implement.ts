@@ -2012,7 +2012,7 @@ async function checkedWorkerPass(
  // The worker said the node cannot be done yet: park on its reason, before
  // any commit it made is tested or pushed.
  const blocked = result.code === 0 ? readBlockedReport(worktree) : null;
- if (blocked !== null) throw await blockedPark(ctx, pass, blocked, log);
+ if (blocked !== null) throw await blockedPark(ctx, pass, blocked, { dropNote: (await blockerNoteBranch(worktree, map.base)) !== null, log });
  if (result.code !== 0) {
   // Mid-session cap (node #45): only the substrate's own signal says so, and
   // only a failed run can be one. A capped failure does not count.
@@ -2040,7 +2040,7 @@ async function checkedWorkerPass(
  }
  if (spec.kind === "build") {
   const note = await blockerNoteBranch(worktree, map.base);
-  if (note !== null) throw await blockedPark(ctx, pass, note, log);
+  if (note !== null) throw await blockedPark(ctx, pass, note, { dropNote: true, log });
  }
  // This session wrote `sha`: record it now, so a later run that adopts the
  // commit unpushed still credits the substrate that actually wrote it.
@@ -2074,16 +2074,21 @@ async function checkedWorkerPass(
 
 /**
  * The park for a worker that reported the node blocked, or whose build is
- * only a blocker note. Before any PR, a branch that holds nothing but the
- * note goes back to its base: it was never pushed, the outcome keeps the
+ * only a blocker note (`dropNote`: the caller found the branch is). Before
+ * any PR, a branch that holds nothing but the note goes back to its base: it was never pushed, the outcome keeps the
  * note's reason and condition, and a resume once the condition holds must
  * start a fresh build, not adopt the note and park again.
  */
-async function blockedPark(ctx: ImplementContext, pass: string, report: BlockedReport, log?: string): Promise<ParkSignal> {
+async function blockedPark(
+ ctx: ImplementContext,
+ pass: string,
+ report: BlockedReport,
+ opts: { dropNote: boolean; log?: string },
+): Promise<ParkSignal> {
  const { worktree, map, journal, node } = ctx;
- let outcome = blockedOutcome({ pass, ...report, ...(log === undefined ? {} : { log }) });
+ let outcome = blockedOutcome({ pass, ...report, ...(opts.log === undefined ? {} : { log: opts.log }) });
  const unpushed = (journal.getWorker(node.ref.id, map.repo)?.prNumber ?? null) === null;
- if (unpushed && (await blockerNoteBranch(worktree, map.base)) !== null) {
+ if (unpushed && opts.dropNote) {
   const base = await safeGit(["--no-replace-objects", "merge-base", `origin/${map.base}`, "HEAD"], { cwd: worktree, timeoutMs: 10_000 });
   const failed = base.code === 0 ? await restoreWorktree(ctx, base.stdout.trim()) : `no merge base with origin/${map.base}`;
   if (failed !== null) outcome += ` — the note's commits stay in the worktree (${failed}): drop them before a resume`;
@@ -2916,7 +2921,7 @@ async function adoptBuiltWork(
  const what = fix === undefined ? "build" : `fix pass ${fix.round}`;
  if (fix === undefined) {
   const note = await blockerNoteBranch(worktree, map.base);
-  if (note !== null) throw await blockedPark(ctx, "adopted build", note);
+  if (note !== null) throw await blockedPark(ctx, "adopted build", note, { dropNote: true });
  }
  const snapshot = await trustedSnapshot(journal, ctx.canonical, { repo: map.repo, nodeId: node.ref.id }, mapKey(map));
  const sha = await headSha(worktree);
