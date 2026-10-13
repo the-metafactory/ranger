@@ -619,6 +619,34 @@ export async function selectSubstrate(
 export interface CapSignal {
  substrate: SubstrateName;
  resetsAt: number | null;
+ /** Set when the provider had no capacity for the model, not when the quota ran out. */
+ reason?: "capacity";
+}
+
+/**
+ * Codex's own refusal when the provider has no capacity for the pinned model
+ * (2026-10-13: cortex #2558's build ended on it, and ranger failed the node).
+ * It is short-lived and says nothing about the node, so it is a cap with a
+ * short window, and the run resumes on the next eligible substrate.
+ */
+const CODEX_CAPACITY = /^ERROR: Selected model is at capacity\b/;
+export const CODEX_CAPACITY_COOLDOWN_MS = 15 * 60_000;
+
+/**
+ * The one cap ranger reads from a run's text, so it reads only where codex
+ * alone writes: the last line of a failed run's stderr transcript, or the
+ * line before codex's closing `tokens used` / count trailer. A worker's tool
+ * output also lands in that transcript, but never after codex's own final
+ * error, and only a run codex itself failed is asked (the caller's exit
+ * check). A spoof gains a 15-minute cap on codex and a resume elsewhere.
+ */
+export function detectCodexCapacity(stderr: string, now: Date): CapSignal | null {
+ const lines = stderr.split("\n").map((line) => line.trimEnd()).filter((line) => line.length > 0);
+ let end = lines.length;
+ if (end >= 2 && lines[end - 2] === "tokens used" && /^[\d',.\s]+$/.test(lines[end - 1])) end -= 2;
+ const last = lines[end - 1];
+ if (last === undefined || !CODEX_CAPACITY.test(last)) return null;
+ return { substrate: "codex", resetsAt: Math.floor((now.getTime() + CODEX_CAPACITY_COOLDOWN_MS) / 1000), reason: "capacity" };
 }
 
 /** A Claude stream's own cap signal: a rate_limit_event with a capped status (see isClaudeCappedStatus). */
@@ -637,27 +665,31 @@ export function detectClaudeCap(lines: string[]): CapSignal | null {
  * substrate's own structured signal answers — the Claude stream's
  * rate_limit_event, else a fresh quota read (Codex `rateLimitReachedType` /
  * `ordinaryUsageAllowed`, the Claude probe's status). Never the run's text,
- * which carries worker- and repo-controlled output. The fresh reading is
- * persisted either way.
+ * which carries worker- and repo-controlled output, with one bounded
+ * exception: codex's own model-capacity refusal at the end of its stderr
+ * (`detectCodexCapacity`), asked when the quota read finds no cap. The fresh
+ * reading is persisted either way.
  */
 export async function confirmCap(
  substrate: SubstrateName,
  journal: Journal,
- opts: { lines?: string[]; readers?: SubstrateReaders },
+ opts: { lines?: string[]; stderr?: string; readers?: SubstrateReaders; now?: Date },
 ): Promise<CapSignal | null> {
  if (substrate === "pi") return null;
  if (substrate === "claude" && opts.lines !== undefined) {
   const cap = detectClaudeCap(opts.lines);
   if (cap !== null) return cap;
  }
+ const capacity = (): CapSignal | null =>
+  substrate === "codex" && opts.stderr !== undefined ? detectCodexCapacity(opts.stderr, opts.now ?? new Date()) : null;
  let reading: QuotaReading;
  try {
   reading = await readerFor(substrate, opts.readers)();
  } catch {
-  return null; // no confirming signal: an ordinary failure
+  return capacity(); // no quota signal: only codex's own refusal makes it a cap
  }
  persistReading(journal, reading);
- return reading.capped ? { substrate, resetsAt: reading.cappedUntil } : null;
+ return reading.capped ? { substrate, resetsAt: reading.cappedUntil } : capacity();
 }
 
 /** Fallback cap window when the substrate reported no reset time. */

@@ -6,6 +6,7 @@ import { runCmd, type RunOptions, type RunResult } from "./exec.ts";
 import { parseForgeRef, qualifiedRepo, repoIdentity, type ForgeRef } from "./forge-ref.ts";
 import { glabConfigEnvAsync } from "./glab-config-dir.ts";
 import { parseGlabResponse } from "./glab-transport.ts";
+import { isTransientGitHubError } from "./transient.ts";
 
 /**
  * The read-only credential gate (node #8 ruling).
@@ -148,9 +149,11 @@ async function introspectToken(
       env: gated.env,
     });
     if (result.code !== 0) {
-      throw new GateError(
-        `token introspection failed (gh api /user, exit ${result.code}): ${result.stderr.trim() || result.stdout.trim()}`,
-      );
+      // A forge that did not answer is transient: a queued resume defers on it
+      // without counting a failed start (2026-10-13: the tick log held over a
+      // hundred "error connecting to api.github.com" introspections).
+      const said = result.stderr.trim() || result.stdout.trim();
+      throw new GateError(`token introspection failed (gh api /user, exit ${result.code}): ${said}`, isTransientGitHubError(said));
     }
     const { scopes } = parseGhHeaders(result.stdout);
     const login = extractLogin(result.stdout);
@@ -207,6 +210,7 @@ async function assertRepoReadable(token: string, repo: string): Promise<void> {
     if (result.code !== 0) {
       throw new GateError(
         `token cannot read ${repo} (gh api repos/${repo}, exit ${result.code}): ${result.stderr.trim() || "access denied"}`,
+        isTransientGitHubError(result.stderr),
       );
     }
   } finally {

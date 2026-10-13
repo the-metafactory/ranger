@@ -29,7 +29,8 @@ export interface ChangeRequest {
 export type CiPurpose = "merge" | "close" | "research";
 export type CiVerdict =
  | { state: "green"; runId: number; runUrl: string; runName: string; snapshot: string }
- | { state: "red" | "pending"; reason: string };
+ /** `noRuns`: pending only because no CI run exists on the head at all (the merge desk's no-CI send-back). */
+ | { state: "red" | "pending"; reason: string; noRuns?: true };
 
 export interface IssueComment {
  id: number;

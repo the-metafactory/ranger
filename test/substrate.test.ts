@@ -6,8 +6,10 @@ import { loadConfig } from "../src/config.ts";
 import { Journal, openJournal, type SubstrateReading } from "../src/journal.ts";
 import {
  confirmCap,
+ CODEX_CAPACITY_COOLDOWN_MS,
  describeWorkerModel,
  detectClaudeCap,
+ detectCodexCapacity,
  drainJsonLines,
  effectiveThreshold,
  extractClaudeResultText,
@@ -666,6 +668,32 @@ describe("confirmCap — only the substrate's own signal (node #45)", () => {
    const fails = { claude: () => Promise.reject(new Error("down")) };
    expect(await confirmCap("claude", journal, { lines: [], readers: fails })).toBeNull();
    expect(await confirmCap("pi", journal, {})).toBeNull();
+  });
+ });
+
+ const CAPACITY = "ERROR: Selected model is at capacity. Please try a different model.";
+ const now = new Date("2026-10-13T12:29:28Z");
+ const until = Math.floor((now.getTime() + CODEX_CAPACITY_COOLDOWN_MS) / 1000);
+
+ test("codex's capacity refusal at the end of its stderr is a cap with a short window (cortex #2558)", async () => {
+  const stderr = `codex\nworking\n${CAPACITY}\n${CAPACITY}\ntokens used\n66'283\n`;
+  expect(detectCodexCapacity(stderr, now)).toEqual({ substrate: "codex", resetsAt: until, reason: "capacity" });
+  expect(detectCodexCapacity(`${CAPACITY}\n`, now)?.reason).toBe("capacity");
+  await withJournal(async (journal) => {
+   const cap = await confirmCap("codex", journal, { stderr, now, readers: { codex: async () => quota("codex", false) } });
+   expect(cap).toEqual({ substrate: "codex", resetsAt: until, reason: "capacity" });
+   // A quota read that fails does not hide it either.
+   expect(await confirmCap("codex", journal, { stderr, now, readers: { codex: () => Promise.reject(new Error("down")) } })).toEqual(cap);
+  });
+ });
+
+ test("the capacity line anywhere but codex's last word is not a cap", async () => {
+  expect(detectCodexCapacity(`exec\ncat notes.md\n${CAPACITY}\nERROR: stream disconnected\ntokens used\n10\n`, now)).toBeNull();
+  expect(detectCodexCapacity(`  ${CAPACITY}\n`, now)).toBeNull();
+  expect(detectCodexCapacity("", now)).toBeNull();
+  await withJournal(async (journal) => {
+   // Only codex is asked: the same text from a claude run means nothing.
+   expect(await confirmCap("claude", journal, { lines: [], stderr: `${CAPACITY}\n`, readers: { claude: async () => quota("claude", false) } })).toBeNull();
   });
  });
 });

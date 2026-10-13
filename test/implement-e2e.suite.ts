@@ -888,6 +888,20 @@ describe("implement lane (node #23)", () => {
   expect((r.github.comments.get(1) ?? []).some((c) => c.body.includes("ranger:base-merge"))).toBe(false);
  }, 60_000);
 
+ test("a head the merge desk sent back because no CI ran on it merges in even one base commit (reflex #43, 2026-10-13)", async () => {
+  const { r } = await failAfterRoundOne();
+  await pushFromOutside(r, "ci.yml", "main");
+  const sent = await r.github.sha(BRANCH);
+  r.journal.recordCiAbsent({ nodeId: "20", repo: "acme/widgets", head: sent, step: "sent-back", note: "no CI ran" });
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  const merged = await r.github.sha(BRANCH);
+  expect(merged).not.toBe(sent);
+  expect((await runCmd("git", ["merge-base", "--is-ancestor", "main", merged], { cwd: r.origin })).code).toBe(0);
+  const markers = (r.github.comments.get(1) ?? []).filter((c) => c.body.includes("ranger:base-merge"));
+  expect(markers).toHaveLength(1);
+  expect(markers[0]?.body).toContain("the branch was 1 commit(s) behind origin/main (limit 0)");
+ }, 60_000);
+
  test("a resume after someone rewound the PR branch below the pushed worktree parks and pushes nothing over it (sage round 2 on PR #234)", async () => {
   const { r, head } = await failAfterRoundOne();
   const pushedHead = await head();
@@ -1441,6 +1455,65 @@ describe("implement lane (node #23)", () => {
   const failed = events.filter((e) => e.kind === "decisions-failed");
   expect(failed).toHaveLength(1);
   expect(failed[0]?.detail).toContain("HTTP 504");
+ }, 60_000);
+
+ /** Merge the PR, then run the close with the fake soma failing it on `fail`. */
+ const closeFailing = async (fail: string) => {
+  const r = await rig({ autonomy: "propose" });
+  cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  await r.github.merge(1);
+  r.journal.updateWorker("20", "acme/widgets", { status: "running" });
+  process.env.FAKE_SOMA_CLOSE_FAIL = fail;
+  try {
+   return { r, outcome: await runNode("20", r.ctx) };
+  } finally {
+   delete process.env.FAKE_SOMA_CLOSE_FAIL;
+  }
+ };
+ const deskTick = async (r: Awaited<ReturnType<typeof rig>>) => {
+  const spawned: string[] = [];
+  await sweepMap({
+   config: r.ctx.config, journal: r.journal, map: r.ctx.map, token: "ghp_write", botIdentity: BOT, github: r.github,
+   post: async () => "msg",
+   respawn: async (nodeId) => { spawned.push(nodeId); return DEAD_PID; },
+  });
+  return spawned;
+ };
+
+ test("a close that hits gh's network error is left for the sweep, uncounted, not parked (soma #795, 2026-10-13)", async () => {
+  const { r, outcome } = await closeFailing(
+   "gh api GET repos/acme/widgets/issues/20 failed (exit 1): error connecting to api.github.com\ncheck your internet connection or https://githubstatus.com",
+  );
+  expect(outcome.status).toBe("failed");
+  expect(r.journal.deadmanCount()).toBe(0);
+  expect(r.journal.getWorker("20", "acme/widgets")?.status).toBe("running");
+  expect(r.journal.listEvents("acme/widgets", 200).some((e) => e.kind === "transient")).toBe(true);
+  expect(state(r.statePath).nodes["20"].status).not.toBe("closed");
+  // The respawn's close goes through.
+  expect((await runNode("20", r.ctx)).status).toBe("success");
+  expect(state(r.statePath).nodes["20"].status).toBe("closed");
+ }, 60_000);
+
+ test("a close refused for a reason a re-run repeats parks once, and the merge desk does not re-run it (soma #795, 2026-10-13)", async () => {
+  const { r, outcome } = await closeFailing(
+   "Close refused.\n\n4 of 6 declared probe(s) name a path outside the probe tree.",
+  );
+  expect(outcome.status).toBe("parked");
+  expect(r.journal.getWorker("20", "acme/widgets")).toMatchObject({ status: "parked", phase: "close" });
+  expect(r.journal.getWorker("20", "acme/widgets")?.outcome).toStartWith("close refused after merge: Close refused.");
+  expect(await deskTick(r)).toEqual([]);
+  expect(await deskTick(r)).toEqual([]);
+  expect(r.journal.getWorker("20", "acme/widgets")?.status).toBe("parked");
+ }, 60_000);
+
+ test("a close parked on a transient error before this rule is still re-run by the merge desk", async () => {
+  const { r } = await closeFailing("Close refused.\n\nprobe outside the probe tree");
+  // The row as soma #795 left it on 2026-10-13: parked in the close on gh's network error.
+  r.journal.updateWorker("20", "acme/widgets", {
+   outcome: "close refused after merge: gh api GET repos/acme/widgets/issues/20 failed (exit 1): error connecting to api.github.com",
+  });
+  expect(await deskTick(r)).toEqual(["20"]);
  }, 60_000);
 
  test("propose node filed by the machine account is refused (node #9 ban)", async () => {
@@ -3363,6 +3436,62 @@ describe("implement lane (node #23)", () => {
   } finally {
    db.close();
   }
+ }, 60_000);
+
+ test("a codex build that ends on the model being at capacity resumes on the next substrate, uncounted (cortex #2558, 2026-10-13)", async () => {
+  const r = await rig({});
+  cleanup.push(r.dir);
+  let calls = 0;
+  r.ctx.substrate = "codex";
+  delete r.ctx.workerCommand;
+  const reading = (substrate: "claude" | "codex") => async () => ({
+   substrate,
+   readAt: new Date(),
+   windows: [{ kind: "seven_day" as const, usedPct: 5, resetsAt: Math.floor(Date.now() / 1000) + 86_400 }],
+   capped: false,
+   cappedUntil: null,
+  });
+  r.ctx.substrateReaders = { codex: reading("codex"), claude: reading("claude") };
+  r.ctx.worker = async (prompt, opts) => {
+   calls += 1;
+   if (calls === 1) {
+    // Codex's own transcript tail, as cortex #2558's build log ended.
+    return { code: 1, stdout: "", stderr: "codex\nworking on it\nERROR: Selected model is at capacity. Please try a different model.\nERROR: Selected model is at capacity. Please try a different model.\ntokens used\n66'283\n" };
+   }
+   return runCmd(implementWorker, ["build", prompt], opts);
+  };
+  const before = Date.now();
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("awaiting-merge");
+  expect(calls).toBe(2);
+  expect(r.journal.deadmanCount()).toBe(0);
+  expect(r.journal.getWorker("20", "acme/widgets")?.attempts).toBe(0);
+  const until = Date.parse(r.journal.getSubstrateReading("codex")?.cappedUntil ?? "");
+  expect(until).toBeGreaterThanOrEqual(before + 14 * 60_000);
+  expect(until).toBeLessThanOrEqual(Date.now() + 16 * 60_000);
+  const capped = r.journal.listEvents("acme/widgets", 200).filter((e) => e.kind === "substrate-capped");
+  expect(capped).toHaveLength(1);
+  expect(capped[0].detail).toContain("substrate codex hit its capacity limit");
+  expect(sessions(r.journal)[0]).toEqual(["codex", "worker", "capped"]);
+  expect(sessions(r.journal)[1]?.[0]).not.toBe("codex");
+ }, 60_000);
+
+ test("a codex build that fails with the capacity line only inside its own output is an ordinary failure", async () => {
+  const r = await rig({});
+  cleanup.push(r.dir);
+  r.ctx.substrate = "codex";
+  delete r.ctx.workerCommand;
+  r.ctx.substrateReaders = {
+   codex: async () => ({ substrate: "codex", readAt: new Date(), windows: [], capped: false, cappedUntil: null }),
+  };
+  // A tool's output quoted the line; codex's own last word is something else.
+  r.ctx.worker = async () => ({
+   code: 1, stdout: "", stderr: "exec\ncat notes.md\nERROR: Selected model is at capacity. Please try a different model.\nERROR: stream disconnected before completion\ntokens used\n1'000\n",
+  });
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("failed");
+  expect(r.journal.listEvents("acme/widgets", 200).some((e) => e.kind === "substrate-capped")).toBe(false);
+  expect(r.journal.getSubstrateReading("codex")?.capped).toBe(false);
  }, 60_000);
 
  test("a review capped on its substrate resumes cross-model without touching attempts or the dead-man", async () => {

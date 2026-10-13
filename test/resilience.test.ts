@@ -24,6 +24,14 @@ describe("transient GitHub errors (found live on #45 and #663)", () => {
   expect(isTransientGitHubError("gh: Server Error (HTTP 502)")).toBe(true);
   expect(isTransientGitHubError("read ECONNRESET")).toBe(true);
  });
+ test("gh's network error and Go's dial errors are transient (soma #795, 2026-10-13)", () => {
+  expect(isTransientGitHubError("gh api GET repos/the-metafactory/soma/issues/795 failed (exit 1): error connecting to api.github.com\ncheck your internet connection or https://githubstatus.com")).toBe(true);
+  expect(isTransientGitHubError('Get "https://gitlab.com/api/v4/user": dial tcp: lookup gitlab.com: no such host')).toBe(true);
+  expect(isTransientGitHubError("dial tcp 140.82.121.6:443: connect: connection refused")).toBe(true);
+ });
+ test("a test that fails connecting to something else is not", () => {
+  expect(isTransientGitHubError("tests failed — failing: integration: error connecting to nats at 127.0.0.1:4222")).toBe(false);
+ });
  test("a bare HTTP 500 is not transient as an outcome: a failing test may name it", () => {
   expect(isTransientGitHubError("tests failed — failing: the API returns HTTP 500 on bad input")).toBe(false);
  });

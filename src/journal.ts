@@ -98,6 +98,16 @@ export class FencedError extends Error {
 /** The fixed prefix `recordRebase` writes and `listRebases` reads: the SHAs, and ` wait` when no request was sent; the note follows. */
 const REBASE_PREFIX = /^from=([0-9a-f]{7,64})(?: to=([0-9a-f]{7,64}))?( wait)?: ?([\s\S]*)$/;
 
+/** The fixed prefix `recordCiAbsent` writes and `listCiAbsent` reads: the head, then the step. */
+const CI_ABSENT_PREFIX = /^head=([0-9a-f]{7,64}) (seen|sent-back|surfaced)(?::|$)/;
+
+/**
+ * The merge desk's steps for a head that no CI ran on (`ci-absent` events):
+ * first seen with no check runs, sent back for a base merge pass, surfaced to
+ * the principal once nothing else will start CI.
+ */
+export type CiAbsentStep = "seen" | "sent-back" | "surfaced";
+
 export interface EventRow {
  id: number;
  at: string;
@@ -274,7 +284,9 @@ export type EventKind =
  | "intake-filed"
  | "intake-discarded"
  /** A principal correction reply got a new draft card that supersedes the old (node #241). */
- | "intake-corrected";
+ | "intake-corrected"
+ /** The merge desk's steps for a head no CI ran on (`CiAbsentStep`). */
+ | "ci-absent";
 
 /** The health-store key of a checkout's known-good git state (`knownGoodGitState`). */
 const knownGoodGitKey = (canonical: string): string => `git.known-good.${canonical}`;
@@ -583,6 +595,26 @@ export class Journal {
    .flatMap((e) => {
     const m = REBASE_PREFIX.exec(e.detail ?? "");
     return m === null ? [] : [{ from: m[1]!, to: m[2] ?? null, requested: m[3] === undefined, note: m[4] ?? "" }];
+   });
+ }
+
+ /** One step for a head no CI ran on; `note` is free prose after the fixed prefix. */
+ recordCiAbsent(opts: { nodeId: string; repo: string; head: string; step: CiAbsentStep; note: string }): void {
+  this.recordEvent("ci-absent", { nodeId: opts.nodeId, repo: opts.repo, detail: `head=${opts.head} ${opts.step}: ${opts.note}` });
+ }
+
+ /** A node's `ci-absent` steps, newest first; queried by kind, like `listRebases`. */
+ listCiAbsent(repo: string, nodeId: string, limit = 30): { head: string; step: CiAbsentStep; at: string }[] {
+  return this.db
+   .select()
+   .from(events)
+   .where(and(eq(events.repo, repo), eq(events.nodeId, nodeId), eq(events.kind, "ci-absent")))
+   .orderBy(desc(events.id))
+   .limit(limit)
+   .all()
+   .flatMap((e) => {
+    const m = CI_ABSENT_PREFIX.exec(e.detail ?? "");
+    return m === null ? [] : [{ head: m[1]!, step: m[2] as CiAbsentStep, at: e.at }];
    });
  }
 
