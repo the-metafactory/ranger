@@ -40,7 +40,7 @@ function walkResult(): WalkResult {
  };
 }
 function escalation(ok = true): EscalateResult {
- return { generatedAt: AT, maps: [{ repo: "acme/widgets", kind: "cards", ok, posted: [], edited: [], deferred: [], keptOpen: [], cardErrors: [], cards: [] }] };
+ return { generatedAt: AT, maps: [{ repo: "acme/widgets", kind: "cards", ok, posted: [], edited: [], deferred: [], keptOpen: [], closed: [], cardErrors: [], cards: [] }] };
 }
 function deps(ledger: RunLedgerDeps = {}, overrides: Partial<TickDeps> = {}): TickDeps {
  return {

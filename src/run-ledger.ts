@@ -16,6 +16,7 @@ import type { Journal } from "./journal.ts";
 import { nodeKey } from "./forge-ref.ts";
 import { workerLogFile } from "./worker-log.ts";
 import type { RunNodeOutcome } from "./worker.ts";
+import { AGE_BAND_STATE, ageBand, type EscalateResult } from "./card-sync.ts";
 
 const SOVEREIGNTY: Sovereignty = {
  classification: "local",
@@ -93,13 +94,13 @@ export function runNodeRunOutcome(status: RunNodeOutcome["status"]): RunOutcome 
 export async function emitTickRunFinished(
  config: RangerConfig,
  journal: Pick<Journal, "recordEvent">,
- run: { startedAt: string; endedAt: string; exitCode: number },
+ run: { startedAt: string; endedAt: string; exitCode: number; escalation?: EscalateResult | null },
  deps: RunLedgerDeps = {},
 ): Promise<void> {
  return emitRunFinished(config, journal, env => {
   const goal = env.MF_SERVES_GOAL || undefined;
   const node = env.MF_SERVES_NODE || undefined;
-  return {
+  return [{
    run_id: randomUUID(),
    producer: "ranger",
    ran: { kind: "job", ref: "ranger:tick" },
@@ -108,8 +109,36 @@ export async function emitTickRunFinished(
    ended_at: run.endedAt,
    detail_ref: config.state.journalPath,
    ...(goal || node ? { serves: { ...(goal ? { goal } : {}), ...(node ? { node } : {}) } } : {}),
-  };
+  }, ...cardRunPayloads(config, run, env)];
  }, deps);
+}
+
+/** Only completed card actions report state; graph audit findings are not state. */
+function cardRunPayloads(
+ config: RangerConfig,
+ run: { startedAt: string; endedAt: string; escalation?: EscalateResult | null },
+ env: NodeJS.ProcessEnv,
+): ExecutionRunFinishedPayloadInput[] {
+ return (run.escalation?.maps ?? []).flatMap(map => {
+  const cards = new Map(map.cards.map(card => [card.nodeId, card]));
+  const closed = new Set(map.closed);
+  return [...new Set([...map.posted, ...map.edited, ...map.keptOpen, ...map.closed])].map(id => {
+   const node = nodeKey(map.repo, id);
+   const card = cards.get(id);
+   if (!closed.has(id) && card === undefined) throw new Error(`card state missing age for ${node}`);
+   return {
+    run_id: randomUUID(),
+    producer: "ranger",
+    ran: { kind: "node" as const, ref: node },
+    serves: { node, ...(env.MF_SERVES_GOAL ? { goal: env.MF_SERVES_GOAL } : {}) },
+    outcome: "blocked" as const,
+    state: { subject: node, value: closed.has(id) ? "resolved" : AGE_BAND_STATE[ageBand(card!.ageDays)] },
+    started_at: run.startedAt,
+    ended_at: run.endedAt,
+    detail_ref: config.state.journalPath,
+   };
+  });
+ });
 }
 
 export async function emitNodeRunFinished(
@@ -120,7 +149,7 @@ export async function emitNodeRunFinished(
 ): Promise<void> {
  return emitRunFinished(config, journal, env => {
   const node = nodeKey(run.repo, run.nodeId);
-  return {
+  return [{
    run_id: randomUUID(),
    producer: "ranger",
    ran: { kind: "node", ref: node },
@@ -129,7 +158,7 @@ export async function emitNodeRunFinished(
    started_at: run.startedAt,
    ended_at: run.endedAt,
    detail_ref: workerLogFile(journal.path, run.repo, run.nodeId, run.generation),
-  };
+  }];
  }, deps);
 }
 
@@ -137,7 +166,7 @@ export async function emitNodeRunFinished(
 async function emitRunFinished(
  config: RangerConfig,
  journal: Pick<Journal, "recordEvent">,
- payload: (env: NodeJS.ProcessEnv) => ExecutionRunFinishedPayloadInput,
+ payloads: (env: NodeJS.ProcessEnv) => ExecutionRunFinishedPayloadInput[],
  deps: RunLedgerDeps,
 ): Promise<void> {
  const bus = config.bus;
@@ -160,18 +189,23 @@ async function emitRunFinished(
  const emit = (async () => {
   try {
    const env = deps.env ?? process.env;
-   const event = createExecutionRunFinished({
+   const correlation_id = env.MF_CORRELATION_ID || randomUUID();
+   const events = payloads(env).map(payload => createExecutionRunFinished({
     source: `${bus.principal}.ranger.run`,
     principal: bus.principal,
     stack: bus.stack,
     sovereignty: SOVEREIGNTY,
     payload: {
-     ...payload(env),
-     ...(env.MF_CORRELATION_ID ? { correlation_id: env.MF_CORRELATION_ID } : {}),
+     ...payload,
+     correlation_id,
     },
-   });
+   }));
    if (deps.publisher !== undefined) {
-    await deps.publisher(event);
+    const publisher = deps.publisher;
+    await Promise.all(events.map(async event => {
+     try { await publisher(event); }
+     catch (error) { log(`run-ledger emit failed: ${error instanceof Error ? error.message : String(error)}`); }
+    }));
     return;
    }
    const inner = (deps.makeTransport ?? natsTransport)(bus);
@@ -179,10 +213,11 @@ async function emitRunFinished(
     if (inner instanceof LedgerNatsTransport) inner.abort();
     else void inner.close().catch(() => {});
    };
-   const envelope = createEnvelope({ ...event.input, sovereignty: SOVEREIGNTY });
+   const envelopes = events.map(event => createEnvelope({ ...event.input, sovereignty: SOVEREIGNTY }));
+   const currentIds = new Set(envelopes.map(envelope => envelope.id));
    const outbox = createOutbox({ path: runLedgerPath(config), log, inner: {
     publish: async (subject, pending) => {
-     if (pending.id === envelope.id) {
+     if (currentIds.has(pending.id)) {
       await outbox.drained;
       if (!active) throw new Error("run-ledger emit timed out");
      }
@@ -192,10 +227,10 @@ async function emitRunFinished(
     close: () => inner.close(),
    } });
    try {
-    // Spool this run before waiting for replay. Its inner publish awaits
-    // drained, so a stalled replay retains this run too. NATS connects lazily
-    // and once per emit, including a failed connection or missing credentials.
-    await outbox.publish(event.subject, envelope);
+    // Start every append before waiting for any delivery: a stalled replay
+    // or connection must retain the entire tick's batch in the spool.
+    // NATS connects lazily and once for all envelopes in this emit.
+    await Promise.all(events.map((event, i) => outbox.publish(event.subject, envelopes[i])));
    } finally {
     if (active) await outbox.close();
    }
