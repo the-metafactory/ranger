@@ -59,7 +59,8 @@ import { mapKey } from "./maps.ts";
  * tick's whole page run when the mention sat on its first page. Undecided, the
  * cursor parks just before it and the next tick starts there. The worst case
  * is a visible duplicate draft; the gate's marker lookup keeps a 👍 on it from
- * filing a second node.
+ * filing a second node. A thread never read has no cursor either, so the
+ * first read drafts each past mention no ranger card has answered.
  *
  * Slice 2, the gate (node #251; rulings D4, D5, D13, D14, with D1): each
  * tick reads the reactions on the thread's open draft cards. The principal's
@@ -675,70 +676,115 @@ async function readThread(args: IntakeContext & {
   };
 
   // Read first, post after: a failed page posts nothing.
-  const pending: ThreadMessage[] = []; // qualifying mentions with no journaled draft
-  const answered = new Set<string>(); // mentions a ranger reply card says filed or discarded
-  let lastRead = cursor ?? THREAD_START;
-  let firstPageEnd: string | null = null;
-  let atEnd = false;
-  let withheld: unknown;
-  read: for (let page = 0; page < MAX_PAGES_PER_THREAD; page++) {
-    const messages = await client.messagesAfter(lastRead, THREAD_PAGE_SIZE, deadline);
-    for (const message of messages) {
-      if (message.authorId === botUserId) {
-        const card = message.replyTo === null ? null : intakeCardState(message.content);
-        if (card !== null && card.state !== "draft") answered.add(message.replyTo!);
-      } else if (message.authorId === principalId) {
-        let counts: boolean;
-        try {
-          counts = qualifies(message, botUserId);
-        } catch (error) {
-          withheld = error;
-          break read;
-        }
-        if (counts) {
-          if (journal.getIntakeDraft(message.id) !== null) result.alreadyDrafted.push(message.id);
-          else pending.push(message);
-        }
-      }
-      result.read++;
-      lastRead = message.id;
-    }
-    if (page === 0) firstPageEnd = lastRead;
-    if (messages.length < THREAD_PAGE_SIZE) {
-      atEnd = true;
-      break;
-    }
-  }
+  const scan = await scanThread({ client, from: cursor ?? THREAD_START, botUserId, principalId, journal, deadline });
+  result.read += scan.read;
+  result.alreadyDrafted.push(...scan.alreadyDrafted);
 
   // A card follows its mention: a mention is decided once the read saw the
   // thread's end, or a whole page run past it (it sat on the first page).
+  // A withheld mention ends every read at the same place until the bot can
+  // read it, so the mentions ahead of it are decided on what was read: the
+  // worst case is a duplicate draft (D14), never a mention stalled for good.
   const decided = (message: ThreadMessage) =>
-    withheld === undefined && (atEnd || (firstPageEnd !== null && compareSnowflakes(message.id, firstPageEnd) <= 0));
+    scan.withheld !== undefined ||
+    scan.atEnd ||
+    (scan.firstPageEnd !== null && compareSnowflakes(message.id, scan.firstPageEnd) <= 0);
   const claude = args.claude === undefined ? defaultClaude() : args.claude;
   let guildId: string | null | undefined;
-  for (const message of pending) {
+  for (const message of scan.pending) {
     // A filed or discarded card is an answer however far the read got.
-    if (answered.has(message.id)) {
+    if (scan.answered.has(message.id)) {
       result.answered.push(message.id);
       continue;
     }
     park(snowflakeBefore(message.id));
-    if (!decided(message)) {
-      if (withheld !== undefined) throw withheld;
-      return;
-    }
+    if (!decided(message)) return;
     // Too little pass time for a claude call: this message and the rest
     // wait for the next tick, not a deterministic draft forced by the clock.
     if (claudeCallStarved({ map, journal, config: args.config, claude, deadline, now: now() })) {
       result.deferred = true;
+      if (scan.withheld !== undefined) throw scan.withheld;
       return;
     }
     if (guildId === undefined) guildId = await client.guildId(deadline);
     await postDraft({ journal, config: args.config, claude, map, client, message, botUserId, guildId, deadline, owned, now: now() });
     result.drafted.push(message.id);
   }
-  park(lastRead);
-  if (withheld !== undefined) throw withheld;
+  park(scan.lastRead);
+  if (scan.withheld !== undefined) throw scan.withheld;
+}
+
+/** What one tick's page run over a thread saw (node #249). */
+interface ThreadScan {
+  /** Qualifying mentions with no journaled draft, oldest first. */
+  pending: ThreadMessage[];
+  /** Mentions a ranger reply card says filed or discarded. */
+  answered: Set<string>;
+  /** Qualifying mentions the journal already holds a draft for. */
+  alreadyDrafted: string[];
+  /** Messages read, the withheld one not counted. */
+  read: number;
+  /** The last message read: every message up to it was seen. */
+  lastRead: string;
+  /** The last message of the first page, or null when no page was read. */
+  firstPageEnd: string | null;
+  /** The read reached the thread's end. */
+  atEnd: boolean;
+  /** The error a mention whose content Discord withheld raised; the read stopped before it. */
+  withheld?: unknown;
+}
+
+/**
+ * Read up to `MAX_PAGES_PER_THREAD` pages after `from`, oldest first. Nothing
+ * is posted or journaled here; a failed page throws.
+ */
+async function scanThread(args: {
+  client: EscalationDiscord;
+  from: string;
+  botUserId: string;
+  principalId: string;
+  journal: Journal;
+  deadline: number;
+}): Promise<ThreadScan> {
+  const { client, botUserId, principalId, journal, deadline } = args;
+  const scan: ThreadScan = {
+    pending: [],
+    answered: new Set(),
+    alreadyDrafted: [],
+    read: 0,
+    lastRead: args.from,
+    firstPageEnd: null,
+    atEnd: false,
+  };
+  for (let page = 0; page < MAX_PAGES_PER_THREAD; page++) {
+    const messages = await client.messagesAfter(scan.lastRead, THREAD_PAGE_SIZE, deadline);
+    for (const message of messages) {
+      if (message.authorId === botUserId) {
+        const card = message.replyTo === null ? null : intakeCardState(message.content);
+        if (card !== null && card.state !== "draft") scan.answered.add(message.replyTo!);
+      } else if (message.authorId === principalId) {
+        let counts: boolean;
+        try {
+          counts = qualifies(message, botUserId);
+        } catch (error) {
+          scan.withheld = error;
+          return scan;
+        }
+        if (counts) {
+          if (journal.getIntakeDraft(message.id) !== null) scan.alreadyDrafted.push(message.id);
+          else scan.pending.push(message);
+        }
+      }
+      scan.read++;
+      scan.lastRead = message.id;
+    }
+    if (page === 0) scan.firstPageEnd = scan.lastRead;
+    if (messages.length < THREAD_PAGE_SIZE) {
+      scan.atEnd = true;
+      break;
+    }
+  }
+  return scan;
 }
 
 /**

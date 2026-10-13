@@ -52,6 +52,8 @@ export const CARD_HEADS: Record<string, { emoji: string; status: string }> = {
   proposal: { emoji: "🗳️", status: "proposal — react 👍 to ratify" },
   draft: { emoji: "📥", status: "draft node" },
   discarded: { emoji: "🗑️", status: "discarded" },
+  // The filed status ends in the node: `filed as #N`.
+  filed: { emoji: "✅", status: "filed as" },
 };
 
 type CardHead = (typeof CARD_HEADS)[string];
@@ -1111,8 +1113,8 @@ export function draftCardContent(map: { repo: string; root: number }, draft: Int
 /** The intake card once the principal's 👍 filed it (node #251, ruling D14). */
 export function filedCardContent(map: { repo: string; root: number }, draft: IntakeCardDraft, node: string): string {
   return renderCard({
-    emoji: "✅",
-    status: `filed as #${sanitizeGraphText(node)}`,
+    emoji: CARD_HEADS.filed!.emoji,
+    status: `${CARD_HEADS.filed!.status} #${sanitizeGraphText(node)}`,
     title: draft.title,
     meta: [...intakeMeta(map, draft), nodeUrl(map.repo, node)],
     lines: ["Filed on your 👍 under the machine account, labelled `ranger:principal-intake`."],
@@ -1146,8 +1148,10 @@ export function intakeCardState(
   const starts = (prefix: string) => line === prefix || line.startsWith(`${prefix} · `);
   if (starts(head(CARD_HEADS.draft!))) return { state: "draft" };
   if (starts(head(CARD_HEADS.discarded!))) return { state: "discarded" };
-  const filed = /^✅ filed as #(\S+?)(?: · |$)/.exec(line);
-  return filed === null ? null : { state: "filed", node: filed[1]! };
+  const filed = `${head(CARD_HEADS.filed!)} #`;
+  if (!line.startsWith(filed)) return null;
+  const node = line.slice(filed.length).split(" · ", 1)[0]!;
+  return node === "" || /\s/.test(node) ? null : { state: "filed", node };
 }
 
 /** Build the card + journal-row inputs for a node in one place (no drift). */

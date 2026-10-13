@@ -233,6 +233,27 @@ describe("intake recovers after the journal is lost (node #249, D14)", () => {
   } finally { r.close(); }
  });
 
+ test("a mention ahead of one whose content Discord withheld is drafted, not stalled behind it", async () => {
+  const r = rig();
+  try {
+   r.discord.say(THREAD, mention("1001"));
+   r.discord.say(THREAD, chatter("1002"));
+   r.discord.say(THREAD, { id: "1003", content: "", author: { id: PRINCIPAL }, mentions: [{ id: FAKE_BOT_ID }] });
+   r.discord.say(THREAD, mention("1004", "Export drops the last row"));
+   const first = await r.tick();
+   expect(thread(first)).toMatchObject({ read: 2, drafted: ["1001"], cursor: "1002" });
+   expect(thread(first).error).toContain("returned no content");
+   expect(r.discord.posts.map((p) => p.replyTo)).toEqual(["1001"]);
+
+   // The read stops at the withheld mention every tick; what lies ahead stays handled.
+   const second = await r.tick();
+   expect(thread(second)).toMatchObject({ read: 0, drafted: [], cursor: "1002" });
+   expect(thread(second).error).toContain("returned no content");
+   expect(r.discord.threadReads[1]).toEqual({ channelId: THREAD, after: "1002" });
+   expect(r.discord.posts).toHaveLength(1);
+  } finally { r.close(); }
+ });
+
  test("a failed rescan read posts nothing, files nothing and moves no cursor (failure case)", async () => {
   const r = rig();
   try {
@@ -269,6 +290,8 @@ describe("intakeCardState reads ranger's intake cards back (node #249)", () => {
   expect(intakeCardState(discardedCardContent(MAP, DRAFT))).toEqual({ state: "discarded" });
   expect(intakeCardState("✅ filed as #77")).toEqual({ state: "filed", node: "77" });
   expect(intakeCardState("a reply that says ✅ filed as #77")).toBeNull();
+  expect(intakeCardState("✅ filed as #")).toBeNull();
+  expect(intakeCardState("✅ filed as #7 7")).toBeNull();
   expect(intakeCardState("🗑️ discardedness · x")).toBeNull();
   expect(intakeCardState("")).toBeNull();
  });
