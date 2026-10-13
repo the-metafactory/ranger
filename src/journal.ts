@@ -167,6 +167,10 @@ export interface IntakeDraftRow {
  body: string;
  messageUrl: string;
  drafter: string;
+ /** The drafted kind (node #252); null when the drafter set none. */
+ kind: string | null;
+ /** JSON array of soma probes. */
+ probes: string | null;
  cardMessageId: string;
  /** draft | filing | filed | discarded (node #251). */
  status: string;

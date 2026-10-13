@@ -11,7 +11,7 @@ import { LeaseLostError, withEscalateLock, type OwnedCheck } from "./lock.ts";
 import { assertReadOnlyToken, type ResolvedToken } from "./token-gate.ts";
 import type { NodeResult } from "./graph.ts";
 import { BudgetDeferral } from "./budget.ts";
-import { code, renderCard, sanitizeGraphText } from "./card-render.ts";
+import { code, oneLine, renderCard, sanitizeGraphText } from "./card-render.ts";
 import { PROPOSAL_MISSING } from "./ratify.ts";
 
 /** The per-tick request budget (round-21) — split into two lanes so NEITHER
@@ -1053,6 +1053,13 @@ export interface IntakeCardDraft {
   checkpoint: string;
   autonomy: string;
   drafter: string;
+  /** The drafted kind and probes (node #252); a deterministic draft sets neither. */
+  kind?: string;
+  probes?: readonly unknown[];
+  /** The model a claude draft ran on (shown, not journaled). */
+  model?: string;
+  /** Why claude did not draft it, on a deterministic draft that fell back (shown, not journaled). */
+  fallback?: string;
   body: string;
   messageUrl: string;
   /** The spec hash the 👍 binds to (ruling D13); absent on a pre-#251 draft. */
@@ -1064,30 +1071,37 @@ function intakeMeta(map: { repo: string; root: number }, draft: IntakeCardDraft)
     `map: ${mapKey(map)}`,
     `parent #${draft.parent}`,
     `checkpoint ${code(draft.checkpoint)}`,
+    ...(draft.kind === undefined ? [] : [`kind ${draft.kind}`]),
     `autonomy ${draft.autonomy}`,
-    `${draft.drafter} draft`,
+    draft.drafter === "deterministic" ? "deterministic draft" : `drafted by ${draft.drafter}`,
     ...(draft.specHash === undefined || draft.specHash === null ? [] : [`spec ${code(draft.specHash.slice(0, 12))}`]),
   ];
 }
 
 /**
  * The draft node card of a principal observation (node #247, ruling D12): the
- * proposed spec on the subtext line, which drafter wrote it, the principal's
- * message as the body, and a link back to it. The principal's 👍 files it,
- * the ❌ discards it (node #251); the spec hash on the subtext line is what
- * the 👍 binds to (ruling D13).
+ * proposed spec on the subtext line, which drafter wrote it ("drafted by
+ * claude" or "deterministic draft", node #252), the principal's message as
+ * the body, and a link back to it. The principal's 👍 files it, the ❌
+ * discards it (node #251); the spec hash on the subtext line is what the 👍
+ * binds to (ruling D13).
  */
 export function draftCardContent(map: { repo: string; root: number }, draft: IntakeCardDraft): string {
   const ask = "React 👍 to file it, ❌ to discard it.";
+  const probes = draft.probes ?? [];
   return renderCard({
     ...CARD_HEADS.draft!,
     title: draft.title,
     meta: intakeMeta(map, draft),
-    lines: [
-      draft.drafter === "deterministic"
-        ? `Deterministic draft: the title is the first line of your message, the checkpoint is slugged from it, and the body is your message verbatim. Not filed yet. ${ask}`
-        : `${sanitizeGraphText(draft.drafter)} draft. Not filed yet. ${ask}`,
-    ],
+    lines: draft.drafter === "deterministic"
+      ? [
+          `Deterministic draft: the title is the first line of your message, the checkpoint is slugged from it, and the body is your message verbatim. Not filed yet. ${ask}`,
+          ...(draft.fallback === undefined ? [] : [`Claude did not draft it: ${sanitizeGraphText(draft.fallback)}.`]),
+        ]
+      : [
+          `Drafted by ${sanitizeGraphText(draft.drafter)}${draft.model === undefined ? "" : ` (${sanitizeGraphText(draft.model)})`} from your message and the map's open nodes. Not filed yet. ${ask}`,
+          probes.length === 0 ? "No probes." : `Probes: ${probes.map((probe) => code(oneLine(JSON.stringify(probe), 200))).join(", ")}`,
+        ],
     body: draft.body,
     // The tail survives every cut, so the link back always shows.
     tail: `From your message: <${draft.messageUrl}>`,

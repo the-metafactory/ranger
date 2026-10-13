@@ -309,8 +309,12 @@ export const intakeDrafts = sqliteTable(
   /** The principal's message, verbatim as Discord returned it. */
   body: text("body").notNull(),
   messageUrl: text("message_url").notNull(),
-  /** Which drafter wrote the spec: `deterministic` (D12's fallback). */
+  /** Which drafter wrote the spec: `claude` or `deterministic` (D12). */
   drafter: text("drafter").notNull(),
+  /** The drafted kind (migration 0026); null when the drafter set none. */
+  kind: text("kind"),
+  /** The drafted probes, a JSON array; null when the drafter set none. */
+  probes: text("probes"),
   /** The draft card ranger posted in the thread. */
   cardMessageId: text("card_message_id").notNull(),
   /**

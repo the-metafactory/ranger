@@ -17,8 +17,9 @@ import {
  type IntakeResult,
 } from "../src/intake.ts";
 import { Journal } from "../src/journal.ts";
+import type { ClaudeOneShot } from "../src/substrate.ts";
 import { walk } from "../src/walk.ts";
-import { baseConfigLines, FAKE_BOT_ID, FAKE_GUILD_ID, fakeDiscord, fixturesBin, type FakeThreadMessage } from "./support.ts";
+import { baseConfigLines, claudeEnvelope, FAKE_BOT_ID, FAKE_GUILD_ID, fakeDiscord, fixturesBin, type FakeThreadMessage } from "./support.ts";
 
 /**
  * The intake gate (node #251): the principal's 👍 on a draft card files the
@@ -46,7 +47,7 @@ function msg(id: string, author: string, content: string): FakeThreadMessage {
  return { id, content, author: { id: author }, mentions };
 }
 
-interface Issue { number: number; parent: string | null; title: string; autonomy: string; checkpoint: string; labels: string[]; body: string; machineAccount: boolean }
+interface Issue { number: number; parent: string | null; title: string; autonomy: string; checkpoint: string; labels: string[]; body: string; machineAccount: boolean; kind?: string; probes?: unknown[] }
 
 interface Rig {
  dir: string;
@@ -77,7 +78,7 @@ async function withEnv<T>(env: NodeJS.ProcessEnv, fn: () => Promise<T>): Promise
 }
 
 /** A map whose thread holds one drafted principal observation (the draft tick has run). */
-async function rig(): Promise<Rig> {
+async function rig(opts: { claude?: ClaudeOneShot } = {}): Promise<Rig> {
  const dir = mkdtempSync(join(tmpdir(), "ranger-intake-gate-"));
  const discord = fakeDiscord();
  const lines = baseConfigLines(dir, { auth: ["  writeTokens:", '    "acme/*": RANGER_WRITE_TEST'] });
@@ -109,7 +110,7 @@ async function rig(): Promise<Rig> {
   discord,
   journal,
   card: () => journal.getIntakeDraft(MESSAGE)!.cardMessageId,
-  tick: (extra = {}) => withEnv({ ...env, ...extra }, () => intakePass({ config, journal, clientFor, portFor })),
+  tick: (extra = {}) => withEnv({ ...env, ...extra }, () => intakePass({ config, journal, clientFor, portFor, ...(opts.claude === undefined ? {} : { claude: opts.claude }) })),
   lookups: () => lookups,
   issues: () => Object.values(state().issues ?? {}),
   links: () => state().links ?? [],
@@ -448,6 +449,35 @@ describe("intake gate: the principal's 👍 files the draft (node #251)", () => 
  });
 });
 
+describe("intake gate on a claude draft (node #252 beside node #251)", () => {
+ test("the 👍 on a claude-drafted card binds to its kind and probes too, and files it", async () => {
+  const answer = {
+   title: "Minimap redraws on resize",
+   parent: 1,
+   checkpoint: "minimap-redraws-on-resize",
+   kind: "task",
+   autonomy: "approve",
+   probes: [{ type: "git-ref-exists", ref: "main" }],
+  };
+  const claude: ClaudeOneShot = async () =>
+   ({ code: 0, stdout: claudeEnvelope(answer), stderr: "" });
+  const r = await rig({ claude });
+  try {
+   const draft = r.journal.getIntakeDraft(MESSAGE)!;
+   expect(draft).toMatchObject({ drafter: "claude", kind: "task", autonomy: "approve", probes: JSON.stringify(answer.probes) });
+   expect(r.discord.posts[0]!.content).toContain("drafted by claude");
+   expect(r.discord.posts[0]!.content).toContain(`spec \`${draft.specHash!.slice(0, 12)}\``);
+
+   r.discord.react(r.card(), "👍", PRINCIPAL);
+   const result = await r.tick();
+   expect(gateOf(result).filed).toEqual([{ messageId: MESSAGE, node: "100", added: true }]);
+   expect(r.issues()[0]).toMatchObject({
+    parent: "1", title: answer.title, autonomy: "approve", checkpoint: answer.checkpoint, kind: "task", probes: answer.probes,
+   });
+  } finally { r.close(); }
+ });
+});
+
 describe("intake gate pieces (node #251)", () => {
  test("the spec hash covers every field the card shows", () => {
   const map = { repo: "acme/widgets", root: 1 };
@@ -458,6 +488,12 @@ describe("intake gate pieces (node #251)", () => {
   }
   expect(intakeSpecHash({ ...map, root: 2 }, draft)).not.toBe(hash);
   expect(intakeSpecHash(map, { ...draft })).toBe(hash);
+  // A claude draft's kind and probes are bound too (node #252); a draft with neither hashes as before.
+  const claude = { ...draft, drafter: "claude", kind: "task", probes: [{ type: "git-ref-exists", ref: "main" }] };
+  const claudeHash = intakeSpecHash(map, claude);
+  expect(intakeSpecHash(map, { ...claude, kind: "research" })).not.toBe(claudeHash);
+  expect(intakeSpecHash(map, { ...claude, probes: [] })).not.toBe(claudeHash);
+  expect(intakeSpecHash(map, { ...draft, kind: undefined, probes: undefined })).toBe(hash);
  });
 
  test("the marker lookup names the one marked node, and refuses two", () => {

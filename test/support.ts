@@ -155,6 +155,11 @@ export function runCliSpawn(
  return { child, result };
 }
 
+/** The `claude -p --output-format json` envelope around a model answer (intake, node #252). */
+export function claudeEnvelope(answer: unknown): string {
+ return JSON.stringify({ type: "result", subtype: "success", is_error: false, result: typeof answer === "string" ? answer : JSON.stringify(answer) });
+}
+
 /** The fake Discord's own bot user id and guild (intake, node #247). */
 export const FAKE_BOT_ID = "900000000000000001";
 export const FAKE_GUILD_ID = "700000000000000007";

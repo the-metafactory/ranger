@@ -99,6 +99,8 @@ export interface WalkContext {
  readGate?: ReadGate;
  /** The intake pass's thread client (tests inject one; default: each map's Discord surface). */
  intakeClient?: IntakeContext["clientFor"];
+ /** The intake drafter's one-shot `claude -p` runner (tests inject a fake). */
+ intakeClaude?: IntakeContext["claude"];
 }
 
 /** Is this resource lane held? (awaiting-merge does not hold it.) */
@@ -662,6 +664,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
   portFor: targetFor,
   ...(ctx.now === undefined ? {} : { now: ctx.now }),
   ...(ctx.intakeClient === undefined ? {} : { clientFor: ctx.intakeClient }),
+  ...(ctx.intakeClaude === undefined ? {} : { claude: ctx.intakeClaude }),
  });
 
  result.maps = maps;

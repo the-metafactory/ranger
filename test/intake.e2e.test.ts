@@ -7,9 +7,11 @@ import { sanitizeGraphText } from "../src/card-render.ts";
 import { EscalationDiscord, snowflakeAt } from "../src/discord.ts";
 import { deterministicDraft, intakePass, slugCheckpoint } from "../src/intake.ts";
 import { Journal } from "../src/journal.ts";
+import type { ClaudeOneShot } from "../src/substrate.ts";
 import { walk } from "../src/walk.ts";
 import {
  baseConfigLines,
+ claudeEnvelope,
  FAKE_BOT_ID,
  FAKE_GUILD_ID,
  fakeDiscord,
@@ -49,7 +51,7 @@ interface Rig {
  journal: Journal;
  config: ReturnType<typeof loadConfig>["config"];
  /** Run one walk tick in-process, its intake client pointed at the fake. */
- tick(): ReturnType<typeof walk>;
+ tick(intakeClaude?: ClaudeOneShot | null): ReturnType<typeof walk>;
  close(): void;
 }
 
@@ -75,7 +77,8 @@ function rig(opts: { extraMaps?: string[]; discordId?: string | null; seed?: boo
   journal,
   config,
   // No write token is configured: every map is gated, and intake still runs.
-  tick: () => walk({ config, configPath, journal, intakeClient }),
+  tick: (intakeClaude?: ClaudeOneShot | null) =>
+   walk({ config, configPath, journal, intakeClient, ...(intakeClaude === undefined ? {} : { intakeClaude }) }),
   close() {
    journal.close();
    discord.stop();
@@ -267,6 +270,60 @@ describe("intake pass of the walk tick (node #247)", () => {
    r.journal = new Journal(join(r.dir, "state.sqlite"));
    r.close();
   }
+ });
+});
+
+describe("the claude drafter on the walk tick (node #252, D12)", () => {
+ const answer = {
+  title: "Export keeps the last row",
+  parent: 1,
+  checkpoint: "export-keeps-last-row",
+  kind: "task",
+  autonomy: "propose",
+  probes: [{ type: "git-ref-exists", ref: "main" }],
+ };
+ const claudeAnswering = (calls: string[]): ClaudeOneShot => async (prompt) => {
+  calls.push(prompt);
+  return { code: 0, stdout: claudeEnvelope(answer), stderr: "" };
+ };
+
+ test("a claude draft is posted as drafted by claude, charged to the spawn ledger, and its whole spec recorded", async () => {
+  const r = rig();
+  try {
+   r.discord.say(THREAD, msg("1001", PRINCIPAL, `<@${FAKE_BOT_ID}> Export drops the last row`));
+   const calls: string[] = [];
+   const result = await r.tick(claudeAnswering(calls));
+   expect(result.intake.threads[0]).toMatchObject({ drafted: ["1001"], cursor: "1001" });
+   expect(calls).toHaveLength(1);
+   expect(r.journal.spawnsToday()).toBe(1);
+   const card = r.discord.posts[0]!.content;
+   expect(card.split("\n")[0]).toBe("📥 draft node · Export keeps the last row");
+   expect(card).toContain("drafted by claude");
+   expect(card).toContain("kind task");
+   expect(r.journal.getIntakeDraft("1001")).toMatchObject({
+    title: "Export keeps the last row",
+    checkpoint: "export-keeps-last-row",
+    drafter: "claude",
+    parent: 1,
+    autonomy: "propose",
+    kind: "task",
+    probes: JSON.stringify(answer.probes),
+   });
+   expect(r.journal.listEvents("acme/widgets").find((e) => e.kind === "intake-draft")?.detail).toContain("(claude)");
+  } finally { r.close(); }
+ });
+
+ test("a failed call posts the deterministic draft and says why", async () => {
+  const r = rig();
+  try {
+   r.discord.say(THREAD, msg("1001", PRINCIPAL, `<@${FAKE_BOT_ID}> Export drops the last row`));
+   await r.tick(async () => ({ code: 2, stdout: "", stderr: "auth expired" }));
+   const card = r.discord.posts[0]!.content;
+   expect(card).toContain("deterministic draft");
+   expect(card).toContain("Claude did not draft it: claude exited 2.");
+   expect(card).not.toContain("auth expired");
+   expect(r.journal.getIntakeDraft("1001")).toMatchObject({ drafter: "deterministic", parent: 1, autonomy: "propose", kind: null, probes: null });
+  } finally { r.close(); }
  });
 });
 
