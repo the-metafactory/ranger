@@ -197,7 +197,7 @@ maps:
   - repo: the-metafactory/cortex
     root: 2556
     walk: full
-    autoMerge: false
+    autoMerge: true
     localCheckout: ~/work/mf/cortex
     commands:
       install: bun install --frozen-lockfile
