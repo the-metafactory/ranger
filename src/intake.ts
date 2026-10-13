@@ -1,7 +1,13 @@
 import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
-import { discardedCardContent, draftCardContent, filedCardContent, type IntakeCardDraft } from "./card-sync.ts";
+import {
+  discardedCardContent,
+  draftCardContent,
+  filedCardContent,
+  intakeCardState,
+  type IntakeCardDraft,
+} from "./card-sync.ts";
 import { cachedFrontier } from "./frontier-cache.ts";
 import { normalizeNodeId, parseForgeRef } from "./forge-ref.ts";
 import { underTest } from "./journal-guard.ts";
@@ -11,8 +17,10 @@ import {
   DiscordMessageGoneError,
   EscalateError,
   EscalationDiscord,
-  snowflakeAt,
+  compareSnowflakes,
+  snowflakeBefore,
   THREAD_PAGE_SIZE,
+  THREAD_START,
   type ThreadMessage,
 } from "./discord.ts";
 import type { ForgeReadPort, LabeledIssue } from "./forge.ts";
@@ -36,10 +44,22 @@ import { mapKey } from "./maps.ts";
  * message and the map's open nodes (node #252); when that call cannot run or
  * its answer fails validation, the deterministic drafter does.
  *
- * Per thread the journal holds a cursor (the newest message id read) and one
- * draft per message id. The cursor moves past each message once it is
- * handled; a message read twice (a crash before the cursor write) finds its
- * draft and posts no second card. A failed read moves nothing.
+ * Per thread the journal holds a cursor (every message up to it is handled)
+ * and one draft per message id. A message read twice (a crash before the
+ * cursor write) finds its draft and posts no second card. A failed read
+ * posts nothing and moves nothing.
+ *
+ * Journal loss (node #249; ruling D14, with D1): each draft card is posted as
+ * a reply to the @-mention it answers, and the gate edits that same card to
+ * "filed as #N" or "discarded". A qualifying mention with no journaled draft
+ * is drafted unless a ranger card replying to it says filed or discarded. A
+ * thread with no cursor is read from its oldest message, one capped run of
+ * pages per tick. Since a card follows its mention, a mention is decided only
+ * once the read has looked far enough past it: the thread's end, or this
+ * tick's whole page run when the mention sat on its first page. Undecided, the
+ * cursor parks just before it and the next tick starts there. The worst case
+ * is a visible duplicate draft; the gate's marker lookup keeps a 👍 on it from
+ * filing a second node.
  *
  * Slice 2, the gate (node #251; rulings D4, D5, D13, D14, with D1): each
  * tick reads the reactions on the thread's open draft cards. The principal's
@@ -97,12 +117,14 @@ export interface IntakeThreadResult {
   drafted: string[];
   /** Message ids read again whose draft the journal already held. */
   alreadyDrafted: string[];
+  /** Message ids with no journaled draft whose ranger reply card says filed or discarded: not redrafted. */
+  answered: string[];
   /** The pass ran short of time for a claude draft: the rest of the thread waits for the next tick. */
   deferred?: boolean;
   /** The cursor after this tick; null when the thread was not read. */
   cursor: string | null;
-  /** First tick on this thread: the cursor was set to now and nothing read. */
-  seeded?: boolean;
+  /** The journal held no cursor for this thread: the read started at its oldest message (node #249). */
+  rescan?: boolean;
   /** Why this thread was not read, when that is configuration, not a failure. */
   skipped?: string;
   error?: string;
@@ -581,6 +603,7 @@ async function readThreads(
       read: 0,
       drafted: [],
       alreadyDrafted: [],
+      answered: [],
       cursor: null,
     };
     results.push(result);
@@ -622,7 +645,9 @@ async function readThreads(
 
 /**
  * Read one thread after its cursor, oldest first, and draft each qualifying
- * message. Throws on the first failure; the cursor stays before that message.
+ * message no ranger card has answered (node #249). A failed read throws before
+ * anything is posted. A mention whose content Discord withheld stops the read
+ * before it: the messages ahead of it are handled, then it throws.
  */
 async function readThread(args: IntakeContext & {
   map: RangerMapConfig;
@@ -638,40 +663,82 @@ async function readThread(args: IntakeContext & {
   const channelId = client.channel;
   let cursor = journal.intakeCursor(channelId);
   if (cursor === null) {
-    // First read of this thread: start from now. A mention posted before
-    // intake was on is history, not a new observation.
-    owned();
-    journal.setIntakeCursor(channelId, snowflakeAt(now()), now());
-    result.seeded = true;
-    return;
+    // No cursor: never read, or the journal was lost. Read from the oldest
+    // message still in the thread; ranger's reply cards say what is answered.
+    result.rescan = true;
   }
-  const claude = args.claude === undefined ? defaultClaude() : args.claude;
-  let guildId: string | null | undefined;
-  for (let page = 0; page < MAX_PAGES_PER_THREAD; page++) {
-    const messages = await client.messagesAfter(cursor, THREAD_PAGE_SIZE, deadline);
+  const park = (to: string) => {
+    if (to === cursor) return;
+    owned();
+    journal.setIntakeCursor(channelId, to, now());
+    cursor = to;
+  };
+
+  // Read first, post after: a failed page posts nothing.
+  const pending: ThreadMessage[] = []; // qualifying mentions with no journaled draft
+  const answered = new Set<string>(); // mentions a ranger reply card says filed or discarded
+  let lastRead = cursor ?? THREAD_START;
+  let firstPageEnd: string | null = null;
+  let atEnd = false;
+  let withheld: unknown;
+  read: for (let page = 0; page < MAX_PAGES_PER_THREAD; page++) {
+    const messages = await client.messagesAfter(lastRead, THREAD_PAGE_SIZE, deadline);
     for (const message of messages) {
-      result.read++;
-      if (message.authorId === principalId && qualifies(message, botUserId)) {
-        if (journal.getIntakeDraft(message.id) !== null) {
-          result.alreadyDrafted.push(message.id);
-        } else {
-          // Too little pass time for a claude call: this message and the rest
-          // wait for the next tick, not a deterministic draft forced by the clock.
-          if (claudeCallStarved({ map, journal, config: args.config, claude, deadline, now: now() })) {
-            result.deferred = true;
-            return;
-          }
-          if (guildId === undefined) guildId = await client.guildId(deadline);
-          await postDraft({ journal, config: args.config, claude, map, client, message, botUserId, guildId, deadline, owned, now: now() });
-          result.drafted.push(message.id);
+      if (message.authorId === botUserId) {
+        const card = message.replyTo === null ? null : intakeCardState(message.content);
+        if (card !== null && card.state !== "draft") answered.add(message.replyTo!);
+      } else if (message.authorId === principalId) {
+        let counts: boolean;
+        try {
+          counts = qualifies(message, botUserId);
+        } catch (error) {
+          withheld = error;
+          break read;
+        }
+        if (counts) {
+          if (journal.getIntakeDraft(message.id) !== null) result.alreadyDrafted.push(message.id);
+          else pending.push(message);
         }
       }
-      owned();
-      journal.setIntakeCursor(channelId, message.id, now());
-      cursor = message.id;
+      result.read++;
+      lastRead = message.id;
     }
-    if (messages.length < THREAD_PAGE_SIZE) return;
+    if (page === 0) firstPageEnd = lastRead;
+    if (messages.length < THREAD_PAGE_SIZE) {
+      atEnd = true;
+      break;
+    }
   }
+
+  // A card follows its mention: a mention is decided once the read saw the
+  // thread's end, or a whole page run past it (it sat on the first page).
+  const decided = (message: ThreadMessage) =>
+    withheld === undefined && (atEnd || (firstPageEnd !== null && compareSnowflakes(message.id, firstPageEnd) <= 0));
+  const claude = args.claude === undefined ? defaultClaude() : args.claude;
+  let guildId: string | null | undefined;
+  for (const message of pending) {
+    // A filed or discarded card is an answer however far the read got.
+    if (answered.has(message.id)) {
+      result.answered.push(message.id);
+      continue;
+    }
+    park(snowflakeBefore(message.id));
+    if (!decided(message)) {
+      if (withheld !== undefined) throw withheld;
+      return;
+    }
+    // Too little pass time for a claude call: this message and the rest
+    // wait for the next tick, not a deterministic draft forced by the clock.
+    if (claudeCallStarved({ map, journal, config: args.config, claude, deadline, now: now() })) {
+      result.deferred = true;
+      return;
+    }
+    if (guildId === undefined) guildId = await client.guildId(deadline);
+    await postDraft({ journal, config: args.config, claude, map, client, message, botUserId, guildId, deadline, owned, now: now() });
+    result.drafted.push(message.id);
+  }
+  park(lastRead);
+  if (withheld !== undefined) throw withheld;
 }
 
 /**
@@ -716,7 +783,8 @@ async function postDraft(args: {
     specHash,
   });
   owned();
-  const cardMessageId = await client.post(content, deadline);
+  // A reply to the mention: after a lost journal, the card says this mention is answered (node #249).
+  const cardMessageId = await client.post(content, deadline, [], [], { replyTo: message.id });
   // No await between the post and its record: a crash can only leave the
   // cursor behind, and the re-read finds this draft.
   journal.recordIntakeDraft({

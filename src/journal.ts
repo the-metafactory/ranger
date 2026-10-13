@@ -1135,7 +1135,12 @@ export class Journal {
 
  // ---- human-observation intake (node #247) ----
 
- /** The newest message id read from a map thread, or null before the first read. */
+ /**
+  * How far intake has handled a map thread: every message up to this id is
+  * done. Null when the journal holds no cursor, before the first read or
+  * after the journal was lost: the rescan then reads from the thread's
+  * oldest message (node #249).
+  */
  intakeCursor(channelId: string): string | null {
   const row = this.db.select().from(intakeCursors).where(eq(intakeCursors.channelId, channelId)).get();
   return row?.lastMessageId ?? null;

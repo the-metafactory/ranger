@@ -1133,6 +1133,23 @@ export function discardedCardContent(map: { repo: string; root: number }, draft:
   });
 }
 
+/**
+ * Which intake card this is, read off its status line: a draft, filed (with
+ * the node), discarded, or null for any other text. The journal-loss rescan
+ * (node #249) reads ranger's own reply cards back with it.
+ */
+export function intakeCardState(
+  content: string,
+): { state: "draft" } | { state: "filed"; node: string } | { state: "discarded" } | null {
+  const line = content.split("\n", 1)[0]!;
+  const head = (h: { emoji: string; status: string }) => `${h.emoji} ${h.status}`;
+  const starts = (prefix: string) => line === prefix || line.startsWith(`${prefix} · `);
+  if (starts(head(CARD_HEADS.draft!))) return { state: "draft" };
+  if (starts(head(CARD_HEADS.discarded!))) return { state: "discarded" };
+  const filed = /^✅ filed as #(\S+?)(?: · |$)/.exec(line);
+  return filed === null ? null : { state: "filed", node: filed[1]! };
+}
+
 /** Build the card + journal-row inputs for a node in one place (no drift). */
 function cardFrom(
   node: ClassifiedNode,
