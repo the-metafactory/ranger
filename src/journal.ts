@@ -195,7 +195,7 @@ export interface IntakeDraftRow {
  /** JSON array of soma probes. */
  probes: string | null;
  cardMessageId: string;
- /** draft | filing | filed | discarded (node #251). */
+ /** draft | filing | filed | discarded (node #251) | superseding | superseded (node #241). */
  status: string;
  createdAt: string;
  /** The spec hash the card showed (ruling D13); null before node #251. */
@@ -208,6 +208,10 @@ export interface IntakeDraftRow {
  parent: number;
  /** The drafted autonomy: the card shows it and the add mints it. */
  autonomy: string;
+ /** The draft this correction replaced (node #241, ruling D13); null on a mention's own draft. */
+ supersedes: string | null;
+ /** The @-mention a corrected draft traces back to; null on the mention's own draft. */
+ originMessageId: string | null;
 }
 
 export interface ResumeQueueRow {
@@ -268,7 +272,9 @@ export type EventKind =
  | "intake-draft"
  /** Intake gate (node #251): the principal's 👍 filed a draft, or ❌ discarded one. */
  | "intake-filed"
- | "intake-discarded";
+ | "intake-discarded"
+ /** A principal correction reply got a new draft card that supersedes the old (node #241). */
+ | "intake-corrected";
 
 /** The health-store key of a checkout's known-good git state (`knownGoodGitState`). */
 const knownGoodGitKey = (canonical: string): string => `git.known-good.${canonical}`;
@@ -1192,7 +1198,12 @@ export class Journal {
 
  // ---- human-observation intake (node #247) ----
 
- /** The newest message id read from a map thread, or null before the first read. */
+ /**
+  * How far intake has handled a map thread: every message up to this id is
+  * done. Null when the journal holds no cursor, before the first read or
+  * after the journal was lost: the rescan then reads from the thread's
+  * oldest message (node #249).
+  */
  intakeCursor(channelId: string): string | null {
   const row = this.db.select().from(intakeCursors).where(eq(intakeCursors.channelId, channelId)).get();
   return row?.lastMessageId ?? null;
@@ -1213,8 +1224,36 @@ export class Journal {
  }
 
  /** Record a posted draft card; a second record for one message is refused. */
- recordIntakeDraft(row: Omit<IntakeDraftRow, "status" | "filedNode" | "gateReadAt">): void {
+ recordIntakeDraft(row: Omit<IntakeDraftRow, "status" | "filedNode" | "gateReadAt" | "supersedes" | "originMessageId">): void {
   this.db.insert(intakeDrafts).values({ ...row, status: "draft" }).run();
+ }
+
+ /**
+  * Record a correction's draft and mark the draft it replaces `superseding`
+  * in one transaction (node #241, ruling D13): from here only the new card
+  * can be filed. Refused unless the replaced draft is still `draft`.
+  */
+ recordIntakeCorrection(row: Omit<IntakeDraftRow, "status" | "filedNode" | "gateReadAt"> & { supersedes: string }): void {
+  this.db.transaction((tx) => {
+   const replaced = tx
+    .update(intakeDrafts)
+    .set({ status: "superseding" })
+    .where(and(eq(intakeDrafts.messageId, row.supersedes), eq(intakeDrafts.status, "draft")))
+    .returning()
+    .get();
+   if (replaced === undefined) throw new Error(`draft ${row.supersedes} is no longer a draft — the correction is not recorded`);
+   tx.insert(intakeDrafts).values({ ...row, status: "draft" }).run();
+  });
+ }
+
+ /** The draft whose card is this Discord message, or null. */
+ getIntakeDraftByCard(cardMessageId: string): IntakeDraftRow | null {
+  return this.db.select().from(intakeDrafts).where(eq(intakeDrafts.cardMessageId, cardMessageId)).get() ?? null;
+ }
+
+ /** The correction that replaced this draft (node #241), or null. */
+ getIntakeSuccessor(messageId: string): IntakeDraftRow | null {
+  return this.db.select().from(intakeDrafts).where(eq(intakeDrafts.supersedes, messageId)).get() ?? null;
  }
 
  updateIntakeDraft(
@@ -1225,14 +1264,15 @@ export class Journal {
  }
 
  /**
-  * The drafts in a thread the gate still reads (node #251): `draft` and
-  * `filing`, the least recently read first, then the oldest.
+  * The drafts in a thread the gate still reads (node #251): `draft`,
+  * `filing` and `superseding` (its old card still to edit, node #241), the
+  * least recently read first, then the oldest.
   */
  listOpenIntakeDrafts(channelId: string): IntakeDraftRow[] {
   return this.db
    .select()
    .from(intakeDrafts)
-   .where(and(eq(intakeDrafts.channelId, channelId), inArray(intakeDrafts.status, ["draft", "filing"])))
+   .where(and(eq(intakeDrafts.channelId, channelId), inArray(intakeDrafts.status, ["draft", "filing", "superseding"])))
    .orderBy(sql`coalesce(${intakeDrafts.gateReadAt}, '')`, asc(intakeDrafts.createdAt), asc(intakeDrafts.messageId))
    .all();
  }

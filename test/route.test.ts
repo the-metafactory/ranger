@@ -11,6 +11,8 @@ import {
   type ProbeRegistry,
 } from "../src/route.ts";
 import type { FrontierEntry } from "../src/graph.ts";
+import { intakeNodeBody } from "../src/intake.ts";
+import { foundByProbeSpec, splitOutOfReviewSpec } from "../src/scribe.ts";
 
 interface EntryOverrides {
   ref?: { id: string };
@@ -403,6 +405,67 @@ describe("probe registry keys (soma registry v2)", () => {
     for (const registry of [v2, EMPTY_REGISTRY]) {
       const node = classify(proposeBuild("bot"), "acme/widgets", "full", registry, { botIdentity: "bot" });
       expect(node.route).toEqual({ route: "escalate-hitl", reason: "propose-approve" });
+    }
+  });
+});
+
+describe("classify — intake-filed nodes walk as principal-filed (node #248, #21 ruling D5)", () => {
+  const BOT = "ivy-agent";
+  const MARKER = "<!-- ranger:intake discord=1288000000000000000 -->";
+  const MERGE = { route: "implement", walkable: true, ratify: "merge" } as const;
+  const HELD = { route: "escalate-hitl", reason: "propose-approve" } as const;
+  const filed = (body: string, kind = "build", author = BOT): FrontierEntry => ({
+    ...entry({ node: { autonomy: "propose", kind } }),
+    author,
+    body,
+  });
+  const route = (e: FrontierEntry) => classify(e, "acme/widgets", "full", EMPTY_REGISTRY, { botIdentity: BOT }).route;
+
+  test("a bot-authored propose build or task carrying the intake marker → class 2a", () => {
+    const body = intakeNodeBody({
+      body: "## Deliverable\n\nThe thing.",
+      messageUrl: "https://discord.com/channels/1/2/1288000000000000000",
+      messageId: "1288000000000000000",
+    });
+    for (const kind of ["build", "task"]) {
+      expect(route(filed(body, kind))).toEqual(MERGE);
+    }
+  });
+
+  test("a bot-authored node without the marker is held as machine-filed", () => {
+    expect(route(filed("## Deliverable\n\nThe thing."))).toEqual(HELD);
+    const bare = entry({ node: { autonomy: "propose", kind: "build" } });
+    expect(route({ ...bare, author: BOT })).toEqual(HELD);
+  });
+
+  test("a marker that is not the body's own last line, or has a non-numeric id, grants nothing", () => {
+    for (const body of [
+      `Quoted ${MARKER} mid-line`,
+      `${MARKER} trailing`,
+      `${MARKER}\n\nmore text after it`,
+      "<!-- ranger:intake discord=abc -->",
+      "<!-- ranger:intake discord= -->",
+      "<!-- ranger:intake discord=12 --> -->",
+    ]) {
+      expect(route(filed(body))).toEqual(HELD);
+    }
+  });
+
+  test("ranger's own filings outside intake are never walked, even quoting a marker (node #9 ban)", () => {
+    const pr = { number: 7, url: "https://github.com/acme/widgets/pull/7" };
+    const baseRed = foundByProbeSpec("acme/widgets", "main", { id: "5" }, "test", [MARKER], "a".repeat(40), pr);
+    const review = { round: 2, sha: "b".repeat(40), blockers: 1, majors: 0, nits: 0, body: MARKER };
+    const split = splitOutOfReviewSpec("acme/widgets", { id: "5", title: "x" }, pr, review);
+    for (const spec of [baseRed, split]) {
+      expect(spec.body).toContain(MARKER);
+      expect(route(filed(spec.body ?? ""))).toEqual(HELD);
+    }
+  });
+
+  test("the marker grants nothing off walk: full", () => {
+    const body = `Words.\n\n${MARKER}`;
+    for (const walk of ["research-only", "none"] as const) {
+      expect(classify(filed(body), "acme/widgets", walk, EMPTY_REGISTRY, { botIdentity: BOT }).route).toEqual(HELD);
     }
   });
 });

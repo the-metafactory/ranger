@@ -298,6 +298,7 @@ export class EscalationDiscord {
     files: readonly DiscordFile[] = [],
     embeds: readonly { description: string }[] = [],
     retryServerErrors = true,
+    replyTo?: string,
   ): Promise<DiscordHttpResult> {
     validateDiscordFiles(files);
     // Every call times out — a run can never stall indefinitely holding the
@@ -326,7 +327,11 @@ export class EscalationDiscord {
           allowed_mentions: {
             parse: [],
             users: this.principalDiscordId ? [this.principalDiscordId] : [],
+            // A reply never pings the author it answers.
+            ...(replyTo === undefined ? {} : { replied_user: false }),
           },
+          // A reply to a message that is gone posts as a plain message.
+          ...(replyTo === undefined ? {} : { message_reference: { message_id: replyTo, fail_if_not_exists: false } }),
           ...(embeds.length === 0 ? {} : { embeds }),
           ...(files.length === 0 ? {} : {
             attachments: files.map((f, id) => ({ id, filename: f.name, description: f.description })),
@@ -424,13 +429,17 @@ export class EscalationDiscord {
     }
   }
 
-  /** Post a new card; returns the Discord message id (announce-once). */
+  /**
+   * Post a new card; returns the Discord message id (announce-once). With
+   * `replyTo`, the card is a reply to that message (`message_reference`):
+   * an intake draft card answers the principal's @-mention (node #249).
+   */
   async post(
     content: string,
     deadline?: number,
     files: readonly DiscordFile[] = [],
     embeds: readonly { description: string }[] = [],
-    opts: { retryServerErrors?: boolean } = {},
+    opts: { retryServerErrors?: boolean; replyTo?: string } = {},
   ): Promise<string> {
     const response = await this.request(
       "POST",
@@ -440,6 +449,7 @@ export class EscalationDiscord {
       files,
       embeds,
       opts.retryServerErrors ?? true,
+      opts.replyTo,
     );
     if (response.status < 200 || response.status >= 300) {
       throw new EscalateError(`discord post returned HTTP ${response.status}`);
@@ -570,8 +580,10 @@ export class EscalationDiscord {
 
   /**
    * Up to `limit` messages after `after` in this channel, oldest first. Over
-   * REST a bot gets the content of a message that mentions it without the
-   * privileged Message Content intent; other messages may come back empty.
+   * REST a bot gets the content of a message that mentions it, and of its own
+   * messages, without the privileged Message Content intent; other messages
+   * may come back empty. `after` = `THREAD_START` reads from the oldest
+   * message still in the channel, one page at a time.
    */
   async messagesAfter(after: string, limit = THREAD_PAGE_SIZE, deadline?: number): Promise<ThreadMessage[]> {
     const label = `read of channel ${this.channelId} messages`;
@@ -587,7 +599,7 @@ export class EscalationDiscord {
         content?: unknown;
         author?: { id?: unknown };
         mentions?: { id?: unknown }[];
-        message_reference?: unknown;
+        message_reference?: { message_id?: unknown; type?: unknown } | null;
       };
       if (typeof m?.id !== "string" || !SNOWFLAKE.test(m.id)) {
         throw new EscalateError(`discord ${label} returned a message without an id`);
@@ -600,6 +612,7 @@ export class EscalationDiscord {
           ? m.mentions.flatMap((u) => (typeof u?.id === "string" ? [u.id] : []))
           : [],
         isReply: m.message_reference !== undefined && m.message_reference !== null,
+        replyTo: replyTarget(m.message_reference),
       };
     });
     // Discord lists newest first; intake walks oldest first.
@@ -652,6 +665,18 @@ export interface ThreadMessage {
   mentionIds: string[];
   /** A reply: Discord lists the replied-to author as mentioned when it pings. */
   isReply: boolean;
+  /** The message this one replies to; null for a non-reply or a forward. */
+  replyTo: string | null;
+}
+
+/** The cursor before every message: a read after it starts at the channel's oldest message. */
+export const THREAD_START = "0";
+
+/** The id a reply's `message_reference` points at. A forward (type 1) answers nothing. */
+function replyTarget(reference: { message_id?: unknown; type?: unknown } | null | undefined): string | null {
+  if (reference === undefined || reference === null) return null;
+  if (reference.type !== undefined && reference.type !== 0) return null;
+  return typeof reference.message_id === "string" && SNOWFLAKE.test(reference.message_id) ? reference.message_id : null;
 }
 
 /** Order two Discord snowflakes (ids grow with time). */
@@ -668,6 +693,12 @@ const DISCORD_EPOCH_MS = 1_420_070_400_000n;
 export function snowflakeAt(at: Date): string {
   const ms = BigInt(Math.max(0, at.getTime())) - DISCORD_EPOCH_MS;
   return (ms < 0n ? 0n : ms << 22n).toString();
+}
+
+/** The cursor just before `id`: a read after it starts with that message. */
+export function snowflakeBefore(id: string): string {
+  const before = BigInt(id) - 1n;
+  return (before < 0n ? 0n : before).toString();
 }
 
 export function sleep(ms: number): Promise<void> {

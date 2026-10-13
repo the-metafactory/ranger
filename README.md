@@ -249,7 +249,7 @@ bun src/cli.ts journal                    # inspect workers/events/health
   --json` `openClaimed`; an audit cached without it is reported until the
   walk caches a fresh one), and its comment id (or its veto) is recovered
   from the node's comments. A write identity that resolves to the
-  principal posts no veto and releases nothing. Migration 0027 keys the
+  principal posts no veto and releases nothing. Migration 0028 keys the
   veto cache by repo.
 - **Observation intake (node #247, #21 rulings D3/D11/D12/D17):** each walk
   tick reads the Discord thread of every map that has one and is not
@@ -260,11 +260,23 @@ bun src/cli.ts journal                    # inspect workers/events/health
   its thread from the deterministic drafter: the message verbatim and a link
   to it, title from its first line, parent the map root, checkpoint slugged
   from the title, autonomy `propose`, and the hash of that spec.
-  The journal keeps a cursor per thread (the first read starts it at now) and
-  one draft per message id, so a re-read posts no second card. A failed read
-  moves no cursor; a mention whose content Discord withheld stops the thread
-  there and reports it. A thread two walked maps share is skipped, not read:
+  Each card is a reply to the mention it answers. The journal keeps a cursor
+  per thread and one draft per message id, so a re-read posts no second card.
+  A failed read posts nothing and moves no cursor; a mention whose content
+  Discord withheld stops the thread there and reports it; the mentions ahead
+  of it are still drafted. A thread two walked maps share is skipped, not read:
   a draft's parent is its map's root, and a shared thread names no one map.
+- **Journal loss (node #249, #21 ruling D14, D1):** a thread with no cursor
+  is read from its oldest message, five pages per tick. A mention with no
+  journaled draft is drafted unless a ranger card replying to it says
+  "filed as #N" or "discarded"; a card still in draft does not count. A
+  mention is decided once the read saw the thread's end or a whole page run
+  past it; until then the cursor parks just before it. The worst case is a
+  visible duplicate draft, and a 👍 on it finds the intake marker and edits
+  that card to "filed as #N" without a second add. The journal cannot tell
+  a lost cursor from a thread never read, so turning intake on for a thread
+  that already holds the principal's @-mentions of the bot drafts each one no
+  ranger card has answered: one card per past mention, filed only on a 👍.
 - **Claude drafter (node #252, #21 ruling D12):** with spawn budget left, one
   tool-less `claude -p` call on `intake.model` (default `haiku`) drafts the
   title, parent, checkpoint, kind, autonomy and probes from the message and
@@ -298,6 +310,19 @@ bun src/cli.ts journal                    # inspect workers/events/health
   identity check or marker lookup files nothing that tick; a 👍 from anyone
   else is ignored. The tracker's node and marker are the binding record; the
   journal is a cache.
+- **Intake corrections (node #241, #21 ruling D13):** the principal replies
+  to the current draft card with a bot @-mention naming changes, e.g.
+  "parent #40, kind build". Claude applies the reply to the previous spec;
+  when it cannot, `parent #N`, `kind <k>`, `autonomy <a>`, `title: <text>`
+  and `checkpoint <slug>` are read off it, and a field not understood keeps
+  its previous value and the card says so. Ranger posts a new draft card
+  (a reply to the correction) with the corrected spec and its own spec hash,
+  and edits the old card to "superseded → <link>"; the old row goes
+  `superseding` → `superseded` and its reactions are never read again, so
+  only a 👍 on the newest card files. The chain keeps the mention's body,
+  link and marker: one observation files at most one node. A reply to a
+  superseded, filed or discarded card, a reply by anyone else and a reply
+  without a bot mention change nothing.
 - **Acceptance (e2e):** an auto research node walked end-to-end against fake
   soma/gh/worker fixtures — claim → worktree → findings branch pushed → draft
   PR → successful CI citation → gated close → `decisions --write`. Live close

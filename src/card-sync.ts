@@ -53,6 +53,10 @@ export const CARD_HEADS: Record<string, { emoji: string; status: string }> = {
   refused: { emoji: "🚫", status: "refused, yours to take" },
   draft: { emoji: "📥", status: "draft node" },
   discarded: { emoji: "🗑️", status: "discarded" },
+  // The superseded status ends in the link to the newer card: `superseded → <url>` (node #241).
+  superseded: { emoji: "↪️", status: "superseded →" },
+  // The filed status ends in the node: `filed as #N`.
+  filed: { emoji: "✅", status: "filed as" },
 };
 
 type CardHead = (typeof CARD_HEADS)[string];
@@ -1071,6 +1075,23 @@ export interface IntakeCardDraft {
   messageUrl: string;
   /** The spec hash the 👍 binds to (ruling D13); absent on a pre-#251 draft. */
   specHash?: string | null;
+  /** The draft a correction replaced (node #241): hashed, so every card in a chain binds its own 👍. */
+  supersedes?: string | null;
+  /** What a correction card says about its correction (shown, not journaled). */
+  correction?: IntakeCorrectionNote;
+}
+
+/** A correction card's account of the correction (node #241, ruling D13). */
+export interface IntakeCorrectionNote {
+  /** The card the correction replied to, now superseded. */
+  previousCardUrl: string;
+  /** Who applied the correction: `claude` or `deterministic`, and claude's model. */
+  appliedBy: string;
+  model?: string;
+  /** The fields the correction changed. */
+  changed: readonly string[];
+  /** Each field the correction named but ranger did not understand, and the value kept. */
+  notUnderstood: readonly string[];
 }
 
 function intakeMeta(map: { repo: string; root: number }, draft: IntakeCardDraft): string[] {
@@ -1100,7 +1121,9 @@ export function draftCardContent(map: { repo: string; root: number }, draft: Int
     ...CARD_HEADS.draft!,
     title: draft.title,
     meta: intakeMeta(map, draft),
-    lines: draft.drafter === "deterministic"
+    lines: draft.correction !== undefined
+      ? correctionLines(draft, draft.correction, ask)
+      : draft.drafter === "deterministic"
       ? [
           `Deterministic draft: the title is the first line of your message, the checkpoint is slugged from it, and the body is your message verbatim. Not filed yet. ${ask}`,
           ...(draft.fallback === undefined ? [] : [`Claude did not draft it: ${sanitizeGraphText(draft.fallback)}.`]),
@@ -1115,11 +1138,42 @@ export function draftCardContent(map: { repo: string; root: number }, draft: Int
   });
 }
 
+/**
+ * A correction card's lines (node #241): what changed, what was not
+ * understood and kept, and that only this card's 👍 files the node.
+ */
+function correctionLines(draft: IntakeCardDraft, note: IntakeCorrectionNote, ask: string): string[] {
+  const by = note.appliedBy === "deterministic"
+    ? "read deterministically"
+    : `applied by ${sanitizeGraphText(note.appliedBy)}${note.model === undefined ? "" : ` (${sanitizeGraphText(note.model)})`}`;
+  return [
+    `Corrected draft, ${by}, replacing <${note.previousCardUrl}>: ${note.changed.length === 0 ? "nothing changed" : `changed ${note.changed.join(", ")}`}. Not filed yet. Only this card's 👍 files it. ${ask}`,
+    ...note.notUnderstood.map((line) => `Not understood: ${sanitizeGraphText(line)}.`),
+    ...(draft.fallback === undefined ? [] : [`Claude did not apply it: ${sanitizeGraphText(draft.fallback)}.`]),
+  ];
+}
+
+/**
+ * The intake card once a correction replaced it (node #241, ruling D13): the
+ * status line links the newer card, and no reaction on this one files anything.
+ */
+export function supersededCardContent(map: { repo: string; root: number }, draft: IntakeCardDraft, newCardUrl: string): string {
+  return renderCard({
+    emoji: CARD_HEADS.superseded!.emoji,
+    status: `${CARD_HEADS.superseded!.status} <${newCardUrl}>`,
+    title: draft.title,
+    meta: intakeMeta(map, draft),
+    lines: ["Superseded by your correction: a 👍 here files nothing. React on the newer card."],
+    body: draft.body,
+    tail: `From your message: <${draft.messageUrl}>`,
+  });
+}
+
 /** The intake card once the principal's 👍 filed it (node #251, ruling D14). */
 export function filedCardContent(map: { repo: string; root: number }, draft: IntakeCardDraft, node: string): string {
   return renderCard({
-    emoji: "✅",
-    status: `filed as #${sanitizeGraphText(node)}`,
+    emoji: CARD_HEADS.filed!.emoji,
+    status: `${CARD_HEADS.filed!.status} #${sanitizeGraphText(node)}`,
     title: draft.title,
     meta: [...intakeMeta(map, draft), nodeUrl(map.repo, node)],
     lines: ["Filed on your 👍 under the machine account, labelled `ranger:principal-intake`."],
@@ -1138,6 +1192,26 @@ export function discardedCardContent(map: { repo: string; root: number }, draft:
     body: draft.body,
     tail: `From your message: <${draft.messageUrl}>`,
   });
+}
+
+/**
+ * Which intake card this is, read off its status line: a draft, filed (with
+ * the node), discarded, superseded (node #241), or null for any other text. The journal-loss rescan
+ * (node #249) reads ranger's own reply cards back with it.
+ */
+export function intakeCardState(
+  content: string,
+): { state: "draft" } | { state: "filed"; node: string } | { state: "discarded" } | { state: "superseded" } | null {
+  const line = content.split("\n", 1)[0]!;
+  const head = (h: { emoji: string; status: string }) => `${h.emoji} ${h.status}`;
+  const starts = (prefix: string) => line === prefix || line.startsWith(`${prefix} · `);
+  if (starts(head(CARD_HEADS.draft!))) return { state: "draft" };
+  if (starts(head(CARD_HEADS.discarded!))) return { state: "discarded" };
+  if (line.startsWith(`${head(CARD_HEADS.superseded!)} `)) return { state: "superseded" };
+  const filed = `${head(CARD_HEADS.filed!)} #`;
+  if (!line.startsWith(filed)) return null;
+  const node = line.slice(filed.length).split(" · ", 1)[0]!;
+  return node === "" || /\s/.test(node) ? null : { state: "filed", node };
 }
 
 /** Build the card + journal-row inputs for a node in one place (no drift). */

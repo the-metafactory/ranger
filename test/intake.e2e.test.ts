@@ -101,12 +101,14 @@ describe("intake pass of the walk tick (node #247)", () => {
 
    const result = await r.tick();
    expect(result.intake.threads).toEqual([
-    { channelId: THREAD, maps: ["acme/widgets#1"], read: 5, drafted: ["1003"], alreadyDrafted: [], cursor: "1005" },
+    { channelId: THREAD, maps: ["acme/widgets#1"], read: 5, drafted: ["1003"], alreadyDrafted: [], answered: [], cursor: "1005" },
    ]);
    expect(r.discord.meReads).toHaveLength(1);
    expect(r.discord.posts).toHaveLength(1);
    expect(r.discord.edits).toHaveLength(0);
    expect(r.discord.posts[0]!.url).toContain(`/channels/${THREAD}/messages`);
+   // The card replies to the mention it answers (node #249).
+   expect(r.discord.posts[0]!.replyTo).toBe("1003");
 
    const card = r.discord.posts[0]!.content;
    expect(card.split("\n")[0]).toBe("📥 draft node · The minimap flickers when the window resizes");
@@ -224,17 +226,16 @@ describe("intake pass of the walk tick (node #247)", () => {
   } finally { r.close(); }
  });
 
- test("the first tick on a thread starts its cursor at now and drafts nothing older", async () => {
+ test("a thread with no cursor is read from its oldest message (node #249)", async () => {
   const r = rig({ seed: false });
   try {
    const before = snowflakeAt(new Date(Date.now() - 60_000));
    r.discord.say(THREAD, msg(before, PRINCIPAL, `<@${FAKE_BOT_ID}> an old mention`));
    const result = await r.tick();
-   expect(result.intake.threads[0]).toMatchObject({ seeded: true, read: 0 });
-   expect(r.discord.threadReads).toHaveLength(0);
-   expect(BigInt(r.journal.intakeCursor(THREAD)!)).toBeGreaterThan(BigInt(before));
+   expect(result.intake.threads[0]).toMatchObject({ rescan: true, read: 1, drafted: [before], cursor: before });
+   expect(r.discord.threadReads[0]).toEqual({ channelId: THREAD, after: "0" });
    await r.tick();
-   expect(r.discord.posts).toHaveLength(0);
+   expect(r.discord.posts).toHaveLength(1);
   } finally { r.close(); }
  });
 

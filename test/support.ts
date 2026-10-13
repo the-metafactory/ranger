@@ -170,7 +170,7 @@ export interface FakeThreadMessage {
  content: string;
  author: { id: string; bot?: boolean };
  mentions: { id: string }[];
- message_reference?: { message_id: string };
+ message_reference?: { message_id: string; type?: number };
 }
 
 /**
@@ -179,8 +179,9 @@ export interface FakeThreadMessage {
  * posted id from a fake one. Thread reads (GET /users/@me, /channels/:id and
  * /channels/:id/messages) serve the messages `say` added (intake, node #247).
  */
-export function fakeDiscord() {
- const posts: { url: string; messageId: string; content: string }[] = [];
+export function fakeDiscord(opts: { echo?: boolean } = {}) {
+ // `replyTo`: the message a reply post answers (`message_reference`, node #249).
+ const posts: { url: string; messageId: string; content: string; replyTo?: string }[] = [];
  const edits: { messageId: string; content: string }[] = [];
  const deleted = new Set<string>(); // messages removed — GET returns 404
  // Thread messages per channel, and every thread read (`after` cursor).
@@ -188,12 +189,32 @@ export function fakeDiscord() {
  const threadReads: { channelId: string; after: string | null }[] = [];
  const meReads: number[] = [];
  let threadReadStatus = 200;
+ // Thread reads past this many answer `threadReadLateStatus` (a later page fails, node #249).
+ let threadReadsServed = Number.POSITIVE_INFINITY;
+ let threadReadLateStatus = 200;
  // Reactions per `messageId|emoji`, every reaction read, and the status the
  // reaction reads and edits answer (intake gate, node #251).
  const reactions = new Map<string, string[]>();
  const reactionReads: { messageId: string; emoji: string; after: string | null }[] = [];
  let reactionReadStatus = 200;
  let editStatus = 200;
+ // Echo (node #241): a post gets the next snowflake and lands in its thread as
+ // the bot's reply, so a later read sees the card and a reply can name it.
+ let lastEchoed = 0n;
+ const echo = (channelId: string, content: string, replyTo: string | undefined): string => {
+  const thread = threads.get(channelId) ?? [];
+  const id = [lastEchoed, ...thread.map((m) => BigInt(m.id))].reduce((a, b) => (a > b ? a : b), 0n) + 1n;
+  lastEchoed = id;
+  thread.push({
+   id: String(id),
+   content,
+   author: { id: FAKE_BOT_ID, bot: true },
+   mentions: [],
+   ...(replyTo === undefined ? {} : { message_reference: { message_id: replyTo } }),
+  });
+  threads.set(channelId, thread);
+  return String(id);
+ };
  const server = Bun.serve({
   port: 0,
   async fetch(req) {
@@ -208,6 +229,7 @@ export function fakeDiscord() {
     const after = url.searchParams.get("after");
     threadReads.push({ channelId, after });
     if (threadReadStatus !== 200) return new Response("refused", { status: threadReadStatus });
+    if (threadReads.length > threadReadsServed) return new Response("refused", { status: threadReadLateStatus });
     const limit = Number(url.searchParams.get("limit") ?? 50);
     // Like Discord: the messages nearest after the cursor, newest first.
     const newer = (threads.get(channelId) ?? [])
@@ -237,9 +259,11 @@ export function fakeDiscord() {
     return Response.json({ id: channelMatch[1], guild_id: FAKE_GUILD_ID });
    }
    if (req.method === "POST" && url.pathname.startsWith("/channels/")) {
-    const parsed = (await req.json()) as { content?: string };
-    const messageId = `discord-msg-${posts.length + 1}`;
-    posts.push({ url: req.url, messageId, content: parsed?.content ?? "" });
+    const parsed = (await req.json()) as { content?: string; message_reference?: { message_id?: string } };
+    const replyTo = parsed?.message_reference?.message_id;
+    const channelId = url.pathname.split("/")[2]!;
+    const messageId = opts.echo ? echo(channelId, parsed?.content ?? "", replyTo) : `discord-msg-${posts.length + 1}`;
+    posts.push({ url: req.url, messageId, content: parsed?.content ?? "", ...(replyTo === undefined ? {} : { replyTo }) });
     return Response.json({ id: messageId });
    }
    const editMatch = url.pathname.match(
@@ -250,6 +274,7 @@ export function fakeDiscord() {
     if (editStatus !== 200) return new Response("refused", { status: editStatus });
     const parsed = (await req.json()) as { content?: string };
     edits.push({ messageId, content: parsed?.content ?? "" });
+    for (const thread of threads.values()) for (const m of thread) if (m.id === messageId) m.content = parsed?.content ?? "";
     return Response.json({ id: messageId });
    }
    if (req.method === "GET" && editMatch) {
@@ -278,6 +303,11 @@ export function fakeDiscord() {
   meReads,
   /** Answer every thread read with this HTTP status (200 = serve normally). */
   failThreadReads: (status: number) => { threadReadStatus = status; },
+  /** Serve the next `count` thread reads, then answer every later one with `status`. */
+  failThreadReadsAfter: (count: number, status: number) => {
+   threadReadsServed = threadReads.length + count;
+   threadReadLateStatus = status;
+  },
   /** A user reacts `emoji` on a message (intake gate, node #251). */
   react: (messageId: string, emoji: string, userId: string) => {
    const key = `${messageId}|${emoji}`;
