@@ -127,6 +127,25 @@ export const ESCALATE_REASONS: Record<EscalateReason, string> = {
 export const HITL_KINDS = new Set(["grilling", "prototype"]);
 export const IMPLEMENT_KINDS = new Set(["task", "build"]);
 
+/** The intake marker line `intakeNodeBody` writes last (node #251, ruling D14). */
+const INTAKE_MARKER_LINE = /^<!-- ranger:intake discord=\d+ -->$/;
+
+/**
+ * Whether the principal filed this node (#21 ruling D5): any author but the
+ * bot identity, or the bot identity filing through intake, where the
+ * principal's 👍 on the draft card is the authorship. Intake writes its
+ * marker as the body's last line; only that line counts, because ranger's
+ * other filings (Scribe, fix-the-base) quote review and probe text mid-body
+ * and a marker quoted there must grant nothing (node #9 ban). Routing keys
+ * on the body, not the `ranger:principal-intake` label: the frontier read
+ * carries no labels.
+ */
+function principalFiled(node: FrontierEntry, botIdentity: string): boolean {
+  if (node.author !== botIdentity) return true;
+  const last = (node.body ?? "").trimEnd().split(/\r?\n/).at(-1)!.trim();
+  return INTAKE_MARKER_LINE.test(last);
+}
+
 /** Load the probe registry from soma-home; absent file → empty registry. */
 export function loadProbeRegistry(
   path = process.env.HOME + "/.soma/policy/probe-registry.json",
@@ -283,8 +302,9 @@ function classifyRoute(
   // Class 2a (#23 ruling) — a `propose` task/build node on a `walk: full`
   // map is walked like an auto one up to the merge; the principal's merge is
   // the ratification. Never for nodes ranger itself filed (node #9: ranger
-  // never walks work it minted), never when the bot identity is unknown,
-  // and never off the allowlist — an unwalked node keeps its HITL card.
+  // never walks work it minted) unless the principal's 👍 filed it through
+  // intake (#21 ruling D5), never when the bot identity is unknown, and
+  // never off the allowlist — an unwalked node keeps its HITL card.
   // A node that qualifies except for unregistered probes gets the
   // provisioning card (class 5), which names the exact run + cwd to
   // register, rather than a HITL card that hides why it was not taken.
@@ -294,7 +314,7 @@ function classifyRoute(
     walkMode === "full" &&
     allowed &&
     opts.botIdentity !== undefined &&
-    node.author !== opts.botIdentity
+    principalFiled(node, opts.botIdentity)
   ) {
     const blockedProbes = blockedProbeSpecs(node.node, repo, registry);
     if (blockedProbes.length > 0) {
