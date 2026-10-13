@@ -75,10 +75,11 @@ export interface ForgeReadPort<Credential = string> {
  issuesWithLabel?(repo: string, label: string, token: Credential): Promise<LabeledIssue[]>;
 }
 
-/** One tracker issue read by label: its number and body. */
+/** One tracker issue read by label: its number, body and author's login. */
 export interface LabeledIssue {
  number: number;
  body: string;
+ author: string;
 }
 
 /** What a merge attempt did. How each adapter reports a refusal is on `ForgePort.mergePr`. */

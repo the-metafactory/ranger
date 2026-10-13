@@ -177,6 +177,10 @@ export interface IntakeDraftRow {
  filedNode: string | null;
  /** When the gate last read the card's reactions. */
  gateReadAt: string | null;
+ /** The drafted parent node: the card shows it and the add files below it. */
+ parent: number;
+ /** The drafted autonomy: the card shows it and the add mints it. */
+ autonomy: string;
 }
 
 export interface ResumeQueueRow {

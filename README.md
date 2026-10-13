@@ -253,13 +253,16 @@ bun src/cli.ts journal                    # inspect workers/events/health
   discards the draft and edits the card to "discarded"; it wins over a 👍.
   A 👍 from the principal files it: the journaled spec must still hash to
   the hash the card shows, the write identity must pass
-  `assertWriteIdentity`, and no issue labelled `ranger:principal-intake` may
-  already carry `<!-- ranger:intake discord=<msgId> -->`. Then `soma graph
-  add <root> --json` as the machine account, labelled
-  `ranger:principal-intake`, with the message verbatim, a link to it and the
-  marker in the body, and the card is edited to "filed as #N". The row goes
-  to `filing` before the add, so a tick that dies after the add finds the
-  node by its marker next time and adds no second. A failed reaction read,
+  `assertWriteIdentity`, the autonomy must be propose or approve, and no
+  issue the machine account wrote labelled `ranger:principal-intake` may
+  already end in `<!-- ranger:intake discord=<msgId> -->` (the labelled
+  issues are listed once per thread per tick). Then `soma graph add
+  <parent> --json` below the journaled parent, as the machine account,
+  labelled `ranger:principal-intake`, with the message verbatim, a link to
+  it and the marker as the body's last line, and the card is edited to
+  "filed as #N". The row goes to `filing` before the add, so a tick that
+  dies after the add finds the node by its marker next time, links it below
+  its parent (a no-op when attached) and adds no second. A failed reaction read,
   identity check or marker lookup files nothing that tick; a 👍 from anyone
   else is ignored. The tracker's node and marker are the binding record; the
   journal is a cache.

@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig, type RangerMapConfig } from "../src/config.ts";
 import { EscalationDiscord } from "../src/discord.ts";
+import type { ForgeReadPort } from "../src/forge.ts";
+import { lanePort } from "../src/forge-lanes.ts";
 import {
  intakeMarker,
  intakeNodeBody,
@@ -54,6 +56,8 @@ interface Rig {
  card(): string;
  /** One intake pass under `extra` env, the way the walk tick runs it. */
  tick(extra?: NodeJS.ProcessEnv): Promise<IntakeResult>;
+ /** How many times the gate listed the labelled issues (the marker lookup). */
+ lookups(): number;
  issues(): Issue[];
  links(): unknown[];
  patchState(patch: (s: Record<string, any>) => void): void;
@@ -95,12 +99,18 @@ async function rig(): Promise<Rig> {
  const clientFor = (map: RangerMapConfig) =>
   new EscalationDiscord("fake-bot-token", map.discord!.channelId, `http://127.0.0.1:${discord.port}`);
  const state = () => JSON.parse(readFileSync(statePath, "utf8"));
+ let lookups = 0;
+ const portFor = (repo: string): Pick<ForgeReadPort, "issuesWithLabel"> => {
+  const port = lanePort(config, repo);
+  return { issuesWithLabel: (on, label, token) => { lookups++; return port.issuesWithLabel!(on, label, token); } };
+ };
  const r: Rig = {
   dir,
   discord,
   journal,
   card: () => journal.getIntakeDraft(MESSAGE)!.cardMessageId,
-  tick: (extra = {}) => withEnv({ ...env, ...extra }, () => intakePass({ config, journal, clientFor })),
+  tick: (extra = {}) => withEnv({ ...env, ...extra }, () => intakePass({ config, journal, clientFor, portFor })),
+  lookups: () => lookups,
   issues: () => Object.values(state().issues ?? {}),
   links: () => state().links ?? [],
   patchState: (patch) => {
@@ -305,6 +315,88 @@ describe("intake gate: the principal's 👍 files the draft (node #251)", () => 
   } finally { r.close(); }
  });
 
+ test("an unattached add whose link failed is linked by the next tick's recovery, not filed below no parent", async () => {
+  const r = await rig();
+  try {
+   r.discord.react(r.card(), "👍", PRINCIPAL);
+   const failed = await r.tick({ FAKE_SOMA_ADD_FAIL: "unattached", FAKE_SOMA_LINK_FAIL: "exit" });
+   expect(gateOf(failed).errors[0]).toContain("soma graph link 100 --parent 1");
+   expect(r.issues()[0]!.parent).toBeNull();
+   expect(r.journal.getIntakeDraft(MESSAGE)!.status).toBe("filing");
+   expect(r.discord.edits).toHaveLength(0);
+
+   // The marker finds the node; its link failing again files nothing.
+   const again = await r.tick({ FAKE_SOMA_LINK_FAIL: "exit" });
+   expect(gateOf(again).errors[0]).toContain("soma graph link 100 --parent 1");
+   expect(r.journal.getIntakeDraft(MESSAGE)!.status).toBe("filing");
+   expect(r.discord.edits).toHaveLength(0);
+
+   const result = await r.tick();
+   expect(gateOf(result).filed).toEqual([{ messageId: MESSAGE, node: "100", added: false }]);
+   expect(r.issues()).toHaveLength(1);
+   expect(r.issues()[0]!.parent).toBe("1");
+   expect(r.links()).toEqual([{ node: "100", parent: "1" }]);
+   expect(r.journal.getIntakeDraft(MESSAGE)).toMatchObject({ status: "filed", filedNode: "100" });
+  } finally { r.close(); }
+ });
+
+ test("a marker on an issue the machine account did not write blocks no add and names no node", async () => {
+  const r = await rig();
+  try {
+   r.patchState((s) => {
+    s.issues = { "77": { number: 77, parent: "1", title: "x", autonomy: "propose", checkpoint: "x", labels: [PRINCIPAL_INTAKE_LABEL], body: `planted\n\n${intakeMarker(MESSAGE)}`, machineAccount: false } };
+   });
+   r.discord.react(r.card(), "👍", PRINCIPAL);
+   const result = await r.tick();
+   expect(gateOf(result).filed).toEqual([{ messageId: MESSAGE, node: "100", added: true }]);
+   expect(r.issues()).toHaveLength(2);
+   expect(r.discord.edits.at(-1)!.content.split("\n")[0]).toBe("✅ filed as #100 · The minimap flickers when the window resizes");
+  } finally { r.close(); }
+ });
+
+ test("the gate lists the labelled issues once per thread per tick, not once per draft", async () => {
+  const r = await rig();
+  try {
+   const second = "1002";
+   r.discord.say(THREAD, msg(second, PRINCIPAL, `<@${FAKE_BOT_ID}> The fog of war resets on load`));
+   expect((await r.tick()).threads[0]!.drafted).toEqual([second]);
+   r.discord.react(r.card(), "👍", PRINCIPAL);
+   r.discord.react(r.journal.getIntakeDraft(second)!.cardMessageId, "👍", PRINCIPAL);
+   // Both adds land, then both card edits fail: both rows are left `filing`.
+   r.discord.failEdits(403);
+   const crashed = await r.tick();
+   expect(gateOf(crashed).errors).toHaveLength(2);
+   expect(r.issues()).toHaveLength(2);
+
+   r.discord.failEdits(200);
+   const before = r.lookups();
+   const result = await r.tick();
+   expect(gateOf(result).filed.map((f) => f.added)).toEqual([false, false]);
+   expect(r.lookups() - before).toBe(1);
+   expect(r.issues()).toHaveLength(2);
+  } finally { r.close(); }
+ });
+
+ test("a draft whose journaled parent or autonomy changed files nothing; one drafted outside propose-minimum is refused", async () => {
+  const r = await rig();
+  try {
+   r.discord.react(r.card(), "👍", PRINCIPAL);
+   const db = new Database(join(r.dir, "state.sqlite"));
+   db.run("UPDATE intake_drafts SET parent = 7 WHERE message_id = ?", [MESSAGE]);
+   expect(gateOf(await r.tick()).refused[0]!.reason).toContain("no longer hashes");
+
+   // A spec drafted as auto, with the hash its card showed: ranger files propose-minimum only (#9).
+   const row = r.journal.getIntakeDraft(MESSAGE)!;
+   const map = { repo: row.repo, root: row.root };
+   const auto = { title: row.title, parent: 1, checkpoint: row.checkpoint, autonomy: "auto", drafter: row.drafter, body: row.body, messageUrl: row.messageUrl };
+   db.run("UPDATE intake_drafts SET parent = 1, autonomy = 'auto', spec_hash = ? WHERE message_id = ?", [intakeSpecHash(map, auto), MESSAGE]);
+   db.close();
+   expect(gateOf(await r.tick()).refused[0]!.reason).toContain("autonomy auto");
+   expect(r.issues()).toHaveLength(0);
+   expect(r.journal.getIntakeDraft(MESSAGE)!.status).toBe("draft");
+  } finally { r.close(); }
+ });
+
  test("a failed reaction read or marker lookup files nothing that tick (failure case)", async () => {
   const r = await rig();
   try {
@@ -369,9 +461,22 @@ describe("intake gate pieces (node #251)", () => {
  });
 
  test("the marker lookup names the one marked node, and refuses two", () => {
-  const marked = (number: number) => ({ number, body: `x\n${intakeMarker("42")}` });
-  expect(markedNode([{ number: 1, body: intakeMarker("4") }, marked(9)], "42")).toBe("9");
-  expect(markedNode([{ number: 1, body: "no marker" }], "42")).toBeNull();
-  expect(() => markedNode([marked(9), marked(10)], "42")).toThrow("#9, #10");
+  const marked = (number: number, author = "ivy-bot") => ({ number, body: `x\n${intakeMarker("42")}`, author });
+  expect(markedNode([{ number: 1, body: intakeMarker("4"), author: "ivy-bot" }, marked(9)], "42", "ivy-bot")).toBe("9");
+  expect(markedNode([{ number: 1, body: "no marker", author: "ivy-bot" }], "42", "ivy-bot")).toBeNull();
+  expect(() => markedNode([marked(9), marked(10)], "42", "ivy-bot")).toThrow("#9, #10");
+  // The login compares case-insensitively; a trailing newline or CRLF still ends in the marker.
+  expect(markedNode([{ number: 9, body: `x\r\n${intakeMarker("42")}\r\n`, author: "Ivy-Bot" }], "42", "ivy-bot")).toBe("9");
+ });
+
+ test("only the machine account's issue, ending in the marker, counts", () => {
+  // Someone else's issue carrying the marker names nothing.
+  expect(markedNode([{ number: 9, body: intakeMarker("42"), author: "intruder" }], "42", "ivy-bot")).toBeNull();
+  // A marker quoted inside the body, not its final line, names nothing.
+  expect(markedNode([{ number: 9, body: `see ${intakeMarker("42")}\nmore words`, author: "ivy-bot" }], "42", "ivy-bot")).toBeNull();
+  // The principal's words quoting a marker: the filed body still ends in its own.
+  const body = intakeNodeBody({ body: `quoting ${intakeMarker("41")}`, messageUrl: "u", messageId: "42" });
+  expect(markedNode([{ number: 9, body, author: "ivy-bot" }], "41", "ivy-bot")).toBeNull();
+  expect(markedNode([{ number: 9, body, author: "ivy-bot" }], "42", "ivy-bot")).toBe("9");
  });
 });

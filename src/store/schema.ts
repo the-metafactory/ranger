@@ -328,6 +328,14 @@ export const intakeDrafts = sqliteTable(
   filedNode: text("filed_node"),
   /** When the gate last read the card's reactions; the rotation key. */
   gateReadAt: text("gate_read_at"),
+  /**
+   * The drafted parent and autonomy, journaled so the spec hash (D13) reads
+   * what the card showed instead of re-deriving it. The SQL defaults only
+   * backfill rows drafted before node #251 (parent = root); every insert
+   * names both.
+   */
+  parent: integer("parent").notNull(),
+  autonomy: text("autonomy").notNull(),
  },
  (table) => [
   index("intake_drafts_repo_root_idx").on(table.repo, table.root),

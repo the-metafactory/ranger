@@ -422,7 +422,7 @@ export async function issuesWithLabel(
   .map((r) => {
    const number = Number(r.number);
    if (!Number.isSafeInteger(number) || number <= 0) throw new GitHubError(`${where}: an issue without a number`);
-   return { number, body: String(r.body ?? "") };
+   return { number, body: String(r.body ?? ""), author: String(((r.user ?? {}) as Record<string, unknown>).login ?? "") };
   });
 }
 

@@ -217,6 +217,10 @@ if verb == "add":
     sys.exit(0)
 
 if verb == "link":
+    # FAKE_SOMA_LINK_FAIL=exit fails the attach (node #251's unattached repair).
+    if os.environ.get("FAKE_SOMA_LINK_FAIL", "") == "exit":
+        print("fake soma: link failed (HTTP 502)", file=sys.stderr)
+        sys.exit(1)
     issue = s.setdefault("issues", {}).get(nid)
     if issue is None:
         print(f"fake soma: no node {nid}", file=sys.stderr)

@@ -39,11 +39,11 @@ import { mapKey } from "./maps.ts";
  * tick reads the reactions on the thread's open draft cards. The principal's
  * ❌ discards a draft. The principal's 👍 files it, once: the journaled spec
  * must still hash to the hash the card showed, the write identity must pass
- * `assertWriteIdentity`, and the map must hold no node carrying the draft's
- * intake marker. Then `soma graph add` below the map root, as the machine
- * account, labelled `ranger:principal-intake`, with a link to the message
- * and the marker in the body. The node and its marker are the binding
- * record; the journal is a cache (D1).
+ * `assertWriteIdentity`, and the map must hold no node the machine account
+ * wrote ending in the draft's intake marker. Then `soma graph add` below the
+ * drafted parent, as the machine account, labelled `ranger:principal-intake`,
+ * with a link to the message and the marker as the body's last line. The
+ * node and its marker are the binding record; the journal is a cache (D1).
  */
 
 /** The drafter of this slice (D12's fallback); the LLM drafter is node #252's. */
@@ -374,6 +374,8 @@ async function postDraft(args: {
     channelId: client.channel,
     repo: map.repo,
     root: map.root,
+    parent: spec.parent,
+    autonomy: spec.autonomy,
     authorId: message.authorId,
     title: spec.title,
     checkpoint: spec.checkpoint,
@@ -397,10 +399,7 @@ async function postDraft(args: {
  * the add writes. The card carries it; the 👍 binds to it. A journaled spec
  * that no longer hashes to it was not the spec the principal saw.
  */
-export function intakeSpecHash(
-  map: { repo: string; root: number },
-  draft: { title: string; parent: number; checkpoint: string; autonomy: string; drafter: string; body: string; messageUrl: string },
-): string {
+export function intakeSpecHash(map: { repo: string; root: number }, draft: Omit<IntakeCardDraft, "specHash">): string {
   const fields = [
     "ranger-intake-spec/1",
     map.repo,
@@ -416,13 +415,13 @@ export function intakeSpecHash(
   return createHash("sha256").update(JSON.stringify(fields)).digest("hex");
 }
 
-/** A journaled draft as the card showed it: parent the map root, autonomy `propose` (D12). */
+/** A journaled draft as the card showed it. */
 function cardDraft(row: IntakeDraftRow): IntakeCardDraft {
   return {
     title: row.title,
-    parent: row.root,
+    parent: row.parent,
     checkpoint: row.checkpoint,
-    autonomy: "propose",
+    autonomy: row.autonomy,
     drafter: row.drafter,
     body: row.body,
     messageUrl: row.messageUrl,
@@ -430,7 +429,7 @@ function cardDraft(row: IntakeDraftRow): IntakeCardDraft {
   };
 }
 
-/** The body of the filed node: the principal's words verbatim, the link back, the marker (D5, D14). */
+/** The body of the filed node: the principal's words verbatim, the link back, the marker last (D5, D14). */
 export function intakeNodeBody(row: Pick<IntakeDraftRow, "body" | "messageUrl" | "messageId">): string {
   return [
     row.body.trim(),
@@ -442,19 +441,73 @@ export function intakeNodeBody(row: Pick<IntakeDraftRow, "body" | "messageUrl" |
   ].join("\n");
 }
 
-/** The node already carrying this draft's marker, or null; two such nodes are refused, not guessed between. */
-export function markedNode(issues: readonly LabeledIssue[], messageId: string): string | null {
+/** A body's last line with text: where `intakeNodeBody` puts the marker. */
+function finalLine(body: string): string {
+  return body.trimEnd().split(/\r?\n/).at(-1)!.trim();
+}
+
+/**
+ * The node already carrying this draft's marker, or null. Only an issue the
+ * machine account wrote counts, with the marker as its final line: a marker
+ * someone else labelled, or one quoted inside a body, blocks no add and
+ * names no node. Two such nodes are refused, not guessed between.
+ */
+export function markedNode(issues: readonly LabeledIssue[], messageId: string, machineLogin: string): string | null {
   const marker = intakeMarker(messageId);
-  const hits = [...new Set(issues.filter((issue) => issue.body.includes(marker)).map((issue) => issue.number))];
+  const login = machineLogin.toLowerCase();
+  const hits = [...new Set(
+    issues
+      .filter((issue) => issue.author.toLowerCase() === login && finalLine(issue.body) === marker)
+      .map((issue) => issue.number),
+  )];
   if (hits.length > 1) {
     throw new EscalateError(`nodes ${hits.map((n) => `#${n}`).join(", ")} all carry ${marker} — one draft filed twice; nothing more is filed`);
   }
   return hits.length === 0 ? null : String(hits[0]);
 }
 
-/** Does the principal's reaction stand on the card? Any failed page throws. */
-async function principalReacted(client: EscalationDiscord, row: IntakeDraftRow, emoji: string, principalId: string, deadline: number): Promise<boolean> {
-  return (await client.reactionUserIds(row.cardMessageId, emoji, deadline)).includes(principalId);
+/** The autonomies a principal-intake node may be filed with: ranger-filed nodes are propose-minimum (#9). */
+const FILABLE_AUTONOMY = ["propose", "approve"] as const;
+
+function filableAutonomy(autonomy: string): autonomy is (typeof FILABLE_AUTONOMY)[number] {
+  return (FILABLE_AUTONOMY as readonly string[]).includes(autonomy);
+}
+
+/**
+ * The write side of one thread's gate, resolved lazily and at most once per
+ * tick: the write identity (D4) and the marker lookup under it. The listing
+ * is read again only after an add, which may have created a node.
+ */
+interface WriteSide {
+  identity(): Promise<{ token: string; login: string }>;
+  issues(): Promise<LabeledIssue[]>;
+  /** An add ran (or may have): the next lookup lists again. */
+  stale(): void;
+  opts: { timeoutMs: number; env: NodeJS.ProcessEnv };
+}
+
+function writeSide(ctx: IntakeContext, map: RangerMapConfig): WriteSide {
+  const env = ctx.env ?? process.env;
+  let identity: Promise<{ token: string; login: string }> | undefined;
+  let issues: Promise<LabeledIssue[]> | undefined;
+  const side: WriteSide = {
+    identity: () => (identity ??= (async () => {
+      const { token, botIdentity } = await assertWriteIdentity(ctx.config, map.repo, env);
+      assertNotPrincipal(ctx.config, botIdentity, map.repo);
+      return { token, login: botIdentity };
+    })()),
+    issues: () => (issues ??= (async () => {
+      const port = (ctx.portFor ?? ((repo: string) => lanePort(ctx.config, repo)))(map.repo);
+      if (port.issuesWithLabel === undefined) {
+        throw new EscalateError(`the forge port for ${mapKey(map)} cannot list labelled issues — the intake marker cannot be checked, so nothing is filed`);
+      }
+      const { token } = await side.identity();
+      return port.issuesWithLabel(map.repo, PRINCIPAL_INTAKE_LABEL, token);
+    })()),
+    stale: () => { issues = undefined; },
+    opts: { timeoutMs: GRAPH_CALL_TIMEOUT_MS, env },
+  };
+  return side;
 }
 
 type GateArgs = IntakeContext & {
@@ -464,6 +517,7 @@ type GateArgs = IntakeContext & {
   deadline: number;
   owned: OwnedCheck;
   gate: IntakeGateResult;
+  write: WriteSide;
 };
 
 /**
@@ -471,15 +525,16 @@ type GateArgs = IntakeContext & {
  * `GATE_READS_PER_THREAD` per tick. One draft's failure is its own: the
  * next draft is still read.
  */
-async function gateDrafts(args: GateArgs & { rows: IntakeDraftRow[] }): Promise<void> {
+async function gateDrafts(args: Omit<GateArgs, "write"> & { rows: IntakeDraftRow[] }): Promise<void> {
   const { rows, gate, deadline } = args;
+  const gateArgs: GateArgs = { ...args, write: writeSide(args, args.map) };
   for (const [i, row] of rows.entries()) {
     if (i >= GATE_READS_PER_THREAD || Date.now() > deadline) {
       gate.deferred.push(row.messageId);
       continue;
     }
     try {
-      await gateDraft(args, row);
+      await gateDraft(gateArgs, row);
     } catch (error) {
       gate.errors.push(`draft ${row.messageId}: ${error instanceof Error ? error.message : String(error)} — nothing filed; read again next tick`);
     }
@@ -487,17 +542,10 @@ async function gateDrafts(args: GateArgs & { rows: IntakeDraftRow[] }): Promise<
 }
 
 async function gateDraft(args: GateArgs, row: IntakeDraftRow): Promise<void> {
-  const { journal, map, client, principalId, deadline, owned, gate } = args;
+  const { journal, client, principalId, deadline, owned, gate } = args;
   const now = () => args.now?.() ?? new Date();
-  // A `filing` row was 👍'd and the tick died around its add: the marker,
-  // not the reactions, says whether the node exists (D1).
   if (row.status === "filing") {
-    const write = await writeGate(args);
-    const node = markedNode(await write.issues(), row.messageId);
-    if (node !== null) return finishFiled(args, row, node, false);
-    // The add never landed: the draft is a draft again, and its reactions decide.
-    owned();
-    journal.updateIntakeDraft(row.messageId, { status: "draft" });
+    if (await recoverFiling(args, row)) return;
     row = { ...row, status: "draft" };
   }
 
@@ -511,77 +559,93 @@ async function gateDraft(args: GateArgs, row: IntakeDraftRow): Promise<void> {
   } catch (error) {
     // The card is gone: no reaction on it can ever file the draft.
     if (!(error instanceof DiscordMessageGoneError)) throw error;
-    owned();
-    journal.updateIntakeDraft(row.messageId, { status: "discarded", gateReadAt: now().toISOString() });
-    journal.recordEvent("intake-discarded", { repo: map.repo, detail: `draft ${row.messageId}: card ${row.cardMessageId} is gone — nothing filed` });
-    gate.discarded.push(row.messageId);
-    return;
+    return discardDraft(args, row, `card ${row.cardMessageId} is gone`, { cardGone: true });
   }
   owned();
   journal.updateIntakeDraft(row.messageId, { gateReadAt: now().toISOString() });
+  if (discard) return discardDraft(args, row, `the principal's ${DISCARD_EMOJI} on card ${row.cardMessageId}`, { cardGone: false });
+  if (file) return fileDraft(args, row);
+}
 
-  if (discard) {
-    owned();
-    await editCard(client, row, discardedCardContent(map, cardDraft(row)), deadline);
-    owned();
-    journal.updateIntakeDraft(row.messageId, { status: "discarded" });
-    journal.recordEvent("intake-discarded", { repo: map.repo, detail: `draft ${row.messageId}: the principal's ${DISCARD_EMOJI} on card ${row.cardMessageId} — nothing filed` });
-    gate.discarded.push(row.messageId);
-    return;
+/** Does the principal's reaction stand on the card? Any failed page throws. */
+async function principalReacted(client: EscalationDiscord, row: IntakeDraftRow, emoji: string, principalId: string, deadline: number): Promise<boolean> {
+  return (await client.reactionUserIds(row.cardMessageId, emoji, deadline)).includes(principalId);
+}
+
+/**
+ * A `filing` row was 👍'd and the tick died around its add: the marker, not
+ * the reactions, says whether the node exists (D1). Found, it is finished
+ * (true); not found, the row is a draft again and its reactions decide.
+ */
+async function recoverFiling(args: GateArgs, row: IntakeDraftRow): Promise<boolean> {
+  const { login } = await args.write.identity();
+  const node = markedNode(await args.write.issues(), row.messageId, login);
+  if (node === null) {
+    args.owned();
+    args.journal.updateIntakeDraft(row.messageId, { status: "draft" });
+    return false;
   }
-  if (!file) return;
+  await finishFound(args, row, node);
+  return true;
+}
 
-  // The 👍 binds to the spec the card showed (D13).
+/** The 👍 binds to the spec the card showed (D13), then files it once (D4, D14). */
+async function fileDraft(args: GateArgs, row: IntakeDraftRow): Promise<void> {
+  const { journal, map, owned, gate, write } = args;
+  const refuse = (reason: string) => { gate.refused.push({ messageId: row.messageId, reason }); };
   if (row.specHash === null) {
-    gate.refused.push({ messageId: row.messageId, reason: "the card carries no spec hash (drafted before node #251) — nothing to bind the 👍 to; mention the bot again to redraft" });
-    return;
+    return refuse("the card carries no spec hash (drafted before node #251) — nothing to bind the 👍 to; mention the bot again to redraft");
   }
   if (intakeSpecHash(map, cardDraft(row)) !== row.specHash) {
-    gate.refused.push({ messageId: row.messageId, reason: `the journaled spec no longer hashes to ${row.specHash.slice(0, 12)}, the spec the card showed — nothing filed` });
-    return;
+    return refuse(`the journaled spec no longer hashes to ${row.specHash.slice(0, 12)}, the spec the card showed — nothing filed`);
+  }
+  const autonomy = row.autonomy;
+  if (!filableAutonomy(autonomy)) {
+    return refuse(`autonomy ${autonomy} — a node ranger files is ${FILABLE_AUTONOMY.join(" or ")} (#9); nothing filed`);
   }
 
   // The write runs only after the identity-pinned read succeeds (D4), and
   // only when no node carries the marker yet (D14).
-  const write = await writeGate(args);
-  const existing = markedNode(await write.issues(), row.messageId);
-  if (existing !== null) return finishFiled(args, row, existing, false);
+  const { token, login } = await write.identity();
+  const existing = markedNode(await write.issues(), row.messageId, login);
+  if (existing !== null) return finishFound(args, row, existing);
 
   // Written before the add: a tick that dies past here leaves `filing`, and
   // the next one asks the marker before anything else.
   owned();
   journal.updateIntakeDraft(row.messageId, { status: "filing" });
+  write.stale();
   let node: string;
   try {
     owned();
-    node = (await graphAdd(map.repo, String(map.root), {
+    node = (await graphAdd(map.repo, String(row.parent), {
       title: row.title,
-      autonomy: "propose",
+      autonomy,
       checkpoint: row.checkpoint,
       labels: [PRINCIPAL_INTAKE_LABEL],
       body: intakeNodeBody(row),
-    }, write.token, { timeoutMs: GRAPH_CALL_TIMEOUT_MS, env: args.env ?? process.env })).node;
+    }, token, write.opts)).node;
   } catch (error) {
     if (!(error instanceof GraphAddUnattached)) throw error;
     // The node exists below no parent: attach it rather than add a second.
+    // A failed link leaves `filing`; the next tick's recovery links again.
     owned();
-    await graphLink(map.repo, error.node, String(map.root), write.token, { timeoutMs: GRAPH_CALL_TIMEOUT_MS, env: args.env ?? process.env });
+    await graphLink(map.repo, error.node, String(row.parent), token, write.opts);
     node = error.node;
   }
   return finishFiled(args, row, node, true);
 }
 
-/** Resolve the write identity (D4) once per draft, and the marker lookup under it. */
-async function writeGate(args: GateArgs): Promise<{ token: string; issues: () => Promise<LabeledIssue[]> }> {
-  const { config, map } = args;
-  const { token, botIdentity } = await assertWriteIdentity(config, map.repo, args.env ?? process.env);
-  assertNotPrincipal(config, botIdentity, map.repo);
-  const port = (args.portFor ?? ((repo: string) => lanePort(config, repo)))(map.repo);
-  if (port.issuesWithLabel === undefined) {
-    throw new EscalateError(`the forge port for ${mapKey(map)} cannot list labelled issues — the intake marker cannot be checked, so nothing is filed`);
-  }
-  const list = port.issuesWithLabel.bind(port);
-  return { token, issues: () => list(map.repo, PRINCIPAL_INTAKE_LABEL, token) };
+/**
+ * A node the marker found, not one this tick added: an earlier add may have
+ * left it unattached, with its link failed. Link it below its parent first;
+ * `soma graph link` skips a parent the node already has.
+ */
+async function finishFound(args: GateArgs, row: IntakeDraftRow, node: string): Promise<void> {
+  const { token } = await args.write.identity();
+  args.owned();
+  await graphLink(args.map.repo, node, String(row.parent), token, args.write.opts);
+  return finishFiled(args, row, node, false);
 }
 
 /**
@@ -600,6 +664,20 @@ async function finishFiled(args: GateArgs, row: IntakeDraftRow, node: string, ad
     detail: `draft ${row.messageId}: ${added ? "filed" : "found already filed (intake marker)"} as #${node} on the principal's ${FILE_EMOJI}`,
   });
   gate.filed.push({ messageId: row.messageId, node, added });
+}
+
+/** Discard a draft: the card says so (unless it is gone), then the journal records it. */
+async function discardDraft(args: GateArgs, row: IntakeDraftRow, why: string, { cardGone }: { cardGone: boolean }): Promise<void> {
+  const { journal, map, client, deadline, owned, gate } = args;
+  const now = () => args.now?.() ?? new Date();
+  if (!cardGone) {
+    owned();
+    await editCard(client, row, discardedCardContent(map, cardDraft(row)), deadline);
+  }
+  owned();
+  journal.updateIntakeDraft(row.messageId, { status: "discarded", gateReadAt: now().toISOString() });
+  journal.recordEvent("intake-discarded", { repo: map.repo, detail: `draft ${row.messageId}: ${why} — nothing filed` });
+  gate.discarded.push(row.messageId);
 }
 
 /** Edit the card; one deleted since leaves nothing to edit, and the record still moves. */
