@@ -145,6 +145,41 @@ bun run test   # unit + e2e (fake soma/gh fixtures), four files at a time
 bunx tsc --noEmit
 ```
 
+### Tick run ledger
+
+An optional `bus` section in `ranger.yaml` enables one
+`execution.run.finished` envelope per `ranger tick`, with producer `ranger`,
+`ran: {kind: job, ref: "ranger:tick"}`, a fresh run UUID, the pass timestamps,
+and the journal path as `detail_ref`. Exit 0 means `succeeded`; exits 1 and 2
+mean `failed`. A config/context load failure emits nothing.
+
+```yaml
+bus:
+  principal: jc
+  stack: default
+  url: nats://127.0.0.1:4222
+  creds: ~/.config/nats/creds/ranger.creds
+```
+
+`principal` is required; `stack` defaults to `default` and `url` to
+`nats://127.0.0.1:4222`. Principal and stack must each be a single subject
+token (`[A-Za-z0-9_-]+`). Credentials are required for a non-loopback host;
+loopback (`localhost`, `127.0.0.1`, `::1`) permits an unauthenticated bus.
+
+`MF_CORRELATION_ID` passes any nonempty string through unchanged, including
+non-UUID values; unset or empty generates a correlation ID. `MF_SERVES_GOAL`
+and `MF_SERVES_NODE` add the optional `serves.goal` and `serves.node` fields.
+Use IDs only, never goal wording. Empty values are omitted, and when both
+are empty or unset the envelope has no `serves`. Tick envelopes have no `state`.
+
+Delivery uses myelin's outbox at `<journal directory>/run-ledger/outbox.jsonl`.
+Each emit spools before delivery, replays pending records before sending the
+current run, and closes its NATS connection. The whole emit has a two-second
+ceiling. Delivery failures leave tick output and exit status unchanged and
+record one `ledger-failed` journal event; retained envelopes replay on the
+next configured tick. Without `bus`, no envelope is built, no connection is
+opened, and no spool is touched. This applies only to `tick`.
+
 ## Walker — claim + research lane (build-path step 3, node #13)
 
 The smallest full claim→execute→close loop, on the safest kind (research),

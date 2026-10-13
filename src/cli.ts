@@ -46,6 +46,7 @@ import { workerLogFile } from "./worker-log.ts";
 import { sweepMap } from "./sweep.ts";
 import { mergeGateNow } from "./merge-desk.ts";
 import { walk } from "./walk.ts";
+import { emitTickRunFinished, type RunLedgerDeps } from "./run-ledger.ts";
 import { spawnRunNodeDetached } from "./spawn.ts";
 import { holdAwake } from "./awake.ts";
 import { BUILD_NOW_NOT_STARTED, buildNow, type BuildNowResult } from "./build-now.ts";
@@ -205,6 +206,71 @@ function loadCtx(configPath: string): {
  const { config } = loadConfig(configPath);
  const journal = openJournal(config);
  return { config, journal };
+}
+
+export interface TickDeps {
+ loadCtx?: typeof loadCtx;
+ escalateMaps?: typeof escalateMaps;
+ walk?: typeof walk;
+ now?: () => Date;
+ ledger?: RunLedgerDeps;
+}
+
+/** The tick action without process I/O or exit, including its ledger attempt. */
+export async function runTick(
+ configPath: string,
+ deps: TickDeps = {},
+): Promise<{ exitCode: number; report: string }> {
+ let config: RangerConfig;
+ let journal: Journal;
+ const failure = (error: unknown) => ({
+  exitCode: 1,
+  report: `ranger tick: ${error instanceof Error ? error.message : String(error)}\n`,
+ });
+ try {
+  ({ config, journal } = (deps.loadCtx ?? loadCtx)(configPath));
+ } catch (error) {
+  return failure(error);
+ }
+ const now = deps.now ?? (() => new Date());
+ const startedAt = now().toISOString();
+ let result: { exitCode: number; report: string };
+ try {
+  // Escalation failures are reported but never prevent scheduled claims.
+  let escalateResult: EscalateResult | null = null;
+  let escalateError: string | undefined;
+  try {
+   escalateResult = await (deps.escalateMaps ?? escalateMaps)(config, journal);
+  } catch (error) {
+   escalateError = error instanceof Error ? error.message : String(error);
+  }
+  // Walking re-fetches its own frontier; the escalation read may be stale.
+  const walkResult = await (deps.walk ?? walk)({ config, configPath, journal });
+  const failed =
+   escalateError !== undefined ||
+   (escalateResult?.maps.some((m) => !m.ok) ?? false) ||
+   walkResult.maps.some((m) => m.errors.length > 0) ||
+   walkResult.intake.error !== undefined ||
+   walkResult.intake.threads.some((t) => t.error !== undefined || (t.gate?.errors.length ?? 0) > 0);
+  result = {
+   exitCode: failed ? 2 : 0,
+   report: JSON.stringify({
+    generatedAt: now().toISOString(),
+    escalate: escalateResult ?? { error: escalateError, maps: [] },
+    walk: walkResult,
+   }, null, 2) + "\n",
+  };
+ } catch (error) {
+  result = failure(error);
+ }
+ try {
+  await emitTickRunFinished(config, journal, {
+   startedAt, endedAt: now().toISOString(), exitCode: result.exitCode,
+  }, deps.ledger);
+ } finally {
+  journal.close();
+ }
+ return result;
 }
 
 /** Resolve the write credential + bot identity for a map, gating the principal, and the credential its graph reads run under. */
@@ -796,59 +862,9 @@ program
  )
  .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
  .action(async (options: { config: string }) => {
-  const configPath = resolve(process.cwd(), options.config);
-  let config: RangerConfig;
-  let journal: Journal;
-  try {
-   ({ config, journal } = loadCtx(configPath));
-  } catch (error) {
-   process.stderr.write(
-    `ranger tick: ${error instanceof Error ? error.message : String(error)}\n`,
-   );
-   process.exit(1);
-  }
-  // Escalation must NOT prevent walking: a lock-contention timeout (an
-  // overlapping digest/cards run holds the desk) or any other escalate
-  // failure is REPORTED in the output, but walk still runs — scheduled
-  // claims are independent of the desk (round-34 review).
-  let escalateResult: EscalateResult | null = null;
-  let escalateError: string | undefined;
-  try {
-   escalateResult = await escalateMaps(config, journal);
-  } catch (error) {
-   escalateError = error instanceof Error ? error.message : String(error);
-  }
-  try {
-   // walk re-fetches its OWN frontier: claims must classify from a fresh
-   // read — a ~120s-old escalation-pass frontier could misroute a node
-   // edited to HITL in that window (round-29 review).
-   const walkResult = await walk({ config, configPath, journal });
-   journal.close();
-   process.stdout.write(
-    JSON.stringify(
-     {
-      generatedAt: new Date().toISOString(),
-      escalate: escalateResult ?? { error: escalateError, maps: [] },
-      walk: walkResult,
-     },
-     null,
-     2,
-    ) + "\n",
-   );
-   const failed =
-    escalateError !== undefined ||
-    (escalateResult?.maps.some((m) => !m.ok) ?? false) ||
-    walkResult.maps.some((m) => m.errors.length > 0) ||
-    walkResult.intake.error !== undefined ||
-    walkResult.intake.threads.some((t) => t.error !== undefined || (t.gate?.errors.length ?? 0) > 0);
-   process.exit(failed ? 2 : 0);
-  } catch (error) {
-   journal.close();
-   process.stderr.write(
-    `ranger tick: ${error instanceof Error ? error.message : String(error)}\n`,
-   );
-   process.exit(1);
-  }
+  const result = await runTick(resolve(process.cwd(), options.config));
+  (result.exitCode === 1 ? process.stderr : process.stdout).write(result.report);
+  process.exit(result.exitCode);
  });
 
 program
@@ -1125,7 +1141,7 @@ program
   }
  });
 
-program.parseAsync(process.argv).catch((error) => {
+if (import.meta.main) program.parseAsync(process.argv).catch((error) => {
  process.stderr.write(
   `ranger: ${error instanceof Error ? error.message : String(error)}\n`,
  );

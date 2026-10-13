@@ -16,6 +16,41 @@ function withConfig(content: string, fn: (path: string) => void) {
 }
 
 describe("loadConfig", () => {
+  test("bus is optional; defaults stack and loopback URL when enabled", () => {
+    const base = "maps:\n  - repo: acme/widgets\n    root: 1\n";
+    withConfig(base, path => expect(loadConfig(path, {}).config.bus).toBeUndefined());
+    withConfig(base + "bus:\n  principal: jc\n", path => {
+      expect(loadConfig(path, {}).config.bus).toEqual({ principal: "jc", stack: "default", url: "nats://127.0.0.1:4222" });
+    });
+  });
+
+  test("bus requires subject tokens and credentials outside loopback", () => {
+    const base = "maps:\n  - repo: acme/widgets\n    root: 1\nbus:\n";
+    for (const token of ["", "jc.*", ">", "work.space", "two tokens"]) {
+      for (const field of ["principal", "stack"]) {
+        withConfig(base + (field === "principal" ? `  principal: ${JSON.stringify(token)}\n` : `  principal: jc\n  stack: ${JSON.stringify(token)}\n`), path => {
+          expect(() => loadConfig(path, {})).toThrow(/single NATS subject token/);
+        });
+      }
+    }
+    for (const host of ["localhost", "127.0.0.1", "[::1]"]) {
+      withConfig(base + `  principal: jc\n  url: nats://${host}:4222\n`, path => {
+        expect(loadConfig(path, {}).config.bus?.creds).toBeUndefined();
+      });
+    }
+    for (const host of ["bus.example.org", "192.0.2.10", "localhost.example.org", "[2001:db8::1]"]) {
+      withConfig(base + `  principal: jc\n  url: nats://${host}:4222\n`, path => {
+        expect(() => loadConfig(path, {})).toThrow(/bus.creds/);
+      });
+    }
+    withConfig(base + "  principal: jc_1\n  stack: work-2\n  url: nats://bus.example.org:4222\n  creds: ~/private/ranger.creds\n", path => {
+      expect(loadConfig(path, {}).config.bus?.creds).toBe("~/private/ranger.creds");
+    });
+    withConfig(base + "  principal: jc\n  url: not-a-url\n", path => {
+      expect(() => loadConfig(path, {})).toThrow(ConfigError);
+    });
+  });
+
   test("principal scalar stays unchanged; host map and qualified write prefixes parse", () => {
     withConfig('maps:\n  - repo: acme/widgets\n    root: 1\nprincipal:\n  login: jcfischer\n', path => {
       expect(loadConfig(path).config.principal.login).toBe("jcfischer");
