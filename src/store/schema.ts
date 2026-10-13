@@ -294,7 +294,7 @@ export const intakeCursors = sqliteTable("intake_cursors", {
 /**
  * One draft node card per principal message (node #247, ruling D12), keyed by
  * the Discord message id: a message read twice finds its draft here and posts
- * no second card. Nothing is filed yet; filing on 👍 is node #251's.
+ * no second card. The principal's 👍 files it, the ❌ discards it (node #251).
  */
 export const intakeDrafts = sqliteTable(
  "intake_drafts",
@@ -313,9 +313,24 @@ export const intakeDrafts = sqliteTable(
   drafter: text("drafter").notNull(),
   /** The draft card ranger posted in the thread. */
   cardMessageId: text("card_message_id").notNull(),
-  /** draft — node #251 adds filed and discarded. */
+  /**
+   * draft → filing (written before `graph add`) → filed; or draft →
+   * discarded (node #251, ruling D14).
+   */
   status: text("status").notNull().default("draft"),
   createdAt: text("created_at").notNull(),
+  /**
+   * The hash of the spec the card showed (ruling D13): the 👍 binds to it.
+   * Null on a draft posted before node #251, which cannot be filed.
+   */
+  specHash: text("spec_hash"),
+  /** The node the 👍 filed (ruling D14); the tracker's marker is the binding record (D1). */
+  filedNode: text("filed_node"),
+  /** When the gate last read the card's reactions; the rotation key. */
+  gateReadAt: text("gate_read_at"),
  },
- (table) => [index("intake_drafts_repo_root_idx").on(table.repo, table.root)],
+ (table) => [
+  index("intake_drafts_repo_root_idx").on(table.repo, table.root),
+  index("intake_drafts_channel_status_idx").on(table.channelId, table.status),
+ ],
 );

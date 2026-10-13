@@ -1,4 +1,4 @@
-import type { ChangeRequest, MergeState, MergeOutcome, CiPurpose, CiVerdict, CommentReaction, IssueComment } from "./forge.ts";
+import type { ChangeRequest, MergeState, MergeOutcome, CiPurpose, CiVerdict, CommentReaction, IssueComment, LabeledIssue } from "./forge.ts";
 import { githubCiVerdict } from "./github-ci.ts";
 import { runCmd } from "./exec.ts";
 import { runReadRetryingTransient } from "./transient.ts";
@@ -398,6 +398,32 @@ export async function commentReactions(
   author: String(((r.user ?? {}) as Record<string, unknown>).login ?? ""),
   content: String(r.content ?? ""),
  }));
+}
+
+/**
+ * Every issue carrying `label`, open or closed, every page (node #251, the
+ * intake gate's marker lookup). The list endpoint, not search: a node added a
+ * moment ago is listed at once, where the search index lags. Pull requests
+ * share the list and are dropped. Any failed page throws.
+ */
+export async function issuesWithLabel(
+ repo: string,
+ label: string,
+ token: string,
+): Promise<LabeledIssue[]> {
+ const where = `issues labelled ${label}`;
+ const raw = await ghApi(
+  token,
+  [`repos/${repo}/issues?labels=${encodeURIComponent(label)}&state=all&per_page=100`, "--paginate", "--slurp"],
+  where,
+ );
+ return pagedList(raw, where)
+  .filter((r) => r.pull_request === undefined || r.pull_request === null)
+  .map((r) => {
+   const number = Number(r.number);
+   if (!Number.isSafeInteger(number) || number <= 0) throw new GitHubError(`${where}: an issue without a number`);
+   return { number, body: String(r.body ?? "") };
+  });
 }
 
 /** Existing GitHub gate semantics: named non-conflict states were allowed. */

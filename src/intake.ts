@@ -1,15 +1,22 @@
+import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
-import { draftCardContent } from "./card-sync.ts";
+import { discardedCardContent, draftCardContent, filedCardContent, type IntakeCardDraft } from "./card-sync.ts";
 import { oneLine } from "./card-render.ts";
 import {
+  DiscordMessageGoneError,
   EscalateError,
   EscalationDiscord,
   snowflakeAt,
   THREAD_PAGE_SIZE,
   type ThreadMessage,
 } from "./discord.ts";
-import type { Journal } from "./journal.ts";
+import type { ForgeReadPort, LabeledIssue } from "./forge.ts";
+import { lanePort } from "./forge-lanes.ts";
+import { GRAPH_CALL_TIMEOUT_MS } from "./graph.ts";
+import { GraphAddUnattached, graphAdd, graphLink } from "./graph-write.ts";
+import { assertNotPrincipal, assertWriteIdentity } from "./identity.ts";
+import type { IntakeDraftRow, Journal } from "./journal.ts";
 import { type OwnedCheck, withOwnedLease } from "./lock.ts";
 import { mapKey } from "./maps.ts";
 
@@ -21,13 +28,22 @@ import { mapKey } from "./maps.ts";
  * counts only when the principal (`principal.discordId`) wrote it and it
  * @-mentions the ranger bot; Discord returns the content of such a message
  * without the privileged Message Content intent. Each one gets a draft node
- * card in its thread, written by the deterministic drafter. Nothing is filed:
- * filing on 👍 and discarding on ❌ are node #251's.
+ * card in its thread, written by the deterministic drafter.
  *
  * Per thread the journal holds a cursor (the newest message id read) and one
  * draft per message id. The cursor moves past each message once it is
  * handled; a message read twice (a crash before the cursor write) finds its
  * draft and posts no second card. A failed read moves nothing.
+ *
+ * Slice 2, the gate (node #251; rulings D4, D5, D13, D14, with D1): each
+ * tick reads the reactions on the thread's open draft cards. The principal's
+ * ❌ discards a draft. The principal's 👍 files it, once: the journaled spec
+ * must still hash to the hash the card showed, the write identity must pass
+ * `assertWriteIdentity`, and the map must hold no node carrying the draft's
+ * intake marker. Then `soma graph add` below the map root, as the machine
+ * account, labelled `ranger:principal-intake`, with a link to the message
+ * and the marker in the body. The node and its marker are the binding
+ * record; the journal is a cache (D1).
  */
 
 /** The drafter of this slice (D12's fallback); the LLM drafter is node #252's. */
@@ -41,6 +57,21 @@ const INTAKE_PASS_MS = 60_000;
 
 /** How long a second intake run waits for the first before it skips. */
 const INTAKE_LOCK_TIMEOUT_MS = 30_000;
+
+/** Draft cards whose reactions one thread's gate reads per tick; the rest wait. */
+const GATE_READS_PER_THREAD = 10;
+
+/** The provenance label of a node the principal's 👍 filed (ruling D5). */
+export const PRINCIPAL_INTAKE_LABEL = "ranger:principal-intake";
+
+/** The 👍 files a draft; the ❌ discards it (ruling D14). Discord's unicode names. */
+export const FILE_EMOJI = "👍";
+export const DISCARD_EMOJI = "❌";
+
+/** The intake marker a filed node's body carries (ruling D14): it blocks a second add. */
+export function intakeMarker(messageId: string): string {
+  return `<!-- ranger:intake discord=${messageId} -->`;
+}
 
 const TITLE_MAX = 120;
 const CHECKPOINT_MAX = 48;
@@ -64,6 +95,23 @@ export interface IntakeThreadResult {
   /** Why this thread was not read, when that is configuration, not a failure. */
   skipped?: string;
   error?: string;
+  /** The gate over the thread's open drafts (node #251); absent when none was read. */
+  gate?: IntakeGateResult;
+}
+
+/** What the gate did with one thread's open drafts this tick (node #251). */
+export interface IntakeGateResult {
+  /** Draft message ids whose card reactions were read. */
+  read: string[];
+  /** Drafts filed this tick; `added: false` when the marker found the node already there. */
+  filed: { messageId: string; node: string; added: boolean }[];
+  /** Drafts the principal's ❌ discarded. */
+  discarded: string[];
+  /** A principal 👍 that filed nothing, and why: the card stays a draft. */
+  refused: { messageId: string; reason: string }[];
+  /** Over the per-tick cap or past the deadline: read on a later tick. */
+  deferred: string[];
+  errors: string[];
 }
 
 export interface IntakeResult {
@@ -152,6 +200,8 @@ export interface IntakeContext {
   now?: () => Date;
   /** The thread client for a map (tests inject one; default: the map's Discord surface). */
   clientFor?: (map: RangerMapConfig) => EscalationDiscord;
+  /** The forge port the gate's marker lookup reads (default: the map's lane port). */
+  portFor?: (repo: string) => Pick<ForgeReadPort, "issuesWithLabel">;
 }
 
 /** The intake pass of one walk tick. Never throws: failures land in the result. */
@@ -217,6 +267,20 @@ async function readThreads(
       result.error = error instanceof Error ? error.message : String(error);
     }
     result.cursor = ctx.journal.intakeCursor(channelId);
+    // The gate reads its own cards: a failed thread read does not stop it.
+    // A card posted this tick has no reaction yet; it is read next tick.
+    const open = ctx.journal
+      .listOpenIntakeDrafts(channelId)
+      .filter((row) => row.repo === map.repo && row.root === map.root && !result.drafted.includes(row.messageId));
+    if (open.length > 0) {
+      const gate: IntakeGateResult = { read: [], filed: [], discarded: [], refused: [], deferred: [], errors: [] };
+      result.gate = gate;
+      try {
+        await gateDrafts({ ...ctx, map, client: clientFor(map), principalId, deadline, owned, rows: open, gate });
+      } catch (error) {
+        gate.errors.push(error instanceof Error ? error.message : String(error));
+      }
+    }
   }
   return { threads: results };
 }
@@ -299,7 +363,8 @@ async function postDraft(args: {
   const { journal, map, client, message, botUserId, guildId, deadline, owned, now } = args;
   const spec = deterministicDraft(message.content, botUserId, map.root);
   const url = messageUrl(guildId, client.channel, message.id);
-  const content = draftCardContent(map, { ...spec, body: message.content, messageUrl: url });
+  const specHash = intakeSpecHash(map, { ...spec, body: message.content, messageUrl: url });
+  const content = draftCardContent(map, { ...spec, body: message.content, messageUrl: url, specHash });
   owned();
   const cardMessageId = await client.post(content, deadline);
   // No await between the post and its record: a crash can only leave the
@@ -317,9 +382,231 @@ async function postDraft(args: {
     drafter: spec.drafter,
     cardMessageId,
     createdAt: now.toISOString(),
+    specHash,
   });
   journal.recordEvent("intake-draft", {
     repo: map.repo,
     detail: `draft card ${cardMessageId} for message ${message.id} (${spec.drafter})`,
   });
+}
+
+// ---- the gate: the principal's 👍 files a draft, ❌ discards it (node #251) ----
+
+/**
+ * The hash of a draft's spec (ruling D13): every field the card shows and
+ * the add writes. The card carries it; the 👍 binds to it. A journaled spec
+ * that no longer hashes to it was not the spec the principal saw.
+ */
+export function intakeSpecHash(
+  map: { repo: string; root: number },
+  draft: { title: string; parent: number; checkpoint: string; autonomy: string; drafter: string; body: string; messageUrl: string },
+): string {
+  const fields = [
+    "ranger-intake-spec/1",
+    map.repo,
+    map.root,
+    draft.parent,
+    draft.title,
+    draft.checkpoint,
+    draft.autonomy,
+    draft.drafter,
+    draft.body,
+    draft.messageUrl,
+  ];
+  return createHash("sha256").update(JSON.stringify(fields)).digest("hex");
+}
+
+/** A journaled draft as the card showed it: parent the map root, autonomy `propose` (D12). */
+function cardDraft(row: IntakeDraftRow): IntakeCardDraft {
+  return {
+    title: row.title,
+    parent: row.root,
+    checkpoint: row.checkpoint,
+    autonomy: "propose",
+    drafter: row.drafter,
+    body: row.body,
+    messageUrl: row.messageUrl,
+    specHash: row.specHash,
+  };
+}
+
+/** The body of the filed node: the principal's words verbatim, the link back, the marker (D5, D14). */
+export function intakeNodeBody(row: Pick<IntakeDraftRow, "body" | "messageUrl" | "messageId">): string {
+  return [
+    row.body.trim(),
+    "",
+    "---",
+    `Filed by ranger on the principal's 👍, from their Discord message: ${row.messageUrl}`,
+    "",
+    intakeMarker(row.messageId),
+  ].join("\n");
+}
+
+/** The node already carrying this draft's marker, or null; two such nodes are refused, not guessed between. */
+export function markedNode(issues: readonly LabeledIssue[], messageId: string): string | null {
+  const marker = intakeMarker(messageId);
+  const hits = [...new Set(issues.filter((issue) => issue.body.includes(marker)).map((issue) => issue.number))];
+  if (hits.length > 1) {
+    throw new EscalateError(`nodes ${hits.map((n) => `#${n}`).join(", ")} all carry ${marker} — one draft filed twice; nothing more is filed`);
+  }
+  return hits.length === 0 ? null : String(hits[0]);
+}
+
+/** Does the principal's reaction stand on the card? Any failed page throws. */
+async function principalReacted(client: EscalationDiscord, row: IntakeDraftRow, emoji: string, principalId: string, deadline: number): Promise<boolean> {
+  return (await client.reactionUserIds(row.cardMessageId, emoji, deadline)).includes(principalId);
+}
+
+type GateArgs = IntakeContext & {
+  map: RangerMapConfig;
+  client: EscalationDiscord;
+  principalId: string;
+  deadline: number;
+  owned: OwnedCheck;
+  gate: IntakeGateResult;
+};
+
+/**
+ * Gate one thread's open drafts, the least recently read first, at most
+ * `GATE_READS_PER_THREAD` per tick. One draft's failure is its own: the
+ * next draft is still read.
+ */
+async function gateDrafts(args: GateArgs & { rows: IntakeDraftRow[] }): Promise<void> {
+  const { rows, gate, deadline } = args;
+  for (const [i, row] of rows.entries()) {
+    if (i >= GATE_READS_PER_THREAD || Date.now() > deadline) {
+      gate.deferred.push(row.messageId);
+      continue;
+    }
+    try {
+      await gateDraft(args, row);
+    } catch (error) {
+      gate.errors.push(`draft ${row.messageId}: ${error instanceof Error ? error.message : String(error)} — nothing filed; read again next tick`);
+    }
+  }
+}
+
+async function gateDraft(args: GateArgs, row: IntakeDraftRow): Promise<void> {
+  const { journal, map, client, principalId, deadline, owned, gate } = args;
+  const now = () => args.now?.() ?? new Date();
+  // A `filing` row was 👍'd and the tick died around its add: the marker,
+  // not the reactions, says whether the node exists (D1).
+  if (row.status === "filing") {
+    const write = await writeGate(args);
+    const node = markedNode(await write.issues(), row.messageId);
+    if (node !== null) return finishFiled(args, row, node, false);
+    // The add never landed: the draft is a draft again, and its reactions decide.
+    owned();
+    journal.updateIntakeDraft(row.messageId, { status: "draft" });
+    row = { ...row, status: "draft" };
+  }
+
+  gate.read.push(row.messageId);
+  let discard: boolean;
+  let file: boolean;
+  try {
+    // ❌ wins: a card the principal both 👍'd and ❌'d files nothing.
+    discard = await principalReacted(client, row, DISCARD_EMOJI, principalId, deadline);
+    file = !discard && (await principalReacted(client, row, FILE_EMOJI, principalId, deadline));
+  } catch (error) {
+    // The card is gone: no reaction on it can ever file the draft.
+    if (!(error instanceof DiscordMessageGoneError)) throw error;
+    owned();
+    journal.updateIntakeDraft(row.messageId, { status: "discarded", gateReadAt: now().toISOString() });
+    journal.recordEvent("intake-discarded", { repo: map.repo, detail: `draft ${row.messageId}: card ${row.cardMessageId} is gone — nothing filed` });
+    gate.discarded.push(row.messageId);
+    return;
+  }
+  owned();
+  journal.updateIntakeDraft(row.messageId, { gateReadAt: now().toISOString() });
+
+  if (discard) {
+    owned();
+    await editCard(client, row, discardedCardContent(map, cardDraft(row)), deadline);
+    owned();
+    journal.updateIntakeDraft(row.messageId, { status: "discarded" });
+    journal.recordEvent("intake-discarded", { repo: map.repo, detail: `draft ${row.messageId}: the principal's ${DISCARD_EMOJI} on card ${row.cardMessageId} — nothing filed` });
+    gate.discarded.push(row.messageId);
+    return;
+  }
+  if (!file) return;
+
+  // The 👍 binds to the spec the card showed (D13).
+  if (row.specHash === null) {
+    gate.refused.push({ messageId: row.messageId, reason: "the card carries no spec hash (drafted before node #251) — nothing to bind the 👍 to; mention the bot again to redraft" });
+    return;
+  }
+  if (intakeSpecHash(map, cardDraft(row)) !== row.specHash) {
+    gate.refused.push({ messageId: row.messageId, reason: `the journaled spec no longer hashes to ${row.specHash.slice(0, 12)}, the spec the card showed — nothing filed` });
+    return;
+  }
+
+  // The write runs only after the identity-pinned read succeeds (D4), and
+  // only when no node carries the marker yet (D14).
+  const write = await writeGate(args);
+  const existing = markedNode(await write.issues(), row.messageId);
+  if (existing !== null) return finishFiled(args, row, existing, false);
+
+  // Written before the add: a tick that dies past here leaves `filing`, and
+  // the next one asks the marker before anything else.
+  owned();
+  journal.updateIntakeDraft(row.messageId, { status: "filing" });
+  let node: string;
+  try {
+    owned();
+    node = (await graphAdd(map.repo, String(map.root), {
+      title: row.title,
+      autonomy: "propose",
+      checkpoint: row.checkpoint,
+      labels: [PRINCIPAL_INTAKE_LABEL],
+      body: intakeNodeBody(row),
+    }, write.token, { timeoutMs: GRAPH_CALL_TIMEOUT_MS, env: args.env ?? process.env })).node;
+  } catch (error) {
+    if (!(error instanceof GraphAddUnattached)) throw error;
+    // The node exists below no parent: attach it rather than add a second.
+    owned();
+    await graphLink(map.repo, error.node, String(map.root), write.token, { timeoutMs: GRAPH_CALL_TIMEOUT_MS, env: args.env ?? process.env });
+    node = error.node;
+  }
+  return finishFiled(args, row, node, true);
+}
+
+/** Resolve the write identity (D4) once per draft, and the marker lookup under it. */
+async function writeGate(args: GateArgs): Promise<{ token: string; issues: () => Promise<LabeledIssue[]> }> {
+  const { config, map } = args;
+  const { token, botIdentity } = await assertWriteIdentity(config, map.repo, args.env ?? process.env);
+  assertNotPrincipal(config, botIdentity, map.repo);
+  const port = (args.portFor ?? ((repo: string) => lanePort(config, repo)))(map.repo);
+  if (port.issuesWithLabel === undefined) {
+    throw new EscalateError(`the forge port for ${mapKey(map)} cannot list labelled issues — the intake marker cannot be checked, so nothing is filed`);
+  }
+  const list = port.issuesWithLabel.bind(port);
+  return { token, issues: () => list(map.repo, PRINCIPAL_INTAKE_LABEL, token) };
+}
+
+/**
+ * The card says "filed as #N", then the journal records it. A tick that
+ * dies between the two re-finds the node by its marker and edits again.
+ */
+async function finishFiled(args: GateArgs, row: IntakeDraftRow, node: string, added: boolean): Promise<void> {
+  const { journal, map, client, deadline, owned, gate } = args;
+  owned();
+  await editCard(client, row, filedCardContent(map, cardDraft(row), node), deadline);
+  owned();
+  journal.updateIntakeDraft(row.messageId, { status: "filed", filedNode: node });
+  journal.recordEvent("intake-filed", {
+    repo: map.repo,
+    nodeId: node,
+    detail: `draft ${row.messageId}: ${added ? "filed" : "found already filed (intake marker)"} as #${node} on the principal's ${FILE_EMOJI}`,
+  });
+  gate.filed.push({ messageId: row.messageId, node, added });
+}
+
+/** Edit the card; one deleted since leaves nothing to edit, and the record still moves. */
+async function editCard(client: EscalationDiscord, row: IntakeDraftRow, content: string, deadline: number): Promise<void> {
+  try {
+    await client.edit(row.cardMessageId, content, deadline);
+  } catch (error) {
+    if (!(error instanceof DiscordMessageGoneError)) throw error;
+  }
 }

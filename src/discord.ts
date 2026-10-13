@@ -524,8 +524,12 @@ export class EscalationDiscord {
 
   // ---- thread reads (human-observation intake, node #247) ----
 
-  /** One GET, parsed; any non-2xx, network error or bad body throws. */
-  private async getJson(path: string, label: string, deadline?: number): Promise<unknown> {
+  /**
+   * One GET, parsed; any non-2xx, network error or bad body throws. With
+   * `gone`, a 404 throws `DiscordMessageGoneError`: the message is not in
+   * this channel.
+   */
+  private async getJson(path: string, label: string, deadline?: number, gone = false): Promise<unknown> {
     let response: DiscordHttpResult;
     try {
       response = await this.fetchOnce(path, { method: "GET" }, deadline);
@@ -533,6 +537,9 @@ export class EscalationDiscord {
       throw new EscalateError(
         `discord ${label} failed: ${error instanceof Error ? error.message : String(error)}`,
       );
+    }
+    if (gone && response.status === 404) {
+      throw new DiscordMessageGoneError(`discord ${label} returned HTTP 404 — the message is not in channel ${this.channelId}`);
     }
     if (response.status < 200 || response.status >= 300) {
       throw new EscalateError(`discord ${label} returned HTTP ${response.status}`);
@@ -598,7 +605,37 @@ export class EscalationDiscord {
     // Discord lists newest first; intake walks oldest first.
     return messages.sort((a, b) => compareSnowflakes(a.id, b.id));
   }
+
+  /**
+   * The ids of every user who reacted `emoji` on a message in this channel,
+   * every page (the intake gate, node #251). Any failed page throws, so a
+   * caller never decides on part of the answer.
+   */
+  async reactionUserIds(messageId: string, emoji: string, deadline?: number): Promise<string[]> {
+    const label = `read of ${emoji} reactions on message ${messageId}`;
+    const base = `/channels/${this.channelId}/messages/${encodeURIComponent(messageId)}/reactions/${encodeURIComponent(emoji)}`;
+    const ids: string[] = [];
+    let after: string | null = null;
+    for (let page = 0; page < MAX_REACTION_PAGES; page++) {
+      const query = `?limit=${REACTION_PAGE_SIZE}${after === null ? "" : `&after=${after}`}`;
+      const body = await this.getJson(`${base}${query}`, label, deadline, true);
+      if (!Array.isArray(body)) throw new EscalateError(`discord ${label} returned no user list`);
+      const users = body.map((raw) => {
+        const id = (raw as { id?: unknown } | null)?.id;
+        if (typeof id !== "string" || !SNOWFLAKE.test(id)) throw new EscalateError(`discord ${label} returned a user without an id`);
+        return id;
+      });
+      ids.push(...users);
+      if (users.length < REACTION_PAGE_SIZE) return ids;
+      after = users.reduce((a, b) => (compareSnowflakes(a, b) >= 0 ? a : b));
+    }
+    throw new EscalateError(`discord ${label}: more than ${MAX_REACTION_PAGES} pages`);
+  }
 }
+
+/** Discord's maximum page of reacting users. */
+const REACTION_PAGE_SIZE = 100;
+const MAX_REACTION_PAGES = 10;
 
 /** The page size of a thread read: Discord's maximum. */
 export const THREAD_PAGE_SIZE = 100;

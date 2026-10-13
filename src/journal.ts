@@ -168,8 +168,15 @@ export interface IntakeDraftRow {
  messageUrl: string;
  drafter: string;
  cardMessageId: string;
+ /** draft | filing | filed | discarded (node #251). */
  status: string;
  createdAt: string;
+ /** The spec hash the card showed (ruling D13); null before node #251. */
+ specHash: string | null;
+ /** The node the principal's 👍 filed. */
+ filedNode: string | null;
+ /** When the gate last read the card's reactions. */
+ gateReadAt: string | null;
 }
 
 export interface ResumeQueueRow {
@@ -223,7 +230,10 @@ export type EventKind =
  | "log-failed"
  | "worktree-synced"
  | "filed"
- | "intake-draft";
+ | "intake-draft"
+ /** Intake gate (node #251): the principal's 👍 filed a draft, or ❌ discarded one. */
+ | "intake-filed"
+ | "intake-discarded";
 
 /** The health-store key of a checkout's known-good git state (`knownGoodGitState`). */
 const knownGoodGitKey = (canonical: string): string => `git.known-good.${canonical}`;
@@ -1138,8 +1148,28 @@ export class Journal {
  }
 
  /** Record a posted draft card; a second record for one message is refused. */
- recordIntakeDraft(row: Omit<IntakeDraftRow, "status">): void {
+ recordIntakeDraft(row: Omit<IntakeDraftRow, "status" | "filedNode" | "gateReadAt">): void {
   this.db.insert(intakeDrafts).values({ ...row, status: "draft" }).run();
+ }
+
+ updateIntakeDraft(
+  messageId: string,
+  patch: Partial<Pick<IntakeDraftRow, "status" | "filedNode" | "gateReadAt">>,
+ ): void {
+  this.db.update(intakeDrafts).set(patch).where(eq(intakeDrafts.messageId, messageId)).run();
+ }
+
+ /**
+  * The drafts in a thread the gate still reads (node #251): `draft` and
+  * `filing`, the least recently read first, then the oldest.
+  */
+ listOpenIntakeDrafts(channelId: string): IntakeDraftRow[] {
+  return this.db
+   .select()
+   .from(intakeDrafts)
+   .where(and(eq(intakeDrafts.channelId, channelId), inArray(intakeDrafts.status, ["draft", "filing"])))
+   .orderBy(sql`coalesce(${intakeDrafts.gateReadAt}, '')`, asc(intakeDrafts.createdAt), asc(intakeDrafts.messageId))
+   .all();
  }
 
  listIntakeDrafts(repo?: string): IntakeDraftRow[] {

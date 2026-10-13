@@ -68,6 +68,17 @@ export interface ForgeReadPort<Credential = string> {
  issueComments?(repo: string, issue: number, token: Credential): Promise<IssueComment[]>;
  /** Every reaction on an issue comment, every page (node #250). GitHub only. */
  commentReactions?(repo: string, commentId: string, token: Credential): Promise<CommentReaction[]>;
+ /**
+  * Every issue (open or closed, never a PR) carrying `label`, every page:
+  * the intake gate's marker lookup (node #251). GitHub only.
+  */
+ issuesWithLabel?(repo: string, label: string, token: Credential): Promise<LabeledIssue[]>;
+}
+
+/** One tracker issue read by label: its number and body. */
+export interface LabeledIssue {
+ number: number;
+ body: string;
 }
 
 /** What a merge attempt did. How each adapter reports a refusal is on `ForgePort.mergePr`. */

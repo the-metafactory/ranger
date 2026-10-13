@@ -183,6 +183,12 @@ export function fakeDiscord() {
  const threadReads: { channelId: string; after: string | null }[] = [];
  const meReads: number[] = [];
  let threadReadStatus = 200;
+ // Reactions per `messageId|emoji`, every reaction read, and the status the
+ // reaction reads and edits answer (intake gate, node #251).
+ const reactions = new Map<string, string[]>();
+ const reactionReads: { messageId: string; emoji: string; after: string | null }[] = [];
+ let reactionReadStatus = 200;
+ let editStatus = 200;
  const server = Bun.serve({
   port: 0,
   async fetch(req) {
@@ -206,6 +212,21 @@ export function fakeDiscord() {
      .reverse();
     return Response.json(newer);
    }
+   const reactionMatch = url.pathname.match(/^\/channels\/[^/]+\/messages\/([^/]+)\/reactions\/([^/]+)$/);
+   if (req.method === "GET" && reactionMatch) {
+    const messageId = decodeURIComponent(reactionMatch[1]!);
+    const emoji = decodeURIComponent(reactionMatch[2]!);
+    const after = url.searchParams.get("after");
+    reactionReads.push({ messageId, emoji, after });
+    if (reactionReadStatus !== 200) return new Response("refused", { status: reactionReadStatus });
+    if (deleted.has(messageId)) return new Response("unknown message", { status: 404 });
+    const limit = Number(url.searchParams.get("limit") ?? 25);
+    const users = (reactions.get(`${messageId}|${emoji}`) ?? [])
+     .filter((id) => after === null || BigInt(id) > BigInt(after))
+     .sort((a, b) => (BigInt(a) < BigInt(b) ? -1 : 1))
+     .slice(0, limit);
+    return Response.json(users.map((id) => ({ id })));
+   }
    const channelMatch = url.pathname.match(/^\/channels\/([^/]+)$/);
    if (req.method === "GET" && channelMatch) {
     return Response.json({ id: channelMatch[1], guild_id: FAKE_GUILD_ID });
@@ -221,6 +242,7 @@ export function fakeDiscord() {
    );
    if (req.method === "PATCH" && editMatch) {
     const messageId = editMatch[1];
+    if (editStatus !== 200) return new Response("refused", { status: editStatus });
     const parsed = (await req.json()) as { content?: string };
     edits.push({ messageId, content: parsed?.content ?? "" });
     return Response.json({ id: messageId });
@@ -251,6 +273,16 @@ export function fakeDiscord() {
   meReads,
   /** Answer every thread read with this HTTP status (200 = serve normally). */
   failThreadReads: (status: number) => { threadReadStatus = status; },
+  /** A user reacts `emoji` on a message (intake gate, node #251). */
+  react: (messageId: string, emoji: string, userId: string) => {
+   const key = `${messageId}|${emoji}`;
+   reactions.set(key, [...(reactions.get(key) ?? []), userId]);
+  },
+  reactionReads,
+  /** Answer every reaction read with this HTTP status (200 = serve normally). */
+  failReactionReads: (status: number) => { reactionReadStatus = status; },
+  /** Answer every edit with this HTTP status (200 = edit normally). */
+  failEdits: (status: number) => { editStatus = status; },
   stop: () => server.stop(true),
  };
 }

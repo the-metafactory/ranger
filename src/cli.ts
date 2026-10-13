@@ -840,7 +840,7 @@ program
     (escalateResult?.maps.some((m) => !m.ok) ?? false) ||
     walkResult.maps.some((m) => m.errors.length > 0) ||
     walkResult.intake.error !== undefined ||
-    walkResult.intake.threads.some((t) => t.error !== undefined);
+    walkResult.intake.threads.some((t) => t.error !== undefined || (t.gate?.errors.length ?? 0) > 0);
    process.exit(failed ? 2 : 0);
   } catch (error) {
    journal.close();
