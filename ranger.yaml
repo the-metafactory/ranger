@@ -230,7 +230,7 @@ maps:
   - repo: the-metafactory/ranger
     root: 257
     walk: full
-    autoMerge: false
+    autoMerge: true
     localCheckout: ~/work/mf/ranger
     commands:
       install: bun install --frozen-lockfile
