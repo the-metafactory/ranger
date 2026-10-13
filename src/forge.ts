@@ -33,6 +33,12 @@ export type CiVerdict =
   state: "red" | "pending";
   reason: string;
   /**
+   * `noRuns`: pending only because no CI run exists on the head at all (no
+   * check run on GitHub, no push or merge_request_event pipeline on GitLab);
+   * the merge desk's no-CI send-back reads it.
+   */
+  noRuns?: true;
+  /**
    * The runs that failed, when the adapter can name them (GitHub's merge
    * verdict). Only a run concluded `failure` is sent back to a worker with
    * its log; a verdict without them is never sent back.

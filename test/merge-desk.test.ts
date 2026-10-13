@@ -1,5 +1,5 @@
 import { githubCiVerdict } from "../src/github-ci.ts";
-import { describe, expect, test } from "bun:test";
+import { describe, expect, setSystemTime, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -460,4 +460,133 @@ describe("mergeGateNow — the desk's gate, for a dashboard merge", () => {
    } finally { r.close(); }
   });
  }
+});
+
+describe("a refused close is not re-run by the desk (2026-10-13: soma #795 and #796, reflex #35)", () => {
+ for (const [why, outcome, rerun] of [
+  ["a probe outside the probe tree", "close refused after merge: Close refused.\n\n4 of 6 declared probe(s) name a path outside the probe tree.", false],
+  ["a probe that ran and failed", "close refused after merge: probe command:bun test|/repo|900|0 on node 796 ran and failed", false],
+  ["gh's network error", "close refused after merge: gh api GET repos/acme/seelite/issues/96 failed (exit 1): error connecting to api.github.com", true],
+ ] as const) {
+  test(`${why}: ${rerun ? "re-run on the merge" : "stays parked, its PR not even read"}`, async () => {
+   const r = rig();
+   try {
+    r.journal.updateWorker("96", GAME, { status: "parked", phase: "close", outcome });
+    const gh = fakeGitHub({ comments: [], ci: GREEN, merged: true });
+    await r.desk(gh.github);
+    expect(r.spawned).toEqual(rerun ? ["96"] : []);
+    if (!rerun) expect(gh.calls).toEqual([]);
+   } finally { r.close(); }
+  });
+ }
+
+ test("a review-cap park whose PR the principal merged still gets its close", async () => {
+  const r = rig();
+  try {
+   r.journal.updateWorker("96", GAME, { status: "parked", phase: "review", outcome: reviewCapOutcome({ repo: GAME, blockers: 1, majors: 0, round: 2, pr: 709 }) });
+   const gh = fakeGitHub({ comments: [], ci: GREEN, merged: true });
+   await r.desk(gh.github);
+   expect(r.spawned).toEqual(["96"]);
+  } finally { r.close(); }
+ });
+});
+
+describe("a ready head no CI ran on (2026-10-13: reflex #43)", () => {
+ const ready = () => {
+  const r = rig({ autoMerge: false });
+  r.journal.updateWorker("96", GAME, { status: "awaiting-merge", outcome: null });
+  return r;
+ };
+ const steps = (r: ReturnType<typeof rig>) => r.journal.listCiAbsent(GAME, "96").map((s) => s.step).reverse();
+ const later = (min: number) => setSystemTime(new Date(Date.now() + min * 60_000));
+
+ test("seen, then sent back for a base merge pass once the grace is over, then surfaced once", async () => {
+  const r = ready();
+  try {
+   const gh = fakeGitHub({ comments: [review(CERTIFIED)], ci: [] });
+   expect(await r.desk(gh.github)).toMatchObject({ pending: ["96"], resumed: [] });
+   expect(steps(r)).toEqual(["seen"]);
+   await r.desk(gh.github);
+   expect(r.spawned).toEqual([]);
+   expect(steps(r)).toEqual(["seen"]);
+
+   later(r.config.workers.noCiGraceMin + 1);
+   expect(await r.desk(gh.github)).toMatchObject({ resumed: ["96"] });
+   expect(r.spawned).toEqual(["96"]);
+   expect(r.journal.getWorker("96", GAME)).toMatchObject({ status: "running", phase: "review" });
+   expect(steps(r)).toEqual(["seen", "sent-back"]);
+
+   // Run-node merged nothing (level with its base): the same head is ready again.
+   r.journal.updateWorker("96", GAME, { status: "awaiting-merge", phase: "awaiting-merge", pid: null });
+   await r.desk(gh.github);
+   expect(r.spawned).toEqual(["96"]);
+   expect(steps(r)).toEqual(["seen", "sent-back", "surfaced"]);
+   expect(r.posts).toHaveLength(1);
+   expect(r.posts[0]).toContain("no CI");
+   await r.desk(gh.github);
+   expect(r.posts).toHaveLength(1);
+   expect(r.spawned).toEqual(["96"]);
+  } finally { setSystemTime(); r.close(); }
+ });
+
+ test("a head whose CI is merely running is not sent back", async () => {
+  const r = ready();
+  try {
+   const gh = fakeGitHub({ comments: [review(CERTIFIED)], ci: [{ id: 3, name: "test", status: "in_progress", conclusion: null } as CheckRun] });
+   later(r.config.workers.noCiGraceMin + 1);
+   await r.desk(gh.github);
+   expect(r.spawned).toEqual([]);
+   expect(steps(r)).toEqual([]);
+  } finally { setSystemTime(); r.close(); }
+ });
+
+ test("the send-back waits for a held lane and is recorded only once it spawns", async () => {
+  const r = ready();
+  try {
+   const gh = fakeGitHub({ comments: [review(CERTIFIED)], ci: [] });
+   await r.desk(gh.github);
+   r.journal.upsertWorker({ root: 460, nodeId: "64", repo: GAME, lane: "implement", status: "running", phase: "review" });
+   later(r.config.workers.noCiGraceMin + 1);
+   await r.desk(gh.github);
+   expect(r.spawned).toEqual([]);
+   expect(steps(r)).toEqual(["seen"]);
+  } finally { setSystemTime(); r.close(); }
+ });
+});
+
+describe("a failed row whose PR the principal merged gets its close (2026-10-13: myelin #324)", () => {
+ test("merged: the close is spawned", async () => {
+  const r = rig();
+  try {
+   r.journal.updateWorker("96", GAME, { status: "failed", phase: "review", outcome: "tests (bun test) failed after the worker (exit 1)" });
+   const gh = fakeGitHub({ comments: [], ci: GREEN, merged: true });
+   await r.desk(gh.github);
+   expect(r.spawned).toEqual(["96"]);
+   expect(r.journal.getWorker("96", GAME)).toMatchObject({ status: "running", phase: "close" });
+  } finally { r.close(); }
+ });
+
+ test("still open: left failed, with no card, park or send-back", async () => {
+  const r = rig({ autoMerge: false });
+  try {
+   r.journal.updateWorker("96", GAME, { status: "failed", phase: "review", outcome: "worker exited 1" });
+   const gh = fakeGitHub({ comments: [review(CERTIFIED)], ci: GREEN });
+   expect(await r.desk(gh.github)).toMatchObject({ cards: [], merged: [], resumed: [], parked: [], pending: [], errors: [] });
+   expect(r.spawned).toEqual([]);
+   expect(r.posts).toEqual([]);
+   expect(gh.calls).toEqual(["getPr"]);
+   expect(r.journal.getWorker("96", GAME)?.status).toBe("failed");
+  } finally { r.close(); }
+ });
+
+ test("a failed close is not re-run on the merge, unless it failed on a transient error", async () => {
+  for (const [outcome, rerun] of [["close after merge: soma graph close refused", false], ["read ECONNRESET", true]] as const) {
+   const r = rig();
+   try {
+    r.journal.updateWorker("96", GAME, { status: "failed", phase: "close", outcome });
+    await r.desk(fakeGitHub({ comments: [], ci: GREEN, merged: true }).github);
+    expect(r.spawned).toEqual(rerun ? ["96"] : []);
+   } finally { r.close(); }
+  }
+ });
 });

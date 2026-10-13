@@ -238,6 +238,38 @@ export function policyBlockedOutcome(r: { pass: string; reason: string; log: str
 
 export const POLICY_BLOCKED_OUTCOME = /^policy-blocked: /;
 
+/**
+ * The worker reported that the node cannot be done yet: a precondition
+ * outside its reach is unmet (cortex#2557: a Myelin export no release
+ * carried). Nothing was pushed and no PR opened. A park, not a failure: it is
+ * no evidence against the node or the worker, so it does not count toward the
+ * dead-man; a resume once the condition holds runs a fresh worker.
+ */
+export function blockedOutcome(r: { pass: string; reason: string; resume: string; log?: string }): string {
+ const resume = r.resume.length > 0 ? r.resume : "none given, read the worker log";
+ return `blocked: ${r.reason}${RESUME_MARK}${resume} (${r.pass}${r.log === undefined ? "" : `; worker log: ${r.log}`})`;
+}
+
+export const BLOCKED_OUTCOME = /^blocked: /;
+
+/** Where the worker writes its blocked report, relative to the worktree root. */
+export const BLOCKED_REPORT_FILE = ".ranger-blocked.md";
+
+const RESUME_MARK = " — resume condition: ";
+
+/**
+ * A blocked outcome's reason and resume condition, as blockedOutcome wrote
+ * them (the trailing pass and log dropped), or null for any other outcome.
+ */
+export function parseBlockedOutcome(outcome: string): { reason: string; resume: string } | null {
+ const line = outcome.split("\n")[0].trim();
+ if (!BLOCKED_OUTCOME.test(line)) return null;
+ const at = line.lastIndexOf(RESUME_MARK);
+ const reason = (at === -1 ? line : line.slice(0, at)).replace(BLOCKED_OUTCOME, "");
+ const resume = at === -1 ? "" : line.slice(at + RESUME_MARK.length).replace(/ \([^()]*\)$/, "");
+ return { reason, resume };
+}
+
 /** The merge desk parked an awaiting-merge row on a hard merge-gate failure; `check` is the gate's check name. */
 export function mergeGateFailedOutcome(r: { check: string; reason: string }): string {
  return `merge gate failed (${r.check}): ${r.reason}`;
@@ -264,7 +296,12 @@ export function ciNotSentBackOutcome(r: { reason: string; head: string; spent?: 
 }
 
 /** A session or review that stopped on its substrate's limit (node #45). */
-export const SUBSTRATE_CAPPED_OUTCOME = /\bhit its rate limit\b/;
+export const SUBSTRATE_CAPPED_OUTCOME = /\bhit its (?:rate|capacity) limit\b/;
+
+/** A worker session's substrate limit: its quota, or the provider's capacity for the model. */
+export function substrateCappedOutcome(cap: { substrate: string; reason?: "capacity" }): string {
+ return `substrate ${cap.substrate} hit its ${cap.reason === "capacity" ? "capacity" : "rate"} limit`;
+}
 
 /** The sweep parked a row whose worker crashed `attempts` times. */
 export function crashParkOutcome(r: { attempts: number; released: boolean; assignees: string[] }): string {

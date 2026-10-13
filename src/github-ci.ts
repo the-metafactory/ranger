@@ -79,7 +79,7 @@ export function githubCiVerdict(repo: string, runs: CheckRun[], purpose: CiPurpo
    : green(success, JSON.stringify(runs));
  }
  const ci = classifyGithubCheckRuns(runs);
- if (ci.state === "none") return { state: "pending", reason: "no check runs on the head yet" };
+ if (ci.state === "none") return { state: "pending", reason: "no check runs on the head yet", noRuns: true };
  if (ci.state === "pending") return { state: "pending", reason: `${ci.running.length} check run(s) still running: ${ci.running.map((c) => c.name).join(", ")}` };
  if (ci.state === "failed") {
   return {

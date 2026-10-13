@@ -24,6 +24,19 @@ describe("transient GitHub errors (found live on #45 and #663)", () => {
   expect(isTransientGitHubError("gh: Server Error (HTTP 502)")).toBe(true);
   expect(isTransientGitHubError("read ECONNRESET")).toBe(true);
  });
+ test("gh's network error and Go's dial errors are transient (soma #795, 2026-10-13)", () => {
+  expect(isTransientGitHubError("gh api GET repos/the-metafactory/soma/issues/795 failed (exit 1): error connecting to api.github.com\ncheck your internet connection or https://githubstatus.com")).toBe(true);
+  expect(isTransientGitHubError('Get "https://gitlab.com/api/v4/user": dial tcp: lookup gitlab.com: no such host')).toBe(true);
+  expect(isTransientGitHubError('Get "https://code.example.ch:8443/api/v4/projects/7": dial tcp 10.0.0.9:8443: connect: network is unreachable')).toBe(true);
+  expect(isTransientGitHubError('Post "https://api.github.com/graphql": dial tcp 140.82.121.6:443: connect: connection refused')).toBe(true);
+  expect(isTransientGitHubError("dial tcp: lookup api.github.com: no such host")).toBe(true);
+ });
+ test("a test that fails connecting to something else is not", () => {
+  expect(isTransientGitHubError("tests failed — failing: integration: error connecting to nats at 127.0.0.1:4222")).toBe(false);
+  expect(isTransientGitHubError("tests failed — failing: publish round-trip: dial tcp 127.0.0.1:4222: connect: connection refused")).toBe(false);
+  expect(isTransientGitHubError("tests failed — failing: store: dial tcp [::1]:5432: connect: connection refused (localhost:5432)")).toBe(false);
+  expect(isTransientGitHubError('failing: fetch: Get "http://localhost:5432/health": dial tcp 127.0.0.1:5432: connect: connection refused')).toBe(false);
+ });
  test("a bare HTTP 500 is not transient as an outcome: a failing test may name it", () => {
   expect(isTransientGitHubError("tests failed — failing: the API returns HTTP 500 on bad input")).toBe(false);
  });

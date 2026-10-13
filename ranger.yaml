@@ -179,7 +179,8 @@ maps:
   # MetaFactory pursues, per-repo build maps (principal, 2026-10-12): the
   # build work soma#787 (Vigil contract) settled, one map per repo, wired
   # cross-repo by blocked-by edges. Same merge policy as soma#781, except
-  # myelin: ranger merges its own gate-passed PRs (principal, 2026-10-13).
+  # myelin and reflex: ranger merges their gate-passed PRs (principal,
+  # 2026-10-13).
   - repo: the-metafactory/myelin
     root: 319
     walk: full
@@ -205,7 +206,7 @@ maps:
   - repo: the-metafactory/reflex
     root: 33
     walk: full
-    autoMerge: false
+    autoMerge: true
     localCheckout: ~/work/mf/reflex
     commands:
       install: bun install --frozen-lockfile

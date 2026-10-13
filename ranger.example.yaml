@@ -119,6 +119,9 @@ workers:
   # Commits a PR branch may trail origin/<base> before a base merge pass
   # brings the base in, ahead of the next review or probe run.
   maxBehindBase: 20
+  # Minutes a ready PR's head may have no check run at all before the merge
+  # desk sends it back for a base merge pass (its push starts CI).
+  noCiGraceMin: 30
 
 auth:
   readOnlyTokens:

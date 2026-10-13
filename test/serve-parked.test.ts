@@ -5,6 +5,7 @@ import { join } from "node:path";
 import type { RangerConfig } from "../src/config.ts";
 import { Journal, type EventRow, type WorkerRow } from "../src/journal.ts";
 import {
+ blockedOutcome,
  CRASH_PARK_OUTCOME,
  crashParkOutcome,
  parseFailedProbes,
@@ -243,6 +244,17 @@ describe("node #54 — the reason class, by ranger's own rules", () => {
   const outcome = policyBlockedOutcome({ pass: "fix pass 3", reason: "Runtime policy denied this action: security-disable-request.", log: "/x.log" });
   const r = row({ status: "parked", outcome });
   expect(classifyReason(r, [], null, 5)).toEqual({ class: "policy blocked", detail: outcome.split("\n")[0].slice(0, 200) });
+ });
+
+ test("blocked: the worker reported an unmet precondition, and the resume condition leads", () => {
+  const outcome = blockedOutcome({ pass: "build pass", reason: "no Myelin release exports validateExecutionRunFinished", resume: "publish a Myelin release with A5b (node #322)", log: "/x.log" });
+  const r = row({ status: "parked", outcome });
+  expect(classifyReason(r, [], null, 5)).toEqual({
+   class: "blocked",
+   detail: "resume once: publish a Myelin release with A5b (node #322) — no Myelin release exports validateExecutionRunFinished",
+  });
+  const none = row({ status: "parked", outcome: blockedOutcome({ pass: "adopted build", reason: "waiting on the SDK", resume: "" }) });
+  expect(classifyReason(none, [], null, 5).detail).toBe("resume once: none given, read the worker log — waiting on the SDK");
  });
 
  test("substrate capped", () => {

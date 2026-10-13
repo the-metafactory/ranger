@@ -164,6 +164,13 @@ if [ "$verb" = "decisions" ] && [ -n "${FAKE_SOMA_DECISIONS_FAIL:-}" ]; then
   exit 1
 fi
 
+# A test can make the close fail with the given text on stderr, closing
+# nothing: gh's network error, or a refusal like the probe-tree gate's.
+if [ "$verb" = "close" ] && [ -n "${FAKE_SOMA_CLOSE_FAIL:-}" ]; then
+  printf '%s\n' "$FAKE_SOMA_CLOSE_FAIL" >&2
+  exit 1
+fi
+
 # A test can make soma refuse chosen nodes' claims (comma-separated ids, or
 # "*" for every claim) the way soma 0.25.0 refuses a blocked node: exit 1 with
 # plain text, not JSON, on stderr (node #163).

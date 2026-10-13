@@ -33,6 +33,7 @@ import { recordKnownGood, trustedSnapshot } from "./git-trust.ts";
 import * as gh from "./github.ts";
 import type { IssueComment, ChangeRequest, ForgePort, CiFailedRun, CiVerdict } from "./forge.ts";
 import { ParkSignal } from "./signals.ts";
+import { isTransientGitHubError } from "./transient.ts";
 import {
  PROBE_FILE,
  unfinishedProbes,
@@ -42,11 +43,13 @@ import {
  probeFailureSummary,
  probeFailureClass,
  baseConflictOutcome,
+ blockedOutcome,
  policyBlockedOutcome,
  probesFailedOutcome,
  gitlabReviewHoldOutcome,
  reviewCapHeadMovedOutcome,
  reviewCapOutcome,
+ substrateCappedOutcome,
 } from "./outcomes.ts";
 import { GRAPH_CALL_TIMEOUT_MS, graphNode, somaRepo, type NodeResult } from "./graph.ts";
 import { finishClosedElsewhere } from "./closed-elsewhere.ts";
@@ -56,6 +59,7 @@ import { FixNodeLockBusy, withFixNodeLock } from "./fix-node-lock.ts";
 import { assertFilable, codeCommentSpec, foundByProbeSpec, landminesInDiff, scribeFile, splitOutOfReviewSpec, type Provenance, type ScribeGraph } from "./scribe.ts";
 import { FencedError, type ImplementPhase, type Journal } from "./journal.ts";
 import { assembleImplementPrompt } from "./prompt.ts";
+import { blockerNoteBranch, discardBlockedReport, readBlockedReport, type BlockedReport } from "./blocked-report.ts";
 import { ReviewError, sageReview, type ReviewVerdict } from "./review.ts";
 import {
  confirmCap,
@@ -1369,8 +1373,10 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
    return "ready";
   }
   if (!workerFixableCi(ci)) return "ready";
-  const { used, foundNothing } = ciFixState(recordedCiFixes(await github.listComments(repo, open.iid, token), botIdentity), head);
-  if (foundNothing) return "ready";
+  const recorded = ciFixState(recordedCiFixes(await github.listComments(repo, open.iid, token), botIdentity), head);
+  if (recorded.foundNothing) return "ready";
+  // This run's own count bounds the loop too, whatever the PR's markers say.
+  const used = Math.max(recorded.used, ciFixes);
   if (used >= MAX_CI_FIXES) {
    journal.recordEvent("reviewed", {
     nodeId,
@@ -1423,7 +1429,10 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
   // to the pushed head.
   if (!staleMerged && (await headSha(worktree)) === live.headSha) {
    const behind = await commitsBehind(worktree, base);
-   const limit = config.workers.maxBehindBase;
+   // A head the merge desk sent back because no CI ran on it merges in any
+   // base commit it lacks: the push is what starts CI (noCiStep).
+   const noCi = journal.listCiAbsent(repo, nodeId).some((s) => s.head === live.headSha && s.step === "sent-back");
+   const limit = noCi ? 0 : config.workers.maxBehindBase;
    if (behind > limit) {
     staleMerged = true;
     // A merge up counts against the same budget as a conflict's: past it,
@@ -2106,6 +2115,8 @@ async function checkedWorkerPass(
   probeTier: map.commands.probe !== undefined,
   remoteTests: remoteTests(ctx),
  });
+ // Only this session's blocked report counts, never one a crashed run left.
+ discardBlockedReport(worktree);
  fenceSpawn();
  const output = workerOutputFor(ctx.substrate);
  const raw = await ctx.workerRun(prompt, {
@@ -2142,14 +2153,18 @@ async function checkedWorkerPass(
  });
  const stopped = hookStopReason(result.stdout, lines);
  if (stopped !== null) throw new ParkSignal(policyBlockedOutcome({ pass, reason: stopped, log }));
+ // The worker said the node cannot be done yet: park on its reason, before
+ // any commit it made is tested or pushed.
+ const blocked = result.code === 0 ? readBlockedReport(worktree) : null;
+ if (blocked !== null) throw await blockedPark(ctx, pass, blocked, { dropNote: (await blockerNoteBranch(worktree, map.base)) !== null, log });
  if (result.code !== 0) {
   // Mid-session cap (node #45): only the substrate's own signal says so, and
   // only a failed run can be one. A capped failure does not count.
   const capSignal: CapSignal | null =
    ctx.substrate === undefined
     ? null
-    : await confirmCap(ctx.substrate, journal, { lines, readers: ctx.substrateReaders });
-  if (capSignal !== null) return fail(`substrate ${capSignal.substrate} hit its rate limit`, capSignal);
+    : await confirmCap(ctx.substrate, journal, { lines, stderr: result.stderr, readers: ctx.substrateReaders });
+  if (capSignal !== null) return fail(substrateCappedOutcome(capSignal), capSignal);
   return fail(`worker exited ${result.code}: ${tail(result)}`);
  }
  // A base merge brings in the base's manifests and lockfile: the tests must
@@ -2171,6 +2186,10 @@ async function checkedWorkerPass(
  }
  if (sha === before || (await commitsAhead(worktree, map.base)) === 0) {
   return fail(nothingCommitted(spec));
+ }
+ if (spec.kind === "build") {
+  const note = await blockerNoteBranch(worktree, map.base);
+  if (note !== null) throw await blockedPark(ctx, pass, note, { dropNote: true, log });
  }
  // This session wrote `sha`: record it now, so a later run that adopts the
  // commit unpushed still credits the substrate that actually wrote it.
@@ -2200,6 +2219,30 @@ async function checkedWorkerPass(
  // Only a pass that goes on to the push puts its waived tests in the receipts.
  if (baseRed !== undefined) recordTestsBaseRed(journal, map.repo, ctx.node.ref.id, { head: sha, base: baseRed.sha, names: baseRed.names, rest: baseRed.rest });
  return { workerExit: result.code, snapshot, sha };
+}
+
+/**
+ * The park for a worker that reported the node blocked, or whose build is
+ * only a blocker note (`dropNote`: the caller found the branch is). Before
+ * any PR, a branch that holds nothing but the note goes back to its base: it was never pushed, the outcome keeps the
+ * note's reason and condition, and a resume once the condition holds must
+ * start a fresh build, not adopt the note and park again.
+ */
+async function blockedPark(
+ ctx: ImplementContext,
+ pass: string,
+ report: BlockedReport,
+ opts: { dropNote: boolean; log?: string },
+): Promise<ParkSignal> {
+ const { worktree, map, journal, node } = ctx;
+ let outcome = blockedOutcome({ pass, ...report, ...(opts.log === undefined ? {} : { log: opts.log }) });
+ const unpushed = (journal.getWorker(node.ref.id, map.repo)?.prNumber ?? null) === null;
+ if (unpushed && opts.dropNote) {
+  const base = await safeGit(["--no-replace-objects", "merge-base", `origin/${map.base}`, "HEAD"], { cwd: worktree, timeoutMs: 10_000 });
+  const failed = base.code === 0 ? await restoreWorktree(ctx, base.stdout.trim()) : `no merge base with origin/${map.base}`;
+  if (failed !== null) outcome += ` — the note's commits stay in the worktree (${failed}): drop them before a resume`;
+ }
+ return new ParkSignal(outcome);
 }
 
 /**
@@ -2323,6 +2366,13 @@ async function closeAfterMerge(
   { cwd: ctx.canonical, timeoutMs: GRAPH_CALL_TIMEOUT_MS },
  );
  if (!close.closed) {
+  // A forge read inside the close that got no answer says nothing about the
+  // node: thrown plain, failNode leaves the row for the sweep to respawn,
+  // uncounted, and the respawn's first read finds the node closed if the
+  // close landed after all.
+  if (isTransientGitHubError(close.detail)) {
+   throw new Error(`close after merge hit a transient forge error: ${close.detail.slice(0, 600)}`);
+  }
   throw new ParkSignal(`close refused after merge: ${close.detail.slice(0, 600)}`);
  }
  journal.recordEvent("closed", { nodeId, repo, detail: close.detail.slice(0, 400) });
@@ -3025,6 +3075,10 @@ async function adoptBuiltWork(
  }
  if ((await dirtyFiles(worktree)).length > 0) return null;
  const what = fix === undefined ? "build" : `fix pass ${fix.round}`;
+ if (fix === undefined) {
+  const note = await blockerNoteBranch(worktree, map.base);
+  if (note !== null) throw await blockedPark(ctx, "adopted build", note, { dropNote: true });
+ }
  const snapshot = await trustedSnapshot(journal, ctx.canonical, { repo: map.repo, nodeId: node.ref.id }, mapKey(map));
  const sha = await headSha(worktree);
  // Tested in a fresh clone of the commit, not in the worktree: whatever the

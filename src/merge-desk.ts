@@ -28,6 +28,7 @@ import { CI_FAILED_PARK_OUTCOME, ciNotSentBackOutcome, mergeGateFailedOutcome } 
 import { changeRequestLabel, changeRequestNoun, forgeName } from "./forge-text.ts";
 import { closingKeywordRefusal, findClosingKeyword } from "./git-ops.ts";
 import { squashTitle } from "./github.ts";
+import { isTransientGitHubError } from "./transient.ts";
 
 /**
  * The merge desk (design §4/§5, #23): each tick, every implement-lane row
@@ -266,12 +267,29 @@ export async function mergeGateNow(
  return evaluateMergeGate(gateInput(map, pr, await github.ciVerdictFor(map.repo, pr.headSha, token), last, probe));
 }
 
-/** Rows the desk watches: awaiting a merge, or parked with a PR the principal may still merge. */
+/**
+ * Rows the desk watches: awaiting a merge, or parked or failed with a PR the
+ * principal may still merge. A failed row moves on the merge alone
+ * (2026-10-13: myelin #324 failed, the principal merged its PR, and with the
+ * queued resume dropped as "PR is merged" nothing ran the close).
+ */
 export function watchedByMergeDesk(w: WorkerRow): boolean {
  return (
   w.status === "awaiting-merge" ||
-  (w.status === "parked" && w.lane === "implement" && w.prNumber !== null)
+  ((w.status === "parked" || w.status === "failed") && w.lane === "implement" && w.prNumber !== null && !closeRefused(w))
  );
+}
+
+/**
+ * A row whose close already ran on its merge and stopped for a reason a
+ * re-run repeats: a probe outside the probe tree, a probe that fails, no CI
+ * to cite. The desk leaves it be; only an operator resume re-runs the close
+ * (2026-10-13: soma #795 and #796 and reflex #35 re-ran their closes, and
+ * soma's test suite, every tick). A close stopped by a transient forge error
+ * is still re-run on the next tick.
+ */
+export function closeRefused(w: WorkerRow): boolean {
+ return (w.status === "parked" || w.status === "failed") && w.phase === "close" && !isTransientGitHubError(w.outcome ?? "");
 }
 
 /** A row the merge desk parked on CI alone, in its awaiting-merge phase (node #104). */
@@ -353,7 +371,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   * step, a base merge pass and a new round, or a CI fix pass. A posted merge
   * card is withdrawn first, so a stale "merge needed" never stands.
   */
- async function sendBack(row: WorkerRow, why: string, title: string): Promise<void> {
+ async function sendBack(row: WorkerRow, why: string, title: string, noCiHead?: string): Promise<void> {
   if (ctx.spawn === undefined || row.prNumber === null) return;
   const cr = changeRequestLabel(repo, row.prNumber);
   if (row.mergeMessageId !== null) {
@@ -397,6 +415,8 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   // A CI-only park's outcome goes with it: the row is running again.
   journal.updateWorker(row.nodeId, repo, { status: "running", phase: "review", pid, outcome: null, finishedAt: null });
   recordImplementStart(journal, map);
+  // Run-node reads this to merge the base in however little the head trails it.
+  if (noCiHead !== undefined) journal.recordCiAbsent({ nodeId: row.nodeId, repo, head: noCiHead, step: "sent-back", note: `${cr}: ${why}` });
   journal.recordEvent("sweep", {
    nodeId: row.nodeId,
    repo,
@@ -497,6 +517,75 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   result.pending.push(row.nodeId);
  }
 
+ /**
+  * A ready head that no CI ran on at all (2026-10-13: reflex #43's head
+  * predated the repo's CI workflow, and GitHub starts a pull_request run only
+  * on a push). Seen first; after `noCiGraceMin` it goes back to run-node,
+  * whose base merge pass merges any commit the head lacks and pushes, which
+  * starts CI. A head that still has none after that, level with its base or
+  * out of base merge passes, is surfaced to the principal once, then waits.
+  * Returns the send-back reason when one is due, else null.
+  */
+ async function noCiStep(row: WorkerRow, pr: ChangeRequest, title: string): Promise<string | null> {
+  const head = pr.headSha.slice(0, 8);
+  const cr = changeRequestLabel(repo, pr.iid);
+  const grace = ctx.config.workers.noCiGraceMin;
+  const steps = journal.listCiAbsent(repo, row.nodeId).filter((s) => s.head === pr.headSha);
+  const seen = steps.find((s) => s.step === "seen");
+  if (seen === undefined) {
+   journal.recordCiAbsent({ nodeId: row.nodeId, repo, head: pr.headSha, step: "seen", note: `no check run on ${cr} at ${head}; sent back after ${grace} min if none starts` });
+   return null;
+  }
+  if (Date.now() - Date.parse(seen.at) < grace * 60_000) return null;
+  if (steps.some((s) => s.step === "surfaced")) return null;
+  if (!steps.some((s) => s.step === "sent-back")) return `no CI ran on ${cr} at ${head} for ${grace} min; a base merge pass pushes a head CI runs on`;
+  try {
+   await post(
+    renderCard({
+     emoji: "⚠️",
+     status: "no CI",
+     nodeId: row.nodeId,
+     title,
+     meta: [`map: ${mapKey(map)}`],
+     lines: [
+      `No check run started on ${cr} at \`${head}\`, and the base merge pass ranger sent it back for pushed no new head (the branch is level with \`${map.base}\`, or its base merge passes are spent).`,
+      `Does the repo run CI on ${changeRequestNoun(repo)}s? Push to the branch to start one, or merge it by hand. Ranger waits on CI and will not send it back again.`,
+     ],
+    }),
+    `no-CI card for #${row.nodeId}`,
+   );
+  } catch {
+   result.errors.push(`#${row.nodeId}: could not post the no-CI card — retrying next tick`);
+   return null;
+  }
+  journal.recordCiAbsent({ nodeId: row.nodeId, repo, head: pr.headSha, step: "surfaced", note: `still no check run on ${cr} at ${head} after its send-back; the principal was told` });
+  return null;
+ }
+
+ /**
+  * Why a ready change request goes back to run-node: sendBackReason's cause,
+  * else a head no CI ran on (noCiStep). That one is asked only of a row that
+  * is no CI-only park, nothing else sends back, and whose gate would wait on
+  * CI alone; its CI read is returned for the gate to reuse.
+  */
+ async function sendBackFor(
+  row: WorkerRow,
+  pr: ChangeRequest,
+  title: string,
+  at: { reason: string | null; ciPark: boolean; last: Review | undefined; probe: Probe | undefined },
+ ): Promise<{ why: string | null; ci?: CiVerdict; noCi: boolean }> {
+  if (at.reason !== null || at.ciPark) return { why: at.reason, noCi: false };
+  const ci = await github.ciVerdictFor(repo, pr.headSha, token);
+  // As the gate below reads it: a rebase the forge asks for waits on the rest of the gate.
+  const gated = pr.mergeState === "needs-rebase" && github.rebasePr !== undefined ? { ...pr, mergeState: "mergeable" as const } : pr;
+  const waits = evaluateMergeGate(gateInput(map, gated, ci, at.last, at.probe));
+  if (ci.state !== "pending" || ci.noRuns !== true || waits.status !== "pending" || waits.check !== "ci-green") {
+   return { why: null, ci, noCi: false };
+  }
+  const why = await noCiStep(row, pr, title);
+  return { why, ci, noCi: why !== null };
+ }
+
  async function progress(row: WorkerRow): Promise<void> {
   if (row.prNumber === null) {
    await park(row, `awaiting merge with no ${changeRequestNoun(repo)} recorded — journal and ${forgeName(repo)} disagree`, `node ${row.nodeId}`);
@@ -533,7 +622,9 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    return;
   }
 
-  // A parked row moves only on a merge, or (a CI-only park) on CI recovering.
+  // A parked row moves only on a merge, or (a CI-only park) on CI recovering;
+  // a failed row only on a merge.
+  if (row.status === "failed") return;
   const ciPark = row.status === "parked" && ciOnlyPark(row);
   if (row.status === "parked" && (!ciPark || pr.state === "closed")) return;
 
@@ -564,11 +655,12 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   // Ranger's recorded rebases, newest first, read once for this row.
   const rebases = journal.listRebases(repo, row.nodeId);
   const rebased = last === undefined ? rebaseOfLatestReview(rebases, latestSha, pr.headSha) : null;
-  const why = sendBackReason(repo, pr, map.base, { last, missingProbes, rebased });
+  const reason = sendBackReason(repo, pr, map.base, { last, missingProbes, rebased });
   // A send-back is a worker session; a CI-only park starts one only for its red CI, below.
-  if (ciPark && why !== null) return;
+  if (ciPark && reason !== null) return;
+  const { why, ci, noCi } = await sendBackFor(row, pr, title, { reason, ciPark, last, probe });
   if (why !== null && ctx.spawn !== undefined) {
-   await sendBack(row, why, title);
+   await sendBack(row, why, title, noCi ? pr.headSha : undefined);
    return;
   }
   // A forge that asks for a rebase (GitLab under rebase_merge) is gated on
@@ -576,13 +668,13 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   const rebasePr = pr.mergeState === "needs-rebase" ? github.rebasePr?.bind(github) : undefined;
   const needsRebase = rebasePr !== undefined;
   const gated = needsRebase ? { ...pr, mergeState: "mergeable" as const } : pr;
-  const ci = await github.ciVerdictFor(repo, pr.headSha, token);
-  const gate = evaluateMergeGate(gateInput(map, gated, ci, last, probe));
+  const verdict = ci ?? await github.ciVerdictFor(repo, pr.headSha, token);
+  const gate = evaluateMergeGate(gateInput(map, gated, verdict, last, probe));
 
   // A red CI a worker may fix goes back to run-node while the node has CI fix
   // passes left and none already found nothing at this head; else it parks
   // on CI (a CI-only park stays parked, quietly).
-  if (gate.status === "fail" && gate.check === "ci-green" && workerFixableCi(ci) && ctx.spawn !== undefined) {
+  if (gate.status === "fail" && gate.check === "ci-green" && workerFixableCi(verdict) && ctx.spawn !== undefined) {
    const { used, foundNothing } = ciFixState(recordedCiFixes(comments, botIdentity), pr.headSha);
    if (!foundNothing && used < MAX_CI_FIXES) {
     await sendBack(row, `CI is red at ${pr.headSha.slice(0, 8)} (${gate.reason})`, title);

@@ -33,6 +33,7 @@ import { childEnv, itermArgv, shellQuote } from "./launch.ts";
 import {
  CRASH_PARK_OUTCOME,
  NEEDS_EYE_LABEL,
+ parseBlockedOutcome,
  parseFailedProbes,
  PROBE_FILE,
  POLICY_BLOCKED_OUTCOME,
@@ -56,6 +57,7 @@ export type ReasonClass =
  | "transient"
  | "substrate capped"
  | "policy blocked"
+ | "blocked"
  | "worker failed"
  | "other";
 
@@ -137,7 +139,7 @@ const firstLine = (text: string): string => text.split("\n")[0].trim();
 
 /**
  * Why a row needs the principal, by ranger's rules, in this order: the review
- * cap, failed probes, a policy-hook stop, a substrate limit, a GitHub-side transient error, then
+ * cap, failed probes, a policy-hook stop, a worker's blocked report, a substrate limit, a GitHub-side transient error, then
  * any other failed worker; anything else parked is `other` with the outcome's
  * first line.
  */
@@ -196,6 +198,13 @@ export function classifyReason(
  }
  if (POLICY_BLOCKED_OUTCOME.test(outcome)) {
   return { class: "policy blocked", detail: firstLine(outcome).slice(0, 200) };
+ }
+ const blocked = parseBlockedOutcome(outcome);
+ if (blocked !== null) {
+  // The resume condition is what the principal acts on: it leads, and the
+  // worker's reason (worker-written, capped by the builder) follows.
+  const { reason, resume } = blocked;
+  return { class: "blocked", detail: (resume ? `resume once: ${resume} — ${reason}` : reason).slice(0, 300) };
  }
  if (SUBSTRATE_CAPPED_OUTCOME.test(outcome)) {
   return { class: "substrate capped", detail: firstLine(outcome).slice(0, 200) };

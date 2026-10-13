@@ -14,7 +14,8 @@
 # scripts/probe-hud.mjs (a branch that changes the probe it fails); merge-noop — builds, but a base
 # merge pass does nothing; merge-forge — a base merge pass commits without merging and moves
 # refs/remotes/origin/main onto its own parent (one commit ahead, base "inside"); orphan — builds on a
-# root commit of its own, sharing no history with origin/main. Base merge pass (prompt carries "## Base merge pass"): merges
+# root commit of its own, sharing no history with origin/main; blocked — writes the blocked report
+# (.ranger-blocked.md) uncommitted and exits 0; blocker-note — commits only a docs/ blocker note. Base merge pass (prompt carries "## Base merge pass"): merges
 # origin/main, resolving a conflict on src/feature.ts by keeping both sides. CI fix pass (prompt
 # carries "## CI fix pass"): commits a CI fix; in mode ci-noop it commits nothing (a flaky red).
 set -euo pipefail
@@ -30,6 +31,17 @@ prompt="${!#}"
 cd "$(git rev-parse --show-toplevel)"
 
 if [ "$mode" = "noop" ]; then exit 0; fi
+if [ "$mode" = "blocked" ]; then
+  printf '# Node #20 is blocked\n\nThe widgets SDK has no release with the feature export.\n\nResume condition: publish a widgets SDK release that exports feature().\n' > .ranger-blocked.md
+  exit 0
+fi
+if [ "$mode" = "blocker-note" ]; then
+  mkdir -p docs
+  printf '# Node #20 dependency blocker\n\nImplementation stopped: no SDK release exports feature().\n\n## Resume condition\n\nPublish an SDK release with feature().\n' > docs/node-20-dependency-blocker.md
+  git add -A
+  git commit -q -m "docs: record the node #20 dependency blocker"
+  exit 0
+fi
 if [ "$mode" = "add-fixed" ]; then
   # continues a build an earlier run committed: adds what its tests were missing
   mkdir -p src
