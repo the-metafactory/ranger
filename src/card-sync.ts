@@ -4,7 +4,7 @@ import { journalKeyFor } from "./forge-ref.ts";
 import { mapKey } from "./maps.ts";
 import { EscalationDiscord, DiscordMessageGoneError } from "./discord.ts";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
-import type { Journal, EscalationRow, WorkerRow } from "./journal.ts";
+import type { Journal, EscalationRow, VetoRow, WorkerRow } from "./journal.ts";
 import { nodeCommentUrl, nodeUrl } from "./forge-text.ts";
 import { briefHoldReason, ESCALATE_REASONS, type ClassifiedNode, type EscalateReason } from "./route.ts";
 import { LeaseLostError, withEscalateLock, type OwnedCheck } from "./lock.ts";
@@ -50,6 +50,7 @@ export const CARD_HEADS: Record<string, { emoji: string; status: string }> = {
   provisioning: { emoji: "🔧", status: "provisioning needed" },
   "brief-not-ready": { emoji: "📝", status: "build brief not ready" },
   proposal: { emoji: "🗳️", status: "proposal — react 👍 to ratify" },
+  refused: { emoji: "🚫", status: "refused, yours to take" },
   draft: { emoji: "📥", status: "draft node" },
   discarded: { emoji: "🗑️", status: "discarded" },
   // The superseded status ends in the link to the newer card: `superseded → <url>` (node #241).
@@ -84,6 +85,12 @@ function cardSpec(node: ClassifiedNode): { head: CardHead; reason: string; journ
         head: CARD_HEADS["brief-not-ready"]!,
         reason: `${briefHoldReason(route.missing)} — ranger will not take it until soma's graph audit no longer lists it`,
         journalReason: "brief-not-ready",
+      };
+    case "refused":
+      return {
+        head: CARD_HEADS.refused!,
+        reason: `The principal 👎'd ranger's proposal${route.commentUrl === null ? "" : ` (${route.commentUrl})`}: ranger posted a veto comment on the node, released its claim and will never propose it again. The node stays open and is yours to take.`,
+        journalReason: "refused",
       };
     case "proposal":
       return {
@@ -1259,10 +1266,66 @@ export function proposalNode(row: WorkerRow, title: string): ClassifiedNode {
   };
 }
 
+/**
+ * The card of a vetoed node (node #240, ruling D7): released, back on the
+ * frontier, and never proposed again. Built from the veto alone, so the
+ * ratify phase's edit and the desk's pass render the same card.
+ */
+export function refusedNode(veto: Pick<VetoRow, "repo" | "nodeId" | "proposalCommentId">, title: string): ClassifiedNode {
+  const url = nodeUrl(veto.repo, veto.nodeId);
+  return {
+    id: veto.nodeId,
+    title,
+    kind: "research",
+    autonomy: "propose",
+    typed: true,
+    url,
+    registryBlocked: false,
+    route: {
+      route: "refused",
+      commentId: veto.proposalCommentId,
+      commentUrl: veto.proposalCommentId === null ? null : nodeCommentUrl(veto.repo, url, veto.proposalCommentId),
+    },
+  };
+}
+
+/**
+ * A principal 👎 on a proposal (node #240, ruling D7): the node's card, when
+ * it has one, is edited at once to "refused, yours to take". The desk renders
+ * the same card for the vetoed node while it stands on the frontier, so its
+ * next pass leaves the card as it is. A card that is not yet posted is the
+ * desk's to post.
+ */
+export async function refuseProposalCard(ctx: {
+  config: RangerConfig;
+  journal: Journal;
+  map: RangerMapConfig;
+  veto: Pick<VetoRow, "repo" | "nodeId" | "proposalCommentId">;
+}): Promise<void> {
+  const { journal, map, veto } = ctx;
+  const prior = journal.getEscalation(map.repo, veto.nodeId);
+  if (prior === null || prior.status === "closed") return;
+  if (prior.root !== map.root) throw new Error(`escalation belongs to map ${map.repo}#${prior.root}, not ${mapKey(map)}`);
+  await withEscalateLock(journal, async (owned) => {
+    const live = journal.getEscalation(map.repo, veto.nodeId);
+    if (live === null || live.status === "closed") return;
+    const pass = outOfBandPass(map);
+    const outcome = await syncCard(
+      { client: pass.client, clientFor: channelClientFor(pass.client), journal, map, config: ctx.config, now: pass.now, budget: pass.budget, owned },
+      refusedNode(veto, live.title ?? `#${veto.nodeId}`),
+      live,
+    );
+    if (outcome.action === "error" || outcome.action === "deferred") {
+      throw new Error(`refused card ${outcome.action}${"error" in outcome ? `: ${outcome.error}` : ""}`);
+    }
+  });
+}
+
 export function cardNeeded(node: ClassifiedNode): boolean {
   return (
     node.route.route === "escalate-hitl" ||
     node.route.route === "proposal" ||
+    node.route.route === "refused" ||
     node.route.route === "provisioning" ||
     // An unread audit names nothing missing: no card until it is read.
     (node.route.route === "brief-not-ready" && node.route.missing !== null)

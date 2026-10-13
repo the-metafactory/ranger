@@ -850,7 +850,7 @@ describe("walk claims exactly planTick's take (#37)", () => {
     const config = writeConfig(dir);
     const statePath = writeState(dir, { "10": RESEARCH_NODE_STATE });
     const journal = new Journal(join(dir, "state.sqlite"));
-    for (const id of vetoed) journal.recordVeto(id, `comment-${id}`);
+    for (const id of vetoed) journal.recordVeto({ repo: "acme/widgets", nodeId: id, commentId: `comment-${id}` });
     journal.close();
 
     const result = await runCli(["walk", "-c", config], {

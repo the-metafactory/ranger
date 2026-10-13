@@ -26,7 +26,7 @@ export function probeRequeueCandidates(journal: Journal, maps: readonly RangerMa
   const map = maps.find((map) => map.repo === row.repo && map.root === row.root);
   if (map === undefined || map.walk !== "full" || map.commands.probe === undefined ||
    map.skip.includes(row.nodeId) || (map.nodes !== undefined && !map.nodes.includes(row.nodeId)) ||
-   journal.hasVeto(row.nodeId) || row.status !== "parked" || row.lane !== "implement" ||
+   journal.hasVeto(row.nodeId, row.repo) || row.status !== "parked" || row.lane !== "implement" ||
    row.phase !== "review" || row.prNumber === null) return false;
   const head = infrastructureProbeHead(row.outcome ?? "");
   return head !== null && attempts(journal, row, head) < limit;

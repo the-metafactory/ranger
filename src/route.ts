@@ -53,7 +53,13 @@ export type RouteClass =
    * `missing`: the ratify phase found no comment carrying the proposal
    * marker either (node #250, ruling D8), so nothing can be ratified.
    */
-  | { route: "proposal"; commentId: string | null; commentUrl: string | null; missing?: true };
+  | { route: "proposal"; commentId: string | null; commentUrl: string | null; missing?: true }
+  /**
+   * Not a frontier class either: a node the principal 👎'd (node #240,
+   * ruling D7). Released, back on the frontier, never proposed again: the
+   * principal's to take. `commentId` is the refused proposal comment.
+   */
+  | { route: "refused"; commentId: string | null; commentUrl: string | null };
 
 export interface ClassifiedNode {
   id: string;

@@ -152,7 +152,8 @@ describe("automatic probe requeue", () => {
    r.config.maps[0].walk = "research-only"; expect(candidates()).toEqual([]); r.config.maps[0].walk = "full";
    r.config.maps[0].root = 460; expect(candidates()).toEqual([]); r.config.maps[0].root = 1;
    r.park("10", A, { outcome: outcome().replace("infrastructure", "assertion") }); expect(candidates()).toEqual([]);
-   r.park("10"); r.journal.recordVeto("10", "veto"); expect(candidates()).toEqual([]);
+   r.park("10"); r.journal.recordVeto({ repo: B, nodeId: "10", commentId: "veto" }); expect(candidates()).toHaveLength(1);
+   r.journal.recordVeto({ repo: A, nodeId: "10", commentId: "veto" }); expect(candidates()).toEqual([]);
   } finally { r.close(); }
  });
 });

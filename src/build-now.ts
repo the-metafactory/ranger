@@ -114,6 +114,7 @@ function notWalkable(node: ClassifiedNode): string | null {
  }
  if (route.route === "brief-not-ready") return `routes brief-not-ready: ${briefHoldReason(route.missing)}`;
  if (route.route === "proposal") return "is proposed — it waits for the principal's 👍 on its proposal comment";
+ if (route.route === "refused") return "was refused — the principal 👎'd ranger's proposal, so ranger never takes it";
  if (!route.walkable) {
   return `routes ${route.route} but is not walkable on this map (walk mode, nodes allowlist or skip list)`;
  }
@@ -185,7 +186,7 @@ async function buildUnderLock(nodeId: string, ctx: BuildNowContext, owned: Owned
  if (why !== null) refuse(why);
  const lane = node!.route.route as "implement" | "research";
 
- if (journal.hasVeto(nodeId)) refuse("vetoed — the walk never claims a vetoed node");
+ if (journal.hasVeto(nodeId, map.repo)) refuse("vetoed — the walk never claims a vetoed node");
  const row = journal.getWorker(nodeId, map.repo);
  if (row !== null && IN_FLIGHT.has(row.status)) {
   refuse(`already in flight (${row.status}) — \`ranger resume-node\` puts a stuck worker back in motion`);

@@ -231,8 +231,26 @@ bun src/cli.ts journal                    # inspect workers/events/health
   A row with no comment id takes the newest comment on the node that the bot
   wrote and that carries the marker; with none, nothing closes, the card says
   the proposal comment is missing, and the row is not read again. A write
-  identity that resolves to the principal closes nothing. The 👎 veto is
-  node #240.
+  identity that resolves to the principal closes nothing.
+- **Veto (node #240, #21 rulings D1/D7):** a `-1` from the principal on a
+  proposal comment, with or without a `+1`, vetoes the node for good. Ranger
+  posts a veto comment on the node carrying `<!-- ranger:veto node=N
+  proposal=<id> -->`, records the veto (per repo and node), releases the
+  claim and edits the card to "refused, yours to take"; the node is never
+  closed. The desk shows the same card while the node stands on the
+  frontier. A vetoed node is never claimed again. The journal is a cache:
+  before the walk claims a propose research node, it reads the node's
+  comments and rebuilds a veto from a bot comment whose final line is the
+  marker. Only the propose nodes the tick can claim are read (within the
+  spawn cap's room, at most `ratify.readsPerTick`); an unread one waits for
+  the next tick, and a failed read claims no propose research node on that
+  map that tick. A proposal whose row a lost journal took with it is found
+  from the bot's open claims in the last cached audit (soma's `graph audit
+  --json` `openClaimed`; an audit cached without it is reported until the
+  walk caches a fresh one), and its comment id (or its veto) is recovered
+  from the node's comments. A write identity that resolves to the
+  principal posts no veto and releases nothing. Migration 0028 keys the
+  veto cache by repo.
 - **Observation intake (node #247, #21 rulings D3/D11/D12/D17):** each walk
   tick reads the Discord thread of every map that has one and is not
   `walk: none`, over REST (no gateway). A message counts only when

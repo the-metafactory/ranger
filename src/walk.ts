@@ -24,7 +24,8 @@ import type { ForgePort } from "./forge.ts";
 import { probeRequeueCandidates, requeueProbes, type ProbeRequeueResult } from "./probe-requeue.ts";
 import { sweepMap, type SweepMapResult } from "./sweep.ts";
 import { intakePass, type IntakeContext, type IntakeResult } from "./intake.ts";
-import { ratifyPass, type RatifyResult } from "./ratify.ts";
+import { gateProposeReads, ratifyPass, rebuildVetoes, type RatifyResult } from "./ratify.ts";
+import { refuseProposalCard } from "./card-sync.ts";
 import {
  drainGate,
  implementCandidates,
@@ -42,9 +43,10 @@ export { implementCandidates, planTick, researchCandidates, selectCandidates };
  *
  * per map → gate (write token + not-principal + walk mode + pause state) →
  * sweep liveness → priority probe requeues → merge desk and its send-backs
- * → ratify open proposals (node #250) → queued resumes;
+ * → ratify open proposals (node #250; a principal 👎 vetoes, node #240) → queued resumes;
  * then, per map again →
  * pause and drain re-read under the claim lock → derive + classify frontier
+ * → vetoes rebuilt from GitHub for propose research nodes (node #240)
  * → research-lane candidates → announce (fail-closed)
  * → claim (race-safe) → spawn a detached `ranger run-node`. Sweeps go first so
  * a send-back takes its implement lane before queued resumes or fresh claims.
@@ -270,7 +272,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
   spawnCapPerDay: config.workers.spawnCapPerDay,
   probeRequeues: { resumed: [], pending: [], errors: [], lanes: [] },
   intake: { threads: [] },
-  ratify: { read: [], closing: [], deferred: [], errors: [] },
+  ratify: { read: [], closing: [], vetoed: [], recovered: [], deferred: [], errors: [] },
  };
  const cliEntry = join(import.meta.dir, "cli.ts");
  // Even a worker finishing during this tick must not allow a second claim
@@ -468,6 +470,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
    portFor: targetFor,
    spawn: (nodeId, repo, root) =>
     (ctx.spawnRunNode ?? spawnRunNodeDetached)({ nodeId, repo, root, cliEntry, configPath: ctx.configPath }),
+   refuseCard: (map, veto) => refuseProposalCard({ config, journal, map, veto }),
    ...(ctx.now === undefined ? {} : { now: ctx.now }),
   });
  } catch (error) {
@@ -566,11 +569,24 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
      });
      if (!briefs.ok) errors.push(`build briefs unverified — build nodes held this tick: ${briefs.error}`);
      // The plan `ranger serve` (#37) also reads, so its "next" is this order.
-     const plan = planTick(classified, {
+     const planOf = (nodes: typeof classified) => planTick(nodes, {
       laneBusy: implementClaimed.has(implementLane(map)) || implementLaneBusy(journal, implementLane(map)),
-      vetoed: (id) => journal.hasVeto(id),
+      vetoed: (id) => journal.hasVeto(id, map.repo),
       implementDrained: drain?.scope === "lane",
      });
+     // A veto is rebuilt from GitHub before a propose research node is
+     // claimed (node #240, rulings D1, D7): the journal is a cache, and a
+     // lost one must not re-propose a node the principal refused.
+     const gate = await gateProposeReads({
+      plan: planOf(classified),
+      replan: () => planOf(classified),
+      room: config.workers.spawnCapPerDay - journal.spawnsToday(ctx.now?.() ?? new Date()),
+      readsPerTick: config.ratify.readsPerTick,
+      rebuild: (nodeIds) => rebuildVetoes({ journal, map, botIdentity, token, port: portFor(map.repo), nodeIds }),
+     });
+     errors.push(...gate.errors);
+     owned();
+     const plan = gate.plan;
      const candidates = plan.selected;
      const laneOf = (id: string) =>
       plan.implement.some((n) => n.id === id) ? "implement" : "research";
@@ -588,6 +604,8 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
        errors.push(`#${node.id} vetoed — not claimed`);
        continue;
       }
+      // A propose research node whose veto was not read this tick (node #240).
+      if (!gate.claimable(node)) continue;
       try {
        journal.assertWorkerRoot(node.id, map.repo, map.root);
       } catch (error) {
