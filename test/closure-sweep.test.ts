@@ -178,7 +178,7 @@ test("a noted card's budget deferral is deferred, with no error or edit", async 
  const outcome = await markAbsentCards({ ...context(), client, now: new Date(), budget: { remaining: 5, deadline: Date.now() + 60_000 }, owned: () => {},
   readNode: async () => { throw new BudgetDeferral("floor"); },
  }, new Set());
- expect(outcome).toEqual({ keptOpen: [], deferred: ["20"], errors: [] });
+ expect(outcome).toEqual({ keptOpen: [], closed: [], cards: [], deferred: ["20"], errors: [] });
  expect(journal.getEscalation(repo, "20")?.status).toBe("open");
 });
 

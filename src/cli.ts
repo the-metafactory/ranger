@@ -235,9 +235,9 @@ export async function runTick(
  const now = deps.now ?? (() => new Date());
  const startedAt = now().toISOString();
  let result: { exitCode: number; report: string };
+ let escalateResult: EscalateResult | null = null;
  try {
   // Escalation failures are reported but never prevent scheduled claims.
-  let escalateResult: EscalateResult | null = null;
   let escalateError: string | undefined;
   try {
    escalateResult = await (deps.escalateMaps ?? escalateMaps)(config, journal);
@@ -265,7 +265,7 @@ export async function runTick(
  }
  try {
   await emitTickRunFinished(config, journal, {
-   startedAt, endedAt: now().toISOString(), exitCode: result.exitCode,
+   startedAt, endedAt: now().toISOString(), exitCode: result.exitCode, escalation: escalateResult,
   }, deps.ledger);
  } finally {
   journal.close();

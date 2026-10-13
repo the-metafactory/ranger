@@ -75,6 +75,7 @@ async function escalateOneMap(
     edited: [],
     deferred: [],
     keptOpen: [],
+    closed: [],
     cardErrors: [],
     cards: [],
   };
@@ -191,6 +192,8 @@ async function escalateOneMap(
       neededIds,
     );
     base.keptOpen.push(...absent.keptOpen);
+    base.closed.push(...absent.closed);
+    base.cards.push(...absent.cards);
     base.deferred.push(...absent.deferred);
     base.cardErrors.push(...absent.errors);
     const active = await syncActivePage({
@@ -208,7 +211,7 @@ async function escalateOneMap(
     base.deferred.push(...active.deferred);
     base.cardErrors.push(...active.cardErrors);
 
-    return { ...base, cards: active.cards };
+    return { ...base, cards: [...base.cards, ...active.cards] };
   } catch (error) {
     // A budget deferral returns BEFORE the absent-card pass: an unread
     // frontier must never read as "every card left the queue".

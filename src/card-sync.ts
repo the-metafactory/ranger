@@ -116,6 +116,13 @@ export function ageBand(ageDays: number): AgeBand {
   return "fresh";
 }
 
+/** Vigil's escalation vocabulary: the aging band still needs the principal. */
+export const AGE_BAND_STATE = {
+  fresh: "needs-principal",
+  aging: "needs-principal",
+  overdue: "overdue",
+} as const satisfies Record<AgeBand, "needs-principal" | "overdue">;
+
 /** Host-local YYYY-MM-DD — the digest cache key and date must match the
  * launchd schedule (host-local 07:30), not the UTC calendar day. */
 export function localDateKey(now: Date): string {
@@ -273,6 +280,8 @@ export interface EscalateMapResult {
    * until a principal response or operator verb resolves them (design §5).
    */
   keptOpen: string[];
+  /** Node ids whose card was closed after a confirmed graph closure. */
+  closed: string[];
   /** Per-card transient failures (e.g. Discord 429) — retried next tick. */
   cardErrors: string[];
   cards: EscalationCard[];
@@ -626,7 +635,7 @@ export async function markAbsentCards(
     onlyClosed?: boolean;
   },
   neededIds: ReadonlySet<string>,
-): Promise<{ keptOpen: string[]; deferred: string[]; errors: string[] }> {
+): Promise<{ keptOpen: string[]; closed: string[]; cards: EscalationCard[]; deferred: string[]; errors: string[] }> {
   const { client, journal, map, now, budget, owned } = ctx;
   const finished = ctx.onlyClosed ? new Set(journal.listWorkers(map.repo, map.root)
     .filter(worker => worker.phase === "close" && (worker.status === "success" || worker.status === "released"))
@@ -637,6 +646,7 @@ export async function markAbsentCards(
   const noted = selectAbsentCards(journal, map.repo, neededIds, wanted, map.root, "noted", () => true);
   const clientFor = channelClientFor(client);
   const reconcileCtx = { clientFor, journal, map, now, budget, owned };
+  const cards: EscalationCard[] = [];
   const resolve = async (prior: EscalationRow): Promise<AbsentOutcome> => {
     const closureOnly = ctx.onlyClosed || prior.notedAt !== null;
     let closed = false;
@@ -652,7 +662,23 @@ export async function markAbsentCards(
       journal.recordEvent("sweep", { nodeId: prior.nodeId, repo: map.repo, detail: `graph closure read deferred: ${String(error)}` });
     }
     if (!closed && closureOnly) return { action: "unchanged", id: prior.nodeId };
-    return reconcileAbsentCard(reconcileCtx, prior, absentCardMode(prior, map, closed, now, read));
+    const outcome = await reconcileAbsentCard(reconcileCtx, prior, absentCardMode(prior, map, closed, now, read));
+    if (outcome.action === "keptOpen" || outcome.action === "closed") {
+      cards.push({
+        nodeId: prior.nodeId,
+        title: prior.title ?? `#${sanitizeGraphText(prior.nodeId)}`,
+        kind: read?.node.kind ?? "untyped",
+        autonomy: read?.node.autonomy ?? "unknown",
+        url: read?.url ?? nodeUrl(map.repo, prior.nodeId),
+        checkpointId: read?.node.checkpointId,
+        route: prior.route ?? "escalate-hitl",
+        ageDays: dayDiff(prior.createdAt, now),
+        status: outcome.action === "closed" ? "closed" : "open",
+        createdAt: prior.createdAt,
+        messageId: prior.messageId,
+      });
+    }
+    return outcome;
   };
   // Queue-exit edits have first use of the shared Discord allowance. Select
   // both pages before edits so newly noted cards are not read twice this tick.
@@ -661,6 +687,7 @@ export async function markAbsentCards(
     ...await mapPool(noted, 3, resolve),
   ];
   const keptOpen: string[] = [];
+  const closed: string[] = [];
   const deferred: string[] = [];
   const errors: string[] = [];
   for (const outcome of outcomes) {
@@ -670,9 +697,11 @@ export async function markAbsentCards(
       deferred.push(outcome.id);
     } else if (outcome.action === "keptOpen") {
       keptOpen.push(outcome.id);
+    } else if (outcome.action === "closed") {
+      closed.push(outcome.id);
     }
   }
-  return { keptOpen, deferred, errors };
+  return { keptOpen, closed, cards, deferred, errors };
 }
 
 /**
