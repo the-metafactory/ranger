@@ -29,12 +29,29 @@ export interface ChangeRequest {
 export type CiPurpose = "merge" | "close" | "research";
 export type CiVerdict =
  | { state: "green"; runId: number; runUrl: string; runName: string; snapshot: string }
- /**
-  * `noRuns`: pending only because no CI run exists on the head at all (no
-  * check run on GitHub, no push or merge_request_event pipeline on GitLab);
-  * the merge desk's no-CI send-back reads it.
-  */
- | { state: "red" | "pending"; reason: string; noRuns?: true };
+ | {
+  state: "red" | "pending";
+  reason: string;
+  /**
+   * `noRuns`: pending only because no CI run exists on the head at all (no
+   * check run on GitHub, no push or merge_request_event pipeline on GitLab);
+   * the merge desk's no-CI send-back reads it.
+   */
+  noRuns?: true;
+  /**
+   * The runs that failed, when the adapter can name them (GitHub's merge
+   * verdict). Only a run concluded `failure` is sent back to a worker with
+   * its log; a verdict without them is never sent back.
+   */
+  failed?: CiFailedRun[];
+ };
+
+/** One failed CI run: its id (a job id on GitHub Actions), name and conclusion. */
+export interface CiFailedRun {
+ id: number;
+ name: string;
+ conclusion: string;
+}
 
 export interface IssueComment {
  id: number;
@@ -59,6 +76,11 @@ export interface ForgeReadPort<Credential = string> {
  findPrByHead(repo: string, branch: string, token: Credential): Promise<ChangeRequest | null>;
  getPr(repo: string, n: number, token: Credential): Promise<ChangeRequest>;
  ciVerdictFor(repo: string, sha: string, token: Credential, purpose?: CiPurpose): Promise<CiVerdict>;
+ /**
+  * The tail of each failed run's log, for a CI fix pass's prompt. GitHub
+  * only; a run whose log cannot be read is named with the reason instead.
+  */
+ ciFailureLog?(repo: string, runs: CiFailedRun[], token: Credential): Promise<string>;
  /** Labels of a tracker issue (a graph node), by issue number. */
  issueLabels(repo: string, issue: number, token: Credential): Promise<string[]>;
  /**

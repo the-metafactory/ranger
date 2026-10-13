@@ -282,6 +282,19 @@ export function mergeGateFailedOutcome(r: { check: string; reason: string }): st
  */
 export const CI_FAILED_PARK_OUTCOME = /^merge gate failed \(ci-green\): /;
 
+/**
+ * A red CI the merge desk does not send back to a worker: its CI fix passes
+ * are spent, or one already ran at this head and found nothing to change. Still a CI-only park, so CI recovering at the
+ * head (a rerun) moves it on. Ranger's words come first: the park keeps 400
+ * characters, and a CI reason can be long.
+ */
+export function ciNotSentBackOutcome(r: { reason: string; head: string; spent?: number }): string {
+ const why = r.spent !== undefined
+  ? `the CI fix budget is spent (${r.spent} CI fix pass(es) at earlier heads), so ranger stops at ${r.head.slice(0, 8)}; fix it by hand, or rerun CI if it is flaky`
+  : `a CI fix pass at ${r.head.slice(0, 8)} found nothing in the branch to change; rerun CI if it is flaky, or fix it by hand`;
+ return mergeGateFailedOutcome({ check: "ci-green", reason: `${why}. ${r.reason}` });
+}
+
 /** A session or review that stopped on its substrate's limit (node #45). */
 export const SUBSTRATE_CAPPED_OUTCOME = /\bhit its (?:rate|capacity) limit\b/;
 

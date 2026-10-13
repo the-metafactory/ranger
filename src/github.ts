@@ -1,4 +1,4 @@
-import type { ChangeRequest, MergeState, MergeOutcome, CiPurpose, CiVerdict, CommentReaction, IssueComment, LabeledIssue } from "./forge.ts";
+import type { ChangeRequest, MergeState, MergeOutcome, CiFailedRun, CiPurpose, CiVerdict, CommentReaction, IssueComment, LabeledIssue } from "./forge.ts";
 import { githubCiVerdict } from "./github-ci.ts";
 import { runCmd } from "./exec.ts";
 import { runReadRetryingTransient } from "./transient.ts";
@@ -54,11 +54,8 @@ export interface CommitStatus {
  state: string;
 }
 
-async function ghApi(
- token: string,
- args: string[],
- label: string,
-): Promise<unknown> {
+/** One `gh api` request; its trimmed stdout. */
+async function ghApiText(token: string, args: string[], label: string): Promise<string> {
  const gated = writeEnv(token);
  try {
   // Reads retry a transient GitHub error; writes run once (a timed-out POST may have landed).
@@ -72,15 +69,23 @@ async function ghApi(
     `${label} failed (gh api, exit ${result.code}): ${(result.stderr || result.stdout).trim().slice(0, 400)}`,
    );
   }
-  const raw = result.stdout.trim();
-  if (raw.length === 0) return null;
-  try {
-   return JSON.parse(raw) as unknown;
-  } catch {
-   throw new GitHubError(`${label}: unparseable JSON from gh api`);
-  }
+  return result.stdout.trim();
  } finally {
   gated.cleanup();
+ }
+}
+
+async function ghApi(
+ token: string,
+ args: string[],
+ label: string,
+): Promise<unknown> {
+ const raw = await ghApiText(token, args, label);
+ if (raw.length === 0) return null;
+ try {
+  return JSON.parse(raw) as unknown;
+ } catch {
+  throw new GitHubError(`${label}: unparseable JSON from gh api`);
  }
 }
 
@@ -441,4 +446,31 @@ export async function ciVerdictFor(repo: string, sha: string, token: string, pur
   checkRunsFor(repo, sha, token), workflowRunsFor(repo, sha, token), commitStatusesFor(repo, sha, token),
  ]);
  return githubCiVerdict(repo, runs, purpose, workflows, statuses);
+}
+
+/** How many failed runs a CI fix pass reads, and how much of each log's end. */
+const CI_LOG_RUNS = 3;
+const CI_LOG_TAIL_CHARS = 6_000;
+
+/**
+ * The end of each failed run's log (GitHub Actions: a check run's id is its
+ * job id), with the runner's timestamps dropped. A run whose log cannot be
+ * read (a third-party check app, an expired log) is named with the reason:
+ * the fix pass still gets the job name and the verdict.
+ */
+export async function ciFailureLog(repo: string, runs: CiFailedRun[], token: string): Promise<string> {
+ const parts: string[] = [];
+ for (const run of runs.slice(0, CI_LOG_RUNS)) {
+  let body: string;
+  try {
+   const raw = await ghApiText(token, [`repos/${repo}/actions/jobs/${run.id}/logs`], `log of job ${run.id}`);
+   const text = raw.split("\n").map((l) => l.replace(/^\d{4}-\d\d-\d\dT[\d:.]+Z /, "")).join("\n");
+   body = text.length > CI_LOG_TAIL_CHARS ? `[…]\n${text.slice(-CI_LOG_TAIL_CHARS)}` : text;
+  } catch (error) {
+   body = `(log not readable: ${error instanceof Error ? error.message.slice(0, 200) : String(error)})`;
+  }
+  parts.push(`### ${run.name} (${run.conclusion})\n${body}`);
+ }
+ if (runs.length > CI_LOG_RUNS) parts.push(`(${runs.length - CI_LOG_RUNS} more failed run(s): ${runs.slice(CI_LOG_RUNS).map((r) => r.name).join(", ")})`);
+ return parts.join("\n\n");
 }

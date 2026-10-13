@@ -1,6 +1,6 @@
 import { createShadowTestBackend, type ShadowComparison } from "../src/remote-test/shadow.ts";
 import { githubCiVerdict } from "../src/github-ci.ts";
-import type { CiPurpose, MergeState } from "../src/forge.ts";
+import type { CiFailedRun, CiPurpose, MergeState } from "../src/forge.ts";
 import { afterEach, beforeEach, describe, expect, spyOn } from "bun:test";
 import { test } from "./partition.ts";
 import {
@@ -127,8 +127,19 @@ class FakeGitHub implements ForgePort {
   const stored = this.prs.get(pr.iid);
   if (stored) stored.draft = false;
  }
- async ciVerdictFor(_repo: string, _sha: string, _token: string, purpose?: CiPurpose) {
+ /** Heads whose merge CI is red (a lint job failed), whatever `checkRuns` says. */
+ redHeads = new Set<string>();
+ /** Every head a CI fix pass's log was read for. */
+ logReads: number[][] = [];
+ async ciVerdictFor(_repo: string, sha: string, _token: string, purpose?: CiPurpose) {
+  if ((purpose ?? "merge") === "merge" && this.redHeads.has(sha)) {
+   return githubCiVerdict(_repo, [...this.checkRuns, { id: 202, name: "lint", status: "completed", conclusion: "failure" }], purpose);
+  }
   return githubCiVerdict(_repo, this.checkRuns, purpose);
+ }
+ async ciFailureLog(_repo: string, runs: CiFailedRun[]) {
+  this.logReads.push(runs.map((r) => r.id));
+  return "### lint (failure)\nsrc/feature.ts:1:1 error  no-unused-vars";
  }
  async postComment(_repo: string, n: number, body: string) {
   const list = this.comments.get(n) ?? [];
@@ -2157,6 +2168,123 @@ describe("implement lane (node #23)", () => {
   expect(events.some((d) => d.includes("conflicts with main") && d.includes("run-node resumes"))).toBe(true);
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
   expect((await r.github.getPr("acme/widgets", 1)).mergeState).toBe("mergeable");
+ }, 60_000);
+
+ // soma #795/#796: a deterministic red CI parked for good, with no worker to fix it.
+ /** A rig whose round-N review runs `hook` once the rig exists (the reviewer is made before it). */
+ const ciRig = async (opts: Parameters<typeof rig>[0] = {}) => {
+  let hook: (round: number, r: Rig) => Promise<void> = async () => {};
+  const r = await rig({ ...opts, onReview: (round) => hook(round, r) });
+  cleanup.push(r.dir);
+  const prompts: string[] = [];
+  let mode = "build";
+  r.ctx.worker = async (prompt, o) => {
+   prompts.push(prompt);
+   return runCmd(implementWorker, [mode, prompt], o);
+  };
+  return {
+   r,
+   prompts,
+   onReview: (h: typeof hook) => { hook = h; },
+   setMode: (m: string) => { mode = m; },
+   markers: () => (r.github.comments.get(1) ?? []).filter((c) => c.body.includes("ranger:ci-fix")),
+   events: () => r.journal.listEvents("acme/widgets", 300).map((e) => e.detail ?? ""),
+  };
+ };
+ const redHead = async (r: Rig) => { r.github.redHeads.add(await r.github.sha(BRANCH)); };
+ const deskSweep = (r: Rig, spawned: string[] = []) =>
+  sweepMap({
+   config: r.ctx.config,
+   journal: r.journal,
+   map: r.ctx.map,
+   token: "ghp_write",
+   botIdentity: BOT,
+   github: r.github,
+   post: async () => "msg",
+   respawn: async (nodeId) => {
+    spawned.push(nodeId);
+    return DEAD_PID;
+   },
+  });
+
+ test("a sage-clean head whose CI fails gets a CI fix pass with the failed logs, a new round, then goes ready", async () => {
+  const c = await ciRig();
+  let red = "";
+  c.onReview(async (round, r) => { if (round === 1) { await redHead(r); red = await r.github.sha(BRANCH); } });
+  expect((await runNode("20", c.r.ctx)).status).toBe("awaiting-merge");
+  expect(c.prompts).toHaveLength(2);
+  const fix = c.prompts[1] as string;
+  expect(fix).toContain("## CI fix pass");
+  expect(fix).toContain(`CI failed at this branch's head \`${red.slice(0, 8)}\`: CI failed: lint=failure.`);
+  expect(fix).toMatch(/<ci-log-([0-9a-f-]{36})>\n### lint \(failure\)\nsrc\/feature\.ts:1:1 error  no-unused-vars\n<\/ci-log-\1>/);
+  expect(c.r.github.logReads).toEqual([[202]]);
+  const head = await c.r.github.sha(BRANCH);
+  expect(c.markers().map((m) => m.body.split("\n")[0])).toEqual([`<!-- ranger:ci-fix sha=${head} red=${red} -->`]);
+  expect(c.r.calls).toHaveLength(2); // round 2 reviews the fix
+  expect(c.events().some((d) => d === `CI fix pass 1 @ ${head.slice(0, 8)}: CI was red at ${red.slice(0, 8)}`)).toBe(true);
+ }, 60_000);
+
+ test("a red CI on a branch behind its base merges the base in first, whatever maxBehindBase says", async () => {
+  const c = await ciRig();
+  c.onReview(async (round, r) => { if (round === 1) { await redHead(r); await pushFromOutside(r, "base-1.txt", "main"); } });
+  expect(c.r.ctx.config.workers.maxBehindBase).toBeGreaterThan(1);
+  expect((await runNode("20", c.r.ctx)).status).toBe("awaiting-merge");
+  expect(c.prompts[1]).toContain("## Base merge pass");
+  expect(c.prompts[1]).toContain("CI failed on this branch (CI failed: lint=failure), and the branch is 1 commit(s) behind `origin/main`.");
+  const merges = (c.r.github.comments.get(1) ?? []).filter((m) => m.body.includes("ranger:base-merge"));
+  expect(merges).toHaveLength(1);
+  expect(merges[0]?.body).toContain("CI was red (CI failed: lint=failure) and the branch was 1 commit(s) behind origin/main");
+  expect((await runCmd("git", ["merge-base", "--is-ancestor", "main", await c.r.github.sha(BRANCH)], { cwd: c.r.origin })).code).toBe(0);
+  expect(c.markers()).toEqual([]);
+  expect(c.prompts.some((p) => p.includes("## CI fix pass"))).toBe(false);
+  expect(c.r.calls).toHaveLength(2);
+ }, 60_000);
+
+ test("a CI fix pass that finds nothing goes ready; the desk parks it on CI, and a green rerun moves it on", async () => {
+  const c = await ciRig();
+  c.setMode("ci-noop");
+  c.onReview(async (round, r) => { if (round === 1) await redHead(r); });
+  expect((await runNode("20", c.r.ctx)).status).toBe("awaiting-merge");
+  const head = await c.r.github.sha(BRANCH);
+  expect(c.markers().map((m) => m.body.split("\n")[0])).toEqual([`<!-- ranger:ci-fix sha=${head} red=${head} -->`]);
+  expect(c.r.calls).toHaveLength(1);
+
+  const spawned: string[] = [];
+  expect((await deskSweep(c.r, spawned)).mergeDesk?.parked).toEqual(["20"]);
+  expect(c.r.journal.getWorker("20", "acme/widgets")?.outcome).toContain(`a CI fix pass at ${head.slice(0, 8)} found nothing in the branch to change`);
+  expect((await deskSweep(c.r, spawned)).mergeDesk?.parked).toEqual([]);
+  expect(spawned).toEqual([]);
+
+  c.r.github.redHeads.clear(); // someone reran CI, and it passed
+  expect((await deskSweep(c.r, spawned)).mergeDesk?.cards).toEqual(["20"]);
+  expect(c.r.journal.getWorker("20", "acme/widgets")?.status).toBe("awaiting-merge");
+  expect(spawned).toEqual([]);
+ }, 60_000);
+
+ test("CI still red after the CI fix budget goes ready, and the desk parks it naming the spent budget", async () => {
+  const c = await ciRig();
+  c.onReview(async (_round, r) => redHead(r));
+  expect((await runNode("20", c.r.ctx)).status).toBe("awaiting-merge");
+  expect(c.markers()).toHaveLength(2);
+  expect(c.r.calls).toHaveLength(3);
+  expect(c.events().some((d) => d.includes("but the node has used its 2 CI fix pass(es)"))).toBe(true);
+  const spawned: string[] = [];
+  expect((await deskSweep(c.r, spawned)).mergeDesk?.parked).toEqual(["20"]);
+  expect(spawned).toEqual([]);
+  expect(c.r.journal.getWorker("20", "acme/widgets")?.outcome).toMatch(/^merge gate failed \(ci-green\): the CI fix budget is spent \(2 CI fix pass\(es\) at earlier heads\)/);
+ }, 60_000);
+
+ test("a ready PR whose CI then fails is sent back by the desk, and run-node fixes it", async () => {
+  const c = await ciRig();
+  expect((await runNode("20", c.r.ctx)).status).toBe("awaiting-merge");
+  await redHead(c.r);
+  const spawned: string[] = [];
+  expect((await deskSweep(c.r, spawned)).mergeDesk?.resumed).toEqual(["20"]);
+  expect(spawned).toEqual(["20"]);
+  expect(c.events().some((d) => d.includes("CI is red at") && d.includes("run-node resumes"))).toBe(true);
+  expect((await runNode("20", c.r.ctx)).status).toBe("awaiting-merge");
+  expect(c.markers()).toHaveLength(1);
+  expect(c.prompts.filter((p) => p.includes("## CI fix pass"))).toHaveLength(1);
  }, 60_000);
 
  test("a failed supervisor test run names its failing test and keeps its whole output in the node's log", async () => {

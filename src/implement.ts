@@ -31,7 +31,7 @@ import {
 } from "./git-ops.ts";
 import { recordKnownGood, trustedSnapshot } from "./git-trust.ts";
 import * as gh from "./github.ts";
-import type { IssueComment, ChangeRequest, ForgePort, CiVerdict } from "./forge.ts";
+import type { IssueComment, ChangeRequest, ForgePort, CiFailedRun, CiVerdict } from "./forge.ts";
 import { ParkSignal } from "./signals.ts";
 import { isTransientGitHubError } from "./transient.ts";
 import {
@@ -1318,12 +1318,11 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
  // that landed in the PR's head grants the round that reviews the merged
  // branch. A marker whose merge was never pushed (a crash between the two)
  // grants nothing and uses up none of the node's merge passes.
- let baseMerges = await landedBaseMerges(
-  worktree,
-  recordedBaseMerges(opening, botIdentity),
-  (await github.getPr(repo, open.iid, token)).headSha,
- );
- const capNow = () => config.workers.reviewRounds + baseMerges;
+ const openingHead = (await github.getPr(repo, open.iid, token)).headSha;
+ let baseMerges = await landedBaseMerges(worktree, recordedBaseMerges(opening, botIdentity), openingHead);
+ // A CI fix pass grants its round the same way.
+ let ciFixes = ciFixState(recordedCiFixes(opening, botIdentity), openingHead).used;
+ const capNow = () => config.workers.reviewRounds + baseMerges + ciFixes;
  // The head whose set-aside major is already journaled: once per head per
  // run, as the loop re-reads an unchanged head on every pass.
  let notedSha: string | undefined;
@@ -1352,6 +1351,71 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
   );
   baseMerges += 1;
   return undefined;
+ };
+ /**
+  * A sage-clean, mergeable head whose CI is red goes back to a worker
+  * (soma #795/#796 parked for good on a deterministic red). CI tests the
+  * branch merged into its base, so when the base moved at all it is merged
+  * in first; otherwise a CI fix pass reads the failed runs' logs. A CI that
+  * is pending, green, unreadable or red for no code's fault goes on to
+  * ready, and the merge desk reads it there. "again" re-reads the new head.
+  */
+ const ciStep = async (head: string): Promise<"ready" | "again" | ImplementOutcome> => {
+  let ci: CiVerdict;
+  try {
+   ci = await github.ciVerdictFor(repo, head, token);
+  } catch (error) {
+   journal.recordEvent("reviewed", {
+    nodeId,
+    repo,
+    detail: `CI at ${head.slice(0, 8)} not read (${String(error).slice(0, 200)}): it goes ready, and the merge desk reads CI there`,
+   });
+   return "ready";
+  }
+  if (!workerFixableCi(ci)) return "ready";
+  const recorded = ciFixState(recordedCiFixes(await github.listComments(repo, open.iid, token), botIdentity), head);
+  if (recorded.foundNothing) return "ready";
+  // This run's own count bounds the loop too, whatever the PR's markers say.
+  const used = Math.max(recorded.used, ciFixes);
+  if (used >= MAX_CI_FIXES) {
+   journal.recordEvent("reviewed", {
+    nodeId,
+    repo,
+    detail: `CI is red at ${head.slice(0, 8)} (${ci.reason}), but the node has used its ${MAX_CI_FIXES} CI fix pass(es): it goes ready, and the merge desk parks it`.slice(0, 400),
+   });
+   return "ready";
+  }
+  if (baseMerges < MAX_BASE_MERGES) {
+   // The fetch carries the write credential: the state must still be the known-good one (node #81).
+   await trustedSnapshot(journal, ctx.canonical, { repo, nodeId }, mapKey(map));
+   await fastForwardCanonical(ctx.canonical, base, gitCredential(repo, token));
+   const behind = await commitsBehind(worktree, base);
+   if (behind > 0) return (await mergeBaseIn(head, { behind, limit: 0, ciRed: ci.reason })) ?? "again";
+  }
+  const log = github.ciFailureLog === undefined
+   ? ""
+   : await github.ciFailureLog(repo, ci.failed, token).catch((error: unknown) => `(logs not read: ${String(error).slice(0, 200)})`);
+  journal.recordEvent("reviewed", {
+   nodeId,
+   repo,
+   detail: `CI is red at ${head.slice(0, 8)} (${ci.reason}) — a CI fix pass reads the failed runs' logs`.slice(0, 400),
+  });
+  const rulings = principalRulings(await github.listComments(repo, open.iid, token), principalLoginForRepo(config, repo));
+  const fixed = await workerPass(ctx, testCommand, { kind: "ci-fix", red: head, reason: ci.reason, log, rulings });
+  workerExit = fixed.workerExit;
+  if (fixed.failure !== undefined) return fixed.failure;
+  // The marker first, as a base merge's: a fix pushed without one would
+  // read as an unreviewed head at the cap.
+  fence("record the CI fix");
+  if (fixed.unchanged === true) {
+   await github.postComment(repo, open.iid, ciFixMarker({ sha: head, red: head, reason: ci.reason }), token);
+   journal.recordEvent("reviewed", { nodeId, repo, detail: `CI fix pass at ${head.slice(0, 8)} found nothing in the branch to change: it goes ready, and the merge desk parks it` });
+   return "ready";
+  }
+  await github.postComment(repo, open.iid, ciFixMarker({ sha: fixed.sha, red: head, reason: ci.reason }), token);
+  await publishPass(ctx, github, open.iid, fixed, "push CI fix", `CI fix pass ${used + 1} @ ${fixed.sha.slice(0, 8)}: CI was red at ${head.slice(0, 8)}`);
+  ciFixes += 1;
+  return "again";
  };
  for (;;) {
   const cap = capNow();
@@ -1481,7 +1545,12 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
    // Sage-clean. Before the probes certify this head, it must merge: GitHub
    // runs no CI on a conflicting PR, so a conflict found only at the merge
    // desk waits forever (seelite #692).
-   if (!(await conflictsWithBase(ctx, github, open.iid))) break;
+   if (!(await conflictsWithBase(ctx, github, open.iid))) {
+    const step = await ciStep(live.headSha);
+    if (step === "ready") break;
+    if (step === "again") continue;
+    return step;
+   }
    if (baseMerges >= MAX_BASE_MERGES) {
     throw new ParkSignal(baseConflictOutcome({ repo, pr: open.iid, base, passes: baseMerges }));
    }
@@ -1598,17 +1667,23 @@ interface BaseMergeInput {
 /** The base is informational: any ref name the config accepts must still parse. */
 const BASE_MERGE_MARKER = /<!-- ranger:base-merge sha=([0-9a-f]{7,64})(?: base=[^\s>]*)? -->/;
 
-/** A branch merged up for trailing its base (ranger issue #231): how far, and the configured limit. */
+/**
+ * A branch merged up for trailing its base (ranger issue #231): how far, and
+ * the configured limit. `ciRed` is set when CI was red at the head: CI tests
+ * the branch merged into its base, so any drift can be the cause, and the
+ * limit does not apply.
+ */
 export interface StaleBase {
  behind: number;
  limit: number;
+ ciRed?: string;
 }
 
 /** Why a base merge pass ran, in the words the marker, the journal and the push detail share. */
 export function baseMergeWhy(base: string, stale?: StaleBase): string {
- return stale === undefined
-  ? `origin/${base} conflicted with the branch`
-  : `the branch was ${stale.behind} commit(s) behind origin/${base} (limit ${stale.limit})`;
+ if (stale === undefined) return `origin/${base} conflicted with the branch`;
+ if (stale.ciRed !== undefined) return `CI was red (${stale.ciRed.slice(0, 200)}) and the branch was ${stale.behind} commit(s) behind origin/${base}`;
+ return `the branch was ${stale.behind} commit(s) behind origin/${base} (limit ${stale.limit})`;
 }
 
 export function baseMergeMarker(sha: string, base: string, stale?: StaleBase): string {
@@ -1624,6 +1699,62 @@ export function recordedBaseMerges(comments: IssueComment[], botIdentity: string
   if (m !== null) out.push({ sha: m[1] });
  }
  return out;
+}
+
+/**
+ * CI fix passes one node gets before a red CI parks at the merge desk. A
+ * dedicated budget, like the base merges', rather than a share of the review
+ * rounds: a PR that used its rounds on sage findings would otherwise get no
+ * CI fix at all. Each fix that lands grants the sage round reviewing it.
+ */
+export const MAX_CI_FIXES = 2;
+
+const CI_FIX_MARKER = /<!-- ranger:ci-fix sha=([0-9a-f]{7,64}) red=([0-9a-f]{7,64}) -->/;
+
+/** One recorded CI fix pass: the red head it answered and the commit it made (`sha === red`: it changed nothing). */
+export interface CiFixRecord {
+ sha: string;
+ red: string;
+}
+
+export function ciFixMarker(r: CiFixRecord & { reason: string }): string {
+ const what = r.sha === r.red
+  ? "and a worker found nothing in the branch to change. Ranger leaves it for the principal: rerun CI if it is flaky."
+  : `so a worker fixed it at \`${r.sha.slice(0, 8)}\`. The next sage round reviews the fix.`;
+ return `<!-- ranger:ci-fix sha=${r.sha} red=${r.red} -->\n**CI fix pass** — CI was red at \`${r.red.slice(0, 8)}\` (${r.reason.slice(0, 300)}), ${what}`;
+}
+
+/** CI fix passes recorded on the PR by the MACHINE ACCOUNT (anyone else's markers are ignored). */
+export function recordedCiFixes(comments: IssueComment[], botIdentity: string): CiFixRecord[] {
+ const out: CiFixRecord[] = [];
+ for (const c of comments) {
+  if (c.author !== botIdentity) continue;
+  const m = c.body.match(CI_FIX_MARKER);
+  if (m !== null) out.push({ sha: m[1], red: m[2] });
+ }
+ return out;
+}
+
+/**
+ * What the recorded CI fix passes leave at `head`. `used` counts the fixes
+ * that moved the branch off a red head; a marker whose red head is still the
+ * head was never pushed (a crash between the two) and counts for nothing.
+ * `foundNothing`: a pass already ran at this head and changed nothing, so no
+ * other one runs there.
+ */
+export function ciFixState(fixes: CiFixRecord[], head: string): { used: number; foundNothing: boolean } {
+ return {
+  used: new Set(fixes.filter((f) => f.sha !== f.red && f.red !== head).map((f) => f.red)).size,
+  foundNothing: fixes.some((f) => f.sha === f.red && f.red === head),
+ };
+}
+
+/**
+ * A red CI a worker may fix: a run concluded `failure`. A cancelled,
+ * timed-out or unnamed red is no code's fault, and stays the principal's.
+ */
+export function workerFixableCi(ci: CiVerdict): ci is Extract<CiVerdict, { state: "red" | "pending" }> & { failed: CiFailedRun[] } {
+ return ci.state === "red" && (ci.failed ?? []).some((f) => f.conclusion === "failure");
 }
 
 /** How many recorded base merges landed: their merge commit is in the PR's head. */
@@ -1835,6 +1966,8 @@ interface PassResult {
  failure?: ImplementOutcome;
  /** The commits were adopted from an earlier run, not written by this run's worker. */
  adopted?: boolean;
+ /** A CI fix pass that exited 0 and committed nothing: the red is not the branch's to fix. */
+ unchanged?: boolean;
 }
 
 /**
@@ -1873,10 +2006,11 @@ function recordHead(ctx: ImplementContext, sha: string): void {
  });
 }
 
-/** What a worker session is for: the build, a fix pass answering a sage round, or a base merge. */
+/** What a worker session is for: the build, a fix pass answering a sage round or a red CI, or a base merge. */
 type WorkerPassSpec =
  | { kind: "build" }
  | { kind: "fix"; round: number; body: string; rulings: string[] }
+ | { kind: "ci-fix"; red: string; reason: string; log: string; rulings: string[] }
  | ({ kind: "base-merge" } & BaseMergeInput);
 
 /** The pass's name in logs, events and outcomes. */
@@ -1886,6 +2020,8 @@ function passLabel(spec: WorkerPassSpec): string {
    return "build pass";
   case "fix":
    return `fix pass ${spec.round}`;
+  case "ci-fix":
+   return "CI fix pass";
   case "base-merge":
    return "base merge pass";
  }
@@ -1898,6 +2034,8 @@ function nothingCommitted(spec: WorkerPassSpec): string {
    return "worker exited 0 but committed nothing — nothing to push";
   case "fix":
    return `fix pass ${spec.round} committed nothing — the blockers stand`;
+  case "ci-fix":
+   return `CI fix pass committed nothing — CI stays red at ${spec.red.slice(0, 8)}`;
   case "base-merge":
    return `base merge pass committed nothing — the conflict with origin/${spec.base} stands`;
  }
@@ -1972,6 +2110,7 @@ async function checkedWorkerPass(
   botIdentity,
   testCommand,
   ...(spec.kind === "fix" ? { review: { round: spec.round, body: spec.body }, rulings: spec.rulings } : {}),
+  ...(spec.kind === "ci-fix" ? { ciFix: { head: spec.red, reason: spec.reason, log: spec.log, base: map.base }, rulings: spec.rulings } : {}),
   ...(spec.kind === "base-merge" ? { baseMerge: { base: spec.base, files: spec.files, ...(spec.stale === undefined ? {} : { stale: spec.stale }) } } : {}),
   probeTier: map.commands.probe !== undefined,
   remoteTests: remoteTests(ctx),
@@ -2040,6 +2179,11 @@ async function checkedWorkerPass(
   }
  }
  const sha = await headSha(worktree);
+ // A CI fix pass may find the red is not the branch's (a flaky test, a
+ // runner outage): it commits nothing, and that is an answer, not a failure.
+ if (spec.kind === "ci-fix" && sha === before && (await dirtyFiles(worktree)).length === 0) {
+  return { workerExit: result.code, snapshot, sha, unchanged: true };
+ }
  if (sha === before || (await commitsAhead(worktree, map.base)) === 0) {
   return fail(nothingCommitted(spec));
  }
