@@ -2804,6 +2804,69 @@ describe("implement lane (node #23)", () => {
   expect(r.github.prs.size).toBe(0);
  }, 60_000);
 
+ // cortex#2557: a worker that could not build the node committed a blocker
+ // note, and the note became a PR that sage read clean.
+ test("a worker's blocked report parks the node on its reason and resume condition: no push, no PR, outside the dead-man", async () => {
+  const r = await rig({});
+  cleanup.push(r.dir);
+  r.ctx.workerCommand = [implementWorker, "blocked"];
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("parked");
+  expect(outcome.detail).toMatch(
+   /^blocked: Node #20 is blocked The widgets SDK has no release with the feature export\. — resume condition: publish a widgets SDK release that exports feature\(\)\. \(build pass; worker log: /,
+  );
+  expect(r.journal.getWorker("20", "acme/widgets")?.status).toBe("parked");
+  expect(r.journal.deadmanCount()).toBe(0);
+  expect(r.github.prs.size).toBe(0);
+  expect(await r.github.sha("node/20-add-the-feature-module")).toBe("");
+  // A resume once the condition holds runs a fresh worker: the old report does not park it again.
+  r.ctx.workerCommand = [implementWorker];
+  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+ }, 60_000);
+
+ test("a build that only commits a blocker note parks as blocked before its tests, and a resume builds afresh", async () => {
+  const r = await rig({});
+  cleanup.push(r.dir);
+  r.ctx.workerCommand = [implementWorker, "blocker-note"];
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("parked");
+  expect(outcome.detail).toMatch(
+   /^blocked: the branch only adds a blocker note \(docs\/node-20-dependency-blocker\.md\), not an implementation: Node #20 dependency blocker Implementation stopped: no SDK release exports feature\(\)\. — resume condition: Publish an SDK release with feature\(\)\. \(build pass; worker log: /,
+  );
+  expect(r.journal.deadmanCount()).toBe(0);
+  expect(r.github.prs.size).toBe(0);
+  expect(await r.github.sha("node/20-add-the-feature-module")).toBe("");
+  // The note never ran the map's tests (it would fail them), and its commit is gone from the worktree.
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.includes("test -f src/feature.ts"))).toBe(false);
+  const worktree = join(r.canonical, ".worktrees", "node-20");
+  const ahead = await runCmd("git", ["rev-list", "--count", "origin/main..HEAD"], { cwd: worktree });
+  expect(ahead.stdout.trim()).toBe("0");
+  r.ctx.workerCommand = [implementWorker];
+  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  const pushed = await runCmd("git", ["ls-tree", "-r", "--name-only", "refs/heads/node/20-add-the-feature-module"], { cwd: r.origin });
+  expect(pushed.stdout).not.toContain("blocker");
+ }, 60_000);
+
+ test("an unpushed build that is only a blocker note is not adopted: it parks as blocked", async () => {
+  const r = await rig({});
+  cleanup.push(r.dir);
+  r.ctx.workerCommand = [implementWorker, "noop"];
+  expect((await runNode("20", r.ctx)).status).toBe("failed");
+  const worktree = join(r.canonical, ".worktrees", "node-20");
+  mkdirSync(join(worktree, "docs"), { recursive: true });
+  writeFileSync(join(worktree, "docs", "BLOCKED.md"), "Waiting on the SDK.\n");
+  await runCmd("git", ["add", "-A"], { cwd: worktree, env: { ...process.env, ...GIT_ENV } });
+  await runCmd("git", ["commit", "-q", "-m", "docs: blocked"], { cwd: worktree, env: { ...process.env, ...GIT_ENV } });
+  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  const resumed = await runNode("20", r.ctx);
+  expect(resumed.status).toBe("parked");
+  expect(resumed.detail).toMatch(/^blocked: the branch only adds a blocker note \(docs\/BLOCKED\.md\), not an implementation: Waiting on the SDK\. — resume condition: none given, read the worker log \(adopted build\)$/);
+  expect(r.github.prs.size).toBe(0);
+ }, 60_000);
+
  test("a PR that went ready before the map had a probe tier is sent back for probes, not parked", async () => {
   const r = await rig({});
   cleanup.push(r.dir);

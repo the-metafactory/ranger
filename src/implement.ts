@@ -42,6 +42,7 @@ import {
  probeFailureSummary,
  probeFailureClass,
  baseConflictOutcome,
+ blockedOutcome,
  policyBlockedOutcome,
  probesFailedOutcome,
  gitlabReviewHoldOutcome,
@@ -56,6 +57,7 @@ import { FixNodeLockBusy, withFixNodeLock } from "./fix-node-lock.ts";
 import { assertFilable, codeCommentSpec, foundByProbeSpec, landminesInDiff, scribeFile, splitOutOfReviewSpec, type Provenance, type ScribeGraph } from "./scribe.ts";
 import { FencedError, type ImplementPhase, type Journal } from "./journal.ts";
 import { assembleImplementPrompt } from "./prompt.ts";
+import { blockerNoteBranch, discardBlockedReport, readBlockedReport, type BlockedReport } from "./blocked-report.ts";
 import { ReviewError, sageReview, type ReviewVerdict } from "./review.ts";
 import {
  confirmCap,
@@ -1969,6 +1971,8 @@ async function checkedWorkerPass(
   probeTier: map.commands.probe !== undefined,
   remoteTests: remoteTests(ctx),
  });
+ // Only this session's blocked report counts, never one a crashed run left.
+ discardBlockedReport(worktree);
  fenceSpawn();
  const output = workerOutputFor(ctx.substrate);
  const raw = await ctx.workerRun(prompt, {
@@ -2005,6 +2009,10 @@ async function checkedWorkerPass(
  });
  const stopped = hookStopReason(result.stdout, lines);
  if (stopped !== null) throw new ParkSignal(policyBlockedOutcome({ pass, reason: stopped, log }));
+ // The worker said the node cannot be done yet: park on its reason, before
+ // any commit it made is tested or pushed.
+ const blocked = result.code === 0 ? readBlockedReport(worktree) : null;
+ if (blocked !== null) throw await blockedPark(ctx, pass, blocked, log);
  if (result.code !== 0) {
   // Mid-session cap (node #45): only the substrate's own signal says so, and
   // only a failed run can be one. A capped failure does not count.
@@ -2029,6 +2037,10 @@ async function checkedWorkerPass(
  const sha = await headSha(worktree);
  if (sha === before || (await commitsAhead(worktree, map.base)) === 0) {
   return fail(nothingCommitted(spec));
+ }
+ if (spec.kind === "build") {
+  const note = await blockerNoteBranch(worktree, map.base);
+  if (note !== null) throw await blockedPark(ctx, pass, note, log);
  }
  // This session wrote `sha`: record it now, so a later run that adopts the
  // commit unpushed still credits the substrate that actually wrote it.
@@ -2058,6 +2070,25 @@ async function checkedWorkerPass(
  // Only a pass that goes on to the push puts its waived tests in the receipts.
  if (baseRed !== undefined) recordTestsBaseRed(journal, map.repo, ctx.node.ref.id, { head: sha, base: baseRed.sha, names: baseRed.names, rest: baseRed.rest });
  return { workerExit: result.code, snapshot, sha };
+}
+
+/**
+ * The park for a worker that reported the node blocked, or whose build is
+ * only a blocker note. Before any PR, a branch that holds nothing but the
+ * note goes back to its base: it was never pushed, the outcome keeps the
+ * note's reason and condition, and a resume once the condition holds must
+ * start a fresh build, not adopt the note and park again.
+ */
+async function blockedPark(ctx: ImplementContext, pass: string, report: BlockedReport, log?: string): Promise<ParkSignal> {
+ const { worktree, map, journal, node } = ctx;
+ let outcome = blockedOutcome({ pass, ...report, ...(log === undefined ? {} : { log }) });
+ const unpushed = (journal.getWorker(node.ref.id, map.repo)?.prNumber ?? null) === null;
+ if (unpushed && (await blockerNoteBranch(worktree, map.base)) !== null) {
+  const base = await safeGit(["--no-replace-objects", "merge-base", `origin/${map.base}`, "HEAD"], { cwd: worktree, timeoutMs: 10_000 });
+  const failed = base.code === 0 ? await restoreWorktree(ctx, base.stdout.trim()) : `no merge base with origin/${map.base}`;
+  if (failed !== null) outcome += ` — the note's commits stay in the worktree (${failed}): drop them before a resume`;
+ }
+ return new ParkSignal(outcome);
 }
 
 /**
@@ -2883,6 +2914,10 @@ async function adoptBuiltWork(
  }
  if ((await dirtyFiles(worktree)).length > 0) return null;
  const what = fix === undefined ? "build" : `fix pass ${fix.round}`;
+ if (fix === undefined) {
+  const note = await blockerNoteBranch(worktree, map.base);
+  if (note !== null) throw await blockedPark(ctx, "adopted build", note);
+ }
  const snapshot = await trustedSnapshot(journal, ctx.canonical, { repo: map.repo, nodeId: node.ref.id }, mapKey(map));
  const sha = await headSha(worktree);
  // Tested in a fresh clone of the commit, not in the worktree: whatever the

@@ -238,6 +238,20 @@ export function policyBlockedOutcome(r: { pass: string; reason: string; log: str
 
 export const POLICY_BLOCKED_OUTCOME = /^policy-blocked: /;
 
+/**
+ * The worker reported that the node cannot be done yet: a precondition
+ * outside its reach is unmet (cortex#2557: a Myelin export no release
+ * carried). Nothing was pushed and no PR opened. A park, not a failure: it is
+ * no evidence against the node or the worker, so it does not count toward the
+ * dead-man; a resume once the condition holds runs a fresh worker.
+ */
+export function blockedOutcome(r: { pass: string; reason: string; resume: string; log?: string }): string {
+ const resume = r.resume.length > 0 ? r.resume : "none given, read the worker log";
+ return `blocked: ${r.reason} — resume condition: ${resume} (${r.pass}${r.log === undefined ? "" : `; worker log: ${r.log}`})`;
+}
+
+export const BLOCKED_OUTCOME = /^blocked: /;
+
 /** The merge desk parked an awaiting-merge row on a hard merge-gate failure; `check` is the gate's check name. */
 export function mergeGateFailedOutcome(r: { check: string; reason: string }): string {
  return `merge gate failed (${r.check}): ${r.reason}`;
