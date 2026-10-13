@@ -16,7 +16,7 @@ const GAME = "acme/seelite";
 const TOOL = "acme/ranger";
 const SECOND_GAME = "acme/other-game";
 
-function rig(cap = 10) {
+function rig(cap = 10, laneSlots?: { visual?: number; headless?: number }) {
  const dir = mkdtempSync(join(tmpdir(), "ranger-lanes-"));
  const discord = fakeDiscord();
  const configPath = join(dir, "ranger.yaml");
@@ -30,7 +30,7 @@ function rig(cap = 10) {
   bot: { identity: "ivy-bot" },
   auth: { defaultWriteTokenEnv: "RANGER_WRITE_TEST" },
   state: { journalPath: join(dir, "state.sqlite") },
-  workers: { spawnCapPerDay: cap },
+  workers: { spawnCapPerDay: cap, ...(laneSlots === undefined ? {} : { laneSlots }) },
  };
  writeFileSync(configPath, stringify(raw));
  const config = loadConfig(configPath).config;
@@ -112,6 +112,41 @@ describe("node #57/#47 — root-aware resource lanes", () => {
    expect(r.journal.laneHolder("headless")?.repo).toBe(TOOL);
    r.journal.updateWorker("90", TOOL, { lane: "research" });
    expect(r.journal.laneHolder("headless")).toBeNull();
+  } finally { r.close(); }
+ });
+
+ test("laneSlots lets a lane hold that many workers before it reports a holder", () => {
+  const r = rig(10, { headless: 2 });
+  try {
+   expect(r.config.workers.laneSlots).toEqual({ visual: 1, headless: 2 });
+   r.journal.upsertWorker({ root: 1, nodeId: "90", repo: TOOL, status: "running", lane: "implement" });
+   expect(r.journal.laneHolder("headless")).toBeNull();
+   r.journal.upsertWorker({ root: 1, nodeId: "91", repo: TOOL, status: "claimed", lane: "implement" });
+   expect(r.journal.laneHolder("headless")?.nodeId).toBe("90");
+   expect(r.journal.laneHolder("headless", { nodeId: "90", repo: TOOL })).toBeNull();
+   expect(r.journal.laneHolder("visual")).toBeNull();
+  } finally { r.close(); }
+ });
+
+ test("walk fills a second headless slot beside a running headless worker", async () => {
+  const r = rig(10, { headless: 2 });
+  try {
+   r.journal.upsertWorker({ root: 1, nodeId: "90", repo: TOOL, status: "running", lane: "implement" });
+   const out = await runCli(["walk", "-c", r.configPath], r.env);
+   expect(out.code).toBe(0);
+   const result = JSON.parse(out.stdout);
+   expect(result.maps.map((m: { claimed: string[] }) => m.claimed)).toEqual([["10"], ["20"], []]);
+  } finally { r.close(); }
+ });
+
+ test("one headless slot keeps the running worker exclusive", async () => {
+  const r = rig();
+  try {
+   r.journal.upsertWorker({ root: 1, nodeId: "90", repo: TOOL, status: "running", lane: "implement" });
+   const out = await runCli(["walk", "-c", r.configPath], r.env);
+   expect(out.code).toBe(0);
+   const result = JSON.parse(out.stdout);
+   expect(result.maps.map((m: { claimed: string[] }) => m.claimed)).toEqual([["10"], [], []]);
   } finally { r.close(); }
  });
 

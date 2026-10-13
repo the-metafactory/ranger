@@ -78,7 +78,7 @@ describe("resolveReadOnlyToken", () => {
     bot: {},
     principal: { login: "jcfischer" },
     state: { journalPath: ":memory:", canonicalRoot: "/tmp/ranger-repos", legacyMapRoots: {} },
-    workers: { spawnCapPerDay: 10, wallClockMin: 90, maxAttempts: 2, probeRequeues: 2, deadmanThreshold: 3, reviewRounds: 2, maxBehindBase: 20, noCiGraceMin: 30, niceness: 10 },
+    workers: { spawnCapPerDay: 10, laneSlots: { visual: 1, headless: 1 }, wallClockMin: 90, maxAttempts: 2, probeRequeues: 2, deadmanThreshold: 3, reviewRounds: 2, maxBehindBase: 20, noCiGraceMin: 30, niceness: 10 },
   budget: { graphqlFloor: 1000, rateLimitCooldownMin: 10, frontierMaxAgeMin: 60 },
   ratify: { readsPerTick: 10 },
   intake: { model: "haiku" },
