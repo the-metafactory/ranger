@@ -292,6 +292,19 @@ bun src/cli.ts journal                    # inspect workers/events/health
   identity check or marker lookup files nothing that tick; a 👍 from anyone
   else is ignored. The tracker's node and marker are the binding record; the
   journal is a cache.
+- **Intake corrections (node #241, #21 ruling D13):** the principal replies
+  to the current draft card with a bot @-mention naming changes, e.g.
+  "parent #40, kind build". Claude applies the reply to the previous spec;
+  when it cannot, `parent #N`, `kind <k>`, `autonomy <a>`, `title: <text>`
+  and `checkpoint <slug>` are read off it, and a field not understood keeps
+  its previous value and the card says so. Ranger posts a new draft card
+  (a reply to the correction) with the corrected spec and its own spec hash,
+  and edits the old card to "superseded → <link>"; the old row goes
+  `superseding` → `superseded` and its reactions are never read again, so
+  only a 👍 on the newest card files. The chain keeps the mention's body,
+  link and marker: one observation files at most one node. A reply to a
+  superseded, filed or discarded card, a reply by anyone else and a reply
+  without a bot mention change nothing.
 - **Acceptance (e2e):** an auto research node walked end-to-end against fake
   soma/gh/worker fixtures — claim → worktree → findings branch pushed → draft
   PR → successful CI citation → gated close → `decisions --write`. Live close
