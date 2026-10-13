@@ -272,9 +272,9 @@ workers:
   # Raised to 30 (principal, 2026-10-13).
   spawnCapPerDay: 30
   # Concurrent implement workers per resource lane (default 1 each). Headless
-  # raised to 2 (principal, 2026-10-13); visual stays exclusive (screen/GPU).
+  # raised to 3 (principal, 2026-10-13); visual stays exclusive (screen/GPU).
   laneSlots:
-    headless: 2
+    headless: 3
   # Hard wall clock per worker session, minutes (default 90). Raised to 150
   # (principal, 2026-10-04): seelite #684, a large Traffic build on Codex, was
   # still uncommitted at 80 minutes.
