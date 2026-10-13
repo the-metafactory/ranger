@@ -181,7 +181,14 @@
       "idx": 25,
       "version": "6",
       "when": 1791676800000,
-      "tag": "0025_intake-draft-spec",
+      "tag": "0025_intake-gate",
+      "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "6",
+      "when": 1791763200000,
+      "tag": "0026_intake-draft-spec",
       "breakpoints": true
     }
   ]
