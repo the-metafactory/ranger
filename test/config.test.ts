@@ -161,6 +161,22 @@ describe("loadConfig", () => {
     );
   });
 
+  test("the daily spawn cap is opt-in: unset means no cap", () => {
+    const base = ["version: 1", "maps:", "  - repo: acme/widgets", "    root: 1"];
+    withConfig(base.join("\n"), (path) => {
+      expect(loadConfig(path).config.workers.spawnCapPerDay).toBe(Number.POSITIVE_INFINITY);
+    });
+    withConfig([...base, "workers:", "  spawnCapPerDay: 30"].join("\n"), (path) => {
+      expect(loadConfig(path).config.workers.spawnCapPerDay).toBe(30);
+    });
+    withConfig([...base, "workers:", "  spawnCapPerDay: .inf"].join("\n"), (path) => {
+      expect(loadConfig(path).config.workers.spawnCapPerDay).toBe(Number.POSITIVE_INFINITY);
+    });
+    withConfig([...base, "workers:", "  spawnCapPerDay: 2.5"].join("\n"), (path) => {
+      expect(() => loadConfig(path)).toThrow(ConfigError);
+    });
+  });
+
   test("walk defaults to none", () => {
     withConfig(
       ["version: 1", "maps:", "  - repo: acme/widgets", "    root: 1"].join(

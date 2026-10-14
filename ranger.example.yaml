@@ -116,8 +116,8 @@ state:
   canonicalRoot: ~/work/ranger-repos
 
 workers:
-  # Daily worker-spawn cap — the global spend bound (design §7).
-  spawnCapPerDay: 10
+  # Daily worker-spawn cap (design §7): opt-in, unset means no cap.
+  # spawnCapPerDay: 10
   # Concurrent implement workers per resource lane, across all maps. The
   # walk claims at most one per lane per tick, so a second slot fills next tick.
   laneSlots:
