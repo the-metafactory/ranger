@@ -76,6 +76,18 @@ refusals count as failed starts. Three consecutive failed starts drop the entry
 with an event naming the last error. A successful start removes the entry;
 queueing the node again starts its failure count at zero.
 
+Ranger queues a resume itself when the supervisor's tests fail and their one
+busy-host retry also ran on a busy host, because the quiet-host wait ran out
+first (node #297). This applies to adoption and to the tests after a worker
+pass. No worker session starts and no fix pass runs. The row ends `failed`
+with an outcome that leads with "waiting for a quiet host: load X on N cores"
+and names up to three failing tests. It does not count toward the dead-man
+switch. The entry starts only when the 1-minute load is below the core count.
+On a busy host it waits: no start and no failed start, one `reviewed` event per
+tick. It holds nothing behind it. A retry that started on a quiet host and
+failed is the branch's failure, as before. Operator `--when-free` entries never
+wait on load.
+
 `ranger serve` (node #166) runs these verbs for the principal: Drain/Undrain on
 the visual lane's header (`ranger drain --lane visual [--off]`) and on each
 headless map (`--map`); a visual map shows no drain of its own. A parked or
@@ -85,7 +97,9 @@ verb would queue, and a queued node shows its place and a Cancel
 shows as next, ahead of any frontier claim; the walk's forge check (a closed
 node, a merged PR) and identity gate come after and may still drop or defer it.
 An entry the tick will drop (a `walk: none` map, a row back in flight) shows
-why and holds nothing behind it.
+why and holds nothing behind it. So does a resume queued for load while the
+host is busy ("waiting for a quiet host: load X on N cores"), and its parked
+card's reason class is `host load`.
 An action `serve` refuses (unknown map, no queued entry) shows its error and
 runs nothing. A verb that exits non-zero shows its exit and error. One that
 timed out or never started may already have applied, so reload the page to see.

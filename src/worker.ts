@@ -63,7 +63,8 @@ import { isTransientGitHubError } from "./transient.ts";
 import { BudgetDeferral } from "./budget.ts";
 import { findNodePr, finishClosedElsewhere } from "./closed-elsewhere.ts";
 import type { ForgePort } from "./forge.ts";
-import { ParkSignal } from "./signals.ts";
+import { HostLoadPark, ParkSignal } from "./signals.ts";
+import { implementLane } from "./lanes.ts";
 import { policyBlockedOutcome } from "./outcomes.ts";
 import { assertResearchFindingsOnly, researchCi, type ResearchCiTiming } from "./research-ci.ts";
 import { proposalMarker } from "./ratify.ts";
@@ -707,6 +708,7 @@ async function runImplementNode(
    if (cap === undefined || capped.has(cap.substrate)) break;
    await handleSubstrateCap(ctx, { nodeId, generation, worktree, branch }, cap, outcome, capped);
   } catch (error) {
+   if (error instanceof HostLoadPark) return hostLoadParkRun(ctx, nodeId, node.node.title, error.message);
    if (error instanceof ParkSignal || error instanceof GitSafetyError) {
     return parkRun(ctx, nodeId, node.node.title, error.message);
    }
@@ -765,6 +767,31 @@ async function parkRun(
 }
 
 /**
+ * Supervisor tests that failed, and failed again on a retry that ran on a
+ * busy host (node #297): the run ends `failed` with the outcome naming the
+ * load and the failing tests, and a resume is queued for the map's implement
+ * lane that the walk starts only once the host is quiet. Not counted toward
+ * the dead-man switch: the host failed, not a worker (2026-10-14: three load
+ * flakes tripped it at 4 and stopped the queue until `resume-run`).
+ */
+async function hostLoadParkRun(
+ ctx: RunNodeContext,
+ nodeId: string,
+ title: string,
+ detail: string,
+): Promise<RunNodeOutcome> {
+ const { journal, map } = ctx;
+ const repo = map.repo;
+ journal.recordEvent("parked", { nodeId, repo, detail: detail.slice(0, 400) });
+ finish(journal, nodeId, repo, "failed", detail);
+ journal.enqueueResume({ nodeId, repo, root: map.root, lane: implementLane(map), reason: "host-load" });
+ await parkCard(map, nodeId, title, detail, HOST_LOAD_FOOTER);
+ return { nodeId, repo, status: "failed", detail, workerExit: null };
+}
+
+const HOST_LOAD_FOOTER = "A resume is queued: the walk starts it once the host is quiet and the lane is free. `ranger resume-node` starts it now.";
+
+/**
  * The run-node's start (node #81): ensure the canonical checkout, check its
  * git state against the known-good record before the first git call that
  * carries the write credential, then add the node's worktree and refresh
@@ -809,6 +836,7 @@ export function parkCardText(
  nodeId: string,
  title: string,
  detail: string,
+ footer = "Parked work waits for you: `ranger resume-node`, or take it in a session.",
 ): string {
  return renderCard({
   emoji: "⏸️",
@@ -817,7 +845,7 @@ export function parkCardText(
   title,
   meta: [`map: ${mapKey(map)}`],
   body: detail,
-  footer: ["Parked work waits for you: `ranger resume-node`, or take it in a session."],
+  footer: [footer],
  });
 }
 
@@ -827,10 +855,11 @@ async function parkCard(
  nodeId: string,
  title: string,
  detail: string,
+ footer?: string,
 ): Promise<void> {
  try {
   await DiscordAnnouncer.fromMap(map).post(
-   parkCardText(map, nodeId, title, detail),
+   parkCardText(map, nodeId, title, detail, footer),
    `park card for #${nodeId}`,
   );
  } catch {
