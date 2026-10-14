@@ -1,220 +1,22 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createServer } from "node:net";
-import {
- createEnvelope, validateExecutionRunFinished,
- type ExecutionRunFinishedEvent, type MyelinEnvelope, type RunOutcome,
-} from "@the-metafactory/myelin";
-import { runRunNode, type RunRunNodeDeps } from "../src/cli.ts";
-import { loadConfig } from "../src/config.ts";
+import { validateExecutionRunFinished, type ExecutionRunFinishedEvent, type RunOutcome } from "@the-metafactory/myelin";
+import { runRunNode } from "../src/cli.ts";
 import { nodeKey } from "../src/forge-ref.ts";
-import type { ChangeRequest, ForgePort } from "../src/forge.ts";
+import type { ChangeRequest } from "../src/forge.ts";
 import { WriteGateError } from "../src/identity.ts";
-import { Journal } from "../src/journal.ts";
-import { runLedgerPath, runNodeRunOutcome, type RunLedgerDeps } from "../src/run-ledger.ts";
+import { runNodeRunOutcome } from "../src/run-ledger.ts";
 import type { RunNodeOutcome } from "../src/worker.ts";
 import { workerLogFile } from "../src/worker-log.ts";
+import { AT, cleanup, controlled, deps, failures, fixture, forge, graphFixture, result, spool, valid } from "./run-node-ledger-support.ts";
 import { createCanonicalRepo, fixturesBin, runCli } from "./support.ts";
 
-const AT = "2026-10-14T07:00:00.000Z";
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
-const dirs: string[] = [];
-const savedEnv = new Map<string, string | undefined>();
-function env(key: string, value: string) {
- if (!savedEnv.has(key)) savedEnv.set(key, process.env[key]);
- process.env[key] = value;
-}
-afterEach(() => {
- for (const [key, value] of savedEnv) {
-  if (value === undefined) delete process.env[key];
-  else process.env[key] = value;
- }
- savedEnv.clear();
- for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
-});
-
-function fixture(bus: string | null = "  principal: jc\n", repo = "acme/widgets", row = true) {
- const dir = mkdtempSync(join(tmpdir(), "ranger-node-ledger-"));
- dirs.push(dir);
- const configPath = join(dir, "ranger.yaml");
- writeFileSync(configPath, `maps:\n  - repo: ${repo}\n    root: 1\n    walk: full\nauth:\n  writeTokens:\n    "acme/*": RANGER_WRITE_TEST\nstate:\n  journalPath: ${join(dir, "state.sqlite")}\n${bus === null ? "" : `bus:\n${bus}`}`);
- const config = loadConfig(configPath, {}).config;
- const journal = new Journal(config.state.journalPath);
- if (row) {
-  journal.upsertWorker({ nodeId: "10", repo, root: 1, status: "claimed" });
-  // Prove detail_ref is for a resumed generation rather than hard-coded g1.
-  journal.beginGeneration("10", repo);
- }
- let closed = false;
- const close = journal.close.bind(journal);
- journal.close = () => { closed = true; close(); };
- return { dir, configPath, config, journal, spool: runLedgerPath(config), closed: () => closed };
-}
-type Fixture = ReturnType<typeof fixture>;
-function deps(f: Fixture, ledger: RunLedgerDeps = {}, overrides: RunRunNodeDeps = {}): RunRunNodeDeps {
- return {
-  loadCtx: () => ({ config: f.config, journal: f.journal }),
-  runNodeContext: async () => ({ token: "ghp_write", botIdentity: "ivy-bot" }),
-  now: () => new Date(AT),
-  ledger: { env: {}, ...ledger },
-  ...overrides,
- };
-}
-function result(status: RunNodeOutcome["status"]): RunNodeOutcome {
- return { nodeId: "10", repo: "acme/widgets", status, detail: "unchanged outcome", workerExit: null };
-}
-function controlled(status: RunNodeOutcome["status"]): RunRunNodeDeps["runNode"] {
- return async (id, ctx) => {
-  if (ctx.journal.getWorker(id, ctx.map.repo) === null) {
-   ctx.journal.upsertWorker({ nodeId: id, repo: ctx.map.repo, root: ctx.map.root, status: "running" });
-  }
-  ctx.journal.beginGeneration(id, ctx.map.repo);
-  return { ...result(status), repo: ctx.map.repo };
- };
-}
-function valid(event: ExecutionRunFinishedEvent, outcome: RunOutcome) {
- const envelope = createEnvelope({ ...event.input, sovereignty: event.input.sovereignty as MyelinEnvelope["sovereignty"] });
- expect(validateExecutionRunFinished(envelope)).toEqual({ valid: true, errors: [] });
- expect(event.input.payload.outcome).toBe(outcome);
- expect(event.input.payload.run_id).toMatch(UUID);
- expect(event.input.payload).not.toHaveProperty("state");
- expect(envelope).not.toHaveProperty("state");
-}
-function failures(f: Fixture) {
- const journal = new Journal(f.journal.path);
- try { return journal.listEvents().filter(event => event.kind === "ledger-failed"); }
- finally { journal.close(); }
-}
-function spool(f: Fixture): { op: string; envelope: MyelinEnvelope }[] {
- return readFileSync(f.spool, "utf8").trim().split("\n").map(line => JSON.parse(line));
-}
-function graphFixture(f: Fixture, options: { kind?: string; autonomy?: string; status?: string } = {}) {
- const data = join(import.meta.dir, "fixtures", "data");
- copyFileSync(join(data, "acme__widgets-node-1.json"), join(f.dir, "acme__widgets-node-1.json"));
- const node = JSON.parse(readFileSync(join(data, "acme__widgets-node-10.json"), "utf8"));
- writeFileSync(join(f.dir, "acme__widgets-node-10.json"), JSON.stringify({
-  ...node, status: options.status ?? "open",
-  node: { ...node.node, kind: options.kind ?? "task", autonomy: options.autonomy ?? "auto" },
- }));
- env("PATH", `${fixturesBin}:${process.env.PATH ?? ""}`);
- env("FAKE_SOMA_DIR", f.dir);
-}
-function forge(findPrByHead: ForgePort["findPrByHead"]): ForgePort {
- const unexpected = async (): Promise<never> => { throw new Error("unexpected forge call"); };
- return {
-  findPrByHead, getPr: unexpected, ciVerdictFor: unexpected, issueLabels: unexpected,
-  listComments: unexpected, createDraftPr: unexpected, updatePrBody: unexpected,
-  markReady: unexpected, postComment: unexpected, mergePr: unexpected,
- };
-}
+afterEach(cleanup);
 
 describe("run-node run ledger", () => {
- for (const [rootGoal, fallback, expected] of [
-  ["G5", undefined, "G5"], ["G5", "G7", "G5"],
-  [undefined, "G7", "G7"], [undefined, undefined, undefined],
-  ["invalid", "G7", "G7"], ["G5\n", undefined, undefined],
-  [7, "G7", "G7"], [null, undefined, undefined],
- ] as const) {
-  test(`root serves ${JSON.stringify(rootGoal)} precedes fallback ${fallback}`, async () => {
-   const f = fixture();
-   graphFixture(f, { kind: "grilling" });
-   const rootPath = join(f.dir, "acme__widgets-node-1.json");
-   const root = JSON.parse(readFileSync(rootPath, "utf8"));
-   root.node.serves = rootGoal;
-   writeFileSync(rootPath, JSON.stringify(root));
-   const nodePath = join(f.dir, "acme__widgets-node-10.json");
-   const node = JSON.parse(readFileSync(nodePath, "utf8"));
-   node.node.serves = "G99";
-   writeFileSync(nodePath, JSON.stringify(node));
-   const calls = join(f.dir, "graph-calls");
-   env("FAKE_SOMA_CALLS", calls);
-   const events: ExecutionRunFinishedEvent[] = [];
-   const output = await runRunNode("10", undefined, f.configPath, deps(f, {
-    env: { MF_SERVES_GOAL: fallback }, publisher: async event => { events.push(event); },
-   }));
-   expect(JSON.parse(output).status).toBe("refused");
-   expect(events).toHaveLength(1);
-   valid(events[0], "blocked");
-   expect(events[0].input.payload.serves).toEqual({ node: "acme/widgets#10", ...(expected ? { goal: expected } : {}) });
-   // The node and root are the only reads: publication reuses the root.
-   expect(readFileSync(calls, "utf8").trim().split("\n")).toHaveLength(2);
-   const journal = new Journal(f.journal.path);
-   try {
-    const diagnostics = journal.listEvents().filter(event => event.kind === "ledger-root-serves-invalid");
-    expect(diagnostics).toHaveLength(rootGoal !== undefined && rootGoal !== "G5" ? 1 : 0);
-    if (diagnostics.length) expect(diagnostics[0]).toMatchObject({ repo: "acme/widgets", nodeId: "1", detail: expect.stringContaining("acme/widgets#1") });
-   } finally { journal.close(); }
-  });
- }
-
- test("unreadable root preserves real CLI output and exit code and publishes fallback", async () => {
-  const outputs = [];
-  for (const bus of [null, "  principal: jc\n"] as const) {
-   const f = fixture(bus);
-   graphFixture(f, { kind: "grilling" });
-   rmSync(join(f.dir, "acme__widgets-node-1.json"));
-   f.journal.close();
-   const output = await runCli(["run-node", "10", "-c", f.configPath], {
-    ...process.env, RANGER_WRITE_TEST: "ghp_write", MF_SERVES_GOAL: "G7",
-    RANGER_JOURNAL_PATH: f.journal.path,
-   }, f.dir);
-   expect(output.code).toBe(0);
-   expect(JSON.parse(output.stdout).status).toBe("failed");
-   // The fake's error includes this run's temporary fixture directory.
-   outputs.push({ ...output, stdout: output.stdout.replaceAll(f.dir, "FIXTURE") });
-   if (bus !== null) {
-    const puts = spool(f).filter(op => op.op === "put");
-    expect(puts).toHaveLength(1);
-    expect(puts[0].envelope.payload.serves).toEqual({ node: "acme/widgets#10", goal: "G7" });
-   }
-  }
-  expect(outputs[0]).toEqual(outputs[1]);
- });
-
- test("root metadata survives a later worker exception without replacing it", async () => {
-  const f = fixture();
-  const root = JSON.parse(readFileSync(join(import.meta.dir, "fixtures/data/acme__widgets-node-1.json"), "utf8"));
-  root.node.serves = "G5";
-  const error = new Error("worker failed after root read");
-  const events: ExecutionRunFinishedEvent[] = [];
-  await expect(runRunNode("10", undefined, f.configPath, deps(f, {
-   env: { MF_SERVES_GOAL: "G7" }, publisher: async event => { events.push(event); },
-  }, {
-   runNode: async (id, ctx) => {
-    ctx.journal.beginGeneration(id, ctx.map.repo);
-    ctx.onMapRootRead?.(root);
-    throw error;
-   },
-  }))).rejects.toBe(error);
-  expect(events).toHaveLength(1);
-  valid(events[0], "failed");
-  expect(events[0].input.payload.serves).toEqual({ node: "acme/widgets#10", goal: "G5" });
- });
-
- test("malformed-root diagnostic failure still publishes fallback and preserves output", async () => {
-  const f = fixture();
-  graphFixture(f, { kind: "grilling" });
-  const rootPath = join(f.dir, "acme__widgets-node-1.json");
-  const root = JSON.parse(readFileSync(rootPath, "utf8"));
-  root.node.serves = "private malformed text";
-  writeFileSync(rootPath, JSON.stringify(root));
-  const recordEvent = f.journal.recordEvent.bind(f.journal);
-  f.journal.recordEvent = (kind, opts) => {
-   if (kind === "ledger-root-serves-invalid") throw new Error("journal diagnostic unavailable");
-   recordEvent(kind, opts);
-  };
-  const events: ExecutionRunFinishedEvent[] = [];
-  const output = await runRunNode("10", undefined, f.configPath, deps(f, {
-   env: { MF_SERVES_GOAL: "G7" }, publisher: async event => { events.push(event); },
-  }));
-  expect(JSON.parse(output).status).toBe("refused");
-  expect(events).toHaveLength(1);
-  expect(events[0].input.payload.serves).toEqual({ node: "acme/widgets#10", goal: "G7" });
- });
-
  const mappings: [RunNodeOutcome["status"], RunOutcome | null][] = [
   ["success", "succeeded"], ["failed", "failed"], ["parked", "blocked"],
   ["released", "cancelled"], ["awaiting-merge", "succeeded"], ["proposed", "succeeded"],
