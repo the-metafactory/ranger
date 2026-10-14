@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { journalKeyFor } from "./forge-ref.ts";
 import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, lt, or, sql } from "drizzle-orm";
 import { openDb, openDbReadOnly, type RangerDb } from "./store/db.ts";
@@ -513,7 +514,7 @@ export class Journal {
   */
  enqueueJobRun(name: string, lane: ImplementLane, now = new Date()): { run: JobRunRow; queued: boolean } {
   return this.db.transaction(() => {
-   const inserted = this.db.insert(jobRuns).values({ name, lane, status: "queued", queuedAt: now.toISOString() })
+   const inserted = this.db.insert(jobRuns).values({ runUuid: randomUUID(), name, lane, status: "queued", queuedAt: now.toISOString() })
     .onConflictDoNothing().returning().get();
    if (inserted !== undefined) {
     this.recordEvent("job-queued", { detail: `job ${name} queued for the ${lane} lane (run ${inserted.id})` });
@@ -550,6 +551,18 @@ export class Journal {
 
  getJobRun(id: number): JobRunRow | null {
   return this.db.select().from(jobRuns).where(eq(jobRuns.id, id)).get() ?? null;
+ }
+
+ /**
+  * Take a running run as its supervisor: only when no pid is recorded or the
+  * recorded one is this process (the tick writes the child's pid). A second
+  * `ranger job run <id>` is refused rather than starting a second session.
+  */
+ claimJobRun(id: number, pid: number): boolean {
+  const rows = this.db.update(jobRuns).set({ pid })
+   .where(and(eq(jobRuns.id, id), eq(jobRuns.status, "running"), or(isNull(jobRuns.pid), eq(jobRuns.pid, pid))))
+   .returning({ id: jobRuns.id }).all();
+  return rows.length > 0;
  }
 
  /**

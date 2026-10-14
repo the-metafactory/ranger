@@ -190,21 +190,22 @@ export function ledgerResultRef(result: string | null | undefined, outcome: RunO
 }
 
 /**
- * One envelope per finished job run (node #301): the job name is `ran.ref`,
+ * One envelope per finished job run (node #301), `run_id` fixed at enqueue: the job name is `ran.ref`,
  * the session log the `detail_ref`. The envelope has no free text, so why a
  * run failed (budget, exit, crash) stays in the journal row.
  */
 export async function emitJobRunFinished(
  config: RangerConfig,
  journal: Pick<Journal, "recordEvent">,
- run: { name: string; startedAt: string; endedAt: string; outcome: RunOutcome; result?: string | null; log?: string | null },
+ run: { runUuid: string; name: string; startedAt: string; endedAt: string; outcome: RunOutcome; result?: string | null; log?: string | null },
  deps: RunLedgerDeps = {},
 ): Promise<void> {
  return emitRunFinished(config, journal, env => {
   const goal = env.MF_SERVES_GOAL || undefined;
   const resultRef = ledgerResultRef(run.result, run.outcome);
   return [{
-   run_id: randomUUID(),
+   // The run's own id, so a repeat after a crash is the same run to a consumer.
+   run_id: run.runUuid,
    producer: "ranger",
    ran: { kind: "job", ref: run.name },
    outcome: run.outcome,

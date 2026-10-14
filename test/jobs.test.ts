@@ -275,6 +275,29 @@ describe("node #301 — scheduled jobs", () => {
   expect(r.envelopes).toHaveLength(1);
  });
 
+ test("a second supervisor for a run another live process supervises is refused, and starts no session", async () => {
+  const r = rig();
+  const runId = await startedRun(r);
+  // The tick recorded a different, live supervisor (this test runner's parent).
+  r.journal.updateJobRun(runId, "running", { pid: process.ppid });
+  const s = session();
+  const outcome = await runJob(runId, { config: r.config, journal: r.journal, substrate: "claude", runSession: s.runSession, ledger: r.ledger });
+  expect(outcome).toMatchObject({ status: "refused" });
+  expect(s.calls).toHaveLength(0);
+  expect(r.journal.getJobRun(runId)).toMatchObject({ status: "running", pid: process.ppid });
+ });
+
+ test("an envelope repeated after a crash carries the run's own run_id", async () => {
+  const r = rig();
+  const runId = await startedRun(r);
+  await runJob(runId, { config: r.config, journal: r.journal, substrate: "claude", runSession: session().runSession, ledger: r.ledger });
+  const uuid = r.journal.getJobRun(runId)!.runUuid;
+  // The supervisor emitted, then died before marking the run reported.
+  r.journal.updateJobRun(runId, "succeeded", { reportedAt: null, pid: 2_147_483_000 });
+  await jobPass({ config: r.config, configPath: r.configPath, journal: r.journal, spawnJob: spawner().spawnJob, ledger: r.ledger });
+  expect(r.envelopes.map(e => e.input.payload.run_id)).toEqual([uuid, uuid]);
+ });
+
  test("a completed run is marked reported", async () => {
   const r = rig();
   const runId = await startedRun(r);

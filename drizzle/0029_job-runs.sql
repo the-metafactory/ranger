@@ -1,5 +1,5 @@
 -- Scheduled job runs (node #301). At most one queued run per job name.
-CREATE TABLE job_runs (id integer PRIMARY KEY AUTOINCREMENT NOT NULL, name text NOT NULL,
+CREATE TABLE job_runs (id integer PRIMARY KEY AUTOINCREMENT NOT NULL, run_uuid text NOT NULL, name text NOT NULL,
 lane text NOT NULL, status text DEFAULT 'queued' NOT NULL, queued_at text NOT NULL,
 started_at text, finished_at text, pid integer, pgid integer, substrate text,
 reason text, result text, log text, reported_at text);

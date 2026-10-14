@@ -124,14 +124,15 @@ export function emptyJobPass(): JobPassResult {
  * Hand a finished run's one envelope to the ledger, then mark it reported.
  * The terminal status is committed first, so a process cut off between the
  * two leaves an unreported finished row that `sweepJobs` reports later:
- * the envelope is never lost, and only that window can repeat it.
+ * the envelope is never lost. Only a crash between the emit and the mark
+ * repeats it, and the repeat carries the same `run_id`.
  */
 async function reportRun(ctx: Pick<JobPassContext, "config" | "journal" | "ledger">, id: number): Promise<void> {
  const run = ctx.journal.getJobRun(id);
  if (run === null || run.reportedAt !== null || (run.status !== "succeeded" && run.status !== "failed")) return;
  const outcome: RunOutcome = run.status;
  await emitJobRunFinished(ctx.config, ctx.journal, {
-  name: run.name, startedAt: run.startedAt ?? run.queuedAt, endedAt: run.finishedAt ?? run.queuedAt,
+  runUuid: run.runUuid, name: run.name, startedAt: run.startedAt ?? run.queuedAt, endedAt: run.finishedAt ?? run.queuedAt,
   outcome, result: run.result, log: run.log,
  }, ctx.ledger);
  ctx.journal.updateJobRun(id, run.status, { reportedAt: new Date().toISOString() });
@@ -319,7 +320,9 @@ export async function runJob(runId: number, ctx: RunJobContext): Promise<RunJobO
  if (run === null || run.status !== "running") {
   return { runId, name: run?.name ?? "?", status: "refused", reason: run === null ? "no such run" : `run is ${run.status}, not running` };
  }
- journal.updateJobRun(runId, "running", { pid: process.pid });
+ if (!journal.claimJobRun(runId, process.pid)) {
+  return { runId, name: run.name, status: "refused", reason: `run is supervised by pid ${run.pid}` };
+ }
  let job: RangerJobConfig;
  try {
   job = findJob(config, run.name);
