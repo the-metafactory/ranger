@@ -66,7 +66,8 @@ import { Journal, vetoApplies, type LaneHolder, type ResumeQueueRow, type Worker
 import { ForeignMigrationError } from "./journal-guard.ts";
 import { IMPLEMENT_LANES, implementLane, workerLane, type ImplementLane } from "./lanes.ts";
 import { activeCooldown, cooldownScope, readGraphqlBudget } from "./budget.ts";
-import { queueEntryGate, queueSpawnGate } from "./resume.ts";
+import { queueEntryGate, queueSpawnGate, quietHostGate } from "./resume.ts";
+import { realHostLoad, type HostLoad, type HostLoadReading } from "./host-load.ts";
 import { cachedFrontier } from "./frontier-cache.ts";
 import { cachedRootAuthor } from "./root-author.ts";
 import { type FrontierEntry, graphFrontier, RateLimitError } from "./graph.ts";
@@ -215,6 +216,8 @@ export interface StateInputs {
  awaitingMerge?: NeedsYouEntry[];
  /** The journal's resume queue, every lane, FIFO (node #166); absent means empty. */
  resumeQueue?: ResumeQueueRow[];
+ /** This host's load now: a resume queued for load waits while it is busy (node #297); absent never waits. */
+ hostLoad?: HostLoadReading;
 }
 
 /** One lane's queued resumes, FIFO, and what the next tick does with them. */
@@ -227,6 +230,8 @@ export interface LaneQueue {
  head: { repo: string; nodeId: string; starts: boolean; reason: string } | null;
  /** Entries the next tick drops from the queue; they hold nothing behind them. */
  drops: { repo: string; nodeId: string; reason: string }[];
+ /** Resumes queued for load that wait for a quiet host (node #297); they hold nothing behind them. */
+ waits: { repo: string; nodeId: string; reason: string }[];
 }
 
 /** An awaiting-merge row that may need the principal's eye; its labels are unknown. */
@@ -392,7 +397,7 @@ function planQueueHeads(
  tick: TickSoFar,
 ): Record<ImplementLane, LaneQueue> {
  const out = Object.fromEntries(
-  IMPLEMENT_LANES.map((lane): [ImplementLane, LaneQueue] => [lane, { entries: views[lane], head: null, drops: [] }]),
+  IMPLEMENT_LANES.map((lane): [ImplementLane, LaneQueue] => [lane, { entries: views[lane], head: null, drops: [], waits: [] }]),
  ) as Record<ImplementLane, LaneQueue>;
  for (const entry of queue) {
   const lane = out[entry.lane];
@@ -412,6 +417,11 @@ function planQueueHeads(
    : queueSpawnGate({ paused: inputs.paused, lane: entry.lane, holder, spawns: tick.spawns, cap: inputs.spawnCap });
   if (held !== null) {
    lane.head = { ...at, starts: false, reason: held };
+   continue;
+  }
+  const busy = quietHostGate(entry, inputs.hostLoad);
+  if (busy !== null) {
+   lane.waits.push({ ...at, reason: busy });
    continue;
   }
   tick.holders[entry.lane] = { repo: key, nodeId: entry.nodeId, thisTick: true, resumed: true };
@@ -1172,7 +1182,8 @@ function laneQueue(s, lane) {
   el("ul", {}, ...q.entries.map((e, i) => {
    const head = q.head && q.head.repo === e.repo && q.head.nodeId === e.nodeId ? q.head : null;
    const drop = (q.drops || []).find((d) => d.repo === e.repo && d.nodeId === e.nodeId);
-   const note = head ? head.reason : drop ? drop.reason : "";
+   const wait = (q.waits || []).find((d) => d.repo === e.repo && d.nodeId === e.nodeId);
+   const note = head ? head.reason : drop ? drop.reason : wait ? wait.reason : "";
    const facts = ordinal(e.position) + " in the " + lane + " resume queue · " + e.key + " · queued " + ago(e.queuedAt) + (e.failedStarts ? " · " + e.failedStarts + " failed start(s)" : "") + (note ? " · " + note : "");
    // A queued node may have no Needs-you card, so its last cancel shows here.
    const last = results.get(e.key + "/" + e.nodeId);
@@ -1940,6 +1951,7 @@ export function stateFromJournal(
  maps: ServeMap[],
  reader: ServeReader,
  now = new Date(),
+ hostLoad: HostLoad = realHostLoad,
 ): DashboardState {
  const journal = Journal.openReadOnly(expandHome(config.state.journalPath), config.maps, config.workers.laneSlots);
  try {
@@ -2038,6 +2050,7 @@ export function stateFromJournal(
    drains: journal === null ? undefined : readDrains(journal, config.maps),
    spawnsToday: journal?.spawnsToday(now) ?? 0,
    spawnCap: config.workers.spawnCapPerDay,
+   hostLoad: hostLoad(),
    vetoed: (id, repo) => vetoes.some((v) => vetoApplies(v, id, repo)),
    pidAlive: defaultPidAlive,
    refreshing: reader.refreshing,

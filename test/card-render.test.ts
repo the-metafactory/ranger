@@ -236,6 +236,11 @@ describe("node #239 — every poster renders through the one renderer", () => {
     );
   });
 
+  test("a host-load park card says what it waits for (node #297)", () => {
+    const card = parkCardText(MAP, "21", "Build it", "waiting for a quiet host: load 14.0 on 10 cores — the tests failed", "A resume is queued.");
+    expect(card).toBe("⏸️ parked · **#21** Build it\n-# map: acme/widgets#1\nwaiting for a quiet host: load 14.0 on 10 cores — the tests failed\nA resume is queued.");
+  });
+
   test("the claim announce", async () => {
     let content = "";
     const fetchFn = (async (_url: string, init: RequestInit) => {

@@ -259,7 +259,15 @@ export interface ResumeQueueRow {
  lane: ImplementLane;
  queuedAt: string;
  failedStarts: number;
+ /**
+  * Why ranger queued it: "host-load" (node #297) starts only on a quiet host;
+  * null or absent is an operator's `resume-node --when-free`, which waits only for its lane.
+  */
+ reason?: ResumeReason | null;
 }
+
+/** A resume ranger queued itself: supervisor tests that failed twice on a busy host (node #297). */
+export type ResumeReason = "host-load";
 
 export type EventKind =
  | "ledger-failed"
@@ -599,12 +607,13 @@ export class Journal {
 
  // ---- queued resumes ----
 
- enqueueResume(entry: Omit<ResumeQueueRow, "id" | "queuedAt" | "failedStarts">, now = new Date()): ResumeQueueRow {
+ enqueueResume(entry: Omit<ResumeQueueRow, "id" | "queuedAt" | "failedStarts" | "reason"> & { reason?: ResumeReason }, now = new Date()): ResumeQueueRow {
   return this.db.transaction(() => {
-   const inserted = this.db.insert(resumeQueue).values({ ...entry, queuedAt: now.toISOString() })
+   const inserted = this.db.insert(resumeQueue).values({ ...entry, reason: entry.reason ?? null, queuedAt: now.toISOString() })
     .onConflictDoNothing({ target: [resumeQueue.repo, resumeQueue.nodeId] }).returning().get();
    if (inserted !== undefined) {
-    this.recordEvent("resume-queued", { nodeId: entry.nodeId, repo: entry.repo, detail: `resume-node queued for the ${entry.lane} implement lane (map root ${entry.root})` });
+    const why = entry.reason === "host-load" ? ", to start once the host is quiet" : "";
+    this.recordEvent("resume-queued", { nodeId: entry.nodeId, repo: entry.repo, detail: `resume-node queued for the ${entry.lane} implement lane (map root ${entry.root})${why}` });
     return inserted;
    }
    return this.db.select().from(resumeQueue)

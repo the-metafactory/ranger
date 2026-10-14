@@ -99,7 +99,7 @@ describe("node #166 — the resume queue on the dashboard, and its head ahead of
 
  test("an empty queue changes nothing: the frontier claim is next", () => {
   const state = assembleState(inputs());
-  expect(state.resumeQueue).toEqual({ visual: { entries: [], head: null, drops: [] }, headless: { entries: [], head: null, drops: [] } });
+  expect(state.resumeQueue).toEqual({ visual: { entries: [], head: null, drops: [], waits: [] }, headless: { entries: [], head: null, drops: [], waits: [] } });
   expect(state.maps[0].next).toMatchObject({ nodeId: "10", waiting: false });
  });
 

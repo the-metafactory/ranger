@@ -1,5 +1,6 @@
 import { implementLane, type ImplementLane } from "./lanes.ts";
 import { processResumeQueue } from "./resume.ts";
+import type { HostLoad } from "./host-load.ts";
 import { graphReadToken, laneCredentialRefusal, lanePort, type ReadGate } from "./forge-lanes.ts";
 import { GateError, tokenBatch, type ResolvedToken } from "./token-gate.ts";
 import { lastImplementMaps, recordImplementStart, mapKey, implementMapOrder, readDrains } from "./maps.ts";
@@ -106,6 +107,8 @@ export interface WalkContext {
  intakeClient?: IntakeContext["clientFor"];
  /** The intake drafter's one-shot `claude -p` runner (tests inject a fake). */
  intakeClaude?: IntakeContext["claude"];
+ /** The host load a resume queued for load waits on (node #297; tests inject a quiet or busy host). */
+ hostLoad?: HostLoad;
  /** Detached `ranger job run` spawner (node #301) — tests inject a recorder. */
  spawnJob?: (args: SpawnJobArgs) => Promise<number | null>;
 }

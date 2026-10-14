@@ -5,7 +5,7 @@ import type { ResolvedToken } from "./token-gate.ts";
 import { changeRequestLabel, changeRequestNoun, changeRequestUrl, ciRunNoun, ciRunText, forgeName } from "./forge-text.ts";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
-import { availableParallelism, loadavg, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { DiscordAnnouncer } from "./announce.ts";
 import { code, renderCard } from "./card-render.ts";
@@ -32,7 +32,8 @@ import {
 import { recordKnownGood, trustedSnapshot } from "./git-trust.ts";
 import * as gh from "./github.ts";
 import type { IssueComment, ChangeRequest, ForgePort, CiFailedRun, CiVerdict } from "./forge.ts";
-import { ParkSignal } from "./signals.ts";
+import { HostLoadPark, ParkSignal } from "./signals.ts";
+import { isQuiet, realHostLoad, type HostLoad, type HostLoadReading } from "./host-load.ts";
 import { isTransientGitHubError } from "./transient.ts";
 import {
  PROBE_FILE,
@@ -47,6 +48,7 @@ import {
  policyBlockedOutcome,
  probesFailedOutcome,
  gitlabReviewHoldOutcome,
+ hostLoadOutcome,
  reviewCapHeadMovedOutcome,
  reviewCapOutcome,
  substrateCappedOutcome,
@@ -585,9 +587,7 @@ async function probeFinalHead(
 }
 
 /** The host's 1-minute load and core count: the probe tier waits for a quiet host. */
-export type HostLoad = () => { load: number; cores: number };
-
-const realHostLoad: HostLoad = () => ({ load: loadavg()[0], cores: availableParallelism() });
+export type { HostLoad } from "./host-load.ts";
 
 /** How long a probe run waits for the host to quiet down before running anyway. */
 const QUIET_HOST = { pollMs: 30_000, maxMs: 20 * 60_000 };
@@ -599,12 +599,13 @@ const QUIET_HOST = { pollMs: 30_000, maxMs: 20 * 60_000 };
  * 28.6 on 10 cores during node 58's fix pass, and the immediate retry ran
  * under the same load; one quiet run passed the same head). After `maxMs`
  * the run goes ahead anyway: a busy host delays the probe tier, never stops it.
+ * Returns the last reading: what the host was when the run started.
  */
-async function awaitQuietHost(ctx: ImplementContext, run: string): Promise<void> {
+async function awaitQuietHost(ctx: ImplementContext, run: string): Promise<HostLoadReading> {
  const read = ctx.hostLoad ?? realHostLoad;
  const { pollMs, maxMs } = ctx.quietHost ?? QUIET_HOST;
  let host = read();
- if (host.load < host.cores) return;
+ if (isQuiet(host)) return host;
  const nodeId = ctx.node.ref.id;
  const repo = ctx.map.repo;
  const started = Date.now();
@@ -626,6 +627,7 @@ async function awaitQuietHost(ctx: ImplementContext, run: string): Promise<void>
     ? `${run} starts after ${waited}s: load ${host.load.toFixed(1)} on ${host.cores} cores`
     : `${run} starts on a busy host after ${waited}s: load ${host.load.toFixed(1)} on ${host.cores} cores`,
  });
+ return host;
 }
 
 export interface BaseProbeResult {
@@ -2273,7 +2275,11 @@ async function checkedWorkerPass(
    `worker left ${dirty.length} uncommitted or untracked file(s) (${dirty.slice(0, 5).join("; ")}) — the tests would not test what gets pushed`,
   );
  }
- const { tests, retried, baseRed } = await supervisorTests(ctx, testCommand, pass, baseTip);
+ const { tests, retried, baseRed, busy } = await supervisorTests(ctx, testCommand, pass, baseTip);
+ // The retry ran on a busy host too and failed: the host's failure, not the
+ // branch's. No fix pass, no failed node: the run parks and a resume waits
+ // for a quiet host (node #297); the resume adopts this pass's commits.
+ if (tests.code !== 0 && busy !== undefined) throw hostLoadPark(busy, `the supervisor's tests (${testCommand}) after the ${pass}`, tests);
  if (tests.code !== 0 && baseRed === undefined) return fail(testsFailedDetail(testCommand, tests, "after the worker"));
  if (retried || baseRed !== undefined) {
   // The pass was certified in a fresh clone, or its failures are the base's:
@@ -2767,13 +2773,20 @@ function testsFailedDetail(testCommand: string, tests: RunResult, after: string)
  * other steps pass on their own, they are the base's, and `baseRed` says the
  * pass goes on as if the tests passed (the receipts say it did not). `tests`
  * is always the branch's own run.
+ *
+ * A retry that ran validly but started on a busy host (the quiet-host wait
+ * ran out) and failed sets `busy` to the load it started at, and gets no
+ * merge-base run: a second run under the same load is no evidence about the
+ * branch, and a base run on that host would be none about the base (node
+ * #297: every failure across four such runs on cortex #2557 was a 4–5 s
+ * timeout at load 58–108 on 10 cores; the same head passed 11494/0 alone).
  */
 async function supervisorTests(
  ctx: ImplementContext,
  testCommand: string,
  label: string,
  baseTip: string | null,
-): Promise<{ tests: RunResult; retried: boolean; baseRed?: BaseRedTests }> {
+): Promise<{ tests: RunResult; retried: boolean; baseRed?: BaseRedTests; busy?: HostLoadReading }> {
  const { journal, map, node, worktree } = ctx;
  const head = await headSha(worktree);
  let tests = await backendTests(ctx, head, () => runShell(testCommand, worktree, ctx, { label: `${label}: supervisor tests`, timeoutMs: TEST_TIMEOUT_MS, measureCpu: true }));
@@ -2800,6 +2813,7 @@ async function supervisorTests(
   journal.recordEvent("reviewed", { nodeId: node.ref.id, repo: map.repo, detail: `tests (${testCommand}) passed on the retry in a fresh checkout` });
   return { tests, retried: true };
  }
+ if (retry.busy !== null) return { tests, retried: false, busy: retry.busy };
  return { tests, retried: false, ...await baseRedAt(ctx, { testCommand, tests, head, label, baseTip }) };
 }
 
@@ -2973,7 +2987,9 @@ async function mergeBaseInFreshClone(ctx: ImplementContext, head: string, baseTi
  * install and the tests once more in a fresh clone of `sha`. Null when the
  * host is not busy: no retry. `ran` is freshCheckoutTests' own: false when
  * the retry's clone, install or checkout check failed (or the local run never
- * happened), so its result is no evidence.
+ * happened), so its result is no evidence. `busy` is the load the retry
+ * started at when the quiet-host wait ran out first, else null: a busy
+ * retry's failure is the host's, not the branch's (node #297).
  */
 async function retryOnBusyHost(
  ctx: ImplementContext,
@@ -2982,15 +2998,15 @@ async function retryOnBusyHost(
  what: string,
  run: string,
  label: string,
-): Promise<{ ran: boolean; result: RunResult } | null> {
+): Promise<{ ran: boolean; result: RunResult; busy: HostLoadReading | null } | null> {
  const host = (ctx.hostLoad ?? realHostLoad)();
- if (host.load < host.cores) return null;
+ if (isQuiet(host)) return null;
  ctx.journal.recordEvent("reviewed", {
   nodeId: ctx.node.ref.id,
   repo: ctx.map.repo,
   detail: `${what} failed on a busy host (load ${host.load.toFixed(1)} on ${host.cores} cores) — retrying once, in a fresh checkout of ${sha.slice(0, 8)}, when it quiets`,
  });
- await awaitQuietHost(ctx, run);
+ const started = await awaitQuietHost(ctx, run);
  let ran = false;
  const local = async () => {
   const fresh = await freshCheckoutTests(ctx, testCommand, sha, label, "retry");
@@ -2998,7 +3014,16 @@ async function retryOnBusyHost(
   return fresh.result;
  };
  const result = ctx.map.testBackend?.kind === "shadow" ? await backendTests(ctx, sha, local) : await local();
- return { ran, result };
+ return { ran, result, busy: isQuiet(started) ? null : started };
+}
+
+/**
+ * The park for supervisor tests whose busy-host retry ran busy and failed
+ * (node #297). `what` names the run; the outcome leads with the wait reason
+ * and the first three failing tests.
+ */
+function hostLoadPark(host: HostLoadReading, what: string, tests: RunResult): HostLoadPark {
+ return new HostLoadPark(hostLoadOutcome({ ...host, what, names: failedTestNames(tests) }), host);
 }
 
 /**
@@ -3169,11 +3194,21 @@ async function adoptBuiltWork(
  // finished work back to a worker with nothing left to commit.
  // Each attempt keeps its own output in the worker log, the retry's included.
  let tests = await backendTests(ctx, sha, () => testsInFreshCheckout(ctx, testCommand, sha, `adopted ${what}: supervisor tests`));
+ let busy: HostLoadReading | null = null;
  if (tests.code !== 0) {
   const retry = remoteTests(ctx) ? null : await retryOnBusyHost(ctx, testCommand, sha, "adoption tests", "the adoption test retry", `adopted ${what}: supervisor test retry`);
-  if (retry !== null) tests = retry.result;
+  if (retry !== null) {
+   tests = retry.result;
+   if (retry.ran) busy = retry.busy;
+  }
  }
  const clean = await assertGitUntouched(ctx.canonical, snapshot);
+ // The retry ran on a busy host too and failed: a worker would find nothing
+ // to change (node #297: cortex #2557 spent two sessions that way). The run
+ // parks and a resume waits for a quiet host to adopt the work then.
+ if (tests.code !== 0 && busy !== null) {
+  throw hostLoadPark(busy, `the adoption tests (${testCommand}) on the ${what} a previous run committed`, tests);
+ }
  if (tests.code !== 0) {
   if (remoteTests(ctx)) return { workerExit: null, snapshot, sha, failure: { status: "failed", detail: tests.stderr, workerExit: null } };
   journal.recordEvent("reviewed", {

@@ -8,6 +8,7 @@ import {
  blockedOutcome,
  CRASH_PARK_OUTCOME,
  crashParkOutcome,
+ hostLoadOutcome,
  parseFailedProbes,
  policyBlockedOutcome,
  probesFailedOutcome,
@@ -262,6 +263,19 @@ describe("node #54 — the reason class, by ranger's own rules", () => {
   expect(classifyReason(r, [], null, 5).class).toBe("substrate capped");
   const w = row({ status: "failed", outcome: "substrate codex hit its rate limit (worker log: /x)" });
   expect(classifyReason(w, [], null, 5).class).toBe("substrate capped");
+ });
+
+ test("host load: tests that failed twice on a busy host lead with the wait reason (node #297)", () => {
+  const outcome = hostLoadOutcome({ load: 58.24, cores: 10, what: "the adoption tests (bun test) on the build a previous run committed",
+   names: ["AgentsDirectoryWatcher > fires", "ConfigWatcher > reloads", "startCortex > reconciles", "status > answers in 5s"] });
+  expect(outcome).toBe("waiting for a quiet host: load 58.2 on 10 cores — the adoption tests (bun test) on the build a previous run committed failed, " +
+   "and the retry ran on a busy host too and failed (failing: AgentsDirectoryWatcher > fires; ConfigWatcher > reloads; startCortex > reconciles); " +
+   "a resume is queued for when the host is quiet, with no worker session meanwhile");
+  expect(outcome.length).toBeLessThanOrEqual(400);
+  expect(classifyReason(row({ status: "failed", outcome }), [], null, 5)).toEqual({ class: "host load", detail: outcome.slice(0, 300) });
+  const unnamed = hostLoadOutcome({ load: 12, cores: 10, what: "the supervisor's tests (bun test) after the build pass", names: [] });
+  expect(unnamed).toContain("(failing test names unavailable)");
+  expect(classifyReason(row({ status: "failed", outcome: unnamed }), [], null, 5).detail).toStartWith("waiting for a quiet host: load 12.0 on 10 cores");
  });
 
  test("worker failed: a failed row with no other class", () => {
