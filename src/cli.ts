@@ -68,6 +68,7 @@ import { publishReceiptFile } from "./remote-test/artifacts.ts";
 import { runSshCommand, statusSshCommand, sshOutcomeExitCode, sshOutcomeMessage, type RunSshCommand } from "./remote-test/ssh-cli.ts";
 import { classifyReceiverFailure, saveRefusalDiagnostic, TaggedReceiverFailure } from "./remote-test/receiver-diagnostics.ts";
 import { serveSshResponse } from "./remote-test/ssh-server.ts";
+import { spawnBudget } from "./digest.ts";
 
 /**
  * ranger — autonomous orienteer work-graph walker.
@@ -636,7 +637,7 @@ function renderEscalateText(result: EscalateResult | DigestResult): string {
     `  cards: ${d.cards.length}${d.cards.length ? ` (${d.cards.map((c) => `#${c.nodeId} ${c.ageDays}d`).join(", ")})` : " — clean"}`,
    );
    lines.push(
-    `  audit: receipt-less ${d.receiptLessCloses.length}${d.receiptLessCloses.length ? ` ${d.receiptLessCloses.join(",")}` : ""} · stale ${d.openClaims.length} · budget ${d.budget.spawnsToday}${Number.isFinite(d.budget.spawnCapPerDay) ? `/${d.budget.spawnCapPerDay}` : ""}${d.budget.paused ? " PAUSED" : ""}`,
+    `  audit: receipt-less ${d.receiptLessCloses.length}${d.receiptLessCloses.length ? ` ${d.receiptLessCloses.join(",")}` : ""} · stale ${d.openClaims.length} · budget ${spawnBudget(d.budget.spawnsToday, d.budget.spawnCapPerDay)}${d.budget.paused ? " PAUSED" : ""}`,
    );
   } else {
    const e = map;

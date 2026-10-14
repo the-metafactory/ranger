@@ -126,6 +126,17 @@ const inputs = (over: Partial<StateInputs> = {}): StateInputs => ({
 });
 
 describe("#37 — the state the dashboard shows", () => {
+ test("with no spawn cap the dashboard carries a null cap and still names the next claim past any count", () => {
+  const uncapped = assembleState(inputs({ spawnsToday: 40, spawnCap: Number.POSITIVE_INFINITY }));
+  expect(uncapped.gates.spawnCap).toBeNull();
+  expect(JSON.parse(JSON.stringify(uncapped)).gates.spawnCap).toBeNull();
+  expect(uncapped.maps[0].next.nodeId).toBe("10");
+  expect(uncapped.maps[0].next).toEqual(assembleState(inputs()).maps[0].next);
+  const capped = assembleState(inputs({ spawnsToday: 40, spawnCap: 10 }));
+  expect(capped.gates.spawnCap).toBe(10);
+  expect(capped.maps[0].next).toEqual({ waiting: false, reason: "daily spawn cap reached (40/10)" });
+ });
+
  test("autonomous nodes are the walkable ones; a skipped node is not among them", () => {
   const map = assembleState(inputs()).maps[0];
   expect(map.autonomous.map((n) => n.id)).toEqual(["10", "14"]);

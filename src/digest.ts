@@ -68,6 +68,11 @@ interface DigestInputs {
   now: Date;
 }
 
+/** Spawns today against the cap, or the count alone when there is none (Infinity). */
+export function spawnBudget(spawnsToday: number, cap: number): string {
+  return Number.isFinite(cap) ? `${spawnsToday}/${cap}` : String(spawnsToday);
+}
+
 export function digestContent(inputs: DigestInputs): string {
   const {
     map,
@@ -111,7 +116,7 @@ export function digestContent(inputs: DigestInputs): string {
       );
     }
   }
-  const budgetLine = `Budget: spawns today ${budget.spawnsToday}${Number.isFinite(budget.spawnCapPerDay) ? `/${budget.spawnCapPerDay}` : ""} · dead-man ${budget.deadman} · ${budget.paused ? "PAUSED" : "running"}`;
+  const budgetLine = `Budget: spawns today ${spawnBudget(budget.spawnsToday, budget.spawnCapPerDay)} · dead-man ${budget.deadman} · ${budget.paused ? "PAUSED" : "running"}`;
   // Reserve room for the audit + budget sections so a long card list can
   // never evict the promised parts of a "cards + audit + budget" digest —
   // the card list is capped to fit, not the tail sliced off.
