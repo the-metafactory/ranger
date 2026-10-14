@@ -49,6 +49,7 @@ import { walk } from "./walk.ts";
 import { emitTickRunFinished, emitNodeRunFinished, runNodeRunOutcome, type RunLedgerDeps } from "./run-ledger.ts";
 import { spawnRunNodeDetached } from "./spawn.ts";
 import { holdAwake } from "./awake.ts";
+import { enqueueJob, JobError, runJob, type RunJobContext } from "./jobs.ts";
 import { BUILD_NOW_NOT_STARTED, buildNow, type BuildNowResult } from "./build-now.ts";
 import { startServe } from "./serve.ts";
 import {
@@ -251,6 +252,7 @@ export async function runTick(
    escalateError !== undefined ||
    (escalateResult?.maps.some((m) => !m.ok) ?? false) ||
    walkResult.maps.some((m) => m.errors.length > 0) ||
+   (walkResult.jobs?.errors.length ?? 0) > 0 ||
    walkResult.intake.error !== undefined ||
    walkResult.intake.threads.some((t) => t.error !== undefined || (t.gate?.errors.length ?? 0) > 0);
   result = {
@@ -895,6 +897,74 @@ program
   const result = await runTick(resolve(process.cwd(), options.config));
   (result.exitCode === 1 ? process.stderr : process.stdout).write(result.report);
   process.exit(result.exitCode);
+ });
+
+// Scheduled jobs (node #301): a Reflex fire enqueues, the tick starts the run.
+const job = program
+ .command("job")
+ .description("Scheduled jobs (ranger.yaml `jobs`): a skill ranger runs on a resource lane, reported to the run ledger");
+
+/** `ranger job enqueue` without process I/O: exit 0 queued or already queued, 1 refused. */
+export function runJobEnqueue(
+ name: string,
+ configPath: string,
+ deps: { loadCtx?: typeof loadCtx; now?: () => Date } = {},
+): { exitCode: number; report: string } {
+ let ctx: ReturnType<typeof loadCtx>;
+ try {
+  ctx = (deps.loadCtx ?? loadCtx)(configPath);
+ } catch (error) {
+  return { exitCode: 1, report: `ranger job enqueue: ${error instanceof Error ? error.message : String(error)}\n` };
+ }
+ try {
+  const queued = enqueueJob(ctx.config, ctx.journal, name, deps.now?.() ?? new Date());
+  return { exitCode: 0, report: JSON.stringify(queued) + "\n" };
+ } catch (error) {
+  return { exitCode: 1, report: `ranger job enqueue: ${error instanceof Error ? error.message : String(error)}\n` };
+ } finally {
+  ctx.journal.close();
+ }
+}
+
+job
+ .command("enqueue")
+ .description("Queue one run of a declared job; a second enqueue before it starts is a no-op. The next tick starts it when its lane is free.")
+ .argument("<name>", "job name from ranger.yaml jobs")
+ .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
+ .action((name: string, options: { config: string }) => {
+  const result = runJobEnqueue(name, resolve(process.cwd(), options.config));
+  (result.exitCode === 0 ? process.stdout : process.stderr).write(result.report);
+  process.exit(result.exitCode);
+ });
+
+job
+ .command("run")
+ .description("Detached job supervisor the tick spawns: runs the job's skill session and reports the run")
+ .argument("<run-id>", "job run id from the journal")
+ .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
+ .action(async (runId: string, options: { config: string }) => {
+  const { config, journal } = loadCtx(resolve(process.cwd(), options.config));
+  try {
+   holdAwake();
+   const outcome = await runJob(Number(runId), { config, journal } satisfies RunJobContext);
+   process.stdout.write(JSON.stringify(outcome, null, 2) + "\n");
+   process.exit(outcome.status === "succeeded" ? 0 : outcome.status === "refused" ? 1 : 2);
+  } catch (error) {
+   process.stderr.write(`ranger job run: ${error instanceof Error ? error.message : String(error)}\n`);
+   process.exit(error instanceof JobError ? 1 : 2);
+  } finally {
+   journal.close();
+  }
+ });
+
+job
+ .command("list")
+ .description("Job runs in the journal, oldest first")
+ .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
+ .action((options: { config: string }) => {
+  const { journal } = loadCtx(resolve(process.cwd(), options.config));
+  try { process.stdout.write(JSON.stringify(journal.listJobRuns(), null, 2) + "\n"); }
+  finally { journal.close(); }
  });
 
 program

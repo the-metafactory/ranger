@@ -12,6 +12,8 @@ export interface RunResult {
    * diagnostics.
    */
   stdoutTail?: string;
+  /** True when `timeoutMs` ran out and the child (or its group) was killed. */
+  timedOut?: boolean;
 }
 
 /** Stdout tail kept beside a filtered stream: lines, and characters per line. */
@@ -102,10 +104,12 @@ export function runCmd(
     child.stderr.on("data", (chunk) => {
       stderr += chunk.toString();
     });
+    let timedOut = false;
     const timer =
       opts.timeoutMs === undefined
         ? undefined
         : setTimeout(() => {
+            timedOut = true;
             if (opts.processGroup === true && child.pid !== undefined) {
               killProcessGroup(child.pid);
             } else {
@@ -118,12 +122,13 @@ export function runCmd(
     });
     child.on("close", (code) => {
       if (timer) clearTimeout(timer);
+      const timeout = timedOut ? { timedOut } : {};
       if (keep === undefined) {
-        resolvePromise({ code: code ?? -1, stdout, stderr });
+        resolvePromise({ code: code ?? -1, stdout, stderr, ...timeout });
         return;
       }
       if (partial.length > 0) keepLine(partial.join(""));
-      resolvePromise({ code: code ?? -1, stdout, stderr, stdoutTail: tail.join("\n") });
+      resolvePromise({ code: code ?? -1, stdout, stderr, stdoutTail: tail.join("\n"), ...timeout });
     });
   });
 }

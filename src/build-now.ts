@@ -93,8 +93,8 @@ export interface BuildNowResult {
  root: number;
  title: string;
  lane: "implement" | "research";
- /** The implement worker this one runs beside (`--force`), if any. */
- beside: { nodeId: string; repo: string; root: number; status: WorkerRow["status"] } | null;
+ /** The implement worker or job (node #301) this one runs beside (`--force`), if any. */
+ beside: { nodeId: string; repo: string; root: number; status: string } | null;
  messageId: string | null;
  announceError: string | null;
  /** The run-node's PID; null when none was spawned (the row stays `claimed`, no worker). */

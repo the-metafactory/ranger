@@ -62,7 +62,7 @@ import {
 } from "./config.ts";
 import { drainGate, implementCandidates, planTick, walkableCandidates, type DrainState } from "./candidates.ts";
 import { pidAlive as defaultPidAlive } from "./exec.ts";
-import { Journal, vetoApplies, type ResumeQueueRow, type WorkerRow } from "./journal.ts";
+import { Journal, vetoApplies, type LaneHolder, type ResumeQueueRow, type WorkerRow } from "./journal.ts";
 import { ForeignMigrationError } from "./journal-guard.ts";
 import { IMPLEMENT_LANES, implementLane, workerLane, type ImplementLane } from "./lanes.ts";
 import { activeCooldown, cooldownScope, readGraphqlBudget } from "./budget.ts";
@@ -194,7 +194,7 @@ export interface StateInputs {
  /** Titles of in-flight nodes not on any frontier, by `repo#id`. */
  titles: Map<string, string>;
  workers: WorkerRow[];
- laneHolders: Record<ImplementLane, WorkerRow | null>;
+ laneHolders: Record<ImplementLane, LaneHolder | null>;
  paused: boolean;
  /** The drain switches (node #165); absent means none is set. */
  drains?: DrainState;

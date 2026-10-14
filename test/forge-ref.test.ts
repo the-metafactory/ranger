@@ -48,6 +48,8 @@ describe("ForgeRef config and identity seam", () => {
    ["the-metafactory/soma", 533, "the-metafactory__soma"],
    ["the-metafactory/soma", 751, "the-metafactory__soma"],
    ["the-metafactory/soma", 766, "the-metafactory__soma"],
+   ["jcfischer/seelite", 1, "jcfischer__seelite"],
+   ["jcfischer/seelite", 460, "jcfischer__seelite"],
    ["the-metafactory/soma", 781, "the-metafactory__soma"],
    ["the-metafactory/myelin", 319, "the-metafactory__myelin"],
    ["the-metafactory/cortex", 2556, "the-metafactory__cortex"],

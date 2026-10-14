@@ -174,6 +174,50 @@ export async function emitNodeRunFinished(
  }, deps);
 }
 
+/**
+ * The result a job reported, as the ledger may carry it (myelin v0.10.0,
+ * soma#842): a `soma:` relative path, and only on a succeeded run. Anything
+ * else (a URL, a path with `..`) stays in the journal and off the envelope,
+ * whose builder would refuse the whole emit for it.
+ */
+export function ledgerResultRef(result: string | null | undefined, outcome: RunOutcome): string | undefined {
+ if (outcome !== "succeeded" || result == null) return undefined;
+ const ref = result.trim();
+ const path = ref.slice("soma:".length);
+ const ok = ref.startsWith("soma:") && path.length > 0 && !path.startsWith("/")
+  && !path.split("/").includes("..") && !path.includes("\\") && !path.includes("\0") && !/\s/.test(ref);
+ return ok ? ref : undefined;
+}
+
+/**
+ * The envelope for a finished job run (node #301), `run_id` fixed at enqueue: the job name is `ran.ref`,
+ * the session log the `detail_ref`. The envelope has no free text, so why a
+ * run failed (budget, exit, crash) stays in the journal row.
+ */
+export async function emitJobRunFinished(
+ config: RangerConfig,
+ journal: Pick<Journal, "recordEvent">,
+ run: { runUuid: string; name: string; startedAt: string; endedAt: string; outcome: RunOutcome; result?: string | null; log?: string | null },
+ deps: RunLedgerDeps = {},
+): Promise<void> {
+ return emitRunFinished(config, journal, env => {
+  const goal = env.MF_SERVES_GOAL || undefined;
+  const resultRef = ledgerResultRef(run.result, run.outcome);
+  return [{
+   // The run's own id, so a repeat after a crash is the same run to a consumer.
+   run_id: run.runUuid,
+   producer: "ranger",
+   ran: { kind: "job", ref: run.name },
+   outcome: run.outcome,
+   started_at: run.startedAt,
+   ended_at: run.endedAt,
+   detail_ref: run.log ?? config.state.journalPath,
+   ...(goal ? { serves: { goal } } : {}),
+   ...(resultRef === undefined ? {} : { result_ref: resultRef }),
+  }];
+ }, deps);
+}
+
 /** One fail-open funnel, with payload construction deferred until bus is configured. */
 async function emitRunFinished(
  config: RangerConfig,

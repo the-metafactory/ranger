@@ -357,3 +357,44 @@ describe("node #165 — the dashboard's next shares the walk's drain gate", () =
   expect(state.gates).toMatchObject({ visualDrained: false, drainedMaps: [`${TOOL}#1`] });
  });
 });
+
+describe("node #301 — a scheduled job on the walk's lanes", () => {
+ test("a queued visual job takes the free visual lane before any claim, and holds it on the next tick", async () => {
+  await withRigEnv(async (r) => {
+   r.config.jobs = [{ name: "daily-short", skill: "daily-short", prompt: "", lane: "visual", wallClockMin: 90, cwd: "/tmp", substrates: ["claude"] }];
+   r.journal.enqueueJobRun("daily-short", "visual");
+   const spawned: string[] = [];
+   const jobs: number[] = [];
+   const tick = () => walk({
+    config: r.config, configPath: r.configPath, journal: r.journal,
+    spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; },
+    spawnJob: async ({ runId }) => { jobs.push(runId); return process.pid; },
+   });
+   const first = await tick();
+   expect(jobs).toEqual([1]);
+   expect(first.jobs?.started).toMatchObject([{ name: "daily-short", lane: "visual" }]);
+   // Only the headless map claims: both visual maps find the lane taken.
+   expect(first.maps.map((m) => m.claimed)).toEqual([[], ["20"], []]);
+   expect(spawned).toEqual(["20"]);
+   const second = await tick();
+   expect(second.maps.map((m) => m.claimed)).toEqual([[], [], []]);
+   expect(spawned).toEqual(["20"]);
+   expect(r.journal.getJobRun(1)).toMatchObject({ status: "running" });
+  });
+ });
+ test("a finished run its supervisor never reported is reported by the next tick, with no other job pending", async () => {
+  await withRigEnv(async (r) => {
+   r.config.jobs = [{ name: "daily-short", skill: "daily-short", prompt: "", lane: "visual", wallClockMin: 90, cwd: "/tmp", substrates: ["claude"] }];
+   const { run } = r.journal.enqueueJobRun("daily-short", "visual");
+   r.journal.updateJobRun(run.id, "queued", { status: "running", startedAt: "2026-10-15T04:00:00Z", pid: 2_147_483_000 });
+   r.journal.updateJobRun(run.id, "running", { status: "succeeded", finishedAt: "2026-10-15T05:10:00Z" });
+   const result = await walk({
+    config: r.config, configPath: r.configPath, journal: r.journal,
+    spawnRunNode: async () => process.pid, spawnJob: async () => process.pid,
+   });
+   expect(result.jobs).toBeDefined();
+   expect(r.journal.getJobRun(run.id)?.reportedAt).not.toBeNull();
+   expect(r.journal.listUnreportedJobRuns()).toEqual([]);
+  });
+ });
+});

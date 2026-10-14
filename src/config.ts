@@ -7,6 +7,7 @@ import { parse } from "yaml";
 import { z } from "zod";
 import { parseForgeRef, repoIdentity, validReadTokenPrefix } from "./forge-ref.ts";
 import { workerEnvPasses } from "./untrusted-env.ts";
+import { SUBSTRATE_NAMES } from "./store/schema.ts";
 export { REPO_PATTERN } from "./forge-ref.ts";
 
 /**
@@ -389,6 +390,32 @@ const BusSchema = z.object({
  }
 });
 
+/**
+ * A scheduled job (node #301): a skill ranger runs headless on a resource
+ * lane when `ranger job enqueue <name>` queued it (a Reflex fire, through a
+ * cortex process spec). A job opens no PR, claims no node and writes no graph.
+ */
+const JobSchema = z.object({
+ /** The name `ranger job enqueue` takes and the run ledger reports as `ran.ref`. */
+ name: z.string().regex(/^[a-z0-9][a-z0-9-]{0,63}$/, "a lowercase name ([a-z0-9-], at most 64)"),
+ /** The skill the session runs (`/<skill>` on Claude). */
+ skill: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9:_-]{0,127}$/, "a plain skill name"),
+ /** Text after the skill invocation; none by default. */
+ prompt: z.string().default(""),
+ /** The resource lane the run holds: `visual` never runs beside a visual implement session. */
+ lane: z.enum(IMPLEMENT_LANES),
+ /** Wall clock for one run, minutes; past it ranger kills the session and reports `failed`. */
+ wallClockMin: z.number().int().positive(),
+ /** The session's working directory. */
+ cwd: z.string().min(1).refine(p => isAbsolute(expandHome(p)), "an absolute path (or ~/…)"),
+ /**
+  * Substrates the run may take, picked by quota like a worker session. A
+  * skill only one substrate carries pins it here (e.g. `[claude]`); when the
+  * quota pick falls outside the list, the run takes the list's first entry.
+  */
+ substrates: z.array(z.enum(SUBSTRATE_NAMES)).min(1).default(["claude", "codex", "pi"]),
+});
+
 const RangerConfigSchema = z.object({
  version: z.literal(1).default(1),
  maps: z.array(MapSchema).min(1, "at least one map must be registered"),
@@ -403,12 +430,18 @@ const RangerConfigSchema = z.object({
  substrates: SubstratesSchema.default({}),
  serve: ServeSchema.optional(),
  bus: BusSchema.optional(),
+ /** Scheduled jobs (node #301), by name; absent means none. */
+ jobs: z.array(JobSchema).optional().refine(
+  jobs => jobs === undefined || new Set(jobs.map(j => j.name)).size === jobs.length,
+  "job names must be unique",
+ ),
 });
 
 export type RangerMapConfig = z.infer<typeof MapSchema>;
 export type RangerAuthConfig = z.infer<typeof AuthSchema>;
 export type RangerBotConfig = z.infer<typeof BotSchema>;
 export type RangerConfig = z.infer<typeof RangerConfigSchema>;
+export type RangerJobConfig = z.infer<typeof JobSchema>;
 
 /** The legacy scalar names GitHub only; no cross-host principal fallback. */
 export function principalLoginForRepo(config: RangerConfig, repo: string): string | undefined {
