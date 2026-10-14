@@ -269,10 +269,8 @@ bot:
 # default of 2).
 workers:
   reviewRounds: 8
-  # New claims per UTC day across all maps (default 10). Raised to 20
-  # (principal, 2026-10-04): two lanes and three walked maps used up 10 by midday.
-  # Raised to 30 (principal, 2026-10-13).
-  spawnCapPerDay: 30
+  # No daily spawn cap (principal, 2026-10-14; #300): unset means none. It was
+  # 10, then 20 (2026-10-04), then 30 (2026-10-13), and still held claims back.
   # Concurrent implement workers per resource lane (default 1 each). Headless
   # raised to 3 (principal, 2026-10-13), back to 2 (principal, 2026-10-14): three
   # suites at once held the 1-min load at 60-108 on 10 cores, and cortex's
