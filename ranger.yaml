@@ -80,10 +80,12 @@ maps:
   # `bun run test` carries soma's per-test timeout (its package.json); bare
   # `bun test` gives each test 5 s, which soma's install tests overrun under
   # load (2026-10-08, soma #767).
+  # Root 604 auto-merges (principal, 2026-10-14): its file-moving refactor PRs
+  # went stale behind the merge card while map 781 kept moving main.
   - repo: the-metafactory/soma
     root: 604
     walk: full
-    autoMerge: false
+    autoMerge: true
     localCheckout: ~/work/mf/soma
     commands:
       install: bun install --frozen-lockfile
