@@ -251,9 +251,12 @@ const WorkersSchema = z.object({
  /**
   * Daily worker-spawn cap (design §7): opt-in. Unset means no cap
   * (principal, 2026-10-14: the substrate quota gates bound spend, and the
-  * cap held 30 claims a day back on a host that had room).
+  * cap held 30 claims a day back on a host that had room). Infinity is the
+  * no-cap value, so a parsed config written back as YAML (`.inf`) reloads.
   */
- spawnCapPerDay: z.number().int().positive().optional().transform((v) => v ?? Number.POSITIVE_INFINITY),
+ spawnCapPerDay: z.number().positive()
+  .refine((v) => Number.isInteger(v) || v === Number.POSITIVE_INFINITY, "an integer, or .inf for no cap")
+  .default(Number.POSITIVE_INFINITY),
  /** Concurrent implement workers per resource lane, across all maps (default one each). */
  laneSlots: z.object({
   visual: z.number().int().positive().default(1),

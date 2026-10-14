@@ -169,6 +169,12 @@ describe("loadConfig", () => {
     withConfig([...base, "workers:", "  spawnCapPerDay: 30"].join("\n"), (path) => {
       expect(loadConfig(path).config.workers.spawnCapPerDay).toBe(30);
     });
+    withConfig([...base, "workers:", "  spawnCapPerDay: .inf"].join("\n"), (path) => {
+      expect(loadConfig(path).config.workers.spawnCapPerDay).toBe(Number.POSITIVE_INFINITY);
+    });
+    withConfig([...base, "workers:", "  spawnCapPerDay: 2.5"].join("\n"), (path) => {
+      expect(() => loadConfig(path)).toThrow(ConfigError);
+    });
   });
 
   test("walk defaults to none", () => {
