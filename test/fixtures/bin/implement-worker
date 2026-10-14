@@ -17,7 +17,9 @@
 # root commit of its own, sharing no history with origin/main; blocked — writes the blocked report
 # (.ranger-blocked.md) uncommitted and exits 0; blocker-note — commits only a docs/ blocker note. Base merge pass (prompt carries "## Base merge pass"): merges
 # origin/main, resolving a conflict on src/feature.ts by keeping both sides. CI fix pass (prompt
-# carries "## CI fix pass"): commits a CI fix; in mode ci-noop it commits nothing (a flaky red).
+# carries "## CI fix pass"): commits a CI fix; in mode ci-noop it commits nothing (a flaky red). A fix pass
+# whose prompt carries the supervisor's artifact finding writes tests/feature-artifact.test.ts, except
+# in mode skip-artifact.
 set -euo pipefail
 
 if [ -n "${GIT_CONFIG_VALUE_0:-}" ] || [ -n "${GH_TOKEN:-}" ]; then
@@ -98,6 +100,9 @@ if printf '%s' "$prompt" | grep -q "## CI fix pass"; then
 fi
 if printf '%s' "$prompt" | grep -q "Fix pass"; then
   echo "export const feature = () => 2; // fixed per review" > src/feature.ts
+  if [ "$mode" != "skip-artifact" ] && printf '%s' "$prompt" | grep -q "Supervisor finding (ranger"; then
+    echo "import { feature } from '../src/feature.ts';" > tests/feature-artifact.test.ts
+  fi
   git add -A
   git commit -q -m "fix: address sage review blockers for node #20"
   echo "fake worker fix pass done"

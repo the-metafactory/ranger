@@ -1190,6 +1190,64 @@ export function implementBranchFor(
  return merged?.ref ?? fallback;
 }
 
+/**
+ * The paths the node's close gate checks on this map's base after the merge:
+ * its `artifact-exists` probes on this repo, read at the base (or, with no
+ * `atRef`, on the canonical checkout's disk, which the close fast-forwards to
+ * the base). A probe on another repo or ref is not this branch's to satisfy.
+ */
+export function checkpointArtifacts(
+ node: { probes?: { type: string; [key: string]: unknown }[] },
+ repo: string,
+ base: string,
+): string[] {
+ const atBase = (ref: unknown) =>
+  ref === undefined || ref === base || ref === `origin/${base}` || ref === `refs/heads/${base}`;
+ const paths = (node.probes ?? []).flatMap((p) =>
+  p.type === "artifact-exists" &&
+  typeof p.path === "string" &&
+  p.path.length > 0 &&
+  (p.repo === undefined || p.repo === repo) &&
+  atBase(p.atRef)
+   ? [p.path]
+   : [],
+ );
+ return [...new Set(paths)];
+}
+
+/** The checkpoint artifacts `sha`'s tree lacks: a merge of it would leave the close refusing (ranger #263, 2026-10-14). */
+async function missingArtifacts(worktree: string, sha: string, paths: string[]): Promise<string[]> {
+ const missing: string[] = [];
+ for (const path of paths) {
+  const found = await safeGit(["cat-file", "-e", `${sha}:${path.replace(/^\.\//, "")}`], { cwd: worktree, timeoutMs: 10_000 });
+  if (found.code !== 0) missing.push(path);
+ }
+ return missing;
+}
+
+/**
+ * A sage-clean review whose head lacks a checkpoint artifact gets the
+ * supervisor's major on top: the fix pass answers it and the next round
+ * reviews the result, as any major. Without it ranger merged ranger #263's
+ * PR, whose tests went to another file than the one its checkpoint names, and
+ * the close then refused after the merge.
+ */
+export function withArtifactFinding<R extends { majors: number; body: string }>(review: R, missing: string[], base: string): R {
+ if (missing.length === 0) return review;
+ const list = missing.map((p) => `\`${p}\``).join(", ");
+ return {
+  ...review,
+  majors: review.majors + 1,
+  body: [
+   review.body.trim(),
+   "",
+   "## Supervisor finding (ranger, not the reviewer) — major",
+   `The node's close gate checks that ${list} exist${missing.length === 1 ? "s" : ""} on \`${base}\` after the merge, and this head lacks ${missing.length === 1 ? "it" : "them"}.`,
+   "Create each at exactly that path (moving this node's tests or code there is fine); the close refuses the node otherwise.",
+  ].join("\n"),
+ };
+}
+
 /** The credential the lane's graph reads run under: the gated one a GitLab map needs, else the write token. */
 function graphCredential(ctx: ImplementContext): ResolvedToken {
  return ctx.graphToken ?? { token: ctx.token, source: "write-token" };
@@ -1327,6 +1385,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
  // run, as the loop re-reads an unchanged head on every pass.
  let notedSha: string | undefined;
  let staleMerged = false;
+ const artifacts = checkpointArtifacts(node.node, repo, base);
  /**
   * One base merge pass on the pushed head, then its marker and its push. A
   * failed pass is the run's outcome. `stale` says the branch was merged up
@@ -1539,6 +1598,17 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
    verdictSha: current.sha,
    verdictBlockers: current.blockers,
   });
+  if (gatingFindings(current) === 0 && artifacts.length > 0) {
+   const missing = await missingArtifacts(worktree, live.headSha, artifacts);
+   if (missing.length > 0) {
+    current = withArtifactFinding(current, missing, base);
+    journal.recordEvent("reviewed", {
+     nodeId,
+     repo,
+     detail: `sage clean at ${live.headSha.slice(0, 8)}, but the checkpoint artifact(s) ${missing.join(", ")} are missing there: a supervisor major goes to the fix pass`.slice(0, 400),
+    });
+   }
+  }
   // Blockers AND majors gate (principal, 2026-10-03): each is reworked and
   // re-reviewed. Suggestions and nits do not gate.
   if (gatingFindings(current) === 0) {
@@ -2114,6 +2184,7 @@ async function checkedWorkerPass(
   ...(spec.kind === "base-merge" ? { baseMerge: { base: spec.base, files: spec.files, ...(spec.stale === undefined ? {} : { stale: spec.stale }) } } : {}),
   probeTier: map.commands.probe !== undefined,
   remoteTests: remoteTests(ctx),
+  artifacts: checkpointArtifacts(node.node, map.repo, map.base),
  });
  // Only this session's blocked report counts, never one a crashed run left.
  discardBlockedReport(worktree);

@@ -598,6 +598,16 @@ describe("gitConfigSnapshot: benign git-lfs and push config (2026-10-10)", () =>
   await expect(assertGitUntouched(canonical, before)).resolves.toBeDefined();
  });
 
+ test("a local commit identity leaves the snapshot unchanged (2026-10-14: soma #849)", async () => {
+  const before = gitConfigSnapshot(canonical);
+  await config("user.name", "ivy-agent");
+  await config("user.email", "ivy-agent@users.noreply.github.com");
+  expect(gitConfigSnapshot(canonical)).toBe(before);
+  await config("user.name", "Someone Else; $(evil)");
+  expect(gitConfigSnapshot(canonical)).toBe(before);
+  await expect(assertGitUntouched(canonical, before)).resolves.toBeDefined();
+ });
+
  const changes: [string, () => Promise<unknown>][] = [
   ["a smudge filter that runs something else", () => config("filter.lfs.smudge", "/tmp/evil -- %f")],
   ["a clean filter with an extra command", () => config("filter.lfs.clean", "git-lfs clean -- %f; /tmp/evil")],
@@ -608,6 +618,8 @@ describe("gitConfigSnapshot: benign git-lfs and push config (2026-10-10)", () =>
   ["an lfs access mode other than basic", () => config(`lfs.${LFS_URL}.access`, "negotiate")],
   ["an lfs url key", () => config("lfs.url", "https://evil.example/lfs")],
   ["filter.lfs.required=false", () => config("filter.lfs.required", "false")],
+  ["a signing key", () => config("user.signingKey", "/tmp/evil.key")],
+  ["user.useConfigOnly", () => config("user.useConfigOnly", "true")],
   [
    "a repeated smudge key, the standard value last",
    async () => {

@@ -12,6 +12,7 @@ import type { CheckRun } from "../src/github.ts";
 import type { FrontierEntry } from "../src/graph.ts";
 import {
  ciFixMarker,
+ checkpointArtifacts,
  ciFixState,
  implementBranchFor,
  MAX_RULING_CHARS,
@@ -254,6 +255,20 @@ describe("review markers (F2 resume record)", () => {
  test("a declared git-merged-into probe names the branch", () => {
   expect(implementBranchFor({ probes: [{ type: "git-merged-into", ref: "node/flight-sound-prune" }] }, "node/9-x")).toBe("node/flight-sound-prune");
   expect(implementBranchFor({ probes: [] }, "node/9-x")).toBe("node/9-x");
+ });
+ test("checkpoint artifacts: this repo's artifact-exists paths at the base or on disk, once each (ranger #263)", () => {
+  const probes = [
+   { type: "artifact-exists", path: "test/a.test.ts", atRef: "main" },
+   { type: "artifact-exists", path: "docs/b.md" },
+   { type: "artifact-exists", path: "test/a.test.ts", atRef: "origin/main" },
+   { type: "artifact-exists", path: "c.md", atRef: "refs/heads/main", repo: "acme/widgets" },
+   { type: "artifact-exists", path: "other-ref.md", atRef: "release" },
+   { type: "artifact-exists", path: "other-repo.md", repo: "acme/other" },
+   { type: "artifact-exists", path: "" },
+   { type: "git-ref-exists", ref: "main" },
+  ];
+  expect(checkpointArtifacts({ probes }, "acme/widgets", "main")).toEqual(["test/a.test.ts", "docs/b.md", "c.md"]);
+  expect(checkpointArtifacts({}, "acme/widgets", "main")).toEqual([]);
  });
 });
 
