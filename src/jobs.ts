@@ -114,6 +114,23 @@ export function emptyJobPass(): JobPassResult {
  return { started: [], waiting: [], failed: [], errors: [] };
 }
 
+/**
+ * Hand a finished run's one envelope to the ledger, then mark it reported.
+ * The terminal status is committed first, so a process cut off between the
+ * two leaves an unreported finished row that `sweepJobs` reports later:
+ * the envelope is never lost, and only that window can repeat it.
+ */
+async function reportRun(ctx: Pick<JobPassContext, "config" | "journal" | "ledger">, id: number): Promise<void> {
+ const run = ctx.journal.getJobRun(id);
+ if (run === null || run.reportedAt !== null || (run.status !== "succeeded" && run.status !== "failed")) return;
+ const outcome: RunOutcome = run.status;
+ await emitJobRunFinished(ctx.config, ctx.journal, {
+  name: run.name, startedAt: run.startedAt ?? run.queuedAt, endedAt: run.finishedAt ?? run.queuedAt,
+  outcome, result: run.result, log: run.log,
+ }, ctx.ledger);
+ ctx.journal.updateJobRun(id, run.status, { reportedAt: new Date().toISOString() });
+}
+
 /** End a run that never reached a session, or whose supervisor died, and report it. */
 async function failRun(
  ctx: Pick<JobPassContext, "config" | "journal" | "ledger">,
@@ -124,9 +141,7 @@ async function failRun(
  const ended = now.toISOString();
  if (!ctx.journal.updateJobRun(run.id, run.status, { status: "failed", reason, finishedAt: ended, pid: null, pgid: null })) return false;
  ctx.journal.recordEvent("job-finished", { detail: `job ${run.name} run ${run.id} failed: ${reason}` });
- await emitJobRunFinished(ctx.config, ctx.journal, {
-  name: run.name, startedAt: run.startedAt ?? run.queuedAt, endedAt: ended, outcome: "failed", log: run.log,
- }, ctx.ledger);
+ await reportRun(ctx, run.id);
  return true;
 }
 
@@ -135,11 +150,27 @@ async function failRun(
  * group may outlive it on the GPU, so the group is killed, but only after
  * `ps` confirms it still runs the job's skill: a recycled group id is never
  * killed on the journal's word alone.
+ *
+ * A running row with no pid was reserved by a tick that died before its
+ * spawn recorded one: the reserving tick holds the claim lock from the
+ * reservation to the pid, and so does this sweep, so such a row is abandoned
+ * (`spawn`). A supervisor that did start writes its own pid first thing.
+ *
+ * A finished run never reported (its process died between status and emit)
+ * is reported here once its supervisor is gone.
  */
 export async function sweepJobs(ctx: JobPassContext, result: JobPassResult): Promise<void> {
  const now = ctx.now?.() ?? new Date();
+ for (const run of [...ctx.journal.listJobRuns("succeeded"), ...ctx.journal.listJobRuns("failed")]) {
+  if (run.reportedAt !== null || (run.pid !== null && pidAlive(run.pid))) continue;
+  await reportRun(ctx, run.id);
+ }
  for (const run of ctx.journal.listJobRuns("running")) {
-  if (run.pid === null || pidAlive(run.pid)) continue;
+  if (run.pid === null) {
+   if (await failRun(ctx, run, "spawn", now)) result.failed.push({ runId: run.id, name: run.name, reason: "spawn" });
+   continue;
+  }
+  if (pidAlive(run.pid)) continue;
   const skill = ctx.config.jobs?.find(j => j.name === run.name)?.skill;
   if (run.pgid !== null && skill !== undefined) {
    const commands = await processGroupCommands(run.pgid);
@@ -331,6 +362,8 @@ export async function runJob(runId: number, ctx: RunJobContext): Promise<RunJobO
  const reason = raw.timedOut ? "budget" : raw.code !== 0 ? `exit ${raw.code}` : undefined;
  const outcome: RunOutcome = reason === undefined ? "succeeded" : "failed";
  const ended = now().toISOString();
+ // The pid stays on the finished row until it is reported, so a sweep
+ // leaves the report to this live supervisor.
  const recorded = journal.updateJobRun(runId, "running", {
   status: outcome === "succeeded" ? "succeeded" : "failed",
   finishedAt: ended, reason: reason ?? null, result, log, pgid: null,
@@ -338,9 +371,7 @@ export async function runJob(runId: number, ctx: RunJobContext): Promise<RunJobO
  // A sweep that already failed this run reported it; one envelope per run.
  if (recorded) {
   journal.recordEvent("job-finished", { detail: `job ${run.name} run ${runId} ${outcome}${reason === undefined ? "" : `: ${reason}`}` });
-  await emitJobRunFinished(config, journal, {
-   name: run.name, startedAt: run.startedAt ?? run.queuedAt, endedAt: ended, outcome, result, log,
-  }, ctx.ledger);
+  await reportRun(ctx, runId);
  }
  return { runId, name: run.name, status: outcome === "succeeded" ? "succeeded" : "failed", reason, substrate, result, log };
 }

@@ -398,6 +398,12 @@ export const jobRuns = sqliteTable(
   result: text("result"),
   /** The session log. */
   log: text("log"),
+  /**
+   * When the run's envelope was handed to the ledger. A finished run with
+   * none was cut off between its terminal status and its emit; the tick's
+   * job sweep reports it once its supervisor is gone.
+   */
+  reportedAt: text("reported_at"),
  },
  (table) => [
   uniqueIndex("job_runs_one_queued_idx").on(table.name).where(sql`status = 'queued'`),

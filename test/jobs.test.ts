@@ -245,6 +245,44 @@ describe("node #301 — scheduled jobs", () => {
   expect(r.envelopes).toHaveLength(0);
  });
 
+ test("a reservation whose tick died before recording a pid is swept as spawn and frees the lane", async () => {
+  const r = rig();
+  const { runId } = JSON.parse(runJobEnqueue("daily-short", r.configPath).report) as { runId: number };
+  // The tick reserved the lane, then died before the spawn recorded a pid.
+  r.journal.updateJobRun(runId, "queued", { status: "running", startedAt: new Date().toISOString() });
+  expect(r.journal.laneHolder("visual")).not.toBeNull();
+  const pass = await jobPass({ config: r.config, configPath: r.configPath, journal: r.journal, spawnJob: spawner().spawnJob, ledger: r.ledger });
+  expect(pass.failed).toEqual([{ runId, name: "daily-short", reason: "spawn" }]);
+  expect(r.journal.laneHolder("visual")).toBeNull();
+  expect(r.envelopes).toHaveLength(1);
+  expect(r.journal.getJobRun(runId)?.reportedAt).not.toBeNull();
+ });
+
+ test("a finished run its supervisor never reported is reported once by the sweep, after the supervisor is gone", async () => {
+  const r = rig();
+  const runId = await startedRun(r);
+  // The supervisor committed the terminal status, then died before its emit.
+  r.journal.updateJobRun(runId, "running", { status: "succeeded", finishedAt: new Date().toISOString(), result: "soma:outputs/G6-2026-10-15.md" });
+  let pass = await jobPass({ config: r.config, configPath: r.configPath, journal: r.journal, spawnJob: spawner().spawnJob, ledger: r.ledger });
+  // Its pid (this process) is alive: the report is still the supervisor's.
+  expect(r.envelopes).toHaveLength(0);
+  r.journal.updateJobRun(runId, "succeeded", { pid: 2_147_483_000 });
+  pass = await jobPass({ config: r.config, configPath: r.configPath, journal: r.journal, spawnJob: spawner().spawnJob, ledger: r.ledger });
+  expect(pass.errors).toEqual([]);
+  expect(r.envelopes).toHaveLength(1);
+  expect(r.envelopes[0].input.payload).toMatchObject({ ran: { ref: "daily-short" }, outcome: "succeeded", result_ref: "soma:outputs/G6-2026-10-15.md" });
+  await jobPass({ config: r.config, configPath: r.configPath, journal: r.journal, spawnJob: spawner().spawnJob, ledger: r.ledger });
+  expect(r.envelopes).toHaveLength(1);
+ });
+
+ test("a completed run is marked reported", async () => {
+  const r = rig();
+  const runId = await startedRun(r);
+  await runJob(runId, { config: r.config, journal: r.journal, substrate: "claude", runSession: session().runSession, ledger: r.ledger });
+  expect(r.journal.getJobRun(runId)?.reportedAt).not.toBeNull();
+  expect(r.envelopes).toHaveLength(1);
+ });
+
  test("a quota pick outside the job's substrates falls back to its first", async () => {
   const r = rig();
   const runId = await startedRun(r);
