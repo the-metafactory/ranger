@@ -25,6 +25,7 @@ import { Database } from "bun:sqlite";
 import { openJournal, type Journal } from "../src/journal.ts";
 import { ReviewError, type ReviewVerdict } from "../src/review.ts";
 import { LAST_IMPLEMENT_MAP } from "../src/maps.ts";
+import { implementLane } from "../src/lanes.ts";
 import { sweepMap } from "../src/sweep.ts";
 import { bootstrapWorktree, runNode, type RunNodeContext } from "../src/worker.ts";
 import { gitCredential, keyLabel } from "../src/git-ops.ts";
@@ -2925,6 +2926,111 @@ describe("implement lane (node #23)", () => {
   expect(events.some((d) => d.startsWith("adoption tests failed on a busy host (load 14.0 on 10 cores)"))).toBe(true);
   expect(events.some((d) => d.startsWith("adopting "))).toBe(true);
   rmSync(counter, { force: true });
+ }, 60_000);
+
+ // Node #297: a retry that ran on a busy host (the quiet-host wait ran out)
+ // and failed is the host's failure. Two such runs on cortex #2557 each
+ // spent a worker session that changed nothing.
+ const LOAD_FLAKE = "(fail) ConfigWatcher > reloads on change [5001.00ms]";
+ const busyHost = (r: Rig) => {
+  r.ctx.hostLoad = () => ({ load: 14, cores: 10 });
+  r.ctx.quietHost = { pollMs: 1, maxMs: 5 };
+ };
+ const quietsDown = (r: Rig) => {
+  const loads = [14, 13, 2]; // at the failure, while waiting, then quiet
+  r.ctx.hostLoad = () => ({ load: loads.length > 1 ? (loads.shift() as number) : loads[0], cores: 10 });
+  r.ctx.quietHost = { pollMs: 1, maxMs: 60_000 };
+ };
+ const countSessions = (r: Rig) => {
+  const sessions: string[] = [];
+  const real = r.ctx.worker;
+  r.ctx.worker = async (prompt, options) => {
+   sessions.push(prompt);
+   const command = r.ctx.workerCommand ?? [implementWorker, "build"];
+   return real === undefined ? runCmd(command[0], [...command.slice(1), prompt], options) : real(prompt, options);
+  };
+  return sessions;
+ };
+
+ test("adoption tests that fail again on a retry that ran on a busy host park and queue a resume, with no worker session (node #297)", async () => {
+  const flag = join(tmpdir(), `ranger-adopt-load-${Date.now()}`);
+  const r = await rig({ test: `test -f ${flag} || { echo "${LOAD_FLAKE}"; exit 1; }` });
+  cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("failed"); // quiet host: no retry, the build's commit stays unpushed
+  const deadman = r.journal.deadmanCount();
+  r.ctx.workerCommand = [implementWorker, "noop"];
+  const sessions = countSessions(r);
+  busyHost(r);
+  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("failed");
+  expect(sessions).toHaveLength(0);
+  const row = r.journal.getWorker("20", "acme/widgets")!;
+  expect(row.status).toBe("failed");
+  expect(row.outcome).toStartWith("waiting for a quiet host: load 14.0 on 10 cores — the adoption tests (");
+  expect(row.outcome).toContain("failing: ConfigWatcher > reloads on change");
+  expect(r.journal.listResumeQueue()).toMatchObject([{ nodeId: "20", repo: "acme/widgets", root: 1, lane: implementLane(r.ctx.map), reason: "host-load", failedStarts: 0 }]);
+  expect(r.journal.deadmanCount()).toBe(deadman); // the host failed, not a worker
+  expect(r.journal.isPaused()).toBe(false);
+  expect(r.github.prs.size).toBe(0);
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.endsWith("— the worker continues"))).toBe(false);
+  // The queued resume, on a quiet host, adopts the same commit with no worker session.
+  writeFileSync(flag, "");
+  r.ctx.hostLoad = () => ({ load: 2, cores: 10 });
+  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  expect(sessions).toHaveLength(0);
+  expect(r.journal.listEvents("acme/widgets", 200).some((e) => (e.detail ?? "").startsWith("adopting "))).toBe(true);
+  rmSync(flag, { force: true });
+ }, 60_000);
+
+ test("adoption tests whose retry started on a quiet host and failed go to the worker, as before (node #297)", async () => {
+  const r = await rig({ test: "test -f src/fixed.ts" });
+  cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("failed");
+  r.ctx.workerCommand = [implementWorker, "add-fixed"];
+  const sessions = countSessions(r);
+  quietsDown(r);
+  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  expect(sessions).toHaveLength(1);
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.startsWith("adoption tests failed on a busy host (load 14.0 on 10 cores)"))).toBe(true);
+  expect(events.some((d) => d.includes("on the work a previous run committed") && d.endsWith("— the worker continues"))).toBe(true);
+  expect(r.journal.listResumeQueue()).toEqual([]);
+ }, 60_000);
+
+ test("supervisor tests after a worker pass whose retry ran on a busy host and failed park and queue, with no fix and no failed node (node #297)", async () => {
+  const r = await rig({ test: `echo "${LOAD_FLAKE}"; exit 1` });
+  cleanup.push(r.dir);
+  const sessions = countSessions(r);
+  busyHost(r);
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("failed");
+  expect(sessions).toHaveLength(1); // the build pass only
+  const row = r.journal.getWorker("20", "acme/widgets")!;
+  expect(row.status).toBe("failed");
+  expect(row.outcome).toStartWith("waiting for a quiet host: load 14.0 on 10 cores — the supervisor's tests (");
+  expect(row.outcome).toContain("after the build pass failed, and the retry ran on a busy host too and failed (failing: ConfigWatcher > reloads on change)");
+  expect(r.journal.listResumeQueue()).toMatchObject([{ nodeId: "20", lane: implementLane(r.ctx.map), reason: "host-load" }]);
+  expect(r.journal.deadmanCount()).toBe(0);
+  expect(r.github.prs.size).toBe(0);
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.includes("failed after the worker"))).toBe(false);
+  expect(events.some((d) => d.includes("merge-base"))).toBe(false); // no base run on a busy host
+ }, 60_000);
+
+ test("supervisor tests after a worker pass whose retry started on a quiet host and failed fail the node, as before (node #297)", async () => {
+  const r = await rig({ test: `echo "${LOAD_FLAKE}"; exit 1` });
+  cleanup.push(r.dir);
+  quietsDown(r);
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("failed");
+  expect(outcome.detail).toStartWith("tests (");
+  expect(outcome.detail).toContain("failed after the worker");
+  expect(r.journal.listResumeQueue()).toEqual([]);
+  expect(r.journal.deadmanCount()).toBe(1);
  }, 60_000);
 
  test("a fix pass a failed run committed but never pushed is adopted on resume, and the next round reviews it", async () => {

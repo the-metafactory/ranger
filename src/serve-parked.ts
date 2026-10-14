@@ -32,6 +32,7 @@ import { whenFreeQueues } from "./resume.ts";
 import { childEnv, itermArgv, shellQuote } from "./launch.ts";
 import {
  CRASH_PARK_OUTCOME,
+ HOST_LOAD_OUTCOME,
  NEEDS_EYE_LABEL,
  parseBlockedOutcome,
  parseFailedProbes,
@@ -58,6 +59,7 @@ export type ReasonClass =
  | "substrate capped"
  | "policy blocked"
  | "blocked"
+ | "host load"
  | "worker failed"
  | "other";
 
@@ -139,7 +141,7 @@ const firstLine = (text: string): string => text.split("\n")[0].trim();
 
 /**
  * Why a row needs the principal, by ranger's rules, in this order: the review
- * cap, failed probes, a policy-hook stop, a worker's blocked report, a substrate limit, a GitHub-side transient error, then
+ * cap, failed probes, a policy-hook stop, a worker's blocked report, a substrate limit, a busy-host test park, a GitHub-side transient error, then
  * any other failed worker; anything else parked is `other` with the outcome's
  * first line.
  */
@@ -208,6 +210,11 @@ export function classifyReason(
  }
  if (SUBSTRATE_CAPPED_OUTCOME.test(outcome)) {
   return { class: "substrate capped", detail: firstLine(outcome).slice(0, 200) };
+ }
+ // Supervisor tests that failed twice on a busy host (node #297): the wait
+ // reason leads the outcome, and a queued resume starts once the host quiets.
+ if (HOST_LOAD_OUTCOME.test(outcome)) {
+  return { class: "host load", detail: firstLine(outcome).slice(0, 300) };
  }
  // An outcome that names its own failure is that failure. Only a crash park,
  // which names none, takes its cause from the last attempt's events.

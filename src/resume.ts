@@ -13,6 +13,8 @@ import type { ResolvedToken } from "./token-gate.ts";
 import type { OwnedCheck } from "./lock.ts";
 import { laneHeldMessage, mapKey, recordImplementStart, resumeMap } from "./maps.ts";
 import { spawnRunNodeDetached, type SpawnRunNodeArgs } from "./spawn.ts";
+import { isQuiet, realHostLoad, type HostLoad, type HostLoadReading } from "./host-load.ts";
+import { waitingForQuietHost } from "./outcomes.ts";
 
 export interface ResumeContext {
  config: RangerConfig;
@@ -20,6 +22,19 @@ export interface ResumeContext {
  journal: Journal;
  spawnRunNode?: (args: SpawnRunNodeArgs) => Promise<number | null>;
  now?: () => Date;
+ /** The host load a load-queued resume waits on (node #297); tests inject a quiet or busy host. */
+ hostLoad?: HostLoad;
+}
+
+/**
+ * Why a queued entry waits for the host, or null when it need not: only a
+ * resume ranger queued for load (node #297) waits, and only while the
+ * 1-minute load is at or above the core count. An operator's `--when-free`
+ * entry never waits on load. `ranger serve` shows the same reason.
+ */
+export function quietHostGate(entry: Pick<ResumeQueueRow, "reason">, host: HostLoadReading | undefined): string | null {
+ if (entry.reason !== "host-load" || host === undefined || isQuiet(host)) return null;
+ return waitingForQuietHost(host);
 }
 
 /** The same identity gate as run-node: the forge credential refusal, then the bot's write identity. */
@@ -230,6 +245,9 @@ export async function processResumeQueue(
 ): Promise<void> {
  const { journal, config } = ctx;
  const waiting = new Set<ImplementLane>();
+ // One reading per tick, taken only when a load-queued entry reaches its gate.
+ let host: HostLoadReading | undefined;
+ const readHost = () => (host ??= (ctx.hostLoad ?? realHostLoad)());
  for (const entry of journal.listResumeQueue()) {
   const state = maps.find(m => m.map.repo === entry.repo && m.map.root === entry.root);
   const map = state?.map;
@@ -261,6 +279,15 @@ export async function processResumeQueue(
   // forge checks, so a held lane still drops a closed node or merged PR.
   if (spawnGate(journal, config, ctx.now?.() ?? new Date(), entry.lane) !== null) {
    waiting.add(entry.lane);
+   continue;
+  }
+  // A resume queued for load waits for a quiet host: not a failed start, and
+  // it holds nothing behind it, so an operator's entry or a claim may take
+  // the lane meanwhile. One event per entry per tick says why it waits.
+  const busy = entry.reason === "host-load" ? quietHostGate(entry, readHost()) : null;
+  if (busy !== null) {
+   owned();
+   journal.recordEvent("reviewed", { nodeId: entry.nodeId, repo: entry.repo, detail: `queued resume #${entry.nodeId} is ${busy}` });
    continue;
   }
   if (state.token === undefined) {
