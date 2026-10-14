@@ -22,18 +22,19 @@ export interface ResumeContext {
  journal: Journal;
  spawnRunNode?: (args: SpawnRunNodeArgs) => Promise<number | null>;
  now?: () => Date;
- /** The host load a load-queued resume waits on (node #297); tests inject a quiet or busy host. */
+ /** The host load queued resumes wait on (node #297); tests inject a quiet or busy host. */
  hostLoad?: HostLoad;
 }
 
 /**
- * Why a queued entry waits for the host, or null when it need not: only a
- * resume ranger queued for load (node #297) waits, and only while the
- * 1-minute load is at or above the core count. An operator's `--when-free`
- * entry never waits on load. `ranger serve` shows the same reason.
+ * Why a queued entry waits for the host, or null when it need not: every
+ * queued resume, ranger's own (node #297) and an operator's `--when-free`
+ * alike, waits while the 1-minute load is at or above `workers.busyLoad`
+ * (else the core count). A start on a busy host is what timed soma #802 and
+ * #853 out (2026-10-14). `ranger serve` shows the same reason.
  */
-export function quietHostGate(entry: Pick<ResumeQueueRow, "reason">, host: HostLoadReading | undefined): string | null {
- if (entry.reason !== "host-load" || host === undefined || isQuiet(host)) return null;
+export function quietHostGate(host: HostLoadReading | undefined, busyLoad?: number): string | null {
+ if (host === undefined || isQuiet(host, busyLoad)) return null;
  return waitingForQuietHost(host);
 }
 
@@ -83,8 +84,8 @@ const spawnGate = (journal: Journal, config: RangerConfig, now: Date, lane: Impl
  * resume" by this same rule (node #166).
  */
 export const whenFreeQueues = (row: Pick<WorkerRow, "lane" | "phase">,
- lane: { held: boolean; queued: boolean; backlog: number }) =>
- startsImplementSession(row) && (lane.held || lane.queued || lane.backlog > 0);
+ lane: { held: boolean; queued: boolean; backlog: number; busy?: boolean }) =>
+ startsImplementSession(row) && (lane.held || lane.queued || lane.backlog > 0 || lane.busy === true);
 
 /**
  * The resume queue's journal-only gate for one entry, ahead of the spawn
@@ -217,6 +218,7 @@ export async function resumeNode(nodeId: string, selector: string | undefined, c
    held: journal.laneHolder(lane, { nodeId, repo: map.repo }) !== null,
    queued: journal.getResume(map.repo, nodeId) !== null,
    backlog: journal.listResumeQueue(lane).length,
+   busy: !isQuiet((ctx.hostLoad ?? realHostLoad)(), config.workers.busyLoad),
   })) {
    await identityGate(config, map);
    owned();
@@ -245,7 +247,7 @@ export async function processResumeQueue(
 ): Promise<void> {
  const { journal, config } = ctx;
  const waiting = new Set<ImplementLane>();
- // One reading per tick, taken only when a load-queued entry reaches its gate.
+ // One reading per tick, taken only when an entry reaches its host gate.
  let host: HostLoadReading | undefined;
  const readHost = () => (host ??= (ctx.hostLoad ?? realHostLoad)());
  for (const entry of journal.listResumeQueue()) {
@@ -281,10 +283,9 @@ export async function processResumeQueue(
    waiting.add(entry.lane);
    continue;
   }
-  // A resume queued for load waits for a quiet host: not a failed start, and
-  // it holds nothing behind it, so an operator's entry or a claim may take
-  // the lane meanwhile. One event per entry per tick says why it waits.
-  const busy = entry.reason === "host-load" ? quietHostGate(entry, readHost()) : null;
+  // A queued resume waits for a quiet host: not a failed start, and it holds
+  // nothing behind it. One event per entry per tick says why it waits.
+  const busy = quietHostGate(readHost(), config.workers.busyLoad);
   if (busy !== null) {
    owned();
    journal.recordEvent("reviewed", { nodeId: entry.nodeId, repo: entry.repo, detail: `queued resume #${entry.nodeId} is ${busy}` });

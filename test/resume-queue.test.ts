@@ -873,27 +873,46 @@ describe("a resume queued for host load (node #297)", () => {
   });
  });
 
- test("holds nothing behind it: an operator's entry still starts on a busy host", async () => {
+ test("an operator's --when-free entry waits on a busy host too, and holds nothing behind it", async () => {
   await withRig(async r => {
-   loadQueue(r, "40");
    r.queue("41");
+   loadQueue(r, "40");
    const spawned: string[] = [];
-   await walk({ ...r, hostLoad: () => BUSY, now: () => NOW,
+   const tick = (host: { load: number; cores: number }) => walk({ ...r, hostLoad: () => host, now: () => NOW,
     spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; } });
+   await tick(BUSY);
+   expect(spawned).toEqual([]);
+   expect(r.journal.listResumeQueue().map(e => [e.nodeId, e.failedStarts])).toEqual([["41", 0], ["40", 0]]);
+   expect(waits(r)).toEqual([
+    "queued resume #40 is waiting for a quiet host: load 14.0 on 10 cores",
+    "queued resume #41 is waiting for a quiet host: load 14.0 on 10 cores",
+   ]);
+   await tick(QUIET);
    expect(spawned).toEqual(["41"]);
-   expect(r.journal.listResumeQueue().map(e => e.nodeId)).toEqual(["40"]);
   });
  });
 
- test("an operator's entry never reads the host load", async () => {
+ test("workers.busyLoad sets where the host counts as busy", async () => {
   await withRig(async r => {
    r.queue("41");
-   let reads = 0;
+   r.config.workers.busyLoad = 20;
    const spawned: string[] = [];
-   await walk({ ...r, hostLoad: () => { reads++; return BUSY; }, now: () => NOW,
+   await walk({ ...r, hostLoad: () => BUSY, now: () => NOW,
     spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; } });
-   expect(spawned).toEqual(["41"]);
-   expect(reads).toBe(0);
+   expect(spawned).toEqual(["41"]); // load 14 on 10 cores is below 20
+  });
+ });
+
+ test("resume-node --when-free queues on a busy host rather than starting; a plain resume-node starts", async () => {
+  await withRig(async r => {
+   r.worker("40", 1, "failed");
+   const spawned: string[] = [];
+   const ctx = { ...r, hostLoad: () => BUSY, spawnRunNode: async ({ nodeId }: { nodeId: string }) => { spawned.push(nodeId); return process.pid; } };
+   expect(await resumeNode("40", undefined, ctx, { whenFree: true })).toMatchObject({ queued: true });
+   expect(spawned).toEqual([]);
+   r.journal.removeResume(r.journal.listResumeQueue()[0], "resume-cancelled", "test");
+   expect(await resumeNode("40", undefined, ctx)).toMatchObject({ kind: "started", pid: process.pid });
+   expect(spawned).toEqual(["40"]);
   });
  });
 
@@ -910,7 +929,7 @@ describe("a resume queued for host load (node #297)", () => {
   });
  });
 
- test("ranger serve shows the wait reason, and the next entry as the lane's head", async () => {
+ test("ranger serve shows each entry's wait reason on a busy host, and the head once it is quiet", async () => {
   await withRig(async r => {
    loadQueue(r, "40");
    r.queue("41");
@@ -918,8 +937,11 @@ describe("a resume queued for host load (node #297)", () => {
    const read = (host: { load: number; cores: number }) =>
     stateFromJournal(r.config, maps, new ServeReader(r.config, maps, r.config.state.journalPath), NOW, () => host).resumeQueue.headless;
    const busy = read(BUSY);
-   expect(busy.waits).toEqual([{ repo: REPO, nodeId: "40", reason: "waiting for a quiet host: load 14.0 on 10 cores" }]);
-   expect(busy.head).toMatchObject({ nodeId: "41", starts: true });
+   expect(busy.waits).toEqual([
+    { repo: REPO, nodeId: "40", reason: "waiting for a quiet host: load 14.0 on 10 cores" },
+    { repo: REPO, nodeId: "41", reason: "waiting for a quiet host: load 14.0 on 10 cores" },
+   ]);
+   expect(busy.head).toBeNull();
    const quiet = read(QUIET);
    expect(quiet.waits).toEqual([]);
    expect(quiet.head).toMatchObject({ nodeId: "40", starts: true });

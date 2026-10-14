@@ -216,8 +216,10 @@ export interface StateInputs {
  awaitingMerge?: NeedsYouEntry[];
  /** The journal's resume queue, every lane, FIFO (node #166); absent means empty. */
  resumeQueue?: ResumeQueueRow[];
- /** This host's load now: a resume queued for load waits while it is busy (node #297); absent never waits. */
+ /** This host's load now: a queued resume waits while it is busy (node #297); absent never waits. */
  hostLoad?: HostLoadReading;
+ /** `workers.busyLoad`: the load the host counts as busy at; absent means the core count. */
+ busyLoad?: number;
 }
 
 /** One lane's queued resumes, FIFO, and what the next tick does with them. */
@@ -419,7 +421,7 @@ function planQueueHeads(
    lane.head = { ...at, starts: false, reason: held };
    continue;
   }
-  const busy = quietHostGate(entry, inputs.hostLoad);
+  const busy = quietHostGate(inputs.hostLoad, inputs.busyLoad);
   if (busy !== null) {
    lane.waits.push({ ...at, reason: busy });
    continue;
@@ -2051,6 +2053,7 @@ export function stateFromJournal(
    spawnsToday: journal?.spawnsToday(now) ?? 0,
    spawnCap: config.workers.spawnCapPerDay,
    hostLoad: hostLoad(),
+   busyLoad: config.workers.busyLoad,
    vetoed: (id, repo) => vetoes.some((v) => vetoApplies(v, id, repo)),
    pidAlive: defaultPidAlive,
    refreshing: reader.refreshing,

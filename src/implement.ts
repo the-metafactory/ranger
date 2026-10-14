@@ -592,8 +592,11 @@ export type { HostLoad } from "./host-load.ts";
 /** How long a probe run waits for the host to quiet down before running anyway. */
 const QUIET_HOST = { pollMs: 30_000, maxMs: 20 * 60_000 };
 
+/** `workers.busyLoad`: the 1-minute load the host counts as busy at; unset, the core count. */
+const busyLoad = (ctx: ImplementContext) => ctx.config?.workers?.busyLoad;
+
 /**
- * Wait until the 1-minute load is below the core count before a probe run.
+ * Wait until the host is quiet (`isQuiet`) before a probe or test run.
  * The browser probes are timing-sensitive, and the headless lane's worker and
  * test runs load the same host (2026-10-04: probe-gamepad failed at peak load
  * 28.6 on 10 cores during node 58's fix pass, and the immediate retry ran
@@ -605,7 +608,7 @@ async function awaitQuietHost(ctx: ImplementContext, run: string): Promise<HostL
  const read = ctx.hostLoad ?? realHostLoad;
  const { pollMs, maxMs } = ctx.quietHost ?? QUIET_HOST;
  let host = read();
- if (isQuiet(host)) return host;
+ if (isQuiet(host, busyLoad(ctx))) return host;
  const nodeId = ctx.node.ref.id;
  const repo = ctx.map.repo;
  const started = Date.now();
@@ -614,7 +617,7 @@ async function awaitQuietHost(ctx: ImplementContext, run: string): Promise<HostL
   repo,
   detail: `${run} waits for the host: load ${host.load.toFixed(1)} on ${host.cores} cores`,
  });
- while (host.load >= host.cores && Date.now() - started < maxMs) {
+ while (!isQuiet(host, busyLoad(ctx)) && Date.now() - started < maxMs) {
   await new Promise((r) => setTimeout(r, pollMs));
   host = read();
  }
@@ -623,7 +626,7 @@ async function awaitQuietHost(ctx: ImplementContext, run: string): Promise<HostL
   nodeId,
   repo,
   detail:
-   host.load < host.cores
+   isQuiet(host, busyLoad(ctx))
     ? `${run} starts after ${waited}s: load ${host.load.toFixed(1)} on ${host.cores} cores`
     : `${run} starts on a busy host after ${waited}s: load ${host.load.toFixed(1)} on ${host.cores} cores`,
  });
@@ -2789,6 +2792,10 @@ async function supervisorTests(
 ): Promise<{ tests: RunResult; retried: boolean; baseRed?: BaseRedTests; busy?: HostLoadReading }> {
  const { journal, map, node, worktree } = ctx;
  const head = await headSha(worktree);
+ // A full suite started on a busy host is what times out (2026-10-14: soma's
+ // 6-minute suite ran past the 20-minute timeout at load 45-55 on 10 cores):
+ // wait for a quiet host first, then run anyway, as the probe tier does.
+ if (!remoteTests(ctx)) await awaitQuietHost(ctx, "the supervisor test run");
  let tests = await backendTests(ctx, head, () => runShell(testCommand, worktree, ctx, { label: `${label}: supervisor tests`, timeoutMs: TEST_TIMEOUT_MS, measureCpu: true }));
  if (remoteTests(ctx)) return { tests, retried: false };
  if (tests.code === 0) return { tests, retried: false };
@@ -2813,7 +2820,8 @@ async function supervisorTests(
   journal.recordEvent("reviewed", { nodeId: node.ref.id, repo: map.repo, detail: `tests (${testCommand}) passed on the retry in a fresh checkout` });
   return { tests, retried: true };
  }
- if (retry.busy !== null) return { tests, retried: false, busy: retry.busy };
+ const busy = retry.busy ?? killedOnBusyHost(ctx, tests);
+ if (busy !== null) return { tests, retried: false, busy };
  return { tests, retried: false, ...await baseRedAt(ctx, { testCommand, tests, head, label, baseTip }) };
 }
 
@@ -3000,7 +3008,7 @@ async function retryOnBusyHost(
  label: string,
 ): Promise<{ ran: boolean; result: RunResult; busy: HostLoadReading | null } | null> {
  const host = (ctx.hostLoad ?? realHostLoad)();
- if (isQuiet(host)) return null;
+ if (isQuiet(host, busyLoad(ctx))) return null;
  ctx.journal.recordEvent("reviewed", {
   nodeId: ctx.node.ref.id,
   repo: ctx.map.repo,
@@ -3014,7 +3022,7 @@ async function retryOnBusyHost(
   return fresh.result;
  };
  const result = ctx.map.testBackend?.kind === "shadow" ? await backendTests(ctx, sha, local) : await local();
- return { ran, result, busy: isQuiet(started) ? null : started };
+ return { ran, result, busy: isQuiet(started, busyLoad(ctx)) ? null : started };
 }
 
 /**
@@ -3024,6 +3032,19 @@ async function retryOnBusyHost(
  */
 function hostLoadPark(host: HostLoadReading, what: string, tests: RunResult): HostLoadPark {
  return new HostLoadPark(hostLoadOutcome({ ...host, what, names: failedTestNames(tests) }), host);
+}
+
+/**
+ * A retry that started on a quiet host but was killed (exit -1: the test
+ * timeout, or a signal) with no failing test while the host is busy now got
+ * no verdict: the load ended it, not the code. The load now, or null when
+ * the run named a failure or the host is quiet (2026-10-14: soma #802 and
+ * #853 parked on 20-minute timeouts with no failing test).
+ */
+function killedOnBusyHost(ctx: ImplementContext, tests: RunResult): HostLoadReading | null {
+ if (tests.code !== -1 || allFailedTestNames(tests).length > 0) return null;
+ const host = (ctx.hostLoad ?? realHostLoad)();
+ return isQuiet(host, busyLoad(ctx)) ? null : host;
 }
 
 /**
@@ -3193,13 +3214,14 @@ async function adoptBuiltWork(
  // the same one retry as any supervisor test run, or a load flake would hand
  // finished work back to a worker with nothing left to commit.
  // Each attempt keeps its own output in the worker log, the retry's included.
+ if (!remoteTests(ctx)) await awaitQuietHost(ctx, "the adoption test run");
  let tests = await backendTests(ctx, sha, () => testsInFreshCheckout(ctx, testCommand, sha, `adopted ${what}: supervisor tests`));
  let busy: HostLoadReading | null = null;
  if (tests.code !== 0) {
   const retry = remoteTests(ctx) ? null : await retryOnBusyHost(ctx, testCommand, sha, "adoption tests", "the adoption test retry", `adopted ${what}: supervisor test retry`);
   if (retry !== null) {
    tests = retry.result;
-   if (retry.ran) busy = retry.busy;
+   if (retry.ran) busy = retry.busy ?? killedOnBusyHost(ctx, tests);
   }
  }
  const clean = await assertGitUntouched(ctx.canonical, snapshot);
