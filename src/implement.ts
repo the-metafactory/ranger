@@ -3081,6 +3081,16 @@ async function freshCheckoutTests(
    const set = await git(["remote", "set-url", "origin", originUrl.stdout.trim()], dir, 10_000);
    if (set.code !== 0) return failed(`could not set origin ${forRun}: ${set.stderr.trim()}`);
   }
+  // The base's remote-tracking ref too: a repo's tests may diff against it
+  // (2026-10-14: soma's boundary check runs `git merge-base HEAD origin/main`,
+  // and the single-branch clone failed it on every retry and adoption).
+  // Best effort: the canonical's origin/<base>, else its local <base>; a
+  // canonical with neither runs the tests as before.
+  const baseRef = `refs/remotes/origin/${ctx.map.base}`;
+  for (const source of [baseRef, `refs/heads/${ctx.map.base}`]) {
+   const base = await git(["fetch", "--quiet", "--no-tags", ctx.canonical, `+${source}:${baseRef}`], dir, 300_000);
+   if (base.code === 0) break;
+  }
   const checkout = await git(["-c", "advice.detachedHead=false", "checkout", "--quiet", "--detach", sha], dir, 120_000);
   if (checkout.code !== 0) return failed(`could not check out ${sha.slice(0, 8)} ${forRun}: ${checkout.stderr.trim()}`);
   if (ctx.map.commands.install !== undefined) {
