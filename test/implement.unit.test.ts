@@ -611,6 +611,15 @@ describe("the implement prompt runs the full test command once (found live on ra
   expect(prompt).toContain("run only the test files that cover what you changed");
   expect(prompt).toContain("full test command (bun test && bunx tsc --noEmit) ONCE, right before your final commit");
  });
+ test("tests stay on this host: no VM or container runtime; failures the base has are committed, not worked around", async () => {
+  const { assembleImplementPrompt } = await import("../src/prompt.ts");
+  for (const prompt of [assembleImplementPrompt(base), assembleImplementPrompt({ ...base, remoteTests: true })]) {
+   expect(prompt).toContain("Never start or configure a VM,\n  container runtime or container");
+   expect(prompt).toContain("rdctl, Rancher Desktop");
+   expect(prompt).toContain("lets through failures that are red there too");
+   expect(prompt).toContain("Only an unmet precondition is a block; a hard task or failing tests are not.");
+  }
+ });
  test("remote tests keep their own rule", async () => {
   const { assembleImplementPrompt } = await import("../src/prompt.ts");
   const prompt = assembleImplementPrompt({ ...base, remoteTests: true });

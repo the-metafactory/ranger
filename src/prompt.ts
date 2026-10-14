@@ -165,6 +165,22 @@ const REMOTE_TEST_RULE = `- Leave the map's dependency install and test command 
   the supervisor refuses to push without a matching passed remote receipt.`;
 
 /**
+ * The supervisor's test run on this host is the one that counts, so a worker
+ * that moves the suite into a VM or container certifies nothing and loads the
+ * host (2026-10-14: cortex #2559 and others started Rancher Desktop through
+ * rdctl for a Debian container, whose VM went read-only when the disk filled).
+ * Failures the base already has are the supervisor's to judge: it reruns the
+ * suite at the merge base and lets through tests that fail the same way there.
+ */
+const HOST_RUNTIME_RULE = `- Run every test on this host, as the supervisor does. Never start or configure a VM,
+  container runtime or container to run tests or anything else (rdctl, Rancher Desktop,
+  docker, nerdctl, podman, colima, limactl): the supervisor's run here is the only one
+  that counts. If tests fail on this host for reasons your change did not cause (they
+  fail the same way on the base commit), do not work around them: commit your work and
+  name those tests and their cause in your final message. The supervisor reruns the
+  suite at the merge base and lets through failures that are red there too.`;
+
+/**
  * A worker that cannot do the node reports it instead of committing a note
  * about it (cortex#2557: a committed blocker note became a PR that sage read
  * clean and the merge desk nearly carded).
@@ -183,6 +199,7 @@ const IMPLEMENT_SOP = `Task/build kind SOP (ranger implement lane):
 - Implement the node in this worktree, on the branch that is already checked out
   ({{branch}}). Do not create or switch branches.
 ${LOCAL_TEST_RULE}
+${HOST_RUNTIME_RULE}
 - COMMIT your work on this branch. Do NOT push, open a pull request, merge, comment
   on GitHub, or touch any other branch: the supervisor does all of that, with a
   credential you never hold.
