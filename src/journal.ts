@@ -236,6 +236,7 @@ export interface ResumeQueueRow {
 
 export type EventKind =
  | "ledger-failed"
+ | "ledger-root-serves-invalid"
  | "resume-queued"
  | "resume-cancelled"
  | "resume-dropped"

@@ -105,6 +105,8 @@ export interface RunNodeContext {
  /** A GitLab map's commit identity, from the write gate (`assertWriteIdentity`, node #127). */
  commitAuthor?: CommitAuthor;
  journal: Journal;
+ /** Observe the existing map-root read without fetching it again for the run ledger. */
+ onMapRootRead?: (root: NodeResult) => void;
  /**
   * Worker command + leading args; the prompt is appended as the final arg.
   * Defaults to the selected substrate's command (`workerCommandFor`);
@@ -502,11 +504,9 @@ export async function runNode(
     timeoutMs: GRAPH_CALL_TIMEOUT_MS,
    },
   );
-  if (node.status === "closed") {
-   const github = ctx.github ?? lanePort(config, repo);
-   const pr = await findNodePr(github, repo, node, row?.prNumber, token);
-   return { ...base, ...await finishClosedElsewhere({ ...ctx, node, pr, generation }) };
-  }
+  // Reuse this one root read for the prompt and ledger, including a node
+  // completed elsewhere. A root failure must not change that reconciliation.
+  let rootReadError: unknown;
   const rootNode = await graphNode(
    repo,
    String(map.root),
@@ -514,7 +514,14 @@ export async function runNode(
    {
     timeoutMs: GRAPH_CALL_TIMEOUT_MS,
    },
-  );
+  ).catch(error => { rootReadError = error; return undefined; });
+  if (rootNode !== undefined) ctx.onMapRootRead?.(rootNode);
+  if (node.status === "closed") {
+   const github = ctx.github ?? lanePort(config, repo);
+   const pr = await findNodePr(github, repo, node, row?.prNumber, token);
+   return { ...base, ...await finishClosedElsewhere({ ...ctx, node, pr, generation }) };
+  }
+  if (rootNode === undefined) throw rootReadError;
 
   // A ratified proposal resumes at the close (node #250): the walk's ratify
   // phase saw the principal's 👍 and set the phase; no worker runs again.

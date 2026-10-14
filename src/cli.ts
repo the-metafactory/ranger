@@ -317,10 +317,12 @@ export async function runRunNode(
   const { token, botIdentity, commitAuthor } = await (deps.runNodeContext ?? runNodeContext)(config, map);
   const before = journal.getWorker(nodeId, map.repo)?.generation ?? 0;
   let outcome: RunNodeOutcome | undefined;
+  let mapRoot: { id: string; serves?: unknown } | undefined;
   try {
    outcome = await (deps.runNode ?? runNode)(nodeId, {
     ...deps.worker,
     config, map, token, botIdentity, commitAuthor, journal,
+    onMapRootRead: root => { mapRoot = { id: String(map.root), serves: root.node.serves }; },
    });
    return JSON.stringify(outcome, null, 2);
   } finally {
@@ -332,6 +334,7 @@ export async function runRunNode(
      // beginGeneration increments once; a fenced successor may own `after`.
      generation: before + 1,
      startedAt, endedAt: now().toISOString(), outcome: mapped,
+     mapRoot,
     }, deps.ledger);
    }
   }
