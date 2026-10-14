@@ -408,5 +408,6 @@ export const jobRuns = sqliteTable(
  (table) => [
   uniqueIndex("job_runs_one_queued_idx").on(table.name).where(sql`status = 'queued'`),
   index("job_runs_status_idx").on(table.status, table.id),
+  index("job_runs_unreported_idx").on(table.id).where(sql`reported_at IS NULL AND status IN ('succeeded', 'failed')`),
  ],
 );

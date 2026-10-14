@@ -110,6 +110,12 @@ export interface JobPassContext {
  ledger?: RunLedgerDeps;
 }
 
+/** Does the tick have job work: a run to start, to watch, or to report? */
+export function jobsPending(journal: Pick<Journal, "listJobRuns" | "listUnreportedJobRuns">): boolean {
+ return journal.listJobRuns("queued").length > 0 || journal.listJobRuns("running").length > 0
+  || journal.listUnreportedJobRuns().length > 0;
+}
+
 export function emptyJobPass(): JobPassResult {
  return { started: [], waiting: [], failed: [], errors: [] };
 }
@@ -161,8 +167,8 @@ async function failRun(
  */
 export async function sweepJobs(ctx: JobPassContext, result: JobPassResult): Promise<void> {
  const now = ctx.now?.() ?? new Date();
- for (const run of [...ctx.journal.listJobRuns("succeeded"), ...ctx.journal.listJobRuns("failed")]) {
-  if (run.reportedAt !== null || (run.pid !== null && pidAlive(run.pid))) continue;
+ for (const run of ctx.journal.listUnreportedJobRuns()) {
+  if (run.pid !== null && pidAlive(run.pid)) continue;
   await reportRun(ctx, run.id);
  }
  for (const run of ctx.journal.listJobRuns("running")) {

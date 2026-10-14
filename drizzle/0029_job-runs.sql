@@ -7,3 +7,5 @@ reason text, result text, log text, reported_at text);
 CREATE UNIQUE INDEX job_runs_one_queued_idx ON job_runs (name) WHERE status = 'queued';
 --> statement-breakpoint
 CREATE INDEX job_runs_status_idx ON job_runs (status, id);
+--> statement-breakpoint
+CREATE INDEX job_runs_unreported_idx ON job_runs (id) WHERE reported_at IS NULL AND status IN ('succeeded', 'failed');

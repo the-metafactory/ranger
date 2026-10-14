@@ -536,6 +536,18 @@ export class Journal {
   }
  }
 
+ /** Finished runs whose envelope was never handed to the ledger (the sweep reports them). */
+ listUnreportedJobRuns(): JobRunRow[] {
+  try {
+   return this.db.select().from(jobRuns)
+    .where(and(isNull(jobRuns.reportedAt), inArray(jobRuns.status, ["succeeded", "failed"])))
+    .orderBy(asc(jobRuns.id)).all();
+  } catch (error) {
+   if (/no such table: job_runs/.test(String(error))) return [];
+   throw error;
+  }
+ }
+
  getJobRun(id: number): JobRunRow | null {
   return this.db.select().from(jobRuns).where(eq(jobRuns.id, id)).get() ?? null;
  }

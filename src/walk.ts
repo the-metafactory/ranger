@@ -23,7 +23,7 @@ import { classifyFrontier, loadProbeRegistry } from "./route.ts";
 import type { ForgePort } from "./forge.ts";
 import { probeRequeueCandidates, requeueProbes, type ProbeRequeueResult } from "./probe-requeue.ts";
 import { sweepMap, type SweepMapResult } from "./sweep.ts";
-import { emptyJobPass, jobPass, type JobPassResult, type SpawnJobArgs } from "./jobs.ts";
+import { emptyJobPass, jobPass, jobsPending, type JobPassResult, type SpawnJobArgs } from "./jobs.ts";
 import { intakePass, type IntakeContext, type IntakeResult } from "./intake.ts";
 import { gateProposeReads, ratifyPass, rebuildVetoes, type RatifyResult } from "./ratify.ts";
 import { refuseProposalCard } from "./card-sync.ts";
@@ -499,8 +499,8 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
  // Pass 1e — scheduled jobs (node #301): a queued job takes its free lane
  // after the send-backs and queued resumes, before any fresh claim, and a
  // lane it takes is closed to this tick's claims. A dead job supervisor is
- // failed here too.
- if (journal.listJobRuns("queued").length > 0 || journal.listJobRuns("running").length > 0) {
+ // failed here too, and a finished run it never reported is reported.
+ if (jobsPending(journal)) {
   try {
    result.jobs = await withClaimLock(journal, () => jobPass({
     config, configPath: ctx.configPath, journal, cliEntry, takenLanes: implementClaimed,
