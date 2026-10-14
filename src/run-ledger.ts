@@ -144,16 +144,28 @@ function cardRunPayloads(
 export async function emitNodeRunFinished(
  config: RangerConfig,
  journal: Pick<Journal, "recordEvent" | "path">,
- run: { repo: string; nodeId: string; generation: number; startedAt: string; endedAt: string; outcome: RunOutcome },
+ run: { repo: string; nodeId: string; generation: number; startedAt: string; endedAt: string; outcome: RunOutcome; mapRoot?: { id: string; serves?: unknown } },
  deps: RunLedgerDeps = {},
 ): Promise<void> {
  return emitRunFinished(config, journal, env => {
   const node = nodeKey(run.repo, run.nodeId);
+  const root = run.mapRoot;
+  const rootGoal = root?.serves;
+  const validRootGoal = typeof rootGoal === "string" && /^G\d+$/.test(rootGoal) && rootGoal === rootGoal.trim();
+  if (root !== undefined && rootGoal !== undefined && !validRootGoal) {
+   try {
+    journal.recordEvent("ledger-root-serves-invalid", {
+     repo: run.repo, nodeId: root.id,
+     detail: `ignoring malformed serves on map root ${nodeKey(run.repo, root.id)}; expected G<n>`,
+    });
+   } catch {} // A diagnostic must never suppress the envelope or change the run result.
+  }
+  const goal = validRootGoal ? rootGoal : env.MF_SERVES_GOAL;
   return [{
    run_id: randomUUID(),
    producer: "ranger",
    ran: { kind: "node", ref: node },
-   serves: { node, ...(env.MF_SERVES_GOAL ? { goal: env.MF_SERVES_GOAL } : {}) },
+   serves: { node, ...(goal ? { goal } : {}) },
    outcome: run.outcome,
    started_at: run.startedAt,
    ended_at: run.endedAt,

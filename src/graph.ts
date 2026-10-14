@@ -62,6 +62,8 @@ export interface FrontierEntryNode {
   kind: string;
   autonomy: string;
   checkpointId?: string;
+  /** Root-only goal ID; validate at the ledger boundary, tolerating malformed metadata. */
+  serves?: unknown;
   probes?: { type: string; [key: string]: unknown }[];
   /** Soma's persisted binding for a gated close. */
   completion?: { closer: string; receiptCommentId: string; closedAt: string };
