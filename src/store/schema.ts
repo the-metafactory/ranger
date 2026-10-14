@@ -6,6 +6,7 @@ import {
  sqliteTable,
  text,
 } from "drizzle-orm/sqlite-core";
+import { sql } from "drizzle-orm";
 
 /** The substrates a worker session or review runs on (node #45). */
 export const SUBSTRATE_NAMES = ["claude", "codex", "pi"] as const;
@@ -362,5 +363,44 @@ export const intakeDrafts = sqliteTable(
  (table) => [
   index("intake_drafts_repo_root_idx").on(table.repo, table.root),
   index("intake_drafts_channel_status_idx").on(table.channelId, table.status),
+ ],
+);
+
+/** A job run's states (node #301): queued → running → succeeded | failed. */
+export const JOB_RUN_STATUSES = ["queued", "running", "succeeded", "failed"] as const;
+export type JobRunStatus = (typeof JOB_RUN_STATUSES)[number];
+
+/**
+ * Scheduled job runs (node #301): one row per enqueue that queued. A job is
+ * named in ranger.yaml `jobs`; it claims no node and writes no graph. At most
+ * one run per job is queued at once (the partial unique index), so a second
+ * enqueue before the run starts is a no-op. A running row holds its resource
+ * lane like an implement session (`Journal.laneHolder`).
+ */
+export const jobRuns = sqliteTable(
+ "job_runs",
+ {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  name: text("name").notNull(),
+  lane: text("lane", { enum: ["visual", "headless"] }).notNull(),
+  status: text("status", { enum: JOB_RUN_STATUSES }).notNull().default("queued"),
+  queuedAt: text("queued_at").notNull(),
+  startedAt: text("started_at"),
+  finishedAt: text("finished_at"),
+  /** The detached `ranger job run` supervisor. */
+  pid: integer("pid"),
+  /** The skill session's process group, killed on the wall-clock budget. */
+  pgid: integer("pgid"),
+  substrate: text("substrate", { enum: SUBSTRATE_NAMES }),
+  /** Why a run failed: budget | exit <n> | crashed | spawn | substrate. */
+  reason: text("reason"),
+  /** What the skill reported (its result file), kept whether or not it rides the ledger. */
+  result: text("result"),
+  /** The session log. */
+  log: text("log"),
+ },
+ (table) => [
+  uniqueIndex("job_runs_one_queued_idx").on(table.name).where(sql`status = 'queued'`),
+  index("job_runs_status_idx").on(table.status, table.id),
  ],
 );

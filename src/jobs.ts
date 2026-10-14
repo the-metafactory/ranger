@@ -1,0 +1,346 @@
+/**
+ * Scheduled jobs (node #301): a Reflex fire enqueues a named job
+ * (`ranger job enqueue <name>`, through a cortex process spec); the next tick
+ * runs the job's skill headless on the lane the job declares, within its
+ * wall clock and the spawn budget, and reports one `execution.run.finished`
+ * per run. A job opens no PR, claims no node and writes no graph.
+ *
+ * enqueue → queued row (one per job at a time) → the tick's job pass reserves
+ * the lane (running row) and spawns a detached `ranger job run <id>` → the
+ * supervisor picks a substrate, runs the session, records the outcome and
+ * emits the envelope. The tick's job sweep fails a run whose supervisor died.
+ */
+import { spawn } from "node:child_process";
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import type { RunOutcome } from "@the-metafactory/myelin";
+import { expandHome, type RangerConfig, type RangerJobConfig } from "./config.ts";
+import { pidAlive, killProcessGroup, processGroupCommands, runCmd, type RunOptions, type RunResult } from "./exec.ts";
+import type { JobRunRow, Journal } from "./journal.ts";
+import { JOURNAL_PATH_ENV, sessionJournalPath } from "./journal-guard.ts";
+import type { ImplementLane } from "./lanes.ts";
+import { emitJobRunFinished, type RunLedgerDeps } from "./run-ledger.ts";
+import type { SubstrateName } from "./store/schema.ts";
+import { selectSubstrate, workerCommandFor, workerOutputFor, type SubstrateReaders } from "./substrate.ts";
+import { selectForBuild } from "./substrate-policy.ts";
+import { workerHostEnv } from "./worker-env.ts";
+
+/** Where a job's session writes what it produced (e.g. `soma:outputs/…`), for `result_ref`. */
+export const JOB_RESULT_ENV = "RANGER_JOB_RESULT_FILE";
+/** The longest result ranger keeps from a session. */
+const RESULT_MAX_CHARS = 2_000;
+
+export class JobError extends Error {
+ override readonly name = "JobError";
+}
+
+/** The job named `name` in ranger.yaml; an unknown name throws. */
+export function findJob(config: RangerConfig, name: string): RangerJobConfig {
+ const job = config.jobs?.find(j => j.name === name);
+ if (job === undefined) {
+  const known = (config.jobs ?? []).map(j => j.name);
+  throw new JobError(`no job named '${name}' in ranger.yaml${known.length === 0 ? " (no jobs declared)" : `; jobs: ${known.join(", ")}`}`);
+ }
+ return job;
+}
+
+/**
+ * Queue a run of a declared job. A second enqueue while a run is still
+ * queued is a no-op (`queued: false`); an unknown name throws and queues nothing.
+ */
+export function enqueueJob(
+ config: RangerConfig,
+ journal: Pick<Journal, "enqueueJobRun">,
+ name: string,
+ now = new Date(),
+): { name: string; runId: number; lane: ImplementLane; queued: boolean } {
+ const job = findJob(config, name);
+ const { run, queued } = journal.enqueueJobRun(job.name, job.lane, now);
+ return { name: job.name, runId: run.id, lane: job.lane, queued };
+}
+
+// ---- the tick's job pass ----
+
+export interface SpawnJobArgs {
+ runId: number;
+ cliEntry: string;
+ configPath: string;
+}
+
+export function jobRunArgv(args: SpawnJobArgs): string[] {
+ // The same bun pins as a detached run-node (spawn.ts runNodeArgv).
+ return [
+  `--config=${join(dirname(args.cliEntry), "..", "bunfig.toml")}`,
+  "--no-env-file",
+  args.cliEntry,
+  "job",
+  "run",
+  String(args.runId),
+  "--config",
+  args.configPath,
+ ];
+}
+
+/** Launch a detached `ranger job run <id>` that outlives the tick. Null when nothing spawned. */
+export async function spawnJobDetached(args: SpawnJobArgs): Promise<number | null> {
+ const child = spawn(process.execPath, jobRunArgv(args), { detached: true, stdio: "ignore", env: process.env });
+ child.on("error", () => {});
+ child.unref();
+ return child.pid ?? null;
+}
+
+export interface JobPassResult {
+ started: { runId: number; name: string; lane: ImplementLane; pid: number }[];
+ waiting: { runId: number; name: string; reason: string }[];
+ /** Runs this pass ended: a dead supervisor, a job no longer declared, a failed spawn. */
+ failed: { runId: number; name: string; reason: string }[];
+ errors: string[];
+}
+
+export interface JobPassContext {
+ config: RangerConfig;
+ configPath: string;
+ journal: Journal;
+ spawnJob?: (args: SpawnJobArgs) => Promise<number | null>;
+ now?: () => Date;
+ /** Lanes an implement claim or resume took earlier in this tick. */
+ takenLanes?: Set<ImplementLane>;
+ cliEntry?: string;
+ ledger?: RunLedgerDeps;
+}
+
+export function emptyJobPass(): JobPassResult {
+ return { started: [], waiting: [], failed: [], errors: [] };
+}
+
+/** End a run that never reached a session, or whose supervisor died, and report it. */
+async function failRun(
+ ctx: Pick<JobPassContext, "config" | "journal" | "ledger">,
+ run: JobRunRow,
+ reason: string,
+ now: Date,
+): Promise<boolean> {
+ const ended = now.toISOString();
+ if (!ctx.journal.updateJobRun(run.id, run.status, { status: "failed", reason, finishedAt: ended, pid: null, pgid: null })) return false;
+ ctx.journal.recordEvent("job-finished", { detail: `job ${run.name} run ${run.id} failed: ${reason}` });
+ await emitJobRunFinished(ctx.config, ctx.journal, {
+  name: run.name, startedAt: run.startedAt ?? run.queuedAt, endedAt: ended, outcome: "failed", log: run.log,
+ }, ctx.ledger);
+ return true;
+}
+
+/**
+ * A running run whose supervisor is gone failed (`crashed`). Its session
+ * group may outlive it on the GPU, so the group is killed, but only after
+ * `ps` confirms it still runs the job's skill: a recycled group id is never
+ * killed on the journal's word alone.
+ */
+export async function sweepJobs(ctx: JobPassContext, result: JobPassResult): Promise<void> {
+ const now = ctx.now?.() ?? new Date();
+ for (const run of ctx.journal.listJobRuns("running")) {
+  if (run.pid === null || pidAlive(run.pid)) continue;
+  const skill = ctx.config.jobs?.find(j => j.name === run.name)?.skill;
+  if (run.pgid !== null && skill !== undefined) {
+   const commands = await processGroupCommands(run.pgid);
+   if (commands.some(c => c.includes(skill))) killProcessGroup(run.pgid);
+  }
+  if (await failRun(ctx, run, "crashed", now)) result.failed.push({ runId: run.id, name: run.name, reason: "crashed" });
+ }
+}
+
+/**
+ * Start each queued run whose lane is free, FIFO. A run waits while the
+ * dead-man switch is paused, its lane is drained, the day's spawn cap is
+ * spent, or its lane is held (an implement session, another job, or a claim
+ * earlier in this tick). Call under the claim lock, before fresh claims.
+ */
+export async function jobPass(ctx: JobPassContext): Promise<JobPassResult> {
+ const { config, journal } = ctx;
+ const result = emptyJobPass();
+ await sweepJobs(ctx, result);
+ const taken = ctx.takenLanes ?? new Set<ImplementLane>();
+ for (const run of journal.listJobRuns("queued")) {
+  const now = ctx.now?.() ?? new Date();
+  const job = config.jobs?.find(j => j.name === run.name);
+  if (job === undefined) {
+   if (await failRun(ctx, run, "job no longer declared", now)) {
+    result.failed.push({ runId: run.id, name: run.name, reason: "job no longer declared" });
+   }
+   continue;
+  }
+  const lane = run.lane;
+  const wait = (reason: string) => result.waiting.push({ runId: run.id, name: run.name, reason });
+  if (journal.isPaused()) { wait("dead-man paused"); continue; }
+  if (lane === "visual" && journal.isVisualLaneDrained()) { wait("visual lane drained"); continue; }
+  if (journal.spawnsToday(now) >= config.workers.spawnCapPerDay) { wait("daily spawn cap reached"); continue; }
+  if (taken.has(lane)) { wait(`the ${lane} lane was taken this tick`); continue; }
+  const holder = journal.laneHolder(lane);
+  if (holder !== null) {
+   wait(`the ${lane} lane is held by ${holder.job === undefined ? `#${holder.nodeId} (${holder.repo}#${holder.root})` : `job ${holder.job}`}`);
+   continue;
+  }
+  // Reserve the lane before spawning: the child must find a running row,
+  // and every other scheduler must see the lane occupied.
+  if (!journal.updateJobRun(run.id, "queued", { status: "running", startedAt: now.toISOString() })) continue;
+  taken.add(lane);
+  journal.recordSpawn(now);
+  let pid: number | null = null;
+  try {
+   pid = await (ctx.spawnJob ?? spawnJobDetached)({
+    runId: run.id,
+    cliEntry: ctx.cliEntry ?? join(import.meta.dir, "cli.ts"),
+    configPath: ctx.configPath,
+   });
+  } catch (error) {
+   result.errors.push(`job ${run.name}: spawn failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  const running = journal.getJobRun(run.id)!;
+  if (pid === null) {
+   if (await failRun(ctx, running, "spawn", now)) result.failed.push({ runId: run.id, name: run.name, reason: "spawn" });
+   continue;
+  }
+  // The child may already have recorded its own pid (the same process).
+  if (running.pid === null) journal.updateJobRun(run.id, "running", { pid });
+  journal.recordEvent("job-started", { detail: `job ${run.name} run ${run.id} started on the ${lane} lane (pid ${pid})` });
+  result.started.push({ runId: run.id, name: run.name, lane, pid });
+ }
+ return result;
+}
+
+// ---- the supervisor: `ranger job run <id>` ----
+
+/** The session prompt: Claude invokes the skill as a slash command; Codex and Pi are asked to use it. */
+export function jobPrompt(job: Pick<RangerJobConfig, "skill" | "prompt">, substrate: SubstrateName): string {
+ const rest = job.prompt.trim();
+ return substrate === "claude"
+  ? `/${job.skill}${rest === "" ? "" : ` ${rest}`}`
+  : `Use the ${job.skill} skill.${rest === "" ? "" : ` ${rest}`}`;
+}
+
+/** The run's session log, next to the journal (like a worker's). */
+export function jobLogFile(journalPath: string, name: string, runId: number): string {
+ return join(dirname(journalPath), "logs", "jobs", `${name}-${runId}.log`);
+}
+
+function saveJobLog(journalPath: string, run: JobRunRow, substrate: SubstrateName, result: RunResult): string | null {
+ const file = jobLogFile(journalPath, run.name, run.id);
+ try {
+  mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
+  appendFileSync(file, [
+   `===== ${new Date().toISOString()} job ${run.name} run ${run.id} on ${substrate} — exit ${result.code}${result.timedOut ? " (wall clock)" : ""}`,
+   "----- stdout", result.stdout, "----- stderr", result.stderr, "",
+  ].join("\n"), { mode: 0o600 });
+  return file;
+ } catch {
+  return null; // The log is evidence, never a gate.
+ }
+}
+
+function readResult(file: string): string | null {
+ try {
+  const text = readFileSync(file, "utf8").split("\n")[0]?.trim() ?? "";
+  return text === "" ? null : text.slice(0, RESULT_MAX_CHARS);
+ } catch {
+  return null;
+ }
+}
+
+export interface RunJobContext {
+ config: RangerConfig;
+ journal: Journal;
+ now?: () => Date;
+ /** The session runner (tests inject a fake substrate). */
+ runSession?: (bin: string, args: string[], opts: RunOptions) => Promise<RunResult>;
+ /** Substrate quota readers (tests inject fakes, as the implement lane's do). */
+ substrateReaders?: SubstrateReaders;
+ /** Pin the substrate instead of picking by quota. */
+ substrate?: SubstrateName;
+ ledger?: RunLedgerDeps;
+}
+
+export interface RunJobOutcome {
+ runId: number;
+ name: string;
+ status: "succeeded" | "failed" | "refused";
+ reason?: string;
+ substrate?: SubstrateName;
+ result?: string | null;
+ log?: string | null;
+}
+
+/**
+ * Supervise one job run the tick started: pick the substrate (quota-picked
+ * among the job's `substrates`), run the skill session in the job's cwd under
+ * the worker host env (no ranger credentials, a per-session journal), kill it
+ * at the wall clock, then record the outcome and emit exactly one envelope.
+ */
+export async function runJob(runId: number, ctx: RunJobContext): Promise<RunJobOutcome> {
+ const { config, journal } = ctx;
+ const now = () => ctx.now?.() ?? new Date();
+ const run = journal.getJobRun(runId);
+ if (run === null || run.status !== "running") {
+  return { runId, name: run?.name ?? "?", status: "refused", reason: run === null ? "no such run" : `run is ${run.status}, not running` };
+ }
+ journal.updateJobRun(runId, "running", { pid: process.pid });
+ let job: RangerJobConfig;
+ try {
+  job = findJob(config, run.name);
+ } catch (error) {
+  await failRun(ctx, run, "job no longer declared", now());
+  return { runId, name: run.name, status: "failed", reason: (error as Error).message };
+ }
+
+ let substrate = ctx.substrate ?? job.substrates[0];
+ if (ctx.substrate === undefined) {
+  try {
+   const picked = (await selectSubstrate(journal, {
+    config: config.substrates, excluded: new Set(), readers: ctx.substrateReaders, pick: selectForBuild,
+   })).substrate;
+   if (job.substrates.includes(picked)) substrate = picked;
+  } catch {
+   // No reading: the job's first substrate runs it.
+  }
+ }
+ journal.updateJobRun(runId, "running", { substrate });
+
+ const scratch = mkdtempSync(join(tmpdir(), "ranger-job-"));
+ const resultFile = join(scratch, "result");
+ const command = workerCommandFor(substrate, config);
+ const output = workerOutputFor(substrate);
+ let raw: RunResult;
+ try {
+  raw = await (ctx.runSession ?? runCmd)(command[0], [...command.slice(1), jobPrompt(job, substrate)], {
+   cwd: expandHome(job.cwd),
+   timeoutMs: job.wallClockMin * 60_000,
+   processGroup: true,
+   // A visual job (GPU capture) keeps normal priority, as the browser probes do.
+   nice: job.lane === "visual" ? undefined : config.workers.niceness,
+   env: { ...workerHostEnv(), [JOURNAL_PATH_ENV]: sessionJournalPath(), [JOB_RESULT_ENV]: resultFile },
+   onSpawn: pgid => journal.updateJobRun(runId, "running", { pgid }),
+   ...output.runOptions,
+  });
+ } catch (error) {
+  raw = { code: -1, stdout: "", stderr: error instanceof Error ? error.message : String(error) };
+ }
+ const result = readResult(resultFile);
+ rmSync(scratch, { recursive: true, force: true });
+ const { result: read } = output.read(raw, journal);
+ const log = saveJobLog(journal.path, run, substrate, read);
+
+ const reason = raw.timedOut ? "budget" : raw.code !== 0 ? `exit ${raw.code}` : undefined;
+ const outcome: RunOutcome = reason === undefined ? "succeeded" : "failed";
+ const ended = now().toISOString();
+ const recorded = journal.updateJobRun(runId, "running", {
+  status: outcome === "succeeded" ? "succeeded" : "failed",
+  finishedAt: ended, reason: reason ?? null, result, log, pgid: null,
+ });
+ // A sweep that already failed this run reported it; one envelope per run.
+ if (recorded) {
+  journal.recordEvent("job-finished", { detail: `job ${run.name} run ${runId} ${outcome}${reason === undefined ? "" : `: ${reason}`}` });
+  await emitJobRunFinished(config, journal, {
+   name: run.name, startedAt: run.startedAt ?? run.queuedAt, endedAt: ended, outcome, result, log,
+  }, ctx.ledger);
+ }
+ return { runId, name: run.name, status: outcome === "succeeded" ? "succeeded" : "failed", reason, substrate, result, log };
+}

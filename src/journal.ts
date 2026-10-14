@@ -10,6 +10,8 @@ import {
  health,
  intakeCursors,
  intakeDrafts,
+ jobRuns,
+ type JobRunStatus,
  resumeQueue,
  substrateReadings,
  substrateSessions,
@@ -224,6 +226,30 @@ export interface IntakeDraftRow {
  originMessageId: string | null;
 }
 
+/** A scheduled job run (node #301). */
+export type JobRunRow = typeof jobRuns.$inferSelect;
+
+/** Fields a job run supervisor or the tick may set on its row. */
+export type JobRunPatch = Partial<Omit<JobRunRow, "id" | "name" | "lane" | "queuedAt">>;
+
+/**
+ * Who holds a resource lane: an implement worker (its row), or a running job
+ * (node #301), which carries `job` (its name) and reads as node `job:<name>`
+ * on map `ranger:job#<run id>` wherever a holder is shown.
+ */
+export interface LaneHolder {
+ nodeId: string;
+ repo: string;
+ root: number;
+ status: string;
+ /** Set only on a job holder: the job name. */
+ job?: string;
+}
+
+function jobHolder(run: JobRunRow): LaneHolder {
+ return { nodeId: `job:${run.name}`, repo: "ranger:job", root: run.id, status: run.status, job: run.name };
+}
+
 export interface ResumeQueueRow {
  id: number;
  repo: string;
@@ -238,6 +264,10 @@ export type EventKind =
  | "ledger-failed"
  | "ledger-root-serves-invalid"
  | "resume-queued"
+ /** Scheduled jobs (node #301). */
+ | "job-queued"
+ | "job-started"
+ | "job-finished"
  | "resume-cancelled"
  | "resume-dropped"
  | "resume-started"
@@ -460,15 +490,65 @@ export class Journal {
   lane: ImplementLane,
   except?: { nodeId: string; repo: string },
   isActive: (worker: WorkerRow) => boolean = () => true,
- ): WorkerRow | null {
-  const occupants = this.listWorkers().filter((w) => {
+ ): LaneHolder | null {
+  const workerOccupants = this.listWorkers().filter((w) => {
    if (w.nodeId === except?.nodeId && w.repo === except?.repo) return false;
    if (!holdsImplementLane(w)) return false;
    if (!isActive(w)) return false;
    const resource = workerLane(w, this.maps);
    return resource === lane || resource === null;
   });
+  // A running job (node #301) takes a slot like an implement session.
+  const occupants: LaneHolder[] = [...workerOccupants, ...this.listJobRuns("running")
+   .filter(run => run.lane === lane).map(jobHolder)];
   return occupants.length >= (this.laneSlots[lane] ?? 1) ? occupants[0] : null;
+ }
+
+ // ---- job runs (node #301) ----
+
+ /**
+  * Queue a run of `name` unless one is already queued: the partial unique
+  * index makes a second enqueue before the run starts a no-op. Returns the
+  * queued run and whether this call queued it.
+  */
+ enqueueJobRun(name: string, lane: ImplementLane, now = new Date()): { run: JobRunRow; queued: boolean } {
+  return this.db.transaction(() => {
+   const inserted = this.db.insert(jobRuns).values({ name, lane, status: "queued", queuedAt: now.toISOString() })
+    .onConflictDoNothing().returning().get();
+   if (inserted !== undefined) {
+    this.recordEvent("job-queued", { detail: `job ${name} queued for the ${lane} lane (run ${inserted.id})` });
+    return { run: inserted, queued: true };
+   }
+   const existing = this.db.select().from(jobRuns)
+    .where(and(eq(jobRuns.name, name), eq(jobRuns.status, "queued"))).get()!;
+   return { run: existing, queued: false };
+  });
+ }
+
+ listJobRuns(status?: JobRunStatus): JobRunRow[] {
+  try {
+   return this.db.select().from(jobRuns).where(status === undefined ? undefined : eq(jobRuns.status, status))
+    .orderBy(asc(jobRuns.id)).all();
+  } catch (error) {
+   // A read-only journal (`ranger serve`) that no tick has migrated yet.
+   if (/no such table: job_runs/.test(String(error))) return [];
+   throw error;
+  }
+ }
+
+ getJobRun(id: number): JobRunRow | null {
+  return this.db.select().from(jobRuns).where(eq(jobRuns.id, id)).get() ?? null;
+ }
+
+ /**
+  * Patch a run, only while it is in `from`: returns false when another
+  * process moved it first (a sweep that failed it, a second tick that took it).
+  */
+ updateJobRun(id: number, from: JobRunStatus, patch: JobRunPatch): boolean {
+  const set = Object.fromEntries(Object.entries(patch).filter(([, v]) => v !== undefined));
+  const rows = this.db.update(jobRuns).set(set).where(and(eq(jobRuns.id, id), eq(jobRuns.status, from)))
+   .returning({ id: jobRuns.id }).all();
+  return rows.length > 0;
  }
 
  getWorker(nodeId: string, repo: string): WorkerRow | null {

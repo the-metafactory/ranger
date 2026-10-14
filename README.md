@@ -363,6 +363,50 @@ bun src/cli.ts journal                    # inspect workers/events/health
   PR → successful CI citation → gated close → `decisions --write`. Live close
   validation for node #25 remains a supervisor action after deployment.
 
+## Scheduled jobs (node #301)
+
+A job is a skill ranger runs headless on a resource lane, outside the graph:
+it opens no PR, claims no node and writes no graph. Declare it in
+`ranger.yaml`:
+
+```yaml
+jobs:
+  - name: daily-short          # what `ranger job enqueue` takes; the ledger's ran.ref
+    skill: daily-short         # `/daily-short` on Claude; "Use the … skill." elsewhere
+    prompt: ""                 # optional text after the skill
+    lane: visual               # visual | headless
+    wallClockMin: 90           # past it the session's process group is killed
+    cwd: ~/work/far-between/shorts
+    substrates: [claude]       # optional; default all three, picked by quota
+```
+
+- `ranger job enqueue <name>` queues one run (a Reflex fire runs it through a
+  cortex process spec). A second enqueue while that run is still queued is a
+  no-op; an unknown name exits 1 and queues nothing.
+- The tick's job pass runs after the merge desks and queued resumes, before
+  fresh claims. A queued run starts when its lane is free and waits while the
+  walk is paused, the visual lane is drained, the daily spawn cap is spent, or
+  the lane is held. A running job holds its lane like an implement session
+  (`laneHolder`), so a visual job never runs beside a visual implement session.
+- The tick spawns a detached `ranger job run <id>`. It picks the substrate by
+  quota among the job's `substrates` (the first one when the pick falls
+  outside), runs the session in `cwd` under the worker host env (no ranger
+  credentials, a per-session journal), and logs to
+  `<journal dir>/logs/jobs/<name>-<id>.log`. A visual job keeps normal CPU
+  priority; a headless one runs at `workers.niceness`.
+- Each run reports one `execution.run.finished`: `ran: {kind: job, ref: <name>}`,
+  `succeeded` or `failed`, and the session log as `detail_ref`. Why a run
+  failed (`budget`, `exit <n>`, `crashed`, `spawn`) stays in the journal row,
+  since the envelope carries no free text.
+- A session reports what it produced by writing one line to
+  `$RANGER_JOB_RESULT_FILE`. A `soma:` relative path on a succeeded run rides
+  the envelope as `result_ref` (myelin v0.10.0). Anything else, such as a URL,
+  stays in the journal row only. To surface a URL, write a small soma file
+  that holds it and report that file's `soma:` path.
+- A running row whose supervisor died is failed as `crashed` on the next
+  tick, and its session group is killed once `ps` confirms it still runs the
+  job's skill. `ranger job list` prints the runs.
+
 ## Doctrine anchors
 
 - The seven `soma graph` verbs are the only graph API ranger uses — never raw tracker writes.

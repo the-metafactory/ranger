@@ -307,3 +307,19 @@ bus:
   stack: default
   url: nats://127.0.0.1:4222
   creds: ~/.config/nats/creds/ranger.creds
+
+# Scheduled jobs (node #301). A Reflex fire enqueues one (`ranger job enqueue
+# <name>`, from a cortex process spec); the next tick runs its skill when the
+# lane is free and reports one execution.run.finished per run. A job claims no
+# node and writes no graph. A session reports its result by writing a `soma:`
+# path to $RANGER_JOB_RESULT_FILE; it rides `result_ref` on a succeeded run.
+jobs:
+  # G6's daily Short (soma#905 D2, D3): daily 06:00 Europe/Zurich. The skill is
+  # Claude-only; capture is GPU work, so the visual lane keeps it off seelite.
+  # Publish alone can wait 40 min for YouTube's checks.
+  - name: daily-short
+    skill: daily-short
+    lane: visual
+    wallClockMin: 90
+    cwd: ~/work/far-between/shorts
+    substrates: [claude]

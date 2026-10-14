@@ -23,6 +23,7 @@ import { classifyFrontier, loadProbeRegistry } from "./route.ts";
 import type { ForgePort } from "./forge.ts";
 import { probeRequeueCandidates, requeueProbes, type ProbeRequeueResult } from "./probe-requeue.ts";
 import { sweepMap, type SweepMapResult } from "./sweep.ts";
+import { emptyJobPass, jobPass, type JobPassResult, type SpawnJobArgs } from "./jobs.ts";
 import { intakePass, type IntakeContext, type IntakeResult } from "./intake.ts";
 import { gateProposeReads, ratifyPass, rebuildVetoes, type RatifyResult } from "./ratify.ts";
 import { refuseProposalCard } from "./card-sync.ts";
@@ -86,6 +87,8 @@ export interface WalkResult {
  intake: IntakeResult;
  /** The ratify phase (node #250): proposals read, ratified closes started. */
  ratify: RatifyResult;
+ /** Scheduled jobs (node #301): runs started, waiting and failed; absent when none was queued or running. */
+ jobs?: JobPassResult;
 }
 
 export interface WalkContext {
@@ -103,6 +106,8 @@ export interface WalkContext {
  intakeClient?: IntakeContext["clientFor"];
  /** The intake drafter's one-shot `claude -p` runner (tests inject a fake). */
  intakeClaude?: IntakeContext["claude"];
+ /** Detached `ranger job run` spawner (node #301) — tests inject a recorder. */
+ spawnJob?: (args: SpawnJobArgs) => Promise<number | null>;
 }
 
 /** Is this resource lane held? (awaiting-merge does not hold it.) */
@@ -488,6 +493,22 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
     }), implementClaimed, owned));
   } catch (error) {
    for (const w of walked) w.errors.push(`resume queue failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+ }
+
+ // Pass 1e — scheduled jobs (node #301): a queued job takes its free lane
+ // after the send-backs and queued resumes, before any fresh claim, and a
+ // lane it takes is closed to this tick's claims. A dead job supervisor is
+ // failed here too.
+ if (journal.listJobRuns("queued").length > 0 || journal.listJobRuns("running").length > 0) {
+  try {
+   result.jobs = await withClaimLock(journal, () => jobPass({
+    config, configPath: ctx.configPath, journal, cliEntry, takenLanes: implementClaimed,
+    ...(ctx.spawnJob === undefined ? {} : { spawnJob: ctx.spawnJob }),
+    ...(ctx.now === undefined ? {} : { now: ctx.now }),
+   }));
+  } catch (error) {
+   result.jobs = { ...emptyJobPass(), errors: [`job pass failed: ${error instanceof Error ? error.message : String(error)}`] };
   }
  }
 
