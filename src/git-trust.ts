@@ -123,7 +123,7 @@ export async function checkKnownGood(
   recordKnownGood(journal, canonical, state, "benign config keys left the hash");
   journal.recordEvent("git-trust", {
    ...at,
-   detail: `known-good git state for ${canonical} re-recorded: ${changed.join(", ")} no longer hashed (benign git-lfs/push config)`,
+   detail: `known-good git state for ${canonical} re-recorded: ${changed.join(", ")} no longer hashed (benign git-lfs, push or identity config)`,
   });
   return { kind: "match", state };
  }

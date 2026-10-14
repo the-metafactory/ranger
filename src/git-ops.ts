@@ -272,6 +272,14 @@ const MAP_REMOTE = "origin";
  * key stays in the hash. Judged per record, never per key: a repeated key
  * whose other copy is not one of these keeps that copy hashed, whichever
  * one git reads last.
+ *
+ * `user.name` and `user.email` pass with any value: they name an author and
+ * steer no command, remote or credential, and every worker and supervisor
+ * commit carries GIT_AUTHOR_* / GIT_COMMITTER_* (`authorEnv`), which git
+ * reads ahead of them (2026-10-14: a codex worker on soma #849 ran `git
+ * config --local user.name` in its worktree, which writes the shared config,
+ * and parked soma #797-#801, #849, #854, #866 and #869). `user.signingkey`
+ * and every other user.* key stay hashed.
  */
 const BENIGN_VALUES: Record<string, (value: string) => boolean> = {
  "filter.lfs.clean": (v) => v === "git-lfs clean -- %f",
@@ -280,6 +288,8 @@ const BENIGN_VALUES: Record<string, (value: string) => boolean> = {
  "filter.lfs.required": (v) => v === "true",
  "lfs.repositoryformatversion": (v) => v === "0",
  "http.postbuffer": (v) => /^[0-9]{1,12}[kmg]?$/i.test(v),
+ "user.name": () => true,
+ "user.email": () => true,
 };
 
 /** `lfs.<url>.access=basic`: git-lfs records that the LFS endpoint took basic auth. */

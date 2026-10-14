@@ -235,6 +235,8 @@ async function rig(opts: {
  /** commands.test for the map (default: test -f src/feature.ts). */
  test?: string;
  autoMerge?: boolean;
+ /** The node's probes (default: src/feature.ts exists on main). */
+ probes?: { type: string; [key: string]: unknown }[];
 }): Promise<Rig & { calls: number[]; announced: string[] }> {
  const nodeId = opts.nodeId ?? "20";
  const dir = mkdtempSync(join(tmpdir(), "ranger-implement-"));
@@ -243,7 +245,7 @@ async function rig(opts: {
  const data = join(dir, "data");
  mkdirSync(data);
  copyFileSync(join(dataDir, "acme__widgets-node-1.json"), join(data, "acme__widgets-node-1.json"));
- const probes = [{ type: "artifact-exists", path: "src/feature.ts", atRef: "main" }];
+ const probes = opts.probes ?? [{ type: "artifact-exists", path: "src/feature.ts", atRef: "main" }];
  writeFileSync(
   join(data, `acme__widgets-node-${nodeId}.json`),
   JSON.stringify({
@@ -2222,6 +2224,36 @@ describe("implement lane (node #23)", () => {
   expect(c.markers().map((m) => m.body.split("\n")[0])).toEqual([`<!-- ranger:ci-fix sha=${head} red=${red} -->`]);
   expect(c.r.calls).toHaveLength(2); // round 2 reviews the fix
   expect(c.events().some((d) => d === `CI fix pass 1 @ ${head.slice(0, 8)}: CI was red at ${red.slice(0, 8)}`)).toBe(true);
+ }, 60_000);
+
+ const artifactProbes = [
+  { type: "artifact-exists", path: "src/feature.ts", atRef: "main" },
+  { type: "artifact-exists", path: "tests/feature-artifact.test.ts", atRef: "main" },
+  { type: "artifact-exists", path: "elsewhere.md", atRef: "main", repo: "acme/other" },
+ ];
+
+ test("a sage-clean head without a checkpoint artifact gets a supervisor major, a fix pass and a new round before ready (ranger #263)", async () => {
+  const c = await ciRig({ probes: artifactProbes });
+  expect((await runNode("20", c.r.ctx)).status).toBe("awaiting-merge");
+  expect(c.prompts).toHaveLength(2);
+  expect(c.prompts[0]).toContain("create each at exactly this path: `src/feature.ts`, `tests/feature-artifact.test.ts`.");
+  expect(c.prompts[1]).toContain("## Supervisor finding (ranger, not the reviewer) — major");
+  expect(c.prompts[1]).toContain("`tests/feature-artifact.test.ts` exists on `main` after the merge, and this head lacks it.");
+  expect(c.prompts[1]).not.toContain("elsewhere.md");
+  expect(c.r.calls).toHaveLength(2); // round 2 reviews the head that has it
+  const head = await c.r.github.sha(BRANCH);
+  expect((await runCmd("git", ["cat-file", "-e", `${head}:tests/feature-artifact.test.ts`], { cwd: c.r.origin })).code).toBe(0);
+  expect(c.events().some((d) => d.includes("checkpoint artifact(s) tests/feature-artifact.test.ts are missing there"))).toBe(true);
+ }, 60_000);
+
+ test("a checkpoint artifact still missing at the review cap parks before ready: the PR stays a draft and unmerged", async () => {
+  const c = await ciRig({ probes: artifactProbes });
+  c.setMode("skip-artifact");
+  const outcome = await runNode("20", c.r.ctx);
+  expect(outcome.status).toBe("parked");
+  expect(c.r.calls).toHaveLength(2);
+  expect(c.r.github.prs.get(1)?.draft).toBe(true);
+  expect(c.r.github.prs.get(1)?.merged).toBe(false);
  }, 60_000);
 
  test("a red CI on a branch behind its base merges the base in first, whatever maxBehindBase says", async () => {

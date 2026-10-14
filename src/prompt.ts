@@ -135,6 +135,8 @@ export interface ImplementPromptInput extends WorkerPromptInput {
  probeTier?: boolean;
  /** Remote install/tests belong to the supervisor; private config never enters this prompt. */
  remoteTests?: boolean;
+ /** The paths the node's checkpoint `artifact-exists` probes check on the base (`checkpointArtifacts`). */
+ artifacts?: string[];
 }
 
 /**
@@ -188,6 +190,10 @@ ${LOCAL_TEST_RULE}
   closing keywords followed by an issue reference ("closes #N", "fixes #N",
   "resolves #N"): a squash merge would auto-close the node and skip its close gate.
   Refer to the node as "node #N" instead. The supervisor refuses to push otherwise.
+- Never write git config (\`git config\` without \`--get\`, \`git lfs install\`, hooks): a
+  worktree shares its config with every other node's, and the supervisor parks them
+  all on a change. Your commit identity is already set in the environment; plain
+  \`git commit\` uses it, whatever \`git config user.name\` prints.
 - Never amend, rebase, squash or reset existing commits: add new commits on top. The
   supervisor pushes fast-forward only, and a rewritten branch parks the node.
 - Leave nothing uncommitted or untracked: the supervisor tests the working tree and
@@ -326,6 +332,12 @@ export function assembleImplementPrompt(input: ImplementPromptInput): string {
   node.body.trim(),
   ...(node.checkpointId !== undefined && node.checkpointId.length > 0
    ? ["", `Checkpoint that gates this close: \`${node.checkpointId}\``]
+   : []),
+  ...((input.artifacts ?? []).length > 0
+   ? [
+      "",
+      `The close gate checks that these files exist on the base after the merge; create each at exactly this path: ${input.artifacts!.map((p) => `\`${p}\``).join(", ")}.`,
+     ]
    : []),
   "",
   `## Map — Destination (binding)`,
