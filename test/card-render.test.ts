@@ -211,6 +211,22 @@ describe("node #239 — every poster renders through the one renderer", () => {
     expect(digest).not.toContain("**");
   });
 
+  test("the daily digest with no spawn cap shows the count alone", () => {
+    const digest = digestContent({
+      map,
+      cards: [],
+      openCount: 0,
+      ageCounts: { aged: 0, overdue: 0 },
+      audit: { repo: "acme/widgets", root: "1", nodes: 3, closedWithoutReceipt: [], openWithoutCheckpoint: [], openClaimed: [] } as never,
+      budget: { spawnsToday: 31, spawnCapPerDay: Number.POSITIVE_INFINITY, deadman: 0, paused: false },
+      principal: "jcfischer",
+      principalDiscordId: "999",
+      now: new Date("2026-10-14T09:00:00"),
+    });
+    expect(digest).toContain("Budget: spawns today 31 · dead-man 0");
+    expect(digest).not.toContain("Infinity");
+  });
+
   test("the park card", () => {
     const card = parkCardText(MAP, "21", "Settle <@123>", "## Why\nthe worker exited 1");
     expectFrame(card, "parked", "21");

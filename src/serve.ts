@@ -324,7 +324,8 @@ export interface DashboardState {
   /** Drained headless maps by key, shown on their maps. */
   drainedMaps: string[];
   spawnsToday: number;
-  spawnCap: number;
+  /** Null when no cap is set: JSON has no Infinity. */
+  spawnCap: number | null;
   laneHolders: Record<ImplementLane, { repo: string; root: number; nodeId: string; status: string } | null>;
  };
  current: CurrentJob[];
@@ -606,7 +607,7 @@ export function assembleState(inputs: StateInputs): DashboardState {
    visualDrained: drains.visual,
    drainedMaps: inputs.maps.filter((m) => drainGate(m, drains)?.scope === "map").map((m) => m.key),
    spawnsToday: inputs.spawnsToday,
-   spawnCap: inputs.spawnCap,
+   spawnCap: Number.isFinite(inputs.spawnCap) ? inputs.spawnCap : null,
    laneHolders: { visual: holderView("visual"), headless: holderView("headless") },
   },
   current,
@@ -1074,7 +1075,7 @@ function byRepo(prefix, items, repoOf, mapGroup) {
 const mapGroup = (id, m, extra, count, meta, body) => ({ count, el: group(id + "/" + m.key, mapTitle(m, extra), count, meta, body) });
 function renderMeta(s) {
  const g = s.gates;
- document.getElementById("meta").textContent = "maps read by ranger's tick, shown from its cache" + (s.refreshing ? " · dashboard reading…" : "") + (s.refreshError ? " · dashboard read: " + s.refreshError : "") + " · spawns today " + g.spawnsToday + "/" + g.spawnCap + (g.paused ? " · DEAD-MAN PAUSED" : "");
+ document.getElementById("meta").textContent = "maps read by ranger's tick, shown from its cache" + (s.refreshing ? " · dashboard reading…" : "") + (s.refreshError ? " · dashboard read: " + s.refreshError : "") + " · spawns today " + g.spawnsToday + (g.spawnCap === null ? "" : "/" + g.spawnCap) + (g.paused ? " · DEAD-MAN PAUSED" : "");
 }
 const tag = (text, cls) => el("span", { class: "tag" + (cls ? " " + cls : ""), text, title: text });
 const tags = (...kids) => el("div", { class: "tags" }, ...kids);

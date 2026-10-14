@@ -248,8 +248,12 @@ const StateSchema = z.object({
 });
 
 const WorkersSchema = z.object({
- /** Daily worker-spawn cap — the global spend bound (design §7). */
- spawnCapPerDay: z.number().int().positive().default(10),
+ /**
+  * Daily worker-spawn cap (design §7): opt-in. Unset means no cap
+  * (principal, 2026-10-14: the substrate quota gates bound spend, and the
+  * cap held 30 claims a day back on a host that had room).
+  */
+ spawnCapPerDay: z.number().int().positive().optional().transform((v) => v ?? Number.POSITIVE_INFINITY),
  /** Concurrent implement workers per resource lane, across all maps (default one each). */
  laneSlots: z.object({
   visual: z.number().int().positive().default(1),
