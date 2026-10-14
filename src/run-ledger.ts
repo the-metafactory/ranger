@@ -190,7 +190,7 @@ export function ledgerResultRef(result: string | null | undefined, outcome: RunO
 }
 
 /**
- * One envelope per finished job run (node #301), `run_id` fixed at enqueue: the job name is `ran.ref`,
+ * The envelope for a finished job run (node #301), `run_id` fixed at enqueue: the job name is `ran.ref`,
  * the session log the `detail_ref`. The envelope has no free text, so why a
  * run failed (budget, exit, crash) stays in the journal row.
  */

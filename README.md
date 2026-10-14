@@ -394,10 +394,16 @@ jobs:
   credentials, a per-session journal), and logs to
   `<journal dir>/logs/jobs/<name>-<id>.log`. A visual job keeps normal CPU
   priority; a headless one runs at `workers.niceness`.
-- Each run reports one `execution.run.finished`: `ran: {kind: job, ref: <name>}`,
-  `succeeded` or `failed`, and the session log as `detail_ref`. Why a run
-  failed (`budget`, `exit <n>`, `crashed`, `spawn`) stays in the journal row,
-  since the envelope carries no free text.
+- Each finished run is reported as an `execution.run.finished`: `ran: {kind:
+  job, ref: <name>}`, `succeeded` or `failed`, the session log as
+  `detail_ref`, and a `run_id` fixed when the run was queued. Why a run
+  failed (`budget`, `exit <n>`, `crashed`, `spawn`) stays in the journal
+  row, since the envelope carries no free text. The run is marked reported
+  once its envelope is handed to the ledger. A process cut off before that is
+  reported by the next tick's sweep, and a crash between the hand-off and the
+  mark repeats the envelope with the same `run_id`. Like the tick and
+  run-node emitters, the hand-off fails open: a failed ledger write records a
+  `ledger-failed` journal event and is not retried.
 - A session reports what it produced by writing one line to
   `$RANGER_JOB_RESULT_FILE`. A `soma:` relative path on a succeeded run rides
   the envelope as `result_ref` (myelin v0.10.0). Anything else, such as a URL,

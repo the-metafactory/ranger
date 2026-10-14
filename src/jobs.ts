@@ -121,11 +121,13 @@ export function emptyJobPass(): JobPassResult {
 }
 
 /**
- * Hand a finished run's one envelope to the ledger, then mark it reported.
+ * Hand a finished run's envelope to the ledger, then mark it reported.
  * The terminal status is committed first, so a process cut off between the
- * two leaves an unreported finished row that `sweepJobs` reports later:
- * the envelope is never lost. Only a crash between the emit and the mark
- * repeats it, and the repeat carries the same `run_id`.
+ * two leaves an unreported finished row that `sweepJobs` reports later. The
+ * emit fails open like the tick's and run-node's: a ledger write that fails
+ * records a `ledger-failed` journal event, and the run still counts as
+ * reported, so that envelope is not retried. A crash between the emit and
+ * the mark repeats the envelope, with the same `run_id`.
  */
 async function reportRun(ctx: Pick<JobPassContext, "config" | "journal" | "ledger">, id: number): Promise<void> {
  const run = ctx.journal.getJobRun(id);
@@ -311,7 +313,7 @@ export interface RunJobOutcome {
  * Supervise one job run the tick started: pick the substrate (quota-picked
  * among the job's `substrates`), run the skill session in the job's cwd under
  * the worker host env (no ranger credentials, a per-session journal), kill it
- * at the wall clock, then record the outcome and emit exactly one envelope.
+ * at the wall clock, then record the outcome and hand its envelope to the ledger.
  */
 export async function runJob(runId: number, ctx: RunJobContext): Promise<RunJobOutcome> {
  const { config, journal } = ctx;
@@ -377,7 +379,7 @@ export async function runJob(runId: number, ctx: RunJobContext): Promise<RunJobO
   status: outcome === "succeeded" ? "succeeded" : "failed",
   finishedAt: ended, reason: reason ?? null, result, log, pgid: null,
  });
- // A sweep that already failed this run reported it; one envelope per run.
+ // A sweep that already failed this run reported it.
  if (recorded) {
   journal.recordEvent("job-finished", { detail: `job ${run.name} run ${runId} ${outcome}${reason === undefined ? "" : `: ${reason}`}` });
   await reportRun(ctx, runId);
