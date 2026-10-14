@@ -163,6 +163,58 @@ maps:
     discord:
       tokenEnv: RANGER_DISCORD_TOKEN
       channelId: "1505550997764833444"
+  # seelite, re-registered (principal, 2026-10-14): walk both maps again so
+  # the standing-red repairs #979 and #980 can be built now. Removed in
+  # 12c25a9 while the principal worked seelite by hand. Ranger merges a
+  # gate-passed PR itself, except nodes labelled ranger:needs-eye.
+  - repo: jcfischer/seelite
+    root: 1
+    walk: full
+    localCheckout: ~/work/cyphr/spark/seelite
+    # #559 needs the principal's ear and a squash-safe probe first.
+    skip: [559]
+    autoMerge: true
+    commands:
+      install: npm ci --no-audit --no-fund
+      test: npm test
+      # The browser tier (principal, 2026-10-03): the selected probes for the
+      # branch diff, once on the final sage-clean head; a passing run gates the
+      # merge card. Only the node id is templated into the intent (seelite
+      # CLAUDE.md: never paste tracker or PR text into --intent).
+      # GPU lane: headed Chromium opens on the host screen while it runs.
+      probe: 'npm run probe:pr -- --base origin/main --head HEAD --intent "Ranger implement lane: the diff on this branch implements orienteer node #{node}; select every browser probe the changed files can affect."'
+      # A failed run retries only the probes it named.
+      probeRetry: PROBE_SELECTION=1 PROBE_FILES={failed} npm run probe
+      probeTimeoutMin: 30
+      views: PROBE_ORIGIN={origin} npm run views -- --label {label} --out {out}
+      viewsServe: npx vite --port {port} --strictPort
+      viewsDiff: node scripts/diff-view-set.mjs {out} {a} {b}
+    discord:
+      tokenEnv: RANGER_DISCORD_TOKEN
+      channelId: "1487052222067118111"
+  - repo: jcfischer/seelite
+    root: 460
+    walk: full
+    localCheckout: ~/work/cyphr/spark/seelite
+    autoMerge: true
+    commands:
+      install: npm ci --no-audit --no-fund
+      test: npm test
+      # The browser tier (principal, 2026-10-03): the selected probes for the
+      # branch diff, once on the final sage-clean head; a passing run gates the
+      # merge card. Only the node id is templated into the intent (seelite
+      # CLAUDE.md: never paste tracker or PR text into --intent).
+      # GPU lane: headed Chromium opens on the host screen while it runs.
+      probe: 'npm run probe:pr -- --base origin/main --head HEAD --intent "Ranger implement lane: the diff on this branch implements orienteer node #{node}; select every browser probe the changed files can affect."'
+      # A failed run retries only the probes it named.
+      probeRetry: PROBE_SELECTION=1 PROBE_FILES={failed} npm run probe
+      probeTimeoutMin: 30
+      views: PROBE_ORIGIN={origin} npm run views -- --label {label} --out {out}
+      viewsServe: npx vite --port {port} --strictPort
+      viewsDiff: node scripts/diff-view-set.mjs {out} {a} {b}
+    discord:
+      tokenEnv: RANGER_DISCORD_TOKEN
+      channelId: "1487052222067118111"
   # MetaFactory pursues (principal, 2026-10-12): the LifeOS-gap walking
   # skeleton. Charted on soma, not meta-factory: ivy-agent cannot be added to
   # the private repo without a paid seat. Soma builds file below their
@@ -276,8 +328,9 @@ workers:
   # suites at once held the 1-min load at 60-108 on 10 cores, and cortex's
   # 4-5 s fs.watch tests flaked every supervisor run (cortex#2557 lost two
   # generations to it). Visual stays exclusive (screen/GPU).
+  # 1 (principal, 2026-10-14): one headless suite at a time.
   laneSlots:
-    headless: 2
+    headless: 1
   # Hard wall clock per worker session, minutes (default 90). Raised to 150
   # (principal, 2026-10-04): seelite #684, a large Traffic build on Codex, was
   # still uncommitted at 80 minutes.
