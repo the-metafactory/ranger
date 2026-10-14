@@ -165,6 +165,19 @@ const REMOTE_TEST_RULE = `- Leave the map's dependency install and test command 
   the supervisor refuses to push without a matching passed remote receipt.`;
 
 /**
+ * The supervisor's test run on this host is the one that counts, so a worker
+ * that moves the suite into a VM or container certifies nothing and loads the
+ * host (2026-10-14: cortex #2559 and others started Rancher Desktop through
+ * rdctl for a Debian container, whose VM went read-only when the disk filled).
+ */
+const HOST_RUNTIME_RULE = `- Run every test on this host, as the supervisor does. Never start or configure a VM,
+  container runtime or container to run tests or anything else (rdctl, Rancher Desktop,
+  docker, nerdctl, podman, colima, limactl): the supervisor's run here is the only one
+  that counts. If the full test command fails on this host for reasons your change did
+  not cause (check by running the failing tests on the base commit), that is a block:
+  report it as below, naming the failing tests and the host cause.`;
+
+/**
  * A worker that cannot do the node reports it instead of committing a note
  * about it (cortex#2557: a committed blocker note became a PR that sage read
  * clean and the merge desk nearly carded).
@@ -176,13 +189,15 @@ const BLOCKED_RULE = `- Blocked: if the node cannot be done yet because a precon
   uncommitted, and exit 0. Its first lines say what blocks the node and the evidence;
   then one line \`Resume condition: <what must hold before the node can be built>\`.
   The supervisor parks the node on it: it pushes nothing and opens no pull request.
-  Only an unmet precondition is a block; a hard task or failing tests are not.`;
+  Only an unmet precondition is a block; a hard task or failing tests are not, except
+  tests that fail on this host for reasons your change did not cause.`;
 
 /** The task/build kind SOP (design §4), the worker's half of it. */
 const IMPLEMENT_SOP = `Task/build kind SOP (ranger implement lane):
 - Implement the node in this worktree, on the branch that is already checked out
   ({{branch}}). Do not create or switch branches.
 ${LOCAL_TEST_RULE}
+${HOST_RUNTIME_RULE}
 - COMMIT your work on this branch. Do NOT push, open a pull request, merge, comment
   on GitHub, or touch any other branch: the supervisor does all of that, with a
   credential you never hold.
