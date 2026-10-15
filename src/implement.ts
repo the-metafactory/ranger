@@ -33,7 +33,8 @@ import { recordKnownGood, trustedSnapshot } from "./git-trust.ts";
 import * as gh from "./github.ts";
 import type { IssueComment, ChangeRequest, ForgePort, CiFailedRun, CiVerdict } from "./forge.ts";
 import { HostLoadPark, ParkSignal } from "./signals.ts";
-import { describeLoad, isQuiet, realHostLoad, type BusyReading, type HostLoad, type HostLoadReading } from "./host-load.ts";
+import { busyLoadFor, describeLoad, isQuiet, realHostLoad, type BusyReading, type HostLoad, type HostLoadReading } from "./host-load.ts";
+import { implementLane } from "./lanes.ts";
 import { isTransientGitHubError } from "./transient.ts";
 import {
  PROBE_FILE,
@@ -593,8 +594,12 @@ export type { HostLoad } from "./host-load.ts";
 /** How long a probe run waits for the host to quiet down before running anyway. */
 const QUIET_HOST = { pollMs: 30_000, maxMs: 20 * 60_000 };
 
-/** `workers.busyLoad`: the 1-minute load the host counts as busy at; unset, the core count. */
-const busyLoad = (ctx: ImplementContext) => ctx.config?.workers?.busyLoad;
+/**
+ * The 1-minute load the host counts as busy at for this node's lane
+ * (`busyLoadFor`, node #312): every wait, retry and host-load park reads it.
+ * Unset, the core count.
+ */
+const busyLoad = (ctx: ImplementContext) => busyLoadFor(ctx.config?.workers, implementLane(ctx.map));
 
 /** The host's load now when it is busy, else null. */
 const busyHostNow = (ctx: ImplementContext): HostLoadReading | null => {

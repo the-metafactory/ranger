@@ -948,3 +948,61 @@ describe("a resume queued for host load (node #297)", () => {
   });
  });
 });
+
+describe("workers.laneBusyLoad: each implement lane has its own busy load (node #312)", () => {
+ const LOAD_25 = { load: 25, cores: 10 };
+ // Map #1 is visual, map #460 headless; busy at 20, the headless lane at 30.
+ const laneRig = (r: ReturnType<typeof rig>) => {
+  r.config.maps[0].lane = "visual";
+  r.config.workers.busyLoad = 20;
+  r.config.workers.laneBusyLoad = { headless: 30 };
+ };
+ const queueLoad = (r: ReturnType<typeof rig>, id: string, root: number, lane: "visual" | "headless") => {
+  r.worker(id, root, "failed");
+  return r.journal.enqueueResume({ nodeId: id, repo: REPO, root, lane, reason: "host-load" }, NOW);
+ };
+
+ test("at load 25 a queued headless resume starts and a queued visual one, ahead of it, waits (busy at 20)", async () => {
+  await withRig(async r => {
+   laneRig(r);
+   queueLoad(r, "40", 1, "visual");
+   queueLoad(r, "41", 460, "headless");
+   const spawned: string[] = [];
+   await walk({ ...r, hostLoad: () => LOAD_25, now: () => NOW,
+    spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; } });
+   expect(spawned).toEqual(["41"]);
+   expect(r.journal.listResumeQueue()).toMatchObject([{ nodeId: "40", lane: "visual", failedStarts: 0 }]);
+   expect(r.journal.listEvents(REPO, 500).map(e => e.detail)).toContain(
+    "queued resume #40 is waiting for a quiet host: load 25.0 on 10 cores, busy at 20");
+  });
+ });
+
+ test("ranger serve gates each lane's queue on that lane's busy load", async () => {
+  await withRig(async r => {
+   laneRig(r);
+   queueLoad(r, "40", 1, "visual");
+   queueLoad(r, "41", 460, "headless");
+   const maps = servedMaps(r.config);
+   const queues = stateFromJournal(r.config, maps, new ServeReader(r.config, maps, r.config.state.journalPath), NOW, () => LOAD_25).resumeQueue;
+   expect(queues.visual.waits).toEqual([{ repo: REPO, nodeId: "40", reason: "waiting for a quiet host: load 25.0 on 10 cores, busy at 20" }]);
+   expect(queues.visual.head).toBeNull();
+   expect(queues.headless.waits).toEqual([]);
+   expect(queues.headless.head).toMatchObject({ nodeId: "41", starts: true });
+   const at31 = stateFromJournal(r.config, maps, new ServeReader(r.config, maps, r.config.state.journalPath), NOW, () => ({ load: 31, cores: 10 })).resumeQueue;
+   expect(at31.headless.waits).toEqual([{ repo: REPO, nodeId: "41", reason: "waiting for a quiet host: load 31.0 on 10 cores, busy at 30" }]);
+  });
+ });
+
+ test("at load 25 the walk claims a headless map's node and no node on a visual map", async () => {
+  await withRig(async r => {
+   laneRig(r);
+   r.frontier(1, ["50"]);
+   r.frontier(460, ["60"]);
+   const result = await walk({ ...r, hostLoad: () => LOAD_25, now: () => NOW, spawnRunNode: async () => process.pid });
+   // Both maps are one repo, so a result is told apart by what it claimed.
+   expect(result.maps.flatMap(m => m.claimed)).toEqual(["60"]);
+   expect(result.maps.map(m => m.hostBusy).filter(b => b !== undefined))
+    .toEqual(["the host is busy (load 25.0 on 10 cores, busy at 20)"]);
+  });
+ });
+});

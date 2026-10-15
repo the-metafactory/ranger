@@ -88,8 +88,11 @@ switch. A retry that started on a quiet host and named a failure is the
 branch's failure, as before.
 
 The host is busy while its 1-minute load is at or above `workers.busyLoad`
-(default: the core count). On a busy host the walk claims nothing, and every
-queued resume waits, ranger's own and an operator's `--when-free` entry alike:
+(default: the core count). `workers.laneBusyLoad` sets it per implement lane,
+shaped like `laneSlots` (`{ headless: 30 }`); a lane with no entry reads
+`busyLoad`, and each gate reads the value for the lane it gates (node #312).
+On a busy host the walk claims nothing on that lane's maps, and every queued
+resume on that lane waits, ranger's own and an operator's `--when-free` entry alike:
 no start and no failed start, one `reviewed` event per tick, and it holds
 nothing behind it. `resume-node --when-free` queues on a busy host rather than
 starting; a plain `resume-node` starts at once. Supervisor and adoption test

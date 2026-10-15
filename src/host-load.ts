@@ -1,4 +1,5 @@
 import { availableParallelism, loadavg } from "node:os";
+import type { ImplementLane } from "./lanes.ts";
 
 /** The host's 1-minute load and its core count. */
 export interface HostLoadReading {
@@ -19,7 +20,18 @@ export type BusyReading = HostLoadReading & { killed?: boolean };
 export const realHostLoad: HostLoad = () =>
  process.env.RANGER_UNDER_TEST === "1" ? { load: 0, cores: 1 } : { load: loadavg()[0], cores: availableParallelism() };
 
-/** The 1-minute load at which the host counts as busy: `workers.busyLoad`, else the core count. */
+/**
+ * The busy load a gate reads for the implement lane it gates (node #312):
+ * `workers.laneBusyLoad[lane]`, else `workers.busyLoad`; undefined leaves
+ * `busyAt` at the core count. One threshold for both lanes held headless work
+ * behind the visual lane's GPU probes (2026-10-15).
+ */
+export const busyLoadFor = (
+ workers: { busyLoad?: number; laneBusyLoad?: Partial<Record<ImplementLane, number>> } | undefined,
+ lane: ImplementLane,
+): number | undefined => workers?.laneBusyLoad?.[lane] ?? workers?.busyLoad;
+
+/** The 1-minute load at which the host counts as busy: `busyLoadFor` the lane, else the core count. */
 export const busyAt = (host: { cores: number }, busyLoad?: number): number => busyLoad ?? host.cores;
 
 /**
