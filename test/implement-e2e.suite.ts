@@ -2914,8 +2914,19 @@ describe("implement lane (node #23)", () => {
 
  test("a fresh checkout carries origin/<base>, so a test can take its merge base (found live on soma #887)", async () => {
   const flag = join(tmpdir(), `ranger-fresh-base-${Date.now()}`);
-  const r = await rig({ test: `test -f ${flag} && git merge-base HEAD origin/main` });
+  const r = await rig({});
   cleanup.push(r.dir);
+  // The node's branch is ahead of origin/main: in the fresh checkout, at a
+  // detached HEAD, origin/main is the canonical's own and is the merge base.
+  const canonicalBase = `git -C "${r.canonical}" rev-parse --verify refs/remotes/origin/main`;
+  r.ctx.map.commands.test = [
+   `test -f ${flag}`,
+   `git rev-parse --verify origin/main`,
+   `test "$(git rev-parse --verify origin/main)" = "$(${canonicalBase})"`,
+   `test "$(git merge-base HEAD origin/main)" = "$(${canonicalBase})"`,
+   `test "$(git rev-list --count origin/main..HEAD)" -gt 0`,
+   `test -z "$(git branch --show-current)"`,
+  ].join(" && ");
   expect((await runNode("20", r.ctx)).status).toBe("failed");
   writeFileSync(flag, "");
   r.ctx.workerCommand = [implementWorker, "noop"]; // only adoption can pass it
@@ -2924,6 +2935,26 @@ describe("implement lane (node #23)", () => {
   const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
   expect(events.some((d) => d.startsWith("adopting "))).toBe(true);
   rmSync(flag, { force: true });
+ }, 60_000);
+
+ test("a fresh checkout fails closed, before install or tests, when the canonical has no origin/<base> (node #298)", async () => {
+  const runs = join(tmpdir(), `ranger-fresh-no-base-${Date.now()}`);
+  const r = await rig({});
+  cleanup.push(r.dir);
+  // The worktree run drops the shared refs/remotes/origin/main and fails on a
+  // busy host; its retry in a fresh checkout has no base ref to copy.
+  r.ctx.map.commands.install = `echo "install $PWD" >> ${runs}`;
+  r.ctx.map.commands.test = `echo "test $PWD" >> ${runs}; git update-ref -d refs/remotes/origin/main; exit 1`;
+  r.ctx.hostLoad = () => ({ load: 14, cores: 10 });
+  r.ctx.quietHost = { pollMs: 1, maxMs: 5 };
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("failed");
+  expect(outcome.detail).toContain("the canonical checkout has no refs/remotes/origin/main");
+  const lines = readFileSync(runs, "utf8").trim().split("\n");
+  expect(lines.some((l) => l.startsWith("test "))).toBe(true); // the worktree run
+  expect(lines.some((l) => l.includes("ranger-test-"))).toBe(false); // nothing in the fresh checkout
+  expect(r.github.prs.size).toBe(0);
+  rmSync(runs, { force: true });
  }, 60_000);
 
  test("an adopted head is credited to the substrate that wrote it, not to a later session that committed nothing", async () => {

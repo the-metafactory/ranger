@@ -3103,9 +3103,10 @@ async function restoreWorktree(ctx: ImplementContext, sha: string): Promise<stri
 /**
  * The map's install and test commands in a throwaway clone of the node's
  * branch, checked out at `sha`. A clone, not a linked worktree, of that one
- * branch without tags: it carries no other ref (refs/replace a failed run
- * planted would make the files checked out differ from the commit that gets
- * pushed; a tag it left could be what a test reads), no config and no hooks
+ * branch without tags: it carries no other ref but origin/<base>, copied
+ * from the canonical (refs/replace a failed run planted would make the files
+ * checked out differ from the commit that gets pushed; a tag it left could be
+ * what a test reads), no config and no hooks
  * from the node's repository. Every git call here also refuses replacement
  * objects.
  */
@@ -3115,8 +3116,8 @@ async function testsInFreshCheckout(ctx: ImplementContext, testCommand: string, 
 
 /**
  * testsInFreshCheckout for a retry, a merge-base run, or the other steps of
- * a base-red run. `ran` is false when the clone, checkout or install failed,
- * or the run changed the checkout's tracked content or HEAD: the result then
+ * a base-red run. `ran` is false when the clone, the copy of origin/<base>,
+ * checkout or install failed, or the run changed the checkout's tracked content or HEAD: the result then
  * carries why, first.
  */
 async function freshCheckoutTests(
@@ -3149,15 +3150,22 @@ async function freshCheckoutTests(
    const set = await git(["remote", "set-url", "origin", originUrl.stdout.trim()], dir, 10_000);
    if (set.code !== 0) return failed(`could not set origin ${forRun}: ${set.stderr.trim()}`);
   }
-  // The base's remote-tracking ref too: a repo's tests may diff against it
-  // (2026-10-14: soma's boundary check runs `git merge-base HEAD origin/main`,
-  // and the single-branch clone failed it on every retry and adoption).
-  // Best effort: the canonical's origin/<base>, else its local <base>; a
-  // canonical with neither runs the tests as before.
+  // The base's remote-tracking ref too, as the node's worktree sees it: a
+  // repo's tests may diff against it (2026-10-14: soma's boundary check runs
+  // `git merge-base HEAD origin/main`, and the single-branch clone failed it
+  // on every retry and adoption — node #298). Copied from the canonical by
+  // sha, no network; a canonical without it fails the run before install,
+  // as tests would otherwise fail on a ref the branch never lacked.
   const baseRef = `refs/remotes/origin/${ctx.map.base}`;
-  for (const source of [baseRef, `refs/heads/${ctx.map.base}`]) {
-   const base = await git(["fetch", "--quiet", "--no-tags", ctx.canonical, `+${source}:${baseRef}`], dir, 300_000);
-   if (base.code === 0) break;
+  const baseTip = await git(["rev-parse", "--verify", "--quiet", `${baseRef}^{commit}`], ctx.canonical, 10_000);
+  const tip = baseTip.stdout.trim();
+  if (baseTip.code !== 0 || !/^[0-9a-f]{40,64}$/.test(tip)) {
+   return failed(`the canonical checkout has no ${baseRef} (origin/${ctx.map.base}) to give the checkout ${forRun}: fetch the base there first`);
+  }
+  const base = await git(["fetch", "--quiet", "--no-tags", ctx.canonical, `+${tip}:${baseRef}`], dir, 300_000);
+  const copied = await git(["rev-parse", "--verify", "--quiet", `${baseRef}^{commit}`], dir, 10_000);
+  if (base.code !== 0 || copied.stdout.trim() !== tip) {
+   return failed(`could not copy ${baseRef} at ${tip.slice(0, 8)} into the checkout ${forRun}: ${base.stderr.trim() || copied.stderr.trim() || "the ref did not resolve"}`);
   }
   const checkout = await git(["-c", "advice.detachedHead=false", "checkout", "--quiet", "--detach", sha], dir, 120_000);
   if (checkout.code !== 0) return failed(`could not check out ${sha.slice(0, 8)} ${forRun}: ${checkout.stderr.trim()}`);
