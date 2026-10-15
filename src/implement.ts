@@ -199,7 +199,8 @@ export interface ImplementOutcome {
 }
 
 const INSTALL_TIMEOUT_MS = 15 * 60 * 1000;
-const TEST_TIMEOUT_MS = 20 * 60 * 1000;
+/** The map's supervisor test wall clock (`commands.testTimeoutMin`), in ms. */
+const testTimeoutMs = (ctx: ImplementContext): number => ctx.map.commands.testTimeoutMin * 60_000;
 
 const backends = new WeakMap<ImplementContext, TestBackend>();
 const remotePasses = new WeakMap<ImplementContext, TestResult & { request: TestRequest }>();
@@ -2803,7 +2804,7 @@ async function supervisorTests(
  // 6-minute suite ran past the 20-minute timeout at load 45-55 on 10 cores):
  // wait for a quiet host first, then run anyway, as the probe tier does.
  if (!remoteTests(ctx)) await awaitQuietHost(ctx, "the supervisor test run");
- let tests = await backendTests(ctx, head, () => runShell(testCommand, worktree, ctx, { label: `${label}: supervisor tests`, timeoutMs: TEST_TIMEOUT_MS, measureCpu: true }));
+ let tests = await backendTests(ctx, head, () => runShell(testCommand, worktree, ctx, { label: `${label}: supervisor tests`, timeoutMs: testTimeoutMs(ctx), measureCpu: true }));
  if (remoteTests(ctx)) return { tests, retried: false };
  if (tests.code === 0) return { tests, retried: false };
  if ((await headSha(worktree)) !== head) {
@@ -3173,7 +3174,7 @@ async function freshCheckoutTests(
    const install = await runShell(ctx.map.commands.install, dir, ctx, { label: `${label}: install in a fresh checkout`, timeoutMs: INSTALL_TIMEOUT_MS });
    if (install.code !== 0) return { ran: false, result: { ...install, stderr: `install ${forRun} failed\n${install.stderr}` } };
   }
-  const tests = await runShell(testCommand, dir, ctx, { label: `${label}: tests in a fresh checkout`, timeoutMs: TEST_TIMEOUT_MS, measureCpu: true });
+  const tests = await runShell(testCommand, dir, ctx, { label: `${label}: tests in a fresh checkout`, timeoutMs: testTimeoutMs(ctx), measureCpu: true });
   // A sanity check on the run, not proof against the commit's own scripts
   // (see supervisorTests): install and the tests should leave the commit's
   // tracked content as committed — no new HEAD, no modified tracked file,

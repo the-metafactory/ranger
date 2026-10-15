@@ -121,8 +121,19 @@ describe("loadConfig", () => {
       });
       expect(map.walk).toBe("none");
       expect(map.autoMerge).toBe(false);
-      expect(map.commands).toEqual({ probeTimeoutMin: 30 });
+      expect(map.commands).toEqual({ probeTimeoutMin: 30, testTimeoutMin: 20 });
     });
+  });
+
+  test("commands.testTimeoutMin sets the supervisor test wall clock per map, and must be a positive whole number", () => {
+    withConfig("maps:\n  - repo: acme/widgets\n    root: 1\n    commands:\n      test: bun test\n      testTimeoutMin: 45\n", path => {
+      expect(loadConfig(path, {}).config.maps[0].commands.testTimeoutMin).toBe(45);
+    });
+    for (const bad of ["0", "-5", "2.5"]) {
+      withConfig(`maps:\n  - repo: acme/widgets\n    root: 1\n    commands:\n      testTimeoutMin: ${bad}\n`, path => {
+        expect(() => loadConfig(path, {})).toThrow(ConfigError);
+      });
+    }
   });
 
   test("accepts host-qualified read prefixes alongside existing GitHub keys", () => {

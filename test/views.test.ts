@@ -288,7 +288,7 @@ describe("capture orchestration", () => {
  test("without needs-eye runs nothing, even with missing configuration", async () => {
   const r = rig();
   r.ctx.labels = [];
-  r.ctx.map.commands = { probeTimeoutMin: 30 };
+  r.ctx.map.commands = { probeTimeoutMin: 30, testTimeoutMin: 20 };
   expect(await captureViews(r.ctx)).toBeUndefined();
   expect(r.calls).toEqual([]);
   expect(r.servers).toEqual([]);

@@ -589,6 +589,20 @@ describe("implement lane (node #23)", () => {
   for (const call of shellCalls) expect(call.journal).toBe(session);
  });
 
+ test("the supervisor test run is killed at the map's commands.testTimeoutMin (soma #908)", async () => {
+  const r = await rig({});
+  cleanup.push(r.dir);
+  r.ctx.map.commands.testTimeoutMin = 45;
+  const timeouts: number[] = [];
+  r.ctx.shellRun = (command, opts) => {
+   if (command === "test -f src/feature.ts") timeouts.push(opts.timeoutMs ?? -1);
+   return runCmd("/bin/sh", ["-c", command], opts);
+  };
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  expect(timeouts.length).toBeGreaterThan(0);
+  for (const t of timeouts) expect(t).toBe(45 * 60_000);
+ });
+
  test("two maps: gameplay prompt, merge recovery and decision projection stay on root 460", async () => {
   const r = await rig({ root: 460 });
   cleanup.push(r.dir);
