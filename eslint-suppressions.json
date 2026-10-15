@@ -1019,9 +1019,6 @@
     },
     "@typescript-eslint/non-nullable-type-assertion-style": {
       "count": 1
-    },
-    "ranger/no-comments": {
-      "count": 126
     }
   },
   "src/worker-env.ts": {
