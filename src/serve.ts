@@ -667,7 +667,13 @@ export function launchPlan(args: {
   kind === "grilling"
    ? `Grill node #${args.nodeId} with me, on map #${args.root} of ${args.repo}. ` +
      `Read it with \`soma graph node ${args.nodeId} --repo ${args.repo}\`, ` +
-     `then work it with the grilling skill.`
+     `then work it with the grilling skill. ` +
+     // The grilling skill knows nothing of build briefs, and the #21 session
+     // filed #239–#241 without them, so ranger parked all three. The orienteer
+     // prompt below needs no such line: that skill routes to build-brief.md.
+     `Any build node you file when it closes follows the orienteer skill's ` +
+     `\`references/build-brief.md\` (\`## Deliverable\`, \`## Acceptance criteria\`): ` +
+     `ranger parks a build node without them.`
    : `Work node #${args.nodeId} with me, a ${kind} waiting on me on map #${args.root} of ${args.repo}. ` +
      `Read it with \`soma graph node ${args.nodeId} --repo ${args.repo}\`, ` +
      `then work it with the orienteer skill.`;
