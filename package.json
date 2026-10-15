@@ -12,7 +12,7 @@
     "walk": "bun src/cli.ts walk",
     "test": "bun test --parallel=4 --timeout=60000",
     "typecheck": "bunx tsc --noEmit",
-    "lint": "bun --bun eslint .",
+    "lint": "bun eslint/suppressions-guard.ts && bun --bun eslint .",
     "lint:fix": "bun --bun eslint --fix ."
   },
   "dependencies": {

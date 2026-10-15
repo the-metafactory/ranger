@@ -9,7 +9,9 @@
 //     carry a violation is eslint-suppressions.json, which shows in the diff.
 //
 // Existing violations live in eslint-suppressions.json. ESLint fails when a
-// suppressed violation is fixed but still listed, so the file only shrinks:
+// suppressed violation is fixed but still listed, and
+// eslint/suppressions-guard.ts fails when a rule's total grows past origin/main
+// (say after --suppress-all), so the file only shrinks:
 //   bun run lint                       # CI gate
 //   bun run lint --prune-suppressions  # after fixing suppressed violations
 //   bun run lint:fix

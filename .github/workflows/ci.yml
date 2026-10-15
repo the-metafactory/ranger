@@ -17,6 +17,9 @@ jobs:
     steps:
       # pinned to actions/checkout v4.2.2
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          # eslint/suppressions-guard.ts compares eslint-suppressions.json with origin/main.
+          fetch-depth: 0
       # pinned to oven-sh/setup-bun v2.2.0
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
         with:
