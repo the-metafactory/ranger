@@ -23,8 +23,10 @@ export const realHostLoad: HostLoad = () =>
 /**
  * The busy load a gate reads for the implement lane it gates (node #312):
  * `workers.laneBusyLoad[lane]`, else `workers.busyLoad`; undefined leaves
- * `busyAt` at the core count. One threshold for both lanes held headless work
- * behind the visual lane's GPU probes (2026-10-15).
+ * `busyAt` at the core count. The gate reads CPU load, so a lane's value is
+ * the load its own suites are known to pass at: with one threshold, the
+ * headless queue waited six hours on load the visual lane's probes made
+ * (2026-10-15), while a soma supervisor run passed in 15 min at load 20-24.
  */
 export const busyLoadFor = (
  workers: { busyLoad?: number; laneBusyLoad?: Partial<Record<ImplementLane, number>> } | undefined,
