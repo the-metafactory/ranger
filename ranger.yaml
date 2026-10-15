@@ -321,6 +321,9 @@ bot:
 # default of 2).
 workers:
   reviewRounds: 8
+  # The host is busy at a 1-min load of 20 (principal, 2026-10-14; #304): no
+  # claim, no queued resume, and supervisor test runs wait until it drops below.
+  busyLoad: 20
   # No daily spawn cap (principal, 2026-10-14; #300): unset means none. It was
   # 10, then 20 (2026-10-04), then 30 (2026-10-13), and still held claims back.
   # Concurrent implement workers per resource lane (default 1 each). Headless
