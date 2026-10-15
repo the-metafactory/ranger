@@ -494,9 +494,14 @@ export interface LoadedConfig {
  path: string;
 }
 
-/** Find the config path: explicit flag, else ./ranger.yaml, else default location. */
+/** The working-directory default when no config override is supplied. */
 export function defaultConfigPath(cwd: string): string {
  return resolve(cwd, "ranger.yaml");
+}
+
+/** Resolve the flag, then RANGER_CONFIG, then ./ranger.yaml against the caller's cwd. */
+export function resolveConfigPath(flag: string | undefined, env: NodeJS.ProcessEnv, cwd: string): string {
+ return resolve(cwd, flag ?? env.RANGER_CONFIG ?? "ranger.yaml");
 }
 
 /** Expand a leading `~` (journal path, canonical root). */

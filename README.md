@@ -139,6 +139,24 @@ cache entries. Remove the migration-only overrides after cutover. Standalone
 Drizzle callers must seed `ranger_legacy_roots(repo, root)` for every legacy repo
 before applying this migration.
 
+## Configuration
+
+Commands that read `ranger.yaml` choose the config path in this order:
+explicit `--config <path>` (or `-c`), `$RANGER_CONFIG`, then `./ranger.yaml`.
+Relative paths from either the flag or the environment resolve against the
+working directory. A missing selected file is an error; ranger does not try
+another location. There is no implicit home-directory config path.
+
+Set an absolute path to use the checked-in config from another directory:
+
+```bash
+export RANGER_CONFIG=/absolute/path/to/ranger/ranger.yaml
+ranger job list
+```
+
+Spawned ranger processes receive the selected absolute path through `--config`.
+The required private JSON `--config` options under `remote-test` are separate.
+
 ## Scout (build-path step 1)
 
 `ranger scout` is the first shipped component: a read-only tick that digests every
@@ -146,7 +164,7 @@ registered map's frontier, audit, and HITL queue to a CLI report (Discord digest
 comes once the bot exists — design §9). It performs **zero graph writes**.
 
 ```bash
-bun src/cli.ts scout                      # text report (ranger.yaml in cwd)
+bun src/cli.ts scout                      # text report ($RANGER_CONFIG or ./ranger.yaml)
 bun src/cli.ts scout --json               # machine-readable report
 bun src/cli.ts scout -c /path/ranger.yaml # explicit config
 ```
