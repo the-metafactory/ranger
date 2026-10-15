@@ -1,0 +1,1751 @@
+{
+  "src/announce.ts": {
+    "@typescript-eslint/require-await": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 6
+    }
+  },
+  "src/awake.ts": {
+    "ranger/no-comments": {
+      "count": 1
+    }
+  },
+  "src/blocked-report.ts": {
+    "@typescript-eslint/non-nullable-type-assertion-style": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 6
+    }
+  },
+  "src/budget.ts": {
+    "ranger/no-comments": {
+      "count": 5
+    }
+  },
+  "src/build-now.ts": {
+    "@typescript-eslint/no-non-null-assertion": {
+      "count": 4
+    },
+    "ranger/no-comments": {
+      "count": 16
+    }
+  },
+  "src/candidates.ts": {
+    "ranger/no-comments": {
+      "count": 7
+    }
+  },
+  "src/card-render.ts": {
+    "@typescript-eslint/no-non-null-assertion": {
+      "count": 1
+    },
+    "@typescript-eslint/no-unnecessary-condition": {
+      "count": 1
+    },
+    "@typescript-eslint/no-unnecessary-type-assertion": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 19
+    }
+  },
+  "src/card-sync.ts": {
+    "@typescript-eslint/no-non-null-assertion": {
+      "count": 22
+    },
+    "@typescript-eslint/no-unnecessary-type-assertion": {
+      "count": 22
+    },
+    "@typescript-eslint/prefer-nullish-coalescing": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 135
+    }
+  },
+  "src/cli.ts": {
+    "@typescript-eslint/no-confusing-void-expression": {
+      "count": 3
+    },
+    "@typescript-eslint/no-unsafe-assignment": {
+      "count": 5
+    },
+    "@typescript-eslint/no-unsafe-member-access": {
+      "count": 1
+    },
+    "@typescript-eslint/non-nullable-type-assertion-style": {
+      "count": 1
+    },
+    "@typescript-eslint/prefer-optional-chain": {
+      "count": 1
+    },
+    "@typescript-eslint/require-await": {
+      "count": 1
+    },
+    "@typescript-eslint/use-unknown-in-catch-callback-variable": {
+      "count": 1
+    },
+    "preserve-caught-error": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 26
+    }
+  },
+  "src/closed-elsewhere.ts": {
+    "@typescript-eslint/no-confusing-void-expression": {
+      "count": 1
+    },
+    "@typescript-eslint/no-non-null-assertion": {
+      "count": 2
+    }
+  },
+  "src/closure-sweep.ts": {
+    "@typescript-eslint/no-non-null-assertion": {
+      "count": 1
+    },
+    "@typescript-eslint/prefer-nullish-coalescing": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 1
+    }
+  },
+  "src/config.ts": {
+    "@typescript-eslint/no-unnecessary-condition": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 83
+    }
+  },
+  "src/digest.ts": {
+    "no-useless-assignment": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 40
+    }
+  },
+  "src/discord.ts": {
+    "@typescript-eslint/no-confusing-void-expression": {
+      "count": 2
+    },
+    "@typescript-eslint/no-unnecessary-condition": {
+      "count": 2
+    },
+    "ranger/no-comments": {
+      "count": 91
+    }
+  },
+  "src/escalate.ts": {
+    "@typescript-eslint/no-unused-vars": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 47
+    }
+  },
+  "src/exec.ts": {
+    "@typescript-eslint/no-unsafe-argument": {
+      "count": 1
+    },
+    "@typescript-eslint/no-unsafe-assignment": {
+      "count": 1
+    },
+    "@typescript-eslint/no-unsafe-call": {
+      "count": 3
+    },
+    "@typescript-eslint/no-unsafe-member-access": {
+      "count": 3
+    },
+    "@typescript-eslint/prefer-regexp-exec": {
+      "count": 1
+    },
+    "@typescript-eslint/restrict-plus-operands": {
+      "count": 3
+    },
+    "ranger/no-comments": {
+      "count": 13
+    }
+  },
+  "src/forge-ref.ts": {
+    "ranger/no-comments": {
+      "count": 6
+    }
+  },
+  "src/forge-text.ts": {
+    "ranger/no-comments": {
+      "count": 1
+    }
+  },
+  "src/forge.ts": {
+    "ranger/no-comments": {
+      "count": 21
+    }
+  },
+  "src/frontier-cache.ts": {
+    "ranger/no-comments": {
+      "count": 31
+    }
+  },
+  "src/git-ops.ts": {
+    "@typescript-eslint/no-confusing-void-expression": {
+      "count": 1
+    },
+    "@typescript-eslint/no-non-null-assertion": {
+      "count": 1
+    },
+    "@typescript-eslint/no-unnecessary-condition": {
+      "count": 2
+    },
+    "@typescript-eslint/no-unnecessary-type-assertion": {
+      "count": 1
+    },
+    "@typescript-eslint/prefer-regexp-exec": {
+      "count": 1
+    },
+    "no-control-regex": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 49
+    }
+  },
+  "src/git-trust.ts": {
+    "@typescript-eslint/no-unnecessary-condition": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 12
+    }
+  },
+  "src/github-ci.ts": {
+    "ranger/no-comments": {
+      "count": 2
+    }
+  },
+  "src/github.ts": {
+    "@typescript-eslint/no-base-to-string": {
+      "count": 26
+    },
+    "@typescript-eslint/no-non-null-assertion": {
+      "count": 1
+    },
+    "@typescript-eslint/no-unnecessary-type-conversion": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 6
+    }
+  },
+  "src/gitlab.ts": {
+    "@typescript-eslint/no-non-null-assertion": {
+      "count": 1
+    },
+    "@typescript-eslint/no-unnecessary-condition": {
+      "count": 1
+    },
+    "@typescript-eslint/no-unnecessary-type-assertion": {
+      "count": 1
+    },
+    "@typescript-eslint/no-unsafe-assignment": {
+      "count": 1
+    },
+    "@typescript-eslint/no-unsafe-return": {
+      "count": 1
+    },
+    "no-control-regex": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 38
+    }
+  },
+  "src/glab-config-dir.ts": {
+    "@typescript-eslint/no-confusing-void-expression": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 1
+    }
+  },
+  "src/glab-transport.ts": {
+    "@typescript-eslint/no-unsafe-assignment": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 1
+    }
+  },
+  "src/graph-write.ts": {
+    "ranger/no-comments": {
+      "count": 18
+    }
+  },
+  "src/graph.ts": {
+    "@typescript-eslint/no-unnecessary-type-conversion": {
+      "count": 1
+    },
+    "@typescript-eslint/no-unnecessary-type-parameters": {
+      "count": 1
+    },
+    "@typescript-eslint/restrict-template-expressions": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 9
+    }
+  },
+  "src/identity.ts": {
+    "ranger/no-comments": {
+      "count": 11
+    }
+  },
+  "src/implement.ts": {
+    "@typescript-eslint/consistent-type-definitions": {
+      "count": 1
+    },
+    "@typescript-eslint/no-confusing-void-expression": {
+      "count": 7
+    },
+    "@typescript-eslint/no-non-null-assertion": {
+      "count": 8
+    },
+    "@typescript-eslint/no-unnecessary-condition": {
+      "count": 9
+    },
+    "@typescript-eslint/no-unnecessary-type-parameters": {
+      "count": 1
+    },
+    "@typescript-eslint/no-unsafe-assignment": {
+      "count": 1
+    },
+    "@typescript-eslint/no-unsafe-return": {
+      "count": 1
+    },
+    "@typescript-eslint/non-nullable-type-assertion-style": {
+      "count": 3
+    },
+    "@typescript-eslint/prefer-optional-chain": {
+      "count": 2
+    },
+    "@typescript-eslint/prefer-regexp-exec": {
+      "count": 6
+    },
+    "ranger/no-comments": {
+      "count": 294
+    }
+  },
+  "src/intake.ts": {
+    "@typescript-eslint/no-confusing-void-expression": {
+      "count": 3
+    },
+    "@typescript-eslint/no-non-null-assertion": {
+      "count": 10
+    },
+    "@typescript-eslint/no-unnecessary-type-assertion": {
+      "count": 4
+    },
+    "@typescript-eslint/only-throw-error": {
+      "count": 2
+    },
+    "ranger/no-comments": {
+      "count": 127
+    }
+  },
+  "src/jobs.ts": {
+    "@typescript-eslint/no-empty-function": {
+      "count": 1
+    },
+    "@typescript-eslint/no-non-null-assertion": {
+      "count": 1
+    },
+    "@typescript-eslint/prefer-optional-chain": {
+      "count": 2
+    },
+    "@typescript-eslint/require-await": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 21
+    }
+  },
+  "src/journal-guard.ts": {
+    "@typescript-eslint/non-nullable-type-assertion-style": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 1
+    }
+  },
+  "src/journal.ts": {
+    "@typescript-eslint/no-confusing-void-expression": {
+      "count": 1
+    },
+    "@typescript-eslint/no-non-null-assertion": {
+      "count": 4
+    },
+    "@typescript-eslint/no-unnecessary-condition": {
+      "count": 13
+    },
+    "@typescript-eslint/no-unnecessary-type-assertion": {
+      "count": 2
+    },
+    "@typescript-eslint/no-unnecessary-type-conversion": {
+      "count": 3
+    },
+    "@typescript-eslint/prefer-includes": {
+      "count": 2
+    },
+    "@typescript-eslint/prefer-optional-chain": {
+      "count": 2
+    },
+    "ranger/no-comments": {
+      "count": 136
+    }
+  },
+  "src/lanes.ts": {
+    "ranger/no-comments": {
+      "count": 1
+    }
+  },
+  "src/launch.ts": {
+    "ranger/no-comments": {
+      "count": 3
+    }
+  },
+  "src/lock.ts": {
+    "ranger/no-comments": {
+      "count": 36
+    }
+  },
+  "src/maps.ts": {
+    "@typescript-eslint/no-non-null-assertion": {
+      "count": 1
+    }
+  },
+  "src/merge-desk.ts": {
+    "@typescript-eslint/no-unnecessary-condition": {
+      "count": 1
+    },
+    "@typescript-eslint/prefer-optional-chain": {
+      "count": 2
+    },
+    "ranger/no-comments": {
+      "count": 71
+    }
+  },
+  "src/merge-gate.ts": {
+    "ranger/no-comments": {
+      "count": 16
+    }
+  },
+  "src/outcomes.ts": {
+    "@typescript-eslint/no-unnecessary-condition": {
+      "count": 1
+    },
+    "@typescript-eslint/prefer-regexp-exec": {
+      "count": 1
+    },
+    "@typescript-eslint/prefer-string-starts-ends-with": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 7
+    }
+  },
+  "src/pool.ts": {
+    "@typescript-eslint/no-unsafe-assignment": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 3
+    }
+  },
+  "src/probe-requeue.ts": {
+    "@typescript-eslint/non-nullable-type-assertion-style": {
+      "count": 3
+    },
+    "@typescript-eslint/prefer-optional-chain": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 8
+    }
+  },
+  "src/prompt.ts": {
+    "@typescript-eslint/no-non-null-assertion": {
+      "count": 1
+    },
+    "@typescript-eslint/prefer-regexp-exec": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 22
+    }
+  },
+  "src/ratify.ts": {
+    "@typescript-eslint/no-non-null-assertion": {
+      "count": 5
+    },
+    "@typescript-eslint/no-unnecessary-condition": {
+      "count": 1
+    },
+    "@typescript-eslint/no-unnecessary-type-assertion": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 30
+    }
+  },
+  "src/remote-test/artifacts.ts": {
+    "@typescript-eslint/no-non-null-assertion": {
+      "count": 1
+    },
+    "@typescript-eslint/no-unsafe-assignment": {
+      "count": 1
+    },
+    "@typescript-eslint/no-unsafe-member-access": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 4
+    }
+  },
+  "src/remote-test/baseline.ts": {
+    "@typescript-eslint/no-confusing-non-null-assertion": {
+      "count": 1
+    },
+    "@typescript-eslint/no-non-null-assertion": {
+      "count": 6
+    },
+    "@typescript-eslint/no-unnecessary-type-assertion": {
+      "count": 4
+    },
+    "ranger/no-comments": {
+      "count": 4
+    }
+  },
+  "src/remote-test/bus-contract.ts": {
+    "ranger/no-comments": {
+      "count": 12
+    }
+  },
+  "src/remote-test/bus-source.ts": {
+    "@typescript-eslint/no-deprecated": {
+      "count": 3
+    },
+    "@typescript-eslint/no-empty-function": {
+      "count": 1
+    },
+    "@typescript-eslint/no-unnecessary-type-assertion": {
+      "count": 1
+    },
+    "@typescript-eslint/use-unknown-in-catch-callback-variable": {
+      "count": 1
+    },
+    "no-empty": {
+      "count": 4
+    },
+    "ranger/no-comments": {
+      "count": 28
+    }
+  },
+  "src/remote-test/contract.ts": {
+    "ranger/no-comments": {
+      "count": 10
+    }
+  },
+  "src/remote-test/executor.ts": {
+    "@typescript-eslint/consistent-type-definitions": {
+      "count": 2
+    },
+    "@typescript-eslint/no-confusing-void-expression": {
+      "count": 2
+    },
+    "@typescript-eslint/no-non-null-assertion": {
+      "count": 6
+    },
+    "@typescript-eslint/no-unnecessary-condition": {
+      "count": 1
+    },
+    "@typescript-eslint/no-unsafe-argument": {
+      "count": 2
+    },
+    "@typescript-eslint/no-unsafe-assignment": {
+      "count": 16
+    },
+    "@typescript-eslint/no-unsafe-call": {
+      "count": 5
+    },
+    "@typescript-eslint/no-unsafe-member-access": {
+      "count": 49
+    },
+    "@typescript-eslint/prefer-regexp-exec": {
+      "count": 3
+    },
+    "@typescript-eslint/restrict-plus-operands": {
+      "count": 1
+    },
+    "@typescript-eslint/use-unknown-in-catch-callback-variable": {
+      "count": 2
+    },
+    "no-unsafe-finally": {
+      "count": 2
+    },
+    "ranger/no-comments": {
+      "count": 17
+    }
+  },
+  "src/remote-test/job-ledger.ts": {
+    "@typescript-eslint/consistent-type-definitions": {
+      "count": 1
+    },
+    "@typescript-eslint/no-deprecated": {
+      "count": 5
+    },
+    "@typescript-eslint/no-non-null-assertion": {
+      "count": 3
+    },
+    "@typescript-eslint/no-unnecessary-condition": {
+      "count": 2
+    },
+    "@typescript-eslint/prefer-optional-chain": {
+      "count": 3
+    },
+    "no-empty": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 13
+    }
+  },
+  "src/remote-test/profiles.ts": {
+    "ranger/no-comments": {
+      "count": 1
+    }
+  },
+  "src/remote-test/receiver-diagnostics.ts": {
+    "ranger/no-comments": {
+      "count": 18
+    }
+  },
+  "src/remote-test/shadow.ts": {
+    "@typescript-eslint/consistent-type-definitions": {
+      "count": 1
+    },
+    "@typescript-eslint/no-non-null-assertion": {
+      "count": 4
+    },
+    "@typescript-eslint/no-unnecessary-type-assertion": {
+      "count": 2
+    },
+    "@typescript-eslint/require-await": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 4
+    }
+  },
+  "src/remote-test/source.ts": {
+    "@typescript-eslint/no-non-null-assertion": {
+      "count": 1
+    },
+    "@typescript-eslint/no-unnecessary-type-assertion": {
+      "count": 1
+    },
+    "@typescript-eslint/prefer-string-starts-ends-with": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 12
+    }
+  },
+  "src/remote-test/ssh-cli.ts": {
+    "@typescript-eslint/no-unsafe-argument": {
+      "count": 1
+    },
+    "@typescript-eslint/no-unsafe-assignment": {
+      "count": 2
+    },
+    "@typescript-eslint/no-unsafe-member-access": {
+      "count": 1
+    },
+    "@typescript-eslint/no-unsafe-return": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 1
+    }
+  },
+  "src/remote-test/ssh-client.ts": {
+    "@typescript-eslint/no-confusing-void-expression": {
+      "count": 1
+    },
+    "@typescript-eslint/no-empty-function": {
+      "count": 1
+    },
+    "@typescript-eslint/no-non-null-assertion": {
+      "count": 1
+    },
+    "@typescript-eslint/no-unnecessary-condition": {
+      "count": 1
+    },
+    "@typescript-eslint/prefer-optional-chain": {
+      "count": 1
+    },
+    "@typescript-eslint/require-await": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 11
+    }
+  },
+  "src/remote-test/ssh-protocol.ts": {
+    "ranger/no-comments": {
+      "count": 2
+    }
+  },
+  "src/remote-test/ssh-server.ts": {
+    "no-unsafe-finally": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 17
+    }
+  },
+  "src/remote-test/supervisor-backend.ts": {
+    "ranger/no-comments": {
+      "count": 6
+    }
+  },
+  "src/report.ts": {
+    "ranger/no-comments": {
+      "count": 4
+    }
+  },
+  "src/research-ci.ts": {
+    "no-useless-assignment": {
+      "count": 1
+    }
+  },
+  "src/resume.ts": {
+    "@typescript-eslint/no-confusing-void-expression": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 21
+    }
+  },
+  "src/review.ts": {
+    "@typescript-eslint/no-base-to-string": {
+      "count": 2
+    },
+    "ranger/no-comments": {
+      "count": 20
+    }
+  },
+  "src/route.ts": {
+    "@typescript-eslint/no-non-null-assertion": {
+      "count": 1
+    },
+    "@typescript-eslint/prefer-optional-chain": {
+      "count": 1
+    },
+    "@typescript-eslint/restrict-plus-operands": {
+      "count": 1
+    },
+    "no-useless-assignment": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 42
+    }
+  },
+  "src/run-ledger.ts": {
+    "@typescript-eslint/no-empty-function": {
+      "count": 3
+    },
+    "@typescript-eslint/no-non-null-assertion": {
+      "count": 1
+    },
+    "@typescript-eslint/no-unnecessary-condition": {
+      "count": 2
+    },
+    "@typescript-eslint/prefer-nullish-coalescing": {
+      "count": 4
+    },
+    "no-empty": {
+      "count": 3
+    },
+    "ranger/no-comments": {
+      "count": 13
+    }
+  },
+  "src/scribe.ts": {
+    "@typescript-eslint/no-empty-function": {
+      "count": 1
+    },
+    "@typescript-eslint/no-unnecessary-condition": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 19
+    }
+  },
+  "src/serve-drain.ts": {
+    "@typescript-eslint/no-unnecessary-condition": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 3
+    }
+  },
+  "src/serve-parked.ts": {
+    "@typescript-eslint/no-base-to-string": {
+      "count": 2
+    },
+    "@typescript-eslint/no-dynamic-delete": {
+      "count": 1
+    },
+    "@typescript-eslint/no-unnecessary-condition": {
+      "count": 3
+    },
+    "@typescript-eslint/non-nullable-type-assertion-style": {
+      "count": 4
+    },
+    "@typescript-eslint/prefer-string-starts-ends-with": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 94
+    }
+  },
+  "src/serve.ts": {
+    "@typescript-eslint/no-confusing-void-expression": {
+      "count": 3
+    },
+    "@typescript-eslint/no-empty-function": {
+      "count": 1
+    },
+    "@typescript-eslint/no-floating-promises": {
+      "count": 1
+    },
+    "@typescript-eslint/no-non-null-assertion": {
+      "count": 3
+    },
+    "@typescript-eslint/no-unnecessary-condition": {
+      "count": 9
+    },
+    "@typescript-eslint/no-unused-vars": {
+      "count": 1
+    },
+    "@typescript-eslint/use-unknown-in-catch-callback-variable": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 121
+    }
+  },
+  "src/spawn.ts": {
+    "@typescript-eslint/no-empty-function": {
+      "count": 1
+    },
+    "@typescript-eslint/require-await": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 5
+    }
+  },
+  "src/store/db.ts": {
+    "@typescript-eslint/no-confusing-void-expression": {
+      "count": 2
+    },
+    "preserve-caught-error": {
+      "count": 2
+    },
+    "ranger/no-comments": {
+      "count": 14
+    }
+  },
+  "src/store/legacy-roots.ts": {
+    "@typescript-eslint/no-non-null-assertion": {
+      "count": 1
+    },
+    "@typescript-eslint/no-unnecessary-condition": {
+      "count": 3
+    },
+    "ranger/no-comments": {
+      "count": 1
+    }
+  },
+  "src/store/schema.ts": {
+    "ranger/no-comments": {
+      "count": 70
+    }
+  },
+  "src/substrate-policy.ts": {
+    "ranger/no-comments": {
+      "count": 3
+    }
+  },
+  "src/substrate-usage.ts": {
+    "@typescript-eslint/no-unnecessary-boolean-literal-compare": {
+      "count": 1
+    },
+    "@typescript-eslint/no-unnecessary-condition": {
+      "count": 2
+    },
+    "@typescript-eslint/prefer-nullish-coalescing": {
+      "count": 1
+    },
+    "@typescript-eslint/prefer-optional-chain": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 22
+    }
+  },
+  "src/substrate.ts": {
+    "@typescript-eslint/no-confusing-void-expression": {
+      "count": 9
+    },
+    "@typescript-eslint/no-unnecessary-condition": {
+      "count": 1
+    },
+    "@typescript-eslint/prefer-promise-reject-errors": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 29
+    }
+  },
+  "src/sweep.ts": {
+    "@typescript-eslint/no-unnecessary-condition": {
+      "count": 1
+    },
+    "@typescript-eslint/non-nullable-type-assertion-style": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 19
+    }
+  },
+  "src/token-gate.ts": {
+    "@typescript-eslint/no-unnecessary-template-expression": {
+      "count": 1
+    },
+    "@typescript-eslint/no-unsafe-assignment": {
+      "count": 2
+    },
+    "@typescript-eslint/no-unsafe-member-access": {
+      "count": 2
+    },
+    "@typescript-eslint/no-unsafe-return": {
+      "count": 1
+    },
+    "@typescript-eslint/prefer-string-starts-ends-with": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 14
+    }
+  },
+  "src/transient.ts": {
+    "ranger/no-comments": {
+      "count": 10
+    }
+  },
+  "src/untrusted-env.ts": {
+    "ranger/no-comments": {
+      "count": 2
+    }
+  },
+  "src/views.ts": {
+    "@typescript-eslint/no-confusing-void-expression": {
+      "count": 3
+    },
+    "@typescript-eslint/no-non-null-assertion": {
+      "count": 1
+    },
+    "@typescript-eslint/no-unnecessary-condition": {
+      "count": 3
+    },
+    "@typescript-eslint/no-unsafe-argument": {
+      "count": 1
+    },
+    "@typescript-eslint/no-unsafe-assignment": {
+      "count": 1
+    },
+    "@typescript-eslint/no-unsafe-call": {
+      "count": 2
+    },
+    "@typescript-eslint/no-unsafe-member-access": {
+      "count": 11
+    },
+    "@typescript-eslint/no-unsafe-return": {
+      "count": 2
+    },
+    "@typescript-eslint/prefer-regexp-exec": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 11
+    }
+  },
+  "src/walk.ts": {
+    "@typescript-eslint/no-empty-function": {
+      "count": 1
+    },
+    "@typescript-eslint/no-non-null-assertion": {
+      "count": 2
+    },
+    "@typescript-eslint/no-unsafe-assignment": {
+      "count": 1
+    },
+    "@typescript-eslint/no-unsafe-call": {
+      "count": 1
+    },
+    "@typescript-eslint/no-unsafe-member-access": {
+      "count": 1
+    },
+    "@typescript-eslint/no-unsafe-return": {
+      "count": 1
+    },
+    "@typescript-eslint/non-nullable-type-assertion-style": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 126
+    }
+  },
+  "src/worker-env.ts": {
+    "@typescript-eslint/no-dynamic-delete": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 11
+    }
+  },
+  "src/worker.ts": {
+    "@typescript-eslint/no-confusing-void-expression": {
+      "count": 4
+    },
+    "@typescript-eslint/no-redundant-type-constituents": {
+      "count": 4
+    },
+    "@typescript-eslint/no-unnecessary-condition": {
+      "count": 2
+    },
+    "@typescript-eslint/no-unused-vars": {
+      "count": 1
+    },
+    "@typescript-eslint/non-nullable-type-assertion-style": {
+      "count": 1
+    },
+    "@typescript-eslint/prefer-optional-chain": {
+      "count": 1
+    },
+    "@typescript-eslint/use-unknown-in-catch-callback-variable": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 122
+    }
+  },
+  "test/base-red-fix-node.test.ts": {
+    "ranger/no-comments": {
+      "count": 6
+    }
+  },
+  "test/brief-not-ready.test.ts": {
+    "@typescript-eslint/no-dynamic-delete": {
+      "count": 5
+    },
+    "@typescript-eslint/no-unnecessary-type-assertion": {
+      "count": 3
+    },
+    "ranger/no-comments": {
+      "count": 26
+    }
+  },
+  "test/budget.test.ts": {
+    "@typescript-eslint/no-dynamic-delete": {
+      "count": 2
+    },
+    "ranger/no-comments": {
+      "count": 15
+    }
+  },
+  "test/build-now.test.ts": {
+    "ranger/no-comments": {
+      "count": 5
+    }
+  },
+  "test/card-render.test.ts": {
+    "@typescript-eslint/no-base-to-string": {
+      "count": 1
+    },
+    "@typescript-eslint/no-unnecessary-type-assertion": {
+      "count": 8
+    },
+    "ranger/no-comments": {
+      "count": 4
+    }
+  },
+  "test/card-state-ledger.test.ts": {
+    "@typescript-eslint/no-dynamic-delete": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 1
+    }
+  },
+  "test/closure-sweep.test.ts": {
+    "@typescript-eslint/no-dynamic-delete": {
+      "count": 1
+    },
+    "@typescript-eslint/no-unnecessary-type-assertion": {
+      "count": 6
+    },
+    "ranger/no-comments": {
+      "count": 2
+    }
+  },
+  "test/config.test.ts": {
+    "ranger/no-comments": {
+      "count": 1
+    }
+  },
+  "test/discord-files.test.ts": {
+    "@typescript-eslint/no-base-to-string": {
+      "count": 1
+    }
+  },
+  "test/drain.test.ts": {
+    "@typescript-eslint/no-dynamic-delete": {
+      "count": 1
+    },
+    "@typescript-eslint/prefer-includes": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 12
+    }
+  },
+  "test/escalate.e2e.test.ts": {
+    "ranger/no-comments": {
+      "count": 165
+    }
+  },
+  "test/fixtures/bin/intake-gh.ts": {
+    "@typescript-eslint/no-unnecessary-type-assertion": {
+      "count": 3
+    },
+    "ranger/no-comments": {
+      "count": 2
+    }
+  },
+  "test/fixtures/bin/ratify-gh.ts": {
+    "@typescript-eslint/no-unnecessary-type-assertion": {
+      "count": 6
+    },
+    "@typescript-eslint/restrict-plus-operands": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 1
+    }
+  },
+  "test/fixtures/bin/research-gh.ts": {
+    "@typescript-eslint/no-unnecessary-type-assertion": {
+      "count": 2
+    },
+    "@typescript-eslint/restrict-plus-operands": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 1
+    }
+  },
+  "test/fixtures/probes/production-node-env.probe.ts": {
+    "ranger/no-comments": {
+      "count": 2
+    }
+  },
+  "test/forge-port.test.ts": {
+    "@typescript-eslint/no-unnecessary-type-assertion": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 1
+    }
+  },
+  "test/forge-ref.test.ts": {
+    "ranger/no-comments": {
+      "count": 6
+    }
+  },
+  "test/forge-text.test.ts": {
+    "@typescript-eslint/no-unnecessary-type-assertion": {
+      "count": 4
+    },
+    "ranger/no-comments": {
+      "count": 10
+    }
+  },
+  "test/git-ops.test.ts": {
+    "ranger/no-comments": {
+      "count": 37
+    }
+  },
+  "test/git-trust.test.ts": {
+    "@typescript-eslint/non-nullable-type-assertion-style": {
+      "count": 3
+    },
+    "ranger/no-comments": {
+      "count": 18
+    }
+  },
+  "test/github-ci.test.ts": {
+    "ranger/no-comments": {
+      "count": 1
+    }
+  },
+  "test/gitlab-budget.test.ts": {
+    "ranger/no-comments": {
+      "count": 8
+    }
+  },
+  "test/gitlab-git-transport.test.ts": {
+    "ranger/no-comments": {
+      "count": 5
+    }
+  },
+  "test/gitlab-lanes.test.ts": {
+    "@typescript-eslint/no-dynamic-delete": {
+      "count": 1
+    },
+    "@typescript-eslint/no-unnecessary-type-assertion": {
+      "count": 4
+    },
+    "@typescript-eslint/no-unnecessary-type-conversion": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 21
+    }
+  },
+  "test/gitlab-merge-desk.test.ts": {
+    "@typescript-eslint/no-unnecessary-type-assertion": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 13
+    }
+  },
+  "test/gitlab-port-merge.test.ts": {
+    "@typescript-eslint/no-non-null-asserted-optional-chain": {
+      "count": 1
+    },
+    "@typescript-eslint/no-unnecessary-type-assertion": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 4
+    }
+  },
+  "test/gitlab-port-writes.test.ts": {
+    "@typescript-eslint/no-non-null-asserted-optional-chain": {
+      "count": 1
+    }
+  },
+  "test/gitlab-port.test.ts": {
+    "@typescript-eslint/no-dynamic-delete": {
+      "count": 2
+    },
+    "@typescript-eslint/no-non-null-asserted-optional-chain": {
+      "count": 1
+    },
+    "@typescript-eslint/no-unnecessary-type-assertion": {
+      "count": 2
+    },
+    "ranger/no-comments": {
+      "count": 4
+    }
+  },
+  "test/gitlab-write-gate.test.ts": {
+    "@typescript-eslint/no-non-null-asserted-optional-chain": {
+      "count": 1
+    },
+    "@typescript-eslint/no-unnecessary-type-assertion": {
+      "count": 2
+    },
+    "ranger/no-comments": {
+      "count": 5
+    }
+  },
+  "test/graph-propose.test.ts": {
+    "@typescript-eslint/no-unnecessary-type-assertion": {
+      "count": 3
+    },
+    "@typescript-eslint/no-useless-default-assignment": {
+      "count": 1
+    }
+  },
+  "test/implement-e2e-1.test.ts": {
+    "ranger/no-comments": {
+      "count": 2
+    }
+  },
+  "test/implement-e2e-2.test.ts": {
+    "ranger/no-comments": {
+      "count": 2
+    }
+  },
+  "test/implement-e2e-3.test.ts": {
+    "ranger/no-comments": {
+      "count": 2
+    }
+  },
+  "test/implement-e2e-4.test.ts": {
+    "ranger/no-comments": {
+      "count": 2
+    }
+  },
+  "test/implement-e2e.suite.ts": {
+    "@typescript-eslint/no-dynamic-delete": {
+      "count": 2
+    },
+    "@typescript-eslint/no-unnecessary-type-assertion": {
+      "count": 13
+    },
+    "@typescript-eslint/non-nullable-type-assertion-style": {
+      "count": 16
+    },
+    "@typescript-eslint/prefer-regexp-exec": {
+      "count": 5
+    },
+    "@typescript-eslint/restrict-plus-operands": {
+      "count": 1
+    },
+    "no-regex-spaces": {
+      "count": 1
+    },
+    "prefer-const": {
+      "count": 6
+    },
+    "ranger/no-comments": {
+      "count": 230
+    }
+  },
+  "test/implement.unit.test.ts": {
+    "@typescript-eslint/no-require-imports": {
+      "count": 3
+    },
+    "@typescript-eslint/non-nullable-type-assertion-style": {
+      "count": 1
+    },
+    "@typescript-eslint/prefer-regexp-exec": {
+      "count": 1
+    },
+    "no-empty": {
+      "count": 2
+    },
+    "ranger/no-comments": {
+      "count": 25
+    }
+  },
+  "test/intake-correction.e2e.test.ts": {
+    "@typescript-eslint/no-dynamic-delete": {
+      "count": 1
+    },
+    "@typescript-eslint/no-unnecessary-type-assertion": {
+      "count": 8
+    },
+    "ranger/no-comments": {
+      "count": 21
+    }
+  },
+  "test/intake-draft.test.ts": {
+    "@typescript-eslint/no-unnecessary-type-assertion": {
+      "count": 7
+    },
+    "@typescript-eslint/restrict-plus-operands": {
+      "count": 2
+    },
+    "ranger/no-comments": {
+      "count": 6
+    }
+  },
+  "test/intake-gate.e2e.test.ts": {
+    "@typescript-eslint/no-dynamic-delete": {
+      "count": 1
+    },
+    "@typescript-eslint/no-unnecessary-type-assertion": {
+      "count": 26
+    },
+    "ranger/no-comments": {
+      "count": 23
+    }
+  },
+  "test/intake-recovery.e2e.test.ts": {
+    "@typescript-eslint/no-dynamic-delete": {
+      "count": 1
+    },
+    "@typescript-eslint/no-unnecessary-type-assertion": {
+      "count": 6
+    },
+    "ranger/no-comments": {
+      "count": 12
+    }
+  },
+  "test/intake.e2e.test.ts": {
+    "@typescript-eslint/no-unnecessary-type-assertion": {
+      "count": 13
+    },
+    "ranger/no-comments": {
+      "count": 13
+    }
+  },
+  "test/jobs.test.ts": {
+    "@typescript-eslint/no-unnecessary-type-assertion": {
+      "count": 1
+    },
+    "@typescript-eslint/non-nullable-type-assertion-style": {
+      "count": 1
+    },
+    "no-useless-assignment": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 15
+    }
+  },
+  "test/journal-cli.test.ts": {
+    "ranger/no-comments": {
+      "count": 2
+    }
+  },
+  "test/journal-guard.test.ts": {
+    "@typescript-eslint/no-dynamic-delete": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 26
+    }
+  },
+  "test/journal-open-race.test.ts": {
+    "ranger/no-comments": {
+      "count": 2
+    }
+  },
+  "test/journal.test.ts": {
+    "ranger/no-comments": {
+      "count": 3
+    }
+  },
+  "test/lanes.test.ts": {
+    "ranger/no-comments": {
+      "count": 1
+    }
+  },
+  "test/merge-desk.test.ts": {
+    "@typescript-eslint/no-unnecessary-type-assertion": {
+      "count": 6
+    },
+    "ranger/no-comments": {
+      "count": 8
+    }
+  },
+  "test/multimap.test.ts": {
+    "@typescript-eslint/no-dynamic-delete": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 17
+    }
+  },
+  "test/partition.ts": {
+    "ranger/no-comments": {
+      "count": 2
+    }
+  },
+  "test/preload.ts": {
+    "ranger/no-comments": {
+      "count": 1
+    }
+  },
+  "test/probe-requeue.test.ts": {
+    "@typescript-eslint/no-dynamic-delete": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 2
+    }
+  },
+  "test/propose-research.e2e.test.ts": {
+    "ranger/no-comments": {
+      "count": 8
+    }
+  },
+  "test/ratify.e2e.test.ts": {
+    "@typescript-eslint/consistent-type-definitions": {
+      "count": 1
+    },
+    "@typescript-eslint/no-dynamic-delete": {
+      "count": 1
+    },
+    "@typescript-eslint/no-unnecessary-type-assertion": {
+      "count": 15
+    },
+    "ranger/no-comments": {
+      "count": 33
+    }
+  },
+  "test/remote-test-baseline-peak.test.ts": {
+    "@typescript-eslint/no-unnecessary-type-assertion": {
+      "count": 2
+    },
+    "ranger/no-comments": {
+      "count": 7
+    }
+  },
+  "test/remote-test-baseline.test.ts": {
+    "@typescript-eslint/no-unnecessary-type-assertion": {
+      "count": 5
+    },
+    "ranger/no-comments": {
+      "count": 7
+    }
+  },
+  "test/remote-test-bus-contract.test.ts": {
+    "@typescript-eslint/no-dynamic-delete": {
+      "count": 1
+    },
+    "@typescript-eslint/no-redundant-type-constituents": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 1
+    }
+  },
+  "test/remote-test-bus-source.test.ts": {
+    "@typescript-eslint/no-unnecessary-type-assertion": {
+      "count": 11
+    },
+    "ranger/no-comments": {
+      "count": 26
+    }
+  },
+  "test/remote-test-contract.test.ts": {
+    "@typescript-eslint/no-dynamic-delete": {
+      "count": 4
+    }
+  },
+  "test/remote-test-executor-integration.test.ts": {
+    "@typescript-eslint/no-unnecessary-type-assertion": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 2
+    }
+  },
+  "test/remote-test-executor.test.ts": {
+    "@typescript-eslint/no-unnecessary-type-assertion": {
+      "count": 2
+    },
+    "ranger/no-comments": {
+      "count": 8
+    }
+  },
+  "test/remote-test-profiles-integration.test.ts": {
+    "@typescript-eslint/no-unnecessary-type-assertion": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 1
+    }
+  },
+  "test/remote-test-shadow.test.ts": {
+    "@typescript-eslint/no-unnecessary-type-assertion": {
+      "count": 13
+    },
+    "@typescript-eslint/no-unnecessary-type-conversion": {
+      "count": 2
+    }
+  },
+  "test/remote-test-source.test.ts": {
+    "@typescript-eslint/no-dynamic-delete": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 2
+    }
+  },
+  "test/remote-test-ssh-client.test.ts": {
+    "@typescript-eslint/no-unnecessary-type-assertion": {
+      "count": 2
+    }
+  },
+  "test/remote-test-ssh-integration.test.ts": {
+    "ranger/no-comments": {
+      "count": 2
+    }
+  },
+  "test/remote-test-ssh-runner.test.ts": {
+    "@typescript-eslint/no-dynamic-delete": {
+      "count": 1
+    }
+  },
+  "test/remote-test-ssh-server.test.ts": {
+    "ranger/no-comments": {
+      "count": 4
+    }
+  },
+  "test/remote-test-supervisor.test.ts": {
+    "@typescript-eslint/no-unnecessary-type-assertion": {
+      "count": 4
+    }
+  },
+  "test/research-ci.test.ts": {
+    "@typescript-eslint/no-unnecessary-type-assertion": {
+      "count": 1
+    }
+  },
+  "test/resilience.test.ts": {
+    "@typescript-eslint/array-type": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 6
+    }
+  },
+  "test/resume-queue.test.ts": {
+    "@typescript-eslint/no-dynamic-delete": {
+      "count": 1
+    },
+    "@typescript-eslint/no-unnecessary-type-assertion": {
+      "count": 3
+    },
+    "ranger/no-comments": {
+      "count": 18
+    }
+  },
+  "test/run-ledger.test.ts": {
+    "ranger/no-comments": {
+      "count": 4
+    }
+  },
+  "test/run-node-ledger-support.ts": {
+    "@typescript-eslint/no-dynamic-delete": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 3
+    }
+  },
+  "test/run-node-ledger.test.ts": {
+    "ranger/no-comments": {
+      "count": 1
+    }
+  },
+  "test/run-node-serves-goal.test.ts": {
+    "ranger/no-comments": {
+      "count": 3
+    }
+  },
+  "test/scout.e2e.test.ts": {
+    "ranger/no-comments": {
+      "count": 11
+    }
+  },
+  "test/scribe.test.ts": {
+    "ranger/no-comments": {
+      "count": 2
+    }
+  },
+  "test/serve-gitlab.test.ts": {
+    "@typescript-eslint/no-implied-eval": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 5
+    }
+  },
+  "test/serve-parked.test.ts": {
+    "@typescript-eslint/no-implied-eval": {
+      "count": 1
+    },
+    "@typescript-eslint/non-nullable-type-assertion-style": {
+      "count": 5
+    },
+    "@typescript-eslint/prefer-includes": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 29
+    }
+  },
+  "test/serve-queue-drain.test.ts": {
+    "@typescript-eslint/no-implied-eval": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 8
+    }
+  },
+  "test/serve.test.ts": {
+    "@typescript-eslint/no-implied-eval": {
+      "count": 2
+    },
+    "ranger/no-comments": {
+      "count": 11
+    }
+  },
+  "test/substrate-usage.test.ts": {
+    "ranger/no-comments": {
+      "count": 10
+    }
+  },
+  "test/substrate.test.ts": {
+    "ranger/no-comments": {
+      "count": 20
+    }
+  },
+  "test/support.ts": {
+    "@typescript-eslint/no-unnecessary-type-assertion": {
+      "count": 4
+    },
+    "@typescript-eslint/non-nullable-type-assertion-style": {
+      "count": 1
+    },
+    "@typescript-eslint/prefer-regexp-exec": {
+      "count": 4
+    },
+    "@typescript-eslint/restrict-plus-operands": {
+      "count": 2
+    },
+    "ranger/no-comments": {
+      "count": 17
+    }
+  },
+  "test/views.test.ts": {
+    "@typescript-eslint/prefer-regexp-exec": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 13
+    }
+  },
+  "test/walk.e2e.test.ts": {
+    "ranger/no-comments": {
+      "count": 60
+    }
+  }
+}
