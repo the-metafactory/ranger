@@ -11,7 +11,9 @@
     "scout": "bun src/cli.ts scout",
     "walk": "bun src/cli.ts walk",
     "test": "bun test --parallel=4 --timeout=60000",
-    "typecheck": "bunx tsc --noEmit"
+    "typecheck": "bunx tsc --noEmit",
+    "lint": "bun eslint/suppressions-guard.ts && bun --bun eslint .",
+    "lint:fix": "bun --bun eslint --fix ."
   },
   "dependencies": {
     "@the-metafactory/myelin": "https://github.com/the-metafactory/myelin.git#v0.10.0",
@@ -21,9 +23,12 @@
     "zod": "^3.24.0"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@types/bun": "latest",
     "drizzle-kit": "^0.31.10",
-    "typescript": "^5"
+    "eslint": "^10.3.0",
+    "typescript": "^5",
+    "typescript-eslint": "^8.59.3"
   },
   "packageManager": "yarn@1.22.22+sha512.a6b2f7906b721bba3d67d4aff083df04dad64c399707841b7acf00f6b133b7ac24255f2652fa22ae3534329dc6180534e98d17432037ff6fd140556e2bb3137e"
 }
