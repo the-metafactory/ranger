@@ -370,7 +370,10 @@ export async function runJob(runId: number, ctx: RunJobContext): Promise<RunJobO
  const { result: read } = output.read(raw, journal);
  const log = saveJobLog(journal.path, run, substrate, read);
 
- const reason = raw.timedOut ? "budget" : raw.code !== 0 ? `exit ${raw.code}` : undefined;
+ const reason = raw.timedOut ? "budget"
+  : raw.code !== 0 ? `exit ${raw.code}`
+  : job.requireResult && result === null ? "no result"
+  : undefined;
  const outcome: RunOutcome = reason === undefined ? "succeeded" : "failed";
  const ended = now().toISOString();
  // The pid stays on the finished row until it is reported, so a sweep

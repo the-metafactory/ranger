@@ -377,3 +377,4 @@ jobs:
     wallClockMin: 90
     cwd: ~/work/far-between/shorts
     substrates: [claude]
+    requireResult: true

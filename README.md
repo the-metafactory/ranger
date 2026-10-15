@@ -401,6 +401,7 @@ jobs:
     wallClockMin: 90           # past it the session's process group is killed
     cwd: ~/work/far-between/shorts
     substrates: [claude]       # optional; default all three, picked by quota
+    requireResult: true        # optional; a clean exit with no result fails
 ```
 
 - `ranger job enqueue <name>` queues one run (a Reflex fire runs it through a
@@ -420,7 +421,7 @@ jobs:
 - Each finished run is reported as an `execution.run.finished`: `ran: {kind:
   job, ref: <name>}`, `succeeded` or `failed`, the session log as
   `detail_ref`, and a `run_id` fixed when the run was queued. Why a run
-  failed (`budget`, `exit <n>`, `crashed`, `spawn`) stays in the journal
+  failed (`budget`, `exit <n>`, `no result`, `crashed`, `spawn`) stays in the journal
   row, since the envelope carries no free text. The run is marked reported
   once its envelope is handed to the ledger. A process cut off before that is
   reported by the next tick's sweep, and a crash between the hand-off and the
@@ -431,7 +432,9 @@ jobs:
   `$RANGER_JOB_RESULT_FILE`. A `soma:` relative path on a succeeded run rides
   the envelope as `result_ref` (myelin v0.10.0). Anything else, such as a URL,
   stays in the journal row only. To surface a URL, write a small soma file
-  that holds it and report that file's `soma:` path.
+  that holds it and report that file's `soma:` path. With `requireResult:
+  true`, a session that exits 0 without writing a result fails as `no
+  result`: a skill that a gate stopped cleanly is not reported as a success.
 - A running row whose supervisor died is failed as `crashed` on the next
   tick, and its session group is killed once `ps` confirms it still runs the
   job's skill. `ranger job list` prints the runs.

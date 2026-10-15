@@ -223,6 +223,29 @@ describe("node #301 — scheduled jobs", () => {
   expect(r.envelopes[0].input.payload).not.toHaveProperty("result_ref");
  });
 
+ test("requireResult: a clean exit with no result fails as no result; with a result it succeeds", async () => {
+  const r = rig([{ ...SHORT, requireResult: true }]);
+  const runId = await startedRun(r);
+  const outcome = await runJob(runId, { config: r.config, journal: r.journal, substrate: "claude", runSession: session().runSession, ledger: r.ledger });
+  expect(outcome).toMatchObject({ status: "failed", reason: "no result", result: null });
+  expect(r.journal.getJobRun(runId)).toMatchObject({ status: "failed", reason: "no result" });
+  expect(r.envelopes).toHaveLength(1);
+  expect(r.envelopes[0].input.payload).toMatchObject({ outcome: "failed" });
+
+  const s = rig([{ ...SHORT, requireResult: true }]);
+  const okId = await startedRun(s);
+  const ok = await runJob(okId, { config: s.config, journal: s.journal, substrate: "claude",
+   runSession: session({}, "soma:outputs/G6/2026-10-15.md").runSession, ledger: s.ledger });
+  expect(ok).toMatchObject({ status: "succeeded", result: "soma:outputs/G6/2026-10-15.md" });
+ });
+
+ test("without requireResult a clean exit with no result still succeeds", async () => {
+  const r = rig();
+  const runId = await startedRun(r);
+  await runJob(runId, { config: r.config, journal: r.journal, substrate: "claude", runSession: session().runSession, ledger: r.ledger });
+  expect(r.journal.getJobRun(runId)).toMatchObject({ status: "succeeded", reason: null, result: null });
+ });
+
  test("a non-zero exit fails the run with its exit code", async () => {
   const r = rig();
   const runId = await startedRun(r);

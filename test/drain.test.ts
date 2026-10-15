@@ -361,7 +361,7 @@ describe("node #165 — the dashboard's next shares the walk's drain gate", () =
 describe("node #301 — a scheduled job on the walk's lanes", () => {
  test("a queued visual job takes the free visual lane before any claim, and holds it on the next tick", async () => {
   await withRigEnv(async (r) => {
-   r.config.jobs = [{ name: "daily-short", skill: "daily-short", prompt: "", lane: "visual", wallClockMin: 90, cwd: "/tmp", substrates: ["claude"] }];
+   r.config.jobs = [{ name: "daily-short", skill: "daily-short", prompt: "", lane: "visual", wallClockMin: 90, cwd: "/tmp", substrates: ["claude"], requireResult: false }];
    r.journal.enqueueJobRun("daily-short", "visual");
    const spawned: string[] = [];
    const jobs: number[] = [];
@@ -384,7 +384,7 @@ describe("node #301 — a scheduled job on the walk's lanes", () => {
  });
  test("a finished run its supervisor never reported is reported by the next tick, with no other job pending", async () => {
   await withRigEnv(async (r) => {
-   r.config.jobs = [{ name: "daily-short", skill: "daily-short", prompt: "", lane: "visual", wallClockMin: 90, cwd: "/tmp", substrates: ["claude"] }];
+   r.config.jobs = [{ name: "daily-short", skill: "daily-short", prompt: "", lane: "visual", wallClockMin: 90, cwd: "/tmp", substrates: ["claude"], requireResult: false }];
    const { run } = r.journal.enqueueJobRun("daily-short", "visual");
    r.journal.updateJobRun(run.id, "queued", { status: "running", startedAt: "2026-10-15T04:00:00Z", pid: 2_147_483_000 });
    r.journal.updateJobRun(run.id, "running", { status: "succeeded", finishedAt: "2026-10-15T05:10:00Z" });
