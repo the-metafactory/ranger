@@ -9,6 +9,7 @@
  */
 
 import { changeRequestLabel } from "./forge-text.ts";
+import { describeLoad, type HostLoadReading } from "./host-load.ts";
 
 /** Defined once in labels.ts; re-exported for the outcome texts that name it. */
 export { NEEDS_EYE_LABEL } from "./labels.ts";
@@ -319,8 +320,8 @@ export function respawnedEvent(attempt: number): string {
 export const RESPAWNED_EVENT = /^respawned \(attempt \d+\)$/;
 
 /** Why a load-queued resume waits (node #297): the park card, `ranger serve` and the queue gate say it the same way. */
-export function waitingForQuietHost(host: { load: number; cores: number }): string {
- return `waiting for a quiet host: load ${host.load.toFixed(1)} on ${host.cores} cores`;
+export function waitingForQuietHost(host: HostLoadReading, busyLoad?: number): string {
+ return `waiting for a quiet host: ${describeLoad(host, busyLoad)}`;
 }
 
 /**
@@ -329,10 +330,11 @@ export function waitingForQuietHost(host: { load: number; cores: number }): stri
  * queued that starts once the host is quiet. The wait reason leads, then up
  * to three failing tests: the row keeps 400 characters of an outcome.
  */
-export function hostLoadOutcome(r: { load: number; cores: number; what: string; names: string[] }): string {
+export function hostLoadOutcome(r: HostLoadReading & { what: string; names: string[]; busyLoad?: number; killed?: boolean }): string {
  const names = r.names.slice(0, 3).map((n) => (n.length > 90 ? `${n.slice(0, 89)}…` : n));
  const failing = names.length > 0 ? `failing: ${names.join("; ")}` : "failing test names unavailable";
- return `${waitingForQuietHost(r)} — ${r.what} failed, and the retry ran on a busy host too and failed (${failing}); a resume is queued for when the host is quiet, with no worker session meanwhile`;
+ const retry = r.killed === true ? "the retry was killed with no failing test while the host was busy" : "the retry ran on a busy host too and failed";
+ return `${waitingForQuietHost(r, r.busyLoad)} — ${r.what} failed, and ${retry} (${failing}); a resume is queued for when the host is quiet, with no worker session meanwhile`;
 }
 
 export const HOST_LOAD_OUTCOME = /^waiting for a quiet host: load [\d.]+ on \d+ cores/;

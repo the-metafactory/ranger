@@ -27,9 +27,12 @@ export const busyAt = (host: { cores: number }, busyLoad?: number): number => bu
  */
 export const isQuiet = (host: HostLoadReading, busyLoad?: number) => host.load < busyAt(host, busyLoad);
 
+/** A reading as every wait reason gives it: "load X on N cores", and ", busy at B" when `busyLoad` is set. */
+export const describeLoad = (host: HostLoadReading, busyLoad?: number) =>
+ `load ${host.load.toFixed(1)} on ${host.cores} cores${busyLoad === undefined ? "" : `, busy at ${busyLoad}`}`;
+
 /** Why the host is too busy to start more work, or null when it is quiet. */
 export function hostBusy(read: HostLoad = realHostLoad, busyLoad?: number): string | null {
  const host = read();
- return isQuiet(host, busyLoad) ? null
-  : `the host is busy (load ${host.load.toFixed(1)} on ${host.cores} cores${busyLoad === undefined ? "" : `, busy at ${busyLoad}`})`;
+ return isQuiet(host, busyLoad) ? null : `the host is busy (${describeLoad(host, busyLoad)})`;
 }

@@ -2833,17 +2833,20 @@ describe("implement lane (node #23)", () => {
   r.ctx.quietHost = { pollMs: 1, maxMs: 60_000 };
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
   const events = r.journal.listEvents("acme/widgets", 300, "20").map((e) => e.detail ?? "");
-  expect(events.some((d) => d.startsWith("the supervisor test run waits for the host: load 6.0 on 10 cores"))).toBe(true);
+  expect(events.some((d) => d.startsWith("the supervisor test run waits for the host: load 6.0 on 10 cores, busy at 4"))).toBe(true);
   expect(events.some((d) => d.startsWith("the supervisor test run starts after"))).toBe(true);
  }, 60_000);
 
- test("a retry killed with no failing test while the host is busy parks for a quiet host; one that names a failure is the node's", async () => {
+ test("a retry killed with no failing test while the host is busy parks for a quiet host once a day; one that names a failure is the node's", async () => {
   for (const named of [false, true]) {
    const r = await rig({});
    cleanup.push(r.dir);
    // quiet before the first run, busy when it fails, quiet for the retry, busy when the retry ends
-   const loads = [0, 20, 0, 20];
-   r.ctx.hostLoad = () => ({ load: loads.length > 1 ? (loads.shift() as number) : loads[0], cores: 1 });
+   const sequence = () => {
+    const loads = [0, 20, 0, 20];
+    r.ctx.hostLoad = () => ({ load: loads.length > 1 ? (loads.shift() as number) : loads[0], cores: 1 });
+   };
+   sequence();
    r.ctx.quietHost = { pollMs: 1, maxMs: 1 };
    r.ctx.shellRun = async (command, opts) => command.includes("bun test") || command === r.ctx.map.commands.test
     ? { code: -1, stdout: named ? "(fail) widgets > renders [1.00ms]\n" : "(pass) widgets > renders [1.00ms]\n", stderr: "" }
@@ -2858,6 +2861,16 @@ describe("implement lane (node #23)", () => {
     expect(queued.map((q) => [q.nodeId, q.reason])).toEqual([["20", "host-load"]]);
     expect(r.journal.deadmanCount()).toBe(0);
     expect(outcome.detail).toMatch(HOST_LOAD_OUTCOME);
+    expect(outcome.detail).toContain("the retry was killed with no failing test while the host was busy");
+    // A hanging suite's own load reads busy too: the second kill in a day counts.
+    r.journal.removeResume(queued[0], "resume-cancelled", "test");
+    r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+    sequence();
+    expect((await runNode("20", r.ctx)).status).toBe("failed");
+    expect(r.journal.listResumeQueue()).toEqual([]);
+    expect(r.journal.deadmanCount()).toBe(1);
+    const events = r.journal.listEvents("acme/widgets", 300, "20").map((e) => e.detail ?? "");
+    expect(events.some((d) => d.includes("for the second time in 24h — it counts as the node's failure"))).toBe(true);
    }
   }
  }, 120_000);

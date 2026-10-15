@@ -35,7 +35,7 @@ export interface ResumeContext {
  */
 export function quietHostGate(host: HostLoadReading | undefined, busyLoad?: number): string | null {
  if (host === undefined || isQuiet(host, busyLoad)) return null;
- return waitingForQuietHost(host);
+ return waitingForQuietHost(host, busyLoad);
 }
 
 /** The same identity gate as run-node: the forge credential refusal, then the bot's write identity. */

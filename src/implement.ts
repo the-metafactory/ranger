@@ -33,7 +33,7 @@ import { recordKnownGood, trustedSnapshot } from "./git-trust.ts";
 import * as gh from "./github.ts";
 import type { IssueComment, ChangeRequest, ForgePort, CiFailedRun, CiVerdict } from "./forge.ts";
 import { HostLoadPark, ParkSignal } from "./signals.ts";
-import { isQuiet, realHostLoad, type HostLoad, type HostLoadReading } from "./host-load.ts";
+import { describeLoad, isQuiet, realHostLoad, type HostLoad, type HostLoadReading } from "./host-load.ts";
 import { isTransientGitHubError } from "./transient.ts";
 import {
  PROBE_FILE,
@@ -595,6 +595,12 @@ const QUIET_HOST = { pollMs: 30_000, maxMs: 20 * 60_000 };
 /** `workers.busyLoad`: the 1-minute load the host counts as busy at; unset, the core count. */
 const busyLoad = (ctx: ImplementContext) => ctx.config?.workers?.busyLoad;
 
+/** The host's load now when it is busy, else null. */
+const busyHostNow = (ctx: ImplementContext): HostLoadReading | null => {
+ const host = (ctx.hostLoad ?? realHostLoad)();
+ return isQuiet(host, busyLoad(ctx)) ? null : host;
+};
+
 /**
  * Wait until the host is quiet (`isQuiet`) before a probe or test run.
  * The browser probes are timing-sensitive, and the headless lane's worker and
@@ -615,7 +621,7 @@ async function awaitQuietHost(ctx: ImplementContext, run: string): Promise<HostL
  ctx.journal.recordEvent("reviewed", {
   nodeId,
   repo,
-  detail: `${run} waits for the host: load ${host.load.toFixed(1)} on ${host.cores} cores`,
+  detail: `${run} waits for the host: ${describeLoad(host, busyLoad(ctx))}`,
  });
  while (!isQuiet(host, busyLoad(ctx)) && Date.now() - started < maxMs) {
   await new Promise((r) => setTimeout(r, pollMs));
@@ -627,8 +633,8 @@ async function awaitQuietHost(ctx: ImplementContext, run: string): Promise<HostL
   repo,
   detail:
    isQuiet(host, busyLoad(ctx))
-    ? `${run} starts after ${waited}s: load ${host.load.toFixed(1)} on ${host.cores} cores`
-    : `${run} starts on a busy host after ${waited}s: load ${host.load.toFixed(1)} on ${host.cores} cores`,
+    ? `${run} starts after ${waited}s: ${describeLoad(host, busyLoad(ctx))}`
+    : `${run} starts on a busy host after ${waited}s: ${describeLoad(host, busyLoad(ctx))}`,
  });
  return host;
 }
@@ -2282,7 +2288,7 @@ async function checkedWorkerPass(
  // The retry ran on a busy host too and failed: the host's failure, not the
  // branch's. No fix pass, no failed node: the run parks and a resume waits
  // for a quiet host (node #297); the resume adopts this pass's commits.
- if (tests.code !== 0 && busy !== undefined) throw hostLoadPark(busy, `the supervisor's tests (${testCommand}) after the ${pass}`, tests);
+ if (tests.code !== 0 && busy !== undefined) throw hostLoadPark(ctx, busy, `the supervisor's tests (${testCommand}) after the ${pass}`, tests);
  if (tests.code !== 0 && baseRed === undefined) return fail(testsFailedDetail(testCommand, tests, "after the worker"));
  if (retried || baseRed !== undefined) {
   // The pass was certified in a fresh clone, or its failures are the base's:
@@ -2789,7 +2795,7 @@ async function supervisorTests(
  testCommand: string,
  label: string,
  baseTip: string | null,
-): Promise<{ tests: RunResult; retried: boolean; baseRed?: BaseRedTests; busy?: HostLoadReading }> {
+): Promise<{ tests: RunResult; retried: boolean; baseRed?: BaseRedTests; busy?: HostLoadReading & { killed?: boolean } }> {
  const { journal, map, node, worktree } = ctx;
  const head = await headSha(worktree);
  // A full suite started on a busy host is what times out (2026-10-14: soma's
@@ -2820,7 +2826,7 @@ async function supervisorTests(
   journal.recordEvent("reviewed", { nodeId: node.ref.id, repo: map.repo, detail: `tests (${testCommand}) passed on the retry in a fresh checkout` });
   return { tests, retried: true };
  }
- const busy = retry.busy ?? killedOnBusyHost(ctx, tests);
+ const busy = retry.busy ?? killedOnBusyHost(ctx, tests, `the test retry (${testCommand})`);
  if (busy !== null) return { tests, retried: false, busy };
  return { tests, retried: false, ...await baseRedAt(ctx, { testCommand, tests, head, label, baseTip }) };
 }
@@ -3007,12 +3013,12 @@ async function retryOnBusyHost(
  run: string,
  label: string,
 ): Promise<{ ran: boolean; result: RunResult; busy: HostLoadReading | null } | null> {
- const host = (ctx.hostLoad ?? realHostLoad)();
- if (isQuiet(host, busyLoad(ctx))) return null;
+ const host = busyHostNow(ctx);
+ if (host === null) return null;
  ctx.journal.recordEvent("reviewed", {
   nodeId: ctx.node.ref.id,
   repo: ctx.map.repo,
-  detail: `${what} failed on a busy host (load ${host.load.toFixed(1)} on ${host.cores} cores) — retrying once, in a fresh checkout of ${sha.slice(0, 8)}, when it quiets`,
+  detail: `${what} failed on a busy host (${describeLoad(host, busyLoad(ctx))}) — retrying once, in a fresh checkout of ${sha.slice(0, 8)}, when it quiets`,
  });
  const started = await awaitQuietHost(ctx, run);
  let ran = false;
@@ -3030,21 +3036,38 @@ async function retryOnBusyHost(
  * (node #297). `what` names the run; the outcome leads with the wait reason
  * and the first three failing tests.
  */
-function hostLoadPark(host: HostLoadReading, what: string, tests: RunResult): HostLoadPark {
- return new HostLoadPark(hostLoadOutcome({ ...host, what, names: failedTestNames(tests) }), host);
+function hostLoadPark(ctx: ImplementContext, host: HostLoadReading & { killed?: boolean }, what: string, tests: RunResult): HostLoadPark {
+ return new HostLoadPark(hostLoadOutcome({ ...host, what, names: failedTestNames(tests), busyLoad: busyLoad(ctx) }), host);
 }
+
+const KILLED_ON_BUSY_HOST = "was killed with no failing test while the host was busy";
 
 /**
  * A retry that started on a quiet host but was killed (exit -1: the test
- * timeout, or a signal) with no failing test while the host is busy now got
- * no verdict: the load ended it, not the code. The load now, or null when
- * the run named a failure or the host is quiet (2026-10-14: soma #802 and
- * #853 parked on 20-minute timeouts with no failing test).
+ * timeout, or a signal) with no failing test while the host is busy now
+ * likely got no verdict: the load ended it, not the code (2026-10-14: soma
+ * #802 and #853 failed on 20-minute timeouts with no failing test). The load
+ * now, or null when the run named a failure or the host is quiet. A hanging
+ * suite's own processes can read as a busy host too, so this parks once per
+ * node a day: a second such kill within 24 hours is the node's failure.
  */
-function killedOnBusyHost(ctx: ImplementContext, tests: RunResult): HostLoadReading | null {
+function killedOnBusyHost(ctx: ImplementContext, tests: RunResult, what: string): (HostLoadReading & { killed: true }) | null {
  if (tests.code !== -1 || allFailedTestNames(tests).length > 0) return null;
- const host = (ctx.hostLoad ?? realHostLoad)();
- return isQuiet(host, busyLoad(ctx)) ? null : host;
+ const host = busyHostNow(ctx);
+ if (host === null) return null;
+ const nodeId = ctx.node.ref.id;
+ const repo = ctx.map.repo;
+ const since = Date.now() - 24 * 60 * 60 * 1000;
+ const again = ctx.journal.listEvents(repo, 500, nodeId)
+  .some((e) => (e.detail ?? "").includes(KILLED_ON_BUSY_HOST) && Date.parse(e.at) >= since);
+ ctx.journal.recordEvent("reviewed", {
+  nodeId,
+  repo,
+  detail: again
+   ? `${what} ${KILLED_ON_BUSY_HOST} (${describeLoad(host, busyLoad(ctx))}) for the second time in 24h — it counts as the node's failure`
+   : `${what} ${KILLED_ON_BUSY_HOST} (${describeLoad(host, busyLoad(ctx))}) — it parks for a quiet host once; a second time in 24h counts`,
+ });
+ return again ? null : { ...host, killed: true };
 }
 
 /**
@@ -3216,12 +3239,12 @@ async function adoptBuiltWork(
  // Each attempt keeps its own output in the worker log, the retry's included.
  if (!remoteTests(ctx)) await awaitQuietHost(ctx, "the adoption test run");
  let tests = await backendTests(ctx, sha, () => testsInFreshCheckout(ctx, testCommand, sha, `adopted ${what}: supervisor tests`));
- let busy: HostLoadReading | null = null;
+ let busy: (HostLoadReading & { killed?: boolean }) | null = null;
  if (tests.code !== 0) {
   const retry = remoteTests(ctx) ? null : await retryOnBusyHost(ctx, testCommand, sha, "adoption tests", "the adoption test retry", `adopted ${what}: supervisor test retry`);
   if (retry !== null) {
    tests = retry.result;
-   if (retry.ran) busy = retry.busy ?? killedOnBusyHost(ctx, tests);
+   if (retry.ran) busy = retry.busy ?? killedOnBusyHost(ctx, tests, "the adoption test retry");
   }
  }
  const clean = await assertGitUntouched(ctx.canonical, snapshot);
@@ -3229,7 +3252,7 @@ async function adoptBuiltWork(
  // to change (node #297: cortex #2557 spent two sessions that way). The run
  // parks and a resume waits for a quiet host to adopt the work then.
  if (tests.code !== 0 && busy !== null) {
-  throw hostLoadPark(busy, `the adoption tests (${testCommand}) on the ${what} a previous run committed`, tests);
+  throw hostLoadPark(ctx, busy, `the adoption tests (${testCommand}) on the ${what} a previous run committed`, tests);
  }
  if (tests.code !== 0) {
   if (remoteTests(ctx)) return { workerExit: null, snapshot, sha, failure: { status: "failed", detail: tests.stderr, workerExit: null } };
