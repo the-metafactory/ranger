@@ -681,7 +681,6 @@ export class Journal {
    .run();
  }
 
- /** The newest `limit` events, of one repo and, with `nodeId`, one node of it. */
  /** How many `kind` events one node has recorded at or after `since`: no row window, so a busy node's other events cannot hide one. */
  countEventsSince(kind: EventKind, repo: string, nodeId: string, since: Date): number {
   const row = this.db.select({ n: sql<number>`count(*)` }).from(events)
@@ -689,6 +688,7 @@ export class Journal {
   return row?.n ?? 0;
  }
 
+ /** The newest `limit` events, of one repo and, with `nodeId`, one node of it. */
  listEvents(repo?: string, limit = 50, nodeId?: string): EventRow[] {
   const where = and(
    repo === undefined ? undefined : eq(events.repo, repo),

@@ -79,7 +79,8 @@ queueing the node again starts its failure count at zero.
 Ranger queues a resume itself when the supervisor's tests fail and their one
 busy-host retry also ran on a busy host, because the quiet-host wait ran out
 first (node #297), or was killed (the test timeout) with no failing test while
-the host is busy. This applies to adoption and to the tests after a worker
+the host is busy. A hanging suite's own load can read as busy, so a kill parks
+once per node in 24 hours; a second is the node's failure. This applies to adoption and to the tests after a worker
 pass. No worker session starts and no fix pass runs. The row ends `failed`
 with an outcome that leads with "waiting for a quiet host: load X on N cores"
 and names up to three failing tests. It does not count toward the dead-man

@@ -613,17 +613,18 @@ const busyHostNow = (ctx: ImplementContext): HostLoadReading | null => {
 async function awaitQuietHost(ctx: ImplementContext, run: string): Promise<HostLoadReading> {
  const read = ctx.hostLoad ?? realHostLoad;
  const { pollMs, maxMs } = ctx.quietHost ?? QUIET_HOST;
+ const limit = busyLoad(ctx);
  let host = read();
- if (isQuiet(host, busyLoad(ctx))) return host;
+ if (isQuiet(host, limit)) return host;
  const nodeId = ctx.node.ref.id;
  const repo = ctx.map.repo;
  const started = Date.now();
  ctx.journal.recordEvent("reviewed", {
   nodeId,
   repo,
-  detail: `${run} waits for the host: ${describeLoad(host, busyLoad(ctx))}`,
+  detail: `${run} waits for the host: ${describeLoad(host, limit)}`,
  });
- while (!isQuiet(host, busyLoad(ctx)) && Date.now() - started < maxMs) {
+ while (!isQuiet(host, limit) && Date.now() - started < maxMs) {
   await new Promise((r) => setTimeout(r, pollMs));
   host = read();
  }
@@ -632,9 +633,9 @@ async function awaitQuietHost(ctx: ImplementContext, run: string): Promise<HostL
   nodeId,
   repo,
   detail:
-   isQuiet(host, busyLoad(ctx))
-    ? `${run} starts after ${waited}s: ${describeLoad(host, busyLoad(ctx))}`
-    : `${run} starts on a busy host after ${waited}s: ${describeLoad(host, busyLoad(ctx))}`,
+   isQuiet(host, limit)
+    ? `${run} starts after ${waited}s: ${describeLoad(host, limit)}`
+    : `${run} starts on a busy host after ${waited}s: ${describeLoad(host, limit)}`,
  });
  return host;
 }
@@ -3237,7 +3238,7 @@ async function adoptBuiltWork(
  // Each attempt keeps its own output in the worker log, the retry's included.
  if (!remoteTests(ctx)) await awaitQuietHost(ctx, "the adoption test run");
  let tests = await backendTests(ctx, sha, () => testsInFreshCheckout(ctx, testCommand, sha, `adopted ${what}: supervisor tests`));
- let busy: (BusyReading) | null = null;
+ let busy: BusyReading | null = null;
  if (tests.code !== 0) {
   const retry = remoteTests(ctx) ? null : await retryOnBusyHost(ctx, testCommand, sha, "adoption tests", "the adoption test retry", `adopted ${what}: supervisor test retry`);
   if (retry !== null) {
