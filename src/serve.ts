@@ -543,7 +543,10 @@ export function assembleState(inputs: StateInputs): DashboardState {
 
  const tickHolder = (lane: ImplementLane) => {
   const holder = inputs.laneHolders[lane];
-  return holder === null ? null : { repo: mapKey(holder), nodeId: holder.nodeId, thisTick: false };
+  if (holder === null) return null;
+  // A job holder's map `ranger:job` is no forge repo: mapKey would throw.
+  const repo = holder.job === undefined ? mapKey(holder) : `${holder.repo}#${holder.root}`;
+  return { repo, nodeId: holder.nodeId, thisTick: false };
  };
  const tick: TickSoFar = {
   holders: { visual: tickHolder("visual"), headless: tickHolder("headless") },

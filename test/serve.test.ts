@@ -289,6 +289,20 @@ describe("#37 — the state the dashboard shows", () => {
   expect(state.maps[1].next.reason).toMatch(/headless implement lane.*#50/);
  });
 
+ test("a running job holding a lane assembles state and names the job as holder", () => {
+  const visual: ServeMap = { ...walked, key: "acme/game#1", repo: "acme/game", lane: "visual" };
+  const job = { nodeId: "job:daily-short", repo: "ranger:job", root: 3, status: "running", job: "daily-short" };
+  const state = assembleState(inputs({
+   maps: [visual, walked],
+   reports: new Map([visual, walked].map((m) => [m.key, report(FRONTIER)])),
+   laneHolders: { visual: job, headless: null },
+  }));
+  expect(state.gates.laneHolders.visual).toMatchObject({ nodeId: "job:daily-short", repo: "ranger:job", root: 3 });
+  expect(state.maps[0].next.waiting).toBe(true);
+  expect(state.maps[0].next.reason).toMatch(/visual implement lane.*job:daily-short/);
+  expect(state.maps[1].next).toMatchObject({ nodeId: "10", waiting: false });
+ });
+
  test("a held visual lane leaves headless free; the cap is shared", () => {
   const visual: ServeMap = { ...walked, key: "acme/game#1", repo: "acme/game", lane: "visual" };
   const game = worker({ repo: visual.repo, nodeId: "60" });
