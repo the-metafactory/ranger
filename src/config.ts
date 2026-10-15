@@ -420,6 +420,13 @@ const JobSchema = z.object({
   * quota pick falls outside the list, the run takes the list's first entry.
   */
  substrates: z.array(z.enum(SUBSTRATE_NAMES)).min(1).default(["claude", "codex", "pi"]),
+ /**
+  * A clean exit that wrote no result to `$RANGER_JOB_RESULT_FILE` fails the
+  * run with reason `no result`. For a job whose skill can end cleanly
+  * without doing its work (a gate that stops it), so the ledger does not
+  * report a day without output as a success.
+  */
+ requireResult: z.boolean().default(false),
 });
 
 const RangerConfigSchema = z.object({
