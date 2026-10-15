@@ -1,6 +1,6 @@
 import { implementLane, type ImplementLane } from "./lanes.ts";
 import { processResumeQueue } from "./resume.ts";
-import { hostBusy, type HostLoad } from "./host-load.ts";
+import { busyLoadFor, hostBusy, type HostLoad } from "./host-load.ts";
 import { graphReadToken, laneCredentialRefusal, lanePort, type ReadGate } from "./forge-lanes.ts";
 import { GateError, tokenBatch, type ResolvedToken } from "./token-gate.ts";
 import { lastImplementMaps, recordImplementStart, mapKey, implementMapOrder, readDrains } from "./maps.ts";
@@ -627,8 +627,10 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
       }
       // A claim starts a worker session and its test suites: none on a busy
       // host (2026-10-14: soma #802 and #853 timed out at load 45-55 on 10
-      // cores). The next tick claims once the load is down.
-      const busy = hostBusy(ctx.hostLoad, config.workers.busyLoad);
+      // cores). The next tick claims once the load is down. The busy load is
+      // this map's lane's (node #312), so the break ends this map's claims
+      // only: the next map, on the other lane, reads its own.
+      const busy = hostBusy(ctx.hostLoad, busyLoadFor(config.workers, implementLane(map)));
       if (busy !== null) {
        mapResult.hostBusy = busy;
        break;

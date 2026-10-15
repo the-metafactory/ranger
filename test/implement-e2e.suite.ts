@@ -2990,6 +2990,48 @@ describe("implement lane (node #23)", () => {
   expect(events.some((d) => d.startsWith("the supervisor test run starts after"))).toBe(true);
  }, 60_000);
 
+ // Node #312: busy at 20, the headless lane at 30; this rig's map has no probe, so it is headless.
+ const laneBusy = (r: Rig) => {
+  expect(implementLane(r.ctx.map)).toBe("headless");
+  r.ctx.config.workers.busyLoad = 20;
+  r.ctx.config.workers.laneBusyLoad = { headless: 30 };
+ };
+
+ test("a headless worker waits on workers.laneBusyLoad: not at load 25, and at 31 it says busy at 30 (node #312)", async () => {
+  const quiet = await rig({});
+  cleanup.push(quiet.dir);
+  laneBusy(quiet);
+  quiet.ctx.hostLoad = () => ({ load: 25, cores: 10 });
+  quiet.ctx.quietHost = { pollMs: 1, maxMs: 5 }; // a wait that runs out still records that it waited
+  expect((await runNode("20", quiet.ctx)).status).toBe("awaiting-merge");
+  expect(quiet.journal.listEvents("acme/widgets", 300, "20").some((e) => (e.detail ?? "").includes("waits for the host"))).toBe(false);
+
+  const busy = await rig({});
+  cleanup.push(busy.dir);
+  laneBusy(busy);
+  const loads = [31, 31, 3];
+  busy.ctx.hostLoad = loadSequence(loads, 10);
+  busy.ctx.quietHost = { pollMs: 1, maxMs: 60_000 };
+  expect((await runNode("20", busy.ctx)).status).toBe("awaiting-merge");
+  const events = busy.journal.listEvents("acme/widgets", 300, "20").map((e) => e.detail ?? "");
+  expect(events.some((d) => d.startsWith("the supervisor test run waits for the host: load 31.0 on 10 cores, busy at 30"))).toBe(true);
+ }, 60_000);
+
+ test("a headless worker's failure at load 25 is not parked as host load under laneBusyLoad: 30; at busyLoad 20 alone it is (node #312)", async () => {
+  for (const lane of [true, false]) {
+   const r = await rig({ test: `echo "${LOAD_FLAKE}"; exit 1` });
+   cleanup.push(r.dir);
+   r.ctx.config.workers.busyLoad = 20;
+   if (lane) laneBusy(r);
+   r.ctx.hostLoad = () => ({ load: 25, cores: 10 });
+   r.ctx.quietHost = { pollMs: 1, maxMs: 5 };
+   await runNode("20", r.ctx);
+   const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+   expect(events.some((d) => d.includes("failed on a busy host"))).toBe(!lane);
+   expect(r.journal.listResumeQueue().filter((q) => q.reason === "host-load")).toHaveLength(lane ? 0 : 1);
+  }
+ }, 60_000);
+
  test("a retry killed with no failing test while the host is busy parks for a quiet host once a day; one that names a failure is the node's", async () => {
   for (const named of [false, true]) {
    const r = await rig({});

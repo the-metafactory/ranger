@@ -272,6 +272,16 @@ const WorkersSchema = z.object({
   * Default: the core count.
   */
  busyLoad: z.number().positive().optional(),
+ /**
+  * The busy load per implement lane (node #312), shaped like `laneSlots`:
+  * `{ headless: 30 }` lets headless work start at a load the visual lane's
+  * probes wait at. A lane with no entry reads `busyLoad`. Strict, so a
+  * misspelt lane is refused rather than silently ignored.
+  */
+ laneBusyLoad: z.object({
+  visual: z.number().positive().optional(),
+  headless: z.number().positive().optional(),
+ }).strict().optional(),
  /** Concurrent implement workers per resource lane, across all maps (default one each). */
  laneSlots: z.object({
   visual: z.number().int().positive().default(1),

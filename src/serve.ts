@@ -67,7 +67,7 @@ import { ForeignMigrationError } from "./journal-guard.ts";
 import { IMPLEMENT_LANES, implementLane, workerLane, type ImplementLane } from "./lanes.ts";
 import { activeCooldown, cooldownScope, readGraphqlBudget } from "./budget.ts";
 import { queueEntryGate, queueSpawnGate, quietHostGate } from "./resume.ts";
-import { realHostLoad, type HostLoad, type HostLoadReading } from "./host-load.ts";
+import { busyLoadFor, realHostLoad, type HostLoad, type HostLoadReading } from "./host-load.ts";
 import { cachedFrontier } from "./frontier-cache.ts";
 import { cachedRootAuthor } from "./root-author.ts";
 import { type FrontierEntry, graphFrontier, RateLimitError } from "./graph.ts";
@@ -220,6 +220,8 @@ export interface StateInputs {
  hostLoad?: HostLoadReading;
  /** `workers.busyLoad`: the load the host counts as busy at; absent means the core count. */
  busyLoad?: number;
+ /** `workers.laneBusyLoad`: a lane's own busy load, ahead of `busyLoad` (node #312). */
+ laneBusyLoad?: Partial<Record<ImplementLane, number>>;
 }
 
 /** One lane's queued resumes, FIFO, and what the next tick does with them. */
@@ -421,7 +423,7 @@ function planQueueHeads(
    lane.head = { ...at, starts: false, reason: held };
    continue;
   }
-  const busy = quietHostGate(inputs.hostLoad, inputs.busyLoad);
+  const busy = quietHostGate(inputs.hostLoad, busyLoadFor(inputs, entry.lane));
   if (busy !== null) {
    lane.waits.push({ ...at, reason: busy });
    continue;
@@ -2057,6 +2059,7 @@ export function stateFromJournal(
    spawnCap: config.workers.spawnCapPerDay,
    hostLoad: hostLoad(),
    busyLoad: config.workers.busyLoad,
+   laneBusyLoad: config.workers.laneBusyLoad,
    vetoed: (id, repo) => vetoes.some((v) => vetoApplies(v, id, repo)),
    pidAlive: defaultPidAlive,
    refreshing: reader.refreshing,

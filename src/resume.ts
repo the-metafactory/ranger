@@ -13,7 +13,7 @@ import type { ResolvedToken } from "./token-gate.ts";
 import type { OwnedCheck } from "./lock.ts";
 import { laneHeldMessage, mapKey, recordImplementStart, resumeMap } from "./maps.ts";
 import { spawnRunNodeDetached, type SpawnRunNodeArgs } from "./spawn.ts";
-import { hostBusy, isQuiet, realHostLoad, type HostLoad, type HostLoadReading } from "./host-load.ts";
+import { busyLoadFor, hostBusy, isQuiet, realHostLoad, type HostLoad, type HostLoadReading } from "./host-load.ts";
 import { waitingForQuietHost } from "./outcomes.ts";
 
 export interface ResumeContext {
@@ -29,8 +29,8 @@ export interface ResumeContext {
 /**
  * Why a queued entry waits for the host, or null when it need not: every
  * queued resume, ranger's own (node #297) and an operator's `--when-free`
- * alike, waits while the 1-minute load is at or above `workers.busyLoad`
- * (else the core count). A start on a busy host is what timed soma #802 and
+ * alike, waits while the 1-minute load is at or above its lane's busy load
+ * (`busyLoadFor`, node #312; else the core count). A start on a busy host is what timed soma #802 and
  * #853 out (2026-10-14). `ranger serve` shows the same reason.
  */
 export function quietHostGate(host: HostLoadReading | undefined, busyLoad?: number): string | null {
@@ -218,7 +218,7 @@ export async function resumeNode(nodeId: string, selector: string | undefined, c
    held: journal.laneHolder(lane, { nodeId, repo: map.repo }) !== null,
    queued: journal.getResume(map.repo, nodeId) !== null,
    backlog: journal.listResumeQueue(lane).length,
-   busy: hostBusy(ctx.hostLoad, config.workers.busyLoad) !== null,
+   busy: hostBusy(ctx.hostLoad, busyLoadFor(config.workers, lane)) !== null,
   })) {
    await identityGate(config, map);
    owned();
@@ -284,8 +284,9 @@ export async function processResumeQueue(
    continue;
   }
   // A queued resume waits for a quiet host: not a failed start, and it holds
-  // nothing behind it. One event per entry per tick says why it waits.
-  const busy = quietHostGate(readHost(), config.workers.busyLoad);
+  // nothing behind it, on its lane or the other. One event per entry per
+  // tick says why it waits, at the entry's lane's busy load (node #312).
+  const busy = quietHostGate(readHost(), busyLoadFor(config.workers, entry.lane));
   if (busy !== null) {
    owned();
    journal.recordEvent("reviewed", { nodeId: entry.nodeId, repo: entry.repo, detail: `queued resume #${entry.nodeId} is ${busy}` });

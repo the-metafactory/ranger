@@ -305,4 +305,28 @@ describe("hostBusy and workers.busyLoad (O2)", () => {
       expect(() => loadConfig(path)).toThrow(ConfigError);
     });
   });
+
+  test("workers.laneBusyLoad sets an implement lane's busy load; a lane without one falls back to busyLoad, then the core count (node #312)", async () => {
+    const { busyLoadFor } = await import("../src/host-load.ts");
+    const base = ["version: 1", "maps:", "  - repo: acme/widgets", "    root: 1", "workers:"];
+    withConfig([...base, "  busyLoad: 20", "  laneBusyLoad:", "    headless: 30"].join("\n"), (path) => {
+      const { workers } = loadConfig(path).config;
+      expect(workers.laneBusyLoad).toEqual({ headless: 30 });
+      expect(busyLoadFor(workers, "headless")).toBe(30);
+      expect(busyLoadFor(workers, "visual")).toBe(20);
+    });
+    withConfig([...base, "  laneBusyLoad:", "    visual: 12.5"].join("\n"), (path) => {
+      const { workers } = loadConfig(path).config;
+      expect(busyLoadFor(workers, "visual")).toBe(12.5);
+      expect(busyLoadFor(workers, "headless")).toBeUndefined(); // the core count, as busyAt reads it
+    });
+    withConfig(base.slice(0, -1).join("\n"), (path) => {
+      expect(loadConfig(path).config.workers.laneBusyLoad).toBeUndefined();
+    });
+    for (const bad of [["    gpu: 30"], ["    headless: 0"], ["    visual: -4"]]) {
+      withConfig([...base, "  laneBusyLoad:", ...bad].join("\n"), (path) => {
+        expect(() => loadConfig(path)).toThrow(ConfigError);
+      });
+    }
+  });
 });
