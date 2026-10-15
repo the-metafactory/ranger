@@ -7,9 +7,10 @@ import { mapKey, pickMap } from "./maps.ts";
 import { implementLane } from "./lanes.ts";
 import { resumeNode } from "./resume.ts";
 import { Command } from "commander";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import {
  loadConfig,
+ resolveConfigPath,
  expandHome,
  type RangerConfig,
  type RangerMapConfig,
@@ -88,7 +89,7 @@ import { spawnBudget } from "./digest.ts";
 const READONLY_SURFACE = ["audit", "frontier", "node"] as const;
 
 interface ScoutOptions {
- config: string;
+ config: string | undefined;
  json: boolean;
 }
 
@@ -166,7 +167,7 @@ async function scoutOneMap(
 }
 
 async function runScout(opts: ScoutOptions): Promise<ScoutReport> {
- const configPath = resolve(process.cwd(), opts.config);
+ const configPath = resolveConfigPath(opts.config, process.env, process.cwd());
  const { config } = loadConfig(configPath);
  const registry = loadProbeRegistry();
 
@@ -848,9 +849,9 @@ program
  .description(
   "Read-only frontier/audit/HITL digest across registered maps (zero graph writes)",
  )
- .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
+ .option("-c, --config <path>", "path to ranger.yaml (fallback: $RANGER_CONFIG, then ./ranger.yaml)")
  .option("-j, --json", "emit machine-readable JSON")
- .action(async (options: { config: string; json: boolean }) => {
+ .action(async (options: { config: string | undefined; json: boolean }) => {
   try {
    const report = await runScout({
     config: options.config,
@@ -874,10 +875,10 @@ program
  .description(
   "Headless tick: claim decided research + implement frontier nodes (announce-fail-closed, race-safe), spawn detached run-node workers, then sweep (crash recovery + the merge desk)",
  )
- .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
- .action(async (options: { config: string }) => {
+ .option("-c, --config <path>", "path to ranger.yaml (fallback: $RANGER_CONFIG, then ./ranger.yaml)")
+ .action(async (options: { config: string | undefined }) => {
   try {
-   const configPath = resolve(process.cwd(), options.config);
+   const configPath = resolveConfigPath(options.config, process.env, process.cwd());
    process.stdout.write((await runWalk(configPath)) + "\n");
   } catch (error) {
    process.stderr.write(
@@ -892,9 +893,9 @@ program
  .description(
   "One bounded autonomous pass (design §1): escalation cards (design §5) then the walk claim phase — so HITL/provisioning cards are posted/edited on the schedule, not just by the daily digest. The launchd tick runs this.",
  )
- .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
- .action(async (options: { config: string }) => {
-  const result = await runTick(resolve(process.cwd(), options.config));
+ .option("-c, --config <path>", "path to ranger.yaml (fallback: $RANGER_CONFIG, then ./ranger.yaml)")
+ .action(async (options: { config: string | undefined }) => {
+  const result = await runTick(resolveConfigPath(options.config, process.env, process.cwd()));
   (result.exitCode === 1 ? process.stderr : process.stdout).write(result.report);
   process.exit(result.exitCode);
  });
@@ -930,9 +931,9 @@ job
  .command("enqueue")
  .description("Queue one run of a declared job; a second enqueue before it starts is a no-op. The next tick starts it when its lane is free.")
  .argument("<name>", "job name from ranger.yaml jobs")
- .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
- .action((name: string, options: { config: string }) => {
-  const result = runJobEnqueue(name, resolve(process.cwd(), options.config));
+ .option("-c, --config <path>", "path to ranger.yaml (fallback: $RANGER_CONFIG, then ./ranger.yaml)")
+ .action((name: string, options: { config: string | undefined }) => {
+  const result = runJobEnqueue(name, resolveConfigPath(options.config, process.env, process.cwd()));
   (result.exitCode === 0 ? process.stdout : process.stderr).write(result.report);
   process.exit(result.exitCode);
  });
@@ -941,9 +942,9 @@ job
  .command("run")
  .description("Detached job supervisor the tick spawns: runs the job's skill session and reports the run")
  .argument("<run-id>", "job run id from the journal")
- .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
- .action(async (runId: string, options: { config: string }) => {
-  const { config, journal } = loadCtx(resolve(process.cwd(), options.config));
+ .option("-c, --config <path>", "path to ranger.yaml (fallback: $RANGER_CONFIG, then ./ranger.yaml)")
+ .action(async (runId: string, options: { config: string | undefined }) => {
+  const { config, journal } = loadCtx(resolveConfigPath(options.config, process.env, process.cwd()));
   try {
    holdAwake();
    const outcome = await runJob(Number(runId), { config, journal } satisfies RunJobContext);
@@ -960,9 +961,9 @@ job
 job
  .command("list")
  .description("Job runs in the journal, oldest first")
- .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
- .action((options: { config: string }) => {
-  const { journal } = loadCtx(resolve(process.cwd(), options.config));
+ .option("-c, --config <path>", "path to ranger.yaml (fallback: $RANGER_CONFIG, then ./ranger.yaml)")
+ .action((options: { config: string | undefined }) => {
+  const { journal } = loadCtx(resolveConfigPath(options.config, process.env, process.cwd()));
   try { process.stdout.write(JSON.stringify(journal.listJobRuns(), null, 2) + "\n"); }
   finally { journal.close(); }
  });
@@ -974,10 +975,10 @@ program
  )
  .argument("<id>", "node id to execute")
  .option("-m, --map <owner/name#root>", "map repo#root (repo alone only when unique)")
- .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
- .action(async (id: string, options: { map?: string; config: string }) => {
+ .option("-c, --config <path>", "path to ranger.yaml (fallback: $RANGER_CONFIG, then ./ranger.yaml)")
+ .action(async (id: string, options: { map?: string; config: string | undefined }) => {
   try {
-   const configPath = resolve(process.cwd(), options.config);
+   const configPath = resolveConfigPath(options.config, process.env, process.cwd());
    // The worker, sage rounds and probe tier must not run on a sleeping host.
    holdAwake();
    process.stdout.write((await runRunNode(id, options.map, configPath)) + "\n");
@@ -994,10 +995,10 @@ program
  .description(
   "Reconcile the journal against reality (crashed workers, stale claims)",
  )
- .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
- .action(async (options: { config: string }) => {
+ .option("-c, --config <path>", "path to ranger.yaml (fallback: $RANGER_CONFIG, then ./ranger.yaml)")
+ .action(async (options: { config: string | undefined }) => {
   try {
-   const configPath = resolve(process.cwd(), options.config);
+   const configPath = resolveConfigPath(options.config, process.env, process.cwd());
    process.stdout.write((await runSweep(configPath)) + "\n");
   } catch (error) {
    process.stderr.write(
@@ -1015,10 +1016,10 @@ program
  .argument("<id>", "node id")
  .requiredOption("-m, --map <owner/name#root>", "map repo#root (repo alone only when unique)")
  .requiredOption("--sha <sha>", "the head the merge is pinned to")
- .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
- .action(async (id: string, options: { map: string; sha: string; config: string }) => {
+ .option("-c, --config <path>", "path to ranger.yaml (fallback: $RANGER_CONFIG, then ./ranger.yaml)")
+ .action(async (id: string, options: { map: string; sha: string; config: string | undefined }) => {
   try {
-   const configPath = resolve(process.cwd(), options.config);
+   const configPath = resolveConfigPath(options.config, process.env, process.cwd());
    const result = await runMergeGate(id, options.map, options.sha, configPath);
    if (!result.ok) {
     process.stderr.write(result.text + "\n");
@@ -1040,10 +1041,10 @@ program
  )
  .requiredOption("-m, --map <owner/name#root>", "map repo#root (repo alone only when unique)")
  .option("--settle", "first wait (up to 90 s) until GitHub has computed mergeability for every awaiting-merge PR on the map, as after a merge moved the base")
- .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
- .action(async (options: { map: string; config: string; settle?: boolean }) => {
+ .option("-c, --config <path>", "path to ranger.yaml (fallback: $RANGER_CONFIG, then ./ranger.yaml)")
+ .action(async (options: { map: string; config: string | undefined; settle?: boolean }) => {
   try {
-   const configPath = resolve(process.cwd(), options.config);
+   const configPath = resolveConfigPath(options.config, process.env, process.cwd());
    process.stdout.write((await runMergeDeskNow(options.map, configPath, options.settle === true)) + "\n");
   } catch (error) {
    process.stderr.write(
@@ -1063,10 +1064,10 @@ program
  .option("--force", "resume even while another implement worker holds the lane")
  .option("--when-free", "queue a resume FIFO when its implement lane is held")
  .option("--cancel", "remove a queued resume")
- .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
- .action(async (id: string, options: { map?: string; config: string; force?: boolean; whenFree?: boolean; cancel?: boolean }) => {
+ .option("-c, --config <path>", "path to ranger.yaml (fallback: $RANGER_CONFIG, then ./ranger.yaml)")
+ .action(async (id: string, options: { map?: string; config: string | undefined; force?: boolean; whenFree?: boolean; cancel?: boolean }) => {
   try {
-   const configPath = resolve(process.cwd(), options.config);
+   const configPath = resolveConfigPath(options.config, process.env, process.cwd());
    process.stdout.write((await runResumeNode(id, options.map, configPath, options)) + "\n");
   } catch (error) {
    process.stderr.write(
@@ -1084,11 +1085,11 @@ program
  .argument("<id>", "node id to build")
  .requiredOption("-m, --map <owner/name#root>", "map repo#root (repo alone only when unique)")
  .option("--force", "start beside whatever holds the implement lane")
- .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
- .action(async (id: string, options: { map: string; config: string; force?: boolean }) => {
+ .option("-c, --config <path>", "path to ranger.yaml (fallback: $RANGER_CONFIG, then ./ranger.yaml)")
+ .action(async (id: string, options: { map: string; config: string | undefined; force?: boolean }) => {
   try {
    if (!/^\d+$/.test(id)) throw new Error(`node id must be numeric, got ${id}`);
-   const configPath = resolve(process.cwd(), options.config);
+   const configPath = resolveConfigPath(options.config, process.env, process.cwd());
    const { result, out } = await runBuildNow(id, options.map, configPath, options.force);
    process.stdout.write(out + "\n");
    // Claimed but nothing spawned (RANGER_NO_SPAWN, or a failed spawn): the
@@ -1110,9 +1111,9 @@ program
 program
  .command("resume-run")
  .description("Operator verb: clear the dead-man pause (claiming resumes on the next tick)")
- .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
- .action((options: { config: string }) => {
-  const configPath = resolve(process.cwd(), options.config);
+ .option("-c, --config <path>", "path to ranger.yaml (fallback: $RANGER_CONFIG, then ./ranger.yaml)")
+ .action((options: { config: string | undefined }) => {
+  const configPath = resolveConfigPath(options.config, process.env, process.cwd());
   process.stdout.write(runResumeRun(configPath) + "\n");
  });
 
@@ -1124,10 +1125,10 @@ program
  .option("--lane <lane>", "drain the visual lane (the only lane drained as one switch)")
  .option("-m, --map <owner/name#root>", "drain one headless-lane map")
  .option("--off", "lift the drain")
- .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
- .action((options: { lane?: string; map?: string; off?: boolean; config: string }) => {
+ .option("-c, --config <path>", "path to ranger.yaml (fallback: $RANGER_CONFIG, then ./ranger.yaml)")
+ .action((options: { lane?: string; map?: string; off?: boolean; config: string | undefined }) => {
   try {
-   const configPath = resolve(process.cwd(), options.config);
+   const configPath = resolveConfigPath(options.config, process.env, process.cwd());
    process.stdout.write(runDrain(configPath, options) + "\n");
   } catch (error) {
    process.stderr.write(`ranger drain: ${error instanceof Error ? error.message : String(error)}\n`);
@@ -1142,10 +1143,10 @@ program
  )
  .requiredOption("-m, --map <owner/name#root>", "map repo#root (repo alone only when unique)")
  .option("--hash <sha256>", "adopt the state only while it still hashes to this (from the listing)")
- .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
- .action(async (options: { map: string; config: string; hash?: string }) => {
+ .option("-c, --config <path>", "path to ranger.yaml (fallback: $RANGER_CONFIG, then ./ranger.yaml)")
+ .action(async (options: { map: string; config: string | undefined; hash?: string }) => {
   try {
-   const configPath = resolve(process.cwd(), options.config);
+   const configPath = resolveConfigPath(options.config, process.env, process.cwd());
    process.stdout.write((await runTrustGit(options.map, configPath, options.hash)) + "\n");
   } catch (error) {
    process.stderr.write(
@@ -1160,11 +1161,11 @@ program
  .description("Inspect the journal (workers, events, health)")
  .option("--repo <repo>", "filter by map repo")
  .option("--node <id>", "one node's workers, escalations and events only, with each worker's log file")
- .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
- .action(async (options: { repo?: string; node?: string; config: string }) => {
+ .option("-c, --config <path>", "path to ranger.yaml (fallback: $RANGER_CONFIG, then ./ranger.yaml)")
+ .action(async (options: { repo?: string; node?: string; config: string | undefined }) => {
   try {
    if (options.node !== undefined && !/^\d+$/.test(options.node)) throw new Error(`--node must be a numeric id, got ${options.node}`);
-   const configPath = resolve(process.cwd(), options.config);
+   const configPath = resolveConfigPath(options.config, process.env, process.cwd());
    process.stdout.write((await runJournal(options.repo, configPath, options.node)) + "\n");
   } catch (error) {
    process.stderr.write(
@@ -1180,12 +1181,12 @@ program
   "Escalation desk (design §5): post/edit HITL + provisioning cards in each map's Discord thread (announce-once, edit-not-repost, age-banded); --digest emits the daily aged-cards + audit + budget digest. Graph-read-only.",
  )
  .option("--digest", "emit the daily digest instead of the cards pass")
- .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
+ .option("-c, --config <path>", "path to ranger.yaml (fallback: $RANGER_CONFIG, then ./ranger.yaml)")
  .option("-j, --json", "emit machine-readable JSON")
  .action(
-  async (options: { digest: boolean; config: string; json: boolean }) => {
+  async (options: { digest: boolean; config: string | undefined; json: boolean }) => {
    try {
-    const configPath = resolve(process.cwd(), options.config);
+    const configPath = resolveConfigPath(options.config, process.env, process.cwd());
     const { config } = loadConfig(configPath);
     const journal = openJournal(config);
     // Test seam: RANGER_NOW injects the clock (age-banding tests).
@@ -1217,12 +1218,12 @@ program
  .description(
   "Local read-only dashboard (#37): the current job, the next in queue, autonomous nodes, and open grillings with a button that opens an interactive session",
  )
- .option("-c, --config <path>", "path to ranger.yaml", "ranger.yaml")
+ .option("-c, --config <path>", "path to ranger.yaml (fallback: $RANGER_CONFIG, then ./ranger.yaml)")
  .option("-p, --port <port>", "port on 127.0.0.1 (default: serve.port, 7311)")
  .option("--open", "open the dashboard in the browser")
- .action((options: { config: string; port?: string; open?: boolean }) => {
+ .action((options: { config: string | undefined; port?: string; open?: boolean }) => {
   try {
-   const configPath = resolve(process.cwd(), options.config);
+   const configPath = resolveConfigPath(options.config, process.env, process.cwd());
    const { config } = loadConfig(configPath);
    const port = options.port === undefined ? undefined : Number(options.port);
    if (
