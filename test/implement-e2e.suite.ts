@@ -947,26 +947,26 @@ describe("implement lane (node #23)", () => {
   return sessions;
  };
  const eventDetails = (r: Rig) => r.journal.listEvents("acme/widgets", 300).map((e) => e.detail ?? "");
- /** A run whose worker commits nothing: the node fails with its worktree at the base it was cut from, and no PR. */
- const failBeforeAnyPr = async () => {
-  const r = await rig({});
+ /** A first run that fails with no PR, its row put back to claimed for a resume: the rig, its worktree and the worktree's HEAD. */
+ const resumableNoPr = async (rigOpts: Parameters<typeof rig>[0], workerCommand?: string[]) => {
+  const r = await rig(rigOpts);
   cleanup.push(r.dir);
-  r.ctx.workerCommand = [implementWorker, "noop"];
+  if (workerCommand !== undefined) r.ctx.workerCommand = workerCommand;
   expect((await runNode("20", r.ctx)).status).toBe("failed");
   expect(r.github.prs.size).toBe(0);
   r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
   const worktree = r.journal.getWorker("20", "acme/widgets")?.worktree as string;
-  return { r, worktree, was: (await git(["rev-parse", "HEAD"], worktree)).stdout.trim() };
+  return { r, worktree, head: (await git(["rev-parse", "HEAD"], worktree)).stdout.trim() };
+ };
+ /** A run whose worker commits nothing: the node fails with its worktree at the base it was cut from, and no PR. */
+ const failBeforeAnyPr = async () => {
+  const { r, worktree, head } = await resumableNoPr({}, [implementWorker, "noop"]);
+  return { r, worktree, was: head };
  };
  /** A run that builds and commits, but whose supervisor tests fail until `flag` exists: the build stays unpushed, and no PR. */
  const unpushedBuild = async (flag: string) => {
-  const r = await rig({ test: `test -f ${flag}` });
-  cleanup.push(r.dir);
-  expect((await runNode("20", r.ctx)).status).toBe("failed");
-  expect(r.github.prs.size).toBe(0);
-  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
-  const worktree = r.journal.getWorker("20", "acme/widgets")?.worktree as string;
-  return { r, worktree, built: (await git(["rev-parse", "HEAD"], worktree)).stdout.trim() };
+  const { r, worktree, head } = await resumableNoPr({ test: `test -f ${flag}` });
+  return { r, worktree, built: head };
  };
 
  test("a resume with no PR whose branch has no commits of its own is fast-forwarded to the moved base before any worker session (node #310)", async () => {
@@ -1062,8 +1062,12 @@ describe("implement lane (node #23)", () => {
   await runNode("20", r.ctx);
   expect(sessions).toHaveLength(1);
   expect(sessions[0]?.head).toBe(was); // the build pass started on the tree as it stood
-  expect(r.journal.listEvents("acme/widgets", 300).some((e) => e.kind === "worktree-synced")).toBe(false);
-  expect(eventDetails(r).some((d) => d.includes("2 commit(s) behind origin/main") && d.includes("README.md"))).toBe(true);
+  const events = r.journal.listEvents("acme/widgets", 300);
+  expect(events.some((e) => e.kind === "worktree-synced")).toBe(false);
+  const stayed = events.filter((e) => e.kind === "worktree-not-synced");
+  expect(stayed).toHaveLength(1);
+  expect(stayed[0]?.detail).toContain("2 commit(s) behind origin/main");
+  expect(stayed[0]?.detail).toContain("README.md");
  }, 60_000);
 
  test("a resume after someone rewound the PR branch below the pushed worktree parks and pushes nothing over it (sage round 2 on PR #234)", async () => {

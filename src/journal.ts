@@ -321,6 +321,8 @@ export type EventKind =
  | "git-trust"
  | "log-failed"
  | "worktree-synced"
+ /** A resumed node with no PR stays behind its base: its tree has changes (node #310). */
+ | "worktree-not-synced"
  | "filed"
  | "intake-draft"
  /** Intake gate (node #251): the principal's 👍 filed a draft, or ❌ discarded one. */
