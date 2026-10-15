@@ -935,6 +935,137 @@ describe("implement lane (node #23)", () => {
   expect(markers[0]?.body).toContain("the branch was 1 commit(s) behind origin/main (limit 0)");
  }, 60_000);
 
+ // Node #310: a resumed node with no PR yet starts from the current base.
+ /** The HEAD each worker session starts on, and its prompt; the worker runs in `mode`. */
+ const watchSessions = (r: Rig, mode: string) => {
+  const sessions: { head: string; prompt: string }[] = [];
+  delete r.ctx.workerCommand;
+  r.ctx.worker = async (prompt, opts) => {
+   sessions.push({ head: (await git(["rev-parse", "HEAD"], opts.cwd as string)).stdout.trim(), prompt });
+   return runCmd(implementWorker, [mode, prompt], opts);
+  };
+  return sessions;
+ };
+ const eventDetails = (r: Rig) => r.journal.listEvents("acme/widgets", 300).map((e) => e.detail ?? "");
+ /** A run whose worker commits nothing: the node fails with its worktree at the base it was cut from, and no PR. */
+ const failBeforeAnyPr = async () => {
+  const r = await rig({});
+  cleanup.push(r.dir);
+  r.ctx.workerCommand = [implementWorker, "noop"];
+  expect((await runNode("20", r.ctx)).status).toBe("failed");
+  expect(r.github.prs.size).toBe(0);
+  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  const worktree = r.journal.getWorker("20", "acme/widgets")?.worktree as string;
+  return { r, worktree, was: (await git(["rev-parse", "HEAD"], worktree)).stdout.trim() };
+ };
+ /** A run that builds and commits, but whose supervisor tests fail until `flag` exists: the build stays unpushed, and no PR. */
+ const unpushedBuild = async (flag: string) => {
+  const r = await rig({ test: `test -f ${flag}` });
+  cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("failed");
+  expect(r.github.prs.size).toBe(0);
+  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  const worktree = r.journal.getWorker("20", "acme/widgets")?.worktree as string;
+  return { r, worktree, built: (await git(["rev-parse", "HEAD"], worktree)).stdout.trim() };
+ };
+
+ test("a resume with no PR whose branch has no commits of its own is fast-forwarded to the moved base before any worker session (node #310)", async () => {
+  const { r, worktree, was } = await failBeforeAnyPr();
+  for (const file of ["base-1.txt", "base-2.txt"]) await pushFromOutside(r, file, "main");
+  const main = await r.github.sha("main");
+  // A blocked report a session left untracked is not a change of the tree's.
+  writeFileSync(join(worktree, ".ranger-blocked.md"), "# left by an earlier session\n");
+  expect((await git(["status", "--porcelain"], worktree)).stdout).toContain(".ranger-blocked.md");
+  const sessions = watchSessions(r, "build");
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  expect(sessions).toHaveLength(1);
+  expect(sessions[0]?.head).toBe(main); // the build pass started on the moved base
+  const synced = r.journal.listEvents("acme/widgets", 300).filter((e) => e.kind === "worktree-synced");
+  expect(synced).toHaveLength(1);
+  expect(synced[0]?.detail).toContain(was);
+  expect(synced[0]?.detail).toContain(main);
+  expect(synced[0]?.detail).toContain("2 commit(s) behind origin/main");
+  expect((await runCmd("git", ["merge-base", "--is-ancestor", "main", await r.github.sha(BRANCH)], { cwd: r.origin })).code).toBe(0);
+ }, 60_000);
+
+ test("a resume with no PR whose own commits are far behind the base merges it in before the adoption tests (node #310)", async () => {
+  const flag = join(tmpdir(), `ranger-prepr-merge-${Date.now()}`);
+  const { r, worktree, built } = await unpushedBuild(flag);
+  for (const file of ["base-1.txt", "base-2.txt", "base-3.txt"]) await pushFromOutside(r, file, "main");
+  r.ctx.config.workers.maxBehindBase = 2;
+  writeFileSync(flag, ""); // whatever broke the tests is gone
+  const sessions = watchSessions(r, "build");
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  // One session: the base merge pass. The build itself is adopted, merged.
+  expect(sessions).toHaveLength(1);
+  expect(sessions[0]?.prompt).toContain("## Base merge pass");
+  expect(sessions[0]?.head).toBe(built); // the unpushed build was kept, not reset away
+  const events = eventDetails(r);
+  expect(events.some((d) => d.startsWith(`${BRANCH}: the branch was 3 commit(s) behind origin/main (limit 2)`))).toBe(true);
+  const adopted = events.find((d) => d.startsWith("adopting "))?.match(/^adopting ([0-9a-f]{8})/)?.[1];
+  expect(adopted).toBeDefined();
+  const pushed = await r.github.sha(BRANCH);
+  expect(pushed.startsWith(adopted as string)).toBe(true);
+  expect((await runCmd("git", ["merge-base", "--is-ancestor", "main", pushed], { cwd: r.origin })).code).toBe(0);
+  expect((await runCmd("git", ["merge-base", "--is-ancestor", built, pushed], { cwd: r.origin })).code).toBe(0);
+  expect((await git(["rev-parse", "HEAD"], worktree)).stdout.trim()).toBe(pushed);
+  rmSync(flag, { force: true });
+ }, 60_000);
+
+ test("a resume with no PR whose base merge leaves the conflict standing parks naming the conflicting files, and keeps the build (node #310)", async () => {
+  const flag = join(tmpdir(), `ranger-prepr-conflict-${Date.now()}`);
+  const { r, worktree, built } = await unpushedBuild(flag);
+  // The base adds its own src/feature.ts: the branch's conflicts with it.
+  const clone = join(r.dir, "outside-conflict");
+  expect((await git(["clone", "--branch", "main", r.origin, clone], r.dir)).code).toBe(0);
+  mkdirSync(join(clone, "src"), { recursive: true });
+  writeFileSync(join(clone, "src", "feature.ts"), "export const feature = () => 42; // main\n");
+  await git(["add", "src/feature.ts"], clone);
+  await git(["commit", "-m", "main: its own feature"], clone);
+  expect((await git(["push", "origin", "HEAD:refs/heads/main"], clone)).code).toBe(0);
+  r.ctx.config.workers.maxBehindBase = 0;
+  writeFileSync(flag, "");
+  const sessions = watchSessions(r, "merge-noop");
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("parked");
+  expect(outcome.detail).toContain("the conflict stands");
+  expect(outcome.detail).toContain("src/feature.ts");
+  expect(sessions).toHaveLength(1);
+  expect(sessions[0]?.prompt).toContain("## Base merge pass");
+  expect((await git(["rev-parse", "HEAD"], worktree)).stdout.trim()).toBe(built);
+  expect((await git(["status", "--porcelain"], worktree)).stdout.trim()).toBe("");
+  expect(r.github.prs.size).toBe(0);
+  expect(await r.github.sha(BRANCH)).toBe("");
+  rmSync(flag, { force: true });
+ }, 60_000);
+
+ test("a resume with no PR whose own commits are within maxBehindBase of the base is not merged up (node #310)", async () => {
+  const flag = join(tmpdir(), `ranger-prepr-within-${Date.now()}`);
+  const { r, built } = await unpushedBuild(flag);
+  for (const file of ["base-1.txt", "base-2.txt"]) await pushFromOutside(r, file, "main");
+  r.ctx.config.workers.maxBehindBase = 2;
+  writeFileSync(flag, "");
+  const sessions = watchSessions(r, "build");
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  expect(sessions).toHaveLength(0); // adopted as it stood
+  expect(await r.github.sha(BRANCH)).toBe(built);
+  expect(eventDetails(r).some((d) => d.includes("a worker merges it in"))).toBe(false);
+  expect(r.journal.listEvents("acme/widgets", 300).some((e) => e.kind === "worktree-synced")).toBe(false);
+  rmSync(flag, { force: true });
+ }, 60_000);
+
+ test("a resume with no PR whose worktree has tracked changes is not moved to the base, and the journal says why (node #310)", async () => {
+  const { r, worktree, was } = await failBeforeAnyPr();
+  writeFileSync(join(worktree, "README.md"), "half-done\n");
+  for (const file of ["base-1.txt", "base-2.txt"]) await pushFromOutside(r, file, "main");
+  const sessions = watchSessions(r, "build");
+  await runNode("20", r.ctx);
+  expect(sessions).toHaveLength(1);
+  expect(sessions[0]?.head).toBe(was); // the build pass started on the tree as it stood
+  expect(r.journal.listEvents("acme/widgets", 300).some((e) => e.kind === "worktree-synced")).toBe(false);
+  expect(eventDetails(r).some((d) => d.includes("2 commit(s) behind origin/main") && d.includes("README.md"))).toBe(true);
+ }, 60_000);
+
  test("a resume after someone rewound the PR branch below the pushed worktree parks and pushes nothing over it (sage round 2 on PR #234)", async () => {
   const { r, head } = await failAfterRoundOne();
   const pushedHead = await head();

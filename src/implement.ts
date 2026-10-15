@@ -61,7 +61,7 @@ import { FixNodeLockBusy, withFixNodeLock } from "./fix-node-lock.ts";
 import { assertFilable, codeCommentSpec, foundByProbeSpec, landminesInDiff, scribeFile, splitOutOfReviewSpec, type Provenance, type ScribeGraph } from "./scribe.ts";
 import { FencedError, type ImplementPhase, type Journal } from "./journal.ts";
 import { assembleImplementPrompt } from "./prompt.ts";
-import { blockerNoteBranch, discardBlockedReport, readBlockedReport, type BlockedReport } from "./blocked-report.ts";
+import { BLOCKED_REPORT_FILE, blockerNoteBranch, discardBlockedReport, readBlockedReport, type BlockedReport } from "./blocked-report.ts";
 import { ReviewError, sageReview, type ReviewVerdict } from "./review.ts";
 import {
  confirmCap,
@@ -1333,13 +1333,16 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
  let workerExit: number | null = null;
  if (phase === "implement") {
   journal.updateWorker(nodeId, ctx.map.repo, { phase: "implement" });
+  // Before the install, so it installs what the moved base declares.
+  const caughtUp = await catchUpWithBase(ctx, testCommand);
+  if (caughtUp?.failure !== undefined) return caughtUp.failure;
   if (!remoteTests(ctx) && map.commands.install !== undefined) {
    const install = await runShell(map.commands.install, worktree, ctx, { label: "install", timeoutMs: INSTALL_TIMEOUT_MS });
    if (install.code !== 0) {
     return {
      status: "failed",
      detail: `install (${map.commands.install}) exited ${install.code}: ${tail(install)}`,
-     workerExit: null,
+     workerExit: caughtUp?.workerExit ?? null,
     };
    }
   }
@@ -1974,6 +1977,68 @@ async function syncWorktreeToHead(ctx: ImplementContext, prNumber: number, prHea
 }
 
 /**
+ * Bring a resumed node's branch up to its base before anything adopts or
+ * builds on it, when there is no PR yet (node #310). `bootstrapWorktree`
+ * reuses a worktree as it stands: soma #829 was resumed on a tree 17 commits
+ * behind a base that had already fixed what it parked on, and a worker
+ * session went on it.
+ *
+ * - Not behind origin/<base> as fetched: nothing to do.
+ * - Changes in the tree (anything but the blocked report a session leaves
+ *   untracked): left as it is, for `adoptBuiltWork` and the build pass to
+ *   judge as before, and the journal says how far behind it stays.
+ * - No commits of its own: fast-forwarded to origin/<base>, no worker
+ *   session, and the journal records both SHAs and the count.
+ * - Commits of its own, more than workers.maxBehindBase behind: one base
+ *   merge pass on the local HEAD (ranger issue #231's pass); the adoption
+ *   tests or the build pass then see the merged branch.
+ * - Commits of its own within the limit: left as it is.
+ */
+async function catchUpWithBase(ctx: ImplementContext, testCommand: string): Promise<PassResult | undefined> {
+ const { worktree, journal, map, branch } = ctx;
+ const repo = map.repo;
+ const nodeId = ctx.node.ref.id;
+ const base = map.base;
+ // The fetch carries the write credential: the state must still be the known-good one (node #81).
+ await trustedSnapshot(journal, ctx.canonical, { repo, nodeId }, mapKey(map));
+ await fastForwardCanonical(ctx.canonical, base, gitCredential(repo, ctx.token));
+ const behind = await commitsBehind(worktree, base);
+ if (behind === 0) return undefined;
+ const dirty = (await dirtyFiles(worktree)).filter((l) => l !== `?? ${BLOCKED_REPORT_FILE}`);
+ if (dirty.length > 0) {
+  journal.recordEvent("reviewed", {
+   nodeId,
+   repo,
+   detail: `${branch} is ${behind} commit(s) behind origin/${base}, but the worktree has uncommitted changes (${dirty.slice(0, 5).map((l) => l.trim()).join(", ")}): it is not moved`.slice(0, 400),
+  });
+  return undefined;
+ }
+ const ahead = await commitsAhead(worktree, base);
+ if (ahead === 0) {
+  const here = await headSha(worktree);
+  const to = await safeGit(["rev-parse", "--verify", `refs/remotes/origin/${base}^{commit}`], { cwd: worktree, timeoutMs: 10_000 });
+  const baseSha = to.stdout.trim();
+  if (to.code !== 0 || !/^[0-9a-f]{40}$/.test(baseSha)) {
+   throw new GitSafetyError(`cannot resolve origin/${base} after the fetch: ${to.stderr.trim()}`);
+  }
+  journal.assertGeneration(nodeId, repo, ctx.generation, "fast-forward the worktree to the base");
+  const ff = await safeGit(["merge", "--ff-only", baseSha], { cwd: worktree, timeoutMs: 60_000 });
+  if (ff.code !== 0) {
+   throw new GitSafetyError(`cannot fast-forward ${worktree} from ${here.slice(0, 8)} to origin/${base} (${baseSha.slice(0, 8)}): ${ff.stderr.trim()}`);
+  }
+  journal.recordEvent("worktree-synced", {
+   nodeId,
+   repo,
+   detail: `worktree fast-forwarded from ${here} to origin/${base} ${baseSha}: ${branch} had no commits of its own and was ${behind} commit(s) behind origin/${base}`,
+  });
+  return undefined;
+ }
+ const limit = ctx.config.workers.maxBehindBase;
+ if (behind <= limit) return undefined;
+ return baseMergePass(ctx, testCommand, null, { behind, limit });
+}
+
+/**
  * The files `git merge-tree` reports as conflicting between the branch and
  * origin/<base>: a hint for the worker's prompt, empty when git cannot say.
  */
@@ -1991,21 +2056,30 @@ async function conflictingFiles(worktree: string, base: string): Promise<string[
  * fetches the base first (the worker holds no credential); the worker merges
  * and resolves; the supervisor's own checks then require a clean tree,
  * passing tests, and origin/<base> actually inside the branch.
+ *
+ * `pushedHead` null: no PR yet (node #310). The pass merges on the local
+ * HEAD, whose commits were never pushed and must not be reset away; the
+ * caller has checked the tree clean. A pass that commits nothing leaves the
+ * tree as it found it, and one that exited 0 so parks: the conflict stands.
  */
-async function baseMergePass(ctx: ImplementContext, testCommand: string, pushedHead: string, stale?: StaleBase): Promise<PassResult> {
+async function baseMergePass(ctx: ImplementContext, testCommand: string, pushedHead: string | null, stale?: StaleBase): Promise<PassResult> {
  const base = ctx.map.base;
+ const start = pushedHead ?? (await headSha(ctx.worktree));
+ const resetTo = async (sha: string, why: string) => {
+  for (const args of [["reset", "--hard", sha], ["clean", "-fd"]]) {
+   // Fenced before EACH destructive command: a replacement run can take the
+   // node over while the previous one awaits.
+   ctx.journal.assertGeneration(ctx.node.ref.id, ctx.map.repo, ctx.generation, `git ${args[0]} ${why}`);
+   const r = await safeGit(args, { cwd: ctx.worktree, timeoutMs: 60_000 });
+   if (r.code !== 0) throw new GitSafetyError(`cannot reset ${ctx.worktree} to ${sha.slice(0, 8)} (git ${args[0]}): ${r.stderr.trim()}`);
+  }
+ };
  // Start from what GitHub has: an earlier run may have merged locally and
  // crashed before its push, and that unpushed state is neither vetted nor
  // reviewed. The pass redoes the merge on the pushed head — only while this
  // supervisor still owns the node: a superseded one must not erase a newer
  // run's work.
- for (const args of [["reset", "--hard", pushedHead], ["clean", "-fd"]]) {
-  // Fenced before EACH destructive command: a replacement run can take the
-  // node over while the previous one awaits.
-  ctx.journal.assertGeneration(ctx.node.ref.id, ctx.map.repo, ctx.generation, `git ${args[0]} before a base merge`);
-  const r = await safeGit(args, { cwd: ctx.worktree, timeoutMs: 60_000 });
-  if (r.code !== 0) throw new GitSafetyError(`cannot reset ${ctx.worktree} to ${pushedHead.slice(0, 8)} (git ${args[0]}): ${r.stderr.trim()}`);
- }
+ if (pushedHead !== null) await resetTo(pushedHead, "before a base merge");
  // The fetch carries the write credential: the state must still be the known-good one (node #81).
  await trustedSnapshot(ctx.journal, ctx.canonical, { repo: ctx.map.repo, nodeId: ctx.node.ref.id }, mapKey(ctx.map));
  await fastForwardCanonical(ctx.canonical, base, gitCredential(ctx.map.repo, ctx.token));
@@ -2029,6 +2103,16 @@ async function baseMergePass(ctx: ImplementContext, testCommand: string, pushedH
     : `${ctx.branch}: ${baseMergeWhy(base, stale)}${files.length > 0 ? `, conflicting in ${files.join(", ")}` : ""} — a worker merges it in before any review or probe run`,
  });
  const pass = await workerPass(ctx, testCommand, { kind: "base-merge", base, files, ...(stale === undefined ? {} : { stale }) });
+ if (pushedHead === null && (await headSha(ctx.worktree)) === start) {
+  // Nothing committed on a tree that was clean: what the worker left is a
+  // half-done merge, and the next run must not build on it.
+  await resetTo(start, "after a base merge that committed nothing");
+  if (pass.failure !== undefined && pass.workerExit === 0 && pass.failure.substrateCapped === undefined) {
+   throw new ParkSignal(
+    `base merge pass committed nothing, and origin/${base} as fetched (${baseSha.slice(0, 8)}) is not in ${ctx.branch} — the conflict stands${files.length > 0 ? ` in ${files.join(", ")}` : ""}; the worktree is back at ${start.slice(0, 8)} and nothing was pushed`,
+   );
+  }
+ }
  if (pass.failure !== undefined) return pass;
  const inside = await safeGit(["merge-base", "--is-ancestor", baseSha, "HEAD"], {
   cwd: ctx.worktree,
