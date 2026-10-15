@@ -43,6 +43,10 @@ import { randomUUID } from "node:crypto";
 const fixturesBin = join(import.meta.dir, "fixtures", "bin");
 const dataDir = join(import.meta.dir, "fixtures", "data");
 const implementWorker = join(fixturesBin, "implement-worker");
+
+/** A load reader that yields `loads` in order, then repeats the last. */
+const loadSequence = (loads: number[], cores: number) => () => ({ load: loads.length > 1 ? (loads.shift() as number) : loads[0], cores });
+
 const BOT = "ivy-bot";
 const DEAD_PID = 2_147_483_646;
 
@@ -2420,7 +2424,7 @@ describe("implement lane (node #23)", () => {
   test("after a failed busy-host retry the base run waits for a quiet host, then clears the shared failure", async () => {
    const r = await bunRig("echo \"(fail) a flake at load\"; echo \" 1 fail\"; exit 1");
    const loads = [2, 14, 13, 2, 14, 13, 2]; // quiet first run; retry: at the failure, waiting, quiet; base run: busy, waiting, quiet
-   r.ctx.hostLoad = () => ({ load: loads.length > 1 ? (loads.shift() as number) : loads[0], cores: 10 });
+   r.ctx.hostLoad = loadSequence(loads, 10);
    r.ctx.quietHost = { pollMs: 1, maxMs: 60_000 };
    expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
    const events = reviewed(r).reverse(); // oldest first
@@ -2698,7 +2702,7 @@ describe("implement lane (node #23)", () => {
    test(`a busy-host retry ${what} certifies nothing: its shared failures gate without a base run`, async () => {
     const r = await bunRig(opts.test, "install" in opts ? { install: opts.install } : {});
     const loads = [2, 14, 13, 2]; // quiet first run, busy at the failure, quiet for the retry
-    r.ctx.hostLoad = () => ({ load: loads.length > 1 ? (loads.shift() as number) : loads[0], cores: 10 });
+    r.ctx.hostLoad = loadSequence(loads, 10);
     r.ctx.quietHost = { pollMs: 1, maxMs: 60_000 };
     expect((await runNode("20", r.ctx)).status).toBe("failed");
     expect(r.calls.filter((c) => c.cwd.includes("ranger-test-retry-")).length).toBeGreaterThan(0);
@@ -2767,7 +2771,7 @@ describe("implement lane (node #23)", () => {
   const r = await rig({ test: `if [ -f ${flag} ]; then test -f src/feature.ts; else touch ${flag}; exit 1; fi` });
   cleanup.push(r.dir);
   const loads = [2, 14, 13, 2]; // before the first run, at the failure, while waiting, then quiet
-  r.ctx.hostLoad = () => ({ load: loads.length > 1 ? (loads.shift() as number) : loads[0], cores: 10 });
+  r.ctx.hostLoad = loadSequence(loads, 10);
   r.ctx.quietHost = { pollMs: 1, maxMs: 60_000 };
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
   const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
@@ -2815,7 +2819,7 @@ describe("implement lane (node #23)", () => {
   });
   cleanup.push(r.dir);
   const loads = [2, 14, 13, 2];
-  r.ctx.hostLoad = () => ({ load: loads.length > 1 ? (loads.shift() as number) : loads[0], cores: 10 });
+  r.ctx.hostLoad = loadSequence(loads, 10);
   r.ctx.quietHost = { pollMs: 1, maxMs: 60_000 };
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
   const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
@@ -2829,7 +2833,7 @@ describe("implement lane (node #23)", () => {
   cleanup.push(r.dir);
   r.ctx.config.workers.busyLoad = 4;
   const loads = [6, 5, 3]; // below the 10 cores, but at or above busyLoad until the third reading
-  r.ctx.hostLoad = () => ({ load: loads.length > 1 ? (loads.shift() as number) : loads[0], cores: 10 });
+  r.ctx.hostLoad = loadSequence(loads, 10);
   r.ctx.quietHost = { pollMs: 1, maxMs: 60_000 };
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
   const events = r.journal.listEvents("acme/widgets", 300, "20").map((e) => e.detail ?? "");
@@ -2844,7 +2848,7 @@ describe("implement lane (node #23)", () => {
    // quiet before the first run, busy when it fails, quiet for the retry, busy when the retry ends
    const sequence = () => {
     const loads = [0, 20, 0, 20];
-    r.ctx.hostLoad = () => ({ load: loads.length > 1 ? (loads.shift() as number) : loads[0], cores: 1 });
+    r.ctx.hostLoad = loadSequence(loads, 1);
    };
    sequence();
    r.ctx.quietHost = { pollMs: 1, maxMs: 1 };
@@ -2970,7 +2974,7 @@ describe("implement lane (node #23)", () => {
   expect((await runNode("20", r.ctx)).status).toBe("failed"); // quiet host: no retry
   r.ctx.workerCommand = [implementWorker, "noop"];
   const loads = [2, 14, 13, 2];
-  r.ctx.hostLoad = () => ({ load: loads.length > 1 ? (loads.shift() as number) : loads[0], cores: 10 });
+  r.ctx.hostLoad = loadSequence(loads, 10);
   r.ctx.quietHost = { pollMs: 1, maxMs: 60_000 };
   r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
@@ -2990,7 +2994,7 @@ describe("implement lane (node #23)", () => {
  };
  const quietsDown = (r: Rig) => {
   const loads = [2, 14, 13, 2]; // before the first run, at the failure, while waiting, then quiet
-  r.ctx.hostLoad = () => ({ load: loads.length > 1 ? (loads.shift() as number) : loads[0], cores: 10 });
+  r.ctx.hostLoad = loadSequence(loads, 10);
   r.ctx.quietHost = { pollMs: 1, maxMs: 60_000 };
  };
  const countSessions = (r: Rig) => {
@@ -3191,7 +3195,7 @@ describe("implement lane (node #23)", () => {
   cleanup.push(r.dir);
   // The supervisor test run reads the host first (quiet); then the probe run waits.
   const loads = [3, 12, 11, 3];
-  r.ctx.hostLoad = () => ({ load: loads.length > 1 ? (loads.shift() as number) : loads[0], cores: 10 });
+  r.ctx.hostLoad = loadSequence(loads, 10);
   r.ctx.quietHost = { pollMs: 1, maxMs: 60_000 };
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
   const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");

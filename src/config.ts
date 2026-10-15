@@ -259,8 +259,9 @@ const WorkersSchema = z.object({
   .refine((v) => Number.isInteger(v) || v === Number.POSITIVE_INFINITY, "an integer, or .inf for no cap")
   .default(Number.POSITIVE_INFINITY),
  /**
-  * The 1-minute load at which the host counts as busy (O2): claims, queued
-  * resumes and supervisor test runs wait below it. Default: the core count.
+  * The 1-minute load at which the host counts as busy: claims, queued
+  * resumes and supervisor test runs wait while the load is at or above it.
+  * Default: the core count.
   */
  busyLoad: z.number().positive().optional(),
  /** Concurrent implement workers per resource lane, across all maps (default one each). */

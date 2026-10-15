@@ -8,6 +8,9 @@ export interface HostLoadReading {
 
 export type HostLoad = () => HostLoadReading;
 
+/** A busy reading a park carries: `killed` when the retry was killed with no failing test, not failed. */
+export type BusyReading = HostLoadReading & { killed?: boolean };
+
 /**
  * The host's real load, except under test (RANGER_UNDER_TEST=1, node #66),
  * where it reads quiet: a test that wants load injects its own reader, and no

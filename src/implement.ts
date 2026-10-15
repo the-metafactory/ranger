@@ -33,7 +33,7 @@ import { recordKnownGood, trustedSnapshot } from "./git-trust.ts";
 import * as gh from "./github.ts";
 import type { IssueComment, ChangeRequest, ForgePort, CiFailedRun, CiVerdict } from "./forge.ts";
 import { HostLoadPark, ParkSignal } from "./signals.ts";
-import { describeLoad, isQuiet, realHostLoad, type HostLoad, type HostLoadReading } from "./host-load.ts";
+import { describeLoad, isQuiet, realHostLoad, type BusyReading, type HostLoad, type HostLoadReading } from "./host-load.ts";
 import { isTransientGitHubError } from "./transient.ts";
 import {
  PROBE_FILE,
@@ -2795,7 +2795,7 @@ async function supervisorTests(
  testCommand: string,
  label: string,
  baseTip: string | null,
-): Promise<{ tests: RunResult; retried: boolean; baseRed?: BaseRedTests; busy?: HostLoadReading & { killed?: boolean } }> {
+): Promise<{ tests: RunResult; retried: boolean; baseRed?: BaseRedTests; busy?: BusyReading }> {
  const { journal, map, node, worktree } = ctx;
  const head = await headSha(worktree);
  // A full suite started on a busy host is what times out (2026-10-14: soma's
@@ -3036,7 +3036,7 @@ async function retryOnBusyHost(
  * (node #297). `what` names the run; the outcome leads with the wait reason
  * and the first three failing tests.
  */
-function hostLoadPark(ctx: ImplementContext, host: HostLoadReading & { killed?: boolean }, what: string, tests: RunResult): HostLoadPark {
+function hostLoadPark(ctx: ImplementContext, host: BusyReading, what: string, tests: RunResult): HostLoadPark {
  return new HostLoadPark(hostLoadOutcome({ ...host, what, names: failedTestNames(tests), busyLoad: busyLoad(ctx) }), host);
 }
 
@@ -3051,16 +3051,14 @@ const KILLED_ON_BUSY_HOST = "was killed with no failing test while the host was 
  * suite's own processes can read as a busy host too, so this parks once per
  * node a day: a second such kill within 24 hours is the node's failure.
  */
-function killedOnBusyHost(ctx: ImplementContext, tests: RunResult, what: string): (HostLoadReading & { killed: true }) | null {
+function killedOnBusyHost(ctx: ImplementContext, tests: RunResult, what: string): BusyReading | null {
  if (tests.code !== -1 || allFailedTestNames(tests).length > 0) return null;
  const host = busyHostNow(ctx);
  if (host === null) return null;
  const nodeId = ctx.node.ref.id;
  const repo = ctx.map.repo;
- const since = Date.now() - 24 * 60 * 60 * 1000;
- const again = ctx.journal.listEvents(repo, 500, nodeId)
-  .some((e) => (e.detail ?? "").includes(KILLED_ON_BUSY_HOST) && Date.parse(e.at) >= since);
- ctx.journal.recordEvent("reviewed", {
+ const again = ctx.journal.countEventsSince("host-killed", repo, nodeId, new Date(Date.now() - 24 * 60 * 60 * 1000)) > 0;
+ ctx.journal.recordEvent(again ? "reviewed" : "host-killed", {
   nodeId,
   repo,
   detail: again
@@ -3239,7 +3237,7 @@ async function adoptBuiltWork(
  // Each attempt keeps its own output in the worker log, the retry's included.
  if (!remoteTests(ctx)) await awaitQuietHost(ctx, "the adoption test run");
  let tests = await backendTests(ctx, sha, () => testsInFreshCheckout(ctx, testCommand, sha, `adopted ${what}: supervisor tests`));
- let busy: (HostLoadReading & { killed?: boolean }) | null = null;
+ let busy: (BusyReading) | null = null;
  if (tests.code !== 0) {
   const retry = remoteTests(ctx) ? null : await retryOnBusyHost(ctx, testCommand, sha, "adoption tests", "the adoption test retry", `adopted ${what}: supervisor test retry`);
   if (retry !== null) {

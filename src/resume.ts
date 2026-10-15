@@ -13,7 +13,7 @@ import type { ResolvedToken } from "./token-gate.ts";
 import type { OwnedCheck } from "./lock.ts";
 import { laneHeldMessage, mapKey, recordImplementStart, resumeMap } from "./maps.ts";
 import { spawnRunNodeDetached, type SpawnRunNodeArgs } from "./spawn.ts";
-import { isQuiet, realHostLoad, type HostLoad, type HostLoadReading } from "./host-load.ts";
+import { hostBusy, isQuiet, realHostLoad, type HostLoad, type HostLoadReading } from "./host-load.ts";
 import { waitingForQuietHost } from "./outcomes.ts";
 
 export interface ResumeContext {
@@ -218,7 +218,7 @@ export async function resumeNode(nodeId: string, selector: string | undefined, c
    held: journal.laneHolder(lane, { nodeId, repo: map.repo }) !== null,
    queued: journal.getResume(map.repo, nodeId) !== null,
    backlog: journal.listResumeQueue(lane).length,
-   busy: !isQuiet((ctx.hostLoad ?? realHostLoad)(), config.workers.busyLoad),
+   busy: hostBusy(ctx.hostLoad, config.workers.busyLoad) !== null,
   })) {
    await identityGate(config, map);
    owned();
