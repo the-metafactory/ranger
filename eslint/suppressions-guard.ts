@@ -12,10 +12,11 @@ export function totalsByRule(suppressions: Suppressions): Map<string, number> {
  return totals;
 }
 
-export function grownRules(base: Suppressions, head: Suppressions): string[] {
+/** A rule the base config does not enable yet starts its baseline in the change that enables it. */
+export function grownRules(base: Suppressions, head: Suppressions, enabledOnBase: (rule: string) => boolean = () => true): string[] {
  const before = totalsByRule(base);
  return [...totalsByRule(head)]
-  .filter(([rule, n]) => n > (before.get(rule) ?? 0))
+  .filter(([rule, n]) => enabledOnBase(rule) && n > (before.get(rule) ?? 0))
   .map(([rule, n]) => `${rule}: ${before.get(rule) ?? 0} -> ${n}`);
 }
 
@@ -32,7 +33,12 @@ if (import.meta.main) {
  }
  const base = git(["show", `${baseRef}:${SUPPRESSIONS}`]);
  if (!base.ok) process.exit(0);
- const grown = grownRules(JSON.parse(base.out) as Suppressions, JSON.parse(readFileSync(SUPPRESSIONS, "utf8")) as Suppressions);
+ const baseConfig = git(["show", `${baseRef}:eslint.config.ts`]).out;
+ const grown = grownRules(
+  JSON.parse(base.out) as Suppressions,
+  JSON.parse(readFileSync(SUPPRESSIONS, "utf8")) as Suppressions,
+  (rule) => baseConfig.includes(JSON.stringify(rule)),
+ );
  if (grown.length > 0) {
   console.error(
    `${SUPPRESSIONS} suppresses more than ${baseRef} does:\n${grown.map((g) => `  ${g}`).join("\n")}\n` +

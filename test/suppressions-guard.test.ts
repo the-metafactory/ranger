@@ -25,4 +25,14 @@ describe("suppressions guard", () => {
   const head = { ...base, "src/b.ts": { "ranger/no-comments": { count: 2 }, "@typescript-eslint/no-explicit-any": { count: 1 } } };
   expect(grownRules(base, head)).toEqual(["@typescript-eslint/no-explicit-any: 0 -> 1"]);
  });
+
+ test("passes the first baseline of a rule the base config does not enable", () => {
+  const head = { ...base, "src/b.ts": { "ranger/no-comments": { count: 2 }, "no-restricted-syntax": { count: 2 } } };
+  expect(grownRules(base, head, (rule) => rule !== "no-restricted-syntax")).toEqual([]);
+ });
+
+ test("fails a rule the base config enables, though the base never suppressed it", () => {
+  const head = { ...base, "src/b.ts": { "ranger/no-comments": { count: 2 }, "no-restricted-syntax": { count: 2 } } };
+  expect(grownRules(base, head, () => true)).toEqual(["no-restricted-syntax: 0 -> 2"]);
+ });
 });
