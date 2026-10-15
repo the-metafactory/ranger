@@ -2065,6 +2065,9 @@ async function conflictingFiles(worktree: string, base: string): Promise<string[
  return trial.stdout.split("\n").slice(1).map((l) => l.trim()).filter(Boolean).slice(0, 20);
 }
 
+/** Where a base merge pass starts: the PR's pushed head, or a local HEAD with no PR yet (node #310). */
+type MergeFrom = { kind: "pushed"; head: string } | { kind: "local"; baseSha: string };
+
 /**
  * One worker pass that merges the moved base into the branch. The supervisor
  * fetches the base first (the worker holds no credential); the worker merges
@@ -2079,8 +2082,6 @@ async function conflictingFiles(worktree: string, base: string): Promise<string[
  *   and fetched the base (`baseSha`). A pass that commits nothing leaves the
  *   tree as it found it, and one that exited 0 so parks: the conflict stands.
  */
-type MergeFrom = { kind: "pushed"; head: string } | { kind: "local"; baseSha: string };
-
 async function baseMergePass(ctx: ImplementContext, testCommand: string, from: MergeFrom, stale?: StaleBase): Promise<PassResult> {
  const base = ctx.map.base;
  const start = from.kind === "pushed" ? from.head : await headSha(ctx.worktree);
