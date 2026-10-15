@@ -13,10 +13,12 @@ describe("ranger journal (ranger issue #229)", () => {
  test("a config it cannot read exits non-zero and says so on stderr", async () => {
   const empty = join(dir, "empty");
   mkdirSync(empty);
-  const result = await runCli(["journal", "--repo", "acme/widgets"], process.env, empty);
+  const env: NodeJS.ProcessEnv = { ...process.env, HOME: empty };
+  delete env.RANGER_CONFIG;
+  const result = await runCli(["journal", "--repo", "acme/widgets"], env, empty);
   expect(result.code).not.toBe(0);
   expect(result.stdout).toBe("");
-  expect(result.stderr).toContain(`cannot read config at ${join(empty, "ranger.yaml")}`);
+  expect(result.stderr).toContain(`cannot read config at ${join(empty, ".config", "ranger", "ranger.yaml")}`);
  });
 
  test("--node keeps one node's rows and names each worker's log file", async () => {
