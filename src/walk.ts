@@ -1,6 +1,6 @@
 import { implementLane, type ImplementLane } from "./lanes.ts";
 import { processResumeQueue } from "./resume.ts";
-import type { HostLoad } from "./host-load.ts";
+import { hostBusy, type HostLoad } from "./host-load.ts";
 import { graphReadToken, laneCredentialRefusal, lanePort, type ReadGate } from "./forge-lanes.ts";
 import { GateError, tokenBatch, type ResolvedToken } from "./token-gate.ts";
 import { lastImplementMaps, recordImplementStart, mapKey, implementMapOrder, readDrains } from "./maps.ts";
@@ -68,6 +68,8 @@ export interface WalkMapResult {
  announced: string[];
  claimed: string[];
  spawnCapExhausted: boolean;
+ /** Why claims stopped on a busy host, when they did. */
+ hostBusy?: string;
  paused: boolean;
  /**
   * Why a drain (node #165) held this map's claims: the visual-lane drain
@@ -107,7 +109,7 @@ export interface WalkContext {
  intakeClient?: IntakeContext["clientFor"];
  /** The intake drafter's one-shot `claude -p` runner (tests inject a fake). */
  intakeClaude?: IntakeContext["claude"];
- /** The host load a resume queued for load waits on (node #297; tests inject a quiet or busy host). */
+ /** The host load claims and queued resumes wait on (node #297; tests inject a quiet or busy host). */
  hostLoad?: HostLoad;
  /** Detached `ranger job run` spawner (node #301) — tests inject a recorder. */
  spawnJob?: (args: SpawnJobArgs) => Promise<number | null>;
@@ -621,6 +623,14 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
        config.workers.spawnCapPerDay
       ) {
        mapResult.spawnCapExhausted = true;
+       break;
+      }
+      // A claim starts a worker session and its test suites: none on a busy
+      // host (2026-10-14: soma #802 and #853 timed out at load 45-55 on 10
+      // cores). The next tick claims once the load is down.
+      const busy = hostBusy(ctx.hostLoad, config.workers.busyLoad);
+      if (busy !== null) {
+       mapResult.hostBusy = busy;
        break;
       }
       // Veto cache: a vetoed node is never claimed (design §5, journal durability).

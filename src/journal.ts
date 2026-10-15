@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { journalKeyFor } from "./forge-ref.ts";
-import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, lt, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, isNotNull, isNull, lt, or, sql } from "drizzle-orm";
 import { openDb, openDbReadOnly, type RangerDb } from "./store/db.ts";
 import { seedLegacyRoots } from "./store/legacy-roots.ts";
 import {
@@ -273,6 +273,8 @@ export type EventKind =
  | "ledger-failed"
  | "ledger-root-serves-invalid"
  | "resume-queued"
+ /** A test retry killed with no failing test on a busy host parked the node (its once-a-day limit reads these). */
+ | "host-killed"
  /** Scheduled jobs (node #301). */
  | "job-queued"
  | "job-started"
@@ -677,6 +679,13 @@ export class Journal {
     detail: opts.detail ?? null,
    })
    .run();
+ }
+
+ /** How many `kind` events one node has recorded at or after `since`: no row window, so a busy node's other events cannot hide one. */
+ countEventsSince(kind: EventKind, repo: string, nodeId: string, since: Date): number {
+  const row = this.db.select({ n: sql<number>`count(*)` }).from(events)
+   .where(and(eq(events.kind, kind), eq(events.repo, repo), eq(events.nodeId, nodeId), gte(events.at, since.toISOString()))).get();
+  return row?.n ?? 0;
  }
 
  /** The newest `limit` events, of one repo and, with `nodeId`, one node of it. */

@@ -78,15 +78,24 @@ queueing the node again starts its failure count at zero.
 
 Ranger queues a resume itself when the supervisor's tests fail and their one
 busy-host retry also ran on a busy host, because the quiet-host wait ran out
-first (node #297). This applies to adoption and to the tests after a worker
+first (node #297), or was killed (the test timeout) with no failing test while
+the host is busy. A hanging suite's own load can read as busy, so a kill parks
+once per node in 24 hours; a second is the node's failure. This applies to adoption and to the tests after a worker
 pass. No worker session starts and no fix pass runs. The row ends `failed`
 with an outcome that leads with "waiting for a quiet host: load X on N cores"
 and names up to three failing tests. It does not count toward the dead-man
-switch. The entry starts only when the 1-minute load is below the core count.
-On a busy host it waits: no start and no failed start, one `reviewed` event per
-tick. It holds nothing behind it. A retry that started on a quiet host and
-failed is the branch's failure, as before. Operator `--when-free` entries never
-wait on load.
+switch. A retry that started on a quiet host and named a failure is the
+branch's failure, as before.
+
+The host is busy while its 1-minute load is at or above `workers.busyLoad`
+(default: the core count). On a busy host the walk claims nothing, and every
+queued resume waits, ranger's own and an operator's `--when-free` entry alike:
+no start and no failed start, one `reviewed` event per tick, and it holds
+nothing behind it. `resume-node --when-free` queues on a busy host rather than
+starting; a plain `resume-node` starts at once. Supervisor and adoption test
+runs wait up to 20 minutes for a quiet host before they start, then run anyway,
+as the probe tier does (2026-10-14: soma's 6-minute suite ran past the
+20-minute test timeout at load 45-55 on 10 cores).
 
 `ranger serve` (node #166) runs these verbs for the principal: Drain/Undrain on
 the visual lane's header (`ranger drain --lane visual [--off]`) and on each
@@ -97,7 +106,7 @@ verb would queue, and a queued node shows its place and a Cancel
 shows as next, ahead of any frontier claim; the walk's forge check (a closed
 node, a merged PR) and identity gate come after and may still drop or defer it.
 An entry the tick will drop (a `walk: none` map, a row back in flight) shows
-why and holds nothing behind it. So does a resume queued for load while the
+why and holds nothing behind it. So does a queued resume while the
 host is busy ("waiting for a quiet host: load X on N cores"), and its parked
 card's reason class is `host load`.
 An action `serve` refuses (unknown map, no queued entry) shows its error and

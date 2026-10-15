@@ -594,3 +594,51 @@ describe("node #47 — map identity", () => {
   expect(servedMaps(config).filter(m => mapKey(m) === "jcfischer/seelite#460")).toHaveLength(1);
  });
 });
+
+describe("O2 (2026-10-14) — work is admitted by host load", () => {
+ const busy = () => ({ load: 30, cores: 10 });
+ const quiet = () => ({ load: 3, cores: 10 });
+
+ test("a busy host stops fresh claims and says why; a quiet one claims", async () => {
+  await withRigEnv(async (r) => {
+   const spawned: string[] = [];
+   const spawnRunNode = async ({ nodeId }: { nodeId: string }) => { spawned.push(nodeId); return process.pid; };
+   const held = await walk({ config: r.config, configPath: r.configPath, journal: r.journal, spawnRunNode, hostLoad: busy });
+   expect(held.maps.flatMap((m) => m.claimed)).toEqual([]);
+   expect(held.maps.some((m) => m.hostBusy === "the host is busy (load 30.0 on 10 cores)")).toBe(true);
+   expect(spawned).toEqual([]);
+   const open = await walk({ config: r.config, configPath: r.configPath, journal: r.journal, spawnRunNode, hostLoad: quiet });
+   expect(open.maps.flatMap((m) => m.claimed).length).toBeGreaterThan(0);
+  });
+ });
+
+ test("workers.busyLoad moves the line: load 30 claims when busy is 40", async () => {
+  await withRigEnv(async (r) => {
+   r.config.workers.busyLoad = 40;
+   const result = await walk({ config: r.config, configPath: r.configPath, journal: r.journal,
+    spawnRunNode: async () => process.pid, hostLoad: busy });
+   expect(result.maps.flatMap((m) => m.claimed).length).toBeGreaterThan(0);
+   expect(result.maps.every((m) => m.hostBusy === undefined)).toBe(true);
+  });
+ });
+
+ test("a queued resume waits while the host is busy and starts once it is quiet", async () => {
+  await withRigEnv(async (r) => {
+   writeFileSync(join(r.dir, "data", "acme__widgets-node-30.json"), JSON.stringify({
+    repo: REPO, ref: { id: "30" }, node: { id: "30", title: "Build 30", kind: "task", autonomy: "auto" },
+    status: "open", assignees: ["ivy-bot"], blockedBy: [], author: "alice", typed: true, url: "",
+   }));
+   r.journal.upsertWorker({ root: 1, nodeId: "30", repo: REPO, status: "failed", lane: "implement" });
+   r.journal.updateWorker("30", REPO, { phase: "implement" });
+   r.journal.enqueueResume({ nodeId: "30", repo: REPO, root: 1, lane: "headless" });
+   const spawned: string[] = [];
+   const spawnRunNode = async ({ nodeId }: { nodeId: string }) => { spawned.push(nodeId); return process.pid; };
+   await walk({ config: r.config, configPath: r.configPath, journal: r.journal, spawnRunNode, hostLoad: busy });
+   expect(spawned).not.toContain("30");
+   expect(r.journal.listResumeQueue().map((q) => q.nodeId)).toEqual(["30"]);
+   await walk({ config: r.config, configPath: r.configPath, journal: r.journal, spawnRunNode, hostLoad: quiet });
+   expect(spawned).toContain("30");
+   expect(r.journal.listResumeQueue()).toEqual([]);
+  });
+ });
+});

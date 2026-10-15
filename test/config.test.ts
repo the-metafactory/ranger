@@ -278,3 +278,20 @@ describe("loadConfig", () => {
     expect(() => loadConfig("/nonexistent/ranger.yaml")).toThrow(ConfigError);
   });
 });
+
+describe("hostBusy and workers.busyLoad (O2)", () => {
+  test("busy at the core count by default, at busyLoad when set; a non-positive busyLoad is refused", async () => {
+    const { hostBusy } = await import("../src/host-load.ts");
+    expect(hostBusy(() => ({ load: 9.9, cores: 10 }))).toBeNull();
+    expect(hostBusy(() => ({ load: 10, cores: 10 }))).toBe("the host is busy (load 10.0 on 10 cores)");
+    expect(hostBusy(() => ({ load: 19.9, cores: 10 }), 20)).toBeNull();
+    expect(hostBusy(() => ({ load: 20, cores: 10 }), 20)).toBe("the host is busy (load 20.0 on 10 cores, busy at 20)");
+    const base = ["version: 1", "maps:", "  - repo: acme/widgets", "    root: 1", "workers:"];
+    withConfig([...base, "  busyLoad: 20"].join("\n"), (path) => {
+      expect(loadConfig(path).config.workers.busyLoad).toBe(20);
+    });
+    withConfig([...base, "  busyLoad: 0"].join("\n"), (path) => {
+      expect(() => loadConfig(path)).toThrow(ConfigError);
+    });
+  });
+});
