@@ -118,6 +118,12 @@ const MapSchema = z.object({
    viewsDiff: z.string().min(1).optional(),
    /** Wall clock for one probe run, minutes. */
    probeTimeoutMin: z.number().int().positive().default(30),
+   /**
+    * Wall clock for one supervisor test run (`test`), minutes. A suite that
+    * runs past it is killed and reads as a failed run (exit -1). Soma's suite
+    * crossed the old fixed 20 minutes on a busy host (2026-10-15, soma #908).
+    */
+   testTimeoutMin: z.number().int().positive().default(20),
   })
   .default({}),
  /**

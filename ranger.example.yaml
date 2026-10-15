@@ -40,6 +40,7 @@ maps:
     #   probe: 'npm run probe:pr -- --base origin/main --head HEAD --intent "… node #{node} …"'
     #   probeRetry: PROBE_SELECTION=1 PROBE_FILES={failed} npm run probe   # retry only the failures
     #   probeTimeoutMin: 30
+    #   testTimeoutMin: 20   # supervisor test run wall clock, minutes; a suite past it is killed (exit -1)
     #   # Informational sheet for ranger:needs-eye, after passing final-head probes.
     #   # before = detached merge-base build; after + after2 = final head + noise control.
     #   # {out} is outside the worktree, under the journal directory, per repo/node/SHA.
