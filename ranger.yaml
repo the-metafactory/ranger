@@ -195,7 +195,8 @@ maps:
       probe: 'npm run probe:pr -- --base origin/main --head HEAD --intent "Ranger implement lane: the diff on this branch implements orienteer node #{node}; select every browser probe the changed files can affect."'
       # A failed run retries only the probes it named.
       probeRetry: PROBE_SELECTION=1 PROBE_FILES={failed} npm run probe
-      probeTimeoutMin: 30
+      # 959 (2026-10-15): 104 selected probes reached #47 in 30 min at load 20–36.
+      probeTimeoutMin: 75
       views: PROBE_ORIGIN={origin} npm run views -- --label {label} --out {out}
       viewsServe: npx vite --port {port} --strictPort
       viewsDiff: node scripts/diff-view-set.mjs {out} {a} {b}
@@ -218,7 +219,8 @@ maps:
       probe: 'npm run probe:pr -- --base origin/main --head HEAD --intent "Ranger implement lane: the diff on this branch implements orienteer node #{node}; select every browser probe the changed files can affect."'
       # A failed run retries only the probes it named.
       probeRetry: PROBE_SELECTION=1 PROBE_FILES={failed} npm run probe
-      probeTimeoutMin: 30
+      # 959 (2026-10-15): 104 selected probes reached #47 in 30 min at load 20–36.
+      probeTimeoutMin: 75
       views: PROBE_ORIGIN={origin} npm run views -- --label {label} --out {out}
       viewsServe: npx vite --port {port} --strictPort
       viewsDiff: node scripts/diff-view-set.mjs {out} {a} {b}
