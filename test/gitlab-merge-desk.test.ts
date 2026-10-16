@@ -7,6 +7,7 @@ import { loadConfig } from "../src/config.ts";
 import { openJournal } from "../src/journal.ts";
 import { deskPort, runMergeDesk } from "../src/merge-desk.ts";
 import { realGitHub } from "../src/implement.ts";
+import { githubMergeState } from "../src/github.ts";
 import type { ChangeRequest, CiVerdict, ForgePort, IssueComment, MergeOutcome, MergeState, RebaseOutcome } from "../src/forge.ts";
 
 const REPO = "gitlab:gitlab.example.test/claw/sim";
@@ -18,6 +19,102 @@ const RUNNING: CiVerdict = { state: "pending", reason: "pipeline 32 is running" 
 
 const review = (sha: string, round: number): IssueComment => ({
  id: 10 + round, author: BOT, body: `<!-- ranger:review round=${round} sha=${sha} blockers=0 majors=0 nits=0 -->`,
+});
+
+describe("node #319 — GitHub behind PRs use the shared branch-update flow", () => {
+ const repo = "acme/widgets";
+ const behind = (over: Partial<Mr> = {}) => needsRebase({ title: "GitHub branch update (node #96)", mergeState: githubMergeState(true, "behind"), ...over });
+ const forge = (mr: Mr) => {
+  const f = fakeGitLab(mr);
+  delete f.port.squashRefusal;
+  return f;
+ };
+
+ test("the real GitHub port exposes the branch-update seam", () => {
+  expect(realGitHub.rebasePr).toBeFunction();
+ });
+
+ test("behind updates from the gated head, then requires a fresh review and green CI before merging", async () => {
+  const r = rig({ repo });
+  try {
+   const mr = behind();
+   const gh = forge(mr);
+   expect(await r.desk(gh.port)).toMatchObject({ pending: ["96"], merged: [], parked: [], errors: [] });
+   expect(gh.rebasedFrom).toEqual([GATED]);
+   expect(gh.merges).toEqual([]);
+   expect(r.journal.listRebases(repo, "96")[0]).toMatchObject({ from: GATED, to: REBASED, requested: true });
+
+   mr.mergeState = "mergeable";
+   mr.ci = GREEN;
+   expect(await r.desk(gh.port)).toMatchObject({ resumed: ["96"], merged: [], parked: [] });
+   expect(r.row()).toMatchObject({ status: "running", phase: "review" });
+   expect(r.spawned).toEqual(["96"]);
+
+   mr.comments.push(review(REBASED, 3));
+   mr.ci = RUNNING;
+   r.journal.upsertWorker({ root: 12, nodeId: "96", repo, lane: "implement", status: "awaiting-merge", phase: "awaiting-merge", prNumber: 9, verdictSha: REBASED, verdictBlockers: 0 });
+   expect(await r.desk(gh.port)).toMatchObject({ pending: ["96"], merged: [], parked: [] });
+   expect(gh.merges).toEqual([]);
+
+   mr.ci = GREEN;
+   expect(await r.desk(gh.port)).toMatchObject({ merged: ["96"], resumed: ["96"], parked: [], errors: [] });
+   expect(gh.merges).toEqual([{ n: 9, sha: REBASED, title: "GitHub branch update (node #96)" }]);
+   expect(gh.rebasedFrom).toEqual([GATED]);
+   expect(r.row()).toMatchObject({ status: "running", phase: "close" });
+  } finally { r.close(); }
+ });
+
+ test("an unconfirmed update parks without attributing a head move or merging", async () => {
+  const r = rig({ repo });
+  try {
+   const gh = forge(behind({ rebase: { status: "unconfirmed", reason: "Expected head sha didn't match current head sha" } }));
+   expect(await r.desk(gh.port)).toMatchObject({ parked: ["96"], merged: [] });
+   expect(r.events("rebased")).toEqual([]);
+   expect(r.row()?.outcome).toContain("Expected head sha didn't match current head sha");
+   expect(gh.merges).toEqual([]);
+  } finally { r.close(); }
+ });
+
+ for (const bound of ["requests", "passes"] as const) {
+  test(`pending updates park at the existing ${bound} cap`, async () => {
+   const r = rig({ repo });
+   try {
+    const mr = behind({ rebase: { status: "pending", requested: true, reason: "GitHub is still updating PR #9 after 2 checks" } });
+    const gh = forge(mr);
+    const limit = bound === "requests" ? 3 : 10;
+    for (let pass = 0; pass < limit; pass++) {
+     if (bound === "passes" && pass > 0) mr.rebase = { status: "pending", requested: false, reason: "waiting on the update" };
+     expect(await r.desk(gh.port)).toMatchObject({ pending: ["96"], parked: [], merged: [] });
+    }
+    expect(await r.desk(gh.port)).toMatchObject({ parked: ["96"], pending: [], merged: [] });
+    expect(gh.rebasedFrom).toHaveLength(limit);
+    expect(gh.merges).toEqual([]);
+    expect(r.row()?.outcome).toContain(`over ${limit} pass(es)`);
+   } finally { r.close(); }
+  });
+ }
+
+ test("a clean PR merges directly without requesting a branch update", async () => {
+  const r = rig({ repo });
+  try {
+   const gh = forge(behind({ mergeState: githubMergeState(true, "clean") }));
+   expect(await r.desk(gh.port)).toMatchObject({ merged: ["96"], parked: [], errors: [] });
+   expect(gh.rebasedFrom).toEqual([]);
+   expect(gh.merges).toEqual([{ n: 9, sha: GATED, title: "GitHub branch update (node #96)" }]);
+  } finally { r.close(); }
+ });
+
+ for (const ci of [RUNNING, { state: "red", reason: "CI failed" }] as CiVerdict[]) {
+  test(`a behind PR with ${ci.state} CI is not updated or merged`, async () => {
+   const r = rig({ repo });
+   try {
+    const gh = forge(behind({ ci }));
+    await r.desk(gh.port);
+    expect(gh.rebasedFrom).toEqual([]);
+    expect(gh.merges).toEqual([]);
+   } finally { r.close(); }
+  });
+ }
 });
 
 /** One MR's live state, which a test script advances between desk passes. */
@@ -84,13 +181,13 @@ function needsRebase(over: Partial<Mr> = {}): Mr {
  };
 }
 
-function rig(opts: { autoMerge?: boolean } = {}) {
+function rig(opts: { autoMerge?: boolean; repo?: string } = {}) {
  const dir = mkdtempSync(join(tmpdir(), "ranger-gitlab-desk-"));
  const configPath = join(dir, "ranger.yaml");
  writeFileSync(configPath, stringify({
   version: 1,
   maps: [{
-   repo: REPO, root: 12, walk: "full", autoMerge: opts.autoMerge ?? true,
+   repo: opts.repo ?? REPO, root: 12, walk: "full", autoMerge: opts.autoMerge ?? true,
    commands: { test: "bun test" },
    discord: { tokenEnv: "RANGER_DISCORD_TOKEN", channelId: "1234567890" },
   }],
@@ -452,7 +549,7 @@ describe("node #126 — gitlab-rebase-squash-merge: the merge desk on a GitLab m
     expect(gl.calls).not.toContain("rebasePr");
     expect(gl.calls).not.toContain("mergePr");
     expect(r.posts.at(-1)).toContain("Labelled `ranger:needs-eye`");
-    if (head === "needs-rebase") expect(r.posts.at(-1)).toContain("rebase the MR onto `main`");
+    if (head === "needs-rebase") expect(r.posts.at(-1)).toContain("update MR !9 onto `main`");
    } finally { r.close(); }
   });
  }

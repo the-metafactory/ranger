@@ -21,13 +21,16 @@ const PR: ChangeRequest = {
 };
 
 describe("GitHub merge-state normalisation", () => {
- for (const state of ["clean", "blocked", "unstable", "behind", "draft", "has_hooks"]) {
+ for (const state of ["clean", "blocked", "unstable", "draft", "has_hooks"]) {
   test(`${state} preserves the existing mergeability mapping`, () => {
    expect(githubMergeState(true, state)).toBe("mergeable");
    expect(githubMergeState(false, state)).toBe("conflict");
    expect(githubMergeState(null, state)).toBe("pending");
   });
  }
+ test("behind requires an update regardless of the mergeable flag", () => {
+  for (const mergeable of [true, false, null]) expect(githubMergeState(mergeable, "behind")).toBe("needs-rebase");
+ });
  test("dirty always conflicts; unknown or null means still computing", () => {
   expect(githubMergeState(null, "dirty")).toBe("conflict");
   expect(githubMergeState(true, "dirty")).toBe("conflict");

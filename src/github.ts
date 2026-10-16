@@ -1,4 +1,4 @@
-import type { ChangeRequest, MergeState, MergeOutcome, CiFailedRun, CiPurpose, CiVerdict, CommentReaction, IssueComment, LabeledIssue } from "./forge.ts";
+import type { ChangeRequest, MergeState, MergeOutcome, RebaseOutcome, CiFailedRun, CiPurpose, CiVerdict, CommentReaction, IssueComment, LabeledIssue } from "./forge.ts";
 import { githubCiVerdict } from "./github-ci.ts";
 import { runCmd } from "./exec.ts";
 import { runReadRetryingTransient } from "./transient.ts";
@@ -250,6 +250,67 @@ export async function mergePr(
  return { status: "merged" };
 }
 
+/** The same bounded wait shape as the GitLab port; injectable for port tests. */
+export interface UpdateBranchWait {
+ polls: number;
+ intervalMs: number;
+ sleep: (ms: number) => Promise<void>;
+}
+const UPDATE_BRANCH_WAIT: UpdateBranchWait = { polls: 2, intervalMs: 1_500, sleep: (ms) => new Promise((r) => setTimeout(r, ms)) };
+
+/**
+ * Merge the base into a behind PR, pinned to the gated head. Never merges the
+ * PR itself. Attribute a moved head only to a two-parent merge of that head
+ * with a commit reachable from the base; any other push fails closed.
+ */
+export async function rebasePr(
+ repo: string,
+ number: number,
+ sha: string,
+ token: string,
+ wait: UpdateBranchWait = UPDATE_BRANCH_WAIT,
+): Promise<RebaseOutcome> {
+ const before = await getPr(repo, number, token);
+ if (before.headSha !== sha) {
+  return { status: "unconfirmed", reason: `the head of PR #${number} moved from ${sha.slice(0, 8)} to ${before.headSha.slice(0, 8)} before ranger asked for a branch update` };
+ }
+ const gated = writeEnv(token);
+ let response;
+ try {
+  response = await runCmd("gh", ["api", `repos/${repo}/pulls/${number}/update-branch`, "--method", "PUT", "-f", `expected_head_sha=${sha}`, "--include"], { env: gated.env, timeoutMs: GH_TIMEOUT_MS });
+ } finally {
+  gated.cleanup();
+ }
+ const http = /^HTTP\/\S+ (\d{3})[^\r\n]*[\s\S]*?\r?\n\r?\n([\s\S]*)$/.exec(response.stdout);
+ const status = Number(http?.[1]);
+ if (status === 422) {
+  let message = "GitHub declined the branch update (HTTP 422)";
+  try {
+   const body = JSON.parse(http?.[2] ?? "") as { message?: unknown };
+   if (typeof body.message === "string") message = body.message.slice(0, 400);
+  } catch { return { status: "unconfirmed", reason: message }; }
+  return { status: "unconfirmed", reason: message };
+ }
+ if (response.code !== 0 || status !== 202) {
+  throw new GitHubError(`update PR #${number} branch failed (expected HTTP 202, got ${status || "no status"}, exit ${response.code}): ${(response.stderr || response.stdout).trim().slice(0, 400)}`);
+ }
+ for (let poll = 0; poll < wait.polls; poll++) {
+  await wait.sleep(wait.intervalMs);
+  const after = await getPr(repo, number, token);
+  if (after.headSha === sha) continue;
+  const unconfirmed: RebaseOutcome = { status: "unconfirmed", reason: `the head of PR #${number} moved from ${sha.slice(0, 8)} to ${after.headSha.slice(0, 8)}, but GitHub does not confirm a merge of the gated head with the base: not counted as the branch update` };
+  if (after.baseRef !== before.baseRef || !after.headSha || !before.baseRef) return unconfirmed;
+  const commit = await ghApi(token, [`repos/${repo}/commits/${encodeURIComponent(after.headSha)}`], `read updated PR #${number} commit`) as { sha?: unknown; parents?: { sha?: unknown }[] } | null;
+  if (commit?.sha !== after.headSha || !Array.isArray(commit.parents) || commit.parents.length !== 2 || commit.parents[0]?.sha !== sha) return unconfirmed;
+  const parent = commit.parents[1]?.sha;
+  if (typeof parent !== "string" || parent.length === 0) return unconfirmed;
+  const comparison = await ghApi(token, [`repos/${repo}/compare/${encodeURIComponent(before.baseRef)}...${encodeURIComponent(parent)}`], `check updated PR #${number} base parent`) as { status?: unknown } | null;
+  if (comparison?.status !== "identical" && comparison?.status !== "behind") return unconfirmed;
+  return { status: "head-moved", headSha: after.headSha, requested: true };
+ }
+ return { status: "pending", reason: `GitHub is still updating PR #${number} after ${wait.polls} checks`, requested: true };
+}
+
 export async function issueLabels(
  repo: string,
  number: number,
@@ -433,6 +494,7 @@ export async function issuesWithLabel(
 
 /** Existing GitHub gate semantics: named non-conflict states were allowed. */
 export function githubMergeState(mergeable: unknown, state: unknown): MergeState {
+ if (state === "behind") return "needs-rebase";
  if (mergeable === false || state === "dirty") return "conflict";
  // New API states must never silently become mergeable, even while computing.
  if (!["clean", "blocked", "unstable", "behind", "draft", "unknown", "has_hooks"].includes(String(state ?? "unknown"))) return "unknown";

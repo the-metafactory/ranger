@@ -130,9 +130,9 @@ export type MergeOutcome =
  */
 export type RebaseOutcome =
  /**
-  * The head moved from the gated SHA to `headSha`, and the forge shows the
-  * same commits there (message, author, author date, in order): a rebase,
-  * not new work.
+  * The head moved from the gated SHA to `headSha`, and the adapter confirms
+  * the update: GitLab lists the same authored commits; GitHub shows a
+  * two-parent merge of the gated head with a commit reachable from the base.
   */
  | { status: "head-moved"; headSha: string; requested: boolean }
  /**
@@ -159,9 +159,9 @@ export interface ForgePort<ReadCredential = string, WriteCredential = string> ex
   */
  mergePr(repo: string, n: number, sha: string, title: string, token: WriteCredential): Promise<MergeOutcome>;
  /**
-  * Rebase the source branch onto its target, for a forge that reports
-  * `needs-rebase` (GitLab under `rebase_merge`), from `sha`, the head the
-  * merge gate passed at. GitHub never reports it.
+  * Update the source branch onto its target, for a forge that reports
+  * `needs-rebase` (GitLab under `rebase_merge`, GitHub when `behind`), from
+  * `sha`, the head the merge gate passed at. GitHub merges the base in.
   */
  rebasePr?(repo: string, n: number, sha: string, token: WriteCredential): Promise<RebaseOutcome>;
  /** Why this forge project cannot take a squash merge, or null when it can. Read before any merge write. */
