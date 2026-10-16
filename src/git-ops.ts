@@ -114,7 +114,7 @@ const NO_SUBMODULE_RECURSION = [
  */
 export async function safeGit(
  args: string[],
- opts: { cwd: string; credential?: GitCredential; canonical?: string; timeoutMs?: number },
+ opts: { cwd: string; credential?: GitCredential; canonical?: string; timeoutMs?: number; stdin?: string },
 ): Promise<RunResult> {
  if (opts.credential !== undefined) {
   assertCredential(opts.credential, `\`git ${args[0]}\``);
@@ -138,6 +138,7 @@ export async function safeGit(
    cwd: opts.cwd,
    env: opts.credential === undefined ? base : gitAuthEnv(opts.credential, base),
    timeoutMs: opts.timeoutMs ?? 60_000,
+   stdin: opts.stdin,
   },
  );
 }
@@ -1078,4 +1079,50 @@ export async function isAncestor(cwd: string, ancestor: string, descendant: stri
  if (r.code === 0) return true;
  if (r.code === 1) return false;
  throw new GitSafetyError(`cannot compare ${ancestor.slice(0, 8)} with ${descendant.slice(0, 8)}: ${r.stderr.trim()}`);
+}
+
+const SHA_RE = /^[0-9a-f]{7,64}$/;
+
+/**
+ * Prove an unchanged PR patch across base-only merges on the first-parent
+ * chain. Any unreadable history, failed command or changed patch refuses
+ * the carry; the caller runs a fresh review instead.
+ */
+export async function baseOnlyMergePatchId(cwd: string, base: string, reviewed: string, head: string): Promise<{ patchId: string } | { refused: string }> {
+ try {
+  if (reviewed === head || !SHA_RE.test(reviewed) || !SHA_RE.test(head)) return { refused: "invalid or identical review heads" };
+  const git = async (args: string[], stdin?: string): Promise<string> => {
+   const result = await safeGit(args, { cwd, stdin, timeoutMs: 30_000 });
+   if (result.code !== 0) throw new GitSafetyError(`git ${args[0]} failed (${result.code}): ${result.stderr.trim()}`);
+   return result.stdout;
+  };
+  const baseSha = (await git(["rev-parse", "--verify", `refs/remotes/origin/${base}^{commit}`])).trim();
+  let at = head;
+  while (at !== reviewed) {
+   const parents = (await git(["rev-list", "--parents", "-n", "1", at])).trim().split(/\s+/);
+   if (parents[0] !== at || parents.length < 3) return { refused: "first-parent chain contains a non-merge commit or does not reach the reviewed head" };
+   for (const parent of parents.slice(2)) {
+    if (!(await isAncestor(cwd, parent, baseSha))) return { refused: "merge parent is not reachable from the base" };
+   }
+   at = parents[1];
+  }
+  const patchIds = async (sha: string) => {
+   const mergeBase = (await git(["merge-base", baseSha, sha])).trim();
+   const diff = await git(["diff", "--no-ext-diff", "--no-textconv", mergeBase, sha, "--"]);
+   const id = async (mode: "--stable" | "--verbatim") => {
+    const output = await git(["patch-id", mode], diff);
+    const value = /^([0-9a-f]{40,64})\s+[0-9a-f]{40,64}$/.exec(output.trim())?.[1];
+    if (value === undefined) throw new GitSafetyError(`git patch-id ${mode} returned no valid patch-id`);
+    return value;
+   };
+   return { stable: await id("--stable"), verbatim: await id("--verbatim") };
+  };
+  const before = await patchIds(reviewed);
+  const after = await patchIds(head);
+  if (before.stable !== after.stable) return { refused: "stable patch-id changed" };
+  if (before.verbatim !== after.verbatim) return { refused: "whitespace-sensitive patch-id changed" };
+  return { patchId: before.stable };
+ } catch (error) {
+  return { refused: error instanceof Error ? error.message : String(error) };
+ }
 }

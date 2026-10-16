@@ -1,5 +1,6 @@
 import { createShadowTestBackend, type ShadowComparison } from "../src/remote-test/shadow.ts";
 import { githubCiVerdict } from "../src/github-ci.ts";
+import { evaluateMergeGate } from "../src/merge-gate.ts";
 import type { CiFailedRun, CiPurpose, MergeState } from "../src/forge.ts";
 import { afterEach, beforeEach, describe, expect, spyOn } from "bun:test";
 import { test } from "./partition.ts";
@@ -564,6 +565,147 @@ describe("implement lane (node #23)", () => {
   }
   Object.assign(process.env, savedEnv);
  });
+
+ const fixtureGit = async (cwd: string, args: string[]) => {
+  const result = await runCmd("git", args, { cwd, env: { ...process.env, ...GIT_ENV } });
+  expect(result.code, `git ${args.join(" ")}: ${result.stderr}`).toBe(0);
+  return result.stdout.trim();
+ };
+ const mergeUpdatedBase = async (r: Rig, name: string, patch: Record<string, string> = {}) => {
+  const seed = join(r.dir, "seed");
+  await fixtureGit(seed, ["pull", "-q", r.origin, "main"]);
+  writeFileSync(join(seed, `${name}.md`), `${name}\n`);
+  await fixtureGit(seed, ["add", "-A"]);
+  await fixtureGit(seed, ["commit", "-m", `base ${name}`]);
+  await fixtureGit(seed, ["push", r.origin, "HEAD:main"]);
+  const wt = join(r.canonical, ".worktrees", "node-20");
+  await fixtureGit(wt, ["fetch", "origin", "main"]);
+  await fixtureGit(wt, ["merge", "--no-ff", "--no-commit", "origin/main"]);
+  for (const [path, content] of Object.entries(patch)) writeFileSync(join(wt, path), content);
+  await fixtureGit(wt, ["add", "-A"]);
+  await fixtureGit(wt, ["commit", "--no-edit"]);
+  await fixtureGit(wt, ["push", "origin", "HEAD"]);
+  return fixtureGit(wt, ["rev-parse", "HEAD"]);
+ };
+ const resumeReview = async (r: Rig) => {
+  r.journal.updateWorker("20", "acme/widgets", { status: "claimed", phase: "review" });
+  return runNode("20", r.ctx);
+ };
+
+ test("node #320: clean review carries at the cap, reruns probes on the new head, and leaves CI gating", async () => {
+  const r = await rig({ probe: "fake-probe ok {node}" }); cleanup.push(r.dir);
+  r.ctx.config.workers.reviewRounds = 1;
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  const before = await r.github.sha("node/20-add-the-feature-module");
+  const after = await mergeUpdatedBase(r, "base-update");
+  const ciReads: string[] = [];
+  const ci = r.github.ciVerdictFor.bind(r.github);
+  r.github.ciVerdictFor = (...args) => { ciReads.push(args[1]); return ci(...args); };
+  expect((await resumeReview(r)).status).toBe("awaiting-merge");
+  expect(r.calls).toHaveLength(1);
+  const comments = r.github.comments.get(1) ?? [];
+  expect(recordedReviews(comments, BOT).map(r => [r.round, r.sha, r.carried])).toEqual([[1, before, undefined], [1, after, before]]);
+  expect(comments.some(c => c.body.includes(`sha=${after}`) && c.body.includes("ranger:probes") && c.body.includes("result=pass"))).toBe(true);
+  expect(ciReads).toContain(after);
+  expect(r.journal.getWorker("20", "acme/widgets")).toMatchObject({ reviewRound: 1, verdictSha: after });
+  const events = r.journal.listNodeEvents("acme/widgets", "20").filter(e => e.kind === "review-carried");
+  expect(events).toHaveLength(1);
+  expect(events[0]?.detail).toMatch(new RegExp(`from ${before} to ${after}; patch-id [0-9a-f]{40}`));
+  const gate = { pr: await r.github.getPr("acme/widgets", 1), expectedBase: "main", verdictSha: after, verdictBlockers: 0, verdictMajors: 0, probesRequired: true };
+  expect(evaluateMergeGate({ ...gate, ci: githubCiVerdict("acme/widgets", []), probePassedSha: after })).toMatchObject({ status: "pending", check: "ci-green" });
+  expect(evaluateMergeGate({ ...gate, ci: await ci("acme/widgets", after, "token"), probePassedSha: before })).toMatchObject({ status: "fail", check: "probes" });
+  expect((await resumeReview(r)).status).toBe("awaiting-merge");
+  expect(recordedReviews(r.github.comments.get(1) ?? [], BOT)).toHaveLength(2);
+ }, 60_000);
+
+ test("node #320: multiple base merges carry the same round, then a normal commit runs round two", async () => {
+  const r = await rig({}); cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  await mergeUpdatedBase(r, "first");
+  const second = await mergeUpdatedBase(r, "second");
+  expect((await resumeReview(r)).status).toBe("awaiting-merge");
+  const third = await mergeUpdatedBase(r, "third");
+  expect((await resumeReview(r)).status).toBe("awaiting-merge");
+  expect(r.calls).toHaveLength(1);
+  expect(recordedReviews(r.github.comments.get(1) ?? [], BOT).at(-1)).toMatchObject({ round: 1, sha: third, carried: second });
+  const wt = join(r.canonical, ".worktrees", "node-20");
+  await fixtureGit(wt, ["commit", "--allow-empty", "-m", "ordinary branch commit"]);
+  await fixtureGit(wt, ["push", "origin", "HEAD"]);
+  expect((await resumeReview(r)).status).toBe("awaiting-merge");
+  expect(r.calls).toHaveLength(2);
+  expect(recordedReviews(r.github.comments.get(1) ?? [], BOT).map(r => r.round)).toEqual([1, 1, 1, 2]);
+ }, 60_000);
+
+ const whitespaceEdits: Record<string, Record<string, string>> = {
+  "changed indentation": { "src/feature.ts": " export const feature = () => 1;\n" },
+  "changed string whitespace": { "tests/feature.test.ts": "import { feature } from '../ src/feature.ts';\n" },
+ };
+ for (const [reason, patch] of Object.entries(whitespaceEdits)) {
+  test(`node #320: ${reason} in a base merge forces fresh review even with equal stable patch-ids`, async () => {
+   const r = await rig({}); cleanup.push(r.dir);
+   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+   const before = await r.github.sha("node/20-add-the-feature-module");
+   const after = await mergeUpdatedBase(r, "whitespace-base", patch);
+   const wt = join(r.canonical, ".worktrees", "node-20");
+   const stableId = async (sha: string) => {
+    const base = await fixtureGit(wt, ["merge-base", "origin/main", sha]);
+    const diff = await runCmd("git", ["diff", base, sha], { cwd: wt, env: { ...process.env, ...GIT_ENV } });
+    expect(diff.code).toBe(0);
+    const id = await runCmd("git", ["patch-id", "--stable"], { cwd: wt, stdin: diff.stdout, env: { ...process.env, ...GIT_ENV } });
+    expect(id.code).toBe(0);
+    return id.stdout;
+   };
+   expect(await stableId(before)).toBe(await stableId(after));
+   expect((await resumeReview(r)).status).toBe("awaiting-merge");
+   expect(r.calls).toHaveLength(2);
+   expect(r.journal.listNodeEvents("acme/widgets", "20").filter(e => e.kind === "review-carried")).toEqual([]);
+  }, 60_000);
+ }
+
+ const failCarryGit = async (r: Rig, fail: string) => {
+  const wrapper = join(r.dir, "git-failure"); mkdirSync(wrapper);
+  const realGit = (await runCmd("which", ["git"])).stdout.trim();
+  writeFileSync(join(wrapper, "git"), `#!/bin/sh\n${fail}\nexec "${realGit}" "$@"\n`, { mode: 0o755 });
+  process.env.PATH = `${wrapper}:${process.env.PATH}`;
+ };
+ const carryRefusals: Record<string, { patch?: Record<string, string>; prepare?: (r: Rig, wt: string, before: string) => Promise<void>; detail?: string }> = {
+  "changed patch": { patch: { "src/feature.ts": "export const feature = () => 42;\n" }, detail: "stable patch-id changed" },
+  blocker: { prepare: async (r, _wt, before) => {
+   await r.github.postComment("acme/widgets", 1, reviewMarker(1, { commitId: before, blockers: 1, majors: 0, nits: 0 }));
+  } },
+  major: { prepare: async (r, _wt, before) => {
+   await r.github.postComment("acme/widgets", 1, reviewMarker(1, { commitId: before, blockers: 0, majors: 1, nits: 0 }));
+  } },
+  "foreign marker": { prepare: async r => {
+   const original = r.github.comments.get(1)!.find(c => c.body.startsWith("<!-- ranger:review"))!;
+   original.author = "mallory";
+  } },
+  "failed diff": { prepare: async r => failCarryGit(r, 'for arg do\n if [ "$arg" = diff ]; then exit 1; fi\ndone'), detail: "git diff failed" },
+  "unreadable merge base": { prepare: async r => failCarryGit(r, 'seen=0\nfor arg do\n if [ "$seen" = 1 ]; then\n  if [ "$arg" != --is-ancestor ]; then exit 1; fi\n  break\n fi\n if [ "$arg" = merge-base ]; then seen=1; fi\ndone'), detail: "git merge-base failed" },
+  "failed verbatim patch-id": { prepare: async r => failCarryGit(r, 'for arg do\n if [ "$arg" = --verbatim ]; then exit 1; fi\ndone'), detail: "git patch-id failed" },
+  "unreadable verbatim patch-id": { prepare: async r => failCarryGit(r, 'for arg do\n if [ "$arg" = --verbatim ]; then echo invalid; exit 0; fi\ndone'), detail: "git patch-id --verbatim returned no valid patch-id" },
+  "foreign merge": { prepare: async (r, wt, before) => {
+   await fixtureGit(wt, ["checkout", "-b", "foreign", before]);
+   await fixtureGit(wt, ["commit", "--allow-empty", "-m", "foreign commit"]);
+   await fixtureGit(wt, ["checkout", "node/20-add-the-feature-module"]);
+   await fixtureGit(wt, ["merge", "--no-ff", "--no-edit", "foreign"]);
+   await fixtureGit(wt, ["push", "origin", "HEAD"]);
+  }, detail: "merge parent is not reachable from the base" },
+ };
+ for (const [reason, setup] of Object.entries(carryRefusals)) {
+  test(`node #320: ${reason} runs a fresh review instead of carrying`, async () => {
+   const r = await rig({}); cleanup.push(r.dir);
+   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+   const before = await r.github.sha("node/20-add-the-feature-module");
+   await mergeUpdatedBase(r, "next-base", setup.patch);
+   const wt = join(r.canonical, ".worktrees", "node-20");
+   await setup.prepare?.(r, wt, before);
+   expect((await resumeReview(r)).status).toBe("awaiting-merge");
+   expect(r.calls).toHaveLength(2);
+   expect(r.journal.listNodeEvents("acme/widgets", "20").filter(e => e.kind === "review-carried")).toEqual([]);
+   if (setup.detail !== undefined) expect(r.journal.listNodeEvents("acme/widgets", "20").some(e => e.detail?.includes(setup.detail!))).toBe(true);
+  }, 60_000);
+ }
 
  test("the worker session and the test command get one per-session temp journal, never the live one (node #66)", async () => {
   const r = await rig({});
@@ -2424,7 +2566,9 @@ describe("implement lane (node #23)", () => {
   expect((await runCmd("git", ["merge-base", "--is-ancestor", "main", await c.r.github.sha(BRANCH)], { cwd: c.r.origin })).code).toBe(0);
   expect(c.markers()).toEqual([]);
   expect(c.prompts.some((p) => p.includes("## CI fix pass"))).toBe(false);
-  expect(c.r.calls).toHaveLength(2);
+  expect(c.r.calls).toHaveLength(1);
+  expect(recordedReviews(c.r.github.comments.get(1) ?? [], BOT).map(r => r.round)).toEqual([1, 1]);
+  expect(c.r.journal.listNodeEvents("acme/widgets", "20").some(e => e.kind === "review-carried")).toBe(true);
  }, 60_000);
 
  test("a CI fix pass that finds nothing goes ready; the desk parks it on CI, and a green rerun moves it on", async () => {
@@ -3559,7 +3703,7 @@ describe("implement lane (node #23)", () => {
    const head = await r.github.sha("node/20-add-the-feature-module");
    // Round 2 stands in for a rerun posted under the machine account: the
    // loop never reviews a head that already has a review.
-   await r.github.postComment("acme/widgets", 1, `${reviewMarker(2, { verdict: "commented", summary: "", commitId: head, blockers: 0, majors, nits: 0, body: "" })}\nround two`);
+   await r.github.postComment("acme/widgets", 1, `${reviewMarker(2, { commitId: head, blockers: 0, majors, nits: 0 })}\nround two`);
 
    r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
    const outcome = await runNode("20", r.ctx);

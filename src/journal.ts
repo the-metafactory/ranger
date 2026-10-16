@@ -302,6 +302,7 @@ export type EventKind =
  | "pr-opened"
  | "ci-passed"
  | "reviewed"
+ | "review-carried"
  | "awaiting-merge"
  | "proposed"
  /** Ratify phase (node #250): a proposal bound from the node's comments, one not found, one ratified. */
