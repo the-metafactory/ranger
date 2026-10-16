@@ -21,7 +21,7 @@ import { loadConfig, principalLoginForRepo } from "../src/config.ts";
 import { runCmd } from "../src/exec.ts";
 import type { IssueComment, ChangeRequest } from "../src/forge.ts";
 import type { CheckRun } from "../src/github.ts";
-import { baseMergeMarker, bunTestChain, coverageInPlay, failedTests, failuresAllNamed, failuresNotAtBase, testsReceipt, recordedBaseMerges, recordedReviews, reviewMarker, type ForgePort } from "../src/implement.ts";
+import { BASE_RERUNS, baseMergeMarker, bunTestChain, coverageInPlay, failedTests, failuresAllNamed, failuresNotAtBase, mostFailing, testsReceipt, recordedBaseMerges, recordedReviews, reviewMarker, type ForgePort } from "../src/implement.ts";
 import { Database } from "bun:sqlite";
 import { openJournal, type Journal } from "../src/journal.ts";
 import { ReviewError, type ReviewVerdict } from "../src/review.ts";
@@ -2642,7 +2642,8 @@ describe("implement lane (node #23)", () => {
   }
   /**
    * The map's test command is `bun test` (and `after`, when given); its
-   * `bun test` step runs `body` from a script outside the repository instead.
+   * `bun test` step runs `body` from a script outside the repository instead,
+   * with the step's arguments (a merge-base rerun's files) as its own.
    * Every repo command is recorded with its directory, as the map spells it.
    */
   async function bunRig(body: string, opts: { after?: string; install?: string } = {}): Promise<Rig & { calls: { command: string; cwd: string }[] }> {
@@ -2653,7 +2654,13 @@ describe("implement lane (node #23)", () => {
    const calls: { command: string; cwd: string }[] = [];
    r.ctx.shellRun = (command, o) => {
     calls.push({ command, cwd: o.cwd ?? "" });
-    const run = command.split("&&").map((s) => (s.trim() === "bun test" ? ` sh '${script}' ` : s)).join("&&");
+    const run = command
+     .split("&&")
+     .map((s) => {
+      const bun = /^bun test((?: \S+)*)$/.exec(s.trim());
+      return bun === null ? s : ` sh '${script}'${bun[1]} `;
+     })
+     .join("&&");
     return runCmd("/bin/sh", ["-c", run], o);
    };
    return { ...r, calls };
@@ -2740,8 +2747,65 @@ describe("implement lane (node #23)", () => {
    expect(outcome.detail).toContain("failing: shared; branch only:");
    const sha = await mergeBase(r);
    expect(reviewed(r).some((d) => d.endsWith(`at the merge base ${sha} fails another set (exit 1) — not red there, they gate: branch only`))).toBe(true);
+   expect(reviewed(r)).toContain(`tests (bun test) at the merge base ${sha} fail another set; no rerun there: branch only name(s) no test file a rerun can select`);
+   expect(baseRuns(r.calls)).toHaveLength(1);
    expect(r.github.prs.size).toBe(0);
   }, 60_000);
+
+  const baseFailingDebounceOnRerunWhen = (catches: string) => [
+   "if [ -f src/feature.ts ]; then printf '\\ntest/a.test.ts:\\n(fail) watcher > debounce\\n\\ntest/b.test.ts:\\n(fail) sandbox > denies\\n\\n 2 fail\\n' >&2; exit 1; fi",
+   "if [ $# -eq 0 ]; then printf '\\ntest/a.test.ts:\\n(fail) watcher > reconcile\\n\\ntest/b.test.ts:\\n(fail) sandbox > denies\\n\\n 2 fail\\n' >&2; exit 1; fi",
+   "d=$(dirname \"$0\"); n=$(($(cat \"$d/reruns\" 2>/dev/null || echo 0) + 1)); echo $n > \"$d/reruns\"",
+   `if ${catches}; then printf '\\ntest/a.test.ts:\\n(fail) watcher > debounce\\n\\n 1 fail\\n' >&2; exit 1; fi`,
+   "echo ' 0 fail'; exit 0",
+  ].join("\n");
+
+  test("a flaky red base reruns only the files of the failures it did not share: one it fails on a rerun is the base's", async () => {
+   const r = await bunRig(baseFailingDebounceOnRerunWhen("[ $n -ge 2 ]"));
+   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+   const sha = await mergeBase(r);
+   expect(baseRuns(r.calls).map((c) => c.command)).toEqual(["bun test", "bun test ./test/a.test.ts", "bun test ./test/a.test.ts"]);
+   const events = reviewed(r);
+   expect(events).toContain(`tests (bun test) rerun 1 of ${BASE_RERUNS} at the merge base ${sha} (bun test ./test/a.test.ts) exit 0: still not red there: test/a.test.ts: watcher > debounce`);
+   expect(events).toContain(`tests (bun test) rerun 2 of ${BASE_RERUNS} at the merge base ${sha} (bun test ./test/a.test.ts) exit 1: every branch failure is red there now`);
+   expect(events).toContain(`tests (bun test) at the merge base ${sha}, failing the same way (counting 2 rerun(s) of their files there): red on the merge base too, not gating: test/a.test.ts: watcher > debounce; test/b.test.ts: sandbox > denies`);
+  }, 60_000);
+
+  test(`a failure a red base does not fail in ${BASE_RERUNS} reruns of its file gates`, async () => {
+   const r = await bunRig(baseFailingDebounceOnRerunWhen("false"));
+   expect((await runNode("20", r.ctx)).status).toBe("failed");
+   const sha = await mergeBase(r);
+   expect(baseRuns(r.calls)).toHaveLength(1 + BASE_RERUNS);
+   expect(reviewed(r).filter((d) => d.includes(`at the merge base ${sha} (bun test ./test/a.test.ts) exit 0: still not red there: test/a.test.ts: watcher > debounce`))).toHaveLength(BASE_RERUNS);
+   expect(reviewed(r).some((d) => d.endsWith(`at the merge base ${sha} fails another set (exit 1) — not red there, they gate: test/a.test.ts: watcher > debounce`))).toBe(true);
+   expect(reviewed(r).some((d) => d.includes("red on the merge base too"))).toBe(false);
+   expect(r.github.prs.size).toBe(0);
+  }, 60_000);
+
+  test("a green base reruns nothing: a failure only the branch has gates", async () => {
+   const r = await bunRig("if [ -f src/feature.ts ]; then printf '\\ntest/a.test.ts:\\n(fail) watcher > debounce\\n\\n 1 fail\\n' >&2; exit 1; fi; echo ' 0 fail'");
+   expect((await runNode("20", r.ctx)).status).toBe("failed");
+   expect(baseRuns(r.calls)).toHaveLength(1);
+   expect(reviewed(r).some((d) => d.endsWith("passes — not red there, they gate: test/a.test.ts: watcher > debounce"))).toBe(true);
+   expect(reviewed(r).some((d) => d.includes(" rerun "))).toBe(false);
+  }, 60_000);
+
+  test("a failure whose file leaves the checkout gets no rerun at the base", async () => {
+   const r = await bunRig("if [ -f src/feature.ts ]; then printf '\\n../x.test.ts:\\n(fail) escapes\\n\\n 1 fail\\n' >&2; else printf '\\ntest/a.test.ts:\\n(fail) other\\n\\n 1 fail\\n' >&2; fi; exit 1");
+   expect((await runNode("20", r.ctx)).status).toBe("failed");
+   const sha = await mergeBase(r);
+   expect(baseRuns(r.calls)).toHaveLength(1);
+   expect(reviewed(r)).toContain(`tests (bun test) at the merge base ${sha} fail another set; no rerun there: ../x.test.ts: escapes name(s) no test file a rerun can select`);
+  }, 60_000);
+
+  test("runs at one merge base merge to each failure's most frequent count, never a sum", () => {
+   const a = { file: "test/a.test.ts", name: "flaky", cause: "" };
+   const b = { file: "test/b.test.ts", name: "other", cause: "" };
+   const merged = mostFailing([[a, b], [a, a], []]);
+   expect(merged).toEqual([a, a, b]);
+   expect(failuresNotAtBase([a, a, a], merged)).toEqual(["test/a.test.ts: flaky (3 on the branch, 2 at the base)"]);
+   expect(failuresNotAtBase([a, b], merged)).toEqual([]);
+  });
 
   test("the comparison uses every failing name, not the three the journal line keeps", async () => {
    const r = await bunRig("echo \"(fail) one\"; echo \"(fail) two\"; echo \"(fail) three\"; if [ -f src/feature.ts ]; then echo \"(fail) four\"; echo \" 4 fail\"; fi; exit 1");
@@ -2971,9 +3035,9 @@ describe("implement lane (node #23)", () => {
   });
 
   test("bunTestChain splits plain && chains with one bun test step, and nothing else", () => {
-   expect(bunTestChain("bun test")).toEqual({ rest: "" });
-   expect(bunTestChain("bun test && bunx tsc --noEmit")).toEqual({ rest: "bunx tsc --noEmit" });
-   expect(bunTestChain("bun run lint && bun test --timeout 20000 && bun run typecheck")).toEqual({ rest: "bun run lint && bun run typecheck" });
+   expect(bunTestChain("bun test")).toEqual({ bun: "bun test", rest: "" });
+   expect(bunTestChain("bun test && bunx tsc --noEmit")).toEqual({ bun: "bun test", rest: "bunx tsc --noEmit" });
+   expect(bunTestChain("bun run lint && bun test --timeout 20000 && bun run typecheck")).toEqual({ bun: "bun test --timeout 20000", rest: "bun run lint && bun run typecheck" });
    for (const command of ["npm test", "bun run test", "bun test; eslint .", "bun test || true", "bun test | tee log", "bun test && eslint . &", "bun test && echo $(eslint .)", "bun test -t 'a b'", "bun test && bun test", "bun test\neslint .", "bun tester"]) {
     expect(bunTestChain(command)).toBeNull();
    }

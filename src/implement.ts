@@ -2786,15 +2786,9 @@ export function failuresAllNamed(result: RunResult): boolean {
  * TypeError on the branch) is not the base's failure.
  */
 export function failuresNotAtBase(branch: FailedTest[], base: FailedTest[]): string[] {
- const key = (t: FailedTest) => `${testIdentity(t)}\u0000${t.cause}`;
- const count = (tests: FailedTest[]) => {
-  const n = new Map<string, number>();
-  for (const t of tests) n.set(key(t), (n.get(key(t)) ?? 0) + 1);
-  return n;
- };
  const said = (cause: string) => (cause === "" ? "no error line" : `"${cause}"`);
- const there = count(base);
- return [...count(branch)].flatMap(([k, n]) => {
+ const there = failureCounts(base);
+ return [...failureCounts(branch)].flatMap(([k, n]) => {
   const at = there.get(k) ?? 0;
   if (n <= at) return [];
   const [id, cause] = k.split("\u0000");
@@ -2803,6 +2797,49 @@ export function failuresNotAtBase(branch: FailedTest[], base: FailedTest[]): str
   return [n === 1 && at === 0 ? id : `${id} (${n} on the branch, ${at} at the base)`];
  });
 }
+
+function failureKey(t: FailedTest): string {
+ return `${testIdentity(t)}\u0000${t.cause}`;
+}
+
+function failureCounts(tests: FailedTest[]): Map<string, number> {
+ const n = new Map<string, number>();
+ for (const t of tests) n.set(failureKey(t), (n.get(failureKey(t)) ?? 0) + 1);
+ return n;
+}
+
+function testsNotAtBase(branch: FailedTest[], base: FailedTest[]): FailedTest[] {
+ const here = failureCounts(branch);
+ const there = failureCounts(base);
+ const seen = new Set<string>();
+ return branch.filter((t) => {
+  const k = failureKey(t);
+  if (seen.has(k)) return false;
+  seen.add(k);
+  return (here.get(k) ?? 0) > (there.get(k) ?? 0);
+ });
+}
+
+/**
+ * Several runs at one merge base as one: each failure (file, title and
+ * cause) as many times as the run failing it most often has it, so a flaky
+ * base's reruns add the failures they caught, never a count no single run
+ * showed.
+ */
+export function mostFailing(runs: FailedTest[][]): FailedTest[] {
+ const most = new Map<string, FailedTest[]>();
+ for (const run of runs) {
+  const byKey = new Map<string, FailedTest[]>();
+  for (const t of run) byKey.set(failureKey(t), [...(byKey.get(failureKey(t)) ?? []), t]);
+  for (const [k, tests] of byKey) if (tests.length > (most.get(k)?.length ?? 0)) most.set(k, tests);
+ }
+ return [...most.values()].flat();
+}
+
+const RERUNNABLE_FILE = /^[\w@+,%-][\w.@+,%-]*(?:\/[\w@+,%-][\w.@+,%-]*)*$/;
+
+/** How many times a red merge base reruns the files holding the branch failures it did not share. */
+export const BASE_RERUNS = 2;
 
 /**
  * Whether the run reports coverage the way bun enforces a threshold: its
@@ -2820,17 +2857,18 @@ const PLAIN_STEP = /^[\w./@:=+,%-]+(?: +[\w./@:=+,%-]+)*$/;
 
 /**
  * A test command a base-red waiver can split: plain steps joined by `&&`,
- * exactly one of them `bun test`. `rest` is every other step, in order,
- * joined by `&&` ("" when the command is `bun test` alone). Null for any
- * other shape (`;`, `||`, a pipe, quotes, an expansion, two bun steps, a
- * script that runs bun inside): what failed beside bun cannot be told apart.
+ * exactly one of them `bun test`. `bun` is that step, `rest` every other
+ * step, in order, joined by `&&` ("" when the command is `bun test` alone).
+ * Null for any other shape (`;`, `||`, a pipe, quotes, an expansion, two bun
+ * steps, a script that runs bun inside): what failed beside bun cannot be
+ * told apart.
  */
-export function bunTestChain(command: string): { rest: string } | null {
+export function bunTestChain(command: string): { bun: string; rest: string } | null {
  const steps = command.split("&&").map((s) => s.trim());
  if (!steps.every((s) => PLAIN_STEP.test(s))) return null;
  const bun = steps.filter((s) => /^bun test(?: |$)/.test(s));
  if (bun.length !== 1) return null;
- return { rest: steps.filter((s) => s !== bun[0]).join(" && ") };
+ return { bun: bun[0], rest: steps.filter((s) => s !== bun[0]).join(" && ") };
 }
 
 /** One waived supervisor test run: the branch head, its merge base, the base-red tests, and the other steps that passed alone. */
@@ -3021,16 +3059,31 @@ async function baseRedAt(ctx: ImplementContext, run: FailedRun): Promise<{ baseR
  * typecheck failure beside the shared tests (or one the failing bun step
  * kept from running) still gates.
  *
- * "Shares" is what the two runs show: the result is the base's red set when
+ * "Shares" is what the runs show: the result is the base's red set when
  * every `(fail)` line the branch run printed is one there too, by file,
  * title and error and as many times (failuresNotAtBase), the base run exits
  * with the branch run's code, and the other steps pass; null when they gate.
+ *
+ * A red merge base can be flaky (2026-10-16: cortex's base failed a
+ * different subset of its fs.watch tests on every run on this host, so no
+ * branch run ever matched it). When the base run fails another set, its
+ * `bun test` step reruns only the test files holding the branch failures
+ * it has not failed yet (rerunsAtBase), in a fresh clone of the merge base
+ * after the host quiets, up to BASE_RERUNS times or until every branch
+ * failure has been red there. The base's failures are then those of every
+ * run there, each as often as the run failing it most (mostFailing). A
+ * failure with no file header, or a file a rerun could not name safely
+ * (RERUNNABLE_FILE: relative, plain words, no `.`-led segment), gets no
+ * rerun; a rerun that did not run stops the reruns, and one a signal ended
+ * counts for nothing. A base that passes reruns nothing: every failure only
+ * the branch has gates.
+ *
  * A run with coverage in play (coverageInPlay) gets no base run: a missed
  * threshold names no test. A failure that names no test (a
  * typecheck after passing tests, a crash, a timeout, a kill), one a signal
  * ended (exit > 128), or one whose `(fail)` lines do not account for every
  * failure bun reports (failuresAllNamed) gets no base run; a base run a signal
- * ended is no base result. Every outcome of a base run, or why none ran, is a
+ * ended is no base result. Every outcome of a base run or rerun, or why none ran, is a
  * `reviewed` event; the lane records a waived run that goes on to the push
  * for the PR and close receipts (testsReceipt).
  */
@@ -3073,7 +3126,8 @@ async function testsRedAtBase(ctx: ImplementContext, run: FailedRun): Promise<Ba
   event(`tests (${testCommand}) at the merge base ${sha} were ended by a signal (exit ${base.result.code}) — not a base result, the failures gate`);
   return null;
  }
- const unshared = failuresNotAtBase(failed, base.result.code > 0 ? failedTests(base.result) : []);
+ const atBase = base.result.code > 0 ? await rerunsAtBase(ctx, { testCommand, bun: chain.bun, sha, label, event }, failed, failedTests(base.result)) : { red: [], reruns: 0 };
+ const unshared = failuresNotAtBase(failed, atBase.red);
  if (unshared.length > 0) {
   const how = base.result.code === 0 ? "passes" : `fails another set (exit ${base.result.code})`;
   event(`tests (${testCommand}) at the merge base ${sha} ${how} — not red there, they gate: ${unshared.join("; ")}`);
@@ -3095,8 +3149,46 @@ async function testsRedAtBase(ctx: ImplementContext, run: FailedRun): Promise<Ba
   }
  }
  const names = [...new Set(failed.map(testIdentity))];
- event(`tests (${testCommand}) at the merge base ${sha}, failing the same way${chain.rest === "" ? "" : ` (the other steps, ${chain.rest}, pass on their own)`}: red on the merge base too, not gating: ${names.join("; ")}`);
+ const reran = atBase.reruns === 0 ? "" : ` (counting ${atBase.reruns} rerun(s) of their files there)`;
+ event(`tests (${testCommand}) at the merge base ${sha}, failing the same way${reran}${chain.rest === "" ? "" : ` (the other steps, ${chain.rest}, pass on their own)`}: red on the merge base too, not gating: ${names.join("; ")}`);
  return { sha, names, rest: chain.rest };
+}
+
+async function rerunsAtBase(
+ ctx: ImplementContext,
+ run: { testCommand: string; bun: string; sha: string; label: string; event: (detail: string) => void },
+ failed: FailedTest[],
+ first: FailedTest[],
+): Promise<{ red: FailedTest[]; reruns: number }> {
+ const { testCommand, bun, sha, label, event } = run;
+ const runs = [first];
+ let reruns = 0;
+ for (let n = 1; n <= BASE_RERUNS; n++) {
+  const missing = testsNotAtBase(failed, mostFailing(runs));
+  if (missing.length === 0) break;
+  const unnamed = missing.filter((t) => !RERUNNABLE_FILE.test(t.file));
+  if (unnamed.length > 0) {
+   event(`tests (${testCommand}) at the merge base ${sha} fail another set; no rerun there: ${unnamed.map(testIdentity).join("; ")} name(s) no test file a rerun can select`);
+   break;
+  }
+  const command = `${bun} ${[...new Set(missing.map((t) => `./${t.file}`))].join(" ")}`;
+  const what = `tests (${testCommand}) rerun ${n} of ${BASE_RERUNS} at the merge base ${sha} (${command})`;
+  await awaitQuietHost(ctx, `merge-base rerun ${n}`);
+  const rerun = await freshCheckoutTests(ctx, command, sha, `${label}: merge base ${sha.slice(0, 8)} rerun ${n}`, "base");
+  if (!rerun.ran) {
+   event(`${what} did not run: ${rerun.result.stderr.trim().split("\n")[0]} — it counts for nothing`);
+   break;
+  }
+  if (signalExit(rerun.result.code)) {
+   event(`${what} was ended by a signal (exit ${rerun.result.code}) — it counts for nothing`);
+   continue;
+  }
+  reruns++;
+  runs.push(rerun.result.code > 0 ? failedTests(rerun.result) : []);
+  const still = failuresNotAtBase(failed, mostFailing(runs));
+  event(`${what} exit ${rerun.result.code}: ${still.length === 0 ? "every branch failure is red there now" : `still not red there: ${still.join("; ")}`}`);
+ }
+ return { red: mostFailing(runs), reruns };
 }
 
 /**
