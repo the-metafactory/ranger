@@ -278,7 +278,7 @@ describe("scribeAfterMerge: the Scribe's pass before the close", () => {
  let ctx: ImplementContext;
  let fake: ReturnType<typeof fakeGraph>;
  let mergeSha: string;
- const REVIEW: RecordedReview = { round: 2, sha: "c".repeat(40), blockers: 0, majors: 0, nits: 2, body: "### Nit\nrename `x`" };
+ const REVIEW: RecordedReview = { round: 2, sha: "c".repeat(40), blockers: 0, majors: 1, nits: 2, body: "### Major\nguard `x`" };
  const pr = () => ({ iid: 42, webUrl: "https://github.com/acme/widgets/pull/42", mergeCommitSha: mergeSha });
  const events = () => ctx.journal.listEvents(ctx.map.repo, 50).filter((e) => e.kind === "filed").map((e) => e.detail ?? "");
 
@@ -332,9 +332,28 @@ describe("scribeAfterMerge: the Scribe's pass before the close", () => {
  });
 
  test("a clean review and a merge with no marker comments file nothing", async () => {
-  const filings = await scribeAfterMerge(ctx, { ...pr(), mergeCommitSha: null }, { ...REVIEW, nits: 0 });
+  const filings = await scribeAfterMerge(ctx, { ...pr(), mergeCommitSha: null }, { ...REVIEW, majors: 0, nits: 0 });
   expect(filings).toEqual({});
   expect(fake.calls).toEqual([]);
+ });
+
+ test("a nit-only round files nothing: the nits stay on the PR, journalled and named in the receipt", async () => {
+  const nitsOnly = { ...REVIEW, majors: 0, nits: 9 };
+  const filings = await scribeAfterMerge(ctx, { ...pr(), mergeCommitSha: null }, nitsOnly);
+  expect(filings).toEqual({});
+  expect(fake.calls).toEqual([]);
+  expect(events()).toEqual([
+   "left the last review's 9 nit(s) on PR #42 (https://github.com/acme/widgets/pull/42), not filed (nits only)",
+  ]);
+  const receipt = closeResolution(ctx, { ...pr(), headSha: "c".repeat(40), mergedBy: "ivy-agent", state: "merged" } as never, nitsOnly, 2,
+   { state: "green", runId: 1, runUrl: "u", runName: "build", snapshot: "" }, undefined, filings);
+  expect(receipt).toContain("- Unfixed review findings: 0 blocker(s), 0 major(s) and 9 nit(s) from the last sage round stay on the PR (https://github.com/acme/widgets/pull/42); nits are not filed back.");
+ });
+
+ test("a round that left a major files it below the node", async () => {
+  const filings = await scribeAfterMerge(ctx, { ...pr(), mergeCommitSha: null }, { ...REVIEW, nits: 0 });
+  expect(filings).toEqual({ review: { node: "300" } });
+  expect(fake.nodes.get("300")).toMatchObject({ parent: "1", autonomy: "propose" });
  });
 
  test("a failed add is journalled and named, and the pass goes on", async () => {

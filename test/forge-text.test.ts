@@ -127,8 +127,8 @@ function implementTexts(repo: string): Record<string, string> {
  try {
   out.fixNode = fixNodeSpec(implementCtx(r, "auto"), "probe-hud.mjs", ["draws"], HEAD, { number: MR, url: change(repo).webUrl }).body ?? "";
   const ctx = implementCtx(r, "auto");
-  out["close filed"] = closeResolution(ctx, change(repo), REVIEW, 2, greenCi(repo), PROBE, { review: { node: "301" }, landmines: { node: "302", count: 2 } });
-  out["close filing failed"] = closeResolution(ctx, change(repo), REVIEW, 2, greenCi(repo), PROBE, { review: { error: "boom" }, landmines: { unread: "git diff exited 128" } });
+  out["close filed"] = closeResolution(ctx, change(repo), { ...REVIEW, majors: 1 }, 2, greenCi(repo), PROBE, { review: { node: "301" }, landmines: { node: "302", count: 2 } });
+  out["close filing failed"] = closeResolution(ctx, change(repo), { ...REVIEW, majors: 1 }, 2, greenCi(repo), PROBE, { review: { error: "boom" }, landmines: { unread: "git diff exited 128" } });
   const spawning = { id: "7", title: "Name MRs and nodes the way their forge does" };
   const cr = { number: MR, url: change(repo).webUrl };
   out.splitOut = splitOutOfReviewSpec(repo, spawning, cr, { ...REVIEW, body: "### Nit\n`x` is unused" }).body ?? "";
@@ -216,7 +216,7 @@ describe("node #129 — GitHub renderings stay pinned (one wording fix, node #12
     - Sage: 2 offline round(s); the last at cccccccc found 0 blockers, 0 majors, 1 nits (machine evidence).
     - Probes: passed at \`cccccccc\` (selection semantic, 3 probe(s)). Only the selected probes ran, not the full suite.
     - Ratification: auto node; declared probes and CI.
-    - Unfixed review findings: 0 blocker(s), 0 major(s) and 1 nit(s) from the last sage round are on the PR, not filed back."
+    - Unfixed review findings: 0 blocker(s), 0 major(s) and 1 nit(s) from the last sage round stay on the PR (https://github.com/acme/widgets/pull/42); nits are not filed back."
     ,
       "close auto/manual": 
     "Implemented by ranger's implement lane in PR #42 (https://github.com/acme/widgets/pull/42), merged by ivy-bot as dddddddd.
@@ -225,24 +225,24 @@ describe("node #129 — GitHub renderings stay pinned (one wording fix, node #12
     - Sage: 2 offline round(s); the last at cccccccc found 0 blockers, 0 majors, 1 nits (machine evidence).
     - Probes: passed at \`cccccccc\` (selection semantic, 3 probe(s)). Only the selected probes ran, not the full suite.
     - Ratification: auto node; declared probes and CI.
-    - Unfixed review findings: 0 blocker(s), 0 major(s) and 1 nit(s) from the last sage round are on the PR, not filed back."
+    - Unfixed review findings: 0 blocker(s), 0 major(s) and 1 nit(s) from the last sage round stay on the PR (https://github.com/acme/widgets/pull/42); nits are not filed back."
     ,
       "close filed": 
     "Implemented by ranger's implement lane in PR #42 (https://github.com/acme/widgets/pull/42), merged by ivy-bot as dddddddd.
 
     - Tests: \`bun test\` passed in the supervisor before every push. CI check run "build" (901) succeeded on the PR head cccccccc.
-    - Sage: 2 offline round(s); the last at cccccccc found 0 blockers, 0 majors, 1 nits (machine evidence).
+    - Sage: 2 offline round(s); the last at cccccccc found 0 blockers, 1 majors, 1 nits (machine evidence).
     - Ratification: auto node; declared probes and CI.
-    - Unfixed review findings: 0 blocker(s), 0 major(s) and 1 nit(s) from the last sage round, split out as node #301 below this node.
+    - Unfixed review findings: 0 blocker(s), 1 major(s) and 1 nit(s) from the last sage round, split out as node #301 below this node.
     - Marker comments: the merge added 2, filed as node #302 below this node."
     ,
       "close filing failed": 
     "Implemented by ranger's implement lane in PR #42 (https://github.com/acme/widgets/pull/42), merged by ivy-bot as dddddddd.
 
     - Tests: \`bun test\` passed in the supervisor before every push. CI check run "build" (901) succeeded on the PR head cccccccc.
-    - Sage: 2 offline round(s); the last at cccccccc found 0 blockers, 0 majors, 1 nits (machine evidence).
+    - Sage: 2 offline round(s); the last at cccccccc found 0 blockers, 1 majors, 1 nits (machine evidence).
     - Ratification: auto node; declared probes and CI.
-    - Unfixed review findings: 0 blocker(s), 0 major(s) and 1 nit(s) from the last sage round are on the PR; filing them back failed (boom).
+    - Unfixed review findings: 0 blocker(s), 1 major(s) and 1 nit(s) from the last sage round are on the PR; filing them back failed (boom).
     - Marker comments: the merge's diff could not be read, so none were filed (git diff exited 128)."
     ,
       "close merge/autoMerge": 
@@ -252,7 +252,7 @@ describe("node #129 — GitHub renderings stay pinned (one wording fix, node #12
     - Sage: 2 offline round(s); the last at cccccccc found 0 blockers, 0 majors, 1 nits (machine evidence).
     - Probes: passed at \`cccccccc\` (selection semantic, 3 probe(s)). Only the selected probes ran, not the full suite.
     - Ratification: ivy-bot merged PR #42 under the principal's standing grant (2026-10-03: ranger merges nodes that need no visual judgment).
-    - Unfixed review findings: 0 blocker(s), 0 major(s) and 1 nit(s) from the last sage round are on the PR, not filed back."
+    - Unfixed review findings: 0 blocker(s), 0 major(s) and 1 nit(s) from the last sage round stay on the PR (https://github.com/acme/widgets/pull/42); nits are not filed back."
     ,
       "close merge/manual": 
     "Implemented by ranger's implement lane in PR #42 (https://github.com/acme/widgets/pull/42), merged by ivy-bot as dddddddd.
@@ -261,7 +261,7 @@ describe("node #129 — GitHub renderings stay pinned (one wording fix, node #12
     - Sage: 2 offline round(s); the last at cccccccc found 0 blockers, 0 majors, 1 nits (machine evidence).
     - Probes: passed at \`cccccccc\` (selection semantic, 3 probe(s)). Only the selected probes ran, not the full suite.
     - Ratification: ivy-bot merged PR #42 under the principal's standing grant (2026-10-03: ranger merges nodes that need no visual judgment).
-    - Unfixed review findings: 0 blocker(s), 0 major(s) and 1 nit(s) from the last sage round are on the PR, not filed back."
+    - Unfixed review findings: 0 blocker(s), 0 major(s) and 1 nit(s) from the last sage round stay on the PR (https://github.com/acme/widgets/pull/42); nits are not filed back."
     ,
       "close no url auto/autoMerge": 
     "Implemented by ranger's implement lane in PR #42 (https://github.com/acme/widgets/pull/42), merged by ivy-bot as dddddddd.
@@ -270,7 +270,7 @@ describe("node #129 — GitHub renderings stay pinned (one wording fix, node #12
     - Sage: 2 offline round(s); the last at cccccccc found 0 blockers, 0 majors, 1 nits (machine evidence).
     - Probes: not recorded at this head.
     - Ratification: auto node; declared probes and CI.
-    - Unfixed review findings: 0 blocker(s), 0 major(s) and 1 nit(s) from the last sage round are on the PR, not filed back."
+    - Unfixed review findings: 0 blocker(s), 0 major(s) and 1 nit(s) from the last sage round stay on the PR (https://github.com/acme/widgets/pull/42); nits are not filed back."
     ,
       "close no url auto/manual": 
     "Implemented by ranger's implement lane in PR #42 (https://github.com/acme/widgets/pull/42), merged by ivy-bot as dddddddd.
@@ -279,7 +279,7 @@ describe("node #129 — GitHub renderings stay pinned (one wording fix, node #12
     - Sage: 2 offline round(s); the last at cccccccc found 0 blockers, 0 majors, 1 nits (machine evidence).
     - Probes: not recorded at this head.
     - Ratification: auto node; declared probes and CI.
-    - Unfixed review findings: 0 blocker(s), 0 major(s) and 1 nit(s) from the last sage round are on the PR, not filed back."
+    - Unfixed review findings: 0 blocker(s), 0 major(s) and 1 nit(s) from the last sage round stay on the PR (https://github.com/acme/widgets/pull/42); nits are not filed back."
     ,
       "close no url merge/autoMerge": 
     "Implemented by ranger's implement lane in PR #42 (https://github.com/acme/widgets/pull/42), merged by ivy-bot as dddddddd.
@@ -288,7 +288,7 @@ describe("node #129 — GitHub renderings stay pinned (one wording fix, node #12
     - Sage: 2 offline round(s); the last at cccccccc found 0 blockers, 0 majors, 1 nits (machine evidence).
     - Probes: not recorded at this head.
     - Ratification: ivy-bot merged PR #42 under the principal's standing grant (2026-10-03: ranger merges nodes that need no visual judgment).
-    - Unfixed review findings: 0 blocker(s), 0 major(s) and 1 nit(s) from the last sage round are on the PR, not filed back."
+    - Unfixed review findings: 0 blocker(s), 0 major(s) and 1 nit(s) from the last sage round stay on the PR (https://github.com/acme/widgets/pull/42); nits are not filed back."
     ,
       "close no url merge/manual": 
     "Implemented by ranger's implement lane in PR #42 (https://github.com/acme/widgets/pull/42), merged by ivy-bot as dddddddd.
@@ -297,7 +297,7 @@ describe("node #129 — GitHub renderings stay pinned (one wording fix, node #12
     - Sage: 2 offline round(s); the last at cccccccc found 0 blockers, 0 majors, 1 nits (machine evidence).
     - Probes: not recorded at this head.
     - Ratification: ivy-bot merged PR #42 under the principal's standing grant (2026-10-03: ranger merges nodes that need no visual judgment).
-    - Unfixed review findings: 0 blocker(s), 0 major(s) and 1 nit(s) from the last sage round are on the PR, not filed back."
+    - Unfixed review findings: 0 blocker(s), 0 major(s) and 1 nit(s) from the last sage round stay on the PR (https://github.com/acme/widgets/pull/42); nits are not filed back."
     ,
       "close principal auto/autoMerge": 
     "Implemented by ranger's implement lane in PR #42 (https://github.com/acme/widgets/pull/42), merged by boss as dddddddd.

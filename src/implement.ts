@@ -974,13 +974,19 @@ function leftFindings(r: { blockers: number; majors: number; nits: number }): nu
  return r.blockers + r.majors + r.nits;
 }
 
+function leftBlocking(r: { blockers: number; majors: number }): number {
+ return r.blockers + r.majors;
+}
+
 /**
  * The Scribe's pass after a merge (design §6, node #24), before the close so
  * the receipt can cite what it filed: the last sage round's findings
- * (split-out-of-review) and the marker comments the merge commit added
- * (code-comment-graduated), each one `propose` node below this node. Best
- * effort: a failed filing is journalled and named in the receipt, and the
- * close goes on. A superseded supervisor stops here (FencedError).
+ * (split-out-of-review, only when it left a blocker or a major) and the
+ * marker comments the merge commit added (code-comment-graduated), each one
+ * `propose` node below this node. A nit-only round files nothing: the nits
+ * stay on the change, journalled and named in the receipt. Best effort: a
+ * failed filing is journalled and named in the receipt, and the close goes
+ * on. A superseded supervisor stops here (FencedError).
  */
 export async function scribeAfterMerge(
  ctx: ImplementContext,
@@ -1009,8 +1015,13 @@ export async function scribeAfterMerge(
   }
  };
  const filings: ScribeFilings = {};
- if (final !== undefined && leftFindings(final) > 0) {
+ if (final !== undefined && leftBlocking(final) > 0) {
   filings.review = await file("split-out-of-review", "the last review's findings", () => splitOutOfReviewSpec(map.repo, spawning, change, final));
+ } else if (final !== undefined && final.nits > 0) {
+  journal.recordEvent("filed", {
+   nodeId, repo: map.repo,
+   detail: `left the last review's ${final.nits} nit(s) on ${changeRequestLabel(map.repo, pr.iid)} (${change.url}), not filed (nits only)`.slice(0, 400),
+  });
  }
  const merge = pr.mergeCommitSha;
  if (merge !== null) {
@@ -3525,7 +3536,9 @@ export function closeResolution(
   final === undefined || leftFindings(final) === 0
    ? "None."
    : review === undefined
-    ? `${counts} are on the ${changeRequestNoun(ctx.map.repo)}, not filed back.`
+    ? leftBlocking(final) === 0
+     ? `${counts} stay on the ${changeRequestNoun(ctx.map.repo)} (${changeRequestUrl(ctx.map.repo, pr.iid, pr.webUrl)}); nits are not filed back.`
+     : `${counts} are on the ${changeRequestNoun(ctx.map.repo)}, not filed back.`
     : "node" in review
      ? `${counts}, split out as node #${review.node} below this node.`
      : `${counts} are on the ${changeRequestNoun(ctx.map.repo)}; filing them back failed (${review.error}).`;
