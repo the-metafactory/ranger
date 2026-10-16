@@ -147,20 +147,25 @@ export function probeFailureClass(runs: readonly { code: number; stdout: string;
 }
 
 /**
- * The failed probes a worker may fix: named ones that ended as an assertion
- * or a page error at the head, in a run classed as an assertion failure, and
- * that the merge base does not share. A crash, kill or timeout, a kind the
- * runner did not print, and a red base stay the principal's.
+ * The failed probes a worker may fix, all or none: every failed probe the
+ * merge base does not share is named, ended as an assertion or a page error
+ * at the head, in a run classed as an assertion failure, and was checked at
+ * the merge base. One crash, kill, timeout, unprinted kind or unconfirmed base
+ * among them leaves the whole failure the principal's (null `base`: no base
+ * check ran); the base-red ones the gate already waives.
  */
 export function branchFixableProbes(
  runs: readonly { code: number; stdout: string; stderr: string }[],
  failed: readonly string[],
- redOnBase: readonly string[],
+ base: { red: readonly string[]; unconfirmed: readonly string[] } | null,
 ): string[] {
  const last = runs.at(-1);
- if (last === undefined || probeFailureClass(runs) !== "assertion") return [];
+ if (last === undefined || base === null || failed.length === 0 || probeFailureClass(runs) !== "assertion") return [];
  const kinds = parseFailedChecks(last.stdout);
- return failed.filter((n) => PROBE_FILE.test(n) && !redOnBase.includes(n) && ["assert", "pageerror"].includes(kinds.get(n)?.kind ?? ""));
+ const own = failed.filter((n) => !base.red.includes(n));
+ const fixable = (n: string) =>
+  PROBE_FILE.test(n) && !base.unconfirmed.includes(n) && ["assert", "pageerror"].includes(kinds.get(n)?.kind ?? "");
+ return own.length > 0 && own.every(fixable) ? own : [];
 }
 
 /** Explicit classes survive outcome truncation. Legacy signal-only parks can retry. */

@@ -609,7 +609,7 @@ async function probeFinalHead(
     summary: failing,
     tail: tail(result),
    }),
-   branchFixable: branchFixableProbes(runs, failed, base?.red ?? []),
+   branchFixable: branchFixableProbes(runs, failed, base),
    failureSummary: failing,
   },
  };
