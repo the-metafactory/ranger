@@ -300,6 +300,11 @@
       "count": 9
     }
   },
+  "src/host-load.ts": {
+    "no-restricted-syntax": {
+      "count": 1
+    }
+  },
   "src/identity.ts": {
     "ranger/no-comments": {
       "count": 11
@@ -352,6 +357,9 @@
     },
     "@typescript-eslint/only-throw-error": {
       "count": 2
+    },
+    "no-restricted-syntax": {
+      "count": 1
     },
     "ranger/no-comments": {
       "count": 127

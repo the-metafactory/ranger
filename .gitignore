@@ -5,3 +5,6 @@ state.sqlite*
 
 # SwiftPM cache dirs a host git hook can leave behind (never ranger output)
 .build/
+
+# The principal's private config lives in ~/.config/ranger/ranger.yaml; ranger.example.yaml is the template.
+/ranger.yaml

@@ -34,29 +34,19 @@ function configWith(repo: string, section: "maps" | "serve" | "legacy" = "maps")
 }
 
 describe("ForgeRef config and identity seam", () => {
- test("today's registry retains explicit GitHub argument, journal, cache and file values", () => {
-  const config = loadConfig(join(import.meta.dir, "../ranger.yaml"), {}).config;
+ test("a GitHub registry keeps explicit argument, journal, cache and file values", () => {
   const expected = [
    ["the-metafactory/ranger", 1, "the-metafactory__ranger"],
    ["the-metafactory/ranger", 91, "the-metafactory__ranger"],
-   ["the-metafactory/ranger", 133, "the-metafactory__ranger"],
    ["jcfischer/seekolous", 26, "jcfischer__seekolous"],
    ["the-metafactory/soma", 604, "the-metafactory__soma"],
-   ["the-metafactory/soma", 645, "the-metafactory__soma"],
-   ["the-metafactory/soma", 565, "the-metafactory__soma"],
-   ["the-metafactory/soma", 706, "the-metafactory__soma"],
-   ["the-metafactory/soma", 533, "the-metafactory__soma"],
-   ["the-metafactory/soma", 751, "the-metafactory__soma"],
-   ["the-metafactory/soma", 766, "the-metafactory__soma"],
-   ["jcfischer/seelite", 1, "jcfischer__seelite"],
    ["jcfischer/seelite", 460, "jcfischer__seelite"],
-   ["the-metafactory/soma", 781, "the-metafactory__soma"],
-   ["the-metafactory/myelin", 319, "the-metafactory__myelin"],
-   ["the-metafactory/cortex", 2556, "the-metafactory__cortex"],
-   ["the-metafactory/reflex", 33, "the-metafactory__reflex"],
-   ["the-metafactory/pulse", 83, "the-metafactory__pulse"],
-   ["the-metafactory/ranger", 257, "the-metafactory__ranger"],
   ] as const;
+  const dir = mkdtempSync(join(tmpdir(), "ranger-forge-ref-"));
+  const path = join(dir, "ranger.yaml");
+  writeFileSync(path, "maps:\n" + expected.map(([repo, root]) => `  - repo: ${repo}\n    root: ${root}\n`).join(""));
+  const config = loadConfig(path, {}).config;
+  rmSync(dir, { recursive: true, force: true });
   expect(config.maps.map(m => [m.repo, m.root])).toEqual(expected.map(([repo, root]) => [repo, root]));
   for (const [index, [repo, root, fileRepo]] of expected.entries()) {
    const map = config.maps[index];

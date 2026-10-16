@@ -141,16 +141,19 @@ before applying this migration.
 
 ## Configuration
 
-Commands that read `ranger.yaml` choose the config path in this order:
-explicit `--config <path>` (or `-c`), `$RANGER_CONFIG`, then `./ranger.yaml`.
-Relative paths from either the flag or the environment resolve against the
-working directory. A missing selected file is an error; ranger does not try
-another location. There is no implicit home-directory config path.
+`ranger.yaml` is private to each operator and is not in this repo. Copy
+`ranger.example.yaml` to `~/.config/ranger/ranger.yaml`, next to the journal,
+and edit it there.
 
-Set an absolute path to use the checked-in config from another directory:
+Commands that read `ranger.yaml` choose the config path in this order:
+explicit `--config <path>` (or `-c`), `$RANGER_CONFIG`, then
+`~/.config/ranger/ranger.yaml`. Relative paths from either the flag or the
+environment resolve against the working directory. A missing selected file is
+an error; ranger does not try another location. `./ranger.yaml` is never read
+implicitly.
 
 ```bash
-export RANGER_CONFIG=/absolute/path/to/ranger/ranger.yaml
+export RANGER_CONFIG=/absolute/path/to/another/ranger.yaml
 ranger job list
 ```
 
@@ -164,7 +167,7 @@ registered map's frontier, audit, and HITL queue to a CLI report (Discord digest
 comes once the bot exists — design §9). It performs **zero graph writes**.
 
 ```bash
-bun src/cli.ts scout                      # text report ($RANGER_CONFIG or ./ranger.yaml)
+bun src/cli.ts scout                      # text report ($RANGER_CONFIG or ~/.config/ranger/ranger.yaml)
 bun src/cli.ts scout --json               # machine-readable report
 bun src/cli.ts scout -c /path/ranger.yaml # explicit config
 ```
