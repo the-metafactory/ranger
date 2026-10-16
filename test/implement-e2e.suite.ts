@@ -2129,18 +2129,115 @@ describe("implement lane (node #23)", () => {
   expect(r.journal.getHealth(`base-red-checks.acme/widgets.${sha}.probe-weapon.mjs`)).toBeNull();
  }, 60_000);
 
- test("a probe red only on the branch still parks, and the park says the base passes it", async () => {
-  const r = await rig({ probe: "fake-probe branch-red {node}", probeRetry: "fake-probe branch-red {node} {failed}" });
+ const probeFixRig = async (probeMode: string) => {
+  const r = await rig({ probe: `fake-probe ${probeMode} {node}`, probeRetry: `fake-probe ${probeMode} {node} {failed}` });
   cleanup.push(r.dir);
-  await seedProbeOnBase(r);
-  const outcome = await runNode("20", r.ctx);
+  const prompts: string[] = [];
+  let mode = "build";
+  r.ctx.worker = async (prompt, o) => {
+   prompts.push(prompt);
+   return runCmd(implementWorker, [mode, prompt], o);
+  };
+  return {
+   r,
+   prompts,
+   setMode: (m: string) => { mode = m; },
+   fixPrompts: () => prompts.filter((p) => p.includes("## Probe fix pass")),
+   markers: () => (r.github.comments.get(1) ?? []).filter((c) => c.body.includes("ranger:probe-fix")),
+   probeRecords: () => (r.github.comments.get(1) ?? []).filter((c) => c.body.includes("ranger:probes")),
+   events: () => r.journal.listEvents("acme/widgets", 300).map((e) => e.detail ?? ""),
+  };
+ };
+
+ test("a probe the branch broke gets one probe fix pass with the failures as its brief; the fix is reviewed, probed and goes ready", async () => {
+  const p = await probeFixRig("branch-fixable");
+  await seedProbeOnBase(p.r);
+  const outcome = await runNode("20", p.r.ctx);
+  expect(outcome.status).toBe("awaiting-merge");
+  expect(p.fixPrompts()).toHaveLength(1);
+  const [red, passed] = p.probeRecords().map((c) => /sha=([0-9a-f]{40}) result=(pass|fail)/.exec(c.body)!.slice(1));
+  expect(red[1]).toBe("fail");
+  expect(passed[1]).toBe("pass");
+  const head = await p.r.github.sha("node/20-add-the-feature-module");
+  expect(passed[0]).toBe(head);
+  const brief = p.fixPrompts()[0];
+  expect(brief).toContain(`failed twice at this branch's head \`${red[0].slice(0, 8)}\``);
+  expect(brief).toContain("between the PR and the merge: `probe-hud.mjs`.");
+  expect(brief).toMatch(/<probe-failures-([0-9a-f-]{36})>\nprobe-hud\.mjs \(assert\): the hud draws\n<\/probe-failures-\1>/);
+  expect(p.markers().map((m) => m.body.split("\n")[0])).toEqual([`<!-- ranger:probe-fix sha=${head} red=${red[0]} -->`]);
+  expect(p.r.calls).toHaveLength(2);
+  expect(p.r.github.prs.get(1)?.draft).toBe(false);
+  expect(p.events().some((d) => d === `probe fix pass 1 @ ${head.slice(0, 8)}: probes failed at ${red[0].slice(0, 8)}`)).toBe(true);
+ }, 60_000);
+
+ test("a probe red only on the branch after its probe fix pass parks, and the park says the base passes it", async () => {
+  const p = await probeFixRig("branch-red");
+  await seedProbeOnBase(p.r);
+  const outcome = await runNode("20", p.r.ctx);
   expect(outcome.status).toBe("parked");
   expect(outcome.detail).toContain("probe failure class: assertion");
   expect(outcome.detail).toContain("FAILED: probe-hud.mjs");
   expect(outcome.detail).not.toContain("red on the merge base too");
-  expect(r.announced).toEqual([]);
-  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
-  expect(events.some((d) => d.includes("pass at the merge base") && d.includes("the failure is this branch's"))).toBe(true);
+  const head = await p.r.github.sha("node/20-add-the-feature-module");
+  expect(outcome.detail).toContain(`browser probes failed twice at ${head.slice(0, 8)}`);
+  expect(p.fixPrompts()).toHaveLength(1);
+  expect(p.markers()).toHaveLength(1);
+  expect(p.probeRecords().map((c) => c.body.includes("result=fail"))).toEqual([true, true]);
+  expect(p.r.github.prs.get(1)?.draft).toBe(true);
+  expect(p.r.announced).toEqual([]);
+  expect(p.events().some((d) => d.includes("pass at the merge base") && d.includes("the failure is this branch's"))).toBe(true);
+  expect(p.events().some((d) => d.includes("but the node has used its 1 probe fix pass(es): it parks"))).toBe(true);
+ }, 60_000);
+
+ test("a probe fix pass that finds nothing in the branch to change parks on the probes, and a resume does not ask again", async () => {
+  const p = await probeFixRig("branch-red");
+  p.setMode("probe-noop");
+  await seedProbeOnBase(p.r);
+  const outcome = await runNode("20", p.r.ctx);
+  expect(outcome.status).toBe("parked");
+  expect(outcome.detail).toContain("probe failure class: assertion");
+  const head = await p.r.github.sha("node/20-add-the-feature-module");
+  expect(p.markers().map((m) => m.body.split("\n")[0])).toEqual([`<!-- ranger:probe-fix sha=${head} red=${head} -->`]);
+  expect(p.r.calls).toHaveLength(1);
+
+  p.r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  expect((await runNode("20", p.r.ctx)).status).toBe("parked");
+  expect(p.fixPrompts()).toHaveLength(1);
+  expect(p.events().some((d) => d.includes("where a probe fix pass found nothing in the branch to change: it parks"))).toBe(true);
+ }, 60_000);
+
+ test("the probe fix budget holds across a run-node restart: a crash after the fix landed gets no second pass", async () => {
+  let crashed = false;
+  const r = await rig({
+   probe: "fake-probe branch-red {node}",
+   probeRetry: "fake-probe branch-red {node} {failed}",
+   onReview: (round) => {
+    if (round === 2 && !crashed) {
+     crashed = true;
+     throw new Error("run-node died after the probe fix landed");
+    }
+   },
+  });
+  cleanup.push(r.dir);
+  const prompts: string[] = [];
+  r.ctx.worker = async (prompt, o) => {
+   prompts.push(prompt);
+   return runCmd(implementWorker, ["build", prompt], o);
+  };
+  await seedProbeOnBase(r);
+  expect((await runNode("20", r.ctx)).status).not.toBe("awaiting-merge");
+  expect(crashed).toBe(true);
+  const fixes = () => (r.github.comments.get(1) ?? []).filter((c) => c.body.includes("ranger:probe-fix"));
+  expect(fixes()).toHaveLength(1);
+
+  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  const resumed = await runNode("20", r.ctx);
+  expect(resumed.status).toBe("parked");
+  expect(resumed.detail).toContain("browser probes failed twice");
+  expect(prompts.filter((p) => p.includes("## Probe fix pass"))).toHaveLength(1);
+  expect(fixes()).toHaveLength(1);
+  const events = r.journal.listEvents("acme/widgets", 300).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.includes("but the node has used its 1 probe fix pass(es): it parks"))).toBe(true);
  }, 60_000);
 
  test("a probe the branch edited gates even when the base fails it too: the base runs another probe under that name", async () => {
@@ -2202,6 +2299,8 @@ describe("implement lane (node #23)", () => {
   expect(outcome.detail).toContain("probe failure class: infrastructure");
   expect(outcome.detail).toContain("FAILED: probe-hud.mjs · probe-weapon.mjs");
   expect(outcome.detail).not.toContain("red on the merge base too");
+  expect((r.github.comments.get(1) ?? []).filter((c) => c.body.includes("ranger:probe-fix"))).toEqual([]);
+  expect(r.calls).toHaveLength(1);
   expect(r.announced).toEqual([]);
   expect(calls.filter((c) => c.cwd.includes("ranger-probe-base-"))).toEqual([]);
   const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
@@ -2217,6 +2316,7 @@ describe("implement lane (node #23)", () => {
   const outcome = await runNode("20", r.ctx);
   expect(outcome.status).toBe("parked");
   expect(outcome.detail).toContain("red on the merge base too: probe-hud.mjs");
+  expect((r.github.comments.get(1) ?? []).filter((c) => c.body.includes("ranger:probe-fix"))).toEqual([]);
   expect(r.announced).toEqual([]);
   const base = calls.filter((c) => c.cwd.includes("ranger-probe-base-")).map((c) => c.command);
   expect(base).toEqual(["fake-probe mixed 20 probe-hud.mjs", "fake-probe mixed 20 probe-hud.mjs"]);
@@ -2283,11 +2383,12 @@ describe("implement lane (node #23)", () => {
   // Both attempts and the merge-base run, labelled, each with its whole output.
   const log = workerLogs(r);
   const sections = log.split(/^===== /m).filter((s) => s.includes("fake-probe"));
-  expect(sections.map((s) => s.split("\n")[0].replace(/^\S+ /, ""))).toEqual([
+  const tier = [
    "probe run 1 (fake-probe red 20) — exit 1",
    "probe run 2 (the retry) (fake-probe red 20 probe-hud.mjs) — exit 1",
    expect.stringMatching(/^merge base [0-9a-f]{8}: probe run \(fake-probe red 20 probe-hud\.mjs\) — exit 0$/),
-  ]);
+  ];
+  expect(sections.map((s) => s.split("\n")[0].replace(/^\S+ /, ""))).toEqual([...tier, ...tier]);
   for (const s of sections.slice(0, 2)) {
    expect(s).toContain('FAIL  the hud draws — {"drawn":false}');
    expect(s).toContain("ok   probe-filler-599.mjs");

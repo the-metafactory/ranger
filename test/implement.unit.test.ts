@@ -15,10 +15,13 @@ import {
  checkpointArtifacts,
  ciFixState,
  implementBranchFor,
+ MAX_PROBE_FIXES,
  MAX_RULING_CHARS,
  MAX_RULINGS,
  principalRulings,
+ probeFixMarker,
  recordedCiFixes,
+ recordedProbeFixes,
  recordedReviews,
  resolvePhase,
  reviewAtHead,
@@ -854,6 +857,17 @@ describe("CI fix passes (soma #795/#796)", () => {
   expect(ciFixState(fixes, RED)).toEqual({ used: 0, foundNothing: false });
   expect(ciFixState([...fixes, { sha: FIX, red: FIX }], FIX)).toEqual({ used: 1, foundNothing: true });
   expect(marker(FIX, FIX).body).toContain("found nothing in the branch to change");
+ });
+ test("probe fix markers are their own budget: CI fix markers do not count against it, nor it against them", () => {
+  const probeFix = (sha: string, red: string, author = "ivy-bot") => ({ id: 2, author, body: probeFixMarker({ sha, red, failed: ["probe-hud.mjs"] }) });
+  const ciFix = { id: 1, author: "ivy-bot", body: ciFixMarker({ sha: FIX, red: RED, reason: "CI failed: lint=failure" }) };
+  const comments = [ciFix, probeFix(FIX, RED), probeFix(SHA, SHA, "drive-by")];
+  expect(recordedProbeFixes(comments, "ivy-bot")).toEqual([{ sha: FIX, red: RED }]);
+  expect(recordedCiFixes(comments, "ivy-bot")).toEqual([{ sha: FIX, red: RED }]);
+  expect(recordedProbeFixes([ciFix], "ivy-bot")).toEqual([]);
+  expect(ciFixState(recordedProbeFixes(comments, "ivy-bot"), FIX).used).toBeGreaterThanOrEqual(MAX_PROBE_FIXES);
+  expect(probeFix(FIX, RED).body).toContain("probes failed at `cccccccc` on this branch (probe-hud.mjs)");
+  expect(probeFix(FIX, FIX).body).toContain("found nothing in the branch to change");
  });
 });
 

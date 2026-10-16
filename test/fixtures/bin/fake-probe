@@ -4,7 +4,8 @@
 # flaky → fail on the first run (creating statefile), pass on the next;
 # red → probe-hud.mjs fails its "the hud draws" check everywhere (a red base);
 # branch-red → probe-hud.mjs fails only where the worker's src/feature.ts exists
-# (the branch, not its base); branch-other → it fails everywhere, but on the
+# (the branch, not its base); branch-fixable → as branch-red, until the worker's probe fix
+# (src/probe-fix.ts) lands; branch-other → it fails everywhere, but on the
 # branch a different check fails too; branch-crash → it fails the same check
 # everywhere, but on the branch the probe then crashes; crash → probe-hud.mjs
 # and probe-weapon.mjs crash everywhere; mixed → probe-hud.mjs fails the same
@@ -48,6 +49,9 @@ case "$mode" in
   no-kind)
     printf 'FAIL probe-hud.mjs (0.1s)\n     │  FAIL  the hud draws — {"drawn":false}\nFAILED: probe-hud.mjs\n'
     exit 1 ;;
+  branch-fixable)
+    if [ -f src/feature.ts ] && [ ! -f src/probe-fix.ts ]; then printf 'FAIL probe-hud.mjs (0.1s) exit=1 assert peak load 1.0\n     │  FAIL  the hud draws — {"drawn":false}\nFAILED: probe-hud.mjs\n'; exit 1; fi
+    echo "node $node: probe-hud.mjs passed"; exit 0 ;;
   branch-red)
     if [ -f src/feature.ts ]; then printf 'FAIL probe-hud.mjs (0.1s) exit=1 assert peak load 1.0\n     │  FAIL  the hud draws — {"drawn":false}\nFAILED: probe-hud.mjs\n'; exit 1; fi
     echo "node $node: probe-hud.mjs passed"; exit 0 ;;
