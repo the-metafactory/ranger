@@ -964,7 +964,7 @@ export type ScribeOutcome = { node: string } | { error: string };
 
 /** The Scribe's filings after a merge; a key is absent when there was nothing to file. */
 export interface ScribeFilings {
- review?: ScribeOutcome | { nitsLeft: number };
+ review?: ScribeOutcome | { proseLeft: number };
  /** `unread` when the merge's diff could not be read: nothing was scanned. */
  landmines?: (ScribeOutcome & { count: number }) | { unread: string };
 }
@@ -974,8 +974,12 @@ function leftFindings(r: { blockers: number; majors: number; nits: number }): nu
  return r.blockers + r.majors + r.nits;
 }
 
-function leftBlocking(r: { blockers: number; majors: number }): number {
- return r.blockers + r.majors;
+const ROUND_IMPACT = /^Round impact: behavior (\d+), checks (\d+), prose \d+; unclassified impact (\d+)/m;
+
+function leftWork(r: { blockers: number; majors: number; nits: number; body: string }): number {
+ const impact = ROUND_IMPACT.exec(r.body);
+ const asked = impact === null ? r.nits : Number(impact[1]) + Number(impact[2]) + Number(impact[3]);
+ return r.blockers + r.majors + asked;
 }
 
 /**
@@ -1015,13 +1019,13 @@ export async function scribeAfterMerge(
   }
  };
  const filings: ScribeFilings = {};
- if (final !== undefined && leftBlocking(final) > 0) {
+ if (final !== undefined && leftWork(final) > 0) {
   filings.review = await file("split-out-of-review", "the last review's findings", () => splitOutOfReviewSpec(map.repo, spawning, change, final));
  } else if (final !== undefined && final.nits > 0) {
-  filings.review = { nitsLeft: final.nits };
+  filings.review = { proseLeft: final.nits };
   journal.recordEvent("filed", {
    nodeId, repo: map.repo,
-   detail: `left the last review's ${final.nits} nit(s) on ${changeRequestLabel(map.repo, pr.iid)} (${change.url}), not filed (nits only)`.slice(0, 400),
+   detail: `left the last review's ${final.nits} nit(s) on ${changeRequestLabel(map.repo, pr.iid)} (${change.url}), not filed (prose only: no blocker, major, behavior or check finding)`.slice(0, 400),
   });
  }
  const merge = pr.mergeCommitSha;
@@ -3527,7 +3531,7 @@ function unfixedFindingsLine(ctx: ImplementContext, pr: ChangeRequest, final: Re
  const counts = `${final.blockers} blocker(s), ${final.majors} major(s) and ${final.nits} nit(s) from the last sage round`;
  const noun = changeRequestNoun(ctx.map.repo);
  if (review === undefined) return `${counts} are on the ${noun}, not filed back.`;
- if ("nitsLeft" in review) return `${counts} stay on the ${noun} (${changeRequestUrl(ctx.map.repo, pr.iid, pr.webUrl)}); nits are not filed back.`;
+ if ("proseLeft" in review) return `${counts} stay on the ${noun} (${changeRequestUrl(ctx.map.repo, pr.iid, pr.webUrl)}); prose-only findings are not filed back.`;
  if ("node" in review) return `${counts}, split out as node #${review.node} below this node.`;
  return `${counts} are on the ${noun}; filing them back failed (${review.error}).`;
 }
