@@ -18,7 +18,7 @@
         <string>escalate</string>
         <string>--digest</string>
         <string>--config</string>
-        <string>/Users/__USER__/work/mf/ranger/ranger.yaml</string>
+        <string>/Users/__USER__/.config/ranger/ranger.yaml</string>
     </array>
     <key>StartCalendarInterval</key>
     <dict>

@@ -21,7 +21,7 @@ import { loadConfig, principalLoginForRepo } from "../src/config.ts";
 import { runCmd } from "../src/exec.ts";
 import type { IssueComment, ChangeRequest } from "../src/forge.ts";
 import type { CheckRun } from "../src/github.ts";
-import { baseMergeMarker, bunTestChain, coverageInPlay, failedTests, failuresAllNamed, failuresNotAtBase, testsReceipt, recordedBaseMerges, recordedReviews, reviewMarker, type ForgePort } from "../src/implement.ts";
+import { BASE_RERUNS, baseMergeMarker, bunTestChain, coverageInPlay, failedTests, failuresAllNamed, failuresNotAtBase, mostFailing, testsReceipt, recordedBaseMerges, recordedReviews, reviewMarker, type ForgePort } from "../src/implement.ts";
 import { Database } from "bun:sqlite";
 import { openJournal, type Journal } from "../src/journal.ts";
 import { ReviewError, type ReviewVerdict } from "../src/review.ts";
@@ -2129,18 +2129,115 @@ describe("implement lane (node #23)", () => {
   expect(r.journal.getHealth(`base-red-checks.acme/widgets.${sha}.probe-weapon.mjs`)).toBeNull();
  }, 60_000);
 
- test("a probe red only on the branch still parks, and the park says the base passes it", async () => {
-  const r = await rig({ probe: "fake-probe branch-red {node}", probeRetry: "fake-probe branch-red {node} {failed}" });
+ const probeFixRig = async (probeMode: string) => {
+  const r = await rig({ probe: `fake-probe ${probeMode} {node}`, probeRetry: `fake-probe ${probeMode} {node} {failed}` });
   cleanup.push(r.dir);
-  await seedProbeOnBase(r);
-  const outcome = await runNode("20", r.ctx);
+  const prompts: string[] = [];
+  let mode = "build";
+  r.ctx.worker = async (prompt, o) => {
+   prompts.push(prompt);
+   return runCmd(implementWorker, [mode, prompt], o);
+  };
+  return {
+   r,
+   prompts,
+   setMode: (m: string) => { mode = m; },
+   fixPrompts: () => prompts.filter((p) => p.includes("## Probe fix pass")),
+   markers: () => (r.github.comments.get(1) ?? []).filter((c) => c.body.includes("ranger:probe-fix")),
+   probeRecords: () => (r.github.comments.get(1) ?? []).filter((c) => c.body.includes("ranger:probes")),
+   events: () => r.journal.listEvents("acme/widgets", 300).map((e) => e.detail ?? ""),
+  };
+ };
+
+ test("a probe the branch broke gets one probe fix pass with the failures as its brief; the fix is reviewed, probed and goes ready", async () => {
+  const p = await probeFixRig("branch-fixable");
+  await seedProbeOnBase(p.r);
+  const outcome = await runNode("20", p.r.ctx);
+  expect(outcome.status).toBe("awaiting-merge");
+  expect(p.fixPrompts()).toHaveLength(1);
+  const [red, passed] = p.probeRecords().map((c) => /sha=([0-9a-f]{40}) result=(pass|fail)/.exec(c.body)!.slice(1));
+  expect(red[1]).toBe("fail");
+  expect(passed[1]).toBe("pass");
+  const head = await p.r.github.sha("node/20-add-the-feature-module");
+  expect(passed[0]).toBe(head);
+  const brief = p.fixPrompts()[0];
+  expect(brief).toContain(`failed twice at this branch's head \`${red[0].slice(0, 8)}\``);
+  expect(brief).toContain("between the PR and the merge: `probe-hud.mjs`.");
+  expect(brief).toMatch(/<probe-failures-([0-9a-f-]{36})>\nprobe-hud\.mjs \(assert\): the hud draws\n<\/probe-failures-\1>/);
+  expect(p.markers().map((m) => m.body.split("\n")[0])).toEqual([`<!-- ranger:probe-fix sha=${head} red=${red[0]} -->`]);
+  expect(p.r.calls).toHaveLength(2);
+  expect(p.r.github.prs.get(1)?.draft).toBe(false);
+  expect(p.events().some((d) => d === `probe fix pass 1 @ ${head.slice(0, 8)}: probes failed at ${red[0].slice(0, 8)}`)).toBe(true);
+ }, 60_000);
+
+ test("a probe red only on the branch after its probe fix pass parks, and the park says the base passes it", async () => {
+  const p = await probeFixRig("branch-red");
+  await seedProbeOnBase(p.r);
+  const outcome = await runNode("20", p.r.ctx);
   expect(outcome.status).toBe("parked");
   expect(outcome.detail).toContain("probe failure class: assertion");
   expect(outcome.detail).toContain("FAILED: probe-hud.mjs");
   expect(outcome.detail).not.toContain("red on the merge base too");
-  expect(r.announced).toEqual([]);
-  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
-  expect(events.some((d) => d.includes("pass at the merge base") && d.includes("the failure is this branch's"))).toBe(true);
+  const head = await p.r.github.sha("node/20-add-the-feature-module");
+  expect(outcome.detail).toContain(`browser probes failed twice at ${head.slice(0, 8)}`);
+  expect(p.fixPrompts()).toHaveLength(1);
+  expect(p.markers()).toHaveLength(1);
+  expect(p.probeRecords().map((c) => c.body.includes("result=fail"))).toEqual([true, true]);
+  expect(p.r.github.prs.get(1)?.draft).toBe(true);
+  expect(p.r.announced).toEqual([]);
+  expect(p.events().some((d) => d.includes("pass at the merge base") && d.includes("the failure is this branch's"))).toBe(true);
+  expect(p.events().some((d) => d.includes("but the node has used its 1 probe fix pass(es): it parks"))).toBe(true);
+ }, 60_000);
+
+ test("a probe fix pass that finds nothing in the branch to change parks on the probes, and a resume does not ask again", async () => {
+  const p = await probeFixRig("branch-red");
+  p.setMode("probe-noop");
+  await seedProbeOnBase(p.r);
+  const outcome = await runNode("20", p.r.ctx);
+  expect(outcome.status).toBe("parked");
+  expect(outcome.detail).toContain("probe failure class: assertion");
+  const head = await p.r.github.sha("node/20-add-the-feature-module");
+  expect(p.markers().map((m) => m.body.split("\n")[0])).toEqual([`<!-- ranger:probe-fix sha=${head} red=${head} -->`]);
+  expect(p.r.calls).toHaveLength(1);
+
+  p.r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  expect((await runNode("20", p.r.ctx)).status).toBe("parked");
+  expect(p.fixPrompts()).toHaveLength(1);
+  expect(p.events().some((d) => d.includes("where a probe fix pass found nothing in the branch to change: it parks"))).toBe(true);
+ }, 60_000);
+
+ test("the probe fix budget holds across a run-node restart: a crash after the fix landed gets no second pass", async () => {
+  let crashed = false;
+  const r = await rig({
+   probe: "fake-probe branch-red {node}",
+   probeRetry: "fake-probe branch-red {node} {failed}",
+   onReview: (round) => {
+    if (round === 2 && !crashed) {
+     crashed = true;
+     throw new Error("run-node died after the probe fix landed");
+    }
+   },
+  });
+  cleanup.push(r.dir);
+  const prompts: string[] = [];
+  r.ctx.worker = async (prompt, o) => {
+   prompts.push(prompt);
+   return runCmd(implementWorker, ["build", prompt], o);
+  };
+  await seedProbeOnBase(r);
+  expect((await runNode("20", r.ctx)).status).not.toBe("awaiting-merge");
+  expect(crashed).toBe(true);
+  const fixes = () => (r.github.comments.get(1) ?? []).filter((c) => c.body.includes("ranger:probe-fix"));
+  expect(fixes()).toHaveLength(1);
+
+  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  const resumed = await runNode("20", r.ctx);
+  expect(resumed.status).toBe("parked");
+  expect(resumed.detail).toContain("browser probes failed twice");
+  expect(prompts.filter((p) => p.includes("## Probe fix pass"))).toHaveLength(1);
+  expect(fixes()).toHaveLength(1);
+  const events = r.journal.listEvents("acme/widgets", 300).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.includes("but the node has used its 1 probe fix pass(es): it parks"))).toBe(true);
  }, 60_000);
 
  test("a probe the branch edited gates even when the base fails it too: the base runs another probe under that name", async () => {
@@ -2202,6 +2299,8 @@ describe("implement lane (node #23)", () => {
   expect(outcome.detail).toContain("probe failure class: infrastructure");
   expect(outcome.detail).toContain("FAILED: probe-hud.mjs · probe-weapon.mjs");
   expect(outcome.detail).not.toContain("red on the merge base too");
+  expect((r.github.comments.get(1) ?? []).filter((c) => c.body.includes("ranger:probe-fix"))).toEqual([]);
+  expect(r.calls).toHaveLength(1);
   expect(r.announced).toEqual([]);
   expect(calls.filter((c) => c.cwd.includes("ranger-probe-base-"))).toEqual([]);
   const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
@@ -2217,6 +2316,7 @@ describe("implement lane (node #23)", () => {
   const outcome = await runNode("20", r.ctx);
   expect(outcome.status).toBe("parked");
   expect(outcome.detail).toContain("red on the merge base too: probe-hud.mjs");
+  expect((r.github.comments.get(1) ?? []).filter((c) => c.body.includes("ranger:probe-fix"))).toEqual([]);
   expect(r.announced).toEqual([]);
   const base = calls.filter((c) => c.cwd.includes("ranger-probe-base-")).map((c) => c.command);
   expect(base).toEqual(["fake-probe mixed 20 probe-hud.mjs", "fake-probe mixed 20 probe-hud.mjs"]);
@@ -2283,11 +2383,12 @@ describe("implement lane (node #23)", () => {
   // Both attempts and the merge-base run, labelled, each with its whole output.
   const log = workerLogs(r);
   const sections = log.split(/^===== /m).filter((s) => s.includes("fake-probe"));
-  expect(sections.map((s) => s.split("\n")[0].replace(/^\S+ /, ""))).toEqual([
+  const tier = [
    "probe run 1 (fake-probe red 20) — exit 1",
    "probe run 2 (the retry) (fake-probe red 20 probe-hud.mjs) — exit 1",
    expect.stringMatching(/^merge base [0-9a-f]{8}: probe run \(fake-probe red 20 probe-hud\.mjs\) — exit 0$/),
-  ]);
+  ];
+  expect(sections.map((s) => s.split("\n")[0].replace(/^\S+ /, ""))).toEqual([...tier, ...tier]);
   for (const s of sections.slice(0, 2)) {
    expect(s).toContain('FAIL  the hud draws — {"drawn":false}');
    expect(s).toContain("ok   probe-filler-599.mjs");
@@ -2642,7 +2743,8 @@ describe("implement lane (node #23)", () => {
   }
   /**
    * The map's test command is `bun test` (and `after`, when given); its
-   * `bun test` step runs `body` from a script outside the repository instead.
+   * `bun test` step runs `body` from a script outside the repository instead,
+   * with the step's arguments (a merge-base rerun's files) as its own.
    * Every repo command is recorded with its directory, as the map spells it.
    */
   async function bunRig(body: string, opts: { after?: string; install?: string } = {}): Promise<Rig & { calls: { command: string; cwd: string }[] }> {
@@ -2653,7 +2755,13 @@ describe("implement lane (node #23)", () => {
    const calls: { command: string; cwd: string }[] = [];
    r.ctx.shellRun = (command, o) => {
     calls.push({ command, cwd: o.cwd ?? "" });
-    const run = command.split("&&").map((s) => (s.trim() === "bun test" ? ` sh '${script}' ` : s)).join("&&");
+    const run = command
+     .split("&&")
+     .map((s) => {
+      const bun = /^bun test((?: \S+)*)$/.exec(s.trim());
+      return bun === null ? s : ` sh '${script}'${bun[1]} `;
+     })
+     .join("&&");
     return runCmd("/bin/sh", ["-c", run], o);
    };
    return { ...r, calls };
@@ -2740,8 +2848,65 @@ describe("implement lane (node #23)", () => {
    expect(outcome.detail).toContain("failing: shared; branch only:");
    const sha = await mergeBase(r);
    expect(reviewed(r).some((d) => d.endsWith(`at the merge base ${sha} fails another set (exit 1) — not red there, they gate: branch only`))).toBe(true);
+   expect(reviewed(r)).toContain(`tests (bun test) at the merge base ${sha} fail another set; no rerun there: branch only name(s) no test file a rerun can select`);
+   expect(baseRuns(r.calls)).toHaveLength(1);
    expect(r.github.prs.size).toBe(0);
   }, 60_000);
+
+  const baseFailingDebounceOnRerunWhen = (catches: string) => [
+   "if [ -f src/feature.ts ]; then printf '\\ntest/a.test.ts:\\n(fail) watcher > debounce\\n\\ntest/b.test.ts:\\n(fail) sandbox > denies\\n\\n 2 fail\\n' >&2; exit 1; fi",
+   "if [ $# -eq 0 ]; then printf '\\ntest/a.test.ts:\\n(fail) watcher > reconcile\\n\\ntest/b.test.ts:\\n(fail) sandbox > denies\\n\\n 2 fail\\n' >&2; exit 1; fi",
+   "d=$(dirname \"$0\"); n=$(($(cat \"$d/reruns\" 2>/dev/null || echo 0) + 1)); echo $n > \"$d/reruns\"",
+   `if ${catches}; then printf '\\ntest/a.test.ts:\\n(fail) watcher > debounce\\n\\n 1 fail\\n' >&2; exit 1; fi`,
+   "echo ' 0 fail'; exit 0",
+  ].join("\n");
+
+  test("a flaky red base reruns only the files of the failures it did not share: one it fails on a rerun is the base's", async () => {
+   const r = await bunRig(baseFailingDebounceOnRerunWhen("[ $n -ge 2 ]"));
+   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+   const sha = await mergeBase(r);
+   expect(baseRuns(r.calls).map((c) => c.command)).toEqual(["bun test", "bun test ./test/a.test.ts", "bun test ./test/a.test.ts"]);
+   const events = reviewed(r);
+   expect(events).toContain(`tests (bun test) rerun 1 of ${BASE_RERUNS} at the merge base ${sha} (bun test ./test/a.test.ts) exit 0: still not red there: test/a.test.ts: watcher > debounce`);
+   expect(events).toContain(`tests (bun test) rerun 2 of ${BASE_RERUNS} at the merge base ${sha} (bun test ./test/a.test.ts) exit 1: every branch failure is red there now`);
+   expect(events).toContain(`tests (bun test) at the merge base ${sha}, failing the same way (counting 2 rerun(s) of their files there): red on the merge base too, not gating: test/a.test.ts: watcher > debounce; test/b.test.ts: sandbox > denies`);
+  }, 60_000);
+
+  test(`a failure a red base does not fail in ${BASE_RERUNS} reruns of its file gates`, async () => {
+   const r = await bunRig(baseFailingDebounceOnRerunWhen("false"));
+   expect((await runNode("20", r.ctx)).status).toBe("failed");
+   const sha = await mergeBase(r);
+   expect(baseRuns(r.calls)).toHaveLength(1 + BASE_RERUNS);
+   expect(reviewed(r).filter((d) => d.includes(`at the merge base ${sha} (bun test ./test/a.test.ts) exit 0: still not red there: test/a.test.ts: watcher > debounce`))).toHaveLength(BASE_RERUNS);
+   expect(reviewed(r).some((d) => d.endsWith(`at the merge base ${sha} fails another set (exit 1) — not red there, they gate: test/a.test.ts: watcher > debounce`))).toBe(true);
+   expect(reviewed(r).some((d) => d.includes("red on the merge base too"))).toBe(false);
+   expect(r.github.prs.size).toBe(0);
+  }, 60_000);
+
+  test("a green base reruns nothing: a failure only the branch has gates", async () => {
+   const r = await bunRig("if [ -f src/feature.ts ]; then printf '\\ntest/a.test.ts:\\n(fail) watcher > debounce\\n\\n 1 fail\\n' >&2; exit 1; fi; echo ' 0 fail'");
+   expect((await runNode("20", r.ctx)).status).toBe("failed");
+   expect(baseRuns(r.calls)).toHaveLength(1);
+   expect(reviewed(r).some((d) => d.endsWith("passes — not red there, they gate: test/a.test.ts: watcher > debounce"))).toBe(true);
+   expect(reviewed(r).some((d) => d.includes(" rerun "))).toBe(false);
+  }, 60_000);
+
+  test("a failure whose file leaves the checkout gets no rerun at the base", async () => {
+   const r = await bunRig("if [ -f src/feature.ts ]; then printf '\\n../x.test.ts:\\n(fail) escapes\\n\\n 1 fail\\n' >&2; else printf '\\ntest/a.test.ts:\\n(fail) other\\n\\n 1 fail\\n' >&2; fi; exit 1");
+   expect((await runNode("20", r.ctx)).status).toBe("failed");
+   const sha = await mergeBase(r);
+   expect(baseRuns(r.calls)).toHaveLength(1);
+   expect(reviewed(r)).toContain(`tests (bun test) at the merge base ${sha} fail another set; no rerun there: ../x.test.ts: escapes name(s) no test file a rerun can select`);
+  }, 60_000);
+
+  test("runs at one merge base merge to each failure's most frequent count, never a sum", () => {
+   const a = { file: "test/a.test.ts", name: "flaky", cause: "" };
+   const b = { file: "test/b.test.ts", name: "other", cause: "" };
+   const merged = mostFailing([[a, b], [a, a], []]);
+   expect(merged).toEqual([a, a, b]);
+   expect(failuresNotAtBase([a, a, a], merged)).toEqual(["test/a.test.ts: flaky (3 on the branch, 2 at the base)"]);
+   expect(failuresNotAtBase([a, b], merged)).toEqual([]);
+  });
 
   test("the comparison uses every failing name, not the three the journal line keeps", async () => {
    const r = await bunRig("echo \"(fail) one\"; echo \"(fail) two\"; echo \"(fail) three\"; if [ -f src/feature.ts ]; then echo \"(fail) four\"; echo \" 4 fail\"; fi; exit 1");
@@ -2971,9 +3136,9 @@ describe("implement lane (node #23)", () => {
   });
 
   test("bunTestChain splits plain && chains with one bun test step, and nothing else", () => {
-   expect(bunTestChain("bun test")).toEqual({ rest: "" });
-   expect(bunTestChain("bun test && bunx tsc --noEmit")).toEqual({ rest: "bunx tsc --noEmit" });
-   expect(bunTestChain("bun run lint && bun test --timeout 20000 && bun run typecheck")).toEqual({ rest: "bun run lint && bun run typecheck" });
+   expect(bunTestChain("bun test")).toEqual({ bun: "bun test", rest: "" });
+   expect(bunTestChain("bun test && bunx tsc --noEmit")).toEqual({ bun: "bun test", rest: "bunx tsc --noEmit" });
+   expect(bunTestChain("bun run lint && bun test --timeout 20000 && bun run typecheck")).toEqual({ bun: "bun test --timeout 20000", rest: "bun run lint && bun run typecheck" });
    for (const command of ["npm test", "bun run test", "bun test; eslint .", "bun test || true", "bun test | tee log", "bun test && eslint . &", "bun test && echo $(eslint .)", "bun test -t 'a b'", "bun test && bun test", "bun test\neslint .", "bun tester"]) {
     expect(bunTestChain(command)).toBeNull();
    }

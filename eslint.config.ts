@@ -77,6 +77,25 @@ export default defineConfig(
   },
  },
  {
+  // Test mode has one owner. Production code that reads it changes behaviour
+  // under test, so a missing injection still passes (host-load.ts, #304).
+  files: ["src/**/*.ts"],
+  ignores: ["src/journal-guard.ts"],
+  rules: {
+   "no-restricted-syntax": [
+    "error",
+    {
+     selector: "ImportSpecifier[imported.name=/^(underTest|UNDER_TEST_ENV)$/]",
+     message: "Only src/journal-guard.ts reads test mode. Take the dependency as a parameter (as ImplementContext.hostLoad does) and let the test inject it.",
+    },
+    {
+     selector: "MemberExpression[property.name=/^(RANGER_UNDER_TEST|NODE_ENV)$/], Literal[value=/^(RANGER_UNDER_TEST|NODE_ENV)$/]",
+     message: "Only src/journal-guard.ts reads test mode. Take the dependency as a parameter (as ImplementContext.hostLoad does) and let the test inject it.",
+    },
+   ],
+  },
+ },
+ {
   // Same test-file carve-out as cortex: tests build any-typed mocks and
   // inject failures through unsafe casts.
   files: ["test/**/*.ts"],

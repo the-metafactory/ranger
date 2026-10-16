@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { stringify } from "yaml";
 import { loadConfig } from "../src/config.ts";
 import { openJournal, type WorkerRow } from "../src/journal.ts";
-import { infrastructureProbeHead, probeFailureClass, probesFailedOutcome } from "../src/outcomes.ts";
+import { branchFixableProbes, infrastructureProbeHead, probeFailureClass, probesFailedOutcome } from "../src/outcomes.ts";
 import { probeRequeueCandidates, requeueProbes } from "../src/probe-requeue.ts";
 import { walk } from "../src/walk.ts";
 import { realGitHub, type ForgePort } from "../src/implement.ts";
@@ -67,6 +67,24 @@ describe("probe failure classification", () => {
   expect(infrastructureProbeHead(legacy + "\nFAILED: probe-site.mjs")).toBeNull();
   expect(infrastructureProbeHead(legacy.replace("exit -1", "exit 1"))).toBeNull();
   expect(infrastructureProbeHead(outcome().replace("infrastructure", "assertion"))).toBeNull();
+ });
+ test("only the branch's own assertion failures and page errors are a probe fix pass's to answer, all or none", () => {
+  const clean = { red: [], unconfirmed: [] };
+  for (const kind of ["assert", "pageerror"]) {
+   expect(branchFixableProbes([run(1, failure(kind)), run(1, failure(kind))], ["probe-site.mjs"], clean)).toEqual(["probe-site.mjs"]);
+  }
+  expect(branchFixableProbes([run(1, failure("assert"))], ["probe-site.mjs"], { red: ["probe-site.mjs"], unconfirmed: [] })).toEqual([]);
+  expect(branchFixableProbes([run(1, failure("assert"))], ["probe-site.mjs"], { red: [], unconfirmed: ["probe-site.mjs"] })).toEqual([]);
+  expect(branchFixableProbes([run(1, failure("assert"))], ["probe-site.mjs"], null)).toEqual([]);
+  for (const result of [run(-1), run(137), run(1, failure("killed")), run(1, failure("crash")), run(1, "unknown error")]) {
+   expect(branchFixableProbes([result], ["probe-site.mjs"], clean)).toEqual([]);
+  }
+  const mixed = "FAIL probe-a.mjs (1.0s) exit=1 assert\n     │  FAIL  draws — x\nFAIL probe-b.mjs (1.0s) exit=1 crash\nFAILED: probe-a.mjs · probe-b.mjs";
+  expect(branchFixableProbes([run(1, mixed)], ["probe-a.mjs", "probe-b.mjs"], clean)).toEqual([]);
+  expect(branchFixableProbes([run(1, mixed)], ["probe-a.mjs", "probe-b.mjs"], { red: ["probe-b.mjs"], unconfirmed: [] })).toEqual(["probe-a.mjs"]);
+  const both = mixed.replace("exit=1 crash", "exit=1 assert");
+  expect(branchFixableProbes([run(1, both)], ["probe-a.mjs", "probe-b.mjs"], clean)).toEqual(["probe-a.mjs", "probe-b.mjs"]);
+  expect(branchFixableProbes([run(1, both)], ["probe-a.mjs", "probe-b.mjs"], { red: ["probe-b.mjs"], unconfirmed: [] })).toEqual(["probe-a.mjs"]);
  });
 });
 

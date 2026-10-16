@@ -1,8 +1,8 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { IMPLEMENT_LANES } from "./lanes.ts";
-import { defaultJournalPath, journalPathOverride } from "./journal-guard.ts";
-import { isAbsolute, resolve } from "node:path";
+import { defaultJournalPath, journalPathOverride, liveJournalDir } from "./journal-guard.ts";
+import { isAbsolute, join, resolve } from "node:path";
 import { parse } from "yaml";
 import { z } from "zod";
 import { parseForgeRef, repoIdentity, validReadTokenPrefix } from "./forge-ref.ts";
@@ -494,14 +494,15 @@ export interface LoadedConfig {
  path: string;
 }
 
-/** The working-directory default when no config override is supplied. */
-export function defaultConfigPath(cwd: string): string {
- return resolve(cwd, "ranger.yaml");
+/** Where the principal's private config lives when neither the flag nor RANGER_CONFIG names one. */
+export function defaultConfigPath(): string {
+ return join(liveJournalDir(), "ranger.yaml");
 }
 
-/** Resolve the flag, then RANGER_CONFIG, then ./ranger.yaml against the caller's cwd. */
+/** Resolve the flag, then RANGER_CONFIG, against the caller's cwd; then ~/.config/ranger/ranger.yaml. */
 export function resolveConfigPath(flag: string | undefined, env: NodeJS.ProcessEnv, cwd: string): string {
- return resolve(cwd, flag ?? env.RANGER_CONFIG ?? "ranger.yaml");
+ const chosen = flag ?? env.RANGER_CONFIG;
+ return chosen === undefined ? defaultConfigPath() : resolve(cwd, chosen);
 }
 
 /** Expand a leading `~` (journal path, canonical root). */

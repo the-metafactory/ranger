@@ -1,6 +1,6 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveConfigPath } from "../src/config.ts";
 import { jobRunArgv } from "../src/jobs.ts";
@@ -32,8 +32,8 @@ describe("resolveConfigPath", () => {
    .toBe(join(dir, "env/ranger.yaml"));
  });
 
- test("absent flag and environment preserve the working-directory default", () => {
-  expect(resolveConfigPath(undefined, {}, dir)).toBe(join(dir, "ranger.yaml"));
+ test("absent flag and environment read ~/.config/ranger/ranger.yaml, not the working directory", () => {
+  expect(resolveConfigPath(undefined, {}, dir)).toBe(join(homedir(), ".config", "ranger", "ranger.yaml"));
  });
 
  test("child commands carry the same absolute environment-selected path through --config", () => {
@@ -75,17 +75,19 @@ describe("CLI config path", () => {
   expect(JSON.parse(result.stdout)).toEqual([]);
  });
 
- test("missing RANGER_CONFIG reports its path even when ./ranger.yaml exists", async () => {
+ test("missing RANGER_CONFIG reports its path even when ~/.config/ranger/ranger.yaml exists", async () => {
   const cwd = join(dir, "default-caller");
   mkdirSync(cwd);
-  writeFileSync(join(cwd, "ranger.yaml"), baseConfigLines(cwd).join("\n") + "\n");
+  const home = join(dir, "default-home");
+  mkdirSync(join(home, ".config", "ranger"), { recursive: true });
+  writeFileSync(join(home, ".config", "ranger", "ranger.yaml"), baseConfigLines(cwd).join("\n") + "\n");
   const missing = join(dir, "does-not-exist.yaml");
-  const result = await runCli(["job", "list"], { ...process.env, RANGER_CONFIG: missing }, cwd);
+  const result = await runCli(["job", "list"], { ...process.env, HOME: home, RANGER_CONFIG: missing }, cwd);
   expect(result.code).not.toBe(0);
   expect(result.stdout).toBe("");
   expect(result.stderr).toContain(`cannot read config at ${missing}`);
 
-  const env = { ...process.env };
+  const env: NodeJS.ProcessEnv = { ...process.env, HOME: home };
   delete env.RANGER_CONFIG;
   const fallback = await runCli(["job", "list"], env, cwd);
   expect(fallback.stderr).toBe("");
@@ -93,10 +95,10 @@ describe("CLI config path", () => {
   expect(JSON.parse(fallback.stdout)).toEqual([]);
  });
 
- test("config option help names RANGER_CONFIG and the working-directory fallback", async () => {
+ test("config option help names RANGER_CONFIG and the ~/.config/ranger fallback", async () => {
   const result = await runCli(["job", "list", "--help"], process.env, dir);
   expect(result.code).toBe(0);
   expect(result.stdout).toContain("$RANGER_CONFIG");
-  expect(result.stdout).toContain("./ranger.yaml");
+  expect(result.stdout).toContain("~/.config/ranger/ranger.yaml");
  });
 });

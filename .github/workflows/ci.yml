@@ -1,7 +1,7 @@
 name: ci
 
 # The check run ranger's merge gate reads (src/merge-gate.ts: zero check runs
-# is not green). Same commands as the map's `commands.test` in ranger.yaml.
+# is not green). A ranger map of this repo sets the same commands as its `commands.test`.
 
 on:
   pull_request:
