@@ -202,7 +202,9 @@ describe("ratify phase (node #250)", () => {
    expect(reactionReads(f).at(-1)).toBe(`repos/${REPO}/issues/comments/9001/reactions?per_page=100`);
 
    // The spawned resume-for-close: no LLM session, the close cites the proposal.
+   const beforeClose = Date.now();
    const close = await f.cli(["run-node", "10", "--map", REPO], { RANGER_WORKER_CMD: "/nonexistent/worker" });
+   const afterClose = Date.now();
    expect(close.code).toBe(0);
    const outcome = JSON.parse(close.stdout);
    expect(outcome).toMatchObject({ status: "success", workerExit: null });
@@ -219,10 +221,16 @@ describe("ratify phase (node #250)", () => {
    expect(kinds).toContain("decisions-written");
    // The card closes with the node.
    expect(f.discord.edits.some((e) => e.messageId === card.messageId && e.content.startsWith("✅ closed on the graph"))).toBe(true);
+   const closedCard = f.journal(j => j.getEscalation(REPO, "10"))!;
+   expect(closedCard.status).toBe("closed");
+   expect(closedCard.closedAt).not.toBeNull();
+   expect(Date.parse(closedCard.closedAt!)).toBeGreaterThanOrEqual(beforeClose);
+   expect(Date.parse(closedCard.closedAt!)).toBeLessThanOrEqual(afterClose);
 
    // Nothing reads it again.
    const after = await f.tick();
    expect(after.result.ratify.read).toEqual([]);
+   expect(f.journal(j => j.getEscalation(REPO, "10")?.closedAt)).toBe(closedCard.closedAt);
   } finally {
    f.stop();
   }

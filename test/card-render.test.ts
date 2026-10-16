@@ -50,7 +50,7 @@ const closedRow: EscalationRow = {
   key: "acme/widgets:21", root: 1, repo: "acme/widgets", nodeId: "21",
   title: "Settle the escalation-desk write-side", route: "escalate-hitl", lastContent: null,
   channelId: "1", messageId: "m1", createdAt: "2026-10-08T10:00:00Z", lastEditedAt: null,
-  status: "open", notedAt: null,
+  status: "open", closedAt: null, notedAt: null,
 };
 const closedNode = {
   repo: "acme/widgets", ref: { id: "21" }, status: "closed", assignees: [], blockedBy: [],

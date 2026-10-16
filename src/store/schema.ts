@@ -157,6 +157,7 @@ export const escalations = sqliteTable(
    *  principal response or operator verb (design §5); the desk only ever
    *  writes open. */
   status: text("status").notNull().default("open"),
+  closedAt: text("closed_at"),
   /** When the queue-exit note was written — reconciles the absent-card scan. */
   notedAt: text("noted_at"),
  },

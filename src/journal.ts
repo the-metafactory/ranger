@@ -187,6 +187,7 @@ export interface EscalationRow {
  lastEditedAt: string | null;
  /** A confirmed graph closure also resolves the card. */
  status: "open" | "closed";
+ closedAt: string | null;
  /** When the queue-exit note was written (bounds the absent-card scan). */
  notedAt: string | null;
 }
@@ -949,6 +950,7 @@ export class Journal {
      | "channelId"
      | "lastEditedAt"
      | "status"
+     | "closedAt"
      | "notedAt"
     >
    >,
@@ -957,6 +959,12 @@ export class Journal {
   if (existing !== null && existing.root !== row.root) {
    throw new Error(`escalation ${row.repo}#${row.nodeId} belongs to map ${row.repo}#${existing.root}; refusing to move it to map ${row.repo}#${row.root}`);
   }
+  const status = row.status ?? existing?.status ?? "open";
+  const closedAt = status === "open"
+   ? null
+   : existing?.status === "closed"
+    ? existing.closedAt
+    : row.closedAt ?? new Date().toISOString();
   // One resolved field set, reused for both the insert values and the
   // conflict-update set (adding an escalation field is a single edit).
   const fields = {
@@ -972,7 +980,8 @@ export class Journal {
    // age"; round-23 review).
    createdAt: existing?.createdAt ?? row.createdAt,
    lastEditedAt: row.lastEditedAt ?? existing?.lastEditedAt ?? null,
-   status: row.status ?? existing?.status ?? "open",
+   status,
+   closedAt,
    notedAt:
     row.notedAt === undefined ? (existing?.notedAt ?? null) : row.notedAt,
   };
@@ -1570,6 +1579,7 @@ function hydrateEscalation(row: {
  createdAt: string;
  lastEditedAt: string | null;
  status: string;
+ closedAt: string | null;
  notedAt: string | null;
 }): EscalationRow {
  return {
@@ -1585,6 +1595,7 @@ function hydrateEscalation(row: {
   createdAt: row.createdAt,
   lastEditedAt: row.lastEditedAt,
   status: row.status as "open" | "closed",
+  closedAt: row.closedAt,
   notedAt: row.notedAt,
  };
 }

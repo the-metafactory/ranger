@@ -896,6 +896,7 @@ async function reconcileAbsentCard(
       createdAt: prior.createdAt,
       lastEditedAt: now.toISOString(),
       status: mode.status,
+      closedAt: mode.status === "closed" ? now.toISOString() : null,
       notedAt: now.toISOString(),
     });
     return {

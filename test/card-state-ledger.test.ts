@@ -137,15 +137,20 @@ describe("tick card-state ledger", () => {
    expect(JSON.parse(left.report).escalate.maps[0].keptOpen).toEqual(["604"]);
    checkBatch(f.captured.splice(0), { "604": "overdue" });
    expect(f.journal(j => j.getEscalation(REPO, "604")?.status)).toBe("open");
+   expect(f.journal(j => j.getEscalation(REPO, "604")?.closedAt)).toBeNull();
    f.graphNode("604", "closed");
    const closed = await f.run();
    expect(JSON.parse(closed.report).escalate.maps[0].closed).toEqual(["604"]);
    checkBatch(f.captured.splice(0), { "604": "resolved" });
    expect(f.journal(j => j.getEscalation(REPO, "604")?.status)).toBe("closed");
+   const closedAt = new Date(Date.parse(AT) + 9 * DAY).toISOString();
+   expect(f.journal(j => j.getEscalation(REPO, "604")?.closedAt)).toBe(closedAt);
    const edits = f.discord.edits.length;
+   f.setNow(10);
    await f.run();
    checkBatch(f.captured.splice(0), {});
    expect(f.discord.edits).toHaveLength(edits);
+   expect(f.journal(j => j.getEscalation(REPO, "604")?.closedAt)).toBe(closedAt);
   } finally { f.cleanup(); }
  });
 
