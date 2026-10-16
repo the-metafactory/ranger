@@ -146,6 +146,23 @@ export function probeFailureClass(runs: readonly { code: number; stdout: string;
  }) ? "infrastructure" : "unknown";
 }
 
+/**
+ * The failed probes a worker may fix: named ones that ended as an assertion
+ * or a page error at the head, in a run classed as an assertion failure, and
+ * that the merge base does not share. A crash, kill or timeout, a kind the
+ * runner did not print, and a red base stay the principal's.
+ */
+export function branchFixableProbes(
+ runs: readonly { code: number; stdout: string; stderr: string }[],
+ failed: readonly string[],
+ redOnBase: readonly string[],
+): string[] {
+ const last = runs.at(-1);
+ if (last === undefined || probeFailureClass(runs) !== "assertion") return [];
+ const kinds = parseFailedChecks(last.stdout);
+ return failed.filter((n) => PROBE_FILE.test(n) && !redOnBase.includes(n) && ["assert", "pageerror"].includes(kinds.get(n)?.kind ?? ""));
+}
+
 /** Explicit classes survive outcome truncation. Legacy signal-only parks can retry. */
 export function infrastructureProbeHead(outcome: string): string | null {
  const head = /^browser probes failed twice at ([0-9a-f]{8}) on (?:PR #|MR !)\d+ \(exit (-?\d+)\)/.exec(outcome);

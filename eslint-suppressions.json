@@ -334,10 +334,10 @@
       "count": 2
     },
     "@typescript-eslint/prefer-regexp-exec": {
-      "count": 6
+      "count": 5
     },
     "ranger/no-comments": {
-      "count": 294
+      "count": 293
     }
   },
   "src/intake.ts": {
