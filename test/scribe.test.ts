@@ -354,7 +354,7 @@ describe("scribeAfterMerge: the Scribe's pass before the close", () => {
  });
 
  test("a nit-severity finding that asks a behavior or check change still files, and so does a round with no impact line", async () => {
-  for (const body of [impact(1, 0, 4), impact(0, 1, 4), "### CodeQuality\nno impact line"]) {
+  for (const body of [impact(1, 0, 4), impact(0, 1, 4), `${impact(0, 0, 2)}\n\n${impact(1, 0, 2)}`, "### CodeQuality\nno impact line"]) {
    const filings = await scribeAfterMerge(ctx, { ...pr(), mergeCommitSha: null }, { ...REVIEW, majors: 0, nits: 5, body });
    expect(filings.review).toEqual({ node: expect.any(String) });
   }

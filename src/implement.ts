@@ -986,23 +986,25 @@ function leftFindings(r: { blockers: number; majors: number; nits: number }): nu
  return r.blockers + r.majors + r.nits;
 }
 
-const ROUND_IMPACT = /^Round impact: behavior (\d+), checks (\d+), prose \d+; unclassified impact (\d+)/m;
+const ROUND_IMPACT = /^Round impact: behavior (\d+), checks (\d+), prose \d+; unclassified impact (\d+)/gm;
 
 function leftWork(r: { blockers: number; majors: number; nits: number; body: string }): number {
- const impact = ROUND_IMPACT.exec(r.body);
- const asked = impact === null ? r.nits : Number(impact[1]) + Number(impact[2]) + Number(impact[3]);
+ const lines = [...r.body.matchAll(ROUND_IMPACT)];
+ const asked = lines.length === 0 ? r.nits : lines.reduce((n, m) => n + Number(m[1]) + Number(m[2]) + Number(m[3]), 0);
  return r.blockers + r.majors + asked;
 }
 
 /**
  * The Scribe's pass after a merge (design §6, node #24), before the close so
  * the receipt can cite what it filed: the last sage round's findings
- * (split-out-of-review, only when it left a blocker or a major) and the
- * marker comments the merge commit added (code-comment-graduated), each one
- * `propose` node below this node. A nit-only round files nothing: the nits
- * stay on the change, journalled and named in the receipt. Best effort: a
- * failed filing is journalled and named in the receipt, and the close goes
- * on. A superseded supervisor stops here (FencedError).
+ * (split-out-of-review, only when it left a blocker, a major, or a behavior,
+ * check or unclassified finding by sage's round-impact lines, or any finding
+ * when the round has none) and the marker comments the merge commit added
+ * (code-comment-graduated), each one `propose` node below this node. A
+ * prose-only round files nothing: its nits stay on the change, journalled and
+ * named in the receipt. Best effort: a failed filing is journalled and
+ * named in the receipt, and the close goes on. A superseded supervisor stops
+ * here (FencedError).
  */
 export async function scribeAfterMerge(
  ctx: ImplementContext,
