@@ -571,7 +571,7 @@ describe("implement lane (node #23)", () => {
   expect(result.code, `git ${args.join(" ")}: ${result.stderr}`).toBe(0);
   return result.stdout.trim();
  };
- const mergeUpdatedBase = async (r: Rig, name: string, changePatch = false) => {
+ const mergeUpdatedBase = async (r: Rig, name: string, patch: Record<string, string> = {}) => {
   const seed = join(r.dir, "seed");
   await fixtureGit(seed, ["pull", "-q", r.origin, "main"]);
   writeFileSync(join(seed, `${name}.md`), `${name}\n`);
@@ -581,7 +581,7 @@ describe("implement lane (node #23)", () => {
   const wt = join(r.canonical, ".worktrees", "node-20");
   await fixtureGit(wt, ["fetch", "origin", "main"]);
   await fixtureGit(wt, ["merge", "--no-ff", "--no-commit", "origin/main"]);
-  if (changePatch) writeFileSync(join(wt, "src", "feature.ts"), "export const feature = () => 42;\n");
+  for (const [path, content] of Object.entries(patch)) writeFileSync(join(wt, path), content);
   await fixtureGit(wt, ["add", "-A"]);
   await fixtureGit(wt, ["commit", "--no-edit"]);
   await fixtureGit(wt, ["push", "origin", "HEAD"]);
@@ -636,36 +636,74 @@ describe("implement lane (node #23)", () => {
   expect(recordedReviews(r.github.comments.get(1) ?? [], BOT).map(r => r.round)).toEqual([1, 1, 1, 2]);
  }, 60_000);
 
- for (const reason of ["changed patch", "blocker", "major", "foreign merge", "unreadable merge base", "failed diff", "foreign marker"] as const) {
+ const whitespaceEdits: Record<string, Record<string, string>> = {
+  "changed indentation": { "src/feature.ts": " export const feature = () => 1;\n" },
+  "changed string whitespace": { "tests/feature.test.ts": "import { feature } from '../ src/feature.ts';\n" },
+ };
+ for (const [reason, patch] of Object.entries(whitespaceEdits)) {
+  test(`node #320: ${reason} in a base merge forces fresh review even with equal stable patch-ids`, async () => {
+   const r = await rig({}); cleanup.push(r.dir);
+   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+   const before = await r.github.sha("node/20-add-the-feature-module");
+   const after = await mergeUpdatedBase(r, "whitespace-base", patch);
+   const wt = join(r.canonical, ".worktrees", "node-20");
+   const stableId = async (sha: string) => {
+    const base = await fixtureGit(wt, ["merge-base", "origin/main", sha]);
+    const diff = await runCmd("git", ["diff", base, sha], { cwd: wt, env: { ...process.env, ...GIT_ENV } });
+    expect(diff.code).toBe(0);
+    const id = await runCmd("git", ["patch-id", "--stable"], { cwd: wt, stdin: diff.stdout, env: { ...process.env, ...GIT_ENV } });
+    expect(id.code).toBe(0);
+    return id.stdout;
+   };
+   expect(await stableId(before)).toBe(await stableId(after));
+   expect((await resumeReview(r)).status).toBe("awaiting-merge");
+   expect(r.calls).toHaveLength(2);
+   expect(r.journal.listNodeEvents("acme/widgets", "20").filter(e => e.kind === "review-carried")).toEqual([]);
+  }, 60_000);
+ }
+
+ const failCarryGit = async (r: Rig, fail: string) => {
+  const wrapper = join(r.dir, "git-failure"); mkdirSync(wrapper);
+  const realGit = (await runCmd("which", ["git"])).stdout.trim();
+  writeFileSync(join(wrapper, "git"), `#!/bin/sh\n${fail}\nexec "${realGit}" "$@"\n`, { mode: 0o755 });
+  process.env.PATH = `${wrapper}:${process.env.PATH}`;
+ };
+ const carryRefusals: Record<string, { patch?: Record<string, string>; prepare?: (r: Rig, wt: string, before: string) => Promise<void>; detail?: string }> = {
+  "changed patch": { patch: { "src/feature.ts": "export const feature = () => 42;\n" }, detail: "stable patch-id changed" },
+  blocker: { prepare: async (r, _wt, before) => {
+   await r.github.postComment("acme/widgets", 1, reviewMarker(1, { commitId: before, blockers: 1, majors: 0, nits: 0 }));
+  } },
+  major: { prepare: async (r, _wt, before) => {
+   await r.github.postComment("acme/widgets", 1, reviewMarker(1, { commitId: before, blockers: 0, majors: 1, nits: 0 }));
+  } },
+  "foreign marker": { prepare: async r => {
+   const original = r.github.comments.get(1)!.find(c => c.body.startsWith("<!-- ranger:review"))!;
+   original.author = "mallory";
+  } },
+  "failed diff": { prepare: async r => failCarryGit(r, 'for arg do\n if [ "$arg" = diff ]; then exit 1; fi\ndone'), detail: "git diff failed" },
+  "unreadable merge base": { prepare: async r => failCarryGit(r, 'seen=0\nfor arg do\n if [ "$seen" = 1 ]; then\n  if [ "$arg" != --is-ancestor ]; then exit 1; fi\n  break\n fi\n if [ "$arg" = merge-base ]; then seen=1; fi\ndone'), detail: "git merge-base failed" },
+  "failed verbatim patch-id": { prepare: async r => failCarryGit(r, 'for arg do\n if [ "$arg" = --verbatim ]; then exit 1; fi\ndone'), detail: "git patch-id failed" },
+  "unreadable verbatim patch-id": { prepare: async r => failCarryGit(r, 'for arg do\n if [ "$arg" = --verbatim ]; then echo invalid; exit 0; fi\ndone'), detail: "git patch-id --verbatim returned no valid patch-id" },
+  "foreign merge": { prepare: async (r, wt, before) => {
+   await fixtureGit(wt, ["checkout", "-b", "foreign", before]);
+   await fixtureGit(wt, ["commit", "--allow-empty", "-m", "foreign commit"]);
+   await fixtureGit(wt, ["checkout", "node/20-add-the-feature-module"]);
+   await fixtureGit(wt, ["merge", "--no-ff", "--no-edit", "foreign"]);
+   await fixtureGit(wt, ["push", "origin", "HEAD"]);
+  }, detail: "merge parent is not reachable from the base" },
+ };
+ for (const [reason, setup] of Object.entries(carryRefusals)) {
   test(`node #320: ${reason} runs a fresh review instead of carrying`, async () => {
    const r = await rig({}); cleanup.push(r.dir);
    expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
    const before = await r.github.sha("node/20-add-the-feature-module");
-   await mergeUpdatedBase(r, "next-base", reason === "changed patch");
+   await mergeUpdatedBase(r, "next-base", setup.patch);
    const wt = join(r.canonical, ".worktrees", "node-20");
-   if (reason === "blocker" || reason === "major") {
-    await r.github.postComment("acme/widgets", 1, reviewMarker(1, { commitId: before, blockers: reason === "blocker" ? 1 : 0, majors: reason === "major" ? 1 : 0, nits: 0 }));
-   } else if (reason === "foreign marker") {
-    const original = r.github.comments.get(1)!.find(c => c.body.startsWith("<!-- ranger:review"))!;
-    original.author = "mallory";
-   } else if (reason === "failed diff" || reason === "unreadable merge base") {
-    const wrapper = join(r.dir, "git-failure"); mkdirSync(wrapper);
-    const realGit = (await runCmd("which", ["git"])).stdout.trim();
-    const fail = reason === "failed diff"
-     ? 'for arg do\n if [ "$arg" = diff ]; then exit 1; fi\ndone'
-     : 'seen=0\nfor arg do\n if [ "$seen" = 1 ]; then\n  if [ "$arg" != --is-ancestor ]; then exit 1; fi\n  break\n fi\n if [ "$arg" = merge-base ]; then seen=1; fi\ndone';
-    writeFileSync(join(wrapper, "git"), `#!/bin/sh\n${fail}\nexec "${realGit}" "$@"\n`, { mode: 0o755 });
-    process.env.PATH = `${wrapper}:${process.env.PATH}`;
-   } else if (reason === "foreign merge") {
-    await fixtureGit(wt, ["checkout", "-b", "foreign", before]);
-    await fixtureGit(wt, ["commit", "--allow-empty", "-m", "foreign commit"]);
-    await fixtureGit(wt, ["checkout", "node/20-add-the-feature-module"]);
-    await fixtureGit(wt, ["merge", "--no-ff", "--no-edit", "foreign"]);
-    await fixtureGit(wt, ["push", "origin", "HEAD"]);
-   }
+   await setup.prepare?.(r, wt, before);
    expect((await resumeReview(r)).status).toBe("awaiting-merge");
    expect(r.calls).toHaveLength(2);
    expect(r.journal.listNodeEvents("acme/widgets", "20").filter(e => e.kind === "review-carried")).toEqual([]);
+   if (setup.detail !== undefined) expect(r.journal.listNodeEvents("acme/widgets", "20").some(e => e.detail?.includes(setup.detail!))).toBe(true);
   }, 60_000);
  }
 
@@ -3665,7 +3703,7 @@ describe("implement lane (node #23)", () => {
    const head = await r.github.sha("node/20-add-the-feature-module");
    // Round 2 stands in for a rerun posted under the machine account: the
    // loop never reviews a head that already has a review.
-   await r.github.postComment("acme/widgets", 1, `${reviewMarker(2, { verdict: "commented", summary: "", commitId: head, blockers: 0, majors, nits: 0, body: "" })}\nround two`);
+   await r.github.postComment("acme/widgets", 1, `${reviewMarker(2, { commitId: head, blockers: 0, majors, nits: 0 })}\nround two`);
 
    r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
    const outcome = await runNode("20", r.ctx);

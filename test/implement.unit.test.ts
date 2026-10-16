@@ -262,6 +262,20 @@ describe("review markers (F2 resume record)", () => {
    { round: 1, sha: SHA, blockers: 1, majors: 2, nits: 3, body: "round one text" },
   ]);
  });
+ test.each([
+  `substrate=codex carried=${SHA}`,
+  `future=value carried=${SHA} substrate=codex`,
+  `substrate=codex future=value carried=${SHA}`,
+ ])("reads optional fields in any order and ignores unknown fields: %s", fields => {
+  const marker = reviewMarker(2, verdict).replace(" -->", ` ${fields} -->`);
+  expect(recordedReviews([{ id: 1, author: "ivy-bot", body: `${marker}\nreview text` }], "ivy-bot")).toEqual([
+   { round: 2, sha: SHA, blockers: 1, majors: 2, nits: 3, substrate: "codex", carried: SHA, body: "review text" },
+  ]);
+ });
+ test.each(["carried=not-a-sha", "carried=abc", "substrate=bad/value"])("ignores malformed known fields: %s", fields => {
+  const marker = reviewMarker(2, verdict).replace(" -->", ` ${fields} -->`);
+  expect(recordedReviews([{ id: 1, author: "ivy-bot", body: marker }], "ivy-bot")).toEqual([]);
+ });
  test("phase resolves from the PR: none → implement, open → review, merged → close, closed → pr-closed", () => {
   expect(resolvePhase(null)).toBe("implement");
   expect(resolvePhase(pr())).toBe("review");
@@ -292,7 +306,7 @@ describe("node #106 — newest-same-head-review-wins: the newest review at a hea
  const at = (round: number, sha: string, majors: number, author = "ivy-bot") => ({
   id: round,
   author,
-  body: `${reviewMarker(round, { verdict: "commented", summary: "", commitId: sha, blockers: 0, majors, nits: 0, body: "" })}\nround ${round}`,
+  body: `${reviewMarker(round, { commitId: sha, blockers: 0, majors, nits: 0 })}\nround ${round}`,
  });
  test("rounds 12 (1 major) and 13 (clean) on one head: round 13 stands, in either comment order", () => {
   for (const comments of [[at(12, SHA, 1), at(13, SHA, 0)], [at(13, SHA, 0), at(12, SHA, 1)]]) {
