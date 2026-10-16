@@ -964,7 +964,7 @@ export type ScribeOutcome = { node: string } | { error: string };
 
 /** The Scribe's filings after a merge; a key is absent when there was nothing to file. */
 export interface ScribeFilings {
- review?: ScribeOutcome;
+ review?: ScribeOutcome | { nitsLeft: number };
  /** `unread` when the merge's diff could not be read: nothing was scanned. */
  landmines?: (ScribeOutcome & { count: number }) | { unread: string };
 }
@@ -1018,6 +1018,7 @@ export async function scribeAfterMerge(
  if (final !== undefined && leftBlocking(final) > 0) {
   filings.review = await file("split-out-of-review", "the last review's findings", () => splitOutOfReviewSpec(map.repo, spawning, change, final));
  } else if (final !== undefined && final.nits > 0) {
+  filings.review = { nitsLeft: final.nits };
   journal.recordEvent("filed", {
    nodeId, repo: map.repo,
    detail: `left the last review's ${final.nits} nit(s) on ${changeRequestLabel(map.repo, pr.iid)} (${change.url}), not filed (nits only)`.slice(0, 400),
@@ -3521,6 +3522,16 @@ export function readyBody(
  ].join("\n");
 }
 
+function unfixedFindingsLine(ctx: ImplementContext, pr: ChangeRequest, final: RecordedReview | undefined, review: ScribeFilings["review"]): string {
+ if (final === undefined || leftFindings(final) === 0) return "None.";
+ const counts = `${final.blockers} blocker(s), ${final.majors} major(s) and ${final.nits} nit(s) from the last sage round`;
+ const noun = changeRequestNoun(ctx.map.repo);
+ if (review === undefined) return `${counts} are on the ${noun}, not filed back.`;
+ if ("nitsLeft" in review) return `${counts} stay on the ${noun} (${changeRequestUrl(ctx.map.repo, pr.iid, pr.webUrl)}); nits are not filed back.`;
+ if ("node" in review) return `${counts}, split out as node #${review.node} below this node.`;
+ return `${counts} are on the ${noun}; filing them back failed (${review.error}).`;
+}
+
 export function closeResolution(
  ctx: ImplementContext,
  pr: ChangeRequest,
@@ -3530,18 +3541,7 @@ export function closeResolution(
  probe?: RecordedProbe,
  filings: ScribeFilings = {},
 ): string {
- const counts = final === undefined ? "" : `${final.blockers} blocker(s), ${final.majors} major(s) and ${final.nits} nit(s) from the last sage round`;
- const review = filings.review;
- const deferred =
-  final === undefined || leftFindings(final) === 0
-   ? "None."
-   : review === undefined
-    ? leftBlocking(final) === 0
-     ? `${counts} stay on the ${changeRequestNoun(ctx.map.repo)} (${changeRequestUrl(ctx.map.repo, pr.iid, pr.webUrl)}); nits are not filed back.`
-     : `${counts} are on the ${changeRequestNoun(ctx.map.repo)}, not filed back.`
-    : "node" in review
-     ? `${counts}, split out as node #${review.node} below this node.`
-     : `${counts} are on the ${changeRequestNoun(ctx.map.repo)}; filing them back failed (${review.error}).`;
+ const deferred = unfixedFindingsLine(ctx, pr, final, filings.review);
  const landmines = filings.landmines;
  const landmineLine = landmines === undefined
   ? []

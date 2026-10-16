@@ -340,7 +340,7 @@ describe("scribeAfterMerge: the Scribe's pass before the close", () => {
  test("a nit-only round files nothing: the nits stay on the PR, journalled and named in the receipt", async () => {
   const nitsOnly = { ...REVIEW, majors: 0, nits: 9 };
   const filings = await scribeAfterMerge(ctx, { ...pr(), mergeCommitSha: null }, nitsOnly);
-  expect(filings).toEqual({});
+  expect(filings).toEqual({ review: { nitsLeft: 9 } });
   expect(fake.calls).toEqual([]);
   expect(events()).toEqual([
    "left the last review's 9 nit(s) on PR #42 (https://github.com/acme/widgets/pull/42), not filed (nits only)",
