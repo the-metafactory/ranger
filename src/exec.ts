@@ -28,6 +28,7 @@ export function splitLines(buffer: string): { lines: string[]; rest: string } {
 }
 
 export interface RunOptions {
+  stdin?: string;
   /** Full env for the child. When `env` is provided it replaces the child env entirely. */
   env?: NodeJS.ProcessEnv;
   cwd?: string;
@@ -71,9 +72,11 @@ export function runCmd(
     const child = spawn(niced ? "nice" : bin, niced ? ["-n", String(opts.nice), bin, ...args] : args, {
       env: opts.env ?? process.env,
       cwd: opts.cwd,
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: [opts.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
       detached: opts.processGroup === true,
     });
+    child.stdin?.on("error", () => undefined);
+    child.stdin?.end(opts.stdin);
     if (child.pid !== undefined) opts.onSpawn?.(child.pid);
     let stdout = "";
     let stderr = "";
@@ -87,7 +90,7 @@ export function runCmd(
       tail.push(line.length > TAIL_LINE_CHARS ? `${line.slice(0, TAIL_LINE_CHARS)}…` : line);
       if (tail.length > TAIL_LINES) tail.shift();
     };
-    child.stdout.on("data", (chunk) => {
+    child.stdout?.on("data", (chunk) => {
       const text = chunk.toString();
       if (keep === undefined) {
         stdout += text;
@@ -101,7 +104,7 @@ export function runCmd(
       partial = rest.length > 0 ? [rest] : [];
       for (const line of lines) keepLine(line);
     });
-    child.stderr.on("data", (chunk) => {
+    child.stderr?.on("data", (chunk) => {
       stderr += chunk.toString();
     });
     let timedOut = false;

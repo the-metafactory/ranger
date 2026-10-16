@@ -114,7 +114,7 @@ const NO_SUBMODULE_RECURSION = [
  */
 export async function safeGit(
  args: string[],
- opts: { cwd: string; credential?: GitCredential; canonical?: string; timeoutMs?: number },
+ opts: { cwd: string; credential?: GitCredential; canonical?: string; timeoutMs?: number; stdin?: string },
 ): Promise<RunResult> {
  if (opts.credential !== undefined) {
   assertCredential(opts.credential, `\`git ${args[0]}\``);
@@ -138,6 +138,7 @@ export async function safeGit(
    cwd: opts.cwd,
    env: opts.credential === undefined ? base : gitAuthEnv(opts.credential, base),
    timeoutMs: opts.timeoutMs ?? 60_000,
+   stdin: opts.stdin,
   },
  );
 }
@@ -1078,4 +1079,41 @@ export async function isAncestor(cwd: string, ancestor: string, descendant: stri
  if (r.code === 0) return true;
  if (r.code === 1) return false;
  throw new GitSafetyError(`cannot compare ${ancestor.slice(0, 8)} with ${descendant.slice(0, 8)}: ${r.stderr.trim()}`);
+}
+
+/**
+ * Prove an unchanged PR patch across base-only merges on the first-parent
+ * chain. Any unreadable history, failed command or changed patch refuses
+ * the carry; the caller runs a fresh review instead.
+ */
+export async function baseOnlyMergePatchId(cwd: string, base: string, reviewed: string, head: string): Promise<string | null> {
+ try {
+  if (reviewed === head || !/^[0-9a-f]{7,64}$/.test(reviewed) || !/^[0-9a-f]{7,64}$/.test(head)) return null;
+  const git = async (args: string[], stdin?: string): Promise<string> => {
+   const result = await safeGit(args, { cwd, stdin, timeoutMs: 30_000 });
+   if (result.code !== 0) throw new GitSafetyError(`cannot prove base-only merge: ${result.stderr.trim()}`);
+   return result.stdout;
+  };
+  const baseSha = (await git(["rev-parse", "--verify", `refs/remotes/origin/${base}^{commit}`])).trim();
+  let at = head;
+  while (at !== reviewed) {
+   const parents = (await git(["rev-list", "--parents", "-n", "1", at])).trim().split(/\s+/);
+   if (parents[0] !== at || parents.length < 3) return null;
+   for (const parent of parents.slice(2)) {
+    if (!(await isAncestor(cwd, parent, baseSha))) return null;
+   }
+   at = parents[1];
+  }
+  const patchId = async (sha: string): Promise<string | null> => {
+   const mergeBase = (await git(["merge-base", baseSha, sha])).trim();
+   const diff = await git(["diff", "--no-ext-diff", "--no-textconv", mergeBase, sha, "--"]);
+   const id = await git(["patch-id", "--stable"], diff);
+   return /^([0-9a-f]{40,64})\s+[0-9a-f]{40,64}$/.exec(id.trim())?.[1] ?? null;
+  };
+  const before = await patchId(reviewed);
+  const after = await patchId(head);
+  return before !== null && before === after ? before : null;
+ } catch {
+  return null;
+ }
 }

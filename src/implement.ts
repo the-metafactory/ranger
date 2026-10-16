@@ -15,6 +15,7 @@ import { runCmd, type RunOptions, type RunResult } from "./exec.ts";
 import {
  assertGitUntouched,
  assertNoClosingKeywords,
+ baseOnlyMergePatchId,
  closingKeywordRefusal,
  commitsAhead,
  dirtyFiles,
@@ -250,9 +251,9 @@ async function assertRemotePush(ctx: ImplementContext, sha: string): Promise<voi
 }
 
 /** The review-round marker ranger writes into each review comment it posts. */
-export function reviewMarker(round: number, v: ReviewVerdict, substrate?: SubstrateName): string {
+export function reviewMarker(round: number, v: ReviewVerdict | Pick<ReviewVerdict, "commitId" | "blockers" | "majors" | "nits">, substrate?: string, carried?: string): string {
  const base = `<!-- ranger:review round=${round} sha=${v.commitId} blockers=${v.blockers} majors=${v.majors} nits=${v.nits}`;
- return substrate !== undefined ? `${base} substrate=${substrate} -->` : `${base} -->`;
+ return `${base}${carried === undefined ? "" : ` carried=${carried}`}${substrate === undefined ? "" : ` substrate=${substrate}`} -->`;
 }
 
 export interface RecordedReview {
@@ -263,11 +264,12 @@ export interface RecordedReview {
  nits: number;
  /** The substrate the review ran on (node #45); undefined for old markers. */
  substrate?: string;
+ carried?: string;
  /** The review text, without the marker — the fix pass's input on a resume. */
  body: string;
 }
 
-const MARKER = /^<!-- ranger:review round=(\d+) sha=([0-9a-f]{7,64}) blockers=(\d+) majors=(\d+) nits=(\d+)(?:\s+substrate=(\w+))? -->/;
+const MARKER = /^<!-- ranger:review round=(\d+) sha=([0-9a-f]{7,64}) blockers=(\d+) majors=(\d+) nits=(\d+)(?:\s+carried=([0-9a-f]{7,64}))?(?:\s+substrate=(\w+))? -->/;
 
 /**
  * The durable review record on the PR: markers in comments the MACHINE
@@ -291,11 +293,16 @@ export function recordedReviews(
    blockers: Number(m[3]),
    majors: Number(m[4]),
    nits: Number(m[5]),
-   substrate: m[6] ?? undefined,
+   carried: m[6],
+   substrate: m[7] ?? undefined,
    body: c.body.replace(MARKER, "").trim(),
   });
  }
  return out.sort((a, b) => a.round - b.round);
+}
+
+function reviewRounds(reviews: RecordedReview[]): number {
+ return reviews.reduce((round, review) => Math.max(round, review.round), 0);
 }
 
 /** The hidden markers ranger and sage write into their own PR comments. */
@@ -1531,6 +1538,20 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
    }
   }
   let current = reviewAtHead(reviews, live.headSha);
+  if (current === undefined && reviewer !== null) {
+   const previous = reviews.at(-1);
+   if (previous !== undefined && gatingFindings(previous) === 0) {
+    const patchId = await baseOnlyMergePatchId(worktree, base, previous.sha, live.headSha);
+    if (patchId !== null) {
+     const body = `Review carried from \`${previous.sha}\` to \`${live.headSha}\`: base-only merges with unchanged patch-id \`${patchId}\`.\n\n${previous.body}`;
+     fence("carry review");
+     await github.postComment(repo, open.iid, `${reviewMarker(previous.round, { ...previous, commitId: live.headSha }, previous.substrate, previous.sha)}\n${body}`, token);
+     current = { ...previous, sha: live.headSha, carried: previous.sha, body };
+     reviews = [...reviews, current];
+     journal.recordEvent("review-carried", { nodeId, repo, detail: `round ${previous.round} carried from ${previous.sha} to ${live.headSha}; patch-id ${patchId}` });
+    }
+   }
+  }
   const superseded = supersededNote(reviews, live.headSha);
   if (superseded !== null && notedSha !== live.headSha) {
    journal.recordEvent("reviewed", { nodeId, repo, detail: superseded });
@@ -1543,10 +1564,10 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
     journal.updateWorker(nodeId, ctx.map.repo, { phase: "awaiting-review" });
     throw new ParkSignal(gitlabReviewHoldOutcome({ repo, pr: open.iid }));
    }
-   if (reviews.length >= cap) {
-    throw new ParkSignal(reviewCapHeadMovedOutcome({ repo, rounds: reviews.length, pr: open.iid }));
+   if (reviewRounds(reviews) >= cap) {
+    throw new ParkSignal(reviewCapHeadMovedOutcome({ repo, rounds: reviewRounds(reviews), pr: open.iid }));
    }
-   const round = reviews.length + 1;
+   const round = reviewRounds(reviews) + 1;
    fence("review");
    const { substrate: reviewSubstrate, chosenOn } = await selectReviewSubstrate(ctx, live.headSha, round);
    // The sage round is a substrate session (node #56): its row opens under
@@ -1723,7 +1744,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
 
  // ---- ready → awaiting merge ----
  fence("mark ready");
- const body = refuseClosingKeyword(ctx, `the ready ${changeRequestNoun(repo)} description`, readyBody(ctx, final, reviews.length, probe));
+ const body = refuseClosingKeyword(ctx, `the ready ${changeRequestNoun(repo)} description`, readyBody(ctx, final, reviewRounds(reviews), probe));
  await github.updatePrBody(repo, open.iid, body, token);
  await github.markReady(repo, await github.getPr(repo, open.iid, token), token);
  journal.updateWorker(nodeId, ctx.map.repo, {
@@ -2512,7 +2533,7 @@ async function closeAfterMerge(
   (p) => p.sha === pr.headSha && p.passed,
  );
  const filings = await scribeAfterMerge(ctx, pr, final);
- const resolution = closeResolution(ctx, pr, final, reviews.length, success, probe, filings);
+ const resolution = closeResolution(ctx, pr, final, reviewRounds(reviews), success, probe, filings);
  const resolutionFile = join(tmpdir(), `ranger-close-${fileStemFor(repo, nodeId)}.md`);
  writeFileSync(resolutionFile, resolution, "utf8");
 

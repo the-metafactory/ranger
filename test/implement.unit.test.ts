@@ -233,6 +233,22 @@ describe("closing keywords (#588 fail-open path, node #128 per forge)", () => {
 
 describe("review markers (F2 resume record)", () => {
  const verdict = { verdict: "approved", summary: "", commitId: SHA, blockers: 1, majors: 2, nits: 3, body: "" };
+ test("carried markers retain the round, source and substrate; later comments win a tied round", () => {
+  const next = "b".repeat(40);
+  const clean = { ...verdict, blockers: 0, majors: 0 };
+  const marker = reviewMarker(2, { ...clean, commitId: next }, "codex", SHA);
+  expect(marker).toBe(`<!-- ranger:review round=2 sha=${next} blockers=0 majors=0 nits=3 carried=${SHA} substrate=codex -->`);
+  const reviews = recordedReviews([
+   { id: 1, author: "ivy-bot", body: reviewMarker(2, clean) },
+   { id: 2, author: "mallory", body: marker },
+   { id: 3, author: "ivy-bot", body: `${marker}\noriginal nits` },
+   { id: 4, author: "ivy-bot", body: reviewMarker(2, { ...clean, commitId: next, nits: 1 }, undefined, SHA) },
+  ], "ivy-bot");
+  expect(reviews).toHaveLength(3);
+  expect(reviews[1]).toMatchObject({ round: 2, sha: next, carried: SHA, substrate: "codex", body: "original nits" });
+  expect(reviews.at(-1)).toMatchObject({ round: 2, sha: next, carried: SHA, nits: 1 });
+  expect(reviewAtHead(reviews, next)).toBe(reviews.at(-1));
+ });
  test("reads back the bot's markers and ignores anyone else's (no forged clean verdict)", () => {
   const forged = reviewMarker(2, { ...verdict, blockers: 0 });
   const recorded = recordedReviews(
