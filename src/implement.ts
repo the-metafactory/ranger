@@ -976,7 +976,7 @@ export type ScribeOutcome = { node: string } | { error: string };
 
 /** The Scribe's filings after a merge; a key is absent when there was nothing to file. */
 export interface ScribeFilings {
- review?: ScribeOutcome;
+ review?: ScribeOutcome | { proseLeft: number };
  /** `unread` when the merge's diff could not be read: nothing was scanned. */
  landmines?: (ScribeOutcome & { count: number }) | { unread: string };
 }
@@ -986,13 +986,25 @@ function leftFindings(r: { blockers: number; majors: number; nits: number }): nu
  return r.blockers + r.majors + r.nits;
 }
 
+const ROUND_IMPACT = /^Round impact: behavior (\d+), checks (\d+), prose \d+; unclassified impact (\d+)/gm;
+
+function leftWork(r: { blockers: number; majors: number; nits: number; body: string }): number {
+ const lines = [...r.body.matchAll(ROUND_IMPACT)];
+ const asked = lines.length === 0 ? r.nits : lines.reduce((n, m) => n + Number(m[1]) + Number(m[2]) + Number(m[3]), 0);
+ return r.blockers + r.majors + asked;
+}
+
 /**
  * The Scribe's pass after a merge (design §6, node #24), before the close so
  * the receipt can cite what it filed: the last sage round's findings
- * (split-out-of-review) and the marker comments the merge commit added
- * (code-comment-graduated), each one `propose` node below this node. Best
- * effort: a failed filing is journalled and named in the receipt, and the
- * close goes on. A superseded supervisor stops here (FencedError).
+ * (split-out-of-review, only when it left a blocker, a major, or a behavior,
+ * check or unclassified finding by sage's round-impact lines, or any finding
+ * when the round has none) and the marker comments the merge commit added
+ * (code-comment-graduated), each one `propose` node below this node. A
+ * prose-only round files nothing: its nits stay on the change, journalled and
+ * named in the receipt. Best effort: a failed filing is journalled and
+ * named in the receipt, and the close goes on. A superseded supervisor stops
+ * here (FencedError).
  */
 export async function scribeAfterMerge(
  ctx: ImplementContext,
@@ -1021,8 +1033,14 @@ export async function scribeAfterMerge(
   }
  };
  const filings: ScribeFilings = {};
- if (final !== undefined && leftFindings(final) > 0) {
+ if (final !== undefined && leftWork(final) > 0) {
   filings.review = await file("split-out-of-review", "the last review's findings", () => splitOutOfReviewSpec(map.repo, spawning, change, final));
+ } else if (final !== undefined && final.nits > 0) {
+  filings.review = { proseLeft: final.nits };
+  journal.recordEvent("filed", {
+   nodeId, repo: map.repo,
+   detail: `left the last review's ${final.nits} nit(s) on ${changeRequestLabel(map.repo, pr.iid)} (${change.url}), not filed (prose only: no blocker, major, behavior or check finding)`.slice(0, 400),
+  });
  }
  const merge = pr.mergeCommitSha;
  if (merge !== null) {
@@ -3682,6 +3700,16 @@ export function readyBody(
  ].join("\n");
 }
 
+function unfixedFindingsLine(ctx: ImplementContext, pr: ChangeRequest, final: RecordedReview | undefined, review: ScribeFilings["review"]): string {
+ if (final === undefined || leftFindings(final) === 0) return "None.";
+ const counts = `${final.blockers} blocker(s), ${final.majors} major(s) and ${final.nits} nit(s) from the last sage round`;
+ const noun = changeRequestNoun(ctx.map.repo);
+ if (review === undefined) return `${counts} are on the ${noun}, not filed back.`;
+ if ("proseLeft" in review) return `${counts} stay on the ${noun} (${changeRequestUrl(ctx.map.repo, pr.iid, pr.webUrl)}); prose-only findings are not filed back.`;
+ if ("node" in review) return `${counts}, split out as node #${review.node} below this node.`;
+ return `${counts} are on the ${noun}; filing them back failed (${review.error}).`;
+}
+
 export function closeResolution(
  ctx: ImplementContext,
  pr: ChangeRequest,
@@ -3691,16 +3719,7 @@ export function closeResolution(
  probe?: RecordedProbe,
  filings: ScribeFilings = {},
 ): string {
- const counts = final === undefined ? "" : `${final.blockers} blocker(s), ${final.majors} major(s) and ${final.nits} nit(s) from the last sage round`;
- const review = filings.review;
- const deferred =
-  final === undefined || leftFindings(final) === 0
-   ? "None."
-   : review === undefined
-    ? `${counts} are on the ${changeRequestNoun(ctx.map.repo)}, not filed back.`
-    : "node" in review
-     ? `${counts}, split out as node #${review.node} below this node.`
-     : `${counts} are on the ${changeRequestNoun(ctx.map.repo)}; filing them back failed (${review.error}).`;
+ const deferred = unfixedFindingsLine(ctx, pr, final, filings.review);
  const landmines = filings.landmines;
  const landmineLine = landmines === undefined
   ? []
