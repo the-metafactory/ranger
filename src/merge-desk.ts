@@ -60,12 +60,12 @@ import { isTransientGitHubError } from "./transient.ts";
  * found nothing to change, the row parks on CI as before, and a rerun that
  * turns CI green still moves it on.
  *
- * On a GitLab map (node #126) the desk holds the GitLab port. A project under
- * `rebase_merge` may answer `needs-rebase`: once the rest of the gate passes
+ * GitLab under `rebase_merge` and GitHub when `behind` answer
+ * `needs-rebase`: once the rest of the gate passes
  * and ranger would merge, it rebases and stops, and the new head is re-gated
  * (a fresh review round, since a review never carries across a rebase). A
  * head move counts as ranger's rebase only when ranger asked for a rebase
- * from the gated head and the forge lists the same commits after the move;
+ * from the gated head and the adapter confirms the update's provenance;
  * any other move the rebase pass sees parks. A move between passes, after a
  * rebase ranger knew only as pending, is re-gated and held at the card:
  * never auto-merged. The merge is squashed and pinned to the gated head, and a project whose squash
@@ -169,7 +169,7 @@ const MAX_REBASE_PASSES_AT_HEAD = 10;
 /** The `rebased` event's prose; the SHAs are the journal's (`recordRebase`). */
 function rebasedNote(rebase: Extract<RebaseOutcome, { status: "head-moved" | "pending" }>, repo: string, iid: number, base: string): string {
  const cr = changeRequestLabel(repo, iid);
- if (rebase.status === "head-moved") return `${cr} rebased onto ${base} (ranger asked for it, and the forge lists the same commits at the new head); it is re-gated there`;
+ if (rebase.status === "head-moved") return `${cr} rebased onto ${base} (ranger asked for it, and the forge confirms the update at the new head); it is re-gated there`;
  return rebase.requested
   ? `ranger asked for a rebase of ${cr} onto ${base}; the head has not moved yet (${rebase.reason})`
   : `ranger waited on a running rebase of ${cr} onto ${base}; the head has not moved yet (${rebase.reason})`;
@@ -648,7 +648,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   // park it there. A posted merge card is withdrawn first, so a stale
   // "merge needed" never stands.
   const missingProbes = probesRequired && probe === undefined && last !== undefined;
-  // Ranger rebased the reviewed head (a forge under rebase_merge asked): the
+  // Ranger updated the reviewed head (the forge asked for needs-rebase): the
   // new head has no review, so it is re-gated by a fresh round, not parked.
   // The review never carries across the rebase: the gate binds to its head.
   // A landing ranger did not see is re-gated too, but never auto-merged.
@@ -663,7 +663,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    await sendBack(row, why, title, noCi ? pr.headSha : undefined);
    return;
   }
-  // A forge that asks for a rebase (GitLab under rebase_merge) is gated on
+  // A forge that asks for a branch update is gated on
   // everything else first: ranger rebases only a change it would merge.
   const rebasePr = pr.mergeState === "needs-rebase" ? github.rebasePr?.bind(github) : undefined;
   const needsRebase = rebasePr !== undefined;
@@ -773,7 +773,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
     ...(rebaseHold !== null
      ? [`Note: ${rebaseHold}. Confirm the moved head is ranger's rebase before you merge.${map.autoMerge ? " Auto-merge is held for that reason." : ""}`]
      : []),
-    ...(needsRebase ? [`The forge asks for a rebase first: rebase the MR onto \`${map.base}\`, then merge it.`] : []),
+    ...(needsRebase ? [`The forge asks for a branch update first: update ${cr} onto \`${map.base}\`, then merge it.`] : []),
     ...(probesRequired
      ? [`Probes passed at \`${gate.headSha.slice(0, 8)}\` (selection ${probe?.mode ?? "?"}, ${probe?.selected ?? "?"} probe(s)). Only the selected probes ran, not the full suite.${baseRedNote(repo, probe)}`]
      : ["No probe tier on this map: CI and the tests are the only automated checks."]),
