@@ -804,14 +804,14 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
           openClaimed: [],
         }),
       );
-      const config = writeConfig(dir, "999"); // principal.discordId → pings
+      const config = writeConfig(dir, "999"); // principal.discordId is set — and ignored
       const env = envFor(fixtureDir, discord.port);
       const run1 = await runCli(["escalate", "-c", config, "--json"], env);
       expect(JSON.parse(run1.stdout).maps[0].posted).toHaveLength(1);
 
       // A week later the age band is overdue: content changes → edit in
-      // place. Assert kind/url mentions are inerted and the `<@id>` suffix
-      // survives the 1950-char front-cap.
+      // place. Assert kind/url mentions are inerted and the overdue tail
+      // survives the 1950-char front-cap WITHOUT mentioning anyone.
       const later = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
       const run2 = await runCli(["escalate", "-c", config, "--json"], {
         ...env,
@@ -821,10 +821,10 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
       const content = discord.edits.at(-1)?.content ?? "";
       expect(content).not.toContain("<@1234567890>");
       expect(content).toContain("‹@1234567890");
-      // The overdue suffix — including the `<@id>` ping — survives the
-      // 2000-char cap (round-13 review fix).
-      expect(content).toContain("📣 <@999>");
-      expect(content.endsWith("\n📣 <@999> 7d old — needs your attention")).toBe(true);
+      // The overdue tail survives the 2000-char cap (round-13 review fix) and
+      // carries no mention: an overdue card is state, not a ping.
+      expect(content.endsWith("\n📣 7d old — overdue")).toBe(true);
+      expect(content).not.toContain("<@");
       expect(content.length).toBeLessThanOrEqual(2000);
     } finally {
       discord.stop();
@@ -839,9 +839,10 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
     const discord = fakeDiscord();
     try {
       // A graph author sets ref.id to the principal's mention: rendered raw it
-      // would ping BEFORE day 7 (allowed_mentions always permits the
-      // principal id) — the blocker is that node.id must be mention-inerted
-      // at every render site (head line, queue-exit note, digest lines).
+      // would ping the principal on day 0 — the blocker is that node.id must
+      // be mention-inerted at every render site (head line, queue-exit note,
+      // digest lines). No render site adds a mention of its own any more, so
+      // no content can carry `<@` at all.
       const node = {
         ref: { id: "<@1234567890>" },
         node: {
@@ -875,17 +876,17 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
           openClaimed: [],
         }),
       );
-      const config = writeConfig(dir, "999"); // pings are possible
+      const config = writeConfig(dir, "999"); // set in ranger.yaml, and never used to ping
       const env = envFor(fixtureDir, discord.port);
       const run = await runCli(["escalate", "-c", config, "--json"], env);
       expect(run.code).toBe(0);
       const content = discord.posts.at(-1)?.content ?? "";
-      // The raw mention must not reach Discord (no early ping); the inerted
-      // form appears instead, and the LEGITIMATE 7-day ping id is NOT present
-      // (age 0).
+      // The raw mention must not reach Discord (no ping at all); the inerted
+      // form appears instead, and no render site adds a mention of its own.
       expect(content).not.toContain("<@1234567890>");
       expect(content).toContain("‹@1234567890");
       expect(content).not.toContain("<@999>");
+      expect(content).not.toContain("<@");
     } finally {
       discord.stop();
       rmSync(dir, { recursive: true, force: true });
@@ -1053,12 +1054,12 @@ describe("ranger escalate — escalation desk (design §5, node #20)", () => {
         { ...baseEnv, RANGER_NOW: t8.toISOString() },
       );
       expect(JSON.parse(r2.stdout).maps[0].posted).toHaveLength(4); // reposted in B
-      // The reposted B card shows the card's TRUE age (8d overdue + ping),
-      // not age 0 — a channel move must not erase escalation state.
+      // The reposted B card shows the card's TRUE age (8d overdue), not age 0
+      // — a channel move must not erase escalation state.
       const bPost = discord.posts[postsBefore]; // first B card (node 11)
       expect(bPost.content).toContain("· age 8d ·");
-      expect(bPost.content).toContain("8d old — needs your attention");
-      expect(bPost.content).toContain("<@285727653603049472>");
+      expect(bPost.content).toContain("8d old — overdue");
+      expect(bPost.content).not.toContain("<@");
       // The row's createdAt is IMMUTABLE across the move.
       expect(j.getEscalation("acme/widgets", "11")?.createdAt).toBe(created);
       // Next tick in B at day 8: no edit (content already shows true age).

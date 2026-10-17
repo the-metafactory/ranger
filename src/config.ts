@@ -238,7 +238,9 @@ const PrincipalSchema = z.object({
    } catch { return false; }
   }, "expected forge:host"), z.string().min(1)),
  ]).default("jcfischer"),
- /** Discord user id for the aged-card @-mention; absent → no pings. */
+ /** Discord user id the intake gate reads the principal's own messages with.
+  *  Ignored by escalation cards since Vigil texts overdue nodes (soma#787 Q42):
+  *  no ranger card or digest pings anyone, whatever this holds. */
  discordId: z.string().optional(),
 });
 

@@ -63,8 +63,6 @@ interface DigestInputs {
   ageCounts: { aged: number; overdue: number };
   audit: AuditResult;
   budget: DigestMapResult["budget"];
-  principal: string;
-  principalDiscordId?: string;
   now: Date;
 }
 
@@ -81,8 +79,6 @@ export function digestContent(inputs: DigestInputs): string {
     ageCounts,
     audit,
     budget,
-    principal,
-    principalDiscordId,
     now,
   } = inputs;
   const frame = {
@@ -91,7 +87,7 @@ export function digestContent(inputs: DigestInputs): string {
     title: mapKey(map),
     meta: [`walk: ${map.walk}`, localDateKey(now)],
   };
-  const cardsLine = `Cards: ${openCount}${ageCounts.aged > 0 ? ` (${ageCounts.aged} aged 3+d, ${ageCounts.overdue} 7+d${principalDiscordId ? " @-mentioned" : " no ping"})` : ""}`;
+  const cardsLine = `Cards: ${openCount}${ageCounts.aged > 0 ? ` (${ageCounts.aged} aged 3+d, ${ageCounts.overdue} 7+d)` : ""}`;
   const summarize = (items: string[], max: number): string => {
     if (items.length === 0) return "";
     // Every item is graph-derived — sanitize so a crafted `<@principal-id>`
@@ -136,8 +132,6 @@ export function digestContent(inputs: DigestInputs): string {
       const line = `- ${code(`#${card.nodeId}`)} ${oneLine(sanitizeGraphText(card.title))} — ${card.route} · ${ageText(
         band,
         card.ageDays,
-        principal,
-        principalDiscordId,
       )}`;
       if (
         cardBudget > 0 &&

@@ -3,7 +3,7 @@ import { EscalationDiscord, DISCORD_MAX_FILE_BYTES, DISCORD_MAX_FILES_BYTES, typ
 import { AnnounceError, DiscordAnnouncer } from "../src/announce.ts";
 
 function client(fetchFn: typeof fetch) {
- return new EscalationDiscord("bot-secret", "123", "https://discord.com/api/v10", "456", undefined, fetchFn);
+ return new EscalationDiscord("bot-secret", "123", "https://discord.com/api/v10", undefined, fetchFn);
 }
 const files: DiscordFile[] = [
  { name: "hull-before.png", description: "hull: before", data: new Blob(["before"], { type: "image/png" }) },
@@ -68,7 +68,7 @@ describe("Discord multipart files", () => {
    expect(init?.body).toBeInstanceOf(FormData);
    const form = init!.body as FormData;
    const payload = JSON.parse(form.get("payload_json") as string);
-   expect(payload).toEqual({ content: "card", allowed_mentions: { parse: [], users: ["456"] }, attachments: [
+   expect(payload).toEqual({ content: "card", allowed_mentions: { parse: [], users: [] }, attachments: [
     { id: 0, filename: "hull-before.png", description: "hull: before" },
     { id: 1, filename: "hull-after.png", description: "hull: after" },
    ] });

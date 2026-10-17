@@ -157,7 +157,6 @@ export class EscalationDiscord {
     private readonly token: string,
     private readonly channelId: string,
     private readonly apiBase: string = resolveDiscordApiBase(),
-    private readonly principalDiscordId?: string,
     cooldown: CooldownState = { until: 0 },
     private readonly fetchFn: typeof fetch = fetch,
   ) {
@@ -169,7 +168,7 @@ export class EscalationDiscord {
     return this.channelId;
   }
 
-  /** A client for a DIFFERENT channel, sharing token/base/principal config
+  /** A client for a DIFFERENT channel, sharing token/base
    *  AND the same global cooldown state — used to reconcile a card that
    *  lives in a channel the map moved away from (patch its queue-exit note
    *  where it actually is). Sharing the cooldown means a global 429 pauses
@@ -179,7 +178,6 @@ export class EscalationDiscord {
       this.token,
       channelId,
       this.apiBase,
-      this.principalDiscordId,
       this.cooldown,
       this.fetchFn,
     );
@@ -187,7 +185,6 @@ export class EscalationDiscord {
 
   static fromMap(
     map: RangerMapConfig,
-    principalDiscordId?: string,
     env: NodeJS.ProcessEnv = process.env,
   ): EscalationDiscord {
     if (map.discord === undefined) {
@@ -202,12 +199,7 @@ export class EscalationDiscord {
         `discord token env ${map.discord.tokenEnv} is unset — cannot post escalation cards for ${map.repo}.`,
       );
     }
-    return new EscalationDiscord(
-      token,
-      map.discord.channelId,
-      undefined,
-      principalDiscordId,
-    );
+    return new EscalationDiscord(token, map.discord.channelId);
   }
 
   /** Wait out any client-wide cooldown (a global 429) before sending — but
@@ -326,7 +318,7 @@ export class EscalationDiscord {
           content,
           allowed_mentions: {
             parse: [],
-            users: this.principalDiscordId ? [this.principalDiscordId] : [],
+            users: [],
             // A reply never pings the author it answers.
             ...(replyTo === undefined ? {} : { replied_user: false }),
           },
@@ -350,8 +342,8 @@ export class EscalationDiscord {
             method,
             headers: files.length === 0 ? { "Content-Type": "application/json" } : {},
             // parse: [] suppresses untrusted @everyone/@here/role mentions in
-            // graph-derived content; only the principal's id (when configured)
-            // is allowed to ping.
+            // graph-derived content, and no user is allow-listed: a ranger
+            // message pings no one.
             body,
           },
           deadline,

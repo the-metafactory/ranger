@@ -43,8 +43,7 @@ const HEADS: Record<keyof typeof CARD_HEADS, ClassifiedNode> = {
   "brief-not-ready": node({ kind: "build", autonomy: "auto", route: { route: "brief-not-ready", missing: ["## Acceptance criteria"] } }),
 };
 
-const render = (n: ClassifiedNode, ageDays = 4, discordId?: string) =>
-  cardContent(n, MAP, ageDays, "jcfischer", discordId);
+const render = (n: ClassifiedNode, ageDays = 4) => cardContent(n, MAP, ageDays);
 
 const closedRow: EscalationRow = {
   key: "acme/widgets:21", root: 1, repo: "acme/widgets", nodeId: "21",
@@ -136,10 +135,10 @@ describe("node #239 — the body", () => {
 
   test("a long body is cut inside the 2000-char cap and ends in `…`", () => {
     const body = Array.from({ length: 400 }, (_, i) => `line ${i} of the question`).join("\n");
-    const card = render(node({ body, route: { route: "escalate-hitl", reason: "propose-approve" } }), 9, "999");
+    const card = render(node({ body, route: { route: "escalate-hitl", reason: "propose-approve" } }), 9);
     expect(card.length).toBeLessThanOrEqual(DISCORD_MESSAGE_LIMIT);
     const lines = card.split("\n");
-    expect(lines.at(-1)).toBe("📣 <@999> 9d old — needs your attention");
+    expect(lines.at(-1)).toBe("📣 9d old — overdue");
     expect(lines.at(-2)).toEndWith("…");
   });
 
@@ -170,15 +169,14 @@ describe("node #239 — mention-inerting holds", () => {
       route: { route: "escalate-hitl", reason: "propose-approve" },
     });
     for (const age of [0, 4, 9]) {
-      const card = render(evil, age, "999");
+      const card = render(evil, age);
       expect(card).not.toContain("<@123>");
       expect(card).not.toContain("<@&456>");
       const pings = card.match(/<@/g) ?? [];
-      expect(pings.length).toBe(age >= 7 ? 1 : 0);
-      if (age >= 7) expect(card).toContain("<@999>");
+      expect(pings).toHaveLength(0);
       // The only `<` graph text yields is a link wrap.
       for (const lt of card.matchAll(/</g)) {
-        expect(card.slice(lt.index)).toMatch(/^<(https?:\/\/[^\s<>‹›]+>|@999>)/);
+        expect(card.slice(lt.index)).toMatch(/^<(https?:\/\/[^\s<>‹›]+)>/);
       }
     }
   });
@@ -200,14 +198,13 @@ describe("node #239 — every poster renders through the one renderer", () => {
       ageCounts: { aged: 1, overdue: 1 },
       audit: { repo: "acme/widgets", root: "1", nodes: 3, closedWithoutReceipt: ["7"], openWithoutCheckpoint: [], openClaimed: [] } as never,
       budget: { spawnsToday: 1, spawnCapPerDay: 10, deadman: 0, paused: false },
-      principal: "jcfischer",
-      principalDiscordId: "999",
       now: new Date("2026-10-12T09:00:00"),
     });
     const lines = digest.split("\n");
     expect(lines[0]).toBe("📰 ranger digest · acme/widgets#1");
     expect(lines[1]).toBe("-# walk: full · 2026-10-12");
-    expect(digest).toContain("\n- `#21` Settle ‹@123> — escalate-hitl · 📣 <@999> 8d\n");
+    expect(digest).toContain("\n- `#21` Settle ‹@123> — escalate-hitl · 📣 8d\n");
+    expect(digest).not.toContain("<@");
     expect(digest).not.toContain("**");
   });
 
@@ -219,8 +216,6 @@ describe("node #239 — every poster renders through the one renderer", () => {
       ageCounts: { aged: 0, overdue: 0 },
       audit: { repo: "acme/widgets", root: "1", nodes: 3, closedWithoutReceipt: [], openWithoutCheckpoint: [], openClaimed: [] } as never,
       budget: { spawnsToday: 31, spawnCapPerDay: Number.POSITIVE_INFINITY, deadman: 0, paused: false },
-      principal: "jcfischer",
-      principalDiscordId: "999",
       now: new Date("2026-10-14T09:00:00"),
     });
     expect(digest).toContain("Budget: spawns today 31 · dead-man 0");

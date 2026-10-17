@@ -44,13 +44,15 @@ const MAX_PASS_MS = 120_000;
 /**
  * Escalation desk (design §5, build-path step 2) — graph-read-only.
  *
- * The map pings the principal: one HITL/provisioning card per frontier node in
- * each map's Discord thread, announce-once and edited-not-reposted (the card
- * updates in place via the journal-cached message id), aged from first post
- * (day 1 age shown, 3+ louder, 7+ @-mention the principal). Plus a daily
+ * The map posts the principal a card: one HITL/provisioning card per frontier
+ * node in each map's Discord thread, announce-once and edited-not-reposted
+ * (the card updates in place via the journal-cached message id), aged from
+ * first post (day 1 age shown, 3+ louder, 7+ marked overdue). Plus a daily
  * digest: aged cards + audit findings + budget/spend. v1 writes nothing to the
  * graph (node #8: reads are outside the doctrine's teeth) — its only side
- * effects are Discord messages and the journal `escalations` table.
+ * effects are Discord messages and the journal `escalations` table. No card
+ * pings the principal: the overdue state is ranger's, and Vigil's text is the
+ * interruption that answers it.
  */
 
 /**
@@ -374,8 +376,6 @@ async function digestOneMap(
       ageCounts: openCards,
       audit,
       budget: base.budget,
-      principal: principalLoginForRepo(config, map.repo) ?? "principal",
-      principalDiscordId: config.principal.discordId,
       now,
     });
 

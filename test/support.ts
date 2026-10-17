@@ -181,8 +181,14 @@ export interface FakeThreadMessage {
  */
 export function fakeDiscord(opts: { echo?: boolean } = {}) {
  // `replyTo`: the message a reply post answers (`message_reference`, node #249).
- const posts: { url: string; messageId: string; content: string; replyTo?: string }[] = [];
- const edits: { messageId: string; content: string }[] = [];
+ const posts: {
+  url: string;
+  messageId: string;
+  content: string;
+  allowedMentions?: unknown;
+  replyTo?: string;
+ }[] = [];
+ const edits: { messageId: string; content: string; allowedMentions?: unknown }[] = [];
  const deleted = new Set<string>(); // messages removed — GET returns 404
  // Thread messages per channel, and every thread read (`after` cursor).
  const threads = new Map<string, FakeThreadMessage[]>();
@@ -259,11 +265,21 @@ export function fakeDiscord(opts: { echo?: boolean } = {}) {
     return Response.json({ id: channelMatch[1], guild_id: FAKE_GUILD_ID });
    }
    if (req.method === "POST" && url.pathname.startsWith("/channels/")) {
-    const parsed = (await req.json()) as { content?: string; message_reference?: { message_id?: string } };
+    const parsed = (await req.json()) as {
+     content?: string;
+     allowed_mentions?: unknown;
+     message_reference?: { message_id?: string };
+    };
     const replyTo = parsed?.message_reference?.message_id;
     const channelId = url.pathname.split("/")[2]!;
     const messageId = opts.echo ? echo(channelId, parsed?.content ?? "", replyTo) : `discord-msg-${posts.length + 1}`;
-    posts.push({ url: req.url, messageId, content: parsed?.content ?? "", ...(replyTo === undefined ? {} : { replyTo }) });
+    posts.push({
+     url: req.url,
+     messageId,
+     content: parsed?.content ?? "",
+     allowedMentions: parsed?.allowed_mentions,
+     ...(replyTo === undefined ? {} : { replyTo }),
+    });
     return Response.json({ id: messageId });
    }
    const editMatch = url.pathname.match(
@@ -272,8 +288,8 @@ export function fakeDiscord(opts: { echo?: boolean } = {}) {
    if (req.method === "PATCH" && editMatch) {
     const messageId = editMatch[1];
     if (editStatus !== 200) return new Response("refused", { status: editStatus });
-    const parsed = (await req.json()) as { content?: string };
-    edits.push({ messageId, content: parsed?.content ?? "" });
+    const parsed = (await req.json()) as { content?: string; allowed_mentions?: unknown };
+    edits.push({ messageId, content: parsed?.content ?? "", allowedMentions: parsed?.allowed_mentions });
     for (const thread of threads.values()) for (const m of thread) if (m.id === messageId) m.content = parsed?.content ?? "";
     return Response.json({ id: messageId });
    }

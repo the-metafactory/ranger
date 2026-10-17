@@ -235,7 +235,7 @@ test("queue-exit keeps a null-channel legacy card open without editing the map c
  const failFetch: typeof fetch = Object.assign(async () => {
   throw new Error("must not edit a card with no known destination");
  }, { preconnect: fetch.preconnect });
- const client = new EscalationDiscord("fake", "123", "https://unused.invalid", undefined, { until: 0 }, failFetch);
+ const client = new EscalationDiscord("fake", "123", "https://unused.invalid", { until: 0 }, failFetch);
  const outcome = await markAbsentCards({ ...context(), client, now: new Date(), budget, owned: () => {},
   readNode: async () => ({ ...node("20"), status: "open" }),
  }, new Set());

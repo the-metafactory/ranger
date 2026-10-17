@@ -52,7 +52,7 @@ export class DiscordAnnouncer implements Announcer {
   apiBase: string = resolveDiscordApiBase(),
   fetchFn: typeof fetch = fetch,
  ) {
-  this.discord = new EscalationDiscord(token, channelId, apiBase, undefined, undefined, fetchFn);
+  this.discord = new EscalationDiscord(token, channelId, apiBase, undefined, fetchFn);
  }
 
  static fromMap(
