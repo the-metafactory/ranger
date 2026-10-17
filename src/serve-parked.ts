@@ -29,7 +29,8 @@ import { REPO_PATTERN } from "./config.ts";
 import type { EventRow, ResumeQueueRow, WorkerRow } from "./journal.ts";
 import { startsImplementSession, type ImplementLane } from "./lanes.ts";
 import { whenFreeQueues } from "./resume.ts";
-import { childEnv, itermArgv, shellQuote } from "./launch.ts";
+import { childEnv, itermArgv, shellQuote, sessionCommand, sessionSubstrate } from "./launch.ts";
+import type { SubstrateName } from "./store/schema.ts";
 import {
  CRASH_PARK_OUTCOME,
  HOST_LOAD_OUTCOME,
@@ -757,6 +758,7 @@ export function sessionPlan(args: {
  configPath?: string;
  workerLog?: string | null;
  behind?: BehindBase | null;
+ substrate?: SubstrateName;
 }): { prompt: string; shellCommand: string; argv: string[] } {
  if (!REPO_PATTERN.test(args.repo)) throw new Error(`bad repo: ${args.repo}`);
  if (!ID_PATTERN.test(args.nodeId)) throw new Error(`bad node id: ${args.nodeId}`);
@@ -773,7 +775,7 @@ export function sessionPlan(args: {
   `journal for it (\`ranger journal --repo ${args.repo} --node ${args.nodeId}${config}\`). ` +
   (facts.length === 0 ? "" : `${facts.join(" ")} `) +
   `Then tell me what the next step is.`;
- const shellCommand = `cd ${shellQuote(args.cwd)} && claude ${shellQuote(prompt)}`;
+ const shellCommand = `cd ${shellQuote(args.cwd)} && ${sessionCommand(prompt, args.substrate)}`;
  return { prompt, shellCommand, argv: itermArgv(shellCommand) };
 }
 
@@ -783,6 +785,7 @@ export interface ActionBody {
  force?: unknown;
  sha?: unknown;
  dryRun?: unknown;
+ substrate?: unknown;
 }
 
 export interface ActionDeps {
@@ -1033,6 +1036,8 @@ async function runHeldAction(
    gate = gateArgv({ rangerBin: deps.rangerBin, configPath: deps.configPath, repo: entry.repo, root: entry.root, nodeId: entry.nodeId, sha: body.sha });
   }
  } else {
+  const substrate = sessionSubstrate(body.substrate);
+  if (substrate === null) return refusal(400, "substrate must be claude, codex or pi");
   if (!entry.actions.session.offered) return refusal(409, entry.actions.session.why);
   const cwd = entry.actions.session.cwd;
   if (!deps.exists(cwd)) return refusal(409, `${cwd} no longer exists`);
@@ -1055,6 +1060,7 @@ async function runHeldAction(
    ...(deps.configPath === undefined ? {} : { configPath: deps.configPath }),
    workerLog,
    behind,
+   substrate,
   }).argv;
   env = childEnv(deps.env);
  }

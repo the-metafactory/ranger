@@ -471,6 +471,23 @@ describe("#37 — the launch endpoint refuses", () => {
   expect(launched).toHaveLength(1);
  });
 
+ for (const substrate of ["claude", "codex", "pi"]) {
+  test(`a grilling session launches the selected ${substrate} CLI`, async () => {
+   const { handler, launched } = setup();
+   const res = await handler(post({ ...ok, substrate, dryRun: true }));
+   expect(res.status).toBe(200);
+   expect(((await res.json()) as { shellCommand: string }).shellCommand).toContain(`&& ${substrate} '`);
+   expect(launched).toHaveLength(0);
+  });
+ }
+
+ test("a session refuses an arbitrary command as substrate", async () => {
+  const { handler, launched } = setup();
+  const res = await handler(post({ ...ok, substrate: "pi; touch /tmp/unwanted" }));
+  expect(res.status).toBe(400);
+  expect(launched).toHaveLength(0);
+ });
+
  test("dry run returns the command and launches nothing", async () => {
   const { handler, launched } = setup();
   const res = await handler(post({ ...ok, dryRun: true }));
