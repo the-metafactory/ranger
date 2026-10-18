@@ -191,6 +191,7 @@ function scriptedReviewer(
  blockers: number[],
  onReview?: (round: number) => void | Promise<void>,
  majors: number[] = [0],
+ behavior: number[] = [0],
 ) {
  const calls: number[] = [];
  const reviewer = async (_repo: string, pr: number): Promise<ReviewVerdict> => {
@@ -200,6 +201,7 @@ function scriptedReviewer(
   const head = (await github.getPr("acme/widgets", pr)).headSha;
   const b = blockers[Math.min(round - 1, blockers.length - 1)];
   const m = majors[Math.min(round - 1, majors.length - 1)];
+  const impact = behavior[Math.min(round - 1, behavior.length - 1)];
   return {
    verdict: b + m > 0 ? "changes-requested" : "approved",
    summary: `round ${round}`,
@@ -207,7 +209,7 @@ function scriptedReviewer(
    blockers: b,
    majors: m,
    nits: 2,
-   body: `## Sage\n\nRound ${round}: ${b} blocker(s), ${m} major(s).`,
+   body: `## Sage\n\nRound ${round}: ${b} blocker(s), ${m} major(s).\n\nRound impact: behavior ${impact}, checks 0, prose 2; unclassified impact 0; prior-round surface 0; restated from earlier rounds 0.`,
   };
  };
  return { reviewer, calls };
@@ -232,6 +234,7 @@ async function rig(opts: {
  author?: string;
  blockers?: number[];
  majors?: number[];
+ behavior?: number[];
  onReview?: (round: number) => void | Promise<void>;
  /** commands.probe for the map (a fake-probe invocation). */
  probe?: string;
@@ -328,7 +331,7 @@ async function rig(opts: {
  const journal = openJournal(config);
  journal.upsertWorker({ root: opts.root ?? 1, nodeId, repo: "acme/widgets", status: "claimed", lane: "implement" });
  const github = new FakeGitHub(origin);
- const { reviewer, calls } = scriptedReviewer(github, opts.blockers ?? [0], opts.onReview, opts.majors ?? [0]);
+ const { reviewer, calls } = scriptedReviewer(github, opts.blockers ?? [0], opts.onReview, opts.majors ?? [0], opts.behavior ?? [0]);
  const announced: string[] = [];
  const ctx: RunNodeContext = {
   config,
@@ -2187,6 +2190,60 @@ describe("implement lane (node #23)", () => {
   expect(p.r.announced).toEqual([]);
   expect(p.events().some((d) => d.includes("pass at the merge base") && d.includes("the failure is this branch's"))).toBe(true);
   expect(p.events().some((d) => d.includes("but the node has used its 1 probe fix pass(es): it parks"))).toBe(true);
+ }, 60_000);
+
+ async function finishRig(behavior: number[], mode = "build") {
+  const r = await rig({ behavior });
+  cleanup.push(r.dir);
+  const prompts: string[] = [];
+  r.ctx.worker = async (prompt, o) => {
+   prompts.push(prompt);
+   return runCmd(implementWorker, [mode, prompt], o);
+  };
+  const markers = () => (r.github.comments.get(1) ?? []).filter((c) => c.body.includes("ranger:finish-fix"));
+  return { r, prompts, markers };
+ }
+
+ test("a gate-clean round that asks a behavior change gets a finish pass before the merge, and the next round reviews it", async () => {
+  const { r, prompts, markers } = await finishRig([1, 0]);
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("awaiting-merge");
+  expect(prompts.filter((p) => p.includes("## Finish pass — sage review round 1"))).toHaveLength(1);
+  expect(r.calls).toHaveLength(2);
+  expect(r.journal.getWorker("20", "acme/widgets")?.reviewRound).toBe(2);
+  const head = await r.github.sha("node/20-add-the-feature-module");
+  expect(markers()).toHaveLength(1);
+  expect(markers()[0].body).toContain(`sha=${head}`);
+ }, 60_000);
+
+ test("a finish pass that declines every finding commits nothing, and the merge goes on without another round", async () => {
+  const { r, prompts, markers } = await finishRig([1], "finish-noop");
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("awaiting-merge");
+  expect(prompts.filter((p) => p.includes("## Finish pass"))).toHaveLength(1);
+  expect(r.calls).toHaveLength(1);
+  const head = await r.github.sha("node/20-add-the-feature-module");
+  expect(markers().map((m) => m.body.split("\n")[0])).toEqual([`<!-- ranger:finish-fix sha=${head} red=${head} -->`]);
+ }, 60_000);
+
+ test("a node gets one finish pass: findings the second round still asks go to the merge, and a resume asks no more", async () => {
+  const { r, prompts, markers } = await finishRig([1]);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  expect(prompts.filter((p) => p.includes("## Finish pass"))).toHaveLength(1);
+  expect(r.calls).toHaveLength(2);
+  expect(markers()).toHaveLength(1);
+
+  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  expect(prompts.filter((p) => p.includes("## Finish pass"))).toHaveLength(1);
+  expect(markers()).toHaveLength(1);
+ }, 60_000);
+
+ test("prose-only nits get no finish pass", async () => {
+  const { r, prompts, markers } = await finishRig([0]);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  expect(prompts.some((p) => p.includes("## Finish pass"))).toBe(false);
+  expect(markers()).toHaveLength(0);
  }, 60_000);
 
  test("a probe fix pass that finds nothing in the branch to change parks on the probes, and a resume does not ask again", async () => {
