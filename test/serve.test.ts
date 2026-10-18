@@ -25,6 +25,7 @@ import {
  type StateInputs,
 } from "../src/serve.ts";
 import { selectCandidates } from "../src/walk.ts";
+import { needsYouEntries } from "../src/serve-parked.ts";
 
 /**
  * #37 — `ranger serve`: the state the dashboard shows, the launch it may make,
@@ -126,6 +127,57 @@ const inputs = (over: Partial<StateInputs> = {}): StateInputs => ({
 });
 
 describe("#37 — the state the dashboard shows", () => {
+ test("failed #500 and human-blocked #640 stay in Needs you, outside fresh work and Build now", async () => {
+  const workers = [
+   worker({ nodeId: "500", status: "failed", outcome: "tests failed" }),
+   worker({ nodeId: "640", status: "parked", outcome: "principal must choose the mouse-sensitivity range" }),
+  ];
+  const needsYou = needsYouEntries({ maps: [walked], workers, events: () => [], labels: () => [], prs: () => null,
+   titleOf: (_repo, id) => `node ${id}`, reviewRounds: 2, exists: () => true });
+  const state = assembleState(inputs({ workers, needsYou,
+   reports: new Map([[walked.key, report([entry("500", "task"), entry("640", "task"), entry("641", "task"), entry("642", "task")])]]) }));
+  expect(state.maps[0].next.nodeId).toBe("641");
+  expect(state.maps[0].queued.map(n => n.id)).toEqual(["642"]);
+  expect(state.maps[0].autonomous.map(n => n.id)).toEqual(["641", "642"]);
+  expect(state.needsYou.map(n => n.nodeId)).toEqual(["500", "640"]);
+  expect(state.needsYou[1].reason.detail).toContain("mouse-sensitivity");
+  for (const row of state.needsYou) {
+   expect(row.actions.resume).toBe(true);
+   expect(row.actions.session.offered).toBe(true);
+  }
+  let builds = 0;
+  const handler = createHandler({ port: 7311, token: "test-token", getState: () => state, refresh: () => {},
+   launch: () => {}, verifyGrilling: async () => null,
+   buildNow: { command: () => [], runVerb: async () => { builds++; return { code: 0, tail: "" }; } } });
+  for (const id of ["500", "640"]) {
+   const response = await handler(new Request("http://127.0.0.1:7311/api/build-now", { method: "POST",
+    body: JSON.stringify({ key: walked.key, id, dryRun: true }), headers: { "Content-Type": "application/json", "x-ranger-token": "test-token" } }));
+   expect(response.status).toBe(409);
+   expect(await response.text()).toMatch(/resume-node.*Resume/i);
+  }
+  expect(builds).toBe(0);
+ });
+
+ test("a held row in another repo does not hold an equal node id; a different map root cannot reclaim it", () => {
+  const otherRepo = worker({ nodeId: "10", repo: "other/widgets", status: "parked" });
+  expect(assembleState(inputs({ workers: [otherRepo] })).maps[0].next.nodeId).toBe("10");
+  const otherRoot = worker({ nodeId: "10", root: 460, status: "parked" });
+  expect(assembleState(inputs({ workers: [otherRoot] })).maps[0].next.nodeId).toBe("14");
+ });
+
+ test("held candidates leave lane, veto, drain, pause and cap gates in force", () => {
+  const base = inputs({ workers: [worker({ nodeId: "10", status: "failed" })] });
+  expect(assembleState(base).maps[0].next.nodeId).toBe("14");
+  const heldLane = assembleState({ ...base, laneHolders: { visual: null, headless: worker({}) } }).maps[0];
+  expect(heldLane.next).toMatchObject({ nodeId: "14", waiting: true });
+  for (const over of [
+   { paused: true },
+   { spawnsToday: 10 },
+   { drains: { visual: false, maps: new Set([walked.key]) } },
+   { vetoed: (id: string) => id === "14" },
+  ]) expect(assembleState({ ...base, ...over }).maps[0].next.nodeId).toBeUndefined();
+ });
+
  test("with no spawn cap the dashboard carries a null cap and still names the next claim past any count", () => {
   const uncapped = assembleState(inputs({ spawnsToday: 40, spawnCap: Number.POSITIVE_INFINITY }));
   expect(uncapped.gates.spawnCap).toBeNull();
@@ -469,6 +521,23 @@ describe("#37 — the launch endpoint refuses", () => {
   const res = await handler(post(ok));
   expect(res.status).toBe(200);
   expect(launched).toHaveLength(1);
+ });
+
+ for (const substrate of ["claude", "codex", "pi"]) {
+  test(`a grilling session launches the selected ${substrate} CLI`, async () => {
+   const { handler, launched } = setup();
+   const res = await handler(post({ ...ok, substrate, dryRun: true }));
+   expect(res.status).toBe(200);
+   expect(((await res.json()) as { shellCommand: string }).shellCommand).toContain(`&& ${substrate} '`);
+   expect(launched).toHaveLength(0);
+  });
+ }
+
+ test("a session refuses an arbitrary command as substrate", async () => {
+  const { handler, launched } = setup();
+  const res = await handler(post({ ...ok, substrate: "pi; touch /tmp/unwanted" }));
+  expect(res.status).toBe(400);
+  expect(launched).toHaveLength(0);
  });
 
  test("dry run returns the command and launches nothing", async () => {

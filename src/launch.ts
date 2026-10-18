@@ -5,6 +5,8 @@
  */
 
 /** Environment keys a launched session may inherit — an allowlist, never a denylist. */
+import { SUBSTRATE_NAMES, type SubstrateName } from "./store/schema.ts";
+
 const CHILD_ENV_KEYS = [
  "PATH",
  "HOME",
@@ -30,6 +32,15 @@ export function childEnv(
 
 /** POSIX single-quote a string for a shell. */
 export const shellQuote = (s: string): string => `'${s.replaceAll("'", `'\\''`)}'`;
+
+export function sessionSubstrate(value: unknown): SubstrateName | null {
+ return value === undefined ? "claude" : SUBSTRATE_NAMES.find((name) => name === value) ?? null;
+}
+
+export function sessionCommand(prompt: string, substrate: SubstrateName = "claude"): string {
+ if (sessionSubstrate(substrate) === null) throw new Error("invalid session substrate");
+ return `${substrate} ${shellQuote(prompt)}`;
+}
 
 /** Escape a string for an AppleScript string literal. */
 const appleQuote = (s: string): string =>

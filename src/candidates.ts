@@ -5,6 +5,28 @@
  */
 import type { ClassifiedNode } from "./route.ts";
 import type { ImplementLane } from "./lanes.ts";
+import type { WorkerRow } from "./journal.ts";
+
+export function freshClaimRefusal(
+ map: { repo: string },
+ nodeId: string,
+ worker: Pick<WorkerRow, "repo" | "root" | "nodeId" | "status"> | null,
+): string | null {
+ if (worker?.repo !== map.repo || worker.nodeId !== nodeId) return null;
+ if (worker.status === "failed" || worker.status === "parked") {
+  return `${worker.status} worker — use \`ranger resume-node ${nodeId} --map ${worker.repo}#${worker.root}\` (Resume) to continue its existing work`;
+ }
+ return null;
+}
+
+export function freshCandidates(
+ frontier: ClassifiedNode[],
+ map: { repo: string; root: number },
+ workers: readonly WorkerRow[],
+): ClassifiedNode[] {
+ return frontier.filter(n => freshClaimRefusal(map, n.id,
+  workers.find(w => w.repo === map.repo && w.nodeId === n.id) ?? null) === null);
+}
 
 /** The drain switches one tick reads (node #165): the visual lane's, and each drained headless map's key. */
 export interface DrainState {

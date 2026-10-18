@@ -727,6 +727,23 @@ describe("node #54 — the actions and their guards", () => {
   });
  }
 
+ for (const substrate of ["claude", "codex", "pi"]) {
+  test(`a parked session launches the selected ${substrate} CLI`, async () => {
+   const { handler, runs } = setup();
+   const res = await handler(post("/api/session", { ...ok, substrate, dryRun: true }));
+   expect(res.status).toBe(200);
+   expect(((await res.json()) as { argv: string[] }).argv.join(" ")).toContain(`&& ${substrate} '`);
+   expect(runs).toHaveLength(0);
+  });
+ }
+
+ test("a parked session refuses an arbitrary command as substrate", async () => {
+  const { handler, runs } = setup();
+  const res = await handler(post("/api/session", { ...ok, substrate: "codex; touch /tmp/unwanted" }));
+  expect(res.status).toBe(400);
+  expect(runs).toHaveLength(0);
+ });
+
  test("the session prompt carries the repo, the id, ranger's own reason and a journal command that names the config, never prose", async () => {
   const { handler, runs } = setup();
   const res = await handler(post("/api/session", { ...ok, dryRun: true }));

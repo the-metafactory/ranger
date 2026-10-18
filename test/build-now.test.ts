@@ -151,6 +151,36 @@ function holdLane(journal: Journal, nodeId = "663") {
 }
 
 describe("node #58 — build-now claims and starts a walkable node", () => {
+ for (const status of ["failed", "parked"] as const) {
+  test(`a ${status} worker requires Resume even with force`, async () => {
+   const r = rig();
+   r.journal.upsertWorker({ nodeId: "10", repo: REPO, root: 1, status, phase: "review", prNumber: 500,
+    outcome: "principal must choose the mouse-sensitivity range", reviewRound: 2, verdictSha: "a".repeat(40), verdictBlockers: 1 });
+   const before = r.journal.getWorker("10", REPO);
+   expect(await refusal(buildNow("10", r.ctx({ force: true })))).toMatch(/resume-node.*Resume/i);
+   expect(r.announced).toEqual([]);
+   expect(r.claimed).toEqual([]);
+   expect(r.spawned).toEqual([]);
+   expect(r.journal.getWorker("10", REPO)).toEqual(before);
+   expect(r.journal.listEvents(REPO)).toEqual([]);
+   expect(r.journal.spawnsToday(r.ctx().now!())).toBe(0);
+  });
+
+  test(`the shared fresh claim boundary refuses a ${status} worker`, async () => {
+   const r = rig();
+   r.journal.upsertWorker({ nodeId: "10", repo: REPO, root: 1, status, phase: "review", prNumber: 500, reviewRound: 2 });
+   const before = r.journal.getWorker("10", REPO);
+   const ctx = r.ctx();
+   const outcome = await claimNode({ ...ctx, node: { id: "10", title: "held" }, lane: "implement", cliEntry: "unused" });
+   expect(outcome).toMatchObject({ claimed: false, error: expect.stringMatching(/resume-node.*Resume/i) });
+   expect(r.announced).toEqual([]);
+   expect(r.claimed).toEqual([]);
+   expect(r.spawned).toEqual([]);
+   expect(r.journal.getWorker("10", REPO)).toEqual(before);
+   expect(r.journal.listEvents(REPO)).toEqual([]);
+  });
+ }
+
  test("an implement node: announced, claimed, a fresh claimed row, the events, the spawn counted and started", async () => {
   const r = rig();
   const result = await buildNow("10", r.ctx());
@@ -188,11 +218,20 @@ describe("node #58 — build-now claims and starts a walkable node", () => {
   expect(r.journal.getWorker("11", REPO)?.lane).toBe("research");
  });
 
- test("a re-claimed node starts a clean row, not the parked attempt's", async () => {
+ test("a released node starts a clean row when reclaimed", async () => {
   const r = rig();
-  r.journal.upsertWorker({ nodeId: "10", repo: REPO, root: 1, status: "parked", lane: "implement", phase: "review", prNumber: 9, reviewRound: 2 });
+  r.journal.upsertWorker({ nodeId: "10", repo: REPO, root: 1, status: "released", lane: "implement", phase: "review", prNumber: 9, reviewRound: 2 });
   await buildNow("10", r.ctx());
   expect(r.journal.getWorker("10", REPO)).toMatchObject({ status: "claimed", phase: null, prNumber: null, reviewRound: 0 });
+ });
+
+ test("an equal held id in another repo does not block a fresh claim", async () => {
+  const r = rig();
+  r.journal.upsertWorker({ nodeId: "10", repo: "other/widgets", root: 1, status: "parked", phase: "review", prNumber: 7 });
+  const before = r.journal.getWorker("10", "other/widgets");
+  await buildNow("10", r.ctx());
+  expect(r.claimed).toEqual(["10"]);
+  expect(r.journal.getWorker("10", "other/widgets")).toEqual(before);
  });
 
  test("with --force it starts beside the lane holder and names it", async () => {

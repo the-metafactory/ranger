@@ -60,7 +60,7 @@ import {
  serveConfig,
  type WalkMode,
 } from "./config.ts";
-import { drainGate, implementCandidates, planTick, walkableCandidates, type DrainState } from "./candidates.ts";
+import { drainGate, freshCandidates, freshClaimRefusal, implementCandidates, planTick, walkableCandidates, type DrainState } from "./candidates.ts";
 import { pidAlive as defaultPidAlive } from "./exec.ts";
 import { Journal, vetoApplies, type LaneHolder, type ResumeQueueRow, type WorkerRow } from "./journal.ts";
 import { ForeignMigrationError } from "./journal-guard.ts";
@@ -75,7 +75,8 @@ import { runCmd } from "./exec.ts";
 import { briefHoldReason, classify, classifyFrontier, type ClassifiedNode, loadProbeRegistry } from "./route.ts";
 import { liveSession, substrateUsageViews, type SubstrateUsageView } from "./substrate-usage.ts";
 import { resolveReadOnlyToken, assertReadOnlyToken, gatedEnv, gitlabApiRead, tokenBatch, type TokenBatch, type ResolvedToken } from "./token-gate.ts";
-import { childEnv, itermArgv, shellQuote } from "./launch.ts";
+import { childEnv, itermArgv, shellQuote, sessionCommand, sessionSubstrate } from "./launch.ts";
+import type { SubstrateName } from "./store/schema.ts";
 import {
  type ActionKind,
  type ActionDeps,
@@ -253,6 +254,7 @@ export interface CurrentJob {
  title: string | null;
  status: WorkerRow["status"];
  phase: WorkerRow["phase"];
+ substrate: WorkerRow["substrate"];
  lane: string | null;
  resourceLane: ImplementLane | null;
  prNumber: number | null;
@@ -459,7 +461,8 @@ function nextFor(
  }
  // The tick's own plan (candidates.ts): the order and the veto rule walk uses.
  const holder = tick.holders[map.lane];
- const plan = planTick(report.frontier, {
+ const frontier = freshCandidates(report.frontier, map, inputs.workers);
+ const plan = planTick(frontier, {
   laneBusy: holder !== null,
   vetoed: (id) => inputs.vetoed(id, map.repo),
   implementDrained: drain?.scope === "lane",
@@ -500,7 +503,7 @@ function nextFor(
  if (vetoed.length > 0) {
   return none(`${vetoed.join(", ")} vetoed — the tick claims nothing else this pass`);
  }
- if (drain !== null && implementCandidates(report.frontier).length > 0) {
+ if (drain !== null && implementCandidates(frontier).length > 0) {
   return none(`no implement claim this tick — see the ${map.lane} lane`);
  }
  return none("nothing walkable on this map's frontier");
@@ -530,6 +533,7 @@ export function assembleState(inputs: StateInputs): DashboardState {
    title: titleOf(w.repo, w.nodeId),
    status: w.status,
    phase: w.phase,
+   substrate: w.substrate,
    lane: w.lane,
    resourceLane: w.lane === "implement" ? workerLane(w, laneMaps) : null,
    prNumber: w.prNumber,
@@ -565,6 +569,7 @@ export function assembleState(inputs: StateInputs): DashboardState {
  const maps: DashboardMap[] = inputs.maps.map((map) => {
   const report = inputs.reports.get(map.key);
   const frontier = report?.ok ? report.frontier : [];
+  const fresh = freshCandidates(frontier, map, inputs.workers);
   const walked = !map.servedOnly && map.walk !== "none";
   // A drain refuses this map's implement claims: none waits in its queue either.
   const drained = drainGate(map, drains) !== null;
@@ -582,11 +587,11 @@ export function assembleState(inputs: StateInputs): DashboardState {
    localCheckout: map.localCheckout,
    next: planned.get(map.key)!,
    queued: walked && !drained
-    ? implementCandidates(frontier)
+    ? implementCandidates(fresh)
        .filter((n) => n.id !== planned.get(map.key)!.nodeId && !inputs.vetoed(n.id, map.repo))
        .map(view)
     : [],
-   autonomous: walked ? walkableCandidates(frontier).map(view) : [],
+   autonomous: walked ? walkableCandidates(fresh).map(view) : [],
    grillings: frontier
     .filter((n) => n.kind === "grilling")
     .map((n) => ({
@@ -657,6 +662,7 @@ export function launchPlan(args: {
  cwd: string;
  /** The node's kind; a grilling (the default) is worked with the grilling skill, anything else with orienteer. */
  kind?: string;
+ substrate?: SubstrateName;
 }): LaunchPlan {
  if (!REPO_PATTERN.test(args.repo)) throw new Error(`bad repo: ${args.repo}`);
  if (!ID_PATTERN.test(args.nodeId)) throw new Error(`bad node id: ${args.nodeId}`);
@@ -674,7 +680,7 @@ export function launchPlan(args: {
    : `Work node #${args.nodeId} with me, a ${kind} waiting on me on map #${args.root} of ${args.repo}. ` +
      `Read it with \`soma graph node ${args.nodeId} --repo ${args.repo}\`, ` +
      `then work it with the orienteer skill.`;
- const shellCommand = `cd ${shellQuote(args.cwd)} && claude ${shellQuote(prompt)}`;
+ const shellCommand = `cd ${shellQuote(args.cwd)} && ${sessionCommand(prompt, args.substrate)}`;
  return { prompt, shellCommand, argv: itermArgv(shellCommand) };
 }
 
@@ -916,7 +922,7 @@ export function createHandler(ctx: HandlerContext): (req: Request) => Promise<Re
    return refuse(404, "not found");
   }
 
-  const body: { key?: unknown; id?: unknown; dryRun?: unknown } | null = await readObject(req);
+  const body: { key?: unknown; id?: unknown; dryRun?: unknown; substrate?: unknown } | null = await readObject(req);
   if (body === null) return refuse(400, "body is not a JSON object");
   if (typeof body.key !== "string" || typeof body.id !== "string") {
    return refuse(400, "key and id are required strings");
@@ -926,6 +932,9 @@ export function createHandler(ctx: HandlerContext): (req: Request) => Promise<Re
   const map = state.maps.find((m) => m.key === body.key);
   if (map === undefined) return refuse(404, `no map ${body.key}`);
   if (url.pathname === "/api/build-now") {
+   const held = state.needsYou.find(row => row.repo === map.repo && row.nodeId === body.id);
+   const refusal = freshClaimRefusal(map, body.id, held ?? null);
+   if (refusal !== null) return refuse(409, refusal);
    // `autonomous` is the walkable set of the frontier ranger cached, read
    // from the journal for this request; the verb re-reads and re-checks it.
    const node = map.autonomous.find((n) => n.id === body.id);
@@ -939,6 +948,8 @@ export function createHandler(ctx: HandlerContext): (req: Request) => Promise<Re
    const run = await ctx.buildNow.runVerb(argv, childEnv(process.env));
    return json(200, { nodeId: node.id, exitCode: run.code, tail: run.tail });
   }
+  const substrate = sessionSubstrate(body.substrate);
+  if (substrate === null) return refuse(400, "substrate must be claude, codex or pi");
   const grilling: (GrillingView | DecisionView) | undefined =
    map.grillings.find((g) => g.id === body.id) ?? map.decisions.find((d) => d.id === body.id);
   if (grilling === undefined) {
@@ -955,6 +966,7 @@ export function createHandler(ctx: HandlerContext): (req: Request) => Promise<Re
    nodeId: grilling.id,
    cwd: map.localCheckout,
    kind: grilling.kind,
+   substrate,
   });
   if (body.dryRun === true) return json(200, { dryRun: true, ...plan });
   ctx.launch(plan.argv, childEnv(process.env));
@@ -1011,7 +1023,7 @@ a:hover { text-decoration:underline; }
 .stale { color:var(--warn); border-color:var(--warn); }
 .empty, .why { color:var(--muted); font-size:12px; }
 .reason { color:var(--muted); font-size:12px; display:block; }
-button { font:inherit; font-size:12px; padding:3px 10px; border-radius:6px; border:1px solid var(--line); background:transparent; color:var(--fg); cursor:pointer; white-space:nowrap; }
+button, select { font:inherit; font-size:12px; padding:3px 10px; border-radius:6px; border:1px solid var(--line); background:var(--bg); color:var(--fg); cursor:pointer; white-space:nowrap; }
 button:hover:not(:disabled) { border-color:var(--accent); color:var(--accent); }
 button:disabled { opacity:.45; cursor:default; }
 #msg { padding:0 20px; color:var(--ok); min-height:1em; font-size:12px; }
@@ -1112,7 +1124,8 @@ function jobTime(iso) {
 // One pill per fact, each once: status and phase are often the same word.
 function jobTags(j) {
  if (j.stale) return [tag("stale: process gone", "stale")];
- const parts = [j.resourceLane || j.lane, j.status, j.phase, j.prLabel || "", j.reviewRound ? "round " + j.reviewRound : ""];
+ const substrate = { claude: "Claude", codex: "Codex", pi: "Pi" }[j.substrate] || "unknown";
+ const parts = [j.resourceLane || j.lane, j.status, j.phase, "substrate: " + substrate, j.prLabel || "", j.reviewRound ? "round " + j.reviewRound : ""];
  return [...new Set(parts.filter(Boolean))].map((p) => tag(p));
 }
 function renderCurrent(s) {
@@ -1236,14 +1249,10 @@ function renderAuto(s) {
  }));
 }
 function grillButton(m, g) {
- const b = el("button", { text: "Start session", disabled: !g.launchable, title: g.why || "Open iTerm2 in " + m.localCheckout + " and start claude on #" + g.id });
- b.onclick = async () => {
-  b.disabled = true;
-  try { await post("/api/grill", { key: m.key, id: g.id }); say("Opened a session on #" + g.id + " in iTerm2."); }
+ return sessionControls(m.key + "/" + g.id, "Start session", g.launchable, g.why || "Open iTerm2 in " + m.localCheckout, async (substrate) => {
+  try { await post("/api/grill", { key: m.key, id: g.id, substrate }); say("Opened a " + substrate + " session on #" + g.id + " in iTerm2."); }
   catch (e) { say("Could not start #" + g.id + ": " + e.message, true); }
-  finally { setTimeout(() => (b.disabled = !g.launchable), 3000); }
- };
- return b;
+ });
 }
 function renderGrill(s) {
  const box = document.getElementById("grill"); box.replaceChildren();
@@ -1283,6 +1292,20 @@ function actionButton(text, title, enabled, run) {
  const b = el("button", { text, title, disabled: !enabled });
  b.onclick = async () => { b.disabled = true; try { await run(); } finally { setTimeout(() => (b.disabled = !enabled), 3000); } };
  return b;
+}
+function sessionControls(id, text, enabled, title, run) {
+ const labels = { claude: "Claude", codex: "Codex", pi: "Pi" };
+ const key = "ranger.session-substrate/" + id;
+ let selected = "claude";
+ try { const saved = localStorage.getItem(key); if (Object.hasOwn(labels, saved)) selected = saved; } catch {}
+ const select = el("select", { ariaLabel: "Session substrate", disabled: !enabled }, ...Object.entries(labels).map(([value, label]) => el("option", { value, text: label })));
+ select.value = selected;
+ const button = actionButton(text + " · " + labels[selected], title, enabled, () => run(select.value));
+ select.onchange = () => {
+  button.textContent = text + " · " + labels[select.value];
+  try { localStorage.setItem(key, select.value); } catch {}
+ };
+ return el("span", { class: "acts" }, select, button);
 }
 // The last result per card survives the re-render that follows every action.
 const results = new Map();
@@ -1333,7 +1356,7 @@ function needsCard(n) {
  }
  acts.append(mergeButton(n, "Merge"));
  const session = n.actions.session;
- acts.append(actionButton("Open session", session.offered ? "Open iTerm2 in " + session.cwd + " and start claude on #" + n.nodeId : session.why, session.offered, () => act("session", n, {})));
+ acts.append(sessionControls(id, "Open session", session.offered, session.offered ? "Open iTerm2 in " + session.cwd : session.why, (substrate) => act("session", n, { substrate })));
  if (n.pr) acts.append(link(n.pr.url, openText(n)));
  const last = results.get(id);
  return el("div", { class: "card" },
