@@ -137,7 +137,7 @@ async function escalateOneMap(
     }));
     // A vetoed node back on the frontier carries the refused card, whatever
     // its route (node #240, ruling D7): the principal's to take.
-    const vetoes = new Map(journal.listVetoes(map.repo).map((veto) => [veto.nodeId, veto]));
+    const vetoes = new Map(journal.vetoesFor(map.repo).map((veto) => [veto.nodeId, veto]));
     const classified = frontier.frontier.map((entry) => {
       const veto = vetoes.get(entry.ref.id);
       if (veto !== undefined) return refusedNode(veto, entry.node.title);

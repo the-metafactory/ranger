@@ -96,4 +96,18 @@ describe("Journal — SQLite state (design §8)", () => {
   expect(j.listVetoes("acme/widgets", 2)).toEqual([]);
   j.close();
  });
+
+ test("vetoesFor lists the repo's own vetoes and the pre-node-#240 rows, as hasVeto counts them", () => {
+  const j = new Journal(":memory:");
+  j.recordVeto({ repo: "", nodeId: "1", root: undefined, commentId: "" });
+  j.recordVeto({ repo: "acme/widgets", nodeId: "2", root: 1, commentId: "c2", proposalCommentId: "p2" });
+  j.recordVeto({ repo: "acme/gadgets", nodeId: "3", root: 1, commentId: "c3" });
+  j.recordVeto({ repo: "", nodeId: "2", root: undefined, commentId: "" });
+  const rows = j.vetoesFor("acme/widgets");
+  expect(rows.map((v) => v.nodeId).sort()).toEqual(["1", "2"]);
+  expect(rows.find((v) => v.nodeId === "1")!.repo).toBe("acme/widgets");
+  expect(rows.find((v) => v.nodeId === "2")!.proposalCommentId).toBe("p2");
+  for (const id of ["1", "2", "3"]) expect(rows.some((v) => v.nodeId === id)).toBe(j.hasVeto(id, "acme/widgets"));
+  j.close();
+ });
 });

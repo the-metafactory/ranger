@@ -137,7 +137,7 @@ export interface VetoRow {
 /**
  * Does this veto stop the node on this repo? Its own repo's row does, and a
  * row from before node #240 (repo '') does on every repo. The one rule every
- * "is it vetoed" reader applies (`Journal.hasVeto`, `ranger serve`).
+ * "is it vetoed" reader applies (`Journal.hasVeto`, `Journal.vetoesFor`, `ranger serve`).
  */
 export function vetoApplies(veto: Pick<VetoRow, "repo" | "nodeId">, nodeId: string, repo: string): boolean {
  return veto.nodeId === nodeId && (veto.repo === repo || veto.repo === "");
@@ -907,6 +907,16 @@ export class Journal {
    at: v.at,
    detail: v.detail,
   }));
+ }
+
+ vetoesFor(repo: string): VetoRow[] {
+  const byNode = new Map<string, VetoRow>();
+  for (const row of this.listVetoes()) {
+   if (!vetoApplies(row, row.nodeId, repo)) continue;
+   if (row.repo === "" && byNode.has(row.nodeId)) continue;
+   byNode.set(row.nodeId, row.repo === "" ? { ...row, repo } : row);
+  }
+  return [...byNode.values()];
  }
 
  /**
