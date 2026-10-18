@@ -352,6 +352,10 @@ const CodexSubstrateSchema = z.object({
  reasoningEffort: z.enum(["low", "medium", "high"]).default("high"),
 });
 
+const ClaudeSubstrateSchema = z.object({
+ model: z.string().regex(MODEL_NAME, "a plain model name ([A-Za-z0-9._-])").default("claude-sonnet-5-5"),
+});
+
 /**
  * Substrate selection (node #45): which of Claude, Codex and Pi runs an
  * implement session, fix pass or sage review, by remaining 5h/7d quota.
@@ -365,6 +369,7 @@ const SubstratesSchema = z.object({
  claudeProbeMaxAgeMin: z.number().int().positive().default(15),
  /** Codex reading max age, minutes (default 5). */
  codexReadMaxAgeMin: z.number().int().positive().default(5),
+ claude: ClaudeSubstrateSchema.default({}),
  /** Codex substrate configuration: the model and reasoning effort a worker runs. */
  codex: CodexSubstrateSchema.default({}),
  /** Pi substrate configuration. */

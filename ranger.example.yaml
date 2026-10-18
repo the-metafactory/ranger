@@ -184,6 +184,11 @@ substrates:
   claudeProbeMaxAgeMin: 15
   # Codex reading max age, minutes. A stale reading triggers an app-server read.
   codexReadMaxAgeMin: 5
+  # Claude worker model: implement sessions, fix passes and scheduled jobs on
+  # Claude run this model. Sage reviews never read it; they run whatever model
+  # sage's own config gives the claude substrate.
+  claude:
+    model: claude-sonnet-5-5    # a plain model name: [A-Za-z0-9._-]
   # Codex worker model (node #60): pinned here, so a change to your own
   # ~/.codex/config.toml never changes a ranger build. Passed as
   # `codex exec --model <model> -c model_reasoning_effort="<effort>"`.

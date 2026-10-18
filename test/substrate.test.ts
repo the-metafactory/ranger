@@ -733,9 +733,9 @@ describe("workerCommandFor", () => {
   join(import.meta.dir, "..", "ranger.example.yaml"),
  ).config;
 
- test("claude: stream-json verbose", () => {
+ test("claude: stream-json verbose, on the pinned Sonnet model", () => {
   const cmd = workerCommandFor("claude", config);
-  expect(cmd).toEqual(["claude", "-p", "--output-format", "stream-json", "--verbose"]);
+  expect(cmd).toEqual(["claude", "-p", "--model", "claude-sonnet-5-5", "--output-format", "stream-json", "--verbose"]);
  });
 
  test("codex: a writable workspace sandbox, plus the common git dir a worktree commits into", () => {
@@ -779,7 +779,7 @@ describe("workerCommandFor", () => {
    expect(cmd).not.toContain("--dangerously-bypass-approvals-and-sandbox");
    expect(workerModelFor("codex", bare)).toEqual({ model: "gpt-6.1-sol", reasoningEffort: "high" });
    expect(describeWorkerModel(workerModelFor("codex", bare)!)).toBe("gpt-6.1-sol, high");
-   expect(workerModelFor("claude", bare)).toBeNull();
+   expect(workerModelFor("claude", bare)).toEqual({ model: "claude-sonnet-5-5" });
   } finally {
    rmSync(dir, { recursive: true, force: true });
   }
