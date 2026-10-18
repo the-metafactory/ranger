@@ -454,13 +454,13 @@ export interface WorkerModel {
 }
 
 /**
- * The model ranger pins for a substrate's worker sessions: Codex and Pi from
- * `substrates` in ranger's config. Null for Claude, which ranger does not pin.
+ * The model ranger pins for a substrate's worker sessions, from `substrates`
+ * in ranger's config.
  */
 export function workerModelFor(substrate: SubstrateName, config: RangerConfig): WorkerModel | null {
  switch (substrate) {
   case "claude":
-   return null;
+   return { model: config.substrates.claude.model };
   case "codex":
    return { model: config.substrates.codex.model, reasoningEffort: config.substrates.codex.reasoningEffort };
   case "pi":
@@ -492,7 +492,7 @@ export function workerCommandFor(
 ): string[] {
  switch (substrate) {
   case "claude":
-   return ["claude", "-p", "--output-format", "stream-json", "--verbose"];
+   return ["claude", "-p", "--model", config.substrates.claude.model, "--output-format", "stream-json", "--verbose"];
   case "codex":
    return [
     "codex",

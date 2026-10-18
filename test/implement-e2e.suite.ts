@@ -4398,9 +4398,9 @@ describe("implement lane (node #23)", () => {
   const starts = events.filter((e) => e.kind === "worker-start" && e.detail?.startsWith("substrate "));
   expect(starts.map((e) => e.detail?.split(" ")[1]).reverse()).toEqual(["claude", "codex"]);
   expect(starts[0].detail).toContain("codex 7d 5%");
-  // The Codex session names the model ranger pins; Claude's is not pinned.
+  // Each session names the model ranger pins.
   expect(starts[0].detail).toStartWith("substrate codex (gpt-6.1-sol, high) (");
-  expect(starts[1].detail).toStartWith("substrate claude (fixed by the caller)");
+  expect(starts[1].detail).toStartWith("substrate claude (claude-sonnet-5-5) (fixed by the caller)");
 
   // The capped session's leftovers were dropped; the pushed head is Codex's.
   const head = await r.github.sha("node/20-add-the-feature-module");
@@ -4417,7 +4417,7 @@ describe("implement lane (node #23)", () => {
   try {
    const models = db.query("SELECT substrate, kind, model FROM substrate_sessions ORDER BY id").all();
    expect(models.slice(0, 2)).toEqual([
-    { substrate: "claude", kind: "worker", model: null },
+    { substrate: "claude", kind: "worker", model: "claude-sonnet-5-5" },
     { substrate: "codex", kind: "worker", model: "gpt-6.1-sol" },
    ]);
    expect(models.filter((m) => (m as { kind: string }).kind === "review").every((m) => (m as { model: unknown }).model === null)).toBe(true);
