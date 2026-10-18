@@ -819,7 +819,7 @@ async function readThreads(
 ): Promise<IntakeResult> {
   const deadline = Date.now() + INTAKE_PASS_MS;
   const clientFor =
-    ctx.clientFor ?? ((map: RangerMapConfig) => EscalationDiscord.fromMap(map, undefined, ctx.env ?? process.env));
+    ctx.clientFor ?? ((map: RangerMapConfig) => EscalationDiscord.fromMap(map, ctx.env ?? process.env));
   // The bot's own id, read once per tick per token (D11).
   const botIds = new Map<string, Promise<string>>();
   const results: IntakeThreadResult[] = [];

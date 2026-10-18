@@ -1,4 +1,3 @@
-import { principalLoginForRepo } from "./config.ts";
 import { mapPool } from "./pool.ts";
 import { journalKeyFor } from "./forge-ref.ts";
 import { mapKey } from "./maps.ts";
@@ -107,7 +106,7 @@ function cardSpec(node: ClassifiedNode): { head: CardHead; reason: string; journ
   }
 }
 
-/** Age band (design §5): shown from day 1, louder at 3+, @-mention at 7+. */
+/** Age band (design §5): shown from day 1, louder at 3+, overdue at 7+. */
 type AgeBand = "fresh" | "aging" | "overdue";
 
 export function ageBand(ageDays: number): AgeBand {
@@ -144,20 +143,13 @@ export function digestAction(
 
 export { sanitizeGraphText };
 
-/** The card's last line: louder at 3+ days, the principal's ping at 7+. The
- *  age itself is on the subtext line; a fresh card has no tail. */
-function ageTail(
-  ageDays: number,
-  principal: string,
-  principalDiscordId?: string,
-): string | null {
+/** The card's last line: louder at 3+ days, overdue at 7+. The age itself is
+ *  on the subtext line; a fresh card has no tail. No band mentions the
+ *  principal: an overdue card is `overdue` state, and Vigil's text is the
+ *  interruption that answers it. */
+function ageTail(ageDays: number): string | null {
   if (ageBand(ageDays) === "overdue") {
-    // A real Discord ping needs `<@id>` in content; the id is allow-listed
-    // in allowed_mentions. Without a configured id, the mention is inert text.
-    return principalDiscordId === undefined
-      ? `📣 @${principal} ${ageDays}d old — needs your attention ` +
-          "(no ping — configure `principal.discordId`)"
-      : `📣 <@${principalDiscordId}> ${ageDays}d old — needs your attention`;
+    return `📣 ${ageDays}d old — overdue`;
   }
   if (ageBand(ageDays) === "aging") {
     return (
@@ -211,8 +203,6 @@ export function cardContent(
   node: ClassifiedNode,
   map: { repo: string; root: number },
   ageDays: number,
-  principal: string,
-  principalDiscordId?: string,
 ): string {
   const spec = cardSpec(node);
   const body =
@@ -231,7 +221,7 @@ export function cardContent(
     // A grilling card carries the question in full room; the others a gist.
     ...(node.kind === "grilling" ? {} : { bodyMax: 140 }),
     footer: probeLines(node),
-    tail: ageTail(ageDays, principal, principalDiscordId),
+    tail: ageTail(ageDays),
   });
 }
 
@@ -550,15 +540,9 @@ async function syncCard(
   node: ClassifiedNode,
   prior: EscalationRow | undefined,
 ): Promise<SyncOutcome> {
-  const { client, config, map, now } = ctx;
+  const { client, map, now } = ctx;
   const ageDays = prior === undefined ? 0 : dayDiff(prior.createdAt, now);
-  const content = cardContent(
-    node,
-    map,
-    ageDays,
-    principalLoginForRepo(config, map.repo) ?? "principal",
-    config.principal.discordId,
-  );
+  const content = cardContent(node, map, ageDays);
   const cardCtx: CardSyncContext = {
     ...ctx,
     node,
@@ -1069,17 +1053,9 @@ export function closedGraphContent(
   });
 }
 
-export function ageText(
-  band: AgeBand,
-  ageDays: number,
-  principal: string,
-  principalDiscordId?: string,
-): string {
+export function ageText(band: AgeBand, ageDays: number): string {
   if (band === "overdue") {
-    if (principalDiscordId !== undefined) {
-      return `📣 <@${principalDiscordId}> ${ageDays}d`;
-    }
-    return `📣 @${principal} ${ageDays}d (no ping)`;
+    return `📣 ${ageDays}d`;
   }
   if (band === "aging") {
     return `⚠️ ${ageDays}d`;
@@ -1372,7 +1348,7 @@ export async function resolveDeskContext(
   map: RangerMapConfig,
 ): Promise<{ token: ResolvedToken; client: EscalationDiscord }> {
   const { token } = await assertReadOnlyToken(config, map.repo);
-  const client = EscalationDiscord.fromMap(map, config.principal.discordId);
+  const client = EscalationDiscord.fromMap(map);
   return { token, client };
 }
 
