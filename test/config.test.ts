@@ -264,6 +264,17 @@ describe("loadConfig", () => {
     }
   });
 
+  test("substrates.pi.reviewEvery still parses but warns that it is ignored", () => {
+    const base = ["version: 1", "maps:", "  - repo: acme/widgets", "    root: 1", "substrates:", "  pi:"];
+    for (const [value, warned] of [[2, true], [0, false]] as const) {
+      withConfig([...base, `    reviewEvery: ${value}`].join("\n"), (path) => {
+        const lines: string[] = [];
+        loadConfig(path, {}, (line) => lines.push(line));
+        expect(lines).toEqual(warned ? [`ranger: substrates.pi.reviewEvery is ignored in ${path}: Pi no longer runs reviews; remove the key`] : []);
+      });
+    }
+  });
+
   test("substrates.codex: configured model and effort parse (node #60)", () => {
     withConfig(
       [

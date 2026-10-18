@@ -331,12 +331,6 @@ const WorkersSchema = z.object({
 const PiSubstrateSchema = z.object({
  provider: z.string().min(1).default("spark"),
  model: z.string().min(1).default("longctx-think"),
- /**
-  * Every Nth sage review round runs on Pi whatever the quota (principal,
-  * 2026-10-09: spread reviews onto the Spark cluster while Claude and Codex
-  * run low). 2 sends rounds 2, 4, 6… to Pi; the other rounds stay
-  * cross-model. 0 (the default) leaves Pi as the fallback only.
-  */
  reviewEvery: z.number().int().min(0).default(0),
 });
 
@@ -356,10 +350,6 @@ const ClaudeSubstrateSchema = z.object({
  model: z.string().regex(MODEL_NAME, "a plain model name ([A-Za-z0-9._-])").default("claude-sonnet-5-5"),
 });
 
-/**
- * Substrate selection (node #45): which of Claude, Codex and Pi runs an
- * implement session, fix pass or sage review, by remaining 5h/7d quota.
- */
 const SubstratesSchema = z.object({
  /** 5-hour reserve at window start: eligible below this, rising toward 100% at reset (default 70). */
  fiveHourMaxUsedPct: z.number().min(0).max(100).default(70),
@@ -525,7 +515,11 @@ export function expandHome(path: string): string {
  * so branch code they run opens a per-session temp journal, never the live
  * one. The live processes never set it, and ranger's wrapper unsets it.
  */
-export function loadConfig(path: string, env: NodeJS.ProcessEnv = process.env): LoadedConfig {
+export function loadConfig(
+ path: string,
+ env: NodeJS.ProcessEnv = process.env,
+ notice: (line: string) => void = (line) => { process.stderr.write(`${line}\n`); },
+): LoadedConfig {
  let raw: string;
  try {
   raw = readFileSync(path, "utf8");
@@ -547,6 +541,9 @@ export function loadConfig(path: string, env: NodeJS.ProcessEnv = process.env): 
   throw new ConfigError(
    `invalid config at ${path}: ${formatZodError(parsed.error)}`,
   );
+ }
+ if (parsed.data.substrates.pi.reviewEvery > 0) {
+  notice(`ranger: substrates.pi.reviewEvery is ignored in ${path}: Pi no longer runs reviews; remove the key`);
  }
  const override = journalPathOverride(env);
  if (override !== undefined) parsed.data.state.journalPath = override;

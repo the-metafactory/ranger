@@ -42,8 +42,9 @@ export async function sageReview(
  repo: string,
  prNumber: number,
  readOnlyToken: string,
- opts: { command?: string; timeoutMs?: number; substrate?: SubstrateName; nice?: number; reviewAuthor?: string } = {},
+ opts: { command?: string; timeoutMs?: number; substrate: SubstrateName; nice?: number; reviewAuthor?: string },
 ): Promise<ReviewVerdict> {
+ if (opts.substrate === "pi") throw new ReviewError("Pi cannot run reviews");
  // Ranger posts each round as a PR comment under its machine account, not as
  // a review under the read-only token's login. Naming that account is what lets
  // sage read its own earlier rounds back (sage#134): without it every
@@ -53,12 +54,7 @@ export async function sageReview(
  const gated = gatedEnv(readOnlyToken, extra, workerHostEnv());
  try {
   const args = ["review", nodeKey(repo, prNumber), "--emit-verdict-block"];
-  // The cross-model choice. Checked against sage 0.2.12 (a4f12c9,
-  // src/cli/index.ts): `review` takes `--substrate <name>` with
-  // {pi|claude|codex}; without it sage falls back to SAGE_SUBSTRATE / config.
-  // A sage that rejects the flag fails here as an ordinary ReviewError
-  // carrying its stderr, never as a cap (confirmCap reads the quota, not text).
-  if (opts.substrate !== undefined) args.push("--substrate", opts.substrate);
+  args.push("--substrate", opts.substrate);
   const result = await runReadRetryingTransient(
    opts.command ?? process.env.RANGER_SAGE_CMD ?? "sage",
    args,

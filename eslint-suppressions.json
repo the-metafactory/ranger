@@ -119,7 +119,7 @@
       "count": 1
     },
     "ranger/no-comments": {
-      "count": 83
+      "count": 81
     }
   },
   "src/digest.ts": {
@@ -342,7 +342,7 @@
       "count": 5
     },
     "ranger/no-comments": {
-      "count": 293
+      "count": 292
     }
   },
   "src/intake.ts": {
@@ -754,7 +754,7 @@
       "count": 2
     },
     "ranger/no-comments": {
-      "count": 20
+      "count": 15
     }
   },
   "src/route.ts": {
@@ -930,7 +930,7 @@
       "count": 1
     },
     "ranger/no-comments": {
-      "count": 29
+      "count": 28
     }
   },
   "src/sweep.ts": {
@@ -1346,7 +1346,7 @@
       "count": 6
     },
     "ranger/no-comments": {
-      "count": 230
+      "count": 226
     }
   },
   "test/implement.unit.test.ts": {
