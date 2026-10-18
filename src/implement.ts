@@ -1464,8 +1464,10 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
  // A CI fix pass grants its round the same way.
  let ciFixes = ciFixState(recordedCiFixes(opening, botIdentity), openingHead).used;
  let probeFixes = ciFixState(recordedProbeFixes(opening, botIdentity), openingHead).used;
- let finishPasses = recordedFinishFixes(opening, botIdentity).length;
- const capNow = () => config.workers.reviewRounds + baseMerges + ciFixes + probeFixes + finishPasses;
+ const finishMarkers = recordedFinishFixes(opening, botIdentity);
+ let finishPasses = finishMarkers.length;
+ let finishFixes = finishMarkers.filter((r) => r.sha !== r.red).length;
+ const capNow = () => config.workers.reviewRounds + baseMerges + ciFixes + probeFixes + finishFixes;
  let probe: RecordedProbe | undefined;
  // The head whose set-aside major is already journaled: once per head per
  // run, as the loop re-reads an unchanged head on every pass.
@@ -1616,7 +1618,10 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
   fence("record the finish pass");
   await github.postComment(repo, open.iid, finishFixMarker({ sha: fixed.sha, red: head }), token);
   finishPasses += 1;
-  if (fixed.unchanged !== true) return "again";
+  if (fixed.unchanged !== true) {
+   finishFixes += 1;
+   return "again";
+  }
   journal.recordEvent("reviewed", { nodeId, repo, detail: `finish pass at ${head.slice(0, 8)} committed nothing: the merge goes on` });
   return "merge";
  };
@@ -1983,7 +1988,7 @@ export function recordedProbeFixes(comments: IssueComment[], botIdentity: string
 /**
  * Finish passes one node gets: one. A marker, posted once the pass's
  * commits are pushed or it committed nothing, spends it across a run-node
- * restart and grants one sage round.
+ * restart; one whose fix landed grants the sage round reviewing it.
  */
 export const MAX_FINISH_FIXES = 1;
 
