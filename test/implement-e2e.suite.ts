@@ -227,6 +227,16 @@ interface Rig {
 
 const savedEnv = { ...process.env };
 
+async function eligibleCodexReading() {
+ return {
+  substrate: "codex" as const,
+  readAt: new Date(),
+  windows: [{ kind: "five_hour" as const, usedPct: 10, resetsAt: Math.floor(Date.now() / 1000) + 3600 }],
+  capped: false,
+  cappedUntil: null,
+ };
+}
+
 async function rig(opts: {
  nodeId?: string;
  root?: number;
@@ -345,6 +355,10 @@ async function rig(opts: {
   github,
   reviewer,
   readOnlyToken: "ghp_readonly",
+  substrateReaders: {
+   claude: () => Promise.reject(new Error("probe down")),
+   codex: eligibleCodexReading,
+  },
  };
  return { dir, origin, canonical, journal, statePath, ctx, github, calls, announced };
 }
@@ -836,12 +850,11 @@ describe("implement lane (node #23)", () => {
   expect(row?.reviewRound).toBe(2);
   expect(row?.verdictBlockers).toBe(0);
   expect(r.calls).toHaveLength(2);
-  // Quota reads fail closed under the injected worker, so every session ran on Pi (node #56).
   expect(sessions(r.journal)).toEqual([
-   ["pi", "worker", "ok"],
-   ["pi", "review", "ok"],
-   ["pi", "fix-pass", "ok"],
-   ["pi", "review", "ok"],
+   ["codex", "worker", "ok"],
+   ["codex", "review", "ok"],
+   ["codex", "fix-pass", "ok"],
+   ["codex", "review", "ok"],
   ]);
   // Each row carries the supervisor generation that ran it: the panel's liveness check.
   expect(new Set(r.journal.listSubstrateSessions(new Date(0))?.map((s) => s.generation))).toEqual(
@@ -4482,7 +4495,7 @@ describe("implement lane (node #23)", () => {
   expect(r.journal.getSubstrateReading("codex")?.capped).toBe(false);
  }, 60_000);
 
- test("a review capped on its substrate resumes cross-model without touching attempts or the dead-man", async () => {
+ test("a review capped with no capable fallback parks without starting Pi", async () => {
   const r = await rig({});
   cleanup.push(r.dir);
   const resetsAt = Math.floor(Date.now() / 1000) + 3600;
@@ -4512,10 +4525,10 @@ describe("implement lane (node #23)", () => {
   };
 
   const outcome = await runNode("20", r.ctx);
-  expect(outcome.status).toBe("awaiting-merge");
-  // Claude wrote the head: the review goes to Codex first; once Codex caps
-  // (and Claude is unread), the resumed review falls back to Pi.
-  expect(reviewSubstrates).toEqual(["codex", "pi"]);
+  expect(outcome.status).toBe("parked");
+  expect(outcome.detail).toContain("Pi cannot run reviews");
+  expect(r.journal.getWorker("20", "acme/widgets")?.phase).toBe("awaiting-review");
+  expect(reviewSubstrates).toEqual(["codex"]);
   expect(r.journal.deadmanCount()).toBe(0);
   expect(r.journal.getWorker("20", "acme/widgets")?.attempts).toBe(0);
   expect(r.journal.getSubstrateReading("codex")?.cappedUntil).toBe(new Date(resetsAt * 1000).toISOString());
@@ -4525,33 +4538,24 @@ describe("implement lane (node #23)", () => {
   expect(capped).toHaveLength(1);
   expect(capped[0].detail).toContain("codex hit its limit");
   const reviewed = events.filter((e) => e.kind === "reviewed");
-  expect(reviewed).toHaveLength(1);
-  expect(reviewed[0].detail).toContain("on pi (head by claude;");
+  expect(reviewed).toHaveLength(0);
 
   const markers = (r.github.comments.get(1) ?? []).filter((c) => c.body.includes("ranger:review"));
-  expect(markers).toHaveLength(1);
-  expect(markers[0].body).toContain("substrate=pi -->");
+  expect(markers).toHaveLength(0);
   expect(sessions(r.journal)).toEqual([
    ["claude", "worker", "ok"],
    ["codex", "review", "capped"],
-   ["pi", "review", "ok"],
   ]);
  }, 60_000);
 
- test("substrates.pi.reviewEvery: 2 sends the second review round to Pi while Codex is eligible", async () => {
+ test("legacy pi.reviewEvery cannot send review rounds to Pi", async () => {
   const r = await rig({ blockers: [1, 0] });
   cleanup.push(r.dir);
   r.ctx.config.substrates.pi.reviewEvery = 2;
   r.ctx.substrate = "claude";
   r.ctx.substrateReaders = {
    claude: () => Promise.reject(new Error("probe down")),
-   codex: async () => ({
-    substrate: "codex",
-    readAt: new Date(),
-    windows: [{ kind: "five_hour", usedPct: 10, resetsAt: Math.floor(Date.now() / 1000) + 3600 }],
-    capped: false,
-    cappedUntil: null,
-   }),
+   codex: eligibleCodexReading,
   };
   const scripted = r.ctx.reviewer!;
   const reviewSubstrates: (string | undefined)[] = [];
@@ -4562,11 +4566,10 @@ describe("implement lane (node #23)", () => {
 
   const outcome = await runNode("20", r.ctx);
   expect(outcome.status).toBe("awaiting-merge");
-  // Round 1 stays cross-model (Claude wrote the head → Codex); round 2 is Pi's turn.
-  expect(reviewSubstrates).toEqual(["codex", "pi"]);
+  expect(reviewSubstrates).toEqual(["codex", "codex"]);
   const reviewed = r.journal.listEvents("acme/widgets", 200).filter((e) => e.kind === "reviewed");
   expect(reviewed.map((e) => e.detail?.match(/^round (\d+)/)?.[1])).toEqual(["2", "1"]);
-  expect(reviewed[0].detail).toContain("on pi (head by claude; Pi rotation (pi.reviewEvery 2);");
+  expect(reviewed[0].detail).toContain("on codex (head by claude;");
   expect(reviewed[1].detail).toContain("on codex (head by claude; claude unread; codex");
  }, 60_000);
 
@@ -4578,13 +4581,7 @@ describe("implement lane (node #23)", () => {
   process.env.RANGER_WORKER_CMD = implementWorker;
   r.ctx.substrateReaders = {
    claude: () => Promise.reject(new Error("down")),
-   codex: async () => ({
-    substrate: "codex",
-    readAt: new Date(),
-    windows: [{ kind: "five_hour", usedPct: 10, resetsAt: Math.floor(Date.now() / 1000) + 3600 }],
-    capped: false,
-    cappedUntil: null,
-   }),
+   codex: eligibleCodexReading,
   };
   const scripted = r.ctx.reviewer!;
   const reviewSubstrates: (string | undefined)[] = [];

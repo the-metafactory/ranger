@@ -53,6 +53,7 @@ import { holdAwake } from "./awake.ts";
 import { enqueueJob, JobError, runJob, type RunJobContext } from "./jobs.ts";
 import { BUILD_NOW_NOT_STARTED, buildNow, type BuildNowResult } from "./build-now.ts";
 import { startServe } from "./serve.ts";
+import { approveNode } from "./approve-node.ts";
 import {
  escalateMaps,
  runDigest,
@@ -886,6 +887,18 @@ program
    );
    process.exit(1);
   }
+ });
+
+program
+ .command("approve-node <id>")
+ .requiredOption("--map <map>", "registered map repo#root")
+ .requiredOption("--version <hash>", "node version shown on the approval card")
+ .option("--dry-run", "validate without approving")
+ .option("-c, --config <path>", "path to ranger.yaml")
+ .action(async (id: string, options: { map: string; version: string; dryRun?: boolean; config?: string }) => {
+  const { config } = loadConfig(resolveConfigPath(options.config, process.env, process.cwd()));
+  const map = pickMap(config, options.map);
+  process.stdout.write(JSON.stringify(await approveNode({ config, map, id, version: options.version, dryRun: options.dryRun })) + "\n");
  });
 
 program

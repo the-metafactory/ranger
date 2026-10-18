@@ -209,6 +209,16 @@ async function rig(opts: { autonomy?: "auto" | "propose"; research?: boolean } =
   researchCiTiming: { settleMs: 0, pollMs: 1 },
   hostLoad: () => ({ load: 0, cores: 1 }),
   announce: async () => undefined,
+  substrateReaders: {
+   claude: () => Promise.reject(new Error("probe down")),
+   codex: async () => ({
+    substrate: "codex" as const,
+    readAt: new Date(),
+    windows: [{ kind: "five_hour" as const, usedPct: 10, resetsAt: Math.floor(Date.now() / 1000) + 3600 }],
+    capped: false,
+    cappedUntil: null,
+   }),
+  },
  };
  return { dir, origin, config, map, journal, statePath, forge, ctx };
 }

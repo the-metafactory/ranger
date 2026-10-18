@@ -95,6 +95,8 @@ import {
  uncheckedNeedsEye,
 } from "./serve-parked.ts";
 import { runDrainAction } from "./serve-drain.ts";
+import { runApproveAction } from "./serve-approve.ts";
+import { executableApproval } from "./approval-spec.ts";
 import { workerLogFile } from "./worker-log.ts";
 
 export { childEnv };
@@ -293,6 +295,8 @@ export interface GrillingView extends NodeView {
 /** A frontier node escalated to the principal that is not a grilling: an approve task, a decision, a prototype. */
 export interface DecisionView extends NodeView {
  autonomy: string;
+ approvalVersion?: string;
+ approvable?: boolean;
  /** Why ranger does not take it. */
  reason: string;
  /** A `propose` node is the principal's to work: "Start session" opens one, as on a grilling. */
@@ -611,7 +615,10 @@ export function assembleState(inputs: StateInputs): DashboardState {
       : map.localCheckout !== undefined
        ? undefined
        : (map.checkoutRefused ?? `no localCheckout for ${map.repo} in ranger.yaml`);
-    return [{ ...view(n), autonomy: n.autonomy, reason, launchable: why === undefined, why }];
+    return [{ ...view(n), autonomy: n.autonomy, reason, launchable: why === undefined, why,
+     approvalVersion: n.approvalVersion,
+     approvable: !map.servedOnly && map.walk === "full" && executableApproval(n),
+    }];
    }),
   };
  });
@@ -881,6 +888,15 @@ export function createHandler(ctx: HandlerContext): (req: Request) => Promise<Re
    return json(202, { refreshing: true });
   }
   const action = ACTION_PATHS[url.pathname];
+  if (url.pathname === "/api/approve") {
+   if (ctx.actions === undefined) return refuse(501, "actions are not wired in this server");
+   const body = await readObject(req);
+   if (body === null) return refuse(400, "body is not a JSON object");
+   const result = await runApproveAction(body, { maps: ctx.getState().maps, configPath: ctx.actions.configPath,
+    rangerBin: ctx.actions.rangerBin, run: ctx.actions.run, env: ctx.actions.env ?? process.env, inFlight });
+   if (result.status === 200 && body.dryRun !== true) ctx.refresh();
+   return json(result.status, result.body);
+  }
   if (action !== undefined) {
    if (ctx.actions === undefined) return refuse(501, "actions are not wired in this server");
    const body = await readObject(req);
@@ -1254,17 +1270,29 @@ function grillButton(m, g) {
   catch (e) { say("Could not start #" + g.id + ": " + e.message, true); }
  });
 }
+const approvedNodes = new Map();
 function renderGrill(s) {
  const box = document.getElementById("grill"); box.replaceChildren();
  box.append(...byRepo("grill", s.maps, (m) => m.repo, (m) => {
-  const decisions = m.decisions || [];
+  const decisions = (m.decisions || []).filter((d) => approvedNodes.get(m.key + "/" + d.id) !== d.approvalVersion || !d.approvalVersion);
   const n = m.grillings.length + decisions.length;
   const body = n === 0 ? unavailable(m, "None open.")
    : el("ul", {},
     ...m.grillings.map((g) => el("li", {}, el("span", { class: "id", text: "#" + g.id }), el("span", { class: "t" }, link(g.url, g.title)), tags(tag("grilling"), grillButton(m, g)))),
-    ...decisions.map((d) => el("li", {}, el("span", { class: "id", text: "#" + d.id }), el("span", { class: "t" }, link(d.url, d.title), el("span", { class: "reason", text: d.reason })), tags(tag((d.kind || "no kind") + " · " + (d.autonomy || "no autonomy")), d.autonomy === "propose" ? grillButton(m, d) : null))));
+    ...decisions.map((d) => el("li", {}, el("span", { class: "id", text: "#" + d.id }), el("span", { class: "t" }, link(d.url, d.title), el("span", { class: "reason", text: d.reason })), tags(tag((d.kind || "no kind") + " · " + (d.autonomy || "no autonomy")), d.approvable ? approveButton(m, d) : null, d.autonomy === "propose" ? grillButton(m, d) : null))));
   return mapGroup("grill", m, m.servedOnly ? " (shown only)" : "", mapCount(m, n), mapMeta(m), body);
  }));
+}
+function approveButton(m, d) {
+ return actionButton("Approve", "Allow Ranger to work on #" + d.id + " through its normal review and merge gates", true, async () => {
+  if (!confirm("Approve #" + d.id + " for Ranger to work on?\\n\\n" + d.title + "\\n\\nDependencies, checks and review gates still apply.")) return;
+  try {
+   const r = await post("/api/approve", { key: m.key, id: d.id, version: d.approvalVersion });
+   if (r.ok) approvedNodes.set(m.key + "/" + d.id, d.approvalVersion);
+   say(r.ok ? "Approved #" + d.id + ". Ranger can pick it up on its next tick." : "Approval failed: " + (r.stderr || "check the node and try again"), !r.ok);
+  } catch (e) { say("Approval refused: " + e.message, true); }
+  load();
+ });
 }
 const short = (sha) => (sha || "").slice(0, 8);
 function prLifecycle(v) {
