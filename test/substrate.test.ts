@@ -1164,7 +1164,7 @@ describe("sageReview passes the chosen substrate (sage src/cli/index.ts --substr
   );
   process.env.SAGE_ARGV_OUT = out;
   try {
-   await sageReview("acme/widgets", 7, "ghp_readonly", { command: fake });
+   await sageReview("acme/widgets", 7, "ghp_readonly", { command: fake, substrate: "claude" });
    expect(readFileSync(out, "utf8").trim().split("\n").slice(-2)).toEqual(["--substrate", "claude"]);
    const verdict = await sageReview("acme/widgets", 7, "ghp_readonly", { command: fake, substrate: "codex" });
    expect(verdict.verdict).toBe("approved");

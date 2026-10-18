@@ -42,7 +42,7 @@ export async function sageReview(
  repo: string,
  prNumber: number,
  readOnlyToken: string,
- opts: { command?: string; timeoutMs?: number; substrate?: SubstrateName; nice?: number; reviewAuthor?: string } = {},
+ opts: { command?: string; timeoutMs?: number; substrate: SubstrateName; nice?: number; reviewAuthor?: string },
 ): Promise<ReviewVerdict> {
  if (opts.substrate === "pi") throw new ReviewError("Pi cannot run reviews");
  // Ranger posts each round as a PR comment under its machine account, not as
@@ -54,7 +54,7 @@ export async function sageReview(
  const gated = gatedEnv(readOnlyToken, extra, workerHostEnv());
  try {
   const args = ["review", nodeKey(repo, prNumber), "--emit-verdict-block"];
-  args.push("--substrate", opts.substrate ?? "claude");
+  args.push("--substrate", opts.substrate);
   const result = await runReadRetryingTransient(
    opts.command ?? process.env.RANGER_SAGE_CMD ?? "sage",
    args,

@@ -561,7 +561,7 @@ describe("sage exit codes (live finding on seelite #667)", () => {
   const saved = process.env.SAGE_FAKE_MODE;
   process.env.SAGE_FAKE_MODE = mode;
   try {
-   return await sageReview("acme/widgets", 7, "ghp_readonly", { command: fake });
+   return await sageReview("acme/widgets", 7, "ghp_readonly", { command: fake, substrate: "claude" });
   } finally {
    if (saved === undefined) delete process.env.SAGE_FAKE_MODE;
    else process.env.SAGE_FAKE_MODE = saved;
@@ -576,12 +576,12 @@ describe("sage exit codes (live finding on seelite #667)", () => {
  });
  test("the posting account reaches sage as its review author, so earlier rounds read back", async () => {
   const { sageReview } = await import("../src/review.ts");
-  const named = await sageReview("acme/widgets", 7, "ghp_readonly", { command: fake, reviewAuthor: "ivy-bot" });
+  const named = await sageReview("acme/widgets", 7, "ghp_readonly", { command: fake, substrate: "claude", reviewAuthor: "ivy-bot" });
   expect(named.summary).toBe("fake author=ivy-bot");
   const saved = process.env.SAGE_REVIEW_AUTHOR_LOGIN;
   delete process.env.SAGE_REVIEW_AUTHOR_LOGIN;
   try {
-   expect((await sageReview("acme/widgets", 7, "ghp_readonly", { command: fake })).summary).toBe("fake author=none");
+   expect((await sageReview("acme/widgets", 7, "ghp_readonly", { command: fake, substrate: "claude" })).summary).toBe("fake author=none");
   } finally {
    if (saved !== undefined) process.env.SAGE_REVIEW_AUTHOR_LOGIN = saved;
   }

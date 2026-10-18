@@ -1,4 +1,4 @@
-import { executableApproval, approvalVersion, NODE_BLOCK } from "./approval-spec.ts";
+import { executableApproval, approvalVersion, isApprovalVersion, isNodeId, NODE_BLOCK } from "./approval-spec.ts";
 import { principalLoginForRepo, type RangerConfig, type RangerMapConfig } from "./config.ts";
 import { parseForgeRef } from "./forge-ref.ts";
 import { childEnv } from "./launch.ts";
@@ -11,7 +11,7 @@ export async function approveNode(args: {
  version: string;
  dryRun?: boolean;
 }, runner: typeof runCmd = runCmd): Promise<{ approved: boolean; dryRun: boolean }> {
- if (!/^\d+$/.test(args.id) || !/^[a-f0-9]{64}$/.test(args.version)) throw new Error("invalid node id or approval version");
+ if (!isNodeId(args.id) || !isApprovalVersion(args.version)) throw new Error("invalid node id or approval version");
  if (args.map.walk !== "full" || (args.map.nodes !== undefined && !args.map.nodes.includes(args.id))) throw new Error("node is outside this map's implementation scope");
  const ref = parseForgeRef(args.map.repo);
  const principal = principalLoginForRepo(args.config, args.map.repo);

@@ -17,6 +17,7 @@ import { assertReadOnlyToken } from "../src/token-gate.ts";
 import { claimNode, walk } from "../src/walk.ts";
 import { runNode, type RunNodeContext } from "../src/worker.ts";
 import { createCanonicalRepo, fakeDiscord, GIT_ENV } from "./support.ts";
+import { eligibleCodexReading } from "./fixtures/substrate-readings.ts";
 
 /**
  * Node #131: the walk, implement and research lanes run a `gitlab:` map
@@ -211,13 +212,7 @@ async function rig(opts: { autonomy?: "auto" | "propose"; research?: boolean } =
   announce: async () => undefined,
   substrateReaders: {
    claude: () => Promise.reject(new Error("probe down")),
-   codex: async () => ({
-    substrate: "codex" as const,
-    readAt: new Date(),
-    windows: [{ kind: "five_hour" as const, usedPct: 10, resetsAt: Math.floor(Date.now() / 1000) + 3600 }],
-    capped: false,
-    cappedUntil: null,
-   }),
+   codex: eligibleCodexReading,
   },
  };
  return { dir, origin, config, map, journal, statePath, forge, ctx };

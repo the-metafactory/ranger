@@ -40,6 +40,7 @@ import { workerLogFile } from "../src/worker-log.ts";
 import type { TestBackend, TestRequest } from "../src/remote-test/supervisor-backend.ts";
 import type { RemoteTestJob, RemoteTestStatus } from "../src/remote-test/contract.ts";
 import { randomUUID } from "node:crypto";
+import { eligibleCodexReading } from "./fixtures/substrate-readings.ts";
 
 const fixturesBin = join(import.meta.dir, "fixtures", "bin");
 const dataDir = join(import.meta.dir, "fixtures", "data");
@@ -226,16 +227,6 @@ interface Rig {
 }
 
 const savedEnv = { ...process.env };
-
-async function eligibleCodexReading() {
- return {
-  substrate: "codex" as const,
-  readAt: new Date(),
-  windows: [{ kind: "five_hour" as const, usedPct: 10, resetsAt: Math.floor(Date.now() / 1000) + 3600 }],
-  capped: false,
-  cappedUntil: null,
- };
-}
 
 async function rig(opts: {
  nodeId?: string;

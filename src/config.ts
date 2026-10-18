@@ -515,7 +515,11 @@ export function expandHome(path: string): string {
  * so branch code they run opens a per-session temp journal, never the live
  * one. The live processes never set it, and ranger's wrapper unsets it.
  */
-export function loadConfig(path: string, env: NodeJS.ProcessEnv = process.env): LoadedConfig {
+export function loadConfig(
+ path: string,
+ env: NodeJS.ProcessEnv = process.env,
+ notice: (line: string) => void = (line) => { process.stderr.write(`${line}\n`); },
+): LoadedConfig {
  let raw: string;
  try {
   raw = readFileSync(path, "utf8");
@@ -537,6 +541,9 @@ export function loadConfig(path: string, env: NodeJS.ProcessEnv = process.env): 
   throw new ConfigError(
    `invalid config at ${path}: ${formatZodError(parsed.error)}`,
   );
+ }
+ if (parsed.data.substrates.pi.reviewEvery > 0) {
+  notice(`ranger: substrates.pi.reviewEvery is ignored in ${path}: Pi no longer runs reviews; remove the key`);
  }
  const override = journalPathOverride(env);
  if (override !== undefined) parsed.data.state.journalPath = override;

@@ -113,7 +113,7 @@ export type Reviewer = (
  repo: string,
  prNumber: number,
  readOnlyToken: string,
- opts?: { substrate?: SubstrateName; nice?: number; reviewAuthor?: string },
+ opts: { substrate: SubstrateName; nice?: number; reviewAuthor?: string },
 ) => Promise<ReviewVerdict>;
 
 export type WorkerRun = (prompt: string, opts: RunOptions) => Promise<RunResult>;
