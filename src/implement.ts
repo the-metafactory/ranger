@@ -1464,8 +1464,8 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
  // A CI fix pass grants its round the same way.
  let ciFixes = ciFixState(recordedCiFixes(opening, botIdentity), openingHead).used;
  let probeFixes = ciFixState(recordedProbeFixes(opening, botIdentity), openingHead).used;
- let finishFixes = ciFixState(recordedFinishFixes(opening, botIdentity), openingHead).used;
- const capNow = () => config.workers.reviewRounds + baseMerges + ciFixes + probeFixes + finishFixes;
+ let finishPasses = recordedFinishFixes(opening, botIdentity).length;
+ const capNow = () => config.workers.reviewRounds + baseMerges + ciFixes + probeFixes + finishPasses;
  let probe: RecordedProbe | undefined;
  // The head whose set-aside major is already journaled: once per head per
  // run, as the loop re-reads an unchanged head on every pass.
@@ -1602,8 +1602,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
   return "again";
  };
  const finishPass = async (head: string, review: RecordedReview): Promise<"again" | "merge" | ImplementOutcome> => {
-  const recorded = recordedFinishFixes(await github.listComments(repo, open.iid, token), botIdentity);
-  if (recorded.length >= MAX_FINISH_FIXES || finishFixes >= MAX_FINISH_FIXES) return "merge";
+  if (finishPasses >= MAX_FINISH_FIXES) return "merge";
   journal.recordEvent("reviewed", {
    nodeId,
    repo,
@@ -1616,12 +1615,13 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
   fence("record the finish pass");
   if (fixed.unchanged === true) {
    await github.postComment(repo, open.iid, finishFixMarker({ sha: head, red: head }), token);
+   finishPasses += 1;
    journal.recordEvent("reviewed", { nodeId, repo, detail: `finish pass at ${head.slice(0, 8)} declined every finding: the merge goes on` });
    return "merge";
   }
   await github.postComment(repo, open.iid, finishFixMarker({ sha: fixed.sha, red: head }), token);
   await publishPass(ctx, github, open.iid, fixed, "push finish fix", `finish pass @ ${fixed.sha.slice(0, 8)}: round ${review.round} left ${leftWork(review)} change(s) at ${head.slice(0, 8)}`);
-  finishFixes += 1;
+  finishPasses += 1;
   return "again";
  };
  for (;;) {
@@ -1985,8 +1985,8 @@ export function recordedProbeFixes(comments: IssueComment[], botIdentity: string
 }
 
 /**
- * Finish passes one node gets: one. The marker carries it across a run-node
- * restart, and a finish fix that lands grants the sage round reviewing it.
+ * Finish passes one node gets: one. Every marker, declined or landed, spends
+ * it across a run-node restart and grants one sage round.
  */
 export const MAX_FINISH_FIXES = 1;
 
