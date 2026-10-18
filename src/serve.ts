@@ -60,7 +60,7 @@ import {
  serveConfig,
  type WalkMode,
 } from "./config.ts";
-import { drainGate, implementCandidates, planTick, walkableCandidates, type DrainState } from "./candidates.ts";
+import { drainGate, freshCandidates, freshClaimRefusal, implementCandidates, planTick, walkableCandidates, type DrainState } from "./candidates.ts";
 import { pidAlive as defaultPidAlive } from "./exec.ts";
 import { Journal, vetoApplies, type LaneHolder, type ResumeQueueRow, type WorkerRow } from "./journal.ts";
 import { ForeignMigrationError } from "./journal-guard.ts";
@@ -461,7 +461,8 @@ function nextFor(
  }
  // The tick's own plan (candidates.ts): the order and the veto rule walk uses.
  const holder = tick.holders[map.lane];
- const plan = planTick(report.frontier, {
+ const frontier = freshCandidates(report.frontier, map, inputs.workers);
+ const plan = planTick(frontier, {
   laneBusy: holder !== null,
   vetoed: (id) => inputs.vetoed(id, map.repo),
   implementDrained: drain?.scope === "lane",
@@ -502,7 +503,7 @@ function nextFor(
  if (vetoed.length > 0) {
   return none(`${vetoed.join(", ")} vetoed — the tick claims nothing else this pass`);
  }
- if (drain !== null && implementCandidates(report.frontier).length > 0) {
+ if (drain !== null && implementCandidates(frontier).length > 0) {
   return none(`no implement claim this tick — see the ${map.lane} lane`);
  }
  return none("nothing walkable on this map's frontier");
@@ -568,6 +569,7 @@ export function assembleState(inputs: StateInputs): DashboardState {
  const maps: DashboardMap[] = inputs.maps.map((map) => {
   const report = inputs.reports.get(map.key);
   const frontier = report?.ok ? report.frontier : [];
+  const fresh = freshCandidates(frontier, map, inputs.workers);
   const walked = !map.servedOnly && map.walk !== "none";
   // A drain refuses this map's implement claims: none waits in its queue either.
   const drained = drainGate(map, drains) !== null;
@@ -585,11 +587,11 @@ export function assembleState(inputs: StateInputs): DashboardState {
    localCheckout: map.localCheckout,
    next: planned.get(map.key)!,
    queued: walked && !drained
-    ? implementCandidates(frontier)
+    ? implementCandidates(fresh)
        .filter((n) => n.id !== planned.get(map.key)!.nodeId && !inputs.vetoed(n.id, map.repo))
        .map(view)
     : [],
-   autonomous: walked ? walkableCandidates(frontier).map(view) : [],
+   autonomous: walked ? walkableCandidates(fresh).map(view) : [],
    grillings: frontier
     .filter((n) => n.kind === "grilling")
     .map((n) => ({
@@ -930,6 +932,9 @@ export function createHandler(ctx: HandlerContext): (req: Request) => Promise<Re
   const map = state.maps.find((m) => m.key === body.key);
   if (map === undefined) return refuse(404, `no map ${body.key}`);
   if (url.pathname === "/api/build-now") {
+   const held = state.needsYou.find(row => row.repo === map.repo && row.nodeId === body.id);
+   const refusal = freshClaimRefusal(map, body.id, held ?? null);
+   if (refusal !== null) return refuse(409, refusal);
    // `autonomous` is the walkable set of the frontier ranger cached, read
    // from the journal for this request; the verb re-reads and re-checks it.
    const node = map.autonomous.find((n) => n.id === body.id);

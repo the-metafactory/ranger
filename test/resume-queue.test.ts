@@ -13,7 +13,8 @@ import type { ChangeRequest, ForgePort } from "../src/forge.ts";
 import { walk } from "../src/walk.ts";
 import type { SpawnRunNodeArgs } from "../src/spawn.ts";
 import { resumeNode } from "../src/resume.ts";
-import { servedMaps, ServeReader, stateFromJournal } from "../src/serve.ts";
+import { assembleState, servedMaps, ServeReader, stateFromJournal } from "../src/serve.ts";
+import { classifyFrontier } from "../src/route.ts";
 import { fakeDiscord, fixturesBin, runCli } from "./support.ts";
 
 const REPO = "acme/widgets";
@@ -71,6 +72,100 @@ function pr(iid = 7): ChangeRequest {
  return { iid, state: "open", draft: false, title: "Build", body: "", headRef: "node/40-x", headSha: "b".repeat(40),
   baseRef: "main", mergeState: "mergeable", mergeCommitSha: null, mergedBy: null, webUrl: "", author: "ivy-bot" };
 }
+
+describe("held frontier eligibility (node #336)", () => {
+ test("held frontier resumes keep FIFO and phase/PR continuation ahead of fresh claims", async () => {
+  await withRig(async r => {
+   for (const [id, status] of [["500", "failed"], ["640", "parked"]] as const) {
+    r.worker(id, 1, status);
+    r.journal.updateWorker(id, REPO, { prNumber: 7, reviewRound: 2, verdictSha: "a".repeat(40) });
+    r.journal.enqueueResume({ nodeId: id, repo: REPO, root: 1, lane: "headless" }, NOW);
+   }
+   r.frontier(1, ["500", "640", "641"]);
+   const github = { getPr: async () => pr() } as unknown as ForgePort;
+   const spawned: string[] = [];
+   const ctx = { ...r, github, now: () => NOW,
+    announce: async () => { throw new Error("no fresh claim expected"); },
+    claim: async () => { throw new Error("no fresh claim expected"); },
+    spawnRunNode: async ({ nodeId }: SpawnRunNodeArgs) => { spawned.push(nodeId); return process.pid; } };
+   await walk(ctx);
+   expect(spawned).toEqual(["500"]);
+   expect(r.journal.listResumeQueue().map(q => q.nodeId)).toEqual(["640"]);
+   expect(r.journal.getWorker("500", REPO)).toMatchObject({ phase: "review", prNumber: 7, reviewRound: 2, verdictSha: "a".repeat(40) });
+   r.journal.updateWorker("500", REPO, { status: "success" });
+   r.frontier(1, ["640", "641"]);
+   await walk(ctx);
+   expect(spawned).toEqual(["500", "640"]);
+   expect(r.journal.listResumeQueue()).toEqual([]);
+   expect(r.journal.getWorker("640", REPO)).toMatchObject({ phase: "review", prNumber: 7, reviewRound: 2, verdictSha: "a".repeat(40) });
+   expect(r.journal.getWorker("641", REPO)).toBeNull();
+  });
+ });
+
+ test("tick agrees with the dashboard past failed #500 and human-blocked #640 without clearing their metadata", async () => {
+  await withRig(async r => {
+   r.worker("500", 1, "failed", "implement", "implement");
+   r.worker("640", 1, "parked", "implement", "implement");
+   r.journal.updateWorker("500", REPO, { prNumber: 7, outcome: "worker exited 1", reviewRound: 2, verdictSha: "a".repeat(40), verdictBlockers: 1 });
+   r.journal.updateWorker("640", REPO, { prNumber: 8, outcome: "blocked: principal must choose the mouse-sensitivity range", reviewRound: 1, verdictSha: "b".repeat(40) });
+   r.frontier(1, ["500", "640", "641", "642"]);
+   const before = ["500", "640"].map(id => r.journal.getWorker(id, REPO));
+   const maps = servedMaps(r.config);
+   const entries = JSON.parse(readFileSync(join(r.env.FAKE_SOMA_DIR, "acme__widgets-frontier-1.json"), "utf8")).frontier;
+   const dashboard = assembleState({ maps, workers: r.journal.listWorkers(), titles: new Map(),
+    reports: new Map([[maps[0].key, { ok: true, readAt: NOW.toISOString(), source: "ranger",
+     frontier: classifyFrontier(entries, r.config.maps[0], {}, "ivy-bot") }]]),
+    laneHolders: { visual: null, headless: null }, paused: false, spawnsToday: 0, spawnCap: 10,
+    vetoed: () => false, pidAlive: () => false, refreshing: false, refreshError: null, now: NOW });
+   expect(dashboard.maps[0].next.nodeId).toBe("641");
+   expect(dashboard.maps[0].queued.map(n => n.id)).toEqual(["642"]);
+   const claims: string[] = [];
+   const announces: string[] = [];
+   const spawned: string[] = [];
+   const result = await walk({ ...r, now: () => NOW,
+    announce: async (_map, node) => { announces.push(node.nodeId); return { messageId: "fixture" }; },
+    claim: async (repo, id, identity) => { claims.push(id); return { repo, node: id, held: true, assignees: [identity] }; },
+    spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return 999999; } });
+   expect(result.maps.flatMap(m => m.claimed)).toEqual([dashboard.maps[0].next.nodeId!]);
+   expect(claims).toEqual(["641"]);
+   expect(announces).toEqual(claims);
+   expect(spawned).toEqual(claims);
+   expect(["500", "640"].map(id => r.journal.getWorker(id, REPO))).toEqual(before);
+   expect(r.journal.listResumeQueue()).toEqual([]);
+  });
+ });
+
+ for (const status of ["failed", "parked"] as const) {
+  test(`the Build now CLI refuses a ${status} frontier worker with Resume guidance`, async () => {
+   await withRig(async r => {
+    r.worker("500", 1, status);
+    r.journal.updateWorker("500", REPO, { prNumber: 7, outcome: "blocked: principal must choose the mouse-sensitivity range" });
+    r.frontier(1, ["500"]);
+    const before = r.journal.getWorker("500", REPO);
+    const result = await runCli(["build-now", "500", "--map", REPO + "#1", "--force", "-c", r.configPath], r.env);
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toMatch(/resume-node.*Resume/i);
+    expect(r.journal.getWorker("500", REPO)).toEqual(before);
+    expect(r.journal.spawnsToday()).toBe(0);
+    expect(r.journal.listEvents(REPO)).toEqual([]);
+   });
+  });
+
+  test(`explicit resume preserves a ${status} frontier worker's phase and PR`, async () => {
+   await withRig(async r => {
+    r.worker("500", 1, status);
+    r.journal.updateWorker("500", REPO, { prNumber: 7, reviewRound: 2, verdictSha: "a".repeat(40) });
+    r.frontier(1, ["500"]);
+    const spawned: string[] = [];
+    const result = await resumeNode("500", REPO + "#1", { ...r,
+     spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return 999999; } });
+    expect(result).toMatchObject({ kind: "started" });
+    expect(spawned).toEqual(["500"]);
+    expect(r.journal.getWorker("500", REPO)).toMatchObject({ phase: "review", prNumber: 7, reviewRound: 2, verdictSha: "a".repeat(40) });
+   });
+  });
+ }
+});
 
 describe("resume-node CLI", () => {
  test("explicit map without a row refuses clearly, including a row disappearing after map selection", async () => {

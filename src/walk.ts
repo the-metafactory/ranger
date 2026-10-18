@@ -30,6 +30,8 @@ import { gateProposeReads, ratifyPass, rebuildVetoes, type RatifyResult } from "
 import { refuseProposalCard } from "./card-sync.ts";
 import {
  drainGate,
+ freshCandidates,
+ freshClaimRefusal,
  implementCandidates,
  planTick,
  researchCandidates,
@@ -68,6 +70,8 @@ export interface WalkContext {
  configPath: string;
  journal: Journal;
  spawnRunNode?: (args: SpawnRunNodeArgs) => Promise<number | null>;
+ announce?: AnnounceFn;
+ claim?: ClaimFn;
  now?: () => Date;
  github?: ForgePort;
  readGate?: ReadGate;
@@ -134,6 +138,8 @@ export async function claimNode(args: ClaimNodeArgs): Promise<ClaimNodeOutcome> 
  const now = () => args.now?.() ?? new Date();
  const owned = args.owned ?? (() => {});
  owned();
+ const refusal = freshClaimRefusal(map, node.id, journal.getWorker(node.id, map.repo));
+ if (refusal !== null) return { claimed: false, messageId: null, error: refusal };
  let messageId: string | null = null;
  let announceError: string | null = null;
  try {
@@ -485,7 +491,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
       rootAuthor,
      });
      if (!briefs.ok) errors.push(`build briefs unverified — build nodes held this tick: ${briefs.error}`);
-     const planOf = (nodes: typeof classified) => planTick(nodes, {
+     const planOf = (nodes: typeof classified) => planTick(freshCandidates(nodes, map, journal.listWorkers(map.repo)), {
       laneBusy: lanesTakenThisTick.has(implementLane(map)) || implementLaneBusy(journal, implementLane(map)),
       vetoed: (id) => journal.hasVeto(id, map.repo),
       implementDrained: drain?.scope === "lane",
@@ -546,6 +552,8 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
         token,
         cliEntry,
         configPath: ctx.configPath,
+        announce: ctx.announce,
+        claim: ctx.claim,
         spawnRunNode: ctx.spawnRunNode,
         now: ctx.now,
         owned,

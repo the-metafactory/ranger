@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import { freshClaimRefusal } from "./candidates.ts";
 import { graphReadToken, laneCredentialRefusal, type ReadGate } from "./forge-lanes.ts";
 import type { ResolvedToken } from "./token-gate.ts";
 import { budgetPolicy } from "./budget.ts";
@@ -188,6 +189,8 @@ async function buildUnderLock(nodeId: string, ctx: BuildNowContext, owned: Owned
 
  if (journal.hasVeto(nodeId, map.repo)) refuse("vetoed — the walk never claims a vetoed node");
  const row = journal.getWorker(nodeId, map.repo);
+ const freshRefusal = freshClaimRefusal(map, nodeId, row);
+ if (freshRefusal !== null) refuse(freshRefusal);
  if (row !== null && IN_FLIGHT.has(row.status)) {
   refuse(`already in flight (${row.status}) — \`ranger resume-node\` puts a stuck worker back in motion`);
  }
