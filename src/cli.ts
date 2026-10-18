@@ -41,13 +41,13 @@ import {
  assertWriteIdentity,
  WriteGateError,
 } from "./identity.ts";
-import { canonicalDir, runNode, type RunNodeContext, type RunNodeOutcome } from "./worker.ts";
+import { canonicalDir, runNode, runNodeRunOutcome, type RunNodeContext, type RunNodeOutcome } from "./worker.ts";
 import { trustCurrentGitState } from "./git-trust.ts";
 import { workerLogFile } from "./worker-log.ts";
 import { sweepMap } from "./sweep.ts";
 import { mergeGateNow } from "./merge-desk.ts";
 import { walk } from "./walk.ts";
-import { emitTickRunFinished, emitNodeRunFinished, runNodeRunOutcome, type RunLedgerDeps } from "./run-ledger.ts";
+import { emitTickRunFinished, emitNodeRunIfGenerated, type RunLedgerDeps } from "./run-ledger.ts";
 import { spawnRunNodeDetached } from "./spawn.ts";
 import { holdAwake } from "./awake.ts";
 import { enqueueJob, JobError, runJob, type RunJobContext } from "./jobs.ts";
@@ -319,7 +319,7 @@ export async function runRunNode(
  try {
   const map = pickMap(config, repo);
   const { token, botIdentity, commitAuthor } = await (deps.runNodeContext ?? runNodeContext)(config, map);
-  const before = journal.getWorker(nodeId, map.repo)?.generation ?? 0;
+  let generation: number | undefined;
   let outcome: RunNodeOutcome | undefined;
   let mapRoot: { id: string; serves?: unknown } | undefined;
   try {
@@ -327,20 +327,14 @@ export async function runRunNode(
     ...deps.worker,
     config, map, token, botIdentity, commitAuthor, journal,
     onMapRootRead: root => { mapRoot = { id: String(map.root), serves: root.node.serves }; },
+    onGenerationBegun: begun => { generation = begun; },
    });
    return JSON.stringify(outcome, null, 2);
   } finally {
-   const after = journal.getWorker(nodeId, map.repo)?.generation ?? 0;
-   const mapped = outcome === undefined ? "failed" : runNodeRunOutcome(outcome.status);
-   if (config.bus !== undefined && after !== before && mapped !== null) {
-    await emitNodeRunFinished(config, journal, {
-     repo: map.repo, nodeId,
-     // beginGeneration increments once; a fenced successor may own `after`.
-     generation: before + 1,
-     startedAt, endedAt: now().toISOString(), outcome: mapped,
-     mapRoot,
-    }, deps.ledger);
-   }
+   await emitNodeRunIfGenerated(config, journal, {
+    repo: map.repo, nodeId, generation, startedAt, mapRoot,
+    outcome: outcome === undefined ? "failed" : runNodeRunOutcome(outcome.status),
+   }, now, deps.ledger);
   }
  } finally {
   journal.close();

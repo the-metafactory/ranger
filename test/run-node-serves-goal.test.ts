@@ -83,7 +83,7 @@ describe("run-node serves.goal from the map root (node #263)", () => {
    env: { MF_SERVES_GOAL: "G7" }, publisher: async event => { events.push(event); },
   }, {
    runNode: async (id, ctx) => {
-    ctx.journal.beginGeneration(id, ctx.map.repo);
+    ctx.onGenerationBegun?.(ctx.journal.beginGeneration(id, ctx.map.repo));
     ctx.onMapRootRead?.(root);
     throw error;
    },

@@ -8,8 +8,7 @@ import { runRunNode } from "../src/cli.ts";
 import { nodeKey } from "../src/forge-ref.ts";
 import type { ChangeRequest } from "../src/forge.ts";
 import { WriteGateError } from "../src/identity.ts";
-import { runNodeRunOutcome } from "../src/run-ledger.ts";
-import type { RunNodeOutcome } from "../src/worker.ts";
+import { runNodeRunOutcome, type RunNodeOutcome } from "../src/worker.ts";
 import { workerLogFile } from "../src/worker-log.ts";
 import { AT, cleanup, controlled, deps, failures, fixture, forge, graphFixture, result, spool, valid } from "./run-node-ledger-support.ts";
 import { createCanonicalRepo, fixturesBin, runCli } from "./support.ts";
@@ -162,6 +161,20 @@ describe("run-node run ledger", () => {
   expect(existsSync(f.spool)).toBe(false);
  });
 
+ test("a refusal before its own generation emits nothing when another run begins one meanwhile", async () => {
+  const f = fixture();
+  let published = 0;
+  const output = await runRunNode("10", undefined, f.configPath, deps(f, { publisher: async () => { published++; } }, {
+   runNode: async (id, ctx) => {
+    ctx.journal.upsertWorker({ nodeId: id, repo: ctx.map.repo, root: ctx.map.root, status: "running" });
+    ctx.journal.beginGeneration(id, ctx.map.repo);
+    return { ...result("refused"), repo: ctx.map.repo };
+   },
+  }));
+  expect(JSON.parse(output).status).toBe("refused");
+  expect(published).toBe(0);
+ });
+
  test("a pending proposal refuses before generation and emits nothing", async () => {
   const f = fixture();
   f.journal.updateWorker("10", "acme/widgets", { status: "proposed", phase: "implement" });
@@ -177,7 +190,7 @@ describe("run-node run ledger", () => {
    const events: ExecutionRunFinishedEvent[] = [];
    const error = new Error("worker exploded");
    await expect(runRunNode("10", undefined, f.configPath, deps(f, { publisher: async event => { expect(f.closed()).toBe(false); events.push(event); } }, {
-    runNode: async (id, ctx) => { if (began) ctx.journal.beginGeneration(id, ctx.map.repo); throw error; },
+    runNode: async (id, ctx) => { if (began) ctx.onGenerationBegun?.(ctx.journal.beginGeneration(id, ctx.map.repo)); throw error; },
    }))).rejects.toBe(error);
    expect(events).toHaveLength(began ? 1 : 0);
    if (began) valid(events[0], "failed");
@@ -213,7 +226,7 @@ describe("run-node run ledger", () => {
   const f = fixture();
   const error = new WriteGateError("worker gate failed after generation");
   await expect(runRunNode("10", undefined, f.configPath, deps(f, { publisher: async () => { throw new Error("ledger offline"); } }, {
-   runNode: async (id, ctx) => { ctx.journal.beginGeneration(id, ctx.map.repo); throw error; },
+   runNode: async (id, ctx) => { ctx.onGenerationBegun?.(ctx.journal.beginGeneration(id, ctx.map.repo)); throw error; },
   }))).rejects.toBe(error);
   expect(failures(f)[0].detail).toContain("ledger offline");
  });

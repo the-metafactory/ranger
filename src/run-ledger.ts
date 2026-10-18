@@ -15,7 +15,6 @@ import { expandHome, type RangerConfig } from "./config.ts";
 import type { Journal } from "./journal.ts";
 import { nodeKey } from "./forge-ref.ts";
 import { workerLogFile } from "./worker-log.ts";
-import type { RunNodeOutcome } from "./worker.ts";
 import { AGE_BAND_STATE, ageBand, type EscalateResult } from "./card-sync.ts";
 
 const SOVEREIGNTY: Sovereignty = {
@@ -74,21 +73,6 @@ function natsTransport(bus: BusConfig): LedgerNatsTransport {
 
 export function runLedgerPath(config: RangerConfig): string {
  return join(dirname(expandHome(config.state.journalPath)), "run-ledger", "outbox.jsonl");
-}
-
-/** The settled run-node status mapping; skipped generations have no envelope. */
-export function runNodeRunOutcome(status: RunNodeOutcome["status"]): RunOutcome | null {
- const outcomes: Record<RunNodeOutcome["status"], RunOutcome | null> = {
-  success: "succeeded",
-  failed: "failed",
-  parked: "blocked",
-  released: "cancelled",
-  "awaiting-merge": "succeeded",
-  proposed: "succeeded",
-  refused: "blocked",
-  skipped: null,
- };
- return outcomes[status];
 }
 
 export async function emitTickRunFinished(
@@ -172,6 +156,22 @@ export async function emitNodeRunFinished(
    detail_ref: workerLogFile(journal.path, run.repo, run.nodeId, run.generation),
   }];
  }, deps);
+}
+
+/**
+ * A run-node's envelope, only when this invocation began a generation: a run
+ * refused before then has no generation of its own to report (node #289).
+ */
+export async function emitNodeRunIfGenerated(
+ config: RangerConfig,
+ journal: Pick<Journal, "recordEvent" | "path">,
+ run: { repo: string; nodeId: string; generation: number | undefined; startedAt: string; outcome: RunOutcome | null; mapRoot?: { id: string; serves?: unknown } },
+ now: () => Date,
+ deps: RunLedgerDeps = {},
+): Promise<void> {
+ const { generation, outcome } = run;
+ if (generation === undefined || outcome === null) return;
+ await emitNodeRunFinished(config, journal, { ...run, generation, outcome, endedAt: now().toISOString() }, deps);
 }
 
 /**
