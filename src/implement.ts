@@ -1464,7 +1464,8 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
  // A CI fix pass grants its round the same way.
  let ciFixes = ciFixState(recordedCiFixes(opening, botIdentity), openingHead).used;
  let probeFixes = ciFixState(recordedProbeFixes(opening, botIdentity), openingHead).used;
- const capNow = () => config.workers.reviewRounds + baseMerges + ciFixes + probeFixes;
+ let finishFixes = ciFixState(recordedFinishFixes(opening, botIdentity), openingHead).used;
+ const capNow = () => config.workers.reviewRounds + baseMerges + ciFixes + probeFixes + finishFixes;
  let probe: RecordedProbe | undefined;
  // The head whose set-aside major is already journaled: once per head per
  // run, as the loop re-reads an unchanged head on every pass.
@@ -1598,6 +1599,29 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
   await publishPass(ctx, github, open.iid, fixed, "push probe fix", `probe fix pass ${used + 1} @ ${fixed.sha.slice(0, 8)}: probes failed at ${head.slice(0, 8)}`);
   probeFixes += 1;
   probe = undefined;
+  return "again";
+ };
+ const finishPass = async (head: string, review: RecordedReview): Promise<"again" | "merge" | ImplementOutcome> => {
+  const recorded = recordedFinishFixes(await github.listComments(repo, open.iid, token), botIdentity);
+  if (recorded.length >= MAX_FINISH_FIXES || finishFixes >= MAX_FINISH_FIXES) return "merge";
+  journal.recordEvent("reviewed", {
+   nodeId,
+   repo,
+   detail: `round ${review.round} @ ${head.slice(0, 8)} is gate-clean but asks ${leftWork(review)} change(s): a finish pass answers them before the merge`,
+  });
+  const rulings = principalRulings(await github.listComments(repo, open.iid, token), principalLoginForRepo(config, repo));
+  const fixed = await workerPass(ctx, testCommand, { kind: "finish-fix", round: review.round, red: head, body: review.body, rulings });
+  workerExit = fixed.workerExit;
+  if (fixed.failure !== undefined) return fixed.failure;
+  fence("record the finish pass");
+  if (fixed.unchanged === true) {
+   await github.postComment(repo, open.iid, finishFixMarker({ sha: head, red: head }), token);
+   journal.recordEvent("reviewed", { nodeId, repo, detail: `finish pass at ${head.slice(0, 8)} declined every finding: the merge goes on` });
+   return "merge";
+  }
+  await github.postComment(repo, open.iid, finishFixMarker({ sha: fixed.sha, red: head }), token);
+  await publishPass(ctx, github, open.iid, fixed, "push finish fix", `finish pass @ ${fixed.sha.slice(0, 8)}: round ${review.round} left ${leftWork(review)} change(s) at ${head.slice(0, 8)}`);
+  finishFixes += 1;
   return "again";
  };
  for (;;) {
@@ -1741,6 +1765,11 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
   // Blockers AND majors gate (principal, 2026-10-03): each is reworked and
   // re-reviewed. Suggestions and nits do not gate.
   if (gatingFindings(current) === 0) {
+   if (leftWork(current) > 0) {
+    const finished = await finishPass(live.headSha, current);
+    if (finished === "again") continue;
+    if (finished !== "merge") return finished;
+   }
    // Sage-clean. Before the probes certify this head, it must merge: GitHub
    // runs no CI on a conflicting PR, so a conflict found only at the merge
    // desk waits forever (seelite #692).
@@ -1953,6 +1982,26 @@ export function probeFixMarker(r: CiFixRecord & { failed: string[] }): string {
 /** Probe fix passes recorded on the PR by the MACHINE ACCOUNT (anyone else's markers are ignored). */
 export function recordedProbeFixes(comments: IssueComment[], botIdentity: string): CiFixRecord[] {
  return recordedFixes(comments, botIdentity, PROBE_FIX_MARKER);
+}
+
+/**
+ * Finish passes one node gets: one. The marker carries it across a run-node
+ * restart, and a finish fix that lands grants the sage round reviewing it.
+ */
+export const MAX_FINISH_FIXES = 1;
+
+const FINISH_FIX_MARKER = /<!-- ranger:finish-fix sha=([0-9a-f]{7,64}) red=([0-9a-f]{7,64}) -->/;
+
+export function finishFixMarker(r: CiFixRecord): string {
+ const what = r.sha === r.red
+  ? "and a worker declined every one of them. The findings left open are filed after the merge."
+  : `so a worker answered them at \`${r.sha.slice(0, 8)}\`. The next sage round reviews the fix.`;
+ return `<!-- ranger:finish-fix sha=${r.sha} red=${r.red} -->\n**Finish pass** — the sage round at \`${r.red.slice(0, 8)}\` had no blocker or major but asked behavior or check changes, ${what}`;
+}
+
+/** Finish passes recorded on the PR by the MACHINE ACCOUNT (anyone else's markers are ignored). */
+export function recordedFinishFixes(comments: IssueComment[], botIdentity: string): CiFixRecord[] {
+ return recordedFixes(comments, botIdentity, FINISH_FIX_MARKER);
 }
 
 /**
@@ -2319,6 +2368,7 @@ function recordHead(ctx: ImplementContext, sha: string): void {
 type WorkerPassSpec =
  | { kind: "build" }
  | { kind: "fix"; round: number; body: string; rulings: string[] }
+ | { kind: "finish-fix"; round: number; red: string; body: string; rulings: string[] }
  | { kind: "ci-fix"; red: string; reason: string; log: string; rulings: string[] }
  | { kind: "probe-fix"; red: string; failed: string[]; summary: string[]; rulings: string[] }
  | ({ kind: "base-merge" } & BaseMergeInput);
@@ -2330,6 +2380,8 @@ function passLabel(spec: WorkerPassSpec): string {
    return "build pass";
   case "fix":
    return `fix pass ${spec.round}`;
+  case "finish-fix":
+   return "finish pass";
   case "ci-fix":
    return "CI fix pass";
   case "probe-fix":
@@ -2346,6 +2398,8 @@ function nothingCommitted(spec: WorkerPassSpec): string {
    return "worker exited 0 but committed nothing — nothing to push";
   case "fix":
    return `fix pass ${spec.round} committed nothing — the blockers stand`;
+  case "finish-fix":
+   return `finish pass committed nothing — the findings at ${spec.red.slice(0, 8)} stand`;
   case "ci-fix":
    return `CI fix pass committed nothing — CI stays red at ${spec.red.slice(0, 8)}`;
   case "probe-fix":
@@ -2424,6 +2478,7 @@ async function checkedWorkerPass(
   botIdentity,
   testCommand,
   ...(spec.kind === "fix" ? { review: { round: spec.round, body: spec.body }, rulings: spec.rulings } : {}),
+  ...(spec.kind === "finish-fix" ? { review: { round: spec.round, body: spec.body, finish: true }, rulings: spec.rulings } : {}),
   ...(spec.kind === "ci-fix" ? { ciFix: { head: spec.red, reason: spec.reason, log: spec.log, base: map.base }, rulings: spec.rulings } : {}),
   ...(spec.kind === "probe-fix" ? { probeFix: { head: spec.red, failed: spec.failed, summary: spec.summary }, rulings: spec.rulings } : {}),
   ...(spec.kind === "base-merge" ? { baseMerge: { base: spec.base, files: spec.files, ...(spec.stale === undefined ? {} : { stale: spec.stale }) } } : {}),
@@ -2497,7 +2552,7 @@ async function checkedWorkerPass(
  const sha = await headSha(worktree);
  // A CI fix pass may find the red is not the branch's (a flaky test, a
  // runner outage): it commits nothing, and that is an answer, not a failure.
- if ((spec.kind === "ci-fix" || spec.kind === "probe-fix") && sha === before && (await dirtyFiles(worktree)).length === 0) {
+ if ((spec.kind === "ci-fix" || spec.kind === "probe-fix" || spec.kind === "finish-fix") && sha === before && (await dirtyFiles(worktree)).length === 0) {
   return { workerExit: result.code, snapshot, sha, unchanged: true };
  }
  if (sha === before || (await commitsAhead(worktree, map.base)) === 0) {
