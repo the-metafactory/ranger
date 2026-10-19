@@ -4,6 +4,7 @@ import type { CiVerdict, ForgeReadPort } from "./forge.ts";
 import { gitlabIssueEndpoint, gitlabLoginCiVerdict, GitLabReadPort, parseGitLabIssue } from "./gitlab.ts";
 import { parseGlabResponse } from "./glab-transport.ts";
 import { lastImplementMaps, mapKey, implementMapOrder, readDrains } from "./maps.ts";
+import { SUSPICIOUS_REVIEW_ROUND } from "./review-round.ts";
 /**
  * `ranger serve` (#37) — a local dashboard of the walk: the job a worker is on
  * now, the next node a tick would take, every node ranger can take on its own,
@@ -263,6 +264,7 @@ export interface CurrentJob {
  /** "PR #N" on GitHub, "MR !N" on GitLab (node #132). */
  prLabel: string | null;
  reviewRound: number;
+ suspicious: boolean;
  startedAt: string | null;
  pid: number | null;
  /** A claimed/running row whose process is gone: stale until `sweep` runs. */
@@ -543,6 +545,7 @@ export function assembleState(inputs: StateInputs): DashboardState {
    prNumber: w.prNumber,
    prLabel: w.prNumber === null ? null : changeRequestLabel(w.repo, w.prNumber),
    reviewRound: w.reviewRound,
+   suspicious: w.reviewRound > SUSPICIOUS_REVIEW_ROUND,
    startedAt: w.startedAt,
    pid: w.pid,
    stale:
@@ -1141,8 +1144,9 @@ function jobTime(iso) {
 function jobTags(j) {
  if (j.stale) return [tag("stale: process gone", "stale")];
  const substrate = { claude: "Claude", codex: "Codex", pi: "Pi" }[j.substrate] || "unknown";
- const parts = [j.resourceLane || j.lane, j.status, j.phase, "substrate: " + substrate, j.prLabel || "", j.reviewRound ? "round " + j.reviewRound : ""];
- return [...new Set(parts.filter(Boolean))].map((p) => tag(p));
+ const parts = [j.resourceLane || j.lane, j.status, j.phase, "substrate: " + substrate, j.prLabel || "", j.reviewRound && !j.suspicious ? "round " + j.reviewRound : ""];
+ const pills = [...new Set(parts.filter(Boolean))].map((p) => tag(p));
+ return j.suspicious ? [...pills, tag("round " + j.reviewRound + ": suspicious", "stale")] : pills;
 }
 function renderCurrent(s) {
  const box = document.getElementById("current"); box.replaceChildren();

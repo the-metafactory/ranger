@@ -627,6 +627,53 @@ describe("implement lane (node #23)", () => {
   expect(recordedReviews(r.github.comments.get(1) ?? [], BOT)).toHaveLength(2);
  }, 60_000);
 
+ const ciFixThenMajorAt = async (r: Rig, at: string) => {
+  const wt = join(r.canonical, ".worktrees", "node-20");
+  writeFileSync(join(wt, "ci-fix.txt"), "fix\n");
+  await fixtureGit(wt, ["add", "-A"]);
+  await fixtureGit(wt, ["commit", "-m", "a one-line fix after the clean round"]);
+  await fixtureGit(wt, ["push", "origin", "HEAD"]);
+  const reviewed: number[] = [];
+  r.ctx.reviewer = async (_repo, pr) => {
+   reviewed.push(pr);
+   return {
+    verdict: "changes-requested",
+    summary: "one more edge case",
+    commitId: (await r.github.getPr("acme/widgets", pr)).headSha,
+    blockers: 0,
+    majors: 1,
+    nits: 0,
+    body: `## Sage\n\nRound impact: behavior 1, checks 0, prose 0; unclassified impact 0; prior-round surface 0; restated from earlier rounds 0.\n\n### HonestOracle\n\n- **[important]** \`${at}\` — **An edge case**\n  Why it matters.`,
+   };
+  };
+  return reviewed;
+ };
+
+ test("ranger#357: a major outside what the head added since a clean round settles, and the PR goes ready", async () => {
+  const r = await rig({}); cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  const clean = await r.github.sha("node/20-add-the-feature-module");
+  const reviewed = await ciFixThenMajorAt(r, "src/feature.ts:1");
+  expect((await resumeReview(r)).status).toBe("awaiting-merge");
+  expect(reviewed).toHaveLength(1);
+  const comments = r.github.comments.get(1) ?? [];
+  expect(recordedReviews(comments, BOT).at(-1)).toMatchObject({ round: 2, majors: 1, settled: 1 });
+  expect(comments.some(c => c.body.includes("**Settled:** 1 major(s)") && c.body.includes(clean.slice(0, 8)))).toBe(true);
+  const events = r.journal.listNodeEvents("acme/widgets", "20").map(e => e.detail);
+  expect(events.some(d => d?.includes("settled, listed on the merge card, not filed"))).toBe(true);
+ }, 60_000);
+
+ test("ranger#357: a major on a line the head added since the clean round still gates", async () => {
+  const r = await rig({}); cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  const reviewed = await ciFixThenMajorAt(r, "ci-fix.txt:1");
+  expect((await resumeReview(r)).status).toBe("parked");
+  expect(reviewed).toHaveLength(1);
+  const last = recordedReviews(r.github.comments.get(1) ?? [], BOT).at(-1);
+  expect(last).toMatchObject({ round: 2, majors: 1 });
+  expect(last?.settled).toBeUndefined();
+ }, 60_000);
+
  test("node #320: multiple base merges carry the same round, then a normal commit runs round two", async () => {
   const r = await rig({}); cleanup.push(r.dir);
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
