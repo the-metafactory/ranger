@@ -162,6 +162,7 @@ export function assertNamedRefs(args: string[]): void {
  if (verb === "clone" || (verb === "worktree" && rest[0] === "add")) return;
  const positional = rest.filter((a) => !a.startsWith("-"));
  if ((verb === "fetch" || verb === "push") && positional.length >= 2) return;
+ if (verb === "lfs" && positional[0] === "push" && positional.length >= 3) return;
  throw new GitSafetyError(
   `refusing a credentialed \`git ${args.join(" ")}\`: it must name its remote and refs, never fall back to a branch's upstream`,
  );
@@ -960,9 +961,23 @@ export async function assertNoClosingKeywords(
  if (hit !== null) throw new GitSafetyError(`${closingKeywordRefusal(forge, "a commit message", hit)}. Refusing to push.`);
 }
 
+async function treeDeclaresLfs(worktree: string, source: string): Promise<boolean> {
+ const found = await safeGit(
+  ["grep", "-q", "-F", "filter=lfs", source, "--", ":(glob)**/.gitattributes"],
+  { cwd: worktree },
+ );
+ return found.code === 0;
+}
+
 /**
  * The vetted push: the supervisor's single credentialed write of exactly
  * `branch`, from an untampered checkout. Returns the state it vetted.
+ *
+ * Every git call runs with hooks off, git-lfs's `pre-push` hook included,
+ * so a branch that commits LFS files uploads their objects here, with the
+ * same credential and checks, before the branch itself: a branch pushed
+ * without them carries pointers to files origin never received
+ * (2026-10-19, seelite #1037).
  */
 export async function vettedPush(opts: {
  worktree: string;
@@ -975,8 +990,18 @@ export async function vettedPush(opts: {
 }): Promise<GitState> {
  assertCredential(opts.credential, `the push of ${opts.branch}`);
  const vetted = await assertGitUntouched(opts.canonical, opts.configSnapshot);
+ const source = opts.source ?? "HEAD";
+ if (await treeDeclaresLfs(opts.worktree, source)) {
+  const lfs = await safeGit(
+   ["lfs", "push", "origin", source],
+   { cwd: opts.worktree, credential: opts.credential, canonical: opts.canonical, timeoutMs: 600_000 },
+  );
+  if (lfs.code !== 0) {
+   throw new GitSafetyError(`LFS push of ${opts.branch} failed: ${lfs.stderr.trim()}`);
+  }
+ }
  const push = await safeGit(
-  ["push", "--no-verify", "origin", `${opts.source ?? "HEAD"}:refs/heads/${opts.branch}`],
+  ["push", "--no-verify", "origin", `${source}:refs/heads/${opts.branch}`],
   { cwd: opts.worktree, credential: opts.credential, canonical: opts.canonical, timeoutMs: 120_000 },
  );
  if (push.code !== 0) {

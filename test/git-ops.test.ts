@@ -653,3 +653,45 @@ describe("gitConfigSnapshot: benign git-lfs and push config (2026-10-10)", () =>
   });
  }
 });
+
+describe("vettedPush: a branch's LFS objects reach origin though hooks are off (seelite #1037)", () => {
+ const hasLfs = Bun.which("git-lfs") !== null;
+ const lfsObject = (bare: string, oid: string) => join(bare, "lfs", "objects", oid.slice(0, 2), oid.slice(2, 4), oid);
+
+ test.skipIf(!hasLfs)("an LFS file committed on a node branch has its object on origin after the push", async () => {
+  const origin = await git(["remote", "get-url", "origin"]);
+  await config("filter.lfs.clean", "git-lfs clean -- %f");
+  await config("filter.lfs.smudge", "git-lfs smudge -- %f");
+  await config("filter.lfs.process", "git-lfs filter-process");
+  await config("filter.lfs.required", "true");
+  const credential = gitCredential("acme/widgets", "placeholder");
+  const worktree = await bootstrapWorktree(canonical, "87", "x", credential);
+  writeFileSync(join(worktree, ".gitattributes"), "*.bin filter=lfs diff=lfs merge=lfs -text\n");
+  writeFileSync(join(worktree, "model.bin"), "a study binary\n".repeat(64));
+  await git(["add", ".gitattributes", "model.bin"], worktree);
+  await git(["commit", "-m", "add a study binary"], worktree);
+  const pointer = await git(["cat-file", "-p", "HEAD:model.bin"], worktree);
+  const oid = /^oid sha256:([0-9a-f]{64})$/m.exec(pointer)?.[1] ?? "";
+  expect(oid).toHaveLength(64);
+
+  await vettedPush({ worktree, canonical, branch: "node/87-x", credential, configSnapshot: gitConfigSnapshot(canonical) });
+
+  expect(await git(["for-each-ref", "--format=%(refname)", "refs/heads/node/87-x"], origin)).toBe("refs/heads/node/87-x");
+  expect(readFileSync(lfsObject(origin, oid), "utf8")).toBe("a study binary\n".repeat(64));
+ });
+
+ test("a branch with no LFS rule pushes without calling git-lfs", async () => {
+  const origin = await git(["remote", "get-url", "origin"]);
+  const credential = gitCredential("acme/widgets", "placeholder");
+  const worktree = await bootstrapWorktree(canonical, "88", "x", credential);
+  await vettedPush({ worktree, canonical, branch: "node/88-x", credential, configSnapshot: gitConfigSnapshot(canonical) });
+  expect(await git(["for-each-ref", "--format=%(refname)", "refs/heads/node/88-x"], origin)).toBe("refs/heads/node/88-x");
+  expect(readdirSync(origin)).not.toContain("lfs");
+ });
+
+ test("a credentialed lfs push names its remote and ref, as a push does", () => {
+  expect(() => assertNamedRefs(["lfs", "push", "origin", "HEAD"])).not.toThrow();
+  expect(() => assertNamedRefs(["lfs", "push", "origin"])).toThrow(GitSafetyError);
+  expect(() => assertNamedRefs(["lfs", "fetch", "origin", "HEAD"])).toThrow(GitSafetyError);
+ });
+});
