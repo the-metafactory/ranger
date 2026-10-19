@@ -1,4 +1,4 @@
-import { somaRepo } from "./graph.ts";
+import { GRAPH_CALL_TIMEOUT_MS, somaRepo } from "./graph.ts";
 import { runCmd, type RunOptions } from "./exec.ts";
 import { writeEnvForRepo } from "./identity.ts";
 import { parseForgeRef, normalizeNodeId, type ForgeRef } from "./forge-ref.ts";
@@ -49,6 +49,7 @@ export interface CloseResult {
  closed: boolean;
  /** Close receipt text (or refusal reason) from the verb. */
  detail: string;
+ timedOut?: boolean;
 }
 
 export interface DecisionsResult {
@@ -66,6 +67,7 @@ interface CallWriteResult {
  code: number;
  stdout: string;
  stderr: string;
+ timedOut?: boolean;
 }
 
 async function callWrite(
@@ -153,12 +155,36 @@ export interface CloseOptions {
  evidence?: { kind: string; summary: string; pointer: string }[];
 }
 
+const CLOSE_PROBE_MARGIN_MS = 60_000;
+
+/**
+ * The timeout for a `soma graph close` call. The close gate runs the node's
+ * command probes inside the call, each up to its `timeoutSec`, so the call
+ * must outlast their sum plus a margin; never below `floorMs`.
+ */
+export function closeTimeoutMs(
+ probes: readonly { type: string; [key: string]: unknown }[] | undefined,
+ floorMs = GRAPH_CALL_TIMEOUT_MS,
+): number {
+ let probeMs = 0;
+ for (const probe of probes ?? []) {
+  if (probe.type === "command" && typeof probe.timeoutSec === "number" && probe.timeoutSec > 0) {
+   probeMs += probe.timeoutSec * 1000;
+  }
+ }
+ return probeMs === 0 ? floorMs : Math.max(floorMs, probeMs + CLOSE_PROBE_MARGIN_MS);
+}
+
 /**
  * Close a node under the bot identity. `close` has no `--json` surface yet
  * (soma note: "close --json remains optional follow-up"), so success is exit 0
  * and the stdout receipt text is captured as `detail`. A refused close (exit 1)
  * returns `closed: false` with the refusal reason in `detail` — callers decide
- * whether that is a park signal, never a silent pass.
+ * whether that is a park signal, never a silent pass. The call runs as its own
+ * process group: on timeout the whole group dies (the `soma` launcher's
+ * child keeps running the gate's probes otherwise and finishes the close
+ * behind ranger's back), and the result is `timedOut` with a timeout
+ * `detail`, never soma's output.
  */
 export async function graphClose(
  repo: string,
@@ -187,7 +213,17 @@ export async function graphClose(
   args.push("--evidence", JSON.stringify(entry));
  }
  if (options.dryRun === true) args.push("--dry-run");
- const result = await callWrite(repo, args, token, opts);
+ const result = await callWrite(repo, args, token, { ...opts, processGroup: true });
+ if (result.timedOut === true) {
+  const seconds = Math.round((opts.timeoutMs ?? 0) / 1000);
+  return {
+   repo,
+   node: id,
+   closed: false,
+   timedOut: true,
+   detail: `soma graph close ${id} (${repo}) timed out after ${seconds}s; its process group was killed`,
+  };
+ }
  const detail = (result.stdout || result.stderr).trim();
  if (result.code === 0) {
   return { repo, node: id, closed: true, detail };

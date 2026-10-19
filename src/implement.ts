@@ -59,7 +59,7 @@ import {
 import { GRAPH_CALL_TIMEOUT_MS, graphNode, somaRepo, type NodeResult } from "./graph.ts";
 import { finishClosedElsewhere } from "./closed-elsewhere.ts";
 import { budgetedRead, budgetPolicy } from "./budget.ts";
-import { GraphAddUnattached, graphAdd, graphClose, graphDecisions, graphLink, type AddSpec, type CloseResult } from "./graph-write.ts";
+import { GraphAddUnattached, closeTimeoutMs, graphAdd, graphClose, graphDecisions, graphLink, type AddSpec, type CloseResult } from "./graph-write.ts";
 import { FixNodeLockBusy, withFixNodeLock } from "./fix-node-lock.ts";
 import { assertFilable, codeCommentSpec, foundByProbeSpec, landminesInDiff, scribeFile, splitOutOfReviewSpec, type Provenance, type ScribeGraph } from "./scribe.ts";
 import { FencedError, type ImplementPhase, type Journal } from "./journal.ts";
@@ -2734,9 +2734,10 @@ async function closeAfterMerge(
    ...(ctx.ratify === "auto" ? { ci: `${success.runId}@${pr.headSha}` } : {}),
    evidence,
   },
-  { cwd: ctx.canonical, timeoutMs: GRAPH_CALL_TIMEOUT_MS },
+  { cwd: ctx.canonical, timeoutMs: closeTimeoutMs(node.node.probes) },
  );
  if (!close.closed) {
+  if (close.timedOut === true) throw new ParkSignal(`close after merge: ${close.detail}`);
   // A forge read inside the close that got no answer says nothing about the
   // node: thrown plain, failNode leaves the row for the sweep to respawn,
   // uncounted, and the respawn's first read finds the node closed if the
