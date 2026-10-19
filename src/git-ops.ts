@@ -1140,17 +1140,24 @@ const SHA_RE = /^[0-9a-f]{7,64}$/;
 export async function linesAddedSince(cwd: string, from: string, head: string): Promise<Map<string, Set<number>> | null> {
  try {
   if (!SHA_RE.test(from) || !SHA_RE.test(head) || !(await isAncestor(cwd, from, head))) return null;
-  const r = await safeGit(["diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--unified=0", from, head, "--"], { cwd, timeoutMs: 30_000 });
+  const r = await safeGit(["-c", "core.quotePath=false", "diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--unified=0", from, head, "--"], { cwd, timeoutMs: 30_000 });
   if (r.code !== 0) return null;
   const added = new Map<string, Set<number>>();
   let path: string | undefined;
+  let header = false;
   for (const line of r.stdout.split("\n")) {
-   if (line.startsWith("+++ ")) {
+   if (line.startsWith("diff --git ")) {
+    header = true;
+    continue;
+   }
+   if (header && line.startsWith("+++ ")) {
     const raw = line.slice(4);
+    if (raw.startsWith("\"")) return null;
     path = raw === "/dev/null" ? undefined : raw.replace(/^b\//, "");
     continue;
    }
    const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/.exec(line);
+   if (hunk !== null) header = false;
    if (hunk === null || path === undefined) continue;
    const start = Number(hunk[1]);
    const count = hunk[2] ? Number(hunk[2]) : 1;

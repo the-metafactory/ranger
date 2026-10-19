@@ -11,6 +11,7 @@ import {
  gitConfigSnapshot,
  gitCredential,
  GitSafetyError,
+ linesAddedSince,
  NODE_BRANCH,
  safeGit,
  utf8Name,
@@ -741,5 +742,49 @@ describe("vettedPush: a branch's LFS objects reach origin though hooks are off (
   expect(() => assertNamedRefs(["lfs", "push", "origin", "HEAD"])).not.toThrow();
   expect(() => assertNamedRefs(["lfs", "push", "origin"])).toThrow(GitSafetyError);
   expect(() => assertNamedRefs(["lfs", "fetch", "origin", "HEAD"])).toThrow(GitSafetyError);
+ });
+});
+
+describe("ranger#357: linesAddedSince", () => {
+ let dir: string;
+ const git = async (args: string[]) => {
+  const r = await runCmd("git", args, { cwd: dir, env: { ...process.env, ...GIT_ENV } });
+  expect(r.code, `git ${args.join(" ")}: ${r.stderr}`).toBe(0);
+  return r.stdout.trim();
+ };
+ beforeEach(async () => {
+  dir = mkdtempSync(join(tmpdir(), "ranger-lines-added-"));
+  await git(["init", "-q", "-b", "main"]);
+  writeFileSync(join(dir, "plain.ts"), "one\ntwo\nthree\n");
+  await git(["add", "-A"]);
+  await git(["commit", "-q", "-m", "base"]);
+ });
+ afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+ test("a non-ASCII path is read unquoted, and an added line starting `++ ` is content, not a header", async () => {
+  const from = await git(["rev-parse", "HEAD"]);
+  writeFileSync(join(dir, "café.ts"), "a\nb\n");
+  writeFileSync(join(dir, "plain.ts"), "one\n++ x\ntwo\nthree\nfour\n");
+  await git(["add", "-A"]);
+  await git(["commit", "-q", "-m", "delta"]);
+  const added = await linesAddedSince(dir, from, await git(["rev-parse", "HEAD"]));
+  expect(added === null ? null : Object.fromEntries([...added].map(([p, l]) => [p, [...l]]))).toEqual({ "café.ts": [1, 2], "plain.ts": [2, 5] });
+ });
+
+ test("a path git still quotes fails closed", async () => {
+  const from = await git(["rev-parse", "HEAD"]);
+  writeFileSync(join(dir, "tab\there.ts"), "x\n");
+  await git(["add", "-A"]);
+  await git(["commit", "-q", "-m", "quoted"]);
+  expect(await linesAddedSince(dir, from, await git(["rev-parse", "HEAD"]))).toBeNull();
+ });
+
+ test("a clean sha that is not an ancestor of the head fails closed", async () => {
+  const base = await git(["rev-parse", "HEAD"]);
+  await git(["commit", "-q", "--allow-empty", "-m", "side"]);
+  const side = await git(["rev-parse", "HEAD"]);
+  await git(["reset", "-q", "--hard", base]);
+  await git(["commit", "-q", "--allow-empty", "-m", "rewritten"]);
+  expect(await linesAddedSince(dir, side, await git(["rev-parse", "HEAD"]))).toBeNull();
  });
 });
