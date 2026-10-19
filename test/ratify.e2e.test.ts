@@ -173,6 +173,26 @@ const reactionReads = (f: Fixture) =>
  existsSync(f.calls) ? readFileSync(f.calls, "utf8").split("\n").filter((l) => l.includes("/reactions?")) : [];
 
 describe("ratify phase (node #250)", () => {
+ test("a ratified close timeout parks without counting a refusal (node #347)", async () => {
+  const f = await fixture();
+  try {
+   seedProposal(f, "10", "9001", new Date().toISOString());
+   f.journal((j) => j.updateWorker("10", REPO, { status: "claimed", phase: "close" }));
+   const result = await runCmd(bun, [
+    "--preload", join(import.meta.dir, "fixtures", "close-times-out.ts"),
+    cliPath, "run-node", "10", "--map", REPO, "-c", f.config,
+   ], { env: testCliEnv({ ...f.env, RANGER_WORKER_CMD: "/nonexistent/worker" }) });
+   expect(result.code).toBe(0);
+   expect(JSON.parse(result.stdout)).toMatchObject({ status: "parked", workerExit: null, close: { timedOut: true } });
+   expect(f.journal((j) => j.getWorker("10", REPO))).toMatchObject({ status: "parked", phase: "close", attempts: 0 });
+   expect(f.journal((j) => j.deadmanCount())).toBe(0);
+   const events = f.journal((j) => j.listEvents(REPO));
+   expect(events.some((e) => e.kind === "parked" && e.detail?.includes("timed out"))).toBe(true);
+   expect(events.some((e) => ["refused", "closed", "decisions-written"].includes(e.kind))).toBe(false);
+   expect(f.state().nodes["10"].status).toBe("open");
+  } finally { f.stop(); }
+ }, 30_000);
+
  test("propose → a non-principal 👍 is ignored → the principal's 👍 on page 2 → ratified close with approved evidence", async () => {
   const f = await fixture();
   try {
