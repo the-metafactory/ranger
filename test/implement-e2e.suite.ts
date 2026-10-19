@@ -19,6 +19,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { loadConfig, principalLoginForRepo } from "../src/config.ts";
 import { runCmd } from "../src/exec.ts";
+import * as graphWrite from "../src/graph-write.ts";
 import type { IssueComment, ChangeRequest } from "../src/forge.ts";
 import type { CheckRun } from "../src/github.ts";
 import { BASE_RERUNS, baseMergeMarker, bunTestChain, coverageInPlay, failedTests, failuresAllNamed, failuresNotAtBase, mostFailing, testsReceipt, recordedBaseMerges, recordedReviews, reviewMarker, type ForgePort } from "../src/implement.ts";
@@ -1797,6 +1798,43 @@ describe("implement lane (node #23)", () => {
   });
   return spawned;
  };
+
+ test.each([false, true])("a post-merge close uses the probe budget and reports timedOut=%s (node #347)", async timedOut => {
+  const r = await rig({ autonomy: "propose", probes: [{ type: "command", run: "true", timeoutSec: 600, expectExit: 0 }] });
+  cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  await r.github.merge(1);
+  const announcedBeforeClose = [...r.announced];
+  const realClose = graphWrite.graphClose;
+  let budget: number | undefined;
+  const close = spyOn(graphWrite, "graphClose").mockImplementation((repo, id, identity, token, options, opts) => {
+   budget = opts?.timeoutMs;
+   return realClose(repo, id, identity, token, options, {
+    ...opts,
+    runner: async () => ({ code: timedOut ? -1 : 0, stdout: "Closed node 20 (acme/widgets)", stderr: "", timedOut }),
+   });
+  });
+  try {
+   const outcome = await runNode("20", r.ctx);
+   expect(budget).toBeGreaterThan(600_000);
+   expect(outcome.status).toBe(timedOut ? "parked" : "success");
+   expect(r.journal.getWorker("20", "acme/widgets")).toMatchObject({ status: timedOut ? "parked" : "success", attempts: 0 });
+   expect(r.journal.deadmanCount()).toBe(0);
+   const events = r.journal.listEvents("acme/widgets", 200);
+   expect(events.some((e) => e.kind === "transient")).toBe(false);
+   if (timedOut) {
+    expect(outcome.detail).toStartWith("close after merge: soma graph close 20");
+    expect(outcome.detail).toContain("timed out after 660s");
+    expect(outcome.detail).not.toContain("refused");
+    expect(events.some((e) => e.kind === "closed")).toBe(false);
+    expect(await deskTick(r)).toEqual([]);
+   } else {
+    expect(events.some((e) => e.kind === "closed")).toBe(true);
+    expect(events.some((e) => e.kind === "refused" || e.kind === "parked")).toBe(false);
+    expect(r.announced).toEqual(announcedBeforeClose);
+   }
+  } finally { close.mockRestore(); }
+ }, 60_000);
 
  test("a close that hits gh's network error is left for the sweep, uncounted, not parked (soma #795, 2026-10-13)", async () => {
   const { r, outcome } = await closeFailing(
