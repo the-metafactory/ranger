@@ -5,7 +5,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSyn
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import { expandHome, loadConfig } from "../src/config.ts";
-import { createHandler, ServeReader, servedMaps, stateFromJournal } from "../src/serve.ts";
+import { createHandler, ServeReader, servedMaps, startServe, stateFromJournal } from "../src/serve.ts";
 import { Journal, openJournal } from "../src/journal.ts";
 import {
  assertNotLiveJournalUnderTest,
@@ -108,6 +108,57 @@ describe("foreign migrations (node #66)", () => {
   expect(body.error).toContain(FOREIGN[1]);
  });
 
+ describe("serve follows the journal (node #348)", () => {
+  const started = (dir: string, extra: { exit: (code: number) => void; log: (line: string) => void }) => {
+   writeFileSync(join(dir, "ranger.yaml"), baseConfigLines(dir).join("\n"));
+   const { config } = loadConfig(join(dir, "ranger.yaml"), {});
+   return startServe({ config, port: 20000 + Math.floor(Math.random() * 30000), env: { ...process.env, RANGER_RO_TEST: "x" }, ...extra });
+  };
+
+  test("a running serve whose journal gains a migration logs why and exits 1, once", async () => {
+   const dir = tempDir();
+   const path = join(dir, "state.sqlite");
+   new Journal(path).close();
+   const exits: number[] = [];
+   const logs: string[] = [];
+   const server = started(dir, { exit: (code) => void exits.push(code), log: (line) => void logs.push(line) });
+   try {
+    expect((await fetch(`${server.url}api/state`)).status).toBe(200);
+    expect(exits).toEqual([]);
+    stampForeign(path);
+    expect((await fetch(`${server.url}api/state`)).status).toBe(503);
+    await fetch(`${server.url}api/state`);
+    expect(exits).toEqual([1]);
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toContain(REFUSAL);
+    expect(logs[0]).toContain(FOREIGN[0]);
+    expect(logs[0]).toContain("restarts it");
+   } finally {
+    server.stop();
+   }
+  });
+
+  test("a serve started on an already-foreign journal stays up and shows the refusal", async () => {
+   const dir = tempDir();
+   foreignJournal(dir);
+   const exits: number[] = [];
+   const logs: string[] = [];
+   const server = started(dir, { exit: (code) => void exits.push(code), log: (line) => void logs.push(line) });
+   try {
+    expect((await fetch(server.url)).status).toBe(200);
+    for (let i = 0; i < 2; i++) {
+     const refused = await fetch(`${server.url}api/state`);
+     expect(refused.status).toBe(503);
+     expect(((await refused.json()) as { error: string }).error).toContain(REFUSAL);
+    }
+    expect(exits).toEqual([]);
+    expect(logs.join("\n")).toContain(REFUSAL);
+   } finally {
+    server.stop();
+   }
+  });
+ });
+
  test("a journal this code migrated opens, and reopens", () => {
   const path = join(tempDir(), "state.sqlite");
   new Journal(path).close();
@@ -116,12 +167,12 @@ describe("foreign migrations (node #66)", () => {
   journal.close();
  });
 
- test("tick, run-node and serve exit 1 with the refusal, before any other work", async () => {
+ test("tick and run-node exit 1 with the refusal, before any other work", async () => {
   const dir = tempDir();
   foreignJournal(dir);
   const config = join(dir, "ranger.yaml");
   writeFileSync(config, baseConfigLines(dir).join("\n"));
-  for (const args of [["tick"], ["run-node", "5"], ["serve", "--port", "47366"]]) {
+  for (const args of [["tick"], ["run-node", "5"]]) {
    const result = await runCli([...args, "--config", config], { PATH: process.env.PATH, HOME: process.env.HOME });
    expect({ args, code: result.code }).toEqual({ args, code: 1 });
    expect(result.stderr).toContain(REFUSAL);
