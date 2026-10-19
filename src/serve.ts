@@ -779,6 +779,7 @@ export interface HandlerContext {
  port: number;
  token: string;
  getState: () => DashboardState;
+ onForeignMigration?: (error: ForeignMigrationError) => void;
  refresh: () => void;
  launch: (argv: string[], env: Record<string, string>) => void;
  /**
@@ -997,7 +998,10 @@ export function createHandler(ctx: HandlerContext): (req: Request) => Promise<Re
   try {
    return await handle(req);
   } catch (error) {
-   if (error instanceof ForeignMigrationError) return refuse(503, error.message);
+   if (error instanceof ForeignMigrationError) {
+    ctx.onForeignMigration?.(error);
+    return refuse(503, error.message);
+   }
    throw error;
   }
  };
@@ -2250,13 +2254,23 @@ export function startServe(opts: {
  open?: boolean;
  /** The environment the read-only tokens are read from (tests pass their own). */
  env?: NodeJS.ProcessEnv;
+ log?: (line: string) => void;
+ exit?: (code: number) => void;
 }): { url: string; stop: () => void } {
  const serve = serveConfig(opts.config);
  const port = opts.port ?? serve.port;
  const token = randomBytes(24).toString("hex");
- // A journal migrated by code this ranger isn't running stops serve at launch
- // with that error, rather than a dashboard that half-works (node #66).
- Journal.openReadOnly(expandHome(opts.config.state.journalPath), opts.config.maps)?.close();
+ const log = opts.log ?? ((line: string) => process.stderr.write(`${line}\n`));
+ const exit = opts.exit ?? ((code: number) => process.exit(code));
+ let startedBehindJournal = false;
+ try {
+  Journal.openReadOnly(expandHome(opts.config.state.journalPath), opts.config.maps)?.close();
+ } catch (error) {
+  if (!(error instanceof ForeignMigrationError)) throw error;
+  startedBehindJournal = true;
+  log(`ranger serve: ${error.message}\nranger serve: staying up to show this on the page.`);
+ }
+ let stopping = false;
  const maps = servedMaps(opts.config);
  assertReadOnlyTokens(opts.config, maps, opts.env);
  const reader = new ServeReader(
@@ -2277,6 +2291,12 @@ export function startServe(opts: {
    return state;
   },
   refresh: () => reader.refresh(),
+  onForeignMigration: (error) => {
+   if (startedBehindJournal || stopping) return;
+   stopping = true;
+   log(`ranger serve: ${error.message}\nranger serve: exiting so launchd restarts it on the code now on disk.`);
+   exit(1);
+  },
   launch: spawnLaunch,
   verifyGrilling: (map, nodeId, kind) => verifyGrillingLive(opts.config, map, nodeId, kind),
   buildNow: {
