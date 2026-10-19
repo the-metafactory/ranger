@@ -693,7 +693,8 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    await park(row, mergeGateFailedOutcome(gate), title);
    return;
   }
-  if (!ciPark && row.mergeMessageId !== null) return; // card already up — announce once
+  const carded = !ciPark && row.mergeMessageId !== null;
+  if (carded && !map.autoMerge) return;
 
   // Auto-merge (principal, 2026-10-03): on a map that opts in, ranger
   // squash-merges the gate-passed PR itself, pinned to the gated head, unless
@@ -758,6 +759,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    }
    return;
   }
+  if (carded) return;
 
   const content = renderCard({
    emoji: "🔀",

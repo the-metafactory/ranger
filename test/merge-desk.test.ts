@@ -394,6 +394,62 @@ describe("node #106 — newest-same-head-review-wins: the desk reads the newest 
  }
 });
 
+describe("node #346 — an autoMerge map merges a gate-passed row whose merge card went up while the map was off", () => {
+ const carded = (r: ReturnType<typeof rig>) => r.journal.updateWorker("96", GAME, { status: "awaiting-merge", outcome: null, mergeMessageId: "card-1" });
+
+ test("a carded row on an autoMerge map is squash-merged at the gated head and its close starts", async () => {
+  const r = rig();
+  try {
+   carded(r);
+   const gh = fakeGitHub({ comments: [review(CERTIFIED)], ci: GREEN });
+   const result = await r.desk(gh.github);
+   expect(result).toMatchObject({ merged: ["96"], resumed: ["96"], parked: [], errors: [] });
+   expect(gh.merges).toEqual([{ n: 709, sha: CERTIFIED }]);
+   expect(r.posts).toHaveLength(1);
+   expect(r.posts[0]).toContain("merged");
+   expect(r.spawned).toEqual(["96"]);
+   expect(r.journal.getWorker("96", GAME)).toMatchObject({ status: "running", phase: "close" });
+  } finally { r.close(); }
+ });
+
+ test("a carded row held by ranger:needs-eye on an autoMerge map neither merges nor posts a second card", async () => {
+  const r = rig();
+  try {
+   carded(r);
+   const gh = fakeGitHub({ comments: [review(CERTIFIED)], ci: GREEN, labels: ["ranger:needs-eye"] });
+   const result = await r.desk(gh.github);
+   expect(result).toMatchObject({ merged: [], cards: [], parked: [] });
+   expect(gh.merges).toEqual([]);
+   expect(r.posts).toEqual([]);
+  } finally { r.close(); }
+ });
+
+ test("a carded row on a manual map posts no second card and does not merge", async () => {
+  const r = rig({ autoMerge: false });
+  try {
+   carded(r);
+   const gh = fakeGitHub({ comments: [review(CERTIFIED)], ci: GREEN });
+   const result = await r.desk(gh.github);
+   expect(result).toMatchObject({ merged: [], cards: [], parked: [] });
+   expect(gh.merges).toEqual([]);
+   expect(r.posts).toEqual([]);
+   expect(r.journal.getWorker("96", GAME)).toMatchObject({ status: "awaiting-merge", mergeMessageId: "card-1" });
+  } finally { r.close(); }
+ });
+
+ test("a carded row on an autoMerge map whose gate fails does not merge", async () => {
+  const r = rig();
+  try {
+   carded(r);
+   const gh = fakeGitHub({ comments: [review(CERTIFIED, 1)], ci: GREEN });
+   const result = await r.desk(gh.github);
+   expect(result.merged).toEqual([]);
+   expect(gh.merges).toEqual([]);
+   expect(r.journal.getWorker("96", GAME)?.status).not.toBe("awaiting-merge");
+  } finally { r.close(); }
+ });
+});
+
 describe("one merge, one close: two desk passes on the same merged PR", () => {
  test("a merged PR spawns its close", async () => {
   const r = rig();
