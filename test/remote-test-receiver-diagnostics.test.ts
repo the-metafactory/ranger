@@ -296,6 +296,20 @@ test("real CLI SIGINT/SIGTERM/SIGHUP during pending upload emits interrupted wit
  }
 });
 
+test("real CLI keeps the final partial chunk of a multi-megabyte upload when stdin ends during a disk write", async () => {
+ for (let attempt = 0; attempt < 3; attempt++) {
+  const f = await fixture(), payload = Buffer.alloc(4 * 1024 * 1024 + 4321, attempt + 1);
+  const job = { ...f.job, bundleDigest: `sha256:${createHash("sha256").update(payload).digest("hex")}` };
+  const header = Buffer.from(JSON.stringify({ version: 2, operation: "submit", job, bundleBytes: payload.length }) + "\n");
+  const configPath = join(f.root, "executor.json"), requestPath = join(f.root, "request.bin");
+  await fs.writeFile(configPath, JSON.stringify(f.config), { mode: 0o600 });
+  await fs.writeFile(requestPath, Buffer.concat([header, payload]), { mode: 0o600 });
+  const child = Bun.spawn([process.execPath, "src/cli.ts", "remote-test", "serve-stdio", "--config", configPath, "--diagnostics-root", f.diagnosticsRoot], { stdin: Bun.file(requestPath), stdout: "pipe", stderr: "pipe" });
+  expect(await child.exited).toBe(0);
+  expect((await f.records()).map(r => r.primary)).not.toContainEqual({ stage: "upload", code: "upload_size" });
+ }
+});
+
 test("real CLI config filesystem errno remains allowlisted rather than guessed from exception text", async () => {
  const f = await fixture(), result = await cli(f, "", ["--config", join(f.root, "absent-" + secret), "--diagnostics-root", f.diagnosticsRoot]);
  expect(result.code).toBe(1); expect(result.stdout).toBe(""); expect(result.stderr).toContain("inspect private operator state");
