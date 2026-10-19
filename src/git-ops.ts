@@ -1132,6 +1132,39 @@ export async function isAncestor(cwd: string, ancestor: string, descendant: stri
 const SHA_RE = /^[0-9a-f]{7,64}$/;
 
 /**
+ * The lines `head` adds since `from`, by path (ranger#357): the surface a
+ * review after a clean round may gate on. Null when `from` is not an ancestor
+ * of `head` (a force-push rewrote what the clean round read) or git fails, so
+ * the caller gates as before.
+ */
+export async function linesAddedSince(cwd: string, from: string, head: string): Promise<Map<string, Set<number>> | null> {
+ try {
+  if (!SHA_RE.test(from) || !SHA_RE.test(head) || !(await isAncestor(cwd, from, head))) return null;
+  const r = await safeGit(["diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--unified=0", from, head, "--"], { cwd, timeoutMs: 30_000 });
+  if (r.code !== 0) return null;
+  const added = new Map<string, Set<number>>();
+  let path: string | undefined;
+  for (const line of r.stdout.split("\n")) {
+   if (line.startsWith("+++ ")) {
+    const raw = line.slice(4);
+    path = raw === "/dev/null" ? undefined : raw.replace(/^b\//, "");
+    continue;
+   }
+   const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/.exec(line);
+   if (hunk === null || path === undefined) continue;
+   const start = Number(hunk[1]);
+   const count = hunk[2] ? Number(hunk[2]) : 1;
+   const lines = added.get(path) ?? new Set<number>();
+   for (let n = start; n < start + count; n++) lines.add(n);
+   added.set(path, lines);
+  }
+  return added;
+ } catch {
+  return null;
+ }
+}
+
+/**
  * Prove an unchanged PR patch across base-only merges on the first-parent
  * chain. Any unreadable history, failed command or changed patch refuses
  * the carry; the caller runs a fresh review instead.

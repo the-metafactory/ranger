@@ -439,6 +439,12 @@ describe("#37 — the state the dashboard shows", () => {
   ).current[0];
   expect(merging.stale).toBe(false);
  });
+
+ test("ranger#357: a job past sage round 4 is flagged suspicious, round 4 is not", () => {
+  const at = (reviewRound: number) => assembleState(inputs({ workers: [worker({ reviewRound })] })).current[0];
+  expect(at(4).suspicious).toBe(false);
+  expect(at(5).suspicious).toBe(true);
+ });
 });
 
 describe("#37 — the session the dashboard may launch", () => {
