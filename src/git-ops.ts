@@ -1144,7 +1144,7 @@ export async function linesAddedSince(cwd: string, from: string, head: string, p
   if (!SHA_RE.test(from) || !SHA_RE.test(head) || !(await isAncestor(cwd, from, head))) return null;
   const added = new Map<string, Set<number>>();
   for (const path of new Set(paths)) {
-   const r = await safeGit(["--literal-pathspecs", "diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--unified=0", from, head, "--", path], { cwd, timeoutMs: 30_000 });
+   const r = await safeGit(["--literal-pathspecs", "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", "--unified=0", from, head, "--", path], { cwd, timeoutMs: 30_000 });
    if (r.code !== 0) return null;
    const lines = new Set<number>();
    for (const hunk of r.stdout.matchAll(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/gm)) {

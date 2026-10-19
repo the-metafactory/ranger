@@ -775,6 +775,17 @@ describe("ranger#357: linesAddedSince", () => {
   });
  });
 
+ test("a repo that forces color still yields its hunks", async () => {
+  await git(["config", "color.ui", "always"]);
+  await git(["config", "color.diff", "always"]);
+  const from = await git(["rev-parse", "HEAD"]);
+  writeFileSync(join(dir, "plain.ts"), "one\nadded\ntwo\nthree\n");
+  await git(["add", "-A"]);
+  await git(["commit", "-q", "-m", "delta"]);
+  const added = await linesAddedSince(dir, from, await git(["rev-parse", "HEAD"]), ["plain.ts"]);
+  expect(added === null ? null : [...(added.get("plain.ts") ?? [])]).toEqual([2]);
+ });
+
  test("a pathspec-looking path is taken literally", async () => {
   const from = await git(["rev-parse", "HEAD"]);
   writeFileSync(join(dir, "plain.ts"), "one\nadded\ntwo\nthree\n");
