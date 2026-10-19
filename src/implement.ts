@@ -424,19 +424,25 @@ export function gatingFindings(r: { blockers: number; majors: number; settled?: 
 
 const FINDING_HEAD = /^- \*\*\[(blocker|important)\]\*\* `([^`\n]+):(\d+)` — /gm;
 
+/** The paths a review's blocker and important findings name, for linesAddedSince (ranger#357). */
+export function findingPaths(body: string): string[] {
+ return [...new Set([...body.matchAll(FINDING_HEAD)].map((f) => f[2]))];
+}
+
 /**
  * How many of a round's majors to settle (ranger#357): all of them when every
  * blocker-or-important finding in the review sits off the lines the head
  * added since the last clean round, else none. A round with a blocker, or
  * with fewer important findings in its text than majors in its count, settles
- * nothing: no finding is set aside that ranger cannot place.
+ * nothing: no finding is set aside that ranger cannot place, and neither
+ * does a finding whose path `added` does not cover.
  */
 export function settledMajors(review: { blockers: number; majors: number; body: string }, added: ReadonlyMap<string, ReadonlySet<number>>): number {
  if (review.blockers > 0 || review.majors === 0) return 0;
  const findings = [...review.body.matchAll(FINDING_HEAD)];
  if (findings.some((f) => f[1] === "blocker")) return 0;
  if (findings.length < review.majors) return 0;
- const inDelta = findings.some((f) => added.get(f[2])?.has(Number(f[3])) === true);
+ const inDelta = findings.some((f) => added.get(f[2])?.has(Number(f[3])) !== false);
  return inDelta ? 0 : review.majors;
 }
 
@@ -1759,7 +1765,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
     );
    }
    const clean = reviews.filter((r) => gatingFindings(r) === 0 && r.sha !== verdict.commitId).at(-1);
-   const added = clean === undefined ? null : await linesAddedSince(worktree, clean.sha, verdict.commitId);
+   const added = clean === undefined ? null : await linesAddedSince(worktree, clean.sha, verdict.commitId, findingPaths(verdict.body));
    const settled = added === null ? 0 : settledMajors(verdict, added);
    const anchor = settled > 0 && clean !== undefined ? { round: clean.round, sha: clean.sha } : undefined;
    fence("post review");

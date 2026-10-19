@@ -28,6 +28,7 @@ import {
  reviewAtHead,
  reviewMarker,
  supersededAtHead,
+ findingPaths,
  settledMajors,
  supersededNote,
  workerFixableCi,
@@ -930,7 +931,7 @@ describe("spliced-in text cannot close its own block", () => {
 
 describe("ranger#357: majors outside the delta since a clean round settle", () => {
  const finding = (severity: string, at: string) => `- **[${severity}]** \`${at}\` — **A finding**\n  Why it matters.`;
- const added = new Map([["src/fix.ts", new Set([3, 4])]]);
+ const added = new Map([["src/fix.ts", new Set([3, 4])], ["CHANGELOG.md", new Set<number>()]]);
  const review = (blockers: number, majors: number, ...findings: string[]) => ({ blockers, majors, body: `## Sage\n\n${findings.join("\n\n")}` });
  test("every important finding off the added lines settles all majors", () => {
   expect(settledMajors(review(0, 2, finding("important", "CHANGELOG.md:13"), finding("important", "src/fix.ts:9")), added)).toBe(2);
@@ -945,5 +946,11 @@ describe("ranger#357: majors outside the delta since a clean round settle", () =
  });
  test("suggestions and nits on added lines do not hold majors elsewhere", () => {
   expect(settledMajors(review(0, 1, finding("important", "CHANGELOG.md:13"), finding("nit", "src/fix.ts:3")), added)).toBe(1);
+ });
+ test("a finding on a path the delta map does not cover settles nothing", () => {
+  expect(settledMajors(review(0, 1, finding("important", "README.md:2")), added)).toBe(0);
+ });
+ test("findingPaths names each blocker-or-important path once, never a nit's", () => {
+  expect(findingPaths(review(0, 2, finding("important", "a b.ts:1"), finding("blocker", "a b.ts:4"), finding("nit", "c.ts:2")).body)).toEqual(["a b.ts"]);
  });
 });

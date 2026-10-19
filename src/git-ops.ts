@@ -1132,37 +1132,26 @@ export async function isAncestor(cwd: string, ancestor: string, descendant: stri
 const SHA_RE = /^[0-9a-f]{7,64}$/;
 
 /**
- * The lines `head` adds since `from`, by path (ranger#357): the surface a
- * review after a clean round may gate on. Null when `from` is not an ancestor
- * of `head` (a force-push rewrote what the clean round read) or git fails, so
+ * The lines `head` adds since `from` in each of `paths` (ranger#357): the
+ * surface a review after a clean round may gate on. Each path is asked for by
+ * name and only hunk headers are read, so no path is parsed out of git's
+ * quoted, tab-terminated diff headers. Null when `from` is not an ancestor of
+ * `head` (a force-push rewrote what the clean round read) or git fails, so
  * the caller gates as before.
  */
-export async function linesAddedSince(cwd: string, from: string, head: string): Promise<Map<string, Set<number>> | null> {
+export async function linesAddedSince(cwd: string, from: string, head: string, paths: readonly string[]): Promise<Map<string, Set<number>> | null> {
  try {
   if (!SHA_RE.test(from) || !SHA_RE.test(head) || !(await isAncestor(cwd, from, head))) return null;
-  const r = await safeGit(["-c", "core.quotePath=false", "diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--unified=0", from, head, "--"], { cwd, timeoutMs: 30_000 });
-  if (r.code !== 0) return null;
   const added = new Map<string, Set<number>>();
-  let path: string | undefined;
-  let header = false;
-  for (const line of r.stdout.split("\n")) {
-   if (line.startsWith("diff --git ")) {
-    header = true;
-    continue;
+  for (const path of new Set(paths)) {
+   const r = await safeGit(["--literal-pathspecs", "diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--unified=0", from, head, "--", path], { cwd, timeoutMs: 30_000 });
+   if (r.code !== 0) return null;
+   const lines = new Set<number>();
+   for (const hunk of r.stdout.matchAll(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/gm)) {
+    const start = Number(hunk[1]);
+    const count = hunk[2] ? Number(hunk[2]) : 1;
+    for (let n = start; n < start + count; n++) lines.add(n);
    }
-   if (header && line.startsWith("+++ ")) {
-    const raw = line.slice(4);
-    if (raw.startsWith("\"")) return null;
-    path = raw === "/dev/null" ? undefined : raw.replace(/^b\//, "");
-    continue;
-   }
-   const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/.exec(line);
-   if (hunk !== null) header = false;
-   if (hunk === null || path === undefined) continue;
-   const start = Number(hunk[1]);
-   const count = hunk[2] ? Number(hunk[2]) : 1;
-   const lines = added.get(path) ?? new Set<number>();
-   for (let n = start; n < start + count; n++) lines.add(n);
    added.set(path, lines);
   }
   return added;

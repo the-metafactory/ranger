@@ -761,22 +761,27 @@ describe("ranger#357: linesAddedSince", () => {
  });
  afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
- test("a non-ASCII path is read unquoted, and an added line starting `++ ` is content, not a header", async () => {
+ test("lines are read per named path: non-ASCII, a space, a tab, and an added line starting `++ `", async () => {
   const from = await git(["rev-parse", "HEAD"]);
   writeFileSync(join(dir, "café.ts"), "a\nb\n");
+  writeFileSync(join(dir, "with space.ts"), "x\n");
+  writeFileSync(join(dir, "tab\there.ts"), "y\n");
   writeFileSync(join(dir, "plain.ts"), "one\n++ x\ntwo\nthree\nfour\n");
   await git(["add", "-A"]);
   await git(["commit", "-q", "-m", "delta"]);
-  const added = await linesAddedSince(dir, from, await git(["rev-parse", "HEAD"]));
-  expect(added === null ? null : Object.fromEntries([...added].map(([p, l]) => [p, [...l]]))).toEqual({ "café.ts": [1, 2], "plain.ts": [2, 5] });
+  const added = await linesAddedSince(dir, from, await git(["rev-parse", "HEAD"]), ["café.ts", "with space.ts", "tab\there.ts", "plain.ts", "untouched.ts"]);
+  expect(added === null ? null : Object.fromEntries([...added].map(([p, l]) => [p, [...l]]))).toEqual({
+   "café.ts": [1, 2], "with space.ts": [1], "tab\there.ts": [1], "plain.ts": [2, 5], "untouched.ts": [],
+  });
  });
 
- test("a path git still quotes fails closed", async () => {
+ test("a pathspec-looking path is taken literally", async () => {
   const from = await git(["rev-parse", "HEAD"]);
-  writeFileSync(join(dir, "tab\there.ts"), "x\n");
+  writeFileSync(join(dir, "plain.ts"), "one\nadded\ntwo\nthree\n");
   await git(["add", "-A"]);
-  await git(["commit", "-q", "-m", "quoted"]);
-  expect(await linesAddedSince(dir, from, await git(["rev-parse", "HEAD"]))).toBeNull();
+  await git(["commit", "-q", "-m", "delta"]);
+  const added = await linesAddedSince(dir, from, await git(["rev-parse", "HEAD"]), ["*.ts"]);
+  expect(added?.get("*.ts")?.size).toBe(0);
  });
 
  test("a clean sha that is not an ancestor of the head fails closed", async () => {
@@ -785,6 +790,6 @@ describe("ranger#357: linesAddedSince", () => {
   const side = await git(["rev-parse", "HEAD"]);
   await git(["reset", "-q", "--hard", base]);
   await git(["commit", "-q", "--allow-empty", "-m", "rewritten"]);
-  expect(await linesAddedSince(dir, side, await git(["rev-parse", "HEAD"]))).toBeNull();
+  expect(await linesAddedSince(dir, side, await git(["rev-parse", "HEAD"]), ["plain.ts"])).toBeNull();
  });
 });
