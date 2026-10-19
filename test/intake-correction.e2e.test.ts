@@ -12,6 +12,7 @@ import {
  intakeMarker,
  intakeNodeBody,
  intakePass,
+ parseClaudeCorrection,
  PRINCIPAL_INTAKE_LABEL,
  type DraftSpec,
  type IntakeResult,
@@ -440,6 +441,29 @@ describe("deterministicCorrection (node #241)", () => {
   expect(nothing.spec).toEqual(prev);
   expect(nothing.changed).toEqual([]);
   expect(nothing.notUnderstood[0]).toContain("no field named");
+ });
+});
+
+describe("a correction that changes only the probes (node #277)", () => {
+ const prev: DraftSpec = { title: TITLE, parent: 1, checkpoint: "minimap", kind: "task", autonomy: "propose", drafter: "deterministic" };
+ const subtree = [{ id: 1, title: "(the map root)" }];
+ const answer = (probes: unknown[]) =>
+  claudeEnvelope({ title: TITLE, parent: 1, checkpoint: "minimap", kind: "task", autonomy: "propose", probes });
+ const probe = { type: "command", run: "bun test", timeoutSec: 60, expectExit: 0 };
+
+ test("the card lists probes when claude adds or changes them", () => {
+  const added = parseClaudeCorrection(answer([probe]), prev, subtree, "m");
+  expect(added.ok && added.value.changed).toEqual(["probes"]);
+  const withProbe = { ...prev, probes: [probe] } as DraftSpec;
+  const changed = parseClaudeCorrection(answer([{ ...probe, run: "bun test x" }]), withProbe, subtree, "m");
+  expect(changed.ok && changed.value.changed).toEqual(["probes"]);
+ });
+
+ test("probes claude leaves alone, or leaves empty on a draft with none, are not a change", () => {
+  const same = parseClaudeCorrection(answer([]), prev, subtree, "m");
+  expect(same.ok && same.value.changed).toEqual([]);
+  const kept = parseClaudeCorrection(answer([probe]), { ...prev, probes: [probe] } as DraftSpec, subtree, "m");
+  expect(kept.ok && kept.value.changed).toEqual([]);
  });
 });
 

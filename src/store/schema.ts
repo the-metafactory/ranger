@@ -366,6 +366,8 @@ export const intakeDrafts = sqliteTable(
  (table) => [
   index("intake_drafts_repo_root_idx").on(table.repo, table.root),
   index("intake_drafts_channel_status_idx").on(table.channelId, table.status),
+  index("intake_drafts_card_idx").on(table.cardMessageId),
+  index("intake_drafts_supersedes_idx").on(table.supersedes),
  ],
 );
 
