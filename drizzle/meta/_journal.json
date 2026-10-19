@@ -225,6 +225,13 @@
       "when": 1792195200000,
       "tag": "0031_escalation-closed-at",
       "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "6",
+      "when": 1792281600000,
+      "tag": "0032_intake-drafts-lookup-indexes",
+      "breakpoints": true
     }
   ]
 }
