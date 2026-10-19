@@ -331,6 +331,13 @@ describe("scribeAfterMerge: the Scribe's pass before the close", () => {
   expect(receipt).toContain("Marker comments: the merge added 1, filed as node #301 below this node.");
  });
 
+ test("ranger#357: a settled round files nothing: its majors stay on the PR, journalled", async () => {
+  const filings = await scribeAfterMerge(ctx, { ...pr(), mergeCommitSha: null }, { ...REVIEW, settled: 1 });
+  expect(filings).toEqual({});
+  expect(fake.calls).toEqual([]);
+  expect(events()).toContainEqual(expect.stringContaining("left round 2's 1 settled major(s) on PR #42"));
+ });
+
  test("a clean review and a merge with no marker comments file nothing", async () => {
   const filings = await scribeAfterMerge(ctx, { ...pr(), mergeCommitSha: null }, { ...REVIEW, majors: 0, nits: 0 });
   expect(filings).toEqual({});

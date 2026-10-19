@@ -349,6 +349,21 @@ describe("node #106 — newest-same-head-review-wins: the desk reads the newest 
   } finally { r.close(); }
  });
 
+ test("ranger#357: a head whose last round settled a major goes on a card, auto-merge held, the major named not filed", async () => {
+  const r = rig();
+  try {
+   const settled: IssueComment = { id: 30, author: BOT, body: `<!-- ranger:review round=6 sha=${CERTIFIED} blockers=0 majors=1 nits=0 settled=1 -->` };
+   const gh = fakeGitHub({ comments: [settled], ci: GREEN });
+   const result = await r.desk(gh.github);
+   expect(result).toMatchObject({ cards: ["96"], merged: [], parked: [], errors: [] });
+   expect(gh.merges).toEqual([]);
+   expect(r.posts).toHaveLength(1);
+   expect(r.posts[0]).toContain("sage round 6 settled 1 major(s) outside what the head added since the last clean round");
+   expect(r.posts[0]).toContain("Auto-merge is held on this head for that reason.");
+   expect(r.posts[0]).toContain("no blocker or major that gates");
+  } finally { r.close(); }
+ });
+
  test("a merge on a single clean round carries no superseded note", async () => {
   const r = rig();
   try {
