@@ -1012,6 +1012,7 @@ export async function vettedPush(opts: {
  assertCredential(opts.credential, `the push of ${opts.branch}`);
  const vetted = await assertGitUntouched(opts.canonical, opts.configSnapshot);
  const source = opts.source ?? "HEAD";
+ await assertCheckoutOf(opts.worktree, opts.canonical);
  if (await treeDeclaresLfs(opts.worktree, source)) {
   await refuseLfsConfig(opts.worktree, source);
   const lfs = await safeGit(
