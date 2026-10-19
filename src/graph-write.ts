@@ -213,9 +213,10 @@ export async function graphClose(
   args.push("--evidence", JSON.stringify(entry));
  }
  if (options.dryRun === true) args.push("--dry-run");
- const result = await callWrite(repo, args, token, { ...opts, processGroup: true });
+ const timeoutMs = opts.timeoutMs ?? GRAPH_CALL_TIMEOUT_MS;
+ const result = await callWrite(repo, args, token, { ...opts, timeoutMs, processGroup: true });
  if (result.timedOut === true) {
-  const seconds = Math.round((opts.timeoutMs ?? 0) / 1000);
+  const seconds = timeoutMs / 1000;
   return {
    repo,
    node: id,

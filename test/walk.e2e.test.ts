@@ -386,6 +386,35 @@ describe("ranger walk — claim phase (node #13)", () => {
 });
 
 describe("ranger run-node — research worker full loop (node #13 acceptance)", () => {
+ test("a research close timeout parks without a refusal or a failed attempt (node #347)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ranger-research-close-timeout-"));
+  try {
+   const { origin } = await createCanonicalRepo(dir);
+   const config = writeConfig(dir);
+   const statePath = writeState(dir, { "10": { ...RESEARCH_NODE_STATE, assignees: ["ivy-bot"] } });
+   const result = await runCmd(bun, [
+    "--preload", join(import.meta.dir, "fixtures", "research-timing.ts"),
+    "--preload", join(import.meta.dir, "fixtures", "close-times-out.ts"),
+    cliPath, "run-node", "10", "--map", "acme/widgets", "-c", config,
+   ], { env: testCliEnv({
+    ...process.env, ...GIT_ENV, PATH: `${fixturesBin}:${process.env.PATH ?? ""}`,
+    FAKE_SOMA_DIR: dataDir, FAKE_SOMA_STATE: statePath, FAKE_SOMA_REPO_DIR: origin,
+    RANGER_WRITE_TEST: "ghp_write", RANGER_WORKER_CMD: join(fixturesBin, "worker"),
+   }) });
+   expect(result.code).toBe(0);
+   expect(JSON.parse(result.stdout)).toMatchObject({ status: "parked", close: { timedOut: true } });
+   const journal = new Journal(join(dir, "state.sqlite"));
+   try {
+    expect(journal.getWorker("10", "acme/widgets")).toMatchObject({ status: "parked", attempts: 0 });
+    expect(journal.deadmanCount()).toBe(0);
+    const events = journal.listEvents("acme/widgets");
+    expect(events.some((e) => e.kind === "parked" && e.detail?.includes("timed out"))).toBe(true);
+    expect(events.some((e) => ["refused", "closed", "decisions-written"].includes(e.kind))).toBe(false);
+   } finally { journal.close(); }
+   expect(JSON.parse(readFileSync(statePath, "utf8")).nodes["10"].status).toBe("open");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+ }, 30_000);
+
  test("worktree → research worker (findings branch pushed) → gated close (probe on pushed ref) → decisions --write", async () => {
   const dir = mkdtempSync(join(tmpdir(), "ranger-run-"));
   try {

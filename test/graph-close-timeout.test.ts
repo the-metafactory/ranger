@@ -95,4 +95,15 @@ describe("graphClose against a stub soma that forks (node #347)", () => {
     await graphClose("acme/widgets", "5", "ivy-agent", "tok", options, { runner });
     expect(seen).toBe(true);
   });
+
+  test("an omitted timeout uses and reports the graph call floor", async () => {
+    let seen: number | undefined;
+    const runner: typeof runCmd = async (_cmd, _args, opts) => {
+      seen = opts?.timeoutMs;
+      return { code: -1, stdout: RECEIPT, stderr: "", timedOut: true };
+    };
+    const result = await graphClose("acme/widgets", "5", "ivy-agent", "tok", options, { runner });
+    expect(seen).toBe(GRAPH_CALL_TIMEOUT_MS);
+    expect(result.detail).toContain(`${GRAPH_CALL_TIMEOUT_MS / 1000}s`);
+  });
 });
