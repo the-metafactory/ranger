@@ -709,7 +709,10 @@ remoteTest.command("serve-stdio")
  .option("--diagnostics-root <absolute-directory>", "existing private operator-only refusal store (default off)")
  .action(async (options: { config: string; diagnosticsRoot?: string }) => {
   const diagnostics = options.diagnosticsRoot === undefined ? undefined : { root: options.diagnosticsRoot };
-  const abort = new AbortController(), cancel = () => { abort.abort(); process.stdin.destroy(new TaggedReceiverFailure("interrupted", "SSH input interrupted")); };
+  const stdin = Bun.stdin.stream().getReader();
+  let interrupted: TaggedReceiverFailure | undefined;
+  const input = (async function* () { for (;;) { const { done, value } = await stdin.read(); if (interrupted) throw interrupted; if (done) return; yield value; } })();
+  const abort = new AbortController(), cancel = () => { abort.abort(); interrupted = new TaggedReceiverFailure("interrupted", "SSH input interrupted"); stdin.cancel(interrupted).catch(() => undefined); };
   process.once("SIGINT", cancel); process.once("SIGTERM", cancel); process.once("SIGHUP", cancel);
   // Includes upload idle time and bounded executor cleanup. No silent daemon.
   const timer = setTimeout(cancel, 15 * 60_000);
@@ -725,7 +728,7 @@ remoteTest.command("serve-stdio")
     await saveRefusalDiagnostic(diagnostics, { operation: null, job: null, primary: failure });
     throw Error("Invalid private executor config");
    }
-   const response = await serveSshResponse(process.stdin, config, { signal: abort.signal, diagnostics });
+   const response = await serveSshResponse(input, config, { signal: abort.signal, diagnostics });
    process.stdout.write(JSON.stringify(response) + "\n");
   } catch { process.stderr.write("ranger remote-test serve-stdio: request, admission, execution or storage failed; inspect private operator state.\n"); process.exitCode = 1; }
   finally { clearTimeout(timer); process.removeListener("SIGINT", cancel); process.removeListener("SIGTERM", cancel); process.removeListener("SIGHUP", cancel); }
