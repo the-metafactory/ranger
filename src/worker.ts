@@ -1,3 +1,4 @@
+import type { RunOutcome } from "@the-metafactory/myelin";
 import { fileStemFor, parseForgeRef, qualifiedRepo } from "./forge-ref.ts";
 import { graphReadToken, laneCredentialRefusal, lanePort, type ReadGate } from "./forge-lanes.ts";
 import { branchUrl, changeRequestLabel, ciRunNoun, nodeCommentUrl } from "./forge-text.ts";
@@ -97,6 +98,22 @@ export interface RunNodeOutcome {
  prNumber?: number;
 }
 
+const RUN_NODE_OUTCOMES = {
+ success: "succeeded",
+ failed: "failed",
+ parked: "blocked",
+ released: "cancelled",
+ "awaiting-merge": "succeeded",
+ proposed: "succeeded",
+ refused: "blocked",
+ skipped: null,
+} as const satisfies Record<RunNodeOutcome["status"], RunOutcome | null>;
+
+/** The settled run-node status mapping; skipped generations have no envelope. */
+export function runNodeRunOutcome(status: RunNodeOutcome["status"]): RunOutcome | null {
+ return RUN_NODE_OUTCOMES[status];
+}
+
 export interface RunNodeContext {
  config: RangerConfig;
  map: RangerMapConfig;
@@ -108,6 +125,7 @@ export interface RunNodeContext {
  journal: Journal;
  /** Observe the existing map-root read without fetching it again for the run ledger. */
  onMapRootRead?: (root: NodeResult) => void;
+ onGenerationBegun?: (generation: number) => void;
  /**
   * Worker command + leading args; the prompt is appended as the final arg.
   * Defaults to the selected substrate's command (`workerCommandFor`);
@@ -483,6 +501,7 @@ export async function runNode(
   journal.upsertWorker({ nodeId, repo, root: map.root, status: "running", attempts: 0 });
  }
  const generation = journal.beginGeneration(nodeId, repo);
+ ctx.onGenerationBegun?.(generation);
  // The supervisor's PID stays on the row until a terminal state (F1): a
  // supervisor crash anywhere in the SOP tail is then visible to sweep.
  journal.updateWorker(nodeId, repo, {

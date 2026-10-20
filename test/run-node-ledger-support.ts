@@ -69,7 +69,7 @@ export function controlled(status: RunNodeOutcome["status"]): RunRunNodeDeps["ru
   if (ctx.journal.getWorker(id, ctx.map.repo) === null) {
    ctx.journal.upsertWorker({ nodeId: id, repo: ctx.map.repo, root: ctx.map.root, status: "running" });
   }
-  ctx.journal.beginGeneration(id, ctx.map.repo);
+  ctx.onGenerationBegun?.(ctx.journal.beginGeneration(id, ctx.map.repo));
   return { ...result(status), repo: ctx.map.repo };
  };
 }
