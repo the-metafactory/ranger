@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { approvalVersion } from "./approval-spec.ts";
 import { parseForgeRef } from "./forge-ref.ts";
 import type { BriefAudit, FrontierEntry } from "./graph.ts";
 import type { WalkMode } from "./config.ts";
@@ -69,6 +70,7 @@ export interface ClassifiedNode {
   typed: boolean;
   url: string;
   checkpointId?: string;
+  approvalVersion?: string;
   route: RouteClass;
   /** Auto node declaring command/url probes — the class-5 signal. */
   registryBlocked: boolean;
@@ -294,6 +296,7 @@ function classifyRoute(
     typed,
     url: node.url,
     checkpointId: node.node.checkpointId,
+    approvalVersion: approvalVersion(node.node, node.body),
     registryBlocked: false,
     body: node.body,
   };

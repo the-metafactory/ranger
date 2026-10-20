@@ -180,7 +180,7 @@ describe("node #301 — scheduled jobs", () => {
    delete process.env.RANGER_DISCORD_TOKEN;
   }
   const call = s.calls[0];
-  expect([call.bin, ...call.args]).toEqual(["claude", "-p", "--output-format", "stream-json", "--verbose", "/daily-short"]);
+  expect([call.bin, ...call.args]).toEqual(["claude", "-p", "--model", "claude-sonnet-5-5", "--output-format", "stream-json", "--verbose", "/daily-short"]);
   expect(call.opts).toMatchObject({ cwd: "/tmp", timeoutMs: 90 * 60_000, processGroup: true });
   expect(call.opts.nice).toBeUndefined();
   expect(call.opts.env?.RANGER_DISCORD_TOKEN).toBeUndefined();

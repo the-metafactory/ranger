@@ -242,7 +242,7 @@ function gateInput(map: RangerMapConfig, pr: ChangeRequest, ci: CiVerdict, last?
   expectedBase: map.base,
   verdictSha: last?.sha ?? null,
   verdictBlockers: last?.blockers ?? null,
-  verdictMajors: last?.majors ?? null,
+  verdictMajors: last === undefined ? null : last.majors - (last.settled ?? 0),
   probesRequired: map.commands.probe !== undefined,
   probePassedSha: probe?.sha ?? null,
  };
@@ -693,7 +693,8 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    await park(row, mergeGateFailedOutcome(gate), title);
    return;
   }
-  if (!ciPark && row.mergeMessageId !== null) return; // card already up — announce once
+  const carded = !ciPark && row.mergeMessageId !== null;
+  if (carded && !map.autoMerge) return;
 
   // Auto-merge (principal, 2026-10-03): on a map that opts in, ranger
   // squash-merges the gate-passed PR itself, pinned to the gated head, unless
@@ -723,7 +724,10 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    if (row.mergeMessageId !== null) return; // its card is still up
   }
   const rebaseHold = unseenRebaseHold(rebases[0], gate.headSha);
-  if (map.autoMerge && !needsEye && superseded === null && rebaseHold === null) {
+  const settled = last !== undefined && (last.settled ?? 0) > 0
+   ? `sage round ${last.round} settled ${last.settled} major(s) outside what the head added since the last clean round; they are listed on ${cr}, not filed`
+   : null;
+  if (map.autoMerge && !needsEye && superseded === null && settled === null && rebaseHold === null) {
    const merge = await autoMerge({ row, pr, headSha: gate.headSha, cardTitle: title, rebases, ...(rebasePr === undefined ? {} : { rebasePr }) });
    if (merge === null) return;
    // A merge the forge did not squash is still a merge: record it and close,
@@ -758,6 +762,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    }
    return;
   }
+  if (carded) return;
 
   const content = renderCard({
    emoji: "🔀",
@@ -766,9 +771,12 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    title,
    meta: [`map: ${mapKey(map)}`],
    lines: [
-    `Gate passed at \`${gate.headSha.slice(0, 8)}\`: CI green, mergeable, base \`${map.base}\`, sage ${last?.round ?? "?"} round(s), the last with 0 blockers and 0 majors (machine evidence, not a sign-off).`,
+    `Gate passed at \`${gate.headSha.slice(0, 8)}\`: CI green, mergeable, base \`${map.base}\`, sage ${last?.round ?? "?"} round(s), the last with ${settled === null ? "0 blockers and 0 majors" : "no blocker or major that gates"} (machine evidence, not a sign-off).`,
     ...(superseded !== null
      ? [`Note: ${superseded}; the reviewer may have missed it, check before you merge.${map.autoMerge ? " Auto-merge is held on this head for that reason." : ""}`]
+     : []),
+    ...(settled !== null
+     ? [`Note: ${settled}. Read them before you merge; ask for a follow-up only if one is worth it.${map.autoMerge ? " Auto-merge is held on this head for that reason." : ""}`]
      : []),
     ...(rebaseHold !== null
      ? [`Note: ${rebaseHold}. Confirm the moved head is ranger's rebase before you merge.${map.autoMerge ? " Auto-merge is held for that reason." : ""}`]
@@ -804,7 +812,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    );
   }
   journal.updateWorker(row.nodeId, repo, { mergeMessageId: messageId });
-  journal.recordEvent("merge-card", { nodeId: row.nodeId, repo, detail: `${cr}, message ${messageId}${superseded !== null ? `; ${superseded}` : ""}${rebaseHold !== null ? `; ${rebaseHold}` : ""}` });
+  journal.recordEvent("merge-card", { nodeId: row.nodeId, repo, detail: `${cr}, message ${messageId}${superseded !== null ? `; ${superseded}` : ""}${settled !== null ? `; ${settled}` : ""}${rebaseHold !== null ? `; ${rebaseHold}` : ""}` });
   result.cards.push(row.nodeId);
  }
 }

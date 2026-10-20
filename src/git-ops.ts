@@ -162,6 +162,7 @@ export function assertNamedRefs(args: string[]): void {
  if (verb === "clone" || (verb === "worktree" && rest[0] === "add")) return;
  const positional = rest.filter((a) => !a.startsWith("-"));
  if ((verb === "fetch" || verb === "push") && positional.length >= 2) return;
+ if (verb === "lfs" && positional[0] === "push" && positional.length >= 3) return;
  throw new GitSafetyError(
   `refusing a credentialed \`git ${args.join(" ")}\`: it must name its remote and refs, never fall back to a branch's upstream`,
  );
@@ -960,9 +961,44 @@ export async function assertNoClosingKeywords(
  if (hit !== null) throw new GitSafetyError(`${closingKeywordRefusal(forge, "a commit message", hit)}. Refusing to push.`);
 }
 
+const GIT_GREP_NO_MATCH = 1;
+
+async function treeDeclaresLfs(worktree: string, source: string): Promise<boolean> {
+ const found = await safeGit(
+  ["grep", "-q", "-F", "filter=lfs", source, "--", ":(glob)**/.gitattributes"],
+  { cwd: worktree },
+ );
+ if (found.code !== 0 && found.code !== GIT_GREP_NO_MATCH) {
+  throw new GitSafetyError(`LFS check of ${source} failed: ${found.stderr.trim()}`);
+ }
+ return found.code === 0;
+}
+
+async function refuseLfsConfig(worktree: string, source: string): Promise<void> {
+ const committed = [":.lfsconfig", "HEAD:.lfsconfig", `${source}:.lfsconfig`];
+ const found = existsSync(join(worktree, ".lfsconfig"))
+  ? [".lfsconfig"]
+  : (
+    await Promise.all(
+     committed.map(async (spec) => ((await safeGit(["cat-file", "-e", spec], { cwd: worktree })).code === 0 ? spec : null)),
+    )
+   ).filter((spec) => spec !== null);
+ if (found.length > 0) {
+  throw new GitSafetyError(
+   `refusing the LFS push of ${source}: a .lfsconfig (${found.join(", ")}) can set the LFS endpoint the credential goes to, and the git state hash never covers it`,
+  );
+ }
+}
+
 /**
  * The vetted push: the supervisor's single credentialed write of exactly
  * `branch`, from an untampered checkout. Returns the state it vetted.
+ *
+ * Every git call runs with hooks off, git-lfs's `pre-push` hook included,
+ * so a branch that commits LFS files uploads their objects here, with the
+ * same credential and checks, before the branch itself: a branch pushed
+ * without them carries pointers to files origin never received
+ * (2026-10-19, seelite #1037).
  */
 export async function vettedPush(opts: {
  worktree: string;
@@ -975,8 +1011,20 @@ export async function vettedPush(opts: {
 }): Promise<GitState> {
  assertCredential(opts.credential, `the push of ${opts.branch}`);
  const vetted = await assertGitUntouched(opts.canonical, opts.configSnapshot);
+ const source = opts.source ?? "HEAD";
+ await assertCheckoutOf(opts.worktree, opts.canonical);
+ if (await treeDeclaresLfs(opts.worktree, source)) {
+  await refuseLfsConfig(opts.worktree, source);
+  const lfs = await safeGit(
+   ["lfs", "push", "origin", source],
+   { cwd: opts.worktree, credential: opts.credential, canonical: opts.canonical, timeoutMs: 600_000 },
+  );
+  if (lfs.code !== 0) {
+   throw new GitSafetyError(`LFS push of ${opts.branch} failed: ${lfs.stderr.trim()}`);
+  }
+ }
  const push = await safeGit(
-  ["push", "--no-verify", "origin", `${opts.source ?? "HEAD"}:refs/heads/${opts.branch}`],
+  ["push", "--no-verify", "origin", `${source}:refs/heads/${opts.branch}`],
   { cwd: opts.worktree, credential: opts.credential, canonical: opts.canonical, timeoutMs: 120_000 },
  );
  if (push.code !== 0) {
@@ -1082,6 +1130,35 @@ export async function isAncestor(cwd: string, ancestor: string, descendant: stri
 }
 
 const SHA_RE = /^[0-9a-f]{7,64}$/;
+
+/**
+ * The lines `head` adds since `from` in each of `paths` (ranger#357): the
+ * surface a review after a clean round may gate on. Each path is asked for by
+ * name and only hunk headers are read, so no path is parsed out of git's
+ * quoted, tab-terminated diff headers. Null when `from` is not an ancestor of
+ * `head` (a force-push rewrote what the clean round read) or git fails, so
+ * the caller gates as before.
+ */
+export async function linesAddedSince(cwd: string, from: string, head: string, paths: readonly string[]): Promise<Map<string, Set<number>> | null> {
+ try {
+  if (!SHA_RE.test(from) || !SHA_RE.test(head) || !(await isAncestor(cwd, from, head))) return null;
+  const added = new Map<string, Set<number>>();
+  for (const path of new Set(paths)) {
+   const r = await safeGit(["--literal-pathspecs", "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", "--unified=0", from, head, "--", path], { cwd, timeoutMs: 30_000 });
+   if (r.code !== 0) return null;
+   const lines = new Set<number>();
+   for (const hunk of r.stdout.matchAll(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/gm)) {
+    const start = Number(hunk[1]);
+    const count = hunk[2] ? Number(hunk[2]) : 1;
+    for (let n = start; n < start + count; n++) lines.add(n);
+   }
+   added.set(path, lines);
+  }
+  return added;
+ } catch {
+  return null;
+ }
+}
 
 /**
  * Prove an unchanged PR patch across base-only merges on the first-parent

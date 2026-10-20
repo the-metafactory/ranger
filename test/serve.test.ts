@@ -417,6 +417,13 @@ describe("#37 — the state the dashboard shows", () => {
   expect(map.next.reason).toMatch(/not walked/);
  });
 
+ test("execution approval is offered for typed task/build nodes, keeping interactive and untyped nodes gated", () => {
+  const nodes = [entry("91", "task", "approve"), entry("92", "build", "approve"), entry("93", "prototype", "approve"), { ...entry("94", "build", "approve"), typed: false }];
+  const state = assembleState(inputs({ reports: new Map([[walked.key, report(nodes)]]) }));
+  expect(state.maps[0].decisions.map((d) => [d.id, d.approvable])).toEqual([["91", true], ["92", true], ["93", false], ["94", false]]);
+  expect(state.maps[0].decisions[0].approvalVersion).toMatch(/^[a-f0-9]{64}$/);
+ });
+
  test("the current job carries its title and map; a dead pid reads stale", () => {
   const live = assembleState(inputs({ workers: [worker({})] })).current;
   expect(live).toHaveLength(1);
@@ -431,6 +438,12 @@ describe("#37 — the state the dashboard shows", () => {
    inputs({ workers: [worker({ status: "awaiting-merge", pid: null })] }),
   ).current[0];
   expect(merging.stale).toBe(false);
+ });
+
+ test("ranger#357: a job past sage round 4 is flagged suspicious, round 4 is not", () => {
+  const at = (reviewRound: number) => assembleState(inputs({ workers: [worker({ reviewRound })] })).current[0];
+  expect(at(4).suspicious).toBe(false);
+  expect(at(5).suspicious).toBe(true);
  });
 });
 

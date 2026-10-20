@@ -564,7 +564,7 @@ async function askClaude<T>(
 // ---- corrections (node #241, ruling D13) ----
 
 /** The spec fields a correction may change. */
-const CORRECTABLE = ["title", "parent", "checkpoint", "kind", "autonomy"] as const;
+const CORRECTABLE = ["title", "parent", "checkpoint", "kind", "autonomy", "probes"] as const;
 type Correctable = (typeof CORRECTABLE)[number];
 
 /** A corrected spec and the card's account of the correction. */
@@ -591,13 +591,55 @@ export function previousSpec(row: IntakeDraftRow): DraftSpec {
 
 /** The fields whose value differs between two specs, in card order. */
 function changedFields(prev: DraftSpec, next: DraftSpec): Correctable[] {
-  return CORRECTABLE.filter((field) => prev[field] !== next[field]);
+  return CORRECTABLE.filter((field) =>
+    field === "probes" ? JSON.stringify(prev.probes ?? []) !== JSON.stringify(next.probes ?? []) : prev[field] !== next[field],
+  );
 }
 
 /** A value the principal wrote, quoted for a card line: one line, short, no backticks. */
 function quoted(value: string): string {
   return `"${oneLine(value.replace(/`/g, ""), 40)}"`;
 }
+
+/** The autonomies a principal-intake node may be filed with: ranger-filed nodes are propose-minimum (#9). */
+const FILABLE_AUTONOMY = ["propose", "approve"] as const;
+
+function filableAutonomy(autonomy: string): autonomy is (typeof FILABLE_AUTONOMY)[number] {
+  return (FILABLE_AUTONOMY as readonly string[]).includes(autonomy);
+}
+
+interface NamedField<T> {
+  parse(value: string, prev: DraftSpec, subtree: readonly SubtreeNode[]): T | undefined;
+  expected: string;
+  kept(prev: DraftSpec): string;
+}
+
+const NAMED_FIELDS = {
+  parent: {
+    parse(value, prev, subtree) {
+      const id = /^#?(\d+)$/.exec(value);
+      const parent = id === null ? undefined : Number(id[1]);
+      return parent !== undefined && (parent === prev.parent || subtree.some((node) => node.id === parent)) ? parent : undefined;
+    },
+    expected: "is not an open node of this map",
+    kept: (prev) => `#${prev.parent}`,
+  } satisfies NamedField<number>,
+  kind: {
+    parse: (value) => (DRAFT_KINDS as readonly string[]).includes(value.toLowerCase()) ? value.toLowerCase() : undefined,
+    expected: `is not one of ${DRAFT_KINDS.join(", ")}`,
+    kept: (prev) => prev.kind ?? "no kind",
+  } satisfies NamedField<string>,
+  autonomy: {
+    parse: (value) => (filableAutonomy(value.toLowerCase()) ? value.toLowerCase() : undefined),
+    expected: `is not ${FILABLE_AUTONOMY.join(" or ")}`,
+    kept: (prev) => prev.autonomy,
+  } satisfies NamedField<string>,
+  checkpoint: {
+    parse: (value) => (value.length <= CHECKPOINT_MAX && CHECKPOINT_SLUG.test(value.toLowerCase()) ? value.toLowerCase() : undefined),
+    expected: "is not a slug",
+    kept: (prev) => prev.checkpoint,
+  } satisfies NamedField<string>,
+};
 
 /**
  * The deterministic correction (D13's fallback): read `title: <text>` (the
@@ -631,35 +673,12 @@ export function deterministicCorrection(
 
   for (const match of text.matchAll(/\b(parent|kind|autonomy|checkpoint)\b[ \t]*[:=]?[ \t]*([^\s,;]*)/gi)) {
     named = true;
-    const field = match[1]!.toLowerCase() as "parent" | "kind" | "autonomy" | "checkpoint";
+    const field = match[1]!.toLowerCase() as keyof typeof NAMED_FIELDS;
     const value = match[2]!.replace(/[.!?]+$/, "");
-    switch (field) {
-      case "parent": {
-        const id = /^#?(\d+)$/.exec(value);
-        const parent = id === null ? undefined : Number(id[1]);
-        if (parent !== undefined && (parent === prev.parent || subtree.some((node) => node.id === parent))) spec.parent = parent;
-        else notUnderstood.push(`parent ${quoted(value)} is not an open node of this map — kept #${prev.parent}`);
-        break;
-      }
-      case "kind": {
-        const kind = value.toLowerCase();
-        if ((DRAFT_KINDS as readonly string[]).includes(kind)) spec.kind = kind;
-        else notUnderstood.push(`kind ${quoted(value)} is not one of ${DRAFT_KINDS.join(", ")} — kept ${prev.kind ?? "no kind"}`);
-        break;
-      }
-      case "autonomy": {
-        const autonomy = value.toLowerCase();
-        if (filableAutonomy(autonomy)) spec.autonomy = autonomy;
-        else notUnderstood.push(`autonomy ${quoted(value)} is not ${FILABLE_AUTONOMY.join(" or ")} — kept ${prev.autonomy}`);
-        break;
-      }
-      case "checkpoint": {
-        const checkpoint = value.toLowerCase();
-        if (checkpoint.length <= CHECKPOINT_MAX && CHECKPOINT_SLUG.test(checkpoint)) spec.checkpoint = checkpoint;
-        else notUnderstood.push(`checkpoint ${quoted(value)} is not a slug — kept ${prev.checkpoint}`);
-        break;
-      }
-    }
+    const rule = NAMED_FIELDS[field];
+    const parsed = rule.parse(value, prev, subtree);
+    if (parsed === undefined) notUnderstood.push(`${field} ${quoted(value)} ${rule.expected} — kept ${rule.kept(prev)}`);
+    else Object.assign(spec, { [field]: parsed });
   }
   if (!named) {
     notUnderstood.push("no field named (parent #N, kind <k>, autonomy <a>, title: <text>, checkpoint <slug>) — kept the previous spec");
@@ -727,7 +746,7 @@ export function parseClaudeCorrection(
  * previous spec's unless claude rewrote it.
  */
 export async function buildCorrection(
-  args: Omit<DraftArgs, "content"> & { content: string; prev: DraftSpec },
+  args: DraftArgs & { prev: DraftSpec },
 ): Promise<CorrectedSpec & { appliedBy: string; fallback?: string }> {
   const { content, botUserId, map, journal, prev } = args;
   const subtree = openSubtree(journal, map);
@@ -1271,13 +1290,6 @@ export function markedNode(issues: readonly LabeledIssue[], messageId: string, m
     throw new EscalateError(`nodes ${hits.map((n) => `#${n}`).join(", ")} all carry ${marker} — one draft filed twice; nothing more is filed`);
   }
   return hits.length === 0 ? null : String(hits[0]);
-}
-
-/** The autonomies a principal-intake node may be filed with: ranger-filed nodes are propose-minimum (#9). */
-const FILABLE_AUTONOMY = ["propose", "approve"] as const;
-
-function filableAutonomy(autonomy: string): autonomy is (typeof FILABLE_AUTONOMY)[number] {
-  return (FILABLE_AUTONOMY as readonly string[]).includes(autonomy);
 }
 
 /**

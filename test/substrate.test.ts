@@ -31,7 +31,6 @@ import {
  describeReadings,
  isEligible,
  selectForBuild,
- isPiReviewTurn,
  selectForReview,
  type SubstrateConfig,
 } from "../src/substrate-policy.ts";
@@ -501,36 +500,22 @@ describe("selectForReview — cross-model selection", () => {
   ).toBe("claude");
  });
 
- test("nothing eligible → Pi", () => {
+ test("nothing eligible → wait for a capable reviewer", () => {
   const noneEligible = [
    reading("claude", { readAt: fresh, fiveHourUsedPct: 80 }),
    reading("codex", { readAt: fresh, fiveHourUsedPct: 80 }),
   ];
   expect(
    selectForReview({ readings: noneEligible, now, config: DEFAULT_CONFIG }, "claude"),
-  ).toBe("pi");
+  ).toBeNull();
  });
 
  test("a near-reset Claude reading becomes eligible for review", () => {
   const early = reading("claude", { readAt: fresh, fiveHourUsedPct: null, sevenDayUsedPct: 85,
    sevenDayResetsAt: new Date(now.getTime() + 6 * 24 * 3_600_000).toISOString() });
   const near = { ...early, sevenDayResetsAt: new Date(now.getTime() + 5 * 3_600_000).toISOString() };
-  expect(selectForReview({ readings: [early], now, config: DEFAULT_CONFIG }, "codex")).toBe("pi");
+  expect(selectForReview({ readings: [early], now, config: DEFAULT_CONFIG }, "codex")).toBeNull();
   expect(selectForReview({ readings: [near], now, config: DEFAULT_CONFIG }, "codex")).toBe("claude");
- });
-});
-
-describe("isPiReviewTurn — review rotation onto Pi", () => {
- test("every 2 → the even rounds", () => {
-  expect([1, 2, 3, 4, 5, 6].map((round) => isPiReviewTurn(round, 2))).toEqual([false, true, false, true, false, true]);
- });
-
- test("0 → never (Pi stays the fallback only)", () => {
-  expect([1, 2, 3, 4].some((round) => isPiReviewTurn(round, 0))).toBe(false);
- });
-
- test("1 → every round", () => {
-  expect([1, 2, 3].every((round) => isPiReviewTurn(round, 1))).toBe(true);
  });
 });
 
@@ -733,9 +718,9 @@ describe("workerCommandFor", () => {
   join(import.meta.dir, "..", "ranger.example.yaml"),
  ).config;
 
- test("claude: stream-json verbose", () => {
+ test("claude: stream-json verbose, on the pinned Sonnet model", () => {
   const cmd = workerCommandFor("claude", config);
-  expect(cmd).toEqual(["claude", "-p", "--output-format", "stream-json", "--verbose"]);
+  expect(cmd).toEqual(["claude", "-p", "--model", "claude-sonnet-5-5", "--output-format", "stream-json", "--verbose"]);
  });
 
  test("codex: a writable workspace sandbox, plus the common git dir a worktree commits into", () => {
@@ -779,7 +764,7 @@ describe("workerCommandFor", () => {
    expect(cmd).not.toContain("--dangerously-bypass-approvals-and-sandbox");
    expect(workerModelFor("codex", bare)).toEqual({ model: "gpt-6.1-sol", reasoningEffort: "high" });
    expect(describeWorkerModel(workerModelFor("codex", bare)!)).toBe("gpt-6.1-sol, high");
-   expect(workerModelFor("claude", bare)).toBeNull();
+   expect(workerModelFor("claude", bare)).toEqual({ model: "claude-sonnet-5-5" });
   } finally {
    rmSync(dir, { recursive: true, force: true });
   }
@@ -851,7 +836,7 @@ describe("window-less readings never bypass the reserve", () => {
    const readings = journal.listSubstrateReadings();
    expect(readings).toHaveLength(2);
    expect(selectForBuild({ readings, now, config: DEFAULT_CONFIG })).toBe("pi");
-   expect(selectForReview({ readings, now, config: DEFAULT_CONFIG }, "claude")).toBe("pi");
+   expect(selectForReview({ readings, now, config: DEFAULT_CONFIG }, "claude")).toBeNull();
   });
  });
 });
@@ -1161,6 +1146,13 @@ describe("workerOutputFor — reading a run on its substrate's format", () => {
 });
 
 describe("sageReview passes the chosen substrate (sage src/cli/index.ts --substrate)", () => {
+ test("Pi is rejected before a review process starts", async () => {
+  await expect(sageReview("acme/widgets", 7, "ghp_readonly", {
+   command: "/does-not-exist",
+   substrate: "pi",
+  })).rejects.toThrow("Pi cannot run reviews");
+ });
+
  test("argv carries --substrate <name>", async () => {
   const dir = mkdtempSync(join(tmpdir(), "ranger-sage-"));
   const out = join(dir, "argv");
@@ -1172,6 +1164,8 @@ describe("sageReview passes the chosen substrate (sage src/cli/index.ts --substr
   );
   process.env.SAGE_ARGV_OUT = out;
   try {
+   await sageReview("acme/widgets", 7, "ghp_readonly", { command: fake, substrate: "claude" });
+   expect(readFileSync(out, "utf8").trim().split("\n").slice(-2)).toEqual(["--substrate", "claude"]);
    const verdict = await sageReview("acme/widgets", 7, "ghp_readonly", { command: fake, substrate: "codex" });
    expect(verdict.verdict).toBe("approved");
    expect(readFileSync(out, "utf8").trim().split("\n")).toEqual([

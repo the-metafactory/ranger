@@ -20,7 +20,7 @@ function config(over: Partial<RangerConfig> = {}): RangerConfig {
   budget: { graphqlFloor: 1000, rateLimitCooldownMin: 10, frontierMaxAgeMin: 60 },
   ratify: { readsPerTick: 10 },
   intake: { model: "haiku" },
-  substrates: { fiveHourMaxUsedPct: 70, sevenDayMaxUsedPct: 80, claudeProbeMaxAgeMin: 15, codexReadMaxAgeMin: 5, codex: { model: "gpt-6.1-sol", reasoningEffort: "high" }, pi: { provider: "spark", model: "longctx-think", reviewEvery: 0 } },
+  substrates: { fiveHourMaxUsedPct: 70, sevenDayMaxUsedPct: 80, claudeProbeMaxAgeMin: 15, codexReadMaxAgeMin: 5, claude: { model: "claude-sonnet-5-5" }, codex: { model: "gpt-6.1-sol", reasoningEffort: "high" }, pi: { provider: "spark", model: "longctx-think", reviewEvery: 0 } },
   ...over,
  };
 }

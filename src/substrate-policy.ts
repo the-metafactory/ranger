@@ -10,7 +10,7 @@ import type { SubstrateName } from "./store/schema.ts";
 
 export const STRONG_SUBSTRATES: SubstrateName[] = ["claude", "codex"];
 
-export type SubstrateConfig = Omit<RangerConfig["substrates"], "pi" | "codex">;
+export type SubstrateConfig = Omit<RangerConfig["substrates"], "claude" | "pi" | "codex">;
 
 export interface SelectionInput {
  readings: SubstrateReading[];
@@ -114,25 +114,9 @@ export function selectForBuild(input: SelectionInput): SubstrateName {
  return eligibleStrong(input)[0]?.name ?? "pi";
 }
 
-/**
- * Sage review: an eligible substrate other than the head's author
- * (Claude-written → Codex and vice versa); a Pi-written head gets the
- * strongest eligible. No other substrate eligible → the author's substrate
- * if eligible, else Pi. Cross-model is preferred, not guaranteed: a Pi-written
- * head reviewed when both strong substrates are out runs on Pi too.
- */
-export function selectForReview(input: SelectionInput, authorSubstrate: SubstrateName): SubstrateName {
+export function selectForReview(input: SelectionInput, authorSubstrate: SubstrateName): SubstrateName | null {
  const eligible = eligibleStrong(input);
- return (
-  eligible.find((e) => e.name !== authorSubstrate)?.name ??
-  eligible.find((e) => e.name === authorSubstrate)?.name ??
-  "pi"
- );
-}
-
-/** A review round that runs on Pi by rotation (substrates.pi.reviewEvery), not by quota. */
-export function isPiReviewTurn(round: number, every: number): boolean {
- return every > 0 && round % every === 0;
+ return eligible.find((e) => e.name !== authorSubstrate)?.name ?? eligible.find((e) => e.name === authorSubstrate)?.name ?? null;
 }
 
 /** One line per reading for journal events: what a selection was made on. */

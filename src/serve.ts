@@ -4,6 +4,7 @@ import type { CiVerdict, ForgeReadPort } from "./forge.ts";
 import { gitlabIssueEndpoint, gitlabLoginCiVerdict, GitLabReadPort, parseGitLabIssue } from "./gitlab.ts";
 import { parseGlabResponse } from "./glab-transport.ts";
 import { lastImplementMaps, mapKey, implementMapOrder, readDrains } from "./maps.ts";
+import { SUSPICIOUS_REVIEW_ROUND } from "./review-round.ts";
 /**
  * `ranger serve` (#37) — a local dashboard of the walk: the job a worker is on
  * now, the next node a tick would take, every node ranger can take on its own,
@@ -95,6 +96,8 @@ import {
  uncheckedNeedsEye,
 } from "./serve-parked.ts";
 import { runDrainAction } from "./serve-drain.ts";
+import { runApproveAction } from "./serve-approve.ts";
+import { executableApproval } from "./approval-spec.ts";
 import { workerLogFile } from "./worker-log.ts";
 
 export { childEnv };
@@ -261,6 +264,7 @@ export interface CurrentJob {
  /** "PR #N" on GitHub, "MR !N" on GitLab (node #132). */
  prLabel: string | null;
  reviewRound: number;
+ suspicious: boolean;
  startedAt: string | null;
  pid: number | null;
  /** A claimed/running row whose process is gone: stale until `sweep` runs. */
@@ -293,6 +297,8 @@ export interface GrillingView extends NodeView {
 /** A frontier node escalated to the principal that is not a grilling: an approve task, a decision, a prototype. */
 export interface DecisionView extends NodeView {
  autonomy: string;
+ approvalVersion?: string;
+ approvable?: boolean;
  /** Why ranger does not take it. */
  reason: string;
  /** A `propose` node is the principal's to work: "Start session" opens one, as on a grilling. */
@@ -539,6 +545,7 @@ export function assembleState(inputs: StateInputs): DashboardState {
    prNumber: w.prNumber,
    prLabel: w.prNumber === null ? null : changeRequestLabel(w.repo, w.prNumber),
    reviewRound: w.reviewRound,
+   suspicious: w.reviewRound > SUSPICIOUS_REVIEW_ROUND,
    startedAt: w.startedAt,
    pid: w.pid,
    stale:
@@ -611,7 +618,10 @@ export function assembleState(inputs: StateInputs): DashboardState {
       : map.localCheckout !== undefined
        ? undefined
        : (map.checkoutRefused ?? `no localCheckout for ${map.repo} in ranger.yaml`);
-    return [{ ...view(n), autonomy: n.autonomy, reason, launchable: why === undefined, why }];
+    return [{ ...view(n), autonomy: n.autonomy, reason, launchable: why === undefined, why,
+     approvalVersion: n.approvalVersion,
+     approvable: !map.servedOnly && map.walk === "full" && executableApproval(n),
+    }];
    }),
   };
  });
@@ -769,6 +779,7 @@ export interface HandlerContext {
  port: number;
  token: string;
  getState: () => DashboardState;
+ onForeignMigration?: (error: ForeignMigrationError) => void;
  refresh: () => void;
  launch: (argv: string[], env: Record<string, string>) => void;
  /**
@@ -881,6 +892,15 @@ export function createHandler(ctx: HandlerContext): (req: Request) => Promise<Re
    return json(202, { refreshing: true });
   }
   const action = ACTION_PATHS[url.pathname];
+  if (url.pathname === "/api/approve") {
+   if (ctx.actions === undefined) return refuse(501, "actions are not wired in this server");
+   const body = await readObject(req);
+   if (body === null) return refuse(400, "body is not a JSON object");
+   const result = await runApproveAction(body, { maps: ctx.getState().maps, configPath: ctx.actions.configPath,
+    rangerBin: ctx.actions.rangerBin, run: ctx.actions.run, env: ctx.actions.env ?? process.env, inFlight });
+   if (result.status === 200 && body.dryRun !== true) ctx.refresh();
+   return json(result.status, result.body);
+  }
   if (action !== undefined) {
    if (ctx.actions === undefined) return refuse(501, "actions are not wired in this server");
    const body = await readObject(req);
@@ -978,7 +998,10 @@ export function createHandler(ctx: HandlerContext): (req: Request) => Promise<Re
   try {
    return await handle(req);
   } catch (error) {
-   if (error instanceof ForeignMigrationError) return refuse(503, error.message);
+   if (error instanceof ForeignMigrationError) {
+    ctx.onForeignMigration?.(error);
+    return refuse(503, error.message);
+   }
    throw error;
   }
  };
@@ -1125,8 +1148,9 @@ function jobTime(iso) {
 function jobTags(j) {
  if (j.stale) return [tag("stale: process gone", "stale")];
  const substrate = { claude: "Claude", codex: "Codex", pi: "Pi" }[j.substrate] || "unknown";
- const parts = [j.resourceLane || j.lane, j.status, j.phase, "substrate: " + substrate, j.prLabel || "", j.reviewRound ? "round " + j.reviewRound : ""];
- return [...new Set(parts.filter(Boolean))].map((p) => tag(p));
+ const parts = [j.resourceLane || j.lane, j.status, j.phase, "substrate: " + substrate, j.prLabel || "", j.reviewRound && !j.suspicious ? "round " + j.reviewRound : ""];
+ const pills = [...new Set(parts.filter(Boolean))].map((p) => tag(p));
+ return j.suspicious ? [...pills, tag("round " + j.reviewRound + ": suspicious", "stale")] : pills;
 }
 function renderCurrent(s) {
  const box = document.getElementById("current"); box.replaceChildren();
@@ -1254,17 +1278,29 @@ function grillButton(m, g) {
   catch (e) { say("Could not start #" + g.id + ": " + e.message, true); }
  });
 }
+const approvedNodes = new Map();
 function renderGrill(s) {
  const box = document.getElementById("grill"); box.replaceChildren();
  box.append(...byRepo("grill", s.maps, (m) => m.repo, (m) => {
-  const decisions = m.decisions || [];
+  const decisions = (m.decisions || []).filter((d) => approvedNodes.get(m.key + "/" + d.id) !== d.approvalVersion || !d.approvalVersion);
   const n = m.grillings.length + decisions.length;
   const body = n === 0 ? unavailable(m, "None open.")
    : el("ul", {},
     ...m.grillings.map((g) => el("li", {}, el("span", { class: "id", text: "#" + g.id }), el("span", { class: "t" }, link(g.url, g.title)), tags(tag("grilling"), grillButton(m, g)))),
-    ...decisions.map((d) => el("li", {}, el("span", { class: "id", text: "#" + d.id }), el("span", { class: "t" }, link(d.url, d.title), el("span", { class: "reason", text: d.reason })), tags(tag((d.kind || "no kind") + " · " + (d.autonomy || "no autonomy")), d.autonomy === "propose" ? grillButton(m, d) : null))));
+    ...decisions.map((d) => el("li", {}, el("span", { class: "id", text: "#" + d.id }), el("span", { class: "t" }, link(d.url, d.title), el("span", { class: "reason", text: d.reason })), tags(tag((d.kind || "no kind") + " · " + (d.autonomy || "no autonomy")), d.approvable ? approveButton(m, d) : null, d.autonomy === "propose" ? grillButton(m, d) : null))));
   return mapGroup("grill", m, m.servedOnly ? " (shown only)" : "", mapCount(m, n), mapMeta(m), body);
  }));
+}
+function approveButton(m, d) {
+ return actionButton("Approve", "Allow Ranger to work on #" + d.id + " through its normal review and merge gates", true, async () => {
+  if (!confirm("Approve #" + d.id + " for Ranger to work on?\\n\\n" + d.title + "\\n\\nDependencies, checks and review gates still apply.")) return;
+  try {
+   const r = await post("/api/approve", { key: m.key, id: d.id, version: d.approvalVersion });
+   if (r.ok) approvedNodes.set(m.key + "/" + d.id, d.approvalVersion);
+   say(r.ok ? "Approved #" + d.id + ". Ranger can pick it up on its next tick." : "Approval failed: " + (r.stderr || "check the node and try again"), !r.ok);
+  } catch (e) { say("Approval refused: " + e.message, true); }
+  load();
+ });
 }
 const short = (sha) => (sha || "").slice(0, 8);
 function prLifecycle(v) {
@@ -2218,13 +2254,23 @@ export function startServe(opts: {
  open?: boolean;
  /** The environment the read-only tokens are read from (tests pass their own). */
  env?: NodeJS.ProcessEnv;
+ log?: (line: string) => void;
+ exit?: (code: number) => void;
 }): { url: string; stop: () => void } {
  const serve = serveConfig(opts.config);
  const port = opts.port ?? serve.port;
  const token = randomBytes(24).toString("hex");
- // A journal migrated by code this ranger isn't running stops serve at launch
- // with that error, rather than a dashboard that half-works (node #66).
- Journal.openReadOnly(expandHome(opts.config.state.journalPath), opts.config.maps)?.close();
+ const log = opts.log ?? ((line: string) => process.stderr.write(`${line}\n`));
+ const exit = opts.exit ?? ((code: number) => process.exit(code));
+ let startedBehindJournal = false;
+ try {
+  Journal.openReadOnly(expandHome(opts.config.state.journalPath), opts.config.maps)?.close();
+ } catch (error) {
+  if (!(error instanceof ForeignMigrationError)) throw error;
+  startedBehindJournal = true;
+  log(`ranger serve: ${error.message}\nranger serve: staying up to show this on the page.`);
+ }
+ let stopping = false;
  const maps = servedMaps(opts.config);
  assertReadOnlyTokens(opts.config, maps, opts.env);
  const reader = new ServeReader(
@@ -2245,6 +2291,12 @@ export function startServe(opts: {
    return state;
   },
   refresh: () => reader.refresh(),
+  onForeignMigration: (error) => {
+   if (startedBehindJournal || stopping) return;
+   stopping = true;
+   log(`ranger serve: ${error.message}\nranger serve: exiting so launchd restarts it on the code now on disk.`);
+   exit(1);
+  },
   launch: spawnLaunch,
   verifyGrilling: (map, nodeId, kind) => verifyGrillingLive(opts.config, map, nodeId, kind),
   buildNow: {

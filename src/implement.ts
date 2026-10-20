@@ -20,6 +20,7 @@ import {
  commitsAhead,
  dirtyFiles,
  commitsBehind,
+ linesAddedSince,
  fastForwardCanonical,
  fetchBranch,
  findClosingKeyword,
@@ -59,13 +60,14 @@ import {
 import { GRAPH_CALL_TIMEOUT_MS, graphNode, somaRepo, type NodeResult } from "./graph.ts";
 import { finishClosedElsewhere } from "./closed-elsewhere.ts";
 import { budgetedRead, budgetPolicy } from "./budget.ts";
-import { GraphAddUnattached, graphAdd, graphClose, graphDecisions, graphLink, type AddSpec, type CloseResult } from "./graph-write.ts";
+import { GraphAddUnattached, closeTimeoutMs, graphAdd, graphClose, graphDecisions, graphLink, type AddSpec, type CloseResult } from "./graph-write.ts";
 import { FixNodeLockBusy, withFixNodeLock } from "./fix-node-lock.ts";
 import { assertFilable, codeCommentSpec, foundByProbeSpec, landminesInDiff, scribeFile, splitOutOfReviewSpec, type Provenance, type ScribeGraph } from "./scribe.ts";
 import { FencedError, type ImplementPhase, type Journal } from "./journal.ts";
 import { assembleImplementPrompt } from "./prompt.ts";
 import { BLOCKED_REPORT_FILE, blockerNoteBranch, discardBlockedReport, readBlockedReport, type BlockedReport } from "./blocked-report.ts";
 import { ReviewError, sageReview, type ReviewVerdict } from "./review.ts";
+import { SUSPICIOUS_REVIEW_ROUND } from "./review-round.ts";
 import {
  confirmCap,
  hookStopReason,
@@ -75,7 +77,7 @@ import {
  type SubstrateName,
  type SubstrateReaders,
 } from "./substrate.ts";
-import { isPiReviewTurn, selectForReview } from "./substrate-policy.ts";
+import { selectForReview } from "./substrate-policy.ts";
 import { failedSessionOutcome, recordSession } from "./substrate-usage.ts";
 import { workerEnv } from "./worker-env.ts";
 import type { CommitAuthor } from "./identity.ts";
@@ -113,7 +115,7 @@ export type Reviewer = (
  repo: string,
  prNumber: number,
  readOnlyToken: string,
- opts?: { substrate?: SubstrateName; nice?: number; reviewAuthor?: string },
+ opts: { substrate: SubstrateName; nice?: number; reviewAuthor?: string },
 ) => Promise<ReviewVerdict>;
 
 export type WorkerRun = (prompt: string, opts: RunOptions) => Promise<RunResult>;
@@ -252,9 +254,10 @@ async function assertRemotePush(ctx: ImplementContext, sha: string): Promise<voi
 }
 
 /** The review-round marker ranger writes into each review comment it posts. */
-export function reviewMarker(round: number, v: Pick<ReviewVerdict, "commitId" | "blockers" | "majors" | "nits">, substrate?: string, carried?: string): string {
+export function reviewMarker(round: number, v: Pick<ReviewVerdict, "commitId" | "blockers" | "majors" | "nits"> & { settled?: number }, substrate?: string, carried?: string): string {
  const base = `<!-- ranger:review round=${round} sha=${v.commitId} blockers=${v.blockers} majors=${v.majors} nits=${v.nits}`;
- return `${base}${carried === undefined ? "" : ` carried=${carried}`}${substrate === undefined ? "" : ` substrate=${substrate}`} -->`;
+ const settled = v.settled === undefined || v.settled === 0 ? "" : ` settled=${v.settled}`;
+ return `${base}${settled}${carried === undefined ? "" : ` carried=${carried}`}${substrate === undefined ? "" : ` substrate=${substrate}`} -->`;
 }
 
 export interface RecordedReview {
@@ -263,6 +266,7 @@ export interface RecordedReview {
  blockers: number;
  majors: number;
  nits: number;
+ settled?: number;
  /** The substrate the review ran on (node #45); undefined for old markers. */
  substrate?: string;
  carried?: string;
@@ -294,14 +298,17 @@ export function recordedReviews(
   }));
   const carried = fields.get("carried");
   const substrate = fields.get("substrate");
+  const settled = fields.get("settled");
   if (carried !== undefined && !/^[0-9a-f]{7,64}$/.test(carried)) continue;
   if (substrate !== undefined && !/^\w+$/.test(substrate)) continue;
+  if (settled !== undefined && (!/^\d+$/.test(settled) || Number(settled) > Number(m[4]))) continue;
   out.push({
    round: Number(m[1]),
    sha: m[2],
    blockers: Number(m[3]),
    majors: Number(m[4]),
    nits: Number(m[5]),
+   ...(settled === undefined ? {} : { settled: Number(settled) }),
    carried,
    substrate,
    body: c.body.replace(MARKER, "").trim(),
@@ -406,9 +413,37 @@ export function supersededNote<R extends GatedReview>(reviews: R[], sha: string)
 export { parseFailedProbes };
 export { NEEDS_EYE_LABEL } from "./labels.ts";
 
-/** The findings that gate a PR: blockers and majors (principal, 2026-10-03). */
-export function gatingFindings(r: { blockers: number; majors: number }): number {
- return r.blockers + r.majors;
+/**
+ * The findings that gate a PR: blockers and majors (principal, 2026-10-03),
+ * less the majors a review after a clean round found outside its delta
+ * (ranger#357).
+ */
+export function gatingFindings(r: { blockers: number; majors: number; settled?: number }): number {
+ return r.blockers + r.majors - (r.settled ?? 0);
+}
+
+const FINDING_HEAD = /^- \*\*\[(blocker|important)\]\*\* `([^`\n]+):(\d+)` — /gm;
+
+/** The paths a review's blocker and important findings name, for linesAddedSince (ranger#357). */
+export function findingPaths(body: string): string[] {
+ return [...new Set([...body.matchAll(FINDING_HEAD)].map((f) => f[2]))];
+}
+
+/**
+ * How many of a round's majors to settle (ranger#357): all of them when every
+ * blocker-or-important finding in the review sits off the lines the head
+ * added since the last clean round, else none. A round with a blocker, or
+ * with fewer important findings in its text than majors in its count, settles
+ * nothing: no finding is set aside that ranger cannot place, and neither
+ * does a finding whose path `added` does not cover.
+ */
+export function settledMajors(review: { blockers: number; majors: number; body: string }, added: ReadonlyMap<string, ReadonlySet<number>>): number {
+ if (review.blockers > 0 || review.majors === 0) return 0;
+ const findings = [...review.body.matchAll(FINDING_HEAD)];
+ if (findings.some((f) => f[1] === "blocker")) return 0;
+ if (findings.length < review.majors) return 0;
+ const inDelta = findings.some((f) => added.get(f[2])?.has(Number(f[3])) !== false);
+ return inDelta ? 0 : review.majors;
 }
 
 export interface RecordedProbe {
@@ -1033,7 +1068,12 @@ export async function scribeAfterMerge(
   }
  };
  const filings: ScribeFilings = {};
- if (final !== undefined && leftWork(final) > 0) {
+ if (final !== undefined && (final.settled ?? 0) > 0) {
+  journal.recordEvent("filed", {
+   nodeId, repo: map.repo,
+   detail: `left round ${final.round}'s ${final.settled} settled major(s) on ${changeRequestLabel(map.repo, pr.iid)} (${change.url}), not filed (outside what the head added since the last clean round)`.slice(0, 400),
+  });
+ } else if (final !== undefined && leftWork(final) > 0) {
   filings.review = await file("split-out-of-review", "the last review's findings", () => splitOutOfReviewSpec(map.repo, spawning, change, final));
  } else if (final !== undefined && final.nits > 0) {
   filings.review = { proseLeft: final.nits };
@@ -1681,7 +1721,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
    }
    const round = rounds + 1;
    fence("review");
-   const { substrate: reviewSubstrate, chosenOn } = await selectReviewSubstrate(ctx, live.headSha, round);
+   const { substrate: reviewSubstrate, chosenOn } = await selectReviewSubstrate(ctx, live.headSha);
    // The sage round is a substrate session (node #56): its row opens under
    // the generation fence once selection has settled (selection awaits, and
    // the generation can move meanwhile), and ends with the cap confirmation,
@@ -1724,11 +1764,15 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
      `sage reviewed ${verdict.commitId.slice(0, 8)} but ${changeRequestLabel(repo, open.iid)}'s head is ${live.headSha.slice(0, 8)} — the head moved during review`,
     );
    }
+   const clean = reviews.filter((r) => gatingFindings(r) === 0 && r.sha !== verdict.commitId).at(-1);
+   const added = clean === undefined ? null : await linesAddedSince(worktree, clean.sha, verdict.commitId, findingPaths(verdict.body));
+   const settled = added === null ? 0 : settledMajors(verdict, added);
+   const anchor = settled > 0 && clean !== undefined ? { round: clean.round, sha: clean.sha } : undefined;
    fence("post review");
    await github.postComment(
     repo,
     open.iid,
-    reviewComment(round, verdict, reviewSubstrate),
+    reviewComment(round, verdict, reviewSubstrate, { settled, anchor }),
     token,
    );
    current = {
@@ -1737,6 +1781,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
     blockers: verdict.blockers,
     majors: verdict.majors,
     nits: verdict.nits,
+    ...(settled > 0 ? { settled } : {}),
     substrate: reviewSubstrate,
     body: verdict.body,
    };
@@ -1746,6 +1791,20 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
     repo,
     detail: `round ${round} @ ${verdict.commitId.slice(0, 8)}: ${verdict.verdict}, ${verdict.blockers} blocker(s), ${verdict.majors} major(s)${chosenOn}`,
    });
+   if (anchor !== undefined) {
+    journal.recordEvent("reviewed", {
+     nodeId,
+     repo,
+     detail: `round ${round} @ ${verdict.commitId.slice(0, 8)}: ${settled} major(s) sit outside what the head added since the clean round ${anchor.round} at ${anchor.sha.slice(0, 8)}: settled, listed on the merge card, not filed`,
+    });
+   }
+   if (round > SUSPICIOUS_REVIEW_ROUND) {
+    journal.recordEvent("reviewed", {
+     nodeId,
+     repo,
+     detail: `round ${round} > ${SUSPICIOUS_REVIEW_ROUND}: suspicious, the review is not converging`,
+    });
+   }
   }
   journal.updateWorker(nodeId, ctx.map.repo, {
    reviewRound: current.round,
@@ -1766,7 +1825,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
   // Blockers AND majors gate (principal, 2026-10-03): each is reworked and
   // re-reviewed. Suggestions and nits do not gate.
   if (gatingFindings(current) === 0) {
-   if (leftWork(current) > 0) {
+   if (leftWork(current) > 0 && (current.settled ?? 0) === 0) {
     const finished = await finishPass(live.headSha, current);
     if (finished === "again") continue;
     if (finished !== "merge") return finished;
@@ -2330,29 +2389,22 @@ interface PassResult {
  unchanged?: boolean;
 }
 
-/**
- * Cross-model review selection (node #45): prefer a substrate other than the
- * one that wrote the head; an unrecorded head counts as Pi's. Substrates
- * capped earlier in this run are left out, so a review never re-picks one
- * whose capped-until has lapsed meanwhile. A round whose number is a multiple
- * of substrates.pi.reviewEvery runs on Pi by rotation, whatever the quota.
- */
 async function selectReviewSubstrate(
  ctx: ImplementContext,
  headSha: string,
- round: number,
 ): Promise<{ substrate: SubstrateName; chosenOn: string }> {
  const author = ctx.journal.headSubstrate(ctx.map.repo, headSha) ?? "pi";
- const every = ctx.config.substrates.pi.reviewEvery;
- const rotation = isPiReviewTurn(round, every);
  const { substrate, chosenOn } = await selectSubstrate(ctx.journal, {
   config: ctx.config.substrates,
   excluded: ctx.excludedSubstrates ?? new Set<SubstrateName>(),
   readers: ctx.substrateReaders,
-  pick: (input) => (rotation ? "pi" : selectForReview(input, author)),
+  pick: (input) => selectForReview(input, author),
  });
- const why = rotation ? `Pi rotation (pi.reviewEvery ${every}); ` : "";
- return { substrate, chosenOn: ` on ${substrate} (head by ${author}; ${why}${chosenOn})` };
+ if (substrate === null) {
+  ctx.journal.updateWorker(ctx.node.ref.id, ctx.map.repo, { phase: "awaiting-review" });
+  throw new ParkSignal(`Review waiting for Claude or Codex quota; Pi cannot run reviews (${chosenOn})`);
+ }
+ return { substrate, chosenOn: ` on ${substrate} (head by ${author}; ${chosenOn})` };
 }
 
 /** Which substrate wrote a pushed SHA: the review of that head reads it back. */
@@ -2741,9 +2793,10 @@ async function closeAfterMerge(
    ...(ctx.ratify === "auto" ? { ci: `${success.runId}@${pr.headSha}` } : {}),
    evidence,
   },
-  { cwd: ctx.canonical, timeoutMs: GRAPH_CALL_TIMEOUT_MS },
+  { cwd: ctx.canonical, timeoutMs: closeTimeoutMs(node.node.probes) },
  );
  if (!close.closed) {
+  if (close.timedOut === true) throw new ParkSignal(`close after merge: ${close.detail}`);
   // A forge read inside the close that got no answer says nothing about the
   // node: thrown plain, failNode leaves the row for the sweep to respawn,
   // uncounted, and the respawn's first read finds the node closed if the
@@ -2814,8 +2867,22 @@ async function awaitHead(
 /** GitHub caps a comment at 65 536 characters; the marker always survives, first. */
 const COMMENT_BUDGET = 60_000;
 
-function reviewComment(round: number, verdict: ReviewVerdict, substrate?: SubstrateName): string {
- const head = `${reviewMarker(round, verdict, substrate)}\n**Sage review — round ${round}** (offline, machine evidence; not a human sign-off)\n\n`;
+function reviewComment(
+ round: number,
+ verdict: ReviewVerdict,
+ substrate?: SubstrateName,
+ opts: { settled?: number; anchor?: { round: number; sha: string } } = {},
+): string {
+ const settled = opts.settled ?? 0;
+ const notes = [
+  settled > 0 && opts.anchor !== undefined
+   ? `**Settled:** ${settled} major(s) sit outside what the head added since the clean round ${opts.anchor.round} at \`${opts.anchor.sha.slice(0, 8)}\`. They do not gate this change and are not filed; the merge card names them.`
+   : "",
+  round > SUSPICIOUS_REVIEW_ROUND
+   ? `**Suspicious:** round ${round} is past ${SUSPICIOUS_REVIEW_ROUND}; the review is not converging.`
+   : "",
+ ].filter(Boolean);
+ const head = `${reviewMarker(round, { ...verdict, settled }, substrate)}\n**Sage review — round ${round}** (offline, machine evidence; not a human sign-off)\n\n${notes.map((n) => `${n}\n\n`).join("")}`;
  const room = COMMENT_BUDGET - head.length;
  const body =
   verdict.body.length <= room

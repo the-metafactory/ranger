@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- ranger serve: the local dashboard, kept alive (node #348). Runs the
+         token-injecting wrapper (~/bin/ranger), so serve gets the same
+         environment the tick does (read-only tokens from the keychain).
+         When the journal is migrated past the code serve started with (the
+         tick applies a migration after main moves), serve logs why and exits
+         non-zero; KeepAlive restarts it on the code now on disk. A serve
+         that starts on a journal already past its code stays up and shows the
+         refusal on the page, so this does not crash-loop.
+         Activation:
+           launchctl unload ...; launchctl load ... -->
+    <key>Label</key>
+    <string>ch.invisible.ranger-serve</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/__USER__/bin/ranger</string>
+        <string>serve</string>
+        <string>--config</string>
+        <string>/Users/__USER__/.config/ranger/ranger.yaml</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>StandardOutPath</key>
+    <string>/Users/__USER__/.config/ranger/logs/serve.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/__USER__/.config/ranger/logs/serve.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/__USER__/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>/Users/__USER__</string>
+    </dict>
+</dict>
+</plist>

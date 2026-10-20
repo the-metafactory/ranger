@@ -1,15 +1,3 @@
-/**
- * Substrate selection (node #45): route implement sessions, fix passes and
- * sage reviews across Claude, Codex and Pi by remaining 5h/7d quota.
- *
- * Strong substrates (Claude, Codex) are eligible while their reading is
- * fresh, reports at least one window, and every window's used% is under its
- * effective threshold. Once neither is eligible (over threshold, stale or
- * failed read, no windows, or capped), Pi is the fallback. Review selection
- * prefers a substrate other than the one that wrote the PR head; when no
- * other substrate is eligible the review runs on the author's own
- * (best-effort independence, not a guarantee).
- */
 import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -454,13 +442,13 @@ export interface WorkerModel {
 }
 
 /**
- * The model ranger pins for a substrate's worker sessions: Codex and Pi from
- * `substrates` in ranger's config. Null for Claude, which ranger does not pin.
+ * The model ranger pins for a substrate's worker sessions, from `substrates`
+ * in ranger's config.
  */
 export function workerModelFor(substrate: SubstrateName, config: RangerConfig): WorkerModel | null {
  switch (substrate) {
   case "claude":
-   return null;
+   return { model: config.substrates.claude.model };
   case "codex":
    return { model: config.substrates.codex.model, reasoningEffort: config.substrates.codex.reasoningEffort };
   case "pi":
@@ -492,7 +480,7 @@ export function workerCommandFor(
 ): string[] {
  switch (substrate) {
   case "claude":
-   return ["claude", "-p", "--output-format", "stream-json", "--verbose"];
+   return ["claude", "-p", "--model", config.substrates.claude.model, "--output-format", "stream-json", "--verbose"];
   case "codex":
    return [
     "codex",
@@ -595,15 +583,15 @@ export async function freshReadings(
  * and pick with `pick` (selectForBuild, or selectForReview for a head).
  * `chosenOn` describes every reading the choice was made on.
  */
-export async function selectSubstrate(
+export async function selectSubstrate<T extends SubstrateName | null>(
  journal: Journal,
  opts: {
   config: SubstrateConfig;
   excluded: ReadonlySet<SubstrateName>;
   readers: SubstrateReaders | undefined;
-  pick: (input: SelectionInput) => SubstrateName;
+  pick: (input: SelectionInput) => T;
  },
-): Promise<{ substrate: SubstrateName; chosenOn: string }> {
+): Promise<{ substrate: T; chosenOn: string }> {
  const { config, excluded, readers, pick } = opts;
  const now = new Date();
  const readings = await freshReadings(journal, config, now, readers);

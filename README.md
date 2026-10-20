@@ -118,6 +118,17 @@ timed out or never started may already have applied, so reload the page to see.
 Plain and immediate operator resumes retain the hand-driven mode where a row
 is claimed without spawning; this mode cannot successfully start a queued resume.
 
+`ranger serve` runs under launchd (node #348): copy
+`ops/launchd/ch.invisible.ranger-serve.plist.example` to
+`~/Library/LaunchAgents/ch.invisible.ranger-serve.plist`, replace `__USER__`
+and load it. It runs `~/bin/ranger serve`, so it has the tick's environment,
+logs to `~/.config/ranger/logs/serve.log`, and is kept alive. When the tick
+migrates the journal past the code serve started with, the next state read
+logs the refusal and exits 1, and launchd restarts serve on the code now on
+disk. A serve that *starts* on a journal already past its code stays up and
+shows the refusal on the page instead (an exit would crash-loop); fix the
+checkout or the journal (`docs/journal-repair.md`) and restart it.
+
 Parked infrastructure probe failures automatically requeue on the next `walk`
 when their lane is free, oldest first across maps. They take priority over
 crash respawns, merge-desk send-backs and fresh implement claims. The running

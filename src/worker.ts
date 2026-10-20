@@ -31,7 +31,7 @@ import {
  tamperOutcome,
  trustFreshClone,
 } from "./git-trust.ts";
-import { graphClose, graphDecisions, graphPropose, type CloseResult, type ProposeResult } from "./graph-write.ts";
+import { closeTimeoutMs, graphClose, graphDecisions, graphPropose, type CloseResult, type ProposeResult } from "./graph-write.ts";
 import {
  implementBranchFor,
  runImplement,
@@ -1140,7 +1140,7 @@ async function runResearch(
    checkpointId: node.node.checkpointId,
    ci: evidence.ci,
   },
-  { cwd: probeCwd, timeoutMs: GRAPH_CALL_TIMEOUT_MS },
+  { cwd: probeCwd, timeoutMs: closeTimeoutMs(node.node.probes) },
  );
 
  if (close.closed) {
@@ -1185,20 +1185,17 @@ async function runResearch(
   };
  }
 
- journal.recordEvent("refused", {
-  nodeId,
-  repo,
-  detail: close.detail.slice(0, 400),
- });
- countFailure(config, journal, repo);
+ return parkResearchClose(ctx, nodeId, close, 0);
+}
+
+function parkResearchClose(ctx: RunNodeContext, nodeId: string, close: CloseResult, workerExit: number | null): RunNodeOutcome {
+ const { config, journal, map } = ctx;
+ const repo = map.repo;
+ const status = close.timedOut === true ? "parked" : "refused";
+ journal.recordEvent(status, { nodeId, repo, detail: close.detail.slice(0, 400) });
+ if (status === "refused") countFailure(config, journal, repo);
  finish(journal, nodeId, repo, "parked", close.detail);
- return {
-  ...base,
-  status: "refused",
-  detail: close.detail,
-  workerExit: 0,
-  close,
- };
+ return { nodeId, repo, status, detail: close.detail, workerExit, close };
 }
 
 /**
@@ -1225,12 +1222,9 @@ async function closeRatified(
  const close = await graphClose(repo, nodeId, botIdentity, token, {
   proposalComment: commentId,
   checkpointId: node.node.checkpointId,
- }, { cwd: canonical, timeoutMs: GRAPH_CALL_TIMEOUT_MS });
+ }, { cwd: canonical, timeoutMs: closeTimeoutMs(node.node.probes) });
  if (!close.closed) {
-  journal.recordEvent("refused", { nodeId, repo, detail: close.detail.slice(0, 400) });
-  countFailure(config, journal, repo);
-  finish(journal, nodeId, repo, "parked", close.detail);
-  return { ...base, status: "refused", detail: close.detail, close };
+  return parkResearchClose(ctx, nodeId, close, null);
  }
  journal.recordEvent("closed", { nodeId, repo, detail: `ratified proposal comment ${commentId}: ${close.detail}`.slice(0, 400) });
  try {
