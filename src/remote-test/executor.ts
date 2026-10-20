@@ -341,12 +341,13 @@ async function executeAdmittedRemoteTest(
   const result = await launcher(["--remote=false", "start", "--attach", containerId], { signal: controller.signal, timeoutMs: Math.max(1, end - now()) + 5000, onLog: captureLog });
   if (result.logsAvailable) outputState = "captured";
   const state = JSON.parse(await command(["inspect", containerId]))[0]?.State;
+  const exited = state?.Status === "exited" || state?.Status === "stopped";
   if (state?.OOMKilled === true) { status = "infra_failed"; exitCode = Number.isInteger(state.ExitCode) && state.ExitCode >= 0 && state.ExitCode <= 255 ? state.ExitCode : null; }
-  else if (!result.stdout.trim() && state?.Status === "exited" && state.ExitCode === 137 && now() - startedAt >= runtimeSeconds * 1000) { status = "timed_out"; }
+  else if (!result.stdout.trim() && exited && state.ExitCode === 137 && now() - startedAt >= runtimeSeconds * 1000) { status = "timed_out"; }
   else {
    const terminal = z.object({ status: z.enum(["passed", "test_failed", "infra_failed"]), exitCode: z.number().int().min(0).max(255).nullable(), resources: ResourceObservationSchema.optional(), coverage: z.object({ requiredSkippedTests: z.number().int().nonnegative().safe().nullable() }).strict().optional() }).strict().parse(JSON.parse(result.stdout.trim()));
    if (terminal.status === "passed" && terminal.exitCode !== 0 || terminal.status === "test_failed" && (terminal.exitCode === null || terminal.exitCode === 0)) throw new Error("Inconsistent test outcome");
-   if (state?.Status !== "exited" || state.ExitCode !== (terminal.exitCode ?? 125) || result.code !== state.ExitCode) throw new Error("Incomplete terminal result");
+   if (!exited || state.ExitCode !== (terminal.exitCode ?? 125) || result.code !== state.ExitCode) throw new Error("Incomplete terminal result");
    status = terminal.status; exitCode = terminal.exitCode;
    if (terminal.resources) resources = terminal.resources;
    if (coverage) {
