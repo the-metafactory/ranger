@@ -24,7 +24,7 @@ import type { IssueComment, ChangeRequest, CiVerdict, ForgePort, MergeOutcome, R
 import { parseForgeRef } from "./forge-ref.ts";
 import { squashMessage as gitlabSquashMessage } from "./gitlab.ts";
 import { lanePort } from "./forge-lanes.ts";
-import { CI_FAILED_PARK_OUTCOME, ciNotSentBackOutcome, mergeGateFailedOutcome } from "./outcomes.ts";
+import { CI_FAILED_PARK_OUTCOME, ciNotSentBackOutcome, closeRefusalHead, mergeGateFailedOutcome } from "./outcomes.ts";
 import { changeRequestLabel, changeRequestNoun, forgeName } from "./forge-text.ts";
 import { closingKeywordRefusal, findClosingKeyword } from "./git-ops.ts";
 import { squashTitle } from "./github.ts";
@@ -289,7 +289,7 @@ export function watchedByMergeDesk(w: WorkerRow): boolean {
  * is still re-run on the next tick.
  */
 export function closeRefused(w: WorkerRow): boolean {
- return (w.status === "parked" || w.status === "failed") && w.phase === "close" && !isTransientGitHubError(w.outcome ?? "");
+ return (w.status === "parked" || w.status === "failed") && w.phase === "close" && !isTransientGitHubError(closeRefusalHead(w.outcome ?? ""));
 }
 
 /** A row the merge desk parked on CI alone, in its awaiting-merge phase (node #104). */
