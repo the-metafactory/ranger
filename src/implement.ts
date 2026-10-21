@@ -56,6 +56,8 @@ import {
  reviewCapHeadMovedOutcome,
  reviewCapOutcome,
  substrateCappedOutcome,
+ closeRefusalHead,
+ closeRefusedOutcome,
 } from "./outcomes.ts";
 import { GRAPH_CALL_TIMEOUT_MS, graphNode, somaRepo, type NodeResult } from "./graph.ts";
 import { finishClosedElsewhere } from "./closed-elsewhere.ts";
@@ -2801,10 +2803,10 @@ async function closeAfterMerge(
   // node: thrown plain, failNode leaves the row for the sweep to respawn,
   // uncounted, and the respawn's first read finds the node closed if the
   // close landed after all.
-  if (isTransientGitHubError(close.detail)) {
+  if (isTransientGitHubError(closeRefusalHead(close.detail))) {
    throw new Error(`close after merge hit a transient forge error: ${close.detail.slice(0, 600)}`);
   }
-  throw new ParkSignal(`close refused after merge: ${close.detail.slice(0, 600)}`);
+  throw new ParkSignal(closeRefusedOutcome(close.detail));
  }
  journal.recordEvent("closed", { nodeId, repo, detail: close.detail.slice(0, 400) });
 
@@ -3617,8 +3619,17 @@ async function freshCheckoutTests(
   if (base.code !== 0 || copied.stdout.trim() !== tip) {
    return failed(`could not copy ${baseRef} at ${tip.slice(0, 8)} into the checkout ${forRun}: ${base.stderr.trim() || copied.stderr.trim() || "the ref did not resolve"}`);
   }
-  const checkout = await git(["-c", "advice.detachedHead=false", "checkout", "--quiet", "--detach", sha], dir, 120_000);
-  if (checkout.code !== 0) return failed(`could not check out ${sha.slice(0, 8)} ${forRun}: ${checkout.stderr.trim()}`);
+  const canonicalLfsStore = await git(["rev-parse", "--path-format=absolute", "--git-common-dir"], ctx.canonical, 10_000);
+  if (canonicalLfsStore.code !== 0) return failed(`could not find the canonical's git dir ${forRun}: ${canonicalLfsStore.stderr.trim()}`);
+  const checkout = await git(
+   ["-c", "advice.detachedHead=false", "-c", `lfs.url=file://${canonicalLfsStore.stdout.trim()}`, "checkout", "--quiet", "--detach", sha],
+   dir,
+   120_000,
+  );
+  if (checkout.code !== 0) {
+   const why = checkout.timedOut === true ? "timed out after 120 s" : checkout.stderr.trim();
+   return failed(`could not check out ${sha.slice(0, 8)} ${forRun}: ${why}`);
+  }
   if (ctx.map.commands.install !== undefined) {
    const install = await runShell(ctx.map.commands.install, dir, ctx, { label: `${label}: install in a fresh checkout`, timeoutMs: INSTALL_TIMEOUT_MS });
    if (install.code !== 0) return { ran: false, result: { ...install, stderr: `install ${forRun} failed\n${install.stderr}` } };

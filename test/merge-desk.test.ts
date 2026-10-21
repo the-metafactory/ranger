@@ -537,6 +537,7 @@ describe("a refused close is not re-run by the desk (2026-10-13: soma #795 and #
  for (const [why, outcome, rerun] of [
   ["a probe outside the probe tree", "close refused after merge: Close refused.\n\n4 of 6 declared probe(s) name a path outside the probe tree.", false],
   ["a probe that ran and failed", "close refused after merge: probe command:bun test|/repo|900|0 on node 796 ran and failed", false],
+  ["a failed probe whose output names a network error", "close refused after merge: probe command:bun test|/repo|900|0 on node 796 ran and failed: exit 1: (fail) gh: error connecting to api.github.com", false],
   ["gh's network error", "close refused after merge: gh api GET repos/acme/seelite/issues/96 failed (exit 1): error connecting to api.github.com", true],
  ] as const) {
   test(`${why}: ${rerun ? "re-run on the merge" : "stays parked, its PR not even read"}`, async () => {

@@ -360,3 +360,23 @@ export function hostLoadOutcome(r: HostLoadReading & { what: string; names: stri
 }
 
 export const HOST_LOAD_OUTCOME = /^waiting for a quiet host: load [\d.]+ on \d+ cores/;
+
+const PROBE_RAN_AND_FAILED = " ran and failed: ";
+
+/**
+ * A close the graph refused after the merge. Soma names the failed probe,
+ * then its bounded output tail; the head and the end of that tail are kept,
+ * since a test run states its failures last (2026-10-21: soma #1002 parked
+ * twice on "ran and failed" with nothing to diagnose).
+ */
+export function closeRefusedOutcome(detail: string): string {
+ const head = closeRefusalHead(detail);
+ const observed = detail.slice(head.length);
+ return `close refused after merge: ${head.slice(0, 600)}${observed.length > 600 ? `: …${observed.slice(-600)}` : observed}`;
+}
+
+/** The refusal without the failed probe's output, which is the command's text, not soma's. */
+export function closeRefusalHead(text: string): string {
+ const at = text.indexOf(PROBE_RAN_AND_FAILED);
+ return at === -1 ? text : text.slice(0, at + PROBE_RAN_AND_FAILED.length - 2);
+}
