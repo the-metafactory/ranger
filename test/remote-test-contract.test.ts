@@ -127,6 +127,18 @@ describe("profile manifest boundary", () => {
 });
 
 describe("terminal receipt attribution and exact identity", () => {
+ test("reads receipts with numeric, absent or unavailable resource peaks and legacy receipts without evidence", () => {
+  expect(validateRemoteTestReceipt(receipt(), job())).toEqual(receipt());
+  for (const resources of [
+   { state: "observed", cpuTimeMicros: 100, peakMemoryBytes: null },
+   { state: "observed", cpuTimeMicros: 100, peakMemoryBytes: 4096 },
+   { state: "unavailable", cpuTimeMicros: null, peakMemoryBytes: null },
+  ] as const) {
+   const value: RemoteTestReceipt = { ...receipt(), evidence: { startedAt: receipt().completedAt - 1, durationMs: 1, resources,
+    output: { state: "unavailable", truncated: false, artifact: null } } };
+   expect(validateRemoteTestReceipt(value, job())).toEqual(value);
+  }
+ });
  test("accepts a matching complete receipt", () => {
   expect(receiptMatchesJob(receipt(), job())).toBe(true);
   expect(validateRemoteTestReceipt(receipt(), job())).toEqual(receipt());
