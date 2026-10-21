@@ -64,7 +64,7 @@ export const ResourceObservationSchema = z.object({
  state: z.enum(["observed", "unavailable", "skipped"]),
  cpuTimeMicros: z.number().int().nonnegative().safe().nullable(),
  peakMemoryBytes: z.number().int().nonnegative().safe().nullable(),
-}).strict().refine(r => r.state === "observed" ? r.cpuTimeMicros !== null && r.peakMemoryBytes !== null : r.cpuTimeMicros === null && r.peakMemoryBytes === null);
+}).strict().refine(r => r.state === "observed" ? r.cpuTimeMicros !== null : r.cpuTimeMicros === null && r.peakMemoryBytes === null);
 export type ResourceObservation = z.infer<typeof ResourceObservationSchema>;
 const EvidenceSchema = z.object({
  startedAt: TimestampSchema,

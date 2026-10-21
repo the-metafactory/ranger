@@ -91,9 +91,15 @@ try {
 result.resources = {state:ran ? "unavailable" : "skipped",cpuTimeMicros:null,peakMemoryBytes:null};
 if (ran) try {
  const cpu = (await fs.readFile("/sys/fs/cgroup/cpu.stat","utf8")).match(/^usage_usec\\s+(\\d+)$/m);
- const peak = Number((await fs.readFile("/sys/fs/cgroup/memory.peak","utf8")).trim());
+ const interfaces = await fs.readdir("/sys/fs/cgroup/");
+ let peak = null;
+ if (interfaces.includes("memory.peak")) {
+  const value = (await fs.readFile("/sys/fs/cgroup/memory.peak","utf8")).trim();
+  if (!/^[0-9]+$/.test(value)) throw Error("Invalid peak memory");
+  peak = Number(value);
+ }
  const micros = cpu ? Number(cpu[1]) : NaN;
- if (Number.isSafeInteger(micros) && micros >= 0 && Number.isSafeInteger(peak) && peak >= 0) result.resources = {state:"observed",cpuTimeMicros:micros,peakMemoryBytes:peak};
+ if (Number.isSafeInteger(micros) && micros >= 0 && (peak === null || Number.isSafeInteger(peak) && peak >= 0)) result.resources = {state:"observed",cpuTimeMicros:micros,peakMemoryBytes:peak};
 } catch {}
 console.log(JSON.stringify(result));
 process.exit(result.exitCode ?? 125);`;
@@ -367,8 +373,9 @@ async function executeAdmittedRemoteTest(
    const oom = Number(metrics.match(/^oom_kill\s+(\d+)$/m)?.[1]);
    if (!Number.isSafeInteger(cpu) || cpu < 0 || !Number.isSafeInteger(oom) || oom !== 0 ||
     peakValue === undefined || (peak !== null && (!Number.isSafeInteger(peak) || peak < 0))) throw Error("Sidecar metrics invalid or OOM");
-   if (resources.state === "observed" && peak !== null) {
-    resources = ResourceObservationSchema.parse({ state: "observed", cpuTimeMicros: resources.cpuTimeMicros! + cpu, peakMemoryBytes: resources.peakMemoryBytes! + peak });
+   if (resources.state === "observed") {
+    resources = ResourceObservationSchema.parse({ state: "observed", cpuTimeMicros: resources.cpuTimeMicros! + cpu,
+     peakMemoryBytes: resources.peakMemoryBytes === null || peak === null ? null : resources.peakMemoryBytes + peak });
    } else resources = { state: "unavailable", cpuTimeMicros: null, peakMemoryBytes: null };
   }
  } catch {

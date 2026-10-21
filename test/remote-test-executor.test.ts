@@ -446,8 +446,38 @@ for (const outcome of [0, 1]) test(`reviewed exit ${outcome} survives absent sid
   ? {code:0,stdout:"usage_usec 10\nranger_peak unavailable\noom_kill 0\n"} : f.launcher(argv,options);
  const receipt = await f.execute({launcher});
  expect(receipt.status).toBe(outcome ? "test_failed" : "passed");
- expect(receipt.evidence!.resources).toEqual({state:"unavailable",cpuTimeMicros:null,peakMemoryBytes:null});
+ expect(receipt.evidence!.resources).toEqual({state:"observed",cpuTimeMicros:133,peakMemoryBytes:null});
  expect(f.calls.filter(c=>c[1]==="rm")).toHaveLength(2);
+});
+for (const testPeak of [null, 456]) for (const sidecarPeak of [null, 512]) test(`reviewed receipt aggregates CPU with test peak ${testPeak} and sidecar peak ${sidecarPeak}`, async () => {
+ const f = await fixture(true);
+ const launcher: ExecutorLauncher = async (argv, options) => {
+  if (argv[1] === "exec") return { code: 0, stdout: `usage_usec 10\nranger_peak ${sidecarPeak ?? "unavailable"}\noom_kill 0\n` };
+  const result = await f.launcher(argv, options);
+  if (argv[1] === "start" && argv.includes("--attach")) {
+   const terminal = JSON.parse(result.stdout); terminal.resources.peakMemoryBytes = testPeak;
+   return { ...result, stdout: JSON.stringify(terminal) };
+  }
+  return result;
+ };
+ const receipt = await f.execute({ launcher });
+ expect(receipt.status).toBe("passed");
+ expect(receipt.evidence!.resources).toEqual({ state: "observed", cpuTimeMicros: 133, peakMemoryBytes: testPeak === null || sidecarPeak === null ? null : testPeak + sidecarPeak });
+ expect(JSON.parse(await readFile(join(f.config.jobsRoot, ".artifacts", id, "receipt.json"), "utf8"))).toEqual(receipt);
+});
+test("sidecar CPU cannot turn unavailable test resources into observed resources", async () => {
+ const f = await fixture(true);
+ const launcher: ExecutorLauncher = async (argv, options) => {
+  const result = await f.launcher(argv, options);
+  if (argv[1] === "start" && argv.includes("--attach")) {
+   const terminal = JSON.parse(result.stdout); terminal.resources = { state: "unavailable", cpuTimeMicros: null, peakMemoryBytes: null };
+   return { ...result, stdout: JSON.stringify(terminal) };
+  }
+  return result;
+ };
+ const receipt = await f.execute({ launcher });
+ expect(receipt.status).toBe("passed");
+ expect(receipt.evidence!.resources).toEqual({ state: "unavailable", cpuTimeMicros: null, peakMemoryBytes: null });
 });
 for (const [name, metrics] of Object.entries({
  unsafePeak:"usage_usec 10\nranger_peak 9007199254740992\noom_kill 0",
