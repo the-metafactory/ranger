@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { stat } from "node:fs/promises";
 import { admitOfferedDispatch, type Offering } from "@the-metafactory/cortex/bus";
 import { validateEnvelope, type MyelinEnvelope } from "@the-metafactory/myelin";
 import { taskSubjectAndType } from "@the-metafactory/myelin/subjects";
@@ -8,7 +9,7 @@ import { sha256Reference, validateRemoteTestJob, type ProfileManifest } from "./
 
 export const BUS_TEST_CAPABILITY = "ci-test";
 
-type AdmissionStage = "envelope" | "alignment" | "request" | "authentication" | "authorization" | "profile" | "policy" | "expiry";
+type AdmissionStage = "config" | "envelope" | "alignment" | "request" | "authentication" | "authorization" | "profile" | "policy" | "expiry";
 type AdmissionCode = "too_large" | "malformed" | "invalid" | "mismatch" | "unverified" | "denied" | "expired";
 export interface BusAdmissionSummary { readonly stage: AdmissionStage; readonly code: AdmissionCode }
 
@@ -37,6 +38,37 @@ export interface AdmittedBusRequest {
  }>;
 }
 
+const registries = new WeakMap<BusAdmissionContext, { file: string; revision: string; registry: ReturnType<typeof loadRegistry> }>();
+
+async function configuredRegistry(context: BusAdmissionContext, file: string) {
+ try {
+  const metadata = await stat(file, { bigint: true });
+  const revision = [metadata.dev, metadata.ino, metadata.size, metadata.mtimeNs, metadata.ctimeNs].join(":");
+  const cached = registries.get(context);
+  if (cached?.file === file && cached.revision === revision) return cached.registry;
+  const registry = loadRegistry(file);
+  registries.set(context, { file, revision, registry });
+  return registry;
+ } catch (error) {
+  registries.delete(context);
+  throw error;
+ }
+}
+
+function assertAligned(envelope: MyelinEnvelope, subject: string, config: BusConfig): void {
+ const expected = taskSubjectAndType(config.routing.principal, BUS_TEST_CAPABILITY, config.routing.stack);
+ const alignment = {
+  subject: subject === expected.subject,
+  type: envelope.type === expected.type,
+  classification: envelope.sovereignty.classification === "local",
+  source: envelope.source.startsWith(`${config.routing.principal}.${config.routing.stack}.`),
+  distribution: envelope.distribution_mode === undefined || envelope.distribution_mode === "offer",
+  target: envelope.target_assistant === undefined,
+  attribution: envelope.originator === undefined || envelope.originator.attribution === "adapter-resolved",
+ };
+ if (!Object.values(alignment).every(Boolean)) throw new BusAdmissionRefusal("alignment", "mismatch");
+}
+
 function parseEnvelope(bytes: Uint8Array): MyelinEnvelope {
  if (!(bytes instanceof Uint8Array)) throw new BusAdmissionRefusal("envelope", "malformed");
  if (bytes.byteLength > BUS_LIMITS.requestBytes) throw new BusAdmissionRefusal("envelope", "too_large");
@@ -49,22 +81,17 @@ function parseEnvelope(bytes: Uint8Array): MyelinEnvelope {
 }
 
 async function admit(input: { bytes: Uint8Array; subject: string }, context: BusAdmissionContext): Promise<AdmittedBusRequest> {
- let stage: AdmissionStage = "envelope";
+ let stage: AdmissionStage = "config";
  try {
-  const envelope = parseEnvelope(input.bytes);
-  const envelopeDigest = sha256Reference(createHash("sha256").update(input.bytes));
   const config = validateBusConfig(context.config);
   const profiles = structuredClone(context.profiles);
   const offerings = structuredClone(context.offerings);
+  stage = "envelope";
+  const envelope = parseEnvelope(input.bytes);
+  const envelopeDigest = sha256Reference(createHash("sha256").update(input.bytes));
   const subject = input.subject;
   stage = "alignment";
-  const expected = taskSubjectAndType(config.routing.principal, BUS_TEST_CAPABILITY, config.routing.stack);
-  if (subject !== expected.subject || envelope.type !== expected.type || envelope.sovereignty.classification !== "local" ||
-   !envelope.source.startsWith(`${config.routing.principal}.${config.routing.stack}.`) ||
-   (envelope.distribution_mode !== undefined && envelope.distribution_mode !== "offer") || envelope.target_assistant !== undefined ||
-   (envelope.originator !== undefined && envelope.originator.attribution !== "adapter-resolved")) {
-   throw new BusAdmissionRefusal(stage, "mismatch");
-  }
+  assertAligned(envelope, subject, config);
   stage = "request";
   const request = validateBusRequest(Buffer.from(JSON.stringify(envelope.payload)));
   if (envelope.correlation_id !== request.job.correlationId ||
@@ -72,7 +99,7 @@ async function admit(input: { bytes: Uint8Array; subject: string }, context: Bus
    throw new BusAdmissionRefusal(stage, "mismatch");
   }
   stage = "authentication";
-  const verified = await verifyEnvelopeIdentity(envelope, loadRegistry(config.registry.file));
+  const verified = await verifyEnvelopeIdentity(envelope, await configuredRegistry(context, config.registry.file));
   if (verified.status !== "verified") throw new BusAdmissionRefusal(stage, "unverified");
   const origin = verified.chain[0]?.principal;
   const chain = getSignedByChain(envelope);
@@ -108,11 +135,16 @@ async function admit(input: { bytes: Uint8Array; subject: string }, context: Bus
  }
 }
 
+function summarizeRefusal(context: BusAdmissionContext, refusal: BusAdmissionRefusal): void {
+ try { context.summary?.(Object.freeze({ stage: refusal.stage, code: refusal.code })); }
+ catch { return; }
+}
+
 export async function admitBusRequest(input: { bytes: Uint8Array; subject: string }, context: BusAdmissionContext): Promise<AdmittedBusRequest> {
  try { return await admit(input, context); }
  catch (error) {
   const refusal = error instanceof BusAdmissionRefusal ? error : new BusAdmissionRefusal("envelope", "invalid");
-  try { context.summary?.(Object.freeze({ stage: refusal.stage, code: refusal.code })); } catch { throw refusal; }
+  summarizeRefusal(context, refusal);
   throw refusal;
  }
 }

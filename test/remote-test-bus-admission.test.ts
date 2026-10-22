@@ -1,5 +1,6 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createHash, generateKeyPairSync, randomBytes, sign } from "node:crypto";
+import * as fs from "node:fs";
 import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -59,6 +60,11 @@ describe("signed private ci-test admission", () => {
  afterEach(() => { rmSync(root, { recursive: true, force: true }); });
 
  const signed = (e = unsigned(), did = issuer) => signEnvelope(e, keys[did].seed, did, { role: "origin" });
+ const restampOrigin = (e: MyelinEnvelope, offsetMs: number) => {
+  e.signed_by![0].at = new Date(Date.now() + offsetMs).toISOString();
+  e.signed_by![0].signature = sign(null, canonicalizeForChainStamp(e, 0), keys[issuer].privateKey).toString("base64");
+  return e;
+ };
  const admit = (e: unknown, subject = route.subject) => admitBusRequest({ bytes: encode(e), subject }, context);
  async function refused(e: unknown, stage: BusAdmissionSummary["stage"], code: BusAdmissionSummary["code"], subject = route.subject) {
   const before = readdirSync(root);
@@ -191,9 +197,65 @@ describe("signed private ci-test admission", () => {
   const r = request(); mutate(r); await refused(await signed(unsigned(r)), stage, "invalid");
  });
 
- test("missing or mismatched operator profile fails closed", async () => {
-  context = { ...context, profiles: [] };
+ for (const [name, profiles] of [
+  ["missing", []],
+  ["different ID", [{ ...profile(), profileId: "other-profile" }]],
+  ["different digest", [{ ...profile(), profileDigest: digest("9") }]],
+ ] as const) test(`${name} operator profile fails closed`, async () => {
+  context = { ...context, profiles };
   await refused(await signed(), "profile", "denied");
+ });
+
+ for (const field of ["config", "profiles", "offerings"] as const) test(`invalid local ${field} is reported as setup failure before envelope parsing`, async () => {
+  context = { ...context, [field]: field === "config" ? {} : [() => "uncloneable private setup"] };
+  await expect(admitBusRequest({ bytes: Buffer.from("{"), subject: route.subject }, context)).rejects.toMatchObject({ stage: "config", code: "invalid" });
+  expect(summaries).toEqual([{ stage: "config", code: "invalid" }]);
+ });
+
+ test("unchanged registry is read only once across admissions sharing a context", async () => {
+  const e = await signed();
+  const reads = spyOn(fs, "readFileSync");
+  try {
+   await admit(e);
+   await admit(e);
+   expect(reads.mock.calls.filter(([path]) => path === context.config.registry.file)).toHaveLength(1);
+  } finally { reads.mockRestore(); }
+ });
+
+ test("registry revocation, failed reload and recovery never fall back to cached permission", async () => {
+  const e = await signed();
+  await admit(e);
+  const original = readFileSync(context.config.registry.file);
+  const rekeyed = original.toString().replace(keys[issuer].identity.public_key, keys[other].identity.public_key);
+  expect(Buffer.byteLength(rekeyed)).toBe(original.byteLength);
+  writeFileSync(context.config.registry.file, rekeyed);
+  await refused(e, "authentication", "unverified"); summaries.length = 0;
+  writeFileSync(context.config.registry.file, JSON.stringify({ version: 2, identities: [keys[relay].identity], trusted_hubs: [] }));
+  await refused(e, "authentication", "unverified");
+  writeFileSync(context.config.registry.file, "private malformed registry"); summaries.length = 0;
+  await refused(e, "authentication", "unverified");
+  rmSync(context.config.registry.file); summaries.length = 0;
+  await expect(admit(e)).rejects.toMatchObject({ stage: "authentication", code: "unverified" });
+  expect(summaries).toEqual([{ stage: "authentication", code: "unverified" }]);
+  writeFileSync(context.config.registry.file, original); summaries.length = 0;
+  expect((await admit(e)).provenance.issuer).toBe(issuer);
+  expect(summaries).toEqual([]);
+ });
+
+ test("a changed configured registry path cannot reuse a cached registry", async () => {
+  const e = await signed();
+  await admit(e);
+  context.config.registry.file = join(root, "another-registry.json");
+  writeFileSync(context.config.registry.file, JSON.stringify({ version: 2, identities: [keys[relay].identity], trusted_hubs: [] }));
+  await refused(e, "authentication", "unverified");
+ });
+
+ test("a cached registry never skips signature verification or freshness", async () => {
+  const e = await signed();
+  await admit(e);
+  (e.payload as unknown as BusRequest).source.bundleBytes++;
+  await refused(e, "authentication", "unverified"); summaries.length = 0;
+  await refused(restampOrigin(await signed(), -301_000), "authentication", "unverified");
  });
 
  test("expired signed jobs are refused at admission", async () => {
@@ -245,20 +307,17 @@ describe("signed private ci-test admission", () => {
  });
 
  test("fresh valid signatures within the existing five-minute window are accepted", async () => {
-  const e = await signed(); e.signed_by![0].at = new Date(Date.now() - 240_000).toISOString();
-  e.signed_by![0].signature = sign(null, canonicalizeForChainStamp(e, 0), keys[issuer].privateKey).toString("base64");
+  const e = restampOrigin(await signed(), -240_000);
   expect((await admit(e)).provenance.issuer).toBe(issuer);
  });
 
  for (const offset of [-301_000, 301_000]) test(`real signatures outside Myelin freshness window (${offset}) refuse`, async () => {
-  const e = await signed(); e.signed_by![0].at = new Date(Date.now() + offset).toISOString();
-  e.signed_by![0].signature = sign(null, canonicalizeForChainStamp(e, 0), keys[issuer].privateKey).toString("base64");
+  const e = restampOrigin(await signed(), offset);
   await refused(e, "authentication", "unverified");
  });
 
  test("fresh final stamp cannot hide an expired origin stamp", async () => {
-  const e = await signed(); e.signed_by![0].at = new Date(Date.now() - 301_000).toISOString();
-  e.signed_by![0].signature = sign(null, canonicalizeForChainStamp(e, 0), keys[issuer].privateKey).toString("base64");
+  const e = restampOrigin(await signed(), -301_000);
   await refused(await signEnvelope(e, keys[relay].seed, relay), "authentication", "unverified");
  });
 

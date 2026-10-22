@@ -284,10 +284,14 @@ describe("existing configuration stays unchanged and the bus shape is inert", ()
   } finally { rmSync(dir, { recursive: true, force: true }); }
  });
 
- test("only the outbox and admission boundaries load the bus contract", () => {
+ test("bus modules remain outside all command paths", () => {
   const root = new URL("../src/", import.meta.url).pathname;
-  const files = readdirSync(root, { recursive: true }).map(String).filter(f => f.endsWith(".ts") && !f.endsWith("bus-contract.ts") && !f.endsWith("bus-outbox.ts") && !f.endsWith("bus-admission.ts"));
+  const files = readdirSync(root, { recursive: true }).map(String).filter(f => f.endsWith(".ts") && !["remote-test/bus-contract.ts", "remote-test/bus-outbox.ts", "remote-test/bus-admission.ts"].includes(f));
   expect(files.length).toBeGreaterThan(10);
-  for (const file of files) expect(readFileSync(join(root, file), "utf8")).not.toContain("bus-contract");
+  for (const file of files) {
+   const source = readFileSync(join(root, file), "utf8");
+   expect(source).not.toContain("bus-contract");
+   expect(source).not.toContain("bus-admission");
+  }
  });
 });

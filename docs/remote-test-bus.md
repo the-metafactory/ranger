@@ -49,8 +49,18 @@ The published Myelin `taskSubjectAndType(principal, "ci-test", stack)` builds th
 
 Myelin validates the envelope schema and verifies every signature in the complete chain against `config.registry.file`, using its existing five-minute freshness window without an override. Unsupported envelope spec versions above 3 refuse. The first stamp must be an Ed25519 signature by the configured issuer itself; a hub attestation of that identity is insufficient. Later valid transit stamps do not change the origin authorized by Ranger. `originator` must be absent or name that issuer with `adapter-resolved` attribution; delegated and federated attribution refuse.
 
+Reuse the operator context across requests to reuse its loaded registry. Each authentication performs an asynchronous file metadata check; a changed path, file identity, size, modification time or change time reloads through Myelin's public loader. A metadata or reload failure discards that context's cache and refuses authentication without using an older registry. Cryptographic verification and signature freshness checks still run on every request.
+
 The origin's explicit permission entry binds repository, profile ID and profile digest. The selected operator profile additionally binds lock, runtime image and platform through `validateRemoteTestJob`. The public `admitOfferedDispatch` evaluator from the pinned Cortex commit receives capability `ci-test`, the operator offerings, local arrival scope and enforced signing posture. Its local admission never substitutes for signature verification or Ranger permission. Agent `trust[]` supplies no capability permission. Expired jobs refuse before admission returns.
 
 Success returns a detached, frozen `request` and frozen `provenance`: origin issuer/actor, envelope ID, SHA-256 of the exact received envelope bytes, subject, source, authentication time and each verified stamp's identity/method/time. No registry keys or configuration are returned. Failures throw `BusAdmissionRefusal` with fixed `stage`/`code` and a fixed message. The optional summary callback receives at most one frozen `{stage, code}` per refusal; callback failure preserves the refusal. There is no payload, error-detail or configuration logging. No source restoration, execution-ledger access or executor launch occurs in this API; consumers perform those only after acceptance, with their existing generation fencing and source verification.
 
+Operator configuration validation and profile/offering snapshot failures report `config/invalid` before envelope parsing. Sender validation failures retain their envelope, alignment or request stage.
+
 `test/remote-test-bus-admission.test.ts` exercises this API with ephemeral real signatures, the actual SDK evaluator, a synthetic private registry, provenance mutation checks and refusal fixtures. Live bus hosting and activation remain separate work.
+
+## SDK dependency coupling
+
+The accepted public bus export is part of the full Cortex package pinned to Cortex commit `937676b` (see the outbox section above). Installing it also installs Cortex's application dependencies, including React, React DOM, XYFlow, Hono, Chokidar, NATS and libsodium. Ranger imports the public `@the-metafactory/cortex/bus` boundary; it does not maintain a copied admission evaluator or a private deep import.
+
+Cortex `937676b` and Ranger both pin Myelin v0.12.0. Treat those pins as a reviewed pair: before upgrading either, check the candidate Cortex package's Myelin pin, keep Ranger's direct Myelin dependency aligned, and rerun the signed admission fixtures and public-import typecheck. A lightweight upstream bus package would remove the application dependency cost; changing Cortex packaging is outside this node.
