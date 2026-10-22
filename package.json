@@ -16,6 +16,7 @@
     "lint:fix": "bun --bun eslint --fix ."
   },
   "dependencies": {
+    "@the-metafactory/cortex": "https://github.com/the-metafactory/cortex.git#937676b9a7744fd5156caac7eb8d43385a2e14b3",
     "@the-metafactory/myelin": "https://github.com/the-metafactory/myelin.git#v0.10.0",
     "commander": "^12.0.0",
     "drizzle-orm": "^0.45.2",
