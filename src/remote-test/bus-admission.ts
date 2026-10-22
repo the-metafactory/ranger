@@ -14,7 +14,10 @@ type AdmissionCode = "too_large" | "malformed" | "invalid" | "mismatch" | "unver
 export interface BusAdmissionSummary { readonly stage: AdmissionStage; readonly code: AdmissionCode }
 
 export class BusAdmissionRefusal extends Error {
- constructor(readonly stage: AdmissionStage, readonly code: AdmissionCode) { super(`Bus admission refused: ${stage}/${code}`); }
+ constructor(readonly stage: AdmissionStage, readonly code: AdmissionCode, readonly authenticated?: AdmittedBusRequest) { super(`Bus admission refused: ${stage}/${code}`); }
+}
+export class BusAdmissionUnavailable extends BusAdmissionRefusal {
+ constructor() { super("authentication", "unverified"); }
 }
 
 export interface BusAdmissionContext {
@@ -49,9 +52,9 @@ async function configuredRegistry(context: BusAdmissionContext, file: string) {
   const registry = loadRegistry(file);
   registries.set(context, { file, revision, registry });
   return registry;
- } catch (error) {
+ } catch {
   registries.delete(context);
-  throw error;
+  throw new BusAdmissionUnavailable();
  }
 }
 
@@ -82,6 +85,7 @@ function parseEnvelope(bytes: Uint8Array): MyelinEnvelope {
 
 async function admit(input: { bytes: Uint8Array; subject: string }, context: BusAdmissionContext): Promise<AdmittedBusRequest> {
  let stage: AdmissionStage = "config";
+ let authenticated: AdmittedBusRequest | undefined;
  try {
   const config = validateBusConfig(context.config);
   const profiles = structuredClone(context.profiles);
@@ -107,6 +111,14 @@ async function admit(input: { bytes: Uint8Array; subject: string }, context: Bus
   const issuer = origin.id;
   stage = "authorization";
   authorizeBusProducer(config, { issuer, actor: envelope.originator?.identity }, request.job);
+  authenticated = Object.freeze({
+   request: Object.freeze({ version: request.version, job: Object.freeze(request.job), source: Object.freeze(request.source) }),
+   provenance: Object.freeze({
+    issuer, actor: envelope.originator?.identity ?? issuer, envelopeId: envelope.id, envelopeDigest,
+    subject, source: envelope.source, authenticatedAt: Date.now(),
+    chain: Object.freeze(chain.map(s => Object.freeze({ identity: s.identity, method: s.method, at: s.at }))),
+   }),
+  });
   stage = "profile";
   const profile = profiles.find(p => p.profileId === request.job.profileId && p.profileDigest === request.job.profileDigest);
   if (!profile) throw new BusAdmissionRefusal(stage, "denied");
@@ -119,19 +131,12 @@ async function admit(input: { bytes: Uint8Array; subject: string }, context: Bus
   });
   if (!decision.admit) throw new BusAdmissionRefusal(stage, "denied");
   stage = "expiry";
-  const authenticatedAt = Date.now();
-  if (request.job.deadline <= authenticatedAt) throw new BusAdmissionRefusal(stage, "expired");
-  return Object.freeze({
-   request: Object.freeze({ version: request.version, job: Object.freeze(request.job), source: Object.freeze(request.source) }),
-   provenance: Object.freeze({
-    issuer, actor: envelope.originator?.identity ?? issuer, envelopeId: envelope.id, envelopeDigest,
-    subject, source: envelope.source, authenticatedAt,
-    chain: Object.freeze(chain.map(s => Object.freeze({ identity: s.identity, method: s.method, at: s.at }))),
-   }),
-  });
+  if (request.job.deadline <= Date.now()) throw new BusAdmissionRefusal(stage, "expired");
+  return authenticated;
  } catch (error) {
-  if (error instanceof BusAdmissionRefusal) throw error;
-  throw new BusAdmissionRefusal(stage, stage === "authentication" ? "unverified" : "invalid");
+  if (error instanceof BusAdmissionUnavailable) throw error;
+  if (error instanceof BusAdmissionRefusal) throw new BusAdmissionRefusal(error.stage, error.code, authenticated);
+  throw new BusAdmissionRefusal(stage, stage === "authentication" ? "unverified" : "invalid", authenticated);
  }
 }
 

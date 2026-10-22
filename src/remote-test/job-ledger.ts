@@ -96,6 +96,10 @@ export class JobLedger {
  recorded(input: unknown) {
   const job = validateJobIdentity(input); return this.read(() => this.row(job) !== null);
  }
+ retryReady(input: unknown): boolean {
+  const job = validateJobIdentity(input);
+  return this.read(() => { const row = this.row(job); return row?.state === "interrupted" && row.attempt < 2 && !this.recovering(); });
+ }
  inspectLegacy(input: unknown, value: unknown): JobStatus | null {
   const job = validateJobIdentity(input), receipt = validateRemoteTestReceipt(value, job);
   if (receipt.executorId !== this.executorId) throw Error("Execution ledger producer mismatch");

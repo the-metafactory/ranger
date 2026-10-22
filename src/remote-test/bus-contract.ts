@@ -64,9 +64,10 @@ const BusConfigSchema = z.object({
   maxAckPending: z.literal(1),
   maxConcurrentJobs: z.literal(1),
   ackWaitSeconds: z.number().int().min(10).max(3600),
-  progressIntervalSeconds: z.number().int().min(1),
+  progressIntervalSeconds: z.number().positive().optional(),
   maxDeliver: z.number().int().min(1).max(10),
- }).strict().refine(e => e.progressIntervalSeconds < e.ackWaitSeconds, { message: "Progress must precede ack expiry" }),
+ }).strict().transform(e => ({ ...e, progressIntervalSeconds: e.progressIntervalSeconds ?? e.ackWaitSeconds / 3 }))
+  .refine(e => e.progressIntervalSeconds < e.ackWaitSeconds, { message: "Progress must precede ack expiry" }),
  /** Private Myelin identity registry used to verify origin signatures. */
  registry: z.object({ file: OperatorPathSchema }).strict(),
  /** Operator-owned permissions: exact issuer to repository/profile-digest bindings. */

@@ -458,6 +458,13 @@ export async function reconcileRemoteTests(input: unknown, options: { launcher?:
      if (owner.ledgerId !== ledger.id || !jobs.some(j => j.jobId === owner.jobId)) throw Error("Unknown recovery lane owner");
      await rm(lane, { recursive: true });
     }
+    const worker = join(root, ".bus-worker"), workerInfo = await lstat(worker).catch((e: unknown) => { if ((e as NodeJS.ErrnoException).code === "ENOENT") return null; throw e; });
+    if (workerInfo) {
+     if (!workerInfo.isDirectory() || workerInfo.uid !== process.getuid?.() || (workerInfo.mode & 0o077)) throw Error("Unsafe recovery bus worker");
+     const owner = z.object({ ledgerId: z.string().uuid() }).strict().parse(JSON.parse(await readFile(join(worker, "owner.json"), "utf8")));
+     if (owner.ledgerId !== ledger.id) throw Error("Unknown recovery bus worker owner");
+     await rm(worker, { recursive: true });
+    }
     const inbox = join(root, ".ssh-incoming"), inboxInfo = await lstat(inbox).catch(e => { if (e.code === "ENOENT") return null; throw e; });
     if (inboxInfo && (!inboxInfo.isDirectory() || inboxInfo.uid !== process.getuid?.() || (inboxInfo.mode & 0o077))) throw Error("Unsafe recovery inbox");
     for (const job of jobs) {
