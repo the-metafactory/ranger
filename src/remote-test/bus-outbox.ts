@@ -44,11 +44,14 @@ export interface BusOutboxOptions {
 }
 export type OutboxState = "pending" | "delivered" | "withheld";
 export interface OutboxEvent { eventId: string; jobId: string; origin: "receipt" | "refusal"; state: OutboxState; attempts: number; failure: string | null }
+export interface QueuedReceipt { jobId: string; job: unknown; evidence: string; state: OutboxState; receiptBytes: string | null }
 export interface DrainReport {
  delivered: string[];
  withheld: { eventId: string; code: OutboxRefusalReason }[];
  failed: { eventId: string; kind: string }[];
 }
+
+const RECEIPT_FILE_LIMIT = 64 * 1024;
 
 interface EventRow {
  id: string; jobid: string; origin: "receipt" | "refusal"; job: string; evidence: string; envelope: string;
@@ -257,6 +260,25 @@ export class BusOutbox {
  envelope(eventId: string): Envelope | null {
   const row = this.db.query("SELECT envelope FROM events WHERE id=?").get(eventId) as { envelope: string } | null;
   return row ? JSON.parse(row.envelope) as Envelope : null;
+ }
+
+ receiptJobIds(): string[] {
+  return (this.db.query("SELECT jobid FROM events WHERE origin='receipt' ORDER BY rowid").all() as { jobid: string }[]).map(r => r.jobid);
+ }
+
+ async queuedReceipt(jobId: string): Promise<QueuedReceipt | null> {
+  const row = this.db.query("SELECT * FROM events WHERE jobid=? AND origin='receipt'").get(jobId) as EventRow | null;
+  if (!row) return null;
+  const path = join(this.options.root, "receipts", `${NameSchema.parse(jobId)}.json`);
+  let receiptBytes: string | null = null;
+  try {
+   const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+   try {
+    const info = await file.stat();
+    if (info.isFile() && info.size <= RECEIPT_FILE_LIMIT) receiptBytes = await file.readFile("utf8");
+   } finally { await file.close(); }
+  } catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e; }
+  return { jobId: row.jobid, job: JSON.parse(row.job) as unknown, evidence: row.evidence, state: row.state, receiptBytes };
  }
 }
 
