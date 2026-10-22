@@ -64,19 +64,27 @@ export type BusPublishOutcome =
 export type BusRunOutcome = BusPublishOutcome | { status: "not_staged"; reason: "expired_job" | "receiver_failed" | "no_response" | "invalid_response" };
 
 /** Real SDK publisher: the Cortex runtime connects with the operator credentials
- * file, signs each envelope with the configured issuer key (never unsigned,
- * never a fallback) and acknowledges only from the configured stream and domain. */
-export const startBusPublisher: BusPublisherFactory = async ({ bus, signer }) => {
- const config = { agent: { name: "ranger", displayName: "Ranger" },
-  nats: { url: bus.transport.servers[0], name: "ranger", subjects: [], credsPath: bus.transport.credentialsFile } } as unknown as Parameters<typeof startMyelinRuntime>[0];
- const runtime = await startMyelinRuntime(config, {
-  jetstreamDomain: bus.target.domain, signer: { principal: signer.issuer, rawSeedBytes: signer.seed },
-  signFailureMode: "drop", stack: bus.routing.stack, principal: bus.routing.principal,
- });
- const publishDurable = runtime.publishDurable?.bind(runtime);
- if (!runtime.enabled || !publishDurable) { await runtime.stop(); throw Error("Bus runtime cannot publish durably"); }
- return { publishDurable, close: () => runtime.stop() };
+ * file to the first reachable configured server (the SDK link takes one URL),
+ * signs each envelope with the configured issuer key (never unsigned, never a
+ * fallback) and acknowledges only from the configured stream and domain. */
+export const connectBusPublisher = (start: typeof startMyelinRuntime): BusPublisherFactory => async ({ bus, signer }) => {
+ let failure: unknown;
+ for (const url of bus.transport.servers) {
+  const config = { agent: { name: "ranger", displayName: "Ranger" },
+   nats: { url, name: "ranger", subjects: [], credsPath: bus.transport.credentialsFile } } as unknown as Parameters<typeof startMyelinRuntime>[0];
+  try {
+   const runtime = await start(config, {
+    jetstreamDomain: bus.target.domain, signer: { principal: signer.issuer, rawSeedBytes: signer.seed },
+    signFailureMode: "drop", stack: bus.routing.stack, principal: bus.routing.principal,
+   });
+   const publishDurable = runtime.publishDurable?.bind(runtime);
+   if (!runtime.enabled || !publishDurable) { await runtime.stop(); throw Error("Bus runtime cannot publish durably"); }
+   return { publishDurable, close: () => runtime.stop() };
+  } catch (error) { failure = error; }
+ }
+ throw failure instanceof Error ? failure : Error("No bus server configured");
 };
+export const startBusPublisher = connectBusPublisher(startMyelinRuntime);
 
 const clock = (injected: BusProducerInjected) => injected.now ?? Date.now;
 const jsonEqual = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);

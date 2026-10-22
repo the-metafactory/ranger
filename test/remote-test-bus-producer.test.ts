@@ -10,7 +10,7 @@ import { subjectFor } from "@the-metafactory/myelin/subjects";
 import { admitBusRequest, BUS_TEST_CAPABILITY } from "../src/remote-test/bus-admission.ts";
 import { validateBusConfig } from "../src/remote-test/bus-contract.ts";
 import {
- BusProducerRefusal, busOutcomeExitCode, busOutcomeMessage, retryBusCommand, runBusCommand, statusBusCommand,
+ BusProducerRefusal, connectBusPublisher, busOutcomeExitCode, busOutcomeMessage, retryBusCommand, runBusCommand, statusBusCommand,
  type BusProducerInjected, type BusPublisher, type BusRefusalStage, type BusStageFunction,
 } from "../src/remote-test/bus-producer.ts";
 import type { ProfileManifest } from "../src/remote-test/contract.ts";
@@ -89,6 +89,24 @@ describe("opt-in bus producer", () => {
   expect(error).toBeInstanceOf(BusProducerRefusal);
   expect((error as BusProducerRefusal).stage).toBe(stage);
  };
+
+ test("the SDK publisher falls through unreachable servers to the next configured one", async () => {
+  const tried: string[] = [];
+  const stopped: string[] = [];
+  const start = (async (config: { nats: { url: string } }) => {
+   const url = config.nats.url;
+   tried.push(url);
+   if (url.includes("down")) throw new Error("connection refused");
+   return { enabled: true, publishDurable: async () => ({}), stop: async () => { stopped.push(url); } };
+  }) as unknown as Parameters<typeof connectBusPublisher>[0];
+  const bus = validateBusConfig({ ...busConfig, transport: { ...busConfig.transport, servers: ["tls://down-1.example.invalid:4222", "tls://down-2.example.invalid:4222", "tls://up.example.invalid:4222", "tls://never.example.invalid:4222"] } });
+  const publisher = await connectBusPublisher(start)({ bus, signer: { issuer, seed: new Uint8Array(32) } });
+  expect(tried).toEqual(["tls://down-1.example.invalid:4222", "tls://down-2.example.invalid:4222", "tls://up.example.invalid:4222"]);
+  await publisher.close?.();
+  expect(stopped).toEqual(["tls://up.example.invalid:4222"]);
+  const allDown = validateBusConfig({ ...busConfig, transport: { ...busConfig.transport, servers: ["tls://down-a.example.invalid:4222", "tls://down-b.example.invalid:4222"] } });
+  await expect(connectBusPublisher(start)({ bus: allDown, signer: { issuer, seed: new Uint8Array(32) } })).rejects.toThrow("connection refused");
+ });
 
  test("saves the exact job and stable unsigned envelope, then publishes durably once and reports submitted only", async () => {
   const result = await runBusCommand(options(), injected);
