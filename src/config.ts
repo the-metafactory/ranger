@@ -411,6 +411,22 @@ const BusSchema = z.object({
  }
 });
 
+const AbsolutePath = z.string().min(1).refine(isAbsolute, "an absolute path");
+
+const CheckReporterSchema = z.object({
+ appId: z.number().int().positive(),
+ privateKeyFile: AbsolutePath,
+ installations: z.record(z.string().regex(/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/, "a GitHub owner login"), z.number().int().positive())
+  .refine(installations => Object.keys(installations).length > 0, "at least one installation"),
+ outbox: z.object({
+  busConfigFile: AbsolutePath,
+  root: AbsolutePath,
+  jobsRoot: AbsolutePath,
+  executorId: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/),
+ }).strict(),
+ stateRoot: AbsolutePath,
+}).strict();
+
 /**
  * A scheduled job (node #301): a skill ranger runs headless on a resource
  * lane when `ranger job enqueue <name>` queued it (a Reflex fire, through a
@@ -458,6 +474,7 @@ const RangerConfigSchema = z.object({
  substrates: SubstratesSchema.default({}),
  serve: ServeSchema.optional(),
  bus: BusSchema.optional(),
+ checkReporter: CheckReporterSchema.optional(),
  /** Scheduled jobs (node #301), by name; absent means none. */
  jobs: z.array(JobSchema).optional().refine(
   jobs => jobs === undefined || new Set(jobs.map(j => j.name)).size === jobs.length,

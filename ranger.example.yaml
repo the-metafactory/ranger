@@ -12,6 +12,20 @@ version: 1
 # MF_SERVES_GOAL / MF_SERVES_NODE: optional IDs; never put goal wording here.
 # Emit is fail-open and capped at 2 s; spool: <journal dir>/run-ledger/outbox.jsonl.
 
+# Optional ci-test check reporter (node #351): `ranger remote-test report-checks`.
+# Private values only; keep this file and every path below outside git.
+# checkReporter:
+#   appId: 123456                          # the dedicated checks-only GitHub App
+#   privateKeyFile: /Users/me/.config/ranger/app.pem   # mode 0600, operator-owned
+#   installations:                         # repository owner login -> installation id
+#     the-metafactory: 1234567
+#   outbox:
+#     busConfigFile: /Users/me/.config/ranger/ci-bus.json
+#     root: /Users/me/.local/state/ranger/ci-outbox
+#     jobsRoot: /Users/me/.local/state/ranger/ci-jobs
+#     executorId: clawbox
+#   stateRoot: /Users/me/.local/state/ranger/check-reporter
+
 maps:
   - repo: the-metafactory/ranger
     root: 1
