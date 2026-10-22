@@ -72,6 +72,7 @@ import { runSshCommand, statusSshCommand, sshOutcomeExitCode, sshOutcomeMessage,
 import { classifyReceiverFailure, saveRefusalDiagnostic, TaggedReceiverFailure } from "./remote-test/receiver-diagnostics.ts";
 import { serveSshResponse } from "./remote-test/ssh-server.ts";
 import { runCheckReporter } from "./remote-test/check-reporter.ts";
+import { runPrHeadSubmitter } from "./remote-test/pr-head-submitter.ts";
 import { BusProducerRefusal, busOutcomeExitCode, busOutcomeMessage, retryBusCommand, runBusCommand, statusBusCommand, type RunBusCommand } from "./remote-test/bus-producer.ts";
 import { BusWorkerReadinessRefusal, runBusWorkerCommand } from "./remote-test/bus-worker.ts";
 import { spawnBudget } from "./digest.ts";
@@ -705,6 +706,18 @@ function busFailure(command: string, error: unknown) {
  process.stderr.write(`ranger remote-test ${command}: ${detail}. If a bus request was saved, bus-status or bus-retry use it; nothing ran locally.\n`);
  process.exitCode = 1;
 }
+
+remoteTest.command("submit-pr-heads")
+ .description("Opt-in scan of registered repositories for exact same-repository PR heads; durable submission only")
+ .option("-c, --config <path>", "Ranger operator configuration")
+ .action(async (options: { config?: string }) => {
+  try {
+   const { config } = loadConfig(resolveConfigPath(options.config, process.env, process.cwd()));
+   const events = await runPrHeadSubmitter(config);
+   process.stdout.write(`PR-head scan: ${events.filter(event => event.code === "submitted").length} submitted, ${events.length} outcomes.\n`);
+   if (events.some(event => ["uncertain", "refused", "not_staged", "submission_failed", "fetch_failed", "list_failed"].includes(event.code))) process.exitCode = 1;
+  } catch { process.stderr.write("ranger remote-test submit-pr-heads: private configuration or scan failed; inspect private state before recovery.\n"); process.exitCode = 1; }
+ });
 
 remoteTest.command("bus-run")
  .description("Opt-in: stage a clean HEAD over SSH, save the exact signed-bus request, then publish it once (submission only, never a test result)")

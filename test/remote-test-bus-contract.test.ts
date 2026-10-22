@@ -286,9 +286,9 @@ describe("existing configuration stays unchanged and the bus shape is inert", ()
   } finally { rmSync(dir, { recursive: true, force: true }); }
  });
 
- test("only explicit bus adapters and the check reporter load the bus contract", () => {
+ test("only explicit bus adapters, the PR submitter and the check reporter load the bus contract", () => {
   const root = new URL("../src/", import.meta.url).pathname;
-  const files = readdirSync(root, { recursive: true }).map(String).filter(f => f.endsWith(".ts") && !f.endsWith("bus-contract.ts") && !f.endsWith("bus-outbox.ts") && !f.endsWith("bus-admission.ts") && !f.endsWith("check-reporter.ts") && !f.endsWith("bus-producer.ts") && !f.endsWith("bus-worker.ts"));
+  const files = readdirSync(root, { recursive: true }).map(String).filter(f => f.endsWith(".ts") && !f.endsWith("bus-contract.ts") && !f.endsWith("bus-outbox.ts") && !f.endsWith("bus-admission.ts") && !f.endsWith("check-reporter.ts") && !f.endsWith("bus-producer.ts") && !f.endsWith("bus-worker.ts") && !f.endsWith("pr-head-submitter.ts"));
   expect(files.length).toBeGreaterThan(10);
   for (const file of files) {
    const source = readFileSync(join(root, file), "utf8");

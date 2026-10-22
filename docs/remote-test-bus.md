@@ -49,6 +49,26 @@ bun src/cli.ts remote-test bus-retry --config <same-private-bus-json> \
 
 On publication uncertainty, look up first. If explicitly approved and still fresh, `bus-retry` republishes the saved request with its original message ID, without restaging, replacing identities or refreshing signature/deadline. It cannot make an expired signed request valid. Never create a replacement job automatically or fall back to local execution. An absent receipt, refusal lifecycle or lost connection is not permission to rerun. Use the existing fenced cancellation/recovery controls with private operator review, never edit ledger/outbox SQLite rows.
 
+## Opt-in PR-head submission
+
+`ranger remote-test submit-pr-heads --config <operator-ranger-yaml>` scans registered repositories and repositories in the selected issuer's approved bus bindings. Enable it only in the operator's private `~/.config/ranger/ranger.yaml`:
+
+```yaml
+prHeadSubmitter:
+  busConfigFile: /absolute/private/ci-bus.json
+  signerFile: /absolute/private/issuer-key.json
+  stateRoot: /absolute/private/pr-head-submitter
+  deadlineSeconds: 660
+```
+
+The issuer's repository/profile-digest allowlist is intersected with the approved SSH manifests. Repository reads and source fetching use the existing `auth.readOnlyTokens`/`auth.defaultTokenEnv` mapping. The command does not install a timer or change `walk`; without `prHeadSubmitter` it returns without reading credentials, listing PRs or creating state.
+
+Open same-repository PRs are eligible regardless of draft status or author. Forks, closed/merged PRs, missing bindings and invalid heads are skipped. Each full head SHA is fetched into a disposable detached checkout with isolated Git configuration; the existing producer stages that exact commit and saves `<jobId>.bus.json` before durable signed publication. Fetch or staging failure never falls back to a branch or local tests.
+
+Private `pr-submissions.sqlite` durably claims `(repository, commit, profile)` before source work. A later scan skips an existing claim, including uncertain or interrupted submission. Each PR/profile retains its correlation ID and advances generation for a new head; the existing executor ledger fences older generations upon admission. The submission journal records fixed outcome codes without transport diagnostics or credentials. Failed fetches release their claims because publication has not been attempted. Once submission begins, failures retain the claim; inspect the journal and saved request before recovery. When `<jobId>.bus.json` exists, the existing `bus-status` and explicit `bus-retry` commands use that exact record. Missing saved bus records require operator inspection rather than automatic replacement.
+
+`test/remote-test-pr-head-submitter.test.ts` covers eligibility, durable restart and concurrent-scan deduplication, generation fencing, immutable local Git fetch/staging, producer save-before-publication, refusal paths and the CLI's unconfigured no-op. It does not establish live deployment or bus activation.
+
 ## Mission Control lifecycle visibility
 
 The projection owner is Cortex's existing [`src/surface/mc/projection/dispatch-lifecycle-renderer.ts`](https://github.com/the-metafactory/cortex/blob/main/src/surface/mc/projection/dispatch-lifecycle-renderer.ts), registered by [`src/cortex.ts`](https://github.com/the-metafactory/cortex/blob/main/src/cortex.ts). Its dispatch subscriber routes `dispatch.task.*` into [`projectDispatchLifecycle` in `src/surface/mc/projection/dispatch-lifecycle.ts`](https://github.com/the-metafactory/cortex/blob/main/src/surface/mc/projection/dispatch-lifecycle.ts). These are public source references, not assertions about an installed private runtime.
