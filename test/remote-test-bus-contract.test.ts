@@ -204,28 +204,30 @@ describe("private bus configuration", () => {
   });
  }
 
- test("documented skeleton is inert until every placeholder is substituted", () => {
-  const template = readFileSync(new URL("../docs/examples/remote-test-bus-config.json", import.meta.url), "utf8");
-  expect(() => validateBusConfig(JSON.parse(template))).toThrow();
-  const c = config();
-  const replacements: Record<string, unknown> = {
-   REPLACE_JETSTREAM_DOMAIN: c.target.domain, REPLACE_NATS_ACCOUNT: c.target.account,
-   REPLACE_PRINCIPAL_TOKEN: c.routing.principal, REPLACE_STACK_TOKEN: c.routing.stack,
-   REPLACE_REQUEST_STREAM: c.streams.request.stream, REPLACE_REQUEST_DURABLE: c.streams.request.durable,
-   REPLACE_RESULT_STREAM: c.streams.result.stream,
-   REPLACE_NATS_SERVER_URL: c.transport.servers[0], REPLACE_NATS_CREDENTIALS_ABSOLUTE_PATH: c.transport.credentialsFile,
-   REPLACE_SSH_CONFIG_ABSOLUTE_PATH: c.ssh.configFile,
-   REPLACE_ACK_WAIT_SECONDS: 60, REPLACE_PROGRESS_INTERVAL_SECONDS: 20, REPLACE_MAX_DELIVER: 3,
-   REPLACE_IDENTITY_REGISTRY_ABSOLUTE_PATH: c.registry.file,
-   REPLACE_RANGER_ISSUER_DID: ISSUER, REPLACE_REPOSITORY_ID: job().repositoryId,
-   REPLACE_APPROVED_PROFILE_ID: job().profileId, REPLACE_PROFILE_DIGEST: job().profileDigest,
-  };
-  const substituted = template.replace(/"(REPLACE_[A-Z_]+)"/g, (_, placeholder: string) => {
-   expect(replacements[placeholder]).toBeDefined();
-   return JSON.stringify(replacements[placeholder]);
+ for (const example of ["remote-test-bus-config.json", "remote-test-private-bus.json"]) {
+  test(`${example} is inert until every placeholder is substituted`, () => {
+   const template = readFileSync(new URL(`../docs/examples/${example}`, import.meta.url), "utf8");
+   expect(() => validateBusConfig(JSON.parse(template))).toThrow();
+   const c = config();
+   const replacements: Record<string, unknown> = {
+    REPLACE_JETSTREAM_DOMAIN: c.target.domain, REPLACE_NATS_ACCOUNT: c.target.account,
+    REPLACE_PRINCIPAL_TOKEN: c.routing.principal, REPLACE_STACK_TOKEN: c.routing.stack,
+    REPLACE_REQUEST_STREAM: c.streams.request.stream, REPLACE_REQUEST_DURABLE: c.streams.request.durable,
+    REPLACE_RESULT_STREAM: c.streams.result.stream,
+    REPLACE_NATS_SERVER_URL: c.transport.servers[0], REPLACE_NATS_CREDENTIALS_ABSOLUTE_PATH: c.transport.credentialsFile,
+    REPLACE_SSH_CONFIG_ABSOLUTE_PATH: c.ssh.configFile,
+    REPLACE_ACK_WAIT_SECONDS: 60, REPLACE_PROGRESS_INTERVAL_SECONDS: 20, REPLACE_MAX_DELIVER: 3,
+    REPLACE_IDENTITY_REGISTRY_ABSOLUTE_PATH: c.registry.file,
+    REPLACE_RANGER_ISSUER_DID: ISSUER, REPLACE_REPOSITORY_ID: job().repositoryId,
+    REPLACE_APPROVED_PROFILE_ID: job().profileId, REPLACE_PROFILE_DIGEST: job().profileDigest,
+   };
+   const substituted = template.replace(/"(REPLACE_[A-Z_]+)"/g, (_, placeholder: string) => {
+    expect(replacements[placeholder]).toBeDefined();
+    return JSON.stringify(replacements[placeholder]);
+   });
+   expect(validateBusConfig(JSON.parse(substituted))).toEqual(c as BusConfig);
   });
-  expect(validateBusConfig(JSON.parse(substituted))).toEqual(c as BusConfig);
- });
+ }
 });
 
 describe("producer binding", () => {
