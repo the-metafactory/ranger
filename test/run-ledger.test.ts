@@ -88,7 +88,7 @@ describe("tick run ledger", () => {
   expect(events).toHaveLength(1);
   const event = events[0];
   expect(event.subject).toBe("local.jc.default.execution.run.finished");
-  expect(event.input.source).toBe("jc.ranger.run");
+  expect(event.input.source).toBe("jc.default.ranger");
   expect(event.input.type).toBe("execution.run.finished");
   expect(event.input.sovereignty).toEqual({ classification: "local", data_residency: "CH", max_hop: 0, frontier_ok: false, model_class: "any" });
   expect(event.input.payload).toMatchObject({
