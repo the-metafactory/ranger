@@ -24,6 +24,7 @@ type Request = Omit<RemoteTestJob, "commitDigest" | "treeDigest" | "bundleDigest
 export interface PrProfileBinding { repo: string; profile: ProfileManifest }
 export type PrScanCode = "submitted" | "uncertain" | "refused" | "not_staged" | "submission_failed" |
  "duplicate" | "closed" | "fork" | "no_reviewed_binding" | "invalid_head" | "fetch_failed" | "list_failed" | "unsupported_repository";
+export const PR_SCAN_FAILURES: ReadonlySet<PrScanCode> = new Set(["uncertain", "refused", "not_staged", "submission_failed", "fetch_failed", "list_failed"]);
 export interface PrScanEvent { repo: string; pr: number | null; sha: string; profileId: string | null; code: PrScanCode }
 
 export class PrSubmissionLedger {
@@ -61,11 +62,16 @@ export class PrSubmissionLedger {
    if (event.code === "submitted" || event.code === "uncertain") {
     this.db.query("UPDATE requests SET superseded=1 WHERE repo=? AND pr=? AND profile=? AND json_extract(request,'$.generation')<?").run(event.repo, event.pr, event.profileId, generation);
    }
-   this.record(event);
   }).immediate();
  }
- record(event: PrScanEvent) {
-  this.db.query("INSERT INTO journal VALUES(?,?,?,?,?,?)").run(this.now(), event.repo, event.pr, event.sha, event.profileId, event.code);
+ recordScan(events: PrScanEvent[]) {
+  const retained = events.filter(event => event.code !== "duplicate");
+  if (!retained.length) return;
+  this.db.transaction(() => {
+   const insert = this.db.query("INSERT INTO journal VALUES(?,?,?,?,?,?)");
+   for (const event of retained) insert.run(this.now(), event.repo, event.pr, event.sha, event.profileId, event.code);
+   this.db.run("DELETE FROM journal WHERE rowid NOT IN (SELECT rowid FROM journal ORDER BY rowid DESC LIMIT 1000)");
+  }).immediate();
  }
  events(): PrScanEvent[] {
   return this.db.query("SELECT repo,pr,sha,profile AS profileId,code FROM journal ORDER BY rowid").all() as PrScanEvent[];
@@ -130,38 +136,60 @@ export interface PrHeadScanDeps {
  now?: () => number;
 }
 
+function classifyPr(pr: PullRequestHead, repo: string, profiles: PrProfileBinding[]): PrScanCode | null {
+ if (pr.state !== "open") return "closed";
+ if (pr.headRepository?.toLowerCase() !== repo || pr.baseRepository?.toLowerCase() !== repo) return "fork";
+ if (!Number.isSafeInteger(pr.number) || pr.number <= 0 || !commitId.test(pr.headSha)) return "invalid_head";
+ return profiles.length === 0 ? "no_reviewed_binding" : null;
+}
+
+interface PrHead { repo: string; pr: number; sha: string }
+async function submitForProfile(head: PrHead, binding: PrProfileBinding, deadline: number, deps: PrHeadScanDeps,
+ fetch: () => ReturnType<PrHeadScanDeps["fetch"]>): Promise<PrScanEvent> {
+ const { repo, pr, sha } = head, { profile } = binding, event = { ...head, profileId: profile.profileId };
+ const request = deps.ledger.claim(repo, pr, sha, profile, deadline, binding.repo);
+ if (!request) return { ...event, code: "duplicate" };
+ let source: Awaited<ReturnType<PrHeadScanDeps["fetch"]>>;
+ try { source = await fetch(); }
+ catch { deps.ledger.abandon(repo, sha, profile.profileId); return { ...event, code: "fetch_failed" }; }
+ let code: PrScanCode;
+ try { code = (await deps.submit({ request, worktree: source.worktree, expectedCommit: sha })).status; }
+ catch { code = "submission_failed"; }
+ const outcome = { ...event, code };
+ deps.ledger.finish(outcome, request.generation);
+ return outcome;
+}
+
+async function submitProfiles(head: PrHead, profiles: PrProfileBinding[], deadlineSeconds: number, deps: PrHeadScanDeps, events: PrScanEvent[]) {
+ let source: ReturnType<PrHeadScanDeps["fetch"]> | undefined;
+ const fetch = () => source ??= deps.fetch(head.repo, head.sha), now = deps.now ?? Date.now;
+ try {
+  for (const binding of profiles) {
+   events.push(await submitForProfile(head, binding, now() + deadlineSeconds * 1000, deps, fetch));
+  }
+ } finally {
+  const fetched = await source?.catch(() => undefined);
+  await fetched?.release();
+ }
+}
+
 export async function scanAndSubmitPrHeads(repositories: string[], bindings: PrProfileBinding[], deadlineSeconds: number, deps: PrHeadScanDeps): Promise<PrScanEvent[]> {
- const events: PrScanEvent[] = [], now = deps.now ?? Date.now;
- const record = (event: PrScanEvent) => { deps.ledger.record(event); events.push(event); };
- for (const repo of new Set(repositories.map(repo => repo.toLowerCase()))) {
-  if (!repositoryName.test(repo)) { record({ repo, pr: null, sha: "", profileId: null, code: "unsupported_repository" }); continue; }
-  let prs: PullRequestHead[];
-  try { prs = await deps.list(repo); }
-  catch { record({ repo, pr: null, sha: "", profileId: null, code: "list_failed" }); continue; }
-  const profiles = bindings.filter(binding => binding.repo.toLowerCase() === repo);
-  for (const pr of prs) {
-   const base = { repo, pr: pr.number, sha: pr.headSha, profileId: null };
-   if (pr.state !== "open") { record({ ...base, code: "closed" }); continue; }
-   if (pr.headRepository?.toLowerCase() !== repo || pr.baseRepository?.toLowerCase() !== repo) { record({ ...base, code: "fork" }); continue; }
-   if (!Number.isSafeInteger(pr.number) || pr.number <= 0 || !commitId.test(pr.headSha)) { record({ ...base, code: "invalid_head" }); continue; }
-   if (profiles.length === 0) { record({ ...base, code: "no_reviewed_binding" }); continue; }
-   for (const { profile, repo: boundRepo } of profiles) {
-    const event = { ...base, profileId: profile.profileId };
-    if (deps.ledger.has(repo, pr.headSha, profile.profileId)) { record({ ...event, code: "duplicate" }); continue; }
-    const request = deps.ledger.claim(repo, pr.number, pr.headSha, profile, now() + deadlineSeconds * 1000, boundRepo);
-    if (!request) { record({ ...event, code: "duplicate" }); continue; }
-    let source: Awaited<ReturnType<PrHeadScanDeps["fetch"]>>;
-    try { source = await deps.fetch(repo, pr.headSha); }
-    catch { deps.ledger.abandon(repo, pr.headSha, profile.profileId); record({ ...event, code: "fetch_failed" }); continue; }
-    try {
-     let code: PrScanCode;
-     try { code = (await deps.submit({ request, worktree: source.worktree, expectedCommit: pr.headSha })).status; }
-     catch { code = "submission_failed"; }
-     const outcome = { ...event, code };
-     deps.ledger.finish(outcome, request.generation); events.push(outcome);
-    } finally { await source.release(); }
+ const events: PrScanEvent[] = [];
+ try {
+  for (const repo of new Set(repositories.map(repo => repo.toLowerCase()))) {
+   if (!repositoryName.test(repo)) { events.push({ repo, pr: null, sha: "", profileId: null, code: "unsupported_repository" }); continue; }
+   let prs: PullRequestHead[];
+   try { prs = await deps.list(repo); }
+   catch { events.push({ repo, pr: null, sha: "", profileId: null, code: "list_failed" }); continue; }
+   const profiles = bindings.filter(binding => binding.repo.toLowerCase() === repo);
+   for (const pr of prs) {
+    const head = { repo, pr: pr.number, sha: pr.headSha }, code = classifyPr(pr, repo, profiles);
+    if (code) { events.push({ ...head, profileId: null, code }); continue; }
+    await submitProfiles(head, profiles, deadlineSeconds, deps, events);
    }
   }
+ } finally {
+  deps.ledger.recordScan(events);
  }
  return events;
 }
@@ -183,8 +211,10 @@ export async function runPrHeadSubmitter(config: RangerConfig, run: PrHeadSubmit
  const bindings: PrProfileBinding[] = [];
  for (const binding of bus.issuers.find(entry => entry.issuer === signer.issuer)?.bindings ?? []) {
   const profile = ssh.profiles.find(p => p.profileId === binding.profileId && p.profileDigest === binding.profileDigest);
-  const repo = binding.repositoryId.startsWith("github:github.com/") ? binding.repositoryId.slice("github:github.com/".length) : "";
-  if (profile && repositoryName.test(repo)) bindings.push({ repo, profile });
+  try {
+   const ref = parseForgeRef(binding.repositoryId);
+   if (profile && ref.forge === "github" && ref.host === "github.com" && repositoryName.test(ref.path)) bindings.push({ repo: ref.path, profile });
+  } catch { continue; }
  }
  const root = await privateRoot(settings.stateRoot), ledger = await openPrSubmissionLedger(root, run.now);
  try {

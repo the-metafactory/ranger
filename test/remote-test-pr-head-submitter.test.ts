@@ -48,7 +48,7 @@ describe("PR head scan and durable tuple ledger", () => {
   expect((await scan()).map(e => e.code)).toEqual(["duplicate", "duplicate"]);
   expect(calls).toHaveLength(1); expect(fetched).toEqual([sha]); expect(released).toBe(1);
   expect((await stat(join(root, "pr-submissions.sqlite"))).mode & 0o077).toBe(0);
-  expect(ledger.events().map(e => e.code)).toEqual(["submitted", "duplicate", "duplicate", "duplicate"]);
+  expect(ledger.events().map(e => e.code)).toEqual(["submitted"]);
  });
 
  test("head movement preserves correlation, advances generation and supersedes through the existing execution ledger", async () => {
@@ -70,6 +70,28 @@ describe("PR head scan and durable tuple ledger", () => {
   prs = [pr({ headRepository: "someone/myelin" }), pr({ headRepository: null }), pr({ baseRepository: "someone/myelin" }), pr({ state: "closed" }), pr({ state: "merged" })];
   expect((await scan()).map(e => e.code)).toEqual(["fork", "fork", "fork", "closed", "closed"]);
   expect(calls).toHaveLength(0); expect(fetched).toHaveLength(0); expect(ledger.events()).toHaveLength(5);
+ });
+
+ test("skip reasons retain only the latest 1000 records across scans", async () => {
+  prs = Array.from({ length: 1100 }, (_, i) => pr({ number: i + 1, state: "closed" }));
+  expect(await scan()).toHaveLength(1100);
+  expect(ledger.events()).toHaveLength(1000);
+  expect(ledger.events()[0]).toMatchObject({ pr: 101, code: "closed" });
+  prs = [pr({ number: 1101, headRepository: "someone/myelin" })];
+  await scan();
+  expect(ledger.events()).toHaveLength(1000);
+  expect(ledger.events()[0].pr).toBe(102);
+  expect(ledger.events().at(-1)).toMatchObject({ pr: 1101, code: "fork" });
+ });
+
+ test("a duplicate-only rescan makes no durable database writes", async () => {
+  await scan();
+  const observer = new Database(join(root, "pr-submissions.sqlite"), { readonly: true });
+  try {
+   const before = observer.query("PRAGMA data_version").get();
+   expect((await scan())[0].code).toBe("duplicate");
+   expect(observer.query("PRAGMA data_version").get()).toEqual(before);
+  } finally { observer.close(); }
  });
 
  test("no binding, malformed SHA, list failure and unsupported forge are journaled without submission", async () => {
@@ -109,10 +131,35 @@ describe("PR head scan and durable tuple ledger", () => {
   await scan([{ repo, profile }, { repo, profile: otherProfile }]);
   expect(calls).toHaveLength(2);
   expect(calls.map(c => c.request.profileId)).toEqual(["myelin-v1", "other-v1"]);
+  expect(fetched).toEqual([sha]); expect(released).toBe(1);
   const otherRepo = "example/another";
   deps.list = async () => [pr({ headRepository: otherRepo, baseRepository: otherRepo })];
   await scan([{ repo: otherRepo, profile }], [otherRepo]);
   expect(calls).toHaveLength(3); expect(calls[2].request.repositoryId).toBe(`github:github.com/${otherRepo}`);
+ });
+
+ test("a failed profile submission preserves the shared source until other profiles finish", async () => {
+  const otherProfile = createReviewedProfile({ ...profile, profileId: "other-v1", reviewed: profile.reviewed });
+  deps.submit = async input => {
+   expect(released).toBe(0); calls.push(input);
+   if (input.request.profileId === profile.profileId) throw Error("private failure");
+   return submitted;
+  };
+  expect((await scan([{ repo, profile }, { repo, profile: otherProfile }])).map(e => e.code)).toEqual(["submission_failed", "submitted"]);
+  expect(calls.map(call => call.worktree)).toEqual(["/fixture/clean", "/fixture/clean"]);
+  expect(fetched).toEqual([sha]); expect(released).toBe(1);
+ });
+
+ test("an unavailable head is fetched once and abandons every profile claim for a later retry", async () => {
+  const otherProfile = createReviewedProfile({ ...profile, profileId: "other-v1", reviewed: profile.reviewed });
+  const selected = [{ repo, profile }, { repo, profile: otherProfile }];
+  deps.fetch = async (_repo, head) => { fetched.push(head); throw Error("unavailable"); };
+  expect((await scan(selected)).map(e => e.code)).toEqual(["fetch_failed", "fetch_failed"]);
+  expect(fetched).toEqual([sha]); expect(calls).toHaveLength(0);
+  expect(ledger.has(repo, sha, profile.profileId)).toBe(false);
+  expect(ledger.has(repo, sha, otherProfile.profileId)).toBe(false);
+  expect((await scan(selected)).map(e => e.code)).toEqual(["fetch_failed", "fetch_failed"]);
+  expect(fetched).toEqual([sha, sha]);
  });
 
  test("slow older-head fetch cannot supersede a newer generation published first", async () => {
@@ -130,6 +177,18 @@ describe("PR head scan and durable tuple ledger", () => {
   const db = new Database(join(root, "pr-submissions.sqlite"), { readonly: true });
   try { expect(db.query("SELECT sha,superseded FROM requests ORDER BY sha").all()).toEqual([{ sha, superseded: 1 }, { sha: nextSha, superseded: 0 }]); }
   finally { db.close(); }
+  const execution = new JobLedger(new Database(":memory:"), root, "fixture", () => now);
+  try {
+   const [newer, stale] = calls.map(call => ({ ...call.request, commitDigest: call.expectedCommit, treeDigest: "c".repeat(40), bundleDigest: digest }));
+   const admitted = execution.admit(newer);
+   expect(admitted.kind).toBe("admitted");
+   expect(execution.admit(stale)).toMatchObject({ kind: "terminal", receipt: { status: "cancelled", identity: stale } });
+   expect(execution.status(stale)).toMatchObject({ kind: "terminal", receipt: { status: "cancelled" } });
+   expect(execution.status(newer)).toMatchObject({ kind: "active" });
+   if (admitted.kind !== "admitted") throw Error("newer head must be admitted");
+   expect(execution.allowed(newer, admitted.token)).toBe(true);
+   expect(() => execution.launch(stale, admitted.token)).toThrow("launch fence");
+  } finally { execution.close(); }
  });
 
  test("durable claim left by an interrupted scan is never silently resubmitted", async () => {
@@ -149,7 +208,7 @@ describe("PR listing, opt-in config and production producer integration", () => 
   return loadConfig(join(root, "ranger.json"), {}).config;
  };
  const settings = () => ({ busConfigFile: join(root, "bus.json"), signerFile: join(root, "signer.json"), stateRoot: join(root, "state"), deadlineSeconds: 660 });
- async function privateConfig(profiles: ProfileManifest[] = [profile], profileDigest = profile.profileDigest, authorized = true) {
+ async function privateConfig(profiles: ProfileManifest[] = [profile], profileDigest = profile.profileDigest, authorized = true, repositoryId = MYELIN_REPOSITORY) {
   const issuer = "did:mf:ranger";
   await writeJson("bus.json", { version: 1, target: { domain: "fixture", account: "fixture" },
    routing: { classification: "local", principal: "fixture", stack: "private" },
@@ -157,7 +216,7 @@ describe("PR listing, opt-in config and production producer integration", () => 
    transport: { servers: ["tls://bus.example.invalid:4222"], credentialsFile: join(root, "bus.creds") },
    ssh: { configFile: join(root, "ssh.json") }, registry: { file: join(root, "registry.json") },
    execution: { maxAckPending: 1, maxConcurrentJobs: 1, ackWaitSeconds: 60, maxDeliver: 3 },
-   issuers: [{ issuer: authorized ? issuer : "did:mf:other", bindings: [{ repositoryId: MYELIN_REPOSITORY, profileId: profile.profileId, profileDigest }] }] });
+   issuers: [{ issuer: authorized ? issuer : "did:mf:other", bindings: [{ repositoryId, profileId: profile.profileId, profileDigest }] }] });
   await writeJson("ssh.json", { target: "fixture", remoteCli: "/reviewed/ranger", remoteConfig: "/private/executor.json", executorId: "fixture", profiles });
   await writeJson("signer.json", { version: 1, issuer, seed: Buffer.alloc(32, 1).toString("base64") });
  }
@@ -217,6 +276,15 @@ describe("PR listing, opt-in config and production producer integration", () => 
   }
  });
 
+ test.each(["gitlab:example.invalid/group/repo", "github:enterprise.invalid/group/repo"])("unsupported binding %s is skipped without fetching or publishing", async repositoryId => {
+  await privateConfig([profile], profile.profileDigest, true, repositoryId);
+  const result = await runPrHeadSubmitter(await config(settings()), { env: { RANGER_READ_TOKEN: "fixture" },
+   api: async () => [[{ number: 1, state: "open", head: { sha, repo: { full_name: repo } }, base: { repo: { full_name: repo } } }]],
+   fetch: async () => { throw Error("must not fetch"); },
+  });
+  expect(result.map(event => event.code)).toEqual(["no_reviewed_binding"]);
+ });
+
  test("an explicitly approved legacy V1 manifest does not require recipe metadata", async () => {
   const { reviewed: _reviewed, ...legacy } = profile;
   await privateConfig([legacy]); let fetched = false;
@@ -251,6 +319,8 @@ describe("PR listing, opt-in config and production producer integration", () => 
   await git(["init", "--template=", original]);
   await writeFile(join(original, "fixture.txt"), "exact source\n");
   await git(["add", "fixture.txt"], original); await git(["commit", "-m", "fixture"], original);
+  await writeFile(join(original, "fixture.txt"), "new exact source\n");
+  await git(["commit", "-am", "second fixture"], original);
   const commit = await git(["rev-parse", "HEAD"], original);
   const source = await fetchPrHead({ repo, sha: commit, root, token: "fixture" }, async (command, args, options) => {
    const local = args.map(arg => arg === `https://github.com/${repo}.git` ? original : arg);

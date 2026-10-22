@@ -72,7 +72,7 @@ import { runSshCommand, statusSshCommand, sshOutcomeExitCode, sshOutcomeMessage,
 import { classifyReceiverFailure, saveRefusalDiagnostic, TaggedReceiverFailure } from "./remote-test/receiver-diagnostics.ts";
 import { serveSshResponse } from "./remote-test/ssh-server.ts";
 import { runCheckReporter } from "./remote-test/check-reporter.ts";
-import { runPrHeadSubmitter } from "./remote-test/pr-head-submitter.ts";
+import { PR_SCAN_FAILURES, runPrHeadSubmitter } from "./remote-test/pr-head-submitter.ts";
 import { BusProducerRefusal, busOutcomeExitCode, busOutcomeMessage, retryBusCommand, runBusCommand, statusBusCommand, type RunBusCommand } from "./remote-test/bus-producer.ts";
 import { BusWorkerReadinessRefusal, runBusWorkerCommand } from "./remote-test/bus-worker.ts";
 import { spawnBudget } from "./digest.ts";
@@ -715,7 +715,7 @@ remoteTest.command("submit-pr-heads")
    const { config } = loadConfig(resolveConfigPath(options.config, process.env, process.cwd()));
    const events = await runPrHeadSubmitter(config);
    process.stdout.write(`PR-head scan: ${events.filter(event => event.code === "submitted").length} submitted, ${events.length} outcomes.\n`);
-   if (events.some(event => ["uncertain", "refused", "not_staged", "submission_failed", "fetch_failed", "list_failed"].includes(event.code))) process.exitCode = 1;
+   if (events.some(event => PR_SCAN_FAILURES.has(event.code))) process.exitCode = 1;
   } catch { process.stderr.write("ranger remote-test submit-pr-heads: private configuration or scan failed; inspect private state before recovery.\n"); process.exitCode = 1; }
  });
 
