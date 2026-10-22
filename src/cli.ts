@@ -72,6 +72,7 @@ import { runSshCommand, statusSshCommand, sshOutcomeExitCode, sshOutcomeMessage,
 import { classifyReceiverFailure, saveRefusalDiagnostic, TaggedReceiverFailure } from "./remote-test/receiver-diagnostics.ts";
 import { serveSshResponse } from "./remote-test/ssh-server.ts";
 import { runCheckReporter } from "./remote-test/check-reporter.ts";
+import { BusProducerRefusal, busOutcomeExitCode, busOutcomeMessage, retryBusCommand, runBusCommand, statusBusCommand, type RunBusCommand } from "./remote-test/bus-producer.ts";
 import { spawnBudget } from "./digest.ts";
 
 /**
@@ -695,6 +696,51 @@ remoteTest.command("status")
   process.once("SIGINT", cancel); process.once("SIGTERM", cancel);
   try { const result = await statusSshCommand(options, { signal: abort.signal }); process.stdout.write(sshOutcomeMessage(result)); process.exitCode = sshOutcomeExitCode(result); }
   catch { process.stderr.write("ranger remote-test status: private input or receipt publication failed.\n"); process.exitCode = 1; }
+  finally { process.removeListener("SIGINT", cancel); process.removeListener("SIGTERM", cancel); }
+ });
+
+function busFailure(command: string, error: unknown) {
+ const detail = error instanceof BusProducerRefusal ? `${error.stage} refusal: ${error.message}` : "private input, staging or publication failed";
+ process.stderr.write(`ranger remote-test ${command}: ${detail}. If a bus request was saved, bus-status or bus-retry use it; nothing ran locally.\n`);
+ process.exitCode = 1;
+}
+
+remoteTest.command("bus-run")
+ .description("Opt-in: stage a clean HEAD over SSH, save the exact signed-bus request, then publish it once (submission only, never a test result)")
+ .requiredOption("--config <path>", "private bus configuration JSON")
+ .requiredOption("--signer <path>", "private issuer key JSON")
+ .requiredOption("--request <path>", "private V1 request excluding commit/tree/bundle digests")
+ .requiredOption("--worktree <path>", "clean committed source worktree")
+ .requiredOption("--staging-root <path>", "existing private source staging root outside git")
+ .requiredOption("--request-output <path>", "new private saved bus request for status and retry")
+ .action(async (options: RunBusCommand) => {
+  const abort = new AbortController(), cancel = () => { abort.abort(); };
+  process.once("SIGINT", cancel); process.once("SIGTERM", cancel);
+  try { const result = await runBusCommand(options, { ssh: { signal: abort.signal } }); process.stdout.write(busOutcomeMessage(result)); process.exitCode = busOutcomeExitCode(result); }
+  catch (error) { busFailure("bus-run", error); }
+  finally { process.removeListener("SIGINT", cancel); process.removeListener("SIGTERM", cancel); }
+ });
+
+remoteTest.command("bus-retry")
+ .description("Explicitly republish one saved bus request with its original message ID; never restages or refreshes it")
+ .requiredOption("--config <path>", "private bus configuration JSON")
+ .requiredOption("--signer <path>", "private issuer key JSON")
+ .requiredOption("--request <path>", "saved bus request from bus-run")
+ .action(async (options: { config: string; signer: string; request: string }) => {
+  try { const result = await retryBusCommand(options); process.stdout.write(busOutcomeMessage(result)); process.exitCode = busOutcomeExitCode(result); }
+  catch (error) { busFailure("bus-retry", error); }
+ });
+
+remoteTest.command("bus-status")
+ .description("Retrieve only the saved bus request's terminal receipt over SSH; never stages, publishes or resubmits")
+ .requiredOption("--config <path>", "private bus configuration JSON")
+ .requiredOption("--request <path>", "saved bus request from bus-run")
+ .requiredOption("--output <path>", "new private terminal receipt JSON")
+ .action(async (options: { config: string; request: string; output: string }) => {
+  const abort = new AbortController(), cancel = () => { abort.abort(); };
+  process.once("SIGINT", cancel); process.once("SIGTERM", cancel);
+  try { const result = await statusBusCommand(options, { ssh: { signal: abort.signal } }); process.stdout.write(sshOutcomeMessage(result)); process.exitCode = sshOutcomeExitCode(result); }
+  catch (error) { busFailure("bus-status", error); }
   finally { process.removeListener("SIGINT", cancel); process.removeListener("SIGTERM", cancel); }
  });
 

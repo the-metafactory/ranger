@@ -14,7 +14,7 @@ export async function readPrivateJson(path: string) {
   return JSON.parse(await file.readFile("utf8"));
  } finally { await file.close(); }
 }
-async function reserve(path: string) {
+export async function reserve(path: string) {
  const destination = await privateOperatorPath(path), reservation = `${destination}.reservation`;
  await mkdir(reservation, { mode: 0o700 });
  try {
@@ -23,7 +23,7 @@ async function reserve(path: string) {
  } catch (e) { await rm(reservation, { recursive: true }); throw e; }
  return { destination, release: () => rm(reservation, { recursive: true }) };
 }
-async function saveJob(path: string, job: unknown) {
+export async function saveJob(path: string, job: unknown) {
  const temporary = join(dirname(path), `.pending-job-${randomUUID()}`);
  let published = false;
  try {
