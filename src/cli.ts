@@ -71,6 +71,7 @@ import { publishReceiptFile } from "./remote-test/artifacts.ts";
 import { runSshCommand, statusSshCommand, sshOutcomeExitCode, sshOutcomeMessage, type RunSshCommand } from "./remote-test/ssh-cli.ts";
 import { classifyReceiverFailure, saveRefusalDiagnostic, TaggedReceiverFailure } from "./remote-test/receiver-diagnostics.ts";
 import { serveSshResponse } from "./remote-test/ssh-server.ts";
+import { runCheckReporter } from "./remote-test/check-reporter.ts";
 import { spawnBudget } from "./digest.ts";
 
 /**
@@ -814,6 +815,24 @@ remoteTest.command("shadow-summary")
    process.stdout.write(`Shadow pilot ${report.status}; ${report.jobCount}/10 jobs. Local gate remains authoritative. Private summary saved.\n`);
    process.exitCode = report.status === "failed" ? 1 : 0;
   } catch { process.stderr.write("Shadow summary failed; inspect private inputs/output.\n"); process.exitCode = 1; }
+ });
+
+remoteTest.command("report-checks")
+ .description("Report each terminal ci-test receipt in the outbox as a clawbox/<profile> check run on its exact commit")
+ .option("-c, --config <path>", "path to ranger.yaml (fallback: $RANGER_CONFIG, then ~/.config/ranger/ranger.yaml)")
+ .option("--job <id>", "redeliver one job's receipt, updating its existing check run")
+ .action(async (options: { config?: string; job?: string }) => {
+  try {
+   const { config } = loadConfig(resolveConfigPath(options.config, process.env, process.cwd()));
+   const summary = await runCheckReporter(config, options.job === undefined ? {} : { job: options.job });
+   process.stdout.write(`Check reporter: ${summary.reported.length} reported, ${summary.stale.length} stale, ${summary.refused.length} refused, ${summary.failed.length} failed.\n`);
+   for (const refusal of summary.refused) process.stderr.write(`refused ${refusal.jobId}: ${refusal.code}\n`);
+   for (const failure of summary.failed) process.stderr.write(`failed ${failure.jobId}: ${failure.message}\n`);
+   process.exitCode = summary.failed.length === 0 ? 0 : 1;
+  } catch (error) {
+   process.stderr.write(`ranger remote-test report-checks: ${error instanceof Error ? error.message : String(error)}\n`);
+   process.exitCode = 1;
+  }
  });
 
 remoteTest.command("baseline")

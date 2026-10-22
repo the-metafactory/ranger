@@ -1,3 +1,4 @@
+import { createSign } from "node:crypto";
 import type { ChangeRequest, MergeState, MergeOutcome, RebaseOutcome, CiFailedRun, CiPurpose, CiVerdict, CommentReaction, IssueComment, LabeledIssue } from "./forge.ts";
 import { githubCiVerdict } from "./github-ci.ts";
 import { runCmd } from "./exec.ts";
@@ -535,4 +536,138 @@ export async function ciFailureLog(repo: string, runs: CiFailedRun[], token: str
  }
  if (runs.length > CI_LOG_RUNS) parts.push(`(${runs.length - CI_LOG_RUNS} more failed run(s): ${runs.slice(CI_LOG_RUNS).map((r) => r.name).join(", ")})`);
  return parts.join("\n\n");
+}
+
+/** One `gh api` request returning parsed JSON; injectable so App token and check-run calls run offline. */
+export type GhApi = (token: string, args: string[], label: string) => Promise<unknown>;
+
+const base64url = (input: string | Buffer): string => Buffer.from(input).toString("base64url");
+
+/** A short-lived RS256 JWT identifying the GitHub App; the only use of its private key. */
+export function mintAppJwt(appId: number, privateKeyPem: string, nowSeconds: number = Math.floor(Date.now() / 1000)): string {
+ const header = base64url(JSON.stringify({ alg: "RS256", typ: "JWT" }));
+ const payload = base64url(JSON.stringify({ iat: nowSeconds - 60, exp: nowSeconds + 540, iss: appId }));
+ const signature = createSign("RSA-SHA256").update(`${header}.${payload}`).sign(privateKeyPem);
+ return `${header}.${payload}.${base64url(signature)}`;
+}
+
+export interface InstallationToken {
+ token: string;
+ expiresAtMs: number;
+}
+
+/** Exchange the App JWT for one installation's token. Any refusal or malformed answer throws. */
+export async function createInstallationToken(jwt: string, installationId: number, api: GhApi = ghApi): Promise<InstallationToken> {
+ const label = `installation ${installationId} token`;
+ const raw = (await api(jwt, [`app/installations/${installationId}/access_tokens`, "--method", "POST"], label)) as Record<string, unknown> | null;
+ const expiresAtMs = typeof raw?.expires_at === "string" ? Date.parse(raw.expires_at) : Number.NaN;
+ if (typeof raw?.token !== "string" || raw.token.length === 0 || !Number.isFinite(expiresAtMs)) {
+  throw new GitHubError(`${label}: invalid response`);
+ }
+ return { token: raw.token, expiresAtMs };
+}
+
+export type CheckConclusion = "success" | "failure" | "neutral" | "cancelled" | "timed_out";
+
+export interface CheckRunWrite {
+ name: string;
+ headSha: string;
+ conclusion: CheckConclusion;
+ title: string;
+ summary: string;
+ externalId: string;
+ startedAtMs?: number;
+ completedAtMs: number;
+}
+
+/** The checks-only surface of the dedicated App, keyed by repository, commit and check name. */
+export interface AppChecks {
+ findCheckRun(repo: string, headSha: string, name: string): Promise<number | null>;
+ createCheckRun(repo: string, write: CheckRunWrite): Promise<number>;
+ updateCheckRun(repo: string, id: number, write: CheckRunWrite): Promise<void>;
+}
+
+export interface AppChecksOptions {
+ appId: number;
+ privateKeyPem: string;
+ installations: Readonly<Record<string, number>>;
+ api?: GhApi;
+ now?: () => number;
+}
+
+const TOKEN_REFRESH_MARGIN_MS = 60_000;
+
+function checkRunFields(write: CheckRunWrite, withHead: boolean): string[] {
+ const fields = [
+  ...(withHead ? ["-f", `head_sha=${write.headSha}`, "-f", `name=${write.name}`] : []),
+  "-f", "status=completed",
+  "-f", `conclusion=${write.conclusion}`,
+  "-f", `external_id=${write.externalId}`,
+  "-f", `completed_at=${new Date(write.completedAtMs).toISOString()}`,
+  "-f", `output[title]=${write.title}`,
+  "-f", `output[summary]=${write.summary}`,
+ ];
+ if (write.startedAtMs !== undefined) fields.push("-f", `started_at=${new Date(write.startedAtMs).toISOString()}`);
+ return fields;
+}
+
+/**
+ * Check-run writes as the App's installation on the repository's owner. A token
+ * is minted lazily and cached until shortly before it expires; a missing
+ * installation or a refused token request throws before any write.
+ */
+export function appChecksClient(options: AppChecksOptions): AppChecks {
+ const api = options.api ?? ghApi;
+ const now = options.now ?? Date.now;
+ const installations = new Map(Object.entries(options.installations).map(([owner, id]) => [owner.toLowerCase(), id]));
+ const tokens = new Map<number, InstallationToken>();
+
+ async function tokenFor(repo: string): Promise<string> {
+  const owner = (repo.split("/")[0] ?? "").toLowerCase();
+  const installationId = installations.get(owner);
+  if (installationId === undefined) throw new GitHubError(`no GitHub App installation configured for ${owner}`);
+  const cached = tokens.get(installationId);
+  if (cached !== undefined && cached.expiresAtMs - now() > TOKEN_REFRESH_MARGIN_MS) return cached.token;
+  const minted = await createInstallationToken(mintAppJwt(options.appId, options.privateKeyPem, Math.floor(now() / 1000)), installationId, api);
+  tokens.set(installationId, minted);
+  return minted.token;
+ }
+
+ return {
+  async findCheckRun(repo, headSha, name) {
+   const label = `check runs ${name} on ${headSha}`;
+   const raw = await api(
+    await tokenFor(repo),
+    [`repos/${repo}/commits/${headSha}/check-runs?check_name=${encodeURIComponent(name)}&app_id=${options.appId}&per_page=100`, "--paginate", "--slurp"],
+    label,
+   );
+   if (!Array.isArray(raw)) throw new GitHubError(`${label}: invalid paged response`);
+   const ids = (raw as Record<string, unknown>[])
+    .flatMap((page) => (Array.isArray(page.check_runs) ? (page.check_runs as Record<string, unknown>[]) : []))
+    .filter((run) => run.name === name && ((run.app ?? {}) as Record<string, unknown>).id === options.appId)
+    .map((run) => Number(run.id));
+   if (ids.some((id) => !Number.isSafeInteger(id) || id <= 0)) throw new GitHubError(`${label}: a check run without an id`);
+   return ids.length === 0 ? null : Math.max(...ids);
+  },
+  async createCheckRun(repo, write) {
+   const label = `create check run ${write.name} on ${write.headSha}`;
+   const raw = (await api(await tokenFor(repo), [`repos/${repo}/check-runs`, "--method", "POST", ...checkRunFields(write, true)], label)) as Record<string, unknown> | null;
+   const id = Number(raw?.id);
+   if (!Number.isSafeInteger(id) || id <= 0) throw new GitHubError(`${label}: response without an id`);
+   return id;
+  },
+  async updateCheckRun(repo, id, write) {
+   await api(await tokenFor(repo), [`repos/${repo}/check-runs/${id}`, "--method", "PATCH", ...checkRunFields(write, false)], `update check run ${id}`);
+  },
+ };
+}
+
+/** Head SHAs of the open pull requests that contain `sha` (the machine account's read, not the App's). */
+export async function openPullHeadsContaining(repo: string, sha: string, token: string, api: GhApi = ghApi): Promise<string[]> {
+ const label = `pull requests containing ${sha}`;
+ const raw = await api(token, [`repos/${repo}/commits/${sha}/pulls?per_page=100`, "--paginate", "--slurp"], label);
+ return pagedList(raw, label)
+  .filter((pr) => pr.state === "open")
+  .map((pr) => ((pr.head ?? {}) as Record<string, unknown>).sha)
+  .filter((head): head is string => typeof head === "string" && head.length > 0);
 }
