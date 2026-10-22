@@ -209,6 +209,16 @@ export class BusOutbox {
    () => { this.db.query("INSERT INTO refusals VALUES(?,?,?,?,?)").run(job.jobId, input.origin.issuer, code, JSON.stringify(job), at); });
  }
 
+ async retainedRefusal(input: { job: RemoteTestJob; origin: { issuer: string; actor?: string } }): Promise<OutboxEvent | null> {
+  authorizeBusProducer(this.options.bus, input.origin, input.job);
+  const row = this.db.query("SELECT * FROM events WHERE jobid=? AND origin='refusal'").get(input.job.jobId) as EventRow | null;
+  if (!row) return null;
+  const refusal = this.db.query("SELECT issuer FROM refusals WHERE jobid=?").get(input.job.jobId) as { issuer: string } | null;
+  if (row.job !== JSON.stringify(input.job) || refusal?.issuer !== input.origin.issuer) throw new BusOutboxRefusal("conflict", "Refusal identity conflict");
+  await this.reverify(row);
+  return eventOf(row);
+ }
+
  private async reverify(row: EventRow) {
   const job = validateJobIdentity(JSON.parse(row.job));
   if (row.origin === "refusal") { await this.assertNotAdmitted(job); return; }

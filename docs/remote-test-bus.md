@@ -1,6 +1,6 @@
 # Private ci-test bus contracts
 
-The [settled bus boundary](https://github.com/the-metafactory/ranger/issues/146) hosts a Ranger bus worker beside the private executor, with the private Clawbox stack owning the request queue and result storage. Only configured Ranger issuers acting as themselves may invoke reviewed repository/profile bindings. `src/remote-test/bus-contract.ts` defines the strict shapes; `src/remote-test/bus-admission.ts` authenticates and admits a signed request. No Ranger command activates bus consumption. Existing SSH, executor and supervisor configuration parse unchanged; `testBackend.kind` still accepts only `ssh` and `shadow`.
+The [settled bus boundary](https://github.com/the-metafactory/ranger/issues/146) hosts a Ranger bus worker beside the private executor, with the private Clawbox stack owning the request queue and result storage. Only configured Ranger issuers acting as themselves may invoke reviewed repository/profile bindings. `src/remote-test/bus-contract.ts` defines the strict shapes; `src/remote-test/bus-admission.ts` authenticates and admits a signed request. The explicit `remote-test bus-worker` command activates consumption. Existing SSH, executor and supervisor configuration parse unchanged; `testBackend.kind` still accepts only `ssh` and `shadow`.
 
 ## Request
 
@@ -14,14 +14,14 @@ The job is the existing V1 schema with every identity field. `source.bundleDiges
 
 ## Operator configuration
 
-`validateBusConfig(input)` checks private operator JSON. [`examples/remote-test-bus-config.json`](examples/remote-test-bus-config.json) is an inert skeleton that fails validation until every `REPLACE_*` value is substituted outside Git. Every field is required and nothing has a default:
+`validateBusConfig(input)` checks private operator JSON. [`examples/remote-test-bus-config.json`](examples/remote-test-bus-config.json) is an inert skeleton that fails validation until every `REPLACE_*` value is substituted outside Git. Every field except the progress interval is required:
 
-- `target.domain` and `target.account`: the explicit JetStream domain and account. The default domain is never inferred.
+- `target.domain` and `target.account`: the explicit JetStream domain and account. The worker requires the account public key from the operator user JWT; account aliases and other credential formats refuse readiness. The default domain is never inferred.
 - `routing`: `classification` is fixed to `local`, plus principal and stack subject tokens. Federated and public routing are unsupported.
 - `streams.request.stream`, `streams.request.durable` and `streams.result.stream`: exact names. The request and result streams must differ. Wildcards, dots and whitespace refuse.
 - `transport.servers`: fixed `nats://host:port` or `tls://host:port` locators without credentials, paths or queries. `transport.credentialsFile` is a normalized absolute operator path.
 - `ssh.configFile`: the existing reviewed SSH JSON that source staging reuses.
-- `execution`: `maxAckPending` and `maxConcurrentJobs` are fixed to 1. `ackWaitSeconds`, `progressIntervalSeconds` (less than the ack wait) and `maxDeliver` are bounded.
+- `execution`: `maxAckPending` and `maxConcurrentJobs` are fixed to 1. `ackWaitSeconds` and `maxDeliver` are bounded. An omitted `progressIntervalSeconds` defaults to one third of the verified ack wait; an explicit interval must be positive and shorter than that wait.
 - `registry.file`: the private Myelin identity registry.
 - `issuers`: at least one concrete issuer DID, each with at least one exact `{repositoryId, profileId, profileDigest}` binding. Missing, empty, duplicate or wildcard entries fail closed.
 
@@ -29,11 +29,23 @@ The job is the existing V1 schema with every identity field. `source.bundleDiges
 
 Keep the substituted configuration, issuer identities, endpoints, credentials and registry in operator-owned locations outside all Git repositories. Activation, credential issuance and gate promotion remain separate operator checkpoints.
 
+## Opt-in worker lifecycle
+
+Run `ranger remote-test bus-worker --config <private-bus-json> --executor-config <private-executor-json> --signer <private-result-signer-json> --outbox-root <private-directory>` only on the reviewed executor host. The signer uses `{version:1, issuer:<DID>, seed:<base64 Ed25519 seed>}`. This command neither provisions resources nor promotes remote results into supervisor or merge gates.
+
+Startup snapshots the checked user JWT and seed into canonical credential blocks in the private worker workspace, then connects through the Cortex runtime with that snapshot and explicit JetStream domain. It reads the existing request/result streams and named durable. Missing resources or drift in filter, explicit acknowledgements, `MaxAckPending=1`, ack wait or delivery limit refuse readiness. The existing request stream must have a positive `max_msg_size` no greater than 128 KiB, bounding envelopes before SDK decoding. The pull requests one message and runs one handler. Worker credentials need read/bind/publish permissions, with provisioning permissions denied.
+
+The public `startBusWorker` / `handle` / `stop` seam composes signed admission, staged digest lookup, the existing source verifier, reviewed executor, JobLedger and terminal outbox. Unauthenticated or unauthorized inputs terminate without job attribution. Authenticated source/profile/expiry refusals use explicit non-receipt outbox evidence. Store, capacity and transport faults yield delayed retry. Current retained terminal receipts replay without execution; interrupted attempts require explicit confirmed recovery before the remaining bounded attempt can run. Request ack requires a durably delivered outbox event. Progress runs during execution and terminal publication, defaults to one third of the verified ack wait, and must be at least one second and shorter than that wait.
+
+SIGINT/SIGTERM abort execution through its durable cancellation controls, await cleanup, stop the subscription/runtime and release the private `.bus-worker` workspace. A stale workspace refuses startup. With the previous worker and executor stopped, the existing `remote-test recover` command verifies owned-container absence and removes a workspace only when its owner matches the execution ledger. Restart never manufactures a receipt or performs automatic recovery.
+
+`test/remote-test-bus-worker.test.ts` covers the public lifecycle with real ledger/staged fixtures and fault injection. `test/remote-test-bus-worker-transport.test.ts` uses disposable native authenticated JetStream brokers, denies worker provisioning, holds a delivery beyond ack wait and verifies the signed durable terminal result. It skips when `nats-server` is unavailable. No container runtime is needed for these tests.
+
 ## Terminal lifecycle outbox
 
 `src/remote-test/bus-outbox.ts` retains terminal lifecycle events in a private SQLite store (`outbox.sqlite`, mode 0600) under an operator-owned outbox root that must be separate from the executor jobs root. It consumes the published Cortex bus SDK (`@the-metafactory/cortex/bus`): the dispatch lifecycle builders and `publishDurable`. It opens no connection itself; the caller passes a runtime or any object with `publishDurable`. It never admits, completes or executes a job.
 
-The dependency is pinned to Cortex commit `937676b`, which is the accepted `v6.17.1` plus the public export of `MyelinDurablePublishError` and the durable option/ack types (cortex#2711). No release contains that export yet; move the pin to the next release tag when one exists.
+The dependency is pinned to Cortex `v6.17.2` (`3a645ff`), which exports the durable publisher error/types and the delivery `working()` context used by the worker.
 
 - `enqueueTerminal(job)` accepts only an authoritative receipt: the job must have a ledger row with a terminal, non-revoked outcome, the retained receipt must exist, and its bytes must equal the ledger receipt. Rowless, revoked, unfinished, absent or conflicting evidence throws `BusOutboxRefusal` and queues nothing. The receipt is then exported to `receipts/<jobId>.json` through the existing atomic exporter, and one event is queued in a single transaction. Repeating the call after a crash returns the same event.
 - `passed` maps to `dispatch.task.completed`; `test_failed`, `infra_failed` and `rejected` map to `dispatch.task.failed`; `timed_out` and `cancelled` map to `dispatch.task.aborted`. The summary carries the status, correlation id, the `ci-test` capability and an opaque `sha256` of the exported receipt. It carries no log, source, path or credential.

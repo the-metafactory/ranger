@@ -7,6 +7,7 @@ import { z } from "zod";
 import { killProcessGroup } from "../exec.ts";
 import { ResourceObservationSchema, validateProfileManifest, validateRemoteTestJob, validateRemoteTestReceipt, type RemoteTestReceipt, type ResourceObservation } from "./contract.ts";
 import { ArtifactPolicySchema, persistExecution, readExecutionReceipt, type ArtifactOptions } from "./artifacts.ts";
+import { BUS_WORKER_DIR, readBusWorkerOwner } from "./bus-worker-workspace.ts";
 import { restoreSource } from "./source.ts";
 import { ActiveRemoteTestJob, BusyRemoteTestExecutor, InterruptedRemoteTestJob, RevokedRemoteTestJob, openJobLedger, type JobLedger, type OwnedContainer } from "./job-ledger.ts";
 import { REMOTE_TEST_LIMITS, profileBudgets, type ReviewedPolicy, type ContainerBudget } from "./profiles.ts";
@@ -457,6 +458,13 @@ export async function reconcileRemoteTests(input: unknown, options: { launcher?:
      const owner = JSON.parse(await readFile(join(lane, "owner.json"), "utf8"));
      if (owner.ledgerId !== ledger.id || !jobs.some(j => j.jobId === owner.jobId)) throw Error("Unknown recovery lane owner");
      await rm(lane, { recursive: true });
+    }
+    const worker = join(root, BUS_WORKER_DIR), workerInfo = await lstat(worker).catch((e: unknown) => { if ((e as NodeJS.ErrnoException).code === "ENOENT") return null; throw e; });
+    if (workerInfo) {
+     if (!workerInfo.isDirectory() || workerInfo.uid !== process.getuid?.() || (workerInfo.mode & 0o077)) throw Error("Unsafe recovery bus worker");
+     const owner = await readBusWorkerOwner(worker);
+     if (owner.ledgerId !== ledger.id) throw Error("Unknown recovery bus worker owner");
+     await rm(worker, { recursive: true });
     }
     const inbox = join(root, ".ssh-incoming"), inboxInfo = await lstat(inbox).catch(e => { if (e.code === "ENOENT") return null; throw e; });
     if (inboxInfo && (!inboxInfo.isDirectory() || inboxInfo.uid !== process.getuid?.() || (inboxInfo.mode & 0o077))) throw Error("Unsafe recovery inbox");

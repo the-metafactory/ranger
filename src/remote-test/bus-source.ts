@@ -100,7 +100,11 @@ async function readReference(directory: string): Promise<ReferenceFile> {
 async function verifyObject(directory: string, digest: string): Promise<ReferenceFile> {
  let reference: ReferenceFile;
  try { reference = await readReference(directory); }
- catch (e) { if (e instanceof StagedSourceRefusal) throw e; throw new StagedSourceRefusal("stage_conflict", "Stored source reference is invalid"); }
+ catch (e) {
+  const code = (e as NodeJS.ErrnoException).code;
+  if (e instanceof StagedSourceRefusal || typeof code === "string" && !["ENOENT", "ENOTDIR", "ELOOP"].includes(code)) throw e;
+  throw new StagedSourceRefusal("stage_conflict", "Stored source reference is invalid");
+ }
  if (reference.bundleDigest !== digest) throw new StagedSourceRefusal("stage_conflict", "Stored source does not match its content address");
  const { file, size: bytes } = await openPrivateFile(join(directory, "source.bundle"), SSH_LIMITS.bundleBytes);
  try {
@@ -112,7 +116,7 @@ async function verifyObject(directory: string, digest: string): Promise<Referenc
  return reference;
 }
 const expired = (reference: ReferenceFile, now: number, retentionMs: number) => now - reference.storedAt >= retentionMs;
-function sourceManifest(job: RemoteTestJob) {
+export function sourceManifest(job: RemoteTestJob) {
  return { version: 1 as const, commitDigest: job.commitDigest, treeDigest: job.treeDigest, bundleDigest: job.bundleDigest };
 }
 
@@ -299,7 +303,7 @@ export async function receiveStagedSource(
  * staged bytes are rechecked against the private reference, then the existing
  * restoreSource validation snapshots, re-hashes and detaches the exact commit.
  * Missing, expired, unsafe or corrupt objects never become execution source. */
-export async function loadStagedSource(input: { config: unknown; job: unknown }, options: { now?: () => number } = {}) {
+export async function stagedSourceBundle(input: { config: unknown; job: unknown }, options: { now?: () => number } = {}) {
  const config = validateExecutorConfig(input.config);
  const selected = config.profiles.find(p => p.profile.profileId === (input.job as { profileId?: unknown } | null)?.profileId);
  if (!selected) throw Error("Job profile is not operator-approved");
@@ -310,6 +314,11 @@ export async function loadStagedSource(input: { config: unknown; job: unknown },
  catch (e) { if (missing(e)) throw new StagedSourceRefusal("stage_missing", "No staged source for this job"); throw e; }
  const reference = await verifyObject(directory, job.bundleDigest);
  if (expired(reference, (options.now ?? Date.now)(), config.artifacts.retentionMs)) throw new StagedSourceRefusal("expired", "Staged source expired");
- const restored = await restoreSource({ bundlePath: join(directory, "source.bundle"), manifest: sourceManifest(job), jobsRoot: root, jobId: job.jobId });
- return { ...restored, reference: { bundleDigest: reference.bundleDigest, bundleBytes: reference.bundleBytes } as StagedSourceReference };
+ return { bundlePath: join(directory, "source.bundle"), job, jobsRoot: root, reference: { bundleDigest: reference.bundleDigest, bundleBytes: reference.bundleBytes } as StagedSourceReference };
+}
+
+export async function loadStagedSource(input: { config: unknown; job: unknown }, options: { now?: () => number } = {}) {
+ const staged = await stagedSourceBundle(input, options);
+ const restored = await restoreSource({ bundlePath: staged.bundlePath, manifest: sourceManifest(staged.job), jobsRoot: staged.jobsRoot, jobId: staged.job.jobId });
+ return { ...restored, reference: staged.reference };
 }

@@ -73,6 +73,7 @@ import { classifyReceiverFailure, saveRefusalDiagnostic, TaggedReceiverFailure }
 import { serveSshResponse } from "./remote-test/ssh-server.ts";
 import { runCheckReporter } from "./remote-test/check-reporter.ts";
 import { BusProducerRefusal, busOutcomeExitCode, busOutcomeMessage, retryBusCommand, runBusCommand, statusBusCommand, type RunBusCommand } from "./remote-test/bus-producer.ts";
+import { BusWorkerReadinessRefusal, runBusWorkerCommand } from "./remote-test/bus-worker.ts";
 import { spawnBudget } from "./digest.ts";
 
 /**
@@ -741,6 +742,20 @@ remoteTest.command("bus-status")
   process.once("SIGINT", cancel); process.once("SIGTERM", cancel);
   try { const result = await statusBusCommand(options, { ssh: { signal: abort.signal } }); process.stdout.write(sshOutcomeMessage(result)); process.exitCode = sshOutcomeExitCode(result); }
   catch (error) { busFailure("bus-status", error); }
+  finally { process.removeListener("SIGINT", cancel); process.removeListener("SIGTERM", cancel); }
+ });
+
+remoteTest.command("bus-worker")
+ .description("Opt-in one-job durable bus worker; recovery and local verification authority remain explicit")
+ .requiredOption("--config <path>", "private bus configuration JSON")
+ .requiredOption("--executor-config <path>", "private reviewed executor configuration JSON")
+ .requiredOption("--signer <path>", "private result signer JSON")
+ .requiredOption("--outbox-root <path>", "private terminal outbox directory outside the jobs root")
+ .action(async (options: { config: string; executorConfig: string; signer: string; outboxRoot: string }) => {
+  const abort = new AbortController(), cancel = () => { abort.abort(); };
+  process.once("SIGINT", cancel); process.once("SIGTERM", cancel);
+  try { await runBusWorkerCommand(options, abort.signal); }
+  catch (error) { process.stderr.write(`ranger remote-test bus-worker: not ready (${error instanceof BusWorkerReadinessRefusal ? error.code : "private_configuration"})\n`); process.exitCode = 1; }
   finally { process.removeListener("SIGINT", cancel); process.removeListener("SIGTERM", cancel); }
  });
 
