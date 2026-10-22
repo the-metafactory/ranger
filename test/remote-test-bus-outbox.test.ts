@@ -328,3 +328,52 @@ test("the outbox root must be private, separate from the jobs root and bound to 
   await expect(openBusOutbox({ ...options, bus: moved, root: f.root })).rejects.toThrow("different executor, stream or domain");
  } finally { outbox.close(); f.close(); }
 });
+
+test("a withheld refusal is superseded by the terminal receipt once the job is admitted and finished", async () => {
+ const f = await fixture(), outbox = await f.opened(), j = job();
+ try {
+  const refusal = await outbox.enqueueRefusal({ job: j, origin: { issuer: ISSUER }, code: "busy" });
+  await finish(f, j);
+  const { publisher: first } = recorder();
+  expect((await outbox.drain(first)).withheld).toEqual([{ eventId: refusal.eventId, code: "already_recorded" }]);
+  expect(outbox.ackEligible(j.jobId)).toBe(false);
+  const event = await outbox.enqueueTerminal(j);
+  expect(event).toMatchObject({ origin: "receipt", state: "pending" });
+  expect(event.eventId).not.toBe(refusal.eventId);
+  expect(outbox.events()).toEqual([event]);
+  const { calls, publisher } = recorder();
+  expect((await outbox.drain(publisher)).delivered).toEqual([event.eventId]);
+  expect(calls[0].envelope.type).toBe("dispatch.task.completed");
+  expect(outbox.ackEligible(j.jobId)).toBe(true);
+  await expect(outbox.enqueueRefusal({ job: j, origin: { issuer: ISSUER }, code: "busy" })).rejects.toBeInstanceOf(BusOutboxRefusal);
+ } finally { f.close(); }
+});
+
+test("a revocation that lands just before the publish call is withheld and never published", async () => {
+ let revoke: (() => void) | undefined;
+ const f = await fixture(step => { if (step === "publish") { revoke?.(); revoke = undefined; } });
+ const j = job(); await finish(f, j);
+ const outbox = await f.opened(), { calls, publisher } = recorder();
+ try {
+  const event = await outbox.enqueueTerminal(j);
+  revoke = () => { f.ledger.cancel(j); };
+  expect(await outbox.drain(publisher)).toEqual({ delivered: [], withheld: [{ eventId: event.eventId, code: "revoked" }], failed: [] });
+  expect(calls).toEqual([]);
+  expect(outbox.ackEligible(j.jobId)).toBe(false);
+ } finally { f.close(); }
+});
+
+test("a backlog larger than one read batch drains in order and a failure stops it without losing the rest", async () => {
+ const f = await fixture(), outbox = await f.opened(), jobs = Array.from({ length: 40 }, job);
+ try {
+  const events = [];
+  for (const j of jobs) { await finish(f, j); events.push(await outbox.enqueueTerminal(j)); }
+  const { calls, publisher } = recorder((_, call) => call === 35 ? new Error("socket reset") : ({ stream: STREAM, seq: call, duplicate: false, domain: DOMAIN }));
+  const report = await outbox.drain(publisher);
+  expect(report.delivered).toEqual(events.slice(0, 34).map(e => e.eventId));
+  expect(report.failed).toEqual([{ eventId: events[34].eventId, kind: "publish_failed" }]);
+  expect(calls).toHaveLength(35);
+  const rest = recorder();
+  expect((await outbox.drain(rest.publisher)).delivered).toEqual(events.slice(34).map(e => e.eventId));
+ } finally { f.close(); }
+});

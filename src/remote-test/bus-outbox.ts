@@ -16,6 +16,7 @@ import { openJobLedger, RemoteTestIdentityConflict } from "./job-ledger.ts";
 
 export const CI_TEST_CAPABILITY = "ci-test";
 const AGENT_ID = "ranger";
+const DRAIN_BATCH = 32;
 
 const LIFECYCLE = {
  passed: "completed", test_failed: "failed", infra_failed: "failed", rejected: "failed", timed_out: "aborted", cancelled: "aborted",
@@ -107,6 +108,7 @@ export class BusOutbox {
      PRAGMA user_version=1;`);
     db.query("INSERT INTO outbox_meta VALUES(1,?,?,?)").run(executorId, bus.streams.result.stream, bus.target.domain);
    }
+   db.run("CREATE INDEX IF NOT EXISTS events_state ON events(state)");
   });
   const meta = db.query("SELECT executor,stream,domain FROM outbox_meta WHERE singleton=1").get() as { executor: string; stream: string; domain: string };
   if (meta.executor !== executorId || meta.stream !== bus.streams.result.stream || meta.domain !== bus.target.domain) { throw Error("Outbox store is bound to a different executor, stream or domain"); }
@@ -167,8 +169,12 @@ export class BusOutbox {
   return this.tx(() => {
    const existing = this.db.query("SELECT * FROM events WHERE jobid=?").get(job.jobId) as EventRow | null;
    if (existing) {
-    if (existing.origin !== origin || existing.job !== encoded || existing.evidence !== evidence) throw new BusOutboxRefusal("conflict", "A different lifecycle event is already queued for this job");
-    return eventOf(existing);
+    const supersedes = existing.state === "withheld" && existing.origin === "refusal" && origin === "receipt" && existing.job === encoded;
+    if (!supersedes) {
+     if (existing.origin !== origin || existing.job !== encoded || existing.evidence !== evidence) throw new BusOutboxRefusal("conflict", "A different lifecycle event is already queued for this job");
+     return eventOf(existing);
+    }
+    this.db.query("DELETE FROM events WHERE id=?").run(existing.id);
    }
    const envelope = build();
    extra?.();
@@ -212,31 +218,36 @@ export class BusOutbox {
  async drain(publisher: DurablePublisher, options: { timeoutMs?: number } = {}): Promise<DrainReport> {
   const report: DrainReport = { delivered: [], withheld: [], failed: [] };
   const { stream, domain } = { stream: this.options.bus.streams.result.stream, domain: this.options.bus.target.domain };
-  for (const row of this.db.query("SELECT * FROM events WHERE state='pending' ORDER BY rowid").all() as EventRow[]) {
-   try { await this.reverify(row); }
-   catch (e) {
-    if (e instanceof BusOutboxRefusal) { this.settle("UPDATE events SET state='withheld',failure=? WHERE id=? AND state='pending'", e.code, row.id); report.withheld.push({ eventId: row.id, code: e.code }); continue; }
-    this.settle("UPDATE events SET attempts=attempts+1,failure='evidence_unavailable' WHERE id=? AND state='pending'", row.id);
-    report.failed.push({ eventId: row.id, kind: "evidence_unavailable" });
-    continue;
-   }
-   let failure: string | undefined, ack: Awaited<ReturnType<DurablePublisher["publishDurable"]>> | undefined;
-   try {
+  let cursor = 0;
+  for (;;) {
+   const batch = this.db.query("SELECT rowid AS rid, * FROM events WHERE state='pending' AND rowid>? ORDER BY rowid LIMIT ?").all(cursor, DRAIN_BATCH) as (EventRow & { rid: number })[];
+   if (batch.length === 0) return report;
+   for (const row of batch) {
+    cursor = row.rid;
     await this.step("publish");
-    ack = await publisher.publishDurable(JSON.parse(row.envelope) as Envelope, { expectedStream: stream, ...(options.timeoutMs !== undefined && { timeoutMs: options.timeoutMs }) });
-    if (ack.stream !== stream || ack.domain !== domain || !Number.isSafeInteger(ack.seq) || ack.seq <= 0) failure = "ack_mismatch";
-   } catch (e) { failure = e instanceof MyelinDurablePublishError ? e.kind : "publish_failed"; }
-   if (failure || !ack) {
-    failure ??= "publish_failed";
-    this.settle("UPDATE events SET attempts=attempts+1,failure=? WHERE id=? AND state='pending'", failure, row.id);
-    report.failed.push({ eventId: row.id, kind: failure });
-    break;
+    try { await this.reverify(row); }
+    catch (e) {
+     if (e instanceof BusOutboxRefusal) { this.settle("UPDATE events SET state='withheld',failure=? WHERE id=? AND state='pending'", e.code, row.id); report.withheld.push({ eventId: row.id, code: e.code }); continue; }
+     this.settle("UPDATE events SET attempts=attempts+1,failure='evidence_unavailable' WHERE id=? AND state='pending'", row.id);
+     report.failed.push({ eventId: row.id, kind: "evidence_unavailable" });
+     continue;
+    }
+    let failure: string | undefined, ack: Awaited<ReturnType<DurablePublisher["publishDurable"]>> | undefined;
+    try {
+     ack = await publisher.publishDurable(JSON.parse(row.envelope) as Envelope, { expectedStream: stream, ...(options.timeoutMs !== undefined && { timeoutMs: options.timeoutMs }) });
+     if (ack.stream !== stream || ack.domain !== domain || !Number.isSafeInteger(ack.seq) || ack.seq <= 0) failure = "ack_mismatch";
+    } catch (e) { failure = e instanceof MyelinDurablePublishError ? e.kind : "publish_failed"; }
+    if (failure || !ack) {
+     failure ??= "publish_failed";
+     this.settle("UPDATE events SET attempts=attempts+1,failure=? WHERE id=? AND state='pending'", failure, row.id);
+     report.failed.push({ eventId: row.id, kind: failure });
+     return report;
+    }
+    await this.step("acked");
+    this.settle("UPDATE events SET state='delivered',failure=NULL,stream=?,seq=?,delivered=? WHERE id=? AND state='pending'", ack.stream, ack.seq, this.now(), row.id);
+    report.delivered.push(row.id);
    }
-   await this.step("acked");
-   this.settle("UPDATE events SET state='delivered',failure=NULL,stream=?,seq=?,delivered=? WHERE id=? AND state='pending'", ack.stream, ack.seq, this.now(), row.id);
-   report.delivered.push(row.id);
   }
-  return report;
  }
 
  ackEligible(jobId: string): boolean {
