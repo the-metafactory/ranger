@@ -14,6 +14,7 @@ import { persistExecution } from "../src/remote-test/artifacts.ts";
 import { validateBusConfig, BUS_LIMITS } from "../src/remote-test/bus-contract.ts";
 import { receiveStagedSource } from "../src/remote-test/bus-source.ts";
 import { startBusWorker, connectBusWorker, BusWorkerReadinessRefusal, type BusWorker, type BusWorkerTransport, type BusWorkerInjected } from "../src/remote-test/bus-worker.ts";
+import { BUS_WORKER_DIR, readBusWorkerOwner, writeBusWorkerOwner } from "../src/remote-test/bus-worker-workspace.ts";
 import { reconcileRemoteTests, validateExecutorConfig } from "../src/remote-test/executor.ts";
 import { openJobLedger, BusyRemoteTestExecutor } from "../src/remote-test/job-ledger.ts";
 import { stageSource } from "../src/remote-test/source.ts";
@@ -43,7 +44,7 @@ async function fixture() {
  await writeFile(registry, JSON.stringify({ version: 2, identities: [{ id: issuer, network: "example", public_key: publicKey.export({ format: "der", type: "spki" }).subarray(-32).toString("base64"), type: "service", created_at: new Date().toISOString() }], trusted_hubs: [] }), { mode: 0o600 });
  const bus = validateBusConfig({ version: 1, target: { domain: "private", account: "A".repeat(56) }, routing: { classification: "local", principal: "example", stack: "private" },
   streams: { request: { stream: "REQUESTS", durable: "executor" }, result: { stream: "RESULTS" } }, transport: { servers: ["nats://127.0.0.1:4222"], credentialsFile: join(root, "user.creds") }, ssh: { configFile: join(root, "ssh.json") }, registry: { file: registry },
-  execution: { maxAckPending: 1, maxConcurrentJobs: 1, ackWaitSeconds: 10, progressIntervalSeconds: 0.01, maxDeliver: 3 }, issuers: [{ issuer, bindings: [{ repositoryId: job.repositoryId, profileId: profile.profileId, profileDigest: profile.profileDigest }] }] });
+  execution: { maxAckPending: 1, maxConcurrentJobs: 1, ackWaitSeconds: 10, progressIntervalSeconds: 1, maxDeliver: 3 }, issuers: [{ issuer, bindings: [{ repositoryId: job.repositoryId, profileId: profile.profileId, profileDigest: profile.profileDigest }] }] });
  const route = taskSubjectAndType("example", "ci-test", "private");
  const consumer = { durable_name: "executor", filter_subject: route.subject, ack_policy: "explicit", max_ack_pending: 1, ack_wait: 10e9, max_deliver: 3 };
  let subscription: MyelinSubscribePullOpts | undefined, closed = 0, executions = 0;
@@ -86,13 +87,15 @@ async function fixture() {
 
 test("public lifecycle uses one pull and serial handler and only a durably published receipt permits ack", async () => {
  const f = await fixture(), w = await f.start();
+ const l = await f.ledger();
+ try { expect(await readBusWorkerOwner(join(f.jobsRoot, BUS_WORKER_DIR))).toEqual({ ledgerId: l.id }); } finally { l.close(); }
  expect(f.subscription()).toMatchObject({ stream: "REQUESTS", durable: "executor", maxMessages: 1, maxConcurrent: 1 });
  expect(await w.handle(await f.input(), { working() {} })).toEqual({ kind: "ack" });
  expect(f.executions()).toBe(1); expect(f.published).toHaveLength(1);
  expect(f.published[0].payload.result_summary).toContain("status=passed");
  expect(await w.handle(await f.input(), { working() {} })).toEqual({ kind: "ack" });
  expect(f.executions()).toBe(1); expect(f.published).toHaveLength(1);
- await w.stop(); expect(f.closed()).toBe(1); expect(existsSync(join(f.jobsRoot, ".bus-worker"))).toBe(false);
+ await w.stop(); expect(f.closed()).toBe(1); expect(existsSync(join(f.jobsRoot, BUS_WORKER_DIR))).toBe(false);
 });
 
 test("pending durable publication retries after restart without another execution and keeps event identity", async () => {
@@ -211,11 +214,24 @@ test("only explicit confirmed recovery enables the remaining bounded attempt wit
 
 test("explicit executor recovery removes only a ledger-owned stale bus workspace after container absence", async () => {
  const f = await fixture(), l = await f.ledger();
- const workspace = join(f.jobsRoot, ".bus-worker"); await mkdir(workspace, { mode: 0o700 }); await writeFile(join(workspace, "owner.json"), JSON.stringify({ ledgerId: l.id }), { mode: 0o600 }); l.close();
+ const workspace = join(f.jobsRoot, BUS_WORKER_DIR); await mkdir(workspace, { mode: 0o700 }); await writeBusWorkerOwner(workspace, l.id); l.close();
  const commands: string[][] = [];
  await reconcileRemoteTests(f.executor, { launcher: async argv => { commands.push([...argv]); return { code: 0, stdout: "" }; } });
  expect(commands).toHaveLength(2); expect(commands.every(c => c.includes("ps"))).toBe(true); expect(existsSync(workspace)).toBe(false);
  await f.start();
+});
+
+test.each([
+ ["foreign ledger", (_id: string) => ({ ledgerId: randomUUID() })],
+ ["malformed ledger", (_id: string) => ({ ledgerId: "invalid" })],
+ ["unknown field", (id: string) => ({ ledgerId: id, extra: true })],
+] as const)("executor recovery retains a bus workspace with %s", async (_label, owner) => {
+ const f = await fixture(), l = await f.ledger(), invalid = owner(l.id); l.close();
+ const workspace = join(f.jobsRoot, BUS_WORKER_DIR); await mkdir(workspace, { mode: 0o700 });
+ await writeFile(join(workspace, "owner.json"), JSON.stringify(invalid), { mode: 0o600 });
+ await expect(reconcileRemoteTests(f.executor, { launcher: async () => ({ code: 0, stdout: "" }) })).rejects.toThrow();
+ expect(existsSync(workspace)).toBe(true);
+ await expect(f.start()).rejects.toThrow(); expect(f.subscription()).toBeUndefined();
 });
 
 test("authenticated profile refusal delivers non-receipt evidence and cannot launch", async () => {
@@ -254,10 +270,11 @@ test("startup refuses unsupported SDK, missing resources, and unbounded request 
  expect(f.executions()).toBe(0);
 });
 
-test("progress defaults to one third of ack wait and refuses nonpositive or expired intervals", async () => {
+test("progress defaults to one third of ack wait and refuses sub-second or expired intervals", async () => {
  const f = await fixture(), raw = structuredClone(f.bus) as any; delete raw.execution.progressIntervalSeconds;
  expect(validateBusConfig(raw).execution.progressIntervalSeconds).toBe(10 / 3);
- for (const value of [0, -1, 10, 11, NaN, Infinity]) { raw.execution.progressIntervalSeconds = value; expect(() => validateBusConfig(raw)).toThrow(); }
+ for (const value of [0, -1, 0.001, 0.999, 10, 11, NaN, Infinity]) { raw.execution.progressIntervalSeconds = value; expect(() => validateBusConfig(raw)).toThrow(); }
+ for (const value of [1, 1.5, 9.999]) { raw.execution.progressIntervalSeconds = value; expect(validateBusConfig(raw).execution.progressIntervalSeconds).toBe(value); }
 });
 
 test("transport account mismatch refuses before SDK connection", async () => {

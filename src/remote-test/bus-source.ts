@@ -116,7 +116,7 @@ async function verifyObject(directory: string, digest: string): Promise<Referenc
  return reference;
 }
 const expired = (reference: ReferenceFile, now: number, retentionMs: number) => now - reference.storedAt >= retentionMs;
-function sourceManifest(job: RemoteTestJob) {
+export function sourceManifest(job: RemoteTestJob) {
  return { version: 1 as const, commitDigest: job.commitDigest, treeDigest: job.treeDigest, bundleDigest: job.bundleDigest };
 }
 

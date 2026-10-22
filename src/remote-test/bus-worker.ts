@@ -9,7 +9,8 @@ import { admitBusRequest, BusAdmissionRefusal, BusAdmissionUnavailable, BUS_TEST
 import { BUS_LIMITS, validateBusConfig, type BusConfig } from "./bus-contract.ts";
 import { BusOutboxRefusal, openBusOutbox, type BusOutbox, type BusOutboxOptions, type DurablePublisher, type RefusalCode } from "./bus-outbox.ts";
 import type { BusSigner } from "./bus-producer.ts";
-import { stagedSourceBundle, StagedSourceRefusal } from "./bus-source.ts";
+import { sourceManifest, stagedSourceBundle, StagedSourceRefusal } from "./bus-source.ts";
+import { BUS_WORKER_DIR, writeBusWorkerOwner } from "./bus-worker-workspace.ts";
 import { executeRemoteTest, validateExecutorConfig, type ExecutorConfig } from "./executor.ts";
 import { openJobLedger, ActiveRemoteTestJob, BusyRemoteTestExecutor, InterruptedRemoteTestJob, RemoteTestIdentityConflict, RevokedRemoteTestJob, type JobLedger } from "./job-ledger.ts";
 import { restoreSource, SourceError } from "./source.ts";
@@ -34,8 +35,9 @@ export class BusWorkerReadinessRefusal extends Error {
  constructor(readonly code: string) { super(`Bus worker not ready: ${code}`); }
 }
 const refuse = (code: string): never => { throw new BusWorkerReadinessRefusal(code); };
+const SIGNER_DID = /^did:[a-z0-9]+(?::[A-Za-z0-9._-]+)+$/;
 const CredentialsSchema = z.object({ iss: z.string(), sub: z.string().regex(/^U[A-Z2-7]{55}$/), nats: z.object({ type: z.literal("user"), issuer_account: z.string().optional() }).passthrough() }).passthrough();
-const SignerSchema = z.object({ version: z.literal(1), issuer: z.string().regex(/^did:[a-z0-9]+(?::[A-Za-z0-9._-]+)+$/), seed: z.string().regex(/^[A-Za-z0-9+/]{43}=$/) }).strict();
+const SignerSchema = z.object({ version: z.literal(1), issuer: z.string().regex(SIGNER_DID), seed: z.string().regex(/^[A-Za-z0-9+/]{43}=$/) }).strict();
 
 export const connectBusWorker = (start: typeof startMyelinRuntime) => async (bus: BusConfig, signer: BusSigner, directory: string): Promise<BusWorkerTransport> => {
  const path = await privateOperatorPath(bus.transport.credentialsFile, true);
@@ -128,31 +130,48 @@ export class BusWorker {
   const job = admitted.request.job, origin = admitted.provenance;
   if (refusal) await this.outbox.enqueueRefusal({ job, origin, code: refusal });
   else await this.outbox.enqueueTerminal(job);
+  return await this.drainAndDecide(job.jobId, !refusal);
+ }
+
+ private async drainAndDecide(jobId: string, requireTerminal = false): Promise<BusWorkerDecision> {
   await this.outbox.drain(this.transport);
-  if (!refusal && !await this.outbox.authorized(job.jobId)) return this.term("terminal_unavailable");
-  return this.outbox.ackEligible(job.jobId) ? { kind: "ack" } : this.retry();
+  if (requireTerminal && !await this.outbox.authorized(jobId)) return this.term("terminal_unavailable");
+  return this.outbox.ackEligible(jobId) ? { kind: "ack" } : this.retry();
+ }
+
+ private async admitOrRefuse(input: { bytes: Uint8Array; subject: string }): Promise<{ admitted: AdmittedBusRequest; refusal?: RefusalCode } | BusWorkerDecision> {
+  try { return { admitted: await admitBusRequest(input, this.context) }; }
+  catch (error) {
+   if (error instanceof BusAdmissionUnavailable) return this.retry();
+   if (!(error instanceof BusAdmissionRefusal)) return this.retry();
+   if (!error.authenticated) return this.term(`admission_${error.stage}_${error.code}`);
+   return { admitted: error.authenticated, refusal: error.stage === "expiry" ? "expired" : "profile_rejected" };
+  }
+ }
+
+ private async prepareSource(admitted: AdmittedBusRequest, sources: string): Promise<string | BusWorkerDecision> {
+  const job = admitted.request.job;
+  try {
+   const staged = await stagedSourceBundle({ config: this.executor, job });
+   if (staged.reference.bundleBytes !== admitted.request.source.bundleBytes) return await this.deliver(admitted, "source_rejected");
+   await restoreSource({ bundlePath: staged.bundlePath, jobsRoot: sources, jobId: job.jobId, manifest: sourceManifest(job) });
+   return staged.bundlePath;
+  } catch (error) {
+   if (error instanceof StagedSourceRefusal && !["stage_busy", "stage_capacity", "interrupted"].includes(error.code) || error instanceof SourceError && error.code !== "source_io") return await this.deliver(admitted, "source_rejected");
+   return this.retry();
+  }
  }
 
  private async run(input: { bytes: Uint8Array; subject: string }, delivery: EnvelopeHandlerContext, signal: AbortSignal): Promise<BusWorkerDecision> {
   const progress = { failed: false }, cancelled = () => signal.aborted;
   const timer = setInterval(() => { try { delivery.working(); } catch { progress.failed = true; } }, this.bus.execution.progressIntervalSeconds * 1000);
   try {
-   let admitted: AdmittedBusRequest;
-   let refusal: RefusalCode | undefined;
-   try { admitted = await admitBusRequest(input, this.context); }
-   catch (error) {
-    if (error instanceof BusAdmissionUnavailable) return this.retry();
-    if (!(error instanceof BusAdmissionRefusal)) return this.retry();
-    if (!error.authenticated) return this.term(`admission_${error.stage}_${error.code}`);
-    admitted = error.authenticated;
-    refusal = error.stage === "expiry" ? "expired" : "profile_rejected";
-   }
+   const admission = await this.admitOrRefuse(input);
+   if (!("admitted" in admission)) return admission;
+   const { admitted, refusal } = admission;
    const job = admitted.request.job;
    const retained = await this.outbox.retainedRefusal({ job, origin: admitted.provenance });
-   if (retained) {
-    await this.outbox.drain(this.transport);
-    return this.outbox.ackEligible(job.jobId) ? { kind: "ack" } : this.retry();
-   }
+   if (retained) return await this.drainAndDecide(job.jobId);
    const state = this.ledger.status(job);
    if (state?.kind === "revoked") return this.term("revoked");
    if (state?.kind === "active" || state?.kind === "interrupted" && !this.ledger.retryReady(job)) return this.retry();
@@ -161,16 +180,8 @@ export class BusWorker {
    if (cancelled()) return this.retry();
    const sources = join(this.directory, "source");
    try {
-    let bundlePath: string;
-    try {
-     const staged = await stagedSourceBundle({ config: this.executor, job });
-     if (staged.reference.bundleBytes !== admitted.request.source.bundleBytes) return await this.deliver(admitted, "source_rejected");
-     await restoreSource({ bundlePath: staged.bundlePath, jobsRoot: sources, jobId: job.jobId, manifest: { version: 1, commitDigest: job.commitDigest, treeDigest: job.treeDigest, bundleDigest: job.bundleDigest } });
-     bundlePath = staged.bundlePath;
-    } catch (error) {
-     if (error instanceof StagedSourceRefusal && !["stage_busy", "stage_capacity", "interrupted"].includes(error.code) || error instanceof SourceError && error.code !== "source_io") return await this.deliver(admitted, "source_rejected");
-     return this.retry();
-    }
+    const bundlePath = await this.prepareSource(admitted, sources);
+    if (typeof bundlePath !== "string") return bundlePath;
     if (cancelled()) return this.retry();
     await (this.injected.execute ?? executeRemoteTest)({ job, bundlePath, config: this.executor }, { signal });
     if (progress.failed) return this.retry();
@@ -201,13 +212,13 @@ export class BusWorker {
 
 export async function startBusWorker(input: BusWorkerInput, injected: BusWorkerInjected = {}): Promise<BusWorker> {
  const bus = validateBusConfig(input.bus), executor = validateExecutorConfig(input.executor);
- if (input.signer.seed.length !== 32 || !/^did:[a-z0-9]+(?::[A-Za-z0-9._-]+)+$/.test(input.signer.issuer)) return refuse("signer");
- const directory = await privateOperatorPath(join(executor.jobsRoot, ".bus-worker"));
+ if (input.signer.seed.length !== 32 || !SIGNER_DID.test(input.signer.issuer)) return refuse("signer");
+ const directory = await privateOperatorPath(join(executor.jobsRoot, BUS_WORKER_DIR));
  await mkdir(directory, { mode: 0o700 });
  let ledger: JobLedger | undefined, outbox: BusOutbox | undefined, transport: BusWorkerTransport | undefined, worker: BusWorker | undefined;
  try {
   ledger = await openJobLedger(executor.jobsRoot, executor.executorId);
-  await writeFile(join(directory, "owner.json"), JSON.stringify({ ledgerId: ledger.id }), { mode: 0o600, flag: "wx" });
+  await writeBusWorkerOwner(directory, ledger.id);
   await mkdir(join(directory, "source"), { mode: 0o700 });
   transport = await (injected.connect ?? connectBusWorker(startMyelinRuntime))(bus, input.signer, directory);
   await verifyResources(transport, bus);

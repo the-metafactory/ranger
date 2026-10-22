@@ -64,7 +64,7 @@ const BusConfigSchema = z.object({
   maxAckPending: z.literal(1),
   maxConcurrentJobs: z.literal(1),
   ackWaitSeconds: z.number().int().min(10).max(3600),
-  progressIntervalSeconds: z.number().positive().optional(),
+  progressIntervalSeconds: z.number().min(1).optional(),
   maxDeliver: z.number().int().min(1).max(10),
  }).strict().transform(e => ({ ...e, progressIntervalSeconds: e.progressIntervalSeconds ?? e.ackWaitSeconds / 3 }))
   .refine(e => e.progressIntervalSeconds < e.ackWaitSeconds, { message: "Progress must precede ack expiry" }),
