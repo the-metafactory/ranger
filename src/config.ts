@@ -413,6 +413,13 @@ const BusSchema = z.object({
 
 const AbsolutePath = z.string().min(1).refine(isAbsolute, "an absolute path");
 
+const PrHeadSubmitterSchema = z.object({
+ busConfigFile: AbsolutePath,
+ signerFile: AbsolutePath,
+ stateRoot: AbsolutePath,
+ deadlineSeconds: z.number().int().min(1).max(900).default(660),
+}).strict();
+
 const CheckReporterSchema = z.object({
  appId: z.number().int().positive(),
  privateKeyFile: AbsolutePath,
@@ -475,6 +482,7 @@ const RangerConfigSchema = z.object({
  serve: ServeSchema.optional(),
  bus: BusSchema.optional(),
  checkReporter: CheckReporterSchema.optional(),
+ prHeadSubmitter: PrHeadSubmitterSchema.optional(),
  /** Scheduled jobs (node #301), by name; absent means none. */
  jobs: z.array(JobSchema).optional().refine(
   jobs => jobs === undefined || new Set(jobs.map(j => j.name)).size === jobs.length,
