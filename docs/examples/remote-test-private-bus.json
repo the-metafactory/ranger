@@ -10,7 +10,7 @@
     "servers": ["REPLACE_NATS_SERVER_URL"],
     "credentialsFile": "REPLACE_NATS_CREDENTIALS_ABSOLUTE_PATH"
   },
-  "ssh": { "configFile": "REPLACE_FIXED_SSH_SOURCE_STORE_CONFIG_ABSOLUTE_PATH" },
+  "ssh": { "configFile": "REPLACE_SSH_CONFIG_ABSOLUTE_PATH" },
   "execution": {
     "maxAckPending": 1,
     "maxConcurrentJobs": 1,

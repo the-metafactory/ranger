@@ -154,7 +154,7 @@ Operator configuration validation and profile/offering snapshot failures report 
 
 ## SDK dependency coupling
 
-The accepted public bus export is part of the full Cortex package pinned to Cortex v6.17.2 (`3a645ff`, see the outbox section above). Installing it also installs Cortex's application dependencies, including React, React DOM, XYFlow, Hono, Chokidar, NATS and libsodium. Ranger imports the public `@the-metafactory/cortex/bus` boundary; it does not maintain a copied admission evaluator or a private deep import.
+The accepted public bus export is part of the full Cortex package: Ranger's [`package.json`](../package.json) pins `v6.17.2`, and [`bun.lock`](../bun.lock) resolves it to `github:the-metafactory/cortex#3a645ff`. Installing it also installs Cortex's application dependencies, including React, React DOM, XYFlow, Hono, Chokidar, NATS and libsodium. Ranger imports the public `@the-metafactory/cortex/bus` boundary; it does not maintain a copied admission evaluator or a private deep import.
 
 Cortex v6.17.2 and Ranger both pin Myelin v0.12.0. Treat those pins as a reviewed pair: before upgrading either, check the candidate Cortex package's Myelin pin, keep Ranger's direct Myelin dependency aligned, and rerun the signed admission fixtures and public-import typecheck. A lightweight upstream bus package would remove the application dependency cost; changing Cortex packaging is outside this node.
 
