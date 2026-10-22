@@ -58,9 +58,10 @@ export function cloneUrl(forge: ForgeRef): string {
 
 /**
  * Basic-auth git header env (no credential persistence; the token never lands
- * in .git/config). GitHub keeps its historical unscoped header. GitLab's is
- * keyed `http.https://<host>/.extraheader` with user `oauth2`, so git sends it
- * to the map's host and no other.
+ * in .git/config), keyed `http.https://<host>/.extraheader` so git and git-lfs
+ * send it to the map's host and no other: an LFS upload goes to a storage host
+ * whose own signed Authorization a second one breaks (S3 answers 501 Not
+ * Implemented, seelite #1057). GitLab's user is `oauth2`.
  */
 export function gitAuthEnv(
  credential: GitCredential,
@@ -72,7 +73,7 @@ export function gitAuthEnv(
  return {
   ...base,
   GIT_CONFIG_COUNT: "1",
-  GIT_CONFIG_KEY_0: gitlab ? `http.https://${forge.host}/.extraheader` : "http.extraheader",
+  GIT_CONFIG_KEY_0: `http.https://${forge.host}/.extraheader`,
   GIT_CONFIG_VALUE_0: `AUTHORIZATION: basic ${Buffer.from(userinfo).toString("base64")}`,
  };
 }

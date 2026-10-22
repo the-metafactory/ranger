@@ -707,7 +707,7 @@ describe("vettedPush: a branch's LFS objects reach origin though hooks are off (
   const seen = join(dir, "lfs-saw-header");
   const recordingLfs = join(dir, "recording-lfs");
   mkdirSync(recordingLfs);
-  writeFileSync(join(recordingLfs, "git-lfs"), `#!/bin/sh\ngit config --get-all http.extraheader > "${seen}"\nexit 0\n`);
+  writeFileSync(join(recordingLfs, "git-lfs"), `#!/bin/sh\ngit config --get-urlmatch http.extraheader https://github.com/acme/widgets.git > "${seen}"\nexit 0\n`);
   chmodSync(join(recordingLfs, "git-lfs"), 0o755);
   const path = process.env.PATH;
   process.env.PATH = `${recordingLfs}:${path}`;

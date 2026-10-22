@@ -31,14 +31,37 @@ const sentinel = "glpat-node127-sentinel";
 const basic = (userinfo: string) => `AUTHORIZATION: basic ${Buffer.from(userinfo).toString("base64")}`;
 
 describe("gitAuthEnv: the header follows the forge", () => {
- test("GitHub keeps today's unscoped header, byte for byte", () => {
+ test("GitHub scopes the header to github.com", () => {
   const env = gitAuthEnv(gitCredential("acme/widgets", "ghp_write"), {});
   expect(env).toEqual({
    GIT_CONFIG_COUNT: "1",
-   GIT_CONFIG_KEY_0: "http.extraheader",
+   GIT_CONFIG_KEY_0: "http.https://github.com/.extraheader",
    GIT_CONFIG_VALUE_0: basic("ghp_write:x-oauth-basic"),
   });
   expect(gitAuthEnv(gitCredential("github:github.com/acme/widgets", "ghp_write"), {})).toEqual(env);
+ });
+
+ test("git sends the GitHub header to github.com and never to the LFS storage host (seelite #1057)", async () => {
+  const home = mkdtempSync(join(tmpdir(), "ranger-urlmatch-"));
+  try {
+   const env = gitAuthEnv(gitCredential("acme/widgets", "ghp_write"), { PATH: process.env.PATH, HOME: home });
+   const header = (url: string) =>
+    runCmd("git", ["config", "--get-urlmatch", "http.extraheader", url], { cwd: home, env });
+   for (const url of ["https://github.com/acme/widgets.git", "https://github.com/acme/widgets.git/info/lfs/objects/batch"]) {
+    const own = await header(url);
+    expect({ url, stdout: own.stdout.trim() }).toEqual({ url, stdout: basic("ghp_write:x-oauth-basic") });
+   }
+   for (const url of [
+    "https://github-cloud.s3.amazonaws.com/alambic/media/1/fc/09/fc09",
+    "https://lfs.github.com/acme/widgets/objects/fc09/verify",
+    "https://github.com.evil.example/acme/widgets.git",
+   ]) {
+    const other = await header(url);
+    expect({ url, code: other.code, stdout: other.stdout.trim() }).toEqual({ url, code: 1, stdout: "" });
+   }
+  } finally {
+   rmSync(home, { recursive: true, force: true });
+  }
  });
 
  test("GitLab scopes the header to the map's host with user oauth2", () => {
