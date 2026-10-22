@@ -12,7 +12,7 @@ export const ArtifactPolicySchema = z.object({
  maxArtifactBytes: z.number().int().positive().safe().default(ARTIFACT_DEFAULTS.maxArtifactBytes),
  maxLogBytes: z.number().int().positive().max(64 * 1024 ** 2).default(ARTIFACT_DEFAULTS.maxLogBytes),
 }).strict();
-type FaultStep = "log-write" | "receipt-write" | "file-sync" | "publish" | "root-sync";
+export type FaultStep = "log-write" | "receipt-write" | "file-sync" | "publish" | "root-sync";
 export interface ExecutionObservation {
  startedAt: number; log: Uint8Array; truncated: boolean;
  outputState: "captured" | "unavailable" | "skipped";
@@ -44,11 +44,11 @@ export async function publishReceiptFile(path: string, input: RemoteTestReceipt,
   throw e;
  } finally { await rm(temporary, { force: true }); }
 }
-async function syncDirectory(path: string) {
+export async function syncDirectory(path: string) {
  const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
  try { await file.sync(); } finally { await file.close(); }
 }
-async function privateDirectory(path: string) {
+export async function privateDirectory(path: string) {
  const info = await lstat(path);
  if (!info.isDirectory() || info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0) throw Error("Artifact directory must be private and operator-owned");
 }
