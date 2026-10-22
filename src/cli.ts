@@ -825,7 +825,7 @@ remoteTest.command("report-checks")
   try {
    const { config } = loadConfig(resolveConfigPath(options.config, process.env, process.cwd()));
    const summary = await runCheckReporter(config, options.job === undefined ? {} : { job: options.job });
-   process.stdout.write(`Check reporter: ${summary.reported.length} reported, ${summary.refused.length} refused, ${summary.failed.length} failed.\n`);
+   process.stdout.write(`Check reporter: ${summary.reported.length} reported, ${summary.stale.length} stale, ${summary.refused.length} refused, ${summary.failed.length} failed.\n`);
    for (const refusal of summary.refused) process.stderr.write(`refused ${refusal.jobId}: ${refusal.code}\n`);
    for (const failure of summary.failed) process.stderr.write(`failed ${failure.jobId}: ${failure.message}\n`);
    process.exitCode = summary.failed.length === 0 ? 0 : 1;

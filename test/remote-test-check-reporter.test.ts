@@ -30,8 +30,8 @@ function job(overrides: Partial<RemoteTestJob> = {}): RemoteTestJob {
  return { version: 1, jobId: randomUUID(), correlationId: randomUUID(), repositoryId: REPOSITORY, commitDigest: COMMIT, treeDigest: "b".repeat(40), bundleDigest: digest("a"), profileId: "unit", profileDigest: digest("a"), lockDigest: digest("c"), imageDigest: digest("d"), platform: "linux-arm64", deadline: 20_000, generation: 1, ...overrides };
 }
 const exitFor = (status: RemoteTestStatus) => status === "passed" ? 0 : status === "test_failed" ? 1 : null;
-function receiptFor(j: RemoteTestJob, status: RemoteTestStatus = "passed"): RemoteTestReceipt {
- return { version: 1, identity: j, executorId: "fixture", status, exitCode: exitFor(status), completedAt: 10_000 };
+function receiptFor(j: RemoteTestJob, status: RemoteTestStatus = "passed", completedAt = 10_000): RemoteTestReceipt {
+ return { version: 1, identity: j, executorId: "fixture", status, exitCode: exitFor(status), completedAt };
 }
 const bytesOf = (receipt: RemoteTestReceipt) => JSON.stringify(receipt) + "\n";
 function queued(j: RemoteTestJob, receipt: RemoteTestReceipt = receiptFor(j), over: Partial<QueuedReceipt> = {}): QueuedReceipt {
@@ -39,9 +39,10 @@ function queued(j: RemoteTestJob, receipt: RemoteTestReceipt = receiptFor(j), ov
  return { jobId: j.jobId, job: j, evidence: sha256(bytes), state: "pending", receiptBytes: bytes, ...over };
 }
 
-function fakeReader(records: QueuedReceipt[], unreadable: string[] = []): ReceiptReader {
+function fakeReader(records: QueuedReceipt[], unreadable: string[] = [], revoked = new Set<string>()): ReceiptReader {
  return {
   jobIds: () => records.map(r => r.jobId),
+  authorized: (id) => Promise.resolve(!revoked.has(id)),
   read: (id) => {
    if (unreadable.includes(id)) throw new UnreadableReceipt("injected");
    return Promise.resolve(records.find(r => r.jobId === id) ?? null);
@@ -75,8 +76,8 @@ function fakeChecks(): FakeChecks {
  return self;
 }
 
-function deps(records: QueuedReceipt[], github: ChecksClient = fakeChecks(), unreadable: string[] = []): ReporterDeps & { github: FakeChecks } {
- return { reader: fakeReader(records, unreadable), github: github as FakeChecks, ledger: new ReporterLedger(new Database(":memory:", { strict: true }), () => 1_000) };
+function deps(records: QueuedReceipt[], github: ChecksClient = fakeChecks(), unreadable: string[] = [], revoked = new Set<string>()): ReporterDeps & { github: FakeChecks } {
+ return { reader: fakeReader(records, unreadable, revoked), github: github as FakeChecks, ledger: new ReporterLedger(new Database(":memory:", { strict: true }), () => 1_000) };
 }
 
 test("a passed receipt whose identity equals the job creates exactly one success check on the receipt commit", async () => {
@@ -186,6 +187,41 @@ test("two jobs for the same commit and profile share one check run key", async (
  await processReceipt(d, b.jobId);
  expect(d.github.creates).toHaveLength(1);
  expect(d.github.updates).toHaveLength(1);
+});
+
+test("an older job retried after a newer job reported is acknowledged without overwriting the newer result", async () => {
+ const older = job(), newer = job(), github = fakeChecks();
+ const d = deps([queued(older, receiptFor(older, "passed", 10_000)), queued(newer, receiptFor(newer, "test_failed", 20_000))], github);
+ github.fail.create = new Error("GitHub unavailable");
+ expect((await reportReceipts(d, older.jobId)).failed).toHaveLength(1);
+ github.fail = {};
+ expect((await reportReceipts(d, newer.jobId)).reported).toMatchObject([{ jobId: newer.jobId, conclusion: "failure", created: true }]);
+
+ const retry = await reportReceipts(d);
+ expect(retry.failed).toEqual([]);
+ expect(retry.reported).toEqual([]);
+ expect(retry.stale).toEqual([{ kind: "stale", jobId: older.jobId, newerJobId: newer.jobId }]);
+ expect(github.creates).toHaveLength(1);
+ expect(github.updates).toHaveLength(0);
+ expect(d.ledger.reported(older.jobId)).toMatchObject({ stale: true });
+ expect(d.ledger.owner("example/repo", COMMIT, "clawbox/unit")).toMatchObject({ jobId: newer.jobId, conclusion: "failure" });
+ expect((await reportReceipts(d)).stale).toEqual([]);
+});
+
+test("a newer job still replaces an older job's result on the same check run", async () => {
+ const older = job(), newer = job(), d = deps([queued(older, receiptFor(older, "test_failed", 10_000)), queued(newer, receiptFor(newer, "passed", 20_000))]);
+ await processReceipt(d, older.jobId);
+ expect(await processReceipt(d, newer.jobId)).toMatchObject({ kind: "reported", created: false, conclusion: "success" });
+ expect(d.github.updates.map(u => u.write.conclusion)).toEqual(["success"]);
+});
+
+test("a receipt whose ledger authorization was revoked after enqueue is refused without a write", async () => {
+ const j = job(), d = deps([queued(j)], fakeChecks(), [], new Set([j.jobId]));
+ expect(await processReceipt(d, j.jobId)).toEqual({ kind: "refused", jobId: j.jobId, code: "revoked" });
+ expect(d.github.creates).toHaveLength(0);
+ expect(d.github.updates).toHaveLength(0);
+ expect(d.ledger.reported(j.jobId)).toBeNull();
+ expect(d.ledger.refusals()).toEqual([{ jobId: j.jobId, code: "revoked", attempts: 1 }]);
 });
 
 test("a GitHub failure writes no acknowledgement and a later run replays the receipt", async () => {
@@ -302,7 +338,7 @@ async function operatorFixture() {
   try { await outbox.enqueueTerminal(j); } finally { outbox.close(); }
   return receipt;
  };
- return { home, load, enqueue, stateRoot, close: () => { ledger.close(); } };
+ return { home, load, enqueue, stateRoot, ledger, close: () => { ledger.close(); } };
 }
 
 test("the reporter reads the real outbox and writes one check through the App client with synthetic keys", async () => {
@@ -328,6 +364,24 @@ test("the reporter reads the real outbox and writes one check through the App cl
   const again = await runCheckReporter(config, { api, pullHeads: () => Promise.resolve([]) });
   expect(again.reported).toEqual([]);
   expect(requests.filter(r => r.includes("repos/example/repo/check-runs"))).toHaveLength(1);
+ } finally { f.close(); }
+});
+
+test("a job cancelled in the ledger after its terminal receipt was enqueued writes no check", async () => {
+ const f = await operatorFixture();
+ try {
+  const j = job(); await f.enqueue(j);
+  f.ledger.cancel(j);
+  const config = await f.load(), writes: string[] = [];
+  const api: GhApi = (_token, args) => {
+   if (args[0]?.startsWith("app/")) return Promise.resolve({ token: "ghs_fake", expires_at: new Date(Date.now() + 3_600_000).toISOString() });
+   if (args.includes("POST") || args.includes("PATCH")) writes.push(args[0]);
+   return Promise.resolve(args[0]?.includes("/check-runs?") ? [{ check_runs: [] }] : { id: 1 });
+  };
+  const summary = await runCheckReporter(config, { api, pullHeads: () => Promise.resolve([]) });
+  expect(summary.reported).toEqual([]);
+  expect(summary.refused).toEqual([{ kind: "refused", jobId: j.jobId, code: "revoked" }]);
+  expect(writes).toEqual([]);
  } finally { f.close(); }
 });
 

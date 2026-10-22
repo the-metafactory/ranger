@@ -25,7 +25,7 @@ const CONCLUSIONS = {
 } as const satisfies Record<RemoteTestStatus, CheckConclusion>;
 
 export type ReporterRefusalCode =
- | "not_in_outbox" | "unreadable" | "withheld" | "invalid_job" | "digest_mismatch"
+ | "not_in_outbox" | "unreadable" | "withheld" | "revoked" | "invalid_job" | "digest_mismatch"
  | "invalid_receipt" | "identity_mismatch" | "unsupported_repository";
 
 /** The reader could not produce the receipt bytes; the reporter refuses rather than retries. */
@@ -36,6 +36,7 @@ export class UnreadableReceipt extends Error {
 export interface ReceiptReader {
  jobIds(): string[];
  read(jobId: string): Promise<QueuedReceipt | null>;
+ authorized(jobId: string): Promise<boolean>;
 }
 
 /** The App's checks surface plus the machine account's read of which open pull requests contain a commit. */
@@ -51,6 +52,8 @@ export interface ReportedCheck {
  checkRunId: number;
  conclusion: CheckConclusion;
  digest: string;
+ completedAt: number;
+ stale: boolean;
 }
 
 export interface RefusalRecord {
@@ -64,22 +67,30 @@ export class ReporterLedger {
  constructor(private db: Database, private now: () => number) {
   db.run("PRAGMA busy_timeout=5000; PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;");
   db.run(`CREATE TABLE IF NOT EXISTS reported (jobid TEXT PRIMARY KEY, repo TEXT NOT NULL, head_sha TEXT NOT NULL, check_name TEXT NOT NULL,
-    check_run_id INTEGER NOT NULL, conclusion TEXT NOT NULL, digest TEXT NOT NULL, at INTEGER NOT NULL);
+    check_run_id INTEGER NOT NULL, conclusion TEXT NOT NULL, digest TEXT NOT NULL, at INTEGER NOT NULL, completed_at INTEGER NOT NULL, stale INTEGER NOT NULL);
    CREATE TABLE IF NOT EXISTS refusals (jobid TEXT NOT NULL, code TEXT NOT NULL, attempts INTEGER NOT NULL, first INTEGER NOT NULL, last INTEGER NOT NULL, PRIMARY KEY (jobid, code));`);
  }
 
  close() { this.db.close(); }
 
  reported(jobId: string): ReportedCheck | null {
-  const row = this.db.query("SELECT jobid, repo, head_sha, check_name, check_run_id, conclusion, digest FROM reported WHERE jobid=?").get(jobId) as
-   { jobid: string; repo: string; head_sha: string; check_name: string; check_run_id: number; conclusion: CheckConclusion; digest: string } | null;
-  return row && { jobId: row.jobid, repo: row.repo, headSha: row.head_sha, checkName: row.check_name, checkRunId: row.check_run_id, conclusion: row.conclusion, digest: row.digest };
+  return this.select("jobid=?", jobId);
+ }
+
+ owner(repo: string, headSha: string, checkName: string): ReportedCheck | null {
+  return this.select("repo=? AND head_sha=? AND check_name=? AND stale=0 ORDER BY completed_at DESC, at DESC LIMIT 1", repo, headSha, checkName);
+ }
+
+ private select(where: string, ...params: string[]): ReportedCheck | null {
+  const row = this.db.query(`SELECT jobid, repo, head_sha, check_name, check_run_id, conclusion, digest, completed_at, stale FROM reported WHERE ${where}`).get(...params) as
+   { jobid: string; repo: string; head_sha: string; check_name: string; check_run_id: number; conclusion: CheckConclusion; digest: string; completed_at: number; stale: number } | null;
+  return row && { jobId: row.jobid, repo: row.repo, headSha: row.head_sha, checkName: row.check_name, checkRunId: row.check_run_id, conclusion: row.conclusion, digest: row.digest, completedAt: row.completed_at, stale: row.stale === 1 };
  }
 
  record(check: ReportedCheck) {
   this.db.transaction(() => {
-   this.db.query("INSERT OR REPLACE INTO reported VALUES(?,?,?,?,?,?,?,?)")
-    .run(check.jobId, check.repo, check.headSha, check.checkName, check.checkRunId, check.conclusion, check.digest, this.now());
+   this.db.query("INSERT OR REPLACE INTO reported VALUES(?,?,?,?,?,?,?,?,?,?)")
+    .run(check.jobId, check.repo, check.headSha, check.checkName, check.checkRunId, check.conclusion, check.digest, this.now(), check.completedAt, check.stale ? 1 : 0);
    this.db.query("DELETE FROM refusals WHERE jobid=?").run(check.jobId);
   }).immediate();
  }
@@ -109,6 +120,7 @@ export async function openReporterLedger(root: string, now: () => number = Date.
 
 export type ReportOutcome =
  | { kind: "reported"; jobId: string; checkRunId: number; created: boolean; conclusion: CheckConclusion; superseded: boolean }
+ | { kind: "stale"; jobId: string; newerJobId: string }
  | { kind: "refused"; jobId: string; code: ReporterRefusalCode };
 
 export interface ReporterDeps {
@@ -157,7 +169,10 @@ function checkWrite(receipt: RemoteTestReceipt, digest: string, superseded: bool
  * Every identity, digest and readability check fails closed into a locally recorded
  * refusal that writes nothing to GitHub. A GitHub, token or storage failure throws and
  * leaves the job unacknowledged, so a later run replays it. A second delivery finds the
- * existing check run by repository, commit and name and updates it.
+ * existing check run by repository, commit and name and updates it. A receipt whose
+ * job completed before the job that already owns that check run is acknowledged as
+ * stale without a write, and the execution ledger is consulted again immediately
+ * before the write so a revoked success never reaches GitHub.
  */
 export async function processReceipt(deps: ReporterDeps, jobId: string): Promise<ReportOutcome> {
  const { reader, github, ledger } = deps;
@@ -188,26 +203,36 @@ export async function processReceipt(deps: ReporterDeps, jobId: string): Promise
  const superseded = heads.length > 0 && !heads.includes(parsedJob.commitDigest);
  const write = checkWrite(receipt, digest, superseded);
  const existing = await github.findCheckRun(repo, write.headSha, write.name);
+ const base = { jobId, repo, headSha: write.headSha, checkName: write.name, conclusion: write.conclusion, digest, completedAt: receipt.completedAt };
+ const owner = ledger.owner(repo, write.headSha, write.name);
+ if (owner !== null && owner.jobId !== jobId && owner.completedAt > receipt.completedAt) {
+  ledger.record({ ...base, checkRunId: existing ?? owner.checkRunId, stale: true });
+  return { kind: "stale", jobId, newerJobId: owner.jobId };
+ }
+ if (!await reader.authorized(jobId)) return refuse("revoked");
  const checkRunId = existing ?? await github.createCheckRun(repo, write);
  if (existing !== null) await github.updateCheckRun(repo, existing, write);
- ledger.record({ jobId, repo, headSha: write.headSha, checkName: write.name, checkRunId, conclusion: write.conclusion, digest });
+ ledger.record({ ...base, checkRunId, stale: false });
  return { kind: "reported", jobId, checkRunId, created: existing === null, conclusion: write.conclusion, superseded };
 }
 
 export interface ReportSummary {
  reported: Extract<ReportOutcome, { kind: "reported" }>[];
+ stale: Extract<ReportOutcome, { kind: "stale" }>[];
  refused: Extract<ReportOutcome, { kind: "refused" }>[];
  failed: { jobId: string; message: string }[];
 }
 
 /** Process one named job, or every outbox receipt not yet acknowledged. A failing job never blocks the others; callers exit non-zero on `failed`. */
 export async function reportReceipts(deps: ReporterDeps, only?: string): Promise<ReportSummary> {
- const summary: ReportSummary = { reported: [], refused: [], failed: [] };
+ const summary: ReportSummary = { reported: [], stale: [], refused: [], failed: [] };
  const jobIds = only === undefined ? deps.reader.jobIds().filter(id => deps.ledger.reported(id) === null) : [only];
  for (const jobId of jobIds) {
   try {
    const outcome = await processReceipt(deps, jobId);
-   if (outcome.kind === "reported") summary.reported.push(outcome); else summary.refused.push(outcome);
+   if (outcome.kind === "reported") summary.reported.push(outcome);
+   else if (outcome.kind === "stale") summary.stale.push(outcome);
+   else summary.refused.push(outcome);
   } catch (e) {
    summary.failed.push({ jobId, message: e instanceof Error ? e.message.slice(0, 400) : String(e) });
   }
@@ -218,6 +243,7 @@ export async function reportReceipts(deps: ReporterDeps, only?: string): Promise
 export function outboxReceiptReader(outbox: BusOutbox): ReceiptReader {
  return {
   jobIds: () => outbox.receiptJobIds(),
+  authorized: (jobId) => outbox.authorized(jobId),
   async read(jobId) {
    try { return await outbox.queuedReceipt(jobId); }
    catch (e) { if (e instanceof SyntaxError) throw new UnreadableReceipt("Stored outbox record is unreadable"); throw e; }

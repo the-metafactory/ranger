@@ -266,6 +266,13 @@ export class BusOutbox {
   return (this.db.query("SELECT jobid FROM events WHERE origin='receipt' ORDER BY rowid").all() as { jobid: string }[]).map(r => r.jobid);
  }
 
+ async authorized(jobId: string): Promise<boolean> {
+  const row = this.db.query("SELECT * FROM events WHERE jobid=? AND origin='receipt'").get(jobId) as EventRow | null;
+  if (!row || row.state === "withheld") return false;
+  try { await this.reverify(row); return true; }
+  catch (e) { if (e instanceof BusOutboxRefusal) return false; throw e; }
+ }
+
  async queuedReceipt(jobId: string): Promise<QueuedReceipt | null> {
   const row = this.db.query("SELECT * FROM events WHERE jobid=? AND origin='receipt'").get(jobId) as EventRow | null;
   if (!row) return null;
