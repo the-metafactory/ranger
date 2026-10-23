@@ -86,7 +86,7 @@ import type { CommitAuthor } from "./identity.ts";
 import { tryWorkerLog, workerLogFile } from "./worker-log.ts";
 import { captureViews, redactViewsReason, saveViewsRecord, viewsComment, viewsDirectory, type ViewsDependencies, type ViewsRecord } from "./views.ts";
 import { NEEDS_EYE_LABEL } from "./labels.ts";
-import { createShadowTestBackend, runShadowMeasured } from "./remote-test/shadow.ts";
+import { createShadowTestBackend, measureShadowTests, runShadowMeasured } from "./remote-test/shadow.ts";
 import { assertTestEvidence, assertTestSource, createSshTestBackend, localTestBackend, runTestBackend, testCorrelationId, type TestBackend, type TestRequest, type TestResult } from "./remote-test/supervisor-backend.ts";
 
 /**
@@ -214,7 +214,7 @@ const remotePasses = new WeakMap<ImplementContext, TestResult & { request: TestR
 function testBackendFor(ctx: ImplementContext): TestBackend {
  let backend = backends.get(ctx);
  if (!backend) {
-  backend = ctx.testBackend ?? (ctx.map.testBackend?.kind === "shadow" ? createShadowTestBackend(ctx.map.testBackend) : ctx.map.testBackend ? createSshTestBackend(ctx.map.testBackend) : localTestBackend);
+  backend = ctx.testBackend ?? (ctx.map.testBackend?.kind === "shadow" ? createShadowTestBackend(ctx.map.testBackend, { measurements: measureShadowTests }) : ctx.map.testBackend ? createSshTestBackend(ctx.map.testBackend) : localTestBackend);
   if (ctx.map.testBackend?.kind === "ssh" && backend.kind !== "ssh") throw new GitSafetyError("SSH map cannot use a local test backend");
   if (ctx.map.testBackend?.kind === "shadow" && backend.kind !== "local") throw new GitSafetyError("Shadow map requires a local-authoritative backend");
   backends.set(ctx, backend);
