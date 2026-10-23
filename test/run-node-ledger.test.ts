@@ -57,7 +57,7 @@ describe("run-node run ledger", () => {
    valid(event, "succeeded");
    const ref = nodeKey(repo, "10");
    expect(event.subject).toBe("local.jc.work.execution.run.finished");
-   expect(event.input.source).toBe("jc.ranger.run");
+   expect(event.input.source).toBe("jc.work.ranger");
    expect(event.input.payload).toMatchObject({
     producer: "ranger", ran: { kind: "node", ref },
     serves: { node: ref, ...(goal ? { goal } : {}) },

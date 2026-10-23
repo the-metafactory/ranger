@@ -247,7 +247,7 @@ async function emitRunFinished(
    const env = deps.env ?? process.env;
    const correlation_id = env.MF_CORRELATION_ID || randomUUID();
    const events = payloads(env).map(payload => createExecutionRunFinished({
-    source: `${bus.principal}.ranger.run`,
+    source: `${bus.principal}.${bus.stack}.ranger`,
     principal: bus.principal,
     stack: bus.stack,
     sovereignty: SOVEREIGNTY,
