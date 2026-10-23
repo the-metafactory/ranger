@@ -671,3 +671,30 @@ export async function openPullHeadsContaining(repo: string, sha: string, token: 
   .map((pr) => ((pr.head ?? {}) as Record<string, unknown>).sha)
   .filter((head): head is string => typeof head === "string" && head.length > 0);
 }
+
+export interface PullRequestHead {
+ number: number;
+ state: "open" | "closed" | "merged";
+ headRepository: string | null;
+ baseRepository: string | null;
+ headSha: string;
+}
+
+export async function listPullRequestHeads(repo: string, token: string, api: GhApi = ghApi): Promise<PullRequestHead[]> {
+ const label = `open pull requests in ${repo}`;
+ const raw = await api(token, [`repos/${repo}/pulls?state=open&per_page=100`, "--paginate", "--slurp"], label);
+ const repository = (value: unknown): string | null => {
+  if (value === null || typeof value !== "object") return null;
+  const name: unknown = (value as Record<string, unknown>).full_name;
+  return typeof name === "string" ? name : null;
+ };
+ return pagedList(raw, label).map(pr => {
+  const head = (pr.head ?? {}) as Record<string, unknown>, base = (pr.base ?? {}) as Record<string, unknown>;
+  return {
+   number: Number(pr.number),
+   state: pr.merged === true || typeof pr.merged_at === "string" ? "merged" : pr.state === "open" ? "open" : "closed",
+   headRepository: repository(head.repo), baseRepository: repository(base.repo),
+   headSha: typeof head.sha === "string" ? head.sha : "",
+  };
+ });
+}

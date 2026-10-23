@@ -16,6 +16,10 @@ const refOf = (repo: Repo): ForgeRef => typeof repo === "string" ? parseForgeRef
 const base = (ref: ForgeRef) => `https://${ref.host}/${ref.path}`;
 const prefer = (webUrl: string | undefined, built: () => string) => webUrl !== undefined && webUrl.length > 0 ? webUrl : built();
 
+export function repositoryCloneUrl(repo: Repo): string {
+ return `${base(refOf(repo))}.git`;
+}
+
 export function forgeName(repo: Repo): "GitHub" | "GitLab" {
  return refOf(repo).forge === "github" ? "GitHub" : "GitLab";
 }
