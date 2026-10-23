@@ -43,19 +43,42 @@ function releaseFileLater(path: string) {
   return { timer: timer!, released };
 }
 
+async function withFixture(prefix: string, run: (fixture: {
+  dir: string;
+  gate: string;
+  ready: string;
+  marker: string;
+  pid: number;
+  release?: ReturnType<typeof releaseFileLater>;
+}) => Promise<void>) {
+  const realKill = process.kill.bind(process);
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  const fixture = {
+    dir,
+    gate: join(dir, "release"),
+    ready: join(dir, "ready"),
+    marker: join(dir, "grandchild-ran"),
+    pid: 0,
+    release: undefined as ReturnType<typeof releaseFileLater> | undefined,
+  };
+  try {
+    await run(fixture);
+  } finally {
+    if (fixture.release !== undefined) clearTimeout(fixture.release.timer);
+    killProcessGroup(fixture.pid);
+    if (fixture.pid > 0 && pidAlive(fixture.pid)) realKill(fixture.pid, "SIGKILL");
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 describe("runCmd process-group timeout cleanup", () => {
-  test("a transient group miss kills the child and retries before a forked grandchild can run", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "ranger-group-kill-"));
-    const gate = join(dir, "release");
-    const marker = join(dir, "grandchild-ran");
-    const ready = join(dir, "ready");
-    let pid = 0;
+  test("a transient group miss kills the child and retries before a forked grandchild can run", () => withFixture("ranger-group-kill-", async (fixture) => {
+    const { gate, marker, ready } = fixture;
     let aliveAtMiss = false;
-    let release: ReturnType<typeof releaseFileLater> | undefined;
-    const { signal, realKill, outcomes } = observeGroupKills(() => pid, (attempt) => {
+    const { signal, realKill, outcomes } = observeGroupKills(() => fixture.pid, (attempt) => {
       if (attempt === 1) {
-        aliveAtMiss = pidAlive(pid);
-        release = releaseFileLater(gate);
+        aliveAtMiss = pidAlive(fixture.pid);
+        fixture.release = releaseFileLater(gate);
         return true;
       }
       return false;
@@ -65,31 +88,25 @@ describe("runCmd process-group timeout cleanup", () => {
         processGroup: true,
         timeoutMs: 300,
         onSpawn: (spawned) => {
-          pid = spawned;
+          fixture.pid = spawned;
           waitForFile(ready);
         },
       });
-      await release?.released;
+      await fixture.release?.released;
       expect(result.timedOut).toBe(true);
       expect(existsSync(ready)).toBe(true);
       expect(aliveAtMiss).toBe(true);
       expect(await Bun.file(marker).exists()).toBe(false);
-      expect(pidAlive(pid)).toBe(false);
+      expect(pidAlive(fixture.pid)).toBe(false);
       expect(outcomes).toEqual(["ESRCH", "killed"]);
-      expect(() => realKill(-pid, 0)).toThrow();
+      expect(() => realKill(-fixture.pid, 0)).toThrow();
     } finally {
       signal.mockRestore();
-      if (release !== undefined) clearTimeout(release.timer);
-      killProcessGroup(pid);
-      rmSync(dir, { recursive: true, force: true });
     }
-  });
+  }));
 
-  test("a genuinely absent group kills the live child before it can fork, even when the retry also gets ESRCH", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "ranger-no-group-"));
-    const gate = join(dir, "release");
-    const ready = join(dir, "ready");
-    const marker = join(dir, "grandchild-ran");
+  test("a genuinely absent group kills the live child before it can fork, even when the retry also gets ESRCH", () => withFixture("ranger-no-group-", async (fixture) => {
+    const { dir, gate, ready, marker } = fixture;
     const stub = join(dir, "stub.ts");
     writeFileSync(stub, `
       import { existsSync, writeFileSync } from "node:fs";
@@ -101,10 +118,9 @@ describe("runCmd process-group timeout cleanup", () => {
         await child.exited;
       }, 10);
     `);
-    let pid = 0;
     let aliveAtMiss = false;
-    const { signal, realKill, outcomes } = observeGroupKills(() => pid, (attempt) => {
-      if (attempt === 1) aliveAtMiss = pidAlive(pid);
+    const { signal, realKill, outcomes } = observeGroupKills(() => fixture.pid, (attempt) => {
+      if (attempt === 1) aliveAtMiss = pidAlive(fixture.pid);
       return false;
     });
     const spawn = childProcess.spawn;
@@ -113,35 +129,31 @@ describe("runCmd process-group timeout cleanup", () => {
       args: readonly string[],
       opts: childProcess.SpawnOptions,
     ) => spawn(bin, args, { ...opts, detached: false })) as typeof spawn);
-    let release: ReturnType<typeof releaseFileLater> | undefined;
     try {
       const pending = runCmd(process.execPath, [stub], {
         processGroup: true,
         timeoutMs: 0,
         onSpawn: (spawned) => {
-          pid = spawned;
+          fixture.pid = spawned;
           waitForFile(ready);
         },
       });
       launch.mockRestore();
       expect(existsSync(ready)).toBe(true);
-      expect(pidAlive(pid)).toBe(true);
-      expect(() => realKill(-pid, 0)).toThrow();
-      release = releaseFileLater(gate);
+      expect(pidAlive(fixture.pid)).toBe(true);
+      expect(() => realKill(-fixture.pid, 0)).toThrow();
+      fixture.release = releaseFileLater(gate);
       const result = await pending;
-      await release.released;
+      await fixture.release.released;
       expect(result.timedOut).toBe(true);
       expect(existsSync(marker)).toBe(false);
       expect(result.code).not.toBe(0);
       expect(aliveAtMiss).toBe(true);
-      expect(pidAlive(pid)).toBe(false);
+      expect(pidAlive(fixture.pid)).toBe(false);
       expect(outcomes).toEqual(["ESRCH", "ESRCH"]);
     } finally {
       launch.mockRestore();
       signal.mockRestore();
-      if (release !== undefined) clearTimeout(release.timer);
-      if (pidAlive(pid)) realKill(pid, "SIGKILL");
-      rmSync(dir, { recursive: true, force: true });
     }
-  });
+  }));
 });
