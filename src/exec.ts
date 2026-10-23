@@ -114,7 +114,10 @@ export function runCmd(
         : setTimeout(() => {
             timedOut = true;
             if (opts.processGroup === true && child.pid !== undefined) {
-              killProcessGroup(child.pid);
+              if (!killProcessGroup(child.pid)) {
+                child.kill("SIGKILL");
+                killProcessGroup(child.pid);
+              }
             } else {
               child.kill("SIGKILL");
             }
