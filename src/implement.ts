@@ -3086,7 +3086,8 @@ function packageTestScript(cwd: string): unknown {
  const pkg: unknown = JSON.parse(readFileSync(join(cwd, "package.json"), "utf8"));
  if (typeof pkg !== "object" || pkg === null || !("scripts" in pkg)) return undefined;
  const scripts = pkg.scripts;
- return typeof scripts === "object" && scripts !== null && "test" in scripts ? scripts.test : undefined;
+ if (typeof scripts !== "object" || scripts === null || "pretest" in scripts || "posttest" in scripts) return undefined;
+ return "test" in scripts ? scripts.test : undefined;
 }
 
 /**
