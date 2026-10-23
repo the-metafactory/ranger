@@ -2893,9 +2893,19 @@ describe("implement lane (node #23)", () => {
    * with the step's arguments (a merge-base rerun's files) as its own.
    * Every repo command is recorded with its directory, as the map spells it.
    */
-  async function bunRig(body: string, opts: { after?: string; install?: string } = {}): Promise<Rig & { calls: { command: string; cwd: string }[] }> {
-   const r = await rig({ test: `bun test${opts.after === undefined ? "" : ` && ${opts.after}`}`, ...(opts.install === undefined ? {} : { install: opts.install }) });
+  const rangerOtherSteps = ["bunx tsc --noEmit", "bun run lint"];
+  const rangerTestCommand = ["bun run test", ...rangerOtherSteps].join(" && ");
+
+  async function bunRig(body: string, opts: { after?: string; testCommand?: string; install?: string; packageJson?: string } = {}): Promise<Rig & { calls: { command: string; cwd: string }[] }> {
+   if (opts.after !== undefined && opts.testCommand !== undefined) throw new Error("after and testCommand are mutually exclusive");
+   const r = await rig({ test: opts.testCommand ?? `bun test${opts.after === undefined ? "" : ` && ${opts.after}`}`, ...(opts.install === undefined ? {} : { install: opts.install }) });
    cleanup.push(r.dir);
+   if (opts.packageJson !== undefined) {
+    writeFileSync(join(r.canonical, "package.json"), opts.packageJson);
+    for (const args of [["add", "package.json"], ["commit", "-m", "add package test script"], ["push", "origin", "main"]]) {
+     expect((await runCmd("git", args, { cwd: r.canonical })).code).toBe(0);
+    }
+   }
    const script = join(r.dir, "fake-bun-test.sh");
    writeFileSync(script, body);
    const calls: { command: string; cwd: string }[] = [];
@@ -2904,6 +2914,8 @@ describe("implement lane (node #23)", () => {
     const run = command
      .split("&&")
      .map((s) => {
+      if (s.trim() === "bun run test") return ` sh '${script}' `;
+      if (rangerOtherSteps.includes(s.trim())) return " test -f src/feature.ts ";
       const bun = /^bun test((?: \S+)*)$/.exec(s.trim());
       return bun === null ? s : ` sh '${script}'${bun[1]} `;
      })
@@ -2915,6 +2927,77 @@ describe("implement lane (node #23)", () => {
   const baseRuns = (calls: { command: string; cwd: string }[]) => calls.filter((c) => c.cwd.includes("ranger-test-base-"));
   const stepRuns = (calls: { command: string; cwd: string }[]) => calls.filter((c) => c.cwd.includes("ranger-test-steps-"));
   const reviewed = (r: Rig) => r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+
+  const rangerTestScript = "bun test --parallel=4 --timeout=60000";
+  const packageWithTest = (script: string) => JSON.stringify({ scripts: { test: script } });
+
+  test("a package fixture preserves the rig's explicit after step", async () => {
+   const r = await bunRig("echo '(fail) shared'; echo ' 1 fail'; exit 1", {
+    after: "test -f src/feature.ts",
+    packageJson: packageWithTest(rangerTestScript),
+   });
+   expect(r.ctx.map.commands.test).toBe("bun test && test -f src/feature.ts");
+   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+   expect(stepRuns(r.calls).map((c) => c.command)).toEqual(["test -f src/feature.ts"]);
+  }, 60_000);
+
+  test("the rig refuses conflicting test command options", async () => {
+   await expect(bunRig("exit 0", { after: "true", testCommand: rangerTestCommand })).rejects.toThrow("after and testCommand are mutually exclusive");
+  });
+
+  for (const hook of ["pretest", "posttest"]) {
+   test(`a lifecycle hook ${hook} prevents a package-script base-red waiver`, async () => {
+    const packageJson = JSON.stringify({ scripts: { test: rangerTestScript, [hook]: "bun run build" } });
+    const r = await bunRig("echo '(fail) shared'; echo ' 1 fail'; exit 1", { testCommand: rangerTestCommand, packageJson });
+    expect((await runNode("20", r.ctx)).status).toBe("failed");
+    expect(baseRuns(r.calls)).toEqual([]);
+    expect(r.github.prs.size).toBe(0);
+   }, 60_000);
+  }
+
+  test("Ranger's package test command waives a shared base failure and checks the remaining steps", async () => {
+   const r = await bunRig("echo '(fail) shared'; echo ' 1 fail'; exit 1", { testCommand: rangerTestCommand, packageJson: packageWithTest(rangerTestScript) });
+   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+   expect(baseRuns(r.calls).map((c) => c.command)).toEqual([rangerTestScript]);
+   expect(stepRuns(r.calls).map((c) => c.command)).toEqual(["bunx tsc --noEmit && bun run lint"]);
+   expect(reviewed(r).some((d) => d.endsWith("red on the merge base too, not gating: shared"))).toBe(true);
+   expect(r.github.prs.get(1)?.body).toContain("the other steps, `bunx tsc --noEmit && bun run lint`, passed on their own");
+   expect(r.github.prs.get(1)?.body).not.toContain("passed in the supervisor");
+  }, 60_000);
+
+  test("a script's resolved bun command keeps its flags for per-file base reruns", async () => {
+   const body = [
+    'if [ -f src/feature.ts ] || [ "$#" -gt 2 ]; then f=test/a.test.ts; else f=test/b.test.ts; fi',
+    'printf "\\n%s:\\n(fail) shared\\n\\n 1 fail\\n" "$f" >&2; exit 1',
+   ].join("\n");
+   const r = await bunRig(body, { testCommand: rangerTestCommand, packageJson: packageWithTest(rangerTestScript) });
+   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+   expect(baseRuns(r.calls).map((c) => c.command)).toEqual([rangerTestScript, `${rangerTestScript} ./test/a.test.ts`]);
+   expect(reviewed(r).some((d) => d.includes("counting 1 rerun(s) of their files there") && d.endsWith("red on the merge base too, not gating: test/a.test.ts: shared"))).toBe(true);
+  }, 60_000);
+
+  for (const [what, packageJson] of [
+   ["compound script", packageWithTest("bun test && eslint .")],
+   ["missing script", "{}"],
+   ["malformed package", "{"],
+   ["invalid scripts field", '{"scripts":null}'],
+  ]) {
+   test(`a package with a ${what} keeps the existing did-not-run event`, async () => {
+    const r = await bunRig("echo '(fail) shared'; echo ' 1 fail'; exit 1", { testCommand: rangerTestCommand, packageJson });
+    expect((await runNode("20", r.ctx)).status).toBe("failed");
+    expect(baseRuns(r.calls)).toEqual([]);
+    expect(reviewed(r)).toContain(`tests (bun run test && bunx tsc --noEmit && bun run lint) failed; the merge-base check did not run: the command is not plain steps joined by && with one \`bun test\` step, so a failure beside the tests could not be told apart — the failures gate`);
+    expect(r.github.prs.size).toBe(0);
+   }, 60_000);
+  }
+
+  test("coverage requested inside a test script still prevents a base-red waiver", async () => {
+   const r = await bunRig("echo '(fail) shared'; echo ' 1 fail'; exit 1", { testCommand: rangerTestCommand, packageJson: packageWithTest("bun test --coverage") });
+   expect((await runNode("20", r.ctx)).status).toBe("failed");
+   expect(baseRuns(r.calls)).toEqual([]);
+   expect(reviewed(r).some((d) => d.includes("failed with coverage reported"))).toBe(true);
+   expect(r.github.prs.size).toBe(0);
+  }, 60_000);
 
   test("every failing test red at the merge base too: not gating, the lane carries on, and the PR does not say the tests passed", async () => {
    const r = await bunRig("echo \"(fail) claude-code install [5000.00ms]\"; echo \"(fail) git trust\" >&2; echo \" 2 fail\" >&2; exit 1");
