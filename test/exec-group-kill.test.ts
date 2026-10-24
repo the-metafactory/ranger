@@ -72,6 +72,24 @@ async function withFixture(prefix: string, run: (fixture: {
 }
 
 describe("runCmd process-group timeout cleanup", () => {
+  test("cleanup before onSpawn removes the fixture without signaling the runner", async () => {
+    let dir = "";
+    const failure = new Error("failed before onSpawn");
+    const signal = spyOn(process, "kill").mockImplementation(() => true);
+    try {
+      await expect(withFixture("ranger-before-spawn-", async (fixture) => {
+        dir = fixture.dir;
+        expect(fixture.pid).toBe(0);
+        throw failure;
+      })).rejects.toBe(failure);
+      expect(signal).not.toHaveBeenCalled();
+      expect(dir).not.toBe("");
+      expect(existsSync(dir)).toBe(false);
+    } finally {
+      signal.mockRestore();
+    }
+  });
+
   test("a transient group miss kills the child and retries before a forked grandchild can run", () => withFixture("ranger-group-kill-", async (fixture) => {
     const { gate, marker, ready } = fixture;
     let aliveAtMiss = false;
