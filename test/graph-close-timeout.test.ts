@@ -53,12 +53,14 @@ describe("graphClose against a stub soma that forks (node #347)", () => {
 
   test("a close that outlives the timeout via a grandchild is a timeout, never soma's output", async () => {
     const marker = join(dir, "grandchild-ran");
-    const runEnv = stub(`( sleep 1.2; echo '${RECEIPT}'; touch '${marker}' ) &\nwait`);
+    const release = join(dir, "release-grandchild");
+    const runEnv = stub(`( while [ ! -f '${release}' ]; do sleep 0.01; done; touch '${marker}' ) >/dev/null 2>&1 &\nwait\necho '${RECEIPT}'`);
     const result = await graphClose("acme/widgets", "5", "ivy-agent", "tok", options, { env: runEnv, timeoutMs: 300 });
     expect(result.closed).toBe(false);
     expect(result.timedOut).toBe(true);
     expect(result.detail).toContain("timed out");
     expect(result.detail).not.toContain("Closed node");
+    writeFileSync(release, "release");
     await new Promise((resolve) => setTimeout(resolve, 1500));
     expect(await Bun.file(marker).exists()).toBe(false);
   });
