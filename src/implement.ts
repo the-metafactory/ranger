@@ -3,7 +3,7 @@ import { fileStemFor, parseForgeRef } from "./forge-ref.ts";
 import { lanePort } from "./forge-lanes.ts";
 import type { ResolvedToken } from "./token-gate.ts";
 import { changeRequestLabel, changeRequestNoun, changeRequestUrl, ciRunNoun, ciRunText, forgeName } from "./forge-text.ts";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
@@ -86,7 +86,7 @@ import type { CommitAuthor } from "./identity.ts";
 import { tryWorkerLog, workerLogFile } from "./worker-log.ts";
 import { captureViews, redactViewsReason, saveViewsRecord, viewsComment, viewsDirectory, type ViewsDependencies, type ViewsRecord } from "./views.ts";
 import { NEEDS_EYE_LABEL } from "./labels.ts";
-import { createShadowTestBackend, runShadowMeasured } from "./remote-test/shadow.ts";
+import { createShadowTestBackend, measureShadowTests, runShadowMeasured } from "./remote-test/shadow.ts";
 import { assertTestEvidence, assertTestSource, createSshTestBackend, localTestBackend, runTestBackend, testCorrelationId, type TestBackend, type TestRequest, type TestResult } from "./remote-test/supervisor-backend.ts";
 
 /**
@@ -214,7 +214,7 @@ const remotePasses = new WeakMap<ImplementContext, TestResult & { request: TestR
 function testBackendFor(ctx: ImplementContext): TestBackend {
  let backend = backends.get(ctx);
  if (!backend) {
-  backend = ctx.testBackend ?? (ctx.map.testBackend?.kind === "shadow" ? createShadowTestBackend(ctx.map.testBackend) : ctx.map.testBackend ? createSshTestBackend(ctx.map.testBackend) : localTestBackend);
+  backend = ctx.testBackend ?? (ctx.map.testBackend?.kind === "shadow" ? createShadowTestBackend(ctx.map.testBackend, { measurements: measureShadowTests }) : ctx.map.testBackend ? createSshTestBackend(ctx.map.testBackend) : localTestBackend);
   if (ctx.map.testBackend?.kind === "ssh" && backend.kind !== "ssh") throw new GitSafetyError("SSH map cannot use a local test backend");
   if (ctx.map.testBackend?.kind === "shadow" && backend.kind !== "local") throw new GitSafetyError("Shadow map requires a local-authoritative backend");
   backends.set(ctx, backend);
@@ -3080,18 +3080,38 @@ export function coverageInPlay(testCommand: string, result: RunResult): boolean 
 /** One step of a test command: plain words, nothing the shell expands, redirects or chains. */
 const PLAIN_STEP = /^[\w./@:=+,%-]+(?: +[\w./@:=+,%-]+)*$/;
 
+const plainBunTest = (step: string): boolean => PLAIN_STEP.test(step) && /^bun test(?: |$)/.test(step);
+
+function packageTestScript(cwd: string): unknown {
+ const pkg: unknown = JSON.parse(readFileSync(join(cwd, "package.json"), "utf8"));
+ if (typeof pkg !== "object" || pkg === null || !("scripts" in pkg)) return undefined;
+ const scripts = pkg.scripts;
+ if (typeof scripts !== "object" || scripts === null || "pretest" in scripts || "posttest" in scripts) return undefined;
+ return "test" in scripts ? scripts.test : undefined;
+}
+
 /**
  * A test command a base-red waiver can split: plain steps joined by `&&`,
  * exactly one of them `bun test`. `bun` is that step, `rest` every other
  * step, in order, joined by `&&` ("" when the command is `bun test` alone).
  * Null for any other shape (`;`, `||`, a pipe, quotes, an expansion, two bun
- * steps, a script that runs bun inside): what failed beside bun cannot be
+ * steps, an unresolved script): what failed beside bun cannot be
  * told apart.
  */
-export function bunTestChain(command: string): { bun: string; rest: string } | null {
+export function bunTestChain(command: string, readTestScript?: () => unknown): { bun: string; rest: string } | null {
  const steps = command.split("&&").map((s) => s.trim());
  if (!steps.every((s) => PLAIN_STEP.test(s))) return null;
- const bun = steps.filter((s) => /^bun test(?: |$)/.test(s));
+ for (let i = 0; i < steps.length; i++) {
+  if (steps[i] !== "bun run test") continue;
+  try {
+   const script = readTestScript?.();
+   if (typeof script !== "string" || !plainBunTest(script.trim())) return null;
+   steps[i] = script.trim();
+  } catch {
+   return null;
+  }
+ }
+ const bun = steps.filter(plainBunTest);
  if (bun.length !== 1) return null;
  return { bun: bun[0], rest: steps.filter((s) => s !== bun[0]).join(" && ") };
 }
@@ -3318,7 +3338,7 @@ async function testsRedAtBase(ctx: ImplementContext, run: FailedRun): Promise<Ba
  const failed = failedTests(tests);
  if (tests.code <= 0 || signalExit(tests.code) || failed.length === 0) return null;
  const event = (detail: string) => journal.recordEvent("reviewed", { nodeId: node.ref.id, repo: map.repo, detail });
- const chain = bunTestChain(testCommand);
+ const chain = bunTestChain(testCommand, () => packageTestScript(ctx.worktree));
  if (chain === null) {
   event(`tests (${testCommand}) failed; the merge-base check did not run: the command is not plain steps joined by && with one \`bun test\` step, so a failure beside the tests could not be told apart — the failures gate`);
   return null;
@@ -3327,7 +3347,7 @@ async function testsRedAtBase(ctx: ImplementContext, run: FailedRun): Promise<Ba
   event(`tests (${testCommand}) failed with failures no (fail) line names (an error outside a test, a TypeScript diagnostic, or a count the names do not cover); the merge-base check did not run — the failures gate`);
   return null;
  }
- if (coverageInPlay(testCommand, tests)) {
+ if (coverageInPlay(testCommand, tests) || coverageInPlay(chain.bun, tests)) {
   event(`tests (${testCommand}) failed with coverage reported, and a missed coverage threshold names no test; the merge-base check did not run — the failures gate`);
   return null;
  }
@@ -3342,7 +3362,7 @@ async function testsRedAtBase(ctx: ImplementContext, run: FailedRun): Promise<Ba
  }
  const { sha } = merged;
  await awaitQuietHost(ctx, "the merge-base test run");
- const base = await freshCheckoutTests(ctx, testCommand, sha, `${label}: merge base ${sha.slice(0, 8)}`, "base");
+ const base = await freshCheckoutTests(ctx, chain.bun, sha, `${label}: merge base ${sha.slice(0, 8)}`, "base");
  if (!base.ran) {
   event(`tests (${testCommand}) failed; the merge-base check at ${sha} did not run: ${base.result.stderr.trim().split("\n")[0]} — the failures gate`);
   return null;

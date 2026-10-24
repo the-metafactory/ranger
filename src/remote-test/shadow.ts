@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { access, lstat, open } from "node:fs/promises";
 import { join } from "node:path";
+import { stripVTControlCharacters } from "node:util";
 import { z } from "zod";
 import type { RunResult } from "../exec.ts";
 import { privateOperatorPath, shellQuote } from "./baseline.ts";
@@ -10,6 +11,7 @@ import { assertTestSource, createSshTestBackend, runTestBackend, type SshSelecti
 
 const metric = z.number().finite().nonnegative();
 const count = z.number().int().nonnegative().safe();
+const ShadowMeasurementsSchema = z.object({ laptopCpuSeconds: metric.nullable(), requiredSkippedTests: count.nullable() }).strict();
 const pending = null;
 export interface ShadowComparison {
  version: 1;
@@ -22,10 +24,19 @@ export interface ShadowComparison {
 }
 export interface ShadowMeasurements { laptopCpuSeconds: number | null; requiredSkippedTests: number | null }
 
+export function measureShadowTests(result: RunResult): ShadowMeasurements {
+ const clean = stripVTControlCharacters(`${result.stdout}\n${result.stderr}`);
+ const passed = [...clean.matchAll(/^\s*(\d+) pass$/gm)];
+ const failed = [...clean.matchAll(/^\s*(\d+) fail$/gm)];
+ const valid = passed.length > 0 && passed.length === failed.length && passed.every((match, index) => Number(match[1]) + Number(failed[index]?.[1]) > 0);
+ const requiredSkippedTests = valid ? count.parse([...clean.matchAll(/^\s*(\d+) (?:skip|todo)$/gm)].reduce((sum, match) => sum + Number(match[1]), 0)) : null;
+ return { laptopCpuSeconds: result.cpuTimeSeconds ?? null, requiredSkippedTests };
+}
+
 /** Pure attribution comparison. Local observations share the immutable job tuple;
  * they are comparison evidence only, never remote execution/admission authority. */
 export function compareShadow(request: TestRequest, local: RunResult, localDurationMs: number, remote: TestResult, roundTripMs: number, measured: ShadowMeasurements = { laptopCpuSeconds: null, requiredSkippedTests: null }): ShadowComparison {
- const observation = z.object({ laptopCpuSeconds: metric.nullable(), requiredSkippedTests: count.nullable() }).strict().parse(measured);
+ const observation = ShadowMeasurementsSchema.parse(measured);
  const report: ShadowComparison = {
   version: 1, authority: "local", request: { head: request.head, repositoryId: request.repositoryId, generation: request.generation, correlationId: request.correlationId },
   local: { code: local.code, durationMs: metric.parse(localDurationMs), ...observation, receipt: null },
@@ -51,7 +62,7 @@ export function compareShadow(request: TestRequest, local: RunResult, localDurat
  * No raw private transport errors or endpoints are sent to the journal/worker. */
 export function createShadowTestBackend(selection: SshSelection, options: {
  remote?: TestBackend; write?: (report: ShadowComparison) => Promise<void>;
- clock?: () => number; measurements?: () => Promise<ShadowMeasurements>;
+ clock?: () => number; measurements?: (result: RunResult) => ShadowMeasurements | Promise<ShadowMeasurements>;
 } = {}): TestBackend {
  const remote = options.remote ?? createSshTestBackend(selection), clock = options.clock ?? (() => performance.now());
  if (remote.kind !== "ssh") throw Error("Shadow requires an SSH comparison backend");
@@ -66,7 +77,7 @@ export function createShadowTestBackend(selection: SshSelection, options: {
   let measured: ShadowMeasurements = { laptopCpuSeconds: result.cpuTimeSeconds ?? null, requiredSkippedTests: null };
   let note = "";
   let shadow: NonNullable<TestResult["shadow"]> = { state: "unavailable", parity: "pending", coverageParity: "pending", reportStored: false };
-  try { if (options.measurements) measured = await options.measurements(); }
+  try { if (options.measurements) measured = ShadowMeasurementsSchema.parse(await options.measurements(result)); }
   catch { note = " Measurements pending."; }
   try {
    const report = compareShadow(request, result, durationMs, compared, clock() - remoteStarted, measured);
