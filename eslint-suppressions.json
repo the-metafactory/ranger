@@ -758,9 +758,6 @@
     }
   },
   "src/route.ts": {
-    "@typescript-eslint/no-non-null-assertion": {
-      "count": 1
-    },
     "@typescript-eslint/prefer-optional-chain": {
       "count": 1
     },
@@ -771,7 +768,7 @@
       "count": 1
     },
     "ranger/no-comments": {
-      "count": 42
+      "count": 40
     }
   },
   "src/run-ledger.ts": {

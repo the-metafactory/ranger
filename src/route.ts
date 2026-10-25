@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { approvalVersion } from "./approval-spec.ts";
+import { approvalVersion, executableApproval, principalFiled, proposeApprovable } from "./approval-spec.ts";
 import { parseForgeRef } from "./forge-ref.ts";
 import type { BriefAudit, FrontierEntry } from "./graph.ts";
 import type { WalkMode } from "./config.ts";
@@ -71,6 +71,7 @@ export interface ClassifiedNode {
   url: string;
   checkpointId?: string;
   approvalVersion?: string;
+  approvable?: boolean;
   route: RouteClass;
   /** Auto node declaring command/url probes — the class-5 signal. */
   registryBlocked: boolean;
@@ -134,25 +135,6 @@ export const ESCALATE_REASONS: Record<EscalateReason, string> = {
 
 export const HITL_KINDS = new Set(["grilling", "prototype"]);
 export const IMPLEMENT_KINDS = new Set(["task", "build"]);
-
-/** The intake marker line `intakeNodeBody` writes last (node #251, ruling D14). */
-const INTAKE_MARKER_LINE = /^<!-- ranger:intake discord=\d+ -->$/;
-
-/**
- * Whether the principal filed this node (#21 ruling D5): any author but the
- * bot identity, or the bot identity filing through intake, where the
- * principal's 👍 on the draft card is the authorship. Intake writes its
- * marker as the body's last line; only that line counts, because ranger's
- * other filings (Scribe, fix-the-base) quote review and probe text mid-body
- * and a marker quoted there must grant nothing (node #9 ban). Routing keys
- * on the body, not the `ranger:principal-intake` label: the frontier read
- * carries no labels.
- */
-function principalFiled(node: FrontierEntry, botIdentity: string): boolean {
-  if (node.author !== botIdentity) return true;
-  const last = (node.body ?? "").trimEnd().split(/\r?\n/).at(-1)!.trim();
-  return INTAKE_MARKER_LINE.test(last);
-}
 
 /** Load the probe registry from soma-home; absent file → empty registry. */
 export function loadProbeRegistry(
@@ -291,6 +273,7 @@ function classifyRoute(
   const { autonomy, kind } = node.node;
   const { typed } = node;
   const id = node.ref.id;
+  const filedByPrincipal = opts.botIdentity !== undefined && principalFiled(node, opts.botIdentity, opts.principal);
   const base = {
     id,
     title: node.node.title,
@@ -300,6 +283,8 @@ function classifyRoute(
     url: node.url,
     checkpointId: node.node.checkpointId,
     approvalVersion: approvalVersion(node.node, node.body),
+    approvable: autonomy === "approve" ? executableApproval({ ...node.node, typed }) :
+      proposeApprovable(node, opts.botIdentity, opts.principal),
     registryBlocked: false,
     body: node.body,
   };
@@ -325,8 +310,7 @@ function classifyRoute(
     IMPLEMENT_KINDS.has(kind) &&
     walkMode === "full" &&
     allowed &&
-    opts.botIdentity !== undefined &&
-    principalFiled(node, opts.botIdentity)
+    filedByPrincipal
   ) {
     const blockedProbes = blockedProbeSpecs(node.node, repo, registry);
     if (blockedProbes.length > 0) {

@@ -13,6 +13,7 @@ import {
 import type { FrontierEntry } from "../src/graph.ts";
 import { intakeNodeBody } from "../src/intake.ts";
 import { foundByProbeSpec, splitOutOfReviewSpec } from "../src/scribe.ts";
+import { approvalVersion } from "../src/approval-spec.ts";
 
 interface EntryOverrides {
   ref?: { id: string };
@@ -181,6 +182,81 @@ describe("classify — design §3 routing table", () => {
       EMPTY_REGISTRY,
     );
     expect(node.route.route).toBe("escalate-hitl");
+  });
+});
+
+describe("classify — principal approval of bot-filed propose execution", () => {
+  const gates = { botIdentity: "ivy-agent", principal: "alice" };
+  const held = { route: "escalate-hitl", reason: "propose-approve" } as const;
+  const merge = { route: "implement", walkable: true, ratify: "merge" } as const;
+  const filed = (kind = "build"): FrontierEntry => ({
+    ...entry({ node: { autonomy: "propose", kind } }), author: "ivy-agent", body: "Build this.",
+  });
+  const marker = (e: FrontierEntry) => `<!-- ranger:approved by=ALICE at=2026-10-25T12:00:00.000Z version=${approvalVersion(e.node, e.body)} -->`;
+  const approved = (kind = "build") => {
+    const e = filed(kind);
+    return { ...e, body: `${e.body}\n${marker(e)}` };
+  };
+  const route = (e: FrontierEntry, opts = gates) => classify(e, "acme/widgets", "full", EMPTY_REGISTRY, opts);
+
+  test("principal-approved bot task/build implements with merge ratification and stable version", () => {
+    for (const kind of ["task", "build"]) {
+      const node = route(approved(kind));
+      expect(node.route).toEqual(merge);
+      expect(node.autonomy).toBe("propose");
+      expect(node.approvable).toBe(false);
+      expect(node.approvalVersion).toBe(approvalVersion(filed(kind).node, filed(kind).body));
+    }
+    expect(route({ ...approved(), author: "IVY-AGENT" }).route).toEqual(merge);
+  });
+
+  test("edits to body, title or execution spec invalidate the approval and offer approval again", () => {
+    const e = approved();
+    for (const edited of [
+      { ...e, body: e.body.replace("Build this.", "Build something else.") },
+      { ...e, node: { ...e.node, title: "New title" } },
+      { ...e, node: { ...e.node, checkpointId: "new-checkpoint" } },
+    ]) {
+      expect(route(edited).route).toEqual(held);
+      expect(route(edited).approvable).toBe(true);
+    }
+  });
+
+  test("wrong principal, no configured principal and malformed markers fail closed", () => {
+    const e = approved();
+    for (const body of [
+      e.body.replace("by=ALICE", "by=mallory"),
+      e.body.replace("at=2026-10-25T12:00:00.000Z", "at=invalid"),
+      e.body.replace("at=2026-10-25T12:00:00.000Z", "at=2026-99-25T12:00:00Z"),
+      e.body.replace("version=", "version=A"),
+      e.body.replace(" -->", " extra -->"),
+    ]) expect(route({ ...e, body }).route).toEqual(held);
+    expect(classify(e, "acme/widgets", "full", EMPTY_REGISTRY, { botIdentity: gates.botIdentity }).route).toEqual(held);
+    expect(route(e, { ...gates, principal: "" }).route).toEqual(held);
+  });
+
+  test("quoted approval markers mid-body do not grant execution", () => {
+    const e = filed();
+    for (const body of [`${e.body}\n\`\`\`\n${marker(e)}\n\`\`\``, `${e.body}\n${marker(e)}\nMore text.`, `${e.body}\n> ${marker(e)}`]) {
+      expect(route({ ...e, body }).route).toEqual(held);
+    }
+  });
+
+  test("approval does not bypass walk scope, brief or probe gates, or enable other autonomy/kinds", () => {
+    const e = approved();
+    for (const walk of ["none", "research-only"] as const) expect(classify(e, "acme/widgets", walk, EMPTY_REGISTRY, gates).route).toEqual(held);
+    expect(classify(e, "acme/widgets", "full", EMPTY_REGISTRY, { ...gates, allowlist: ["99"] }).route).toEqual(held);
+    expect(classify(e, "acme/widgets", "full", EMPTY_REGISTRY, { ...gates, skip: ["1"] }).route).toEqual(held);
+    expect(classify(e, "acme/widgets", "full", EMPTY_REGISTRY, { ...gates, briefs: { ok: false, error: "unavailable" } }).route.route).toBe("brief-not-ready");
+    const unregistered = filed();
+    unregistered.node.probes = [{ type: "command", run: "bun test", cwd: "/tmp/widgets" }];
+    unregistered.body = `${unregistered.body}\n${marker(unregistered)}`;
+    expect(route(unregistered).route.route).toBe("provisioning");
+    expect(route(approved("prototype")).route).toEqual(held);
+    const approve = filed();
+    approve.node.autonomy = "approve";
+    approve.body = `${approve.body}\n${marker(approve)}`;
+    expect(route(approve).route).toEqual(held);
   });
 });
 

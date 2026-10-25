@@ -7,6 +7,7 @@ import { approvalVersion } from "../src/approval-spec.ts";
 import { loadConfig } from "../src/config.ts";
 import type { RunOptions } from "../src/exec.ts";
 import { runApproveAction } from "../src/serve-approve.ts";
+import { classify } from "../src/route.ts";
 
 const repo = "acme/widgets";
 const spec = { autonomy: "approve", kind: "build", checkpointId: "cp-build" };
@@ -115,4 +116,88 @@ test("the dashboard approval action uses the registered map, version and an allo
  expect((await runApproveAction({ key: repo + "#1", id: "12;false", version }, deps)).status).toBe(400);
  expect((await runApproveAction({ key: repo + "#1", id: "12", version }, { ...deps, maps: deps.maps.map((m) => ({ ...m, servedOnly: true })) })).status).toBe(409);
  expect(calls).toHaveLength(1);
+});
+
+const proposeSpec = { ...spec, autonomy: "propose" };
+const proposeBody = body.replace('"approve"', '"propose"');
+const proposeVersion = approvalVersion({ ...proposeSpec, title: "Build this" }, proposeBody);
+const botIssue = { body: proposeBody, user: { login: "ivy-agent" } };
+
+test("principal approves bot-filed propose build, preserving body and routing it implement", async () => {
+ const fixture = setup(botIssue, "ALICE");
+ await approveNode({ config, map: config.maps[0], id: "12", version: proposeVersion }, fixture.runner);
+ const saved = String(fixture.issue().body);
+ expect(saved).toStartWith(proposeBody + "\n");
+ expect(saved.split("\n").at(-1)).toMatch(new RegExp(`^<!-- ranger:approved by=ALICE at=\\d{4}-\\d{2}-\\d{2}T.*Z version=${proposeVersion} -->$`));
+ const routed = classify({ ref: { id: "12" }, node: { ...proposeSpec, id: "12", title: "Build this" }, author: "ivy-agent", body: saved, typed: true, status: "open", assignees: [], blockedBy: [], url: "https://github.com/acme/widgets/issues/12" }, repo, "full", {}, { botIdentity: "ivy-agent", principal: "alice" });
+ expect(routed.route).toEqual({ route: "implement", walkable: true, ratify: "merge" });
+ expect(routed.autonomy).toBe("propose");
+ expect(routed.approvalVersion).toBe(proposeVersion);
+ await expect(approveNode({ config, map: config.maps[0], id: "12", version: proposeVersion }, fixture.runner)).rejects.toThrow("already principal-filed");
+ expect(fixture.calls.filter((c) => c.argv.includes("PATCH"))).toHaveLength(1);
+});
+
+test("a stale approval is replaced on reapproval with one last-line marker", async () => {
+ const stale = `${proposeBody}\n<!-- ranger:approved by=alice at=2026-10-25T12:00:00Z version=${proposeVersion} -->`.replace("Build this.", "Build the new scope.");
+ const updatedVersion = approvalVersion({ ...proposeSpec, title: "Build this" }, stale);
+ const fixture = setup({ ...botIssue, body: stale });
+ await expect(approveNode({ config, map: config.maps[0], id: "12", version: proposeVersion }, fixture.runner)).rejects.toThrow("changed since the card");
+ expect(fixture.calls.some((c) => c.argv.includes("PATCH"))).toBe(false);
+ await approveNode({ config, map: config.maps[0], id: "12", version: updatedVersion }, fixture.runner);
+ const saved = String(fixture.issue().body);
+ expect(saved.match(/<!-- ranger:approved /g)).toHaveLength(1);
+ expect(saved).toEndWith(`version=${updatedVersion} -->`);
+ expect(saved).toContain('"autonomy":"propose"');
+ expect(approvalVersion({ ...proposeSpec, title: "Build this" }, saved)).toBe(updatedVersion);
+});
+
+for (const [name, changes, login] of [
+ ["non-principal", {}, "ivy-agent"],
+ ["principal-authored propose", { user: { login: "alice" } }, "alice"],
+ ["intake-filed propose", { body: `${proposeBody}\n<!-- ranger:intake discord=123 -->` }, "alice"],
+ ["claimed propose", { assignees: [{ login: "worker" }] }, "alice"],
+ ["closed propose", { state: "closed" }, "alice"],
+ ["multiple typed blocks", { body: `${proposeBody}\n${proposeBody}` }, "alice"],
+ ["pull request", { pull_request: {} }, "alice"],
+] as const) {
+ test(`bot propose approval refuses ${name} without writing`, async () => {
+  const fixture = setup({ ...botIssue, ...changes }, login);
+  const currentVersion = approvalVersion({ ...proposeSpec, title: "Build this" }, String(fixture.issue().body));
+  await expect(approveNode({ config, map: config.maps[0], id: "12", version: currentVersion }, fixture.runner)).rejects.toThrow();
+  expect(fixture.calls.some((c) => c.argv.includes("PATCH"))).toBe(false);
+ });
+}
+
+test("bot propose approval rechecks before writing and confirms the saved body", async () => {
+ for (const mode of ["race", "readback"] as const) {
+  const fixture = setup(botIssue);
+  let reads = 0;
+  const runner: typeof fixture.runner = async (command, args, opts) => {
+   const result = await fixture.runner(command, args, opts);
+   if (args[1] !== "user" && !args.includes("PATCH")) {
+    reads++;
+    if (reads === (mode === "race" ? 2 : 3)) result.stdout = JSON.stringify({ ...fixture.issue(), body: proposeBody + "\nChanged." });
+   }
+   return result;
+  };
+  await expect(approveNode({ config, map: config.maps[0], id: "12", version: proposeVersion }, runner)).rejects.toThrow(mode === "race" ? "changed during approval" : "write could not be confirmed");
+  expect(fixture.calls.filter((c) => c.argv.includes("PATCH"))).toHaveLength(mode === "race" ? 0 : 1);
+ }
+});
+
+test("dashboard propose approval delegates to the guarded command and checks card eligibility", async () => {
+ const fixture = setup(botIssue);
+ const deps = {
+  maps: [{ key: repo + "#1", walk: "full", servedOnly: false, decisions: [{ id: "12", kind: "build", autonomy: "propose", approvalVersion: proposeVersion, approvable: true }] }],
+  configPath: configFile, rangerBin: "/bin/ranger", inFlight: new Set<string>(), env: {},
+  run: async (argv: string[]) => {
+   expect(argv.slice(0, 3)).toEqual(["/bin/ranger", "approve-node", "12"]);
+   await approveNode({ config, map: config.maps[0], id: argv[2], version: argv[6] }, fixture.runner);
+   return { code: 0, stderr: "" };
+  },
+ };
+ expect((await runApproveAction({ key: repo + "#1", id: "12", version: proposeVersion }, deps)).status).toBe(200);
+ expect(String(fixture.issue().body)).toEndWith(`version=${proposeVersion} -->`);
+ const refused = { ...deps, maps: deps.maps.map((m) => ({ ...m, decisions: m.decisions.map((n) => ({ ...n, approvable: false })) })) };
+ expect((await runApproveAction({ key: repo + "#1", id: "12", version: proposeVersion }, refused)).status).toBe(409);
 });

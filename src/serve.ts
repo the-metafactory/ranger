@@ -97,7 +97,6 @@ import {
 } from "./serve-parked.ts";
 import { runDrainAction } from "./serve-drain.ts";
 import { runApproveAction } from "./serve-approve.ts";
-import { executableApproval } from "./approval-spec.ts";
 import { workerLogFile } from "./worker-log.ts";
 
 export { childEnv };
@@ -620,7 +619,7 @@ export function assembleState(inputs: StateInputs): DashboardState {
        : (map.checkoutRefused ?? `no localCheckout for ${map.repo} in ranger.yaml`);
     return [{ ...view(n), autonomy: n.autonomy, reason, launchable: why === undefined, why,
      approvalVersion: n.approvalVersion,
-     approvable: !map.servedOnly && map.walk === "full" && executableApproval(n),
+     approvable: !map.servedOnly && map.walk === "full" && n.approvable === true,
     }];
    }),
   };
