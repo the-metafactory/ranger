@@ -19,8 +19,8 @@ the graph. Exit 0 when every map read, 2 when one failed.
 
 Preconditions: baseline; the change under test is in scout, digest or routing (scout costs ~4.5 min and GraphQL budget).
 
-- **Digest.** `time bun src/cli.ts scout --config "$RUN/state/ranger.yaml" > "$RUN/evidence/scout.txt" 2>&1; echo $?`. Exit 0; line 2 reads `identity: jcfischer (fine-grained) · read-only surface: audit/frontier/node`; one `map:` block per map in the config.
-- **JSON.** `bun src/cli.ts scout --json --config "$RUN/state/ranger.yaml" > "$RUN/evidence/scout.json"`. `maps[].ok` all true.
+- **Digest.** `source "$RUN/state/env.sh" && time bun src/cli.ts scout --config "$RUN/state/ranger.yaml" > "$RUN/evidence/scout.txt" 2>&1; echo $?`. Exit 0; line 2 reads `identity: jcfischer (fine-grained) · read-only surface: audit/frontier/node`; one `map:` block per map in the config.
+- **JSON.** `source "$RUN/state/env.sh" && bun src/cli.ts scout --json --config "$RUN/state/ranger.yaml" > "$RUN/evidence/scout.json"`. `maps[].ok` all true.
 
 ## Gotchas
 

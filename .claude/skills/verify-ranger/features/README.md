@@ -7,7 +7,7 @@ index, then use the matching feature file as the recipe.
 
 - `RUN=$(scripts/launch.sh | tail -1)` succeeded and `scripts/doctor.sh "$RUN"` exits 0.
 - The dashboard is at `http://127.0.0.1:7399` (or `$VERIFY_RANGER_PORT`), serving this checkout on a snapshot of the live journal.
-- CLI steps run after `source "$RUN/state/env.sh"` from the checkout doctor printed, with `--config "$RUN/state/ranger.yaml"`.
+- CLI steps run from the checkout doctor printed, each as one command `source "$RUN/state/env.sh" && bun src/cli.ts ... --config "$RUN/state/ranger.yaml"`: env vars do not survive between Bash tool calls.
 - Never drive the live dashboard on 7311 or the live journal.
 
 ## Driving conventions

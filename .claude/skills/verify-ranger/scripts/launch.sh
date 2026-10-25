@@ -24,6 +24,9 @@ echo "$PORT" > "$RUN/state/port"
 # Consistent snapshot through SQLite's backup API; the live file is only read.
 sqlite3 "$LIVE_DIR/state.sqlite" ".backup '$RUN/state/state.sqlite'"
 cp "$LIVE_DIR/ranger.yaml" "$RUN/state/ranger.yaml"
+# The copy names the snapshot itself: an env without RANGER_JOURNAL_PATH (a
+# dashboard action's allowlisted env, a fresh shell) still lands on the copy.
+(cd "$CHECKOUT" && "$BUN" "$SKILL_DIR/scripts/pin-journal.ts" "$RUN/state/ranger.yaml" "$RUN/state/state.sqlite")
 
 cat > "$RUN/state/env.sh" <<EOF
 export RANGER_JOURNAL_PATH="$RUN/state/state.sqlite"

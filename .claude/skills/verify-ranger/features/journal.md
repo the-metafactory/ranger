@@ -19,12 +19,12 @@ events. `--node <id>` narrows it to one node; `--repo` to one map repo.
 
 Preconditions: baseline; pick a node id from `#needsyou` in the latest `<stamp>-state.json`.
 
-- **All.** `bun src/cli.ts journal --config "$RUN/state/ranger.yaml" > "$RUN/evidence/journal.json"; echo $?`. Exit 0; first key `journalPath` equals `$RUN/state/state.sqlite` (proves the snapshot, not the live file).
-- **One node.** `bun src/cli.ts journal --node <id> --config "$RUN/state/ranger.yaml" > "$RUN/evidence/journal-<id>.json"`. Every worker row has `"nodeId": "<id>"`.
-- **Refusal.** `bun src/cli.ts journal --node abc --config "$RUN/state/ranger.yaml"; echo $?`. stderr `ranger journal: --node must be a numeric id, got abc`, exit 1.
+- **All.** `source "$RUN/state/env.sh" && bun src/cli.ts journal --config "$RUN/state/ranger.yaml" > "$RUN/evidence/journal.json"; echo $?`. Exit 0; first key `journalPath` equals `$RUN/state/state.sqlite` (proves the snapshot, not the live file).
+- **One node.** `source "$RUN/state/env.sh" && bun src/cli.ts journal --node <id> --config "$RUN/state/ranger.yaml" > "$RUN/evidence/journal-<id>.json"`. Every worker row has `"nodeId": "<id>"`.
+- **Refusal.** `source "$RUN/state/env.sh" && bun src/cli.ts journal --node abc --config "$RUN/state/ranger.yaml"; echo $?`. stderr `ranger journal: --node must be a numeric id, got abc`, exit 1.
 
 ## Gotchas
 
 - The whole journal is ~18k lines; always redirect to a file.
 - Worker `log` paths point at `~/.config/ranger/logs/`, the live logs; reading them is fine, writing is not.
-- `journalPath` showing `~/.config/ranger/state.sqlite` means env.sh was not sourced: stop.
+- `journalPath` showing `~/.config/ranger/state.sqlite` means the config is not the pinned copy: stop and relaunch.

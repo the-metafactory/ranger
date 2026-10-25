@@ -12,8 +12,10 @@ Discord; it is never driven from this skill. Its proof is `bun test`.
 
 The scripts here never touch the live instance: they copy the live journal
 (`~/.config/ranger/state.sqlite`) with SQLite's backup API, copy the live
-`ranger.yaml`, and run this checkout's code on port 7399 with **read-only**
-GitHub tokens only. The write and Discord tokens are unset.
+`ranger.yaml` with `state.journalPath` pinned to the copy, and run this
+checkout's `serve` on port 7399. `serve` and the read verbs get the
+read-only GitHub tokens only; `env.sh` unsets the write and Discord tokens.
+That does not hold for `approve-node` (see Hard rules).
 
 Paths below are relative to this skill's directory. Run from any checkout or
 worktree: the scripts serve the checkout they live in (`RANGER_CHECKOUT`
@@ -29,6 +31,14 @@ overrides).
   journal. `drive.ts` aborts every POST except `/api/refresh` and proves the
   block on each run. Verify those actions with `bun test test/serve*.test.ts`
   and the CLI dry runs in `features/`.
+- `approve-node` runs `gh` with an allowlisted env that drops `GH_TOKEN` and
+  `GH_CONFIG_DIR`, so it uses the principal's own write-capable gh keyring
+  whatever `env.sh` sets, and it refuses any other login. Run it only with
+  `--dry-run`; without it, it edits the GitHub issue.
+- The Bash tool does not keep env vars between calls. Write every CLI step as
+  one command, `source "$RUN/state/env.sh" && bun src/cli.ts ...`. The pinned
+  config keeps the journal on the copy even when env.sh is lost, but not the
+  tokens.
 - `scout` and Refresh spend the principal's read-only GraphQL budget; scout
   takes ~4.5 min over 26 maps. Run it only when the change is in scout.
 
@@ -55,9 +65,12 @@ scripts/doctor.sh "$RUN"
 ```
 
 Read-only. Checks: port is not 7311; our serve is up; it owns the port; its
-cwd is the checkout (prints HEAD); its `RANGER_JOURNAL_PATH` is the snapshot;
-`/api/state` reads maps. `maps read: 0/N` means the read-only PATs
-(`ranger-ro-metafactory`, `ranger-ro-personal` keychain items) are missing.
+cwd is the checkout (prints HEAD); its `RANGER_JOURNAL_PATH` and the copied config's `state.journalPath` are
+the snapshot; `/api/state` reads maps. Registered maps render from the
+snapshot's frontier cache without a token, so `maps read: 0/N` means the
+snapshot cached no frontier. Missing read-only PATs
+(`ranger-ro-metafactory`, `ranger-ro-personal` keychain items) stop serve at
+startup instead: launch prints the refusal from `serve.log`.
 Run it first whenever anything looks off.
 
 ## Drive
@@ -81,11 +94,10 @@ expected rows against it. To check a new element, extend `drive.ts` with a
 CLI (same snapshot, read-only tokens):
 
 ```bash
-source "$RUN/state/env.sh"
 cd "$(cat "$RUN/state/checkout")"
-bun src/cli.ts journal --config "$RUN/state/ranger.yaml" > "$RUN/evidence/journal.json"
-bun src/cli.ts journal --node <id> --config "$RUN/state/ranger.yaml"
-bun src/cli.ts job list --config "$RUN/state/ranger.yaml"
+source "$RUN/state/env.sh" && bun src/cli.ts journal --config "$RUN/state/ranger.yaml" > "$RUN/evidence/journal.json"
+source "$RUN/state/env.sh" && bun src/cli.ts journal --node <id> --config "$RUN/state/ranger.yaml"
+source "$RUN/state/env.sh" && bun src/cli.ts job list --config "$RUN/state/ranger.yaml"
 ```
 
 Per-feature journeys: [`features/README.md`](features/README.md).
@@ -123,5 +135,6 @@ refuses a busy port. Stranded runs:
 | `scripts/launch.sh` | snapshot + start isolated serve; last line is the run dir |
 | `scripts/doctor.sh <run>` | read-only health check, exit 1 on any FAIL |
 | `scripts/drive.ts <run> [--refresh]` | headless dashboard journey with POST guard |
+| `scripts/pin-journal.ts <yaml> <sqlite>` | launch's step: set `state.journalPath` in the copied config |
 | `scripts/state-summary.ts <state.json>` | array counts and map read errors of a `/api/state` dump |
 | `scripts/cleanup.sh <run>` | stop our serve, drop scratch state, keep evidence |

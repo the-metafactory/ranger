@@ -20,9 +20,9 @@ lane, and reported to the run ledger. The principal reads their runs with
 
 Preconditions: baseline.
 
-- **List.** `bun src/cli.ts job list --config "$RUN/state/ranger.yaml" > "$RUN/evidence/jobs.json"; echo $?`. Exit 0; a JSON array; the newest entries match the job names in `ranger.yaml`.
+- **List.** `source "$RUN/state/env.sh" && bun src/cli.ts job list --config "$RUN/state/ranger.yaml" > "$RUN/evidence/jobs.json"; echo $?`. Exit 0; a JSON array; the newest entries match the job names in `ranger.yaml`.
 - **Lanes.** `bun scripts/drive.ts "$RUN"`, then read `gates.laneHolders` in `<stamp>-state.json` and `#next` in `<stamp>-dashboard.png`. A null holder shows "free".
-- **Enqueue.** Allowed on the snapshot only: `bun src/cli.ts job enqueue daily-short --config "$RUN/state/ranger.yaml"` prints `{"name":"daily-short","runId":N,"lane":"none","queued":true}`; a second call prints the same `runId` with `"queued":false`, exit 0 both times. Then `sqlite3 ~/.config/ranger/state.sqlite "select max(id) from job_runs"` is still below N: the live journal did not see it. Nothing starts the run, since no tick reads the snapshot.
+- **Enqueue.** Allowed on the snapshot only: `source "$RUN/state/env.sh" && bun src/cli.ts job enqueue daily-short --config "$RUN/state/ranger.yaml"` prints `{"name":"daily-short","runId":N,"lane":"none","queued":true}`; a second call prints the same `runId` with `"queued":false`, exit 0 both times. Then `source "$RUN/state/env.sh" && bun src/cli.ts job list --config "$RUN/state/ranger.yaml"` lists run N, and `journal` reports `journalPath` = `$RUN/state/state.sqlite`: the write went to the copy. Never open the live journal to compare; its id sequence is shared, so an equal id proves nothing. Nothing starts the run, since no tick reads the snapshot.
 
 ## Gotchas
 

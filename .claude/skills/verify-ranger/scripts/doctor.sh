@@ -21,8 +21,13 @@ if ps -E -p "$PID" -o command= 2>/dev/null | grep -q "RANGER_JOURNAL_PATH=$RUN/s
 else
   bad "cannot confirm RANGER_JOURNAL_PATH points at the snapshot"
 fi
+if grep -qF "journalPath: $RUN/state/state.sqlite" "$RUN/state/ranger.yaml"; then
+  ok "copied config pins journalPath to the snapshot"
+else
+  bad "copied config does not pin state.journalPath to the snapshot"
+fi
 if curl -fsS "http://127.0.0.1:$PORT/api/state" -o "$RUN/state/doctor.json" 2>/dev/null; then
-  bun "$(dirname "$0")/state-summary.ts" "$RUN/state/doctor.json" | sed "s/^/     /" && ok "at least one map read" || bad "no map read without error (read-only tokens in keychain?)"
+  bun "$(dirname "$0")/state-summary.ts" "$RUN/state/doctor.json" | sed "s/^/     /" && ok "at least one map read" || bad "no map read without error: the snapshot holds no cached frontier for them (a missing read-only PAT stops serve at startup instead; see serve.log)"
 else
   bad "/api/state did not answer"
 fi
