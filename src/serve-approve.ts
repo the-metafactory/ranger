@@ -16,7 +16,7 @@ export async function runApproveAction(body: Record<string, unknown>, deps: {
  if (map.servedOnly || map.walk !== "full" || node.approvable !== true || !executableApproval(node)) return refusal(409, "only approval-gated task/build nodes on implementation maps can be approved");
  if (typeof body.version !== "string" || !isApprovalVersion(body.version) || body.version !== node.approvalVersion) return refusal(409, "node changed; refresh before approving");
  if (deps.configPath === undefined) return noConfigPath("approve");
- const argv = [deps.rangerBin, "approve-node", node.id, "--map", map.key, "--version", body.version, "-c", deps.configPath];
+ const argv = [deps.rangerBin, "approve-node", node.id, "--map", map.key, "--approval-version", body.version, "-c", deps.configPath];
  return holding(deps.inFlight, "approve:" + map.key + "/" + node.id, "approval is already running", () =>
   runOperatorVerb(argv, body.dryRun, deps, "approve", { nodeId: node.id }));
 }

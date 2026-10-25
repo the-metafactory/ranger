@@ -5,9 +5,10 @@ import { join } from "node:path";
 import { approveNode } from "../src/approve-node.ts";
 import { approvalVersion } from "../src/approval-spec.ts";
 import { loadConfig } from "../src/config.ts";
-import type { RunOptions } from "../src/exec.ts";
+import { runCmd, type RunOptions } from "../src/exec.ts";
 import { runApproveAction } from "../src/serve-approve.ts";
 import { classify } from "../src/route.ts";
+import { bun, cliPath, testCliEnv } from "./support.ts";
 
 const repo = "acme/widgets";
 const spec = { autonomy: "approve", kind: "build", checkpointId: "cp-build" };
@@ -111,7 +112,7 @@ test("the dashboard approval action uses the registered map, version and an allo
  };
  const result = await runApproveAction({ key: repo + "#1", id: "12", version }, deps);
  expect(result.status).toBe(200);
- expect(calls[0]).toEqual(["/bin/ranger", "approve-node", "12", "--map", repo + "#1", "--version", version, "-c", "/tmp/ranger.yaml"]);
+ expect(calls[0]).toEqual(["/bin/ranger", "approve-node", "12", "--map", repo + "#1", "--approval-version", version, "-c", "/tmp/ranger.yaml"]);
  expect((await runApproveAction({ key: repo + "#1", id: "12", version: "0".repeat(64) }, deps)).status).toBe(409);
  expect((await runApproveAction({ key: repo + "#1", id: "12;false", version }, deps)).status).toBe(400);
  expect((await runApproveAction({ key: repo + "#1", id: "12", version }, { ...deps, maps: deps.maps.map((m) => ({ ...m, servedOnly: true })) })).status).toBe(409);
@@ -200,4 +201,19 @@ test("dashboard propose approval delegates to the guarded command and checks car
  expect(String(fixture.issue().body)).toEndWith(`version=${proposeVersion} -->`);
  const refused = { ...deps, maps: deps.maps.map((m) => ({ ...m, decisions: m.decisions.map((n) => ({ ...n, approvable: false })) })) };
  expect((await runApproveAction({ key: repo + "#1", id: "12", version: proposeVersion }, refused)).status).toBe(409);
+});
+
+test("the dashboard's approve argv reaches the approve-node action through the real CLI", async () => {
+ const scoped = join(directory, "scoped.yaml");
+ writeFileSync(scoped, JSON.stringify({ maps: [{ repo, root: 1, walk: "full", nodes: ["99"] }], principal: { login: "alice" }, bot: { identity: "ivy-agent" } }));
+ let argv: string[] = [];
+ await runApproveAction({ key: repo + "#1", id: "12", version }, {
+  maps: [{ key: repo + "#1", walk: "full", servedOnly: false, decisions: [{ id: "12", kind: "build", autonomy: "approve", approvalVersion: version, approvable: true }] }],
+  configPath: scoped, rangerBin: "ranger", inFlight: new Set<string>(), env: {},
+  run: async (built: string[]) => { argv = built; return { code: 0, stderr: "" }; },
+ });
+ const result = await runCmd(bun, [cliPath, ...argv.slice(1)], { env: testCliEnv(process.env) });
+ expect(result.stdout.trim()).not.toBe("0.1.0");
+ expect(result.stderr).toContain("node is outside this map's implementation scope");
+ expect(result.code).toBe(1);
 });

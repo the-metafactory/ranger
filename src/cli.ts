@@ -984,13 +984,13 @@ program
 program
  .command("approve-node <id>")
  .requiredOption("--map <map>", "registered map repo#root")
- .requiredOption("--version <hash>", "node version shown on the approval card")
+ .requiredOption("--approval-version <hash>", "node version shown on the approval card")
  .option("--dry-run", "validate without approving")
  .option("-c, --config <path>", "path to ranger.yaml")
- .action(async (id: string, options: { map: string; version: string; dryRun?: boolean; config?: string }) => {
+ .action(async (id: string, options: { map: string; approvalVersion: string; dryRun?: boolean; config?: string }) => {
   const { config } = loadConfig(resolveConfigPath(options.config, process.env, process.cwd()));
   const map = pickMap(config, options.map);
-  process.stdout.write(JSON.stringify(await approveNode({ config, map, id, version: options.version, dryRun: options.dryRun })) + "\n");
+  process.stdout.write(JSON.stringify(await approveNode({ config, map, id, version: options.approvalVersion, dryRun: options.dryRun })) + "\n");
  });
 
 program
