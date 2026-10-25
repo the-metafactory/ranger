@@ -2,6 +2,10 @@
 export const IMPLEMENT_LANES = ["visual", "headless"] as const;
 export type ImplementLane = (typeof IMPLEMENT_LANES)[number];
 
+/** A job may also take no lane: it holds no slot and waits on no lane holder. */
+export const JOB_LANES = [...IMPLEMENT_LANES, "none"] as const;
+export type JobLane = (typeof JOB_LANES)[number];
+
 export interface LaneMap {
  repo: string;
  root: number;
