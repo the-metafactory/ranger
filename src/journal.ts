@@ -24,7 +24,7 @@ import {
 } from "./store/schema.ts";
 import type { RangerConfig } from "./config.ts";
 import { expandHome } from "./config.ts";
-import { holdsImplementLane, workerLane, type ImplementLane, type LaneMap } from "./lanes.ts";
+import { holdsImplementLane, workerLane, type ImplementLane, type JobLane, type LaneMap } from "./lanes.ts";
 import { assertNotLiveJournalUnderTest } from "./journal-guard.ts";
 
 /**
@@ -526,12 +526,12 @@ export class Journal {
   * index makes a second enqueue before the run starts a no-op. Returns the
   * queued run and whether this call queued it.
   */
- enqueueJobRun(name: string, lane: ImplementLane, now = new Date()): { run: JobRunRow; queued: boolean } {
+ enqueueJobRun(name: string, lane: JobLane, now = new Date()): { run: JobRunRow; queued: boolean } {
   return this.db.transaction(() => {
    const inserted = this.db.insert(jobRuns).values({ runUuid: randomUUID(), name, lane, status: "queued", queuedAt: now.toISOString() })
     .onConflictDoNothing().returning().get();
    if (inserted !== undefined) {
-    this.recordEvent("job-queued", { detail: `job ${name} queued for the ${lane} lane (run ${inserted.id})` });
+    this.recordEvent("job-queued", { detail: `job ${name} queued ${lane === "none" ? "without a lane" : `for the ${lane} lane`} (run ${inserted.id})` });
     return { run: inserted, queued: true };
    }
    const existing = this.db.select().from(jobRuns)

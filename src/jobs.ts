@@ -19,7 +19,7 @@ import { expandHome, type RangerConfig, type RangerJobConfig } from "./config.ts
 import { pidAlive, killProcessGroup, processGroupCommands, runCmd, type RunOptions, type RunResult } from "./exec.ts";
 import type { JobRunRow, Journal } from "./journal.ts";
 import { JOURNAL_PATH_ENV, sessionJournalPath } from "./journal-guard.ts";
-import type { ImplementLane } from "./lanes.ts";
+import type { ImplementLane, JobLane } from "./lanes.ts";
 import { emitJobRunFinished, type RunLedgerDeps } from "./run-ledger.ts";
 import type { SubstrateName } from "./store/schema.ts";
 import { selectSubstrate, workerCommandFor, workerOutputFor, type SubstrateReaders } from "./substrate.ts";
@@ -54,7 +54,7 @@ export function enqueueJob(
  journal: Pick<Journal, "enqueueJobRun">,
  name: string,
  now = new Date(),
-): { name: string; runId: number; lane: ImplementLane; queued: boolean } {
+): { name: string; runId: number; lane: JobLane; queued: boolean } {
  const job = findJob(config, name);
  const { run, queued } = journal.enqueueJobRun(job.name, job.lane, now);
  return { name: job.name, runId: run.id, lane: job.lane, queued };
@@ -91,7 +91,7 @@ export async function spawnJobDetached(args: SpawnJobArgs): Promise<number | nul
 }
 
 export interface JobPassResult {
- started: { runId: number; name: string; lane: ImplementLane; pid: number }[];
+ started: { runId: number; name: string; lane: JobLane; pid: number }[];
  waiting: { runId: number; name: string; reason: string }[];
  /** Runs this pass ended: a dead supervisor, a job no longer declared, a failed spawn. */
  failed: { runId: number; name: string; reason: string }[];
@@ -214,8 +214,8 @@ export async function jobPass(ctx: JobPassContext): Promise<JobPassResult> {
   if (journal.isPaused()) { wait("dead-man paused"); continue; }
   if (lane === "visual" && journal.isVisualLaneDrained()) { wait("visual lane drained"); continue; }
   if (journal.spawnsToday(now) >= config.workers.spawnCapPerDay) { wait("daily spawn cap reached"); continue; }
-  if (taken.has(lane)) { wait(`the ${lane} lane was taken this tick`); continue; }
-  const holder = journal.laneHolder(lane);
+  if (lane !== "none" && taken.has(lane)) { wait(`the ${lane} lane was taken this tick`); continue; }
+  const holder = lane === "none" ? null : journal.laneHolder(lane);
   if (holder !== null) {
    wait(`the ${lane} lane is held by ${holder.job === undefined ? `#${holder.nodeId} (${holder.repo}#${holder.root})` : `job ${holder.job}`}`);
    continue;
@@ -223,7 +223,7 @@ export async function jobPass(ctx: JobPassContext): Promise<JobPassResult> {
   // Reserve the lane before spawning: the child must find a running row,
   // and every other scheduler must see the lane occupied.
   if (!journal.updateJobRun(run.id, "queued", { status: "running", startedAt: now.toISOString() })) continue;
-  taken.add(lane);
+  if (lane !== "none") taken.add(lane);
   journal.recordSpawn(now);
   let pid: number | null = null;
   try {
@@ -242,7 +242,7 @@ export async function jobPass(ctx: JobPassContext): Promise<JobPassResult> {
   }
   // The child may already have recorded its own pid (the same process).
   if (running.pid === null) journal.updateJobRun(run.id, "running", { pid });
-  journal.recordEvent("job-started", { detail: `job ${run.name} run ${run.id} started on the ${lane} lane (pid ${pid})` });
+  journal.recordEvent("job-started", { detail: `job ${run.name} run ${run.id} started ${lane === "none" ? "without a lane" : `on the ${lane} lane`} (pid ${pid})` });
   result.started.push({ runId: run.id, name: run.name, lane, pid });
  }
  return result;

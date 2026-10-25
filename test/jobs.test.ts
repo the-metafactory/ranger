@@ -119,6 +119,32 @@ describe("node #301 — scheduled jobs", () => {
   expect(r.journal.listJobRuns("queued")).toHaveLength(1);
  });
 
+ test("a lane-none job starts while both lanes are held, and holds neither", async () => {
+  const r = rig([{ ...SHORT, lane: "none" }]);
+  runJobEnqueue("daily-short", r.configPath);
+  holdVisual(r.journal);
+  r.journal.upsertWorker({ nodeId: "8", repo: "acme/tools", root: 2, status: "running", lane: "implement", phase: "implement" });
+  const s = spawner();
+  const pass = await jobPass({ config: r.config, configPath: r.configPath, journal: r.journal, spawnJob: s.spawnJob });
+  expect(pass.waiting).toEqual([]);
+  expect(pass.started).toEqual([{ runId: 1, name: "daily-short", lane: "none", pid: 4242 }]);
+  r.journal.upsertWorker({ nodeId: "7", repo: GAME, root: 1, status: "released", lane: "implement", phase: "implement" });
+  r.journal.upsertWorker({ nodeId: "8", repo: "acme/tools", root: 2, status: "released", lane: "implement", phase: "implement" });
+  expect(r.journal.listJobRuns("running")).toHaveLength(1);
+  expect(r.journal.laneHolder("visual")).toBeNull();
+  expect(r.journal.laneHolder("headless")).toBeNull();
+ });
+
+ test("a lane-none job still waits while the dead-man switch is paused", async () => {
+  const r = rig([{ ...SHORT, lane: "none" }]);
+  runJobEnqueue("daily-short", r.configPath);
+  r.journal.setPaused(true);
+  const s = spawner();
+  const pass = await jobPass({ config: r.config, configPath: r.configPath, journal: r.journal, spawnJob: s.spawnJob });
+  expect(s.calls).toHaveLength(0);
+  expect(pass.waiting[0].reason).toBe("dead-man paused");
+ });
+
  test("a running visual job holds the lane against implement sessions, and never runs beside one", async () => {
   const r = rig();
   const runId = await startedRun(r);

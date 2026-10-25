@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { IMPLEMENT_LANES } from "./lanes.ts";
+import { IMPLEMENT_LANES, JOB_LANES } from "./lanes.ts";
 import { defaultJournalPath, journalPathOverride, liveJournalDir } from "./journal-guard.ts";
 import { isAbsolute, join, resolve } from "node:path";
 import { parse } from "yaml";
@@ -446,8 +446,11 @@ const JobSchema = z.object({
  skill: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9:_-]{0,127}$/, "a plain skill name"),
  /** Text after the skill invocation; none by default. */
  prompt: z.string().default(""),
- /** The resource lane the run holds: `visual` never runs beside a visual implement session. */
- lane: z.enum(IMPLEMENT_LANES),
+ /**
+  * The resource lane the run holds: `visual` never runs beside a visual
+  * implement session; `none` holds no slot and never waits on a lane.
+  */
+ lane: z.enum(JOB_LANES),
  /** Wall clock for one run, minutes; past it ranger kills the session and reports `failed`. */
  wallClockMin: z.number().int().positive(),
  /** The session's working directory. */

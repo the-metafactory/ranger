@@ -389,7 +389,7 @@ export const jobRuns = sqliteTable(
   /** The run ledger's `run_id`, fixed at enqueue: an envelope repeated after a crash names the same run. */
   runUuid: text("run_uuid").notNull(),
   name: text("name").notNull(),
-  lane: text("lane", { enum: ["visual", "headless"] }).notNull(),
+  lane: text("lane", { enum: ["visual", "headless", "none"] }).notNull(),
   status: text("status", { enum: JOB_RUN_STATUSES }).notNull().default("queued"),
   queuedAt: text("queued_at").notNull(),
   startedAt: text("started_at"),
