@@ -272,13 +272,13 @@ function holdUnreadyBrief(node: ClassifiedNode, briefs: BriefAudit | undefined):
   if (!briefs.ok || briefs.unverified?.includes(node.id) === true) {
     return { ...node, route: { route: "brief-not-ready", missing: null } };
   }
-  const missing = briefs.notReady.find((n) => n.id === node.id)?.missing.filter((m) => !AUDIT_ONLY_BRIEF_ITEMS.has(m)) ?? [];
+  const finding = briefs.notReady.find((n) => n.id === node.id);
+  const missing = finding?.missing.filter((m) => !AUDIT_ONLY_BRIEF_ITEMS.has(m)) ?? [];
   return missing.length === 0
     ? node
     : { ...node, route: { route: "brief-not-ready", missing } };
 }
 
-// https://github.com/the-metafactory/soma/pull/1061
 const AUDIT_ONLY_BRIEF_ITEMS: ReadonlySet<string> = new Set(["Live probe"]);
 
 function classifyRoute(
