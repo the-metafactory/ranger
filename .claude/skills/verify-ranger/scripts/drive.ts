@@ -39,19 +39,20 @@ try {
     return allowed ? route.continue() : route.abort();
   });
 
+  const rendered = page.waitForResponse((r: any) => new URL(r.url()).pathname === "/api/state");
   await page.goto(base + "/");
+  const state = (await (await rendered).json()) as State;
   await page.waitForFunction(() => document.getElementById("meta")?.textContent !== "loading…", null, { timeout: 30_000 });
   const guard = await page.evaluate(() => fetch("/api/merge", { method: "POST" }).then(() => "sent", () => "blocked"));
   check(guard === "blocked", `guard aborts action POSTs (/api/merge ${guard})`);
   await page.screenshot({ path: out("dashboard.png"), fullPage: true });
 
-  const state = (await (await fetch(base + "/api/state")).json()) as State;
   writeFileSync(out("state.json"), JSON.stringify(state, null, 2));
   const dom = await page.evaluate(() => ({
     meta: document.getElementById("meta")?.textContent ?? "",
     msg: document.getElementById("msg")?.textContent ?? "",
     needsCards: document.getElementById("needsyou")?.children.length ?? 0,
-    grillText: document.getElementById("grill")?.textContent ?? "",
+    grillIds: [...document.querySelectorAll("#grill .id")].map((e) => (e.textContent ?? "").trim()),
     sections: [...document.querySelectorAll("main h2")].map((h) => h.textContent),
   }));
   writeFileSync(out("dom.json"), JSON.stringify(dom, null, 2));
@@ -62,7 +63,8 @@ try {
   const expectedNeeds = state.needsYou.length === 0 && unchecked === 0 ? 1 : state.needsYou.length + unchecked;
   check(dom.needsCards === expectedNeeds, `Needs you shows ${dom.needsCards} entries, state implies ${expectedNeeds}`);
   const grillIds = state.maps.flatMap((m) => m.grillings.map((g) => `#${g.id}`));
-  const missing = grillIds.filter((id) => !dom.grillText.includes(id));
+  const shown = new Set(dom.grillIds);
+  const missing = grillIds.filter((id) => !shown.has(id));
   check(missing.length === 0, `all ${grillIds.length} grillings in state appear under "Needs your decision"${missing.length ? `; missing ${missing.join(",")}` : ""}`);
 
   if (flags.includes("--refresh")) {

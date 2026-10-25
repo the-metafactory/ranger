@@ -55,8 +55,11 @@ copy before serve starts. Env: `VERIFY_RANGER_PORT` (default 7399; 7311 is
 refused), `VERIFY_RANGER_RUN` (run dir; default
 `~/.cache/verify-ranger/runs/<timestamp>`). A second run needs a different port.
 
-On failure launch prints `serve.log`. A `ForeignMigrationError` in it means the
-live journal carries a migration this checkout lacks: rebase onto main.
+The run dir is the last line on failure too, so cleanup always has its
+argument. On failure launch prints the log that explains it: `migrate.log`
+when this checkout could not open the snapshot (a `ForeignMigrationError`
+there means the live journal carries a migration this checkout lacks: rebase
+onto main), otherwise `serve.log`.
 
 ## Doctor
 

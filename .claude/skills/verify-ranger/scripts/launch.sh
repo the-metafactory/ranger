@@ -18,6 +18,8 @@ if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
 fi
 
 mkdir -p "$RUN/state" "$RUN/evidence"
+# The run dir is always the last stdout line, on success and on every failure.
+trap 'echo "$RUN"' EXIT
 echo "$CHECKOUT" > "$RUN/state/checkout"
 echo "$PORT" > "$RUN/state/port"
 
@@ -40,7 +42,9 @@ mkdir -p "$RUN/state/gh-config"
 source "$RUN/state/env.sh"
 
 # Bring the snapshot up to this checkout's migrations (a branch may add one).
-(cd "$CHECKOUT" && "$BUN" src/cli.ts job list --config "$RUN/state/ranger.yaml" >/dev/null)
+if ! (cd "$CHECKOUT" && "$BUN" src/cli.ts job list --config "$RUN/state/ranger.yaml" >/dev/null 2>"$RUN/state/migrate.log"); then
+  echo "opening the snapshot with this checkout failed; migrate.log:" >&2; cat "$RUN/state/migrate.log" >&2; exit 1
+fi
 
 cd "$CHECKOUT"
 nohup "$BUN" src/cli.ts serve --config "$RUN/state/ranger.yaml" --port "$PORT" >"$RUN/state/serve.log" 2>&1 &
@@ -50,7 +54,6 @@ for _ in $(seq 1 60); do
   if curl -fsS "http://127.0.0.1:$PORT/api/state" -o "$RUN/state/ready.json" 2>/dev/null \
      && "$BUN" "$SKILL_DIR/scripts/state-summary.ts" "$RUN/state/ready.json" --quiet; then
     echo "ready: http://127.0.0.1:$PORT  pid $(pgrep -f "src/cli.ts serve --config $RUN/state/ranger.yaml" | head -1)  checkout $CHECKOUT"
-    echo "$RUN"
     exit 0
   fi
   if ! pgrep -f "src/cli.ts serve --config $RUN/state/ranger.yaml" >/dev/null; then
@@ -59,5 +62,4 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 echo "not ready after 60s; log:" >&2; tail -40 "$RUN/state/serve.log" >&2
-echo "$RUN"
 exit 1
