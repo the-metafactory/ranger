@@ -1,5 +1,4 @@
-import { executableApproval, approvalVersion, isApprovalVersion, isNodeId, NODE_BLOCK, stripApprovalMarker } from "./approval-spec.ts";
-import { principalFiled } from "./route.ts";
+import { executableApproval, approvalVersion, formatApprovalMarker, isApprovalVersion, isNodeId, NODE_BLOCK, proposeApprovable, stripApprovalMarker } from "./approval-spec.ts";
 import { principalLoginForRepo, type RangerConfig, type RangerMapConfig } from "./config.ts";
 import { parseForgeRef } from "./forge-ref.ts";
 import { childEnv } from "./launch.ts";
@@ -46,13 +45,13 @@ export async function approveNode(args: {
  if (typeof author !== "string" || !author.trim()) throw new Error("node author is unreadable");
  const botAuthored = author.toLowerCase() === bot.toLowerCase();
  if (spec.autonomy === "approve" && botAuthored) throw new Error("bot-authored nodes require the principal intake workflow before execution");
- if (spec.autonomy === "propose" && (!botAuthored || principalFiled({ author, body, node: { ...spec, title: issue.title } }, bot, principal))) throw new Error("propose execution approval requires a bot-authored node that is not already principal-filed");
+ if (spec.autonomy === "propose" && !proposeApprovable({ author, body, node: { ...spec, title: issue.title } }, bot, principal)) throw new Error("propose execution approval requires a bot-authored node that is not already principal-filed");
  if (approvalVersion({ ...spec, title: issue.title }, body) !== args.version) throw new Error("node changed since the card was read; refresh before approving");
  if (args.dryRun) return { approved: false, dryRun: true };
  const current = await call(endpoint);
  if (JSON.stringify([current.title, current.state, current.assignees, github ? current.body : current.description]) !== JSON.stringify([issue.title, issue.state, issue.assignees, body])) throw new Error("node changed during approval; refresh before approving");
  const approved = spec.autonomy === "propose"
-  ? `${stripApprovalMarker(body).trimEnd()}\n<!-- ranger:approved by=${login} at=${new Date().toISOString()} version=${args.version} -->`
+  ? `${stripApprovalMarker(body).trimEnd()}\n${formatApprovalMarker(login, new Date(), args.version)}`
   : body.replace(NODE_BLOCK, () => `<!-- soma:work-graph-node\n${JSON.stringify({ ...spec, autonomy: "propose" }, null, 2)}\n-->`) +
     `\n\nRanger execution approved by @${login} on ${new Date().toISOString()}. Existing review and merge gates apply.\n`;
  await call(endpoint, github ? "PATCH" : "PUT", github ? { body: approved } : { description: approved });

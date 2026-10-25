@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { APPROVAL_MARKER_LINE, approvalVersion, executableApproval } from "./approval-spec.ts";
+import { approvalVersion, executableApproval, principalFiled, proposeApprovable } from "./approval-spec.ts";
 import { parseForgeRef } from "./forge-ref.ts";
 import type { BriefAudit, FrontierEntry } from "./graph.ts";
 import type { WalkMode } from "./config.ts";
@@ -135,29 +135,6 @@ export const ESCALATE_REASONS: Record<EscalateReason, string> = {
 
 export const HITL_KINDS = new Set(["grilling", "prototype"]);
 export const IMPLEMENT_KINDS = new Set(["task", "build"]);
-
-/** The intake marker line `intakeNodeBody` writes last (node #251, ruling D14). */
-const INTAKE_MARKER_LINE = /^<!-- ranger:intake discord=\d+ -->$/;
-
-/**
- * Whether the principal filed this node (#21 ruling D5): any author but the
- * bot identity, or the bot identity filing through intake, where the
- * principal's 👍 on the draft card is the authorship. Intake writes its
- * marker as the body's last line; only that line counts, because ranger's
- * other filings (Scribe, fix-the-base) quote review and probe text mid-body
- * and a marker quoted there must grant nothing (node #9 ban). Routing keys
- * on the body, not the `ranger:principal-intake` label: the frontier read
- * carries no labels.
- */
-export function principalFiled(node: { author: string; body?: string; node: Parameters<typeof approvalVersion>[0] }, botIdentity: string, principal?: string): boolean {
-  if (node.author.toLowerCase() !== botIdentity.toLowerCase()) return true;
-  const last = (node.body ?? "").trimEnd().split(/\r?\n/).at(-1)!.trim();
-  if (INTAKE_MARKER_LINE.test(last)) return true;
-  const approval = APPROVAL_MARKER_LINE.exec(last);
-  return principal !== undefined && principal.trim() !== "" && approval !== null &&
-    approval[1].toLowerCase() === principal.toLowerCase() &&
-    Number.isFinite(Date.parse(approval[2])) && approval[3] === approvalVersion(node.node, node.body);
-}
 
 /** Load the probe registry from soma-home; absent file → empty registry. */
 export function loadProbeRegistry(
@@ -306,8 +283,8 @@ function classifyRoute(
     url: node.url,
     checkpointId: node.node.checkpointId,
     approvalVersion: approvalVersion(node.node, node.body),
-    approvable: executableApproval({ ...node.node, typed }) && (autonomy === "approve" ||
-      (node.author.toLowerCase() === opts.botIdentity?.toLowerCase() && !filedByPrincipal)),
+    approvable: autonomy === "approve" ? executableApproval({ ...node.node, typed }) :
+      proposeApprovable(node, opts.botIdentity, opts.principal),
     registryBlocked: false,
     body: node.body,
   };

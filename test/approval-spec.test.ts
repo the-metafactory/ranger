@@ -14,3 +14,13 @@ test("version ignores a trailing approval marker but preserves intake and mid-bo
  expect(stripApprovalMarker(`${body}${marker}\nMore.`)).toBe(`${body}${marker}\nMore.`);
  expect(stripApprovalMarker(`${body}<!-- ranger:approved broken -->`)).toBe("Build this.");
 });
+
+test("marker stripping preserves a marker followed by non-whitespace, including after long whitespace runs", () => {
+ for (const whitespace of [" ", "\t", " \t".repeat(50_000)]) {
+  const trailing = `Build this.\n${marker}${whitespace}`;
+  expect(stripApprovalMarker(trailing)).toBe("Build this.");
+  const followed = `${trailing}More.`;
+  expect(stripApprovalMarker(followed)).toBe(followed);
+  expect(approvalVersion(node, followed)).not.toBe(approvalVersion(node, "Build this."));
+ }
+});
