@@ -28,5 +28,5 @@ Preconditions: baseline; `$RUN/evidence/*-state.json` from a drive run has a dec
 - `approve-node` uses the principal's own gh keyring login (its env allowlist drops `GH_TOKEN` and `GH_CONFIG_DIR`), so the read-only env does not protect it. Never drop `--dry-run`.
 
 - **Fails as of dae71a8 (2026-10-25):** the dry run prints `0.1.0` and exits 0. `program.version("0.1.0")` in `src/cli.ts` owns `--version`, so `approve-node`'s own `--version <hash>` never reaches the action. `src/serve-approve.ts` builds the same argv, so the dashboard's Approve most likely reports success without writing. The tests stub the runner and never parse the argv. Recheck this journey after a fix.
-- The live dashboard's Approve button is real: it edits the GitHub issue under the machine account.
+- The live dashboard's Approve button is real: it edits the GitHub issue under the principal's own gh login (keyring), not the machine account.
 - Approval versions change when the node's spec changes; take the version from the same state dump as the id.

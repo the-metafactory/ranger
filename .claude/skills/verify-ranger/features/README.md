@@ -5,7 +5,7 @@ index, then use the matching feature file as the recipe.
 
 ## Baseline preconditions
 
-- `RUN=$(scripts/launch.sh | tail -1)` succeeded and `scripts/doctor.sh "$RUN"` exits 0.
+- `RUN=$(scripts/launch.sh | tail -1)` set the run dir (it is set on failure too) and `scripts/doctor.sh "$RUN"` exits 0. Doctor's exit code, not a non-empty `$RUN`, says the launch worked.
 - The dashboard is at `http://127.0.0.1:7399` (or `$VERIFY_RANGER_PORT`), serving this checkout on a snapshot of the live journal.
 - CLI steps run from the checkout doctor printed, each as one command `source "$RUN/state/env.sh" && bun src/cli.ts ... --config "$RUN/state/ranger.yaml"`: env vars do not survive between Bash tool calls.
 - Never drive the live dashboard on 7311 or the live journal.

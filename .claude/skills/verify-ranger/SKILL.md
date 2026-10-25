@@ -46,7 +46,11 @@ overrides).
 
 ```bash
 RUN=$(scripts/launch.sh | tail -1)    # prints "ready: http://127.0.0.1:7399 ..." then the run dir
+scripts/doctor.sh "$RUN"              # exit 0 is the launch's success signal
 ```
+
+The pipe drops launch's exit code and `$RUN` is set on failure too, so only
+doctor's exit code says the instance is usable.
 
 Ready means `/api/state` answers and at least one map was read without error,
 not just that the port is open. Launch also opens the snapshot once with this
