@@ -1,8 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, cpSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { runCmd } from "../src/exec.ts";
+import { approvalVersion } from "../src/approval-spec.ts";
 
 const fixturesBin = join(import.meta.dir, "fixtures", "bin");
 const dataDir = join(import.meta.dir, "fixtures", "data");
@@ -57,6 +58,32 @@ async function runScout(opts: RunScoutOptions) {
 }
 
 describe("ranger scout — end-to-end against fake soma/gh", () => {
+  test("scout routes a bot propose node approved by the map principal and holds it after an edit", async () => {
+    const config = writeConfig({ "acme/*": "RANGER_RO_TEST" });
+    const dir = dirname(config);
+    try {
+      appendFileSync(config, "\nprincipal:\n  login: alice\nbot:\n  identity: ivy-agent\n");
+      const fixtures = join(dir, "fixtures");
+      cpSync(dataDir, fixtures, { recursive: true });
+      const node = { id: "95", title: "Build this", kind: "build", autonomy: "propose", probes: [] };
+      const body = `Build this.\n<!-- ranger:approved by=ALICE at=2026-10-25T12:00:00Z version=${approvalVersion(node, "Build this.")} -->`;
+      for (const edited of [false, true]) {
+        writeFileSync(join(fixtures, "acme__widgets-frontier.json"), JSON.stringify({ repo: "acme/widgets", root: "1", frontier: [{
+          ref: { id: "95" }, node, body: edited ? body.replace("Build this.", "Changed scope.") : body,
+          author: "ivy-agent", typed: true, status: "open", assignees: [], blockedBy: [], url: "https://github.com/acme/widgets/issues/95",
+        }] }));
+        const result = await runScout({ config, json: true, tokenEnv: { RANGER_RO_TEST: "github_pat_readonly", FAKE_SOMA_DIR: fixtures } });
+        expect(result.code).toBe(0);
+        const report = JSON.parse(result.stdout);
+        const routed = report.maps.find((m: { repo: string }) => m.repo === "acme/widgets").frontier[0];
+        expect(routed.route).toEqual(edited ? { route: "escalate-hitl", reason: "propose-approve" } : { route: "implement", walkable: true, ratify: "merge" });
+        expect(routed.approvable).toBe(edited);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test("reports frontier by route class, HITL waiting, claims, receipt-less closes (fine-grained token)", async () => {
     const config = writeConfig({ "acme/*": "RANGER_RO_TEST" });
     const result = await runScout({

@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { approvalVersion } from "./approval-spec.ts";
+import { APPROVAL_MARKER_LINE, approvalVersion, executableApproval } from "./approval-spec.ts";
 import { parseForgeRef } from "./forge-ref.ts";
 import type { BriefAudit, FrontierEntry } from "./graph.ts";
 import type { WalkMode } from "./config.ts";
@@ -71,6 +71,7 @@ export interface ClassifiedNode {
   url: string;
   checkpointId?: string;
   approvalVersion?: string;
+  approvable?: boolean;
   route: RouteClass;
   /** Auto node declaring command/url probes — the class-5 signal. */
   registryBlocked: boolean;
@@ -148,10 +149,14 @@ const INTAKE_MARKER_LINE = /^<!-- ranger:intake discord=\d+ -->$/;
  * on the body, not the `ranger:principal-intake` label: the frontier read
  * carries no labels.
  */
-function principalFiled(node: FrontierEntry, botIdentity: string): boolean {
-  if (node.author !== botIdentity) return true;
+export function principalFiled(node: { author: string; body?: string; node: Parameters<typeof approvalVersion>[0] }, botIdentity: string, principal?: string): boolean {
+  if (node.author.toLowerCase() !== botIdentity.toLowerCase()) return true;
   const last = (node.body ?? "").trimEnd().split(/\r?\n/).at(-1)!.trim();
-  return INTAKE_MARKER_LINE.test(last);
+  if (INTAKE_MARKER_LINE.test(last)) return true;
+  const approval = APPROVAL_MARKER_LINE.exec(last);
+  return principal !== undefined && principal.trim() !== "" && approval !== null &&
+    approval[1].toLowerCase() === principal.toLowerCase() &&
+    Number.isFinite(Date.parse(approval[2])) && approval[3] === approvalVersion(node.node, node.body);
 }
 
 /** Load the probe registry from soma-home; absent file → empty registry. */
@@ -291,6 +296,7 @@ function classifyRoute(
   const { autonomy, kind } = node.node;
   const { typed } = node;
   const id = node.ref.id;
+  const filedByPrincipal = opts.botIdentity !== undefined && principalFiled(node, opts.botIdentity, opts.principal);
   const base = {
     id,
     title: node.node.title,
@@ -300,6 +306,8 @@ function classifyRoute(
     url: node.url,
     checkpointId: node.node.checkpointId,
     approvalVersion: approvalVersion(node.node, node.body),
+    approvable: executableApproval({ ...node.node, typed }) && (autonomy === "approve" ||
+      (node.author.toLowerCase() === opts.botIdentity?.toLowerCase() && !filedByPrincipal)),
     registryBlocked: false,
     body: node.body,
   };
@@ -325,8 +333,7 @@ function classifyRoute(
     IMPLEMENT_KINDS.has(kind) &&
     walkMode === "full" &&
     allowed &&
-    opts.botIdentity !== undefined &&
-    principalFiled(node, opts.botIdentity)
+    filedByPrincipal
   ) {
     const blockedProbes = blockedProbeSpecs(node.node, repo, registry);
     if (blockedProbes.length > 0) {

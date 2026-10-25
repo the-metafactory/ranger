@@ -26,6 +26,7 @@ import {
 } from "../src/serve.ts";
 import { selectCandidates } from "../src/walk.ts";
 import { needsYouEntries } from "../src/serve-parked.ts";
+import { approvalVersion } from "../src/approval-spec.ts";
 
 /**
  * #37 — `ranger serve`: the state the dashboard shows, the launch it may make,
@@ -422,6 +423,27 @@ describe("#37 — the state the dashboard shows", () => {
   const state = assembleState(inputs({ reports: new Map([[walked.key, report(nodes)]]) }));
   expect(state.maps[0].decisions.map((d) => [d.id, d.approvable])).toEqual([["91", true], ["92", true], ["93", false], ["94", false]]);
   expect(state.maps[0].decisions[0].approvalVersion).toMatch(/^[a-f0-9]{64}$/);
+ });
+
+ test("dashboard offers bot propose approval, removes it when approved, and offers it after an edit", () => {
+  const bot = (id: string, kind = "build"): FrontierEntry => ({ ...entry(id, kind), author: "bot", body: "Build this." });
+  const pending = bot("95");
+  const approved = { ...bot("96"), body: `Build this.\n<!-- ranger:approved by=alice at=2026-10-25T12:00:00Z version=${approvalVersion(bot("96").node, "Build this.")} -->` };
+  const stale = { ...approved, ref: { id: "97" }, node: { ...approved.node, id: "97" }, body: approved.body.replace("Build this.", "Changed scope.") };
+  const intake = { ...bot("98"), body: "Build this.\n<!-- ranger:intake discord=123 -->" };
+  const principal = { ...bot("99"), author: "alice" };
+  const skipped = { ...principal, ref: { id: "100" }, node: { ...principal.node, id: "100" } };
+  const nodes = [pending, approved, stale, intake, principal, skipped, bot("101", "prototype"), { ...bot("102"), typed: false }, bot("103", "task")];
+  const frontier = nodes.map((e) => classify(e, REPO, "full", registry, { botIdentity: "bot", principal: "alice", skip: ["100"] }));
+  const reports = new Map<string, MapRead>([[walked.key, { ok: true, frontier, readAt: "2026-10-25T12:00:00Z", source: "ranger" }]]);
+  const map = assembleState(inputs({ reports })).maps[0];
+  expect(map.decisions.map((d) => [d.id, d.approvable])).toEqual([["95", true], ["97", true], ["100", false], ["101", false], ["102", false], ["103", true]]);
+  expect(map.autonomous.map((n) => n.id)).toEqual(expect.arrayContaining(["96", "98", "99"]));
+  expect(map.decisions.find((d) => d.id === "97")?.approvalVersion).not.toBe(approvalVersion(approved.node, approved.body));
+  for (const override of [{ servedOnly: true }, { walk: "research-only" as const }]) {
+   const restricted = assembleState(inputs({ maps: [{ ...walked, ...override }], reports })).maps[0];
+   expect(restricted.decisions.some((d) => d.approvable)).toBe(false);
+  }
  });
 
  test("the current job carries its title and map; a dead pid reads stale", () => {

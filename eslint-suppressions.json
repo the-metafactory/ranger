@@ -771,7 +771,7 @@
       "count": 1
     },
     "ranger/no-comments": {
-      "count": 42
+      "count": 41
     }
   },
   "src/run-ledger.ts": {

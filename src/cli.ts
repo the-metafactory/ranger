@@ -9,6 +9,7 @@ import { resumeNode } from "./resume.ts";
 import { Command } from "commander";
 import { join } from "node:path";
 import {
+ principalLoginForRepo,
  loadConfig,
  resolveConfigPath,
  expandHome,
@@ -136,6 +137,7 @@ async function scoutOneMap(
   const classified = frontier.frontier.map((entry: FrontierEntry) =>
    classify(entry, map.repo, map.walk, registry, {
         botIdentity: config.bot.identity,
+        principal: principalLoginForRepo(config, map.repo),
         allowlist: map.nodes,
         skip: map.skip,
       }),
