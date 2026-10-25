@@ -128,6 +128,19 @@ describe("the tick planner holds a build node soma's audit reports not ready", (
     process.env.FAKE_GH_EVENTS_LATEST = "1000";
   };
 
+  test("a missing Live probe alone is audit-only: the build node is still taken", async () => {
+    writeAudit(dir, [{ id: "21", missing: ["Live probe"] }]);
+    const { classified, plan: p } = await plan();
+    expect(classified.find((n) => n.id === "21")?.route.route).toBe("implement");
+    expect(ids(p.implement)).toEqual(["21"]);
+  });
+
+  test("a missing Live probe beside a real gap holds the node naming only the gap", async () => {
+    writeAudit(dir, [{ id: "21", missing: ["## Acceptance criteria", "Live probe"] }]);
+    const { classified } = await plan();
+    expect(classified.find((n) => n.id === "21")?.route).toEqual({ route: "brief-not-ready", missing: ["## Acceptance criteria"] });
+  });
+
   test("a listed build node is not claimed and not counted as taken: the next build node is", async () => {
     writeAudit(dir, [MISSING_21]);
     const { classified, plan: p } = await plan();

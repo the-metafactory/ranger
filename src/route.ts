@@ -273,10 +273,13 @@ function holdUnreadyBrief(node: ClassifiedNode, briefs: BriefAudit | undefined):
     return { ...node, route: { route: "brief-not-ready", missing: null } };
   }
   const finding = briefs.notReady.find((n) => n.id === node.id);
-  return finding === undefined
+  const missing = finding?.missing.filter((m) => !AUDIT_ONLY_BRIEF_ITEMS.has(m)) ?? [];
+  return missing.length === 0
     ? node
-    : { ...node, route: { route: "brief-not-ready", missing: finding.missing } };
+    : { ...node, route: { route: "brief-not-ready", missing } };
 }
+
+const AUDIT_ONLY_BRIEF_ITEMS: ReadonlySet<string> = new Set(["Live probe"]);
 
 function classifyRoute(
   node: FrontierEntry,
