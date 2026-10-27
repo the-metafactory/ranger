@@ -1,4 +1,4 @@
-import { GRAPH_CALL_TIMEOUT_MS, somaRepo } from "./graph.ts";
+import { GRAPH_CALL_TIMEOUT_MS, somaRepo, type FrontierEntryNode } from "./graph.ts";
 import { runCmd, type RunOptions } from "./exec.ts";
 import { writeEnvForRepo } from "./identity.ts";
 import { parseForgeRef, normalizeNodeId, type ForgeRef } from "./forge-ref.ts";
@@ -173,6 +173,23 @@ export function closeTimeoutMs(
   }
  }
  return probeMs === 0 ? floorMs : Math.max(floorMs, probeMs + CLOSE_PROBE_MARGIN_MS);
+}
+
+/**
+ * The timeout for closing `node`: soma's own reported close deadline plus a
+ * margin, so the outer call outlasts the probes soma runs inside it. A node
+ * read without a positive finite `closeDeadlineSec` (a soma older than
+ * soma#1079) falls back to the sum of its command probes.
+ */
+export function closeTimeoutForNode(
+ node: { closeDeadlineSec?: unknown; node: Pick<FrontierEntryNode, "probes"> },
+ floorMs = GRAPH_CALL_TIMEOUT_MS,
+): number {
+ const deadline = node.closeDeadlineSec;
+ if (typeof deadline === "number" && Number.isFinite(deadline) && deadline > 0) {
+  return Math.max(floorMs, deadline * 1000 + CLOSE_PROBE_MARGIN_MS);
+ }
+ return closeTimeoutMs(node.node.probes, floorMs);
 }
 
 /**

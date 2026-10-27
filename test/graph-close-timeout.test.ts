@@ -2,8 +2,8 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { closeTimeoutMs, graphClose } from "../src/graph-write.ts";
-import { GRAPH_CALL_TIMEOUT_MS } from "../src/graph.ts";
+import { closeTimeoutForNode, closeTimeoutMs, graphClose } from "../src/graph-write.ts";
+import { GRAPH_CALL_TIMEOUT_MS, normalizeGraphNode } from "../src/graph.ts";
 import type { runCmd } from "../src/exec.ts";
 
 const RECEIPT = "Closed node 5 (acme/widgets) — attestation: unverified.";
@@ -107,5 +107,44 @@ describe("graphClose against a stub soma that forks (node #347)", () => {
     const result = await graphClose("acme/widgets", "5", "ivy-agent", "tok", options, { runner });
     expect(seen).toBe(GRAPH_CALL_TIMEOUT_MS);
     expect(result.detail).toContain(`${GRAPH_CALL_TIMEOUT_MS / 1000}s`);
+  });
+});
+
+describe("closeTimeoutForNode (node #400)", () => {
+  const command = { type: "command", run: "bun test", timeoutSec: 300, expectExit: 0 };
+
+  test("soma's closeDeadlineSec plus the margin sizes the call", () => {
+    expect(closeTimeoutForNode({ closeDeadlineSec: 1860, node: { probes: [] } })).toBe(1_920_000);
+  });
+
+  test("the 900s floor outranks a smaller command sum", () => {
+    expect(closeTimeoutForNode({ closeDeadlineSec: 900, node: { probes: [command] } })).toBe(960_000);
+  });
+
+  test("a node read without closeDeadlineSec falls back to the probe sum", () => {
+    const node = { node: { probes: [command] } };
+    expect(closeTimeoutForNode(node)).toBe(closeTimeoutMs([command]));
+  });
+
+  test.each([0, -5, Number.NaN, Number.POSITIVE_INFINITY, "900", null])("closeDeadlineSec %p falls back without throwing", bad => {
+    const node = { closeDeadlineSec: bad, node: { probes: [command] } };
+    expect(closeTimeoutForNode(node)).toBe(closeTimeoutMs([command]));
+  });
+
+  test("normalizeGraphNode carries closeDeadlineSec through", () => {
+    const read = normalizeGraphNode("acme/widgets", {
+      repo: "acme/widgets",
+      ref: { id: "5" },
+      node: { id: "5", title: "t", kind: "task", autonomy: "auto", probes: [] },
+      status: "open",
+      assignees: [],
+      blockedBy: [],
+      author: "a",
+      url: "u",
+      typed: true,
+      closeDeadlineSec: 1860,
+    });
+    expect(read.closeDeadlineSec).toBe(1860);
+    expect(closeTimeoutForNode(read)).toBe(1_920_000);
   });
 });

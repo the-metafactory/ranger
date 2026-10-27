@@ -32,7 +32,7 @@ import {
  tamperOutcome,
  trustFreshClone,
 } from "./git-trust.ts";
-import { closeTimeoutMs, graphClose, graphDecisions, graphPropose, type CloseResult, type ProposeResult } from "./graph-write.ts";
+import { closeTimeoutForNode, graphClose, graphDecisions, graphPropose, type CloseResult, type ProposeResult } from "./graph-write.ts";
 import {
  implementBranchFor,
  runImplement,
@@ -1142,7 +1142,7 @@ async function runResearch(
    checkpointId: node.node.checkpointId,
    ci: evidence.ci,
   },
-  { cwd: probeCwd, timeoutMs: closeTimeoutMs(node.node.probes) },
+  { cwd: probeCwd, timeoutMs: closeTimeoutForNode(node) },
  );
 
  if (close.closed) {
@@ -1224,7 +1224,7 @@ async function closeRatified(
  const close = await graphClose(repo, nodeId, botIdentity, token, {
   proposalComment: commentId,
   checkpointId: node.node.checkpointId,
- }, { cwd: canonical, timeoutMs: closeTimeoutMs(node.node.probes) });
+ }, { cwd: canonical, timeoutMs: closeTimeoutForNode(node) });
  if (!close.closed) {
   return parkResearchClose(ctx, nodeId, close, null);
  }
