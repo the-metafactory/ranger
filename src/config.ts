@@ -8,6 +8,7 @@ import { z } from "zod";
 import { parseForgeRef, repoIdentity, validReadTokenPrefix } from "./forge-ref.ts";
 import { workerEnvPasses } from "./untrusted-env.ts";
 import { SUBSTRATE_NAMES } from "./store/schema.ts";
+import { GitHubApiBaseUrlSchema } from "./github-api-base.ts";
 export { REPO_PATTERN } from "./forge-ref.ts";
 
 /**
@@ -422,6 +423,7 @@ const PrHeadSubmitterSchema = z.object({
 
 const CheckReporterSchema = z.object({
  appId: z.number().int().positive(),
+ apiBaseUrl: GitHubApiBaseUrlSchema,
  privateKeyFile: AbsolutePath,
  installations: z.record(z.string().regex(/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/, "a GitHub owner login"), z.number().int().positive())
   .refine(installations => Object.keys(installations).length > 0, "at least one installation"),
