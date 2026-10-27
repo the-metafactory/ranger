@@ -17,6 +17,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { approvalVersion, formatApprovalMarker } from "../src/approval-spec.ts";
 import { loadConfig, principalLoginForRepo } from "../src/config.ts";
 import { runCmd } from "../src/exec.ts";
 import * as graphWrite from "../src/graph-write.ts";
@@ -234,6 +235,7 @@ async function rig(opts: {
  root?: number;
  autonomy?: "auto" | "propose";
  author?: string;
+ body?: (node: { title: string; kind: string; checkpointId: string; autonomy: string; probes: unknown }) => string;
  blockers?: number[];
  majors?: number[];
  behavior?: number[];
@@ -258,19 +260,20 @@ async function rig(opts: {
  mkdirSync(data);
  copyFileSync(join(dataDir, "acme__widgets-node-1.json"), join(data, "acme__widgets-node-1.json"));
  const probes = opts.probes ?? [{ type: "artifact-exists", path: "src/feature.ts", atRef: "main" }];
+ const node = {
+  id: nodeId,
+  title: "Add the feature module",
+  kind: "task",
+  checkpointId: "feature-shipped",
+  autonomy: opts.autonomy ?? "auto",
+  probes,
+ };
  writeFileSync(
   join(data, `acme__widgets-node-${nodeId}.json`),
   JSON.stringify({
    repo: "acme/widgets",
    ref: { id: nodeId },
-   node: {
-    id: nodeId,
-    title: "Add the feature module",
-    kind: "task",
-    checkpointId: "feature-shipped",
-    autonomy: opts.autonomy ?? "auto",
-    probes,
-   },
+   node,
    status: "open",
    assignees: [BOT],
    blockedBy: [],
@@ -278,7 +281,7 @@ async function rig(opts: {
    url: `https://github.com/acme/widgets/issues/${nodeId}`,
    typed: true,
    parent: { id: "1" },
-   body: "## Task\n\nAdd src/feature.ts and its test.",
+   body: opts.body?.(node) ?? "## Task\n\nAdd src/feature.ts and its test.",
   }),
  );
  const statePath = join(dir, "state.json");
@@ -1925,6 +1928,26 @@ describe("implement lane (node #23)", () => {
   expect(outcome.status).toBe("refused");
   expect(outcome.detail).toContain("never walks work it minted");
   expect(r.github.prs.size).toBe(0);
+ }, 60_000);
+
+ test("a propose node the machine account filed and the principal approved on the dashboard is walked to its PR (node #395)", async () => {
+  let approved = "";
+  const r = await rig({
+   autonomy: "propose",
+   author: BOT,
+   body: (node) => {
+    const body = "## Task\n\nAdd src/feature.ts and its test.";
+    approved = `${body}\n\n${formatApprovalMarker("PRINCIPAL", new Date("2026-10-26T23:16:59Z"), approvalVersion(node, body))}`;
+    return approved;
+   },
+  });
+  cleanup.push(r.dir);
+  const principal = principalLoginForRepo(r.ctx.config, "acme/widgets")!;
+  const data = join(r.dir, "data", "acme__widgets-node-20.json");
+  writeFileSync(data, readFileSync(data, "utf8").replace("PRINCIPAL", principal));
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.detail).not.toContain("never walks work it minted");
+  expect(r.github.prs.size).toBe(1);
  }, 60_000);
 
  test("a superseded occupant is fenced before its next outward action (F1)", async () => {
