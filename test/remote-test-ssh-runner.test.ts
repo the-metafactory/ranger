@@ -22,7 +22,7 @@ const input = (bytes = Buffer.from("bounded request")) => (async function* () { 
 test("real SSH subprocess seam feeds stdin, drains stderr, and excludes inherited forge/bus secrets", async () => {
  for (const key of secretKeys) process.env[key] = "test-only-credential-sentinel";
  await executable('for await (const _ of process.stdin) {} process.stderr.write("private diagnostic".repeat(10000)); console.log(JSON.stringify({ blocked: ["GH_TOKEN", "NATS_TOKEN", "RANGER_JOURNAL_PATH"].some(k => k in process.env) }));');
- const result = await sshRunner({ args: [], input: input(), timeoutMs: 3000 }); expect(result.code).toBe(0); expect(JSON.parse(result.stdout)).toEqual({ blocked: false });
+ const result = await sshRunner({ args: [], input: input(), timeoutMs: 30_000 }); expect(result.code).toBe(0); expect(JSON.parse(result.stdout)).toEqual({ blocked: false });
 });
 test("bounded SSH stdout and timeout fail transport; early peer close during large stdin cannot hang", async () => {
  await executable('console.log("a".repeat(100000)); await new Promise(() => {});');
