@@ -1,50 +1,34 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
-import { createHash, generateKeyPairSync, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as fs from "node:fs/promises";
 import { type MyelinSubscribePullOpts } from "@the-metafactory/cortex/bus";
-import { createEnvelope } from "@the-metafactory/myelin";
-import { signEnvelope } from "@the-metafactory/myelin/identity";
 import { taskSubjectAndType } from "@the-metafactory/myelin/subjects";
 import { runCmd } from "../src/exec.ts";
 import { persistExecution } from "../src/remote-test/artifacts.ts";
 import { validateBusConfig, BUS_LIMITS } from "../src/remote-test/bus-contract.ts";
-import { receiveStagedSource } from "../src/remote-test/bus-source.ts";
 import { startBusWorker, connectBusWorker, BusWorkerReadinessRefusal, type BusWorker, type BusWorkerTransport, type BusWorkerInjected } from "../src/remote-test/bus-worker.ts";
 import { BUS_WORKER_DIR, readBusWorkerOwner, writeBusWorkerOwner } from "../src/remote-test/bus-worker-workspace.ts";
-import { reconcileRemoteTests, validateExecutorConfig } from "../src/remote-test/executor.ts";
+import { reconcileRemoteTests } from "../src/remote-test/executor.ts";
 import { openJobLedger, BusyRemoteTestExecutor } from "../src/remote-test/job-ledger.ts";
-import { stageSource } from "../src/remote-test/source.ts";
 import type { RemoteTestJob, RemoteTestReceipt } from "../src/remote-test/contract.ts";
+import { busWorkerIssuers, busWorkerRegistry, busWorkerRequest, busWorkerSource, issuer, sha } from "./remote-test-bus-worker-support.ts";
 
 const roots: string[] = [], workers: BusWorker[] = [];
 afterEach(async () => { for (const w of workers.splice(0)) await w.stop(); for (const r of roots.splice(0)) await rm(r, { recursive: true, force: true }); });
-const sha = (s: string) => `sha256:${createHash("sha256").update(s).digest("hex")}`;
-const issuer = "did:mf:fixture-ranger";
 function deferred() { let resolve!: () => void; const promise = new Promise<void>(r => { resolve = r; }); return { promise, resolve }; }
 async function until(probe: () => boolean) { for (let i = 0; i < 500 && !probe(); i++) await Bun.sleep(5); expect(probe()).toBe(true); }
 
 async function fixture() {
  const root = await realpath(await mkdtemp(join(tmpdir(), "ranger-bus-worker-"))); roots.push(root);
- const repo = join(root, "repo"), staging = join(root, "staging"), jobsRoot = join(root, "jobs"), outboxRoot = join(root, "outbox");
- for (const p of [repo, staging, jobsRoot]) await mkdir(p, { mode: 0o700 });
- const git = async (...args: string[]) => { const r = await runCmd("git", ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", ...args], { cwd: repo }); if (r.code) throw Error(r.stderr); };
- await git("init", "--initial-branch=main"); await writeFile(join(repo, "bun.lock"), "lock\n"); await git("add", "."); await git("commit", "-m", "fixture");
- const staged = await stageSource({ worktree: repo, stagingRoot: staging, jobId: randomUUID() });
- const bytes = await readFile(staged.bundlePath);
- const profile = { version: 1 as const, profileId: "unit", profileDigest: sha("profile"), lockDigest: sha("lock\n"), imageDigest: sha("image"), platform: "linux-arm64" as const, commands: [["bun", "test"]] as [string, ...string[]][] };
- const executor = validateExecutorConfig({ executorId: "fixture", jobsRoot, profiles: [{ profile, lockFile: "bun.lock", imageReference: `localhost/runtime@${profile.imageDigest}` }] });
- const job: RemoteTestJob = { jobId: randomUUID(), correlationId: randomUUID(), repositoryId: "github:github.com/example/repo", ...staged.manifest, profileId: profile.profileId, profileDigest: profile.profileDigest, lockDigest: profile.lockDigest, imageDigest: profile.imageDigest, platform: profile.platform, generation: 2, deadline: Date.now() + 300_000 };
- await receiveStagedSource({ jobsRoot, job, declaredBytes: bytes.length, chunks: (async function* () { yield bytes; })(), policy: executor.artifacts });
- const { publicKey, privateKey } = generateKeyPairSync("ed25519"), seed = privateKey.export({ format: "der", type: "pkcs8" }).subarray(-32);
- const registry = join(root, "registry.json");
- await writeFile(registry, JSON.stringify({ version: 2, identities: [{ id: issuer, network: "example", public_key: publicKey.export({ format: "der", type: "spki" }).subarray(-32).toString("base64"), type: "service", created_at: new Date().toISOString() }], trusted_hubs: [] }), { mode: 0o600 });
+ const outboxRoot = join(root, "outbox");
+ const { jobsRoot, bytes, executor, job } = await busWorkerSource(root), { seed, registryFile: registry } = await busWorkerRegistry(root);
  const bus = validateBusConfig({ version: 1, target: { domain: "private", account: "A".repeat(56) }, routing: { classification: "local", principal: "example", stack: "private" },
   streams: { request: { stream: "REQUESTS", durable: "executor" }, result: { stream: "RESULTS" } }, transport: { servers: ["nats://127.0.0.1:4222"], credentialsFile: join(root, "user.creds") }, ssh: { configFile: join(root, "ssh.json") }, registry: { file: registry },
-  execution: { maxAckPending: 1, maxConcurrentJobs: 1, ackWaitSeconds: 10, progressIntervalSeconds: 1, maxDeliver: 3 }, issuers: [{ issuer, bindings: [{ repositoryId: job.repositoryId, profileId: profile.profileId, profileDigest: profile.profileDigest }] }] });
+  execution: { maxAckPending: 1, maxConcurrentJobs: 1, ackWaitSeconds: 10, progressIntervalSeconds: 1, maxDeliver: 3 }, issuers: busWorkerIssuers(job) });
  const route = taskSubjectAndType("example", "ci-test", "private");
  const consumer = { durable_name: "executor", filter_subject: route.subject, ack_policy: "explicit", max_ack_pending: 1, ack_wait: 10e9, max_deliver: 3 };
  let subscription: MyelinSubscribePullOpts | undefined, closed = 0, executions = 0;
@@ -65,19 +49,19 @@ async function fixture() {
    const a = l.admit(j); if (a.kind === "busy") throw new BusyRemoteTestExecutor(); if (a.kind !== "admitted") throw Error(a.kind);
    const cancel = () => { l.cancel(j); }; options?.signal?.addEventListener("abort", cancel, { once: true });
    if (options?.signal?.aborted) cancel();
+   const startedAt = Date.now();
    try {
     await beforeExecution(options?.signal);
     const allowed = l.allowed(j, a.token);
     if (allowed) l.launch(j, a.token);
     const r: RemoteTestReceipt = { version: 1, identity: j, executorId: "fixture", status: allowed ? "passed" : "cancelled", exitCode: allowed ? 0 : null, completedAt: Date.now() };
-    const stored = await persistExecution(join(jobsRoot, ".artifacts"), r, { startedAt: Date.now(), log: Buffer.from("log"), truncated: false, outputState: "captured", resources: { state: "skipped", cpuTimeMicros: null, peakMemoryBytes: null } });
+    const stored = await persistExecution(join(jobsRoot, ".artifacts"), r, { startedAt, log: Buffer.from("log"), truncated: false, outputState: "captured", resources: { state: "skipped", cpuTimeMicros: null, peakMemoryBytes: null } });
     return l.complete(j, a.token, stored);
    } finally { options?.signal?.removeEventListener("abort", cancel); }
   } finally { l.close(); }
  };
  const input = async (j = job, signed = true, sourceBytes = bytes.length) => {
-  let e = createEnvelope({ source: "example.private.ranger", type: route.type, sovereignty: { classification: "local", data_residency: "CH", max_hop: 0, frontier_ok: false, model_class: "local-only" }, correlation_id: j.correlationId, deadline: new Date(j.deadline).toISOString(), distribution_mode: "offer", payload: { version: 1, job: j, source: { bundleDigest: j.bundleDigest, bundleBytes: sourceBytes } } });
-  if (signed) e = await signEnvelope(e, seed.toString("base64"), issuer, { role: "origin" });
+  const e = await busWorkerRequest({ source: "example.private.ranger", type: route.type, job: j, bundleBytes: sourceBytes, seed: signed ? seed : undefined });
   return { bytes: Buffer.from(JSON.stringify(e)), subject: route.subject };
  };
  const start = async (injected: BusWorkerInjected = {}) => { const w = await startBusWorker({ bus, executor, signer: { issuer, seed }, outboxRoot, offerings: [{ capability: "ci-test", scopes: ["local"] }] }, { connect: async () => transport, execute, diagnostic: code => { diagnostics.push(code); }, ...injected }); workers.push(w); return w; };

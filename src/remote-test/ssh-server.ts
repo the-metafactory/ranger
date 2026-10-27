@@ -7,7 +7,8 @@ import { validateRemoteTestJob, validateRemoteTestReceipt, type RemoteTestJob, t
 import { executeRemoteTest, validateExecutorConfig } from "./executor.ts";
 import { ActiveRemoteTestJob, BusyRemoteTestExecutor, InterruptedRemoteTestJob, RemoteTestIdentityConflict, RevokedRemoteTestJob, openJobLedger } from "./job-ledger.ts";
 import { InvalidStoredRemoteTestReceipt, readExecutionReceipt } from "./artifacts.ts";
-import { SSH_LIMITS, SshRequestSchema, type SshResponse, type SshStageResponse } from "./ssh-protocol.ts";
+import { SSH_LIMITS, SshRequestSchema, type SshReceiptResponse, type SshResponse, type SshStageResponse } from "./ssh-protocol.ts";
+import { openBusOutboxReader } from "./bus-outbox.ts";
 import { receiveStagedSource, type StageStoreOptions } from "./bus-source.ts";
 
 class InvalidSshReceipt extends Error {}
@@ -23,7 +24,7 @@ export interface SshServerOptions {
  /** Unit-test seam. Production always uses the bounded durable executor. */
  execute?: typeof executeRemoteTest;
  /** Internal response negotiation seam; job and receipt identities remain V1. */
- onProtocolVersion?: (version: 1 | 2 | 3) => void;
+ onProtocolVersion?: (version: 1 | 2 | 3 | 4) => void;
  /** Fixed operator configuration only, never taken from JSON/job/environment. */
  diagnostics?: ReceiverDiagnostics;
  /** Narrow upload/cleanup fault seam. */
@@ -35,7 +36,7 @@ export interface SshServerOptions {
 }
 interface RefusalContext {
  stage: DiagnosticStage;
- operation: "submit" | "status" | "stage" | null;
+ operation: "submit" | "status" | "stage" | "receipt-list" | "receipt-get" | null;
  job: RefusalDiagnostic["job"];
  jobsRoot?: string;
  primary?: RefusalDiagnostic["primary"];
@@ -44,6 +45,20 @@ interface RefusalContext {
 async function privateDirectory(path: string) {
  const info = await lstat(path);
  if (!info.isDirectory() || info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0) throw new TaggedReceiverFailure("unsafe_path", "SSH workspace must be private and operator-owned");
+}
+type ReceiptRequest = Extract<ReturnType<typeof SshRequestSchema.parse>, { operation: "receipt-list" | "receipt-get" }>;
+async function serveReceipts(request: ReceiptRequest, input: { jobsRoot: string; executorId: string; outboxRoot: string | undefined; now: () => number }): Promise<SshReceiptResponse> {
+ if (input.outboxRoot === undefined) throw new TaggedReceiverFailure("invalid_config", "No receipt outbox is configured");
+ const reader = await openBusOutboxReader({ root: input.outboxRoot, jobsRoot: input.jobsRoot, executorId: input.executorId, now: input.now });
+ const { executorId } = input;
+ try {
+  if (request.operation === "receipt-list") return { version: 4, executorId, ...reader.receiptJobIdPage(request.after, SSH_LIMITS.receiptPage) };
+  const queued = await reader.queuedReceipt(request.jobId);
+  if (queued === null) return { version: 4, executorId, receipt: null };
+  const authorized = await reader.authorized(request.jobId);
+  const receiptBytes = queued.receiptBytes !== null && Buffer.byteLength(queued.receiptBytes) <= SSH_LIMITS.receiptBytes ? queued.receiptBytes : null;
+  return { version: 4, executorId, receipt: { jobId: queued.jobId, job: queued.job, evidence: queued.evidence, state: queued.state, receiptBytes, authorized } };
+ } finally { reader.close(); }
 }
 async function lookup(root: string, job: RemoteTestJob, executorId: string): Promise<RemoteTestReceipt | null> {
  const ledger = await openJobLedger(root, executorId);
@@ -68,7 +83,7 @@ async function lookup(root: string, job: RemoteTestJob, executorId: string): Pro
 /** Reviewed fixed command: one bounded JSON line followed by exact bundle
  * bytes and EOF, or a status request with no body. All paths and executable
  * policy come from private local configuration, never the request. */
-export async function serveSshRequest(input: AsyncIterable<Uint8Array>, operatorConfig: unknown, options: SshServerOptions = {}): Promise<SshResponse | SshStageResponse> {
+export async function serveSshRequest(input: AsyncIterable<Uint8Array>, operatorConfig: unknown, options: SshServerOptions = {}): Promise<SshResponse | SshStageResponse | SshReceiptResponse> {
  return receive(input, operatorConfig, options, { stage: "config", operation: null, job: null });
 }
 function failureTag(error: unknown, stage: DiagnosticStage) {
@@ -78,7 +93,7 @@ function failureTag(error: unknown, stage: DiagnosticStage) {
 function isStateOutcome(error: unknown): error is ActiveRemoteTestJob | InterruptedRemoteTestJob | RevokedRemoteTestJob | BusyRemoteTestExecutor {
  return error instanceof ActiveRemoteTestJob || error instanceof InterruptedRemoteTestJob || error instanceof RevokedRemoteTestJob || error instanceof BusyRemoteTestExecutor;
 }
-async function receive(input: AsyncIterable<Uint8Array>, operatorConfig: unknown, options: SshServerOptions, context: RefusalContext): Promise<SshResponse | SshStageResponse> {
+async function receive(input: AsyncIterable<Uint8Array>, operatorConfig: unknown, options: SshServerOptions, context: RefusalContext): Promise<SshResponse | SshStageResponse | SshReceiptResponse> {
  const now = options.now ?? Date.now;
  context.stage = "config";
  context.jobsRoot = diagnosticJobsRoot(operatorConfig);
@@ -114,6 +129,12 @@ async function receive(input: AsyncIterable<Uint8Array>, operatorConfig: unknown
  catch { throw new TaggedReceiverFailure("malformed_request", "Malformed SSH request"); }
  context.operation = request.operation;
  options.onProtocolVersion?.(request.version);
+ if (request.operation === "receipt-list" || request.operation === "receipt-get") {
+  if (rest.length) throw new TaggedReceiverFailure("unexpected_payload", "Unexpected SSH receipt payload");
+  for (;;) { const next = await iterator.next(); if (next.done) break; if (next.value.byteLength) throw new TaggedReceiverFailure("unexpected_payload", "Unexpected SSH receipt payload"); }
+  context.stage = "lookup";
+  return serveReceipts(request, { jobsRoot: root, executorId: config.executorId, outboxRoot: config.outboxRoot, now });
+ }
  const profileId = (request.job as { profileId?: unknown } | null)?.profileId;
  const selected = config.profiles.find(p => p.profile.profileId === profileId);
  if (!selected) throw new TaggedReceiverFailure("profile_not_approved", "Job profile is not operator-approved");
@@ -194,15 +215,16 @@ async function receive(input: AsyncIterable<Uint8Array>, operatorConfig: unknown
 /** A completed, authenticated SSH command may report a typed failure without
  * implying a terminal test result. Transport interruption remains uncertain.
  * No private error details enter the response. */
-export async function serveSshResponse(input: AsyncIterable<Uint8Array>, config: unknown, options: SshServerOptions = {}): Promise<SshResponse | SshStageResponse> {
- // Numbers legacy submit/status replies only; a stage reply is always V3.
+export async function serveSshResponse(input: AsyncIterable<Uint8Array>, config: unknown, options: SshServerOptions = {}): Promise<SshResponse | SshStageResponse | SshReceiptResponse> {
+ // Numbers legacy submit/status replies only; a stage reply is always V3 and a receipt reply V4.
  let version = 1 as 1 | 2;
  const context: RefusalContext = { stage: "config", operation: null, job: null };
- try { return await receive(input, config, { ...options, onProtocolVersion: value => { if (value !== 3) version = value; options.onProtocolVersion?.(value); } }, context); }
+ try { return await receive(input, config, { ...options, onProtocolVersion: value => { if (value === 1 || value === 2) version = value; options.onProtocolVersion?.(value); } }, context); }
  catch (e) {
   // A stage reply is never a receipt or test state, whatever its protocol version.
   const staging = context.operation === "stage";
-  if (isStateOutcome(e) && !staging) {
+  const receipts = context.operation === "receipt-list" || context.operation === "receipt-get";
+  if (isStateOutcome(e) && !staging && !receipts) {
    if (version === 1) return { version: 1, receipt: null };
    if (e instanceof RevokedRemoteTestJob) return { version: 2, receipt: e.receipt, state: "revoked" };
    if (e instanceof BusyRemoteTestExecutor) return { version: 2, receipt: null, state: "busy" };
@@ -214,6 +236,7 @@ export async function serveSshResponse(input: AsyncIterable<Uint8Array>, config:
    ...(context.primary && context.cleanup ? { cleanup: context.cleanup } : {}),
   }, context.jobsRoot);
   if (staging) return { version: 3, error: "receiver_failed" };
+  if (receipts) return { version: 4, error: "receiver_failed" };
   return { version, error: e instanceof InvalidSshReceipt || e instanceof InvalidStoredRemoteTestReceipt ? "invalid_receipt" : "receiver_failed" };
  }
 }

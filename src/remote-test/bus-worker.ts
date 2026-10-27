@@ -14,7 +14,7 @@ import { BUS_WORKER_DIR, writeBusWorkerOwner } from "./bus-worker-workspace.ts";
 import { executeRemoteTest, validateExecutorConfig, type ExecutorConfig } from "./executor.ts";
 import { openJobLedger, ActiveRemoteTestJob, BusyRemoteTestExecutor, InterruptedRemoteTestJob, RemoteTestIdentityConflict, RevokedRemoteTestJob, type JobLedger } from "./job-ledger.ts";
 import { restoreSource, SourceError } from "./source.ts";
-import { readPrivateJson } from "./ssh-cli.ts";
+import { readPrivateJson } from "./private-io.ts";
 
 export type BusWorkerDecision = { kind: "ack" } | { kind: "nak"; delayMs: number } | { kind: "term"; reason: string };
 export interface BusWorkerTransport extends DurablePublisher {

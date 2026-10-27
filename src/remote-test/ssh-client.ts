@@ -10,7 +10,7 @@ import { killProcessGroup } from "../exec.ts";
 import { isPrivateDirectory, privateOperatorPath, shellQuote } from "./baseline.ts";
 import { sha256Reference, validateProfileManifest, validateRemoteTestJob, validateRemoteTestReceipt, type RemoteTestJob, type RemoteTestReceipt } from "./contract.ts";
 import { stageSource } from "./source.ts";
-import { SSH_LIMITS, SshResponseSchema, SshStageResponseSchema } from "./ssh-protocol.ts";
+import { SSH_LIMITS, SshReceiptResponseSchema, SshResponseSchema, SshStageResponseSchema, type SshReceiptRecord } from "./ssh-protocol.ts";
 
 const operatorPath = z.string().max(4096).refine(p => isAbsolute(p) && !p.includes("\0") && !/[\r\n]/.test(p));
 const ConfigSchema = z.object({
@@ -184,4 +184,36 @@ export async function stageCommittedSource(
   // Local cleanup never masks the remote outcome or the primary error.
   await rm(dirname(source.bundlePath), { recursive: true, force: true }).catch(() => {});
  }
+}
+
+/** A recorded terminal receipt as the executor host holds it. Nothing here is validated against a job: the caller owns that. */
+export interface SshReceiptListing { jobIds: string[]; more: boolean }
+
+async function receiptExchange(config: SshConfig, request: { operation: "receipt-list"; after?: string } | { operation: "receipt-get"; jobId: string }, options: Omit<SshOptions, "receiptStore">) {
+ const result = await invoke(config, Buffer.from(JSON.stringify({ version: 4, ...request }) + "\n"), undefined, options);
+ if (result?.code !== 0) throw Error("SSH receipt lookup failed");
+ if (Buffer.byteLength(result.stdout) > SSH_LIMITS.responseBytes) throw Error("Oversize SSH response");
+ let response;
+ try { response = SshReceiptResponseSchema.parse(JSON.parse(result.stdout)); }
+ catch { throw Error("SSH receipt reply is invalid"); }
+ if ("error" in response) throw Error("SSH receipt lookup was refused by the receiver");
+ if (response.executorId !== config.executorId) throw Error("SSH receipt reply is from another executor");
+ return response;
+}
+
+/** One page of the receipt job IDs the executor host recorded, in queue order after `after`. */
+export async function listSshReceipts(input: { config: unknown; after?: string }, options: Omit<SshOptions, "receiptStore"> = {}): Promise<SshReceiptListing> {
+ const config = validateSshConfig(input.config);
+ const response = await receiptExchange(config, { operation: "receipt-list", ...(input.after !== undefined && { after: input.after }) }, options);
+ if (!("jobIds" in response)) throw Error("SSH receipt reply is invalid");
+ return { jobIds: response.jobIds, more: response.more };
+}
+
+/** The recorded receipt for exactly `jobId`, or null when the executor host has none. Never runs, stages or acknowledges. */
+export async function getSshReceipt(input: { config: unknown; jobId: string }, options: Omit<SshOptions, "receiptStore"> = {}): Promise<SshReceiptRecord | null> {
+ const config = validateSshConfig(input.config);
+ const response = await receiptExchange(config, { operation: "receipt-get", jobId: input.jobId }, options);
+ if (!("receipt" in response)) throw Error("SSH receipt reply is invalid");
+ if (response.receipt !== null && response.receipt.jobId !== input.jobId) throw Error("SSH receipt reply is for another job");
+ return response.receipt;
 }

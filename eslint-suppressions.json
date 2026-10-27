@@ -632,6 +632,11 @@
       "count": 13
     }
   },
+  "src/remote-test/private-io.ts": {
+    "@typescript-eslint/no-unsafe-return": {
+      "count": 1
+    }
+  },
   "src/remote-test/profiles.ts": {
     "ranger/no-comments": {
       "count": 1
@@ -681,9 +686,6 @@
       "count": 2
     },
     "@typescript-eslint/no-unsafe-member-access": {
-      "count": 1
-    },
-    "@typescript-eslint/no-unsafe-return": {
       "count": 1
     },
     "ranger/no-comments": {

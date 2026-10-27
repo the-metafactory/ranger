@@ -8,6 +8,7 @@ import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import { expandHome, principalLoginForRepo } from "./config.ts";
+import { principalFiled } from "./approval-spec.ts";
 import { DiscordAnnouncer } from "./announce.ts";
 import { renderCard } from "./card-render.ts";
 import { runCmd, type RunOptions } from "./exec.ts";
@@ -590,13 +591,14 @@ function ratifyFor(
  node: NodeResult,
  map: RangerMapConfig,
  botIdentity: string,
+ principal: string | undefined,
 ): "auto" | "merge" | string {
  if (map.walk !== "full") {
   return `map ${map.repo} is walk: ${map.walk} — only walk: full maps get the implement lane (node #9)`;
  }
  if (node.node.autonomy === "auto") return "auto";
  if (node.node.autonomy === "propose") {
-  if (node.author === botIdentity) {
+  if (!principalFiled(node, botIdentity, principal)) {
    return `node #${node.ref.id} was filed by ${botIdentity} — ranger never walks work it minted (node #9)`;
   }
   return "merge";
@@ -659,7 +661,7 @@ async function runImplementNode(
  const repo = map.repo;
  const base: RunNodeOutcome = { nodeId, repo, status: "skipped", detail: "", workerExit: null };
 
- const ratify = ratifyFor(node, map, botIdentity);
+ const ratify = ratifyFor(node, map, botIdentity, principalLoginForRepo(config, repo));
  if (ratify !== "auto" && ratify !== "merge") {
   journal.recordEvent("refused", { nodeId, repo, detail: ratify });
   finish(journal, nodeId, repo, "parked", ratify);

@@ -90,38 +90,16 @@ async function openStoreFile(directory: string): Promise<string> {
  return path;
 }
 
-/** The terminal-lifecycle outbox. Its SQLite store is private and separate from
- * the executor ledger; it only reads ledger and receipt evidence and never
- * admits, completes or executes a job. A row is delivered only after a positive
- * PubAck from the configured result stream and domain; every other outcome
- * leaves the row replayable. */
-export class BusOutbox {
- constructor(private db: Database, private options: Required<Pick<BusOutboxOptions, "bus" | "root" | "jobsRoot" | "executorId">> & { now: () => number; fault?: OutboxFault }) {
-  db.run("PRAGMA busy_timeout=5000; PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;");
-  const { executorId, bus } = options;
-  this.tx(() => {
-   const version = (db.query("PRAGMA user_version").get() as { user_version: number }).user_version;
-   if (version !== 0 && version !== 1) throw Error("Unsupported outbox schema version");
-   if (version === 0) {
-    if (db.query("SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'").get()) throw Error("Unversioned outbox schema");
-    db.run(`CREATE TABLE outbox_meta (singleton INTEGER PRIMARY KEY CHECK(singleton=1), executor TEXT NOT NULL, stream TEXT NOT NULL, domain TEXT NOT NULL);
-     CREATE TABLE events (id TEXT PRIMARY KEY, jobid TEXT NOT NULL UNIQUE, origin TEXT NOT NULL CHECK(origin IN ('receipt','refusal')), job TEXT NOT NULL, evidence TEXT NOT NULL, envelope TEXT NOT NULL,
-      state TEXT NOT NULL CHECK(state IN ('pending','delivered','withheld')), attempts INTEGER NOT NULL DEFAULT 0, failure TEXT, stream TEXT, seq INTEGER, queued INTEGER NOT NULL, delivered INTEGER);
-     CREATE TABLE refusals (jobid TEXT PRIMARY KEY, issuer TEXT NOT NULL, code TEXT NOT NULL, job TEXT NOT NULL, recorded INTEGER NOT NULL);
-     PRAGMA user_version=1;`);
-    db.query("INSERT INTO outbox_meta VALUES(1,?,?,?)").run(executorId, bus.streams.result.stream, bus.target.domain);
-   }
-   db.run("CREATE INDEX IF NOT EXISTS events_state ON events(state)");
-  });
-  const meta = db.query("SELECT executor,stream,domain FROM outbox_meta WHERE singleton=1").get() as { executor: string; stream: string; domain: string };
-  if (meta.executor !== executorId || meta.stream !== bus.streams.result.stream || meta.domain !== bus.target.domain) { throw Error("Outbox store is bound to a different executor, stream or domain"); }
- }
- close() { this.db.close(); }
- private tx<T>(fn: () => T): T { return this.db.transaction(fn).immediate(); }
- private async step(step: OutboxStep) { await this.options.fault?.(step); }
- private now() { const n = this.options.now(); if (!Number.isSafeInteger(n) || n <= 0) throw Error("Invalid outbox clock"); return n; }
+export interface OutboxReadOptions { root: string; jobsRoot: string; executorId: string; now: () => number }
 
- private async authoritativeReceipt(input: unknown): Promise<{ job: RemoteTestJob; receipt: RemoteTestReceipt }> {
+/** Read-only view of the outbox for a process that must never write it: the SSH
+ * receiver serving terminal receipts to the Ranger host. It opens the store
+ * read-only and only reads ledger and receipt evidence. */
+export class BusOutboxReader {
+ constructor(protected db: Database, protected options: OutboxReadOptions) {}
+ close() { this.db.close(); }
+
+ protected async authoritativeReceipt(input: unknown): Promise<{ job: RemoteTestJob; receipt: RemoteTestReceipt }> {
   const job = validateJobIdentity(input), { jobsRoot, executorId, now } = this.options;
   const ledger = await openJobLedger(jobsRoot, executorId, now);
   try {
@@ -146,7 +124,7 @@ export class BusOutbox {
   } finally { ledger.close(); }
  }
 
- private async assertNotAdmitted(job: RemoteTestJob) {
+ protected async assertNotAdmitted(job: RemoteTestJob) {
   const ledger = await openJobLedger(this.options.jobsRoot, this.options.executorId, this.options.now);
   try {
    if (ledger.recorded(job) || await readExecutionReceipt(this.options.jobsRoot, job, this.options.executorId)) throw new BusOutboxRefusal("already_recorded", "Job has an execution record");
@@ -156,6 +134,78 @@ export class BusOutbox {
    throw e;
   } finally { ledger.close(); }
  }
+
+ protected async reverify(row: EventRow) {
+  const job = validateJobIdentity(JSON.parse(row.job));
+  if (row.origin === "refusal") { await this.assertNotAdmitted(job); return; }
+  const { receipt } = await this.authoritativeReceipt(job);
+  if (sha256(receiptBytes(receipt)) !== row.evidence) throw new BusOutboxRefusal("conflict", "Current receipt differs from the queued evidence");
+ }
+ receiptJobIdPage(after: string | undefined, limit: number): { jobIds: string[]; more: boolean } {
+  let from = 0;
+  if (after !== undefined) {
+   const row = this.db.query("SELECT rowid AS rid FROM events WHERE jobid=? AND origin='receipt'").get(after) as { rid: number } | null;
+   if (!row) throw Error("Unknown receipt cursor");
+   from = row.rid;
+  }
+  const rows = (this.db.query("SELECT jobid FROM events WHERE origin='receipt' AND rowid>? ORDER BY rowid LIMIT ?").all(from, limit + 1) as { jobid: string }[]).map(r => r.jobid);
+  return { jobIds: rows.slice(0, limit), more: rows.length > limit };
+ }
+
+ async authorized(jobId: string): Promise<boolean> {
+  const row = this.db.query("SELECT * FROM events WHERE jobid=? AND origin='receipt'").get(jobId) as EventRow | null;
+  if (!row || row.state === "withheld") return false;
+  try { await this.reverify(row); return true; }
+  catch (e) { if (e instanceof BusOutboxRefusal) return false; throw e; }
+ }
+
+ async queuedReceipt(jobId: string): Promise<QueuedReceipt | null> {
+  const row = this.db.query("SELECT * FROM events WHERE jobid=? AND origin='receipt'").get(jobId) as EventRow | null;
+  if (!row) return null;
+  const path = join(this.options.root, "receipts", `${NameSchema.parse(jobId)}.json`);
+  let receiptBytes: string | null = null;
+  try {
+   const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+   try {
+    const info = await file.stat();
+    if (info.isFile() && info.size <= RECEIPT_FILE_LIMIT) receiptBytes = await file.readFile("utf8");
+   } finally { await file.close(); }
+  } catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e; }
+  return { jobId: row.jobid, job: JSON.parse(row.job) as unknown, evidence: row.evidence, state: row.state, receiptBytes };
+ }
+}
+
+/** The terminal-lifecycle outbox. Its SQLite store is private and separate from
+ * the executor ledger; it only reads ledger and receipt evidence and never
+ * admits, completes or executes a job. A row is delivered only after a positive
+ * PubAck from the configured result stream and domain; every other outcome
+ * leaves the row replayable. */
+export class BusOutbox extends BusOutboxReader {
+ declare protected options: Required<Pick<BusOutboxOptions, "bus" | "root" | "jobsRoot" | "executorId">> & { now: () => number; fault?: OutboxFault };
+ constructor(db: Database, options: Required<Pick<BusOutboxOptions, "bus" | "root" | "jobsRoot" | "executorId">> & { now: () => number; fault?: OutboxFault }) {
+  super(db, options);
+  db.run("PRAGMA busy_timeout=5000; PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;");
+  const { executorId, bus } = options;
+  this.tx(() => {
+   const version = (db.query("PRAGMA user_version").get() as { user_version: number }).user_version;
+   if (version !== 0 && version !== 1) throw Error("Unsupported outbox schema version");
+   if (version === 0) {
+    if (db.query("SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'").get()) throw Error("Unversioned outbox schema");
+    db.run(`CREATE TABLE outbox_meta (singleton INTEGER PRIMARY KEY CHECK(singleton=1), executor TEXT NOT NULL, stream TEXT NOT NULL, domain TEXT NOT NULL);
+     CREATE TABLE events (id TEXT PRIMARY KEY, jobid TEXT NOT NULL UNIQUE, origin TEXT NOT NULL CHECK(origin IN ('receipt','refusal')), job TEXT NOT NULL, evidence TEXT NOT NULL, envelope TEXT NOT NULL,
+      state TEXT NOT NULL CHECK(state IN ('pending','delivered','withheld')), attempts INTEGER NOT NULL DEFAULT 0, failure TEXT, stream TEXT, seq INTEGER, queued INTEGER NOT NULL, delivered INTEGER);
+     CREATE TABLE refusals (jobid TEXT PRIMARY KEY, issuer TEXT NOT NULL, code TEXT NOT NULL, job TEXT NOT NULL, recorded INTEGER NOT NULL);
+     PRAGMA user_version=1;`);
+    db.query("INSERT INTO outbox_meta VALUES(1,?,?,?)").run(executorId, bus.streams.result.stream, bus.target.domain);
+   }
+   db.run("CREATE INDEX IF NOT EXISTS events_state ON events(state)");
+  });
+  const meta = db.query("SELECT executor,stream,domain FROM outbox_meta WHERE singleton=1").get() as { executor: string; stream: string; domain: string };
+  if (meta.executor !== executorId || meta.stream !== bus.streams.result.stream || meta.domain !== bus.target.domain) { throw Error("Outbox store is bound to a different executor, stream or domain"); }
+ }
+ private tx<T>(fn: () => T): T { return this.db.transaction(fn).immediate(); }
+ private async step(step: OutboxStep) { await this.options.fault?.(step); }
+ private now() { const n = this.options.now(); if (!Number.isSafeInteger(n) || n <= 0) throw Error("Invalid outbox clock"); return n; }
 
  private async exportReceipt(receipt: RemoteTestReceipt): Promise<string> {
   const bytes = receiptBytes(receipt), path = join(this.options.root, "receipts", `${receipt.identity.jobId}.json`);
@@ -219,13 +269,6 @@ export class BusOutbox {
   return eventOf(row);
  }
 
- private async reverify(row: EventRow) {
-  const job = validateJobIdentity(JSON.parse(row.job));
-  if (row.origin === "refusal") { await this.assertNotAdmitted(job); return; }
-  const { receipt } = await this.authoritativeReceipt(job);
-  if (sha256(receiptBytes(receipt)) !== row.evidence) throw new BusOutboxRefusal("conflict", "Current receipt differs from the queued evidence");
- }
-
  private settle(sql: string, ...params: (string | number)[]) { this.tx(() => { this.db.query(sql).run(...params); }); }
 
  async drain(publisher: DurablePublisher, options: { timeoutMs?: number } = {}): Promise<DrainReport> {
@@ -271,32 +314,6 @@ export class BusOutbox {
   const row = this.db.query("SELECT envelope FROM events WHERE id=?").get(eventId) as { envelope: string } | null;
   return row ? JSON.parse(row.envelope) as Envelope : null;
  }
-
- receiptJobIds(): string[] {
-  return (this.db.query("SELECT jobid FROM events WHERE origin='receipt' ORDER BY rowid").all() as { jobid: string }[]).map(r => r.jobid);
- }
-
- async authorized(jobId: string): Promise<boolean> {
-  const row = this.db.query("SELECT * FROM events WHERE jobid=? AND origin='receipt'").get(jobId) as EventRow | null;
-  if (!row || row.state === "withheld") return false;
-  try { await this.reverify(row); return true; }
-  catch (e) { if (e instanceof BusOutboxRefusal) return false; throw e; }
- }
-
- async queuedReceipt(jobId: string): Promise<QueuedReceipt | null> {
-  const row = this.db.query("SELECT * FROM events WHERE jobid=? AND origin='receipt'").get(jobId) as EventRow | null;
-  if (!row) return null;
-  const path = join(this.options.root, "receipts", `${NameSchema.parse(jobId)}.json`);
-  let receiptBytes: string | null = null;
-  try {
-   const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-   try {
-    const info = await file.stat();
-    if (info.isFile() && info.size <= RECEIPT_FILE_LIMIT) receiptBytes = await file.readFile("utf8");
-   } finally { await file.close(); }
-  } catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e; }
-  return { jobId: row.jobid, job: JSON.parse(row.job) as unknown, evidence: row.evidence, state: row.state, receiptBytes };
- }
 }
 
 function eventOf(row: EventRow): OutboxEvent {
@@ -319,4 +336,28 @@ export async function openBusOutbox(options: BusOutboxOptions): Promise<BusOutbo
  const db = new Database(await openStoreFile(real), { strict: true });
  try { return new BusOutbox(db, { bus, root: real, jobsRoot, executorId, now: options.now ?? Date.now, fault: options.fault }); }
  catch (e) { db.close(); throw e; }
+}
+
+/** Open the existing store read-only. Creates no directory, file or row, and never takes the writer's schema or stream binding. */
+export async function openBusOutboxReader(options: { root: string; jobsRoot: string; executorId: string; now?: () => number }): Promise<BusOutboxReader> {
+ const executorId = NameSchema.parse(options.executorId);
+ const jobsRoot = await realpath(options.jobsRoot);
+ const real = await realpath(await privateOperatorPath(options.root));
+ await privateDirectory(real);
+ if (contains(jobsRoot, real) || contains(real, jobsRoot)) throw Error("Outbox root must be separate from the executor jobs root");
+ await privateDirectory(join(real, "receipts"));
+ const path = join(real, "outbox.sqlite");
+ const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+ try {
+  const info = await file.stat();
+  if (!info.isFile() || info.uid !== process.getuid?.() || (info.mode & 0o077) || info.nlink !== 1) throw Error("Unsafe outbox store file");
+ } finally { await file.close(); }
+ const db = new Database(path, { readonly: true, strict: true });
+ try {
+  db.run("PRAGMA busy_timeout=5000;");
+  if ((db.query("PRAGMA user_version").get() as { user_version: number }).user_version !== 1) throw Error("Unsupported outbox schema version");
+  const meta = db.query("SELECT executor FROM outbox_meta WHERE singleton=1").get() as { executor: string } | null;
+  if (meta?.executor !== executorId) throw Error("Outbox store is bound to a different executor");
+  return new BusOutboxReader(db, { root: real, jobsRoot, executorId, now: options.now ?? Date.now });
+ } catch (e) { db.close(); throw e; }
 }

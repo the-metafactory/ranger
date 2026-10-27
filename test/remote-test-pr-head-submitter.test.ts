@@ -11,7 +11,7 @@ import { type ProfileManifest, type RemoteTestJob } from "../src/remote-test/con
 import { stageSource } from "../src/remote-test/source.ts";
 import { JobLedger } from "../src/remote-test/job-ledger.ts";
 import { createReviewedProfile, MYELIN_REPOSITORY } from "../src/remote-test/profiles.ts";
-import { fetchPrHead, openPrSubmissionLedger, PrSubmissionLedger, runPrHeadSubmitter, scanAndSubmitPrHeads,
+import { fetchPrHead, openPrSubmissionLedger, PR_LEDGER_VERSION, PrSubmissionLedger, runPrHeadSubmitter, scanAndSubmitPrHeads,
  type PrHeadScanDeps } from "../src/remote-test/pr-head-submitter.ts";
 
 const repo = "the-metafactory/myelin", sha = "a".repeat(40), nextSha = "b".repeat(40), now = 1_800_000_000_000;
@@ -19,8 +19,10 @@ const digest = `sha256:${"a".repeat(64)}`;
 const profile = createReviewedProfile({ profileId: "myelin-v1", lockDigest: digest, imageDigest: digest,
  reviewed: { recipe: "myelin-v1", cache: "disabled", install: "frozen-offline-copy", checks: ["unit", "integration", "typecheck", "lint"],
   sidecars: [{ kind: "nats", imageReference: `nats@${digest}` }] } });
+const otherProfile = createReviewedProfile({ ...profile, profileId: "other-v1", reviewed: profile.reviewed });
 const bindings = [{ repo, profile }];
 const pr = (extra: Partial<PullRequestHead> = {}): PullRequestHead => ({ number: 1, state: "open", headRepository: repo, baseRepository: repo, headSha: sha, ...extra });
+const apiRow = (extra = {}) => ({ number: 1, state: "open", head: { sha, repo: { full_name: repo } }, base: { repo: { full_name: repo } }, ...extra });
 const submitted: BusRunOutcome = { status: "submitted", eventId: "event", stream: "REQUESTS", seq: 1, duplicate: false };
 
 describe("PR head scan and durable tuple ledger", () => {
@@ -127,7 +129,6 @@ describe("PR head scan and durable tuple ledger", () => {
  });
 
  test("separate profiles and repositories have separate tuple identities", async () => {
-  const otherProfile = createReviewedProfile({ ...profile, profileId: "other-v1", reviewed: profile.reviewed });
   await scan([{ repo, profile }, { repo, profile: otherProfile }]);
   expect(calls).toHaveLength(2);
   expect(calls.map(c => c.request.profileId)).toEqual(["myelin-v1", "other-v1"]);
@@ -139,7 +140,6 @@ describe("PR head scan and durable tuple ledger", () => {
  });
 
  test("a failed profile submission preserves the shared source until other profiles finish", async () => {
-  const otherProfile = createReviewedProfile({ ...profile, profileId: "other-v1", reviewed: profile.reviewed });
   deps.submit = async input => {
    expect(released).toBe(0); calls.push(input);
    if (input.request.profileId === profile.profileId) throw Error("private failure");
@@ -151,7 +151,6 @@ describe("PR head scan and durable tuple ledger", () => {
  });
 
  test("an unavailable head is fetched once and abandons every profile claim for a later retry", async () => {
-  const otherProfile = createReviewedProfile({ ...profile, profileId: "other-v1", reviewed: profile.reviewed });
   const selected = [{ repo, profile }, { repo, profile: otherProfile }];
   deps.fetch = async (_repo, head) => { fetched.push(head); throw Error("unavailable"); };
   expect((await scan(selected)).map(e => e.code)).toEqual(["fetch_failed", "fetch_failed"]);
@@ -191,6 +190,32 @@ describe("PR head scan and durable tuple ledger", () => {
   } finally { execution.close(); }
  });
 
+ const ledgerVersion = (version?: number) => {
+  const db = new Database(join(root, "pr-submissions.sqlite"));
+  try {
+   if (version !== undefined) db.run(`PRAGMA user_version=${version}`);
+   return (db.query("PRAGMA user_version").get() as { user_version: number }).user_version;
+  } finally { db.close(); }
+ };
+
+ test("a fresh ledger records the current schema version", () => {
+  expect(PR_LEDGER_VERSION).toBe(1); expect(ledgerVersion()).toBe(PR_LEDGER_VERSION);
+ });
+
+ test("an unversioned ledger from the current schema is adopted with its claims", async () => {
+  ledger.claim(repo, 1, sha, profile, now + 660_000);
+  ledger.close(); expect(ledgerVersion(0)).toBe(0);
+  ledger = await openPrSubmissionLedger(root, () => now); deps.ledger = ledger;
+  expect(ledgerVersion()).toBe(PR_LEDGER_VERSION); expect(ledger.has(repo, sha, profile.profileId)).toBe(true);
+  expect((await scan())[0].code).toBe("duplicate"); expect(calls).toHaveLength(0);
+ });
+
+ test("an unknown ledger version is refused and left untouched", async () => {
+  ledger.close(); ledgerVersion(PR_LEDGER_VERSION + 1);
+  await expect(openPrSubmissionLedger(root, () => now)).rejects.toThrow(`Unsupported PR submission ledger version ${PR_LEDGER_VERSION + 1}`);
+  expect(ledgerVersion()).toBe(PR_LEDGER_VERSION + 1);
+ });
+
  test("durable claim left by an interrupted scan is never silently resubmitted", async () => {
   ledger.claim(repo, 1, sha, profile, now + 660_000);
   ledger.close(); ledger = await openPrSubmissionLedger(root); deps.ledger = ledger;
@@ -223,7 +248,7 @@ describe("PR listing, opt-in config and production producer integration", () => 
 
  test("REST listing paginates all open PRs and preserves repository identity and terminal states; drafts are eligible", async () => {
   let args: string[] = [];
-  const row = (draft: boolean, extra = {}) => ({ number: 1, state: "open", draft, head: { sha, repo: { full_name: repo } }, base: { repo: { full_name: repo } }, ...extra });
+  const row = (draft: boolean, extra = {}) => apiRow({ draft, ...extra });
   const prs = await listPullRequestHeads(repo, "fixture", async (_token, argv) => { args = argv; return [[row(true)], [row(false), row(true, { state: "closed" }), row(false, { merged_at: "2026-01-01" }), row(false, { head: { sha, repo: null } })]]; });
   expect(args).toEqual([`repos/${repo}/pulls?state=open&per_page=100`, "--paginate", "--slurp"]);
   expect(prs).toEqual([pr(), pr(), pr({ state: "closed" }), pr({ state: "merged" }), pr({ headRepository: null })]);
@@ -245,7 +270,7 @@ describe("PR listing, opt-in config and production producer integration", () => 
  test("reviewed binding selects exact producer profile and persists the bus request before publication", async () => {
   await privateConfig(); const loaded = await config(settings()); let published = 0;
   const run = { env: { RANGER_READ_TOKEN: "read-fixture" }, now: () => now,
-   api: async () => [[{ number: 1, state: "open", draft: true, head: { sha, repo: { full_name: repo } }, base: { repo: { full_name: repo } } }]],
+   api: async () => [[apiRow({ draft: true })]],
    fetch: async () => ({ worktree: "/fixture/clean", release: async () => undefined }),
    producer: {
     stage: async (input: { request: Record<string, unknown>; expectedCommit?: string }) => {
@@ -269,7 +294,7 @@ describe("PR listing, opt-in config and production producer integration", () => 
   for (const [authorized, selectedDigest] of [[false, profile.profileDigest], [true, `sha256:${"b".repeat(64)}`]] as const) {
    await privateConfig([profile], selectedDigest, authorized);
    const result = await runPrHeadSubmitter(await config(settings()), { env: { RANGER_READ_TOKEN: "fixture" },
-    api: async () => [[{ number: 1, state: "open", head: { sha, repo: { full_name: repo } }, base: { repo: { full_name: repo } } }]],
+    api: async () => [[apiRow()]],
     fetch: async () => { throw Error("must not fetch"); },
    });
    expect(result[0].code).toBe("no_reviewed_binding");
@@ -279,7 +304,7 @@ describe("PR listing, opt-in config and production producer integration", () => 
  test.each(["gitlab:example.invalid/group/repo", "github:enterprise.invalid/group/repo"])("unsupported binding %s is skipped without fetching or publishing", async repositoryId => {
   await privateConfig([profile], profile.profileDigest, true, repositoryId);
   const result = await runPrHeadSubmitter(await config(settings()), { env: { RANGER_READ_TOKEN: "fixture" },
-   api: async () => [[{ number: 1, state: "open", head: { sha, repo: { full_name: repo } }, base: { repo: { full_name: repo } } }]],
+   api: async () => [[apiRow()]],
    fetch: async () => { throw Error("must not fetch"); },
   });
   expect(result.map(event => event.code)).toEqual(["no_reviewed_binding"]);
@@ -289,7 +314,7 @@ describe("PR listing, opt-in config and production producer integration", () => 
   const { reviewed: _reviewed, ...legacy } = profile;
   await privateConfig([legacy]); let fetched = false;
   const events = await runPrHeadSubmitter(await config(settings()), { env: { RANGER_READ_TOKEN: "fixture" }, now: () => now,
-   api: async () => [[{ number: 1, state: "open", head: { sha, repo: { full_name: repo } }, base: { repo: { full_name: repo } } }]],
+   api: async () => [[apiRow()]],
    fetch: async () => { fetched = true; throw Error("stop before transport"); },
   });
   expect(fetched).toBe(true); expect(events[0].code).toBe("fetch_failed");
@@ -338,7 +363,7 @@ describe("PR listing, opt-in config and production producer integration", () => 
   await privateConfig(); let publishes = 0;
   const result = await runPrHeadSubmitter(await config(settings()), {
    env: { RANGER_READ_TOKEN: "fixture" }, now: () => now,
-   api: async () => [[{ number: 1, state: "open", head: { sha, repo: { full_name: repo } }, base: { repo: { full_name: repo } } }]],
+   api: async () => [[apiRow()]],
    fetch: async () => ({ worktree: "/fixture/clean", release: async () => undefined }),
    producer: {
     stage: async ({ request }) => failure === "staging_refused" ? { status: "refused", reason: "receiver_failed" } : {
