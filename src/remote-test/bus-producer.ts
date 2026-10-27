@@ -9,7 +9,7 @@ import { publishReceiptFile } from "./artifacts.ts";
 import { BUS_TEST_CAPABILITY } from "./bus-admission.ts";
 import { authorizeBusProducer, BUS_LIMITS, validateBusConfig, validateBusRequest, type BusConfig } from "./bus-contract.ts";
 import type { DurablePublisher } from "./bus-outbox.ts";
-import { busRuntimeStartArgs } from "./bus-runtime.ts";
+import { busRuntimeStartArgs, type BusSigner } from "./bus-runtime.ts";
 import { Sha256Schema, type RemoteTestJob } from "./contract.ts";
 import { bindsNatsAccount, readNatsCredentials, writeNatsCredentialsSnapshot, type NatsCredentials } from "./nats-credentials.ts";
 import { readPrivateJson, reserve, saveJob } from "./private-io.ts";
@@ -43,7 +43,7 @@ const RecordSchema = z.object({
  envelope: z.unknown(),
 }).strict();
 
-export interface BusSigner { readonly issuer: string; readonly seed: Uint8Array }
+export type { BusSigner } from "./bus-runtime.ts";
 /** The saved request identity. It carries no submission result: a success
  * marker is never persisted, so loading it can only replay the same request. */
 export type BusRequestRecord = Omit<z.infer<typeof RecordSchema>, "job" | "envelope"> & { job: RemoteTestJob; envelope: MyelinEnvelope };
