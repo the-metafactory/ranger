@@ -135,6 +135,7 @@ export interface NodeResult {
   parent?: { id: string };
   /** Node body (question/prose) — carried at the node-result top level by the verb. */
   body?: string;
+  closeDeadlineSec?: number;
 }
 
 function isReadonlyVerb(verb: string): verb is ReadonlyVerb {
