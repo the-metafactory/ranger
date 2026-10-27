@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { readPrivateJson } from "./remote-test/ssh-cli.ts";
+import { readPrivateJson } from "./remote-test/private-io.ts";
 import { isGithubRepo } from "./forge-ref.ts";
 import { graphReadToken, laneCredentialRefusal, lanePort } from "./forge-lanes.ts";
 import { changeRequestNoun } from "./forge-text.ts";
