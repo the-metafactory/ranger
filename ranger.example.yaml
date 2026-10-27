@@ -13,17 +13,16 @@ version: 1
 # Emit is fail-open and capped at 2 s; spool: <journal dir>/run-ledger/outbox.jsonl.
 
 # Optional ci-test check reporter (node #351): `ranger remote-test report-checks`.
+# Runs on the Ranger host, where the checks-only App key lives. It reads terminal
+# receipts from the executor host over the fixed SSH receipt-only path (node #408);
+# the key and every GitHub token stay on this host.
 # Private values only; keep this file and every path below outside git.
 # checkReporter:
 #   appId: 123456                          # the dedicated checks-only GitHub App
 #   privateKeyFile: /Users/me/.config/ranger/app.pem   # mode 0600, operator-owned
 #   installations:                         # repository owner login -> installation id
 #     the-metafactory: 1234567
-#   outbox:
-#     busConfigFile: /Users/me/.config/ranger/ci-bus.json
-#     root: /Users/me/.local/state/ranger/ci-outbox
-#     jobsRoot: /Users/me/.local/state/ranger/ci-jobs
-#     executorId: clawbox
+#   sshConfigFile: /Users/me/.config/ranger/ci-ssh.json   # the reviewed SSH JSON bus-status uses
 #   stateRoot: /Users/me/.local/state/ranger/check-reporter
 
 maps:
