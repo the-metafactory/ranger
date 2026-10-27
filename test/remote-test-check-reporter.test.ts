@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { stringify } from "yaml";
 import { runCmd } from "../src/exec.ts";
 import { loadConfig, type RangerConfig } from "../src/config.ts";
-import { appChecksClient, type CheckRunWrite, type GhApi } from "../src/github.ts";
+import { appChecksClient, createInstallationToken, mintAppJwt, type CheckRunWrite, type FetchFn, type GhApi } from "../src/github.ts";
 import { persistExecution } from "../src/remote-test/artifacts.ts";
 import { validateBusConfig } from "../src/remote-test/bus-contract.ts";
 import { openBusOutbox, openBusOutboxReader, type QueuedReceipt } from "../src/remote-test/bus-outbox.ts";
@@ -28,6 +28,10 @@ const digest = (c: string) => `sha256:${c.repeat(64)}`;
 const sha256 = (value: string) => `sha256:${createHash("sha256").update(value).digest("hex")}`;
 const COMMIT = "a".repeat(40);
 const REPOSITORY = "github:github.com/example/repo";
+
+interface FetchCall { url: string; init: RequestInit }
+const tokenAnswer = (expiresAtMs = Date.now() + 3_600_000) => Response.json({ token: "ghs_fake", expires_at: new Date(expiresAtMs).toISOString() }, { status: 201 });
+const tokenFetch = (calls: FetchCall[] = [], answer: () => Response = () => tokenAnswer()): FetchFn => (url, init) => { calls.push({ url, init }); return Promise.resolve(answer()); };
 
 function job(overrides: Partial<RemoteTestJob> = {}): RemoteTestJob {
  return { version: 1, jobId: randomUUID(), correlationId: randomUUID(), repositoryId: REPOSITORY, commitDigest: COMMIT, treeDigest: "b".repeat(40), bundleDigest: digest("a"), profileId: "unit", profileDigest: digest("a"), lockDigest: digest("c"), imageDigest: digest("d"), platform: "linux-arm64", deadline: 20_000, generation: 1, ...overrides };
@@ -257,32 +261,44 @@ test("a batch skips acknowledged receipts, keeps going past a failure and report
  expect(github.updates).toHaveLength(1);
 });
 
-test("the App client mints a verifiable RS256 JWT, one installation token per owner, and writes with the installation token", async () => {
+test("the App client exchanges a verifiable RS256 JWT in-process with a Bearer header, once per owner, and writes with the installation token", async () => {
  const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
  const pem = privateKey.export({ type: "pkcs8", format: "pem" });
- const calls: { token: string; args: string[] }[] = [];
+ const calls: { token: string; args: string[] }[] = [], exchanges: FetchCall[] = [];
  const api: GhApi = (token, args) => {
   calls.push({ token, args });
-  if (args[0] === "app/installations/77/access_tokens") return Promise.resolve({ token: "ghs_installation", expires_at: new Date(5_000_000 + 3_600_000).toISOString() });
   if (args[0]?.includes("/check-runs?")) return Promise.resolve([{ check_runs: [{ id: 4, name: "clawbox/unit", app: { id: 9 } }, { id: 8, name: "clawbox/unit", app: { id: 9 } }, { id: 99, name: "clawbox/unit", app: { id: 10 } }] }]);
   if (args[0] === "repos/Example/repo/check-runs") return Promise.resolve({ id: 321 });
   return Promise.resolve(null);
  };
- const client = appChecksClient({ appId: 9, privateKeyPem: pem, installations: { Example: 77 }, api, now: () => 5_000_000 });
+ const fetch = tokenFetch(exchanges, () => Response.json({ token: "ghs_installation", expires_at: new Date(5_000_000 + 3_600_000).toISOString() }, { status: 201 }));
+ const client = appChecksClient({ appId: 9, privateKeyPem: pem, installations: { Example: 77 }, api, fetch, now: () => 5_000_000 });
  const write: CheckRunWrite = { name: "clawbox/unit", headSha: COMMIT, conclusion: "success", title: "t", summary: "s", externalId: "e", startedAtMs: 1_000, completedAtMs: 2_000 };
 
  expect(await client.findCheckRun("Example/repo", COMMIT, "clawbox/unit")).toBe(8);
  expect(await client.createCheckRun("Example/repo", write)).toBe(321);
  await client.updateCheckRun("Example/repo", 8, write);
 
- const [mint, find, create, update] = calls;
- const [header, payload, signature] = mint.token.split(".") as [string, string, string];
+ expect(exchanges).toHaveLength(1);
+ const [{ url, init }] = exchanges as [FetchCall];
+ const headers = new Headers(init.headers);
+ expect(url).toBe("https://api.github.com/app/installations/77/access_tokens");
+ expect(init.method).toBe("POST");
+ expect(headers.get("accept")).toBe("application/vnd.github+json");
+ expect(headers.get("x-github-api-version")).toBe("2022-11-28");
+ expect(init.signal).toBeInstanceOf(AbortSignal);
+ const [scheme, jwt] = (headers.get("authorization") ?? "").split(" ") as [string, string];
+ expect(scheme).toBe("Bearer");
+ const [header, payload, signature] = jwt.split(".") as [string, string, string];
  expect(JSON.parse(Buffer.from(header, "base64url").toString())).toEqual({ alg: "RS256", typ: "JWT" });
  expect(JSON.parse(Buffer.from(payload, "base64url").toString())).toEqual({ iat: 5_000 - 60, exp: 5_000 + 540, iss: 9 });
  expect(createVerify("RSA-SHA256").update(`${header}.${payload}`).verify(publicKey, Buffer.from(signature, "base64url"))).toBe(true);
- expect(mint.args).toEqual(["app/installations/77/access_tokens", "--method", "POST"]);
- expect(calls.filter(c => c.args[0]?.startsWith("app/"))).toHaveLength(1);
- expect([find, create, update].map(c => c.token)).toEqual(["ghs_installation", "ghs_installation", "ghs_installation"]);
+
+ const [find, create, update] = calls as [typeof calls[0], typeof calls[0], typeof calls[0]];
+ expect(calls).toHaveLength(3);
+ expect(calls.map(c => c.token)).toEqual(["ghs_installation", "ghs_installation", "ghs_installation"]);
+ expect(calls.some(c => c.args.some(a => a.startsWith("app/")))).toBe(false);
+ expect(find.args[0]).toContain("repos/Example/repo/commits/" + COMMIT + "/check-runs?");
  expect(create.args).toContain("head_sha=" + COMMIT);
  expect(create.args).toContain("conclusion=success");
  expect(create.args).toContain("output[summary]=s");
@@ -293,19 +309,63 @@ test("the App client mints a verifiable RS256 JWT, one installation token per ow
 test("a refused installation token request or a missing installation throws before any check write", async () => {
  const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
  const pem = privateKey.export({ type: "pkcs8", format: "pem" });
- const calls: string[] = [];
- const api: GhApi = (_token, args) => { calls.push(args[0]); return args[0].startsWith("app/") ? Promise.reject(new Error("401")) : Promise.resolve({ id: 1 }); };
- const refused = appChecksClient({ appId: 9, privateKeyPem: pem, installations: { example: 77 }, api });
+ const calls: string[] = [], exchanges: FetchCall[] = [];
+ const api: GhApi = (_token, args) => { calls.push(args[0]); return Promise.resolve({ id: 1 }); };
+ const fetch = tokenFetch(exchanges, () => Response.json({ message: "A JSON web token could not be decoded" }, { status: 401 }));
+ const refused = appChecksClient({ appId: 9, privateKeyPem: pem, installations: { example: 77 }, api, fetch });
  const write: CheckRunWrite = { name: "clawbox/unit", headSha: COMMIT, conclusion: "success", title: "t", summary: "s", externalId: "e", completedAtMs: 2_000 };
- await expect(refused.createCheckRun("example/repo", write)).rejects.toThrow("401");
- expect(calls).toEqual(["app/installations/77/access_tokens"]);
- const missing = appChecksClient({ appId: 9, privateKeyPem: pem, installations: { other: 5 }, api });
+ await expect(refused.createCheckRun("example/repo", write)).rejects.toThrow("installation 77 token: HTTP 401: A JSON web token could not be decoded");
+ expect(exchanges).toHaveLength(1);
+ expect(calls).toEqual([]);
+ const missing = appChecksClient({ appId: 9, privateKeyPem: pem, installations: { other: 5 }, api, fetch });
  await expect(missing.createCheckRun("example/repo", write)).rejects.toThrow(/no GitHub App installation/);
- expect(calls).toHaveLength(1);
+ expect(exchanges).toHaveLength(1);
 
- const garbled = appChecksClient({ appId: 9, privateKeyPem: "not a key", installations: { example: 77 }, api });
+ const garbled = appChecksClient({ appId: 9, privateKeyPem: "not a key", installations: { example: 77 }, api, fetch });
  await expect(garbled.findCheckRun("example/repo", COMMIT, "clawbox/unit")).rejects.toThrow();
- expect(calls).toHaveLength(1);
+ expect(exchanges).toHaveLength(1);
+ expect(calls).toEqual([]);
+});
+
+test("the installation token exchange labels a refusal, a timeout, a network failure and a malformed body without the JWT or the token", async () => {
+ const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+ const jwt = mintAppJwt(9, privateKey.export({ type: "pkcs8", format: "pem" }));
+ const leaked = { token: "ghs_secret_token", expires_at: "not a date" };
+ const failure = async (fetch: FetchFn, timeoutMs?: number): Promise<string> => {
+  try { await createInstallationToken(jwt, 77, fetch, timeoutMs); } catch (error) { expect(error).toBeInstanceOf(Error); return (error as Error).message; }
+  throw new Error("the exchange did not throw");
+ };
+ const hanging: FetchFn = (_url, init) => new Promise((_resolve, reject) => init.signal?.addEventListener("abort", () => reject(new DOMException("timed out", "TimeoutError"))));
+ const stalledBody: FetchFn = (_url, init) => Promise.resolve(new Response(new ReadableStream({
+  start(controller) { init.signal?.addEventListener("abort", () => controller.error(new DOMException("timed out", "TimeoutError"))); },
+ }), { status: 201 }));
+ const messages = [
+  await failure(tokenFetch([], () => Response.json({ message: `bad credentials ${jwt}` }, { status: 401 }))),
+  await failure(tokenFetch([], () => new Response("<html>bad gateway</html>", { status: 502 }))),
+  await failure(hanging, 20),
+  await failure(stalledBody, 20),
+  await failure(() => Promise.reject(new TypeError(`connect failed for ${jwt}`))),
+  await failure(tokenFetch([], () => new Response("{not json", { status: 201 }))),
+  await failure(tokenFetch([], () => Response.json(leaked, { status: 201 }))),
+  await failure(tokenFetch([], () => Response.json({ token: "", expires_at: new Date().toISOString() }, { status: 201 }))),
+ ];
+ expect(messages).toEqual([
+  "installation 77 token: HTTP 401: bad credentials [jwt]",
+  "installation 77 token: HTTP 502",
+  "installation 77 token: timed out after 20ms",
+  "installation 77 token: timed out after 20ms",
+  "installation 77 token: request failed: connect failed for [jwt]",
+  "installation 77 token: invalid response",
+  "installation 77 token: invalid response",
+  "installation 77 token: invalid response",
+ ]);
+ for (const message of messages) {
+  expect(message).not.toContain(jwt);
+  expect(message).not.toContain(jwt.split(".")[2]);
+  expect(message).not.toContain(leaked.token);
+ }
+ const issued = await createInstallationToken(jwt, 77, tokenFetch([], () => tokenAnswer(1_900_000_000_000)));
+ expect(issued).toEqual({ token: "ghs_fake", expiresAtMs: 1_900_000_000_000 });
 });
 
 const PROFILE = { version: 1 as const, profileId: "unit", profileDigest: digest("a"), lockDigest: digest("c"), imageDigest: digest("d"), platform: "linux-arm64" as const, commands: [["bun", "test"]] as [string, ...string[]][] };
@@ -364,14 +424,14 @@ test("the reporter reads receipts over the fixed SSH path and writes one check t
  const f = await operatorFixture();
  try {
   const j = job(), receipt = await f.enqueue(j), config = await f.load();
-  const requests: string[][] = [];
+  const requests: string[][] = [], exchanges: FetchCall[] = [];
+  const fetch = tokenFetch(exchanges);
   const api: GhApi = (token, args) => {
    requests.push([token === "ghs_fake" ? "installation" : "other", ...args]);
-   if (args[0]?.startsWith("app/")) return Promise.resolve({ token: "ghs_fake", expires_at: new Date(Date.now() + 3_600_000).toISOString() });
    if (args[0]?.includes("/check-runs?")) return Promise.resolve([{ check_runs: [] }]);
    return Promise.resolve({ id: 555 });
   };
-  const summary = await runCheckReporter(config, { ssh: { runner: f.ssh() }, api, pullHeads: () => Promise.resolve([]) });
+  const summary = await runCheckReporter(config, { ssh: { runner: f.ssh() }, api, fetch, pullHeads: () => Promise.resolve([]) });
   expect(summary.failed).toEqual([]);
   expect(summary.reported).toMatchObject([{ jobId: j.jobId, checkRunId: 555, conclusion: "success", created: true }]);
   const create = requests.find(r => r.includes("repos/example/repo/check-runs"))!;
@@ -380,9 +440,11 @@ test("the reporter reads receipts over the fixed SSH path and writes one check t
   expect(create.some(a => a.includes(sha256(bytesOf(receipt))))).toBe(true);
   expect(create[0]).toBe("installation");
 
-  const again = await runCheckReporter(config, { ssh: { runner: f.ssh() }, api, pullHeads: () => Promise.resolve([]) });
+  const again = await runCheckReporter(config, { ssh: { runner: f.ssh() }, api, fetch, pullHeads: () => Promise.resolve([]) });
   expect(again.reported).toEqual([]);
   expect(requests.filter(r => r.includes("repos/example/repo/check-runs"))).toHaveLength(1);
+  expect(requests.every(r => r[0] === "installation")).toBe(true);
+  expect(exchanges.map(e => e.url)).toEqual(["https://api.github.com/app/installations/77/access_tokens"]);
  } finally { f.close(); }
 });
 
@@ -392,12 +454,12 @@ test("a job cancelled in the ledger after its terminal receipt was enqueued writ
   const j = job(); await f.enqueue(j);
   f.ledger.cancel(j);
   const config = await f.load(), writes: string[] = [];
+  const fetch = tokenFetch();
   const api: GhApi = (_token, args) => {
-   if (args[0]?.startsWith("app/")) return Promise.resolve({ token: "ghs_fake", expires_at: new Date(Date.now() + 3_600_000).toISOString() });
    if (args.includes("POST") || args.includes("PATCH")) writes.push(args[0]);
    return Promise.resolve(args[0]?.includes("/check-runs?") ? [{ check_runs: [] }] : { id: 1 });
   };
-  const summary = await runCheckReporter(config, { ssh: { runner: f.ssh() }, api, pullHeads: () => Promise.resolve([]) });
+  const summary = await runCheckReporter(config, { ssh: { runner: f.ssh() }, api, fetch, pullHeads: () => Promise.resolve([]) });
   expect(summary.reported).toEqual([]);
   expect(summary.refused).toEqual([{ kind: "refused", jobId: j.jobId, code: "revoked" }]);
   expect(writes).toEqual([]);
@@ -410,17 +472,17 @@ test("a failing installation token request is reported as failed, writes no chec
   const j = job(); await f.enqueue(j);
   const config = await f.load(), writes: string[] = [];
   let tokenOk = false;
+  const fetch = tokenFetch([], () => (tokenOk ? tokenAnswer() : new Response(null, { status: 503 })));
   const api: GhApi = (_token, args) => {
-   if (args[0]?.startsWith("app/")) return tokenOk ? Promise.resolve({ token: "ghs_fake", expires_at: new Date(Date.now() + 3_600_000).toISOString() }) : Promise.reject(new Error("installation token request failed"));
    if (args.includes("POST") || args.includes("PATCH")) writes.push(args[0]);
    return Promise.resolve(args[0]?.includes("/check-runs?") ? [{ check_runs: [] }] : { id: 1 });
   };
-  const failed = await runCheckReporter(config, { ssh: { runner: f.ssh() }, api, pullHeads: () => Promise.resolve([]) });
-  expect(failed.failed).toHaveLength(1);
+  const failed = await runCheckReporter(config, { ssh: { runner: f.ssh() }, api, fetch, pullHeads: () => Promise.resolve([]) });
+  expect(failed.failed).toEqual([{ jobId: j.jobId, message: "installation 77 token: HTTP 503" }]);
   expect(failed.reported).toEqual([]);
   expect(writes).toEqual([]);
   tokenOk = true;
-  const replay = await runCheckReporter(config, { ssh: { runner: f.ssh() }, api, pullHeads: () => Promise.resolve([]) });
+  const replay = await runCheckReporter(config, { ssh: { runner: f.ssh() }, api, fetch, pullHeads: () => Promise.resolve([]) });
   expect(replay.reported.map(r => r.jobId)).toEqual([j.jobId]);
   expect(writes).toEqual(["repos/example/repo/check-runs"]);
  } finally { f.close(); }
@@ -432,13 +494,14 @@ test("missing or unusable App configuration throws before any outbox read or Git
   const config = await f.load();
   const calls: string[] = [];
   const api: GhApi = (_t, args) => { calls.push(args[0]); return Promise.resolve(null); };
-  await expect(runCheckReporter({ ...config, checkReporter: undefined }, { api })).rejects.toThrow("checkReporter is not configured");
-  await expect(runCheckReporter(await f.load({ privateKeyFile: join(f.home, "missing.pem") }), { api })).rejects.toThrow();
+  const fetch: FetchFn = (url) => { calls.push(url); return Promise.resolve(tokenAnswer()); };
+  await expect(runCheckReporter({ ...config, checkReporter: undefined }, { api, fetch })).rejects.toThrow("checkReporter is not configured");
+  await expect(runCheckReporter(await f.load({ privateKeyFile: join(f.home, "missing.pem") }), { api, fetch })).rejects.toThrow();
   const loose = join(f.home, "loose.pem");
   await writeFile(loose, "-----BEGIN PRIVATE KEY-----\nnope\n-----END PRIVATE KEY-----\n", { mode: 0o644 });
-  await expect(runCheckReporter(await f.load({ privateKeyFile: loose }), { api })).rejects.toThrow(/operator-owned/);
+  await expect(runCheckReporter(await f.load({ privateKeyFile: loose }), { api, fetch })).rejects.toThrow(/operator-owned/);
   await chmod(loose, 0o600);
-  await expect(runCheckReporter(await f.load({ privateKeyFile: loose }), { api })).rejects.toThrow();
+  await expect(runCheckReporter(await f.load({ privateKeyFile: loose }), { api, fetch })).rejects.toThrow();
   expect(calls).toEqual([]);
  } finally { f.close(); }
 });
@@ -469,11 +532,10 @@ test("the CLI exits non-zero when the checkReporter block is missing", async () 
  } finally { f.close(); }
 });
 
-const apiFor = (writes: string[], tokenOk = () => true): GhApi => (_token, args) => {
- if (args[0]?.startsWith("app/")) return tokenOk() ? Promise.resolve({ token: "ghs_fake", expires_at: new Date(Date.now() + 3_600_000).toISOString() }) : Promise.reject(new Error("installation token request failed"));
+const githubFor = (writes: string[], tokenOk = () => true): { api: GhApi; fetch: FetchFn } => ({ fetch: tokenFetch([], () => (tokenOk() ? tokenAnswer() : new Response(null, { status: 503 }))), api: (_token, args) => {
  if (args.includes("POST") || args.includes("PATCH")) writes.push(args[0]);
  return Promise.resolve(args[0]?.includes("/check-runs?") ? [{ check_runs: [] }] : { id: 1 });
-};
+} });
 const noHeads = () => Promise.resolve([]);
 
 test("report-checks lists and retrieves receipts only through the receipt-only SSH operations and sends no credential", async () => {
@@ -482,7 +544,7 @@ test("report-checks lists and retrieves receipts only through the receipt-only S
   const a = job(), b = job({ commitDigest: "e".repeat(40) });
   await f.enqueue(a); await f.enqueue(b, "test_failed");
   const writes: string[] = [];
-  const summary = await runCheckReporter(await f.load(), { ssh: { runner: f.ssh() }, api: apiFor(writes), pullHeads: noHeads });
+  const summary = await runCheckReporter(await f.load(), { ssh: { runner: f.ssh() }, ...githubFor(writes), pullHeads: noHeads });
   expect(summary.failed).toEqual([]);
   expect(summary.reported.map(r => [r.jobId, r.conclusion])).toEqual([[a.jobId, "success"], [b.jobId, "failure"]]);
   expect(f.sent.map(s => s.request.operation)).toEqual(["receipt-list", "receipt-get", "receipt-get", "receipt-get", "receipt-get"]);
@@ -504,7 +566,7 @@ test("the receipt operations are read-only: the outbox store and receipt files a
   const j = job(); await f.enqueue(j);
   const store = join(f.outboxRoot, "outbox.sqlite"), exported = join(f.outboxRoot, "receipts", j.jobId + ".json");
   const before = [await readFileBytes(store), await readFileBytes(exported)];
-  await runCheckReporter(await f.load(), { ssh: { runner: f.ssh() }, api: apiFor([]), pullHeads: noHeads });
+  await runCheckReporter(await f.load(), { ssh: { runner: f.ssh() }, ...githubFor([]), pullHeads: noHeads });
   expect([await readFileBytes(store), await readFileBytes(exported)]).toEqual(before);
   await expect(openBusOutboxReader({ root: join(f.home, "absent"), jobsRoot: f.jobsRoot, executorId: "fixture" })).rejects.toThrow();
   await expect(Bun.file(join(f.home, "absent")).exists()).resolves.toBe(false);
@@ -518,7 +580,7 @@ test("a receipt file rewritten on the executor host after enqueue is a digest mi
   const j = job(); await f.enqueue(j, "test_failed");
   await writeFile(join(f.outboxRoot, "receipts", j.jobId + ".json"), bytesOf(receiptFor(j, "passed")), { mode: 0o600 });
   const writes: string[] = [];
-  const summary = await runCheckReporter(await f.load(), { ssh: { runner: f.ssh() }, api: apiFor(writes), pullHeads: noHeads });
+  const summary = await runCheckReporter(await f.load(), { ssh: { runner: f.ssh() }, ...githubFor(writes), pullHeads: noHeads });
   expect(summary.refused).toEqual([{ kind: "refused", jobId: j.jobId, code: "digest_mismatch" }]);
   expect(summary.reported).toEqual([]);
   expect(writes).toEqual([]);
@@ -531,7 +593,7 @@ test("a missing receipt file is refused as unreadable and an unknown job as not 
   const j = job(); await f.enqueue(j);
   await rm(join(f.outboxRoot, "receipts", j.jobId + ".json"));
   const writes: string[] = [];
-  const config = await f.load(), run = { ssh: { runner: f.ssh() }, api: apiFor(writes), pullHeads: noHeads };
+  const config = await f.load(), run = { ssh: { runner: f.ssh() }, ...githubFor(writes), pullHeads: noHeads };
   expect((await runCheckReporter(config, run)).refused).toEqual([{ kind: "refused", jobId: j.jobId, code: "unreadable" }]);
   const unknown = randomUUID();
   expect((await runCheckReporter(config, { ...run, job: unknown })).refused).toEqual([{ kind: "refused", jobId: unknown, code: "not_in_outbox" }]);
@@ -545,7 +607,7 @@ test("a job cancelled on the executor host after enqueue is reported revoked thr
   const j = job(); await f.enqueue(j);
   f.ledger.cancel(j);
   const writes: string[] = [];
-  const summary = await runCheckReporter(await f.load(), { ssh: { runner: f.ssh() }, api: apiFor(writes), pullHeads: noHeads });
+  const summary = await runCheckReporter(await f.load(), { ssh: { runner: f.ssh() }, ...githubFor(writes), pullHeads: noHeads });
   expect(summary.refused).toEqual([{ kind: "refused", jobId: j.jobId, code: "revoked" }]);
   expect(writes).toEqual([]);
  } finally { f.close(); }
@@ -556,7 +618,7 @@ test("an SSH failure leaves the receipt unacknowledged and the next run replays 
  try {
   const j = job(); await f.enqueue(j);
   const config = await f.load(), writes: string[] = [];
-  const run = (runner: SshRunner, extra: object = {}) => ({ ssh: { runner }, api: apiFor(writes), pullHeads: noHeads, ...extra });
+  const run = (runner: SshRunner, extra: object = {}) => ({ ssh: { runner }, ...githubFor(writes), pullHeads: noHeads, ...extra });
   await expect(runCheckReporter(config, run(f.ssh(r => r.operation === "receipt-list")))).rejects.toThrow(/SSH receipt lookup failed/);
   const retrieval = await runCheckReporter(config, run(f.ssh(r => r.operation === "receipt-get")));
   expect(retrieval.failed).toEqual([{ jobId: j.jobId, message: "SSH receipt lookup failed" }]);
@@ -580,7 +642,7 @@ test("a GitHub or token failure after a successful retrieval writes no acknowled
   const j = job(); await f.enqueue(j);
   const config = await f.load(), writes: string[] = [];
   let tokenOk = false;
-  const run = { ssh: { runner: f.ssh() }, api: apiFor(writes, () => tokenOk), pullHeads: noHeads };
+  const run = { ssh: { runner: f.ssh() }, ...githubFor(writes, () => tokenOk), pullHeads: noHeads };
   expect((await runCheckReporter(config, run)).failed).toHaveLength(1);
   tokenOk = true;
   expect((await runCheckReporter(config, run)).reported.map(r => r.jobId)).toEqual([j.jobId]);

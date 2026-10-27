@@ -556,10 +556,37 @@ export interface InstallationToken {
  expiresAtMs: number;
 }
 
-/** Exchange the App JWT for one installation's token. Any refusal or malformed answer throws. */
-export async function createInstallationToken(jwt: string, installationId: number, api: GhApi = ghApi): Promise<InstallationToken> {
+/** The in-process HTTP call the App JWT exchange uses; injectable so tests never reach GitHub. */
+export type FetchFn = (url: string, init: RequestInit) => Promise<Response>;
+
+const GITHUB_API = "https://api.github.com";
+const INSTALLATION_TOKEN_TIMEOUT_MS = 30_000;
+
+/**
+ * Exchange the App JWT for one installation's token, in-process with `Authorization: Bearer`:
+ * `gh` would send the JWT under the `token` scheme, which GitHub refuses, and would put it in a
+ * child's environment. Any refusal, timeout or malformed answer throws without either credential.
+ */
+export async function createInstallationToken(jwt: string, installationId: number, fetchFn: FetchFn = fetch, timeoutMs: number = INSTALLATION_TOKEN_TIMEOUT_MS): Promise<InstallationToken> {
  const label = `installation ${installationId} token`;
- const raw = (await api(jwt, [`app/installations/${installationId}/access_tokens`, "--method", "POST"], label)) as Record<string, unknown> | null;
+ const redact = (text: string): string => (jwt.length > 0 ? text.replaceAll(jwt, "[jwt]") : text).slice(0, 200);
+ const timedOut = (error: unknown): boolean => error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError");
+ const timeout = new GitHubError(`${label}: timed out after ${timeoutMs}ms`);
+ let response: Response;
+ try {
+  response = await fetchFn(`${GITHUB_API}/app/installations/${installationId}/access_tokens`, {
+   method: "POST",
+   headers: { Authorization: `Bearer ${jwt}`, Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" },
+   signal: AbortSignal.timeout(timeoutMs),
+  });
+ } catch (error) {
+  throw timedOut(error) ? timeout : new GitHubError(`${label}: request failed: ${redact(error instanceof Error ? error.message : String(error))}`);
+ }
+ const raw = (await response.json().catch((error: unknown) => { if (timedOut(error)) throw timeout; return null; })) as Record<string, unknown> | null;
+ if (!response.ok) {
+  const message = typeof raw?.message === "string" ? `: ${redact(raw.message)}` : "";
+  throw new GitHubError(`${label}: HTTP ${response.status}${message}`);
+ }
  const expiresAtMs = typeof raw?.expires_at === "string" ? Date.parse(raw.expires_at) : Number.NaN;
  if (typeof raw?.token !== "string" || raw.token.length === 0 || !Number.isFinite(expiresAtMs)) {
   throw new GitHubError(`${label}: invalid response`);
@@ -592,6 +619,7 @@ export interface AppChecksOptions {
  privateKeyPem: string;
  installations: Readonly<Record<string, number>>;
  api?: GhApi;
+ fetch?: FetchFn;
  now?: () => number;
 }
 
@@ -628,7 +656,7 @@ export function appChecksClient(options: AppChecksOptions): AppChecks {
   if (installationId === undefined) throw new GitHubError(`no GitHub App installation configured for ${owner}`);
   const cached = tokens.get(installationId);
   if (cached !== undefined && cached.expiresAtMs - now() > TOKEN_REFRESH_MARGIN_MS) return cached.token;
-  const minted = await createInstallationToken(mintAppJwt(options.appId, options.privateKeyPem, Math.floor(now() / 1000)), installationId, api);
+  const minted = await createInstallationToken(mintAppJwt(options.appId, options.privateKeyPem, Math.floor(now() / 1000)), installationId, options.fetch);
   tokens.set(installationId, minted);
   return minted.token;
  }
