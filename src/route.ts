@@ -111,7 +111,7 @@ export interface ProbeRegistry {
   version?: number;
   repos?: Record<
     string,
-    { commands?: { run: string; cwd: string }[]; urlHosts?: string[] }
+    { commands?: RegisteredCommand[]; urlHosts?: string[] }
   >;
 }
 
@@ -183,6 +183,16 @@ export function probeRegistryKey(repo: string): string | null {
   }
 }
 
+export interface RegisteredCommand {
+  run: string;
+  cwd: string;
+}
+
+export function registeredCommands(repo: string, registry: ProbeRegistry): RegisteredCommand[] {
+  const key = probeRegistryKey(repo);
+  return (key === null ? undefined : registry.repos?.[key])?.commands ?? [];
+}
+
 /** The declared probes that are not satisfiable by the registry on this host. */
 export function blockedProbeSpecs(
   node: FrontierEntry["node"],
@@ -194,7 +204,7 @@ export function blockedProbeSpecs(
   const key = probeRegistryKey(repo);
   const repoEntry = key === null ? undefined : registry.repos?.[key];
   const declaredCommands = new Set(
-    (repoEntry?.commands ?? []).map((c) => `${c.run}\u0000${c.cwd}`),
+    registeredCommands(repo, registry).map((c) => `${c.run}\u0000${c.cwd}`),
   );
   const declaredHosts = new Set(
     (repoEntry?.urlHosts ?? []).map((h) => h.toLowerCase()),

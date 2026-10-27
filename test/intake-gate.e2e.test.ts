@@ -110,7 +110,7 @@ async function rig(opts: { claude?: ClaudeOneShot } = {}): Promise<Rig> {
   discord,
   journal,
   card: () => journal.getIntakeDraft(MESSAGE)!.cardMessageId,
-  tick: (extra = {}) => withEnv({ ...env, ...extra }, () => intakePass({ config, journal, clientFor, portFor, ...(opts.claude === undefined ? {} : { claude: opts.claude }) })),
+  tick: (extra = {}) => withEnv({ ...env, ...extra }, () => intakePass({ config, journal, clientFor, portFor, registry: {}, ...(opts.claude === undefined ? {} : { claude: opts.claude }) })),
   lookups: () => lookups,
   issues: () => Object.values(state().issues ?? {}),
   links: () => state().links ?? [],
@@ -445,6 +445,29 @@ describe("intake gate: the principal's 👍 files the draft (node #251)", () => 
    );
    expect(result.intake.threads[0]!.gate!.filed).toEqual([{ messageId: MESSAGE, node: "100", added: true }]);
    expect(r.issues()).toHaveLength(1);
+  } finally { r.close(); }
+ });
+});
+
+describe("intake gate on a draft journaled with a probe that cannot close (node #414)", () => {
+ test("a 👍 on a draft whose card showed a bare bun test files nothing and says why", async () => {
+  const r = await rig();
+  try {
+   r.discord.react(r.card(), "👍", PRINCIPAL);
+   const row = r.journal.getIntakeDraft(MESSAGE);
+   if (row === null) throw new Error("no draft journaled");
+   const probes = [{ type: "command", run: "bun test", timeoutSec: 1800, expectExit: 0 }];
+   const drafted = { title: row.title, parent: row.parent, checkpoint: row.checkpoint, autonomy: row.autonomy, drafter: "claude", kind: "task", probes, body: row.body, messageUrl: row.messageUrl };
+   const db = new Database(join(r.dir, "state.sqlite"));
+   db.run("UPDATE intake_drafts SET drafter = 'claude', kind = 'task', probes = ?, spec_hash = ? WHERE message_id = ?", [
+    JSON.stringify(probes), intakeSpecHash({ repo: row.repo, root: row.root }, drafted), MESSAGE,
+   ]);
+   db.close();
+   const [refused] = gateOf(await r.tick()).refused;
+   expect(refused?.reason).toContain("bare `bun test`");
+   expect(refused?.reason).toContain("nothing filed");
+   expect(r.issues()).toHaveLength(0);
+   expect(r.journal.getIntakeDraft(MESSAGE)?.status).toBe("draft");
   } finally { r.close(); }
  });
 });
