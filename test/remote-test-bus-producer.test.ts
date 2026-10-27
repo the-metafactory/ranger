@@ -15,6 +15,7 @@ import {
 } from "../src/remote-test/bus-producer.ts";
 import type { ProfileManifest } from "../src/remote-test/contract.ts";
 import type { SshRunner } from "../src/remote-test/ssh-client.ts";
+import { accountCreds, creds, userJwt } from "./remote-test-nats-credentials.ts";
 
 const sha = (s: string) => `sha256:${createHash("sha256").update(s).digest("hex")}`;
 const issuer = "did:mf:example-ranger";
@@ -28,9 +29,6 @@ const staged = { bundleDigest: source.bundleDigest, bundleBytes: 4096 };
 const job = { ...request, ...source };
 const account = `A${"C".repeat(55)}`;
 const otherAccount = `A${"D".repeat(55)}`;
-const userJwt = (claims: Record<string, unknown>) => ["e30", Buffer.from(JSON.stringify(claims)).toString("base64url"), "sig"].join(".");
-const creds = (jwt: string) => `-----BEGIN NATS USER JWT-----\n${jwt}\n------END NATS USER JWT------\n\n-----BEGIN USER NKEY SEED-----\nSU${"A".repeat(56)}\n------END USER NKEY SEED------\n`;
-const accountCreds = (issuerAccount: string) => creds(userJwt({ iss: issuerAccount, sub: `U${"A".repeat(55)}`, nats: { type: "user" } }));
 const issuerAccountCreds = (issuerAccount: string) => creds(userJwt({ iss: `O${"A".repeat(55)}`, sub: `U${"A".repeat(55)}`, nats: { type: "user", issuer_account: issuerAccount } }));
 const receipt = { version: 1 as const, identity: job, executorId: "fixture", status: "passed" as const, completedAt: now - 1000, exitCode: 0 };
 
@@ -102,8 +100,9 @@ describe("opt-in bus producer", () => {
   const stopped: string[] = [];
   const snapshots: string[] = [], paths: string[] = [];
   const exists = (file: string) => stat(file).then(() => true, () => false);
-  const start = (async (config: { nats: { url: string; credsPath: string } }) => {
+  const start = (async (config: { nats: { url: string; name: string; credsPath: string } }) => {
    const url = config.nats.url;
+   expect(config.nats.name).toBe("ranger");
    tried.push(url);
    expect(config.nats.credsPath).not.toBe(path("private.creds"));
    snapshots.push(await readFile(config.nats.credsPath, "utf8"));

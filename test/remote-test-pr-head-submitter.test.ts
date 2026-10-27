@@ -11,6 +11,7 @@ import { type ProfileManifest, type RemoteTestJob } from "../src/remote-test/con
 import { stageSource } from "../src/remote-test/source.ts";
 import { JobLedger } from "../src/remote-test/job-ledger.ts";
 import { createReviewedProfile, MYELIN_REPOSITORY } from "../src/remote-test/profiles.ts";
+import { accountCreds } from "./remote-test-nats-credentials.ts";
 import { fetchPrHead, openPrSubmissionLedger, PR_LEDGER_VERSION, PrSubmissionLedger, runPrHeadSubmitter, scanAndSubmitPrHeads,
  type PrHeadScanDeps } from "../src/remote-test/pr-head-submitter.ts";
 
@@ -244,8 +245,7 @@ describe("PR listing, opt-in config and production producer integration", () => 
    issuers: [{ issuer: authorized ? issuer : "did:mf:other", bindings: [{ repositoryId, profileId: profile.profileId, profileDigest }] }] });
   await writeJson("ssh.json", { target: "fixture", remoteCli: "/reviewed/ranger", remoteConfig: "/private/executor.json", executorId: "fixture", profiles });
   await writeJson("signer.json", { version: 1, issuer, seed: Buffer.alloc(32, 1).toString("base64") });
-  const jwt = ["e30", Buffer.from(JSON.stringify({ iss: account, sub: `U${"A".repeat(55)}`, nats: { type: "user" } })).toString("base64url"), "sig"].join(".");
-  await writeFile(join(root, "bus.creds"), `-----BEGIN NATS USER JWT-----\n${jwt}\n------END NATS USER JWT------\n\n-----BEGIN USER NKEY SEED-----\nSU${"A".repeat(56)}\n------END USER NKEY SEED------\n`, { mode: 0o600 });
+  await writeFile(join(root, "bus.creds"), accountCreds(account), { mode: 0o600 });
  }
 
  test("REST listing paginates all open PRs and preserves repository identity and terminal states; drafts are eligible", async () => {

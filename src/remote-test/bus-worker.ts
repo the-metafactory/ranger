@@ -8,6 +8,7 @@ import { admitBusRequest, BusAdmissionRefusal, BusAdmissionUnavailable, BUS_TEST
 import { BUS_LIMITS, validateBusConfig, type BusConfig } from "./bus-contract.ts";
 import { BusOutboxRefusal, openBusOutbox, type BusOutbox, type BusOutboxOptions, type DurablePublisher, type RefusalCode } from "./bus-outbox.ts";
 import type { BusSigner } from "./bus-producer.ts";
+import { busRuntimeStartArgs } from "./bus-runtime.ts";
 import { sourceManifest, stagedSourceBundle, StagedSourceRefusal } from "./bus-source.ts";
 import { BUS_WORKER_DIR, writeBusWorkerOwner } from "./bus-worker-workspace.ts";
 import { executeRemoteTest, validateExecutorConfig, type ExecutorConfig } from "./executor.ts";
@@ -45,8 +46,7 @@ export const connectBusWorker = (start: typeof startMyelinRuntime) => async (bus
  if (!bindsNatsAccount(credentials, bus.target.account)) return refuse("account_binding");
  const snapshot = await writeNatsCredentialsSnapshot(directory, credentials);
  for (const url of bus.transport.servers) {
-  const runtime = await start({ agent: { name: "ranger", displayName: "Ranger" }, nats: { url, name: "ranger-ci-test", subjects: [], credsPath: snapshot } } as unknown as Parameters<typeof start>[0],
-   { jetstreamDomain: bus.target.domain, signer: { principal: signer.issuer, rawSeedBytes: signer.seed }, signFailureMode: "drop", stack: bus.routing.stack, principal: bus.routing.principal });
+  const runtime = await start(...busRuntimeStartArgs({ bus, signer, url, credsPath: snapshot, name: "ranger-ci-test" }));
   if (runtime.enabled && runtime.publishDurable && runtime.subscribePull && runtime.jetstreamManager) {
    return { enabled: true, publishDurable: runtime.publishDurable.bind(runtime), subscribePull: runtime.subscribePull.bind(runtime), jetstreamManager: runtime.jetstreamManager.bind(runtime), stop: () => runtime.stop() };
   }
