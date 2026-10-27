@@ -30,7 +30,7 @@ const COMMIT = "a".repeat(40);
 const REPOSITORY = "github:github.com/example/repo";
 
 interface FetchCall { url: string; init: RequestInit }
-const tokenAnswer = (expiresAtMs = Date.now() + 3_600_000) => Response.json({ token: "ghs_fake", expires_at: new Date(expiresAtMs).toISOString() }, { status: 201 });
+const tokenAnswer = (expiresAtMs = Date.now() + 3_600_000, token = "ghs_fake") => Response.json({ token, expires_at: new Date(expiresAtMs).toISOString() }, { status: 201 });
 const tokenFetch = (calls: FetchCall[] = [], answer: () => Response = () => tokenAnswer()): FetchFn => (url, init) => { calls.push({ url, init }); return Promise.resolve(answer()); };
 
 function job(overrides: Partial<RemoteTestJob> = {}): RemoteTestJob {
@@ -271,7 +271,7 @@ test("the App client exchanges a verifiable RS256 JWT in-process with a Bearer h
   if (args[0] === "repos/Example/repo/check-runs") return Promise.resolve({ id: 321 });
   return Promise.resolve(null);
  };
- const fetch = tokenFetch(exchanges, () => Response.json({ token: "ghs_installation", expires_at: new Date(5_000_000 + 3_600_000).toISOString() }, { status: 201 }));
+ const fetch = tokenFetch(exchanges, () => tokenAnswer(5_000_000 + 3_600_000, "ghs_installation"));
  const client = appChecksClient({ appId: 9, privateKeyPem: pem, installations: { Example: 77 }, api, fetch, now: () => 5_000_000 });
  const write: CheckRunWrite = { name: "clawbox/unit", headSha: COMMIT, conclusion: "success", title: "t", summary: "s", externalId: "e", startedAtMs: 1_000, completedAtMs: 2_000 };
 
@@ -284,6 +284,7 @@ test("the App client exchanges a verifiable RS256 JWT in-process with a Bearer h
  const headers = new Headers(init.headers);
  expect(url).toBe("https://api.github.com/app/installations/77/access_tokens");
  expect(init.method).toBe("POST");
+ expect(init.redirect).toBe("error");
  expect(headers.get("accept")).toBe("application/vnd.github+json");
  expect(headers.get("x-github-api-version")).toBe("2022-11-28");
  expect(init.signal).toBeInstanceOf(AbortSignal);
