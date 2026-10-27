@@ -19,6 +19,7 @@ version: 1
 # Private values only; keep this file and every path below outside git.
 # checkReporter:
 #   appId: 123456                          # the dedicated checks-only GitHub App
+#   apiBaseUrl: https://api.github.com      # default; GHES uses https://HOST/api/v3
 #   privateKeyFile: /Users/me/.config/ranger/app.pem   # mode 0600, operator-owned
 #   installations:                         # repository owner login -> installation id
 #     the-metafactory: 1234567

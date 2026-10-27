@@ -33,6 +33,13 @@ interface FetchCall { url: string; init: RequestInit }
 const tokenAnswer = (expiresAtMs = Date.now() + 3_600_000, token = "ghs_fake") => Response.json({ token, expires_at: new Date(expiresAtMs).toISOString() }, { status: 201 });
 const tokenFetch = (calls: FetchCall[] = [], answer: () => Response = () => tokenAnswer()): FetchFn => (url, init) => { calls.push({ url, init }); return Promise.resolve(answer()); };
 
+function recordingApi(calls: string[][], id: number): GhApi {
+ return (_token, args) => {
+  calls.push(args);
+  return Promise.resolve(args[0]?.includes("/pulls?") ? [[]] : args.includes("--paginate") ? [{ check_runs: [] }] : { id });
+ };
+}
+
 function job(overrides: Partial<RemoteTestJob> = {}): RemoteTestJob {
  return { version: 1, jobId: randomUUID(), correlationId: randomUUID(), repositoryId: REPOSITORY, commitDigest: COMMIT, treeDigest: "b".repeat(40), bundleDigest: digest("a"), profileId: "unit", profileDigest: digest("a"), lockDigest: digest("c"), imageDigest: digest("d"), platform: "linux-arm64", deadline: 20_000, generation: 1, ...overrides };
 }
@@ -268,7 +275,7 @@ test("the App client exchanges a verifiable RS256 JWT in-process with a Bearer h
  const api: GhApi = (token, args) => {
   calls.push({ token, args });
   if (args[0]?.includes("/check-runs?")) return Promise.resolve([{ check_runs: [{ id: 4, name: "clawbox/unit", app: { id: 9 } }, { id: 8, name: "clawbox/unit", app: { id: 9 } }, { id: 99, name: "clawbox/unit", app: { id: 10 } }] }]);
-  if (args[0] === "repos/Example/repo/check-runs") return Promise.resolve({ id: 321 });
+  if (args[0] === "https://api.github.com/repos/Example/repo/check-runs") return Promise.resolve({ id: 321 });
   return Promise.resolve(null);
  };
  const fetch = tokenFetch(exchanges, () => tokenAnswer(5_000_000 + 3_600_000, "ghs_installation"));
@@ -298,13 +305,34 @@ test("the App client exchanges a verifiable RS256 JWT in-process with a Bearer h
  const [find, create, update] = calls as [typeof calls[0], typeof calls[0], typeof calls[0]];
  expect(calls).toHaveLength(3);
  expect(calls.map(c => c.token)).toEqual(["ghs_installation", "ghs_installation", "ghs_installation"]);
+ for (const call of calls) expect(call.args.slice(-2)).toEqual(["--hostname", "api.github.com"]);
  expect(calls.some(c => c.args.some(a => a.startsWith("app/")))).toBe(false);
- expect(find.args[0]).toContain("repos/Example/repo/commits/" + COMMIT + "/check-runs?");
+ expect(find.args[0]).toContain("https://api.github.com/repos/Example/repo/commits/" + COMMIT + "/check-runs?");
  expect(create.args).toContain("head_sha=" + COMMIT);
  expect(create.args).toContain("conclusion=success");
  expect(create.args).toContain("output[summary]=s");
- expect(update.args.slice(0, 3)).toEqual(["repos/Example/repo/check-runs/8", "--method", "PATCH"]);
+ expect(update.args.slice(0, 3)).toEqual(["https://api.github.com/repos/Example/repo/check-runs/8", "--method", "PATCH"]);
  expect(update.args).not.toContain("head_sha=" + COMMIT);
+});
+
+test("a configured API base reaches the App exchange and every check-run gh api host", async () => {
+ const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+ const apiBaseUrl = "https://github.example.test:8443/api/v3/";
+ const exchanges: FetchCall[] = [], calls: string[][] = [];
+ const api = recordingApi(calls, 321);
+ const client = appChecksClient({ appId: 9, privateKeyPem: privateKey.export({ type: "pkcs8", format: "pem" }), installations: { example: 77 }, apiBaseUrl, api, fetch: tokenFetch(exchanges) });
+ const write: CheckRunWrite = { name: "clawbox/unit", headSha: COMMIT, conclusion: "success", title: "t", summary: "s", externalId: "e", completedAtMs: 2_000 };
+ expect(await client.findCheckRun("example/repo", COMMIT, write.name)).toBeNull();
+ expect(await client.createCheckRun("example/repo", write)).toBe(321);
+ await client.updateCheckRun("example/repo", 321, write);
+ expect(exchanges.map(e => e.url)).toEqual([`${apiBaseUrl}app/installations/77/access_tokens`]);
+ expect(calls).toHaveLength(3);
+ expect(calls.map(args => args[0])).toEqual([
+  `${apiBaseUrl}repos/example/repo/commits/${COMMIT}/check-runs?check_name=clawbox%2Funit&app_id=9&per_page=100`,
+  `${apiBaseUrl}repos/example/repo/check-runs`,
+  `${apiBaseUrl}repos/example/repo/check-runs/321`,
+ ]);
+ for (const args of calls) expect(args.slice(-2)).toEqual(["--hostname", "github.example.test:8443"]);
 });
 
 test("a refused installation token request or a missing installation throws before any check write", async () => {
@@ -328,12 +356,50 @@ test("a refused installation token request or a missing installation throws befo
  expect(calls).toEqual([]);
 });
 
+test("the gh subprocess uses the configured host and installation credential despite inherited host and tokens", async () => {
+ const home = await mkdtemp(join(tmpdir(), "check-reporter-gh-")); roots.push(home);
+ const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+ const keyFile = join(home, "app.pem"), callsFile = join(home, "calls.jsonl");
+ await writeFile(keyFile, privateKey.export({ type: "pkcs8", format: "pem" }), { mode: 0o600 });
+ await writeFile(join(home, "gh"), `#!/usr/bin/env bun
+import { appendFileSync } from "node:fs";
+const args = process.argv.slice(2);
+const pinned = ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"].every(key => process.env[key] === "ghs_installation");
+if (!pinned || process.env.GH_CONFIG_DIR === "inherited-config") process.exit(95);
+appendFileSync(process.env.CHECK_CALLS, JSON.stringify(args) + "\\n");
+console.log(JSON.stringify(args.includes("--paginate") ? [{ check_runs: [] }] : { id: 321 }));
+`, { mode: 0o755 });
+ const result = await runCmd(process.execPath, ["-e", `
+import { readFileSync } from "node:fs";
+import { appChecksClient } from ${JSON.stringify(join(import.meta.dir, "..", "src", "github.ts"))};
+const exchanges = [];
+const client = appChecksClient({ appId: 9, privateKeyPem: readFileSync(${JSON.stringify(keyFile)}, "utf8"), installations: { example: 77 }, apiBaseUrl: "https://github.example.test/api/v3", fetch: async (url) => {
+ exchanges.push(url);
+ return Response.json({ token: "ghs_installation", expires_at: new Date(Date.now() + 3600000).toISOString() });
+} });
+const write = { name: "clawbox/unit", headSha: "${COMMIT}", conclusion: "success", title: "t", summary: "s", externalId: "e", completedAtMs: 2000 };
+await client.findCheckRun("example/repo", write.headSha, write.name);
+await client.createCheckRun("example/repo", write);
+await client.updateCheckRun("example/repo", 321, write);
+console.log(JSON.stringify(exchanges));
+`], { env: { ...process.env, PATH: `${home}:${process.env.PATH}`, CHECK_CALLS: callsFile, GH_HOST: "wrong.example.test", GH_CONFIG_DIR: "inherited-config", GH_TOKEN: "inherited", GITHUB_TOKEN: "inherited", GH_ENTERPRISE_TOKEN: "inherited", GITHUB_ENTERPRISE_TOKEN: "inherited" } });
+ expect(result.stderr).toBe("");
+ expect(result.code).toBe(0);
+ expect(result.stdout.trim()).toBe(JSON.stringify(["https://github.example.test/api/v3/app/installations/77/access_tokens"]));
+ const calls: unknown[] = (await readFile(callsFile, "utf8")).trim().split("\n").map(line => JSON.parse(line) as unknown);
+ expect(calls).toHaveLength(3);
+ for (const args of calls) {
+  expect(args).toEqual(expect.arrayContaining(["api", "--hostname", "github.example.test"]));
+ }
+ expect(calls[0]).toEqual(["api", `https://github.example.test/api/v3/repos/example/repo/commits/${COMMIT}/check-runs?check_name=clawbox%2Funit&app_id=9&per_page=100`, "--paginate", "--slurp", "--hostname", "github.example.test"]);
+});
+
 test("the installation token exchange labels a refusal, a timeout, a network failure and a malformed body without the JWT or the token", async () => {
  const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
  const jwt = mintAppJwt(9, privateKey.export({ type: "pkcs8", format: "pem" }));
  const leaked = { token: "ghs_secret_token", expires_at: "not a date" };
  const failure = async (fetch: FetchFn, timeoutMs?: number): Promise<string> => {
-  try { await createInstallationToken(jwt, 77, fetch, timeoutMs); } catch (error) { expect(error).toBeInstanceOf(Error); return (error as Error).message; }
+  try { await createInstallationToken(jwt, 77, { fetch, timeoutMs }); } catch (error) { expect(error).toBeInstanceOf(Error); return (error as Error).message; }
   throw new Error("the exchange did not throw");
  };
  const hanging: FetchFn = (_url, init) => new Promise((_resolve, reject) => init.signal?.addEventListener("abort", () => reject(new DOMException("timed out", "TimeoutError"))));
@@ -365,7 +431,7 @@ test("the installation token exchange labels a refusal, a timeout, a network fai
   expect(message).not.toContain(jwt.split(".")[2]);
   expect(message).not.toContain(leaked.token);
  }
- const issued = await createInstallationToken(jwt, 77, tokenFetch([], () => tokenAnswer(1_900_000_000_000)));
+ const issued = await createInstallationToken(jwt, 77, { fetch: tokenFetch([], () => tokenAnswer(1_900_000_000_000)) });
  expect(issued).toEqual({ token: "ghs_fake", expiresAtMs: 1_900_000_000_000 });
 });
 
@@ -435,7 +501,7 @@ test("the reporter reads receipts over the fixed SSH path and writes one check t
   const summary = await runCheckReporter(config, { ssh: { runner: f.ssh() }, api, fetch, pullHeads: () => Promise.resolve([]) });
   expect(summary.failed).toEqual([]);
   expect(summary.reported).toMatchObject([{ jobId: j.jobId, checkRunId: 555, conclusion: "success", created: true }]);
-  const create = requests.find(r => r.includes("repos/example/repo/check-runs"))!;
+  const create = requests.find(r => r.includes("https://api.github.com/repos/example/repo/check-runs"))!;
   expect(create).toContain("head_sha=" + COMMIT);
   expect(create).toContain("name=clawbox/unit");
   expect(create.some(a => a.includes(sha256(bytesOf(receipt))))).toBe(true);
@@ -443,9 +509,36 @@ test("the reporter reads receipts over the fixed SSH path and writes one check t
 
   const again = await runCheckReporter(config, { ssh: { runner: f.ssh() }, api, fetch, pullHeads: () => Promise.resolve([]) });
   expect(again.reported).toEqual([]);
-  expect(requests.filter(r => r.includes("repos/example/repo/check-runs"))).toHaveLength(1);
+  expect(requests.filter(r => r.includes("https://api.github.com/repos/example/repo/check-runs"))).toHaveLength(1);
   expect(requests.every(r => r[0] === "installation")).toBe(true);
   expect(exchanges.map(e => e.url)).toEqual(["https://api.github.com/app/installations/77/access_tokens"]);
+ } finally { f.close(); }
+});
+
+test("the reporter carries its configured API base from YAML to both transports", async () => {
+ const f = await operatorFixture();
+ try {
+  await f.enqueue(job());
+  const apiBaseUrl = "https://github.example.test:8443/api/v3";
+  const config = await f.load({ apiBaseUrl }), calls: string[][] = [], exchanges: FetchCall[] = [];
+  config.auth.defaultWriteTokenEnv = "RANGER_CHECK_TEST_TOKEN";
+  expect(config.checkReporter?.apiBaseUrl).toBe(apiBaseUrl);
+  const record = recordingApi(calls, 555), tokens: string[] = [];
+  const api: GhApi = (token, args, label) => {
+   tokens.push(token);
+   return record(token, args, label);
+  };
+  const summary = await runCheckReporter(config, { ssh: { runner: f.ssh() }, api, fetch: tokenFetch(exchanges), env: { RANGER_CHECK_TEST_TOKEN: "machine-token" } });
+  expect(summary.failed).toEqual([]);
+  expect(summary.reported).toHaveLength(1);
+  expect(exchanges.map(e => e.url)).toEqual([`${apiBaseUrl}/app/installations/77/access_tokens`]);
+  expect(calls).toHaveLength(3);
+  expect(calls[0][0]).toBe(`${apiBaseUrl}/repos/example/repo/commits/${COMMIT}/pulls?per_page=100`);
+  expect(tokens).toEqual(["machine-token", "ghs_fake", "ghs_fake"]);
+  for (const args of calls) {
+   expect(args[0]).toStartWith(`${apiBaseUrl}/repos/example/repo/`);
+   expect(args.slice(-2)).toEqual(["--hostname", "github.example.test:8443"]);
+  }
  } finally { f.close(); }
 });
 
@@ -485,7 +578,7 @@ test("a failing installation token request is reported as failed, writes no chec
   tokenOk = true;
   const replay = await runCheckReporter(config, { ssh: { runner: f.ssh() }, api, fetch, pullHeads: () => Promise.resolve([]) });
   expect(replay.reported.map(r => r.jobId)).toEqual([j.jobId]);
-  expect(writes).toEqual(["repos/example/repo/check-runs"]);
+  expect(writes).toEqual(["https://api.github.com/repos/example/repo/check-runs"]);
  } finally { f.close(); }
 });
 
@@ -513,6 +606,10 @@ test("the opt-in config block is optional and rejects relative paths, unknown ke
   const path = join(f.home, "plain.yaml");
   await writeFile(path, stringify({ maps: [{ repo: "example/repo", root: 1 }] }));
   expect(loadConfig(path, {}).config.checkReporter).toBeUndefined();
+  expect((await f.load()).checkReporter?.apiBaseUrl).toBe("https://api.github.com");
+  for (const apiBaseUrl of ["invalid", "http://github.example.test/api/v3", "https://user:secret@github.example.test/api/v3", "https://github.example.test/api/v3?query=1", "https://github.example.test/api/v3#fragment", "https://github.example.test/api/v3?", "https://github.example.test/api/v3#"]) {
+   await expect(f.load({ apiBaseUrl })).rejects.toThrow(/API base URL|Invalid url/);
+  }
   await expect(f.load({ privateKeyFile: "relative.pem" })).rejects.toThrow(/absolute path/);
   await expect(f.load({ installations: {} })).rejects.toThrow(/at least one installation/);
   await expect(f.load({ appId: 0 })).rejects.toThrow();
@@ -557,7 +654,7 @@ test("report-checks lists and retrieves receipts only through the receipt-only S
    expect(args.slice(-1)[0]).toBe("'/opt/ranger/src/cli.ts' 'remote-test' 'serve-stdio' '--config' '/etc/ranger/executor.json'");
    expect(JSON.stringify(request)).not.toMatch(/BEGIN|ghs_|token|appId/i);
   }
-  expect(writes).toEqual(["repos/example/repo/check-runs", "repos/example/repo/check-runs"]);
+  expect(writes).toEqual(["https://api.github.com/repos/example/repo/check-runs", "https://api.github.com/repos/example/repo/check-runs"]);
  } finally { f.close(); }
 });
 
@@ -632,7 +729,7 @@ test("an SSH failure leaves the receipt unacknowledged and the next run replays 
   expect(writes).toEqual([]);
   const replay = await runCheckReporter(config, run(f.ssh()));
   expect(replay.reported.map(r => r.jobId)).toEqual([j.jobId]);
-  expect(writes).toEqual(["repos/example/repo/check-runs"]);
+  expect(writes).toEqual(["https://api.github.com/repos/example/repo/check-runs"]);
   expect((await runCheckReporter(config, run(f.ssh()))).reported).toEqual([]);
  } finally { f.close(); }
 });
@@ -647,7 +744,7 @@ test("a GitHub or token failure after a successful retrieval writes no acknowled
   expect((await runCheckReporter(config, run)).failed).toHaveLength(1);
   tokenOk = true;
   expect((await runCheckReporter(config, run)).reported.map(r => r.jobId)).toEqual([j.jobId]);
-  expect(writes).toEqual(["repos/example/repo/check-runs"]);
+  expect(writes).toEqual(["https://api.github.com/repos/example/repo/check-runs"]);
  } finally { f.close(); }
 });
 

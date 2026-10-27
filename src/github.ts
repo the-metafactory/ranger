@@ -4,6 +4,7 @@ import { githubCiVerdict } from "./github-ci.ts";
 import { runCmd } from "./exec.ts";
 import { runReadRetryingTransient } from "./transient.ts";
 import { writeEnv } from "./identity.ts";
+import { GitHubApiBaseUrlSchema } from "./github-api-base.ts";
 
 /**
  * The implement lane's pull-request surface (design §4, #23): every call is a
@@ -57,7 +58,7 @@ export interface CommitStatus {
 
 /** One `gh api` request; its trimmed stdout. */
 async function ghApiText(token: string, args: string[], label: string): Promise<string> {
- const gated = writeEnv(token);
+ const gated = writeEnv(token, { GH_ENTERPRISE_TOKEN: token, GITHUB_ENTERPRISE_TOKEN: token });
  try {
   // Reads retry a transient GitHub error; writes run once (a timed-out POST may have landed).
   const run = isReadRequest(args) ? runReadRetryingTransient : runCmd;
@@ -559,7 +560,6 @@ export interface InstallationToken {
 /** The in-process HTTP call the App JWT exchange uses; injectable so tests never reach GitHub. */
 export type FetchFn = (url: string, init: RequestInit) => Promise<Response>;
 
-const GITHUB_API = "https://api.github.com";
 const INSTALLATION_TOKEN_TIMEOUT_MS = 30_000;
 
 /**
@@ -567,14 +567,17 @@ const INSTALLATION_TOKEN_TIMEOUT_MS = 30_000;
  * `gh` would send the JWT under the `token` scheme, which GitHub refuses, and would put it in a
  * child's environment. Any refusal, timeout or malformed answer throws without either credential.
  */
-export async function createInstallationToken(jwt: string, installationId: number, fetchFn: FetchFn = fetch, timeoutMs: number = INSTALLATION_TOKEN_TIMEOUT_MS): Promise<InstallationToken> {
+export async function createInstallationToken(jwt: string, installationId: number, options: { apiBaseUrl?: string; fetch?: FetchFn; timeoutMs?: number } = {}): Promise<InstallationToken> {
+ const apiBaseUrl = GitHubApiBaseUrlSchema.parse(options.apiBaseUrl);
+ const fetchFn = options.fetch ?? fetch;
+ const timeoutMs = options.timeoutMs ?? INSTALLATION_TOKEN_TIMEOUT_MS;
  const label = `installation ${installationId} token`;
  const redact = (text: string): string => (jwt.length > 0 ? text.replaceAll(jwt, "[jwt]") : text).slice(0, 200);
  const timedOut = (error: unknown): boolean => error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError");
  const timeout = new GitHubError(`${label}: timed out after ${timeoutMs}ms`);
  let response: Response;
  try {
-  response = await fetchFn(`${GITHUB_API}/app/installations/${installationId}/access_tokens`, {
+  response = await fetchFn(`${apiBaseUrl}/app/installations/${installationId}/access_tokens`, {
    method: "POST",
    headers: { Authorization: `Bearer ${jwt}`, Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" },
    redirect: "error",
@@ -617,6 +620,7 @@ export interface AppChecks {
 
 export interface AppChecksOptions {
  appId: number;
+ apiBaseUrl?: string;
  privateKeyPem: string;
  installations: Readonly<Record<string, number>>;
  api?: GhApi;
@@ -640,13 +644,19 @@ function checkRunFields(write: CheckRunWrite, withHead: boolean): string[] {
  return fields;
 }
 
+function apiAtBase(apiBaseUrl: string, request: GhApi = ghApi): GhApi {
+ const host = new URL(apiBaseUrl).host;
+ return (token, [path, ...args], label) => request(token, [`${apiBaseUrl}/${path}`, ...args, "--hostname", host], label);
+}
+
 /**
  * Check-run writes as the App's installation on the repository's owner. A token
  * is minted lazily and cached until shortly before it expires; a missing
  * installation or a refused token request throws before any write.
  */
 export function appChecksClient(options: AppChecksOptions): AppChecks {
- const api = options.api ?? ghApi;
+ const apiBaseUrl = GitHubApiBaseUrlSchema.parse(options.apiBaseUrl);
+ const api = apiAtBase(apiBaseUrl, options.api);
  const now = options.now ?? Date.now;
  const installations = new Map(Object.entries(options.installations).map(([owner, id]) => [owner.toLowerCase(), id]));
  const tokens = new Map<number, InstallationToken>();
@@ -657,7 +667,7 @@ export function appChecksClient(options: AppChecksOptions): AppChecks {
   if (installationId === undefined) throw new GitHubError(`no GitHub App installation configured for ${owner}`);
   const cached = tokens.get(installationId);
   if (cached !== undefined && cached.expiresAtMs - now() > TOKEN_REFRESH_MARGIN_MS) return cached.token;
-  const minted = await createInstallationToken(mintAppJwt(options.appId, options.privateKeyPem, Math.floor(now() / 1000)), installationId, options.fetch);
+  const minted = await createInstallationToken(mintAppJwt(options.appId, options.privateKeyPem, Math.floor(now() / 1000)), installationId, { apiBaseUrl, fetch: options.fetch });
   tokens.set(installationId, minted);
   return minted.token;
  }
@@ -692,7 +702,8 @@ export function appChecksClient(options: AppChecksOptions): AppChecks {
 }
 
 /** Head SHAs of the open pull requests that contain `sha` (the machine account's read, not the App's). */
-export async function openPullHeadsContaining(repo: string, sha: string, token: string, api: GhApi = ghApi): Promise<string[]> {
+export async function openPullHeadsContaining(repo: string, sha: string, token: string, options: { apiBaseUrl?: string; api?: GhApi } = {}): Promise<string[]> {
+ const api = apiAtBase(GitHubApiBaseUrlSchema.parse(options.apiBaseUrl), options.api);
  const label = `pull requests containing ${sha}`;
  const raw = await api(token, [`repos/${repo}/commits/${sha}/pulls?per_page=100`, "--paginate", "--slurp"], label);
  return pagedList(raw, label)
