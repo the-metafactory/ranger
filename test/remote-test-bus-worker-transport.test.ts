@@ -1,29 +1,24 @@
 import { expect, test } from "bun:test";
 import { spawn } from "node:child_process";
-import { createHash, generateKeyPairSync, randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createAccount, createOperator, createUser, encodeAccount, encodeOperator, encodeUser, fmtCreds } from "@nats-io/jwt";
 import { validateEnvelope } from "@the-metafactory/cortex/bus";
-import { createEnvelope, type MyelinEnvelope } from "@the-metafactory/myelin";
-import { loadRegistry, signEnvelope, verifyEnvelopeIdentity, type Identity } from "@the-metafactory/myelin/identity";
+import type { MyelinEnvelope } from "@the-metafactory/myelin";
+import { loadRegistry, verifyEnvelopeIdentity } from "@the-metafactory/myelin/identity";
 import { taskSubjectAndType } from "@the-metafactory/myelin/subjects";
 import { AckPolicy, connect, credsAuthenticator, nanos, StorageType, type NatsConnection } from "nats";
-import { runCmd } from "../src/exec.ts";
 import { persistExecution } from "../src/remote-test/artifacts.ts";
 import { BUS_LIMITS, validateBusConfig } from "../src/remote-test/bus-contract.ts";
-import { receiveStagedSource } from "../src/remote-test/bus-source.ts";
 import { startBusWorker, type BusWorker } from "../src/remote-test/bus-worker.ts";
 import { openJobLedger } from "../src/remote-test/job-ledger.ts";
-import { stageSource } from "../src/remote-test/source.ts";
+import { busWorkerIssuers, busWorkerRegistry, busWorkerRequest, busWorkerSource, issuer } from "./remote-test-bus-worker-support.ts";
 
 const binary = Bun.which("nats-server");
 const transportTest = binary ? test : test.skip;
-const issuer = "did:mf:synthetic-ranger";
 const requestStream = "CI_REQUESTS", resultStream = "CI_RESULTS", durable = "ranger-worker";
 const route = taskSubjectAndType("synthetic", "ci-test", "beta");
-const sha = (value: string) => `sha256:${createHash("sha256").update(value).digest("hex")}`;
 
 async function waitFor(predicate: () => boolean | Promise<boolean>, description: string, timeoutMs = 8_000) {
  const deadline = performance.now() + timeoutMs;
@@ -102,31 +97,8 @@ async function fixture() {
     ack_wait: nanos(10_000), max_ack_pending: 1, max_deliver: 3 });
    managers.push(manager);
   }
-  const jobsRoot = join(root, "jobs"), repo = join(root, "repo"), stagingRoot = join(root, "staging");
-  for (const directory of [jobsRoot, repo, stagingRoot]) await mkdir(directory, { mode: 0o700 });
-  const git = async (...args: string[]) => {
-   const result = await runCmd("git", args, { cwd: repo });
-   if (result.code) throw Error(result.stderr);
-   return result.stdout.trim();
-  };
-  await git("init", "--initial-branch=main");
-  await writeFile(join(repo, "bun.lock"), "synthetic-lock\n");
-  await git("add", ".");
-  await git("-c", "user.name=Synthetic", "-c", "user.email=synthetic@example.invalid", "commit", "-m", "Synthetic source fixture");
-  const staged = await stageSource({ worktree: repo, stagingRoot, jobId: randomUUID() });
-  const bytes = await readFile(staged.bundlePath);
-  const profile = { version: 1 as const, profileId: "unit-v1", profileDigest: sha("profile"), lockDigest: sha("synthetic-lock\n"), imageDigest: sha("image"),
-   platform: "linux-arm64" as const, commands: [["bun", "test"]] as [string, ...string[]][] };
-  const job = { ...staged.manifest, jobId: randomUUID(), correlationId: randomUUID(), repositoryId: "github:github.com/example/repo",
-   profileId: profile.profileId, profileDigest: profile.profileDigest, lockDigest: profile.lockDigest, imageDigest: profile.imageDigest,
-   platform: profile.platform, deadline: Date.now() + 120_000, generation: 1 };
-  await receiveStagedSource({ jobsRoot, job, declaredBytes: bytes.length, chunks: (async function* () { yield bytes; })() });
-  const key = generateKeyPairSync("ed25519");
-  const seed = key.privateKey.export({ format: "der", type: "pkcs8" }).subarray(-32);
-  const identity: Identity = { id: issuer, network: "synthetic", type: "service", created_at: new Date().toISOString(),
-   public_key: key.publicKey.export({ format: "der", type: "spki" }).subarray(-32).toString("base64") };
-  const registryFile = join(root, "registry.json");
-  await writeFile(registryFile, JSON.stringify({ version: 2, identities: [identity], trusted_hubs: [] }), { mode: 0o600 });
+  const { jobsRoot, bytes, executor, job } = await busWorkerSource(root);
+  const { seed, registryFile } = await busWorkerRegistry(root);
   const beta = servers[1], alphaManager = managers[0], betaManager = managers[1], alphaConnection = connections[0], betaConnection = connections[1];
   if (!beta || !alphaManager || !betaManager || !alphaConnection || !betaConnection) throw Error("Missing brokers");
   const bus = validateBusConfig({ version: 1, target: { domain: "beta", account: account.getPublicKey() },
@@ -134,8 +106,7 @@ async function fixture() {
    streams: { request: { stream: requestStream, durable }, result: { stream: resultStream } }, transport: { servers: [beta.url], credentialsFile },
    ssh: { configFile: join(root, "ssh.json") }, registry: { file: registryFile },
    execution: { maxAckPending: 1, maxConcurrentJobs: 1, ackWaitSeconds: 10, progressIntervalSeconds: 1, maxDeliver: 3 },
-   issuers: [{ issuer, bindings: [{ repositoryId: job.repositoryId, profileId: profile.profileId, profileDigest: profile.profileDigest }] }] });
-  const executor = { executorId: "fixture", jobsRoot, profiles: [{ profile, lockFile: "bun.lock", imageReference: `localhost/runtime@${profile.imageDigest}` }] };
+   issuers: busWorkerIssuers(job) });
   let executions = 0;
   const begin = async () => {
    worker = await startBusWorker({ bus, executor, signer: { issuer, seed }, outboxRoot: join(root, "outbox"), offerings: [{ capability: "ci-test", scopes: ["local"] }] }, {
@@ -157,13 +128,8 @@ async function fixture() {
    });
    return worker;
   };
-  const envelope = () => createEnvelope({ source: "synthetic.beta.ranger", type: route.type,
-   sovereignty: { classification: "local", data_residency: "CH", max_hop: 0, frontier_ok: false, model_class: "local-only" },
-   correlation_id: job.correlationId, deadline: new Date(job.deadline).toISOString(), distribution_mode: "offer",
-   originator: { identity: issuer, attribution: "adapter-resolved" }, payload: { version: 1, job, source: { bundleDigest: job.bundleDigest, bundleBytes: bytes.length } } });
   const publish = async (nc: NatsConnection, signed = true) => {
-   const value = envelope();
-   const payload = signed ? await signEnvelope(value, seed.toString("base64"), issuer, { role: "origin" }) : value;
+   const payload = await busWorkerRequest({ source: "synthetic.beta.ranger", type: route.type, job, bundleBytes: bytes.length, seed: signed ? seed : undefined });
    return nc.jetstream({ domain: nc === alphaConnection ? "alpha" : "beta" }).publish(route.subject, Buffer.from(JSON.stringify(payload)));
   };
   return { root, jobsRoot, job, bus, executor, seed, registryFile, begin, publish, alphaConnection, betaConnection, alphaManager, betaManager,

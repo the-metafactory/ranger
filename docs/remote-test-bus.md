@@ -122,7 +122,7 @@ The job is the existing V1 schema with every identity field. `source.bundleDiges
 - `streams.request.stream`, `streams.request.durable` and `streams.result.stream`: exact names. The request and result streams must differ. Wildcards, dots and whitespace refuse.
 - `transport.servers`: fixed `nats://host:port` or `tls://host:port` locators without credentials, paths or queries. `transport.credentialsFile` is a normalized absolute operator path.
 - `ssh.configFile`: the existing reviewed SSH JSON that source staging reuses.
-- `execution`: `maxAckPending` and `maxConcurrentJobs` are fixed to 1. `ackWaitSeconds` and `maxDeliver` are bounded. An omitted `progressIntervalSeconds` defaults to one third of the verified ack wait; an explicit interval must be positive and shorter than that wait.
+- `execution`: `maxAckPending` and `maxConcurrentJobs` are fixed to 1. `ackWaitSeconds` and `maxDeliver` are bounded. An omitted `progressIntervalSeconds` defaults to one third of the verified ack wait; an explicit interval must be at least one second and shorter than that wait.
 - `registry.file`: the private Myelin identity registry.
 - `issuers`: at least one concrete issuer DID, each with at least one exact `{repositoryId, profileId, profileDigest}` binding. Missing, empty, duplicate or wildcard entries fail closed.
 
