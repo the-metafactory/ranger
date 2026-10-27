@@ -33,6 +33,13 @@ interface FetchCall { url: string; init: RequestInit }
 const tokenAnswer = (expiresAtMs = Date.now() + 3_600_000, token = "ghs_fake") => Response.json({ token, expires_at: new Date(expiresAtMs).toISOString() }, { status: 201 });
 const tokenFetch = (calls: FetchCall[] = [], answer: () => Response = () => tokenAnswer()): FetchFn => (url, init) => { calls.push({ url, init }); return Promise.resolve(answer()); };
 
+function recordingApi(calls: string[][], id: number): GhApi {
+ return (_token, args) => {
+  calls.push(args);
+  return Promise.resolve(args[0]?.includes("/pulls?") ? [[]] : args.includes("--paginate") ? [{ check_runs: [] }] : { id });
+ };
+}
+
 function job(overrides: Partial<RemoteTestJob> = {}): RemoteTestJob {
  return { version: 1, jobId: randomUUID(), correlationId: randomUUID(), repositoryId: REPOSITORY, commitDigest: COMMIT, treeDigest: "b".repeat(40), bundleDigest: digest("a"), profileId: "unit", profileDigest: digest("a"), lockDigest: digest("c"), imageDigest: digest("d"), platform: "linux-arm64", deadline: 20_000, generation: 1, ...overrides };
 }
@@ -312,10 +319,7 @@ test("a configured API base reaches the App exchange and every check-run gh api 
  const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
  const apiBaseUrl = "https://github.example.test:8443/api/v3/";
  const exchanges: FetchCall[] = [], calls: string[][] = [];
- const api: GhApi = (_token, args) => {
-  calls.push(args);
-  return Promise.resolve(args.includes("--paginate") ? [{ check_runs: [] }] : { id: 321 });
- };
+ const api = recordingApi(calls, 321);
  const client = appChecksClient({ appId: 9, privateKeyPem: privateKey.export({ type: "pkcs8", format: "pem" }), installations: { example: 77 }, apiBaseUrl, api, fetch: tokenFetch(exchanges) });
  const write: CheckRunWrite = { name: "clawbox/unit", headSha: COMMIT, conclusion: "success", title: "t", summary: "s", externalId: "e", completedAtMs: 2_000 };
  expect(await client.findCheckRun("example/repo", COMMIT, write.name)).toBeNull();
@@ -515,21 +519,25 @@ test("the reporter carries its configured API base from YAML to both transports"
  const f = await operatorFixture();
  try {
   await f.enqueue(job());
-  const apiBaseUrl = "https://github.example.test/api/v3";
+  const apiBaseUrl = "https://github.example.test:8443/api/v3";
   const config = await f.load({ apiBaseUrl }), calls: string[][] = [], exchanges: FetchCall[] = [];
+  config.auth.defaultWriteTokenEnv = "RANGER_CHECK_TEST_TOKEN";
   expect(config.checkReporter?.apiBaseUrl).toBe(apiBaseUrl);
-  const api: GhApi = (_token, args) => {
-   calls.push(args);
-   return Promise.resolve(args.includes("--paginate") ? [{ check_runs: [] }] : { id: 555 });
+  const record = recordingApi(calls, 555), tokens: string[] = [];
+  const api: GhApi = (token, args, label) => {
+   tokens.push(token);
+   return record(token, args, label);
   };
-  const summary = await runCheckReporter(config, { ssh: { runner: f.ssh() }, api, fetch: tokenFetch(exchanges), pullHeads: () => Promise.resolve([]) });
+  const summary = await runCheckReporter(config, { ssh: { runner: f.ssh() }, api, fetch: tokenFetch(exchanges), env: { RANGER_CHECK_TEST_TOKEN: "machine-token" } });
   expect(summary.failed).toEqual([]);
   expect(summary.reported).toHaveLength(1);
   expect(exchanges.map(e => e.url)).toEqual([`${apiBaseUrl}/app/installations/77/access_tokens`]);
-  expect(calls).toHaveLength(2);
+  expect(calls).toHaveLength(3);
+  expect(calls[0][0]).toBe(`${apiBaseUrl}/repos/example/repo/commits/${COMMIT}/pulls?per_page=100`);
+  expect(tokens).toEqual(["machine-token", "ghs_fake", "ghs_fake"]);
   for (const args of calls) {
    expect(args[0]).toStartWith(`${apiBaseUrl}/repos/example/repo/`);
-   expect(args.slice(-2)).toEqual(["--hostname", "github.example.test"]);
+   expect(args.slice(-2)).toEqual(["--hostname", "github.example.test:8443"]);
   }
  } finally { f.close(); }
 });

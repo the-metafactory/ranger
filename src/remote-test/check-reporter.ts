@@ -300,7 +300,7 @@ export async function runCheckReporter(config: RangerConfig, run: CheckReporterR
  const ledger = await openReporterLedger(settings.stateRoot, run.now);
  try {
   const app = appChecksClient({ appId: settings.appId, apiBaseUrl: settings.apiBaseUrl, privateKeyPem, installations: settings.installations, ...(run.api && { api: run.api }), ...(run.fetch && { fetch: run.fetch }), ...(run.now && { now: run.now }) });
-  const openPullHeads = run.pullHeads ?? ((repo, sha) => openPullHeadsContaining(repo, sha, resolveWriteToken(config, repo, run.env).token, run.api));
+  const openPullHeads = run.pullHeads ?? ((repo, sha) => openPullHeadsContaining(repo, sha, resolveWriteToken(config, repo, run.env).token, { apiBaseUrl: settings.apiBaseUrl, api: run.api }));
   const reader = sshReceiptReader(ssh, run.ssh);
   return await reportReceipts({ reader, github: { ...app, openPullHeads }, ledger }, run.job);
  } finally { ledger.close(); }

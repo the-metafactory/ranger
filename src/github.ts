@@ -644,6 +644,11 @@ function checkRunFields(write: CheckRunWrite, withHead: boolean): string[] {
  return fields;
 }
 
+function apiAtBase(apiBaseUrl: string, request: GhApi = ghApi): GhApi {
+ const host = new URL(apiBaseUrl).host;
+ return (token, [path, ...args], label) => request(token, [`${apiBaseUrl}/${path}`, ...args, "--hostname", host], label);
+}
+
 /**
  * Check-run writes as the App's installation on the repository's owner. A token
  * is minted lazily and cached until shortly before it expires; a missing
@@ -651,9 +656,7 @@ function checkRunFields(write: CheckRunWrite, withHead: boolean): string[] {
  */
 export function appChecksClient(options: AppChecksOptions): AppChecks {
  const apiBaseUrl = GitHubApiBaseUrlSchema.parse(options.apiBaseUrl);
- const host = new URL(apiBaseUrl).host;
- const request = options.api ?? ghApi;
- const api: GhApi = (token, [path, ...args], label) => request(token, [`${apiBaseUrl}/${path}`, ...args, "--hostname", host], label);
+ const api = apiAtBase(apiBaseUrl, options.api);
  const now = options.now ?? Date.now;
  const installations = new Map(Object.entries(options.installations).map(([owner, id]) => [owner.toLowerCase(), id]));
  const tokens = new Map<number, InstallationToken>();
@@ -699,7 +702,8 @@ export function appChecksClient(options: AppChecksOptions): AppChecks {
 }
 
 /** Head SHAs of the open pull requests that contain `sha` (the machine account's read, not the App's). */
-export async function openPullHeadsContaining(repo: string, sha: string, token: string, api: GhApi = ghApi): Promise<string[]> {
+export async function openPullHeadsContaining(repo: string, sha: string, token: string, options: { apiBaseUrl?: string; api?: GhApi } = {}): Promise<string[]> {
+ const api = apiAtBase(GitHubApiBaseUrlSchema.parse(options.apiBaseUrl), options.api);
  const label = `pull requests containing ${sha}`;
  const raw = await api(token, [`repos/${repo}/commits/${sha}/pulls?per_page=100`, "--paginate", "--slurp"], label);
  return pagedList(raw, label)
