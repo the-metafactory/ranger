@@ -7,7 +7,7 @@ import { BUS_TEST_CAPABILITY } from "./bus-admission.ts";
 import { authorizeBusProducer, BUS_LIMITS, validateBusConfig, validateBusRequest, type BusConfig } from "./bus-contract.ts";
 import type { DurablePublisher } from "./bus-outbox.ts";
 import { Sha256Schema, type RemoteTestJob } from "./contract.ts";
-import { readPrivateJson, reserve, saveJob } from "./ssh-cli.ts";
+import { readPrivateJson, reserve, saveJob } from "./private-io.ts";
 import { selectSshJob, stageCommittedSource, statusSshRemoteTest, validateSshConfig, type SshConfig, type SshOptions, type SshOutcome, type SshStageOutcome } from "./ssh-client.ts";
 
 const SOURCE_FIELDS = ["commitDigest", "treeDigest", "bundleDigest"] as const;
