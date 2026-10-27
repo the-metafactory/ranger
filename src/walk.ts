@@ -590,6 +590,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
  result.intake = await intakePass({
   config,
   journal,
+  registry,
   portFor: targetFor,
   ...(ctx.now === undefined ? {} : { now: ctx.now }),
   ...(ctx.intakeClient === undefined ? {} : { clientFor: ctx.intakeClient }),

@@ -1075,6 +1075,7 @@ export interface IntakeCardDraft {
   probes?: readonly unknown[];
   /** The model a claude draft ran on (shown, not journaled). */
   model?: string;
+  droppedProbes?: readonly string[];
   /** Why claude did not draft it, on a deterministic draft that fell back (shown, not journaled). */
   fallback?: string;
   body: string;
@@ -1137,11 +1138,16 @@ export function draftCardContent(map: { repo: string; root: number }, draft: Int
       : [
           `Drafted by ${sanitizeGraphText(draft.drafter)}${draft.model === undefined ? "" : ` (${sanitizeGraphText(draft.model)})`} from your message and the map's open nodes. Not filed yet. ${ask}`,
           probes.length === 0 ? "No probes." : `Probes: ${probes.map((probe) => code(oneLine(JSON.stringify(probe), 200))).join(", ")}`,
+          ...droppedProbeLines(draft),
         ],
     body: draft.body,
     // The tail survives every cut, so the link back always shows.
     tail: `From your message: <${draft.messageUrl}>`,
   });
+}
+
+function droppedProbeLines(draft: IntakeCardDraft): string[] {
+  return (draft.droppedProbes ?? []).map((line) => `${sanitizeGraphText(line)}.`);
 }
 
 /**
@@ -1155,6 +1161,7 @@ function correctionLines(draft: IntakeCardDraft, note: IntakeCorrectionNote, ask
   return [
     `Corrected draft, ${by}, replacing <${note.previousCardUrl}>: ${note.changed.length === 0 ? "nothing changed" : `changed ${note.changed.join(", ")}`}. Not filed yet. Only this card's 👍 files it. ${ask}`,
     ...note.notUnderstood.map((line) => `Not understood: ${sanitizeGraphText(line)}.`),
+    ...droppedProbeLines(draft),
     ...(draft.fallback === undefined ? [] : [`Claude did not apply it: ${sanitizeGraphText(draft.fallback)}.`]),
   ];
 }
