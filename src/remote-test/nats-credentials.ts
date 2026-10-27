@@ -1,5 +1,6 @@
 import { constants } from "node:fs";
-import { open } from "node:fs/promises";
+import { open, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { z } from "zod";
 import { privateOperatorPath } from "./baseline.ts";
 
@@ -13,7 +14,7 @@ export interface NatsCredentials { readonly account: string; readonly canonical:
 const ClaimsSchema = z.object({ iss: z.string(), sub: z.string().regex(/^U[A-Z2-7]{55}$/), nats: z.object({ type: z.literal("user"), issuer_account: z.string().optional() }).passthrough() }).passthrough();
 const invalid = (): never => { throw new InvalidNatsCredentials(); };
 
-export function parseNatsCredentials(text: string): NatsCredentials {
+function parseNatsCredentials(text: string): NatsCredentials {
  try {
   const jwt = /-----BEGIN NATS USER JWT-----\s+([A-Za-z0-9_.-]+)\s+------END NATS USER JWT------/.exec(text)?.[1];
   if (jwt?.split(".").length !== 3) return invalid();
@@ -35,6 +36,13 @@ export async function readNatsCredentials(path: string): Promise<NatsCredentials
   bytes = await file.readFile();
  } finally { await file.close(); }
  return parseNatsCredentials(bytes.toString("utf8"));
+}
+
+/** Writes the checked blocks as transport.creds in a private directory; the SDK authenticates with this file only. */
+export async function writeNatsCredentialsSnapshot(directory: string, credentials: NatsCredentials): Promise<string> {
+ const path = join(directory, "transport.creds");
+ await writeFile(path, credentials.canonical, { flag: "wx", mode: 0o600 });
+ return path;
 }
 
 export const bindsNatsAccount = (credentials: NatsCredentials, account: string) => /^A[A-Z2-7]{55}$/.test(credentials.account) && credentials.account === account;

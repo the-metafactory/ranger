@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MyelinDurablePublishError, startMyelinRuntime } from "@the-metafactory/cortex/bus";
@@ -10,7 +10,7 @@ import { BUS_TEST_CAPABILITY } from "./bus-admission.ts";
 import { authorizeBusProducer, BUS_LIMITS, validateBusConfig, validateBusRequest, type BusConfig } from "./bus-contract.ts";
 import type { DurablePublisher } from "./bus-outbox.ts";
 import { Sha256Schema, type RemoteTestJob } from "./contract.ts";
-import { bindsNatsAccount, readNatsCredentials, type NatsCredentials } from "./nats-credentials.ts";
+import { bindsNatsAccount, readNatsCredentials, writeNatsCredentialsSnapshot, type NatsCredentials } from "./nats-credentials.ts";
 import { readPrivateJson, reserve, saveJob } from "./private-io.ts";
 import { selectSshJob, stageCommittedSource, statusSshRemoteTest, validateSshConfig, type SshConfig, type SshOptions, type SshOutcome, type SshStageOutcome } from "./ssh-client.ts";
 
@@ -68,14 +68,14 @@ export type BusPublishOutcome =
 export type BusRunOutcome = BusPublishOutcome | { status: "not_staged"; reason: "expired_job" | "receiver_failed" | "no_response" | "invalid_response" };
 
 /** Real SDK publisher: the Cortex runtime connects with a private snapshot of
- * the checked credential blocks to the first reachable configured server (the SDK link takes one URL),
+ * the checked credential blocks, kept until close, to the first reachable configured server (the SDK link takes one URL),
  * signs each envelope with the configured issuer key (never unsigned, never a
  * fallback) and acknowledges only from the configured stream and domain. */
 export const connectBusPublisher = (start: typeof startMyelinRuntime): BusPublisherFactory => async ({ bus, signer, credentials }) => {
  let failure: unknown;
- const directory = await mkdtemp(join(tmpdir(), "ranger-bus-creds-")), credsPath = join(directory, "transport.creds");
+ const directory = await mkdtemp(join(tmpdir(), "ranger-bus-creds-")), discard = () => rm(directory, { recursive: true, force: true });
  try {
-  await writeFile(credsPath, credentials.canonical, { flag: "wx", mode: 0o600 });
+  const credsPath = await writeNatsCredentialsSnapshot(directory, credentials);
   for (const url of bus.transport.servers) {
    const config = { agent: { name: "ranger", displayName: "Ranger" }, nats: { url, name: "ranger", subjects: [], credsPath } } as unknown as Parameters<typeof startMyelinRuntime>[0];
    try {
@@ -85,10 +85,11 @@ export const connectBusPublisher = (start: typeof startMyelinRuntime): BusPublis
     });
     const publishDurable = runtime.publishDurable?.bind(runtime);
     if (!runtime.enabled || !publishDurable) { await runtime.stop(); throw Error("Bus runtime cannot publish durably"); }
-    return { publishDurable, close: () => runtime.stop() };
+    return { publishDurable, close: () => runtime.stop().finally(discard) };
    } catch (error) { failure = error; }
   }
- } finally { await rm(directory, { recursive: true, force: true }); }
+ } catch (error) { failure = error; }
+ await discard();
  throw failure instanceof Error ? failure : Error("No bus server configured");
 };
 export const startBusPublisher = connectBusPublisher(startMyelinRuntime);

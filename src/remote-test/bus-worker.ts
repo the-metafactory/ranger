@@ -1,4 +1,4 @@
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { startMyelinRuntime, type EnvelopeHandlerContext, type MyelinRuntime, type MyelinSubscribePullOpts, type MyelinSubscriber, type Offering } from "@the-metafactory/cortex/bus";
 import { taskSubjectAndType } from "@the-metafactory/myelin/subjects";
@@ -13,7 +13,7 @@ import { BUS_WORKER_DIR, writeBusWorkerOwner } from "./bus-worker-workspace.ts";
 import { executeRemoteTest, validateExecutorConfig, type ExecutorConfig } from "./executor.ts";
 import { openJobLedger, ActiveRemoteTestJob, BusyRemoteTestExecutor, InterruptedRemoteTestJob, RemoteTestIdentityConflict, RevokedRemoteTestJob, type JobLedger } from "./job-ledger.ts";
 import { restoreSource, SourceError } from "./source.ts";
-import { bindsNatsAccount, InvalidNatsCredentials, readNatsCredentials, type NatsCredentials } from "./nats-credentials.ts";
+import { bindsNatsAccount, InvalidNatsCredentials, readNatsCredentials, writeNatsCredentialsSnapshot, type NatsCredentials } from "./nats-credentials.ts";
 import { readPrivateJson } from "./private-io.ts";
 
 export type BusWorkerDecision = { kind: "ack" } | { kind: "nak"; delayMs: number } | { kind: "term"; reason: string };
@@ -43,8 +43,7 @@ export const connectBusWorker = (start: typeof startMyelinRuntime) => async (bus
  try { credentials = await readNatsCredentials(bus.transport.credentialsFile); }
  catch (error) { if (error instanceof InvalidNatsCredentials) return refuse("credentials"); throw error; }
  if (!bindsNatsAccount(credentials, bus.target.account)) return refuse("account_binding");
- const snapshot = join(directory, "transport.creds");
- await writeFile(snapshot, credentials.canonical, { flag: "wx", mode: 0o600 });
+ const snapshot = await writeNatsCredentialsSnapshot(directory, credentials);
  for (const url of bus.transport.servers) {
   const runtime = await start({ agent: { name: "ranger", displayName: "Ranger" }, nats: { url, name: "ranger-ci-test", subjects: [], credsPath: snapshot } } as unknown as Parameters<typeof start>[0],
    { jetstreamDomain: bus.target.domain, signer: { principal: signer.issuer, rawSeedBytes: signer.seed }, signFailureMode: "drop", stack: bus.routing.stack, principal: bus.routing.principal });

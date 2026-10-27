@@ -31,6 +31,7 @@ const otherAccount = `A${"D".repeat(55)}`;
 const userJwt = (claims: Record<string, unknown>) => ["e30", Buffer.from(JSON.stringify(claims)).toString("base64url"), "sig"].join(".");
 const creds = (jwt: string) => `-----BEGIN NATS USER JWT-----\n${jwt}\n------END NATS USER JWT------\n\n-----BEGIN USER NKEY SEED-----\nSU${"A".repeat(56)}\n------END USER NKEY SEED------\n`;
 const accountCreds = (issuerAccount: string) => creds(userJwt({ iss: issuerAccount, sub: `U${"A".repeat(55)}`, nats: { type: "user" } }));
+const issuerAccountCreds = (issuerAccount: string) => creds(userJwt({ iss: `O${"A".repeat(55)}`, sub: `U${"A".repeat(55)}`, nats: { type: "user", issuer_account: issuerAccount } }));
 const receipt = { version: 1 as const, identity: job, executorId: "fixture", status: "passed" as const, completedAt: now - 1000, exitCode: 0 };
 
 function keyPair() {
@@ -99,12 +100,14 @@ describe("opt-in bus producer", () => {
  test("the SDK publisher falls through unreachable servers to the next configured one", async () => {
   const tried: string[] = [];
   const stopped: string[] = [];
-  const snapshots: string[] = [];
+  const snapshots: string[] = [], paths: string[] = [];
+  const exists = (file: string) => stat(file).then(() => true, () => false);
   const start = (async (config: { nats: { url: string; credsPath: string } }) => {
    const url = config.nats.url;
    tried.push(url);
    expect(config.nats.credsPath).not.toBe(path("private.creds"));
    snapshots.push(await readFile(config.nats.credsPath, "utf8"));
+   paths.push(config.nats.credsPath);
    if (url.includes("down")) throw new Error("connection refused");
    return { enabled: true, publishDurable: async () => ({}), stop: async () => { stopped.push(url); } };
   }) as unknown as Parameters<typeof connectBusPublisher>[0];
@@ -112,11 +115,14 @@ describe("opt-in bus producer", () => {
   const credentials = { account, canonical: accountCreds(account) };
   const publisher = await connectBusPublisher(start)({ bus, signer: { issuer, seed: new Uint8Array(32) }, credentials });
   expect(tried).toEqual(["tls://down-1.example.invalid:4222", "tls://down-2.example.invalid:4222", "tls://up.example.invalid:4222"]);
+  expect(await exists(paths[2])).toBe(true);
   await publisher.close?.();
+  expect(await exists(paths[2])).toBe(false);
   expect(stopped).toEqual(["tls://up.example.invalid:4222"]);
   expect(snapshots).toEqual(Array(3).fill(credentials.canonical));
   const allDown = validateBusConfig({ ...busConfig, transport: { ...busConfig.transport, servers: ["tls://down-a.example.invalid:4222", "tls://down-b.example.invalid:4222"] } });
   await expect(connectBusPublisher(start)({ bus: allDown, signer: { issuer, seed: new Uint8Array(32) }, credentials })).rejects.toThrow("connection refused");
+  expect(await exists(paths.at(-1)!)).toBe(false);
  });
 
  test("saves the exact job and stable unsigned envelope, then publishes durably once and reports submitted only", async () => {
@@ -229,7 +235,7 @@ describe("opt-in bus producer", () => {
   });
 
   test("bus-run refuses credentials of another account before staging, saving or publishing", async () => {
-   for (const text of [accountCreds(otherAccount), creds(userJwt({ iss: `O${"A".repeat(55)}`, sub: `U${"A".repeat(55)}`, nats: { type: "user", issuer_account: otherAccount } }))]) {
+   for (const text of [accountCreds(otherAccount), issuerAccountCreds(otherAccount)]) {
     await writeFile(path("private.creds"), text, { mode: 0o600 });
     const error = await runBusCommand(options(), injected).then(() => undefined, (e: unknown) => e) as BusProducerRefusal;
     expect(error).toBeInstanceOf(BusProducerRefusal);
@@ -241,7 +247,7 @@ describe("opt-in bus producer", () => {
   });
 
   test("an issuer account claim that names the configured account is accepted", async () => {
-   await writeFile(path("private.creds"), creds(userJwt({ iss: `O${"A".repeat(55)}`, sub: `U${"A".repeat(55)}`, nats: { type: "user", issuer_account: account } })), { mode: 0o600 });
+   await writeFile(path("private.creds"), issuerAccountCreds(account), { mode: 0o600 });
    expect(await runBusCommand(options(), injected)).toMatchObject({ status: "submitted" });
   });
 
