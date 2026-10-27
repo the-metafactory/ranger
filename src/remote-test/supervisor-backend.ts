@@ -7,7 +7,8 @@ import { safeGit } from "../git-ops.ts";
 import type { RangerMapConfig } from "../config.ts";
 import { privateOperatorPath } from "./baseline.ts";
 import { validateRemoteTestReceipt, type RemoteTestJob, type RemoteTestReceipt } from "./contract.ts";
-import { readPrivateJson, runSshCommand, statusSshCommand } from "./ssh-cli.ts";
+import { readPrivateJson } from "./private-io.ts";
+import { runSshCommand, statusSshCommand } from "./ssh-cli.ts";
 import { selectSshJob, validateSshConfig, type SshOptions } from "./ssh-client.ts";
 
 export interface TestRequest {

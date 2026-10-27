@@ -15,7 +15,7 @@ import { privateOperatorPath } from "./baseline.ts";
 import { validateBusConfig } from "./bus-contract.ts";
 import { runBusCommand, type BusProducerInjected, type BusRunOutcome } from "./bus-producer.ts";
 import { type ProfileManifest, type RemoteTestJob } from "./contract.ts";
-import { readPrivateJson, saveJob } from "./ssh-cli.ts";
+import { readPrivateJson, saveJob } from "./private-io.ts";
 import { validateSshConfig } from "./ssh-client.ts";
 
 const repositoryName = /^[A-Za-z0-9_-][A-Za-z0-9._-]*\/[A-Za-z0-9_-][A-Za-z0-9._-]*$/;
@@ -27,12 +27,19 @@ export type PrScanCode = "submitted" | "uncertain" | "refused" | "not_staged" | 
 export const PR_SCAN_FAILURES: ReadonlySet<PrScanCode> = new Set(["uncertain", "refused", "not_staged", "submission_failed", "fetch_failed", "list_failed"]);
 export interface PrScanEvent { repo: string; pr: number | null; sha: string; profileId: string | null; code: PrScanCode }
 
+export const PR_LEDGER_VERSION = 1;
+
 export class PrSubmissionLedger {
  constructor(private db: Database, private now: () => number = Date.now) {
-  db.run(`PRAGMA busy_timeout=5000; PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;
-   CREATE TABLE IF NOT EXISTS scopes (repo TEXT NOT NULL, pr INTEGER NOT NULL, profile TEXT NOT NULL, correlation TEXT NOT NULL, generation INTEGER NOT NULL, PRIMARY KEY(repo,pr,profile));
-   CREATE TABLE IF NOT EXISTS requests (repo TEXT NOT NULL, sha TEXT NOT NULL, profile TEXT NOT NULL, pr INTEGER NOT NULL, request TEXT NOT NULL, state TEXT NOT NULL, superseded INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(repo,sha,profile));
-   CREATE TABLE IF NOT EXISTS journal (at INTEGER NOT NULL, repo TEXT NOT NULL, pr INTEGER, sha TEXT NOT NULL, profile TEXT, code TEXT NOT NULL);`);
+  db.run("PRAGMA busy_timeout=5000; PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;");
+  db.transaction(() => {
+   const { user_version: version } = db.query("PRAGMA user_version").get() as { user_version: number };
+   if (version !== 0 && version !== PR_LEDGER_VERSION) throw Error(`Unsupported PR submission ledger version ${version}; this Ranger reads version ${PR_LEDGER_VERSION}`);
+   db.run(`CREATE TABLE IF NOT EXISTS scopes (repo TEXT NOT NULL, pr INTEGER NOT NULL, profile TEXT NOT NULL, correlation TEXT NOT NULL, generation INTEGER NOT NULL, PRIMARY KEY(repo,pr,profile));
+    CREATE TABLE IF NOT EXISTS requests (repo TEXT NOT NULL, sha TEXT NOT NULL, profile TEXT NOT NULL, pr INTEGER NOT NULL, request TEXT NOT NULL, state TEXT NOT NULL, superseded INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(repo,sha,profile));
+    CREATE TABLE IF NOT EXISTS journal (at INTEGER NOT NULL, repo TEXT NOT NULL, pr INTEGER, sha TEXT NOT NULL, profile TEXT, code TEXT NOT NULL);
+    PRAGMA user_version=${PR_LEDGER_VERSION};`);
+  }).immediate();
  }
  close() { this.db.close(); }
  has(repo: string, sha: string, profile: string): boolean {
@@ -94,7 +101,9 @@ export async function openPrSubmissionLedger(root: string, now: () => number = D
   if (!info.isFile() || info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0) throw Error("Unsafe PR submission ledger");
   await file.sync();
  } finally { await file.close(); }
- const ledger = new PrSubmissionLedger(new Database(path, { strict: true }), now);
+ const db = new Database(path, { strict: true });
+ let ledger: PrSubmissionLedger;
+ try { ledger = new PrSubmissionLedger(db, now); } catch (e) { db.close(); throw e; }
  await syncDirectory(root);
  return ledger;
 }
