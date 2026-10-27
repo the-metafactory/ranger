@@ -1,3 +1,6 @@
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { MyelinDurablePublishError, startMyelinRuntime } from "@the-metafactory/cortex/bus";
 import { createEnvelope, validateEnvelope, type MyelinEnvelope } from "@the-metafactory/myelin";
 import { subjectFor, taskSubjectAndType } from "@the-metafactory/myelin/subjects";
@@ -7,6 +10,7 @@ import { BUS_TEST_CAPABILITY } from "./bus-admission.ts";
 import { authorizeBusProducer, BUS_LIMITS, validateBusConfig, validateBusRequest, type BusConfig } from "./bus-contract.ts";
 import type { DurablePublisher } from "./bus-outbox.ts";
 import { Sha256Schema, type RemoteTestJob } from "./contract.ts";
+import { bindsNatsAccount, readNatsCredentials, type NatsCredentials } from "./nats-credentials.ts";
 import { readPrivateJson, reserve, saveJob } from "./private-io.ts";
 import { selectSshJob, stageCommittedSource, statusSshRemoteTest, validateSshConfig, type SshConfig, type SshOptions, type SshOutcome, type SshStageOutcome } from "./ssh-client.ts";
 
@@ -44,7 +48,7 @@ export interface BusSigner { readonly issuer: string; readonly seed: Uint8Array 
 export type BusRequestRecord = Omit<z.infer<typeof RecordSchema>, "job" | "envelope"> & { job: RemoteTestJob; envelope: MyelinEnvelope };
 
 export interface BusPublisher extends DurablePublisher { close?(): Promise<void> }
-export type BusPublisherFactory = (input: { bus: BusConfig; signer: BusSigner }) => Promise<BusPublisher>;
+export type BusPublisherFactory = (input: { bus: BusConfig; signer: BusSigner; credentials: NatsCredentials }) => Promise<BusPublisher>;
 export type BusStageFunction = (
  input: { config: unknown; request: Record<string, unknown>; worktree: string; stagingRoot: string; expectedCommit?: string },
  options: Omit<SshOptions, "receiptStore">,
@@ -63,25 +67,28 @@ export type BusPublishOutcome =
  | { status: "uncertain"; eventId: string; reason: "timeout" | "jetstream-error" | "stream-mismatch" | "domain-mismatch" | "ack_mismatch" | "publish_failed" };
 export type BusRunOutcome = BusPublishOutcome | { status: "not_staged"; reason: "expired_job" | "receiver_failed" | "no_response" | "invalid_response" };
 
-/** Real SDK publisher: the Cortex runtime connects with the operator credentials
- * file to the first reachable configured server (the SDK link takes one URL),
+/** Real SDK publisher: the Cortex runtime connects with a private snapshot of
+ * the checked credential blocks to the first reachable configured server (the SDK link takes one URL),
  * signs each envelope with the configured issuer key (never unsigned, never a
  * fallback) and acknowledges only from the configured stream and domain. */
-export const connectBusPublisher = (start: typeof startMyelinRuntime): BusPublisherFactory => async ({ bus, signer }) => {
+export const connectBusPublisher = (start: typeof startMyelinRuntime): BusPublisherFactory => async ({ bus, signer, credentials }) => {
  let failure: unknown;
- for (const url of bus.transport.servers) {
-  const config = { agent: { name: "ranger", displayName: "Ranger" },
-   nats: { url, name: "ranger", subjects: [], credsPath: bus.transport.credentialsFile } } as unknown as Parameters<typeof startMyelinRuntime>[0];
-  try {
-   const runtime = await start(config, {
-    jetstreamDomain: bus.target.domain, signer: { principal: signer.issuer, rawSeedBytes: signer.seed },
-    signFailureMode: "drop", stack: bus.routing.stack, principal: bus.routing.principal,
-   });
-   const publishDurable = runtime.publishDurable?.bind(runtime);
-   if (!runtime.enabled || !publishDurable) { await runtime.stop(); throw Error("Bus runtime cannot publish durably"); }
-   return { publishDurable, close: () => runtime.stop() };
-  } catch (error) { failure = error; }
- }
+ const directory = await mkdtemp(join(tmpdir(), "ranger-bus-creds-")), credsPath = join(directory, "transport.creds");
+ try {
+  await writeFile(credsPath, credentials.canonical, { flag: "wx", mode: 0o600 });
+  for (const url of bus.transport.servers) {
+   const config = { agent: { name: "ranger", displayName: "Ranger" }, nats: { url, name: "ranger", subjects: [], credsPath } } as unknown as Parameters<typeof startMyelinRuntime>[0];
+   try {
+    const runtime = await start(config, {
+     jetstreamDomain: bus.target.domain, signer: { principal: signer.issuer, rawSeedBytes: signer.seed },
+     signFailureMode: "drop", stack: bus.routing.stack, principal: bus.routing.principal,
+    });
+    const publishDurable = runtime.publishDurable?.bind(runtime);
+    if (!runtime.enabled || !publishDurable) { await runtime.stop(); throw Error("Bus runtime cannot publish durably"); }
+    return { publishDurable, close: () => runtime.stop() };
+   } catch (error) { failure = error; }
+  }
+ } finally { await rm(directory, { recursive: true, force: true }); }
  throw failure instanceof Error ? failure : Error("No bus server configured");
 };
 export const startBusPublisher = connectBusPublisher(startMyelinRuntime);
@@ -89,11 +96,16 @@ export const startBusPublisher = connectBusPublisher(startMyelinRuntime);
 const clock = (injected: BusProducerInjected) => injected.now ?? Date.now;
 const jsonEqual = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
 
-async function loadConfigs(path: string): Promise<{ bus: BusConfig; ssh: SshConfig }> {
+async function loadConfigs(path: string): Promise<{ bus: BusConfig; ssh: SshConfig; credentials: NatsCredentials }> {
+ let bus: BusConfig, ssh: SshConfig, credentials: NatsCredentials;
  try {
-  const bus = validateBusConfig(await readPrivateJson(path));
-  return { bus, ssh: validateSshConfig(await readPrivateJson(bus.ssh.configFile)) };
+  bus = validateBusConfig(await readPrivateJson(path));
+  ssh = validateSshConfig(await readPrivateJson(bus.ssh.configFile));
  } catch { throw new BusProducerRefusal("config", "Bus or SSH configuration is missing, unsafe or invalid"); }
+ try { credentials = await readNatsCredentials(bus.transport.credentialsFile); }
+ catch { throw new BusProducerRefusal("config", "NATS credentials are missing, unsafe or invalid"); }
+ if (!bindsNatsAccount(credentials, bus.target.account)) throw new BusProducerRefusal("config", "NATS credentials are not for the configured target account");
+ return { bus, ssh, credentials };
 }
 
 async function loadSigner(path: string, bus: BusConfig): Promise<BusSigner> {
@@ -157,11 +169,11 @@ function assertStaged(ssh: SshConfig, request: Record<string, unknown>, staged: 
  } catch { throw new BusProducerRefusal("binding", "Staged source does not bind this exact request"); }
 }
 
-async function publishRecord(record: BusRequestRecord, bus: BusConfig, signer: BusSigner, injected: BusProducerInjected): Promise<BusPublishOutcome> {
+async function publishRecord(record: BusRequestRecord, bus: BusConfig, signer: BusSigner, credentials: NatsCredentials, injected: BusProducerInjected): Promise<BusPublishOutcome> {
  const eventId = record.envelope.id;
  if (clock(injected)() >= record.job.deadline) return { status: "refused", eventId, reason: "expired_request" };
  let publisher: BusPublisher;
- try { publisher = await (injected.publisher ?? startBusPublisher)({ bus, signer }); }
+ try { publisher = await (injected.publisher ?? startBusPublisher)({ bus, signer, credentials }); }
  catch { return { status: "refused", eventId, reason: "publisher_unavailable" }; }
  try {
   const ack = await publisher.publishDurable(record.envelope, {
@@ -186,7 +198,7 @@ export interface RunBusCommand { config: string; request: string; worktree: stri
  * the single durable publish. Nothing runs locally and nothing is resubmitted:
  * a published request is only "submitted", never a test result. */
 export async function runBusCommand(options: RunBusCommand, injected: BusProducerInjected = {}): Promise<BusRunOutcome> {
- const { bus, ssh } = await loadConfigs(options.config);
+ const { bus, ssh, credentials } = await loadConfigs(options.config);
  const signer = await loadSigner(options.signer, bus);
  const request = await readPrivateJson(options.request) as Record<string, unknown>;
  if (SOURCE_FIELDS.some(field => Object.hasOwn(request, field))) throw new BusProducerRefusal("request", "Source bindings must be derived from staging");
@@ -207,7 +219,7 @@ export async function runBusCommand(options: RunBusCommand, injected: BusProduce
   const { envelope, subject } = requestEnvelope(bus, signer.issuer, job, staged.source);
   const record = { version: 1 as const, issuer: signer.issuer, subject, executorId: ssh.executorId, stream: bus.streams.request.stream, domain: bus.target.domain, job, source: staged.source, envelope };
   await saveJob(output.destination, record);
-  return await publishRecord(record, bus, signer, injected);
+  return await publishRecord(record, bus, signer, credentials, injected);
  } finally { await output.release(); }
 }
 
@@ -215,13 +227,13 @@ export async function runBusCommand(options: RunBusCommand, injected: BusProduce
  * and message ID are republished. Never restages, never snapshots a new HEAD,
  * never refreshes an expired request. */
 export async function retryBusCommand(options: { config: string; request: string; signer: string }, injected: BusProducerInjected = {}): Promise<BusPublishOutcome> {
- const { bus, ssh } = await loadConfigs(options.config);
+ const { bus, ssh, credentials } = await loadConfigs(options.config);
  const signer = await loadSigner(options.signer, bus);
  let raw: unknown;
  try { raw = await readPrivateJson(options.request); } catch { throw new BusProducerRefusal("record", "Saved bus request is missing or unsafe"); }
  const record = checkRecord(bus, ssh, raw);
  if (record.issuer !== signer.issuer) throw new BusProducerRefusal("signer", "Signer is not the issuer of the saved request");
- return publishRecord(record, bus, signer, injected);
+ return publishRecord(record, bus, signer, credentials, injected);
 }
 
 /** Receipt-only lookup over the existing SSH status path with the saved exact

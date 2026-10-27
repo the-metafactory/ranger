@@ -1,5 +1,4 @@
-import { constants } from "node:fs";
-import { mkdir, open, rm, writeFile } from "node:fs/promises";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { startMyelinRuntime, type EnvelopeHandlerContext, type MyelinRuntime, type MyelinSubscribePullOpts, type MyelinSubscriber, type Offering } from "@the-metafactory/cortex/bus";
 import { taskSubjectAndType } from "@the-metafactory/myelin/subjects";
@@ -14,6 +13,7 @@ import { BUS_WORKER_DIR, writeBusWorkerOwner } from "./bus-worker-workspace.ts";
 import { executeRemoteTest, validateExecutorConfig, type ExecutorConfig } from "./executor.ts";
 import { openJobLedger, ActiveRemoteTestJob, BusyRemoteTestExecutor, InterruptedRemoteTestJob, RemoteTestIdentityConflict, RevokedRemoteTestJob, type JobLedger } from "./job-ledger.ts";
 import { restoreSource, SourceError } from "./source.ts";
+import { bindsNatsAccount, InvalidNatsCredentials, readNatsCredentials, type NatsCredentials } from "./nats-credentials.ts";
 import { readPrivateJson } from "./private-io.ts";
 
 export type BusWorkerDecision = { kind: "ack" } | { kind: "nak"; delayMs: number } | { kind: "term"; reason: string };
@@ -36,31 +36,15 @@ export class BusWorkerReadinessRefusal extends Error {
 }
 const refuse = (code: string): never => { throw new BusWorkerReadinessRefusal(code); };
 const SIGNER_DID = /^did:[a-z0-9]+(?::[A-Za-z0-9._-]+)+$/;
-const CredentialsSchema = z.object({ iss: z.string(), sub: z.string().regex(/^U[A-Z2-7]{55}$/), nats: z.object({ type: z.literal("user"), issuer_account: z.string().optional() }).passthrough() }).passthrough();
 const SignerSchema = z.object({ version: z.literal(1), issuer: z.string().regex(SIGNER_DID), seed: z.string().regex(/^[A-Za-z0-9+/]{43}=$/) }).strict();
 
 export const connectBusWorker = (start: typeof startMyelinRuntime) => async (bus: BusConfig, signer: BusSigner, directory: string): Promise<BusWorkerTransport> => {
- const path = await privateOperatorPath(bus.transport.credentialsFile, true);
- const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
- let bytes: Buffer;
- try {
-  const info = await file.stat();
-  if (!info.isFile() || info.size > 65_536 || info.nlink !== 1) return refuse("credentials");
-  bytes = await file.readFile();
- } finally { await file.close(); }
- let account: string, canonical: string;
- try {
-  const jwt = /-----BEGIN NATS USER JWT-----\s+([A-Za-z0-9_.-]+)\s+------END NATS USER JWT------/.exec(bytes.toString("utf8"))?.[1];
-  if (jwt?.split(".").length !== 3) return refuse("credentials");
-  const claims = CredentialsSchema.parse(JSON.parse(Buffer.from(jwt.split(".")[1] ?? "", "base64url").toString("utf8")));
-  account = claims.nats.issuer_account ?? claims.iss;
-  const seed = /-----BEGIN USER NKEY SEED-----\s+(SU[A-Z2-7]{56})\s+------END USER NKEY SEED------/.exec(bytes.toString("utf8"))?.[1];
-  if (!seed) return refuse("credentials");
-  canonical = `-----BEGIN NATS USER JWT-----\n${jwt}\n------END NATS USER JWT------\n\n-----BEGIN USER NKEY SEED-----\n${seed}\n------END USER NKEY SEED------\n`;
- } catch { return refuse("credentials"); }
- if (!/^A[A-Z2-7]{55}$/.test(account) || account !== bus.target.account) return refuse("account_binding");
+ let credentials: NatsCredentials;
+ try { credentials = await readNatsCredentials(bus.transport.credentialsFile); }
+ catch (error) { if (error instanceof InvalidNatsCredentials) return refuse("credentials"); throw error; }
+ if (!bindsNatsAccount(credentials, bus.target.account)) return refuse("account_binding");
  const snapshot = join(directory, "transport.creds");
- await writeFile(snapshot, canonical, { flag: "wx", mode: 0o600 });
+ await writeFile(snapshot, credentials.canonical, { flag: "wx", mode: 0o600 });
  for (const url of bus.transport.servers) {
   const runtime = await start({ agent: { name: "ranger", displayName: "Ranger" }, nats: { url, name: "ranger-ci-test", subjects: [], credsPath: snapshot } } as unknown as Parameters<typeof start>[0],
    { jetstreamDomain: bus.target.domain, signer: { principal: signer.issuer, rawSeedBytes: signer.seed }, signFailureMode: "drop", stack: bus.routing.stack, principal: bus.routing.principal });

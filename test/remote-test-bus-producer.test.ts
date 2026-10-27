@@ -26,6 +26,11 @@ const request = { version: 1 as const, jobId: id, correlationId: id, repositoryI
 const source = { commitDigest: "a".repeat(40), treeDigest: "b".repeat(40), bundleDigest: sha("bundle") };
 const staged = { bundleDigest: source.bundleDigest, bundleBytes: 4096 };
 const job = { ...request, ...source };
+const account = `A${"C".repeat(55)}`;
+const otherAccount = `A${"D".repeat(55)}`;
+const userJwt = (claims: Record<string, unknown>) => ["e30", Buffer.from(JSON.stringify(claims)).toString("base64url"), "sig"].join(".");
+const creds = (jwt: string) => `-----BEGIN NATS USER JWT-----\n${jwt}\n------END NATS USER JWT------\n\n-----BEGIN USER NKEY SEED-----\nSU${"A".repeat(56)}\n------END USER NKEY SEED------\n`;
+const accountCreds = (issuerAccount: string) => creds(userJwt({ iss: issuerAccount, sub: `U${"A".repeat(55)}`, nats: { type: "user" } }));
 const receipt = { version: 1 as const, identity: job, executorId: "fixture", status: "passed" as const, completedAt: now - 1000, exitCode: 0 };
 
 function keyPair() {
@@ -49,13 +54,13 @@ describe("opt-in bus producer", () => {
  const writeJson = (name: string, value: unknown) => writeFile(path(name), JSON.stringify(value), { mode: 0o600 });
  const options = (extra: Record<string, string> = {}) => ({ config: path("bus.json"), signer: path("signer.json"), request: path("request.json"),
   worktree: path("worktree"), stagingRoot: root, requestOutput: path("saved-request.json"), ...extra });
- const savedFiles = async () => (await readdir(root)).filter(name => name !== "bus.json" && name !== "ssh.json" && name !== "signer.json" && name !== "request.json" && name !== "registry.json");
+ const savedFiles = async () => (await readdir(root)).filter(name => name !== "bus.json" && name !== "ssh.json" && name !== "signer.json" && name !== "request.json" && name !== "registry.json" && name !== "private.creds");
  const saved = async () => JSON.parse(await readFile(path("saved-request.json"), "utf8"));
 
  beforeEach(async () => {
   root = await realpath(await mkdtemp(join(tmpdir(), "ranger-bus-producer-")));
   key = keyPair();
-  busConfig = { version: 1, target: { domain: "private-domain", account: "private-account" },
+  busConfig = { version: 1, target: { domain: "private-domain", account },
    routing: { classification: "local", principal: "example", stack: "private" },
    streams: { request: { stream: "CI_REQUESTS", durable: "CI_EXECUTOR" }, result: { stream: "CI_RESULTS" } },
    transport: { servers: ["tls://bus.example.invalid:4222"], credentialsFile: path("private.creds") },
@@ -67,6 +72,7 @@ describe("opt-in bus producer", () => {
   await writeJson("signer.json", { version: 1, issuer, seed: key.seed });
   await writeJson("registry.json", { version: 2, identities: [key.identity], trusted_hubs: [] });
   await writeJson("request.json", request);
+  await writeFile(path("private.creds"), accountCreds(account), { mode: 0o600 });
   calls = { stage: 0, publish: [], closed: 0, ssh: [] };
   stageOutcome = { status: "staged", job, executorId: "fixture", source: staged };
   publishOutcome = async () => ({ stream: "CI_REQUESTS", seq: 7, duplicate: false, domain: "private-domain" });
@@ -93,19 +99,24 @@ describe("opt-in bus producer", () => {
  test("the SDK publisher falls through unreachable servers to the next configured one", async () => {
   const tried: string[] = [];
   const stopped: string[] = [];
-  const start = (async (config: { nats: { url: string } }) => {
+  const snapshots: string[] = [];
+  const start = (async (config: { nats: { url: string; credsPath: string } }) => {
    const url = config.nats.url;
    tried.push(url);
+   expect(config.nats.credsPath).not.toBe(path("private.creds"));
+   snapshots.push(await readFile(config.nats.credsPath, "utf8"));
    if (url.includes("down")) throw new Error("connection refused");
    return { enabled: true, publishDurable: async () => ({}), stop: async () => { stopped.push(url); } };
   }) as unknown as Parameters<typeof connectBusPublisher>[0];
   const bus = validateBusConfig({ ...busConfig, transport: { ...busConfig.transport, servers: ["tls://down-1.example.invalid:4222", "tls://down-2.example.invalid:4222", "tls://up.example.invalid:4222", "tls://never.example.invalid:4222"] } });
-  const publisher = await connectBusPublisher(start)({ bus, signer: { issuer, seed: new Uint8Array(32) } });
+  const credentials = { account, canonical: accountCreds(account) };
+  const publisher = await connectBusPublisher(start)({ bus, signer: { issuer, seed: new Uint8Array(32) }, credentials });
   expect(tried).toEqual(["tls://down-1.example.invalid:4222", "tls://down-2.example.invalid:4222", "tls://up.example.invalid:4222"]);
   await publisher.close?.();
   expect(stopped).toEqual(["tls://up.example.invalid:4222"]);
+  expect(snapshots).toEqual(Array(3).fill(credentials.canonical));
   const allDown = validateBusConfig({ ...busConfig, transport: { ...busConfig.transport, servers: ["tls://down-a.example.invalid:4222", "tls://down-b.example.invalid:4222"] } });
-  await expect(connectBusPublisher(start)({ bus: allDown, signer: { issuer, seed: new Uint8Array(32) } })).rejects.toThrow("connection refused");
+  await expect(connectBusPublisher(start)({ bus: allDown, signer: { issuer, seed: new Uint8Array(32) }, credentials })).rejects.toThrow("connection refused");
  });
 
  test("saves the exact job and stable unsigned envelope, then publishes durably once and reports submitted only", async () => {
@@ -215,6 +226,50 @@ describe("opt-in bus producer", () => {
    await refusal(runBusCommand(options(), injected), "signer");
    expect(calls.stage).toBe(0);
    expect(calls.publish).toEqual([]);
+  });
+
+  test("bus-run refuses credentials of another account before staging, saving or publishing", async () => {
+   for (const text of [accountCreds(otherAccount), creds(userJwt({ iss: `O${"A".repeat(55)}`, sub: `U${"A".repeat(55)}`, nats: { type: "user", issuer_account: otherAccount } }))]) {
+    await writeFile(path("private.creds"), text, { mode: 0o600 });
+    const error = await runBusCommand(options(), injected).then(() => undefined, (e: unknown) => e) as BusProducerRefusal;
+    expect(error).toBeInstanceOf(BusProducerRefusal);
+    expect(error).toMatchObject({ stage: "config", message: "NATS credentials are not for the configured target account" });
+   }
+   expect(calls.stage).toBe(0);
+   expect(calls.publish).toEqual([]);
+   expect(await savedFiles()).toEqual([]);
+  });
+
+  test("an issuer account claim that names the configured account is accepted", async () => {
+   await writeFile(path("private.creds"), creds(userJwt({ iss: `O${"A".repeat(55)}`, sub: `U${"A".repeat(55)}`, nats: { type: "user", issuer_account: account } })), { mode: 0o600 });
+   expect(await runBusCommand(options(), injected)).toMatchObject({ status: "submitted" });
+  });
+
+  test("bus-retry and bus-status refuse a saved request once the credentials name another account", async () => {
+   await runBusCommand(options(), injected);
+   await writeFile(path("private.creds"), accountCreds(otherAccount), { mode: 0o600 });
+   await refusal(retryBusCommand({ config: path("bus.json"), signer: path("signer.json"), request: path("saved-request.json") }, injected), "config");
+   await refusal(statusBusCommand({ config: path("bus.json"), request: path("saved-request.json"), output: path("receipt.json") }, injected), "config");
+   expect(calls.publish).toHaveLength(1);
+   expect(calls.ssh).toEqual([]);
+   expect(await savedFiles()).toEqual(["saved-request.json"]);
+  });
+
+  test.each([
+   ["missing", async () => { await rm(path("private.creds")); }],
+   ["group-writable", async () => { await chmod(path("private.creds"), 0o620); }],
+   ["not a creds file", async () => { await writeFile(path("private.creds"), "secret-token-material\n", { mode: 0o600 }); }],
+   ["a JWT that is not JSON", async () => { await writeFile(path("private.creds"), creds("e30.c2VjcmV0LXRva2Vu.sig"), { mode: 0o600 }); }],
+   ["a JWT that is not a user", async () => { await writeFile(path("private.creds"), creds(userJwt({ iss: account, sub: `U${"A".repeat(55)}`, nats: { type: "account" } })), { mode: 0o600 }); }],
+   ["no seed", async () => { await writeFile(path("private.creds"), accountCreds(account).replace(/SU[A-Z]+/, "secret-seed"), { mode: 0o600 }); }],
+  ])("%s credentials are refused without echoing them", async (_name, corrupt) => {
+   await corrupt();
+   const error = await runBusCommand(options(), injected).then(() => undefined, (e: unknown) => e) as BusProducerRefusal;
+   expect(error).toBeInstanceOf(BusProducerRefusal);
+   expect(error).toMatchObject({ stage: "config", message: "NATS credentials are missing, unsafe or invalid" });
+   expect(String(error.stack)).not.toContain("secret");
+   expect(calls.stage).toBe(0);
+   expect(await savedFiles()).toEqual([]);
   });
 
   test("an existing output path is never overwritten", async () => {
