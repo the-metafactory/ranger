@@ -49,12 +49,13 @@ async function fixture() {
    const a = l.admit(j); if (a.kind === "busy") throw new BusyRemoteTestExecutor(); if (a.kind !== "admitted") throw Error(a.kind);
    const cancel = () => { l.cancel(j); }; options?.signal?.addEventListener("abort", cancel, { once: true });
    if (options?.signal?.aborted) cancel();
+   const startedAt = Date.now();
    try {
     await beforeExecution(options?.signal);
     const allowed = l.allowed(j, a.token);
     if (allowed) l.launch(j, a.token);
     const r: RemoteTestReceipt = { version: 1, identity: j, executorId: "fixture", status: allowed ? "passed" : "cancelled", exitCode: allowed ? 0 : null, completedAt: Date.now() };
-    const stored = await persistExecution(join(jobsRoot, ".artifacts"), r, { startedAt: Date.now(), log: Buffer.from("log"), truncated: false, outputState: "captured", resources: { state: "skipped", cpuTimeMicros: null, peakMemoryBytes: null } });
+    const stored = await persistExecution(join(jobsRoot, ".artifacts"), r, { startedAt, log: Buffer.from("log"), truncated: false, outputState: "captured", resources: { state: "skipped", cpuTimeMicros: null, peakMemoryBytes: null } });
     return l.complete(j, a.token, stored);
    } finally { options?.signal?.removeEventListener("abort", cancel); }
   } finally { l.close(); }
