@@ -17,7 +17,7 @@ export type DiagnosticFailure = z.infer<typeof failureSchema>;
 // `stage` in a failure is the receiver phase that failed (e.g. "upload").
 export const ReceiverDiagnosticSchema = z.object({
  version: z.literal(1), id: z.string().uuid(), time: z.number().int().positive().safe(),
- operation: z.enum(["submit", "status", "stage"]).nullable(),
+ operation: z.enum(["submit", "status", "stage", "receipt-list", "receipt-get"]).nullable(),
  job: z.object({ jobId: z.string().uuid(), generation: z.number().int().positive().safe() }).strict().nullable(),
  primary: failureSchema, cleanup: failureSchema.optional(),
 }).strict();

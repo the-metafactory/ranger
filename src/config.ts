@@ -425,12 +425,7 @@ const CheckReporterSchema = z.object({
  privateKeyFile: AbsolutePath,
  installations: z.record(z.string().regex(/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/, "a GitHub owner login"), z.number().int().positive())
   .refine(installations => Object.keys(installations).length > 0, "at least one installation"),
- outbox: z.object({
-  busConfigFile: AbsolutePath,
-  root: AbsolutePath,
-  jobsRoot: AbsolutePath,
-  executorId: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/),
- }).strict(),
+ sshConfigFile: AbsolutePath,
  stateRoot: AbsolutePath,
 }).strict();
 

@@ -17,6 +17,7 @@ export const CONTAINER_BOOTSTRAP_FLAGS = ["--config=/dev/null", "--no-env-file"]
 const ConfigSchema = z.object({
  executorId: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/),
  jobsRoot: z.string().refine(s => isAbsolute(s) && !/[\0,:\n]/.test(s) && !s.split("/").includes("..")),
+ outboxRoot: z.string().refine(s => isAbsolute(s) && !/[\0,:\n]/.test(s) && !s.split("/").includes("..")).optional(),
  artifacts: ArtifactPolicySchema.default({}),
  profiles: z.array(z.object({
   profile: z.unknown().transform(validateProfileManifest),

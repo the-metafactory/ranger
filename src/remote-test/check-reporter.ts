@@ -8,9 +8,9 @@ import { appChecksClient, openPullHeadsContaining, type AppChecks, type CheckCon
 import { resolveWriteToken } from "../identity.ts";
 import { privateDirectory, syncDirectory } from "./artifacts.ts";
 import { isOperatorPrivate, privateOperatorPath } from "./baseline.ts";
-import { validateBusConfig } from "./bus-contract.ts";
-import { openBusOutbox, type BusOutbox, type QueuedReceipt } from "./bus-outbox.ts";
+import type { QueuedReceipt } from "./bus-outbox.ts";
 import { validateJobIdentity, validateRemoteTestReceipt, type RemoteTestReceipt, type RemoteTestStatus } from "./contract.ts";
+import { getSshReceipt, listSshReceipts, validateSshConfig, type SshOptions } from "./ssh-client.ts";
 
 export const CHECK_NAME_PREFIX = "clawbox/";
 export const checkNameFor = (profileId: string): string => `${CHECK_NAME_PREFIX}${profileId}`;
@@ -34,7 +34,7 @@ export class UnreadableReceipt extends Error {
 }
 
 export interface ReceiptReader {
- jobIds(): string[];
+ jobIds(): Promise<string[]>;
  read(jobId: string): Promise<QueuedReceipt | null>;
  authorized(jobId: string): Promise<boolean>;
 }
@@ -165,7 +165,7 @@ function checkWrite(receipt: RemoteTestReceipt, digest: string, superseded: bool
 }
 
 /**
- * Turn one terminal receipt in the outbox into one check run on the receipt's own commit.
+ * Turn one terminal receipt recorded on the executor host into one check run on the receipt's own commit.
  * Every identity, digest and readability check fails closed into a locally recorded
  * refusal that writes nothing to GitHub. A GitHub, token or storage failure throws and
  * leaves the job unacknowledged, so a later run replays it. A second delivery finds the
@@ -223,10 +223,10 @@ export interface ReportSummary {
  failed: { jobId: string; message: string }[];
 }
 
-/** Process one named job, or every outbox receipt not yet acknowledged. A failing job never blocks the others; callers exit non-zero on `failed`. */
+/** Process one named job, or every executor-host receipt not yet acknowledged. A failing job never blocks the others; callers exit non-zero on `failed`. */
 export async function reportReceipts(deps: ReporterDeps, only?: string): Promise<ReportSummary> {
  const summary: ReportSummary = { reported: [], stale: [], refused: [], failed: [] };
- const jobIds = only === undefined ? deps.reader.jobIds().filter(id => deps.ledger.reported(id) === null) : [only];
+ const jobIds = only === undefined ? (await deps.reader.jobIds()).filter(id => deps.ledger.reported(id) === null) : [only];
  for (const jobId of jobIds) {
   try {
    const outcome = await processReceipt(deps, jobId);
@@ -240,19 +240,37 @@ export async function reportReceipts(deps: ReporterDeps, only?: string): Promise
  return summary;
 }
 
-export function outboxReceiptReader(outbox: BusOutbox): ReceiptReader {
+/**
+ * Read the executor host's terminal receipts over the fixed SSH receipt-only path.
+ * The outbox store never leaves that host: the receiver reads it and returns the
+ * recorded job, digest and receipt bytes, and `processReceipt` re-derives every
+ * check from them. A transport, refusal or reply failure throws (the job stays
+ * unacknowledged and replays); only a receipt the host cannot produce is a refusal.
+ */
+export function sshReceiptReader(config: unknown, options: Omit<SshOptions, "receiptStore"> = {}): ReceiptReader {
+ const get = (jobId: string) => getSshReceipt({ config, jobId }, options);
  return {
-  jobIds: () => outbox.receiptJobIds(),
-  authorized: (jobId) => outbox.authorized(jobId),
+  async jobIds() {
+   const jobIds: string[] = [];
+   for (let after: string | undefined;;) {
+    const page = await listSshReceipts({ config, ...(after !== undefined && { after }) }, options);
+    jobIds.push(...page.jobIds);
+    if (!page.more || page.jobIds.length === 0) return jobIds;
+    after = page.jobIds[page.jobIds.length - 1];
+   }
+  },
+  async authorized(jobId) { return (await get(jobId))?.authorized === true; },
   async read(jobId) {
-   try { return await outbox.queuedReceipt(jobId); }
-   catch (e) { if (e instanceof SyntaxError) throw new UnreadableReceipt("Stored outbox record is unreadable"); throw e; }
+   const record = await get(jobId);
+   if (record === null) return null;
+   return { jobId: record.jobId, job: record.job, evidence: record.evidence, state: record.state, receiptBytes: record.receiptBytes };
   },
  };
 }
 
 export interface CheckReporterRun {
  job?: string;
+ ssh?: Pick<SshOptions, "runner" | "signal">;
  env?: NodeJS.ProcessEnv;
  api?: GhApi;
  now?: () => number;
@@ -269,21 +287,20 @@ async function readAppKey(path: string): Promise<string> {
 
 /**
  * Load the operator-local configuration and report. Throws, before any GitHub call,
- * when the opt-in block, the key, the bus configuration or the outbox is missing or
- * invalid. The App key path, App id and installation ids come only from that block.
+ * when the opt-in block, the key or the reviewed SSH binding is missing or invalid.
+ * The App key path, App id and installation ids come only from that block; the
+ * executor host never sees them.
  */
 export async function runCheckReporter(config: RangerConfig, run: CheckReporterRun = {}): Promise<ReportSummary> {
  const settings = config.checkReporter;
  if (settings === undefined) throw Error("checkReporter is not configured");
  const privateKeyPem = await readAppKey(settings.privateKeyFile);
- const bus = validateBusConfig(JSON.parse(await readFile(await privateOperatorPath(settings.outbox.busConfigFile, true), "utf8")));
- const outbox = await openBusOutbox({ bus, root: settings.outbox.root, jobsRoot: settings.outbox.jobsRoot, executorId: settings.outbox.executorId, ...(run.now && { now: run.now }) });
+ const ssh = validateSshConfig(JSON.parse(await readFile(await privateOperatorPath(settings.sshConfigFile, true), "utf8")));
+ const ledger = await openReporterLedger(settings.stateRoot, run.now);
  try {
-  const ledger = await openReporterLedger(settings.stateRoot, run.now);
-  try {
-   const app = appChecksClient({ appId: settings.appId, privateKeyPem, installations: settings.installations, ...(run.api && { api: run.api }), ...(run.now && { now: run.now }) });
-   const openPullHeads = run.pullHeads ?? ((repo, sha) => openPullHeadsContaining(repo, sha, resolveWriteToken(config, repo, run.env).token, run.api));
-   return await reportReceipts({ reader: outboxReceiptReader(outbox), github: { ...app, openPullHeads }, ledger }, run.job);
-  } finally { ledger.close(); }
- } finally { outbox.close(); }
+  const app = appChecksClient({ appId: settings.appId, privateKeyPem, installations: settings.installations, ...(run.api && { api: run.api }), ...(run.now && { now: run.now }) });
+  const openPullHeads = run.pullHeads ?? ((repo, sha) => openPullHeadsContaining(repo, sha, resolveWriteToken(config, repo, run.env).token, run.api));
+  const reader = sshReceiptReader(ssh, run.ssh);
+  return await reportReceipts({ reader, github: { ...app, openPullHeads }, ledger }, run.job);
+ } finally { ledger.close(); }
 }

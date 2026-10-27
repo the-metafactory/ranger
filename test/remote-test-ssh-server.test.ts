@@ -108,7 +108,7 @@ test("restart recovery clears only known stale SSH uploads and lets an interrupt
   const response = await serveSshResponse(f.frame(), f.config, { execute: async (input, options) => {
    calls++; return executeRemoteTest(input, { ...options, uid: 1000, gid: 1000, launcher: async () => ({ code: 0, stdout: JSON.stringify({ host: { os: "linux", arch: "unsupported" } }) }) });
   } });
-  if (!("receipt" in response)) throw Error(); expect(response.receipt!.status).toBe("rejected"); expect(calls).toBe(1);
+  if (!("receipt" in response) || response.version === 4) throw Error(); expect(response.receipt!.status).toBe("rejected"); expect(calls).toBe(1);
   expect(await serveSshResponse(f.frame(), f.config, { execute: f.execute })).toEqual(response); expect(f.calls()).toBe(0);
  } finally { ledger.close(); }
 });
