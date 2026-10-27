@@ -234,8 +234,8 @@ describe("PR listing, opt-in config and production producer integration", () => 
  };
  const settings = () => ({ busConfigFile: join(root, "bus.json"), signerFile: join(root, "signer.json"), stateRoot: join(root, "state"), deadlineSeconds: 660 });
  async function privateConfig(profiles: ProfileManifest[] = [profile], profileDigest = profile.profileDigest, authorized = true, repositoryId = MYELIN_REPOSITORY) {
-  const issuer = "did:mf:ranger";
-  await writeJson("bus.json", { version: 1, target: { domain: "fixture", account: "fixture" },
+  const issuer = "did:mf:ranger", account = `A${"C".repeat(55)}`;
+  await writeJson("bus.json", { version: 1, target: { domain: "fixture", account },
    routing: { classification: "local", principal: "fixture", stack: "private" },
    streams: { request: { stream: "REQUESTS", durable: "EXECUTOR" }, result: { stream: "RESULTS" } },
    transport: { servers: ["tls://bus.example.invalid:4222"], credentialsFile: join(root, "bus.creds") },
@@ -244,6 +244,8 @@ describe("PR listing, opt-in config and production producer integration", () => 
    issuers: [{ issuer: authorized ? issuer : "did:mf:other", bindings: [{ repositoryId, profileId: profile.profileId, profileDigest }] }] });
   await writeJson("ssh.json", { target: "fixture", remoteCli: "/reviewed/ranger", remoteConfig: "/private/executor.json", executorId: "fixture", profiles });
   await writeJson("signer.json", { version: 1, issuer, seed: Buffer.alloc(32, 1).toString("base64") });
+  const jwt = ["e30", Buffer.from(JSON.stringify({ iss: account, sub: `U${"A".repeat(55)}`, nats: { type: "user" } })).toString("base64url"), "sig"].join(".");
+  await writeFile(join(root, "bus.creds"), `-----BEGIN NATS USER JWT-----\n${jwt}\n------END NATS USER JWT------\n\n-----BEGIN USER NKEY SEED-----\nSU${"A".repeat(56)}\n------END USER NKEY SEED------\n`, { mode: 0o600 });
  }
 
  test("REST listing paginates all open PRs and preserves repository identity and terminal states; drafts are eligible", async () => {
