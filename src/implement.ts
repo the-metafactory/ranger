@@ -3082,6 +3082,8 @@ const PLAIN_STEP = /^[\w./@:=+,%-]+(?: +[\w./@:=+,%-]+)*$/;
 
 const plainBunTest = (step: string): boolean => PLAIN_STEP.test(step) && /^bun test(?: |$)/.test(step);
 
+const PACKAGE_TEST_STEPS = new Set(["bun run test", "npm test", "npm run test"]);
+
 function packageTestScript(cwd: string): unknown {
  const pkg: unknown = JSON.parse(readFileSync(join(cwd, "package.json"), "utf8"));
  if (typeof pkg !== "object" || pkg === null || !("scripts" in pkg)) return undefined;
@@ -3092,7 +3094,10 @@ function packageTestScript(cwd: string): unknown {
 
 /**
  * A test command a base-red waiver can split: plain steps joined by `&&`,
- * exactly one of them `bun test`. `bun` is that step, `rest` every other
+ * exactly one of them `bun test`. A `bun run test`, `npm test` or
+ * `npm run test` step (PACKAGE_TEST_STEPS) stands for the package's `test`
+ * script, read through `readTestScript`, and counts only when that script is
+ * a plain `bun test` step. `bun` is that step, `rest` every other
  * step, in order, joined by `&&` ("" when the command is `bun test` alone).
  * Null for any other shape (`;`, `||`, a pipe, quotes, an expansion, two bun
  * steps, an unresolved script): what failed beside bun cannot be
@@ -3102,7 +3107,7 @@ export function bunTestChain(command: string, readTestScript?: () => unknown): {
  const steps = command.split("&&").map((s) => s.trim());
  if (!steps.every((s) => PLAIN_STEP.test(s))) return null;
  for (let i = 0; i < steps.length; i++) {
-  if (steps[i] !== "bun run test") continue;
+  if (!PACKAGE_TEST_STEPS.has(steps[i])) continue;
   try {
    const script = readTestScript?.();
    if (typeof script !== "string" || !plainBunTest(script.trim())) return null;
@@ -3308,7 +3313,8 @@ async function baseRedAt(ctx: ImplementContext, run: FailedRun): Promise<{ baseR
  * commit its failures are compared with.
  *
  * Only the `bun test` step is waived: the command must be plain steps joined
- * by `&&`, one of them `bun test` (bunTestChain), and every other step then
+ * by `&&`, one of them `bun test` or a `bun run test`, `npm test` or
+ * `npm run test` step whose package script is one (bunTestChain), and every other step then
  * runs on its own in a fresh clone of `head` and must pass, so a lint or
  * typecheck failure beside the shared tests (or one the failing bun step
  * kept from running) still gates.
