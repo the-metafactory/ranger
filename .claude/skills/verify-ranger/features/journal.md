@@ -1,13 +1,14 @@
 # Journal inspection
 
 `ranger journal` prints the journal as JSON: pause state, dead-man count,
-spawns today, every worker with its status and log file, escalations and
-events. `--node <id>` narrows it to one node; `--repo` to one map repo.
+spawns today, every worker with its status, escalations and the newest 50
+events. `--node <id>` narrows it to one node and adds each worker's log file;
+`--repo` narrows it to one map repo.
 
 ## Sub-features
 
 - `journal-all` whole journal, JSON with `journalPath`, `paused`, `deadmanCount`, `spawnsToday`, `workers`.
-- `journal-node` one node's workers, escalations, events and worker log paths.
+- `journal-node` one node's workers, escalations and events; each worker row gets a `workerLog` path (only with `--node`).
 - `journal-repo` one repo's rows.
 - `journal-bad-node` a non-numeric `--node` is refused with exit 1.
 
@@ -26,5 +27,5 @@ Preconditions: baseline; pick a node id from `#needsyou` in the latest `<stamp>-
 ## Gotchas
 
 - The whole journal is ~18k lines; always redirect to a file.
-- Worker `log` paths point at `~/.config/ranger/logs/`, the live logs; reading them is fine, writing is not.
+- `workerLog` is built from the journal's own directory, so on the snapshot it points under `$RUN/state/logs/workers/`, which launch does not create. The live log has the same file name under `~/.config/ranger/logs/workers/`; reading it is fine, writing is not.
 - `journalPath` showing `~/.config/ranger/state.sqlite` means the config is not the pinned copy: stop and relaunch.
