@@ -521,10 +521,13 @@ export function defaultConfigPath(): string {
  return join(liveJournalDir(), "ranger.yaml");
 }
 
-/** Resolve the flag, then RANGER_CONFIG, against the caller's cwd; then ~/.config/ranger/ranger.yaml. */
+/**
+ * Resolve the flag, then RANGER_CONFIG, against the caller's cwd; then ~/.config/ranger/ranger.yaml.
+ * An arc shim runs ranger from its install dir and passes the caller's cwd as ARC_INVOCATION_CWD.
+ */
 export function resolveConfigPath(flag: string | undefined, env: NodeJS.ProcessEnv, cwd: string): string {
  const chosen = flag ?? env.RANGER_CONFIG;
- return chosen === undefined ? defaultConfigPath() : resolve(cwd, chosen);
+ return chosen === undefined ? defaultConfigPath() : resolve(env.ARC_INVOCATION_CWD ?? cwd, chosen);
 }
 
 /** Expand a leading `~` (journal path, canonical root). */
