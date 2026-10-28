@@ -1,13 +1,15 @@
 # Scout digest
 
-`ranger scout` reads every registered map from GitHub with the read-only PATs
-and prints, per map, the frontier by routing (escalate, provisioning, walk),
-the HITL nodes waiting on the principal and the audit. It writes nothing to
-the graph. Exit 0 when every map read, 2 when one failed.
+`ranger scout` reads every registered map from its forge (GitHub or GitLab)
+with the read-only PATs and prints, per map, the frontier by route class
+(`ROUTE_LABELS` in `src/route.ts`: escalate, research, implement,
+provisioning, ...), the HITL nodes waiting on the principal and the audit. It
+writes nothing to the graph. Exit 0 when every map read, 2 when one failed,
+1 on a command error such as a bad config.
 
 ## Sub-features
 
-- `scout-text` text digest: header `ranger scout — <time>`, `identity: <login> (fine-grained)`, then one `map:` block per registered map.
+- `scout-text` text digest: header `ranger scout — <time>`, `identity: <login> (fine-grained)` (`(classic)` for a read-only classic PAT, `unknown` when no GitHub map passed the gate), then one `map:` block per registered map.
 - `scout-json` `--json` emits the same report as JSON.
 - `scout-fail` a map that could not be read sets exit 2.
 
@@ -24,6 +26,6 @@ Preconditions: baseline; the change under test is in scout, digest or routing (s
 
 ## Gotchas
 
-- `identity:` naming the machine account or a classic token means the write token leaked into the env: stop and re-source env.sh.
+- Scout reads only the per-repo read-only variables and refuses a classic token with write scopes, so a missing or wrong token shows as `identity: unknown (fine-grained)` and `✗ FAILED` per map: stop and re-source env.sh. `identity:` naming the machine account means a fine-grained write PAT sits under a read-only variable name.
 - Scout reads GitHub now, the dashboard reads the snapshot: counts can differ by whatever the tick changed since launch.
 - A secondary rate limit shows as a map error while `/rate_limit` still has budget; wait, don't retry in a loop.

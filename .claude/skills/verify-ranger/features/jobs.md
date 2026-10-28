@@ -8,13 +8,13 @@ lane, and reported to the run ledger. The principal reads their runs with
 ## Sub-features
 
 - `jobs-list` `job list` prints every job run oldest first: `name`, `lane`, `status`, `queuedAt`, `startedAt`, `finishedAt`, `log`.
-- `jobs-lane` the dashboard's `#next` shows `visual lane · free` or its holder, and `#current` the running job.
+- `jobs-lane` the dashboard's `#next` shows `visual lane · free` or its holder; a running job on the `visual` or `headless` lane holds it as `held by #job:<name> (ranger:job#<runId>)`. `#current` lists running workers only, never a job.
 - `jobs-enqueue` `job enqueue <name>` queues one run (not driven: see Gotchas).
 
 ## How to get to it (user POV)
 
 - `ranger job list`.
-- Dashboard "Next in queue" and "Current job".
+- Dashboard "Next in queue" (a job never shows under "Current job").
 
 ## Driving it with the CLI and drive.ts
 
