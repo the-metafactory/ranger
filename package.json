@@ -1,6 +1,6 @@
 {
   "name": "@the-metafactory/ranger",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "license": "MIT",
   "private": true,
   "description": "Autonomous orienteer work-graph walker — scout (read-only digest) + claim & research lane (walk / run-node / sweep)",
