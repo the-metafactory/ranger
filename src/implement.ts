@@ -3536,14 +3536,16 @@ const KILLED_ON_BUSY_HOST = "was killed with no failing test while the host was 
  * failure.
  */
 function killedOnBusyHost(ctx: ImplementContext, tests: RunResult, what: string): BusyReading | null {
- if (tests.code !== -1 || allFailedTestNames(tests).length > 0) return null;
+ if (!killedWithNoFailure(tests)) return null;
  const host = busyHostNow(ctx);
  if (host === null) return null;
  return parksOnceADay(ctx, "host-killed", `${what} ${KILLED_ON_BUSY_HOST} (${describeLoad(host, busyLoad(ctx))})`) ? { ...host, killed: true } : null;
 }
 
+const killedWithNoFailure = (tests: RunResult) => tests.code === -1 && allFailedTestNames(tests).length === 0;
+
 function endedOnBusyHost(ctx: ImplementContext, tests: RunResult, started: HostLoadReading, what: string): BusyReading | null {
- if (tests.code === -1 && allFailedTestNames(tests).length === 0) return killedOnBusyHost(ctx, tests, what);
+ if (killedWithNoFailure(tests)) return killedOnBusyHost(ctx, tests, what);
  const host = busyHostNow(ctx);
  if (host === null) return null;
  const loads = `started on a quiet host (${describeLoad(started)}) and ended on a busy one (${describeLoad(host, busyLoad(ctx))})`;
