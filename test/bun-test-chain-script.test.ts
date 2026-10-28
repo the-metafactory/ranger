@@ -20,6 +20,28 @@ describe("bun test package-script resolution", () => {
   });
  });
 
+ test.each(["npm test", "npm run test"])("resolves %s through the package's test script", (step) => {
+  expect(bunTestChain(step, () => "bun test tests/")).toEqual({ bun: "bun test tests/", rest: "" });
+  expect(bunTestChain(`${step} && bunx tsc --noEmit`, () => script)).toEqual({
+   bun: script,
+   rest: "bunx tsc --noEmit",
+  });
+ });
+
+ test.each(["npm test", "npm run test"])("%s refuses a script that is not a plain bun test step", (step) => {
+  for (const value of [undefined, "vitest run", "bun test && eslint .", "bun run test", "npm test"]) {
+   expect(bunTestChain(`${step} && bunx tsc --noEmit`, () => value)).toBeNull();
+  }
+  expect(bunTestChain(step, () => { throw new Error("unreadable package.json"); })).toBeNull();
+  expect(bunTestChain(step)).toBeNull();
+ });
+
+ test.each([
+  "npm test && bun test", "npm test && bun run test", "npm run test && npm test", "npm test --coverage",
+ ])("rejects npm commands with more than one test step or extra arguments: %s", (value) => {
+  expect(bunTestChain(value, () => script)).toBeNull();
+ });
+
  test.each([
   undefined, null, 12, {}, "", "bun tester", "npm test", "bun run test", "bun run other",
   "bun test && eslint .", "bun test; eslint .", "bun test || true", "bun test | tee log",

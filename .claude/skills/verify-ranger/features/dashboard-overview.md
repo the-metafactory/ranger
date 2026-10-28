@@ -8,7 +8,7 @@ running worker, and each substrate's quota and recent runs.
 ## Sub-features
 
 - `overview-load` the page reads `/api/state` and `#meta` leaves "loading…".
-- `overview-needs` `#needsyou` has one card per `needsYou` row, or the empty line "Nothing is parked, failed or waiting on a needs-eye merge."
+- `overview-needs` `#needsyou` has one card per `needsYou` row, led by an "awaiting-merge row(s) not yet checked" notice when `needsYouUnchecked` is non-empty; with no rows and no notice it shows the empty line "Nothing is parked, failed or waiting on a needs-eye merge."
 - `overview-grill` `#grill` lists every grilling and decision per map, with counts.
 - `overview-queue` `#next` shows each lane (visual, headless) with its holder or "free".
 - `overview-current` `#current` shows the running worker or "No worker is running."
@@ -35,6 +35,6 @@ Preconditions: baseline from the README.
 
 - Registered maps render from the tick's frontier cache in the journal, so Refresh re-reads only serve-only maps (`serve.extraMaps`); it changes nothing for the rest.
 - The page polls `/api/state` every 15 s; assert after `#meta` changes, not on a fixed sleep.
-- Titles show "(title not read yet)" until serve's own REST read lands; it is not a rendering bug.
+- Needs-you titles show "(title not read yet)", and current-job and queued-resume rows "(title not in the frontier read)", until serve's own REST read lands; it is not a rendering bug.
 - The page token rotates on every serve restart; a page from a previous launch gets "token refused".
-- The buttons in each Needs-you card (Resume, Merge, Open session) are outward actions; the guard blocks them.
+- The buttons in each Needs-you card (Resume or Queue resume, Merge, Open session) are outward actions; the guard blocks them.

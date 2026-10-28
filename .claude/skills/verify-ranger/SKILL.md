@@ -8,7 +8,10 @@ description: Drive ranger for real to prove a change works. Starts an isolated `
 Ranger has two user surfaces: the local dashboard (`ranger serve`, live on
 127.0.0.1:7311 under launchd) and the CLI (`src/cli.ts`). The tick
 (`walk`/`tick`/`run-node`/`escalate`) claims GitHub issues, pushes and posts to
-Discord; it is never driven from this skill. Its proof is `bun test`.
+Discord; it is never driven from this skill. Its proof is `bun test`. The same
+holds for the operator-only `remote-test` group (`run`, `status`,
+`submit-pr-heads`, `bus-run`, `bus-retry`, `bus-status`), which stages over
+SSH and publishes to the signed bus; its proof is `bun test test/remote-test*.test.ts`.
 
 The scripts here never touch the live instance: they copy the live journal
 (`~/.config/ranger/state.sqlite`) with SQLite's backup API, copy the live
@@ -93,7 +96,8 @@ bun scripts/drive.ts "$RUN" --refresh  # also click #refresh and expect 202 + "R
 
 Stable handles (`renderPage` in `src/serve.ts`): `#meta` (leaves "loading…"
 once state is read), `#msg` (toasts and errors), `#refresh`, `#needsyou`
-(one child per `state.needsYou` row), `#grill`, `#auto`, `#next`, `#current`,
+(one child per `state.needsYou` row, plus a leading notice when
+`state.needsYouUnchecked` is non-empty), `#grill`, `#auto`, `#next`, `#current`,
 `#substrates`. `/api/state` is the page's only data source; diff a change's
 expected rows against it. To check a new element, extend `drive.ts` with a
 `check(...)` on its id or text rather than eyeballing the screenshot.

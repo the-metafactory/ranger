@@ -4,7 +4,7 @@ import { chmod, mkdir, open, readFile, realpath, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { ZodError } from "zod";
 import type { RangerConfig } from "../config.ts";
-import { appChecksClient, openPullHeadsContaining, type AppChecks, type CheckConclusion, type CheckRunWrite, type GhApi } from "../github.ts";
+import { appChecksClient, openPullHeadsContaining, type AppChecks, type CheckConclusion, type CheckRunWrite, type FetchFn, type GhApi } from "../github.ts";
 import { resolveWriteToken } from "../identity.ts";
 import { privateDirectory, syncDirectory } from "./artifacts.ts";
 import { isOperatorPrivate, privateOperatorPath } from "./baseline.ts";
@@ -273,6 +273,7 @@ export interface CheckReporterRun {
  ssh?: Pick<SshOptions, "runner" | "signal">;
  env?: NodeJS.ProcessEnv;
  api?: GhApi;
+ fetch?: FetchFn;
  now?: () => number;
  pullHeads?: (repo: string, commitDigest: string) => Promise<string[]>;
 }
@@ -298,8 +299,8 @@ export async function runCheckReporter(config: RangerConfig, run: CheckReporterR
  const ssh = validateSshConfig(JSON.parse(await readFile(await privateOperatorPath(settings.sshConfigFile, true), "utf8")));
  const ledger = await openReporterLedger(settings.stateRoot, run.now);
  try {
-  const app = appChecksClient({ appId: settings.appId, privateKeyPem, installations: settings.installations, ...(run.api && { api: run.api }), ...(run.now && { now: run.now }) });
-  const openPullHeads = run.pullHeads ?? ((repo, sha) => openPullHeadsContaining(repo, sha, resolveWriteToken(config, repo, run.env).token, run.api));
+  const app = appChecksClient({ appId: settings.appId, apiBaseUrl: settings.apiBaseUrl, privateKeyPem, installations: settings.installations, ...(run.api && { api: run.api }), ...(run.fetch && { fetch: run.fetch }), ...(run.now && { now: run.now }) });
+  const openPullHeads = run.pullHeads ?? ((repo, sha) => openPullHeadsContaining(repo, sha, resolveWriteToken(config, repo, run.env).token, { apiBaseUrl: settings.apiBaseUrl, api: run.api }));
   const reader = sshReceiptReader(ssh, run.ssh);
   return await reportReceipts({ reader, github: { ...app, openPullHeads }, ledger }, run.job);
  } finally { ledger.close(); }

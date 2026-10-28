@@ -1330,7 +1330,7 @@
       "count": 13
     },
     "@typescript-eslint/non-nullable-type-assertion-style": {
-      "count": 16
+      "count": 15
     },
     "@typescript-eslint/prefer-regexp-exec": {
       "count": 5
@@ -1345,7 +1345,15 @@
       "count": 6
     },
     "ranger/no-comments": {
-      "count": 226
+      "count": 210
+    }
+  },
+  "test/implement-rig.ts": {
+    "@typescript-eslint/non-nullable-type-assertion-style": {
+      "count": 1
+    },
+    "ranger/no-comments": {
+      "count": 14
     }
   },
   "test/implement.unit.test.ts": {

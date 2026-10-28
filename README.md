@@ -1,485 +1,114 @@
 # ranger
 
-Autonomous orienteer work-graph walker for the metafactory ecosystem.
+Ranger walks an orienteer map until the work is done. A map is a `soma graph` work graph kept on a repo's issues. On each tick, ranger claims the decided nodes on the map's frontier, runs each one in a detached worker session, and closes it through the node's checkpoint gate. Research nodes end in a findings commit. Task and build nodes end in a reviewed pull request. Ranger files new work it finds back onto the graph, and it sends only real decisions to the principal.
 
-Ranger points at an orienteer map (a `soma graph` work graph on a repo's issues) and
-walks it to completion: it claims decided frontier nodes, executes AFK-capable work
-through the standard SOP (pre-PR working-tree review, pilot/sage review loop, merge),
-files newly-discovered work back onto the graph as typed nodes, and escalates only
-genuine decisions to the principal.
+Ranger implements the walk that soma's `docs/work-graph.md` §5 Phase 2 specifies: the headless tick, the claim announcement, and the close auditor. It adds routing by node kind and the PR review and merge steps that turn a walked graph into merged software. The design lives in [the ranger design document](design/ranger-design.md). Ranger's own map is on this repo's issues, under the `orienteer:map` label.
 
-Ranger is the implementation of the walk specified in soma `docs/work-graph.md` §5
-Phase 2 — the headless tick, the claim announcement with veto window, and the close
-auditor — extended with the node-kind routing and SOP integration that turn a walked
-graph into merged software.
+## Install ranger
 
-## Status
+Ranger runs on [Bun](https://bun.sh) 1.3 or later and calls `git`, `gh`, and `soma`. It is built for macOS: the scheduled tick and the dashboard run under launchd.
 
-Design + early build. The design document lives in
-[`design/ranger-design.md`](design/ranger-design.md). The effort's own orienteer
-map (dogfooding) lives on this repo's issues — find it via the `orienteer:map`
-label.
-
-Shipped build-path steps:
-
-- **Step 1 — `ranger scout`** (node #12): read-only frontier/audit/HITL digest.
-- **Step 3 — claim + research lane** (node #13): the smallest full
-  claim→execute→close loop on the safest kind — `ranger walk` (headless tick:
-  announce → claim → spawn), `ranger run-node` (detached worker supervisor with
-  the research SOP tail), `ranger sweep`, `ranger journal`.
-- **Step 4 — implement lane** (node #23; built, live acceptance on seelite #550
-  pending): `walk: full` maps get the task/build
-  SOP — worker implements and commits; the supervisor tests, pushes, opens a
-  draft PR, runs offline sage rounds (cap 2) with fix passes, marks it ready, and
-  the tick posts a one-tap merge card. Ranger never merges; after the
-  principal's merge it closes the node through the gate, citing the PR's CI
-  run. `propose` task/build nodes take the same lane, with the merge as the
-  ratification. Each run-node is a fenced occupant (generation check before every
-  outward action, process-group kill) and resumes its phase from GitHub. The
-  approver bot (node #16) remains.
-
-Implement resource lanes (node #57): **1 visual + 1 headless** across all maps.
-The daily spawn cap and dead-man pause remain global across both lanes.
-A map defaults to visual with `commands.probe`, headless otherwise; `lane` can
-override that choice. Within each lane, maps alternate by the persisted map of
-the last implement start (node #47); empty or gated maps are skipped. Claims,
-operator resumes, sweep respawns and merge-desk send-backs record starts;
-close-only runs leave the cursor unchanged. Awaiting-merge releases capacity.
-The dashboard shows both holders and the same next choices as walk.
-Unknown or ambiguous worker maps conservatively hold both resource lanes.
-
-`ranger drain --lane visual` (node #165) stops new implement claims on every
-visual-lane map: the visual lane is one per machine, so its drain is one switch.
-Research on a visual map still claims. `ranger drain --map owner/name#root`
-drains one headless map, which then claims nothing new. A visual map has no
-drain of its own. `--off` lifts either. Sweeps, merge desks (and their
-send-backs) and queued resumes keep running under a drain. The walk reads the
-drain under the claim lock, and the dashboard shows it from the same gate.
-
-`ranger resume-node <id> --when-free` resumes immediately when its lane is
-free and no resumes wait in that lane. Otherwise it records a durable FIFO entry.
-Research and close-only resumes start immediately. On each walk tick, queued
-resumes run after merge desks and before new claims; a started implement resume
-reserves its lane for that tick. The dead-man pause and daily spawn cap retain
-queued entries. Closed nodes, released or already active rows, merged or closed
-PRs and maps set to `walk: none` are removed with a reason. Moving a PR head
-keeps its entry valid. `ranger resume-node <id> --cancel` removes an entry and
-returns non-zero if none exists. Use `--map owner/name#root` to disambiguate.
-Cancellation remains available after a map is deregistered, using the queued
-repository's write-token mapping and the same machine-account identity gate.
-Starts by the walk count toward the daily spawn cap; immediate operator resumes
-do not. A queued entry never reserves a lane: if its head cannot start, fresh
-claims remain eligible that tick, while later queued entries in the lane wait.
-Transient graph or GitHub read errors defer the head without counting a failure.
-Spawn errors, a null PID (including `RANGER_NO_SPAWN=1`), and identity gate
-refusals count as failed starts. Three consecutive failed starts drop the entry
-with an event naming the last error. A successful start removes the entry;
-queueing the node again starts its failure count at zero.
-
-Ranger queues a resume itself when the supervisor's tests fail and their one
-busy-host retry also ran on a busy host, because the quiet-host wait ran out
-first (node #297), or was killed (the test timeout) with no failing test while
-the host is busy. A hanging suite's own load can read as busy, so a kill parks
-once per node in 24 hours; a second is the node's failure. This applies to adoption and to the tests after a worker
-pass. No worker session starts and no fix pass runs. The row ends `failed`
-with an outcome that leads with "waiting for a quiet host: load X on N cores"
-and names up to three failing tests. It does not count toward the dead-man
-switch. A retry that started on a quiet host and named a failure is the
-branch's failure, as before.
-
-The host is busy while its 1-minute load is at or above `workers.busyLoad`
-(default: the core count). `workers.laneBusyLoad` sets it per implement lane,
-shaped like `laneSlots` (`{ headless: 30 }`); a lane with no entry reads
-`busyLoad`, and each gate reads the value for the lane it gates (node #312).
-On a busy host the walk claims nothing on that lane's maps, and every queued
-resume on that lane waits, ranger's own and an operator's `--when-free` entry alike:
-no start and no failed start, one `reviewed` event per tick, and it holds
-nothing behind it. `resume-node --when-free` queues on a busy host rather than
-starting; a plain `resume-node` starts at once. Supervisor and adoption test
-runs wait up to 20 minutes for a quiet host before they start, then run anyway,
-as the probe tier does (2026-10-14: soma's 6-minute suite ran past the
-20-minute test timeout at load 45-55 on 10 cores).
-
-`ranger serve` (node #166) runs these verbs for the principal: Drain/Undrain on
-the visual lane's header (`ranger drain --lane visual [--off]`) and on each
-headless map (`--map`); a visual map shows no drain of its own. A parked or
-failed card offers "Queue resume" (`resume-node <id> --when-free`) where that
-verb would queue, and a queued node shows its place and a Cancel
-(`--cancel`). Each lane lists its queue FIFO, and a head the journal lets start
-shows as next, ahead of any frontier claim; the walk's forge check (a closed
-node, a merged PR) and identity gate come after and may still drop or defer it.
-An entry the tick will drop (a `walk: none` map, a row back in flight) shows
-why and holds nothing behind it. So does a queued resume while the
-host is busy ("waiting for a quiet host: load X on N cores"), and its parked
-card's reason class is `host load`.
-An action `serve` refuses (unknown map, no queued entry) shows its error and
-runs nothing. A verb that exits non-zero shows its exit and error. One that
-timed out or never started may already have applied, so reload the page to see.
-Plain and immediate operator resumes retain the hand-driven mode where a row
-is claimed without spawning; this mode cannot successfully start a queued resume.
-
-`ranger serve` runs under launchd (node #348): copy
-`ops/launchd/ch.invisible.ranger-serve.plist.example` to
-`~/Library/LaunchAgents/ch.invisible.ranger-serve.plist`, replace `__USER__`
-and load it. It runs `~/bin/ranger serve`, so it has the tick's environment,
-logs to `~/.config/ranger/logs/serve.log`, and is kept alive. When the tick
-migrates the journal past the code serve started with, the next state read
-logs the refusal and exits 1, and launchd restarts serve on the code now on
-disk. A serve that *starts* on a journal already past its code stays up and
-shows the refusal on the page instead (an exit would crash-loop); fix the
-checkout or the journal (`docs/journal-repair.md`) and restart it.
-
-Parked infrastructure probe failures automatically requeue on the next `walk`
-when their lane is free, oldest first across maps. They take priority over
-crash respawns, merge-desk send-backs and fresh implement claims. The running
-worker is never interrupted. `workers.probeRequeues` bounds automatic requeues
-per node/head (default 2; 0 disables them); the count survives restarts. A failed
-child spawn keeps its place without spending a retry. Pause, veto, walk mode,
-map skip/allowlists and existing review/merge gates still apply. Assertion,
-page-error and unknown failures remain parked for investigation; a timeout
-cannot erase an assertion from the preceding probe attempt. Legacy parks
-without a failure class retry only when their outcome records a signal/timeout
-and no named probe failure. Operator `resume-node` remains available afterwards.
-
-Journal upgrades run through `openJournal`, which seeds the root inputs required
-by `drizzle/0009_worker-root.sql` before applying migrations. A legacy repo with
-one registered map inherits that root. For multiple maps or a deregistered repo,
-set `state.legacyMapRoots` to its original root; that historical root need not be
-registered now. This includes repos with only legacy digest or escalation cursor
-cache entries. Remove the migration-only overrides after cutover. Standalone
-Drizzle callers must seed `ranger_legacy_roots(repo, root)` for every legacy repo
-before applying this migration.
-
-## Configuration
-
-`ranger.yaml` is private to each operator and is not in this repo. Copy
-`ranger.example.yaml` to `~/.config/ranger/ranger.yaml`, next to the journal,
-and edit it there.
-
-Commands that read `ranger.yaml` choose the config path in this order:
-explicit `--config <path>` (or `-c`), `$RANGER_CONFIG`, then
-`~/.config/ranger/ranger.yaml`. Relative paths from either the flag or the
-environment resolve against the working directory. A missing selected file is
-an error; ranger does not try another location. `./ranger.yaml` is never read
-implicitly.
+To install a release with [arc](https://github.com/the-metafactory/arc):
 
 ```bash
-export RANGER_CONFIG=/absolute/path/to/another/ranger.yaml
-ranger job list
+arc install https://github.com/the-metafactory/ranger --pin v0.1.2
 ```
 
-Spawned ranger processes receive the selected absolute path through `--config`.
-The required private JSON `--config` options under `remote-test` are separate.
+Arc clones the release, runs `bun install`, and puts a `ranger` shim in its bin directory (`arc config get bin-dir`). Releases are listed on [the releases page](https://github.com/the-metafactory/ranger/releases).
 
-## Scout (build-path step 1)
-
-`ranger scout` is the first shipped component: a read-only tick that digests every
-registered map's frontier, audit, and HITL queue to a CLI report (Discord digest
-comes once the bot exists — design §9). It performs **zero graph writes**.
+To run ranger from a checkout instead:
 
 ```bash
-bun src/cli.ts scout                      # text report ($RANGER_CONFIG or ~/.config/ranger/ranger.yaml)
-bun src/cli.ts scout --json               # machine-readable report
-bun src/cli.ts scout -c /path/ranger.yaml # explicit config
+git clone https://github.com/the-metafactory/ranger.git
+cd ranger
+bun install
+bun src/cli.ts --help
 ```
 
-- **Read-only token gate (node #8):** every map runs under an explicit read-only
-  fine-grained PAT resolved from `auth.readOnlyTokens` (env var names, never
-  inline tokens). Scout aborts a map whose token is unset (no `gh` keyring
-  fallback — the keyring token is write-capable) or whose scopes are
-  write-capable, and verifies the token can read the map's repo.
-- **Fixed verb surface:** scout only ever invokes `soma graph audit/frontier/node
-  --json`; the read-only set is enforced in code before a subprocess spawns.
-- **Route classes (design §3):** each frontier node is classified — HITL
-  escalate (propose/approve, HITL-kind-as-auto, needs-typing), research,
-  implement (walkable per `walk: full`), provisioning (probe-registry
-  preflight).
-- **Acceptance:** run against this map (root 1) and a Seekolous map (root 26);
-  correctly reports frontier by route class, HITL nodes waiting, stale claims
-  (audit `openClaimed` — in-flight or stale), and receipt-less closes.
+## Configure ranger
+
+Ranger reads `~/.config/ranger/ranger.yaml`. That file is private to each operator and is never committed. Start from the annotated template:
 
 ```bash
-bun run test   # unit + e2e (fake soma/gh fixtures), four files at a time
-bunx tsc --noEmit
+mkdir -p ~/.config/ranger
+cp ranger.example.yaml ~/.config/ranger/ranger.yaml
 ```
 
-### Tick run ledger
+The config names the maps to walk, the machine account, the principal, and the environment variables that hold each token. It never holds a token itself. [Configuration](docs/configuration.md) lists every section, the credentials ranger needs, and how ranger picks a config path.
 
-An optional `bus` section in `ranger.yaml` enables one
-`execution.run.finished` envelope per `ranger tick`, with producer `ranger`,
-`ran: {kind: job, ref: "ranger:tick"}`, a fresh run UUID, the pass timestamps,
-and the journal path as `detail_ref`. Exit 0 means `succeeded`; exits 1 and 2
-mean `failed`. A config/context load failure emits nothing.
+## Check a map with scout
 
-```yaml
-bus:
-  principal: jc
-  stack: default
-  url: nats://127.0.0.1:4222
-  creds: ~/.config/nats/creds/ranger.creds
-```
-
-`principal` is required; `stack` defaults to `default` and `url` to
-`nats://127.0.0.1:4222`. Principal and stack must each be a single subject
-token (`[A-Za-z0-9_-]+`). Credentials are required for a non-loopback host;
-loopback (`localhost`, `127.0.0.1`, `::1`) permits an unauthenticated bus.
-
-`MF_CORRELATION_ID` passes any nonempty string through unchanged, including
-non-UUID values; unset or empty generates a correlation ID. `MF_SERVES_GOAL`
-and `MF_SERVES_NODE` add the optional `serves.goal` and `serves.node` fields.
-Use IDs only, never goal wording. Empty values are omitted, and when both
-are empty or unset the envelope has no `serves`. Tick envelopes have no `state`.
-
-Delivery uses myelin's outbox at `<journal directory>/run-ledger/outbox.jsonl`.
-Each emit spools before delivery, replays pending records before sending the
-current run, and closes its NATS connection. The whole emit has a two-second
-ceiling. Delivery failures leave tick output and exit status unchanged and
-record one `ledger-failed` journal event; retained envelopes replay on the
-next configured tick. Without `bus`, no envelope is built, no connection is
-opened, and no spool is touched. This applies only to `tick`.
-
-## Walker — claim + research lane (build-path step 3, node #13)
-
-The smallest full claim→execute→close loop, on the safest kind (research),
-under the machine account. Every graph write goes through the `soma graph`
-verbs with `--identity <bot>`; the tick refuses to run under the principal's
-identity (design §2, node #11).
+`ranger scout` is read-only. It reports each registered map's frontier, its stale claims, and the nodes waiting for the principal, and it writes nothing to the graph:
 
 ```bash
-bun src/cli.ts walk                       # headless tick: announce → claim → spawn → sweep
-bun src/cli.ts run-node <id> --map <repo> # detached worker supervisor (research SOP tail)
-bun src/cli.ts sweep                      # reconcile journal vs reality (crashed workers)
-bun src/cli.ts journal                    # inspect workers/events/health
+ranger scout
+ranger scout --json
 ```
 
-- **Walk-mode opt-in (node #9):** a map is claimed only when its `walk` is
-  `research-only` or `full`; `none` registers it for scout only. `auto`
-  research nodes are the lane's candidates.
-- **Announce-fail-closed (node #7):** no veto window — but no confirmed
-  Discord message id, no claim. A missing bot token or a non-2xx post refuses
-  the claim.
-- **Race-safe claim:** `soma graph claim` re-reads and tie-breaks; a lost race
-  is skipped, never fought.
-- **Build briefs (node #154):** a build node that `soma graph audit` lists
-  under `buildBriefNotReady` routes `brief-not-ready`: the tick does not take
-  it, and the escalation desk posts one card naming what is missing. The audit
-  is read with each fresh frontier read and cached beside it, so a fixed body
-  (which bumps the issue's `updated_at`) is re-checked on the next tick. An
-  audit without the field (soma before soma#753) holds nothing; an unreadable
-  or malformed audit holds every build node, and the next tick re-runs only
-  the audit until it reads. A verdict change the sentinel cannot see (a soma
-  upgrade, a changed readiness rule) lands within `budget.frontierMaxAgeMin`.
-  `ranger build-now` refuses a held node the same way.
-- **Dead-man + spend bound (design §7):** N consecutive worker failures pause
-  claiming; a daily spawn cap bounds spend. `RANGER_NO_SPAWN=1` claims without
-  spawning (simulation).
-- **Journal (design §8):** SQLite at `~/.config/ranger/state.sqlite` holds only
-  what the graph cannot — worker liveness/outcomes, vetoes cache, dead-man and
-  spawn ledgers. Deleting it degrades to re-announce + retry once.
-- **Research CI (node #25):** the supervisor refuses a commit whose tree differs
-  from the pre-worker base in any path other than `findings.md`, before pushing
-  or citing CI on a retry. After the findings push, the supervisor opens a
-  draft PR against the map's base and waits up to 15 minutes for CI on the
-  findings head. Registered check runs, Actions workflow runs (including queued
-  workflows whose jobs have not registered) and external commit statuses must
-  finish without failure. The completed snapshot must stay unchanged for 30
-  seconds, with at least one successful check run for
-  `soma graph close --ci <checkRunId>@<headSha>`. Polling backs off from 10 to
-  60 seconds while CI is pending, then resets to 10 seconds while settling.
-  This observes CI registered during the wait; it cannot guarantee
-  that an external provider will never register more CI afterward. Missing,
-  pending, failed, or stale-head evidence parks the node; a retry reuses the
-  open draft and committed findings. Failed CI needs an operator to rerun or
-  repair CI; retrying alone does not change the verdict on the same head.
-  CI parks do not consume the dead-man failure budget. The journal preserves
-  the pre-worker base SHA across retries; a draft without that anchor parks
-  for operator intervention.
-  A closed draft needs operator intervention.
-  The PR stays draft and unmerged.
-- **Propose research (node #246, #21 rulings D6/D8/D10/D18):** a `propose`
-  research node is walked too, when the map is a GitHub map whose root the
-  principal (`principal.login`) authored, on `walk: research-only` or `full`,
-  and the machine account did not file the node. Otherwise it escalates as
-  `propose-approve`. The root's author is read once per map and kept in the
-  journal. The work runs the research SOP above (findings branch, draft, CI),
-  then ends with `soma graph close --propose --body-file …` instead of a
-  close: the body is the findings, a link to the findings branch and draft,
-  and `<!-- ranger:proposal node=N -->`. The comment id comes from soma's
-  `--json` payload when it has one, else from `Posted proposal comment <id>`;
-  when neither names it the row keeps no id and the card says so. The row
-  becomes `proposed`: the claim stays, no worker runs, no lane slot is held,
-  and `run-node`, `resume-node` and `build-now` refuse it. The escalation desk
-  posts its card, which links the proposal comment and says to react 👍 there.
-- **Ratify (node #250, #21 rulings D4/D6/D8/D9):** each walk tick reads the
-  reactions on every open proposal (one `GET issues/comments/{id}/reactions`,
-  all pages, under the machine write token), at most `ratify.readsPerTick`
-  (default 10) per tick: least recently read first, then oldest proposal.
-  Soma counts any non-proposer 👍, so the pin is ranger's: only a `+1` from
-  the principal login for the map's forge host, with no `-1` from that login,
-  ratifies; every other reaction is ignored. A ratified proposal resumes at
-  the close: a detached `run-node` runs `soma graph close N
-  --proposal-comment <id>` from the canonical checkout (probes run there; no
-  LLM session; soma records `approved` evidence), writes the decisions and
-  closes the card. A failed read closes nothing and is read again next tick.
-  A row with no comment id takes the newest comment on the node that the bot
-  wrote and that carries the marker; with none, nothing closes, the card says
-  the proposal comment is missing, and the row is not read again. A write
-  identity that resolves to the principal closes nothing.
-- **Veto (node #240, #21 rulings D1/D7):** a `-1` from the principal on a
-  proposal comment, with or without a `+1`, vetoes the node for good. Ranger
-  posts a veto comment on the node carrying `<!-- ranger:veto node=N
-  proposal=<id> -->`, records the veto (per repo and node), releases the
-  claim and edits the card to "refused, yours to take"; the node is never
-  closed. The desk shows the same card while the node stands on the
-  frontier. A vetoed node is never claimed again. The journal is a cache:
-  before the walk claims a propose research node, it reads the node's
-  comments and rebuilds a veto from a bot comment whose final line is the
-  marker. Only the propose nodes the tick can claim are read (within the
-  spawn cap's room, at most `ratify.readsPerTick`); an unread one waits for
-  the next tick, and a failed read claims no propose research node on that
-  map that tick. A proposal whose row a lost journal took with it is found
-  from the bot's open claims in the last cached audit (soma's `graph audit
-  --json` `openClaimed`; an audit cached without it is reported until the
-  walk caches a fresh one), and its comment id (or its veto) is recovered
-  from the node's comments. A write identity that resolves to the
-  principal posts no veto and releases nothing. Migration 0028 keys the
-  veto cache by repo.
-- **Observation intake (node #247, #21 rulings D3/D11/D12/D17):** each walk
-  tick reads the Discord thread of every map that has one and is not
-  `walk: none`, over REST (no gateway). A message counts only when
-  `principal.discordId` wrote it and its text @-mentions the bot (the bot's
-  id is read once per tick from `GET /users/@me`); without
-  `principal.discordId` no thread is read. Each one gets a draft node card in
-  its thread from the deterministic drafter: the message verbatim and a link
-  to it, title from its first line, parent the map root, checkpoint slugged
-  from the title, autonomy `propose`, and the hash of that spec.
-  Each card is a reply to the mention it answers. The journal keeps a cursor
-  per thread and one draft per message id, so a re-read posts no second card.
-  A failed read posts nothing and moves no cursor; a mention whose content
-  Discord withheld stops the thread there and reports it; the mentions ahead
-  of it are still drafted. A thread two walked maps share is skipped, not read:
-  a draft's parent is its map's root, and a shared thread names no one map.
-- **Journal loss (node #249, #21 ruling D14, D1):** a thread with no cursor
-  is read from its oldest message, five pages per tick. A mention with no
-  journaled draft is drafted unless a ranger card replying to it says
-  "filed as #N" or "discarded"; a card still in draft does not count. A
-  mention is decided once the read saw the thread's end or a whole page run
-  past it; until then the cursor parks just before it. The worst case is a
-  visible duplicate draft, and a 👍 on it finds the intake marker and edits
-  that card to "filed as #N" without a second add. The journal cannot tell
-  a lost cursor from a thread never read, so turning intake on for a thread
-  that already holds the principal's @-mentions of the bot drafts each one no
-  ranger card has answered: one card per past mention, filed only on a 👍.
-- **Claude drafter (node #252, #21 ruling D12):** with spawn budget left, one
-  tool-less `claude -p` call on `intake.model` (default `haiku`) drafts the
-  title, parent, checkpoint, kind, autonomy and probes from the message and
-  the map's open nodes (the root and the frontier the walk cached), charged to
-  the spawn ledger. The message and node titles reach the model only as JSON
-  data; the answer is parsed, never run. The parent must be one of those open
-  nodes, autonomy `auto`/`propose`/`approve`, kind one of
-  research/prototype/grilling/task/build, the checkpoint a slug, and each
-  probe a soma probe. A spent budget, a call that fails, times out or returns
-  non-JSON, or any field that fails falls back to the whole deterministic
-  draft; the card says "drafted by claude" or "deterministic draft" and why.
-  With too little of the pass left for a call, the rest of the thread waits
-  for the next tick. The journal records the whole drafted spec (migration
-  0026).
-- **Intake gate (node #251, #21 rulings D4/D5/D13/D14, D1):** the same tick
-  reads the 👍 and ❌ reactions on each open draft card (at most 10 per
-  thread, least recently read first). A ❌ from `principal.discordId`
-  discards the draft and edits the card to "discarded"; it wins over a 👍.
-  A 👍 from the principal files it: the journaled spec must still hash to
-  the hash the card shows, the write identity must pass
-  `assertWriteIdentity`, the autonomy must be propose or approve, and no
-  issue the machine account wrote labelled `ranger:principal-intake` may
-  already end in `<!-- ranger:intake discord=<msgId> -->` (the labelled
-  issues are listed once per thread per tick). Then `soma graph add
-  <parent> --json` below the journaled parent, as the machine account,
-  labelled `ranger:principal-intake`, with the message verbatim, a link to
-  it and the marker as the body's last line, and the card is edited to
-  "filed as #N". The row goes to `filing` before the add, so a tick that
-  dies after the add finds the node by its marker next time, links it below
-  its parent (a no-op when attached) and adds no second. A failed reaction read,
-  identity check or marker lookup files nothing that tick; a 👍 from anyone
-  else is ignored. The tracker's node and marker are the binding record; the
-  journal is a cache.
-- **Intake corrections (node #241, #21 ruling D13):** the principal replies
-  to the current draft card with a bot @-mention naming changes, e.g.
-  "parent #40, kind build". Claude applies the reply to the previous spec;
-  when it cannot, `parent #N`, `kind <k>`, `autonomy <a>`, `title: <text>`
-  and `checkpoint <slug>` are read off it, and a field not understood keeps
-  its previous value and the card says so. Ranger posts a new draft card
-  (a reply to the correction) with the corrected spec and its own spec hash,
-  and edits the old card to "superseded → <link>"; the old row goes
-  `superseding` → `superseded` and its reactions are never read again, so
-  only a 👍 on the newest card files. The chain keeps the mention's body,
-  link and marker: one observation files at most one node. A reply to a
-  superseded, filed or discarded card, a reply by anyone else and a reply
-  without a bot mention change nothing.
-- **Acceptance (e2e):** an auto research node walked end-to-end against fake
-  soma/gh/worker fixtures — claim → worktree → findings branch pushed → draft
-  PR → successful CI citation → gated close → `decisions --write`. Live close
-  validation for node #25 remains a supervisor action after deployment.
+Scout needs a read-only token for every map. It refuses a map whose token is unset or can write. [Scout](docs/scout.md) describes the checks.
 
-## Scheduled jobs (node #301)
+## Run ranger on a schedule
 
-A job is a skill ranger runs headless on a resource lane, outside the graph:
-it opens no PR, claims no node and writes no graph. Declare it in
-`ranger.yaml`:
+Autonomous work runs under the machine account, never under the principal's credentials. Two pieces set that up:
 
-```yaml
-jobs:
-  - name: daily-short          # what `ranger job enqueue` takes; the ledger's ran.ref
-    skill: daily-short         # `/daily-short` on Claude; "Use the … skill." elsewhere
-    prompt: ""                 # optional text after the skill
-    lane: visual               # visual | headless
-    wallClockMin: 90           # past it the session's process group is killed
-    cwd: ~/work/far-between/shorts
-    substrates: [claude]       # optional; default all three, picked by quota
-    requireResult: true        # optional; a clean exit with no result fails
+- `ops/bin/ranger.example` is the wrapper that every scheduled run goes through. It reads the tokens from the macOS keychain, clears the caller's environment, and starts ranger. Copy it to `~/bin/ranger`, replace `__USER__`, and make it executable. Set `RANGER_DIR` in it to the directory that holds ranger: your checkout, or the arc install directory.
+- `ops/launchd/` holds the launchd jobs. `ch.invisible.ranger-tick` runs `ranger tick` every 10 minutes. `ch.invisible.ranger-serve` keeps the dashboard running. `ch.invisible.ranger-escalate` sends the daily digest at 07:30 local time. Copy each one to `~/Library/LaunchAgents/`, replace `__USER__`, and load it with `launchctl load`.
+
+Each tick posts escalation cards, then claims frontier nodes and starts their workers, then sweeps for crashed workers. [The walk](docs/walk.md) covers what a tick claims and how each lane ends.
+
+## Commands
+
+| Command | What it does |
+| --- | --- |
+| `scout` | Reports every map's frontier, audit, and waiting nodes. Writes nothing. |
+| `tick` | Runs one bounded pass: escalation cards, then the walk. The launchd job runs this. |
+| `walk` | Claims frontier nodes, starts detached `run-node` workers, then sweeps. |
+| `run-node <id>` | Supervises one node's worker session and then runs the node kind's steps to its close. |
+| `sweep` | Reconciles the journal with crashed workers and stale claims. |
+| `escalate` | Posts and edits the decision cards in each map's Discord thread. `--digest` sends the daily digest. |
+| `serve` | Runs the local dashboard. |
+| `job` | Queues, runs, and lists scheduled jobs. |
+| `journal` | Shows the journal's workers, events, and health. |
+| `merge-gate <id>` | Checks one node's PR against the merge desk's gate. Exits 0 only when the gate passes. |
+| `merge-desk` | Runs one map's merge desk now. |
+| `approve-node <id>` | Approves an `approve` node at the version its approval card shows. |
+| `build-now <id>` | Claims one walkable node and starts its worker now. |
+| `resume-node <id>` | Puts a parked or failed node back in motion. `--when-free` queues it for a free lane. |
+| `resume-run` | Clears the dead-man pause. |
+| `drain` | Stops new claims on the visual lane or on one headless map. `--off` lifts it. |
+| `trust-git` | Lists changes to a canonical checkout's git config and hooks, and records a known-good state. |
+| `remote-test` | Operator tooling for the private remote test executor. |
+
+`ranger <command> --help` lists each command's options.
+
+## Documentation
+
+[The docs index](docs/README.md) lists every document. Start with these:
+
+- [Configuration](docs/configuration.md): `ranger.yaml`, credentials, and the tick run ledger.
+- [The walk](docs/walk.md): claims, the research and implement lanes, and proposals.
+- [Lanes and the resume queue](docs/lanes.md): resource lanes, drains, host load, and queued resumes.
+- [Observation intake](docs/intake.md): turning the principal's Discord mentions into graph nodes.
+- [Scheduled jobs](docs/jobs.md): skills that ranger runs on a lane, outside the graph.
+- [The dashboard](docs/serve.md): `ranger serve` and the verbs it runs.
+
+## Rules ranger keeps
+
+- Ranger changes the graph only through the `soma graph` verbs, never with raw tracker writes.
+- Autonomous ticks run under the machine account. A tick refuses to change the graph when its identity resolves to the principal.
+- `propose` and `approve` nodes go to the principal. Ranger never takes the principal's side of a decision.
+- Claims start without a veto window. Anything blocked waits for the principal (node #7).
+
+## Develop ranger
+
+```bash
+bun run test        # unit and end-to-end tests, four files at a time
+bun run typecheck
+bun run lint
 ```
 
-- `ranger job enqueue <name>` queues one run (a Reflex fire runs it through a
-  cortex process spec). A second enqueue while that run is still queued is a
-  no-op; an unknown name exits 1 and queues nothing.
-- The tick's job pass runs after the merge desks and queued resumes, before
-  fresh claims. A queued run starts when its lane is free and waits while the
-  walk is paused, the visual lane is drained, the daily spawn cap is spent, or
-  the lane is held. A running job holds its lane like an implement session
-  (`laneHolder`), so a visual job never runs beside a visual implement session.
-- The tick spawns a detached `ranger job run <id>`. It picks the substrate by
-  quota among the job's `substrates` (the first one when the pick falls
-  outside), runs the session in `cwd` under the worker host env (no ranger
-  credentials, a per-session journal), and logs to
-  `<journal dir>/logs/jobs/<name>-<id>.log`. A visual job keeps normal CPU
-  priority; a headless one runs at `workers.niceness`.
-- Each finished run is reported as an `execution.run.finished`: `ran: {kind:
-  job, ref: <name>}`, `succeeded` or `failed`, the session log as
-  `detail_ref`, and a `run_id` fixed when the run was queued. Why a run
-  failed (`budget`, `exit <n>`, `no result`, `crashed`, `spawn`) stays in the journal
-  row, since the envelope carries no free text. The run is marked reported
-  once its envelope is handed to the ledger. A process cut off before that is
-  reported by the next tick's sweep, and a crash between the hand-off and the
-  mark repeats the envelope with the same `run_id`. Like the tick and
-  run-node emitters, the hand-off fails open: a failed ledger write records a
-  `ledger-failed` journal event and is not retried.
-- A session reports what it produced by writing one line to
-  `$RANGER_JOB_RESULT_FILE`. A `soma:` relative path on a succeeded run rides
-  the envelope as `result_ref` (myelin v0.10.0). Anything else, such as a URL,
-  stays in the journal row only. To surface a URL, write a small soma file
-  that holds it and report that file's `soma:` path. With `requireResult:
-  true`, a session that exits 0 without writing a result fails as `no
-  result`: a skill that a gate stopped cleanly is not reported as a success.
-- A running row whose supervisor died is failed as `crashed` on the next
-  tick, and its session group is killed once `ps` confirms it still runs the
-  job's skill. `ranger job list` prints the runs.
+The tests run against fake `soma`, `gh`, and worker fixtures. [AGENTS.md](AGENTS.md) lists the rules that agents working in this repo most often break, and the check that enforces each one.
 
-## Doctrine anchors
+## License
 
-- The seven `soma graph` verbs are the only graph API ranger uses — never raw tracker writes.
-- No autonomous ticking under the principal's credentials; headless work runs under the
-  machine account.
-- HITL nodes (`propose`/`approve`) route to the principal; ranger never stands in for
-  the human's side of a decision.
-- Claims proceed automatically (no veto window); blocking items wait indefinitely
-  for the principal (node #7).
+MIT. See [LICENSE](LICENSE).

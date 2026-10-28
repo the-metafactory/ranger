@@ -65,7 +65,7 @@ import { budgetedRead, budgetPolicy } from "./budget.ts";
 import { GraphAddUnattached, closeTimeoutForNode, graphAdd, graphClose, graphDecisions, graphLink, type AddSpec, type CloseResult } from "./graph-write.ts";
 import { FixNodeLockBusy, withFixNodeLock } from "./fix-node-lock.ts";
 import { assertFilable, codeCommentSpec, foundByProbeSpec, landminesInDiff, scribeFile, splitOutOfReviewSpec, type Provenance, type ScribeGraph } from "./scribe.ts";
-import { FencedError, type ImplementPhase, type Journal } from "./journal.ts";
+import { FencedError, type EventKind, type ImplementPhase, type Journal } from "./journal.ts";
 import { assembleImplementPrompt } from "./prompt.ts";
 import { BLOCKED_REPORT_FILE, blockerNoteBranch, discardBlockedReport, readBlockedReport, type BlockedReport } from "./blocked-report.ts";
 import { ReviewError, sageReview, type ReviewVerdict } from "./review.ts";
@@ -3082,6 +3082,8 @@ const PLAIN_STEP = /^[\w./@:=+,%-]+(?: +[\w./@:=+,%-]+)*$/;
 
 const plainBunTest = (step: string): boolean => PLAIN_STEP.test(step) && /^bun test(?: |$)/.test(step);
 
+const PACKAGE_TEST_STEPS = new Set(["bun run test", "npm test", "npm run test"]);
+
 function packageTestScript(cwd: string): unknown {
  const pkg: unknown = JSON.parse(readFileSync(join(cwd, "package.json"), "utf8"));
  if (typeof pkg !== "object" || pkg === null || !("scripts" in pkg)) return undefined;
@@ -3092,7 +3094,10 @@ function packageTestScript(cwd: string): unknown {
 
 /**
  * A test command a base-red waiver can split: plain steps joined by `&&`,
- * exactly one of them `bun test`. `bun` is that step, `rest` every other
+ * exactly one of them `bun test`. A `bun run test`, `npm test` or
+ * `npm run test` step (PACKAGE_TEST_STEPS) stands for the package's `test`
+ * script, read through `readTestScript`, and counts only when that script is
+ * a plain `bun test` step. `bun` is that step, `rest` every other
  * step, in order, joined by `&&` ("" when the command is `bun test` alone).
  * Null for any other shape (`;`, `||`, a pipe, quotes, an expansion, two bun
  * steps, an unresolved script): what failed beside bun cannot be
@@ -3102,7 +3107,7 @@ export function bunTestChain(command: string, readTestScript?: () => unknown): {
  const steps = command.split("&&").map((s) => s.trim());
  if (!steps.every((s) => PLAIN_STEP.test(s))) return null;
  for (let i = 0; i < steps.length; i++) {
-  if (steps[i] !== "bun run test") continue;
+  if (!PACKAGE_TEST_STEPS.has(steps[i])) continue;
   try {
    const script = readTestScript?.();
    if (typeof script !== "string" || !plainBunTest(script.trim())) return null;
@@ -3208,6 +3213,15 @@ function testsFailedDetail(testCommand: string, tests: RunResult, after: string)
  * branch, and a base run on that host would be none about the base (node
  * #297: every failure across four such runs on cortex #2557 was a 4–5 s
  * timeout at load 58–108 on 10 cores; the same head passed 11494/0 alone).
+ * So does a retry that started on a quiet host and failed on a host busy as
+ * it ends (`endedOnBusyHost`): the quiet-host wait sees only the start, and
+ * the load can climb during the run (node #430, 2026-10-27/28: six failures,
+ * almost all 5 s or 60 s timeouts, started at load 14.6–27.8 and ran at
+ * 25.7–346.3; ranger paused at a dead-man count of 3). `busy` then carries
+ * both loads. Such a park, and a kill with no failing test on a busy host
+ * (`killedOnBusyHost`), share one park per node a day (`parksOnceADay`): a
+ * second within 24 hours is the node's failure, so a branch that is truly
+ * broken still fails.
  */
 async function supervisorTests(
  ctx: ImplementContext,
@@ -3245,7 +3259,7 @@ async function supervisorTests(
   journal.recordEvent("reviewed", { nodeId: node.ref.id, repo: map.repo, detail: `tests (${testCommand}) passed on the retry in a fresh checkout` });
   return { tests, retried: true };
  }
- const busy = retry.busy ?? killedOnBusyHost(ctx, tests, `the test retry (${testCommand})`);
+ const busy = retry.busy ?? endedOnBusyHost(ctx, tests, retry.started, `the test retry (${testCommand})`);
  if (busy !== null) return { tests, retried: false, busy };
  return { tests, retried: false, ...await baseRedAt(ctx, { testCommand, tests, head, label, baseTip }) };
 }
@@ -3299,7 +3313,8 @@ async function baseRedAt(ctx: ImplementContext, run: FailedRun): Promise<{ baseR
  * commit its failures are compared with.
  *
  * Only the `bun test` step is waived: the command must be plain steps joined
- * by `&&`, one of them `bun test` (bunTestChain), and every other step then
+ * by `&&`, one of them `bun test` or a `bun run test`, `npm test` or
+ * `npm run test` step whose package script is one (bunTestChain), and every other step then
  * runs on its own in a fresh clone of `head` and must pass, so a lint or
  * typecheck failure beside the shared tests (or one the failing bun step
  * kept from running) still gates.
@@ -3474,9 +3489,10 @@ async function mergeBaseInFreshClone(ctx: ImplementContext, head: string, baseTi
  * install and the tests once more in a fresh clone of `sha`. Null when the
  * host is not busy: no retry. `ran` is freshCheckoutTests' own: false when
  * the retry's clone, install or checkout check failed (or the local run never
- * happened), so its result is no evidence. `busy` is the load the retry
- * started at when the quiet-host wait ran out first, else null: a busy
- * retry's failure is the host's, not the branch's (node #297).
+ * happened), so its result is no evidence. `started` is the load the retry
+ * started at; `busy` is that load when the quiet-host wait ran out first,
+ * else null: a busy retry's failure is the host's, not the branch's (node
+ * #297).
  */
 async function retryOnBusyHost(
  ctx: ImplementContext,
@@ -3485,7 +3501,7 @@ async function retryOnBusyHost(
  what: string,
  run: string,
  label: string,
-): Promise<{ ran: boolean; result: RunResult; busy: HostLoadReading | null } | null> {
+): Promise<{ ran: boolean; result: RunResult; started: HostLoadReading; busy: HostLoadReading | null } | null> {
  const host = busyHostNow(ctx);
  if (host === null) return null;
  ctx.journal.recordEvent("reviewed", {
@@ -3501,7 +3517,7 @@ async function retryOnBusyHost(
   return fresh.result;
  };
  const result = ctx.map.testBackend?.kind === "shadow" ? await backendTests(ctx, sha, local) : await local();
- return { ran, result, busy: isQuiet(started, busyLoad(ctx)) ? null : started };
+ return { ran, result, started, busy: isQuiet(started, busyLoad(ctx)) ? null : started };
 }
 
 /**
@@ -3522,23 +3538,41 @@ const KILLED_ON_BUSY_HOST = "was killed with no failing test while the host was 
  * #802 and #853 failed on 20-minute timeouts with no failing test). The load
  * now, or null when the run named a failure or the host is quiet. A hanging
  * suite's own processes can read as a busy host too, so this parks once per
- * node a day: a second such kill within 24 hours is the node's failure.
+ * node a day (`parksOnceADay`): a second park within 24 hours is the node's
+ * failure.
  */
 function killedOnBusyHost(ctx: ImplementContext, tests: RunResult, what: string): BusyReading | null {
- if (tests.code !== -1 || allFailedTestNames(tests).length > 0) return null;
+ if (!killedWithNoFailure(tests)) return null;
  const host = busyHostNow(ctx);
  if (host === null) return null;
+ return parksOnceADay(ctx, "host-killed", `${what} ${KILLED_ON_BUSY_HOST} (${describeLoad(host, busyLoad(ctx))})`) ? { ...host, killed: true } : null;
+}
+
+const killedWithNoFailure = (tests: RunResult) => tests.code === -1 && allFailedTestNames(tests).length === 0;
+
+function endedOnBusyHost(ctx: ImplementContext, tests: RunResult, started: HostLoadReading, what: string): BusyReading | null {
+ if (killedWithNoFailure(tests)) return killedOnBusyHost(ctx, tests, what);
+ const host = busyHostNow(ctx);
+ if (host === null) return null;
+ const loads = `started on a quiet host (${describeLoad(started)}) and ended on a busy one (${describeLoad(host, busyLoad(ctx))})`;
+ return parksOnceADay(ctx, "host-busy-end", `${what} failed: it ${loads}`) ? { ...host, startedAt: started } : null;
+}
+
+const BUSY_HOST_PARKS = ["host-killed", "host-busy-end"] as const satisfies EventKind[];
+
+function parksOnceADay(ctx: ImplementContext, kind: (typeof BUSY_HOST_PARKS)[number], detail: string): boolean {
  const nodeId = ctx.node.ref.id;
  const repo = ctx.map.repo;
- const again = ctx.journal.countEventsSince("host-killed", repo, nodeId, new Date(Date.now() - 24 * 60 * 60 * 1000)) > 0;
- ctx.journal.recordEvent(again ? "reviewed" : "host-killed", {
+ const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+ const again = BUSY_HOST_PARKS.some((parked) => ctx.journal.countEventsSince(parked, repo, nodeId, since) > 0);
+ ctx.journal.recordEvent(again ? "reviewed" : kind, {
   nodeId,
   repo,
   detail: again
-   ? `${what} ${KILLED_ON_BUSY_HOST} (${describeLoad(host, busyLoad(ctx))}) for the second time in 24h — it counts as the node's failure`
-   : `${what} ${KILLED_ON_BUSY_HOST} (${describeLoad(host, busyLoad(ctx))}) — it parks for a quiet host once; a second time in 24h counts`,
+   ? `${detail} for the second time in 24h — it counts as the node's failure`
+   : `${detail} — it parks for a quiet host once; a second time in 24h counts`,
  });
- return again ? null : { ...host, killed: true };
+ return !again;
 }
 
 /**

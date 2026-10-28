@@ -8,6 +8,7 @@ import { implementLane } from "./lanes.ts";
 import { resumeNode } from "./resume.ts";
 import { Command } from "commander";
 import { join } from "node:path";
+import pkg from "../package.json" with { type: "json" };
 import {
  principalLoginForRepo,
  loadConfig,
@@ -669,7 +670,7 @@ const program = new Command();
 program
  .name("ranger")
  .description("Autonomous orienteer work-graph walker")
- .version("0.1.0");
+ .version(pkg.version);
 
 const remoteTest = program.command("remote-test")
  .description("Operator-only remote-test tooling; local verification remains the default");

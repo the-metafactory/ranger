@@ -1,0 +1,67 @@
+schema: arc/v1
+name: ranger
+version: 0.1.2
+type: tool
+tier: community
+description: Autonomous orienteer work-graph walker — scout (read-only digest) plus the claim and research lane (walk, run-node, sweep).
+license: MIT
+repository: https://github.com/the-metafactory/ranger
+
+author:
+  name: Jens-Christian Fischer
+  github: jcfischer
+
+provides:
+  cli:
+    - name: ranger
+      command: bun src/cli.ts
+      description: Scout, walk and sweep orienteer maps; claim, run and resume work-graph nodes.
+
+depends_on:
+  tools:
+    - name: bun
+      version: ">=1.3.0"
+    - name: git
+    - name: gh
+      version: ">=2.0.0"
+    - name: soma
+
+capabilities:
+  filesystem:
+    read:
+      - "~/.config/ranger/**"
+      - "~/work/**"
+    write:
+      - "~/.config/ranger/**"
+      - "~/work/**"
+  network:
+    - host: api.github.com
+      reason: Read and write work-graph issues, pull requests and check runs.
+    - host: discord.com
+      reason: Post escalations and digests to the principal.
+    - host: localhost
+      reason: Dashboard server and the local NATS bus.
+  bash:
+    allowed: true
+    restricted_to:
+      - bun
+      - git
+      - gh
+      - glab
+      - soma
+      - claude
+      - pi
+      - codex
+      - ssh
+      - podman
+      - osascript
+  secrets: []
+
+bundle:
+  exclude:
+    - node_modules
+    - .claude-wt
+    - .ranger-worktrees
+    - .pi
+    - design
+    - test
