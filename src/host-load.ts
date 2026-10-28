@@ -9,8 +9,12 @@ export interface HostLoadReading {
 
 export type HostLoad = () => HostLoadReading;
 
-/** A busy reading a park carries: `killed` when the retry was killed with no failing test, not failed. */
-export type BusyReading = HostLoadReading & { killed?: boolean };
+/**
+ * A busy reading a park carries: `killed` when the retry was killed with no
+ * failing test, not failed; `startedAt` when the retry started on a quiet
+ * host, failed, and the host read busy as it ended (node #430), the load it started at.
+ */
+export type BusyReading = HostLoadReading & { killed?: boolean; startedAt?: HostLoadReading };
 
 /**
  * The host's real load, except under test (RANGER_UNDER_TEST=1, node #66),

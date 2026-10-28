@@ -9,7 +9,7 @@
  */
 
 import { changeRequestLabel } from "./forge-text.ts";
-import { describeLoad, type HostLoadReading } from "./host-load.ts";
+import { describeLoad, type BusyReading, type HostLoadReading } from "./host-load.ts";
 
 /** Defined once in labels.ts; re-exported for the outcome texts that name it. */
 export { NEEDS_EYE_LABEL } from "./labels.ts";
@@ -348,14 +348,19 @@ export function waitingForQuietHost(host: HostLoadReading, busyLoad?: number): s
 
 /**
  * The supervisor's tests failed and their one busy-host retry ran on a busy
- * host too and failed (node #297): no worker session runs, and a resume is
+ * host too and failed (node #297), or started on a quiet host, failed, and
+ * the host read busy as it ended (node #430): no worker session runs, and a resume is
  * queued that starts once the host is quiet. The wait reason leads, then up
  * to three failing tests: the row keeps 400 characters of an outcome.
  */
-export function hostLoadOutcome(r: HostLoadReading & { what: string; names: string[]; busyLoad?: number; killed?: boolean }): string {
+export function hostLoadOutcome(r: BusyReading & { what: string; names: string[]; busyLoad?: number }): string {
  const names = r.names.slice(0, 3).map((n) => (n.length > 90 ? `${n.slice(0, 89)}…` : n));
  const failing = names.length > 0 ? `failing: ${names.join("; ")}` : "failing test names unavailable";
- const retry = r.killed === true ? "the retry was killed with no failing test while the host was busy" : "the retry ran on a busy host too and failed";
+ const retry = r.killed === true
+  ? "the retry was killed with no failing test while the host was busy"
+  : r.startedAt === undefined
+   ? "the retry ran on a busy host too and failed"
+   : `the retry started on a quiet host (${describeLoad(r.startedAt)}), failed, and the host read busy as it ended`;
  return `${waitingForQuietHost(r, r.busyLoad)} — ${r.what} failed, and ${retry} (${failing}); a resume is queued for when the host is quiet, with no worker session meanwhile`;
 }
 

@@ -274,8 +274,13 @@ export type EventKind =
  | "ledger-failed"
  | "ledger-root-serves-invalid"
  | "resume-queued"
- /** A test retry killed with no failing test on a busy host parked the node (its once-a-day limit reads these). */
+ /**
+  * A test retry parked the node for a quiet host: killed with no failing test
+  * on a busy host, or started quiet and failed with the host busy at its end
+  * (node #430). The once-a-day limit reads both.
+  */
  | "host-killed"
+ | "host-busy-end"
  /** Scheduled jobs (node #301). */
  | "job-queued"
  | "job-started"
