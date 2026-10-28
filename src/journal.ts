@@ -276,8 +276,8 @@ export type EventKind =
  | "resume-queued"
  /**
   * A test retry parked the node for a quiet host: killed with no failing test
-  * on a busy host, or started quiet and failed as the host turned busy (node
-  * #430). The once-a-day limit reads both.
+  * on a busy host, or started quiet and failed with the host busy at its end
+  * (node #430). The once-a-day limit reads both.
   */
  | "host-killed"
  | "host-busy-end"

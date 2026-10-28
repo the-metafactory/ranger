@@ -47,7 +47,7 @@ describe("a supervisor test retry that ends on a busy host (node #430)", () => {
   const outcome = await runNode("20", r.ctx);
   expect(outcome.status).toBe("failed");
   expect(outcome.detail).toMatch(HOST_LOAD_OUTCOME);
-  expect(outcome.detail).toContain("the retry started on a quiet host (load 0.0 on 1 cores) and failed as the host turned busy (failing: ConfigWatcher > reloads on change)");
+  expect(outcome.detail).toContain("the retry started on a quiet host (load 0.0 on 1 cores), failed, and the host read busy as it ended (failing: ConfigWatcher > reloads on change)");
   expect(r.journal.listResumeQueue().map((q) => [q.nodeId, q.reason])).toEqual([["20", "host-load"]]);
   expect(r.journal.deadmanCount()).toBe(0);
   expect(r.github.prs.size).toBe(0);

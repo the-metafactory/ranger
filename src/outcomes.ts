@@ -348,8 +348,8 @@ export function waitingForQuietHost(host: HostLoadReading, busyLoad?: number): s
 
 /**
  * The supervisor's tests failed and their one busy-host retry ran on a busy
- * host too and failed (node #297), or started on a quiet host and failed as
- * it turned busy (node #430): no worker session runs, and a resume is
+ * host too and failed (node #297), or started on a quiet host, failed, and
+ * the host read busy as it ended (node #430): no worker session runs, and a resume is
  * queued that starts once the host is quiet. The wait reason leads, then up
  * to three failing tests: the row keeps 400 characters of an outcome.
  */
@@ -360,7 +360,7 @@ export function hostLoadOutcome(r: BusyReading & { what: string; names: string[]
   ? "the retry was killed with no failing test while the host was busy"
   : r.startedAt === undefined
    ? "the retry ran on a busy host too and failed"
-   : `the retry started on a quiet host (${describeLoad(r.startedAt)}) and failed as the host turned busy`;
+   : `the retry started on a quiet host (${describeLoad(r.startedAt)}), failed, and the host read busy as it ended`;
  return `${waitingForQuietHost(r, r.busyLoad)} — ${r.what} failed, and ${retry} (${failing}); a resume is queued for when the host is quiet, with no worker session meanwhile`;
 }
 

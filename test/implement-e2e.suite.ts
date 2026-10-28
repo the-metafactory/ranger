@@ -3302,7 +3302,7 @@ describe("implement lane (node #23)", () => {
    if (named) {
     expect(queued.map((q) => [q.nodeId, q.reason])).toEqual([["20", "host-load"]]);
     expect(r.journal.deadmanCount()).toBe(0);
-    expect(outcome.detail).toContain("the retry started on a quiet host (load 0.0 on 1 cores) and failed as the host turned busy");
+    expect(outcome.detail).toContain("the retry started on a quiet host (load 0.0 on 1 cores), failed, and the host read busy as it ended");
    } else {
     expect(queued.map((q) => [q.nodeId, q.reason])).toEqual([["20", "host-load"]]);
     expect(r.journal.deadmanCount()).toBe(0);

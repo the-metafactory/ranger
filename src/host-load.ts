@@ -12,7 +12,7 @@ export type HostLoad = () => HostLoadReading;
 /**
  * A busy reading a park carries: `killed` when the retry was killed with no
  * failing test, not failed; `startedAt` when the retry started on a quiet
- * host and failed as it turned busy (node #430), the load it started at.
+ * host, failed, and the host read busy as it ended (node #430), the load it started at.
  */
 export type BusyReading = HostLoadReading & { killed?: boolean; startedAt?: HostLoadReading };
 
