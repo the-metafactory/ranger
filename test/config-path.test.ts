@@ -32,6 +32,12 @@ describe("resolveConfigPath", () => {
    .toBe(join(dir, "env/ranger.yaml"));
  });
 
+ test("relative flag and RANGER_CONFIG resolve against the arc shim's ARC_INVOCATION_CWD, not the install dir", () => {
+  const env = { ARC_INVOCATION_CWD: join(dir, "caller"), RANGER_CONFIG: "../env/ranger.yaml" };
+  expect(resolveConfigPath(undefined, env, join(dir, "install"))).toBe(join(dir, "env/ranger.yaml"));
+  expect(resolveConfigPath("flag.yaml", env, join(dir, "install"))).toBe(join(dir, "caller/flag.yaml"));
+ });
+
  test("absent flag and environment read ~/.config/ranger/ranger.yaml, not the working directory", () => {
   expect(resolveConfigPath(undefined, {}, dir)).toBe(join(homedir(), ".config", "ranger", "ranger.yaml"));
  });

@@ -1,0 +1,106 @@
+name: Publish Ranger
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  publish:
+    name: Publish Ranger
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Install Arc
+        run: |
+          ARC_ROOT="${RUNNER_TEMP}/arc"
+          git clone --depth 1 https://github.com/the-metafactory/arc.git "${ARC_ROOT}"
+          (
+            cd "${ARC_ROOT}"
+            bun install --frozen-lockfile
+          )
+
+          mkdir -p "${RUNNER_TEMP}/bin"
+          cat > "${RUNNER_TEMP}/bin/arc" <<SH
+          #!/usr/bin/env bash
+          exec bun "${ARC_ROOT}/src/cli.ts" "\$@"
+          SH
+          chmod +x "${RUNNER_TEMP}/bin/arc"
+          echo "${RUNNER_TEMP}/bin" >> "${GITHUB_PATH}"
+          echo "ARC_ROOT=${ARC_ROOT}" >> "${GITHUB_ENV}"
+
+      - name: Configure Arc source
+        env:
+          METAFACTORY_TOKEN: ${{ secrets.METAFACTORY_TOKEN }}
+        run: |
+          if [ -z "${METAFACTORY_TOKEN}" ]; then
+            echo "::error::METAFACTORY_TOKEN secret is not set"
+            exit 1
+          fi
+
+          # Isolate Arc from its XDG migration. The explicit config root becomes
+          # the sole source for both the bundle and publish steps below.
+          ARC_CONFIG_DIR="${RUNNER_TEMP}/arc-config"
+          mkdir -p "${ARC_CONFIG_DIR}"
+          (
+            cd "${ARC_ROOT}"
+            ARC_CONFIG_DIR="${ARC_CONFIG_DIR}" bun -e '
+              import YAML from "yaml";
+              const token = process.env.METAFACTORY_TOKEN;
+              const target = process.env.ARC_CONFIG_DIR + "/sources.yaml";
+              await Bun.write(target, YAML.stringify({
+                sources: [{
+                  name: "prod",
+                  url: "https://meta-factory.ai",
+                  tier: "official",
+                  enabled: true,
+                  type: "metafactory",
+                  token,
+                }],
+              }));
+            '
+          )
+
+          # Pre-flight: confirm a non-empty token actually landed in the prod
+          # source before bundling/publishing. Prints presence only — never
+          # the token value. `arc publish` reports a bare "Not authenticated"
+          # when source.token is falsy, which is opaque; fail here with a
+          # clear message instead.
+          if (
+            cd "${ARC_ROOT}"
+            ARC_CONFIG_DIR="${ARC_CONFIG_DIR}" bun -e '
+              import YAML from "yaml";
+              const config = YAML.parse(await Bun.file(process.env.ARC_CONFIG_DIR + "/sources.yaml").text());
+              const token = config?.sources?.find((source) => source?.name === "prod")?.token;
+              if (typeof token !== "string" || token.length === 0) process.exit(1);
+            '
+          ); then
+            echo "auth pre-flight: prod token present in sources.yaml"
+          else
+            echo "::error::METAFACTORY_TOKEN did not land as a non-empty prod token in sources.yaml"
+            exit 1
+          fi
+
+          echo "ARC_CONFIG_ROOT=${ARC_CONFIG_DIR}" >> "${GITHUB_ENV}"
+
+      - name: Bundle
+        id: bundle
+        run: |
+          VERSION="$(bun -e "console.log(require('./package.json').version)")"
+          TARBALL="ranger-${VERSION}.tar.gz"
+          arc bundle --output "${TARBALL}"
+          echo "tarball=${TARBALL}" >> "${GITHUB_OUTPUT}"
+
+      - name: Publish
+        run: arc publish -t "${{ steps.bundle.outputs.tarball }}" --scope metafactory -s prod

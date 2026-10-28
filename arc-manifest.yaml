@@ -1,10 +1,10 @@
 schema: arc/v1
 name: ranger
-version: 0.1.0
+version: 0.1.1
 type: tool
 tier: community
 description: Autonomous orienteer work-graph walker — scout (read-only digest) plus the claim and research lane (walk, run-node, sweep).
-license: UNLICENSED
+license: MIT
 repository: https://github.com/the-metafactory/ranger
 
 author:
