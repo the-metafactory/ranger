@@ -11,7 +11,7 @@ Ranger runs on [Bun](https://bun.sh) 1.3 or later and calls `git`, `gh`, and `so
 To install a release with [arc](https://github.com/the-metafactory/arc):
 
 ```bash
-arc install https://github.com/the-metafactory/ranger --pin v0.1.1
+arc install https://github.com/the-metafactory/ranger --pin v0.1.2
 ```
 
 Arc clones the release, runs `bun install`, and puts a `ranger` shim in its bin directory (`arc config get bin-dir`). Releases are listed on [the releases page](https://github.com/the-metafactory/ranger/releases).
