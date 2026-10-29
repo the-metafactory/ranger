@@ -9,6 +9,7 @@ import { publishReceiptFile } from "./artifacts.ts";
 import { BUS_TEST_CAPABILITY } from "./bus-admission.ts";
 import { authorizeBusProducer, BUS_LIMITS, validateBusConfig, validateBusRequest, type BusConfig } from "./bus-contract.ts";
 import type { DurablePublisher } from "./bus-outbox.ts";
+import { busRuntimeStartArgs, type BusSigner } from "./bus-runtime.ts";
 import { Sha256Schema, type RemoteTestJob } from "./contract.ts";
 import { bindsNatsAccount, readNatsCredentials, writeNatsCredentialsSnapshot, type NatsCredentials } from "./nats-credentials.ts";
 import { readPrivateJson, reserve, saveJob } from "./private-io.ts";
@@ -42,7 +43,7 @@ const RecordSchema = z.object({
  envelope: z.unknown(),
 }).strict();
 
-export interface BusSigner { readonly issuer: string; readonly seed: Uint8Array }
+export type { BusSigner } from "./bus-runtime.ts";
 /** The saved request identity. It carries no submission result: a success
  * marker is never persisted, so loading it can only replay the same request. */
 export type BusRequestRecord = Omit<z.infer<typeof RecordSchema>, "job" | "envelope"> & { job: RemoteTestJob; envelope: MyelinEnvelope };
@@ -77,12 +78,8 @@ export const connectBusPublisher = (start: typeof startMyelinRuntime): BusPublis
  try {
   const credsPath = await writeNatsCredentialsSnapshot(directory, credentials);
   for (const url of bus.transport.servers) {
-   const config = { agent: { name: "ranger", displayName: "Ranger" }, nats: { url, name: "ranger", subjects: [], credsPath } } as unknown as Parameters<typeof startMyelinRuntime>[0];
    try {
-    const runtime = await start(config, {
-     jetstreamDomain: bus.target.domain, signer: { principal: signer.issuer, rawSeedBytes: signer.seed },
-     signFailureMode: "drop", stack: bus.routing.stack, principal: bus.routing.principal,
-    });
+    const runtime = await start(...busRuntimeStartArgs({ bus, signer, url, credsPath, name: "ranger" }));
     const publishDurable = runtime.publishDurable?.bind(runtime);
     if (!runtime.enabled || !publishDurable) { await runtime.stop(); throw Error("Bus runtime cannot publish durably"); }
     return { publishDurable, close: () => runtime.stop().finally(discard) };

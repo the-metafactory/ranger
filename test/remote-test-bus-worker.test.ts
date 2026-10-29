@@ -16,6 +16,7 @@ import { reconcileRemoteTests } from "../src/remote-test/executor.ts";
 import { openJobLedger, BusyRemoteTestExecutor } from "../src/remote-test/job-ledger.ts";
 import type { RemoteTestJob, RemoteTestReceipt } from "../src/remote-test/contract.ts";
 import { busWorkerIssuers, busWorkerRegistry, busWorkerRequest, busWorkerSource, issuer, sha } from "./remote-test-bus-worker-support.ts";
+import { creds, userJwt } from "./remote-test-nats-credentials.ts";
 
 const roots: string[] = [], workers: BusWorker[] = [];
 afterEach(async () => { for (const w of workers.splice(0)) await w.stop(); for (const r of roots.splice(0)) await rm(r, { recursive: true, force: true }); });
@@ -263,17 +264,17 @@ test("progress defaults to one third of ack wait and refuses sub-second or expir
 
 test("transport account mismatch refuses before SDK connection", async () => {
  const f = await fixture(); let calls = 0;
- await writeFile(f.bus.transport.credentialsFile, "-----BEGIN NATS USER JWT-----\n" + ["e30", Buffer.from(JSON.stringify({ iss: "B".repeat(56), sub: "U".repeat(56), nats: { type: "user" } })).toString("base64url"), "sig"].join(".") + "\n------END NATS USER JWT------\n-----BEGIN USER NKEY SEED-----\nSU" + "A".repeat(56) + "\n------END USER NKEY SEED------\n", { mode: 0o600 });
+ await writeFile(f.bus.transport.credentialsFile, creds(userJwt({ iss: "B".repeat(56), sub: "U".repeat(56), nats: { type: "user" } })), { mode: 0o600 });
  const connect = connectBusWorker(async () => { calls++; throw Error(); });
  await expect(f.start({ connect })).rejects.toMatchObject({ code: "account_binding" }); expect(calls).toBe(0);
 });
 
 test("SDK authenticates only the exact checked credential blocks despite prepended account decoys", async () => {
- const f = await fixture(), token = ["e30", Buffer.from(JSON.stringify({ iss: f.bus.target.account, sub: "U".repeat(56), nats: { type: "user" } })).toString("base64url"), "sig"].join(".");
- const checked = `-----BEGIN NATS USER JWT-----\n${token}\n------END NATS USER JWT------\n\n-----BEGIN USER NKEY SEED-----\nSU${"A".repeat(56)}\n------END USER NKEY SEED------\n`;
+ const f = await fixture(), checked = creds(userJwt({ iss: f.bus.target.account, sub: "U".repeat(56), nats: { type: "user" } }));
  await writeFile(f.bus.transport.credentialsFile, `-----BEGIN DECOY JWT-----\nother-account-token\n------END DECOY JWT------\n-----BEGIN DECOY SEED-----\nother-account-seed\n------END DECOY SEED------\n${checked}`, { mode: 0o600 });
  let snapshot = "";
  const connect = connectBusWorker(async config => {
+  expect(config.nats?.name).toBe("ranger-ci-test");
   snapshot = await readFile(config.nats!.credsPath!, "utf8");
   return { enabled: false, stop: async () => {} } as any;
  });
