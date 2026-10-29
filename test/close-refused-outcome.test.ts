@@ -24,13 +24,35 @@ test("journal storage preserves a refused close's bounded head and bun failure t
  const outcome = closeRefusedOutcome(`probe command:${"long-command".repeat(200)} ran and failed: exit 1:\n${"passing output\n".repeat(200)}${failures}`);
  expect(outcome.length).toBeGreaterThan(400);
  expect(outcome.length).toBeLessThanOrEqual(1300);
- expect(outcome).toContain(failures);
+ expect(outcome).toContain("(fail) close gate > preserves names");
+ expect(outcome).toContain("(fail) journal > preserves counts");
+ expect(outcome).toContain("2 fail");
  expect(journalOutcome(outcome)).toBe(outcome);
 });
 
 test("journal storage caps even an oversized refused-close outcome", () => {
  const outcome = `close refused after merge: ${"x".repeat(4000)}`;
- expect(journalOutcome(outcome)).toBe(outcome.slice(0, 1300));
+ const maximum = closeRefusedOutcome(`probe command:${"x".repeat(2000)} ran and failed: ${"y".repeat(2000)}`).length;
+ expect(journalOutcome(outcome)).toBe(outcome.slice(0, maximum));
+});
+
+test("a long bun failure list keeps its first five bounded names and total count", () => {
+ const failures = Array.from({ length: 20 }, (_, i) => `(fail) failure ${i + 1} > ${"long test name ".repeat(20)}`);
+ const outcome = journalOutcome(closeRefusedOutcome(`${HEAD}: exit 1:\n${failures.join("\n")}\n 1200 pass\n 20 fail\nRan 1220 tests across 180 files.`));
+ const storedFailures = outcome.split("\n").filter(line => line.startsWith("(fail)"));
+ expect(storedFailures).toHaveLength(5);
+ for (let i = 0; i < 5; i++) {
+  expect(storedFailures[i]).toStartWith(`(fail) failure ${i + 1} > long test name`);
+  expect(storedFailures[i]?.length).toBeLessThanOrEqual(90);
+ }
+ expect(outcome).toContain("20 fail");
+ expect(outcome.length).toBeLessThanOrEqual(1300);
+});
+
+test("a long bun failure list without a count keeps names without inventing a count", () => {
+ const outcome = journalOutcome(closeRefusedOutcome(`${HEAD}: exit 1:\n(fail) an early failing test\n${"passing output\n".repeat(200)}`));
+ expect(outcome).toContain("(fail) an early failing test");
+ expect(outcome).not.toMatch(/\d+ fail\b/);
 });
 
 test("journal storage keeps the 400-character bound for other outcomes", () => {

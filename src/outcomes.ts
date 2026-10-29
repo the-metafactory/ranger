@@ -368,21 +368,29 @@ export const HOST_LOAD_OUTCOME = /^waiting for a quiet host: load [\d.]+ on \d+ 
 
 const PROBE_RAN_AND_FAILED = " ran and failed: ";
 const CLOSE_REFUSED_PREFIX = "close refused after merge: ";
+const CLOSE_REFUSAL_PART = 600;
+const JOURNAL_OUTCOME_MAX = 400;
+const CLOSE_REFUSAL_SEPARATOR = ": …";
+const CLOSE_REFUSED_JOURNAL_MAX = CLOSE_REFUSED_PREFIX.length + 2 * CLOSE_REFUSAL_PART + CLOSE_REFUSAL_SEPARATOR.length;
+const CLOSE_REFUSAL_TESTS = 5;
+const CLOSE_REFUSAL_LINE = 90;
 
 export function journalOutcome(outcome: string): string {
- return outcome.slice(0, outcome.startsWith(CLOSE_REFUSED_PREFIX) ? 1300 : 400);
+ return outcome.slice(0, outcome.startsWith(CLOSE_REFUSED_PREFIX) ? CLOSE_REFUSED_JOURNAL_MAX : JOURNAL_OUTCOME_MAX);
 }
 
-/**
- * A close the graph refused after the merge. Soma names the failed probe,
- * then its bounded output tail; the head and the end of that tail are kept,
- * since a test run states its failures last (2026-10-21: soma #1002 parked
- * twice on "ran and failed" with nothing to diagnose).
- */
 export function closeRefusedOutcome(detail: string): string {
  const head = closeRefusalHead(detail);
  const observed = detail.slice(head.length);
- return `${CLOSE_REFUSED_PREFIX}${head.slice(0, 600)}${observed.length > 600 ? `: …${observed.slice(-600)}` : observed}`;
+ return `${CLOSE_REFUSED_PREFIX}${head.slice(0, CLOSE_REFUSAL_PART)}${observed.length > CLOSE_REFUSAL_PART ? `${CLOSE_REFUSAL_SEPARATOR}${closeRefusalOutput(observed)}` : observed}`;
+}
+
+function closeRefusalOutput(output: string): string {
+ const failures = [...output.matchAll(/^[ \t]*\(fail\)[^\r\n]*/gm)].slice(0, CLOSE_REFUSAL_TESTS).map(match => match[0].trim());
+ if (failures.length === 0) return output.slice(-CLOSE_REFUSAL_PART);
+ const count = [...output.matchAll(/^[ \t]*\d+ fail\b[^\r\n]*/gm)].at(-1)?.[0].trim();
+ const lines = count === undefined ? failures : [...failures, count];
+ return `\n${lines.map(line => line.length > CLOSE_REFUSAL_LINE ? `${line.slice(0, CLOSE_REFUSAL_LINE - 1)}…` : line).join("\n")}`.slice(0, CLOSE_REFUSAL_PART);
 }
 
 /** The refusal without the failed probe's output, which is the command's text, not soma's. */

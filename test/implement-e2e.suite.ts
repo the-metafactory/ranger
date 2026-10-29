@@ -1601,7 +1601,26 @@ describe("implement lane (node #23)", () => {
   expect(parked).toHaveLength(1);
   for (const stored of [worker?.outcome, parked[0]?.detail]) {
    expect(stored).toStartWith("close refused after merge: probe command:bun run test");
-   expect(stored).toContain(failures);
+   expect(stored).toContain("(fail) close gate > names the failed tests [5000.00ms]");
+   expect(stored).toContain("(fail) journal > retains the probe result [5000.00ms]");
+   expect(stored).toContain("2 fail");
+   expect(stored?.length).toBeLessThanOrEqual(1300);
+  }
+  expect(worker?.outcome).toBe(parked[0]?.detail);
+ }, 60_000);
+
+ test("a refused close with many failures stores the first five names and total count (node #406)", async () => {
+  const failures = Array.from({ length: 20 }, (_, i) => `(fail) failure ${i + 1} > ${"long test name ".repeat(20)}`);
+  const { r, outcome } = await closeFailing(
+   `probe command:bun run test|/repo|1800|0 on node 20 ran and failed: exit 1:\n${"(pass) a passing test\n".repeat(100)}${failures.join("\n")}\n 1200 pass\n 20 fail\nRan 1220 tests across 180 files.`,
+  );
+  expect(outcome.status).toBe("parked");
+  const worker = r.journal.getWorker("20", "acme/widgets");
+  const parked = r.journal.listEvents("acme/widgets", 200).filter(e => e.kind === "parked" && e.nodeId === "20");
+  expect(parked).toHaveLength(1);
+  for (const stored of [worker?.outcome, parked[0]?.detail]) {
+   for (let i = 1; i <= 5; i++) expect(stored).toContain(`(fail) failure ${i} > long test name`);
+   expect(stored).toContain("20 fail");
    expect(stored?.length).toBeLessThanOrEqual(1300);
   }
   expect(worker?.outcome).toBe(parked[0]?.detail);
