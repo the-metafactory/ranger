@@ -45,7 +45,7 @@ import {
 } from "./identity.ts";
 import { canonicalDir, runNode, runNodeRunOutcome, type RunNodeContext, type RunNodeOutcome } from "./worker.ts";
 import { trustCurrentGitState } from "./git-trust.ts";
-import { workerLogFile } from "./worker-log.ts";
+import { existingWorkerLog } from "./worker-log.ts";
 import { sweepMap } from "./sweep.ts";
 import { mergeGateNow } from "./merge-desk.ts";
 import { walk } from "./walk.ts";
@@ -609,7 +609,7 @@ async function runJournal(
   workers:
    nodeId === undefined
     ? workers
-    : workers.map((w) => ({ ...w, workerLog: workerLogFile(journalPath, w.repo, w.nodeId, w.generation) })),
+    : workers.map((w) => ({ ...w, workerLog: existingWorkerLog(journalPath, w.repo, w.nodeId, w.generation) })),
   escalations: ofNode(journal.listEscalations(target)),
   events: journal.listEvents(target, 50, nodeId),
  };

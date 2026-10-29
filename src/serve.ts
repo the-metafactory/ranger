@@ -97,7 +97,7 @@ import {
 } from "./serve-parked.ts";
 import { runDrainAction } from "./serve-drain.ts";
 import { runApproveAction } from "./serve-approve.ts";
-import { workerLogFile } from "./worker-log.ts";
+import { existingWorkerLog } from "./worker-log.ts";
 
 export { childEnv };
 
@@ -1832,14 +1832,13 @@ export async function readPrLive(
  };
 }
 
-/** The node's current worker log file, by the journal's row, or null with no row. */
-function workerLogOf(config: RangerConfig, repo: string, nodeId: string): string | null {
+export function workerLogOf(config: RangerConfig, repo: string, nodeId: string): string | null {
  const journalPath = expandHome(config.state.journalPath);
  const journal = Journal.openReadOnly(journalPath, config.maps, config.workers.laneSlots);
  if (journal === null) return null;
  try {
   const row = journal.getWorker(nodeId, repo);
-  return row === null ? null : workerLogFile(journalPath, repo, nodeId, row.generation);
+  return row === null ? null : existingWorkerLog(journalPath, repo, nodeId, row.generation);
  } finally {
   journal.close();
  }
