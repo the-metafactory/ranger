@@ -682,6 +682,13 @@ describe("implement lane (node #23)", () => {
  // ranger issue #228: a resume after someone else pushed to the PR branch.
  const BRANCH = "node/20-add-the-feature-module";
  const git = (args: string[], cwd: string) => runCmd("git", args, { cwd, env: { ...process.env, ...GIT_ENV } });
+ const commitLocalFile = async (r: Rig, file: string, content: string): Promise<string> => {
+  const worktree = join(r.canonical, ".worktrees", "node-20");
+  writeFileSync(join(worktree, file), content);
+  expect((await git(["add", file], worktree)).code).toBe(0);
+  expect((await git(["commit", "-m", "retain work for node #20"], worktree)).code).toBe(0);
+  return (await git(["rev-parse", "HEAD"], worktree)).stdout.trim();
+ };
  /** A push to the PR branch from outside the run (a principal's session): returns the new head. */
  const pushFromOutside = async (r: Rig, file: string, branch = BRANCH): Promise<string> => {
   const clone = join(r.dir, `outside-${file}`);
@@ -2064,6 +2071,60 @@ describe("implement lane (node #23)", () => {
   expect(markers().map((m) => m.body.split("\n")[0])).toEqual([`<!-- ranger:finish-fix sha=${head} red=${head} -->`]);
  }, 60_000);
 
+ test("node #439: a finish worker that adds nothing still tests and publishes work ahead of its reviewed head", async () => {
+  let local = "";
+  const r = await rig({ behavior: [1, 0], onReview: async round => {
+   if (round !== 1) return;
+   local = await commitLocalFile(r, "src/finish-fix.ts", "export const finished = true;\n");
+  } });
+  cleanup.push(r.dir);
+  r.ctx.workerCommand = [implementWorker, "finish-noop"];
+  const tested = join(r.dir, "tested-head");
+  r.ctx.map.commands.test = `git rev-parse HEAD > ${tested}`;
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  expect(await r.github.sha("node/20-add-the-feature-module")).toBe(local);
+  expect(readFileSync(tested, "utf8").trim()).toBe(local);
+  expect(r.calls).toHaveLength(2);
+  const markers = (r.github.comments.get(1) ?? []).filter(c => c.body.includes("ranger:finish-fix"));
+  expect(markers).toHaveLength(1);
+  expect(markers[0].body).toContain(`sha=${local}`);
+ }, 60_000);
+
+ test.each([false, true])("node #439: resume reconciles an unpushed descendant before review (tests fail: %s)", async testsFail => {
+  const r = await rig({});
+  cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  const branch = "node/20-add-the-feature-module";
+  const pushed = await r.github.sha(branch);
+  const local = await commitLocalFile(r, "local.txt", "unpushed work\n");
+  const tested = join(r.dir, "tested-head");
+  r.ctx.map.commands.test = `git rev-parse HEAD > ${tested}; ${testsFail ? "exit 1" : "test -f local.txt"}`;
+  const prior = r.journal.listEvents("acme/widgets", 1000).length;
+  r.ctx.worker = async () => { throw new Error("resume must not start a worker"); };
+  r.ctx.reviewer = async () => {
+   expect(readFileSync(tested, "utf8").trim()).toBe(local);
+   expect(await r.github.sha(branch)).toBe(local);
+   return { verdict: "approved", summary: "reconciled", commitId: local, blockers: 0, majors: 0, nits: 0, body: "No changes requested." };
+  };
+  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  const outcome = await runNode("20", r.ctx);
+  expect(readFileSync(tested, "utf8").trim()).toBe(local);
+  expect(outcome.status).toBe(testsFail ? "failed" : "awaiting-merge");
+  expect(await r.github.sha(branch)).toBe(testsFail ? pushed : local);
+  const events = r.journal.listEvents("acme/widgets", 1000).reverse().slice(prior);
+  if (testsFail) {
+   expect(events.some(e => e.kind === "pushed")).toBe(false);
+   expect(events.some(e => e.kind === "reviewed")).toBe(false);
+  } else {
+   const push = events.findIndex(e => e.kind === "pushed");
+   expect(push).toBeGreaterThanOrEqual(0);
+   expect(events[push].detail).toContain(pushed);
+   expect(events[push].detail).toContain(local);
+   expect(events.findIndex(e => e.kind === "reviewed")).toBeGreaterThan(push);
+  }
+  expect(r.github.merges).toEqual([]);
+ }, 60_000);
+
  test("a node gets one finish pass: findings the second round still asks go to the merge, and a resume asks no more", async () => {
   const { r, prompts, markers } = await finishRig([1]);
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
@@ -2406,7 +2467,7 @@ describe("implement lane (node #23)", () => {
   expect((r.github.comments.get(1) ?? []).some((c) => c.body.includes("ranger:base-merge"))).toBe(false);
  }, 60_000);
 
- test("a resumed run drops an unpushed merge from a crashed one, and its markers grant nothing", async () => {
+ test("a resumed run tests and pushes an unpushed merge from a crashed one, and only its landed marker grants a round", async () => {
   let r!: Rig & { calls: number[]; announced: string[] };
   r = await rig({ onReview: async (round) => { if (round === 1) await moveBaseUnder(r); } });
   cleanup.push(r.dir);
@@ -2430,11 +2491,11 @@ describe("implement lane (node #23)", () => {
   // Counted naively, two markers would use up both merge passes and park it.
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
   const head = await r.github.sha("node/20-add-the-feature-module");
-  expect(head).not.toBe(stranded);
+  expect(head).toBe(stranded);
   expect((await runCmd("git", ["merge-base", "--is-ancestor", "main", head], { cwd: r.origin })).code).toBe(0);
   expect(r.calls).toHaveLength(2);
   const markers = recordedBaseMerges(r.github.comments.get(1) ?? [], BOT);
-  expect(markers.map((m) => m.sha)).toEqual([stranded, "f".repeat(40), head]); // the release/… base still parses
+  expect(markers.map((m) => m.sha)).toEqual([stranded, "f".repeat(40)]);
  }, 60_000);
 
  test("a ready PR whose base moves under it is sent back for a base merge, not left pending on CI", async () => {
@@ -3618,14 +3679,14 @@ describe("implement lane (node #23)", () => {
   r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
   const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
-  expect(events.some((d) => d.startsWith("adopting ") && d.includes("as fix pass 1"))).toBe(true);
+  expect(events.some((d) => d.startsWith("resumed worktree pushed ") && d.includes(pushed) && d.includes(unpushed))).toBe(true);
   expect(r.calls).toHaveLength(2); // round 2 reviewed the adopted head
   expect(await r.github.sha("node/20-add-the-feature-module")).toBe(unpushed); // the adopted commit, as it stood
   expect(r.journal.headSubstrate("acme/widgets", unpushed)).toBe(writer); // still the session that wrote it
   rmSync(flag, { force: true });
  }, 60_000);
 
- test("unpushed commits holding a merge are not adopted as a fix pass", async () => {
+ test("unpushed descendant commits holding a merge are tested and pushed before review", async () => {
   const flag = join(tmpdir(), `ranger-adopt-fix-merge-${Date.now()}`);
   const r = await rig({
    blockers: [1, 0],
@@ -3636,12 +3697,13 @@ describe("implement lane (node #23)", () => {
   const worktree = join(r.canonical, ".worktrees", "node-20");
   const side = await runCmd("git", ["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "side"], { cwd: worktree, env: { ...process.env, ...GIT_ENV } });
   expect((await runCmd("git", ["merge", "--no-ff", "-q", "-m", "merge side", side.stdout.trim()], { cwd: worktree, env: { ...process.env, ...GIT_ENV } })).code).toBe(0);
+  const unpushed = (await runCmd("git", ["rev-parse", "HEAD"], { cwd: worktree })).stdout.trim();
   writeFileSync(flag, "");
   r.ctx.workerCommand = [implementWorker, "noop"];
   r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
   const resumed = await runNode("20", r.ctx);
-  expect(resumed.status).toBe("failed");
-  expect(resumed.detail).toContain("fix pass 1 committed nothing");
+  expect(resumed.status).toBe("awaiting-merge");
+  expect(await r.github.sha("node/20-add-the-feature-module")).toBe(unpushed);
   const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
   expect(events.some((d) => d.startsWith("adopting "))).toBe(false);
   rmSync(flag, { force: true });
