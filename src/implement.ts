@@ -1672,12 +1672,19 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
   const live = await github.getPr(repo, open.iid, token);
   // Whatever reviews or fixes this head works on a tree at it (ranger issue #228).
   await syncWorktreeToHead(ctx, open.iid, live.headSha);
-  // A branch far behind its base is merged up before anything reviews or
-  // probes it (ranger issue #231): reds the base already fixed would park it
-  // again. Once per run, and only on the pushed head: unpushed work in the
-  // worktree is adoptBuiltWork's to judge first, and the merge pass resets
-  // to the pushed head.
-  if (!staleMerged && (await headSha(worktree)) === live.headSha) {
+  const here = await headSha(worktree);
+  if (here !== live.headSha) {
+   const snapshot = await trustedSnapshot(journal, ctx.canonical, { repo, nodeId }, mapKey(map));
+   const failure = await checkPass(ctx, testCommand, { sha: here, snapshot, baseTip: await testBaseTip(ctx), label: "resumed worktree", context: "resume" });
+   if (failure !== undefined) return { status: "failed", detail: failure, workerExit: null };
+   await publishPass(ctx, github, open.iid, { sha: here, snapshot, workerExit: null, adopted: true }, "push resumed worktree", `resumed worktree pushed ${branch} from PR head ${live.headSha} to worktree head ${here}`);
+   const comments = await github.listComments(repo, open.iid, token);
+   baseMerges = Math.max(baseMerges, await landedBaseMerges(worktree, recordedBaseMerges(comments, botIdentity), here));
+   ciFixes = Math.max(ciFixes, ciFixState(recordedCiFixes(comments, botIdentity), here).used);
+   probeFixes = Math.max(probeFixes, ciFixState(recordedProbeFixes(comments, botIdentity), here).used);
+   continue;
+  }
+  if (!staleMerged) {
    const behind = await commitsBehind(worktree, base);
    // A head the merge desk sent back because no CI ran on it merges in any
    // base commit it lacks: the push is what starts CI (noCiStep).
@@ -2143,22 +2150,6 @@ async function conflictsWithBase(ctx: ImplementContext, github: ForgePort, prNum
  return false;
 }
 
-/**
- * Bring the worktree to the change request's live head before anything
- * reviews or works on it (ranger issue #228). A principal's session or
- * another agent can push to the branch while the node is parked; a resumed
- * worker on the old tree would answer a review of the new head by editing
- * code that head no longer has.
- *
- * - At the head already: nothing to do, and no fetch.
- * - The head is inside the worktree's HEAD (an earlier run committed and
- *   never pushed): left as it is, for `adoptBuiltWork` to judge.
- * - The worktree's HEAD is inside the head and the tree is clean: fetched
- *   and fast-forwarded, and the journal records both SHAs.
- * - Anything else (the worktree has commits the head lacks, or uncommitted
- *   changes): parks naming both SHAs and the dirty paths, and changes
- *   nothing in the worktree.
- */
 async function syncWorktreeToHead(ctx: ImplementContext, prNumber: number, prHead: string): Promise<void> {
  const { worktree, journal, branch } = ctx;
  const repo = ctx.map.repo;
@@ -2171,12 +2162,6 @@ async function syncWorktreeToHead(ctx: ImplementContext, prNumber: number, prHea
  }
  const haveHead = async () =>
   (await safeGit(["cat-file", "-e", `${prHead}^{commit}`], { cwd: worktree, timeoutMs: 10_000 })).code === 0;
- // The head inside the worktree's HEAD needs no fetch: the head is already
- // here. It is unpushed work on top of the head (adoptBuiltWork judges it),
- // unless HEAD was itself pushed and the branch then rewound under it: then
- // origin/<branch>, as ranger's last push left it (nothing fetched yet),
- // still holds HEAD, and pushing it again would undo the rewind (sage round
- // 2 on PR #234).
  if ((await haveHead()) && (await isAncestor(worktree, prHead, here))) {
   const tracked = await safeGit(["rev-parse", "--verify", "--quiet", `refs/remotes/origin/${branch}^{commit}`], { cwd: worktree, timeoutMs: 10_000 });
   const pushedTip = tracked.stdout.trim();
@@ -2515,8 +2500,7 @@ async function checkedWorkerPass(
  // origin/<base> as the supervisor holds it before the worker runs: the base
  // a failing test is compared with (node #164) is never a ref the worker or
  // its tests could have moved.
- const baseRef = await safeGit(["rev-parse", "--verify", `refs/remotes/origin/${map.base}^{commit}`], { cwd: worktree, timeoutMs: 30_000 });
- const baseTip = baseRef.code === 0 && /^[0-9a-f]{40}$/.test(baseRef.stdout.trim()) ? baseRef.stdout.trim() : null;
+ const baseTip = await testBaseTip(ctx);
  const prompt = assembleImplementPrompt({
   repo: map.repo,
   node: {
@@ -2609,10 +2593,11 @@ async function checkedWorkerPass(
  const sha = await headSha(worktree);
  // A CI fix pass may find the red is not the branch's (a flaky test, a
  // runner outage): it commits nothing, and that is an answer, not a failure.
- if ((spec.kind === "ci-fix" || spec.kind === "probe-fix" || spec.kind === "finish-fix") && sha === before && (await dirtyFiles(worktree)).length === 0) {
+ const optionalFix = spec.kind === "ci-fix" || spec.kind === "probe-fix" || spec.kind === "finish-fix";
+ if (optionalFix && sha === spec.red && (await dirtyFiles(worktree)).length === 0) {
   return { workerExit: result.code, snapshot, sha, unchanged: true };
  }
- if (sha === before || (await commitsAhead(worktree, map.base)) === 0) {
+ if ((!optionalFix && sha === before) || (await commitsAhead(worktree, map.base)) === 0) {
   return fail(nothingCommitted(spec));
  }
  if (spec.kind === "build") {
@@ -2621,27 +2606,42 @@ async function checkedWorkerPass(
  }
  // This session wrote `sha`: record it now, so a later run that adopts the
  // commit unpushed still credits the substrate that actually wrote it.
- recordHead(ctx, sha);
+ if (sha !== before) recordHead(ctx, sha);
+ const failure = await checkPass(ctx, testCommand, { sha, snapshot, baseTip, label: pass, context: "worker" });
+ if (failure !== undefined) return fail(failure);
+ return { workerExit: result.code, snapshot, sha, ...(sha === before ? { adopted: true } : {}) };
+}
+
+async function testBaseTip(ctx: ImplementContext): Promise<string | null> {
+ const baseRef = await safeGit(["rev-parse", "--verify", `refs/remotes/origin/${ctx.map.base}^{commit}`], { cwd: ctx.worktree, timeoutMs: 30_000 });
+ return baseRef.code === 0 && /^[0-9a-f]{40}$/.test(baseRef.stdout.trim()) ? baseRef.stdout.trim() : null;
+}
+
+async function checkPass(
+ ctx: ImplementContext,
+ testCommand: string,
+ input: { sha: string; snapshot: string; baseTip: string | null; label: string; context: "worker" | "resume" },
+): Promise<string | undefined> {
+ const { sha, snapshot, baseTip, label: pass } = input;
+ const { worktree, journal, map } = ctx;
  // The supervisor tests the working tree but pushes commits: a dirty tree
  // would let a green test run cover code that never lands.
  const dirty = await dirtyFiles(worktree);
  if (dirty.length > 0) {
-  return fail(
-   `worker left ${dirty.length} uncommitted or untracked file(s) (${dirty.slice(0, 5).join("; ")}) — the tests would not test what gets pushed`,
-  );
+  return `worker left ${dirty.length} uncommitted or untracked file(s) (${dirty.slice(0, 5).join("; ")}) — the tests would not test what gets pushed`;
  }
  const { tests, retried, baseRed, busy } = await supervisorTests(ctx, testCommand, pass, baseTip);
  // The retry ran on a busy host too and failed: the host's failure, not the
  // branch's. No fix pass, no failed node: the run parks and a resume waits
  // for a quiet host (node #297); the resume adopts this pass's commits.
  if (tests.code !== 0 && busy !== undefined) throw hostLoadPark(ctx, busy, `the supervisor's tests (${testCommand}) after the ${pass}`, tests);
- if (tests.code !== 0 && baseRed === undefined) return fail(testsFailedDetail(testCommand, tests, "after the worker"));
+ if (tests.code !== 0 && baseRed === undefined) return testsFailedDetail(testCommand, tests, input.context === "resume" ? "on the resumed worktree" : "after the worker");
  if (retried || baseRed !== undefined) {
   // The pass was certified in a fresh clone, or its failures are the base's:
   // the worktree still holds what the failed run left, and the probes run
   // there next.
   const restored = await restoreWorktree(ctx, sha);
-  if (restored !== null) return fail(restored);
+  if (restored !== null) return restored;
  }
  // The tests ran worker-written code: the state must still be the vetted one
  // before it counts as seen clean.
@@ -2650,7 +2650,6 @@ async function checkedWorkerPass(
  await assertNoClosingKeywords(worktree, map.base, parseForgeRef(map.repo).forge);
  // Only a pass that goes on to the push puts its waived tests in the receipts.
  if (baseRed !== undefined) recordTestsBaseRed(journal, map.repo, ctx.node.ref.id, { head: sha, base: baseRed.sha, names: baseRed.names, rest: baseRed.rest });
- return { workerExit: result.code, snapshot, sha };
 }
 
 /**

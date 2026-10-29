@@ -342,7 +342,7 @@
       "count": 5
     },
     "ranger/no-comments": {
-      "count": 292
+      "count": 280
     }
   },
   "src/intake.ts": {
@@ -1345,7 +1345,7 @@
       "count": 6
     },
     "ranger/no-comments": {
-      "count": 210
+      "count": 209
     }
   },
   "test/implement-rig.ts": {
