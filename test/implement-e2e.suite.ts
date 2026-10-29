@@ -3686,7 +3686,7 @@ describe("implement lane (node #23)", () => {
   rmSync(flag, { force: true });
  }, 60_000);
 
- test("unpushed descendant commits holding a merge are tested and pushed before review", async () => {
+ test.each(["pass", "fail", "review-cap"])("unpushed merge descendants are reconciled before review without granting a round (%s)", async scenario => {
   const flag = join(tmpdir(), `ranger-adopt-fix-merge-${Date.now()}`);
   const r = await rig({
    blockers: [1, 0],
@@ -3694,18 +3694,40 @@ describe("implement lane (node #23)", () => {
   });
   cleanup.push(r.dir);
   expect((await runNode("20", r.ctx)).status).toBe("failed");
+  const branch = "node/20-add-the-feature-module";
+  const pushed = await r.github.sha(branch);
   const worktree = join(r.canonical, ".worktrees", "node-20");
   const side = await runCmd("git", ["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "side"], { cwd: worktree, env: { ...process.env, ...GIT_ENV } });
   expect((await runCmd("git", ["merge", "--no-ff", "-q", "-m", "merge side", side.stdout.trim()], { cwd: worktree, env: { ...process.env, ...GIT_ENV } })).code).toBe(0);
   const unpushed = (await runCmd("git", ["rev-parse", "HEAD"], { cwd: worktree })).stdout.trim();
-  writeFileSync(flag, "");
+  const tested = join(r.dir, "tested-head");
+  r.ctx.map.commands.test = `git rev-parse HEAD > ${tested}; test -f ${flag}`;
+  if (scenario !== "fail") writeFileSync(flag, "");
+  if (scenario === "review-cap") r.ctx.config.workers.reviewRounds = 1;
   r.ctx.workerCommand = [implementWorker, "noop"];
+  const sessions = countSessions(r);
+  const prior = r.journal.listEvents("acme/widgets", 1000).length;
   r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
   const resumed = await runNode("20", r.ctx);
-  expect(resumed.status).toBe("awaiting-merge");
-  expect(await r.github.sha("node/20-add-the-feature-module")).toBe(unpushed);
-  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
-  expect(events.some((d) => d.startsWith("adopting "))).toBe(false);
+  expect(resumed.status).toBe(scenario === "fail" ? "failed" : scenario === "review-cap" ? "parked" : "awaiting-merge");
+  expect(readFileSync(tested, "utf8").trim()).toBe(unpushed);
+  expect(await r.github.sha(branch)).toBe(scenario === "fail" ? pushed : unpushed);
+  expect(sessions).toHaveLength(0);
+  expect(r.calls).toHaveLength(scenario === "pass" ? 2 : 1);
+  const events = r.journal.listEvents("acme/widgets", 1000).reverse().slice(prior);
+  const push = events.findIndex(e => e.kind === "pushed");
+  if (scenario === "fail") {
+   expect(resumed.detail).toContain("on the resumed worktree");
+   expect(push).toBe(-1);
+   expect(events.some(e => e.kind === "reviewed")).toBe(false);
+  } else {
+   expect(push).toBeGreaterThanOrEqual(0);
+   expect(events[push].detail).toContain(pushed);
+   expect(events[push].detail).toContain(unpushed);
+   if (scenario === "pass") expect(events.findIndex(e => e.kind === "reviewed")).toBeGreaterThan(push);
+  }
+  expect((r.github.comments.get(1) ?? []).some(c => c.body.includes("ranger:base-merge"))).toBe(false);
+  expect(r.github.merges).toEqual([]);
   rmSync(flag, { force: true });
  }, 60_000);
 

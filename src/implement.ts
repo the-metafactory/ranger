@@ -1675,7 +1675,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
   const here = await headSha(worktree);
   if (here !== live.headSha) {
    const snapshot = await trustedSnapshot(journal, ctx.canonical, { repo, nodeId }, mapKey(map));
-   const failure = await checkPass(ctx, testCommand, { sha: here, snapshot, baseTip: await testBaseTip(ctx), label: "resumed worktree" });
+   const failure = await checkPass(ctx, testCommand, { sha: here, snapshot, baseTip: await testBaseTip(ctx), label: "resumed worktree", context: "resume" });
    if (failure !== undefined) return { status: "failed", detail: failure, workerExit: null };
    await publishPass(ctx, github, open.iid, { sha: here, snapshot, workerExit: null, adopted: true }, "push resumed worktree", `resumed worktree pushed ${branch} from PR head ${live.headSha} to worktree head ${here}`);
    const comments = await github.listComments(repo, open.iid, token);
@@ -1684,7 +1684,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
    probeFixes = Math.max(probeFixes, ciFixState(recordedProbeFixes(comments, botIdentity), here).used);
    continue;
   }
-  if (!staleMerged && (await headSha(worktree)) === live.headSha) {
+  if (!staleMerged) {
    const behind = await commitsBehind(worktree, base);
    // A head the merge desk sent back because no CI ran on it merges in any
    // base commit it lacks: the push is what starts CI (noCiStep).
@@ -2607,7 +2607,7 @@ async function checkedWorkerPass(
  // This session wrote `sha`: record it now, so a later run that adopts the
  // commit unpushed still credits the substrate that actually wrote it.
  if (sha !== before) recordHead(ctx, sha);
- const failure = await checkPass(ctx, testCommand, { sha, snapshot, baseTip, label: pass });
+ const failure = await checkPass(ctx, testCommand, { sha, snapshot, baseTip, label: pass, context: "worker" });
  if (failure !== undefined) return fail(failure);
  return { workerExit: result.code, snapshot, sha, ...(sha === before ? { adopted: true } : {}) };
 }
@@ -2620,7 +2620,7 @@ async function testBaseTip(ctx: ImplementContext): Promise<string | null> {
 async function checkPass(
  ctx: ImplementContext,
  testCommand: string,
- input: { sha: string; snapshot: string; baseTip: string | null; label: string },
+ input: { sha: string; snapshot: string; baseTip: string | null; label: string; context: "worker" | "resume" },
 ): Promise<string | undefined> {
  const { sha, snapshot, baseTip, label: pass } = input;
  const { worktree, journal, map } = ctx;
@@ -2635,7 +2635,7 @@ async function checkPass(
  // branch's. No fix pass, no failed node: the run parks and a resume waits
  // for a quiet host (node #297); the resume adopts this pass's commits.
  if (tests.code !== 0 && busy !== undefined) throw hostLoadPark(ctx, busy, `the supervisor's tests (${testCommand}) after the ${pass}`, tests);
- if (tests.code !== 0 && baseRed === undefined) return testsFailedDetail(testCommand, tests, pass === "resumed worktree" ? "on the resumed worktree" : "after the worker");
+ if (tests.code !== 0 && baseRed === undefined) return testsFailedDetail(testCommand, tests, input.context === "resume" ? "on the resumed worktree" : "after the worker");
  if (retried || baseRed !== undefined) {
   // The pass was certified in a fresh clone, or its failures are the base's:
   // the worktree still holds what the failed run left, and the probes run
