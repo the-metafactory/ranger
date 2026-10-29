@@ -15,6 +15,7 @@ import { laneHeldMessage, mapKey, recordImplementStart, resumeMap } from "./maps
 import { spawnRunNodeDetached, type SpawnRunNodeArgs } from "./spawn.ts";
 import { busyLoadFor, hostBusy, isQuiet, realHostLoad, type HostLoad, type HostLoadReading } from "./host-load.ts";
 import { waitingForQuietHost } from "./outcomes.ts";
+import { unchangedHeadPark } from "./worktree-head.ts";
 
 export interface ResumeContext {
  config: RangerConfig;
@@ -306,6 +307,12 @@ export async function processResumeQueue(
     const pr = await ctx.github.getPr(entry.repo, row.prNumber, state.token);
     if (pr.state === "merged" || pr.state === "closed") {
      drop(`${changeRequestNoun(entry.repo)} is ${pr.state === "merged" ? "merged" : "closed"}`);
+     continue;
+    }
+    if (await unchangedHeadPark(row, pr.headSha, journal)) {
+     owned();
+     journal.recordEvent("sweep", { nodeId: entry.nodeId, repo: entry.repo,
+      detail: `queued resume #${entry.nodeId} waits: the worktree and PR head are unchanged since the head reconciliation park` });
      continue;
     }
    }

@@ -11,6 +11,8 @@ import { ciFixMarker, probeMarker, type ForgePort } from "../src/implement.ts";
 import type { IssueComment, ChangeRequest } from "../src/forge.ts";
 import type { CheckRun } from "../src/github.ts";
 import { CI_FAILED_PARK_OUTCOME, ciNotSentBackOutcome, mergeGateFailedOutcome, reviewCapOutcome } from "../src/outcomes.ts";
+import { createCanonicalRepo, GIT_ENV } from "./support.ts";
+import { runCmd } from "../src/exec.ts";
 
 const GAME = "acme/seelite";
 const BOT = "ivy-bot";
@@ -88,8 +90,43 @@ function rig(map: { autoMerge?: boolean; probe?: boolean } = {}) {
   spawn: async (id) => { spawned.push(id); return 4242; },
  });
  const events = (kind: string) => journal.listNodeEvents(GAME, "96").filter((e) => e.kind === kind);
- return { config, journal, desk, posts, spawned, events, close() { journal.close(); rmSync(dir, { recursive: true, force: true }); } };
+ return { dir, config, journal, desk, posts, spawned, events, close() { journal.close(); rmSync(dir, { recursive: true, force: true }); } };
 }
+
+describe("node #440 — rebase leaves unpushed work to implement", () => {
+ for (const localWork of [true, false]) {
+  test(`behind PR rebase with unpushed work=${localWork}`, async () => {
+   const r = rig();
+   try {
+    const { canonical } = await createCanonicalRepo(r.dir);
+    const git = (args: string[]) => runCmd("git", args, { cwd: canonical, env: { ...process.env, ...GIT_ENV } });
+    const head = (await git(["rev-parse", "HEAD"])).stdout.trim();
+    if (localWork) {
+     writeFileSync(join(canonical, "local.txt"), "unpushed\n");
+     expect((await git(["add", "local.txt"])).code).toBe(0);
+     expect((await git(["commit", "-m", "local work"])).code).toBe(0);
+    }
+    const local = (await git(["rev-parse", "HEAD"])).stdout.trim();
+    r.journal.updateWorker("96", GAME, { status: "awaiting-merge", outcome: null, worktree: canonical, verdictSha: head });
+    const gh = fakeGitHub({ head, comments: [review(head)], ci: GREEN });
+    const get = gh.github.getPr;
+    gh.github.getPr = async (...args) => ({ ...await get(...args), mergeState: "needs-rebase" });
+    const rebases: string[] = [];
+    gh.github.rebasePr = async (_repo, _n, from) => { rebases.push(from); return { status: "pending", requested: true, reason: "updating" }; };
+    const result = await r.desk(gh.github);
+    expect(result.errors).toEqual([]);
+    expect(rebases).toEqual(localWork ? [] : [head]);
+    expect(r.journal.listRebases(GAME, "96")).toHaveLength(localWork ? 0 : 1);
+    expect(r.spawned).toEqual(localWork ? ["96"] : []);
+    if (localWork) {
+     expect(r.journal.getWorker("96", GAME)).toMatchObject({ status: "running", phase: "review" });
+     expect(r.events("sweep").some(e => e.detail?.includes("rebase skipped") && e.detail.includes(local.slice(0, 8)) && e.detail.includes("unpushed"))).toBe(true);
+    }
+    expect((await git(["rev-parse", "HEAD"])).stdout.trim()).toBe(local);
+   } finally { r.close(); }
+  });
+ }
+});
 
 describe("node #104 — ci-only-park-merges-without-lane: a CI-only park merges once CI recovers at the certified head", () => {
  for (const laneHeld of [false, true]) {

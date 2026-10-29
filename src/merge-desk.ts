@@ -26,7 +26,7 @@ import { squashMessage as gitlabSquashMessage } from "./gitlab.ts";
 import { lanePort } from "./forge-lanes.ts";
 import { CI_FAILED_PARK_OUTCOME, ciNotSentBackOutcome, closeRefusalHead, mergeGateFailedOutcome } from "./outcomes.ts";
 import { changeRequestLabel, changeRequestNoun, forgeName } from "./forge-text.ts";
-import { closingKeywordRefusal, findClosingKeyword } from "./git-ops.ts";
+import { closingKeywordRefusal, findClosingKeyword, headSha as worktreeHead, isAncestor } from "./git-ops.ts";
 import { squashTitle } from "./github.ts";
 import { isTransientGitHubError } from "./transient.ts";
 
@@ -485,6 +485,15 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   rebasePr: NonNullable<ForgePort["rebasePr"]>,
  ): Promise<void> {
   const cr = changeRequestLabel(repo, pr.iid);
+  if (row.worktree !== null) {
+   const here = await worktreeHead(row.worktree);
+   if (!await isAncestor(row.worktree, here, headSha)) {
+    const why = `rebase skipped: the worktree (${here.slice(0, 8)}) holds unpushed commits ${cr}'s head (${headSha.slice(0, 8)}) does not contain; the implement lane tests and pushes them first`;
+    journal.recordEvent("sweep", { nodeId: row.nodeId, repo, detail: `${cr}: ${why}` });
+    await sendBack(row, why, cardTitle);
+    return;
+   }
+  }
   const passes = rebases.filter((r) => r.from === headSha);
   const asked = passes.filter((r) => r.requested).length;
   if (asked >= MAX_REBASE_REQUESTS_AT_HEAD || passes.length >= MAX_REBASE_PASSES_AT_HEAD) {

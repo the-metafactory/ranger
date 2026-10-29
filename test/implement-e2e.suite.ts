@@ -31,6 +31,7 @@ import { LAST_IMPLEMENT_MAP } from "../src/maps.ts";
 import { HOST_LOAD_OUTCOME } from "../src/outcomes.ts";
 import { implementLane } from "../src/lanes.ts";
 import { sweepMap } from "../src/sweep.ts";
+import { processResumeQueue } from "../src/resume.ts";
 import { bootstrapWorktree, runNode, type RunNodeContext } from "../src/worker.ts";
 import { gitCredential, keyLabel } from "../src/git-ops.ts";
 import { trustCurrentGitState } from "../src/git-trust.ts";
@@ -784,6 +785,92 @@ describe("implement lane (node #23)", () => {
   expect(outcome.detail).toContain(pushed.slice(0, 8));
   expect(await head()).toBe(local);
   expect((await r.github.getPr("acme/widgets", 1)).headSha).toBe(pushed);
+ }, 60_000);
+
+ const rebasedWithLocalWork = async (conflict = false) => {
+  const { r, worktree, head } = await failAfterRoundOne();
+  const from = await head();
+  const file = conflict ? "base.txt" : "local.txt";
+  writeFileSync(join(worktree, file), "unpushed local work\n");
+  expect((await git(["add", file], worktree)).code).toBe(0);
+  expect((await git(["commit", "-m", "local work after review"], worktree)).code).toBe(0);
+  const local = await head();
+  await pushFromOutside(r, "base.txt", "main");
+  const rebase = await r.github.rebasePr("acme/widgets", 1, from);
+  if (rebase.status !== "head-moved") throw new Error("fixture rebase did not move head");
+  expect(rebase.headSha).not.toBe(from);
+  return { r, worktree, head, from, local, to: rebase.headSha };
+ };
+
+ test.each(["clean", "tests-fail", "conflict", "foreign", "wrong-from", "wrong-to", "pending", "other-node", "dirty"])("own rebase reconciliation (node #440): %s", async scenario => {
+  const { r, worktree, head, from, local, to } = await rebasedWithLocalWork(scenario === "conflict");
+  if (scenario !== "foreign") r.journal.recordRebase({ repo: "acme/widgets", nodeId: scenario === "other-node" ? "99" : "20",
+   from: scenario === "wrong-from" ? to : from, to: scenario === "pending" ? null : scenario === "wrong-to" ? from : to,
+   requested: true, note: "fixture forge confirmed rebase" });
+  if (scenario === "dirty") writeFileSync(join(worktree, "scratch.txt"), "unfinished\n");
+  const tested = join(r.dir, "tested-head");
+  r.ctx.map.commands.test = `git rev-parse HEAD > ${tested}; ${scenario === "tests-fail" ? "exit 1" : "test -f local.txt"}`;
+  const sessions = countSessions(r);
+  const outcome = await runNode("20", r.ctx);
+  if (scenario === "clean" || scenario === "tests-fail") {
+   const merged = await head();
+   expect(merged).not.toBe(local);
+   expect((await git(["rev-list", "--parents", "-n", "1", merged], worktree)).stdout.trim().split(" ")).toEqual([merged, local, to]);
+   expect((await git(["show", "-s", "--format=%an|%ae|%cn|%ce", merged], worktree)).stdout.trim()).toBe(`${BOT}|${BOT}@users.noreply.github.com|${BOT}|${BOT}@users.noreply.github.com`);
+   expect(readFileSync(tested, "utf8").trim()).toBe(merged);
+   expect(sessions).toHaveLength(0);
+   expect(outcome.status).toBe(scenario === "clean" ? "awaiting-merge" : "failed");
+   expect(await r.github.sha(BRANCH)).toBe(scenario === "clean" ? merged : to);
+   expect(r.calls).toHaveLength(scenario === "clean" ? 2 : 1);
+   expect(r.journal.listNodeEvents("acme/widgets", "20").some(e => e.kind === "worktree-synced" && e.detail?.includes("recorded rebase"))).toBe(true);
+  } else {
+   expect(outcome.status).toBe("parked");
+   expect(await head()).toBe(local);
+   expect(await r.github.sha(BRANCH)).toBe(to);
+   expect(r.calls).toHaveLength(1);
+   if (scenario === "conflict") {
+    expect(outcome.detail).toContain("rebase merge conflicts");
+    expect(outcome.detail).toContain("base.txt");
+    expect((await git(["status", "--porcelain"], worktree)).stdout.trim()).toBe("");
+    expect((await git(["rev-parse", "--verify", "MERGE_HEAD"], worktree)).code).not.toBe(0);
+   } else if (scenario === "dirty") {
+    expect(outcome.detail).toContain("scratch.txt");
+    expect(readFileSync(join(worktree, "scratch.txt"), "utf8")).toBe("unfinished\n");
+   } else expect(outcome.detail).toContain("someone pushed");
+  }
+ }, 60_000);
+
+ test.each(["local-changed", "remote-changed", "rebase-recorded", "conflict"])("unchanged queued head park starts no run (node #440): %s", async scenario => {
+  const { r, worktree, from, to } = await rebasedWithLocalWork(scenario === "conflict");
+  const record = () => r.journal.recordRebase({ repo: "acme/widgets", nodeId: "20", from, to, requested: true, note: "confirmed rebase" });
+  if (scenario === "conflict") record();
+  expect((await runNode("20", r.ctx)).status).toBe("parked");
+  r.journal.enqueueResume({ nodeId: "20", repo: "acme/widgets", root: 1, lane: implementLane(r.ctx.map) });
+  const spawned: string[] = [];
+  const reservations = new Set<ReturnType<typeof implementLane>>();
+  const errors: string[] = [];
+  process.env.RANGER_WRITE_TEST = "ghp_write";
+  const queue = () => processResumeQueue({ config: r.ctx.config, configPath: join(r.dir, "ranger.yaml"), journal: r.journal,
+   github: r.github, hostLoad: () => ({ load: 0, cores: 1 }),
+   spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return 4242; },
+  }, [{ map: r.ctx.map, token: r.ctx.token, errors }], reservations, () => {});
+  await queue();
+  await queue();
+  expect(spawned).toEqual([]);
+  expect(r.journal.getWorker("20", "acme/widgets")?.status).toBe("parked");
+  expect(r.journal.listResumeQueue()).toHaveLength(1);
+  expect(r.journal.listResumeQueue()[0].failedStarts).toBe(0);
+  expect(reservations.size).toBe(0);
+  expect(errors).toEqual([]);
+  if (scenario === "rebase-recorded") record();
+  else if (scenario === "remote-changed") await pushFromOutside(r, "resolution.txt");
+  else {
+   writeFileSync(join(worktree, "resolution.txt"), "operator reconciled branch\n");
+   await git(["add", "resolution.txt"], worktree);
+   await git(["commit", "-m", "reconcile parked work"], worktree);
+  }
+  await queue();
+  expect(spawned).toEqual(["20"]);
  }, 60_000);
 
  test("a resume on a branch far behind its base merges the base in before any review or probe (ranger issue #231)", async () => {

@@ -81,7 +81,8 @@ import {
 } from "./substrate.ts";
 import { selectForReview } from "./substrate-policy.ts";
 import { failedSessionOutcome, recordSession } from "./substrate-usage.ts";
-import { workerEnv } from "./worker-env.ts";
+import { commitAuthorFor, workerEnv } from "./worker-env.ts";
+import { recordedRebaseFrom } from "./worktree-head.ts";
 import type { CommitAuthor } from "./identity.ts";
 import { tryWorkerLog, workerLogFile } from "./worker-log.ts";
 import { captureViews, redactViewsReason, saveViewsRecord, viewsComment, viewsDirectory, type ViewsDependencies, type ViewsRecord } from "./views.ts";
@@ -2185,6 +2186,25 @@ async function syncWorktreeToHead(ctx: ImplementContext, prNumber: number, prHea
  const dirty = await dirtyFiles(worktree);
  const dirtyNote = dirty.length === 0 ? "" : `; uncommitted: ${dirty.slice(0, 20).map((l) => l.trim()).join(", ")}${dirty.length > 20 ? ` (+${dirty.length - 20} more)` : ""}`;
  if (!(await isAncestor(worktree, here, prHead))) {
+  const from = await recordedRebaseFrom({ worktree, here, prHead, rebases: journal.listRebases(repo, nodeId) });
+  if (from !== null) {
+   if (dirty.length > 0) throw new ParkSignal(`${label}'s head moved by ranger's recorded rebase to ${prHead.slice(0, 8)}, but the worktree (${here.slice(0, 8)}) has uncommitted changes${dirtyNote}. Nothing was changed; commit or discard them, then resume`);
+   journal.assertGeneration(nodeId, repo, ctx.generation, "merge ranger's rebased PR head into the worktree");
+   const author = commitAuthorFor(ctx.config, repo, ctx.commitAuthor);
+   if (author === undefined) throw new GitSafetyError("no machine commit identity for the rebase merge");
+   const merge = await safeGit(["-c", `user.name=${author.name}`, "-c", `user.email=${author.email}`,
+    "merge", "--no-edit", "--no-ff", "-m", `Merge ranger's rebased head ${prHead.slice(0, 8)} into ${branch}`, prHead], { cwd: worktree, timeoutMs: 60_000 });
+   if (merge.code !== 0) {
+    const conflicts = await safeGit(["diff", "--name-only", "--diff-filter=U"], { cwd: worktree, timeoutMs: 10_000 });
+    const abort = await safeGit(["merge", "--abort"], { cwd: worktree, timeoutMs: 30_000 });
+    if (abort.code !== 0) throw new GitSafetyError(`cannot abort the rebase merge in ${worktree}: ${abort.stderr.trim()}`);
+    if (conflicts.code !== 0 || conflicts.stdout.trim() === "") throw new GitSafetyError(`cannot merge ranger's rebased head ${prHead}: ${merge.stderr.trim()}`);
+    throw new ParkSignal(`rebase merge conflicts: the worktree (${here.slice(0, 8)}) and ${label}'s head (${prHead.slice(0, 8)}): ${conflicts.stdout.trim().split("\n").join(", ")}. The merge was aborted; resolve the conflict, then resume`);
+   }
+   journal.recordEvent("worktree-synced", { nodeId, repo,
+    detail: `worktree merged ${label}'s head ${prHead} after ranger's recorded rebase from ${from}, preserving unpushed work at ${here}` });
+   return;
+  }
   throw new ParkSignal(
    `the worktree (${here.slice(0, 8)}) has commits ${label}'s head (${prHead.slice(0, 8)}) does not contain: someone pushed to ${branch} while this tree held unpushed work${dirtyNote}. ` +
     `Nothing was changed; merge or drop one side, then resume`,
