@@ -93,6 +93,15 @@ function rig(map: { autoMerge?: boolean; probe?: boolean } = {}) {
  return { dir, config, journal, desk, posts, spawned, events, close() { journal.close(); rmSync(dir, { recursive: true, force: true }); } };
 }
 
+function needsRebaseDesk(r: ReturnType<typeof rig>, head: string) {
+ const gh = fakeGitHub({ head, comments: [review(head)], ci: GREEN });
+ const get = gh.github.getPr;
+ gh.github.getPr = async (...args) => ({ ...await get(...args), mergeState: "needs-rebase" });
+ const rebases: string[] = [];
+ gh.github.rebasePr = async (_repo, _n, sha) => { rebases.push(sha); return { status: "pending", requested: true, reason: "updating" }; };
+ return { gh, rebases, run: () => r.desk(gh.github) };
+}
+
 describe("node #440 — rebase leaves unpushed work to implement", () => {
  test.each(["at-from", "after-from", "foreign", "missing-head"])("rebase worktree ancestry: %s", async scenario => {
   const r = rig();
@@ -111,14 +120,10 @@ describe("node #440 — rebase leaves unpushed work to implement", () => {
    const here = await git(["rev-parse", "HEAD"]);
    if (scenario === "at-from" || scenario === "after-from") r.journal.recordRebase({ repo: GAME, nodeId: "96", from, to: head, requested: true, note: "confirmed rebase" });
    r.journal.updateWorker("96", GAME, { status: "awaiting-merge", outcome: null, worktree: canonical, verdictSha: head });
-   const gh = fakeGitHub({ head, comments: [review(head)], ci: GREEN });
-   const get = gh.github.getPr;
-   gh.github.getPr = async (...args) => ({ ...await get(...args), mergeState: "needs-rebase" });
-   const rebases: string[] = [];
-   gh.github.rebasePr = async (_repo, _n, sha) => { rebases.push(sha); return { status: "pending", requested: true, reason: "updating" }; };
-   const result = await r.desk(gh.github);
+   const desk = needsRebaseDesk(r, head);
+   const result = await desk.run();
    expect(result.errors).toEqual([]);
-   expect(rebases).toEqual(scenario === "at-from" ? [head] : []);
+   expect(desk.rebases).toEqual(scenario === "at-from" ? [head] : []);
    expect(r.spawned).toEqual(scenario === "at-from" ? [] : ["96"]);
    expect(await git(["rev-parse", "HEAD"])).toBe(here);
    if (scenario === "missing-head") {
@@ -142,14 +147,10 @@ describe("node #440 — rebase leaves unpushed work to implement", () => {
     }
     const local = (await git(["rev-parse", "HEAD"])).stdout.trim();
     r.journal.updateWorker("96", GAME, { status: "awaiting-merge", outcome: null, worktree: canonical, verdictSha: head });
-    const gh = fakeGitHub({ head, comments: [review(head)], ci: GREEN });
-    const get = gh.github.getPr;
-    gh.github.getPr = async (...args) => ({ ...await get(...args), mergeState: "needs-rebase" });
-    const rebases: string[] = [];
-    gh.github.rebasePr = async (_repo, _n, from) => { rebases.push(from); return { status: "pending", requested: true, reason: "updating" }; };
-    const result = await r.desk(gh.github);
+    const desk = needsRebaseDesk(r, head);
+    const result = await desk.run();
     expect(result.errors).toEqual([]);
-    expect(rebases).toEqual(localWork ? [] : [head]);
+    expect(desk.rebases).toEqual(localWork ? [] : [head]);
     expect(r.journal.listRebases(GAME, "96")).toHaveLength(localWork ? 0 : 1);
     expect(r.spawned).toEqual(localWork ? ["96"] : []);
     if (localWork) {

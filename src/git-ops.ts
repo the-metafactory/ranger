@@ -903,6 +903,10 @@ export function closingKeywordRefusal(forge: ForgeRef["forge"], what: string, hi
  return `${what} carries a ${forge === "github" ? "GitHub" : "GitLab"} closing keyword ("${hit}") — a merge would auto-close the node and skip its close gate (#588)`;
 }
 
+export async function hasCommit(worktree: string, sha: string): Promise<boolean> {
+ return (await safeGit(["cat-file", "-e", `${sha}^{commit}`], { cwd: worktree, timeoutMs: 10_000 })).code === 0;
+}
+
 export async function headSha(worktree: string): Promise<string> {
  const result = await safeGit(["rev-parse", "HEAD"], {
   cwd: worktree,

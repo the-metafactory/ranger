@@ -1,4 +1,4 @@
-import { headSha, isAncestor, safeGit } from "./git-ops.ts";
+import { hasCommit, headSha, isAncestor } from "./git-ops.ts";
 import type { Journal, WorkerRow } from "./journal.ts";
 import { parseHeadPark } from "./outcomes.ts";
 
@@ -10,8 +10,7 @@ export async function recordedRebaseFrom(opts: {
 }): Promise<string | null> {
  for (const rebase of opts.rebases) {
   if (rebase.to !== opts.prHead) continue;
-  const have = await safeGit(["cat-file", "-e", `${rebase.from}^{commit}`], { cwd: opts.worktree, timeoutMs: 10_000 });
-  if (have.code === 0 && await isAncestor(opts.worktree, rebase.from, opts.here)) return rebase.from;
+  if (await hasCommit(opts.worktree, rebase.from) && await isAncestor(opts.worktree, rebase.from, opts.here)) return rebase.from;
  }
  return null;
 }

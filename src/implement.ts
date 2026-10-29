@@ -26,6 +26,7 @@ import {
  findClosingKeyword,
  gitCredential,
  GitSafetyError,
+ hasCommit,
  headSha,
  isAncestor,
  safeGit,
@@ -2196,9 +2197,7 @@ async function syncWorktreeToHead(ctx: ImplementContext, prNumber: number, prHea
  if (!/^[0-9a-f]{40}$/.test(prHead)) {
   throw new ParkSignal(`${label}'s head is unknown ("${prHead}"), and the worktree is at ${here.slice(0, 8)}: ranger will not work on a tree it cannot match to the head`);
  }
- const haveHead = async () =>
-  (await safeGit(["cat-file", "-e", `${prHead}^{commit}`], { cwd: worktree, timeoutMs: 10_000 })).code === 0;
- if ((await haveHead()) && (await isAncestor(worktree, prHead, here))) {
+ if ((await hasCommit(worktree, prHead)) && (await isAncestor(worktree, prHead, here))) {
   const tracked = await safeGit(["rev-parse", "--verify", "--quiet", `refs/remotes/origin/${branch}^{commit}`], { cwd: worktree, timeoutMs: 10_000 });
   const pushedTip = tracked.stdout.trim();
   if (tracked.code === 0 && /^[0-9a-f]{40}$/.test(pushedTip) && (await isAncestor(worktree, here, pushedTip))) {
@@ -2212,7 +2211,7 @@ async function syncWorktreeToHead(ctx: ImplementContext, prNumber: number, prHea
  // The fetch carries the write credential: the state must still be the known-good one (node #81).
  await trustedSnapshot(journal, ctx.canonical, { repo, nodeId }, mapKey(ctx.map));
  await fetchBranch(ctx.canonical, branch, gitCredential(repo, ctx.token));
- if (!(await haveHead())) {
+ if (!(await hasCommit(worktree, prHead))) {
   throw new ParkSignal(
    `${label}'s head ${prHead.slice(0, 8)} is not on origin/${branch} after a fetch, and the worktree is at ${here.slice(0, 8)}: nothing was changed`,
   );

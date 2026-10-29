@@ -26,7 +26,7 @@ import { squashMessage as gitlabSquashMessage } from "./gitlab.ts";
 import { lanePort } from "./forge-lanes.ts";
 import { CI_FAILED_PARK_OUTCOME, ciNotSentBackOutcome, closeRefusalHead, mergeGateFailedOutcome } from "./outcomes.ts";
 import { changeRequestLabel, changeRequestNoun, forgeName } from "./forge-text.ts";
-import { closingKeywordRefusal, findClosingKeyword, headSha as worktreeHead, isAncestor, safeGit } from "./git-ops.ts";
+import { closingKeywordRefusal, findClosingKeyword, hasCommit, headSha as worktreeHead, isAncestor } from "./git-ops.ts";
 import { recordedRebaseFrom } from "./worktree-head.ts";
 import { squashTitle } from "./github.ts";
 import { isTransientGitHubError } from "./transient.ts";
@@ -488,8 +488,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   const cr = changeRequestLabel(repo, pr.iid);
   if (row.worktree !== null) {
    const here = await worktreeHead(row.worktree);
-   const haveHead = await safeGit(["cat-file", "-e", `${headSha}^{commit}`], { cwd: row.worktree, timeoutMs: 10_000 });
-   if (haveHead.code !== 0) {
+   if (!await hasCommit(row.worktree, headSha)) {
     const why = `rebase skipped: ${cr}'s head (${headSha.slice(0, 8)}) is not available locally; the implement lane fetches it before reconciling the worktree`;
     journal.recordEvent("sweep", { nodeId: row.nodeId, repo, detail: `${cr}: ${why}` });
     await sendBack(row, why, cardTitle);
