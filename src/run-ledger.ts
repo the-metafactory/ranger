@@ -14,7 +14,7 @@ import { createOutbox } from "@the-metafactory/myelin/outbox";
 import { expandHome, type RangerConfig } from "./config.ts";
 import type { Journal } from "./journal.ts";
 import { nodeKey } from "./forge-ref.ts";
-import { workerLogFile } from "./worker-log.ts";
+import { existingWorkerLog } from "./worker-log.ts";
 import { AGE_BAND_STATE, ageBand, type EscalateResult } from "./card-sync.ts";
 
 const SOVEREIGNTY: Sovereignty = {
@@ -145,6 +145,7 @@ export async function emitNodeRunFinished(
    } catch {} // A diagnostic must never suppress the envelope or change the run result.
   }
   const goal = validRootGoal ? rootGoal : env.MF_SERVES_GOAL;
+  const log = existingWorkerLog(journal.path, run.repo, run.nodeId, run.generation);
   return [{
    run_id: randomUUID(),
    producer: "ranger",
@@ -153,7 +154,7 @@ export async function emitNodeRunFinished(
    outcome: run.outcome,
    started_at: run.startedAt,
    ended_at: run.endedAt,
-   detail_ref: workerLogFile(journal.path, run.repo, run.nodeId, run.generation),
+   ...(log === null ? {} : { detail_ref: log }),
   }];
  }, deps);
 }

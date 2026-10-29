@@ -1,11 +1,23 @@
 import { fileStemFor } from "./forge-ref.ts";
-import { appendFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, mkdirSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { RunResult } from "./exec.ts";
 
 /** The node and generation's log file: one per node and generation, next to the journal. */
 export function workerLogFile(journalPath: string, repo: string, nodeId: string, generation: number): string {
  return join(dirname(journalPath), "logs", "workers", `${fileStemFor(repo, nodeId)}-g${generation}.log`);
+}
+
+export function existingWorkerLog(journalPath: string, repo: string, nodeId: string, generation: number): string | null {
+ for (let current = generation; current >= 0; current--) {
+  const file = workerLogFile(journalPath, repo, nodeId, current);
+  try {
+   if (statSync(file).isFile()) return file;
+  } catch {
+   continue;
+  }
+ }
+ return null;
 }
 
 /**

@@ -2795,7 +2795,15 @@ async function closeAfterMerge(
    ...(ctx.ratify === "auto" ? { ci: `${success.runId}@${pr.headSha}` } : {}),
    evidence,
   },
-  { cwd: ctx.canonical, timeoutMs: closeTimeoutForNode(node) },
+  {
+   cwd: ctx.canonical,
+   timeoutMs: closeTimeoutForNode(node),
+   runner: async (command, args, opts) => {
+    const result = await runCmd(command, args, opts);
+    logRun(ctx, `soma graph close ${nodeId}`, result);
+    return result;
+   },
+  },
  );
  if (!close.closed) {
   if (close.timedOut === true) throw new ParkSignal(`close after merge: ${close.detail}`);
