@@ -17,6 +17,22 @@ export { NEEDS_EYE_LABEL } from "./labels.ts";
 /** A probe file name as the runner prints it: no path, no shell metacharacters. */
 export const PROBE_FILE = /^[\w.-]+\.m?js$/;
 
+export function foreignPushParkOutcome(r: { here: string; label: string; prHead: string; branch: string; dirtyNote: string }): string {
+ return `the worktree (${r.here.slice(0, 8)}) has commits ${r.label}'s head (${r.prHead.slice(0, 8)}) does not contain: someone pushed to ${r.branch} while this tree held unpushed work${r.dirtyNote}. ` +
+  `Nothing was changed; merge or drop one side, then resume`;
+}
+
+export function rebaseConflictParkOutcome(r: { here: string; label: string; prHead: string; files: string[] }): string {
+ return `rebase merge conflicts: the worktree (${r.here.slice(0, 8)}) and ${r.label}'s head (${r.prHead.slice(0, 8)}): ${r.files.join(", ")}. The merge was aborted; resolve the conflict, then resume`;
+}
+
+export function parseHeadPark(outcome: string): { kind: "foreign" | "conflict"; here: string; prHead: string } | null {
+ const foreign = /^the worktree \(([0-9a-f]{8})\) has commits .+?'s head \(([0-9a-f]{8})\) does not contain: someone pushed/.exec(outcome);
+ if (foreign !== null) return { kind: "foreign", here: foreign[1], prHead: foreign[2] };
+ const conflict = /^rebase merge conflicts: the worktree \(([0-9a-f]{8})\) and .+?'s head \(([0-9a-f]{8})\)/.exec(outcome);
+ return conflict === null ? null : { kind: "conflict", here: conflict[1], prHead: conflict[2] };
+}
+
 /**
  * The probes a failed run names on its `FAILED: a.mjs · b.mjs` line (the
  * seelite runner's summary). Empty when there is no such line or any name

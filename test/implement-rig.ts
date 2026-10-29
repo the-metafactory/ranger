@@ -1,9 +1,9 @@
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "../src/config.ts";
 import { runCmd } from "../src/exec.ts";
-import type { ChangeRequest, CiFailedRun, CiPurpose, IssueComment, MergeState } from "../src/forge.ts";
+import type { ChangeRequest, CiFailedRun, CiPurpose, IssueComment, MergeState, RebaseOutcome } from "../src/forge.ts";
 import type { CheckRun } from "../src/github.ts";
 import { githubCiVerdict } from "../src/github-ci.ts";
 import type { ForgePort } from "../src/implement.ts";
@@ -130,6 +130,24 @@ export class FakeGitHub implements ForgePort {
 
  async issueLabels(_repo: string, n: number) {
   return this.labels.get(n) ?? [];
+ }
+ async rebasePr(_repo: string, n: number, expected: string): Promise<RebaseOutcome> {
+  const pr = this.prs.get(n);
+  if (pr === undefined) throw new Error(`no PR #${n}`);
+  if (await this.sha(pr.head) !== expected) throw new Error("head moved before rebase");
+  const dir = mkdtempSync(join(tmpdir(), "ranger-forge-rebase-"));
+  const git = async (args: string[]) => {
+   const result = await runCmd("git", args, { cwd: dir, env: { ...process.env, ...GIT_ENV } });
+   if (result.code !== 0) throw new Error(result.stderr);
+   return result.stdout.trim();
+  };
+  try {
+   await git(["clone", "--branch", pr.head, this.origin, "."]);
+   await git(["rebase", `origin/${pr.base}`]);
+   const headSha = await git(["rev-parse", "HEAD"]);
+   await git(["push", `--force-with-lease=refs/heads/${pr.head}:${expected}`, "origin", `HEAD:refs/heads/${pr.head}`]);
+   return { status: "head-moved", headSha, requested: true };
+  } finally { rmSync(dir, { recursive: true, force: true }); }
  }
  /** Ranger's merge: like GitHub, refused when the head moved off `sha`. */
  async mergePr(_repo: string, n: number, sha: string, title: string) {

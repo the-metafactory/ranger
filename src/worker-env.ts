@@ -74,6 +74,18 @@ export function workerEnv(
  * A GitLab map without one refuses: it would commit as the host's identity.
  */
 function authorEnv(config: RangerConfig, repo: string, commitAuthor: CommitAuthor | undefined): NodeJS.ProcessEnv {
+ const author = commitAuthorFor(config, repo, commitAuthor);
+ return author === undefined
+  ? {}
+  : {
+     GIT_AUTHOR_NAME: author.name,
+     GIT_AUTHOR_EMAIL: author.email,
+     GIT_COMMITTER_NAME: author.name,
+     GIT_COMMITTER_EMAIL: author.email,
+    };
+}
+
+export function commitAuthorFor(config: RangerConfig, repo: string, commitAuthor: CommitAuthor | undefined): CommitAuthor | undefined {
  let author = commitAuthor;
  if (parseForgeRef(repo).forge === "gitlab") {
   if (author === undefined) {
@@ -83,12 +95,5 @@ function authorEnv(config: RangerConfig, repo: string, commitAuthor: CommitAutho
   const identity = config.bot.identity;
   author = identity === undefined ? undefined : { name: identity, email: `${identity}@users.noreply.github.com` };
  }
- return author === undefined
-  ? {}
-  : {
-     GIT_AUTHOR_NAME: author.name,
-     GIT_AUTHOR_EMAIL: author.email,
-     GIT_COMMITTER_NAME: author.name,
-     GIT_COMMITTER_EMAIL: author.email,
-    };
+ return author;
 }
