@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Journal } from "../src/journal.ts";
-import { workerLogFile } from "../src/worker-log.ts";
+import { saveWorkerLog } from "../src/worker-log.ts";
 import { baseConfigLines, runCli } from "./support.ts";
 
 const dir = realpathSync(mkdtempSync(join(tmpdir(), "ranger-journal-cli-")));
@@ -21,13 +21,16 @@ describe("ranger journal (ranger issue #229)", () => {
   expect(result.stderr).toContain(`cannot read config at ${join(empty, ".config", "ranger", "ranger.yaml")}`);
  });
 
- test("--node keeps one node's rows and names each worker's log file", async () => {
+ test("--node keeps one node's rows and names only existing worker logs", async () => {
   const config = join(dir, "ranger.yaml");
   writeFileSync(config, baseConfigLines(dir).join("\n") + "\n");
   const journalPath = join(dir, "state.sqlite");
   const j = new Journal(journalPath);
   j.upsertWorker({ root: 1, nodeId: "769", repo: "acme/widgets", status: "parked", attempts: 1, outcome: "probes failed" });
   j.upsertWorker({ root: 1, nodeId: "843", repo: "acme/widgets", status: "running", attempts: 1 });
+  const log = saveWorkerLog(journalPath, "acme/widgets", "769", 1, "build", { code: 0, stdout: "built", stderr: "" });
+  j.beginGeneration("769", "acme/widgets");
+  j.beginGeneration("769", "acme/widgets");
   j.recordEvent("parked", { nodeId: "769", repo: "acme/widgets", detail: "FAILED: probe-system-sweep.mjs" });
   // Newer events of another node must not push 769's out of the window.
   for (let i = 0; i < 60; i++) j.recordEvent("reviewed", { nodeId: "843", repo: "acme/widgets", detail: `round ${i}` });
@@ -41,9 +44,15 @@ describe("ranger journal (ranger issue #229)", () => {
    events: { nodeId: string; detail: string }[];
   };
   expect(out.workers.map((w) => w.nodeId)).toEqual(["769"]);
-  expect(out.workers[0].workerLog).toBe(workerLogFile(journalPath, "acme/widgets", "769", out.workers[0].generation));
+  expect(out.workers[0].generation).toBe(2);
+  expect(out.workers[0].workerLog).toBe(log);
   expect(out.events).toHaveLength(1);
   expect(out.events[0].detail).toBe("FAILED: probe-system-sweep.mjs");
+  const withoutLog = await runCli(["journal", "--repo", "acme/widgets", "--node", "843", "-c", config], process.env, tmpdir());
+  expect(withoutLog.code).toBe(0);
+  const logless = JSON.parse(withoutLog.stdout) as { workers: { nodeId: string; workerLog: string | null }[] };
+  expect(logless.workers).toHaveLength(1);
+  expect(logless.workers[0].workerLog).toBeNull();
  });
 
  test("--node refuses a non-numeric id", async () => {

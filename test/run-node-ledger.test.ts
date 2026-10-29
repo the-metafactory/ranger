@@ -9,7 +9,7 @@ import { nodeKey } from "../src/forge-ref.ts";
 import type { ChangeRequest } from "../src/forge.ts";
 import { WriteGateError } from "../src/identity.ts";
 import { runNodeRunOutcome, type RunNodeOutcome } from "../src/worker.ts";
-import { workerLogFile } from "../src/worker-log.ts";
+import { saveWorkerLog } from "../src/worker-log.ts";
 import { AT, cleanup, controlled, deps, failures, fixture, forge, graphFixture, result, spool, valid } from "./run-node-ledger-support.ts";
 import { createCanonicalRepo, fixturesBin, runCli } from "./support.ts";
 
@@ -62,9 +62,9 @@ describe("run-node run ledger", () => {
     producer: "ranger", ran: { kind: "node", ref },
     serves: { node: ref, ...(goal ? { goal } : {}) },
     started_at: AT, ended_at: "2026-10-14T07:00:01.000Z",
-    detail_ref: workerLogFile(f.journal.path, repo, "10", row ? 2 : 1),
     correlation_id: "origin-correlation",
    });
+   expect(event.input.payload).not.toHaveProperty("detail_ref");
    if (!goal) expect(event.input.payload.serves).not.toHaveProperty("goal");
   }
   expect(events[0].input.payload.run_id).not.toBe(events[1].input.payload.run_id);
@@ -85,9 +85,24 @@ describe("run-node run ledger", () => {
    expect(JSON.parse(output).detail).toMatch(path === "unsupported kind" ? /kind 'grilling'/ : path === "fenced" ? /superseded/ : /waits for the principal/);
    expect(events).toHaveLength(1);
    valid(events[0], "blocked");
-   expect(events[0].input.payload.detail_ref).toBe(workerLogFile(f.journal.path, "acme/widgets", "10", 2));
+   expect(events[0].input.payload).not.toHaveProperty("detail_ref");
   });
  }
+
+ test.each([1, 2])("a generation emits only its own log when generation %s has a file", async generation => {
+  const f = fixture();
+  const log = saveWorkerLog(f.journal.path, "acme/widgets", "10", generation, "build", { code: 0, stdout: "built", stderr: "" });
+  saveWorkerLog(f.journal.path, "acme/widgets", "10", 3, "future", { code: 0, stdout: "future", stderr: "" });
+  const events: ExecutionRunFinishedEvent[] = [];
+  await runRunNode("10", undefined, f.configPath, deps(f, {
+   publisher: async event => { events.push(event); },
+  }, { runNode: controlled("parked") }));
+  expect(events).toHaveLength(1);
+  valid(events[0], "blocked");
+  if (generation === 2) expect(events[0].input.payload.detail_ref).toBe(log);
+  else expect(events[0].input.payload).not.toHaveProperty("detail_ref");
+  expect(existsSync(log)).toBe(true);
+ });
 
  for (const merged of [true, false]) for (const readableRoot of [true, false]) {
   test(`real runNode reconciles a closed node as ${merged ? "success" : "released"} with root readable=${readableRoot}`, async () => {
