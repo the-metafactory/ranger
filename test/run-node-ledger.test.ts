@@ -89,7 +89,7 @@ describe("run-node run ledger", () => {
   });
  }
 
- test.each([1, 2])("a logless generation emits the existing generation %s log", async generation => {
+ test.each([1, 2])("a generation emits only its own log when generation %s has a file", async generation => {
   const f = fixture();
   const log = saveWorkerLog(f.journal.path, "acme/widgets", "10", generation, "build", { code: 0, stdout: "built", stderr: "" });
   saveWorkerLog(f.journal.path, "acme/widgets", "10", 3, "future", { code: 0, stdout: "future", stderr: "" });
@@ -99,7 +99,8 @@ describe("run-node run ledger", () => {
   }, { runNode: controlled("parked") }));
   expect(events).toHaveLength(1);
   valid(events[0], "blocked");
-  expect(events[0].input.payload.detail_ref).toBe(log);
+  if (generation === 2) expect(events[0].input.payload.detail_ref).toBe(log);
+  else expect(events[0].input.payload).not.toHaveProperty("detail_ref");
   expect(existsSync(log)).toBe(true);
  });
 
