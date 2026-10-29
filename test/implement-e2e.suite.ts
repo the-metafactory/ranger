@@ -689,6 +689,16 @@ describe("implement lane (node #23)", () => {
   expect((await git(["commit", "-m", "retain work for node #20"], worktree)).code).toBe(0);
   return (await git(["rev-parse", "HEAD"], worktree)).stdout.trim();
  };
+ const eventsSince = (r: Rig, prior: number) => r.journal.listEvents("acme/widgets", 1000).reverse().slice(prior);
+ const expectPushedThenReviewed = (events: ReturnType<typeof eventsSince>, from: string, to: string, reviewed = true) => {
+  const push = events.findIndex(e => e.kind === "pushed");
+  expect(push).toBeGreaterThanOrEqual(0);
+  expect(events[push].detail).toContain(from);
+  expect(events[push].detail).toContain(to);
+  const review = events.findIndex(e => e.kind === "reviewed");
+  if (reviewed) expect(review).toBeGreaterThan(push);
+  else expect(review).toBe(-1);
+ };
  /** A push to the PR branch from outside the run (a principal's session): returns the new head. */
  const pushFromOutside = async (r: Rig, file: string, branch = BRANCH): Promise<string> => {
   const clone = join(r.dir, `outside-${file}`);
@@ -2111,16 +2121,12 @@ describe("implement lane (node #23)", () => {
   expect(readFileSync(tested, "utf8").trim()).toBe(local);
   expect(outcome.status).toBe(testsFail ? "failed" : "awaiting-merge");
   expect(await r.github.sha(branch)).toBe(testsFail ? pushed : local);
-  const events = r.journal.listEvents("acme/widgets", 1000).reverse().slice(prior);
+  const events = eventsSince(r, prior);
   if (testsFail) {
    expect(events.some(e => e.kind === "pushed")).toBe(false);
    expect(events.some(e => e.kind === "reviewed")).toBe(false);
   } else {
-   const push = events.findIndex(e => e.kind === "pushed");
-   expect(push).toBeGreaterThanOrEqual(0);
-   expect(events[push].detail).toContain(pushed);
-   expect(events[push].detail).toContain(local);
-   expect(events.findIndex(e => e.kind === "reviewed")).toBeGreaterThan(push);
+   expectPushedThenReviewed(events, pushed, local);
   }
   expect(r.github.merges).toEqual([]);
  }, 60_000);
@@ -3714,17 +3720,13 @@ describe("implement lane (node #23)", () => {
   expect(await r.github.sha(branch)).toBe(scenario === "fail" ? pushed : unpushed);
   expect(sessions).toHaveLength(0);
   expect(r.calls).toHaveLength(scenario === "pass" ? 2 : 1);
-  const events = r.journal.listEvents("acme/widgets", 1000).reverse().slice(prior);
-  const push = events.findIndex(e => e.kind === "pushed");
+  const events = eventsSince(r, prior);
   if (scenario === "fail") {
    expect(resumed.detail).toContain("on the resumed worktree");
-   expect(push).toBe(-1);
+   expect(events.some(e => e.kind === "pushed")).toBe(false);
    expect(events.some(e => e.kind === "reviewed")).toBe(false);
   } else {
-   expect(push).toBeGreaterThanOrEqual(0);
-   expect(events[push].detail).toContain(pushed);
-   expect(events[push].detail).toContain(unpushed);
-   if (scenario === "pass") expect(events.findIndex(e => e.kind === "reviewed")).toBeGreaterThan(push);
+   expectPushedThenReviewed(events, pushed, unpushed, scenario === "pass");
   }
   expect((r.github.comments.get(1) ?? []).some(c => c.body.includes("ranger:base-merge"))).toBe(false);
   expect(r.github.merges).toEqual([]);
