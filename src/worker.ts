@@ -67,7 +67,7 @@ import { findNodePr, finishClosedElsewhere } from "./closed-elsewhere.ts";
 import type { ForgePort } from "./forge.ts";
 import { HostLoadPark, ParkSignal } from "./signals.ts";
 import { implementLane } from "./lanes.ts";
-import { policyBlockedOutcome } from "./outcomes.ts";
+import { journalOutcome, policyBlockedOutcome } from "./outcomes.ts";
 import { assertResearchFindingsOnly, researchCi, type ResearchCiTiming } from "./research-ci.ts";
 import { proposalMarker } from "./ratify.ts";
 import { closeGraphEscalation } from "./card-sync.ts";
@@ -462,7 +462,7 @@ function finish(
   pid: null,
   workerPgid: null,
   finishedAt: new Date().toISOString(),
-  outcome: outcome.slice(0, 400),
+  outcome: journalOutcome(outcome),
  });
 }
 
@@ -781,7 +781,7 @@ async function parkRun(
  detail: string,
 ): Promise<RunNodeOutcome> {
  const repo = ctx.map.repo;
- ctx.journal.recordEvent("parked", { nodeId, repo, detail: detail.slice(0, 400) });
+ ctx.journal.recordEvent("parked", { nodeId, repo, detail: journalOutcome(detail) });
  finish(ctx.journal, nodeId, repo, "parked", detail);
  await parkCard(ctx.map, nodeId, title, detail);
  return { nodeId, repo, status: "parked", detail, workerExit: null };
