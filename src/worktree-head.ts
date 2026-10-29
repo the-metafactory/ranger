@@ -1,5 +1,6 @@
 import { headSha, isAncestor, safeGit } from "./git-ops.ts";
 import type { Journal, WorkerRow } from "./journal.ts";
+import { parseHeadPark } from "./outcomes.ts";
 
 export async function recordedRebaseFrom(opts: {
  worktree: string;
@@ -17,12 +18,10 @@ export async function recordedRebaseFrom(opts: {
 
 export async function unchangedHeadPark(row: WorkerRow, prHead: string, journal: Journal): Promise<boolean> {
  if (row.status !== "parked" || row.worktree === null || row.outcome === null) return false;
- const foreign = /^the worktree \(([0-9a-f]{8})\) has commits .+?'s head \(([0-9a-f]{8})\) does not contain: someone pushed/.exec(row.outcome);
- const conflict = /^rebase merge conflicts: the worktree \(([0-9a-f]{8})\) and .+?'s head \(([0-9a-f]{8})\)/.exec(row.outcome);
- const parked = foreign ?? conflict;
- if (parked === null || !prHead.startsWith(parked[2])) return false;
+ const parked = parseHeadPark(row.outcome);
+ if (parked === null || !prHead.startsWith(parked.prHead)) return false;
  const here = await headSha(row.worktree);
- if (!here.startsWith(parked[1])) return false;
- if (conflict !== null) return true;
+ if (!here.startsWith(parked.here)) return false;
+ if (parked.kind === "conflict") return true;
  return await recordedRebaseFrom({ worktree: row.worktree, here, prHead, rebases: journal.listRebases(row.repo, row.nodeId) }) === null;
 }

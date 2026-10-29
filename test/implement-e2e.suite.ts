@@ -787,13 +787,15 @@ describe("implement lane (node #23)", () => {
   expect((await r.github.getPr("acme/widgets", 1)).headSha).toBe(pushed);
  }, 60_000);
 
- const rebasedWithLocalWork = async (conflict = false) => {
+ const rebasedWithLocalWork = async (conflict = false, localWork = true) => {
   const { r, worktree, head } = await failAfterRoundOne();
   const from = await head();
   const file = conflict ? "base.txt" : "local.txt";
-  writeFileSync(join(worktree, file), "unpushed local work\n");
-  expect((await git(["add", file], worktree)).code).toBe(0);
-  expect((await git(["commit", "-m", "local work after review"], worktree)).code).toBe(0);
+  if (localWork) {
+   writeFileSync(join(worktree, file), "unpushed local work\n");
+   expect((await git(["add", file], worktree)).code).toBe(0);
+   expect((await git(["commit", "-m", "local work after review"], worktree)).code).toBe(0);
+  }
   const local = await head();
   await pushFromOutside(r, "base.txt", "main");
   const rebase = await r.github.rebasePr("acme/widgets", 1, from);
@@ -801,6 +803,27 @@ describe("implement lane (node #23)", () => {
   expect(rebase.headSha).not.toBe(from);
   return { r, worktree, head, from, local, to: rebase.headSha };
  };
+
+ test.each(["clean", "dirty", "foreign"])("own rebase without local commits (node #440): %s", async scenario => {
+  const { r, worktree, head, from, to } = await rebasedWithLocalWork(false, false);
+  expect((await git(["merge-base", "--is-ancestor", from, to], r.origin)).code).toBe(1);
+  if (scenario !== "foreign") r.journal.recordRebase({ repo: "acme/widgets", nodeId: "20", from, to, requested: true, note: "confirmed rebase" });
+  if (scenario === "dirty") writeFileSync(join(worktree, "scratch.txt"), "unfinished\n");
+  const sessions = countSessions(r);
+  const outcome = await runNode("20", r.ctx);
+  expect(await r.github.sha(BRANCH)).toBe(to);
+  expect(sessions).toHaveLength(0);
+  if (scenario === "clean") {
+   expect(outcome.status).toBe("awaiting-merge");
+   expect(await head()).toBe(to);
+   expect((await git(["merge-base", "--is-ancestor", from, await head()], worktree)).code).toBe(1);
+   expect(r.journal.listNodeEvents("acme/widgets", "20").some(e => e.kind === "worktree-synced" && e.detail?.includes("recorded rebase"))).toBe(true);
+  } else {
+   expect(outcome.status).toBe("parked");
+   expect(await head()).toBe(from);
+   expect(outcome.detail).toContain(scenario === "dirty" ? "scratch.txt" : "someone pushed");
+  }
+ }, 60_000);
 
  test.each(["clean", "tests-fail", "conflict", "foreign", "wrong-from", "wrong-to", "pending", "other-node", "dirty"])("own rebase reconciliation (node #440): %s", async scenario => {
   const { r, worktree, head, from, local, to } = await rebasedWithLocalWork(scenario === "conflict");
