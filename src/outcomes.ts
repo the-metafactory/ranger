@@ -367,6 +367,11 @@ export function hostLoadOutcome(r: BusyReading & { what: string; names: string[]
 export const HOST_LOAD_OUTCOME = /^waiting for a quiet host: load [\d.]+ on \d+ cores/;
 
 const PROBE_RAN_AND_FAILED = " ran and failed: ";
+const CLOSE_REFUSED_PREFIX = "close refused after merge: ";
+
+export function journalOutcome(outcome: string): string {
+ return outcome.slice(0, outcome.startsWith(CLOSE_REFUSED_PREFIX) ? 1300 : 400);
+}
 
 /**
  * A close the graph refused after the merge. Soma names the failed probe,
@@ -377,7 +382,7 @@ const PROBE_RAN_AND_FAILED = " ran and failed: ";
 export function closeRefusedOutcome(detail: string): string {
  const head = closeRefusalHead(detail);
  const observed = detail.slice(head.length);
- return `close refused after merge: ${head.slice(0, 600)}${observed.length > 600 ? `: …${observed.slice(-600)}` : observed}`;
+ return `${CLOSE_REFUSED_PREFIX}${head.slice(0, 600)}${observed.length > 600 ? `: …${observed.slice(-600)}` : observed}`;
 }
 
 /** The refusal without the failed probe's output, which is the command's text, not soma's. */

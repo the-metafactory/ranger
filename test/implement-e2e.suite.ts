@@ -1589,6 +1589,24 @@ describe("implement lane (node #23)", () => {
   expect(state(r.statePath).nodes["20"].status).toBe("closed");
  }, 60_000);
 
+ test("a refused close keeps bun's failing tests and counts in the worker row and parked event (node #406)", async () => {
+  const failures = "(fail) close gate > names the failed tests [5000.00ms]\n(fail) journal > retains the probe result [5000.00ms]\n\n 1200 pass\n 2 fail\nRan 1202 tests across 180 files.";
+  const { r, outcome } = await closeFailing(
+   `probe command:bun run test|/repo|1800|0 on node 20 ran and failed: exit 1:\n${"(pass) a passing test\n".repeat(100)}${failures}`,
+  );
+  expect(outcome.status).toBe("parked");
+  const worker = r.journal.getWorker("20", "acme/widgets");
+  const parked = r.journal.listEvents("acme/widgets", 200).filter(e => e.kind === "parked" && e.nodeId === "20");
+  expect(worker).toMatchObject({ status: "parked", phase: "close" });
+  expect(parked).toHaveLength(1);
+  for (const stored of [worker?.outcome, parked[0]?.detail]) {
+   expect(stored).toStartWith("close refused after merge: probe command:bun run test");
+   expect(stored).toContain(failures);
+   expect(stored?.length).toBeLessThanOrEqual(1300);
+  }
+  expect(worker?.outcome).toBe(parked[0]?.detail);
+ }, 60_000);
+
  test("a close refused for a reason a re-run repeats parks once, and the merge desk does not re-run it (soma #795, 2026-10-13)", async () => {
   const { r, outcome } = await closeFailing(
    "Close refused.\n\n4 of 6 declared probe(s) name a path outside the probe tree.",
