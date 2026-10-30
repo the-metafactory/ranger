@@ -98,7 +98,7 @@ describe("the Scribe's rules (design §6, node #24)", () => {
     : { code: 0, stdout: JSON.stringify({ node: "300", parent: "24", parentStatus: "already" }), stderr: "" };
   });
   try {
-   expect(await graphAdd("acme/widgets", "24", { ...SPEC, blockedBy: ["12", "13"] }, "ghp_machine")).toEqual({ repo: "acme/widgets", node: "300", parent: "24" });
+   expect(await graphAdd("acme/widgets", "24", { ...SPEC, blockedBy: ["12", "13"] }, "ghp_machine")).toEqual({ repo: "acme/widgets", node: "300", parent: "24", existing: false });
    await graphLink("acme/widgets", "300", "24", "ghp_machine", { blockedBy: ["13"] });
    expect(seen[0].join(" ")).toContain("--blocked-by 12 --blocked-by 13 --repo");
    expect(seen[1]).toEqual(["graph", "link", "300", "--blocked-by", "13", "--parent", "24", "--repo", "github:github.com/acme/widgets", "--json"]);

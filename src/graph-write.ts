@@ -335,12 +335,14 @@ export interface AddSpec {
  body?: string;
  /** Blocking edges, wired before the node is attached to its parent. */
  blockedBy?: string[];
+ once?: string;
 }
 
 export interface AddResult {
  repo: string;
  node: string;
  parent: string;
+ existing: boolean;
 }
 
 /**
@@ -350,6 +352,16 @@ export interface AddResult {
  */
 export class GraphAddUnattached extends GraphWriteError {
  constructor(message: string, readonly node: string, readonly parent: string) {
+  super(message);
+ }
+}
+
+/**
+ * `soma graph add --once` found two or more nodes carrying the marker and
+ * added nothing: one observation was filed twice, which a caller escalates.
+ */
+export class GraphAddOnceAmbiguous extends GraphWriteError {
+ constructor(message: string, readonly nodes: string[]) {
   super(message);
  }
 }
@@ -381,21 +393,29 @@ export async function graphAdd(
  for (const label of spec.labels ?? []) args.push("--label", label);
  if (spec.body !== undefined) args.push("--body", spec.body);
  for (const blocker of spec.blockedBy ?? []) args.push("--blocked-by", writeNodeId(ref, blocker));
+ if (spec.once !== undefined) args.push("--once", spec.once);
  args.push("--repo", somaRepo(ref), "--json");
  const result = await callWrite(repo, args, token, opts);
  if (result.code !== 0) {
   const message = (created: string) =>
    `soma graph add below ${parent} (${repo}) failed (exit ${result.code})${created}: ${(result.stderr || result.stdout).trim()}`.slice(0, 600);
   let node: string | null = null;
+  let ambiguous: string[] = [];
   try {
    const payload = parsePayload(result, "add");
    if (payload.attached === false && typeof payload.node === "string") node = writeNodeId(ref, payload.node);
+   if (payload.error === "once-ambiguous" && Array.isArray(payload.nodes)) {
+    ambiguous = payload.nodes.map((id: unknown) => writeNodeId(ref, typeof id === "number" ? String(id) : id));
+   }
   } catch { /* no payload: whether a node was created is unknown */ }
+  if (spec.once !== undefined && ambiguous.length > 1) {
+   throw new GraphAddOnceAmbiguous(message(` — nodes ${ambiguous.map((id) => `#${id}`).join(", ")} all carry ${spec.once}; nothing added`), ambiguous);
+  }
   if (node !== null) throw new GraphAddUnattached(message(` — created ${node} but left it unattached`), node, parent);
   throw new GraphWriteError(message(""));
  }
  const payload = parsePayload(result, "add");
- return { repo, node: writeNodeId(ref, payload.node), parent };
+ return { repo, node: writeNodeId(ref, payload.node), parent, existing: payload.existing === true };
 }
 
 /**

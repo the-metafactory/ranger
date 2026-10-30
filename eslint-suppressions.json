@@ -350,7 +350,7 @@
       "count": 3
     },
     "@typescript-eslint/no-non-null-assertion": {
-      "count": 10
+      "count": 9
     },
     "@typescript-eslint/no-unnecessary-type-assertion": {
       "count": 4
@@ -362,7 +362,7 @@
       "count": 1
     },
     "ranger/no-comments": {
-      "count": 127
+      "count": 125
     }
   },
   "src/jobs.ts": {
@@ -1378,7 +1378,7 @@
       "count": 1
     },
     "@typescript-eslint/no-unnecessary-type-assertion": {
-      "count": 8
+      "count": 6
     },
     "ranger/no-comments": {
       "count": 21
@@ -1400,7 +1400,7 @@
       "count": 1
     },
     "@typescript-eslint/no-unnecessary-type-assertion": {
-      "count": 26
+      "count": 23
     },
     "ranger/no-comments": {
       "count": 23
