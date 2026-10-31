@@ -16,7 +16,7 @@ const Params = z.object({
  requestId: z.string().regex(/^[\w-]{8,64}$/).optional(),
  mode: z.string().regex(/^(think|grill|other-side|red-team|first-principles|persona:[^\r\n]{1,100})$/).optional(),
 }).strict();
-const Front = z.object({ areas: z.array(z.string()).min(1), state: z.enum(["active", "parked", "closed"]), outcome: z.enum(["decided", "shipped", "dropped"]).optional(), reviewOn: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional() });
+const Front = z.object({ areas: z.array(z.string()).min(1), state: z.enum(["active", "parked", "closed"]), outcome: z.enum(["decided", "shipped", "dropped"]).optional(), reviewOn: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refine(value => !Number.isNaN(Date.parse(value))).optional() });
 const PolicyView = z.object({
  directory: z.string(),
  studio: z.object({ areas: z.array(z.object({ id: z.string(), policy: z.enum(["local", "cloud"]) })) }),
@@ -72,6 +72,7 @@ export async function prepareStudio(job: RangerJobConfig, params: Record<string,
   if (text.length > 1_000_000) return deferred("thread exceeds the Studio file limit");
   const match = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(text);
   const front = Front.parse(parseYaml(match?.[1] ?? ""));
+  if (front.state === "parked" && input.mode === undefined) return deferred("thread is parked; automatic thinking deferred");
   const dueReview = front.outcome === "decided" && front.reviewOn !== undefined && front.reviewOn <= new Date().toISOString().slice(0, 10) && input.trigger.startsWith("Decision review due ");
   if (front.state === "closed" && !dueReview) return deferred("thread is closed and has no due decision review");
   const status = await git(dir, ["status", "--porcelain", "--untracked-files=all"]);

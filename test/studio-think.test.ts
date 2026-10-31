@@ -282,7 +282,8 @@ test("only a due closed decision accepts an automatic review and keeps local pol
  const params = { thread: "alpha", trigger: "Decision review due 2000-01-01" };
  for (const front of ["outcome: shipped\nreviewOn: 2000-01-01", "outcome: dropped\nreviewOn: 2000-01-01", "outcome: decided\nreviewOn: 2999-01-01"]) {
   writeFileSync(join(r.repo, "threads/alpha.md"), thread("work").replace("state: active", `state: closed\n${front}`));
-  expect(await prepareStudio(r.job, params)).toMatchObject({ kind: "deferred" });
+  r.git("add", "."); r.git("commit", "-qm", "Clean decision eligibility fixture");
+  expect(await prepareStudio(r.job, params)).toMatchObject({ kind: "deferred", reason: "thread is closed and has no due decision review" });
  }
  writeFileSync(join(r.repo, "threads/alpha.md"), thread("work").replace("state: active", "state: closed\noutcome: decided\nreviewOn: 2000-01-01"));
  r.git("add", "."); r.git("commit", "-qm", "Decided fixture");
@@ -343,4 +344,13 @@ test("CRLF threads without a notes section consume successful automatic tonight 
  const outcome = await runJob(runId, { ...r, substrate: "claude", now: () => now, runSession: async () => ({ code: 0, stdout: response, stderr: "" }) });
  expect(outcome.status).toBe("succeeded");
  expect(readFileSync(join(r.repo, "threads/alpha.md"), "utf8")).toContain("thinkTonight: false");
+});
+
+
+test("parking a thread defers queued automatic work but permits an explicit mode", async () => {
+ const r=rig();
+ writeFileSync(join(r.repo,"threads/alpha.md"),thread().replace("state: active","state: parked"));
+ r.git("add",".");r.git("commit","-qm","Parked fixture");
+ expect(await prepareStudio(r.job,r.params)).toMatchObject({kind:"deferred",reason:"thread is parked; automatic thinking deferred"});
+ expect(await prepareStudio(r.job,{...r.params,mode:"grill"})).toMatchObject({kind:"ready"});
 });
