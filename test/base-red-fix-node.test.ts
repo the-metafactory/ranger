@@ -6,7 +6,7 @@ import { loadConfig } from "../src/config.ts";
 import * as exec from "../src/exec.ts";
 import { runCmd, type RunResult } from "../src/exec.ts";
 import { fixNodeLockFile, FixNodeLockBusy, withFixNodeLock } from "../src/fix-node-lock.ts";
-import { GraphAddUnattached, graphAdd, graphLink, GraphWriteError, type AddSpec } from "../src/graph-write.ts";
+import { GraphAddOnceAmbiguous, GraphAddUnattached, graphAdd, graphLink, GraphWriteError, somaProse, type AddSpec } from "../src/graph-write.ts";
 import { baseRedFixKey, fileBaseRedFixNodes, FIX_NODE_FILING_CONCURRENCY, probeMergeBase, type FixNodeGraph, type ImplementContext } from "../src/implement.ts";
 import { Journal } from "../src/journal.ts";
 import { openDb } from "../src/store/db.ts";
@@ -257,6 +257,48 @@ describe("fix-the-base node for a confirmed base-red probe (node #152)", () => {
   } finally {
    spy.mockRestore();
   }
+ });
+
+ test("graphAdd --once: passes the marker, reports a found node as existing, and names two hits", async () => {
+  const marker = "<!-- ranger:intake discord=42 -->";
+  const seen: string[][] = [];
+  const answers = [
+   { code: 0, stdout: JSON.stringify({ repo: "acme/widgets", node: "77", parent: "1", blockedBy: [], existing: true }), stderr: "" },
+   { code: 0, stdout: JSON.stringify({ repo: "acme/widgets", node: "78", parent: "1", blockedBy: [] }), stderr: "" },
+   { code: 1, stdout: "", stderr: JSON.stringify({ error: "once-ambiguous", marker, nodes: ["77", 78] }) },
+   { code: 1, stdout: "", stderr: JSON.stringify({ error: "something-else", nodes: ["77", "78"] }) },
+  ];
+  const spy = spyOn(exec, "runCmd").mockImplementation(async (_cmd, args) => {
+   seen.push(args);
+   const answer = answers.shift();
+   if (answer === undefined) throw new Error("unexpected soma call");
+   return answer;
+  });
+  const spec = { title: "t", autonomy: "propose" as const, checkpoint: "c", labels: ["ranger:principal-intake"], once: marker };
+  try {
+   expect(await graphAdd("acme/widgets", "1", spec, "ghp_machine")).toEqual({ repo: "acme/widgets", node: "77", parent: "1", existing: true });
+   expect(seen[0]?.slice(seen[0].indexOf("--once"), seen[0].indexOf("--once") + 2)).toEqual(["--once", marker]);
+   expect(seen[0]?.slice(seen[0].indexOf("--label"), seen[0].indexOf("--label") + 2)).toEqual(["--label", "ranger:principal-intake"]);
+   expect((await graphAdd("acme/widgets", "1", spec, "ghp_machine")).existing).toBe(false);
+   const twice = graphAdd("acme/widgets", "1", spec, "ghp_machine");
+   await expect(twice).rejects.toThrow(GraphAddOnceAmbiguous);
+   await expect(twice).rejects.toMatchObject({ nodes: ["77", "78"], marker });
+   await expect(twice).rejects.toThrow(`nodes #77, #78 all carry ${marker}; nothing added`);
+   expect(new GraphAddOnceAmbiguous("m", ["77", "78"], marker).carriers()).toBe(`nodes #77, #78 all carry ${marker}`);
+   const other = graphAdd("acme/widgets", "1", spec, "ghp_machine");
+   await expect(other).rejects.toThrow(GraphWriteError);
+   await expect(other).rejects.not.toThrow(GraphAddOnceAmbiguous);
+   expect(seen.every((args) => args.includes("--once"))).toBe(true);
+  } finally {
+   spy.mockRestore();
+  }
+ });
+
+ test("somaProse drops the node block soma appends and keeps an unclosed one", () => {
+  const block = `<!-- soma:work-graph-node\n${JSON.stringify({ autonomy: "propose", checkpointId: "c" }, null, 2)}\n-->`;
+  expect(somaProse(`words\n\nmarker\n\n${block}`)).toBe("words\n\nmarker\n\n");
+  expect(somaProse("words")).toBe("words");
+  expect(somaProse("words\n<!-- soma:work-graph-node {")).toBe("words\n<!-- soma:work-graph-node {");
  });
 
  test("graphAdd: a failure without a payload is a plain write error", async () => {

@@ -47,7 +47,7 @@ function msg(id: string, author: string, content: string): FakeThreadMessage {
  return { id, content, author: { id: author }, mentions };
 }
 
-interface Issue { number: number; parent: string | null; title: string; autonomy: string; checkpoint: string; labels: string[]; body: string; machineAccount: boolean; kind?: string; probes?: unknown[] }
+interface Issue { number: number; parent: string | null; title: string; autonomy: string; checkpoint: string; labels: string[]; body: string; prose?: string; machineAccount: boolean; kind?: string; probes?: unknown[] }
 
 interface Rig {
  dir: string;
@@ -59,6 +59,7 @@ interface Rig {
  tick(extra?: NodeJS.ProcessEnv): Promise<IntakeResult>;
  /** How many times the gate listed the labelled issues (the marker lookup). */
  lookups(): number;
+ onceCalls(): { marker: string; labels: string[] }[];
  issues(): Issue[];
  links(): unknown[];
  patchState(patch: (s: Record<string, any>) => void): void;
@@ -112,6 +113,7 @@ async function rig(opts: { claude?: ClaudeOneShot } = {}): Promise<Rig> {
   card: () => journal.getIntakeDraft(MESSAGE)!.cardMessageId,
   tick: (extra = {}) => withEnv({ ...env, ...extra }, () => intakePass({ config, journal, clientFor, portFor, registry: {}, ...(opts.claude === undefined ? {} : { claude: opts.claude }) })),
   lookups: () => lookups,
+  onceCalls: () => state().onceCalls ?? [],
   issues: () => Object.values(state().issues ?? {}),
   links: () => state().links ?? [],
   patchState: (patch) => {
@@ -162,12 +164,16 @@ describe("intake gate: the principal's 👍 files the draft (node #251)", () => 
     autonomy: "propose",
     checkpoint: "the-minimap-flickers-when-the-window-resizes",
     labels: [PRINCIPAL_INTAKE_LABEL],
-    body: intakeNodeBody({ body: OBSERVATION, messageUrl: url, messageId: MESSAGE }),
+    body: expect.stringContaining("<!-- soma:work-graph-node"),
+    prose: intakeNodeBody({ body: OBSERVATION, messageUrl: url, messageId: MESSAGE }),
     machineAccount: true,
    });
-   expect(issues[0]!.body.startsWith(OBSERVATION)).toBe(true);
-   expect(issues[0]!.body).toContain(url);
-   expect(issues[0]!.body.trimEnd().endsWith(`<!-- ranger:intake discord=${MESSAGE} -->`)).toBe(true);
+   expect(issues[0]?.prose?.startsWith(OBSERVATION)).toBe(true);
+   expect(issues[0]?.prose).toContain(url);
+   expect(issues[0]?.prose?.trimEnd().endsWith(`<!-- ranger:intake discord=${MESSAGE} -->`)).toBe(true);
+   expect(issues[0]?.body.split(intakeMarker(MESSAGE))).toHaveLength(2);
+   expect(r.onceCalls()).toEqual([{ marker: intakeMarker(MESSAGE), labels: [PRINCIPAL_INTAKE_LABEL] }]);
+   expect(r.lookups()).toBe(0);
 
    expect(r.discord.edits).toHaveLength(1);
    expect(r.discord.edits[0]!.messageId).toBe(r.card());
@@ -285,7 +291,33 @@ describe("intake gate: the principal's 👍 files the draft (node #251)", () => 
    const result = await r.tick();
    expect(gateOf(result).filed).toEqual([{ messageId: MESSAGE, node: "77", added: false }]);
    expect(r.issues()).toHaveLength(1);
+   expect(r.onceCalls()).toEqual([{ marker: intakeMarker(MESSAGE), labels: [PRINCIPAL_INTAKE_LABEL] }]);
+   expect(r.lookups()).toBe(0);
+   expect(r.links()).toEqual([{ node: "77", parent: "1" }]);
+   expect(r.discord.edits).toHaveLength(1);
+   expect(r.discord.edits[0]?.content.split("\n")[0]).toBe("✅ filed as #77 · The minimap flickers when the window resizes");
    expect(r.journal.getIntakeDraft(MESSAGE)).toMatchObject({ status: "filed", filedNode: "77" });
+   expect(r.journal.listEvents("acme/widgets").some((e) => e.kind === "intake-filed" && e.detail?.includes("found already filed"))).toBe(true);
+  } finally { r.close(); }
+ });
+
+ test("two nodes carrying the marker: soma's --once refuses, the gate escalates and adds nothing (failure case)", async () => {
+  const r = await rig();
+  try {
+   const marked = (number: number) => ({ number, parent: "1", title: "x", autonomy: "propose", checkpoint: "x", labels: [PRINCIPAL_INTAKE_LABEL], body: `words\n\n${intakeMarker(MESSAGE)}`, machineAccount: true });
+   r.patchState((s) => { s.issues = { "77": marked(77), "78": marked(78) }; });
+   r.discord.react(r.card(), "👍", PRINCIPAL);
+   const result = await r.tick();
+   expect(gateOf(result).filed).toEqual([]);
+   expect(gateOf(result).errors[0]).toContain("nodes #77, #78 all carry");
+   expect(gateOf(result).errors[0]).toContain("one draft filed twice");
+   expect(r.issues()).toHaveLength(2);
+   expect(r.discord.edits).toHaveLength(0);
+
+   const again = await r.tick();
+   expect(gateOf(again).errors[0]).toContain("#77, #78");
+   expect(r.issues()).toHaveLength(2);
+   expect(r.discord.edits).toHaveLength(0);
   } finally { r.close(); }
  });
 
@@ -408,11 +440,16 @@ describe("intake gate: the principal's 👍 files the draft (node #251)", () => 
    expect(r.journal.getIntakeDraft(MESSAGE)!.gateReadAt).toBeNull();
    r.discord.failReactionReads(200);
 
-   const lookup = await r.tick({ FAKE_GH_INTAKE_FAIL: "exit" });
-   expect(gateOf(lookup).errors[0]).toContain("issues labelled ranger:principal-intake");
-   expect(r.journal.getIntakeDraft(MESSAGE)!.status).toBe("draft");
+   const lookup = await r.tick({ FAKE_SOMA_ONCE_FAIL: "list" });
+   expect(gateOf(lookup).errors[0]).toContain("cannot list issues labelled ranger:principal-intake");
+   expect(r.journal.getIntakeDraft(MESSAGE)!.status).toBe("filing");
    expect(r.issues()).toHaveLength(0);
    expect(r.discord.edits).toHaveLength(0);
+
+   const recovery = await r.tick({ FAKE_GH_INTAKE_FAIL: "exit" });
+   expect(gateOf(recovery).errors[0]).toContain("issues labelled ranger:principal-intake");
+   expect(r.journal.getIntakeDraft(MESSAGE)!.status).toBe("filing");
+   expect(r.issues()).toHaveLength(0);
 
    // Once both reads succeed, the 👍 files the node.
    expect(gateOf(await r.tick()).filed).toEqual([{ messageId: MESSAGE, node: "100", added: true }]);
@@ -526,6 +563,14 @@ describe("intake gate pieces (node #251)", () => {
   expect(() => markedNode([marked(9), marked(10)], "42", "ivy-bot")).toThrow("#9, #10");
   // The login compares case-insensitively; a trailing newline or CRLF still ends in the marker.
   expect(markedNode([{ number: 9, body: `x\r\n${intakeMarker("42")}\r\n`, author: "Ivy-Bot" }], "42", "ivy-bot")).toBe("9");
+ });
+
+ test("the marker lookup reads past the node block soma appends to every body it files", () => {
+  const block = `<!-- soma:work-graph-node\n${JSON.stringify({ autonomy: "propose", checkpointId: "c" }, null, 2)}\n-->`;
+  const filed = `${intakeNodeBody({ body: "words", messageUrl: "u", messageId: "42" })}\n\n${block}`;
+  expect(markedNode([{ number: 9, body: filed, author: "ivy-bot" }], "42", "ivy-bot")).toBe("9");
+  expect(markedNode([{ number: 9, body: `see ${intakeMarker("42")}\nmore words\n\n${block}`, author: "ivy-bot" }], "42", "ivy-bot")).toBeNull();
+  expect(markedNode([{ number: 9, body: `x\n${intakeMarker("42")}\n\n<!-- soma:work-graph-node {`, author: "ivy-bot" }], "42", "ivy-bot")).toBeNull();
  });
 
  test("only the machine account's issue, ending in the marker, counts", () => {

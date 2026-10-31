@@ -35,6 +35,7 @@ autonomy=""
 body=""
 parent=""
 labels=""
+once=""
 kind=""
 probes=""
 evidence_file="$(mktemp)"
@@ -59,6 +60,7 @@ while [ $i -le $# ]; do
     --parent) i=$((i+1)); parent="${!i}" ;;
     --label) i=$((i+1)); labels="${labels}${!i}"$'\n' ;;
     --kind) i=$((i+1)); kind="${!i}" ;;
+    --once) i=$((i+1)); once="${!i}" ;;
     --probe) i=$((i+1)); probes="${probes}${!i}"$'\n' ;;
     --write) : ;;
     --dry-run) : ;;
@@ -156,7 +158,7 @@ export FAKE_SOMA_STATE FAKE_SOMA_REPO_DIR FAKE_SOMA_IDENTITY="$identity" \
   FAKE_SOMA_PROPOSE="$propose" FAKE_SOMA_BODY_FILE="$body_file" \
   FAKE_SOMA_PROPOSAL_COMMENT="$proposal_comment" \
   FAKE_SOMA_TITLE="$title" FAKE_SOMA_AUTONOMY="$autonomy" FAKE_SOMA_BODY="$body" \
-  FAKE_SOMA_PARENT="$parent" FAKE_SOMA_LABELS="$labels" FAKE_SOMA_KIND="$kind" FAKE_SOMA_PROBES="$probes"
+  FAKE_SOMA_PARENT="$parent" FAKE_SOMA_LABELS="$labels" FAKE_SOMA_KIND="$kind" FAKE_SOMA_PROBES="$probes" FAKE_SOMA_ONCE="$once"
 
 # A test can make the map-index write fail the way it did live (node #108).
 if [ "$verb" = "decisions" ] && [ -n "${FAKE_SOMA_DECISIONS_FAIL:-}" ]; then
@@ -208,6 +210,43 @@ if verb == "add":
         print("fake soma: add failed (HTTP 502)", file=sys.stderr)
         sys.exit(1)
     issues = s.setdefault("issues", {})
+    labels = [l for l in os.environ.get("FAKE_SOMA_LABELS", "").split("\n") if l]
+    body = os.environ.get("FAKE_SOMA_BODY", "")
+    machine = os.environ.get("GH_TOKEN", "") == "ghp_write"
+    once = os.environ.get("FAKE_SOMA_ONCE", "")
+    if once:
+        # `--once <marker>`: the first label's nodes the acting identity wrote,
+        # whose last non-empty line is the marker. FAKE_SOMA_ONCE_FAIL=list
+        # makes the listing impossible.
+        s.setdefault("onceCalls", []).append({"marker": once, "labels": labels})
+        save()
+        if not labels:
+            print("soma graph add --once needs a --label", file=sys.stderr)
+            sys.exit(2)
+        if os.environ.get("FAKE_SOMA_ONCE_FAIL", "") == "list":
+            print("fake soma: cannot list issues labelled " + labels[0] + " (HTTP 403)", file=sys.stderr)
+            sys.exit(1)
+        def last_line(text):
+            open_at = text.rfind("<!-- soma:work-graph-node")
+            close_at = -1 if open_at == -1 else text.find("-->", open_at + len("<!-- soma:work-graph-node"))
+            if close_at != -1:
+                text = text[:open_at] + text[close_at + 3:]
+            lines = [l.strip() for l in text.splitlines() if l.strip()]
+            return lines[-1] if lines else ""
+        hits = sorted(
+            (i for i in issues.values()
+             if labels[0] in i.get("labels", []) and i.get("machineAccount") == machine and last_line(i.get("body", "")) == once),
+            key=lambda i: i["number"],
+        )
+        if len(hits) > 1:
+            print(json.dumps({"error": "once-ambiguous", "marker": once, "nodes": [str(i["number"]) for i in hits]}), file=sys.stderr)
+            sys.exit(1)
+        if len(hits) == 1:
+            hit = hits[0]
+            print(json.dumps({"repo": repo, "node": str(hit["number"]), "parent": nid, "blockedBy": [], "existing": True}))
+            sys.exit(0)
+        if last_line(body) != once:
+            body = body.rstrip("\n") + "\n\n" + once
     number = s.get("nextIssue", 100)
     s["nextIssue"] = number + 1
     issues[str(number)] = {
@@ -216,9 +255,12 @@ if verb == "add":
         "title": os.environ.get("FAKE_SOMA_TITLE", ""),
         "autonomy": os.environ.get("FAKE_SOMA_AUTONOMY", ""),
         "checkpoint": os.environ.get("FAKE_SOMA_CHECKPOINT", ""),
-        "labels": [l for l in os.environ.get("FAKE_SOMA_LABELS", "").split("\n") if l],
-        "body": os.environ.get("FAKE_SOMA_BODY", ""),
-        "machineAccount": os.environ.get("GH_TOKEN", "") == "ghp_write",
+        "labels": labels,
+        # Real soma appends its node block to the body it files (soma
+        # work-graph-github.ts); `prose` is the body as readNode reports it.
+        "body": body + "\n\n<!-- soma:work-graph-node\n" + json.dumps({"autonomy": os.environ.get("FAKE_SOMA_AUTONOMY", ""), "checkpointId": os.environ.get("FAKE_SOMA_CHECKPOINT", "")}, indent=2) + "\n-->",
+        "prose": body,
+        "machineAccount": machine,
     }
     # Kind and probes (node #252) are recorded only when the add passed them.
     if os.environ.get("FAKE_SOMA_KIND", ""):
@@ -230,7 +272,10 @@ if verb == "add":
     if fail == "unattached":
         print(json.dumps({"repo": repo, "node": str(number), "parent": nid, "attached": False}), file=sys.stderr)
         sys.exit(1)
-    print(json.dumps({"repo": repo, "node": str(number), "parent": nid, "attached": True}))
+    added = {"repo": repo, "node": str(number), "parent": nid, "attached": True}
+    if once:
+        added["existing"] = False
+    print(json.dumps(added))
     sys.exit(0)
 
 if verb == "link":

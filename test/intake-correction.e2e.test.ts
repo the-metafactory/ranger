@@ -74,7 +74,7 @@ function entry(id: string, title: string): FrontierEntry {
  } as FrontierEntry;
 }
 
-interface Issue { number: number; parent: string | null; title: string; autonomy: string; checkpoint: string; labels: string[]; body: string; machineAccount: boolean; kind?: string }
+interface Issue { number: number; parent: string | null; title: string; autonomy: string; checkpoint: string; labels: string[]; body: string; prose?: string; machineAccount: boolean; kind?: string }
 
 interface Rig {
  discord: ReturnType<typeof fakeDiscord>;
@@ -216,8 +216,8 @@ describe("intake corrections: a reply re-drafts, the 👍 binds to the newest ca
     labels: [PRINCIPAL_INTAKE_LABEL], machineAccount: true,
    });
    // The body is the observation, its link and the mention's marker: one observation, one marker.
-   expect(issues[0]!.body).toBe(intakeNodeBody({ body: OBSERVATION, messageUrl: old.messageUrl, messageId: MENTION }));
-   expect(issues[0]!.body.trimEnd().endsWith(intakeMarker(MENTION))).toBe(true);
+   expect(issues[0]?.prose).toBe(intakeNodeBody({ body: OBSERVATION, messageUrl: old.messageUrl, messageId: MENTION }));
+   expect(issues[0]?.prose?.trimEnd().endsWith(intakeMarker(MENTION))).toBe(true);
    expect(firstLine(r.discord.edits.at(-1)!.content)).toBe(`✅ filed as #100 · ${TITLE}`);
    expect(r.journal.getIntakeDraft(CORRECTION)).toMatchObject({ status: "filed", filedNode: "100" });
 

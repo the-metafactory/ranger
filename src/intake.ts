@@ -27,7 +27,7 @@ import {
 import type { ForgeReadPort, LabeledIssue } from "./forge.ts";
 import { lanePort } from "./forge-lanes.ts";
 import { GRAPH_CALL_TIMEOUT_MS } from "./graph.ts";
-import { GraphAddUnattached, graphAdd, graphLink } from "./graph-write.ts";
+import { GraphAddOnceAmbiguous, GraphAddUnattached, graphAdd, graphLink, somaProse } from "./graph-write.ts";
 import { assertNotPrincipal, assertWriteIdentity } from "./identity.ts";
 import type { IntakeDraftRow, Journal } from "./journal.ts";
 import { type OwnedCheck, withOwnedLease } from "./lock.ts";
@@ -1328,9 +1328,9 @@ export function intakeNodeBody(row: Pick<IntakeDraftRow, "body" | "messageUrl" |
   ].join("\n");
 }
 
-/** A body's last line with text: where `intakeNodeBody` puts the marker. */
+/** A body's last line with text, past soma's node block: where `intakeNodeBody` puts the marker. */
 function finalLine(body: string): string {
-  return body.trimEnd().split(/\r?\n/).at(-1)!.trim();
+  return somaProse(body).trimEnd().split(/\r?\n/).at(-1)?.trim() ?? "";
 }
 
 /**
@@ -1355,7 +1355,8 @@ export function markedNode(issues: readonly LabeledIssue[], messageId: string, m
 
 /**
  * The write side of one thread's gate, resolved lazily and at most once per
- * tick: the write identity (D4) and the marker lookup under it. The listing
+ * tick: the write identity (D4) and the marker lookup a `filing` row's
+ * recovery reads under it; an add asks soma's `--once` instead. The listing
  * is read again only after an add, which may have created a node.
  */
 interface WriteSide {
@@ -1494,11 +1495,7 @@ async function fileDraft(args: GateArgs, row: IntakeDraftRow): Promise<void> {
     return;
   }
 
-  // The write runs only after the identity-pinned read succeeds (D4), and
-  // only when no node carries the marker yet (D14).
-  const { token, login } = await write.identity();
-  const existing = markedNode(await write.issues(), intakeOrigin(row), login);
-  if (existing !== null) return finishFound(args, row, existing);
+  const { token } = await write.identity();
 
   // Written before the add: a tick that dies past here leaves `filing`, and
   // the next one asks the marker before anything else.
@@ -1506,9 +1503,10 @@ async function fileDraft(args: GateArgs, row: IntakeDraftRow): Promise<void> {
   journal.updateIntakeDraft(row.messageId, { status: "filing" });
   write.stale();
   let node: string;
+  let existing = false;
   try {
     owned();
-    node = (await graphAdd(map.repo, String(row.parent), {
+    const added = await graphAdd(map.repo, String(row.parent), {
       title: row.title,
       autonomy,
       checkpoint: row.checkpoint,
@@ -1517,8 +1515,14 @@ async function fileDraft(args: GateArgs, row: IntakeDraftRow): Promise<void> {
       ...(row.probes === null ? {} : { probes: JSON.parse(row.probes) as unknown[] }),
       labels: [PRINCIPAL_INTAKE_LABEL],
       body: intakeNodeBody({ ...row, messageId: intakeOrigin(row) }),
-    }, token, write.opts)).node;
+      once: intakeMarker(intakeOrigin(row)),
+    }, token, write.opts);
+    node = added.node;
+    existing = added.existing;
   } catch (error) {
+    if (error instanceof GraphAddOnceAmbiguous) {
+      throw new EscalateError(`${error.carriers()} — one draft filed twice; nothing more is filed`);
+    }
     if (!(error instanceof GraphAddUnattached)) throw error;
     // The node exists below no parent: attach it rather than add a second.
     // A failed link leaves `filing`; the next tick's recovery links again.
@@ -1526,7 +1530,7 @@ async function fileDraft(args: GateArgs, row: IntakeDraftRow): Promise<void> {
     await graphLink(map.repo, error.node, String(row.parent), token, write.opts);
     node = error.node;
   }
-  return finishFiled(args, row, node, true);
+  return existing ? finishFound(args, row, node) : finishFiled(args, row, node, true);
 }
 
 /**
