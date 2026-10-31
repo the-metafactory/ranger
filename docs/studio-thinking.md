@@ -21,7 +21,7 @@ jobs:
         cloud: 5
 ```
 
-Set `substrates.pi.provider` and `substrates.pi.model` to the local provider and model. The provider's `baseUrl` in Pi's `models.json` must match `studio.localEndpoint`. Configure this endpoint only for a model deployment you trust to satisfy local policy. Ranger never substitutes Claude or Codex for a local run.
+Set `substrates.pi.provider` and `substrates.pi.model` to the local provider and model. Define the exact selected model ID in that provider's `models` list. The provider URL, the selected model URL, and any model override URL must all match `studio.localEndpoint` when present. The selected model must use `openai-completions` or `openai-responses`; unknown, duplicated, or differently routed models defer the job. Configure this endpoint only for a model deployment you trust to satisfy local policy. Ranger never substitutes Claude or Codex for a local run.
 
 Enqueue one thread through the existing job supervisor:
 

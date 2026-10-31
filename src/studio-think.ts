@@ -95,9 +95,25 @@ export async function studioSubstrates(job: RangerJobConfig, config: RangerConfi
  if (!studio || !job.substrates.includes("pi") || config.substrates.pi.provider !== studio.localProvider) return [];
  try {
   const dir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
-  const catalog = z.object({ providers: z.record(z.object({ baseUrl: z.string() }).passthrough()) }).parse(JSON.parse(await readFile(join(dir, "models.json"), "utf8")));
-  const actual = catalog.providers[studio.localProvider].baseUrl;
-  return actual && new URL(actual).href === new URL(studio.localEndpoint).href ? ["pi"] : [];
+  const endpoint = z.object({ baseUrl: z.string().url().optional(), api: z.string().optional() });
+  const provider = endpoint.extend({
+   models: z.array(endpoint.extend({ id: z.string() })).default([]),
+   modelOverrides: z.record(endpoint).default({}),
+  });
+  const catalog = z.object({ providers: z.record(provider) }).parse(JSON.parse(await readFile(join(dir, "models.json"), "utf8")));
+  const selected = new Map(Object.entries(catalog.providers)).get(studio.localProvider);
+  if (!selected) return [];
+  const models = selected.models.filter(model => model.id === config.substrates.pi.model);
+  if (models.length !== 1) return [];
+  const model = models[0];
+  const override = new Map(Object.entries(selected.modelOverrides)).get(model.id);
+  const actual = model.baseUrl ?? selected.baseUrl;
+  const api = model.api ?? selected.api;
+  if (!actual || !api || !["openai-completions", "openai-responses"].includes(api)) return [];
+  if (override?.api !== undefined && override.api !== api) return [];
+  const expected = new URL(studio.localEndpoint).href;
+  const endpoints = [selected.baseUrl, model.baseUrl, override?.baseUrl].filter((value): value is string => value !== undefined);
+  return endpoints.length > 0 && endpoints.every(value => new URL(value).href === expected) ? ["pi"] : [];
  } catch {
   return [];
  }

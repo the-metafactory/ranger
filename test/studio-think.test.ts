@@ -123,9 +123,9 @@ test("local substrate requires endpoint attestation and never has cloud fallback
  const prior = process.env.PI_CODING_AGENT_DIR;
  process.env.PI_CODING_AGENT_DIR = r.dir;
  cleanup.push(() => { if (prior === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = prior; });
- writeFileSync(join(r.dir, "models.json"), JSON.stringify({ providers: { "test-local": { baseUrl: "https://cloud.example.invalid/v1" } } }));
+ writeFileSync(join(r.dir, "models.json"), JSON.stringify({ providers: { "test-local": { baseUrl: "https://cloud.example.invalid/v1", api: "openai-completions", models: [{ id: "local-model" }] } } }));
  expect(await studioSubstrates(r.job, r.config, "local")).toEqual([]);
- writeFileSync(join(r.dir, "models.json"), JSON.stringify({ providers: { "test-local": { baseUrl: r.job.studio?.localEndpoint } } }));
+ writeFileSync(join(r.dir, "models.json"), JSON.stringify({ providers: { "test-local": { baseUrl: r.job.studio?.localEndpoint, api: "openai-completions", models: [{ id: "local-model" }] } } }));
  expect(await studioSubstrates(r.job, r.config, "local")).toEqual(["pi"]);
  const id = await reserve(r);
  const result = await runJob(id, { ...r, now: () => now, substrate: "pi", runSession: async (bin, args) => {
@@ -219,4 +219,26 @@ test("final content reread preserves a manual edit injected during git-log looku
  await expect(finishStudio(snapshot, r.job, row, "claude", response, now, runGit)).rejects.toThrow("final git lookup");
  expect(injected).toBe(true); expect(readFileSync(join(r.repo, "threads/alpha.md"), "utf8")).toBe(changed);
  expect(r.git("rev-list", "--count", "HEAD")).toBe("1");
+});
+
+test("local policy rejects model endpoint overrides, unknown IDs and untrusted APIs", async () => {
+ const r = rig("work");
+ const prior = process.env.PI_CODING_AGENT_DIR;
+ process.env.PI_CODING_AGENT_DIR = r.dir;
+ cleanup.push(() => { if (prior === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = prior; });
+ const endpoint = r.job.studio?.localEndpoint;
+ const catalog = (models: object[], overrides: object = {}, api = "openai-completions") => writeFileSync(join(r.dir, "models.json"), JSON.stringify({ providers: { "test-local": { baseUrl: endpoint, api, models, modelOverrides: overrides } } }));
+ for (const [models, overrides] of [
+  [[{ id: "local-model", baseUrl: "https://cloud.example.invalid/v1" }], {}],
+  [[{ id: "local-model" }], { "local-model": { baseUrl: "https://cloud.example.invalid/v1" } }],
+  [[{ id: "another-model" }], {}],
+  [[{ id: "local-model" }, { id: "local-model" }], {}],
+ ] satisfies [object[], object][]) {
+  catalog(models, overrides);
+  expect(await studioSubstrates(r.job, r.config, "local")).toEqual([]);
+ }
+ catalog([{ id: "local-model" }], {}, "openai-codex-responses");
+ expect(await studioSubstrates(r.job, r.config, "local")).toEqual([]);
+ catalog([{ id: "local-model", baseUrl: endpoint }], { "local-model": { baseUrl: endpoint } });
+ expect(await studioSubstrates(r.job, r.config, "local")).toEqual(["pi"]);
 });
