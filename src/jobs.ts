@@ -24,7 +24,7 @@ import { emitJobRunFinished, type RunLedgerDeps } from "./run-ledger.ts";
 import type { SubstrateName } from "./store/schema.ts";
 import { selectSubstrate, workerCommandFor, workerOutputFor, type SubstrateReaders } from "./substrate.ts";
 import { selectForBuild } from "./substrate-policy.ts";
-import { finishStudio, prepareStudio, studioCommand, studioEnvironment, studioLimit, studioPrompt, studioSubstrates, validateStudioParams } from "./studio-think.ts";
+import { finishStudio, prepareStudio, studioCommand, studioEnvironment, studioLimit, studioPolicyCache, studioPrompt, studioSubstrates, validateStudioParams } from "./studio-think.ts";
 import { workerHostEnv } from "./worker-env.ts";
 
 /** Where a job's session writes what it produced (e.g. `soma:outputs/…`), for `result_ref`. */
@@ -204,6 +204,7 @@ export async function jobPass(ctx: JobPassContext): Promise<JobPassResult> {
  const result = emptyJobPass();
  await sweepJobs(ctx, result);
  const taken = ctx.takenLanes ?? new Set<ImplementLane>();
+ const studioPolicies = studioPolicyCache();
  for (const run of journal.listJobRuns("queued")) {
   const now = ctx.now?.() ?? new Date();
   const job = config.jobs?.find(j => j.name === run.name);
@@ -218,14 +219,6 @@ export async function jobPass(ctx: JobPassContext): Promise<JobPassResult> {
    journal.updateJobRun(run.id, "queued", { reason });
    result.waiting.push({ runId: run.id, name: run.name, reason });
   };
-  if (run.name === "ivy-think") {
-   const prepared = await prepareStudio(job, run.params);
-   if (prepared.kind === "deferred") { wait(prepared.reason); continue; }
-   const limit = job.studio ? studioLimit(prepared, job.studio, journal.listJobRuns(), now, run.id) : "Studio job is not configured";
-   if (limit) { wait(limit); continue; }
-   if ((await studioSubstrates(job, config, prepared.policy)).length === 0) { wait(`No permitted ${prepared.policy} substrate is available`); continue; }
-   journal.updateJobRun(run.id, "queued", { policy: prepared.policy, reason: null });
-  }
   if (journal.isPaused()) { wait("dead-man paused"); continue; }
   if (lane === "visual" && journal.isVisualLaneDrained()) { wait("visual lane drained"); continue; }
   if (journal.spawnsToday(now) >= config.workers.spawnCapPerDay) { wait("daily spawn cap reached"); continue; }
@@ -234,6 +227,14 @@ export async function jobPass(ctx: JobPassContext): Promise<JobPassResult> {
   if (holder !== null) {
    wait(`the ${lane} lane is held by ${holder.job === undefined ? `#${holder.nodeId} (${holder.repo}#${holder.root})` : `job ${holder.job}`}`);
    continue;
+  }
+  if (run.name === "ivy-think") {
+   const prepared = await prepareStudio(job, run.params, studioPolicies);
+   if (prepared.kind === "deferred") { wait(prepared.reason); continue; }
+   const limit = job.studio ? studioLimit(prepared, job.studio, journal.listJobRuns(), now, run.id) : "Studio job is not configured";
+   if (limit) { wait(limit); continue; }
+   if ((await studioSubstrates(job, config, prepared.policy)).length === 0) { wait(`No permitted ${prepared.policy} substrate is available`); continue; }
+   journal.updateJobRun(run.id, "queued", { policy: prepared.policy, reason: null });
   }
   // Reserve the lane before spawning: the child must find a running row,
   // and every other scheduler must see the lane occupied.

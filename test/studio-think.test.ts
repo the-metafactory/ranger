@@ -6,7 +6,7 @@ import { stringify } from "yaml";
 import { loadConfig } from "../src/config.ts";
 import { enqueueJob, jobPass, runJob } from "../src/jobs.ts";
 import { openJournal } from "../src/journal.ts";
-import { appendStudioNotes, prepareStudio, studioCommand, studioEnvironment, studioPolicy, studioSubstrates } from "../src/studio-think.ts";
+import { appendStudioNotes, finishStudio, prepareStudio, studioCommand, studioEnvironment, studioPolicy, studioSubstrates } from "../src/studio-think.ts";
 
 const cleanup: (() => void)[] = [];
 afterEach(() => { for (const close of cleanup.splice(0).reverse()) close(); });
@@ -26,8 +26,10 @@ function rig(areas = "lab", budget = 5) {
  };
  git("init", "-q"); git("config", "user.name", "Test"); git("config", "user.email", "test@example.invalid"); git("add", "."); git("commit", "-qm", "initial");
  let policy = "cloud";
+ let requests = 0;
+ let unavailable = false;
  let directory = repo;
- const server = Bun.serve({ port: 0, fetch: () => Response.json({ directory, studio: { areas: [{ id: "lab", policy }, { id: "work", policy: "local" }] } }) });
+ const server = Bun.serve({ port: 0, fetch: () => { requests++; return unavailable ? new Response("unavailable", { status: 503 }) : Response.json({ directory, studio: { areas: [{ id: "lab", policy }, { id: "work", policy: "local" }] } }); } });
  cleanup.push(() => { server.stop(true); });
  const studio = { dir: repo, url: `http://127.0.0.1:${server.port}/api/desk/studio`, localProvider: "test-local", localEndpoint: "http://127.0.0.1:9999/v1", dailyRuns: { local: budget, cloud: budget } };
  const configPath = join(dir, "ranger.yaml");
@@ -39,7 +41,7 @@ function rig(areas = "lab", budget = 5) {
  if (!job) throw new Error("missing job");
  const params = { thread: "alpha", trigger: "New material" };
  const ledger = { env: {}, publisher: async () => {} };
- return { dir, repo, git, configPath, config, journal, job, params, ledger, setPolicy: (value: string) => { policy = value; }, setDirectory: (value: string) => { directory = value; } };
+ return { dir, repo, git, configPath, config, journal, job, params, ledger, requests: () => requests, setUnavailable: (value: boolean) => { unavailable = value; }, setPolicy: (value: string) => { policy = value; }, setDirectory: (value: string) => { directory = value; } };
 }
 
 async function reserve(r: ReturnType<typeof rig>, params: Record<string, string> = r.params) {
@@ -183,5 +185,38 @@ test("failed commit rollback preserves a concurrent manual edit", async () => {
  const result = await runJob(id, { ...r, now: () => now, substrate: "claude", runSession: async () => ({ code: 0, stdout: response, stderr: "" }) });
  expect(result.status).toBe("failed");
  expect(readFileSync(join(r.repo, "threads/alpha.md"), "utf8")).toContain("Manual edit during commit.");
+ expect(r.git("rev-list", "--count", "HEAD")).toBe("1");
+});
+
+test("one failed policy lookup per pass does not starve unrelated jobs", async () => {
+ const r = rig(); r.setUnavailable(true);
+ const config = { ...r.config, jobs: [...r.config.jobs ?? [], { ...r.job, name: "unrelated", skill: "unrelated", studio: undefined, lane: "none" as const }] };
+ for (const trigger of ["one", "two", "three"]) enqueueJob(config, r.journal, "ivy-think", now, { ...r.params, trigger });
+ const unrelated = enqueueJob(config, r.journal, "unrelated", now);
+ r.journal.setPaused(true);
+ await jobPass({ ...r, config, now: () => now, spawnJob: async () => process.pid });
+ expect(r.requests()).toBe(0);
+ r.journal.setPaused(false);
+ const pass = await jobPass({ ...r, config, now: () => now, spawnJob: async () => process.pid });
+ expect(r.requests()).toBe(1); expect(pass.waiting).toHaveLength(3);
+ expect(r.journal.getJobRun(unrelated.runId)?.status).toBe("running");
+ await jobPass({ ...r, config, now: () => now, spawnJob: async () => process.pid });
+ expect(r.requests()).toBe(2);
+});
+
+test("final content reread preserves a manual edit injected during git-log lookup", async () => {
+ const r = rig(); const id = await reserve(r);
+ const snapshot = await prepareStudio(r.job, r.params);
+ const row = r.journal.getJobRun(id);
+ if (snapshot.kind !== "ready" || !row) throw new Error("Fixture not ready");
+ const changed = thread().replace("Carefully.", "Saved during git log.");
+ let injected = false;
+ const runGit = async (dir: string, args: string[]) => {
+  const child = Bun.spawnSync(["git", ...args], { cwd: dir });
+  if (args[0] === "log") { writeFileSync(join(r.repo, "threads/alpha.md"), changed); injected = true; }
+  return { code: child.exitCode, stdout: child.stdout.toString(), stderr: child.stderr.toString() };
+ };
+ await expect(finishStudio(snapshot, r.job, row, "claude", response, now, runGit)).rejects.toThrow("final git lookup");
+ expect(injected).toBe(true); expect(readFileSync(join(r.repo, "threads/alpha.md"), "utf8")).toBe(changed);
  expect(r.git("rev-list", "--count", "HEAD")).toBe("1");
 });

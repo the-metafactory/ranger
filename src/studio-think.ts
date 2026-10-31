@@ -1,3 +1,4 @@
+import { readFileSync, writeFileSync } from "node:fs";
 import { mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -46,12 +47,24 @@ async function areaPolicies(studio: StudioJob, dir: string): Promise<z.infer<typ
  return view.studio.areas;
 }
 
-export async function prepareStudio(job: RangerJobConfig, params: Record<string, string>): Promise<StudioSnapshot | Deferred> {
+export function studioPolicyCache(): typeof areaPolicies {
+ const pending = new Map<string, ReturnType<typeof areaPolicies>>();
+ return (studio, dir) => {
+  const key = JSON.stringify([studio.url, dir]);
+  const existing = pending.get(key);
+  if (existing) return existing;
+  const lookup = areaPolicies(studio, dir);
+  pending.set(key, lookup);
+  return lookup;
+ };
+}
+
+export async function prepareStudio(job: RangerJobConfig, params: Record<string, string>, policies: typeof areaPolicies = areaPolicies): Promise<StudioSnapshot | Deferred> {
  try {
   if (!job.studio) return deferred("ivy-think needs a Studio job configuration");
   const input = Params.parse(params);
   const dir = await realpath(expandHome(job.studio.dir));
-  const areas = await areaPolicies(job.studio, dir);
+  const areas = await policies(job.studio, dir);
   const path = `threads/${input.thread}.md`;
   if (await realpath(join(dir, path)) !== join(dir, path)) return deferred("thread must be a regular file inside the configured Studio");
   const text = await readFile(join(dir, path), "utf8");
@@ -144,10 +157,10 @@ export function studioCommand(substrate: SubstrateName, config: RangerConfig, re
  ];
 }
 
-export async function finishStudio(snapshot: StudioSnapshot, job: RangerJobConfig, run: JobRunRow, substrate: SubstrateName, modelText: string, now: Date): Promise<string> {
+export async function finishStudio(snapshot: StudioSnapshot, job: RangerJobConfig, run: JobRunRow, substrate: SubstrateName, modelText: string, now: Date, runGit: typeof git = git): Promise<string> {
  const raw = modelText.trim().replace(/^```(?:json)?\s*/, "").replace(/\s*```$/, "");
  const answer = Answer.parse(JSON.parse(raw));
- const lockPath = await git(snapshot.dir, ["rev-parse", "--path-format=absolute", "--git-path", "studio-write.lock"]);
+ const lockPath = await runGit(snapshot.dir, ["rev-parse", "--path-format=absolute", "--git-path", "studio-write.lock"]);
  if (lockPath.code !== 0) throw new Error("Studio git lock path is unavailable");
  const lock = lockPath.stdout.trim();
  await mkdir(lock, { mode: 0o700 });
@@ -155,23 +168,24 @@ export async function finishStudio(snapshot: StudioSnapshot, job: RangerJobConfi
   await writeFile(join(lock, "owner.json"), JSON.stringify({ pid: process.pid, at: new Date().toISOString(), runId: run.id }), { mode: 0o600 });
   const current = await prepareStudio(job, run.params);
   if (current.kind !== "ready" || current.head !== snapshot.head || current.text !== snapshot.text || current.policyStamp !== snapshot.policyStamp || current.policy !== snapshot.policy) throw new Error("Studio changed during thinking; nothing was written; enqueue a fresh run");
-  const replay = await git(snapshot.dir, ["log", "-1", "--format=%H", `--grep=Studio-Think-Run: ${run.runUuid}`, "--fixed-strings"]);
+  const replay = await runGit(snapshot.dir, ["log", "-1", "--format=%H", `--grep=Studio-Think-Run: ${run.runUuid}`, "--fixed-strings"]);
   if (replay.stdout.trim()) return `studio:${run.params.thread}@${replay.stdout.trim()}`;
   const text = appendStudioNotes(current.text, answer, { at: now, trigger: snapshot.params.trigger, mode: snapshot.params.mode ?? "think", model: `${snapshot.policy} / ${substrate}` });
   const target = join(snapshot.dir, snapshot.path);
   if (Buffer.byteLength(text, "utf8") > 1_000_000) throw new Error("Generated notes exceed the Studio file limit; nothing was written");
-  await writeFile(target, text, "utf8");
-  const added = await git(snapshot.dir, ["add", "--", snapshot.path]);
-  const committed = added.code === 0 ? await git(snapshot.dir, ["commit", "-m", `Studio: Ivy thinks about ${snapshot.params.thread}\n\nStudio-Think-Run: ${run.runUuid}`, "--", snapshot.path]) : added;
+  if (readFileSync(target, "utf8") !== snapshot.text) throw new Error("Studio changed during the final git lookup; the edit is preserved and nothing was written");
+  writeFileSync(target, text, "utf8");
+  const added = await runGit(snapshot.dir, ["add", "--", snapshot.path]);
+  const committed = added.code === 0 ? await runGit(snapshot.dir, ["commit", "-m", `Studio: Ivy thinks about ${snapshot.params.thread}\n\nStudio-Think-Run: ${run.runUuid}`, "--", snapshot.path]) : added;
   if (committed.code !== 0) {
-   const currentHead = await git(snapshot.dir, ["rev-parse", "HEAD"]);
-   const currentText = await readFile(target, "utf8");
+   const currentHead = await runGit(snapshot.dir, ["rev-parse", "HEAD"]);
+   const currentText = readFileSync(target, "utf8");
    if (currentHead.stdout.trim() !== snapshot.head || currentText !== text) throw new Error("Studio commit failed while another edit occurred; that edit is preserved. Inspect the working tree and index before retrying");
-   await writeFile(target, snapshot.text, "utf8");
-   const reset = await git(snapshot.dir, ["reset", "HEAD", "--", snapshot.path]);
+   writeFileSync(target, snapshot.text, "utf8");
+   const reset = await runGit(snapshot.dir, ["reset", "HEAD", "--", snapshot.path]);
    throw new Error(`Studio commit failed; original thread restored${reset.code === 0 ? "" : "; inspect the git index"}`);
   }
-  const head = await git(snapshot.dir, ["rev-parse", "HEAD"]);
+  const head = await runGit(snapshot.dir, ["rev-parse", "HEAD"]);
   return `studio:${snapshot.params.thread}@${head.stdout.trim()}`;
  } finally {
   await rm(lock, { recursive: true, force: true });
