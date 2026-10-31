@@ -190,11 +190,12 @@ export async function finishStudio(snapshot: StudioSnapshot, job: RangerJobConfi
   const replay = await runGit(snapshot.dir, ["log", "-1", "--format=%H", `--grep=Studio-Think-Run: ${run.runUuid}`, "--fixed-strings"]);
   if (replay.stdout.trim()) return `studio:${run.params.thread}@${replay.stdout.trim()}`;
   let text = appendStudioNotes(current.text, answer, { at: now, trigger: snapshot.params.trigger, mode: snapshot.params.mode ?? "think", model: `${snapshot.policy} / ${substrate}`, run: run.runUuid });
-  if (snapshot.params.mode === undefined && snapshot.params.trigger.split("; ").includes("Asked to think tonight")) text = text.replace(/^---\n([\s\S]*?)\n---/, (_match, front: string) => {
+  if (snapshot.params.mode === undefined && snapshot.params.trigger.split("; ").includes("Asked to think tonight")) text = text.replace(/^---\r?\n([\s\S]*?)\r?\n---/, (_match, front: string) => {
    const document = parseDocument(front);
    if (document.get("thinkTonight") === true) document.set("thinkTonight", false);
    return `---\n${document.toString().trimEnd()}\n---`;
-  });  const target = join(snapshot.dir, snapshot.path);
+  });
+  const target = join(snapshot.dir, snapshot.path);
   if (Buffer.byteLength(text, "utf8") > 1_000_000) throw new Error("Generated notes exceed the Studio file limit; nothing was written");
   if (readFileSync(target, "utf8") !== snapshot.text) throw new Error("Studio changed during the final git lookup; the edit is preserved and nothing was written");
   writeFileSync(target, text, "utf8");

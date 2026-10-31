@@ -331,3 +331,16 @@ test("failed automatic work and successful explicit modes retain think-tonight",
   expect(readFileSync(join(r.repo, "threads/alpha.md"), "utf8")).toContain("thinkTonight: true");
  }
 });
+
+
+test("CRLF threads without a notes section consume successful automatic tonight requests", async () => {
+ const r = rig();
+ const text = thread().replace("state: active", "state: active\nthinkTonight: true").replace("## Ivy's notes\n\n", "").replaceAll("\n", "\r\n");
+ writeFileSync(join(r.repo, "threads/alpha.md"), text);
+ r.git("add", "."); r.git("commit", "-qm", "CRLF tonight fixture");
+ const params = { thread: "alpha", trigger: "Asked to think tonight" };
+ const runId = await reserve(r, params);
+ const outcome = await runJob(runId, { ...r, substrate: "claude", now: () => now, runSession: async () => ({ code: 0, stdout: response, stderr: "" }) });
+ expect(outcome.status).toBe("succeeded");
+ expect(readFileSync(join(r.repo, "threads/alpha.md"), "utf8")).toContain("thinkTonight: false");
+});
