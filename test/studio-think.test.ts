@@ -242,3 +242,37 @@ test("local policy rejects model endpoint overrides, unknown IDs and untrusted A
  catalog([{ id: "local-model", baseUrl: endpoint }], { "local-model": { baseUrl: endpoint } });
  expect(await studioSubstrates(r.job, r.config, "local")).toEqual(["pi"]);
 });
+
+
+test("person request receipts survive completion and journal reopen without another budget attempt", async () => {
+ const r = rig();
+ const params = { ...r.params, mode: "red-team", requestId: "request-red-team" };
+ const runId = await reserve(r, params);
+ const result = await runJob(runId, { ...r, substrate: "claude", now: () => now, runSession: async () => ({ code: 0, stdout: response, stderr: "" }) });
+ expect(result.status).toBe("succeeded");
+ const reopened = openJournal(r.config);
+ try {
+  expect(enqueueJob(r.config, reopened, "ivy-think", now, params)).toMatchObject({ runId, queued: false });
+  expect(() => enqueueJob(r.config, reopened, "ivy-think", now, { ...params, mode: "grill" })).toThrow("another job request");
+  expect(() => enqueueJob(r.config, reopened, "ivy-think", now, { ...params, thread: "beta" })).toThrow("another job request");
+  expect(() => enqueueJob(r.config, reopened, "ivy-think", now, { ...params, trigger: "Different trigger" })).toThrow("another job request");
+  expect(reopened.listJobRuns()).toHaveLength(1);
+  expect(readFileSync(join(r.repo, "threads/alpha.md"), "utf8")).toContain(`run: ${reopened.getJobRun(runId)?.runUuid}`);
+ } finally { reopened.close(); }
+});
+
+
+test("native CLI receipt survives independent process restarts and Studio readback exposes no endpoint secrets", async () => {
+ const r = rig();
+ const cli = (...args: string[]) => Bun.spawnSync(["bun", "src/cli.ts", "job", ...args, "--config", r.configPath], { cwd: import.meta.dir + "/..", env: { ...process.env, RANGER_UNDER_TEST: "1", RANGER_JOURNAL_PATH: r.config.state.journalPath } });
+ const args = ["enqueue", "ivy-think", "--param", "thread=alpha", "--param", "mode=red-team", "--param", "trigger=You asked: red-team", "--param", "requestId=restart-request"];
+ const first = cli(...args); expect(first.exitCode).toBe(0);
+ const receipt = JSON.parse(first.stdout.toString());
+ r.journal.updateJobRun(receipt.runId, "queued", { status: "failed", finishedAt: now.toISOString() });
+ const second = cli(...args); expect(second.exitCode).toBe(0);
+ expect(JSON.parse(second.stdout.toString())).toMatchObject({ runId: receipt.runId, queued: false });
+ const status = cli("list", "--studio"); expect(status.exitCode).toBe(0);
+ const readback = JSON.parse(status.stdout.toString());
+ expect(readback.directory).toBe(r.repo); expect(readback.dailyRuns).toEqual({ local: 5, cloud: 5 }); expect(readback.runs).toHaveLength(1);
+ expect(status.stdout.toString()).not.toContain("localEndpoint");
+});

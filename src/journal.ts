@@ -534,6 +534,14 @@ export class Journal {
  enqueueJobRun(name: string, lane: JobLane, now = new Date(), params: Record<string, string> = {}): { run: JobRunRow; queued: boolean } {
   return this.db.transaction(() => {
    const queueKey = JSON.stringify(Object.entries(params).sort(([a], [b]) => a.localeCompare(b)));
+   if (params.requestId) {
+    const receipt = this.listJobRuns().find(run => run.name === name && run.params.requestId === params.requestId);
+    if (receipt) {
+     const previous = JSON.stringify(Object.entries(receipt.params).sort(([a], [b]) => a.localeCompare(b)));
+     if (previous !== queueKey) throw new Error("This request id already belongs to another job request");
+     return { run: receipt, queued: false };
+    }
+   }
    if (Object.keys(params).length > 0) {
     const running = this.db.select().from(jobRuns)
      .where(and(eq(jobRuns.name, name), eq(jobRuns.queueKey, queueKey), eq(jobRuns.status, "running"))).get();
