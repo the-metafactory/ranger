@@ -142,7 +142,7 @@ test("different stack policy, unavailable policy and closed threads fail closed"
  expect(await prepareStudio(r.job, r.params)).toMatchObject({ kind: "deferred" });
  r.setDirectory(r.repo);
  writeFileSync(join(r.repo, "threads/alpha.md"), thread().replace("state: active", "state: closed"));
- expect(await prepareStudio(r.job, r.params)).toMatchObject({ kind: "deferred", reason: "thread is closed" });
+ expect(await prepareStudio(r.job, r.params)).toMatchObject({ kind: "deferred", reason: "thread is closed and has no due decision review" });
 });
 
 test("edits and policy changes during model latency survive without a generated note", async () => {
@@ -275,4 +275,59 @@ test("native CLI receipt survives independent process restarts and Studio readba
  const readback = JSON.parse(status.stdout.toString());
  expect(readback.directory).toBe(r.repo); expect(readback.dailyRuns).toEqual({ local: 5, cloud: 5 }); expect(readback.runs).toHaveLength(1);
  expect(status.stdout.toString()).not.toContain("localEndpoint");
+});
+
+test("only a due closed decision accepts an automatic review and keeps local policy", async () => {
+ const r = rig("work");
+ const params = { thread: "alpha", trigger: "Decision review due 2000-01-01" };
+ for (const front of ["outcome: shipped\nreviewOn: 2000-01-01", "outcome: dropped\nreviewOn: 2000-01-01", "outcome: decided\nreviewOn: 2999-01-01"]) {
+  writeFileSync(join(r.repo, "threads/alpha.md"), thread("work").replace("state: active", `state: closed\n${front}`));
+  expect(await prepareStudio(r.job, params)).toMatchObject({ kind: "deferred" });
+ }
+ writeFileSync(join(r.repo, "threads/alpha.md"), thread("work").replace("state: active", "state: closed\noutcome: decided\nreviewOn: 2000-01-01"));
+ r.git("add", "."); r.git("commit", "-qm", "Decided fixture");
+ expect(await prepareStudio(r.job, r.params)).toMatchObject({ kind: "deferred" });
+ expect(await prepareStudio(r.job, params)).toMatchObject({ kind: "ready", policy: "local" });
+});
+
+
+test("a due closed decision receives a review note while retaining outcome and stand", async () => {
+ const r = rig();
+ const text = thread().replace("state: active", "state: closed\noutcome: decided\nreviewOn: 2000-01-01");
+ writeFileSync(join(r.repo, "threads/alpha.md"), text);
+ r.git("add", "."); r.git("commit", "-qm", "Decided fixture");
+ const params = { thread: "alpha", trigger: "Decision review due 2000-01-01" };
+ const runId = await reserve(r, params);
+ const outcome = await runJob(runId, { ...r, substrate: "claude", now: () => now, runSession: async () => ({ code: 0, stdout: response, stderr: "" }) });
+ expect(outcome.status).toBe("succeeded");
+ const updated = readFileSync(join(r.repo, "threads/alpha.md"), "utf8");
+ expect(updated).toContain("state: closed\noutcome: decided\nreviewOn: 2000-01-01");
+ expect(updated).toContain("## Where I stand\n\nCarefully.");
+ expect(updated).toContain("trigger: Decision review due 2000-01-01");
+});
+
+
+test("successful automatic think-tonight consumes its request in the note commit", async () => {
+ const r = rig();
+ writeFileSync(join(r.repo, "threads/alpha.md"), thread().replace("state: active", "state: active\nthinkTonight: true"));
+ r.git("add", "."); r.git("commit", "-qm", "Tonight fixture");
+ const params = { thread: "alpha", trigger: "Asked to think tonight; New Material committed" };
+ const runId = await reserve(r, params);
+ const outcome = await runJob(runId, { ...r, substrate: "claude", now: () => now, runSession: async () => ({ code: 0, stdout: response, stderr: "" }) });
+ expect(outcome.status).toBe("succeeded");
+ expect(readFileSync(join(r.repo, "threads/alpha.md"), "utf8")).toContain("thinkTonight: false");
+});
+
+
+test("failed automatic work and successful explicit modes retain think-tonight", async () => {
+ for (const mode of [undefined, "grill"]) {
+  const r = rig();
+  writeFileSync(join(r.repo, "threads/alpha.md"), thread().replace("state: active", "state: active\nthinkTonight: true"));
+  r.git("add", "."); r.git("commit", "-qm", "Tonight fixture");
+  const params = { thread: "alpha", trigger: "Asked to think tonight", ...(mode ? { mode } : {}) };
+  const runId = await reserve(r, params);
+  const outcome = await runJob(runId, { ...r, substrate: "claude", now: () => now, runSession: async () => ({ code: 0, stdout: mode ? response : "invalid JSON", stderr: "" }) });
+  expect(outcome.status).toBe(mode ? "succeeded" : "failed");
+  expect(readFileSync(join(r.repo, "threads/alpha.md"), "utf8")).toContain("thinkTonight: true");
+ }
 });

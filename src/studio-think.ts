@@ -2,7 +2,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { parse as parseYaml } from "yaml";
+import { parse as parseYaml, parseDocument } from "yaml";
 import { z } from "zod";
 import { expandHome, type RangerConfig, type RangerJobConfig } from "./config.ts";
 import { runCmd } from "./exec.ts";
@@ -16,7 +16,7 @@ const Params = z.object({
  requestId: z.string().regex(/^[\w-]{8,64}$/).optional(),
  mode: z.string().regex(/^(think|grill|other-side|red-team|first-principles|persona:[^\r\n]{1,100})$/).optional(),
 }).strict();
-const Front = z.object({ areas: z.array(z.string()).min(1), state: z.enum(["active", "parked", "closed"]) });
+const Front = z.object({ areas: z.array(z.string()).min(1), state: z.enum(["active", "parked", "closed"]), outcome: z.enum(["decided", "shipped", "dropped"]).optional(), reviewOn: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional() });
 const PolicyView = z.object({
  directory: z.string(),
  studio: z.object({ areas: z.array(z.object({ id: z.string(), policy: z.enum(["local", "cloud"]) })) }),
@@ -72,7 +72,8 @@ export async function prepareStudio(job: RangerJobConfig, params: Record<string,
   if (text.length > 1_000_000) return deferred("thread exceeds the Studio file limit");
   const match = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(text);
   const front = Front.parse(parseYaml(match?.[1] ?? ""));
-  if (front.state === "closed") return deferred("thread is closed");
+  const dueReview = front.outcome === "decided" && front.reviewOn !== undefined && front.reviewOn <= new Date().toISOString().slice(0, 10) && input.trigger.startsWith("Decision review due ");
+  if (front.state === "closed" && !dueReview) return deferred("thread is closed and has no due decision review");
   const status = await git(dir, ["status", "--porcelain", "--untracked-files=all"]);
   const head = await git(dir, ["rev-parse", "--verify", "HEAD"]);
   if (status.code !== 0 || status.stdout.trim() || head.code !== 0) return deferred("Studio must have a committed HEAD and a clean working tree");
@@ -188,8 +189,12 @@ export async function finishStudio(snapshot: StudioSnapshot, job: RangerJobConfi
   if (current.kind !== "ready" || current.head !== snapshot.head || current.text !== snapshot.text || current.policyStamp !== snapshot.policyStamp || current.policy !== snapshot.policy) throw new Error("Studio changed during thinking; nothing was written; enqueue a fresh run");
   const replay = await runGit(snapshot.dir, ["log", "-1", "--format=%H", `--grep=Studio-Think-Run: ${run.runUuid}`, "--fixed-strings"]);
   if (replay.stdout.trim()) return `studio:${run.params.thread}@${replay.stdout.trim()}`;
-  const text = appendStudioNotes(current.text, answer, { at: now, trigger: snapshot.params.trigger, mode: snapshot.params.mode ?? "think", model: `${snapshot.policy} / ${substrate}`, run: run.runUuid });
-  const target = join(snapshot.dir, snapshot.path);
+  let text = appendStudioNotes(current.text, answer, { at: now, trigger: snapshot.params.trigger, mode: snapshot.params.mode ?? "think", model: `${snapshot.policy} / ${substrate}`, run: run.runUuid });
+  if (snapshot.params.mode === undefined && snapshot.params.trigger.split("; ").includes("Asked to think tonight")) text = text.replace(/^---\n([\s\S]*?)\n---/, (_match, front: string) => {
+   const document = parseDocument(front);
+   if (document.get("thinkTonight") === true) document.set("thinkTonight", false);
+   return `---\n${document.toString().trimEnd()}\n---`;
+  });  const target = join(snapshot.dir, snapshot.path);
   if (Buffer.byteLength(text, "utf8") > 1_000_000) throw new Error("Generated notes exceed the Studio file limit; nothing was written");
   if (readFileSync(target, "utf8") !== snapshot.text) throw new Error("Studio changed during the final git lookup; the edit is preserved and nothing was written");
   writeFileSync(target, text, "utf8");
