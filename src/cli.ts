@@ -78,6 +78,7 @@ import { PR_SCAN_FAILURES, runPrHeadSubmitter } from "./remote-test/pr-head-subm
 import { BusProducerRefusal, busOutcomeExitCode, busOutcomeMessage, retryBusCommand, runBusCommand, statusBusCommand, type RunBusCommand } from "./remote-test/bus-producer.ts";
 import { BusWorkerReadinessRefusal, runBusWorkerCommand } from "./remote-test/bus-worker.ts";
 import { spawnBudget } from "./digest.ts";
+import { runSelectionCli } from "./selection-cli.ts";
 
 /**
  * ranger — autonomous orienteer work-graph walker.
@@ -671,6 +672,11 @@ program
  .name("ranger")
  .description("Autonomous orienteer work-graph walker")
  .version(pkg.version);
+
+program.command("select-substrate")
+ .description("Select a parser substrate from a versioned JSON request on stdin; quota refresh only, no task dispatch")
+ .option("-c, --config <path>", "path to ranger.yaml")
+ .action(async (options: { config?: string }) => runSelectionCli(options.config));
 
 const remoteTest = program.command("remote-test")
  .description("Operator-only remote-test tooling; local verification remains the default");

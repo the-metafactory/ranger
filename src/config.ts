@@ -488,6 +488,9 @@ const RangerConfigSchema = z.object({
  ratify: RatifySchema.default({}),
  intake: IntakeSchema.default({}),
  substrates: SubstratesSchema.default({}),
+ selection: z.object({
+  substrates: z.array(z.enum(SUBSTRATE_NAMES)),
+ }).strict().optional(),
  serve: ServeSchema.optional(),
  bus: BusSchema.optional(),
  checkReporter: CheckReporterSchema.optional(),
