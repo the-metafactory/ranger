@@ -13,6 +13,7 @@ import { workerHostEnv } from "./worker-env.ts";
 const Params = z.object({
  thread: z.string().regex(/^[a-z0-9][a-z0-9-]{0,79}$/),
  trigger: z.string().trim().min(1).max(2000),
+ requestId: z.string().regex(/^[\w-]{8,64}$/).optional(),
  mode: z.string().regex(/^(think|grill|other-side|red-team|first-principles|persona:[^\r\n]{1,100})$/).optional(),
 }).strict();
 const Front = z.object({ areas: z.array(z.string()).min(1), state: z.enum(["active", "parked", "closed"]) });
@@ -133,7 +134,7 @@ export function studioPrompt(snapshot: StudioSnapshot): string {
 const oneLine = (value: string) => value.replace(/\s+/g, " ").trim();
 const safeBody = (value: string) => value.replace(/\r\n/g, "\n").split("\n").map(line => /^\s*(#|---)/.test(line) ? `\\${line.trimStart()}` : line).join("\n");
 
-export function appendStudioNotes(text: string, answer: z.infer<typeof Answer>, metadata: { at: Date; trigger: string; mode: string; model: string }): string {
+export function appendStudioNotes(text: string, answer: z.infer<typeof Answer>, metadata: { at: Date; trigger: string; mode: string; model: string; run?: string }): string {
  const latest: number[] = [];
  const headings = /^### (\d{4}-\d{2}-\d{2}T\S+)$/gm;
  for (let match = headings.exec(text); match; match = headings.exec(text)) {
@@ -145,6 +146,7 @@ export function appendStudioNotes(text: string, answer: z.infer<typeof Answer>, 
  const blocks = entries.map(entry => [
   `### ${new Date(offset++).toISOString()}`,
   `trigger: ${oneLine(metadata.trigger)}`, `model: ${oneLine(metadata.model)}`, `mode: ${oneLine(metadata.mode)}`,
+  ...(metadata.run ? [`run: ${metadata.run}`] : []),
   `kind: ${entry.kind}`, "status: open", "", safeBody(entry.text), "",
  ].join("\n")).join("\n");
  const lines = text.replace(/\r\n/g, "\n").split("\n");
@@ -186,7 +188,7 @@ export async function finishStudio(snapshot: StudioSnapshot, job: RangerJobConfi
   if (current.kind !== "ready" || current.head !== snapshot.head || current.text !== snapshot.text || current.policyStamp !== snapshot.policyStamp || current.policy !== snapshot.policy) throw new Error("Studio changed during thinking; nothing was written; enqueue a fresh run");
   const replay = await runGit(snapshot.dir, ["log", "-1", "--format=%H", `--grep=Studio-Think-Run: ${run.runUuid}`, "--fixed-strings"]);
   if (replay.stdout.trim()) return `studio:${run.params.thread}@${replay.stdout.trim()}`;
-  const text = appendStudioNotes(current.text, answer, { at: now, trigger: snapshot.params.trigger, mode: snapshot.params.mode ?? "think", model: `${snapshot.policy} / ${substrate}` });
+  const text = appendStudioNotes(current.text, answer, { at: now, trigger: snapshot.params.trigger, mode: snapshot.params.mode ?? "think", model: `${snapshot.policy} / ${substrate}`, run: run.runUuid });
   const target = join(snapshot.dir, snapshot.path);
   if (Buffer.byteLength(text, "utf8") > 1_000_000) throw new Error("Generated notes exceed the Studio file limit; nothing was written");
   if (readFileSync(target, "utf8") !== snapshot.text) throw new Error("Studio changed during the final git lookup; the edit is preserved and nothing was written");

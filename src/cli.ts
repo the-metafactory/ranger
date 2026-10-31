@@ -52,7 +52,7 @@ import { walk } from "./walk.ts";
 import { emitTickRunFinished, emitNodeRunIfGenerated, type RunLedgerDeps } from "./run-ledger.ts";
 import { spawnRunNodeDetached } from "./spawn.ts";
 import { holdAwake } from "./awake.ts";
-import { enqueueJob, JobError, runJob, type RunJobContext } from "./jobs.ts";
+import { enqueueJob, findJob, JobError, runJob, type RunJobContext } from "./jobs.ts";
 import { BUILD_NOW_NOT_STARTED, buildNow, type BuildNowResult } from "./build-now.ts";
 import { startServe } from "./serve.ts";
 import { approveNode } from "./approve-node.ts";
@@ -1074,10 +1074,17 @@ job
 job
  .command("list")
  .description("Job runs in the journal, oldest first")
+ .option("--studio", "Studio directory, daily budgets and ivy-think runs")
  .option("-c, --config <path>", "path to ranger.yaml (fallback: $RANGER_CONFIG, then ~/.config/ranger/ranger.yaml)")
- .action((options: { config: string | undefined }) => {
-  const { journal } = loadCtx(resolveConfigPath(options.config, process.env, process.cwd()));
-  try { process.stdout.write(JSON.stringify(journal.listJobRuns(), null, 2) + "\n"); }
+ .action((options: { config: string | undefined; studio?: boolean }) => {
+  const { config, journal } = loadCtx(resolveConfigPath(options.config, process.env, process.cwd()));
+  try {
+   const runs = journal.listJobRuns();
+   const studio = options.studio ? findJob(config, "ivy-think").studio : undefined;
+   if (options.studio && !studio) throw new JobError("ivy-think has no Studio configuration");
+   const result = studio ? { directory: expandHome(studio.dir), dailyRuns: studio.dailyRuns, runs: runs.filter(run => run.name === "ivy-think") } : runs;
+   process.stdout.write(JSON.stringify(result, null, 2) + "\n");
+  }
   finally { journal.close(); }
  });
 
