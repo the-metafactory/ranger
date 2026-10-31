@@ -1015,7 +1015,7 @@ const job = program
 export function runJobEnqueue(
  name: string,
  configPath: string,
- deps: { loadCtx?: typeof loadCtx; now?: () => Date } = {},
+ deps: { loadCtx?: typeof loadCtx; now?: () => Date; params?: string[] } = {},
 ): { exitCode: number; report: string } {
  let ctx: ReturnType<typeof loadCtx>;
  try {
@@ -1024,7 +1024,13 @@ export function runJobEnqueue(
   return { exitCode: 1, report: `ranger job enqueue: ${error instanceof Error ? error.message : String(error)}\n` };
  }
  try {
-  const queued = enqueueJob(ctx.config, ctx.journal, name, deps.now?.() ?? new Date());
+  const params: Record<string, string> = {};
+  for (const param of deps.params ?? []) {
+   const match = /^([a-z][a-zA-Z-]*)=(.+)$/s.exec(param);
+   if (!match?.[1] || !match[2] || match[1] in params) throw new JobError("params must be distinct name=value pairs");
+   params[match[1]] = match[2];
+  }
+  const queued = enqueueJob(ctx.config, ctx.journal, name, deps.now?.() ?? new Date(), params);
   return { exitCode: 0, report: JSON.stringify(queued) + "\n" };
  } catch (error) {
   return { exitCode: 1, report: `ranger job enqueue: ${error instanceof Error ? error.message : String(error)}\n` };
@@ -1037,9 +1043,10 @@ job
  .command("enqueue")
  .description("Queue one run of a declared job; a second enqueue before it starts is a no-op. The next tick starts it when its lane is free.")
  .argument("<name>", "job name from ranger.yaml jobs")
+ .option("--param <name=value...>", "durable ivy-think parameters")
  .option("-c, --config <path>", "path to ranger.yaml (fallback: $RANGER_CONFIG, then ~/.config/ranger/ranger.yaml)")
- .action((name: string, options: { config: string | undefined }) => {
-  const result = runJobEnqueue(name, resolveConfigPath(options.config, process.env, process.cwd()));
+ .action((name: string, options: { config: string | undefined; param?: string[] }) => {
+  const result = runJobEnqueue(name, resolveConfigPath(options.config, process.env, process.cwd()), { params: options.param });
   (result.exitCode === 0 ? process.stdout : process.stderr).write(result.report);
   process.exit(result.exitCode);
  });
@@ -1055,7 +1062,7 @@ job
    holdAwake();
    const outcome = await runJob(Number(runId), { config, journal } satisfies RunJobContext);
    process.stdout.write(JSON.stringify(outcome, null, 2) + "\n");
-   process.exit(outcome.status === "succeeded" ? 0 : outcome.status === "refused" ? 1 : 2);
+   process.exit(outcome.status === "succeeded" || outcome.status === "deferred" ? 0 : outcome.status === "refused" ? 1 : 2);
   } catch (error) {
    process.stderr.write(`ranger job run: ${error instanceof Error ? error.message : String(error)}\n`);
    process.exit(error instanceof JobError ? 1 : 2);

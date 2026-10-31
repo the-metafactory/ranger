@@ -531,16 +531,22 @@ export class Journal {
   * index makes a second enqueue before the run starts a no-op. Returns the
   * queued run and whether this call queued it.
   */
- enqueueJobRun(name: string, lane: JobLane, now = new Date()): { run: JobRunRow; queued: boolean } {
+ enqueueJobRun(name: string, lane: JobLane, now = new Date(), params: Record<string, string> = {}): { run: JobRunRow; queued: boolean } {
   return this.db.transaction(() => {
-   const inserted = this.db.insert(jobRuns).values({ runUuid: randomUUID(), name, lane, status: "queued", queuedAt: now.toISOString() })
+   const queueKey = JSON.stringify(Object.entries(params).sort(([a], [b]) => a.localeCompare(b)));
+   if (Object.keys(params).length > 0) {
+    const running = this.db.select().from(jobRuns)
+     .where(and(eq(jobRuns.name, name), eq(jobRuns.queueKey, queueKey), eq(jobRuns.status, "running"))).get();
+    if (running) return { run: running, queued: false };
+   }
+   const inserted = this.db.insert(jobRuns).values({ runUuid: randomUUID(), name, lane, params, queueKey, status: "queued", queuedAt: now.toISOString() })
     .onConflictDoNothing().returning().get();
    if (inserted !== undefined) {
     this.recordEvent("job-queued", { detail: `job ${name} queued ${lane === "none" ? "without a lane" : `for the ${lane} lane`} (run ${inserted.id})` });
     return { run: inserted, queued: true };
    }
    const existing = this.db.select().from(jobRuns)
-    .where(and(eq(jobRuns.name, name), eq(jobRuns.status, "queued"))).get()!;
+    .where(and(eq(jobRuns.name, name), eq(jobRuns.queueKey, queueKey), eq(jobRuns.status, "queued"))).get()!;
    return { run: existing, queued: false };
   });
  }

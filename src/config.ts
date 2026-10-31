@@ -436,7 +436,16 @@ const CheckReporterSchema = z.object({
  * lane when `ranger job enqueue <name>` queued it (a Reflex fire, through a
  * cortex process spec). A job opens no PR, claims no node and writes no graph.
  */
+const StudioJobSchema = z.object({
+ dir: z.string().min(1),
+ url: z.string().url(),
+ localProvider: z.string().min(1),
+ localEndpoint: z.string().url(),
+ dailyRuns: z.object({ local: z.number().int().nonnegative(), cloud: z.number().int().nonnegative() }),
+});
+
 const JobSchema = z.object({
+ studio: StudioJobSchema.optional(),
  /** The name `ranger job enqueue` takes and the run ledger reports as `ran.ref`. */
  name: z.string().regex(/^[a-z0-9][a-z0-9-]{0,63}$/, "a lowercase name ([a-z0-9-], at most 64)"),
  /** The skill the session runs (`/<skill>` on Claude). */

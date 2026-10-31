@@ -389,6 +389,9 @@ export const jobRuns = sqliteTable(
   /** The run ledger's `run_id`, fixed at enqueue: an envelope repeated after a crash names the same run. */
   runUuid: text("run_uuid").notNull(),
   name: text("name").notNull(),
+  params: text("params", { mode: "json" }).$type<Record<string, string>>().notNull().default({}),
+  queueKey: text("queue_key").notNull().default("[]"),
+  policy: text("policy", { enum: ["local", "cloud"] }),
   lane: text("lane", { enum: ["visual", "headless", "none"] }).notNull(),
   status: text("status", { enum: JOB_RUN_STATUSES }).notNull().default("queued"),
   queuedAt: text("queued_at").notNull(),
@@ -413,7 +416,7 @@ export const jobRuns = sqliteTable(
   reportedAt: text("reported_at"),
  },
  (table) => [
-  uniqueIndex("job_runs_one_queued_idx").on(table.name).where(sql`status = 'queued'`),
+  uniqueIndex("job_runs_one_queued_idx").on(table.name, table.queueKey).where(sql`status = 'queued'`),
   index("job_runs_status_idx").on(table.status, table.id),
   index("job_runs_unreported_idx").on(table.id).where(sql`reported_at IS NULL AND status IN ('succeeded', 'failed')`),
  ],
