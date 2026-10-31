@@ -61,6 +61,7 @@ Each tick posts escalation cards, then claims frontier nodes and starts their wo
 | Command | What it does |
 | --- | --- |
 | `scout` | Reports every map's frontier, audit, and waiting nodes. Writes nothing. |
+| `select-substrate` | Selects a parser substrate from JSON on stdin, with quota refresh and strict caller restrictions. See [the contract](docs/selection.md). |
 | `tick` | Runs one bounded pass: escalation cards, then the walk. The launchd job runs this. |
 | `walk` | Claims frontier nodes, starts detached `run-node` workers, then sweeps. |
 | `run-node <id>` | Supervises one node's worker session and then runs the node kind's steps to its close. |

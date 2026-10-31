@@ -182,6 +182,9 @@ budget:
 # Reviews use Claude or Codex and wait when neither is eligible.
 # Review prefers a substrate other than the one that wrote the PR head.
 # Quota thresholds rise linearly toward 100% at reset.
+selection:
+  substrates: []
+
 substrates:
   # 5-hour window: eligible below this at window start; threshold rises to 100% at reset.
   fiveHourMaxUsedPct: 70
