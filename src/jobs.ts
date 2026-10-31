@@ -24,6 +24,7 @@ import { emitJobRunFinished, type RunLedgerDeps } from "./run-ledger.ts";
 import type { SubstrateName } from "./store/schema.ts";
 import { selectSubstrate, workerCommandFor, workerOutputFor, type SubstrateReaders } from "./substrate.ts";
 import { selectForBuild } from "./substrate-policy.ts";
+import { finishStudio, prepareStudio, studioCommand, studioEnvironment, studioLimit, studioPolicyCache, studioPrompt, studioSubstrates, validateStudioParams } from "./studio-think.ts";
 import { workerHostEnv } from "./worker-env.ts";
 
 /** Where a job's session writes what it produced (e.g. `soma:outputs/…`), for `result_ref`. */
@@ -54,9 +55,12 @@ export function enqueueJob(
  journal: Pick<Journal, "enqueueJobRun">,
  name: string,
  now = new Date(),
+ params: Record<string, string> = {},
 ): { name: string; runId: number; lane: JobLane; queued: boolean } {
  const job = findJob(config, name);
- const { run, queued } = journal.enqueueJobRun(job.name, job.lane, now);
+ if (name === "ivy-think") validateStudioParams(params);
+ else if (Object.keys(params).length > 0) throw new JobError("Only ivy-think currently accepts named parameters");
+ const { run, queued } = journal.enqueueJobRun(job.name, job.lane, now, params);
  return { name: job.name, runId: run.id, lane: job.lane, queued };
 }
 
@@ -180,7 +184,7 @@ export async function sweepJobs(ctx: JobPassContext, result: JobPassResult): Pro
    continue;
   }
   if (pidAlive(run.pid)) continue;
-  const skill = ctx.config.jobs?.find(j => j.name === run.name)?.skill;
+  const skill = run.name === "ivy-think" ? "Studio ivy-think job" : ctx.config.jobs?.find(j => j.name === run.name)?.skill;
   if (run.pgid !== null && skill !== undefined) {
    const commands = await processGroupCommands(run.pgid);
    if (commands.some(c => c.includes(skill))) killProcessGroup(run.pgid);
@@ -200,6 +204,7 @@ export async function jobPass(ctx: JobPassContext): Promise<JobPassResult> {
  const result = emptyJobPass();
  await sweepJobs(ctx, result);
  const taken = ctx.takenLanes ?? new Set<ImplementLane>();
+ const studioPolicies = studioPolicyCache();
  for (const run of journal.listJobRuns("queued")) {
   const now = ctx.now?.() ?? new Date();
   const job = config.jobs?.find(j => j.name === run.name);
@@ -210,7 +215,10 @@ export async function jobPass(ctx: JobPassContext): Promise<JobPassResult> {
    continue;
   }
   const lane = run.lane;
-  const wait = (reason: string) => result.waiting.push({ runId: run.id, name: run.name, reason });
+  const wait = (reason: string) => {
+   journal.updateJobRun(run.id, "queued", { reason });
+   result.waiting.push({ runId: run.id, name: run.name, reason });
+  };
   if (journal.isPaused()) { wait("dead-man paused"); continue; }
   if (lane === "visual" && journal.isVisualLaneDrained()) { wait("visual lane drained"); continue; }
   if (journal.spawnsToday(now) >= config.workers.spawnCapPerDay) { wait("daily spawn cap reached"); continue; }
@@ -219,6 +227,14 @@ export async function jobPass(ctx: JobPassContext): Promise<JobPassResult> {
   if (holder !== null) {
    wait(`the ${lane} lane is held by ${holder.job === undefined ? `#${holder.nodeId} (${holder.repo}#${holder.root})` : `job ${holder.job}`}`);
    continue;
+  }
+  if (run.name === "ivy-think") {
+   const prepared = await prepareStudio(job, run.params, studioPolicies);
+   if (prepared.kind === "deferred") { wait(prepared.reason); continue; }
+   const limit = job.studio ? studioLimit(prepared, job.studio, journal.listJobRuns(), now, run.id) : "Studio job is not configured";
+   if (limit) { wait(limit); continue; }
+   if ((await studioSubstrates(job, config, prepared.policy)).length === 0) { wait(`No permitted ${prepared.policy} substrate is available`); continue; }
+   journal.updateJobRun(run.id, "queued", { policy: prepared.policy, reason: null });
   }
   // Reserve the lane before spawning: the child must find a running row,
   // and every other scheduler must see the lane occupied.
@@ -302,7 +318,7 @@ export interface RunJobContext {
 export interface RunJobOutcome {
  runId: number;
  name: string;
- status: "succeeded" | "failed" | "refused";
+ status: "succeeded" | "failed" | "refused" | "deferred";
  reason?: string;
  substrate?: SubstrateName;
  result?: string | null;
@@ -333,41 +349,62 @@ export async function runJob(runId: number, ctx: RunJobContext): Promise<RunJobO
   return { runId, name: run.name, status: "failed", reason: (error as Error).message };
  }
 
- let substrate = ctx.substrate ?? job.substrates[0];
- if (ctx.substrate === undefined) {
+ const studio = run.name === "ivy-think" ? await prepareStudio(job, run.params) : null;
+ const defer = (reason: string): RunJobOutcome => {
+  journal.updateJobRun(runId, "running", { status: "queued", reason, startedAt: null, pid: null, pgid: null });
+  return { runId, name: run.name, status: "deferred", reason };
+ };
+ if (studio?.kind === "deferred") return defer(studio.reason);
+ if (studio?.kind === "ready" && job.studio) {
+  const limit = studioLimit(studio, job.studio, journal.listJobRuns(), now(), run.id);
+  if (limit) return defer(limit);
+ }
+ const permitted = studio?.kind === "ready" ? await studioSubstrates(job, config, studio.policy) : job.substrates;
+ if (permitted.length === 0) return defer("No policy-permitted substrate is available");
+ if (ctx.substrate !== undefined && !permitted.includes(ctx.substrate)) return defer("Requested substrate is forbidden by the job policy");
+ let substrate = ctx.substrate ?? permitted[0];
+ if (ctx.substrate === undefined && studio?.policy !== "local") {
   try {
    const picked = (await selectSubstrate(journal, {
     config: config.substrates, excluded: new Set(), readers: ctx.substrateReaders, pick: selectForBuild,
    })).substrate;
-   if (job.substrates.includes(picked)) substrate = picked;
+   if (permitted.includes(picked)) substrate = picked;
   } catch {
-   // No reading: the job's first substrate runs it.
+   substrate = permitted[0] ?? substrate;
   }
  }
- journal.updateJobRun(runId, "running", { substrate });
+ journal.updateJobRun(runId, "running", { substrate, ...(studio?.kind === "ready" ? { policy: studio.policy } : {}) });
 
  const scratch = mkdtempSync(join(tmpdir(), "ranger-job-"));
  const resultFile = join(scratch, "result");
- const command = workerCommandFor(substrate, config);
+ const command = studio?.kind === "ready" ? studioCommand(substrate, config, resultFile) : workerCommandFor(substrate, config);
  const output = workerOutputFor(substrate);
  let raw: RunResult;
  try {
-  raw = await (ctx.runSession ?? runCmd)(command[0], [...command.slice(1), jobPrompt(job, substrate)], {
-   cwd: expandHome(job.cwd),
+  raw = await (ctx.runSession ?? runCmd)(command[0], [...command.slice(1), studio?.kind === "ready" ? studioPrompt(studio) : jobPrompt(job, substrate)], {
+   cwd: studio?.kind === "ready" ? scratch : expandHome(job.cwd),
    timeoutMs: job.wallClockMin * 60_000,
    processGroup: true,
    // A visual job (GPU capture) keeps normal priority, as the browser probes do.
    nice: job.lane === "visual" ? undefined : config.workers.niceness,
-   env: { ...workerHostEnv(), [JOURNAL_PATH_ENV]: sessionJournalPath(), [JOB_RESULT_ENV]: resultFile },
+   env: { ...(studio?.kind === "ready" ? studioEnvironment() : workerHostEnv()), [JOURNAL_PATH_ENV]: sessionJournalPath(), [JOB_RESULT_ENV]: resultFile },
    onSpawn: pgid => journal.updateJobRun(runId, "running", { pgid }),
-   ...output.runOptions,
+   ...(studio?.kind === "ready" ? {} : output.runOptions),
   });
  } catch (error) {
   raw = { code: -1, stdout: "", stderr: error instanceof Error ? error.message : String(error) };
  }
- const result = readResult(resultFile);
+ let result = readResult(resultFile);
+ if (studio?.kind === "ready" && raw.code === 0 && !raw.timedOut) {
+  try {
+   const modelText = substrate === "codex" ? readFileSync(resultFile, "utf8") : raw.stdout;
+   result = await finishStudio(studio, job, run, substrate, modelText, now());
+  } catch (error) {
+   raw = { ...raw, code: -1, stderr: `${raw.stderr}\n${error instanceof Error ? error.message : String(error)}` };
+  }
+ }
  rmSync(scratch, { recursive: true, force: true });
- const { result: read } = output.read(raw, journal);
+ const read = studio?.kind === "ready" ? raw : output.read(raw, journal).result;
  const log = saveJobLog(journal.path, run, substrate, read);
 
  const reason = raw.timedOut ? "budget"
