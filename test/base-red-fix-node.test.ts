@@ -6,7 +6,7 @@ import { loadConfig } from "../src/config.ts";
 import * as exec from "../src/exec.ts";
 import { runCmd, type RunResult } from "../src/exec.ts";
 import { fixNodeLockFile, FixNodeLockBusy, withFixNodeLock } from "../src/fix-node-lock.ts";
-import { GraphAddOnceAmbiguous, GraphAddUnattached, graphAdd, graphLink, GraphWriteError, type AddSpec } from "../src/graph-write.ts";
+import { GraphAddOnceAmbiguous, GraphAddUnattached, graphAdd, graphLink, GraphWriteError, somaProse, type AddSpec } from "../src/graph-write.ts";
 import { baseRedFixKey, fileBaseRedFixNodes, FIX_NODE_FILING_CONCURRENCY, probeMergeBase, type FixNodeGraph, type ImplementContext } from "../src/implement.ts";
 import { Journal } from "../src/journal.ts";
 import { openDb } from "../src/store/db.ts";
@@ -282,7 +282,9 @@ describe("fix-the-base node for a confirmed base-red probe (node #152)", () => {
    expect((await graphAdd("acme/widgets", "1", spec, "ghp_machine")).existing).toBe(false);
    const twice = graphAdd("acme/widgets", "1", spec, "ghp_machine");
    await expect(twice).rejects.toThrow(GraphAddOnceAmbiguous);
-   await expect(twice).rejects.toMatchObject({ nodes: ["77", "78"] });
+   await expect(twice).rejects.toMatchObject({ nodes: ["77", "78"], marker });
+   await expect(twice).rejects.toThrow(`nodes #77, #78 all carry ${marker}; nothing added`);
+   expect(new GraphAddOnceAmbiguous("m", ["77", "78"], marker).carriers()).toBe(`nodes #77, #78 all carry ${marker}`);
    const other = graphAdd("acme/widgets", "1", spec, "ghp_machine");
    await expect(other).rejects.toThrow(GraphWriteError);
    await expect(other).rejects.not.toThrow(GraphAddOnceAmbiguous);
@@ -290,6 +292,13 @@ describe("fix-the-base node for a confirmed base-red probe (node #152)", () => {
   } finally {
    spy.mockRestore();
   }
+ });
+
+ test("somaProse drops the node block soma appends and keeps an unclosed one", () => {
+  const block = `<!-- soma:work-graph-node\n${JSON.stringify({ autonomy: "propose", checkpointId: "c" }, null, 2)}\n-->`;
+  expect(somaProse(`words\n\nmarker\n\n${block}`)).toBe("words\n\nmarker\n\n");
+  expect(somaProse("words")).toBe("words");
+  expect(somaProse("words\n<!-- soma:work-graph-node {")).toBe("words\n<!-- soma:work-graph-node {");
  });
 
  test("graphAdd: a failure without a payload is a plain write error", async () => {

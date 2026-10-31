@@ -27,7 +27,7 @@ import {
 import type { ForgeReadPort, LabeledIssue } from "./forge.ts";
 import { lanePort } from "./forge-lanes.ts";
 import { GRAPH_CALL_TIMEOUT_MS } from "./graph.ts";
-import { GraphAddOnceAmbiguous, GraphAddUnattached, graphAdd, graphLink } from "./graph-write.ts";
+import { GraphAddOnceAmbiguous, GraphAddUnattached, graphAdd, graphLink, somaProse } from "./graph-write.ts";
 import { assertNotPrincipal, assertWriteIdentity } from "./identity.ts";
 import type { IntakeDraftRow, Journal } from "./journal.ts";
 import { type OwnedCheck, withOwnedLease } from "./lock.ts";
@@ -1328,18 +1328,9 @@ export function intakeNodeBody(row: Pick<IntakeDraftRow, "body" | "messageUrl" |
   ].join("\n");
 }
 
-const NODE_BLOCK_OPEN = "<!-- soma:work-graph-node";
-const NODE_BLOCK_CLOSE = "-->";
-
-function bodyWithoutSomaNodeBlock(body: string): string {
-  const open = body.lastIndexOf(NODE_BLOCK_OPEN);
-  const close = open === -1 ? -1 : body.indexOf(NODE_BLOCK_CLOSE, open + NODE_BLOCK_OPEN.length);
-  return close === -1 ? body : `${body.slice(0, open)}${body.slice(close + NODE_BLOCK_CLOSE.length)}`;
-}
-
 /** A body's last line with text, past soma's node block: where `intakeNodeBody` puts the marker. */
 function finalLine(body: string): string {
-  return bodyWithoutSomaNodeBlock(body).trimEnd().split(/\r?\n/).at(-1)?.trim() ?? "";
+  return somaProse(body).trimEnd().split(/\r?\n/).at(-1)?.trim() ?? "";
 }
 
 /**
@@ -1530,7 +1521,7 @@ async function fileDraft(args: GateArgs, row: IntakeDraftRow): Promise<void> {
     existing = added.existing;
   } catch (error) {
     if (error instanceof GraphAddOnceAmbiguous) {
-      throw new EscalateError(`nodes ${error.nodes.map((n) => `#${n}`).join(", ")} all carry ${intakeMarker(intakeOrigin(row))} — one draft filed twice; nothing more is filed`);
+      throw new EscalateError(`${error.carriers()} — one draft filed twice; nothing more is filed`);
     }
     if (!(error instanceof GraphAddUnattached)) throw error;
     // The node exists below no parent: attach it rather than add a second.

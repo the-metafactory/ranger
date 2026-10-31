@@ -361,9 +361,26 @@ export class GraphAddUnattached extends GraphWriteError {
  * added nothing: one observation was filed twice, which a caller escalates.
  */
 export class GraphAddOnceAmbiguous extends GraphWriteError {
- constructor(message: string, readonly nodes: string[]) {
+ constructor(message: string, readonly nodes: string[], readonly marker: string) {
   super(message);
  }
+
+ carriers(): string {
+  return onceCarriers(this.nodes, this.marker);
+ }
+}
+
+function onceCarriers(nodes: readonly string[], marker: string): string {
+ return `nodes ${nodes.map((id) => `#${id}`).join(", ")} all carry ${marker}`;
+}
+
+const NODE_BLOCK_OPEN = "<!-- soma:work-graph-node";
+const NODE_BLOCK_CLOSE = "-->";
+
+export function somaProse(body: string): string {
+ const open = body.lastIndexOf(NODE_BLOCK_OPEN);
+ const close = open === -1 ? -1 : body.indexOf(NODE_BLOCK_CLOSE, open + NODE_BLOCK_OPEN.length);
+ return close === -1 ? body : `${body.slice(0, open)}${body.slice(close + NODE_BLOCK_CLOSE.length)}`;
 }
 
 /**
@@ -409,7 +426,7 @@ export async function graphAdd(
    }
   } catch { /* no payload: whether a node was created is unknown */ }
   if (spec.once !== undefined && ambiguous.length > 1) {
-   throw new GraphAddOnceAmbiguous(message(` — nodes ${ambiguous.map((id) => `#${id}`).join(", ")} all carry ${spec.once}; nothing added`), ambiguous);
+   throw new GraphAddOnceAmbiguous(message(` — ${onceCarriers(ambiguous, spec.once)}; nothing added`), ambiguous, spec.once);
   }
   if (node !== null) throw new GraphAddUnattached(message(` — created ${node} but left it unattached`), node, parent);
   throw new GraphWriteError(message(""));
