@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stringify } from "yaml";
@@ -58,6 +58,41 @@ test("strictest policy wins; unknown areas fail closed", () => {
  expect(studioPolicy(["work"], areas)).toBe("local");
  expect(studioPolicy(["lab", "work"], areas)).toBe("local");
  expect(studioPolicy(["missing"], areas)).toBe("local");
+});
+
+test("ignored uncommitted threads never enter native thinking context", async () => {
+ const r = rig();
+ writeFileSync(join(r.repo, ".gitignore"), "threads/draft.md\nlocal-cache/\n");
+ r.git("add", "."); r.git("commit", "-qm", "Ignore drafts");
+ writeFileSync(join(r.repo, "threads/draft.md"), thread());
+ mkdirSync(join(r.repo, "local-cache"));
+ writeFileSync(join(r.repo, "local-cache/state.json"), "private state");
+ expect(r.git("status", "--porcelain", "--untracked-files=all")).toBe("");
+ expect(await prepareStudio(r.job, { ...r.params, thread: "draft" })).toMatchObject({ kind: "deferred" });
+ expect(await prepareStudio(r.job, r.params)).toMatchObject({ kind: "ready", text: thread() });
+});
+
+test("native thinking refuses assume-unchanged edits without invoking a model", async () => {
+ const r = rig();
+ r.git("update-index", "--assume-unchanged", "threads/alpha.md");
+ const edited = thread() + "Uncommitted private material\n";
+ writeFileSync(join(r.repo, "threads/alpha.md"), edited);
+ expect(r.git("status", "--porcelain")).toBe("");
+ expect(await prepareStudio(r.job, r.params)).toMatchObject({ kind: "deferred" });
+ const id = await reserve(r);
+ let called = false;
+ const outcome = await runJob(id, { ...r, now: () => now, substrate: "claude", runSession: async () => { called = true; return { code: 0, stdout: response, stderr: "" }; } });
+ expect(outcome.status).toBe("deferred");
+ expect(called).toBe(false);
+ expect(readFileSync(join(r.repo, "threads/alpha.md"), "utf8")).toBe(edited);
+});
+
+test("a committed symbolic link cannot supply native thread content", async () => {
+ const r = rig();
+ writeFileSync(join(r.repo, "private.md"), thread());
+ symlinkSync("../private.md", join(r.repo, "threads/linked.md"));
+ r.git("add", "."); r.git("commit", "-qm", "Linked thread fixture");
+ expect(await prepareStudio(r.job, { ...r.params, thread: "linked" })).toMatchObject({ kind: "deferred", reason: "thread must be a committed regular file in Studio" });
 });
 
 test("parameters survive journal reopen and independent threads stay queued", () => {
@@ -142,6 +177,7 @@ test("different stack policy, unavailable policy and closed threads fail closed"
  expect(await prepareStudio(r.job, r.params)).toMatchObject({ kind: "deferred" });
  r.setDirectory(r.repo);
  writeFileSync(join(r.repo, "threads/alpha.md"), thread().replace("state: active", "state: closed"));
+ r.git("add", "."); r.git("commit", "-qm", "Closed thread fixture");
  expect(await prepareStudio(r.job, r.params)).toMatchObject({ kind: "deferred", reason: "thread is closed and has no due decision review" });
 });
 

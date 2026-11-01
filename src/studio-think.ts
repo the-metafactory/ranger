@@ -1,5 +1,5 @@
 import { readFileSync, writeFileSync } from "node:fs";
-import { mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { parse as parseYaml, parseDocument } from "yaml";
@@ -67,18 +67,31 @@ export async function prepareStudio(job: RangerJobConfig, params: Record<string,
   const dir = await realpath(expandHome(job.studio.dir));
   const areas = await policies(job.studio, dir);
   const path = `threads/${input.thread}.md`;
-  if (await realpath(join(dir, path)) !== join(dir, path)) return deferred("thread must be a regular file inside the configured Studio");
-  const text = await readFile(join(dir, path), "utf8");
-  if (text.length > 1_000_000) return deferred("thread exceeds the Studio file limit");
+  const head = await git(dir, ["rev-parse", "--verify", "HEAD"]);
+  if (head.code !== 0) return deferred("Studio needs a committed HEAD");
+  const boundHead = head.stdout.trim();
+  const tracked = await git(dir, ["ls-tree", "-z", "--full-tree", boundHead, "--", path]);
+  const entry = /^100(?:644|755) blob ([a-f0-9]{40})\t([^\0]+)\0$/.exec(tracked.stdout);
+  if (tracked.code !== 0 || entry?.[2] !== path) return deferred("thread must be a committed regular file in Studio");
+  const target = join(dir, path);
+  const info = await lstat(target);
+  if (!info.isFile() || await realpath(target) !== target) return deferred("thread must be a regular file inside the configured Studio");
+  const size = await git(dir, ["cat-file", "-s", entry[1]]);
+  if (size.code !== 0 || !/^\d+\s*$/.test(size.stdout) || Number(size.stdout) > 1_000_000 || info.size > 1_000_000) return deferred("thread exceeds the Studio file limit");
+  const hash = await git(dir, ["hash-object", "--no-filters", "--", path]);
+  if (hash.code !== 0 || hash.stdout.trim() !== entry[1]) return deferred("thread differs from its committed source");
+  const blob = await git(dir, ["cat-file", "blob", entry[1]]);
+  if (blob.code !== 0) return deferred("committed thread could not be read");
+  const text = blob.stdout;
   const match = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(text);
   const front = Front.parse(parseYaml(match?.[1] ?? ""));
   if (front.state === "parked" && input.mode === undefined) return deferred("thread is parked; automatic thinking deferred");
   const dueReview = front.outcome === "decided" && front.reviewOn !== undefined && front.reviewOn <= new Date().toISOString().slice(0, 10) && input.trigger.startsWith("Decision review due ");
   if (front.state === "closed" && !dueReview) return deferred("thread is closed and has no due decision review");
   const status = await git(dir, ["status", "--porcelain", "--untracked-files=all"]);
-  const head = await git(dir, ["rev-parse", "--verify", "HEAD"]);
-  if (status.code !== 0 || status.stdout.trim() || head.code !== 0) return deferred("Studio must have a committed HEAD and a clean working tree");
-  return { kind: "ready", dir, path, text, head: head.stdout.trim(), policy: studioPolicy(front.areas, areas), params: input, policyStamp: JSON.stringify(areas) };
+  const currentHead = await git(dir, ["rev-parse", "--verify", "HEAD"]);
+  if (status.code !== 0 || status.stdout.trim() || currentHead.code !== 0 || currentHead.stdout.trim() !== boundHead) return deferred("Studio must have a committed HEAD and a clean working tree");
+  return { kind: "ready", dir, path, text, head: boundHead, policy: studioPolicy(front.areas, areas), params: input, policyStamp: JSON.stringify(areas) };
  } catch (error) {
   return deferred(`Studio preparation deferred: ${error instanceof Error ? error.message : String(error)}`);
  }
