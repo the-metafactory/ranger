@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stringify } from "yaml";
@@ -13,7 +13,7 @@ afterEach(() => { for (const close of cleanup.splice(0).reverse()) close(); });
 const now = new Date("2026-10-31T10:00:00Z");
 const thread = (areas = "lab") => `---\ntype: question\nareas: [${areas}]\nstate: active\nopened: 2026-10-01\n---\n\n## Question\n\nHow do we test this?\n\n## Where I stand\n\nCarefully.\n\n## Material\n\n- capture: Test a real git repository.\n\n## Ivy's notes\n\n## Log\n\n- 2026-10-01: Opened\n`;
 
-function rig(areas = "lab", budget = 5) {
+function rig(areas = "lab", budget = 5, format = "sha1") {
  const dir = mkdtempSync(join(tmpdir(), "studio-think-"));
  cleanup.push(() => rmSync(dir, { recursive: true, force: true }));
  const repo = join(dir, "studio");
@@ -24,7 +24,7 @@ function rig(areas = "lab", budget = 5) {
   if (result.exitCode !== 0) throw new Error(result.stderr.toString());
   return result.stdout.toString().trim();
  };
- git("init", "-q"); git("config", "user.name", "Test"); git("config", "user.email", "test@example.invalid"); git("add", "."); git("commit", "-qm", "initial");
+ git("init", "-q", `--object-format=${format}`); git("config", "user.name", "Test"); git("config", "user.email", "test@example.invalid"); git("add", "."); git("commit", "-qm", "initial");
  let policy = "cloud";
  let requests = 0;
  let unavailable = false;
@@ -52,12 +52,75 @@ async function reserve(r: ReturnType<typeof rig>, params: Record<string, string>
 
 const response = JSON.stringify({ note: "Try the smallest meaningful experiment.", stand: "We should test through git.", ideas: ["Use a scratch repository."] });
 
+for (const area of ["lab", "work"]) test(`native SHA-256 thinking commits a note and preserves ${area} policy and stand`, async () => {
+ const r = rig(area, 5, "sha256");
+ const snapshot = await prepareStudio(r.job, r.params);
+ expect(snapshot.kind).toBe("ready");
+ if (snapshot.kind !== "ready") throw new Error(snapshot.reason);
+ expect(snapshot.head).toHaveLength(64);
+ expect(snapshot.policy).toBe(area === "work" ? "local" : "cloud");
+ if (area === "work") {
+  const prior = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = r.dir;
+  cleanup.push(() => { if (prior === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = prior; });
+  writeFileSync(join(r.dir, "models.json"), JSON.stringify({ providers: { "test-local": { baseUrl: r.job.studio?.localEndpoint, api: "openai-completions", models: [{ id: "local-model" }] } } }));
+ }
+ const id = await reserve(r);
+ let calls = 0;
+ const result = await runJob(id, { ...r, now: () => now, substrate: area === "work" ? "pi" : "claude", runSession: async (bin) => { calls++; expect(bin).toBe(area === "work" ? "pi" : "claude"); return { code: 0, stdout: response, stderr: "" }; } });
+ expect(result.status).toBe("succeeded");
+ expect(calls).toBe(1);
+ const text = readFileSync(join(r.repo, "threads/alpha.md"), "utf8");
+ expect(text).toContain("## Where I stand\n\nCarefully.");
+ expect(text).toContain("Try the smallest meaningful experiment.");
+ expect(r.journal.getJobRun(id)?.policy).toBe(snapshot.policy);
+ expect(r.journal.getJobRun(id)?.result).toContain(r.git("rev-parse", "HEAD"));
+ expect(r.git("rev-parse", "HEAD")).toHaveLength(64);
+ expect(r.git("status", "--porcelain")).toBe("");
+ expect(await prepareStudio(r.job, r.params)).toMatchObject({ kind: "ready" });
+});
+
 test("strictest policy wins; unknown areas fail closed", () => {
  const areas = [{ id: "lab", policy: "cloud" as const }, { id: "work", policy: "local" as const }];
  expect(studioPolicy(["lab"], areas)).toBe("cloud");
  expect(studioPolicy(["work"], areas)).toBe("local");
  expect(studioPolicy(["lab", "work"], areas)).toBe("local");
  expect(studioPolicy(["missing"], areas)).toBe("local");
+});
+
+test("ignored uncommitted threads never enter native thinking context", async () => {
+ const r = rig();
+ writeFileSync(join(r.repo, ".gitignore"), "threads/draft.md\nlocal-cache/\n");
+ r.git("add", "."); r.git("commit", "-qm", "Ignore drafts");
+ writeFileSync(join(r.repo, "threads/draft.md"), thread());
+ mkdirSync(join(r.repo, "local-cache"));
+ writeFileSync(join(r.repo, "local-cache/state.json"), "private state");
+ expect(r.git("status", "--porcelain", "--untracked-files=all")).toBe("");
+ expect(await prepareStudio(r.job, { ...r.params, thread: "draft" })).toMatchObject({ kind: "deferred" });
+ expect(await prepareStudio(r.job, r.params)).toMatchObject({ kind: "ready", text: thread() });
+});
+
+test("native thinking refuses assume-unchanged edits without invoking a model", async () => {
+ const r = rig();
+ r.git("update-index", "--assume-unchanged", "threads/alpha.md");
+ const edited = thread() + "Uncommitted private material\n";
+ writeFileSync(join(r.repo, "threads/alpha.md"), edited);
+ expect(r.git("status", "--porcelain")).toBe("");
+ expect(await prepareStudio(r.job, r.params)).toMatchObject({ kind: "deferred" });
+ const id = await reserve(r);
+ let called = false;
+ const outcome = await runJob(id, { ...r, now: () => now, substrate: "claude", runSession: async () => { called = true; return { code: 0, stdout: response, stderr: "" }; } });
+ expect(outcome.status).toBe("deferred");
+ expect(called).toBe(false);
+ expect(readFileSync(join(r.repo, "threads/alpha.md"), "utf8")).toBe(edited);
+});
+
+test("a committed symbolic link cannot supply native thread content", async () => {
+ const r = rig();
+ writeFileSync(join(r.repo, "private.md"), thread());
+ symlinkSync("../private.md", join(r.repo, "threads/linked.md"));
+ r.git("add", "."); r.git("commit", "-qm", "Linked thread fixture");
+ expect(await prepareStudio(r.job, { ...r.params, thread: "linked" })).toMatchObject({ kind: "deferred", reason: "thread must be a committed regular file in Studio" });
 });
 
 test("parameters survive journal reopen and independent threads stay queued", () => {
@@ -142,7 +205,8 @@ test("different stack policy, unavailable policy and closed threads fail closed"
  expect(await prepareStudio(r.job, r.params)).toMatchObject({ kind: "deferred" });
  r.setDirectory(r.repo);
  writeFileSync(join(r.repo, "threads/alpha.md"), thread().replace("state: active", "state: closed"));
- expect(await prepareStudio(r.job, r.params)).toMatchObject({ kind: "deferred", reason: "thread is closed" });
+ r.git("add", "."); r.git("commit", "-qm", "Closed thread fixture");
+ expect(await prepareStudio(r.job, r.params)).toMatchObject({ kind: "deferred", reason: "thread is closed and has no due decision review" });
 });
 
 test("edits and policy changes during model latency survive without a generated note", async () => {
@@ -275,4 +339,82 @@ test("native CLI receipt survives independent process restarts and Studio readba
  const readback = JSON.parse(status.stdout.toString());
  expect(readback.directory).toBe(r.repo); expect(readback.dailyRuns).toEqual({ local: 5, cloud: 5 }); expect(readback.runs).toHaveLength(1);
  expect(status.stdout.toString()).not.toContain("localEndpoint");
+});
+
+test("only a due closed decision accepts an automatic review and keeps local policy", async () => {
+ const r = rig("work");
+ const params = { thread: "alpha", trigger: "Decision review due 2000-01-01" };
+ for (const front of ["outcome: shipped\nreviewOn: 2000-01-01", "outcome: dropped\nreviewOn: 2000-01-01", "outcome: decided\nreviewOn: 2999-01-01"]) {
+  writeFileSync(join(r.repo, "threads/alpha.md"), thread("work").replace("state: active", `state: closed\n${front}`));
+  r.git("add", "."); r.git("commit", "-qm", "Clean decision eligibility fixture");
+  expect(await prepareStudio(r.job, params)).toMatchObject({ kind: "deferred", reason: "thread is closed and has no due decision review" });
+ }
+ writeFileSync(join(r.repo, "threads/alpha.md"), thread("work").replace("state: active", "state: closed\noutcome: decided\nreviewOn: 2000-01-01"));
+ r.git("add", "."); r.git("commit", "-qm", "Decided fixture");
+ expect(await prepareStudio(r.job, r.params)).toMatchObject({ kind: "deferred" });
+ expect(await prepareStudio(r.job, params)).toMatchObject({ kind: "ready", policy: "local" });
+});
+
+
+test("a due closed decision receives a review note while retaining outcome and stand", async () => {
+ const r = rig();
+ const text = thread().replace("state: active", "state: closed\noutcome: decided\nreviewOn: 2000-01-01");
+ writeFileSync(join(r.repo, "threads/alpha.md"), text);
+ r.git("add", "."); r.git("commit", "-qm", "Decided fixture");
+ const params = { thread: "alpha", trigger: "Decision review due 2000-01-01" };
+ const runId = await reserve(r, params);
+ const outcome = await runJob(runId, { ...r, substrate: "claude", now: () => now, runSession: async () => ({ code: 0, stdout: response, stderr: "" }) });
+ expect(outcome.status).toBe("succeeded");
+ const updated = readFileSync(join(r.repo, "threads/alpha.md"), "utf8");
+ expect(updated).toContain("state: closed\noutcome: decided\nreviewOn: 2000-01-01");
+ expect(updated).toContain("## Where I stand\n\nCarefully.");
+ expect(updated).toContain("trigger: Decision review due 2000-01-01");
+});
+
+
+test("successful automatic think-tonight consumes its request in the note commit", async () => {
+ const r = rig();
+ writeFileSync(join(r.repo, "threads/alpha.md"), thread().replace("state: active", "state: active\nthinkTonight: true"));
+ r.git("add", "."); r.git("commit", "-qm", "Tonight fixture");
+ const params = { thread: "alpha", trigger: "Asked to think tonight; New Material committed" };
+ const runId = await reserve(r, params);
+ const outcome = await runJob(runId, { ...r, substrate: "claude", now: () => now, runSession: async () => ({ code: 0, stdout: response, stderr: "" }) });
+ expect(outcome.status).toBe("succeeded");
+ expect(readFileSync(join(r.repo, "threads/alpha.md"), "utf8")).toContain("thinkTonight: false");
+});
+
+
+test("failed automatic work and successful explicit modes retain think-tonight", async () => {
+ for (const mode of [undefined, "grill"]) {
+  const r = rig();
+  writeFileSync(join(r.repo, "threads/alpha.md"), thread().replace("state: active", "state: active\nthinkTonight: true"));
+  r.git("add", "."); r.git("commit", "-qm", "Tonight fixture");
+  const params = { thread: "alpha", trigger: "Asked to think tonight", ...(mode ? { mode } : {}) };
+  const runId = await reserve(r, params);
+  const outcome = await runJob(runId, { ...r, substrate: "claude", now: () => now, runSession: async () => ({ code: 0, stdout: mode ? response : "invalid JSON", stderr: "" }) });
+  expect(outcome.status).toBe(mode ? "succeeded" : "failed");
+  expect(readFileSync(join(r.repo, "threads/alpha.md"), "utf8")).toContain("thinkTonight: true");
+ }
+});
+
+
+test("CRLF threads without a notes section consume successful automatic tonight requests", async () => {
+ const r = rig();
+ const text = thread().replace("state: active", "state: active\nthinkTonight: true").replace("## Ivy's notes\n\n", "").replaceAll("\n", "\r\n");
+ writeFileSync(join(r.repo, "threads/alpha.md"), text);
+ r.git("add", "."); r.git("commit", "-qm", "CRLF tonight fixture");
+ const params = { thread: "alpha", trigger: "Asked to think tonight" };
+ const runId = await reserve(r, params);
+ const outcome = await runJob(runId, { ...r, substrate: "claude", now: () => now, runSession: async () => ({ code: 0, stdout: response, stderr: "" }) });
+ expect(outcome.status).toBe("succeeded");
+ expect(readFileSync(join(r.repo, "threads/alpha.md"), "utf8")).toContain("thinkTonight: false");
+});
+
+
+test("parking a thread defers queued automatic work but permits an explicit mode", async () => {
+ const r=rig();
+ writeFileSync(join(r.repo,"threads/alpha.md"),thread().replace("state: active","state: parked"));
+ r.git("add",".");r.git("commit","-qm","Parked fixture");
+ expect(await prepareStudio(r.job,r.params)).toMatchObject({kind:"deferred",reason:"thread is parked; automatic thinking deferred"});
+ expect(await prepareStudio(r.job,{...r.params,mode:"grill"})).toMatchObject({kind:"ready"});
 });
