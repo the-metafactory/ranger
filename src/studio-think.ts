@@ -71,7 +71,7 @@ export async function prepareStudio(job: RangerJobConfig, params: Record<string,
   if (head.code !== 0) return deferred("Studio needs a committed HEAD");
   const boundHead = head.stdout.trim();
   const tracked = await git(dir, ["ls-tree", "-z", "--full-tree", boundHead, "--", path]);
-  const entry = /^100(?:644|755) blob ([a-f0-9]{40})\t([^\0]+)\0$/.exec(tracked.stdout);
+  const entry = /^100(?:644|755) blob ([a-f0-9]{40}|[a-f0-9]{64})\t([^\0]+)\0$/.exec(tracked.stdout);
   if (tracked.code !== 0 || entry?.[2] !== path) return deferred("thread must be a committed regular file in Studio");
   const target = join(dir, path);
   const info = await lstat(target);

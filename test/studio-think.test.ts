@@ -13,7 +13,7 @@ afterEach(() => { for (const close of cleanup.splice(0).reverse()) close(); });
 const now = new Date("2026-10-31T10:00:00Z");
 const thread = (areas = "lab") => `---\ntype: question\nareas: [${areas}]\nstate: active\nopened: 2026-10-01\n---\n\n## Question\n\nHow do we test this?\n\n## Where I stand\n\nCarefully.\n\n## Material\n\n- capture: Test a real git repository.\n\n## Ivy's notes\n\n## Log\n\n- 2026-10-01: Opened\n`;
 
-function rig(areas = "lab", budget = 5) {
+function rig(areas = "lab", budget = 5, format = "sha1") {
  const dir = mkdtempSync(join(tmpdir(), "studio-think-"));
  cleanup.push(() => rmSync(dir, { recursive: true, force: true }));
  const repo = join(dir, "studio");
@@ -24,7 +24,7 @@ function rig(areas = "lab", budget = 5) {
   if (result.exitCode !== 0) throw new Error(result.stderr.toString());
   return result.stdout.toString().trim();
  };
- git("init", "-q"); git("config", "user.name", "Test"); git("config", "user.email", "test@example.invalid"); git("add", "."); git("commit", "-qm", "initial");
+ git("init", "-q", `--object-format=${format}`); git("config", "user.name", "Test"); git("config", "user.email", "test@example.invalid"); git("add", "."); git("commit", "-qm", "initial");
  let policy = "cloud";
  let requests = 0;
  let unavailable = false;
@@ -51,6 +51,34 @@ async function reserve(r: ReturnType<typeof rig>, params: Record<string, string>
 }
 
 const response = JSON.stringify({ note: "Try the smallest meaningful experiment.", stand: "We should test through git.", ideas: ["Use a scratch repository."] });
+
+for (const area of ["lab", "work"]) test(`native SHA-256 thinking commits a note and preserves ${area} policy and stand`, async () => {
+ const r = rig(area, 5, "sha256");
+ const snapshot = await prepareStudio(r.job, r.params);
+ expect(snapshot.kind).toBe("ready");
+ if (snapshot.kind !== "ready") throw new Error(snapshot.reason);
+ expect(snapshot.head).toHaveLength(64);
+ expect(snapshot.policy).toBe(area === "work" ? "local" : "cloud");
+ if (area === "work") {
+  const prior = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = r.dir;
+  cleanup.push(() => { if (prior === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = prior; });
+  writeFileSync(join(r.dir, "models.json"), JSON.stringify({ providers: { "test-local": { baseUrl: r.job.studio?.localEndpoint, api: "openai-completions", models: [{ id: "local-model" }] } } }));
+ }
+ const id = await reserve(r);
+ let calls = 0;
+ const result = await runJob(id, { ...r, now: () => now, substrate: area === "work" ? "pi" : "claude", runSession: async (bin) => { calls++; expect(bin).toBe(area === "work" ? "pi" : "claude"); return { code: 0, stdout: response, stderr: "" }; } });
+ expect(result.status).toBe("succeeded");
+ expect(calls).toBe(1);
+ const text = readFileSync(join(r.repo, "threads/alpha.md"), "utf8");
+ expect(text).toContain("## Where I stand\n\nCarefully.");
+ expect(text).toContain("Try the smallest meaningful experiment.");
+ expect(r.journal.getJobRun(id)?.policy).toBe(snapshot.policy);
+ expect(r.journal.getJobRun(id)?.result).toContain(r.git("rev-parse", "HEAD"));
+ expect(r.git("rev-parse", "HEAD")).toHaveLength(64);
+ expect(r.git("status", "--porcelain")).toBe("");
+ expect(await prepareStudio(r.job, r.params)).toMatchObject({ kind: "ready" });
+});
 
 test("strictest policy wins; unknown areas fail closed", () => {
  const areas = [{ id: "lab", policy: "cloud" as const }, { id: "work", policy: "local" as const }];
