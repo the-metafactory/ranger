@@ -139,8 +139,7 @@ async function terminate(
   }
  };
  if (live.size === 0) return outcome;
- targets.supervisor.signal("SIGTERM");
- targets.workerGroup.signal("SIGTERM");
+ for (const target of live.values()) target.signal("SIGTERM");
  await settleWithin(timing.graceMs, "terminated");
  if (live.size === 0) return outcome;
  for (const [name, target] of live) {

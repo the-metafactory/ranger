@@ -315,4 +315,43 @@ describe("ranger stop-node", () => {
   expect(result).toMatchObject({ state: "stopped", workerGroup: "foreign" });
   expect(groupSignals).toEqual([]);
  });
+
+ test("a reused supervisor pid is not signalled while the verified worker group is stopped", async () => {
+  const worktree = join(dir, "worktree-453");
+  const generation = seed("453", { pid: 4242, workerPgid: 5151 });
+  const signals: string[] = [];
+  const groupSignals: string[] = [];
+  let groupAlive = true;
+  const ports = livePorts({
+   inspect: async () => ({ kind: "alive", command: "/usr/bin/some-other-tool" }),
+   groupCommands: async () => (groupAlive ? [`worker ${worktree}`] : []),
+   signal: (_pid, signal) => { signals.push(signal); return true; },
+   signalGroup: (_pgid, signal) => { groupSignals.push(signal); groupAlive = false; return true; },
+  });
+
+  const result = await stopNode({ config, journal, ports, graceMs: 50, pollMs: 1 }, { nodeId: "453", map: KEY, generation });
+
+  expect(result).toMatchObject({ state: "stopped", supervisor: "foreign", workerGroup: "terminated" });
+  expect(signals).toEqual([]);
+  expect(groupSignals).toEqual(["SIGTERM"]);
+ });
+
+ test("a reused worker group is not signalled while the verified supervisor is stopped", async () => {
+  const generation = seed("453", { pid: 4242, workerPgid: 5151 });
+  const signals: string[] = [];
+  const groupSignals: string[] = [];
+  let supervisorAlive = true;
+  const ports = livePorts({
+   inspect: async () => (supervisorAlive ? { kind: "alive", command: `bun cli.ts run-node 453 --map ${KEY}` } : { kind: "gone" }),
+   groupCommands: async () => ["/usr/bin/some-other-tool"],
+   signal: (_pid, signal) => { signals.push(signal); supervisorAlive = false; return true; },
+   signalGroup: (_pgid, signal) => { groupSignals.push(signal); return true; },
+  });
+
+  const result = await stopNode({ config, journal, ports, graceMs: 50, pollMs: 1 }, { nodeId: "453", map: KEY, generation });
+
+  expect(result).toMatchObject({ state: "stopped", supervisor: "terminated", workerGroup: "foreign" });
+  expect(signals).toEqual(["SIGTERM"]);
+  expect(groupSignals).toEqual([]);
+ });
 });
