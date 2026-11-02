@@ -47,7 +47,8 @@ export type WorkerStatus =
   * (node #246, ruling D10): the claim stays, no worker runs, no lane slot is
   * held, and the node waits for the principal's 👍.
   */
- | "proposed";
+ | "proposed"
+ | "stop-requested";
 
 /**
  * Implement-lane phases (F2, #23 amendment) — the forge wins on resume.
@@ -285,6 +286,8 @@ export type EventKind =
  | "job-queued"
  | "job-started"
  | "job-finished"
+ | "stop-requested"
+ | "stopped"
  | "resume-cancelled"
  | "resume-dropped"
  | "resume-started"
@@ -463,6 +466,36 @@ export class Journal {
   );
   if (Object.keys(set).length === 0) return;
   this.db.update(workers).set(set).where(and(eq(workers.nodeId, nodeId), eq(workers.repo, repo))).run();
+ }
+
+ requestStop(nodeId: string, repo: string, generation: number, outcome: string, at: Date): boolean {
+  return this.db.transaction(() => {
+   const rows = this.db.update(workers)
+    .set({ status: "stop-requested", outcome, finishedAt: at.toISOString() })
+    .where(and(
+     eq(workers.nodeId, nodeId), eq(workers.repo, repo), eq(workers.generation, generation),
+     inArray(workers.status, ["claimed", "running"]),
+    ))
+    .returning({ nodeId: workers.nodeId }).all();
+   if (rows.length === 0) return false;
+   this.recordEvent("stop-requested", { nodeId, repo, detail: outcome });
+   return true;
+  });
+ }
+
+ settleStop(nodeId: string, repo: string, generation: number, detail: string): boolean {
+  return this.db.transaction(() => {
+   const rows = this.db.update(workers)
+    .set({ pid: null, workerPgid: null })
+    .where(and(
+     eq(workers.nodeId, nodeId), eq(workers.repo, repo), eq(workers.generation, generation),
+     eq(workers.status, "stop-requested"),
+    ))
+    .returning({ nodeId: workers.nodeId }).all();
+   if (rows.length === 0) return false;
+   this.recordEvent("stopped", { nodeId, repo, detail });
+   return true;
+  });
  }
 
  /**

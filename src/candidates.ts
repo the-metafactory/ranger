@@ -16,6 +16,9 @@ export function freshClaimRefusal(
  if (worker.status === "failed" || worker.status === "parked") {
   return `${worker.status} worker — use \`ranger resume-node ${nodeId} --map ${worker.repo}#${worker.root}\` (Resume) to continue its existing work`;
  }
+ if (worker.status === "stop-requested") {
+  return `stopped by operator — use \`ranger resume-node ${nodeId} --map ${worker.repo}#${worker.root}\` to restart it`;
+ }
  return null;
 }
 

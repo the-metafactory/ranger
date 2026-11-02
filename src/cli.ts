@@ -56,6 +56,7 @@ import { enqueueJob, findJob, JobError, runJob, type RunJobContext } from "./job
 import { BUILD_NOW_NOT_STARTED, buildNow, type BuildNowResult } from "./build-now.ts";
 import { startServe } from "./serve.ts";
 import { approveNode } from "./approve-node.ts";
+import { stopNode } from "./stop-node.ts";
 import {
  escalateMaps,
  runDigest,
@@ -998,6 +999,30 @@ program
   const { config } = loadConfig(resolveConfigPath(options.config, process.env, process.cwd()));
   const map = pickMap(config, options.map);
   process.stdout.write(JSON.stringify(await approveNode({ config, map, id, version: options.approvalVersion, dryRun: options.dryRun })) + "\n");
+ });
+
+program
+ .command("stop-node <id>")
+ .description(
+  "Operator verb: stop one exact active worker generation of a node. Prints one JSON result (state: stopped | already-stopped | stopping | unknown | superseded | not-active | refused); exits 0 only for stopped and already-stopped. `resume-node` restarts it",
+ )
+ .requiredOption("-m, --map <owner/name#root>", "registered map repo#root")
+ .requiredOption("--generation <n>", "the worker generation to stop, as recorded in the journal")
+ .option("--grace-ms <ms>", "how long to wait for a graceful exit before SIGKILL")
+ .option("-c, --config <path>", "path to ranger.yaml (fallback: $RANGER_CONFIG, then ~/.config/ranger/ranger.yaml)")
+ .action(async (id: string, options: { map: string; generation: string; graceMs?: string; config: string | undefined }) => {
+  const configPath = resolveConfigPath(options.config, process.env, process.cwd());
+  const { config, journal } = loadCtx(configPath);
+  try {
+   const result = await stopNode(
+    { config, journal, graceMs: options.graceMs === undefined ? undefined : Number(options.graceMs) },
+    { nodeId: id, map: options.map, generation: /^\d+$/.test(options.generation) ? Number(options.generation) : Number.NaN },
+   );
+   process.stdout.write(JSON.stringify(result) + "\n");
+   process.exitCode = result.ok ? 0 : 1;
+  } finally {
+   journal.close();
+  }
  });
 
 program

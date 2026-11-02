@@ -156,6 +156,11 @@ export async function startResumeNode(
    `node ${nodeId}'s run-node (pid ${row.pid}) is still ${row.status} — resume only a parked, failed or dead worker`,
   );
  }
+ if (row.status === "stop-requested" && (row.pid !== null || row.workerPgid !== null)) {
+  throw new Error(
+   `node ${nodeId}'s stop is not settled (supervisor pid ${row.pid ?? "none"}, worker group ${row.workerPgid ?? "none"}) — replay \`ranger stop-node ${nodeId} --map ${mapKey(map)} --generation ${row.generation}\` until it reports stopped`,
+  );
+ }
  const lane = implementLane(map);
  const takesLane = startsImplementSession(row);
  const holder = takesLane ? journal.laneHolder(lane, { nodeId, repo: map.repo }) : null;

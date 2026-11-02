@@ -75,6 +75,7 @@ Each tick posts escalation cards, then claims frontier nodes and starts their wo
 | `approve-node <id>` | Approves an `approve` node at the version its approval card shows. |
 | `build-now <id>` | Claims one walkable node and starts its worker now. |
 | `resume-node <id>` | Puts a parked or failed node back in motion. `--when-free` queues it for a free lane. |
+| `stop-node <id> --map <repo#root> --generation <n>` | Stops one exact active worker generation and prints one JSON result (`state`: `stopped`, `already-stopped`, `stopping`, `unknown`, `superseded`, `not-active` or `refused`). The row becomes `stop-requested`, so ticks, sweep and queued resumes leave it alone until `resume-node`. Exit 0 only for `stopped` and `already-stopped`. |
 | `resume-run` | Clears the dead-man pause. |
 | `drain` | Stops new claims on the visual lane or on one headless map. `--off` lifts it. |
 | `trust-git` | Lists changes to a canonical checkout's git config and hooks, and records a known-good state. |
