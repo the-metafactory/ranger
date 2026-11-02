@@ -496,6 +496,10 @@ export async function runNode(
   return { ...base, status: "refused", detail: `node #${nodeId} is proposed (comment ${row.proposalCommentId ?? "id unknown"}) — it waits for the principal's ratification` };
  }
 
+ if (row?.status === "stop-requested") {
+  return { ...base, status: "refused", detail: `node #${nodeId} was stopped by the operator — \`ranger resume-node\` restarts it` };
+ }
+
  // Take the node as a new occupant. A run-node with no claim row (an
  // operator's manual run) gets a running row first.
  if (row === null) {

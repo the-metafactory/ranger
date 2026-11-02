@@ -97,6 +97,8 @@ export async function sweepMap(ctx: SweepContext): Promise<SweepMapResult> {
   // tick. Only a row that HAD a supervisor is a crash candidate.
   if (worker.pid === null) continue;
   if (pidAlive(worker.pid)) continue; // genuinely in-flight
+  const current = journal.getWorker(worker.nodeId, repo);
+  if (current?.status !== "claimed" && current?.status !== "running") continue;
   result.crashed += 1;
   journal.recordEvent("sweep", {
    nodeId: worker.nodeId,

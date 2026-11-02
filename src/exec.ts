@@ -179,3 +179,43 @@ export function pidAlive(pid: number | null): boolean {
   return false;
  }
 }
+
+export type ProcessInspection =
+ | { kind: "gone" }
+ | { kind: "alive"; command: string }
+ | { kind: "unknown" };
+
+export async function inspectProcess(pid: number): Promise<ProcessInspection> {
+ if (pid <= 1) return { kind: "gone" };
+ let result: RunResult;
+ try {
+  result = await runCmd("ps", ["-p", String(pid), "-ww", "-o", "stat=,command="], { timeoutMs: 10_000 });
+ } catch {
+  return { kind: "unknown" };
+ }
+ const line = result.stdout.split("\n").find((l) => l.trim() !== "");
+ if (line === undefined) return result.code === 0 || result.code === 1 ? { kind: "gone" } : { kind: "unknown" };
+ const match = /^\s*(\S+)\s+(.*)$/.exec(line);
+ if (match === null) return { kind: "unknown" };
+ return match[1].startsWith("Z") ? { kind: "gone" } : { kind: "alive", command: match[2] };
+}
+
+export function signalProcess(pid: number, signal: NodeJS.Signals): boolean {
+ if (pid <= 1) return false;
+ try {
+  process.kill(pid, signal);
+  return true;
+ } catch {
+  return false;
+ }
+}
+
+export function signalProcessGroup(pgid: number, signal: NodeJS.Signals): boolean {
+ if (pgid <= 1) return false;
+ try {
+  process.kill(-pgid, signal);
+  return true;
+ } catch {
+  return false;
+ }
+}
