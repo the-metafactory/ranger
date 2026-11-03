@@ -78,9 +78,15 @@ export function gitAuthEnv(
  };
 }
 
-/** The env every supervisor git call runs with: enough to find git and the user's home, nothing else. */
+/**
+ * The env every supervisor git call runs with: enough to find git and the
+ * user's home, nothing else. No checkout downloads LFS objects: a clone or
+ * worktree of an LFS-heavy repo took longer than its limit doing so (seelite,
+ * 995 objects, ranger #460), and a worker that needs the content runs `git lfs
+ * pull` itself.
+ */
 function minimalGitEnv(): NodeJS.ProcessEnv {
- const env: NodeJS.ProcessEnv = { GIT_TERMINAL_PROMPT: "0" };
+ const env: NodeJS.ProcessEnv = { GIT_TERMINAL_PROMPT: "0", GIT_LFS_SKIP_SMUDGE: "1" };
  for (const key of ["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL"]) {
   const value = process.env[key];
   if (value !== undefined) env[key] = value;
