@@ -250,6 +250,16 @@ export async function bootstrapCanonical(
  * Add a worktree off origin/<base> (adopts an existing one on conflict).
  * `branch` overrides the `node/<N>-<slug>` default (a declared
  * `git-merged-into` probe names the branch the close checks).
+ *
+ * A branch missing locally can still exist on origin: an open PR's node
+ * branch after a fresh canonical clone, or one pushed after the clone. It
+ * starts at the remote head, not at the base, or the review phase reads the
+ * base's newer commits as unpushed work (#456). The one-branch fetch uses a
+ * glob refspec, which matches nothing without failing, so an absent branch is
+ * read from the refs, not from git's localized stderr; `--prune` drops a
+ * tracking ref whose branch origin has deleted, and the glob's prefix matches
+ * only add tracking refs. A fetch failure throws: falling back to the base on
+ * a network error would recreate #456.
  */
 export async function bootstrapWorktree(
  canonical: string,
@@ -277,11 +287,6 @@ export async function bootstrapWorktree(
  // `branch.autoSetupRebase=always` adds a `rebase` line to it, a probe-named
  // branch none at all. `--no-track` also overrides `branch.autoSetupMerge`.
  // Ranger's git calls name their refs and never use the upstream.
- /* A branch missing locally can still exist on origin: an open PR's node
-  branch after a fresh canonical clone, or one pushed after the clone. It
-  starts at the remote head, not at the base, or the review phase reads the
-  base's newer commits as unpushed work:
-  https://github.com/the-metafactory/ranger/issues/456 */
  const args =
   existing.code === 0
    ? ["worktree", "add", dir, branch]
@@ -305,16 +310,6 @@ export async function bootstrapWorktree(
  return dir;
 }
 
-/**
- * Fetch `branch` from origin into `refs/remotes/origin/<branch>` and return
- * that ref, or null when origin has no such branch. The refspec is a glob,
- * which matches nothing without failing, so an absent branch is read from the
- * refs, not from git's localized stderr; `--prune` drops a tracking ref whose
- * branch origin has deleted. The glob also takes branches the name prefixes,
- * which only adds tracking refs. Any other failure throws: falling back to
- * the base on a network error would recreate
- * https://github.com/the-metafactory/ranger/issues/456.
- */
 async function fetchRemoteBranch(
  canonical: string,
  branch: string,
