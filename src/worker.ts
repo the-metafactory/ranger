@@ -266,6 +266,16 @@ export const CANONICAL_CLONE_TIMEOUT_MS = 600_000;
  * Add a worktree off origin/<base> (adopts an existing one on conflict).
  * `branch` overrides the `node/<N>-<slug>` default (a declared
  * `git-merged-into` probe names the branch the close checks).
+ *
+ * A branch missing locally can still exist on origin: an open PR's node
+ * branch after a fresh canonical clone, or one pushed after the clone. It
+ * starts at the remote head, not at the base, or the review phase reads the
+ * base's newer commits as unpushed work (#456). The one-branch fetch uses a
+ * glob refspec, which matches nothing without failing, so an absent branch is
+ * read from the refs, not from git's localized stderr; `--prune` drops a
+ * tracking ref whose branch origin has deleted, and the glob's prefix matches
+ * only add tracking refs. A fetch failure throws: falling back to the base on
+ * a network error would recreate #456.
  */
 export async function bootstrapWorktree(
  canonical: string,
@@ -296,7 +306,10 @@ export async function bootstrapWorktree(
  const args =
   existing.code === 0
    ? ["worktree", "add", dir, branch]
-   : ["worktree", "add", "--no-track", dir, "-b", branch, `origin/${base}`];
+   : [
+      "worktree", "add", "--no-track", dir, "-b", branch,
+      (await fetchRemoteBranch(canonical, branch, credential)) ?? `origin/${base}`,
+     ];
  // worktree add fires post-checkout; safeGit keeps a planted hook from
  // running with the supervisor's credentials.
  const timeoutMs = 60_000;
@@ -312,6 +325,26 @@ export async function bootstrapWorktree(
   );
  }
  return dir;
+}
+
+async function fetchRemoteBranch(
+ canonical: string,
+ branch: string,
+ credential: GitCredential,
+): Promise<string | null> {
+ const remoteRef = `refs/remotes/origin/${branch}`;
+ const fetched = await safeGit(
+  ["fetch", "--prune", "origin", `+refs/heads/${branch}*:${remoteRef}*`],
+  { cwd: canonical, credential, canonical, timeoutMs: 120_000 },
+ );
+ if (fetched.code !== 0) {
+  throw new Error(`cannot fetch origin's ${branch} (exit ${fetched.code}): ${fetched.stderr.trim()}`);
+ }
+ const present = await safeGit(
+  ["show-ref", "--verify", "--quiet", remoteRef],
+  { cwd: canonical, timeoutMs: 10_000 },
+ );
+ return present.code === 0 ? remoteRef : null;
 }
 
 function defaultWorkerCommand(): string[] {
