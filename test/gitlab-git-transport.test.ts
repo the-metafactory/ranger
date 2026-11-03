@@ -187,6 +187,18 @@ describe("a GitLab map's canonical checkout against a local bare repo", () => {
   rmSync(dir, { recursive: true, force: true });
  });
 
+ test("clone creates a missing owner directory first (#455)", async () => {
+  const canonical = join(dir, "repos", "claw", "crisis-simulator");
+  expect(existsSync(join(dir, "repos"))).toBeFalse();
+  expect(await bootstrapCanonical(canonical, repo, gitCredential(repo, sentinel))).toBeTrue();
+  expect(existsSync(join(canonical, ".git"))).toBeTrue();
+ });
+
+ test("a spawn in a missing directory names the directory (#455)", async () => {
+  const missing = join(dir, "nowhere");
+  await expect(runCmd("git", ["--version"], { cwd: missing })).rejects.toThrow(missing);
+ });
+
  test("clone, fetch and push leave no credential in .git/config or the worktree", async () => {
   const canonical = join(dir, "canonical");
   const credential = gitCredential(repo, sentinel);

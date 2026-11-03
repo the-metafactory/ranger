@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 
 export interface RunResult {
   code: number;
@@ -124,7 +125,8 @@ export function runCmd(
           }, opts.timeoutMs);
     child.on("error", (error) => {
       if (timer) clearTimeout(timer);
-      reject(new Error(`failed to spawn ${bin}: ${error.message}`));
+      const missingCwd = opts.cwd !== undefined && !existsSync(opts.cwd) ? ` (cwd ${opts.cwd} does not exist)` : "";
+      reject(new Error(`failed to spawn ${bin}${missingCwd}: ${error.message}`));
     });
     child.on("close", (code) => {
       if (timer) clearTimeout(timer);

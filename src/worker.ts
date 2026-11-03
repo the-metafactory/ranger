@@ -3,7 +3,7 @@ import { fileStemFor, parseForgeRef, qualifiedRepo } from "./forge-ref.ts";
 import { graphReadToken, laneCredentialRefusal, lanePort, type ReadGate } from "./forge-lanes.ts";
 import { branchUrl, changeRequestLabel, ciRunNoun, nodeCommentUrl } from "./forge-text.ts";
 import { mapKey } from "./maps.ts";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
@@ -234,6 +234,7 @@ export async function bootstrapCanonical(
   return false;
  }
  const parent = resolve(dir, "..");
+ mkdirSync(parent, { recursive: true });
  const result = await safeGit(
   ["clone", cloneUrl(forge), dir],
   { cwd: parent, credential, timeoutMs: 120_000 },
