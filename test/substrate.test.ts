@@ -723,12 +723,16 @@ describe("workerCommandFor", () => {
   expect(cmd).toEqual(["claude", "-p", "--model", "claude-sonnet-5-5", "--output-format", "stream-json", "--verbose"]);
  });
 
- test("codex: a writable workspace sandbox, plus the common git dir a worktree commits into", () => {
+ test("codex: a writable workspace sandbox, an explicit auto-reviewed approval mode (#457), plus the common git dir a worktree commits into", () => {
   expect(workerCommandFor("codex", config)).toEqual([
    "codex",
    "exec",
    "--sandbox",
    "workspace-write",
+   "-c",
+   'approval_policy="on-request"',
+   "-c",
+   'approvals_reviewer="auto_review"',
    "--model",
    "gpt-6.1-sol",
    "-c",
@@ -739,6 +743,10 @@ describe("workerCommandFor", () => {
    "exec",
    "--sandbox",
    "workspace-write",
+   "-c",
+   'approval_policy="on-request"',
+   "-c",
+   'approvals_reviewer="auto_review"',
    "--add-dir",
    "/c/acme/widgets/.git",
    "--model",
@@ -781,6 +789,10 @@ describe("workerCommandFor", () => {
    "exec",
    "--sandbox",
    "workspace-write",
+   "-c",
+   'approval_policy="on-request"',
+   "-c",
+   'approvals_reviewer="auto_review"',
    "--add-dir",
    "/c/.git",
    "--model",
