@@ -855,6 +855,56 @@ describe("bootstrapWorktree — orphaned branch (node #19 live finding)", () => 
  });
 });
 
+describe("bootstrapWorktree — node branch only on the remote (#456)", () => {
+ const git = async (args: string[], cwd: string) => {
+  const result = await runCmd("git", args, { cwd, env: { ...process.env, ...GIT_ENV } });
+  if (result.code !== 0) throw new Error(`git ${args.join(" ")}: ${result.stderr}`);
+  return result.stdout.trim();
+ };
+
+ async function pushNodeBranchFromAnotherClone(dir: string, origin: string): Promise<string> {
+  const other = join(dir, "other");
+  await git(["clone", origin, other], dir);
+  await git(["checkout", "-b", "node/10-test-node"], other);
+  writeFileSync(join(other, "work.txt"), "node work\n");
+  await git(["add", "-A"], other);
+  await git(["commit", "-m", "node work"], other);
+  await git(["push", "origin", "node/10-test-node"], other);
+  return git(["rev-parse", "HEAD"], other);
+ }
+
+ async function expectUntrackedWorktreeAtRemoteHead(canonical: string, head: string): Promise<void> {
+  const worktree = await bootstrapWorktree(canonical, "10", "test-node", gitCredential("acme/widgets", "ghp_write"));
+  expect(await git(["rev-parse", "HEAD"], worktree)).toBe(head);
+  expect(await git(["branch", "--show-current"], worktree)).toBe("node/10-test-node");
+  expect(await git(["config", "--list", "--local"], canonical)).not.toContain("branch.node/");
+ }
+
+ test("a fresh clone starts the worktree at the remote branch head, not at main", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ranger-wt-remote-"));
+  try {
+   const { origin } = await createCanonicalRepo(dir);
+   const head = await pushNodeBranchFromAnotherClone(dir, origin);
+   const fresh = join(dir, "fresh");
+   await git(["clone", origin, fresh], dir);
+   await expectUntrackedWorktreeAtRemoteHead(fresh, head);
+  } finally {
+   rmSync(dir, { recursive: true, force: true });
+  }
+ });
+
+ test("a canonical cloned before the push fetches the branch and starts at its head", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ranger-wt-remote-"));
+  try {
+   const { origin, canonical } = await createCanonicalRepo(dir);
+   const head = await pushNodeBranchFromAnotherClone(dir, origin);
+   await expectUntrackedWorktreeAtRemoteHead(canonical, head);
+  } finally {
+   rmSync(dir, { recursive: true, force: true });
+  }
+ });
+});
+
 /**
  * #37: `ranger serve` names `planTick(...).take[0]` as the next job, so the
  * real walk must claim exactly `take` — checked by running it, not by reading
