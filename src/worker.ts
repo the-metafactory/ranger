@@ -3,15 +3,15 @@ import { fileStemFor, parseForgeRef, qualifiedRepo } from "./forge-ref.ts";
 import { graphReadToken, laneCredentialRefusal, lanePort, type ReadGate } from "./forge-lanes.ts";
 import { branchUrl, changeRequestLabel, ciRunNoun, nodeCommentUrl } from "./forge-text.ts";
 import { mapKey } from "./maps.ts";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { basename, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import { expandHome, principalLoginForRepo } from "./config.ts";
 import { principalFiled } from "./approval-spec.ts";
 import { DiscordAnnouncer } from "./announce.ts";
 import { renderCard } from "./card-render.ts";
-import { runCmd, type RunOptions } from "./exec.ts";
+import { exitText, runCmd, type RunOptions } from "./exec.ts";
 import {
  cloneUrl,
  fastForwardCanonical,
@@ -219,12 +219,16 @@ export function slugify(title: string): string {
 /**
  * Ensure the canonical checkout exists (clone on first use; true when it
  * cloned). Read-only ops only. The clone URL is the map's forge host, and the
- * credential must be the map's own (node #127).
+ * credential must be the map's own (node #127). The clone lands in a
+ * temporary sibling and is renamed into place only once it succeeded, so a
+ * clone that fails or is killed leaves no `.git` a later run would trust
+ * (node #460).
  */
 export async function bootstrapCanonical(
  dir: string,
  repo: string,
  credential: GitCredential,
+ opts: { cloneTimeoutMs?: number } = {},
 ): Promise<boolean> {
  const forge = parseForgeRef(repo);
  if (credential === undefined || credential.token.trim().length === 0 || qualifiedRepo(credential.forge) !== qualifiedRepo(forge)) {
@@ -234,17 +238,29 @@ export async function bootstrapCanonical(
   return false;
  }
  const parent = resolve(dir, "..");
- const result = await safeGit(
-  ["clone", cloneUrl(forge), dir],
-  { cwd: parent, credential, timeoutMs: 120_000 },
- );
- if (result.code !== 0) {
-  throw new Error(
-   `cannot bootstrap canonical checkout ${dir} (git clone, exit ${result.code}): ${result.stderr.trim()}`,
-  );
+ mkdirSync(parent, { recursive: true });
+ const partial = mkdtempSync(join(parent, `.${basename(dir)}.cloning-`));
+ const timeoutMs = opts.cloneTimeoutMs ?? CANONICAL_CLONE_TIMEOUT_MS;
+ try {
+  const result = await safeGit(["clone", cloneUrl(forge), partial], { cwd: parent, credential, timeoutMs });
+  if (result.code !== 0) {
+   throw new Error(
+    `cannot bootstrap canonical checkout ${dir} (git clone, ${exitText(result, timeoutMs)}): ${result.stderr.trim()}`,
+   );
+  }
+  renameSync(partial, dir);
+ } finally {
+  rmSync(partial, { recursive: true, force: true });
  }
  return true;
 }
+
+/**
+ * A canonical clone fetches history only (LFS objects stay on the remote):
+ * seelite's pack is 601 MiB, 77 s at the 7.8 MiB/s its killed first clone saw,
+ * too close to the 120 s that clone had.
+ */
+export const CANONICAL_CLONE_TIMEOUT_MS = 600_000;
 
 /**
  * Add a worktree off origin/<base> (adopts an existing one on conflict).
@@ -296,15 +312,16 @@ export async function bootstrapWorktree(
      ];
  // worktree add fires post-checkout; safeGit keeps a planted hook from
  // running with the supervisor's credentials.
+ const timeoutMs = 60_000;
  const result = await safeGit(args, {
   cwd: canonical,
   credential,
   canonical,
-  timeoutMs: 60_000,
+  timeoutMs,
  });
  if (result.code !== 0) {
   throw new Error(
-   `cannot add worktree for node ${nodeId} (exit ${result.code}): ${result.stderr.trim()}`,
+   `cannot add worktree for node ${nodeId} (${exitText(result, timeoutMs)}): ${result.stderr.trim()}`,
   );
  }
  return dir;

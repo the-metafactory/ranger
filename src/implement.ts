@@ -3716,10 +3716,8 @@ async function freshCheckoutTests(
   if (base.code !== 0 || copied.stdout.trim() !== tip) {
    return failed(`could not copy ${baseRef} at ${tip.slice(0, 8)} into the checkout ${forRun}: ${base.stderr.trim() || copied.stderr.trim() || "the ref did not resolve"}`);
   }
-  const canonicalLfsStore = await git(["rev-parse", "--path-format=absolute", "--git-common-dir"], ctx.canonical, 10_000);
-  if (canonicalLfsStore.code !== 0) return failed(`could not find the canonical's git dir ${forRun}: ${canonicalLfsStore.stderr.trim()}`);
   const checkout = await git(
-   ["-c", "advice.detachedHead=false", "-c", `lfs.url=file://${canonicalLfsStore.stdout.trim()}`, "checkout", "--quiet", "--detach", sha],
+   ["-c", "advice.detachedHead=false", "checkout", "--quiet", "--detach", sha],
    dir,
    120_000,
   );
