@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 
 export interface RunResult {
   code: number;
@@ -124,7 +125,8 @@ export function runCmd(
           }, opts.timeoutMs);
     child.on("error", (error) => {
       if (timer) clearTimeout(timer);
-      reject(new Error(`failed to spawn ${bin}: ${error.message}`));
+      const where = opts.cwd !== undefined && !existsSync(opts.cwd) ? ` (its working directory ${opts.cwd} does not exist)` : "";
+      reject(new Error(`failed to spawn ${bin}${where}: ${error.message}`));
     });
     child.on("close", (code) => {
       if (timer) clearTimeout(timer);
@@ -218,4 +220,9 @@ export function signalProcessGroup(pgid: number, signal: NodeJS.Signals): boolea
  } catch {
   return false;
  }
+}
+
+/** How a command ended, for an error message: its exit code, or the limit it ran past. */
+export function exitText(result: RunResult, timeoutMs: number): string {
+ return result.timedOut === true ? `timed out after ${timeoutMs / 1000} s` : `exit ${result.code}`;
 }
