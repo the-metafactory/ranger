@@ -467,8 +467,14 @@ export function describeWorkerModel(model: WorkerModel): string {
  * src/substrate/{claude,pi}.ts). Codex does not: sage only reviews, and a bare
  * `codex exec` runs in Codex's read-only sandbox, where a build session cannot
  * write. A worker gets `--sandbox workspace-write` (its cwd, the worktree) plus
- * the canonical clone's `.git` via `--add-dir`, because a worktree commits
- * into the common git dir, which lies outside the worktree. Its model and
+ * the canonical clone's `.git` via `--add-dir`. `--add-dir` adds a writable
+ * root, but Codex's seatbelt still denies every write under a `.git` path, so
+ * it never lets a worktree commit into the common git dir. Ranger therefore
+ * sets the approval mode itself: `approval_policy="on-request"` with
+ * `approvals_reviewer="auto_review"` reruns a blocked command, such as the
+ * commit, outside the sandbox after an automatic review. Without it a worker
+ * commits only where the principal's ~/.codex/config.toml happens to set the
+ * same (#457). Its model and
  * reasoning effort come from ranger's config (node #60), never the
  * principal's own Codex defaults; the config schema admits only plain names
  * and the effort enum, so the `-c` override stays a literal TOML string.
@@ -487,6 +493,10 @@ export function workerCommandFor(
     "exec",
     "--sandbox",
     "workspace-write",
+    "-c",
+    'approval_policy="on-request"',
+    "-c",
+    'approvals_reviewer="auto_review"',
     ...(opts.writableGitDir !== undefined ? ["--add-dir", opts.writableGitDir] : []),
     "--model",
     config.substrates.codex.model,
