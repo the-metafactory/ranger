@@ -930,14 +930,11 @@
     }
   },
   "src/sweep.ts": {
-    "@typescript-eslint/no-unnecessary-condition": {
-      "count": 1
-    },
     "@typescript-eslint/non-nullable-type-assertion-style": {
       "count": 1
     },
     "ranger/no-comments": {
-      "count": 15
+      "count": 9
     }
   },
   "src/token-gate.ts": {

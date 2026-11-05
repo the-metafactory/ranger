@@ -1,5 +1,4 @@
-import { pidAlive } from "./exec.ts";
-import { reservationPending } from "./node-ownership.ts";
+import { acquireGeneration } from "./node-ownership.ts";
 import type { RunOutcome } from "@the-metafactory/myelin";
 import { fileStemFor, parseForgeRef, qualifiedRepo } from "./forge-ref.ts";
 import { graphReadToken, laneCredentialRefusal, lanePort, type ReadGate } from "./forge-lanes.ts";
@@ -561,21 +560,7 @@ export async function runNode(
  }
  let generation: number;
  try {
-  if (ctx.generation !== undefined) {
-   generation = ctx.generation;
-   journal.adoptReservation(nodeId, repo, generation, process.pid);
-  } else {
-   const candidate = journal.getWorker(nodeId, repo);
-   if (candidate === null) throw new FencedError(`node ${nodeId} has no reservation row`);
-   if (reservationPending(candidate) || ((candidate.status === "running" || candidate.status === "claimed") && pidAlive(candidate.pid))) {
-    throw new FencedError(`node ${nodeId} already has a live owner or pending reservation`);
-   }
-   const reserved = journal.reserveWorker(candidate);
-   if (reserved === null) throw new FencedError(`node ${nodeId} ownership changed before start`);
-   generation = reserved;
-   ctx.onGenerationBegun?.(generation);
-   journal.adoptReservation(nodeId, repo, generation, process.pid);
-  }
+  generation = acquireGeneration(journal, nodeId, repo, ctx.generation, ctx.onGenerationBegun);
  } catch (error) {
   if (!(error instanceof FencedError)) throw error;
   journal.recordEvent("fenced", { nodeId, repo, detail: error.message });
@@ -583,7 +568,6 @@ export async function runNode(
  }
  journal = journal.forWorker(nodeId, repo, generation);
  ctx = { ...ctx, journal };
- if (ctx.generation !== undefined) ctx.onGenerationBegun?.(generation);
 
  try {
   // A GitLab map's graph reads run under its read gate (node #122).

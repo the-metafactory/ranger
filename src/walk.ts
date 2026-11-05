@@ -1,4 +1,4 @@
-import { startOwnedWorker } from "./node-ownership.ts";
+import { startOwnedWorker, FRESH_START_FAILURE, startFailureOutcome } from "./node-ownership.ts";
 import { implementLane, type ImplementLane } from "./lanes.ts";
 import { processResumeQueue } from "./resume.ts";
 import { busyLoadFor, hostBusy, type HostLoad } from "./host-load.ts";
@@ -139,6 +139,9 @@ export async function claimNode(args: ClaimNodeArgs): Promise<ClaimNodeOutcome> 
  const owned = args.owned ?? (() => {});
  owned();
  const previous = journal.getWorker(node.id, map.repo);
+ const startHold = journal.listWorkers(map.repo, map.root).find(row => row.status === "parked" && row.outcome?.includes(FRESH_START_FAILURE));
+ if (startHold !== undefined) return { claimed: false, messageId: null,
+  error: `map ${mapKey(map)} fresh claims held after worker start failure on #${startHold.nodeId}; resume or release that node before claiming more work` };
  const refusal = freshClaimRefusal(map, node.id, previous);
  if (refusal !== null) return { claimed: false, messageId: null, error: refusal };
  let messageId: string | null = null;
@@ -172,9 +175,17 @@ export async function claimNode(args: ClaimNodeArgs): Promise<ClaimNodeOutcome> 
  owned();
  const reservation = recordFreshClaim(args, messageId, now(), previous);
  if (reservation === null) return { claimed: false, messageId, error: `#${node.id} ownership changed during claim; skipped` };
- const claim = await (args.claim ?? graphClaim)(map.repo, node.id, botIdentity, token, {
-  timeoutMs: GRAPH_CALL_TIMEOUT_MS,
- });
+ let claim: ClaimResult;
+ try {
+  claim = await (args.claim ?? graphClaim)(map.repo, node.id, botIdentity, token, { timeoutMs: GRAPH_CALL_TIMEOUT_MS });
+ } catch (error) {
+  journal.updateReservation(node.id, map.repo, reservation.generation, {
+   status: "parked", outcome: startFailureOutcome(reservation.row.outcome,
+    `graph claim result unknown (${String(error)}); verify the claim, then resume or release node ${node.id}`, true),
+  });
+  throw error;
+ }
+
  if (!claim.held) {
   journal.updateReservation(node.id, map.repo, reservation.generation, { status: "released", outcome: `claim held by ${claim.holder ?? "another session"}` });
   return {
@@ -188,7 +199,7 @@ export async function claimNode(args: ClaimNodeArgs): Promise<ClaimNodeOutcome> 
  journal.assertGeneration(node.id, map.repo, reservation.generation, "spawn claimed worker");
  journal.recordSpawn(now());
  if (args.lane === "implement") recordImplementStart(journal, map);
- const pid = await startOwnedWorker({ journal, row: reservation.row, generation: reservation.generation, now: now(),
+ const pid = await startOwnedWorker({ journal, row: reservation.row, generation: reservation.generation, now: now(), freshClaim: true,
   spawn: generation => (args.spawnRunNode ?? spawnRunNodeDetached)({
   generation,
   nodeId: node.id,
@@ -308,9 +319,10 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
    github: portFor(w.map.repo),
    phase,
    reservedLanes: priorityLanes,
-   respawn: (nodeId, repo, root, generation) =>
-    (ctx.spawnRunNode ?? spawnRunNodeDetached)({ nodeId, repo, root, generation, cliEntry, configPath: ctx.configPath }),
+   respawn: spawnNode,
   });
+ const spawnNode = (nodeId: string, repo: string, root: number, generation: number) =>
+  (ctx.spawnRunNode ?? spawnRunNodeDetached)({ nodeId, repo, root, generation, cliEntry, configPath: ctx.configPath });
  const maps: WalkMapResult[] = [];
  const mapResults = new Map<RangerMapConfig, WalkMapResult>();
  const walked: { map: (typeof order)[number]; mapResult: WalkMapResult; token: string; botIdentity: string; graphToken: ResolvedToken; errors: string[] }[] = [];
@@ -386,9 +398,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
  try {
   result.probeRequeues = await withClaimLock(journal, (owned) => requeueProbes({
    journal, maps: retryMaps, limit: config.workers.probeRequeues, owned,
-   spawn: (nodeId, repo, root, generation) => (ctx.spawnRunNode ?? spawnRunNodeDetached)({
-    nodeId, repo, root, generation, cliEntry, configPath: ctx.configPath,
-   }),
+   spawn: spawnNode,
   }));
   priorityLanes.clear();
   for (const lane of result.probeRequeues.lanes) priorityLanes.add(lane);
@@ -415,8 +425,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
    journal,
    maps: walked.map(({ map, token, botIdentity }) => ({ map, token, botIdentity })),
    portFor: targetFor,
-   spawn: (nodeId, repo, root, generation) =>
-    (ctx.spawnRunNode ?? spawnRunNodeDetached)({ nodeId, repo, root, generation, cliEntry, configPath: ctx.configPath }),
+   spawn: spawnNode,
    refuseCard: (map, veto) => refuseProposalCard({ config, journal, map, veto }),
    ...(ctx.now === undefined ? {} : { now: ctx.now }),
   });

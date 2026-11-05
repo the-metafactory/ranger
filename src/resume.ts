@@ -174,8 +174,9 @@ export async function startResumeNode(
  const spawner = ctx.spawnRunNode ?? spawnRunNodeDetached;
  let spawnError: Error | undefined;
  const pid = await startOwnedWorker({ journal, row, now,
+  onSpawnFailure: error => { spawnError = error; },
   spawn: generation => spawner({ nodeId, repo: map.repo, root: map.root, generation,
-   cliEntry: join(import.meta.dir, "cli.ts"), configPath: ctx.configPath }).catch((error: unknown) => { spawnError = error instanceof Error ? error : new Error(String(error)); throw spawnError; }),
+   cliEntry: join(import.meta.dir, "cli.ts"), configPath: ctx.configPath }),
  });
  owned();
  if (pid === null) throw spawnError ?? new Error("run-node spawn returned no PID or ownership was taken");

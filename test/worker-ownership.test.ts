@@ -1,4 +1,6 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import * as exec from "../src/exec.ts";
+import { claimNode } from "../src/walk.ts";
+import { afterEach, beforeEach, expect, test, spyOn } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { fixturesBin } from "./support.ts";
 import { tmpdir } from "node:os";
@@ -6,7 +8,7 @@ import { join } from "node:path";
 import { stringify } from "yaml";
 import { loadConfig, type RangerConfig } from "../src/config.ts";
 import { FencedError, Journal, type WorkerRow } from "../src/journal.ts";
-import { startOwnedWorker } from "../src/node-ownership.ts";
+import { startOwnedWorker, startFailureOutcome, FRESH_START_FAILURE } from "../src/node-ownership.ts";
 import { runMergeDesk } from "../src/merge-desk.ts";
 import { realGitHub } from "../src/implement.ts";
 import { sweepMap } from "../src/sweep.ts";
@@ -180,4 +182,62 @@ test("a delayed desk failure cannot park a newly resumed generation", async () =
  await pass;
  expect(row()).toMatchObject({ generation: 1, status: "claimed", pid: process.pid, outcome: null });
  expect(a.listNodeEvents(repo, "10").some(event => event.kind === "fenced")).toBe(true);
+});
+
+test("orphan cleanup precedes a lane wait and preserves the unspent recovery attempt", async () => {
+ a.updateWorker("10", repo, { status: "running", pid: 2_147_483_647, phase: "implement", lane: "implement", workerPgid: 1234, worktree: "/tmp/node-10" });
+ const read = spyOn(exec, "processGroupCommands").mockResolvedValue(["worker /tmp/node-10"]);
+ const kill = spyOn(exec, "killProcessGroup").mockReturnValue(true);
+ try {
+  const result = await sweepMap({ config, journal: a, map: config.maps[0], token: "unused", botIdentity: "bot",
+   phase: "liveness", reservedLanes: new Set(["headless"]), respawn: async () => { throw new Error("lane held"); } });
+  expect(result.orphansKilled).toEqual(["10"]);
+  expect(kill).toHaveBeenCalledWith(1234);
+  expect(row()).toMatchObject({ status: "running", pid: 2_147_483_647, workerPgid: null, attempts: 0 });
+ } finally { read.mockRestore(); kill.mockRestore(); }
+});
+
+test("start-failure suffix is bounded, deduplicated and preserves infrastructure evidence", () => {
+ const evidence = "probe failure class: infrastructure\nprobe failure head: " + "a".repeat(40);
+ let outcome: string | null = evidence;
+ for (let n = 0; n < 100; n++) outcome = startFailureOutcome(outcome, `failure ${n} ${"x".repeat(1000)}`);
+ expect(outcome).toStartWith(evidence);
+ expect(outcome.length).toBeLessThan(evidence.length + 430);
+ expect(outcome.split("[worker-start]")).toHaveLength(2);
+});
+
+const freshClaim = (id: string, spawn: () => Promise<number | null>, claim?: () => Promise<never>) => claimNode({
+ journal: a, map: config.maps[0], node: { id, title: "Feature" }, lane: "implement", botIdentity: "ivy-bot", token: "unused",
+ cliEntry: "/tmp/ranger/cli.ts", configPath, announce: async () => ({ messageId: "message" }),
+ claim: claim ?? (async () => ({ repo, node: id, held: true, assignees: ["ivy-bot"] })), spawnRunNode: spawn,
+});
+
+test("throwing graph claim parks unknown remote ownership and holds fresh claims without spending spawn budget", async () => {
+ await expect(freshClaim("20", async () => 123, async () => { throw new Error("claim endpoint unavailable"); })).rejects.toThrow("claim endpoint unavailable");
+ expect(a.getWorker("20", repo)).toMatchObject({ status: "parked", outcome: expect.stringContaining("graph claim result unknown") });
+ expect(a.spawnsToday()).toBe(0);
+ expect(await freshClaim("21", async () => 123)).toMatchObject({ claimed: false, error: expect.stringContaining("fresh claims held") });
+});
+
+for (const resolution of ["resume", "release", "external-close"] as const) test(`failed fresh spawn holds further claims until ${resolution}`, async () => {
+ expect(await freshClaim("20", async () => null)).toMatchObject({ claimed: true, pid: null });
+ expect(a.getWorker("20", repo)?.outcome).toContain(FRESH_START_FAILURE);
+ let spawns = 0;
+ for (let n = 0; n < 3; n++) expect(await freshClaim("21", async () => { spawns++; return 123; })).toMatchObject({ claimed: false, error: expect.stringContaining("fresh claims held") });
+ expect(spawns).toBe(0);
+ expect(a.getWorker("21", repo)).toBeNull();
+ if (resolution === "resume") {
+  await startResumeNode("20", config.maps[0], { config, configPath, journal: b, spawnRunNode: async () => process.pid }, () => {});
+ } else a.updateWorker("20", repo, { status: resolution === "release" ? "released" : "success" });
+ expect(await freshClaim("21", async () => 123)).toMatchObject({ claimed: true, pid: 123 });
+});
+
+test("abandoned reservation preserves its original probe evidence", async () => {
+ const evidence = "probe failure class: infrastructure\nprobe failure head: " + "a".repeat(40);
+ a.updateWorker("10", repo, { outcome: evidence });
+ a.reserveWorker(row(), {}, new Date(0));
+ await sweepMap({ config, journal: a, map: config.maps[0], token: "unused", botIdentity: "bot", phase: "liveness" });
+ expect(row().outcome).toStartWith(evidence);
+ expect(row().outcome).toContain("abandoned worker reservation");
+ expect(await freshClaim("21", async () => 123)).toMatchObject({ claimed: false, error: expect.stringContaining("fresh claims held") });
 });

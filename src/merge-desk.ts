@@ -19,7 +19,7 @@ import {
  supersededNote,
  workerFixableCi,
 } from "./implement.ts";
-import type { Journal, WorkerRow } from "./journal.ts";
+import type { Journal, WorkerRow, WorkerPatch } from "./journal.ts";
 import { evaluateMergeGate, type MergeGateInput, type MergeGateResult } from "./merge-gate.ts";
 import type { IssueComment, ChangeRequest, CiVerdict, ForgePort, MergeOutcome, RebaseOutcome } from "./forge.ts";
 import { parseForgeRef } from "./forge-ref.ts";
@@ -342,8 +342,17 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
  }
  return result;
 
+ function writeOwned(row: WorkerRow, patch: WorkerPatch): void {
+  journal.forWorker(row.nodeId, repo, row.generation).updateWorker(row.nodeId, repo, patch);
+ }
+
+ function startDeskWorker(row: WorkerRow, patch: WorkerPatch): Promise<number | null> {
+  return startOwnedWorker({ journal, row, status: "running", patch,
+   spawn: generation => ctx.spawn?.(row.nodeId, repo, row.root, generation) ?? Promise.resolve(null) });
+ }
+
  async function park(row: WorkerRow, detail: string, title: string): Promise<void> {
-  journal.forWorker(row.nodeId, repo, row.generation).updateWorker(row.nodeId, repo, {
+  writeOwned(row, {
    status: "parked",
    finishedAt: new Date().toISOString(),
    outcome: detail.slice(0, 400),
@@ -393,7 +402,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
     result.errors.push(`#${row.nodeId}: could not post the card withdrawal — retrying next tick`);
     return;
    }
-   journal.forWorker(row.nodeId, repo, row.generation).updateWorker(row.nodeId, repo, { mergeMessageId: null });
+   writeOwned(row, { mergeMessageId: null });
   }
   // A send-back starts a worker session (a fix, CI fix or base merge pass, or
   // probes): it waits for the implement lane like any other start. The stale
@@ -409,8 +418,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    });
    return;
   }
-  const pid = await startOwnedWorker({ journal, row, status: "running", patch: { phase: "review", outcome: null },
-   spawn: generation => ctx.spawn?.(row.nodeId, repo, row.root, generation) ?? Promise.resolve(null) });
+  const pid = await startDeskWorker(row, { phase: "review", outcome: null });
   if (pid === null) {
    result.errors.push(`#${row.nodeId}: ${why}, but run-node did not spawn — retrying next tick`);
    return;
@@ -628,8 +636,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    if (now === null || !watchedByMergeDesk(now)) return;
    // The resume-for-close: no LLM session, so it neither counts an attempt
    // nor touches the dead-man counter.
-   const pid = await startOwnedWorker({ journal, row: now, status: "running", patch: { phase: "close" },
-    spawn: generation => ctx.spawn?.(row.nodeId, repo, row.root, generation) ?? Promise.resolve(null) });
+   const pid = await startDeskWorker(now, { phase: "close" });
    if (pid === null) {
     result.errors.push(`#${row.nodeId}: merged, but the close run-node did not spawn — retrying next tick`);
     return;
@@ -737,7 +744,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   }
   if (ciPark) {
    if (needsEye) return;
-   journal.forWorker(row.nodeId, repo, row.generation).updateWorker(row.nodeId, repo, { status: "awaiting-merge", finishedAt: null, outcome: null });
+   writeOwned(row, { status: "awaiting-merge", finishedAt: null, outcome: null });
    journal.recordEvent("sweep", {
     nodeId: row.nodeId,
     repo,
@@ -781,8 +788,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
     /* the merged PR and the event are the record */
    }
    if (ctx.spawn !== undefined) {
-    const pid = await startOwnedWorker({ journal, row: ciPark ? { ...row, status: "awaiting-merge" } : row, status: "running", patch: { phase: "close" },
-     spawn: generation => ctx.spawn?.(row.nodeId, repo, row.root, generation) ?? Promise.resolve(null) });
+    const pid = await startDeskWorker(ciPark ? { ...row, status: "awaiting-merge" } : row, { phase: "close" });
     if (pid !== null) {
 
      result.resumed.push(row.nodeId);
@@ -839,7 +845,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
     label,
    );
   }
-  journal.forWorker(row.nodeId, repo, row.generation).updateWorker(row.nodeId, repo, { mergeMessageId: messageId });
+  writeOwned(row, { mergeMessageId: messageId });
   journal.recordEvent("merge-card", { nodeId: row.nodeId, repo, detail: `${cr}, message ${messageId}${superseded !== null ? `; ${superseded}` : ""}${settled !== null ? `; ${settled}` : ""}${rebaseHold !== null ? `; ${rebaseHold}` : ""}` });
   result.cards.push(row.nodeId);
  }

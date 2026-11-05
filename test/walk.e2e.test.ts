@@ -1011,7 +1011,7 @@ describe("ranger walk — GitHub budget deferral (src/budget.ts)", () => {
  * from any other claim failure — so the walk records it against that node
  * and goes on to the next candidate in the same tick.
  */
-describe("ranger walk — a failed claim skips its own node (node #163)", () => {
+describe("ranger walk — known claim races skip and unknown claims hold the map", () => {
  const second = (entry: Record<string, any>) => ({
   ...entry,
   ref: { id: "20" },
@@ -1056,17 +1056,18 @@ describe("ranger walk — a failed claim skips its own node (node #163)", () => 
   }
  }
 
- test("A's claim refused with plain text: B is still claimed in the same tick", async () => {
+ test("a plain-text claim failure parks unknown ownership and holds B", async () => {
   const dir = mkdtempSync(join(tmpdir(), "ranger-walk-claim-fail-"));
   try {
    const { result, report, state } = await walkTwo(dir, { refuse: "10" });
    expect(result.code).toBe(0);
-   expect(report.maps[0].claimed).toEqual(["20"]);
-   expect(report.maps[0].errors).toHaveLength(1);
+   expect(report.maps[0].claimed).toEqual([]);
+   expect(report.maps[0].errors).toHaveLength(2);
+   expect(report.maps[0].errors[1]).toContain("fresh claims held");
    expect(report.maps[0].errors[0]).toStartWith("#10 claim failed");
    expect(report.maps[0].errors[0]).toContain("Claim refused: node 10 has an open blocker");
    expect(state.nodes["10"].assignees).toEqual([]);
-   expect(state.nodes["20"].assignees).toEqual(["ivy-bot"]);
+   expect(state.nodes["20"].assignees).toEqual([]);
   } finally {
    rmSync(dir, { recursive: true, force: true });
   }
@@ -1090,7 +1091,7 @@ describe("ranger walk — a failed claim skips its own node (node #163)", () => 
   }
  }, 30_000);
 
- test("every claim fails: one error per candidate, nothing claimed, no retry, exit 0", async () => {
+ test("an unknown first claim is not retried and no further claim is attempted", async () => {
   const dir = mkdtempSync(join(tmpdir(), "ranger-walk-claim-fail-all-"));
   try {
    const { result, report, state, claimCalls } = await walkTwo(dir, { refuse: "*" });
@@ -1098,8 +1099,8 @@ describe("ranger walk — a failed claim skips its own node (node #163)", () => 
    expect(report.maps[0].claimed).toEqual([]);
    expect(report.maps[0].errors).toHaveLength(2);
    expect(report.maps[0].errors[0]).toStartWith("#10 claim failed");
-   expect(report.maps[0].errors[1]).toStartWith("#20 claim failed");
-   expect(claimCalls).toBe(2);
+   expect(report.maps[0].errors[1]).toContain("fresh claims held");
+   expect(claimCalls).toBe(1);
    expect(state.nodes["10"].assignees).toEqual([]);
    expect(state.nodes["20"].assignees).toEqual([]);
   } finally {

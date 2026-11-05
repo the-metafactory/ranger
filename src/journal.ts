@@ -370,7 +370,7 @@ export class Journal {
  }
 
  reserveWorker(row: WorkerRow, patch: WorkerPatch = {}, at = new Date()): number | null {
-  const reserved = this.db.update(workers).set({ ...patch, status: "claimed", pid: null, workerPgid: null,
+  const reserved = this.db.update(workers).set({ ...patch, status: "claimed", pid: null, workerPgid: patch.workerPgid === undefined ? row.workerPgid : patch.workerPgid,
    startedAt: at.toISOString(), finishedAt: null, generation: sql`${workers.generation} + 1` })
    .where(and(eq(workers.nodeId, row.nodeId), eq(workers.repo, row.repo),
     eq(workers.generation, row.generation), eq(workers.status, row.status),
