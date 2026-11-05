@@ -1,6 +1,6 @@
 import { githubCiVerdict } from "../src/github-ci.ts";
 import { describe, expect, setSystemTime, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stringify } from "yaml";
@@ -31,6 +31,7 @@ const probes = (sha: string): IssueComment => ({
 function fakeGitHub(opts: { head?: string; comments: IssueComment[]; ci: CheckRun[]; labels?: string[]; merged?: boolean; title?: string; body?: string; onGetPr?: () => void }) {
  const calls: string[] = [];
  const merges: { n: number; sha: string }[] = [];
+ const deletions: { repo: string; branch: string; token: string }[] = [];
  const forbidden = (name: string) => async () => { throw new Error(`unexpected GitHub call: ${name}`); };
  const github: ForgePort = {
   findPrByHead: forbidden("findPrByHead"),
@@ -51,8 +52,9 @@ function fakeGitHub(opts: { head?: string; comments: IssueComment[]; ci: CheckRu
   ciVerdictFor: async (repo) => { calls.push("ciVerdictFor"); return githubCiVerdict(repo, opts.ci); },
   issueLabels: async () => { calls.push("issueLabels"); return opts.labels ?? []; },
   mergePr: async (_repo, n, sha) => { calls.push("mergePr"); merges.push({ n, sha }); return { status: "merged" as const }; },
+  deleteBranch: async (repo, branch, token) => { calls.push("deleteBranch"); deletions.push({ repo, branch, token }); },
  };
- return { github, calls, merges };
+ return { github, calls, merges, deletions };
 }
 
 const GREEN: CheckRun[] = [{ id: 7, name: "deploy", status: "completed", conclusion: "success" } as CheckRun];
@@ -101,6 +103,55 @@ function needsRebaseDesk(r: ReturnType<typeof rig>, head: string) {
  gh.github.rebasePr = async (_repo, _n, sha) => { rebases.push(sha); return { status: "pending", requested: true, reason: "updating" }; };
  return { gh, rebases, run: () => r.desk(gh.github) };
 }
+
+describe("node #470 — remote branch deletion after squash merge", () => {
+ test("a successful merge deletes the PR head and preserves the local worktree", async () => {
+  const r = rig();
+  try {
+   const worktree = join(r.dir, "node-worktree");
+   mkdirSync(worktree);
+   const sentinel = join(worktree, "local.txt");
+   writeFileSync(sentinel, "local worktree sentinel");
+   r.journal.updateWorker("96", GAME, { status: "awaiting-merge", outcome: null, worktree });
+   const gh = fakeGitHub({ comments: [review(CERTIFIED)], ci: GREEN });
+   expect(await r.desk(gh.github)).toMatchObject({ merged: ["96"], resumed: ["96"], parked: [], errors: [] });
+   expect(gh.deletions).toEqual([{ repo: GAME, branch: "node/96", token: "unused" }]);
+   expect(gh.calls.indexOf("mergePr")).toBeLessThan(gh.calls.indexOf("deleteBranch"));
+   expect(r.events("branch-delete-failed")).toEqual([]);
+   expect(readFileSync(sentinel, "utf8")).toBe("local worktree sentinel");
+   expect(r.journal.getWorker("96", GAME)).toMatchObject({ status: "running", phase: "close", worktree });
+  } finally { r.close(); }
+ });
+
+ test("a delete failure records one reason, leaves the merge done, and starts close", async () => {
+  const r = rig();
+  try {
+   const gh = fakeGitHub({ comments: [review(CERTIFIED)], ci: GREEN });
+   gh.github.deleteBranch = async () => { gh.calls.push("deleteBranch"); throw new Error("HTTP 500: Internal Server Error"); };
+   expect(await r.desk(gh.github)).toMatchObject({ merged: ["96"], resumed: ["96"], parked: [], errors: [] });
+   expect(r.events("merged")).toHaveLength(1);
+   expect(r.events("branch-delete-failed")).toMatchObject([{ repo: GAME, nodeId: "96", detail: "node/96: HTTP 500: Internal Server Error" }]);
+   expect(r.journal.getWorker("96", GAME)).toMatchObject({ status: "running", phase: "close" });
+   await r.desk(gh.github);
+   expect(r.events("branch-delete-failed")).toHaveLength(1);
+   expect(gh.calls.filter(call => call === "deleteBranch")).toHaveLength(1);
+  } finally { r.close(); }
+ });
+
+ test.each(["head-moved", "not-mergeable", "error"])("a merge that answers %s never deletes the branch", async status => {
+  const r = rig();
+  try {
+   const gh = fakeGitHub({ comments: [review(CERTIFIED)], ci: GREEN });
+   gh.github.mergePr = async () => {
+    if (status === "error") throw new Error("HTTP 500: merge failed");
+    return { status, reason: "merge refused" };
+   };
+   expect((await r.desk(gh.github)).merged).toEqual([]);
+   expect(gh.deletions).toEqual([]);
+   expect(r.events("branch-delete-failed")).toEqual([]);
+  } finally { r.close(); }
+ });
+});
 
 describe("node #440 — rebase leaves unpushed work to implement", () => {
  test.each(["at-from", "after-from", "foreign", "missing-head"])("rebase worktree ancestry: %s", async scenario => {

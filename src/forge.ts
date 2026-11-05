@@ -158,6 +158,7 @@ export interface ForgePort<ReadCredential = string, WriteCredential = string> ex
   * fault.
   */
  mergePr(repo: string, n: number, sha: string, title: string, token: WriteCredential): Promise<MergeOutcome>;
+ deleteBranch?(repo: string, branch: string, token: WriteCredential): Promise<void>;
  /**
   * Update the source branch onto its target, for a forge that reports
   * `needs-rebase` (GitLab under `rebase_merge`, GitHub when `behind`), from
