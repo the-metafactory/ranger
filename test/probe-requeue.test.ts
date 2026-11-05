@@ -60,6 +60,32 @@ describe("probe failure classification", () => {
   expect(probeFailureClass([run(1, "unknown error"), run(-1)])).toBe("unknown");
   expect(probeFailureClass([run(1, failure("crash") + "\n" + failure("exit"))])).toBe("unknown");
  });
+ test("a check a probe printed before the runner reports it crashed or killed does not make an assertion", () => {
+  const died = (kind: string) => `FAIL probe-boot.mjs (52.0s) exit=${kind === "killed" ? "killed:SIGKILL" : "1"} ${kind}\n     │  FAIL  a probe page boots direct — boot mode null\n     │   ok   frames are being drawn\n     │ page.waitForFunction: Timeout 20000ms exceeded.`;
+  for (const kind of ["crash", "killed"]) {
+   const mass = `${died(kind)}\n${failure("crash")}\nFAILED: probe-boot.mjs · probe-site.mjs`;
+   expect(probeFailureClass([run(1, mass), run(1, mass)])).toBe("infrastructure");
+   expect(infrastructureProbeHead(outcome().replace("infrastructure", probeFailureClass([run(1, mass)])))).toBe(SHA);
+  }
+ });
+ test("an assert or page error beside crashed probes, and a check with no runner header, stay assertions", () => {
+  const crashed = "FAIL probe-boot.mjs (52.0s) exit=1 crash\n     │  FAIL  boots — null";
+  for (const kind of ["assert", "pageerror"]) {
+   expect(probeFailureClass([run(1, `${crashed}\n${failure(kind)}`)])).toBe("assertion");
+  }
+  expect(probeFailureClass([run(1, `${crashed}\nFAIL probe-a.mjs (1.0s) exit=1 assert\n     │  FAIL  draws — x`)])).toBe("assertion");
+  expect(probeFailureClass([run(-1, "     │  FAIL  last change can be scrolled to — false")])).toBe("assertion");
+  expect(probeFailureClass([run(1, `     │  FAIL  loose — x\n${crashed}`)])).toBe("assertion");
+  expect(probeFailureClass([run(1, `${crashed}\nPAGEERROR boom`)])).toBe("assertion");
+ });
+ test("a quarantined probe's warn block does not class the run", () => {
+  const quarantined = "warn probe-output-stage.mjs (22.5s) exit=1 assert\n     │  FAIL  lit pixels agree — 1.21%";
+  expect(probeFailureClass([run(1, `${quarantined}\n${failure("crash")}`)])).toBe("infrastructure");
+ });
+ test("a later ok header ends a dead probe's block", () => {
+  const output = `FAIL probe-boot.mjs (52.0s) exit=1 crash\nok   probe-site.mjs (1.0s)\n     │  FAIL  loose — x`;
+  expect(probeFailureClass([run(1, output)])).toBe("assertion");
+ });
  test("class survives journal truncation and legacy fallback stays narrow", () => {
   expect(infrastructureProbeHead(outcome().slice(0, 400))).toBe(SHA);
   const legacy = probesFailedOutcome({ repo: "acme/widgets", sha: SHA, pr: 1, exit: -1, failed: [], tail: "lock wait" });
