@@ -51,6 +51,8 @@ export function parseFailedProbes(stdout: string): string[] {
  return names.length > 0 && names.every((n) => PROBE_FILE.test(n)) ? names : [];
 }
 
+const PROBE_HEADER = /^(ok|FAIL|warn) +([\w.-]+\.m?js) \([^)]*\)(?: exit=(?:-?\d+|killed:[\w]+) (\w+))?/;
+
 /** How a failed probe failed, as the runner's header and the probe's own output say. */
 export interface FailedProbeRun {
  /** The runner's failure kind (`assert`, `crash`, …); null when the header names none. */
@@ -71,7 +73,7 @@ export function parseFailedChecks(stdout: string): Map<string, FailedProbeRun> {
  const out = new Map<string, FailedProbeRun>();
  let current: FailedProbeRun | null = null;
  for (const line of stdout.split("\n")) {
-  const header = /^(ok|FAIL|warn) +([\w.-]+\.m?js) \([^)]*\)(?: exit=(?:-?\d+|killed:[\w]+) (\w+))?/.exec(line);
+  const header = PROBE_HEADER.exec(line);
   if (header !== null) {
    current = null;
    if (header[1] === "FAIL" && PROBE_FILE.test(header[2])) {
@@ -152,13 +154,30 @@ export const GITLAB_REVIEW_HOLD_OUTCOME = /^awaiting review: MR !\d+ has no revi
 
 export type ProbeFailureClass = "infrastructure" | "assertion" | "unknown";
 
-/** Classify all attempts: a timeout must not erase an earlier assertion. */
+const printedAnAssertion = (stdout: string): boolean => {
+ let discounted = false;
+ for (const line of stdout.split("\n")) {
+  const header = PROBE_HEADER.exec(line);
+  if (header !== null) {
+   discounted = header[1] === "warn" || (header[1] === "FAIL" && (header[3] === "crash" || header[3] === "killed"));
+  } else if (/^(?:PAGEERROR|SHADERERROR) |failed by kind:.*\b(?:assert|pageerror) \d+/.test(line) || (!discounted && /^\s*│\s*FAIL\s/.test(line))) {
+   return true;
+  }
+ }
+ return false;
+};
+
+/**
+ * Classify all attempts: a timeout must not erase an earlier assertion. A check
+ * printed under a probe the runner reports as crashed or killed is that probe's
+ * dying output, and a quarantined probe's `warn` block does not gate, so neither
+ * makes an assertion (node #474).
+ */
 export function probeFailureClass(runs: readonly { code: number; stdout: string; stderr: string }[]): ProbeFailureClass {
  const failed = runs.filter((run) => run.code !== 0);
  if (failed.length === 0) return "unknown";
  const kinds = failed.flatMap((run) => [...parseFailedChecks(run.stdout).values()]);
- if (kinds.some((run) => run.kind === "assert" || run.kind === "pageerror" || run.checks.size > 0) ||
-  failed.some((run) => /(?:^\s*│\s*FAIL\s|^(?:PAGEERROR|SHADERERROR) |failed by kind:.*\b(?:assert|pageerror) \d+)/m.test(run.stdout))) {
+ if (kinds.some((run) => run.kind === "assert" || run.kind === "pageerror") || failed.some((run) => printedAnAssertion(run.stdout))) {
   return "assertion";
  }
  return failed.every((run) => {
