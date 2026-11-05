@@ -1886,7 +1886,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
   const readRulings = async (): Promise<string[]> =>
    principalRulings(await github.listComments(repo, open.iid, token), principalLoginForRepo(config, repo));
   const fixed =
-   (await adoptBuiltWork(ctx, testCommand, { round: current.round, pushedHead: live.headSha })) ??
+   (await adoptBuiltWork(ctx, testCommand, { fix: { round: current.round, pushedHead: live.headSha } })) ??
    (await workerPass(ctx, testCommand, { kind: "fix", round: current.round, body: current.body, rulings: await readRulings() }));
   workerExit = fixed.workerExit;
   if (fixed.failure !== undefined) return fixed.failure;
@@ -2171,18 +2171,10 @@ async function reconcileRecordedRebase(ctx: ImplementContext, opts: {
    detail: `worktree aligned with ${label}'s head ${prHead} after ranger's recorded rebase from ${from}: no unpushed work` });
   return;
  }
- journal.assertGeneration(nodeId, repo, ctx.generation, "merge ranger's rebased PR head into the worktree");
- const author = commitAuthorFor(ctx.config, repo, ctx.commitAuthor);
- if (author === undefined) throw new GitSafetyError("no machine commit identity for the rebase merge");
- const merge = await safeGit(["-c", `user.name=${author.name}`, "-c", `user.email=${author.email}`,
-  "merge", "--no-edit", "--no-ff", "-m", `Merge ranger's rebased head ${prHead.slice(0, 8)} into ${branch}`, prHead], { cwd: worktree, timeoutMs: 60_000 });
- if (merge.code !== 0) {
-  const conflicts = await safeGit(["diff", "--name-only", "--diff-filter=U"], { cwd: worktree, timeoutMs: 10_000 });
-  const abort = await safeGit(["merge", "--abort"], { cwd: worktree, timeoutMs: 30_000 });
-  if (abort.code !== 0) throw new GitSafetyError(`cannot abort the rebase merge in ${worktree}: ${abort.stderr.trim()}`);
-  if (conflicts.code !== 0 || conflicts.stdout.trim() === "") throw new GitSafetyError(`cannot merge ranger's rebased head ${prHead}: ${merge.stderr.trim()}`);
-  throw new ParkSignal(rebaseConflictParkOutcome({ here, label, prHead, files: conflicts.stdout.trim().split("\n") }));
- }
+ if (commitAuthorFor(ctx.config, repo, ctx.commitAuthor) === undefined) throw new GitSafetyError("no machine commit identity for the rebase merge");
+ const merge = await machineMerge(ctx, prHead, `Merge ranger's rebased head ${prHead.slice(0, 8)} into ${branch}`, "the rebase merge");
+ if (merge.kind === "failed") throw new GitSafetyError(`cannot merge ranger's rebased head ${prHead}: ${merge.why}`);
+ if (merge.kind === "conflict") throw new ParkSignal(rebaseConflictParkOutcome({ here, label, prHead, files: merge.files }));
  journal.recordEvent("worktree-synced", { nodeId, repo,
   detail: `worktree merged ${label}'s head ${prHead} after ranger's recorded rebase from ${from}, preserving unpushed work at ${here}` });
  return;
@@ -2299,6 +2291,26 @@ async function catchUpWithBase(ctx: ImplementContext, testCommand: string): Prom
  return baseMergePass(ctx, testCommand, { kind: "local", baseSha }, { behind, limit });
 }
 
+type MachineMerge = { kind: "merged" } | { kind: "conflict"; files: string[] } | { kind: "failed"; why: string };
+
+async function machineMerge(ctx: ImplementContext, ref: string, message: string, what: string): Promise<MachineMerge> {
+ const { worktree, journal } = ctx;
+ const git = (args: string[], timeoutMs: number) => safeGit(["--no-replace-objects", ...args], { cwd: worktree, timeoutMs });
+ const author = commitAuthorFor(ctx.config, ctx.map.repo, ctx.commitAuthor);
+ const identity = author === undefined ? [] : ["-c", `user.name=${author.name}`, "-c", `user.email=${author.email}`];
+ journal.assertGeneration(ctx.node.ref.id, ctx.map.repo, ctx.generation, `${what} into the worktree`);
+ const merge = await git([...identity, "merge", "--no-edit", "--no-ff", "-m", message, ref], 120_000);
+ if (merge.code === 0) return { kind: "merged" };
+ const conflicts = await git(["diff", "--name-only", "--diff-filter=U"], 10_000);
+ const files = conflicts.code === 0 ? conflicts.stdout.trim().split("\n").filter(Boolean) : [];
+ const why = merge.stderr.trim() || merge.stdout.trim() || `exit ${merge.code}`;
+ if (files.length === 0) return { kind: "failed", why };
+ journal.assertGeneration(ctx.node.ref.id, ctx.map.repo, ctx.generation, `abort ${what}`);
+ const abort = await git(["merge", "--abort"], 30_000);
+ if (abort.code !== 0) throw new GitSafetyError(`cannot abort ${what} in ${worktree}: ${abort.stderr.trim()}`);
+ return { kind: "conflict", files };
+}
+
 async function mergeBaseAfterRedTests(ctx: ImplementContext, what: string, baseSha: string): Promise<boolean> {
  const { worktree, journal, map, branch } = ctx;
  const repo = map.repo;
@@ -2306,30 +2318,20 @@ async function mergeBaseAfterRedTests(ctx: ImplementContext, what: string, baseS
  const base = map.base;
  const hasPr = (journal.getWorker(nodeId, repo)?.prNumber ?? null) !== null;
  if (hasPr || (await dirtyFiles(worktree)).length > 0) return false;
- const git = (args: string[], timeoutMs = 30_000) => safeGit(["--no-replace-objects", ...args], { cwd: worktree, timeoutMs });
+ const git = (args: string[]) => safeGit(["--no-replace-objects", ...args], { cwd: worktree, timeoutMs: 30_000 });
  const count = await git(["rev-list", "--count", `HEAD..${baseSha}`]);
  const behind = count.code === 0 ? Number(count.stdout.trim()) : 0;
  if (!(behind > 0) || (await git(["merge-base", "HEAD", baseSha])).code !== 0) return false;
  const here = await headSha(worktree);
- const author = commitAuthorFor(ctx.config, repo, ctx.commitAuthor);
- const identity = author === undefined ? [] : ["-c", `user.name=${author.name}`, "-c", `user.email=${author.email}`];
- journal.assertGeneration(nodeId, repo, ctx.generation, `merge origin/${base} after ${what} failed`);
- const merge = await git([...identity, "merge", "--no-edit", "--no-ff", "-m", `Merge origin/${base} (${baseSha.slice(0, 8)}) into ${branch}`, baseSha], 120_000);
- if (merge.code !== 0) {
-  const conflicts = await git(["diff", "--name-only", "--diff-filter=U"], 10_000);
-  const files = conflicts.code === 0 ? conflicts.stdout.trim().split("\n").filter(Boolean) : [];
-  if (files.length === 0) {
-   journal.recordEvent("worktree-not-synced", {
-    nodeId,
-    repo,
-    detail: `${what} failed with ${branch} ${behind} commit(s) behind origin/${base}, and merging origin/${base} ${baseSha} did not run: ${merge.stderr.trim() || merge.stdout.trim()} — the failure stands`.slice(0, 400),
-   });
-   return false;
-  }
-  journal.assertGeneration(nodeId, repo, ctx.generation, `abort the merge of origin/${base}`);
-  const abort = await git(["merge", "--abort"]);
-  if (abort.code !== 0) throw new GitSafetyError(`cannot abort the merge of origin/${base} in ${worktree}: ${abort.stderr.trim()}`);
-  throw new ParkSignal(behindBaseConflictParkOutcome({ what, branch, base, baseSha, behind, here, files }));
+ const merge = await machineMerge(ctx, baseSha, `Merge origin/${base} (${baseSha.slice(0, 8)}) into ${branch}`, `the merge of origin/${base}`);
+ if (merge.kind === "conflict") throw new ParkSignal(behindBaseConflictParkOutcome({ what, branch, base, baseSha, behind, here, files: merge.files }));
+ if (merge.kind === "failed") {
+  journal.recordEvent("worktree-not-synced", {
+   nodeId,
+   repo,
+   detail: `${what} failed with ${branch} ${behind} commit(s) behind origin/${base}, and merging origin/${base} ${baseSha} did not run: ${merge.why} — the failure stands`.slice(0, 400),
+  });
+  return false;
  }
  const sha = await headSha(worktree);
  journal.recordEvent("worktree-synced", {
@@ -3823,9 +3825,9 @@ async function freshCheckoutTests(
 async function adoptBuiltWork(
  ctx: ImplementContext,
  testCommand: string,
- fix?: { round: number; pushedHead: string },
- baseMerged = false,
+ opts: { fix?: { round: number; pushedHead: string }; baseMerged?: boolean } = {},
 ): Promise<PassResult | null> {
+ const { fix, baseMerged = false } = opts;
  const { map, worktree, journal, node } = ctx;
  if (fix === undefined ? (await commitsAhead(worktree, map.base)) === 0 : !(await fixCommitsOn(worktree, fix.pushedHead))) {
   return null;
@@ -3862,7 +3864,7 @@ async function adoptBuiltWork(
   throw hostLoadPark(ctx, busy, `the adoption tests (${testCommand}) on the ${what} a previous run committed`, tests);
  }
  if (tests.code !== 0 && fix === undefined && !baseMerged && !remoteTests(ctx)) {
-  if (await mergeBaseAfterRedTests(ctx, `the adoption tests (${testCommand})`, await fetchBaseTrusted(ctx))) return adoptBuiltWork(ctx, testCommand, undefined, true);
+  if (await mergeBaseAfterRedTests(ctx, `the adoption tests (${testCommand})`, await fetchBaseTrusted(ctx))) return adoptBuiltWork(ctx, testCommand, { baseMerged: true });
  }
  if (tests.code !== 0) {
   if (remoteTests(ctx)) return { workerExit: null, snapshot, sha, failure: { status: "failed", detail: tests.stderr, workerExit: null } };
