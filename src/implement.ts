@@ -3266,7 +3266,7 @@ export function failedTestNames(result: RunResult): string[] {
 /** A failed supervisor test run, named: the failing tests first (the journal keeps 400 characters), then the tail. */
 function testsFailedDetail(testCommand: string, tests: RunResult, after: string): string {
  const names = failedTestNames(tests);
- return `tests (${testCommand}) failed ${after} (exit ${tests.code})${names.length > 0 ? ` — failing: ${names.join("; ")}` : " — failing test names unavailable"} — output tail: ${tail(tests)}`;
+ return `tests (${testCommand}) failed ${after} (exit ${tests.code})${names.length > 0 ? ` — failing: ${names.join("; ")}` : " — failing test names unavailable"} — output tail: ${tail(tests, true)}`;
 }
 
 /**
@@ -3902,10 +3902,10 @@ async function fixCommitsOn(worktree: string, pushedHead: string): Promise<boole
  return Number(ahead.stdout.trim()) > 0 && Number(merges.stdout.trim()) === 0;
 }
 
-function tail(result: RunResult): string {
+function tail(result: RunResult, dropPartialLine = false): string {
  const output = result.stderr.trim() || result.stdout.trim();
  let start = Math.max(0, output.length - 600);
- if (start > 0 && output[start - 1] !== "\n") {
+ if (dropPartialLine && start > 0 && output[start - 1] !== "\n") {
   const newline = output.indexOf("\n", start);
   start = newline === -1 ? output.length : newline + 1;
  }

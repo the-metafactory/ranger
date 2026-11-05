@@ -2842,6 +2842,17 @@ describe("implement lane (node #23)", () => {
   expect(c.prompts.filter((p) => p.includes("## CI fix pass"))).toHaveLength(1);
  }, 60_000);
 
+ test.each(["stdout", "stderr"])("a long worker error in %s keeps its output tail", async (stream) => {
+  const r = await rig({});
+  cleanup.push(r.dir);
+  const output = `error: ${"x".repeat(700)}`;
+  r.ctx.worker = async () => ({ code: 1, stdout: stream === "stdout" ? output : "", stderr: stream === "stderr" ? output : "" });
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("failed");
+  expect(outcome.detail).toStartWith(`worker exited 1: ${"x".repeat(600)} (worker log: `);
+  expect(r.journal.getWorker("20", "acme/widgets")!.outcome).toBe(outcome.detail.slice(0, 400));
+ }, 60_000);
+
  test.each([
   { label: "names", output: "(fail) first test\n(fail) second test", names: "failing: first test; second test", tail: "(fail) first test\n(fail) second test", stream: "stderr" },
   { label: "unavailable names", output: "runner exited before reporting tests", names: "failing test names unavailable", tail: "runner exited before reporting tests", stream: "stdout" },
