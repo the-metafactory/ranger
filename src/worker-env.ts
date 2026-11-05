@@ -51,17 +51,15 @@ export function workerEnv(
  commitAuthor?: CommitAuthor,
 ): NodeJS.ProcessEnv {
  const principal = principalLoginForRepo(config, repo);
+ const hostEnv = workerHostEnv();
+ delete hostEnv.GIT_CONFIG_PARAMETERS;
  return {
-  ...workerHostEnv(),
+  ...hostEnv,
   SOMA_GRAPH_REPO: somaRepo(repo),
   SAGE_STACK: "default",
   ...(principal === undefined ? {} : { PILOT_PRINCIPAL: principal }),
   [JOURNAL_PATH_ENV]: sessionJournal,
-  // The host's global git hooks are the principal's, not the walk's: they
-  // can leave build caches in the worktree (a dirty tree the implement lane
-  // refuses) and nothing about them is part of ranger's gate. Disabled for
-  // every git call in the worker session and the repo commands (#23).
-  GIT_CONFIG_PARAMETERS: "'core.hooksPath'='/dev/null'",
+  GIT_CONFIG_GLOBAL: "/dev/null",
   // The machine account authors the work (design §2), not whoever the host's
   // global git identity is.
   ...authorEnv(config, repo, commitAuthor),

@@ -40,6 +40,8 @@ CI evidence that is missing, pending, failed, or from an old head parks the node
 
 On a `walk: full` map, task and build nodes take the implement lane (node #23). Its live acceptance target was seelite #550.
 
+Worker sessions and repo commands (install, test and probe) use `GIT_CONFIG_GLOBAL=/dev/null` and discard inherited `GIT_CONFIG_PARAMETERS`. This excludes the principal's global git config and hooks while allowing repo-local `core.hooksPath` and `.git/hooks`, including hooks installed by tests. The machine account's commit identity comes from explicit author and committer environment variables. The supervisor's own git calls still disable hooks and fsmonitor on the command line.
+
 1. The worker implements the node and commits.
 2. The supervisor runs `commands.test`, pushes, and opens a draft PR. On a resume, when the tests fail on work an earlier run committed and the branch, with no PR yet, is behind its base, the supervisor merges the base and runs them once more. A conflicting merge parks the node, naming the base SHA and the files (ranger issue #463). A map with remote tests does not get this step yet.
 3. The supervisor runs offline sage review rounds, at most `workers.reviewRounds` (default 2), with a fix pass after each round that finds something.
