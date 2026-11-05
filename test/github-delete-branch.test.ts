@@ -8,6 +8,8 @@ async function deletion(status: number) {
  const dir = mkdtempSync(join(tmpdir(), "ranger-gh-delete-"));
  try {
   const callsPath = join(dir, "calls.jsonl");
+  const configPath = join(dir, "ranger.yaml");
+  writeFileSync(configPath, "maps:\n  - repo: other-owner/other-map\n    root: 1\n    walk: full\n");
   writeFileSync(join(dir, "gh"), `#!/usr/bin/env bun
 import { appendFileSync } from "node:fs";
 appendFileSync(process.env.DELETE_CALLS, JSON.stringify(process.argv.slice(2)) + "\\n");
@@ -17,8 +19,11 @@ if (${status} >= 400) console.error("gh: delete refused (HTTP ${status})");
 process.exit(${status} >= 400 ? 1 : 0);
 `, { mode: 0o755 });
   const result = await runCmd(process.execPath, ["-e", `
-import { deleteBranch } from ${JSON.stringify(join(import.meta.dir, "..", "src", "github.ts"))};
-try { await deleteBranch("other-owner/other-map", "node/470-some#branch", "machine"); }
+import { loadConfig } from ${JSON.stringify(join(import.meta.dir, "..", "src", "config.ts"))};
+import { lanePort } from ${JSON.stringify(join(import.meta.dir, "..", "src", "forge-lanes.ts"))};
+const { config } = loadConfig(${JSON.stringify(configPath)});
+const github = lanePort(config, config.maps[0].repo);
+try { await github.deleteBranch("other-owner/other-map", "node/470-some#branch", "machine"); }
 catch (error) { console.error(error.message); process.exit(1); }
 `], { env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, DELETE_CALLS: callsPath } });
   const calls = readFileSync(callsPath, "utf8").trim().split("\n").map(line => JSON.parse(line) as string[]);
@@ -26,7 +31,7 @@ catch (error) { console.error(error.message); process.exit(1); }
  } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 
-describe("node #470 — GitHub remote branch deletion", () => {
+describe("node #470 — production GitHub lane remote branch deletion", () => {
  test.each([204, 404, 422])("HTTP %i succeeds with one remote DELETE", async status => {
   const result = await deletion(status);
   expect(result.code).toBe(0);
