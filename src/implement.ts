@@ -11,7 +11,8 @@ import { DiscordAnnouncer } from "./announce.ts";
 import { code, renderCard } from "./card-render.ts";
 import { mapKey } from "./maps.ts";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
-import { runCmd, type RunOptions, type RunResult } from "./exec.ts";
+import { exitText, runCmd, type RunOptions, type RunResult } from "./exec.ts";
+import { captureProcessGroup, TIMEOUT_CAPTURE_LIMIT_MS } from "./timeout-capture.ts";
 import {
  assertGitUntouched,
  assertNoClosingKeywords,
@@ -2718,7 +2719,7 @@ async function checkPass(
  // branch's. No fix pass, no failed node: the run parks and a resume waits
  // for a quiet host (node #297); the resume adopts this pass's commits.
  if (tests.code !== 0 && busy !== undefined) throw hostLoadPark(ctx, busy, `the supervisor's tests (${testCommand}) after the ${pass}`, tests);
- if (tests.code !== 0 && baseRed === undefined) return testsFailedDetail(testCommand, tests, input.context === "resume" ? "on the resumed worktree" : "after the worker");
+ if (tests.code !== 0 && baseRed === undefined) return testsFailedDetail(ctx, testCommand, tests, input.context === "resume" ? "on the resumed worktree" : "after the worker");
  if (retried || baseRed !== undefined) {
   // The pass was certified in a fresh clone, or its failures are the base's:
   // the worktree still holds what the failed run left, and the probes run
@@ -2780,9 +2781,10 @@ async function runShell(
   processGroup: true,
   // Install and tests yield the CPU; the timing-sensitive probes do not.
   ...(opts.priority === "probe" ? {} : { nice: ctx.config.workers.niceness }),
+  timeoutCapture: { capture: captureProcessGroup, limitMs: TIMEOUT_CAPTURE_LIMIT_MS },
  });
  const result = ctx.map.testBackend?.kind === "shadow" && opts.measureCpu ? await runShadowMeasured(command, execute) : await execute(command);
- logRun(ctx, `${opts.label} (${command})`, result);
+ logRun(ctx, `${opts.label} (${command})`, result, exitText(result, opts.timeoutMs));
  return result;
 }
 
@@ -2798,8 +2800,8 @@ function logFailureCount(ctx: ImplementContext): number {
  * Append a run's whole output to the node's worker log. A log that cannot be
  * written is journaled and the run goes on: logging never changes a gate.
  */
-function logRun(ctx: ImplementContext, label: string, result: RunResult): string | null {
- const saved = tryWorkerLog(ctx.journal.path, ctx.map.repo, ctx.node.ref.id, ctx.generation, label, result);
+function logRun(ctx: ImplementContext, label: string, result: RunResult, ended?: string): string | null {
+ const saved = tryWorkerLog(ctx.journal.path, ctx.map.repo, ctx.node.ref.id, ctx.generation, label, result, ended);
  if ("file" in saved) return saved.file;
  logFailures.set(ctx, logFailureCount(ctx) + 1);
  ctx.journal.recordEvent("log-failed", {
@@ -3264,9 +3266,9 @@ export function failedTestNames(result: RunResult): string[] {
 }
 
 /** A failed supervisor test run, named: the failing tests first (the journal keeps 400 characters), then the tail. */
-function testsFailedDetail(testCommand: string, tests: RunResult, after: string): string {
+function testsFailedDetail(ctx: ImplementContext, testCommand: string, tests: RunResult, after: string): string {
  const names = failedTestNames(tests);
- return `tests (${testCommand}) failed ${after} (exit ${tests.code})${names.length > 0 ? ` — failing: ${names.join("; ")}` : " — failing test names unavailable"} — output tail: ${tail(tests, true)}`;
+ return `tests (${testCommand}) failed ${after} (${exitText(tests, testTimeoutMs(ctx))})${names.length > 0 ? ` — failing: ${names.join("; ")}` : " — failing test names unavailable"} — output tail: ${tail(tests, true)}`;
 }
 
 /**
@@ -3336,7 +3338,7 @@ async function supervisorTests(
   });
   return { tests, retried: false };
  }
- const retry = await retryOnBusyHost(ctx, testCommand, head, `tests (${testCommand})`, "the test retry", `${label}: supervisor test retry`);
+ const retry = await retryWithoutVerdict(ctx, tests, testCommand, head, `tests (${testCommand})`, "the test retry", `${label}: supervisor test retry`);
  if (retry === null) return { tests, retried: false, ...await baseRedAt(ctx, { testCommand, tests, head, label, baseTip }) };
  tests = retry.result;
  // A retry that did not run validly (its clone, install or checkout check
@@ -3574,18 +3576,20 @@ async function mergeBaseInFreshClone(ctx: ImplementContext, head: string, baseTi
 }
 
 /**
- * The one busy-host retry supervisor test runs and adoption share: on a
- * loaded host, wait for it to quiet (or for the wait to run out) and run
+ * The one retry supervisor test runs and adoption share, for a run that gave
+ * no verdict on the code: on a loaded host, or after the run hit its timeout
+ * on any host, wait for the host to quiet (or for the wait to run out) and run
  * install and the tests once more in a fresh clone of `sha`. Null when the
- * host is not busy: no retry. `ran` is freshCheckoutTests' own: false when
+ * run ended by itself on a host that is not busy: no retry. `ran` is freshCheckoutTests' own: false when
  * the retry's clone, install or checkout check failed (or the local run never
  * happened), so its result is no evidence. `started` is the load the retry
  * started at; `busy` is that load when the quiet-host wait ran out first,
  * else null: a busy retry's failure is the host's, not the branch's (node
  * #297).
  */
-async function retryOnBusyHost(
+async function retryWithoutVerdict(
  ctx: ImplementContext,
+ failed: RunResult,
  testCommand: string,
  sha: string,
  what: string,
@@ -3593,11 +3597,14 @@ async function retryOnBusyHost(
  label: string,
 ): Promise<{ ran: boolean; result: RunResult; started: HostLoadReading; busy: HostLoadReading | null } | null> {
  const host = busyHostNow(ctx);
- if (host === null) return null;
+ if (host === null && failed.timedOut !== true) return null;
+ const retryOnce = `retrying once, in a fresh checkout of ${sha.slice(0, 8)}`;
  ctx.journal.recordEvent("reviewed", {
   nodeId: ctx.node.ref.id,
   repo: ctx.map.repo,
-  detail: `${what} failed on a busy host (${describeLoad(host, busyLoad(ctx))}) — retrying once, in a fresh checkout of ${sha.slice(0, 8)}, when it quiets`,
+  detail: host === null
+   ? `${what} ${exitText(failed, testTimeoutMs(ctx))} on a quiet host — ${retryOnce}`
+   : `${what} failed on a busy host (${describeLoad(host, busyLoad(ctx))}) — ${retryOnce}, when it quiets`,
  });
  const started = await awaitQuietHost(ctx, run);
  let ran = false;
@@ -3852,7 +3859,7 @@ async function adoptBuiltWork(
  let tests = await backendTests(ctx, sha, () => testsInFreshCheckout(ctx, testCommand, sha, `adopted ${what}: supervisor tests`));
  let busy: BusyReading | null = null;
  if (tests.code !== 0) {
-  const retry = remoteTests(ctx) ? null : await retryOnBusyHost(ctx, testCommand, sha, "adoption tests", "the adoption test retry", `adopted ${what}: supervisor test retry`);
+  const retry = remoteTests(ctx) ? null : await retryWithoutVerdict(ctx, tests, testCommand, sha, "adoption tests", "the adoption test retry", `adopted ${what}: supervisor test retry`);
   if (retry !== null) {
    tests = retry.result;
    if (retry.ran) busy = retry.busy ?? killedOnBusyHost(ctx, tests, "the adoption test retry");
@@ -3873,7 +3880,7 @@ async function adoptBuiltWork(
   journal.recordEvent("reviewed", {
    nodeId: node.ref.id,
    repo: map.repo,
-   detail: `${testsFailedDetail(testCommand, tests, "on the work a previous run committed")} — the worker continues`.slice(0, 400),
+   detail: `${testsFailedDetail(ctx, testCommand, tests, "on the work a previous run committed")} — the worker continues`.slice(0, 400),
   });
   return null;
  }

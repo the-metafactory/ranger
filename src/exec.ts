@@ -15,6 +15,7 @@ export interface RunResult {
   stdoutTail?: string;
   /** True when `timeoutMs` ran out and the child (or its group) was killed. */
   timedOut?: boolean;
+  timeoutCapture?: string;
 }
 
 /** Stdout tail kept beside a filtered stream: lines, and characters per line. */
@@ -54,6 +55,23 @@ export interface RunOptions {
    * Undefined or 0: the caller's own priority.
    */
   nice?: number;
+  timeoutCapture?: { capture: (pid: number) => Promise<string>; limitMs: number };
+}
+
+async function boundedCapture(opts: NonNullable<RunOptions["timeoutCapture"]>, pid: number): Promise<string> {
+  let limit: ReturnType<typeof setTimeout> | undefined;
+  const overdue = new Promise<string>((resolve) => {
+    limit = setTimeout(() => {
+      resolve(`timeout capture did not finish within ${opts.limitMs} ms`);
+    }, opts.limitMs);
+  });
+  try {
+    return await Promise.race([opts.capture(pid), overdue]);
+  } catch (error) {
+    return `timeout capture failed: ${error instanceof Error ? error.message : String(error)}`;
+  } finally {
+    clearTimeout(limit);
+  }
 }
 
 /**
@@ -109,19 +127,32 @@ export function runCmd(
       stderr += chunk.toString();
     });
     let timedOut = false;
+    let closed = false;
+    let timeoutCapture: string | undefined;
+    const killOnTimeout = () => {
+      timedOut = true;
+      if (opts.processGroup === true && child.pid !== undefined) {
+        if (!killProcessGroup(child.pid)) {
+          child.kill("SIGKILL");
+          killProcessGroup(child.pid);
+        }
+      } else {
+        child.kill("SIGKILL");
+      }
+    };
     const timer =
       opts.timeoutMs === undefined
         ? undefined
         : setTimeout(() => {
-            timedOut = true;
-            if (opts.processGroup === true && child.pid !== undefined) {
-              if (!killProcessGroup(child.pid)) {
-                child.kill("SIGKILL");
-                killProcessGroup(child.pid);
-              }
-            } else {
-              child.kill("SIGKILL");
+            if (opts.timeoutCapture === undefined || child.pid === undefined) {
+              killOnTimeout();
+              return;
             }
+            void boundedCapture(opts.timeoutCapture, child.pid).then((text) => {
+              if (closed) return;
+              timeoutCapture = text;
+              killOnTimeout();
+            });
           }, opts.timeoutMs);
     child.on("error", (error) => {
       if (timer) clearTimeout(timer);
@@ -129,8 +160,9 @@ export function runCmd(
       reject(new Error(`failed to spawn ${bin}${where}: ${error.message}`));
     });
     child.on("close", (code) => {
+      closed = true;
       if (timer) clearTimeout(timer);
-      const timeout = timedOut ? { timedOut } : {};
+      const timeout = timedOut ? { timedOut, ...(timeoutCapture === undefined ? {} : { timeoutCapture }) } : {};
       if (keep === undefined) {
         resolvePromise({ code: code ?? -1, stdout, stderr, ...timeout });
         return;

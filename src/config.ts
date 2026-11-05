@@ -121,7 +121,7 @@ const MapSchema = z.object({
    probeTimeoutMin: z.number().int().positive().default(30),
    /**
     * Wall clock for one supervisor test run (`test`), minutes. A suite that
-    * runs past it is killed and reads as a failed run (exit -1). Soma's suite
+    * runs past it is killed, retried once, and then reads as a failed run. Soma's suite
     * took 20 min 21 s with no other suite running (2026-10-15, soma #908): its
     * tests stage the runtime about 345 times, and file creation and deletion
     * are slow on this host. That is its steady duration, not transient load.
