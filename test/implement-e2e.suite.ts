@@ -1086,6 +1086,57 @@ describe("implement lane (node #23)", () => {
   expect(stayed[0]?.detail).toContain("README.md");
  }, 60_000);
 
+ const UP_TO_DATE = "git merge-base --is-ancestor origin/main HEAD";
+
+ test("a resume with no PR, 1 commit behind the base, whose adoption tests fail only on an up-to-date check merges the base and adopts the build (ranger issue #463)", async () => {
+  const flag = join(tmpdir(), `ranger-behind-adopt-${Date.now()}`);
+  const { r, worktree, head: built } = await resumableNoPr({ test: `test -f ${flag} && ${UP_TO_DATE}` });
+  const main = await pushFromOutside(r, "base-1.txt", "main");
+  writeFileSync(flag, "");
+  const deadman = r.journal.deadmanCount();
+  const sessions = watchSessions(r, "noop");
+  expect(r.ctx.config.workers.maxBehindBase).toBeGreaterThan(1);
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("awaiting-merge");
+  expect(sessions).toHaveLength(0);
+  const pushed = await r.github.sha(BRANCH);
+  expect((await runCmd("git", ["merge-base", "--is-ancestor", main, pushed], { cwd: r.origin })).code).toBe(0);
+  expect((await runCmd("git", ["merge-base", "--is-ancestor", built, pushed], { cwd: r.origin })).code).toBe(0);
+  expect((await git(["rev-parse", "HEAD"], worktree)).stdout.trim()).toBe(pushed);
+  const synced = r.journal.listEvents("acme/widgets", 300).filter((e) => e.kind === "worktree-synced");
+  expect(synced).toHaveLength(1);
+  expect(synced[0]?.detail).toContain("1 commit(s) behind origin/main");
+  expect(synced[0]?.detail).toContain(`merged origin/main ${main} into ${built} as ${pushed}`);
+  expect(r.journal.deadmanCount()).toBeLessThanOrEqual(deadman);
+  rmSync(flag, { force: true });
+ }, 60_000);
+
+ test("a resume with no PR whose base merge after red adoption tests conflicts parks naming the base SHA and the files, and the dead-man count does not rise (ranger issue #463)", async () => {
+  const flag = join(tmpdir(), `ranger-behind-conflict-${Date.now()}`);
+  const { r, worktree, head: built } = await resumableNoPr({ test: `test -f ${flag} && ${UP_TO_DATE}` });
+  const clone = join(r.dir, "outside-conflict");
+  expect((await git(["clone", "--branch", "main", r.origin, clone], r.dir)).code).toBe(0);
+  mkdirSync(join(clone, "src"), { recursive: true });
+  writeFileSync(join(clone, "src", "feature.ts"), "export const feature = () => 42; // main\n");
+  await git(["add", "src/feature.ts"], clone);
+  await git(["commit", "-m", "main: its own feature"], clone);
+  expect((await git(["push", "origin", "HEAD:refs/heads/main"], clone)).code).toBe(0);
+  const main = await r.github.sha("main");
+  writeFileSync(flag, "");
+  const deadman = r.journal.deadmanCount();
+  const sessions = watchSessions(r, "noop");
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("parked");
+  expect(outcome.detail).toContain(`merging origin/main at ${main} conflicts in: src/feature.ts`);
+  expect(sessions).toHaveLength(0);
+  expect((await git(["rev-parse", "HEAD"], worktree)).stdout.trim()).toBe(built);
+  expect((await git(["status", "--porcelain"], worktree)).stdout.trim()).toBe("");
+  expect(r.github.prs.size).toBe(0);
+  expect(await r.github.sha(BRANCH)).toBe("");
+  expect(r.journal.deadmanCount()).toBe(deadman);
+  rmSync(flag, { force: true });
+ }, 60_000);
+
  test("a resume after someone rewound the PR branch below the pushed worktree parks and pushes nothing over it (sage round 2 on PR #234)", async () => {
   const { r, head } = await failAfterRoundOne();
   const pushedHead = await head();

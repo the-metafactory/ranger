@@ -115,6 +115,7 @@ export function assembleResearchPrompt(input: WorkerPromptInput): string {
 export interface ImplementPromptInput extends WorkerPromptInput {
  /** The repo's test command the supervisor will run before pushing. */
  testCommand: string;
+ base: string;
  /** Set on a fix pass: the sage review the worker must answer (untrusted). */
  review?: { round: number; body: string; finish?: boolean };
  /** The principal's rulings on the PR, oldest first: binding, and ahead of any review (ranger issue #230). */
@@ -195,15 +196,23 @@ const BLOCKED_RULE = `- Blocked: if the node cannot be done yet because a precon
   The supervisor parks the node on it: it pushes nothing and opens no pull request.
   Only an unmet precondition is a block; a hard task or failing tests are not.`;
 
+const BEHIND_BASE_RULE = `- Behind the base: when the only check that fails is one that needs this branch to
+  contain origin/{{base}} (an up-to-date or ancestor check, such as
+  \`git merge-base --is-ancestor origin/{{base}} HEAD\`), merge the base: run
+  \`git merge --no-edit origin/{{base}}\` (do not fetch: the supervisor already did), run
+  the check again, and commit. Never defer, skip or waive that check: it is part of
+  the node, and a session that commits nothing is refused.`;
+
 /** The task/build kind SOP (design §4), the worker's half of it. */
 const IMPLEMENT_SOP = `Task/build kind SOP (ranger implement lane):
 - Implement the node in this worktree, on the branch that is already checked out
   ({{branch}}). Do not create or switch branches.
 ${LOCAL_TEST_RULE}
 ${HOST_RUNTIME_RULE}
-- COMMIT your work on this branch. Do NOT push, open a pull request, merge, comment
-  on GitHub, or touch any other branch: the supervisor does all of that, with a
-  credential you never hold.
+${BEHIND_BASE_RULE}
+- COMMIT your work on this branch. Do NOT push, open a pull request, merge anything
+  but origin/{{base}}, comment on GitHub, or touch any other branch: the supervisor
+  does all of that, with a credential you never hold.
 - Commit messages, code comments and any docs you write must NOT contain GitHub
   closing keywords followed by an issue reference ("closes #N", "fixes #N",
   "resolves #N"): a squash merge would auto-close the node and skip its close gate.
@@ -315,7 +324,7 @@ export function assembleImplementPrompt(input: ImplementPromptInput): string {
           ` the base may have changed how the tests and probes run${
            baseMerge.files.length > 0 ? `. A trial merge conflicts in: ${baseMerge.files.map((f) => `\`${f}\``).join(", ")}` : ""
           }.`,
-      "This pass is the one exception to the SOP's no-merge rule. Your job is only to bring the base in:",
+      "This pass exists to merge the base. Your job is only to bring the base in:",
       `1. Run \`git merge --no-edit origin/${baseMerge.base}\`. Do not fetch: the supervisor already did.`,
       "   Never rebase, reset or amend: the supervisor pushes fast-forward only.",
       "2. Resolve every conflict so both sides keep working. The base's changes are merged work and",
@@ -410,7 +419,7 @@ export function assembleImplementPrompt(input: ImplementPromptInput): string {
   (input.remoteTests ? IMPLEMENT_SOP.replace(LOCAL_TEST_RULE, REMOTE_TEST_RULE) : IMPLEMENT_SOP).replaceAll("{{branch}}", branch).replaceAll(
    "{{test}}",
    testCommand,
-  ),
+  ).replaceAll("{{base}}", input.base),
   ...(probeTier === true ? [PROBE_TIER_RULE] : []),
   ...rulingsSection(input.rulings ?? [], nonce),
   ...fixPass,
