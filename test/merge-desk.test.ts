@@ -123,14 +123,14 @@ describe("node #470 — remote branch deletion after squash merge", () => {
   } finally { r.close(); }
  });
 
- test("a delete failure records one reason, leaves the merge done, and starts close", async () => {
+ test.each(["HTTP 500: Internal Server Error", "HTTP 422: Cannot delete protected branch"])("a delete failure (%s) records one reason, leaves the merge done, and starts close", async reason => {
   const r = rig();
   try {
    const gh = fakeGitHub({ comments: [review(CERTIFIED)], ci: GREEN });
-   gh.github.deleteBranch = async () => { gh.calls.push("deleteBranch"); throw new Error("HTTP 500: Internal Server Error"); };
+   gh.github.deleteBranch = async () => { gh.calls.push("deleteBranch"); throw new Error(reason); };
    expect(await r.desk(gh.github)).toMatchObject({ merged: ["96"], resumed: ["96"], parked: [], errors: [] });
    expect(r.events("merged")).toHaveLength(1);
-   expect(r.events("branch-delete-failed")).toMatchObject([{ repo: GAME, nodeId: "96", detail: "node/96: HTTP 500: Internal Server Error" }]);
+   expect(r.events("branch-delete-failed")).toMatchObject([{ repo: GAME, nodeId: "96", detail: `node/96: ${reason}` }]);
    expect(r.journal.getWorker("96", GAME)).toMatchObject({ status: "running", phase: "close" });
    await r.desk(gh.github);
    expect(r.events("branch-delete-failed")).toHaveLength(1);
