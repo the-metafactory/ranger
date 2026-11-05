@@ -755,6 +755,11 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    journal.recordEvent("merged", { nodeId: row.nodeId, repo, detail: event });
    result.merged.push(row.nodeId);
    try {
+    await github.deleteBranch?.(repo, pr.headRef, token);
+   } catch (error) {
+    journal.recordEvent("branch-delete-failed", { nodeId: row.nodeId, repo, detail: `${pr.headRef}: ${error instanceof Error ? error.message : String(error)}` });
+   }
+   try {
     await post(
      renderCard({
       emoji: "✅",

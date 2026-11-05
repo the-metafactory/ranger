@@ -324,6 +324,7 @@ export type EventKind =
  | "veto-recovered"
  | "merge-card"
  | "merged"
+ | "branch-delete-failed"
  | "rebased"
  | "orphan-killed"
  | "substrate-capped"

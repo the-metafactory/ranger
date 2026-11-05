@@ -57,7 +57,7 @@ export interface CommitStatus {
 }
 
 /** One `gh api` request; its trimmed stdout. */
-async function ghApiText(token: string, args: string[], label: string): Promise<string> {
+async function ghApiText(token: string, args: string[], label: string, acceptError?: (status: number, response: string) => boolean): Promise<string> {
  const gated = writeEnv(token, { GH_ENTERPRISE_TOKEN: token, GITHUB_ENTERPRISE_TOKEN: token });
  try {
   // Reads retry a transient GitHub error; writes run once (a timed-out POST may have landed).
@@ -66,6 +66,8 @@ async function ghApiText(token: string, args: string[], label: string): Promise<
    env: gated.env,
    timeoutMs: GH_TIMEOUT_MS,
   });
+  const status = Number(/^HTTP\/\S+ (\d{3})\b/m.exec(result.stdout)?.[1]);
+  if (acceptError?.(status, result.stdout)) return "";
   if (result.code !== 0) {
    throw new GitHubError(
     `${label} failed (gh api, exit ${result.code}): ${(result.stderr || result.stdout).trim().slice(0, 400)}`,
@@ -250,6 +252,22 @@ export async function mergePr(
   `merge PR #${number}`,
  );
  return { status: "merged" };
+}
+
+export async function deleteBranch(repo: string, branch: string, token: string): Promise<void> {
+ await ghApiText(
+  token,
+  [`repos/${repo}/git/refs/heads/${encodeURIComponent(branch)}`, "--method", "DELETE", "--include"],
+  `delete branch ${branch}`,
+  (status, response) => {
+   if (status === 404) return true;
+   if (status !== 422) return false;
+   try {
+    const body = JSON.parse(response.replace(/^[\s\S]*?\r?\n\r?\n/, "")) as { message?: unknown } | null;
+    return body?.message === "Reference does not exist";
+   } catch { return false; }
+  },
+ );
 }
 
 /** The same bounded wait shape as the GitLab port; injectable for port tests. */
