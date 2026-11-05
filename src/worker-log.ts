@@ -38,17 +38,19 @@ export function saveWorkerLog(
  generation: number,
  label: string,
  result: RunResult,
+ ended = `exit ${result.code}`,
 ): string {
  const file = workerLogFile(journalPath, repo, nodeId, generation);
  mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
  appendFileSync(
   file,
   [
-   `===== ${new Date().toISOString()} ${label} — exit ${result.code}`,
+   `===== ${new Date().toISOString()} ${label} — ${ended}`,
    "----- stdout",
    result.stdout,
    "----- stderr",
    result.stderr,
+   ...(result.timeoutCapture === undefined ? [] : ["----- timeout capture", result.timeoutCapture]),
    "",
   ].join("\n"),
   { mode: 0o600 },
@@ -67,9 +69,10 @@ export function tryWorkerLog(
  generation: number,
  label: string,
  result: RunResult,
+ ended?: string,
 ): { file: string } | { error: string } {
  try {
-  return { file: saveWorkerLog(journalPath, repo, nodeId, generation, label, result) };
+  return { file: saveWorkerLog(journalPath, repo, nodeId, generation, label, result, ended) };
  } catch (error) {
   return { error: error instanceof Error ? error.message : String(error) };
  }
