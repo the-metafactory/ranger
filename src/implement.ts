@@ -2304,11 +2304,13 @@ async function machineMerge(ctx: ImplementContext, ref: string, message: string,
  const conflicts = await git(["diff", "--name-only", "--diff-filter=U"], 10_000);
  const files = conflicts.code === 0 ? conflicts.stdout.trim().split("\n").filter(Boolean) : [];
  const why = merge.stderr.trim() || merge.stdout.trim() || `exit ${merge.code}`;
- if (files.length === 0) return { kind: "failed", why };
- journal.assertGeneration(ctx.node.ref.id, ctx.map.repo, ctx.generation, `abort ${what}`);
- const abort = await git(["merge", "--abort"], 30_000);
- if (abort.code !== 0) throw new GitSafetyError(`cannot abort ${what} in ${worktree}: ${abort.stderr.trim()}`);
- return { kind: "conflict", files };
+ const midMerge = (await git(["rev-parse", "-q", "--verify", "MERGE_HEAD"], 10_000)).code === 0;
+ if (midMerge) {
+  journal.assertGeneration(ctx.node.ref.id, ctx.map.repo, ctx.generation, `abort ${what}`);
+  const abort = await git(["merge", "--abort"], 30_000);
+  if (abort.code !== 0) throw new GitSafetyError(`cannot abort ${what} in ${worktree}: ${abort.stderr.trim()}`);
+ }
+ return files.length === 0 ? { kind: "failed", why } : { kind: "conflict", files };
 }
 
 async function mergeBaseAfterRedTests(ctx: ImplementContext, what: string, baseSha: string): Promise<boolean> {
