@@ -322,6 +322,7 @@ export async function runRunNode(
  repo: string | undefined,
  configPath: string,
  deps: RunRunNodeDeps = {},
+ reservationGeneration?: number,
 ): Promise<string> {
  const now = deps.now ?? (() => new Date());
  const startedAt = now().toISOString();
@@ -335,6 +336,7 @@ export async function runRunNode(
   try {
    outcome = await (deps.runNode ?? runNode)(nodeId, {
     ...deps.worker,
+    generation: reservationGeneration,
     config, map, token, botIdentity, commitAuthor, journal,
     onMapRootRead: root => { mapRoot = { id: String(map.root), serves: root.node.serves }; },
     onGenerationBegun: begun => { generation = begun; },
@@ -462,8 +464,8 @@ async function runMergeDeskNow(selector: string, configPath: string, settle = fa
    botIdentity,
    graphToken,
    phase: "desk",
-   respawn: (nodeId, repo, root) =>
-    spawnRunNodeDetached({ nodeId, repo, root, cliEntry: join(import.meta.dir, "cli.ts"), configPath }),
+   respawn: (nodeId, repo, root, generation) =>
+    spawnRunNodeDetached({ nodeId, repo, root, generation, cliEntry: join(import.meta.dir, "cli.ts"), configPath }),
   });
   return JSON.stringify(result.mergeDesk ?? { idle: "no row on this map waits on a merge" }, null, 2);
  } finally {
@@ -1124,15 +1126,16 @@ program
  .description(
   "Detached worker supervisor: worktree, worker session, then the kind SOP — research (findings → gated close) or implement (tests → PR → sage → merge card → gated close after the principal's merge)",
  )
+ .option("--generation <number>", "reserved worker generation", Number)
  .argument("<id>", "node id to execute")
  .option("-m, --map <owner/name#root>", "map repo#root (repo alone only when unique)")
  .option("-c, --config <path>", "path to ranger.yaml (fallback: $RANGER_CONFIG, then ~/.config/ranger/ranger.yaml)")
- .action(async (id: string, options: { map?: string; config: string | undefined }) => {
+ .action(async (id: string, options: { map?: string; config: string | undefined; generation?: number }) => {
   try {
    const configPath = resolveConfigPath(options.config, process.env, process.cwd());
    // The worker, sage rounds and probe tier must not run on a sleeping host.
    holdAwake();
-   process.stdout.write((await runRunNode(id, options.map, configPath)) + "\n");
+   process.stdout.write((await runRunNode(id, options.map, configPath, {}, options.generation)) + "\n");
   } catch (error) {
    process.stderr.write(
     `ranger run-node: ${error instanceof Error ? error.message : String(error)}\n`,

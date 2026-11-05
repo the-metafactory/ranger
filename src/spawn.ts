@@ -3,6 +3,7 @@ import { dirname, join } from "node:path";
 import { mapKey } from "./maps.ts";
 
 export interface SpawnRunNodeArgs {
+ generation?: number;
  nodeId: string;
  repo: string;
  root: number;
@@ -28,6 +29,7 @@ export function runNodeArgv(args: SpawnRunNodeArgs): string[] {
   mapKey(args),
   "--config",
   args.configPath,
+  ...(args.generation === undefined ? [] : ["--generation", String(args.generation)]),
  ];
 }
 

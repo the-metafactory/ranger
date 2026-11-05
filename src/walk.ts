@@ -1,3 +1,4 @@
+import { startOwnedWorker } from "./node-ownership.ts";
 import { implementLane, type ImplementLane } from "./lanes.ts";
 import { processResumeQueue } from "./resume.ts";
 import { busyLoadFor, hostBusy, type HostLoad } from "./host-load.ts";
@@ -17,7 +18,7 @@ import {
  assertWriteIdentity,
  WriteGateError,
 } from "./identity.ts";
-import type { Journal } from "./journal.ts";
+import type { Journal, WorkerRow } from "./journal.ts";
 import { ClaimLockBusy, withClaimLock } from "./claim-lock.ts";
 import type { OwnedCheck } from "./lock.ts";
 import { classifyFrontier, loadProbeRegistry } from "./route.ts";
@@ -130,15 +131,15 @@ export type ClaimNodeOutcome =
  * claim (race-safe) → spawn count → a fresh `claimed` row → detached
  * run-node → `claimed` event. The walk and `ranger build-now` (node #58)
  * both call this under the claim lock; each checks its own gates (pause, cap,
- * veto, lane) first. A null `pid` means no run-node was spawned: the row stays
- * `claimed` with no worker, and the caller reports that, not a start.
+ * veto, lane) first.
  */
 export async function claimNode(args: ClaimNodeArgs): Promise<ClaimNodeOutcome> {
  const { journal, map, node, botIdentity, token } = args;
  const now = () => args.now?.() ?? new Date();
  const owned = args.owned ?? (() => {});
  owned();
- const refusal = freshClaimRefusal(map, node.id, journal.getWorker(node.id, map.repo));
+ const previous = journal.getWorker(node.id, map.repo);
+ const refusal = freshClaimRefusal(map, node.id, previous);
  if (refusal !== null) return { claimed: false, messageId: null, error: refusal };
  let messageId: string | null = null;
  let announceError: string | null = null;
@@ -169,10 +170,13 @@ export async function claimNode(args: ClaimNodeArgs): Promise<ClaimNodeOutcome> 
  }
 
  owned();
+ const reservation = recordFreshClaim(args, messageId, now(), previous);
+ if (reservation === null) return { claimed: false, messageId, error: `#${node.id} ownership changed during claim; skipped` };
  const claim = await (args.claim ?? graphClaim)(map.repo, node.id, botIdentity, token, {
   timeoutMs: GRAPH_CALL_TIMEOUT_MS,
  });
  if (!claim.held) {
+  journal.updateReservation(node.id, map.repo, reservation.generation, { status: "released", outcome: `claim held by ${claim.holder ?? "another session"}` });
   return {
    claimed: false,
    messageId,
@@ -181,15 +185,18 @@ export async function claimNode(args: ClaimNodeArgs): Promise<ClaimNodeOutcome> 
   };
  }
  owned();
- recordFreshClaim(args, messageId, now());
- const pid = await (args.spawnRunNode ?? spawnRunNodeDetached)({
+ journal.assertGeneration(node.id, map.repo, reservation.generation, "spawn claimed worker");
+ journal.recordSpawn(now());
+ if (args.lane === "implement") recordImplementStart(journal, map);
+ const pid = await startOwnedWorker({ journal, row: reservation.row, generation: reservation.generation, now: now(),
+  spawn: generation => (args.spawnRunNode ?? spawnRunNodeDetached)({
+  generation,
   nodeId: node.id,
   repo: map.repo,
   root: map.root,
   cliEntry: args.cliEntry,
   configPath: args.configPath,
- });
- if (pid !== null) journal.updateWorker(node.id, map.repo, { pid });
+ }) });
  journal.recordEvent("claimed", {
   nodeId: node.id,
   repo: map.repo,
@@ -198,15 +205,12 @@ export async function claimNode(args: ClaimNodeArgs): Promise<ClaimNodeOutcome> 
  return { claimed: true, messageId, announceError, pid };
 }
 
-function recordFreshClaim(args: ClaimNodeArgs, messageId: string | null, at: Date): void {
+function recordFreshClaim(args: ClaimNodeArgs, messageId: string | null, at: Date, previous: WorkerRow | null) {
  const { journal, map, node } = args;
- if (args.lane === "implement") recordImplementStart(journal, map);
- journal.recordSpawn(at);
- journal.upsertWorker({
-  nodeId: node.id,
-  repo: map.repo,
-  root: map.root,
-  status: "claimed",
+ const inserted = previous === null && journal.insertWorker({ nodeId: node.id, repo: map.repo, root: map.root, status: "claimed" });
+ const row = previous ?? (inserted ? journal.getWorker(node.id, map.repo) : null);
+ if (row === null) return null;
+ const generation = journal.reserveWorker(row, {
   attempts: 0,
   pid: null,
   messageId,
@@ -222,7 +226,9 @@ function recordFreshClaim(args: ClaimNodeArgs, messageId: string | null, at: Dat
   finishedAt: null,
   substrate: null,
   proposalCommentId: null,
- });
+ }, at);
+ const reserved = generation === null ? null : journal.getWorker(node.id, map.repo);
+ return reserved === null || generation === null ? null : { row: reserved, generation };
 }
 
 /**
@@ -302,8 +308,8 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
    github: portFor(w.map.repo),
    phase,
    reservedLanes: priorityLanes,
-   respawn: (nodeId, repo, root) =>
-    (ctx.spawnRunNode ?? spawnRunNodeDetached)({ nodeId, repo, root, cliEntry, configPath: ctx.configPath }),
+   respawn: (nodeId, repo, root, generation) =>
+    (ctx.spawnRunNode ?? spawnRunNodeDetached)({ nodeId, repo, root, generation, cliEntry, configPath: ctx.configPath }),
   });
  const maps: WalkMapResult[] = [];
  const mapResults = new Map<RangerMapConfig, WalkMapResult>();
@@ -380,8 +386,8 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
  try {
   result.probeRequeues = await withClaimLock(journal, (owned) => requeueProbes({
    journal, maps: retryMaps, limit: config.workers.probeRequeues, owned,
-   spawn: (nodeId, repo, root) => (ctx.spawnRunNode ?? spawnRunNodeDetached)({
-    nodeId, repo, root, cliEntry, configPath: ctx.configPath,
+   spawn: (nodeId, repo, root, generation) => (ctx.spawnRunNode ?? spawnRunNodeDetached)({
+    nodeId, repo, root, generation, cliEntry, configPath: ctx.configPath,
    }),
   }));
   priorityLanes.clear();
@@ -409,8 +415,8 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
    journal,
    maps: walked.map(({ map, token, botIdentity }) => ({ map, token, botIdentity })),
    portFor: targetFor,
-   spawn: (nodeId, repo, root) =>
-    (ctx.spawnRunNode ?? spawnRunNodeDetached)({ nodeId, repo, root, cliEntry, configPath: ctx.configPath }),
+   spawn: (nodeId, repo, root, generation) =>
+    (ctx.spawnRunNode ?? spawnRunNodeDetached)({ nodeId, repo, root, generation, cliEntry, configPath: ctx.configPath }),
    refuseCard: (map, veto) => refuseProposalCard({ config, journal, map, veto }),
    ...(ctx.now === undefined ? {} : { now: ctx.now }),
   });

@@ -328,7 +328,7 @@ describe("node #131 — the lanes route a gitlab: map to the GitLab port and gat
   expect(r.forge.merges).toEqual([]);
 
   // A resume holds it again, still unmerged.
-  r.journal.updateWorker("20", REPO, { status: "claimed" });
+  r.journal.updateWorker("20", REPO, { status: "claimed", startedAt: null, pid: null });
   expect(await runNode("20", r.ctx)).toMatchObject({ status: "parked" });
   expect(r.forge.mrs.size).toBe(1);
   expect(r.forge.merges).toEqual([]);

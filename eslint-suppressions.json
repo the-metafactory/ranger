@@ -482,7 +482,7 @@
       "count": 1
     },
     "ranger/no-comments": {
-      "count": 8
+      "count": 6
     }
   },
   "src/prompt.ts": {
@@ -507,7 +507,7 @@
       "count": 1
     },
     "ranger/no-comments": {
-      "count": 30
+      "count": 28
     }
   },
   "src/remote-test/artifacts.ts": {
@@ -744,9 +744,6 @@
     }
   },
   "src/resume.ts": {
-    "@typescript-eslint/no-confusing-void-expression": {
-      "count": 1
-    },
     "ranger/no-comments": {
       "count": 21
     }
@@ -940,7 +937,7 @@
       "count": 1
     },
     "ranger/no-comments": {
-      "count": 19
+      "count": 16
     }
   },
   "src/token-gate.ts": {
@@ -1059,7 +1056,7 @@
       "count": 1
     },
     "ranger/no-comments": {
-      "count": 122
+      "count": 120
     }
   },
   "test/base-red-fix-node.test.ts": {
@@ -1345,7 +1342,7 @@
       "count": 6
     },
     "ranger/no-comments": {
-      "count": 209
+      "count": 208
     }
   },
   "test/implement-rig.ts": {
@@ -1480,7 +1477,7 @@
       "count": 1
     },
     "ranger/no-comments": {
-      "count": 17
+      "count": 16
     }
   },
   "test/partition.ts": {

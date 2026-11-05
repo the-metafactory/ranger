@@ -167,7 +167,7 @@ describe("automatic probe requeue", () => {
     r.park("10");
     expect(await r.retry(async () => { if (throws) throw new Error("spawn failed"); return null; }))
      .toMatchObject({ resumed: [], pending: [`${A}#10`], lanes: ["visual"] });
-    expect(r.journal.getWorker("10", A)).toMatchObject({ status: "parked", outcome: outcome(), finishedAt: "2026-10-07T07:00:00.000Z" });
+    expect(r.journal.getWorker("10", A)).toMatchObject({ status: "parked", generation: 1, outcome: expect.stringContaining(outcome()), finishedAt: "2026-10-07T07:00:00.000Z" });
     expect((await r.retry()).resumed).toEqual([`${A}#10`]);
    } finally { r.close(); }
   });

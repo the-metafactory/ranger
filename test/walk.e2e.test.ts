@@ -231,7 +231,7 @@ describe("ranger walk — claim phase (node #13)", () => {
     "ivy-bot",
    );
    const worker = journal.getWorker("10", "acme/widgets");
-   expect(worker?.status).toBe("claimed");
+   expect(worker?.status).toBe("parked");
    expect(worker?.messageId).toMatch(/^discord-msg-/);
    journal.close();
   } finally {

@@ -1,3 +1,4 @@
+import { startOwnedWorker } from "./node-ownership.ts";
 import { principalLoginForRepo, type RangerConfig, type RangerMapConfig } from "./config.ts";
 import type { TickPlan } from "./candidates.ts";
 import type { CommentReaction, ForgePort, IssueComment } from "./forge.ts";
@@ -86,7 +87,7 @@ export interface RatifyContext {
  maps: RatifyMap[];
  portFor: (repo: string) => Pick<ForgePort, "issueComments" | "commentReactions" | "postComment">;
  /** Spawn the resume-for-close run-node; null when nothing started. */
- spawn: (nodeId: string, repo: string, root: number) => Promise<number | null>;
+ spawn: (nodeId: string, repo: string, root: number, generation: number) => Promise<number | null>;
  /** Release the machine account's claim (default `soma graph release`). */
  release?: (repo: string, nodeId: string, identity: string, token: string) => Promise<ReleaseResult>;
  /** Edit the node's card to "refused, yours to take" (node #240); none when absent. */
@@ -235,11 +236,11 @@ export async function ratifyPass(ctx: RatifyContext): Promise<RatifyResult> {
     if (current?.status !== "proposed" || current.proposalCommentId !== null) continue;
     if (commentId === null) {
      const detail = `${PROPOSAL_MISSING}: no comment on #${row.nodeId} by ${botIdentity} carries ${proposalMarker(row.nodeId)} — nothing is closed`;
-     journal.updateWorker(row.nodeId, row.repo, { outcome: detail });
+     journal.forWorker(row.nodeId, row.repo, row.generation).updateWorker(row.nodeId, row.repo, { outcome: detail });
      journal.recordEvent("proposal-missing", { nodeId: row.nodeId, repo: row.repo, detail });
      continue;
     }
-    journal.updateWorker(row.nodeId, row.repo, { proposalCommentId: commentId });
+    journal.forWorker(row.nodeId, row.repo, row.generation).updateWorker(row.nodeId, row.repo, { proposalCommentId: commentId });
     journal.recordEvent("proposal-bound", {
      nodeId: row.nodeId,
      repo: row.repo,
@@ -260,19 +261,12 @@ export async function ratifyPass(ctx: RatifyContext): Promise<RatifyResult> {
     await vetoProposal(tick, m, row, commentId, principal);
     continue;
    }
-   // The close phase is set before the spawn, so the child never reads a
-   // plain `proposed` row and refuses; a tick that dies here leaves the row
-   // `proposed`, and the next one reads and spawns it again.
-   journal.updateWorker(row.nodeId, row.repo, { phase: "close" });
-   const pid = await ctx.spawn(row.nodeId, row.repo, row.root);
+   const pid = await startOwnedWorker({ journal, row: current, status: "running", patch: { phase: "close" },
+    spawn: generation => ctx.spawn(row.nodeId, row.repo, row.root, generation) });
    if (pid === null) {
-    journal.updateWorker(row.nodeId, row.repo, { phase: null });
     result.errors.push(`#${row.nodeId}: ratified, but the close run-node did not spawn — retrying next tick`);
     continue;
    }
-   // The resume-for-close: no LLM session, so it neither counts an attempt
-   // nor touches the dead-man counter nor the spawn cap.
-   journal.updateWorker(row.nodeId, row.repo, { status: "running", phase: "close", pid, finishedAt: null });
    journal.recordEvent("ratified", {
     nodeId: row.nodeId,
     repo: row.repo,
@@ -334,7 +328,7 @@ async function finishVeto(tick: RatifyTick, m: RatifyMap, veto: VetoRow): Promis
  if (current?.status !== "proposed") return;
  // Soma releases only the machine account's own claim: a refusal means it holds none.
  const claim = released.released ? "claim released" : `no claim to release (${released.assignees.join(", ") || "unclaimed"})`;
- journal.updateWorker(veto.nodeId, map.repo, {
+ journal.forWorker(veto.nodeId, map.repo, current.generation).updateWorker(veto.nodeId, map.repo, {
   status: "released",
   phase: null,
   pid: null,

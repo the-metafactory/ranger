@@ -46,7 +46,7 @@ function rig() {
   repo: REPO, ref: { id }, node: { id, title: `Build ${id}`, kind: "task", autonomy: "auto" },
   status, assignees: ["ivy-bot"], blockedBy: [], author: "alice", typed: true, url: "" }));
  const worker = (id: string, root = 1, status: WorkerStatus = "parked", lane = "implement", phase: ImplementPhase | null = "review") => {
-  journal.upsertWorker({ nodeId: id, repo: REPO, root, status, lane, phase, finishedAt: "2026-10-06T00:00:00Z", workerPgid: 1234 });
+  journal.upsertWorker({ nodeId: id, repo: REPO, root, status, lane, phase, pid: status === "running" ? process.pid : null, startedAt: status === "claimed" ? new Date().toISOString() : null, finishedAt: "2026-10-06T00:00:00Z", workerPgid: 1234 });
   node(id);
  };
  const queue = (id: string, root = 1) => {
@@ -238,9 +238,8 @@ describe("resume-node CLI", () => {
     if (gate === "pause") r.journal.setPaused(true);
     else for (let i = 0; i < r.config.workers.spawnCapPerDay; i++) r.journal.recordSpawn(new Date());
     const before = r.journal.spawnsToday();
-    const result = await r.cli("40", ["--when-free"]);
-    expect(result.code).toBe(0);
-    expect(JSON.parse(result.stdout)).toMatchObject({ nodeId: "40", kind: "started" });
+    const result = await resumeNode("40", undefined, { ...r, spawnRunNode: async () => process.pid }, { whenFree: true });
+    expect(result).toMatchObject({ nodeId: "40", kind: "started" });
     expect(r.journal.listResumeQueue()).toEqual([]);
     expect(r.journal.getWorker("40", REPO)?.status).toBe("claimed");
     expect(r.journal.spawnsToday()).toBe(before);
@@ -280,9 +279,8 @@ describe("resume-node CLI", () => {
     r.queue("40"); r.worker("41", 460, "parked", lane, phase);
     r.journal.setPaused(true);
     for (let i = 0; i < r.config.workers.spawnCapPerDay; i++) r.journal.recordSpawn(new Date());
-    const result = await r.cli("41", ["--when-free"]);
-    expect(result.code).toBe(0);
-    expect(JSON.parse(result.stdout)).toMatchObject({ nodeId: "41", was: "parked", pid: null });
+    const result = await resumeNode("41", undefined, { ...r, spawnRunNode: async () => process.pid }, { whenFree: true });
+    expect(result).toMatchObject({ nodeId: "41", was: "parked", pid: process.pid });
     expect(r.journal.getWorker("41", REPO)?.status).toBe("claimed");
     expect(r.journal.listResumeQueue().map(e => e.nodeId)).toEqual(["40"]);
    });
@@ -298,9 +296,8 @@ describe("resume-node CLI", () => {
    await withRig(async r => {
     r.worker("40", 460, "failed", lane, phase);
     if (held) r.worker("41", 1, "running");
-    const result = await r.cli("40", ["--when-free"]);
-    expect(result.code).toBe(0);
-    expect(JSON.parse(result.stdout)).toMatchObject({ nodeId: "40", root: 460, was: "failed", pid: null });
+    const result = await resumeNode("40", undefined, { ...r, spawnRunNode: async () => process.pid }, { whenFree: true });
+    expect(result).toMatchObject({ nodeId: "40", root: 460, was: "failed", pid: process.pid });
     expect(r.journal.listResumeQueue()).toEqual([]);
     expect(r.journal.getWorker("40", REPO)).toMatchObject({ status: "claimed", workerPgid: null, finishedAt: null, phase });
     expect(r.journal.getHealth(LAST_IMPLEMENT_MAP)).toBe(held ? null : REPO + "#460");
@@ -349,7 +346,7 @@ describe("resume-node CLI", () => {
     expect((await r.cli("40", flags)).code).not.toBe(0);
    }
    expect(r.journal.listResumeQueue()).toEqual([]);
-   expect((await r.cli("40", ["--force"])).code).toBe(0);
+   expect(await resumeNode("40", undefined, { ...r, spawnRunNode: async () => process.pid }, { force: true })).toMatchObject({ kind: "started" });
    expect(r.journal.getWorker("40", REPO)?.status).toBe("claimed");
   });
  });
@@ -462,7 +459,7 @@ describe("resume-queue-starts-when-lane-frees", () => {
    await expect(resumeNode("40", undefined, { ...r, now: () => NOW,
     spawnRunNode: async () => { throw new Error("spawn failed"); } }, { whenFree: true }))
     .rejects.toThrow("spawn failed");
-   expect(r.journal.getWorker("40", REPO)).toEqual(before);
+   expect(r.journal.getWorker("40", REPO)).toMatchObject({ ...before, generation: (before?.generation ?? 0) + 1, workerPgid: null, outcome: expect.stringContaining("spawn failed") });
    expect(r.journal.spawnsToday(NOW)).toBe(0);
   });
  });
@@ -557,7 +554,8 @@ describe("resume-queue-starts-when-lane-frees", () => {
    await withRig(async r => {
     r.queue("40"); r.queue("41", 460);
     if (reason === "node closed") r.node("40", "closed");
-    if (["released", "claimed", "running"].includes(reason)) r.journal.updateWorker("40", REPO, { status: reason as WorkerStatus });
+    if (["released", "claimed", "running"].includes(reason)) r.journal.updateWorker("40", REPO, { status: reason as WorkerStatus,
+     pid: reason === "running" ? process.pid : null, startedAt: reason === "claimed" ? new Date().toISOString() : null });
     if (reason.startsWith("PR")) r.journal.updateWorker("40", REPO, { status: "failed", prNumber: 7 });
     if (reason === "walk none") r.config.maps[0].walk = "none";
     const github = { getPr: async () => ({ ...pr(), state: reason === "PR merged" ? "merged" : "closed" }) } as unknown as ForgePort;
@@ -795,7 +793,7 @@ describe("resume-queue-starts-when-lane-frees", () => {
     expect(result.maps.flatMap(m => m.claimed)).toEqual(["21"]);
     expect(result.maps.flatMap(m => m.errors).join(" ")).toContain("queued resume #40: start failed: spawn failed");
     expect(r.journal.listResumeQueue()).toEqual([{ ...entry, failedStarts: 1 }]);
-    expect(r.journal.getWorker("40", REPO)).toEqual(before);
+    expect(r.journal.getWorker("40", REPO)).toMatchObject({ ...before, generation: expect.any(Number), workerPgid: null, outcome: expect.stringContaining("worker start failed") });
    });
   });
  }
@@ -822,7 +820,7 @@ describe("resume-queue-starts-when-lane-frees", () => {
     expect(result.maps.flatMap(m => m.claimed)).toEqual(attempt === 0 ? ["20"] : []);
     expect(result.maps.flatMap(m => m.errors).join(" ")).toContain(`queued resume #40: start failed: ${error}`);
     expect(r.journal.listResumeQueue()).toEqual([{ ...entries[0], failedStarts: attempt + 1 }, entries[1]]);
-    expect(r.journal.getWorker("40", REPO)).toEqual(before);
+    expect(r.journal.getWorker("40", REPO)).toMatchObject({ ...before, generation: expect.any(Number), workerPgid: null, outcome: expect.stringContaining("worker start failed") });
     expect(r.journal.getWorker("41", REPO)?.status).toBe("parked");
     expect(r.journal.spawnsToday(NOW)).toBe(1);
    }
@@ -895,7 +893,7 @@ describe("the dashboard's queue head is the one the walk starts", () => {
    await withRig(async r => {
     r.queue("40"); r.queue("41", 460);
     if (scenario === "walk none") r.config.maps[0].walk = "none";
-    if (scenario === "running") r.journal.updateWorker("40", REPO, { status: "running" });
+    if (scenario === "running") r.journal.updateWorker("40", REPO, { status: "running", pid: process.pid });
     if (scenario === "pause") r.journal.setPaused(true);
     if (scenario === "cap") for (let i = 0; i < r.config.workers.spawnCapPerDay; i++) r.journal.recordSpawn(NOW);
     if (scenario === "drain") {

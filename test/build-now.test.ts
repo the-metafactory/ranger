@@ -329,13 +329,13 @@ describe("node #58 — build-now refuses", () => {
   expect(r.claimed).toHaveLength(0);
  });
 
- test("a lost claim race is reported once, never retried, and writes no row", async () => {
+ test("a lost claim race is reported once and resolves its reservation", async () => {
   const r = rig();
   r.loseRace("someone-else");
   expect(await refusal(buildNow("10", r.ctx()))).toMatch(/claim race lost to someone-else/);
   expect(r.claimed).toEqual(["10"]);
   expect(r.spawned).toHaveLength(0);
-  expect(r.journal.getWorker("10", REPO)).toBeNull();
+  expect(r.journal.getWorker("10", REPO)).toMatchObject({ status: "released", outcome: "claim held by someone-else" });
   expect(r.journal.listEvents(REPO).map((e) => e.kind)).toEqual(["announced"]);
   expect(r.journal.spawnsToday(new Date("2026-10-04T10:00:00Z"))).toBe(0);
  });
@@ -433,10 +433,10 @@ describe("node #58 — the claim lock serializes claimers", () => {
   expect(r.journal.getWorker("10", REPO)).toBeNull();
  });
 
- test("no run-node spawned: the result carries a null pid, the row stays claimed", async () => {
+ test("no run-node spawned: the result carries a null pid and a visible parked reason", async () => {
   const r = rig();
   const result = await buildNow("10", r.ctx({ spawnRunNode: async () => null }));
   expect(result.pid).toBeNull();
-  expect(r.journal.getWorker("10", REPO)).toMatchObject({ status: "claimed", pid: null });
+  expect(r.journal.getWorker("10", REPO)).toMatchObject({ status: "parked", pid: null, outcome: expect.stringContaining("resume node 10") });
  });
 });

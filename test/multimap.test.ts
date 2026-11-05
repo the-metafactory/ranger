@@ -303,8 +303,9 @@ describe("node #47 — map identity", () => {
    expect(ambiguous.code).toBe(1);
    expect(ambiguous.stderr).toContain("acme/widgets#460");
    const resumed = await runCli(["resume-node", "21", "-c", r.configPath], r.env);
-   expect(resumed.code).toBe(0);
-   expect(JSON.parse(resumed.stdout).root).toBe(460);
+   expect(resumed.code).not.toBe(0);
+   expect(resumed.stderr).toContain("spawn returned no PID");
+   expect(r.journal.getWorker("21", REPO)?.root).toBe(460);
   } finally { r.close(); }
  });
 
@@ -338,8 +339,9 @@ describe("node #47 — map identity", () => {
    expect(r.journal.getHealth(`${LAST_IMPLEMENT_MAP}.headless`)).toBe(REPO + "#1");
    r.journal.updateWorker("31", REPO, { status: "parked", pid: null });
    const resumed = await runCli(["resume-node", "31", "-c", r.configPath], r.env);
-   expect(resumed.code).toBe(0);
-   expect(JSON.parse(resumed.stdout).root).toBe(460);
+   expect(resumed.code).not.toBe(0);
+   expect(resumed.stderr).toContain("spawn returned no PID");
+   expect(r.journal.getWorker("31", REPO)?.root).toBe(460);
    expect(r.journal.getHealth(LAST_IMPLEMENT_MAP)).toBe(REPO + "#1");
    expect(r.journal.getHealth(`${LAST_IMPLEMENT_MAP}.headless`)).toBe(REPO + "#1");
   } finally { r.close(); }
@@ -414,7 +416,7 @@ describe("node #47 — map identity", () => {
    r.frontier(1, ["22"]);
    expect((await tick()).code).toBe(0);
    expect(r.journal.getHealth(LAST_IMPLEMENT_MAP)).toBe(REPO + "#1");
-   expect(r.journal.getWorker("22", REPO)?.status).toBe("claimed");
+   expect(r.journal.getWorker("22", REPO)?.status).toBe("parked");
    r.journal.updateWorker("22", REPO, { status: "success" });
    r.frontier(460, []);
    r.frontier(1, ["23"]);
@@ -463,7 +465,7 @@ describe("node #47 — map identity", () => {
   });
  });
 
- test("a liveness sweep that throws still reports what the merge desk did", async () => {
+ test("a failed liveness spawn parks visibly and leaves the lane available to the merge desk", async () => {
   await withRigEnv(async (r) => {
    r.journal.upsertWorker({ root: 460, nodeId: "40", repo: REPO, status: "awaiting-merge", lane: "implement" });
    r.journal.updateWorker("40", REPO, { phase: "awaiting-merge", prNumber: 7 });
@@ -477,9 +479,9 @@ describe("node #47 — map identity", () => {
      return process.pid;
     },
    });
-   const map460 = result.maps.find((m) => m.repo === REPO && m.errors.some((e) => e.includes("spawn exploded")));
-   expect(map460).toBeDefined();
-   expect(map460?.sweep?.mergeDesk?.pending).toEqual(["40"]); // the desk ran, waited on the held lane, and says so
+   expect(r.journal.getWorker("45", REPO)).toMatchObject({ status: "parked", outcome: expect.stringContaining("spawn exploded") });
+   expect(result.maps.flatMap(m => m.sweep?.mergeDesk?.resumed ?? [])).toEqual(["40"]);
+
   });
  });
 
@@ -504,7 +506,7 @@ describe("node #47 — map identity", () => {
    expect(predicted(r.config)).toEqual([REPO + "#460", "acme/game#1"]);
    expect((await runCli(["walk", "-c", r.configPath], r.env)).code).toBe(0);
    expect(r.journal.getWorker("21", REPO)?.root).toBe(460);
-   expect(r.journal.getWorker("51", visual.repo)?.status).toBe("claimed");
+   expect(r.journal.getWorker("51", visual.repo)?.status).toBe("parked");
   } finally { r.close(); }
  });
 

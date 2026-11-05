@@ -103,7 +103,7 @@ describe("node #57/#47 — root-aware resource lanes", () => {
  test("independent holders; exclusion uses repo and id", () => {
   const r = rig();
   try {
-   r.journal.upsertWorker({ root: 1, nodeId: "90", repo: GAME, status: "running", lane: "implement" });
+   r.journal.upsertWorker({ root: 1, nodeId: "90", repo: GAME, status: "running", lane: "implement", pid: process.pid });
    r.journal.upsertWorker({ root: 1, nodeId: "90", repo: TOOL, status: "claimed", lane: "implement" });
    expect(r.journal.laneHolder("visual")?.repo).toBe(GAME);
    expect(r.journal.laneHolder("headless", { nodeId: "90", repo: GAME })?.repo).toBe(TOOL);
@@ -119,7 +119,7 @@ describe("node #57/#47 — root-aware resource lanes", () => {
   const r = rig(10, { headless: 2 });
   try {
    expect(r.config.workers.laneSlots).toEqual({ visual: 1, headless: 2 });
-   r.journal.upsertWorker({ root: 1, nodeId: "90", repo: TOOL, status: "running", lane: "implement" });
+   r.journal.upsertWorker({ root: 1, nodeId: "90", repo: TOOL, status: "running", lane: "implement", pid: process.pid });
    expect(r.journal.laneHolder("headless")).toBeNull();
    r.journal.upsertWorker({ root: 1, nodeId: "91", repo: TOOL, status: "claimed", lane: "implement" });
    expect(r.journal.laneHolder("headless")?.nodeId).toBe("90");
@@ -131,7 +131,7 @@ describe("node #57/#47 — root-aware resource lanes", () => {
  test("walk fills a second headless slot beside a running headless worker", async () => {
   const r = rig(10, { headless: 2 });
   try {
-   r.journal.upsertWorker({ root: 1, nodeId: "90", repo: TOOL, status: "running", lane: "implement" });
+   r.journal.upsertWorker({ root: 1, nodeId: "90", repo: TOOL, status: "running", lane: "implement", pid: process.pid });
    const out = await runCli(["walk", "-c", r.configPath], r.env);
    expect(out.code).toBe(0);
    const result = JSON.parse(out.stdout);
@@ -142,7 +142,7 @@ describe("node #57/#47 — root-aware resource lanes", () => {
  test("one headless slot keeps the running worker exclusive", async () => {
   const r = rig();
   try {
-   r.journal.upsertWorker({ root: 1, nodeId: "90", repo: TOOL, status: "running", lane: "implement" });
+   r.journal.upsertWorker({ root: 1, nodeId: "90", repo: TOOL, status: "running", lane: "implement", pid: process.pid });
    const out = await runCli(["walk", "-c", r.configPath], r.env);
    expect(out.code).toBe(0);
    const result = JSON.parse(out.stdout);
@@ -154,7 +154,7 @@ describe("node #57/#47 — root-aware resource lanes", () => {
   test(`walk claims one per resource lane (visual occupied=${occupied})`, async () => {
    const r = rig();
    try {
-    if (occupied) r.journal.upsertWorker({ root: 1, nodeId: "90", repo: GAME, status: "running", lane: "implement" });
+    if (occupied) r.journal.upsertWorker({ root: 1, nodeId: "90", repo: GAME, status: "running", lane: "implement", pid: process.pid });
     const out = await runCli(["walk", "-c", r.configPath], r.env);
     expect(out.code).toBe(0);
     const result = JSON.parse(out.stdout);
@@ -207,7 +207,7 @@ describe("node #57/#47 — root-aware resource lanes", () => {
  test("resume enforces resource capacity; explicit force and research behavior remain", async () => {
   const r = rig();
   try {
-   r.journal.upsertWorker({ root: 1, nodeId: "90", repo: GAME, status: "running", lane: "implement" });
+   r.journal.upsertWorker({ root: 1, nodeId: "90", repo: GAME, status: "running", lane: "implement", pid: process.pid });
    for (const [id, repo, lane] of [["20", TOOL, "implement"], ["30", SECOND_GAME, "implement"], ["31", SECOND_GAME, "research"]]) {
     r.journal.upsertWorker({ root: 1, nodeId: id, repo, status: "parked", lane });
     const out = await runCli(["resume-node", id, "--map", repo, "-c", r.configPath], r.env);
@@ -215,18 +215,19 @@ describe("node #57/#47 — root-aware resource lanes", () => {
      expect(out.code).toBe(1);
      expect(out.stderr).toMatch(/implement lane.*#90/);
      expect(r.journal.getWorker(id, repo)?.status).toBe("parked");
-     expect((await runCli(["resume-node", id, "--map", repo, "--force", "-c", r.configPath], r.env)).code).toBe(0);
+     expect((await runCli(["resume-node", id, "--map", repo, "--force", "-c", r.configPath], r.env)).stderr).toContain("spawn returned no PID");
     } else {
-     expect(out.code).toBe(0);
+     expect(out.stderr).toContain("spawn returned no PID");
     }
-    expect(r.journal.getWorker(id, repo)?.status).toBe("claimed");
+    expect(r.journal.getWorker(id, repo)?.status).toBe("parked");
+    if (id === "20") r.journal.updateWorker(id, repo, { status: "running", pid: process.pid });
    }
    r.journal.upsertWorker({ root: 1, nodeId: "21", repo: TOOL, status: "parked", lane: "implement" });
    const blocked = await runCli(["resume-node", "21", "--map", TOOL, "-c", r.configPath], r.env);
    expect(blocked.code).toBe(1);
    expect(blocked.stderr).toMatch(/headless implement lane.*#20.*acme\/ranger#1/);
    expect(r.journal.getWorker("21", TOOL)?.status).toBe("parked");
-   expect((await runCli(["resume-node", "20", "--map", TOOL, "-c", r.configPath], r.env)).code).toBe(0);
+   expect((await runCli(["resume-node", "20", "--map", TOOL, "-c", r.configPath], r.env)).stderr).toContain("still running");
   } finally { r.close(); }
  });
 
@@ -239,20 +240,20 @@ describe("node #57/#47 — root-aware resource lanes", () => {
    expect(live.stderr).toMatch(new RegExp(`pid ${process.pid}\\) is still running`));
    expect(r.journal.getWorker("20", TOOL)?.status).toBe("running");
    r.journal.updateWorker("20", TOOL, { pid: 2 ** 22 + 1 });
-   expect((await runCli(["resume-node", "20", "--map", TOOL, "-c", r.configPath], r.env)).code).toBe(0);
-   expect(r.journal.getWorker("20", TOOL)?.status).toBe("claimed");
+   expect((await runCli(["resume-node", "20", "--map", TOOL, "-c", r.configPath], r.env)).stderr).toContain("spawn returned no PID");
+   expect(r.journal.getWorker("20", TOOL)?.status).toBe("parked");
   } finally { r.close(); }
  });
 
  test("node #58: build-now claims one node through the CLI; a held lane needs --force", async () => {
   const r = rig();
   try {
-   // RANGER_NO_SPAWN: claimed, no run-node — exit 3, never reported as a start.
    const first = await runCli(["build-now", "20", "--map", `${TOOL}#1`, "-c", r.configPath], r.env);
    expect(first.code).toBe(3);
    expect(first.stderr).toMatch(/claimed #20 but no run-node was started — `ranger run-node 20 --map /);
    expect(JSON.parse(first.stdout)).toMatchObject({ nodeId: "20", lane: "implement", beside: null });
-   expect(r.journal.getWorker("20", TOOL)).toMatchObject({ status: "claimed", lane: "implement" });
+   expect(r.journal.getWorker("20", TOOL)).toMatchObject({ status: "parked", lane: "implement" });
+   r.journal.updateWorker("20", TOOL, { status: "running", pid: process.pid });
    expect(r.journal.spawnsToday()).toBe(1);
    const held = await runCli(["build-now", "21", "--map", TOOL, "-c", r.configPath], r.env);
    expect(held.code).toBe(1);
@@ -276,7 +277,7 @@ describe("node #57/#47 — root-aware resource lanes", () => {
     getPr: async (_repo, number) => ({ iid: number, state: "open", headSha: head, webUrl: "" } as ChangeRequest),
     listComments: async () => [{ id: 1, author: "ivy-bot", body: `<!-- ranger:review round=1 sha=${head} blockers=1 majors=0 nits=0 -->` }],
    };
-   r.journal.upsertWorker({ root: 1, nodeId: "90", repo: GAME, status: "running", lane: "implement" });
+   r.journal.upsertWorker({ root: 1, nodeId: "90", repo: GAME, status: "running", lane: "implement", pid: process.pid });
    const spawned: string[] = [];
    const posts: string[] = [];
    const desk = (index: number) => runMergeDesk({
@@ -302,7 +303,7 @@ describe("node #57/#47 — root-aware resource lanes", () => {
  test("read-only dashboard reads both resource holders", () => {
   const r = rig();
   try {
-   r.journal.upsertWorker({ root: 1, nodeId: "90", repo: GAME, status: "running", lane: "implement" });
+   r.journal.upsertWorker({ root: 1, nodeId: "90", repo: GAME, status: "running", lane: "implement", pid: process.pid });
    r.journal.upsertWorker({ root: 1, nodeId: "91", repo: TOOL, status: "claimed", lane: "implement" });
    const reader = new ServeReader(r.config, servedMaps(r.config), r.config.state.journalPath);
    const state = stateFromJournal(r.config, servedMaps(r.config), reader);
