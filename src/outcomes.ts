@@ -26,6 +26,12 @@ export function rebaseConflictParkOutcome(r: { here: string; label: string; prHe
  return `rebase merge conflicts: the worktree (${r.here.slice(0, 8)}) and ${r.label}'s head (${r.prHead.slice(0, 8)}): ${r.files.join(", ")}. The merge was aborted; resolve the conflict, then resume`;
 }
 
+/** The park when the base merge after a red supervisor test run, on a branch with no PR yet, conflicts (ranger issue #463). */
+export function behindBaseConflictParkOutcome(r: { what: string; branch: string; base: string; baseSha: string; behind: number; here: string; files: string[] }): string {
+ return `${r.what} failed with ${r.branch} ${r.behind} commit(s) behind origin/${r.base}, and merging origin/${r.base} at ${r.baseSha} conflicts in: ${r.files.join(", ")}. ` +
+  `The merge was aborted; the worktree is back at ${r.here.slice(0, 8)} and nothing was pushed. Merge the base and resolve the conflict, then resume`;
+}
+
 export function parseHeadPark(outcome: string): { kind: "foreign" | "conflict"; here: string; prHead: string } | null {
  const foreign = /^the worktree \(([0-9a-f]{8})\) has commits .+?'s head \(([0-9a-f]{8})\) does not contain: someone pushed/.exec(outcome);
  if (foreign !== null) return { kind: "foreign", here: foreign[1], prHead: foreign[2] };

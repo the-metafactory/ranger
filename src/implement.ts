@@ -61,6 +61,7 @@ import {
  closeRefusedOutcome,
  foreignPushParkOutcome,
  rebaseConflictParkOutcome,
+ behindBaseConflictParkOutcome,
 } from "./outcomes.ts";
 import { GRAPH_CALL_TIMEOUT_MS, graphNode, somaRepo, type NodeResult } from "./graph.ts";
 import { finishClosedElsewhere } from "./closed-elsewhere.ts";
@@ -2298,6 +2299,47 @@ async function catchUpWithBase(ctx: ImplementContext, testCommand: string): Prom
  return baseMergePass(ctx, testCommand, { kind: "local", baseSha }, { behind, limit });
 }
 
+async function mergeBaseAfterRedTests(ctx: ImplementContext, what: string, baseSha: string): Promise<boolean> {
+ const { worktree, journal, map, branch } = ctx;
+ const repo = map.repo;
+ const nodeId = ctx.node.ref.id;
+ const base = map.base;
+ const hasPr = (journal.getWorker(nodeId, repo)?.prNumber ?? null) !== null;
+ if (hasPr || (await dirtyFiles(worktree)).length > 0) return false;
+ const git = (args: string[], timeoutMs = 30_000) => safeGit(["--no-replace-objects", ...args], { cwd: worktree, timeoutMs });
+ const count = await git(["rev-list", "--count", `HEAD..${baseSha}`]);
+ const behind = count.code === 0 ? Number(count.stdout.trim()) : 0;
+ if (!(behind > 0) || (await git(["merge-base", "HEAD", baseSha])).code !== 0) return false;
+ const here = await headSha(worktree);
+ const author = commitAuthorFor(ctx.config, repo, ctx.commitAuthor);
+ const identity = author === undefined ? [] : ["-c", `user.name=${author.name}`, "-c", `user.email=${author.email}`];
+ journal.assertGeneration(nodeId, repo, ctx.generation, `merge origin/${base} after ${what} failed`);
+ const merge = await git([...identity, "merge", "--no-edit", "--no-ff", "-m", `Merge origin/${base} (${baseSha.slice(0, 8)}) into ${branch}`, baseSha], 120_000);
+ if (merge.code !== 0) {
+  const conflicts = await git(["diff", "--name-only", "--diff-filter=U"], 10_000);
+  const files = conflicts.code === 0 ? conflicts.stdout.trim().split("\n").filter(Boolean) : [];
+  if (files.length === 0) {
+   journal.recordEvent("worktree-not-synced", {
+    nodeId,
+    repo,
+    detail: `${what} failed with ${branch} ${behind} commit(s) behind origin/${base}, and merging origin/${base} ${baseSha} did not run: ${merge.stderr.trim() || merge.stdout.trim()} — the failure stands`.slice(0, 400),
+   });
+   return false;
+  }
+  journal.assertGeneration(nodeId, repo, ctx.generation, `abort the merge of origin/${base}`);
+  const abort = await git(["merge", "--abort"]);
+  if (abort.code !== 0) throw new GitSafetyError(`cannot abort the merge of origin/${base} in ${worktree}: ${abort.stderr.trim()}`);
+  throw new ParkSignal(behindBaseConflictParkOutcome({ what, branch, base, baseSha, behind, here, files }));
+ }
+ const sha = await headSha(worktree);
+ journal.recordEvent("worktree-synced", {
+  nodeId,
+  repo,
+  detail: `${what} failed with ${branch} ${behind} commit(s) behind origin/${base}: merged origin/${base} ${baseSha} into ${here} as ${sha}, and the tests run again`,
+ });
+ return true;
+}
+
 /**
  * Fetch the base into the canonical clone and return origin/<base>'s commit
  * as fetched, read before any worker runs: the worker shares the repository
@@ -2553,6 +2595,7 @@ async function checkedWorkerPass(
   worktree,
   botIdentity,
   testCommand,
+  base: map.base,
   ...(spec.kind === "fix" || spec.kind === "finish-fix"
    ? { review: { round: spec.round, body: spec.body, ...(spec.kind === "finish-fix" ? { finish: true } : {}) }, rulings: spec.rulings }
    : {}),
@@ -3781,6 +3824,7 @@ async function adoptBuiltWork(
  ctx: ImplementContext,
  testCommand: string,
  fix?: { round: number; pushedHead: string },
+ baseMerged = false,
 ): Promise<PassResult | null> {
  const { map, worktree, journal, node } = ctx;
  if (fix === undefined ? (await commitsAhead(worktree, map.base)) === 0 : !(await fixCommitsOn(worktree, fix.pushedHead))) {
@@ -3816,6 +3860,9 @@ async function adoptBuiltWork(
  // parks and a resume waits for a quiet host to adopt the work then.
  if (tests.code !== 0 && busy !== null) {
   throw hostLoadPark(ctx, busy, `the adoption tests (${testCommand}) on the ${what} a previous run committed`, tests);
+ }
+ if (tests.code !== 0 && fix === undefined && !baseMerged && !remoteTests(ctx)) {
+  if (await mergeBaseAfterRedTests(ctx, `the adoption tests (${testCommand})`, await fetchBaseTrusted(ctx))) return adoptBuiltWork(ctx, testCommand, undefined, true);
  }
  if (tests.code !== 0) {
   if (remoteTests(ctx)) return { workerExit: null, snapshot, sha, failure: { status: "failed", detail: tests.stderr, workerExit: null } };

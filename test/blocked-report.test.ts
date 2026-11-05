@@ -114,6 +114,7 @@ test("the implement prompt tells the worker to report a block, never to commit a
   worktree: "/w",
   botIdentity: "bot",
   testCommand: "bun test",
+  base: "main",
  });
  expect(prompt).toContain(`Write \`${BLOCKED_REPORT_FILE}\` at the worktree root, leave it\n  uncommitted, and exit 0.`);
  expect(prompt).toContain("do NOT commit a note, a stub or a partial");
