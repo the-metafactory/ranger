@@ -573,6 +573,7 @@ export async function runNode(
    const reserved = journal.reserveWorker(candidate);
    if (reserved === null) throw new FencedError(`node ${nodeId} ownership changed before start`);
    generation = reserved;
+   ctx.onGenerationBegun?.(generation);
    journal.adoptReservation(nodeId, repo, generation, process.pid);
   }
  } catch (error) {
@@ -582,7 +583,7 @@ export async function runNode(
  }
  journal = journal.forWorker(nodeId, repo, generation);
  ctx = { ...ctx, journal };
- ctx.onGenerationBegun?.(generation);
+ if (ctx.generation !== undefined) ctx.onGenerationBegun?.(generation);
 
  try {
   // A GitLab map's graph reads run under its read gate (node #122).

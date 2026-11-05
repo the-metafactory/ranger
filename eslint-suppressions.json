@@ -507,7 +507,7 @@
       "count": 1
     },
     "ranger/no-comments": {
-      "count": 28
+      "count": 25
     }
   },
   "src/remote-test/artifacts.ts": {
@@ -937,7 +937,7 @@
       "count": 1
     },
     "ranger/no-comments": {
-      "count": 16
+      "count": 15
     }
   },
   "src/token-gate.ts": {
@@ -1457,11 +1457,6 @@
   "test/journal.test.ts": {
     "ranger/no-comments": {
       "count": 3
-    }
-  },
-  "test/lanes.test.ts": {
-    "ranger/no-comments": {
-      "count": 1
     }
   },
   "test/merge-desk.test.ts": {

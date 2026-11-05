@@ -516,7 +516,7 @@ export class Journal {
    owner === undefined ? undefined : and(eq(workers.generation, owner.generation), sql`${workers.status} != 'stop-requested'`)))
    .returning({ nodeId: workers.nodeId }).all();
   if (owner !== undefined && changed.length === 0) {
-   const detail = `node ${nodeId}: generation ${owner.generation} fenced from worker state write`;
+   const detail = `node ${nodeId}: generation ${owner.generation} superseded or stopped; fenced from worker state write`;
    this.recordEvent("fenced", { nodeId, repo, detail });
    throw new FencedError(detail);
   }

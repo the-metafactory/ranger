@@ -4192,7 +4192,7 @@ describe("implement lane (node #23)", () => {
   r.journal.updateWorker("20", "acme/widgets", { status: "awaiting-merge", phase: "awaiting-merge", mergeMessageId: "old-card" });
   r.ctx.config.workers.reviewRounds = 2;
   // Another implement worker holds the lane.
-  r.journal.upsertWorker({ root: 1, nodeId: "99", repo: "acme/widgets", status: "running", lane: "implement" });
+  r.journal.upsertWorker({ root: 1, nodeId: "99", repo: "acme/widgets", status: "running", lane: "implement", pid: process.pid });
 
   const posts: string[] = [];
   const spawned: string[] = [];
