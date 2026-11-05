@@ -2842,13 +2842,36 @@ describe("implement lane (node #23)", () => {
   expect(c.prompts.filter((p) => p.includes("## CI fix pass"))).toHaveLength(1);
  }, 60_000);
 
+ test.each([
+  { label: "names", output: "(fail) first test\n(fail) second test", names: "failing: first test; second test", tail: "(fail) first test\n(fail) second test", stream: "stderr" },
+  { label: "unavailable names", output: "runner exited before reporting tests", names: "failing test names unavailable", tail: "runner exited before reporting tests", stream: "stdout" },
+  { label: "a partial first line", output: `(fail) first test\n(fail) second test\n(todo) provider contract ${"x".repeat(700)}\n${"complete output line\n".repeat(25)}finished`, names: "failing: first test; second test", tail: `${"complete output line\n".repeat(25)}finished`, stream: "stderr" },
+  { label: "a cut already at a line boundary", output: `${"x".repeat(700)}\ncomplete line\n${"x".repeat(586)}`, names: "failing test names unavailable", tail: `complete line\n${"x".repeat(586)}`, stream: "stderr" },
+  { label: "no complete line in the tail", output: "x".repeat(700), names: "failing test names unavailable", tail: "", stream: "stderr" },
+ ])("failed-test detail separates output tail with $label", async ({ output, names, tail, stream }) => {
+  const r = await rig({ test: "run-tests" });
+  cleanup.push(r.dir);
+  r.ctx.shellRun = async () => ({ code: 1, stdout: stream === "stdout" ? output : "", stderr: stream === "stderr" ? output : "" });
+  const outcome = await runNode("20", r.ctx);
+  const detail = `tests (run-tests) failed after the worker (exit 1) — ${names} — output tail: ${tail}`;
+  expect(outcome.status).toBe("failed");
+  expect(outcome.detail).toStartWith(`${detail} (worker log: `);
+  const stored = r.journal.getWorker("20", "acme/widgets")!.outcome;
+  expect(stored).toBe(outcome.detail.slice(0, 400));
+  expect(stored).toContain(` — ${names} — output tail: `);
+  if (detail.length > 400) {
+   expect(stored).toHaveLength(400);
+   expect(stored).toBe(detail.slice(0, 400));
+  }
+ }, 60_000);
+
  test("a failed supervisor test run names its failing test and keeps its whole output in the node's log", async () => {
   // Red on the branch only: the base has no src/feature.ts.
   const r = await rig({ test: "if [ -f src/feature.ts ]; then echo \"(fail) the hud draws [3.00ms]\" >&2; echo \" 1 fail\" >&2; exit 1; fi" });
   cleanup.push(r.dir);
   const outcome = await runNode("20", r.ctx);
   expect(outcome.status).toBe("failed");
-  expect(outcome.detail).toContain("failed after the worker (exit 1) — failing: the hud draws:");
+  expect(outcome.detail).toContain("failed after the worker (exit 1) — failing: the hud draws — output tail:");
   const log = /\(worker log: ([^)]+)\)/.exec(outcome.detail)?.[1] ?? "";
   expect(readFileSync(log, "utf8")).toContain("build pass: supervisor tests");
   const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
@@ -3051,7 +3074,7 @@ describe("implement lane (node #23)", () => {
    const r = await bunRig("echo \"(fail) shared\"; if [ -f src/feature.ts ]; then echo \"(fail) branch only\"; echo \" 2 fail\"; fi; exit 1");
    const outcome = await runNode("20", r.ctx);
    expect(outcome.status).toBe("failed");
-   expect(outcome.detail).toContain("failing: shared; branch only:");
+   expect(outcome.detail).toContain("failing: shared; branch only — output tail:");
    const sha = await mergeBase(r);
    expect(reviewed(r).some((d) => d.endsWith(`at the merge base ${sha} fails another set (exit 1) — not red there, they gate: branch only`))).toBe(true);
    expect(reviewed(r)).toContain(`tests (bun test) at the merge base ${sha} fail another set; no rerun there: branch only name(s) no test file a rerun can select`);
@@ -3118,7 +3141,7 @@ describe("implement lane (node #23)", () => {
    const r = await bunRig("echo \"(fail) one\"; echo \"(fail) two\"; echo \"(fail) three\"; if [ -f src/feature.ts ]; then echo \"(fail) four\"; echo \" 4 fail\"; fi; exit 1");
    const outcome = await runNode("20", r.ctx);
    expect(outcome.status).toBe("failed");
-   expect(outcome.detail).toContain("failing: one; two; three:");
+   expect(outcome.detail).toContain("failing: one; two; three — output tail:");
    expect(reviewed(r).some((d) => d.endsWith("not red there, they gate: four"))).toBe(true);
    expect(r.github.prs.size).toBe(0);
   }, 60_000);
@@ -3380,7 +3403,7 @@ describe("implement lane (node #23)", () => {
    const r = await bunRig("echo \"(fail) shared\"; echo \" 1 fail\"; exit 1", { install: "case \"$PWD\" in *ranger-test-base-*) exit 3 ;; esac" });
    const outcome = await runNode("20", r.ctx);
    expect(outcome.status).toBe("failed");
-   expect(outcome.detail).toContain("failing: shared:");
+   expect(outcome.detail).toContain("failing: shared — output tail:");
    const sha = await mergeBase(r);
    expect(reviewed(r)).toContain(`tests (bun test) failed; the merge-base check at ${sha} did not run: install for the merge-base run failed — the failures gate`);
   }, 60_000);

@@ -3266,7 +3266,7 @@ export function failedTestNames(result: RunResult): string[] {
 /** A failed supervisor test run, named: the failing tests first (the journal keeps 400 characters), then the tail. */
 function testsFailedDetail(testCommand: string, tests: RunResult, after: string): string {
  const names = failedTestNames(tests);
- return `tests (${testCommand}) failed ${after} (exit ${tests.code})${names.length > 0 ? ` — failing: ${names.join("; ")}` : " — failing test names unavailable"}: ${tail(tests)}`;
+ return `tests (${testCommand}) failed ${after} (exit ${tests.code})${names.length > 0 ? ` — failing: ${names.join("; ")}` : " — failing test names unavailable"} — output tail: ${tail(tests)}`;
 }
 
 /**
@@ -3903,7 +3903,13 @@ async function fixCommitsOn(worktree: string, pushedHead: string): Promise<boole
 }
 
 function tail(result: RunResult): string {
- return (result.stderr.trim() || result.stdout.trim()).slice(-600);
+ const output = result.stderr.trim() || result.stdout.trim();
+ let start = Math.max(0, output.length - 600);
+ if (start > 0 && output[start - 1] !== "\n") {
+  const newline = output.indexOf("\n", start);
+  start = newline === -1 ? output.length : newline + 1;
+ }
+ return output.slice(start);
 }
 
 /** The node title, refused if it would carry a closing keyword into the squash message. */
