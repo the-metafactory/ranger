@@ -1,3 +1,4 @@
+import { startOwnedWorker, reservationPending, startFailureOutcome } from "./node-ownership.ts";
 import { recordImplementStart, mapKey } from "./maps.ts";
 import { implementLane, startsImplementSession, type ImplementLane } from "./lanes.ts";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
@@ -34,13 +35,7 @@ export interface SweepContext {
  botIdentity: string;
  /** The credential graph reads run under (`graphReadToken`); the write token when unset. */
  graphToken?: ResolvedToken;
- /**
-  * Called to (re)spawn a detached run-node: a crashed worker's respawn, and
-  * the merge desk's resume-for-close. Returns the new supervisor's PID, or
-  * null when nothing spawned (spawn cap, no hook) — the claim stays and the
-  * next tick's sweep retries.
-  */
- respawn?: (nodeId: string, repo: string, root: number) => Promise<number | null>;
+ respawn?: (nodeId: string, repo: string, root: number, generation: number) => Promise<number | null>;
  /** Merge-desk seams (tests): the forge and the Discord post. */
  github?: ForgePort;
  /**
@@ -92,68 +87,56 @@ export async function sweepMap(ctx: SweepContext): Promise<SweepMapResult> {
    : journal.listWorkers(repo, map.root).filter((w) => w.status === "claimed" || w.status === "running");
 
  for (const worker of inFlight) {
-  // No observed PID = no supervisor yet (freshly claimed, spawn pending, or
-  // the no-spawn seam). There is nothing to be dead; leave it for the next
-  // tick. Only a row that HAD a supervisor is a crash candidate.
-  if (worker.pid === null) continue;
-  if (pidAlive(worker.pid)) continue; // genuinely in-flight
-  const current = journal.getWorker(worker.nodeId, repo);
-  if (current?.status !== "claimed" && current?.status !== "running") continue;
-  result.crashed += 1;
-  journal.recordEvent("sweep", {
-   nodeId: worker.nodeId,
-   repo,
-   detail: `crashed worker (pid ${worker.pid ?? "?"}) with no outcome — attempt ${worker.attempts}/${config.workers.maxAttempts}`,
-  });
-
-  // The supervisor is dead, but its worker session may not be: a group the
-  // dead supervisor started is reparented and keeps running in the worktree.
-  // Kill it before a new occupant adopts the worktree (#23 F1) — but only
-  // when a live member still names this node's worktree, never on the
-  // journal's recorded group id alone (group ids are recycled).
+  if (worker.pid === null && reservationPending(worker)) continue;
+  if (worker.pid !== null && pidAlive(worker.pid)) continue;
+  const generation = journal.reserveWorker(worker);
+  if (generation === null) continue;
+  const scoped = journal.forWorker(worker.nodeId, repo, generation);
   if (worker.workerPgid !== null && worker.worktree !== null) {
    const commands = await processGroupCommands(worker.workerPgid);
-   const ours = commands.some((c) => c.includes(worker.worktree as string));
+   scoped.assertGeneration(worker.nodeId, repo, generation, "reconcile orphan worker");
+   const ours = commands.some(command => command.includes(worker.worktree as string));
    if (ours && killProcessGroup(worker.workerPgid)) {
     result.orphansKilled.push(worker.nodeId);
-    journal.recordEvent("orphan-killed", {
-     nodeId: worker.nodeId,
-     repo,
-     detail: `killed orphaned worker group ${worker.workerPgid} (${commands.length} process(es)) in ${worker.worktree}`,
-    });
+    journal.recordEvent("orphan-killed", { nodeId: worker.nodeId, repo,
+     detail: `killed orphaned worker group ${worker.workerPgid} (${commands.length} process(es)) in ${worker.worktree}` });
    }
-   journal.updateWorker(worker.nodeId, repo, { workerPgid: null });
   }
-
+  scoped.updateWorker(worker.nodeId, repo, { workerPgid: null });
+  if (worker.pid === null) {
+   const detail = `abandoned worker reservation without a supervisor PID; resume node ${worker.nodeId} to retry`;
+   scoped.updateWorker(worker.nodeId, repo, {
+    status: "parked", outcome: startFailureOutcome(worker.outcome, detail, true), finishedAt: new Date().toISOString(),
+   });
+   result.parked.push(worker.nodeId);
+   journal.recordEvent("parked", { nodeId: worker.nodeId, repo, detail });
+   continue;
+  }
+  result.crashed += 1;
+  journal.recordEvent("sweep", { nodeId: worker.nodeId, repo,
+   detail: `crashed worker (pid ${worker.pid}) with no outcome — attempt ${worker.attempts}/${config.workers.maxAttempts}` });
   if (worker.attempts < config.workers.maxAttempts) {
-   if (startsImplementSession(worker)) {
-    if (ctx.reservedLanes?.has(implementLane(map))) continue;
-    const holder = journal.laneHolder(implementLane(map), { nodeId: worker.nodeId, repo },
-     row => row.pid === null || pidAlive(row.pid));
-    if (holder !== null) {
-     journal.recordEvent("sweep", { nodeId: worker.nodeId, repo,
-      detail: `respawn waits for the ${implementLane(map)} implement lane (held by #${holder.nodeId}, ${mapKey(holder)})` });
-     continue;
-    }
+   const holder = startsImplementSession(worker) ? journal.laneHolder(implementLane(map), { nodeId: worker.nodeId, repo },
+    row => row.pid === null || pidAlive(row.pid)) : null;
+   const reservedLane = startsImplementSession(worker) && ctx.reservedLanes?.has(implementLane(map));
+   if (holder !== null || reservedLane) {
+    scoped.updateWorker(worker.nodeId, repo, { status: worker.status, pid: worker.pid, startedAt: worker.startedAt });
+    journal.recordEvent("sweep", { nodeId: worker.nodeId, repo,
+     detail: `respawn waits for the ${implementLane(map)} implement lane${holder === null ? " reserved by priority work" : ` (held by #${holder.nodeId}, ${mapKey(holder)})`}` });
+    continue;
    }
    const attempt = worker.attempts + 1;
-   journal.updateWorker(worker.nodeId, repo, {
-    status: "claimed",
-    attempts: attempt,
-    pid: null,
+   scoped.updateWorker(worker.nodeId, repo, { attempts: attempt });
+   const pid = await startOwnedWorker({ journal, row: worker, generation,
+    spawn: generation => ctx.respawn === undefined ? Promise.resolve(null) : ctx.respawn(worker.nodeId, repo, worker.root, generation),
    });
-   const pid = ctx.respawn === undefined ? null : await ctx.respawn(worker.nodeId, repo, worker.root);
    if (pid !== null) {
-    journal.updateWorker(worker.nodeId, repo, { pid });
     if (startsImplementSession(worker)) recordImplementStart(journal, map);
     result.respawned.push(worker.nodeId);
     journal.recordEvent("sweep", { nodeId: worker.nodeId, repo, detail: respawnedEvent(attempt) });
    } else {
-    journal.recordEvent("sweep", {
-     nodeId: worker.nodeId,
-     repo,
-     detail: `respawn refused (spawn cap or no respawn hook) — claim kept for the next tick`,
-    });
+    journal.recordEvent("sweep", { nodeId: worker.nodeId, repo,
+     detail: "respawn did not start; parked for operator resume with its crash-attempt budget preserved" });
    }
   } else {
    result.parked.push(worker.nodeId);
@@ -162,8 +145,9 @@ export async function sweepMap(ctx: SweepContext): Promise<SweepMapResult> {
     repo,
     detail: `crashed ${config.workers.maxAttempts} times — parking; releasing the claim`,
    });
+   scoped.assertGeneration(worker.nodeId, repo, generation, "release crashed worker claim");
    const released = await graphRelease(repo, worker.nodeId, botIdentity, token);
-   journal.upsertWorker({
+   scoped.upsertWorker({
     nodeId: worker.nodeId,
     repo,
     root: worker.root,

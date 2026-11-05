@@ -65,6 +65,10 @@ function remoteBackend(r: Rig, opts: { status?: RemoteTestStatus; mutate?: (requ
  return requests;
 }
 
+function reclaim(r: Rig): void {
+ r.journal.updateWorker("20", "acme/widgets", { status: "claimed", startedAt: null, pid: null });
+}
+
 describe("remote supervisor backend integration", () => {
  const cleanup: string[] = [];
  afterEach(() => {
@@ -290,7 +294,7 @@ describe("implement lane (node #23)", () => {
   return fixtureGit(wt, ["rev-parse", "HEAD"]);
  };
  const resumeReview = async (r: Rig) => {
-  r.journal.updateWorker("20", "acme/widgets", { status: "claimed", phase: "review" });
+  r.journal.updateWorker("20", "acme/widgets", { status: "claimed", phase: "review", startedAt: null, pid: null });
   return runNode("20", r.ctx);
  };
 
@@ -672,7 +676,7 @@ describe("implement lane (node #23)", () => {
   expect(r.calls).toHaveLength(1);
 
   mode[1] = "build";
-  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  reclaim(r);
   const resumed = await runNode("20", r.ctx);
   expect(resumed.status).toBe("awaiting-merge");
   expect(r.calls).toHaveLength(2); // round 1 was read back from the PR, not re-run
@@ -719,7 +723,7 @@ describe("implement lane (node #23)", () => {
   r.ctx.workerCommand = mode;
   expect((await runNode("20", r.ctx)).status).toBe("failed");
   mode[1] = "build";
-  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  reclaim(r);
   const worktree = r.journal.getWorker("20", "acme/widgets")?.worktree as string;
   const head = async () => (await runCmd("git", ["rev-parse", "HEAD"], { cwd: worktree })).stdout.trim();
   return { r, worktree, head };
@@ -970,7 +974,7 @@ describe("implement lane (node #23)", () => {
   if (workerCommand !== undefined) r.ctx.workerCommand = workerCommand;
   expect((await runNode("20", r.ctx)).status).toBe("failed");
   expect(r.github.prs.size).toBe(0);
-  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  reclaim(r);
   const worktree = r.journal.getWorker("20", "acme/widgets")?.worktree as string;
   return { r, worktree, head: (await git(["rev-parse", "HEAD"], worktree)).stdout.trim() };
  };
@@ -1238,7 +1242,7 @@ describe("implement lane (node #23)", () => {
    r.ctx.map.commands.test = "test -f src/feature.ts";
    await moveOriginMain(r);
    const fetched = await fetchedMain(r);
-   r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+   reclaim(r);
    const resumed = await runNode("20", r.ctx);
    expect(resumed.status).toBe("parked");
    expect(resumed.detail).toContain("http.sslverify (new)");
@@ -1252,7 +1256,7 @@ describe("implement lane (node #23)", () => {
    expect(r.github.prs.size).toBe(0);
 
    // Parked again on the next resume: the changed state was not adopted.
-   r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+   reclaim(r);
    expect((await runNode("20", r.ctx)).status).toBe("parked");
 
    // The operator vets the change and trusts it; the node then runs (from a
@@ -1260,7 +1264,7 @@ describe("implement lane (node #23)", () => {
    const { hash } = await trustCurrentGitState(r.journal, r.canonical, "acme/widgets");
    await trustCurrentGitState(r.journal, r.canonical, "acme/widgets", hash);
    await git(["reset", "--hard", "refs/remotes/origin/main"], join(r.canonical, ".worktrees", "node-20"));
-   r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+   reclaim(r);
    expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
    expect(await fetchedMain(r)).not.toBe(fetched);
   }, 60_000);
@@ -1276,7 +1280,7 @@ describe("implement lane (node #23)", () => {
    r.ctx.workerCommand = [implementWorker, "noop"]; // a worker session would commit nothing and fail, not park
    await moveOriginMain(r);
    const fetched = await fetchedMain(r);
-   r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+   reclaim(r);
    const resumed = await runNode("20", r.ctx);
    expect(resumed.status).toBe("parked");
    expect(resumed.detail).toContain("http.sslverify (new)");
@@ -1302,7 +1306,7 @@ describe("implement lane (node #23)", () => {
    r.ctx.map.commands.test = "test -f src/feature.ts";
    await moveOriginMain(r);
    const fetched = await fetchedMain(r);
-   r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+   reclaim(r);
    const resumed = await runNode("20", r.ctx);
    expect(resumed.status).toBe("parked");
    expect(resumed.detail).toContain("http.sslverify (new)");
@@ -1325,7 +1329,7 @@ describe("implement lane (node #23)", () => {
    expect((await git(["config", "--get-regexp", "^branch\\.node/21-"], r.canonical)).stdout.trim()).toBe("");
 
    r.ctx.workerCommand = [implementWorker, "build"];
-   r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+   reclaim(r);
    expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
   }, 60_000);
 
@@ -1342,7 +1346,7 @@ describe("implement lane (node #23)", () => {
 
    await bootstrapWorktree(r.canonical, "21", "another-node", gitCredential("acme/widgets", "tok"));
    r.ctx.workerCommand = [implementWorker, "build"];
-   r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+   reclaim(r);
    expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
   }, 60_000);
 
@@ -1354,7 +1358,7 @@ describe("implement lane (node #23)", () => {
 
    expect((await git(["config", "url.https://bot:SECRETTOKEN@github.com/.insteadOf", "https://github.com/"], r.canonical)).code).toBe(0);
    r.ctx.workerCommand = [implementWorker, "build"];
-   r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+   reclaim(r);
    const parked = await runNode("20", r.ctx);
    expect(parked.status).toBe("parked");
    expect(parked.detail).toMatch(/url\.<[0-9a-f]{12}>\.insteadof \(new\)/);
@@ -1374,7 +1378,7 @@ describe("implement lane (node #23)", () => {
    r.ctx.map.commands.test = "test -f src/feature.ts";
    await moveOriginMain(r);
    const fetched = await fetchedMain(r);
-   r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+   reclaim(r);
    const resumed = await runNode("20", r.ctx);
    expect(resumed.status).toBe("parked");
    expect(resumed.detail).toStartWith("git config include refused: include.path in config");
@@ -1393,7 +1397,7 @@ describe("implement lane (node #23)", () => {
 
    expect((await git(["config", "--worktree", "includeIf.onbranch:main.path", "/tmp/evil.gitconfig"], r.canonical)).code).toBe(0);
    r.ctx.workerCommand = [implementWorker, "build"];
-   r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+   reclaim(r);
    const parked = await runNode("20", r.ctx);
    expect(parked.status).toBe("parked");
    expect(parked.detail).toContain(`${keyLabel("includeif.onbranch:main.path")} in config.worktree`);
@@ -1413,7 +1417,7 @@ describe("implement lane (node #23)", () => {
 
    writeFileSync(Buffer.concat([Buffer.from(join(r.canonical, ".git", "hooks", "pre-push")), Buffer.from([0xfe])]), "#!/bin/sh\n");
    r.ctx.workerCommand = [implementWorker, "build"];
-   r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+   reclaim(r);
    const parked = await runNode("20", r.ctx);
    expect(parked.status).toBe("parked");
    expect(parked.detail).toMatch(/not UTF-8/);
@@ -1762,7 +1766,7 @@ describe("implement lane (node #23)", () => {
   expect(r.journal.getWorker("20", "acme/widgets")?.status).toBe("running");
   expect(r.journal.listEvents("acme/widgets", 200).some((e) => e.kind === "transient")).toBe(true);
   expect(state(r.statePath).nodes["20"].status).not.toBe("closed");
-  // The respawn's close goes through.
+  r.journal.updateWorker("20", "acme/widgets", { pid: 2_147_483_647 });
   expect((await runNode("20", r.ctx)).status).toBe("success");
   expect(state(r.statePath).nodes["20"].status).toBe("closed");
  }, 60_000);
@@ -2277,7 +2281,7 @@ describe("implement lane (node #23)", () => {
    expect(await r.github.sha(branch)).toBe(local);
    return { verdict: "approved", summary: "reconciled", commitId: local, blockers: 0, majors: 0, nits: 0, body: "No changes requested." };
   };
-  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  reclaim(r);
   const outcome = await runNode("20", r.ctx);
   expect(readFileSync(tested, "utf8").trim()).toBe(local);
   expect(outcome.status).toBe(testsFail ? "failed" : "awaiting-merge");
@@ -2299,7 +2303,7 @@ describe("implement lane (node #23)", () => {
   expect(r.calls).toHaveLength(2);
   expect(markers()).toHaveLength(1);
 
-  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  reclaim(r);
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
   expect(prompts.filter((p) => p.includes("## Finish pass"))).toHaveLength(1);
   expect(markers()).toHaveLength(1);
@@ -2323,7 +2327,7 @@ describe("implement lane (node #23)", () => {
   expect(p.markers().map((m) => m.body.split("\n")[0])).toEqual([`<!-- ranger:probe-fix sha=${head} red=${head} -->`]);
   expect(p.r.calls).toHaveLength(1);
 
-  p.r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  reclaim(p.r);
   expect((await runNode("20", p.r.ctx)).status).toBe("parked");
   expect(p.fixPrompts()).toHaveLength(1);
   expect(p.events().some((d) => d.includes("where a probe fix pass found nothing in the branch to change: it parks"))).toBe(true);
@@ -2353,7 +2357,7 @@ describe("implement lane (node #23)", () => {
   const fixes = () => (r.github.comments.get(1) ?? []).filter((c) => c.body.includes("ranger:probe-fix"));
   expect(fixes()).toHaveLength(1);
 
-  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  reclaim(r);
   const resumed = await runNode("20", r.ctx);
   expect(resumed.status).toBe("parked");
   expect(resumed.detail).toContain("browser probes failed twice");
@@ -2654,7 +2658,7 @@ describe("implement lane (node #23)", () => {
   await r.github.postComment("acme/widgets", 1, baseMergeMarker("f".repeat(40), "release/1.0+hotfix"));
 
   r.ctx.workerCommand = [implementWorker, "build"];
-  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  reclaim(r);
   // Counted naively, two markers would use up both merge passes and park it.
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
   const head = await r.github.sha("node/20-add-the-feature-module");
@@ -3609,7 +3613,7 @@ describe("implement lane (node #23)", () => {
     expect(outcome.detail).toContain("the retry was killed with no failing test while the host was busy");
     // A hanging suite's own load reads busy too: the second kill in a day counts.
     r.journal.removeResume(queued[0], "resume-cancelled", "test");
-    r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+    reclaim(r);
     sequence();
     expect((await runNode("20", r.ctx)).status).toBe("failed");
     expect(r.journal.listResumeQueue()).toEqual([]);
@@ -3628,7 +3632,7 @@ describe("implement lane (node #23)", () => {
   expect(r.github.prs.size).toBe(0);
   writeFileSync(flag, ""); // whatever broke the tests is gone
   r.ctx.workerCommand = [implementWorker, "noop"]; // a worker session would commit nothing and fail
-  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  reclaim(r);
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
   const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
   expect(events.some((d) => d.startsWith("adopting ") && d.includes("no new worker session"))).toBe(true);
@@ -3646,7 +3650,7 @@ describe("implement lane (node #23)", () => {
   expect((await runNode("20", r.ctx)).status).toBe("failed");
   writeFileSync(flag, "");
   r.ctx.workerCommand = [implementWorker, "noop"]; // only adoption can pass it
-  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  reclaim(r);
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
   const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
   expect(events.some((d) => d.startsWith("adopting "))).toBe(true);
@@ -3671,7 +3675,7 @@ describe("implement lane (node #23)", () => {
   expect((await runNode("20", r.ctx)).status).toBe("failed");
   writeFileSync(flag, "");
   r.ctx.workerCommand = [implementWorker, "noop"]; // only adoption can pass it
-  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  reclaim(r);
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
   const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
   expect(events.some((d) => d.startsWith("adopting "))).toBe(true);
@@ -3713,11 +3717,11 @@ describe("implement lane (node #23)", () => {
   expect((await runNode("20", r.ctx)).status).toBe("failed"); // Claude built it; the tests fail
   r.ctx.substrate = "codex";
   mode = "noop";
-  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  reclaim(r);
   expect((await runNode("20", r.ctx)).status).toBe("failed"); // still failing: Codex's session commits nothing
   writeFileSync(flag, "");
   r.ctx.substrate = "pi";
-  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  reclaim(r);
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
   expect(sessions).toBe(2); // the third run adopted: no session
   const head = await r.github.sha("node/20-add-the-feature-module");
@@ -3730,7 +3734,7 @@ describe("implement lane (node #23)", () => {
   cleanup.push(r.dir);
   expect((await runNode("20", r.ctx)).status).toBe("failed"); // the failed run leaves t.fixture behind
   r.ctx.workerCommand = [implementWorker, "noop"];
-  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  reclaim(r);
   expect((await runNode("20", r.ctx)).status).toBe("failed"); // not adopted; the worker has nothing to add
   const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
   expect(events.some((d) => d.includes("on the work a previous run committed") && d.endsWith("— the worker continues"))).toBe(true);
@@ -3748,7 +3752,7 @@ describe("implement lane (node #23)", () => {
   const loads = [2, 14, 13, 2];
   r.ctx.hostLoad = loadSequence(loads, 10);
   r.ctx.quietHost = { pollMs: 1, maxMs: 60_000 };
-  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  reclaim(r);
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
   const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
   expect(events.some((d) => d.startsWith("adoption tests failed on a busy host (load 14.0 on 10 cores)"))).toBe(true);
@@ -3789,7 +3793,7 @@ describe("implement lane (node #23)", () => {
   r.ctx.workerCommand = [implementWorker, "noop"];
   const sessions = countSessions(r);
   busyHost(r);
-  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  reclaim(r);
   const outcome = await runNode("20", r.ctx);
   expect(outcome.status).toBe("failed");
   expect(sessions).toHaveLength(0);
@@ -3806,7 +3810,7 @@ describe("implement lane (node #23)", () => {
   // The queued resume, on a quiet host, adopts the same commit with no worker session.
   writeFileSync(flag, "");
   r.ctx.hostLoad = () => ({ load: 2, cores: 10 });
-  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  reclaim(r);
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
   expect(sessions).toHaveLength(0);
   expect(r.journal.listEvents("acme/widgets", 200).some((e) => (e.detail ?? "").startsWith("adopting "))).toBe(true);
@@ -3820,7 +3824,7 @@ describe("implement lane (node #23)", () => {
   r.ctx.workerCommand = [implementWorker, "add-fixed"];
   const sessions = countSessions(r);
   quietsDown(r);
-  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  reclaim(r);
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
   expect(sessions).toHaveLength(1);
   const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
@@ -3877,7 +3881,7 @@ describe("implement lane (node #23)", () => {
   const writer = r.journal.headSubstrate("acme/widgets", unpushed);
   writeFileSync(flag, ""); // whatever broke the tests is gone
   r.ctx.workerCommand = [implementWorker, "noop"]; // a worker session would commit nothing and fail
-  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  reclaim(r);
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
   const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
   expect(events.some((d) => d.startsWith("resumed worktree pushed ") && d.includes(pushed) && d.includes(unpushed))).toBe(true);
@@ -3908,7 +3912,7 @@ describe("implement lane (node #23)", () => {
   r.ctx.workerCommand = [implementWorker, "noop"];
   const sessions = countSessions(r);
   const prior = r.journal.listEvents("acme/widgets", 1000).length;
-  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  reclaim(r);
   const resumed = await runNode("20", r.ctx);
   expect(resumed.status).toBe(scenario === "fail" ? "failed" : scenario === "review-cap" ? "parked" : "awaiting-merge");
   expect(readFileSync(tested, "utf8").trim()).toBe(unpushed);
@@ -3933,7 +3937,7 @@ describe("implement lane (node #23)", () => {
   cleanup.push(r.dir);
   expect((await runNode("20", r.ctx)).status).toBe("failed");
   r.ctx.workerCommand = [implementWorker, "add-fixed"];
-  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  reclaim(r);
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
   const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
   expect(events.some((d) => d.includes("on the work a previous run committed") && d.endsWith("— the worker continues"))).toBe(true);
@@ -4022,7 +4026,7 @@ describe("implement lane (node #23)", () => {
   expect(await r.github.sha("node/20-add-the-feature-module")).toBe("");
   // A resume once the condition holds runs a fresh worker: the old report does not park it again.
   r.ctx.workerCommand = [implementWorker];
-  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  reclaim(r);
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
  }, 60_000);
 
@@ -4045,7 +4049,7 @@ describe("implement lane (node #23)", () => {
   const ahead = await runCmd("git", ["rev-list", "--count", "origin/main..HEAD"], { cwd: worktree });
   expect(ahead.stdout.trim()).toBe("0");
   r.ctx.workerCommand = [implementWorker];
-  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  reclaim(r);
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
   const pushed = await runCmd("git", ["ls-tree", "-r", "--name-only", "refs/heads/node/20-add-the-feature-module"], { cwd: r.origin });
   expect(pushed.stdout).not.toContain("blocker");
@@ -4061,7 +4065,7 @@ describe("implement lane (node #23)", () => {
   writeFileSync(join(worktree, "docs", "BLOCKED.md"), "Waiting on the SDK.\n");
   await runCmd("git", ["add", "-A"], { cwd: worktree, env: { ...process.env, ...GIT_ENV } });
   await runCmd("git", ["commit", "-q", "-m", "docs: blocked"], { cwd: worktree, env: { ...process.env, ...GIT_ENV } });
-  r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+  reclaim(r);
   const resumed = await runNode("20", r.ctx);
   expect(resumed.status).toBe("parked");
   expect(resumed.detail).toMatch(/^blocked: the branch only adds a blocker note \(docs\/BLOCKED\.md\), not an implementation: Waiting on the SDK\. — resume condition: none given, read the worker log \(adopted build\)$/);
@@ -4130,7 +4134,7 @@ describe("implement lane (node #23)", () => {
    // loop never reviews a head that already has a review.
    await r.github.postComment("acme/widgets", 1, `${reviewMarker(2, { commitId: head, blockers: 0, majors, nits: 0 })}\nround two`);
 
-   r.journal.updateWorker("20", "acme/widgets", { status: "claimed" });
+   reclaim(r);
    const outcome = await runNode("20", r.ctx);
    expect(outcome.status).toBe(status);
    if (majors > 0) expect(outcome.detail).toContain("0 blocker(s) and 1 major(s) remain after 2 sage round(s)");
@@ -4192,7 +4196,7 @@ describe("implement lane (node #23)", () => {
   r.journal.updateWorker("20", "acme/widgets", { status: "awaiting-merge", phase: "awaiting-merge", mergeMessageId: "old-card" });
   r.ctx.config.workers.reviewRounds = 2;
   // Another implement worker holds the lane.
-  r.journal.upsertWorker({ root: 1, nodeId: "99", repo: "acme/widgets", status: "running", lane: "implement" });
+  r.journal.upsertWorker({ root: 1, nodeId: "99", repo: "acme/widgets", status: "running", lane: "implement", pid: process.pid });
 
   const posts: string[] = [];
   const spawned: string[] = [];

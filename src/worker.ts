@@ -1,3 +1,4 @@
+import { acquireGeneration } from "./node-ownership.ts";
 import type { RunOutcome } from "@the-metafactory/myelin";
 import { fileStemFor, parseForgeRef, qualifiedRepo } from "./forge-ref.ts";
 import { graphReadToken, laneCredentialRefusal, lanePort, type ReadGate } from "./forge-lanes.ts";
@@ -126,6 +127,7 @@ export interface RunNodeContext {
  journal: Journal;
  /** Observe the existing map-root read without fetching it again for the run ledger. */
  onMapRootRead?: (root: NodeResult) => void;
+ generation?: number;
  onGenerationBegun?: (generation: number) => void;
  /**
   * Worker command + leading args; the prompt is appended as the final arg.
@@ -495,8 +497,8 @@ function failNode(
   });
   return;
  }
- countFailure(config, journal, repo);
  finish(journal, nodeId, repo, "failed", detail);
+ countFailure(config, journal, repo);
 }
 
 /** Mark the row terminal: the supervisor PID is released only here (F1). */
@@ -524,7 +526,8 @@ export async function runNode(
  nodeId: string,
  ctx: RunNodeContext,
 ): Promise<RunNodeOutcome> {
- const { config, token, journal } = ctx;
+ const { config, token } = ctx;
+ let journal = ctx.journal;
  const map = ctx.map;
  const repo = map.repo;
  const refusal = laneCredentialRefusal(config, repo);
@@ -553,17 +556,18 @@ export async function runNode(
  // Take the node as a new occupant. A run-node with no claim row (an
  // operator's manual run) gets a running row first.
  if (row === null) {
-  journal.upsertWorker({ nodeId, repo, root: map.root, status: "running", attempts: 0 });
+  journal.insertWorker({ nodeId, repo, root: map.root, status: "parked" });
  }
- const generation = journal.beginGeneration(nodeId, repo);
- ctx.onGenerationBegun?.(generation);
- // The supervisor's PID stays on the row until a terminal state (F1): a
- // supervisor crash anywhere in the SOP tail is then visible to sweep.
- journal.updateWorker(nodeId, repo, {
-  pid: process.pid,
-  status: "running",
-  startedAt: new Date().toISOString(),
- });
+ let generation: number;
+ try {
+  generation = acquireGeneration(journal, nodeId, repo, ctx.generation, ctx.onGenerationBegun);
+ } catch (error) {
+  if (!(error instanceof FencedError)) throw error;
+  journal.recordEvent("fenced", { nodeId, repo, detail: error.message });
+  return { ...base, status: "refused", detail: error.message };
+ }
+ journal = journal.forWorker(nodeId, repo, generation);
+ ctx = { ...ctx, journal };
 
  try {
   // A GitLab map's graph reads run under its read gate (node #122).
@@ -614,6 +618,13 @@ export async function runNode(
   finish(journal, nodeId, repo, "parked", detail);
   return { ...base, status: "refused", detail };
  } catch (error) {
+  const current = journal.getWorker(nodeId, repo);
+  if (current?.generation !== generation || current.status === "stop-requested") {
+   const detail = error instanceof FencedError ? error.message :
+    `node ${nodeId}: generation ${generation} superseded or stopped; fenced before recording outcome`;
+   journal.recordEvent("fenced", { nodeId, repo, detail });
+   return { ...base, status: "refused", detail };
+  }
   const detail = error instanceof Error ? error.message : String(error);
   if (error instanceof FencedError) {
    // A newer occupant owns the row — leave it untouched.

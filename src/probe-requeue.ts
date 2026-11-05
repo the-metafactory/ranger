@@ -1,3 +1,4 @@
+import { startOwnedWorker } from "./node-ownership.ts";
 import type { RangerMapConfig } from "./config.ts";
 import type { Journal, WorkerRow } from "./journal.ts";
 import { implementLane, type ImplementLane } from "./lanes.ts";
@@ -48,7 +49,7 @@ export async function requeueProbes(args: {
  maps: readonly RangerMapConfig[];
  limit: number;
  owned: OwnedCheck;
- spawn: (nodeId: string, repo: string, root: number) => Promise<number | null>;
+ spawn: (nodeId: string, repo: string, root: number, generation: number) => Promise<number | null>;
 }): Promise<ProbeRequeueResult> {
  const { journal, maps, limit, owned, spawn } = args;
  const result: ProbeRequeueResult = { resumed: [], pending: [], errors: [], lanes: [] };
@@ -71,29 +72,18 @@ export async function requeueProbes(args: {
   const used = attempts(journal, row, head);
   // Reserve before spawning: the child must see a claimed row, and another
   // scheduler must see the lane occupied. The retry count also survives a crash.
-  journal.updateWorker(row.nodeId, row.repo, { status: "claimed", pid: null, workerPgid: null, finishedAt: null });
-  journal.setHealth(budgetKey(row, head), String(used + 1));
-  let pid: number | null = null;
-  try {
-   pid = await spawn(row.nodeId, row.repo, row.root);
-  } catch (error) {
-   result.errors.push(`${key}: ${String(error)}`);
-  }
+  const pid = await startOwnedWorker({ journal, row,
+   onSpawnFailure: () => { journal.setHealth(budgetKey(row, head), String(used)); },
+   spawn: async generation => {
+    journal.setHealth(budgetKey(row, head), String(used + 1));
+    return spawn(row.nodeId, row.repo, row.root, generation);
+   },
+  });
   owned();
-  const current = journal.getWorker(row.nodeId, row.repo);
   if (pid === null) {
-   // Roll back only our reservation, never a child or operator's newer occupant.
-   if (current?.generation === row.generation && current.status === "claimed" && current.pid === null) {
-    journal.updateWorker(row.nodeId, row.repo, { status: "parked", pid: row.pid, finishedAt: row.finishedAt });
-    journal.setHealth(budgetKey(row, head), String(used));
-   }
    result.pending.push(key);
    result.errors.push(`${key}: probe requeue did not spawn; priority retained for the next tick`);
    continue;
-  }
-  // A fast child may already have completed; do not overwrite its status or PID.
-  if (current?.generation === row.generation && current.status === "claimed" && current.pid === null) {
-   journal.updateWorker(row.nodeId, row.repo, { pid });
   }
   recordImplementStart(journal, map);
   journal.recordEvent("sweep", { nodeId: row.nodeId, repo: row.repo,

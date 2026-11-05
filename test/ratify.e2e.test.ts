@@ -222,8 +222,13 @@ describe("ratify phase (node #250)", () => {
    expect(reactionReads(f).at(-1)).toBe(`repos/${REPO}/issues/comments/9001/reactions?per_page=100`);
 
    // The spawned resume-for-close: no LLM session, the close cites the proposal.
+   const generation = f.journal(j => {
+    const row = j.getWorker("10", REPO);
+    j.updateWorker("10", REPO, { status: "claimed", pid: null });
+    return row?.generation;
+   });
    const beforeClose = Date.now();
-   const close = await f.cli(["run-node", "10", "--map", REPO], { RANGER_WORKER_CMD: "/nonexistent/worker" });
+   const close = await f.cli(["run-node", "10", "--map", REPO, "--generation", String(generation)], { RANGER_WORKER_CMD: "/nonexistent/worker" });
    const afterClose = Date.now();
    expect(close.code).toBe(0);
    const outcome = JSON.parse(close.stdout);

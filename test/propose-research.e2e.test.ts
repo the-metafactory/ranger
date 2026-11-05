@@ -143,7 +143,7 @@ describe("propose research lane (node #246)", () => {
   try {
    expect((await walk(f)).claimed).toEqual(["10"]);
    expect(f.state().nodes["10"].assignees).toEqual(["ivy-bot"]);
-   expect(f.journal((j) => j.getWorker("10", "acme/widgets"))).toMatchObject({ status: "claimed", lane: "research" });
+   expect(f.journal((j) => j.getWorker("10", "acme/widgets"))).toMatchObject({ status: "parked", lane: "research" });
 
    const run = await runNode(f);
    expect(run.code).toBe(0);
@@ -251,7 +251,7 @@ describe("propose research lane (node #246)", () => {
    expect(run.code).not.toBe(0);
    expect(run.stderr).toContain("principal's identity");
    expect(f.state().proposals).toBeUndefined();
-   expect(f.journal((j) => j.getWorker("10", "acme/widgets"))?.status).toBe("claimed");
+   expect(f.journal((j) => j.getWorker("10", "acme/widgets"))?.status).toBe("parked");
   } finally {
    f.stop();
   }

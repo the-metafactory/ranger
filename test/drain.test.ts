@@ -146,7 +146,7 @@ describe("node #165 — ranger drain", () => {
    expect((await r.cli(["drain", "--lane", "visual"])).code).toBe(0);
    const maps = await walked(r);
    expect(maps.map((m) => m.claimed)).toEqual([["11"], ["20"], []]);
-   expect(r.journal.getWorker("11", GAME)).toMatchObject({ lane: "research", status: "claimed" });
+   expect(r.journal.getWorker("11", GAME)).toMatchObject({ lane: "research", status: "parked" });
    expect(r.journal.getWorker("10", GAME)).toBeNull();
   } finally { r.close(); }
  });
@@ -175,7 +175,9 @@ describe("node #165 — ranger drain", () => {
    expect(maps[1].drained).toMatch(/ranger drain --map acme\/ranger#1 --off/);
    expect(maps[0].drained).toBeUndefined();
    expect((await r.cli(["drain", "--map", TOOL, "--off"])).code).toBe(0);
-   expect((await walked(r)).map((m) => m.claimed)).toEqual([[], ["20", "21"], []]);
+   const recovered = await walked(r);
+   expect(recovered.map((m) => m.claimed)).toEqual([["30"], ["20"], []]);
+   expect(recovered[1].errors.join(" ")).toContain("fresh claims held");
   } finally { r.close(); }
  });
 

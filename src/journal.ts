@@ -356,6 +356,45 @@ const rootFilter = (column: typeof workers.root | typeof escalations.root, root?
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 export class Journal {
+ private ownership?: { nodeId: string; repo: string; generation: number };
+
+ forWorker(nodeId: string, repo: string, generation: number): Journal {
+  const scoped = Object.create(this) as Journal;
+  scoped.ownership = { nodeId, repo, generation };
+  return scoped;
+ }
+
+ insertWorker(row: Pick<WorkerRow, "nodeId" | "repo" | "root" | "status">): boolean {
+  return this.db.insert(workers).values({ ...row, startedAt: new Date().toISOString() })
+   .onConflictDoNothing().returning({ nodeId: workers.nodeId }).all().length > 0;
+ }
+
+ reserveWorker(row: WorkerRow, patch: WorkerPatch = {}, at = new Date()): number | null {
+  const reserved = this.db.update(workers).set({ ...patch, status: "claimed", pid: null, workerPgid: patch.workerPgid === undefined ? row.workerPgid : patch.workerPgid,
+   startedAt: at.toISOString(), finishedAt: null, generation: sql`${workers.generation} + 1` })
+   .where(and(eq(workers.nodeId, row.nodeId), eq(workers.repo, row.repo),
+    eq(workers.generation, row.generation), eq(workers.status, row.status),
+    row.pid === null ? isNull(workers.pid) : eq(workers.pid, row.pid),
+    row.startedAt === null ? isNull(workers.startedAt) : eq(workers.startedAt, row.startedAt)))
+   .returning({ generation: workers.generation }).all();
+  return reserved[0]?.generation ?? null;
+ }
+
+ updateReservation(nodeId: string, repo: string, generation: number, patch: WorkerPatch): boolean {
+  return this.db.update(workers).set(patch).where(and(eq(workers.nodeId, nodeId), eq(workers.repo, repo),
+   eq(workers.generation, generation), eq(workers.status, "claimed"), isNull(workers.pid)))
+   .returning({ nodeId: workers.nodeId }).all().length > 0;
+ }
+
+ adoptReservation(nodeId: string, repo: string, generation: number, pid: number): void {
+  const adopted = this.db.update(workers).set({ status: "running", pid })
+   .where(and(eq(workers.nodeId, nodeId), eq(workers.repo, repo), eq(workers.generation, generation),
+    or(and(eq(workers.status, "claimed"), or(isNull(workers.pid), eq(workers.pid, pid))),
+     and(eq(workers.status, "running"), eq(workers.pid, pid)))))
+   .returning({ nodeId: workers.nodeId }).all();
+  if (adopted.length === 0) throw new FencedError(`node ${nodeId}: reservation ${generation} no longer available`);
+ }
+
  private readonly db: RangerDb;
  private readonly closeDb: () => void;
  /** The sqlite file path — callers derive sibling lock/state dirs from it. */
@@ -402,6 +441,11 @@ export class Journal {
  upsertWorker(
   row: Partial<WorkerRow> & Pick<WorkerRow, "nodeId" | "repo" | "root" | "status">,
  ): void {
+  if (this.ownership !== undefined) {
+   const { nodeId, repo, root: _root, ...patch } = row;
+   this.updateWorker(nodeId, repo, patch);
+   return;
+  }
   this.assertWorkerRoot(row.nodeId, row.repo, row.root);
   this.db
    .insert(workers)
@@ -466,7 +510,16 @@ export class Journal {
    Object.entries(patch).filter(([, v]) => v !== undefined),
   );
   if (Object.keys(set).length === 0) return;
-  this.db.update(workers).set(set).where(and(eq(workers.nodeId, nodeId), eq(workers.repo, repo))).run();
+  const owner = this.ownership;
+  if (owner !== undefined && (owner.nodeId !== nodeId || owner.repo !== repo)) throw new FencedError("scoped journal cannot write another worker");
+  const changed = this.db.update(workers).set(set).where(and(eq(workers.nodeId, nodeId), eq(workers.repo, repo),
+   owner === undefined ? undefined : and(eq(workers.generation, owner.generation), sql`${workers.status} != 'stop-requested'`)))
+   .returning({ nodeId: workers.nodeId }).all();
+  if (owner !== undefined && changed.length === 0) {
+   const detail = `node ${nodeId}: generation ${owner.generation} superseded or stopped; fenced from worker state write`;
+   this.recordEvent("fenced", { nodeId, repo, detail });
+   throw new FencedError(detail);
+  }
  }
 
  requestStop(nodeId: string, repo: string, generation: number, outcome: string, at: Date): boolean {
@@ -526,7 +579,7 @@ export class Journal {
   */
  assertGeneration(nodeId: string, repo: string, generation: number, action: string): void {
   const row = this.getWorker(nodeId, repo);
-  if (row === null || row.generation !== generation) {
+  if (row === null || row.generation !== generation || row.status === "stop-requested") {
    throw new FencedError(
     `node ${nodeId}: generation ${generation} superseded by ${row?.generation ?? "a removed row"} — refusing to ${action}`,
    );

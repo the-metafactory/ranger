@@ -23,7 +23,7 @@ function hostLoads(r: Rig, loads: number[]) {
 function resumeAfterPark(r: Rig, loads: number[]) {
  const [queued] = r.journal.listResumeQueue();
  r.journal.removeResume(queued, "resume-cancelled", "test");
- r.journal.updateWorker("20", REPO, { status: "claimed" });
+ r.journal.updateWorker("20", REPO, { status: "claimed", startedAt: null, pid: null });
  r.ctx.workerCommand = [implementWorker, "add-fixed"];
  hostLoads(r, loads);
 }

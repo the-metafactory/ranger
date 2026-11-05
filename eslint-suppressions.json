@@ -482,7 +482,7 @@
       "count": 1
     },
     "ranger/no-comments": {
-      "count": 8
+      "count": 6
     }
   },
   "src/prompt.ts": {
@@ -507,7 +507,7 @@
       "count": 1
     },
     "ranger/no-comments": {
-      "count": 30
+      "count": 25
     }
   },
   "src/remote-test/artifacts.ts": {
@@ -744,9 +744,6 @@
     }
   },
   "src/resume.ts": {
-    "@typescript-eslint/no-confusing-void-expression": {
-      "count": 1
-    },
     "ranger/no-comments": {
       "count": 21
     }
@@ -933,14 +930,11 @@
     }
   },
   "src/sweep.ts": {
-    "@typescript-eslint/no-unnecessary-condition": {
-      "count": 1
-    },
     "@typescript-eslint/non-nullable-type-assertion-style": {
       "count": 1
     },
     "ranger/no-comments": {
-      "count": 19
+      "count": 9
     }
   },
   "src/token-gate.ts": {
@@ -1059,7 +1053,7 @@
       "count": 1
     },
     "ranger/no-comments": {
-      "count": 122
+      "count": 120
     }
   },
   "test/base-red-fix-node.test.ts": {
@@ -1345,7 +1339,7 @@
       "count": 6
     },
     "ranger/no-comments": {
-      "count": 209
+      "count": 208
     }
   },
   "test/implement-rig.ts": {
@@ -1462,11 +1456,6 @@
       "count": 3
     }
   },
-  "test/lanes.test.ts": {
-    "ranger/no-comments": {
-      "count": 1
-    }
-  },
   "test/merge-desk.test.ts": {
     "@typescript-eslint/no-unnecessary-type-assertion": {
       "count": 6
@@ -1480,7 +1469,7 @@
       "count": 1
     },
     "ranger/no-comments": {
-      "count": 17
+      "count": 16
     }
   },
   "test/partition.ts": {
