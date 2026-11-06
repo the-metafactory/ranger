@@ -122,7 +122,7 @@ export async function checkKnownGood(
  const recorded = known !== null && known !== "unreadable" ? known.entries : {};
  const retired = (c: string) => c.endsWith(" (gone)") && isBenignEntry(c.slice(0, -7), recorded[c.slice(0, -7)]);
  if (since !== null && changed.length > 0 && changed.every(retired)) {
-  recordKnownGood(journal, canonical, state, "benign config keys left the hash");
+  recordKnownGood(journal, canonical, state, "benign entries left the hash");
   journal.recordEvent("git-trust", {
    ...at,
    detail: `known-good git state for ${canonical} re-recorded: ${changed.join(", ")} no longer hashed (benign git-lfs, push or identity config, or git-lfs's own hook stubs)`,

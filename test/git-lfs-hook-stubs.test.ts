@@ -15,7 +15,7 @@ const gitLfs381Stub = (hook: string): string =>
  `#!/bin/sh\ncommand -v git-lfs >/dev/null 2>&1 || { printf >&2 "\\n%s\\n\\n" "This repository is configured for Git LFS but 'git-lfs' was not found on your path. If you no longer wish to use Git LFS, remove this hook by deleting the '${hook}' file in the hooks directory (set by 'core.hookspath'; usually '.git/hooks')."; exit 2; }\ngit lfs ${hook} "$@"\n`;
 
 const hasGitLfs381 = (): boolean =>
- Bun.which("git-lfs") !== null && /^git-lfs\/3\.8\.1 /.test(Bun.spawnSync(["git-lfs", "version"]).stdout.toString());
+ Bun.which("git-lfs") !== null && Bun.spawnSync(["git-lfs", "version"]).stdout.toString().startsWith("git-lfs/3.8.1 ");
 
 const sha256 = (text: string): string => createHash("sha256").update(text).digest("hex");
 
