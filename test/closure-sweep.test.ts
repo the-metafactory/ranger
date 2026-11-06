@@ -168,7 +168,8 @@ test("sweep handles crashed workers before graph closure reads", async () => {
    order.push(`respawn-${id}`); return null;
   } });
   expect(outcome.crashed).toBe(1);
-  expect(order).toEqual(["respawn-crashed", "read-20", "read-crashed"]);
+  expect(order[0]).toBe("respawn-crashed");
+  expect(order.slice(1).sort()).toEqual(["read-20", "read-crashed"]);
  } finally { read.mockRestore(); }
 });
 

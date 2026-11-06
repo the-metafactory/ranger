@@ -1,4 +1,3 @@
-import { OperationFailure } from "../src/operation-outcome.ts";
 import { activeRecovery, nodeRecoveryScope } from "../src/recovery.ts";
 import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
@@ -296,7 +295,7 @@ test("detached context failure retains typed evidence fenced to its reservation"
  const f = fixture();
  const generation = f.journal.getWorker("10", "acme/widgets")!.generation;
  const output = await runRunNode("10", undefined, f.configPath, deps(f, {}, {
-  runNodeContext: async () => { throw new OperationFailure({ kind: "infrastructure", operation: "token-read", evidence: "trusted preflight timeout", action: "restore token service" }); },
+  runNodeContext: async () => { throw new WriteGateError("trusted preflight timeout", true); },
  }), generation);
  expect(JSON.parse(output).status).toBe("parked");
  const reopened = new (await import("../src/journal.ts")).Journal(f.journal.path);
