@@ -1441,7 +1441,7 @@ describe("implement lane (node #23)", () => {
   }, 60_000);
  });
 
- test("a transient GitHub error at review is not counted and leaves the row for the sweep (found live on #45)", async () => {
+ test("opaque reviewer connectivity text holds visibly without charging a code strike", async () => {
   const r = await rig({});
   cleanup.push(r.dir);
   r.ctx.reviewer = async () => {
@@ -1450,12 +1450,11 @@ describe("implement lane (node #23)", () => {
    );
   };
   const outcome = await runNode("20", r.ctx);
-  expect(outcome.status).toBe("failed");
+  expect(outcome.status).toBe("parked");
   expect(r.journal.deadmanCount()).toBe(0);
-  // Still running under this supervisor's PID: when it exits, the sweep sees a crash and respawns.
-  expect(r.journal.getWorker("20", "acme/widgets")?.status).toBe("running");
-  expect(r.journal.listEvents().some((e) => e.kind === "transient")).toBe(true);
-  // The pushed work and the PR survive for the respawn to pick up.
+  expect(r.journal.getWorker("20", "acme/widgets")?.status).toBe("parked");
+  expect(r.journal.listEvents().some((e) => e.kind === "transient")).toBe(false);
+  expect(outcome.detail).toContain("unknown recovery");
   expect(r.github.prs.size).toBe(1);
  }, 60_000);
 
