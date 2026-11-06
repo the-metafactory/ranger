@@ -1496,6 +1496,10 @@ async function runImplementFlow(ctx: ImplementContext): Promise<ImplementOutcome
  if (phase === "close") {
   return closeAfterMerge(ctx, github, pr as ChangeRequest);
  }
+ const recordMachineMerge = (prNumber: number) => async (sha: string, stale: StaleBase): Promise<void> => {
+  fence("record the base merge");
+  await github.postComment(repo, prNumber, baseMergeMarker(sha, base, stale, "ranger"), token);
+ };
  let checkedResume: CheckedOnBase | undefined;
  if (phase === "review" && pr !== null && pr.headSha === await headSha(worktree)) {
   journal.updateWorker(nodeId, repo, { phase: "review" });
@@ -1503,7 +1507,7 @@ async function runImplementFlow(ctx: ImplementContext): Promise<ImplementOutcome
   const accepted = checkpoint?.evidence.some(evidence => evidence.kind === "tests-gate" && evidence.result === "passed" && evidence.detail === testCommand);
   if (!accepted) {
    const landed = await landedBaseMerges(worktree, recordedBaseMerges(await github.listComments(repo, pr.iid, token), botIdentity), pr.headSha);
-   checkedResume = await checkOnCurrentBase(ctx, testCommand, { label: "resumed checkpoint", budgetLeft: landed < MAX_BASE_MERGES });
+   checkedResume = await checkOnCurrentBase(ctx, testCommand, { label: "resumed checkpoint", mergesLeft: MAX_BASE_MERGES - landed, recordMerge: recordMachineMerge(pr.iid) });
    if (checkedResume.failure !== undefined) return { status: "failed", detail: checkedResume.failure, workerExit: null };
   }
  }
@@ -1744,12 +1748,8 @@ async function runImplementFlow(ctx: ImplementContext): Promise<ImplementOutcome
   await prepareWorktree(ctx, { at: "pr-head", prNumber: open.iid, prHead: live.headSha });
   const here = await headSha(worktree);
   if (here !== live.headSha) {
-   const checked = checkedResume?.sha === here ? checkedResume : await checkOnCurrentBase(ctx, testCommand, { label: "resumed worktree", budgetLeft: baseMerges < MAX_BASE_MERGES, merged: checkedResume?.merged });
+   const checked = checkedResume?.sha === here ? checkedResume : await checkOnCurrentBase(ctx, testCommand, { label: "resumed worktree", mergesLeft: MAX_BASE_MERGES - baseMerges, recordMerge: recordMachineMerge(open.iid) });
    if (checked.failure !== undefined) return { status: "failed", detail: checked.failure, workerExit: null };
-   if (checked.merged !== undefined) {
-    fence("record the base merge");
-    await github.postComment(repo, open.iid, baseMergeMarker(checked.sha, base, checked.merged, "ranger"), token);
-   }
    await publishPass(ctx, github, open.iid, { sha: checked.sha, snapshot: checked.snapshot, workerExit: null, adopted: true }, "push resumed worktree", `resumed worktree pushed ${branch} from PR head ${live.headSha} to worktree head ${checked.sha}`);
    const comments = await github.listComments(repo, open.iid, token);
    baseMerges = Math.max(baseMerges, await landedBaseMerges(worktree, recordedBaseMerges(comments, botIdentity), checked.sha));
@@ -2271,6 +2271,10 @@ async function prepareWorktree(ctx: ImplementContext, need: WorktreeNeed): Promi
  }
 }
 
+function firstDirtyFiles(dirty: string[]): string {
+ return dirty.slice(0, 5).map((l) => l.trim()).join(", ");
+}
+
 async function staleBaseVerdict(ctx: ImplementContext, limit: number, budgetLeft: boolean): Promise<StaleVerdict> {
  const { worktree, journal, branch } = ctx;
  const base = ctx.map.base;
@@ -2295,43 +2299,50 @@ async function mergeBaseBeforeTests(ctx: ImplementContext, budgetLeft: boolean):
  const nodeId = ctx.node.ref.id;
  const dirty = await dirtyFiles(worktree);
  if (dirty.length > 0 || !budgetLeft) {
-  const why = dirty.length > 0 ? `the worktree has uncommitted changes (${dirty.slice(0, 5).map((l) => l.trim()).join(", ")})` : `the node has used its ${MAX_BASE_MERGES} base merge pass(es)`;
+  const why = dirty.length > 0 ? `the worktree has uncommitted changes (${firstDirtyFiles(dirty)})` : `the node has used its ${MAX_BASE_MERGES} base merge pass(es)`;
   journal.recordEvent("worktree-prepared", { nodeId, repo: map.repo, detail: `${branch} is ${behind} commit(s) behind origin/${map.base}, but ${why}: it is not moved before the tests`.slice(0, 400) });
   return {};
  }
  const merged = await machineMergeBase(ctx, { why: "the commits on this head wait on the supervisor's tests", then: "the tests run on the merge", baseSha, behind });
  if (!merged) return {};
+ const stale: StaleBase = { behind, limit: 0 };
  if (!remoteTests(ctx) && map.commands.install !== undefined) {
   const install = await runShell(map.commands.install, worktree, ctx, { label: "base merge before the tests: install", timeoutMs: INSTALL_TIMEOUT_MS });
-  if (install.code !== 0) return { failure: `install (${map.commands.install}) after the base merge exited ${install.code}: ${tail(install)}` };
+  if (install.code !== 0) return { merged: stale, failure: `install (${map.commands.install}) after the base merge exited ${install.code}: ${tail(install)}` };
  }
- return { merged: { behind, limit: 0 } };
+ return { merged: stale };
 }
 
 interface CheckedOnBase {
  sha: string;
  snapshot: string;
- merged?: StaleBase;
  failure?: string;
 }
 
 const MAX_BASE_MOVES_UNDER_TESTS = 1;
 
-async function checkOnCurrentBase(ctx: ImplementContext, testCommand: string, input: { label: string; budgetLeft: boolean; merged?: StaleBase | undefined }): Promise<CheckedOnBase> {
+async function checkOnCurrentBase(ctx: ImplementContext, testCommand: string, input: { label: string; mergesLeft: number; recordMerge: (sha: string, stale: StaleBase) => Promise<void> }): Promise<CheckedOnBase> {
  const { worktree, journal, map } = ctx;
- let merged = input.merged;
+ let mergesLeft = input.mergesLeft;
+ const mergeUp = async (): Promise<MergedBeforeTests> => {
+  const prepared = await prepareWorktree(ctx, { at: "before-tests", budgetLeft: mergesLeft > 0 });
+  if (prepared.merged !== undefined) {
+   mergesLeft -= 1;
+   await input.recordMerge(await headSha(worktree), prepared.merged);
+  }
+  return prepared;
+ };
+ let prepared = await mergeUp();
  for (let moves = 0; ; moves += 1) {
-  const prepared = await prepareWorktree(ctx, { at: "before-tests", budgetLeft: input.budgetLeft });
-  merged = prepared.merged ?? merged;
   const sha = await headSha(worktree);
   const snapshot = await trustedSnapshot(journal, ctx.canonical, { repo: map.repo, nodeId: ctx.node.ref.id }, mapKey(map));
-  const result: CheckedOnBase = { sha, snapshot, ...(merged === undefined ? {} : { merged }) };
+  const result: CheckedOnBase = { sha, snapshot };
   if (prepared.failure !== undefined) return { ...result, failure: prepared.failure };
   const failure = await checkPass(ctx, testCommand, { sha, snapshot, baseTip: await testBaseTip(ctx), label: input.label, context: "resume" });
   if (failure === undefined) return result;
   if (moves >= MAX_BASE_MOVES_UNDER_TESTS) return { ...result, failure };
-  await fetchBaseTrusted(ctx);
-  if ((await commitsBehind(worktree, map.base)) === 0) return { ...result, failure };
+  prepared = await mergeUp();
+  if (prepared.merged === undefined && prepared.failure === undefined) return { ...result, failure };
  }
 }
 
@@ -2422,7 +2433,7 @@ async function catchUpWithBase(ctx: ImplementContext, testCommand: string): Prom
   journal.recordEvent("worktree-prepared", {
    nodeId,
    repo,
-   detail: `${branch} is ${behind} commit(s) behind origin/${base}, but the worktree has uncommitted changes (${dirty.slice(0, 5).map((l) => l.trim()).join(", ")}): it is not moved`.slice(0, 400),
+   detail: `${branch} is ${behind} commit(s) behind origin/${base}, but the worktree has uncommitted changes (${firstDirtyFiles(dirty)}): it is not moved`.slice(0, 400),
   });
   return undefined;
  }
@@ -2471,9 +2482,10 @@ async function machineMerge(ctx: ImplementContext, ref: string, message: string,
 async function mergeBaseAfterRedTests(ctx: ImplementContext, what: string, baseSha: string): Promise<boolean> {
  const hasPr = (ctx.journal.getWorker(ctx.node.ref.id, ctx.map.repo)?.prNumber ?? null) !== null;
  if (hasPr || (await dirtyFiles(ctx.worktree)).length > 0) return false;
- const count = await safeGit(["--no-replace-objects", "rev-list", "--count", `HEAD..${baseSha}`], { cwd: ctx.worktree, timeoutMs: 30_000 });
+ const git = (args: string[]) => safeGit(["--no-replace-objects", ...args], { cwd: ctx.worktree, timeoutMs: 30_000 });
+ const count = await git(["rev-list", "--count", `HEAD..${baseSha}`]);
  const behind = count.code === 0 ? Number(count.stdout.trim()) : 0;
- if (!(behind > 0) || (await safeGit(["--no-replace-objects", "merge-base", "HEAD", baseSha], { cwd: ctx.worktree, timeoutMs: 30_000 })).code !== 0) return false;
+ if (!(behind > 0) || (await git(["merge-base", "HEAD", baseSha])).code !== 0) return false;
  return machineMergeBase(ctx, { why: `${what} failed`, then: "the tests run again", baseSha, behind });
 }
 

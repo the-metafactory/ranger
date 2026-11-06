@@ -25,6 +25,7 @@ const WORKTREE_PRIMITIVES = [
  /\bmachineMerge\(/,
  /\bbaseMergePass\(/,
  /"--ff-only"/,
+ /\[\s*(?:\.\.\.\w+,\s*)?"merge"\s*,/,
 ];
 
 const ELSEWHERE_ALLOWED: Record<string, string> = {
@@ -54,7 +55,9 @@ describe("prepareWorktree owns every move of a node worktree to a head or the ba
   const owner = "async function machineMerge(ctx) {\n return git([\"merge\"]);\n}\n";
   expect(violations("implement.ts", owner)).toEqual([]);
   expect(violations("implement.ts", `${owner}async function rogue(ctx) {\n await machineMerge(ctx);\n}\n`)).toEqual(["implement.ts: \\bmachineMerge\\("]);
-  expect(violations("worker.ts", `await safeGit(["merge", "--ff-only", head]);\n`)).toEqual([`worker.ts: "--ff-only"`]);
+  expect(violations("worker.ts", `await safeGit(["reset", "--ff-only"]);\n`)).toEqual([`worker.ts: "--ff-only"`]);
+  expect(violations("worker.ts", `await safeGit(["merge", "origin/main"]);\n`)).toHaveLength(1);
+  expect(violations("worker.ts", `await run(["gh", "pr", "merge", "1"]);\n`)).toEqual([]);
  });
 
  test("the guard names every owner function that still exists", () => {

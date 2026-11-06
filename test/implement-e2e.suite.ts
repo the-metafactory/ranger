@@ -1182,6 +1182,32 @@ describe("implement lane (node #23)", () => {
   expect(prepared.map((e) => e.detail ?? "").some((d) => d.includes("base merge pass(es): it is not moved before the tests"))).toBe(true);
  }, 60_000);
 
+ test("a red run after the base merge keeps the merge's marker, so the merge counts when it lands (ranger issue #322)", async () => {
+  const { r } = await prWithUnpushedCommit();
+  const main = await pushFromOutside(r, "base-1.txt", "main");
+  const runs = join(r.dir, "runs");
+  r.ctx.map.commands.test = `echo run >> ${runs}; exit 1`;
+  expect((await runNode("20", r.ctx)).status).toBe("failed");
+  expect(readFileSync(runs, "utf8").trim().split("\n")).toHaveLength(1);
+  const landed = recordedBaseMerges(r.github.comments.get(1) ?? [], BOT);
+  expect(landed).toHaveLength(1);
+  const worktree = join(r.canonical, ".worktrees", "node-20");
+  expect((await git(["rev-parse", "HEAD"], worktree)).stdout.trim()).toBe(landed[0]?.sha);
+  expect((await git(["merge-base", "--is-ancestor", main, "HEAD"], worktree)).code).toBe(0);
+ }, 60_000);
+
+ test("a red run past the base merge budget is not run again, however far behind the branch is (ranger issue #322)", async () => {
+  const { r, pushed } = await prWithUnpushedCommit();
+  const initial = (await git(["rev-parse", "main~0"], r.origin)).stdout.trim();
+  await r.github.postComment("acme/widgets", 1, baseMergeMarker(pushed, "main"));
+  await r.github.postComment("acme/widgets", 1, baseMergeMarker(initial, "main"));
+  await pushFromOutside(r, "base-1.txt", "main");
+  const runs = join(r.dir, "runs");
+  r.ctx.map.commands.test = `echo run >> ${runs}; exit 1`;
+  expect((await runNode("20", r.ctx)).status).toBe("failed");
+  expect(readFileSync(runs, "utf8").trim().split("\n")).toHaveLength(1);
+ }, 60_000);
+
  test("a resumed checkpoint at the PR head, behind the base, merges it before an up-to-date gate and pushes once (ranger issue #322)", async () => {
   const r = await rig({});
   cleanup.push(r.dir);
