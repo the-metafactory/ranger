@@ -312,13 +312,31 @@ export function isBenignRecord(key: string, value: string | null): boolean {
 }
 
 /**
- * Whether a `GitState.entries` name is one `isBenignRecord` can drop: a
- * known-good record taken before a key joined that list still names it, and
- * its "(gone)" is no change (`checkKnownGood`). A record with any other
- * value is still hashed and still named, so it shows as changed, never gone.
+ * Whether a `GitState.entries` name is one `isBenignRecord` can drop, or a
+ * hook `recorded` by digest as git-lfs's stub: a known-good record taken
+ * before either was exempt still names it, and its "(gone)" is no change
+ * (`checkKnownGood`). A record with any other value is still hashed and still
+ * named, so it shows as changed, never gone. Any `git-lfs filter-process` run
+ * installs its stubs when they are absent, whatever config the command was
+ * given (node #484: seelite #1152's worker wrote no config and parked itself
+ * and #1160). A stub runs `git lfs <hook>`, the program `filter.lfs.*` already
+ * runs; other bytes, or another hook's stub at that name, stay in the hash.
  */
-export function isBenignEntry(name: string): boolean {
- return name in BENIGN_VALUES || /^lfs\.<[0-9a-f]{12}>\.access$/.test(name);
+export function isBenignEntry(name: string, recorded?: string): boolean {
+ if (name in BENIGN_VALUES || /^lfs\.<[0-9a-f]{12}>\.access$/.test(name)) return true;
+ if (!name.startsWith("hooks/")) return false;
+ const stub = gitLfs381HookStub(name.slice("hooks/".length));
+ return stub !== null && recorded === digest(stub);
+}
+
+function gitLfs381HookStub(hook: string): string | null {
+ if (!["pre-push", "post-checkout", "post-commit", "post-merge"].includes(hook)) return null;
+ return `#!/bin/sh\ncommand -v git-lfs >/dev/null 2>&1 || { printf >&2 "\\n%s\\n\\n" "This repository is configured for Git LFS but 'git-lfs' was not found on your path. If you no longer wish to use Git LFS, remove this hook by deleting the '${hook}' file in the hooks directory (set by 'core.hookspath'; usually '.git/hooks')."; exit 2; }\ngit lfs ${hook} "$@"\n`;
+}
+
+function isLfsHookStub(hook: string, body: ReturnType<typeof readIfFile>): boolean {
+ const stub = gitLfs381HookStub(hook);
+ return stub !== null && Buffer.isBuffer(body) && body.equals(Buffer.from(stub));
 }
 
 /** `branch.<name>.<key>` → name and key (subsection split on the first and last dot; names may hold dots). */
@@ -755,7 +773,10 @@ export function readGitState(canonical: string): GitState {
  }
  const hooks = join(gitDir, "hooks");
  if (existsSync(hooks)) {
-  for (const entry of entryNames(hooks)) add(join(hooks, entry));
+  for (const entry of entryNames(hooks)) {
+   const file = join(hooks, entry);
+   if (!isLfsHookStub(entry, readIfFile(file))) add(file);
+  }
  }
  return { hash: hash.digest("hex"), entries, includes: [...includes].sort() };
 }
