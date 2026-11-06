@@ -287,9 +287,6 @@
     }
   },
   "src/graph.ts": {
-    "@typescript-eslint/no-unnecessary-type-conversion": {
-      "count": 1
-    },
     "@typescript-eslint/no-unnecessary-type-parameters": {
       "count": 1
     },
@@ -342,7 +339,7 @@
       "count": 5
     },
     "ranger/no-comments": {
-      "count": 280
+      "count": 276
     }
   },
   "src/intake.ts": {
@@ -369,9 +366,6 @@
     "@typescript-eslint/no-empty-function": {
       "count": 1
     },
-    "@typescript-eslint/no-non-null-assertion": {
-      "count": 1
-    },
     "@typescript-eslint/prefer-optional-chain": {
       "count": 2
     },
@@ -379,7 +373,7 @@
       "count": 1
     },
     "ranger/no-comments": {
-      "count": 20
+      "count": 19
     }
   },
   "src/journal-guard.ts": {
@@ -1632,10 +1626,10 @@
       "count": 1
     },
     "@typescript-eslint/no-unnecessary-type-assertion": {
-      "count": 3
+      "count": 2
     },
     "ranger/no-comments": {
-      "count": 18
+      "count": 17
     }
   },
   "test/run-ledger.test.ts": {

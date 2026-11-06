@@ -1,3 +1,5 @@
+import { requireReachable, type EndpointProbe } from "./endpoint.ts";
+import { nodeRecoveryScope, recoveryHold, recoverablePending } from "./recovery.ts";
 import { startOwnedWorker, reservationPending, startFailureOutcome } from "./node-ownership.ts";
 import { recordImplementStart, mapKey } from "./maps.ts";
 import { implementLane, startsImplementSession, type ImplementLane } from "./lanes.ts";
@@ -28,6 +30,8 @@ import { BudgetDeferral, budgetedRead, budgetPolicy } from "./budget.ts";
  */
 
 export interface SweepContext {
+ endpointProbe?: EndpointProbe;
+ now?: () => Date;
  config: RangerConfig;
  journal: Journal;
  map: RangerMapConfig;
@@ -84,9 +88,23 @@ export async function sweepMap(ctx: SweepContext): Promise<SweepMapResult> {
  const inFlight =
   phase === "desk"
    ? []
-   : journal.listWorkers(repo, map.root).filter((w) => w.status === "claimed" || w.status === "running");
+   : journal.listWorkers(repo, map.root).filter((w) => w.status === "claimed" || w.status === "running" || (w.status === "parked" && recoverablePending(journal, nodeRecoveryScope(repo, w.nodeId))));
 
  for (const worker of inFlight) {
+  if (worker.status === "parked") {
+   const held = recoveryHold(journal, nodeRecoveryScope(repo, worker.nodeId), ctx.now?.() ?? new Date());
+   if (held !== null || journal.spawnsToday(ctx.now?.() ?? new Date()) >= config.workers.spawnCapPerDay) continue;
+   const holder = startsImplementSession(worker) ? journal.laneHolder(implementLane(map), { nodeId: worker.nodeId, repo }) : null;
+   if (holder !== null || (startsImplementSession(worker) && ctx.reservedLanes?.has(implementLane(map)))) continue;
+   const pid = await startOwnedWorker({ journal, row: worker, now: ctx.now?.(),
+    preflight: worker.phase === "close" ? undefined : () => requireReachable(map.reachable, ctx.endpointProbe),
+    spawn: generation => ctx.respawn?.(worker.nodeId, repo, worker.root, generation) ?? Promise.resolve(null) });
+   if (pid !== null) {
+    result.respawned.push(worker.nodeId);
+    journal.recordSpawn(ctx.now?.() ?? new Date());
+   }
+   continue;
+  }
   if (worker.pid === null && reservationPending(worker)) continue;
   if (worker.pid !== null && pidAlive(worker.pid)) continue;
   const generation = journal.reserveWorker(worker);

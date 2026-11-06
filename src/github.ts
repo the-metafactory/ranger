@@ -1,3 +1,5 @@
+import { OperationFailure, type OperationOutcome } from "./operation-outcome.ts";
+import { forgeOutcome } from "./transient.ts";
 import { createSign } from "node:crypto";
 import type { ChangeRequest, MergeState, MergeOutcome, RebaseOutcome, CiFailedRun, CiPurpose, CiVerdict, CommentReaction, IssueComment, LabeledIssue } from "./forge.ts";
 import { githubCiVerdict } from "./github-ci.ts";
@@ -13,8 +15,12 @@ import { GitHubApiBaseUrlSchema } from "./github-api-base.ts";
  * never does — it holds no credential.
  */
 
-export class GitHubError extends Error {
+export class GitHubError extends OperationFailure {
  override readonly name = "GitHubError";
+ constructor(message: string, outcome?: OperationOutcome) {
+  super(outcome ?? { kind: "unknown", operation: "forge-response", evidence: message, action: "inspect the forge response before resuming" });
+  this.message = message;
+ }
 }
 
 const GH_TIMEOUT_MS = 60_000;
@@ -71,6 +77,7 @@ async function ghApiText(token: string, args: string[], label: string, acceptErr
   if (result.code !== 0) {
    throw new GitHubError(
     `${label} failed (gh api, exit ${result.code}): ${(result.stderr || result.stdout).trim().slice(0, 400)}`,
+    forgeOutcome(result, label),
    );
   }
   return result.stdout.trim();

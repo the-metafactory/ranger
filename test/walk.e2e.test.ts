@@ -1,3 +1,4 @@
+import { resetRecovery, nodeRecoveryScope } from "../src/recovery.ts";
 import { describe, expect, test } from "bun:test";
 import {
  mkdirSync,
@@ -143,7 +144,7 @@ test("research retry refuses an altered findings branch before citing CI", async
  }
 }, 30_000); // two real run-node CLI processes: under load they outlast 5s
 
-test("a PR lookup outage after the findings branch is cut does not park the retry", async () => {
+test("a PR lookup outage retains its hold until explicit intervention", async () => {
  const dir = mkdtempSync(join(tmpdir(), "ranger-research-lookup-"));
  try {
   const { origin } = await createCanonicalRepo(dir);
@@ -158,6 +159,10 @@ test("a PR lookup outage after the findings branch is cut does not park the retr
   const args = ["run-node", "10", "--map", "acme/widgets", "-c", config];
   const first = await runCli(args, env);
   expect(first.stdout).not.toContain("pre-worker base is missing");
+  const held = await runCli(args, env);
+  expect(JSON.parse(held.stdout).status).toBe("parked");
+  const recoveryJournal = new Journal(join(dir, "state.sqlite"));
+  try { resetRecovery(recoveryJournal, nodeRecoveryScope("acme/widgets", "10")); } finally { recoveryJournal.close(); }
   const retry = await runCli(args, env);
   expect(retry.code).toBe(0);
   expect(JSON.parse(retry.stdout).status).toBe("success");

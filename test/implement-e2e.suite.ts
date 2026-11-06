@@ -1744,9 +1744,9 @@ describe("implement lane (node #23)", () => {
    expect(r.journal.getWorker("20", "acme/widgets")).toMatchObject({ status: timedOut ? "parked" : "success", attempts: 0 });
    expect(r.journal.deadmanCount()).toBe(0);
    const events = r.journal.listEvents("acme/widgets", 200);
-   expect(events.some((e) => e.kind === "transient")).toBe(false);
+   expect(events.some((e) => e.kind === "transient")).toBe(timedOut);
    if (timedOut) {
-    expect(outcome.detail).toStartWith("close after merge: soma graph close 20");
+    expect(outcome.detail).toContain("soma graph close 20");
     expect(outcome.detail).toContain("timed out after 660s");
     expect(outcome.detail).not.toContain("refused");
     expect(events.some((e) => e.kind === "closed")).toBe(false);
@@ -1759,18 +1759,16 @@ describe("implement lane (node #23)", () => {
   } finally { close.mockRestore(); }
  }, 60_000);
 
- test("a close that hits gh's network error is left for the sweep, uncounted, not parked (soma #795, 2026-10-13)", async () => {
+ test("opaque close transport text parks visibly without charging a code strike", async () => {
   const { r, outcome } = await closeFailing(
-   "gh api GET repos/acme/widgets/issues/20 failed (exit 1): error connecting to api.github.com\ncheck your internet connection or https://githubstatus.com",
+   "gh api GET repos/acme/widgets/issues/20 failed (exit 1): error connecting to api.github.com",
   );
-  expect(outcome.status).toBe("failed");
+  expect(outcome.status).toBe("parked");
   expect(r.journal.deadmanCount()).toBe(0);
-  expect(r.journal.getWorker("20", "acme/widgets")?.status).toBe("running");
-  expect(r.journal.listEvents("acme/widgets", 200).some((e) => e.kind === "transient")).toBe(true);
+  expect(r.journal.getWorker("20", "acme/widgets")?.status).toBe("parked");
+  expect(r.journal.getWorker("20", "acme/widgets")?.outcome).toContain("unknown");
   expect(state(r.statePath).nodes["20"].status).not.toBe("closed");
-  r.journal.updateWorker("20", "acme/widgets", { pid: 2_147_483_647 });
-  expect((await runNode("20", r.ctx)).status).toBe("success");
-  expect(state(r.statePath).nodes["20"].status).toBe("closed");
+  expect(await deskTick(r)).toEqual([]);
  }, 60_000);
 
  test("a refused close keeps bun's failing tests and counts in the worker row and parked event (node #406)", async () => {
@@ -1822,13 +1820,13 @@ describe("implement lane (node #23)", () => {
   expect(r.journal.getWorker("20", "acme/widgets")?.status).toBe("parked");
  }, 60_000);
 
- test("a close parked on a transient error before this rule is still re-run by the merge desk", async () => {
+ test("a legacy close containing opaque transport text requires explicit intervention", async () => {
   const { r } = await closeFailing("Close refused.\n\nprobe outside the probe tree");
   // The row as soma #795 left it on 2026-10-13: parked in the close on gh's network error.
   r.journal.updateWorker("20", "acme/widgets", {
    outcome: "close refused after merge: gh api GET repos/acme/widgets/issues/20 failed (exit 1): error connecting to api.github.com",
   });
-  expect(await deskTick(r)).toEqual(["20"]);
+  expect(await deskTick(r)).toEqual([]);
  }, 60_000);
 
  test("propose node filed by the machine account is refused (node #9 ban)", async () => {

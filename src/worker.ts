@@ -1,3 +1,6 @@
+import { OperationFailure, processOutcome, failureOutcome, type OperationOutcome } from "./operation-outcome.ts";
+import { activeRecovery, activeRecoveryReason, completeRecovery, nodeRecoveryScope, recordRecovery, recoveryHold, recoveryReason, reserveRecovery } from "./recovery.ts";
+import { requireEndpoint, type EndpointProbe, type EndpointLookup } from "./endpoint.ts";
 import { acquireGeneration } from "./node-ownership.ts";
 import { checkpointNode, confirmPreservedProgress, nodeCheckpoint, preserveNodeProgress, progressRemote, reconcileNodeProgress, ProgressConflict } from "./node-progress.ts";
 import type { RunOutcome } from "@the-metafactory/myelin";
@@ -64,7 +67,6 @@ import { workerEnv } from "./worker-env.ts";
 import { assertNotPrincipal, type CommitAuthor } from "./identity.ts";
 import { sessionJournalPath } from "./journal-guard.ts";
 import { saveWorkerLog } from "./worker-log.ts";
-import { isTransientGitHubError } from "./transient.ts";
 import { BudgetDeferral } from "./budget.ts";
 import { findNodePr, finishClosedElsewhere } from "./closed-elsewhere.ts";
 import type { ForgePort } from "./forge.ts";
@@ -130,6 +132,10 @@ export interface RunNodeContext {
  /** Observe the existing map-root read without fetching it again for the run ledger. */
  onMapRootRead?: (root: NodeResult) => void;
  generation?: number;
+ graphReadNode?: typeof graphNode;
+ endpointProbe?: EndpointProbe;
+ endpointLookup?: EndpointLookup;
+ now?: () => Date;
  onGenerationBegun?: (generation: number) => void;
  /**
   * Worker command + leading args; the prompt is appended as the final arg.
@@ -466,18 +472,18 @@ function countFailure(config: RangerConfig, journal: Journal, repo: string): voi
  * kept. Any other failure counts and ends the row as failed.
  */
 function failNode(
- config: RangerConfig,
- journal: Journal,
- nodeId: string,
- repo: string,
- detail: string,
+ config: RangerConfig, journal: Journal, nodeId: string, repo: string, detail: string,
+ outcome: OperationOutcome = { kind: "code", operation: "worker-result", evidence: detail, action: "repair the failure and resume" },
+ now = new Date(),
 ): void {
- if (isTransientGitHubError(detail)) {
-  journal.recordEvent("transient", {
-   nodeId,
-   repo,
-   detail: `GitHub-side transient error, left for the sweep to respawn (not counted): ${detail.slice(0, 300)}`,
-  });
+ if (outcome.kind === "success") outcome = { kind: "unknown", operation: outcome.operation, evidence: "failure path returned a success outcome", action: "inspect the unknown failure before resuming" };
+ if (outcome.kind !== "code") {
+  const generation = journal.getWorker(nodeId, repo)?.generation;
+  if (generation === undefined) throw new Error("recovery needs an owner");
+  const state = recordRecovery(journal, nodeRecoveryScope(repo, nodeId), { ...outcome, evidence: detail }, now, { nodeId, repo, generation });
+  const reason = recoveryReason(state);
+  journal.recordEvent(outcome.kind === "infrastructure" || outcome.kind === "dependency" ? "transient" : "parked", { nodeId, repo, detail: reason });
+  finish(journal, nodeId, repo, "parked", reason);
   return;
  }
  finish(journal, nodeId, repo, "failed", detail);
@@ -499,6 +505,7 @@ function finish(
   finishedAt: new Date().toISOString(),
   outcome: journalOutcome(outcome),
  });
+ if (status === "success") completeRecovery(journal, nodeRecoveryScope(repo, nodeId));
 }
 
 /**
@@ -552,11 +559,22 @@ export async function runNode(
  journal = journal.forWorker(nodeId, repo, generation);
  ctx = { ...ctx, journal };
 
+ const recoveryScope = nodeRecoveryScope(repo, nodeId);
+ const held = ctx.generation !== undefined && activeRecovery(journal, recoveryScope)?.status === "reserved" ? null : recoveryHold(journal, recoveryScope, ctx.now?.() ?? new Date());
+ if (held !== null) {
+  finish(journal, nodeId, repo, "parked", held);
+  return { ...base, status: "parked", detail: held };
+ }
+ if (ctx.generation === undefined && !reserveRecovery(journal, recoveryScope, ctx.now?.() ?? new Date(), { nodeId, repo, generation })) {
+  const detail = activeRecoveryReason(journal, recoveryScope);
+  finish(journal, nodeId, repo, "parked", detail);
+  return { ...base, status: "parked", detail };
+ }
  let observedNode: NodeResult | undefined;
  try {
   // A GitLab map's graph reads run under its read gate (node #122).
   const graphToken = await graphReadToken(config, repo, token, ctx.readGate);
-  const node = await graphNode(
+  const node = await (ctx.graphReadNode ?? graphNode)(
    repo,
    nodeId,
    graphToken,
@@ -567,11 +585,12 @@ export async function runNode(
     timeoutMs: GRAPH_CALL_TIMEOUT_MS,
    },
   );
+  completeRecovery(journal, recoveryScope, "graph:node", nodeId);
   observedNode = node;
   // Reuse this one root read for the prompt and ledger, including a node
   // completed elsewhere. A root failure must not change that reconciliation.
   let rootReadError: unknown;
-  const rootNode = await graphNode(
+  const rootNode = await (ctx.graphReadNode ?? graphNode)(
    repo,
    String(map.root),
    graphToken,
@@ -579,7 +598,10 @@ export async function runNode(
     timeoutMs: GRAPH_CALL_TIMEOUT_MS,
    },
   ).catch(error => { rootReadError = error; return undefined; });
-  if (rootNode !== undefined) ctx.onMapRootRead?.(rootNode);
+  if (rootNode !== undefined) {
+   completeRecovery(journal, recoveryScope, "graph:node", String(map.root));
+   ctx.onMapRootRead?.(rootNode);
+  }
   if (node.status === "closed") {
    const github = ctx.github ?? lanePort(config, repo);
    const pr = await findNodePr(github, repo, node, row?.prNumber, token);
@@ -600,7 +622,7 @@ export async function runNode(
   }
   const detail = `node #${nodeId} is kind '${node.node.kind}' — ranger walks research and task/build nodes only (design §3).`;
   journal.recordEvent("refused", { nodeId, repo, detail });
-  finish(journal, nodeId, repo, "parked", detail);
+  finish(journal, nodeId, repo, "parked", humanRecovery(journal, nodeId, repo, detail));
   return { ...base, status: "refused", detail };
  } catch (caught) {
   let error = caught;
@@ -611,7 +633,7 @@ export async function runNode(
    journal.recordEvent("fenced", { nodeId, repo, detail });
    return { ...base, status: "refused", detail };
   }
-  if (observedNode?.node.kind === "research" && !(error instanceof FencedError) && !(error instanceof ProgressConflict)) {
+  if (observedNode?.node.kind === "research" && !(error instanceof FencedError) && !(error instanceof ProgressConflict) && !(error instanceof OperationFailure)) {
    try {
     const failure = await preserveResearchProgress(ctx, observedNode, generation, error instanceof GitSafetyError ? error.message : undefined);
     if (failure !== null) error = new ParkSignal(`${error instanceof Error ? error.message : String(error)}\n${failure}`);
@@ -634,12 +656,17 @@ export async function runNode(
    repo,
    detail: detail.slice(0, 400),
   });
+  if (error instanceof OperationFailure) {
+   failNode(config, journal, nodeId, repo, detail, error.outcome, ctx.now?.() ?? new Date());
+   return { ...base, status: error.outcome.kind === "code" ? "failed" : "parked", detail: journal.getWorker(nodeId, repo)?.outcome ?? detail };
+  }
   if (error instanceof ParkSignal) {
-   finish(journal, nodeId, repo, "parked", detail);
+   const reason = humanRecovery(journal, nodeId, repo, detail);
+   finish(journal, nodeId, repo, "parked", reason);
    return { ...base, status: "parked", detail };
   }
-  failNode(config, journal, nodeId, repo, detail);
-  return { ...base, status: "failed", detail };
+  failNode(config, journal, nodeId, repo, detail, failureOutcome(error), ctx.now?.() ?? new Date());
+  return { ...base, status: "parked", detail: journal.getWorker(nodeId, repo)?.outcome ?? detail };
  }
 }
 
@@ -683,6 +710,10 @@ async function runSession(
    ? await selectBuildSubstrate(ctx, capped)
    : { substrate: undefined, chosenOn: "RANGER_WORKER_CMD override; its heads count as Pi-written" };
  const workerCmd = envCmd ?? resolveWorkerCommand(ctx, substrate as SubstrateName, session.canonical);
+ if (ctx.map.reachable !== undefined || (envCmd === undefined && ctx.workerCommand === undefined && substrate !== undefined)) {
+  await requireEndpoint(ctx.config, substrate ?? "claude", ctx.map.reachable, ctx.endpointProbe, ctx.endpointLookup);
+  completeRecovery(journal, nodeRecoveryScope(ctx.map.repo, nodeId), "model-endpoint", undefined, { nodeId, repo: ctx.map.repo, generation: session.generation });
+ }
  // The pinned model (node #60), only when ranger built the command from its
  // config: an operator's or a test's command carries no model ranger knows.
  const model =
@@ -697,6 +728,7 @@ async function runSession(
  });
  return runImplement({
   ...session,
+  workerSource: envCmd !== undefined || ctx.workerCommand !== undefined || ctx.worker !== undefined ? "command" : "model",
   workerRun:
    ctx.worker ??
    ((p: string, opts: RunOptions) => runCmd(workerCmd[0], [...workerCmd.slice(1), p], opts)),
@@ -721,7 +753,7 @@ async function runImplementNode(
  const ratify = ratifyFor(node, map, botIdentity, principalLoginForRepo(config, repo));
  if (ratify !== "auto" && ratify !== "merge") {
   journal.recordEvent("refused", { nodeId, repo, detail: ratify });
-  finish(journal, nodeId, repo, "parked", ratify);
+  finish(journal, nodeId, repo, "parked", humanRecovery(journal, nodeId, repo, ratify));
   return { ...base, status: "refused", detail: ratify };
  }
  const readOnlyToken = ctx.readOnlyToken ?? resolveReadOnlyToken(config, repo).token;
@@ -805,25 +837,27 @@ async function runImplementNode(
    finish(journal, nodeId, repo, "success", outcome.detail);
    break;
   case "awaiting-merge":
+   completeRecovery(journal, nodeRecoveryScope(repo, nodeId));
    journal.resetDeadman();
    // The row already says awaiting-merge; the supervisor exits, so its PID goes.
    journal.updateWorker(nodeId, repo, { pid: null });
    break;
+  case "parked":
   case "refused":
    journal.recordEvent("refused", { nodeId, repo, detail: outcome.detail.slice(0, 400) });
-   finish(journal, nodeId, repo, "parked", outcome.detail);
+   finish(journal, nodeId, repo, "parked", humanRecovery(journal, nodeId, repo, outcome.detail));
    break;
   default:
    journal.recordEvent("refused", { nodeId, repo, detail: outcome.detail.slice(0, 400) });
    // Backstop: a capped failure never counts (node #45), even if it ends the
    // run; a transient GitHub error is left for the sweep (failNode).
    if (outcome.substrateCapped !== undefined) finish(journal, nodeId, repo, "failed", outcome.detail);
-   else failNode(config, journal, nodeId, repo, outcome.detail);
+   else failNode(config, journal, nodeId, repo, outcome.detail, outcome.failureOutcome, ctx.now?.() ?? new Date());
  }
  return {
   ...base,
-  status: outcome.status,
-  detail: outcome.detail,
+  status: outcome.failureOutcome !== undefined && outcome.failureOutcome.kind !== "code" ? "parked" : outcome.status,
+  detail: outcome.failureOutcome !== undefined && outcome.failureOutcome.kind !== "code" ? journal.getWorker(nodeId, repo)?.outcome ?? outcome.detail : outcome.detail,
   workerExit: outcome.workerExit,
   close: outcome.close,
   prNumber: outcome.prNumber,
@@ -831,6 +865,14 @@ async function runImplementNode(
 }
 
 /** Park the run: the event, the terminal row, the card. The claim stays. */
+function humanRecovery(journal: Journal, nodeId: string, repo: string, detail: string): string {
+ const scope = nodeRecoveryScope(repo, nodeId);
+ const state = activeRecovery(journal, scope);
+ if (state === null || state.status === "complete") return detail;
+ return recoveryReason(recordRecovery(journal, scope, { kind: "human", operation: "human-decision", evidence: detail,
+  action: "resolve the human decision, then resume-node --reset-recovery" }));
+}
+
 async function parkRun(
  ctx: RunNodeContext,
  nodeId: string,
@@ -839,7 +881,7 @@ async function parkRun(
 ): Promise<RunNodeOutcome> {
  const repo = ctx.map.repo;
  ctx.journal.recordEvent("parked", { nodeId, repo, detail: journalOutcome(detail) });
- finish(ctx.journal, nodeId, repo, "parked", detail);
+ finish(ctx.journal, nodeId, repo, "parked", humanRecovery(ctx.journal, nodeId, repo, detail));
  await parkCard(ctx.map, nodeId, title, detail);
  return { nodeId, repo, status: "parked", detail, workerExit: null };
 }
@@ -973,7 +1015,7 @@ async function runResearch(
  const ratify = researchRatifyFor(node, rootNode, ctx);
  if (ratify !== "auto" && ratify !== "propose") {
   journal.recordEvent("refused", { nodeId, repo, detail: ratify });
-  finish(journal, nodeId, repo, "parked", ratify);
+  finish(journal, nodeId, repo, "parked", humanRecovery(journal, nodeId, repo, ratify));
   return { ...base, status: "refused", detail: ratify };
  }
 
@@ -1088,6 +1130,7 @@ async function runResearch(
 
   // The run-node start check vetted this state against the known-good one.
   const snapshot = start.state.hash;
+  if (map.reachable !== undefined) await requireEndpoint(config, "claude", map.reachable, ctx.endpointProbe, ctx.endpointLookup);
   fence("spawn the worker");
   const workerResult = await workerRun(prompt, {
    cwd: worktree,
@@ -1109,14 +1152,14 @@ async function runResearch(
    const head = await resolveBranchSha(canonical, branch);
    if (head !== null && head !== baseSha) await checkpointNode(progress, { sha: head,
     evidence: { sha: head, kind: "research-worker", result: "failed", detail: `research worker exited ${workerResult.code}` } });
-   return failResearch(detail, workerResult.code);
+   return failResearch(detail, workerResult.code, undefined, processOutcome(workerResult, "research-worker"));
   }
 
   // Research SOP tail: findings must exist on the worktree.
   const findingsPath = join(worktree, "findings.md");
   if (!existsSync(findingsPath)) {
    const detail = `worker succeeded but wrote no findings.md at ${findingsPath} — the close would be hollow, so ranger refuses to close. (worker log: ${log})`;
-   return failResearch(detail, 0);
+   return failResearch(detail, 0, undefined, { kind: "code", operation: "research-findings", evidence: detail, action: "write findings.md before retrying" });
   }
 
   journal.resetDeadman();
@@ -1149,7 +1192,7 @@ async function runResearch(
   } catch (error) {
    if (error instanceof FencedError) throw error;
    const detail = `research branch push failed (${branch}): ${error instanceof Error ? error.message : String(error)}`;
-   return failResearch(detail, 0, error instanceof GitSafetyError ? error.message : undefined);
+   return failResearch(detail, 0, error instanceof GitSafetyError ? error.message : undefined, failureOutcome(error, "research-push"));
   }
  } else {
   const head = await resolveBranchSha(canonical, branch);
@@ -1264,12 +1307,16 @@ async function runResearch(
 
  return parkResearchClose(ctx, nodeId, close, 0);
 
- async function failResearch(detail: string, workerExit: number, refusal?: string): Promise<RunNodeOutcome> {
+ async function failResearch(detail: string, workerExit: number, refusal?: string, outcome?: OperationOutcome): Promise<RunNodeOutcome> {
   const failure = await preserveResearchProgress(ctx, node, generation, refusal);
-  if (failure !== null) throw new ProgressConflict(`${detail}\n${failure}`);
+  if (failure !== null) {
+   if (outcome !== undefined && outcome.kind !== "code") throw new OperationFailure({ ...outcome, evidence: `${detail}\n${failure}` });
+   throw new ProgressConflict(`${detail}\n${failure}`);
+  }
   journal.recordEvent("refused", { nodeId, repo, detail });
-  failNode(config, journal, nodeId, repo, detail);
-  return { ...base, status: "failed", detail, workerExit };
+  failNode(config, journal, nodeId, repo, detail, outcome ?? (workerExit === 0 ? { kind: "human", operation: "research-policy", evidence: detail, action: "resolve the research refusal before resuming" } : processOutcome({ code: workerExit }, "research-worker")));
+  const parked = journal.getWorker(nodeId, repo)?.status === "parked";
+  return { ...base, status: parked ? "parked" : "failed", detail: parked ? activeRecoveryReason(journal, nodeRecoveryScope(repo, nodeId)) : detail, workerExit };
  }
 }
 

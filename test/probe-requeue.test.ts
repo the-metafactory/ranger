@@ -1,3 +1,4 @@
+import { activeRecovery, nodeRecoveryScope } from "../src/recovery.ts";
 import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -32,13 +33,15 @@ function rig() {
  }));
  const config = loadConfig(configPath).config;
  let journal = openJournal(config);
+ let now = new Date();
  const park = (id: string, repo = A, extra: Partial<WorkerRow> = {}) => journal.upsertWorker({
   repo, root: 1, nodeId: id, status: "parked", lane: "implement", phase: "review", prNumber: 1,
   outcome: outcome(), finishedAt: "2026-10-07T07:00:00.000Z", ...extra,
  });
  const retry = (spawn: (id: string, repo: string, root: number) => Promise<number | null> = async () => process.pid) =>
-  requeueProbes({ journal, maps: config.maps, limit: config.workers.probeRequeues, owned: () => {}, spawn });
+  requeueProbes({ journal, now: () => now, maps: config.maps, limit: config.workers.probeRequeues, owned: () => {}, spawn });
  return { dir, config, configPath, get journal() { return journal; }, park, retry,
+  advance(id: string, repo = A) { const state = activeRecovery(journal, nodeRecoveryScope(repo, id)); if (state?.nextEligibleAt) now = new Date(state.nextEligibleAt); },
   reopen() { journal.close(); journal = openJournal(config); },
   close() { journal.close(); rmSync(dir, { recursive: true, force: true }); },
  };
@@ -168,6 +171,8 @@ describe("automatic probe requeue", () => {
     expect(await r.retry(async () => { if (throws) throw new Error("spawn failed"); return null; }))
      .toMatchObject({ resumed: [], pending: [`${A}#10`], lanes: ["visual"] });
     expect(r.journal.getWorker("10", A)).toMatchObject({ status: "parked", generation: 1, outcome: expect.stringContaining(outcome()), finishedAt: "2026-10-07T07:00:00.000Z" });
+    expect((await r.retry()).resumed).toEqual([]);
+    r.advance("10");
     expect((await r.retry()).resumed).toEqual([`${A}#10`]);
    } finally { r.close(); }
   });

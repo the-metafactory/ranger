@@ -237,16 +237,15 @@ describe("node #301 — scheduled jobs", () => {
   expect(r.journal.getJobRun(runId)?.result).toBe("https://youtube.com/shorts/C67Fj9RkhRI");
  });
 
- test("past wallClockMin the run is failed with reason budget, one envelope, no result_ref", async () => {
+ test("past wallClockMin the run stays queued with bounded retry and no finished envelope", async () => {
   const r = rig();
   const runId = await startedRun(r);
   const outcome = await runJob(runId, { config: r.config, journal: r.journal, substrate: "claude",
    runSession: session({ code: -1, timedOut: true }, "soma:outputs/x.md").runSession, ledger: r.ledger });
-  expect(outcome).toMatchObject({ status: "failed", reason: "budget" });
-  expect(r.journal.getJobRun(runId)).toMatchObject({ status: "failed", reason: "budget" });
-  expect(r.envelopes).toHaveLength(1);
-  expect(r.envelopes[0].input.payload).toMatchObject({ outcome: "failed" });
-  expect(r.envelopes[0].input.payload).not.toHaveProperty("result_ref");
+  expect(outcome.status).toBe("deferred");
+  expect(outcome.reason).toContain("next retry");
+  expect(r.journal.getJobRun(runId)).toMatchObject({ status: "queued", reportedAt: null });
+  expect(r.envelopes).toHaveLength(0);
  });
 
  test("requireResult: a clean exit with no result fails as no result; with a result it succeeds", async () => {
@@ -276,17 +275,18 @@ describe("node #301 — scheduled jobs", () => {
   const r = rig();
   const runId = await startedRun(r);
   await runJob(runId, { config: r.config, journal: r.journal, substrate: "claude", runSession: session({ code: 3 }).runSession, ledger: r.ledger });
-  expect(r.journal.getJobRun(runId)).toMatchObject({ status: "failed", reason: "exit 3" });
+  expect(r.journal.getJobRun(runId)).toMatchObject({ status: "failed", reason: expect.stringContaining("job-session exited 3") });
  });
 
- test("a dead supervisor is swept to failed (crashed), reported once, and frees the lane", async () => {
+ test("a dead supervisor queues bounded recovery, reports no terminal outcome, and frees the lane", async () => {
   const r = rig();
   const runId = await startedRun(r);
   r.journal.updateJobRun(runId, "running", { pid: 2_147_483_000 });
   const pass = await jobPass({ config: r.config, configPath: r.configPath, journal: r.journal, spawnJob: spawner().spawnJob, ledger: r.ledger });
-  expect(pass.failed).toEqual([{ runId, name: "daily-short", reason: "crashed" }]);
+  expect(pass.failed).toEqual([]);
+  expect(pass.waiting[0]?.reason).toContain("job supervisor crashed");
   expect(r.journal.laneHolder("visual")).toBeNull();
-  expect(r.envelopes).toHaveLength(1);
+  expect(r.envelopes).toHaveLength(0);
   // A late supervisor finishing the same run reports nothing more.
   r.envelopes.length = 0;
   const late = await runJob(runId, { config: r.config, journal: r.journal, substrate: "claude", runSession: session().runSession, ledger: r.ledger });
@@ -294,17 +294,18 @@ describe("node #301 — scheduled jobs", () => {
   expect(r.envelopes).toHaveLength(0);
  });
 
- test("a reservation whose tick died before recording a pid is swept as spawn and frees the lane", async () => {
+ test("an abandoned reservation queues bounded spawn recovery and frees the lane", async () => {
   const r = rig();
   const { runId } = JSON.parse(runJobEnqueue("daily-short", r.configPath).report) as { runId: number };
   // The tick reserved the lane, then died before the spawn recorded a pid.
   r.journal.updateJobRun(runId, "queued", { status: "running", startedAt: new Date().toISOString() });
   expect(r.journal.laneHolder("visual")).not.toBeNull();
   const pass = await jobPass({ config: r.config, configPath: r.configPath, journal: r.journal, spawnJob: spawner().spawnJob, ledger: r.ledger });
-  expect(pass.failed).toEqual([{ runId, name: "daily-short", reason: "spawn" }]);
+  expect(pass.failed).toEqual([]);
+  expect(pass.waiting[0]?.reason).toContain("abandoned supervisor reservation");
   expect(r.journal.laneHolder("visual")).toBeNull();
-  expect(r.envelopes).toHaveLength(1);
-  expect(r.journal.getJobRun(runId)?.reportedAt).not.toBeNull();
+  expect(r.envelopes).toHaveLength(0);
+  expect(r.journal.getJobRun(runId)?.reportedAt).toBeNull();
  });
 
  test("a finished run its supervisor never reported is reported once by the sweep, after the supervisor is gone", async () => {

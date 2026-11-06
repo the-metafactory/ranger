@@ -53,7 +53,7 @@ test.each([0, 1])("close-only generation keeps complete stdout and stderr with e
   expect(workerLogOf(r.ctx.config, "acme/widgets", "20")).toBe(log);
   if (code !== 0) {
    const parked = r.journal.listEvents("acme/widgets", 200).find(e => e.kind === "parked");
-   expect(parked?.detail).toStartWith("close refused after merge:");
+   expect(parked?.detail).toContain("unknown recovery");
    expect(parked?.detail?.length).toBeLessThan(stdout.length);
   }
  } finally {

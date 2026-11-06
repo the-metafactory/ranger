@@ -1,3 +1,4 @@
+import { processOutcome, type OperationOutcome } from "./operation-outcome.ts";
 import { runCmd, type RunOptions, type RunResult } from "./exec.ts";
 
 /**
@@ -42,7 +43,7 @@ export function isTransientGitHubError(text: string): boolean {
  */
 const READ_RETRYABLE = [/\bHTTP 500\b/, /\b500 Internal Server Error\b/i];
 
-function isRetryableRead(text: string): boolean {
+export function isRetryableRead(text: string): boolean {
  return isTransientGitHubError(text) || READ_RETRYABLE.some((pattern) => pattern.test(text));
 }
 
@@ -93,11 +94,21 @@ export async function runReadRetryingTransient(
  const sleep = retry.sleep ?? defaultSleep;
  let result = await runCmd(bin, args, opts);
  for (let i = 0; i < backoff.length; i++) {
-  if (result.code === 0 || !isRetryableRead(`${result.stderr}\n${result.stdout}`)) break;
+  if (forgeOutcome(result, `${bin} read`).kind !== "infrastructure") break;
   if (retry.shouldRetry !== undefined && !retry.shouldRetry(result)) break;
   retry.onRetry?.(i + 2, result);
   await sleep(backoff[i]);
   result = await runCmd(bin, args, opts);
  }
- return result;
+ return { ...result, outcome: forgeOutcome(result, `${bin} read`) };
+}
+
+export function forgeOutcome(result: RunResult, operation: string): OperationOutcome {
+ const basic = processOutcome(result, operation);
+ if (basic.kind === "success" || basic.kind === "infrastructure" || basic.kind === "unknown") return basic;
+ const status = Number(/^HTTP\/\S+ (\d{3})\b/m.exec(result.stdout)?.[1]);
+ if ([429, 500, 502, 503, 504].includes(status) || isRetryableRead(result.stderr)) {
+  return { kind: "infrastructure", operation, evidence: `${operation}: ${result.stderr.trim().slice(0, 400) || `HTTP ${status}`}`, action: "restore forge connectivity and retry" };
+ }
+ return { kind: "human", operation, evidence: `${operation}: ${result.stderr.trim().slice(0, 400) || `exit ${result.code}`}`, action: "resolve the forge refusal before resuming" };
 }

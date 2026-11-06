@@ -1,3 +1,5 @@
+import { OperationFailure } from "../src/operation-outcome.ts";
+import { activeRecovery, nodeRecoveryScope } from "../src/recovery.ts";
 import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -288,4 +290,20 @@ describe("run-node run ledger", () => {
   expect(outputs[1]).toEqual(outputs[0]);
  });
  }
+});
+
+test("detached context failure retains typed evidence fenced to its reservation", async () => {
+ const f = fixture();
+ const generation = f.journal.getWorker("10", "acme/widgets")!.generation;
+ const output = await runRunNode("10", undefined, f.configPath, deps(f, {}, {
+  runNodeContext: async () => { throw new OperationFailure({ kind: "infrastructure", operation: "token-read", evidence: "trusted preflight timeout", action: "restore token service" }); },
+ }), generation);
+ expect(JSON.parse(output).status).toBe("parked");
+ const reopened = new (await import("../src/journal.ts")).Journal(f.journal.path);
+ try {
+  const state = activeRecovery(reopened, nodeRecoveryScope("acme/widgets", "10"));
+  expect(state).toMatchObject({ kind: "infrastructure", attempts: 1, evidence: "trusted preflight timeout" });
+  expect(reopened.getWorker("10", "acme/widgets")).toMatchObject({ status: "parked", generation, attempts: 0 });
+  expect(reopened.getWorker("10", "acme/widgets")?.outcome).toContain("next retry");
+ } finally { reopened.close(); }
 });

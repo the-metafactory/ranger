@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 
 export interface RunResult {
+  outcome?: import("./operation-outcome.ts").OperationOutcome;
   code: number;
   stdout: string;
   stderr: string;

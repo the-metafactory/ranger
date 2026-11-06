@@ -54,6 +54,7 @@ const RepoSchema = ValidRepoString.transform(repo => {
 });
 
 const MapSchema = z.object({
+ reachable: z.string().url().optional(),
  /** Bare GitHub or forge-qualified ref — the repo whose issues hold the work graph. */
  repo: RepoSchema,
  /** Root node id of the orienteer map (the `orienteer:map` issue). */
@@ -330,6 +331,7 @@ const WorkersSchema = z.object({
 });
 
 const PiSubstrateSchema = z.object({
+ reachable: z.string().url().optional(),
  provider: z.string().min(1).default("spark"),
  model: z.string().min(1).default("longctx-think"),
  reviewEvery: z.number().int().min(0).default(0),
@@ -343,11 +345,13 @@ const MODEL_NAME = /^[A-Za-z0-9._-]+$/;
  * inherited from the principal's own ~/.codex/config.toml.
  */
 const CodexSubstrateSchema = z.object({
+ reachable: z.string().url().optional(),
  model: z.string().regex(MODEL_NAME, "a plain model name ([A-Za-z0-9._-])").default("gpt-6.1-sol"),
  reasoningEffort: z.enum(["low", "medium", "high"]).default("high"),
 });
 
 const ClaudeSubstrateSchema = z.object({
+ reachable: z.string().url().optional(),
  model: z.string().regex(MODEL_NAME, "a plain model name ([A-Za-z0-9._-])").default("claude-sonnet-5-5"),
 });
 
@@ -445,6 +449,7 @@ const StudioJobSchema = z.object({
 });
 
 const JobSchema = z.object({
+ reachable: z.string().url().optional(),
  studio: StudioJobSchema.optional(),
  /** The name `ranger job enqueue` takes and the run ledger reports as `ran.ref`. */
  name: z.string().regex(/^[a-z0-9][a-z0-9-]{0,63}$/, "a lowercase name ([a-z0-9-], at most 64)"),

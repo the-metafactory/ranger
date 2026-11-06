@@ -41,7 +41,7 @@ function rig(areas = "lab", budget = 5, format = "sha1") {
  if (!job) throw new Error("missing job");
  const params = { thread: "alpha", trigger: "New material" };
  const ledger = { env: {}, publisher: async () => {} };
- return { dir, repo, git, configPath, config, journal, job, params, ledger, requests: () => requests, setUnavailable: (value: boolean) => { unavailable = value; }, setPolicy: (value: string) => { policy = value; }, setDirectory: (value: string) => { directory = value; } };
+ return { dir, repo, git, configPath, config, journal, job, params, ledger, endpointProbe: async () => true, requests: () => requests, setUnavailable: (value: boolean) => { unavailable = value; }, setPolicy: (value: string) => { policy = value; }, setDirectory: (value: string) => { directory = value; } };
 }
 
 async function reserve(r: ReturnType<typeof rig>, params: Record<string, string> = r.params) {

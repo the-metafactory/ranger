@@ -177,7 +177,7 @@ test("a delayed desk failure cannot park a newly resumed generation", async () =
  const pass = runMergeDesk({ config, journal: a, map: config.maps[0], token: "unused", botIdentity: "ivy-bot", github,
   post: async () => "message" });
  await waiting;
- await startResumeNode("10", config.maps[0], { config, configPath, journal: b, spawnRunNode: async () => process.pid }, () => {});
+ await startResumeNode("10", config.maps[0], { config, configPath, journal: b, spawnRunNode: async () => process.pid }, () => {}, { resetRecovery: true });
  release();
  await pass;
  expect(row()).toMatchObject({ generation: 1, status: "claimed", pid: process.pid, outcome: null });
@@ -227,7 +227,7 @@ for (const resolution of ["resume", "release", "external-close"] as const) test(
  expect(spawns).toBe(0);
  expect(a.getWorker("21", repo)).toBeNull();
  if (resolution === "resume") {
-  await startResumeNode("20", config.maps[0], { config, configPath, journal: b, spawnRunNode: async () => process.pid }, () => {});
+  await startResumeNode("20", config.maps[0], { config, configPath, journal: b, spawnRunNode: async () => process.pid }, () => {}, { resetRecovery: true });
  } else a.updateWorker("20", repo, { status: resolution === "release" ? "released" : "success" });
  expect(await freshClaim("21", async () => 123)).toMatchObject({ claimed: true, pid: 123 });
 });

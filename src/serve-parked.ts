@@ -45,7 +45,6 @@ import {
  REVIEW_CAP_OUTCOME,
  SUBSTRATE_CAPPED_OUTCOME,
 } from "./outcomes.ts";
-import { isTransientGitHubError } from "./transient.ts";
 
 const ID_PATTERN = /^\d+$/;
 const SHA_PATTERN = /^[0-9a-f]{40}$/;
@@ -156,6 +155,8 @@ export function classifyReason(
   return { class: "needs-eye", detail: `labelled ${NEEDS_EYE_LABEL}: your eye is the check, and the merge is yours` };
  }
  const outcome = row.outcome ?? "";
+ const recovery = /^(infrastructure|dependency|human|unknown) recovery /.exec(outcome);
+ if (recovery !== null) return { class: recovery[1] === "dependency" ? "blocked" : recovery[1] === "infrastructure" ? "transient" : "other", detail: outcome.slice(0, 400) };
  const recent = sinceMotion(events);
  if (REVIEW_CAP_HEAD_MOVED_OUTCOME.test(outcome)) {
   // The counts of the last round belong to the head before the move: the
@@ -220,7 +221,6 @@ export function classifyReason(
  // An outcome that names its own failure is that failure. Only a crash park,
  // which names none, takes its cause from the last attempt's events.
  if (
-  isTransientGitHubError(outcome) ||
   (CRASH_PARK_OUTCOME.test(outcome) && lastAttempt(recent).some((e) => e.kind === "transient"))
  ) {
   // A text match (timeouts, 5xx, connection resets), not a provenance check:

@@ -533,8 +533,17 @@ const CLAUDE_STREAM_OUTPUT: WorkerOutput = {
  read(raw, journal) {
   const lines = raw.stdout.split("\n");
   cacheClaudeRateLimitEvents(lines, journal);
+  let rejected: string | null = null;
+  for (const line of lines) {
+   try {
+    const value: unknown = JSON.parse(line);
+    if (value !== null && typeof value === "object" && "type" in value && value.type === "result" && "is_error" in value && value.is_error === true) {
+     rejected = "subtype" in value && typeof value.subtype === "string" ? value.subtype : "error result";
+    }
+   } catch { continue; }
+  }
   return {
-   result: { ...raw, stdout: extractClaudeResultText(lines, raw.stdoutTail ?? raw.stdout) },
+   result: { ...raw, ...(rejected === null ? {} : { code: raw.code === 0 ? 1 : raw.code, outcome: { kind: "unknown" as const, operation: "model-protocol", evidence: `Claude rejected its result: ${rejected}`, action: "inspect the model protocol result before resuming" } }), stdout: extractClaudeResultText(lines, raw.stdoutTail ?? raw.stdout) },
    lines,
   };
  },

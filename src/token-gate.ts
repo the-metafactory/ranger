@@ -1,3 +1,4 @@
+import { OperationFailure } from "./operation-outcome.ts";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -41,7 +42,7 @@ export type TokenIntrospection = {
   login: string;
 } | { forge: "gitlab"; scopes: string[]; tokenType: "gitlab_pat" };
 
-export class GateError extends Error {
+export class GateError extends OperationFailure {
   override readonly name = "GateError";
   /**
    * True when the gate could not be evaluated (no response, a timeout, a 429 or
@@ -50,7 +51,7 @@ export class GateError extends Error {
    * transient gate without counting a failed start, as with `WriteGateError`.
    */
   constructor(message: string, readonly transient = false) {
-    super(message);
+    super({ kind: transient ? "infrastructure" : "human", operation: "token-gate", evidence: message, action: "restore authorized forge access and retry" });
   }
 }
 

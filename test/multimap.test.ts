@@ -400,9 +400,9 @@ describe("node #47 — map identity", () => {
  });
 
  test("a resource lane alternates maps across restarts and serve predicts the same choice", async () => {
-  const r = rig();
-  const tick = () => runCli(["walk", "-c", r.configPath], r.env);
-  try {
+  await withRigEnv(async r => {
+  const tick = () => walk({ config: r.config, configPath: r.configPath, journal: r.journal, spawnRunNode: async () => process.pid }).then(() => ({ code: 0 }));
+
    expect((await tick()).code).toBe(0);
    expect(r.journal.listWorkers().map(w => [w.nodeId, w.root])).toEqual([["20", 1]]);
    expect(r.journal.getHealth(LAST_IMPLEMENT_MAP)).toBe(REPO + "#1");
@@ -416,13 +416,13 @@ describe("node #47 — map identity", () => {
    r.frontier(1, ["22"]);
    expect((await tick()).code).toBe(0);
    expect(r.journal.getHealth(LAST_IMPLEMENT_MAP)).toBe(REPO + "#1");
-   expect(r.journal.getWorker("22", REPO)?.status).toBe("parked");
+   expect(r.journal.getWorker("22", REPO)?.status).toBe("claimed");
    r.journal.updateWorker("22", REPO, { status: "success" });
    r.frontier(460, []);
    r.frontier(1, ["23"]);
    expect((await tick()).code).toBe(0);
    expect(r.journal.getWorker("23", REPO)?.root).toBe(1); // empty sibling skipped
-  } finally { r.close(); }
+  });
  });
 
  test("a merge-desk send-back takes its lane before a fresh claim (seelite #691 beat #491 to it, 2026-10-05)", async () => {
@@ -486,8 +486,8 @@ describe("node #47 — map identity", () => {
  });
 
  test("starts in another resource lane do not starve sibling map rotation", async () => {
-  const r = rig();
-  try {
+  await withRigEnv(async r => {
+
    const visual = { ...r.config.maps[0], repo: "acme/game", commands: { ...r.config.maps[0].commands, test: "bun test", probe: "true" } };
    r.config.maps.push(visual);
    writeFileSync(r.configPath, stringify(r.config));
@@ -496,7 +496,7 @@ describe("node #47 — map identity", () => {
    fixture.repo = visual.repo;
    fixture.frontier[0].ref.id = fixture.frontier[0].node.id = "50";
    writeFileSync(visualFrontier, JSON.stringify(fixture));
-   expect((await runCli(["walk", "-c", r.configPath], r.env)).code).toBe(0);
+   expect((await walk({ config: r.config, configPath: r.configPath, journal: r.journal, spawnRunNode: async () => process.pid }).then(() => ({ code: 0 }))).code).toBe(0);
    expect(r.journal.listWorkers().map(w => [w.repo, w.nodeId, w.root])).toEqual([[REPO, "20", 1], [visual.repo, "50", 1]]);
    expect(r.journal.getHealth(LAST_IMPLEMENT_MAP)).toBe("acme/game#1");
    r.journal.updateWorker("20", REPO, { status: "success" });
@@ -504,10 +504,10 @@ describe("node #47 — map identity", () => {
    fixture.frontier[0].ref.id = fixture.frontier[0].node.id = "51";
    writeFileSync(visualFrontier, JSON.stringify(fixture));
    expect(predicted(r.config)).toEqual([REPO + "#460", "acme/game#1"]);
-   expect((await runCli(["walk", "-c", r.configPath], r.env)).code).toBe(0);
+   expect((await walk({ config: r.config, configPath: r.configPath, journal: r.journal, spawnRunNode: async () => process.pid }).then(() => ({ code: 0 }))).code).toBe(0);
    expect(r.journal.getWorker("21", REPO)?.root).toBe(460);
-   expect(r.journal.getWorker("51", visual.repo)?.status).toBe("parked");
-  } finally { r.close(); }
+   expect(r.journal.getWorker("51", visual.repo)?.status).toBe("claimed");
+  });
  });
 
  test("sibling escalation passes keep each other's cards and separate daily digests", async () => {

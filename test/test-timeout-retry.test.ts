@@ -48,15 +48,17 @@ describe("a supervisor test run that hits its timeout (node #476)", () => {
   expect(details(r).some((d) => d.includes("passed on the retry in a fresh checkout"))).toBe(true);
  }, 120_000);
 
- test("a second timeout fails the node with the timed-out reason and does not retry again", async () => {
+ test("a second timeout parks with bounded infrastructure recovery and no code strike", async () => {
   const r = await rig({});
   cleanup.push(r.dir);
   quietHost(r);
   const tests = scriptedTests(r, [TIMED_OUT]);
   const outcome = await runNode("20", r.ctx);
   expect(tests.calls).toBe(2);
-  expect(outcome.status).toBe("failed");
-  expect(outcome.detail).toContain("failed after the worker (timed out after 1200 s) — failing test names unavailable");
+  expect(outcome.status).toBe("parked");
+  expect(r.journal.deadmanCount()).toBe(0);
+  expect(outcome.detail).toContain("next retry");
+  expect(workerLog(r)).toContain("timed out after 1200 s");
   expect(outcome.detail).not.toContain("exit -1");
  }, 120_000);
 

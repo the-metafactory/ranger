@@ -12,6 +12,7 @@ import { LAST_IMPLEMENT_MAP } from "../src/maps.ts";
 import type { ChangeRequest, ForgePort } from "../src/forge.ts";
 import { walk } from "../src/walk.ts";
 import type { SpawnRunNodeArgs } from "../src/spawn.ts";
+import { activeRecovery, nodeRecoveryScope } from "../src/recovery.ts";
 import { resumeNode } from "../src/resume.ts";
 import { assembleState, servedMaps, ServeReader, stateFromJournal } from "../src/serve.ts";
 import { classifyFrontier } from "../src/route.ts";
@@ -385,52 +386,42 @@ describe("resume-queue-starts-when-lane-frees", () => {
   });
  });
 
- test("transient reads and admission holds preserve prior failures until the third failed start", async () => {
+ test("infrastructure holds preserve queue entries and spend no failed-start or spawn budget", async () => {
   await withRig(async r => {
-   const entry = r.queue("40");
-   const tick = () => walk({ ...r, now: () => NOW, spawnRunNode: async () => { throw new Error("spawn unavailable"); } });
-   await tick(); await tick();
-   expect(r.journal.getResume(REPO, "40")?.failedStarts).toBe(2);
-   rmSync(join(r.env.FAKE_SOMA_DIR!, "acme__widgets-node-40.json"));
+   r.queue("40");
+   let now = NOW;
+   let calls = 0;
+   const tick = () => walk({ ...r, now: () => now, spawnRunNode: async () => { calls++; throw new Error("spawn unavailable"); } });
+   await tick();
+   expect(calls).toBe(1);
+   expect(r.journal.getResume(REPO, "40")?.failedStarts).toBe(0);
    for (let i = 0; i < 4; i++) await tick();
-   expect(r.journal.getResume(REPO, "40")).toEqual({ ...entry, failedStarts: 2 });
-   r.node("40"); r.journal.setPaused(true);
+   expect(calls).toBe(1);
+   const scope = nodeRecoveryScope(REPO, "40");
+   expect(activeRecovery(r.journal, scope)?.attempts).toBe(1);
+   now = new Date(activeRecovery(r.journal, scope)!.nextEligibleAt!);
    await tick();
-   expect(r.journal.getResume(REPO, "40")?.failedStarts).toBe(2);
-   r.journal.setPaused(false); r.journal.recordSpawn(NOW); r.config.workers.spawnCapPerDay = 1;
-   await tick();
-   expect(r.journal.getResume(REPO, "40")?.failedStarts).toBe(2);
-   r.config.workers.spawnCapPerDay++;
-   await tick();
-   expect(r.journal.getResume(REPO, "40")).toBeNull();
-   expect(r.journal.listEvents(REPO).find(e => e.kind === "resume-dropped")?.detail)
-    .toContain("3 consecutive failed starts; last error: start failed: spawn unavailable");
-   expect(r.journal.getWorker("40", REPO)?.status).toBe("parked");
+   expect(calls).toBe(2);
+   expect(activeRecovery(r.journal, scope)?.attempts).toBe(2);
+   expect(r.journal.getResume(REPO, "40")?.failedStarts).toBe(0);
+   expect(r.journal.spawnsToday(now)).toBe(0);
   });
  });
 
- test("RANGER_NO_SPAWN counts a failed queued start, permits fresh claims, and drops after three", async () => {
+ test("RANGER_NO_SPAWN defers without charging the daily cap or dropping queued work", async () => {
   await withRig(async r => {
-   r.queue("40", 460); r.queue("41");
-   r.frontier(1, ["20"]);
+   r.queue("40", 460); r.queue("41"); r.frontier(1, ["20"]);
    const tick = () => walk({ ...r, now: () => NOW });
    const first = await tick();
    expect(first.maps.flatMap(m => m.claimed)).toEqual(["20"]);
-   expect(first.maps.flatMap(m => m.errors).join(" ")).toContain("run-node spawn returned no PID");
    expect(r.journal.getWorker("40", REPO)?.status).toBe("parked");
-   expect(r.journal.getResume(REPO, "40")?.failedStarts).toBe(1);
-   expect(r.journal.getResume(REPO, "41")?.failedStarts).toBe(0);
-   r.frontier(1, []);
-   r.journal.updateWorker("20", REPO, { status: "success" });
-   await tick();
-   expect(r.journal.getResume(REPO, "40")?.failedStarts).toBe(2);
-   await tick();
-   expect(r.journal.getResume(REPO, "40")).toBeNull();
-   expect(r.journal.getResume(REPO, "41")?.failedStarts).toBe(1);
-   expect(r.journal.listEvents(REPO).find(e => e.kind === "resume-dropped")?.detail)
-    .toContain("3 consecutive failed starts; last error: start failed: run-node spawn returned no PID");
-   expect(r.journal.listEvents(REPO).some(e => e.kind === "resume-started")).toBe(false);
-   expect(r.journal.spawnsToday(NOW)).toBe(1); // Only the fresh claim spent budget.
+   expect(r.journal.getResume(REPO, "40")?.failedStarts).toBe(0);
+   r.frontier(1, []); r.journal.updateWorker("20", REPO, { status: "success" });
+   await tick(); await tick();
+   expect(r.journal.getResume(REPO, "40")).not.toBeNull();
+   expect(r.journal.getResume(REPO, "41")).not.toBeNull();
+   expect(r.journal.listEvents(REPO).some(e => e.kind === "resume-dropped")).toBe(false);
+   expect(r.journal.spawnsToday(NOW)).toBe(0);
   });
  });
 
@@ -620,7 +611,7 @@ describe("resume-queue-starts-when-lane-frees", () => {
     expect(spawned).toEqual(["20"]);
     expect(r.journal.listResumeQueue()).toEqual(entries);
     expect(result.maps.flatMap(m => m.claimed)).toEqual(attempt === 0 ? ["20"] : []);
-    expect(result.maps.flatMap(m => m.errors).join(" ")).toContain("validation failed");
+    expect(result.maps.flatMap(m => m.errors)).toEqual([]);
     expect(r.journal.getWorker("40", REPO)?.status).toBe("failed");
     expect(r.journal.getWorker("41", REPO)?.status).toBe("parked");
     expect(r.journal.spawnsToday(NOW)).toBe(1);
@@ -663,8 +654,9 @@ describe("resume-queue-starts-when-lane-frees", () => {
    } });
    expect(spawned).toEqual(["21"]);
    expect(result.maps.flatMap(m => m.claimed)).toEqual(["21"]);
-   expect(r.journal.listResumeQueue()).toEqual([{ ...entry, failedStarts: failure === "no PID" ? 1 : 0 }]);
-   expect(result.maps.flatMap(m => m.errors).join(" ")).toContain(failure === "validation" ? "validation failed" : "run-node spawn returned no PID");
+   expect(r.journal.listResumeQueue()).toEqual([{ ...entry, failedStarts: 0 }]);
+   if (failure === "validation") expect(result.maps.flatMap(m => m.errors)).toEqual([]);
+   else expect(activeRecovery(r.journal, nodeRecoveryScope(REPO, "40"))?.evidence).toContain("no PID");
   });
  });
  }
@@ -791,58 +783,42 @@ describe("resume-queue-starts-when-lane-frees", () => {
     } });
     expect(spawned).toEqual(["40", "21"]);
     expect(result.maps.flatMap(m => m.claimed)).toEqual(["21"]);
-    expect(result.maps.flatMap(m => m.errors).join(" ")).toContain("queued resume #40: start failed: spawn failed");
-    expect(r.journal.listResumeQueue()).toEqual([{ ...entry, failedStarts: 1 }]);
+    expect(activeRecovery(r.journal, nodeRecoveryScope(REPO, "40"))?.evidence).toContain("spawn failed");
+    expect(r.journal.listResumeQueue()).toEqual([{ ...entry, failedStarts: 0 }]);
     expect(r.journal.getWorker("40", REPO)).toMatchObject({ ...before, generation: expect.any(Number), workerPgid: null, outcome: expect.stringContaining("worker start failed") });
    });
   });
  }
 
  for (const failure of ["no PID", "throws"] as const) {
- test(`${failure} reports failed queued starts, retains FIFO and restores rows until recovery`, async () => {
+ test(`${failure} holds its retry while an independent queued node starts`, async () => {
   await withRig(async r => {
    r.queue("40"); r.queue("41", 460);
-   r.frontier(1, ["20"]); r.frontier(460, ["21"]);
-   const entries = r.journal.listResumeQueue();
-   const before = r.journal.getWorker("40", REPO);
    const spawned: string[] = [];
-   const error = failure === "throws" ? "spawn failed" : "run-node spawn returned no PID";
-   const spawnRunNode = async ({ nodeId }: SpawnRunNodeArgs) => {
+   let now = NOW;
+   let fail = true;
+   const tick = () => walk({ ...r, now: () => now, spawnRunNode: async ({ nodeId }) => {
     spawned.push(nodeId);
-    if (nodeId !== "40") return process.pid;
-    if (failure === "throws") throw new Error(error);
-    return null;
-   };
-   for (let attempt = 0; attempt < 2; attempt++) {
-    if (attempt > 0) { r.journal.updateWorker("20", REPO, { status: "success" }); r.frontier(1, []); r.frontier(460, []); }
-    const result = await walk({ ...r, spawnRunNode, now: () => NOW });
-    expect(spawned).toEqual(attempt === 0 ? ["40", "20"] : ["40", "20", "40"]);
-    expect(result.maps.flatMap(m => m.claimed)).toEqual(attempt === 0 ? ["20"] : []);
-    expect(result.maps.flatMap(m => m.errors).join(" ")).toContain(`queued resume #40: start failed: ${error}`);
-    expect(r.journal.listResumeQueue()).toEqual([{ ...entries[0], failedStarts: attempt + 1 }, entries[1]]);
-    expect(r.journal.getWorker("40", REPO)).toMatchObject({ ...before, generation: expect.any(Number), workerPgid: null, outcome: expect.stringContaining("worker start failed") });
-    expect(r.journal.getWorker("41", REPO)?.status).toBe("parked");
-    expect(r.journal.spawnsToday(NOW)).toBe(1);
-   }
-   const events = r.journal.listEvents(REPO).filter(e => e.kind === "sweep" && e.detail?.includes("queued resume #40 deferred: start failed"));
-   expect(events).toHaveLength(2);
-   expect(events.every(e => e.detail?.includes(error))).toBe(true);
-   expect(r.journal.listEvents(REPO).some(e => e.kind === "resume-started")).toBe(false);
-   const recovered: string[] = [];
-   const tick = () => walk({ ...r, now: () => NOW,
-    spawnRunNode: async ({ nodeId }) => { recovered.push(nodeId); return process.pid; } });
+    if (nodeId === "40" && fail) {
+     if (failure === "throws") throw new Error("spawn failed");
+     return null;
+    }
+    return process.pid;
+   } });
    await tick();
-   expect(recovered).toEqual(["40"]);
-   expect(r.journal.listResumeQueue()).toEqual([entries[1]]);
-   expect(r.journal.spawnsToday(NOW)).toBe(2);
-   r.journal.updateWorker("40", REPO, { status: "parked" });
-   const requeued = r.journal.enqueueResume({ nodeId: "40", repo: REPO, root: 1, lane: "headless" }, NOW);
-   expect(requeued.failedStarts).toBe(0);
-   r.journal.removeResume(requeued, "resume-cancelled", "test reset");
-   r.journal.updateWorker("40", REPO, { status: "success" });
+   expect(spawned).toEqual(["40"]);
+   expect(r.journal.getResume(REPO, "40")?.failedStarts).toBe(0);
    await tick();
-   expect(recovered).toEqual(["40", "41"]);
+   expect(spawned).toEqual(["40", "41"]);
+   expect(r.journal.spawnsToday(NOW)).toBe(1);
+   r.journal.updateWorker("41", REPO, { status: "success" });
+   fail = false;
+   now = new Date(activeRecovery(r.journal, nodeRecoveryScope(REPO, "40"))!.nextEligibleAt!);
+   await tick();
+   expect(spawned).toEqual(["40", "41", "40"]);
+   expect(r.journal.getWorker("40", REPO)?.status).toBe("claimed");
    expect(r.journal.listResumeQueue()).toEqual([]);
+   expect(r.journal.spawnsToday(now)).toBe(2);
   });
  });
  }
@@ -1097,5 +1073,27 @@ describe("workers.laneBusyLoad: each implement lane has its own busy load (node 
    expect(result.maps.map(m => m.hostBusy).filter(b => b !== undefined))
     .toEqual(["the host is busy (load 25.0 on 10 cores, busy at 20)"]);
   });
+ });
+});
+
+test("a dependency-held map leaves an independent node eligible across ticks", async () => {
+ await withRig(async r => {
+  r.queue("40"); r.queue("41", 460);
+  r.config.maps[0].reachable = "https://offline.invalid/models";
+  r.config.maps[1].reachable = "https://online.invalid/models";
+  const spawned: string[] = [];
+  const probes: string[] = [];
+  const tick = () => walk({ ...r, now: () => NOW,
+   endpointProbe: async url => { probes.push(url); return url.includes("online"); },
+   spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; },
+  });
+  await tick(); await tick();
+  expect(spawned).toEqual(["41"]);
+  expect(probes.filter(url => url.includes("offline"))).toHaveLength(1);
+  expect(activeRecovery(r.journal, nodeRecoveryScope(REPO, "40"))).toMatchObject({ kind: "dependency", attempts: 1 });
+  expect(r.journal.getWorker("40", REPO)).toMatchObject({ status: "parked", attempts: 0, pid: null });
+  expect(r.journal.getWorker("41", REPO)?.pid).toBe(process.pid);
+  expect(r.journal.deadmanCount()).toBe(0);
+  expect(r.journal.spawnsToday(NOW)).toBe(1);
  });
 });

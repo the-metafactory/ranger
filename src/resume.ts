@@ -1,3 +1,6 @@
+import { OperationFailure } from "./operation-outcome.ts";
+import { requireReachable, type EndpointProbe } from "./endpoint.ts";
+import { activeRecovery, nodeRecoveryScope, recoveryHold, resetRecovery } from "./recovery.ts";
 import { startOwnedWorker, reservationPending } from "./node-ownership.ts";
 import { join } from "node:path";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
@@ -22,6 +25,7 @@ export interface ResumeContext {
  config: RangerConfig;
  configPath: string;
  journal: Journal;
+ endpointProbe?: EndpointProbe;
  spawnRunNode?: (args: SpawnRunNodeArgs) => Promise<number | null>;
  now?: () => Date;
  /** The host load queued resumes wait on (node #297); tests inject a quiet or busy host. */
@@ -130,10 +134,13 @@ export type ResumeOutcome = ResumeResult & (
 /** Caller holds the claim lock. CLI and queued resumes use this same startup path. */
 export async function startResumeNode(
  nodeId: string, map: RangerMapConfig, ctx: ResumeContext, owned: OwnedCheck,
- options: { force?: boolean; queued?: ResumeQueueRow } = {},
+ options: { force?: boolean; queued?: ResumeQueueRow; resetRecovery?: boolean } = {},
 ): Promise<ResumeOutcome> {
  const { journal } = ctx;
  await identityGate(ctx.config, map);
+ if (options.resetRecovery) resetRecovery(journal, nodeRecoveryScope(map.repo, nodeId));
+ const held = recoveryHold(journal, nodeRecoveryScope(map.repo, nodeId), ctx.now?.() ?? new Date());
+ if (held !== null) throw new Error(`${held}; use resume-node --reset-recovery after intervention`);
  const row = journal.getWorker(nodeId, map.repo);
  if (row === null) throw missingRowError(nodeId, map.repo);
  journal.assertWorkerRoot(nodeId, map.repo, map.root);
@@ -174,12 +181,17 @@ export async function startResumeNode(
  const spawner = ctx.spawnRunNode ?? spawnRunNodeDetached;
  let spawnError: Error | undefined;
  const pid = await startOwnedWorker({ journal, row, now,
+  preflight: row.phase === "close" ? undefined : () => requireReachable(map.reachable, ctx.endpointProbe),
   onSpawnFailure: error => { spawnError = error; },
   spawn: generation => spawner({ nodeId, repo: map.repo, root: map.root, generation,
    cliEntry: join(import.meta.dir, "cli.ts"), configPath: ctx.configPath }),
  });
  owned();
- if (pid === null) throw spawnError ?? new Error("run-node spawn returned no PID or ownership was taken");
+ if (pid === null) {
+  const recovery = activeRecovery(journal, nodeRecoveryScope(map.repo, nodeId));
+  if (recovery !== null && recovery.status !== "complete") throw new OperationFailure({ kind: recovery.kind, operation: recovery.operation, target: recovery.target, evidence: recovery.evidence, action: recovery.action });
+  throw spawnError ?? new Error("run-node spawn returned no PID or ownership was taken");
+ }
  if (takesLane) recordImplementStart(journal, map);
  if (options.queued !== undefined) journal.recordSpawn(now);
  const entry = options.queued ?? journal.getResume(map.repo, nodeId);
@@ -189,7 +201,7 @@ export async function startResumeNode(
 }
 
 export async function resumeNode(nodeId: string, selector: string | undefined, ctx: ResumeContext,
- options: { force?: boolean; whenFree?: boolean; cancel?: boolean } = {}) {
+ options: { force?: boolean; whenFree?: boolean; cancel?: boolean; resetRecovery?: boolean } = {}) {
  if ((options.cancel && (options.force || options.whenFree)) || (options.force && options.whenFree)) {
   throw new Error("--cancel, --when-free and --force are mutually exclusive");
  }
@@ -221,7 +233,7 @@ export async function resumeNode(nodeId: string, selector: string | undefined, c
    const entry = journal.enqueueResume({ nodeId, repo: map.repo, root: map.root, lane }, ctx.now?.() ?? new Date());
    return { nodeId, repo: map.repo, root: map.root, queued: true, lane: entry.lane, queuedAt: entry.queuedAt };
   }
-  return startResumeNode(nodeId, map, ctx, owned, { force: options.force });
+  return startResumeNode(nodeId, map, ctx, owned, { force: options.force, resetRecovery: options.resetRecovery });
  });
 }
 
@@ -257,7 +269,7 @@ export async function processResumeQueue(
    owned();
    journal.recordEvent("sweep", { nodeId: entry.nodeId, repo: entry.repo,
     detail: `queued resume #${entry.nodeId} deferred: ${reason}` });
-   state?.errors.push(`queued resume #${entry.nodeId}: ${reason}`);
+   if (failedStart) state?.errors.push(`queued resume #${entry.nodeId}: ${reason}`);
    if (failedStart && journal.recordResumeStartFailure(entry, reason)) return;
    waiting.add(entry.lane);
   };
@@ -271,6 +283,11 @@ export async function processResumeQueue(
   // not, the entry still defers and holds its lane, never skips silently.
   if (state === undefined || map === undefined || row === null) {
    defer(state === undefined ? "map state is unavailable" : "map or worker row is unavailable");
+   continue;
+  }
+  const recoveryWait = recoveryHold(journal, nodeRecoveryScope(entry.repo, entry.nodeId), ctx.now?.() ?? new Date());
+  if (recoveryWait !== null) {
+   journal.recordEvent("sweep", { nodeId: entry.nodeId, repo: entry.repo, detail: `queued recovery deferred: ${recoveryWait}` });
    continue;
   }
   // The lane holder is read at the start itself (startResumeNode), after the
@@ -326,7 +343,7 @@ export async function processResumeQueue(
      break;
    }
   } catch (error) {
-   defer(`start failed: ${error instanceof Error ? error.message : String(error)}`, !transientGate(error));
+   defer(`start failed: ${error instanceof Error ? error.message : String(error)}`, !(error instanceof OperationFailure && ["infrastructure", "dependency"].includes(error.outcome.kind)) && !transientGate(error));
   }
  }
 }

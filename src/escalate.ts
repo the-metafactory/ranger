@@ -1,5 +1,6 @@
 import { principalLoginForRepo } from "./config.ts";
-import { mapKey } from "./maps.ts";
+import { mapKey, mapOrder } from "./maps.ts";
+export const LAST_ESCALATE_MAP = "escalate.lastMap";
 import { join } from "node:path";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import type { EscalationDiscord } from "./discord.ts";
@@ -68,6 +69,7 @@ async function escalateOneMap(
   now: Date,
   passDeadline: number,
   owned: OwnedCheck,
+  clock: () => number = Date.now,
 ): Promise<EscalateMapResult> {
   const base: EscalateMapResult = {
     repo: map.repo,
@@ -87,11 +89,10 @@ async function escalateOneMap(
   // cards are served next tick. This keeps the per-map overhead bounded so
   // the end-to-end pass can't drift unboundedly past the deadline (round-30
   // review: the 120s bound is not just the budget's charge gate).
-  if (Date.now() > passDeadline) {
+  if (clock() >= passDeadline) {
     return {
       ...base,
-      ok: false,
-      error: "pass deadline reached before this map",
+      budgetDeferred: "pass deadline reached before this map",
     };
   }
 
@@ -133,7 +134,7 @@ async function escalateOneMap(
       token,
       policy: budgetPolicy(config),
       now,
-      timeoutMs: Math.max(1, Math.min(GRAPH_CALL_TIMEOUT_MS, passDeadline - Date.now())),
+      timeoutMs: Math.max(1, Math.min(GRAPH_CALL_TIMEOUT_MS, passDeadline - clock())),
     }));
     // A vetoed node back on the frontier carries the refused card, whatever
     // its route (node #240, ruling D7): the principal's to take.
@@ -151,9 +152,9 @@ async function escalateOneMap(
       });
     });
     const readNode = (id: string) => {
-      if (Date.now() >= passDeadline) throw new BudgetDeferral("graph closure pass deadline reached");
+      if (clock() >= passDeadline) throw new BudgetDeferral("graph closure pass deadline reached");
       return budgetedRead(journal, map.repo, token, budgetPolicy(config), now, () => {
-        const remaining = passDeadline - Date.now();
+        const remaining = passDeadline - clock();
         if (remaining <= 0) throw new BudgetDeferral("graph closure pass deadline reached");
         return graphNode(map.repo, id, token, { timeoutMs: Math.min(GRAPH_CALL_TIMEOUT_MS, remaining) });
       });
@@ -262,7 +263,7 @@ async function proposalCards(
 export async function escalateMaps(
   config: RangerConfig,
   journal: Journal,
-  opts: { now?: Date } = {},
+  opts: { now?: Date; clock?: () => number; passMs?: number; step?: (map: RangerMapConfig, deadline: number) => Promise<EscalateMapResult> } = {},
 ): Promise<EscalateResult> {
   return withEscalateLock(journal, async (owned) => {
     const now = opts.now ?? new Date();
@@ -271,22 +272,32 @@ export async function escalateMaps(
     // walk for ~240s (round-28 review: "escalation never blocks walking"
     // is bounded at the TICK scope, not per map). Deferred maps/cards are
     // served next tick.
-    const passDeadline = Date.now() + MAX_PASS_MS;
+    const clock = opts.clock ?? Date.now;
+    const passDeadline = clock() + (opts.passMs ?? MAX_PASS_MS);
     const registry = loadProbeRegistry();
-    const maps: EscalateMapResult[] = [];
-    for (const map of config.maps) {
-      maps.push(
-        await escalateOneMap(
-          config,
-          map,
-          journal,
-          registry,
-          now,
-          passDeadline,
-          owned,
-        ),
-      );
+    const reports = new Map<string, EscalateMapResult>();
+    for (const map of mapOrder(config.maps, journal.getHealth(LAST_ESCALATE_MAP))) {
+      if (clock() >= passDeadline) {
+        reports.set(mapKey(map), { repo: map.repo, kind: "cards", ok: true, posted: [], edited: [], deferred: [],
+          keptOpen: [], closed: [], cardErrors: [], cards: [], budgetDeferred: "pass deadline reached before this map" });
+        continue;
+      }
+      let result: EscalateMapResult;
+      try {
+        owned();
+        result = await (opts.step ? opts.step(map, passDeadline) :
+          escalateOneMap(config, map, journal, registry, now, passDeadline, owned, clock));
+        if (result.budgetDeferred === undefined) journal.setHealth(LAST_ESCALATE_MAP, mapKey(map));
+      } catch (error) {
+        result = { repo: map.repo, kind: "cards", ok: false, posted: [], edited: [], deferred: [],
+          keptOpen: [], closed: [], cardErrors: [], cards: [], error: error instanceof Error ? error.message : String(error) };
+      }
+      reports.set(mapKey(map), result);
     }
+    const maps = config.maps.flatMap(map => {
+      const report = reports.get(mapKey(map));
+      return report === undefined ? [] : [report];
+    });
     return { generatedAt: now.toISOString(), maps };
   });
 }

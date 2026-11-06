@@ -1,3 +1,5 @@
+import { OperationFailure, type OperationOutcome } from "./operation-outcome.ts";
+import { forgeOutcome } from "./transient.ts";
 import { isGitLabRateLimit, runReadRetryingTransient } from "./transient.ts";
 import { gatedEnv, assertGitLabReadGrant, type ResolvedToken } from "./token-gate.ts";
 import { glabConfigEnvAsync } from "./glab-config-dir.ts";
@@ -14,8 +16,12 @@ import { parseForgeRef, qualifiedRepo, normalizeNodeId, type ForgeRef } from "./
 export const READONLY_VERBS = ["frontier", "node", "audit"] as const;
 export type ReadonlyVerb = (typeof READONLY_VERBS)[number];
 
-export class GraphError extends Error {
+export class GraphError extends OperationFailure {
   override readonly name: string = "GraphError";
+  constructor(message: string, outcome?: OperationOutcome) {
+   super(outcome ?? { kind: "unknown", operation: "graph-read", evidence: message, action: "inspect the graph read and retry" });
+   this.message = message;
+  }
 }
 
 /**
@@ -49,11 +55,12 @@ export function graphFailure(
   message: string,
   stderr: string,
   repo: string,
+  outcome?: OperationOutcome,
 ): GraphError {
   const gitlab = parseForgeRef(repo).forge === "gitlab";
   return RATE_LIMITED.test(stderr) || (gitlab && isGitLabRateLimit(stderr))
-    ? new RateLimitError(message)
-    : new GraphError(message);
+    ? new RateLimitError(message, { kind: "infrastructure", operation: "graph-read", evidence: message, action: "wait for the forge rate limit and retry" })
+    : new GraphError(message, outcome ?? forgeOutcome({ code: 1, stdout: "", stderr }, "graph-read"));
 }
 
 export interface FrontierEntryNode {
@@ -192,7 +199,7 @@ interface CallGraphArgs {
  */
 export async function callGraph(
   args: CallGraphArgs,
-): Promise<{ code: number; stdout: string; stderr: string }> {
+): Promise<import("./exec.ts").RunResult> {
   const { verb, root, repo, token, opts = {} } = args;
   if (!isReadonlyVerb(verb)) {
     throw new GraphError(
@@ -205,17 +212,18 @@ export async function callGraph(
     const cliArgs = [
       "graph",
       verb,
-      graphNodeId(ref, String(root)),
+      graphNodeId(ref, root),
       "--repo",
       somaRepo(ref),
       "--json",
     ];
     const runner = opts.runner ?? backend.runner;
-    return await runner("soma", cliArgs, {
+    const result = await runner("soma", cliArgs, {
       cwd: opts.cwd,
       timeoutMs: opts.timeoutMs ?? backend.timeoutMs,
       env: backend.env,
     });
+    return { ...result, outcome: { ...(result.outcome ?? forgeOutcome(result, `graph:${verb}`)), operation: `graph:${verb}`, target: root } };
   } finally {
     await backend.cleanup();
   }
@@ -247,6 +255,7 @@ export async function graphFrontier(
       `soma graph frontier ${root} (${repo}) failed (exit ${result.code}): ${result.stderr.trim()}`,
       result.stderr,
       repo,
+      result.outcome,
     );
   }
   return normalizeFrontier(repo, parseJson<FrontierResult>("frontier", result.stdout));
@@ -270,6 +279,7 @@ export async function graphAudit(
       `soma graph audit ${root} (${repo}) failed (exit ${result.code}): ${result.stderr.trim()}`,
       result.stderr,
       repo,
+      result.outcome,
     );
   }
   const audit = parseJson<AuditResult>("audit", result.stdout);
@@ -307,6 +317,7 @@ export async function graphNode(
       `soma graph node ${id} (${repo}) failed (exit ${result.code}): ${result.stderr.trim()}`,
       result.stderr,
       repo,
+      result.outcome,
     );
   }
   return normalizeGraphNode(repo, parseJson<NodeResult>("node", result.stdout));

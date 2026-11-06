@@ -98,3 +98,13 @@ If a lost journal took a proposal's row with it, ranger finds the proposal among
 ## End-to-end test
 
 The end-to-end test walks an `auto` research node against fake `soma`, `gh`, and worker fixtures: claim, worktree, findings branch pushed, draft PR, successful CI citation, gated close, and `decisions --write`. A live close for node #25 is the supervisor's check after a deployment.
+
+## Recovery and dependencies
+
+Ranger records infrastructure and dependency failures separately from repository failures. A recovery episode allows three attempts across worker generations and restarts, with one minute and five minute waits before the remaining attempts. A reserved attempt survives a crash. Changing operations or recovering one dependency does not replenish another operation’s outstanding budget. Infrastructure failures do not add code failure strikes.
+
+The worker outcome and dashboard show the next eligible retry, or the reason and action needed after exhaustion. Unknown boundary results remain held for inspection. Opaque output from a nested `soma graph close` cannot establish an infrastructure failure; repository test output cannot grant a retry waiver. After intervention, `ranger resume-node <id> --map <repo#root> --reset-recovery` explicitly resets the node’s recovery budget. A human decision suspends automatic recovery without restoring spent attempts.
+
+Maps, jobs, and model substrates may declare a `reachable` HTTP URL. Ranger probes the selected dependency before dispatch and again before the worker session; any HTTP response establishes reachability. Network failure or timeout holds the affected work without spawning or spending a worker. Pi uses the selected provider’s base URL when no explicit URL is declared. An ambiguous provider configuration requires inspection. Other eligible work continues while a dependency is held. Jobs retain their queued run during bounded recovery; exhausted jobs report failure and require intervention before a new run is enqueued.
+
+Escalation execution resumes after the last map attempted, while reports retain configuration order. Budget deferrals are counted separately from failed maps, and a tick deferred only by its pass budget exits successfully.

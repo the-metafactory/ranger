@@ -1,3 +1,6 @@
+import { failureOutcome, workerOutcome, type OperationOutcome } from "./operation-outcome.ts";
+import { activeRecoveryReason, completeRecovery, jobRecoveryScope, recordRecovery, recoveryHold, recoveryReason, reserveRecovery } from "./recovery.ts";
+import { cachedProbe, requireEndpoint, type EndpointProbe, type EndpointLookup } from "./endpoint.ts";
 /**
  * Scheduled jobs (node #301): a Reflex fire enqueues a named job
  * (`ranger job enqueue <name>`, through a cortex process spec); the next tick
@@ -103,6 +106,8 @@ export interface JobPassResult {
 }
 
 export interface JobPassContext {
+ endpointProbe?: EndpointProbe;
+ endpointLookup?: EndpointLookup;
  config: RangerConfig;
  configPath: string;
  journal: Journal;
@@ -180,7 +185,7 @@ export async function sweepJobs(ctx: JobPassContext, result: JobPassResult): Pro
  }
  for (const run of ctx.journal.listJobRuns("running")) {
   if (run.pid === null) {
-   if (await failRun(ctx, run, "spawn", now)) result.failed.push({ runId: run.id, name: run.name, reason: "spawn" });
+   await recoverJob(ctx, run, { kind: "infrastructure", operation: "job-spawn", evidence: "abandoned supervisor reservation", action: "restore process spawning and re-enqueue after exhaustion" }, now, result);
    continue;
   }
   if (pidAlive(run.pid)) continue;
@@ -189,7 +194,7 @@ export async function sweepJobs(ctx: JobPassContext, result: JobPassResult): Pro
    const commands = await processGroupCommands(run.pgid);
    if (commands.some(c => c.includes(skill))) killProcessGroup(run.pgid);
   }
-  if (await failRun(ctx, run, "crashed", now)) result.failed.push({ runId: run.id, name: run.name, reason: "crashed" });
+  await recoverJob(ctx, run, { kind: "infrastructure", operation: "job-supervisor", evidence: "job supervisor crashed", action: "inspect the process failure and re-enqueue after exhaustion" }, now, result);
  }
 }
 
@@ -205,6 +210,7 @@ export async function jobPass(ctx: JobPassContext): Promise<JobPassResult> {
  await sweepJobs(ctx, result);
  const taken = ctx.takenLanes ?? new Set<ImplementLane>();
  const studioPolicies = studioPolicyCache();
+ const probe = cachedProbe(ctx.endpointProbe);
  for (const run of journal.listJobRuns("queued")) {
   const now = ctx.now?.() ?? new Date();
   const job = config.jobs?.find(j => j.name === run.name);
@@ -228,19 +234,41 @@ export async function jobPass(ctx: JobPassContext): Promise<JobPassResult> {
    wait(`the ${lane} lane is held by ${holder.job === undefined ? `#${holder.nodeId} (${holder.repo}#${holder.root})` : `job ${holder.job}`}`);
    continue;
   }
+  let permitted = job.substrates;
+  let declaredEndpoint = job.reachable;
   if (run.name === "ivy-think") {
    const prepared = await prepareStudio(job, run.params, studioPolicies);
    if (prepared.kind === "deferred") { wait(prepared.reason); continue; }
    const limit = job.studio ? studioLimit(prepared, job.studio, journal.listJobRuns(), now, run.id) : "Studio job is not configured";
    if (limit) { wait(limit); continue; }
-   if ((await studioSubstrates(job, config, prepared.policy)).length === 0) { wait(`No permitted ${prepared.policy} substrate is available`); continue; }
+   permitted = await studioSubstrates(job, config, prepared.policy);
+   if (prepared.policy === "local") declaredEndpoint ??= job.studio?.localEndpoint;
+   if (permitted.length === 0) { wait(`No permitted ${prepared.policy} substrate is available`); continue; }
    journal.updateJobRun(run.id, "queued", { policy: prepared.policy, reason: null });
   }
+  const scope = jobRecoveryScope(run.id);
+  const held = recoveryHold(journal, scope, now);
+  if (held !== null) { wait(held); continue; }
+  if (!reserveRecovery(journal, scope, now, { jobRunId: run.id, status: "queued", pid: run.pid })) { wait(activeRecoveryReason(journal, scope)); continue; }
+  let unavailable: OperationOutcome | null = null;
+  let reachable = false;
+  for (const substrate of permitted) {
+   try { await requireEndpoint(config, substrate, declaredEndpoint, probe, ctx.endpointLookup); reachable = true; break; }
+   catch (error) { unavailable = failureOutcome(error); }
+  }
+  if (!reachable && unavailable !== null) {
+   const state = recordRecovery(journal, scope, unavailable, now, { jobRunId: run.id, status: "queued", pid: run.pid });
+   const reason = recoveryReason(state);
+   if (state.status === "exhausted") {
+    if (await failRun(ctx, run, reason, now)) result.failed.push({ runId: run.id, name: run.name, reason });
+   } else wait(reason);
+   continue;
+  }
+  completeRecovery(journal, scope, "model-endpoint", undefined, { jobRunId: run.id, status: "queued", pid: run.pid });
   // Reserve the lane before spawning: the child must find a running row,
   // and every other scheduler must see the lane occupied.
   if (!journal.updateJobRun(run.id, "queued", { status: "running", startedAt: now.toISOString() })) continue;
-  if (lane !== "none") taken.add(lane);
-  journal.recordSpawn(now);
+
   let pid: number | null = null;
   try {
    pid = await (ctx.spawnJob ?? spawnJobDetached)({
@@ -249,19 +277,44 @@ export async function jobPass(ctx: JobPassContext): Promise<JobPassResult> {
     configPath: ctx.configPath,
    });
   } catch (error) {
-   result.errors.push(`job ${run.name}: spawn failed: ${error instanceof Error ? error.message : String(error)}`);
+   journal.recordEvent("job-finished", { detail: `job ${run.name}: spawn failed: ${error instanceof Error ? error.message : String(error)}` });
   }
-  const running = journal.getJobRun(run.id)!;
+  if (pid !== null) journal.recordSpawn(now);
+  const accepted = journal.recoveryTransaction(undefined, () => {
+   const running = requiredJob(journal, run.id);
+   if (running.status !== "running" || (running.pid !== null && running.pid !== pid)) return null;
+   if (pid === null) return running;
+   if (running.pid === null && !journal.updateJobRun(run.id, "running", { pid }, null)) return null;
+   completeRecovery(journal, scope, "job-spawn", undefined, { jobRunId: run.id, status: "running", pid });
+   return requiredJob(journal, run.id);
+  });
+  if (accepted === null) continue;
   if (pid === null) {
-   if (await failRun(ctx, running, "spawn", now)) result.failed.push({ runId: run.id, name: run.name, reason: "spawn" });
+   await recoverJob(ctx, accepted, { kind: "infrastructure", operation: "job-spawn", evidence: "job supervisor did not spawn", action: "restore process spawning and re-enqueue after exhaustion" }, now, result);
    continue;
   }
-  // The child may already have recorded its own pid (the same process).
-  if (running.pid === null) journal.updateJobRun(run.id, "running", { pid });
+  if (lane !== "none") taken.add(lane);
   journal.recordEvent("job-started", { detail: `job ${run.name} run ${run.id} started ${lane === "none" ? "without a lane" : `on the ${lane} lane`} (pid ${pid})` });
   result.started.push({ runId: run.id, name: run.name, lane, pid });
  }
  return result;
+}
+
+async function recoverJob(ctx: Pick<JobPassContext, "config" | "journal" | "ledger">, run: JobRunRow,
+ outcome: OperationOutcome, now: Date, result?: JobPassResult): Promise<void> {
+ const state = ctx.journal.recoveryTransaction({ jobRunId: run.id, status: run.status, pid: run.pid }, () => {
+  if (!ctx.journal.updateJobRun(run.id, run.status, { status: "queued", pid: null, pgid: null, startedAt: null }, run.pid)) return null;
+  return recordRecovery(ctx.journal, jobRecoveryScope(run.id), outcome, now);
+ });
+ if (state === null) return;
+ const reason = recoveryReason(state);
+ const queued = requiredJob(ctx.journal, run.id);
+ if (state.status === "exhausted") {
+  if (await failRun(ctx, queued, reason, now)) result?.failed.push({ runId: run.id, name: run.name, reason });
+ } else {
+  ctx.journal.updateJobRun(run.id, "queued", { reason });
+  result?.waiting.push({ runId: run.id, name: run.name, reason });
+ }
 }
 
 // ---- the supervisor: `ranger job run <id>` ----
@@ -303,6 +356,8 @@ function readResult(file: string): string | null {
 }
 
 export interface RunJobContext {
+ endpointProbe?: EndpointProbe;
+ endpointLookup?: EndpointLookup;
  config: RangerConfig;
  journal: Journal;
  now?: () => Date;
@@ -373,6 +428,22 @@ export async function runJob(runId: number, ctx: RunJobContext): Promise<RunJobO
    substrate = permitted[0] ?? substrate;
   }
  }
+ const probe = cachedProbe(ctx.endpointProbe);
+ let unavailable: OperationOutcome | undefined;
+ let ready = false;
+ for (const candidate of ctx.substrate === undefined ? [substrate, ...permitted.filter(candidate => candidate !== substrate)] : [substrate]) {
+  try {
+   await requireEndpoint(config, candidate, job.reachable ?? (studio?.policy === "local" ? job.studio?.localEndpoint : undefined), probe, ctx.endpointLookup);
+   substrate = candidate;
+   ready = true;
+   break;
+  } catch (error) { unavailable = failureOutcome(error); }
+ }
+ if (!ready) {
+  await recoverJob(ctx, { ...requiredJob(journal, runId), pid: process.pid }, unavailable ?? { kind: "unknown", operation: "job-endpoint", evidence: "no eligible endpoint", action: "configure an eligible endpoint" }, now());
+  return { runId, name: run.name, status: journal.getJobRun(runId)?.status === "failed" ? "failed" : "deferred", reason: activeRecoveryReason(journal, jobRecoveryScope(runId)) };
+ }
+ completeRecovery(journal, jobRecoveryScope(runId), "model-endpoint", undefined, { jobRunId: runId, status: "running", pid: process.pid });
  journal.updateJobRun(runId, "running", { substrate, ...(studio?.kind === "ready" ? { policy: studio.policy } : {}) });
 
  const scratch = mkdtempSync(join(tmpdir(), "ranger-job-"));
@@ -407,8 +478,14 @@ export async function runJob(runId: number, ctx: RunJobContext): Promise<RunJobO
  const read = studio?.kind === "ready" ? raw : output.read(raw, journal).result;
  const log = saveJobLog(journal.path, run, substrate, read);
 
- const reason = raw.timedOut ? "budget"
-  : raw.code !== 0 ? `exit ${raw.code}`
+ const operation = workerOutcome({ ...read, timedOut: raw.timedOut ?? read.timedOut }, "job-session", "model");
+ if (operation.kind === "infrastructure" || operation.kind === "unknown") {
+  await recoverJob(ctx, { ...requiredJob(journal, runId), pid: process.pid }, operation, now());
+  return { runId, name: run.name, status: journal.getJobRun(runId)?.status === "failed" ? "failed" : "deferred", reason: activeRecoveryReason(journal, jobRecoveryScope(runId)), substrate, result, log };
+ }
+ if (operation.kind === "success") completeRecovery(journal, jobRecoveryScope(runId), undefined, undefined, { jobRunId: runId, status: "running", pid: process.pid });
+ const reason = read.timedOut ? "budget"
+  : read.code !== 0 ? `exit ${read.code}`
   : job.requireResult && result === null ? "no result"
   : undefined;
  const outcome: RunOutcome = reason === undefined ? "succeeded" : "failed";
@@ -418,11 +495,17 @@ export async function runJob(runId: number, ctx: RunJobContext): Promise<RunJobO
  const recorded = journal.updateJobRun(runId, "running", {
   status: outcome === "succeeded" ? "succeeded" : "failed",
   finishedAt: ended, reason: reason ?? null, result, log, pgid: null,
- });
+ }, process.pid);
  // A sweep that already failed this run reported it.
  if (recorded) {
   journal.recordEvent("job-finished", { detail: `job ${run.name} run ${runId} ${outcome}${reason === undefined ? "" : `: ${reason}`}` });
   await reportRun(ctx, runId);
  }
  return { runId, name: run.name, status: outcome === "succeeded" ? "succeeded" : "failed", reason, substrate, result, log };
+}
+
+function requiredJob(journal: Journal, id: number): JobRunRow {
+ const run = journal.getJobRun(id);
+ if (run === null) throw new JobError(`job run ${id} is missing`);
+ return run;
 }

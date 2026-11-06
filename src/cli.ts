@@ -1,4 +1,6 @@
 #!/usr/bin/env bun
+import { failureOutcome } from "./operation-outcome.ts";
+import { nodeRecoveryScope, recordRecovery, recoveryReason } from "./recovery.ts";
 import { readPrivateJson } from "./remote-test/private-io.ts";
 import { isGithubRepo } from "./forge-ref.ts";
 import { graphReadToken, laneCredentialRefusal, lanePort } from "./forge-lanes.ts";
@@ -329,7 +331,18 @@ export async function runRunNode(
  const { config, journal } = (deps.loadCtx ?? loadCtx)(configPath);
  try {
   const map = pickMap(config, repo);
-  const { token, botIdentity, commitAuthor } = await (deps.runNodeContext ?? runNodeContext)(config, map);
+  let identity: Awaited<ReturnType<typeof runNodeContext>>;
+  try { identity = await (deps.runNodeContext ?? runNodeContext)(config, map); }
+  catch (error) {
+   if (reservationGeneration === undefined) throw error;
+   const scoped = journal.forWorker(nodeId, map.repo, reservationGeneration);
+   const state = recordRecovery(scoped, nodeRecoveryScope(map.repo, nodeId), failureOutcome(error), now());
+   const reason = recoveryReason(state);
+   scoped.updateWorker(nodeId, map.repo, { status: "parked", pid: null, workerPgid: null, outcome: reason });
+   scoped.recordEvent("parked", { nodeId, repo: map.repo, detail: reason });
+   return JSON.stringify({ status: "parked", reason }, null, 2);
+  }
+  const { token, botIdentity, commitAuthor } = identity;
   let generation: number | undefined;
   let outcome: RunNodeOutcome | undefined;
   let mapRoot: { id: string; serves?: unknown } | undefined;
@@ -484,7 +497,7 @@ async function runResumeNode(
  nodeId: string,
  repo: string | undefined,
  configPath: string,
- options: { force?: boolean; whenFree?: boolean; cancel?: boolean },
+ options: { force?: boolean; resetRecovery?: boolean; whenFree?: boolean; cancel?: boolean },
 ): Promise<string> {
  const { config, journal } = loadCtx(configPath);
  try {
@@ -1219,7 +1232,8 @@ program
  .option("--when-free", "queue a resume FIFO when its implement lane is held")
  .option("--cancel", "remove a queued resume")
  .option("-c, --config <path>", "path to ranger.yaml (fallback: $RANGER_CONFIG, then ~/.config/ranger/ranger.yaml)")
- .action(async (id: string, options: { map?: string; config: string | undefined; force?: boolean; whenFree?: boolean; cancel?: boolean }) => {
+  .option("--reset-recovery", "reset the persisted retry budget after operator intervention")
+ .action(async (id: string, options: { map?: string; config: string | undefined; force?: boolean; resetRecovery?: boolean; whenFree?: boolean; cancel?: boolean }) => {
   try {
    const configPath = resolveConfigPath(options.config, process.env, process.cwd());
    process.stdout.write((await runResumeNode(id, options.map, configPath, options)) + "\n");

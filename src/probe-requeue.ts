@@ -46,6 +46,7 @@ export interface ProbeRequeueResult {
 /** Run under the claim lease, before merge-desk send-backs or fresh claims. */
 export async function requeueProbes(args: {
  journal: Journal;
+ now?: () => Date;
  maps: readonly RangerMapConfig[];
  limit: number;
  owned: OwnedCheck;
@@ -72,7 +73,7 @@ export async function requeueProbes(args: {
   const used = attempts(journal, row, head);
   // Reserve before spawning: the child must see a claimed row, and another
   // scheduler must see the lane occupied. The retry count also survives a crash.
-  const pid = await startOwnedWorker({ journal, row,
+  const pid = await startOwnedWorker({ journal, row, now: args.now?.(),
    onSpawnFailure: () => { journal.setHealth(budgetKey(row, head), String(used)); },
    spawn: async generation => {
     journal.setHealth(budgetKey(row, head), String(used + 1));
