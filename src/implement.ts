@@ -1507,7 +1507,7 @@ async function runImplementFlow(ctx: ImplementContext): Promise<ImplementOutcome
   const accepted = checkpoint?.evidence.some(evidence => evidence.kind === "tests-gate" && evidence.result === "passed" && evidence.detail === testCommand);
   if (!accepted) {
    const landed = await landedBaseMerges(worktree, recordedBaseMerges(await github.listComments(repo, pr.iid, token), botIdentity), pr.headSha);
-   checkedResume = await checkOnCurrentBase(ctx, testCommand, { label: "resumed checkpoint", mergesLeft: MAX_BASE_MERGES - landed, recordMerge: recordMachineMerge(pr.iid) });
+   checkedResume = await checkOnCurrentBase(ctx, testCommand, { label: "resumed checkpoint", mergeFirst: false, mergesLeft: MAX_BASE_MERGES - landed, recordMerge: recordMachineMerge(pr.iid) });
    if (checkedResume.failure !== undefined) return { status: "failed", detail: checkedResume.failure, workerExit: null };
   }
  }
@@ -1748,7 +1748,7 @@ async function runImplementFlow(ctx: ImplementContext): Promise<ImplementOutcome
   await prepareWorktree(ctx, { at: "pr-head", prNumber: open.iid, prHead: live.headSha });
   const here = await headSha(worktree);
   if (here !== live.headSha) {
-   const checked = checkedResume?.sha === here ? checkedResume : await checkOnCurrentBase(ctx, testCommand, { label: "resumed worktree", mergesLeft: MAX_BASE_MERGES - baseMerges, recordMerge: recordMachineMerge(open.iid) });
+   const checked = checkedResume?.sha === here ? checkedResume : await checkOnCurrentBase(ctx, testCommand, { label: "resumed worktree", mergeFirst: true, mergesLeft: MAX_BASE_MERGES - baseMerges, recordMerge: recordMachineMerge(open.iid) });
    if (checked.failure !== undefined) return { status: "failed", detail: checked.failure, workerExit: null };
    await publishPass(ctx, github, open.iid, { sha: checked.sha, snapshot: checked.snapshot, workerExit: null, adopted: true }, "push resumed worktree", `resumed worktree pushed ${branch} from PR head ${live.headSha} to worktree head ${checked.sha}`);
    const comments = await github.listComments(repo, open.iid, token);
@@ -2321,7 +2321,7 @@ interface CheckedOnBase {
 
 const MAX_BASE_MOVES_UNDER_TESTS = 1;
 
-async function checkOnCurrentBase(ctx: ImplementContext, testCommand: string, input: { label: string; mergesLeft: number; recordMerge: (sha: string, stale: StaleBase) => Promise<void> }): Promise<CheckedOnBase> {
+async function checkOnCurrentBase(ctx: ImplementContext, testCommand: string, input: { label: string; mergeFirst: boolean; mergesLeft: number; recordMerge: (sha: string, stale: StaleBase) => Promise<void> }): Promise<CheckedOnBase> {
  const { worktree, journal, map } = ctx;
  let mergesLeft = input.mergesLeft;
  const mergeUp = async (): Promise<MergedBeforeTests> => {
@@ -2332,7 +2332,7 @@ async function checkOnCurrentBase(ctx: ImplementContext, testCommand: string, in
   }
   return prepared;
  };
- let prepared = await mergeUp();
+ let prepared: MergedBeforeTests = input.mergeFirst ? await mergeUp() : {};
  for (let moves = 0; ; moves += 1) {
   const sha = await headSha(worktree);
   const snapshot = await trustedSnapshot(journal, ctx.canonical, { repo: map.repo, nodeId: ctx.node.ref.id }, mapKey(map));

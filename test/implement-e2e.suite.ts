@@ -1102,6 +1102,10 @@ describe("implement lane (node #23)", () => {
   reclaim(r);
   return { r, pushed, local, worktree: join(r.canonical, ".worktrees", "node-20") };
  };
+ const spendBaseMergeBudget = async (r: Rig, pushed: string) => {
+  const initial = (await git(["rev-parse", "main~0"], r.origin)).stdout.trim();
+  for (const sha of [pushed, initial]) await r.github.postComment("acme/widgets", 1, baseMergeMarker(sha, "main"));
+ };
  const markersOn = (r: Rig) => (r.github.comments.get(1) ?? []).filter((c) => c.body.includes("ranger:base-merge"));
  const holds = async (r: Rig, ancestor: string, head: string) => (await runCmd("git", ["merge-base", "--is-ancestor", ancestor, head], { cwd: r.origin })).code === 0;
 
@@ -1169,9 +1173,7 @@ describe("implement lane (node #23)", () => {
 
  test("an unpushed commit past the base merge budget is not merged, and the journal says so (ranger issue #322)", async () => {
   const { r, pushed, local } = await prWithUnpushedCommit();
-  const initial = (await git(["rev-parse", "main~0"], r.origin)).stdout.trim();
-  await r.github.postComment("acme/widgets", 1, baseMergeMarker(pushed, "main"));
-  await r.github.postComment("acme/widgets", 1, baseMergeMarker(initial, "main"));
+  await spendBaseMergeBudget(r, pushed);
   await pushFromOutside(r, "base-1.txt", "main");
   r.ctx.map.commands.test = "true";
   r.ctx.config.workers.reviewRounds = 9;
@@ -1198,9 +1200,7 @@ describe("implement lane (node #23)", () => {
 
  test("a red run past the base merge budget is not run again, however far behind the branch is (ranger issue #322)", async () => {
   const { r, pushed } = await prWithUnpushedCommit();
-  const initial = (await git(["rev-parse", "main~0"], r.origin)).stdout.trim();
-  await r.github.postComment("acme/widgets", 1, baseMergeMarker(pushed, "main"));
-  await r.github.postComment("acme/widgets", 1, baseMergeMarker(initial, "main"));
+  await spendBaseMergeBudget(r, pushed);
   await pushFromOutside(r, "base-1.txt", "main");
   const runs = join(r.dir, "runs");
   r.ctx.map.commands.test = `echo run >> ${runs}; exit 1`;
@@ -1208,7 +1208,23 @@ describe("implement lane (node #23)", () => {
   expect(readFileSync(runs, "utf8").trim().split("\n")).toHaveLength(1);
  }, 60_000);
 
- test("a resumed checkpoint at the PR head, behind the base, merges it before an up-to-date gate and pushes once (ranger issue #322)", async () => {
+ test("a resumed checkpoint at the PR head, behind the base, whose tests pass is not merged up: there is nothing to push (ranger issue #322)", async () => {
+  const r = await rig({});
+  cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  const pushed = await r.github.sha(BRANCH);
+  await pushFromOutside(r, "base-1.txt", "main");
+  const runs = join(r.dir, "runs");
+  r.ctx.map.commands.test = `echo run >> ${runs}`;
+  r.ctx.worker = async () => { throw new Error("no worker session on this resume"); };
+  reclaim(r);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  expect(await r.github.sha(BRANCH)).toBe(pushed);
+  expect(markersOn(r)).toHaveLength(0);
+  expect(readFileSync(runs, "utf8").trim().split("\n")).toHaveLength(1);
+ }, 60_000);
+
+ test("a resumed checkpoint at the PR head that fails an up-to-date gate merges the base, runs again and pushes once (ranger issue #322)", async () => {
   const r = await rig({});
   cleanup.push(r.dir);
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
@@ -1223,7 +1239,7 @@ describe("implement lane (node #23)", () => {
   expect(head).not.toBe(pushed);
   expect(await holds(r, main, head)).toBe(true);
   expect(markersOn(r)).toHaveLength(1);
-  expect(readFileSync(runs, "utf8").trim().split("\n")).toHaveLength(1);
+  expect(readFileSync(runs, "utf8").trim().split("\n")).toHaveLength(2);
  }, 60_000);
 
  test("a resume with no PR, 1 commit behind the base, whose adoption tests fail only on an up-to-date check merges the base and adopts the build (ranger issue #463)", async () => {
