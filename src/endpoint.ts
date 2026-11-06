@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -5,6 +6,11 @@ import type { RangerConfig } from "./config.ts";
 import type { SubstrateName } from "./store/schema.ts";
 import { OperationFailure } from "./operation-outcome.ts";
 
+export interface DependencyCheck { operation: "model-endpoint" | "worker-dependency"; target: string }
+export function dependencyTarget(endpoint: string): string {
+ const url = new URL(endpoint);
+ return `${url.origin}#${createHash("sha256").update(url.toString()).digest("hex")}`;
+}
 export type EndpointProbe = (url: string) => Promise<boolean>;
 export type EndpointLookup = (config: RangerConfig, substrate: SubstrateName, explicit?: string) => string | null;
 export const probeEndpoint: EndpointProbe = async url => {
@@ -43,28 +49,30 @@ export function cachedProbe(probe: EndpointProbe = probeEndpoint): EndpointProbe
 }
 
 export async function requireEndpoint(config: RangerConfig, substrate: SubstrateName, explicit?: string,
- probe: EndpointProbe = probeEndpoint, lookup: EndpointLookup = modelEndpoint): Promise<void> {
+ probe: EndpointProbe = probeEndpoint, lookup: EndpointLookup = modelEndpoint): Promise<DependencyCheck | undefined> {
  const endpoint = lookup(config, substrate, explicit);
- if (endpoint === null || await probe(endpoint)) return;
- endpointUnavailable(endpoint, substrate);
+ if (endpoint === null) return undefined;
+ if (await probe(endpoint)) return { operation: "model-endpoint", target: dependencyTarget(endpoint) };
+ endpointUnavailable(endpoint, substrate, "model-endpoint");
 }
 
-function endpointUnavailable(endpoint: string, substrate: string): never {
+function endpointUnavailable(endpoint: string, substrate: string, operation: DependencyCheck["operation"]): never {
  const target = new URL(endpoint).origin;
- throw new OperationFailure({ kind: "dependency", operation: "model-endpoint", target,
-  evidence: `model endpoint unreachable for ${substrate} (${target})`, action: "restore endpoint connectivity, then retry" });
+ throw new OperationFailure({ kind: "dependency", operation, target: dependencyTarget(endpoint),
+  evidence: `${operation === "model-endpoint" ? "model" : "dependency"} endpoint unreachable for ${substrate} (${target})`, action: "restore endpoint connectivity, then retry" });
 }
 
-export async function requireReachable(endpoint: string | undefined, probe: EndpointProbe = probeEndpoint): Promise<void> {
- if (endpoint === undefined || await probe(endpoint)) return;
- endpointUnavailable(endpoint, "declared worker dependency");
+export async function requireReachable(endpoint: string | undefined, probe: EndpointProbe = probeEndpoint): Promise<DependencyCheck | undefined> {
+ if (endpoint === undefined) return undefined;
+ if (await probe(endpoint)) return { operation: "worker-dependency", target: dependencyTarget(endpoint) };
+ endpointUnavailable(endpoint, "declared worker dependency", "worker-dependency");
 }
 
 export async function firstReachableSubstrate(config: RangerConfig, candidates: readonly SubstrateName[], explicit: string | undefined,
- probe: EndpointProbe = probeEndpoint, lookup: EndpointLookup = modelEndpoint): Promise<SubstrateName> {
+ probe: EndpointProbe = probeEndpoint, lookup: EndpointLookup = modelEndpoint): Promise<{ substrate: SubstrateName; check?: DependencyCheck }> {
  let last: unknown = new OperationFailure({ kind: "unknown", operation: "model-endpoint", evidence: "no eligible endpoint", action: "configure an eligible endpoint" });
  for (const substrate of candidates) {
-  try { await requireEndpoint(config, substrate, explicit, probe, lookup); return substrate; }
+  try { const check = await requireEndpoint(config, substrate, explicit, probe, lookup); return { substrate, check }; }
   catch (error) { last = error; }
  }
  throw last;

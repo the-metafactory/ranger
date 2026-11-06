@@ -1,6 +1,6 @@
 import { failureOutcome, workerOutcome, type OperationOutcome } from "./operation-outcome.ts";
-import { activeRecoveryReason, completeRecovery, jobRecoveryScope, recordRecovery, recoveryHold, recoveryReason, reserveRecovery } from "./recovery.ts";
-import { cachedProbe, firstReachableSubstrate, type EndpointProbe, type EndpointLookup } from "./endpoint.ts";
+import { activeRecoveryReason, completeRecovery, completeRecoveryChecks, jobRecoveryScope, recordRecovery, recoveryHold, recoveryReason, reserveRecovery } from "./recovery.ts";
+import { cachedProbe, firstReachableSubstrate, requireReachable, type EndpointProbe, type EndpointLookup } from "./endpoint.ts";
 /**
  * Scheduled jobs (node #301): a Reflex fire enqueues a named job
  * (`ranger job enqueue <name>`, through a cortex process spec); the next tick
@@ -90,7 +90,14 @@ export function jobRunArgv(args: SpawnJobArgs): string[] {
 }
 
 function jobModelEndpoint(job: RangerJobConfig, policy?: string): string | undefined {
- return job.reachable ?? (policy === "local" ? job.studio?.localEndpoint : undefined);
+ return policy === "local" ? job.studio?.localEndpoint : undefined;
+}
+
+async function jobPreflight(config: RangerConfig, job: RangerJobConfig, candidates: readonly SubstrateName[], explicit: string | undefined,
+ probe: EndpointProbe, lookup?: EndpointLookup) {
+ const dependency = await requireReachable(job.reachable, probe);
+ const selected = await firstReachableSubstrate(config, candidates, explicit, probe, lookup);
+ return { substrate: selected.substrate, checks: [dependency, selected.check].filter(check => check !== undefined) };
 }
 
 /** Launch a detached `ranger job run <id>` that outlives the tick. Null when nothing spawned. */
@@ -254,7 +261,10 @@ export async function jobPass(ctx: JobPassContext): Promise<JobPassResult> {
   const held = recoveryHold(journal, scope, now);
   if (held !== null) { wait(held); continue; }
   if (!reserveRecovery(journal, scope, { now: now, owner: { jobRunId: run.id, status: "queued", pid: run.pid } })) { wait(activeRecoveryReason(journal, scope)); continue; }
-  try { await firstReachableSubstrate(config, permitted, declaredEndpoint, probe, ctx.endpointLookup); }
+  try {
+   const checked = await jobPreflight(config, job, permitted, declaredEndpoint, probe, ctx.endpointLookup);
+   completeRecoveryChecks(journal, scope, checked.checks, { jobRunId: run.id, status: "queued", pid: run.pid });
+  }
   catch (error) {
    const state = recordRecovery(journal, scope, failureOutcome(error), { now: now, owner: { jobRunId: run.id, status: "queued", pid: run.pid } });
    const reason = recoveryReason(state);
@@ -263,7 +273,6 @@ export async function jobPass(ctx: JobPassContext): Promise<JobPassResult> {
    } else wait(reason);
    continue;
   }
-  completeRecovery(journal, scope, { operation: "model-endpoint", owner: { jobRunId: run.id, status: "queued", pid: run.pid } });
   // Reserve the lane before spawning: the child must find a running row,
   // and every other scheduler must see the lane occupied.
   if (!journal.updateJobRun(run.id, "queued", { status: "running", startedAt: now.toISOString() })) continue;
@@ -433,13 +442,14 @@ export async function runJob(runId: number, ctx: RunJobContext): Promise<RunJobO
  }
  const probe = cachedProbe(ctx.endpointProbe);
  try {
-  substrate = await firstReachableSubstrate(config, ctx.substrate === undefined ? [substrate, ...permitted.filter(candidate => candidate !== substrate)] : [substrate],
+  const checked = await jobPreflight(config, job, ctx.substrate === undefined ? [substrate, ...permitted.filter(candidate => candidate !== substrate)] : [substrate],
    jobModelEndpoint(job, studio?.policy), probe, ctx.endpointLookup);
+  substrate = checked.substrate;
+  completeRecoveryChecks(journal, jobRecoveryScope(runId), checked.checks, { jobRunId: runId, status: "running", pid: process.pid });
  } catch (error) {
   await recoverJob(ctx, { ...requiredJob(journal, runId), pid: process.pid }, failureOutcome(error), now());
   return { runId, name: job.name, status: recoveredJobStatus(journal, runId), reason: activeRecoveryReason(journal, jobRecoveryScope(runId)) };
  }
- completeRecovery(journal, jobRecoveryScope(runId), { operation: "model-endpoint", owner: { jobRunId: runId, status: "running", pid: process.pid } });
  journal.updateJobRun(runId, "running", { substrate, ...(studio?.kind === "ready" ? { policy: studio.policy } : {}) });
 
  const scratch = mkdtempSync(join(tmpdir(), "ranger-job-"));

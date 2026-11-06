@@ -1,7 +1,6 @@
-import { pinNodeSubstrate } from "./node-dependency.ts";
-import type { SubstrateName } from "./store/schema.ts";
+import { pinNodeSubstrate, type NodePreflightResult } from "./node-dependency.ts";
 import { OperationFailure } from "./operation-outcome.ts";
-import { activeRecoveryReason, completeRecovery, nodeRecoveryScope, recordRecovery, recoveryHold, recoveryReason, reserveRecovery } from "./recovery.ts";
+import { activeRecoveryReason, completeRecovery, completeRecoveryChecks, nodeRecoveryScope, recordRecovery, recoveryHold, recoveryReason, reserveRecovery } from "./recovery.ts";
 import { pidAlive } from "./exec.ts";
 import { FencedError, type Journal, type WorkerPatch, type WorkerRow } from "./journal.ts";
 
@@ -47,7 +46,7 @@ export async function startOwnedWorker(args: {
  status?: "claimed" | "running";
  freshClaim?: boolean;
  onSpawnFailure?: (error: Error) => void;
- preflight?: () => Promise<SubstrateName | undefined>;
+ preflight?: () => Promise<NodePreflightResult | undefined>;
  spawn: (generation: number) => Promise<number | null>;
  now?: Date;
 }): Promise<number | null> {
@@ -70,10 +69,11 @@ export async function startOwnedWorker(args: {
  let failure = new Error("run-node spawn returned no PID");
  try {
   if (args.preflight !== undefined) {
-   const selected = await args.preflight();
-   if (selected !== undefined && !pinNodeSubstrate(journal, owner, selected)) return null;
-   completeRecovery(journal, scope, { operation: "model-endpoint", owner: owner });
+   const checked = await args.preflight();
+   if (checked?.substrate !== undefined && !pinNodeSubstrate(journal, owner, checked.substrate)) return null;
+   if (checked !== undefined) completeRecoveryChecks(journal, scope, checked.checks, owner);
   }
+  if (!journal.updateReservation(row.nodeId, row.repo, generation, { workerPgid: null })) return null;
   pid = await args.spawn(generation);
  } catch (error) {
   failure = error instanceof Error ? error : new Error(String(error));

@@ -1,7 +1,5 @@
-import { defaultNodeSelector, nodePreflight, type NodeSelector } from "./node-dependency.ts";
-import type { EndpointLookup } from "./endpoint.ts";
-import { spawningEnabled } from "./spawn.ts";
-import { cachedProbe, type EndpointProbe } from "./endpoint.ts";
+import { resolveNodeSelector, workerPreflight, type DispatchDeps } from "./node-dependency.ts";
+import { cachedProbe } from "./endpoint.ts";
 import { startOwnedWorker, FRESH_START_FAILURE, startFailureOutcome } from "./node-ownership.ts";
 import { implementLane, type ImplementLane } from "./lanes.ts";
 import { processResumeQueue } from "./resume.ts";
@@ -70,13 +68,10 @@ export interface WalkResult {
  jobs?: JobPassResult;
 }
 
-export interface WalkContext {
+export interface WalkContext extends DispatchDeps {
  config: RangerConfig;
  configPath: string;
  journal: Journal;
- endpointProbe?: EndpointProbe;
- endpointLookup?: EndpointLookup;
- nodeSelector?: NodeSelector;
  spawnRunNode?: (args: SpawnRunNodeArgs) => Promise<number | null>;
  announce?: AnnounceFn;
  claim?: ClaimFn;
@@ -107,7 +102,7 @@ export type ClaimFn = (
  opts: { timeoutMs: number },
 ) => Promise<ClaimResult>;
 
-export interface ClaimNodeArgs {
+export interface ClaimNodeArgs extends DispatchDeps {
  config?: RangerConfig;
  journal: Journal;
  map: RangerMapConfig;
@@ -120,9 +115,6 @@ export interface ClaimNodeArgs {
  announceRequired?: boolean;
  announce?: AnnounceFn;
  claim?: ClaimFn;
- endpointProbe?: EndpointProbe;
- endpointLookup?: EndpointLookup;
- nodeSelector?: NodeSelector;
  spawnRunNode?: (args: SpawnRunNodeArgs) => Promise<number | null>;
  now?: () => Date;
  owned?: OwnedCheck;
@@ -210,7 +202,7 @@ export async function claimNode(args: ClaimNodeArgs): Promise<ClaimNodeOutcome> 
  journal.assertGeneration(node.id, map.repo, reservation.generation, "spawn claimed worker");
 
  const pid = await startOwnedWorker({ journal, row: reservation.row, generation: reservation.generation, now: now(), freshClaim: true,
-  preflight: () => nodePreflight({ config: args.config, map, lane: args.lane, requiresModel: true, selector: args.nodeSelector, probe: args.endpointProbe, lookup: args.endpointLookup }),
+  preflight: () => workerPreflight({ worktree: null, phase: null, lane: args.lane }, map, args),
   spawn: generation => (args.spawnRunNode ?? spawnRunNodeDetached)({
   generation,
   nodeId: node.id,
@@ -276,7 +268,7 @@ function recordFreshClaim(args: ClaimNodeArgs, messageId: string | null, at: Dat
  * Stateless over the graph: everything topological is re-derived per pass.
  */
 export async function walk(ctx: WalkContext): Promise<WalkResult> {
- ctx = { ...ctx, endpointProbe: cachedProbe(ctx.endpointProbe), nodeSelector: ctx.nodeSelector ?? (ctx.spawnRunNode === undefined && spawningEnabled() ? defaultNodeSelector(ctx.config, ctx.journal) : undefined) };
+ ctx = { ...ctx, endpointProbe: cachedProbe(ctx.endpointProbe), nodeSelector: resolveNodeSelector(ctx) };
  const { config, journal } = ctx;
  const registry = loadProbeRegistry();
  const result: WalkResult = {

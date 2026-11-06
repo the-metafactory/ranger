@@ -1,3 +1,5 @@
+import { Journal } from "../src/journal.ts";
+import { dependencyTarget } from "../src/endpoint.ts";
 import { defaultNodeSelector } from "../src/node-dependency.ts";
 import { eligibleCodexReading } from "./fixtures/substrate-readings.ts";
 import { nodePreflight, pinNodeSubstrate } from "../src/node-dependency.ts";
@@ -19,6 +21,43 @@ const rigs: Rig[] = [];
 afterEach(() => { for (const r of rigs.splice(0)) { r.journal.close(); rmSync(r.dir, { recursive: true, force: true }); } restoreEnv(); });
 const fixture = async () => { const r = await rig({}); rigs.push(r); return r; };
 const scope = nodeRecoveryScope("acme/widgets", "20");
+
+test("existing-worktree scheduler and child retain a model outage budget across journal restarts", async () => {
+ const r = await fixture();
+ r.ctx.map.commands.test = "exit 1";
+ expect((await runNode("20", r.ctx)).status).toBe("failed");
+ r.journal.resetDeadman();
+ let now = new Date("2026-11-06T00:00:00Z");
+ r.ctx.now = () => now;
+ delete r.ctx.workerCommand; delete r.ctx.worker;
+ r.ctx.substrate = "pi";
+ r.ctx.config.substrates.pi.reachable = "https://same.invalid/models";
+ r.ctx.map.reachable = "https://same.invalid/health";
+ r.ctx.endpointProbe = async url => url.endsWith("health");
+ expect((await runNode("20", r.ctx)).status).toBe("parked");
+ expect(activeRecovery(r.journal, scope)).toMatchObject({ attempts: 1, operation: "model-endpoint", target: dependencyTarget("https://same.invalid/models") });
+ let spawns = 0;
+ let reserved: number | undefined;
+ const sweep = () => sweepMap({ config: r.ctx.config, journal: r.journal, map: r.ctx.map, token: "fixture", botIdentity: "ivy-bot",
+  phase: "liveness", now: () => now, endpointProbe: r.ctx.endpointProbe,
+  respawn: async (_id, _repo, _root, generation) => { spawns++; reserved = generation; return process.pid; },
+ });
+ for (const attempt of [2, 3]) {
+  now = new Date(activeRecovery(r.journal, scope)!.nextEligibleAt!);
+  await sweep();
+  expect(activeRecovery(r.journal, scope)).toMatchObject({ attempts: attempt, status: "reserved", operation: "model-endpoint" });
+  const path = r.journal.path;
+  r.journal.close(); r.journal = new Journal(path); r.ctx.journal = r.journal;
+  expect((await runNode("20", { ...r.ctx, generation: reserved })).status).toBe("parked");
+  expect(activeRecovery(r.journal, scope)?.attempts).toBe(attempt);
+ }
+ expect(activeRecovery(r.journal, scope)).toMatchObject({ status: "exhausted", attempts: 3 });
+ now = new Date(now.getTime() + 86_400_000);
+ for (let n = 0; n < 3; n++) await sweep();
+ expect(spawns).toBe(2);
+ expect(r.journal.deadmanCount()).toBe(0);
+ expect(r.journal.getWorker("20", "acme/widgets")?.outcome).toContain("exhausted");
+}, 30_000);
 
 test("repository output cannot forge an infrastructure waiver", async () => {
  const r = await fixture();

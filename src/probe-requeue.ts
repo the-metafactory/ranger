@@ -1,5 +1,4 @@
-import { nodePreflight, type NodeSelector } from "./node-dependency.ts";
-import type { EndpointProbe, EndpointLookup } from "./endpoint.ts";
+import { workerPreflight, type DispatchDeps } from "./node-dependency.ts";
 import { startOwnedWorker } from "./node-ownership.ts";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import type { Journal, WorkerRow } from "./journal.ts";
@@ -46,11 +45,8 @@ export interface ProbeRequeueResult {
 }
 
 /** Run under the claim lease, before merge-desk send-backs or fresh claims. */
-export async function requeueProbes(args: {
+export async function requeueProbes(args: DispatchDeps & {
  config?: RangerConfig;
- nodeSelector?: NodeSelector;
- endpointProbe?: EndpointProbe;
- endpointLookup?: EndpointLookup;
  journal: Journal;
  now?: () => Date;
  maps: readonly RangerMapConfig[];
@@ -80,7 +76,7 @@ export async function requeueProbes(args: {
   // Reserve before spawning: the child must see a claimed row, and another
   // scheduler must see the lane occupied. The retry count also survives a crash.
   const pid = await startOwnedWorker({ journal, row, now: args.now?.(),
-   preflight: () => nodePreflight({ config: args.config, map, lane: "implement", requiresModel: row.worktree === null, selector: args.nodeSelector, probe: args.endpointProbe, lookup: args.endpointLookup }),
+   preflight: () => workerPreflight(row, map, args),
    onSpawnFailure: () => { journal.setHealth(budgetKey(row, head), String(used)); },
    spawn: async generation => {
     journal.setHealth(budgetKey(row, head), String(used + 1));

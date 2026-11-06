@@ -1,5 +1,4 @@
-import { nodePreflight, type NodeSelector } from "./node-dependency.ts";
-import type { EndpointProbe, EndpointLookup } from "./endpoint.ts";
+import { workerPreflight, type DispatchDeps } from "./node-dependency.ts";
 import { startOwnedWorker } from "./node-ownership.ts";
 import { implementLane } from "./lanes.ts";
 import { recordImplementStart, mapKey } from "./maps.ts";
@@ -82,10 +81,7 @@ import { squashTitle } from "./github.ts";
  * journal (the journal is a cache).
  */
 
-export interface MergeDeskContext {
- nodeSelector?: NodeSelector;
- endpointProbe?: EndpointProbe;
- endpointLookup?: EndpointLookup;
+export interface MergeDeskContext extends DispatchDeps {
  now?: () => Date;
  config: RangerConfig;
  journal: Journal;
@@ -353,7 +349,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
 
  function startDeskWorker(row: WorkerRow, patch: WorkerPatch): Promise<number | null> {
   return startOwnedWorker({ journal, row, status: "running", patch, now: ctx.now?.(),
-   preflight: patch.phase === "close" ? undefined : () => nodePreflight({ config: ctx.config, map, lane: "implement", requiresModel: row.worktree === null, selector: ctx.nodeSelector, probe: ctx.endpointProbe, lookup: ctx.endpointLookup }),
+   preflight: () => workerPreflight({ ...row, ...patch }, map, ctx),
    spawn: generation => ctx.spawn?.(row.nodeId, repo, row.root, generation) ?? Promise.resolve(null) });
  }
 

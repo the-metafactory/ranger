@@ -4,12 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stringify } from "yaml";
 import { Journal, FencedError } from "../src/journal.ts";
-import { activeRecovery, completeRecovery, jobRecoveryScope, nodeRecoveryScope, recordRecovery, recoveryHold, reserveRecovery } from "../src/recovery.ts";
+import { activeRecovery, completeRecovery, completeRecoveryChecks, jobRecoveryScope, nodeRecoveryScope, recordRecovery, recoveryHold, reserveRecovery } from "../src/recovery.ts";
 import { failureOutcome, OperationFailure, processOutcome, type OperationOutcome } from "../src/operation-outcome.ts";
 import { forgeOutcome } from "../src/transient.ts";
 import { loadConfig } from "../src/config.ts";
 import { jobPass, enqueueJob, runJob } from "../src/jobs.ts";
-import { modelEndpoint } from "../src/endpoint.ts";
+import { dependencyTarget, requireEndpoint, requireReachable, modelEndpoint } from "../src/endpoint.ts";
 import { workerOutcome } from "../src/operation-outcome.ts";
 import { startOwnedWorker } from "../src/node-ownership.ts";
 import { sweepMap } from "../src/sweep.ts";
@@ -49,7 +49,7 @@ test("operation changes cannot replenish a retry episode", () => {
  recordRecovery(journal, scope, failure(), { now: now });
  advance(); expect(reserveRecovery(journal, scope, { now: now })).toBe(true);
  recordRecovery(journal, scope, failure("model-endpoint", "dependency"), { now: now });
- completeRecovery(journal, scope, { operation: "model-endpoint" });
+ completeRecovery(journal, scope, { operation: "model-endpoint", target: "head-a" });
  expect(activeRecovery(journal, scope)?.attempts).toBe(2);
  expect(activeRecovery(journal, scope)?.operation).toBe("supervisor-tests");
  restart(); advance(); expect(reserveRecovery(journal, scope, { now: now })).toBe(true);
@@ -61,7 +61,7 @@ test("only a successful operation clears its obligation; a new episode starts at
  recordRecovery(journal, scope, failure(), { now: now });
  completeRecovery(journal, scope, { operation: "unrelated" });
  expect(activeRecovery(journal, scope)?.status).toBe("waiting");
- completeRecovery(journal, scope, { operation: "supervisor-tests" });
+ completeRecovery(journal, scope, { operation: "supervisor-tests", target: "head-a" });
  expect(activeRecovery(journal, scope)?.status).toBe("complete");
  recordRecovery(journal, scope, failure(), { now: now });
  expect(activeRecovery(journal, scope)?.attempts).toBe(1);
@@ -73,6 +73,7 @@ test("old scoped workers cannot change a newer owner's recovery", () => {
  journal.beginGeneration("20", "acme/widgets");
  expect(() => recordRecovery(old, scope, failure(), { now: now })).toThrow(FencedError);
  expect(() => completeRecovery(old, scope)).toThrow(FencedError);
+ expect(() => completeRecoveryChecks(old, scope, [])).toThrow(FencedError);
  expect(activeRecovery(journal, scope)?.status).toBe("waiting");
 });
 
@@ -102,6 +103,7 @@ test("null worker spawns are bounded infrastructure recovery without code strike
 function config() {
  const file = join(dir, "ranger.yaml");
  writeFileSync(file, stringify({ maps: [{ repo: "acme/widgets", root: 1, walk: "full" }],
+  substrates: { pi: { reachable: "https://model.invalid/models" } },
   jobs: [{ name: "offline", skill: "test", cwd: dir, lane: "none", wallClockMin: 1, substrates: ["pi"], reachable: "https://offline.invalid/models" },
    { name: "independent", skill: "test", cwd: dir, lane: "none", wallClockMin: 1, substrates: ["claude"], reachable: "https://online.invalid/models" }],
   state: { journalPath: journal.path } }));
@@ -147,9 +149,56 @@ test("completed recovery never automatically restarts a later human park", async
 
 test("provider lookup uses only the selected provider and ambiguity stays unknown", () => {
  const cfg = config();
+ delete cfg.substrates.pi.reachable;
  expect(modelEndpoint(cfg, "pi", undefined, { providers: { spark: { baseUrl: "https://selected.invalid/v1" }, unrelated: { baseUrl: "https://unrelated.invalid" } } })).toBe("https://selected.invalid/v1/models");
  expect(() => modelEndpoint(cfg, "pi", undefined, { providers: { unrelated: { baseUrl: "https://unrelated.invalid" } } })).toThrow(OperationFailure);
  expect(modelEndpoint(cfg, "pi", "https://explicit.invalid/check", {})).toBe("https://explicit.invalid/check");
+});
+
+test("successful receipts complete only the exact probed dependency and endpoint path", async () => {
+ const cfg = config();
+ const modelA = "https://same.invalid/a/models?route=a";
+ const modelB = "https://same.invalid/b/models?route=b";
+ const map = "https://same.invalid/health";
+ for (const [operation, endpoint] of [["model-endpoint", modelA], ["model-endpoint", modelB], ["worker-dependency", map]]) {
+  recordRecovery(journal, scope, { kind: "dependency", operation, target: dependencyTarget(endpoint), evidence: "same.invalid offline", action: "restore" }, { now });
+ }
+ expect(activeRecovery(journal, scope)?.attempts).toBe(3);
+ completeRecovery(journal, scope, { operation: "model-endpoint" });
+ expect(activeRecovery(journal, scope)?.pending).toHaveLength(3);
+ const checkedMap = await requireReachable(map, async () => true);
+ completeRecoveryChecks(journal, scope, [checkedMap!]);
+ expect(activeRecovery(journal, scope)?.pending).toHaveLength(2);
+ expect(activeRecovery(journal, scope)?.attempts).toBe(3);
+ const checkedA = await requireEndpoint(cfg, "pi", modelA, async () => true);
+ completeRecoveryChecks(journal, scope, [checkedA!]);
+ expect(activeRecovery(journal, scope)?.pending).toMatchObject([{ operation: "model-endpoint", target: dependencyTarget(modelB) }]);
+ expect(JSON.stringify(activeRecovery(journal, scope))).not.toContain("route=");
+ const noProbe = await requireEndpoint(cfg, "claude", undefined, async () => { throw new Error("no endpoint declared"); });
+ expect(noProbe).toBeUndefined();
+ completeRecoveryChecks(journal, scope, []);
+ expect(activeRecovery(journal, scope)?.attempts).toBe(3);
+ const checkedB = await requireEndpoint(cfg, "pi", modelB, async () => true);
+ completeRecoveryChecks(journal, scope, [checkedB!]);
+ expect(activeRecovery(journal, scope)).toMatchObject({ status: "complete", attempts: 0 });
+});
+
+test("a reachable job dependency cannot hide its unavailable selected model endpoint", async () => {
+ const cfg = config();
+ const job = cfg.jobs![0];
+ job.reachable = "https://same.invalid/health";
+ cfg.substrates.pi.reachable = "https://same.invalid/models";
+ const { runId } = enqueueJob(cfg, journal, job.name, now);
+ let spawns = 0;
+ const probes: string[] = [];
+ const result = await jobPass({ config: cfg, journal, configPath: "unused", now: () => now,
+  endpointProbe: async url => { probes.push(url); return url.endsWith("health"); },
+  spawnJob: async () => { spawns++; return process.pid; },
+ });
+ expect(spawns).toBe(0);
+ expect(probes).toEqual(["https://same.invalid/health", "https://same.invalid/models"]);
+ expect(result.waiting).toHaveLength(1);
+ expect(activeRecovery(journal, jobRecoveryScope(runId))).toMatchObject({ operation: "model-endpoint", attempts: 1 });
 });
 
 test("model exit failure is unknown while explicit repository command failure remains code", () => {

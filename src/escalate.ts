@@ -70,11 +70,9 @@ async function escalateOneMap(
   map: RangerMapConfig,
   journal: Journal,
   registry: ReturnType<typeof loadProbeRegistry>,
-  now: Date,
-  passDeadline: number,
-  owned: OwnedCheck,
-  clock: () => number = Date.now,
+  opts: { now: Date; passDeadline: number; owned: OwnedCheck; clock?: () => number },
 ): Promise<EscalateMapResult> {
+  const { now, passDeadline, owned, clock = Date.now } = opts;
   const base = emptyMapResult(map);
 
   // Pre-map deadline gate: if the tick-wide pass deadline has already passed
@@ -278,7 +276,7 @@ export async function escalateMaps(
       try {
         owned();
         result = await (opts.step ? opts.step(map, passDeadline) :
-          escalateOneMap(config, map, journal, registry, now, passDeadline, owned, clock));
+          escalateOneMap(config, map, journal, registry, { now, passDeadline, owned, clock }));
         if (result.budgetDeferred === undefined) journal.setHealth(LAST_ESCALATE_MAP, mapKey(map));
       } catch (error) {
         result = { ...emptyMapResult(map), ok: false, error: error instanceof Error ? error.message : String(error) };

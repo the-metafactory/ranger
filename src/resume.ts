@@ -1,10 +1,7 @@
 import { quietHostGate, queuedResumeStale, queueSpawnGate, whenFreeQueues, queueEntryGate } from "./resume-gates.ts";
 export { quietHostGate, queuedResumeStale, queueSpawnGate, whenFreeQueues, queueEntryGate, type QueueEntryGate } from "./resume-gates.ts";
-import { defaultNodeSelector, nodePreflight, type NodeSelector } from "./node-dependency.ts";
-import type { EndpointLookup } from "./endpoint.ts";
-import { spawningEnabled } from "./spawn.ts";
+import { resolveNodeSelector, workerPreflight, type DispatchDeps } from "./node-dependency.ts";
 import { OperationFailure } from "./operation-outcome.ts";
-import { type EndpointProbe } from "./endpoint.ts";
 import { activeRecovery, nodeRecoveryScope, recoveryHold, resetRecovery } from "./recovery.ts";
 import { startOwnedWorker, reservationPending } from "./node-ownership.ts";
 import { join } from "node:path";
@@ -25,13 +22,10 @@ import { spawnRunNodeDetached, type SpawnRunNodeArgs } from "./spawn.ts";
 import { busyLoadFor, hostBusy, realHostLoad, type HostLoad, type HostLoadReading } from "./host-load.ts";
 import { unchangedHeadPark } from "./worktree-head.ts";
 
-export interface ResumeContext {
+export interface ResumeContext extends DispatchDeps {
  config: RangerConfig;
  configPath: string;
  journal: Journal;
- endpointProbe?: EndpointProbe;
- endpointLookup?: EndpointLookup;
- nodeSelector?: NodeSelector;
  spawnRunNode?: (args: SpawnRunNodeArgs) => Promise<number | null>;
  now?: () => Date;
  /** The host load queued resumes wait on (node #297); tests inject a quiet or busy host. */
@@ -119,7 +113,7 @@ export async function startResumeNode(
  const spawner = ctx.spawnRunNode ?? spawnRunNodeDetached;
  let spawnError: Error | undefined;
  const pid = await startOwnedWorker({ journal, row, now,
-  preflight: row.phase === "close" ? undefined : () => nodePreflight({ config: ctx.config, map, lane: row.lane === "research" ? "research" : "implement", requiresModel: row.worktree === null, selector: ctx.nodeSelector ?? (ctx.spawnRunNode === undefined && spawningEnabled() ? defaultNodeSelector(ctx.config, journal) : undefined), probe: ctx.endpointProbe, lookup: ctx.endpointLookup }),
+  preflight: () => workerPreflight(row, map, { ...ctx, nodeSelector: resolveNodeSelector(ctx) }),
   onSpawnFailure: error => { spawnError = error; },
   spawn: generation => spawner({ nodeId, repo: map.repo, root: map.root, generation,
    cliEntry: join(import.meta.dir, "cli.ts"), configPath: ctx.configPath }),

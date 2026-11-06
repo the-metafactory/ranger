@@ -1,6 +1,4 @@
-import { defaultNodeSelector, type NodeSelector } from "./node-dependency.ts";
-import type { EndpointProbe, EndpointLookup } from "./endpoint.ts";
-import { spawningEnabled } from "./spawn.ts";
+import { resolveNodeSelector, type DispatchDeps } from "./node-dependency.ts";
 import { join } from "node:path";
 import { freshClaimRefusal } from "./candidates.ts";
 import { graphReadToken, laneCredentialRefusal, type ReadGate } from "./forge-lanes.ts";
@@ -67,10 +65,7 @@ export class BuildNowRefusal extends Error {
  override readonly name = "BuildNowRefusal";
 }
 
-export interface BuildNowContext {
- nodeSelector?: NodeSelector;
- endpointProbe?: EndpointProbe;
- endpointLookup?: EndpointLookup;
+export interface BuildNowContext extends DispatchDeps {
  config: RangerConfig;
  configPath: string;
  journal: Journal;
@@ -219,7 +214,7 @@ async function buildUnderLock(nodeId: string, ctx: BuildNowContext, owned: Owned
  const outcome = await claimNode({
   config: ctx.config, journal,
   endpointProbe: ctx.endpointProbe, endpointLookup: ctx.endpointLookup,
-  nodeSelector: ctx.nodeSelector ?? (ctx.spawnRunNode === undefined && spawningEnabled() ? defaultNodeSelector(ctx.config, journal) : undefined),
+  nodeSelector: resolveNodeSelector(ctx),
   map,
   node: node!,
   lane,

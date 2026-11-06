@@ -1,6 +1,6 @@
 import { selectNodeSubstrate, pinnedNodeSubstrate } from "./node-dependency.ts";
 import { OperationFailure, processOutcome, workerOutcome, failureOutcome, type OperationOutcome } from "./operation-outcome.ts";
-import { activeRecovery, activeRecoveryReason, completeRecovery, nodeRecoveryScope, recordRecovery, recoveryHold, recoveryReason, reserveRecovery } from "./recovery.ts";
+import { activeRecovery, activeRecoveryReason, completeRecovery, completeRecoveryChecks, nodeRecoveryScope, recordRecovery, recoveryHold, recoveryReason, reserveRecovery } from "./recovery.ts";
 import { requireReachable, requireEndpoint, type EndpointProbe, type EndpointLookup } from "./endpoint.ts";
 import { acquireGeneration } from "./node-ownership.ts";
 import { checkpointNode, confirmPreservedProgress, nodeCheckpoint, preserveNodeProgress, progressRemote, reconcileNodeProgress, ProgressConflict } from "./node-progress.ts";
@@ -469,11 +469,11 @@ function countFailure(config: RangerConfig, journal: Journal, repo: string): voi
  * the implement lane re-derives its phase from GitHub, so finished work is
  * kept. Any other failure counts and ends the row as failed.
  */
-function failNode(
- config: RangerConfig, journal: Journal, nodeId: string, repo: string, detail: string,
- outcome: OperationOutcome = { kind: "code", operation: "worker-result", evidence: detail, action: "repair the failure and resume" },
- now = new Date(),
-): void {
+function failNode(config: RangerConfig, journal: Journal, args: {
+ nodeId: string; repo: string; detail: string; outcome?: OperationOutcome; now?: Date;
+}): void {
+ const { nodeId, repo, detail, now = new Date() } = args;
+ let outcome = args.outcome ?? { kind: "code" as const, operation: "worker-result", evidence: detail, action: "repair the failure and resume" };
  if (outcome.kind === "success") outcome = { kind: "unknown", operation: outcome.operation, evidence: "failure path returned a success outcome", action: "inspect the unknown failure before resuming" };
  if (outcome.kind !== "code") {
   const generation = journal.getWorker(nodeId, repo)?.generation;
@@ -655,7 +655,7 @@ export async function runNode(
    detail: journalOutcome(detail),
   });
   if (error instanceof OperationFailure) {
-   failNode(config, journal, nodeId, repo, detail, error.outcome, ctx.now?.() ?? new Date());
+   failNode(config, journal, { nodeId: nodeId, repo: repo, detail: detail, outcome: error.outcome, now: ctx.now?.() ?? new Date() });
    return { ...base, status: error.outcome.kind === "code" ? "failed" : "parked", detail: journal.getWorker(nodeId, repo)?.outcome ?? detail };
   }
   if (error instanceof ParkSignal) {
@@ -663,7 +663,7 @@ export async function runNode(
    finish(journal, nodeId, repo, "parked", reason);
    return { ...base, status: "parked", detail };
   }
-  failNode(config, journal, nodeId, repo, detail, failureOutcome(error), ctx.now?.() ?? new Date());
+  failNode(config, journal, { nodeId: nodeId, repo: repo, detail: detail, outcome: failureOutcome(error), now: ctx.now?.() ?? new Date() });
   return { ...base, status: "parked", detail: journal.getWorker(nodeId, repo)?.outcome ?? detail };
  }
 }
@@ -726,9 +726,9 @@ async function runSession(
   workerSource: workerSource(ctx),
   workerRun: async (p: string, opts: RunOptions) => {
    if (ctx.map.reachable !== undefined || (workerSource(ctx) === "model" && substrate !== undefined)) {
-    await requireReachable(ctx.map.reachable, ctx.endpointProbe);
-    if (workerSource(ctx) === "model") await requireEndpoint(ctx.config, substrate ?? "claude", undefined, ctx.endpointProbe, ctx.endpointLookup);
-    completeRecovery(journal, nodeRecoveryScope(ctx.map.repo, nodeId), { operation: "model-endpoint", owner: { nodeId, repo: ctx.map.repo, generation: session.generation } });
+    const dependency = await requireReachable(ctx.map.reachable, ctx.endpointProbe);
+    const model = workerSource(ctx) === "model" ? await requireEndpoint(ctx.config, substrate ?? "claude", undefined, ctx.endpointProbe, ctx.endpointLookup) : undefined;
+    completeRecoveryChecks(journal, nodeRecoveryScope(ctx.map.repo, nodeId), [dependency, model].filter(check => check !== undefined), { nodeId, repo: ctx.map.repo, generation: session.generation });
    }
    return ctx.worker === undefined ? runCmd(workerCmd[0], [...workerCmd.slice(1), p], opts) : ctx.worker(p, opts);
   },
@@ -852,12 +852,13 @@ async function runImplementNode(
    // Backstop: a capped failure never counts (node #45), even if it ends the
    // run; a transient GitHub error is left for the sweep (failNode).
    if (outcome.substrateCapped !== undefined) finish(journal, nodeId, repo, "failed", outcome.detail);
-   else failNode(config, journal, nodeId, repo, outcome.detail, outcome.failureOutcome, ctx.now?.() ?? new Date());
+   else failNode(config, journal, { nodeId: nodeId, repo: repo, detail: outcome.detail, outcome: outcome.failureOutcome, now: ctx.now?.() ?? new Date() });
  }
+ const recovering = outcome.substrateCapped === undefined && outcome.failureOutcome !== undefined && outcome.failureOutcome.kind !== "code";
  return {
   ...base,
-  status: outcome.substrateCapped === undefined && outcome.failureOutcome !== undefined && outcome.failureOutcome.kind !== "code" ? "parked" : outcome.status,
-  detail: outcome.substrateCapped === undefined && outcome.failureOutcome !== undefined && outcome.failureOutcome.kind !== "code" ? journal.getWorker(nodeId, repo)?.outcome ?? outcome.detail : outcome.detail,
+  status: recovering ? "parked" : outcome.status,
+  detail: recovering ? journal.getWorker(nodeId, repo)?.outcome ?? outcome.detail : outcome.detail,
   workerExit: outcome.workerExit,
   close: outcome.close,
   prNumber: outcome.prNumber,
@@ -1130,8 +1131,9 @@ async function runResearch(
 
   // The run-node start check vetted this state against the known-good one.
   const snapshot = start.state.hash;
-  await requireReachable(map.reachable, ctx.endpointProbe);
-  if (workerSource(ctx) === "model") await requireEndpoint(config, "claude", undefined, ctx.endpointProbe, ctx.endpointLookup);
+  const dependency = await requireReachable(map.reachable, ctx.endpointProbe);
+  const model = workerSource(ctx) === "model" ? await requireEndpoint(config, "claude", undefined, ctx.endpointProbe, ctx.endpointLookup) : undefined;
+  completeRecoveryChecks(journal, nodeRecoveryScope(repo, nodeId), [dependency, model].filter(check => check !== undefined), { nodeId, repo, generation });
   fence("spawn the worker");
   const workerResult = await workerRun(prompt, {
    cwd: worktree,
@@ -1315,7 +1317,7 @@ async function runResearch(
    throw new ProgressConflict(`${detail}\n${failure}`);
   }
   journal.recordEvent("refused", { nodeId, repo, detail });
-  failNode(config, journal, nodeId, repo, detail, outcome ?? (workerExit === 0 ? { kind: "human", operation: "research-policy", evidence: detail, action: "resolve the research refusal before resuming" } : processOutcome({ code: workerExit }, "research-worker")));
+  failNode(config, journal, { nodeId: nodeId, repo: repo, detail: detail, outcome: outcome ?? (workerExit === 0 ? { kind: "human", operation: "research-policy", evidence: detail, action: "resolve the research refusal before resuming" } : processOutcome({ code: workerExit }, "research-worker")) });
   const parked = journal.getWorker(nodeId, repo)?.status === "parked";
   return { ...base, status: parked ? "parked" : "failed", detail: parked ? activeRecoveryReason(journal, nodeRecoveryScope(repo, nodeId)) : detail, workerExit };
  }

@@ -287,10 +287,10 @@ test("a held caller-supplied reservation parks immediately without spawning or s
  expect(spawns).toBe(0);
 });
 
-test("a completed reservation cannot be revived by a late model selection", async () => {
+test.each([false, true])("a completed reservation cannot be revived after preflight (selected=%s)", async selected => {
  let spawns = 0;
  const result = await startOwnedWorker({ journal: a, row: row(),
-  preflight: async () => { a.updateWorker("10", repo, { status: "success", pid: null }); return "pi"; },
+  preflight: async () => { a.updateWorker("10", repo, { status: "success", pid: null }); return { substrate: selected ? "pi" : undefined, checks: [] }; },
   spawn: async () => { spawns++; return process.pid; },
  });
  expect(result).toBeNull();

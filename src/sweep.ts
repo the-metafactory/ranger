@@ -1,6 +1,4 @@
-import { nodePreflight, type NodeSelector } from "./node-dependency.ts";
-import type { EndpointLookup } from "./endpoint.ts";
-import { type EndpointProbe } from "./endpoint.ts";
+import { workerPreflight, type DispatchDeps } from "./node-dependency.ts";
 import { RECOVERY_LIMIT, nodeRecoveryScope, recordRecovery, recoveryReason, recoveryHold, recoverablePending } from "./recovery.ts";
 import { startOwnedWorker, reservationPending, FRESH_START_FAILURE } from "./node-ownership.ts";
 import { recordImplementStart } from "./maps.ts";
@@ -29,10 +27,7 @@ import { BudgetDeferral, budgetedRead, budgetPolicy } from "./budget.ts";
  * the worker; sweep only reports pause state.
  */
 
-export interface SweepContext {
- endpointProbe?: EndpointProbe;
- endpointLookup?: EndpointLookup;
- nodeSelector?: NodeSelector;
+export interface SweepContext extends DispatchDeps {
  now?: () => Date;
  config: RangerConfig;
  journal: Journal;
@@ -99,7 +94,7 @@ export async function sweepMap(ctx: SweepContext): Promise<SweepMapResult> {
    const holder = startsImplementSession(worker) ? journal.laneHolder(implementLane(map), { nodeId: worker.nodeId, repo }) : null;
    if (holder !== null || (startsImplementSession(worker) && ctx.reservedLanes?.has(implementLane(map)))) continue;
    const pid = await startOwnedWorker({ journal, row: worker, now: ctx.now?.(),
-    preflight: worker.phase === "close" ? undefined : () => nodePreflight({ config, map, lane: worker.lane === "research" ? "research" : "implement", requiresModel: worker.worktree === null, selector: ctx.nodeSelector, probe: ctx.endpointProbe, lookup: ctx.endpointLookup }),
+    preflight: () => workerPreflight(worker, map, ctx),
     spawn: generation => ctx.respawn?.(worker.nodeId, repo, worker.root, generation) ?? Promise.resolve(null) });
    if (pid !== null) {
     result.respawned.push(worker.nodeId);

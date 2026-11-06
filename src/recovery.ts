@@ -44,6 +44,11 @@ export function recoveryHold(journal: Journal, scope: string, now = new Date()):
  return null;
 }
 
+function nextEligibleAt(now: Date, attemptsSpent: number): string {
+ const backoff = RECOVERY_BACKOFF_MS[Math.min(Math.max(0, attemptsSpent - 1), RECOVERY_BACKOFF_MS.length - 1)];
+ return new Date(now.getTime() + backoff).toISOString();
+}
+
 export function recordRecovery(journal: Journal, scope: string, outcome: OperationOutcome, options: { now?: Date; owner?: RecoveryOwner; attemptLimit?: number } = {}): RecoveryState {
  const { now = new Date(), owner, attemptLimit = RECOVERY_LIMIT } = options;
  if (outcome.kind === "success" || outcome.kind === "code") throw new Error("only non-code recovery outcomes can be scheduled");
@@ -58,7 +63,7 @@ export function recordRecovery(journal: Journal, scope: string, outcome: Operati
   pending.push({ operation: outcome.operation, target: outcome.target ?? "", kind: outcome.kind as RecoveryState["kind"], evidence: outcome.evidence.slice(0, 2000), action: outcome.action });
   const state: RecoveryState = { pending, key, scope, operation: outcome.operation, target: outcome.target ?? "", kind: outcome.kind as RecoveryState["kind"],
    attempts, limit, status: exhausted ? "exhausted" : "waiting",
-   nextEligibleAt: exhausted ? null : new Date(now.getTime() + (RECOVERY_BACKOFF_MS[Math.min(attempts - 1, RECOVERY_BACKOFF_MS.length - 1)] ?? 900_000)).toISOString(),
+   nextEligibleAt: exhausted ? null : nextEligibleAt(now, attempts),
    evidence: outcome.evidence.slice(0, 2000), action: exhausted ? `${outcome.action}; explicitly reset recovery after intervention` : outcome.action };
   journal.setHealth(key, JSON.stringify(state));
   journal.setHealth(pointer(scope), key);
@@ -78,7 +83,7 @@ export function reserveRecovery(journal: Journal, scope: string, options: { now?
    return false;
   }
   const next = { ...state, attempts: state.attempts + 1, status: "reserved" as const,
-   nextEligibleAt: new Date(now.getTime() + (RECOVERY_BACKOFF_MS[Math.min(state.attempts, RECOVERY_BACKOFF_MS.length - 1)] ?? 900_000)).toISOString() };
+   nextEligibleAt: nextEligibleAt(now, state.attempts + 1) };
   journal.setHealth(state.key, JSON.stringify(next));
   return true;
  });
@@ -89,10 +94,16 @@ export function completeRecovery(journal: Journal, scope: string, options: { ope
  journal.recoveryTransaction(owner, () => {
   const state = activeRecovery(journal, scope);
   if (state === null) return;
-  const pending = operation === undefined ? [] : state.pending.filter(item => item.operation !== operation || (target !== undefined && item.target !== target));
+  const pending = operation === undefined ? [] : state.pending.filter(item => item.operation !== operation || item.target !== (target ?? ""));
   if (pending.length === state.pending.length && operation !== undefined) return;
   const remaining = pending.at(-1);
   journal.setHealth(state.key, JSON.stringify(remaining === undefined ? { ...state, pending, status: "complete", attempts: 0, nextEligibleAt: null } : { ...state, ...remaining, pending }));
+ });
+}
+
+export function completeRecoveryChecks(journal: Journal, scope: string, checks: readonly { operation: string; target: string }[], owner?: RecoveryOwner): void {
+ journal.recoveryTransaction(owner, () => {
+  for (const check of checks) completeRecovery(journal, scope, { ...check, owner });
  });
 }
 
