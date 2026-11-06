@@ -299,6 +299,10 @@ export async function jobPass(ctx: JobPassContext): Promise<JobPassResult> {
  return result;
 }
 
+function recoveredJobStatus(journal: Journal, runId: number): "failed" | "deferred" {
+ return journal.getJobRun(runId)?.status === "failed" ? "failed" : "deferred";
+}
+
 async function recoverJob(ctx: Pick<JobPassContext, "config" | "journal" | "ledger">, run: JobRunRow,
  outcome: OperationOutcome, now: Date, result?: JobPassResult): Promise<void> {
  const state = ctx.journal.recoveryTransaction({ jobRunId: run.id, status: run.status, pid: run.pid }, () => {
@@ -433,7 +437,7 @@ export async function runJob(runId: number, ctx: RunJobContext): Promise<RunJobO
    jobModelEndpoint(job, studio?.policy), probe, ctx.endpointLookup);
  } catch (error) {
   await recoverJob(ctx, { ...requiredJob(journal, runId), pid: process.pid }, failureOutcome(error), now());
-  return { runId, name: job.name, status: "deferred", reason: activeRecoveryReason(journal, jobRecoveryScope(runId)) };
+  return { runId, name: job.name, status: recoveredJobStatus(journal, runId), reason: activeRecoveryReason(journal, jobRecoveryScope(runId)) };
  }
  completeRecovery(journal, jobRecoveryScope(runId), { operation: "model-endpoint", owner: { jobRunId: runId, status: "running", pid: process.pid } });
  journal.updateJobRun(runId, "running", { substrate, ...(studio?.kind === "ready" ? { policy: studio.policy } : {}) });
@@ -473,7 +477,7 @@ export async function runJob(runId: number, ctx: RunJobContext): Promise<RunJobO
  const operation = workerOutcome({ ...read, timedOut: raw.timedOut ?? read.timedOut }, "job-session", "model");
  if (operation.kind === "infrastructure" || operation.kind === "unknown") {
   await recoverJob(ctx, { ...requiredJob(journal, runId), pid: process.pid }, operation, now());
-  return { runId, name: run.name, status: journal.getJobRun(runId)?.status === "failed" ? "failed" : "deferred", reason: activeRecoveryReason(journal, jobRecoveryScope(runId)), substrate, result, log };
+  return { runId, name: run.name, status: recoveredJobStatus(journal, runId), reason: activeRecoveryReason(journal, jobRecoveryScope(runId)), substrate, result, log };
  }
  if (operation.kind === "success") completeRecovery(journal, jobRecoveryScope(runId), { owner: { jobRunId: runId, status: "running", pid: process.pid } });
  const reason = read.timedOut ? "budget"

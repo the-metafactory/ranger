@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stringify } from "yaml";
 import { Journal, FencedError } from "../src/journal.ts";
-import { activeRecovery, completeRecovery, nodeRecoveryScope, recordRecovery, recoveryHold, reserveRecovery } from "../src/recovery.ts";
+import { activeRecovery, completeRecovery, jobRecoveryScope, nodeRecoveryScope, recordRecovery, recoveryHold, reserveRecovery } from "../src/recovery.ts";
 import { failureOutcome, OperationFailure, processOutcome, type OperationOutcome } from "../src/operation-outcome.ts";
 import { forgeOutcome } from "../src/transient.ts";
 import { loadConfig } from "../src/config.ts";
@@ -187,4 +187,25 @@ test("a structured model error cannot pass merely because its process exited zer
  expect(result.status).toBe("failed");
  expect(result.reason).toContain("unknown");
  expect(journal.getJobRun(runId)?.status).toBe("failed");
+});
+
+test("an exhausted endpoint retry returns failed consistently with its persisted job run", async () => {
+ const cfg = config();
+ const { runId } = enqueueJob(cfg, journal, "offline", now);
+ const scope = jobRecoveryScope(runId);
+ const outcome = { kind: "dependency" as const, operation: "model-endpoint", target: "https://offline.invalid", evidence: "offline", action: "restore" };
+ recordRecovery(journal, scope, outcome, { now });
+ const prior = recordRecovery(journal, scope, outcome, { now });
+ const due = new Date(prior.nextEligibleAt!);
+ expect(reserveRecovery(journal, scope, { now: due })).toBe(true);
+ journal.updateJobRun(runId, "queued", { status: "running" });
+ let sessions = 0;
+ const result = await runJob(runId, { config: cfg, journal, substrate: "pi", now: () => due,
+  endpointProbe: async () => false,
+  runSession: async () => { sessions++; return { code: 0, stdout: "", stderr: "" }; },
+ });
+ expect(result.status).toBe("failed");
+ expect(journal.getJobRun(runId)?.status).toBe("failed");
+ expect(activeRecovery(journal, scope)).toMatchObject({ status: "exhausted", attempts: 3 });
+ expect(sessions).toBe(0);
 });
