@@ -1194,18 +1194,28 @@ describe("implement lane (node #23)", () => {
   const landed = recordedBaseMerges(r.github.comments.get(1) ?? [], BOT);
   expect(landed).toHaveLength(1);
   const worktree = join(r.canonical, ".worktrees", "node-20");
-  expect((await git(["rev-parse", "HEAD"], worktree)).stdout.trim()).toBe(landed[0]?.sha);
+  const merged = (await git(["rev-parse", "HEAD"], worktree)).stdout.trim();
+  expect(merged).toBe(landed[0]?.sha);
   expect((await git(["merge-base", "--is-ancestor", main, "HEAD"], worktree)).code).toBe(0);
+  r.ctx.map.commands.test = "true";
+  const rounds = r.calls.length;
+  reclaim(r);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  expect(await r.github.sha(BRANCH)).toBe(merged);
+  expect(markersOn(r)).toHaveLength(1);
+  expect(r.calls.length).toBe(rounds + 1);
  }, 60_000);
 
  test("a red run past the base merge budget is not run again, however far behind the branch is (ranger issue #322)", async () => {
   const { r, pushed } = await prWithUnpushedCommit();
   await spendBaseMergeBudget(r, pushed);
-  await pushFromOutside(r, "base-1.txt", "main");
+  const main = await pushFromOutside(r, "base-1.txt", "main");
   const runs = join(r.dir, "runs");
   r.ctx.map.commands.test = `echo run >> ${runs}; exit 1`;
   expect((await runNode("20", r.ctx)).status).toBe("failed");
   expect(readFileSync(runs, "utf8").trim().split("\n")).toHaveLength(1);
+  expect(markersOn(r)).toHaveLength(2);
+  expect(await holds(r, main, await r.github.sha(BRANCH))).toBe(false);
  }, 60_000);
 
  test("a resumed checkpoint at the PR head, behind the base, whose tests pass is not merged up: there is nothing to push (ranger issue #322)", async () => {

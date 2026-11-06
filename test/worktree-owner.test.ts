@@ -18,6 +18,7 @@ const OWNER_FUNCTIONS = [
 
 const WORKTREE_PRIMITIVES = [
  /\bsyncWorktreeToHead\(/,
+ /\breconcileRecordedRebase\(/,
  /\bcatchUpWithBase\(/,
  /\bmergeBaseBeforeTests\(/,
  /\bmergeBaseAfterRedTests\(/,
@@ -49,7 +50,7 @@ function violations(file: string, source: string): string[] {
 
 describe("prepareWorktree owns every move of a node worktree to a head or the base (ranger issue #322)", () => {
  test("no source outside the owner calls a fast-forward or base-merge primitive", () => {
-  const found = readdirSync(SRC)
+  const found = readdirSync(SRC, { recursive: true, encoding: "utf8" })
    .filter((file) => file.endsWith(".ts"))
    .flatMap((file) => violations(file, readFileSync(join(SRC, file), "utf8")));
   expect(found).toEqual([]);
