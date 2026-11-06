@@ -91,7 +91,8 @@ for (const [name, tamper] of [
     RANGER_WRITE_TEST: "ghp_write", RANGER_WORKER_CMD: worker, FAKE_RESEARCH_CI: "failure",
    });
    expect(result.code).toBe(0);
-   expect(JSON.parse(result.stdout)).toMatchObject({ status: "failed" });
+   expect(JSON.parse(result.stdout)).toMatchObject({ status: "parked" });
+   expect(JSON.parse(result.stdout).detail).toContain("durability failure");
    expect(JSON.parse(result.stdout).detail).toContain("only findings.md");
    const remote = await runCmd("git", ["--git-dir", origin, "rev-parse", "--verify", "refs/heads/research/api-survey"]);
    expect(remote.code).not.toBe(0);
@@ -128,7 +129,8 @@ test("research retry refuses an altered findings branch before citing CI", async
   }
   const retry = await runCli(args, { ...env, FAKE_RESEARCH_CI: "success" });
   expect(retry.code).toBe(0);
-  expect(JSON.parse(retry.stdout).status).toBe("failed");
+  expect(JSON.parse(retry.stdout).status).toBe("parked");
+  expect(JSON.parse(retry.stdout).detail).toContain("durability failure");
   expect(JSON.parse(retry.stdout).detail).toContain("only findings.md");
   const state = JSON.parse(readFileSync(statePath, "utf8"));
   expect(state.lastClose).toBeUndefined();

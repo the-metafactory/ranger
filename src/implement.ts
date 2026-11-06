@@ -1,4 +1,5 @@
 import { principalLoginForRepo } from "./config.ts";
+import { checkpointNode, nodeCheckpoint, preserveNodeProgress, preserveUnmergedClosure, progressRemote, reconcileNodeProgress, ProgressConflict } from "./node-progress.ts";
 import { fileStemFor, parseForgeRef } from "./forge-ref.ts";
 import { lanePort } from "./forge-lanes.ts";
 import type { ResolvedToken } from "./token-gate.ts";
@@ -247,6 +248,11 @@ async function backendTests(ctx: ImplementContext, sha: string, local: () => Pro
   remotePasses.delete(ctx);
   if (tested.evidence) ctx.journal.recordEvent("reviewed", { nodeId: ctx.node.ref.id, repo: ctx.map.repo, detail: `remote supervisor tests: ${tested.evidence.receipt.status}; receipt ${tested.evidence.path}` });
   if (tested.result.code === 0) remotePasses.set(ctx, { ...tested, request });
+ }
+ if (sha === await headSha(ctx.worktree) && await testBaseTip(ctx) !== null && await commitsAhead(ctx.worktree, ctx.map.base) > 0) {
+  await checkpointNode(ctx, { sha, evidence: { sha, kind: "tests",
+   result: tested.result.timedOut || tested.result.code <= 0 || (await dirtyFiles(ctx.worktree)).length > 0 ? "unknown" : "failed",
+   detail: `supervisor ${backend.kind} tests exited ${tested.result.code}` } });
  }
  return tested.result;
 }
@@ -1402,6 +1408,28 @@ async function tryCarryReview(ctx: ImplementContext, reviews: RecordedReview[], 
 }
 
 export async function runImplement(ctx: ImplementContext): Promise<ImplementOutcome> {
+ let outcome: ImplementOutcome;
+ try {
+  outcome = await runImplementFlow(ctx);
+ } catch (error) {
+  if (error instanceof FencedError || error instanceof ProgressConflict) throw error;
+  const failure = await preserveNodeProgress(ctx, error instanceof GitSafetyError ? error.message : undefined);
+  if (failure !== null) {
+   throw new ParkSignal(`${error instanceof Error ? error.message : String(error)}\n${failure}`);
+  }
+  throw error;
+ }
+ if (["failed", "parked", "refused"].includes(outcome.status)) {
+  const failure = await preserveNodeProgress(ctx);
+  if (failure !== null) throw new ParkSignal(`${outcome.detail}\n${failure}`);
+ } else if (outcome.status === "awaiting-merge") {
+  const sha = await headSha(ctx.worktree);
+  await checkpointNode(ctx, { sha, preservedSha: sha, durabilityError: null });
+ }
+ return outcome;
+}
+
+async function runImplementFlow(ctx: ImplementContext): Promise<ImplementOutcome> {
  const { config, map, journal, node, token, botIdentity, branch, worktree } = ctx;
  const github = ctx.github ?? lanePort(config, map.repo);
  const reviewer = reviewGate(ctx);
@@ -1427,7 +1455,22 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
   recorded === null
    ? await github.findPrByHead(repo, branch, token)
    : await github.getPr(repo, recorded, token);
+ const remote = await progressRemote(ctx);
+ if (pr?.state === "open" && remote !== null && pr.headSha !== remote && await hasCommit(worktree, pr.headSha)) {
+  if (await isAncestor(worktree, pr.headSha, remote)) {
+   await awaitHead(github, repo, pr.iid, remote, token, ctx.headPollMs);
+   pr = await github.getPr(repo, pr.iid, token);
+  }
+ }
+ const progressPrNumber = pr?.iid;
+ try {
+  await reconcileNodeProgress(ctx, remote, progressPrNumber === undefined ? undefined : head => syncWorktreeToHead(ctx, progressPrNumber, head));
+ } catch (error) {
+  if (error instanceof ParkSignal) throw new ProgressConflict(error.message);
+  throw error;
+ }
  const phase = resolvePhase(pr);
+ if (pr?.state === "merged") await preserveUnmergedClosure(ctx, pr);
  if (node.status === "closed") return finishClosedElsewhere({ ...ctx, pr });
  journal.recordEvent("worker-start", {
   nodeId,
@@ -1442,6 +1485,16 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
  }
  if (phase === "close") {
   return closeAfterMerge(ctx, github, pr as ChangeRequest);
+ }
+ if (phase === "review" && pr !== null && pr.headSha === await headSha(worktree)) {
+  journal.updateWorker(nodeId, repo, { phase: "review" });
+  const checkpoint = nodeCheckpoint(ctx);
+  const accepted = checkpoint?.evidence.some(evidence => evidence.kind === "tests-gate" && evidence.result === "passed" && evidence.detail === testCommand);
+  if (!accepted) {
+   const snapshot = await trustedSnapshot(journal, ctx.canonical, { repo, nodeId }, mapKey(map));
+   const failure = await checkPass(ctx, testCommand, { sha: pr.headSha, snapshot, baseTip: await testBaseTip(ctx), label: "resumed checkpoint", context: "resume" });
+   if (failure !== undefined) return { status: "failed", detail: failure, workerExit: null };
+  }
  }
 
  // ---- implement ----
@@ -1826,6 +1879,8 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
    verdictSha: current.sha,
    verdictBlockers: current.blockers,
   });
+  if (current.sha === await headSha(worktree)) await checkpointNode(ctx, { sha: current.sha,
+   evidence: { sha: current.sha, kind: "review", result: gatingFindings(current) === 0 ? "passed" : "failed", detail: `review round ${current.round}: ${gatingFindings(current)} gating finding(s)` } });
   if (gatingFindings(current) === 0 && artifacts.length > 0) {
    const missing = await missingArtifacts(worktree, live.headSha, artifacts);
    if (missing.length > 0) {
@@ -2441,7 +2496,7 @@ async function baseMergePass(ctx: ImplementContext, testCommand: string, from: M
   timeoutMs: 30_000,
  });
  if (inside.code !== 0) {
-  throw new ParkSignal(
+  throw new GitSafetyError(
    `base merge pass committed, but origin/${base} as fetched (${baseSha.slice(0, 8)}) is not in ${ctx.branch} — the conflict stands; nothing was pushed`,
   );
  }
@@ -2730,10 +2785,20 @@ async function checkPass(
  // The tests ran worker-written code: the state must still be the vetted one
  // before it counts as seen clean.
  const clean = await assertGitUntouched(ctx.canonical, snapshot);
+ if (await headSha(worktree) !== sha || (await dirtyFiles(worktree)).length > 0) {
+  return `supervisor tests changed the committed source at ${sha}; no exact-SHA test evidence was accepted`;
+ }
  recordKnownGood(journal, ctx.canonical, clean, `passing ${pass}`);
  await assertNoClosingKeywords(worktree, map.base, parseForgeRef(map.repo).forge);
+ await checkpointAcceptedTests(ctx, sha, testCommand, tests.code === 0);
  // Only a pass that goes on to the push puts its waived tests in the receipts.
  if (baseRed !== undefined) recordTestsBaseRed(journal, map.repo, ctx.node.ref.id, { head: sha, base: baseRed.sha, names: baseRed.names, rest: baseRed.rest });
+}
+
+async function checkpointAcceptedTests(ctx: ImplementContext, sha: string, command: string, passed: boolean): Promise<void> {
+ await checkpointNode(ctx, { sha, evidence: { sha, kind: "tests", result: passed ? "passed" : "failed",
+  detail: passed ? "supervisor tests accepted on exact committed source" : "supervisor gate accepted with recorded baseline failures" } });
+ await checkpointNode(ctx, { sha, evidence: { sha, kind: "tests-gate", result: "passed", detail: command } });
 }
 
 /**
@@ -3891,6 +3956,7 @@ async function adoptBuiltWork(
  if (restored !== null) {
   return { workerExit: null, snapshot, sha, failure: { status: "failed", detail: restored, workerExit: null } };
  }
+ await checkpointAcceptedTests(ctx, sha, testCommand, true);
  journal.recordEvent("reviewed", {
   nodeId: node.ref.id,
   repo: map.repo,

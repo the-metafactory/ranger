@@ -1215,3 +1215,23 @@ export async function baseOnlyMergePatchId(cwd: string, base: string, reviewed: 
   return { refused: error instanceof Error ? error.message : String(error) };
  }
 }
+
+export async function fetchRemoteBranch(
+ canonical: string,
+ branch: string,
+ credential: GitCredential,
+): Promise<string | null> {
+ const remoteRef = `refs/remotes/origin/${branch}`;
+ const fetched = await safeGit(
+  ["fetch", "--prune", "origin", `+refs/heads/${branch}*:${remoteRef}*`],
+  { cwd: canonical, credential, canonical, timeoutMs: 120_000 },
+ );
+ if (fetched.code !== 0) {
+  throw new Error(`cannot fetch origin's ${branch} (exit ${fetched.code}): ${fetched.stderr.trim()}`);
+ }
+ const present = await safeGit(
+  ["show-ref", "--verify", "--quiet", remoteRef],
+  { cwd: canonical, timeoutMs: 10_000 },
+ );
+ return present.code === 0 ? remoteRef : null;
+}

@@ -1,4 +1,5 @@
 import { acquireGeneration } from "./node-ownership.ts";
+import { checkpointNode, preserveNodeProgress, progressRemote, reconcileNodeProgress, ProgressConflict } from "./node-progress.ts";
 import type { RunOutcome } from "@the-metafactory/myelin";
 import { fileStemFor, parseForgeRef, qualifiedRepo } from "./forge-ref.ts";
 import { graphReadToken, laneCredentialRefusal, lanePort, type ReadGate } from "./forge-lanes.ts";
@@ -16,6 +17,7 @@ import { exitText, runCmd, type RunOptions } from "./exec.ts";
 import {
  cloneUrl,
  fastForwardCanonical,
+ fetchRemoteBranch,
  assertGitUntouched,
  gitCredential,
  safeGit,
@@ -329,25 +331,6 @@ export async function bootstrapWorktree(
  return dir;
 }
 
-async function fetchRemoteBranch(
- canonical: string,
- branch: string,
- credential: GitCredential,
-): Promise<string | null> {
- const remoteRef = `refs/remotes/origin/${branch}`;
- const fetched = await safeGit(
-  ["fetch", "--prune", "origin", `+refs/heads/${branch}*:${remoteRef}*`],
-  { cwd: canonical, credential, canonical, timeoutMs: 120_000 },
- );
- if (fetched.code !== 0) {
-  throw new Error(`cannot fetch origin's ${branch} (exit ${fetched.code}): ${fetched.stderr.trim()}`);
- }
- const present = await safeGit(
-  ["show-ref", "--verify", "--quiet", remoteRef],
-  { cwd: canonical, timeoutMs: 10_000 },
- );
- return present.code === 0 ? remoteRef : null;
-}
 
 function defaultWorkerCommand(): string[] {
  const envCmd = process.env.RANGER_WORKER_CMD;
@@ -569,6 +552,7 @@ export async function runNode(
  journal = journal.forWorker(nodeId, repo, generation);
  ctx = { ...ctx, journal };
 
+ let observedNode: NodeResult | undefined;
  try {
   // A GitLab map's graph reads run under its read gate (node #122).
   const graphToken = await graphReadToken(config, repo, token, ctx.readGate);
@@ -583,6 +567,7 @@ export async function runNode(
     timeoutMs: GRAPH_CALL_TIMEOUT_MS,
    },
   );
+  observedNode = node;
   // Reuse this one root read for the prompt and ledger, including a node
   // completed elsewhere. A root failure must not change that reconciliation.
   let rootReadError: unknown;
@@ -617,13 +602,20 @@ export async function runNode(
   journal.recordEvent("refused", { nodeId, repo, detail });
   finish(journal, nodeId, repo, "parked", detail);
   return { ...base, status: "refused", detail };
- } catch (error) {
+ } catch (caught) {
+  let error = caught;
   const current = journal.getWorker(nodeId, repo);
   if (current?.generation !== generation || current.status === "stop-requested") {
    const detail = error instanceof FencedError ? error.message :
     `node ${nodeId}: generation ${generation} superseded or stopped; fenced before recording outcome`;
    journal.recordEvent("fenced", { nodeId, repo, detail });
    return { ...base, status: "refused", detail };
+  }
+  if (observedNode?.node.kind === "research" && !(error instanceof FencedError) && !(error instanceof ProgressConflict)) {
+   try {
+    const failure = await preserveResearchProgress(ctx, observedNode, generation, error instanceof GitSafetyError ? error.message : undefined);
+    if (failure !== null) error = new ParkSignal(`${error instanceof Error ? error.message : String(error)}\n${failure}`);
+   } catch (preservationError) { error = preservationError; }
   }
   const detail = error instanceof Error ? error.message : String(error);
   if (error instanceof FencedError) {
@@ -1026,6 +1018,7 @@ async function runResearch(
  // retry after a failed PR lookup must not read it as unexplained state.
  let baseSha = journal.getWorker(nodeId, repo)?.researchBaseSha ?? null;
  const freshBase = baseSha === null;
+ let recoveredFindings = false;
  if (baseSha === null) {
   if (preexisting !== null) {
    throw new ParkSignal(`research pre-worker base is missing for ${branch}; operator intervention required`);
@@ -1034,8 +1027,22 @@ async function runResearch(
   if (baseSha === null) {
    throw new GitSafetyError(`cannot resolve research pre-worker base for node #${nodeId}`);
   }
+  const base = await safeGit(["merge-base", `origin/${map.base}`, baseSha], { cwd: worktree, timeoutMs: 10_000 });
+  if (base.code !== 0) throw new GitSafetyError(`cannot reconstruct research base for ${branch}: ${base.stderr.trim()}`);
+  if (base.stdout.trim() !== baseSha) {
+   await assertResearchFindingsOnly(canonical, base.stdout.trim(), baseSha);
+   baseSha = base.stdout.trim();
+   recoveredFindings = true;
+  }
   fence("record research base");
   journal.updateWorker(nodeId, repo, { researchBaseSha: baseSha });
+ }
+ const progress = { journal, map, node, canonical, worktree, branch, generation, token };
+ await reconcileNodeProgress(progress, await progressRemote(progress));
+ const recovered = await resolveBranchSha(canonical, branch);
+ if (recovered !== null && recovered !== baseSha && existsSync(join(worktree, "findings.md"))) {
+  await assertResearchFindingsOnly(canonical, baseSha, recovered);
+  recoveredFindings = true;
  }
 
  const github = ctx.github ?? lanePort(config, repo);
@@ -1044,14 +1051,14 @@ async function runResearch(
   ? await github.findPrByHead(repo, branch, token)
   : await github.getPr(repo, recorded, token);
  // A draft for a branch cut only now was opened by something else.
- if (freshBase && existingPr !== null) {
+ if (freshBase && !recoveredFindings && existingPr !== null) {
   throw new ParkSignal(`research pre-worker base is missing for ${branch}; operator intervention required`);
  }
  let sha: string;
 
  // A retry after the draft was opened resumes its CI/close tail, without
  // asking a worker to recreate an existing findings branch.
- if (existingPr === null) {
+ if (existingPr === null && !recoveredFindings) {
   const prompt = assembleResearchPrompt({
    repo,
    node: {
@@ -1097,6 +1104,8 @@ async function runResearch(
 
   if (workerResult.code !== 0) {
    const detail = `worker exited ${workerResult.code}: ${workerResult.stderr.trim() || workerResult.stdout.trim().slice(0, 500)} (worker log: ${log})`;
+   const failure = await preserveResearchProgress(ctx, node, generation);
+   if (failure !== null) throw new ProgressConflict(`${detail}\n${failure}`);
    journal.recordEvent("refused", { nodeId, repo, detail });
    failNode(config, journal, nodeId, repo, detail);
    return { ...base, status: "failed", detail, workerExit: workerResult.code };
@@ -1106,6 +1115,8 @@ async function runResearch(
   const findingsPath = join(worktree, "findings.md");
   if (!existsSync(findingsPath)) {
    const detail = `worker succeeded but wrote no findings.md at ${findingsPath} — the close would be hollow, so ranger refuses to close. (worker log: ${log})`;
+   const failure = await preserveResearchProgress(ctx, node, generation);
+   if (failure !== null) throw new ProgressConflict(`${detail}\n${failure}`);
    journal.recordEvent("refused", { nodeId, repo, detail });
    failNode(config, journal, nodeId, repo, detail);
    return { ...base, status: "failed", detail, workerExit: 0 };
@@ -1136,9 +1147,12 @@ async function runResearch(
     source: sha,
    });
    recordKnownGood(journal, canonical, vetted, "vetted push");
+   await checkpointNode(progress, { sha, preservedSha: sha, durabilityError: null });
   } catch (error) {
    if (error instanceof FencedError) throw error;
    const detail = `research branch push failed (${branch}): ${error instanceof Error ? error.message : String(error)}`;
+   const failure = await preserveResearchProgress(ctx, node, generation, error instanceof GitSafetyError ? error.message : undefined);
+   if (failure !== null) throw new ProgressConflict(`${detail}\n${failure}`);
    journal.recordEvent("refused", { nodeId, repo, detail });
    failNode(config, journal, nodeId, repo, detail);
    return { ...base, status: "failed", detail, workerExit: 0 };
@@ -1151,6 +1165,11 @@ async function runResearch(
   sha = head;
   await assertResearchFindingsOnly(canonical, baseSha, sha);
  }
+ if (await progressRemote(progress) !== sha) {
+  const failure = await preserveNodeProgress(progress);
+  if (failure !== null) throw new ProgressConflict(failure);
+ }
+ await checkpointNode(progress, { sha, preservedSha: sha, durabilityError: null });
  const findings = await safeGit(["--no-replace-objects", "show", `${sha}:findings.md`], { cwd: canonical });
  if (findings.code !== 0 || findings.stdout.trim().length === 0) {
   throw new ParkSignal(`research findings.md is missing or empty at ${sha}`);
@@ -1165,6 +1184,7 @@ async function runResearch(
    }
   },
  });
+ await checkpointNode(progress, { sha, phase: "close", evidence: { sha, kind: "research-ci", result: "passed", detail: `${evidence.ci} (${evidence.check.runName})` } });
  journal.recordEvent("ci-passed", { nodeId, repo, detail: `research ${evidence.ci} (${evidence.check.runName})` });
  if (ratify === "propose") {
   return await proposeResearch(ctx, node, {
@@ -1253,6 +1273,13 @@ async function runResearch(
  }
 
  return parkResearchClose(ctx, nodeId, close, 0);
+}
+
+async function preserveResearchProgress(ctx: RunNodeContext, node: NodeResult, generation: number, refusal?: string): Promise<string | null> {
+ const worktree = ctx.journal.getWorker(node.ref.id, ctx.map.repo)?.worktree;
+ if (worktree == null) return null;
+ return preserveNodeProgress({ journal: ctx.journal, map: ctx.map, node, generation, worktree,
+  canonical: canonicalDir(ctx.config, ctx.map), branch: researchBranchFor(node.node), token: ctx.token }, refusal);
 }
 
 function parkResearchClose(ctx: RunNodeContext, nodeId: string, close: CloseResult, workerExit: number | null): RunNodeOutcome {

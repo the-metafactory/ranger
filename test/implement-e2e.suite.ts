@@ -847,7 +847,7 @@ describe("implement lane (node #23)", () => {
    expect(readFileSync(tested, "utf8").trim()).toBe(merged);
    expect(sessions).toHaveLength(0);
    expect(outcome.status).toBe(scenario === "clean" ? "awaiting-merge" : "failed");
-   expect(await r.github.sha(BRANCH)).toBe(scenario === "clean" ? merged : to);
+   expect(await r.github.sha(BRANCH)).toBe(merged);
    expect(r.calls).toHaveLength(scenario === "clean" ? 2 : 1);
    expect(r.journal.listNodeEvents("acme/widgets", "20").some(e => e.kind === "worktree-synced" && e.detail?.includes("recorded rebase"))).toBe(true);
   } else {
@@ -1055,7 +1055,7 @@ describe("implement lane (node #23)", () => {
   expect((await git(["rev-parse", "HEAD"], worktree)).stdout.trim()).toBe(built);
   expect((await git(["status", "--porcelain"], worktree)).stdout.trim()).toBe("");
   expect(r.github.prs.size).toBe(0);
-  expect(await r.github.sha(BRANCH)).toBe("");
+  expect(await r.github.sha(BRANCH)).toBe(built);
   rmSync(flag, { force: true });
  }, 60_000);
 
@@ -1136,7 +1136,7 @@ describe("implement lane (node #23)", () => {
   expect((await git(["rev-parse", "HEAD"], worktree)).stdout.trim()).toBe(built);
   expect((await git(["status", "--porcelain"], worktree)).stdout.trim()).toBe("");
   expect(r.github.prs.size).toBe(0);
-  expect(await r.github.sha(BRANCH)).toBe("");
+  expect(await r.github.sha(BRANCH)).toBe(built);
   expect(r.journal.deadmanCount()).toBe(deadman);
   rmSync(flag, { force: true });
  }, 60_000);
@@ -1235,7 +1235,8 @@ describe("implement lane (node #23)", () => {
    cleanup.push(r.dir);
    r.ctx.map.commands.test = TAMPER;
    const first = await runNode("20", r.ctx);
-   expect(first.status).toBe("failed");
+   expect(first.status).toBe("parked");
+   expect(first.detail).toContain("durability failure");
    expect(first.detail).toContain("tests (");
    expect((await git(["config", "--get", "http.sslVerify"], r.canonical)).stdout.trim()).toBe("false");
 
@@ -1249,7 +1250,7 @@ describe("implement lane (node #23)", () => {
    expect(resumed.detail).toContain("ranger trust-git --map acme/widgets#1");
    expect(r.journal.getWorker("20", "acme/widgets")?.status).toBe("parked");
    expect(r.journal.getWorker("20", "acme/widgets")?.outcome).toContain("http.sslverify");
-   expect(r.journal.deadmanCount()).toBe(1); // the failed run only; a park is not a crash
+   expect(r.journal.deadmanCount()).toBe(0);
    // Nothing ran under the credential: no fetch, no push, no PR.
    expect(await fetchedMain(r)).toBe(fetched);
    expect(await r.github.sha("node/20-add-the-feature-module")).toBe("");
@@ -1273,7 +1274,7 @@ describe("implement lane (node #23)", () => {
    const r = await rig({});
    cleanup.push(r.dir);
    r.ctx.map.commands.test = TAMPER;
-   expect((await runNode("20", r.ctx)).status).toBe("failed"); // built and committed; the tests tamper and fail
+   expect((await runNode("20", r.ctx)).status).toBe("parked");
    expect((await git(["config", "--get", "http.sslVerify"], r.canonical)).stdout.trim()).toBe("false");
 
    r.ctx.map.commands.test = "test -f src/feature.ts"; // the committed work would now pass adoption
@@ -1297,7 +1298,8 @@ describe("implement lane (node #23)", () => {
    // Passes on the build; the fix pass's tests change the config and fail.
    r.ctx.map.commands.test = `test -f src/feature.ts && if grep -q fixed src/feature.ts; then ${TAMPER}; fi`;
    const first = await runNode("20", r.ctx);
-   expect(first.status).toBe("failed");
+   expect(first.status).toBe("parked");
+   expect(first.detail).toContain("durability failure");
    expect(first.detail).toContain("tests (");
    const pushed = await r.github.sha("node/20-add-the-feature-module");
    expect(pushed).not.toBe("");
@@ -1373,7 +1375,7 @@ describe("implement lane (node #23)", () => {
    const r = await rig({});
    cleanup.push(r.dir);
    r.ctx.map.commands.test = "git config include.path /tmp/evil.gitconfig; exit 1";
-   expect((await runNode("20", r.ctx)).status).toBe("failed");
+   expect((await runNode("20", r.ctx)).status).toBe("parked");
 
    r.ctx.map.commands.test = "test -f src/feature.ts";
    await moveOriginMain(r);
@@ -2285,7 +2287,7 @@ describe("implement lane (node #23)", () => {
   const outcome = await runNode("20", r.ctx);
   expect(readFileSync(tested, "utf8").trim()).toBe(local);
   expect(outcome.status).toBe(testsFail ? "failed" : "awaiting-merge");
-  expect(await r.github.sha(branch)).toBe(testsFail ? pushed : local);
+  expect(await r.github.sha(branch)).toBe(local);
   const events = eventsSince(r, prior);
   if (testsFail) {
    expect(events.some(e => e.kind === "pushed")).toBe(false);
@@ -2597,7 +2599,7 @@ describe("implement lane (node #23)", () => {
   expect((await r.github.getPr("acme/widgets", 1)).mergeState).toBe("conflict");
  }, 60_000);
 
- test("an install after the base merge that rewrites a tracked file fails the pass before the tests, and nothing is pushed", async () => {
+ test("an install that rewrites tracked source fails the gate and preserves only the committed merge", async () => {
   let r!: Rig & { calls: number[]; announced: string[] };
   let before = "";
   // Only the merged tree has src/feature.ts at install time: the build's install leaves the tree alone.
@@ -2615,7 +2617,12 @@ describe("implement lane (node #23)", () => {
   expect(outcome.status).toBe("failed");
   expect(outcome.detail).toContain("uncommitted or untracked file(s) ( M README.md)");
   expect(before).not.toBe("");
-  expect(await r.github.sha("node/20-add-the-feature-module")).toBe(before);
+  const worktree = r.journal.getWorker("20", "acme/widgets")!.worktree!;
+  const committed = (await runCmd("git", ["rev-parse", "HEAD"], { cwd: worktree })).stdout.trim();
+  expect(committed).not.toBe(before);
+  expect(await r.github.sha("node/20-add-the-feature-module")).toBe(committed);
+  expect((await runCmd("git", ["show", `${committed}:README.md`], { cwd: r.origin })).stdout).not.toContain("regenerated");
+  expect(r.journal.listNodeEvents("acme/widgets", "20").some(event => event.kind === "progress-preserved" && event.detail?.includes(committed))).toBe(true);
  }, 60_000);
 
  test("a worker that moves origin/<base> onto its own commit does not pass for a merge", async () => {
@@ -3693,7 +3700,8 @@ describe("implement lane (node #23)", () => {
   r.ctx.hostLoad = () => ({ load: 14, cores: 10 });
   r.ctx.quietHost = { pollMs: 1, maxMs: 5 };
   const outcome = await runNode("20", r.ctx);
-  expect(outcome.status).toBe("failed");
+  expect(outcome.status).toBe("parked");
+  expect(outcome.detail).toContain("durability failure");
   expect(outcome.detail).toContain("the canonical checkout has no refs/remotes/origin/main");
   const lines = readFileSync(runs, "utf8").trim().split("\n");
   expect(lines.some((l) => l.startsWith("test "))).toBe(true); // the worktree run
@@ -3865,7 +3873,7 @@ describe("implement lane (node #23)", () => {
   expect(r.journal.deadmanCount()).toBe(1);
  }, 60_000);
 
- test("a fix pass a failed run committed but never pushed is adopted on resume, and the next round reviews it", async () => {
+ test("a failed fix pass is preserved and retested before the resumed review", async () => {
   const flag = join(tmpdir(), `ranger-adopt-fix-${Date.now()}`);
   // The build passes; the fix pass's commit fails the supervisor's tests until the flag exists.
   const r = await rig({
@@ -3877,14 +3885,14 @@ describe("implement lane (node #23)", () => {
   expect(r.calls).toHaveLength(1);
   const pushed = await r.github.sha("node/20-add-the-feature-module");
   const unpushed = (await runCmd("git", ["rev-parse", "HEAD"], { cwd: join(r.canonical, ".worktrees", "node-20") })).stdout.trim();
-  expect(unpushed).not.toBe(pushed);
+  expect(unpushed).toBe(pushed);
   const writer = r.journal.headSubstrate("acme/widgets", unpushed);
   writeFileSync(flag, ""); // whatever broke the tests is gone
   r.ctx.workerCommand = [implementWorker, "noop"]; // a worker session would commit nothing and fail
   reclaim(r);
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
   const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
-  expect(events.some((d) => d.startsWith("resumed worktree pushed ") && d.includes(pushed) && d.includes(unpushed))).toBe(true);
+  expect(JSON.parse(r.journal.nodeProgress("acme/widgets", "20") ?? "{}").evidence).toContainEqual({ sha: unpushed, kind: "tests-gate", result: "passed", detail: r.ctx.map.commands.test });
   expect(r.calls).toHaveLength(2); // round 2 reviewed the adopted head
   expect(await r.github.sha("node/20-add-the-feature-module")).toBe(unpushed); // the adopted commit, as it stood
   expect(r.journal.headSubstrate("acme/widgets", unpushed)).toBe(writer); // still the session that wrote it
@@ -3916,7 +3924,7 @@ describe("implement lane (node #23)", () => {
   const resumed = await runNode("20", r.ctx);
   expect(resumed.status).toBe(scenario === "fail" ? "failed" : scenario === "review-cap" ? "parked" : "awaiting-merge");
   expect(readFileSync(tested, "utf8").trim()).toBe(unpushed);
-  expect(await r.github.sha(branch)).toBe(scenario === "fail" ? pushed : unpushed);
+  expect(await r.github.sha(branch)).toBe(unpushed);
   expect(sessions).toHaveLength(0);
   expect(r.calls).toHaveLength(scenario === "pass" ? 2 : 1);
   const events = eventsSince(r, prior);

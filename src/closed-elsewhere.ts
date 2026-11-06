@@ -11,6 +11,7 @@ import { closeGraphEscalation, type CardBudget } from "./card-sync.ts";
 import { changeRequestLabel, changeRequestNoun, nodeCommentUrl } from "./forge-text.ts";
 import { implementBranchFor } from "./implement.ts";
 import { researchBranchFor, slugify, worktreeBranch } from "./worker.ts";
+import { preserveUnmergedClosure } from "./node-progress.ts";
 
 export async function findNodePr(
   forge: ForgePort,
@@ -37,6 +38,7 @@ export async function finishClosedElsewhere(ctx: {
   canonical?: string;
   worktree?: string | null;
   cardBudget?: CardBudget;
+  token?: string;
 }): Promise<{ status: "success" | "released"; detail: string; workerExit: null; prNumber?: number; graphClosureReconciled: true }> {
   const { map, journal, node, pr, generation } = ctx;
   if (node.status !== "closed") throw new Error("closed-elsewhere reconciliation requires a closed graph node");
@@ -54,6 +56,8 @@ export async function finishClosedElsewhere(ctx: {
   const worktree = ctx.worktree ?? journal.getWorker(id, map.repo)?.worktree;
   fence();
   if (merged && worktree != null && existsSync(worktree)) {
+    await preserveUnmergedClosure({ map, journal, node, canonical, worktree,
+      branch: pr.headRef, generation, token: ctx.token ?? "" }, pr);
     await trustedSnapshot(journal, canonical, { repo: map.repo, nodeId: id }, mapKey(map));
     fence();
     const removed = await safeGit(["worktree", "remove", "--force", worktree], { cwd: canonical });
