@@ -1,3 +1,4 @@
+import { recoveryReason, type RecoveryState } from "./recovery.ts";
 import { isGithubRepo, nodeKey, parseForgeRef } from "./forge-ref.ts";
 import { changeRequestLabel, changeRequestNoun, changeRequestUrl, nodeUrl } from "./forge-text.ts";
 import type { MergeState } from "./forge.ts";
@@ -150,10 +151,14 @@ export function classifyReason(
  events: EventRow[],
  labels: string[] | null,
  reviewRounds: number,
+ recoveryState?: RecoveryState | null,
 ): Reason {
  if (row.status === "awaiting-merge" && labels?.includes(NEEDS_EYE_LABEL) === true) {
   return { class: "needs-eye", detail: `labelled ${NEEDS_EYE_LABEL}: your eye is the check, and the merge is yours` };
  }
+ if (recoveryState !== undefined && recoveryState !== null && recoveryState.status !== "complete") return {
+  class: recoveryState.kind === "dependency" ? "blocked" : recoveryState.kind === "infrastructure" ? "transient" : "other", detail: recoveryReason(recoveryState).slice(0, 400),
+ };
  const outcome = row.outcome ?? "";
  const recovery = /^(infrastructure|dependency|human|unknown) recovery /.exec(outcome);
  if (recovery !== null) return { class: recovery[1] === "dependency" ? "blocked" : recovery[1] === "infrastructure" ? "transient" : "other", detail: outcome.slice(0, 400) };
@@ -421,6 +426,7 @@ export interface NeedsYouEntry {
 }
 
 export interface NeedsYouInputs {
+ recovery?: (repo: string, nodeId: string) => RecoveryState | null;
  maps: NeedsYouMap[];
  workers: WorkerRow[];
  /** A node's events, newest first. */
@@ -560,7 +566,7 @@ function rowEntries(
    url: nodeUrl(row.repo, row.nodeId),
    status: row.status as NeedsYouEntry["status"],
    endedAt: row.finishedAt,
-   reason: classifyReason(row, events, labels, inputs.reviewRounds),
+   reason: classifyReason(row, events, labels, inputs.reviewRounds, inputs.recovery?.(row.repo, row.nodeId)),
    pr:
     row.prNumber === null
      ? null

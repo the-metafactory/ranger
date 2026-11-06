@@ -1,3 +1,5 @@
+import { pinNodeSubstrate } from "./node-dependency.ts";
+import type { SubstrateName } from "./store/schema.ts";
 import { OperationFailure } from "./operation-outcome.ts";
 import { activeRecoveryReason, completeRecovery, nodeRecoveryScope, recordRecovery, recoveryHold, recoveryReason, reserveRecovery } from "./recovery.ts";
 import { pidAlive } from "./exec.ts";
@@ -45,17 +47,21 @@ export async function startOwnedWorker(args: {
  status?: "claimed" | "running";
  freshClaim?: boolean;
  onSpawnFailure?: (error: Error) => void;
- preflight?: () => Promise<void>;
+ preflight?: () => Promise<SubstrateName | undefined>;
  spawn: (generation: number) => Promise<number | null>;
  now?: Date;
 }): Promise<number | null> {
  const { journal, row } = args;
  const scope = nodeRecoveryScope(row.repo, row.nodeId);
- if (recoveryHold(journal, scope, args.now) !== null) return null;
+ const hold = recoveryHold(journal, scope, args.now);
+ if (hold !== null) {
+  if (args.generation !== undefined) journal.updateReservation(row.nodeId, row.repo, args.generation, { status: "parked", pid: null, outcome: hold });
+  return null;
+ }
  const generation = args.generation ?? journal.reserveWorker(row, { workerPgid: null, ...args.patch }, args.now);
  if (generation === null) return null;
  const owner = { nodeId: row.nodeId, repo: row.repo, generation };
- if (!reserveRecovery(journal, scope, args.now, owner)) {
+ if (!reserveRecovery(journal, scope, { now: args.now, owner: owner })) {
   const detail = activeRecoveryReason(journal, scope);
   journal.updateReservation(row.nodeId, row.repo, generation, { status: "parked", outcome: detail });
   return null;
@@ -64,8 +70,9 @@ export async function startOwnedWorker(args: {
  let failure = new Error("run-node spawn returned no PID");
  try {
   if (args.preflight !== undefined) {
-   await args.preflight();
-   completeRecovery(journal, scope, "model-endpoint", undefined, owner);
+   const selected = await args.preflight();
+   if (selected !== undefined && !pinNodeSubstrate(journal, owner, selected)) return null;
+   completeRecovery(journal, scope, { operation: "model-endpoint", owner: owner });
   }
   pid = await args.spawn(generation);
  } catch (error) {
@@ -76,7 +83,7 @@ export async function startOwnedWorker(args: {
   return null;
  }
  if (pid === null) {
-  const state = recordRecovery(journal, scope, failure instanceof OperationFailure ? failure.outcome : { kind: "infrastructure", operation: "worker-spawn", evidence: failure.message, action: `restore worker spawning and resume node ${row.nodeId}` }, args.now, owner);
+  const state = recordRecovery(journal, scope, failure instanceof OperationFailure ? failure.outcome : { kind: "infrastructure", operation: "worker-spawn", evidence: failure.message, action: `restore worker spawning and resume node ${row.nodeId}` }, { now: args.now, owner: owner });
   const detail = `worker start failed (${failure.message}); ${recoveryReason(state)}`;
   const resolved = journal.updateReservation(row.nodeId, row.repo, generation, {
    status: row.status === "claimed" || row.status === "running" ? "parked" : row.status,
@@ -89,6 +96,6 @@ export async function startOwnedWorker(args: {
   return null;
  }
  journal.updateReservation(row.nodeId, row.repo, generation, { pid, status: args.status ?? "claimed" });
- completeRecovery(journal, scope, "worker-spawn", undefined, owner);
+ completeRecovery(journal, scope, { operation: "worker-spawn", owner: owner });
  return pid;
 }

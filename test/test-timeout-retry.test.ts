@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { runCmd, type RunResult } from "../src/exec.ts";
 import { workerLogFile } from "../src/worker-log.ts";
 import { runNode } from "../src/worker.ts";
-import { loadSequence, restoreEnv, rig, type Rig } from "./implement-rig.ts";
+import { loadSequence, restoreEnv, rig, implementWorker, type Rig } from "./implement-rig.ts";
 
 const REPO = "acme/widgets";
 const TIMED_OUT: RunResult = { code: -1, stdout: "(pass) widgets > renders [1.00ms]\n", stderr: "", timedOut: true };
@@ -46,6 +46,19 @@ describe("a supervisor test run that hits its timeout (node #476)", () => {
   expect(outcome.status).toBe("awaiting-merge");
   expect(details(r).some((d) => d.includes("timed out after 1200 s on a quiet host — retrying once, in a fresh checkout"))).toBe(true);
   expect(details(r).some((d) => d.includes("passed on the retry in a fresh checkout"))).toBe(true);
+ }, 120_000);
+
+ test("a recovered timeout cannot waive a later no-commit fix failure", async () => {
+  const r = await rig({ blockers: [1, 0] });
+  cleanup.push(r.dir); quietHost(r);
+  const tests = scriptedTests(r, [TIMED_OUT, PASSED]);
+  let workers = 0;
+  r.ctx.worker = (prompt, opts) => runCmd(implementWorker, [workers++ === 0 ? "build" : "noop", prompt], opts);
+  const outcome = await runNode("20", r.ctx);
+  expect(tests.calls).toBeGreaterThanOrEqual(2);
+  expect(outcome.status).toBe("failed");
+  expect(outcome.detail).toContain("committed nothing");
+  expect(r.journal.deadmanCount()).toBe(1);
  }, 120_000);
 
  test("a second timeout parks with bounded infrastructure recovery and no code strike", async () => {

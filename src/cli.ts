@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import { defaultNodeSelector } from "./node-dependency.ts";
 import { failureOutcome } from "./operation-outcome.ts";
 import { nodeRecoveryScope, recordRecovery, recoveryReason } from "./recovery.ts";
 import { readPrivateJson } from "./remote-test/private-io.ts";
@@ -52,7 +53,7 @@ import { sweepMap } from "./sweep.ts";
 import { mergeGateNow } from "./merge-desk.ts";
 import { walk } from "./walk.ts";
 import { emitTickRunFinished, emitNodeRunIfGenerated, type RunLedgerDeps } from "./run-ledger.ts";
-import { spawnRunNodeDetached } from "./spawn.ts";
+import { spawningEnabled, spawnRunNodeDetached } from "./spawn.ts";
 import { holdAwake } from "./awake.ts";
 import { enqueueJob, findJob, JobError, runJob, type RunJobContext } from "./jobs.ts";
 import { BUILD_NOW_NOT_STARTED, buildNow, type BuildNowResult } from "./build-now.ts";
@@ -336,7 +337,7 @@ export async function runRunNode(
   catch (error) {
    if (reservationGeneration === undefined) throw error;
    const scoped = journal.forWorker(nodeId, map.repo, reservationGeneration);
-   const state = recordRecovery(scoped, nodeRecoveryScope(map.repo, nodeId), failureOutcome(error), now());
+   const state = recordRecovery(scoped, nodeRecoveryScope(map.repo, nodeId), failureOutcome(error), { now: now() });
    const reason = recoveryReason(state);
    scoped.updateWorker(nodeId, map.repo, { status: "parked", pid: null, workerPgid: null, outcome: reason });
    scoped.recordEvent("parked", { nodeId, repo: map.repo, detail: reason });
@@ -368,6 +369,7 @@ export async function runRunNode(
 
 async function runSweep(configPath: string): Promise<string> {
  const { config, journal } = loadCtx(configPath);
+ const nodeSelector = spawningEnabled() ? defaultNodeSelector(config, journal) : undefined;
  const results = [];
  for (const map of config.maps) {
   if (map.walk === "none") {
@@ -381,7 +383,8 @@ async function runSweep(configPath: string): Promise<string> {
   }
   try {
    const { token, botIdentity, graphToken } = await writeContext(config, map);
-   const result = await sweepMap({ config, journal, map, token, botIdentity, graphToken });
+   const result = await sweepMap({ config, journal, map, token, botIdentity, graphToken, nodeSelector,
+    respawn: (nodeId, repo, root, generation) => spawnRunNodeDetached({ nodeId, repo, root, generation, cliEntry: join(import.meta.dir, "cli.ts"), configPath }) });
    results.push({ repo: map.repo, walk: map.walk, swept: true, result });
   } catch (error) {
    results.push({
@@ -477,6 +480,7 @@ async function runMergeDeskNow(selector: string, configPath: string, settle = fa
    botIdentity,
    graphToken,
    phase: "desk",
+   nodeSelector: spawningEnabled() ? defaultNodeSelector(config, journal) : undefined,
    respawn: (nodeId, repo, root, generation) =>
     spawnRunNodeDetached({ nodeId, repo, root, generation, cliEntry: join(import.meta.dir, "cli.ts"), configPath }),
   });

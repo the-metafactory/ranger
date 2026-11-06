@@ -1,4 +1,6 @@
-import { requireReachable, type EndpointProbe } from "./endpoint.ts";
+import { nodePreflight, type NodeSelector } from "./node-dependency.ts";
+import type { EndpointLookup } from "./endpoint.ts";
+import { type EndpointProbe } from "./endpoint.ts";
 import { RECOVERY_LIMIT, nodeRecoveryScope, recordRecovery, recoveryReason, recoveryHold, recoverablePending } from "./recovery.ts";
 import { startOwnedWorker, reservationPending, FRESH_START_FAILURE } from "./node-ownership.ts";
 import { recordImplementStart } from "./maps.ts";
@@ -29,6 +31,8 @@ import { BudgetDeferral, budgetedRead, budgetPolicy } from "./budget.ts";
 
 export interface SweepContext {
  endpointProbe?: EndpointProbe;
+ endpointLookup?: EndpointLookup;
+ nodeSelector?: NodeSelector;
  now?: () => Date;
  config: RangerConfig;
  journal: Journal;
@@ -95,7 +99,7 @@ export async function sweepMap(ctx: SweepContext): Promise<SweepMapResult> {
    const holder = startsImplementSession(worker) ? journal.laneHolder(implementLane(map), { nodeId: worker.nodeId, repo }) : null;
    if (holder !== null || (startsImplementSession(worker) && ctx.reservedLanes?.has(implementLane(map)))) continue;
    const pid = await startOwnedWorker({ journal, row: worker, now: ctx.now?.(),
-    preflight: worker.phase === "close" ? undefined : () => requireReachable(map.reachable, ctx.endpointProbe),
+    preflight: worker.phase === "close" ? undefined : () => nodePreflight({ config, map, lane: worker.lane === "research" ? "research" : "implement", requiresModel: worker.worktree === null, selector: ctx.nodeSelector, probe: ctx.endpointProbe, lookup: ctx.endpointLookup }),
     spawn: generation => ctx.respawn?.(worker.nodeId, repo, worker.root, generation) ?? Promise.resolve(null) });
    if (pid !== null) {
     result.respawned.push(worker.nodeId);
@@ -125,7 +129,7 @@ export async function sweepMap(ctx: SweepContext): Promise<SweepMapResult> {
    kind: "infrastructure", operation: "worker-supervisor", target: worker.nodeId,
    evidence: [worker.pid === null ? "abandoned worker reservation without a supervisor PID" : `worker supervisor ${worker.pid} died without an outcome`, worker.outcome].filter(Boolean).join("; previous outcome: "),
    action: `inspect the worker log and restore supervision; resume-node ${worker.nodeId} --map ${repo}#${worker.root} --reset-recovery after intervention`,
-  }, ctx.now?.() ?? new Date(), undefined, Math.min(RECOVERY_LIMIT, config.workers.maxAttempts + 1));
+  }, { now: ctx.now?.() ?? new Date(), attemptLimit: Math.min(RECOVERY_LIMIT, config.workers.maxAttempts + 1) });
   const detail = recoveryReason(state);
   scoped.updateWorker(worker.nodeId, repo, { status: "parked", pid: null, workerPgid: null,
    outcome: worker.pid === null ? `${detail}\n${FRESH_START_FAILURE}abandoned reservation` : detail, finishedAt: (ctx.now?.() ?? new Date()).toISOString() });
@@ -159,7 +163,7 @@ export async function sweepMap(ctx: SweepContext): Promise<SweepMapResult> {
    botIdentity,
    github: ctx.github,
    post: ctx.post,
-   spawn: ctx.respawn,
+   spawn: ctx.respawn, nodeSelector: ctx.nodeSelector, endpointProbe: ctx.endpointProbe, endpointLookup: ctx.endpointLookup, now: ctx.now,
   });
  }
 

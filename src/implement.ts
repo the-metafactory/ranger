@@ -1412,6 +1412,7 @@ async function tryCarryReview(ctx: ImplementContext, reviews: RecordedReview[], 
 const failedOperations = new WeakMap<ImplementContext, OperationOutcome>();
 
 export async function runImplement(ctx: ImplementContext): Promise<ImplementOutcome> {
+ failedOperations.delete(ctx);
  let outcome: ImplementOutcome;
  try {
   outcome = await runImplementFlow(ctx);
@@ -2604,6 +2605,7 @@ function nothingCommitted(spec: WorkerPassSpec): string {
  * it is not recorded.
  */
 async function workerPass(ctx: ImplementContext, testCommand: string, spec: WorkerPassSpec): Promise<PassResult> {
+ failedOperations.delete(ctx);
  const nodeId = ctx.node.ref.id;
  if (ctx.substrate === undefined) {
   return checkedWorkerPass(ctx, testCommand, spec, () =>
@@ -2806,7 +2808,8 @@ async function checkPass(
 }
 
 async function checkpointAcceptedTests(ctx: ImplementContext, sha: string, command: string, passed: boolean): Promise<void> {
- completeRecovery(ctx.journal, nodeRecoveryScope(ctx.map.repo, ctx.node.ref.id), "supervisor-tests", undefined, { repo: ctx.map.repo, nodeId: ctx.node.ref.id, generation: ctx.generation });
+ failedOperations.delete(ctx);
+ completeRecovery(ctx.journal, nodeRecoveryScope(ctx.map.repo, ctx.node.ref.id), { operation: "supervisor-tests", owner: { repo: ctx.map.repo, nodeId: ctx.node.ref.id, generation: ctx.generation } });
  await checkpointNode(ctx, { sha, evidence: { sha, kind: "tests", result: passed ? "passed" : "failed",
   detail: passed ? "supervisor tests accepted on exact committed source" : "supervisor gate accepted with recorded baseline failures" } });
  await checkpointNode(ctx, { sha, evidence: { sha, kind: "tests-gate", result: "passed", detail: command } });
@@ -2861,6 +2864,7 @@ async function runShell(
  });
  const result = ctx.map.testBackend?.kind === "shadow" && opts.measureCpu ? await runShadowMeasured(command, execute) : await execute(command);
  if (result.code !== 0) failedOperations.set(ctx, processOutcome(result, "repository-command"));
+ else failedOperations.delete(ctx);
  logRun(ctx, `${opts.label} (${command})`, result, exitText(result, opts.timeoutMs));
  return result;
 }

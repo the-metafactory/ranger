@@ -9,7 +9,7 @@ import { cachedRootAuthor, needsRootAuthor, readRootAuthor } from "./root-author
 import { BudgetDeferral, budgetPolicy, budgetedRead } from "./budget.ts";
 import { readFrontier } from "./frontier-cache.ts";
 import { AUDIT_CALL_TIMEOUT_MS, GRAPH_CALL_TIMEOUT_MS, graphAudit, graphNode } from "./graph.ts";
-import { type OwnedCheck, withEscalateLock } from "./lock.ts";
+import { LeaseLostError, type OwnedCheck, withEscalateLock } from "./lock.ts";
 import type { ResolvedToken } from "./token-gate.ts";
 import type { Journal } from "./journal.ts";
 import {
@@ -61,6 +61,10 @@ const MAX_PASS_MS = 120_000;
  * with the walker announcer (src/discord.ts).
  */
 
+function emptyMapResult(map: RangerMapConfig): EscalateMapResult {
+ return { repo: map.repo, kind: "cards", ok: true, posted: [], edited: [], deferred: [], keptOpen: [], closed: [], cardErrors: [], cards: [] };
+}
+
 async function escalateOneMap(
   config: RangerConfig,
   map: RangerMapConfig,
@@ -71,18 +75,7 @@ async function escalateOneMap(
   owned: OwnedCheck,
   clock: () => number = Date.now,
 ): Promise<EscalateMapResult> {
-  const base: EscalateMapResult = {
-    repo: map.repo,
-    kind: "cards",
-    ok: true,
-    posted: [],
-    edited: [],
-    deferred: [],
-    keptOpen: [],
-    closed: [],
-    cardErrors: [],
-    cards: [],
-  };
+  const base = emptyMapResult(map);
 
   // Pre-map deadline gate: if the tick-wide pass deadline has already passed
   // (a prior map consumed it), skip this map's graph calls entirely — its
@@ -278,8 +271,7 @@ export async function escalateMaps(
     const reports = new Map<string, EscalateMapResult>();
     for (const map of mapOrder(config.maps, journal.getHealth(LAST_ESCALATE_MAP))) {
       if (clock() >= passDeadline) {
-        reports.set(mapKey(map), { repo: map.repo, kind: "cards", ok: true, posted: [], edited: [], deferred: [],
-          keptOpen: [], closed: [], cardErrors: [], cards: [], budgetDeferred: "pass deadline reached before this map" });
+        reports.set(mapKey(map), { ...emptyMapResult(map), budgetDeferred: "pass deadline reached before this map" });
         continue;
       }
       let result: EscalateMapResult;
@@ -289,10 +281,10 @@ export async function escalateMaps(
           escalateOneMap(config, map, journal, registry, now, passDeadline, owned, clock));
         if (result.budgetDeferred === undefined) journal.setHealth(LAST_ESCALATE_MAP, mapKey(map));
       } catch (error) {
-        result = { repo: map.repo, kind: "cards", ok: false, posted: [], edited: [], deferred: [],
-          keptOpen: [], closed: [], cardErrors: [], cards: [], error: error instanceof Error ? error.message : String(error) };
+        result = { ...emptyMapResult(map), ok: false, error: error instanceof Error ? error.message : String(error) };
       }
       reports.set(mapKey(map), result);
+      try { owned(); } catch (error) { if (error instanceof LeaseLostError) break; throw error; }
     }
     const maps = config.maps.flatMap(map => {
       const report = reports.get(mapKey(map));

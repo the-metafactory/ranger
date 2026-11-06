@@ -1,3 +1,5 @@
+import { isRetryableStatus } from "./transient.ts";
+import type { OperationOutcome } from "./operation-outcome.ts";
 import { OperationFailure } from "./operation-outcome.ts";
 import type { ChangeRequest, CiPurpose, CiVerdict, ForgePort, ForgeReadPort, IssueComment, MergeOutcome, MergeState, RebaseOutcome } from "./forge.ts";
 import type { RangerConfig } from "./config.ts";
@@ -7,11 +9,15 @@ import { parseGlabResponse } from "./glab-transport.ts";
 import { assertReadOnlyToken, GateError, gitlabApiRead, tokenBatch, type ResolvedToken } from "./token-gate.ts";
 import { assertWriteIdentity, gitlabApiWrite, resolveWriteToken, WriteGateError } from "./identity.ts";
 
+function gitlabOutcome(endpoint: string, message: string, status?: number): OperationOutcome {
+ return { kind: status !== undefined && isRetryableStatus(status) ? "infrastructure" : "unknown", operation: `glab:${endpoint}`, evidence: `${endpoint}: ${message}${status === undefined ? "" : ` HTTP ${status}`}`, action: "restore forge access and retry" };
+}
+
 /** Transport and schema failures never become a passing gate value. */
 export class GitLabReadError extends OperationFailure {
  override readonly name = "GitLabReadError";
  constructor(message: string, readonly endpoint: string, readonly status?: number) {
-  super({ kind: status !== undefined && [429, 500, 502, 503, 504].includes(status) ? "infrastructure" : "unknown", operation: `glab:${endpoint}`, evidence: `${endpoint}: ${message}${status === undefined ? "" : ` HTTP ${status}`}`, action: "restore forge access and retry" });
+  super(gitlabOutcome(endpoint, message, status));
  }
 }
 
@@ -347,7 +353,7 @@ export function gitlabLoginCiVerdict(repo: string, sha: string, env: Record<stri
 export class GitLabWriteError extends OperationFailure {
  override readonly name = "GitLabWriteError";
  constructor(message: string, readonly endpoint: string, readonly status?: number) {
-  super({ kind: status !== undefined && [429, 500, 502, 503, 504].includes(status) ? "infrastructure" : "unknown", operation: `glab:${endpoint}`, evidence: `${endpoint}: ${message}${status === undefined ? "" : ` HTTP ${status}`}`, action: "restore forge access and retry" });
+  super(gitlabOutcome(endpoint, message, status));
  }
 }
 

@@ -1,6 +1,7 @@
+import { selectNodeSubstrate, pinnedNodeSubstrate } from "./node-dependency.ts";
 import { OperationFailure, processOutcome, workerOutcome, failureOutcome, type OperationOutcome } from "./operation-outcome.ts";
 import { activeRecovery, activeRecoveryReason, completeRecovery, nodeRecoveryScope, recordRecovery, recoveryHold, recoveryReason, reserveRecovery } from "./recovery.ts";
-import { requireEndpoint, type EndpointProbe, type EndpointLookup } from "./endpoint.ts";
+import { requireReachable, requireEndpoint, type EndpointProbe, type EndpointLookup } from "./endpoint.ts";
 import { acquireGeneration } from "./node-ownership.ts";
 import { checkpointNode, confirmPreservedProgress, nodeCheckpoint, preserveNodeProgress, progressRemote, reconcileNodeProgress, ProgressConflict } from "./node-progress.ts";
 import type { RunOutcome } from "@the-metafactory/myelin";
@@ -53,7 +54,6 @@ import {
  hookStopReason,
  markSubstrateCapped,
  describeWorkerModel,
- selectSubstrate,
  workerCommandFor,
  workerModelFor,
  type CapSignal,
@@ -61,7 +61,6 @@ import {
  type SubstrateName,
  type SubstrateReaders,
 } from "./substrate.ts";
-import { selectForBuild } from "./substrate-policy.ts";
 import { resolveReadOnlyToken, type ResolvedToken } from "./token-gate.ts";
 import { workerEnv } from "./worker-env.ts";
 import { assertNotPrincipal, type CommitAuthor } from "./identity.ts";
@@ -338,6 +337,10 @@ export async function bootstrapWorktree(
 }
 
 
+function workerSource(ctx: RunNodeContext): "model" | "command" {
+ return ctx.worker !== undefined || ctx.workerCommand !== undefined || process.env.RANGER_WORKER_CMD ? "command" : "model";
+}
+
 function defaultWorkerCommand(): string[] {
  const envCmd = process.env.RANGER_WORKER_CMD;
  if (envCmd !== undefined && envCmd.length > 0) return [envCmd];
@@ -398,12 +401,7 @@ async function selectBuildSubstrate(
  if (ctx.substrate !== undefined && excluded.size === 0) {
   return { substrate: ctx.substrate, chosenOn: "fixed by the caller" };
  }
- return selectSubstrate(ctx.journal, {
-  config: ctx.config.substrates,
-  excluded,
-  readers: resolveReaders(ctx),
-  pick: selectForBuild,
- });
+ return selectNodeSubstrate(ctx.journal, ctx.config, excluded, resolveReaders(ctx));
 }
 
 /**
@@ -480,7 +478,7 @@ function failNode(
  if (outcome.kind !== "code") {
   const generation = journal.getWorker(nodeId, repo)?.generation;
   if (generation === undefined) throw new Error("recovery needs an owner");
-  const state = recordRecovery(journal, nodeRecoveryScope(repo, nodeId), { ...outcome, evidence: detail }, now, { nodeId, repo, generation });
+  const state = recordRecovery(journal, nodeRecoveryScope(repo, nodeId), { ...outcome, evidence: detail }, { now: now, owner: { nodeId, repo, generation } });
   const reason = recoveryReason(state);
   journal.recordEvent(outcome.kind === "infrastructure" || outcome.kind === "dependency" ? "transient" : "parked", { nodeId, repo, detail: reason });
   finish(journal, nodeId, repo, "parked", reason);
@@ -565,7 +563,7 @@ export async function runNode(
   finish(journal, nodeId, repo, "parked", held);
   return { ...base, status: "parked", detail: held };
  }
- if (ctx.generation === undefined && !reserveRecovery(journal, recoveryScope, ctx.now?.() ?? new Date(), { nodeId, repo, generation })) {
+ if (ctx.generation === undefined && !reserveRecovery(journal, recoveryScope, { now: ctx.now?.() ?? new Date(), owner: { nodeId, repo, generation } })) {
   const detail = activeRecoveryReason(journal, recoveryScope);
   finish(journal, nodeId, repo, "parked", detail);
   return { ...base, status: "parked", detail };
@@ -585,7 +583,7 @@ export async function runNode(
     timeoutMs: GRAPH_CALL_TIMEOUT_MS,
    },
   );
-  completeRecovery(journal, recoveryScope, "graph:node", nodeId);
+  completeRecovery(journal, recoveryScope, { operation: "graph:node", target: nodeId });
   observedNode = node;
   // Reuse this one root read for the prompt and ledger, including a node
   // completed elsewhere. A root failure must not change that reconciliation.
@@ -599,7 +597,7 @@ export async function runNode(
    },
   ).catch(error => { rootReadError = error; return undefined; });
   if (rootNode !== undefined) {
-   completeRecovery(journal, recoveryScope, "graph:node", String(map.root));
+   completeRecovery(journal, recoveryScope, { operation: "graph:node", target: String(map.root) });
    ctx.onMapRootRead?.(rootNode);
   }
   if (node.status === "closed") {
@@ -705,7 +703,8 @@ async function runSession(
 ): Promise<ImplementOutcome> {
  const { journal } = session;
  const envCmd = envWorkerOverride(ctx);
- const { substrate, chosenOn } =
+ const pinned = workerSource(ctx) === "model" && capped.size === 0 ? pinnedNodeSubstrate(journal, session.map.repo, nodeId, session.generation) : undefined;
+ const { substrate, chosenOn } = pinned !== undefined ? { substrate: pinned, chosenOn: "pinned by owned dispatch preflight" } :
   envCmd === undefined
    ? await selectBuildSubstrate(ctx, capped)
    : { substrate: undefined, chosenOn: "RANGER_WORKER_CMD override; its heads count as Pi-written" };
@@ -724,11 +723,12 @@ async function runSession(
  });
  return runImplement({
   ...session,
-  workerSource: envCmd !== undefined || ctx.workerCommand !== undefined || ctx.worker !== undefined ? "command" : "model",
+  workerSource: workerSource(ctx),
   workerRun: async (p: string, opts: RunOptions) => {
-   if (ctx.map.reachable !== undefined || (envCmd === undefined && ctx.workerCommand === undefined && ctx.worker === undefined && substrate !== undefined)) {
-    await requireEndpoint(ctx.config, substrate ?? "claude", ctx.map.reachable, ctx.endpointProbe, ctx.endpointLookup);
-    completeRecovery(journal, nodeRecoveryScope(ctx.map.repo, nodeId), "model-endpoint", undefined, { nodeId, repo: ctx.map.repo, generation: session.generation });
+   if (ctx.map.reachable !== undefined || (workerSource(ctx) === "model" && substrate !== undefined)) {
+    await requireReachable(ctx.map.reachable, ctx.endpointProbe);
+    if (workerSource(ctx) === "model") await requireEndpoint(ctx.config, substrate ?? "claude", undefined, ctx.endpointProbe, ctx.endpointLookup);
+    completeRecovery(journal, nodeRecoveryScope(ctx.map.repo, nodeId), { operation: "model-endpoint", owner: { nodeId, repo: ctx.map.repo, generation: session.generation } });
    }
    return ctx.worker === undefined ? runCmd(workerCmd[0], [...workerCmd.slice(1), p], opts) : ctx.worker(p, opts);
   },
@@ -856,8 +856,8 @@ async function runImplementNode(
  }
  return {
   ...base,
-  status: outcome.failureOutcome !== undefined && outcome.failureOutcome.kind !== "code" ? "parked" : outcome.status,
-  detail: outcome.failureOutcome !== undefined && outcome.failureOutcome.kind !== "code" ? journal.getWorker(nodeId, repo)?.outcome ?? outcome.detail : outcome.detail,
+  status: outcome.substrateCapped === undefined && outcome.failureOutcome !== undefined && outcome.failureOutcome.kind !== "code" ? "parked" : outcome.status,
+  detail: outcome.substrateCapped === undefined && outcome.failureOutcome !== undefined && outcome.failureOutcome.kind !== "code" ? journal.getWorker(nodeId, repo)?.outcome ?? outcome.detail : outcome.detail,
   workerExit: outcome.workerExit,
   close: outcome.close,
   prNumber: outcome.prNumber,
@@ -1130,7 +1130,8 @@ async function runResearch(
 
   // The run-node start check vetted this state against the known-good one.
   const snapshot = start.state.hash;
-  if (map.reachable !== undefined || (ctx.worker === undefined && ctx.workerCommand === undefined && !process.env.RANGER_WORKER_CMD)) await requireEndpoint(config, "claude", map.reachable, ctx.endpointProbe, ctx.endpointLookup);
+  await requireReachable(map.reachable, ctx.endpointProbe);
+  if (workerSource(ctx) === "model") await requireEndpoint(config, "claude", undefined, ctx.endpointProbe, ctx.endpointLookup);
   fence("spawn the worker");
   const workerResult = await workerRun(prompt, {
    cwd: worktree,
@@ -1152,7 +1153,7 @@ async function runResearch(
    const head = await resolveBranchSha(canonical, branch);
    if (head !== null && head !== baseSha) await checkpointNode(progress, { sha: head,
     evidence: { sha: head, kind: "research-worker", result: "failed", detail: `research worker exited ${workerResult.code}` } });
-   return failResearch(detail, workerResult.code, undefined, workerOutcome(workerResult, "research-worker", ctx.worker !== undefined || ctx.workerCommand !== undefined || process.env.RANGER_WORKER_CMD ? "command" : "model"));
+   return failResearch(detail, workerResult.code, undefined, workerOutcome(workerResult, "research-worker", workerSource(ctx)));
   }
 
   // Research SOP tail: findings must exist on the worktree.

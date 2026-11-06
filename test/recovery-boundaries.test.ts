@@ -1,3 +1,6 @@
+import { defaultNodeSelector } from "../src/node-dependency.ts";
+import { eligibleCodexReading } from "./fixtures/substrate-readings.ts";
+import { nodePreflight, pinNodeSubstrate } from "../src/node-dependency.ts";
 import { afterEach, expect, test } from "bun:test";
 import { rmSync, renameSync } from "node:fs";
 import { rig, restoreEnv, loadSequence, type Rig } from "./implement-rig.ts";
@@ -126,4 +129,53 @@ test("all HTTP replies establish reachability without following redirects", asyn
   for (const status of [200, 301, 302, 401, 500]) expect(await probeEndpoint(new URL(String(status), source.url).toString())).toBe(true);
   expect(redirects).toBe(0);
  } finally { source.stop(true); target.stop(true); }
+});
+
+test("map dependency and selected model endpoint are both probed", async () => {
+ const r = await fixture();
+ r.ctx.map.reachable = "https://map.invalid/health";
+ const probes: string[] = [];
+ await expect(nodePreflight({ config: r.ctx.config, map: r.ctx.map, lane: "implement", requiresModel: true,
+  selector: async () => "pi", lookup: () => "https://model.invalid/models",
+  probe: async url => { probes.push(url); return url.includes("map.invalid"); },
+ })).rejects.toThrow("model endpoint unreachable");
+ expect(probes).toEqual(["https://map.invalid/health", "https://model.invalid/models"]);
+});
+
+test("a native child honors its generation-bound dispatch selection and rechecks the endpoint", async () => {
+ const r = await fixture();
+ delete r.ctx.workerCommand; delete r.ctx.worker;
+ const generation = r.journal.reserveWorker(r.journal.getWorker("20", "acme/widgets")!)!;
+ pinNodeSubstrate(r.journal, { nodeId: "20", repo: "acme/widgets", generation }, "pi");
+ r.ctx.config.substrates.pi.reachable = "https://selected.invalid/models";
+ const probes: string[] = [];
+ r.ctx.endpointProbe = async url => { probes.push(url); return false; };
+ const outcome = await runNode("20", { ...r.ctx, generation });
+ expect(outcome.status).toBe("parked");
+ expect(probes).toEqual(["https://selected.invalid/models"]);
+ expect(outcome.detail).toContain("model endpoint unreachable for pi");
+ expect(r.journal.deadmanCount()).toBe(0);
+});
+
+test("quota selection is refreshed once per dispatch pass and cached for independent maps", async () => {
+ const r = await fixture();
+ let reads = 0;
+ const select = defaultNodeSelector(r.ctx.config, r.journal, {
+  codex: async () => { reads++; return eligibleCodexReading(); },
+  claude: async () => { reads++; throw new Error("quota unavailable"); },
+ });
+ expect(await select(r.ctx.map, "implement")).toBe("codex");
+ expect(await select({ ...r.ctx.map, root: 460 }, "implement")).toBe("codex");
+ expect(reads).toBe(2);
+ expect(await select(r.ctx.map, "research")).toBe("claude");
+ expect(reads).toBe(2);
+});
+
+test("dashboard classifies persisted dependency holds independently of start-failure prose", async () => {
+ const r = await fixture();
+ const state = recordRecovery(r.journal, scope, { kind: "dependency", operation: "model-endpoint", evidence: "x".repeat(2000), action: "restore selected provider" });
+ const reason = classifyReason({ status: "parked", reviewRound: 0, outcome: "worker start failed: opaque prefix" }, [], null, 3, state);
+ expect(reason.class).toBe("blocked");
+ expect(reason.detail).toContain("next retry");
+ expect(reason.detail).toContain("restore selected provider");
 });

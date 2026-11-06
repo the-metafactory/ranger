@@ -59,3 +59,13 @@ export async function requireReachable(endpoint: string | undefined, probe: Endp
  if (endpoint === undefined || await probe(endpoint)) return;
  endpointUnavailable(endpoint, "declared worker dependency");
 }
+
+export async function firstReachableSubstrate(config: RangerConfig, candidates: readonly SubstrateName[], explicit: string | undefined,
+ probe: EndpointProbe = probeEndpoint, lookup: EndpointLookup = modelEndpoint): Promise<SubstrateName> {
+ let last: unknown = new OperationFailure({ kind: "unknown", operation: "model-endpoint", evidence: "no eligible endpoint", action: "configure an eligible endpoint" });
+ for (const substrate of candidates) {
+  try { await requireEndpoint(config, substrate, explicit, probe, lookup); return substrate; }
+  catch (error) { last = error; }
+ }
+ throw last;
+}

@@ -1,4 +1,7 @@
-import { requireReachable, cachedProbe, type EndpointProbe } from "./endpoint.ts";
+import { defaultNodeSelector, nodePreflight, type NodeSelector } from "./node-dependency.ts";
+import type { EndpointLookup } from "./endpoint.ts";
+import { spawningEnabled } from "./spawn.ts";
+import { cachedProbe, type EndpointProbe } from "./endpoint.ts";
 import { startOwnedWorker, FRESH_START_FAILURE, startFailureOutcome } from "./node-ownership.ts";
 import { implementLane, type ImplementLane } from "./lanes.ts";
 import { processResumeQueue } from "./resume.ts";
@@ -72,6 +75,8 @@ export interface WalkContext {
  configPath: string;
  journal: Journal;
  endpointProbe?: EndpointProbe;
+ endpointLookup?: EndpointLookup;
+ nodeSelector?: NodeSelector;
  spawnRunNode?: (args: SpawnRunNodeArgs) => Promise<number | null>;
  announce?: AnnounceFn;
  claim?: ClaimFn;
@@ -103,6 +108,7 @@ export type ClaimFn = (
 ) => Promise<ClaimResult>;
 
 export interface ClaimNodeArgs {
+ config?: RangerConfig;
  journal: Journal;
  map: RangerMapConfig;
  node: { id: string; title: string };
@@ -115,6 +121,8 @@ export interface ClaimNodeArgs {
  announce?: AnnounceFn;
  claim?: ClaimFn;
  endpointProbe?: EndpointProbe;
+ endpointLookup?: EndpointLookup;
+ nodeSelector?: NodeSelector;
  spawnRunNode?: (args: SpawnRunNodeArgs) => Promise<number | null>;
  now?: () => Date;
  owned?: OwnedCheck;
@@ -202,7 +210,7 @@ export async function claimNode(args: ClaimNodeArgs): Promise<ClaimNodeOutcome> 
  journal.assertGeneration(node.id, map.repo, reservation.generation, "spawn claimed worker");
 
  const pid = await startOwnedWorker({ journal, row: reservation.row, generation: reservation.generation, now: now(), freshClaim: true,
-  preflight: () => requireReachable(map.reachable, args.endpointProbe),
+  preflight: () => nodePreflight({ config: args.config, map, lane: args.lane, requiresModel: true, selector: args.nodeSelector, probe: args.endpointProbe, lookup: args.endpointLookup }),
   spawn: generation => (args.spawnRunNode ?? spawnRunNodeDetached)({
   generation,
   nodeId: node.id,
@@ -268,7 +276,7 @@ function recordFreshClaim(args: ClaimNodeArgs, messageId: string | null, at: Dat
  * Stateless over the graph: everything topological is re-derived per pass.
  */
 export async function walk(ctx: WalkContext): Promise<WalkResult> {
- ctx = { ...ctx, endpointProbe: cachedProbe(ctx.endpointProbe) };
+ ctx = { ...ctx, endpointProbe: cachedProbe(ctx.endpointProbe), nodeSelector: ctx.nodeSelector ?? (ctx.spawnRunNode === undefined && spawningEnabled() ? defaultNodeSelector(ctx.config, ctx.journal) : undefined) };
  const { config, journal } = ctx;
  const registry = loadProbeRegistry();
  const result: WalkResult = {
@@ -327,7 +335,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
    github: portFor(w.map.repo),
    phase,
    now: ctx.now,
-   endpointProbe: ctx.endpointProbe,
+   endpointProbe: ctx.endpointProbe, endpointLookup: ctx.endpointLookup, nodeSelector: ctx.nodeSelector,
    reservedLanes: priorityLanes,
    respawn: spawnNode,
   });
@@ -407,7 +415,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
 
  try {
   result.probeRequeues = await withClaimLock(journal, (owned) => requeueProbes({
-   journal, maps: retryMaps, now: ctx.now, limit: config.workers.probeRequeues, owned,
+   config, journal, maps: retryMaps, nodeSelector: ctx.nodeSelector, endpointProbe: ctx.endpointProbe, endpointLookup: ctx.endpointLookup, now: ctx.now, limit: config.workers.probeRequeues, owned,
    spawn: spawnNode,
   }));
   priorityLanes.clear();
@@ -459,7 +467,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
  if (jobsPending(journal)) {
   try {
    result.jobs = await withClaimLock(journal, () => jobPass({
-    config, configPath: ctx.configPath, journal, cliEntry, endpointProbe: ctx.endpointProbe, takenLanes: lanesTakenThisTick,
+    config, configPath: ctx.configPath, journal, cliEntry, endpointProbe: ctx.endpointProbe, endpointLookup: ctx.endpointLookup, takenLanes: lanesTakenThisTick,
     ...(ctx.spawnJob === undefined ? {} : { spawnJob: ctx.spawnJob }),
     ...(ctx.now === undefined ? {} : { now: ctx.now }),
    }));
@@ -569,7 +577,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
       let outcome: ClaimNodeOutcome;
       try {
        outcome = await claimNode({
-        journal,
+        config, journal,
         map,
         node,
         lane: laneOf(node.id),
@@ -580,7 +588,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
         announce: ctx.announce,
         claim: ctx.claim,
         spawnRunNode: ctx.spawnRunNode,
-        endpointProbe: ctx.endpointProbe,
+        endpointProbe: ctx.endpointProbe, endpointLookup: ctx.endpointLookup, nodeSelector: ctx.nodeSelector,
         now: ctx.now,
         owned,
        });

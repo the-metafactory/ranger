@@ -1,6 +1,6 @@
 import { failureOutcome, workerOutcome, type OperationOutcome } from "./operation-outcome.ts";
 import { activeRecoveryReason, completeRecovery, jobRecoveryScope, recordRecovery, recoveryHold, recoveryReason, reserveRecovery } from "./recovery.ts";
-import { cachedProbe, requireEndpoint, type EndpointProbe, type EndpointLookup } from "./endpoint.ts";
+import { cachedProbe, firstReachableSubstrate, type EndpointProbe, type EndpointLookup } from "./endpoint.ts";
 /**
  * Scheduled jobs (node #301): a Reflex fire enqueues a named job
  * (`ranger job enqueue <name>`, through a cortex process spec); the next tick
@@ -87,6 +87,10 @@ export function jobRunArgv(args: SpawnJobArgs): string[] {
   "--config",
   args.configPath,
  ];
+}
+
+function jobModelEndpoint(job: RangerJobConfig, policy?: string): string | undefined {
+ return job.reachable ?? (policy === "local" ? job.studio?.localEndpoint : undefined);
 }
 
 /** Launch a detached `ranger job run <id>` that outlives the tick. Null when nothing spawned. */
@@ -235,36 +239,31 @@ export async function jobPass(ctx: JobPassContext): Promise<JobPassResult> {
    continue;
   }
   let permitted = job.substrates;
-  let declaredEndpoint = job.reachable;
+  let declaredEndpoint = jobModelEndpoint(job);
   if (run.name === "ivy-think") {
    const prepared = await prepareStudio(job, run.params, studioPolicies);
    if (prepared.kind === "deferred") { wait(prepared.reason); continue; }
    const limit = job.studio ? studioLimit(prepared, job.studio, journal.listJobRuns(), now, run.id) : "Studio job is not configured";
    if (limit) { wait(limit); continue; }
    permitted = await studioSubstrates(job, config, prepared.policy);
-   if (prepared.policy === "local") declaredEndpoint ??= job.studio?.localEndpoint;
+   declaredEndpoint = jobModelEndpoint(job, prepared.policy);
    if (permitted.length === 0) { wait(`No permitted ${prepared.policy} substrate is available`); continue; }
    journal.updateJobRun(run.id, "queued", { policy: prepared.policy, reason: null });
   }
   const scope = jobRecoveryScope(run.id);
   const held = recoveryHold(journal, scope, now);
   if (held !== null) { wait(held); continue; }
-  if (!reserveRecovery(journal, scope, now, { jobRunId: run.id, status: "queued", pid: run.pid })) { wait(activeRecoveryReason(journal, scope)); continue; }
-  let unavailable: OperationOutcome | null = null;
-  let reachable = false;
-  for (const substrate of permitted) {
-   try { await requireEndpoint(config, substrate, declaredEndpoint, probe, ctx.endpointLookup); reachable = true; break; }
-   catch (error) { unavailable = failureOutcome(error); }
-  }
-  if (!reachable && unavailable !== null) {
-   const state = recordRecovery(journal, scope, unavailable, now, { jobRunId: run.id, status: "queued", pid: run.pid });
+  if (!reserveRecovery(journal, scope, { now: now, owner: { jobRunId: run.id, status: "queued", pid: run.pid } })) { wait(activeRecoveryReason(journal, scope)); continue; }
+  try { await firstReachableSubstrate(config, permitted, declaredEndpoint, probe, ctx.endpointLookup); }
+  catch (error) {
+   const state = recordRecovery(journal, scope, failureOutcome(error), { now: now, owner: { jobRunId: run.id, status: "queued", pid: run.pid } });
    const reason = recoveryReason(state);
    if (state.status === "exhausted") {
     if (await failRun(ctx, run, reason, now)) result.failed.push({ runId: run.id, name: run.name, reason });
    } else wait(reason);
    continue;
   }
-  completeRecovery(journal, scope, "model-endpoint", undefined, { jobRunId: run.id, status: "queued", pid: run.pid });
+  completeRecovery(journal, scope, { operation: "model-endpoint", owner: { jobRunId: run.id, status: "queued", pid: run.pid } });
   // Reserve the lane before spawning: the child must find a running row,
   // and every other scheduler must see the lane occupied.
   if (!journal.updateJobRun(run.id, "queued", { status: "running", startedAt: now.toISOString() })) continue;
@@ -285,7 +284,7 @@ export async function jobPass(ctx: JobPassContext): Promise<JobPassResult> {
    if (running.status !== "running" || (running.pid !== null && running.pid !== pid)) return null;
    if (pid === null) return running;
    if (running.pid === null && !journal.updateJobRun(run.id, "running", { pid }, null)) return null;
-   completeRecovery(journal, scope, "job-spawn", undefined, { jobRunId: run.id, status: "running", pid });
+   completeRecovery(journal, scope, { operation: "job-spawn", owner: { jobRunId: run.id, status: "running", pid } });
    return requiredJob(journal, run.id);
   });
   if (accepted === null) continue;
@@ -304,7 +303,7 @@ async function recoverJob(ctx: Pick<JobPassContext, "config" | "journal" | "ledg
  outcome: OperationOutcome, now: Date, result?: JobPassResult): Promise<void> {
  const state = ctx.journal.recoveryTransaction({ jobRunId: run.id, status: run.status, pid: run.pid }, () => {
   if (!ctx.journal.updateJobRun(run.id, run.status, { status: "queued", pid: null, pgid: null, startedAt: null }, run.pid)) return null;
-  return recordRecovery(ctx.journal, jobRecoveryScope(run.id), outcome, now);
+  return recordRecovery(ctx.journal, jobRecoveryScope(run.id), outcome, { now: now });
  });
  if (state === null) return;
  const reason = recoveryReason(state);
@@ -429,21 +428,14 @@ export async function runJob(runId: number, ctx: RunJobContext): Promise<RunJobO
   }
  }
  const probe = cachedProbe(ctx.endpointProbe);
- let unavailable: OperationOutcome | undefined;
- let ready = false;
- for (const candidate of ctx.substrate === undefined ? [substrate, ...permitted.filter(candidate => candidate !== substrate)] : [substrate]) {
-  try {
-   await requireEndpoint(config, candidate, job.reachable ?? (studio?.policy === "local" ? job.studio?.localEndpoint : undefined), probe, ctx.endpointLookup);
-   substrate = candidate;
-   ready = true;
-   break;
-  } catch (error) { unavailable = failureOutcome(error); }
+ try {
+  substrate = await firstReachableSubstrate(config, ctx.substrate === undefined ? [substrate, ...permitted.filter(candidate => candidate !== substrate)] : [substrate],
+   jobModelEndpoint(job, studio?.policy), probe, ctx.endpointLookup);
+ } catch (error) {
+  await recoverJob(ctx, { ...requiredJob(journal, runId), pid: process.pid }, failureOutcome(error), now());
+  return { runId, name: job.name, status: "deferred", reason: activeRecoveryReason(journal, jobRecoveryScope(runId)) };
  }
- if (!ready) {
-  await recoverJob(ctx, { ...requiredJob(journal, runId), pid: process.pid }, unavailable ?? { kind: "unknown", operation: "job-endpoint", evidence: "no eligible endpoint", action: "configure an eligible endpoint" }, now());
-  return { runId, name: run.name, status: journal.getJobRun(runId)?.status === "failed" ? "failed" : "deferred", reason: activeRecoveryReason(journal, jobRecoveryScope(runId)) };
- }
- completeRecovery(journal, jobRecoveryScope(runId), "model-endpoint", undefined, { jobRunId: runId, status: "running", pid: process.pid });
+ completeRecovery(journal, jobRecoveryScope(runId), { operation: "model-endpoint", owner: { jobRunId: runId, status: "running", pid: process.pid } });
  journal.updateJobRun(runId, "running", { substrate, ...(studio?.kind === "ready" ? { policy: studio.policy } : {}) });
 
  const scratch = mkdtempSync(join(tmpdir(), "ranger-job-"));
@@ -483,7 +475,7 @@ export async function runJob(runId: number, ctx: RunJobContext): Promise<RunJobO
   await recoverJob(ctx, { ...requiredJob(journal, runId), pid: process.pid }, operation, now());
   return { runId, name: run.name, status: journal.getJobRun(runId)?.status === "failed" ? "failed" : "deferred", reason: activeRecoveryReason(journal, jobRecoveryScope(runId)), substrate, result, log };
  }
- if (operation.kind === "success") completeRecovery(journal, jobRecoveryScope(runId), undefined, undefined, { jobRunId: runId, status: "running", pid: process.pid });
+ if (operation.kind === "success") completeRecovery(journal, jobRecoveryScope(runId), { owner: { jobRunId: runId, status: "running", pid: process.pid } });
  const reason = read.timedOut ? "budget"
   : read.code !== 0 ? `exit ${read.code}`
   : job.requireResult && result === null ? "no result"

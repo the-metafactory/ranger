@@ -30,48 +30,48 @@ const restart = () => { journal.close(); journal = new Journal(join(dir, "journa
 const advance = () => { now = new Date(activeRecovery(journal, scope)!.nextEligibleAt!); };
 
 test("backoff and consumed reservation survive restarts and eventually exhaust", () => {
- recordRecovery(journal, scope, failure(), now);
- expect(reserveRecovery(journal, scope, now)).toBe(false);
+ recordRecovery(journal, scope, failure(), { now: now });
+ expect(reserveRecovery(journal, scope, { now: now })).toBe(false);
  expect(recoveryHold(journal, scope, now)).toContain("next retry");
  restart(); advance();
- expect(reserveRecovery(journal, scope, now)).toBe(true);
+ expect(reserveRecovery(journal, scope, { now: now })).toBe(true);
  expect(activeRecovery(journal, scope)?.attempts).toBe(2);
  restart(); advance();
- expect(reserveRecovery(journal, scope, now)).toBe(true);
+ expect(reserveRecovery(journal, scope, { now: now })).toBe(true);
  expect(activeRecovery(journal, scope)?.attempts).toBe(3);
  restart(); advance();
- expect(reserveRecovery(journal, scope, now)).toBe(false);
+ expect(reserveRecovery(journal, scope, { now: now })).toBe(false);
  expect(recoveryHold(journal, scope, now)).toContain("exhausted");
  expect(journal.deadmanCount()).toBe(0);
 });
 
 test("operation changes cannot replenish a retry episode", () => {
- recordRecovery(journal, scope, failure(), now);
- advance(); expect(reserveRecovery(journal, scope, now)).toBe(true);
- recordRecovery(journal, scope, failure("model-endpoint", "dependency"), now);
- completeRecovery(journal, scope, "model-endpoint");
+ recordRecovery(journal, scope, failure(), { now: now });
+ advance(); expect(reserveRecovery(journal, scope, { now: now })).toBe(true);
+ recordRecovery(journal, scope, failure("model-endpoint", "dependency"), { now: now });
+ completeRecovery(journal, scope, { operation: "model-endpoint" });
  expect(activeRecovery(journal, scope)?.attempts).toBe(2);
  expect(activeRecovery(journal, scope)?.operation).toBe("supervisor-tests");
- restart(); advance(); expect(reserveRecovery(journal, scope, now)).toBe(true);
- recordRecovery(journal, scope, failure(), now);
+ restart(); advance(); expect(reserveRecovery(journal, scope, { now: now })).toBe(true);
+ recordRecovery(journal, scope, failure(), { now: now });
  expect(activeRecovery(journal, scope)).toMatchObject({ attempts: 3, status: "exhausted" });
 });
 
 test("only a successful operation clears its obligation; a new episode starts at one", () => {
- recordRecovery(journal, scope, failure(), now);
- completeRecovery(journal, scope, "unrelated");
+ recordRecovery(journal, scope, failure(), { now: now });
+ completeRecovery(journal, scope, { operation: "unrelated" });
  expect(activeRecovery(journal, scope)?.status).toBe("waiting");
- completeRecovery(journal, scope, "supervisor-tests");
+ completeRecovery(journal, scope, { operation: "supervisor-tests" });
  expect(activeRecovery(journal, scope)?.status).toBe("complete");
- recordRecovery(journal, scope, failure(), now);
+ recordRecovery(journal, scope, failure(), { now: now });
  expect(activeRecovery(journal, scope)?.attempts).toBe(1);
 });
 
 test("old scoped workers cannot change a newer owner's recovery", () => {
  const old = journal.forWorker("20", "acme/widgets", 0);
- recordRecovery(journal, scope, failure(), now);
+ recordRecovery(journal, scope, failure(), { now: now });
  journal.beginGeneration("20", "acme/widgets");
- expect(() => recordRecovery(old, scope, failure(), now)).toThrow(FencedError);
+ expect(() => recordRecovery(old, scope, failure(), { now: now })).toThrow(FencedError);
  expect(() => completeRecovery(old, scope)).toThrow(FencedError);
  expect(activeRecovery(journal, scope)?.status).toBe("waiting");
 });
@@ -81,8 +81,8 @@ test("unknown and malformed outcomes never become passing results", () => {
  expect(failureOutcome(new OperationFailure({})).kind).toBe("unknown");
  expect(forgeOutcome({ code: -1, stdout: "", stderr: "" }, "read").kind).toBe("unknown");
  expect(processOutcome({ code: 1 }, "tests").kind).toBe("code");
- recordRecovery(journal, scope, { ...failure(), kind: "unknown" }, now);
- expect(reserveRecovery(journal, scope, new Date("2030-01-01"))).toBe(false);
+ recordRecovery(journal, scope, { ...failure(), kind: "unknown" }, { now: now });
+ expect(reserveRecovery(journal, scope, { now: new Date("2030-01-01") })).toBe(false);
 });
 
 test("null worker spawns are bounded infrastructure recovery without code strikes", async () => {
@@ -136,7 +136,7 @@ test("endpoint outages hold only affected queued jobs and recheck before spendin
 });
 
 test("completed recovery never automatically restarts a later human park", async () => {
- recordRecovery(journal, scope, failure(), now);
+ recordRecovery(journal, scope, failure(), { now: now });
  completeRecovery(journal, scope);
  const cfg = config();
  let spawns = 0;

@@ -1,4 +1,4 @@
-import { activeRecovery, nodeRecoveryScope } from "../src/recovery.ts";
+import { activeRecovery, recordRecovery, nodeRecoveryScope } from "../src/recovery.ts";
 import * as exec from "../src/exec.ts";
 import { claimNode } from "../src/walk.ts";
 import { afterEach, beforeEach, expect, test, spyOn } from "bun:test";
@@ -275,4 +275,25 @@ test.each([1, 2])("dead supervisors exhaust configured respawns=%s durably witho
  expect(activeRecovery(a, nodeRecoveryScope(repo, "10"))).toMatchObject({ status: "exhausted", attempts: limit, limit });
  expect(row()?.outcome).toContain("--reset-recovery after intervention");
  expect(a.deadmanCount()).toBe(0);
+});
+
+test("a held caller-supplied reservation parks immediately without spawning or spending another attempt", async () => {
+ const generation = a.reserveWorker(row())!;
+ recordRecovery(a, nodeRecoveryScope(repo, "10"), { kind: "dependency", operation: "endpoint", evidence: "offline", action: "restore" });
+ let spawns = 0;
+ expect(await startOwnedWorker({ journal: a, row: row(), generation, spawn: async () => { spawns++; return process.pid; } })).toBeNull();
+ expect(row()).toMatchObject({ status: "parked", pid: null, generation });
+ expect(activeRecovery(a, nodeRecoveryScope(repo, "10"))?.attempts).toBe(1);
+ expect(spawns).toBe(0);
+});
+
+test("a completed reservation cannot be revived by a late model selection", async () => {
+ let spawns = 0;
+ const result = await startOwnedWorker({ journal: a, row: row(),
+  preflight: async () => { a.updateWorker("10", repo, { status: "success", pid: null }); return "pi"; },
+  spawn: async () => { spawns++; return process.pid; },
+ });
+ expect(result).toBeNull();
+ expect(row()).toMatchObject({ status: "success", pid: null });
+ expect(spawns).toBe(0);
 });

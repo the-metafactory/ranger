@@ -1,3 +1,5 @@
+import { modelEndpoint } from "../src/endpoint.ts";
+import { pinnedNodeSubstrate } from "../src/node-dependency.ts";
 import { describe, expect, spyOn, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { drizzle } from "drizzle-orm/bun-sqlite";
@@ -12,7 +14,7 @@ import { LAST_IMPLEMENT_MAP } from "../src/maps.ts";
 import type { ChangeRequest, ForgePort } from "../src/forge.ts";
 import { walk } from "../src/walk.ts";
 import type { SpawnRunNodeArgs } from "../src/spawn.ts";
-import { activeRecovery, nodeRecoveryScope } from "../src/recovery.ts";
+import { activeRecovery, recordRecovery, nodeRecoveryScope } from "../src/recovery.ts";
 import { resumeNode } from "../src/resume.ts";
 import { assembleState, servedMaps, ServeReader, stateFromJournal } from "../src/serve.ts";
 import { classifyFrontier } from "../src/route.ts";
@@ -1095,5 +1097,43 @@ test("a dependency-held map leaves an independent node eligible across ticks", a
   expect(r.journal.getWorker("41", REPO)?.pid).toBe(process.pid);
   expect(r.journal.deadmanCount()).toBe(0);
   expect(r.journal.spawnsToday(NOW)).toBe(1);
+ });
+});
+
+test("when-free plus reset clears an exhausted hold before durable enqueue", async () => {
+ await withRig(async r => {
+  r.worker("40");
+  r.journal.upsertWorker({ repo: REPO, root: 460, nodeId: "busy", status: "running", lane: "implement", pid: process.pid });
+  recordRecovery(r.journal, nodeRecoveryScope(REPO, "40"), { kind: "unknown", operation: "startup", evidence: "inspect", action: "intervene" }, { now: NOW });
+  expect(await resumeNode("40", undefined, r, { whenFree: true, resetRecovery: true })).toMatchObject({ queued: true });
+  expect(activeRecovery(r.journal, nodeRecoveryScope(REPO, "40"))?.status).toBe("complete");
+  r.journal.updateWorker("busy", REPO, { status: "success", pid: null });
+  const spawned: string[] = [];
+  await walk({ ...r, now: () => NOW, spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; } });
+  expect(spawned).toEqual(["40"]);
+  expect(r.journal.listResumeQueue()).toEqual([]);
+ });
+});
+
+test("selected Pi dependency holds before supervisor spawn without map reachable while an independent node starts", async () => {
+ await withRig(async r => {
+  r.queue("40"); r.queue("41", 460);
+  const spawned: string[] = [];
+  const probes: string[] = [];
+  const tick = () => walk({ ...r, now: () => NOW,
+   nodeSelector: async map => map.root === 1 ? "pi" as const : "claude" as const,
+   endpointLookup: (config, substrate) => substrate === "pi" ? modelEndpoint(config, substrate, undefined, { providers: { [config.substrates.pi.provider]: { baseUrl: "https://offline.invalid/v1" } } }) : null,
+   endpointProbe: async url => { probes.push(url); return false; },
+   spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; },
+  });
+  await tick(); await tick();
+  expect(r.config.maps.every(map => map.reachable === undefined)).toBe(true);
+  expect(spawned).toEqual(["41"]);
+  expect(probes).toEqual(["https://offline.invalid/v1/models"]);
+  expect(r.journal.getWorker("40", REPO)).toMatchObject({ pid: null, attempts: 0, status: "parked" });
+  expect(r.journal.spawnsToday(NOW)).toBe(1);
+  const live = r.journal.getWorker("41", REPO)!;
+  expect(pinnedNodeSubstrate(r.journal, REPO, "41", live.generation)).toBe("claude");
+  expect(pinnedNodeSubstrate(r.journal, REPO, "41", live.generation + 1)).toBeUndefined();
  });
 });

@@ -18,7 +18,7 @@ export const RECOVERY_BACKOFF_MS = [60_000, 300_000, 900_000];
 export const nodeRecoveryScope = (repo: string, nodeId: string) => `node:${repo}#${nodeId}`;
 export const jobRecoveryScope = (runId: number) => `job:${runId}`;
 const pointer = (scope: string) => `recovery-active:${scope}`;
-const stateKey = (scope: string, operation: string, target = "") => `recovery:${JSON.stringify([scope, operation, target])}`;
+const stateKey = (scope: string) => `recovery:${JSON.stringify([scope, "episode", ""])}`;
 
 export function activeRecovery(journal: Journal, scope: string): RecoveryState | null {
  const key = journal.getHealth(pointer(scope));
@@ -44,9 +44,10 @@ export function recoveryHold(journal: Journal, scope: string, now = new Date()):
  return null;
 }
 
-export function recordRecovery(journal: Journal, scope: string, outcome: OperationOutcome, now = new Date(), owner?: RecoveryOwner, attemptLimit = RECOVERY_LIMIT): RecoveryState {
+export function recordRecovery(journal: Journal, scope: string, outcome: OperationOutcome, options: { now?: Date; owner?: RecoveryOwner; attemptLimit?: number } = {}): RecoveryState {
+ const { now = new Date(), owner, attemptLimit = RECOVERY_LIMIT } = options;
  if (outcome.kind === "success" || outcome.kind === "code") throw new Error("only non-code recovery outcomes can be scheduled");
- const key = stateKey(scope, "episode");
+ const key = stateKey(scope);
  return journal.recoveryTransaction(owner, () => {
   const raw = journal.getHealth(key);
   const previous = raw === null ? null : recoverySchema.parse(JSON.parse(raw));
@@ -65,7 +66,8 @@ export function recordRecovery(journal: Journal, scope: string, outcome: Operati
  });
 }
 
-export function reserveRecovery(journal: Journal, scope: string, now = new Date(), owner?: RecoveryOwner): boolean {
+export function reserveRecovery(journal: Journal, scope: string, options: { now?: Date; owner?: RecoveryOwner } = {}): boolean {
+ const { now = new Date(), owner } = options;
  return journal.recoveryTransaction(owner, () => {
   const state = activeRecovery(journal, scope);
   if (state === null || state.status === "complete") return true;
@@ -82,7 +84,8 @@ export function reserveRecovery(journal: Journal, scope: string, now = new Date(
  });
 }
 
-export function completeRecovery(journal: Journal, scope: string, operation?: string, target?: string, owner?: RecoveryOwner): void {
+export function completeRecovery(journal: Journal, scope: string, options: { operation?: string; target?: string; owner?: RecoveryOwner } = {}): void {
+ const { operation, target, owner } = options;
  journal.recoveryTransaction(owner, () => {
   const state = activeRecovery(journal, scope);
   if (state === null) return;
@@ -93,8 +96,9 @@ export function completeRecovery(journal: Journal, scope: string, operation?: st
  });
 }
 
-export function resetRecovery(journal: Journal, scope: string): void {
- journal.recoveryTransaction(undefined, () => {
+export function resetRecovery(journal: Journal, scope: string, options: { owner?: RecoveryOwner } = {}): void {
+ const { owner } = options;
+ journal.recoveryTransaction(owner, () => {
   const state = activeRecovery(journal, scope);
   if (state !== null) journal.setHealth(state.key, JSON.stringify({ ...state, pending: [], attempts: 0, status: "complete", nextEligibleAt: null }));
  });

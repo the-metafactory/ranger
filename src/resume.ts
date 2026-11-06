@@ -1,5 +1,8 @@
+import { defaultNodeSelector, nodePreflight, type NodeSelector } from "./node-dependency.ts";
+import type { EndpointLookup } from "./endpoint.ts";
+import { spawningEnabled } from "./spawn.ts";
 import { OperationFailure } from "./operation-outcome.ts";
-import { requireReachable, type EndpointProbe } from "./endpoint.ts";
+import { type EndpointProbe } from "./endpoint.ts";
 import { activeRecovery, nodeRecoveryScope, recoveryHold, resetRecovery } from "./recovery.ts";
 import { startOwnedWorker, reservationPending } from "./node-ownership.ts";
 import { join } from "node:path";
@@ -26,6 +29,8 @@ export interface ResumeContext {
  configPath: string;
  journal: Journal;
  endpointProbe?: EndpointProbe;
+ endpointLookup?: EndpointLookup;
+ nodeSelector?: NodeSelector;
  spawnRunNode?: (args: SpawnRunNodeArgs) => Promise<number | null>;
  now?: () => Date;
  /** The host load queued resumes wait on (node #297); tests inject a quiet or busy host. */
@@ -181,7 +186,7 @@ export async function startResumeNode(
  const spawner = ctx.spawnRunNode ?? spawnRunNodeDetached;
  let spawnError: Error | undefined;
  const pid = await startOwnedWorker({ journal, row, now,
-  preflight: row.phase === "close" ? undefined : () => requireReachable(map.reachable, ctx.endpointProbe),
+  preflight: row.phase === "close" ? undefined : () => nodePreflight({ config: ctx.config, map, lane: row.lane === "research" ? "research" : "implement", requiresModel: row.worktree === null, selector: ctx.nodeSelector ?? (ctx.spawnRunNode === undefined && spawningEnabled() ? defaultNodeSelector(ctx.config, journal) : undefined), probe: ctx.endpointProbe, lookup: ctx.endpointLookup }),
   onSpawnFailure: error => { spawnError = error; },
   spawn: generation => spawner({ nodeId, repo: map.repo, root: map.root, generation,
    cliEntry: join(import.meta.dir, "cli.ts"), configPath: ctx.configPath }),
@@ -202,7 +207,7 @@ export async function startResumeNode(
 
 export async function resumeNode(nodeId: string, selector: string | undefined, ctx: ResumeContext,
  options: { force?: boolean; whenFree?: boolean; cancel?: boolean; resetRecovery?: boolean } = {}) {
- if ((options.cancel && (options.force || options.whenFree)) || (options.force && options.whenFree)) {
+ if ((options.cancel && (options.force || options.whenFree || options.resetRecovery)) || (options.force && options.whenFree)) {
   throw new Error("--cancel, --when-free and --force are mutually exclusive");
  }
  return withClaimLock(ctx.journal, async owned => {
@@ -230,6 +235,7 @@ export async function resumeNode(nodeId: string, selector: string | undefined, c
   })) {
    await identityGate(config, map);
    owned();
+   if (options.resetRecovery) resetRecovery(journal, nodeRecoveryScope(map.repo, nodeId), { owner: { nodeId, repo: map.repo, generation: row.generation } });
    const entry = journal.enqueueResume({ nodeId, repo: map.repo, root: map.root, lane }, ctx.now?.() ?? new Date());
    return { nodeId, repo: map.repo, root: map.root, queued: true, lane: entry.lane, queuedAt: entry.queuedAt };
   }

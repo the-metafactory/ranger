@@ -1,3 +1,4 @@
+import { activeRecovery, nodeRecoveryScope } from "./recovery.ts";
 import { decodeForgeKey, isGithubRepo, nodeKey } from "./forge-ref.ts";
 import { changeRequestLabel, changeRequestUrl } from "./forge-text.ts";
 import type { CiVerdict, ForgeReadPort } from "./forge.ts";
@@ -2081,6 +2082,7 @@ export function stateFromJournal(
     }
     return reader.titles.get(nodeKey(repo, nodeId)) ?? null;
    },
+   recovery: (repo, nodeId) => journal == null ? null : activeRecovery(journal, nodeRecoveryScope(repo, nodeId)),
    reviewRounds: config.workers.reviewRounds,
    exists: existsSync,
   };

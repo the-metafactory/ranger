@@ -103,11 +103,13 @@ export async function runReadRetryingTransient(
  return { ...result, outcome: forgeOutcome(result, `${bin} read`) };
 }
 
+export const isRetryableStatus = (status: number) => [429, 500, 502, 503, 504].includes(status);
+
 export function forgeOutcome(result: RunResult, operation: string): OperationOutcome {
  const basic = processOutcome(result, operation);
  if (basic.kind === "success" || basic.kind === "infrastructure" || basic.kind === "unknown") return basic;
  const status = Number(/^HTTP\/\S+ (\d{3})\b/m.exec(result.stdout)?.[1]);
- if ([429, 500, 502, 503, 504].includes(status) || isRetryableRead(result.stderr)) {
+ if (isRetryableStatus(status) || isRetryableRead(result.stderr)) {
   return { kind: "infrastructure", operation, evidence: `${operation}: ${result.stderr.trim().slice(0, 400) || `HTTP ${status}`}`, action: "restore forge connectivity and retry" };
  }
  return { kind: "human", operation, evidence: `${operation}: ${result.stderr.trim().slice(0, 400) || `exit ${result.code}`}`, action: "resolve the forge refusal before resuming" };
