@@ -736,7 +736,7 @@ describe("implement lane (node #23)", () => {
   const pushed = await pushFromOutside(r, "principal.txt");
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
   expect(await head()).toBe(pushed);
-  const synced = r.journal.listEvents("acme/widgets", 200).filter((e) => e.kind === "worktree-synced");
+  const synced = r.journal.listEvents("acme/widgets", 200).filter((e) => e.kind === "worktree-prepared");
   expect(synced).toHaveLength(1);
   expect(synced[0]?.detail).toContain(was);
   expect(synced[0]?.detail).toContain(pushed);
@@ -822,7 +822,7 @@ describe("implement lane (node #23)", () => {
    expect(outcome.status).toBe("awaiting-merge");
    expect(await head()).toBe(to);
    expect((await git(["merge-base", "--is-ancestor", from, await head()], worktree)).code).toBe(1);
-   expect(r.journal.listNodeEvents("acme/widgets", "20").some(e => e.kind === "worktree-synced" && e.detail?.includes("recorded rebase"))).toBe(true);
+   expect(r.journal.listNodeEvents("acme/widgets", "20").some(e => e.kind === "worktree-prepared" && e.detail?.includes("recorded rebase"))).toBe(true);
   } else {
    expect(outcome.status).toBe("parked");
    expect(await head()).toBe(from);
@@ -850,7 +850,7 @@ describe("implement lane (node #23)", () => {
    expect(outcome.status).toBe(scenario === "clean" ? "awaiting-merge" : "failed");
    expect(await r.github.sha(BRANCH)).toBe(merged);
    expect(r.calls).toHaveLength(scenario === "clean" ? 2 : 1);
-   expect(r.journal.listNodeEvents("acme/widgets", "20").some(e => e.kind === "worktree-synced" && e.detail?.includes("recorded rebase"))).toBe(true);
+   expect(r.journal.listNodeEvents("acme/widgets", "20").some(e => e.kind === "worktree-prepared" && e.detail?.includes("recorded rebase"))).toBe(true);
   } else {
    expect(outcome.status).toBe("parked");
    expect(await head()).toBe(local);
@@ -1001,7 +1001,7 @@ describe("implement lane (node #23)", () => {
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
   expect(sessions).toHaveLength(1);
   expect(sessions[0]?.head).toBe(main); // the build pass started on the moved base
-  const synced = r.journal.listEvents("acme/widgets", 300).filter((e) => e.kind === "worktree-synced");
+  const synced = r.journal.listEvents("acme/widgets", 300).filter((e) => e.kind === "worktree-prepared");
   expect(synced).toHaveLength(1);
   expect(synced[0]?.detail).toContain(was);
   expect(synced[0]?.detail).toContain(main);
@@ -1071,7 +1071,7 @@ describe("implement lane (node #23)", () => {
   expect(sessions).toHaveLength(0); // adopted as it stood
   expect(await r.github.sha(BRANCH)).toBe(built);
   expect(eventDetails(r).some((d) => d.includes("a worker merges it in"))).toBe(false);
-  expect(r.journal.listEvents("acme/widgets", 300).some((e) => e.kind === "worktree-synced")).toBe(false);
+  expect(r.journal.listEvents("acme/widgets", 300).some((e) => e.kind === "worktree-prepared")).toBe(false);
   rmSync(flag, { force: true });
  }, 60_000);
 
@@ -1084,14 +1084,173 @@ describe("implement lane (node #23)", () => {
   expect(sessions).toHaveLength(1);
   expect(sessions[0]?.head).toBe(was); // the build pass started on the tree as it stood
   const events = r.journal.listEvents("acme/widgets", 300);
-  expect(events.some((e) => e.kind === "worktree-synced")).toBe(false);
-  const stayed = events.filter((e) => e.kind === "worktree-not-synced");
+  const stayed = events.filter((e) => e.kind === "worktree-prepared");
   expect(stayed).toHaveLength(1);
   expect(stayed[0]?.detail).toContain("2 commit(s) behind origin/main");
   expect(stayed[0]?.detail).toContain("README.md");
  }, 60_000);
 
  const UP_TO_DATE = "git merge-base --is-ancestor origin/main HEAD";
+
+ const prWithUnpushedCommit = async (file = "local.txt") => {
+  const r = await rig({});
+  cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  const pushed = await r.github.sha(BRANCH);
+  const local = await commitLocalFile(r, file, "unpushed work\n");
+  r.ctx.worker = async () => { throw new Error("no worker session on this resume"); };
+  reclaim(r);
+  return { r, pushed, local, worktree: join(r.canonical, ".worktrees", "node-20") };
+ };
+ const spendBaseMergeBudget = async (r: Rig, pushed: string) => {
+  const initial = (await git(["rev-parse", "main~0"], r.origin)).stdout.trim();
+  for (const sha of [pushed, initial]) await r.github.postComment("acme/widgets", 1, baseMergeMarker(sha, "main"));
+ };
+ const markersOn = (r: Rig) => (r.github.comments.get(1) ?? []).filter((c) => c.body.includes("ranger:base-merge"));
+ const holds = async (r: Rig, ancestor: string, head: string) => (await runCmd("git", ["merge-base", "--is-ancestor", ancestor, head], { cwd: r.origin })).code === 0;
+
+ test("a PR with an unpushed commit, 1 commit behind the base, merges the base before an up-to-date gate and pushes the merge (ranger issue #322)", async () => {
+  const { r, pushed, local } = await prWithUnpushedCommit();
+  const main = await pushFromOutside(r, "base-1.txt", "main");
+  r.ctx.map.commands.test = UP_TO_DATE;
+  expect(r.ctx.config.workers.maxBehindBase).toBeGreaterThan(1);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  const head = await r.github.sha(BRANCH);
+  expect(head).not.toBe(pushed);
+  expect(await holds(r, main, head)).toBe(true);
+  expect(await holds(r, local, head)).toBe(true);
+  const markers = markersOn(r);
+  expect(markers).toHaveLength(1);
+  expect(markers[0]?.body).toContain("1 commit(s) behind origin/main");
+  expect(markers[0]?.body).toContain("so ranger merged it in");
+  const prepared = r.journal.listEvents("acme/widgets", 300).filter((e) => e.kind === "worktree-prepared");
+  expect(prepared).toHaveLength(1);
+  expect(prepared[0]?.detail).toContain(`merged origin/main ${main} into ${local} as ${head}`);
+ }, 60_000);
+
+ test("a base that moves during the tests on an unpushed commit is merged once more, and the gate runs again (ranger issue #322)", async () => {
+  const { r, local } = await prWithUnpushedCommit();
+  const clone = join(r.dir, "moves-under-tests");
+  expect((await git(["clone", "--branch", "main", r.origin, clone], r.dir)).code).toBe(0);
+  writeFileSync(join(clone, "late.txt"), "landed during the test run\n");
+  await git(["add", "late.txt"], clone);
+  await git(["commit", "-m", "late base commit"], clone);
+  const late = (await git(["rev-parse", "HEAD"], clone)).stdout.trim();
+  const once = join(r.dir, "moved-once");
+  r.ctx.map.commands.test = `if [ ! -f ${once} ]; then touch ${once}; git -C ${clone} push -q origin HEAD:refs/heads/main; exit 1; fi; ${UP_TO_DATE}`;
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  const head = await r.github.sha(BRANCH);
+  expect(await holds(r, late, head)).toBe(true);
+  expect(await holds(r, local, head)).toBe(true);
+  expect(markersOn(r)).toHaveLength(1);
+ }, 60_000);
+
+ test("a red run on an unpushed commit with no base movement fails without a second run (ranger issue #322)", async () => {
+  const { r, local } = await prWithUnpushedCommit();
+  const runs = join(r.dir, "runs");
+  r.ctx.map.commands.test = `echo run >> ${runs}; exit 1`;
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("failed");
+  expect(outcome.detail).toContain("on the resumed worktree");
+  expect(readFileSync(runs, "utf8").trim().split("\n")).toHaveLength(1);
+  expect(await r.github.sha(BRANCH)).toBe(local);
+  expect(markersOn(r)).toHaveLength(0);
+ }, 60_000);
+
+ test("an unpushed commit that conflicts with the moved base parks naming the files, and pushes no merge (ranger issue #322)", async () => {
+  const { r, local, worktree } = await prWithUnpushedCommit("clash.txt");
+  const main = await pushFromOutside(r, "clash.txt", "main");
+  r.ctx.map.commands.test = UP_TO_DATE;
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("parked");
+  expect(outcome.detail).toContain("clash.txt");
+  expect(outcome.detail).toContain(main);
+  expect(outcome.detail).toContain(local.slice(0, 8));
+  expect(await r.github.sha(BRANCH)).toBe(local);
+  expect((await git(["rev-parse", "HEAD"], worktree)).stdout.trim()).toBe(local);
+  expect((await git(["status", "--porcelain"], worktree)).stdout.trim()).toBe("");
+ }, 60_000);
+
+ test("an unpushed commit past the base merge budget is not merged, and the journal says so (ranger issue #322)", async () => {
+  const { r, pushed, local } = await prWithUnpushedCommit();
+  await spendBaseMergeBudget(r, pushed);
+  await pushFromOutside(r, "base-1.txt", "main");
+  r.ctx.map.commands.test = "true";
+  r.ctx.config.workers.reviewRounds = 9;
+  await runNode("20", r.ctx);
+  const head = await r.github.sha(BRANCH);
+  expect(head).toBe(local);
+  const prepared = r.journal.listEvents("acme/widgets", 300).filter((e) => e.kind === "worktree-prepared");
+  expect(prepared.map((e) => e.detail ?? "").some((d) => d.includes("base merge pass(es): it is not moved before the tests"))).toBe(true);
+ }, 60_000);
+
+ test("a red run after the base merge keeps the merge's marker, so the merge counts when it lands (ranger issue #322)", async () => {
+  const { r } = await prWithUnpushedCommit();
+  const main = await pushFromOutside(r, "base-1.txt", "main");
+  const runs = join(r.dir, "runs");
+  r.ctx.map.commands.test = `echo run >> ${runs}; exit 1`;
+  expect((await runNode("20", r.ctx)).status).toBe("failed");
+  expect(readFileSync(runs, "utf8").trim().split("\n")).toHaveLength(1);
+  const landed = recordedBaseMerges(r.github.comments.get(1) ?? [], BOT);
+  expect(landed).toHaveLength(1);
+  const worktree = join(r.canonical, ".worktrees", "node-20");
+  const merged = (await git(["rev-parse", "HEAD"], worktree)).stdout.trim();
+  expect(merged).toBe(landed[0]?.sha);
+  expect((await git(["merge-base", "--is-ancestor", main, "HEAD"], worktree)).code).toBe(0);
+  r.ctx.map.commands.test = "true";
+  const rounds = r.calls.length;
+  reclaim(r);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  expect(await r.github.sha(BRANCH)).toBe(merged);
+  expect(markersOn(r)).toHaveLength(1);
+  expect(r.calls.length).toBe(rounds + 1);
+ }, 60_000);
+
+ test("a red run past the base merge budget is not run again, however far behind the branch is (ranger issue #322)", async () => {
+  const { r, pushed } = await prWithUnpushedCommit();
+  await spendBaseMergeBudget(r, pushed);
+  const main = await pushFromOutside(r, "base-1.txt", "main");
+  const runs = join(r.dir, "runs");
+  r.ctx.map.commands.test = `echo run >> ${runs}; exit 1`;
+  expect((await runNode("20", r.ctx)).status).toBe("failed");
+  expect(readFileSync(runs, "utf8").trim().split("\n")).toHaveLength(1);
+  expect(markersOn(r)).toHaveLength(2);
+  expect(await holds(r, main, await r.github.sha(BRANCH))).toBe(false);
+ }, 60_000);
+
+ test("a resumed checkpoint at the PR head, behind the base, whose tests pass is not merged up: there is nothing to push (ranger issue #322)", async () => {
+  const r = await rig({});
+  cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  const pushed = await r.github.sha(BRANCH);
+  await pushFromOutside(r, "base-1.txt", "main");
+  const runs = join(r.dir, "runs");
+  r.ctx.map.commands.test = `echo run >> ${runs}`;
+  r.ctx.worker = async () => { throw new Error("no worker session on this resume"); };
+  reclaim(r);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  expect(await r.github.sha(BRANCH)).toBe(pushed);
+  expect(markersOn(r)).toHaveLength(0);
+  expect(readFileSync(runs, "utf8").trim().split("\n")).toHaveLength(1);
+ }, 60_000);
+
+ test("a resumed checkpoint at the PR head that fails an up-to-date gate merges the base, runs again and pushes once (ranger issue #322)", async () => {
+  const r = await rig({});
+  cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  const pushed = await r.github.sha(BRANCH);
+  const main = await pushFromOutside(r, "base-1.txt", "main");
+  const runs = join(r.dir, "runs");
+  r.ctx.map.commands.test = `echo run >> ${runs}; ${UP_TO_DATE}`;
+  r.ctx.worker = async () => { throw new Error("no worker session on this resume"); };
+  reclaim(r);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  const head = await r.github.sha(BRANCH);
+  expect(head).not.toBe(pushed);
+  expect(await holds(r, main, head)).toBe(true);
+  expect(markersOn(r)).toHaveLength(1);
+  expect(readFileSync(runs, "utf8").trim().split("\n")).toHaveLength(2);
+ }, 60_000);
 
  test("a resume with no PR, 1 commit behind the base, whose adoption tests fail only on an up-to-date check merges the base and adopts the build (ranger issue #463)", async () => {
   const flag = join(tmpdir(), `ranger-behind-adopt-${Date.now()}`);
@@ -1108,7 +1267,7 @@ describe("implement lane (node #23)", () => {
   expect((await runCmd("git", ["merge-base", "--is-ancestor", main, pushed], { cwd: r.origin })).code).toBe(0);
   expect((await runCmd("git", ["merge-base", "--is-ancestor", built, pushed], { cwd: r.origin })).code).toBe(0);
   expect((await git(["rev-parse", "HEAD"], worktree)).stdout.trim()).toBe(pushed);
-  const synced = r.journal.listEvents("acme/widgets", 300).filter((e) => e.kind === "worktree-synced");
+  const synced = r.journal.listEvents("acme/widgets", 300).filter((e) => e.kind === "worktree-prepared");
   expect(synced).toHaveLength(1);
   expect(synced[0]?.detail).toContain("1 commit(s) behind origin/main");
   expect(synced[0]?.detail).toContain(`merged origin/main ${main} into ${built} as ${pushed}`);
@@ -1172,7 +1331,7 @@ describe("implement lane (node #23)", () => {
   expect((await git(["rev-parse", "HEAD"], worktree)).stdout.trim()).toBe(pushed);
   const events = r.journal.listEvents("acme/widgets", 200);
   expect(events.some((e) => e.detail?.includes(`head moved from`) && e.detail.includes(pushed.slice(0, 8)))).toBe(true);
-  expect(events.filter((e) => e.kind === "worktree-synced")).toHaveLength(1);
+  expect(events.filter((e) => e.kind === "worktree-prepared")).toHaveLength(1);
   expect(events.some((e) => e.detail?.startsWith("fix pass 1 @"))).toBe(false);
   // Round 2 reviewed the pushed head, and the branch is that head: nothing of the run's was pushed over it.
   expect(r.calls).toHaveLength(2);
