@@ -333,9 +333,8 @@ export type EventKind =
  | "transient"
  | "git-trust"
  | "log-failed"
- | "worktree-synced"
- /** A resumed node with no PR stays behind its base: its tree has changes (node #310). */
- | "worktree-not-synced"
+ /** What prepareWorktree did to a node's worktree, or why it left it as it was (ranger issue #322). */
+ | "worktree-prepared"
  | "filed"
  | "intake-draft"
  /** Intake gate (node #251): the principal's 👍 filed a draft, or ❌ discarded one. */
