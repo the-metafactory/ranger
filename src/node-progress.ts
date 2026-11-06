@@ -10,10 +10,11 @@ import { parseForgeRef } from "./forge-ref.ts";
 import { assertResearchFindingsOnly } from "./research-ci.ts";
 
 const sha = z.string().regex(/^[0-9a-f]{40}$/);
-const evidenceSchema = z.object({ sha, kind: z.enum(["tests", "tests-gate", "review", "research-ci"]), result: z.enum(["passed", "failed", "unknown"]), detail: z.string() });
+const phases = ["research", "implement", "review", "awaiting-review", "awaiting-merge", "close"] as const;
+const evidenceSchema = z.object({ sha, kind: z.enum(["tests", "tests-gate", "review", "research-worker", "research-ci"]), result: z.enum(["passed", "failed", "unknown"]), detail: z.string() });
 const checkpointSchema = z.object({
  version: z.literal(1), repo: z.string(), nodeId: z.string(), branch: z.string(), sha,
- phase: z.enum(["research", "implement", "review", "awaiting-review", "awaiting-merge", "close"]),
+ phase: z.enum(phases),
  preservedSha: sha.nullable(), worktree: z.string(), evidence: z.array(evidenceSchema), durabilityError: z.string().nullable(),
 });
 export type NodeCheckpoint = z.infer<typeof checkpointSchema>;
@@ -21,8 +22,15 @@ export type ProgressEvidence = z.infer<typeof evidenceSchema>;
 export class ProgressConflict extends ParkSignal {}
 export type ProgressContext = Pick<ImplementContext, "journal" | "map" | "node" | "canonical" | "worktree" | "branch" | "generation" | "token">;
 
-const phases = ["research", "implement", "review", "awaiting-review", "awaiting-merge", "close"] as const;
 const identity = (ctx: ProgressContext) => ({ repo: ctx.map.repo, nodeId: ctx.node.ref.id });
+
+function recordedProgressRebase(ctx: ProgressContext, from: string, to: string): boolean {
+ return ctx.journal.listRebases(ctx.map.repo, ctx.node.ref.id).some(rebase => rebase.from === from && rebase.to === to);
+}
+
+async function remoteWasRewound(ctx: ProgressContext, remote: string | null, preserved: string | null | undefined): Promise<boolean> {
+ return remote !== null && preserved != null && remote !== preserved && await hasCommit(ctx.worktree, preserved) && await isAncestor(ctx.worktree, remote, preserved);
+}
 
 export function nodeCheckpoint(ctx: ProgressContext): NodeCheckpoint | null {
  const { repo, nodeId } = identity(ctx);
@@ -43,7 +51,7 @@ export async function checkpointNode(ctx: ProgressContext, input: {
  const expected = ctx.journal.nodeProgress(repo, nodeId);
  const previous = nodeCheckpoint(ctx);
  const current = input.sha ?? await headSha(ctx.worktree);
- const rebased = previous !== null && ctx.journal.listRebases(repo, nodeId).some(rebase => rebase.from === previous.sha && rebase.to === current);
+ const rebased = previous !== null && recordedProgressRebase(ctx, previous.sha, current);
  if (previous !== null && previous.sha !== current &&
   !rebased && (!(await hasCommit(ctx.worktree, previous.sha)) || !(await isAncestor(ctx.worktree, previous.sha, current)))) {
   throw new ProgressConflict(`checkpoint ${previous.sha} is not an ancestor of worktree ${current}; saved progress was retained, reconcile ${ctx.worktree} before resuming`);
@@ -51,14 +59,17 @@ export async function checkpointNode(ctx: ProgressContext, input: {
  const initial = ctx.node.node.kind === "research" ? "research" : "implement";
  const phase = input.phase ?? ctx.journal.getWorker(nodeId, repo)?.phase ?? initial;
  const same = previous?.sha === current;
- const evidence = same ? previous.evidence.filter(item => item.kind !== input.evidence?.kind) : [];
+ const invalidatesTests = input.evidence?.kind === "tests" && input.evidence.result !== "passed";
+ const invalidatesResearch = input.evidence?.kind === "research-worker" && input.evidence.result !== "passed";
+ const evidence = same ? previous.evidence.filter(item => item.kind !== input.evidence?.kind &&
+  !(invalidatesTests && item.kind === "tests-gate") && !(invalidatesResearch && item.kind === "research-ci")) : [];
  if (input.evidence !== undefined) {
   if (input.evidence.sha !== current) throw new ProgressConflict(`evidence at ${input.evidence.sha} cannot certify checkpoint ${current}`);
   evidence.push(input.evidence);
  }
  const checkpoint: NodeCheckpoint = {
   version: 1, repo, nodeId, branch: ctx.branch, sha: current, worktree: ctx.worktree,
-  phase: !same ? initial : phases.indexOf(previous.phase) > phases.indexOf(phase) ? previous.phase : phase,
+  phase: !same || invalidatesTests || invalidatesResearch ? initial : phases.indexOf(previous.phase) > phases.indexOf(phase) ? previous.phase : phase,
   preservedSha: input.preservedSha ?? previous?.preservedSha ?? null, evidence,
   durabilityError: input.durabilityError === undefined ? previous?.durabilityError ?? null : input.durabilityError,
  };
@@ -87,14 +98,13 @@ export async function reconcileNodeProgress(ctx: ProgressContext, remote: string
   if (await isAncestor(ctx.worktree, here, saved)) {
    await align(saved);
    here = await headSha(ctx.worktree);
-  } else if (!(await isAncestor(ctx.worktree, saved, here))) {
+  } else if (!(await isAncestor(ctx.worktree, saved, here)) && !recordedProgressRebase(ctx, saved, here)) {
    throw new ProgressConflict(`worktree ${here} diverges from checkpoint ${saved}; reconcile both before resuming`);
   }
  }
  if (remote !== null && remote !== here) {
-  if (previous?.preservedSha !== null && previous?.preservedSha !== undefined && remote !== previous.preservedSha &&
-   await hasCommit(ctx.worktree, previous.preservedSha) && await isAncestor(ctx.worktree, remote, previous.preservedSha)) {
-   throw new ProgressConflict(`origin/${ctx.branch} went back to ${remote.slice(0, 8)} (${remote}) from preserved ${previous.preservedSha}; nothing was pushed over the rewind, reconcile ${ctx.worktree}`);
+  if (await remoteWasRewound(ctx, remote, previous?.preservedSha)) {
+   throw new ProgressConflict(`origin/${ctx.branch} went back to ${remote.slice(0, 8)} (${remote}) from preserved ${previous?.preservedSha}; nothing was pushed over the rewind, reconcile ${ctx.worktree}`);
   }
   if (sync !== undefined) await sync(remote);
   else if (await isAncestor(ctx.worktree, here, remote)) await align(remote);
@@ -124,8 +134,7 @@ export async function preserveNodeProgress(ctx: ProgressContext, refusal?: strin
   const checkpoint = await checkpointNode(ctx, { sha: current });
   await policy(current);
   const remote = await progressRemote(ctx);
-  if (remote !== null && checkpoint.preservedSha !== null && remote !== checkpoint.preservedSha &&
-   await hasCommit(ctx.worktree, checkpoint.preservedSha) && await isAncestor(ctx.worktree, remote, checkpoint.preservedSha)) {
+  if (await remoteWasRewound(ctx, remote, checkpoint.preservedSha)) {
    throw new ProgressConflict(`origin/${ctx.branch} was rewound from ${checkpoint.preservedSha} to ${remote}; remote preservation refused`);
   }
   await assertNoClosingKeywords(ctx.worktree, ctx.map.base, parseForgeRef(repo).forge);
@@ -138,7 +147,8 @@ export async function preserveNodeProgress(ctx: ProgressContext, refusal?: strin
   return null;
  } catch (error) {
   if (error instanceof FencedError) throw error;
-  const detail = `durability failure: committed progress${current === undefined ? "" : ` at ${current}`} is not confirmed recoverable on another machine; local recovery: ${ctx.worktree} (${ctx.branch}); ${refusal === undefined ? "" : "current SHA unavailable: the supervisor safety gate refused Git access; "}${String(error).slice(0, 400)}`;
+  const state = refusal === undefined ? `committed progress${current === undefined ? "" : ` at ${current}`}` : "commit state is unknown because the supervisor safety gate refused Git access";
+  const detail = `durability failure: ${state}; work is not confirmed recoverable on another machine; local recovery: ${ctx.worktree} (${ctx.branch}); ${String(error).slice(0, 400)}`;
   if (current !== undefined && !(error instanceof ProgressConflict)) {
    try { await checkpointNode(ctx, { sha: current, durabilityError: detail }); }
    catch (checkpointError) { if (checkpointError instanceof FencedError) throw checkpointError; }
@@ -146,6 +156,21 @@ export async function preserveNodeProgress(ctx: ProgressContext, refusal?: strin
   ctx.journal.recordEvent("progress-preservation-failed", { repo, nodeId, detail });
   return detail;
  }
+}
+
+export async function confirmPreservedProgress(ctx: ProgressContext, current: string): Promise<void> {
+ let confirmed = false;
+ try { confirmed = await progressRemote(ctx) === current; }
+ catch (error) { if (error instanceof FencedError) throw error; }
+ if (!confirmed) {
+  const failure = await preserveNodeProgress(ctx);
+  if (failure !== null) throw new ProgressConflict(failure);
+  const remote = await progressRemote(ctx);
+  if (remote === null || !(await isAncestor(ctx.worktree, current, remote))) {
+   throw new ProgressConflict(`durability failure: origin/${ctx.branch} does not confirm committed ${current}; local recovery: ${ctx.worktree}; no remote preservation was recorded`);
+  }
+ }
+ await checkpointNode(ctx, { sha: current, preservedSha: current, durabilityError: null });
 }
 
 async function progressPushPolicy(ctx: ProgressContext, sha: string): Promise<void> {

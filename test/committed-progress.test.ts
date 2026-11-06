@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { runCmd } from "../src/exec.ts";
 import { FencedError, Journal } from "../src/journal.ts";
 import { runNode } from "../src/worker.ts";
-import { checkpointNode, nodeCheckpoint, preserveNodeProgress, progressRemote, reconcileNodeProgress } from "../src/node-progress.ts";
+import { checkpointNode, confirmPreservedProgress, nodeCheckpoint, preserveNodeProgress, progressRemote, reconcileNodeProgress } from "../src/node-progress.ts";
 import type { ImplementContext } from "../src/implement.ts";
 import { implementWorker, restoreEnv, rig, type Rig } from "./implement-rig.ts";
 import { eligibleCodexReading } from "./fixtures/substrate-readings.ts";
@@ -318,7 +318,8 @@ for (const scenario of ["findings", "outage", "restricted-file"] as const) test(
  const raw = r.journal.nodeProgress("acme/widgets", "20");
  if (raw === null) throw new Error("research checkpoint missing");
  const checkpoint = JSON.parse(raw);
- expect(checkpoint).toMatchObject({ sha, branch: "research/progress-20", phase: "research", evidence: [] });
+ expect(checkpoint).toMatchObject({ sha, branch: "research/progress-20", phase: "research" });
+ expect(checkpoint.evidence).toContainEqual(expect.objectContaining({ sha, kind: "research-worker", result: "failed" }));
  expect(r.github.prs.size).toBe(0);
  if (scenario === "findings") {
   expect(outcome.status).toBe("failed");
@@ -336,7 +337,7 @@ for (const scenario of ["findings", "outage", "restricted-file"] as const) test(
  }
 });
 
-test("a fresh research clone and journal recover preserved findings and run CI without another worker", async () => {
+test("a fresh research clone recovers partial findings and requires worker completion before CI", async () => {
  const r = await researchFixture("findings");
  expect((await runNode("20", r.ctx)).status).toBe("failed");
  const sha = r.committed();
@@ -350,10 +351,15 @@ test("a fresh research clone and journal recover preserved findings and run CI w
  r.ctx.map.canonical = fresh;
  r.ctx.researchCiTiming = { settleMs: 0, pollMs: 1, timeoutMs: 1000 };
  let workers = 0;
- r.ctx.worker = async () => { workers++; throw new Error("recovered findings must not rerun coding"); };
+ r.ctx.worker = async (_prompt, options) => {
+  workers++;
+  expect(await git(options.cwd!, ["rev-parse", "HEAD"])).toBe(sha);
+  expect(readFileSync(join(options.cwd!, "findings.md"), "utf8")).toContain("Committed findings before worker failure");
+  return { code: 0, stdout: "research finished after reviewing preserved findings", stderr: "" };
+ };
  journal.upsertWorker({ nodeId: "20", repo: "acme/widgets", root: 1, status: "claimed", lane: "research" });
  const outcome = await runNode("20", r.ctx);
- expect(workers).toBe(0);
+ expect(workers).toBe(1);
  expect(r.github.prs.size).toBe(1);
  expect(journal.listNodeEvents("acme/widgets", "20").some(event => event.kind === "ci-passed")).toBe(true);
  expect(JSON.parse(journal.nodeProgress("acme/widgets", "20") ?? "{}")).toMatchObject({ sha, preservedSha: sha, phase: "close" });
@@ -372,7 +378,12 @@ test("research draft resume preserves and checks its local descendant before CI"
  await git(worktree, ["commit", "-m", "additional findings before park"]);
  const sha = await git(worktree, ["rev-parse", "HEAD"]);
  r.ctx.researchCiTiming = { settleMs: 0, pollMs: 1, timeoutMs: 1000 };
- r.ctx.worker = async () => { throw new Error("research resume must recover committed findings"); };
+ let completions = 0;
+ r.ctx.worker = async (_prompt, options) => {
+  completions++;
+  expect(await git(options.cwd!, ["rev-parse", "HEAD"])).toBe(sha);
+  return { code: 0, stdout: "verified additional findings are complete", stderr: "" };
+ };
  const checked: string[] = [];
  const verdict = r.github.ciVerdictFor.bind(r.github);
  const ci = spyOn(r.github, "ciVerdictFor").mockImplementation(async (repo, head, token, purpose) => {
@@ -384,10 +395,62 @@ test("research draft resume preserves and checks its local descendant before CI"
   const outcome = await runNode("20", r.ctx);
   expect(outcome.detail).not.toContain("durability failure");
   expect(checked.length).toBeGreaterThan(0);
+  expect(completions).toBe(1);
   expect(checked.every(head => head === sha)).toBe(true);
   expect(JSON.parse(r.journal.nodeProgress("acme/widgets", "20") ?? "{}").evidence).toContainEqual(expect.objectContaining({ sha, kind: "research-ci", result: "passed" }));
   expect(await r.github.sha(branch)).toBe(sha);
   expect(JSON.parse(r.journal.nodeProgress("acme/widgets", "20") ?? "{}")).toMatchObject({ sha, preservedSha: sha });
   expect(r.github.prs.size).toBe(1);
  } finally { ci.mockRestore(); }
+});
+
+for (const result of ["failed", "unknown"] as const) test(`same-SHA ${result} tests invalidate the old accepted gate`, async () => {
+ const r = await rig({}); rigs.push(r);
+ expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+ const ctx = context(r);
+ const sha = nodeCheckpoint(ctx)!.sha;
+ await checkpointNode(ctx, { sha, evidence: { sha, kind: "tests", result, detail: "a later test result" } });
+ expect(nodeCheckpoint(ctx)?.evidence.some(evidence => evidence.kind === "tests-gate")).toBe(false);
+ let runs = 0;
+ r.ctx.shellRun = async () => { runs++; return { code: 1, stdout: "", stderr: "still failing" }; };
+ r.journal.updateWorker("20", "acme/widgets", { status: "parked", pid: null });
+ const resumed = await runNode("20", r.ctx);
+ expect(resumed.status).toBe("failed");
+ expect(runs).toBeGreaterThan(0);
+ expect(r.calls).toHaveLength(1);
+});
+
+test("a recorded rebase after a checkpoint crash preserves the new SHA without old evidence", async () => {
+ const r = await fixture();
+ await runNode("20", r.ctx);
+ const ctx = context(r);
+ const saved = nodeCheckpoint(ctx)!;
+ await git(ctx.worktree, ["commit", "--amend", "-m", "recorded rebase with identical tree"]);
+ const rebased = await git(ctx.worktree, ["rev-parse", "HEAD"]);
+ await git(ctx.worktree, ["push", "origin", `HEAD:refs/heads/rebased-progress`]);
+ await git(r.origin, ["update-ref", `refs/heads/${ctx.branch}`, rebased]);
+ r.journal.recordRebase({ repo: "acme/widgets", nodeId: "20", from: saved.sha, to: rebased, requested: true, note: "confirmed rebase before process crash" });
+ await reconcileNodeProgress(ctx, await progressRemote(ctx));
+ expect(nodeCheckpoint(ctx)).toMatchObject({ sha: rebased, preservedSha: rebased, evidence: [] });
+});
+
+test("remote confirmation failure retains explicit durability error instead of claiming preservation", async () => {
+ const r = await fixture();
+ await runNode("20", r.ctx);
+ const ctx = context(r);
+ const sha = nodeCheckpoint(ctx)!.sha;
+ renameSync(r.origin, `${r.origin}-unavailable`);
+ await expect(confirmPreservedProgress(ctx, sha)).rejects.toThrow("durability failure");
+ expect(nodeCheckpoint(ctx)?.durabilityError).toContain("local recovery:");
+});
+
+test("a preservation no-op with no own commits cannot confirm a missing remote branch", async () => {
+ const r = await rig({}); rigs.push(r);
+ r.ctx.workerCommand = [implementWorker, "noop"];
+ expect((await runNode("20", r.ctx)).status).toBe("failed");
+ const ctx = context(r);
+ const sha = await git(ctx.worktree, ["rev-parse", "HEAD"]);
+ await expect(confirmPreservedProgress(ctx, sha)).rejects.toThrow("no remote preservation was recorded");
+ expect(nodeCheckpoint(ctx)).toBeNull();
+ expect(await r.github.sha(ctx.branch)).toBe("");
 });

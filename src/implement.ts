@@ -1,5 +1,5 @@
 import { principalLoginForRepo } from "./config.ts";
-import { checkpointNode, nodeCheckpoint, preserveNodeProgress, preserveUnmergedClosure, progressRemote, reconcileNodeProgress, ProgressConflict } from "./node-progress.ts";
+import { checkpointNode, confirmPreservedProgress, nodeCheckpoint, preserveNodeProgress, preserveUnmergedClosure, progressRemote, reconcileNodeProgress, ProgressConflict } from "./node-progress.ts";
 import { fileStemFor, parseForgeRef } from "./forge-ref.ts";
 import { lanePort } from "./forge-lanes.ts";
 import type { ResolvedToken } from "./token-gate.ts";
@@ -1424,7 +1424,7 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
   if (failure !== null) throw new ParkSignal(`${outcome.detail}\n${failure}`);
  } else if (outcome.status === "awaiting-merge") {
   const sha = await headSha(ctx.worktree);
-  await checkpointNode(ctx, { sha, preservedSha: sha, durabilityError: null });
+  await confirmPreservedProgress(ctx, sha);
  }
  return outcome;
 }
@@ -1879,8 +1879,6 @@ async function runImplementFlow(ctx: ImplementContext): Promise<ImplementOutcome
    verdictSha: current.sha,
    verdictBlockers: current.blockers,
   });
-  if (current.sha === await headSha(worktree)) await checkpointNode(ctx, { sha: current.sha,
-   evidence: { sha: current.sha, kind: "review", result: gatingFindings(current) === 0 ? "passed" : "failed", detail: `review round ${current.round}: ${gatingFindings(current)} gating finding(s)` } });
   if (gatingFindings(current) === 0 && artifacts.length > 0) {
    const missing = await missingArtifacts(worktree, live.headSha, artifacts);
    if (missing.length > 0) {
@@ -1892,6 +1890,8 @@ async function runImplementFlow(ctx: ImplementContext): Promise<ImplementOutcome
     });
    }
   }
+  if (current.sha === await headSha(worktree)) await checkpointNode(ctx, { sha: current.sha,
+   evidence: { sha: current.sha, kind: "review", result: gatingFindings(current) === 0 ? "passed" : "failed", detail: `review round ${current.round}: ${gatingFindings(current)} gating finding(s)` } });
   // Blockers AND majors gate (principal, 2026-10-03): each is reworked and
   // re-reviewed. Suggestions and nits do not gate.
   if (gatingFindings(current) === 0) {

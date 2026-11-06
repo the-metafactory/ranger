@@ -1,5 +1,5 @@
 import { acquireGeneration } from "./node-ownership.ts";
-import { checkpointNode, preserveNodeProgress, progressRemote, reconcileNodeProgress, ProgressConflict } from "./node-progress.ts";
+import { checkpointNode, confirmPreservedProgress, nodeCheckpoint, preserveNodeProgress, progressRemote, reconcileNodeProgress, ProgressConflict } from "./node-progress.ts";
 import type { RunOutcome } from "@the-metafactory/myelin";
 import { fileStemFor, parseForgeRef, qualifiedRepo } from "./forge-ref.ts";
 import { graphReadToken, laneCredentialRefusal, lanePort, type ReadGate } from "./forge-lanes.ts";
@@ -1044,6 +1044,8 @@ async function runResearch(
   await assertResearchFindingsOnly(canonical, baseSha, recovered);
   recoveredFindings = true;
  }
+ const checkpoint = nodeCheckpoint(progress);
+ const finishedResearch = checkpoint?.sha === recovered && checkpoint.evidence.some(evidence => evidence.kind === "research-worker" && evidence.result === "passed");
 
  const github = ctx.github ?? lanePort(config, repo);
  const recorded = journal.getWorker(nodeId, repo)?.prNumber ?? null;
@@ -1058,7 +1060,7 @@ async function runResearch(
 
  // A retry after the draft was opened resumes its CI/close tail, without
  // asking a worker to recreate an existing findings branch.
- if (existingPr === null && !recoveredFindings) {
+ if (!finishedResearch) {
   const prompt = assembleResearchPrompt({
    repo,
    node: {
@@ -1104,22 +1106,17 @@ async function runResearch(
 
   if (workerResult.code !== 0) {
    const detail = `worker exited ${workerResult.code}: ${workerResult.stderr.trim() || workerResult.stdout.trim().slice(0, 500)} (worker log: ${log})`;
-   const failure = await preserveResearchProgress(ctx, node, generation);
-   if (failure !== null) throw new ProgressConflict(`${detail}\n${failure}`);
-   journal.recordEvent("refused", { nodeId, repo, detail });
-   failNode(config, journal, nodeId, repo, detail);
-   return { ...base, status: "failed", detail, workerExit: workerResult.code };
+   const head = await resolveBranchSha(canonical, branch);
+   if (head !== null && head !== baseSha) await checkpointNode(progress, { sha: head,
+    evidence: { sha: head, kind: "research-worker", result: "failed", detail: `research worker exited ${workerResult.code}` } });
+   return failResearch(detail, workerResult.code);
   }
 
   // Research SOP tail: findings must exist on the worktree.
   const findingsPath = join(worktree, "findings.md");
   if (!existsSync(findingsPath)) {
    const detail = `worker succeeded but wrote no findings.md at ${findingsPath} — the close would be hollow, so ranger refuses to close. (worker log: ${log})`;
-   const failure = await preserveResearchProgress(ctx, node, generation);
-   if (failure !== null) throw new ProgressConflict(`${detail}\n${failure}`);
-   journal.recordEvent("refused", { nodeId, repo, detail });
-   failNode(config, journal, nodeId, repo, detail);
-   return { ...base, status: "failed", detail, workerExit: 0 };
+   return failResearch(detail, 0);
   }
 
   journal.resetDeadman();
@@ -1137,6 +1134,7 @@ async function runResearch(
    }
    sha = head;
    await assertResearchFindingsOnly(canonical, baseSha, sha);
+   await checkpointNode(progress, { sha, evidence: { sha, kind: "research-worker", result: "passed", detail: "research worker exited 0 with accepted findings-only committed source" } });
    fence("push");
    const vetted = await vettedPush({
     worktree,
@@ -1151,11 +1149,7 @@ async function runResearch(
   } catch (error) {
    if (error instanceof FencedError) throw error;
    const detail = `research branch push failed (${branch}): ${error instanceof Error ? error.message : String(error)}`;
-   const failure = await preserveResearchProgress(ctx, node, generation, error instanceof GitSafetyError ? error.message : undefined);
-   if (failure !== null) throw new ProgressConflict(`${detail}\n${failure}`);
-   journal.recordEvent("refused", { nodeId, repo, detail });
-   failNode(config, journal, nodeId, repo, detail);
-   return { ...base, status: "failed", detail, workerExit: 0 };
+   return failResearch(detail, 0, error instanceof GitSafetyError ? error.message : undefined);
   }
  } else {
   const head = await resolveBranchSha(canonical, branch);
@@ -1165,11 +1159,7 @@ async function runResearch(
   sha = head;
   await assertResearchFindingsOnly(canonical, baseSha, sha);
  }
- if (await progressRemote(progress) !== sha) {
-  const failure = await preserveNodeProgress(progress);
-  if (failure !== null) throw new ProgressConflict(failure);
- }
- await checkpointNode(progress, { sha, preservedSha: sha, durabilityError: null });
+ await confirmPreservedProgress(progress, sha);
  const findings = await safeGit(["--no-replace-objects", "show", `${sha}:findings.md`], { cwd: canonical });
  if (findings.code !== 0 || findings.stdout.trim().length === 0) {
   throw new ParkSignal(`research findings.md is missing or empty at ${sha}`);
@@ -1273,6 +1263,14 @@ async function runResearch(
  }
 
  return parkResearchClose(ctx, nodeId, close, 0);
+
+ async function failResearch(detail: string, workerExit: number, refusal?: string): Promise<RunNodeOutcome> {
+  const failure = await preserveResearchProgress(ctx, node, generation, refusal);
+  if (failure !== null) throw new ProgressConflict(`${detail}\n${failure}`);
+  journal.recordEvent("refused", { nodeId, repo, detail });
+  failNode(config, journal, nodeId, repo, detail);
+  return { ...base, status: "failed", detail, workerExit };
+ }
 }
 
 async function preserveResearchProgress(ctx: RunNodeContext, node: NodeResult, generation: number, refusal?: string): Promise<string | null> {
