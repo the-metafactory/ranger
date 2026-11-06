@@ -1,3 +1,4 @@
+import { resetRecovery, nodeRecoveryScope } from "../src/recovery.ts";
 import { createShadowTestBackend, type ShadowComparison } from "../src/remote-test/shadow.ts";
 import { githubCiVerdict } from "../src/github-ci.ts";
 import { evaluateMergeGate } from "../src/merge-gate.ts";
@@ -2357,6 +2358,7 @@ describe("implement lane (node #23)", () => {
   const fixes = () => (r.github.comments.get(1) ?? []).filter((c) => c.body.includes("ranger:probe-fix"));
   expect(fixes()).toHaveLength(1);
 
+  resetRecovery(r.journal, nodeRecoveryScope("acme/widgets", "20"));
   reclaim(r);
   const resumed = await runNode("20", r.ctx);
   expect(resumed.status).toBe("parked");

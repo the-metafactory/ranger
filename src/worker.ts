@@ -1,4 +1,4 @@
-import { OperationFailure, processOutcome, failureOutcome, type OperationOutcome } from "./operation-outcome.ts";
+import { OperationFailure, processOutcome, workerOutcome, failureOutcome, type OperationOutcome } from "./operation-outcome.ts";
 import { activeRecovery, activeRecoveryReason, completeRecovery, nodeRecoveryScope, recordRecovery, recoveryHold, recoveryReason, reserveRecovery } from "./recovery.ts";
 import { requireEndpoint, type EndpointProbe, type EndpointLookup } from "./endpoint.ts";
 import { acquireGeneration } from "./node-ownership.ts";
@@ -1152,7 +1152,7 @@ async function runResearch(
    const head = await resolveBranchSha(canonical, branch);
    if (head !== null && head !== baseSha) await checkpointNode(progress, { sha: head,
     evidence: { sha: head, kind: "research-worker", result: "failed", detail: `research worker exited ${workerResult.code}` } });
-   return failResearch(detail, workerResult.code, undefined, processOutcome(workerResult, "research-worker"));
+   return failResearch(detail, workerResult.code, undefined, workerOutcome(workerResult, "research-worker", ctx.worker !== undefined || ctx.workerCommand !== undefined || process.env.RANGER_WORKER_CMD ? "command" : "model"));
   }
 
   // Research SOP tail: findings must exist on the worktree.
