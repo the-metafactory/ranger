@@ -119,11 +119,13 @@ export async function checkKnownGood(
  const { changed, since } = againstKnown(known, state);
  // A record from before a key joined the benign list still names it: its
  // leaving the hash is the only change, so the current state takes its place.
- if (since !== null && changed.length > 0 && changed.every((c) => c.endsWith(" (gone)") && isBenignEntry(c.slice(0, -7)))) {
+ const recorded = known !== null && known !== "unreadable" ? known.entries : {};
+ const retired = (c: string) => c.endsWith(" (gone)") && isBenignEntry(c.slice(0, -7), recorded[c.slice(0, -7)]);
+ if (since !== null && changed.length > 0 && changed.every(retired)) {
   recordKnownGood(journal, canonical, state, "benign config keys left the hash");
   journal.recordEvent("git-trust", {
    ...at,
-   detail: `known-good git state for ${canonical} re-recorded: ${changed.join(", ")} no longer hashed (benign git-lfs, push or identity config)`,
+   detail: `known-good git state for ${canonical} re-recorded: ${changed.join(", ")} no longer hashed (benign git-lfs, push or identity config, or git-lfs's own hook stubs)`,
   });
   return { kind: "match", state };
  }

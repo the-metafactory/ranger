@@ -9,12 +9,9 @@ import { checkKnownGood, recordKnownGood } from "../src/git-trust.ts";
 import { Journal } from "../src/journal.ts";
 import { createCanonicalRepo, GIT_ENV } from "./support.ts";
 
-/** Node #484: the hook stubs git-lfs installs as a side effect are not tampering. */
-
 const STUBBED = ["pre-push", "post-checkout", "post-commit", "post-merge"];
 
-/** The bytes git-lfs 3.8.1 writes, copied from a real checkout rather than from `src/`. */
-const stub = (hook: string): string =>
+const gitLfs381Stub = (hook: string): string =>
  `#!/bin/sh\ncommand -v git-lfs >/dev/null 2>&1 || { printf >&2 "\\n%s\\n\\n" "This repository is configured for Git LFS but 'git-lfs' was not found on your path. If you no longer wish to use Git LFS, remove this hook by deleting the '${hook}' file in the hooks directory (set by 'core.hookspath'; usually '.git/hooks')."; exit 2; }\ngit lfs ${hook} "$@"\n`;
 
 const sha256 = (text: string): string => createHash("sha256").update(text).digest("hex");
@@ -43,7 +40,7 @@ describe("the stubs git-lfs writes", () => {
  test("leave the hash unchanged and pass both the known-good check and the post-worker check", async () => {
   await checkKnownGood(journal, canonical, at);
   const snapshot = gitConfigSnapshot(canonical);
-  for (const hook of STUBBED) install(hook, stub(hook));
+  for (const hook of STUBBED) install(hook, gitLfs381Stub(hook));
   expect(gitConfigSnapshot(canonical)).toBe(snapshot);
   expect((await checkKnownGood(journal, canonical, at)).kind).toBe("match");
   await assertGitUntouched(canonical, snapshot);
@@ -67,11 +64,12 @@ describe("the stubs git-lfs writes", () => {
 
 describe("anything else in a stub's place still parks", () => {
  const cases: [string, string, () => void][] = [
-  ["a stub with a byte added", "pre-push", () => install("pre-push", `${stub("pre-push")}\n`)],
-  ["a stub that also runs something", "pre-push", () => install("pre-push", stub("pre-push").replace('"$@"', '"$@"; /tmp/evil'))],
-  ["a stub without its final newline", "post-merge", () => install("post-merge", stub("post-merge").slice(0, -1))],
-  ["another hook's stub", "pre-push", () => install("pre-push", stub("post-merge"))],
-  ["a stub at a name git-lfs does not write", "pre-commit", () => install("pre-commit", stub("pre-commit"))],
+  ["a stub with a byte added", "pre-push", () => install("pre-push", `${gitLfs381Stub("pre-push")}\n`)],
+  ["a stub that also runs something", "pre-push", () => install("pre-push", gitLfs381Stub("pre-push").replace('"$@"', '"$@"; /tmp/evil'))],
+  ["a stub without its final newline", "post-merge", () => install("post-merge", gitLfs381Stub("post-merge").slice(0, -1))],
+  ["another hook's stub", "pre-push", () => install("pre-push", gitLfs381Stub("post-merge"))],
+  ["a stub at a name git-lfs does not write", "pre-commit", () => install("pre-commit", gitLfs381Stub("pre-commit"))],
+  ["a NUL byte at a name git-lfs does not write", "evil", () => install("evil", "\0")],
   ["a directory", "pre-push", () => mkdirSync(join(hooks, "pre-push"))],
   ["a FIFO", "post-commit", () => expect(Bun.spawnSync(["mkfifo", join(hooks, "post-commit")]).exitCode).toBe(0)],
  ];
@@ -93,10 +91,10 @@ describe("a known-good record from before this exemption", () => {
  };
 
  test("naming the stubs is re-recorded without parking, and the journal says so", async () => {
-  for (const hook of STUBBED) install(hook, stub(hook));
-  recordNaming(Object.fromEntries(STUBBED.map((hook) => [`hooks/${hook}`, sha256(stub(hook))])));
+  for (const hook of STUBBED) install(hook, gitLfs381Stub(hook));
+  recordNaming(Object.fromEntries(STUBBED.map((hook) => [`hooks/${hook}`, sha256(gitLfs381Stub(hook))])));
   expect((await checkKnownGood(journal, canonical, at)).kind).toBe("match");
-  expect(JSON.parse(journal.knownGoodGitState(canonical) as string).hash).toBe(gitConfigSnapshot(canonical));
+  expect(JSON.parse(journal.knownGoodGitState(canonical)!).hash).toBe(gitConfigSnapshot(canonical));
   expect(journal.listEvents("acme/widgets")[0].detail).toContain("no longer hashed");
  });
 
@@ -111,13 +109,13 @@ describe("a known-good record from before this exemption", () => {
  test("naming another hook at a stub's name parks when a stub replaces it", async () => {
   install("pre-push", "#!/bin/sh\nexit 0\n");
   await checkKnownGood(journal, canonical, at);
-  install("pre-push", stub("pre-push"));
+  install("pre-push", gitLfs381Stub("pre-push"));
   const check = await checkKnownGood(journal, canonical, at);
   expect(check.kind === "mismatch" && check.changed).toEqual(["hooks/pre-push (gone)"]);
  });
 
  test("stubs gone plus any other change still parks", async () => {
-  recordNaming({ "hooks/pre-push": sha256(stub("pre-push")) });
+  recordNaming({ "hooks/pre-push": sha256(gitLfs381Stub("pre-push")) });
   install("post-commit", "#!/bin/sh\necho owned\n");
   const check = await checkKnownGood(journal, canonical, at);
   expect(check.kind === "mismatch" && check.changed).toContain("hooks/post-commit (new)");
