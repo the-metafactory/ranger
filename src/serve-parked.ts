@@ -29,7 +29,7 @@ import { classifyGithubCheckRuns } from "./github-ci.ts";
 import { REPO_PATTERN } from "./config.ts";
 import type { EventRow, ResumeQueueRow, WorkerRow } from "./journal.ts";
 import { startsImplementSession, type ImplementLane } from "./lanes.ts";
-import { whenFreeQueues } from "./resume.ts";
+import { whenFreeQueues } from "./resume-gates.ts";
 import { childEnv, itermArgv, shellQuote, sessionCommand, sessionSubstrate } from "./launch.ts";
 import type { SubstrateName } from "./store/schema.ts";
 import {

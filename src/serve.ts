@@ -68,7 +68,7 @@ import { Journal, vetoApplies, type LaneHolder, type ResumeQueueRow, type Worker
 import { ForeignMigrationError } from "./journal-guard.ts";
 import { IMPLEMENT_LANES, implementLane, workerLane, type ImplementLane } from "./lanes.ts";
 import { activeCooldown, cooldownScope, readGraphqlBudget } from "./budget.ts";
-import { queueEntryGate, queueSpawnGate, quietHostGate } from "./resume.ts";
+import { queueEntryGate, queueSpawnGate, quietHostGate } from "./resume-gates.ts";
 import { busyLoadFor, realHostLoad, type HostLoad, type HostLoadReading } from "./host-load.ts";
 import { cachedFrontier } from "./frontier-cache.ts";
 import { cachedRootAuthor } from "./root-author.ts";
