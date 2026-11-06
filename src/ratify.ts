@@ -1,3 +1,4 @@
+import { activeRecoveryReason, nodeRecoveryScope } from "./recovery.ts";
 import { startOwnedWorker } from "./node-ownership.ts";
 import { principalLoginForRepo, type RangerConfig, type RangerMapConfig } from "./config.ts";
 import type { TickPlan } from "./candidates.ts";
@@ -261,10 +262,12 @@ export async function ratifyPass(ctx: RatifyContext): Promise<RatifyResult> {
     await vetoProposal(tick, m, row, commentId, principal);
     continue;
    }
-   const pid = await startOwnedWorker({ journal, row: current, status: "running", patch: { phase: "close" },
+   const pid = await startOwnedWorker({ journal, row: current, now: now(), status: "running", patch: { phase: "close" },
     spawn: generation => ctx.spawn(row.nodeId, row.repo, row.root, generation) });
    if (pid === null) {
-    result.errors.push(`#${row.nodeId}: ratified, but the close run-node did not spawn — retrying next tick`);
+    result.deferred.push(id);
+    const reason = activeRecoveryReason(journal, nodeRecoveryScope(row.repo, row.nodeId));
+    journal.recordEvent("sweep", { nodeId: row.nodeId, repo: row.repo, detail: reason });
     continue;
    }
    journal.recordEvent("ratified", {

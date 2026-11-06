@@ -1,3 +1,5 @@
+import { OperationFailure, processOutcome, workerOutcome, type OperationOutcome } from "./operation-outcome.ts";
+import { completeRecovery, nodeRecoveryScope } from "./recovery.ts";
 import { principalLoginForRepo } from "./config.ts";
 import { checkpointNode, confirmPreservedProgress, nodeCheckpoint, preserveNodeProgress, preserveUnmergedClosure, progressRemote, reconcileNodeProgress, ProgressConflict } from "./node-progress.ts";
 import { fileStemFor, parseForgeRef } from "./forge-ref.ts";
@@ -40,7 +42,6 @@ import type { IssueComment, ChangeRequest, ForgePort, CiFailedRun, CiVerdict } f
 import { HostLoadPark, ParkSignal } from "./signals.ts";
 import { busyLoadFor, describeLoad, isQuiet, realHostLoad, type BusyReading, type HostLoad, type HostLoadReading } from "./host-load.ts";
 import { implementLane } from "./lanes.ts";
-import { isTransientGitHubError } from "./transient.ts";
 import {
  PROBE_FILE,
  unfinishedProbes,
@@ -59,7 +60,6 @@ import {
  reviewCapHeadMovedOutcome,
  reviewCapOutcome,
  substrateCappedOutcome,
- closeRefusalHead,
  closeRefusedOutcome,
  foreignPushParkOutcome,
  rebaseConflictParkOutcome,
@@ -133,6 +133,7 @@ export type WorkerRun = (prompt: string, opts: RunOptions) => Promise<RunResult>
 export type ShellRun = (command: string, opts: RunOptions) => Promise<RunResult>;
 
 export interface ImplementContext {
+ workerSource?: "model" | "command";
  config: RangerConfig;
  map: RangerMapConfig;
  token: string;
@@ -205,6 +206,7 @@ export interface ImplementOutcome {
  detail: string;
  workerExit: number | null;
  close?: CloseResult;
+ failureOutcome?: OperationOutcome;
  prNumber?: number;
  /** The closure reconciler has already finalized the worker and liveness state. */
  graphClosureReconciled?: true;
@@ -1407,7 +1409,10 @@ async function tryCarryReview(ctx: ImplementContext, reviews: RecordedReview[], 
  return { ...previous, sha: live.headSha, carried: previous.sha, body };
 }
 
+const failedOperations = new WeakMap<ImplementContext, OperationOutcome>();
+
 export async function runImplement(ctx: ImplementContext): Promise<ImplementOutcome> {
+ failedOperations.delete(ctx);
  let outcome: ImplementOutcome;
  try {
   outcome = await runImplementFlow(ctx);
@@ -1415,13 +1420,18 @@ export async function runImplement(ctx: ImplementContext): Promise<ImplementOutc
   if (error instanceof FencedError || error instanceof ProgressConflict) throw error;
   const failure = await preserveNodeProgress(ctx, error instanceof GitSafetyError ? error.message : undefined);
   if (failure !== null) {
+   if (error instanceof OperationFailure && error.outcome.kind !== "code") throw new OperationFailure({ ...error.outcome, evidence: `${error.message}\n${failure}` });
    throw new ParkSignal(`${error instanceof Error ? error.message : String(error)}\n${failure}`);
   }
   throw error;
  }
+ if (outcome.status === "failed") outcome = { ...outcome, failureOutcome: outcome.failureOutcome ?? failedOperations.get(ctx) ?? { kind: "code", operation: "implementation", evidence: outcome.detail, action: "repair the failure and resume" } };
  if (["failed", "parked", "refused"].includes(outcome.status)) {
   const failure = await preserveNodeProgress(ctx);
-  if (failure !== null) throw new ParkSignal(`${outcome.detail}\n${failure}`);
+  if (failure !== null) {
+   if (outcome.failureOutcome !== undefined && outcome.failureOutcome.kind !== "code") throw new OperationFailure({ ...outcome.failureOutcome, evidence: `${outcome.detail}\n${failure}` });
+   throw new ParkSignal(`${outcome.detail}\n${failure}`);
+  }
  } else if (outcome.status === "awaiting-merge") {
   const sha = await headSha(ctx.worktree);
   await confirmPreservedProgress(ctx, sha);
@@ -2595,6 +2605,7 @@ function nothingCommitted(spec: WorkerPassSpec): string {
  * it is not recorded.
  */
 async function workerPass(ctx: ImplementContext, testCommand: string, spec: WorkerPassSpec): Promise<PassResult> {
+ failedOperations.delete(ctx);
  const nodeId = ctx.node.ref.id;
  if (ctx.substrate === undefined) {
   return checkedWorkerPass(ctx, testCommand, spec, () =>
@@ -2699,6 +2710,7 @@ async function checkedWorkerPass(
    status: "failed",
    detail: `${detail} (worker log: ${log})`,
    workerExit: result.code,
+   failureOutcome: result.code !== 0 ? workerOutcome(result, "worker-session", ctx.workerSource ?? "command") : failedOperations.get(ctx) ?? { kind: "code", operation: "implementation-gate", evidence: detail, action: "repair the failed gate and resume" },
    ...(substrateCapped === undefined ? {} : { substrateCapped }),
   },
  });
@@ -2796,6 +2808,8 @@ async function checkPass(
 }
 
 async function checkpointAcceptedTests(ctx: ImplementContext, sha: string, command: string, passed: boolean): Promise<void> {
+ failedOperations.delete(ctx);
+ completeRecovery(ctx.journal, nodeRecoveryScope(ctx.map.repo, ctx.node.ref.id), { operation: "supervisor-tests", owner: { repo: ctx.map.repo, nodeId: ctx.node.ref.id, generation: ctx.generation } });
  await checkpointNode(ctx, { sha, evidence: { sha, kind: "tests", result: passed ? "passed" : "failed",
   detail: passed ? "supervisor tests accepted on exact committed source" : "supervisor gate accepted with recorded baseline failures" } });
  await checkpointNode(ctx, { sha, evidence: { sha, kind: "tests-gate", result: "passed", detail: command } });
@@ -2849,6 +2863,8 @@ async function runShell(
   timeoutCapture: { capture: captureProcessGroup, limitMs: TIMEOUT_CAPTURE_LIMIT_MS },
  });
  const result = ctx.map.testBackend?.kind === "shadow" && opts.measureCpu ? await runShadowMeasured(command, execute) : await execute(command);
+ if (result.code !== 0) failedOperations.set(ctx, processOutcome(result, "repository-command"));
+ else failedOperations.delete(ctx);
  logRun(ctx, `${opts.label} (${command})`, result, exitText(result, opts.timeoutMs));
  return result;
 }
@@ -2955,14 +2971,7 @@ async function closeAfterMerge(
   },
  );
  if (!close.closed) {
-  if (close.timedOut === true) throw new ParkSignal(`close after merge: ${close.detail}`);
-  // A forge read inside the close that got no answer says nothing about the
-  // node: thrown plain, failNode leaves the row for the sweep to respawn,
-  // uncounted, and the respawn's first read finds the node closed if the
-  // close landed after all.
-  if (isTransientGitHubError(closeRefusalHead(close.detail))) {
-   throw new Error(`close after merge hit a transient forge error: ${close.detail.slice(0, 600)}`);
-  }
+  if (close.outcome !== undefined && ["infrastructure", "dependency", "code", "unknown"].includes(close.outcome.kind)) throw new OperationFailure({ ...close.outcome, evidence: close.outcome.kind === "code" ? closeRefusedOutcome(close.detail) : close.detail });
   throw new ParkSignal(closeRefusedOutcome(close.detail));
  }
  journal.recordEvent("closed", { nodeId, repo, detail: close.detail.slice(0, 400) });
@@ -3332,6 +3341,7 @@ export function failedTestNames(result: RunResult): string[] {
 
 /** A failed supervisor test run, named: the failing tests first (the journal keeps 400 characters), then the tail. */
 function testsFailedDetail(ctx: ImplementContext, testCommand: string, tests: RunResult, after: string): string {
+ failedOperations.set(ctx, processOutcome(tests, "supervisor-tests", undefined));
  const names = failedTestNames(tests);
  return `tests (${testCommand}) failed ${after} (${exitText(tests, testTimeoutMs(ctx))})${names.length > 0 ? ` — failing: ${names.join("; ")}` : " — failing test names unavailable"} — output tail: ${tail(tests, true)}`;
 }

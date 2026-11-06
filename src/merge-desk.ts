@@ -1,3 +1,4 @@
+import { workerPreflight, type DispatchDeps } from "./node-dependency.ts";
 import { startOwnedWorker } from "./node-ownership.ts";
 import { implementLane } from "./lanes.ts";
 import { recordImplementStart, mapKey } from "./maps.ts";
@@ -25,12 +26,11 @@ import type { IssueComment, ChangeRequest, CiVerdict, ForgePort, MergeOutcome, R
 import { parseForgeRef } from "./forge-ref.ts";
 import { squashMessage as gitlabSquashMessage } from "./gitlab.ts";
 import { lanePort } from "./forge-lanes.ts";
-import { CI_FAILED_PARK_OUTCOME, ciNotSentBackOutcome, closeRefusalHead, mergeGateFailedOutcome } from "./outcomes.ts";
+import { CI_FAILED_PARK_OUTCOME, ciNotSentBackOutcome, mergeGateFailedOutcome } from "./outcomes.ts";
 import { changeRequestLabel, changeRequestNoun, forgeName } from "./forge-text.ts";
 import { closingKeywordRefusal, findClosingKeyword, hasCommit, headSha as worktreeHead, isAncestor } from "./git-ops.ts";
 import { recordedRebaseFrom } from "./worktree-head.ts";
 import { squashTitle } from "./github.ts";
-import { isTransientGitHubError } from "./transient.ts";
 
 /**
  * The merge desk (design §4/§5, #23): each tick, every implement-lane row
@@ -81,7 +81,8 @@ import { isTransientGitHubError } from "./transient.ts";
  * journal (the journal is a cache).
  */
 
-export interface MergeDeskContext {
+export interface MergeDeskContext extends DispatchDeps {
+ now?: () => Date;
  config: RangerConfig;
  journal: Journal;
  map: RangerMapConfig;
@@ -291,7 +292,7 @@ export function watchedByMergeDesk(w: WorkerRow): boolean {
  * is still re-run on the next tick.
  */
 export function closeRefused(w: WorkerRow): boolean {
- return (w.status === "parked" || w.status === "failed") && w.phase === "close" && !isTransientGitHubError(closeRefusalHead(w.outcome ?? ""));
+ return (w.status === "parked" || w.status === "failed") && w.phase === "close";
 }
 
 /** A row the merge desk parked on CI alone, in its awaiting-merge phase (node #104). */
@@ -347,7 +348,8 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
  }
 
  function startDeskWorker(row: WorkerRow, patch: WorkerPatch): Promise<number | null> {
-  return startOwnedWorker({ journal, row, status: "running", patch,
+  return startOwnedWorker({ journal, row, status: "running", patch, now: ctx.now?.(),
+   preflight: () => workerPreflight({ ...row, ...patch }, map, ctx),
    spawn: generation => ctx.spawn?.(row.nodeId, repo, row.root, generation) ?? Promise.resolve(null) });
  }
 

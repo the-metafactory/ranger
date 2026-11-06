@@ -92,6 +92,10 @@ export async function emitTickRunFinished(
    started_at: run.startedAt,
    ended_at: run.endedAt,
    detail_ref: config.state.journalPath,
+   ...((run.escalation?.maps.some(map => map.budgetDeferred !== undefined || !map.ok) ?? false) ? {
+    state: { subject: "ranger:escalation", value: JSON.stringify({ deferred: run.escalation?.maps.filter(map => map.budgetDeferred !== undefined).length ?? 0,
+     failed: run.escalation?.maps.filter(map => !map.ok).length ?? 0 }) },
+   } : {}),
    ...(goal || node ? { serves: { ...(goal ? { goal } : {}), ...(node ? { node } : {}) } } : {}),
   }, ...cardRunPayloads(config, run, env)];
  }, deps);

@@ -1,3 +1,4 @@
+import { recoveryReason, type RecoveryState } from "./recovery.ts";
 import { isGithubRepo, nodeKey, parseForgeRef } from "./forge-ref.ts";
 import { changeRequestLabel, changeRequestNoun, changeRequestUrl, nodeUrl } from "./forge-text.ts";
 import type { MergeState } from "./forge.ts";
@@ -28,7 +29,7 @@ import { classifyGithubCheckRuns } from "./github-ci.ts";
 import { REPO_PATTERN } from "./config.ts";
 import type { EventRow, ResumeQueueRow, WorkerRow } from "./journal.ts";
 import { startsImplementSession, type ImplementLane } from "./lanes.ts";
-import { whenFreeQueues } from "./resume.ts";
+import { whenFreeQueues } from "./resume-gates.ts";
 import { childEnv, itermArgv, shellQuote, sessionCommand, sessionSubstrate } from "./launch.ts";
 import type { SubstrateName } from "./store/schema.ts";
 import {
@@ -45,7 +46,6 @@ import {
  REVIEW_CAP_OUTCOME,
  SUBSTRATE_CAPPED_OUTCOME,
 } from "./outcomes.ts";
-import { isTransientGitHubError } from "./transient.ts";
 
 const ID_PATTERN = /^\d+$/;
 const SHA_PATTERN = /^[0-9a-f]{40}$/;
@@ -151,11 +151,17 @@ export function classifyReason(
  events: EventRow[],
  labels: string[] | null,
  reviewRounds: number,
+ recoveryState?: RecoveryState | null,
 ): Reason {
  if (row.status === "awaiting-merge" && labels?.includes(NEEDS_EYE_LABEL) === true) {
   return { class: "needs-eye", detail: `labelled ${NEEDS_EYE_LABEL}: your eye is the check, and the merge is yours` };
  }
+ if (recoveryState !== undefined && recoveryState !== null && recoveryState.status !== "complete") return {
+  class: recoveryState.kind === "dependency" ? "blocked" : recoveryState.kind === "infrastructure" ? "transient" : "other", detail: recoveryReason(recoveryState).slice(0, 400),
+ };
  const outcome = row.outcome ?? "";
+ const recovery = /^(infrastructure|dependency|human|unknown) recovery /.exec(outcome);
+ if (recovery !== null) return { class: recovery[1] === "dependency" ? "blocked" : recovery[1] === "infrastructure" ? "transient" : "other", detail: outcome.slice(0, 400) };
  const recent = sinceMotion(events);
  if (REVIEW_CAP_HEAD_MOVED_OUTCOME.test(outcome)) {
   // The counts of the last round belong to the head before the move: the
@@ -220,7 +226,6 @@ export function classifyReason(
  // An outcome that names its own failure is that failure. Only a crash park,
  // which names none, takes its cause from the last attempt's events.
  if (
-  isTransientGitHubError(outcome) ||
   (CRASH_PARK_OUTCOME.test(outcome) && lastAttempt(recent).some((e) => e.kind === "transient"))
  ) {
   // A text match (timeouts, 5xx, connection resets), not a provenance check:
@@ -421,6 +426,7 @@ export interface NeedsYouEntry {
 }
 
 export interface NeedsYouInputs {
+ recovery?: (repo: string, nodeId: string) => RecoveryState | null;
  maps: NeedsYouMap[];
  workers: WorkerRow[];
  /** A node's events, newest first. */
@@ -560,7 +566,7 @@ function rowEntries(
    url: nodeUrl(row.repo, row.nodeId),
    status: row.status as NeedsYouEntry["status"],
    endedAt: row.finishedAt,
-   reason: classifyReason(row, events, labels, inputs.reviewRounds),
+   reason: classifyReason(row, events, labels, inputs.reviewRounds, inputs.recovery?.(row.repo, row.nodeId)),
    pr:
     row.prNumber === null
      ? null

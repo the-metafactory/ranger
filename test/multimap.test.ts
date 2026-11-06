@@ -1,3 +1,4 @@
+import { activeRecovery, nodeRecoveryScope } from "../src/recovery.ts";
 import { githubCiVerdict } from "../src/github-ci.ts";
 import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
@@ -90,6 +91,17 @@ async function withRigEnv(fn: (r: ReturnType<typeof rig>) => Promise<void>): Pro
   Object.assign(process.env, saved);
   r.close();
  }
+}
+
+async function sweepAfterBackoff(ctx: Parameters<typeof sweepMap>[0]) {
+ const first = await sweepMap(ctx);
+ const due = ctx.journal.listWorkers(ctx.map.repo, ctx.map.root).flatMap(row => {
+  const state = activeRecovery(ctx.journal, nodeRecoveryScope(row.repo, row.nodeId));
+  return state?.nextEligibleAt == null ? [] : [Date.parse(state.nextEligibleAt)];
+ });
+ if (due.length === 0) return first;
+ const next = await sweepMap({ ...ctx, now: () => new Date(Math.max(...due)) });
+ return { ...next, crashed: first.crashed + next.crashed };
 }
 
 /** A merge desk's fake forge: PR #7 for node 40, sage-clean at its head, conflicting with main. */
@@ -315,12 +327,12 @@ describe("node #47 — map identity", () => {
    for (const [nodeId, root] of [["30", 1], ["31", 460]] as const) r.journal.upsertWorker({ nodeId, repo: REPO, root, status: "running", pid: 2_147_483_646 });
    const spawns: string[] = [];
    for (const map of r.config.maps) {
-    const result = await sweepMap({ config: r.config, journal: r.journal, map, token: "unused", botIdentity: "ivy-bot",
+    const result = await sweepAfterBackoff({ config: r.config, journal: r.journal, map, token: "unused", botIdentity: "ivy-bot",
      respawn: async (id, repo, root) => { spawns.push(`${repo}#${root}:${id}`); return 2_147_483_646; } });
     expect(result.crashed).toBe(1);
    }
    expect(spawns).toEqual(["acme/widgets#1:30", "acme/widgets#460:31"]);
-   expect(r.journal.listWorkers().map(w => w.attempts)).toEqual([1, 1]);
+   expect(r.journal.listWorkers().map(w => w.attempts)).toEqual([0, 0]);
   } finally { r.close(); }
  });
 
@@ -332,13 +344,13 @@ describe("node #47 — map identity", () => {
    r.journal.setHealth(LAST_IMPLEMENT_MAP, REPO + "#1");
    r.journal.setHealth(`${LAST_IMPLEMENT_MAP}.headless`, REPO + "#1");
    expect(r.journal.laneHolder("headless", { nodeId: "30", repo: REPO })).toBeNull();
-   const result = await sweepMap({ config: r.config, journal: r.journal, map: r.config.maps[1], token: "unused", botIdentity: "ivy-bot",
+   const result = await sweepAfterBackoff({ config: r.config, journal: r.journal, map: r.config.maps[1], token: "unused", botIdentity: "ivy-bot",
     respawn: async (_id, _repo, root) => { expect(root).toBe(460); return 2_147_483_646; } });
    expect(result.respawned).toEqual(["31"]);
    expect(r.journal.getHealth(LAST_IMPLEMENT_MAP)).toBe(REPO + "#1");
    expect(r.journal.getHealth(`${LAST_IMPLEMENT_MAP}.headless`)).toBe(REPO + "#1");
    r.journal.updateWorker("31", REPO, { status: "parked", pid: null });
-   const resumed = await runCli(["resume-node", "31", "-c", r.configPath], r.env);
+   const resumed = await runCli(["resume-node", "31", "--reset-recovery", "-c", r.configPath], r.env);
    expect(resumed.code).not.toBe(0);
    expect(resumed.stderr).toContain("spawn returned no PID");
    expect(r.journal.getWorker("31", REPO)?.root).toBe(460);
@@ -353,7 +365,7 @@ describe("node #47 — map identity", () => {
    r.journal.upsertWorker({ nodeId: "30", repo: REPO, root: 1, status: "running", lane: "implement" });
    r.journal.upsertWorker({ nodeId: "31", repo: REPO, root: 460, status: "running", lane: "implement", pid: 2_147_483_646 });
    let spawned = false;
-   const result = await sweepMap({ config: r.config, journal: r.journal, map: r.config.maps[1], token: "unused", botIdentity: "ivy-bot",
+   const result = await sweepAfterBackoff({ config: r.config, journal: r.journal, map: r.config.maps[1], token: "unused", botIdentity: "ivy-bot",
     respawn: async () => { spawned = true; return 2_147_483_646; } });
    expect(result.respawned).toEqual([]);
    expect(spawned).toBe(false);
@@ -368,18 +380,20 @@ describe("node #47 — map identity", () => {
     r.journal.upsertWorker({ nodeId: "30", repo: REPO, root: 1, status: "claimed", lane: "implement", pid: 2_147_483_646 });
     r.journal.upsertWorker({ nodeId: "31", repo: REPO, root: siblingRoot, status: "running", lane: "implement", pid: 2_147_483_646 });
     const spawns: string[] = [];
-    const sweep = (root: number) => sweepMap({ config: r.config, journal: r.journal,
+    const sweep = (root: number) => sweepAfterBackoff({ config: r.config, journal: r.journal,
      map: pickMap(r.config, `${REPO}#${root}`), token: "unused", botIdentity: "ivy-bot",
      respawn: async (id) => { spawns.push(id); return process.pid; } });
     await sweep(1);
     if (siblingRoot !== 1) await sweep(siblingRoot);
-    expect(spawns).toEqual(["30"]);
-    expect(r.journal.getWorker("30", REPO)?.attempts).toBe(1);
+    expect(spawns).toHaveLength(1);
+    expect(r.journal.getWorker("30", REPO)?.attempts).toBe(0);
     expect(r.journal.getWorker("31", REPO)?.attempts).toBe(0);
-    r.journal.updateWorker("30", REPO, { status: "success", pid: null });
-    expect((await sweep(siblingRoot)).respawned).toEqual(["31"]);
-    expect(spawns).toEqual(["30", "31"]);
-    expect(r.journal.getWorker("31", REPO)?.attempts).toBe(1);
+    const first = spawns[0];
+    const second = first === "30" ? "31" : "30";
+    r.journal.updateWorker(first, REPO, { status: "success", pid: null });
+    expect((await sweep(second === "30" ? 1 : siblingRoot)).respawned).toEqual([second]);
+    expect(spawns.sort()).toEqual(["30", "31"]);
+    expect(r.journal.getWorker("31", REPO)?.attempts).toBe(0);
    } finally { r.close(); }
   });
  }
@@ -391,7 +405,7 @@ describe("node #47 — map identity", () => {
     r.journal.upsertWorker({ nodeId: id, repo: REPO, root, pid, status: "running", lane: "implement" });
    }
    let spawns = 0;
-   const result = await sweepMap({ config: r.config, journal: r.journal, map: r.config.maps[1],
+   const result = await sweepAfterBackoff({ config: r.config, journal: r.journal, map: r.config.maps[1],
     token: "unused", botIdentity: "ivy-bot", respawn: async () => { spawns++; return process.pid; } });
    expect(result.respawned).toEqual([]);
    expect(spawns).toBe(0);
@@ -400,9 +414,9 @@ describe("node #47 — map identity", () => {
  });
 
  test("a resource lane alternates maps across restarts and serve predicts the same choice", async () => {
-  const r = rig();
-  const tick = () => runCli(["walk", "-c", r.configPath], r.env);
-  try {
+  await withRigEnv(async r => {
+  const tick = () => walk({ config: r.config, configPath: r.configPath, journal: r.journal, spawnRunNode: async () => process.pid }).then(() => ({ code: 0 }));
+
    expect((await tick()).code).toBe(0);
    expect(r.journal.listWorkers().map(w => [w.nodeId, w.root])).toEqual([["20", 1]]);
    expect(r.journal.getHealth(LAST_IMPLEMENT_MAP)).toBe(REPO + "#1");
@@ -416,13 +430,13 @@ describe("node #47 — map identity", () => {
    r.frontier(1, ["22"]);
    expect((await tick()).code).toBe(0);
    expect(r.journal.getHealth(LAST_IMPLEMENT_MAP)).toBe(REPO + "#1");
-   expect(r.journal.getWorker("22", REPO)?.status).toBe("parked");
+   expect(r.journal.getWorker("22", REPO)?.status).toBe("claimed");
    r.journal.updateWorker("22", REPO, { status: "success" });
    r.frontier(460, []);
    r.frontier(1, ["23"]);
    expect((await tick()).code).toBe(0);
    expect(r.journal.getWorker("23", REPO)?.root).toBe(1); // empty sibling skipped
-  } finally { r.close(); }
+  });
  });
 
  test("a merge-desk send-back takes its lane before a fresh claim (seelite #691 beat #491 to it, 2026-10-05)", async () => {
@@ -479,15 +493,15 @@ describe("node #47 — map identity", () => {
      return process.pid;
     },
    });
-   expect(r.journal.getWorker("45", REPO)).toMatchObject({ status: "parked", outcome: expect.stringContaining("spawn exploded") });
+   expect(r.journal.getWorker("45", REPO)).toMatchObject({ status: "parked", outcome: expect.stringContaining("died without an outcome") });
    expect(result.maps.flatMap(m => m.sweep?.mergeDesk?.resumed ?? [])).toEqual(["40"]);
 
   });
  });
 
  test("starts in another resource lane do not starve sibling map rotation", async () => {
-  const r = rig();
-  try {
+  await withRigEnv(async r => {
+
    const visual = { ...r.config.maps[0], repo: "acme/game", commands: { ...r.config.maps[0].commands, test: "bun test", probe: "true" } };
    r.config.maps.push(visual);
    writeFileSync(r.configPath, stringify(r.config));
@@ -496,7 +510,7 @@ describe("node #47 — map identity", () => {
    fixture.repo = visual.repo;
    fixture.frontier[0].ref.id = fixture.frontier[0].node.id = "50";
    writeFileSync(visualFrontier, JSON.stringify(fixture));
-   expect((await runCli(["walk", "-c", r.configPath], r.env)).code).toBe(0);
+   expect((await walk({ config: r.config, configPath: r.configPath, journal: r.journal, spawnRunNode: async () => process.pid }).then(() => ({ code: 0 }))).code).toBe(0);
    expect(r.journal.listWorkers().map(w => [w.repo, w.nodeId, w.root])).toEqual([[REPO, "20", 1], [visual.repo, "50", 1]]);
    expect(r.journal.getHealth(LAST_IMPLEMENT_MAP)).toBe("acme/game#1");
    r.journal.updateWorker("20", REPO, { status: "success" });
@@ -504,10 +518,10 @@ describe("node #47 — map identity", () => {
    fixture.frontier[0].ref.id = fixture.frontier[0].node.id = "51";
    writeFileSync(visualFrontier, JSON.stringify(fixture));
    expect(predicted(r.config)).toEqual([REPO + "#460", "acme/game#1"]);
-   expect((await runCli(["walk", "-c", r.configPath], r.env)).code).toBe(0);
+   expect((await walk({ config: r.config, configPath: r.configPath, journal: r.journal, spawnRunNode: async () => process.pid }).then(() => ({ code: 0 }))).code).toBe(0);
    expect(r.journal.getWorker("21", REPO)?.root).toBe(460);
-   expect(r.journal.getWorker("51", visual.repo)?.status).toBe("parked");
-  } finally { r.close(); }
+   expect(r.journal.getWorker("51", visual.repo)?.status).toBe("claimed");
+  });
  });
 
  test("sibling escalation passes keep each other's cards and separate daily digests", async () => {

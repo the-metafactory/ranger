@@ -171,22 +171,22 @@ describe("node #54 — the reason class, by ranger's own rules", () => {
   expect(classifyReason(r, [], ["ranger:needs-eye"], 5).class).toBe("needs-eye");
  });
 
- test("transient: a GitHub-side error in the outcome (#45, 2026-10-03)", () => {
+ test("opaque GitHub error text remains worker failure (#45, 2026-10-03)", () => {
   const r = row({
    nodeId: "45",
    repo: RANGER,
    status: "failed",
    outcome: "sage review the-metafactory/ranger#50 exited 1: gh: We couldn't respond to your request in time. Sorry about that.",
   });
-  expect(classifyReason(r, [], null, 5).class).toBe("transient");
+  expect(classifyReason(r, [], null, 5).class).toBe("worker failed");
  });
 
- test("transient: the detail names the match and keeps the outcome, never exonerating the node", () => {
+ test("repository transport words retain the worker failure and evidence", () => {
   // A worker's own bug can carry ECONNRESET from another service; the text
   // match cannot tell, so the dashboard must not say it was GitHub's fault.
   const r = row({ nodeId: "54", repo: RANGER, status: "failed", outcome: "TypeError: fetch to the views server failed: ECONNRESET" });
   const reason = classifyReason(r, [], null, 5);
-  expect(reason.class).toBe("transient");
+  expect(reason.class).toBe("worker failed");
   expect(reason.detail).toContain("TypeError: fetch to the views server failed: ECONNRESET");
   expect(reason.detail).not.toContain("not the node's fault");
   expect(reason.detail).not.toContain("GitHub-side");

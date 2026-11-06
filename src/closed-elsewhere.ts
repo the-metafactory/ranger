@@ -1,3 +1,4 @@
+import { completeRecovery, nodeRecoveryScope } from "./recovery.ts";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { expandHome, type RangerConfig, type RangerMapConfig } from "./config.ts";
@@ -64,10 +65,13 @@ export async function finishClosedElsewhere(ctx: {
     if (removed.code !== 0) throw new Error(`could not remove closed node's worktree: ${removed.stderr}`);
   }
   fence();
-  journal.updateWorker(id, map.repo, {
+  journal.recoveryTransaction({ nodeId: id, repo: map.repo, generation }, () => {
+   journal.updateWorker(id, map.repo, {
     status: merged ? "success" : "released", pid: null, workerPgid: null,
     phase: "close", finishedAt: new Date().toISOString(), outcome: detail,
     ...(merged ? { worktree: null } : {}),
+  });
+   completeRecovery(journal, nodeRecoveryScope(map.repo, id));
   });
   if (merged && kind === "own") journal.resetDeadman();
   const eventKind = ({ ungated: "closed-elsewhere-ungated", own: "closed", external: "closed-elsewhere" } as const)[kind];

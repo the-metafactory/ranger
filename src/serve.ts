@@ -1,3 +1,4 @@
+import { activeRecovery, nodeRecoveryScope } from "./recovery.ts";
 import { decodeForgeKey, isGithubRepo, nodeKey } from "./forge-ref.ts";
 import { changeRequestLabel, changeRequestUrl } from "./forge-text.ts";
 import type { CiVerdict, ForgeReadPort } from "./forge.ts";
@@ -67,7 +68,7 @@ import { Journal, vetoApplies, type LaneHolder, type ResumeQueueRow, type Worker
 import { ForeignMigrationError } from "./journal-guard.ts";
 import { IMPLEMENT_LANES, implementLane, workerLane, type ImplementLane } from "./lanes.ts";
 import { activeCooldown, cooldownScope, readGraphqlBudget } from "./budget.ts";
-import { queueEntryGate, queueSpawnGate, quietHostGate } from "./resume.ts";
+import { queueEntryGate, queueSpawnGate, quietHostGate } from "./resume-gates.ts";
 import { busyLoadFor, realHostLoad, type HostLoad, type HostLoadReading } from "./host-load.ts";
 import { cachedFrontier } from "./frontier-cache.ts";
 import { cachedRootAuthor } from "./root-author.ts";
@@ -2081,6 +2082,7 @@ export function stateFromJournal(
     }
     return reader.titles.get(nodeKey(repo, nodeId)) ?? null;
    },
+   recovery: (repo, nodeId) => journal == null ? null : activeRecovery(journal, nodeRecoveryScope(repo, nodeId)),
    reviewRounds: config.workers.reviewRounds,
    exists: existsSync,
   };

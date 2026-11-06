@@ -1,3 +1,4 @@
+import { resolveNodeSelector, type DispatchDeps } from "./node-dependency.ts";
 import { join } from "node:path";
 import { freshClaimRefusal } from "./candidates.ts";
 import { graphReadToken, laneCredentialRefusal, type ReadGate } from "./forge-lanes.ts";
@@ -64,7 +65,7 @@ export class BuildNowRefusal extends Error {
  override readonly name = "BuildNowRefusal";
 }
 
-export interface BuildNowContext {
+export interface BuildNowContext extends DispatchDeps {
  config: RangerConfig;
  configPath: string;
  journal: Journal;
@@ -211,7 +212,9 @@ async function buildUnderLock(nodeId: string, ctx: BuildNowContext, owned: Owned
  }
 
  const outcome = await claimNode({
-  journal,
+  config: ctx.config, journal,
+  endpointProbe: ctx.endpointProbe, endpointLookup: ctx.endpointLookup,
+  nodeSelector: resolveNodeSelector(ctx),
   map,
   node: node!,
   lane,

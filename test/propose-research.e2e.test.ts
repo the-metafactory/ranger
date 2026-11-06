@@ -1,3 +1,4 @@
+import { resetRecovery, nodeRecoveryScope } from "../src/recovery.ts";
 import { describe, expect, test } from "bun:test";
 import { cpSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -127,6 +128,7 @@ async function walk(f: Fixture, env: NodeJS.ProcessEnv = {}) {
 }
 
 async function runNode(f: Fixture, env: NodeJS.ProcessEnv = {}) {
+ f.journal(j => resetRecovery(j, nodeRecoveryScope("acme/widgets", "10")));
  const result = await runCli(["run-node", "10", "--map", "acme/widgets", "-c", f.config], { ...f.env, ...env });
  return { ...result, outcome: result.code === 0 ? JSON.parse(result.stdout) : null };
 }
@@ -147,7 +149,7 @@ describe("propose research lane (node #246)", () => {
 
    const run = await runNode(f);
    expect(run.code).toBe(0);
-   expect(run.outcome.status).toBe("proposed");
+   expect(run.outcome).toMatchObject({ status: "proposed" });
 
    // One proposal comment through `close --propose`, under the machine account, from the canonical checkout.
    const state = f.state();
@@ -202,7 +204,7 @@ describe("propose research lane (node #246)", () => {
   try {
    expect((await walk(f)).claimed).toEqual(["10"]);
    const run = await runNode(f, { FAKE_SOMA_PROPOSE_OUTPUT: "json" });
-   expect(run.outcome.status).toBe("proposed");
+   expect(run.outcome).toMatchObject({ status: "proposed" });
    expect(f.journal((j) => j.getWorker("10", "acme/widgets"))?.proposalCommentId).toBe("9101");
   } finally {
    f.stop();
@@ -214,7 +216,7 @@ describe("propose research lane (node #246)", () => {
   try {
    await walk(f);
    const run = await runNode(f, { FAKE_SOMA_PROPOSE_OUTPUT: "garbled" });
-   expect(run.outcome.status).toBe("proposed");
+   expect(run.outcome).toMatchObject({ status: "proposed" });
    expect(run.outcome.detail).toContain("comment id is unknown");
    expect(f.journal((j) => j.getWorker("10", "acme/widgets"))).toMatchObject({ status: "proposed", proposalCommentId: null });
    await cards(f);

@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { runCmd, type RunResult } from "../src/exec.ts";
 import { workerLogFile } from "../src/worker-log.ts";
 import { runNode } from "../src/worker.ts";
-import { loadSequence, restoreEnv, rig, type Rig } from "./implement-rig.ts";
+import { loadSequence, restoreEnv, rig, implementWorker, type Rig } from "./implement-rig.ts";
 
 const REPO = "acme/widgets";
 const TIMED_OUT: RunResult = { code: -1, stdout: "(pass) widgets > renders [1.00ms]\n", stderr: "", timedOut: true };
@@ -48,15 +48,30 @@ describe("a supervisor test run that hits its timeout (node #476)", () => {
   expect(details(r).some((d) => d.includes("passed on the retry in a fresh checkout"))).toBe(true);
  }, 120_000);
 
- test("a second timeout fails the node with the timed-out reason and does not retry again", async () => {
+ test("a recovered timeout cannot waive a later no-commit fix failure", async () => {
+  const r = await rig({ blockers: [1, 0] });
+  cleanup.push(r.dir); quietHost(r);
+  const tests = scriptedTests(r, [TIMED_OUT, PASSED]);
+  let workers = 0;
+  r.ctx.worker = (prompt, opts) => runCmd(implementWorker, [workers++ === 0 ? "build" : "noop", prompt], opts);
+  const outcome = await runNode("20", r.ctx);
+  expect(tests.calls).toBeGreaterThanOrEqual(2);
+  expect(outcome.status).toBe("failed");
+  expect(outcome.detail).toContain("committed nothing");
+  expect(r.journal.deadmanCount()).toBe(1);
+ }, 120_000);
+
+ test("a second timeout parks with bounded infrastructure recovery and no code strike", async () => {
   const r = await rig({});
   cleanup.push(r.dir);
   quietHost(r);
   const tests = scriptedTests(r, [TIMED_OUT]);
   const outcome = await runNode("20", r.ctx);
   expect(tests.calls).toBe(2);
-  expect(outcome.status).toBe("failed");
-  expect(outcome.detail).toContain("failed after the worker (timed out after 1200 s) — failing test names unavailable");
+  expect(outcome.status).toBe("parked");
+  expect(r.journal.deadmanCount()).toBe(0);
+  expect(outcome.detail).toContain("next retry");
+  expect(workerLog(r)).toContain("timed out after 1200 s");
   expect(outcome.detail).not.toContain("exit -1");
  }, 120_000);
 

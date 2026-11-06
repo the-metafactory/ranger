@@ -1,3 +1,6 @@
+import { closeRefusalHead } from "./outcomes.ts";
+import { forgeOutcome } from "./transient.ts";
+import { OperationFailure, processOutcome, type OperationOutcome } from "./operation-outcome.ts";
 import { GRAPH_CALL_TIMEOUT_MS, somaRepo, type FrontierEntryNode } from "./graph.ts";
 import { runCmd, type RunOptions } from "./exec.ts";
 import { writeEnvForRepo } from "./identity.ts";
@@ -11,8 +14,12 @@ import { parseForgeRef, normalizeNodeId, type ForgeRef } from "./forge-ref.ts";
  * module pins it via `writeEnvForRepo` (GitLab writes use per-call config).
  */
 
-export class GraphWriteError extends Error {
+export class GraphWriteError extends OperationFailure {
  override readonly name = "GraphWriteError";
+ constructor(message: string, outcome?: OperationOutcome) {
+  super(outcome ?? { kind: "human", operation: "graph-write", evidence: message, action: "resolve the graph refusal and resume" });
+  this.message = message;
+ }
 }
 
 function writeNodeId(ref: ForgeRef, value: unknown): string {
@@ -47,6 +54,7 @@ export interface CloseResult {
  repo: string;
  node: string;
  closed: boolean;
+ outcome?: OperationOutcome;
  /** Close receipt text (or refusal reason) from the verb. */
  detail: string;
  timedOut?: boolean;
@@ -64,6 +72,7 @@ export interface GraphWriteRunOptions extends RunOptions {
 }
 
 interface CallWriteResult {
+ outcome?: OperationOutcome;
  code: number;
  stdout: string;
  stderr: string;
@@ -78,7 +87,8 @@ async function callWrite(
 ): Promise<CallWriteResult> {
   const gated = writeEnvForRepo(repo, token, opts.env);
   try {
-    return await (opts.runner ?? runCmd)("soma", args, { ...opts, env: gated.env });
+    const result = await (opts.runner ?? runCmd)("soma", args, { ...opts, env: gated.env });
+    return { ...result, outcome: args[1] === "close" ? result.outcome : result.outcome ?? forgeOutcome(result, `graph:${args[1]}`) };
   } finally {
     gated.cleanup();
   }
@@ -113,6 +123,7 @@ export async function graphClaim(
  }
  throw new GraphWriteError(
   `soma graph claim ${id} (${repo}) failed (exit ${result.code}): ${(result.stderr || result.stdout).trim()}`,
+  result.outcome,
  );
 }
 
@@ -131,6 +142,7 @@ export async function graphRelease(
  if (result.code !== 0) {
   throw new GraphWriteError(
    `soma graph release ${id} (${repo}) failed (exit ${result.code}): ${(result.stderr || result.stdout).trim()}`,
+   result.outcome,
   );
  }
  const parsed = parsePayload(result, "release") as unknown as ReleaseResult;
@@ -239,14 +251,21 @@ export async function graphClose(
    node: id,
    closed: false,
    timedOut: true,
+   outcome: processOutcome(result, "graph-close", id),
    detail: `soma graph close ${id} (${repo}) timed out after ${seconds}s; its process group was killed`,
   };
  }
  const detail = (result.stdout || result.stderr).trim();
  if (result.code === 0) {
-  return { repo, node: id, closed: true, detail };
+  return { repo, node: id, closed: true, detail, outcome: processOutcome(result, "graph-close", id) };
  }
- return { repo, node: id, closed: false, detail };
+ const head = closeRefusalHead(detail);
+ const raw = processOutcome(result, "graph-close", id);
+ const outcome = result.outcome ?? (raw.kind === "unknown" ? raw :
+  /^probe .*ran and failed/.test(head) ? { ...raw, kind: "code" as const } :
+  /^Close refused[.:]/i.test(head) ? { ...raw, kind: "human" as const, action: "resolve the close gate refusal before resuming" } :
+  { ...raw, kind: "unknown" as const, action: "inspect the opaque close refusal before resuming" });
+ return { repo, node: id, closed: false, detail, outcome };
 }
 
 export interface ProposeResult {
@@ -497,6 +516,7 @@ function parsePayload(
  } catch {
   throw new GraphWriteError(
    `unparseable JSON from soma graph ${label} (exit ${result.code}): ${raw || "(empty)"}`,
+   result.code !== 0 ? result.outcome : { kind: "unknown", operation: `graph:${label}`, evidence: "unparseable graph response", action: "inspect the graph response before resuming" },
   );
  }
 }

@@ -360,6 +360,26 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 export class Journal {
  private ownership?: { nodeId: string; repo: string; generation: number };
 
+ private recoveryDepth = 0;
+
+ recoveryTransaction<T>(owner: { nodeId: string; repo: string; generation: number } | { jobRunId: number; status: JobRunStatus; pid: number | null } | undefined, run: () => T): T {
+  const execute = () => {
+   const scoped = this.ownership;
+   if (scoped !== undefined) {
+    if (owner !== undefined && ("jobRunId" in owner || owner.nodeId !== scoped.nodeId || owner.repo !== scoped.repo || owner.generation !== scoped.generation)) throw new FencedError("recovery owner differs from scoped worker");
+    this.assertGeneration(scoped.nodeId, scoped.repo, scoped.generation, "update recovery");
+   } else if (owner !== undefined) {
+    if ("jobRunId" in owner) {
+     const current = this.getJobRun(owner.jobRunId);
+     if (current?.status !== owner.status || current.pid !== owner.pid) throw new FencedError("job recovery owner changed");
+    } else this.assertGeneration(owner.nodeId, owner.repo, owner.generation, "update recovery");
+   }
+   this.recoveryDepth++;
+   try { return run(); } finally { this.recoveryDepth--; }
+  };
+  return this.recoveryDepth > 0 ? execute() : this.db.transaction(execute);
+ }
+
  nodeProgress(repo: string, nodeId: string): string | null {
   return this.getHealth(`node-progress:${repo}#${nodeId}`);
  }
@@ -704,9 +724,9 @@ export class Journal {
   * Patch a run, only while it is in `from`: returns false when another
   * process moved it first (a sweep that failed it, a second tick that took it).
   */
- updateJobRun(id: number, from: JobRunStatus, patch: JobRunPatch): boolean {
+ updateJobRun(id: number, from: JobRunStatus, patch: JobRunPatch, expectedPid?: number | null): boolean {
   const set = Object.fromEntries(Object.entries(patch).filter(([, v]) => v !== undefined));
-  const rows = this.db.update(jobRuns).set(set).where(and(eq(jobRuns.id, id), eq(jobRuns.status, from)))
+  const rows = this.db.update(jobRuns).set(set).where(and(eq(jobRuns.id, id), eq(jobRuns.status, from), expectedPid === undefined ? undefined : expectedPid === null ? isNull(jobRuns.pid) : eq(jobRuns.pid, expectedPid)))
    .returning({ id: jobRuns.id }).all();
   return rows.length > 0;
  }

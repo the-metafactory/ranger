@@ -1,3 +1,4 @@
+import { activeRecovery, recordRecovery, nodeRecoveryScope } from "../src/recovery.ts";
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -81,7 +82,9 @@ test("closure sweep caps reads, runs three together and resumes its persisted cu
 
 test.each([botIdentity, "jcfischer", undefined])("closure attribution uses receipt evidence (closer %s)", async closer => {
  journal.upsertWorker({ repo, root: 1, nodeId: "20", status: "failed" });
+ recordRecovery(journal, nodeRecoveryScope(repo, "20"), { kind: "infrastructure", operation: "worker-supervisor", evidence: "crashed after close", action: "inspect" });
  const outcome = await finishClosedElsewhere({ ...context(), node: node("20", closer), pr: null, generation: 0 });
+ expect(activeRecovery(journal, nodeRecoveryScope(repo, "20"))).toMatchObject({ status: "complete", attempts: 0 });
  expect(outcome.status).toBe("released");
  const events = journal.listEvents(repo);
  expect(events[0]?.kind).toBe(closer === undefined ? "closed-elsewhere-ungated" : closer === botIdentity ? "closed" : "closed-elsewhere");
@@ -96,7 +99,9 @@ test.each([botIdentity, "jcfischer", undefined])("closure attribution uses recei
 test.each([botIdentity, "jcfischer", undefined])("merged closure preserves deadman unless it recovers ranger's own close (closer %s)", async closer => {
  journal.upsertWorker({ repo, root: 1, nodeId: "20", status: "failed" });
  journal.bumpDeadman(); journal.bumpDeadman();
+ recordRecovery(journal, nodeRecoveryScope(repo, "20"), { kind: "infrastructure", operation: "worker-supervisor", evidence: "crashed after close", action: "inspect" });
  const outcome = await finishClosedElsewhere({ ...context(), node: node("20", closer), pr: mergedPr, generation: 0 });
+ expect(activeRecovery(journal, nodeRecoveryScope(repo, "20"))).toMatchObject({ status: "complete", attempts: 0 });
  expect(outcome.status).toBe("success");
  expect(journal.deadmanCount()).toBe(closer === botIdentity ? 0 : 2);
 });
@@ -160,6 +165,7 @@ test("sweep handles crashed workers before graph closure reads", async () => {
  journal.upsertWorker({ repo, root: 1, nodeId: "20", status: "failed" });
  const order: string[] = [];
  const read = spyOn(graph, "graphNode").mockImplementation(async (_repo, id) => {
+  expect(journal.getWorker("crashed", repo)?.status).toBe("parked");
   order.push(`read-${id}`);
   return { ...node(id), status: "open" };
  });
@@ -168,7 +174,7 @@ test("sweep handles crashed workers before graph closure reads", async () => {
    order.push(`respawn-${id}`); return null;
   } });
   expect(outcome.crashed).toBe(1);
-  expect(order).toEqual(["respawn-crashed", "read-20", "read-crashed"]);
+  expect(order.sort()).toEqual(["read-20", "read-crashed"]);
  } finally { read.mockRestore(); }
 });
 

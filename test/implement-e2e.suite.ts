@@ -1,3 +1,4 @@
+import { resetRecovery, nodeRecoveryScope } from "../src/recovery.ts";
 import { createShadowTestBackend, type ShadowComparison } from "../src/remote-test/shadow.ts";
 import { githubCiVerdict } from "../src/github-ci.ts";
 import { evaluateMergeGate } from "../src/merge-gate.ts";
@@ -1440,7 +1441,7 @@ describe("implement lane (node #23)", () => {
   }, 60_000);
  });
 
- test("a transient GitHub error at review is not counted and leaves the row for the sweep (found live on #45)", async () => {
+ test("opaque reviewer connectivity text holds visibly without charging a code strike", async () => {
   const r = await rig({});
   cleanup.push(r.dir);
   r.ctx.reviewer = async () => {
@@ -1449,12 +1450,11 @@ describe("implement lane (node #23)", () => {
    );
   };
   const outcome = await runNode("20", r.ctx);
-  expect(outcome.status).toBe("failed");
+  expect(outcome.status).toBe("parked");
   expect(r.journal.deadmanCount()).toBe(0);
-  // Still running under this supervisor's PID: when it exits, the sweep sees a crash and respawns.
-  expect(r.journal.getWorker("20", "acme/widgets")?.status).toBe("running");
-  expect(r.journal.listEvents().some((e) => e.kind === "transient")).toBe(true);
-  // The pushed work and the PR survive for the respawn to pick up.
+  expect(r.journal.getWorker("20", "acme/widgets")?.status).toBe("parked");
+  expect(r.journal.listEvents().some((e) => e.kind === "transient")).toBe(false);
+  expect(outcome.detail).toContain("unknown recovery");
   expect(r.github.prs.size).toBe(1);
  }, 60_000);
 
@@ -1744,9 +1744,9 @@ describe("implement lane (node #23)", () => {
    expect(r.journal.getWorker("20", "acme/widgets")).toMatchObject({ status: timedOut ? "parked" : "success", attempts: 0 });
    expect(r.journal.deadmanCount()).toBe(0);
    const events = r.journal.listEvents("acme/widgets", 200);
-   expect(events.some((e) => e.kind === "transient")).toBe(false);
+   expect(events.some((e) => e.kind === "transient")).toBe(timedOut);
    if (timedOut) {
-    expect(outcome.detail).toStartWith("close after merge: soma graph close 20");
+    expect(outcome.detail).toContain("soma graph close 20");
     expect(outcome.detail).toContain("timed out after 660s");
     expect(outcome.detail).not.toContain("refused");
     expect(events.some((e) => e.kind === "closed")).toBe(false);
@@ -1759,18 +1759,16 @@ describe("implement lane (node #23)", () => {
   } finally { close.mockRestore(); }
  }, 60_000);
 
- test("a close that hits gh's network error is left for the sweep, uncounted, not parked (soma #795, 2026-10-13)", async () => {
+ test("opaque close transport text parks visibly without charging a code strike", async () => {
   const { r, outcome } = await closeFailing(
-   "gh api GET repos/acme/widgets/issues/20 failed (exit 1): error connecting to api.github.com\ncheck your internet connection or https://githubstatus.com",
+   "gh api GET repos/acme/widgets/issues/20 failed (exit 1): error connecting to api.github.com",
   );
-  expect(outcome.status).toBe("failed");
+  expect(outcome.status).toBe("parked");
   expect(r.journal.deadmanCount()).toBe(0);
-  expect(r.journal.getWorker("20", "acme/widgets")?.status).toBe("running");
-  expect(r.journal.listEvents("acme/widgets", 200).some((e) => e.kind === "transient")).toBe(true);
+  expect(r.journal.getWorker("20", "acme/widgets")?.status).toBe("parked");
+  expect(r.journal.getWorker("20", "acme/widgets")?.outcome).toContain("unknown");
   expect(state(r.statePath).nodes["20"].status).not.toBe("closed");
-  r.journal.updateWorker("20", "acme/widgets", { pid: 2_147_483_647 });
-  expect((await runNode("20", r.ctx)).status).toBe("success");
-  expect(state(r.statePath).nodes["20"].status).toBe("closed");
+  expect(await deskTick(r)).toEqual([]);
  }, 60_000);
 
  test("a refused close keeps bun's failing tests and counts in the worker row and parked event (node #406)", async () => {
@@ -1778,11 +1776,12 @@ describe("implement lane (node #23)", () => {
   const { r, outcome } = await closeFailing(
    `probe command:bun run test|/repo|1800|0 on node 20 ran and failed: exit 1:\n${"(pass) a passing test\n".repeat(100)}${failures}`,
   );
-  expect(outcome.status).toBe("parked");
+  expect(outcome.status).toBe("failed");
   const worker = r.journal.getWorker("20", "acme/widgets");
-  const parked = r.journal.listEvents("acme/widgets", 200).filter(e => e.kind === "parked" && e.nodeId === "20");
-  expect(worker).toMatchObject({ status: "parked", phase: "close" });
+  const parked = r.journal.listEvents("acme/widgets", 200).filter(e => e.kind === "refused" && e.nodeId === "20");
+  expect(worker).toMatchObject({ status: "failed", phase: "close" });
   expect(parked).toHaveLength(1);
+  expect(r.journal.deadmanCount()).toBe(1);
   for (const stored of [worker?.outcome, parked[0]?.detail]) {
    expect(stored).toStartWith("close refused after merge: probe command:bun run test");
    expect(stored).toContain("(fail) close gate > names the failed tests [5000.00ms]");
@@ -1798,10 +1797,11 @@ describe("implement lane (node #23)", () => {
   const { r, outcome } = await closeFailing(
    `probe command:bun run test|/repo|1800|0 on node 20 ran and failed: exit 1:\n${"(pass) a passing test\n".repeat(100)}${failures.join("\n")}\n 1200 pass\n 20 fail\nRan 1220 tests across 180 files.`,
   );
-  expect(outcome.status).toBe("parked");
+  expect(outcome.status).toBe("failed");
   const worker = r.journal.getWorker("20", "acme/widgets");
-  const parked = r.journal.listEvents("acme/widgets", 200).filter(e => e.kind === "parked" && e.nodeId === "20");
+  const parked = r.journal.listEvents("acme/widgets", 200).filter(e => e.kind === "refused" && e.nodeId === "20");
   expect(parked).toHaveLength(1);
+  expect(r.journal.deadmanCount()).toBe(1);
   for (const stored of [worker?.outcome, parked[0]?.detail]) {
    for (let i = 1; i <= 5; i++) expect(stored).toContain(`(fail) failure ${i} > long test name`);
    expect(stored).toContain("20 fail");
@@ -1822,13 +1822,13 @@ describe("implement lane (node #23)", () => {
   expect(r.journal.getWorker("20", "acme/widgets")?.status).toBe("parked");
  }, 60_000);
 
- test("a close parked on a transient error before this rule is still re-run by the merge desk", async () => {
+ test("a legacy close containing opaque transport text requires explicit intervention", async () => {
   const { r } = await closeFailing("Close refused.\n\nprobe outside the probe tree");
   // The row as soma #795 left it on 2026-10-13: parked in the close on gh's network error.
   r.journal.updateWorker("20", "acme/widgets", {
    outcome: "close refused after merge: gh api GET repos/acme/widgets/issues/20 failed (exit 1): error connecting to api.github.com",
   });
-  expect(await deskTick(r)).toEqual(["20"]);
+  expect(await deskTick(r)).toEqual([]);
  }, 60_000);
 
  test("propose node filed by the machine account is refused (node #9 ban)", async () => {
@@ -2359,6 +2359,7 @@ describe("implement lane (node #23)", () => {
   const fixes = () => (r.github.comments.get(1) ?? []).filter((c) => c.body.includes("ranger:probe-fix"));
   expect(fixes()).toHaveLength(1);
 
+  resetRecovery(r.journal, nodeRecoveryScope("acme/widgets", "20"));
   reclaim(r);
   const resumed = await runNode("20", r.ctx);
   expect(resumed.status).toBe("parked");
@@ -3182,7 +3183,7 @@ describe("implement lane (node #23)", () => {
     if (command === r.ctx.map.commands.test) return Promise.resolve({ code: -1, stdout: "(fail) a shared flake\n 1 fail\n", stderr: "timed out" });
     return runCmd("/bin/sh", ["-c", command], opts);
    };
-   expect((await runNode("20", r.ctx)).status).toBe("failed");
+   expect((await runNode("20", r.ctx)).status).toBe("parked");
    expect(baseRuns(r.calls)).toEqual([]);
    expect(reviewed(r).some((d) => d.includes("merge base") || d.includes("merge-base"))).toBe(false);
   }, 60_000);

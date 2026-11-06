@@ -1,3 +1,6 @@
+import { isRetryableStatus } from "./transient.ts";
+import type { OperationOutcome } from "./operation-outcome.ts";
+import { OperationFailure } from "./operation-outcome.ts";
 import type { ChangeRequest, CiPurpose, CiVerdict, ForgePort, ForgeReadPort, IssueComment, MergeOutcome, MergeState, RebaseOutcome } from "./forge.ts";
 import type { RangerConfig } from "./config.ts";
 import { parseForgeRef } from "./forge-ref.ts";
@@ -6,11 +9,15 @@ import { parseGlabResponse } from "./glab-transport.ts";
 import { assertReadOnlyToken, GateError, gitlabApiRead, tokenBatch, type ResolvedToken } from "./token-gate.ts";
 import { assertWriteIdentity, gitlabApiWrite, resolveWriteToken, WriteGateError } from "./identity.ts";
 
+function gitlabOutcome(endpoint: string, message: string, status?: number): OperationOutcome {
+ return { kind: status !== undefined && isRetryableStatus(status) ? "infrastructure" : "unknown", operation: `glab:${endpoint}`, evidence: `${endpoint}: ${message}${status === undefined ? "" : ` HTTP ${status}`}`, action: "restore forge access and retry" };
+}
+
 /** Transport and schema failures never become a passing gate value. */
-export class GitLabReadError extends Error {
+export class GitLabReadError extends OperationFailure {
  override readonly name = "GitLabReadError";
  constructor(message: string, readonly endpoint: string, readonly status?: number) {
-  super(`${endpoint}: ${message}`);
+  super(gitlabOutcome(endpoint, message, status));
  }
 }
 
@@ -343,10 +350,10 @@ export function gitlabLoginCiVerdict(repo: string, sha: string, env: Record<stri
 }
 
 /** Write failures never echo subprocess output or retry an uncertain mutation. */
-export class GitLabWriteError extends Error {
+export class GitLabWriteError extends OperationFailure {
  override readonly name = "GitLabWriteError";
  constructor(message: string, readonly endpoint: string, readonly status?: number) {
-  super(`${endpoint}: ${message}`);
+  super(gitlabOutcome(endpoint, message, status));
  }
 }
 

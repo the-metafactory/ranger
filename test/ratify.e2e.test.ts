@@ -1,3 +1,4 @@
+import { activeRecovery, resetRecovery, nodeRecoveryScope } from "../src/recovery.ts";
 import { describe, expect, test } from "bun:test";
 import { cpSync, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -148,6 +149,7 @@ async function fixture(opts: { pinBot?: boolean; readsPerTick?: number; spawnCap
 async function propose(f: Fixture): Promise<void> {
  const walked = await runCmd(bun, ["--preload", join(import.meta.dir, "fixtures", "research-timing.ts"), cliPath, "walk", "-c", f.config], { env: testCliEnv(f.env) });
  expect(walked.code).toBe(0);
+ f.journal(j => resetRecovery(j, nodeRecoveryScope(REPO, "10")));
  const run = await runCmd(bun, ["--preload", join(import.meta.dir, "fixtures", "research-timing.ts"), cliPath, "run-node", "10", "--map", REPO, "-c", f.config], { env: testCliEnv(f.env) });
  expect(run.code).toBe(0);
  expect(JSON.parse(run.stdout).status).toBe("proposed");
@@ -280,18 +282,20 @@ describe("ratify phase (node #250)", () => {
   }
  }, 60_000);
 
- test("a ratified close whose run-node did not spawn stays proposed and spawns next tick", async () => {
+ test("a ratified close whose run-node did not spawn retains its proposal with bounded recovery", async () => {
   const f = await fixture();
   try {
    seedProposal(f, "10", "9001", "2026-10-01T00:00:00.000Z");
    f.writeFrontier([]);
    f.patchState((s) => { s.reactions = { "9001": [[r("jcfischer", "+1")]] }; });
    const failed = await f.tick({}, null);
-   expect(failed.result.ratify.errors.join("\n")).toContain("did not spawn");
+   expect(failed.result.ratify.deferred).toContain(`${REPO}#10`);
    expect(f.journal((j) => j.getWorker("10", REPO))).toMatchObject({ status: "proposed", phase: null });
+   expect(f.journal(j => activeRecovery(j, nodeRecoveryScope(REPO, "10")))).toMatchObject({ attempts: 1, kind: "infrastructure" });
+   expect((await f.tick()).spawned).toEqual([]);
    const next = await f.tick();
-   expect(next.spawned).toEqual(["10"]);
-   expect(f.journal((j) => j.getWorker("10", REPO))).toMatchObject({ status: "running", phase: "close" });
+   expect(next.spawned).toEqual([]);
+   expect(f.journal((j) => j.getWorker("10", REPO))).toMatchObject({ status: "proposed", phase: null });
   } finally {
    f.stop();
   }

@@ -134,7 +134,7 @@ describe("node #165 — ranger drain", () => {
     expect(maps[i].gated).toBe(false);
    }
    expect(maps[1].drained).toBeUndefined();
-   expect(r.journal.spawnsToday()).toBe(1);
+   expect(r.journal.spawnsToday()).toBe(0);
    expect(r.journal.listEvents().some((e) => e.kind === "drain" && /visual lane drained/.test(e.detail ?? ""))).toBe(true);
   } finally { r.close(); }
  });
@@ -176,7 +176,7 @@ describe("node #165 — ranger drain", () => {
    expect(maps[0].drained).toBeUndefined();
    expect((await r.cli(["drain", "--map", TOOL, "--off"])).code).toBe(0);
    const recovered = await walked(r);
-   expect(recovered.map((m) => m.claimed)).toEqual([["30"], ["20"], []]);
+   expect(recovered.map((m) => m.claimed)).toEqual([[], ["20"], ["30"]]);
    expect(recovered[1].errors.join(" ")).toContain("fresh claims held");
   } finally { r.close(); }
  });

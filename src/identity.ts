@@ -1,3 +1,4 @@
+import { OperationFailure } from "./operation-outcome.ts";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -21,7 +22,7 @@ import { workerEnvPasses } from "./untrusted-env.ts";
  * preserves an inherited operator restriction.
  */
 
-export class WriteGateError extends Error {
+export class WriteGateError extends OperationFailure {
  override readonly name = "WriteGateError";
  /**
   * True when the gate could not be evaluated (the forge's identity read failed
@@ -30,7 +31,7 @@ export class WriteGateError extends Error {
   * transient gate without counting a failed start (node #158).
   */
  constructor(message: string, readonly transient = false) {
-  super(message);
+  super({ kind: transient ? "infrastructure" : "human", operation: "write-identity", evidence: message, action: transient ? "restore identity service connectivity before retrying" : "correct the write identity or credential mapping before resuming" });
  }
 }
 

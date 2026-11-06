@@ -2,6 +2,8 @@ import { spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { mapKey } from "./maps.ts";
 
+export const spawningEnabled = () => process.env.RANGER_NO_SPAWN !== "1";
+
 export interface SpawnRunNodeArgs {
  generation?: number;
  nodeId: string;
@@ -42,7 +44,7 @@ export async function spawnRunNodeDetached(
 ): Promise<number | null> {
  // Test/operational seam: claim without spawning a worker (simulation, or a
  // run where the operator drives run-node by hand).
- if (process.env.RANGER_NO_SPAWN === "1") {
+ if (!spawningEnabled()) {
   return null;
  }
  const child = spawn(

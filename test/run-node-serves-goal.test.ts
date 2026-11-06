@@ -61,9 +61,9 @@ describe("run-node serves.goal from the map root (node #263)", () => {
     RANGER_JOURNAL_PATH: f.journal.path,
    }, f.dir);
    expect(output.code).toBe(0);
-   expect(JSON.parse(output.stdout).status).toBe("failed");
+   expect(JSON.parse(output.stdout).status).toBe("parked");
    // The fake's error includes this run's temporary fixture directory.
-   outputs.push({ ...output, stdout: output.stdout.replaceAll(f.dir, "FIXTURE") });
+   outputs.push({ ...output, stdout: JSON.stringify({ ...JSON.parse(output.stdout), detail: JSON.parse(output.stdout).detail.replaceAll(f.dir, "FIXTURE") }) });
    if (bus !== null) {
     const puts = spool(f).filter(op => op.op === "put");
     expect(puts).toHaveLength(1);

@@ -1,3 +1,8 @@
+import { quietHostGate, queuedResumeStale, queueSpawnGate, whenFreeQueues, queueEntryGate } from "./resume-gates.ts";
+export { quietHostGate, queuedResumeStale, queueSpawnGate, whenFreeQueues, queueEntryGate, type QueueEntryGate } from "./resume-gates.ts";
+import { resolveNodeSelector, workerPreflight, type DispatchDeps } from "./node-dependency.ts";
+import { OperationFailure } from "./operation-outcome.ts";
+import { activeRecovery, nodeRecoveryScope, recoveryHold, resetRecovery } from "./recovery.ts";
 import { startOwnedWorker, reservationPending } from "./node-ownership.ts";
 import { join } from "node:path";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
@@ -6,7 +11,7 @@ import { laneCredentialRefusal } from "./forge-lanes.ts";
 import { changeRequestNoun } from "./forge-text.ts";
 import { pidAlive } from "./exec.ts";
 import { assertWriteIdentity, WriteGateError } from "./identity.ts";
-import type { Journal, ResumeQueueRow, WorkerRow, WorkerStatus } from "./journal.ts";
+import type { Journal, ResumeQueueRow, WorkerStatus } from "./journal.ts";
 import { implementLane, startsImplementSession, type ImplementLane } from "./lanes.ts";
 import { graphNode, GRAPH_CALL_TIMEOUT_MS } from "./graph.ts";
 import type { ForgePort } from "./forge.ts";
@@ -14,11 +19,10 @@ import type { ResolvedToken } from "./token-gate.ts";
 import type { OwnedCheck } from "./lock.ts";
 import { laneHeldMessage, mapKey, recordImplementStart, resumeMap } from "./maps.ts";
 import { spawnRunNodeDetached, type SpawnRunNodeArgs } from "./spawn.ts";
-import { busyLoadFor, hostBusy, isQuiet, realHostLoad, type HostLoad, type HostLoadReading } from "./host-load.ts";
-import { waitingForQuietHost } from "./outcomes.ts";
+import { busyLoadFor, hostBusy, realHostLoad, type HostLoad, type HostLoadReading } from "./host-load.ts";
 import { unchangedHeadPark } from "./worktree-head.ts";
 
-export interface ResumeContext {
+export interface ResumeContext extends DispatchDeps {
  config: RangerConfig;
  configPath: string;
  journal: Journal;
@@ -26,18 +30,6 @@ export interface ResumeContext {
  now?: () => Date;
  /** The host load queued resumes wait on (node #297); tests inject a quiet or busy host. */
  hostLoad?: HostLoad;
-}
-
-/**
- * Why a queued entry waits for the host, or null when it need not: every
- * queued resume, ranger's own (node #297) and an operator's `--when-free`
- * alike, waits while the 1-minute load is at or above its lane's busy load
- * (`busyLoadFor`, node #312; else the core count). A start on a busy host is what timed soma #802 and
- * #853 out (2026-10-14). `ranger serve` shows the same reason.
- */
-export function quietHostGate(host: HostLoadReading | undefined, busyLoad?: number): string | null {
- if (host === undefined || isQuiet(host, busyLoad)) return null;
- return waitingForQuietHost(host, busyLoad);
 }
 
 /** The same identity gate as run-node: the forge credential refusal, then the bot's write identity. */
@@ -53,66 +45,10 @@ const transientGate = (error: unknown) => error instanceof WriteGateError && err
 const releasedError = (nodeId: string) => new Error(`node ${nodeId}'s claim was released — the walk re-claims it from the frontier`);
 const missingRowError = (nodeId: string, repo: string) => new Error(`no journal row for node ${nodeId} on ${repo} — nothing to resume`);
 
-export const queuedResumeStale = (status: WorkerStatus) => status === "released" || status === "claimed" || status === "running";
-
-/**
- * Pass 1c's spawn gates for a queue head, in the walk's order: the dead-man
- * pause, a holder of the entry's lane, the spent daily spawn cap. Why the
- * head waits, or null when it may start. `ranger serve` reads its "next"
- * head through this same gate (node #166).
- */
-export function queueSpawnGate(g: {
- paused: boolean;
- lane: ImplementLane;
- holder: { nodeId: string; repo: string } | null;
- spawns: number;
- cap: number;
-}): string | null {
- if (g.paused) return "dead-man paused: queued resumes wait for `ranger resume-run`";
- if (g.holder !== null) return `waits for the ${g.lane} lane, held by #${g.holder.nodeId} (${g.holder.repo})`;
- if (g.spawns >= g.cap) return `waits: the daily spawn cap (${g.cap}) is spent`;
- return null;
-}
-
 /** The journal's spawn gates for a queued start; the lane holder, when it matters, is the caller's. */
 const spawnGate = (journal: Journal, config: RangerConfig, now: Date, lane: ImplementLane,
  holder: { nodeId: string; repo: string } | null = null) =>
  queueSpawnGate({ paused: journal.isPaused(), lane, holder, spawns: journal.spawnsToday(now), cap: config.workers.spawnCapPerDay });
-
-/**
- * Whether `resume-node --when-free` queues the row rather than starting it:
- * an implement session, and its lane held, the node already queued, or a
- * queue already waiting in that lane. `ranger serve` offers its "Queue
- * resume" by this same rule (node #166).
- */
-export const whenFreeQueues = (row: Pick<WorkerRow, "lane" | "phase">,
- lane: { held: boolean; queued: boolean; backlog: number; busy?: boolean }) =>
- startsImplementSession(row) && (lane.held || lane.queued || lane.backlog > 0 || lane.busy === true);
-
-/**
- * The resume queue's journal-only gate for one entry, ahead of the spawn
- * gates and any forge read: what Pass 1c does with it, and what `ranger
- * serve` shows (node #166). `drop` leaves the queue and holds nothing;
- * `defer` stays and holds its lane's queue behind it; `behind` waits for an
- * earlier entry or a claim already holding the lane this tick. Null passes
- * the entry on to the spawn gates (pause, spawn cap, lane holder).
- */
-export type QueueEntryGate = { kind: "drop" | "defer"; reason: string } | { kind: "behind" } | null;
-export function queueEntryGate(
- entry: Pick<ResumeQueueRow, "root" | "lane">,
- map: { walk: RangerMapConfig["walk"]; lane: ImplementLane } | undefined,
- row: Pick<WorkerRow, "status" | "root"> | null,
- laneWaiting: boolean,
-): QueueEntryGate {
- if (map?.walk === "none") return { kind: "drop", reason: "map is walk: none" };
- if (laneWaiting) return { kind: "behind" };
- if (row !== null && queuedResumeStale(row.status)) return { kind: "drop", reason: `worker row is ${row.status}` };
- if (map === undefined) return { kind: "defer", reason: "map is no longer registered" };
- if (row === null) return { kind: "defer", reason: "worker row is missing" };
- if (row.root !== entry.root) return { kind: "defer", reason: "worker map root changed" };
- if (entry.lane !== map.lane) return { kind: "defer", reason: `map implement lane changed from ${entry.lane} to ${map.lane}` };
- return null;
-}
 
 interface ResumeResult {
  nodeId: string;
@@ -130,10 +66,13 @@ export type ResumeOutcome = ResumeResult & (
 /** Caller holds the claim lock. CLI and queued resumes use this same startup path. */
 export async function startResumeNode(
  nodeId: string, map: RangerMapConfig, ctx: ResumeContext, owned: OwnedCheck,
- options: { force?: boolean; queued?: ResumeQueueRow } = {},
+ options: { force?: boolean; queued?: ResumeQueueRow; resetRecovery?: boolean } = {},
 ): Promise<ResumeOutcome> {
  const { journal } = ctx;
  await identityGate(ctx.config, map);
+ if (options.resetRecovery) resetRecovery(journal, nodeRecoveryScope(map.repo, nodeId));
+ const held = recoveryHold(journal, nodeRecoveryScope(map.repo, nodeId), ctx.now?.() ?? new Date());
+ if (held !== null) throw new Error(`${held}; use resume-node --reset-recovery after intervention`);
  const row = journal.getWorker(nodeId, map.repo);
  if (row === null) throw missingRowError(nodeId, map.repo);
  journal.assertWorkerRoot(nodeId, map.repo, map.root);
@@ -174,12 +113,17 @@ export async function startResumeNode(
  const spawner = ctx.spawnRunNode ?? spawnRunNodeDetached;
  let spawnError: Error | undefined;
  const pid = await startOwnedWorker({ journal, row, now,
+  preflight: () => workerPreflight(row, map, { ...ctx, nodeSelector: resolveNodeSelector(ctx) }),
   onSpawnFailure: error => { spawnError = error; },
   spawn: generation => spawner({ nodeId, repo: map.repo, root: map.root, generation,
    cliEntry: join(import.meta.dir, "cli.ts"), configPath: ctx.configPath }),
  });
  owned();
- if (pid === null) throw spawnError ?? new Error("run-node spawn returned no PID or ownership was taken");
+ if (pid === null) {
+  const recovery = activeRecovery(journal, nodeRecoveryScope(map.repo, nodeId));
+  if (recovery !== null && recovery.status !== "complete") throw new OperationFailure({ kind: recovery.kind, operation: recovery.operation, target: recovery.target, evidence: recovery.evidence, action: recovery.action });
+  throw spawnError ?? new Error("run-node spawn returned no PID or ownership was taken");
+ }
  if (takesLane) recordImplementStart(journal, map);
  if (options.queued !== undefined) journal.recordSpawn(now);
  const entry = options.queued ?? journal.getResume(map.repo, nodeId);
@@ -189,8 +133,8 @@ export async function startResumeNode(
 }
 
 export async function resumeNode(nodeId: string, selector: string | undefined, ctx: ResumeContext,
- options: { force?: boolean; whenFree?: boolean; cancel?: boolean } = {}) {
- if ((options.cancel && (options.force || options.whenFree)) || (options.force && options.whenFree)) {
+ options: { force?: boolean; whenFree?: boolean; cancel?: boolean; resetRecovery?: boolean } = {}) {
+ if ((options.cancel && (options.force || options.whenFree || options.resetRecovery)) || (options.force && options.whenFree)) {
   throw new Error("--cancel, --when-free and --force are mutually exclusive");
  }
  return withClaimLock(ctx.journal, async owned => {
@@ -218,10 +162,11 @@ export async function resumeNode(nodeId: string, selector: string | undefined, c
   })) {
    await identityGate(config, map);
    owned();
+   if (options.resetRecovery) resetRecovery(journal, nodeRecoveryScope(map.repo, nodeId), { owner: { nodeId, repo: map.repo, generation: row.generation } });
    const entry = journal.enqueueResume({ nodeId, repo: map.repo, root: map.root, lane }, ctx.now?.() ?? new Date());
    return { nodeId, repo: map.repo, root: map.root, queued: true, lane: entry.lane, queuedAt: entry.queuedAt };
   }
-  return startResumeNode(nodeId, map, ctx, owned, { force: options.force });
+  return startResumeNode(nodeId, map, ctx, owned, { force: options.force, resetRecovery: options.resetRecovery });
  });
 }
 
@@ -257,7 +202,7 @@ export async function processResumeQueue(
    owned();
    journal.recordEvent("sweep", { nodeId: entry.nodeId, repo: entry.repo,
     detail: `queued resume #${entry.nodeId} deferred: ${reason}` });
-   state?.errors.push(`queued resume #${entry.nodeId}: ${reason}`);
+   if (failedStart) state?.errors.push(`queued resume #${entry.nodeId}: ${reason}`);
    if (failedStart && journal.recordResumeStartFailure(entry, reason)) return;
    waiting.add(entry.lane);
   };
@@ -271,6 +216,11 @@ export async function processResumeQueue(
   // not, the entry still defers and holds its lane, never skips silently.
   if (state === undefined || map === undefined || row === null) {
    defer(state === undefined ? "map state is unavailable" : "map or worker row is unavailable");
+   continue;
+  }
+  const recoveryWait = recoveryHold(journal, nodeRecoveryScope(entry.repo, entry.nodeId), ctx.now?.() ?? new Date());
+  if (recoveryWait !== null) {
+   journal.recordEvent("sweep", { nodeId: entry.nodeId, repo: entry.repo, detail: `queued recovery deferred: ${recoveryWait}` });
    continue;
   }
   // The lane holder is read at the start itself (startResumeNode), after the
@@ -326,7 +276,7 @@ export async function processResumeQueue(
      break;
    }
   } catch (error) {
-   defer(`start failed: ${error instanceof Error ? error.message : String(error)}`, !transientGate(error));
+   defer(`start failed: ${error instanceof Error ? error.message : String(error)}`, !(error instanceof OperationFailure && ["infrastructure", "dependency"].includes(error.outcome.kind)) && !transientGate(error));
   }
  }
 }

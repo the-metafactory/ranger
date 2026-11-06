@@ -1,3 +1,4 @@
+import { walk } from "../src/walk.ts";
 import { describe, expect, test } from "bun:test";
 import { readFileSync as read, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -63,6 +64,17 @@ function rig(cap = 10, laneSlots?: { visual?: number; headless?: number }) {
  return { config, configPath, journal, env, raw, data, close() {
   journal.close(); discord.stop(); rmSync(dir, { recursive: true, force: true });
  } };
+}
+
+async function startedWalk(r: ReturnType<typeof rig>) {
+ const saved = { ...process.env };
+ try {
+  Object.assign(process.env, r.env);
+  return await walk({ ...r, spawnRunNode: async () => process.pid });
+ } finally {
+  for (const key of Object.keys(process.env)) if (!(key in saved)) Reflect.deleteProperty(process.env, key);
+  Object.assign(process.env, saved);
+ }
 }
 
 describe("node #57/#47 — root-aware resource lanes", () => {
@@ -155,9 +167,7 @@ describe("node #57/#47 — root-aware resource lanes", () => {
    const r = rig();
    try {
     if (occupied) r.journal.upsertWorker({ root: 1, nodeId: "90", repo: GAME, status: "running", lane: "implement", pid: process.pid });
-    const out = await runCli(["walk", "-c", r.configPath], r.env);
-    expect(out.code).toBe(0);
-    const result = JSON.parse(out.stdout);
+    const result = await startedWalk(r);
     expect(result.maps.map((m: { claimed: string[] }) => m.claimed)).toEqual(occupied ? [[], ["20"], []] : [["10"], ["20"], []]);
     expect(r.journal.spawnsToday()).toBe(occupied ? 1 : 2);
    } finally { r.close(); }
@@ -167,9 +177,7 @@ describe("node #57/#47 — root-aware resource lanes", () => {
  test("the daily spawn cap bounds visual and headless implement claims together", async () => {
   const r = rig(1);
   try {
-   const out = await runCli(["walk", "-c", r.configPath], r.env);
-   expect(out.code).toBe(0);
-   const result = JSON.parse(out.stdout);
+   const result = await startedWalk(r);
    expect(result.maps.map((m: { claimed: string[] }) => m.claimed)).toEqual([["10"], [], []]);
    expect(result.maps[1].spawnCapExhausted).toBe(true);
    expect(r.journal.spawnsToday()).toBe(1);
@@ -184,9 +192,7 @@ describe("node #57/#47 — root-aware resource lanes", () => {
    const fixture = JSON.parse(read(path, "utf8"));
    fixture.frontier[0].node.kind = "research";
    writeFileSync(path, JSON.stringify(fixture));
-   const out = await runCli(["walk", "-c", r.configPath], r.env);
-   expect(out.code).toBe(0);
-   const result = JSON.parse(out.stdout);
+   const result = await startedWalk(r);
    expect(result.maps.map((m: { claimed: string[] }) => m.claimed)).toEqual([["10"], [], []]);
    expect(result.maps[1].spawnCapExhausted).toBe(true);
    expect(r.journal.spawnsToday()).toBe(1);
@@ -227,7 +233,7 @@ describe("node #57/#47 — root-aware resource lanes", () => {
    expect(blocked.code).toBe(1);
    expect(blocked.stderr).toMatch(/headless implement lane.*#20.*acme\/ranger#1/);
    expect(r.journal.getWorker("21", TOOL)?.status).toBe("parked");
-   expect((await runCli(["resume-node", "20", "--map", TOOL, "-c", r.configPath], r.env)).stderr).toContain("still running");
+   expect((await runCli(["resume-node", "20", "--map", TOOL, "--reset-recovery", "-c", r.configPath], r.env)).stderr).toContain("still running");
   } finally { r.close(); }
  });
 
@@ -254,7 +260,7 @@ describe("node #57/#47 — root-aware resource lanes", () => {
    expect(JSON.parse(first.stdout)).toMatchObject({ nodeId: "20", lane: "implement", beside: null });
    expect(r.journal.getWorker("20", TOOL)).toMatchObject({ status: "parked", lane: "implement" });
    r.journal.updateWorker("20", TOOL, { status: "running", pid: process.pid });
-   expect(r.journal.spawnsToday()).toBe(1);
+   expect(r.journal.spawnsToday()).toBe(0);
    const held = await runCli(["build-now", "21", "--map", TOOL, "-c", r.configPath], r.env);
    expect(held.code).toBe(1);
    expect(held.stderr).toMatch(/headless implement lane is held by #20.*--force/);
