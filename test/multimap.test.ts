@@ -1,3 +1,4 @@
+import { activeRecovery, nodeRecoveryScope } from "../src/recovery.ts";
 import { githubCiVerdict } from "../src/github-ci.ts";
 import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
@@ -90,6 +91,17 @@ async function withRigEnv(fn: (r: ReturnType<typeof rig>) => Promise<void>): Pro
   Object.assign(process.env, saved);
   r.close();
  }
+}
+
+async function sweepAfterBackoff(ctx: Parameters<typeof sweepMap>[0]) {
+ const first = await sweepMap(ctx);
+ const due = ctx.journal.listWorkers(ctx.map.repo, ctx.map.root).flatMap(row => {
+  const state = activeRecovery(ctx.journal, nodeRecoveryScope(row.repo, row.nodeId));
+  return state?.nextEligibleAt == null ? [] : [Date.parse(state.nextEligibleAt)];
+ });
+ if (due.length === 0) return first;
+ const next = await sweepMap({ ...ctx, now: () => new Date(Math.max(...due)) });
+ return { ...next, crashed: first.crashed + next.crashed };
 }
 
 /** A merge desk's fake forge: PR #7 for node 40, sage-clean at its head, conflicting with main. */
@@ -315,12 +327,12 @@ describe("node #47 — map identity", () => {
    for (const [nodeId, root] of [["30", 1], ["31", 460]] as const) r.journal.upsertWorker({ nodeId, repo: REPO, root, status: "running", pid: 2_147_483_646 });
    const spawns: string[] = [];
    for (const map of r.config.maps) {
-    const result = await sweepMap({ config: r.config, journal: r.journal, map, token: "unused", botIdentity: "ivy-bot",
+    const result = await sweepAfterBackoff({ config: r.config, journal: r.journal, map, token: "unused", botIdentity: "ivy-bot",
      respawn: async (id, repo, root) => { spawns.push(`${repo}#${root}:${id}`); return 2_147_483_646; } });
     expect(result.crashed).toBe(1);
    }
    expect(spawns).toEqual(["acme/widgets#1:30", "acme/widgets#460:31"]);
-   expect(r.journal.listWorkers().map(w => w.attempts)).toEqual([1, 1]);
+   expect(r.journal.listWorkers().map(w => w.attempts)).toEqual([0, 0]);
   } finally { r.close(); }
  });
 
@@ -332,13 +344,13 @@ describe("node #47 — map identity", () => {
    r.journal.setHealth(LAST_IMPLEMENT_MAP, REPO + "#1");
    r.journal.setHealth(`${LAST_IMPLEMENT_MAP}.headless`, REPO + "#1");
    expect(r.journal.laneHolder("headless", { nodeId: "30", repo: REPO })).toBeNull();
-   const result = await sweepMap({ config: r.config, journal: r.journal, map: r.config.maps[1], token: "unused", botIdentity: "ivy-bot",
+   const result = await sweepAfterBackoff({ config: r.config, journal: r.journal, map: r.config.maps[1], token: "unused", botIdentity: "ivy-bot",
     respawn: async (_id, _repo, root) => { expect(root).toBe(460); return 2_147_483_646; } });
    expect(result.respawned).toEqual(["31"]);
    expect(r.journal.getHealth(LAST_IMPLEMENT_MAP)).toBe(REPO + "#1");
    expect(r.journal.getHealth(`${LAST_IMPLEMENT_MAP}.headless`)).toBe(REPO + "#1");
    r.journal.updateWorker("31", REPO, { status: "parked", pid: null });
-   const resumed = await runCli(["resume-node", "31", "-c", r.configPath], r.env);
+   const resumed = await runCli(["resume-node", "31", "--reset-recovery", "-c", r.configPath], r.env);
    expect(resumed.code).not.toBe(0);
    expect(resumed.stderr).toContain("spawn returned no PID");
    expect(r.journal.getWorker("31", REPO)?.root).toBe(460);
@@ -353,7 +365,7 @@ describe("node #47 — map identity", () => {
    r.journal.upsertWorker({ nodeId: "30", repo: REPO, root: 1, status: "running", lane: "implement" });
    r.journal.upsertWorker({ nodeId: "31", repo: REPO, root: 460, status: "running", lane: "implement", pid: 2_147_483_646 });
    let spawned = false;
-   const result = await sweepMap({ config: r.config, journal: r.journal, map: r.config.maps[1], token: "unused", botIdentity: "ivy-bot",
+   const result = await sweepAfterBackoff({ config: r.config, journal: r.journal, map: r.config.maps[1], token: "unused", botIdentity: "ivy-bot",
     respawn: async () => { spawned = true; return 2_147_483_646; } });
    expect(result.respawned).toEqual([]);
    expect(spawned).toBe(false);
@@ -368,18 +380,20 @@ describe("node #47 — map identity", () => {
     r.journal.upsertWorker({ nodeId: "30", repo: REPO, root: 1, status: "claimed", lane: "implement", pid: 2_147_483_646 });
     r.journal.upsertWorker({ nodeId: "31", repo: REPO, root: siblingRoot, status: "running", lane: "implement", pid: 2_147_483_646 });
     const spawns: string[] = [];
-    const sweep = (root: number) => sweepMap({ config: r.config, journal: r.journal,
+    const sweep = (root: number) => sweepAfterBackoff({ config: r.config, journal: r.journal,
      map: pickMap(r.config, `${REPO}#${root}`), token: "unused", botIdentity: "ivy-bot",
      respawn: async (id) => { spawns.push(id); return process.pid; } });
     await sweep(1);
     if (siblingRoot !== 1) await sweep(siblingRoot);
-    expect(spawns).toEqual(["30"]);
-    expect(r.journal.getWorker("30", REPO)?.attempts).toBe(1);
+    expect(spawns).toHaveLength(1);
+    expect(r.journal.getWorker("30", REPO)?.attempts).toBe(0);
     expect(r.journal.getWorker("31", REPO)?.attempts).toBe(0);
-    r.journal.updateWorker("30", REPO, { status: "success", pid: null });
-    expect((await sweep(siblingRoot)).respawned).toEqual(["31"]);
-    expect(spawns).toEqual(["30", "31"]);
-    expect(r.journal.getWorker("31", REPO)?.attempts).toBe(1);
+    const first = spawns[0];
+    const second = first === "30" ? "31" : "30";
+    r.journal.updateWorker(first, REPO, { status: "success", pid: null });
+    expect((await sweep(second === "30" ? 1 : siblingRoot)).respawned).toEqual([second]);
+    expect(spawns.sort()).toEqual(["30", "31"]);
+    expect(r.journal.getWorker("31", REPO)?.attempts).toBe(0);
    } finally { r.close(); }
   });
  }
@@ -391,7 +405,7 @@ describe("node #47 — map identity", () => {
     r.journal.upsertWorker({ nodeId: id, repo: REPO, root, pid, status: "running", lane: "implement" });
    }
    let spawns = 0;
-   const result = await sweepMap({ config: r.config, journal: r.journal, map: r.config.maps[1],
+   const result = await sweepAfterBackoff({ config: r.config, journal: r.journal, map: r.config.maps[1],
     token: "unused", botIdentity: "ivy-bot", respawn: async () => { spawns++; return process.pid; } });
    expect(result.respawned).toEqual([]);
    expect(spawns).toBe(0);
@@ -479,7 +493,7 @@ describe("node #47 — map identity", () => {
      return process.pid;
     },
    });
-   expect(r.journal.getWorker("45", REPO)).toMatchObject({ status: "parked", outcome: expect.stringContaining("spawn exploded") });
+   expect(r.journal.getWorker("45", REPO)).toMatchObject({ status: "parked", outcome: expect.stringContaining("died without an outcome") });
    expect(result.maps.flatMap(m => m.sweep?.mergeDesk?.resumed ?? [])).toEqual(["40"]);
 
   });

@@ -44,18 +44,19 @@ export function recoveryHold(journal: Journal, scope: string, now = new Date()):
  return null;
 }
 
-export function recordRecovery(journal: Journal, scope: string, outcome: OperationOutcome, now = new Date(), owner?: RecoveryOwner): RecoveryState {
+export function recordRecovery(journal: Journal, scope: string, outcome: OperationOutcome, now = new Date(), owner?: RecoveryOwner, attemptLimit = RECOVERY_LIMIT): RecoveryState {
  if (outcome.kind === "success" || outcome.kind === "code") throw new Error("only non-code recovery outcomes can be scheduled");
  const key = stateKey(scope, "episode");
  return journal.recoveryTransaction(owner, () => {
   const raw = journal.getHealth(key);
   const previous = raw === null ? null : recoverySchema.parse(JSON.parse(raw));
   const attempts = previous?.status === "reserved" ? previous.attempts : (previous?.status === "complete" ? 0 : previous?.attempts ?? 0) + 1;
-  const exhausted = attempts >= RECOVERY_LIMIT || outcome.kind === "human" || outcome.kind === "unknown";
+  const limit = Math.min(attemptLimit, previous?.status === "complete" ? attemptLimit : previous?.limit ?? attemptLimit);
+  const exhausted = attempts >= limit || outcome.kind === "human" || outcome.kind === "unknown";
   const pending = (previous?.status === "complete" ? [] : previous?.pending ?? []).filter(item => item.operation !== outcome.operation || item.target !== (outcome.target ?? ""));
   pending.push({ operation: outcome.operation, target: outcome.target ?? "", kind: outcome.kind as RecoveryState["kind"], evidence: outcome.evidence.slice(0, 2000), action: outcome.action });
   const state: RecoveryState = { pending, key, scope, operation: outcome.operation, target: outcome.target ?? "", kind: outcome.kind as RecoveryState["kind"],
-   attempts, limit: RECOVERY_LIMIT, status: exhausted ? "exhausted" : "waiting",
+   attempts, limit, status: exhausted ? "exhausted" : "waiting",
    nextEligibleAt: exhausted ? null : new Date(now.getTime() + (RECOVERY_BACKOFF_MS[Math.min(attempts - 1, RECOVERY_BACKOFF_MS.length - 1)] ?? 900_000)).toISOString(),
    evidence: outcome.evidence.slice(0, 2000), action: exhausted ? `${outcome.action}; explicitly reset recovery after intervention` : outcome.action };
   journal.setHealth(key, JSON.stringify(state));

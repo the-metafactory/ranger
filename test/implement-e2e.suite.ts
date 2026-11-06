@@ -3183,7 +3183,7 @@ describe("implement lane (node #23)", () => {
     if (command === r.ctx.map.commands.test) return Promise.resolve({ code: -1, stdout: "(fail) a shared flake\n 1 fail\n", stderr: "timed out" });
     return runCmd("/bin/sh", ["-c", command], opts);
    };
-   expect((await runNode("20", r.ctx)).status).toBe("failed");
+   expect((await runNode("20", r.ctx)).status).toBe("parked");
    expect(baseRuns(r.calls)).toEqual([]);
    expect(reviewed(r).some((d) => d.includes("merge base") || d.includes("merge-base"))).toBe(false);
   }, 60_000);

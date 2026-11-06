@@ -1333,7 +1333,7 @@
       "count": 6
     },
     "ranger/no-comments": {
-      "count": 206
+      "count": 204
     }
   },
   "test/implement-rig.ts": {
@@ -1740,7 +1740,7 @@
   },
   "test/walk.e2e.test.ts": {
     "ranger/no-comments": {
-      "count": 60
+      "count": 56
     }
   }
 }

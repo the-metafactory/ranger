@@ -1,3 +1,4 @@
+import { activeRecovery, nodeRecoveryScope } from "../src/recovery.ts";
 import * as exec from "../src/exec.ts";
 import { claimNode } from "../src/walk.ts";
 import { afterEach, beforeEach, expect, test, spyOn } from "bun:test";
@@ -159,10 +160,13 @@ test("concurrent sweep handles recover a dead supervisor once", async () => {
  let spawns = 0;
  const respawn = async () => { spawns++; await new Promise(resolve => setTimeout(resolve, 10)); return process.pid; };
  const context = { config, map: config.maps[0], token: "unused", botIdentity: "ivy-bot", phase: "liveness" as const, respawn };
- const results = await Promise.all([sweepMap({ ...context, journal: a }), sweepMap({ ...context, journal: b })]);
+ await Promise.all([sweepMap({ ...context, journal: a }), sweepMap({ ...context, journal: b })]);
+ expect(spawns).toBe(0);
+ const due = new Date(activeRecovery(a, nodeRecoveryScope(repo, "10"))!.nextEligibleAt!);
+ const results = await Promise.all([sweepMap({ ...context, journal: a, now: () => due }), sweepMap({ ...context, journal: b, now: () => due })]);
  expect(spawns).toBe(1);
  expect(results.flatMap(result => result.respawned)).toEqual(["10"]);
- expect(row()).toMatchObject({ generation: 1, attempts: 1, pid: process.pid });
+ expect(row()).toMatchObject({ generation: 2, attempts: 0, pid: process.pid });
 });
 
 test("a delayed desk failure cannot park a newly resumed generation", async () => {
@@ -193,7 +197,7 @@ test("orphan cleanup precedes a lane wait and preserves the unspent recovery att
    phase: "liveness", reservedLanes: new Set(["headless"]), respawn: async () => { throw new Error("lane held"); } });
   expect(result.orphansKilled).toEqual(["10"]);
   expect(kill).toHaveBeenCalledWith(1234);
-  expect(row()).toMatchObject({ status: "running", pid: 2_147_483_647, workerPgid: null, attempts: 0 });
+  expect(row()).toMatchObject({ status: "parked", pid: null, workerPgid: null, attempts: 0 });
  } finally { read.mockRestore(); kill.mockRestore(); }
 });
 
@@ -237,7 +241,38 @@ test("abandoned reservation preserves its original probe evidence", async () => 
  a.updateWorker("10", repo, { outcome: evidence });
  a.reserveWorker(row(), {}, new Date(0));
  await sweepMap({ config, journal: a, map: config.maps[0], token: "unused", botIdentity: "bot", phase: "liveness" });
- expect(row().outcome).toStartWith(evidence);
+ expect(row().outcome).toContain(evidence);
  expect(row().outcome).toContain("abandoned worker reservation");
  expect(await freshClaim("21", async () => 123)).toMatchObject({ claimed: false, error: expect.stringContaining("fresh claims held") });
+});
+
+test.each([1, 2])("dead supervisors exhaust configured respawns=%s durably without fresh frontier replenishment", async maxAttempts => {
+ config.workers.maxAttempts = maxAttempts;
+ const limit = maxAttempts + 1;
+ let now = new Date("2026-11-06T00:00:00Z");
+ let spawns = 0;
+ a.updateWorker("10", repo, { status: "running", pid: 2_147_483_647, phase: "close" });
+ const tick = () => sweepMap({ config, journal: a, map: config.maps[0], token: "unused", botIdentity: "bot",
+  now: () => now, phase: "liveness", respawn: async () => { spawns++; return 2_147_483_647; } });
+ for (let attempt = 1; attempt <= limit; attempt++) {
+  await tick();
+  const state = activeRecovery(a, nodeRecoveryScope(repo, "10"))!;
+  expect(state.attempts).toBe(attempt);
+  expect(row()).toMatchObject({ status: "parked", pid: null, attempts: 0 });
+  expect(await freshClaim("10", async () => { throw new Error("fresh claim must not start"); })).toMatchObject({ claimed: false });
+  a.close(); a = new Journal(config.state.journalPath);
+  await tick();
+  expect(spawns).toBe(attempt - 1);
+  if (attempt < limit) {
+   now = new Date(state.nextEligibleAt!);
+   await tick();
+   expect(spawns).toBe(attempt);
+  }
+ }
+ now = new Date(now.getTime() + 86_400_000);
+ for (let n = 0; n < 5; n++) await tick();
+ expect(spawns).toBe(maxAttempts);
+ expect(activeRecovery(a, nodeRecoveryScope(repo, "10"))).toMatchObject({ status: "exhausted", attempts: limit, limit });
+ expect(row()?.outcome).toContain("--reset-recovery after intervention");
+ expect(a.deadmanCount()).toBe(0);
 });

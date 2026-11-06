@@ -1,4 +1,4 @@
-import { resetRecovery, nodeRecoveryScope } from "../src/recovery.ts";
+import { activeRecovery, resetRecovery, nodeRecoveryScope } from "../src/recovery.ts";
 import { describe, expect, test } from "bun:test";
 import {
  mkdirSync,
@@ -741,68 +741,37 @@ describe("ranger run-node — research worker full loop (node #13 acceptance)", 
 });
 
 describe("ranger sweep — reconcile journal vs reality (design §7)", () => {
- test("respawns a crashed worker below max attempts; parks + releases at max", async () => {
+ test("a crashed worker waits for bounded recovery and retains its claim after exhaustion", async () => {
   const dir = mkdtempSync(join(tmpdir(), "ranger-sweep-"));
   try {
-   const configPath = writeConfig(dir);
-   const { loadConfig } = await import("../src/config.ts");
-   const { openJournal } = await import("../src/journal.ts");
-   const { sweepMap } = await import("../src/sweep.ts");
-   const loaded = loadConfig(configPath);
+   const loaded = (await import("../src/config.ts")).loadConfig(writeConfig(dir));
    const map = loaded.config.maps[0];
-   const journal = openJournal(loaded.config);
-
-   const statePath = writeState(dir, {
-    "7": { assignees: ["ivy-bot"], status: "open" },
-   });
+   const journal = new Journal(loaded.config.state.journalPath);
+   const statePath = writeState(dir, { "7": { assignees: ["ivy-bot"], status: "open" } });
    process.env.FAKE_SOMA_STATE = statePath;
    process.env.FAKE_SOMA_DIR = dataDir;
    process.env.PATH = `${fixturesBin}:${process.env.PATH ?? ""}`;
-   process.env.GH_TOKEN = "ghp_write";
-
-   // Crashed worker (dead pid) that has already crashed once → respawned
-   // (attempt 1 < 2), then parked + released on the next crash (attempt 2 ≥ 2).
-   journal.upsertWorker({ root: 1,
-    nodeId: "7",
-    repo: map.repo,
-    status: "claimed",
-    attempts: 1,
-    pid: 2_147_483_647,
-   });
-   const respawned: string[] = [];
-   const first = await sweepMap({
-    config: loaded.config,
-    journal,
-    map,
-    token: "ghp_write",
-    botIdentity: "ivy-bot",
-    respawn: async (nodeId) => {
-     respawned.push(nodeId);
-     return 2_147_483_646; // the respawned supervisor's pid (dead too)
-    },
-   });
-   expect(first.crashed).toBe(1);
-   expect(first.respawned).toEqual(["7"]);
-
-   // Second crash at max attempts → parked + claim released.
-   const second = await sweepMap({
-    config: loaded.config,
-    journal,
-    map,
-    token: "ghp_write",
-    botIdentity: "ivy-bot",
-    respawn: async () => 2_147_483_646,
-   });
-   expect(second.parked).toEqual(["7"]);
-   expect(second.released).toEqual(["7"]);
-   expect(journal.getWorker("7", "acme/widgets")?.status).toBe("released");
-   const state = JSON.parse(readFileSync(statePath, "utf8"));
-   expect(state.nodes["7"].assignees).toEqual([]);
-
+   const { sweepMap } = await import("../src/sweep.ts");
+   journal.upsertWorker({ root: 1, nodeId: "7", repo: map.repo, status: "claimed", attempts: 1, pid: 2_147_483_647 });
+   let now = new Date();
+   let spawns = 0;
+   const tick = () => sweepMap({ config: loaded.config, journal, map, token: "ghp_write", botIdentity: "ivy-bot",
+    now: () => now, respawn: async () => { spawns++; return 2_147_483_646; } });
+   for (let attempt = 1; attempt <= 3; attempt++) {
+    const crashed = await tick();
+    expect(crashed.crashed).toBe(1);
+    expect(crashed.released).toEqual([]);
+    const recovery = activeRecovery(journal, nodeRecoveryScope(map.repo, "7"))!;
+    expect(recovery.attempts).toBe(attempt);
+    expect(journal.getWorker("7", map.repo)).toMatchObject({ status: "parked", attempts: 1 });
+    expect((await tick()).respawned).toEqual([]);
+    if (attempt < 3) { now = new Date(recovery.nextEligibleAt!); await tick(); }
+   }
+   expect(spawns).toBe(2);
+   expect(activeRecovery(journal, nodeRecoveryScope(map.repo, "7"))?.status).toBe("exhausted");
+   expect(JSON.parse(readFileSync(statePath, "utf8")).nodes["7"].assignees).toEqual(["ivy-bot"]);
    journal.close();
-  } finally {
-   rmSync(dir, { recursive: true, force: true });
-  }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
  });
 });
 

@@ -1,12 +1,11 @@
 import { requireReachable, type EndpointProbe } from "./endpoint.ts";
-import { nodeRecoveryScope, recoveryHold, recoverablePending } from "./recovery.ts";
-import { startOwnedWorker, reservationPending, startFailureOutcome } from "./node-ownership.ts";
-import { recordImplementStart, mapKey } from "./maps.ts";
+import { RECOVERY_LIMIT, nodeRecoveryScope, recordRecovery, recoveryReason, recoveryHold, recoverablePending } from "./recovery.ts";
+import { startOwnedWorker, reservationPending, FRESH_START_FAILURE } from "./node-ownership.ts";
+import { recordImplementStart } from "./maps.ts";
 import { implementLane, startsImplementSession, type ImplementLane } from "./lanes.ts";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import type { Journal } from "./journal.ts";
 import { killProcessGroup, pidAlive, processGroupCommands } from "./exec.ts";
-import { graphRelease } from "./graph-write.ts";
 import type { ForgePort } from "./forge.ts";
 import type { ResolvedToken } from "./token-gate.ts";
 import {
@@ -14,7 +13,6 @@ import {
  watchedByMergeDesk,
  type MergeDeskResult,
 } from "./merge-desk.ts";
-import { crashParkOutcome, respawnedEvent } from "./outcomes.ts";
 import { graphNode, GRAPH_CALL_TIMEOUT_MS } from "./graph.ts";
 import { reconcileGraphClosures } from "./closure-sweep.ts";
 import { BudgetDeferral, budgetedRead, budgetPolicy } from "./budget.ts";
@@ -102,6 +100,7 @@ export async function sweepMap(ctx: SweepContext): Promise<SweepMapResult> {
    if (pid !== null) {
     result.respawned.push(worker.nodeId);
     journal.recordSpawn(ctx.now?.() ?? new Date());
+    if (startsImplementSession(worker)) recordImplementStart(journal, map);
    }
    continue;
   }
@@ -121,64 +120,17 @@ export async function sweepMap(ctx: SweepContext): Promise<SweepMapResult> {
    }
   }
   scoped.updateWorker(worker.nodeId, repo, { workerPgid: null });
-  if (worker.pid === null) {
-   const detail = `abandoned worker reservation without a supervisor PID; resume node ${worker.nodeId} to retry`;
-   scoped.updateWorker(worker.nodeId, repo, {
-    status: "parked", outcome: startFailureOutcome(worker.outcome, detail, true), finishedAt: new Date().toISOString(),
-   });
-   result.parked.push(worker.nodeId);
-   journal.recordEvent("parked", { nodeId: worker.nodeId, repo, detail });
-   continue;
-  }
-  result.crashed += 1;
-  journal.recordEvent("sweep", { nodeId: worker.nodeId, repo,
-   detail: `crashed worker (pid ${worker.pid}) with no outcome — attempt ${worker.attempts}/${config.workers.maxAttempts}` });
-  if (worker.attempts < config.workers.maxAttempts) {
-   const holder = startsImplementSession(worker) ? journal.laneHolder(implementLane(map), { nodeId: worker.nodeId, repo },
-    row => row.pid === null || pidAlive(row.pid)) : null;
-   const reservedLane = startsImplementSession(worker) && ctx.reservedLanes?.has(implementLane(map));
-   if (holder !== null || reservedLane) {
-    scoped.updateWorker(worker.nodeId, repo, { status: worker.status, pid: worker.pid, startedAt: worker.startedAt });
-    journal.recordEvent("sweep", { nodeId: worker.nodeId, repo,
-     detail: `respawn waits for the ${implementLane(map)} implement lane${holder === null ? " reserved by priority work" : ` (held by #${holder.nodeId}, ${mapKey(holder)})`}` });
-    continue;
-   }
-   const attempt = worker.attempts + 1;
-   scoped.updateWorker(worker.nodeId, repo, { attempts: attempt });
-   const pid = await startOwnedWorker({ journal, row: worker, generation,
-    spawn: generation => ctx.respawn === undefined ? Promise.resolve(null) : ctx.respawn(worker.nodeId, repo, worker.root, generation),
-   });
-   if (pid !== null) {
-    if (startsImplementSession(worker)) recordImplementStart(journal, map);
-    result.respawned.push(worker.nodeId);
-    journal.recordEvent("sweep", { nodeId: worker.nodeId, repo, detail: respawnedEvent(attempt) });
-   } else {
-    journal.recordEvent("sweep", { nodeId: worker.nodeId, repo,
-     detail: "respawn did not start; parked for operator resume with its crash-attempt budget preserved" });
-   }
-  } else {
-   result.parked.push(worker.nodeId);
-   journal.recordEvent("parked", {
-    nodeId: worker.nodeId,
-    repo,
-    detail: `crashed ${config.workers.maxAttempts} times — parking; releasing the claim`,
-   });
-   scoped.assertGeneration(worker.nodeId, repo, generation, "release crashed worker claim");
-   const released = await graphRelease(repo, worker.nodeId, botIdentity, token);
-   scoped.upsertWorker({
-    nodeId: worker.nodeId,
-    repo,
-    root: worker.root,
-    status: released.released ? "released" : "parked",
-    attempts: worker.attempts,
-    finishedAt: new Date().toISOString(),
-    outcome: crashParkOutcome({ attempts: config.workers.maxAttempts, released: released.released, assignees: released.assignees }),
-   });
-   if (released.released) {
-    result.released.push(worker.nodeId);
-    journal.recordEvent("released", { nodeId: worker.nodeId, repo, detail: "claim released after park" });
-   }
-  }
+  if (worker.pid !== null) result.crashed += 1;
+  const state = recordRecovery(scoped, nodeRecoveryScope(repo, worker.nodeId), {
+   kind: "infrastructure", operation: "worker-supervisor", target: worker.nodeId,
+   evidence: [worker.pid === null ? "abandoned worker reservation without a supervisor PID" : `worker supervisor ${worker.pid} died without an outcome`, worker.outcome].filter(Boolean).join("; previous outcome: "),
+   action: `inspect the worker log and restore supervision; resume-node ${worker.nodeId} --map ${repo}#${worker.root} --reset-recovery after intervention`,
+  }, ctx.now?.() ?? new Date(), undefined, Math.min(RECOVERY_LIMIT, config.workers.maxAttempts + 1));
+  const detail = recoveryReason(state);
+  scoped.updateWorker(worker.nodeId, repo, { status: "parked", pid: null, workerPgid: null,
+   outcome: worker.pid === null ? `${detail}\n${FRESH_START_FAILURE}abandoned reservation` : detail, finishedAt: (ctx.now?.() ?? new Date()).toISOString() });
+  result.parked.push(worker.nodeId);
+  journal.recordEvent("parked", { nodeId: worker.nodeId, repo, detail });
  }
 
  // Worker and card closure scans share a deadline after crash handling.
