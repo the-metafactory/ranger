@@ -313,34 +313,29 @@ export function isBenignRecord(key: string, value: string | null): boolean {
 
 /**
  * Whether a `GitState.entries` name is one `isBenignRecord` can drop, or a
- * hook `recorded` by digest as git-lfs's stub (`lfsHookStub`): a known-good
- * record taken before either was exempt still names it, and its "(gone)" is
- * no change (`checkKnownGood`). A record with any other value is still
- * hashed and still named, so it shows as changed, never gone.
+ * hook `recorded` by digest as git-lfs's stub: a known-good record taken
+ * before either was exempt still names it, and its "(gone)" is no change
+ * (`checkKnownGood`). A record with any other value is still hashed and still
+ * named, so it shows as changed, never gone. Any `git-lfs filter-process` run
+ * installs its stubs when they are absent, whatever config the command was
+ * given (node #484: seelite #1152's worker wrote no config and parked itself
+ * and #1160). A stub runs `git lfs <hook>`, the program `filter.lfs.*` already
+ * runs; other bytes, or another hook's stub at that name, stay in the hash.
  */
 export function isBenignEntry(name: string, recorded?: string): boolean {
  if (name in BENIGN_VALUES || /^lfs\.<[0-9a-f]{12}>\.access$/.test(name)) return true;
  if (!name.startsWith("hooks/")) return false;
- const stub = lfsHookStub(name.slice("hooks/".length));
+ const stub = gitLfs381HookStub(name.slice("hooks/".length));
  return stub !== null && recorded === digest(stub);
 }
 
-/**
- * The bytes git-lfs 3.8.1 writes for `hook`, or null for a hook it never
- * writes. Any `git-lfs filter-process` run installs these in the shared
- * hooks directory when they are absent, whatever config the command was given
- * (node #484: seelite #1152's worker staged LFS files with `git -c
- * filter.lfs.process=…`, writing no config, and parked itself and #1160). The
- * stub runs `git lfs <hook>`, the program `filter.lfs.*` already runs. Other
- * bytes, or another hook's stub at this name, stay in the tamper hash.
- */
-export function lfsHookStub(hook: string): string | null {
+function gitLfs381HookStub(hook: string): string | null {
  if (!["pre-push", "post-checkout", "post-commit", "post-merge"].includes(hook)) return null;
  return `#!/bin/sh\ncommand -v git-lfs >/dev/null 2>&1 || { printf >&2 "\\n%s\\n\\n" "This repository is configured for Git LFS but 'git-lfs' was not found on your path. If you no longer wish to use Git LFS, remove this hook by deleting the '${hook}' file in the hooks directory (set by 'core.hookspath'; usually '.git/hooks')."; exit 2; }\ngit lfs ${hook} "$@"\n`;
 }
 
 function isLfsHookStub(hook: string, body: ReturnType<typeof readIfFile>): boolean {
- const stub = lfsHookStub(hook);
+ const stub = gitLfs381HookStub(hook);
  return stub !== null && Buffer.isBuffer(body) && body.equals(Buffer.from(stub));
 }
 

@@ -14,6 +14,9 @@ const STUBBED = ["pre-push", "post-checkout", "post-commit", "post-merge"];
 const gitLfs381Stub = (hook: string): string =>
  `#!/bin/sh\ncommand -v git-lfs >/dev/null 2>&1 || { printf >&2 "\\n%s\\n\\n" "This repository is configured for Git LFS but 'git-lfs' was not found on your path. If you no longer wish to use Git LFS, remove this hook by deleting the '${hook}' file in the hooks directory (set by 'core.hookspath'; usually '.git/hooks')."; exit 2; }\ngit lfs ${hook} "$@"\n`;
 
+const hasGitLfs381 = (): boolean =>
+ Bun.which("git-lfs") !== null && /^git-lfs\/3\.8\.1 /.test(Bun.spawnSync(["git-lfs", "version"]).stdout.toString());
+
 const sha256 = (text: string): string => createHash("sha256").update(text).digest("hex");
 
 let dir: string;
@@ -46,7 +49,7 @@ describe("the stubs git-lfs writes", () => {
   await assertGitUntouched(canonical, snapshot);
  });
 
- test.skipIf(Bun.which("git-lfs") === null)("a real filter-process run installs hooks the check does not count", async () => {
+ test.skipIf(!hasGitLfs381())("a real filter-process run installs hooks the check does not count", async () => {
   await checkKnownGood(journal, canonical, at);
   const snapshot = gitConfigSnapshot(canonical);
   writeFileSync(join(canonical, ".gitattributes"), "*.bin filter=lfs diff=lfs merge=lfs -text\n");
