@@ -132,7 +132,7 @@ test("worker, install and gate tests use explicit repo git settings without glob
  expect(existsSync(globalMarker)).toBe(false);
 }, 60_000);
 
-test("a repo commit hook that leaves an untracked build cache fails before tests or push", async () => {
+test("a repo commit hook cache blocks tests and preserves only the committed source", async () => {
  const r = await rig({});
  cleanup.push(r.dir);
  const hook = join(r.canonical, ".git/hooks/pre-commit");
@@ -147,5 +147,7 @@ test("a repo commit hook that leaves an untracked build cache fails before tests
  expect(outcome.detail).toContain("hook-build-cache");
  expect(existsSync(tested)).toBe(false);
  expect(r.github.prs.size).toBe(0);
- expect(await r.github.sha("node/20-add-the-feature-module")).toBe("");
+ const head = (await runCmd("git", ["rev-parse", "HEAD"], { cwd: worktree })).stdout.trim();
+ expect(await r.github.sha("node/20-add-the-feature-module")).toBe(head);
+ expect((await runCmd("git", ["ls-tree", "-r", "--name-only", head], { cwd: r.origin })).stdout).not.toContain("hook-build-cache");
 }, 60_000);

@@ -272,6 +272,8 @@ export interface ResumeQueueRow {
 export type ResumeReason = "host-load";
 
 export type EventKind =
+ | "progress-preserved"
+ | "progress-preservation-failed"
  | "ledger-failed"
  | "ledger-root-serves-invalid"
  | "resume-queued"
@@ -357,6 +359,19 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 
 export class Journal {
  private ownership?: { nodeId: string; repo: string; generation: number };
+
+ nodeProgress(repo: string, nodeId: string): string | null {
+  return this.getHealth(`node-progress:${repo}#${nodeId}`);
+ }
+
+ saveNodeProgress(repo: string, nodeId: string, generation: number, expected: string | null, value: string): boolean {
+  return this.db.transaction(() => {
+   this.assertGeneration(nodeId, repo, generation, "save progress checkpoint");
+   if (this.nodeProgress(repo, nodeId) !== expected) return false;
+   this.setHealth(`node-progress:${repo}#${nodeId}`, value);
+   return true;
+  });
+ }
 
  forWorker(nodeId: string, repo: string, generation: number): Journal {
   const scoped = Object.create(this) as Journal;
