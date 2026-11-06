@@ -2967,7 +2967,7 @@ async function closeAfterMerge(
   },
  );
  if (!close.closed) {
-  if (close.outcome !== undefined && ["infrastructure", "dependency", "code", "unknown"].includes(close.outcome.kind)) throw new OperationFailure({ ...close.outcome, evidence: close.detail });
+  if (close.outcome !== undefined && ["infrastructure", "dependency", "code", "unknown"].includes(close.outcome.kind)) throw new OperationFailure({ ...close.outcome, evidence: close.outcome.kind === "code" ? closeRefusedOutcome(close.detail) : close.detail });
   throw new ParkSignal(closeRefusedOutcome(close.detail));
  }
  journal.recordEvent("closed", { nodeId, repo, detail: close.detail.slice(0, 400) });

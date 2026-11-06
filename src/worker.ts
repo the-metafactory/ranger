@@ -654,7 +654,7 @@ export async function runNode(
   journal.recordEvent("refused", {
    nodeId,
    repo,
-   detail: detail.slice(0, 400),
+   detail: journalOutcome(detail),
   });
   if (error instanceof OperationFailure) {
    failNode(config, journal, nodeId, repo, detail, error.outcome, ctx.now?.() ?? new Date());
@@ -710,10 +710,6 @@ async function runSession(
    ? await selectBuildSubstrate(ctx, capped)
    : { substrate: undefined, chosenOn: "RANGER_WORKER_CMD override; its heads count as Pi-written" };
  const workerCmd = envCmd ?? resolveWorkerCommand(ctx, substrate as SubstrateName, session.canonical);
- if (ctx.map.reachable !== undefined || (envCmd === undefined && ctx.workerCommand === undefined && substrate !== undefined)) {
-  await requireEndpoint(ctx.config, substrate ?? "claude", ctx.map.reachable, ctx.endpointProbe, ctx.endpointLookup);
-  completeRecovery(journal, nodeRecoveryScope(ctx.map.repo, nodeId), "model-endpoint", undefined, { nodeId, repo: ctx.map.repo, generation: session.generation });
- }
  // The pinned model (node #60), only when ranger built the command from its
  // config: an operator's or a test's command carries no model ranger knows.
  const model =
@@ -729,9 +725,13 @@ async function runSession(
  return runImplement({
   ...session,
   workerSource: envCmd !== undefined || ctx.workerCommand !== undefined || ctx.worker !== undefined ? "command" : "model",
-  workerRun:
-   ctx.worker ??
-   ((p: string, opts: RunOptions) => runCmd(workerCmd[0], [...workerCmd.slice(1), p], opts)),
+  workerRun: async (p: string, opts: RunOptions) => {
+   if (ctx.map.reachable !== undefined || (envCmd === undefined && ctx.workerCommand === undefined && ctx.worker === undefined && substrate !== undefined)) {
+    await requireEndpoint(ctx.config, substrate ?? "claude", ctx.map.reachable, ctx.endpointProbe, ctx.endpointLookup);
+    completeRecovery(journal, nodeRecoveryScope(ctx.map.repo, nodeId), "model-endpoint", undefined, { nodeId, repo: ctx.map.repo, generation: session.generation });
+   }
+   return ctx.worker === undefined ? runCmd(workerCmd[0], [...workerCmd.slice(1), p], opts) : ctx.worker(p, opts);
+  },
   substrate,
   model: model?.model,
   excludedSubstrates: capped,
@@ -1130,7 +1130,7 @@ async function runResearch(
 
   // The run-node start check vetted this state against the known-good one.
   const snapshot = start.state.hash;
-  if (map.reachable !== undefined) await requireEndpoint(config, "claude", map.reachable, ctx.endpointProbe, ctx.endpointLookup);
+  if (map.reachable !== undefined || (ctx.worker === undefined && ctx.workerCommand === undefined && !process.env.RANGER_WORKER_CMD)) await requireEndpoint(config, "claude", map.reachable, ctx.endpointProbe, ctx.endpointLookup);
   fence("spawn the worker");
   const workerResult = await workerRun(prompt, {
    cwd: worktree,
