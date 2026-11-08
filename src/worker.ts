@@ -54,7 +54,7 @@ import {
  hookStopReason,
  markSubstrateCapped,
  describeWorkerModel,
- workerCommandFor,
+ nodeWorkerCommandFor,
  workerModelFor,
  type CapSignal,
  type QuotaReading,
@@ -367,7 +367,7 @@ function resolveWorkerCommand(
 ): string[] {
  return (
   ctx.workerCommand ??
-  workerCommandFor(substrate, ctx.config, { writableGitDir: join(canonical, ".git") })
+  nodeWorkerCommandFor(substrate, ctx.config, join(canonical, ".git"))
  );
 }
 
