@@ -194,6 +194,7 @@ describe("what still parks (ranger#492)", () => {
   ["a marker that is not the last line", `${marker(RATE_LIMITED)}\ntrailing noise`, 2],
   ["a marker on another exit code", marker(RATE_LIMITED), 3],
   ["an old sage with no marker", "gh auth is not configured", 2],
+  ["a secondary limit after the preflight passed, with no marker", "[sage] error: GraphQL: API rate limit already exceeded for user ID 1", 1],
  ])("%s parks for the principal with its evidence and no wait", async (_name, line, exit) => {
   const { r } = await waitingRig(refused(line), exit);
   cleanup.push(r.dir);
