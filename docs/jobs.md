@@ -23,7 +23,7 @@ jobs:
 
 ## Shrink a Claude session
 
-Without `claudeSession`, a session loads the principal's user settings: every user skill, every hook and the auto permission mode. With it, the session runs with `--setting-sources project --settings <file>`, plus `--add-dir <skillsDir>` when set. `substrates.claude.session` takes the same two fields and applies to every worker on Claude. A job's `claudeSession` replaces it.
+Without `claudeSession`, a session loads the principal's user settings: every user skill, every hook and the auto permission mode. With it, the session runs with `--setting-sources project --settings <file>`, plus `--add-dir <skillsDir>` when set. `substrates.claude.session` takes the same two fields and applies to every node worker on Claude. A job never inherits it: a job without its own `claudeSession` keeps the principal's user settings, so it keeps the user skill it runs. The `ivy-think` Studio job ignores `claudeSession`: its own command already runs with no tools, MCP servers or session persistence, in a scratch directory.
 
 The settings file has to bring back what the session still needs:
 

@@ -54,7 +54,7 @@ import {
  hookStopReason,
  markSubstrateCapped,
  describeWorkerModel,
- workerCommandFor,
+ nodeWorkerCommandFor,
  workerModelFor,
  type CapSignal,
  type QuotaReading,
@@ -360,14 +360,14 @@ function envWorkerOverride(ctx: RunNodeContext): string[] | undefined {
 }
 
 /** Resolve the worker command: explicit override > the substrate's command. */
-function resolveWorkerCommand(
+export function resolveWorkerCommand(
  ctx: RunNodeContext,
  substrate: SubstrateName,
  canonical: string,
 ): string[] {
  return (
   ctx.workerCommand ??
-  workerCommandFor(substrate, ctx.config, { writableGitDir: join(canonical, ".git") })
+  nodeWorkerCommandFor(substrate, ctx.config, join(canonical, ".git"))
  );
 }
 

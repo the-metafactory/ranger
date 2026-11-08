@@ -486,7 +486,7 @@ export function workerCommandFor(
 ): string[] {
  switch (substrate) {
   case "claude": {
-   const session = opts.claudeSession ?? config.substrates.claude.session;
+   const session = opts.claudeSession;
    return [
     "claude", "-p", "--model", config.substrates.claude.model, "--output-format", "stream-json", "--verbose",
     ...(session?.skillsDir === undefined ? [] : ["--add-dir", expandHome(session.skillsDir)]),
@@ -554,6 +554,12 @@ const CLAUDE_STREAM_OUTPUT: WorkerOutput = {
   };
  },
 };
+
+/** A node worker's command: the only caller that takes `substrates.claude.session`, so a job never inherits a workers' skill set. */
+export function nodeWorkerCommandFor(substrate: SubstrateName, config: RangerConfig, writableGitDir: string): string[] {
+ const claudeSession = config.substrates.claude.session;
+ return workerCommandFor(substrate, config, { writableGitDir, ...(claudeSession === undefined ? {} : { claudeSession }) });
+}
 
 /** The output reader for a substrate; an unlabelled run is plain text. */
 export function workerOutputFor(substrate: SubstrateName | undefined): WorkerOutput {

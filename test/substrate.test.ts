@@ -22,6 +22,7 @@ import {
  persistReading,
  type QuotaReading,
  workerOutputFor,
+ nodeWorkerCommandFor,
  workerCommandFor,
  workerModelFor,
  type ClaudeRateLimitEvent,
@@ -36,6 +37,7 @@ import {
 } from "../src/substrate-policy.ts";
 import { recordedReviews, reviewMarker } from "../src/implement.ts";
 import { sageReview } from "../src/review.ts";
+import { resolveWorkerCommand, type RunNodeContext } from "../src/worker.ts";
 import { runCmd } from "../src/exec.ts";
 import { baseConfigLines } from "./support.ts";
 
@@ -727,17 +729,19 @@ describe("workerCommandFor", () => {
   const session = { settings: "/etc/ranger/worker.json", skillsDir: "/etc/ranger/dev-skills" };
   const flags = ["--add-dir", "/etc/ranger/dev-skills", "--setting-sources", "project", "--settings", "/etc/ranger/worker.json"];
   const onConfig = { ...config, substrates: { ...config.substrates, claude: { ...config.substrates.claude, session } } };
-  expect(workerCommandFor("claude", onConfig).slice(-flags.length)).toEqual(flags);
+  const nodeContext = { config: onConfig } as RunNodeContext;
+  expect(resolveWorkerCommand(nodeContext, "claude", "/c").slice(-flags.length)).toEqual(flags);
   expect(workerCommandFor("claude", config, { claudeSession: session }).slice(-flags.length)).toEqual(flags);
  });
 
- test("claude session: a job's session replaces the workers' session, and no other substrate takes it", () => {
+ test("claude session: a job takes only its own session, never the workers', and no other substrate takes it", () => {
   const session = { settings: "/etc/ranger/worker.json", skillsDir: "/etc/ranger/dev-skills" };
   const onConfig = { ...config, substrates: { ...config.substrates, claude: { ...config.substrates.claude, session } } };
-  const cmd = workerCommandFor("claude", onConfig, { claudeSession: { settings: "/etc/ranger/job.json" } });
-  expect(cmd.slice(-4)).toEqual(["--setting-sources", "project", "--settings", "/etc/ranger/job.json"]);
-  expect(cmd).not.toContain("--add-dir");
-  expect(workerCommandFor("codex", onConfig)).not.toContain("--setting-sources");
+  const own = workerCommandFor("claude", onConfig, { claudeSession: { settings: "/etc/ranger/job.json" } });
+  expect(own.slice(-4)).toEqual(["--setting-sources", "project", "--settings", "/etc/ranger/job.json"]);
+  expect(own).not.toContain("--add-dir");
+  expect(workerCommandFor("claude", onConfig)).not.toContain("--setting-sources");
+  expect(nodeWorkerCommandFor("codex", onConfig, "/c/.git")).not.toContain("--setting-sources");
  });
 
  test("codex: a writable workspace sandbox, an explicit auto-reviewed approval mode (#457), plus the common git dir a worktree commits into", () => {
