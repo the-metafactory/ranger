@@ -68,7 +68,7 @@ import {
 } from "./outcomes.ts";
 import { GRAPH_CALL_TIMEOUT_MS, graphNode, somaRepo, type NodeResult } from "./graph.ts";
 import { finishClosedElsewhere } from "./closed-elsewhere.ts";
-import { budgetedRead, budgetPolicy, clearThrottleStrikes, recordThrottle, reviewCooldownScope, reviewThrottle } from "./budget.ts";
+import { budgetedRead, budgetPolicy, clearThrottleStrikes, MAX_REVIEW_THROTTLES_IN_A_ROW, recordThrottle, reviewCooldownScope, reviewThrottle } from "./budget.ts";
 import { GraphAddUnattached, closeTimeoutForNode, graphAdd, graphClose, graphDecisions, graphLink, type AddSpec, type CloseResult } from "./graph-write.ts";
 import { FixNodeLockBusy, withFixNodeLock } from "./fix-node-lock.ts";
 import { assertFilable, codeCommentSpec, foundByProbeSpec, landminesInDiff, scribeFile, splitOutOfReviewSpec, type Provenance, type ScribeGraph } from "./scribe.ts";
@@ -1429,6 +1429,7 @@ function reviewFailure(ctx: ImplementContext, error: ReviewError, round: number)
   ...(preflight.resetAt === undefined ? {} : { resetAt: preflight.resetAt }),
   reason: (strikes) => `GitHub rate limit on sage's read-only token: ${status}throttle ${strikes} in a row`,
  });
+ if (throttled.strikes > MAX_REVIEW_THROTTLES_IN_A_ROW) return error;
  return new ReviewRateLimitWait(reviewRateLimitOutcome({ round, until: throttled.until, reason: throttled.reason, evidence: error.message }));
 }
 

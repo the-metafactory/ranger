@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { activeCooldown, MAX_THROTTLE_MS, recordThrottle } from "../src/budget.ts";
+import { activeCooldown, MAX_REVIEW_THROTTLES_IN_A_ROW, MAX_THROTTLE_MS, recordThrottle } from "../src/budget.ts";
 import { openJournal } from "../src/journal.ts";
 import { activeRecovery, nodeRecoveryScope, recordRecovery, recoverablePending, recoveryHold } from "../src/recovery.ts";
 import { processResumeQueue } from "../src/resume.ts";
@@ -150,6 +150,18 @@ describe("a rate-limited sage review (ranger#492)", () => {
   expect(readFileSync(calls, "utf8")).toBe("call\n");
   expect(cooldown(r, T0)?.strikes).toBe(1);
   expect(r.journal.listResumeQueue()).toHaveLength(1);
+ }, 120_000);
+
+ test("a limit that will not pass stops waiting and parks for the principal with its evidence", async () => {
+  const { r } = track(await waitingRig(refused(marker(RATE_LIMITED))));
+  for (let i = 0; i < MAX_REVIEW_THROTTLES_IN_A_ROW; i++) {
+   recordThrottle(r.journal, READ_TOKEN_ENV, { cooldownMs: 1 }, new Date(T0.getTime() - 86_400_000), { reason: () => "earlier" });
+  }
+  const outcome = await runNode(NODE, r.ctx);
+  expect(outcome.status).toBe("parked");
+  expect(row(r)?.outcome).toContain("unknown recovery 1/3 exhausted");
+  expect(row(r)?.outcome).toContain("SAGE_PREFLIGHT_FAILURE");
+  expect(r.journal.listResumeQueue()).toEqual([]);
  }, 120_000);
 
  test("a verdict in flight when another node is throttled leaves that node's cooldown in force", async () => {

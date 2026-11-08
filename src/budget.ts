@@ -55,6 +55,9 @@ export interface BudgetPolicy {
 /** The longest a throttled cooldown backs off to. */
 export const MAX_THROTTLE_MS = 60 * 60_000;
 
+/** Reviews refused in a row before ranger stops waiting and asks the principal: several hours of cooldowns. */
+export const MAX_REVIEW_THROTTLES_IN_A_ROW = 8;
+
 export function budgetPolicy(config: RangerConfig): BudgetPolicy {
   return {
     floor: config.budget.graphqlFloor,
