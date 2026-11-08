@@ -925,7 +925,7 @@ function reviewWaitRun(ctx: RunNodeContext, nodeId: string, generation: number, 
  return { nodeId, repo, status: "failed", detail, workerExit: null };
 }
 
-const HOST_LOAD_FOOTER ="A resume is queued: the walk starts it once the host is quiet and the lane is free. `ranger resume-node` starts it now.";
+const HOST_LOAD_FOOTER = "A resume is queued: the walk starts it once the host is quiet and the lane is free. `ranger resume-node` starts it now.";
 
 /**
  * The run-node's start (node #81): ensure the canonical checkout, check its

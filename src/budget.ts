@@ -91,6 +91,12 @@ export function reviewCooldownScope(config: Pick<RangerConfig, "auth">, repo: st
   return cooldownScope(repo, matchTokenEnv(config.auth, repo) ?? "read-only-token");
 }
 
+/** The cooldown that holds back a review on this repo right now, if any. */
+export function reviewThrottle(journal: Journal, config: Pick<RangerConfig, "auth">, repo: string, now: Date): Cooldown | null {
+  const cooling = activeCooldown(journal, reviewCooldownScope(config, repo), now);
+  return cooling?.kind === "throttled" ? cooling : null;
+}
+
 const COOLDOWN_KEY = (scope: string) => `ratelimit:${scope}`;
 
 function readCooldownRecord(journal: Journal, scope: string): Cooldown | null {

@@ -68,7 +68,7 @@ import {
 } from "./outcomes.ts";
 import { GRAPH_CALL_TIMEOUT_MS, graphNode, somaRepo, type NodeResult } from "./graph.ts";
 import { finishClosedElsewhere } from "./closed-elsewhere.ts";
-import { activeCooldown, budgetedRead, budgetPolicy, clearThrottleStrikes, recordThrottle, reviewCooldownScope } from "./budget.ts";
+import { budgetedRead, budgetPolicy, clearThrottleStrikes, recordThrottle, reviewCooldownScope, reviewThrottle } from "./budget.ts";
 import { GraphAddUnattached, closeTimeoutForNode, graphAdd, graphClose, graphDecisions, graphLink, type AddSpec, type CloseResult } from "./graph-write.ts";
 import { FixNodeLockBusy, withFixNodeLock } from "./fix-node-lock.ts";
 import { assertFilable, codeCommentSpec, foundByProbeSpec, landminesInDiff, scribeFile, splitOutOfReviewSpec, type Provenance, type ScribeGraph } from "./scribe.ts";
@@ -1809,8 +1809,8 @@ async function runImplementFlow(ctx: ImplementContext): Promise<ImplementOutcome
    }
    const round = rounds + 1;
    fence("review");
-   const cooling = activeCooldown(journal, reviewCooldownScope(config, repo), ctx.now?.() ?? new Date());
-   if (cooling?.kind === "throttled") throw new ReviewRateLimitWait(reviewRateLimitOutcome({ round, until: cooling.until, reason: cooling.reason }));
+   const cooling = reviewThrottle(journal, config, repo, ctx.now?.() ?? new Date());
+   if (cooling !== null) throw new ReviewRateLimitWait(reviewRateLimitOutcome({ round, until: cooling.until, reason: cooling.reason }));
    const { substrate: reviewSubstrate, chosenOn } = await selectReviewSubstrate(ctx, live.headSha);
    // The sage round is a substrate session (node #56): its row opens under
    // the generation fence once selection has settled (selection awaits, and
