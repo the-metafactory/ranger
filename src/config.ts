@@ -350,9 +350,19 @@ const CodexSubstrateSchema = z.object({
  reasoningEffort: z.enum(["low", "medium", "high"]).default("high"),
 });
 
+const absolutePath = z.string().min(1).refine(p => isAbsolute(expandHome(p)), "an absolute path (or ~/…)");
+
+const ClaudeSessionSchema = z.object({
+ settings: absolutePath,
+ skillsDir: absolutePath.optional(),
+}).strict();
+
+export type ClaudeSession = z.infer<typeof ClaudeSessionSchema>;
+
 const ClaudeSubstrateSchema = z.object({
  reachable: z.string().url().optional(),
  model: z.string().regex(MODEL_NAME, "a plain model name ([A-Za-z0-9._-])").default("claude-sonnet-5-5"),
+ session: ClaudeSessionSchema.optional(),
 });
 
 const SubstratesSchema = z.object({
@@ -479,6 +489,7 @@ const JobSchema = z.object({
   * report a day without output as a success.
   */
  requireResult: z.boolean().default(false),
+ claudeSession: ClaudeSessionSchema.optional(),
 });
 
 const RangerConfigSchema = z.object({
