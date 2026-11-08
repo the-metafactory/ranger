@@ -367,7 +367,7 @@ export function resolveWorkerCommand(
 ): string[] {
  return (
   ctx.workerCommand ??
-  nodeWorkerCommandFor(substrate, ctx.config, join(canonical, ".git"))
+  nodeWorkerCommandFor(substrate, ctx.config, join(canonical, ".git"), ctx.map.claudeSession)
  );
 }
 

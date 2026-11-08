@@ -555,9 +555,9 @@ const CLAUDE_STREAM_OUTPUT: WorkerOutput = {
  },
 };
 
-/** A node worker's command: the only caller that takes `substrates.claude.session`, so a job never inherits a workers' skill set. */
-export function nodeWorkerCommandFor(substrate: SubstrateName, config: RangerConfig, writableGitDir: string): string[] {
- const claudeSession = config.substrates.claude.session;
+/** A node worker's command: the only caller that takes `substrates.claude.session`, so a job never inherits a workers' skill set. The map's own session wins over it. */
+export function nodeWorkerCommandFor(substrate: SubstrateName, config: RangerConfig, writableGitDir: string, mapSession?: ClaudeSession): string[] {
+ const claudeSession = mapSession ?? config.substrates.claude.session;
  return workerCommandFor(substrate, config, { writableGitDir, ...(claudeSession === undefined ? {} : { claudeSession }) });
 }
 

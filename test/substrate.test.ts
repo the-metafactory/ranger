@@ -729,7 +729,7 @@ describe("workerCommandFor", () => {
   const session = { settings: "/etc/ranger/worker.json", skillsDir: "/etc/ranger/dev-skills" };
   const flags = ["--add-dir", "/etc/ranger/dev-skills", "--setting-sources", "project", "--settings", "/etc/ranger/worker.json"];
   const onConfig = { ...config, substrates: { ...config.substrates, claude: { ...config.substrates.claude, session } } };
-  const nodeContext = { config: onConfig } as RunNodeContext;
+  const nodeContext = { config: onConfig, map: {} } as RunNodeContext;
   expect(resolveWorkerCommand(nodeContext, "claude", "/c").slice(-flags.length)).toEqual(flags);
   expect(workerCommandFor("claude", config, { claudeSession: session }).slice(-flags.length)).toEqual(flags);
  });
@@ -742,6 +742,17 @@ describe("workerCommandFor", () => {
   expect(own).not.toContain("--add-dir");
   expect(workerCommandFor("claude", onConfig)).not.toContain("--setting-sources");
   expect(nodeWorkerCommandFor("codex", onConfig, "/c/.git")).not.toContain("--setting-sources");
+ });
+
+ test("claude session: a map's own session replaces the workers' on that map only", () => {
+  const session = { settings: "/etc/ranger/worker.json", skillsDir: "/etc/ranger/dev-skills" };
+  const onConfig = { ...config, substrates: { ...config.substrates, claude: { ...config.substrates.claude, session } } };
+  const own = { settings: "/etc/ranger/map.json", skillsDir: "/etc/ranger/map-skills" };
+  const flags = ["--add-dir", "/etc/ranger/map-skills", "--setting-sources", "project", "--settings", "/etc/ranger/map.json"];
+  const context = (claudeSession?: typeof own) => ({ config: onConfig, map: { claudeSession } }) as unknown as RunNodeContext;
+  expect(resolveWorkerCommand(context(own), "claude", "/c").slice(-flags.length)).toEqual(flags);
+  expect(resolveWorkerCommand(context(), "claude", "/c")).toContain("/etc/ranger/worker.json");
+  expect(resolveWorkerCommand(context(own), "codex", "/c")).not.toContain("--setting-sources");
  });
 
  test("codex: a writable workspace sandbox, an explicit auto-reviewed approval mode (#457), plus the common git dir a worktree commits into", () => {

@@ -32,6 +32,10 @@ The settings file has to bring back what the session still needs:
 - **Rule exclusions.** `~/.claude/rules` still loads when the session's cwd is under the home directory. Use `claudeMdExcludes` to leave rules out.
 - **Skills.** User skills no longer load. Put the job's skill in the project's `.claude/skills`, or in `skillsDir`'s.
 
+A map's `claudeSession` replaces `substrates.claude.session` for that map's node workers on Claude. The two are not merged, so the map's settings file and `skillsDir` have to bring back everything its workers need.
+
+A worker can only find a skill that its session lists. For a single node that needs a skill outside the list, name the skill's path in the node's brief: "Read `~/.soma/skills/writer/SKILL.md` and follow it." Give a map its own `claudeSession` when its workers need a skill without being told.
+
 ## Queue and run a job
 
 `ranger job enqueue <name>` queues one run. A Reflex fire runs this command through a cortex process spec. A second enqueue while that run is still queued does nothing. An unknown name exits 1 and queues nothing. `ranger job list` prints the runs.
