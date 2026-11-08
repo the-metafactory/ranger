@@ -1107,6 +1107,17 @@ describe("implement lane (node #23)", () => {
   for (const sha of [pushed, initial]) await r.github.postComment("acme/widgets", 1, baseMergeMarker(sha, "main"));
  };
  const markersOn = (r: Rig) => (r.github.comments.get(1) ?? []).filter((c) => c.body.includes("ranger:base-merge"));
+ const lateBaseCommit = async (r: Rig, file = "late.txt") => {
+  const clone = join(r.dir, "moves-under-tests");
+  expect((await git(["clone", "--branch", "main", r.origin, clone], r.dir)).code).toBe(0);
+  mkdirSync(dirname(join(clone, file)), { recursive: true });
+  writeFileSync(join(clone, file), "landed during the test run\n");
+  await git(["add", file], clone);
+  await git(["commit", "-m", "late base commit"], clone);
+  const late = (await git(["rev-parse", "HEAD"], clone)).stdout.trim();
+  const once = join(r.dir, "moved-once");
+  return { clone, late, landOnce: `[ ! -f ${once} ] && touch ${once} && git -C ${clone} push -q origin HEAD:refs/heads/main` };
+ };
  const holds = async (r: Rig, ancestor: string, head: string) => (await runCmd("git", ["merge-base", "--is-ancestor", ancestor, head], { cwd: r.origin })).code === 0;
 
  test("a PR with an unpushed commit, 1 commit behind the base, merges the base before an up-to-date gate and pushes the merge (ranger issue #322)", async () => {
@@ -1130,14 +1141,8 @@ describe("implement lane (node #23)", () => {
 
  test("a base that moves during the tests on an unpushed commit is merged once more, and the gate runs again (ranger issue #322)", async () => {
   const { r, local } = await prWithUnpushedCommit();
-  const clone = join(r.dir, "moves-under-tests");
-  expect((await git(["clone", "--branch", "main", r.origin, clone], r.dir)).code).toBe(0);
-  writeFileSync(join(clone, "late.txt"), "landed during the test run\n");
-  await git(["add", "late.txt"], clone);
-  await git(["commit", "-m", "late base commit"], clone);
-  const late = (await git(["rev-parse", "HEAD"], clone)).stdout.trim();
-  const once = join(r.dir, "moved-once");
-  r.ctx.map.commands.test = `if [ ! -f ${once} ]; then touch ${once}; git -C ${clone} push -q origin HEAD:refs/heads/main; exit 1; fi; ${UP_TO_DATE}`;
+  const { late, landOnce } = await lateBaseCommit(r);
+  r.ctx.map.commands.test = `if ${landOnce}; then exit 1; fi; ${UP_TO_DATE}`;
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
   const head = await r.github.sha(BRANCH);
   expect(await holds(r, late, head)).toBe(true);
@@ -1251,6 +1256,126 @@ describe("implement lane (node #23)", () => {
   expect(markersOn(r)).toHaveLength(1);
   expect(readFileSync(runs, "utf8").trim().split("\n")).toHaveLength(2);
  }, 60_000);
+
+ describe("the post-worker test gate when the base moves during the tests (ranger issue #490)", () => {
+  const FIXED = 'grep -q "fixed per review" src/feature.ts';
+  const CURRENT = `git fetch -q origin; ${UP_TO_DATE}`;
+  const merges = (r: Rig) => r.journal.listEvents("acme/widgets", 300).filter((e) => e.kind === "worktree-prepared");
+  const runsIn = (file: string) => readFileSync(file, "utf8").trim().split("\n").length;
+  const fetchedBase = async (r: Rig) => (await git(["rev-parse", "refs/remotes/origin/main"], r.canonical)).stdout.trim();
+
+  test("a build whose only red is an up-to-date check merges the base, reruns the tests and opens the PR", async () => {
+   const r = await rig({});
+   cleanup.push(r.dir);
+   const { late, landOnce } = await lateBaseCommit(r);
+   const runs = join(r.dir, "runs");
+   r.ctx.map.commands.test = `echo run >> ${runs}; ${landOnce}; ${CURRENT}`;
+   const deadman = r.journal.deadmanCount();
+   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+   const head = await r.github.sha(BRANCH);
+   expect(await holds(r, late, head)).toBe(true);
+   expect(await holds(r, head, late)).toBe(false);
+   expect(runsIn(runs)).toBe(2);
+   expect(merges(r)).toHaveLength(1);
+   expect(merges(r)[0]?.detail).toContain(`merged origin/main ${late}`);
+   expect(r.journal.deadmanCount()).toBe(deadman);
+  }, 60_000);
+
+  test("a fix pass whose only red is an up-to-date check merges the base, spends a merge and earns the round that reviews it", async () => {
+   const r = await rig({ blockers: [1, 1, 0] });
+   cleanup.push(r.dir);
+   const { late, landOnce } = await lateBaseCommit(r);
+   r.ctx.map.commands.test = `if ${FIXED}; then ${landOnce}; fi; ${CURRENT}`;
+   let passes = 0;
+   delete r.ctx.workerCommand;
+   r.ctx.worker = async (prompt, opts) => {
+    if (prompt.includes("Fix pass")) writeFileSync(join(String(opts.cwd), "src", "round.txt"), `${(passes += 1)}\n`);
+    return runCmd(implementWorker, ["build", prompt], opts);
+   };
+   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+   const head = await r.github.sha(BRANCH);
+   expect(await holds(r, late, head)).toBe(true);
+   const markers = markersOn(r);
+   expect(markers).toHaveLength(1);
+   expect(markers[0]?.body).toContain("so ranger merged it in");
+   expect(passes).toBe(2);
+   expect(recordedReviews(r.github.comments.get(1) ?? [], BOT).map((v) => v.round)).toEqual([1, 2, 3]);
+  }, 60_000);
+
+  test("a merge that conflicts parks naming the base SHA and the files, with no push and no dead-man count", async () => {
+   const r = await rig({});
+   cleanup.push(r.dir);
+   const { late, landOnce } = await lateBaseCommit(r, "src/feature.ts");
+   r.ctx.map.commands.test = `${landOnce}; ${CURRENT}`;
+   const deadman = r.journal.deadmanCount();
+   const outcome = await runNode("20", r.ctx);
+   expect(outcome.status).toBe("parked");
+   expect(outcome.detail).toContain(`merging origin/main at ${late} conflicts in: src/feature.ts`);
+   const worktree = join(r.canonical, ".worktrees", "node-20");
+   expect((await git(["status", "--porcelain"], worktree)).stdout.trim()).toBe("");
+   const built = (await git(["rev-parse", "HEAD"], worktree)).stdout.trim();
+   expect((await git(["merge-base", "--is-ancestor", late, built], worktree)).code).toBe(1);
+   expect(await r.github.sha(BRANCH)).toBe(built);
+   expect(r.github.prs.size).toBe(0);
+   expect(r.journal.deadmanCount()).toBe(deadman);
+  }, 60_000);
+
+  test("a fix pass past the merge budget is refused without a merge or a second run", async () => {
+   const rigged = Promise.withResolvers<Rig>();
+   const spendOnce = async () => { const live = await rigged.promise; await spendBaseMergeBudget(live, await live.github.sha(BRANCH)); };
+   const r = await rig({ blockers: [1, 0], onReview: (round) => (round === 1 ? spendOnce() : undefined) });
+   rigged.resolve(r);
+   cleanup.push(r.dir);
+   const { late, landOnce } = await lateBaseCommit(r);
+   const runs = join(r.dir, "runs");
+   r.ctx.map.commands.test = `if ${FIXED}; then echo run >> ${runs}; ${landOnce}; fi; ${CURRENT}`;
+   const outcome = await runNode("20", r.ctx);
+   expect(outcome.status).not.toBe("awaiting-merge");
+   expect(outcome.detail).toContain("after the worker");
+   expect(runsIn(runs)).toBe(1);
+   expect(markersOn(r)).toHaveLength(2);
+   expect(await holds(r, late, await r.github.sha(BRANCH))).toBe(false);
+   expect(merges(r).map((e) => e.detail ?? "").some((d) => d.includes("base merge pass(es): it is not moved before the tests"))).toBe(true);
+  }, 60_000);
+
+  test("a base that moves under every run gets one merge and one rerun, then the run is refused", async () => {
+   const r = await rig({});
+   cleanup.push(r.dir);
+   const { clone } = await lateBaseCommit(r);
+   const runs = join(r.dir, "runs");
+   r.ctx.map.commands.test = `echo run >> ${runs}; git -C ${clone} -c user.name=base -c user.email=base@example.com commit -q --allow-empty -m moved; git -C ${clone} push -q origin HEAD:refs/heads/main; ${CURRENT}`;
+   const outcome = await runNode("20", r.ctx);
+   expect(outcome.status).not.toBe("awaiting-merge");
+   expect(outcome.detail).toContain("after the worker");
+   expect(runsIn(runs)).toBe(2);
+   expect(merges(r)).toHaveLength(1);
+   expect(r.github.prs.size).toBe(0);
+  }, 60_000);
+
+  test("a failure that names its failing test is refused without a fetch, a merge or a second run", async () => {
+   const r = await rig({});
+   cleanup.push(r.dir);
+   const { late, landOnce } = await lateBaseCommit(r);
+   const runs = join(r.dir, "runs");
+   r.ctx.map.commands.test = `echo run >> ${runs}; ${landOnce}; echo "(fail) feature > works"; exit 1`;
+   const outcome = await runNode("20", r.ctx);
+   expect(outcome.status).not.toBe("awaiting-merge");
+   expect(outcome.detail).toContain("feature > works");
+   expect(runsIn(runs)).toBe(1);
+   expect(merges(r)).toHaveLength(0);
+   expect(await fetchedBase(r)).not.toBe(late);
+  }, 60_000);
+
+  test("a worker that leaves the tree dirty is refused before any test, fetch or merge", async () => {
+   const r = await rig({});
+   cleanup.push(r.dir);
+   r.ctx.workerCommand = [implementWorker, "dirty"];
+   const outcome = await runNode("20", r.ctx);
+   expect(outcome.status).not.toBe("awaiting-merge");
+   expect(outcome.detail).toContain("uncommitted or untracked");
+   expect(merges(r)).toHaveLength(0);
+  }, 60_000);
+ });
 
  test("a resume with no PR, 1 commit behind the base, whose adoption tests fail only on an up-to-date check merges the base and adopts the build (ranger issue #463)", async () => {
   const flag = join(tmpdir(), `ranger-behind-adopt-${Date.now()}`);

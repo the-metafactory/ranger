@@ -47,7 +47,7 @@ Global `credential.helper`, `url.*.insteadOf`, `core.excludesFile` and `safe.dir
 Repo hooks also run on worker commits. A hook that leaves an uncommitted or untracked artifact causes the existing clean-tree check to fail before tests or push. Repos must track the intended generated changes or ignore their disposable caches.
 
 1. The worker implements the node and commits.
-2. The supervisor runs `commands.test`, pushes, and opens a draft PR. On a resume, when the tests fail on work an earlier run committed and the branch, with no PR yet, is behind its base, the supervisor merges the base and runs them once more. A conflicting merge parks the node, naming the base SHA and the files (ranger issue #463). A map with remote tests does not get this step yet.
+2. The supervisor runs `commands.test`, pushes, and opens a draft PR. On a resume, when the tests fail on work an earlier run committed and the branch, with no PR yet, is behind its base, the supervisor merges the base and runs them once more. A conflicting merge parks the node, naming the base SHA and the files (ranger issue #463). A map with remote tests does not get this step yet. The gate after a worker pass does the same when the tests fail without naming a failing test and the branch is behind its base, as when the base moves during the run: one merge and one rerun, counted against the node's base merges once a PR exists (ranger issue #490).
 3. The supervisor runs offline sage review rounds, at most `workers.reviewRounds` (default 2), with a fix pass after each round that finds something.
 4. The supervisor marks the PR ready, and the tick posts a one-tap merge card.
 5. After the principal merges, ranger closes the node through the gate and cites the PR's CI run.
