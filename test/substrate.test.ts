@@ -37,6 +37,7 @@ import {
 } from "../src/substrate-policy.ts";
 import { recordedReviews, reviewMarker } from "../src/implement.ts";
 import { sageReview } from "../src/review.ts";
+import { resolveWorkerCommand, type RunNodeContext } from "../src/worker.ts";
 import { runCmd } from "../src/exec.ts";
 import { baseConfigLines } from "./support.ts";
 
@@ -728,7 +729,8 @@ describe("workerCommandFor", () => {
   const session = { settings: "/etc/ranger/worker.json", skillsDir: "/etc/ranger/dev-skills" };
   const flags = ["--add-dir", "/etc/ranger/dev-skills", "--setting-sources", "project", "--settings", "/etc/ranger/worker.json"];
   const onConfig = { ...config, substrates: { ...config.substrates, claude: { ...config.substrates.claude, session } } };
-  expect(nodeWorkerCommandFor("claude", onConfig, "/c/.git").slice(-flags.length)).toEqual(flags);
+  const nodeContext = { config: onConfig } as RunNodeContext;
+  expect(resolveWorkerCommand(nodeContext, "claude", "/c").slice(-flags.length)).toEqual(flags);
   expect(workerCommandFor("claude", config, { claudeSession: session }).slice(-flags.length)).toEqual(flags);
  });
 

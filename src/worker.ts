@@ -360,7 +360,7 @@ function envWorkerOverride(ctx: RunNodeContext): string[] | undefined {
 }
 
 /** Resolve the worker command: explicit override > the substrate's command. */
-function resolveWorkerCommand(
+export function resolveWorkerCommand(
  ctx: RunNodeContext,
  substrate: SubstrateName,
  canonical: string,

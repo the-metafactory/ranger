@@ -1047,7 +1047,7 @@
       "count": 1
     },
     "ranger/no-comments": {
-      "count": 120
+      "count": 119
     }
   },
   "test/base-red-fix-node.test.ts": {

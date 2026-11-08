@@ -555,13 +555,13 @@ const CLAUDE_STREAM_OUTPUT: WorkerOutput = {
  },
 };
 
-/** The output reader for a substrate; an unlabelled run is plain text. */
 /** A node worker's command: the only caller that takes `substrates.claude.session`, so a job never inherits a workers' skill set. */
 export function nodeWorkerCommandFor(substrate: SubstrateName, config: RangerConfig, writableGitDir: string): string[] {
  const claudeSession = config.substrates.claude.session;
  return workerCommandFor(substrate, config, { writableGitDir, ...(claudeSession === undefined ? {} : { claudeSession }) });
 }
 
+/** The output reader for a substrate; an unlabelled run is plain text. */
 export function workerOutputFor(substrate: SubstrateName | undefined): WorkerOutput {
  return substrate === "claude" ? CLAUDE_STREAM_OUTPUT : PLAIN_OUTPUT;
 }
