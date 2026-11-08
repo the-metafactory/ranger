@@ -15,3 +15,11 @@ export class HostLoadPark extends ParkSignal {
   super(message);
  }
 }
+
+/**
+ * GitHub refused the read-only token sage reviews under for a rate limit
+ * (ranger#492): nothing is wrong with the node. The run ends with its row
+ * `failed` and a resume queued behind the token's cooldown, and spends no
+ * recovery budget. A ParkSignal, for the same reason as HostLoadPark.
+ */
+export class ReviewRateLimitWait extends ParkSignal {}

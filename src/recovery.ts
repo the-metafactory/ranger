@@ -89,6 +89,15 @@ export function reserveRecovery(journal: Journal, scope: string, options: { now?
  });
 }
 
+/** Give back a start's reserved attempt: the run ended on a wait, so it spent no retry. */
+export function refundRecoveryReservation(journal: Journal, scope: string, options: { owner?: RecoveryOwner } = {}): void {
+ journal.recoveryTransaction(options.owner, () => {
+  const state = activeRecovery(journal, scope);
+  if (state?.status !== "reserved") return;
+  journal.setHealth(state.key, JSON.stringify({ ...state, attempts: Math.max(0, state.attempts - 1), status: "waiting", nextEligibleAt: null }));
+ });
+}
+
 export function completeRecovery(journal: Journal, scope: string, options: { operation?: string; target?: string; owner?: RecoveryOwner } = {}): void {
  const { operation, target, owner } = options;
  journal.recoveryTransaction(owner, () => {

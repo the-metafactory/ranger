@@ -70,6 +70,7 @@ export const TRANSIENT_BACKOFF_MS = [10_000, 30_000];
 export interface TransientRetryOptions {
  backoffMs?: number[];
  sleep?: (ms: number) => Promise<void>;
+ isTransient?: (result: RunResult) => boolean;
  /** Extra veto on a retry, checked after the transient-error test (e.g. a result that carries a verdict). */
  shouldRetry?: (result: RunResult) => boolean;
  /** Called before each retry, with the attempt about to run (2, 3, …). */
@@ -94,7 +95,7 @@ export async function runReadRetryingTransient(
  const sleep = retry.sleep ?? defaultSleep;
  let result = await runCmd(bin, args, opts);
  for (let i = 0; i < backoff.length; i++) {
-  if (forgeOutcome(result, `${bin} read`).kind !== "infrastructure") break;
+  if (forgeOutcome(result, `${bin} read`).kind !== "infrastructure" && retry.isTransient?.(result) !== true) break;
   if (retry.shouldRetry !== undefined && !retry.shouldRetry(result)) break;
   retry.onRetry?.(i + 2, result);
   await sleep(backoff[i]);

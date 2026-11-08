@@ -1,6 +1,6 @@
 import { selectNodeSubstrate, pinnedNodeSubstrate } from "./node-dependency.ts";
 import { OperationFailure, processOutcome, workerOutcome, failureOutcome, type OperationOutcome } from "./operation-outcome.ts";
-import { activeRecovery, activeRecoveryReason, completeRecovery, completeRecoveryChecks, nodeRecoveryScope, recordRecovery, recoveryHold, recoveryReason, reserveRecovery } from "./recovery.ts";
+import { activeRecovery, activeRecoveryReason, completeRecovery, completeRecoveryChecks, nodeRecoveryScope, recordRecovery, recoveryHold, recoveryReason, refundRecoveryReservation, reserveRecovery } from "./recovery.ts";
 import { requireReachable, requireEndpoint, type EndpointProbe, type EndpointLookup } from "./endpoint.ts";
 import { acquireGeneration } from "./node-ownership.ts";
 import { checkpointNode, confirmPreservedProgress, nodeCheckpoint, preserveNodeProgress, progressRemote, reconcileNodeProgress, ProgressConflict } from "./node-progress.ts";
@@ -69,7 +69,7 @@ import { saveWorkerLog } from "./worker-log.ts";
 import { BudgetDeferral } from "./budget.ts";
 import { findNodePr, finishClosedElsewhere } from "./closed-elsewhere.ts";
 import type { ForgePort } from "./forge.ts";
-import { HostLoadPark, ParkSignal } from "./signals.ts";
+import { HostLoadPark, ParkSignal, ReviewRateLimitWait } from "./signals.ts";
 import { implementLane } from "./lanes.ts";
 import { journalOutcome, policyBlockedOutcome } from "./outcomes.ts";
 import { assertResearchFindingsOnly, researchCi, type ResearchCiTiming } from "./research-ci.ts";
@@ -808,6 +808,7 @@ async function runImplementNode(
   fixNode: ctx.fixNode,
   mergeablePoll: ctx.mergeablePoll,
   substrateReaders: resolveReaders(ctx),
+  now: ctx.now,
  };
  const capped = new Set<SubstrateName>();
  let outcome: ImplementOutcome;
@@ -819,6 +820,7 @@ async function runImplementNode(
    await handleSubstrateCap(ctx, { nodeId, generation, worktree, branch }, cap, outcome, capped);
   } catch (error) {
    if (error instanceof HostLoadPark) return hostLoadParkRun(ctx, nodeId, node.node.title, error.message);
+   if (error instanceof ReviewRateLimitWait) return reviewWaitRun(ctx, nodeId, generation, error.message);
    if (error instanceof ParkSignal || error instanceof GitSafetyError) {
     return parkRun(ctx, nodeId, node.node.title, error.message);
    }
@@ -907,6 +909,19 @@ async function hostLoadParkRun(
  finish(journal, nodeId, repo, "failed", detail);
  journal.enqueueResume({ nodeId, repo, root: map.root, lane: implementLane(map), reason: "host-load" });
  await parkCard(map, nodeId, title, detail, HOST_LOAD_FOOTER);
+ return { nodeId, repo, status: "failed", detail, workerExit: null };
+}
+
+function reviewWaitRun(ctx: RunNodeContext, nodeId: string, generation: number, detail: string): RunNodeOutcome {
+ const { journal, map } = ctx;
+ const repo = map.repo;
+ const owner = { nodeId, repo, generation };
+ journal.recoveryTransaction(owner, () => {
+  journal.recordEvent("transient", { nodeId, repo, detail: journalOutcome(detail) });
+  refundRecoveryReservation(journal, nodeRecoveryScope(repo, nodeId), { owner });
+  finish(journal, nodeId, repo, "failed", detail);
+  journal.enqueueResume({ nodeId, repo, root: map.root, lane: implementLane(map) }, ctx.now?.() ?? new Date());
+ });
  return { nodeId, repo, status: "failed", detail, workerExit: null };
 }
 

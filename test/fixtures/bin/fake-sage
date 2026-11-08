@@ -20,6 +20,8 @@ while [ $# -gt 0 ]; do
   esac
 done
 mode="${SAGE_FAKE_MODE:-approved}"
+if [ -n "${SAGE_FAKE_CALLS:-}" ]; then echo call >> "$SAGE_FAKE_CALLS"; fi
+if [ "$mode" = "preflight" ]; then printf '%s\n' "${SAGE_FAKE_STDERR:-}" >&2; exit "${SAGE_FAKE_EXIT:-2}"; fi
 if [ "$mode" = "crash" ]; then echo "[sage] substrate failed" >&2; exit 1; fi
 verdict="approved"; blockers=0
 if [ "$mode" = "changes-requested" ]; then verdict="changes-requested"; blockers=2; fi
