@@ -1,7 +1,9 @@
+import { z } from "zod";
+import type { RunResult } from "./exec.ts";
 import { nodeKey } from "./forge-ref.ts";
 import { changeRequestRef } from "./forge-text.ts";
 import type { SubstrateName } from "./store/schema.ts";
-import { runReadRetryingTransient } from "./transient.ts";
+import { runReadRetryingTransient, type TransientRetryOptions } from "./transient.ts";
 import { gatedEnv } from "./token-gate.ts";
 import { workerHostEnv } from "./worker-env.ts";
 
@@ -20,6 +22,9 @@ import { workerHostEnv } from "./worker-env.ts";
 
 export class ReviewError extends Error {
  override readonly name = "ReviewError";
+ constructor(message: string, readonly preflight: SagePreflightFailure | null = null) {
+  super(message);
+ }
 }
 
 export interface ReviewVerdict {
@@ -38,11 +43,52 @@ export interface ReviewVerdict {
 /** Sage's per-review wall clock (several lenses, each up to ~17 min by default). */
 const REVIEW_TIMEOUT_MS = 40 * 60 * 1000;
 
+const preflightFailureSchema = z.object({
+ kind: z.enum(["auth", "rate-limit", "transient", "unknown"]),
+ http_status: z.number().int().optional(),
+ reset_at: z.string().datetime({ offset: true }).optional(),
+});
+
+/** Why sage's forge preflight failed, as its SAGE_PREFLIGHT_FAILURE line says (sage#143). */
+export interface SagePreflightFailure {
+ kind: z.infer<typeof preflightFailureSchema>["kind"];
+ httpStatus?: number;
+ resetAt?: Date;
+}
+
+const PREFLIGHT_FAILURE_LINE = /^SAGE_PREFLIGHT_FAILURE (\{.*\})$/;
+const PREFLIGHT_FAILURE_EXIT = 2;
+
+function parsedMarkerOrMalformed(json: string): unknown {
+ try {
+  return JSON.parse(json);
+ } catch {
+  return undefined;
+ }
+}
+
+function preflightFailure(result: Pick<RunResult, "code" | "stderr">): SagePreflightFailure | null {
+ if (result.code !== PREFLIGHT_FAILURE_EXIT) return null;
+ const line = PREFLIGHT_FAILURE_LINE.exec(result.stderr.trimEnd().split("\n").at(-1) ?? "");
+ if (line === null) return null;
+ const parsed = preflightFailureSchema.safeParse(parsedMarkerOrMalformed(line[1]));
+ if (!parsed.success) return null;
+ const { kind, http_status: httpStatus, reset_at: resetAt } = parsed.data;
+ return {
+  kind,
+  ...(httpStatus === undefined ? {} : { httpStatus }),
+  ...(resetAt === undefined ? {} : { resetAt: new Date(resetAt) }),
+ };
+}
+
+const markerAllowsRetry = (result: Pick<RunResult, "code" | "stderr">): boolean =>
+ (preflightFailure(result)?.kind ?? "transient") === "transient";
+
 export async function sageReview(
  repo: string,
  prNumber: number,
  readOnlyToken: string,
- opts: { command?: string; timeoutMs?: number; substrate: SubstrateName; nice?: number; reviewAuthor?: string },
+ opts: { command?: string; timeoutMs?: number; substrate: SubstrateName; nice?: number; reviewAuthor?: string; retry?: Pick<TransientRetryOptions, "sleep"> },
 ): Promise<ReviewVerdict> {
  if (opts.substrate === "pi") throw new ReviewError("Pi cannot run reviews");
  // Ranger posts each round as a PR comment under its machine account, not as
@@ -66,7 +112,11 @@ export async function sageReview(
    },
    // A verdict is never retried, whatever its text says; only a failed run
    // with no verdict block whose error is GitHub-side.
-   { shouldRetry: (r) => !hasVerdictBlock(r.stdout) },
+   {
+    ...opts.retry,
+    isTransient: (r) => preflightFailure(r)?.kind === "transient",
+    shouldRetry: (r) => !hasVerdictBlock(r.stdout) && markerAllowsRetry(r),
+   },
   );
   // sage exits 1 on a changes-requested verdict, after printing the review
   // and its verdict block (sage src/cli/index.ts) — that is a verdict, not a
@@ -83,6 +133,7 @@ export async function sageReview(
    if (verdict?.verdict === "changes-requested") return verdict;
    throw new ReviewError(
     `sage review ${repo}${changeRequestRef(repo, prNumber)} exited ${result.code}: ${(result.stderr || result.stdout).trim().slice(-400)}`,
+    preflightFailure(result),
    );
   }
   return parseVerdictBlock(result.stdout);

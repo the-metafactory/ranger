@@ -39,7 +39,7 @@ import {
 import { recordKnownGood, trustedSnapshot } from "./git-trust.ts";
 import * as gh from "./github.ts";
 import type { IssueComment, ChangeRequest, ForgePort, CiFailedRun, CiVerdict } from "./forge.ts";
-import { HostLoadPark, ParkSignal } from "./signals.ts";
+import { HostLoadPark, ParkSignal, ReviewRateLimitWait } from "./signals.ts";
 import { busyLoadFor, describeLoad, isQuiet, realHostLoad, type BusyReading, type HostLoad, type HostLoadReading } from "./host-load.ts";
 import { implementLane } from "./lanes.ts";
 import {
@@ -59,6 +59,7 @@ import {
  hostLoadOutcome,
  reviewCapHeadMovedOutcome,
  reviewCapOutcome,
+ reviewRateLimitOutcome,
  substrateCappedOutcome,
  closeRefusedOutcome,
  foreignPushParkOutcome,
@@ -67,7 +68,7 @@ import {
 } from "./outcomes.ts";
 import { GRAPH_CALL_TIMEOUT_MS, graphNode, somaRepo, type NodeResult } from "./graph.ts";
 import { finishClosedElsewhere } from "./closed-elsewhere.ts";
-import { budgetedRead, budgetPolicy } from "./budget.ts";
+import { activeCooldown, budgetedRead, budgetPolicy, clearThrottleStrikes, recordThrottle, reviewCooldownScope } from "./budget.ts";
 import { GraphAddUnattached, closeTimeoutForNode, graphAdd, graphClose, graphDecisions, graphLink, type AddSpec, type CloseResult } from "./graph-write.ts";
 import { FixNodeLockBusy, withFixNodeLock } from "./fix-node-lock.ts";
 import { assertFilable, codeCommentSpec, foundByProbeSpec, landminesInDiff, scribeFile, splitOutOfReviewSpec, type Provenance, type ScribeGraph } from "./scribe.ts";
@@ -86,7 +87,7 @@ import {
  type SubstrateReaders,
 } from "./substrate.ts";
 import { selectForReview } from "./substrate-policy.ts";
-import { failedSessionOutcome, recordSession } from "./substrate-usage.ts";
+import { failedSessionOutcome, recordSession, type SessionOutcome } from "./substrate-usage.ts";
 import { commitAuthorFor, workerEnv } from "./worker-env.ts";
 import { recordedRebaseFrom } from "./worktree-head.ts";
 import type { CommitAuthor } from "./identity.ts";
@@ -173,6 +174,7 @@ export interface ImplementContext {
  model?: string;
  /** Quota readers for review selection and cap confirmation (tests inject them). */
  substrateReaders?: SubstrateReaders;
+ now?: () => Date;
  /** Substrates capped earlier in this run: review selection leaves them out. */
  excludedSubstrates?: ReadonlySet<SubstrateName>;
  /** Capture shell/server injection; tests launch no browser. */
@@ -1411,6 +1413,25 @@ async function tryCarryReview(ctx: ImplementContext, reviews: RecordedReview[], 
 
 const failedOperations = new WeakMap<ImplementContext, OperationOutcome>();
 
+function failedReviewSessionOutcome(error: ReviewError, cap: CapSignal | null): SessionOutcome {
+ const kind = error.preflight?.kind;
+ return kind === "rate-limit" || kind === "transient" ? "transient" : failedSessionOutcome(error.message, cap);
+}
+
+function reviewFailure(ctx: ImplementContext, error: ReviewError, round: number): Error {
+ const preflight = error.preflight;
+ if (preflight?.kind === "transient") {
+  return new OperationFailure({ kind: "infrastructure", operation: "sage-preflight", evidence: error.message, action: "wait for GitHub to recover; the sweep retries the review" });
+ }
+ if (preflight?.kind !== "rate-limit") return error;
+ const status = preflight.httpStatus === undefined ? "" : `HTTP ${preflight.httpStatus}, `;
+ const throttled = recordThrottle(ctx.journal, reviewCooldownScope(ctx.config, ctx.map.repo), budgetPolicy(ctx.config), ctx.now?.() ?? new Date(), {
+  ...(preflight.resetAt === undefined ? {} : { resetAt: preflight.resetAt }),
+  reason: (strikes) => `GitHub rate limit on sage's read-only token: ${status}throttle ${strikes} in a row`,
+ });
+ return new ReviewRateLimitWait(reviewRateLimitOutcome({ round, until: throttled.until, reason: throttled.reason, evidence: error.message }));
+}
+
 export async function runImplement(ctx: ImplementContext): Promise<ImplementOutcome> {
  failedOperations.delete(ctx);
  let outcome: ImplementOutcome;
@@ -1788,6 +1809,8 @@ async function runImplementFlow(ctx: ImplementContext): Promise<ImplementOutcome
    }
    const round = rounds + 1;
    fence("review");
+   const cooling = activeCooldown(journal, reviewCooldownScope(config, repo), ctx.now?.() ?? new Date());
+   if (cooling?.kind === "throttled") throw new ReviewRateLimitWait(reviewRateLimitOutcome({ round, until: cooling.until, reason: cooling.reason }));
    const { substrate: reviewSubstrate, chosenOn } = await selectReviewSubstrate(ctx, live.headSha);
    // The sage round is a substrate session (node #56): its row opens under
    // the generation fence once selection has settled (selection awaits, and
@@ -1808,15 +1831,15 @@ async function runImplementFlow(ctx: ImplementContext): Promise<ImplementOutcome
       };
      } catch (error) {
       if (!(error instanceof ReviewError)) throw error;
-      return { error, cap: await confirmCap(reviewSubstrate, journal, { readers: ctx.substrateReaders }) };
+      return { error, cap: error.preflight === null ? await confirmCap(reviewSubstrate, journal, { readers: ctx.substrateReaders }) : null };
      }
     },
-    (r) => ("verdict" in r ? "ok" : failedSessionOutcome(r.error.message, r.cap)),
+    (r) => ("verdict" in r ? "ok" : failedReviewSessionOutcome(r.error, r.cap)),
    );
    if (!("verdict" in reviewed)) {
     // A review that failed on its substrate's limit resumes elsewhere; any
     // other review failure is an ordinary one.
-    if (reviewed.cap === null) throw reviewed.error;
+    if (reviewed.cap === null) throw reviewFailure(ctx, reviewed.error, round);
     return {
      status: "failed",
      detail: `sage review round ${round} on ${reviewSubstrate} hit its rate limit: ${reviewed.error.message.slice(0, 300)}`,
@@ -1826,6 +1849,7 @@ async function runImplementFlow(ctx: ImplementContext): Promise<ImplementOutcome
     };
    }
    const verdict = reviewed.verdict;
+   clearThrottleStrikes(journal, reviewCooldownScope(config, repo));
    if (verdict.commitId !== live.headSha) {
     throw new ParkSignal(
      `sage reviewed ${verdict.commitId.slice(0, 8)} but ${changeRequestLabel(repo, open.iid)}'s head is ${live.headSha.slice(0, 8)} — the head moved during review`,

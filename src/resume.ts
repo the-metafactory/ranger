@@ -2,6 +2,7 @@ import { quietHostGate, queuedResumeStale, queueSpawnGate, whenFreeQueues, queue
 export { quietHostGate, queuedResumeStale, queueSpawnGate, whenFreeQueues, queueEntryGate, type QueueEntryGate } from "./resume-gates.ts";
 import { resolveNodeSelector, workerPreflight, type DispatchDeps } from "./node-dependency.ts";
 import { OperationFailure } from "./operation-outcome.ts";
+import { activeCooldown, reviewCooldownScope } from "./budget.ts";
 import { activeRecovery, nodeRecoveryScope, recoveryHold, resetRecovery } from "./recovery.ts";
 import { startOwnedWorker, reservationPending } from "./node-ownership.ts";
 import { join } from "node:path";
@@ -221,6 +222,11 @@ export async function processResumeQueue(
   const recoveryWait = recoveryHold(journal, nodeRecoveryScope(entry.repo, entry.nodeId), ctx.now?.() ?? new Date());
   if (recoveryWait !== null) {
    journal.recordEvent("sweep", { nodeId: entry.nodeId, repo: entry.repo, detail: `queued recovery deferred: ${recoveryWait}` });
+   continue;
+  }
+  const cooling = activeCooldown(journal, reviewCooldownScope(config, entry.repo), ctx.now?.() ?? new Date());
+  if (cooling?.kind === "throttled") {
+   journal.recordEvent("sweep", { nodeId: entry.nodeId, repo: entry.repo, detail: `queued resume #${entry.nodeId} waits until ${cooling.until.toISOString()}: ${cooling.reason}` });
    continue;
   }
   // The lane holder is read at the start itself (startResumeNode), after the

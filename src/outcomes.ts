@@ -382,6 +382,12 @@ export function respawnedEvent(attempt: number): string {
 
 export const RESPAWNED_EVENT = /^respawned \(attempt \d+\)$/;
 
+/** A review waiting out the read-only token's cooldown (ranger#492): the row's outcome and its journal event. */
+export function reviewRateLimitOutcome(r: { round: number; until: Date; reason: string; evidence?: string }): string {
+ const wait = `sage review round ${r.round} waits until ${r.until.toISOString()} (${r.reason}); a queued resume restarts it and spends no recovery budget`;
+ return r.evidence === undefined ? wait : `${wait}: ${r.evidence}`;
+}
+
 /** Why a load-queued resume waits (node #297): the park card, `ranger serve` and the queue gate say it the same way. */
 export function waitingForQuietHost(host: HostLoadReading, busyLoad?: number): string {
  return `waiting for a quiet host: ${describeLoad(host, busyLoad)}`;

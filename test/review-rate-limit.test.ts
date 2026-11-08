@@ -189,7 +189,7 @@ describe("what still parks (ranger#492)", () => {
   expect(outcome.status).toBe("parked");
   expect(row(r)?.status).toBe("parked");
   expect(row(r)?.outcome).toContain("unknown recovery 1/3 exhausted");
-  expect(row(r)?.outcome).toContain(line.split("\n").at(-1) as string);
+  expect(row(r)?.outcome).toContain(line.split("\n").at(-1) ?? line);
   expect(r.journal.listResumeQueue()).toEqual([]);
   expect(activeCooldown(r.journal, READ_TOKEN_ENV, T0)).toBeNull();
  }, 120_000);

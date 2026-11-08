@@ -2,7 +2,7 @@ import type { RangerConfig } from "./config.ts";
 import { runCmd } from "./exec.ts";
 import { RateLimitError } from "./graph.ts";
 import type { Journal } from "./journal.ts";
-import { gatedEnv, assertGitLabReadGrant, type ResolvedToken } from "./token-gate.ts";
+import { gatedEnv, assertGitLabReadGrant, matchTokenEnv, type ResolvedToken } from "./token-gate.ts";
 import { parseForgeRef } from "./forge-ref.ts";
 
 /**
@@ -83,6 +83,14 @@ export function cooldownScope(repo: string, source: string): string {
   return ref.forge === "github" ? source : `${ref.forge}:${ref.host}:${source}`;
 }
 
+/**
+ * The scope of the read-only token sage reviews under. On GitHub, graph reads
+ * run under the machine write token, so a refused review cools only this token.
+ */
+export function reviewCooldownScope(config: Pick<RangerConfig, "auth">, repo: string): string {
+  return cooldownScope(repo, matchTokenEnv(config.auth, repo) ?? "read-only-token");
+}
+
 const COOLDOWN_KEY = (scope: string) => `ratelimit:${scope}`;
 
 function readCooldownRecord(journal: Journal, scope: string): Cooldown | null {
@@ -129,6 +137,40 @@ function deferral(scope: string, c: Cooldown): BudgetDeferral {
   return new BudgetDeferral(
     `graph reads on ${scope} deferred until ${c.until.toISOString()} (${c.reason})`,
   );
+}
+
+/**
+ * Record a refusal as a `throttled` cooldown: until the forge's own reset when
+ * it gave a future one, and otherwise for the doubling backoff. Either way it
+ * ends within MAX_THROTTLE_MS, so a wild reset cannot hold a token for long.
+ */
+export function recordThrottle(
+  journal: Journal,
+  scope: string,
+  policy: Pick<BudgetPolicy, "cooldownMs">,
+  now: Date,
+  refusal: { resetAt?: Date; reason: (strikes: number) => string },
+): Cooldown {
+  const strikes = (readCooldownRecord(journal, scope)?.strikes ?? 0) + 1;
+  const latest = now.getTime() + MAX_THROTTLE_MS;
+  const resetAt = refusal.resetAt?.getTime();
+  const until = resetAt !== undefined && resetAt > now.getTime()
+    ? Math.min(resetAt, latest)
+    : Math.min(now.getTime() + policy.cooldownMs * 2 ** (strikes - 1), latest);
+  const throttled: Cooldown = { kind: "throttled", until: new Date(until), reason: refusal.reason(strikes), strikes };
+  writeCooldown(journal, scope, throttled);
+  return throttled;
+}
+
+/** A call under the token succeeded: the next throttle starts from the first backoff. */
+export function clearThrottleStrikes(journal: Journal, scope: string): void {
+  if ((readCooldownRecord(journal, scope)?.strikes ?? 0) === 0) return;
+  writeCooldown(journal, scope, {
+    kind: "throttled",
+    until: new Date(0),
+    reason: "cleared by a successful read",
+    strikes: 0,
+  });
 }
 
 /**
@@ -263,31 +305,16 @@ export async function budgetedRead<T>(
     // GitHub's allowance distinguishes a spent window from a secondary
     // limit. GitLab has no allowance probe and uses the throttle backoff.
     const spent = budget !== null && budget.remaining === 0;
-    const strikes = (readCooldownRecord(journal, scope)?.strikes ?? 0) + 1;
-    const backoff = Math.min(
-      policy.cooldownMs * 2 ** (strikes - 1),
-      MAX_THROTTLE_MS,
-    );
-    const throttled: Cooldown = {
-      kind: "throttled",
-      until: spent && budget !== null ? budget.resetAt : new Date(now.getTime() + backoff),
-      reason: spent
+    const throttled = recordThrottle(journal, scope, policy, now, {
+      ...(spent && budget !== null ? { resetAt: budget.resetAt } : {}),
+      reason: (strikes) => spent
         ? "GraphQL allowance spent"
         : `${ref.forge === "github" ? "GitHub secondary" : "GitLab"} rate limit, throttle ${strikes} in a row`,
-      strikes,
-    };
-    writeCooldown(journal, scope, throttled);
+    });
     throw new BudgetDeferral(
       `graph reads on ${scope} deferred until ${throttled.until.toISOString()} (${throttled.reason}): ${error.message}`,
     );
   }
-  if ((readCooldownRecord(journal, scope)?.strikes ?? 0) > 0) {
-    writeCooldown(journal, scope, {
-      kind: "throttled",
-      until: new Date(0),
-      reason: "cleared by a successful read",
-      strikes: 0,
-    });
-  }
+  clearThrottleStrikes(journal, scope);
   return value;
 }
