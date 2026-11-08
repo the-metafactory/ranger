@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { RangerConfig } from "./config.ts";
+import { expandHome, type ClaudeSession, type RangerConfig } from "./config.ts";
 import { runCmd, splitLines, type RunOptions, type RunResult } from "./exec.ts";
 import type { Journal, SubstrateReading } from "./journal.ts";
 import type { SubstrateName } from "./store/schema.ts";
@@ -482,11 +482,17 @@ export function describeWorkerModel(model: WorkerModel): string {
 export function workerCommandFor(
  substrate: SubstrateName,
  config: RangerConfig,
- opts: { writableGitDir?: string } = {},
+ opts: { writableGitDir?: string; claudeSession?: ClaudeSession } = {},
 ): string[] {
  switch (substrate) {
-  case "claude":
-   return ["claude", "-p", "--model", config.substrates.claude.model, "--output-format", "stream-json", "--verbose"];
+  case "claude": {
+   const session = opts.claudeSession ?? config.substrates.claude.session;
+   return [
+    "claude", "-p", "--model", config.substrates.claude.model, "--output-format", "stream-json", "--verbose",
+    ...(session?.skillsDir === undefined ? [] : ["--add-dir", expandHome(session.skillsDir)]),
+    ...(session === undefined ? [] : ["--setting-sources", "project", "--settings", expandHome(session.settings)]),
+   ];
+  }
   case "codex":
    return [
     "codex",

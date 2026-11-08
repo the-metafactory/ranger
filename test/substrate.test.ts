@@ -723,6 +723,23 @@ describe("workerCommandFor", () => {
   expect(cmd).toEqual(["claude", "-p", "--model", "claude-sonnet-5-5", "--output-format", "stream-json", "--verbose"]);
  });
 
+ test("claude session: --add-dir comes before the single-value flags, so its variadic list cannot swallow the final prompt", () => {
+  const session = { settings: "/etc/ranger/worker.json", skillsDir: "/etc/ranger/dev-skills" };
+  const flags = ["--add-dir", "/etc/ranger/dev-skills", "--setting-sources", "project", "--settings", "/etc/ranger/worker.json"];
+  const onConfig = { ...config, substrates: { ...config.substrates, claude: { ...config.substrates.claude, session } } };
+  expect(workerCommandFor("claude", onConfig).slice(-flags.length)).toEqual(flags);
+  expect(workerCommandFor("claude", config, { claudeSession: session }).slice(-flags.length)).toEqual(flags);
+ });
+
+ test("claude session: a job's session replaces the workers' session, and no other substrate takes it", () => {
+  const session = { settings: "/etc/ranger/worker.json", skillsDir: "/etc/ranger/dev-skills" };
+  const onConfig = { ...config, substrates: { ...config.substrates, claude: { ...config.substrates.claude, session } } };
+  const cmd = workerCommandFor("claude", onConfig, { claudeSession: { settings: "/etc/ranger/job.json" } });
+  expect(cmd.slice(-4)).toEqual(["--setting-sources", "project", "--settings", "/etc/ranger/job.json"]);
+  expect(cmd).not.toContain("--add-dir");
+  expect(workerCommandFor("codex", onConfig)).not.toContain("--setting-sources");
+ });
+
  test("codex: a writable workspace sandbox, an explicit auto-reviewed approval mode (#457), plus the common git dir a worktree commits into", () => {
   expect(workerCommandFor("codex", config)).toEqual([
    "codex",

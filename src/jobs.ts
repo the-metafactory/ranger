@@ -454,7 +454,7 @@ export async function runJob(runId: number, ctx: RunJobContext): Promise<RunJobO
 
  const scratch = mkdtempSync(join(tmpdir(), "ranger-job-"));
  const resultFile = join(scratch, "result");
- const command = studio?.kind === "ready" ? studioCommand(substrate, config, resultFile) : workerCommandFor(substrate, config);
+ const command = studio?.kind === "ready" ? studioCommand(substrate, config, resultFile) : workerCommandFor(substrate, config, job.claudeSession === undefined ? {} : { claudeSession: job.claudeSession });
  const output = workerOutputFor(substrate);
  let raw: RunResult;
  try {

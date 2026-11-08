@@ -248,6 +248,14 @@ describe("node #301 — scheduled jobs", () => {
   expect(r.envelopes).toHaveLength(0);
  });
 
+ test("claudeSession: the session starts on project settings and the job's file, with the prompt still last", async () => {
+  const r = rig([{ ...SHORT, claudeSession: { settings: "/tmp/job.settings.json" } }]);
+  const runId = await startedRun(r);
+  const s = session({}, "soma:outputs/G6/2026-10-15.md");
+  await runJob(runId, { config: r.config, journal: r.journal, substrate: "claude", runSession: s.runSession, ledger: r.ledger });
+  expect(s.calls[0].args.slice(-5)).toEqual(["--setting-sources", "project", "--settings", "/tmp/job.settings.json", "/daily-short"]);
+ });
+
  test("requireResult: a clean exit with no result fails as no result; with a result it succeeds", async () => {
   const r = rig([{ ...SHORT, requireResult: true }]);
   const runId = await startedRun(r);

@@ -16,7 +16,21 @@ jobs:
     cwd: ~/work/far-between/shorts
     substrates: [claude]       # optional; default all three, picked by quota
     requireResult: true        # optional; a clean exit with no result fails
+    claudeSession:             # optional; a smaller startup on Claude
+      settings: ~/work/far-between/shorts/install/daily-short-job.settings.json
+      skillsDir: ~/.config/ranger/job-skills   # optional; loads its .claude/skills
 ```
+
+## Shrink a Claude session
+
+Without `claudeSession`, a session loads the principal's user settings: every user skill, every hook and the auto permission mode. With it, the session runs with `--setting-sources project --settings <file>`, plus `--add-dir <skillsDir>` when set. `substrates.claude.session` takes the same two fields and applies to every worker on Claude. A job's `claudeSession` replaces it.
+
+The settings file has to bring back what the session still needs:
+
+- **Guard hooks.** User hooks no longer run, so declare each guard hook the session must keep.
+- **Permission mode.** Claude Code ignores `permissions.defaultMode: auto` in a project's settings, but honours it in this file.
+- **Rule exclusions.** `~/.claude/rules` still loads when the session's cwd is under the home directory. Use `claudeMdExcludes` to leave rules out.
+- **Skills.** User skills no longer load. Put the job's skill in the project's `.claude/skills`, or in `skillsDir`'s.
 
 ## Queue and run a job
 
