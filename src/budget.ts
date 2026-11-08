@@ -162,9 +162,14 @@ export function recordThrottle(
   return throttled;
 }
 
-/** A call under the token succeeded: the next throttle starts from the first backoff. */
-export function clearThrottleStrikes(journal: Journal, scope: string): void {
-  if ((readCooldownRecord(journal, scope)?.strikes ?? 0) === 0) return;
+/**
+ * A call under the token succeeded: the next throttle starts from the first
+ * backoff. A cooldown still in force stays, because a call that began before
+ * another caller's refusal says nothing about the limit now.
+ */
+export function clearThrottleStrikes(journal: Journal, scope: string, now: Date): void {
+  const record = readCooldownRecord(journal, scope);
+  if (record === null || record.strikes === 0 || record.until > now) return;
   writeCooldown(journal, scope, {
     kind: "throttled",
     until: new Date(0),
@@ -315,6 +320,6 @@ export async function budgetedRead<T>(
       `graph reads on ${scope} deferred until ${throttled.until.toISOString()} (${throttled.reason}): ${error.message}`,
     );
   }
-  clearThrottleStrikes(journal, scope);
+  clearThrottleStrikes(journal, scope, now);
   return value;
 }

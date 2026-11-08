@@ -1849,7 +1849,7 @@ async function runImplementFlow(ctx: ImplementContext): Promise<ImplementOutcome
     };
    }
    const verdict = reviewed.verdict;
-   clearThrottleStrikes(journal, reviewCooldownScope(config, repo));
+   clearThrottleStrikes(journal, reviewCooldownScope(config, repo), ctx.now?.() ?? new Date());
    if (verdict.commitId !== live.headSha) {
     throw new ParkSignal(
      `sage reviewed ${verdict.commitId.slice(0, 8)} but ${changeRequestLabel(repo, open.iid)}'s head is ${live.headSha.slice(0, 8)} — the head moved during review`,

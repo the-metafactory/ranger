@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { activeCooldown, MAX_THROTTLE_MS } from "../src/budget.ts";
+import { activeCooldown, MAX_THROTTLE_MS, recordThrottle } from "../src/budget.ts";
 import { openJournal } from "../src/journal.ts";
 import { activeRecovery, nodeRecoveryScope, recordRecovery, recoverablePending, recoveryHold } from "../src/recovery.ts";
 import { processResumeQueue } from "../src/resume.ts";
@@ -150,6 +150,18 @@ describe("a rate-limited sage review (ranger#492)", () => {
   expect(readFileSync(calls, "utf8")).toBe("call\n");
   expect(cooldown(r, T0)?.strikes).toBe(1);
   expect(r.journal.listResumeQueue()).toHaveLength(1);
+ }, 120_000);
+
+ test("a verdict in flight when another node is throttled leaves that node's cooldown in force", async () => {
+  const { r, scripted } = track(await waitingRig(refused(marker(RATE_LIMITED))));
+  clearSageStub();
+  r.ctx.reviewer = async (repo, pr, token, opts) => {
+   recordThrottle(r.journal, READ_TOKEN_ENV, { cooldownMs: 600_000 }, T0, { resetAt: minutes(20), reason: () => "another node" });
+   if (scripted === undefined) throw new Error("the rig always scripts a reviewer");
+   return scripted(repo, pr, token, opts);
+  };
+  expect((await runNode(NODE, r.ctx)).status).toBe("awaiting-merge");
+  expect(cooldown(r, T0)).toMatchObject({ kind: "throttled", strikes: 1, until: minutes(20) });
  }, 120_000);
 
  test("a verdict clears the strikes, so the next throttle starts from the first cooldown", async () => {
