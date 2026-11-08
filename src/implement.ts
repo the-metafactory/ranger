@@ -1496,18 +1496,14 @@ async function runImplementFlow(ctx: ImplementContext): Promise<ImplementOutcome
  if (phase === "close") {
   return closeAfterMerge(ctx, github, pr as ChangeRequest);
  }
- const recordMachineMerge = (prNumber: number) => async (sha: string, stale: StaleBase): Promise<void> => {
-  fence("record the base merge");
-  await github.postComment(repo, prNumber, baseMergeMarker(sha, base, stale, "ranger"), token);
- };
  let checkedResume: CheckedOnBase | undefined;
  if (phase === "review" && pr !== null && pr.headSha === await headSha(worktree)) {
   journal.updateWorker(nodeId, repo, { phase: "review" });
   const checkpoint = nodeCheckpoint(ctx);
   const accepted = checkpoint?.evidence.some(evidence => evidence.kind === "tests-gate" && evidence.result === "passed" && evidence.detail === testCommand);
   if (!accepted) {
-   const landed = await landedBaseMerges(worktree, recordedBaseMerges(await github.listComments(repo, pr.iid, token), botIdentity), pr.headSha);
-   checkedResume = await checkOnCurrentBase(ctx, testCommand, { label: "resumed checkpoint", mergeFirst: false, mergesLeft: MAX_BASE_MERGES - landed, recordMerge: recordMachineMerge(pr.iid) });
+   const prNumber = pr.iid, prHead = pr.headSha;
+   checkedResume = await checkOnCurrentBase(ctx, testCommand, { label: "resumed checkpoint", mergeFirst: false, mergesLeft: () => mergesLeftOnPr(ctx, github, prNumber, prHead), recordMerge: recordMachineMerge(ctx, github, prNumber) });
    if (checkedResume.failure !== undefined) return { status: "failed", detail: checkedResume.failure, workerExit: null };
   }
  }
@@ -1742,17 +1738,17 @@ async function runImplementFlow(ctx: ImplementContext): Promise<ImplementOutcome
   return "merge";
  };
  for (;;) {
-  const cap = capNow();
   const live = await github.getPr(repo, open.iid, token);
   // Whatever reviews or fixes this head works on a tree at it (ranger issue #228).
   await prepareWorktree(ctx, { at: "pr-head", prNumber: open.iid, prHead: live.headSha });
+  baseMerges = Math.max(baseMerges, await landedBaseMerges(worktree, recordedBaseMerges(await github.listComments(repo, open.iid, token), botIdentity), live.headSha));
+  const cap = capNow();
   const here = await headSha(worktree);
   if (here !== live.headSha) {
-   const checked = checkedResume?.sha === here ? checkedResume : await checkOnCurrentBase(ctx, testCommand, { label: "resumed worktree", mergeFirst: true, mergesLeft: MAX_BASE_MERGES - baseMerges, recordMerge: recordMachineMerge(open.iid) });
+   const checked = checkedResume?.sha === here ? checkedResume : await checkOnCurrentBase(ctx, testCommand, { label: "resumed worktree", mergeFirst: true, mergesLeft: () => Promise.resolve(MAX_BASE_MERGES - baseMerges), recordMerge: recordMachineMerge(ctx, github, open.iid) });
    if (checked.failure !== undefined) return { status: "failed", detail: checked.failure, workerExit: null };
    await publishPass(ctx, github, open.iid, { sha: checked.sha, snapshot: checked.snapshot, workerExit: null, adopted: true }, "push resumed worktree", `resumed worktree pushed ${branch} from PR head ${live.headSha} to worktree head ${checked.sha}`);
    const comments = await github.listComments(repo, open.iid, token);
-   baseMerges = Math.max(baseMerges, await landedBaseMerges(worktree, recordedBaseMerges(comments, botIdentity), checked.sha));
    ciFixes = Math.max(ciFixes, ciFixState(recordedCiFixes(comments, botIdentity), checked.sha).used);
    probeFixes = Math.max(probeFixes, ciFixState(recordedProbeFixes(comments, botIdentity), checked.sha).used);
    continue;
@@ -2011,6 +2007,16 @@ async function runImplementFlow(ctx: ImplementContext): Promise<ImplementOutcome
 
 /** Base merge passes one node gets before a still-conflicting branch parks. */
 const MAX_BASE_MERGES = 2;
+
+const recordMachineMerge = (ctx: ImplementContext, github: ForgePort, prNumber: number) => async (sha: string, stale: StaleBase): Promise<void> => {
+ ctx.journal.assertGeneration(ctx.node.ref.id, ctx.map.repo, ctx.generation, "record the base merge");
+ await github.postComment(ctx.map.repo, prNumber, baseMergeMarker(sha, ctx.map.base, stale, "ranger"), ctx.token);
+};
+
+async function mergesLeftOnPr(ctx: ImplementContext, github: ForgePort, prNumber: number, head: string): Promise<number> {
+ const comments = await github.listComments(ctx.map.repo, prNumber, ctx.token);
+ return MAX_BASE_MERGES - await landedBaseMerges(ctx.worktree, recordedBaseMerges(comments, ctx.botIdentity), head);
+}
 
 interface BaseMergeInput {
  base: string;
@@ -2321,10 +2327,27 @@ interface CheckedOnBase {
 
 const MAX_BASE_MOVES_UNDER_TESTS = 1;
 
-async function checkOnCurrentBase(ctx: ImplementContext, testCommand: string, input: { label: string; mergeFirst: boolean; mergesLeft: number; recordMerge: (sha: string, stale: StaleBase) => Promise<void> }): Promise<CheckedOnBase> {
+async function workerRedMayBeTheBase(ctx: ImplementContext, refusal: GateRefusal): Promise<boolean> {
+ if (!refusal.mayBeBehindBase || remoteTests(ctx) || (await testBaseTip(ctx)) === null) return false;
+ try {
+  await fetchBaseTrusted(ctx);
+  return true;
+ } catch (error) {
+  if (!(error instanceof GitSafetyError)) throw error;
+  ctx.journal.recordEvent("reviewed", {
+   nodeId: ctx.node.ref.id,
+   repo: ctx.map.repo,
+   detail: `the worker's commits failed the tests, and the base was not fetched to look for a move: ${error.message}`.slice(0, 400),
+  });
+  return false;
+ }
+}
+
+async function checkOnCurrentBase(ctx: ImplementContext, testCommand: string, input: { label: string; mergeFirst: boolean; mergesLeft: () => Promise<number>; recordMerge: (sha: string, stale: StaleBase) => Promise<void>; worker?: { baseTip: string | null } }): Promise<CheckedOnBase> {
  const { worktree, journal, map } = ctx;
- let mergesLeft = input.mergesLeft;
+ let mergesLeft: number | undefined;
  const mergeUp = async (): Promise<MergedBeforeTests> => {
+  mergesLeft ??= await input.mergesLeft();
   const prepared = await prepareWorktree(ctx, { at: "before-tests", budgetLeft: mergesLeft > 0 });
   if (prepared.merged !== undefined) {
    mergesLeft -= 1;
@@ -2338,11 +2361,14 @@ async function checkOnCurrentBase(ctx: ImplementContext, testCommand: string, in
   const snapshot = await trustedSnapshot(journal, ctx.canonical, { repo: map.repo, nodeId: ctx.node.ref.id }, mapKey(map));
   const result: CheckedOnBase = { sha, snapshot };
   if (prepared.failure !== undefined) return { ...result, failure: prepared.failure };
-  const failure = await checkPass(ctx, testCommand, { sha, snapshot, baseTip: await testBaseTip(ctx), label: input.label, context: "resume" });
-  if (failure === undefined) return result;
-  if (moves >= MAX_BASE_MOVES_UNDER_TESTS) return { ...result, failure };
+  const baseTip = input.worker !== undefined && moves === 0 ? input.worker.baseTip : await testBaseTip(ctx);
+  const refusal = await checkPass(ctx, testCommand, { sha, snapshot, baseTip, label: input.label, context: input.worker === undefined ? "resume" : "worker" });
+  if (refusal === undefined) return result;
+  const refused = { ...result, failure: refusal.detail };
+  if (moves >= MAX_BASE_MOVES_UNDER_TESTS) return refused;
+  if (input.worker !== undefined && !(await workerRedMayBeTheBase(ctx, refusal))) return refused;
   prepared = await mergeUp();
-  if (prepared.merged === undefined && prepared.failure === undefined) return { ...result, failure };
+  if (prepared.merged === undefined && prepared.failure === undefined) return refused;
  }
 }
 
@@ -2863,9 +2889,22 @@ async function checkedWorkerPass(
  // This session wrote `sha`: record it now, so a later run that adopts the
  // commit unpushed still credits the substrate that actually wrote it.
  if (sha !== before) recordHead(ctx, sha);
- const failure = await checkPass(ctx, testCommand, { sha, snapshot, baseTip, label: pass, context: "worker" });
- if (failure !== undefined) return fail(failure);
- return { workerExit: result.code, snapshot, sha, ...(sha === before ? { adopted: true } : {}) };
+ const gate = await checkOnCurrentBase(ctx, testCommand, { label: pass, mergeFirst: false, worker: { baseTip }, ...workerGateBudget(ctx, spec) });
+ if (gate.failure !== undefined) return fail(gate.failure);
+ return { workerExit: result.code, snapshot: gate.snapshot, sha: gate.sha, ...(sha === before ? { adopted: true } : {}) };
+}
+
+const NO_PR_THREAD_TO_RECORD_ON = (): Promise<void> => Promise.resolve();
+
+function workerGateBudget(ctx: ImplementContext, spec: WorkerPassSpec): { mergesLeft: () => Promise<number>; recordMerge: (sha: string, stale: StaleBase) => Promise<void> } {
+ const spentByThisPass = spec.kind === "base-merge" ? 1 : 0;
+ const prNumber = ctx.journal.getWorker(ctx.node.ref.id, ctx.map.repo)?.prNumber ?? null;
+ if (prNumber === null) return { mergesLeft: () => Promise.resolve(MAX_BASE_MERGES - spentByThisPass), recordMerge: NO_PR_THREAD_TO_RECORD_ON };
+ const github = ctx.github ?? lanePort(ctx.config, ctx.map.repo);
+ return {
+  mergesLeft: async () => await mergesLeftOnPr(ctx, github, prNumber, await headSha(ctx.worktree)) - spentByThisPass,
+  recordMerge: recordMachineMerge(ctx, github, prNumber),
+ };
 }
 
 async function testBaseTip(ctx: ImplementContext): Promise<string | null> {
@@ -2873,37 +2912,49 @@ async function testBaseTip(ctx: ImplementContext): Promise<string | null> {
  return baseRef.code === 0 && /^[0-9a-f]{40}$/.test(baseRef.stdout.trim()) ? baseRef.stdout.trim() : null;
 }
 
+interface GateRefusal {
+ detail: string;
+ mayBeBehindBase: boolean;
+}
+
+const refusedOutright = (detail: string): GateRefusal => ({ detail, mayBeBehindBase: false });
+
 async function checkPass(
  ctx: ImplementContext,
  testCommand: string,
  input: { sha: string; snapshot: string; baseTip: string | null; label: string; context: "worker" | "resume" },
-): Promise<string | undefined> {
+): Promise<GateRefusal | undefined> {
  const { sha, snapshot, baseTip, label: pass } = input;
  const { worktree, journal, map } = ctx;
  // The supervisor tests the working tree but pushes commits: a dirty tree
  // would let a green test run cover code that never lands.
  const dirty = await dirtyFiles(worktree);
  if (dirty.length > 0) {
-  return `worker left ${dirty.length} uncommitted or untracked file(s) (${dirty.slice(0, 5).join("; ")}) — the tests would not test what gets pushed`;
+  return refusedOutright(`worker left ${dirty.length} uncommitted or untracked file(s) (${dirty.slice(0, 5).join("; ")}) — the tests would not test what gets pushed`);
  }
  const { tests, retried, baseRed, busy } = await supervisorTests(ctx, testCommand, pass, baseTip);
  // The retry ran on a busy host too and failed: the host's failure, not the
  // branch's. No fix pass, no failed node: the run parks and a resume waits
  // for a quiet host (node #297); the resume adopts this pass's commits.
  if (tests.code !== 0 && busy !== undefined) throw hostLoadPark(ctx, busy, `the supervisor's tests (${testCommand}) after the ${pass}`, tests);
- if (tests.code !== 0 && baseRed === undefined) return testsFailedDetail(ctx, testCommand, tests, input.context === "resume" ? "on the resumed worktree" : "after the worker");
+ if (tests.code !== 0 && baseRed === undefined) {
+  return {
+   detail: testsFailedDetail(ctx, testCommand, tests, input.context === "resume" ? "on the resumed worktree" : "after the worker"),
+   mayBeBehindBase: tests.timedOut !== true && failedTestNames(tests).length === 0 && (await headSha(worktree)) === sha,
+  };
+ }
  if (retried || baseRed !== undefined) {
   // The pass was certified in a fresh clone, or its failures are the base's:
   // the worktree still holds what the failed run left, and the probes run
   // there next.
   const restored = await restoreWorktree(ctx, sha);
-  if (restored !== null) return restored;
+  if (restored !== null) return refusedOutright(restored);
  }
  // The tests ran worker-written code: the state must still be the vetted one
  // before it counts as seen clean.
  const clean = await assertGitUntouched(ctx.canonical, snapshot);
  if (await headSha(worktree) !== sha || (await dirtyFiles(worktree)).length > 0) {
-  return `supervisor tests changed the committed source at ${sha}; no exact-SHA test evidence was accepted`;
+  return refusedOutright(`supervisor tests changed the committed source at ${sha}; no exact-SHA test evidence was accepted`);
  }
  recordKnownGood(journal, ctx.canonical, clean, `passing ${pass}`);
  await assertNoClosingKeywords(worktree, map.base, parseForgeRef(map.repo).forge);

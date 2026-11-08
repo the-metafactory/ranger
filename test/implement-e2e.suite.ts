@@ -1107,7 +1107,6 @@ describe("implement lane (node #23)", () => {
   for (const sha of [pushed, initial]) await r.github.postComment("acme/widgets", 1, baseMergeMarker(sha, "main"));
  };
  const markersOn = (r: Rig) => (r.github.comments.get(1) ?? []).filter((c) => c.body.includes("ranger:base-merge"));
- /** A commit waiting in a clone of the base. `landOnce` is a shell condition that pushes it the first time it runs, and is false after that. */
  const lateBaseCommit = async (r: Rig, file = "late.txt") => {
   const clone = join(r.dir, "moves-under-tests");
   expect((await git(["clone", "--branch", "main", r.origin, clone], r.dir)).code).toBe(0);
@@ -1290,7 +1289,7 @@ describe("implement lane (node #23)", () => {
    let passes = 0;
    delete r.ctx.workerCommand;
    r.ctx.worker = async (prompt, opts) => {
-    if (prompt.includes("Fix pass")) writeFileSync(join(opts.cwd as string, "src", "round.txt"), `${(passes += 1)}\n`);
+    if (prompt.includes("Fix pass")) writeFileSync(join(String(opts.cwd), "src", "round.txt"), `${(passes += 1)}\n`);
     return runCmd(implementWorker, ["build", prompt], opts);
    };
    expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
@@ -1314,14 +1313,18 @@ describe("implement lane (node #23)", () => {
    expect(outcome.detail).toContain(`merging origin/main at ${late} conflicts in: src/feature.ts`);
    const worktree = join(r.canonical, ".worktrees", "node-20");
    expect((await git(["status", "--porcelain"], worktree)).stdout.trim()).toBe("");
-   expect(await r.github.sha(BRANCH)).toBe("");
+   const built = (await git(["rev-parse", "HEAD"], worktree)).stdout.trim();
+   expect((await git(["merge-base", "--is-ancestor", late, built], worktree)).code).toBe(1);
+   expect(await r.github.sha(BRANCH)).toBe(built);
    expect(r.github.prs.size).toBe(0);
    expect(r.journal.deadmanCount()).toBe(deadman);
   }, 60_000);
 
   test("a fix pass past the merge budget is refused without a merge or a second run", async () => {
-   let r!: Rig & { calls: number[]; announced: string[] };
-   r = await rig({ blockers: [1, 0], onReview: async (round) => { if (round === 1) await spendBaseMergeBudget(r, await r.github.sha(BRANCH)); } });
+   const rigged = Promise.withResolvers<Rig>();
+   const spendOnce = async () => { const live = await rigged.promise; await spendBaseMergeBudget(live, await live.github.sha(BRANCH)); };
+   const r = await rig({ blockers: [1, 0], onReview: (round) => (round === 1 ? spendOnce() : undefined) });
+   rigged.resolve(r);
    cleanup.push(r.dir);
    const { late, landOnce } = await lateBaseCommit(r);
    const runs = join(r.dir, "runs");
