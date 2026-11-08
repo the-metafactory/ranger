@@ -23,7 +23,7 @@ Ranger passes the chosen path, made absolute, to every ranger process it starts,
 
 | Section | Purpose |
 | --- | --- |
-| `maps` | The maps ranger knows. Each entry has `repo`, `root`, and `walk` (`none`, `research-only`, or `full`), plus optional `lane`, `canonical`, `commands`, `nodes`, `skip`, `autoMerge`, `base`, `discord`, `localCheckout`, and `testBackend`. Two maps can share a repo. Select one with `--map owner/name#root`. |
+| `maps` | The maps ranger knows. Each entry has `repo`, `root`, and `walk` (`none`, `research-only`, or `full`), plus optional `lane`, `canonical`, `commands`, `nodes`, `skip`, `autoMerge`, `base`, `discord`, `localCheckout`, `testBackend`, and `claudeSession`. Two maps can share a repo. Select one with `--map owner/name#root`. |
 | `bot` | The machine account. `identity` pins the GitHub bot login. |
 | `principal` | The principal's `login` and, for intake, `discordId`. No tick that changes the graph runs under this identity. |
 | `state` | `journalPath` (default `~/.config/ranger/state.sqlite`), `canonicalRoot` (where canonical checkouts live), and the migration-only `legacyMapRoots`. |

@@ -16,6 +16,16 @@ function withConfig(content: string, fn: (path: string) => void) {
 }
 
 describe("loadConfig", () => {
+  test("a map's claudeSession parses, and a relative path is refused", () => {
+    const base = "maps:\n  - repo: acme/widgets\n    root: 1\n    claudeSession:\n";
+    withConfig(base + "      settings: ~/map.json\n      skillsDir: /etc/skills\n", path => {
+      expect(loadConfig(path, {}).config.maps[0]?.claudeSession).toEqual({ settings: "~/map.json", skillsDir: "/etc/skills" });
+    });
+    withConfig(base + "      settings: map.json\n", path => {
+      expect(() => loadConfig(path, {})).toThrow(ConfigError);
+    });
+  });
+
   test("bus is optional; defaults stack and loopback URL when enabled", () => {
     const base = "maps:\n  - repo: acme/widgets\n    root: 1\n";
     withConfig(base, path => expect(loadConfig(path, {}).config.bus).toBeUndefined());

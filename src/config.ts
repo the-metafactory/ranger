@@ -53,6 +53,15 @@ const RepoSchema = ValidRepoString.transform(repo => {
  return { repo: repoIdentity(forgeRef), forgeRef };
 });
 
+const absolutePath = z.string().min(1).refine(p => isAbsolute(expandHome(p)), "an absolute path (or ~/…)");
+
+const ClaudeSessionSchema = z.object({
+ settings: absolutePath,
+ skillsDir: absolutePath.optional(),
+}).strict();
+
+export type ClaudeSession = z.infer<typeof ClaudeSessionSchema>;
+
 const MapSchema = z.object({
  reachable: z.string().url().optional(),
  /** Bare GitHub or forge-qualified ref — the repo whose issues hold the work graph. */
@@ -164,6 +173,7 @@ const MapSchema = z.object({
   * `servedMaps` and the dashboard says why. Unset means no session.
   */
  localCheckout: z.string().optional(),
+ claudeSession: ClaudeSessionSchema.optional(),
 }).transform(({ repo, ...map }) => ({ ...map, ...repo }));
 
 /**
@@ -349,15 +359,6 @@ const CodexSubstrateSchema = z.object({
  model: z.string().regex(MODEL_NAME, "a plain model name ([A-Za-z0-9._-])").default("gpt-6.1-sol"),
  reasoningEffort: z.enum(["low", "medium", "high"]).default("high"),
 });
-
-const absolutePath = z.string().min(1).refine(p => isAbsolute(expandHome(p)), "an absolute path (or ~/…)");
-
-const ClaudeSessionSchema = z.object({
- settings: absolutePath,
- skillsDir: absolutePath.optional(),
-}).strict();
-
-export type ClaudeSession = z.infer<typeof ClaudeSessionSchema>;
 
 const ClaudeSubstrateSchema = z.object({
  reachable: z.string().url().optional(),
