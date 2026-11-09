@@ -8,7 +8,7 @@ import { runNode } from "../src/worker.ts";
 import { checkpointNode, confirmPreservedProgress, nodeCheckpoint, preserveNodeProgress, preserveUnmergedClosure, progressRemote, reconcileNodeProgress } from "../src/node-progress.ts";
 import type { ImplementContext } from "../src/implement.ts";
 import { implementWorker, restoreEnv, rig, type Rig } from "./implement-rig.ts";
-import { GIT_ENV } from "./support.ts";
+import { gitIn } from "./support.ts";
 import { eligibleCodexReading } from "./fixtures/substrate-readings.ts";
 
 const rigs: Rig[] = [];
@@ -18,11 +18,7 @@ async function fixture() {
  rigs.push(r);
  return r;
 }
-async function git(cwd: string, args: string[]): Promise<string> {
- const result = await runCmd("git", args, { cwd });
- if (result.code !== 0) throw new Error(result.stderr);
- return result.stdout.trim();
-}
+const git = (cwd: string, args: string[]): Promise<string> => gitIn(cwd)(args);
 function context(r: Rig): ImplementContext {
  const row = r.journal.getWorker("20", "acme/widgets");
  if (row?.worktree == null) throw new Error("missing worktree");
@@ -196,11 +192,7 @@ test("resume tests and publishes a local descendant before reviewing the stale P
 
 async function squashMerge(r: Rig, branch: string): Promise<string> {
  const dir = mkdtempSync(join(tmpdir(), "ranger-squash-"));
- const git = async (args: string[]) => {
-  const result = await runCmd("git", args, { cwd: dir, env: { ...process.env, ...GIT_ENV } });
-  if (result.code !== 0) throw new Error(result.stderr);
-  return result.stdout.trim();
- };
+ const git = gitIn(dir);
  try {
   await git(["clone", "--branch", "main", r.origin, "."]);
   await git(["fetch", "origin", `refs/heads/${branch}`]);

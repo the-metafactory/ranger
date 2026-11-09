@@ -8,11 +8,9 @@ import { Journal } from "../src/journal.ts";
 import type { NodeResult } from "../src/graph.ts";
 import * as graph from "../src/graph.ts";
 import { MAX_IDENTICAL_CLOSURE_DEFERRALS, MAX_WORKER_CLOSURE_READS, reconcileGraphClosures } from "../src/closure-sweep.ts";
-import { runCmd } from "../src/exec.ts";
-import { GIT_ENV } from "./support.ts";
 import { finishClosedElsewhere } from "../src/closed-elsewhere.ts";
 import { sweepMap, type SweepMapResult } from "../src/sweep.ts";
-import { fixturesBin } from "./support.ts";
+import { fixturesBin, gitIn } from "./support.ts";
 import { BudgetDeferral } from "../src/budget.ts";
 import { ABSENT_RESERVE, markAbsentCards } from "../src/card-sync.ts";
 import { EscalationDiscord } from "../src/discord.ts";
@@ -56,11 +54,7 @@ const mergedPr: ChangeRequest = {
 async function worktreeFixture(label: string): Promise<{ path: string; commit: (name: string) => Promise<string> }> {
  const path = join(dir, label);
  mkdirSync(path);
- const git = async (args: string[]) => {
-  const result = await runCmd("git", args, { cwd: path, env: { ...process.env, ...GIT_ENV } });
-  if (result.code !== 0) throw new Error(result.stderr);
-  return result.stdout.trim();
- };
+ const git = gitIn(path);
  await git(["init", "-b", "main"]);
  const commit = async (name: string) => {
   writeFileSync(join(path, name), `${name}\n`);
@@ -127,6 +121,25 @@ test("a changed worktree head or failure text restarts the closure deferral coun
  await reconcileGraphClosures(ctx, b, result());
  expect(reads).toHaveLength(MAX_IDENTICAL_CLOSURE_DEFERRALS + 3);
  expect(posts).toHaveLength(1);
+});
+
+test("a failure that only gains a new timing, id or sha keeps counting toward the park", async () => {
+ const worktree = await worktreeFixture("node-24");
+ journal.upsertWorker({ repo, root: 1, nodeId: "24", status: "failed", worktree: worktree.path });
+ const posts: string[] = [], reads: string[] = [];
+ const ctx = { ...context(), post: async (content: string) => { posts.push(content); return "card-1"; } };
+ for (let tick = 0; tick < MAX_IDENTICAL_CLOSURE_DEFERRALS; tick++) {
+  const read = async (id: string) => {
+   reads.push(id);
+   const commit = (tick + 1).toString(16).padStart(8, "0").repeat(3);
+   throw new Error(`graph read timed out after ${60 + tick}s for node ${id} at commit ${commit}, https://soma.example/events/${tick + 1}`);
+  };
+  await reconcileGraphClosures(ctx, read, result());
+ }
+ expect(reads).toHaveLength(MAX_IDENTICAL_CLOSURE_DEFERRALS);
+ expect(posts).toHaveLength(1);
+ expect(posts[0]).toContain(`repeated ${MAX_IDENTICAL_CLOSURE_DEFERRALS} times`);
+ expect(posts[0]).toContain(`timed out after ${60 + MAX_IDENTICAL_CLOSURE_DEFERRALS - 1}s`);
 });
 
 test("a closure park card that fails to post is retried without another graph read", async () => {

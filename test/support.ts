@@ -25,6 +25,15 @@ export const GIT_ENV = {
  GIT_COMMITTER_EMAIL: "ranger-test@example.com",
 };
 
+/** Run git in `cwd` under GIT_ENV, returning trimmed stdout; a non-zero exit throws its stderr. */
+export function gitIn(cwd: string): (args: string[]) => Promise<string> {
+ return async args => {
+  const result = await runCmd("git", args, { cwd, env: { ...process.env, ...GIT_ENV } });
+  if (result.code !== 0) throw new Error(result.stderr);
+  return result.stdout.trim();
+ };
+}
+
 /**
  * Seed a real git origin (with a main branch) and a canonical clone, the
  * fixture shared by every run-node/worktree test. Returns the origin and
@@ -36,15 +45,13 @@ export async function createCanonicalRepo(
  const seed = join(dir, "seed");
  mkdirSync(seed, { recursive: true });
  writeFileSync(join(seed, "README.md"), "# acme/widgets\n");
- const git = (args: string[], cwd: string) =>
-  runCmd("git", args, { cwd, env: { ...process.env, ...GIT_ENV } });
- await git(["init", "-b", "main"], seed);
- await git(["add", "-A"], seed);
- await git(["commit", "-m", "initial"], seed);
+ await gitIn(seed)(["init", "-b", "main"]);
+ await gitIn(seed)(["add", "-A"]);
+ await gitIn(seed)(["commit", "-m", "initial"]);
  const origin = join(dir, "origin.git");
- await git(["clone", "--bare", seed, origin], dir);
+ await gitIn(dir)(["clone", "--bare", seed, origin]);
  const canonical = join(dir, "canonical");
- await git(["clone", origin, canonical], dir);
+ await gitIn(dir)(["clone", origin, canonical]);
  return { origin, canonical };
 }
 

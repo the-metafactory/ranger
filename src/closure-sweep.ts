@@ -19,8 +19,16 @@ export const MAX_WORKER_CLOSURE_READS = 5;
  * One node's closure reconciliation that defers with the same worktree head and
  * the same failure this many times is parked instead of retried (node #504:
  * cortex#3217 deferred once per tick for 36 hours, 267 events, no park).
+ * A failure counts as the same one when it only differs in a URL, a SHA or a
+ * number: an incident's error text carries timings and ids that move per tick.
  */
 export const MAX_IDENTICAL_CLOSURE_DEFERRALS = 3;
+
+const VOLATILE_FAILURE_DETAIL = /https?:\/\/\S+|\b[0-9a-f]{7,40}\b|\d+(?:\.\d+)?/g;
+
+function failureShape(failure: string): string {
+ return failure.replace(VOLATILE_FAILURE_DETAIL, "·").replace(/\s+/g, " ").trim();
+}
 
 const CLOSURE_PARK_OUTCOME = "closure sweep parked: ";
 
@@ -103,49 +111,35 @@ async function notifyClosurePark(args: {
  const key = deferralKey(map, worker.nodeId);
  const record = parseDeferral(journal.getHealth(key));
  if (record === null || !record.parked || record.notified) return;
- if (post === null) {
-  journal.setHealth(key, JSON.stringify({ ...record, notified: true }));
-  return;
- }
- try {
-  await post(renderCard({
-   emoji: "⏸️",
-   status: "closure sweep parked",
-   nodeId: worker.nodeId,
-   meta: [`map: ${mapKey(map)}`],
-   body: closureParkReason(record, worker),
-   bodyMax: 1_500,
-  }), `closure park card for #${worker.nodeId}`);
- } catch (error) {
-  journal.recordEvent("sweep", { nodeId: worker.nodeId, repo: map.repo,
-   detail: `closure park card for #${worker.nodeId} not posted: ${String(error).slice(0, 400)}` });
-  return;
+ if (post !== null) {
+  try {
+   await post(renderCard({
+    emoji: "⏸️",
+    status: "closure sweep parked",
+    nodeId: worker.nodeId,
+    meta: [`map: ${mapKey(map)}`],
+    body: closureParkReason(record, worker),
+    bodyMax: 1_500,
+   }), `closure park card for #${worker.nodeId}`);
+  } catch (error) {
+   journal.recordEvent("sweep", { nodeId: worker.nodeId, repo: map.repo,
+    detail: `closure park card for #${worker.nodeId} not posted: ${String(error).slice(0, 400)}` });
+   return;
+  }
  }
  journal.setHealth(key, JSON.stringify({ ...record, notified: true }));
 }
 
-async function recordClosureDeferral(args: {
+async function parkClosure(args: {
  journal: Journal;
  map: RangerMapConfig;
  worker: WorkerRow;
  result: SweepMapResult;
+ record: ClosureDeferral;
  post: Post | null;
- detail: string;
  phase?: "close";
 }): Promise<void> {
- const { journal, map, worker, result, post } = args;
- const failure = args.detail.slice(0, 400);
- journal.recordEvent("sweep", { nodeId: worker.nodeId, repo: map.repo, detail: failure });
- const key = deferralKey(map, worker.nodeId);
- const previous = parseDeferral(journal.getHealth(key));
- const head = await worktreeHead(worker.worktree);
- const repeated = previous !== null && previous.generation === worker.generation &&
-  previous.head === head && previous.failure === failure;
- const count = repeated ? previous.count + 1 : 1;
- const parked = count >= MAX_IDENTICAL_CLOSURE_DEFERRALS;
- const record: ClosureDeferral = { generation: worker.generation, head, failure, count, parked, notified: false };
- journal.setHealth(key, JSON.stringify(record));
- if (!parked) return;
+ const { journal, map, worker, result, record, post } = args;
  const reason = closureParkReason(record, worker);
  const reparkable = worker.status === "awaiting-merge" || worker.status === "proposed";
  if (reparkable) {
@@ -169,6 +163,31 @@ async function recordClosureDeferral(args: {
    detail: `${reason}; the row stays ${worker.status} with its own outcome` });
  }
  await notifyClosurePark({ journal, map, worker, post });
+}
+
+async function recordClosureDeferral(args: {
+ journal: Journal;
+ map: RangerMapConfig;
+ worker: WorkerRow;
+ result: SweepMapResult;
+ post: Post | null;
+ detail: string;
+ phase?: "close";
+}): Promise<void> {
+ const { journal, map, worker, result, post } = args;
+ const failure = args.detail.slice(0, 400);
+ journal.recordEvent("sweep", { nodeId: worker.nodeId, repo: map.repo, detail: failure });
+ const key = deferralKey(map, worker.nodeId);
+ const previous = parseDeferral(journal.getHealth(key));
+ const head = await worktreeHead(worker.worktree);
+ const repeated = previous !== null && previous.generation === worker.generation &&
+  previous.head === head && failureShape(previous.failure) === failureShape(failure);
+ const count = repeated ? previous.count + 1 : 1;
+ const parked = count >= MAX_IDENTICAL_CLOSURE_DEFERRALS;
+ const record: ClosureDeferral = { generation: worker.generation, head, failure, count, parked, notified: false };
+ journal.setHealth(key, JSON.stringify(record));
+ if (!parked) return;
+ await parkClosure({ journal, map, worker, result, record, post, phase: args.phase });
 }
 
 export async function reconcileGraphClosures(
