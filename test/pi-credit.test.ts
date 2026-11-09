@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { Journal, type SubstrateReading } from "../src/journal.ts";
 import type { RangerConfig, RangerMapConfig } from "../src/config.ts";
 import { defaultNodeSelector } from "../src/node-dependency.ts";
-import { buildQuotaSubstrates, freshReadings, readOpenRouterCredit, selectSubstrate } from "../src/substrate.ts";
+import { buildQuotaSubstrates, freshReadings, persistReading, readOpenRouterCredit, selectSubstrate } from "../src/substrate.ts";
 import { isEligible, QUOTA_SUBSTRATES, selectForBuild, selectForReview, type SubstrateConfig } from "../src/substrate-policy.ts";
 
 const CONFIG: SubstrateConfig = {
@@ -142,6 +142,18 @@ describe("what a selection reads", () => {
   const { substrate } = await selectSubstrate(journal, { config: CONFIG, excluded: new Set(), readers, pick: (input) => selectForReview(input, "claude") });
   expect(substrate).toBe("codex");
   expect(piReads).toBe(0);
+ }));
+
+ test("a cached OpenRouter credit gives Pi no share once Pi runs elsewhere", withJournal(async (journal) => {
+  persistReading(journal, await readOpenRouterCredit("k", keyResponse({ limit: 50, limit_remaining: 50, limit_reset: "monthly" })));
+  const tired = (substrate: "claude" | "codex") => async () => ({ ...(await quota(substrate)()), windows: [{ kind: "five_hour" as const, usedPct: 60, resetsAt: Math.floor(Date.now() / 1000) + 5 * 3600 }] });
+  const readers = { claude: tired("claude"), codex: tired("codex") };
+  const select = defaultNodeSelector(rangerConfig("spark"), journal, readers);
+  const picks = new Set<string>();
+  for (let i = 0; i < 4; i++) picks.add(await select({} as RangerMapConfig, "implement"));
+  expect(picks).toEqual(new Set(["claude", "codex"]));
+  const { substrate } = await selectSubstrate(journal, { config: CONFIG, excluded: new Set(), readers, pick: selectForBuild, refresh: buildQuotaSubstrates(rangerConfig("spark")) });
+  expect(substrate).not.toBe("pi");
  }));
 
  test("a dispatch pass counts each build once, though its sessions start mid-pass", withJournal(async (journal) => {

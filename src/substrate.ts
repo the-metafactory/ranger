@@ -650,7 +650,7 @@ export function buildQuotaSubstrates(config: RangerConfig): SubstrateName[] {
  return config.substrates.pi.provider === "openrouter" ? QUOTA_SUBSTRATES : STRONG_SUBSTRATES;
 }
 
-/** Refresh `substrates` (by default the strong two) concurrently, then return every reading. */
+/** Refresh `substrates` (by default the strong two) concurrently, then return their readings and no others. */
 export async function freshReadings(
  journal: Journal,
  config: SubstrateConfig,
@@ -661,7 +661,7 @@ export async function freshReadings(
  await Promise.all(
   substrates.map((name) => ensureFreshReading(name, journal, config, now, readers)),
  );
- return journal.listSubstrateReadings();
+ return journal.listSubstrateReadings().filter((reading) => substrates.includes(reading.substrate));
 }
 
 /**
