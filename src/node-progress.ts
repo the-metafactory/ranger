@@ -3,7 +3,7 @@ import type { ImplementContext } from "./implement.ts";
 import type { ChangeRequest } from "./forge.ts";
 import { FencedError } from "./journal.ts";
 import { ParkSignal } from "./signals.ts";
-import { assertNoClosingKeywords, commitsAhead, dirtyFiles, fetchRemoteBranch, gitCredential, hasCommit, headSha, isAncestor, safeGit, vettedPush } from "./git-ops.ts";
+import { assertNoClosingKeywords, commitsAhead, dirtyFiles, fetchBranch, fetchRemoteBranch, gitCredential, hasCommit, headSha, isAncestor, safeGit, vettedPush } from "./git-ops.ts";
 import { recordKnownGood, trustedSnapshot } from "./git-trust.ts";
 import { mapKey } from "./maps.ts";
 import { parseForgeRef } from "./forge-ref.ts";
@@ -182,6 +182,24 @@ async function progressPushPolicy(ctx: ProgressContext, sha: string): Promise<vo
  await assertResearchFindingsOnly(ctx.canonical, base, sha);
 }
 
+async function mergedResultContains(ctx: ProgressContext, pr: ChangeRequest, here: string): Promise<boolean> {
+ const merged = pr.mergeCommitSha ?? null;
+ if (pr.state !== "merged" || merged === null) return false;
+ try {
+  if (!(await hasCommit(ctx.worktree, merged))) {
+   await fetchBranch(ctx.canonical, ctx.map.base, gitCredential(ctx.map.repo, ctx.token));
+   if (!(await hasCommit(ctx.worktree, merged))) return false;
+  }
+  const tree = await safeGit(["rev-parse", "--verify", `${merged}^{tree}`], { cwd: ctx.worktree, timeoutMs: 10_000 });
+  if (tree.code !== 0) return false;
+  const trial = await safeGit(["merge-tree", "--write-tree", "--no-messages", merged, here], { cwd: ctx.worktree, timeoutMs: 60_000 });
+  return trial.code === 0 && trial.stdout.split("\n")[0]?.trim() === tree.stdout.trim();
+ } catch (error) {
+  if (error instanceof FencedError) throw error;
+  return false;
+ }
+}
+
 export async function preserveUnmergedClosure(ctx: ProgressContext, pr: ChangeRequest): Promise<void> {
  const here = await headSha(ctx.worktree);
  const saved = nodeCheckpoint(ctx);
@@ -190,6 +208,7 @@ export async function preserveUnmergedClosure(ctx: ProgressContext, pr: ChangeRe
   throw new ProgressConflict(`checkpoint ${saved.sha} is missing from worktree ${here}; reconcile ${saved.worktree} before closure cleanup`);
  }
  if (here === pr.headSha || await isAncestor(ctx.worktree, here, `origin/${ctx.map.base}`)) return;
+ if (await mergedResultContains(ctx, pr, here)) return;
  const failure = await preserveNodeProgress(ctx);
  throw new ProgressConflict(`merged PR ${pr.iid} covers ${pr.headSha}, but worktree ${here} contains additional committed progress; reconcile ${ctx.worktree} before closing${failure === null ? `; preserved at ${here} on origin/${ctx.branch}` : `; ${failure}`}`);
 }

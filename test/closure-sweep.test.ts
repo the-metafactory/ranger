@@ -1,21 +1,22 @@
 import { activeRecovery, recordRecovery, nodeRecoveryScope } from "../src/recovery.ts";
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig, type RangerConfig } from "../src/config.ts";
 import { Journal } from "../src/journal.ts";
 import type { NodeResult } from "../src/graph.ts";
 import * as graph from "../src/graph.ts";
-import { MAX_WORKER_CLOSURE_READS, reconcileGraphClosures } from "../src/closure-sweep.ts";
+import { MAX_IDENTICAL_CLOSURE_DEFERRALS, MAX_WORKER_CLOSURE_READS, reconcileGraphClosures } from "../src/closure-sweep.ts";
 import { finishClosedElsewhere } from "../src/closed-elsewhere.ts";
 import { sweepMap, type SweepMapResult } from "../src/sweep.ts";
-import { fixturesBin } from "./support.ts";
+import { fixturesBin, gitIn } from "./support.ts";
 import { BudgetDeferral } from "../src/budget.ts";
 import { ABSENT_RESERVE, markAbsentCards } from "../src/card-sync.ts";
 import { EscalationDiscord } from "../src/discord.ts";
 import * as github from "../src/github.ts";
 import type { ChangeRequest } from "../src/forge.ts";
+import { watchedByMergeDesk } from "../src/merge-desk.ts";
 
 let dir: string;
 let journal: Journal;
@@ -49,6 +50,136 @@ const mergedPr: ChangeRequest = {
  baseRef: "main", mergeState: "mergeable", webUrl: `https://github.com/${repo}/pull/1`,
  author: botIdentity, title: "Feature", body: "", mergeCommitSha: "b".repeat(40), mergedBy: "jcfischer",
 };
+
+async function worktreeFixture(label: string): Promise<{ path: string; commit: (name: string) => Promise<string> }> {
+ const path = join(dir, label);
+ mkdirSync(path);
+ const git = gitIn(path);
+ await git(["init", "-b", "main"]);
+ const commit = async (name: string) => {
+  writeFileSync(join(path, name), `${name}\n`);
+  await git(["add", "-A"]);
+  await git(["commit", "-m", name]);
+  return git(["rev-parse", "HEAD"]);
+ };
+ await commit("README.md");
+ return { path, commit };
+}
+
+test("an unchanged closure deferral is capped after a fixed count with one card and no further reads", async () => {
+ const worktree = await worktreeFixture("node-20");
+ journal.upsertWorker({ repo, root: 1, nodeId: "20", status: "failed", worktree: worktree.path, prNumber: 7,
+  outcome: "worker supervisor died; resume-node --reset-recovery after intervention" });
+ const reads: string[] = [], posts: string[] = [];
+ const read = async (id: string) => { reads.push(id); throw new Error("graph read timed out after 60s"); };
+ const ctx = { ...context(), post: async (content: string) => { posts.push(content); return "card-1"; } };
+ for (let tick = 0; tick < MAX_IDENTICAL_CLOSURE_DEFERRALS; tick++) await reconcileGraphClosures(ctx, read, result());
+ expect(reads).toHaveLength(MAX_IDENTICAL_CLOSURE_DEFERRALS);
+ const capped = journal.getWorker("20", repo);
+ if (capped === null) throw new Error("missing worker row");
+ expect(capped.status).toBe("failed");
+ expect(capped.outcome).toBe("worker supervisor died; resume-node --reset-recovery after intervention");
+ expect(posts).toHaveLength(1);
+ expect(posts[0]).toContain("**#20**");
+ expect(posts[0]).toContain(`repeated ${MAX_IDENTICAL_CLOSURE_DEFERRALS} times`);
+ expect(posts[0]).toContain("graph read timed out after 60s");
+ expect(journal.listEvents(repo).filter(event => event.detail?.startsWith("closure sweep parked: the same deferral"))).toHaveLength(1);
+ await reconcileGraphClosures(ctx, read, result());
+ expect(reads).toHaveLength(MAX_IDENTICAL_CLOSURE_DEFERRALS);
+ expect(posts).toHaveLength(1);
+ const current = journal.getWorker("20", repo);
+ if (current === null) throw new Error("missing worker row");
+ const generation = journal.reserveWorker(current);
+ expect(generation).not.toBeNull();
+ journal.updateWorker("20", repo, { status: "failed", pid: null });
+ await reconcileGraphClosures(ctx, read, result());
+ expect(reads).toHaveLength(MAX_IDENTICAL_CLOSURE_DEFERRALS + 1);
+ expect(journal.getWorker("20", repo)?.status).toBe("failed");
+});
+
+test("a changed worktree head or failure text restarts the closure deferral count", async () => {
+ const worktree = await worktreeFixture("node-21");
+ journal.upsertWorker({ repo, root: 1, nodeId: "21", status: "failed", worktree: worktree.path });
+ const posts: string[] = [], reads: string[] = [];
+ const ctx = { ...context(), post: async (content: string) => { posts.push(content); return "card-1"; } };
+ const failing = (text: string) => async (id: string) => { reads.push(id); throw new Error(text); };
+ const a = failing("the same failure");
+ const b = failing("a different failure");
+ await reconcileGraphClosures(ctx, a, result());
+ await reconcileGraphClosures(ctx, a, result());
+ expect(posts).toHaveLength(0);
+ await worktree.commit("next.txt");
+ await reconcileGraphClosures(ctx, a, result());
+ expect(posts).toHaveLength(0);
+ await reconcileGraphClosures(ctx, b, result());
+ await reconcileGraphClosures(ctx, b, result());
+ expect(posts).toHaveLength(0);
+ await reconcileGraphClosures(ctx, b, result());
+ expect(posts).toHaveLength(1);
+ expect(posts[0]).toContain("a different failure");
+ expect(reads).toHaveLength(MAX_IDENTICAL_CLOSURE_DEFERRALS + 3);
+ await reconcileGraphClosures(ctx, b, result());
+ expect(reads).toHaveLength(MAX_IDENTICAL_CLOSURE_DEFERRALS + 3);
+ expect(posts).toHaveLength(1);
+});
+
+test("a failure that only gains a new timing, id or sha keeps counting toward the park", async () => {
+ const worktree = await worktreeFixture("node-24");
+ journal.upsertWorker({ repo, root: 1, nodeId: "24", status: "failed", worktree: worktree.path });
+ const posts: string[] = [], reads: string[] = [];
+ const ctx = { ...context(), post: async (content: string) => { posts.push(content); return "card-1"; } };
+ for (let tick = 0; tick < MAX_IDENTICAL_CLOSURE_DEFERRALS; tick++) {
+  const read = async (id: string) => {
+   reads.push(id);
+   const commit = (tick + 1).toString(16).padStart(8, "0").repeat(3);
+   throw new Error(`graph read timed out after ${60 + tick}s for node ${id} at commit ${commit}, https://soma.example/events/${tick + 1}`);
+  };
+  await reconcileGraphClosures(ctx, read, result());
+ }
+ expect(reads).toHaveLength(MAX_IDENTICAL_CLOSURE_DEFERRALS);
+ expect(posts).toHaveLength(1);
+ expect(posts[0]).toContain(`repeated ${MAX_IDENTICAL_CLOSURE_DEFERRALS} times`);
+ expect(posts[0]).toContain(`timed out after ${60 + MAX_IDENTICAL_CLOSURE_DEFERRALS - 1}s`);
+});
+
+test("a closure park card that fails to post is retried without another graph read", async () => {
+ const worktree = await worktreeFixture("node-22");
+ journal.upsertWorker({ repo, root: 1, nodeId: "22", status: "failed", worktree: worktree.path });
+ const reads: string[] = [], posts: string[] = [];
+ const read = async (id: string) => { reads.push(id); throw new Error("cannot read the graph node"); };
+ let failing = true;
+ const ctx = { ...context(), post: async (content: string) => {
+  if (failing) { failing = false; throw new Error("discord is unavailable"); }
+  posts.push(content); return "card-1";
+ } };
+ for (let tick = 0; tick < MAX_IDENTICAL_CLOSURE_DEFERRALS; tick++) await reconcileGraphClosures(ctx, read, result());
+ expect(journal.getWorker("22", repo)?.status).toBe("failed");
+ expect(posts).toEqual([]);
+ expect(journal.listEvents(repo).some(event => event.detail?.includes("closure park card for #22 not posted"))).toBe(true);
+ await reconcileGraphClosures(ctx, read, result());
+ expect(posts).toHaveLength(1);
+ await reconcileGraphClosures(ctx, read, result());
+ expect(posts).toHaveLength(1);
+ expect(reads).toHaveLength(MAX_IDENTICAL_CLOSURE_DEFERRALS);
+});
+
+test("a merged closure that keeps deferring parks on the close phase so the merge desk leaves it alone", async () => {
+ const worktree = await worktreeFixture("node-23");
+ journal.upsertWorker({ repo, root: 1, nodeId: "23", status: "awaiting-merge", worktree: worktree.path, prNumber: 9, lane: "implement", phase: "awaiting-merge" });
+ let reads = 0;
+ const read = async (id: string) => { reads++; return node(id, "jcfischer"); };
+ const ctx = { ...context(), post: async () => "card-1", github: { ...github, getPr: async () => { throw new Error("github read failed"); } } };
+ for (let tick = 0; tick < MAX_IDENTICAL_CLOSURE_DEFERRALS; tick++) await reconcileGraphClosures(ctx, read, result());
+ const row = journal.getWorker("23", repo);
+ if (row === null) throw new Error("missing worker row");
+ expect(reads).toBe(MAX_IDENTICAL_CLOSURE_DEFERRALS);
+ expect(row.status).toBe("parked");
+ expect(row.phase).toBe("close");
+ expect(row.outcome).toContain("github read failed");
+ expect(watchedByMergeDesk(row)).toBe(false);
+ await reconcileGraphClosures(ctx, read, result());
+ expect(reads).toBe(MAX_IDENTICAL_CLOSURE_DEFERRALS);
+});
 
 test("closure sweep caps reads, runs three together and resumes its persisted cursor past an open prefix", async () => {
  for (let i = 0; i < 12; i++) journal.upsertWorker({ repo, root: 1, nodeId: String(i).padStart(2, "0"), status: "failed" });
