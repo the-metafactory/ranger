@@ -298,6 +298,30 @@ describe("tracing spend from the record alone", () => {
   expect(window.outsideRanger).toBe(0);
  });
 
+ test("a short run in a long gap gets the whole gap, and the report calls that an upper bound", () => {
+  recordBeganEarlier();
+  seed("2026-11-08", [call(0, "token-gate", 5000), { ...opaque(10, 10, "soma-graph-read"), endedAt: at(10, 1) }, call(50, "token-gate", 4000)]);
+  expect(onlyWindow().duringOpaque).toEqual({ "soma-graph-read": 999 });
+  const text = renderUsageReport(buildUsageReport(usageDir, period.since, period.until));
+  expect(text).toContain("at most 999 during soma-graph-read");
+  expect(text).toContain("upper bound");
+ });
+
+ test("spend with no run going is not called outside everything ranger started, in text or JSON", () => {
+  recordBeganEarlier();
+  seed("2026-11-08", [call(0, "token-gate", 5000), call(15, "token-gate", 4700)]);
+  const report = buildUsageReport(usageDir, period.since, period.until);
+  expect(renderUsageReport(report)).toContain("with no soma or sage run going 299");
+  expect(renderUsageReport(report)).toContain("a worker's own gh");
+  expect(report.caveats.join(" ")).toContain("a worker's own gh");
+ });
+
+ test("a day past the engine's argument limit still reports", () => {
+  const lines = Array.from({ length: 70_000 }, (_, i) => call(0, "forge-port", 5000 - (i % 5000)));
+  seed("2026-11-08", lines);
+  expect(buildUsageReport(usageDir, period.since, period.until).spenders[0].calls).toBe(70_000);
+ });
+
  test("a run under another account's token does not explain this window's spend", () => {
   recordBeganEarlier();
   seed("2026-11-08", [

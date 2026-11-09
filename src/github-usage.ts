@@ -4,8 +4,8 @@ import { runCmd, type RunResult } from "./exec.ts";
 
 export const MAX_DAY_BYTES = 16 * 1024 * 1024;
 export const RETENTION_DAYS = 14;
-const DAY_MS = 86_400_000;
-const DAY_FILE = /^(\d{4}-\d{2}-\d{2})\.jsonl$/;
+export const DAY_MS = 86_400_000;
+export const DAY_FILE = /^(\d{4}-\d{2}-\d{2})\.jsonl$/;
 
 export type RefusalKind = "primary" | "secondary" | "unclassified";
 

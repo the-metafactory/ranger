@@ -1,9 +1,7 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { MAX_DAY_BYTES, type CallRecord, type GaugeRecord, type OpaqueRecord, type RefusalKind, type UsageRecord } from "./github-usage.ts";
+import { DAY_FILE, DAY_MS, MAX_DAY_BYTES, type CallRecord, type GaugeRecord, type OpaqueRecord, type RefusalKind, type UsageRecord } from "./github-usage.ts";
 
-const DAY_FILE = /^(\d{4}-\d{2}-\d{2})\.jsonl$/;
-const DAY_MS = 86_400_000;
 const WINDOW_MS = 3_600_000;
 const TOP_SPENDERS = 5;
 
@@ -37,7 +35,9 @@ export interface RefusalEntry {
 /**
  * One budget window: a resource and its reset time. Tokens on one account share
  * a window, so it is reported whole, even past the chosen period. `used` splits
- * into `recordedCalls` and three kinds of spend ranger did not count.
+ * into `recordedCalls` and three kinds of spend ranger did not count:
+ * `duringOpaque` is an upper bound for each run, and `outsideRanger` is spend
+ * with no recorded soma or sage run going, which a worker's own `gh` can be.
  */
 export interface WindowReport {
  resource: string;
@@ -64,6 +64,7 @@ export interface UsageReport {
  windows: WindowReport[];
  cappedDays: string[];
  malformedLines: number;
+ caveats: string[];
 }
 
 function isUsageRecord(value: unknown): value is UsageRecord {
@@ -153,28 +154,35 @@ function reportWindow(observations: Observation[], opaque: OpaqueRecord[], recor
  const limit = sorted.find((o) => o.limit !== undefined)?.limit ?? sorted[0].remaining ?? 0;
  const sources = [...new Set(sorted.map((o) => o.source))].sort();
  const windowRuns = opaque.filter((run) => sources.includes(run.source));
- const duringOpaque: Record<string, number> = {};
+ const spend = attributeSpend(sorted, windowRuns, { limit, windowStart: reset * 1000 - WINDOW_MS, recordBegan });
  const spenders = new Map<string, number>();
+ for (const observation of sorted) if (observation.kind === "call") bump(spenders, observation.component);
+ return {
+  resource, reset, resetAt: new Date(reset * 1000).toISOString(), limit, sources, used: limit - spend.lowest, lowestRemaining: spend.lowest,
+  exhausted: spend.lowest === 0 || sorted.some((o) => o.kind === "call" && o.refusal === "primary"),
+  recordedCalls: sorted.filter((o) => o.kind === "call").length,
+  topSpenders: [...spenders].map(([component, calls]) => ({ component, calls })).sort(byCount((s) => s.component)).slice(0, TOP_SPENDERS),
+  duringOpaque: spend.duringOpaque, outsideRanger: spend.outsideRanger, beforeRecordBegan: spend.beforeRecordBegan,
+ };
+}
+
+function attributeSpend(sorted: Observation[], runs: OpaqueRecord[], window: { limit: number; windowStart: number; recordBegan: number }) {
+ const duringOpaque: Record<string, number> = {};
  let outsideRanger = 0;
  let beforeRecordBegan = 0;
- let recordedCalls = 0;
- let lowest = limit;
+ let lowest = window.limit;
  let uncounted = 0;
- let previous = reset * 1000 - WINDOW_MS;
+ let previous = window.windowStart;
  let first = true;
  for (const observation of sorted) {
-  if (observation.kind === "call") {
-   recordedCalls++;
-   uncounted++;
-   bump(spenders, observation.component);
-  }
+  if (observation.kind === "call") uncounted++;
   const { remaining } = observation;
   if (remaining === undefined) continue;
   const now = ms(observation.at);
   const unexplained = Math.max(0, lowest - remaining - uncounted);
   if (unexplained > 0) {
-   const run = longestOverlappingRun(windowRuns, previous, now);
-   if (first && recordBegan > previous) beforeRecordBegan += unexplained;
+   const run = longestOverlappingRun(runs, previous, now);
+   if (first && window.recordBegan > previous) beforeRecordBegan += unexplained;
    else if (run !== undefined) duringOpaque[run.component] = (duringOpaque[run.component] ?? 0) + unexplained;
    else outsideRanger += unexplained;
   }
@@ -183,13 +191,7 @@ function reportWindow(observations: Observation[], opaque: OpaqueRecord[], recor
   previous = now;
   first = false;
  }
- return {
-  resource, reset, resetAt: new Date(reset * 1000).toISOString(), limit, sources, used: limit - lowest, lowestRemaining: lowest,
-  exhausted: lowest === 0 || sorted.some((o) => o.kind === "call" && o.refusal === "primary"),
-  recordedCalls,
-  topSpenders: [...spenders].map(([component, calls]) => ({ component, calls })).sort(byCount((s) => s.component)).slice(0, TOP_SPENDERS),
-  duringOpaque, outsideRanger, beforeRecordBegan,
- };
+ return { duringOpaque, outsideRanger, beforeRecordBegan, lowest };
 }
 
 function refusalEntry(record: CallRecord | OpaqueRecord): RefusalEntry | null {
@@ -212,32 +214,42 @@ function dayFiles(directory: string): string[] {
 
 const dayOf = (date: Date): string => date.toISOString().slice(0, 10);
 
-/**
- * Rank what spent GitHub budget in a period, from the record alone. Calls, runs
- * and refusals are those in the period. A window any of them touches is shown
- * whole, and so the days around the period are read as well.
- */
-export function buildUsageReport(directory: string, since: Date, until: Date): UsageReport {
- const files = dayFiles(directory);
+function loadRecords(directory: string, since: Date, until: Date) {
  const firstDay = dayOf(new Date(Math.max(0, since.getTime() - DAY_MS)));
  const lastDay = dayOf(new Date(until.getTime() + DAY_MS));
- const inPeriod = (at: string): boolean => ms(at) >= since.getTime() && ms(at) <= until.getTime();
  const records: UsageRecord[] = [];
  const cappedDays: string[] = [];
  let malformedLines = 0;
  let recordBegan: number | null = null;
- for (const name of files) {
+ for (const name of dayFiles(directory)) {
   const day = name.slice(0, 10);
   const wanted = day >= firstDay && day <= lastDay;
   if (!wanted && recordBegan !== null) continue;
   const read = readDay(join(directory, name));
   if (recordBegan === null && read.records.length > 0) recordBegan = ms(read.records[0].at);
   if (!wanted) continue;
-  records.push(...read.records);
+  for (const record of read.records) records.push(record);
   malformedLines += read.malformed;
   if (day >= dayOf(since) && day <= dayOf(until) && statSync(join(directory, name)).size >= MAX_DAY_BYTES) cappedDays.push(day);
  }
- const calls = records.filter((r): r is CallRecord => r.kind === "call");
+ return { records, cappedDays, malformedLines, recordBegan: recordBegan ?? Number.POSITIVE_INFINITY };
+}
+
+const CAVEATS = [
+ "A soma or sage run gets all the spend between the two budget readings around it, so a during figure is an upper bound.",
+ "Spend with no soma or sage run going can be a worker's own gh, your own gh, gh pr merge from the dashboard, or a run that was killed or has not finished.",
+ "The calls inside soma and sage are not counted.",
+];
+
+/**
+ * Rank what spent GitHub budget in a period, from the record alone. Calls, runs
+ * and refusals are those in the period. A window any of them touches is shown
+ * whole, and so the days around the period are read as well.
+ */
+export function buildUsageReport(directory: string, since: Date, until: Date): UsageReport {
+ const { records, cappedDays, malformedLines, recordBegan } = loadRecords(directory, since, until);
+ const inPeriod = (at: string): boolean => ms(at) >= since.getTime() && ms(at) <= until.getTime();
+ const calls =records.filter((r): r is CallRecord => r.kind === "call");
  const opaqueRuns = records.filter((r): r is OpaqueRecord => r.kind === "opaque");
  const observations = records.filter((r): r is Observation => r.kind !== "opaque" && r.reset !== undefined && r.resource !== undefined);
  const windowKey = (o: Observation): string => `${o.resource}:${o.reset}`;
@@ -261,21 +273,20 @@ export function buildUsageReport(directory: string, since: Date, until: Date): U
    .map(refusalEntry)
    .filter((entry): entry is RefusalEntry => entry !== null)
    .sort((a, b) => ms(a.at) - ms(b.at)),
-  windows: [...groups.values()].map((group) => reportWindow(group, opaqueRuns, recordBegan ?? Number.POSITIVE_INFINITY)).sort((a, b) => a.reset - b.reset || a.resource.localeCompare(b.resource)),
+  windows: [...groups.values()].map((group) => reportWindow(group, opaqueRuns, recordBegan)).sort((a, b) => a.reset - b.reset || a.resource.localeCompare(b.resource)),
   cappedDays,
   malformedLines,
+  caveats: CAVEATS,
  };
 }
 
-const NOT_COUNTED = "Not counted: a worker's own gh, your own gh, gh pr merge from the dashboard, and the calls inside soma and sage.";
-
 function renderWindow(window: WindowReport): string {
- const during = Object.entries(window.duringOpaque).map(([component, calls]) => `during ${component} ${calls}`);
+ const during = Object.entries(window.duringOpaque).map(([component, calls]) => `at most ${calls} during ${component}`);
  const parts = [
   `used ${window.used}/${window.limit}`,
   `ranger's calls ${window.recordedCalls}`,
   ...during,
-  `not ranger's ${window.outsideRanger}`,
+  `with no soma or sage run going ${window.outsideRanger}`,
   ...(window.beforeRecordBegan > 0 ? [`before the record began ${window.beforeRecordBegan}`] : []),
  ];
  const top = window.topSpenders.map((s) => `${s.component} ${s.calls}`).join(", ");
@@ -318,7 +329,7 @@ export function renderUsageReport(report: UsageReport): string {
  }
  if (report.cappedDays.length > 0) lines.push("", `Incomplete: the record reached its daily cap on ${report.cappedDays.join(", ")}.`);
  if (report.malformedLines > 0) lines.push("", `${report.malformedLines} unreadable line(s) in the record were skipped.`);
- if (!empty) lines.push("", NOT_COUNTED);
+ if (!empty) lines.push("", ...report.caveats);
  return lines.join("\n");
 }
 
