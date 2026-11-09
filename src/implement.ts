@@ -3086,13 +3086,15 @@ async function deployAfterMerge(ctx: ImplementContext, pr: ChangeRequest): Promi
  const deployed = await deployMerged({
   repo: map.repo,
   command,
-  mergedCheckout: ctx.canonical,
+  canonical: ctx.canonical,
+  base: map.base,
   timeoutMs: map.commands.deployTimeoutMin * 60_000,
   journalPath: journal.path,
   ...(ctx.shellRun === undefined ? {} : { run: ctx.shellRun }),
  });
  if (deployed.result !== null) logRun(ctx, `deploy (${command})`, deployed.result);
- const merged = `${changeRequestLabel(map.repo, pr.iid)} at ${code(map.base)}`;
+ const at = deployed.sha === null ? code(map.base) : `${code(map.base)} ${code(deployed.sha.slice(0, 8))}`;
+ const merged = `${changeRequestLabel(map.repo, pr.iid)}, ${at}`;
  const detail = deployed.status === "deployed" ? `deployed ${merged}` : `deploy of ${merged} FAILED: ${deployed.detail}`;
  journal.recordEvent(deployed.status === "deployed" ? "deployed" : "deploy-failed", { nodeId, repo: map.repo, detail: detail.slice(0, 400) });
  const text = renderCard({

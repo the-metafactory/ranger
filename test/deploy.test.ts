@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { deployLockFile, deployMerged } from "../src/deploy.ts";
@@ -44,10 +44,12 @@ test("a merge ranger closes runs the map's deploy in the canonical checkout at t
  process.env.GH_TOKEN = "machine-write-token";
  const out = join(tmpdir(), `ranger-deploy-${process.pid}-${Date.now()}.txt`);
  dirs.push(out);
- const r = await mergedAndClosing(`{ pwd -P; cat src/feature.ts; echo "token=\${GH_TOKEN:-none}"; } > ${out}`);
+ const r = await mergedAndClosing(`{ git rev-parse HEAD; git status --porcelain --branch | head -1; cat src/feature.ts; echo "token=\${GH_TOKEN:-none}"; } > ${out}`);
  const result = await runNode("20", r.ctx);
  expect(result.status).toBe("success");
- expect(readFileSync(out, "utf8")).toBe(`${realpathSync(r.canonical)}\nexport const merged = true;\ntoken=none\n`);
+ const main = (await exec.runCmd("git", ["rev-parse", "main"], { cwd: r.canonical })).stdout.trim();
+ expect(readFileSync(out, "utf8")).toBe(`${main}\n## HEAD (no branch)\nexport const merged = true;\ntoken=none\n`);
+ expect((await exec.runCmd("git", ["worktree", "list"], { cwd: r.canonical })).stdout).not.toContain("ranger-deploy-");
  expect(events(r, "deployed")).toHaveLength(1);
  expect(events(r, "deploy-failed")).toHaveLength(0);
  expect(r.announced.some((text) => text.includes("deployed") && text.includes("is live"))).toBe(true);
@@ -72,10 +74,29 @@ test("a map without commands.deploy deploys nothing", async () => {
  expect(events(r, "deploy-failed")).toHaveLength(0);
 });
 
-test("deploys of one repo run one at a time", async () => {
- const dir = mkdtempSync(join(tmpdir(), "ranger-deploy-lock-"));
+async function gitRepo(): Promise<{ dir: string; canonical: string; journalPath: string; commit: (file: string) => Promise<string> }> {
+ const dir = mkdtempSync(join(tmpdir(), "ranger-deploy-"));
  dirs.push(dir);
- const journalPath = join(dir, "state.sqlite");
+ const canonical = join(dir, "canonical");
+ mkdirSync(canonical);
+ const git = async (...args: string[]) => (await exec.runCmd("git", args, { cwd: canonical })).stdout.trim();
+ await git("init", "-q", "-b", "main");
+ await git("config", "user.email", "t@example.com");
+ await git("config", "user.name", "t");
+ const commit = async (file: string) => {
+  writeFileSync(join(canonical, file), file);
+  await git("add", file);
+  await git("commit", "-qm", file);
+  return git("rev-parse", "HEAD");
+ };
+ await commit("first");
+ return { dir, canonical, journalPath: join(dir, "state.sqlite"), commit };
+}
+
+const ok = async () => ({ code: 0, stdout: "", stderr: "" });
+
+test("deploys of one repo run one at a time", async () => {
+ const repo = await gitRepo();
  let running = 0;
  let overlap = 0;
  const run = async () => {
@@ -83,23 +104,56 @@ test("deploys of one repo run one at a time", async () => {
   overlap = Math.max(overlap, running);
   await new Promise((resolve) => setTimeout(resolve, 50));
   running--;
-  return { code: 0, stdout: "", stderr: "" };
+  return ok();
  };
- const request = { repo: "acme/widgets", command: "deploy", mergedCheckout: dir, timeoutMs: 5_000, journalPath, run };
+ const request = { repo: "acme/widgets", command: "deploy", canonical: repo.canonical, base: "main", timeoutMs: 5_000, journalPath: repo.journalPath, run };
  const results = await Promise.all([deployMerged(request), deployMerged(request), deployMerged(request)]);
  expect(results.map((r) => r.status)).toEqual(["deployed", "deployed", "deployed"]);
  expect(overlap).toBe(1);
 });
 
+test("a deploy runs the base's newest commit, whatever branch the canonical checkout has out", async () => {
+ const repo = await gitRepo();
+ const main = await repo.commit("merged");
+ await exec.runCmd("git", ["checkout", "-qb", "someone-elses-branch"], { cwd: repo.canonical });
+ await repo.commit("unmerged-work");
+ let seen = "";
+ const result = await deployMerged({ repo: "acme/widgets", command: "deploy", canonical: repo.canonical, base: "main", timeoutMs: 5_000, journalPath: repo.journalPath,
+  run: async (_command, opts) => {
+   seen = (await exec.runCmd("git", ["rev-parse", "HEAD"], { cwd: opts.cwd })).stdout.trim();
+   return ok();
+  } });
+ expect(result).toMatchObject({ status: "deployed", sha: main });
+ expect(seen).toBe(main);
+});
+
+test("a deploy that waited its turn deploys the base as it is then, never an older one", async () => {
+ const repo = await gitRepo();
+ const seen: string[] = [];
+ let release!: () => void;
+ const held = new Promise<void>((resolve) => { release = resolve; });
+ const run = async (_command: string, opts: { cwd?: string }) => {
+  seen.push((await exec.runCmd("git", ["rev-parse", "HEAD"], { cwd: opts.cwd })).stdout.trim());
+  if (seen.length === 1) await held;
+  return ok();
+ };
+ const request = { repo: "acme/widgets", command: "deploy", canonical: repo.canonical, base: "main", timeoutMs: 5_000, journalPath: repo.journalPath, run };
+ const first = deployMerged(request);
+ while (seen.length === 0) await new Promise((resolve) => setTimeout(resolve, 10));
+ const second = deployMerged(request);
+ const newest = await repo.commit("merged-meanwhile");
+ release();
+ await Promise.all([first, second]);
+ expect(seen[1]).toBe(newest);
+});
+
 test("a deploy that cannot get the repo's lock fails without running", async () => {
- const dir = mkdtempSync(join(tmpdir(), "ranger-deploy-lock-"));
- dirs.push(dir);
- const journalPath = join(dir, "state.sqlite");
- const lock = deployLockFile(journalPath, "acme/widgets");
+ const repo = await gitRepo();
+ const lock = deployLockFile(repo.journalPath, "acme/widgets");
  expect(tryAcquireLock(lock, JSON.stringify({ nonce: "other", pid: process.pid, startedAt: Date.now(), leaseUntil: Date.now() + 600_000 }))).toBe(true);
  let ran = false;
- const result = await deployMerged({ repo: "acme/widgets", command: "deploy", mergedCheckout: dir, timeoutMs: 1, journalPath,
-  run: async () => { ran = true; return { code: 0, stdout: "", stderr: "" }; } });
+ const result = await deployMerged({ repo: "acme/widgets", command: "deploy", canonical: repo.canonical, base: "main", timeoutMs: 1, journalPath: repo.journalPath,
+  run: async () => { ran = true; return ok(); } });
  expect(result.status).toBe("failed");
  expect(ran).toBe(false);
 }, 120_000);
