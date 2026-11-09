@@ -75,6 +75,7 @@ export interface TransientRetryOptions {
  shouldRetry?: (result: RunResult) => boolean;
  /** Called before each retry, with the attempt about to run (2, 3, …). */
  onRetry?: (attempt: number, result: RunResult) => void;
+ runner?: typeof runCmd;
 }
 
 const defaultSleep = (ms: number) => new Promise<void>((done) => setTimeout(done, ms));
@@ -93,13 +94,14 @@ export async function runReadRetryingTransient(
 ): Promise<RunResult> {
  const backoff = retry.backoffMs ?? TRANSIENT_BACKOFF_MS;
  const sleep = retry.sleep ?? defaultSleep;
- let result = await runCmd(bin, args, opts);
+ const run = retry.runner ?? runCmd;
+ let result = await run(bin, args, opts);
  for (let i = 0; i < backoff.length; i++) {
   if (forgeOutcome(result, `${bin} read`).kind !== "infrastructure" && retry.isTransient?.(result) !== true) break;
   if (retry.shouldRetry !== undefined && !retry.shouldRetry(result)) break;
   retry.onRetry?.(i + 2, result);
   await sleep(backoff[i]);
-  result = await runCmd(bin, args, opts);
+  result = await run(bin, args, opts);
  }
  return { ...result, outcome: forgeOutcome(result, `${bin} read`) };
 }

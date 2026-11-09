@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { RunResult } from "./exec.ts";
+import { meteredOpaque } from "./github-usage.ts";
 import { nodeKey } from "./forge-ref.ts";
 import { changeRequestRef } from "./forge-text.ts";
 import type { SubstrateName } from "./store/schema.ts";
@@ -88,7 +89,7 @@ export async function sageReview(
  repo: string,
  prNumber: number,
  readOnlyToken: string,
- opts: { command?: string; timeoutMs?: number; substrate: SubstrateName; nice?: number; reviewAuthor?: string; retry?: Pick<TransientRetryOptions, "sleep"> },
+ opts: { command?: string; timeoutMs?: number; substrate: SubstrateName; nice?: number; reviewAuthor?: string; tokenSource?: string; retry?: Pick<TransientRetryOptions, "sleep"> },
 ): Promise<ReviewVerdict> {
  if (opts.substrate === "pi") throw new ReviewError("Pi cannot run reviews");
  // Ranger posts each round as a PR comment under its machine account, not as
@@ -101,6 +102,7 @@ export async function sageReview(
  try {
   const args = ["review", nodeKey(repo, prNumber), "--emit-verdict-block"];
   args.push("--substrate", opts.substrate);
+  const metered = meteredOpaque({ component: "sage-review", source: opts.tokenSource ?? "read-only-token" });
   const result = await runReadRetryingTransient(
    opts.command ?? process.env.RANGER_SAGE_CMD ?? "sage",
    args,
@@ -114,6 +116,7 @@ export async function sageReview(
    // with no verdict block whose error is GitHub-side.
    {
     ...opts.retry,
+    runner: metered,
     isTransient: (r) => preflightFailure(r)?.kind === "transient",
     shouldRetry: (r) => !hasVerdictBlock(r.stdout) && markerAllowsRetry(r),
    },

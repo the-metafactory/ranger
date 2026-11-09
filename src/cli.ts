@@ -7,6 +7,8 @@ import { isGithubRepo } from "./forge-ref.ts";
 import { graphReadToken, laneCredentialRefusal, lanePort } from "./forge-lanes.ts";
 import { changeRequestNoun } from "./forge-text.ts";
 import { mapKey, pickMap } from "./maps.ts";
+import { configureGitHubUsage, githubUsageDirectory } from "./github-usage.ts";
+import { buildUsageReport, parsePeriodStart, renderUsageReport } from "./github-usage-report.ts";
 import { implementLane } from "./lanes.ts";
 import { resumeNode } from "./resume.ts";
 import { Command } from "commander";
@@ -687,11 +689,27 @@ function renderEscalateText(result: EscalateResult | DigestResult): string {
  return lines.join("\n").trimEnd();
 }
 
+const quietNotice = (_line: string): void => undefined;
+
+function recordGitHubUsageFor(action: Command): void {
+ const { config: configOption } = action.opts<{ config?: string }>();
+ try {
+  const { config } = loadConfig(resolveConfigPath(configOption, process.env, process.cwd()), process.env, quietNotice);
+  configureGitHubUsage({ directory: githubUsageDirectory(expandHome(config.state.journalPath)), command: action.name() });
+ } catch {
+  configureGitHubUsage(null);
+ }
+}
+
 const program = new Command();
 program
  .name("ranger")
  .description("Autonomous orienteer work-graph walker")
  .version(pkg.version);
+
+program.hook("preAction", (_root, action) => {
+ recordGitHubUsageFor(action);
+});
 
 program.command("select-substrate")
  .description("Select a parser substrate from a versioned JSON request on stdin; quota refresh only, no task dispatch")
@@ -1324,6 +1342,28 @@ program
    process.stderr.write(
     `ranger trust-git: ${error instanceof Error ? error.message : String(error)}\n`,
    );
+   process.exit(1);
+  }
+ });
+
+program
+ .command("budget")
+ .description("Show what spent the GitHub budget in a period, per calling component (#493)")
+ .option("--since <when>", "start: a duration back from now (90m, 2d) or a timestamp", "24h")
+ .option("--until <when>", "end: a duration back from now or a timestamp (default: now)")
+ .option("--json", "print the report as JSON")
+ .option("-c, --config <path>", "path to ranger.yaml (fallback: $RANGER_CONFIG, then ~/.config/ranger/ranger.yaml)")
+ .action((options: { since: string; until?: string; json?: boolean; config: string | undefined }) => {
+  try {
+   const now = new Date();
+   const since = parsePeriodStart(options.since, now);
+   const until = options.until === undefined ? now : parsePeriodStart(options.until, now, "--until");
+   if (since > until) throw new Error(`--since ${since.toISOString()} is after --until ${until.toISOString()}`);
+   const { config } = loadConfig(resolveConfigPath(options.config, process.env, process.cwd()));
+   const report = buildUsageReport(githubUsageDirectory(expandHome(config.state.journalPath)), since, until);
+   process.stdout.write(`${options.json === true ? JSON.stringify(report, null, 2) : renderUsageReport(report)}\n`);
+  } catch (error) {
+   process.stderr.write(`ranger budget: ${error instanceof Error ? error.message : String(error)}\n`);
    process.exit(1);
   }
  });

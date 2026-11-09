@@ -68,7 +68,7 @@ import {
 } from "./outcomes.ts";
 import { GRAPH_CALL_TIMEOUT_MS, graphNode, somaRepo, type NodeResult } from "./graph.ts";
 import { finishClosedElsewhere } from "./closed-elsewhere.ts";
-import { budgetedRead, budgetPolicy, clearThrottleStrikes, MAX_REVIEW_THROTTLES_IN_A_ROW, recordThrottle, reviewCooldownScope, reviewThrottle } from "./budget.ts";
+import { budgetedRead, budgetPolicy, clearThrottleStrikes, MAX_REVIEW_THROTTLES_IN_A_ROW, recordThrottle, reviewCooldownScope, reviewThrottle, reviewTokenSource } from "./budget.ts";
 import { GraphAddUnattached, closeTimeoutForNode, graphAdd, graphClose, graphDecisions, graphLink, type AddSpec, type CloseResult } from "./graph-write.ts";
 import { FixNodeLockBusy, withFixNodeLock } from "./fix-node-lock.ts";
 import { assertFilable, codeCommentSpec, foundByProbeSpec, landminesInDiff, scribeFile, splitOutOfReviewSpec, type Provenance, type ScribeGraph } from "./scribe.ts";
@@ -125,7 +125,7 @@ export type Reviewer = (
  repo: string,
  prNumber: number,
  readOnlyToken: string,
- opts: { substrate: SubstrateName; nice?: number; reviewAuthor?: string },
+ opts: { substrate: SubstrateName; nice?: number; reviewAuthor?: string; tokenSource?: string },
 ) => Promise<ReviewVerdict>;
 
 export type WorkerRun = (prompt: string, opts: RunOptions) => Promise<RunResult>;
@@ -1828,6 +1828,7 @@ async function runImplementFlow(ctx: ImplementContext): Promise<ImplementOutcome
         substrate: reviewSubstrate,
         nice: config.workers.niceness,
         reviewAuthor: botIdentity,
+        tokenSource: reviewTokenSource(config, repo),
        }),
       };
      } catch (error) {

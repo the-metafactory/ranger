@@ -5,6 +5,7 @@ import { join } from "node:path";
 import type { RangerAuthConfig, RangerConfig } from "./config.ts";
 import { runCmd, type RunOptions, type RunResult } from "./exec.ts";
 import { parseForgeRef, qualifiedRepo, repoIdentity, type ForgeRef } from "./forge-ref.ts";
+import { meteredGh } from "./github-usage.ts";
 import { glabConfigEnvAsync } from "./glab-config-dir.ts";
 import { parseGlabResponse } from "./glab-transport.ts";
 import { isTransientGitHubError } from "./transient.ts";
@@ -141,11 +142,12 @@ export function gatedEnv(
  */
 async function introspectToken(
   token: string,
+  source: string,
   runOpts: RunOptions = {},
 ): Promise<TokenIntrospection> {
   const gated = gatedEnv(token);
   try {
-    const result = await runCmd("gh", ["api", "/user", "-i"], {
+    const result = await meteredGh({ component: "token-gate", source })("gh", ["api", "/user", "-i"], {
       ...runOpts,
       env: gated.env,
     });
@@ -183,7 +185,7 @@ export async function assertReadOnlyToken(
 ): Promise<{ token: ResolvedToken; info: TokenIntrospection }> {
   const resolved = resolveReadOnlyToken(config, repo, env);
   if (parseForgeRef(repo).forge === "gitlab") return assertGitLabReadOnlyToken(repo, resolved, env, runner);
-  const info = await introspectToken(resolved.token);
+  const info = await introspectToken(resolved.token, resolved.source);
 
   const writeScopes = info.scopes.filter(
     (scope) => !READ_ONLY_SCOPE.test(scope),
@@ -195,15 +197,15 @@ export async function assertReadOnlyToken(
     );
   }
 
-  await assertRepoReadable(resolved.token, repo);
+  await assertRepoReadable(resolved, repo);
   return { token: resolved, info };
 }
 
 /** `GET /repos/{owner}/{repo}` must succeed with this token — proves it can read the map's repo. */
-async function assertRepoReadable(token: string, repo: string): Promise<void> {
+async function assertRepoReadable({ token, source }: ResolvedToken, repo: string): Promise<void> {
   const gated = gatedEnv(token);
   try {
-    const result = await runCmd(
+    const result = await meteredGh({ component: "token-gate", source })(
       "gh",
       ["api", `repos/${repo}`, "--jq", ".full_name"],
       { env: gated.env },

@@ -1,5 +1,5 @@
 import type { RangerConfig } from "./config.ts";
-import { runCmd } from "./exec.ts";
+import { meteredGauge, recordGauge } from "./github-usage.ts";
 import { RateLimitError } from "./graph.ts";
 import type { Journal } from "./journal.ts";
 import { gatedEnv, assertGitLabReadGrant, matchTokenEnv, type ResolvedToken } from "./token-gate.ts";
@@ -86,12 +86,17 @@ export function cooldownScope(repo: string, source: string): string {
   return ref.forge === "github" ? source : `${ref.forge}:${ref.host}:${source}`;
 }
 
+/** The label of the read-only token sage reviews under: its env var name. */
+export function reviewTokenSource(config: Pick<RangerConfig, "auth">, repo: string): string {
+  return matchTokenEnv(config.auth, repo) ?? "read-only-token";
+}
+
 /**
  * The scope of the read-only token sage reviews under. On GitHub, graph reads
  * run under the machine write token, so a refused review cools only this token.
  */
 export function reviewCooldownScope(config: Pick<RangerConfig, "auth">, repo: string): string {
-  return cooldownScope(repo, matchTokenEnv(config.auth, repo) ?? "read-only-token");
+  return cooldownScope(repo, reviewTokenSource(config, repo));
 }
 
 /** The cooldown that holds back a review on this repo right now, if any. */
@@ -232,10 +237,12 @@ function noteGitLabBudget(): void {
  */
 export async function readGraphqlBudget(
   token: string,
+  source: string,
 ): Promise<GraphqlBudget | null> {
   const gated = gatedEnv(token);
+  const spec = { component: "budget-gate", source };
   try {
-    const result = await runCmd(
+    const result = await meteredGauge(spec)(
       "gh",
       ["api", "rate_limit", "--jq", ".resources.graphql"],
       { env: gated.env, timeoutMs: 15_000 },
@@ -250,6 +257,7 @@ export async function readGraphqlBudget(
     ) {
       return null;
     }
+    recordGauge(spec, { resource: "graphql", limit, remaining, reset });
     return { limit, remaining, resetAt: new Date(reset * 1000) };
   } catch {
     return null;
@@ -272,7 +280,7 @@ export async function assertGraphBudget(
 ): Promise<GraphqlBudget | null> {
   const cooling = activeCooldown(journal, token.source, now);
   if (cooling !== null) throw deferral(token.source, cooling);
-  const budget = await readGraphqlBudget(token.token);
+  const budget = await readGraphqlBudget(token.token, token.source);
   if (budget === null || budget.remaining >= policy.floor) return budget;
   const floor: Cooldown = {
     kind: "floor",

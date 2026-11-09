@@ -7,6 +7,7 @@ ranger walk                         # announce, claim, spawn, sweep
 ranger run-node <id> --map <repo>   # the detached worker supervisor
 ranger sweep                        # reconcile the journal with crashed workers
 ranger journal                      # inspect workers, events, and health
+ranger budget --since 24h           # what spent the GitHub budget, per component
 ```
 
 Ranger has two lanes of work. The research lane shipped first (build-path step 3, node #13). The implement lane followed (build-path step 4, node #23). The [lanes and the resume queue](lanes.md) page covers how the two implement resource lanes share the machine.
@@ -22,6 +23,14 @@ Ranger has two lanes of work. The research lane shipped first (build-path step 3
 ## The journal
 
 The journal is a SQLite file at `~/.config/ranger/state.sqlite` (design §8). It holds only what the graph cannot: worker liveness and outcomes, the veto cache, and the dead-man and spawn ledgers. If you delete it, ranger announces again and retries once.
+
+## The GitHub budget record
+
+Each `gh api` call ranger makes appends one line to a day file in `github-usage/` beside the journal: the calling component, the token's env var name or source label, the endpoint's shape, and the rate-limit numbers GitHub returned. Measuring adds no API call. The record holds no token value, header block, repo or login. Files older than 14 days are pruned, and a day stops growing at 16 MiB. A failed write gives one notice on stderr and never breaks the call.
+
+`ranger budget [--since 90m|2d|<timestamp>] [--until …] [--json]` ranks the calls in a period and lists refusals, primary or secondary, with the budget left at the time. It also shows each budget window the period touches, one per resource and reset time, whole. A window's spend splits into ranger's counted calls, spend while a soma or sage run was going (those runs record their time, not their calls), spend before the record began, and the rest, which is not ranger's own calls.
+
+The rest includes a worker's own `gh`, the principal's own `gh`, and `gh pr merge` from the dashboard, none of which the record sees. A run still going when the report is taken has no line yet, so its spend counts as the rest until it ends. Two accounts whose windows reset in the same second would read as one window.
 
 ## Research lane
 

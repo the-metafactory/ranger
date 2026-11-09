@@ -5,7 +5,7 @@ import {
   budgetedRead,
 } from "./budget.ts";
 import { createHash } from "node:crypto";
-import { runCmd } from "./exec.ts";
+import { meteredGh } from "./github-usage.ts";
 import {
   type BriefAudit,
   type BuildBriefNotReady,
@@ -174,14 +174,16 @@ function writeAuditRecord(journal: Journal, repo: string, root: number, record: 
 export async function readRepoSentinel(
   repo: string,
   token: string,
+  source: string,
 ): Promise<string | null> {
   // readFrontier never asks for a GitLab sentinel; null keeps any other
   // caller off the GitHub API (null means "fresh read, no cache write").
   if (!isGithubRepo(repo)) return null;
   const gated = gatedEnv(token);
   try {
+    const metered = meteredGh({ component: "frontier-sentinel", source });
     const read = async (path: string, jq: string) => {
-      const result = await runCmd("gh", ["api", path, "--jq", jq], {
+      const result = await metered("gh", ["api", path, "--jq", jq], {
         env: gated.env,
         timeoutMs: 15_000,
       });
@@ -267,7 +269,7 @@ export async function readFrontier(
   // included: requests sent while limited can extend the limit.
   assertNotThrottled(journal, repo, token, now);
   const github = isGithubRepo(repo);
-  const sentinel = github ? await readRepoSentinel(repo, token.token) : null;
+  const sentinel = github ? await readRepoSentinel(repo, token.token, token.source) : null;
   const cached = github ? readCache(journal, repo, root) : null;
   const hit =
     sentinel !== null &&

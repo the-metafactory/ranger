@@ -3,6 +3,7 @@ import { forgeOutcome } from "./transient.ts";
 import { OperationFailure, processOutcome, type OperationOutcome } from "./operation-outcome.ts";
 import { GRAPH_CALL_TIMEOUT_MS, somaRepo, type FrontierEntryNode } from "./graph.ts";
 import { runCmd, type RunOptions } from "./exec.ts";
+import { meteredOpaque } from "./github-usage.ts";
 import { writeEnvForRepo } from "./identity.ts";
 import { parseForgeRef, normalizeNodeId, type ForgeRef } from "./forge-ref.ts";
 
@@ -87,7 +88,9 @@ async function callWrite(
 ): Promise<CallWriteResult> {
   const gated = writeEnvForRepo(repo, token, opts.env);
   try {
-    const result = await (opts.runner ?? runCmd)("soma", args, { ...opts, env: gated.env });
+    const selected = opts.runner ?? runCmd;
+    const runner = parseForgeRef(repo).forge === "github" ? meteredOpaque({ component: `soma-graph-${args[1]}`, source: "write-token" }, selected) : selected;
+    const result = await runner("soma", args, { ...opts, env: gated.env });
     return { ...result, outcome: args[1] === "close" ? result.outcome : result.outcome ?? forgeOutcome(result, `graph:${args[1]}`) };
   } finally {
     gated.cleanup();
