@@ -2,10 +2,10 @@ import { spawningEnabled } from "./spawn.ts";
 import { OperationFailure } from "./operation-outcome.ts";
 import { z } from "zod";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
-import type { Journal, WorkerRow } from "./journal.ts";
+import type { Journal, SubstrateReading, WorkerRow } from "./journal.ts";
 import { requireEndpoint, requireReachable, type EndpointLookup, type EndpointProbe, type DependencyCheck } from "./endpoint.ts";
-import { selectSubstrate, type SubstrateName, type SubstrateReaders } from "./substrate.ts";
-import { selectForBuild } from "./substrate-policy.ts";
+import { freshReadings, selectSubstrate, type SubstrateName, type SubstrateReaders } from "./substrate.ts";
+import { BUILD_SHARE_WINDOW_MS, selectForBuild } from "./substrate-policy.ts";
 
 export interface NodePreflightResult { substrate?: SubstrateName; checks: DependencyCheck[] }
 export interface DispatchDeps { nodeSelector?: NodeSelector; endpointProbe?: EndpointProbe; endpointLookup?: EndpointLookup }
@@ -14,11 +14,17 @@ export async function selectNodeSubstrate(journal: Journal, config: RangerConfig
  return selectSubstrate(journal, { config: config.substrates, excluded, readers, pick: selectForBuild });
 }
 export function defaultNodeSelector(config: RangerConfig, journal: Journal, readers?: SubstrateReaders): NodeSelector {
- let build: Promise<SubstrateName> | undefined;
- return (_map, lane) => {
-  if (lane === "research") return Promise.resolve("claude");
-  build ??= selectNodeSubstrate(journal, config, new Set(), readers).then(result => result.substrate);
-  return build;
+ let readings: Promise<SubstrateReading[]> | undefined;
+ const picked: Partial<Record<SubstrateName, number>> = {};
+ return async (_map, lane) => {
+  if (lane === "research") return "claude";
+  readings ??= freshReadings(journal, config.substrates, new Date(), readers);
+  const now = new Date();
+  const recentBuilds = journal.buildCountsSince(new Date(now.getTime() - BUILD_SHARE_WINDOW_MS));
+  for (const [name, count] of Object.entries(picked) as [SubstrateName, number][]) recentBuilds[name] = (recentBuilds[name] ?? 0) + count;
+  const substrate = selectForBuild({ readings: await readings, now, config: config.substrates, recentBuilds });
+  picked[substrate] = (picked[substrate] ?? 0) + 1;
+  return substrate;
  };
 }
 export async function nodePreflight(args: {

@@ -391,7 +391,7 @@ function resolveReaders(ctx: RunNodeContext): SubstrateReaders | undefined {
 
 /**
  * Select the substrate for a worker session (node #45): refresh both strong
- * readings, then the eligible one with the most headroom, else Pi.
+ * readings, then share builds by headroom among the eligible, else Pi.
  * Substrates capped earlier in this run are left out.
  */
 async function selectBuildSubstrate(

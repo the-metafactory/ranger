@@ -181,19 +181,19 @@ export function substrateUsageViews(inputs: UsageInputs): SubstrateUsageView[] {
 
 function usageView(name: SubstrateName, inputs: UsageInputs): SubstrateUsageView {
  const { now, config } = inputs;
- const reading = name === "pi" ? null : (inputs.readings.find((r) => r.substrate === name) ?? null);
+ const reading = inputs.readings.find((r) => r.substrate === name) ?? null;
  const mine = inputs.sessions?.filter((s) => s.substrate === name) ?? null;
  const last = inputs.lastSession(name);
  const fresh = reading !== null && isFresh(reading, config, now);
  const cappedUntil = reading === null ? null : activeCappedUntil(reading, now);
  return {
   substrate: name,
-  quota: name === "pi" ? "none" : reading === null ? "unread" : "read",
+  quota: reading !== null ? "read" : name === "pi" ? "none" : "unread",
   fiveHour: reading === null ? null : windowView("five_hour", reading, config, now),
   sevenDay: reading === null ? null : windowView("seven_day", reading, config, now),
   readAt: reading?.readAt ?? null,
   ageMin: reading === null ? null : readingAgeMin(reading, now),
-  maxAgeMin: name === "pi" ? null : maxReadingAgeMs(name, config) / 60_000,
+  maxAgeMin: name === "pi" && reading === null ? null : maxReadingAgeMs(name, config) / 60_000,
   fresh,
   capped: cappedUntil !== null || (fresh && reading?.capped === true),
   cappedUntil,
@@ -251,7 +251,7 @@ function eligibility(
  config: SubstrateConfig,
  now: Date,
 ): Eligibility {
- if (name === "pi") return { state: "yes", reason: "no quota (always eligible)" };
+ if (name === "pi" && reading === null) return { state: "yes", reason: "no credit reading (fallback only)" };
  if (reading === null) return { state: "no", reason: "no reading: treated as capped" };
  const until = activeCappedUntil(reading, now);
  // A capped-until survives a fresh read (persistReading), so it binds now.

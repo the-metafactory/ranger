@@ -210,6 +210,21 @@ test("quota selection is refreshed once per dispatch pass and cached for indepen
  expect(reads).toBe(2);
 });
 
+test("a dispatch pass shares builds between claude and codex by headroom", async () => {
+ const r = await fixture();
+ const reading = (substrate: "claude" | "codex", usedPct: number) => async () => ({ ...(await eligibleCodexReading()), substrate,
+  windows: [{ kind: "five_hour" as const, usedPct, resetsAt: Math.floor(Date.now() / 1000) + 5 * 3600 }] });
+ let reads = 0;
+ const select = defaultNodeSelector(r.ctx.config, r.journal, {
+  codex: async () => { reads++; return reading("codex", 10)(); },
+  claude: async () => { reads++; return reading("claude", 10)(); },
+ });
+ const picks = { claude: 0, codex: 0, pi: 0 };
+ for (let i = 0; i < 6; i++) picks[await select(r.ctx.map, "implement")] += 1;
+ expect(picks).toEqual({ claude: 3, codex: 3, pi: 0 });
+ expect(reads).toBe(2);
+});
+
 test("dashboard classifies persisted dependency holds independently of start-failure prose", async () => {
  const r = await fixture();
  const state = recordRecovery(r.journal, scope, { kind: "dependency", operation: "model-endpoint", evidence: "x".repeat(2000), action: "restore selected provider" });

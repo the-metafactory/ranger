@@ -1437,7 +1437,7 @@ function renderSubstrates(s) {
  if (!s.substrates || s.substrates.length === 0) { box.append(empty("No substrates.")); return; }
  box.append(el("ul", {}, ...s.substrates.map((sub) => {
   const lines = [];
-  if (sub.quota === "none") lines.push(span("no quota (always eligible)"));
+  if (sub.quota === "none") lines.push(span("no credit reading (fallback only)"));
   else if (sub.quota === "unread") lines.push(span("no reading: treated as capped", "warn"));
   else {
    const grey = sub.fresh ? "" : "muted";

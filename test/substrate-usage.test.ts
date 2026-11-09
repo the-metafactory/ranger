@@ -128,6 +128,26 @@ describe("the substrate_sessions migration", () => {
   }
  });
 
+ test("buildCountsSince counts worker and fix-pass sessions per substrate, not reviews or older ones", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ranger-usage-"));
+  try {
+   const j = new Journal(join(dir, "state.sqlite"));
+   expect(j.buildCountsSince(NOW)).toEqual({});
+   occupy(j, "7", 3);
+   const at = (substrate: "claude" | "codex", kind: "worker" | "fix-pass" | "review", minutes: number) =>
+    j.endSubstrateSession(j.startSubstrateSession({ substrate, kind, repo: "acme/widgets", nodeId: "7", generation: 3 }, new Date(NOW.getTime() + minutes * MIN)), "ok");
+   at("codex", "worker", -10);
+   at("codex", "worker", 1);
+   at("claude", "fix-pass", 2);
+   at("codex", "review", 3);
+   at("codex", "fix-pass", 4);
+   expect(j.buildCountsSince(NOW)).toEqual({ claude: 1, codex: 2 });
+   j.close();
+  } finally {
+   rmSync(dir, { recursive: true, force: true });
+  }
+ });
+
  test("a session's pinned model is stored, and a journal from before the model column still lists sessions (node #60)", () => {
   const dir = mkdtempSync(join(tmpdir(), "ranger-usage-"));
   try {
@@ -272,14 +292,24 @@ describe("the panel: one row per known substrate", () => {
   });
  });
 
- test("Pi has no quota and is always eligible", () => {
-  expect(view("pi", { readings: [reading("pi")] })).toMatchObject({
+ test("Pi with a credit reading shows it and is judged on it", () => {
+  expect(view("pi", { readings: [reading("pi", { fiveHourUsedPct: null, sevenDayUsedPct: 40 })] })).toMatchObject({
+   quota: "read",
+   fiveHour: null,
+   sevenDay: { usedPct: 40 },
+   maxAgeMin: 10,
+   eligible: { state: "yes" },
+  });
+ });
+
+ test("Pi without a credit reading is the fallback only", () => {
+  expect(view("pi")).toMatchObject({
    quota: "none",
    fiveHour: null,
    sevenDay: null,
    maxAgeMin: null,
    capped: false,
-   eligible: { state: "yes", reason: "no quota (always eligible)" },
+   eligible: { state: "yes", reason: "no credit reading (fallback only)" },
   });
  });
 

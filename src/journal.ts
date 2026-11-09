@@ -1505,6 +1505,18 @@ export class Journal {
   );
  }
 
+ buildCountsSince(since: Date): Partial<Record<SubstrateName, number>> {
+  const rows = withoutSessionsTable(() =>
+   this.db
+    .select({ substrate: substrateSessions.substrate, count: sql<number>`count(*)` })
+    .from(substrateSessions)
+    .where(and(inArray(substrateSessions.kind, ["worker", "fix-pass"]), gt(substrateSessions.startedAt, since.toISOString())))
+    .groupBy(substrateSessions.substrate)
+    .all(),
+  ) ?? [];
+  return Object.fromEntries(rows.map((row) => [row.substrate, row.count]));
+ }
+
  /** Prune spawn-ledger keys older than the retention window (keeps health tidy). */
  pruneSpawnLedger(now = new Date(), retentionDays = 30): void {
   const cutoff = dayKey(new Date(now.getTime() - retentionDays * DAY_MS));
@@ -1633,7 +1645,7 @@ const SESSION_COLUMNS = {
 const SESSION_RETENTION_DAYS = 30;
 
 /** Null when `substrate_sessions` is not migrated in yet. */
-function withoutSessionsTable(read: () => SubstrateSessionRow[]): SubstrateSessionRow[] | null {
+function withoutSessionsTable<T>(read: () => T[]): T[] | null {
  try {
   return read();
  } catch (error) {
