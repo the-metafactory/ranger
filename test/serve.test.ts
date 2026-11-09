@@ -462,6 +462,22 @@ describe("#37 — the state the dashboard shows", () => {
   expect(merging.stale).toBe(false);
  });
 
+ test("a job in its review loop names the open session's substrate, not the builder's", () => {
+  const session = (id: number, substrate: "claude" | "pi", kind: "review" | "fix-pass", endedAt: string | null) => ({
+   id, substrate, kind, repo: REPO, nodeId: "50", generation: 1,
+   startedAt: "2026-10-03T10:00:00Z", endedAt, outcome: endedAt === null ? null : ("ok" as const),
+  });
+  const built = worker({ substrate: "pi", phase: "review" });
+  const at = (sessions: ReturnType<typeof session>[]) =>
+   assembleState(inputs({ workers: [built], openSessions: sessions.filter((s) => s.endedAt === null) })).current[0];
+  expect(at([session(1, "claude", "review", null)]).session).toEqual({ kind: "review", substrate: "claude" });
+  expect(at([session(1, "claude", "review", "2026-10-03T10:01:00Z"), session(2, "pi", "fix-pass", null)]).session)
+   .toEqual({ kind: "fix-pass", substrate: "pi" });
+  expect(at([]).session).toBeNull();
+  const other = { ...session(3, "claude", "review", null), nodeId: "51" };
+  expect(assembleState(inputs({ workers: [built], openSessions: [other] })).current[0].session).toBeNull();
+ });
+
  test("ranger#357: a job past sage round 4 is flagged suspicious, round 4 is not", () => {
   const at = (reviewRound: number) => assembleState(inputs({ workers: [worker({ reviewRound })] })).current[0];
   expect(at(4).suspicious).toBe(false);
