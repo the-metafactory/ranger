@@ -30,7 +30,7 @@ Each `gh api` call ranger makes appends one line to a day file in `github-usage/
 
 `ranger budget [--since 90m|2d|<timestamp>] [--until …] [--json]` ranks the calls in a period and lists refusals, primary or secondary, with the budget left at the time. It also shows each budget window the period touches, one per resource and reset time, whole. A window's spend splits into ranger's counted calls, spend around a soma or sage run, spend before the record began, and the rest, with no such run going.
 
-Soma and sage runs record their time, not their calls. Every run going between two budget readings gets all the spend between them, however short the run, so its figure is an upper bound and overlapping runs' figures do not add up. The rest can be a worker's own `gh`, the principal's own `gh`, or `gh pr merge` from the dashboard, none of which the record sees. A run still going when the report is taken has no line yet, and a killed run never gets one, so their spend counts as the rest. Two accounts whose windows reset in the same second would read as one window.
+Soma and sage runs record their time, not their calls. Every run going between two budget readings gets all the spend between them, however short the run, so its figure is an upper bound up to the window's last reading and overlapping runs' figures do not add up. Spend after a window's last reading shows nowhere. The rest can be a worker's own `gh`, the principal's own `gh`, or `gh pr merge` from the dashboard, none of which the record sees. A run still going when the report is taken has no line yet, and a killed run never gets one, so their spend counts as the rest. Two accounts whose windows reset in the same second would read as one window.
 
 ## Research lane
 

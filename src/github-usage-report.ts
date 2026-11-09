@@ -228,7 +228,7 @@ function loadRecords(directory: string, since: Date, until: Date) {
 }
 
 const CAVEATS = [
- "Every soma or sage run going between two budget readings gets all the spend between them, so a during figure is an upper bound for that run, and overlapping runs' figures do not add up.",
+ "Every soma or sage run going between two budget readings gets all the spend between them, so a during figure is an upper bound for that run up to the window's last reading, and overlapping runs' figures do not add up. Spend after the last reading shows nowhere.",
  "Spend with no soma or sage run going can be a worker's own gh, your own gh, gh pr merge from the dashboard, or a run that was killed or has not finished.",
  "The calls inside soma and sage are not counted.",
 ];
