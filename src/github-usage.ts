@@ -7,6 +7,11 @@ export const RETENTION_DAYS = 14;
 export const DAY_MS = 86_400_000;
 export const DAY_FILE = /^(\d{4}-\d{2}-\d{2})\.jsonl$/;
 
+/** The source label of the machine write token, wherever a call or run uses it: the report joins on it. */
+export const WRITE_TOKEN_SOURCE = "write-token";
+/** The source label of a read-only token whose env var name is unknown. */
+export const READ_ONLY_TOKEN_SOURCE = "read-only-token";
+
 export type RefusalKind = "primary" | "secondary" | "unclassified";
 
 export interface CallRecord {

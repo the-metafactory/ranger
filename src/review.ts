@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { RunResult } from "./exec.ts";
-import { meteredOpaque } from "./github-usage.ts";
+import { meteredOpaque, READ_ONLY_TOKEN_SOURCE } from "./github-usage.ts";
 import { nodeKey } from "./forge-ref.ts";
 import { changeRequestRef } from "./forge-text.ts";
 import type { SubstrateName } from "./store/schema.ts";
@@ -102,7 +102,7 @@ export async function sageReview(
  try {
   const args = ["review", nodeKey(repo, prNumber), "--emit-verdict-block"];
   args.push("--substrate", opts.substrate);
-  const metered = meteredOpaque({ component: "sage-review", source: opts.tokenSource ?? "read-only-token" });
+  const metered = meteredOpaque({ component: "sage-review", source: opts.tokenSource ?? READ_ONLY_TOKEN_SOURCE });
   const result = await runReadRetryingTransient(
    opts.command ?? process.env.RANGER_SAGE_CMD ?? "sage",
    args,

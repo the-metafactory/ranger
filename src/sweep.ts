@@ -1,6 +1,7 @@
 import { workerPreflight, type DispatchDeps } from "./node-dependency.ts";
 import { RECOVERY_LIMIT, nodeRecoveryScope, recordRecovery, recoveryReason, recoveryHold, recoverablePending } from "./recovery.ts";
 import { startOwnedWorker, reservationPending, FRESH_START_FAILURE } from "./node-ownership.ts";
+import { WRITE_TOKEN_SOURCE } from "./github-usage.ts";
 import { recordImplementStart } from "./maps.ts";
 import { implementLane, startsImplementSession, type ImplementLane } from "./lanes.ts";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
@@ -136,7 +137,7 @@ export async function sweepMap(ctx: SweepContext): Promise<SweepMapResult> {
  // Each scan also has a fixed row cap to bound its graph reads.
  if (phase !== "desk") {
   const deadline = Date.now() + GRAPH_CALL_TIMEOUT_MS;
-  const credential = ctx.graphToken ?? { token, source: "write-token" };
+  const credential = ctx.graphToken ?? { token, source: WRITE_TOKEN_SOURCE };
   const readNode = async (id: string) => {
    if (Date.now() >= deadline) throw new BudgetDeferral("graph closure pass deadline reached");
    return budgetedRead(journal, repo, credential, budgetPolicy(config), new Date(), () => {

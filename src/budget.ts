@@ -1,5 +1,5 @@
 import type { RangerConfig } from "./config.ts";
-import { meteredGauge, recordGauge } from "./github-usage.ts";
+import { meteredGauge, READ_ONLY_TOKEN_SOURCE, recordGauge } from "./github-usage.ts";
 import { RateLimitError } from "./graph.ts";
 import type { Journal } from "./journal.ts";
 import { gatedEnv, assertGitLabReadGrant, matchTokenEnv, type ResolvedToken } from "./token-gate.ts";
@@ -88,7 +88,7 @@ export function cooldownScope(repo: string, source: string): string {
 
 /** The label of the read-only token sage reviews under: its env var name. */
 export function reviewTokenSource(config: Pick<RangerConfig, "auth">, repo: string): string {
-  return matchTokenEnv(config.auth, repo) ?? "read-only-token";
+  return matchTokenEnv(config.auth, repo) ?? READ_ONLY_TOKEN_SOURCE;
 }
 
 /**

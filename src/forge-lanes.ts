@@ -2,6 +2,7 @@ import * as github from "./github.ts";
 import type { RangerConfig } from "./config.ts";
 import type { ForgePort } from "./forge.ts";
 import { parseForgeRef, qualifiedRepo } from "./forge-ref.ts";
+import { WRITE_TOKEN_SOURCE } from "./github-usage.ts";
 import { gitlabForgePort } from "./gitlab.ts";
 import { resolveWriteToken, WriteGateError } from "./identity.ts";
 import { assertReadOnlyToken, GateError, resolveReadOnlyToken, type ResolvedToken } from "./token-gate.ts";
@@ -39,7 +40,7 @@ export async function graphReadToken(
  writeToken: string,
  gate: ReadGate = assertReadOnlyToken,
 ): Promise<ResolvedToken> {
- if (parseForgeRef(repo).forge === "github") return { token: writeToken, source: "write-token" };
+ if (parseForgeRef(repo).forge === "github") return { token: writeToken, source: WRITE_TOKEN_SOURCE };
  return (await gate(config, repo)).token;
 }
 

@@ -307,6 +307,14 @@ describe("tracing spend from the record alone", () => {
   expect(text).toContain("upper bound");
  });
 
+ test("overlapping runs each get the gap, so a short run inside a long one keeps a true upper bound", () => {
+  recordBeganEarlier();
+  seed("2026-11-08", [call(0, "token-gate", 5000), opaque(5, 40, "sage-review"), { ...opaque(10, 10, "soma-graph-read"), endedAt: at(10, 1) }, call(50, "token-gate", 4000)]);
+  const window = onlyWindow();
+  expect(window.duringOpaque).toEqual({ "sage-review": 999, "soma-graph-read": 999 });
+  expect(window.outsideRanger).toBe(0);
+ });
+
  test("spend with no run going is not called outside everything ranger started, in text or JSON", () => {
   recordBeganEarlier();
   seed("2026-11-08", [call(0, "token-gate", 5000), call(15, "token-gate", 4700)]);
@@ -436,7 +444,7 @@ describe("the operator command", () => {
   const configPath = join(dir, "ranger.yaml");
   writeFileSync(configPath, `state:\n  journalPath: ${join(dir, "state.sqlite")}\nmaps:\n  - repo: acme/widgets\n    root: 1\n    walk: full\n`);
   seed("2026-11-08", [call(5, "token-gate", 4990, { reset: WINDOW_RESET - 3600 }), call(50, "forge-port", 4980), call(51, "forge-port", 4979)]);
-  const args =[cliPath, "budget", "-c", configPath, "--since", at(40), "--until", at(59)];
+  const args = [cliPath, "budget", "-c", configPath, "--since", at(40), "--until", at(59)];
   const text = await runCmd(bun, args, { env: testCliEnv(process.env) });
   expect(text.stderr).toBe("");
   expect(text.code).toBe(0);

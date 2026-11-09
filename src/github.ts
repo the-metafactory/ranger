@@ -6,7 +6,7 @@ import { githubCiVerdict } from "./github-ci.ts";
 import { runReadRetryingTransient } from "./transient.ts";
 import { writeEnv } from "./identity.ts";
 import { GitHubApiBaseUrlSchema } from "./github-api-base.ts";
-import { explicitMethod, hasRequestBody, meteredGh } from "./github-usage.ts";
+import { explicitMethod, hasRequestBody, meteredGh, WRITE_TOKEN_SOURCE } from "./github-usage.ts";
 
 /**
  * The implement lane's pull-request surface (design §4, #23): every call is a
@@ -25,7 +25,6 @@ export class GitHubError extends OperationFailure {
 
 const GH_TIMEOUT_MS = 60_000;
 
-const FORGE_PORT_SOURCE = "write-token";
 const APP_INSTALLATION_SOURCE = "github-app-installation";
 
 /** A plain GET is safe to repeat; anything with a body or another method is not. */
@@ -53,7 +52,7 @@ export interface CommitStatus {
 }
 
 /** One `gh api` request; its trimmed stdout. */
-async function ghApiText(token: string, args: string[], label: string, acceptError?: (status: number, response: string) => boolean, source = FORGE_PORT_SOURCE): Promise<string> {
+async function ghApiText(token: string, args: string[], label: string, acceptError?: (status: number, response: string) => boolean, source = WRITE_TOKEN_SOURCE): Promise<string> {
  const gated = writeEnv(token, { GH_ENTERPRISE_TOKEN: token, GITHUB_ENTERPRISE_TOKEN: token });
  try {
   const metered = meteredGh({ component: "forge-port", source });
@@ -80,7 +79,7 @@ async function ghApi(
  token: string,
  args: string[],
  label: string,
- source = FORGE_PORT_SOURCE,
+ source = WRITE_TOKEN_SOURCE,
 ): Promise<unknown> {
  const raw = await ghApiText(token, args, label, undefined, source);
  if (raw.length === 0) return null;
@@ -295,7 +294,7 @@ export async function rebasePr(
  const gated = writeEnv(token);
  let response;
  try {
-  response = await meteredGh({ component: "forge-port", source: FORGE_PORT_SOURCE })("gh", ["api", `repos/${repo}/pulls/${number}/update-branch`, "--method", "PUT", "-f", `expected_head_sha=${sha}`, "--include"], { env: gated.env, timeoutMs: GH_TIMEOUT_MS });
+  response = await meteredGh({ component: "forge-port", source: WRITE_TOKEN_SOURCE })("gh", ["api", `repos/${repo}/pulls/${number}/update-branch`, "--method", "PUT", "-f", `expected_head_sha=${sha}`, "--include"], { env: gated.env, timeoutMs: GH_TIMEOUT_MS });
  } finally {
   gated.cleanup();
  }

@@ -135,17 +135,9 @@ function summariseOpaque(runs: OpaqueRecord[]): OpaqueSummary[] {
  return [...groups.values()].sort((a, b) => b.runs - a.runs || a.component.localeCompare(b.component));
 }
 
-function longestOverlappingRun(runs: OpaqueRecord[], from: number, to: number): OpaqueRecord | undefined {
- let best: OpaqueRecord | undefined;
- let bestOverlap = -1;
- for (const run of runs) {
-  const overlap = Math.min(to, ms(run.endedAt)) - Math.max(from, ms(run.at));
-  if (overlap >= 0 && overlap > bestOverlap) {
-   best = run;
-   bestOverlap = overlap;
-  }
- }
- return best;
+function componentsRunningBetween(runs: OpaqueRecord[], from: number, to: number): string[] {
+ const running = runs.filter((run) => ms(run.at) <= to && ms(run.endedAt) >= from);
+ return [...new Set(running.map((run) => run.component))];
 }
 
 function reportWindow(observations: Observation[], opaque: OpaqueRecord[], recordBegan: number): WindowReport {
@@ -181,10 +173,10 @@ function attributeSpend(sorted: Observation[], runs: OpaqueRecord[], window: { l
   const now = ms(observation.at);
   const unexplained = Math.max(0, lowest - remaining - uncounted);
   if (unexplained > 0) {
-   const run = longestOverlappingRun(runs, previous, now);
+   const running = componentsRunningBetween(runs, previous, now);
    if (first && window.recordBegan > previous) beforeRecordBegan += unexplained;
-   else if (run !== undefined) duringOpaque[run.component] = (duringOpaque[run.component] ?? 0) + unexplained;
-   else outsideRanger += unexplained;
+   else if (running.length === 0) outsideRanger += unexplained;
+   else for (const component of running) duringOpaque[component] = (duringOpaque[component] ?? 0) + unexplained;
   }
   lowest = Math.min(lowest, remaining);
   uncounted = 0;
@@ -236,7 +228,7 @@ function loadRecords(directory: string, since: Date, until: Date) {
 }
 
 const CAVEATS = [
- "A soma or sage run gets all the spend between the two budget readings around it, so a during figure is an upper bound.",
+ "Every soma or sage run going between two budget readings gets all the spend between them, so a during figure is an upper bound for that run, and overlapping runs' figures do not add up.",
  "Spend with no soma or sage run going can be a worker's own gh, your own gh, gh pr merge from the dashboard, or a run that was killed or has not finished.",
  "The calls inside soma and sage are not counted.",
 ];
@@ -249,7 +241,7 @@ const CAVEATS = [
 export function buildUsageReport(directory: string, since: Date, until: Date): UsageReport {
  const { records, cappedDays, malformedLines, recordBegan } = loadRecords(directory, since, until);
  const inPeriod = (at: string): boolean => ms(at) >= since.getTime() && ms(at) <= until.getTime();
- const calls =records.filter((r): r is CallRecord => r.kind === "call");
+ const calls = records.filter((r): r is CallRecord => r.kind === "call");
  const opaqueRuns = records.filter((r): r is OpaqueRecord => r.kind === "opaque");
  const observations = records.filter((r): r is Observation => r.kind !== "opaque" && r.reset !== undefined && r.resource !== undefined);
  const windowKey = (o: Observation): string => `${o.resource}:${o.reset}`;
