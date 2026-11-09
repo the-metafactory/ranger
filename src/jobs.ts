@@ -25,7 +25,7 @@ import { JOURNAL_PATH_ENV, sessionJournalPath } from "./journal-guard.ts";
 import type { ImplementLane, JobLane } from "./lanes.ts";
 import { emitJobRunFinished, type RunLedgerDeps } from "./run-ledger.ts";
 import type { SubstrateName } from "./store/schema.ts";
-import { selectSubstrate, workerCommandFor, workerOutputFor, type SubstrateReaders } from "./substrate.ts";
+import { buildQuotaSubstrates, selectSubstrate, workerCommandFor, workerOutputFor, type SubstrateReaders } from "./substrate.ts";
 import { selectForBuild } from "./substrate-policy.ts";
 import { finishStudio, prepareStudio, studioCommand, studioEnvironment, studioLimit, studioPolicyCache, studioPrompt, studioSubstrates, validateStudioParams } from "./studio-think.ts";
 import { workerHostEnv } from "./worker-env.ts";
@@ -433,7 +433,7 @@ export async function runJob(runId: number, ctx: RunJobContext): Promise<RunJobO
  if (ctx.substrate === undefined && studio?.policy !== "local") {
   try {
    const picked = (await selectSubstrate(journal, {
-    config: config.substrates, excluded: new Set(), readers: ctx.substrateReaders, pick: selectForBuild,
+    config: config.substrates, excluded: new Set(), readers: ctx.substrateReaders, pick: selectForBuild, refresh: buildQuotaSubstrates(config),
    })).substrate;
    if (permitted.includes(picked)) substrate = picked;
   } catch {

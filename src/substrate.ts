@@ -14,6 +14,7 @@ import {
  describeReadings,
  isFresh,
  QUOTA_SUBSTRATES,
+ STRONG_SUBSTRATES,
  type SelectionInput,
  type SubstrateConfig,
 } from "./substrate-policy.ts";
@@ -644,15 +645,21 @@ export async function ensureFreshReading(
  }
 }
 
-/** Refresh every substrate with a quota (claude, codex, Pi's credit) concurrently, then return every reading. */
+/** The substrates a build selection refreshes: Pi's credit only when Pi runs on OpenRouter, the provider that credit measures. */
+export function buildQuotaSubstrates(config: RangerConfig): SubstrateName[] {
+ return config.substrates.pi.provider === "openrouter" ? QUOTA_SUBSTRATES : STRONG_SUBSTRATES;
+}
+
+/** Refresh `substrates` (by default the strong two) concurrently, then return every reading. */
 export async function freshReadings(
  journal: Journal,
  config: SubstrateConfig,
  now: Date,
  readers?: SubstrateReaders,
+ substrates: SubstrateName[] = STRONG_SUBSTRATES,
 ): Promise<SubstrateReading[]> {
  await Promise.all(
-  QUOTA_SUBSTRATES.map((name) => ensureFreshReading(name, journal, config, now, readers)),
+  substrates.map((name) => ensureFreshReading(name, journal, config, now, readers)),
  );
  return journal.listSubstrateReadings();
 }
@@ -669,11 +676,12 @@ export async function selectSubstrate<T extends SubstrateName | null>(
   excluded: ReadonlySet<SubstrateName>;
   readers: SubstrateReaders | undefined;
   pick: (input: SelectionInput) => T;
+  refresh?: SubstrateName[];
  },
 ): Promise<{ substrate: T; chosenOn: string }> {
  const { config, excluded, readers, pick } = opts;
  const now = new Date();
- const readings = await freshReadings(journal, config, now, readers);
+ const readings = await freshReadings(journal, config, now, readers, opts.refresh);
  const selectable = readings.filter((r) => !excluded.has(r.substrate));
  return {
   substrate: pick({ readings: selectable, now, config, recentBuilds: journal.buildCountsSince(new Date(now.getTime() - BUILD_SHARE_WINDOW_MS)) }),

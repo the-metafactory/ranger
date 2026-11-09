@@ -3,8 +3,10 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Journal, type SubstrateReading } from "../src/journal.ts";
-import { freshReadings, readOpenRouterCredit } from "../src/substrate.ts";
-import { isEligible, selectForBuild, selectForReview, type SubstrateConfig } from "../src/substrate-policy.ts";
+import type { RangerConfig, RangerMapConfig } from "../src/config.ts";
+import { defaultNodeSelector } from "../src/node-dependency.ts";
+import { buildQuotaSubstrates, freshReadings, readOpenRouterCredit, selectSubstrate } from "../src/substrate.ts";
+import { isEligible, QUOTA_SUBSTRATES, selectForBuild, selectForReview, type SubstrateConfig } from "../src/substrate-policy.ts";
 
 const CONFIG: SubstrateConfig = {
  fiveHourMaxUsedPct: 70,
@@ -97,11 +99,61 @@ describe("Pi in the build share", () => {
    const failing = () => Promise.reject(new Error("no read"));
    expect((await freshReadings(journal, CONFIG, NOW, { claude: failing, codex: failing })).map((r) => r.substrate)).toEqual([]);
    const credit = () => readOpenRouterCredit("k", keyResponse({ limit: 50, limit_remaining: 25, limit_reset: "monthly" }), NOW);
-   const stored = await freshReadings(journal, CONFIG, NOW, { claude: failing, codex: failing, pi: credit });
+   const stored = await freshReadings(journal, CONFIG, NOW, { claude: failing, codex: failing, pi: credit }, QUOTA_SUBSTRATES);
    expect(stored.map((r) => [r.substrate, r.sevenDayUsedPct])).toEqual([["pi", 50]]);
    journal.close();
   } finally {
    rmSync(dir, { recursive: true, force: true });
   }
  });
+});
+
+describe("what a selection reads", () => {
+ const rangerConfig = (provider: string) => ({ substrates: { ...CONFIG, pi: { provider, model: "m", reviewEvery: 0 } } }) as unknown as RangerConfig;
+ const quota = (substrate: "claude" | "codex" | "pi") => async () => ({
+  substrate,
+  readAt: new Date(),
+  windows: [{ kind: "five_hour" as const, usedPct: 10, resetsAt: Math.floor(Date.now() / 1000) + 5 * 3600 }],
+  capped: false,
+  cappedUntil: null,
+ });
+
+ function withJournal(run: (journal: Journal) => Promise<void>): () => Promise<void> {
+  return async () => {
+   const dir = mkdtempSync(join(tmpdir(), "ranger-pi-credit-"));
+   const journal = new Journal(join(dir, "state.sqlite"));
+   try {
+    await run(journal);
+   } finally {
+    journal.close();
+    rmSync(dir, { recursive: true, force: true });
+   }
+  };
+ }
+
+ test("Pi's OpenRouter credit is read for builds only while Pi runs on OpenRouter", () => {
+  expect(buildQuotaSubstrates(rangerConfig("openrouter"))).toEqual(["claude", "codex", "pi"]);
+  expect(buildQuotaSubstrates(rangerConfig("spark"))).toEqual(["claude", "codex"]);
+ });
+
+ test("a review selection never waits on Pi's credit", withJournal(async (journal) => {
+  let piReads = 0;
+  const readers = { claude: quota("claude"), codex: quota("codex"), pi: async () => { piReads++; return quota("pi")(); } };
+  const { substrate } = await selectSubstrate(journal, { config: CONFIG, excluded: new Set(), readers, pick: (input) => selectForReview(input, "claude") });
+  expect(substrate).toBe("codex");
+  expect(piReads).toBe(0);
+ }));
+
+ test("a dispatch pass counts each build once, though its sessions start mid-pass", withJournal(async (journal) => {
+  journal.upsertWorker({ root: 1, nodeId: "7", repo: "acme/widgets", status: "claimed" });
+  const generation = journal.getWorker("7", "acme/widgets")!.generation;
+  const select = defaultNodeSelector(rangerConfig("spark"), journal, { claude: quota("claude"), codex: quota("codex") });
+  const picks = { claude: 0, codex: 0, pi: 0 };
+  for (let i = 0; i < 10; i++) {
+   const substrate = await select({} as RangerMapConfig, "implement");
+   picks[substrate] += 1;
+   journal.startSubstrateSession({ substrate, kind: "worker", repo: "acme/widgets", nodeId: "7", generation });
+  }
+  expect(picks).toEqual({ claude: 5, codex: 5, pi: 0 });
+ }));
 });

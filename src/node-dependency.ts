@@ -4,26 +4,25 @@ import { z } from "zod";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import type { Journal, SubstrateReading, WorkerRow } from "./journal.ts";
 import { requireEndpoint, requireReachable, type EndpointLookup, type EndpointProbe, type DependencyCheck } from "./endpoint.ts";
-import { freshReadings, selectSubstrate, type SubstrateName, type SubstrateReaders } from "./substrate.ts";
+import { buildQuotaSubstrates, freshReadings, selectSubstrate, type SubstrateName, type SubstrateReaders } from "./substrate.ts";
 import { BUILD_SHARE_WINDOW_MS, selectForBuild } from "./substrate-policy.ts";
 
 export interface NodePreflightResult { substrate?: SubstrateName; checks: DependencyCheck[] }
 export interface DispatchDeps { nodeSelector?: NodeSelector; endpointProbe?: EndpointProbe; endpointLookup?: EndpointLookup }
 export type NodeSelector = (map: RangerMapConfig, lane: "implement" | "research") => Promise<SubstrateName>;
 export async function selectNodeSubstrate(journal: Journal, config: RangerConfig, excluded: ReadonlySet<SubstrateName>, readers?: SubstrateReaders) {
- return selectSubstrate(journal, { config: config.substrates, excluded, readers, pick: selectForBuild });
+ return selectSubstrate(journal, { config: config.substrates, excluded, readers, pick: selectForBuild, refresh: buildQuotaSubstrates(config) });
 }
 export function defaultNodeSelector(config: RangerConfig, journal: Journal, readers?: SubstrateReaders): NodeSelector {
  let readings: Promise<SubstrateReading[]> | undefined;
- const picked: Partial<Record<SubstrateName, number>> = {};
+ let recentBuilds: Partial<Record<SubstrateName, number>> | undefined;
  return async (_map, lane) => {
   if (lane === "research") return "claude";
-  readings ??= freshReadings(journal, config.substrates, new Date(), readers);
   const now = new Date();
-  const recentBuilds = journal.buildCountsSince(new Date(now.getTime() - BUILD_SHARE_WINDOW_MS));
-  for (const [name, count] of Object.entries(picked) as [SubstrateName, number][]) recentBuilds[name] = (recentBuilds[name] ?? 0) + count;
+  readings ??= freshReadings(journal, config.substrates, now, readers, buildQuotaSubstrates(config));
+  recentBuilds ??= journal.buildCountsSince(new Date(now.getTime() - BUILD_SHARE_WINDOW_MS));
   const substrate = selectForBuild({ readings: await readings, now, config: config.substrates, recentBuilds });
-  picked[substrate] = (picked[substrate] ?? 0) + 1;
+  recentBuilds[substrate] = (recentBuilds[substrate] ?? 0) + 1;
   return substrate;
  };
 }
