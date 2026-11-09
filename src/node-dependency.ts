@@ -2,23 +2,28 @@ import { spawningEnabled } from "./spawn.ts";
 import { OperationFailure } from "./operation-outcome.ts";
 import { z } from "zod";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
-import type { Journal, WorkerRow } from "./journal.ts";
+import type { Journal, SubstrateReading, WorkerRow } from "./journal.ts";
 import { requireEndpoint, requireReachable, type EndpointLookup, type EndpointProbe, type DependencyCheck } from "./endpoint.ts";
-import { selectSubstrate, type SubstrateName, type SubstrateReaders } from "./substrate.ts";
-import { selectForBuild } from "./substrate-policy.ts";
+import { buildQuotaSubstrates, freshReadings, selectSubstrate, type SubstrateName, type SubstrateReaders } from "./substrate.ts";
+import { BUILD_SHARE_WINDOW_MS, selectForBuild } from "./substrate-policy.ts";
 
 export interface NodePreflightResult { substrate?: SubstrateName; checks: DependencyCheck[] }
 export interface DispatchDeps { nodeSelector?: NodeSelector; endpointProbe?: EndpointProbe; endpointLookup?: EndpointLookup }
 export type NodeSelector = (map: RangerMapConfig, lane: "implement" | "research") => Promise<SubstrateName>;
 export async function selectNodeSubstrate(journal: Journal, config: RangerConfig, excluded: ReadonlySet<SubstrateName>, readers?: SubstrateReaders) {
- return selectSubstrate(journal, { config: config.substrates, excluded, readers, pick: selectForBuild });
+ return selectSubstrate(journal, { config: config.substrates, excluded, readers, pick: selectForBuild, refresh: buildQuotaSubstrates(config) });
 }
 export function defaultNodeSelector(config: RangerConfig, journal: Journal, readers?: SubstrateReaders): NodeSelector {
- let build: Promise<SubstrateName> | undefined;
- return (_map, lane) => {
-  if (lane === "research") return Promise.resolve("claude");
-  build ??= selectNodeSubstrate(journal, config, new Set(), readers).then(result => result.substrate);
-  return build;
+ let readings: Promise<SubstrateReading[]> | undefined;
+ let recentBuilds: Partial<Record<SubstrateName, number>> | undefined;
+ return async (_map, lane) => {
+  if (lane === "research") return "claude";
+  const now = new Date();
+  readings ??= freshReadings(journal, config.substrates, now, readers, buildQuotaSubstrates(config));
+  recentBuilds ??= journal.buildCountsSince(new Date(now.getTime() - BUILD_SHARE_WINDOW_MS));
+  const substrate = selectForBuild({ readings: await readings, now, config: config.substrates, recentBuilds });
+  recentBuilds[substrate] = (recentBuilds[substrate] ?? 0) + 1;
+  return substrate;
  };
 }
 export async function nodePreflight(args: {

@@ -403,9 +403,9 @@ describe("isEligible", () => {
   expect(isEligible(null, DEFAULT_CONFIG, now)).toBeNull();
  });
 
- test("pi is never eligible as a strong substrate", () => {
-  const r = reading("pi", { readAt: fresh });
-  expect(isEligible(r, DEFAULT_CONFIG, now)).toBeNull();
+ test("pi is eligible on its credit reading, like a strong substrate", () => {
+  expect(isEligible(reading("pi", { readAt: fresh }), DEFAULT_CONFIG, now)?.headroom).toBe(50);
+  expect(isEligible(reading("pi", { readAt: fresh, fiveHourUsedPct: null, sevenDayUsedPct: 85 }), DEFAULT_CONFIG, now)).toBeNull();
  });
 
  test("eligible with only one window reported", () => {
@@ -433,6 +433,39 @@ describe("selectForBuild", () => {
    reading("codex", { readAt: fresh, fiveHourUsedPct: 20, sevenDayUsedPct: 30 }),
   ];
   expect(selectForBuild({ readings, now, config: DEFAULT_CONFIG })).toBe("codex");
+ });
+
+ test("builds are shared in proportion to headroom: 10% and 20% left give claude 1/3", () => {
+  const readings = [
+   reading("claude", { readAt: fresh, fiveHourUsedPct: 60, sevenDayUsedPct: 30 }),
+   reading("codex", { readAt: fresh, fiveHourUsedPct: 50, sevenDayUsedPct: 30 }),
+  ];
+  const headroom = (name: "claude" | "codex") => isEligible(readings.find((r) => r.substrate === name)!, DEFAULT_CONFIG, now)!.headroom;
+  expect(headroom("codex") / headroom("claude")).toBeCloseTo(2, 5);
+  const recentBuilds = { claude: 0, codex: 0 };
+  for (let i = 0; i < 30; i++) {
+   const picked = selectForBuild({ readings, now, config: DEFAULT_CONFIG, recentBuilds });
+   if (picked === "pi") throw new Error("both are eligible");
+   recentBuilds[picked] += 1;
+  }
+  expect(recentBuilds).toEqual({ claude: 10, codex: 20 });
+ });
+
+ test("a substrate behind its share gets the build even with less headroom", () => {
+  const readings = [
+   reading("claude", { readAt: fresh, fiveHourUsedPct: 60, sevenDayUsedPct: 30 }),
+   reading("codex", { readAt: fresh, fiveHourUsedPct: 20, sevenDayUsedPct: 30 }),
+  ];
+  expect(selectForBuild({ readings, now, config: DEFAULT_CONFIG, recentBuilds: { codex: 5 } })).toBe("claude");
+  expect(selectForBuild({ readings, now, config: DEFAULT_CONFIG })).toBe("codex");
+ });
+
+ test("an ineligible substrate gets no share", () => {
+  const readings = [
+   reading("claude", { readAt: fresh, fiveHourUsedPct: 80, sevenDayUsedPct: 30 }),
+   reading("codex", { readAt: fresh, fiveHourUsedPct: 20, sevenDayUsedPct: 30 }),
+  ];
+  expect(selectForBuild({ readings, now, config: DEFAULT_CONFIG, recentBuilds: { codex: 50 } })).toBe("codex");
  });
 
  test("falls back to Pi when neither is eligible", () => {

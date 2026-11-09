@@ -7,10 +7,13 @@ import { runCmd, splitLines, type RunOptions, type RunResult } from "./exec.ts";
 import type { Journal, SubstrateReading } from "./journal.ts";
 import type { SubstrateName } from "./store/schema.ts";
 import { workerHostEnv } from "./worker-env.ts";
+import { z } from "zod";
 import {
  activeCappedUntil,
+ BUILD_SHARE_WINDOW_MS,
  describeReadings,
  isFresh,
+ QUOTA_SUBSTRATES,
  STRONG_SUBSTRATES,
  type SelectionInput,
  type SubstrateConfig,
@@ -43,6 +46,49 @@ export interface QuotaReading {
 export interface SubstrateReaders {
  codex?: () => Promise<QuotaReading>;
  claude?: () => Promise<QuotaReading>;
+ pi?: () => Promise<QuotaReading>;
+}
+
+const OpenRouterKeySchema = z.object({
+ data: z.object({
+  limit: z.number().positive(),
+  limit_remaining: z.number(),
+  limit_reset: z.literal("monthly"),
+ }),
+});
+
+function nextUtcMonth(now: Date): number {
+ return Math.floor(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1) / 1000);
+}
+
+/**
+ * Pi's OpenRouter key allowance as a long-window reading: used% of the key's
+ * monthly limit, resetting at the next UTC month. A key without a monthly
+ * limit has no share to report, so the read fails and Pi stays the fallback.
+ * https://openrouter.ai/docs/api-reference/limits
+ */
+export async function readOpenRouterCredit(
+ apiKey: string | undefined,
+ fetchImpl: typeof fetch = fetch,
+ now = new Date(),
+): Promise<QuotaReading> {
+ if (apiKey === undefined || apiKey === "") throw new Error("OPENROUTER_API_KEY is not set");
+ const response = await fetchImpl("https://openrouter.ai/api/v1/key", {
+  headers: { Authorization: `Bearer ${apiKey}` },
+  signal: AbortSignal.timeout(10_000),
+ });
+ if (!response.ok) throw new Error(`OpenRouter key read failed: HTTP ${response.status}`);
+ const { data } = OpenRouterKeySchema.parse(await response.json());
+ const remaining = Math.max(0, data.limit_remaining);
+ const usedPct = Math.min(100, Math.round(100 - (remaining / data.limit) * 100));
+ const resetsAt = nextUtcMonth(now);
+ return {
+  substrate: "pi",
+  readAt: now,
+  windows: [{ kind: "seven_day", usedPct, resetsAt }],
+  capped: remaining <= 0,
+  cappedUntil: remaining <= 0 ? resetsAt : null,
+ };
 }
 
 // ---- Codex quota parser ----
@@ -568,7 +614,11 @@ export function workerOutputFor(substrate: SubstrateName | undefined): WorkerOut
 
 // ---- refresh ----
 
-function readerFor(substrate: "claude" | "codex", readers: SubstrateReaders | undefined) {
+function readerFor(substrate: SubstrateName, readers: SubstrateReaders | undefined): () => Promise<QuotaReading> {
+ if (substrate === "pi") {
+  if (readers !== undefined) return readers.pi ?? (() => Promise.reject(new Error("no Pi credit reader injected")));
+  return () => readOpenRouterCredit(process.env.OPENROUTER_API_KEY);
+ }
  return substrate === "codex"
   ? (readers?.codex ?? (() => readCodexQuota()))
   : (readers?.claude ?? (() => probeClaudeQuota()));
@@ -586,7 +636,6 @@ export async function ensureFreshReading(
  now: Date,
  readers?: SubstrateReaders,
 ): Promise<void> {
- if (substrate === "pi") return;
  const existing = journal.getSubstrateReading(substrate);
  if (existing !== null && isFresh(existing, config, now)) return;
  try {
@@ -596,17 +645,23 @@ export async function ensureFreshReading(
  }
 }
 
-/** Refresh both strong substrates concurrently, then return every reading. */
+/** The substrates a build selection refreshes: Pi's credit only when Pi runs on OpenRouter, the provider that credit measures. */
+export function buildQuotaSubstrates(config: RangerConfig): SubstrateName[] {
+ return config.substrates.pi.provider === "openrouter" ? QUOTA_SUBSTRATES : STRONG_SUBSTRATES;
+}
+
+/** Refresh `substrates` (by default the strong two) concurrently, then return their readings and no others. */
 export async function freshReadings(
  journal: Journal,
  config: SubstrateConfig,
  now: Date,
  readers?: SubstrateReaders,
+ substrates: SubstrateName[] = STRONG_SUBSTRATES,
 ): Promise<SubstrateReading[]> {
  await Promise.all(
-  STRONG_SUBSTRATES.map((name) => ensureFreshReading(name, journal, config, now, readers)),
+  substrates.map((name) => ensureFreshReading(name, journal, config, now, readers)),
  );
- return journal.listSubstrateReadings();
+ return journal.listSubstrateReadings().filter((reading) => substrates.includes(reading.substrate));
 }
 
 /**
@@ -621,14 +676,15 @@ export async function selectSubstrate<T extends SubstrateName | null>(
   excluded: ReadonlySet<SubstrateName>;
   readers: SubstrateReaders | undefined;
   pick: (input: SelectionInput) => T;
+  refresh?: SubstrateName[];
  },
 ): Promise<{ substrate: T; chosenOn: string }> {
  const { config, excluded, readers, pick } = opts;
  const now = new Date();
- const readings = await freshReadings(journal, config, now, readers);
+ const readings = await freshReadings(journal, config, now, readers, opts.refresh);
  const selectable = readings.filter((r) => !excluded.has(r.substrate));
  return {
-  substrate: pick({ readings: selectable, now, config }),
+  substrate: pick({ readings: selectable, now, config, recentBuilds: journal.buildCountsSince(new Date(now.getTime() - BUILD_SHARE_WINDOW_MS)) }),
   chosenOn: describeReadings(readings, now, config),
  };
 }

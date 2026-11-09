@@ -10,12 +10,19 @@ import type { SubstrateName } from "./store/schema.ts";
 
 export const STRONG_SUBSTRATES: SubstrateName[] = ["claude", "codex"];
 
+/** Substrates with a reading to share builds by: the strong two, and Pi by its OpenRouter key's monthly allowance. */
+export const QUOTA_SUBSTRATES: SubstrateName[] = [...STRONG_SUBSTRATES, "pi"];
+
+/** Max age of a Pi credit reading, minutes. */
+export const PI_CREDIT_MAX_AGE_MIN = 10;
+
 export type SubstrateConfig = Omit<RangerConfig["substrates"], "claude" | "pi" | "codex">;
 
 export interface SelectionInput {
  readings: SubstrateReading[];
  now: Date;
  config: SubstrateConfig;
+ recentBuilds?: Partial<Record<SubstrateName, number>>;
 }
 
 export interface EligibleSubstrate {
@@ -44,6 +51,7 @@ export function effectiveThreshold(
 }
 
 export function maxReadingAgeMs(name: SubstrateName, config: SubstrateConfig): number {
+ if (name === "pi") return PI_CREDIT_MAX_AGE_MIN * 60_000;
  return (name === "claude" ? config.claudeProbeMaxAgeMin : config.codexReadMaxAgeMin) * 60_000;
 }
 
@@ -83,7 +91,6 @@ export function isEligible(
 ): EligibleSubstrate | null {
  if (reading === null) return null;
  const name = reading.substrate;
- if (!STRONG_SUBSTRATES.includes(name)) return null;
  if (!isFresh(reading, config, now)) return null;
  if (isCappedAt(reading, now)) return null;
 
@@ -102,16 +109,30 @@ export function isEligible(
 
 /** The eligible strong substrates, most headroom first. */
 export function eligibleStrong(input: SelectionInput): EligibleSubstrate[] {
- return STRONG_SUBSTRATES.map((name) =>
+ return eligibleAmong(STRONG_SUBSTRATES, input);
+}
+
+function eligibleAmong(names: SubstrateName[], input: SelectionInput): EligibleSubstrate[] {
+ return names.map((name) =>
   isEligible(input.readings.find((r) => r.substrate === name) ?? null, input.config, input.now),
  )
   .filter((e): e is EligibleSubstrate => e !== null)
   .sort((a, b) => b.headroom - a.headroom);
 }
 
-/** Implement session or fix pass: the eligible strong substrate with the most headroom, else Pi. */
+/** How far back selectForBuild counts builds when it shares them out: the short quota window. */
+export const BUILD_SHARE_WINDOW_MS = 5 * 60 * 60_000;
+
+/**
+ * Implement session or fix pass: the eligible substrates (claude, codex, and
+ * Pi while its key allowance has room) share the builds in proportion to
+ * their headroom. The next build goes to the one
+ * whose recent builds, this one included, are fewest per point of headroom;
+ * ties go to the most headroom. None eligible: Pi.
+ */
 export function selectForBuild(input: SelectionInput): SubstrateName {
- return eligibleStrong(input)[0]?.name ?? "pi";
+ const load = (e: EligibleSubstrate): number => ((input.recentBuilds?.[e.name] ?? 0) + 1) / e.headroom;
+ return eligibleAmong(QUOTA_SUBSTRATES, input).sort((a, b) => load(a) - load(b))[0]?.name ?? "pi";
 }
 
 export function selectForReview(input: SelectionInput, authorSubstrate: SubstrateName): SubstrateName | null {
@@ -121,9 +142,9 @@ export function selectForReview(input: SelectionInput, authorSubstrate: Substrat
 
 /** One line per reading for journal events: what a selection was made on. */
 export function describeReadings(readings: SubstrateReading[], now: Date, config: SubstrateConfig): string {
- const parts = STRONG_SUBSTRATES.map((name) => {
+ const parts = QUOTA_SUBSTRATES.flatMap((name) => {
   const r = readings.find((x) => x.substrate === name);
-  if (r === undefined) return `${name} unread`;
+  if (r === undefined) return name === "pi" ? [] : [`${name} unread`];
   const age = readingAgeMin(r, now);
   const windows = (["five_hour", "seven_day"] as const).flatMap((window) => {
    const used = window === "five_hour" ? r.fiveHourUsedPct : r.sevenDayUsedPct;
@@ -133,7 +154,7 @@ export function describeReadings(readings: SubstrateReading[], now: Date, config
    return [`${window === "five_hour" ? "5h" : "7d"} ${used}% < ${effectiveThreshold(window, r, now, config).toFixed(1)}% (${remaining})`];
   });
   const capped = isCappedAt(r, now);
-  return `${name} ${windows.join(" ") || "no windows"} read ${age}m ago${capped ? " CAPPED" : ""}`;
+  return [`${name} ${windows.join(" ") || "no windows"} read ${age}m ago${capped ? " CAPPED" : ""}`];
  });
  return parts.join("; ");
 }
