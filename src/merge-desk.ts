@@ -93,7 +93,10 @@ export interface MergeDeskContext extends DispatchDeps {
  post?: (content: string, label: string, files?: readonly DiscordFile[], embeds?: readonly { description: string }[]) => Promise<string>;
  /** Spawn a detached run-node (the resume-for-close); returns its PID. */
  spawn?: (nodeId: string, repo: string, root: number, generation: number) => Promise<number | null>;
+ sleep?: (ms: number) => Promise<void>;
 }
+
+const WAITS_FOR_MERGEABILITY_RECOMPUTED_AFTER_BASE_MOVED_MS = [2_000, 4_000, 8_000] as const;
 
 export interface MergeDeskResult {
  cards: string[];
@@ -310,6 +313,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
  const github = ctx.github ?? deskPort(ctx.config, map);
  const repo = map.repo;
  const result: MergeDeskResult = { cards: [], merged: [], resumed: [], parked: [], pending: [], errors: [] };
+ const sleep = ctx.sleep ?? ((ms: number) => Bun.sleep(ms));
  let announcer: DiscordAnnouncer | undefined;
  const post =
   ctx.post ??
@@ -622,7 +626,12 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    await park(row, `awaiting merge with no ${changeRequestNoun(repo)} recorded — journal and ${forgeName(repo)} disagree`, `node ${row.nodeId}`);
    return;
   }
-  const pr = await github.getPr(repo, row.prNumber, token);
+  let pr = await github.getPr(repo, row.prNumber, token);
+  for (const ms of WAITS_FOR_MERGEABILITY_RECOMPUTED_AFTER_BASE_MOVED_MS) {
+   if (pr.state !== "open" || pr.mergeState !== "pending") break;
+   await sleep(ms);
+   pr = await github.getPr(repo, row.prNumber, token);
+  }
   const cr = changeRequestLabel(repo, pr.iid);
   const title = pr.webUrl.length > 0 ? `${cr} ${pr.webUrl}` : cr;
 
