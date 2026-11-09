@@ -109,9 +109,6 @@
     },
     "@typescript-eslint/prefer-nullish-coalescing": {
       "count": 1
-    },
-    "ranger/no-comments": {
-      "count": 1
     }
   },
   "src/config.ts": {

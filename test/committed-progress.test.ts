@@ -1,12 +1,14 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
-import { readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCmd } from "../src/exec.ts";
 import { FencedError, Journal } from "../src/journal.ts";
 import { runNode } from "../src/worker.ts";
-import { checkpointNode, confirmPreservedProgress, nodeCheckpoint, preserveNodeProgress, progressRemote, reconcileNodeProgress } from "../src/node-progress.ts";
+import { checkpointNode, confirmPreservedProgress, nodeCheckpoint, preserveNodeProgress, preserveUnmergedClosure, progressRemote, reconcileNodeProgress } from "../src/node-progress.ts";
 import type { ImplementContext } from "../src/implement.ts";
 import { implementWorker, restoreEnv, rig, type Rig } from "./implement-rig.ts";
+import { GIT_ENV } from "./support.ts";
 import { eligibleCodexReading } from "./fixtures/substrate-readings.ts";
 
 const rigs: Rig[] = [];
@@ -190,6 +192,66 @@ test("resume tests and publishes a local descendant before reviewing the stale P
  expect(reviewed).toEqual([sha]);
  expect(r.journal.listNodeEvents("acme/widgets", "20").some(event => event.kind === "pushed" && event.detail?.includes(old) && event.detail.includes(sha))).toBe(true);
  expect(nodeCheckpoint(context(r))?.evidence.every(evidence => evidence.sha === sha)).toBe(true);
+});
+
+async function squashMerge(r: Rig, branch: string): Promise<string> {
+ const dir = mkdtempSync(join(tmpdir(), "ranger-squash-"));
+ const git = async (args: string[]) => {
+  const result = await runCmd("git", args, { cwd: dir, env: { ...process.env, ...GIT_ENV } });
+  if (result.code !== 0) throw new Error(result.stderr);
+  return result.stdout.trim();
+ };
+ try {
+  await git(["clone", "--branch", "main", r.origin, "."]);
+  await git(["fetch", "origin", `refs/heads/${branch}`]);
+  await git(["merge", "--squash", "FETCH_HEAD"]);
+  await git(["commit", "-m", `squash ${branch}`]);
+  const squash = await git(["rev-parse", "HEAD"]);
+  await git(["push", "origin", "HEAD:refs/heads/main"]);
+  await runCmd("git", ["update-ref", "-d", `refs/heads/${branch}`], { cwd: r.origin });
+  return squash;
+ } finally { rmSync(dir, { recursive: true, force: true }); }
+}
+
+async function markSquashMerged(r: Rig, squash: string): Promise<void> {
+ const stored = r.github.prs.get(1);
+ if (stored === undefined) throw new Error("missing PR #1");
+ stored.merged = true;
+ stored.state = "closed";
+ stored.mergedSha = squash;
+ stored.mergedBy = "jcfischer";
+}
+
+test("a squash-merged PR that already holds every worktree change closes without a push", async () => {
+ const r = await rig({}); rigs.push(r);
+ expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+ const ctx = context(r);
+ const here = await git(ctx.worktree, ["rev-parse", "HEAD"]);
+ const squash = await squashMerge(r, ctx.branch);
+ expect(squash).not.toBe(here);
+ await markSquashMerged(r, squash);
+ const pr = await r.github.getPr("acme/widgets", 1);
+ expect(pr.mergeCommitSha).toBe(squash);
+ await preserveUnmergedClosure(ctx, pr);
+ expect(await r.github.sha(ctx.branch)).toBe("");
+ expect(await git(ctx.worktree, ["rev-parse", "HEAD"])).toBe(here);
+ expect(r.journal.listNodeEvents("acme/widgets", "20").some(event => event.kind === "progress-preserved")).toBe(false);
+});
+
+test("a squash-merged PR that lacks a worktree change still parks on the preserved progress", async () => {
+ const r = await rig({}); rigs.push(r);
+ expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+ const ctx = context(r);
+ const squash = await squashMerge(r, ctx.branch);
+ await markSquashMerged(r, squash);
+ writeFileSync(join(ctx.worktree, "not-merged.txt"), "work the merged PR lacks\n");
+ await git(ctx.worktree, ["add", "not-merged.txt"]);
+ await git(ctx.worktree, ["commit", "-m", "work after the squash merge"]);
+ const here = await git(ctx.worktree, ["rev-parse", "HEAD"]);
+ const pr = await r.github.getPr("acme/widgets", 1);
+ await expect(preserveUnmergedClosure(ctx, pr)).rejects.toThrow("additional committed progress");
+ expect(await r.github.sha(ctx.branch)).toBe(here);
+ expect(await git(ctx.worktree, ["rev-parse", "HEAD"])).toBe(here);
 });
 
 for (const graphClosed of [false, true]) test(`a merged PR preserves newer local progress before closure cleanup (graph closed: ${graphClosed})`, async () => {
