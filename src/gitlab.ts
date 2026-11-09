@@ -21,6 +21,7 @@ export class GitLabReadError extends OperationFailure {
  }
 }
 
+const COMPUTING = new Set(["checking", "unchecked", "preparing"]);
 const PENDING = new Set(["checking", "unchecked", "preparing", "approvals_syncing", "ci_still_running", "ci_must_pass"]);
 const BLOCKED = new Set([
  "not_approved", "discussions_not_resolved", "draft_status", "blocked_status", "not_open", "requested_changes",
@@ -92,6 +93,7 @@ function changeRequest(raw: unknown, endpoint: string): { mr: ChangeRequest; sam
    baseRef: string(r.target_branch, endpoint, "target_branch"),
    mergeState: gitlabMergeState(detail),
    mergeDetail: detail,
+   ...(COMPUTING.has(detail) ? { mergeabilityComputing: true as const } : {}),
    webUrl: string(r.web_url, endpoint, "web_url"),
    author: username(r.author, endpoint, "author"),
    title: string(r.title, endpoint, "title"),

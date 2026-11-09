@@ -132,6 +132,13 @@ describe("GitLab detailed merge status", () => {
    expect((await port.getPr(repo, 7, token)).mergeState).toBe(expected);
   });
  }
+ const computing = { checking: true, unchecked: true, preparing: true, approvals_syncing: false, ci_still_running: false, ci_must_pass: false, mergeable: false };
+ for (const [value, flagged] of Object.entries(computing)) {
+  test(`${value} ${flagged ? "is" : "is not"} mergeability still computing`, async () => {
+   const { port, token } = await setup(() => response({ ...fixture.mr, detailed_merge_status: value }));
+   expect((await port.getPr(repo, 7, token)).mergeabilityComputing).toBe(flagged ? true : undefined);
+  });
+ }
 });
 
 describe("GitLab head pipeline trust", () => {

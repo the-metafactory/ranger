@@ -792,7 +792,7 @@ describe("mergeability still computing after a merge moved the base", () => {
   const gh = fakeGitHub({ comments: [review(CERTIFIED)], ci: GREEN });
   const get = gh.github.getPr;
   let reads = 0;
-  gh.github.getPr = async (...args) => ({ ...await get(...args), ...(reads++ < pendingReads ? { mergeState: "pending" as const } : {}) });
+  gh.github.getPr = async (...args) => ({ ...await get(...args), ...(reads++ < pendingReads ? { mergeState: "pending" as const, mergeabilityComputing: true as const } : {}) });
   const waits: number[] = [];
   const run = () => runMergeDesk({
    config: r.config, journal: r.journal, map: r.config.maps[0], token: "unused", botIdentity: BOT, github: gh.github,
@@ -819,4 +819,22 @@ describe("mergeability still computing after a merge moved the base", () => {
    expect(gh.merges).toEqual([]);
   } finally { r.close(); }
  });
+});
+
+test("a PR pending on something other than mergeability is not re-read", async () => {
+ const r = rig();
+ try {
+  r.journal.updateWorker("96", GAME, { status: "awaiting-merge", outcome: null });
+  const gh = fakeGitHub({ comments: [review(CERTIFIED)], ci: GREEN });
+  const get = gh.github.getPr;
+  gh.github.getPr = async (...args) => ({ ...await get(...args), mergeState: "pending" as const, mergeDetail: "ci_still_running" });
+  const waits: number[] = [];
+  const result = await runMergeDesk({
+   config: r.config, journal: r.journal, map: r.config.maps[0], token: "unused", botIdentity: BOT, github: gh.github,
+   post: async () => "msg", spawn: async () => 4242, sleep: async (ms) => { waits.push(ms); },
+  });
+  expect(result).toMatchObject({ merged: [], pending: ["96"] });
+  expect(waits).toEqual([]);
+  expect(gh.calls.filter((c) => c === "getPr")).toHaveLength(1);
+ } finally { r.close(); }
 });

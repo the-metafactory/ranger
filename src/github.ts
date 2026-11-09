@@ -107,6 +107,7 @@ function toChangeRequest(raw: unknown): ChangeRequest {
   baseRef: String(base.ref ?? ""),
   mergeState: githubMergeState(r.mergeable, r.mergeable_state),
   mergeDetail: githubMergeState(r.mergeable, r.mergeable_state) === "pending" ? "GitHub is still computing mergeability" : `mergeable=${typeof r.mergeable === "boolean" ? r.mergeable : null}, state=${String(r.mergeable_state ?? "unknown")}`,
+  ...(githubMergeState(r.mergeable, r.mergeable_state) === "pending" ? { mergeabilityComputing: true as const } : {}),
   mergeCommitSha:
    typeof r.merge_commit_sha === "string" ? r.merge_commit_sha : null,
   mergedBy: mergedBy === null ? null : String(mergedBy.login ?? ""),

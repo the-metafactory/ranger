@@ -628,7 +628,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   }
   let pr = await github.getPr(repo, row.prNumber, token);
   for (const ms of WAITS_FOR_MERGEABILITY_RECOMPUTED_AFTER_BASE_MOVED_MS) {
-   if (pr.state !== "open" || pr.mergeState !== "pending") break;
+   if (pr.state !== "open" || pr.mergeabilityComputing !== true) break;
    await sleep(ms);
    pr = await github.getPr(repo, row.prNumber, token);
   }
