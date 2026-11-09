@@ -366,7 +366,7 @@ describe("the live wrapper (node #66)", () => {
    },
    cwd,
   );
-  const ranger = join(home, "work", "mf", "ranger");
+  const ranger = join(home, ".local", "share", "metafactory", "arc", "repos", "ranger");
   expect(out.argv).toBe(`ARGV --config=${join(ranger, "bunfig.toml")} --no-env-file ${join(ranger, "src", "cli.ts")} tick --config ranger.yaml`);
   expect(out.stdout).not.toContain("HIJACKED");
   expect(out.stdout).not.toContain("FUNC-HIJACK");
@@ -384,7 +384,7 @@ describe("the live wrapper (node #66)", () => {
   // A caller-controlled .env expands \$GH_TOKEN into a name the worker env
   // forwards (SAGE_*): bun's dotenv loading runs after the wrapper's clean-up.
   const { wrapper, home } = stubbedWrapper({ realBun: true });
-  const ranger = join(home, "work", "mf", "ranger");
+  const ranger = join(home, ".local", "share", "metafactory", "arc", "repos", "ranger");
   mkdirSync(join(ranger, "src"), { recursive: true });
   writeFileSync(join(ranger, "bunfig.toml"), "");
   writeFileSync(join(ranger, "src", "cli.ts"), "console.log(JSON.stringify(process.env));\n");
