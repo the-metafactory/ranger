@@ -55,6 +55,12 @@ maps:
     #   probeRetry: PROBE_SELECTION=1 PROBE_FILES={failed} npm run probe   # retry only the failures
     #   probeTimeoutMin: 30
     #   testTimeoutMin: 20   # supervisor test run wall clock, minutes; a suite past it is killed (exit -1)
+    #   # Deploy after every merge ranger sees (its own or yours), once the node
+    #   # closes. It runs in the canonical checkout at the merged base, under the
+    #   # host env without forge tokens, one deploy per repo at a time. A failed
+    #   # deploy is journaled (deploy-failed) and announced; the close stands.
+    #   deploy: arc upgrade ranger --force && launchctl kickstart -k gui/$(id -u)/ch.invisible.ranger-serve
+    #   deployTimeoutMin: 15
     #   # Informational sheet for ranger:needs-eye, after passing final-head probes.
     #   # before = detached merge-base build; after + after2 = final head + noise control.
     #   # {out} is outside the worktree, under the journal directory, per repo/node/SHA.

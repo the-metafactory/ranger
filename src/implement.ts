@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { DiscordAnnouncer } from "./announce.ts";
 import { code, renderCard } from "./card-render.ts";
+import { deployMerged } from "./deploy.ts";
 import { mapKey } from "./maps.ts";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import { exitText, runCmd, type RunOptions, type RunResult } from "./exec.ts";
@@ -3076,6 +3077,36 @@ function logRun(ctx: ImplementContext, label: string, result: RunResult, ended?:
  return null;
 }
 
+async function deployAfterMerge(ctx: ImplementContext, pr: ChangeRequest): Promise<void> {
+ const command = ctx.map.commands.deploy;
+ if (command === undefined) return;
+ const { journal, map } = ctx;
+ const nodeId = ctx.node.ref.id;
+ journal.assertGeneration(nodeId, map.repo, ctx.generation, "deploy the merge");
+ const deployed = await deployMerged({
+  repo: map.repo,
+  command,
+  mergedCheckout: ctx.canonical,
+  timeoutMs: map.commands.deployTimeoutMin * 60_000,
+  journalPath: journal.path,
+  ...(ctx.shellRun === undefined ? {} : { run: ctx.shellRun }),
+ });
+ if (deployed.result !== null) logRun(ctx, `deploy (${command})`, deployed.result);
+ const merged = `${changeRequestLabel(map.repo, pr.iid)} at ${code(map.base)}`;
+ const detail = deployed.status === "deployed" ? `deployed ${merged}` : `deploy of ${merged} FAILED: ${deployed.detail}`;
+ journal.recordEvent(deployed.status === "deployed" ? "deployed" : "deploy-failed", { nodeId, repo: map.repo, detail: detail.slice(0, 400) });
+ const text = renderCard({
+  emoji: deployed.status === "deployed" ? "🚀" : "🔴",
+  status: deployed.status === "deployed" ? "deployed" : "deploy failed",
+  nodeId,
+  title: ctx.node.node.title,
+  meta: [`map: ${mapKey(map)}`],
+  lines: [deployed.status === "deployed" ? `${merged} is live (${code(command)}).` : `${code(command)} for ${merged}: ${deployed.detail}`],
+ });
+ const announce = ctx.announce ?? ((t: string) => DiscordAnnouncer.fromMap(map).post(t, "deploy notice"));
+ await announce(text).catch(() => undefined);
+}
+
 /** After the principal's merge: fast-forward, gated close citing CI, decisions --write. */
 async function closeAfterMerge(
  ctx: ImplementContext,
@@ -3172,6 +3203,8 @@ async function closeAfterMerge(
   const detail = `decisions --write FAILED after close: ${error instanceof Error ? error.message : String(error)}`;
   journal.recordEvent("decisions-failed", { nodeId, repo, detail: detail.slice(0, 400) });
  }
+
+ await deployAfterMerge(ctx, pr);
 
  // The merged branch's worktree is ranger's scratch; drop it.
  await safeGit(["worktree", "remove", "--force", ctx.worktree], {
