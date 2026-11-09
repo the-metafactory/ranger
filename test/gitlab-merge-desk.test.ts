@@ -207,6 +207,7 @@ function rig(opts: { autoMerge?: boolean; repo?: string } = {}) {
   config, journal, map, token: "write-token", botIdentity: BOT, github: port,
   post: async (content) => { posts.push(content); return `msg-${posts.length}`; },
   spawn: async (id) => { spawned.push(id); return 4242; },
+  sleep: async () => {},
  });
  const events = (kind: string) => journal.listNodeEvents(map.repo, "96").filter((e) => e.kind === kind);
  const row = () => journal.getWorker("96", map.repo);

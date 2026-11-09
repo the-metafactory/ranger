@@ -23,6 +23,7 @@ export interface ChangeRequest {
   * still reads `closed` by contract; a consumer must not treat it as abandoned.
   */
  mergeInProgress?: true;
+ mergeabilityComputing?: true;
 }
 
 /** Preserve each lane's existing evidence policy at the adapter boundary. */
