@@ -51,10 +51,28 @@ Scout needs a read-only token for every map. It refuses a map whose token is uns
 
 Autonomous work runs under the machine account, never under the principal's credentials. Two pieces set that up:
 
-- `ops/bin/ranger.example` is the wrapper that every scheduled run goes through. It reads the tokens from the macOS keychain, clears the caller's environment, and starts ranger. Copy it to `~/bin/ranger`, replace `__USER__`, and make it executable. Set `RANGER_DIR` in it to the directory that holds ranger: your checkout, or the arc install directory.
+- `ops/bin/ranger.example` is the wrapper that every scheduled run goes through. It reads the tokens from the macOS keychain, clears the caller's environment, and starts ranger. Copy it to `~/bin/ranger`, replace `__USER__`, and make it executable. `RANGER_DIR` in it names the arc install directory (`~/.local/share/metafactory/arc/repos/ranger`). Keep it there, not on a working checkout: the scheduled jobs run whatever code sits in that directory, so a checkout's open branch or unfinished edits would go live on the next tick.
 - `ops/launchd/` holds the launchd jobs. `ch.invisible.ranger-tick` runs `ranger tick` every 10 minutes. `ch.invisible.ranger-serve` keeps the dashboard running. `ch.invisible.ranger-escalate` sends the daily digest at 07:30 local time. Copy each one to `~/Library/LaunchAgents/`, replace `__USER__`, and load it with `launchctl load`.
 
 Each tick posts escalation cards, then claims frontier nodes and starts their workers, then sweeps for crashed workers. [The walk](docs/walk.md) covers what a tick claims and how each lane ends.
+
+### Deploy a merged change
+
+Live ranger stays on its old code until the arc install is upgraded. After every merge to `main`, including the ones ranger's merge desk makes, run:
+
+```bash
+arc upgrade ranger --force
+launchctl kickstart -k gui/$(id -u)/ch.invisible.ranger-serve
+```
+
+`--force` is needed because a plain `arc upgrade` skips a package whose version has not changed, and ranger's version does not change on every merge. The next tick starts on the new code by itself; the dashboard needs the restart.
+
+The upgrade pulls the install's branch, so the install must track `main`. An install made with `--pin` is detached, and its upgrade fails with "You are not currently on a branch". Put it on `main` once:
+
+```bash
+git -C ~/.local/share/metafactory/arc/repos/ranger fetch origin
+git -C ~/.local/share/metafactory/arc/repos/ranger checkout -B main --track origin/main
+```
 
 ## Commands
 

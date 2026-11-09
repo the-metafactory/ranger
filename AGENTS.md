@@ -10,6 +10,7 @@ Prefer a check over a line here; a rule marked "docs only" has nothing that fail
 | Code says it; comments don't. | `ranger/no-comments` + `eslint/suppressions-guard.ts` | `619568f` (#245, fixed by #318) |
 | A second copy of logic becomes one helper both sites call. | docs only: `jscpd` missed #234, #235, #304 and #311 at 15–50 tokens, and saw #282 only at 15–20 tokens among 45–60 existing clones | — |
 | A PR body or doc claims only what a test or probe shows. | docs only (sage review) | — |
+| After merging a PR here, deploy it: `arc upgrade ranger --force`, then restart `ranger serve` (README, "Deploy a merged change"). Live ranger runs the arc install, never this checkout. | docs only | — |
 
 ## Exceptions
 

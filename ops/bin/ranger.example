@@ -84,7 +84,7 @@ SECURITY="/usr/bin/security"
 GREP="/usr/bin/grep"
 CUT="/usr/bin/cut"
 MKDIR="/bin/mkdir"
-RANGER_DIR="$HOME/work/mf/ranger"
+RANGER_DIR="$HOME/.local/share/metafactory/arc/repos/ranger"
 RANGER_CLI="$RANGER_DIR/src/cli.ts"
 RANGER_LOGS="$HOME/.config/ranger/logs"
 # Isolate gh from the write-capable keyring (the read-only gate's invariant).
