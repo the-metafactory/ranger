@@ -2,6 +2,7 @@ import { resolveNodeSelector, type DispatchDeps } from "./node-dependency.ts";
 import { join } from "node:path";
 import { freshClaimRefusal } from "./candidates.ts";
 import { graphReadToken, laneCredentialRefusal, type ReadGate } from "./forge-lanes.ts";
+import { WRITE_TOKEN_SOURCE } from "./github-usage.ts";
 import type { ResolvedToken } from "./token-gate.ts";
 import { budgetPolicy } from "./budget.ts";
 import { ClaimLockBusy, withClaimLock } from "./claim-lock.ts";
@@ -154,7 +155,7 @@ function frontierArgs(ctx: BuildNowContext) {
   journal: ctx.journal,
   repo: ctx.map.repo,
   root: ctx.map.root,
-  token: ctx.graphToken ?? { token: ctx.token, source: "write-token" },
+  token: ctx.graphToken ?? { token: ctx.token, source: WRITE_TOKEN_SOURCE },
   policy: budgetPolicy(ctx.config),
   maxAgeMs: ctx.config.budget.frontierMaxAgeMin * 60_000,
   now: ctx.now?.() ?? new Date(),

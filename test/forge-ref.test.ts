@@ -177,7 +177,7 @@ describe("ForgeRef config and identity seam", () => {
    await expect(buildNow("12", { ...base, configPath: "/unused", readFrontier: forbidden, announce: forbidden, claim: forbidden,
     spawnRunNode: forbidden })).rejects.toThrow("no GitLab credentials for");
    expect(await runNode("12", { ...base, readGate: forbidden })).toMatchObject({ status: "refused" });
-   expect(await readRepoSentinel(gitlab, "fixture")).toBeNull();
+   expect(await readRepoSentinel(gitlab, "fixture", "RANGER_READONLY_FIXTURE")).toBeNull();
    expect(calls).toBe(0);
    expect(journal.listWorkers()).toEqual([]);
    expect(journal.listEvents()).toEqual([]);

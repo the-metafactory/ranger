@@ -3,6 +3,7 @@ export { quietHostGate, queuedResumeStale, queueSpawnGate, whenFreeQueues, queue
 import { resolveNodeSelector, workerPreflight, type DispatchDeps } from "./node-dependency.ts";
 import { OperationFailure } from "./operation-outcome.ts";
 import { reviewThrottle } from "./budget.ts";
+import { WRITE_TOKEN_SOURCE } from "./github-usage.ts";
 import { activeRecovery, nodeRecoveryScope, recoveryHold, resetRecovery } from "./recovery.ts";
 import { startOwnedWorker, reservationPending } from "./node-ownership.ts";
 import { join } from "node:path";
@@ -251,7 +252,7 @@ export async function processResumeQueue(
    continue;
   }
   try {
-   const node = await graphNode(entry.repo, entry.nodeId, state.graphToken ?? { token: state.token, source: "write-token" },
+   const node = await graphNode(entry.repo, entry.nodeId, state.graphToken ?? { token: state.token, source: WRITE_TOKEN_SOURCE },
     { timeoutMs: GRAPH_CALL_TIMEOUT_MS });
    if (node.status === "closed") { drop("node is closed"); continue; }
    if (row.prNumber !== null) {

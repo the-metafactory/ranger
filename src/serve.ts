@@ -74,6 +74,7 @@ import { cachedFrontier } from "./frontier-cache.ts";
 import { cachedRootAuthor } from "./root-author.ts";
 import { type FrontierEntry, graphFrontier, RateLimitError } from "./graph.ts";
 import { runCmd } from "./exec.ts";
+import { meteredGh } from "./github-usage.ts";
 import { briefHoldReason, classify, classifyFrontier, type ClassifiedNode, loadProbeRegistry } from "./route.ts";
 import { liveSession, substrateUsageViews, type SubstrateUsageView } from "./substrate-usage.ts";
 import { resolveReadOnlyToken, assertReadOnlyToken, gatedEnv, gitlabApiRead, tokenBatch, type TokenBatch, type ResolvedToken } from "./token-gate.ts";
@@ -1682,7 +1683,7 @@ export class ServeReader {
     keep(`deferred: ${token.source} cooling down until ${cooling.until.toISOString()} (${cooling.reason})`);
     continue;
    }
-   const budget = isGithubRepo(map.repo) ? await readGraphqlBudget(token.token) : null;
+   const budget = isGithubRepo(map.repo) ? await readGraphqlBudget(token.token, token.source) : null;
    if (budget !== null && budget.remaining < this.config.budget.graphqlFloor) {
     keep(`deferred: GraphQL allowance ${budget.remaining}/${budget.limit} under the floor of ${this.config.budget.graphqlFloor}`);
     continue;
@@ -1767,7 +1768,7 @@ async function restRead(
  }
  const gated = gatedEnv(token.token);
  try {
-  const result = await runner("gh", ["api", path, ...flags], { env: gated.env, timeoutMs: 15_000 });
+  const result = await meteredGh({ component: "serve-read", source: token.source }, runner)("gh", ["api", path, ...flags], { env: gated.env, timeoutMs: 15_000 });
   if (result.code !== 0) return null;
   try {
    return JSON.parse(result.stdout) as unknown;
@@ -1940,7 +1941,7 @@ export async function verifyChecksAs(
    return null;
   }
  }
- const result = await runner(
+ const result = await meteredGh({ component: "serve-merge-checks", source: "merge-environment" }, runner)(
   "gh",
   ["api", `repos/${repo}/commits/${sha}/check-runs?filter=latest&per_page=100`, "--paginate", "--slurp"],
   { env, timeoutMs: 15_000 },

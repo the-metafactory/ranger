@@ -4,6 +4,7 @@ import { isGitLabRateLimit, runReadRetryingTransient } from "./transient.ts";
 import { gatedEnv, assertGitLabReadGrant, type ResolvedToken } from "./token-gate.ts";
 import { glabConfigEnvAsync } from "./glab-config-dir.ts";
 import { runCmd } from "./exec.ts";
+import { meteredOpaque } from "./github-usage.ts";
 import { parseForgeRef, qualifiedRepo, normalizeNodeId, type ForgeRef } from "./forge-ref.ts";
 
 /**
@@ -217,7 +218,8 @@ export async function callGraph(
       somaRepo(ref),
       "--json",
     ];
-    const runner = opts.runner ?? backend.runner;
+    const selected = opts.runner ?? backend.runner;
+    const runner = ref.forge === "github" ? meteredOpaque({ component: `soma-graph-${verb}`, source: token.source }, selected) : selected;
     const result = await runner("soma", cliArgs, {
       cwd: opts.cwd,
       timeoutMs: opts.timeoutMs ?? backend.timeoutMs,

@@ -68,7 +68,8 @@ import {
 } from "./outcomes.ts";
 import { GRAPH_CALL_TIMEOUT_MS, graphNode, somaRepo, type NodeResult } from "./graph.ts";
 import { finishClosedElsewhere } from "./closed-elsewhere.ts";
-import { budgetedRead, budgetPolicy, clearThrottleStrikes, MAX_REVIEW_THROTTLES_IN_A_ROW, recordThrottle, reviewCooldownScope, reviewThrottle } from "./budget.ts";
+import { WRITE_TOKEN_SOURCE } from "./github-usage.ts";
+import { budgetedRead, budgetPolicy, clearThrottleStrikes, MAX_REVIEW_THROTTLES_IN_A_ROW, recordThrottle, reviewCooldownScope, reviewThrottle, reviewTokenSource } from "./budget.ts";
 import { GraphAddUnattached, closeTimeoutForNode, graphAdd, graphClose, graphDecisions, graphLink, type AddSpec, type CloseResult } from "./graph-write.ts";
 import { FixNodeLockBusy, withFixNodeLock } from "./fix-node-lock.ts";
 import { assertFilable, codeCommentSpec, foundByProbeSpec, landminesInDiff, scribeFile, splitOutOfReviewSpec, type Provenance, type ScribeGraph } from "./scribe.ts";
@@ -125,7 +126,7 @@ export type Reviewer = (
  repo: string,
  prNumber: number,
  readOnlyToken: string,
- opts: { substrate: SubstrateName; nice?: number; reviewAuthor?: string },
+ opts: { substrate: SubstrateName; nice?: number; reviewAuthor?: string; tokenSource?: string },
 ) => Promise<ReviewVerdict>;
 
 export type WorkerRun = (prompt: string, opts: RunOptions) => Promise<RunResult>;
@@ -1015,7 +1016,7 @@ function machineFixNodeGraph(ctx: ImplementContext): FixNodeGraph {
 
 function machineScribeGraph(ctx: ImplementContext): ScribeGraph {
  const repo = ctx.map.repo;
- const credential = { token: ctx.token, source: "write-token" };
+ const credential = { token: ctx.token, source: WRITE_TOKEN_SOURCE };
  return {
   add: (parent, spec) => graphAdd(repo, parent, spec, ctx.token, { timeoutMs: GRAPH_CALL_TIMEOUT_MS }),
   link: (node, parent, blockedBy) => graphLink(repo, node, parent, ctx.token, { timeoutMs: GRAPH_CALL_TIMEOUT_MS, blockedBy }),
@@ -1371,7 +1372,7 @@ export function withArtifactFinding<R extends { majors: number; body: string }>(
 
 /** The credential the lane's graph reads run under: the gated one a GitLab map needs, else the write token. */
 function graphCredential(ctx: ImplementContext): ResolvedToken {
- return ctx.graphToken ?? { token: ctx.token, source: "write-token" };
+ return ctx.graphToken ?? { token: ctx.token, source: WRITE_TOKEN_SOURCE };
 }
 
 /**
@@ -1828,6 +1829,7 @@ async function runImplementFlow(ctx: ImplementContext): Promise<ImplementOutcome
         substrate: reviewSubstrate,
         nice: config.workers.niceness,
         reviewAuthor: botIdentity,
+        tokenSource: reviewTokenSource(config, repo),
        }),
       };
      } catch (error) {

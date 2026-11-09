@@ -3,10 +3,10 @@ import { forgeOutcome } from "./transient.ts";
 import { createSign } from "node:crypto";
 import type { ChangeRequest, MergeState, MergeOutcome, RebaseOutcome, CiFailedRun, CiPurpose, CiVerdict, CommentReaction, IssueComment, LabeledIssue } from "./forge.ts";
 import { githubCiVerdict } from "./github-ci.ts";
-import { runCmd } from "./exec.ts";
 import { runReadRetryingTransient } from "./transient.ts";
 import { writeEnv } from "./identity.ts";
 import { GitHubApiBaseUrlSchema } from "./github-api-base.ts";
+import { explicitMethod, hasRequestBody, meteredGh, WRITE_TOKEN_SOURCE } from "./github-usage.ts";
 
 /**
  * The implement lane's pull-request surface (design §4, #23): every call is a
@@ -25,22 +25,11 @@ export class GitHubError extends OperationFailure {
 
 const GH_TIMEOUT_MS = 60_000;
 
-/** gh api flags that make the request a write (a method other than GET, or a body). */
-const WRITE_FLAGS = new Set(["-f", "-F", "--field", "--raw-field", "--input"]);
+const APP_INSTALLATION_SOURCE = "github-app-installation";
 
 /** A plain GET is safe to repeat; anything with a body or another method is not. */
 export function isReadRequest(args: string[]): boolean {
- for (let i = 0; i < args.length; i++) {
-  const a = args[i];
-  if (WRITE_FLAGS.has(a) || a.startsWith("--field=") || a.startsWith("--raw-field=") || a.startsWith("--input=")) return false;
-  if (a === "-X" || a === "--method") {
-   if ((args[i + 1] ?? "").toUpperCase() !== "GET") return false;
-  } else if (a.startsWith("--method=") || a.startsWith("-X")) {
-   const method = a.startsWith("--method=") ? a.slice(9) : a.slice(2);
-   if (method.length > 0 && method.toUpperCase() !== "GET") return false;
-  }
- }
- return true;
+ return !hasRequestBody(args) && (explicitMethod(args) ?? "GET").toUpperCase() === "GET";
 }
 
 export interface CheckRun {
@@ -63,15 +52,15 @@ export interface CommitStatus {
 }
 
 /** One `gh api` request; its trimmed stdout. */
-async function ghApiText(token: string, args: string[], label: string, acceptError?: (status: number, response: string) => boolean): Promise<string> {
+async function ghApiText(token: string, args: string[], label: string, acceptError?: (status: number, response: string) => boolean, source = WRITE_TOKEN_SOURCE): Promise<string> {
  const gated = writeEnv(token, { GH_ENTERPRISE_TOKEN: token, GITHUB_ENTERPRISE_TOKEN: token });
  try {
+  const metered = meteredGh({ component: "forge-port", source });
+  const options = { env: gated.env, timeoutMs: GH_TIMEOUT_MS };
   // Reads retry a transient GitHub error; writes run once (a timed-out POST may have landed).
-  const run = isReadRequest(args) ? runReadRetryingTransient : runCmd;
-  const result = await run("gh", ["api", ...args], {
-   env: gated.env,
-   timeoutMs: GH_TIMEOUT_MS,
-  });
+  const result = isReadRequest(args)
+   ? await runReadRetryingTransient("gh", ["api", ...args], options, { runner: metered })
+   : await metered("gh", ["api", ...args], options);
   const status = Number(/^HTTP\/\S+ (\d{3})\b/m.exec(result.stdout)?.[1]);
   if (acceptError?.(status, result.stdout)) return "";
   if (result.code !== 0) {
@@ -90,8 +79,9 @@ async function ghApi(
  token: string,
  args: string[],
  label: string,
+ source = WRITE_TOKEN_SOURCE,
 ): Promise<unknown> {
- const raw = await ghApiText(token, args, label);
+ const raw = await ghApiText(token, args, label, undefined, source);
  if (raw.length === 0) return null;
  try {
   return JSON.parse(raw) as unknown;
@@ -304,7 +294,7 @@ export async function rebasePr(
  const gated = writeEnv(token);
  let response;
  try {
-  response = await runCmd("gh", ["api", `repos/${repo}/pulls/${number}/update-branch`, "--method", "PUT", "-f", `expected_head_sha=${sha}`, "--include"], { env: gated.env, timeoutMs: GH_TIMEOUT_MS });
+  response = await meteredGh({ component: "forge-port", source: WRITE_TOKEN_SOURCE })("gh", ["api", `repos/${repo}/pulls/${number}/update-branch`, "--method", "PUT", "-f", `expected_head_sha=${sha}`, "--include"], { env: gated.env, timeoutMs: GH_TIMEOUT_MS });
  } finally {
   gated.cleanup();
  }
@@ -681,7 +671,7 @@ function apiAtBase(apiBaseUrl: string, request: GhApi = ghApi): GhApi {
  */
 export function appChecksClient(options: AppChecksOptions): AppChecks {
  const apiBaseUrl = GitHubApiBaseUrlSchema.parse(options.apiBaseUrl);
- const api = apiAtBase(apiBaseUrl, options.api);
+ const api = apiAtBase(apiBaseUrl, options.api ?? ((token, args, label) => ghApi(token, args, label, APP_INSTALLATION_SOURCE)));
  const now = options.now ?? Date.now;
  const installations = new Map(Object.entries(options.installations).map(([owner, id]) => [owner.toLowerCase(), id]));
  const tokens = new Map<number, InstallationToken>();

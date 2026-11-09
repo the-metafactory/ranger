@@ -5,6 +5,7 @@ import { join } from "node:path";
 import type { RangerAuthConfig, RangerConfig } from "./config.ts";
 import { principalLoginForRepo } from "./config.ts";
 import { runCmd, type RunOptions } from "./exec.ts";
+import { meteredGh, WRITE_TOKEN_SOURCE } from "./github-usage.ts";
 import { parseForgeRef, qualifiedRepo } from "./forge-ref.ts";
 import { glabConfigEnv } from "./glab-config-dir.ts";
 import { workerEnvPasses } from "./untrusted-env.ts";
@@ -184,7 +185,7 @@ export async function loginForToken(
  if (ref.forge === "gitlab") return gitlabLogin(await gitlabGet(token, repo, "/user", runner, opts));
  const gated = writeEnvForRepo(repo, token, opts.env);
  try {
-  const result = await runner("gh", ["api", "/user", "--jq", ".login"], {
+  const result = await meteredGh({ component: "write-identity", source: WRITE_TOKEN_SOURCE }, runner)("gh", ["api", "/user", "--jq", ".login"], {
    ...opts,
    timeoutMs: opts.timeoutMs ?? 60_000,
    env: gated.env,
