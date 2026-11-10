@@ -1,3 +1,5 @@
+import { hasMergeConflict } from "./forge.ts";
+import { conflictResume } from "./resume-priority.ts";
 import { quietHostGate, queuedResumeStale, queueSpawnGate, whenFreeQueues, queueEntryGate } from "./resume-gates.ts";
 export { quietHostGate, queuedResumeStale, queueSpawnGate, whenFreeQueues, queueEntryGate, type QueueEntryGate } from "./resume-gates.ts";
 import { resolveNodeSelector, workerPreflight, type DispatchDeps } from "./node-dependency.ts";
@@ -115,6 +117,7 @@ export async function startResumeNode(
  const spawner = ctx.spawnRunNode ?? spawnRunNodeDetached;
  let spawnError: Error | undefined;
  const pid = await startOwnedWorker({ journal, row, now,
+  ...(options.queued !== undefined && conflictResume(options.queued) ? { status: "running" as const, patch: { phase: "review" as const, outcome: null, mergeMessageId: null } } : {}),
   preflight: () => workerPreflight(row, map, { ...ctx, nodeSelector: resolveNodeSelector(ctx) }),
   onSpawnFailure: error => { spawnError = error; },
   spawn: generation => spawner({ nodeId, repo: map.repo, root: map.root, generation,
@@ -173,6 +176,7 @@ export async function resumeNode(nodeId: string, selector: string | undefined, c
 }
 
 export interface ResumeQueueMap {
+ botIdentity?: string;
  map: RangerMapConfig;
  token?: string;
  /** The credential graph reads run under (`graphReadToken`); the write token when unset. */
@@ -186,14 +190,15 @@ export interface ResumeQueueMap {
 /** Caller holds the claim lease; only successful starts reserve implement capacity. */
 export async function processResumeQueue(
  ctx: ResumeContext & { github: Pick<ForgePort, "getPr"> }, maps: ResumeQueueMap[],
- reservations: Set<ImplementLane>, owned: OwnedCheck,
-): Promise<void> {
+ reservations: Set<ImplementLane>, owned: OwnedCheck, conflictsOnly = false,
+): Promise<ResumeOutcome[]> {
+ const started: ResumeOutcome[] = [];
  const { journal, config } = ctx;
  const waiting = new Set<ImplementLane>();
  // One reading per tick, taken only when an entry reaches its host gate.
  let host: HostLoadReading | undefined;
  const readHost = () => (host ??= (ctx.hostLoad ?? realHostLoad)());
- for (const entry of journal.listResumeQueue()) {
+ for (const entry of journal.listResumeQueue().filter(e => conflictsOnly === (conflictResume(e)))) {
   const state = maps.find(m => m.map.repo === entry.repo && m.map.root === entry.root);
   const map = state?.map;
   const drop = (reason: string) => {
@@ -206,7 +211,7 @@ export async function processResumeQueue(
     detail: `queued resume #${entry.nodeId} deferred: ${reason}` });
    if (failedStart) state?.errors.push(`queued resume #${entry.nodeId}: ${reason}`);
    if (failedStart && journal.recordResumeStartFailure(entry, reason)) return;
-   waiting.add(entry.lane);
+   if (!conflictResume(entry)) waiting.add(entry.lane);
   };
   const row = journal.getWorker(entry.nodeId, entry.repo);
   const gate = queueEntryGate(entry, map === undefined ? undefined : { walk: map.walk, lane: implementLane(map) }, row,
@@ -232,8 +237,9 @@ export async function processResumeQueue(
   }
   // The lane holder is read at the start itself (startResumeNode), after the
   // forge checks, so a held lane still drops a closed node or merged PR.
-  if (spawnGate(journal, config, ctx.now?.() ?? new Date(), entry.lane) !== null) {
-   waiting.add(entry.lane);
+  const spawnRefusal = spawnGate(journal, config, ctx.now?.() ?? new Date(), entry.lane);
+  if (spawnRefusal !== null) {
+   defer(spawnRefusal);
    continue;
   }
   // A queued resume waits for a quiet host: not a failed start, and it holds
@@ -255,10 +261,23 @@ export async function processResumeQueue(
    const node = await graphNode(entry.repo, entry.nodeId, state.graphToken ?? { token: state.token, source: WRITE_TOKEN_SOURCE },
     { timeoutMs: GRAPH_CALL_TIMEOUT_MS });
    if (node.status === "closed") { drop("node is closed"); continue; }
+   if (conflictResume(entry)) {
+    const reason = node.blockedBy.some(b => b.status !== "closed") ? "node has an open blocker"
+     : node.assignees.some(a => a.toLowerCase() !== state.botIdentity?.toLowerCase()) ? "node has another active claim"
+     : map.walk !== "full" ? "conflict repair requires walk: full"
+     : map.skip.includes(entry.nodeId) || (map.nodes !== undefined && !map.nodes.includes(entry.nodeId)) ? "node is excluded by map policy"
+     : journal.hasVeto(entry.nodeId, entry.repo) ? "node is vetoed" : null;
+    if (reason !== null) { defer(reason); continue; }
+   }
    if (row.prNumber !== null) {
     const pr = await ctx.github.getPr(entry.repo, row.prNumber, state.token);
     if (pr.state === "merged" || pr.state === "closed") {
      drop(`${changeRequestNoun(entry.repo)} is ${pr.state === "merged" ? "merged" : "closed"}`);
+     continue;
+    }
+    if (conflictResume(entry) && !hasMergeConflict(pr)) {
+     if (entry.reason === "merge-conflict-resume") journal.setResumeReason(entry, null);
+     else drop("PR no longer conflicts");
      continue;
     }
     if (await unchangedHeadPark(row, pr.headSha, journal)) {
@@ -276,8 +295,11 @@ export async function processResumeQueue(
    const resumed = await startResumeNode(entry.nodeId, map, ctx, owned, { queued: entry });
    switch (resumed.kind) {
     case "dropped": break;
-    case "queued": waiting.add(entry.lane); break;
+    case "queued":
+     defer(journal.laneHolder(entry.lane) === null ? "spawn gate changed before dispatch" : "implement lane is occupied");
+     break;
     case "started":
+     started.push(resumed);
      waiting.add(entry.lane);
      if (startsImplementSession(row)) reservations.add(implementLane(map));
      break;
@@ -286,4 +308,5 @@ export async function processResumeQueue(
    defer(`start failed: ${error instanceof Error ? error.message : String(error)}`, !(error instanceof OperationFailure && ["infrastructure", "dependency"].includes(error.outcome.kind)) && !transientGate(error));
   }
  }
+ return started;
 }

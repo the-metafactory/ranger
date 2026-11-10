@@ -1,3 +1,4 @@
+import { hasMergeConflict } from "./forge.ts";
 import { workerPreflight, type DispatchDeps } from "./node-dependency.ts";
 import { startOwnedWorker } from "./node-ownership.ts";
 import { implementLane } from "./lanes.ts";
@@ -94,6 +95,7 @@ export interface MergeDeskContext extends DispatchDeps {
  /** Spawn a detached run-node (the resume-for-close); returns its PID. */
  spawn?: (nodeId: string, repo: string, root: number, generation: number) => Promise<number | null>;
  sleep?: (ms: number) => Promise<void>;
+ conflicts?: "collect" | "skip";
 }
 
 const WAITS_FOR_MERGEABILITY_RECOMPUTED_AFTER_BASE_MOVED_MS = [2_000, 4_000, 8_000] as const;
@@ -388,7 +390,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   * step, a base merge pass and a new round, or a CI fix pass. A posted merge
   * card is withdrawn first, so a stale "merge needed" never stands.
   */
- async function sendBack(row: WorkerRow, why: string, title: string, noCiHead?: string): Promise<void> {
+ async function sendBack(row: WorkerRow, why: string, title: string, noCiHead?: string, enqueue = false): Promise<void> {
   if (ctx.spawn === undefined || row.prNumber === null) return;
   const cr = changeRequestLabel(repo, row.prNumber);
   if (row.mergeMessageId !== null) {
@@ -414,6 +416,10 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   // probes): it waits for the implement lane like any other start. The stale
   // card is already gone.
   const lane = implementLane(map);
+  if (enqueue) {
+   journal.enqueueResume({ repo, root: map.root, nodeId: row.nodeId, lane, reason: "merge-conflict" }, ctx.now?.() ?? new Date());
+   return;
+  }
   const holder = journal.laneHolder(lane, { nodeId: row.nodeId, repo });
   if (holder !== null) {
    result.pending.push(row.nodeId);
@@ -632,6 +638,13 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    await sleep(ms);
    pr = await github.getPr(repo, row.prNumber, token);
   }
+  if (ctx.conflicts === "collect") {
+   if (row.status === "awaiting-merge" && hasMergeConflict(pr)) {
+    await sendBack(row, `${changeRequestLabel(repo, pr.iid)} conflicts with ${map.base}`, changeRequestLabel(repo, pr.iid), undefined, true);
+   }
+   return;
+  }
+  if (ctx.conflicts === "skip" && hasMergeConflict(pr)) return;
   const cr = changeRequestLabel(repo, pr.iid);
   const title = pr.webUrl.length > 0 ? `${cr} ${pr.webUrl}` : cr;
 

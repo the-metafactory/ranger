@@ -1,3 +1,4 @@
+import { conflictResume } from "./resume-priority.ts";
 import { workerPreflight, type DispatchDeps } from "./node-dependency.ts";
 import { startOwnedWorker } from "./node-ownership.ts";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
@@ -28,6 +29,7 @@ export function probeRequeueCandidates(journal: Journal, maps: readonly RangerMa
   const map = maps.find((map) => map.repo === row.repo && map.root === row.root);
   if (map === undefined || map.walk !== "full" || map.commands.probe === undefined ||
    map.skip.includes(row.nodeId) || (map.nodes !== undefined && !map.nodes.includes(row.nodeId)) ||
+   conflictResume(journal.getResume(row.repo, row.nodeId) ?? {}) ||
    journal.hasVeto(row.nodeId, row.repo) || row.status !== "parked" || row.lane !== "implement" ||
    row.phase !== "review" || row.prNumber === null) return false;
   const head = infrastructureProbeHead(row.outcome ?? "");

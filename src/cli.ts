@@ -1,5 +1,4 @@
 #!/usr/bin/env bun
-import { defaultNodeSelector } from "./node-dependency.ts";
 import { failureOutcome } from "./operation-outcome.ts";
 import { nodeRecoveryScope, recordRecovery, recoveryReason } from "./recovery.ts";
 import { readPrivateJson } from "./remote-test/private-io.ts";
@@ -13,7 +12,6 @@ import { buildUsageReport, parsePeriodStart, renderUsageReport } from "./github-
 import { implementLane } from "./lanes.ts";
 import { resumeNode } from "./resume.ts";
 import { Command } from "commander";
-import { join } from "node:path";
 import pkg from "../package.json" with { type: "json" };
 import {
  principalLoginForRepo,
@@ -52,11 +50,9 @@ import {
 import { canonicalDir, runNode, runNodeRunOutcome, type RunNodeContext, type RunNodeOutcome } from "./worker.ts";
 import { trustCurrentGitState } from "./git-trust.ts";
 import { existingWorkerLog } from "./worker-log.ts";
-import { sweepMap } from "./sweep.ts";
 import { mergeGateNow } from "./merge-desk.ts";
 import { walk } from "./walk.ts";
 import { emitTickRunFinished, emitNodeRunIfGenerated, type RunLedgerDeps } from "./run-ledger.ts";
-import { spawningEnabled, spawnRunNodeDetached } from "./spawn.ts";
 import { holdAwake } from "./awake.ts";
 import { enqueueJob, findJob, JobError, runJob, type RunJobContext } from "./jobs.ts";
 import { BUILD_NOW_NOT_STARTED, buildNow, type BuildNowResult } from "./build-now.ts";
@@ -372,34 +368,11 @@ export async function runRunNode(
 
 async function runSweep(configPath: string): Promise<string> {
  const { config, journal } = loadCtx(configPath);
- const nodeSelector = spawningEnabled() ? defaultNodeSelector(config, journal) : undefined;
- const results = [];
- for (const map of config.maps) {
-  if (map.walk === "none") {
-   results.push({
-    repo: map.repo,
-    walk: map.walk,
-    swept: false,
-    reason: "walk: none",
-   });
-   continue;
-  }
-  try {
-   const { token, botIdentity, graphToken } = await writeContext(config, map);
-   const result = await sweepMap({ config, journal, map, token, botIdentity, graphToken, nodeSelector,
-    respawn: (nodeId, repo, root, generation) => spawnRunNodeDetached({ nodeId, repo, root, generation, cliEntry: join(import.meta.dir, "cli.ts"), configPath }) });
-   results.push({ repo: map.repo, walk: map.walk, swept: true, result });
-  } catch (error) {
-   results.push({
-    repo: map.repo,
-    walk: map.walk,
-    swept: false,
-    error: error instanceof Error ? error.message : String(error),
-   });
-  }
- }
- journal.close();
- return JSON.stringify(results, null, 2);
+ try {
+  const result = await walk({ config, configPath, journal, maintenance: "sweep" });
+  return JSON.stringify(result.maps.map(m => ({ repo: m.repo, walk: m.walkMode, swept: m.sweep !== undefined,
+   ...(m.sweep === undefined ? { reason: m.gateReason } : { result: m.sweep }), errors: m.errors })), null, 2);
+ } finally { journal.close(); }
 }
 
 /** How long `merge-desk --settle` waits for GitHub to compute mergeability, and how often it asks. */
@@ -473,21 +446,10 @@ async function runMergeDeskNow(selector: string, configPath: string, settle = fa
  const { config, journal } = loadCtx(configPath);
  try {
   const map = pickMap(config, selector);
-  const { token, botIdentity, graphToken } = await writeContext(config, map);
+  const { token } = await writeContext(config, map);
   if (settle) await settleMergeability(config, journal, map, token);
-  const result = await sweepMap({
-   config,
-   journal,
-   map,
-   token,
-   botIdentity,
-   graphToken,
-   phase: "desk",
-   nodeSelector: spawningEnabled() ? defaultNodeSelector(config, journal) : undefined,
-   respawn: (nodeId, repo, root, generation) =>
-    spawnRunNodeDetached({ nodeId, repo, root, generation, cliEntry: join(import.meta.dir, "cli.ts"), configPath }),
-  });
-  return JSON.stringify(result.mergeDesk ?? { idle: "no row on this map waits on a merge" }, null, 2);
+  const result = await walk({ config, configPath, journal, maintenance: { desk: mapKey(map) } });
+  return JSON.stringify(result.maps.find(m => m.repo === map.repo && m.sweep?.repo === map.repo)?.sweep?.mergeDesk ?? { idle: "no row on this map waits on a merge" }, null, 2);
  } finally {
   journal.close();
  }

@@ -595,7 +595,7 @@ describe("resume-queue-starts-when-lane-frees", () => {
   await withRig(async r => {
    r.queue("40"); r.queue("41", 460); r.journal.updateWorker("40", REPO, { status: "failed", prNumber: 7 });
    const entries = r.journal.listResumeQueue();
-   if (failure === "node") rmSync(join(r.env.FAKE_SOMA_DIR!, "acme__widgets-node-40.json"));
+   if (failure === "node") rmSync(join(r.env.FAKE_SOMA_DIR, "acme__widgets-node-40.json"));
    r.frontier(1, ["20"]);
    r.frontier(460, ["21"]);
    let readFails = failure === "PR";
@@ -647,7 +647,7 @@ describe("resume-queue-starts-when-lane-frees", () => {
   await withRig(async r => {
    r.config.maps[1].lane = "visual";
    const entry = r.queue("40");
-   if (failure === "validation") rmSync(join(r.env.FAKE_SOMA_DIR!, "acme__widgets-node-40.json"));
+   if (failure === "validation") rmSync(join(r.env.FAKE_SOMA_DIR, "acme__widgets-node-40.json"));
    r.frontier(460, ["21"]);
    const spawned: string[] = [];
    const result = await walk({ ...r, spawnRunNode: async ({ nodeId }) => {
@@ -1135,5 +1135,146 @@ test("selected Pi dependency holds before supervisor spawn without map reachable
   const live = r.journal.getWorker("41", REPO)!;
   expect(pinnedNodeSubstrate(r.journal, REPO, "41", live.generation)).toBe("claude");
   expect(pinnedNodeSubstrate(r.journal, REPO, "41", live.generation + 1)).toBeUndefined();
+ });
+});
+
+describe("merge-conflict priority (node #517)", () => {
+ const conflictForge = (conflicts: number[]) => ({
+  getPr: async (_repo: string, iid: number) => ({ ...pr(iid), mergeState: conflicts.includes(iid) ? "conflict" : "mergeable" }),
+ } as unknown as ForgePort);
+
+ test.each([false, true])("occupied slot releases to conflict before ordinary work, restart=%s", async restart => {
+  await withRig(async r => {
+   r.worker("10", 1, "running");
+   r.queue("20");
+   r.frontier(1, ["21"]);
+   r.worker("30", 460, "awaiting-merge", "implement", "awaiting-merge");
+   r.journal.updateWorker("30", REPO, { prNumber: 30 });
+   const spawned: string[] = [];
+   const trace: string[] = [];
+   let journal = r.journal;
+   const ctx = () => ({ ...r, journal, github: conflictForge([30]), now: () => NOW, hostLoad: () => ({ load: 0, cores: 8 }),
+    spawnRunNode: async ({ nodeId }: SpawnRunNodeArgs) => { spawned.push(nodeId); return process.pid; } });
+   await walk(ctx());
+   expect(spawned).toEqual([]);
+   trace.push("occupied: no dispatch; repair retained ahead of ordinary resume");
+   expect(journal.listResumeQueue().map(q => [q.nodeId, q.reason])).toEqual([["30", "merge-conflict"], ["20", null]]);
+   journal.updateWorker("10", REPO, { status: "success" });
+   if (restart) { journal.close(); journal = openJournal(r.config); trace.push("reopened persisted journal"); }
+   try {
+    await walk(ctx());
+    expect(spawned).toEqual(["30"]);
+    expect(journal.getWorker("30", REPO)).toMatchObject({ status: "running", phase: "review", prNumber: 30 });
+    await walk(ctx());
+    expect(spawned).toEqual(["30"]);
+    expect(journal.getWorker("21", REPO)).toBeNull();
+    trace.push(`released: dispatched ${spawned.join(",")}; repeat tick: no duplicate; ordinary resume and fresh node wait`);
+    console.info(JSON.stringify({ scenario: "conflict-priority-slot-release", restart, trace }));
+   } finally { if (restart) journal.close(); }
+  });
+ });
+
+ test("resolved credential identity authorizes repair when bot.identity is omitted", async () => {
+  await withRig(async r => {
+   r.config.bot.identity = undefined;
+   r.queue("20");
+   r.worker("30", 460, "awaiting-merge", "implement", "awaiting-merge");
+   r.journal.updateWorker("30", REPO, { prNumber: 30 });
+   const spawned: string[] = [];
+   await walk({ ...r, github: conflictForge([30]), now: () => NOW, hostLoad: () => ({ load: 0, cores: 8 }),
+    spawnRunNode: async ({ nodeId }: SpawnRunNodeArgs) => { spawned.push(nodeId); return process.pid; } });
+   expect(spawned).toEqual(["30"]);
+  });
+ });
+
+ test.each(["parked", "awaiting-merge"] as const)("a promoted operator resume (%s) keeps its request after the conflict clears", async status => {
+  await withRig(async r => {
+   r.worker("10", 1, "running");
+   r.queue("30", 460);
+   r.journal.updateWorker("30", REPO, { prNumber: 30, status, phase: status === "awaiting-merge" ? "awaiting-merge" : "review" });
+   const spawned: string[] = [];
+   const ctx = { ...r, now: () => NOW, hostLoad: () => ({ load: 0, cores: 8 }),
+    spawnRunNode: async ({ nodeId }: SpawnRunNodeArgs) => { spawned.push(nodeId); return process.pid; } };
+   await walk({ ...ctx, github: conflictForge([30]) });
+   expect(r.journal.listResumeQueue()[0]?.reason).toBe("merge-conflict-resume");
+   r.journal.updateWorker("10", REPO, { status: "success" });
+   await walk({ ...ctx, github: conflictForge([]) });
+   expect(spawned).toEqual(["30"]);
+  });
+ });
+
+ test.each(["sweep", "desk"])("%s maintenance considers other maps' conflicts before ordinary send-backs", async mode => {
+  await withRig(async r => {
+   for (const [id, root] of [["20", 1], ["30", 460]] as const) {
+    r.worker(id, root, "awaiting-merge", "implement", "awaiting-merge");
+    r.journal.updateWorker(id, REPO, { prNumber: Number(id) });
+   }
+   const github = { ...conflictForge([30]), listComments: async () => [{ id: 1, author: "ivy-bot",
+    body: `<!-- ranger:review round=1 sha=${"b".repeat(40)} blockers=1 majors=0 nits=0 -->` }] } as unknown as ForgePort;
+   const spawned: string[] = [];
+   const result = await walk({ ...r, github, maintenance: mode === "sweep" ? "sweep" : { desk: `${REPO}#1` },
+    now: () => NOW, hostLoad: () => ({ load: 0, cores: 8 }),
+    spawnRunNode: async ({ nodeId }: SpawnRunNodeArgs) => { spawned.push(nodeId); return process.pid; } });
+   expect(spawned).toEqual(["30"]);
+   expect(result.maps.flatMap(m => m.claimed)).toEqual([]);
+  });
+ });
+
+ test.each(["paused", "cap"])("priority retains the %s gate", async gate => {
+  await withRig(async r => {
+   r.worker("30", 460, "awaiting-merge", "implement", "awaiting-merge");
+   r.journal.updateWorker("30", REPO, { prNumber: 30 });
+   if (gate === "paused") r.journal.setHealth("paused", "true");
+   else r.config.workers.spawnCapPerDay = 0;
+   const spawned: string[] = [];
+   await walk({ ...r, github: conflictForge([30]), now: () => NOW, hostLoad: () => ({ load: 0, cores: 8 }),
+    spawnRunNode: async ({ nodeId }: SpawnRunNodeArgs) => { spawned.push(nodeId); return process.pid; } });
+   expect(spawned).toEqual([]);
+   expect(r.journal.listResumeQueue()[0]?.reason).toBe("merge-conflict");
+   expect(r.journal.listNodeEvents(REPO, "30").some(e => e.detail?.includes(gate === "paused" ? "paused" : "cap"))).toBe(true);
+  });
+ });
+
+ test("queued conflicts outrank older ordinary resumes and keep FIFO against newcomers", async () => {
+  await withRig(async r => {
+   r.queue("20");
+   for (const id of ["30", "40"]) {
+    r.queue(id, 460);
+    r.journal.updateWorker(id, REPO, { prNumber: Number(id) });
+   }
+   const spawned: string[] = [];
+   const ctx = { ...r, github: conflictForge([30, 40, 50]), now: () => NOW, hostLoad: () => ({ load: 0, cores: 8 }),
+    spawnRunNode: async ({ nodeId }: SpawnRunNodeArgs) => { spawned.push(nodeId); return process.pid; } };
+   await walk(ctx);
+   expect(spawned).toEqual(["30"]);
+   r.journal.updateWorker("30", REPO, { status: "success" });
+   r.worker("50", 1, "awaiting-merge", "implement", "awaiting-merge");
+   r.journal.updateWorker("50", REPO, { prNumber: 50 });
+   await walk(ctx);
+   expect(spawned).toEqual(["30", "40"]);
+  });
+ });
+
+ test.each(["blocker", "claim", "substrate", "veto", "policy"])("ineligible conflict (%s) leaves capacity for ordinary work", async refused => {
+  await withRig(async r => {
+   r.queue("20");
+   r.worker("30", 460, "awaiting-merge", "implement", "awaiting-merge");
+   r.journal.updateWorker("30", REPO, { prNumber: 30 });
+   if (refused === "blocker" || refused === "claim") {
+    const path = join(r.dir, "data", "acme__widgets-node-30.json");
+    const node = JSON.parse(readFileSync(path, "utf8"));
+    if (refused === "blocker") node.blockedBy = [{ id: "99", status: "open" }];
+    else node.assignees = ["someone-else"];
+    writeFileSync(path, JSON.stringify(node));
+   }
+   if (refused === "policy") r.config.maps[1].skip.push("30");
+   if (refused === "veto") r.journal.recordVeto({ nodeId: "30", repo: REPO, commentId: "99", detail: "principal refused" });
+   const spawned: string[] = [];
+   await walk({ ...r, github: conflictForge([30]), now: () => NOW, hostLoad: () => ({ load: 0, cores: 8 }),
+    ...(refused === "substrate" ? { nodeSelector: async (map: { root: number }) => { if (map.root === 460) throw new Error("substrate unavailable"); return "claude" as const; } } : {}),
+    spawnRunNode: async ({ nodeId }: SpawnRunNodeArgs) => { spawned.push(nodeId); return process.pid; } });
+   expect(spawned).toEqual(["20"]);
+   expect(r.journal.listNodeEvents(REPO, "30").some(e => e.detail?.includes(refused === "substrate" ? "substrate unavailable" : refused === "claim" ? "active claim" : refused))).toBe(true);
+  });
  });
 });
