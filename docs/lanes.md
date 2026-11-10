@@ -4,7 +4,7 @@ Implement workers share the machine through two resource lanes: one visual and o
 
 ## How maps share the lanes
 
-`workers.laneSlots` sets how many implement workers each lane runs at once. The default is one visual and one headless. The daily spawn cap and the dead-man pause apply across both lanes.
+`workers.laneSlots` sets how many implement workers each lane runs at once. The default is one visual and one headless. `workers.jobSlots`, in the same shape, sets how many scheduled jobs each lane runs at once; jobs and workers are counted apart, so a long worker does not block a job and a job does not block a claim. The visual lane stays exclusive: a visual job never runs beside a visual worker, whatever either count says (node #506). The daily spawn cap and the dead-man pause apply across both lanes.
 
 A map with `commands.probe` takes the visual lane by default. Any other map takes the headless lane. A map's `lane` key overrides that choice.
 

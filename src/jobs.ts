@@ -240,7 +240,7 @@ export async function jobPass(ctx: JobPassContext): Promise<JobPassResult> {
   if (lane === "visual" && journal.isVisualLaneDrained()) { wait("visual lane drained"); continue; }
   if (journal.spawnsToday(now) >= config.workers.spawnCapPerDay) { wait("daily spawn cap reached"); continue; }
   if (lane !== "none" && taken.has(lane)) { wait(`the ${lane} lane was taken this tick`); continue; }
-  const holder = lane === "none" ? null : journal.laneHolder(lane);
+  const holder = lane === "none" ? null : journal.laneHolder(lane, undefined, undefined, "job");
   if (holder !== null) {
    wait(`the ${lane} lane is held by ${holder.job === undefined ? `#${holder.nodeId} (${holder.repo}#${holder.root})` : `job ${holder.job}`}`);
    continue;

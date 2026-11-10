@@ -440,6 +440,7 @@ export class Journal {
   private readonly maps: readonly LaneMap[] = [],
   legacyMapRoots: Readonly<Record<string, number>> = {},
   private readonly laneSlots: Partial<Record<ImplementLane, number>> = {},
+  private readonly jobSlots: Partial<Record<ImplementLane, number>> = {},
  ) {
   // Under test, the live journal is out of reach (node #66).
   assertNotLiveJournalUnderTest(expandHome(path));
@@ -458,9 +459,10 @@ export class Journal {
   path: string,
   maps: readonly LaneMap[] = [],
   laneSlots: Partial<Record<ImplementLane, number>> = {},
+  jobSlots: Partial<Record<ImplementLane, number>> = {},
  ): Journal | null {
   const opened = openDbReadOnly(path);
-  return opened === null ? null : new Journal(path, opened, maps, {}, laneSlots);
+  return opened === null ? null : new Journal(path, opened, maps, {}, laneSlots, jobSlots);
  }
 
  // ---- workers ----
@@ -622,8 +624,11 @@ export class Journal {
 
  /**
   * A resource lane holds `workers.laneSlots` claimed/running implement
-  * workers across all maps (default one). Returns the first occupant once
-  * every slot is taken, null while one is free.
+  * workers and `workers.jobSlots` running jobs (node #506), each counted
+  * apart. The visual lane is also exclusive: a visual job never runs beside
+  * a visual implement session, whatever the slot counts. `for` names who is
+  * asking (default a worker). Returns the occupant in the way, null while
+  * the asker may start.
   * Excluding an occupant requires its repo as well as node id.
   * Unknown or ambiguous maps conservatively hold both resource lanes.
   */
@@ -631,18 +636,35 @@ export class Journal {
   lane: ImplementLane,
   except?: { nodeId: string; repo: string },
   isActive: (worker: WorkerRow) => boolean = () => true,
+  asker: "worker" | "job" = "worker",
  ): LaneHolder | null {
-  const workerOccupants = this.listWorkers().filter((w) => {
+  const { workers, jobs } = this.laneOccupants(lane, except, isActive);
+  const own = asker === "worker" ? workers : jobs;
+  const slots = (asker === "worker" ? this.laneSlots : this.jobSlots)[lane] ?? 1;
+  if (own.length >= slots) return own[0];
+  const other = asker === "worker" ? jobs : workers;
+  return lane === "visual" && other.length > 0 ? other[0] : null;
+ }
+
+ laneOccupants(
+  lane: ImplementLane,
+  except?: { nodeId: string; repo: string },
+  isActive: (worker: WorkerRow) => boolean = () => true,
+ ): { workers: LaneHolder[]; jobs: LaneHolder[] } {
+  const workers = this.listWorkers().filter((w) => {
    if (w.nodeId === except?.nodeId && w.repo === except?.repo) return false;
    if (!holdsImplementLane(w)) return false;
    if (!isActive(w)) return false;
    const resource = workerLane(w, this.maps);
    return resource === lane || resource === null;
   });
-  // A running job (node #301) takes a slot like an implement session.
-  const occupants: LaneHolder[] = [...workerOccupants, ...this.listJobRuns("running")
-   .filter(run => run.lane === lane).map(jobHolder)];
-  return occupants.length >= (this.laneSlots[lane] ?? 1) ? occupants[0] : null;
+  const jobs = this.listJobRuns("running").filter(run => run.lane === lane).map(jobHolder);
+  return { workers, jobs };
+ }
+
+ laneOccupancy(lane: ImplementLane): { workers: number; workerSlots: number; jobs: number; jobSlots: number } {
+  const { workers, jobs } = this.laneOccupants(lane);
+  return { workers: workers.length, workerSlots: this.laneSlots[lane] ?? 1, jobs: jobs.length, jobSlots: this.jobSlots[lane] ?? 1 };
  }
 
  // ---- job runs (node #301) ----
@@ -1788,5 +1810,5 @@ function hydrateSubstrateReading(row: {
 
 /** Open the configured journal (default from config.state.journalPath). */
 export function openJournal(config: RangerConfig): Journal {
- return new Journal(expandHome(config.state.journalPath), undefined, config.maps, config.state.legacyMapRoots, config.workers.laneSlots);
+ return new Journal(expandHome(config.state.journalPath), undefined, config.maps, config.state.legacyMapRoots, config.workers.laneSlots, config.workers.jobSlots);
 }
