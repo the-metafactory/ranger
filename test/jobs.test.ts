@@ -381,4 +381,87 @@ describe("node #301 — scheduled jobs", () => {
   for (const bad of ["https://x", "soma:/abs", "soma:a/../b", "soma:", "soma:a b"]) expect(ledgerResultRef(bad, "succeeded")).toBeUndefined();
   expect(ledgerResultRef("soma:outputs/a.md", "failed")).toBeUndefined();
  });
+
+describe("node #506 — job slots beside implement workers", () => {
+ const TOOL = "acme/tool";
+ const HEADLESS = { ...SHORT, name: "nightly-head", skill: "nightly-head", lane: "headless" };
+ const headlessRig = (extra: Record<string, unknown> = {}) => rig([HEADLESS, SHORT], {
+  maps: [
+   { repo: GAME, root: 1, walk: "full", commands: { test: "bun test", probe: "npm run probe" } },
+   { repo: TOOL, root: 1, walk: "full", commands: { test: "bun test" } },
+  ],
+  ...extra,
+ });
+ const holdHeadless = (journal: Journal) => journal.upsertWorker({ nodeId: "8", repo: TOOL, root: 1, status: "running", lane: "implement", phase: "implement" });
+
+ test("a headless implement worker does not block a queued headless job", async () => {
+  const r = headlessRig();
+  holdHeadless(r.journal);
+  runJobEnqueue("nightly-head", r.configPath);
+  const s = spawner();
+  await jobPass({ config: r.config, configPath: r.configPath, journal: r.journal, spawnJob: s.spawnJob });
+  expect(s.calls).toHaveLength(1);
+ });
+
+ test("a headless lane a worker took this tick does not block a headless job", async () => {
+  const r = headlessRig();
+  runJobEnqueue("nightly-head", r.configPath);
+  const s = spawner();
+  const taken = new Set<"headless">(["headless"]);
+  await jobPass({ config: r.config, configPath: r.configPath, journal: r.journal, spawnJob: s.spawnJob, takenLanes: taken });
+  expect(s.calls).toHaveLength(1);
+ });
+
+ test("a headless job started this tick leaves the worker reservation untouched", async () => {
+  const r = headlessRig();
+  runJobEnqueue("nightly-head", r.configPath);
+  const taken = new Set<"headless">();
+  await jobPass({ config: r.config, configPath: r.configPath, journal: r.journal, spawnJob: spawner(process.pid).spawnJob, takenLanes: taken });
+  expect(taken.size).toBe(0);
+ });
+
+ test("a running headless job does not block a headless implement claim", async () => {
+  const r = headlessRig();
+  runJobEnqueue("nightly-head", r.configPath);
+  await jobPass({ config: r.config, configPath: r.configPath, journal: r.journal, spawnJob: spawner(process.pid).spawnJob });
+  expect(r.journal.laneHolder("headless")).toBeNull();
+  expect(r.journal.laneHolder("headless", undefined, undefined, "job")?.job).toBe("nightly-head");
+ });
+
+ test("jobSlots caps running jobs on a lane", async () => {
+  const r = headlessRig({ workers: { jobSlots: { headless: 2 } } });
+  runJobEnqueue("nightly-head", r.configPath);
+  await jobPass({ config: r.config, configPath: r.configPath, journal: r.journal, spawnJob: spawner(process.pid).spawnJob });
+  expect(r.journal.laneHolder("headless", undefined, undefined, "job")).toBeNull();
+  const second = r.journal.enqueueJobRun("nightly-head", "headless", new Date(), { n: "2" }).run;
+  r.journal.updateJobRun(second.id, "queued", { status: "running" });
+  expect(r.journal.laneHolder("headless", undefined, undefined, "job")).not.toBeNull();
+ });
+
+ test("a visual job waits for a visual worker whatever jobSlots.visual says", async () => {
+  const r = headlessRig({ workers: { jobSlots: { visual: 3 } } });
+  holdVisual(r.journal);
+  runJobEnqueue("daily-short", r.configPath);
+  const s = spawner();
+  const pass = await jobPass({ config: r.config, configPath: r.configPath, journal: r.journal, spawnJob: s.spawnJob });
+  expect(s.calls).toHaveLength(0);
+  expect(pass.waiting[0].reason).toContain("held by #7");
+ });
+
+ test("a running visual job blocks a visual implement claim", async () => {
+  const r = headlessRig();
+  await startedRun(r);
+  expect(r.journal.laneHolder("visual")?.job).toBe("daily-short");
+ });
+
+ test("occupancy counts workers and jobs apart", async () => {
+  const r = headlessRig();
+  holdHeadless(r.journal);
+  runJobEnqueue("nightly-head", r.configPath);
+  await jobPass({ config: r.config, configPath: r.configPath, journal: r.journal, spawnJob: spawner(process.pid).spawnJob });
+  const o = r.journal.laneOccupants("headless");
+  expect([o.workers.length, o.jobs.length]).toEqual([1, 1]);
+ });
+});
+
 });

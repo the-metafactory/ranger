@@ -301,6 +301,10 @@ const WorkersSchema = z.object({
   visual: z.number().int().positive().default(1),
   headless: z.number().int().positive().default(1),
  }).default({}),
+ jobSlots: z.object({
+  visual: z.number().int().positive().default(1),
+  headless: z.number().int().positive().default(1),
+ }).default({}),
  /** Hard wall-clock kill per worker, minutes (design §4 NodeBudget). */
  wallClockMin: z.number().int().positive().default(90),
  /** Respawn attempts before a crashed worker is parked (design §7). */

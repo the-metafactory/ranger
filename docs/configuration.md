@@ -27,7 +27,7 @@ Ranger passes the chosen path, made absolute, to every ranger process it starts,
 | `bot` | The machine account. `identity` pins the GitHub bot login. |
 | `principal` | The principal's `login` and, for intake, `discordId`. No tick that changes the graph runs under this identity. |
 | `state` | `journalPath` (default `~/.config/ranger/state.sqlite`), `canonicalRoot` (where canonical checkouts live), and the migration-only `legacyMapRoots`. |
-| `workers` | Spawn cap, lane slots, wall clock, attempts, dead-man threshold, review rounds, base drift, CI grace, host load, and probe requeues. |
+| `workers` | Spawn cap, lane slots, job slots, wall clock, attempts, dead-man threshold, review rounds, base drift, CI grace, host load, and probe requeues. |
 | `auth` | `readOnlyTokens` and `writeTokens`: environment variable names by repo prefix. The longest matching prefix wins. |
 | `budget` | GitHub GraphQL floor, the cooldown after a secondary rate limit, and the frontier's maximum age. |
 | `substrates` | Quota thresholds and the Claude, Codex, and Pi worker models. |

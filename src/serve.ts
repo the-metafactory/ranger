@@ -200,6 +200,7 @@ export interface StateInputs {
  titles: Map<string, string>;
  workers: WorkerRow[];
  laneHolders: Record<ImplementLane, LaneHolder | null>;
+ laneOccupancy?: Record<ImplementLane, LaneOccupancy>;
  paused: boolean;
  /** The drain switches (node #165); absent means none is set. */
  drains?: DrainState;
@@ -228,6 +229,8 @@ export interface StateInputs {
  /** `workers.laneBusyLoad`: a lane's own busy load, ahead of `busyLoad` (node #312). */
  laneBusyLoad?: Partial<Record<ImplementLane, number>>;
 }
+
+export interface LaneOccupancy { workers: number; workerSlots: number; jobs: number; jobSlots: number }
 
 /** One lane's queued resumes, FIFO, and what the next tick does with them. */
 export interface LaneQueue {
@@ -345,6 +348,7 @@ export interface DashboardState {
   /** Null when no cap is set: JSON has no Infinity. */
   spawnCap: number | null;
   laneHolders: Record<ImplementLane, { repo: string; root: number; nodeId: string; status: string } | null>;
+  laneOccupancy: Record<ImplementLane, LaneOccupancy>;
  };
  current: CurrentJob[];
  maps: DashboardMap[];
@@ -642,6 +646,10 @@ export function assembleState(inputs: StateInputs): DashboardState {
    spawnsToday: inputs.spawnsToday,
    spawnCap: Number.isFinite(inputs.spawnCap) ? inputs.spawnCap : null,
    laneHolders: { visual: holderView("visual"), headless: holderView("headless") },
+   laneOccupancy: inputs.laneOccupancy ?? {
+    visual: { workers: 0, workerSlots: 1, jobs: 0, jobSlots: 1 },
+    headless: { workers: 0, workerSlots: 1, jobs: 0, jobSlots: 1 },
+   },
   },
   current,
   maps,
@@ -1174,7 +1182,8 @@ function renderNext(s) {
  for (const lane of ["visual", "headless"]) {
   const holder = s.gates.laneHolders[lane];
   const drained = lane === "visual" && s.gates.visualDrained ? " · DRAINED: no new implement claims on any visual map (ranger drain --lane visual --off)" : "";
-  box.append(el("h3", { text: lane + " lane · " + (holder ? "held by #" + holder.nodeId + " (" + holder.repo + "#" + holder.root + ")" : "free") + drained }));
+  const occ = s.gates.laneOccupancy[lane];
+  box.append(el("h3", { text: lane + " lane · " + (holder ? "held by #" + holder.nodeId + " (" + holder.repo + "#" + holder.root + ")" : "free") + " · workers " + occ.workers + "/" + occ.workerSlots + " · jobs " + occ.jobs + "/" + occ.jobSlots + drained }));
   // The visual lane drains as one switch; a visual map has no drain of its own.
   if (lane === "visual") box.append(el("div", { class: "acts" }, drainButton(s.gates.visualDrained, { lane: "visual" }, "the visual lane: no new implement claims on any visual map")));
   const q = laneQueue(s, lane);
@@ -1836,7 +1845,7 @@ export async function readPrLive(
 
 export function workerLogOf(config: RangerConfig, repo: string, nodeId: string): string | null {
  const journalPath = expandHome(config.state.journalPath);
- const journal = Journal.openReadOnly(journalPath, config.maps, config.workers.laneSlots);
+ const journal = Journal.openReadOnly(journalPath, config.maps, config.workers.laneSlots, config.workers.jobSlots);
  if (journal === null) return null;
  try {
   const row = journal.getWorker(nodeId, repo);
@@ -2022,7 +2031,7 @@ export function stateFromJournal(
  now = new Date(),
  hostLoad: HostLoad = realHostLoad,
 ): DashboardState {
- const journal = Journal.openReadOnly(expandHome(config.state.journalPath), config.maps, config.workers.laneSlots);
+ const journal = Journal.openReadOnly(expandHome(config.state.journalPath), config.maps, config.workers.laneSlots, config.workers.jobSlots);
  try {
   const registry = loadProbeRegistry();
   const reports = new Map<string, MapRead>();
@@ -2066,6 +2075,11 @@ export function stateFromJournal(
   const workers = journal?.listWorkers() ?? [];
   const resumeQueue = journal?.listResumeQueue() ?? [];
   const laneHolders = { visual: journal?.laneHolder("visual") ?? null, headless: journal?.laneHolder("headless") ?? null };
+  const occupancy = (lane: ImplementLane): LaneOccupancy => {
+   const o = journal?.laneOccupancy(lane);
+   return o ?? { workers: 0, workerSlots: 1, jobs: 0, jobSlots: 1 };
+  };
+  const laneOccupancy = { visual: occupancy("visual"), headless: occupancy("headless") };
   const entryInputs: Parameters<typeof needsYouEntries>[0] = {
    resumeQueue,
    laneHolders,
@@ -2115,6 +2129,7 @@ export function stateFromJournal(
    awaitingMerge,
    lastImplementMaps: lastImplementMaps(journal),
    laneHolders,
+   laneOccupancy,
    resumeQueue,
    paused: journal?.isPaused() ?? false,
    drains: journal === null ? undefined : readDrains(journal, config.maps),
