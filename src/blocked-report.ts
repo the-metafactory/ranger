@@ -37,6 +37,33 @@ export interface BlockedReport {
 const RESUME_LINE = /^\s*(#{1,6}\s*)?(?:\*\*)?resume[ -]condition(?:\*\*)?\s*:?(?:\*\*)?\s*(.*)$/i;
 const HEADING = /^\s*#{1,6}\s/;
 
+/** A node a resume condition names: `#12`, or `owner/name#12` when it names the repo too. */
+export interface NodeReference {
+ repo?: string;
+ id: string;
+}
+
+const NODE_REFERENCE = /(?:([\w.-]+\/[\w.-]+))?#(\d+)\b/g;
+const TRAILING_WORD_BEFORE = /[\w./-]/;
+
+/**
+ * The first node a resume condition names, or null. A bare `#12` counts; a
+ * reference whose repo differs from the caller's is left to the caller to
+ * judge, and `cortex#3459` (a repo prefix, no owner) names no node ranger can
+ * resolve, so it is text.
+ */
+export function namedNodeReference(text: string): NodeReference | null {
+ for (const match of text.matchAll(NODE_REFERENCE)) {
+  const at = match.index;
+  const qualified = !match[0].startsWith("#");
+  if (!qualified && at > 0 && TRAILING_WORD_BEFORE.test(text[at - 1])) continue;
+  return qualified
+   ? { repo: match[0].slice(0, match[0].lastIndexOf("#")), id: match[2] }
+   : { id: match[2] };
+ }
+ return null;
+}
+
 function fold(lines: string[]): string {
  const text = lines
   .map((l) => l.replace(/^\s*#{1,6}\s*/, "").trim())

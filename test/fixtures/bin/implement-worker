@@ -39,6 +39,10 @@ if [ "$mode" = "blocked" ]; then
   printf '# Node #20 is blocked\n\nThe widgets SDK has no release with the feature export.\n\nResume condition: publish a widgets SDK release that exports feature().\n' > .ranger-blocked.md
   exit 0
 fi
+if [ "$mode" = "blocked-again" ]; then
+  printf '# Node #20 is blocked\n\nThe widgets SDK has no bus subject.\n\nResume condition: node #30 closes.\n' > .ranger-blocked.md
+  exit 0
+fi
 if [ "$mode" = "blocker-note" ]; then
   mkdir -p docs
   printf '# Node #20 dependency blocker\n\nImplementation stopped: no SDK release exports feature().\n\n## Resume condition\n\nPublish an SDK release with feature().\n' > docs/node-20-dependency-blocker.md

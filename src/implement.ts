@@ -73,7 +73,7 @@ import { WRITE_TOKEN_SOURCE } from "./github-usage.ts";
 import { budgetedRead, budgetPolicy, clearThrottleStrikes, MAX_REVIEW_THROTTLES_IN_A_ROW, recordThrottle, reviewCooldownScope, reviewThrottle, reviewTokenSource } from "./budget.ts";
 import { GraphAddUnattached, closeTimeoutForNode, graphAdd, graphClose, graphDecisions, graphLink, type AddSpec, type CloseResult } from "./graph-write.ts";
 import { FixNodeLockBusy, withFixNodeLock } from "./fix-node-lock.ts";
-import { assertFilable, codeCommentSpec, foundByProbeSpec, landminesInDiff, scribeFile, splitOutOfReviewSpec, type Provenance, type ScribeGraph } from "./scribe.ts";
+import { assertFilable, codeCommentSpec, fileBlockedPrerequisite, foundByProbeSpec, landminesInDiff, parkIdentity, scribeFile, splitOutOfReviewSpec, type PrerequisiteFiling, type Provenance, type ScribeGraph } from "./scribe.ts";
 import { FencedError, type EventKind, type ImplementPhase, type Journal } from "./journal.ts";
 import { assembleImplementPrompt } from "./prompt.ts";
 import { BLOCKED_REPORT_FILE, blockerNoteBranch, discardBlockedReport, readBlockedReport, type BlockedReport } from "./blocked-report.ts";
@@ -3014,6 +3014,7 @@ async function blockedPark(
 ): Promise<ParkSignal> {
  const { worktree, map, journal, node } = ctx;
  let outcome = blockedOutcome({ pass, ...report, ...(opts.log === undefined ? {} : { log: opts.log }) });
+ await parkPrerequisite(ctx, report);
  const unpushed = (journal.getWorker(node.ref.id, map.repo)?.prNumber ?? null) === null;
  if (unpushed && opts.dropNote) {
   const base = await safeGit(["--no-replace-objects", "merge-base", `origin/${map.base}`, "HEAD"], { cwd: worktree, timeoutMs: 10_000 });
@@ -3021,6 +3022,47 @@ async function blockedPark(
   if (failed !== null) outcome += ` — the note's commits stay in the worktree (${failed}): drop them before a resume`;
  }
  return new ParkSignal(outcome);
+}
+
+/** The one line the park posts for a filed or linked prerequisite. */
+export function prerequisiteNotice(nodeId: string, filing: { kind: "filed" | "linked"; node: string }): string {
+ return filing.kind === "linked"
+  ? `🔗 Node #${nodeId} is blocked on node #${filing.node}, which is already open: ranger linked it as #${nodeId}'s blocker.`
+  : `📌 Ranger filed node #${nodeId}'s missing prerequisite as node #${filing.node} and linked it as #${nodeId}'s blocker.`;
+}
+
+async function parkPrerequisite(ctx: ImplementContext, report: BlockedReport): Promise<void> {
+ const { journal, map, node } = ctx;
+ const nodeId = node.ref.id;
+ const fence = () => {
+  journal.assertGeneration(nodeId, map.repo, ctx.generation, "file the blocked prerequisite");
+ };
+ const spawning = { id: nodeId, title: node.node.title, ...(node.parent === undefined ? {} : { parent: node.parent }) };
+ let filing: PrerequisiteFiling;
+ try {
+  filing = await fileBlockedPrerequisite(ctx.scribe ?? machineScribeGraph(ctx), journal, { map, node: spawning, report }, fence);
+ } catch (error) {
+  if (error instanceof FencedError) throw error;
+  const message = error instanceof Error ? error.message : String(error);
+  journal.recordEvent("filed", { nodeId, repo: map.repo, detail: `filing the blocked prerequisite FAILED: ${message}`.slice(0, 400) });
+  return;
+ }
+ if (filing.kind === "none") return;
+ const notice = prerequisiteNotice(nodeId, filing);
+ journal.recordEvent("filed", {
+  nodeId, repo: map.repo,
+  detail: `${filing.kind === "linked" ? "linked" : "filed"} the blocked park's prerequisite #${filing.node}, which blocks #${nodeId} (blocked-prerequisite)`.slice(0, 400),
+ });
+ const key = `blocked-prerequisite.${mapKey(map)}.${nodeId}.${parkIdentity(report.resume)}`;
+ if (journal.getHealth(key) !== null) return;
+ try {
+  await (ctx.announce ?? ((text: string) => DiscordAnnouncer.fromMap(map).post(text, "blocked prerequisite notice")))(notice);
+ } catch (error) {
+  const message = error instanceof Error ? error.message : String(error);
+  journal.recordEvent("filed", { nodeId, repo: map.repo, detail: `the blocked prerequisite notice did not post (${message}); a later park retries it`.slice(0, 400) });
+  return;
+ }
+ journal.setHealth(key, new Date().toISOString());
 }
 
 /**

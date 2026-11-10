@@ -1,5 +1,7 @@
+import { createHash } from "node:crypto";
+import { namedNodeReference, type BlockedReport, type NodeReference } from "./blocked-report.ts";
 import { changeRequestLabel, changeRequestNoun } from "./forge-text.ts";
-import { normalizeNodeId, parseForgeRef } from "./forge-ref.ts";
+import { normalizeNodeId, parseForgeRef, repoIdentity } from "./forge-ref.ts";
 import { GraphAddUnattached, type AddSpec } from "./graph-write.ts";
 import type { NodeResult } from "./graph.ts";
 import type { Journal } from "./journal.ts";
@@ -8,9 +10,10 @@ import { mapKey } from "./maps.ts";
 /**
  * The Scribe (design §6): files newly discovered work back onto the graph as
  * typed nodes through `soma graph add`, each with the provenance of where it
- * was found. Three templates live here: split-out-of-review, found-by-probe
- * and code-comment-graduated. The fourth, human observation, is node #21's
- * intake flow, where the words stay the principal's.
+ * was found. Four templates live here: split-out-of-review, found-by-probe,
+ * code-comment-graduated and the blocked park's missing prerequisite. The
+ * fifth, human observation, is node #21's intake flow, where the words stay
+ * the principal's.
  *
  * Every filing is `propose` at minimum (node #9 ban: ranger never mints an
  * `auto` node), carries a checkpoint minted at add time (no verb attaches one
@@ -20,7 +23,7 @@ import { mapKey } from "./maps.ts";
  * fails the filing.
  */
 
-export type Provenance = "split-out-of-review" | "found-by-probe" | "code-comment-graduated";
+export type Provenance = "split-out-of-review" | "found-by-probe" | "code-comment-graduated" | "blocked-prerequisite";
 
 /** The graph port the Scribe writes and re-reads through; default is `soma graph` under the machine token. */
 export interface ScribeGraph {
@@ -29,16 +32,22 @@ export interface ScribeGraph {
  /** Attach `node` below `parent` and wire `blockedBy`; a parent or edge already there is skipped. */
  link(node: string, parent: string, blockedBy: string[]): Promise<void>;
  /** The node as the tracker shows it now. */
- node(id: string): Promise<Pick<NodeResult, "parent" | "blockedBy" | "node">>;
+ node(id: string): Promise<Pick<NodeResult, "parent" | "blockedBy" | "node" | "status">>;
 }
 
 export class ScribeError extends Error {
  override readonly name = "ScribeError";
 }
 
-/** The journal key of one filing: one node per (map, spawning node, provenance). */
-export function scribeKey(map: { repo: string; root: number }, parent: string, provenance: Provenance): string {
- return `scribe.${mapKey(map)}.${parent}.${provenance}`;
+/**
+ * The journal key of one filing: one node per (map, keying node, provenance),
+ * told apart by `variant` where one keying node files more than one node of
+ * the same provenance — a parked node's second, different prerequisite is not
+ * the first one's.
+ */
+export function scribeKey(map: { repo: string; root: number }, keyedBy: string, provenance: Provenance, variant?: string): string {
+ const key = `scribe.${mapKey(map)}.${keyedBy}.${provenance}`;
+ return variant === undefined ? key : `${key}.${variant}`;
 }
 
 function sameNode(repo: string, a: string, b: string): boolean {
@@ -90,8 +99,10 @@ function readRecord(value: string | null): ScribeRecord | null {
 
 export interface ScribeFiling {
  map: { repo: string; root: number };
- /** The spawning node: the filed node hangs below it. */
+ /** The node the filed node hangs below. */
  parent: string;
+ owner?: string;
+ variant?: string;
  provenance: Provenance;
  spec: AddSpec;
 }
@@ -119,7 +130,7 @@ export async function scribeFile(
 ): Promise<ScribeFiled> {
  const { map, parent, provenance, spec } = filing;
  assertFilable(map, parent, spec);
- const key = scribeKey(map, parent, provenance);
+ const key = scribeKey(map, filing.owner ?? parent, provenance, filing.variant);
  let record = readRecord(journal.getHealth(key));
  if (record?.verified === true) return { node: record.node, added: false };
  const added = record === null;
@@ -520,4 +531,115 @@ export function landminesInDiff(diff: string): Landmine[] {
   }
  }
  return found;
+}
+
+/** What filing a blocked park's missing prerequisite came to. */
+export type PrerequisiteFiling =
+ | { kind: "filed"; node: string; added: boolean }
+ | { kind: "linked"; node: string }
+ | { kind: "none" };
+
+/** A blocked park whose prerequisite is not on the graph yet, or is. */
+export interface BlockedPrerequisite {
+ map: { repo: string; root: number };
+ node: SpawningNode & { parent?: { id: string } };
+ report: BlockedReport;
+}
+
+/**
+ * Blocked-prerequisite (design §6, the fourth template): the gap a blocked
+ * worker named in its resume condition, filed as one `propose` build node so
+ * it reaches the principal as an approvable node instead of a parked row
+ * nobody sees. The title carries the condition, the body the condition and
+ * the report's reason, the checkpoint carries the condition's identity so a
+ * second gap's node is gated by its own checkpoint; the parked node is
+ * blocked by the filed one.
+ */
+export function blockedPrerequisiteSpec(node: SpawningNode, report: BlockedReport): AddSpec {
+ return {
+  ...build(),
+  title: titled(`Prerequisite for #${node.id}`, report.resume),
+  checkpoint: `blocked-prerequisite-${stem(node.id)}-${parkIdentity(report.resume)}`,
+  body: [
+   "## Deliverable",
+   "",
+   `${report.resume} — the condition node #${node.id} named before it could be built.`,
+   "",
+   "## Blocked prerequisite",
+   "",
+   `Node #${node.id} (${node.title}) parked as blocked and named a condition it could not reach on its own. Ranger filed this node so the gap reaches the principal as an approvable node; the parked row stays parked until this one closes.`,
+   "",
+   `- Parked node: node #${node.id} (${node.title})`,
+   `- Resume condition: ${report.resume}`,
+   "",
+   "## Blocked report",
+   "",
+   "The worker's report, folded to one line by ranger:",
+   "",
+   ...fenced(report.reason),
+   "",
+   "## Acceptance criteria",
+   "",
+   `- Given this node's deliverable, when it closes, then node #${node.id}'s resume condition holds.`,
+   `- Given node #${node.id} is resumed after this closes, when its worker runs, then it can build its deliverable without the gap named above.`,
+   "",
+   "## Out of scope",
+   "",
+   `- Resuming node #${node.id}: its parked row resumes by ranger's resume watch, not by this node.`,
+  ].join("\n"),
+ };
+}
+
+/**
+ * The park a resume condition names, as a key segment: a retry of the same
+ * condition files nothing new, and a resumed worker that reports a different
+ * gap files its own prerequisite instead of being handed the old one.
+ */
+export function parkIdentity(resume: string): string {
+ return createHash("sha256").update(resume.trim()).digest("hex").slice(0, 16);
+}
+
+async function openReferencedNode(graph: ScribeGraph, repo: string, reference: NodeReference, self: string): Promise<string | null> {
+ if (sameNode(repo, reference.id, self)) return null;
+ if (reference.repo !== undefined && reference.repo !== repoIdentity(parseForgeRef(repo))) return null;
+ const read = await graph.node(reference.id);
+ return read.status === "closed" ? null : reference.id;
+}
+
+/**
+ * File the prerequisite a blocked park's resume condition names, or link the
+ * open node the condition already names, and wire it as the parked node's
+ * blocker. One filing per parked node and resume condition (the scribe key
+ * carries the condition's identity), so a second pass over the same park adds
+ * nothing while a different gap gets its own node. A condition that names no
+ * open node is filed below the parked node's parent; a parent that is the map
+ * root files below the parked node itself, since ranger never files on the
+ * root.
+ */
+export async function fileBlockedPrerequisite(
+ graph: ScribeGraph,
+ journal: Journal,
+ park: BlockedPrerequisite,
+ fence?: () => void,
+): Promise<PrerequisiteFiling> {
+ const { map, node } = park;
+ const resume = park.report.resume.trim();
+ if (resume.length === 0) return { kind: "none" };
+ const parent = node.parent?.id;
+ if (parent === undefined) throw new ScribeError(`node #${node.id} sits below no parent: ranger cannot wire its blocking prerequisite`);
+ const reference = namedNodeReference(resume);
+ const existing = reference === null ? null : await openReferencedNode(graph, map.repo, reference, node.id);
+ if (existing !== null) {
+  fence?.();
+  await graph.link(node.id, parent, [existing]);
+  return { kind: "linked", node: existing };
+ }
+ const filingParent = sameNode(map.repo, parent, String(map.root)) ? node.id : parent;
+ const spec = blockedPrerequisiteSpec(node, park.report);
+ const filed = await scribeFile(graph, journal, {
+  map, parent: filingParent, owner: node.id, variant: parkIdentity(resume), provenance: "blocked-prerequisite", spec,
+ }, fence);
+ fence?.();
+ await graph.link(node.id, parent, [filed.node]);
+ return { kind: "filed", node: filed.node, added: filed.added };
 }

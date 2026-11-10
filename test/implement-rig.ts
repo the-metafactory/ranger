@@ -242,6 +242,7 @@ export async function rig(opts: {
  autoMerge?: boolean;
  /** The node's probes (default: src/feature.ts exists on main). */
  probes?: { type: string; [key: string]: unknown }[];
+ parent?: string;
 }): Promise<Rig & { calls: number[]; announced: string[] }> {
  const nodeId = opts.nodeId ?? "20";
  const dir = mkdtempSync(join(tmpdir(), "ranger-implement-"));
@@ -271,7 +272,7 @@ export async function rig(opts: {
    author: opts.author ?? "alice",
    url: `https://github.com/acme/widgets/issues/${nodeId}`,
    typed: true,
-   parent: { id: "1" },
+   parent: { id: opts.parent ?? "1" },
    body: opts.body?.(node) ?? "## Task\n\nAdd src/feature.ts and its test.",
   }),
  );

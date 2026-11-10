@@ -6,6 +6,7 @@ import {
  BLOCKED_REPORT_FILE,
  blockerNoteOnly,
  discardBlockedReport,
+ namedNodeReference,
  parseBlockedReport,
  readBlockedReport,
 } from "../src/blocked-report.ts";
@@ -46,6 +47,22 @@ describe("parseBlockedReport", () => {
   expect(r.reason.length).toBe(300);
   expect(r.reason.endsWith("…")).toBe(true);
   expect(r.reason).not.toContain("\n");
+ });
+});
+
+describe("namedNodeReference: the node a resume condition names", () => {
+ test("a bare #N counts wherever it stands, and a qualified owner/name#N carries its repo", () => {
+  expect(namedNodeReference("open node #3459 or publish a release")).toEqual({ id: "3459" });
+  expect(namedNodeReference("#12 closes")).toEqual({ id: "12" });
+  expect(namedNodeReference("wait for the-metafactory/cortex#3460")).toEqual({ repo: "the-metafactory/cortex", id: "3460" });
+  expect(namedNodeReference("#12 and #13")).toEqual({ id: "12" });
+ });
+
+ test("a bare repo prefix, a word glued to the hash and a non-numeric tag name no node", () => {
+  expect(namedNodeReference("cortex#3459 is open")).toBeNull();
+  expect(namedNodeReference("see PR#12")).toBeNull();
+  expect(namedNodeReference("nothing here")).toBeNull();
+  expect(namedNodeReference("#3459abc")).toBeNull();
  });
 });
 
