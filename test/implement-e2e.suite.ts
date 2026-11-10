@@ -4323,6 +4323,44 @@ describe("implement lane (node #23)", () => {
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
  }, 60_000);
 
+ test("a blocked park files its missing prerequisite as a propose node below the parked node's parent and blocks it (node #514)", async () => {
+  const r = await rig({ parent: "5" });
+  cleanup.push(r.dir);
+  r.ctx.workerCommand = [implementWorker, "blocked"];
+  expect((await runNode("20", r.ctx)).status).toBe("parked");
+  const state = (): { issues?: Record<string, any>; nodes?: Record<string, any>; links?: { node: string; parent: string }[] } =>
+   JSON.parse(readFileSync(r.statePath, "utf8"));
+  const issues = Object.values(state().issues ?? {});
+  expect(issues).toHaveLength(1);
+  expect(issues[0]).toMatchObject({
+   parent: "5",
+   autonomy: "propose",
+   kind: "build",
+   title: "Prerequisite for #20: publish a widgets SDK release that exports feature().",
+   labels: ["orienteer:build"],
+  });
+  expect(issues[0].prose).toContain("Resume condition: publish a widgets SDK release that exports feature().");
+  expect(issues[0].prose).toContain("The widgets SDK has no release with the feature export.");
+  expect(state().links).toContainEqual({ node: "20", parent: "5" });
+  expect(state().nodes?.["20"]?.blockedBy).toEqual([String(issues[0].number)]);
+  expect(r.announced).toHaveLength(1);
+  expect(r.announced[0]).toMatch(/^📌 Ranger filed node #20's missing prerequisite as node #\d+ and linked it as #20's blocker\.$/);
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => /^filed the blocked park's prerequisite #\d+, which blocks #20 \(blocked-prerequisite\)$/.test(d))).toBe(true);
+  reclaim(r);
+  expect((await runNode("20", r.ctx)).status).toBe("parked");
+  expect(Object.values(state().issues ?? {})).toHaveLength(1);
+  expect(r.announced).toHaveLength(1);
+ }, 60_000);
+
+ test("a park that is not blocked files no prerequisite (node #514)", async () => {
+  const r = await rig({ parent: "5", probe: "fake-probe fail {node}" });
+  cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe("parked");
+  expect(JSON.parse(readFileSync(r.statePath, "utf8")).issues ?? {}).toEqual({});
+  expect(r.announced).toEqual([]);
+ }, 60_000);
+
  test("a build that only commits a blocker note parks as blocked before its tests, and a resume builds afresh", async () => {
   const r = await rig({});
   cleanup.push(r.dir);

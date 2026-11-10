@@ -36,6 +36,7 @@ body=""
 parent=""
 labels=""
 once=""
+blocked=""
 kind=""
 probes=""
 evidence_file="$(mktemp)"
@@ -62,6 +63,7 @@ while [ $i -le $# ]; do
     --kind) i=$((i+1)); kind="${!i}" ;;
     --once) i=$((i+1)); once="${!i}" ;;
     --probe) i=$((i+1)); probes="${probes}${!i}"$'\n' ;;
+    --blocked-by) i=$((i+1)); blocked="${blocked}${!i}"$'\n' ;;
     --write) : ;;
     --dry-run) : ;;
   esac
@@ -139,6 +141,43 @@ case "$verb" in
       exit 0
     fi
     if [ ! -f "$file" ]; then
+      # A node this run filed (an `add` in state) reads back as soma shows it,
+      # so the Scribe's re-read of its own filing works.
+      if [ "$verb" = "node" ] && [ -n "${FAKE_SOMA_STATE:-}" ] && [ -f "${FAKE_SOMA_STATE}" ]; then
+        if python3 - "$root" "$repo" <<'PY'
+import json, os, sys
+
+nid, repo = sys.argv[1], sys.argv[2]
+with open(os.environ["FAKE_SOMA_STATE"]) as fh:
+    s = json.load(fh)
+issue = (s.get("issues") or {}).get(nid)
+if issue is None:
+    sys.exit(93)
+entry = issue
+parent = entry.get("parent")
+print(json.dumps({
+    "repo": repo,
+    "ref": {"id": nid},
+    "node": {
+        "id": nid,
+        "title": entry.get("title", ""),
+        "kind": entry.get("kind", "build"),
+        "autonomy": entry.get("autonomy", "propose"),
+        "checkpointId": entry.get("checkpoint", ""),
+    },
+    "status": entry.get("status", "open"),
+    "assignees": entry.get("assignees", []),
+    "blockedBy": [{"id": b, "status": "open"} for b in entry.get("blockedBy", [])],
+    "author": "",
+    "url": "",
+    "typed": True,
+    **({} if parent is None else {"parent": {"id": str(parent)}}),
+}))
+PY
+        then
+          exit 0
+        fi
+      fi
       echo "fake soma: no fixture $file" >&2
       exit 93
     fi
@@ -158,7 +197,8 @@ export FAKE_SOMA_STATE FAKE_SOMA_REPO_DIR FAKE_SOMA_IDENTITY="$identity" \
   FAKE_SOMA_PROPOSE="$propose" FAKE_SOMA_BODY_FILE="$body_file" \
   FAKE_SOMA_PROPOSAL_COMMENT="$proposal_comment" \
   FAKE_SOMA_TITLE="$title" FAKE_SOMA_AUTONOMY="$autonomy" FAKE_SOMA_BODY="$body" \
-  FAKE_SOMA_PARENT="$parent" FAKE_SOMA_LABELS="$labels" FAKE_SOMA_KIND="$kind" FAKE_SOMA_PROBES="$probes" FAKE_SOMA_ONCE="$once"
+  FAKE_SOMA_PARENT="$parent" FAKE_SOMA_LABELS="$labels" FAKE_SOMA_KIND="$kind" FAKE_SOMA_PROBES="$probes" FAKE_SOMA_ONCE="$once" \
+  FAKE_SOMA_BLOCKED="$blocked"
 
 # A test can make the map-index write fail the way it did live (node #108).
 if [ "$verb" = "decisions" ] && [ -n "${FAKE_SOMA_DECISIONS_FAIL:-}" ]; then
@@ -285,11 +325,16 @@ if verb == "link":
         sys.exit(1)
     issue = s.setdefault("issues", {}).get(nid)
     if issue is None:
+        # A node the fixtures describe (a walked node) is linkable too.
+        issue = s.setdefault("nodes", {}).get(nid)
+    if issue is None:
         print(f"fake soma: no node {nid}", file=sys.stderr)
         sys.exit(1)
     parent = os.environ.get("FAKE_SOMA_PARENT", "")
     status = "already" if issue.get("parent") == parent else "attached"
+    blocked_by = [b for b in os.environ.get("FAKE_SOMA_BLOCKED", "").split("\n") if b]
     issue["parent"] = parent
+    issue["blockedBy"] = list(dict.fromkeys(issue.get("blockedBy", []) + blocked_by))
     s.setdefault("links", []).append({"node": nid, "parent": parent})
     save()
     print(json.dumps({"repo": repo, "node": nid, "parent": parent, "parentStatus": status}))

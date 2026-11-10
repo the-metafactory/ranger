@@ -10,8 +10,10 @@ import { closeResolution, scribeAfterMerge, type ImplementContext, type Recorded
 import { FencedError, Journal } from "../src/journal.ts";
 import {
  assertFilable,
+ blockedPrerequisiteSpec,
  codeCommentSpec,
  commentSyntax,
+ fileBlockedPrerequisite,
  landminesInDiff,
  lineHasMarkerComment,
  scribeFile,
@@ -32,6 +34,7 @@ interface FakeNode {
  blockedBy: string[];
  autonomy: string;
  checkpointId?: string;
+ status?: string;
 }
 
 /** A tracker the Scribe writes to; flags reproduce the documented partial-write shapes. */
@@ -67,6 +70,7 @@ function fakeGraph() {
    return {
     ...(n.parent === null ? {} : { parent: { id: n.parent } }),
     blockedBy: n.blockedBy.map((b) => ({ id: b, status: "open" })),
+    status: n.status ?? "open",
     node: { id, title: "", kind: "build", autonomy: n.autonomy, ...(n.checkpointId === undefined ? {} : { checkpointId: n.checkpointId }) },
    };
   },
@@ -177,6 +181,105 @@ describe("scribeFile: add, record, re-read, repair", () => {
   const { graph, calls } = fakeGraph();
   await expect(scribeFile(graph, journal, { ...filing(), parent: "9" })).rejects.toThrow(/map root/);
   expect(calls).toEqual([]);
+ });
+});
+
+describe("a blocked park's prerequisite (node #514)", () => {
+ let dir: string;
+ let journal: Journal;
+ beforeEach(() => {
+  dir = mkdtempSync(join(tmpdir(), "ranger-prerequisite-test-"));
+  journal = memoryJournal(dir);
+ });
+ afterEach(() => {
+  journal.close();
+  rmSync(dir, { recursive: true, force: true });
+ });
+
+ const REPORT = {
+  reason: "Node #3358 is blocked The desk adapter has no session read.",
+  resume: "open node #3459 or an equivalent session-read release is published",
+ };
+ const park = (parent: string | null = "5") => ({
+  map: MAP,
+  node: { id: "24", title: "Add the desk adapter", ...(parent === null ? {} : { parent: { id: parent } }) },
+  report: REPORT,
+ });
+ const parked = () => ({ parent: "5", blockedBy: [] as string[], autonomy: "auto" });
+
+ test("files one propose build node below the parked node's parent and blocks the parked node with it", async () => {
+  const { graph, nodes, calls } = fakeGraph();
+  nodes.set("24", parked());
+  nodes.set("3459", { parent: "9", blockedBy: [], autonomy: "auto", status: "closed" });
+  const filed = await fileBlockedPrerequisite(graph, journal, park());
+  expect(filed).toEqual({ kind: "filed", node: "300", added: true });
+  expect(nodes.get("300")).toMatchObject({ parent: "5", autonomy: "propose", checkpointId: "blocked-prerequisite-24" });
+  expect(nodes.get("24")?.blockedBy).toEqual(["300"]);
+  expect(calls).toEqual(["node 3459", "add 5", "node 300", "link 24 5 [300]"]);
+  const spec = blockedPrerequisiteSpec({ id: "24", title: "Add the desk adapter" }, REPORT);
+  expect(spec.title).toBe("Prerequisite for #24: open node #3459 or an equivalent session-read release is published");
+  expect(spec.body).toContain("open node #3459 or an equivalent session-read release is published");
+  expect(spec.body).toContain("Node #3358 is blocked The desk adapter has no session read.");
+  expect(spec).toMatchObject({ autonomy: "propose", kind: "build", labels: ["orienteer:build"] });
+ });
+
+ test("a second pass over the same park files no second node and wires no second edge", async () => {
+  const { graph, nodes, calls } = fakeGraph();
+  nodes.set("24", parked());
+  nodes.set("3459", { parent: "9", blockedBy: [], autonomy: "auto", status: "closed" });
+  await fileBlockedPrerequisite(graph, journal, park());
+  expect(await fileBlockedPrerequisite(graph, journal, park())).toEqual({ kind: "filed", node: "300", added: false });
+  expect(calls.filter((c) => c.startsWith("add"))).toHaveLength(1);
+  expect(new Set(nodes.get("24")?.blockedBy)).toEqual(new Set(["300"]));
+ });
+
+ test("a resume condition naming an open node links that node instead of filing one", async () => {
+  const { graph, nodes, calls } = fakeGraph();
+  nodes.set("24", parked());
+  nodes.set("3459", { parent: "9", blockedBy: [], autonomy: "auto" });
+  expect(await fileBlockedPrerequisite(graph, journal, park())).toEqual({ kind: "linked", node: "3459" });
+  expect(calls).toEqual(["node 3459", "link 24 5 [3459]"]);
+  expect(nodes.get("24")?.blockedBy).toEqual(["3459"]);
+  expect([...nodes.keys()]).toEqual(["24", "3459"]);
+ });
+
+ test("a named repo other than the map's, the parked node itself and an unreadable node are filed instead", async () => {
+  for (const resume of ["the-metafactory/cortex#3459 is open", "own node #24 closes", "another repo: acme/other#12"]) {
+   const { graph, nodes, calls } = fakeGraph();
+   const once = memoryJournal(dir);
+   try {
+    nodes.set("24", parked());
+    nodes.set("3459", { parent: "9", blockedBy: [], autonomy: "auto" });
+    expect(await fileBlockedPrerequisite(graph, once, { ...park(), report: { ...REPORT, resume } })).toMatchObject({ kind: "filed", added: true });
+   } finally {
+    once.close();
+   }
+   expect(calls.filter((c) => c.startsWith("add"))).toHaveLength(1);
+   expect(nodes.get("24")?.blockedBy).toEqual(["300"]);
+  }
+ });
+
+ test("a report naming no resume condition files nothing", async () => {
+  const { graph, nodes, calls } = fakeGraph();
+  nodes.set("24", parked());
+  expect(await fileBlockedPrerequisite(graph, journal, { ...park(), report: { reason: "no SDK", resume: "" } })).toEqual({ kind: "none" });
+  expect(calls).toEqual([]);
+ });
+
+ test("a parked node below the map root is filed below itself: ranger never files on the root", async () => {
+  const { graph, nodes } = fakeGraph();
+  nodes.set("24", { parent: "9", blockedBy: [], autonomy: "auto" });
+  expect(await fileBlockedPrerequisite(graph, journal, park("9"))).toMatchObject({ kind: "filed", node: "300" });
+  expect(nodes.get("300")?.parent).toBe("24");
+  expect(nodes.get("24")?.blockedBy).toEqual(["300"]);
+ });
+
+ test("a parked node below no parent cannot be wired, and a fenced supervisor writes nothing", async () => {
+  const { graph, nodes } = fakeGraph();
+  nodes.set("24", parked());
+  await expect(fileBlockedPrerequisite(graph, journal, park(null))).rejects.toThrow(/sits below no parent/);
+  await expect(fileBlockedPrerequisite(graph, journal, park(), () => { throw new FencedError("superseded"); })).rejects.toThrow(FencedError);
+  expect(journal.getHealth(scribeKey(MAP, "24", "blocked-prerequisite"))).toBeNull();
  });
 });
 
