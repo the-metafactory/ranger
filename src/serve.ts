@@ -64,7 +64,7 @@ import {
 } from "./config.ts";
 import { drainGate, freshCandidates, freshClaimRefusal, implementCandidates, planTick, walkableCandidates, type DrainState } from "./candidates.ts";
 import { pidAlive as defaultPidAlive } from "./exec.ts";
-import { Journal, vetoApplies, type LaneHolder, type ResumeQueueRow, type WorkerRow } from "./journal.ts";
+import { Journal, vetoApplies, type LaneHolder, type ResumeQueueRow, type SubstrateSessionRow, type WorkerRow } from "./journal.ts";
 import { ForeignMigrationError } from "./journal-guard.ts";
 import { IMPLEMENT_LANES, implementLane, workerLane, type ImplementLane } from "./lanes.ts";
 import { activeCooldown, cooldownScope, readGraphqlBudget } from "./budget.ts";
@@ -79,7 +79,7 @@ import { briefHoldReason, classify, classifyFrontier, type ClassifiedNode, loadP
 import { liveSession, substrateUsageViews, type SubstrateUsageView } from "./substrate-usage.ts";
 import { resolveReadOnlyToken, assertReadOnlyToken, gatedEnv, gitlabApiRead, tokenBatch, type TokenBatch, type ResolvedToken } from "./token-gate.ts";
 import { childEnv, itermArgv, shellQuote, sessionCommand, sessionSubstrate } from "./launch.ts";
-import type { SubstrateName } from "./store/schema.ts";
+import type { SessionKind, SubstrateName } from "./store/schema.ts";
 import {
  type ActionKind,
  type ActionDeps,
@@ -214,6 +214,7 @@ export interface StateInputs {
  now: Date;
  /** Every substrate's limits and sessions, as the panel shows them (node #56). */
  substrates?: SubstrateUsageView[];
+ openSessions?: SubstrateSessionRow[];
  /** Parked, failed and needs-eye rows (node #54). */
  needsYou?: NeedsYouEntry[];
  /** Awaiting-merge rows whose labels are not known yet, with the read's error. */
@@ -262,6 +263,7 @@ export interface CurrentJob {
  status: WorkerRow["status"];
  phase: WorkerRow["phase"];
  substrate: WorkerRow["substrate"];
+ session: { kind: SessionKind; substrate: SubstrateName } | null;
  lane: string | null;
  resourceLane: ImplementLane | null;
  prNumber: number | null;
@@ -535,6 +537,13 @@ export function assembleState(inputs: StateInputs): DashboardState {
   return inputs.titles.get(nodeKey(repo, id)) ?? null;
  };
 
+ const openSession = ({ repo, nodeId, generation }: WorkerRow): CurrentJob["session"] => {
+  const newest = (inputs.openSessions ?? [])
+   .filter((row) => row.repo === repo && row.nodeId === nodeId && row.generation === generation && row.endedAt === null)
+   .reduce<SubstrateSessionRow | null>((latest, row) => (latest === null || row.id > latest.id ? row : latest), null);
+  return newest === null ? null : { kind: newest.kind, substrate: newest.substrate };
+ };
+
  const current: CurrentJob[] = inputs.workers
   .filter((w) => IN_FLIGHT.has(w.status))
   .map((w) => ({
@@ -545,6 +554,7 @@ export function assembleState(inputs: StateInputs): DashboardState {
    status: w.status,
    phase: w.phase,
    substrate: w.substrate,
+   session: openSession(w),
    lane: w.lane,
    resourceLane: w.lane === "implement" ? workerLane(w, laneMaps) : null,
    prNumber: w.prNumber,
@@ -1156,8 +1166,10 @@ function jobTime(iso) {
 // One pill per fact, each once: status and phase are often the same word.
 function jobTags(j) {
  if (j.stale) return [tag("stale: process gone", "stale")];
- const substrate = { claude: "Claude", codex: "Codex", pi: "Pi" }[j.substrate] || "unknown";
- const parts = [j.resourceLane || j.lane, j.status, j.phase, "substrate: " + substrate, j.prLabel || "", j.reviewRound && !j.suspicious ? "round " + j.reviewRound : ""];
+ const name = (sub) => ({ claude: "Claude", codex: "Codex", pi: "Pi" }[sub] || "unknown");
+ const doing = { worker: "build", "fix-pass": "fix pass", review: "review" };
+ const running = j.session ? (doing[j.session.kind] || j.session.kind) + " on " + name(j.session.substrate) : "substrate: " + name(j.substrate);
+ const parts = [j.resourceLane || j.lane, j.status, j.phase, running, j.prLabel || "", j.reviewRound && !j.suspicious ? "round " + j.reviewRound : ""];
  const pills = [...new Set(parts.filter(Boolean))].map((p) => tag(p));
  return j.suspicious ? [...pills, tag("round " + j.reviewRound + ": suspicious", "stale")] : pills;
 }
@@ -2074,6 +2086,7 @@ export function stateFromJournal(
   const vetoes = journal?.listVetoes() ?? [];
   const workers = journal?.listWorkers() ?? [];
   const resumeQueue = journal?.listResumeQueue() ?? [];
+  const sessions = journal?.listSubstrateSessions(new Date(now.getTime() - 7 * 24 * 60 * 60_000)) ?? null;
   const laneHolders = { visual: journal?.laneHolder("visual") ?? null, headless: journal?.laneHolder("headless") ?? null };
   const occupancy = (lane: ImplementLane): LaneOccupancy => {
    const o = journal?.laneOccupancy(lane);
@@ -2143,9 +2156,10 @@ export function stateFromJournal(
    refreshing: reader.refreshing,
    refreshError: reader.lastError,
    now,
+   openSessions: (sessions ?? []).filter((row) => row.endedAt === null),
    substrates: substrateUsageViews({
     readings: journal?.listSubstrateReadings() ?? [],
-    sessions: journal?.listSubstrateSessions(new Date(now.getTime() - 7 * 24 * 60 * 60_000)) ?? null,
+    sessions,
     lastSession: (substrate) => journal?.lastSubstrateSession(substrate) ?? null,
     live: liveSession(workers, defaultPidAlive),
     config: config.substrates,
