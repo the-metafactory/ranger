@@ -276,7 +276,8 @@ export async function processResumeQueue(
      continue;
     }
     if (conflictResume(entry) && !hasMergeConflict(pr)) {
-     if (entry.reason === "merge-conflict-resume") journal.setResumeReason(entry, null);
+     if (entry.reason === "merge-conflict-host-load") journal.setResumeReason(entry, "host-load");
+     else if (entry.reason === "merge-conflict-resume") journal.setResumeReason(entry, null);
      else drop("PR no longer conflicts");
      continue;
     }

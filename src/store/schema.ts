@@ -82,7 +82,7 @@ export const resumeQueue = sqliteTable("resume_queue", {
  queuedAt: text("queued_at").notNull(),
  failedStarts: integer("failed_starts").notNull().default(0),
  /** Why ranger queued it (node #297): "host-load" waits for a quiet host; null is an operator's `--when-free`. */
- reason: text("reason", { enum: ["host-load", "merge-conflict", "merge-conflict-resume"] }),
+ reason: text("reason", { enum: ["host-load", "merge-conflict", "merge-conflict-resume", "merge-conflict-host-load"] }),
 }, table => [
  uniqueIndex("resume_queue_repo_node_idx").on(table.repo, table.nodeId),
  index("resume_queue_lane_id_idx").on(table.lane, table.id),

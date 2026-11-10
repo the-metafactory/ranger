@@ -69,6 +69,10 @@ function rig() {
   url: `https://github.com/${REPO}/issues/${id}`,
  })) }));
  frontier(1, ["20"]); frontier(460, ["21"]);
+ writeFileSync(join(data, "acme__widgets-node-40.json"), JSON.stringify({
+  repo: REPO, ref: { id: "40" }, node: { id: "40", title: "Build 40", kind: "task", autonomy: "auto" },
+  status: "open", assignees: ["ivy-bot"], blockedBy: [], author: "alice", typed: true, url: "",
+ }));
  for (const root of [1, 460]) writeFileSync(join(data, `acme__widgets-audit-${root}.json`), JSON.stringify({
   repo: REPO, root: String(root), nodes: 1, closedWithoutReceipt: [], openWithoutCheckpoint: [], openClaimed: [],
  }));
@@ -447,7 +451,7 @@ describe("node #47 — map identity", () => {
    r.journal.updateWorker("40", REPO, { phase: "awaiting-merge", prNumber: 7 });
    const spawned: string[] = [];
    const result = await walk({
-    config: r.config, configPath: r.configPath, journal: r.journal, github: conflictingPrForge(),
+    config: r.config, configPath: r.configPath, journal: r.journal, github: conflictingPrForge(), hostLoad: () => ({ load: 0, cores: 8 }),
     spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; },
    });
    expect(spawned).toEqual(["40"]); // the send-back, and no fresh worker
@@ -469,7 +473,7 @@ describe("node #47 — map identity", () => {
    expect(r.journal.laneHolder(implementLane(r.config.maps[0]))?.nodeId).toBe("45");
    const spawned: string[] = [];
    const result = await walk({
-    config: r.config, configPath: r.configPath, journal: r.journal, github: conflictingPrForge(),
+    config: r.config, configPath: r.configPath, journal: r.journal, github: conflictingPrForge(), hostLoad: () => ({ load: 0, cores: 8 }),
     spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; },
    });
    expect(r.journal.getWorker("45", REPO)?.status).not.toBe("running"); // parked or released
@@ -487,7 +491,7 @@ describe("node #47 — map identity", () => {
    r.journal.upsertWorker({ root: 460, nodeId: "45", repo: REPO, status: "running", lane: "implement" });
    r.journal.updateWorker("45", REPO, { pid: 999_999, attempts: 0, phase: "implement" });
    const result = await walk({
-    config: r.config, configPath: r.configPath, journal: r.journal, github: conflictingPrForge(),
+    config: r.config, configPath: r.configPath, journal: r.journal, github: conflictingPrForge(), hostLoad: () => ({ load: 0, cores: 8 }),
     spawnRunNode: async ({ nodeId }) => {
      if (nodeId === "45") throw new Error("spawn exploded");
      return process.pid;

@@ -1,5 +1,5 @@
 import { hasMergeConflict } from "./forge.ts";
-import { conflictResume } from "./resume-priority.ts";
+import { conflictResume, promotedConflictReason } from "./resume-priority.ts";
 import { resolveNodeSelector, workerPreflight, type DispatchDeps } from "./node-dependency.ts";
 import { cachedProbe } from "./endpoint.ts";
 import { startOwnedWorker, FRESH_START_FAILURE, startFailureOutcome } from "./node-ownership.ts";
@@ -273,6 +273,7 @@ function recordFreshClaim(args: ClaimNodeArgs, messageId: string | null, at: Dat
 export async function walk(ctx: WalkContext): Promise<WalkResult> {
  ctx = { ...ctx, endpointProbe: cachedProbe(ctx.endpointProbe), nodeSelector: resolveNodeSelector(ctx) };
  const { config, journal } = ctx;
+ const deskOnly = typeof ctx.maintenance === "object";
  const registry = loadProbeRegistry();
  const result: WalkResult = {
   maps: [],
@@ -404,7 +405,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
  }
  for (const { map, mapResult, token, botIdentity, graphToken, errors } of walked) {
   try {
-   if (typeof ctx.maintenance === "object") continue;
+   if (deskOnly) continue;
    mapResult.sweep = await sweepPhase({ map, token, botIdentity, graphToken }, "liveness");
   } catch (error) {
    errors.push(
@@ -431,13 +432,13 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
    if (w === undefined || row?.prNumber == null || (row.lane !== "implement" || row.phase === "close")) continue;
    try {
     const pr = await getPr(entry.repo, row.prNumber, w.token);
-    if (hasMergeConflict(pr) && !conflictResume(entry)) journal.setResumeReason(entry, "merge-conflict-resume");
+    if (hasMergeConflict(pr) && !conflictResume(entry)) journal.setResumeReason(entry, promotedConflictReason(entry));
    } catch (error) { journal.recordEvent("sweep", { repo: entry.repo, nodeId: entry.nodeId, detail: `queued conflict discovery deferred: ${String(error)}` }); }
   }
   priorityStarts.push(...await processResumeQueue({ ...ctx, github: { getPr } }, queueMaps(), lanesTakenThisTick, owned, true));
  });
  for (const w of walked) {
-  if (typeof ctx.maintenance === "object") continue;
+  if (deskOnly) continue;
   try {
    const recovered = await sweepPhase(w, "recovery");
    w.mapResult.sweep?.respawned.push(...recovered.respawned);
@@ -445,7 +446,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
  }
 
  try {
-  if (typeof ctx.maintenance !== "object") result.probeRequeues = await withClaimLock(journal, (owned) => requeueProbes({
+  if (!deskOnly) result.probeRequeues = await withClaimLock(journal, (owned) => requeueProbes({
    config, journal, maps: retryMaps, nodeSelector: ctx.nodeSelector, endpointProbe: ctx.endpointProbe, endpointLookup: ctx.endpointLookup, now: ctx.now, limit: config.workers.probeRequeues, owned,
    spawn: spawnNode,
   }));

@@ -1203,6 +1203,26 @@ describe("merge-conflict priority (node #517)", () => {
   });
  });
 
+ test("a host-load resume keeps its origin and host gate after its conflict clears", async () => {
+  await withRig(async r => {
+   r.worker("10", 1, "running");
+   r.worker("30", 460);
+   r.journal.updateWorker("30", REPO, { prNumber: 30 });
+   r.journal.enqueueResume({ repo: REPO, nodeId: "30", root: 460, lane: "headless", reason: "host-load" }, NOW);
+   const spawned: string[] = [];
+   const reasons: unknown[] = [];
+   const ctx = { ...r, now: () => NOW, hostLoad: () => ({ load: 0, cores: 8 }),
+    spawnRunNode: async ({ nodeId }: SpawnRunNodeArgs) => { spawned.push(nodeId); reasons.push(r.journal.getResume(REPO, nodeId)?.reason); return process.pid; } };
+   await walk({ ...ctx, github: conflictForge([30]) });
+   expect(r.journal.getResume(REPO, "30")?.reason).toBe("merge-conflict-host-load");
+   r.journal.updateWorker("10", REPO, { status: "success" });
+   await walk({ ...ctx, github: conflictForge([]) });
+   expect(spawned).toEqual(["30"]);
+   expect(reasons).toEqual(["host-load"]);
+   expect(r.journal.listNodeEvents(REPO, "30").find(e => e.kind === "resume-started")).toBeDefined();
+  });
+ });
+
  test.each(["sweep", "desk"])("%s maintenance considers other maps' conflicts before ordinary send-backs", async mode => {
   await withRig(async r => {
    for (const [id, root] of [["20", 1], ["30", 460]] as const) {
