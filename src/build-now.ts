@@ -1,6 +1,6 @@
 import { resolveNodeSelector, type DispatchDeps } from "./node-dependency.ts";
 import { join } from "node:path";
-import { freshClaimRefusal } from "./candidates.ts";
+import { drainGate, freshClaimRefusal } from "./candidates.ts";
 import { graphReadToken, laneCredentialRefusal, type ReadGate } from "./forge-lanes.ts";
 import { WRITE_TOKEN_SOURCE } from "./github-usage.ts";
 import type { ResolvedToken } from "./token-gate.ts";
@@ -13,7 +13,7 @@ import { type BriefAudit, type FrontierEntry, GRAPH_CALL_TIMEOUT_MS } from "./gr
 import type { Journal, WorkerRow } from "./journal.ts";
 import type { OwnedCheck } from "./lock.ts";
 import { implementLane } from "./lanes.ts";
-import { laneHeldMessage } from "./maps.ts";
+import { laneHeldMessage, mapKey, readDrains } from "./maps.ts";
 import {
  briefHoldReason,
  classifyFrontier,
@@ -211,6 +211,9 @@ async function buildUnderLock(nodeId: string, ctx: BuildNowContext, owned: Owned
  if (holder !== null && ctx.force !== true) {
   refuse(laneHeldMessage(implementLane(map), holder, "build", nodeId));
  }
+
+ const drain = drainGate({ key: mapKey(map), lane: implementLane(map) }, readDrains(journal, [map]));
+ if (drain !== null && (drain.scope === "map" || lane === "implement")) refuse(drain.reason);
 
  const outcome = await claimNode({
   config: ctx.config, journal,

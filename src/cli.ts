@@ -7,6 +7,7 @@ import { isGithubRepo } from "./forge-ref.ts";
 import { graphReadToken, laneCredentialRefusal, lanePort } from "./forge-lanes.ts";
 import { changeRequestNoun } from "./forge-text.ts";
 import { mapKey, pickMap } from "./maps.ts";
+import { changeDrain, type DrainTarget } from "./drain.ts";
 import { configureGitHubUsage, githubUsageDirectory } from "./github-usage.ts";
 import { buildUsageReport, parsePeriodStart, renderUsageReport } from "./github-usage-report.ts";
 import { implementLane } from "./lanes.ts";
@@ -567,22 +568,16 @@ function runResumeRun(configPath: string): string {
  return JSON.stringify({ resumed: true, was }, null, 2);
 }
 
-/**
- * Operator verb (node #165): drain the visual lane (every visual map, one
- * switch) or one headless map, so no new frontier work is claimed there;
- * `off` lifts it. Every refusal is decided from the config alone, before
- * the journal opens, so a refused drain writes nothing.
- */
-function runDrain(
+async function runDrain(
  configPath: string,
  opts: { lane?: string; map?: string; off?: boolean },
-): string {
+): Promise<string> {
  if ((opts.lane === undefined) === (opts.map === undefined)) {
   throw new Error("name exactly one of --lane visual or --map <owner/name#root>");
  }
  const drained = opts.off !== true;
  const { config } = loadConfig(configPath);
- let target: { scope: "lane"; lane: "visual" } | { scope: "map"; key: string };
+ let target: DrainTarget;
  if (opts.lane !== undefined) {
   if (opts.lane !== "visual") {
    throw new Error(`--lane '${opts.lane}' cannot be drained: only the visual lane is a machine-wide switch; drain a headless map with --map <owner/name#root>`);
@@ -597,12 +592,7 @@ function runDrain(
  }
  const journal = openJournal(config);
  try {
-  const was = target.scope === "lane" ? journal.isVisualLaneDrained() : journal.isMapDrained(target.key);
-  if (target.scope === "lane") journal.setVisualLaneDrained(drained);
-  else journal.setMapDrained(target.key, drained);
-  const what = target.scope === "lane" ? "visual lane" : target.key;
-  journal.recordEvent("drain", { detail: `${what} ${drained ? "drained" : "drain lifted"} by operator (was ${was ? "drained" : "open"})` });
-  return JSON.stringify({ ...target, drained, was }, null, 2);
+  return JSON.stringify(await changeDrain(journal, target, drained), null, 2);
  } finally {
   journal.close();
  }
@@ -1316,10 +1306,10 @@ program
  .option("-m, --map <owner/name#root>", "drain one headless-lane map")
  .option("--off", "lift the drain")
  .option("-c, --config <path>", "path to ranger.yaml (fallback: $RANGER_CONFIG, then ~/.config/ranger/ranger.yaml)")
- .action((options: { lane?: string; map?: string; off?: boolean; config: string | undefined }) => {
+ .action(async (options: { lane?: string; map?: string; off?: boolean; config: string | undefined }) => {
   try {
    const configPath = resolveConfigPath(options.config, process.env, process.cwd());
-   process.stdout.write(runDrain(configPath, options) + "\n");
+   process.stdout.write(await runDrain(configPath, options) + "\n");
   } catch (error) {
    process.stderr.write(`ranger drain: ${error instanceof Error ? error.message : String(error)}\n`);
    process.exit(1);

@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stringify } from "yaml";
 import { buildNow, BuildNowRefusal, type BuildNowContext } from "../src/build-now.ts";
-import { ClaimLeaseLost, withClaimLock } from "../src/claim-lock.ts";
+import { ClaimLeaseLost, ClaimLockBusy, withClaimLock } from "../src/claim-lock.ts";
+import { changeDrain, type DrainTarget } from "../src/drain.ts";
 import { loadConfig } from "../src/config.ts";
 import type { FrontierEntry } from "../src/graph.ts";
 import { openJournal, type Journal } from "../src/journal.ts";
@@ -52,7 +53,7 @@ afterEach(() => {
  cleanup = [];
 });
 
-function rig(opts: { cap?: number } = {}) {
+function rig(opts: { cap?: number; lane?: "headless" | "visual" } = {}) {
  const dir = mkdtempSync(join(tmpdir(), "ranger-build-now-"));
  const configPath = join(dir, "ranger.yaml");
  writeFileSync(
@@ -63,6 +64,7 @@ function rig(opts: { cap?: number } = {}) {
     {
      repo: REPO,
      root: 1,
+     lane: opts.lane ?? "headless",
      walk: "full",
      skip: ["13"],
      commands: { test: "bun test" },
@@ -252,6 +254,97 @@ describe("node #58 — build-now claims and starts a walkable node", () => {
   expect(events.map((e) => e.kind)).toEqual(["claimed"]);
   expect(events[0].detail).toMatch(/announce failed: discord down/);
   expect(r.spawned).toHaveLength(1);
+ });
+});
+
+describe("node #512 — build-now honours drains", () => {
+ for (const lane of ["headless", "visual"] as const) {
+  const target: DrainTarget = lane === "visual" ? { scope: "lane", lane: "visual" } : { scope: "map", key: `${REPO}#1` };
+
+  test(`${lane}: drain committed before admission refuses with no effects; lifting it restores starts`, async () => {
+   const r = rig({ lane });
+   const operator = openJournal(r.config);
+   try {
+    expect(await changeDrain(operator, target, true)).toMatchObject({ drained: true, was: false });
+    const before = r.journal.listEvents();
+    expect(await refusal(buildNow("10", r.ctx({ force: true })))).toContain("drained");
+    expect(r.announced).toEqual([]);
+    expect(r.claimed).toEqual([]);
+    expect(r.spawned).toEqual([]);
+    expect(r.journal.getWorker("10", REPO)).toBeNull();
+    expect(r.journal.spawnsToday(r.ctx().now!())).toBe(0);
+    expect(r.journal.listEvents()).toEqual(before);
+    expect(await changeDrain(operator, target, false)).toMatchObject({ drained: false, was: true });
+    expect(await buildNow("10", r.ctx())).toMatchObject({ pid: 4242 });
+   } finally { operator.close(); }
+  });
+
+  test(`${lane}: admission owns the boundary through spawn before a competing drain can commit`, async () => {
+   const r = rig({ lane });
+   const operator = openJournal(r.config);
+   const entered = Promise.withResolvers<undefined>();
+   const release = Promise.withResolvers<undefined>();
+   const announcing = r.ctx().announce!;
+   const starting = buildNow("10", r.ctx({ announce: async (...args) => {
+    entered.resolve();
+    await release.promise;
+    return announcing(...args);
+   } }));
+   await entered.promise;
+   const draining = changeDrain(operator, target, true);
+   try {
+    await expect(withClaimLock(operator, async () => {}, 0)).rejects.toBeInstanceOf(ClaimLockBusy);
+    expect(operator.isVisualLaneDrained()).toBe(false);
+    expect(operator.isMapDrained(`${REPO}#1`)).toBe(false);
+    expect(operator.listEvents()).toEqual([]);
+    expect(r.claimed).toEqual([]);
+    expect(r.spawned).toEqual([]);
+    expect(r.journal.getWorker("10", REPO)).toBeNull();
+    release.resolve();
+    expect(await starting).toMatchObject({ pid: 4242 });
+    expect(await draining).toMatchObject({ drained: true, was: false });
+    expect(r.claimed).toEqual(["10"]);
+    expect(r.spawned).toHaveLength(1);
+    expect(r.journal.listEvents().map(e => e.kind).reverse()).toEqual(["announced", "claimed", "drain"]);
+    expect(await refusal(buildNow("15", r.ctx({ force: true })))).toContain("drained");
+    expect(r.claimed).toEqual(["10"]);
+    expect(r.spawned).toHaveLength(1);
+   } finally { release.resolve(); await Promise.allSettled([starting, draining]); operator.close(); }
+  });
+
+  for (const force of [false, true]) {
+   test(`${lane} drain refuses implementation before any effects, force=${force}`, async () => {
+    const r = rig({ lane });
+    if (lane === "headless") r.journal.setMapDrained(`${REPO}#1`, true);
+    else r.journal.setVisualLaneDrained(true);
+    const why = await refusal(buildNow("10", r.ctx({ force })));
+    expect(why).toContain(lane === "headless" ? "map drained" : "visual lane drained");
+    expect(why).toContain(lane === "headless" ? `ranger drain --map ${REPO}#1 --off` : "ranger drain --lane visual --off");
+    untouched(r, "10");
+   });
+  }
+ }
+
+ test("a map drain also refuses fresh research", async () => {
+  const r = rig();
+  r.journal.setMapDrained(`${REPO}#1`, true);
+  expect(await refusal(buildNow("11", r.ctx()))).toContain("map drained");
+  untouched(r, "11");
+ });
+
+ test("visual research still starts while the visual lane is drained", async () => {
+  const r = rig({ lane: "visual" });
+  r.journal.setVisualLaneDrained(true);
+  expect(await buildNow("11", r.ctx())).toMatchObject({ lane: "research", pid: 4242 });
+  expect(r.claimed).toEqual(["11"]);
+ });
+
+ test("an unrelated map drain and the visual drain do not stop a headless start", async () => {
+  const r = rig();
+  r.journal.setMapDrained("acme/other#1", true);
+  r.journal.setVisualLaneDrained(true);
+  expect(await buildNow("10", r.ctx())).toMatchObject({ lane: "implement", pid: 4242 });
+  expect(r.claimed).toEqual(["10"]);
  });
 });
 
