@@ -121,6 +121,27 @@ function conflictingPrForge(): ForgePort {
 }
 
 describe("node #165 — ranger drain", () => {
+ for (const [scope, repo, id, args] of [
+  ["map", TOOL, "20", ["--map", `${TOOL}#1`]],
+  ["visual", GAME, "10", ["--lane", "visual"]],
+ ] as const) {
+  test(`the build-now CLI refuses the ${scope} drain without accepting work, even with force`, async () => {
+   const r = rig();
+   try {
+    expect((await r.cli(["drain", ...args])).code).toBe(0);
+    const before = r.journal.listEvents();
+    const out = await r.cli(["build-now", id, "--map", `${repo}#1`, "--force"]);
+    expect(out.code).toBe(1);
+    expect(out.stdout).toBe("");
+    expect(out.stderr).toContain(scope === "map" ? "map drained" : "visual lane drained");
+    expect(r.journal.listEvents()).toEqual(before);
+    expect(r.journal.listWorkers()).toEqual([]);
+    expect(r.journal.spawnsToday()).toBe(0);
+    expect(JSON.parse(readFileSync(join(r.data, "..", "state.json"), "utf8")).nodes).toEqual({});
+   } finally { r.close(); }
+  });
+ }
+
  test("a drained visual lane stops implement claims on every visual map; the headless map claims", async () => {
   const r = rig();
   try {
