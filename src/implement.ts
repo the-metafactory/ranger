@@ -73,7 +73,7 @@ import { WRITE_TOKEN_SOURCE } from "./github-usage.ts";
 import { budgetedRead, budgetPolicy, clearThrottleStrikes, MAX_REVIEW_THROTTLES_IN_A_ROW, recordThrottle, reviewCooldownScope, reviewThrottle, reviewTokenSource } from "./budget.ts";
 import { GraphAddUnattached, closeTimeoutForNode, graphAdd, graphClose, graphDecisions, graphLink, type AddSpec, type CloseResult } from "./graph-write.ts";
 import { FixNodeLockBusy, withFixNodeLock } from "./fix-node-lock.ts";
-import { assertFilable, codeCommentSpec, fileBlockedPrerequisite, foundByProbeSpec, landminesInDiff, scribeFile, splitOutOfReviewSpec, type PrerequisiteFiling, type Provenance, type ScribeGraph } from "./scribe.ts";
+import { assertFilable, codeCommentSpec, fileBlockedPrerequisite, foundByProbeSpec, landminesInDiff, parkIdentity, scribeFile, splitOutOfReviewSpec, type PrerequisiteFiling, type Provenance, type ScribeGraph } from "./scribe.ts";
 import { FencedError, type EventKind, type ImplementPhase, type Journal } from "./journal.ts";
 import { assembleImplementPrompt } from "./prompt.ts";
 import { BLOCKED_REPORT_FILE, blockerNoteBranch, discardBlockedReport, readBlockedReport, type BlockedReport } from "./blocked-report.ts";
@@ -3024,10 +3024,6 @@ async function blockedPark(
  return new ParkSignal(outcome);
 }
 
-function prerequisiteNoticeKey(map: { repo: string; root: number }, nodeId: string): string {
- return `blocked-prerequisite.${mapKey(map)}.${nodeId}`;
-}
-
 /** The one line the park posts for a filed or linked prerequisite. */
 export function prerequisiteNotice(nodeId: string, filing: { kind: "filed" | "linked"; node: string }): string {
  return filing.kind === "linked"
@@ -3057,7 +3053,7 @@ async function parkPrerequisite(ctx: ImplementContext, report: BlockedReport): P
   nodeId, repo: map.repo,
   detail: `${filing.kind === "linked" ? "linked" : "filed"} the blocked park's prerequisite #${filing.node}, which blocks #${nodeId} (blocked-prerequisite)`.slice(0, 400),
  });
- const key = prerequisiteNoticeKey(map, nodeId);
+ const key = `blocked-prerequisite.${mapKey(map)}.${nodeId}.${parkIdentity(report.resume)}`;
  if (journal.getHealth(key) !== null) return;
  try {
   await (ctx.announce ?? ((text: string) => DiscordAnnouncer.fromMap(map).post(text, "blocked prerequisite notice")))(notice);

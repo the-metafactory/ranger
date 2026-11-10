@@ -23,6 +23,14 @@ const NAMED_OPEN_NODE = `# Node #3360 is blocked
 Resume condition: node #3459 closes.
 `;
 
+/** The same parked node, resumed later, reporting a gap it did not name the first time. */
+const SECOND_GAP = `# Node #3358 is blocked
+
+The desk adapter also needs the bus subject.
+
+Resume condition: the desk bus subject is provisioned.
+`;
+
 const MAP = { repo: "the-metafactory/cortex", root: 3326 };
 const PARKED = { id: "3358", title: "Read a session through the desk adapter", parent: { id: "3326" } };
 
@@ -89,6 +97,7 @@ export async function probeBlockedPrerequisite(): Promise<number> {
   const first = await fileBlockedPrerequisite(graph, journal, park);
   const filed = [...nodes.entries()].filter(([id]) => !seeded.has(id));
   results.push(check("one node filed", first.kind === "filed" && filed.length === 1, `outcome ${JSON.stringify(first)}, ${filed.length} filed`));
+  const firstNode = filed.length === 1 ? filed[0][0] : "";
   const node = filed[0]?.[1];
   results.push(check(
    "titled Prerequisite for #3358 and proposed, not auto",
@@ -125,6 +134,39 @@ export async function probeBlockedPrerequisite(): Promise<number> {
    "a resume condition naming an open node links that node instead of filing one",
    named.kind === "linked" && named.node === "3459" && nodes.get("3360")?.blockedBy.includes("3459") === true && nodes.size === 4,
    `outcome ${JSON.stringify(named)}, nodes ${[...nodes.keys()].join(",")}`,
+  ));
+
+  const second = await fileBlockedPrerequisite(graph, journal, { ...park, report: parseBlockedReport(SECOND_GAP) });
+  const secondNode = second.kind === "filed" ? second.node : "";
+  results.push(check(
+   "a resumed worker's different gap files its own node beside the first, gated by its own checkpoint",
+   second.kind === "filed" && second.added === true && secondNode !== firstNode &&
+    nodes.get(secondNode)?.checkpointId !== node?.checkpointId &&
+    nodes.get(PARKED.id)?.blockedBy.length === 2,
+   `outcome ${JSON.stringify(second)}, blockedBy ${JSON.stringify(nodes.get(PARKED.id)?.blockedBy)}`,
+  ));
+
+  let failedRead = "the failing read filed something";
+  const unreadable: ScribeGraph = {
+   ...graph,
+   node: async (id) => {
+    if (id === "3459") throw new Error("soma graph node 3459 (the-metafactory/cortex) failed (exit 1): HTTP 502");
+    return graph.node(id);
+   },
+  };
+  try {
+   await fileBlockedPrerequisite(unreadable, journal, {
+    map: MAP,
+    node: { id: "3361", title: "An unread desk node", parent: { id: "3326" } },
+    report: parseBlockedReport(NAMED_OPEN_NODE),
+   });
+  } catch (error) {
+   failedRead = `rejected: ${error instanceof Error ? error.message : String(error)}`;
+  }
+  results.push(check(
+   "a failed read of the named node files nothing instead of a duplicate",
+   failedRead.startsWith("rejected:") && !nodes.has("3361") && nodes.size === 5,
+   `${failedRead}, nodes ${[...nodes.keys()].join(",")}`,
   ));
  } finally {
   journal.close();

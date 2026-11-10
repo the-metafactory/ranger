@@ -4353,6 +4353,27 @@ describe("implement lane (node #23)", () => {
   expect(r.announced).toHaveLength(1);
  }, 60_000);
 
+ test("a resumed worker reporting a different gap gets its own park line, and names the open node it finds (node #514)", async () => {
+  const r = await rig({ parent: "5" });
+  cleanup.push(r.dir);
+  r.ctx.workerCommand = [implementWorker, "blocked"];
+  expect((await runNode("20", r.ctx)).status).toBe("parked");
+  const first = Object.values(JSON.parse(readFileSync(r.statePath, "utf8")).issues ?? {})[0] as { number: number };
+  writeFileSync(join(r.dir, "data", "acme__widgets-node-30.json"), JSON.stringify({
+   repo: "acme/widgets", ref: { id: "30" },
+   node: { id: "30", title: "Provision the bus subject", kind: "build", checkpointId: "bus-subject-live", autonomy: "propose", probes: [] },
+   status: "open", assignees: [], blockedBy: [], author: "alice", url: "https://github.com/acme/widgets/issues/30", typed: true, parent: { id: "5" },
+  }));
+  r.ctx.workerCommand = [implementWorker, "blocked-again"];
+  reclaim(r);
+  expect((await runNode("20", r.ctx)).status).toBe("parked");
+  const state = JSON.parse(readFileSync(r.statePath, "utf8"));
+  expect(Object.values(state.issues ?? {})).toHaveLength(1);
+  expect(state.nodes["20"].blockedBy).toEqual([String(first.number), "30"]);
+  expect(r.announced).toHaveLength(2);
+  expect(r.announced[1]).toBe("🔗 Node #20 is blocked on node #30, which is already open: ranger linked it as #20's blocker.");
+ }, 60_000);
+
  test("a park that is not blocked files no prerequisite (node #514)", async () => {
   const r = await rig({ parent: "5", probe: "fake-probe fail {node}" });
   cleanup.push(r.dir);

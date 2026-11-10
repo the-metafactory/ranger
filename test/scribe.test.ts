@@ -16,6 +16,7 @@ import {
  fileBlockedPrerequisite,
  landminesInDiff,
  lineHasMarkerComment,
+ parkIdentity,
  scribeFile,
  scribeKey,
  ScribeError,
@@ -213,7 +214,7 @@ describe("a blocked park's prerequisite (node #514)", () => {
   nodes.set("3459", { parent: "9", blockedBy: [], autonomy: "auto", status: "closed" });
   const filed = await fileBlockedPrerequisite(graph, journal, park());
   expect(filed).toEqual({ kind: "filed", node: "300", added: true });
-  expect(nodes.get("300")).toMatchObject({ parent: "5", autonomy: "propose", checkpointId: "blocked-prerequisite-24" });
+  expect(nodes.get("300")).toMatchObject({ parent: "5", autonomy: "propose", checkpointId: `blocked-prerequisite-24-${parkIdentity(REPORT.resume)}` });
   expect(nodes.get("24")?.blockedBy).toEqual(["300"]);
   expect(calls).toEqual(["node 3459", "add 5", "node 300", "link 24 5 [300]"]);
   const spec = blockedPrerequisiteSpec({ id: "24", title: "Add the desk adapter" }, REPORT);
@@ -243,7 +244,7 @@ describe("a blocked park's prerequisite (node #514)", () => {
   expect([...nodes.keys()]).toEqual(["24", "3459"]);
  });
 
- test("a named repo other than the map's, the parked node itself and an unreadable node are filed instead", async () => {
+ test("a named repo other than the map's and the parked node itself are filed instead", async () => {
   for (const resume of ["the-metafactory/cortex#3459 is open", "own node #24 closes", "another repo: acme/other#12"]) {
    const { graph, nodes, calls } = fakeGraph();
    const once = memoryJournal(dir);
@@ -259,6 +260,40 @@ describe("a blocked park's prerequisite (node #514)", () => {
   }
  });
 
+ test("a resume condition naming a node whose read fails files nothing instead of a duplicate", async () => {
+  const fake = fakeGraph();
+  fake.nodes.set("24", parked());
+  fake.nodes.set("3459", { parent: "9", blockedBy: [], autonomy: "auto" });
+  const unreadable: ScribeGraph = {
+   ...fake.graph,
+   node: async (id) => {
+    if (id === "3459") throw new Error("soma graph node 3459 (acme/widgets) failed (exit 1): HTTP 502");
+    return fake.graph.node(id);
+   },
+  };
+  await expect(fileBlockedPrerequisite(unreadable, journal, park())).rejects.toThrow(/HTTP 502/);
+  expect(fake.calls.filter((c) => c.startsWith("add"))).toEqual([]);
+  expect([...fake.nodes.keys()]).toEqual(["24", "3459"]);
+  expect(journal.getHealth(scribeKey(MAP, "24", "blocked-prerequisite", parkIdentity(REPORT.resume)))).toBeNull();
+ });
+
+ test("a resumed worker reporting a different gap files its own prerequisite beside the first", async () => {
+  const { graph, nodes, calls } = fakeGraph();
+  nodes.set("24", parked());
+  nodes.set("3459", { parent: "9", blockedBy: [], autonomy: "auto", status: "closed" });
+  const first = await fileBlockedPrerequisite(graph, journal, park());
+  const again = await fileBlockedPrerequisite(graph, journal, park());
+  const other = { ...park(), report: { reason: REPORT.reason, resume: "a Myelin release exports the session reader" } };
+  expect(await fileBlockedPrerequisite(graph, journal, other)).toEqual({ kind: "filed", node: "301", added: true });
+  expect(await fileBlockedPrerequisite(graph, journal, other)).toEqual({ kind: "filed", node: "301", added: false });
+  expect(first).toEqual({ kind: "filed", node: "300", added: true });
+  expect(again).toEqual({ kind: "filed", node: "300", added: false });
+  expect(calls.filter((c) => c.startsWith("add"))).toEqual(["add 5", "add 5"]);
+  expect(nodes.get("24")?.blockedBy).toEqual(["300", "301"]);
+  expect(nodes.get("301")?.checkpointId).toBe(`blocked-prerequisite-24-${parkIdentity("a Myelin release exports the session reader")}`);
+  expect(nodes.get("301")?.checkpointId).not.toBe(nodes.get("300")?.checkpointId);
+ });
+
  test("a report naming no resume condition files nothing", async () => {
   const { graph, nodes, calls } = fakeGraph();
   nodes.set("24", parked());
@@ -269,6 +304,7 @@ describe("a blocked park's prerequisite (node #514)", () => {
  test("a parked node below the map root is filed below itself: ranger never files on the root", async () => {
   const { graph, nodes } = fakeGraph();
   nodes.set("24", { parent: "9", blockedBy: [], autonomy: "auto" });
+  nodes.set("3459", { parent: "9", blockedBy: [], autonomy: "auto", status: "closed" });
   expect(await fileBlockedPrerequisite(graph, journal, park("9"))).toMatchObject({ kind: "filed", node: "300" });
   expect(nodes.get("300")?.parent).toBe("24");
   expect(nodes.get("24")?.blockedBy).toEqual(["300"]);
@@ -277,9 +313,10 @@ describe("a blocked park's prerequisite (node #514)", () => {
  test("a parked node below no parent cannot be wired, and a fenced supervisor writes nothing", async () => {
   const { graph, nodes } = fakeGraph();
   nodes.set("24", parked());
+  nodes.set("3459", { parent: "9", blockedBy: [], autonomy: "auto", status: "closed" });
   await expect(fileBlockedPrerequisite(graph, journal, park(null))).rejects.toThrow(/sits below no parent/);
   await expect(fileBlockedPrerequisite(graph, journal, park(), () => { throw new FencedError("superseded"); })).rejects.toThrow(FencedError);
-  expect(journal.getHealth(scribeKey(MAP, "24", "blocked-prerequisite"))).toBeNull();
+  expect(journal.getHealth(scribeKey(MAP, "24", "blocked-prerequisite", parkIdentity(REPORT.resume)))).toBeNull();
  });
 });
 
