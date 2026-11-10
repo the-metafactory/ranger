@@ -1,3 +1,4 @@
+import { conflictResume, promotedConflictReason } from "./resume-priority.ts";
 import { randomUUID } from "node:crypto";
 import { journalKeyFor } from "./forge-ref.ts";
 import { and, asc, desc, eq, gt, gte, inArray, isNotNull, isNull, lt, or, sql } from "drizzle-orm";
@@ -269,7 +270,7 @@ export interface ResumeQueueRow {
 }
 
 /** A resume ranger queued itself: supervisor tests that failed twice on a busy host (node #297). */
-export type ResumeReason = "host-load";
+export type ResumeReason = "host-load" | "merge-conflict" | "merge-conflict-resume" | "merge-conflict-host-load";
 
 export type EventKind =
  | "progress-preserved"
@@ -786,14 +787,26 @@ export class Journal {
     this.recordEvent("resume-queued", { nodeId: entry.nodeId, repo: entry.repo, detail: `resume-node queued for the ${entry.lane} implement lane (map root ${entry.root})${why}` });
     return inserted;
    }
-   return this.db.select().from(resumeQueue)
-    .where(and(eq(resumeQueue.repo, entry.repo), eq(resumeQueue.nodeId, entry.nodeId))).get()!;
+   const existing = this.db.select().from(resumeQueue)
+    .where(and(eq(resumeQueue.repo, entry.repo), eq(resumeQueue.nodeId, entry.nodeId))).get();
+   if (existing === undefined) throw new Error("resume queue entry disappeared during enqueue");
+   if (conflictResume(entry) && !conflictResume(existing)) {
+    const reason = promotedConflictReason(existing);
+    this.setResumeReason(existing, reason);
+    return { ...existing, reason };
+   }
+   return existing;
   });
+ }
+
+ setResumeReason(entry: ResumeQueueRow, reason: ResumeReason | null): void {
+  this.db.update(resumeQueue).set({ reason }).where(eq(resumeQueue.id, entry.id)).run();
  }
 
  listResumeQueue(lane?: ImplementLane): ResumeQueueRow[] {
   return this.db.select().from(resumeQueue).where(lane === undefined ? undefined : eq(resumeQueue.lane, lane))
-   .orderBy(asc(resumeQueue.id)).all();
+   .orderBy(asc(resumeQueue.id)).all()
+   .sort((a, b) => Number(conflictResume(b)) - Number(conflictResume(a)) || a.id - b.id);
  }
 
  getResume(repo: string, nodeId: string): ResumeQueueRow | null {

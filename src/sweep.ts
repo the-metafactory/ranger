@@ -1,3 +1,4 @@
+import { conflictResume } from "./resume-priority.ts";
 import { workerPreflight, type DispatchDeps } from "./node-dependency.ts";
 import { RECOVERY_LIMIT, nodeRecoveryScope, recordRecovery, recoveryReason, recoveryHold, recoverablePending } from "./recovery.ts";
 import { startOwnedWorker, reservationPending, FRESH_START_FAILURE } from "./node-ownership.ts";
@@ -46,7 +47,9 @@ export interface SweepContext extends DispatchDeps {
   * every map's liveness before any map's desk, so a send-back sees the lanes
   * that crashed holders released on any map.
   */
- phase?: "all" | "liveness" | "desk";
+ phase?: "all" | "liveness" | "desk" | "recovery";
+ deferRespawns?: boolean;
+ conflicts?: "collect" | "skip";
  /** Parked probe retries reserve capacity before any crashed implement respawn. */
  reservedLanes?: ReadonlySet<ImplementLane>;
  post?: import("./merge-desk.ts").MergeDeskContext["post"];
@@ -89,7 +92,9 @@ export async function sweepMap(ctx: SweepContext): Promise<SweepMapResult> {
    : journal.listWorkers(repo, map.root).filter((w) => w.status === "claimed" || w.status === "running" || (w.status === "parked" && recoverablePending(journal, nodeRecoveryScope(repo, w.nodeId))));
 
  for (const worker of inFlight) {
+  if (phase === "recovery" && worker.status !== "parked") continue;
   if (worker.status === "parked") {
+   if (ctx.deferRespawns || conflictResume(journal.getResume(repo, worker.nodeId) ?? {})) continue;
    const held = recoveryHold(journal, nodeRecoveryScope(repo, worker.nodeId), ctx.now?.() ?? new Date());
    if (held !== null || journal.spawnsToday(ctx.now?.() ?? new Date()) >= config.workers.spawnCapPerDay) continue;
    const holder = startsImplementSession(worker) ? journal.laneHolder(implementLane(map), { nodeId: worker.nodeId, repo }) : null;
@@ -135,7 +140,7 @@ export async function sweepMap(ctx: SweepContext): Promise<SweepMapResult> {
 
  // Worker and card closure scans share a deadline after crash handling.
  // Each scan also has a fixed row cap to bound its graph reads.
- if (phase !== "desk") {
+ if (phase !== "desk" && phase !== "recovery") {
   const deadline = Date.now() + GRAPH_CALL_TIMEOUT_MS;
   const credential = ctx.graphToken ?? { token, source: WRITE_TOKEN_SOURCE };
   const readNode = async (id: string) => {
@@ -150,14 +155,14 @@ export async function sweepMap(ctx: SweepContext): Promise<SweepMapResult> {
  }
 
  // Implement-lane rows waiting on (or parked before) the principal's merge (#23).
- if (phase !== "liveness" && journal.listWorkers(repo, map.root).some(watchedByMergeDesk)) {
+ if (phase !== "liveness" && phase !== "recovery" && journal.listWorkers(repo, map.root).some(watchedByMergeDesk)) {
   result.mergeDesk = await runMergeDesk({
    config,
    journal,
    map,
    token,
    botIdentity,
-   github: ctx.github,
+   github: ctx.github, conflicts: ctx.conflicts,
    post: ctx.post,
    spawn: ctx.respawn, nodeSelector: ctx.nodeSelector, endpointProbe: ctx.endpointProbe, endpointLookup: ctx.endpointLookup, now: ctx.now,
   });

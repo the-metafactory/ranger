@@ -170,3 +170,7 @@ export interface ForgePort<ReadCredential = string, WriteCredential = string> ex
  squashRefusal?(repo: string, token: ReadCredential): Promise<string | null>;
  postComment(repo: string, n: number, body: string, token: WriteCredential): Promise<number>;
 }
+
+export function hasMergeConflict(pr: Pick<ChangeRequest, "state" | "mergeState">): boolean {
+ return pr.state === "open" && pr.mergeState === "conflict";
+}

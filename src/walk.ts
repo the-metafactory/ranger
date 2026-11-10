@@ -1,3 +1,5 @@
+import { hasMergeConflict } from "./forge.ts";
+import { conflictResume, promotedConflictReason } from "./resume-priority.ts";
 import { resolveNodeSelector, workerPreflight, type DispatchDeps } from "./node-dependency.ts";
 import { cachedProbe } from "./endpoint.ts";
 import { startOwnedWorker, FRESH_START_FAILURE, startFailureOutcome } from "./node-ownership.ts";
@@ -81,6 +83,7 @@ export interface WalkContext extends DispatchDeps {
  intakeClient?: IntakeContext["clientFor"];
  intakeClaude?: IntakeContext["claude"];
  hostLoad?: HostLoad;
+ maintenance?: "sweep" | { desk: string };
  spawnJob?: (args: SpawnJobArgs) => Promise<number | null>;
 }
 
@@ -270,6 +273,7 @@ function recordFreshClaim(args: ClaimNodeArgs, messageId: string | null, at: Dat
 export async function walk(ctx: WalkContext): Promise<WalkResult> {
  ctx = { ...ctx, endpointProbe: cachedProbe(ctx.endpointProbe), nodeSelector: resolveNodeSelector(ctx) };
  const { config, journal } = ctx;
+ const deskOnly = typeof ctx.maintenance === "object";
  const registry = loadProbeRegistry();
  const result: WalkResult = {
   maps: [],
@@ -291,8 +295,11 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
  const prReads = new Map<string, ReturnType<ForgePort["getPr"]>>();
  const getPr: ForgePort["getPr"] = (repo, number, token) => {
   const key = `${repo}#${number}`;
-  if (!prReads.has(key)) prReads.set(key, targetFor(repo).getPr(repo, number, token));
-  return prReads.get(key)!;
+  const cached = prReads.get(key);
+  if (cached !== undefined) return cached;
+  const pending = targetFor(repo).getPr(repo, number, token);
+  prReads.set(key, pending);
+  return pending;
  };
  const portFor = (repo: string): ForgePort => {
   let port = ports.get(repo);
@@ -315,7 +322,8 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
  const order = implementMapOrder(config.maps, lastImplementMaps(journal), implementLane);
  const sweepPhase = (
   w: { map: RangerMapConfig; token: string; botIdentity: string; graphToken: ResolvedToken },
-  phase: "liveness" | "desk",
+  phase: "liveness" | "desk" | "recovery",
+  conflicts?: "collect" | "skip",
  ): Promise<SweepMapResult> =>
   sweepMap({
    config,
@@ -325,7 +333,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
    botIdentity: w.botIdentity,
    graphToken: w.graphToken,
    github: portFor(w.map.repo),
-   phase,
+   phase, conflicts, deferRespawns: phase === "liveness",
    now: ctx.now,
    endpointProbe: ctx.endpointProbe, endpointLookup: ctx.endpointLookup, nodeSelector: ctx.nodeSelector,
    reservedLanes: priorityLanes,
@@ -397,6 +405,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
  }
  for (const { map, mapResult, token, botIdentity, graphToken, errors } of walked) {
   try {
+   if (deskOnly) continue;
    mapResult.sweep = await sweepPhase({ map, token, botIdentity, graphToken }, "liveness");
   } catch (error) {
    errors.push(
@@ -405,8 +414,39 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
   }
  }
 
+ const priorityStarts: Awaited<ReturnType<typeof processResumeQueue>> = [];
+ const queueMaps = () => order.map(map => {
+  const w = walked.find(w => w.map === map);
+  const m = mapResults.get(map);
+  if (m === undefined) throw new Error(`missing map result for ${mapKey(map)}`);
+  return { map, botIdentity: w?.botIdentity, token: w?.token, graphToken: w?.graphToken, gateReason: m.gateReason, gateTransient: transientGates.has(map), errors: w?.errors ?? m.errors };
+ });
+ await withClaimLock(journal, async owned => {
+  for (const w of [...walked].sort((a, b) => mapKey(a.map).localeCompare(mapKey(b.map)))) {
+   try { await sweepPhase(w, "desk", "collect"); }
+   catch (error) { w.errors.push(`conflict discovery failed: ${String(error)}`); }
+  }
+  for (const entry of journal.listResumeQueue()) {
+   const w = walked.find(w => w.map.repo === entry.repo && w.map.root === entry.root);
+   const row = journal.getWorker(entry.nodeId, entry.repo);
+   if (w === undefined || row?.prNumber == null || (row.lane !== "implement" || row.phase === "close")) continue;
+   try {
+    const pr = await getPr(entry.repo, row.prNumber, w.token);
+    if (hasMergeConflict(pr) && !conflictResume(entry)) journal.setResumeReason(entry, promotedConflictReason(entry));
+   } catch (error) { journal.recordEvent("sweep", { repo: entry.repo, nodeId: entry.nodeId, detail: `queued conflict discovery deferred: ${String(error)}` }); }
+  }
+  priorityStarts.push(...await processResumeQueue({ ...ctx, github: { getPr } }, queueMaps(), lanesTakenThisTick, owned, true));
+ });
+ for (const w of walked) {
+  if (deskOnly) continue;
+  try {
+   const recovered = await sweepPhase(w, "recovery");
+   w.mapResult.sweep?.respawned.push(...recovered.respawned);
+  } catch (error) { w.errors.push(`recovery failed: ${String(error)}`); }
+ }
+
  try {
-  result.probeRequeues = await withClaimLock(journal, (owned) => requeueProbes({
+  if (!deskOnly) result.probeRequeues = await withClaimLock(journal, (owned) => requeueProbes({
    config, journal, maps: retryMaps, nodeSelector: ctx.nodeSelector, endpointProbe: ctx.endpointProbe, endpointLookup: ctx.endpointLookup, now: ctx.now, limit: config.workers.probeRequeues, owned,
    spawn: spawnNode,
   }));
@@ -418,15 +458,28 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
  for (const lane of priorityLanes) lanesTakenThisTick.add(lane);
 
  for (const { map, mapResult, token, botIdentity, graphToken, errors } of walked) {
+  if (typeof ctx.maintenance === "object" && mapKey(map) !== ctx.maintenance.desk) continue;
   const retryReservedIdleLane = priorityLanes.has(implementLane(map)) && journal.laneHolder(implementLane(map)) === null;
   if (retryReservedIdleLane) continue;
   try {
-   const desk = await sweepPhase({ map, token, botIdentity, graphToken }, "desk");
+   const desk = await sweepPhase({ map, token, botIdentity, graphToken }, "desk", "skip");
    if (mapResult.sweep === undefined) mapResult.sweep = desk;
    else if (desk.mergeDesk !== undefined) mapResult.sweep.mergeDesk = desk.mergeDesk;
   } catch (error) {
    errors.push(`merge desk failed: ${error instanceof Error ? error.message : String(error)}`);
   }
+ }
+
+ for (const started of priorityStarts) {
+  const sweep = walked.find(w => w.map.repo === started.repo && w.map.root === started.root)?.mapResult.sweep;
+  if (sweep === undefined) continue;
+  sweep.mergeDesk ??= { cards: [], merged: [], resumed: [], parked: [], pending: [], errors: [] };
+  sweep.mergeDesk.resumed.push(started.nodeId);
+ }
+ if (ctx.maintenance !== undefined) {
+  for (const w of walked) w.mapResult.errors = w.errors;
+  result.maps = maps;
+  return result;
  }
 
  try {
@@ -446,11 +499,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
  if (journal.listResumeQueue().length > 0) {
   try {
    await withClaimLock(journal, owned => processResumeQueue({ ...ctx, github: { getPr } },
-    order.map(map => {
-     const w = walked.find(w => w.map === map);
-     const m = mapResults.get(map)!;
-     return { map, token: w?.token, graphToken: w?.graphToken, gateReason: m.gateReason, gateTransient: transientGates.has(map), errors: w?.errors ?? m.errors };
-    }), lanesTakenThisTick, owned));
+    queueMaps(), lanesTakenThisTick, owned));
   } catch (error) {
    for (const w of walked) w.errors.push(`resume queue failed: ${error instanceof Error ? error.message : String(error)}`);
   }

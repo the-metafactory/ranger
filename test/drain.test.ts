@@ -233,9 +233,14 @@ describe("node #165 — ranger drain", () => {
    r.journal.setVisualLaneDrained(true);
    r.journal.upsertWorker({ root: 1, nodeId: "40", repo: GAME, status: "awaiting-merge", lane: "implement" });
    r.journal.updateWorker("40", GAME, { phase: "awaiting-merge", prNumber: 7 });
+   writeFileSync(join(r.data, "acme__seelite-node-40.json"), JSON.stringify({
+    repo: GAME, ref: { id: "40" }, node: { id: "40", title: "Build 40", kind: "task", autonomy: "auto" },
+    status: "open", assignees: ["ivy-bot"], blockedBy: [], author: "alice", typed: true, url: "",
+   }));
    const spawned: string[] = [];
    const result = await walk({
     config: r.config, configPath: r.configPath, journal: r.journal, github: conflictingPrForge(),
+    hostLoad: () => ({ load: 0, cores: 8 }),
     spawnRunNode: async ({ nodeId }) => { spawned.push(nodeId); return process.pid; },
    });
    expect(spawned).toEqual(["40", "20"]); // the send-back, then the headless claim
