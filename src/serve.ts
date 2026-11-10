@@ -1432,11 +1432,12 @@ function renderNeeds(s) {
   const errs = unchecked.filter((u) => u.error).map((u) => u.key + ": " + u.error);
   box.append(el("div", { class: "reason", text: unchecked.length + " awaiting-merge row(s) not yet checked for needs-eye (" + unchecked.map((u) => u.key).join(", ") + "): " + (errs.length > 0 ? "the label read failed — " + errs.join("; ") : "labels not read yet") }));
  }
- if (!s.needsYou || s.needsYou.length === 0) {
-  if (unchecked.length === 0) box.append(empty("Nothing is parked, failed or waiting on a needs-eye merge."));
+ const entries = (s.needsYou || []).filter((n) => !n.queued);
+ if (entries.length === 0) {
+  if (unchecked.length === 0) box.append(empty("Nothing needs your attention."));
   return;
  }
- box.append(...s.needsYou.map(needsCard));
+ box.append(...entries.map(needsCard));
 }
 const KINDS = [["worker", "worker"], ["fix-pass", "fix pass"], ["review", "review"]];
 const span = (text, cls) => el("span", { class: "line" + (cls ? " " + cls : ""), text });

@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { runInNewContext, Script } from "node:vm";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -333,11 +334,26 @@ describe("node #166 — the action handlers run the CLI verbs, and refuse with n
   });
  }
 
+ test("Needs you hides queued nodes and shows an empty state when all are queued", () => {
+  const script = renderPage(TOKEN).split("<script>")[1].split("</script>")[0];
+  const render = script.slice(script.indexOf("function renderNeeds(s) {"), script.indexOf("const KINDS ="));
+  const children: unknown[] = [];
+  const box = { replaceChildren: () => { children.length = 0; }, append: (...items: unknown[]) => children.push(...items) };
+  const draw = runInNewContext(render + "; renderNeeds;", {
+   document: { getElementById: () => box }, needsCard: (n: { nodeId: string }) => n.nodeId, empty: (text: string) => text,
+  });
+  const queuedNode = { nodeId: "40", queued: { lane: "visual", position: 1 } };
+  draw({ needsYou: [queuedNode, { nodeId: "41", queued: null }] });
+  expect(children).toEqual(["41"]);
+  draw({ needsYou: [queuedNode] });
+  expect(children).toEqual(["Nothing needs your attention."]);
+ });
+
  test("the page offers the drains and queue controls, and its script parses", () => {
   const page = renderPage(TOKEN);
   for (const s of ["/api/drain", "Queue resume", "cancel-resume", "queue-resume", "resume queue"]) expect(page).toContain(s);
   const script = page.split("<script>")[1].split("</script>")[0];
-  expect(() => new Function(script)).not.toThrow();
+  expect(() => new Script(script)).not.toThrow();
  });
 });
 

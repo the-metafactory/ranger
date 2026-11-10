@@ -1685,9 +1685,6 @@
     }
   },
   "test/serve-queue-drain.test.ts": {
-    "@typescript-eslint/no-implied-eval": {
-      "count": 1
-    },
     "ranger/no-comments": {
       "count": 8
     }

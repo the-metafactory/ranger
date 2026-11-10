@@ -1178,6 +1178,6 @@ describe("node #54 — details read a few at a time, and an unread label never r
   expect(state.needsYouUnchecked).toEqual([{ key: `${SEELITE}#433`, error: "HTTP 502" }]);
   const page = renderPage("token");
   expect(page).toContain("not yet checked for needs-eye");
-  expect(page).toContain("if (unchecked.length === 0) box.append(empty(\"Nothing is parked");
+  expect(page).toContain("if (unchecked.length === 0) box.append(empty(\"Nothing needs your attention.");
  });
 });
