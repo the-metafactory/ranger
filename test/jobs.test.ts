@@ -403,6 +403,23 @@ describe("node #506 — job slots beside implement workers", () => {
   expect(s.calls).toHaveLength(1);
  });
 
+ test("a headless lane a worker took this tick does not block a headless job", async () => {
+  const r = headlessRig();
+  runJobEnqueue("nightly-head", r.configPath);
+  const s = spawner();
+  const taken = new Set<"headless">(["headless"]);
+  await jobPass({ config: r.config, configPath: r.configPath, journal: r.journal, spawnJob: s.spawnJob, takenLanes: taken });
+  expect(s.calls).toHaveLength(1);
+ });
+
+ test("a headless job started this tick leaves the worker reservation untouched", async () => {
+  const r = headlessRig();
+  runJobEnqueue("nightly-head", r.configPath);
+  const taken = new Set<"headless">();
+  await jobPass({ config: r.config, configPath: r.configPath, journal: r.journal, spawnJob: spawner(process.pid).spawnJob, takenLanes: taken });
+  expect(taken.size).toBe(0);
+ });
+
  test("a running headless job does not block a headless implement claim", async () => {
   const r = headlessRig();
   runJobEnqueue("nightly-head", r.configPath);

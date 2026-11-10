@@ -212,8 +212,8 @@ export async function sweepJobs(ctx: JobPassContext, result: JobPassResult): Pro
 /**
  * Start each queued run whose lane is free, FIFO. A run waits while the
  * dead-man switch is paused, its lane is drained, the day's spawn cap is
- * spent, or its lane is held (an implement session, another job, or a claim
- * earlier in this tick). Call under the claim lock, before fresh claims.
+ * spent, or its lane is held (job slots full, a visual implement session, or a visual
+ * claim earlier in this tick; headless claims never take a job slot). Call under the claim lock, before fresh claims.
  */
 export async function jobPass(ctx: JobPassContext): Promise<JobPassResult> {
  const { config, journal } = ctx;
@@ -239,7 +239,7 @@ export async function jobPass(ctx: JobPassContext): Promise<JobPassResult> {
   if (journal.isPaused()) { wait("dead-man paused"); continue; }
   if (lane === "visual" && journal.isVisualLaneDrained()) { wait("visual lane drained"); continue; }
   if (journal.spawnsToday(now) >= config.workers.spawnCapPerDay) { wait("daily spawn cap reached"); continue; }
-  if (lane !== "none" && taken.has(lane)) { wait(`the ${lane} lane was taken this tick`); continue; }
+  if (lane === "visual" && taken.has(lane)) { wait("the visual lane was taken this tick"); continue; }
   const holder = lane === "none" ? null : journal.laneHolder(lane, undefined, undefined, "job");
   if (holder !== null) {
    wait(`the ${lane} lane is held by ${holder.job === undefined ? `#${holder.nodeId} (${holder.repo}#${holder.root})` : `job ${holder.job}`}`);
@@ -301,8 +301,7 @@ export async function jobPass(ctx: JobPassContext): Promise<JobPassResult> {
    await recoverJob(ctx, accepted, { kind: "infrastructure", operation: "job-spawn", evidence: "job supervisor did not spawn", action: "restore process spawning and re-enqueue after exhaustion" }, now, result);
    continue;
   }
-  if (lane !== "none") taken.add(lane);
-  journal.recordEvent("job-started", { detail: `job ${run.name} run ${run.id} started ${lane === "none" ? "without a lane" : `on the ${lane} lane`} (pid ${pid})` });
+   journal.recordEvent("job-started", { detail: `job ${run.name} run ${run.id} started ${lane === "none" ? "without a lane" : `on the ${lane} lane`} (pid ${pid})` });
   result.started.push({ runId: run.id, name: run.name, lane, pid });
  }
  return result;
