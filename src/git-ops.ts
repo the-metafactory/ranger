@@ -325,8 +325,13 @@ export function isBenignRecord(key: string, value: string | null): boolean {
 export function isBenignEntry(name: string, recorded?: string): boolean {
  if (name in BENIGN_VALUES || /^lfs\.<[0-9a-f]{12}>\.access$/.test(name)) return true;
  if (!name.startsWith("hooks/")) return false;
+ if (isInertSampleHook(name.slice("hooks/".length))) return true;
  const stub = gitLfs381HookStub(name.slice("hooks/".length));
  return stub !== null && recorded === digest(stub);
+}
+
+function isInertSampleHook(hook: string): boolean {
+ return hook.endsWith(".sample");
 }
 
 function gitLfs381HookStub(hook: string): string | null {
@@ -775,7 +780,7 @@ export function readGitState(canonical: string): GitState {
  if (existsSync(hooks)) {
   for (const entry of entryNames(hooks)) {
    const file = join(hooks, entry);
-   if (!isLfsHookStub(entry, readIfFile(file))) add(file);
+   if (!isInertSampleHook(entry) && !isLfsHookStub(entry, readIfFile(file))) add(file);
   }
  }
  return { hash: hash.digest("hex"), entries, includes: [...includes].sort() };

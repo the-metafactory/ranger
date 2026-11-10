@@ -561,3 +561,39 @@ describe("recording the known-good state", () => {
   expect(journal.knownGoodGitState(canonical)).toBe(record);
  });
 });
+
+describe("inert hooks/*.sample files are not git state (node #505)", () => {
+ const hooks = () => join(canonical, ".git", "hooks");
+ const at505 = { repo: "acme/widgets", nodeId: "505" };
+
+ test("added, edited and removed samples leave the check matching", async () => {
+  writeFileSync(join(hooks(), "pre-commit.sample"), "one\n");
+  recordKnownGood(journal, canonical, readGitState(canonical), "test");
+  writeFileSync(join(hooks(), "pre-commit.sample"), "two\n");
+  writeFileSync(join(hooks(), "commit-msg.sample"), "new\n");
+  expect((await checkKnownGood(journal, canonical, at505)).kind).toBe("match");
+  rmSync(join(hooks(), "pre-commit.sample"));
+  expect((await checkKnownGood(journal, canonical, at505)).kind).toBe("match");
+ });
+
+ test("a record that hashed samples re-records instead of parking", async () => {
+  const state = readGitState(canonical);
+  const old = { hash: "0".repeat(64), entries: { ...state.entries, "hooks/pre-commit.sample": "abc" }, at: "2026-11-03T14:59:01Z", source: "worktree created" };
+  journal.setKnownGoodGitState(canonical, JSON.stringify(old));
+  expect((await checkKnownGood(journal, canonical, at505)).kind).toBe("match");
+ });
+
+ test("a hook without the .sample suffix still parks and is named", async () => {
+  recordKnownGood(journal, canonical, readGitState(canonical), "test");
+  writeFileSync(join(hooks(), "pre-commit.sample"), "inert\n");
+  writeFileSync(join(hooks(), "pre-commit"), "#!/bin/sh\necho owned\n");
+  const check = await checkKnownGood(journal, canonical, at505);
+  expect(check.kind === "mismatch" && check.changed).toEqual(["hooks/pre-commit (new)"]);
+ });
+
+ test("a fresh clone records known-good, so the next check matches", async () => {
+  writeFileSync(join(hooks(), "pre-commit.sample"), "from the clone\n");
+  expect(trustFreshClone(journal, canonical).kind).toBe("match");
+  expect((await checkKnownGood(journal, canonical, at505)).kind).toBe("match");
+ });
+});
