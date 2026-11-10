@@ -302,6 +302,8 @@ export type EventKind =
  | "closed-elsewhere-ungated"
  | "decisions-written"
  | "decisions-failed"
+ | "deployed"
+ | "deploy-failed"
  | "refused"
  | "parked"
  | "released"

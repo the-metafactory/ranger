@@ -58,7 +58,7 @@ Each tick posts escalation cards, then claims frontier nodes and starts their wo
 
 ### Deploy a merged change
 
-Live ranger stays on its old code until the arc install is upgraded. After every merge to `main`, including the ones ranger's merge desk makes, run:
+Live ranger stays on its old code until the arc install is upgraded. Set the map's `commands.deploy` to the command below and ranger runs it itself once a merged node closes, whether its merge desk or you merged the PR (see `ranger.example.yaml`). A failed deploy is announced in the map's channel and journaled as `deploy-failed`. A merge ranger does not close, such as a PR with no node, still needs it by hand:
 
 ```bash
 arc upgrade ranger --force

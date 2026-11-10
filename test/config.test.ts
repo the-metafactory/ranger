@@ -131,7 +131,7 @@ describe("loadConfig", () => {
       });
       expect(map.walk).toBe("none");
       expect(map.autoMerge).toBe(false);
-      expect(map.commands).toEqual({ probeTimeoutMin: 30, testTimeoutMin: 20 });
+      expect(map.commands).toEqual({ deployTimeoutMin: 15, probeTimeoutMin: 30, testTimeoutMin: 20 });
     });
   });
 

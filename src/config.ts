@@ -127,6 +127,8 @@ const MapSchema = z.object({
    viewsServe: z.string().min(1).optional(),
    /** Compare captured runs; {out}, {a}, {b}. */
    viewsDiff: z.string().min(1).optional(),
+   deploy: z.string().min(1).optional(),
+   deployTimeoutMin: z.number().int().positive().default(15),
    /** Wall clock for one probe run, minutes. */
    probeTimeoutMin: z.number().int().positive().default(30),
    /**
