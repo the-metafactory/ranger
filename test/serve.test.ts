@@ -476,6 +476,8 @@ describe("#37 — the state the dashboard shows", () => {
   expect(at([]).session).toBeNull();
   const other = { ...session(3, "claude", "review", null), nodeId: "51" };
   expect(assembleState(inputs({ workers: [built], openSessions: [other] })).current[0].session).toBeNull();
+  const orphan = { ...session(4, "claude", "review", null), generation: 0 };
+  expect(assembleState(inputs({ workers: [built], openSessions: [orphan] })).current[0].session).toBeNull();
  });
 
  test("ranger#357: a job past sage round 4 is flagged suspicious, round 4 is not", () => {

@@ -537,9 +537,9 @@ export function assembleState(inputs: StateInputs): DashboardState {
   return inputs.titles.get(nodeKey(repo, id)) ?? null;
  };
 
- const openSession = (repo: string, nodeId: string): CurrentJob["session"] => {
+ const openSession = ({ repo, nodeId, generation }: WorkerRow): CurrentJob["session"] => {
   const newest = (inputs.openSessions ?? [])
-   .filter((row) => row.repo === repo && row.nodeId === nodeId && row.endedAt === null)
+   .filter((row) => row.repo === repo && row.nodeId === nodeId && row.generation === generation && row.endedAt === null)
    .reduce<SubstrateSessionRow | null>((latest, row) => (latest === null || row.id > latest.id ? row : latest), null);
   return newest === null ? null : { kind: newest.kind, substrate: newest.substrate };
  };
@@ -554,7 +554,7 @@ export function assembleState(inputs: StateInputs): DashboardState {
    status: w.status,
    phase: w.phase,
    substrate: w.substrate,
-   session: openSession(w.repo, w.nodeId),
+   session: openSession(w),
    lane: w.lane,
    resourceLane: w.lane === "implement" ? workerLane(w, laneMaps) : null,
    prNumber: w.prNumber,
