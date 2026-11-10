@@ -52,7 +52,7 @@ afterEach(() => {
  cleanup = [];
 });
 
-function rig(opts: { cap?: number } = {}) {
+function rig(opts: { cap?: number; lane?: "headless" | "visual" } = {}) {
  const dir = mkdtempSync(join(tmpdir(), "ranger-build-now-"));
  const configPath = join(dir, "ranger.yaml");
  writeFileSync(
@@ -63,6 +63,7 @@ function rig(opts: { cap?: number } = {}) {
     {
      repo: REPO,
      root: 1,
+     lane: opts.lane ?? "headless",
      walk: "full",
      skip: ["13"],
      commands: { test: "bun test" },
@@ -252,6 +253,44 @@ describe("node #58 — build-now claims and starts a walkable node", () => {
   expect(events.map((e) => e.kind)).toEqual(["claimed"]);
   expect(events[0].detail).toMatch(/announce failed: discord down/);
   expect(r.spawned).toHaveLength(1);
+ });
+});
+
+describe("node #512 — build-now honours drains", () => {
+ for (const lane of ["headless", "visual"] as const) {
+  for (const force of [false, true]) {
+   test(`${lane} drain refuses implementation before any effects, force=${force}`, async () => {
+    const r = rig({ lane });
+    if (lane === "headless") r.journal.setMapDrained(`${REPO}#1`, true);
+    else r.journal.setVisualLaneDrained(true);
+    const why = await refusal(buildNow("10", r.ctx({ force })));
+    expect(why).toContain(lane === "headless" ? "map drained" : "visual lane drained");
+    expect(why).toContain(lane === "headless" ? `ranger drain --map ${REPO}#1 --off` : "ranger drain --lane visual --off");
+    untouched(r, "10");
+   });
+  }
+ }
+
+ test("a map drain also refuses fresh research", async () => {
+  const r = rig();
+  r.journal.setMapDrained(`${REPO}#1`, true);
+  expect(await refusal(buildNow("11", r.ctx()))).toContain("map drained");
+  untouched(r, "11");
+ });
+
+ test("visual research still starts while the visual lane is drained", async () => {
+  const r = rig({ lane: "visual" });
+  r.journal.setVisualLaneDrained(true);
+  expect(await buildNow("11", r.ctx())).toMatchObject({ lane: "research", pid: 4242 });
+  expect(r.claimed).toEqual(["11"]);
+ });
+
+ test("an unrelated map drain and the visual drain do not stop a headless start", async () => {
+  const r = rig();
+  r.journal.setMapDrained("acme/other#1", true);
+  r.journal.setVisualLaneDrained(true);
+  expect(await buildNow("10", r.ctx())).toMatchObject({ lane: "implement", pid: 4242 });
+  expect(r.claimed).toEqual(["10"]);
  });
 });
 
