@@ -1,4 +1,4 @@
-import { conflictResume, promotedConflictReason } from "./resume-priority.ts";
+import { conflictResume, promotedConflictReason, type ResumeReason } from "./resume-priority.ts";
 import { randomUUID } from "node:crypto";
 import { journalKeyFor } from "./forge-ref.ts";
 import { and, asc, desc, eq, gt, gte, inArray, isNotNull, isNull, lt, or, sql } from "drizzle-orm";
@@ -270,7 +270,7 @@ export interface ResumeQueueRow {
 }
 
 /** A resume ranger queued itself: supervisor tests that failed twice on a busy host (node #297). */
-export type ResumeReason = "host-load" | "merge-conflict" | "merge-conflict-resume" | "merge-conflict-host-load";
+export type { ResumeReason };
 
 export type EventKind =
  | "progress-preserved"
