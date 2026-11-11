@@ -1,9 +1,15 @@
-import type { ResumeQueueRow } from "./journal.ts";
+export const CONFLICT_RESUME_REASONS = ["merge-conflict", "merge-conflict-resume", "merge-conflict-host-load"] as const;
 
-export function conflictResume(entry: Pick<ResumeQueueRow, "reason">): boolean {
- return entry.reason === "merge-conflict" || entry.reason === "merge-conflict-resume" || entry.reason === "merge-conflict-host-load";
+export const RESUME_REASONS = ["host-load", ...CONFLICT_RESUME_REASONS] as const;
+
+export type ConflictResumeReason = (typeof CONFLICT_RESUME_REASONS)[number];
+
+export type ResumeReason = (typeof RESUME_REASONS)[number];
+
+export function conflictResume(entry: { reason?: ResumeReason | null }): boolean {
+ return CONFLICT_RESUME_REASONS.some((reason) => reason === entry.reason);
 }
 
-export function promotedConflictReason(entry: Pick<ResumeQueueRow, "reason">): "merge-conflict-resume" | "merge-conflict-host-load" {
+export function promotedConflictReason(entry: { reason?: ResumeReason | null }): ConflictResumeReason {
  return entry.reason === "host-load" ? "merge-conflict-host-load" : "merge-conflict-resume";
 }
