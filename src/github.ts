@@ -268,6 +268,21 @@ export async function deleteBranch(repo: string, branch: string, token: string):
  );
 }
 
+/**
+ * Re-run the failed jobs of a red head (node #521). A check run's id is its job
+ * id, and GitHub's job rerun starts a new attempt on the same check run, so the
+ * next CI read finds it queued or running. Only a job concluded `failure` is
+ * asked for: a cancelled or timed-out job is no code's fault. Returns how many
+ * jobs the request covers; a refusal throws.
+ */
+export async function rerunFailedJobs(repo: string, runs: CiFailedRun[], token: string): Promise<number> {
+ const failed = runs.filter((run) => run.conclusion === "failure");
+ for (const run of failed) {
+  await ghApiText(token, [`repos/${repo}/actions/jobs/${run.id}/rerun`, "--method", "POST"], `rerun job ${run.id}`);
+ }
+ return failed.length;
+}
+
 /** The same bounded wait shape as the GitLab port; injectable for port tests. */
 export interface UpdateBranchWait {
  polls: number;

@@ -2153,7 +2153,7 @@ export interface CiFixRecord {
 
 export function ciFixMarker(r: CiFixRecord & { reason: string }): string {
  const what = r.sha === r.red
-  ? "and a worker found nothing in the branch to change. Ranger leaves it for the principal: rerun CI if it is flaky."
+  ? "and a worker found nothing in the branch to change. Ranger reruns the failed jobs once before it parks the node for the principal."
   : `so a worker fixed it at \`${r.sha.slice(0, 8)}\`. The next sage round reviews the fix.`;
  return `<!-- ranger:ci-fix sha=${r.sha} red=${r.red} -->\n**CI fix pass** — CI was red at \`${r.red.slice(0, 8)}\` (${r.reason.slice(0, 300)}), ${what}`;
 }
@@ -2236,6 +2236,30 @@ export function ciFixState(fixes: CiFixRecord[], head: string): { used: number; 
  */
 export function workerFixableCi(ci: CiVerdict): ci is Extract<CiVerdict, { state: "red" | "pending" }> & { failed: CiFailedRun[] } {
  return ci.state === "red" && (ci.failed ?? []).some((f) => f.conclusion === "failure");
+}
+
+const CI_RERUN_MARKER = /<!-- ranger:ci-rerun sha=([0-9a-f]{7,64}) -->/;
+
+/**
+ * The record of the one automatic rerun of a red head's failed jobs (node
+ * #521). The merge desk asks for that rerun and writes this to the change
+ * request in the same pass, so the same head never buys a second one: a red
+ * again there parks for the principal.
+ */
+export function ciRerunMarker(r: { sha: string; jobs: string[] }): string {
+ const what = (r.jobs.length === 0 ? "the failed jobs" : r.jobs.join(", ")).slice(0, 300);
+ return `<!-- ranger:ci-rerun sha=${r.sha} -->\n**CI rerun** — a CI fix pass at \`${r.sha.slice(0, 8)}\` found nothing in the branch to change, so ranger asked the CI to rerun the failed job(s) (${what}) once. A red again at this head is the principal's.`;
+}
+
+/** CI reruns recorded on the change request by the MACHINE ACCOUNT, by the head each one answered. */
+export function recordedCiReruns(comments: IssueComment[], botIdentity: string): { sha: string }[] {
+ const out: { sha: string }[] = [];
+ for (const c of comments) {
+  if (c.author !== botIdentity) continue;
+  const m = CI_RERUN_MARKER.exec(c.body);
+  if (m !== null) out.push({ sha: m[1] });
+ }
+ return out;
 }
 
 /** How many recorded base merges landed: their merge commit is in the PR's head. */

@@ -12,9 +12,11 @@ import { NEEDS_EYE_LABEL } from "./labels.ts";
 import {
  baseRedNote,
  ciFixState,
+ ciRerunMarker,
  gatingFindings,
  MAX_CI_FIXES,
  recordedCiFixes,
+ recordedCiReruns,
  recordedProbes,
  recordedReviews,
  reviewAtHead,
@@ -23,11 +25,11 @@ import {
 } from "./implement.ts";
 import type { Journal, WorkerRow, WorkerPatch } from "./journal.ts";
 import { evaluateMergeGate, type MergeGateInput, type MergeGateResult } from "./merge-gate.ts";
-import type { IssueComment, ChangeRequest, CiVerdict, ForgePort, MergeOutcome, RebaseOutcome } from "./forge.ts";
+import type { IssueComment, ChangeRequest, CiFailedRun, CiVerdict, ForgePort, MergeOutcome, RebaseOutcome } from "./forge.ts";
 import { parseForgeRef } from "./forge-ref.ts";
 import { squashMessage as gitlabSquashMessage } from "./gitlab.ts";
 import { lanePort } from "./forge-lanes.ts";
-import { CI_FAILED_PARK_OUTCOME, ciNotSentBackOutcome, mergeGateFailedOutcome } from "./outcomes.ts";
+import { CI_FAILED_PARK_OUTCOME, ciNotSentBackOutcome, mergeGateFailedOutcome, needsEyeCiRecoveredOutcome, NEEDS_EYE_CI_RECOVERED_OUTCOME } from "./outcomes.ts";
 import { changeRequestLabel, changeRequestNoun, forgeName } from "./forge-text.ts";
 import { closingKeywordRefusal, findClosingKeyword, hasCommit, headSha as worktreeHead, isAncestor } from "./git-ops.ts";
 import { recordedRebaseFrom } from "./worktree-head.ts";
@@ -49,19 +51,23 @@ import { squashTitle } from "./github.ts";
  * principal). The merge resumes the close. One park moves on its own: a park
  * on CI alone (node #104). Once the full gate passes at the live head, the row
  * goes back to awaiting-merge and takes the ordinary merge path. That needs
- * the review and probe certification recorded at that head, and no
- * ranger:needs-eye label. A merge-only move starts no worker session, so the
- * implement lane is never consulted. Anything short of that leaves it parked
- * quietly, with no new park card.
+ * the review and probe certification recorded at that head. A row labelled
+ * ranger:needs-eye never takes that path, but its recovery is not silent
+ * either (node #521): its CI reason is replaced with the recovered head and
+ * the needs-eye hold, it stays parked, and one merge card goes up, posted
+ * once. A merge-only move starts no worker session, so the implement lane is
+ * never consulted. Anything short of a gate pass leaves it parked quietly,
+ * with no new park card.
  *
  * A red CI with a run concluded `failure` is not left to recover by itself
  * (soma #795/#796 sat parked on a deterministic red: their branches trailed a
  * base that broke the check each PR added). The row, awaiting merge or
  * CI-only parked, goes back to run-node like any send-back: it merges the
  * base in if the base moved, else a CI fix pass reads the failed logs. The
- * node gets MAX_CI_FIXES of them; once they are spent, or a pass at this head
- * found nothing to change, the row parks on CI as before, and a rerun that
- * turns CI green still moves it on.
+ * node gets MAX_CI_FIXES of them. A pass at this head that found nothing to
+ * change buys the head one rerun of its failed jobs (node #521), recorded on
+ * the change request before the desk parks; a red again at that head parks on
+ * CI as before, where a rerun that turns CI green still moves the row on.
  *
  * GitLab under `rebase_merge` and GitHub when `behind` answer
  * `needs-rebase`: once the rest of the gate passes
@@ -300,13 +306,19 @@ export function closeRefused(w: WorkerRow): boolean {
  return (w.status === "parked" || w.status === "failed") && w.phase === "close";
 }
 
-/** A row the merge desk parked on CI alone, in its awaiting-merge phase (node #104). */
+/**
+ * A row the merge desk parked on CI alone, in its awaiting-merge phase (node
+ * #104), including one whose CI recovered into the needs-eye hold (node #521):
+ * that row is watched at the live head too, so a red or a moved head is read
+ * there rather than going unnoticed.
+ */
 export function ciOnlyPark(w: WorkerRow): boolean {
+ const outcome = w.outcome ?? "";
  return (
   w.status === "parked" &&
   w.lane === "implement" &&
   w.phase === "awaiting-merge" &&
-  CI_FAILED_PARK_OUTCOME.test(w.outcome ?? "")
+  (CI_FAILED_PARK_OUTCOME.test(outcome) || NEEDS_EYE_CI_RECOVERED_OUTCOME.test(outcome))
  );
 }
 
@@ -359,7 +371,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    spawn: generation => ctx.spawn?.(row.nodeId, repo, row.root, generation) ?? Promise.resolve(null) });
  }
 
- async function park(row: WorkerRow, detail: string, title: string): Promise<void> {
+ function recordPark(row: WorkerRow, detail: string): void {
   writeOwned(row, {
    status: "parked",
    finishedAt: new Date().toISOString(),
@@ -367,6 +379,10 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   });
   journal.recordEvent("parked", { nodeId: row.nodeId, repo, detail: detail.slice(0, 400) });
   result.parked.push(row.nodeId);
+ }
+
+ async function park(row: WorkerRow, detail: string, title: string): Promise<void> {
+  recordPark(row, detail);
   try {
    await post(
     renderCard({
@@ -384,6 +400,43 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   }
  }
 
+ async function withdrawCard(row: WorkerRow, title: string, lines: string[]): Promise<boolean> {
+  if (row.mergeMessageId === null) return true;
+  try {
+   await post(
+    renderCard({
+     emoji: "↩️",
+     status: "merge card withdrawn",
+     nodeId: row.nodeId,
+     title,
+     meta: [`map: ${mapKey(map)}`],
+     lines,
+    }),
+    `merge card withdrawal for #${row.nodeId}`,
+   );
+  } catch {
+   result.errors.push(`#${row.nodeId}: could not post the card withdrawal — retrying next tick`);
+   return false;
+  }
+  writeOwned(row, { mergeMessageId: null });
+  return true;
+ }
+
+ async function reparkIfRecovered(row: WorkerRow, detail: string, title: string): Promise<void> {
+  if (!NEEDS_EYE_CI_RECOVERED_OUTCOME.test(row.outcome ?? "")) return;
+  if (row.mergeMessageId === null) {
+   await park(row, detail, title);
+   return;
+  }
+  const cr = row.prNumber === null ? `node ${row.nodeId}` : changeRequestLabel(repo, row.prNumber);
+  const watchedAgain = CI_FAILED_PARK_OUTCOME.test(detail);
+  const held = watchedAgain
+   ? `${cr} stays parked on its merge gate; ranger re-reads the gate every tick and posts a new merge card once it passes.`
+   : `${cr} stays parked; resume it when you want it reworked, or merge it by hand.`;
+  if (!(await withdrawCard(row, title, [`Do not merge yet: the CI recovery at this head no longer holds. ${detail}.`, held]))) return;
+  recordPark(row, detail);
+ }
+
  /**
   * Send a ready (or CI-parked) change request back to run-node, which
   * resumes in the review phase: a fix pass and a new round, only the probe
@@ -393,25 +446,10 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
  async function sendBack(row: WorkerRow, why: string, title: string, noCiHead?: string, enqueue = false): Promise<void> {
   if (ctx.spawn === undefined || row.prNumber === null) return;
   const cr = changeRequestLabel(repo, row.prNumber);
-  if (row.mergeMessageId !== null) {
-   try {
-    await post(
-     renderCard({
-      emoji: "↩️",
-      status: "merge card withdrawn",
-      nodeId: row.nodeId,
-      title,
-      meta: [`map: ${mapKey(map)}`],
-      lines: [`Do not merge yet: ${why}. Ranger reworks it; a new merge card follows when the ${changeRequestNoun(repo)} is clean.`],
-     }),
-     `merge card withdrawal for #${row.nodeId}`,
-    );
-   } catch {
-    result.errors.push(`#${row.nodeId}: could not post the card withdrawal — retrying next tick`);
-    return;
-   }
-   writeOwned(row, { mergeMessageId: null });
-  }
+  const withdrawn = await withdrawCard(row, title, [
+   `Do not merge yet: ${why}. Ranger reworks it; a new merge card follows when the ${changeRequestNoun(repo)} is clean.`,
+  ]);
+  if (!withdrawn) return;
   // A send-back starts a worker session (a fix, CI fix or base merge pass, or
   // probes): it waits for the implement lane like any other start. The stale
   // card is already gone.
@@ -446,6 +484,42 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    detail: `${cr}: ${why} — run-node resumes (pid ${pid})`,
   });
   result.resumed.push(row.nodeId);
+ }
+
+ async function rerunRedHead(
+  row: WorkerRow,
+  pr: ChangeRequest,
+  comments: IssueComment[],
+  ci: Extract<CiVerdict, { state: "red" | "pending" }> & { failed: CiFailedRun[] },
+ ): Promise<"requested" | "already" | "unavailable"> {
+  const head = pr.headSha;
+  const cr = changeRequestLabel(repo, pr.iid);
+  if (recordedCiReruns(comments, botIdentity).some((r) => r.sha === head)) return "already";
+  if (github.rerunFailedJobs === undefined) return "unavailable";
+  const failed = ci.failed.filter((run) => run.conclusion === "failure");
+  if (failed.length === 0) return "unavailable";
+  let jobs: number;
+  try {
+   jobs = await github.rerunFailedJobs(repo, failed, token);
+  } catch (error) {
+   journal.recordEvent("sweep", {
+    nodeId: row.nodeId,
+    repo,
+    detail: `${cr}: the one rerun of the failed jobs at ${head.slice(0, 8)} was refused (${redactViewsReason(String(error), process.env).slice(-300)}), so the red parks as before`.slice(0, 400),
+   });
+   return "unavailable";
+  }
+  try {
+   await github.postComment(repo, pr.iid, ciRerunMarker({ sha: head, jobs: failed.map((run) => run.name) }), token);
+  } catch (error) {
+   result.errors.push(`#${row.nodeId}: reran ${jobs} job(s) at ${head.slice(0, 8)}, but the rerun record on ${cr} did not post (${redactViewsReason(String(error), process.env).slice(-200)}) — a second rerun may be asked for next tick`);
+  }
+  journal.recordEvent("sweep", {
+   nodeId: row.nodeId,
+   repo,
+   detail: `${cr}: a CI fix pass at ${head.slice(0, 8)} found nothing to change, so ranger asked the CI to rerun ${jobs} failed job(s) once — it waits on CI, and a red again at this head parks`.slice(0, 400),
+  });
+  return "requested";
  }
 
  /**
@@ -679,10 +753,12 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   // a failed row only on a merge.
   if (row.status === "failed") return;
   const ciPark = row.status === "parked" && ciOnlyPark(row);
-  if (row.status === "parked" && (!ciPark || pr.state === "closed")) return;
+  if (row.status === "parked" && !ciPark) return;
 
   if (pr.state === "closed") {
-   await park(row, `${cr} was closed without merging — declined; ranger will not reopen or re-propose it`, title);
+   const declined = `${cr} was closed without merging — declined; ranger will not reopen or re-propose it`;
+   if (ciPark) await reparkIfRecovered(row, declined, title);
+   else await park(row, declined, title);
    return;
   }
 
@@ -710,7 +786,10 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   const rebased = last === undefined ? rebaseOfLatestReview(rebases, latestSha, pr.headSha) : null;
   const reason = sendBackReason(repo, pr, map.base, { last, missingProbes, rebased });
   // A send-back is a worker session; a CI-only park starts one only for its red CI, below.
-  if (ciPark && reason !== null) return;
+  if (ciPark && reason !== null) {
+   await reparkIfRecovered(row, reason, title);
+   return;
+  }
   const { why, ci, noCi } = await sendBackFor(row, pr, title, { reason, ciPark, last, probe });
   if (why !== null && ctx.spawn !== undefined) {
    await sendBack(row, why, title, noCi ? pr.headSha : undefined);
@@ -733,11 +812,27 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
     await sendBack(row, `CI is red at ${pr.headSha.slice(0, 8)} (${gate.reason})`, title);
     return;
    }
-   if (!ciPark) await park(row, ciNotSentBackOutcome({ reason: gate.reason, head: pr.headSha, ...(foundNothing ? {} : { spent: used }) }), title);
+   const reran = foundNothing ? await rerunRedHead(row, pr, comments, verdict) : "unavailable";
+   const waitingOnRerun = reran === "requested";
+   const detail = ciNotSentBackOutcome({
+    reason: gate.reason,
+    head: pr.headSha,
+    ...(foundNothing ? (waitingOnRerun ? { waiting: true } : { reran: reran === "already" }) : { spent: used }),
+   });
+   if (waitingOnRerun) {
+    if (ciPark) await reparkIfRecovered(row, detail, title);
+    return;
+   }
+   if (ciPark) await reparkIfRecovered(row, detail, title);
+   else await park(row, detail, title);
    return;
   }
   // A CI-only park stays parked, quietly, until the whole gate passes.
-  if (ciPark && gate.status !== "pass") return;
+  if (ciPark && gate.status === "pending") return;
+  if (ciPark && gate.status === "fail") {
+   await reparkIfRecovered(row, mergeGateFailedOutcome(gate), title);
+   return;
+  }
   if (gate.status === "pending") {
    result.pending.push(row.nodeId);
    return;
@@ -752,7 +847,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   // Auto-merge (principal, 2026-10-03): on a map that opts in, ranger
   // squash-merges the gate-passed PR itself, pinned to the gated head, unless
   // the node is labelled ranger:needs-eye. The close follows on this tick.
-  // A CI-only park always reads the labels: needs-eye keeps it parked.
+  // A CI-only park always reads the labels: needs-eye keeps it parked and cards it (node #521).
   let needsEye = false;
   if (ciPark || map.autoMerge || map.commands.views) {
    try {
@@ -767,13 +862,24 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    }
   }
   if (ciPark) {
-   if (needsEye) return;
-   writeOwned(row, { status: "awaiting-merge", finishedAt: null, outcome: null });
-   journal.recordEvent("sweep", {
-    nodeId: row.nodeId,
-    repo,
-    detail: `${cr}: CI recovered at ${gate.headSha.slice(0, 8)}, the gate passes there — the CI-only park returns to awaiting-merge (no worker, no lane)`,
-   });
+   if (needsEye) {
+    const recovered = needsEyeCiRecoveredOutcome({ head: gate.headSha });
+    if (row.outcome !== recovered) {
+     writeOwned(row, { outcome: recovered });
+     journal.recordEvent("sweep", {
+      nodeId: row.nodeId,
+      repo,
+      detail: `${cr}: CI recovered at ${gate.headSha.slice(0, 8)}, the gate passes there — labelled ${NEEDS_EYE_LABEL}, so it stays parked and one merge card goes up`,
+     });
+    }
+   } else {
+    writeOwned(row, { status: "awaiting-merge", finishedAt: null, outcome: null });
+    journal.recordEvent("sweep", {
+     nodeId: row.nodeId,
+     repo,
+     detail: `${cr}: CI recovered at ${gate.headSha.slice(0, 8)}, the gate passes there — the CI-only park returns to awaiting-merge (no worker, no lane)`,
+    });
+   }
    if (row.mergeMessageId !== null) return; // its card is still up
   }
   const rebaseHold = unseenRebaseHold(rebases[0], gate.headSha);
