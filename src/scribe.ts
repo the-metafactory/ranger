@@ -556,14 +556,15 @@ export interface BlockedPrerequisite {
  * blocked by the filed one.
  */
 export function blockedPrerequisiteSpec(node: SpawningNode, report: BlockedReport): AddSpec {
+ const ruling = report.ruling === true;
  return {
-  ...build(),
+  ...(ruling ? { autonomy: "approve" as const, kind: "decision", labels: ["orienteer:decision"] } : build()),
   title: titled(`Prerequisite for #${node.id}`, report.resume),
   checkpoint: `blocked-prerequisite-${stem(node.id)}-${parkIdentity(report.resume)}`,
   body: [
    "## Deliverable",
    "",
-   `${report.resume} — the condition node #${node.id} named before it could be built.`,
+   `${ruling ? "The principal rules: " : ""}${report.resume} — the condition node #${node.id} named before it could be built.`,
    "",
    "## Blocked prerequisite",
    "",

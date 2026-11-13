@@ -83,6 +83,16 @@ function memoryJournal(dir: string): Journal {
  return new Journal(join(dir, "journal.sqlite"), openDb(":memory:", (db) => seedLegacyRoots(db, [], {})));
 }
 
+describe("blockedPrerequisiteSpec: a ruling gap", () => {
+ test("a ruling is filed as a decision node, a code gap as a propose build", () => {
+  const node = { id: "24", title: "Add the desk adapter" };
+  const ruling = blockedPrerequisiteSpec(node, { reason: "No budget.", resume: "the principal records a budget.", ruling: true });
+  expect(ruling).toMatchObject({ kind: "decision", autonomy: "approve", labels: ["orienteer:decision"] });
+  const code = blockedPrerequisiteSpec(node, { reason: "No SDK.", resume: "publish one." });
+  expect(code).toMatchObject({ kind: "build", autonomy: "propose", labels: ["orienteer:build"] });
+ });
+});
+
 describe("the Scribe's rules (design §6, node #24)", () => {
  test("refuses auto, a blank checkpoint, the map root and a blocker that is the parent", () => {
   expect(() => assertFilable(MAP, "24", { ...SPEC, autonomy: "auto" })).toThrow(/propose at minimum/);
