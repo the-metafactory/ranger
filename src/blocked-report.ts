@@ -32,7 +32,10 @@ export interface BlockedReport {
  reason: string;
  /** What must hold before a resume can succeed; empty when the worker named none. */
  resume: string;
+ ruling?: boolean;
 }
+
+const GAP_LINE = /^\s*(?:#{1,6}\s*)?(?:\*\*)?gap(?:\*\*)?\s*:\s*(?:\*\*)?\s*(ruling|code|provisioning)\b/i;
 
 const RESUME_LINE = /^\s*(#{1,6}\s*)?(?:\*\*)?resume[ -]condition(?:\*\*)?\s*:?(?:\*\*)?\s*(.*)$/i;
 const HEADING = /^\s*#{1,6}\s/;
@@ -82,6 +85,12 @@ function fold(lines: string[]): string {
  */
 export function parseBlockedReport(text: string): BlockedReport {
  const lines = text.split(/\r?\n/);
+ const gap = lines.map((l) => GAP_LINE.exec(l)).find((m) => m !== null);
+ const parsed = parseParts(lines.filter((l) => !GAP_LINE.test(l)));
+ return gap?.[1].toLowerCase() === "ruling" ? { ...parsed, ruling: true } : parsed;
+}
+
+function parseParts(lines: string[]): BlockedReport {
  const at = lines.findIndex((l) => RESUME_LINE.test(l));
  if (at === -1) return { reason: fold(lines), resume: "" };
  const m = RESUME_LINE.exec(lines[at]) as RegExpExecArray;
@@ -170,5 +179,6 @@ export async function blockerNoteBranch(worktree: string, base: string): Promise
  return {
   reason: `the branch only adds a blocker note (${named}), not an implementation${parsed.reason.length > 0 ? `: ${parsed.reason}` : ""}`,
   resume: parsed.resume,
+  ...(parsed.ruling === true ? { ruling: true } : {}),
  };
 }
