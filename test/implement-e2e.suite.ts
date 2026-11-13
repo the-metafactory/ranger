@@ -1404,44 +1404,98 @@ describe("implement lane (node #23)", () => {
   rmSync(flag, { force: true });
  }, 60_000);
 
- test.each(["resolved", "noop", "unmerged", "red-tests", "exit", "dirty", "merge-forge"])("pre-PR base conflict worker pass (node #522): %s", async scenario => {
+ const prePrConflict = async (mode: string) => {
   const flag = join(tmpdir(), `ranger-behind-conflict-${Date.now()}`);
+  cleanup.push(flag);
   const { r, worktree, head: built } = await resumableNoPr({ test: `test -f ${flag} && ${UP_TO_DATE}` });
   await moveBaseUnder(r);
   const main = await r.github.sha("main");
   writeFileSync(flag, "");
   const deadman = r.journal.deadmanCount();
-  if (scenario === "red-tests") r.ctx.map.commands.test = `test -f ${flag} && ${UP_TO_DATE} && ! grep -q fromMain src/feature.ts`;
-  const sessions = watchSessions(r, ["noop", "dirty", "merge-forge"].includes(scenario) ? scenario : "build");
-  if (scenario === "exit" || scenario === "unmerged") r.ctx.worker = async (prompt, opts) => {
-   sessions.push({ head: (await git(["rev-parse", "HEAD"], worktree)).stdout.trim(), prompt });
-   if (scenario === "unmerged") expect((await runCmd("git", ["merge", "--no-edit", "origin/main"], opts)).code).toBe(1);
-   return { code: scenario === "exit" ? 1 : 0, stdout: "", stderr: "worker left the conflict" };
-  };
-  const outcome = await runNode("20", r.ctx);
-  if (scenario === "resolved") {
-   expect(outcome.status).toBe("awaiting-merge");
-   const pushed = await r.github.sha(BRANCH);
-   expect(await holds(r, main, pushed)).toBe(true);
-   expect(await holds(r, built, pushed)).toBe(true);
-   expect(readFileSync(join(worktree, "src/feature.ts"), "utf8")).toContain("fromMain");
-   expect(r.github.prs.size).toBe(1);
-  } else {
-   expect(outcome.status).toBe("parked");
-   expect(outcome.detail).toContain(`merging origin/main at ${main} conflicts in: src/feature.ts`);
-   expect(r.github.prs.size).toBe(0);
-  }
+  const sessions = watchSessions(r, mode);
+  return { flag, r, worktree, built, main, deadman, sessions };
+ };
+
+ test("pre-PR base conflict worker pass resolves the merge and continues (node #522)", async () => {
+  const { r, worktree, built, main, deadman, sessions } = await prePrConflict("build");
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  const pushed = await r.github.sha(BRANCH);
+  expect(await holds(r, main, pushed)).toBe(true);
+  expect(await holds(r, built, pushed)).toBe(true);
+  expect(readFileSync(join(worktree, "src/feature.ts"), "utf8")).toContain("fromMain");
+  expect(r.github.prs.size).toBe(1);
   expect(sessions).toHaveLength(1);
   expect(sessions[0]?.head).toBe(built);
   expect(sessions[0]?.prompt).toContain("## Base merge pass");
   expect(sessions[0]?.prompt).toContain("in: `src/feature.ts`");
   expect(sessions[0]?.prompt).toContain("Start the merge again even if no conflict markers are present");
-  if (scenario === "noop" || scenario === "exit" || scenario === "unmerged") {
+  expect(r.journal.deadmanCount()).toBeLessThanOrEqual(deadman);
+ }, 60_000);
+
+ const failedConflictPasses: {
+  scenario: string;
+  mode: string;
+  expectRestoredTree: boolean;
+  redTests?: boolean;
+  workerExit?: number;
+  startMerge?: boolean;
+  preservesCommit?: boolean;
+ }[] = [
+  { scenario: "noop", mode: "noop", expectRestoredTree: true },
+  { scenario: "unmerged", mode: "build", expectRestoredTree: true, workerExit: 0, startMerge: true },
+  { scenario: "red-tests", mode: "build", expectRestoredTree: false, redTests: true, preservesCommit: true },
+  { scenario: "exit", mode: "build", expectRestoredTree: true, workerExit: 1 },
+  { scenario: "dirty", mode: "dirty", expectRestoredTree: false },
+  { scenario: "merge-forge", mode: "merge-forge", expectRestoredTree: false, preservesCommit: true },
+ ];
+
+ test.each(failedConflictPasses)("pre-PR base conflict worker pass parks with recoverable progress (node #522): $scenario", async row => {
+  const { flag, r, worktree, built, main, deadman, sessions } = await prePrConflict(row.mode);
+  if (row.redTests) r.ctx.map.commands.test = `test -f ${flag} && ${UP_TO_DATE} && ! grep -q fromMain src/feature.ts`;
+  const workerExit = row.workerExit;
+  if (workerExit !== undefined) r.ctx.worker = async (prompt, opts) => {
+   sessions.push({ head: (await git(["rev-parse", "HEAD"], worktree)).stdout.trim(), prompt });
+   if (row.startMerge) expect((await runCmd("git", ["merge", "--no-edit", "origin/main"], opts)).code).toBe(1);
+   return { code: workerExit, stdout: "", stderr: "worker left the conflict" };
+  };
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("parked");
+  expect(outcome.detail).toContain(`merging origin/main at ${main} conflicts in: src/feature.ts`);
+  if (row.preservesCommit) {
+   const saved = (await git(["rev-parse", "HEAD"], worktree)).stdout.trim();
+   expect(saved).not.toBe(built);
+   expect(await r.github.sha(BRANCH)).toBe(saved);
+   expect(JSON.parse(r.journal.nodeProgress("acme/widgets", "20") ?? "{}")).toMatchObject({ sha: saved, preservedSha: saved });
+  } else {
+   expect(await r.github.sha(BRANCH)).toBe(built);
+  }
+  expect(r.github.prs.size).toBe(0);
+  expect(sessions).toHaveLength(1);
+  expect(sessions[0]?.head).toBe(built);
+  expect(sessions[0]?.prompt).toContain("## Base merge pass");
+  expect(sessions[0]?.prompt).toContain("in: `src/feature.ts`");
+  expect(sessions[0]?.prompt).toContain("Start the merge again even if no conflict markers are present");
+  if (row.expectRestoredTree) {
    expect((await git(["rev-parse", "HEAD"], worktree)).stdout.trim()).toBe(built);
    expect((await git(["status", "--porcelain"], worktree)).stdout.trim()).toBe("");
   }
   expect(r.journal.deadmanCount()).toBeLessThanOrEqual(deadman);
-  rmSync(flag, { force: true });
+ }, 60_000);
+
+ test("pre-PR base conflict worker pass preserves a superseding generation (node #522)", async () => {
+  const { r, built, deadman } = await prePrConflict("noop");
+  let replacement = 0;
+  r.ctx.worker = async () => {
+   replacement = r.journal.beginGeneration("20", "acme/widgets");
+   return { code: 1, stdout: "", stderr: "superseded worker" };
+  };
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("refused");
+  expect(r.journal.getWorker("20", "acme/widgets")?.generation).toBe(replacement);
+  expect(r.journal.getWorker("20", "acme/widgets")?.status).not.toBe("parked");
+  expect(await r.github.sha(BRANCH)).toBe(built);
+  expect(r.github.prs.size).toBe(0);
+  expect(r.journal.deadmanCount()).toBe(deadman);
  }, 60_000);
 
  test("pre-PR base conflict repairs stop after two worker passes when the base keeps moving (node #522)", async () => {
