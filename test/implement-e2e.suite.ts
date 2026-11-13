@@ -1302,15 +1302,19 @@ describe("implement lane (node #23)", () => {
    expect(recordedReviews(r.github.comments.get(1) ?? [], BOT).map((v) => v.round)).toEqual([1, 2, 3]);
   }, 60_000);
 
-  test("a merge that conflicts parks naming the base SHA and the files, with no push and no dead-man count", async () => {
+  test("a pre-PR merge that conflicts runs a worker and parks on failed repair without a dead-man count", async () => {
    const r = await rig({});
    cleanup.push(r.dir);
    const { late, landOnce } = await lateBaseCommit(r, "src/feature.ts");
    r.ctx.map.commands.test = `${landOnce}; ${CURRENT}`;
+   const sessions = watchSessions(r, "merge-noop");
    const deadman = r.journal.deadmanCount();
    const outcome = await runNode("20", r.ctx);
    expect(outcome.status).toBe("parked");
    expect(outcome.detail).toContain(`merging origin/main at ${late} conflicts in: src/feature.ts`);
+   expect(sessions).toHaveLength(2);
+   expect(sessions[1]?.prompt).toContain("## Base merge pass");
+   expect(sessions[1]?.prompt).toContain("`src/feature.ts`");
    const worktree = join(r.canonical, ".worktrees", "node-20");
    expect((await git(["status", "--porcelain"], worktree)).stdout.trim()).toBe("");
    const built = (await git(["rev-parse", "HEAD"], worktree)).stdout.trim();
@@ -1400,28 +1404,70 @@ describe("implement lane (node #23)", () => {
   rmSync(flag, { force: true });
  }, 60_000);
 
- test("a resume with no PR whose base merge after red adoption tests conflicts parks naming the base SHA and the files, and the dead-man count does not rise (ranger issue #463)", async () => {
+ test.each(["resolved", "noop", "unmerged", "red-tests", "exit", "dirty", "merge-forge"])("pre-PR base conflict worker pass (node #522): %s", async scenario => {
   const flag = join(tmpdir(), `ranger-behind-conflict-${Date.now()}`);
   const { r, worktree, head: built } = await resumableNoPr({ test: `test -f ${flag} && ${UP_TO_DATE}` });
-  const clone = join(r.dir, "outside-conflict");
-  expect((await git(["clone", "--branch", "main", r.origin, clone], r.dir)).code).toBe(0);
-  mkdirSync(join(clone, "src"), { recursive: true });
-  writeFileSync(join(clone, "src", "feature.ts"), "export const feature = () => 42; // main\n");
-  await git(["add", "src/feature.ts"], clone);
-  await git(["commit", "-m", "main: its own feature"], clone);
-  expect((await git(["push", "origin", "HEAD:refs/heads/main"], clone)).code).toBe(0);
+  await moveBaseUnder(r);
   const main = await r.github.sha("main");
   writeFileSync(flag, "");
   const deadman = r.journal.deadmanCount();
-  const sessions = watchSessions(r, "noop");
+  if (scenario === "red-tests") r.ctx.map.commands.test = `test -f ${flag} && ${UP_TO_DATE} && ! grep -q fromMain src/feature.ts`;
+  const sessions = watchSessions(r, ["noop", "dirty", "merge-forge"].includes(scenario) ? scenario : "build");
+  if (scenario === "exit" || scenario === "unmerged") r.ctx.worker = async (prompt, opts) => {
+   sessions.push({ head: (await git(["rev-parse", "HEAD"], worktree)).stdout.trim(), prompt });
+   if (scenario === "unmerged") expect((await runCmd("git", ["merge", "--no-edit", "origin/main"], opts)).code).toBe(1);
+   return { code: scenario === "exit" ? 1 : 0, stdout: "", stderr: "worker left the conflict" };
+  };
+  const outcome = await runNode("20", r.ctx);
+  if (scenario === "resolved") {
+   expect(outcome.status).toBe("awaiting-merge");
+   const pushed = await r.github.sha(BRANCH);
+   expect(await holds(r, main, pushed)).toBe(true);
+   expect(await holds(r, built, pushed)).toBe(true);
+   expect(readFileSync(join(worktree, "src/feature.ts"), "utf8")).toContain("fromMain");
+   expect(r.github.prs.size).toBe(1);
+  } else {
+   expect(outcome.status).toBe("parked");
+   expect(outcome.detail).toContain(`merging origin/main at ${main} conflicts in: src/feature.ts`);
+   expect(r.github.prs.size).toBe(0);
+  }
+  expect(sessions).toHaveLength(1);
+  expect(sessions[0]?.head).toBe(built);
+  expect(sessions[0]?.prompt).toContain("## Base merge pass");
+  expect(sessions[0]?.prompt).toContain("in: `src/feature.ts`");
+  expect(sessions[0]?.prompt).toContain("Start the merge again even if no conflict markers are present");
+  if (scenario === "noop" || scenario === "exit" || scenario === "unmerged") {
+   expect((await git(["rev-parse", "HEAD"], worktree)).stdout.trim()).toBe(built);
+   expect((await git(["status", "--porcelain"], worktree)).stdout.trim()).toBe("");
+  }
+  expect(r.journal.deadmanCount()).toBeLessThanOrEqual(deadman);
+  rmSync(flag, { force: true });
+ }, 60_000);
+
+ test("pre-PR base conflict repairs stop after two worker passes when the base keeps moving (node #522)", async () => {
+  const flag = join(tmpdir(), `ranger-conflict-budget-${Date.now()}`);
+  const { r } = await resumableNoPr({ test: `test -f ${flag} && git fetch -q origin && ${UP_TO_DATE}` });
+  await moveBaseUnder(r);
+  writeFileSync(flag, "");
+  const deadman = r.journal.deadmanCount();
+  const prompts: string[] = [];
+  delete r.ctx.workerCommand;
+  r.ctx.worker = async (prompt, opts) => {
+   prompts.push(prompt);
+   const result = await runCmd(implementWorker, ["build", prompt], opts);
+   const seed = join(r.dir, "seed");
+   writeFileSync(join(seed, "src/feature.ts"), `export const fromMain = ${prompts.length};\n`);
+   expect((await git(["add", "src/feature.ts"], seed)).code).toBe(0);
+   expect((await git(["commit", "-m", "base moves again"], seed)).code).toBe(0);
+   expect((await git(["push", r.origin, "HEAD:main"], seed)).code).toBe(0);
+   return result;
+  };
   const outcome = await runNode("20", r.ctx);
   expect(outcome.status).toBe("parked");
-  expect(outcome.detail).toContain(`merging origin/main at ${main} conflicts in: src/feature.ts`);
-  expect(sessions).toHaveLength(0);
-  expect((await git(["rev-parse", "HEAD"], worktree)).stdout.trim()).toBe(built);
-  expect((await git(["status", "--porcelain"], worktree)).stdout.trim()).toBe("");
+  expect(outcome.detail).toContain("conflicts in: src/feature.ts");
+  expect(prompts).toHaveLength(2);
+  expect(prompts.every(prompt => prompt.includes("## Base merge pass"))).toBe(true);
   expect(r.github.prs.size).toBe(0);
-  expect(await r.github.sha(BRANCH)).toBe(built);
   expect(r.journal.deadmanCount()).toBe(deadman);
   rmSync(flag, { force: true });
  }, 60_000);

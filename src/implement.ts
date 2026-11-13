@@ -1437,6 +1437,7 @@ function reviewFailure(ctx: ImplementContext, error: ReviewError, round: number)
 
 export async function runImplement(ctx: ImplementContext): Promise<ImplementOutcome> {
  failedOperations.delete(ctx);
+ prePrBaseMerges.delete(ctx);
  let outcome: ImplementOutcome;
  try {
   outcome = await runImplementFlow(ctx);
@@ -2035,6 +2036,7 @@ async function runImplementFlow(ctx: ImplementContext): Promise<ImplementOutcome
 
 /** Base merge passes one node gets before a still-conflicting branch parks. */
 const MAX_BASE_MERGES = 2;
+const prePrBaseMerges = new WeakMap<ImplementContext, number>();
 
 const recordMachineMerge = (ctx: ImplementContext, github: ForgePort, prNumber: number) => async (sha: string, stale: StaleBase): Promise<void> => {
  ctx.journal.assertGeneration(ctx.node.ref.id, ctx.map.repo, ctx.generation, "record the base merge");
@@ -2551,7 +2553,15 @@ async function machineMergeBase(ctx: ImplementContext, input: { why: string; the
  const base = map.base;
  const here = await headSha(ctx.worktree);
  const merge = await machineMerge(ctx, baseSha, `Merge origin/${base} (${baseSha.slice(0, 8)}) into ${branch}`, `the merge of origin/${base}`);
- if (merge.kind === "conflict") throw new ParkSignal(behindBaseConflictParkOutcome({ why, branch, base, baseSha, behind, here, files: merge.files }));
+ if (merge.kind === "conflict") {
+  const parkOutcome = behindBaseConflictParkOutcome({ why, branch, base, baseSha, behind, here, files: merge.files });
+  const hasPr = (journal.getWorker(nodeId, repo)?.prNumber ?? null) !== null;
+  const testCommand = map.commands.test;
+  if (hasPr || testCommand === undefined || (prePrBaseMerges.get(ctx) ?? 0) >= MAX_BASE_MERGES) throw new ParkSignal(parkOutcome);
+  const pass = await baseMergePass(ctx, testCommand, { kind: "local", baseSha, conflict: { files: merge.files, parkOutcome } });
+  if (pass.failure !== undefined) throw new ParkSignal(parkOutcome);
+  return true;
+ }
  if (merge.kind === "failed") {
   journal.recordEvent("worktree-prepared", {
    nodeId,
@@ -2604,7 +2614,7 @@ async function conflictingFiles(worktree: string, base: string): Promise<string[
 }
 
 /** Where a base merge pass starts: the PR's pushed head, or a local HEAD with no PR yet (node #310). */
-type MergeFrom = { kind: "pushed"; head: string } | { kind: "local"; baseSha: string };
+type MergeFrom = { kind: "pushed"; head: string } | { kind: "local"; baseSha: string; conflict?: { files: string[]; parkOutcome: string } };
 
 /**
  * One worker pass that merges the moved base into the branch. The supervisor
@@ -2622,6 +2632,8 @@ type MergeFrom = { kind: "pushed"; head: string } | { kind: "local"; baseSha: st
  */
 async function baseMergePass(ctx: ImplementContext, testCommand: string, from: MergeFrom, stale?: StaleBase): Promise<PassResult> {
  const base = ctx.map.base;
+ const conflict = from.kind === "local" ? from.conflict : undefined;
+ if (from.kind === "local") prePrBaseMerges.set(ctx, (prePrBaseMerges.get(ctx) ?? 0) + 1);
  const start = from.kind === "pushed" ? from.head : await headSha(ctx.worktree);
  const resetTo = async (sha: string, why: string) => {
   for (const args of [["reset", "--hard", sha], ["clean", "-fd"]]) {
@@ -2639,13 +2651,13 @@ async function baseMergePass(ctx: ImplementContext, testCommand: string, from: M
  // run's work.
  if (from.kind === "pushed") await resetTo(from.head, "before a base merge");
  const baseSha = from.kind === "pushed" ? await fetchBaseTrusted(ctx) : from.baseSha;
- const files = await conflictingFiles(ctx.worktree, base);
+ const files = conflict?.files ?? await conflictingFiles(ctx.worktree, base);
  ctx.journal.recordEvent("reviewed", {
   nodeId: ctx.node.ref.id,
   repo: ctx.map.repo,
   detail:
    stale === undefined
-    ? `${changeRequestNoun(ctx.map.repo)} conflicts with origin/${base}${files.length > 0 ? ` in ${files.join(", ")}` : ""} — a worker merges it in`
+    ? `${from.kind === "local" ? ctx.branch : changeRequestNoun(ctx.map.repo)} conflicts with origin/${base}${files.length > 0 ? ` in ${files.join(", ")}` : ""} — a worker merges it in`
     : `${ctx.branch}: ${baseMergeWhy(base, stale)}${files.length > 0 ? `, conflicting in ${files.join(", ")}` : ""} — a worker merges it in before any review or probe run`,
  });
  const pass = await workerPass(ctx, testCommand, { kind: "base-merge", base, files, ...(stale === undefined ? {} : { stale }) });
@@ -2653,6 +2665,7 @@ async function baseMergePass(ctx: ImplementContext, testCommand: string, from: M
   // Nothing committed on a tree that was clean: what the worker left is a
   // half-done merge, and the next run must not build on it.
   await resetTo(start, "after a base merge that committed nothing");
+  if (conflict !== undefined) throw new ParkSignal(conflict.parkOutcome);
   if (pass.failure !== undefined && pass.workerExit === 0 && pass.failure.substrateCapped === undefined) {
    throw new ParkSignal(
     `base merge pass committed nothing, and origin/${base} as fetched (${baseSha.slice(0, 8)}) is not in ${ctx.branch} — the conflict stands${files.length > 0 ? ` in ${files.join(", ")}` : ""}; the worktree is back at ${start.slice(0, 8)} and nothing was pushed`,
@@ -2665,6 +2678,7 @@ async function baseMergePass(ctx: ImplementContext, testCommand: string, from: M
   timeoutMs: 30_000,
  });
  if (inside.code !== 0) {
+  if (conflict !== undefined) throw new ParkSignal(conflict.parkOutcome);
   throw new GitSafetyError(
    `base merge pass committed, but origin/${base} as fetched (${baseSha.slice(0, 8)}) is not in ${ctx.branch} — the conflict stands; nothing was pushed`,
   );
@@ -2927,7 +2941,7 @@ const NO_PR_THREAD_TO_RECORD_ON = (): Promise<void> => Promise.resolve();
 function workerGateBudget(ctx: ImplementContext, spec: WorkerPassSpec): { mergesLeft: () => Promise<number>; recordMerge: (sha: string, stale: StaleBase) => Promise<void> } {
  const spentByThisPass = spec.kind === "base-merge" ? 1 : 0;
  const prNumber = ctx.journal.getWorker(ctx.node.ref.id, ctx.map.repo)?.prNumber ?? null;
- if (prNumber === null) return { mergesLeft: () => Promise.resolve(MAX_BASE_MERGES - spentByThisPass), recordMerge: NO_PR_THREAD_TO_RECORD_ON };
+ if (prNumber === null) return { mergesLeft: () => Promise.resolve(MAX_BASE_MERGES - (prePrBaseMerges.get(ctx) ?? 0)), recordMerge: NO_PR_THREAD_TO_RECORD_ON };
  const github = ctx.github ?? lanePort(ctx.config, ctx.map.repo);
  return {
   mergesLeft: async () => await mergesLeftOnPr(ctx, github, prNumber, await headSha(ctx.worktree)) - spentByThisPass,
