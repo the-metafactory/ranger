@@ -50,6 +50,22 @@ describe("parseBlockedReport", () => {
  });
 });
 
+describe("parseBlockedReport: the gap line", () => {
+ test("Gap: ruling marks the report and stays out of the reason and condition", () => {
+  expect(parseBlockedReport("Needs a budget.\nGap: ruling\nResume condition: the principal sets it.\n")).toEqual({
+   reason: "Needs a budget.",
+   resume: "the principal sets it.",
+   ruling: true,
+  });
+  expect(parseBlockedReport("Needs a budget.\nResume condition: set it.\n**Gap:** Ruling\n").ruling).toBe(true);
+ });
+
+ test("Gap: code or no gap line leaves the report unmarked", () => {
+  expect(parseBlockedReport("No SDK.\nGap: code\nResume condition: publish.").ruling).toBeUndefined();
+  expect(parseBlockedReport("No SDK.\nResume condition: publish.").ruling).toBeUndefined();
+ });
+});
+
 describe("namedNodeReference: the node a resume condition names", () => {
  test("a bare #N counts wherever it stands, and a qualified owner/name#N carries its repo", () => {
   expect(namedNodeReference("open node #3459 or publish a release")).toEqual({ id: "3459" });
@@ -136,4 +152,5 @@ test("the implement prompt tells the worker to report a block, never to commit a
  expect(prompt).toContain(`Write \`${BLOCKED_REPORT_FILE}\` at the worktree root, leave it\n  uncommitted, and exit 0.`);
  expect(prompt).toContain("do NOT commit a note, a stub or a partial");
  expect(prompt).toContain("Resume condition: <what must hold before the node can be built>");
+ expect(prompt).toContain("Gap: ruling");
 });

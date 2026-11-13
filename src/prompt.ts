@@ -193,6 +193,9 @@ const BLOCKED_RULE = `- Blocked: if the node cannot be done yet because a precon
   implementation about it. Write \`${BLOCKED_REPORT_FILE}\` at the worktree root, leave it
   uncommitted, and exit 0. Its first lines say what blocks the node and the evidence;
   then one line \`Resume condition: <what must hold before the node can be built>\`.
+  Also write one line \`Gap: ruling\` when the condition is a ruling only the principal can
+  make (a budget, a policy, a choice between options), or \`Gap: code\` when it is a code or
+  provisioning gap a worker could close.
   The supervisor parks the node on it: it pushes nothing and opens no pull request.
   Only an unmet precondition is a block; a hard task or failing tests are not.`;
 
