@@ -325,6 +325,7 @@ export function assembleImplementPrompt(input: ImplementPromptInput): string {
            baseMerge.files.length > 0 ? `. A trial merge conflicts in: ${baseMerge.files.map((f) => `\`${f}\``).join(", ")}` : ""
           }.`,
       "This pass exists to merge the base. Your job is only to bring the base in:",
+      "The supervisor aborted any conflicting trial merge before this pass. Start the merge again even if no conflict markers are present.",
       `1. Run \`git merge --no-edit origin/${baseMerge.base}\`. Do not fetch: the supervisor already did.`,
       "   Never rebase, reset or amend: the supervisor pushes fast-forward only.",
       "2. Resolve every conflict so both sides keep working. The base's changes are merged work and",
