@@ -10,7 +10,7 @@ import { mergeGateNow, runMergeDesk } from "../src/merge-desk.ts";
 import { ciFixMarker, probeMarker, type ForgePort } from "../src/implement.ts";
 import type { IssueComment, ChangeRequest } from "../src/forge.ts";
 import type { CheckRun } from "../src/github.ts";
-import { CI_FAILED_PARK_OUTCOME, ciNotSentBackOutcome, mergeGateFailedOutcome, reviewCapOutcome } from "../src/outcomes.ts";
+import { CI_FAILED_PARK_OUTCOME, ciNotSentBackOutcome, mergeGateFailedOutcome, needsEyeCiRecoveredOutcome, reviewCapOutcome } from "../src/outcomes.ts";
 import { createCanonicalRepo, GIT_ENV } from "./support.ts";
 import { runCmd } from "../src/exec.ts";
 
@@ -252,8 +252,6 @@ describe("node #104 — ci-only-park-merges-without-lane: a CI-only park merges 
   ["CI failing with its CI fix passes spent", { comments: [review(CERTIFIED), ciFix("c", "d"), ciFix("e", "f")], ci: FAILING }],
   ["CI failing where a CI fix pass found nothing at the head", { comments: [review(CERTIFIED), ciFix(CERTIFIED, CERTIFIED)], ci: FAILING }],
   ["CI rerun still running", { comments: [review(CERTIFIED)], ci: [{ id: 10, name: "deploy", status: "in_progress", conclusion: null } as CheckRun] }],
-  ["the node is labelled ranger:needs-eye", { comments: [review(CERTIFIED)], ci: GREEN, labels: ["ranger:needs-eye"] }],
-  ["the node is labelled ranger:needs-eye on a manual map", { comments: [review(CERTIFIED)], ci: GREEN, labels: ["ranger:needs-eye"] }, { autoMerge: false }],
   ["no review recorded at the head", { comments: [], ci: GREEN }],
   ["the review at the head still has a major", { comments: [review(CERTIFIED, 0, 1)], ci: GREEN }],
   ["no probe certification at the head", { comments: [review(CERTIFIED)], ci: GREEN }, { probe: true }],
@@ -327,6 +325,148 @@ describe("node #104 — ci-only-park-merges-without-lane: a CI-only park merges 
    const result = await r.desk(gh.github);
    expect(result.parked).toEqual(["96"]);
    expect(r.journal.getWorker("96", GAME)).toMatchObject({ status: "parked", outcome: CI_PARK });
+  } finally { r.close(); }
+ });
+});
+
+describe("node #521 — a needs-eye CI-only park whose CI recovers reaches the principal", () => {
+ const needsEye = { comments: [review(CERTIFIED)], ci: GREEN, labels: ["ranger:needs-eye"] };
+
+ test("the CI reason becomes the recovered head and the needs-eye hold, and one merge card goes up", async () => {
+  const r = rig();
+  try {
+   const gh = fakeGitHub(needsEye);
+   const result = await r.desk(gh.github);
+   expect(result).toMatchObject({ cards: ["96"], merged: [], resumed: [], parked: [], errors: [] });
+   expect(gh.merges).toEqual([]);
+   expect(r.spawned).toEqual([]);
+   expect(r.posts).toHaveLength(1);
+   expect(r.posts[0]).toContain("ranger:needs-eye");
+   expect(r.journal.getWorker("96", GAME)).toMatchObject({
+    status: "parked", mergeMessageId: "msg-1", outcome: needsEyeCiRecoveredOutcome({ head: CERTIFIED }),
+   });
+   expect(r.events("sweep").map((e) => e.detail)).toContainEqual(expect.stringContaining(`CI recovered at ${CERTIFIED.slice(0, 8)}`));
+   expect(r.events("parked")).toEqual([]);
+  } finally { r.close(); }
+ });
+
+ test("later ticks neither rewrite the row nor repost the card", async () => {
+  const r = rig();
+  try {
+   const gh = fakeGitHub(needsEye);
+   await r.desk(gh.github);
+   const sweeps = r.events("sweep").length;
+   expect(await r.desk(gh.github)).toMatchObject({ cards: [], merged: [], parked: [], errors: [] });
+   expect(r.posts).toHaveLength(1);
+   expect(r.events("sweep")).toHaveLength(sweeps);
+   expect(r.journal.getWorker("96", GAME)).toMatchObject({ status: "parked", mergeMessageId: "msg-1", outcome: needsEyeCiRecoveredOutcome({ head: CERTIFIED }) });
+  } finally { r.close(); }
+ });
+
+ test("a manual map gets the card and the merge-by-hand instruction too", async () => {
+  const r = rig({ autoMerge: false });
+  try {
+   const gh = fakeGitHub(needsEye);
+   expect(await r.desk(gh.github)).toMatchObject({ cards: ["96"], merged: [], resumed: [] });
+   expect(gh.merges).toEqual([]);
+   expect(r.posts[0]).toContain("Merge it by hand (squash)");
+   expect(r.journal.getWorker("96", GAME)).toMatchObject({ status: "parked", mergeMessageId: "msg-1" });
+  } finally { r.close(); }
+ });
+
+ test("the recovered row still closes once the principal merges it by hand", async () => {
+  const r = rig();
+  try {
+   await r.desk(fakeGitHub(needsEye).github);
+   expect(await r.desk(fakeGitHub({ ...needsEye, merged: true }).github)).toMatchObject({ resumed: ["96"] });
+   expect(r.journal.getWorker("96", GAME)).toMatchObject({ status: "running", phase: "close" });
+  } finally { r.close(); }
+ });
+
+ test("a needs-eye CI park whose gate does not pass at the head stays parked and quiet", async () => {
+  const r = rig();
+  try {
+   const gh = fakeGitHub({ comments: [], ci: GREEN, labels: ["ranger:needs-eye"] });
+   expect(await r.desk(gh.github)).toMatchObject({ cards: [], merged: [], parked: [], errors: [] });
+   expect(r.posts).toEqual([]);
+   expect(r.journal.getWorker("96", GAME)).toMatchObject({ status: "parked", outcome: CI_PARK });
+  } finally { r.close(); }
+ });
+});
+
+describe("node #521 — a red CI a CI fix pass found nothing in gets one rerun before the park", () => {
+ const foundNothing = () => [review(CERTIFIED), ciFix(CERTIFIED, CERTIFIED)];
+ const withRerun = (comments: IssueComment[], ci: CheckRun[] = FAILING) => {
+  const gh = fakeGitHub({ comments, ci });
+  const reruns: number[] = [];
+  const posted: string[] = [];
+  gh.github.rerunFailedJobs = async (_repo, runs) => { reruns.push(...runs.map((run) => run.id)); return runs.length; };
+  gh.github.postComment = async (_repo, _n, body) => { posted.push(body); return posted.length; };
+  return { gh, reruns, posted };
+ };
+
+ test("an awaiting-merge row waits on the rerun instead of parking, and the record lands on the PR", async () => {
+  const r = rig();
+  try {
+   r.journal.updateWorker("96", GAME, { status: "awaiting-merge", outcome: null });
+   const { gh, reruns, posted } = withRerun(foundNothing());
+   expect(await r.desk(gh.github)).toMatchObject({ parked: [], resumed: [], errors: [] });
+   expect(reruns).toEqual([9]);
+   expect(posted).toHaveLength(1);
+   expect(posted[0]).toContain(`<!-- ranger:ci-rerun sha=${CERTIFIED} -->`);
+   expect(r.journal.getWorker("96", GAME)).toMatchObject({ status: "awaiting-merge", outcome: null });
+   expect(r.events("sweep").map((e) => e.detail)).toContainEqual(expect.stringContaining("rerun 1 failed job(s) once"));
+  } finally { r.close(); }
+ });
+
+ test("the rerun shows as running, and a red again at the same head parks, naming the rerun", async () => {
+  const r = rig();
+  try {
+   r.journal.updateWorker("96", GAME, { status: "awaiting-merge", outcome: null });
+   const first = withRerun(foundNothing());
+   await r.desk(first.gh.github);
+   const record: IssueComment = { id: 41, author: BOT, body: first.posted[0] };
+   const running: CheckRun[] = [{ id: 10, name: "build", status: "in_progress", conclusion: null }];
+   const rerunInFlight = withRerun([...foundNothing(), record], running);
+   expect(await r.desk(rerunInFlight.gh.github)).toMatchObject({ pending: ["96"], parked: [] });
+   expect(rerunInFlight.reruns).toEqual([]);
+   const red = withRerun([...foundNothing(), record]);
+   expect(await r.desk(red.gh.github)).toMatchObject({ parked: ["96"], resumed: [] });
+   expect(red.reruns).toEqual([]);
+   expect(red.posted).toEqual([]);
+   expect(r.journal.getWorker("96", GAME)?.outcome).toBe(ciNotSentBackOutcome({ reason: "CI failed: build=failure", head: CERTIFIED, reran: true }));
+  } finally { r.close(); }
+ });
+
+ test("a CI-only park at that head reruns too, and stays parked", async () => {
+  const r = rig();
+  try {
+   const { gh, reruns, posted } = withRerun(foundNothing());
+   expect(await r.desk(gh.github)).toMatchObject({ parked: [], resumed: [], errors: [] });
+   expect(reruns).toEqual([9]);
+   expect(posted).toHaveLength(1);
+   expect(r.journal.getWorker("96", GAME)).toMatchObject({ status: "parked", outcome: CI_PARK });
+  } finally { r.close(); }
+ });
+
+ test("a forge that cannot rerun a job parks the head as today", async () => {
+  const r = rig();
+  try {
+   r.journal.updateWorker("96", GAME, { status: "awaiting-merge", outcome: null });
+   expect(await r.desk(fakeGitHub({ comments: foundNothing(), ci: FAILING }).github)).toMatchObject({ parked: ["96"] });
+   expect(r.journal.getWorker("96", GAME)?.outcome).toBe(ciNotSentBackOutcome({ reason: "CI failed: build=failure", head: CERTIFIED }));
+  } finally { r.close(); }
+ });
+
+ test("a rerun the forge refuses parks the head and records the refusal", async () => {
+  const r = rig();
+  try {
+   r.journal.updateWorker("96", GAME, { status: "awaiting-merge", outcome: null });
+   const { gh, posted } = withRerun(foundNothing());
+   gh.github.rerunFailedJobs = async () => { throw new Error("HTTP 403: Resource not accessible by integration"); };
+   expect(await r.desk(gh.github)).toMatchObject({ parked: ["96"] });
+   expect(posted).toEqual([]);
+   expect(r.events("sweep").map((e) => e.detail)).toContainEqual(expect.stringContaining("the one rerun of the failed jobs"));
   } finally { r.close(); }
  });
 });

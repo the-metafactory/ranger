@@ -166,6 +166,7 @@ export interface ForgePort<ReadCredential = string, WriteCredential = string> ex
   * `sha`, the head the merge gate passed at. GitHub merges the base in.
   */
  rebasePr?(repo: string, n: number, sha: string, token: WriteCredential): Promise<RebaseOutcome>;
+ rerunFailedJobs?(repo: string, runs: CiFailedRun[], token: WriteCredential): Promise<number>;
  /** Why this forge project cannot take a squash merge, or null when it can. Read before any merge write. */
  squashRefusal?(repo: string, token: ReadCredential): Promise<string | null>;
  postComment(repo: string, n: number, body: string, token: WriteCredential): Promise<number>;
