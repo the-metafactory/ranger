@@ -7,7 +7,7 @@ import { stringify } from "yaml";
 import { loadConfig } from "../src/config.ts";
 import { openJournal } from "../src/journal.ts";
 import { mergeGateNow, runMergeDesk } from "../src/merge-desk.ts";
-import { ciFixMarker, probeMarker, type ForgePort } from "../src/implement.ts";
+import { ciFixMarker, ciRerunMarker, probeMarker, type ForgePort } from "../src/implement.ts";
 import type { IssueComment, ChangeRequest } from "../src/forge.ts";
 import type { CheckRun } from "../src/github.ts";
 import { CI_FAILED_PARK_OUTCOME, ciNotSentBackOutcome, mergeGateFailedOutcome, needsEyeCiRecoveredOutcome, reviewCapOutcome } from "../src/outcomes.ts";
@@ -28,7 +28,7 @@ const probes = (sha: string): IssueComment => ({
 });
 
 /** A forge with only the calls the merge desk may make; anything else throws. */
-function fakeGitHub(opts: { head?: string; comments: IssueComment[]; ci: CheckRun[]; labels?: string[]; merged?: boolean; title?: string; body?: string; onGetPr?: () => void }) {
+function fakeGitHub(opts: { head?: string; comments: IssueComment[]; ci: CheckRun[]; labels?: string[]; merged?: boolean; state?: "open" | "closed" | "merged"; title?: string; body?: string; onGetPr?: () => void }) {
  const calls: string[] = [];
  const merges: { n: number; sha: string }[] = [];
  const deletions: { repo: string; branch: string; token: string }[] = [];
@@ -43,7 +43,7 @@ function fakeGitHub(opts: { head?: string; comments: IssueComment[]; ci: CheckRu
    calls.push("getPr");
    opts.onGetPr?.();
    return {
-    iid: number, state: opts.merged ? "merged" : "open", draft: false, title: opts.title ?? "Repair the deploy step (node #96)",
+    iid: number, state: opts.state ?? (opts.merged ? "merged" : "open"), draft: false, title: opts.title ?? "Repair the deploy step (node #96)",
     headRef: "node/96", headSha: opts.head ?? CERTIFIED, baseRef: "main",
     mergeState: "mergeable", body: opts.body ?? "", mergeCommitSha: null, mergedBy: null, webUrl: "", author: BOT,
    } satisfies ChangeRequest;
@@ -390,6 +390,106 @@ describe("node #521 — a needs-eye CI-only park whose CI recovers reaches the p
    expect(await r.desk(gh.github)).toMatchObject({ cards: [], merged: [], parked: [], errors: [] });
    expect(r.posts).toEqual([]);
    expect(r.journal.getWorker("96", GAME)).toMatchObject({ status: "parked", outcome: CI_PARK });
+  } finally { r.close(); }
+ });
+});
+
+describe("node #521 — a recovered needs-eye park that stops passing loses the claim and its card", () => {
+ const needsEye = { comments: [review(CERTIFIED)], ci: GREEN, labels: ["ranger:needs-eye"] };
+ const red = (comments: IssueComment[]) => fakeGitHub({ comments, ci: FAILING, labels: ["ranger:needs-eye"] });
+
+ test("a red CI with the fix budget spent replaces the recovered claim and withdraws the card", async () => {
+  const r = rig();
+  try {
+   await r.desk(fakeGitHub(needsEye).github);
+   expect(r.journal.getWorker("96", GAME)).toMatchObject({ mergeMessageId: "msg-1", outcome: needsEyeCiRecoveredOutcome({ head: CERTIFIED }) });
+   const gh = red([review(CERTIFIED), ciFix("c", "d"), ciFix("e", "f")]);
+   expect(await r.desk(gh.github)).toMatchObject({ cards: [], merged: [], resumed: [], parked: ["96"], errors: [] });
+   expect(r.posts).toHaveLength(2);
+   expect(r.posts[1]).toContain("merge card withdrawn");
+   expect(r.posts[1]).toContain("CI failed: build=failure");
+   expect(r.journal.getWorker("96", GAME)).toMatchObject({
+    status: "parked",
+    mergeMessageId: null,
+    outcome: ciNotSentBackOutcome({ reason: "CI failed: build=failure", head: CERTIFIED, spent: 2 }),
+   });
+   expect(gh.calls).not.toContain("mergePr");
+  } finally { r.close(); }
+ });
+
+ test("a red again after the one rerun also takes the claim and the card down", async () => {
+  const r = rig();
+  try {
+   await r.desk(fakeGitHub(needsEye).github);
+   const already: IssueComment = { id: 42, author: BOT, body: ciRerunMarker({ sha: CERTIFIED, jobs: ["build"] }) };
+   const gh = red([review(CERTIFIED), ciFix(CERTIFIED, CERTIFIED), already]);
+   expect(await r.desk(gh.github)).toMatchObject({ parked: ["96"], errors: [] });
+   expect(r.journal.getWorker("96", GAME)).toMatchObject({
+    mergeMessageId: null,
+    outcome: ciNotSentBackOutcome({ reason: "CI failed: build=failure", head: CERTIFIED, reran: true }),
+   });
+  } finally { r.close(); }
+ });
+
+ test("a head the review no longer covers parks the row on that check, with the card down", async () => {
+  const r = rig();
+  try {
+   await r.desk(fakeGitHub(needsEye).github);
+   const gh = fakeGitHub({ head: MOVED, comments: [review(CERTIFIED)], ci: GREEN, labels: ["ranger:needs-eye"] });
+   expect(await r.desk(gh.github)).toMatchObject({ cards: [], parked: ["96"], errors: [] });
+   expect(r.posts[1]).toContain("resume it when you want it reworked");
+   expect(r.journal.getWorker("96", GAME)?.outcome).toBe(mergeGateFailedOutcome({ check: "review-clean", reason: `no sage verdict recorded for head ${MOVED.slice(0, 8)}` }));
+  } finally { r.close(); }
+ });
+
+ test("a review that gained a blocking finding parks the row on it, with the card down", async () => {
+  const r = rig();
+  try {
+   await r.desk(fakeGitHub(needsEye).github);
+   const gh = fakeGitHub({ comments: [review(CERTIFIED, 0, 1)], ci: GREEN, labels: ["ranger:needs-eye"] });
+   expect(await r.desk(gh.github)).toMatchObject({ cards: [], parked: ["96"], errors: [] });
+   expect(r.posts).toHaveLength(2);
+   expect(r.journal.getWorker("96", GAME)).toMatchObject({
+    status: "parked", mergeMessageId: null, outcome: `sage round 3 at ${CERTIFIED.slice(0, 8)} has 0 blocker(s) and 1 major(s) to rework`,
+   });
+  } finally { r.close(); }
+ });
+
+ test("the claim returns with one new card once the gate passes again", async () => {
+  const r = rig();
+  try {
+   await r.desk(fakeGitHub(needsEye).github);
+   await r.desk(red([review(CERTIFIED), ciFix(CERTIFIED, CERTIFIED)]).github);
+   expect(r.journal.getWorker("96", GAME)?.mergeMessageId).toBeNull();
+   expect(await r.desk(fakeGitHub(needsEye).github)).toMatchObject({ cards: ["96"], errors: [] });
+   expect(r.posts).toHaveLength(3);
+   expect(r.posts[2]).toContain("merge needed");
+   expect(r.journal.getWorker("96", GAME)).toMatchObject({ mergeMessageId: "msg-3", outcome: needsEyeCiRecoveredOutcome({ head: CERTIFIED }) });
+  } finally { r.close(); }
+ });
+
+ test("a declined change takes the recovered card down too", async () => {
+  const r = rig();
+  try {
+   await r.desk(fakeGitHub(needsEye).github);
+   const gh = fakeGitHub({ ...needsEye, state: "closed" });
+   expect(await r.desk(gh.github)).toMatchObject({ cards: [], merged: [], parked: ["96"], errors: [] });
+   expect(r.posts).toHaveLength(2);
+   expect(r.posts[1]).toContain("merge card withdrawn");
+   expect(r.journal.getWorker("96", GAME)).toMatchObject({ mergeMessageId: null });
+   expect(r.journal.getWorker("96", GAME)?.outcome).toContain("was closed without merging");
+  } finally { r.close(); }
+ });
+
+ test("a later tick at the same red stays quiet (one withdrawal, no reparking card per tick)", async () => {
+  const r = rig();
+  try {
+   await r.desk(fakeGitHub(needsEye).github);
+   const gh = red([review(CERTIFIED), ciFix("c", "d"), ciFix("e", "f")]);
+   await r.desk(gh.github);
+   const posts = r.posts.length;
+   expect(await r.desk(gh.github)).toMatchObject({ cards: [], parked: [], errors: [] });
+   expect(r.posts).toHaveLength(posts);
   } finally { r.close(); }
  });
 });

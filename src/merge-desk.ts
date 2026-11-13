@@ -371,7 +371,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    spawn: generation => ctx.spawn?.(row.nodeId, repo, row.root, generation) ?? Promise.resolve(null) });
  }
 
- async function park(row: WorkerRow, detail: string, title: string): Promise<void> {
+ function recordPark(row: WorkerRow, detail: string): void {
   writeOwned(row, {
    status: "parked",
    finishedAt: new Date().toISOString(),
@@ -379,6 +379,10 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   });
   journal.recordEvent("parked", { nodeId: row.nodeId, repo, detail: detail.slice(0, 400) });
   result.parked.push(row.nodeId);
+ }
+
+ async function park(row: WorkerRow, detail: string, title: string): Promise<void> {
+  recordPark(row, detail);
   try {
    await post(
     renderCard({
@@ -396,6 +400,43 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   }
  }
 
+ async function withdrawCard(row: WorkerRow, title: string, lines: string[]): Promise<boolean> {
+  if (row.mergeMessageId === null) return true;
+  try {
+   await post(
+    renderCard({
+     emoji: "↩️",
+     status: "merge card withdrawn",
+     nodeId: row.nodeId,
+     title,
+     meta: [`map: ${mapKey(map)}`],
+     lines,
+    }),
+    `merge card withdrawal for #${row.nodeId}`,
+   );
+  } catch {
+   result.errors.push(`#${row.nodeId}: could not post the card withdrawal — retrying next tick`);
+   return false;
+  }
+  writeOwned(row, { mergeMessageId: null });
+  return true;
+ }
+
+ async function reparkIfRecovered(row: WorkerRow, detail: string, title: string): Promise<void> {
+  if (!NEEDS_EYE_CI_RECOVERED_OUTCOME.test(row.outcome ?? "")) return;
+  if (row.mergeMessageId === null) {
+   await park(row, detail, title);
+   return;
+  }
+  const cr = row.prNumber === null ? `node ${row.nodeId}` : changeRequestLabel(repo, row.prNumber);
+  const watchedAgain = CI_FAILED_PARK_OUTCOME.test(detail);
+  const held = watchedAgain
+   ? `${cr} stays parked on its merge gate; ranger re-reads the gate every tick and posts a new merge card once it passes.`
+   : `${cr} stays parked; resume it when you want it reworked, or merge it by hand.`;
+  if (!(await withdrawCard(row, title, [`Do not merge yet: the CI recovery at this head no longer holds. ${detail}.`, held]))) return;
+  recordPark(row, detail);
+ }
+
  /**
   * Send a ready (or CI-parked) change request back to run-node, which
   * resumes in the review phase: a fix pass and a new round, only the probe
@@ -405,25 +446,10 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
  async function sendBack(row: WorkerRow, why: string, title: string, noCiHead?: string, enqueue = false): Promise<void> {
   if (ctx.spawn === undefined || row.prNumber === null) return;
   const cr = changeRequestLabel(repo, row.prNumber);
-  if (row.mergeMessageId !== null) {
-   try {
-    await post(
-     renderCard({
-      emoji: "↩️",
-      status: "merge card withdrawn",
-      nodeId: row.nodeId,
-      title,
-      meta: [`map: ${mapKey(map)}`],
-      lines: [`Do not merge yet: ${why}. Ranger reworks it; a new merge card follows when the ${changeRequestNoun(repo)} is clean.`],
-     }),
-     `merge card withdrawal for #${row.nodeId}`,
-    );
-   } catch {
-    result.errors.push(`#${row.nodeId}: could not post the card withdrawal — retrying next tick`);
-    return;
-   }
-   writeOwned(row, { mergeMessageId: null });
-  }
+  const withdrawn = await withdrawCard(row, title, [
+   `Do not merge yet: ${why}. Ranger reworks it; a new merge card follows when the ${changeRequestNoun(repo)} is clean.`,
+  ]);
+  if (!withdrawn) return;
   // A send-back starts a worker session (a fix, CI fix or base merge pass, or
   // probes): it waits for the implement lane like any other start. The stale
   // card is already gone.
@@ -727,10 +753,12 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   // a failed row only on a merge.
   if (row.status === "failed") return;
   const ciPark = row.status === "parked" && ciOnlyPark(row);
-  if (row.status === "parked" && (!ciPark || pr.state === "closed")) return;
+  if (row.status === "parked" && !ciPark) return;
 
   if (pr.state === "closed") {
-   await park(row, `${cr} was closed without merging — declined; ranger will not reopen or re-propose it`, title);
+   const declined = `${cr} was closed without merging — declined; ranger will not reopen or re-propose it`;
+   if (ciPark) await reparkIfRecovered(row, declined, title);
+   else await park(row, declined, title);
    return;
   }
 
@@ -758,7 +786,10 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   const rebased = last === undefined ? rebaseOfLatestReview(rebases, latestSha, pr.headSha) : null;
   const reason = sendBackReason(repo, pr, map.base, { last, missingProbes, rebased });
   // A send-back is a worker session; a CI-only park starts one only for its red CI, below.
-  if (ciPark && reason !== null) return;
+  if (ciPark && reason !== null) {
+   await reparkIfRecovered(row, reason, title);
+   return;
+  }
   const { why, ci, noCi } = await sendBackFor(row, pr, title, { reason, ciPark, last, probe });
   if (why !== null && ctx.spawn !== undefined) {
    await sendBack(row, why, title, noCi ? pr.headSha : undefined);
@@ -783,11 +814,17 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    }
    const reran = foundNothing ? await rerunRedHead(row, pr, comments, verdict) : "unavailable";
    if (reran === "requested") return;
-   if (!ciPark) await park(row, ciNotSentBackOutcome({ reason: gate.reason, head: pr.headSha, ...(foundNothing ? { reran: reran === "already" } : { spent: used }) }), title);
+   const detail = ciNotSentBackOutcome({ reason: gate.reason, head: pr.headSha, ...(foundNothing ? { reran: reran === "already" } : { spent: used }) });
+   if (ciPark) await reparkIfRecovered(row, detail, title);
+   else await park(row, detail, title);
    return;
   }
   // A CI-only park stays parked, quietly, until the whole gate passes.
-  if (ciPark && gate.status !== "pass") return;
+  if (ciPark && gate.status === "pending") return;
+  if (ciPark && gate.status === "fail") {
+   await reparkIfRecovered(row, mergeGateFailedOutcome(gate), title);
+   return;
+  }
   if (gate.status === "pending") {
    result.pending.push(row.nodeId);
    return;
