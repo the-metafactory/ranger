@@ -813,8 +813,16 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
     return;
    }
    const reran = foundNothing ? await rerunRedHead(row, pr, comments, verdict) : "unavailable";
-   if (reran === "requested") return;
-   const detail = ciNotSentBackOutcome({ reason: gate.reason, head: pr.headSha, ...(foundNothing ? { reran: reran === "already" } : { spent: used }) });
+   const waitingOnRerun = reran === "requested";
+   const detail = ciNotSentBackOutcome({
+    reason: gate.reason,
+    head: pr.headSha,
+    ...(foundNothing ? (waitingOnRerun ? { waiting: true } : { reran: reran === "already" }) : { spent: used }),
+   });
+   if (waitingOnRerun) {
+    if (ciPark) await reparkIfRecovered(row, detail, title);
+    return;
+   }
    if (ciPark) await reparkIfRecovered(row, detail, title);
    else await park(row, detail, title);
    return;

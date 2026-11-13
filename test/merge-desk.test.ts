@@ -481,6 +481,40 @@ describe("node #521 — a recovered needs-eye park that stops passing loses the 
   } finally { r.close(); }
  });
 
+ test("the one rerun asked at a red head takes the claim and the card down before ranger waits on it", async () => {
+  const r = rig();
+  try {
+   await r.desk(fakeGitHub(needsEye).github);
+   expect(r.journal.getWorker("96", GAME)).toMatchObject({ mergeMessageId: "msg-1", outcome: needsEyeCiRecoveredOutcome({ head: CERTIFIED }) });
+   const gh = red([review(CERTIFIED), ciFix(CERTIFIED, CERTIFIED)]);
+   const reruns: number[] = [];
+   const posted: string[] = [];
+   gh.github.rerunFailedJobs = async (_repo, runs) => { reruns.push(...runs.map((run) => run.id)); return runs.length; };
+   gh.github.postComment = async (_repo, _n, body) => { posted.push(body); return posted.length; };
+   expect(await r.desk(gh.github)).toMatchObject({ cards: [], merged: [], resumed: [], parked: ["96"], errors: [] });
+   expect(reruns).toEqual([9]);
+   expect(posted).toHaveLength(1);
+   expect(r.posts).toHaveLength(2);
+   expect(r.posts[1]).toContain("merge card withdrawn");
+   expect(r.posts[1]).toContain("CI failed: build=failure");
+   expect(r.journal.getWorker("96", GAME)).toMatchObject({
+    status: "parked",
+    mergeMessageId: null,
+    outcome: ciNotSentBackOutcome({ reason: "CI failed: build=failure", head: CERTIFIED, waiting: true }),
+   });
+   const running: CheckRun[] = [{ id: 10, name: "build", status: "in_progress", conclusion: null }];
+   const record: IssueComment = { id: 41, author: BOT, body: posted[0] };
+   const waiting = fakeGitHub({ comments: [review(CERTIFIED), ciFix(CERTIFIED, CERTIFIED), record], ci: running, labels: ["ranger:needs-eye"] });
+   expect(await r.desk(waiting.github)).toMatchObject({ cards: [], merged: [], parked: [], errors: [] });
+   expect(r.posts).toHaveLength(2);
+   expect(r.journal.getWorker("96", GAME)?.outcome).toContain("waits on it");
+   expect(await r.desk(fakeGitHub(needsEye).github)).toMatchObject({ cards: ["96"], errors: [] });
+   expect(r.posts).toHaveLength(3);
+   expect(r.posts[2]).toContain("merge needed");
+   expect(r.journal.getWorker("96", GAME)).toMatchObject({ mergeMessageId: "msg-3", outcome: needsEyeCiRecoveredOutcome({ head: CERTIFIED }) });
+  } finally { r.close(); }
+ });
+
  test("a later tick at the same red stays quiet (one withdrawal, no reparking card per tick)", async () => {
   const r = rig();
   try {

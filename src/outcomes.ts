@@ -349,16 +349,19 @@ export const CI_FAILED_PARK_OUTCOME = /^merge gate failed \(ci-green\): /;
 
 /**
  * A red CI the merge desk does not send back to a worker: its CI fix passes
- * are spent, or one already ran at this head and found nothing to change. Still a CI-only park, so CI recovering at the
- * head (a rerun) moves it on. Ranger's words come first: the park keeps 400
- * characters, and a CI reason can be long.
+ * are spent, one already ran at this head and found nothing to change, or the
+ * rerun it asked for at that head is still running. Still a CI-only park, so
+ * CI recovering at the head (a rerun) moves it on. Ranger's words come first:
+ * the park keeps 400 characters, and a CI reason can be long.
  */
-export function ciNotSentBackOutcome(r: { reason: string; head: string; spent?: number; reran?: boolean }): string {
+export function ciNotSentBackOutcome(r: { reason: string; head: string; spent?: number; reran?: boolean; waiting?: boolean }): string {
  const why = r.spent !== undefined
   ? `the CI fix budget is spent (${r.spent} CI fix pass(es) at earlier heads), so ranger stops at ${r.head.slice(0, 8)}; fix it by hand, or rerun CI if it is flaky`
   : r.reran === true
    ? `a CI fix pass at ${r.head.slice(0, 8)} found nothing in the branch to change, and ranger's one rerun of the failed jobs there was red again; fix it by hand`
-   : `a CI fix pass at ${r.head.slice(0, 8)} found nothing in the branch to change; rerun CI if it is flaky, or fix it by hand`;
+   : r.waiting === true
+    ? `a CI fix pass at ${r.head.slice(0, 8)} found nothing in the branch to change, so ranger asked CI to rerun the failed jobs once and waits on it; a red again at this head parks it`
+    : `a CI fix pass at ${r.head.slice(0, 8)} found nothing in the branch to change; rerun CI if it is flaky, or fix it by hand`;
  return mergeGateFailedOutcome({ check: "ci-green", reason: `${why}. ${r.reason}` });
 }
 
