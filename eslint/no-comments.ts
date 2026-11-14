@@ -57,4 +57,3 @@ export const noComments: Rule.RuleModule = {
  },
 };
 
-export const ranger = { rules: { "no-comments": noComments } };
