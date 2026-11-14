@@ -37,6 +37,15 @@ test("only transient deferrals in a row escalate; another outcome restarts the c
  expect(posts).toHaveLength(1);
 });
 
+test("a card that never posts is retried on every deferral and journaled once", async () => {
+ const entry = { id: 1, repo: REPO, nodeId: "40", lane: "headless" as const };
+ let attempts = 0;
+ const post = async () => { attempts += 1; throw new Error("discord 503"); };
+ for (let i = 0; i < MAX_TRANSIENT_RESUME_DEFERRALS + 5; i++) await recordTransientDeferral({ journal, map, entry, reason: "gh down", post });
+ expect(attempts).toBe(6);
+ expect(journal.listEvents(REPO, 1_000).filter((e) => e.detail?.includes("card for #40 not posted")).length).toBe(1);
+});
+
 test("a card that fails to post is retried on the next deferral", async () => {
  const entry = { id: 1, repo: REPO, nodeId: "40", lane: "headless" as const };
  let up = false;

@@ -13,7 +13,7 @@ import { mapKey } from "./maps.ts";
  */
 export const MAX_TRANSIENT_RESUME_DEFERRALS = 3;
 
-const streakSchema = z.object({ entryId: z.number(), count: z.number(), escalated: z.boolean(), posted: z.boolean() });
+const streakSchema = z.object({ entryId: z.number(), count: z.number(), escalated: z.boolean(), posted: z.boolean(), postFailed: z.boolean() });
 type Streak = z.infer<typeof streakSchema>;
 type Entry = Pick<ResumeQueueRow, "id" | "repo" | "nodeId" | "lane">;
 export type Post = (content: string, label: string) => Promise<string>;
@@ -41,7 +41,8 @@ export function mapAnnouncer(map: RangerMapConfig): Post | null {
  * Count one transient deferral. Journals each one until the streak escalates,
  * journals the escalation once, then stays silent while the same entry keeps
  * waiting. The card goes to the map's channel as soon as there is one: a post
- * that fails, or a map that has no channel yet, is retried on a later deferral.
+ * that fails, or a map that has no channel yet, is retried on a later deferral,
+ * and only the first failed post is journaled.
  */
 export async function recordTransientDeferral(args: {
  journal: Journal;
@@ -53,7 +54,7 @@ export async function recordTransientDeferral(args: {
  const { journal, entry, reason } = args;
  const previous = readStreak(journal, entry);
  const streak: Streak = { entryId: entry.id, count: (previous?.count ?? 0) + 1,
-  escalated: previous?.escalated ?? false, posted: previous?.posted ?? false };
+  escalated: previous?.escalated ?? false, posted: previous?.posted ?? false, postFailed: previous?.postFailed ?? false };
  const detail = `queued resume #${entry.nodeId} escalated: ${streak.count} transient deferrals in a row, last: ${reason}. ` +
   `It keeps its place in the ${entry.lane} queue and starts once the failure clears; \`ranger resume-node ${entry.nodeId} --cancel\` drops it`;
  if (!streak.escalated) {
@@ -71,8 +72,11 @@ export async function recordTransientDeferral(args: {
    }), `queued resume escalation for #${entry.nodeId}`);
    streak.posted = true;
   } catch (error) {
-   journal.recordEvent("sweep", { nodeId: entry.nodeId, repo: entry.repo,
-    detail: `queued resume escalation card for #${entry.nodeId} not posted: ${String(error).slice(0, 400)}` });
+   if (!streak.postFailed) {
+    journal.recordEvent("sweep", { nodeId: entry.nodeId, repo: entry.repo,
+     detail: `queued resume escalation card for #${entry.nodeId} not posted, retried on each later deferral: ${String(error).slice(0, 400)}` });
+   }
+   streak.postFailed = true;
   }
  }
  journal.setHealth(streakKey(entry), JSON.stringify(streak));
