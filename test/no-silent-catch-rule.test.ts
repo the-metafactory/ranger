@@ -33,6 +33,7 @@ describe("ranger/no-silent-catch", () => {
    "function c() { try { return go(); } catch { return { ok: false } as const; } }",
    "const d = p.catch((error: unknown) => ({ ok: false, error }));",
    "function e() { try { go(); } catch { const inner = () => null; inner(); return 1; } }",
+   "void Promise.resolve(1).catch();",
   ].join("\n");
   expect(flagged(code)).toEqual([]);
  });

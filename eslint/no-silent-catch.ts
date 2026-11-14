@@ -58,7 +58,8 @@ export const noSilentCatch: Rule.RuleModule = {
    CallExpression(node) {
     const callee = node.callee;
     if (callee.type !== "MemberExpression" || callee.property.type !== "Identifier" || callee.property.name !== "catch") return;
-    const handler = node.arguments[0];
+    const handler = node.arguments.at(0);
+    if (handler === undefined) return;
     if (handler.type !== "ArrowFunctionExpression" && handler.type !== "FunctionExpression") return;
     const fn: Fn = handler;
     if (!unread(source.getDeclaredVariables(fn))) return;
