@@ -3,6 +3,7 @@
 //
 // Ranger additions:
 //   - ranger/no-comments (eslint/no-comments.ts): code says it, comments don't.
+//   - ranger/no-silent-catch (eslint/no-silent-catch.ts): a caught failure never comes back as null, false, [] or {}.
 //   - it also bans @ts-ignore / @ts-expect-error / @ts-nocheck outright
 //     (ban-ts-comment is off: its message points at @ts-expect-error).
 //   - noInlineConfig: `eslint-disable` comments do nothing; the only way to
@@ -19,7 +20,7 @@
 import js from "@eslint/js";
 import { defineConfig } from "eslint/config";
 import tseslint from "typescript-eslint";
-import { ranger } from "./eslint/no-comments.ts";
+import { ranger } from "./eslint/plugin.ts";
 
 // Test mode has one owner. Production code that reads it changes behaviour
 // under test, so a missing injection still passes (host-load.ts, #304).
@@ -53,6 +54,7 @@ export default defineConfig(
   plugins: { ranger },
   rules: {
    "ranger/no-comments": "error",
+   "ranger/no-silent-catch": "error",
    "@typescript-eslint/ban-ts-comment": "off",
 
    "@typescript-eslint/no-floating-promises": "error",
@@ -105,6 +107,7 @@ export default defineConfig(
   // inject failures through unsafe casts.
   files: ["test/**/*.ts"],
   rules: {
+   "ranger/no-silent-catch": "off",
    "@typescript-eslint/no-explicit-any": "off",
    "@typescript-eslint/no-non-null-assertion": "off",
    "@typescript-eslint/no-unsafe-assignment": "off",

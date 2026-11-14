@@ -10,6 +10,9 @@
   "src/awake.ts": {
     "ranger/no-comments": {
       "count": 1
+    },
+    "ranger/no-silent-catch": {
+      "count": 1
     }
   },
   "src/blocked-report.ts": {
@@ -18,11 +21,17 @@
     },
     "ranger/no-comments": {
       "count": 6
+    },
+    "ranger/no-silent-catch": {
+      "count": 1
     }
   },
   "src/budget.ts": {
     "ranger/no-comments": {
       "count": 5
+    },
+    "ranger/no-silent-catch": {
+      "count": 2
     }
   },
   "src/build-now.ts": {
@@ -93,6 +102,9 @@
     },
     "ranger/no-comments": {
       "count": 24
+    },
+    "ranger/no-silent-catch": {
+      "count": 1
     }
   },
   "src/closed-elsewhere.ts": {
@@ -117,6 +129,9 @@
     },
     "ranger/no-comments": {
       "count": 81
+    },
+    "ranger/no-silent-catch": {
+      "count": 1
     }
   },
   "src/digest.ts": {
@@ -136,6 +151,11 @@
     },
     "ranger/no-comments": {
       "count": 91
+    }
+  },
+  "src/endpoint.ts": {
+    "ranger/no-silent-catch": {
+      "count": 2
     }
   },
   "src/escalate.ts": {
@@ -167,6 +187,9 @@
     },
     "ranger/no-comments": {
       "count": 13
+    },
+    "ranger/no-silent-catch": {
+      "count": 4
     }
   },
   "src/forge-ref.ts": {
@@ -187,6 +210,9 @@
   "src/frontier-cache.ts": {
     "ranger/no-comments": {
       "count": 31
+    },
+    "ranger/no-silent-catch": {
+      "count": 2
     }
   },
   "src/git-ops.ts": {
@@ -210,6 +236,9 @@
     },
     "ranger/no-comments": {
       "count": 49
+    },
+    "ranger/no-silent-catch": {
+      "count": 2
     }
   },
   "src/git-trust.ts": {
@@ -225,6 +254,11 @@
       "count": 2
     }
   },
+  "src/github-usage-report.ts": {
+    "ranger/no-silent-catch": {
+      "count": 1
+    }
+  },
   "src/github.ts": {
     "@typescript-eslint/no-base-to-string": {
       "count": 26
@@ -237,6 +271,9 @@
     },
     "ranger/no-comments": {
       "count": 5
+    },
+    "ranger/no-silent-catch": {
+      "count": 1
     }
   },
   "src/gitlab.ts": {
@@ -337,6 +374,9 @@
     },
     "ranger/no-comments": {
       "count": 276
+    },
+    "ranger/no-silent-catch": {
+      "count": 5
     }
   },
   "src/intake.ts": {
@@ -357,6 +397,9 @@
     },
     "ranger/no-comments": {
       "count": 125
+    },
+    "ranger/no-silent-catch": {
+      "count": 1
     }
   },
   "src/jobs.ts": {
@@ -371,6 +414,9 @@
     },
     "ranger/no-comments": {
       "count": 19
+    },
+    "ranger/no-silent-catch": {
+      "count": 2
     }
   },
   "src/journal-guard.ts": {
@@ -436,11 +482,19 @@
     },
     "ranger/no-comments": {
       "count": 70
+    },
+    "ranger/no-silent-catch": {
+      "count": 2
     }
   },
   "src/merge-gate.ts": {
     "ranger/no-comments": {
       "count": 16
+    }
+  },
+  "src/node-dependency.ts": {
+    "ranger/no-silent-catch": {
+      "count": 1
     }
   },
   "src/outcomes.ts": {
@@ -532,6 +586,14 @@
   "src/remote-test/bus-contract.ts": {
     "ranger/no-comments": {
       "count": 12
+    },
+    "ranger/no-silent-catch": {
+      "count": 1
+    }
+  },
+  "src/remote-test/bus-producer.ts": {
+    "ranger/no-silent-catch": {
+      "count": 1
     }
   },
   "src/remote-test/bus-source.ts": {
@@ -552,6 +614,11 @@
     },
     "ranger/no-comments": {
       "count": 28
+    }
+  },
+  "src/remote-test/check-reporter.ts": {
+    "ranger/no-silent-catch": {
+      "count": 1
     }
   },
   "src/remote-test/contract.ts": {
@@ -623,6 +690,11 @@
       "count": 13
     }
   },
+  "src/remote-test/pr-head-submitter.ts": {
+    "ranger/no-silent-catch": {
+      "count": 1
+    }
+  },
   "src/remote-test/private-io.ts": {
     "@typescript-eslint/no-unsafe-return": {
       "count": 1
@@ -653,6 +725,9 @@
     },
     "ranger/no-comments": {
       "count": 4
+    },
+    "ranger/no-silent-catch": {
+      "count": 1
     }
   },
   "src/remote-test/source.ts": {
@@ -704,6 +779,9 @@
     },
     "ranger/no-comments": {
       "count": 11
+    },
+    "ranger/no-silent-catch": {
+      "count": 1
     }
   },
   "src/remote-test/ssh-protocol.ts": {
@@ -745,6 +823,14 @@
     },
     "ranger/no-comments": {
       "count": 15
+    },
+    "ranger/no-silent-catch": {
+      "count": 1
+    }
+  },
+  "src/root-author.ts": {
+    "ranger/no-silent-catch": {
+      "count": 1
     }
   },
   "src/route.ts": {
@@ -759,6 +845,9 @@
     },
     "ranger/no-comments": {
       "count": 40
+    },
+    "ranger/no-silent-catch": {
+      "count": 2
     }
   },
   "src/run-ledger.ts": {
@@ -790,6 +879,9 @@
     },
     "ranger/no-comments": {
       "count": 19
+    },
+    "ranger/no-silent-catch": {
+      "count": 1
     }
   },
   "src/serve-drain.ts": {
@@ -818,6 +910,9 @@
     },
     "ranger/no-comments": {
       "count": 94
+    },
+    "ranger/no-silent-catch": {
+      "count": 1
     }
   },
   "src/serve.ts": {
@@ -844,6 +939,9 @@
     },
     "ranger/no-comments": {
       "count": 118
+    },
+    "ranger/no-silent-catch": {
+      "count": 4
     }
   },
   "src/spawn.ts": {
@@ -884,6 +982,11 @@
       "count": 70
     }
   },
+  "src/studio-think.ts": {
+    "ranger/no-silent-catch": {
+      "count": 1
+    }
+  },
   "src/substrate-policy.ts": {
     "ranger/no-comments": {
       "count": 3
@@ -918,6 +1021,9 @@
     },
     "ranger/no-comments": {
       "count": 28
+    },
+    "ranger/no-silent-catch": {
+      "count": 1
     }
   },
   "src/sweep.ts": {
@@ -988,6 +1094,9 @@
     },
     "ranger/no-comments": {
       "count": 11
+    },
+    "ranger/no-silent-catch": {
+      "count": 2
     }
   },
   "src/walk.ts": {
@@ -1016,6 +1125,11 @@
     },
     "ranger/no-comments": {
       "count": 7
+    }
+  },
+  "src/worker-log.ts": {
+    "ranger/no-silent-catch": {
+      "count": 1
     }
   },
   "src/worker.ts": {

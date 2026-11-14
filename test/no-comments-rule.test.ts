@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { Linter } from "eslint";
 import tseslint from "typescript-eslint";
-import { ranger } from "../eslint/no-comments.ts";
+import { ranger } from "../eslint/plugin.ts";
 
 const linter = new Linter({ configType: "flat" });
 const config: Linter.Config[] = [
