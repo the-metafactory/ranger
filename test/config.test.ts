@@ -26,6 +26,19 @@ describe("loadConfig", () => {
     });
   });
 
+  test("a map's advisoryChecks default empty, parse a list, and a GitLab map refuses them by name (node #528)", () => {
+    withConfig("maps:\n  - repo: acme/widgets\n    root: 1\n", path => {
+      expect(loadConfig(path, {}).config.maps[0]?.advisoryChecks).toEqual([]);
+    });
+    withConfig("maps:\n  - repo: acme/widgets\n    root: 1\n    advisoryChecks:\n      - codecov/project\n", path => {
+      expect(loadConfig(path, {}).config.maps[0]?.advisoryChecks).toEqual(["codecov/project"]);
+    });
+    withConfig("maps:\n  - repo: gitlab:gitlab.example.org/team/widgets\n    root: 1\n    advisoryChecks:\n      - codecov/project\n", path => {
+      expect(() => loadConfig(path, {})).toThrow(/maps\.0\.advisoryChecks/);
+      expect(() => loadConfig(path, {})).toThrow(/GitHub-only/);
+    });
+  });
+
   test("bus is optional; defaults stack and loopback URL when enabled", () => {
     const base = "maps:\n  - repo: acme/widgets\n    root: 1\n";
     withConfig(base, path => expect(loadConfig(path, {}).config.bus).toBeUndefined());

@@ -29,10 +29,11 @@ export interface ChangeRequest {
 /** Preserve each lane's existing evidence policy at the adapter boundary. */
 export type CiPurpose = "merge" | "close" | "research";
 export type CiVerdict =
- | { state: "green"; runId: number; runUrl: string; runName: string; snapshot: string }
+ | { state: "green"; runId: number; runUrl: string; runName: string; snapshot: string; advisory?: string[] }
  | {
   state: "red" | "pending";
   reason: string;
+  advisory?: string[];
   /**
    * `noRuns`: pending only because no CI run exists on the head at all (no
    * check run on GitHub, no push or merge_request_event pipeline on GitLab);
@@ -52,6 +53,7 @@ export interface CiFailedRun {
  id: number;
  name: string;
  conclusion: string;
+ advisory?: true;
 }
 
 export interface IssueComment {
@@ -76,7 +78,7 @@ export interface CommentReaction {
 export interface ForgeReadPort<Credential = string> {
  findPrByHead(repo: string, branch: string, token: Credential): Promise<ChangeRequest | null>;
  getPr(repo: string, n: number, token: Credential): Promise<ChangeRequest>;
- ciVerdictFor(repo: string, sha: string, token: Credential, purpose?: CiPurpose): Promise<CiVerdict>;
+ ciVerdictFor(repo: string, sha: string, token: Credential, purpose?: CiPurpose, advisoryChecks?: readonly string[]): Promise<CiVerdict>;
  /**
   * The tail of each failed run's log, for a CI fix pass's prompt. GitHub
   * only; a run whose log cannot be read is named with the reason instead.

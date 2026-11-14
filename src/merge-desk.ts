@@ -249,6 +249,12 @@ function sendBackReason(
  return null;
 }
 
+function advisoryLine(advisory: readonly string[] | undefined): string[] {
+ return advisory === undefined || advisory.length === 0
+  ? []
+  : [`Advisory check run(s) did not pass: ${advisory.join(", ")}; they do not gate the merge.`];
+}
+
 function gateInput(map: RangerMapConfig, pr: ChangeRequest, ci: CiVerdict, last?: Review, probe?: Probe): MergeGateInput {
  return {
   pr,
@@ -278,7 +284,7 @@ export async function mergeGateNow(
  const pr = await github.getPr(map.repo, prNumber, token);
  if (pr.state !== "open") return evaluateMergeGate(gateInput(map, pr, { state: "pending", reason: "not read" }));
  const { last, probe } = headEvidence(await github.listComments(map.repo, prNumber, token), pr.headSha, botIdentity);
- return evaluateMergeGate(gateInput(map, pr, await github.ciVerdictFor(map.repo, pr.headSha, token), last, probe));
+ return evaluateMergeGate(gateInput(map, pr, await github.ciVerdictFor(map.repo, pr.headSha, token, "merge", map.advisoryChecks), last, probe));
 }
 
 /**
@@ -496,7 +502,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   const cr = changeRequestLabel(repo, pr.iid);
   if (recordedCiReruns(comments, botIdentity).some((r) => r.sha === head)) return "already";
   if (github.rerunFailedJobs === undefined) return "unavailable";
-  const failed = ci.failed.filter((run) => run.conclusion === "failure");
+  const failed = ci.failed.filter((run) => run.conclusion === "failure" && run.advisory !== true);
   if (failed.length === 0) return "unavailable";
   let jobs: number;
   try {
@@ -690,7 +696,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   at: { reason: string | null; ciPark: boolean; last: Review | undefined; probe: Probe | undefined },
  ): Promise<{ why: string | null; ci?: CiVerdict; noCi: boolean }> {
   if (at.reason !== null || at.ciPark) return { why: at.reason, noCi: false };
-  const ci = await github.ciVerdictFor(repo, pr.headSha, token);
+  const ci = await github.ciVerdictFor(repo, pr.headSha, token, "merge", map.advisoryChecks);
   // As the gate below reads it: a rebase the forge asks for waits on the rest of the gate.
   const gated = pr.mergeState === "needs-rebase" && github.rebasePr !== undefined ? { ...pr, mergeState: "mergeable" as const } : pr;
   const waits = evaluateMergeGate(gateInput(map, gated, ci, at.last, at.probe));
@@ -800,7 +806,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
   const rebasePr = pr.mergeState === "needs-rebase" ? github.rebasePr?.bind(github) : undefined;
   const needsRebase = rebasePr !== undefined;
   const gated = needsRebase ? { ...pr, mergeState: "mergeable" as const } : pr;
-  const verdict = ci ?? await github.ciVerdictFor(repo, pr.headSha, token);
+  const verdict = ci ?? await github.ciVerdictFor(repo, pr.headSha, token, "merge", map.advisoryChecks);
   const gate = evaluateMergeGate(gateInput(map, gated, verdict, last, probe));
 
   // A red CI a worker may fix goes back to run-node while the node has CI fix
@@ -909,6 +915,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
       meta: [`map: ${mapKey(map)}`],
       lines: [
        `Gate passed at \`${gate.headSha.slice(0, 8)}\` (CI, mergeable, sage 0 blockers / 0 majors${probesRequired ? ", probes" : ""}); ${how} by ranger. The node closes through the gate next.`,
+       ...advisoryLine(verdict.advisory),
        ...warnings,
       ],
      }),
@@ -936,6 +943,7 @@ export async function runMergeDesk(ctx: MergeDeskContext): Promise<MergeDeskResu
    meta: [`map: ${mapKey(map)}`],
    lines: [
     `Gate passed at \`${gate.headSha.slice(0, 8)}\`: CI green, mergeable, base \`${map.base}\`, sage ${last?.round ?? "?"} round(s), the last with ${settled === null ? "0 blockers and 0 majors" : "no blocker or major that gates"} (machine evidence, not a sign-off).`,
+    ...advisoryLine(verdict.advisory),
     ...(superseded !== null
      ? [`Note: ${superseded}; the reviewer may have missed it, check before you merge.${map.autoMerge ? " Auto-merge is held on this head for that reason." : ""}`]
      : []),
