@@ -61,8 +61,16 @@ export function classifyResearchCi(runs: CheckRun[], workflows: WorkflowRun[], s
  return { kind: "complete", success, snapshot };
 }
 
+export interface GithubCiVerdictOptions {
+ purpose?: CiPurpose;
+ workflows?: WorkflowRun[];
+ statuses?: CommitStatus[];
+ advisoryChecks?: readonly string[];
+}
+
 /** GitHub classifications, translated once before crossing the port. */
-export function githubCiVerdict(repo: string, runs: CheckRun[], purpose: CiPurpose = "merge", workflows: WorkflowRun[] = [], statuses: CommitStatus[] = []): CiVerdict {
+export function githubCiVerdict(repo: string, runs: CheckRun[], options: GithubCiVerdictOptions = {}): CiVerdict {
+ const { purpose = "merge", workflows = [], statuses = [], advisoryChecks = [] } = options;
  const green = (success: CheckRun, snapshot: string): CiVerdict => ({
   state: "green", runId: success.id, runUrl: ciRunUrl(repo, success.id), runName: success.name, snapshot,
  });
@@ -78,16 +86,36 @@ export function githubCiVerdict(repo: string, runs: CheckRun[], purpose: CiPurpo
   return success === undefined ? { state: "red", reason: "no successful check run to cite" }
    : green(success, JSON.stringify(runs));
  }
- const ci = classifyGithubCheckRuns(runs);
+ const advisory = new Set(advisoryChecks);
+ const required = runs.filter((r) => !advisory.has(r.name));
+ const advisoryFailed = runs.filter((r) => advisory.has(r.name) && r.status === "completed" && !OK_CONCLUSIONS.has(r.conclusion ?? ""));
+ const advisoryNote = advisoryFailed.length === 0 ? "" : `; advisory: ${advisoryFailed.map((c) => `${c.name}=${c.conclusion ?? "none"}`).join(", ")}`;
+ const advisoryNames = advisoryFailed.map((c) => `${c.name}=${c.conclusion ?? "none"}`);
+ const named = (names: string[]): { advisory?: string[] } => names.length === 0 ? {} : { advisory: names };
+ const advisoryFailedRuns = advisoryFailed.map((c) => ({ id: c.id, name: c.name, conclusion: c.conclusion ?? "none", advisory: true as const }));
+ if (runs.length === 0) return { state: "pending", reason: "no check runs on the head yet", noRuns: true };
+ if (required.length === 0) {
+  return {
+   state: "red",
+   reason: `no check run concluded success (all neutral/skipped) — nothing for the close to cite${advisoryNote}`,
+   ...named(advisoryNames),
+   ...(advisoryFailedRuns.length === 0 ? {} : { failed: advisoryFailedRuns }),
+  };
+ }
+ const ci = classifyGithubCheckRuns(required);
  if (ci.state === "none") return { state: "pending", reason: "no check runs on the head yet", noRuns: true };
- if (ci.state === "pending") return { state: "pending", reason: `${ci.running.length} check run(s) still running: ${ci.running.map((c) => c.name).join(", ")}` };
+ if (ci.state === "pending") return { state: "pending", reason: `${ci.running.length} check run(s) still running: ${ci.running.map((c) => c.name).join(", ")}${advisoryNote}`, ...named(advisoryNames) };
  if (ci.state === "failed") {
   return {
    state: "red",
-   reason: `CI failed: ${ci.failed.map((c) => `${c.name}=${c.conclusion}`).join(", ")}`,
-   failed: ci.failed.map((c) => ({ id: c.id, name: c.name, conclusion: c.conclusion ?? "none" })),
+   reason: `CI failed: ${ci.failed.map((c) => `${c.name}=${c.conclusion}`).join(", ")}${advisoryNote}`,
+   ...named(advisoryNames),
+   failed: [
+    ...ci.failed.map((c) => ({ id: c.id, name: c.name, conclusion: c.conclusion ?? "none" })),
+    ...advisoryFailedRuns,
+   ],
   };
  }
- if (ci.state === "no-success") return { state: "red", reason: "no check run concluded success (all neutral/skipped) — nothing for the close to cite" };
- return green(ci.success, JSON.stringify(runs));
+ if (ci.state === "no-success") return { state: "red", reason: `no check run concluded success (all neutral/skipped) — nothing for the close to cite${advisoryNote}`, ...named(advisoryNames), ...(advisoryFailedRuns.length === 0 ? {} : { failed: advisoryFailedRuns }) };
+ return { ...green(ci.success, JSON.stringify(runs)), ...named(advisoryNames) };
 }

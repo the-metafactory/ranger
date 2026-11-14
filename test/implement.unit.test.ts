@@ -874,6 +874,10 @@ describe("CI fix passes (soma #795/#796)", () => {
   expect(workerFixableCi(red("failure"))).toBe(true);
   for (const c of ["cancelled", "timed_out", "action_required"]) expect(workerFixableCi(red(c))).toBe(false);
   expect(workerFixableCi(githubCiVerdict("acme/widgets", GREEN))).toBe(false);
+  const advisory = githubCiVerdict("acme/widgets", [...GREEN, { id: 5, name: "codecov", status: "completed", conclusion: "failure" }], { advisoryChecks: ["codecov"] });
+  expect(workerFixableCi(advisory)).toBe(false);
+  const mixed = githubCiVerdict("acme/widgets", [...GREEN, { id: 4, name: "lint", status: "completed", conclusion: "failure" }, { id: 5, name: "codecov", status: "completed", conclusion: "failure" }], { advisoryChecks: ["codecov"] });
+  expect(workerFixableCi(mixed)).toBe(true);
   expect(workerFixableCi({ state: "red", reason: "pipeline 30 is failed" })).toBe(false); // no named runs (GitLab)
  });
  test("markers are read from the machine account only, and count fixes that moved the head off a red one", () => {

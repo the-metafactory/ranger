@@ -1647,7 +1647,7 @@ async function runImplementFlow(ctx: ImplementContext): Promise<ImplementOutcome
  const ciStep = async (head: string): Promise<"ready" | "again" | ImplementOutcome> => {
   let ci: CiVerdict;
   try {
-   ci = await github.ciVerdictFor(repo, head, token);
+   ci = await github.ciVerdictFor(repo, head, token, "merge", map.advisoryChecks);
   } catch (error) {
    journal.recordEvent("reviewed", {
     nodeId,
@@ -2235,7 +2235,7 @@ export function ciFixState(fixes: CiFixRecord[], head: string): { used: number; 
  * timed-out or unnamed red is no code's fault, and stays the principal's.
  */
 export function workerFixableCi(ci: CiVerdict): ci is Extract<CiVerdict, { state: "red" | "pending" }> & { failed: CiFailedRun[] } {
- return ci.state === "red" && (ci.failed ?? []).some((f) => f.conclusion === "failure");
+ return ci.state === "red" && (ci.failed ?? []).some((f) => f.conclusion === "failure" && f.advisory !== true);
 }
 
 const CI_RERUN_MARKER = /<!-- ranger:ci-rerun sha=([0-9a-f]{7,64}) -->/;

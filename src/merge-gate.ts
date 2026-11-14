@@ -38,7 +38,7 @@ export interface MergeGateInput {
 }
 
 export type MergeGateResult =
- | { status: "pass"; ciCheckRunId: number; headSha: string }
+ | { status: "pass"; ciCheckRunId: number; headSha: string; advisory?: string[] }
  /** Not decidable yet (CI running, mergeability computing) — re-check next tick. */
  | { status: "pending"; check: GateCheck; reason: string }
  /** A hard failure that needs a human or a new round — park + card. */
@@ -120,5 +120,6 @@ export function evaluateMergeGate(input: MergeGateInput): MergeGateResult {
   };
  }
 
- return { status: "pass", ciCheckRunId: ci.runId, headSha: pr.headSha };
+ const advisory = input.ci.state === "green" ? input.ci.advisory : undefined;
+ return { status: "pass", ciCheckRunId: ci.runId, headSha: pr.headSha, ...(advisory === undefined ? {} : { advisory }) };
 }

@@ -166,6 +166,7 @@ const MapSchema = z.object({
   * merge card. Off by default: the merge card is the default authority.
   */
  autoMerge: z.boolean().default(false),
+ advisoryChecks: z.array(z.string().min(1)).default([]),
  /** The branch PRs target and probes resolve `atRef` against. */
  base: z.string().min(1).default("main"),
  /**
@@ -176,7 +177,11 @@ const MapSchema = z.object({
   */
  localCheckout: z.string().optional(),
  claudeSession: ClaudeSessionSchema.optional(),
-}).transform(({ repo, ...map }) => ({ ...map, ...repo }));
+}).transform(({ repo, ...map }) => ({ ...map, ...repo })).superRefine((map, ctx) => {
+ if (map.forgeRef.forge !== "github" && map.advisoryChecks.length > 0) {
+  ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["advisoryChecks"], message: "advisoryChecks is GitHub-only; remove it from this map" });
+ }
+});
 
 /**
  * A map `ranger serve` shows and nothing else reads (#37): no walk, no scout
