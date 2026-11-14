@@ -124,4 +124,22 @@ describe("a node stuck on a failure that never clears goes quiet within a bounde
   expect(stillWaking(snapshots)).toEqual({});
   expect(said(snapshots[SETTLED_BY - 1], "40", "resume-dropped")).toBe(true);
  }, 120_000);
+
+ test("a queued resume whose identity read never comes back is escalated once and keeps its place", async () => {
+  const h = host({ FAKE_GH_USER_FAIL: "1" });
+  h.node("40");
+  const journal = h.journal();
+  journal.upsertWorker({ repo: REPO, root: 1, nodeId: "40", status: "parked", lane: "implement", phase: "review", pid: null, finishedAt: "2026-10-06T00:00:00Z" });
+  journal.enqueueResume({ nodeId: "40", repo: REPO, root: 1, lane: "headless" });
+  journal.close();
+
+  const snapshots = await soak(h);
+
+  expect(stillWaking(snapshots)).toEqual({});
+  expect(said(snapshots[SETTLED_BY - 1], "40", "queued resume #40 escalated: 3 transient deferrals in a row")).toBe(true);
+  expect(discord.posts.filter((p) => p.content.includes("queued resume stuck"))).toHaveLength(1);
+  const after = h.journal();
+  expect(after.getResume(REPO, "40")).not.toBeNull();
+  after.close();
+ }, 120_000);
 });
