@@ -10,6 +10,7 @@ import {
 } from "./exec.ts";
 import type { Journal, WorkerRow } from "./journal.ts";
 import { mapKey, pickMap } from "./maps.ts";
+import { isActiveStatus } from "./liveness.ts";
 
 export type StopState =
  | "stopped"
@@ -204,7 +205,7 @@ export async function stopNode(ctx: StopContext, request: StopRequest): Promise<
 
    const replay = row.status === "stop-requested";
    if (!replay) {
-    if (row.status !== "claimed" && row.status !== "running") {
+    if (!isActiveStatus(row.status)) {
      return answer("not-active", `the worker row is ${row.status}; there is no active worker to stop`, seen);
     }
     if (row.phase === "close") {

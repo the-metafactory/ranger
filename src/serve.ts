@@ -100,6 +100,7 @@ import {
 import { runDrainAction } from "./serve-drain.ts";
 import { runApproveAction } from "./serve-approve.ts";
 import { existingWorkerLog } from "./worker-log.ts";
+import { isStaleOwner } from "./liveness.ts";
 
 export { childEnv };
 
@@ -563,10 +564,7 @@ export function assembleState(inputs: StateInputs): DashboardState {
    suspicious: w.reviewRound > SUSPICIOUS_REVIEW_ROUND,
    startedAt: w.startedAt,
    pid: w.pid,
-   stale:
-    (w.status === "claimed" || w.status === "running") &&
-    w.pid !== null &&
-    !inputs.pidAlive(w.pid),
+   stale: isStaleOwner(w, inputs.pidAlive),
   }));
 
  const tickHolder = (lane: ImplementLane) => {

@@ -1,10 +1,9 @@
 import { pinNodeSubstrate, type NodePreflightResult } from "./node-dependency.ts";
 import { OperationFailure } from "./operation-outcome.ts";
 import { activeRecoveryReason, completeRecovery, completeRecoveryChecks, nodeRecoveryScope, recordRecovery, recoveryHold, recoveryReason, reserveRecovery } from "./recovery.ts";
-import { pidAlive } from "./exec.ts";
+import { hasLiveOwner, isActiveStatus } from "./liveness.ts";
 import { FencedError, type Journal, type WorkerPatch, type WorkerRow } from "./journal.ts";
 
-export const RESERVATION_GRACE_MS = 120_000;
 const START_FAILURE = "[worker-start] ";
 export const FRESH_START_FAILURE = `${START_FAILURE}fresh claim: `;
 
@@ -12,11 +11,6 @@ export function startFailureOutcome(previous: string | null, detail: string, fre
  const retained = (previous ?? "").split(START_FAILURE)[0].trimEnd();
  const latest = `${fresh ? FRESH_START_FAILURE : START_FAILURE}${detail.replace(/\s+/g, " ").slice(0, 400)}`;
  return [retained, latest].filter(Boolean).join("\n");
-}
-
-export function reservationPending(row: WorkerRow, now = new Date()): boolean {
- return row.status === "claimed" && row.pid === null && row.startedAt !== null &&
-  now.getTime() - Date.parse(row.startedAt) < RESERVATION_GRACE_MS;
 }
 
 export function acquireGeneration(journal: Journal, nodeId: string, repo: string,
@@ -28,7 +22,7 @@ export function acquireGeneration(journal: Journal, nodeId: string, repo: string
  }
  const row = journal.getWorker(nodeId, repo);
  if (row === null) throw new FencedError(`node ${nodeId} has no reservation row`);
- if (reservationPending(row) || ((row.status === "running" || row.status === "claimed") && pidAlive(row.pid))) {
+ if (hasLiveOwner(row)) {
   throw new FencedError(`node ${nodeId} already has a live owner or pending reservation`);
  }
  const generation = journal.reserveWorker(row);
@@ -86,7 +80,7 @@ export async function startOwnedWorker(args: {
   const state = recordRecovery(journal, scope, failure instanceof OperationFailure ? failure.outcome : { kind: "infrastructure", operation: "worker-spawn", evidence: failure.message, action: `restore worker spawning and resume node ${row.nodeId}` }, { now: args.now, owner: owner });
   const detail = `worker start failed (${failure.message}); ${recoveryReason(state)}`;
   const resolved = journal.updateReservation(row.nodeId, row.repo, generation, {
-   status: row.status === "claimed" || row.status === "running" ? "parked" : row.status,
+   status: isActiveStatus(row.status) ? "parked" : row.status,
    phase: row.phase, pid: null, workerPgid: null, attempts: row.attempts,
    startedAt: row.startedAt, finishedAt: row.finishedAt ?? new Date().toISOString(),
    outcome: startFailureOutcome(row.outcome, detail, args.freshClaim),

@@ -7,13 +7,13 @@ import { OperationFailure } from "./operation-outcome.ts";
 import { reviewThrottle } from "./budget.ts";
 import { WRITE_TOKEN_SOURCE } from "./github-usage.ts";
 import { activeRecovery, nodeRecoveryScope, recoveryHold, resetRecovery } from "./recovery.ts";
-import { startOwnedWorker, reservationPending } from "./node-ownership.ts";
+import { startOwnedWorker } from "./node-ownership.ts";
+import { hasLiveOwner } from "./liveness.ts";
 import { join } from "node:path";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import { withClaimLock } from "./claim-lock.ts";
 import { laneCredentialRefusal } from "./forge-lanes.ts";
 import { changeRequestNoun } from "./forge-text.ts";
-import { pidAlive } from "./exec.ts";
 import { assertWriteIdentity, WriteGateError } from "./identity.ts";
 import type { Journal, ResumeQueueRow, WorkerStatus } from "./journal.ts";
 import { implementLane, startsImplementSession, type ImplementLane } from "./lanes.ts";
@@ -95,7 +95,7 @@ export async function startResumeNode(
  // A live occupant keeps the node: a second run-node would race it through
  // the same worktree and PR (2026-10-07, soma #753: two generations raced the
  // close, and the loser's park was re-spawned 50 times).
- if ((row.status === "running" || row.status === "claimed") && (pidAlive(row.pid) || reservationPending(row, ctx.now?.() ?? new Date()))) {
+ if (hasLiveOwner(row, ctx.now?.() ?? new Date())) {
   throw new Error(
    `node ${nodeId}'s run-node (pid ${row.pid}) is still ${row.status} — resume only a parked, failed or dead worker`,
   );
