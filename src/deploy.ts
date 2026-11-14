@@ -49,8 +49,9 @@ export async function deployMerged(req: DeployRequest): Promise<DeployResult> {
     timeoutMs: req.timeoutMs + LOCK_WAIT_BEYOND_A_DEPLOY_MS,
     contended: () => new Error(`another deploy of ${req.repo} still holds the lock`),
     lost: (why) => new Error(`lost the deploy lock for ${req.repo}: ${why}`),
+    rejectExpired: true,
    },
-   async () => {
+   async (owned) => {
     const head = await safeGit(["rev-parse", "--verify", `refs/heads/${req.base}^{commit}`], { cwd: req.canonical, timeoutMs: 10_000 });
     if (head.code !== 0) return { status: "failed", detail: `no ${req.base} in ${req.canonical}: ${head.stderr.trim()}`, sha: null, result: null };
     const sha = head.stdout.trim();
@@ -59,6 +60,7 @@ export async function deployMerged(req: DeployRequest): Promise<DeployResult> {
     try {
      const added = await safeGit(["worktree", "add", "--detach", checkout, sha], { cwd: req.canonical, timeoutMs: 120_000 });
      if (added.code !== 0) return { status: "failed", detail: `cannot check out ${sha.slice(0, 8)}: ${added.stderr.trim()}`, sha, result: null };
+     owned();
      const result = await run(req.command, { cwd: checkout, env: workerHostEnv(), timeoutMs: req.timeoutMs, processGroup: true });
      if (result.code === 0) return { status: "deployed", sha, result };
      const why = result.timedOut === true ? `timed out after ${Math.round(req.timeoutMs / 60_000)} min` : `exited ${result.code}`;

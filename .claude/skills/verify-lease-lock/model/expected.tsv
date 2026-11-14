@@ -1,0 +1,5 @@
+# config	expected outcome (pass, or the broken rule and the shortest trace's action names)
+code	MutualExclusion: TryCreate TryCreate ChkLock MkMarker MkMarkerWrite Revalidate TryWrite RmLock TryCreate TryWrite
+pauses-only	MutualExclusion: TryCreate Finish RelRead TryCreate LeaseExpires ChkLock MkMarker Revalidate RelRm TryCreate RmLock MkLock DropMarker
+no-triggers	pass
+crashed-reclaimer	MutualExclusion: TryCreate Crash TryCreate TryCreate TryCreate LeaseExpires ChkLock MkMarker Crash ChkLock MkMarker ChkMarker ChkLock MkMarker RmMarker ChkMarker MkMarker Revalidate RmMarker MkMarker Revalidate RmLock MkLock DropMarker RmLock MkLock DropMarker
