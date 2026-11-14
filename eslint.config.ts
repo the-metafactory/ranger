@@ -21,6 +21,23 @@ import { defineConfig } from "eslint/config";
 import tseslint from "typescript-eslint";
 import { ranger } from "./eslint/no-comments.ts";
 
+// Test mode has one owner. Production code that reads it changes behaviour
+// under test, so a missing injection still passes (host-load.ts, #304).
+const TEST_MODE_OWNER = "src/journal-guard.ts";
+const TEST_MODE_MESSAGE = "Only src/journal-guard.ts reads test mode. Take the dependency as a parameter (as ImplementContext.hostLoad does) and let the test inject it.";
+const TEST_MODE = [
+ { selector: "ImportSpecifier[imported.name=/^(underTest|UNDER_TEST_ENV)$/]", message: TEST_MODE_MESSAGE },
+ { selector: "MemberExpression[property.name=/^(RANGER_UNDER_TEST|NODE_ENV)$/], Literal[value=/^(RANGER_UNDER_TEST|NODE_ENV)$/]", message: TEST_MODE_MESSAGE },
+];
+
+// Whether a worker row is live has one owner. Inline status checks drifted
+// apart: a dead-PID row held its lane (#65), a stale row passed as live (#511).
+const LIVENESS_OWNER = "src/liveness.ts";
+export const LIVENESS = {
+ selector: "BinaryExpression[operator=/^[!=]==$/][right.value='claimed']:matches([left.property.name='status'], [left.name='status'])",
+ message: "Ask src/liveness.ts whether a worker is live: isActiveStatus, hasLiveOwner, isStaleOwner or reservationPending.",
+};
+
 export default defineConfig(
  js.configs.recommended,
  tseslint.configs.strictTypeChecked,
@@ -77,24 +94,12 @@ export default defineConfig(
   },
  },
  {
-  // Test mode has one owner. Production code that reads it changes behaviour
-  // under test, so a missing injection still passes (host-load.ts, #304).
   files: ["src/**/*.ts"],
-  ignores: ["src/journal-guard.ts"],
-  rules: {
-   "no-restricted-syntax": [
-    "error",
-    {
-     selector: "ImportSpecifier[imported.name=/^(underTest|UNDER_TEST_ENV)$/]",
-     message: "Only src/journal-guard.ts reads test mode. Take the dependency as a parameter (as ImplementContext.hostLoad does) and let the test inject it.",
-    },
-    {
-     selector: "MemberExpression[property.name=/^(RANGER_UNDER_TEST|NODE_ENV)$/], Literal[value=/^(RANGER_UNDER_TEST|NODE_ENV)$/]",
-     message: "Only src/journal-guard.ts reads test mode. Take the dependency as a parameter (as ImplementContext.hostLoad does) and let the test inject it.",
-    },
-   ],
-  },
+  ignores: [TEST_MODE_OWNER, LIVENESS_OWNER],
+  rules: { "no-restricted-syntax": ["error", ...TEST_MODE, LIVENESS] },
  },
+ { files: [TEST_MODE_OWNER], rules: { "no-restricted-syntax": ["error", LIVENESS] } },
+ { files: [LIVENESS_OWNER], rules: { "no-restricted-syntax": ["error", ...TEST_MODE] } },
  {
   // Same test-file carve-out as cortex: tests build any-typed mocks and
   // inject failures through unsafe casts.

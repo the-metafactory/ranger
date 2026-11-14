@@ -3,6 +3,7 @@ import type { ResumeQueueRow, WorkerRow, WorkerStatus } from "./journal.ts";
 import { startsImplementSession, type ImplementLane } from "./lanes.ts";
 import { isQuiet, type HostLoadReading } from "./host-load.ts";
 import { waitingForQuietHost } from "./outcomes.ts";
+import { isActiveStatus } from "./liveness.ts";
 
 
 /**
@@ -18,7 +19,7 @@ export function quietHostGate(host: HostLoadReading | undefined, busyLoad?: numb
 }
 
 
-export const queuedResumeStale = (status: WorkerStatus) => status === "released" || status === "claimed" || status === "running";
+export const queuedResumeStale = (status: WorkerStatus) => status === "released" || isActiveStatus(status);
 
 
 /**

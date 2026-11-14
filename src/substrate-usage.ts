@@ -34,6 +34,7 @@ import {
  type SubstrateConfig,
 } from "./substrate-policy.ts";
 import { isTransientGitHubError } from "./transient.ts";
+import { isActiveStatus } from "./liveness.ts";
 
 export type { SessionKind, SessionOutcome };
 
@@ -310,7 +311,7 @@ export function liveSession(
   return (
    w !== undefined &&
    w.generation === session.generation &&
-   (w.status === "claimed" || w.status === "running") &&
+   isActiveStatus(w.status) &&
    w.pid !== null &&
    pidAlive(w.pid)
   );

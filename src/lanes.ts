@@ -1,3 +1,4 @@
+import { isActiveStatus } from "./liveness.ts";
 /** Implement resource lanes follow machine resources, independently of worker substrate. */
 export const IMPLEMENT_LANES = ["visual", "headless"] as const;
 export type ImplementLane = (typeof IMPLEMENT_LANES)[number];
@@ -39,5 +40,5 @@ export function startsImplementSession(row: { lane: string | null; phase?: strin
  * principal's 👍, and the walk keeps claiming beside it.
  */
 export function holdsImplementLane(row: { lane: string | null; status: string; phase?: string | null }): boolean {
- return startsImplementSession(row) && (row.status === "claimed" || row.status === "running");
+ return startsImplementSession(row) && isActiveStatus(row.status);
 }

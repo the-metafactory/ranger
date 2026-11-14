@@ -1,7 +1,8 @@
 import { conflictResume } from "./resume-priority.ts";
 import { workerPreflight, type DispatchDeps } from "./node-dependency.ts";
 import { RECOVERY_LIMIT, nodeRecoveryScope, recordRecovery, recoveryReason, recoveryHold, recoverablePending } from "./recovery.ts";
-import { startOwnedWorker, reservationPending, FRESH_START_FAILURE } from "./node-ownership.ts";
+import { startOwnedWorker, FRESH_START_FAILURE } from "./node-ownership.ts";
+import { isActiveStatus, reservationPending } from "./liveness.ts";
 import { WRITE_TOKEN_SOURCE } from "./github-usage.ts";
 import { recordImplementStart } from "./maps.ts";
 import { implementLane, startsImplementSession, type ImplementLane } from "./lanes.ts";
@@ -89,7 +90,7 @@ export async function sweepMap(ctx: SweepContext): Promise<SweepMapResult> {
  const inFlight =
   phase === "desk"
    ? []
-   : journal.listWorkers(repo, map.root).filter((w) => w.status === "claimed" || w.status === "running" || (w.status === "parked" && recoverablePending(journal, nodeRecoveryScope(repo, w.nodeId))));
+   : journal.listWorkers(repo, map.root).filter((w) => isActiveStatus(w.status) || (w.status === "parked" && recoverablePending(journal, nodeRecoveryScope(repo, w.nodeId))));
 
  for (const worker of inFlight) {
   if (phase === "recovery" && worker.status !== "parked") continue;
