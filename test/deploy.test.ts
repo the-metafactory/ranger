@@ -1,11 +1,11 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { deployLockFile, deployMerged } from "../src/deploy.ts";
 import * as exec from "../src/exec.ts";
 import { gitCredential } from "../src/git-ops.ts";
-import { tryAcquireLock } from "../src/lock.ts";
+import { tryAcquireLock, writeLockAtomic } from "../src/lock.ts";
 import { bootstrapWorktree, runNode } from "../src/worker.ts";
 import { restoreEnv, rig, type Rig } from "./implement-rig.ts";
 
@@ -157,3 +157,25 @@ test("a deploy that cannot get the repo's lock fails without running", async () 
  expect(result.status).toBe("failed");
  expect(ran).toBe(false);
 }, 120_000);
+
+test("a deploy whose lock another deploy took over before the command fails without running it", async () => {
+ const repo = await gitRepo();
+ const lock = deployLockFile(repo.journalPath, "acme/widgets");
+ const runCmd = exec.runCmd;
+ const spy = spyOn(exec, "runCmd").mockImplementation(async (cmd, args, opts) => {
+  if (args.includes("worktree") && args.includes("add")) {
+   writeLockAtomic(lock, JSON.stringify({ nonce: "other", pid: process.pid, startedAt: Date.now(), leaseUntil: Date.now() + 600_000 }));
+  }
+  return runCmd(cmd, args, opts);
+ });
+ let ran = false;
+ try {
+  const result = await deployMerged({ repo: "acme/widgets", command: "deploy", canonical: repo.canonical, base: "main", timeoutMs: 5_000, journalPath: repo.journalPath,
+   run: async () => { ran = true; return ok(); } });
+  expect(result).toMatchObject({ status: "failed", detail: expect.stringContaining("lost the deploy lock for acme/widgets") });
+ } finally {
+  spy.mockRestore();
+ }
+ expect(ran).toBe(false);
+ expect((await exec.runCmd("git", ["worktree", "list"], { cwd: repo.canonical })).stdout.trim().split("\n")).toHaveLength(1);
+});
