@@ -92,13 +92,13 @@ test("GitHub CI classification order and the close citation policy stay unchange
  const failed = { ...success, id: 18, conclusion: "failure" };
  const running = { ...success, id: 19, status: "queued", conclusion: null };
  expect(githubCiVerdict("acme/widgets", [failed, running]).state).toBe("pending");
- expect(githubCiVerdict("acme/widgets", [failed, running], "research").state).toBe("red");
- expect(githubCiVerdict("acme/widgets", [success, failed], "close")).toMatchObject({ state: "green", runId: 17 });
- expect(githubCiVerdict("acme/widgets", [success, failed], "merge").state).toBe("red");
+ expect(githubCiVerdict("acme/widgets", [failed, running], { purpose: "research" }).state).toBe("red");
+ expect(githubCiVerdict("acme/widgets", [success, failed], { purpose: "close" })).toMatchObject({ state: "green", runId: 17 });
+ expect(githubCiVerdict("acme/widgets", [success, failed], { purpose: "merge" }).state).toBe("red");
  expect(githubCiVerdict("acme/widgets", [success, { ...success, conclusion: "neutral" }, { ...success, conclusion: "skipped" }]))
   .toMatchObject({ state: "green", runId: 17 });
  for (const purpose of ["merge", "close", "research"] as const) {
-  expect(githubCiVerdict("acme/widgets", [success], purpose))
+  expect(githubCiVerdict("acme/widgets", [success], { purpose }))
    .toMatchObject({ state: "green", runId: 17, runUrl: "https://github.com/acme/widgets/runs/17" });
  }
 });
@@ -111,19 +111,19 @@ describe("advisory check runs (node #528)", () => {
 
  test("an advisory-only failure leaves the verdict green and names it in the snapshot", () => {
   for (const conclusion of ["failure", "timed_out", "cancelled"]) {
-   const verdict = githubCiVerdict("acme/widgets", [success, advisory(conclusion)], "merge", [], [], advisoryChecks);
+   const verdict = githubCiVerdict("acme/widgets", [success, advisory(conclusion)], { advisoryChecks });
    expect(verdict).toMatchObject({ state: "green", runId: 17, advisory: [`codecov/project=${conclusion}`] });
    if (verdict.state === "green") expect(verdict.snapshot).toContain(conclusion);
   }
  });
 
  test("the same runs without advisoryChecks stay red as before", () => {
-  expect(githubCiVerdict("acme/widgets", [success, advisory("failure")], "merge"))
+  expect(githubCiVerdict("acme/widgets", [success, advisory("failure")], {}))
    .toMatchObject({ state: "red", reason: "CI failed: codecov/project=failure" });
  });
 
  test("a required failure and an advisory failure are both named, and only the required one is fixable", () => {
-  const verdict = githubCiVerdict("acme/widgets", [success, requiredFailure, advisory("failure")], "merge", [], [], advisoryChecks);
+  const verdict = githubCiVerdict("acme/widgets", [success, requiredFailure, advisory("failure")], { advisoryChecks });
   expect(verdict).toMatchObject({
    state: "red",
    advisory: ["codecov/project=failure"],
@@ -141,20 +141,20 @@ describe("advisory check runs (node #528)", () => {
    { ...success, id: 20, name: "docs", conclusion: "neutral" },
    { ...success, id: 21, name: "optional", conclusion: "skipped" },
    advisory("failure"),
-  ], "merge", [], [], advisoryChecks);
+  ], { advisoryChecks });
   expect(verdict.state).toBe("red");
   expect(verdict.state === "red" && verdict.reason).toContain("no check run concluded success");
   expect(verdict.state === "red" && verdict.reason).toContain("advisory: codecov/project=failure");
  });
 
  test("a green verdict with an advisory failure passes the gate and the pass names it", () => {
-  const ci = githubCiVerdict("acme/widgets", [success, advisory("failure")], "merge", [], [], advisoryChecks);
+  const ci = githubCiVerdict("acme/widgets", [success, advisory("failure")], { advisoryChecks });
   expect(evaluateMergeGate({ pr: PR, ci, expectedBase: "main", verdictSha: SHA, verdictBlockers: 0 }))
    .toMatchObject({ status: "pass", ciCheckRunId: 17, advisory: ["codecov/project=failure"] });
  });
 
  test("an advisory-only failure never triggers a CI fix pass", () => {
-  const ci = githubCiVerdict("acme/widgets", [success, advisory("failure")], "merge", [], [], advisoryChecks);
+  const ci = githubCiVerdict("acme/widgets", [success, advisory("failure")], { advisoryChecks });
   expect(workerFixableCi(ci)).toBe(false);
  });
 });

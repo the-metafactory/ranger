@@ -536,11 +536,11 @@ export function githubMergeState(mergeable: unknown, state: unknown): MergeState
 }
 
 export async function ciVerdictFor(repo: string, sha: string, token: string, purpose: CiPurpose = "merge", advisoryChecks: readonly string[] = []): Promise<CiVerdict> {
- if (purpose !== "research") return githubCiVerdict(repo, await checkRunsFor(repo, sha, token), purpose, [], [], advisoryChecks);
+ if (purpose !== "research") return githubCiVerdict(repo, await checkRunsFor(repo, sha, token), { purpose, advisoryChecks });
  const [runs, workflows, statuses] = await Promise.all([
   checkRunsFor(repo, sha, token), workflowRunsFor(repo, sha, token), commitStatusesFor(repo, sha, token),
  ]);
- return githubCiVerdict(repo, runs, purpose, workflows, statuses);
+ return githubCiVerdict(repo, runs, { purpose, workflows, statuses });
 }
 
 /** How many failed runs a CI fix pass reads, and how much of each log's end. */

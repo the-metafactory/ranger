@@ -110,9 +110,9 @@ export class FakeGitHub implements ForgePort {
  logReads: number[][] = [];
  async ciVerdictFor(_repo: string, sha: string, _token: string, purpose?: CiPurpose) {
   if ((purpose ?? "merge") === "merge" && this.redHeads.has(sha)) {
-   return githubCiVerdict(_repo, [...this.checkRuns, { id: 202, name: "lint", status: "completed", conclusion: "failure" }], purpose);
+   return githubCiVerdict(_repo, [...this.checkRuns, { id: 202, name: "lint", status: "completed", conclusion: "failure" }], { purpose });
   }
-  return githubCiVerdict(_repo, this.checkRuns, purpose);
+  return githubCiVerdict(_repo, this.checkRuns, { purpose });
  }
  async ciFailureLog(_repo: string, runs: CiFailedRun[]) {
   this.logReads.push(runs.map((r) => r.id));

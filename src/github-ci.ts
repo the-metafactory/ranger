@@ -61,8 +61,16 @@ export function classifyResearchCi(runs: CheckRun[], workflows: WorkflowRun[], s
  return { kind: "complete", success, snapshot };
 }
 
+export interface GithubCiVerdictOptions {
+ purpose?: CiPurpose;
+ workflows?: WorkflowRun[];
+ statuses?: CommitStatus[];
+ advisoryChecks?: readonly string[];
+}
+
 /** GitHub classifications, translated once before crossing the port. */
-export function githubCiVerdict(repo: string, runs: CheckRun[], purpose: CiPurpose = "merge", workflows: WorkflowRun[] = [], statuses: CommitStatus[] = [], advisoryChecks: readonly string[] = []): CiVerdict {
+export function githubCiVerdict(repo: string, runs: CheckRun[], options: GithubCiVerdictOptions = {}): CiVerdict {
+ const { purpose = "merge", workflows = [], statuses = [], advisoryChecks = [] } = options;
  const green = (success: CheckRun, snapshot: string): CiVerdict => ({
   state: "green", runId: success.id, runUrl: ciRunUrl(repo, success.id), runName: success.name, snapshot,
  });
