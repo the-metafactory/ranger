@@ -20,12 +20,13 @@ same time, unless one of them went longer than its 60 s lease without a step
 (it stalled or died). This is the promise in lock.ts's header: "only one run
 holds the desk at a time, a renewing run is never reclaimed".
 
-**The harm when it breaks.** Two holders run at once. Callers that never call
-the `owned` fence keep running side by side: the walk's job pass
-(`src/walk.ts`, `withClaimLock(journal, () => jobPass(...))`) and the deploy
-lock (`src/deploy.ts`) are two of them. Callers that do call the fence stop
-the older holder at its next fence, except for a write it has already
-started.
+**The harm when it breaks.** Two holders run at once. A caller that never
+calls the `owned` fence keeps running side by side with the other holder:
+the walk's job pass (`src/walk.ts`, `withClaimLock(journal, () => jobPass(...))`)
+is one. A caller that does call the fence stops the older holder at its next
+fence, but not a write it has already started. The deploy lock
+(`src/deploy.ts`) calls the fence once, right before the deploy command, so a
+deploy that passed the fence before its lock was deleted still runs.
 
 ## Run it
 

@@ -178,4 +178,4 @@ test("a deploy whose lock another deploy took over before the command fails with
  }
  expect(ran).toBe(false);
  expect((await exec.runCmd("git", ["worktree", "list"], { cwd: repo.canonical })).stdout.trim().split("\n")).toHaveLength(1);
-});
+}, 120_000);

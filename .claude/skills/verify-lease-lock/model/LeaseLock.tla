@@ -17,7 +17,7 @@ CONSTANTS
     None,           \* "no owner": the file exists but holds no parseable JSON
     AtomicCreate,   \* FALSE = the code: writeFileSync(..., {flag:"wx"}) is open(O_EXCL) THEN write
     Pauses,         \* TRUE = a live process can stall past its lease (sleep, SIGSTOP)
-    RejectExpired,  \* the claim and fix-node locks pass rejectExpired: true
+    RejectExpired,  \* the claim, fix-node and deploy locks pass rejectExpired: true
     AbsentIsStale   \* TRUE = the code: lockOwnerStale returns true when the file is missing (ENOENT)
 
 VARIABLES

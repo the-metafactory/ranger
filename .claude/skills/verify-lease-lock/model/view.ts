@@ -37,12 +37,10 @@ function who(v: Vars, p: string): string {
   return v.lapsed[p] === true ? `${words} (stalled past its lease)` : words;
 }
 
-export const title = "src/lock.ts lease lock: three processes, one lock file";
+export const title = "src/lock.ts lease lock: contending processes, one lock file";
 
 export const state = (v: Vars) => ({
-  p1: who(v, "p1"),
-  p2: who(v, "p2"),
-  p3: who(v, "p3"),
+  ...Object.fromEntries(Object.keys(v.pc).sort().map((p) => [p, who(v, p)])),
   Files: `${file(v.lock, "lock")}; ${file(v.marker, "marker")}`,
 });
 
