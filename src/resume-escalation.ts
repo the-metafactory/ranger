@@ -13,7 +13,7 @@ import { mapKey } from "./maps.ts";
  */
 export const MAX_TRANSIENT_RESUME_DEFERRALS = 3;
 
-const streakSchema = z.object({ entryId: z.number(), count: z.number(), notified: z.boolean() });
+const streakSchema = z.object({ entryId: z.number(), count: z.number(), escalated: z.boolean(), posted: z.boolean() });
 type Streak = z.infer<typeof streakSchema>;
 type Entry = Pick<ResumeQueueRow, "id" | "repo" | "nodeId" | "lane">;
 export type Post = (content: string, label: string) => Promise<string>;
@@ -38,9 +38,10 @@ export function mapAnnouncer(map: RangerMapConfig): Post | null {
 }
 
 /**
- * Count one transient deferral. Journals it until the streak is escalated,
- * then stays silent while the same entry keeps waiting; posts the escalation
- * card once, retrying on a later tick when the post fails.
+ * Count one transient deferral. Journals each one until the streak escalates,
+ * journals the escalation once, then stays silent while the same entry keeps
+ * waiting. The card goes to the map's channel as soon as there is one: a post
+ * that fails, or a map that has no channel yet, is retried on a later deferral.
  */
 export async function recordTransientDeferral(args: {
  journal: Journal;
@@ -51,25 +52,28 @@ export async function recordTransientDeferral(args: {
 }): Promise<void> {
  const { journal, entry, reason } = args;
  const previous = readStreak(journal, entry);
- const streak: Streak = { entryId: entry.id, count: (previous?.count ?? 0) + 1, notified: previous?.notified ?? false };
- journal.setHealth(streakKey(entry), JSON.stringify(streak));
- if (streak.notified) return;
- journal.recordEvent("sweep", { nodeId: entry.nodeId, repo: entry.repo, detail: `queued resume #${entry.nodeId} deferred: ${reason}` });
- if (streak.count < MAX_TRANSIENT_RESUME_DEFERRALS) return;
+ const streak: Streak = { entryId: entry.id, count: (previous?.count ?? 0) + 1,
+  escalated: previous?.escalated ?? false, posted: previous?.posted ?? false };
  const detail = `queued resume #${entry.nodeId} escalated: ${streak.count} transient deferrals in a row, last: ${reason}. ` +
   `It keeps its place in the ${entry.lane} queue and starts once the failure clears; \`ranger resume-node ${entry.nodeId} --cancel\` drops it`;
- if (args.post !== null && args.map !== undefined) {
+ if (!streak.escalated) {
+  journal.recordEvent("sweep", { nodeId: entry.nodeId, repo: entry.repo, detail: `queued resume #${entry.nodeId} deferred: ${reason}` });
+  if (streak.count >= MAX_TRANSIENT_RESUME_DEFERRALS) {
+   journal.recordEvent("sweep", { nodeId: entry.nodeId, repo: entry.repo, detail });
+   streak.escalated = true;
+  }
+ }
+ if (streak.escalated && !streak.posted && args.post !== null && args.map !== undefined) {
   try {
    await args.post(renderCard({
     emoji: "⏳", status: "queued resume stuck", nodeId: entry.nodeId,
     meta: [`map: ${mapKey(args.map)}`], body: detail, bodyMax: 1_500,
    }), `queued resume escalation for #${entry.nodeId}`);
+   streak.posted = true;
   } catch (error) {
    journal.recordEvent("sweep", { nodeId: entry.nodeId, repo: entry.repo,
     detail: `queued resume escalation card for #${entry.nodeId} not posted: ${String(error).slice(0, 400)}` });
-   return;
   }
  }
- journal.recordEvent("sweep", { nodeId: entry.nodeId, repo: entry.repo, detail });
- journal.setHealth(streakKey(entry), JSON.stringify({ ...streak, notified: true }));
+ journal.setHealth(streakKey(entry), JSON.stringify(streak));
 }

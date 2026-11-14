@@ -56,3 +56,14 @@ test("a new queue entry for the same node starts a fresh streak", async () => {
  await recordTransientDeferral({ journal, map, entry: { id: 2, repo: REPO, nodeId: "40", lane: "headless" }, reason: "gh down", post });
  expect(posts).toEqual([]);
 });
+
+test("a map with no channel journals the escalation once and posts the card once a channel exists", async () => {
+ const entry = { id: 1, repo: REPO, nodeId: "40", lane: "headless" as const };
+ for (let i = 0; i < MAX_TRANSIENT_RESUME_DEFERRALS + 2; i++) await recordTransientDeferral({ journal, map, entry, reason: "gh down", post: null });
+ const escalations = () => journal.listEvents(REPO, 1_000).filter((e) => e.detail?.startsWith("queued resume #40 escalated")).length;
+ expect(escalations()).toBe(1);
+ const posts: string[] = [];
+ await recordTransientDeferral({ journal, map, entry, reason: "gh down", post: async (content) => { posts.push(content); return "card"; } });
+ expect(posts).toHaveLength(1);
+ expect(escalations()).toBe(1);
+});
