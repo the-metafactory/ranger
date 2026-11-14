@@ -25,6 +25,7 @@ import { laneHeldMessage, mapKey, recordImplementStart, resumeMap } from "./maps
 import { spawnRunNodeDetached, type SpawnRunNodeArgs } from "./spawn.ts";
 import { busyLoadFor, hostBusy, realHostLoad, type HostLoad, type HostLoadReading } from "./host-load.ts";
 import { unchangedHeadPark } from "./worktree-head.ts";
+import { clearTransientStreak, mapAnnouncer, recordTransientDeferral } from "./resume-escalation.ts";
 
 export interface ResumeContext extends DispatchDeps {
  config: RangerConfig;
@@ -203,14 +204,21 @@ export async function processResumeQueue(
   const map = state?.map;
   const drop = (reason: string) => {
    owned();
+   clearTransientStreak(journal, entry);
    journal.removeResume(entry, "resume-dropped", reason);
   };
   const defer = (reason: string, failedStart = false) => {
    owned();
+   clearTransientStreak(journal, entry);
    journal.recordEvent("sweep", { nodeId: entry.nodeId, repo: entry.repo,
     detail: `queued resume #${entry.nodeId} deferred: ${reason}` });
    if (failedStart) state?.errors.push(`queued resume #${entry.nodeId}: ${reason}`);
    if (failedStart && journal.recordResumeStartFailure(entry, reason)) return;
+   if (!conflictResume(entry)) waiting.add(entry.lane);
+  };
+  const deferTransient = async (reason: string) => {
+   owned();
+   await recordTransientDeferral({ journal, map, entry, reason, post: map === undefined ? null : mapAnnouncer(map) });
    if (!conflictResume(entry)) waiting.add(entry.lane);
   };
   const row = journal.getWorker(entry.nodeId, entry.repo);
@@ -254,7 +262,9 @@ export async function processResumeQueue(
   if (state.token === undefined) {
    // A refusal (unmapped token, the principal's identity) is a failed start;
    // a forge read that failed or timed out is a transient read error and is not.
-   defer(`start failed: ${state.gateReason ?? "identity gate unavailable"}`, state.gateTransient !== true);
+   const reason = `start failed: ${state.gateReason ?? "identity gate unavailable"}`;
+   if (state.gateTransient === true) await deferTransient(reason);
+   else defer(reason, true);
    continue;
   }
   try {
@@ -289,11 +299,12 @@ export async function processResumeQueue(
     }
    }
   } catch (error) {
-   defer(`validation failed: ${error instanceof Error ? error.message : String(error)}`);
+   await deferTransient(`validation failed: ${error instanceof Error ? error.message : String(error)}`);
    continue;
   }
   try {
    const resumed = await startResumeNode(entry.nodeId, map, ctx, owned, { queued: entry });
+   clearTransientStreak(journal, entry);
    switch (resumed.kind) {
     case "dropped": break;
     case "queued":
@@ -306,7 +317,9 @@ export async function processResumeQueue(
      break;
    }
   } catch (error) {
-   defer(`start failed: ${error instanceof Error ? error.message : String(error)}`, !(error instanceof OperationFailure && ["infrastructure", "dependency"].includes(error.outcome.kind)) && !transientGate(error));
+   const reason = `start failed: ${error instanceof Error ? error.message : String(error)}`;
+   if ((error instanceof OperationFailure && ["infrastructure", "dependency"].includes(error.outcome.kind)) || transientGate(error)) await deferTransient(reason);
+   else defer(reason, true);
   }
  }
  return started;
