@@ -50,3 +50,35 @@ Nothing in the suite reaches a real network: the GitHub and GitLab tests use fix
 ### Unverified here
 
 This recipe has not been run in the container. The 2026-11-15 trial on a 2-vCPU x86 VM took 324 s with 56 of 3778 tests failing (git-lfs, cgroup timing, canonical-clone bootstrap, remote supervisor). If the container run fails beyond that list or exceeds two cores, 1.5 GiB or ten minutes, escalate with the failing tests instead of widening the recipe. Whether Bun 1.3.14 accepts `--path-ignore-patterns` and `--parallel` is also unchecked here; the local Bun is 1.4.4.
+
+## `threva-app-v1`
+
+`threva-app-v1` is bound to `github:github.com/the-metafactory/threva-app`, needs no sidecar, and runs the three checks `scripts/check.ts` runs, in its order: `typecheck`, `lint`, `unit`. Commands were inspected at threva-app commit `e690d7a91af36a24ff1b2efaecf2c22c19c41e2f`.
+
+| Check | `scripts/check.ts` step | Recipe argv, after the frozen install |
+| --- | --- | --- |
+| `typecheck` | `bunx tsc --noEmit` | `bun ./node_modules/typescript/bin/tsc --noEmit` |
+| `lint` | `bun run lint`, that is `bun eslint/suppressions-guard.ts && bun --bun eslint .` | `bun ./node_modules/eslint/bin/eslint.js .` |
+| `unit` | `bun test test` | `bun test test` |
+
+- `typecheck` runs the installed compiler entrypoint instead of `bunx`, so no package is resolved at run time. The compiler, its version and `--noEmit` are the same.
+- `lint` runs ESLint alone. Recipe commands are argv vectors, never shell text, so the `&&` chain has no form here. `eslint/suppressions-guard.ts` also reads `origin/main` (or `LINT_BASE_REF`), and the immutable bundle the executor restores carries only the submitted commit, so the guard would exit 2. The guard still runs in the local `bun run check` and in CI.
+- `unit` is the repository's whole test directory. It carries no `bunfig.toml`, no preload and no opt-in files, so the recipe adds no flags: no test under `test/` skips, and none needs a network, a platform or a real home directory.
+- The repository has no separate integration root, so there is no `integration` check. The recipe accepts exactly these three named checks, without duplicates.
+- `probe:ui` (`commands.probe`) stays local. It launches Chromium through `playwright-core` and starts `dev:stack` against a local Cortex (`CORTEX_DIR`, `CORTEX_ADAPTERS_DIR`); this lane keeps graphical probes and a local Cortex out. A `threva-app-v1` receipt certifies the three checks, never the probe.
+
+### Runtime image requirements
+
+The image needs everything the Myelin image needs (pinned Bun 1.3.14, `/opt/ranger-dependencies/node_modules` with its `bun.lock`), plus:
+
+- A full dependency snapshot, dev dependencies included. `typescript`, `eslint`, `typescript-eslint`, `happy-dom`, `playwright-core` and `@antithesishq/bombadil` are dev dependencies, and all three checks need some of them: a checkout holding runtime dependencies only typechecks with unresolved-module errors.
+- `git` under `/usr/local/bin`, `/usr/bin` or `/bin`, the container's fixed `PATH`. `dev-stack-studio` drives real repositories with `git -C` and a job-private `HOME`, and `dev-stack-lanes` spawns `/bin/sh -c` for the generated home wrapper.
+- A writable `/tmp` within its 64 MiB mount. `dev-stack-studio` commits into a `mkdtemp` directory there.
+
+No browser, NATS server or Cortex is needed: `playwright-core` is installed for the local scripts, and no test under `test/` launches it.
+
+### Native verification and unverified here
+
+On a macOS ARM64 host with Bun 1.4.4, the three commands passed against threva-app commit `e690d7a`, using the recipe's `--config=/dev/null --no-env-file`: typecheck and ESLint exited 0, and `bun test test` reported 452 pass and 0 fail across 47 files in about 2.2 s, with no skip or todo lines. Threva-app has no `bunfig.toml`, so the container needs no flag mirroring.
+
+This recipe has not been run in the container, and Bun 1.3.14 producing the same test summary is unchecked here. If the container run fails or exceeds two cores, 1.5 GiB or ten minutes, escalate with the failing tests instead of widening the recipe.

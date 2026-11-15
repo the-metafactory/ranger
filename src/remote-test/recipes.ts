@@ -2,13 +2,14 @@ import type { ReviewedPolicy } from "./profiles.ts";
 
 export const MYELIN_REPOSITORY = "github:github.com/the-metafactory/myelin";
 export const RANGER_REPOSITORY = "github:github.com/the-metafactory/ranger";
+export const THREVA_APP_REPOSITORY = "github:github.com/the-metafactory/threva-app";
 export const RANGER_OPT_IN_TEST_FILES = [
  "test/remote-test-executor-integration.test.ts",
  "test/remote-test-profiles-integration.test.ts",
  "test/remote-test-ssh-integration.test.ts",
  "test/remote-test-bus-worker-transport.test.ts",
 ] as const;
-const RANGER_BUN = ["bun", "--config=/dev/null", "--no-env-file"] as const;
+const REVIEWED_BUN = ["bun", "--config=/dev/null", "--no-env-file"] as const;
 export interface ReviewedRecipe {
  checks: Readonly<Partial<Record<ReviewedPolicy["checks"][number], readonly [string, ...string[]]>>>;
  needsNats: boolean;
@@ -22,8 +23,13 @@ export const REVIEWED_RECIPES: ReviewedRecipeRegistry = {
   lint: ["bun", "--config=/dev/null", "--no-env-file", "./node_modules/eslint/bin/eslint.js", "."],
  } } },
  [RANGER_REPOSITORY]: { "ranger-v1": { needsNats: false, checks: {
-  unit: [...RANGER_BUN, "test", "--preload=./test/preload.ts", "--randomize", "--parallel=2", "--timeout=60000", ...RANGER_OPT_IN_TEST_FILES.flatMap(file => ["--path-ignore-patterns", file])] as [string, ...string[]],
-  typecheck: [...RANGER_BUN, "./node_modules/typescript/bin/tsc", "--noEmit"],
-  lint: [...RANGER_BUN, "./node_modules/eslint/bin/eslint.js", "."],
+  unit: [...REVIEWED_BUN, "test", "--preload=./test/preload.ts", "--randomize", "--parallel=2", "--timeout=60000", ...RANGER_OPT_IN_TEST_FILES.flatMap(file => ["--path-ignore-patterns", file])] as [string, ...string[]],
+  typecheck: [...REVIEWED_BUN, "./node_modules/typescript/bin/tsc", "--noEmit"],
+  lint: [...REVIEWED_BUN, "./node_modules/eslint/bin/eslint.js", "."],
+ } } },
+ [THREVA_APP_REPOSITORY]: { "threva-app-v1": { needsNats: false, checks: {
+  typecheck: [...REVIEWED_BUN, "./node_modules/typescript/bin/tsc", "--noEmit"],
+  lint: [...REVIEWED_BUN, "./node_modules/eslint/bin/eslint.js", "."],
+  unit: [...REVIEWED_BUN, "test", "test"],
  } } },
 };
