@@ -1,4 +1,3 @@
-import { conflictResume } from "./resume-priority.ts";
 import { workerPreflight, type DispatchDeps } from "./node-dependency.ts";
 import { RECOVERY_LIMIT, nodeRecoveryScope, recordRecovery, recoveryReason, recoveryHold, recoverablePending } from "./recovery.ts";
 import { startOwnedWorker, FRESH_START_FAILURE } from "./node-ownership.ts";
@@ -95,7 +94,7 @@ export async function sweepMap(ctx: SweepContext): Promise<SweepMapResult> {
  for (const worker of inFlight) {
   if (phase === "recovery" && worker.status !== "parked") continue;
   if (worker.status === "parked") {
-   if (ctx.deferRespawns || conflictResume(journal.getResume(repo, worker.nodeId) ?? {})) continue;
+   if (ctx.deferRespawns || journal.getResume(repo, worker.nodeId) !== null) continue;
    const held = recoveryHold(journal, nodeRecoveryScope(repo, worker.nodeId), ctx.now?.() ?? new Date());
    if (held !== null || journal.spawnsToday(ctx.now?.() ?? new Date()) >= config.workers.spawnCapPerDay) continue;
    const holder = startsImplementSession(worker) ? journal.laneHolder(implementLane(map), { nodeId: worker.nodeId, repo }) : null;

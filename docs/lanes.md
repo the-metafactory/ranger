@@ -45,7 +45,7 @@ This applies to adoption and to the tests after a worker pass. No worker session
 
 `ranger resume-node <id> --when-free` resumes at once when the node's lane is free and no other resume waits in that lane. Otherwise, it adds a lasting first-in, first-out entry to the queue. Research resumes, and resumes that only close a node, start at once.
 
-On each walk tick, queued resumes run after the merge desks and before new claims. An implement resume that starts reserves its lane for that tick. An entry in the queue never reserves a lane. If the head of a lane's queue cannot start, fresh claims stay eligible that tick, and later entries in that lane wait.
+On each walk tick, queued resumes run after the merge desks and before new claims. An implement resume that starts reserves its lane for that tick. A queued implement resume waiting on a review rate-limit cooldown or a recovery hold also reserves its lane: later resumes and fresh implement claims on that lane wait. Other lanes stay eligible. The journal records the hold and its reason once while it stays unchanged, and the dashboard shows the waiting resume and its reason. Once the hold clears, the resume takes its turn before fresh claims.
 
 `ranger resume-node <id> --cancel` removes an entry, and exits non-zero when there is none. Cancelling still works after the map is deregistered. It uses the queued repo's write token and the same machine-account identity check.
 

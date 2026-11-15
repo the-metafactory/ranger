@@ -269,6 +269,8 @@ export interface ResumeQueueRow {
  reason?: ResumeReason | null;
 }
 
+const resumeHoldKey = (entry: Pick<ResumeQueueRow, "repo" | "nodeId">) => `resume-hold:${entry.repo}#${entry.nodeId}`;
+
 /** A resume ranger queued itself: supervisor tests that failed twice on a busy host (node #297). */
 export type { ResumeReason };
 
@@ -826,10 +828,24 @@ export class Journal {
   });
  }
 
+ noteResumeHold(entry: ResumeQueueRow, hold: string, takesLane: boolean): void {
+  const key = resumeHoldKey(entry);
+  const held = JSON.stringify([entry.id, hold]);
+  if (this.getHealth(key) === held) return;
+  this.recordEvent("sweep", { nodeId: entry.nodeId, repo: entry.repo,
+   detail: `queued resume #${entry.nodeId} ${takesLane ? `holds the ${entry.lane} implement lane` : "waits"}: ${hold}` });
+  this.setHealth(key, held);
+ }
+
+ clearResumeHold(entry: ResumeQueueRow): void {
+  this.db.delete(health).where(eq(health.key, resumeHoldKey(entry))).run();
+ }
+
  removeResume(entry: ResumeQueueRow, kind: "resume-cancelled" | "resume-dropped" | "resume-started", reason: string): boolean {
   return this.db.transaction(() => {
    const removed = this.db.delete(resumeQueue).where(eq(resumeQueue.id, entry.id)).returning().get();
    if (removed === undefined) return false;
+   this.clearResumeHold(removed);
    this.recordEvent(kind, { nodeId: entry.nodeId, repo: entry.repo, detail: reason });
    return true;
   });
