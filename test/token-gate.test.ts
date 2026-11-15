@@ -5,8 +5,206 @@ import {
   resolveReadOnlyToken,
   GateError,
   tokenBatch,
+  assertReadOnlyToken,
+  ReadOnlyTokenCache,
+  TOKEN_GATE_CACHE_MS,
 } from "../src/token-gate.ts";
 import type { RangerConfig } from "../src/config.ts";
+import type { runCmd, RunResult } from "../src/exec.ts";
+
+describe("assertReadOnlyToken — bounded GitHub reuse", () => {
+  const config = { auth: { readOnlyTokens: { "*": "RO" }, writeTokens: {} } } as unknown as RangerConfig;
+  const response = (options: { scopes?: string; remaining?: number; reset?: number; code?: number; resource?: string; stderr?: string } = {}): RunResult => ({
+    code: options.code ?? 0,
+    stdout: [
+      `HTTP/2.0 ${options.code ? 403 : 200} Status`,
+      `X-OAuth-Scopes: ${options.scopes ?? "read:org"}`,
+      `X-RateLimit-Remaining: ${options.remaining ?? 100}`,
+      `X-RateLimit-Resource: ${options.resource ?? "core"}`,
+      ...(options.reset === undefined ? [] : [`X-RateLimit-Reset: ${options.reset}`]),
+      "", '{"login":"scout"}',
+    ].join("\r\n"),
+    stderr: options.stderr ?? "",
+  });
+
+  function harness() {
+    let now = Date.parse("2026-11-15T10:00:00Z");
+    const cache = new ReadOnlyTokenCache(() => now);
+    const calls: { endpoint: string; token: string | undefined }[] = [];
+    let respond = (_endpoint: string): RunResult => response();
+    const runner: typeof runCmd = async (_bin, args, opts) => {
+      expect(args).toContain("-i");
+      expect(opts?.env?.GH_CONFIG_DIR).toBeTruthy();
+      calls.push({ endpoint: args[1], token: opts?.env?.GH_TOKEN });
+      return respond(args[1]);
+    };
+    return {
+      calls,
+      gate: (repo = "acme/a", token = "fixture-token") => assertReadOnlyToken(config, repo, { RO: token }, runner, cache),
+      advance: (ms: number) => { now += ms; },
+      reset: () => now / 1000 + 3600,
+      respond: (fn: typeof respond) => { respond = fn; },
+    };
+  }
+
+  test("fresh batches share introspection across repos and reuse successful repo checks", async () => {
+    const h = harness();
+    const first = await h.gate();
+    const nextBatch = tokenBatch(config, (_config, repo) => h.gate(repo));
+    await nextBatch("github:github.com/Acme/A");
+    await h.gate("acme/b");
+    h.advance(TOKEN_GATE_CACHE_MS - 1);
+    expect((await h.gate()).info).toEqual(first.info);
+    expect(h.calls.map(call => call.endpoint)).toEqual(["/user", "repos/acme/a", "repos/acme/b"]);
+  });
+
+  test("expiry refreshes the gate and refuses a newly added write scope", async () => {
+    const h = harness();
+    await h.gate();
+    h.respond(() => response({ scopes: "read:org, repo" }));
+    h.advance(TOKEN_GATE_CACHE_MS);
+    await expect(h.gate()).rejects.toThrow(/write-capable/);
+    await expect(h.gate()).rejects.toThrow(/write-capable/);
+    expect(h.calls.map(call => call.endpoint)).toEqual(["/user", "repos/acme/a", "/user", "/user"]);
+    h.respond(() => response());
+    await h.gate();
+    expect(h.calls.slice(-2).map(call => call.endpoint)).toEqual(["/user", "repos/acme/a"]);
+  });
+
+  test("repo access expires independently of refreshed introspection", async () => {
+    const h = harness();
+    await h.gate();
+    h.advance(TOKEN_GATE_CACHE_MS - 1);
+    await h.gate("acme/b");
+    h.advance(1);
+    await h.gate("acme/b");
+    await h.gate();
+    expect(h.calls.map(call => call.endpoint)).toEqual(["/user", "repos/acme/a", "repos/acme/b", "/user", "repos/acme/a"]);
+  });
+
+  test("rotated tokens require fresh checks; aliases of a token share checks", async () => {
+    const h = harness();
+    await h.gate();
+    await h.gate("acme/a", "replacement");
+    expect(h.calls.map(call => call.token)).toEqual(["fixture-token", "fixture-token", "replacement", "replacement"]);
+    const alias = { auth: { readOnlyTokens: { "*": "ALIAS" }, writeTokens: {} } } as unknown as RangerConfig;
+    const cache = new ReadOnlyTokenCache();
+    let calls = 0;
+    const runner: typeof runCmd = async () => { calls++; return response(); };
+    await assertReadOnlyToken(config, "acme/a", { RO: "same" }, runner, cache);
+    await assertReadOnlyToken(alias, "acme/a", { ALIAS: "same" }, runner, cache);
+    expect(calls).toBe(2);
+  });
+
+  test.each(["/user", "repos/acme/a"])("an empty core window from %s blocks every repo until reset", async endpoint => {
+    const h = harness();
+    const reset = h.reset();
+    h.respond(path => path === endpoint ? response({ remaining: 0, reset, code: 1, stderr: "rate limit exceeded" }) : response());
+    await expect(h.gate()).rejects.toMatchObject({ transient: true });
+    const calls = h.calls.length;
+    h.advance(3_600_000 - 1);
+    await expect(h.gate()).rejects.toMatchObject({ transient: true });
+    await expect(h.gate("acme/b")).rejects.toMatchObject({ transient: true });
+    expect(h.calls).toHaveLength(calls);
+    h.respond(() => response());
+    await h.gate("acme/a", "other-token");
+    expect(h.calls).toHaveLength(calls + 2);
+    h.advance(1);
+    await h.gate();
+    expect(h.calls.slice(-2).map(call => call.endpoint)).toEqual(["/user", "repos/acme/a"]);
+  });
+
+  test("a successful last core call stops requests and overrides cached passes", async () => {
+    const h = harness();
+    await h.gate();
+    h.respond(() => response({ remaining: 0, reset: h.reset() }));
+    await h.gate("acme/b");
+    await expect(h.gate()).rejects.toMatchObject({ transient: true });
+    await expect(h.gate("acme/c")).rejects.toMatchObject({ transient: true });
+    expect(h.calls).toHaveLength(3);
+    const firstCall = harness();
+    firstCall.respond(() => response({ remaining: 0, reset: firstCall.reset() }));
+    await expect(firstCall.gate()).rejects.toMatchObject({ transient: true });
+    expect(firstCall.calls.map(call => call.endpoint)).toEqual(["/user"]);
+  });
+
+  test.each(["/user", "repos/acme/a"])("other refusals at %s cache neither introspection nor access", async endpoint => {
+    const h = harness();
+    h.respond(path => path === endpoint ? response({ code: 1, stderr: "access denied" }) : response());
+    await expect(h.gate()).rejects.toMatchObject({ transient: false });
+    const before = h.calls.length;
+    h.respond(() => response());
+    await h.gate();
+    expect(h.calls.length - before).toBe(2);
+  });
+
+  test("network failures remain transient and are retried", async () => {
+    const h = harness();
+    h.respond(() => response({ code: 1, stderr: "error connecting to api.github.com" }));
+    await expect(h.gate()).rejects.toMatchObject({ transient: true });
+    await expect(h.gate()).rejects.toMatchObject({ transient: true });
+    expect(h.calls).toHaveLength(2);
+  });
+
+  test.each([
+    { remaining: 0 }, { remaining: 0, reset: 1 },
+    { remaining: 1, reset: 9999999999 }, { remaining: 0, reset: 9999999999, resource: "graphql" },
+  ])("unusable or non-core reset evidence does not create a cooldown: %j", async evidence => {
+    const h = harness();
+    h.respond(() => response({ ...evidence, code: 1, stderr: "access denied" }));
+    await expect(h.gate()).rejects.toThrow(GateError);
+    await expect(h.gate()).rejects.toThrow(GateError);
+    expect(h.calls).toHaveLength(2);
+  });
+
+  test("concurrent gates share successful checks across repos", async () => {
+    const h = harness();
+    await Promise.all([h.gate(), h.gate(), h.gate("acme/b"), h.gate("acme/b")]);
+    expect(h.calls.map(call => call.endpoint)).toEqual(["/user", "repos/acme/a", "repos/acme/b"]);
+  });
+
+  test("the default gate cache survives across fresh batches", async () => {
+    let calls = 0;
+    const runner: typeof runCmd = async () => { calls++; return response(); };
+    const gate = (c: RangerConfig, repo: string) => assertReadOnlyToken(c, repo, { RO: "default-cache-fixture" }, runner);
+    await tokenBatch(config, gate)("acme/default-cache");
+    await tokenBatch(config, gate)("acme/default-cache");
+    expect(calls).toBe(2);
+  });
+
+  test("an empty window observed by one gate holds all queued gates", async () => {
+    const h = harness();
+    h.respond(() => response({ remaining: 0, reset: h.reset(), code: 1 }));
+    const results = await Promise.allSettled([h.gate(), h.gate(), h.gate("acme/b")]);
+    for (const result of results) {
+      expect(result.status).toBe("rejected");
+      if (result.status === "rejected") expect(result.reason).toMatchObject({ transient: true });
+    }
+    expect(h.calls).toHaveLength(1);
+  });
+
+  test("mutating returned introspection does not affect the cached authorization", async () => {
+    const h = harness();
+    const result = await h.gate();
+    result.info.scopes.push("repo");
+    expect((await h.gate()).info.scopes).toEqual(["read:org"]);
+    expect(h.calls).toHaveLength(2);
+  });
+
+  test("one hour of refresh batches spends at most one check per token and repo each lifetime", async () => {
+    const h = harness();
+    for (let second = 0; second < 3600; second += 15) {
+      const tokens = tokenBatch(config, (_config, repo) => h.gate(repo, repo.startsWith("other/") ? "second" : "first"));
+      await Promise.all([tokens("acme/a"), tokens("acme/a"), tokens("acme/b"), tokens("other/c")]);
+      h.advance(15_000);
+    }
+    expect(h.calls.filter(call => call.endpoint === "/user")).toHaveLength(8);
+    for (const endpoint of ["repos/acme/a", "repos/acme/b", "repos/other/c"]) {
+      expect(h.calls.filter(call => call.endpoint === endpoint)).toHaveLength(4);
+    }
+    expect(h.calls).toHaveLength(20);
+  });
+});
 
 describe("parseGhHeaders", () => {
   test("classic token scopes are parsed from the header block", () => {
