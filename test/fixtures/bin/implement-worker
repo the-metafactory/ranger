@@ -15,7 +15,7 @@
 # merge pass does nothing; merge-forge — a base merge pass commits without merging and moves
 # refs/remotes/origin/main onto its own parent (one commit ahead, base "inside"); orphan — builds on a
 # root commit of its own, sharing no history with origin/main; blocked — writes the blocked report
-# (.ranger-blocked.md) uncommitted and exits 0; blocker-note — commits only a docs/ blocker note. Base merge pass (prompt carries "## Base merge pass"): merges
+# (.ranger-blocked.md) uncommitted and exits 0; blocker-note — commits only a docs/ blocker note; ruling-unclassed — parks on a ruling with no class, then builds with a Default: line once the prompt says the park was refused; ruling-insists — always parks on a ruling with no class; ruling-security — parks on a security ruling. Base merge pass (prompt carries "## Base merge pass"): merges
 # origin/main, resolving a conflict on src/feature.ts by keeping both sides. CI fix pass (prompt
 # carries "## CI fix pass"): commits a CI fix; in mode ci-noop it commits nothing (a flaky red). Probe fix
 # pass (prompt carries "## Probe fix pass"): commits src/probe-fix.ts; in mode probe-noop it commits nothing. Finish pass (prompt
@@ -41,6 +41,14 @@ if [ "$mode" = "blocked" ]; then
 fi
 if [ "$mode" = "blocked-again" ]; then
   printf '# Node #20 is blocked\n\nThe widgets SDK has no bus subject.\n\nResume condition: node #30 closes.\n' > .ranger-blocked.md
+  exit 0
+fi
+if [ "$mode" = "ruling-insists" ] || { [ "$mode" = "ruling-unclassed" ] && [[ "$prompt" != *"## Your park was refused"* ]]; }; then
+  printf '# Node #20 is blocked\n\nThe node does not say which colour the badge is.\n\nGap: ruling\n\nResume condition: the principal picks the badge colour.\n' > .ranger-blocked.md
+  exit 0
+fi
+if [ "$mode" = "ruling-security" ]; then
+  printf '# Node #20 is blocked\n\nThe node does not say who may read the export.\n\nGap: ruling security\n\nResume condition: the principal rules who may read it.\n' > .ranger-blocked.md
   exit 0
 fi
 if [ "$mode" = "blocker-note" ]; then
@@ -137,6 +145,7 @@ if [ "$mode" = "probe-edit" ]; then mkdir -p scripts; echo "// edited on the bra
 git add -A
 msg="feat: implement node #20"
 if [ "$mode" = "keyword" ]; then msg="feat: implement the feature, closes #20"; fi
+if [ "$mode" = "ruling-unclassed" ]; then msg="$(printf 'feat: implement node #20\n\nDefault: a grey badge, because it matches the card')"; fi
 git commit -q -m "$msg"
 if [ "$mode" = "orphan" ]; then git reset -q --hard "$(git commit-tree "HEAD^{tree}" -m "$msg (no parent)")"; fi
 echo "fake worker build pass done; prompt bytes: ${#prompt}"

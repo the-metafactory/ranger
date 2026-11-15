@@ -239,6 +239,7 @@ describe("fix-the-base node for a confirmed base-red probe (node #152)", () => {
    expect(args[args.indexOf("--autonomy") + 1]).toBe("propose");
    expect(args[args.indexOf("--kind") + 1]).toBe("build");
    expect(args[args.indexOf("--label") + 1]).toBe("orienteer:build");
+   expect(args[args.indexOf("--over-budget") + 1]).toBe("filed by ranger, which map spawn budgets exempt");
    expect(JSON.parse(ctx.journal.getHealth(baseRedFixKey(ctx.map, HUD))!).node).toBe("77");
   } finally {
    spy.mockRestore();

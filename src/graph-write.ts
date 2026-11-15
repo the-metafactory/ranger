@@ -405,6 +405,8 @@ export function somaProse(body: string): string {
  return close === -1 ? body : `${body.slice(0, open)}${body.slice(close + NODE_BLOCK_CLOSE.length)}`;
 }
 
+export const RANGER_OVER_BUDGET = "filed by ranger, which map spawn budgets exempt";
+
 /**
  * Create a node below `parent` (the spawning node, never the map root).
  * Exit 1 with `attached: false` means the node exists but hangs off no
@@ -433,6 +435,7 @@ export async function graphAdd(
  if (spec.body !== undefined) args.push("--body", spec.body);
  for (const blocker of spec.blockedBy ?? []) args.push("--blocked-by", writeNodeId(ref, blocker));
  if (spec.once !== undefined) args.push("--once", spec.once);
+ args.push("--over-budget", RANGER_OVER_BUDGET);
  args.push("--repo", somaRepo(ref), "--json");
  const result = await callWrite(repo, args, token, opts);
  if (result.code !== 0) {

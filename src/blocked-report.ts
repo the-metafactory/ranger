@@ -28,14 +28,18 @@ const MAX_REPORT_BYTES = 16_384;
 /** Characters each part keeps in the outcome. */
 const MAX_PART_CHARS = 300;
 
+export const RULING_CLASSES = ["irreversible", "security", "contract"] as const;
+export type RulingClass = (typeof RULING_CLASSES)[number];
+
 export interface BlockedReport {
  reason: string;
  /** What must hold before a resume can succeed; empty when the worker named none. */
  resume: string;
  ruling?: boolean;
+ rulingClass?: RulingClass;
 }
 
-const GAP_LINE = /^\s*(?:#{1,6}\s*)?(?:\*\*)?gap(?:\*\*)?\s*:\s*(?:\*\*)?\s*(ruling|code|provisioning)\b/i;
+const GAP_LINE = new RegExp(`^\\s*(?:#{1,6}\\s*)?(?:\\*\\*)?gap(?:\\*\\*)?\\s*:\\s*(?:\\*\\*)?\\s*(ruling|code|provisioning)\\b(?:[\\s:(,—–-]*(${RULING_CLASSES.join("|")})\\b)?`, "i");
 
 const RESUME_LINE = /^\s*(#{1,6}\s*)?(?:\*\*)?resume[ -]condition(?:\*\*)?\s*:?(?:\*\*)?\s*(.*)$/i;
 const HEADING = /^\s*#{1,6}\s/;
@@ -87,7 +91,9 @@ export function parseBlockedReport(text: string): BlockedReport {
  const lines = text.split(/\r?\n/);
  const gap = lines.map((l) => GAP_LINE.exec(l)).find((m) => m !== null);
  const parsed = parseParts(lines.filter((l) => !GAP_LINE.test(l)));
- return gap?.[1].toLowerCase() === "ruling" ? { ...parsed, ruling: true } : parsed;
+ if (gap?.[1].toLowerCase() !== "ruling") return parsed;
+ const named = (gap[2] as string | undefined)?.toLowerCase() as RulingClass | undefined;
+ return named === undefined ? { ...parsed, ruling: true } : { ...parsed, ruling: true, rulingClass: named };
 }
 
 function parseParts(lines: string[]): BlockedReport {
@@ -180,5 +186,6 @@ export async function blockerNoteBranch(worktree: string, base: string): Promise
   reason: `the branch only adds a blocker note (${named}), not an implementation${parsed.reason.length > 0 ? `: ${parsed.reason}` : ""}`,
   resume: parsed.resume,
   ...(parsed.ruling === true ? { ruling: true } : {}),
+  ...(parsed.rulingClass === undefined ? {} : { rulingClass: parsed.rulingClass }),
  };
 }
