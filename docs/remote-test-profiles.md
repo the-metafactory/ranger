@@ -25,3 +25,28 @@ Flag semantics: [Podman create](https://docs.podman.io/en/latest/markdown/podman
 Repository command verification at the inspected Myelin revision passed 1,769 unit tests and 36 integration tests across all 11 integration files, each with zero failures, zero skips and zero todos, plus typecheck and lint (two lint warnings, no errors). The integration run used a disposable native NATS 2.14.0 process bound to an OS-selected loopback port, with fresh temporary JetStream storage and an explicit environment without bus/domain credentials; that process and storage were removed afterward. Copying the dependency snapshot and installing with an empty private cache also passed under Bun 1.3.14. These native checks establish recipe compatibility and real broker behavior; they do not establish Linux ARM64 container startup, kernel enforcement or service capacity. The operator-prepared container fixture above remains unrun in this delivery.
 
 Both complete captured native Bun outputs were also replayed through the executor-generated wrapper with disposable controller/readiness fixtures: the real summaries decoded as 1,769/36 executed tests and zero skipped/todo tests; the wrapper returned `passed`, exit zero and `coverage.requiredSkippedTests: 0`. The controller/resource values in this replay are fixtures, not kernel measurements. This verifies summary compatibility without claiming a container run. Local Ranger `bun test` now requires Bun 1.3.14 for the reviewed-wrapper regression, and the entire CI suite is pinned to that version.
+
+## `ranger-v1`
+
+`ranger-v1` is bound to `github:github.com/the-metafactory/ranger`, needs no sidecar, and runs three checks after the frozen offline install: `unit`, `typecheck`, `lint`. They match the map's `commands.test` (`bun run test`, `tsc --noEmit`, `bun run lint`), with these named differences:
+
+- `unit` runs `bun test` with `--preload=./test/preload.ts`, `--randomize`, `--timeout=60000` and `--parallel=2`. Bun configuration is disabled in the container (`--config=/dev/null`), so the settings `bunfig.toml` carries are passed as flags. `--parallel=2` fits the two-core budget; the local script uses 4.
+- `lint` runs ESLint directly. `eslint/suppressions-guard.ts` is not run: it compares the suppression baseline with `origin/main`, which an immutable source bundle does not contain. The merge gates still run it locally and in CI.
+- Four test files are excluded by name (`RANGER_OPT_IN_TEST_FILES` in `src/remote-test/recipes.ts`), because they skip unless an operator supplies a Podman image, an SSH fixture or a `nats-server` binary, and a skipped required test makes a receipt `infra_failed`: `remote-test-executor-integration`, `remote-test-profiles-integration`, `remote-test-ssh-integration` and `remote-test-bus-worker-transport`. Any other exclusion needs a reviewed change to that list.
+
+### Runtime image requirements
+
+The image needs everything the Myelin image needs (pinned Bun 1.3.14, `/opt/ranger-dependencies/node_modules` with its `bun.lock`), plus:
+
+- `git` and `git-lfs`. The suite drives real git repositories. `git-lfs` must be exactly 3.8.1, or `git-lfs-hook-stubs` skips its real filter-process test and the receipt fails.
+- A non-root user: `remote-test-baseline-peak` skips its unwritable-root test as uid 0.
+- A writable temporary directory that accepts non-UTF-8 file names, or two `git-ops` and one implement end-to-end test skip.
+- `sh`, `tar` and coreutils for the fixtures that spawn them.
+
+### Tests that need network, macOS or a real home directory
+
+Nothing in the suite reaches a real network: the GitHub and GitLab tests use fixtures and local servers, and the container has no network. Tests that read `HOME`, `homedir()` or `process.platform` build a temporary home in the test. The four opt-in files above are the only deliberate exclusions.
+
+### Unverified here
+
+This recipe has not been run in the container. The 2026-11-15 trial on a 2-vCPU x86 VM took 324 s with 56 of 3778 tests failing (git-lfs, cgroup timing, canonical-clone bootstrap, remote supervisor). If the container run fails beyond that list or exceeds two cores, 1.5 GiB or ten minutes, escalate with the failing tests instead of widening the recipe. Whether Bun 1.3.14 accepts `--path-ignore-patterns` and `--parallel` is also unchecked here; the local Bun is 1.4.4.

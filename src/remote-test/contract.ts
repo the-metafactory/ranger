@@ -1,6 +1,6 @@
 import type { Hash } from "node:crypto";
 import { z } from "zod";
-import { MYELIN_REPOSITORY, ReviewedPolicySchema, validateReviewedManifest } from "./profiles.ts";
+import { reviewedRecipe, ReviewedPolicySchema, validateReviewedManifest } from "./profiles.ts";
 
 /** V1 is deliberately limited to the first non-graphical Linux ARM64 lane. */
 const PlatformSchema = z.literal("linux-arm64");
@@ -126,7 +126,7 @@ export function validateProfileManifest(input: unknown): ProfileManifest {
 export function validateRemoteTestJob(input: unknown, operatorProfile: unknown): RemoteTestJob {
  const profile = validateProfileManifest(operatorProfile);
  const request = RemoteTestJobSchema.parse(input);
- if (profile.reviewed && request.repositoryId !== MYELIN_REPOSITORY) throw Error("Reviewed recipe repository mismatch");
+ if (profile.reviewed && request.repositoryId !== reviewedRecipe(profile.reviewed).repositoryId) throw Error("Reviewed recipe repository mismatch");
  const fields = Object.keys(ProfileBindingShape) as (keyof typeof ProfileBindingShape)[];
  for (const field of fields) {
   if (request[field] !== profile[field]) throw new Error(`Remote-test job does not match operator profile: ${field}`);
