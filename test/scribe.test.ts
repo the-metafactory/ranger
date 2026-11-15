@@ -503,18 +503,24 @@ describe("scribeAfterMerge: the Scribe's pass before the close", () => {
   expect(filings).toEqual({ review: { proseLeft: 9 } });
   expect(fake.calls).toEqual([]);
   expect(events()).toEqual([
-   "left the last review's 9 nit(s) on PR #42 (https://github.com/acme/widgets/pull/42), not filed (prose only: no blocker, major, behavior or check finding)",
+   "left the last review's 9 nit(s) on PR #42 (https://github.com/acme/widgets/pull/42), not filed (no blocker or major)",
   ]);
   const receipt = closeResolution(ctx, { ...pr(), headSha: "c".repeat(40), mergedBy: "ivy-agent", state: "merged" } as never, nitsOnly, 2,
    { state: "green", runId: 1, runUrl: "u", runName: "build", snapshot: "" }, undefined, filings);
-  expect(receipt).toContain("- Unfixed review findings: 0 blocker(s), 0 major(s) and 9 nit(s) from the last sage round stay on the PR (https://github.com/acme/widgets/pull/42); prose-only findings are not filed back.");
+  expect(receipt).toContain("- Unfixed review findings: 0 blocker(s), 0 major(s) and 9 nit(s) from the last sage round stay on the PR (https://github.com/acme/widgets/pull/42); findings below a major are not filed back.");
  });
 
- test("a nit-severity finding that asks a behavior or check change still files, and so does a round with no impact line", async () => {
+ test("a nit-severity finding stays on the PR even when it asks a behavior or check change, or the round has no impact line", async () => {
   for (const body of [impact(1, 0, 4), impact(0, 1, 4), `${impact(0, 0, 2)}\n\n${impact(1, 0, 2)}`, "### CodeQuality\nno impact line"]) {
    const filings = await scribeAfterMerge(ctx, { ...pr(), mergeCommitSha: null }, { ...REVIEW, majors: 0, nits: 5, body });
-   expect(filings.review).toEqual({ node: expect.any(String) });
+   expect(filings.review).toEqual({ proseLeft: 5 });
   }
+  expect(fake.calls).toEqual([]);
+ });
+
+ test("a round that left a blocker files it below the node", async () => {
+  const filings = await scribeAfterMerge(ctx, { ...pr(), mergeCommitSha: null }, { ...REVIEW, blockers: 1, majors: 0, nits: 0 });
+  expect(filings).toEqual({ review: { node: "300" } });
  });
 
  test("a round that left a major files it below the node", async () => {

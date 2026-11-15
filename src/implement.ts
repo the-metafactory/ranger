@@ -1052,12 +1052,12 @@ function leftWork(r: { blockers: number; majors: number; nits: number; body: str
 /**
  * The Scribe's pass after a merge (design §6, node #24), before the close so
  * the receipt can cite what it filed: the last sage round's findings
- * (split-out-of-review, only when it left a blocker, a major, or a behavior,
- * check or unclassified finding by sage's round-impact lines, or any finding
- * when the round has none) and the marker comments the merge commit added
- * (code-comment-graduated), each one `propose` node below this node. A
- * prose-only round files nothing: its nits stay on the change, journalled and
- * named in the receipt. Best effort: a failed filing is journalled and
+ * (split-out-of-review, only when it left a blocker or a major) and the
+ * marker comments the merge commit added (code-comment-graduated), each one
+ * `propose` node below this node. A round that left only nits and
+ * suggestions files nothing, whatever their round impact: they stay on the
+ * change, journalled and named in the receipt (principal, 2026-11-15: 67 of
+ * 68 split-out nodes held no blocker or major, and each grew the map). Best effort: a failed filing is journalled and
  * named in the receipt, and the close goes on. A superseded supervisor stops
  * here (FencedError).
  */
@@ -1093,13 +1093,13 @@ export async function scribeAfterMerge(
    nodeId, repo: map.repo,
    detail: `left round ${final.round}'s ${final.settled} settled major(s) on ${changeRequestLabel(map.repo, pr.iid)} (${change.url}), not filed (outside what the head added since the last clean round)`.slice(0, 400),
   });
- } else if (final !== undefined && leftWork(final) > 0) {
+ } else if (final !== undefined && gatingFindings(final) > 0) {
   filings.review = await file("split-out-of-review", "the last review's findings", () => splitOutOfReviewSpec(map.repo, spawning, change, final));
  } else if (final !== undefined && final.nits > 0) {
   filings.review = { proseLeft: final.nits };
   journal.recordEvent("filed", {
    nodeId, repo: map.repo,
-   detail: `left the last review's ${final.nits} nit(s) on ${changeRequestLabel(map.repo, pr.iid)} (${change.url}), not filed (prose only: no blocker, major, behavior or check finding)`.slice(0, 400),
+   detail: `left the last review's ${final.nits} nit(s) on ${changeRequestLabel(map.repo, pr.iid)} (${change.url}), not filed (no blocker or major)`.slice(0, 400),
   });
  }
  const merge = pr.mergeCommitSha;
@@ -4405,7 +4405,7 @@ function unfixedFindingsLine(ctx: ImplementContext, pr: ChangeRequest, final: Re
  const counts = `${final.blockers} blocker(s), ${final.majors} major(s) and ${final.nits} nit(s) from the last sage round`;
  const noun = changeRequestNoun(ctx.map.repo);
  if (review === undefined) return `${counts} are on the ${noun}, not filed back.`;
- if ("proseLeft" in review) return `${counts} stay on the ${noun} (${changeRequestUrl(ctx.map.repo, pr.iid, pr.webUrl)}); prose-only findings are not filed back.`;
+ if ("proseLeft" in review) return `${counts} stay on the ${noun} (${changeRequestUrl(ctx.map.repo, pr.iid, pr.webUrl)}); findings below a major are not filed back.`;
  if ("node" in review) return `${counts}, split out as node #${review.node} below this node.`;
  return `${counts} are on the ${noun}; filing them back failed (${review.error}).`;
 }
