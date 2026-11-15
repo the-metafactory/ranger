@@ -61,6 +61,8 @@ This recipe has not been run in the container. The 2026-11-15 trial on a 2-vCPU 
 | `lint` | `bun run lint`, that is `bun eslint/suppressions-guard.ts && bun --bun eslint .` | `bun ./node_modules/eslint/bin/eslint.js .` |
 | `unit` | `bun test test` | `bun test test` |
 
+Every row above runs through `bun --config=/dev/null --no-env-file`; the table omits those two flags for width.
+
 - `typecheck` runs the installed compiler entrypoint instead of `bunx`, so no package is resolved at run time. The compiler, its version and `--noEmit` are the same.
 - `lint` runs ESLint alone. Recipe commands are argv vectors, never shell text, so the `&&` chain has no form here. `eslint/suppressions-guard.ts` also reads `origin/main` (or `LINT_BASE_REF`), and the immutable bundle the executor restores carries only the submitted commit, so the guard would exit 2. The guard still runs in the local `bun run check` and in CI.
 - `unit` is the repository's whole test directory. It carries no `bunfig.toml`, no preload and no opt-in files, so the recipe adds no flags: no test under `test/` skips, and none needs a network, a platform or a real home directory.
