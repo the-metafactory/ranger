@@ -1,6 +1,6 @@
 import type { Hash } from "node:crypto";
 import { z } from "zod";
-import { REVIEWED_RECIPES, reviewedRecipe, ReviewedPolicySchema, validateReviewedManifest, type ReviewedRecipeRegistry } from "./profiles.ts";
+import { reviewedRecipe, ReviewedPolicySchema, validateReviewedManifest } from "./profiles.ts";
 
 /** V1 is deliberately limited to the first non-graphical Linux ARM64 lane. */
 const PlatformSchema = z.literal("linux-arm64");
@@ -113,23 +113,20 @@ export type RemoteTestStatus = RemoteTestReceipt["status"];
 /** Structural validation for the private ledger; profile approval remains at admission. */
 export function validateJobIdentity(input: unknown): RemoteTestJob { return RemoteTestJobSchema.parse(input); }
 
-function parseProfileManifest(input: unknown, registry: ReviewedRecipeRegistry): ProfileManifest {
- return validateReviewedManifest(ProfileManifestSchema.parse(input), registry);
-}
 /** Structural validation only. Approval, digest verification and provenance are
  * caller responsibilities: load this from an operator-owned allow-list, never
  * from the job or its submitter. A claimed digest does not authenticate content. */
 export function validateProfileManifest(input: unknown): ProfileManifest {
- return parseProfileManifest(input, REVIEWED_RECIPES);
+ return validateReviewedManifest(ProfileManifestSchema.parse(input));
 }
 
 /** Pure admission shape check against an already selected trusted profile.
  * Returns a detached validated job; never executes commands or reads config.
  * Throws ZodError for malformed input, Error for profile mismatch. */
-export function validateRemoteTestJob(input: unknown, operatorProfile: unknown, registry: ReviewedRecipeRegistry = REVIEWED_RECIPES): RemoteTestJob {
- const profile = parseProfileManifest(operatorProfile, registry);
+export function validateRemoteTestJob(input: unknown, operatorProfile: unknown): RemoteTestJob {
+ const profile = validateProfileManifest(operatorProfile);
  const request = RemoteTestJobSchema.parse(input);
- if (profile.reviewed && request.repositoryId !== reviewedRecipe(profile.reviewed.recipe, registry).repositoryId) throw Error("Reviewed recipe repository mismatch");
+ if (profile.reviewed && request.repositoryId !== reviewedRecipe(profile.reviewed).repositoryId) throw Error("Reviewed recipe repository mismatch");
  const fields = Object.keys(ProfileBindingShape) as (keyof typeof ProfileBindingShape)[];
  for (const field of fields) {
   if (request[field] !== profile[field]) throw new Error(`Remote-test job does not match operator profile: ${field}`);
