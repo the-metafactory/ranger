@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stringify } from "yaml";
 import { Journal } from "../src/journal.ts";
+import { recordThrottle } from "../src/budget.ts";
+import { recordRecovery, nodeRecoveryScope } from "../src/recovery.ts";
 import { fakeDiscord, fixturesBin, GIT_ENV, runCli } from "./support.ts";
 
 const REPO = "acme/widgets";
@@ -98,6 +100,32 @@ function stillWaking(snapshots: Snapshot[]): Record<string, string[]> {
 const said = (snapshot: Snapshot, nodeId: string, text: string) => snapshot.get(nodeId)?.some((e) => e.includes(text)) ?? false;
 
 describe("a node stuck on a failure that never clears goes quiet within a bounded number of ticks", () => {
+ test.each(["throttled", "recovery"] as const)("a queued resume with an unchanged %s hold journals it once", async hold => {
+  const h = host();
+  h.node("40");
+  const journal = h.journal();
+  journal.upsertWorker({ repo: REPO, root: 1, nodeId: "40", status: "parked", lane: "implement", phase: "review", pid: null });
+  journal.enqueueResume({ nodeId: "40", repo: REPO, root: 1, lane: "headless" });
+  if (hold === "throttled") {
+   recordThrottle(journal, "RANGER_RO_TEST", { cooldownMs: 3_600_000 }, new Date(), { reason: () => "GitHub rate limit" });
+  } else {
+   recordRecovery(journal, nodeRecoveryScope(REPO, "40"), {
+    kind: "unknown", operation: "review", evidence: "review state unknown", action: "inspect review",
+   });
+  }
+  journal.close();
+  const snapshots = await soak(h);
+  expect(stillWaking(snapshots)).toEqual({});
+  const holds = snapshots.at(-1)?.get("40")?.filter(e => e.includes("holds the headless implement lane"));
+  expect(holds).toHaveLength(1);
+  expect(holds?.[0]).toContain(hold === "throttled" ? "GitHub rate limit" : "inspect review");
+  const after = h.journal();
+  try {
+   expect(after.getResume(REPO, "40")).not.toBeNull();
+   expect(after.spawnsToday()).toBe(0);
+  } finally { after.close(); }
+ }, 120_000);
+
  test("a worker row whose graph node can never be read parks (#504)", async () => {
   const h = host();
   const journal = h.journal();

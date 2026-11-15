@@ -16,6 +16,7 @@ import { walk } from "../src/walk.ts";
 import type { SpawnRunNodeArgs } from "../src/spawn.ts";
 import { activeRecovery, recordRecovery, nodeRecoveryScope } from "../src/recovery.ts";
 import { resumeNode } from "../src/resume.ts";
+import { recordThrottle, reviewCooldownScope } from "../src/budget.ts";
 import { assembleState, servedMaps, ServeReader, stateFromJournal } from "../src/serve.ts";
 import { classifyFrontier } from "../src/route.ts";
 import { fakeDiscord, fixturesBin, runCli } from "./support.ts";
@@ -75,6 +76,88 @@ function pr(iid = 7): ChangeRequest {
  return { iid, state: "open", draft: false, title: "Build", body: "", headRef: "node/40-x", headSha: "b".repeat(40),
   baseRef: "main", mergeState: "mergeable", mergeCommitSha: null, mergedBy: null, webUrl: "", author: "ivy-bot" };
 }
+
+describe("queued resume holds its lane (node #538)", () => {
+ test.each([
+  ["throttled", false], ["recovery", false], ["throttled", true], ["recovery", true],
+  ["throttled with eligible recovery", false], ["throttled with eligible recovery", true],
+ ] as const)("%s holds visual work while headless claims, then resumes first (conflict=%s)", async (hold, conflict) => {
+  await withRig(async r => {
+   r.config.maps[0].lane = "visual";
+   for (const id of ["40", "41"]) {
+    r.worker(id);
+    r.journal.enqueueResume({ nodeId: id, repo: REPO, root: 1, lane: "visual" }, NOW);
+   }
+   if (conflict) r.journal.setResumeReason(r.journal.getResume(REPO, "40")!, "merge-conflict-resume");
+   r.frontier(1, ["50"]);
+   r.frontier(460, ["60"]);
+   let until: Date;
+   if (hold !== "recovery") {
+    until = recordThrottle(r.journal, reviewCooldownScope(r.config, REPO), { cooldownMs: 60_000 }, NOW,
+     { reason: () => "GitHub rate limit" }).until;
+    if (hold === "throttled with eligible recovery") recordRecovery(r.journal, nodeRecoveryScope(REPO, "40"), {
+     kind: "infrastructure", operation: "review", evidence: "review unavailable", action: "retry review",
+    }, { now: new Date(NOW.getTime() - 60_000) });
+   } else {
+    const recovery = recordRecovery(r.journal, nodeRecoveryScope(REPO, "40"), {
+     kind: "infrastructure", operation: "review", evidence: "review unavailable", action: "retry review",
+    }, { now: NOW });
+    until = new Date(recovery.nextEligibleAt!);
+   }
+   const spawned: string[] = [];
+   const spawnRunNode = async ({ nodeId }: SpawnRunNodeArgs) => {
+    spawned.push(nodeId);
+    r.journal.updateWorker(nodeId, REPO, { status: "success" });
+    return process.pid;
+   };
+   const result = await walk({ ...r, now: () => NOW, spawnRunNode });
+   expect(result.maps.flatMap(m => m.claimed)).toEqual(["60"]);
+   expect(spawned).toEqual(["60"]);
+   expect(r.journal.getWorker("50", REPO)).toBeNull();
+   expect(r.journal.listResumeQueue().map(q => q.nodeId)).toEqual(["40", "41"]);
+   const event = r.journal.listNodeEvents(REPO, "40").find(e => e.detail?.includes("holds the visual implement lane"));
+   expect(event?.detail).toContain(hold === "recovery" ? "retry review" : "GitHub rate limit");
+   const maps = servedMaps(r.config);
+   const reader = new ServeReader(r.config, maps, r.config.state.journalPath);
+   const state = stateFromJournal(r.config, maps, reader, NOW);
+   expect(state.resumeQueue.visual.head).toMatchObject({ nodeId: "40", starts: false, holdsLane: true });
+   expect(event?.detail).toContain(state.resumeQueue.visual.head!.reason);
+   expect(state.maps.find(m => m.root === 1)?.next).toMatchObject({ nodeId: "50", waiting: true,
+    reason: expect.stringContaining("held by queued resume #40") });
+   r.frontier(460, []);
+   spawned.length = 0;
+   const beforeExpiry = new Date(until.getTime() - 1);
+   expect(stateFromJournal(r.config, maps, reader, beforeExpiry).resumeQueue.visual.head).toMatchObject({ nodeId: "40", starts: false, holdsLane: true });
+   const held = await walk({ ...r, now: () => beforeExpiry, spawnRunNode });
+   expect(spawned).toEqual([]);
+   expect(held.maps.flatMap(m => m.claimed)).toEqual([]);
+   expect(r.journal.listNodeEvents(REPO, "40").filter(e => e.detail?.includes("holds the visual implement lane"))).toHaveLength(1);
+   expect(stateFromJournal(r.config, maps, reader, until).resumeQueue.visual.head).toMatchObject({ nodeId: "40", starts: true });
+   const expired = await walk({ ...r, now: () => until, spawnRunNode });
+   expect(spawned).toEqual(["40"]);
+   expect(expired.maps.flatMap(m => m.claimed)).toEqual([]);
+   expect(r.journal.listResumeQueue().map(q => q.nodeId)).toEqual(["41"]);
+   expect(r.journal.getHealth(`resume-hold:${REPO}#40`)).toBeNull();
+  });
+ });
+
+ test.each(["cancel", "drop"] as const)("%s removes a waiting resume's hold bookkeeping", async removal => {
+  await withRig(async r => {
+   r.queue("40");
+   recordThrottle(r.journal, reviewCooldownScope(r.config, REPO), { cooldownMs: 60_000 }, NOW,
+    { reason: () => "GitHub rate limit" });
+   await walk({ ...r, now: () => NOW });
+   expect(r.journal.getHealth(`resume-hold:${REPO}#40`)).not.toBeNull();
+   if (removal === "cancel") await resumeNode("40", `${REPO}#1`, r, { cancel: true });
+   else {
+    r.config.maps[0].walk = "none";
+    await walk({ ...r, now: () => NOW });
+   }
+   expect(r.journal.getResume(REPO, "40")).toBeNull();
+   expect(r.journal.getHealth(`resume-hold:${REPO}#40`)).toBeNull();
+  });
+ });
+});
 
 describe("held frontier eligibility (node #336)", () => {
  test("held frontier resumes keep FIFO and phase/PR continuation ahead of fresh claims", async () => {
@@ -793,7 +876,7 @@ describe("resume-queue-starts-when-lane-frees", () => {
  }
 
  for (const failure of ["no PID", "throws"] as const) {
- test(`${failure} holds its retry while an independent queued node starts`, async () => {
+ test(`${failure} holds its lane until recovery clears, then resumes before the next queued node`, async () => {
   await withRig(async r => {
    r.queue("40"); r.queue("41", 460);
    const spawned: string[] = [];
@@ -811,14 +894,17 @@ describe("resume-queue-starts-when-lane-frees", () => {
    expect(spawned).toEqual(["40"]);
    expect(r.journal.getResume(REPO, "40")?.failedStarts).toBe(0);
    await tick();
-   expect(spawned).toEqual(["40", "41"]);
-   expect(r.journal.spawnsToday(NOW)).toBe(1);
-   r.journal.updateWorker("41", REPO, { status: "success" });
+   expect(spawned).toEqual(["40"]);
+   expect(r.journal.spawnsToday(NOW)).toBe(0);
    fail = false;
    now = new Date(activeRecovery(r.journal, nodeRecoveryScope(REPO, "40"))!.nextEligibleAt!);
    await tick();
-   expect(spawned).toEqual(["40", "41", "40"]);
+   expect(spawned).toEqual(["40", "40"]);
    expect(r.journal.getWorker("40", REPO)?.status).toBe("claimed");
+   expect(r.journal.listResumeQueue().map(q => q.nodeId)).toEqual(["41"]);
+   r.journal.updateWorker("40", REPO, { status: "success" });
+   await tick();
+   expect(spawned).toEqual(["40", "40", "41"]);
    expect(r.journal.listResumeQueue()).toEqual([]);
    expect(r.journal.spawnsToday(now)).toBe(2);
   });
@@ -1080,7 +1166,9 @@ describe("workers.laneBusyLoad: each implement lane has its own busy load (node 
 
 test("a dependency-held map leaves an independent node eligible across ticks", async () => {
  await withRig(async r => {
-  r.queue("40"); r.queue("41", 460);
+  r.config.maps[1].lane = "visual";
+  r.queue("40"); r.worker("41", 460);
+  r.journal.enqueueResume({ nodeId: "41", repo: REPO, root: 460, lane: "visual" }, NOW);
   r.config.maps[0].reachable = "https://offline.invalid/models";
   r.config.maps[1].reachable = "https://online.invalid/models";
   const spawned: string[] = [];
@@ -1117,7 +1205,9 @@ test("when-free plus reset clears an exhausted hold before durable enqueue", asy
 
 test("selected Pi dependency holds before supervisor spawn without map reachable while an independent node starts", async () => {
  await withRig(async r => {
-  r.queue("40"); r.queue("41", 460);
+  r.config.maps[1].lane = "visual";
+  r.queue("40"); r.worker("41", 460);
+  r.journal.enqueueResume({ nodeId: "41", repo: REPO, root: 460, lane: "visual" }, NOW);
   const spawned: string[] = [];
   const probes: string[] = [];
   const tick = () => walk({ ...r, now: () => NOW,

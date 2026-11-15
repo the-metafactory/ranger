@@ -86,6 +86,25 @@ const inputs = (over: Partial<StateInputs> = {}): StateInputs => ({
 });
 
 describe("node #166 — the resume queue on the dashboard, and its head ahead of any claim", () => {
+ test("the lane heading names the held resume and its reason while the independent lane stays free", () => {
+  const reason = "review throttled until 2026-10-09T11:00:00.000Z: GitHub rate limit";
+  const state = assembleState(inputs({ resumeQueue: [queued(GAME, "40", "visual")], resumeHold: () => reason }));
+  expect(state.resumeQueue.visual.head).toMatchObject({ nodeId: "40", starts: false, holdsLane: true, reason });
+  expect(state.maps[0].next).toMatchObject({ waiting: true, reason: expect.stringContaining("held by queued resume #40") });
+  expect(state.maps[1].next).toMatchObject({ nodeId: "20", waiting: false });
+  const script = renderPage(TOKEN).split("<script>")[1].split("</script>")[0];
+  const render = script.slice(script.indexOf("function renderNext(s) {"), script.indexOf("async function pageVerb("));
+  const headings: string[] = [];
+  const draw = runInNewContext(render + "; renderNext;", {
+   document: { getElementById: () => ({ replaceChildren() {}, append() {} }) },
+   el: (tag: string, attrs: { text?: string }) => { if (tag === "h3") headings.push(attrs.text!); },
+   drainButton: () => null, laneQueue: () => null, byRepo: () => [],
+  });
+  draw(state);
+  expect(headings[0]).toContain(`visual lane · held by queued resume #40 (${GAME}): ${reason}`);
+  expect(headings[1]).toContain("headless lane · free");
+ });
+
  test("each lane lists its entries FIFO; a free lane's head is next and the frontier waits behind it", () => {
   const state = assembleState(inputs({
    resumeQueue: [queued(GAME, "40", "visual"), queued(TOOL, "50", "headless"), queued(GAME, "41", "visual")],
