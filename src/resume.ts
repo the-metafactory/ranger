@@ -232,21 +232,16 @@ export async function processResumeQueue(
    continue;
   }
   const hold = queueHoldReason(journal, config, entry, ctx.now?.() ?? new Date());
-  const holdKey = `resume-hold:${entry.repo}#${entry.nodeId}`;
   if (hold !== null) {
    owned();
    waiting.add(entry.lane);
    const takesLane = startsImplementSession(row);
    if (takesLane) reservations.add(entry.lane);
-   const held = JSON.stringify([entry.id, hold]);
-   if (journal.getHealth(holdKey) !== held) {
-    journal.recordEvent("sweep", { nodeId: entry.nodeId, repo: entry.repo,
-     detail: `queued resume #${entry.nodeId} ${takesLane ? `holds the ${entry.lane} implement lane` : "waits"}: ${hold}` });
-    journal.setHealth(holdKey, held);
-   }
+   journal.noteResumeHold(entry, hold, takesLane);
    continue;
   }
-  if (journal.getHealth(holdKey)) { owned(); journal.setHealth(holdKey, ""); }
+  owned();
+  journal.clearResumeHold(entry);
   // The lane holder is read at the start itself (startResumeNode), after the
   // forge checks, so a held lane still drops a closed node or merged PR.
   const spawnRefusal = spawnGate(journal, config, ctx.now?.() ?? new Date(), entry.lane);

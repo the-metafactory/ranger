@@ -14,7 +14,7 @@ import { LAST_IMPLEMENT_MAP } from "../src/maps.ts";
 import type { ChangeRequest, ForgePort } from "../src/forge.ts";
 import { walk } from "../src/walk.ts";
 import type { SpawnRunNodeArgs } from "../src/spawn.ts";
-import { activeRecovery, recordRecovery, nodeRecoveryScope, resetRecovery } from "../src/recovery.ts";
+import { activeRecovery, recordRecovery, nodeRecoveryScope } from "../src/recovery.ts";
 import { resumeNode } from "../src/resume.ts";
 import { recordThrottle, reviewCooldownScope } from "../src/budget.ts";
 import { assembleState, servedMaps, ServeReader, stateFromJournal } from "../src/serve.ts";
@@ -80,6 +80,7 @@ function pr(iid = 7): ChangeRequest {
 describe("queued resume holds its lane (node #538)", () => {
  test.each([
   ["throttled", false], ["recovery", false], ["throttled", true], ["recovery", true],
+  ["throttled with eligible recovery", false], ["throttled with eligible recovery", true],
  ] as const)("%s holds visual work while headless claims, then resumes first (conflict=%s)", async (hold, conflict) => {
   await withRig(async r => {
    r.config.maps[0].lane = "visual";
@@ -91,9 +92,12 @@ describe("queued resume holds its lane (node #538)", () => {
    r.frontier(1, ["50"]);
    r.frontier(460, ["60"]);
    let until: Date;
-   if (hold === "throttled") {
+   if (hold !== "recovery") {
     until = recordThrottle(r.journal, reviewCooldownScope(r.config, REPO), { cooldownMs: 60_000 }, NOW,
      { reason: () => "GitHub rate limit" }).until;
+    if (hold === "throttled with eligible recovery") recordRecovery(r.journal, nodeRecoveryScope(REPO, "40"), {
+     kind: "infrastructure", operation: "review", evidence: "review unavailable", action: "retry review",
+    }, { now: new Date(NOW.getTime() - 60_000) });
    } else {
     const recovery = recordRecovery(r.journal, nodeRecoveryScope(REPO, "40"), {
      kind: "infrastructure", operation: "review", evidence: "review unavailable", action: "retry review",
@@ -112,7 +116,7 @@ describe("queued resume holds its lane (node #538)", () => {
    expect(r.journal.getWorker("50", REPO)).toBeNull();
    expect(r.journal.listResumeQueue().map(q => q.nodeId)).toEqual(["40", "41"]);
    const event = r.journal.listNodeEvents(REPO, "40").find(e => e.detail?.includes("holds the visual implement lane"));
-   expect(event?.detail).toContain(hold === "throttled" ? "GitHub rate limit" : "retry review");
+   expect(event?.detail).toContain(hold === "recovery" ? "retry review" : "GitHub rate limit");
    const maps = servedMaps(r.config);
    const reader = new ServeReader(r.config, maps, r.config.state.journalPath);
    const state = stateFromJournal(r.config, maps, reader, NOW);
@@ -122,12 +126,35 @@ describe("queued resume holds its lane (node #538)", () => {
     reason: expect.stringContaining("held by queued resume #40") });
    r.frontier(460, []);
    spawned.length = 0;
-   if (hold === "recovery") resetRecovery(r.journal, nodeRecoveryScope(REPO, "40"));
+   const beforeExpiry = new Date(until.getTime() - 1);
+   expect(stateFromJournal(r.config, maps, reader, beforeExpiry).resumeQueue.visual.head).toMatchObject({ nodeId: "40", starts: false, holdsLane: true });
+   const held = await walk({ ...r, now: () => beforeExpiry, spawnRunNode });
+   expect(spawned).toEqual([]);
+   expect(held.maps.flatMap(m => m.claimed)).toEqual([]);
+   expect(r.journal.listNodeEvents(REPO, "40").filter(e => e.detail?.includes("holds the visual implement lane"))).toHaveLength(1);
    expect(stateFromJournal(r.config, maps, reader, until).resumeQueue.visual.head).toMatchObject({ nodeId: "40", starts: true });
    const expired = await walk({ ...r, now: () => until, spawnRunNode });
    expect(spawned).toEqual(["40"]);
    expect(expired.maps.flatMap(m => m.claimed)).toEqual([]);
    expect(r.journal.listResumeQueue().map(q => q.nodeId)).toEqual(["41"]);
+   expect(r.journal.getHealth(`resume-hold:${REPO}#40`)).toBeNull();
+  });
+ });
+
+ test.each(["cancel", "drop"] as const)("%s removes a waiting resume's hold bookkeeping", async removal => {
+  await withRig(async r => {
+   r.queue("40");
+   recordThrottle(r.journal, reviewCooldownScope(r.config, REPO), { cooldownMs: 60_000 }, NOW,
+    { reason: () => "GitHub rate limit" });
+   await walk({ ...r, now: () => NOW });
+   expect(r.journal.getHealth(`resume-hold:${REPO}#40`)).not.toBeNull();
+   if (removal === "cancel") await resumeNode("40", `${REPO}#1`, r, { cancel: true });
+   else {
+    r.config.maps[0].walk = "none";
+    await walk({ ...r, now: () => NOW });
+   }
+   expect(r.journal.getResume(REPO, "40")).toBeNull();
+   expect(r.journal.getHealth(`resume-hold:${REPO}#40`)).toBeNull();
   });
  });
 });
@@ -871,7 +898,6 @@ describe("resume-queue-starts-when-lane-frees", () => {
    expect(r.journal.spawnsToday(NOW)).toBe(0);
    fail = false;
    now = new Date(activeRecovery(r.journal, nodeRecoveryScope(REPO, "40"))!.nextEligibleAt!);
-   resetRecovery(r.journal, nodeRecoveryScope(REPO, "40"));
    await tick();
    expect(spawned).toEqual(["40", "40"]);
    expect(r.journal.getWorker("40", REPO)?.status).toBe("claimed");

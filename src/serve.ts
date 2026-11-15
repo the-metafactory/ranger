@@ -461,6 +461,13 @@ function planQueueHeads(
  return out;
 }
 
+function holderWaitReason(map: ServeMap, holder: NonNullable<TickSoFar["holders"][ImplementLane]>): string {
+ if (holder.holdReason !== undefined) return `the ${map.lane} implement lane is held by queued resume #${holder.nodeId} (${holder.repo}): ${holder.holdReason}`;
+ if (holder.resumed === true) return `waits for the ${map.lane} implement lane: this tick resumes queued #${holder.nodeId} (${holder.repo}) first`;
+ if (holder.thisTick) return `waits for the ${map.lane} implement lane: this tick claims #${holder.nodeId} (${holder.repo}) first`;
+ return `waits for the ${map.lane} implement lane, held by #${holder.nodeId} (${holder.repo})`;
+}
+
 function nextFor(
  map: ServeMap,
  report: MapRead | undefined,
@@ -516,13 +523,7 @@ function nextFor(
    url: plan.waiting.url,
    lane: "implement",
    waiting: true,
-   reason: holder.holdReason !== undefined
-    ? `the ${map.lane} implement lane is held by queued resume #${holder.nodeId} (${holder.repo}): ${holder.holdReason}`
-    : holder.resumed === true
-    ? `waits for the ${map.lane} implement lane: this tick resumes queued #${holder.nodeId} (${holder.repo}) first`
-    : holder.thisTick
-    ? `waits for the ${map.lane} implement lane: this tick claims #${holder.nodeId} (${holder.repo}) first`
-    : `waits for the ${map.lane} implement lane, held by #${holder.nodeId} (${holder.repo})`,
+   reason: holderWaitReason(map, holder),
   };
  }
  const vetoed = plan.vetoed.map((n) => `#${n.id}`);
