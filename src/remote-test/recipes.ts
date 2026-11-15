@@ -1,3 +1,5 @@
+import { CONTAINER_BOOTSTRAP_FLAGS } from "./isolation.ts";
+
 export const MYELIN_REPOSITORY = "github:github.com/the-metafactory/myelin";
 export const RANGER_REPOSITORY = "github:github.com/the-metafactory/ranger";
 export const CORTEX_REPOSITORY = "github:github.com/the-metafactory/cortex";
@@ -9,7 +11,7 @@ export const RANGER_OPT_IN_TEST_FILES = [
 ] as const;
 /** Every reviewed command starts with this prefix, so the checkout's own
  * bunfig.toml and .env never reach the process the recipe launches. */
-export const ISOLATED_BUN = ["bun", "--config=/dev/null", "--no-env-file"] as const;
+export const ISOLATED_BUN = ["bun", ...CONTAINER_BOOTSTRAP_FLAGS] as const;
 
 /** Cortex's reviewed gates from scripts/check.ts at 4b79b01a, minus `up-to-date`
  * (localOnly: it needs origin/main, which an immutable bundle does not carry).

@@ -29,8 +29,7 @@ test("cortex-v1 runs every non-localOnly check.ts gate offline without a sidecar
 test("every cortex check launches Bun with the checkout's own config disabled", () => {
  const checks = REVIEWED_RECIPES[CORTEX_REPOSITORY]["cortex-v1"].checks;
  expect(Object.keys(checks)).toEqual([...CORTEX_CHECKS]);
- for (const argv of Object.values(checks)) expect(argv.slice(argv.indexOf("bun"), argv.indexOf("bun") + 3)).toEqual([...ISOLATED_BUN]);
- for (const recipe of [REVIEWED_RECIPES[MYELIN_REPOSITORY]["myelin-v1"], REVIEWED_RECIPES[RANGER_REPOSITORY]["ranger-v1"]])
+ for (const recipe of [REVIEWED_RECIPES[CORTEX_REPOSITORY]["cortex-v1"], REVIEWED_RECIPES[MYELIN_REPOSITORY]["myelin-v1"], REVIEWED_RECIPES[RANGER_REPOSITORY]["ranger-v1"]])
   for (const argv of Object.values(recipe.checks)) expect(argv.slice(argv.indexOf("bun"), argv.indexOf("bun") + 3)).toEqual([...ISOLATED_BUN]);
 });
 

@@ -6,7 +6,8 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { runCmd } from "../src/exec.ts";
 import { stageSource } from "../src/remote-test/source.ts";
-import { CONTAINER_BOOTSTRAP_FLAGS, containerProgram, sidecarMetricsProgram, executeRemoteTest, podmanLauncher, reconcileRemoteTests, type ExecutorLauncher } from "../src/remote-test/executor.ts";
+import { containerProgram, sidecarMetricsProgram, executeRemoteTest, podmanLauncher, reconcileRemoteTests, type ExecutorLauncher } from "../src/remote-test/executor.ts";
+import { CONTAINER_BOOTSTRAP_FLAGS } from "../src/remote-test/isolation.ts";
 import { openJobLedger } from "../src/remote-test/job-ledger.ts";
 import { createReviewedProfile, MYELIN_REPOSITORY } from "../src/remote-test/profiles.ts";
 

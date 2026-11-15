@@ -11,10 +11,10 @@ import { BUS_WORKER_DIR, readBusWorkerOwner } from "./bus-worker-workspace.ts";
 import { restoreSource } from "./source.ts";
 import { ActiveRemoteTestJob, BusyRemoteTestExecutor, InterruptedRemoteTestJob, RevokedRemoteTestJob, openJobLedger, type JobLedger, type OwnedContainer } from "./job-ledger.ts";
 import { REMOTE_TEST_LIMITS, reviewedRecipe, profileBudgets, type ReviewedPolicy, type ContainerBudget } from "./profiles.ts";
+import { CONTAINER_BOOTSTRAP_FLAGS } from "./isolation.ts";
 import type { ReviewedRecipe } from "./recipes.ts";
 
 export const EXECUTOR_LIMITS = REMOTE_TEST_LIMITS;
-export const CONTAINER_BOOTSTRAP_FLAGS = ["--config=/dev/null", "--no-env-file"] as const;
 const ConfigSchema = z.object({
  executorId: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/),
  jobsRoot: z.string().refine(s => isAbsolute(s) && !/[\0,:\n]/.test(s) && !s.split("/").includes("..")),
