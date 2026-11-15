@@ -1,32 +1,41 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import type { ProfileManifest } from "./contract.ts";
+import { MYELIN_REPOSITORY, REVIEWED_RECIPES, type ReviewedRecipe } from "./recipes.ts";
+export { MYELIN_REPOSITORY } from "./recipes.ts";
 
 /** Recipes are code-reviewed policy, not submitter-supplied commands or env. */
 export const ReviewedPolicySchema = z.object({
- recipe: z.literal("myelin-v1"),
+ recipe: z.string().min(1).max(128),
+ repositoryId: z.string().min(1).max(512).optional(),
  runtime: z.literal("bun-1.3.14").default("bun-1.3.14"),
  cache: z.literal("disabled"),
  install: z.literal("frozen-offline-copy"),
- checks: z.array(z.enum(["unit", "integration", "typecheck", "lint"])).length(4)
-  .refine(a => new Set(a).size === 4),
- sidecars: z.tuple([z.object({ kind: z.literal("nats"),
+ checks: z.array(z.enum(["unit", "integration", "typecheck", "lint"])).min(1).max(4)
+  .refine(a => new Set(a).size === a.length),
+ sidecars: z.array(z.object({ kind: z.literal("nats"),
   imageReference: z.string().regex(/^[a-z0-9][a-z0-9./:_-]*@sha256:[a-f0-9]{64}$/),
- }).strict()]),
+ }).strict()).max(1),
 }).strict();
 export type ReviewedPolicy = z.infer<typeof ReviewedPolicySchema>;
-export const MYELIN_REPOSITORY = "github:github.com/the-metafactory/myelin";
 export const FROZEN_INSTALL = ["bun", "--config=/dev/null", "--no-env-file", "install", "--frozen-lockfile", "--offline", "--ignore-scripts", "--backend=copyfile", "--cache-dir=/tmp/ranger-install"] as [string, ...string[]];
+
+export function reviewedRecipe(policy: Pick<ReviewedPolicy, "recipe" | "repositoryId">): { repositoryId: string; recipe: ReviewedRecipe } {
+ const repositoryId = policy.repositoryId ?? MYELIN_REPOSITORY;
+ if (!Object.hasOwn(REVIEWED_RECIPES, repositoryId) || !Object.hasOwn(REVIEWED_RECIPES[repositoryId], policy.recipe)) throw Error("Unknown reviewed recipe");
+ return { repositoryId, recipe: REVIEWED_RECIPES[repositoryId][policy.recipe] };
+}
 
 export function reviewedCommands(input: unknown): [string, ...string[]][] {
  const p = ReviewedPolicySchema.parse(input);
- const recipes: Record<ReviewedPolicy["checks"][number], [string, ...string[]]> = {
-  unit: ["bun", "--config=/dev/null", "--no-env-file", "test", "./src", "./scripts", "./tools", "./tests/package-exports.smoke.test.ts"],
-  integration: ["bun", "--config=/dev/null", "--no-env-file", "test", "./tests/integration"],
-  typecheck: ["bun", "--config=/dev/null", "--no-env-file", "./node_modules/typescript/bin/tsc", "--noEmit"],
-  lint: ["bun", "--config=/dev/null", "--no-env-file", "./node_modules/eslint/bin/eslint.js", "."],
- };
- return [[...FROZEN_INSTALL], ...p.checks.map(check => [...recipes[check]] as [string, ...string[]])];
+ const { recipe } = reviewedRecipe(p);
+ if (p.checks.length !== Object.keys(recipe.checks).length || p.checks.some(check => !Object.hasOwn(recipe.checks, check))) throw Error("Reviewed recipe checks mismatch");
+ if (p.sidecars.length !== (recipe.needsNats ? 1 : 0)) throw Error("Reviewed recipe sidecars mismatch");
+ return [[...FROZEN_INSTALL], ...p.checks.map(check => {
+  const command = recipe.checks[check];
+  if (!command) throw Error("Reviewed recipe check command missing");
+  return [...command] as [string, ...string[]];
+ })];
 }
 
 function canonical(value: unknown): string {
@@ -54,6 +63,6 @@ export interface ContainerBudget { cpuCores: number; memoryBytes: number; pids: 
 export const REMOTE_TEST_LIMITS = { cpuCores: 2, memoryBytes: 1610612736, pids: 256, timeoutMs: 600_000 } as const;
 export function profileBudgets(reviewed?: ReviewedPolicy): { test: ContainerBudget; nats?: ContainerBudget } {
  const nats = { cpuCores: 0.25, memoryBytes: 268435456, pids: 32 };
- return reviewed ? { test: { cpuCores: REMOTE_TEST_LIMITS.cpuCores - nats.cpuCores, memoryBytes: REMOTE_TEST_LIMITS.memoryBytes - nats.memoryBytes, pids: REMOTE_TEST_LIMITS.pids - nats.pids }, nats }
+ return reviewed?.sidecars.length ? { test: { cpuCores: REMOTE_TEST_LIMITS.cpuCores - nats.cpuCores, memoryBytes: REMOTE_TEST_LIMITS.memoryBytes - nats.memoryBytes, pids: REMOTE_TEST_LIMITS.pids - nats.pids }, nats }
   : { test: { cpuCores: REMOTE_TEST_LIMITS.cpuCores, memoryBytes: REMOTE_TEST_LIMITS.memoryBytes, pids: REMOTE_TEST_LIMITS.pids } };
 }
