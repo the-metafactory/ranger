@@ -481,6 +481,16 @@ describe("scribeAfterMerge: the Scribe's pass before the close", () => {
   expect(receipt).toContain("Marker comments: the merge added 1, filed as node #301 below this node.");
  });
 
+ test("the close receipt lists the defaults the PR body recorded", async () => {
+  const body = ["Implements node 1", "", "## Defaults taken", "", "Overturn one.", "", "- a grey badge, because it matches the card"].join("\n");
+  const receipt = closeResolution(ctx, { ...pr(), body, headSha: "c".repeat(40), mergedBy: "ivy-agent", state: "merged" } as never, REVIEW, 2,
+   { state: "green", runId: 1, runUrl: "u", runName: "build", snapshot: "" }, undefined, {});
+  expect(receipt).toContain("- Defaults taken (1), listed on the PR:\n  - a grey badge, because it matches the card");
+  const none = closeResolution(ctx, { ...pr(), headSha: "c".repeat(40), mergedBy: "ivy-agent", state: "merged" } as never, REVIEW, 2,
+   { state: "green", runId: 1, runUrl: "u", runName: "build", snapshot: "" }, undefined, {});
+  expect(none).not.toContain("Defaults taken");
+ });
+
  test("ranger#357: a settled round files nothing: its majors stay on the PR, journalled", async () => {
   const filings = await scribeAfterMerge(ctx, { ...pr(), mergeCommitSha: null }, { ...REVIEW, settled: 1 });
   expect(filings).toEqual({});

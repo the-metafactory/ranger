@@ -76,6 +76,7 @@ import { FixNodeLockBusy, withFixNodeLock } from "./fix-node-lock.ts";
 import { assertFilable, codeCommentSpec, fileBlockedPrerequisite, foundByProbeSpec, landminesInDiff, parkIdentity, scribeFile, splitOutOfReviewSpec, type PrerequisiteFiling, type Provenance, type ScribeGraph } from "./scribe.ts";
 import { FencedError, type EventKind, type ImplementPhase, type Journal } from "./journal.ts";
 import { assembleImplementPrompt } from "./prompt.ts";
+import { branchDefaults, defaultsFromBody, defaultsSection } from "./defaults.ts";
 import { BLOCKED_REPORT_FILE, blockerNoteBranch, discardBlockedReport, readBlockedReport, type BlockedReport } from "./blocked-report.ts";
 import { ReviewError, sageReview, type ReviewVerdict } from "./review.ts";
 import { SUSPICIOUS_REVIEW_ROUND } from "./review-round.ts";
@@ -1056,8 +1057,7 @@ function leftWork(r: { blockers: number; majors: number; nits: number; body: str
  * marker comments the merge commit added (code-comment-graduated), each one
  * `propose` node below this node. A round that left only nits and
  * suggestions files nothing, whatever their round impact: they stay on the
- * change, journalled and named in the receipt (principal, 2026-11-15: 67 of
- * 68 split-out nodes held no blocker or major, and each grew the map). Best effort: a failed filing is journalled and
+ * change, journalled and named in the receipt. Best effort: a failed filing is journalled and
  * named in the receipt, and the close goes on. A superseded supervisor stops
  * here (FencedError).
  */
@@ -1553,7 +1553,8 @@ async function runImplementFlow(ctx: ImplementContext): Promise<ImplementOutcome
   // Work an earlier run built and committed, but never pushed, is adopted
   // when it passes the supervisor's checks (#691: its tests failed under
   // load; a fresh worker would find nothing to commit and fail again).
-  const built = (await adoptBuiltWork(ctx, testCommand)) ?? (await workerPass(ctx, testCommand, { kind: "build" }));
+  let built = (await adoptBuiltWork(ctx, testCommand)) ?? (await workerPass(ctx, testCommand, { kind: "build" }));
+  if (built.refusedRuling !== undefined) built = await workerPass(ctx, testCommand, { kind: "build", refusedPark: built.refusedRuling });
   workerExit = built.workerExit;
   if (built.failure !== undefined) return built.failure;
 
@@ -2013,7 +2014,7 @@ async function runImplementFlow(ctx: ImplementContext): Promise<ImplementOutcome
 
  // ---- ready → awaiting merge ----
  fence("mark ready");
- const body = refuseClosingKeyword(ctx, `the ready ${changeRequestNoun(repo)} description`, readyBody(ctx, final, reviewRounds(reviews), probe));
+ const body = refuseClosingKeyword(ctx, `the ready ${changeRequestNoun(repo)} description`, readyBody(ctx, final, reviewRounds(reviews), probe, await branchDefaults(worktree, map.base)));
  await github.updatePrBody(repo, open.iid, body, token);
  await github.markReady(repo, await github.getPr(repo, open.iid, token), token);
  journal.updateWorker(nodeId, ctx.map.repo, {
@@ -2763,6 +2764,7 @@ interface PassResult {
  adopted?: boolean;
  /** A CI or probe fix pass that exited 0 and committed nothing: the red is not the branch's to fix. */
  unchanged?: boolean;
+ refusedRuling?: string;
 }
 
 async function selectReviewSubstrate(
@@ -2794,9 +2796,13 @@ function recordHead(ctx: ImplementContext, sha: string): void {
  });
 }
 
+export function refusesRulingPark(spec: WorkerPassSpec, report: BlockedReport): boolean {
+ return spec.kind === "build" && spec.refusedPark === undefined && report.ruling === true && report.rulingClass === undefined;
+}
+
 /** What a worker session is for: the build, a fix pass answering a sage round, a red CI or failed probes, or a base merge. */
 type WorkerPassSpec =
- | { kind: "build" }
+ | { kind: "build"; refusedPark?: string }
  | { kind: "fix"; round: number; body: string; rulings: string[] }
  | { kind: "finish-fix"; round: number; red: string; body: string; rulings: string[] }
  | { kind: "ci-fix"; red: string; reason: string; log: string; rulings: string[] }
@@ -2913,6 +2919,7 @@ async function checkedWorkerPass(
    : {}),
   ...(spec.kind === "ci-fix" ? { ciFix: { head: spec.red, reason: spec.reason, log: spec.log, base: map.base }, rulings: spec.rulings } : {}),
   ...(spec.kind === "probe-fix" ? { probeFix: { head: spec.red, failed: spec.failed, summary: spec.summary }, rulings: spec.rulings } : {}),
+  ...(spec.kind === "build" && spec.refusedPark !== undefined ? { refusedPark: spec.refusedPark } : {}),
   ...(spec.kind === "base-merge" ? { baseMerge: { base: spec.base, files: spec.files, ...(spec.stale === undefined ? {} : { stale: spec.stale }) } } : {}),
   probeTier: map.commands.probe !== undefined,
   remoteTests: remoteTests(ctx),
@@ -2960,6 +2967,11 @@ async function checkedWorkerPass(
  // The worker said the node cannot be done yet: park on its reason, before
  // any commit it made is tested or pushed.
  const blocked = result.code === 0 ? readBlockedReport(worktree) : null;
+ if (blocked !== null && refusesRulingPark(spec, blocked) && (await blockerNoteBranch(worktree, map.base)) === null && await headSha(worktree) === before) {
+  journal.recordEvent("refused", { nodeId, repo: map.repo, detail: `${pass} parked on a ruling with no class: refused, the build runs once more and takes a default`.slice(0, 400) });
+  discardBlockedReport(worktree);
+  return { workerExit: result.code, snapshot, sha: before, refusedRuling: blocked.reason };
+ }
  if (blocked !== null) throw await blockedPark(ctx, pass, blocked, { dropNote: (await blockerNoteBranch(worktree, map.base)) !== null, log });
  if (result.code !== 0) {
   // Mid-session cap (node #45): only the substrate's own signal says so, and
@@ -4379,6 +4391,7 @@ export function readyBody(
  final: RecordedReview,
  rounds: number,
  probe?: RecordedProbe,
+ defaults: readonly string[] = [],
 ): string {
  const noun = changeRequestNoun(ctx.map.repo);
  const ratify = ctx.map.autoMerge
@@ -4397,7 +4410,13 @@ export function readyBody(
   "",
   // GitLab's merge method may add its own merge commit beside the squash one.
   `${forgeName(ctx.map.repo) === "GitLab" ? "Squash-merge lands the node's commits as one squash commit; the project's merge method may add a merge commit beside it." : "Squash-merge keeps one commit per node."} The node is not referenced with a closing keyword on purpose: the close goes through the graph's gate.`,
+  ...defaultsSection(defaults),
  ].join("\n");
+}
+
+function defaultsReceipt(body: string | undefined): string[] {
+ const defaults = defaultsFromBody(body);
+ return defaults.length === 0 ? [] : [`- Defaults taken (${defaults.length}), listed on the PR:`, ...defaults.map((d) => `  - ${d}`)];
 }
 
 function unfixedFindingsLine(ctx: ImplementContext, pr: ChangeRequest, final: RecordedReview | undefined, review: ScribeFilings["review"]): string {
@@ -4438,6 +4457,7 @@ export function closeResolution(
   ...probeLine(ctx, probe),
   `- Ratification: ${ctx.ratify === "merge" ? `${ratificationText(ctx, pr)}.` : "auto node; declared probes and CI."}`,
   `- Unfixed review findings: ${deferred}`,
+  ...defaultsReceipt(pr.body),
   ...landmineLine,
  ].join("\n");
 }
