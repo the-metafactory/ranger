@@ -4423,6 +4423,32 @@ describe("implement lane (node #23)", () => {
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
  }, 60_000);
 
+ test("a ruling park that names no class is refused once: the worker takes a default and the PR lists it (principal, 2026-11-15)", async () => {
+  const r = await rig({});
+  cleanup.push(r.dir);
+  r.ctx.workerCommand = [implementWorker, "ruling-unclassed"];
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  const body = r.github.prs.get(1)?.body ?? "";
+  expect(body).toContain("## Defaults taken");
+  expect(body).toContain("- a grey badge, because it matches the card");
+  const events = r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.startsWith("build pass parked on a ruling with no class: refused"))).toBe(true);
+ }, 60_000);
+
+ test("a worker that insists on an unclassed ruling parks on the retry, and a classed ruling parks at once", async () => {
+  const insists = await rig({});
+  cleanup.push(insists.dir);
+  insists.ctx.workerCommand = [implementWorker, "ruling-insists"];
+  expect((await runNode("20", insists.ctx)).status).toBe("parked");
+  expect(insists.github.prs.size).toBe(0);
+  const classed = await rig({});
+  cleanup.push(classed.dir);
+  classed.ctx.workerCommand = [implementWorker, "ruling-security"];
+  expect((await runNode("20", classed.ctx)).status).toBe("parked");
+  const events = classed.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
+  expect(events.some((d) => d.includes("ruling with no class"))).toBe(false);
+ }, 120_000);
+
  test("a blocked park files its missing prerequisite as a propose node below the parked node's parent and blocks it (node #514)", async () => {
   const r = await rig({ parent: "5" });
   cleanup.push(r.dir);
