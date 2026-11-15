@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCmd } from "../src/exec.ts";
 import { ResourceObservationSchema } from "../src/remote-test/contract.ts";
-import { CONTAINER_BOOTSTRAP_FLAGS, containerProgram } from "../src/remote-test/executor.ts";
+import { containerProgram } from "../src/remote-test/executor.ts";
+import { CONTAINER_BOOTSTRAP_FLAGS } from "../src/remote-test/isolation.ts";
 
 const roots: string[] = [];
 afterEach(async () => { for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });

@@ -9,12 +9,14 @@ function check(name: string, run: () => void): void {
 
 const repository = "github:github.com/example/fixture";
 const otherRepository = "github:github.com/example/other";
-const fixtureRecipe = { needsNats: false, checks: { unit: ["bun", "--config=/dev/null", "--no-env-file", "test", "./test"] as const } };
+const fixtureRecipe = { packageName: "fixture", scripts: {}, testRoots: ["test/"], needsNats: false,
+ checks: { unit: ["bun", "--config=/dev/null", "--no-env-file", "test", "./test"] as const } };
 const registry: ReviewedRecipeRegistry = {
  ...REVIEWED_RECIPES,
  [repository]: {
   "fixture-v1": fixtureRecipe,
-  "fixture-nats-v1": { needsNats: true, checks: { integration: ["bun", "--config=/dev/null", "--no-env-file", "test", "./bus-test"] } },
+  "fixture-nats-v1": { ...fixtureRecipe, needsNats: true,
+   checks: { integration: ["bun", "--config=/dev/null", "--no-env-file", "test", "./bus-test"] } },
  },
  [otherRepository]: { "fixture-v1": fixtureRecipe },
 };

@@ -11,7 +11,7 @@ export const ReviewedPolicySchema = z.object({
  runtime: z.literal("bun-1.3.14").default("bun-1.3.14"),
  cache: z.literal("disabled"),
  install: z.literal("frozen-offline-copy"),
- checks: z.array(z.enum(["unit", "integration", "typecheck", "lint"])).min(1).max(4)
+ checks: z.array(z.string().regex(/^[a-z][a-z0-9-]{0,63}$/)).min(1).max(32)
   .refine(a => new Set(a).size === a.length),
  sidecars: z.array(z.object({ kind: z.literal("nats"),
   imageReference: z.string().regex(/^[a-z0-9][a-z0-9./:_-]*@sha256:[a-f0-9]{64}$/),
@@ -32,9 +32,7 @@ export function reviewedCommands(input: unknown): [string, ...string[]][] {
  if (p.checks.length !== Object.keys(recipe.checks).length || p.checks.some(check => !Object.hasOwn(recipe.checks, check))) throw Error("Reviewed recipe checks mismatch");
  if (p.sidecars.length !== (recipe.needsNats ? 1 : 0)) throw Error("Reviewed recipe sidecars mismatch");
  return [[...FROZEN_INSTALL], ...p.checks.map(check => {
-  const command = recipe.checks[check];
-  if (!command) throw Error("Reviewed recipe check command missing");
-  return [...command] as [string, ...string[]];
+  return [...recipe.checks[check]] as [string, ...string[]];
  })];
 }
 
