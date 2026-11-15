@@ -7,7 +7,9 @@ export const RANGER_OPT_IN_TEST_FILES = [
  "test/remote-test-ssh-integration.test.ts",
  "test/remote-test-bus-worker-transport.test.ts",
 ] as const;
-const RANGER_BUN = ["bun", "--config=/dev/null", "--no-env-file"] as const;
+/** Every reviewed command starts with this prefix, so the checkout's own
+ * bunfig.toml and .env never reach the process the recipe launches. */
+export const ISOLATED_BUN = ["bun", "--config=/dev/null", "--no-env-file"] as const;
 
 /** Cortex's reviewed gates from scripts/check.ts at 4b79b01a, minus `up-to-date`
  * (localOnly: it needs origin/main, which an immutable bundle does not carry).
@@ -71,7 +73,15 @@ export interface ReviewedRecipe {
 }
 export type ReviewedRecipeRegistry = Readonly<Record<string, Readonly<Record<string, ReviewedRecipe>>>>;
 
-const CORTEX_BUN = ["bun", "--no-env-file"] as const;
+const CORTEX_GATE_ENV: Readonly<Partial<Record<string, readonly string[]>>> = {
+ lint: ["LINT_BASE_REF=HEAD^"],
+ sdk: ["RELEASE_PINS_BASE_REF=HEAD^", "DESK_SDK_BASE_REF=HEAD^"],
+};
+const cortexGate = (gate: string): [string, ...string[]] => {
+ const argv: [string, ...string[]] = [...ISOLATED_BUN, "scripts/check.ts", gate];
+ const baseRefs = CORTEX_GATE_ENV[gate];
+ return baseRefs ? ["env", ...baseRefs, ...argv] : argv;
+};
 
 export const REVIEWED_RECIPES: ReviewedRecipeRegistry = {
  [MYELIN_REPOSITORY]: { "myelin-v1": {
@@ -79,16 +89,16 @@ export const REVIEWED_RECIPES: ReviewedRecipeRegistry = {
   scripts: { test: "bun test", typecheck: "bunx tsc --noEmit", lint: "eslint ." },
   testRoots: ["src/", "scripts/", "tools/", "tests/integration/", "tests/package-exports.smoke.test.ts"],
   needsNats: true, checks: {
-   unit: ["bun", "--config=/dev/null", "--no-env-file", "test", "./src", "./scripts", "./tools", "./tests/package-exports.smoke.test.ts"],
-   integration: ["bun", "--config=/dev/null", "--no-env-file", "test", "./tests/integration"],
-   typecheck: ["bun", "--config=/dev/null", "--no-env-file", "./node_modules/typescript/bin/tsc", "--noEmit"],
-   lint: ["bun", "--config=/dev/null", "--no-env-file", "./node_modules/eslint/bin/eslint.js", "."],
+   unit: [...ISOLATED_BUN, "test", "./src", "./scripts", "./tools", "./tests/package-exports.smoke.test.ts"],
+   integration: [...ISOLATED_BUN, "test", "./tests/integration"],
+   typecheck: [...ISOLATED_BUN, "./node_modules/typescript/bin/tsc", "--noEmit"],
+   lint: [...ISOLATED_BUN, "./node_modules/eslint/bin/eslint.js", "."],
   } } },
  [RANGER_REPOSITORY]: { "ranger-v1": {
   packageName: "@the-metafactory/ranger", scripts: {}, testRoots: ["test/"], needsNats: false, checks: {
-   unit: [...RANGER_BUN, "test", "--preload=./test/preload.ts", "--randomize", "--parallel=2", "--timeout=60000", ...RANGER_OPT_IN_TEST_FILES.flatMap(file => ["--path-ignore-patterns", file])] as [string, ...string[]],
-   typecheck: [...RANGER_BUN, "./node_modules/typescript/bin/tsc", "--noEmit"],
-   lint: [...RANGER_BUN, "./node_modules/eslint/bin/eslint.js", "."],
+   unit: [...ISOLATED_BUN, "test", "--preload=./test/preload.ts", "--randomize", "--parallel=2", "--timeout=60000", ...RANGER_OPT_IN_TEST_FILES.flatMap(file => ["--path-ignore-patterns", file])],
+   typecheck: [...ISOLATED_BUN, "./node_modules/typescript/bin/tsc", "--noEmit"],
+   lint: [...ISOLATED_BUN, "./node_modules/eslint/bin/eslint.js", "."],
   } } },
  [CORTEX_REPOSITORY]: { "cortex-v1": {
   packageName: "@the-metafactory/cortex",
@@ -99,19 +109,13 @@ export const REVIEWED_RECIPES: ReviewedRecipeRegistry = {
    "desk:dts:check": "bun scripts/gen-desk-sdk-dts.ts --check",
   },
   testRoots: ["src/", "scripts/", "eslint/"], needsNats: false, checks: {
-   lint: ["env", "LINT_BASE_REF=HEAD^", ...CORTEX_BUN, "scripts/check.ts", "lint"],
-   duplication: [...CORTEX_BUN, "scripts/check.ts", "duplication"],
-   "unused-exports": [...CORTEX_BUN, "scripts/check.ts", "unused-exports"],
-   typecheck: [...CORTEX_BUN, "scripts/check.ts", "typecheck"],
-   vocab: [...CORTEX_BUN, "scripts/check.ts", "vocab"],
-   sdk: ["env", "RELEASE_PINS_BASE_REF=HEAD^", "DESK_SDK_BASE_REF=HEAD^", ...CORTEX_BUN, "scripts/check.ts", "sdk"],
-   shippable: [...CORTEX_BUN, "scripts/check.ts", "shippable"],
-   xdg: [...CORTEX_BUN, "scripts/check.ts", "xdg"],
-   "test-wake": [...CORTEX_BUN, "scripts/build-desk-wake.ts"],
-   "test-wake-cache": [...CORTEX_BUN, "scripts/desk-wake/probe-build-cache.ts"],
-   "test-desk-probes": [...CORTEX_BUN, "scripts/check-desk-probes.ts"],
-   "test-conversation-tools": [...CORTEX_BUN, "scripts/probe-conversation-tools.ts"],
-   test: [...CORTEX_BUN, "run", "test", "--parallel=2", ...CORTEX_EXCLUDED_TESTS.flatMap(({ file }) => ["--path-ignore-patterns", file]),
+   ...Object.fromEntries(CORTEX_GATES.map(gate => [gate, cortexGate(gate)])),
+   "test-wake": [...ISOLATED_BUN, "scripts/build-desk-wake.ts"],
+   "test-wake-cache": [...ISOLATED_BUN, "scripts/desk-wake/probe-build-cache.ts"],
+   "test-desk-probes": [...ISOLATED_BUN, "scripts/check-desk-probes.ts"],
+   "test-conversation-tools": [...ISOLATED_BUN, "scripts/probe-conversation-tools.ts"],
+   test: [...ISOLATED_BUN, "run", "test", "--config=/dev/null", "--preload=./scripts/test-preload.ts", "--parallel=2",
+    ...CORTEX_EXCLUDED_TESTS.flatMap(({ file }) => ["--path-ignore-patterns", file]),
     `--test-name-pattern=${CORTEX_TEST_NAME_PATTERN}`],
   } } },
 };

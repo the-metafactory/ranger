@@ -3,7 +3,7 @@ import { containerProgram, recipePackageRefusal, unresolvedTestRoot } from "../s
 import { createReviewedProfile, validateReviewedManifest } from "../src/remote-test/profiles.ts";
 import {
  CORTEX_CHECKS, CORTEX_EXCLUDED_TESTS, CORTEX_GATES, CORTEX_REPOSITORY, CORTEX_SKIPPED_TEST_NAME, CORTEX_TEST_NAME_PATTERN,
- REVIEWED_RECIPES,
+ CORTEX_TEST_STEPS, ISOLATED_BUN, MYELIN_REPOSITORY, RANGER_REPOSITORY, REVIEWED_RECIPES,
 } from "../src/remote-test/recipes.ts";
 import { digest } from "./fixtures/remote-test-recipe-inputs.ts";
 
@@ -26,6 +26,22 @@ test("cortex-v1 runs every non-localOnly check.ts gate offline without a sidecar
  expect(REVIEWED_RECIPES[CORTEX_REPOSITORY]["cortex-v1"].needsNats).toBe(false);
 });
 
+test("every cortex check launches Bun with the checkout's own config disabled", () => {
+ const checks = REVIEWED_RECIPES[CORTEX_REPOSITORY]["cortex-v1"].checks;
+ expect(Object.keys(checks)).toEqual([...CORTEX_CHECKS]);
+ for (const argv of Object.values(checks)) expect(argv.slice(argv.indexOf("bun"), argv.indexOf("bun") + 3)).toEqual([...ISOLATED_BUN]);
+ for (const recipe of [REVIEWED_RECIPES[MYELIN_REPOSITORY]["myelin-v1"], REVIEWED_RECIPES[RANGER_REPOSITORY]["ranger-v1"]])
+  for (const argv of Object.values(recipe.checks)) expect(argv.slice(argv.indexOf("bun"), argv.indexOf("bun") + 3)).toEqual([...ISOLATED_BUN]);
+});
+
+test("the test step disables the checkout's bunfig in the suite process and loads cortex's preload itself", () => {
+ const checks = REVIEWED_RECIPES[CORTEX_REPOSITORY]["cortex-v1"].checks;
+ const [test] = createReviewedProfile(input).commands.filter(command => command.includes("run"));
+ expect(test.slice(0, 6)).toEqual([...ISOLATED_BUN, "run", "test", "--config=/dev/null"]);
+ expect(test).toContain("--preload=./scripts/test-preload.ts");
+ for (const step of CORTEX_TEST_STEPS.slice(0, -1)) expect(checks[step].slice(0, 3)).toEqual([...ISOLATED_BUN]);
+});
+
 test("the base-ref ratchets read the submitted commit's parent through their own override", () => {
  const checks = REVIEWED_RECIPES[CORTEX_REPOSITORY]["cortex-v1"].checks;
  expect(checks.lint.slice(0, 2)).toEqual(["env", "LINT_BASE_REF=HEAD^"]);
@@ -35,7 +51,7 @@ test("the base-ref ratchets read the submitted commit's parent through their own
 
 test("the test step mirrors scripts/check.ts and names every exclusion", () => {
  const [test] = createReviewedProfile(input).commands.filter(command => command.includes("run"));
- expect(test.slice(0, 4)).toEqual(["bun", "--no-env-file", "run", "test"]);
+ expect(test.slice(3, 6)).toEqual(["run", "test", "--config=/dev/null"]);
  expect(test).toContain("--parallel=2");
  const ignored = test.flatMap((arg, index) => (test[index - 1] === "--path-ignore-patterns" ? [arg] : []));
  expect(ignored).toEqual(CORTEX_EXCLUDED_TESTS.map(({ file }) => file));
