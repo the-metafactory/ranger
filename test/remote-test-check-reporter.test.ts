@@ -391,7 +391,7 @@ console.log(JSON.stringify(exchanges));
  for (const args of calls) {
   expect(args).toEqual(expect.arrayContaining(["api", "--hostname", "github.example.test"]));
  }
- expect(calls[0]).toEqual(["api", `https://github.example.test/api/v3/repos/example/repo/commits/${COMMIT}/check-runs?check_name=clawbox%2Funit&app_id=9&per_page=100`, "--paginate", "--slurp", "--hostname", "github.example.test"]);
+ expect(calls[0]).toEqual(["api", `https://github.example.test/api/v3/repos/example/repo/commits/${COMMIT}/check-runs?check_name=clawbox%2Funit&app_id=9&per_page=100`, "--paginate", "--slurp", "--hostname", "github.example.test", "--include"]);
 });
 
 test("the installation token exchange labels a refusal, a timeout, a network failure and a malformed body without the JWT or the token", async () => {

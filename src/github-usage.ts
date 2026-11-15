@@ -1,5 +1,6 @@
 import { appendFileSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { createHash } from "node:crypto";
 import { runCmd, type RunResult } from "./exec.ts";
 
 export const MAX_DAY_BYTES = 16 * 1024 * 1024;
@@ -86,7 +87,7 @@ const stderrLine = (line: string): void => { process.stderr.write(`${line}\n`); 
 
 let active: ActiveUsage | null = null;
 
-/** Start recording this process's calls, or stop with null. Calls are unchanged while stopped. */
+/** Start recording this process's calls, or stop recording with null. */
 export function configureGitHubUsage(config: UsageConfig | null): void {
  active = config === null ? null : { directory: config.directory, command: config.command, notice: config.notice ?? stderrLine, pruned: false, noticed: false };
 }
@@ -245,6 +246,37 @@ function recordResponses(usage: ActiveUsage, spec: UsageSpec, args: string[], re
  });
 }
 
+export const githubTokenFingerprint = (token: string): string => createHash("sha256").update(token).digest("hex");
+
+export class GitHubCoreCooldown {
+ private readonly tokens = new Map<string, number>();
+
+ constructor(private readonly now: () => number = Date.now) {}
+
+ activeUntil(token: string | undefined): number | undefined {
+  const now = this.now();
+  for (const [key, until] of this.tokens) {
+   if (until <= now) this.tokens.delete(key);
+  }
+  return token === undefined ? undefined : this.tokens.get(githubTokenFingerprint(token));
+ }
+
+ observe(token: string | undefined, heads: ResponseHead[]): void {
+  if (token === undefined) return;
+  for (const head of heads) {
+   const remaining = numberHeader(head, "x-ratelimit-remaining");
+   const reset = numberHeader(head, "x-ratelimit-reset");
+   const resource = head.headers.get("x-ratelimit-resource");
+   if (remaining === 0 && (resource === undefined || resource === "core") && reset !== undefined && Number.isSafeInteger(reset * 1000) && reset * 1000 > this.now()) {
+    const key = githubTokenFingerprint(token);
+    this.tokens.set(key, Math.max(this.tokens.get(key) ?? 0, reset * 1000));
+   }
+  }
+ }
+}
+
+export const githubCoreCooldown = new GitHubCoreCooldown();
+
 /**
  * `runCmd` for one `gh api` request that records what the request cost. It adds
  * `--include` to read the rate-limit headers and strips them again, so a caller
@@ -256,20 +288,27 @@ function recordResponses(usage: ActiveUsage, spec: UsageSpec, args: string[], re
  * `--paginate` gets no `--include`, since `gh` stops merging its pages under that
  * flag; it counts as one call of unknown cost.
  */
-export function meteredGh(spec: UsageSpec, base: typeof runCmd = runCmd): typeof runCmd {
+export function meteredGh(spec: UsageSpec, base: typeof runCmd = runCmd, cooldown: GitHubCoreCooldown = githubCoreCooldown): typeof runCmd {
  return async (bin, args, opts) => {
   const usage = active;
-  if (usage === null) return base(bin, args, opts);
+  const env = opts?.env ?? process.env;
+  const token = env.GH_TOKEN ?? env.GITHUB_TOKEN;
+  const until = cooldown.activeUntil(token);
+  if (until !== undefined) {
+   return { code: 1, stdout: "", stderr: `GitHub API rate limit exceeded: core allowance spent until ${new Date(until).toISOString()}` };
+  }
+  if (usage === null && token === undefined) return base(bin, args, opts);
   const paginated = args.includes("--paginate");
   if (paginated && !args.includes("--slurp")) {
    const plain = await base(bin, args, opts);
-   recordResponses(usage, spec, args, plain, []);
+   if (usage !== null) recordResponses(usage, spec, args, plain, []);
    return plain;
   }
   const askedForHeads = args.includes("--include") || args.includes("-i");
   const result = await base(bin, askedForHeads ? args : [...args, "--include"], opts);
   const { heads, body } = splitResponseHeads(result.stdout, paginated);
-  recordResponses(usage, spec, args, result, heads);
+  cooldown.observe(token, heads);
+  if (usage !== null) recordResponses(usage, spec, args, result, heads);
   return askedForHeads ? result : { ...result, stdout: body };
  };
 }

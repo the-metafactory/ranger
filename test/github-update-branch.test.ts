@@ -10,13 +10,13 @@ const BASE = "c".repeat(40);
 const pr = (head = SHA, base = "main") => ({ number: 7, head: { sha: head }, base: { ref: base }, mergeable: true, mergeable_state: "behind" });
 const commit = { sha: UPDATED, parents: [{ sha: SHA }, { sha: BASE }] };
 interface Reply { args: string[]; body: unknown; status?: number; code?: number }
-const readPr = (head = SHA, base = "main"): Reply => ({ args: ["repos/acme/widgets/pulls/7"], body: pr(head, base) });
+const readPr = (head = SHA, base = "main"): Reply => ({ args: ["repos/acme/widgets/pulls/7", "--include"], body: pr(head, base) });
 const request = (status = 202, message = "Updating pull request branch."): Reply => ({
  args: ["repos/acme/widgets/pulls/7/update-branch", "--method", "PUT", "-f", `expected_head_sha=${SHA}`, "--include"],
  body: { message }, status, code: status >= 400 ? 1 : 0,
 });
-const readCommit = (body: unknown = commit): Reply => ({ args: [`repos/acme/widgets/commits/${UPDATED}`], body });
-const compare = (status = "identical", base = "main"): Reply => ({ args: [`repos/acme/widgets/compare/${encodeURIComponent(base)}...${BASE}`], body: { status } });
+const readCommit = (body: unknown = commit): Reply => ({ args: [`repos/acme/widgets/commits/${UPDATED}`, "--include"], body });
+const compare = (status = "identical", base = "main"): Reply => ({ args: [`repos/acme/widgets/compare/${encodeURIComponent(base)}...${BASE}`, "--include"], body: { status } });
 
 async function update(replies: Reply[]) {
  const dir = mkdtempSync(join(tmpdir(), "ranger-gh-update-"));

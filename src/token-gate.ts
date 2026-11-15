@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { RangerAuthConfig, RangerConfig } from "./config.ts";
 import { runCmd, type RunOptions, type RunResult } from "./exec.ts";
 import { parseForgeRef, qualifiedRepo, repoIdentity, type ForgeRef } from "./forge-ref.ts";
-import { meteredGh } from "./github-usage.ts";
+import { githubCoreCooldown, githubTokenFingerprint, meteredGh, type GitHubCoreCooldown } from "./github-usage.ts";
 import { glabConfigEnvAsync } from "./glab-config-dir.ts";
 import { parseGlabResponse } from "./glab-transport.ts";
 import { isTransientGitHubError } from "./transient.ts";
@@ -136,89 +136,150 @@ export function gatedEnv(
   };
 }
 
-/**
- * Introspect the token via `gh api /user -i` and classify it.
- * Throws GateError on any failure to reach GitHub or unparseable output.
- */
-async function introspectToken(
-  token: string,
-  source: string,
-  runOpts: RunOptions = {},
-): Promise<TokenIntrospection> {
-  const gated = gatedEnv(token);
-  try {
-    const result = await meteredGh({ component: "token-gate", source })("gh", ["api", "/user", "-i"], {
-      ...runOpts,
-      env: gated.env,
-    });
-    if (result.code !== 0) {
-      // A forge that did not answer is transient: a queued resume defers on it
-      // without counting a failed start (2026-10-13: the tick log held over a
-      // hundred "error connecting to api.github.com" introspections).
-      const said = result.stderr.trim() || result.stdout.trim();
-      throw new GateError(`token introspection failed (gh api /user, exit ${result.code}): ${said}`, isTransientGitHubError(said));
+export const TOKEN_GATE_CACHE_MS = 15 * 60_000;
+
+type GitHubIntrospection = Extract<TokenIntrospection, { forge: "github" }>;
+
+interface CachedToken {
+  info?: { value: GitHubIntrospection; until: number };
+  repos: Map<string, number>;
+  pendingInfo?: Promise<GitHubIntrospection>;
+  pendingRepos: Map<string, Promise<void>>;
+}
+
+/** Process-local successful checks; a restart requires fresh authorization. */
+export class ReadOnlyTokenCache {
+  private readonly tokens = new Map<string, CachedToken>();
+
+  constructor(
+    private readonly now: () => number = Date.now,
+    private readonly cooldown: GitHubCoreCooldown = githubCoreCooldown,
+  ) {}
+
+  private isIdle(state: CachedToken, now: number): boolean {
+    return state.pendingInfo === undefined && state.pendingRepos.size === 0 &&
+      (state.info?.until ?? 0) <= now && state.repos.size === 0;
+  }
+
+  private prune(now: number): void {
+    for (const [key, cached] of this.tokens) {
+      for (const [path, until] of cached.repos) {
+        if (until <= now) cached.repos.delete(path);
+      }
+      if (this.isIdle(cached, now)) this.tokens.delete(key);
     }
-    const { scopes } = parseGhHeaders(result.stdout);
-    const login = extractLogin(result.stdout);
-    return {
-      forge: "github",
-      scopes,
-      tokenType: scopes.length > 0 ? "classic" : "fine-grained",
-      login,
-    };
-  } finally {
-    gated.cleanup();
+  }
+
+  async check(resolved: ResolvedToken, repo: string, runner: typeof runCmd): Promise<GitHubIntrospection> {
+    this.prune(this.now());
+    const key = githubTokenFingerprint(resolved.token);
+    let cached = this.tokens.get(key);
+    if (cached === undefined) {
+      cached = { repos: new Map(), pendingRepos: new Map() };
+      this.tokens.set(key, cached);
+    }
+    try {
+      return structuredClone(await this.validate(resolved, repo, cached, runner));
+    } catch (error) {
+      if (this.tokens.get(key) === cached) this.tokens.delete(key);
+      throw error;
+    }
+  }
+
+  private assertAvailable(resolved: ResolvedToken): void {
+    const until = this.cooldown.activeUntil(resolved.token);
+    if (until !== undefined) {
+      throw new GateError(`${resolved.source}: token gate deferred until ${new Date(until).toISOString()} (GitHub core allowance spent)`, true);
+    }
+  }
+
+  private async request(resolved: ResolvedToken, endpoint: string, runner: typeof runCmd): Promise<RunResult> {
+    this.assertAvailable(resolved);
+    const gated = gatedEnv(resolved.token);
+    try {
+      const result = await meteredGh({ component: "token-gate", source: resolved.source }, runner, this.cooldown)(
+        "gh", ["api", endpoint, "-i"], { env: gated.env },
+      );
+      if (result.code !== 0) {
+        this.assertAvailable(resolved);
+        const said = result.stderr.trim() || result.stdout.trim();
+        throw new GateError(`${resolved.source}: token gate failed (gh api ${endpoint}, exit ${result.code}): ${said}`, isTransientGitHubError(said));
+      }
+      return result;
+    } finally {
+      gated.cleanup();
+    }
+  }
+
+  private async refreshInfo(resolved: ResolvedToken, state: CachedToken, runner: typeof runCmd): Promise<GitHubIntrospection> {
+    if (state.info !== undefined && state.info.until > this.now()) return state.info.value;
+    if (state.pendingInfo !== undefined) return state.pendingInfo;
+    const checkedAt = this.now();
+    const pending = this.request(resolved, "/user", runner).then(result => {
+      const { scopes, login } = parseGhHeaders(result.stdout);
+      const writeScopes = scopes.filter(scope => !READ_ONLY_SCOPE.test(scope));
+      if (writeScopes.length > 0) {
+        throw new GateError(`refusing to run scout with a write-capable token: ${resolved.source} carries scope(s) ${writeScopes.join(", ")}. Scout runs read-only — provision a fine-grained PAT with only read permissions (node #8).`);
+      }
+      const value: GitHubIntrospection = {
+        forge: "github", scopes, tokenType: scopes.length > 0 ? "classic" : "fine-grained", login,
+      };
+      state.info = { value, until: checkedAt + TOKEN_GATE_CACHE_MS };
+      return value;
+    });
+    state.pendingInfo = pending;
+    try {
+      return await pending;
+    } finally {
+      state.pendingInfo = undefined;
+    }
+  }
+
+  private async refreshRepo(resolved: ResolvedToken, repo: string, state: CachedToken, runner: typeof runCmd): Promise<void> {
+    if ((state.repos.get(repo) ?? 0) > this.now()) return;
+    const existing = state.pendingRepos.get(repo);
+    if (existing !== undefined) return existing;
+    const checkedAt = this.now();
+    const pending = this.request(resolved, `repos/${repo}`, runner).then(() => {
+      state.repos.set(repo, checkedAt + TOKEN_GATE_CACHE_MS);
+    });
+    state.pendingRepos.set(repo, pending);
+    try {
+      await pending;
+    } finally {
+      state.pendingRepos.delete(repo);
+    }
+  }
+
+  private async validate(resolved: ResolvedToken, repo: string, state: CachedToken, runner: typeof runCmd): Promise<GitHubIntrospection> {
+    this.assertAvailable(resolved);
+    try {
+      const info = await this.refreshInfo(resolved, state, runner);
+      await this.refreshRepo(resolved, repo, state, runner);
+      return info;
+    } catch (error) {
+      state.info = undefined;
+      state.repos.clear();
+      throw error;
+    }
   }
 }
 
-/**
- * The full gate: resolve → introspect → abort-on-write-scopes → per-repo read.
- * GitLab introspects PAT scopes and proves project access under per-call
- * GLAB_CONFIG_DIR; its returned token object is authorized for that project.
- * Returns the resolved token plus introspection. Throws GateError.
- */
+const readOnlyTokenCache = new ReadOnlyTokenCache();
+
+/** Resolve explicit credentials and validate scopes and repo access, with bounded GitHub reuse. */
 export async function assertReadOnlyToken(
   config: RangerConfig,
   repo: string,
   env: NodeJS.ProcessEnv = process.env,
   runner: typeof runCmd = runCmd,
+  cache: ReadOnlyTokenCache = readOnlyTokenCache,
 ): Promise<{ token: ResolvedToken; info: TokenIntrospection }> {
   const resolved = resolveReadOnlyToken(config, repo, env);
-  if (parseForgeRef(repo).forge === "gitlab") return assertGitLabReadOnlyToken(repo, resolved, env, runner);
-  const info = await introspectToken(resolved.token, resolved.source);
-
-  const writeScopes = info.scopes.filter(
-    (scope) => !READ_ONLY_SCOPE.test(scope),
-  );
-  if (writeScopes.length > 0) {
-    throw new GateError(
-      `refusing to run scout with a write-capable token: ${resolved.source} carries scope(s) ${writeScopes.join(", ")}. ` +
-        `Scout runs read-only — provision a fine-grained PAT with only read permissions (node #8).`,
-    );
-  }
-
-  await assertRepoReadable(resolved, repo);
+  const ref = parseForgeRef(repo);
+  if (ref.forge === "gitlab") return assertGitLabReadOnlyToken(repo, resolved, env, runner);
+  const info = await cache.check(resolved, ref.path.toLowerCase(), runner);
   return { token: resolved, info };
-}
-
-/** `GET /repos/{owner}/{repo}` must succeed with this token — proves it can read the map's repo. */
-async function assertRepoReadable({ token, source }: ResolvedToken, repo: string): Promise<void> {
-  const gated = gatedEnv(token);
-  try {
-    const result = await meteredGh({ component: "token-gate", source })(
-      "gh",
-      ["api", `repos/${repo}`, "--jq", ".full_name"],
-      { env: gated.env },
-    );
-    if (result.code !== 0) {
-      throw new GateError(
-        `token cannot read ${repo} (gh api repos/${repo}, exit ${result.code}): ${result.stderr.trim() || "access denied"}`,
-        isTransientGitHubError(result.stderr),
-      );
-    }
-  } finally {
-    gated.cleanup();
-  }
 }
 
 // Only the gate can authorize a GitLab token object. A copied/unvalidated token
@@ -304,24 +365,24 @@ export async function gitlabApiRead(
 export function parseGhHeaders(output: string): {
   scopes: string[];
   login: string;
+  remaining?: number;
+  reset?: number;
+  resource?: string;
 } {
   const [head] = output.split(/\r?\n\r?\n/);
   if (!head) return { scopes: [], login: "" };
-  let scopes: string[] = [];
-  for (const line of head.split(/\r?\n/)) {
-    const lower = line.toLowerCase();
-    if (lower.startsWith("x-oauth-scopes:")) {
-      const value = line.slice(line.indexOf(":") + 1).trim();
-      scopes =
-        value.length > 0
-          ? value
-              .split(",")
-              .map((s) => s.trim())
-              .filter(Boolean)
-          : [];
-    }
-  }
-  return { scopes, login: extractLogin(output) };
+  const headers = new Map(head.split(/\r?\n/).flatMap(line => {
+    const colon = line.indexOf(":");
+    return colon > 0 ? [[line.slice(0, colon).toLowerCase(), line.slice(colon + 1).trim()] as const] : [];
+  }));
+  const scopes = (headers.get("x-oauth-scopes") ?? "").split(",").map(scope => scope.trim()).filter(Boolean);
+  const number = (name: string): number | undefined => {
+    const raw = headers.get(name);
+    if (raw === undefined || !/^\d+$/.test(raw)) return undefined;
+    const value = Number(raw);
+    return Number.isSafeInteger(value) ? value : undefined;
+  };
+  return { scopes, login: extractLogin(output), remaining: number("x-ratelimit-remaining"), reset: number("x-ratelimit-reset"), resource: headers.get("x-ratelimit-resource") };
 }
 
 function extractLogin(output: string): string {
@@ -343,8 +404,8 @@ export type TokenBatch = (repo: string) => Promise<ResolvedToken>;
 /**
  * Run the gate once per repo and hand the validated token to every read in
  * one batch; a refusal is shared the same way. Make a new batch per refresh
- * or live read, never a long-lived one: the gate must see a token revoked
- * or re-scoped since.
+ * or live read, never a long-lived one: GitHub successes expire after
+ * TOKEN_GATE_CACHE_MS and refusals must be retried by the next batch.
  */
 export function tokenBatch(
   config: RangerConfig,

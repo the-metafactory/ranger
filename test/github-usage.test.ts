@@ -7,7 +7,7 @@ import * as github from "../src/github.ts";
 import { GitHubError } from "../src/github.ts";
 import { readGraphqlBudget } from "../src/budget.ts";
 import { readRepoSentinel } from "../src/frontier-cache.ts";
-import { configureGitHubUsage, githubUsageDirectory, meteredGh, meteredOpaque, MAX_DAY_BYTES, RETENTION_DAYS } from "../src/github-usage.ts";
+import { configureGitHubUsage, GitHubCoreCooldown, githubUsageDirectory, meteredGh, meteredOpaque, MAX_DAY_BYTES, RETENTION_DAYS } from "../src/github-usage.ts";
 import { buildUsageReport, parsePeriodStart, renderUsageReport, type WindowReport } from "../src/github-usage-report.ts";
 import { sageReview } from "../src/review.ts";
 import { runReadRetryingTransient } from "../src/transient.ts";
@@ -214,11 +214,43 @@ describe("recording ranger's own calls", () => {
   expect(JSON.stringify(records)).not.toContain(SENTINEL_CREDENTIAL);
  });
 
- test("with no record configured, the call is exactly what it was", async () => {
+ test("with no record configured, headers still track cooldown and callers receive the same body", async () => {
   configureGitHubUsage(null);
   const calls = fakeGh({ "pulls/7": openPr });
-  await github.getPr("acme/widgets", 7, SENTINEL_CREDENTIAL);
-  expect(JSON.parse(readFileSync(calls, "utf8").trim())).toEqual(["api", "repos/acme/widgets/pulls/7"]);
+  const pr = await github.getPr("acme/widgets", 7, SENTINEL_CREDENTIAL);
+  expect(pr.iid).toBe(7);
+  expect(JSON.parse(readFileSync(calls, "utf8").trim())).toEqual(["api", "repos/acme/widgets/pulls/7", "--include"]);
+  expect(recorded()).toEqual([]);
+ });
+});
+
+describe("shared core cooldown", () => {
+ test.each([true, false])("blocks other components and source aliases until reset, recording enabled: %j", async recording => {
+  if (!recording) configureGitHubUsage(null);
+  let now = Date.parse("2026-11-15T10:00:00Z");
+  const reset = now / 1000 + 3600;
+  const cooldown = new GitHubCoreCooldown(() => now);
+  let calls = 0;
+  const runner: typeof runCmd = async () => {
+   calls++;
+   return { code: 0, stdout: `HTTP/2.0 200 OK\r\nX-Ratelimit-Remaining: ${calls === 1 ? 0 : 10}\r\nX-Ratelimit-Reset: ${reset}\r\nX-Ratelimit-Resource: core\r\n\r\n{}`, stderr: "" };
+  };
+  const first = meteredGh({ component: "token-gate", source: "FIRST" }, runner, cooldown);
+  const other = meteredGh({ component: "forge-port", source: "ALIAS" }, runner, cooldown);
+  await first("gh", ["api", "/user"], { env: { GH_TOKEN: "same-token" } });
+  const blocked = await other("gh", ["api", "repos/acme/a"], { env: { GITHUB_TOKEN: "same-token" } });
+  expect(blocked.code).toBe(1);
+  expect(blocked.stderr).toContain("rate limit exceeded");
+  expect(calls).toBe(1);
+  expect(recorded()).toHaveLength(recording ? 1 : 0);
+  await other("gh", ["api", "repos/acme/a"], { env: { GH_TOKEN: "rotated-token" } });
+  expect(calls).toBe(2);
+  now = reset * 1000 - 1;
+  await other("gh", ["api", "repos/acme/a"], { env: { GH_TOKEN: "same-token" } });
+  expect(calls).toBe(2);
+  now++;
+  expect((await other("gh", ["api", "repos/acme/a"], { env: { GH_TOKEN: "same-token" } })).code).toBe(0);
+  expect(calls).toBe(3);
  });
 });
 

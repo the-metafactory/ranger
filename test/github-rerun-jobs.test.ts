@@ -44,8 +44,8 @@ describe("node #521 — the GitHub port reruns the failed jobs of a red head", (
   expect(result.code).toBe(0);
   expect(result.stdout.trim()).toBe("2");
   expect(result.calls).toEqual([
-   ["api", "repos/other-owner/other-map/actions/jobs/9/rerun", "--method", "POST"],
-   ["api", "repos/other-owner/other-map/actions/jobs/11/rerun", "--method", "POST"],
+   ["api", "repos/other-owner/other-map/actions/jobs/9/rerun", "--method", "POST", "--include"],
+   ["api", "repos/other-owner/other-map/actions/jobs/11/rerun", "--method", "POST", "--include"],
   ]);
  });
 
@@ -54,6 +54,6 @@ describe("node #521 — the GitHub port reruns the failed jobs of a red head", (
   expect(result.code).toBe(1);
   expect(result.stderr).toContain("rerun job 9");
   expect(result.stderr).toContain("HTTP 403");
-  expect(result.calls).toEqual([["api", "repos/other-owner/other-map/actions/jobs/9/rerun", "--method", "POST"]]);
+  expect(result.calls).toEqual([["api", "repos/other-owner/other-map/actions/jobs/9/rerun", "--method", "POST", "--include"]]);
  });
 });
