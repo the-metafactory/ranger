@@ -202,7 +202,7 @@ describe("GitLab write gate", () => {
  test("GitHub identity lookup remains compatible", async () => {
   expect(await loginForToken("gh-token", "team/project", {}, async (bin, args, opts) => {
    expect(bin).toBe("gh");
-   expect(args).toEqual(["api", "/user", "--jq", ".login"]);
+   expect(args).toEqual(["api", "/user", "--jq", ".login", "--include"]);
    expect(opts?.env?.GH_TOKEN).toBe("gh-token");
    return { code: 0, stdout: "ivy-agent\n", stderr: "" };
   })).toBe("ivy-agent");

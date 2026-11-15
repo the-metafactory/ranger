@@ -11,6 +11,7 @@ import {
 } from "../src/token-gate.ts";
 import type { RangerConfig } from "../src/config.ts";
 import type { runCmd, RunResult } from "../src/exec.ts";
+import { GitHubCoreCooldown, meteredGh } from "../src/github-usage.ts";
 
 describe("assertReadOnlyToken — bounded GitHub reuse", () => {
   const config = { auth: { readOnlyTokens: { "*": "RO" }, writeTokens: {} } } as unknown as RangerConfig;
@@ -29,9 +30,10 @@ describe("assertReadOnlyToken — bounded GitHub reuse", () => {
 
   function harness() {
     let now = Date.parse("2026-11-15T10:00:00Z");
-    const cache = new ReadOnlyTokenCache(() => now);
+    const cooldown = new GitHubCoreCooldown(() => now);
+    const cache = new ReadOnlyTokenCache(() => now, cooldown);
     const calls: { endpoint: string; token: string | undefined }[] = [];
-    let respond = (_endpoint: string): RunResult => response();
+    let respond = (_endpoint: string): RunResult | Promise<RunResult> => response();
     const runner: typeof runCmd = async (_bin, args, opts) => {
       expect(args).toContain("-i");
       expect(opts?.env?.GH_CONFIG_DIR).toBeTruthy();
@@ -40,6 +42,7 @@ describe("assertReadOnlyToken — bounded GitHub reuse", () => {
     };
     return {
       calls,
+      cooldown,
       gate: (repo = "acme/a", token = "fixture-token") => assertReadOnlyToken(config, repo, { RO: token }, runner, cache),
       advance: (ms: number) => { now += ms; },
       reset: () => now / 1000 + 3600,
@@ -62,7 +65,10 @@ describe("assertReadOnlyToken — bounded GitHub reuse", () => {
     const h = harness();
     await h.gate();
     h.respond(() => response({ scopes: "read:org, repo" }));
-    h.advance(TOKEN_GATE_CACHE_MS);
+    h.advance(TOKEN_GATE_CACHE_MS - 1);
+    await h.gate();
+    expect(h.calls).toHaveLength(2);
+    h.advance(1);
     await expect(h.gate()).rejects.toThrow(/write-capable/);
     await expect(h.gate()).rejects.toThrow(/write-capable/);
     expect(h.calls.map(call => call.endpoint)).toEqual(["/user", "repos/acme/a", "/user", "/user"]);
@@ -161,6 +167,63 @@ describe("assertReadOnlyToken — bounded GitHub reuse", () => {
     const h = harness();
     await Promise.all([h.gate(), h.gate(), h.gate("acme/b"), h.gate("acme/b")]);
     expect(h.calls.map(call => call.endpoint)).toEqual(["/user", "repos/acme/a", "repos/acme/b"]);
+  });
+
+  test("different repos start together while duplicate checks share one request", async () => {
+    const h = harness();
+    await h.gate();
+    h.advance(TOKEN_GATE_CACHE_MS);
+    const user = Promise.withResolvers<RunResult>();
+    const a = Promise.withResolvers<RunResult>();
+    const b = Promise.withResolvers<RunResult>();
+    h.respond(path => path === "/user" ? user.promise : path === "repos/acme/a" ? a.promise : b.promise);
+    const gates = Promise.all([h.gate(), h.gate(), h.gate("acme/b"), h.gate("acme/b")]);
+    expect(h.calls.slice(2).map(call => call.endpoint)).toEqual(["/user"]);
+    user.resolve(response());
+    await Bun.sleep(0);
+    const started = h.calls.slice(2).map(call => call.endpoint);
+    a.resolve(response());
+    b.resolve(response());
+    await gates;
+    expect(started).toEqual(["/user", "repos/acme/a", "repos/acme/b"]);
+  });
+
+  test("a late repo success cannot restore authorization after another repo refuses", async () => {
+    const h = harness();
+    const late = Promise.withResolvers<RunResult>();
+    h.respond(path => path === "repos/acme/b" ? late.promise : response({ code: path === "repos/acme/a" ? 1 : 0, stderr: "access denied" }));
+    const failed = h.gate();
+    const pending = h.gate("acme/b");
+    await expect(failed).rejects.toMatchObject({ transient: false });
+    late.resolve(response());
+    await pending;
+    const before = h.calls.length;
+    h.respond(() => response());
+    await h.gate("acme/b");
+    expect(h.calls.slice(before).map(call => call.endpoint)).toEqual(["/user", "repos/acme/b"]);
+  });
+
+  test("other metered callers share the gate's cooldown in both directions", async () => {
+    const h = harness();
+    await h.gate();
+    let calls = 0;
+    const runner: typeof runCmd = async () => {
+      calls++;
+      return response({ remaining: 0, reset: h.reset() });
+    };
+    const other = meteredGh({ component: "forge-port", source: "alias" }, runner, h.cooldown);
+    await other("gh", ["api", "repos/acme/a/issues"], { env: { GH_TOKEN: "fixture-token" } });
+    await expect(h.gate()).rejects.toMatchObject({ transient: true });
+    expect(h.calls).toHaveLength(2);
+    await other("gh", ["api", "repos/acme/b/issues"], { env: { GH_TOKEN: "fixture-token" } });
+    expect(calls).toBe(1);
+
+    const gateFirst = harness();
+    gateFirst.respond(() => response({ remaining: 0, reset: gateFirst.reset(), code: 1 }));
+    await expect(gateFirst.gate()).rejects.toMatchObject({ transient: true });
+    const blocked = meteredGh({ component: "forge-port", source: "alias" }, runner, gateFirst.cooldown);
+    expect((await blocked("gh", ["api", "repos/acme/a"], { env: { GH_TOKEN: "fixture-token" } })).code).toBe(1);
+    expect(calls).toBe(1);
   });
 
   test("the default gate cache survives across fresh batches", async () => {
