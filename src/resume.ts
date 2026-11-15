@@ -1,10 +1,9 @@
 import { hasMergeConflict } from "./forge.ts";
 import { conflictResume } from "./resume-priority.ts";
-import { quietHostGate, queuedResumeStale, queueSpawnGate, whenFreeQueues, queueEntryGate } from "./resume-gates.ts";
+import { quietHostGate, queuedResumeStale, queueSpawnGate, whenFreeQueues, queueEntryGate, queueHoldReason } from "./resume-gates.ts";
 export { quietHostGate, queuedResumeStale, queueSpawnGate, whenFreeQueues, queueEntryGate, type QueueEntryGate } from "./resume-gates.ts";
 import { resolveNodeSelector, workerPreflight, type DispatchDeps } from "./node-dependency.ts";
 import { OperationFailure } from "./operation-outcome.ts";
-import { reviewThrottle } from "./budget.ts";
 import { WRITE_TOKEN_SOURCE } from "./github-usage.ts";
 import { activeRecovery, nodeRecoveryScope, recoveryHold, resetRecovery } from "./recovery.ts";
 import { startOwnedWorker } from "./node-ownership.ts";
@@ -188,7 +187,6 @@ export interface ResumeQueueMap {
  errors: string[];
 }
 
-/** Caller holds the claim lease; only successful starts reserve implement capacity. */
 export async function processResumeQueue(
  ctx: ResumeContext & { github: Pick<ForgePort, "getPr"> }, maps: ResumeQueueMap[],
  reservations: Set<ImplementLane>, owned: OwnedCheck, conflictsOnly = false,
@@ -233,16 +231,22 @@ export async function processResumeQueue(
    defer(state === undefined ? "map state is unavailable" : "map or worker row is unavailable");
    continue;
   }
-  const recoveryWait = recoveryHold(journal, nodeRecoveryScope(entry.repo, entry.nodeId), ctx.now?.() ?? new Date());
-  if (recoveryWait !== null) {
-   journal.recordEvent("sweep", { nodeId: entry.nodeId, repo: entry.repo, detail: `queued recovery deferred: ${recoveryWait}` });
+  const hold = queueHoldReason(journal, config, entry, ctx.now?.() ?? new Date());
+  const holdKey = `resume-hold:${entry.repo}#${entry.nodeId}`;
+  if (hold !== null) {
+   owned();
+   waiting.add(entry.lane);
+   const takesLane = startsImplementSession(row);
+   if (takesLane) reservations.add(entry.lane);
+   const held = JSON.stringify([entry.id, hold]);
+   if (journal.getHealth(holdKey) !== held) {
+    journal.recordEvent("sweep", { nodeId: entry.nodeId, repo: entry.repo,
+     detail: `queued resume #${entry.nodeId} ${takesLane ? `holds the ${entry.lane} implement lane` : "waits"}: ${hold}` });
+    journal.setHealth(holdKey, held);
+   }
    continue;
   }
-  const cooling = reviewThrottle(journal, config, entry.repo, ctx.now?.() ?? new Date());
-  if (cooling !== null) {
-   journal.recordEvent("sweep", { nodeId: entry.nodeId, repo: entry.repo, detail: `queued resume #${entry.nodeId} waits until ${cooling.until.toISOString()}: ${cooling.reason}` });
-   continue;
-  }
+  if (journal.getHealth(holdKey)) { owned(); journal.setHealth(holdKey, ""); }
   // The lane holder is read at the start itself (startResumeNode), after the
   // forge checks, so a held lane still drops a closed node or merged PR.
   const spawnRefusal = spawnGate(journal, config, ctx.now?.() ?? new Date(), entry.lane);

@@ -1,9 +1,19 @@
-import type { RangerMapConfig } from "./config.ts";
-import type { ResumeQueueRow, WorkerRow, WorkerStatus } from "./journal.ts";
+import type { RangerConfig, RangerMapConfig } from "./config.ts";
+import type { Journal, ResumeQueueRow, WorkerRow, WorkerStatus } from "./journal.ts";
+import { reviewThrottle } from "./budget.ts";
+import { nodeRecoveryScope, recoveryHold } from "./recovery.ts";
 import { startsImplementSession, type ImplementLane } from "./lanes.ts";
 import { isQuiet, type HostLoadReading } from "./host-load.ts";
 import { waitingForQuietHost } from "./outcomes.ts";
 import { isActiveStatus } from "./liveness.ts";
+
+export function queueHoldReason(journal: Journal, config: Pick<RangerConfig, "auth">,
+ entry: Pick<ResumeQueueRow, "repo" | "nodeId">, now: Date): string | null {
+ const recovery = recoveryHold(journal, nodeRecoveryScope(entry.repo, entry.nodeId), now);
+ if (recovery !== null) return recovery;
+ const cooling = reviewThrottle(journal, config, entry.repo, now);
+ return cooling === null ? null : `review throttled until ${cooling.until.toISOString()}: ${cooling.reason}`;
+}
 
 
 /**

@@ -66,9 +66,9 @@ import { drainGate, freshCandidates, freshClaimRefusal, implementCandidates, pla
 import { pidAlive as defaultPidAlive } from "./exec.ts";
 import { Journal, vetoApplies, type LaneHolder, type ResumeQueueRow, type SubstrateSessionRow, type WorkerRow } from "./journal.ts";
 import { ForeignMigrationError } from "./journal-guard.ts";
-import { IMPLEMENT_LANES, implementLane, workerLane, type ImplementLane } from "./lanes.ts";
+import { IMPLEMENT_LANES, implementLane, startsImplementSession, workerLane, type ImplementLane } from "./lanes.ts";
 import { activeCooldown, cooldownScope, readGraphqlBudget } from "./budget.ts";
-import { queueEntryGate, queueSpawnGate, quietHostGate } from "./resume-gates.ts";
+import { queueEntryGate, queueSpawnGate, quietHostGate, queueHoldReason } from "./resume-gates.ts";
 import { busyLoadFor, realHostLoad, type HostLoad, type HostLoadReading } from "./host-load.ts";
 import { cachedFrontier } from "./frontier-cache.ts";
 import { cachedRootAuthor } from "./root-author.ts";
@@ -224,6 +224,7 @@ export interface StateInputs {
  awaitingMerge?: NeedsYouEntry[];
  /** The journal's resume queue, every lane, FIFO (node #166); absent means empty. */
  resumeQueue?: ResumeQueueRow[];
+ resumeHold?: (entry: ResumeQueueRow) => string | null;
  /** This host's load now: a queued resume waits while it is busy (node #297); absent never waits. */
  hostLoad?: HostLoadReading;
  /** `workers.busyLoad`: the load the host counts as busy at; absent means the core count. */
@@ -241,7 +242,7 @@ export interface LaneQueue {
   * The entry the next tick reaches first; null when none is left to reach.
   * `starts`: the tick resumes it ahead of any frontier claim.
   */
- head: { repo: string; nodeId: string; starts: boolean; reason: string } | null;
+ head: { repo: string; nodeId: string; starts: boolean; reason: string; holdsLane?: boolean } | null;
  /** Entries the next tick drops from the queue; they hold nothing behind them. */
  drops: { repo: string; nodeId: string; reason: string }[];
  /** Resumes queued for load that wait for a quiet host (node #297); they hold nothing behind them. */
@@ -395,7 +396,7 @@ const view = (n: ClassifiedNode): NodeView => ({
  */
 interface TickSoFar {
  /** `resumed`: the holder is a queued resume this tick starts, not a claim. */
- holders: Record<ImplementLane, { repo: string; nodeId: string; thisTick: boolean; resumed?: boolean } | null>;
+ holders: Record<ImplementLane, { repo: string; nodeId: string; thisTick: boolean; resumed?: boolean; holdReason?: string } | null>;
  spawns: number;
 }
 
@@ -429,6 +430,15 @@ function planQueueHeads(
   const at = { repo: entry.repo, nodeId: entry.nodeId };
   if (gate?.kind === "drop") {
    lane.drops.push({ ...at, reason: `the next tick drops it: ${gate.reason}` });
+   continue;
+  }
+  const hold = gate === null ? inputs.resumeHold?.(entry) ?? null : null;
+  if (hold !== null) {
+   const holdsLane = row !== null && startsImplementSession(row);
+   lane.head = { ...at, starts: false, reason: hold, holdsLane };
+   if (holdsLane) {
+    tick.holders[entry.lane] ??= { repo: key, nodeId: entry.nodeId, thisTick: true, holdReason: hold };
+   }
    continue;
   }
   const holder = tick.holders[entry.lane];
@@ -506,7 +516,9 @@ function nextFor(
    url: plan.waiting.url,
    lane: "implement",
    waiting: true,
-   reason: holder.resumed === true
+   reason: holder.holdReason !== undefined
+    ? `the ${map.lane} implement lane is held by queued resume #${holder.nodeId} (${holder.repo}): ${holder.holdReason}`
+    : holder.resumed === true
     ? `waits for the ${map.lane} implement lane: this tick resumes queued #${holder.nodeId} (${holder.repo}) first`
     : holder.thisTick
     ? `waits for the ${map.lane} implement lane: this tick claims #${holder.nodeId} (${holder.repo}) first`
@@ -1191,9 +1203,12 @@ function renderNext(s) {
  const box = document.getElementById("next"); box.replaceChildren();
  for (const lane of ["visual", "headless"]) {
   const holder = s.gates.laneHolders[lane];
+  const heldResume = s.resumeQueue[lane].head;
+  const held = holder ? "held by #" + holder.nodeId + " (" + holder.repo + "#" + holder.root + ")"
+   : heldResume && heldResume.holdsLane ? "held by queued resume #" + heldResume.nodeId + " (" + heldResume.repo + "): " + heldResume.reason : "free";
   const drained = lane === "visual" && s.gates.visualDrained ? " · DRAINED: no new implement claims on any visual map (ranger drain --lane visual --off)" : "";
   const occ = s.gates.laneOccupancy[lane];
-  box.append(el("h3", { text: lane + " lane · " + (holder ? "held by #" + holder.nodeId + " (" + holder.repo + "#" + holder.root + ")" : "free") + " · workers " + occ.workers + "/" + occ.workerSlots + " · jobs " + occ.jobs + "/" + occ.jobSlots + drained }));
+  box.append(el("h3", { text: lane + " lane · " + held + " · workers " + occ.workers + "/" + occ.workerSlots + " · jobs " + occ.jobs + "/" + occ.jobSlots + drained }));
   // The visual lane drains as one switch; a visual map has no drain of its own.
   if (lane === "visual") box.append(el("div", { class: "acts" }, drainButton(s.gates.visualDrained, { lane: "visual" }, "the visual lane: no new implement claims on any visual map")));
   const q = laneQueue(s, lane);
@@ -2144,6 +2159,7 @@ export function stateFromJournal(
    laneOccupancy,
    resumeQueue,
    paused: journal?.isPaused() ?? false,
+   resumeHold: entry => journal === null ? null : queueHoldReason(journal, config, entry, now),
    drains: journal === null ? undefined : readDrains(journal, config.maps),
    spawnsToday: journal?.spawnsToday(now) ?? 0,
    spawnCap: config.workers.spawnCapPerDay,
