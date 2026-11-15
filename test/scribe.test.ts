@@ -510,7 +510,7 @@ describe("scribeAfterMerge: the Scribe's pass before the close", () => {
  test("a prose-only round files nothing: the nits stay on the PR, journalled and named in the receipt", async () => {
   const nitsOnly = { ...REVIEW, majors: 0, nits: 9, body: `### CodeQuality\n\n${impact(0, 0, 9)}` };
   const filings = await scribeAfterMerge(ctx, { ...pr(), mergeCommitSha: null }, nitsOnly);
-  expect(filings).toEqual({ review: { proseLeft: 9 } });
+  expect(filings).toEqual({ review: { leftOnChange: 9 } });
   expect(fake.calls).toEqual([]);
   expect(events()).toEqual([
    "left the last review's 9 nit(s) on PR #42 (https://github.com/acme/widgets/pull/42), not filed (no blocker or major)",
@@ -523,7 +523,7 @@ describe("scribeAfterMerge: the Scribe's pass before the close", () => {
  test("a nit-severity finding stays on the PR even when it asks a behavior or check change, or the round has no impact line", async () => {
   for (const body of [impact(1, 0, 4), impact(0, 1, 4), `${impact(0, 0, 2)}\n\n${impact(1, 0, 2)}`, "### CodeQuality\nno impact line"]) {
    const filings = await scribeAfterMerge(ctx, { ...pr(), mergeCommitSha: null }, { ...REVIEW, majors: 0, nits: 5, body });
-   expect(filings.review).toEqual({ proseLeft: 5 });
+   expect(filings.review).toEqual({ leftOnChange: 5 });
   }
   expect(fake.calls).toEqual([]);
  });

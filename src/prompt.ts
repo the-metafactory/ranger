@@ -11,6 +11,7 @@
 
 import { randomUUID } from "node:crypto";
 import { BLOCKED_REPORT_FILE } from "./outcomes.ts";
+import { RULING_CLASSES } from "./blocked-report.ts";
 
 export interface PromptNode {
  id: string;
@@ -183,11 +184,6 @@ const HOST_RUNTIME_RULE = `- Run every test on this host, as the supervisor does
   name those tests and their cause in your final message. The supervisor reruns the
   suite at the merge base and lets through failures that are red there too.`;
 
-/**
- * A worker that cannot do the node reports it instead of committing a note
- * about it (cortex#2557: a committed blocker note became a PR that sage read
- * clean and the merge desk nearly carded).
- */
 const DEFAULTS_RULE = `- Open choices: when the node leaves a choice open that you can undo later (a name, a
   layout, wording, an internal structure, a reasonable limit), take the simplest option
   and build it. Record each one as a line \`Default: <choice>, because <one line>\` in the
@@ -195,9 +191,14 @@ const DEFAULTS_RULE = `- Open choices: when the node leaves a choice open that y
   Only three kinds of choice are not yours to default: an irreversible one (deletion,
   a data migration, published content, money spent), a security or matching boundary
   (what is allowed, matched or trusted), and a contract another repository consumes.
-  When you cannot tell whether a choice is one of those, treat it as one and report
-  it as blocked.`;
+  When you cannot tell whether a choice is one of those, treat it as one: report it
+  as blocked and name the kind you suspect on the \`Gap: ruling\` line.`;
 
+/**
+ * A worker that cannot do the node reports it instead of committing a note
+ * about it (cortex#2557: a committed blocker note became a PR that sage read
+ * clean and the merge desk nearly carded).
+ */
 const BLOCKED_RULE = `- Blocked: if the node cannot be done yet because a precondition outside your reach is
   unmet (a dependency release that does not exist yet, access you do not have, an
   open choice of the three kinds above),
@@ -205,9 +206,10 @@ const BLOCKED_RULE = `- Blocked: if the node cannot be done yet because a precon
   uncommitted, and exit 0. Its first lines say what blocks the node and the evidence;
   then one line \`Resume condition: <what must hold before the node can be built>\`.
   Also write one line \`Gap: ruling <class>\` when the condition is a ruling only the
-  principal can make, where <class> is \`irreversible\`, \`security\` or \`contract\`; or
-  \`Gap: code\` when it is a code or provisioning gap a worker could close. A ruling park
-  that names no class is refused, and you are asked to take a default instead.
+  principal can make, where <class> is one of ${RULING_CLASSES.map((c) => `\`${c}\``).join(", ")}; or
+  \`Gap: code\` when it is a code or provisioning gap a worker could close. On the build
+  pass, a ruling park that names no class is refused once, and you are asked to take a
+  default instead.
   The supervisor parks the node on it: it pushes nothing and opens no pull request.
   Only an unmet precondition is a block; a hard task or failing tests are not.`;
 

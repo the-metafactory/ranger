@@ -1032,7 +1032,7 @@ export type ScribeOutcome = { node: string } | { error: string };
 
 /** The Scribe's filings after a merge; a key is absent when there was nothing to file. */
 export interface ScribeFilings {
- review?: ScribeOutcome | { proseLeft: number };
+ review?: ScribeOutcome | { leftOnChange: number };
  /** `unread` when the merge's diff could not be read: nothing was scanned. */
  landmines?: (ScribeOutcome & { count: number }) | { unread: string };
 }
@@ -1096,7 +1096,7 @@ export async function scribeAfterMerge(
  } else if (final !== undefined && gatingFindings(final) > 0) {
   filings.review = await file("split-out-of-review", "the last review's findings", () => splitOutOfReviewSpec(map.repo, spawning, change, final));
  } else if (final !== undefined && final.nits > 0) {
-  filings.review = { proseLeft: final.nits };
+  filings.review = { leftOnChange: final.nits };
   journal.recordEvent("filed", {
    nodeId, repo: map.repo,
    detail: `left the last review's ${final.nits} nit(s) on ${changeRequestLabel(map.repo, pr.iid)} (${change.url}), not filed (no blocker or major)`.slice(0, 400),
@@ -2967,12 +2967,13 @@ async function checkedWorkerPass(
  // The worker said the node cannot be done yet: park on its reason, before
  // any commit it made is tested or pushed.
  const blocked = result.code === 0 ? readBlockedReport(worktree) : null;
- if (blocked !== null && refusesRulingPark(spec, blocked) && (await blockerNoteBranch(worktree, map.base)) === null && await headSha(worktree) === before) {
+ const blockerNote = blocked === null ? null : await blockerNoteBranch(worktree, map.base);
+ if (blocked !== null && refusesRulingPark(spec, blocked) && blockerNote === null && await headSha(worktree) === before) {
   journal.recordEvent("refused", { nodeId, repo: map.repo, detail: `${pass} parked on a ruling with no class: refused, the build runs once more and takes a default`.slice(0, 400) });
   discardBlockedReport(worktree);
   return { workerExit: result.code, snapshot, sha: before, refusedRuling: blocked.reason };
  }
- if (blocked !== null) throw await blockedPark(ctx, pass, blocked, { dropNote: (await blockerNoteBranch(worktree, map.base)) !== null, log });
+ if (blocked !== null) throw await blockedPark(ctx, pass, blocked, { dropNote: blockerNote !== null, log });
  if (result.code !== 0) {
   // Mid-session cap (node #45): only the substrate's own signal says so, and
   // only a failed run can be one. A capped failure does not count.
@@ -4424,7 +4425,7 @@ function unfixedFindingsLine(ctx: ImplementContext, pr: ChangeRequest, final: Re
  const counts = `${final.blockers} blocker(s), ${final.majors} major(s) and ${final.nits} nit(s) from the last sage round`;
  const noun = changeRequestNoun(ctx.map.repo);
  if (review === undefined) return `${counts} are on the ${noun}, not filed back.`;
- if ("proseLeft" in review) return `${counts} stay on the ${noun} (${changeRequestUrl(ctx.map.repo, pr.iid, pr.webUrl)}); findings below a major are not filed back.`;
+ if ("leftOnChange" in review) return `${counts} stay on the ${noun} (${changeRequestUrl(ctx.map.repo, pr.iid, pr.webUrl)}); findings below a major are not filed back.`;
  if ("node" in review) return `${counts}, split out as node #${review.node} below this node.`;
  return `${counts} are on the ${noun}; filing them back failed (${review.error}).`;
 }
