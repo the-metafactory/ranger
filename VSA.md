@@ -105,7 +105,7 @@ Ranger claims only nodes that cite a failing ISC from their repo's confirmed `VS
 | 4 | Unit test on `assembleImplementPrompt` (`src/prompt.ts:307`); `grep` a live worker log for the ISC text. |
 | 5 | Close-path test: a merged PR that leaves the ISC `[ ]` parks the node; one that flips it closes. |
 | 6, 7 | Unit test on job preflight: dirty tree refused, unpushed HEAD refused, clean pushed HEAD runs. |
-| 8, 9 | A read-only query on the journal: `select count(*) from job_runs where started_at >= date('now','-7 day') and <sha or receipt column> is null` returns 0. |
+| 8, 9 | A read-only query on the journal: `select count(*) from job_runs where coalesce(finished_at, started_at) >= date('now','-7 day') and <sha or receipt column> is null` returns 0 (ISC-9 counts by `finished_at`, since a queued run can finish without ever starting). |
 | 10 | Config test for the probe field; a fixture job whose probe fails ends `failed` despite exit 0. |
 | 11 | Two-failure fixture in the job pass test; live check by `events.kind='goal-job-failing'`. |
 | 12 | `select count(*) from events where kind='closed' and at >= date('now','-7 day') and detail like '%attestation: unverified%'` returns 0. |
