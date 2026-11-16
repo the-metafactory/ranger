@@ -7,6 +7,7 @@ import { parse } from "yaml";
 import { z } from "zod";
 import { parseForgeRef, repoIdentity, validReadTokenPrefix } from "./forge-ref.ts";
 import { workerEnvPasses } from "./untrusted-env.ts";
+import { HOST_PATTERN } from "./remote-job.ts";
 import { SUBSTRATE_NAMES } from "./store/schema.ts";
 import { GitHubApiBaseUrlSchema } from "./github-api-base.ts";
 export { REPO_PATTERN } from "./forge-ref.ts";
@@ -502,6 +503,7 @@ const JobSchema = z.object({
   */
  requireResult: z.boolean().default(false),
  claudeSession: ClaudeSessionSchema.optional(),
+ host: z.string().regex(HOST_PATTERN, "a plain host name").optional(),
 });
 
 const RangerConfigSchema = z.object({
