@@ -29,9 +29,11 @@ import { buildQuotaSubstrates, selectSubstrate, workerCommandFor, workerOutputFo
 import { selectForBuild } from "./substrate-policy.ts";
 import { finishStudio, prepareStudio, studioCommand, studioEnvironment, studioLimit, studioPolicyCache, studioPrompt, studioSubstrates, validateStudioParams } from "./studio-think.ts";
 import { workerHostEnv } from "./worker-env.ts";
+import { remoteJobArgv, remoteJobResult } from "./remote-job.ts";
 
 /** Where a job's session writes what it produced (e.g. `soma:outputs/…`), for `result_ref`. */
 export const JOB_RESULT_ENV = "RANGER_JOB_RESULT_FILE";
+const REMOTE_GRACE_MIN = 2;
 /** The longest result ranger keeps from a session. */
 const RESULT_MAX_CHARS = 2_000;
 
@@ -93,10 +95,20 @@ function jobModelEndpoint(job: RangerJobConfig, policy?: string): string | undef
  return policy === "local" ? job.studio?.localEndpoint : undefined;
 }
 
+export function jobConfigFor(config: RangerConfig, job: RangerJobConfig): RangerConfig {
+ if (job.pi === undefined) return config;
+ const { reachable, ...pin } = job.pi;
+ const { reachable: _hostReachable, ...hostPi } = config.substrates.pi;
+ return { ...config, substrates: { ...config.substrates, pi: { ...hostPi, ...pin, ...(reachable === undefined ? {} : { reachable }) } } };
+}
+
 async function jobPreflight(config: RangerConfig, job: RangerJobConfig, candidates: readonly SubstrateName[], explicit: string | undefined,
  probe: EndpointProbe, lookup?: EndpointLookup) {
  const dependency = await requireReachable(job.reachable, probe);
- const selected = await firstReachableSubstrate(config, candidates, explicit, probe, lookup);
+ const remoteUnchecked = job.host !== undefined && explicit === undefined && candidates.every(candidate => config.substrates[candidate].reachable === undefined);
+ const selected = remoteUnchecked
+  ? { substrate: candidates[0] }
+  : await firstReachableSubstrate(config, candidates, explicit, probe, lookup);
  return { substrate: selected.substrate, checks: [dependency, selected.check].filter(check => check !== undefined) };
 }
 
@@ -252,7 +264,7 @@ export async function jobPass(ctx: JobPassContext): Promise<JobPassResult> {
    if (prepared.kind === "deferred") { wait(prepared.reason); continue; }
    const limit = job.studio ? studioLimit(prepared, job.studio, journal.listJobRuns(), now, run.id) : "Studio job is not configured";
    if (limit) { wait(limit); continue; }
-   permitted = await studioSubstrates(job, config, prepared.policy);
+   permitted = await studioSubstrates(job, jobConfigFor(config, job), prepared.policy);
    declaredEndpoint = jobModelEndpoint(job, prepared.policy);
    if (permitted.length === 0) { wait(`No permitted ${prepared.policy} substrate is available`); continue; }
    journal.updateJobRun(run.id, "queued", { policy: prepared.policy, reason: null });
@@ -262,7 +274,7 @@ export async function jobPass(ctx: JobPassContext): Promise<JobPassResult> {
   if (held !== null) { wait(held); continue; }
   if (!reserveRecovery(journal, scope, { now: now, owner: { jobRunId: run.id, status: "queued", pid: run.pid } })) { wait(activeRecoveryReason(journal, scope)); continue; }
   try {
-   const checked = await jobPreflight(config, job, permitted, declaredEndpoint, probe, ctx.endpointLookup);
+   const checked = await jobPreflight(jobConfigFor(config, job), job, permitted, declaredEndpoint, probe, ctx.endpointLookup);
    completeRecoveryChecks(journal, scope, checked.checks, { jobRunId: run.id, status: "queued", pid: run.pid });
   }
   catch (error) {
@@ -415,6 +427,7 @@ export async function runJob(runId: number, ctx: RunJobContext): Promise<RunJobO
   return { runId, name: run.name, status: "failed", reason: (error as Error).message };
  }
 
+ const jobConfig = jobConfigFor(config, job);
  const studio = run.name === "ivy-think" ? await prepareStudio(job, run.params) : null;
  const defer = (reason: string): RunJobOutcome => {
   journal.updateJobRun(runId, "running", { status: "queued", reason, startedAt: null, pid: null, pgid: null });
@@ -425,14 +438,14 @@ export async function runJob(runId: number, ctx: RunJobContext): Promise<RunJobO
   const limit = studioLimit(studio, job.studio, journal.listJobRuns(), now(), run.id);
   if (limit) return defer(limit);
  }
- const permitted = studio?.kind === "ready" ? await studioSubstrates(job, config, studio.policy) : job.substrates;
+ const permitted = studio?.kind === "ready" ? await studioSubstrates(job, jobConfig, studio.policy) : job.substrates;
  if (permitted.length === 0) return defer("No policy-permitted substrate is available");
  if (ctx.substrate !== undefined && !permitted.includes(ctx.substrate)) return defer("Requested substrate is forbidden by the job policy");
  let substrate = ctx.substrate ?? permitted[0];
  if (ctx.substrate === undefined && studio?.policy !== "local") {
   try {
    const picked = (await selectSubstrate(journal, {
-    config: config.substrates, excluded: new Set(), readers: ctx.substrateReaders, pick: selectForBuild, refresh: buildQuotaSubstrates(config),
+    config: jobConfig.substrates, excluded: new Set(), readers: ctx.substrateReaders, pick: selectForBuild, refresh: buildQuotaSubstrates(jobConfig),
    })).substrate;
    if (permitted.includes(picked)) substrate = picked;
   } catch {
@@ -441,7 +454,7 @@ export async function runJob(runId: number, ctx: RunJobContext): Promise<RunJobO
  }
  const probe = cachedProbe(ctx.endpointProbe);
  try {
-  const checked = await jobPreflight(config, job, ctx.substrate === undefined ? [substrate, ...permitted.filter(candidate => candidate !== substrate)] : [substrate],
+  const checked = await jobPreflight(jobConfig, job, ctx.substrate === undefined ? [substrate, ...permitted.filter(candidate => candidate !== substrate)] : [substrate],
    jobModelEndpoint(job, studio?.policy), probe, ctx.endpointLookup);
   substrate = checked.substrate;
   completeRecoveryChecks(journal, jobRecoveryScope(runId), checked.checks, { jobRunId: runId, status: "running", pid: process.pid });
@@ -453,13 +466,17 @@ export async function runJob(runId: number, ctx: RunJobContext): Promise<RunJobO
 
  const scratch = mkdtempSync(join(tmpdir(), "ranger-job-"));
  const resultFile = join(scratch, "result");
- const command = studio?.kind === "ready" ? studioCommand(substrate, config, resultFile) : workerCommandFor(substrate, config, job.claudeSession === undefined ? {} : { claudeSession: job.claudeSession });
- const output = workerOutputFor(substrate);
+ const command = studio?.kind === "ready" ? studioCommand(substrate, jobConfig, resultFile) : workerCommandFor(substrate, jobConfig, job.claudeSession === undefined ? {} : { claudeSession: job.claudeSession });
+ const prompt = studio?.kind === "ready" ? studioPrompt(studio) : jobPrompt(job, substrate);
+ const remote = studio === null && job.host !== undefined
+  ? remoteJobArgv({ host: job.host, cwd: job.cwd, name: job.name, runId, wallClockMin: job.wallClockMin, session: job.hostSession }, command, prompt)
+  : null;
+ const output = workerOutputFor(remote === null ? substrate : undefined);
  let raw: RunResult;
  try {
-  raw = await (ctx.runSession ?? runCmd)(command[0], [...command.slice(1), studio?.kind === "ready" ? studioPrompt(studio) : jobPrompt(job, substrate)], {
-   cwd: studio?.kind === "ready" ? scratch : expandHome(job.cwd),
-   timeoutMs: job.wallClockMin * 60_000,
+  raw = await (ctx.runSession ?? runCmd)(remote?.[0] ?? command[0], remote?.slice(1) ?? [...command.slice(1), prompt], {
+   cwd: remote !== null || studio?.kind === "ready" ? scratch : expandHome(job.cwd),
+   timeoutMs: (job.wallClockMin + (remote === null ? 0 : REMOTE_GRACE_MIN)) * 60_000,
    processGroup: true,
    // A visual job (GPU capture) keeps normal priority, as the browser probes do.
    nice: job.lane === "visual" ? undefined : config.workers.niceness,
@@ -470,7 +487,7 @@ export async function runJob(runId: number, ctx: RunJobContext): Promise<RunJobO
  } catch (error) {
   raw = { code: -1, stdout: "", stderr: error instanceof Error ? error.message : String(error) };
  }
- let result = readResult(resultFile);
+ let result = remote === null ? readResult(resultFile) : remoteJobResult(raw.stdout)?.slice(0, RESULT_MAX_CHARS) ?? null;
  if (studio?.kind === "ready" && raw.code === 0 && !raw.timedOut) {
   try {
    const modelText = substrate === "codex" ? readFileSync(resultFile, "utf8") : raw.stdout;

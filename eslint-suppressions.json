@@ -643,13 +643,13 @@
       "count": 2
     },
     "@typescript-eslint/no-unsafe-assignment": {
-      "count": 16
+      "count": 15
     },
     "@typescript-eslint/no-unsafe-call": {
       "count": 5
     },
     "@typescript-eslint/no-unsafe-member-access": {
-      "count": 49
+      "count": 45
     },
     "@typescript-eslint/prefer-regexp-exec": {
       "count": 3
@@ -664,7 +664,7 @@
       "count": 2
     },
     "ranger/no-comments": {
-      "count": 17
+      "count": 16
     }
   },
   "src/remote-test/job-ledger.ts": {
@@ -1061,7 +1061,7 @@
   },
   "src/untrusted-env.ts": {
     "ranger/no-comments": {
-      "count": 2
+      "count": 1
     }
   },
   "src/views.ts": {

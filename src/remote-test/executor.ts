@@ -10,10 +10,11 @@ import { ArtifactPolicySchema, persistExecution, readExecutionReceipt, type Arti
 import { BUS_WORKER_DIR, readBusWorkerOwner } from "./bus-worker-workspace.ts";
 import { restoreSource } from "./source.ts";
 import { ActiveRemoteTestJob, BusyRemoteTestExecutor, InterruptedRemoteTestJob, RevokedRemoteTestJob, openJobLedger, type JobLedger, type OwnedContainer } from "./job-ledger.ts";
-import { REMOTE_TEST_LIMITS, profileBudgets, type ReviewedPolicy, type ContainerBudget } from "./profiles.ts";
+import { REMOTE_TEST_LIMITS, reviewedRecipe, profileBudgets, type ReviewedPolicy, type ContainerBudget } from "./profiles.ts";
+import { CONTAINER_BOOTSTRAP_FLAGS } from "./isolation.ts";
+import type { ReviewedRecipe } from "./recipes.ts";
 
 export const EXECUTOR_LIMITS = REMOTE_TEST_LIMITS;
-export const CONTAINER_BOOTSTRAP_FLAGS = ["--config=/dev/null", "--no-env-file"] as const;
 const ConfigSchema = z.object({
  executorId: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/),
  jobsRoot: z.string().refine(s => isAbsolute(s) && !/[\0,:\n]/.test(s) && !s.split("/").includes("..")),
@@ -64,7 +65,7 @@ try {
  const cpu = (await value("cpu.max")).split(/\\s+/).map(Number);
  if (process.getuid() === 0 || cpu.length !== 2 || !cpu.every(Number.isFinite) || cpu[0] <= 0 || cpu[1] <= 0 || cpu[0]/cpu[1] > ${budget.cpuCores} ||
      await value("memory.max") !== "${budget.memoryBytes}" || await value("memory.swap.max") !== "0" || await value("pids.max") !== "${budget.pids}") throw Error("Required controller enforcement unavailable");
- ${reviewed ? reviewedBootstrap(lockDigest!) : ''}
+ ${reviewed ? reviewedBootstrap(lockDigest!, reviewed.sidecars.length > 0) : ''}
  for (const argv of ${JSON.stringify(commands)}) {
   let summary = "";
   const collectSummary = ${!!reviewed} && argv.includes("test");
@@ -107,16 +108,29 @@ console.log(JSON.stringify(result));
 process.exit(result.exitCode ?? 125);`;
 }
 
+/** A reviewed recipe pins its repository's package identity and every package
+ * script its commands call, so a drifted script refuses execution. */
+export function recipePackageRefusal(pkg: unknown, recipe: ReviewedRecipe): boolean {
+ if (pkg === null || typeof pkg !== "object") return true;
+ const { name, scripts } = pkg as { name?: unknown; scripts?: Record<string, unknown> };
+ return name !== recipe.packageName || Object.entries(recipe.scripts).some(([script, command]) => scripts?.[script] !== command);
+}
+/** A new test root needs renewed review rather than silently losing coverage. */
+export function unresolvedTestRoot(relative: string, recipe: ReviewedRecipe): boolean {
+ return !recipe.testRoots.some(root => relative === root || (root.endsWith("/") && relative.startsWith(root)));
+}
+
 /** No network, shared package cache, hooks or source-provided install commands.
- * The image's self-contained dependency snapshot is copied, never mounted RW. */
-function reviewedBootstrap(lockDigest: string): string {
+ * The image's self-contained dependency snapshot is copied, never mounted RW.
+ * A recipe without a declared sidecar has no broker to wait for. */
+function reviewedBootstrap(lockDigest: string, needsNats: boolean): string {
  return `if (Bun.version !== "1.3.14") throw Error("Reviewed recipe requires Bun 1.3.14");
  const crypto = await import("node:crypto");
  const digest = "sha256:"+crypto.createHash("sha256").update(await fs.readFile("/opt/ranger-dependencies/bun.lock")).digest("hex");
  if (digest !== ${JSON.stringify(lockDigest)}) throw Error("Image dependencies do not match lock");
  try { await fs.lstat("/work/node_modules"); throw Error("Source contains node_modules"); } catch (e) { if (e.code !== "ENOENT") throw e; }
  await fs.cp("/opt/ranger-dependencies/node_modules","/work/node_modules",{recursive:true,dereference:true,force:false,errorOnExist:true});
- let ready = false;
+${needsNats ? ` let ready = false;
  for (let attempt = 0; attempt < 50 && !ready; attempt++) {
   ready = await new Promise(resolve => {
    let connection, received = "";
@@ -129,7 +143,7 @@ function reviewedBootstrap(lockDigest: string): string {
   });
   if (!ready) await Bun.sleep(100);
  }
- if (!ready) throw Error("Job-private NATS not ready");`;
+ if (!ready) throw Error("Job-private NATS not ready");` : ''}`;
 }
 
 function isolatedContainerFlags(budget: ContainerBudget, seconds: number, uid: number, gid: number): string[] {
@@ -291,13 +305,12 @@ async function executeAdmittedRemoteTest(
    if (!(await lock.stat()).isFile() || `sha256:${createHash("sha256").update(await lock.readFile()).digest("hex")}` !== job.lockDigest) throw new Error("Lock identity mismatch");
   } finally { await lock.close(); }
   if (selected.profile.reviewed) {
+   const { recipe } = reviewedRecipe(selected.profile.reviewed);
    const packageFile = await open(join(checkout, "package.json"), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
    try {
     if (!(await packageFile.stat()).isFile()) throw Error("Invalid package file");
-    const pkg = JSON.parse(await packageFile.readFile("utf8"));
-    if (pkg.name !== "@the-metafactory/myelin" || pkg.scripts?.test !== "bun test" || pkg.scripts?.typecheck !== "bunx tsc --noEmit" || pkg.scripts?.lint !== "eslint .") throw Error("Repository recipe requires renewed review");
+    if (recipePackageRefusal(JSON.parse(await packageFile.readFile("utf8")), recipe)) throw Error("Repository recipe requires renewed review");
    } finally { await packageFile.close(); }
-   // A new test root needs renewed review rather than silently losing coverage.
    const pending = [checkout]; let entries = 0;
    while (pending.length) {
     const directory = pending.pop()!;
@@ -307,7 +320,7 @@ async function executeAdmittedRemoteTest(
      const path = join(directory, entry.name), relative = path.slice(checkout.length + 1);
      if (entry.isSymbolicLink()) throw Error("Reviewed recipe does not support source symlinks");
      if (entry.isDirectory()) { pending.push(path); continue; }
-     if (/(?:[._](?:test|spec))\.(?:[cm]?[jt]sx?)$/.test(entry.name) && !/^(?:src\/|scripts\/|tools\/|tests\/integration\/|tests\/package-exports\.smoke\.test\.ts$)/.test(relative)) throw Error("New test root requires recipe review");
+     if (/(?:[._](?:test|spec))\.(?:[cm]?[jt]sx?)$/.test(entry.name) && unresolvedTestRoot(relative, recipe)) throw Error("New test root requires recipe review");
     }
    }
   }

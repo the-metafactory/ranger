@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stringify } from "yaml";
@@ -270,6 +270,40 @@ describe("node #301 — scheduled jobs", () => {
   const ok = await runJob(okId, { config: s.config, journal: s.journal, substrate: "claude",
    runSession: session({}, "soma:outputs/G6/2026-10-15.md").runSession, ledger: s.ledger });
   expect(ok).toMatchObject({ status: "succeeded", result: "soma:outputs/G6/2026-10-15.md" });
+ });
+
+ test("a job with a host runs over ssh, takes its result from the marked line, and logs no session output here", async () => {
+  const r = rig([{ ...SHORT, host: "macjcf.local", requireResult: true }]);
+  const runId = await startedRun(r);
+  const s = session({ stdout: "remote log: macjcf:/Users/x/.local/state/ranger-jobs/daily-short-1.log\nRANGER_JOB_RESULT soma:outputs/G8-2026-w47.md\n" });
+  const outcome = await runJob(runId, { config: r.config, journal: r.journal, substrate: "claude", runSession: s.runSession, ledger: r.ledger });
+  expect(outcome).toMatchObject({ status: "succeeded", result: "soma:outputs/G8-2026-w47.md" });
+  const call = s.calls[0];
+  expect([call.bin, ...call.args.slice(0, 5)]).toEqual(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "macjcf.local"]);
+  expect(call.args.at(-1)).toStartWith("/bin/bash -c ");
+  expect(call.args.at(-1)).toContain("/tmp");
+  expect(call.opts.cwd).not.toBe("/tmp");
+  expect(call.opts.timeoutMs).toBe((90 + 2) * 60_000);
+  const log = readFileSync(outcome.log!, "utf8");
+  expect(log).toContain("remote log: macjcf:");
+  expect(r.envelopes[0].input.payload).toMatchObject({ outcome: "succeeded" });
+ });
+
+ test("a job that pins a pi model runs that model, never the host's pi provider, and in the login session when asked", async () => {
+  const r = rig([{ ...SHORT, substrates: ["pi"], host: "macjcf.local", hostSession: "login", pi: { provider: "spark", model: "longctx-think" } }],
+   { substrates: { pi: { provider: "openrouter", model: "deepseek/deepseek-v4.1-flash-1017", reachable: "https://openrouter.ai/api/v1/models" } } });
+  const runId = await startedRun(r);
+  const s = session({ stdout: "remote log: macjcf:/x.log\nRANGER_JOB_RESULT soma:outputs/G8-2026-w46.md\n" });
+  const probed: string[] = [];
+  const outcome = await runJob(runId, { config: r.config, journal: r.journal, substrate: "pi", runSession: s.runSession, ledger: r.ledger,
+   endpointProbe: async (url: string) => { probed.push(url); return true; } });
+  expect(outcome).toMatchObject({ status: "succeeded", substrate: "pi", result: "soma:outputs/G8-2026-w46.md" });
+  const script = s.calls[0].args.at(-1)!.replaceAll("'\\''", "'");
+  expect(script).toContain("'pi' '-p' '--provider' 'spark' '--model' 'longctx-think'");
+  expect(script).not.toContain("openrouter");
+  expect(script).not.toContain("deepseek");
+  expect(script).toContain("/bin/launchctl submit -l");
+  expect(probed).not.toContain("https://openrouter.ai/api/v1/models");
  });
 
  test("without requireResult a clean exit with no result still succeeds", async () => {

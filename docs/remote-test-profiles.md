@@ -2,11 +2,11 @@
 
 `createReviewedProfile(input)` in `src/remote-test/profiles.ts` expands a reviewed recipe into a V1 manifest with named commands and a canonical SHA-256 digest. Start with [the placeholder input](examples/remote-test-myelin-profile.json), replace every placeholder privately, generate the manifest and review it before adding it to both executor and SSH allow-lists. Runtime `imageReference` still belongs in the private executor config and must match `imageDigest`. No live allow-list is enabled by this change.
 
-The first recipe is `myelin-v1`, bound to `github:github.com/the-metafactory/myelin` and Linux ARM64. Its commands and dependencies were inspected at Myelin commit `c67e64fe2f4c6be749f5eeea4b1d565a91dde2d9`. Unit checks include `src`, `scripts`, `tools` and the package export smoke test; integration checks include `tests/integration`; typecheck and lint invoke the installed TypeScript and ESLint entrypoints through Bun. All four named checks are mandatory, without duplicate names. Arbitrary argv, graphical/platform-specific commands, endpoints, credentials, extra services and mutable sidecar image tags are rejected. A changed package name or test/typecheck/lint script refuses execution pending renewed recipe review. Additional repositories and new test roots require a code-reviewed recipe; this is not a generic script runner. Legacy approved V1 manifests remain supported with their existing operator-owned approval boundary.
+The first recipe is `myelin-v1`, bound to `github:github.com/the-metafactory/myelin` and Linux ARM64. Its commands and dependencies were inspected at Myelin commit `c67e64fe2f4c6be749f5eeea4b1d565a91dde2d9`. Unit checks include `src`, `scripts`, `tools` and the package export smoke test; integration checks include `tests/integration`; typecheck and lint invoke the installed TypeScript and ESLint entrypoints through Bun. Every check a recipe declares is mandatory, without duplicate names, and a name the selected recipe does not declare is refused. Arbitrary argv, graphical/platform-specific commands, endpoints, credentials, extra services and mutable sidecar image tags are rejected. Each recipe also pins its repository's package name, every package script its commands call and the source roots a test file may live in; a changed value refuses execution pending renewed recipe review. Additional repositories need a code-reviewed recipe; this is not a generic script runner. Legacy approved V1 manifests remain supported with their existing operator-owned approval boundary.
 
 The pinned Bun image must contain a self-contained Linux ARM64 dependency snapshot at `/opt/ranger-dependencies/node_modules` and its original `bun.lock` alongside it. The wrapper verifies the image lock digest, refuses source-owned `node_modules`, copies the snapshot into this job's checkout without hardlinks, then runs `bun install --frozen-lockfile --offline --ignore-scripts --backend=copyfile --cache-dir=/tmp/ranger-install`. Bun configuration and automatic env-file loading are disabled. There is no reusable writable dependency cache or shared `node_modules`; install scratch is private and destroyed with the container. Missing dependencies fail offline rather than downloading packages or a runtime. The reviewed recipe explicitly binds `runtime: bun-1.3.14` and refuses any other Bun version before installation; CI uses the same fixed version. Runtime images are inspected locally at their manifest digests and never pulled.
 
-The NATS image must be a reviewed Linux ARM64 image containing `/nats-server`, `/bin/sh`, `id` and `cat`, supporting JetStream and execution as the operator's non-root UID/GID. It receives no configuration file or inherited credentials. Its fixed startup checks actual cgroup CPU, memory, swap and PID limits before launching NATS on loopback port 4222 with JetStream storage in a disposable, bounded `/data` tmpfs volume. NATS owns a `network=none` namespace; the test container joins only that container's namespace. No host port is published, no external network is created and no control-plane connection or leaf configuration exists. The wrapper waits for a NATS PONG, then gives every reviewed command only PATH, HOME and the fixed job-private `NATS_URL`. Job `.env` files cannot override it.
+The NATS image must be a reviewed Linux ARM64 image containing `/nats-server`, `/bin/sh`, `id` and `cat`, supporting JetStream and execution as the operator's non-root UID/GID. It receives no configuration file or inherited credentials. Its fixed startup checks actual cgroup CPU, memory, swap and PID limits before launching NATS on loopback port 4222 with JetStream storage in a disposable, bounded `/data` tmpfs volume. NATS owns a `network=none` namespace; the test container joins only that container's namespace. No host port is published, no external network is created and no control-plane connection or leaf configuration exists. When the recipe declares a sidecar, the wrapper waits for its NATS PONG; a recipe that declares none starts no broker and skips that wait. Every reviewed command gets only PATH, HOME and the fixed job-private `NATS_URL`. Job `.env` files cannot override it.
 
 | Container | CPU ceiling | Memory ceiling | PID ceiling |
 | --- | ---: | ---: | ---: |
@@ -51,9 +51,64 @@ Nothing in the suite reaches a real network: the GitHub and GitLab tests use fix
 
 This recipe has not been run in the container. The 2026-11-15 trial on a 2-vCPU x86 VM took 324 s with 56 of 3778 tests failing (git-lfs, cgroup timing, canonical-clone bootstrap, remote supervisor). If the container run fails beyond that list or exceeds two cores, 1.5 GiB or ten minutes, escalate with the failing tests instead of widening the recipe. Whether Bun 1.3.14 accepts `--path-ignore-patterns` and `--parallel` is also unchecked here; the local Bun is 1.4.4.
 
+## `cortex-v1`
+
+`cortex-v1` is bound to `github:github.com/the-metafactory/cortex`, needs no sidecar, and declares one check per `scripts/check.ts` gate at cortex commit `4b79b01a`, except `up-to-date` (marked `localOnly` because it needs `origin/main`, which an immutable bundle does not carry). The `test` gate's five steps are separate checks because only its last step takes the reviewed exclusions:
+
+| Check | Runs |
+| --- | --- |
+| `lint` | `scripts/check.ts lint` (`suppressions-guard.ts` + ESLint) |
+| `duplication` | `scripts/check.ts duplication` (jscpd ratchet) |
+| `unused-exports` | `scripts/check.ts unused-exports` (knip ratchet) |
+| `typecheck` | `scripts/check.ts typecheck` (`bunx tsc --noEmit`) |
+| `vocab` | `scripts/check.ts vocab` (`check-carveouts.sh` + `check-wire-vocab.ts`) |
+| `sdk` | `scripts/check.ts sdk` (`sdk:dts:check`, release pins, desk SDK, conformance export) |
+| `shippable` | `scripts/check.ts shippable` (`check-shippable-hygiene.ts`) |
+| `xdg` | `scripts/check.ts xdg` (`xdg-audit.ts --repos .`) |
+| `test-wake` | `scripts/build-desk-wake.ts` |
+| `test-wake-cache` | `scripts/desk-wake/probe-build-cache.ts` |
+| `test-desk-probes` | `scripts/check-desk-probes.ts` |
+| `test-conversation-tools` | `scripts/probe-conversation-tools.ts` |
+| `test` | `bun run test --parallel=2` with the reviewed exclusions, the disabled checkout config and cortex's preload below |
+
+### Base refs
+
+The immutable bundle carries the submitted commit's full ancestry but no remote refs. Three ratchets read `origin/main` through `resolveBaseRef` and exit 2 when it is absent: the suppression baseline in the `lint` gate, and the release-pin and desk-SDK drift checks in the `sdk` gate. The recipe sets their documented overrides (`LINT_BASE_REF`, `RELEASE_PINS_BASE_REF`, `DESK_SDK_BASE_REF`) to `HEAD^`, the newest commit the bundle contains. The comparison base is therefore the submitted commit's parent, not the merge base with `origin/main`: for a single-commit head they are the same, and for a multi-commit head the drift check is narrower. `bun run check` locally still uses `origin/main`, so this is a remote-lane difference, recorded rather than silent.
+
+### Bun configuration
+
+Every check starts with `bun --config=/dev/null --no-env-file`, the one pair of isolation flags `CONTAINER_BOOTSTRAP_FLAGS` in `src/remote-test/isolation.ts` declares for `myelin-v1`, `ranger-v1`, `cortex-v1` and the container bootstrap itself, so the checkout's `bunfig.toml` and `.env` never reach the process the recipe launches. Bun grandchildren are a different matter: two cortex scripts spawn them, `scripts/check.ts` runs each gate step as its own `bun`/`bunx` command, and `scripts/test.ts` spawns `bun test` once it has built a temporary `HOME` and `TMPDIR`. Those children run an argv the cortex scripts build, so only the flags the recipe below forwards reach them; they read `/work/bunfig.toml` and `/work/.env` whenever the submitted commit carries them. At cortex `4b79b01a` the bunfig holds one key, `[test] preload = ["./scripts/test-preload.ts"]`, which only the suite uses.
+
+The test check therefore forwards `--config=/dev/null` to the spawned suite and passes `--preload=./scripts/test-preload.ts` itself, so the suite loads that preload because the reviewed recipe declares it. The preload refuses a run against the real `HOME` or a temp directory that outlives the run, and fails a test that leaks a non-zero `process.exitCode`. `--no-env-file` is not forwarded, so a `.env` in the submitted commit still injects variables into that suite process, and the gate steps that `scripts/check.ts` spawns read both files freely, because no flag reaches them either. This recipe claims bunfig and env-file isolation for the commands it launches, not for their Bun descendants; a submitted commit that carries a `.env` therefore changes what the gates and the suite see.
+
+### Network and sidecar
+
+- The only network use is `scripts/build-desk-wake.ts`, which downloads three sha256-pinned archives from `registry.npmjs.org` and the sherpa-onnx GitHub release. The image seeds the dependency snapshot's `node_modules/.cache/desk-wake/<sha256>` with them; the script verifies each sha256 before extraction, so the build stays offline. `probe-build-cache.ts` then reuses those archives. A missing or altered archive fails the check instead of fetching.
+- No gate talks to a shared broker. Cortex's suites start their own disposable `nats-server` on loopback, so the recipe declares no NATS sidecar and the test container runs with `--network=none`.
+- `check-wire-vocab` resolves the Myelin RFC pack through `MYELIN_RFC_DIR`, a `../myelin` checkout or `gh api`. With none present it prints a non-blocking `SKIPPING` line and exits zero.
+
+### Runtime image requirements
+
+Everything the Myelin image needs (pinned Bun 1.3.14, `/opt/ranger-dependencies/node_modules` with its `bun.lock`), plus:
+
+- `git`, `bash` and `grep`: `shippable` and `xdg` call `git`, and `vocab` runs `check-carveouts.sh`.
+- `tar`: `build-desk-wake` and `probe-build-cache` extract the pinned archives.
+- `nats-server` 2.14.0 on `PATH`: six suites skip without it, and a skipped test fails the receipt.
+- `node` on `PATH` (any current LTS): the cc-events mTLS wire test starts a Node TLS server.
+- `/usr/bin/env`: the base-ref overrides are passed as an argv prefix.
+- The three wake archives at `node_modules/.cache/desk-wake/031b235001fb41cc20ad405abe48e07891094047d6f462c9bdbb5a57434d2d54`, `.../74ad6965c6f8cb61d17b1798d48095c3238eca5707b517640a12150f17b8f93d` and `.../f170013b4716e41b62b9bfd809687c207cef798ef9bc6534d524e17af9b6561a`.
+- A non-root user and a writable `/tmp` that a full run's temporary homes and repositories fit in.
+
+### Excluded tests
+
+A skipped or todo test makes a receipt `infra_failed`, so `CORTEX_EXCLUDED_TESTS` in `src/remote-test/recipes.ts` excludes whole files that gate themselves on a capability this lane does not provide: the three macOS `sandbox-exec` files, the three `claude`-binary files, the two `SYSTEMD_E2E` files, the `scan-deploy-surface` engine-pack cases, the built-dashboard case and the five `pi`-binary files. Each entry carries its reason; any other exclusion needs renewed review. The bluntness costs coverage: a file with one gated test loses its ungated tests too, and `bun test` cannot filter a `describe.skip` block by name. `src/bus/nats/__tests__/connection.test.ts` is kept because only its empty `test.skip` placeholder is gated; `--test-name-pattern` drops that one test by name. `scripts/test.ts` forwards its own argv to `bun test`, so every reviewed flag and exclusion reaches the suite.
+
+### Unverified here
+
+This recipe has not been run in a container. Cortex's CI `Test` job (`bun scripts/check.ts test`) took 5 m 48 s on an `ubuntu-latest` runner with Bun latest; the profile pins Bun 1.3.14, and cortex warns that Bun before 1.4.3 can hang in `Bun.spawnSync` once a child exits. Two cores, 1.5 GiB, ten minutes and the 64 MiB `/tmp` tmpfs are not measured against this suite. `scripts/test.ts` at `4b79b01a` forwards `process.argv.slice(2)` to `bun test`, so the reviewed flags reach the suite; a local Bun 1.4.4 probe of the reviewed command shape ran `scripts/__tests__/check-unused-exports.test.ts` green through `scripts/test.ts`, `--config`, `--preload` and `--test-name-pattern` included. Whether Bun 1.3.14 accepts `--parallel`, `--path-ignore-patterns`, `--test-name-pattern`, `--config` and `--preload` as the recipe passes them is unchecked (as with `ranger-v1`; the local Bun is 1.4.4). If the container run fails or does not fit, escalate with the failing tests and the measurement instead of widening the recipe.
 ## `threva-app-v1`
 
-`threva-app-v1` is bound to `github:github.com/the-metafactory/threva-app`, needs no sidecar, and runs the three checks `scripts/check.ts` runs, in its order: `typecheck`, `lint`, `unit`. Commands were inspected at threva-app commit `e690d7a91af36a24ff1b2efaecf2c22c19c41e2f`.
+`threva-app-v1` is bound to `github:github.com/jcfischer/threva-app`, needs no sidecar, and runs the three checks `scripts/check.ts` runs, in its order: `typecheck`, `lint`, `unit`. Commands were inspected at threva-app commit `e690d7a91af36a24ff1b2efaecf2c22c19c41e2f`.
 
 | Check | `scripts/check.ts` step | Recipe argv, after the frozen install |
 | --- | --- | --- |

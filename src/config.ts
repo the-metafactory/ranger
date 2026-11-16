@@ -7,6 +7,7 @@ import { parse } from "yaml";
 import { z } from "zod";
 import { parseForgeRef, repoIdentity, validReadTokenPrefix } from "./forge-ref.ts";
 import { workerEnvPasses } from "./untrusted-env.ts";
+import { HOST_PATTERN, HOST_SESSIONS } from "./remote-job.ts";
 import { SUBSTRATE_NAMES } from "./store/schema.ts";
 import { GitHubApiBaseUrlSchema } from "./github-api-base.ts";
 export { REPO_PATTERN } from "./forge-ref.ts";
@@ -502,7 +503,16 @@ const JobSchema = z.object({
   */
  requireResult: z.boolean().default(false),
  claudeSession: ClaudeSessionSchema.optional(),
-});
+ host: z.string().regex(HOST_PATTERN, "a plain host name").optional(),
+ hostSession: z.enum(HOST_SESSIONS).optional(),
+ pi: z.object({
+  provider: z.string().regex(MODEL_NAME, "a plain provider name"),
+  model: z.string().regex(MODEL_NAME, "a plain model name"),
+  reachable: z.string().url().optional(),
+ }).strict().optional(),
+})
+ .refine(job => job.pi === undefined || (job.substrates.length === 1 && job.substrates[0] === "pi"), { message: "a job that pins a pi model runs on pi only: substrates must be [pi]", path: ["substrates"] })
+ .refine(job => job.hostSession === undefined || job.host !== undefined, { message: "hostSession needs a host", path: ["hostSession"] });
 
 const RangerConfigSchema = z.object({
  version: z.literal(1).default(1),

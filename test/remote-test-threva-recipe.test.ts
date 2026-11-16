@@ -34,3 +34,7 @@ test("the recipe stays bound to its repository and admits only that repository's
  const ranger = createReviewedProfile({ ...input, profileId: "ranger-v1", reviewed: { ...input.reviewed, repositoryId: RANGER_REPOSITORY, recipe: "ranger-v1" } });
  expect(() => validateRemoteTestJob(jobFor(ranger, THREVA_APP_REPOSITORY), ranger)).toThrow("Reviewed recipe repository mismatch");
 });
+
+test("the recipe pins the Threva repository, which is not under the-metafactory", () => {
+ expect(THREVA_APP_REPOSITORY).toBe("github:github.com/jcfischer/threva-app");
+});
