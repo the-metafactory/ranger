@@ -1,11 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stringify } from "yaml";
 import { ConfigError, loadConfig } from "../src/config.ts";
-import { remoteJobArgv, remoteJobResult, REMOTE_RESULT_MARK } from "../src/remote-job.ts";
+import { remoteJobArgv, remoteJobResult, REMOTE_KILL_GRACE_S, REMOTE_RESULT_MARK, REMOTE_TIMED_OUT } from "../src/remote-job.ts";
 
 const spec = { host: "macjcf.local", cwd: "~/work/abacus-timesheet", name: "abacus-friday", runId: 7, wallClockMin: 60 };
 
@@ -64,15 +64,65 @@ describe("jobs on another host", () => {
   }
  });
 
- test("the host stops the worker at the wall clock", () => {
+ test("the host stops the worker at the wall clock and reports a timeout, not a success", () => {
   const home = mkdtempSync(join(tmpdir(), "ranger-remote-"));
   try {
    spawnSync("mkdir", ["-p", join(home, "work/abacus-timesheet")]);
-   const script = remoteJobArgv({ ...spec, wallClockMin: 1 / 60 }, ["/bin/sleep", "30"], "").at(-1)!;
+   const script = remoteJobArgv({ ...spec, wallClockMin: 1 / 60 }, ["/bin/sh", "-c", "/bin/sleep 30"], "prompt").at(-1)!;
    const started = Date.now();
    const run = runScript(script, home);
    expect(Date.now() - started).toBeLessThan(10_000);
-   expect(run.status).not.toBe(0);
+   expect(run.status).toBe(REMOTE_TIMED_OUT);
+   expect(remoteJobResult(run.stdout)).toBeNull();
+  } finally {
+   rmSync(home, { recursive: true, force: true });
+  }
+ });
+
+ test("a worker that ignores TERM is killed with its children after the grace period", () => {
+  const home = mkdtempSync(join(tmpdir(), "ranger-remote-"));
+  try {
+   spawnSync("mkdir", ["-p", join(home, "work/abacus-timesheet")]);
+   const worker = join(home, "stubborn.sh");
+   writeFileSync(worker, `trap '' TERM\nprintf 'soma:outputs/late.md\\n' > "$RANGER_JOB_RESULT_FILE"\n/bin/sleep 47.25 &\nwait\n`);
+   const script = remoteJobArgv({ ...spec, wallClockMin: 1 / 60 }, ["/bin/sh", worker], "prompt").at(-1)!;
+   const started = Date.now();
+   const run = runScript(script, home);
+   expect(Date.now() - started).toBeLessThan((REMOTE_KILL_GRACE_S + 5) * 1000);
+   expect(run.status).toBe(REMOTE_TIMED_OUT);
+   expect(remoteJobResult(run.stdout)).toBeNull();
+   expect(spawnSync("pgrep", ["-f", "sleep 47.25"]).status).toBe(1);
+  } finally {
+   rmSync(home, { recursive: true, force: true });
+  }
+ }, 30_000);
+
+ test("the session log is readable by its owner only", () => {
+  const home = mkdtempSync(join(tmpdir(), "ranger-remote-"));
+  try {
+   spawnSync("mkdir", ["-p", join(home, "work/abacus-timesheet")]);
+   const script = remoteJobArgv(spec, ["/bin/sh", "-c", "echo secret"], "").at(-1)!;
+   runScript(script, home);
+   expect(statSync(join(home, ".local/state/ranger-jobs")).mode & 0o777).toBe(0o700);
+   expect(statSync(join(home, ".local/state/ranger-jobs/abacus-friday-7.log")).mode & 0o777).toBe(0o600);
+  } finally {
+   rmSync(home, { recursive: true, force: true });
+  }
+ });
+
+ test("the worker gets only the allowlisted environment of the host", () => {
+  const home = mkdtempSync(join(tmpdir(), "ranger-remote-"));
+  try {
+   const cwd = join(home, "work/abacus-timesheet");
+   spawnSync("mkdir", ["-p", cwd]);
+   const script = remoteJobArgv(spec, ["/bin/sh", "-c", "env > env.txt"], "").at(-1)!;
+   spawnSync("/bin/sh", ["-c", script], { encoding: "utf8", env: { PATH: process.env.PATH, HOME: home, GH_TOKEN: "gh-secret", RANGER_DISCORD_TOKEN: "d-secret", FOO: "x", OPENROUTER_API_KEY: "kept" } });
+   const seen = readFileSync(join(cwd, "env.txt"), "utf8");
+   expect(seen).not.toContain("gh-secret");
+   expect(seen).not.toContain("d-secret");
+   expect(seen).not.toContain("FOO=");
+   expect(seen).toContain("OPENROUTER_API_KEY=kept");
+   expect(seen).toContain(`HOME=${home}`);
   } finally {
    rmSync(home, { recursive: true, force: true });
   }

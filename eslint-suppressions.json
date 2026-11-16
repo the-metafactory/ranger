@@ -1061,7 +1061,7 @@
   },
   "src/untrusted-env.ts": {
     "ranger/no-comments": {
-      "count": 2
+      "count": 1
     }
   },
   "src/views.ts": {

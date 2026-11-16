@@ -280,7 +280,8 @@ describe("node #301 — scheduled jobs", () => {
   expect(outcome).toMatchObject({ status: "succeeded", result: "soma:outputs/G8-2026-w47.md" });
   const call = s.calls[0];
   expect([call.bin, ...call.args.slice(0, 5)]).toEqual(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "macjcf.local"]);
-  expect(call.args.at(-1)).toContain("cd '/tmp' ||");
+  expect(call.args.at(-1)).toStartWith("/bin/sh -c ");
+  expect(call.args.at(-1)).toContain("/tmp");
   expect(call.opts.cwd).not.toBe("/tmp");
   expect(call.opts.timeoutMs).toBe((90 + 2) * 60_000);
   const log = readFileSync(outcome.log!, "utf8");
