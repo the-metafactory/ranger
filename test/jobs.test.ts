@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stringify } from "yaml";
@@ -270,6 +270,23 @@ describe("node #301 — scheduled jobs", () => {
   const ok = await runJob(okId, { config: s.config, journal: s.journal, substrate: "claude",
    runSession: session({}, "soma:outputs/G6/2026-10-15.md").runSession, ledger: s.ledger });
   expect(ok).toMatchObject({ status: "succeeded", result: "soma:outputs/G6/2026-10-15.md" });
+ });
+
+ test("a job with a host runs over ssh, takes its result from the marked line, and logs no session output here", async () => {
+  const r = rig([{ ...SHORT, host: "macjcf.local", requireResult: true }]);
+  const runId = await startedRun(r);
+  const s = session({ stdout: "remote log: macjcf:/Users/x/.local/state/ranger-jobs/daily-short-1.log\nRANGER_JOB_RESULT soma:outputs/G8-2026-w47.md\n" });
+  const outcome = await runJob(runId, { config: r.config, journal: r.journal, substrate: "claude", runSession: s.runSession, ledger: r.ledger });
+  expect(outcome).toMatchObject({ status: "succeeded", result: "soma:outputs/G8-2026-w47.md" });
+  const call = s.calls[0];
+  expect([call.bin, ...call.args.slice(0, 5)]).toEqual(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "macjcf.local"]);
+  expect(call.args.at(-1)).toStartWith("/bin/bash -c ");
+  expect(call.args.at(-1)).toContain("/tmp");
+  expect(call.opts.cwd).not.toBe("/tmp");
+  expect(call.opts.timeoutMs).toBe((90 + 2) * 60_000);
+  const log = readFileSync(outcome.log!, "utf8");
+  expect(log).toContain("remote log: macjcf:");
+  expect(r.envelopes[0].input.payload).toMatchObject({ outcome: "succeeded" });
  });
 
  test("without requireResult a clean exit with no result still succeeds", async () => {

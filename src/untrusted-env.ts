@@ -3,7 +3,7 @@
  * config validation can refuse credential env names that would pass it
  * without importing worker-env.ts (which imports config.ts).
  */
-const ALLOWED_NAMES = new Set([
+export const ALLOWED_NAMES = new Set([
  "PATH",
  "HOME",
  "USER",
@@ -26,7 +26,7 @@ const ALLOWED_NAMES = new Set([
  "GIT_TERMINAL_PROMPT",
 ]);
 
-const ALLOWED_PREFIXES = [
+export const ALLOWED_PREFIXES = [
  "ANTHROPIC_",
  "CLAUDE_",
  "CLAUDECODE_",
