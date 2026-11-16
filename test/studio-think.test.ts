@@ -13,7 +13,7 @@ afterEach(() => { for (const close of cleanup.splice(0).reverse()) close(); });
 const now = new Date("2026-10-31T10:00:00Z");
 const thread = (areas = "lab") => `---\ntype: question\nareas: [${areas}]\nstate: active\nopened: 2026-10-01\n---\n\n## Question\n\nHow do we test this?\n\n## Where I stand\n\nCarefully.\n\n## Material\n\n- capture: Test a real git repository.\n\n## Ivy's notes\n\n## Log\n\n- 2026-10-01: Opened\n`;
 
-function rig(areas = "lab", budget = 5, format = "sha1") {
+function rig(areas = "lab", budget = 5, format = "sha1", jobExtra: Record<string, unknown> = {}) {
  const dir = mkdtempSync(join(tmpdir(), "studio-think-"));
  cleanup.push(() => rmSync(dir, { recursive: true, force: true }));
  const repo = join(dir, "studio");
@@ -33,7 +33,7 @@ function rig(areas = "lab", budget = 5, format = "sha1") {
  cleanup.push(() => { server.stop(true); });
  const studio = { dir: repo, url: `http://127.0.0.1:${server.port}/api/desk/studio`, localProvider: "test-local", localEndpoint: "http://127.0.0.1:9999/v1", dailyRuns: { local: budget, cloud: budget } };
  const configPath = join(dir, "ranger.yaml");
- writeFileSync(configPath, stringify({ maps: [{ repo: "acme/example", root: 1 }], state: { journalPath: join(dir, "journal.sqlite") }, substrates: { pi: { provider: "test-local", model: "local-model" } }, jobs: [{ name: "ivy-think", skill: "ivy-think", lane: "headless", wallClockMin: 5, cwd: repo, substrates: ["claude", "pi"], requireResult: true, studio }] }));
+ writeFileSync(configPath, stringify({ maps: [{ repo: "acme/example", root: 1 }], state: { journalPath: join(dir, "journal.sqlite") }, substrates: { pi: { provider: "test-local", model: "local-model" } }, jobs: [{ name: "ivy-think", skill: "ivy-think", lane: "headless", wallClockMin: 5, cwd: repo, substrates: ["claude", "pi"], requireResult: true, studio, ...jobExtra }] }));
  const config = loadConfig(configPath, {}).config;
  const journal = openJournal(config);
  cleanup.push(() => journal.close());
@@ -197,6 +197,19 @@ test("local substrate requires endpoint attestation and never has cloud fallback
  } });
  expect(result).toMatchObject({ status: "succeeded", substrate: "pi" });
  expect(r.journal.getJobRun(id)?.substrate).toBe("pi");
+});
+
+test("a Studio job that pins a pi model runs the pinned model, not the host's", async () => {
+ const r = rig("work", 5, "sha1", { substrates: ["pi"], pi: { provider: "test-local", model: "pinned-model" } });
+ const prior = process.env.PI_CODING_AGENT_DIR;
+ process.env.PI_CODING_AGENT_DIR = r.dir;
+ cleanup.push(() => { if (prior === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = prior; });
+ writeFileSync(join(r.dir, "models.json"), JSON.stringify({ providers: { "test-local": { baseUrl: r.job.studio?.localEndpoint, api: "openai-completions", models: [{ id: "local-model" }, { id: "pinned-model" }] } } }));
+ const id = await reserve(r);
+ let seen: string[] = [];
+ const result = await runJob(id, { ...r, now: () => now, substrate: "pi", runSession: async (_bin, args) => { seen = args; return { code: 0, stdout: response, stderr: "" }; } });
+ expect(result).toMatchObject({ status: "succeeded", substrate: "pi" });
+ expect(seen.slice(seen.indexOf("--model"), seen.indexOf("--model") + 2)).toEqual(["--model", "pinned-model"]);
 });
 
 test("different stack policy, unavailable policy and closed threads fail closed", async () => {

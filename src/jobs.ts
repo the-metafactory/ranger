@@ -264,7 +264,7 @@ export async function jobPass(ctx: JobPassContext): Promise<JobPassResult> {
    if (prepared.kind === "deferred") { wait(prepared.reason); continue; }
    const limit = job.studio ? studioLimit(prepared, job.studio, journal.listJobRuns(), now, run.id) : "Studio job is not configured";
    if (limit) { wait(limit); continue; }
-   permitted = await studioSubstrates(job, config, prepared.policy);
+   permitted = await studioSubstrates(job, jobConfigFor(config, job), prepared.policy);
    declaredEndpoint = jobModelEndpoint(job, prepared.policy);
    if (permitted.length === 0) { wait(`No permitted ${prepared.policy} substrate is available`); continue; }
    journal.updateJobRun(run.id, "queued", { policy: prepared.policy, reason: null });
@@ -438,7 +438,7 @@ export async function runJob(runId: number, ctx: RunJobContext): Promise<RunJobO
   const limit = studioLimit(studio, job.studio, journal.listJobRuns(), now(), run.id);
   if (limit) return defer(limit);
  }
- const permitted = studio?.kind === "ready" ? await studioSubstrates(job, config, studio.policy) : job.substrates;
+ const permitted = studio?.kind === "ready" ? await studioSubstrates(job, jobConfig, studio.policy) : job.substrates;
  if (permitted.length === 0) return defer("No policy-permitted substrate is available");
  if (ctx.substrate !== undefined && !permitted.includes(ctx.substrate)) return defer("Requested substrate is forbidden by the job policy");
  let substrate = ctx.substrate ?? permitted[0];
@@ -466,7 +466,7 @@ export async function runJob(runId: number, ctx: RunJobContext): Promise<RunJobO
 
  const scratch = mkdtempSync(join(tmpdir(), "ranger-job-"));
  const resultFile = join(scratch, "result");
- const command = studio?.kind === "ready" ? studioCommand(substrate, config, resultFile) : workerCommandFor(substrate, jobConfig, job.claudeSession === undefined ? {} : { claudeSession: job.claudeSession });
+ const command = studio?.kind === "ready" ? studioCommand(substrate, jobConfig, resultFile) : workerCommandFor(substrate, jobConfig, job.claudeSession === undefined ? {} : { claudeSession: job.claudeSession });
  const prompt = studio?.kind === "ready" ? studioPrompt(studio) : jobPrompt(job, substrate);
  const remote = studio === null && job.host !== undefined
   ? remoteJobArgv({ host: job.host, cwd: job.cwd, name: job.name, runId, wallClockMin: job.wallClockMin, session: job.hostSession }, command, prompt)

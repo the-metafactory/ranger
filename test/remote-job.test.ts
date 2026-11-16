@@ -84,39 +84,12 @@ describe("jobs on another host", () => {
   });
  });
 
- test("a worker that ignores TERM is killed with its children after the grace period", () => {
-  withRemoteHome((home, cwd) => {
-   const worker = join(home, "stubborn.sh");
-   writeFileSync(worker, `trap '' TERM\nprintf 'soma:outputs/late.md\\n' > "$RANGER_JOB_RESULT_FILE"\n/bin/sleep 47.25 &\nwait\n`);
-   const script = remoteJobArgv({ ...spec, wallClockMin: 1 / 60 }, ["/bin/sh", worker], "prompt").at(-1)!;
-   const started = Date.now();
-   const run = runScript(script, home);
-   expect(Date.now() - started).toBeLessThan((REMOTE_KILL_GRACE_S + 5) * 1000);
-   expect(run.status).toBe(REMOTE_TIMED_OUT);
-   expect(remoteJobResult(run.stdout)).toBeNull();
-   expect(goneWithin("sleep 47.25", 3000)).toBe(true);
-  });
- }, 30_000);
-
  test("the session log is readable by its owner only", () => {
   withRemoteHome((home, cwd) => {
    const script = remoteJobArgv(spec, ["/bin/sh", "-c", "echo secret"], "").at(-1)!;
    runScript(script, home);
    expect(statSync(join(home, ".local/state/ranger-jobs")).mode & 0o777).toBe(0o700);
    expect(statSync(join(home, ".local/state/ranger-jobs/abacus-friday-7.log")).mode & 0o777).toBe(0o600);
-  });
- });
-
- test("the worker gets only the allowlisted environment of the host", () => {
-  withRemoteHome((home, cwd) => {
-   const script = remoteJobArgv(spec, ["/bin/sh", "-c", "env > env.txt"], "").at(-1)!;
-   spawnSync("/bin/bash", ["-c", script], { encoding: "utf8", env: { PATH: process.env.PATH, HOME: home, GH_TOKEN: "gh-secret", RANGER_DISCORD_TOKEN: "d-secret", FOO: "x", OPENROUTER_API_KEY: "kept" } });
-   const seen = readFileSync(join(cwd, "env.txt"), "utf8");
-   expect(seen).not.toContain("gh-secret");
-   expect(seen).not.toContain("d-secret");
-   expect(seen).not.toContain("FOO=");
-   expect(seen).toContain("OPENROUTER_API_KEY=kept");
-   expect(seen).toContain(`HOME=${home}`);
   });
  });
 
@@ -155,32 +128,39 @@ describe("jobs on another host", () => {
   });
  }, 30_000);
 
- test.skipIf(!onMac)("login: the deadline stops the worker and its children, reports 124, and removes the label", () => {
-  withRemoteHome(home => {
-   const s = { ...loginSpec(), wallClockMin: 1 / 60 };
-   const worker = join(home, "stubborn.sh");
-   writeFileSync(worker, `trap '' TERM\nprintf 'soma:outputs/late.md\\n' > "$RANGER_JOB_RESULT_FILE"\n/bin/sleep 53.75 &\nwait\n`);
-   const started = Date.now();
-   const run = runScript(remoteJobArgv(s, ["/bin/sh", worker], "prompt").at(-1)!, home);
-   expect(Date.now() - started).toBeLessThan((REMOTE_KILL_GRACE_S + 8) * 1000);
-   expect(run.status).toBe(REMOTE_TIMED_OUT);
-   expect(remoteJobResult(run.stdout)).toBeNull();
-   expect(goneWithin("sleep 53.75", 3000)).toBe(true);
-   expect(labelGone(s.runId)).toBe(true);
-  });
- }, 40_000);
+ for (const session of ["ssh", "login"] as const) {
+  const skip = session === "login" && !onMac;
+  const specFor = () => ({ ...spec, session, runId: 900_000 + Math.floor(Math.random() * 99_999) });
 
- test.skipIf(!onMac)("login: the launchd job gets only the allowlisted environment", () => {
-  withRemoteHome((home, cwd) => {
-   const script = remoteJobArgv(loginSpec(), ["/bin/sh", "-c", "env > env.txt"], "").at(-1)!;
-   spawnSync("/bin/bash", ["-c", script], { encoding: "utf8", env: { PATH: process.env.PATH, HOME: home, GH_TOKEN: "gh-secret", FOO: "x", OPENROUTER_API_KEY: "kept" } });
-   const seen = readFileSync(join(cwd, "env.txt"), "utf8");
-   expect(seen).not.toContain("gh-secret");
-   expect(seen).not.toContain("FOO=");
-   expect(seen).toContain("OPENROUTER_API_KEY=kept");
-   expect(seen).toContain(`HOME=${home}`);
-  });
- }, 30_000);
+  test.skipIf(skip)(`${session}: a worker that ignores TERM is killed with its children at the deadline, with exit 124 and no result`, () => {
+   withRemoteHome(home => {
+    const s = { ...specFor(), wallClockMin: 1 / 60 };
+    const marker = `sleep ${40 + (s.runId % 1000) / 100}`;
+    const worker = join(home, "stubborn.sh");
+    writeFileSync(worker, `trap '' TERM\nprintf 'soma:outputs/late.md\\n' > "$RANGER_JOB_RESULT_FILE"\n/bin/${marker} &\nwait\n`);
+    const started = Date.now();
+    const run = runScript(remoteJobArgv(s, ["/bin/sh", worker], "prompt").at(-1)!, home);
+    expect(Date.now() - started).toBeLessThan((REMOTE_KILL_GRACE_S + 8) * 1000);
+    expect(run.status).toBe(REMOTE_TIMED_OUT);
+    expect(remoteJobResult(run.stdout)).toBeNull();
+    expect(goneWithin(marker, 3000)).toBe(true);
+    if (session === "login") expect(labelGone(s.runId)).toBe(true);
+   });
+  }, 40_000);
+
+  test.skipIf(skip)(`${session}: the worker gets only the allowlisted environment of the host`, () => {
+   withRemoteHome((home, cwd) => {
+    const script = remoteJobArgv(specFor(), ["/bin/sh", "-c", "env > env.txt"], "prompt").at(-1)!;
+    spawnSync("/bin/bash", ["-c", script], { encoding: "utf8", env: { PATH: process.env.PATH, HOME: home, GH_TOKEN: "gh-secret", RANGER_DISCORD_TOKEN: "d-secret", FOO: "x", OPENROUTER_API_KEY: "kept" } });
+    const seen = readFileSync(join(cwd, "env.txt"), "utf8");
+    expect(seen).not.toContain("gh-secret");
+    expect(seen).not.toContain("d-secret");
+    expect(seen).not.toContain("FOO=");
+    expect(seen).toContain("OPENROUTER_API_KEY=kept");
+    expect(seen).toContain(`HOME=${home}`);
+   });
+  }, 30_000);
+ }
 
  test("ranger.yaml: a job host is a plain host name, never an ssh option", () => {
   const dir = mkdtempSync(join(tmpdir(), "ranger-remote-cfg-"));
