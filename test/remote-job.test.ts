@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stringify } from "yaml";
@@ -10,7 +10,18 @@ import { remoteJobArgv, remoteJobResult, REMOTE_KILL_GRACE_S, REMOTE_RESULT_MARK
 const spec = { host: "macjcf.local", cwd: "~/work/abacus-timesheet", name: "abacus-friday", runId: 7, wallClockMin: 60 };
 
 function runScript(script: string, home: string) {
- return spawnSync("/bin/sh", ["-c", script], { encoding: "utf8", env: { ...process.env, HOME: home } });
+ return spawnSync("/bin/bash", ["-c", script], { encoding: "utf8", env: { ...process.env, HOME: home } });
+}
+
+function withRemoteHome(scenario: (home: string, cwd: string) => void, makeCwd = true) {
+ const home = mkdtempSync(join(tmpdir(), "ranger-remote-"));
+ const cwd = join(home, "work/abacus-timesheet");
+ try {
+  if (makeCwd) mkdirSync(cwd, { recursive: true });
+  scenario(home, cwd);
+ } finally {
+  rmSync(home, { recursive: true, force: true });
+ }
 }
 
 describe("jobs on another host", () => {
@@ -21,9 +32,7 @@ describe("jobs on another host", () => {
  });
 
  test("on the host it runs the worker in the job's cwd, logs there, and prints only the log path and the result", () => {
-  const home = mkdtempSync(join(tmpdir(), "ranger-remote-"));
-  try {
-   spawnSync("mkdir", ["-p", join(home, "work/abacus-timesheet")]);
+  withRemoteHome((home, cwd) => {
    const worker = join(home, "worker.sh");
    writeFileSync(worker, `pwd\necho "hours for Mo: 8111200 4.0"\nprintf 'soma:outputs/G8-2026-w47.md\\n' > "$RANGER_JOB_RESULT_FILE"\n`);
    const script = remoteJobArgv(spec, ["/bin/sh", worker], "prompt text").at(-1)!;
@@ -36,53 +45,38 @@ describe("jobs on another host", () => {
    const log = readFileSync(logPath!, "utf8");
    expect(log).toContain("hours for Mo: 8111200 4.0");
    expect(log).toContain(join(home, "work/abacus-timesheet"));
-  } finally {
-   rmSync(home, { recursive: true, force: true });
-  }
+  });
  });
 
  test("the worker's exit code comes back, and a run with no result has none", () => {
-  const home = mkdtempSync(join(tmpdir(), "ranger-remote-"));
-  try {
-   spawnSync("mkdir", ["-p", join(home, "work/abacus-timesheet")]);
+  withRemoteHome((home, cwd) => {
    const script = remoteJobArgv(spec, ["/bin/sh", "-c", "exit 3"], "").at(-1)!;
    const run = runScript(script, home);
    expect(run.status).toBe(3);
    expect(remoteJobResult(run.stdout)).toBeNull();
-  } finally {
-   rmSync(home, { recursive: true, force: true });
-  }
+  });
  });
 
  test("a missing cwd on the host fails before the worker starts", () => {
-  const home = mkdtempSync(join(tmpdir(), "ranger-remote-"));
-  try {
+  withRemoteHome((home, cwd) => {
    const script = remoteJobArgv(spec, ["/bin/sh", "-c", "exit 0"], "").at(-1)!;
    expect(runScript(script, home).status).toBe(97);
-  } finally {
-   rmSync(home, { recursive: true, force: true });
-  }
+  }, false);
  });
 
  test("the host stops the worker at the wall clock and reports a timeout, not a success", () => {
-  const home = mkdtempSync(join(tmpdir(), "ranger-remote-"));
-  try {
-   spawnSync("mkdir", ["-p", join(home, "work/abacus-timesheet")]);
+  withRemoteHome((home, cwd) => {
    const script = remoteJobArgv({ ...spec, wallClockMin: 1 / 60 }, ["/bin/sh", "-c", "/bin/sleep 30"], "prompt").at(-1)!;
    const started = Date.now();
    const run = runScript(script, home);
    expect(Date.now() - started).toBeLessThan(10_000);
    expect(run.status).toBe(REMOTE_TIMED_OUT);
    expect(remoteJobResult(run.stdout)).toBeNull();
-  } finally {
-   rmSync(home, { recursive: true, force: true });
-  }
+  });
  });
 
  test("a worker that ignores TERM is killed with its children after the grace period", () => {
-  const home = mkdtempSync(join(tmpdir(), "ranger-remote-"));
-  try {
-   spawnSync("mkdir", ["-p", join(home, "work/abacus-timesheet")]);
+  withRemoteHome((home, cwd) => {
    const worker = join(home, "stubborn.sh");
    writeFileSync(worker, `trap '' TERM\nprintf 'soma:outputs/late.md\\n' > "$RANGER_JOB_RESULT_FILE"\n/bin/sleep 47.25 &\nwait\n`);
    const script = remoteJobArgv({ ...spec, wallClockMin: 1 / 60 }, ["/bin/sh", worker], "prompt").at(-1)!;
@@ -92,54 +86,39 @@ describe("jobs on another host", () => {
    expect(run.status).toBe(REMOTE_TIMED_OUT);
    expect(remoteJobResult(run.stdout)).toBeNull();
    expect(spawnSync("pgrep", ["-f", "sleep 47.25"]).status).toBe(1);
-  } finally {
-   rmSync(home, { recursive: true, force: true });
-  }
+  });
  }, 30_000);
 
  test("the session log is readable by its owner only", () => {
-  const home = mkdtempSync(join(tmpdir(), "ranger-remote-"));
-  try {
-   spawnSync("mkdir", ["-p", join(home, "work/abacus-timesheet")]);
+  withRemoteHome((home, cwd) => {
    const script = remoteJobArgv(spec, ["/bin/sh", "-c", "echo secret"], "").at(-1)!;
    runScript(script, home);
    expect(statSync(join(home, ".local/state/ranger-jobs")).mode & 0o777).toBe(0o700);
    expect(statSync(join(home, ".local/state/ranger-jobs/abacus-friday-7.log")).mode & 0o777).toBe(0o600);
-  } finally {
-   rmSync(home, { recursive: true, force: true });
-  }
+  });
  });
 
  test("the worker gets only the allowlisted environment of the host", () => {
-  const home = mkdtempSync(join(tmpdir(), "ranger-remote-"));
-  try {
-   const cwd = join(home, "work/abacus-timesheet");
-   spawnSync("mkdir", ["-p", cwd]);
+  withRemoteHome((home, cwd) => {
    const script = remoteJobArgv(spec, ["/bin/sh", "-c", "env > env.txt"], "").at(-1)!;
-   spawnSync("/bin/sh", ["-c", script], { encoding: "utf8", env: { PATH: process.env.PATH, HOME: home, GH_TOKEN: "gh-secret", RANGER_DISCORD_TOKEN: "d-secret", FOO: "x", OPENROUTER_API_KEY: "kept" } });
+   spawnSync("/bin/bash", ["-c", script], { encoding: "utf8", env: { PATH: process.env.PATH, HOME: home, GH_TOKEN: "gh-secret", RANGER_DISCORD_TOKEN: "d-secret", FOO: "x", OPENROUTER_API_KEY: "kept" } });
    const seen = readFileSync(join(cwd, "env.txt"), "utf8");
    expect(seen).not.toContain("gh-secret");
    expect(seen).not.toContain("d-secret");
    expect(seen).not.toContain("FOO=");
    expect(seen).toContain("OPENROUTER_API_KEY=kept");
    expect(seen).toContain(`HOME=${home}`);
-  } finally {
-   rmSync(home, { recursive: true, force: true });
-  }
+  });
  });
 
  test("prompt and arguments reach the worker as single words, whatever they contain", () => {
-  const home = mkdtempSync(join(tmpdir(), "ranger-remote-"));
-  try {
-   spawnSync("mkdir", ["-p", join(home, "work/abacus-timesheet")]);
+  withRemoteHome((home, cwd) => {
    const worker = join(home, "args.sh");
    writeFileSync(worker, `printf '%s|' "$@" > "$RANGER_JOB_RESULT_FILE"\n`);
    const script = remoteJobArgv(spec, ["/bin/sh", worker, "a b"], "it's $HOME; `x`").at(-1)!;
    const run = runScript(script, home);
    expect(remoteJobResult(run.stdout)).toBe("a b|it's $HOME; `x`|");
-  } finally {
-   rmSync(home, { recursive: true, force: true });
-  }
+  });
  });
 
  test("only the marked line is the result", () => {

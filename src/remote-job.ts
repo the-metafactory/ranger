@@ -54,7 +54,7 @@ function remoteScript(spec: RemoteJobSpec, worker: string[]): string {
 
 export function remoteJobArgv(spec: RemoteJobSpec, command: string[], prompt: string): string[] {
  const script = remoteScript(spec, [...command, prompt]);
- return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", spec.host, `/bin/sh -c ${quote(script)}`];
+ return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", spec.host, `/bin/bash -c ${quote(script)}`];
 }
 
 export function remoteJobResult(stdout: string): string | null {
