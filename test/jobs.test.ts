@@ -289,6 +289,23 @@ describe("node #301 — scheduled jobs", () => {
   expect(r.envelopes[0].input.payload).toMatchObject({ outcome: "succeeded" });
  });
 
+ test("a job that pins a pi model runs that model, never the host's pi provider, and in the login session when asked", async () => {
+  const r = rig([{ ...SHORT, substrates: ["pi"], host: "macjcf.local", hostSession: "login", pi: { provider: "spark", model: "longctx-think" } }],
+   { substrates: { pi: { provider: "openrouter", model: "deepseek/deepseek-v4.1-flash-1017", reachable: "https://openrouter.ai/api/v1/models" } } });
+  const runId = await startedRun(r);
+  const s = session({ stdout: "remote log: macjcf:/x.log\nRANGER_JOB_RESULT soma:outputs/G8-2026-w46.md\n" });
+  const probed: string[] = [];
+  const outcome = await runJob(runId, { config: r.config, journal: r.journal, substrate: "pi", runSession: s.runSession, ledger: r.ledger,
+   endpointProbe: async (url: string) => { probed.push(url); return true; } });
+  expect(outcome).toMatchObject({ status: "succeeded", substrate: "pi", result: "soma:outputs/G8-2026-w46.md" });
+  const script = s.calls[0].args.at(-1)!.replaceAll("'\\''", "'");
+  expect(script).toContain("'pi' '-p' '--provider' 'spark' '--model' 'longctx-think'");
+  expect(script).not.toContain("openrouter");
+  expect(script).not.toContain("deepseek");
+  expect(script).toContain("/bin/launchctl submit -l");
+  expect(probed).not.toContain("https://openrouter.ai/api/v1/models");
+ });
+
  test("without requireResult a clean exit with no result still succeeds", async () => {
   const r = rig();
   const runId = await startedRun(r);
