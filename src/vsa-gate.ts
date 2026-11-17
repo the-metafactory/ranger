@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { vsaClaimRefusal } from "./candidates.ts";
+import { criterionCitations, iscLine, vsaClaimVerdict, type VsaClaimVerdict } from "./candidates.ts";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import { lanePort } from "./forge-lanes.ts";
 import type { ForgeReadPort } from "./forge.ts";
@@ -42,18 +42,18 @@ export interface VsaGateArgs {
 }
 
 /**
- * Why the VSA gate refuses this claim, or null. Fails closed: an error
- * reading `VSA.md` or the node's date refuses with that error. Without a
- * config there is no checkout to read, so the gate allows.
+ * The VSA gate's verdict on this claim. Fails closed: an error reading
+ * `VSA.md` or the node's date refuses with that error. Without a config
+ * there is no checkout to read, so the gate allows.
  */
-export async function vsaGateRefusal(args: VsaGateArgs): Promise<string | null> {
+export async function vsaGate(args: VsaGateArgs): Promise<VsaClaimVerdict> {
  const { config, map, node } = args;
  if (config === undefined || !IMPLEMENT_KINDS.has(node.kind)) return null;
  let vsa: BaseVsa | null;
  try {
   vsa = await readBaseVsa(canonicalDir(config, map), map.base);
  } catch (error) {
-  return `VSA.md unreadable on origin/${map.base} (${error instanceof Error ? error.message : String(error)})`;
+  return { refused: `VSA.md unreadable on origin/${map.base} (${error instanceof Error ? error.message : String(error)})` };
  }
  if (vsa === null) return null;
  let createdAt: Date;
@@ -63,7 +63,29 @@ export async function vsaGateRefusal(args: VsaGateArgs): Promise<string | null> 
   if (forge.issueCreatedAt === undefined) throw new Error("this forge cannot read issue creation dates");
   createdAt = new Date(await forge.issueCreatedAt(map.repo, Number(node.id), args.token));
  } catch (error) {
-  return `node creation date unreadable (${error instanceof Error ? error.message : String(error)})`;
+  return { refused: `node creation date unreadable (${error instanceof Error ? error.message : String(error)})` };
  }
- return vsaClaimRefusal(node.body, node.kind, createdAt, vsa.text, vsa.createdAt);
+ return vsaClaimVerdict(node.body, node.kind, createdAt, vsa.text, vsa.createdAt);
+}
+
+/**
+ * The ISC line ranger writes into a node it files: the criteria `source`
+ * cites, else `ISC: none (<none>)`. Null when the base has no `VSA.md`, the
+ * kind needs no citation, or there is nothing to write; `error` when
+ * `VSA.md` could not be read, so the node is filed without a line.
+ */
+export async function filedIscLine(
+ canonical: string,
+ base: string,
+ kind: string | undefined,
+ source: string | undefined,
+ none?: string,
+): Promise<{ line: string | null } | { error: string }> {
+ if (kind !== undefined && !IMPLEMENT_KINDS.has(kind)) return { line: null };
+ try {
+  const vsa = await readBaseVsa(canonical, base);
+  return { line: vsa === null ? null : iscLine(criterionCitations(source, vsa.text), none) };
+ } catch (error) {
+  return { error: error instanceof Error ? error.message : String(error) };
+ }
 }

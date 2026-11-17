@@ -9,32 +9,68 @@ import type { WorkerRow } from "./journal.ts";
 
 const ISC_CITATION = /\bISC-\d+(?:\.\d+)?\b/g;
 const ISC_CRITERION = /^\s*[-*]\s+\[[ xX]\]\s+(ISC-\d+(?:\.\d+)?)\b/gm;
+const ISC_EXEMPTION = /^ISC: none \((.*)\)[ \t]*$/gm;
+
+function criteria(vsaText: string): Set<string> {
+ return new Set([...vsaText.matchAll(ISC_CRITERION)].map(m => m[1]));
+}
+
+/** The ISC IDs `text` cites that are criterion lines in `vsaText`, in first-cited order. */
+export function criterionCitations(text: string | undefined, vsaText: string): string[] {
+ const known = criteria(vsaText);
+ return [...new Set((text ?? "").match(ISC_CITATION) ?? [])].filter(id => known.has(id));
+}
+
+/** The reason of the first `ISC: none (<reason>)` line with a non-empty reason, or null. */
+export function iscExemption(body: string | undefined): string | null {
+ for (const m of (body ?? "").matchAll(ISC_EXEMPTION)) {
+  const reason = m[1].trim();
+  if (reason.length > 0) return reason;
+ }
+ return null;
+}
 
 /**
- * The VSA claim gate (ranger VSA ISC-2), or null when the claim may go on.
+ * The ISC line a filed node carries: `Serves: ISC-7, ISC-9.` for its
+ * citations, else `ISC: none (<none>)`, else null. The `soma graph add`
+ * flags `--isc` and `--isc-none` write the same two lines.
+ */
+export function iscLine(cites: readonly string[], none?: string): string | null {
+ if (cites.length > 0) return `Serves: ${cites.join(", ")}.`;
+ return none === undefined || none.trim() === "" ? null : `ISC: none (${none})`;
+}
+
+export type VsaClaimVerdict = { refused: string } | { waived: string } | null;
+
+/**
+ * The VSA claim gate (ranger VSA ISC-2): null when the claim may go on.
  * A repo without `VSA.md` (`vsaText` null) allows every claim. Only
  * implement kinds need a citation, and only nodes created at or after the
  * instant `VSA.md` was added to the base; older nodes keep flowing. A cited
- * ID counts only when it is a criterion line in that `VSA.md`.
+ * ID counts only when it is a criterion line in that `VSA.md`. A node that
+ * cites none but carries `ISC: none (<reason>)` is waived with that reason.
  */
-export function vsaClaimRefusal(
+export function vsaClaimVerdict(
  body: string | undefined,
  kind: string,
  nodeCreatedAt: Date | null,
  vsaText: string | null,
  vsaCreatedAt: Date | null,
-): string | null {
+): VsaClaimVerdict {
  if (vsaText === null || !IMPLEMENT_KINDS.has(kind)) return null;
- if (vsaCreatedAt === null || Number.isNaN(vsaCreatedAt.getTime())) return "VSA.md creation date unknown";
- if (nodeCreatedAt === null || Number.isNaN(nodeCreatedAt.getTime())) return "node creation date unknown";
+ if (vsaCreatedAt === null || Number.isNaN(vsaCreatedAt.getTime())) return { refused: "VSA.md creation date unknown" };
+ if (nodeCreatedAt === null || Number.isNaN(nodeCreatedAt.getTime())) return { refused: "node creation date unknown" };
  if (nodeCreatedAt.getTime() < vsaCreatedAt.getTime()) return null;
+ if (criterionCitations(body, vsaText).length > 0) return null;
+ const waived = iscExemption(body);
+ if (waived !== null) return { waived };
  const cited = [...new Set((body ?? "").match(ISC_CITATION) ?? [])];
- const known = new Set([...vsaText.matchAll(ISC_CRITERION)].map(m => m[1]));
- if (cited.some(id => known.has(id))) return null;
  const since = `created ${nodeCreatedAt.toISOString()}, on or after VSA.md was added ${vsaCreatedAt.toISOString()}`;
- return cited.length === 0
-  ? `${kind} node cites no ISC from VSA.md (${since})`
-  : `${kind} node cites ${cited.join(", ")}, not a criterion in VSA.md (${since})`;
+ return {
+  refused: cited.length === 0
+   ? `${kind} node cites no ISC from VSA.md (${since})`
+   : `${kind} node cites ${cited.join(", ")}, not a criterion in VSA.md (${since})`,
+ };
 }
 
 export function freshClaimRefusal(

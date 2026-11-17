@@ -27,12 +27,14 @@ import {
 import type { ForgeReadPort, LabeledIssue } from "./forge.ts";
 import { lanePort } from "./forge-lanes.ts";
 import { GRAPH_CALL_TIMEOUT_MS } from "./graph.ts";
-import { GraphAddOnceAmbiguous, GraphAddUnattached, graphAdd, graphLink, somaProse } from "./graph-write.ts";
+import { GraphAddOnceAmbiguous, GraphAddUnattached, GraphWriteError, graphAdd, graphLink, somaProse } from "./graph-write.ts";
 import { assertNotPrincipal, assertWriteIdentity } from "./identity.ts";
 import type { IntakeDraftRow, Journal } from "./journal.ts";
 import { type OwnedCheck, withOwnedLease } from "./lock.ts";
 import { mapKey } from "./maps.ts";
 import { loadProbeRegistry, registeredCommands, type ProbeRegistry, type RegisteredCommand } from "./route.ts";
+import { filedIscLine } from "./vsa-gate.ts";
+import { canonicalDir } from "./worker.ts";
 
 /**
  * Human-observation intake, slice 1 (node #247; #21 rulings D3, D11, D12, D17).
@@ -1317,10 +1319,11 @@ function intakeOrigin(row: Pick<IntakeDraftRow, "messageId" | "originMessageId">
 }
 
 /** The body of the filed node: the principal's words verbatim, the link back, the marker last (D5, D14). */
-export function intakeNodeBody(row: Pick<IntakeDraftRow, "body" | "messageUrl" | "messageId">): string {
+export function intakeNodeBody(row: Pick<IntakeDraftRow, "body" | "messageUrl" | "messageId">, isc: string | null = null): string {
   return [
     row.body.trim(),
     "",
+    ...(isc === null ? [] : [isc, ""]),
     "---",
     `Filed by ranger on the principal's 👍, from their Discord message: ${row.messageUrl}`,
     "",
@@ -1495,7 +1498,15 @@ async function fileDraft(args: GateArgs, row: IntakeDraftRow): Promise<void> {
     return;
   }
 
+  const somaRefused = journal.getHealth(somaRefusalKey(row.messageId));
+  if (somaRefused !== null && somaRefused === row.specHash) {
+    refuse("soma graph add refused this spec before (journalled once as intake-refused) — reply to the card with a correction to change it");
+    return;
+  }
+
   const { token } = await write.identity();
+  const isc = await filedIscLine(canonicalDir(args.config, map), map.base, row.kind ?? undefined, row.body);
+  const iscNote = "error" in isc ? `; VSA.md unreadable, filed without an ISC line: ${isc.error}` : "";
 
   // Written before the add: a tick that dies past here leaves `filing`, and
   // the next one asks the marker before anything else.
@@ -1514,7 +1525,7 @@ async function fileDraft(args: GateArgs, row: IntakeDraftRow): Promise<void> {
       ...(row.kind === null ? {} : { kind: row.kind }),
       ...(row.probes === null ? {} : { probes: JSON.parse(row.probes) as unknown[] }),
       labels: [PRINCIPAL_INTAKE_LABEL],
-      body: intakeNodeBody({ ...row, messageId: intakeOrigin(row) }),
+      body: intakeNodeBody({ ...row, messageId: intakeOrigin(row) }, "line" in isc ? isc.line : null),
       once: intakeMarker(intakeOrigin(row)),
     }, token, write.opts);
     node = added.node;
@@ -1523,6 +1534,11 @@ async function fileDraft(args: GateArgs, row: IntakeDraftRow): Promise<void> {
     if (error instanceof GraphAddOnceAmbiguous) {
       throw new EscalateError(`${error.carriers()} — one draft filed twice; nothing more is filed`);
     }
+    const reason = somaRefusal(error);
+    if (reason !== null) {
+      somaRefusedDraft(args, row, reason);
+      return;
+    }
     if (!(error instanceof GraphAddUnattached)) throw error;
     // The node exists below no parent: attach it rather than add a second.
     // A failed link leaves `filing`; the next tick's recovery links again.
@@ -1530,7 +1546,31 @@ async function fileDraft(args: GateArgs, row: IntakeDraftRow): Promise<void> {
     await graphLink(map.repo, error.node, String(row.parent), token, write.opts);
     node = error.node;
   }
-  return existing ? finishFound(args, row, node) : finishFiled(args, row, node, true);
+  return existing ? finishFound(args, row, node, iscNote) : finishFiled(args, row, node, true, iscNote);
+}
+
+const SOMA_ADD_REFUSED = "soma graph add refused:";
+
+function somaRefusalKey(messageId: string): string {
+  return `intake.soma-refused.${messageId}`;
+}
+
+function somaRefusal(error: unknown): string | null {
+  if (!(error instanceof GraphWriteError) || error instanceof GraphAddUnattached) return null;
+  const at = error.message.indexOf(SOMA_ADD_REFUSED);
+  return at < 0 ? null : error.message.slice(at).trim();
+}
+
+function somaRefusedDraft(args: GateArgs, row: IntakeDraftRow, reason: string): void {
+  const { journal, map, owned, gate } = args;
+  owned();
+  journal.updateIntakeDraft(row.messageId, { status: "draft" });
+  journal.setHealth(somaRefusalKey(row.messageId), row.specHash ?? "");
+  journal.recordEvent("intake-refused", {
+    repo: map.repo,
+    detail: `draft ${row.messageId}: nothing filed — ${reason}; reply to the card with a correction that cites an ISC`.slice(0, 400),
+  });
+  gate.refused.push({ messageId: row.messageId, reason });
 }
 
 /**
@@ -1538,18 +1578,18 @@ async function fileDraft(args: GateArgs, row: IntakeDraftRow): Promise<void> {
  * left it unattached, with its link failed. Link it below its parent first;
  * `soma graph link` skips a parent the node already has.
  */
-async function finishFound(args: GateArgs, row: IntakeDraftRow, node: string): Promise<void> {
+async function finishFound(args: GateArgs, row: IntakeDraftRow, node: string, note = ""): Promise<void> {
   const { token } = await args.write.identity();
   args.owned();
   await graphLink(args.map.repo, node, String(row.parent), token, args.write.opts);
-  return finishFiled(args, row, node, false);
+  return finishFiled(args, row, node, false, note);
 }
 
 /**
  * The card says "filed as #N", then the journal records it. A tick that
  * dies between the two re-finds the node by its marker and edits again.
  */
-async function finishFiled(args: GateArgs, row: IntakeDraftRow, node: string, added: boolean): Promise<void> {
+async function finishFiled(args: GateArgs, row: IntakeDraftRow, node: string, added: boolean, note = ""): Promise<void> {
   const { journal, map, client, deadline, owned, gate } = args;
   owned();
   await editCard(client, row, filedCardContent(map, cardDraft(row), node), deadline);
@@ -1558,7 +1598,7 @@ async function finishFiled(args: GateArgs, row: IntakeDraftRow, node: string, ad
   journal.recordEvent("intake-filed", {
     repo: map.repo,
     nodeId: node,
-    detail: `draft ${row.messageId}: ${added ? "filed" : "found already filed (intake marker)"} as #${node} on the principal's ${FILE_EMOJI}`,
+    detail: `draft ${row.messageId}: ${added ? "filed" : "found already filed (intake marker)"} as #${node} on the principal's ${FILE_EMOJI}${note}`,
   });
   gate.filed.push({ messageId: row.messageId, node, added });
 }

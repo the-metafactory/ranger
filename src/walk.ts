@@ -27,7 +27,7 @@ import { ClaimLockBusy, withClaimLock } from "./claim-lock.ts";
 import type { OwnedCheck } from "./lock.ts";
 import { classifyFrontier, loadProbeRegistry } from "./route.ts";
 import type { ForgePort, ForgeReadPort } from "./forge.ts";
-import { vsaGateRefusal } from "./vsa-gate.ts";
+import { vsaGate } from "./vsa-gate.ts";
 import { probeRequeueCandidates, requeueProbes, type ProbeRequeueResult } from "./probe-requeue.ts";
 import { sweepMap, type SweepMapResult } from "./sweep.ts";
 import { emptyJobPass, jobPass, jobsPending, type JobPassResult, type SpawnJobArgs } from "./jobs.ts";
@@ -153,15 +153,19 @@ export async function claimNode(args: ClaimNodeArgs): Promise<ClaimNodeOutcome> 
   error: `map ${mapKey(map)} fresh claims held after worker start failure on #${startHold.nodeId}; resume or release that node before claiming more work` };
  const refusal = freshClaimRefusal(map, node.id, previous);
  if (refusal !== null) return { claimed: false, messageId: null, error: refusal };
- const vsaRefusal = await vsaGateRefusal({ config: args.config, map, node, token, forge: args.forge });
- if (vsaRefusal !== null) {
-  const detail = `#${node.id} claim refused by the VSA gate: ${vsaRefusal}`;
+ const vsa = await vsaGate({ config: args.config, map, node, token, forge: args.forge });
+ const journalOnce = (kind: "refused" | "vsa-waived", detail: string) => {
   const journaled = detail.slice(0, 400);
-  if (journal.lastEventDetail("refused", map.repo, node.id) !== journaled) {
-   journal.recordEvent("refused", { nodeId: node.id, repo: map.repo, detail: journaled });
+  if (journal.lastEventDetail(kind, map.repo, node.id) !== journaled) {
+   journal.recordEvent(kind, { nodeId: node.id, repo: map.repo, detail: journaled });
   }
+ };
+ if (vsa !== null && "refused" in vsa) {
+  const detail = `#${node.id} claim refused by the VSA gate: ${vsa.refused}`;
+  journalOnce("refused", detail);
   return { claimed: false, messageId: null, error: detail, refusedBy: "vsa" };
  }
+ if (vsa !== null) journalOnce("vsa-waived", `#${node.id} claimed without an ISC citation: ISC: none (${vsa.waived})`);
  let messageId: string | null = null;
  let announceError: string | null = null;
  try {

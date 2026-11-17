@@ -73,7 +73,8 @@ import { WRITE_TOKEN_SOURCE } from "./github-usage.ts";
 import { budgetedRead, budgetPolicy, clearThrottleStrikes, MAX_REVIEW_THROTTLES_IN_A_ROW, recordThrottle, reviewCooldownScope, reviewThrottle, reviewTokenSource } from "./budget.ts";
 import { GraphAddUnattached, closeTimeoutForNode, graphAdd, graphClose, graphDecisions, graphLink, type AddSpec, type CloseResult } from "./graph-write.ts";
 import { FixNodeLockBusy, withFixNodeLock } from "./fix-node-lock.ts";
-import { assertFilable, codeCommentSpec, fileBlockedPrerequisite, foundByProbeSpec, landminesInDiff, parkIdentity, scribeFile, splitOutOfReviewSpec, type PrerequisiteFiling, type Provenance, type ScribeGraph } from "./scribe.ts";
+import { assertFilable, codeCommentSpec, fileBlockedPrerequisite, foundByProbeSpec, landminesInDiff, parkIdentity, scribeFile, splitOutOfReviewSpec, withIscLine, type PrerequisiteFiling, type Provenance, type ScribeGraph } from "./scribe.ts";
+import { filedIscLine } from "./vsa-gate.ts";
 import { FencedError, type EventKind, type ImplementPhase, type Journal } from "./journal.ts";
 import { assembleImplementPrompt } from "./prompt.ts";
 import { branchDefaults, defaultsFromBody, defaultsSection } from "./defaults.ts";
@@ -1027,6 +1028,22 @@ function machineScribeGraph(ctx: ImplementContext): ScribeGraph {
  };
 }
 
+/**
+ * The ISC line the Scribe writes into a build node it files below this
+ * node: the criteria this node cites, else `ISC: none (follows #N, …)`.
+ * A `VSA.md` that cannot be read files without a line, journalled.
+ */
+export async function scribeIscLine(ctx: ImplementContext): Promise<string | null> {
+ const nodeId = ctx.node.ref.id;
+ const read = await filedIscLine(ctx.canonical, ctx.map.base, undefined, ctx.node.body, `follows #${nodeId}, which cites no ISC`);
+ if ("line" in read) return read.line;
+ ctx.journal.recordEvent("filed", {
+  nodeId, repo: ctx.map.repo,
+  detail: `reading VSA.md on origin/${ctx.map.base} for the ISC line FAILED, filing without one: ${read.error}`.slice(0, 400),
+ });
+ return null;
+}
+
 /** What one Scribe filing after a merge came to: the filed node, or why it failed. */
 export type ScribeOutcome = { node: string } | { error: string };
 
@@ -1072,9 +1089,11 @@ export async function scribeAfterMerge(
  const fence = () => journal.assertGeneration(nodeId, map.repo, ctx.generation, "file discovered work");
  const spawning = { id: nodeId, title: ctx.node.node.title };
  const change = { number: pr.iid, url: changeRequestUrl(map.repo, pr.iid, pr.webUrl) };
+ let isc: Promise<string | null> | undefined;
  const file = async (provenance: Provenance, what: string, spec: () => AddSpec): Promise<ScribeOutcome> => {
   try {
-   const filed = await scribeFile(graph, journal, { map, parent: nodeId, provenance, spec: spec() }, fence);
+   const filedSpec = withIscLine(spec(), await (isc ??= scribeIscLine(ctx)));
+   const filed = await scribeFile(graph, journal, { map, parent: nodeId, provenance, spec: filedSpec }, fence);
    journal.recordEvent("filed", {
     nodeId, repo: map.repo,
     detail: `${filed.added ? "filed" : "already filed"} ${what} as node #${filed.node} below #${nodeId} (${provenance})`.slice(0, 400),
@@ -3122,7 +3141,7 @@ async function parkPrerequisite(ctx: ImplementContext, report: BlockedReport): P
  const spawning = { id: nodeId, title: node.node.title, ...(node.parent === undefined ? {} : { parent: node.parent }) };
  let filing: PrerequisiteFiling;
  try {
-  filing = await fileBlockedPrerequisite(ctx.scribe ?? machineScribeGraph(ctx), journal, { map, node: spawning, report }, fence);
+  filing = await fileBlockedPrerequisite(ctx.scribe ?? machineScribeGraph(ctx), journal, { map, node: spawning, report, isc: () => scribeIscLine(ctx) }, fence);
  } catch (error) {
   if (error instanceof FencedError) throw error;
   const message = error instanceof Error ? error.message : String(error);

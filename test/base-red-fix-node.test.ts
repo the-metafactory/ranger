@@ -142,6 +142,11 @@ describe("fix-the-base node for a confirmed base-red probe (node #152)", () => {
   expect(events().some((d) => d.includes(`filed fix-the-base node #300 below #${ctx.node.ref.id}`))).toBe(true);
  });
 
+ test("the fix-the-base node's body ends with the ISC exemption line naming the broken base", async () => {
+  await confirmAndFile();
+  expect(added[0].spec.body?.trimEnd().split("\n").at(-1)).toBe(`ISC: none (fix-base: ${ctx.map.base} is broken)`);
+ });
+
  test("a cache hit without the map's record files the node", async () => {
   ctx.journal.setHealth(`base-red-checks.acme/widgets.${sha}.${HUD}`, JSON.stringify(["draws"]));
   answers = [];

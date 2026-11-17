@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stringify } from "yaml";
-import { vsaClaimRefusal } from "../src/candidates.ts";
+import { criterionCitations, iscExemption, iscLine, vsaClaimVerdict } from "../src/candidates.ts";
 import { loadConfig, type RangerConfig } from "../src/config.ts";
 import { Journal } from "../src/journal.ts";
 import { readBaseVsa } from "../src/vsa-gate.ts";
@@ -21,6 +21,11 @@ const VSA = [
  "Prose that mentions ISC-7 is not a criterion.",
 ].join("\n");
 const ADDED = new Date("2026-11-17T10:00:00Z");
+
+function vsaClaimRefusal(...args: Parameters<typeof vsaClaimVerdict>): string | null {
+ const verdict = vsaClaimVerdict(...args);
+ return verdict !== null && "refused" in verdict ? verdict.refused : null;
+}
 const AFTER = new Date("2026-11-18T10:00:00Z");
 const BEFORE = new Date("2026-11-16T10:00:00Z");
 
@@ -60,6 +65,31 @@ describe("vsaClaimRefusal", () => {
  });
  test("an unknown node creation date refuses an implement node in a VSA repo", () => {
   expect(vsaClaimRefusal("no citation", "task", null, VSA, ADDED)).toContain("creation date");
+ });
+});
+
+describe("the ISC exemption line", () => {
+ test("a new uncited implement node with ISC: none (reason) is waived with that reason", () => {
+  expect(vsaClaimVerdict("Body.\n\nISC: none (fix-base: main is broken)", "task", AFTER, VSA, ADDED)).toEqual({ waived: "fix-base: main is broken" });
+ });
+ test("an empty or blank reason does not count and the node is refused", () => {
+  expect(vsaClaimRefusal("ISC: none ()", "task", AFTER, VSA, ADDED)).toContain("cites no ISC");
+  expect(vsaClaimRefusal("ISC: none (   )", "build", AFTER, VSA, ADDED)).toContain("cites no ISC");
+ });
+ test("the line counts only at line start and case-sensitively", () => {
+  expect(vsaClaimRefusal("See ISC: none (quoted)", "task", AFTER, VSA, ADDED)).toContain("cites no ISC");
+  expect(vsaClaimRefusal("isc: none (lower case)", "task", AFTER, VSA, ADDED)).toContain("cites no ISC");
+ });
+ test("a known citation allows without a waiver, and an older node needs neither", () => {
+  expect(vsaClaimVerdict("Serves: ISC-2.\nISC: none (stale)", "task", AFTER, VSA, ADDED)).toBeNull();
+  expect(vsaClaimVerdict("ISC: none (old)", "task", BEFORE, VSA, ADDED)).toBeNull();
+ });
+ test("iscExemption reads the reason; iscLine writes both formats; criterionCitations keeps only VSA criteria", () => {
+  expect(iscExemption("x\nISC: none (follows #12, which cites no ISC)\n")).toBe("follows #12, which cites no ISC");
+  expect(iscLine(["ISC-7", "ISC-9"])).toBe("Serves: ISC-7, ISC-9.");
+  expect(iscLine([], "fix-base: main is broken")).toBe("ISC: none (fix-base: main is broken)");
+  expect(iscLine([])).toBeNull();
+  expect(criterionCitations("ISC-3.1, ISC-7, ISC-2 and ISC-3.1 again", VSA)).toEqual(["ISC-3.1", "ISC-2"]);
  });
 });
 
@@ -127,11 +157,15 @@ describe("claimNode VSA gate", () => {
  });
  afterEach(() => { journal.close(); rmSync(dir, { recursive: true, force: true }); });
 
- const claim = (body: string, createdAt: Date, announced: string[]) => claimNode({
+ const claim = (body: string, createdAt: Date, announced: string[], announceFails = false) => claimNode({
   config, journal, map: config.maps[0], node: { id: "30", title: "Feature", kind: "task", body }, lane: "implement",
   botIdentity: "ivy-bot", token: "unused", cliEntry: "/tmp/ranger/cli.ts", configPath: join(dir, "ranger.yaml"),
   forge: { issueCreatedAt: async () => createdAt.toISOString() },
-  announce: async (_map, ctx) => { announced.push(ctx.nodeId); return { messageId: "message" }; },
+  announce: async (_map, ctx) => {
+   if (announceFails) throw new Error("discord down");
+   announced.push(ctx.nodeId);
+   return { messageId: "message" };
+  },
   claim: async () => ({ repo, node: "30", held: true, assignees: ["ivy-bot"] }),
   spawnRunNode: async () => 123,
  });
@@ -152,6 +186,26 @@ describe("claimNode VSA gate", () => {
   const announced: string[] = [];
   expect(await claim("Serves ISC-2.", AFTER, announced)).toMatchObject({ claimed: true });
   expect(announced).toEqual(["30"]);
+ });
+
+ test("a new node with ISC: none (reason) is claimed and journals the waiver once, with the reason", async () => {
+  const announced: string[] = [];
+  const body = "Build the thing.\n\nISC: none (fix-base: main is broken)";
+  expect(await claim(body, AFTER, announced, true)).toMatchObject({ claimed: false, error: expect.stringContaining("announce failed") });
+  expect(await claim(body, AFTER, announced)).toMatchObject({ claimed: true });
+  expect(announced).toEqual(["30"]);
+  const events = journal.listEvents(repo, 50, "30");
+  expect(events.filter(e => e.kind === "refused")).toHaveLength(0);
+  const waived = events.filter(e => e.kind === "vsa-waived");
+  expect(waived).toHaveLength(1);
+  expect(waived[0].detail).toContain("fix-base: main is broken");
+ });
+
+ test("a new node whose ISC: none line has an empty reason is refused", async () => {
+  const announced: string[] = [];
+  expect(await claim("Build.\n\nISC: none ()", AFTER, announced)).toMatchObject({ claimed: false, error: expect.stringContaining("cites no ISC") });
+  expect(announced).toEqual([]);
+  expect(journal.listEvents(repo, 50, "30").filter(e => e.kind === "vsa-waived")).toHaveLength(0);
  });
 
  test("an older uncited node is claimed", async () => {

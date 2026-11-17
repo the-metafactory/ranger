@@ -308,6 +308,7 @@ export type EventKind =
  | "deployed"
  | "deploy-failed"
  | "refused"
+ | "vsa-waived"
  | "parked"
  | "released"
  | "sweep"
@@ -345,6 +346,7 @@ export type EventKind =
  /** Intake gate (node #251): the principal's 👍 filed a draft, or ❌ discarded one. */
  | "intake-filed"
  | "intake-discarded"
+ | "intake-refused"
  /** A principal correction reply got a new draft card that supersedes the old (node #241). */
  | "intake-corrected"
  /** The merge desk's steps for a head no CI ran on (`CiAbsentStep`). */
