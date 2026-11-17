@@ -587,6 +587,16 @@ export function expandHome(path: string): string {
  return path;
 }
 
+/** The canonical checkout dir for a repo (design §4: probes run there). */
+export function canonicalDir(
+ config: RangerConfig,
+ map: RangerMapConfig,
+): string {
+ return map.canonical === undefined
+  ? join(expandHome(config.state.canonicalRoot), map.repo)
+  : expandHome(map.canonical);
+}
+
 /**
  * Load and validate ranger.yaml. `RANGER_JOURNAL_PATH` in `env` overrides
  * `state.journalPath` (node #66): the supervisor sets it for worker sessions,

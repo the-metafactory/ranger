@@ -86,6 +86,7 @@ export interface ForgeReadPort<Credential = string> {
  ciFailureLog?(repo: string, runs: CiFailedRun[], token: Credential): Promise<string>;
  /** Labels of a tracker issue (a graph node), by issue number. */
  issueLabels(repo: string, issue: number, token: Credential): Promise<string[]>;
+ issueCreatedAt?(repo: string, issue: number, token: Credential): Promise<string>;
  /**
   * Conversation comments of a change request, by PR/MR number. GitHub shares one
   * number space for issues and PRs; GitLab does not, so never pass an issue iid.

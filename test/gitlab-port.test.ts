@@ -233,6 +233,14 @@ describe("GitLab notes and issue labels", () => {
   const { port, token } = await setup(() => response(raw));
   await expect(port.issueLabels(repo, 124, token)).rejects.toBeInstanceOf(GitLabReadError);
  });
+ test("node creation date comes from the issue endpoint", async () => {
+  const { port, token } = await setup(path => { expect(path).toBe(issuePath); return response({ iid: 124, created_at: "2026-11-17T10:00:00.000Z" }); });
+  expect(await port.issueCreatedAt?.(repo, 124, token)).toBe("2026-11-17T10:00:00.000Z");
+ });
+ test.each([{ iid: 124 }, { iid: 124, created_at: "not a date" }, { iid: 125, created_at: "2026-11-17T10:00:00Z" }])("malformed creation date or mismatched issue %j throws", async raw => {
+  const { port, token } = await setup(() => response(raw));
+  await expect(port.issueCreatedAt?.(repo, 124, token)).rejects.toBeInstanceOf(GitLabReadError);
+ });
 });
 
 async function rejection(pending: Promise<unknown>): Promise<GitLabReadError> {

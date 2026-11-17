@@ -223,7 +223,7 @@ const soma = (r: Rig) => JSON.parse(readFileSync(r.statePath, "utf8"));
 /** Claim node 20 the way the walk does: announce, `soma graph claim` under the bot, a claimed row. */
 async function claim(r: Rig, lane: "implement" | "research") {
  return claimNode({
-  journal: r.journal, map: r.map, node: { id: "20", title: "Node 20" }, lane, botIdentity: BOT, token: r.ctx.token,
+  journal: r.journal, map: r.map, node: { id: "20", title: "Node 20", kind: "task" }, lane, botIdentity: BOT, token: r.ctx.token,
   cliEntry: "/unused", configPath: "/unused",
   announce: async () => ({ messageId: "discord-1" }) as never,
   spawnRunNode: async () => 4242,

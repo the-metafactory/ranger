@@ -250,6 +250,12 @@ if verb == "add":
     if fail == "exit":
         print("fake soma: add failed (HTTP 502)", file=sys.stderr)
         sys.exit(1)
+    # =vsa refuses the way soma's VSA filing gate does, and counts the try.
+    if fail == "vsa":
+        s["refusedAdds"] = s.get("refusedAdds", 0) + 1
+        save()
+        print("soma graph add refused: task node cites no ISC criterion from VSA.md", file=sys.stderr)
+        sys.exit(1)
     issues = s.setdefault("issues", {})
     labels = [l for l in os.environ.get("FAKE_SOMA_LABELS", "").split("\n") if l]
     body = os.environ.get("FAKE_SOMA_BODY", "")

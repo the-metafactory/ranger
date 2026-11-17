@@ -67,7 +67,7 @@ Ranger claims only nodes that cite a failing ISC from their repo's confirmed `VS
 - [x] ISC-1: The maintainers confirm Levels 1 and 2 of this Vision, recorded with a date in Decisions.
 
 ### Claims aim at criteria
-- [ ] ISC-2: In a repo with a `VSA.md`, ranger refuses to claim a node whose body cites no ISC ID from that file, and journals a `refused` event naming the node and the missing citation.
+- [ ] ISC-2: In a repo with a `VSA.md`, ranger refuses to claim an implement node (`task` or `build`) created on or after `VSA.md` was added to the base branch whose body cites no ISC ID from that file, and journals a `refused` event naming the node and the missing citation. A body line `ISC: none (<reason>)` with a non-empty reason exempts the node, and the waiver is journaled with its reason. Other kinds and older nodes are exempt; a repo without `VSA.md` allows every claim.
 - [ ] ISC-3: Ranger refuses to claim a node whose cited ISC is already `[x]` in the base branch's `VSA.md`, and journals the refusal.
 - [ ] ISC-4: The worker brief for a claimed node contains the full text of each ISC the node cites, copied from the base branch's `VSA.md`.
 - [ ] ISC-5: Ranger closes a node only when each ISC it cites is `[x]` in `VSA.md` on the base after the merge; otherwise it parks the node with that reason.
@@ -135,3 +135,5 @@ Order: F-job-preflight first, because it protects the jobs already running unatt
 - 2026-11-16: Drafted read-only from the repo at 8185b76 and public `gh` counts. ISC-18 and ISC-19 pass on that evidence; the rest are unverified or failing.
 - 2026-11-16: confirmed: levels 1-2 (jcfischer). Level 3 stays the builders' to change.
 - 2026-11-16: ISC-12 and ISC-13 set ideal-state targets of zero. The maintainers may prefer a threshold; that is open.
+- 2026-11-17: ISC-2 narrowed: only task/build nodes created on or after VSA.md was added to the base branch need a citation; repos without VSA.md allow every claim (jcfischer, O1+O2).
+- 2026-11-17: ISC-2 accepts an explicit "ISC: none (<reason>)" line; ranger's scribe and fix-node filers write citations or that line; intake files without one when the source cites none, so the gate refuses it (jcfischer, D1/D2).

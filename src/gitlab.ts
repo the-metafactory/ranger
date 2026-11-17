@@ -281,6 +281,14 @@ export class GitLabReadPort implements ForgeReadPort<ResolvedToken> {
   return r.labels;
  }
 
+ async issueCreatedAt(repo: string, issue: number, token: ResolvedToken): Promise<string> {
+  const endpoint = `${this.project(repo)}/issues/${id(issue, repo, "iid")}`;
+  const r = object((await this.read(repo, token, endpoint)).body, endpoint);
+  if (id(r.iid, endpoint, "iid") !== issue) invalid(endpoint, "iid differs from requested issue");
+  if (typeof r.created_at !== "string" || Number.isNaN(Date.parse(r.created_at))) invalid(endpoint, "created_at");
+  return r.created_at;
+ }
+
  /** The project's squash policy (`GET projects/:id`); only `never` refuses, an unknown value fails closed. */
  async squashRefusal(repo: string, token: ResolvedToken): Promise<string | null> {
   const endpoint = this.project(repo);
@@ -599,6 +607,7 @@ export function gitlabForgePort(
   getPr: async (repo, n) => port.getPr(repo, n, await read(repo)),
   ciVerdictFor: async (repo, sha, _token, purpose) => port.ciVerdictFor(repo, sha, await read(repo), purpose),
   issueLabels: async (repo, issue) => port.issueLabels(repo, issue, await read(repo)),
+  issueCreatedAt: async (repo, issue) => port.issueCreatedAt(repo, issue, await read(repo)),
   listComments: async (repo, n) => port.listComments(repo, n, await read(repo)),
   squashRefusal: async (repo) => port.squashRefusal(repo, await read(repo)),
   createDraftPr: (repo, pr, token) => port.createDraftPr(repo, pr, token),

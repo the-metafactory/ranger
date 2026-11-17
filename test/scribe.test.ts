@@ -6,7 +6,7 @@ import { loadConfig } from "../src/config.ts";
 import * as exec from "../src/exec.ts";
 import { runCmd } from "../src/exec.ts";
 import { GraphAddUnattached, graphAdd, graphLink, GraphWriteError, type AddSpec } from "../src/graph-write.ts";
-import { closeResolution, scribeAfterMerge, type ImplementContext, type RecordedReview } from "../src/implement.ts";
+import { closeResolution, scribeAfterMerge, scribeIscLine, type ImplementContext, type RecordedReview } from "../src/implement.ts";
 import { FencedError, Journal } from "../src/journal.ts";
 import {
  assertFilable,
@@ -25,7 +25,7 @@ import {
 } from "../src/scribe.ts";
 import { openDb } from "../src/store/db.ts";
 import { seedLegacyRoots } from "../src/store/legacy-roots.ts";
-import { baseConfigLines, createCanonicalRepo, GIT_ENV } from "./support.ts";
+import { baseConfigLines, commitVsaToOrigin, createCanonicalRepo, GIT_ENV } from "./support.ts";
 
 const MAP = { repo: "acme/widgets", root: 9 };
 const SPEC: AddSpec = { title: "Do the thing", autonomy: "propose", kind: "build", labels: ["orienteer:build"], checkpoint: "thing-done" };
@@ -36,6 +36,7 @@ interface FakeNode {
  autonomy: string;
  checkpointId?: string;
  status?: string;
+ body?: string;
 }
 
 /** A tracker the Scribe writes to; flags reproduce the documented partial-write shapes. */
@@ -53,6 +54,7 @@ function fakeGraph() {
     blockedBy: state.dropEdges ? [] : [...(spec.blockedBy ?? [])],
     autonomy: spec.autonomy,
     checkpointId: state.mintCheckpoint ?? spec.checkpoint,
+    ...(spec.body === undefined ? {} : { body: spec.body }),
    });
    if (state.unattach) throw new GraphAddUnattached(`created ${node} but left it unattached`, node, parent);
    return { node };
@@ -557,6 +559,56 @@ describe("scribeAfterMerge: the Scribe's pass before the close", () => {
   ctx.journal.beginGeneration(ctx.node.ref.id, ctx.map.repo);
   await expect(scribeAfterMerge(ctx, pr(), REVIEW)).rejects.toThrow(FencedError);
   expect(fake.calls).toEqual([]);
+ });
+
+ const VSA = ["- [ ] ISC-2: Claims cite a criterion.", "- [x] ISC-3.1: A sub-criterion.", "- [ ] ISC-7: Another."].join("\n");
+ const pushVsa = () => commitVsaToOrigin(ctx.canonical, VSA);
+ const lastLine = (id: string) => fake.nodes.get(id)?.body?.trimEnd().split("\n").at(-1);
+ const prerequisite = (resume: string, ruling = false) => (fake.nodes.set(ctx.node.ref.id, { parent: "5", blockedBy: [], autonomy: "auto" }), fileBlockedPrerequisite(fake.graph, ctx.journal, {
+  map: ctx.map, node: { id: ctx.node.ref.id, title: "t", parent: { id: "5" } },
+  report: { reason: "blocked", resume, ...(ruling ? { ruling: true } : {}) },
+  isc: () => scribeIscLine(ctx),
+ }));
+
+ test("a split-out node copies the spawning node's VSA criteria as Serves and drops unknown IDs", async () => {
+  await pushVsa();
+  ctx.node = { ...ctx.node, body: "Serves ISC-7, ISC-99 and ISC-3.1." };
+  await scribeAfterMerge(ctx, pr(), REVIEW);
+  expect(lastLine("300")).toBe("Serves: ISC-7, ISC-3.1.");
+  expect(lastLine("301")).toBe("Serves: ISC-7, ISC-3.1.");
+ });
+
+ test("a scribe prerequisite copies the parked node's valid citations and drops unknown IDs", async () => {
+  await pushVsa();
+  ctx.node = { ...ctx.node, body: "Serves: ISC-2, ISC-42." };
+  expect(await prerequisite("publish the SDK")).toMatchObject({ kind: "filed", node: "300" });
+  expect(lastLine("300")).toBe("Serves: ISC-2.");
+ });
+
+ test("a scribe prerequisite of a node citing no criterion writes the none-line naming it", async () => {
+  await pushVsa();
+  ctx.node = { ...ctx.node, body: "Cites ISC-42 only, which VSA.md does not have." };
+  await prerequisite("publish the SDK");
+  expect(lastLine("300")).toBe(`ISC: none (follows #${ctx.node.ref.id}, which cites no ISC)`);
+ });
+
+ test("a ruling prerequisite (a decision node) carries no ISC line", async () => {
+  await pushVsa();
+  await prerequisite("the principal rules on the budget", true);
+  expect(fake.nodes.get("300")?.body).not.toContain("ISC");
+ });
+
+ test("a base without VSA.md files without an ISC line", async () => {
+  ctx.node = { ...ctx.node, body: "Serves ISC-2." };
+  await scribeAfterMerge(ctx, pr(), REVIEW);
+  expect(fake.nodes.get("300")?.body).not.toMatch(/^(Serves:|ISC: none)/m);
+ });
+
+ test("an unreadable VSA.md files without a line and journals why", async () => {
+  ctx.map.base = "no-such-branch";
+  await scribeAfterMerge(ctx, pr(), REVIEW);
+  expect(fake.nodes.get("300")?.body).not.toMatch(/^(Serves:|ISC: none)/m);
+  expect(events().filter((d) => d.startsWith("reading VSA.md on origin/no-such-branch for the ISC line FAILED"))).toHaveLength(1);
  });
 
  test("templates name their provenance and quote untrusted text in a fence it cannot close", () => {

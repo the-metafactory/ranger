@@ -26,7 +26,8 @@ import type { Journal, WorkerRow } from "./journal.ts";
 import { ClaimLockBusy, withClaimLock } from "./claim-lock.ts";
 import type { OwnedCheck } from "./lock.ts";
 import { classifyFrontier, loadProbeRegistry } from "./route.ts";
-import type { ForgePort } from "./forge.ts";
+import type { ForgePort, ForgeReadPort } from "./forge.ts";
+import { vsaGate } from "./vsa-gate.ts";
 import { probeRequeueCandidates, requeueProbes, type ProbeRequeueResult } from "./probe-requeue.ts";
 import { sweepMap, type SweepMapResult } from "./sweep.ts";
 import { emptyJobPass, jobPass, jobsPending, type JobPassResult, type SpawnJobArgs } from "./jobs.ts";
@@ -109,7 +110,7 @@ export interface ClaimNodeArgs extends DispatchDeps {
  config?: RangerConfig;
  journal: Journal;
  map: RangerMapConfig;
- node: { id: string; title: string };
+ node: { id: string; title: string; kind: string; body?: string };
  lane: "implement" | "research";
  botIdentity: string;
  token: string;
@@ -121,6 +122,7 @@ export interface ClaimNodeArgs extends DispatchDeps {
  spawnRunNode?: (args: SpawnRunNodeArgs) => Promise<number | null>;
  now?: () => Date;
  owned?: OwnedCheck;
+ forge?: Pick<ForgeReadPort, "issueCreatedAt">;
 }
 
 export type ClaimNodeOutcome =
@@ -130,6 +132,7 @@ export type ClaimNodeOutcome =
     messageId: string | null;
     error: string;
     holder?: string | null;
+    refusedBy?: "vsa";
    };
 
 /**
@@ -150,6 +153,19 @@ export async function claimNode(args: ClaimNodeArgs): Promise<ClaimNodeOutcome> 
   error: `map ${mapKey(map)} fresh claims held after worker start failure on #${startHold.nodeId}; resume or release that node before claiming more work` };
  const refusal = freshClaimRefusal(map, node.id, previous);
  if (refusal !== null) return { claimed: false, messageId: null, error: refusal };
+ const vsa = await vsaGate({ config: args.config, map, node, token, forge: args.forge, cache: journal });
+ const journalOnce = (kind: "refused" | "vsa-waived", detail: string) => {
+  const journaled = detail.slice(0, 400);
+  if (journal.lastEventDetail(kind, map.repo, node.id) !== journaled) {
+   journal.recordEvent(kind, { nodeId: node.id, repo: map.repo, detail: journaled });
+  }
+ };
+ if (vsa !== null && "refused" in vsa) {
+  const detail = `#${node.id} claim refused by the VSA gate: ${vsa.refused}`;
+  journalOnce("refused", detail);
+  return { claimed: false, messageId: null, error: detail, refusedBy: "vsa" };
+ }
+ if (vsa !== null) journalOnce("vsa-waived", `#${node.id} claimed without an ISC citation: ISC: none (${vsa.waived})`);
  let messageId: string | null = null;
  let announceError: string | null = null;
  try {
@@ -565,7 +581,8 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
       rootAuthor,
      });
      if (!briefs.ok) errors.push(`build briefs unverified — build nodes held this tick: ${briefs.error}`);
-     const planOf = (nodes: typeof classified) => planTick(freshCandidates(nodes, map, journal.listWorkers(map.repo)), {
+     const vsaRefused = new Set<string>();
+     const planOf = (nodes: typeof classified) => planTick(freshCandidates(nodes, map, journal.listWorkers(map.repo)).filter((n) => !vsaRefused.has(n.id)), {
       laneBusy: lanesTakenThisTick.has(implementLane(map)) || implementLaneBusy(journal, implementLane(map)),
       vetoed: (id) => journal.hasVeto(id, map.repo),
       implementDrained: drain?.scope === "lane",
@@ -580,11 +597,20 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
      errors.push(...gate.errors);
      owned();
      const plan = gate.plan;
-     const candidates = plan.selected;
-     const laneOf = (id: string) =>
-      plan.implement.some((n) => n.id === id) ? "implement" : "research";
+     const candidates = [...plan.selected];
+     const implementIds = new Set(plan.implement.map((n) => n.id));
+     const laneOf = (id: string) => implementIds.has(id) ? "implement" : "research";
+     const requeueAfterVsaRefusal = (nodeId: string): { heads: typeof classified; vetoErrors: string[] } => {
+      vsaRefused.add(nodeId);
+      const next = planOf(classified);
+      return {
+       heads: next.implement.filter((head) => !next.vetoed.includes(head)),
+       vetoErrors: next.implement.filter((head) => next.vetoed.includes(head)).map((head) => `#${head.id} vetoed — not claimed`),
+      };
+     };
 
-     for (const node of candidates) {
+     for (let i = 0; i < candidates.length; i++) {
+      const node = candidates[i];
       if (
        journal.spawnsToday(ctx.now?.() ?? new Date()) >=
        config.workers.spawnCapPerDay
@@ -632,6 +658,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
         endpointProbe: ctx.endpointProbe, endpointLookup: ctx.endpointLookup, nodeSelector: ctx.nodeSelector,
         now: ctx.now,
         owned,
+        forge: portFor(map.repo),
        });
       } catch (error) {
        if (!(error instanceof GraphWriteError)) throw error;
@@ -641,6 +668,12 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
       if (outcome.messageId !== null) mapResult.announced.push(node.id);
       if (!outcome.claimed) {
        errors.push(outcome.error);
+       if (outcome.refusedBy === "vsa" && laneOf(node.id) === "implement") {
+        const { heads, vetoErrors } = requeueAfterVsaRefusal(node.id);
+        errors.push(...vetoErrors);
+        for (const head of heads) implementIds.add(head.id);
+        candidates.splice(i + 1, 0, ...heads);
+       }
        continue;
       }
       mapResult.claimed.push(node.id);

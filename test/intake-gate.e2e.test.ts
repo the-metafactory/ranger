@@ -19,7 +19,7 @@ import {
 import { Journal } from "../src/journal.ts";
 import type { ClaudeOneShot } from "../src/substrate.ts";
 import { walk } from "../src/walk.ts";
-import { baseConfigLines, claudeEnvelope, FAKE_BOT_ID, FAKE_GUILD_ID, fakeDiscord, fixturesBin, type FakeThreadMessage } from "./support.ts";
+import { baseConfigLines, claudeEnvelope, commitVsaToOrigin, createCanonicalRepo, FAKE_BOT_ID, FAKE_GUILD_ID, fakeDiscord, fixturesBin, type FakeThreadMessage } from "./support.ts";
 
 /**
  * The intake gate (node #251): the principal's 👍 on a draft card files the
@@ -79,10 +79,12 @@ async function withEnv<T>(env: NodeJS.ProcessEnv, fn: () => Promise<T>): Promise
 }
 
 /** A map whose thread holds one drafted principal observation (the draft tick has run). */
-async function rig(opts: { claude?: ClaudeOneShot } = {}): Promise<Rig> {
+async function rig(opts: { claude?: ClaudeOneShot; vsa?: string; observation?: string } = {}): Promise<Rig> {
  const dir = mkdtempSync(join(tmpdir(), "ranger-intake-gate-"));
  const discord = fakeDiscord();
- const lines = baseConfigLines(dir, { auth: ["  writeTokens:", '    "acme/*": RANGER_WRITE_TEST'] });
+ const canonical = opts.vsa === undefined ? join(dir, "no-canonical") : (await createCanonicalRepo(dir)).canonical;
+ if (opts.vsa !== undefined) await commitVsaToOrigin(canonical, opts.vsa);
+ const lines = baseConfigLines(dir, { map: [`    canonical: ${canonical}`], auth: ["  writeTokens:", '    "acme/*": RANGER_WRITE_TEST'] });
  lines.push("principal:", "  login: jcfischer", `  discordId: "${PRINCIPAL}"`);
  const configPath = join(dir, "ranger.yaml");
  writeFileSync(configPath, lines.join("\n"));
@@ -127,7 +129,7 @@ async function rig(opts: { claude?: ClaudeOneShot } = {}): Promise<Rig> {
    rmSync(dir, { recursive: true, force: true });
   },
  };
- discord.say(THREAD, msg(MESSAGE, PRINCIPAL, OBSERVATION));
+ discord.say(THREAD, msg(MESSAGE, PRINCIPAL, opts.observation ?? OBSERVATION));
  const drafted = await r.tick();
  expect(drafted.threads[0]!.drafted).toEqual([MESSAGE]);
  // A card posted this tick has no reaction yet: the gate does not read it.
@@ -482,6 +484,68 @@ describe("intake gate: the principal's 👍 files the draft (node #251)", () => 
    );
    expect(result.intake.threads[0]!.gate!.filed).toEqual([{ messageId: MESSAGE, node: "100", added: true }]);
    expect(r.issues()).toHaveLength(1);
+  } finally { r.close(); }
+ });
+});
+
+describe("intake gate: the ISC line (ranger VSA ISC-2, D2)", () => {
+ const VSA = ["- [ ] ISC-2: Claims cite a criterion.", "- [ ] ISC-7: Another."].join("\n");
+ const prose = (r: Rig) => r.issues()[0]?.prose ?? "";
+
+ test("a source message citing VSA criteria files them as Serves, dropping IDs VSA.md does not have", async () => {
+  const observation = `<@${FAKE_BOT_ID}> The minimap flickers when the window resizes\nThis is for ISC-7 and ISC-99, maybe ISC-2.`;
+  const r = await rig({ vsa: VSA, observation });
+  try {
+   r.discord.react(r.card(), "👍", PRINCIPAL);
+   expect(gateOf(await r.tick()).filed).toEqual([{ messageId: MESSAGE, node: "100", added: true }]);
+   expect(prose(r)).toContain(`${observation}\n\nServes: ISC-7, ISC-2.\n\n---`);
+   expect(prose(r).trimEnd().endsWith(intakeMarker(MESSAGE))).toBe(true);
+  } finally { r.close(); }
+ });
+
+ test("a source message citing no criterion files without any ISC line, so the claim gate refuses the node", async () => {
+  const r = await rig({ vsa: VSA });
+  try {
+   r.discord.react(r.card(), "👍", PRINCIPAL);
+   expect(gateOf(await r.tick()).filed).toEqual([{ messageId: MESSAGE, node: "100", added: true }]);
+   expect(prose(r)).not.toMatch(/^(Serves:|ISC: none)/m);
+   expect(prose(r)).toBe(intakeNodeBody({ body: OBSERVATION, messageUrl: `https://discord.com/channels/${FAKE_GUILD_ID}/${THREAD}/${MESSAGE}`, messageId: MESSAGE }));
+  } finally { r.close(); }
+ });
+
+ test("a newer soma that refuses the add is a terminal outcome: journalled once, no add retried each tick, the draft still correctable", async () => {
+  const r = await rig({ vsa: VSA });
+  try {
+   r.discord.react(r.card(), "👍", PRINCIPAL);
+   for (let i = 0; i < 3; i++) {
+    const gate = gateOf(await r.tick({ FAKE_SOMA_ADD_FAIL: "vsa" }));
+    expect(gate.filed).toEqual([]);
+    expect(gate.errors).toEqual([]);
+    expect(gate.refused).toEqual([{ messageId: MESSAGE, reason: expect.stringMatching(i === 0 ? /^soma graph add refused: / : /refused this spec before/) }]);
+   }
+   expect(r.issues()).toEqual([]);
+   const state = JSON.parse(readFileSync(join(r.dir, "soma-state.json"), "utf8"));
+   expect(state.refusedAdds).toBe(1);
+   expect(r.journal.getIntakeDraft(MESSAGE)?.status).toBe("draft");
+   const refused = r.journal.listEvents("acme/widgets", 50).filter((e) => e.kind === "intake-refused");
+   expect(refused).toHaveLength(1);
+   expect(refused[0].detail).toContain("cites no ISC criterion from VSA.md");
+  } finally { r.close(); }
+ });
+
+ test("a draft without a spec hash never reaches the add a refusing soma would answer: no add tried, no intake-refused, over two ticks", async () => {
+  const r = await rig({ vsa: VSA });
+  try {
+   const legacy = new Database(join(r.dir, "state.sqlite"));
+   legacy.run("UPDATE intake_drafts SET spec_hash = NULL WHERE message_id = ?", [MESSAGE]);
+   legacy.close();
+   r.discord.react(r.card(), "👍", PRINCIPAL);
+   for (let i = 0; i < 2; i++) {
+    expect(gateOf(await r.tick({ FAKE_SOMA_ADD_FAIL: "vsa" })).refused).toEqual([{ messageId: MESSAGE, reason: expect.stringContaining("no spec hash") }]);
+   }
+   const state = JSON.parse(readFileSync(join(r.dir, "soma-state.json"), "utf8"));
+   expect(state.refusedAdds ?? 0).toBe(0);
+   expect(r.journal.listEvents("acme/widgets", 50).filter((e) => e.kind === "intake-refused")).toHaveLength(0);
   } finally { r.close(); }
  });
 });

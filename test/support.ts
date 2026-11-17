@@ -67,6 +67,16 @@ export async function createCanonicalRepo(
  return { origin, canonical };
 }
 
+/** Commit `text` as `VSA.md` in `canonical`, push it to origin's main and fetch, so `origin/main` has it. */
+export async function commitVsaToOrigin(canonical: string, text: string): Promise<void> {
+ const git = gitIn(canonical);
+ writeFileSync(join(canonical, "VSA.md"), text);
+ await git(["add", "VSA.md"]);
+ await git(["commit", "-m", "add vsa"]);
+ await git(["push", "origin", "HEAD:main"]);
+ await git(["fetch", "origin"]);
+}
+
 /**
  * Add a node worktree the way ranger did before node #81: a `node/<N>-<slug>`
  * branch that tracks origin/<base>, so the shared config gains its remote +

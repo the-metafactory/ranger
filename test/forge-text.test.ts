@@ -408,7 +408,9 @@ describe("node #129 — GitHub renderings stay pinned (one wording fix, node #12
 
     ## Out of scope
 
-    - Ranger does not close this node when the probe goes green."
+    - Ranger does not close this node when the probe goes green.
+
+    ISC: none (fix-base: main is broken)"
     ,
       "gist": "Name MRs and nodes the way their forge does — PR #42",
       "ready auto/autoMerge": 

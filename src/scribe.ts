@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { iscLine } from "./candidates.ts";
 import { namedNodeReference, type BlockedReport, type NodeReference } from "./blocked-report.ts";
 import { changeRequestLabel, changeRequestNoun } from "./forge-text.ts";
 import { normalizeNodeId, parseForgeRef, repoIdentity } from "./forge-ref.ts";
@@ -6,6 +7,7 @@ import { GraphAddUnattached, type AddSpec } from "./graph-write.ts";
 import type { NodeResult } from "./graph.ts";
 import type { Journal } from "./journal.ts";
 import { mapKey } from "./maps.ts";
+import { IMPLEMENT_KINDS } from "./route.ts";
 
 /**
  * The Scribe (design §6): files newly discovered work back onto the graph as
@@ -211,6 +213,17 @@ function titled(prefix: string, title: string): string {
  return raw.length > 120 ? `${raw.slice(0, 119)}…` : raw;
 }
 
+/** Does a node filed from `spec` need an ISC line? Only implement kinds do. */
+export function needsIscLine(spec: AddSpec): boolean {
+ return IMPLEMENT_KINDS.has(spec.kind ?? "");
+}
+
+/** `spec` with `line` as its body's last paragraph, when it needs one; any other spec, or no line, as it is. */
+export function withIscLine(spec: AddSpec, line: string | null): AddSpec {
+ if (line === null || !needsIscLine(spec)) return spec;
+ return { ...spec, body: spec.body === undefined || spec.body === "" ? line : `${spec.body}\n\n${line}` };
+}
+
 /** Every template files a `propose` build node (node #9: never `auto`). */
 const build = (): Pick<AddSpec, "autonomy" | "kind" | "labels"> => ({ autonomy: "propose", kind: "build", labels: ["orienteer:build"] });
 
@@ -312,6 +325,8 @@ export function foundByProbeSpec(
    "## Out of scope",
    "",
    "- Ranger does not close this node when the probe goes green.",
+   "",
+   iscLine([], `fix-base: ${base} is broken`),
   ].join("\n"),
  };
 }
@@ -544,6 +559,7 @@ export interface BlockedPrerequisite {
  map: { repo: string; root: number };
  node: SpawningNode & { parent?: { id: string } };
  report: BlockedReport;
+ isc?: () => Promise<string | null>;
 }
 
 /**
@@ -637,8 +653,9 @@ export async function fileBlockedPrerequisite(
  }
  const filingParent = sameNode(map.repo, parent, String(map.root)) ? node.id : parent;
  const spec = blockedPrerequisiteSpec(node, park.report);
+ const filedSpec = park.isc === undefined || !needsIscLine(spec) ? spec : withIscLine(spec, await park.isc());
  const filed = await scribeFile(graph, journal, {
-  map, parent: filingParent, owner: node.id, variant: parkIdentity(resume), provenance: "blocked-prerequisite", spec,
+  map, parent: filingParent, owner: node.id, variant: parkIdentity(resume), provenance: "blocked-prerequisite", spec: filedSpec,
  }, fence);
  fence?.();
  await graph.link(node.id, parent, [filed.node]);

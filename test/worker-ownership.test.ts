@@ -211,7 +211,7 @@ test("start-failure suffix is bounded, deduplicated and preserves infrastructure
 });
 
 const freshClaim = (id: string, spawn: () => Promise<number | null>, claim?: () => Promise<never>) => claimNode({
- journal: a, map: config.maps[0], node: { id, title: "Feature" }, lane: "implement", botIdentity: "ivy-bot", token: "unused",
+ journal: a, map: config.maps[0], node: { id, title: "Feature", kind: "task" }, lane: "implement", botIdentity: "ivy-bot", token: "unused",
  cliEntry: "/tmp/ranger/cli.ts", configPath, announce: async () => ({ messageId: "message" }),
  claim: claim ?? (async () => ({ repo, node: id, held: true, assignees: ["ivy-bot"] })), spawnRunNode: spawn,
 });
