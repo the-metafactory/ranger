@@ -5,6 +5,7 @@ import { canonicalDir, type RangerConfig, type RangerMapConfig } from "./config.
 import { lanePort } from "./forge-lanes.ts";
 import type { ForgeReadPort } from "./forge.ts";
 import { safeGit } from "./git-ops.ts";
+import type { Journal } from "./journal.ts";
 import { IMPLEMENT_KINDS } from "./route.ts";
 
 export interface BaseVsa {
@@ -12,11 +13,17 @@ export interface BaseVsa {
  createdAt: Date;
 }
 
+/** Where the gate keeps values that never change for a given key: the journal's health table. */
+export type VsaCache = Pick<Journal, "getHealth" | "setHealth">;
+
 /**
  * `VSA.md` at `origin/<base>` in `canonical`, or null when there is no
- * checkout or the base has no `VSA.md`. Any other git failure throws.
+ * checkout or the base has no `VSA.md`. Any other git failure throws. The
+ * add date comes from a walk of the base's history, so `cache` keeps it
+ * with the base commit it was read at and the walk runs again only when
+ * `origin/<base>` moves.
  */
-export async function readBaseVsa(canonical: string, base: string): Promise<BaseVsa | null> {
+export async function readBaseVsa(canonical: string, base: string, cache?: VsaCache): Promise<BaseVsa | null> {
  if (!existsSync(join(canonical, ".git"))) return null;
  const ref = `refs/remotes/origin/${base}`;
  const git = async (args: string[]): Promise<string> => {
@@ -24,12 +31,31 @@ export async function readBaseVsa(canonical: string, base: string): Promise<Base
   if (result.code !== 0) throw new Error(`git ${args[0]} ${ref}: ${result.stderr.trim() || `exit ${result.code}`}`);
   return result.stdout;
  };
- if ((await git(["ls-tree", "--name-only", ref, "--", "VSA.md"])).trim() === "") return null;
- const text = await git(["show", `${ref}:VSA.md`]);
- const added = (await git(["log", "--diff-filter=A", "--format=%cI", ref, "--", "VSA.md"])).trim().split("\n").filter(Boolean);
+ const sha = (await git(["rev-parse", "--verify", `${ref}^{commit}`])).trim();
+ if ((await git(["ls-tree", "--name-only", sha, "--", "VSA.md"])).trim() === "") return null;
+ const text = await git(["show", `${sha}:VSA.md`]);
+ const key = `vsa.added:${canonical}#${base}`;
+ const cached = cache?.getHealth(key);
+ if (cached?.startsWith(`${sha} `) === true) return { text, createdAt: new Date(cached.slice(sha.length + 1)) };
+ const added = (await git(["log", "--diff-filter=A", "--format=%cI", sha, "--", "VSA.md"])).trim().split("\n").filter(Boolean);
  const oldest = added.at(-1);
  if (oldest === undefined) throw new Error(`no commit on ${ref} adds VSA.md`);
+ cache?.setHealth(key, `${sha} ${oldest}`);
  return { text, createdAt: new Date(oldest) };
+}
+
+async function cachedIssueCreatedAt(args: VsaGateArgs & { config: RangerConfig }): Promise<Date> {
+ const { config, map, node } = args;
+ const key = `vsa.issue-created:${map.repo}#${node.id}`;
+ const cached = args.cache.getHealth(key);
+ if (cached !== null) return new Date(cached);
+ if (!/^\d+$/.test(node.id)) throw new Error(`node id ${node.id} is not an issue number`);
+ const forge = args.forge ?? lanePort(config, map.repo);
+ if (forge.issueCreatedAt === undefined) throw new Error("this forge cannot read issue creation dates");
+ const read = await forge.issueCreatedAt(map.repo, Number(node.id), args.token);
+ if (Number.isNaN(new Date(read).getTime())) throw new Error(`forge returned creation date ${JSON.stringify(read)}`);
+ args.cache.setHealth(key, read);
+ return new Date(read);
 }
 
 export interface VsaGateArgs {
@@ -38,6 +64,7 @@ export interface VsaGateArgs {
  node: { id: string; kind: string; body?: string };
  token: string;
  forge?: Pick<ForgeReadPort, "issueCreatedAt">;
+ cache: VsaCache;
 }
 
 /**
@@ -50,17 +77,14 @@ export async function vsaGate(args: VsaGateArgs): Promise<VsaClaimVerdict> {
  if (config === undefined || !IMPLEMENT_KINDS.has(node.kind)) return null;
  let vsa: BaseVsa | null;
  try {
-  vsa = await readBaseVsa(canonicalDir(config, map), map.base);
+  vsa = await readBaseVsa(canonicalDir(config, map), map.base, args.cache);
  } catch (error) {
   return { refused: `VSA.md unreadable on origin/${map.base} (${error instanceof Error ? error.message : String(error)})` };
  }
  if (vsa === null) return null;
  let createdAt: Date;
  try {
-  if (!/^\d+$/.test(node.id)) throw new Error(`node id ${node.id} is not an issue number`);
-  const forge = args.forge ?? lanePort(config, map.repo);
-  if (forge.issueCreatedAt === undefined) throw new Error("this forge cannot read issue creation dates");
-  createdAt = new Date(await forge.issueCreatedAt(map.repo, Number(node.id), args.token));
+  createdAt = await cachedIssueCreatedAt({ ...args, config });
  } catch (error) {
   return { refused: `node creation date unreadable (${error instanceof Error ? error.message : String(error)})` };
  }

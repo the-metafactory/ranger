@@ -153,7 +153,7 @@ export async function claimNode(args: ClaimNodeArgs): Promise<ClaimNodeOutcome> 
   error: `map ${mapKey(map)} fresh claims held after worker start failure on #${startHold.nodeId}; resume or release that node before claiming more work` };
  const refusal = freshClaimRefusal(map, node.id, previous);
  if (refusal !== null) return { claimed: false, messageId: null, error: refusal };
- const vsa = await vsaGate({ config: args.config, map, node, token, forge: args.forge });
+ const vsa = await vsaGate({ config: args.config, map, node, token, forge: args.forge, cache: journal });
  const journalOnce = (kind: "refused" | "vsa-waived", detail: string) => {
   const journaled = detail.slice(0, 400);
   if (journal.lastEventDetail(kind, map.repo, node.id) !== journaled) {

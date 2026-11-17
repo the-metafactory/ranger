@@ -136,6 +136,23 @@ describe("readBaseVsa", () => {
  test("a missing checkout reads as none", async () => {
   expect(await readBaseVsa(join(dir, "absent"), "main")).toBeNull();
  });
+ test("the add date is read once per base commit: a cached date for the same SHA is used, a new SHA re-reads it", async () => {
+  const canonical = await seedCanonicalAddingVsaAtAddedThenEditing(dir, true);
+  const health = new Map<string, string>();
+  const cache = { getHealth: (k: string) => health.get(k) ?? null, setHealth: (k: string, v: string) => { health.set(k, v); } };
+  expect((await readBaseVsa(canonical, "main", cache))?.createdAt.toISOString()).toBe(ADDED.toISOString());
+  expect(health.size).toBe(1);
+  const [key, value] = [...health][0];
+  const planted = new Date("2026-01-01T00:00:00Z");
+  health.set(key, `${value.split(" ")[0]} ${planted.toISOString()}`);
+  expect((await readBaseVsa(canonical, "main", cache))?.createdAt.toISOString()).toBe(planted.toISOString());
+  writeFileSync(join(canonical, "other.md"), "x\n");
+  await git(canonical, ["add", "-A"]);
+  await git(canonical, ["commit", "-q", "-m", "other"]);
+  await git(canonical, ["push", "-q", "origin", "HEAD:main"]);
+  await git(canonical, ["fetch", "-q", "origin"]);
+  expect((await readBaseVsa(canonical, "main", cache))?.createdAt.toISOString()).toBe(ADDED.toISOString());
+ });
  test("an unreadable base ref throws", async () => {
   await expect(readBaseVsa(await seedCanonicalAddingVsaAtAddedThenEditing(dir, true), "no-such-branch")).rejects.toThrow();
  });
@@ -305,6 +322,13 @@ describe("walk VSA gate", () => {
   frontier([{ id: "30", body: "Build the thing." }, { id: "31", body: "Build the other thing." }]);
   const result = await tick({ 30: AFTER, 31: BEFORE }, []);
   expect(result.maps[0].claimed).toEqual(["31"]);
+ });
+
+ test("a refused head over two ticks reads its issue creation date from the forge once", async () => {
+  frontier([{ id: "30", body: "Build the thing." }]);
+  const reads: string[] = [];
+  for (let i = 0; i < 2; i++) expect((await tick({ 30: AFTER }, reads)).maps[0].claimed).toEqual([]);
+  expect(reads).toEqual(["30"]);
  });
 
  test("the same refused head over two ticks journals one refused event", async () => {
