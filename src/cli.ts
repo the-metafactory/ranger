@@ -14,6 +14,7 @@ import { resumeNode } from "./resume.ts";
 import { Command } from "commander";
 import pkg from "../package.json" with { type: "json" };
 import {
+ canonicalDir,
  principalLoginForRepo,
  loadConfig,
  resolveConfigPath,
@@ -47,7 +48,7 @@ import {
  assertWriteIdentity,
  WriteGateError,
 } from "./identity.ts";
-import { canonicalDir, runNode, runNodeRunOutcome, type RunNodeContext, type RunNodeOutcome } from "./worker.ts";
+import { runNode, runNodeRunOutcome, type RunNodeContext, type RunNodeOutcome } from "./worker.ts";
 import { trustCurrentGitState } from "./git-trust.ts";
 import { existingWorkerLog } from "./worker-log.ts";
 import { mergeGateNow } from "./merge-desk.ts";

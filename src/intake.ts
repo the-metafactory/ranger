@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
-import type { RangerConfig, RangerMapConfig } from "./config.ts";
+import { canonicalDir, type RangerConfig, type RangerMapConfig } from "./config.ts";
 import {
   discardedCardContent,
   draftCardContent,
@@ -34,7 +34,6 @@ import { type OwnedCheck, withOwnedLease } from "./lock.ts";
 import { mapKey } from "./maps.ts";
 import { loadProbeRegistry, registeredCommands, type ProbeRegistry, type RegisteredCommand } from "./route.ts";
 import { filedIscLine } from "./vsa-gate.ts";
-import { canonicalDir } from "./worker.ts";
 
 /**
  * Human-observation intake, slice 1 (node #247; #21 rulings D3, D11, D12, D17).

@@ -1,12 +1,11 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { criterionCitations, iscLine, vsaClaimVerdict, type VsaClaimVerdict } from "./candidates.ts";
-import type { RangerConfig, RangerMapConfig } from "./config.ts";
+import { canonicalDir, type RangerConfig, type RangerMapConfig } from "./config.ts";
 import { lanePort } from "./forge-lanes.ts";
 import type { ForgeReadPort } from "./forge.ts";
 import { safeGit } from "./git-ops.ts";
 import { IMPLEMENT_KINDS } from "./route.ts";
-import { canonicalDir } from "./worker.ts";
 
 export interface BaseVsa {
  text: string;

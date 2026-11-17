@@ -13,7 +13,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, w
 import { basename, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
-import { expandHome, principalLoginForRepo } from "./config.ts";
+import { canonicalDir, principalLoginForRepo } from "./config.ts";
 import { principalFiled } from "./approval-spec.ts";
 import { DiscordAnnouncer } from "./announce.ts";
 import { renderCard } from "./card-render.ts";
@@ -175,16 +175,6 @@ export interface RunNodeContext {
  /** Fix-the-base node filing (node #152); tests inject a fake graph port. */
  fixNode?: ImplementContext["fixNode"];
  mergeablePoll?: ImplementContext["mergeablePoll"];
-}
-
-/** The canonical checkout dir for a repo (design §4: probes run there). */
-export function canonicalDir(
- config: RangerConfig,
- map: RangerMapConfig,
-): string {
- return map.canonical === undefined
-  ? join(expandHome(config.state.canonicalRoot), map.repo)
-  : expandHome(map.canonical);
 }
 
 /** The worktree dir for a node, under the canonical checkout. */
