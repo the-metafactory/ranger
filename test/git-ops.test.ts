@@ -18,7 +18,7 @@ import {
  vettedPush,
 } from "../src/git-ops.ts";
 import { bootstrapWorktree, slugify, worktreeBranch } from "../src/worker.ts";
-import { addTrackedWorktree, createCanonicalRepo, GIT_ENV, takesRawByteNames } from "./support.ts";
+import { addTrackedWorktree, createCanonicalRepo, GIT_ENV, takesRawByteNames, useGitHome } from "./support.ts";
 
 /**
  * Node #63: the tamper guard leaves out only the branch-tracking entries
@@ -519,21 +519,19 @@ describe("utf8Name: entry names are judged as bytes (sage round 4 on node #86)",
  * recursion off.
  */
 describe("credentialed calls never recurse into submodules", () => {
- let home: string | undefined;
+ let restoreHome: () => void;
 
  beforeEach(() => {
-  home = process.env.HOME;
   // Git 2.38.1+ refuses file:// submodule transport by default; the fixture
   // remotes are local paths. minimalGitEnv passes HOME through.
   const fakeHome = join(dir, "home");
   mkdirSync(fakeHome);
   writeFileSync(join(fakeHome, ".gitconfig"), "[protocol \"file\"]\n\tallow = always\n");
-  process.env.HOME = fakeHome;
+  restoreHome = useGitHome(fakeHome);
  });
 
  afterEach(() => {
-  if (home === undefined) delete process.env.HOME;
-  else process.env.HOME = home;
+  restoreHome();
  });
 
  test("a fetch that brings a new submodule commit leaves the submodule's remote alone", async () => {

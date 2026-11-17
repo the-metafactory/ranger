@@ -5,6 +5,18 @@ import type { ChildProcess } from "node:child_process";
 import { spawn } from "node:child_process";
 import { runCmd } from "../src/exec.ts";
 
+export function useGitHome(home: string): () => void {
+ const { HOME, GIT_CONFIG_GLOBAL } = process.env;
+ process.env.HOME = home;
+ delete process.env.GIT_CONFIG_GLOBAL;
+ return () => {
+  if (HOME === undefined) delete process.env.HOME;
+  else process.env.HOME = HOME;
+  if (GIT_CONFIG_GLOBAL === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+  else process.env.GIT_CONFIG_GLOBAL = GIT_CONFIG_GLOBAL;
+ };
+}
+
 export const fixturesBin = join(import.meta.dir, "fixtures", "bin");
 export const cliPath = join(import.meta.dir, "..", "src", "cli.ts");
 export const bun = process.execPath;
