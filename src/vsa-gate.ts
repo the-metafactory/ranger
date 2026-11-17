@@ -4,7 +4,7 @@ import { criterionCitations, iscLine, vsaClaimVerdict, type VsaClaimVerdict } fr
 import { canonicalDir, type RangerConfig, type RangerMapConfig } from "./config.ts";
 import { lanePort } from "./forge-lanes.ts";
 import type { ForgeReadPort } from "./forge.ts";
-import { safeGit } from "./git-ops.ts";
+import { fetchBranch, gitCredential, safeGit } from "./git-ops.ts";
 import type { Journal } from "./journal.ts";
 import { IMPLEMENT_KINDS } from "./route.ts";
 
@@ -70,14 +70,30 @@ export interface VsaGateArgs {
 /**
  * The VSA gate's verdict on this claim. Fails closed: an error reading
  * `VSA.md` or the node's date refuses with that error. Without a config
- * there is no checkout to read, so the gate allows.
+ * there is no checkout to read, so the gate allows. A refusal fetches the
+ * base from origin and judges again, so a criterion added to `VSA.md` since
+ * the checkout last fetched counts; a failed fetch keeps the refusal and
+ * names the fetch error.
  */
 export async function vsaGate(args: VsaGateArgs): Promise<VsaClaimVerdict> {
  const { config, map, node } = args;
  if (config === undefined || !IMPLEMENT_KINDS.has(node.kind)) return null;
+ const canonical = canonicalDir(config, map);
+ const first = await vsaGateAt(args, config, canonical);
+ if (first === null || !("refused" in first)) return first;
+ try {
+  await fetchBranch(canonical, map.base, gitCredential(map.repo, args.token));
+ } catch (error) {
+  return { refused: `${first.refused}; fetch of origin/${map.base} failed (${error instanceof Error ? error.message : String(error)})` };
+ }
+ return vsaGateAt(args, config, canonical);
+}
+
+async function vsaGateAt(args: VsaGateArgs, config: RangerConfig, canonical: string): Promise<VsaClaimVerdict> {
+ const { map, node } = args;
  let vsa: BaseVsa | null;
  try {
-  vsa = await readBaseVsa(canonicalDir(config, map), map.base, args.cache);
+  vsa = await readBaseVsa(canonical, map.base, args.cache);
  } catch (error) {
   return { refused: `VSA.md unreadable on origin/${map.base} (${error instanceof Error ? error.message : String(error)})` };
  }

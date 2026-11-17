@@ -230,6 +230,45 @@ describe("claimNode VSA gate", () => {
   expect(await claim("Build the thing.", BEFORE, announced)).toMatchObject({ claimed: true });
  });
 
+ async function pushVsaFromElsewhere(text: string): Promise<void> {
+  const other = join(dir, "other");
+  await git(dir, ["clone", "-q", join(dir, "origin.git"), other]);
+  writeFileSync(join(other, "VSA.md"), text);
+  await git(other, ["commit", "-q", "-am", "add ISC-20"]);
+  await git(other, ["push", "-q", "origin", "HEAD:main"]);
+ }
+ const VSA_WITH_ISC_20 = `${VSA}\n- [ ] ISC-20: Added after the canonical clone last fetched.\n`;
+
+ test("a node citing a criterion only on the remote's VSA.md is claimed after the gate fetches the base", async () => {
+  await pushVsaFromElsewhere(VSA_WITH_ISC_20);
+  const announced: string[] = [];
+  expect(await claim("Serves ISC-20.", AFTER, announced)).toMatchObject({ claimed: true });
+  expect(announced).toEqual(["30"]);
+  expect(journal.listEvents(repo, 50, "30").filter(e => e.kind === "refused")).toHaveLength(0);
+ });
+
+ test("a node citing a criterion absent on the remote too is still refused and journaled after the fetch", async () => {
+  await pushVsaFromElsewhere(VSA_WITH_ISC_20);
+  const announced: string[] = [];
+  const outcome = await claim("Serves ISC-21.", AFTER, announced);
+  expect(outcome).toMatchObject({ claimed: false, error: expect.stringContaining("ISC-21, not a criterion") });
+  expect(announced).toEqual([]);
+  const refused = journal.listEvents(repo, 50, "30").filter(e => e.kind === "refused");
+  expect(refused).toHaveLength(1);
+  expect(refused[0].detail).toContain("ISC-21");
+ });
+
+ test("a failed fetch keeps the refusal and names the fetch error", async () => {
+  rmSync(join(dir, "origin.git"), { recursive: true, force: true });
+  const announced: string[] = [];
+  const outcome = await claim("Serves ISC-20.", AFTER, announced);
+  if (outcome.claimed) throw new Error("claimed despite a failed fetch");
+  expect(outcome.error).toContain("ISC-20, not a criterion");
+  expect(outcome.error).toContain("fetch of origin/main failed");
+  expect(announced).toEqual([]);
+  expect(journal.listEvents(repo, 50, "30").find(e => e.kind === "refused")?.detail).toContain("fetch of origin/main failed");
+ });
+
  test("a failed node-date read refuses the claim with the error", async () => {
   const announced: string[] = [];
   const outcome = await claimNode({
