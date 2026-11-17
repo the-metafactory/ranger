@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { runCmd } from "../src/exec.ts";
 import { gitCredential } from "../src/git-ops.ts";
 import { bootstrapCanonical, bootstrapWorktree } from "../src/worker.ts";
-import { GIT_ENV } from "./support.ts";
+import { GIT_ENV, useGitHome } from "./support.ts";
 
 const repo = "acme/widgets";
 const credential = gitCredential(repo, "placeholder");
@@ -14,7 +14,7 @@ const POINTER = /^version https:\/\/git-lfs\.github\.com\/spec\/v1\noid sha256:[
 
 let dir: string;
 let origin: string;
-let savedHome: string | undefined;
+let restoreHome: () => void;
 let savedPath: string | undefined;
 
 const git = async (args: string[], cwd: string) => {
@@ -40,9 +40,8 @@ beforeEach(async () => {
    "",
   ].join("\n"),
  );
- savedHome = process.env.HOME;
  savedPath = process.env.PATH;
- process.env.HOME = home;
+ restoreHome = useGitHome(home);
  const seed = join(dir, "seed");
  mkdirSync(seed);
  writeFileSync(join(seed, ".gitattributes"), "*.bin filter=lfs diff=lfs merge=lfs -text\n");
@@ -57,8 +56,7 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
- if (savedHome === undefined) delete process.env.HOME;
- else process.env.HOME = savedHome;
+ restoreHome();
  process.env.PATH = savedPath;
  rmSync(dir, { recursive: true, force: true });
 });
