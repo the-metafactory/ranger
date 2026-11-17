@@ -1,13 +1,14 @@
 import { Database } from "bun:sqlite";
-import { createHash, createPrivateKey } from "node:crypto";
-import { chmod, mkdir, open, readFile, realpath, stat } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { chmod, mkdir, open, readFile, realpath } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { ZodError } from "zod";
 import type { RangerConfig } from "../config.ts";
 import { appChecksClient, openPullHeadsContaining, type AppChecks, type CheckConclusion, type CheckRunWrite, type FetchFn, type GhApi } from "../github.ts";
+import { readGitHubAppKey } from "../github-app-key.ts";
 import { resolveWriteToken } from "../identity.ts";
 import { privateDirectory, syncDirectory } from "./artifacts.ts";
-import { isOperatorPrivate, privateOperatorPath } from "./baseline.ts";
+import { privateOperatorPath } from "./baseline.ts";
 import type { QueuedReceipt } from "./bus-outbox.ts";
 import { validateJobIdentity, validateRemoteTestReceipt, type RemoteTestReceipt, type RemoteTestStatus } from "./contract.ts";
 import { getSshReceipt, listSshReceipts, validateSshConfig, type SshOptions } from "./ssh-client.ts";
@@ -278,14 +279,6 @@ export interface CheckReporterRun {
  pullHeads?: (repo: string, commitDigest: string) => Promise<string[]>;
 }
 
-async function readAppKey(path: string): Promise<string> {
- const file = await privateOperatorPath(path, true);
- if (!isOperatorPrivate(await stat(file))) throw Error("GitHub App key file must be operator-owned without group/world access");
- const pem = await readFile(file, "utf8");
- createPrivateKey(pem);
- return pem;
-}
-
 /**
  * Load the operator-local configuration and report. Throws, before any GitHub call,
  * when the opt-in block, the key or the reviewed SSH binding is missing or invalid.
@@ -295,7 +288,7 @@ async function readAppKey(path: string): Promise<string> {
 export async function runCheckReporter(config: RangerConfig, run: CheckReporterRun = {}): Promise<ReportSummary> {
  const settings = config.checkReporter;
  if (settings === undefined) throw Error("checkReporter is not configured");
- const privateKeyPem = await readAppKey(settings.privateKeyFile);
+ const privateKeyPem = await readGitHubAppKey(settings.privateKeyFile);
  const ssh = validateSshConfig(JSON.parse(await readFile(await privateOperatorPath(settings.sshConfigFile, true), "utf8")));
  const ledger = await openReporterLedger(settings.stateRoot, run.now);
  try {

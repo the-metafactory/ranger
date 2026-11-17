@@ -1,6 +1,6 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { DAY_FILE, DAY_MS, MAX_DAY_BYTES, type CallRecord, type GaugeRecord, type OpaqueRecord, type RefusalKind, type UsageRecord } from "./github-usage.ts";
+import { DAY_FILE, DAY_MS, MAX_DAY_BYTES, SAGE_APP_SOURCE_PREFIX, type CallRecord, type GaugeRecord, type OpaqueRecord, type RefusalKind, type UsageRecord } from "./github-usage.ts";
 
 const WINDOW_MS = 3_600_000;
 const TOP_SPENDERS = 5;
@@ -244,7 +244,7 @@ export function buildUsageReport(directory: string, since: Date, until: Date): U
  const calls = records.filter((r): r is CallRecord => r.kind === "call");
  const opaqueRuns = records.filter((r): r is OpaqueRecord => r.kind === "opaque");
  const observations = records.filter((r): r is Observation => r.kind !== "opaque" && r.reset !== undefined && r.resource !== undefined);
- const windowKey = (o: Observation): string => `${o.resource}:${o.reset}`;
+ const windowKey = (o: Observation): string => `${o.resource}:${o.reset}:${o.source.startsWith(SAGE_APP_SOURCE_PREFIX) ? o.source : ""}`;
  const touched = new Set(observations.filter((o) => inPeriod(o.at)).map(windowKey));
  const groups = new Map<string, Observation[]>();
  for (const observation of observations) {

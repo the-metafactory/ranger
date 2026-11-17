@@ -215,7 +215,24 @@ const ServeSchema = z.object({
 const credentialEnvName = z.string().min(1).refine(name => !workerEnvPasses(name),
  name => ({ message: `credential env var ${name} would be inherited by worker sessions; use a RANGER_* name` }));
 
+const AbsolutePath = z.string().min(1).refine(isAbsolute, "an absolute path");
+
+const GitHubAppInstallations = z.record(
+ z.string().regex(/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/, "a GitHub owner login"),
+ z.number().int().positive(),
+).refine(installations => Object.keys(installations).length > 0, "at least one installation");
+
+const SageAppSchema = z.object({
+ appId: z.number().int().positive(),
+ privateKeyFile: AbsolutePath,
+ installations: GitHubAppInstallations.refine(installations => {
+  const owners = Object.keys(installations);
+  return new Set(owners.map(owner => owner.toLowerCase())).size === owners.length;
+ }, "installation owners must be unique"),
+}).strict();
+
 const AuthSchema = z.object({
+ sageApp: SageAppSchema.optional(),
  /**
   * Repo-prefix → env var name holding a read-only PAT. Bare keys match only
   * GitHub. GitLab requires gitlab:host/path prefixes, matched longest-first.
@@ -439,8 +456,6 @@ const BusSchema = z.object({
  }
 });
 
-const AbsolutePath = z.string().min(1).refine(isAbsolute, "an absolute path");
-
 const PrHeadSubmitterSchema = z.object({
  busConfigFile: AbsolutePath,
  signerFile: AbsolutePath,
@@ -452,8 +467,7 @@ const CheckReporterSchema = z.object({
  appId: z.number().int().positive(),
  apiBaseUrl: GitHubApiBaseUrlSchema,
  privateKeyFile: AbsolutePath,
- installations: z.record(z.string().regex(/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/, "a GitHub owner login"), z.number().int().positive())
-  .refine(installations => Object.keys(installations).length > 0, "at least one installation"),
+ installations: GitHubAppInstallations,
  sshConfigFile: AbsolutePath,
  stateRoot: AbsolutePath,
 }).strict();

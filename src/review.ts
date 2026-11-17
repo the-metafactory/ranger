@@ -1,6 +1,6 @@
 import { z } from "zod";
-import type { RunResult } from "./exec.ts";
-import { meteredOpaque, READ_ONLY_TOKEN_SOURCE } from "./github-usage.ts";
+import { runCmd, type RunResult } from "./exec.ts";
+import { meteredGauge, meteredOpaque, READ_ONLY_TOKEN_SOURCE, SAGE_APP_SOURCE_PREFIX } from "./github-usage.ts";
 import { nodeKey } from "./forge-ref.ts";
 import { changeRequestRef } from "./forge-text.ts";
 import type { SubstrateName } from "./store/schema.ts";
@@ -63,8 +63,9 @@ const PREFLIGHT_FAILURE_EXIT = 2;
 function parsedMarkerOrMalformed(json: string): unknown {
  try {
   return JSON.parse(json);
- } catch {
-  return undefined;
+ } catch (error) {
+  if (error instanceof SyntaxError) return undefined;
+  throw error;
  }
 }
 
@@ -85,6 +86,14 @@ function preflightFailure(result: Pick<RunResult, "code" | "stderr">): SagePrefl
 const markerAllowsRetry = (result: Pick<RunResult, "code" | "stderr">): boolean =>
  (preflightFailure(result)?.kind ?? "transient") === "transient";
 
+async function recordAppWindow(source: string, env: NodeJS.ProcessEnv): Promise<void> {
+ try {
+  await meteredGauge({ component: "sage-review", source })("gh", ["api", "rate_limit"], { env, timeoutMs: 15_000 });
+ } catch {
+  process.stderr.write(`ranger: GitHub budget reading unavailable for ${source}\n`);
+ }
+}
+
 export async function sageReview(
  repo: string,
  prNumber: number,
@@ -102,7 +111,15 @@ export async function sageReview(
  try {
   const args = ["review", nodeKey(repo, prNumber), "--emit-verdict-block"];
   args.push("--substrate", opts.substrate);
-  const metered = meteredOpaque({ component: "sage-review", source: opts.tokenSource ?? READ_ONLY_TOKEN_SOURCE });
+  const source = opts.tokenSource ?? READ_ONLY_TOKEN_SOURCE;
+  const app = source.startsWith(SAGE_APP_SOURCE_PREFIX);
+  const run: typeof runCmd = async (bin, args, options) => {
+   const result = await runCmd(bin, args, options);
+   if (!app) return result;
+   return { ...result, stdout: result.stdout.replaceAll(readOnlyToken, "[credential]"), stderr: result.stderr.replaceAll(readOnlyToken, "[credential]") };
+  };
+  if (app) await recordAppWindow(source, gated.env);
+  const metered = meteredOpaque({ component: "sage-review", source }, run);
   const result = await runReadRetryingTransient(
    opts.command ?? process.env.RANGER_SAGE_CMD ?? "sage",
    args,
@@ -133,13 +150,18 @@ export async function sageReview(
      verdict = undefined;
     }
    }
-   if (verdict?.verdict === "changes-requested") return verdict;
+   if (verdict?.verdict === "changes-requested") {
+    if (app) await recordAppWindow(source, gated.env);
+    return verdict;
+   }
    throw new ReviewError(
     `sage review ${repo}${changeRequestRef(repo, prNumber)} exited ${result.code}: ${(result.stderr || result.stdout).trim().slice(-400)}`,
     preflightFailure(result),
    );
   }
-  return parseVerdictBlock(result.stdout);
+  const verdict = parseVerdictBlock(result.stdout);
+  if (app) await recordAppWindow(source, gated.env);
+  return verdict;
  } finally {
   gated.cleanup();
  }

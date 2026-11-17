@@ -28,7 +28,7 @@ Ranger passes the chosen path, made absolute, to every ranger process it starts,
 | `principal` | The principal's `login` and, for intake, `discordId`. No tick that changes the graph runs under this identity. |
 | `state` | `journalPath` (default `~/.config/ranger/state.sqlite`), `canonicalRoot` (where canonical checkouts live), and the migration-only `legacyMapRoots`. |
 | `workers` | Spawn cap, lane slots, job slots, wall clock, attempts, dead-man threshold, review rounds, base drift, CI grace, host load, and probe requeues. |
-| `auth` | `readOnlyTokens` and `writeTokens`: environment variable names by repo prefix. The longest matching prefix wins. |
+| `auth` | `readOnlyTokens` and `writeTokens` name environment variables by repo prefix. The longest prefix wins. `sageApp` optionally configures a dedicated GitHub App for review. |
 | `budget` | GitHub GraphQL floor, the cooldown after a secondary rate limit, and the frontier's maximum age. |
 | `substrates` | Quota thresholds and the Claude, Codex, and Pi worker models. |
 | `ratify`, `intake` | Proposal reads per tick, and the intake drafter's model. See [the walk](walk.md) and [observation intake](intake.md). |
@@ -59,6 +59,12 @@ security add-generic-password -s ranger-ro-metafactory -a token -w <pat>
 The write credential is a classic PAT for a reason. A fine-grained PAT cannot reach an organization's repos as an outside collaborator, and it can never be scoped to another account's personal repos. The Discord bot must be a member of the guild of each map's channel.
 
 The wrapper also clears the caller's environment, pins `PATH`, `HOME`, and the `bun` binary, and starts bun with ranger's own `bunfig.toml` and no `.env` file. A worker session runs as the same user and can call the wrapper, so the wrapper never runs a program the caller chose with the tokens in its environment (node #66). The comments in `ops/bin/ranger.example` list every rule.
+
+### Sage's GitHub App
+
+Set `auth.sageApp.appId`, `auth.sageApp.privateKeyFile`, and `auth.sageApp.installations` to use a dedicated GitHub App for Sage. The private key needs an absolute path outside any repository, operator ownership and permission mode `0600` or stricter. Map each GitHub repository owner to its installation ID. Grant read access to Contents, Pull requests, Issues, Checks and Metadata, and install the App on the repositories Sage reviews.
+
+Ranger mints a token for the reviewed repository and passes it through the gated Sage environment. `ranger budget` reports reviews and their core window under `sage-app:<appId>:<installationId>`. The principal's PAT cooldown and the App installation's cooldown are independent. Maps without a matching installation keep their configured PAT. A configured installation that cannot mint a token fails the review.
 
 ## Tick run ledger
 

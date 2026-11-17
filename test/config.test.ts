@@ -116,6 +116,19 @@ describe("loadConfig", () => {
     });
   });
 
+  test("loads Sage App settings and refuses ambiguous owners and relative key paths", () => {
+    const base = "maps:\n  - repo: acme/widgets\n    root: 1\nauth:\n  sageApp:\n    appId: 10\n";
+    withConfig(base + "    privateKeyFile: /operator/sage.pem\n    installations: {Acme: 20}\n", path => {
+      expect(loadConfig(path).config.auth.sageApp).toEqual({ appId: 10, privateKeyFile: "/operator/sage.pem", installations: { Acme: 20 } });
+    });
+    withConfig(base + "    privateKeyFile: sage.pem\n    installations: {Acme: 20}\n", path => {
+      expect(() => loadConfig(path)).toThrow(/absolute path/);
+    });
+    withConfig(base + "    privateKeyFile: /operator/sage.pem\n    installations: {Acme: 20, acme: 21}\n", path => {
+      expect(() => loadConfig(path)).toThrow(/owners must be unique/);
+    });
+  });
+
   test("private shadow example substitutes into the current loader without changing authority", () => {
     const template = readFileSync(new URL("../docs/examples/remote-test-private-shadow.yaml", import.meta.url), "utf8");
     const replacements: Record<string, string> = {

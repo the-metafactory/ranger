@@ -602,6 +602,11 @@ export interface InstallationToken {
 /** The in-process HTTP call the App JWT exchange uses; injectable so tests never reach GitHub. */
 export type FetchFn = (url: string, init: RequestInit) => Promise<Response>;
 
+interface InstallationTokenScope {
+ repositories: readonly string[];
+ permissions: Readonly<Record<string, "read">>;
+}
+
 const INSTALLATION_TOKEN_TIMEOUT_MS = 30_000;
 
 /**
@@ -609,7 +614,7 @@ const INSTALLATION_TOKEN_TIMEOUT_MS = 30_000;
  * `gh` would send the JWT under the `token` scheme, which GitHub refuses, and would put it in a
  * child's environment. Any refusal, timeout or malformed answer throws without either credential.
  */
-export async function createInstallationToken(jwt: string, installationId: number, options: { apiBaseUrl?: string; fetch?: FetchFn; timeoutMs?: number } = {}): Promise<InstallationToken> {
+export async function createInstallationToken(jwt: string, installationId: number, options: { apiBaseUrl?: string; fetch?: FetchFn; timeoutMs?: number; scope?: InstallationTokenScope } = {}): Promise<InstallationToken> {
  const apiBaseUrl = GitHubApiBaseUrlSchema.parse(options.apiBaseUrl);
  const fetchFn = options.fetch ?? fetch;
  const timeoutMs = options.timeoutMs ?? INSTALLATION_TOKEN_TIMEOUT_MS;
@@ -617,11 +622,14 @@ export async function createInstallationToken(jwt: string, installationId: numbe
  const redact = (text: string): string => (jwt.length > 0 ? text.replaceAll(jwt, "[jwt]") : text).slice(0, 200);
  const timedOut = (error: unknown): boolean => error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError");
  const timeout = new GitHubError(`${label}: timed out after ${timeoutMs}ms`);
+ const headers = { Authorization: `Bearer ${jwt}`, Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" };
+ const payload = options.scope === undefined ? {} : { body: JSON.stringify(options.scope) };
  let response: Response;
  try {
   response = await fetchFn(`${apiBaseUrl}/app/installations/${installationId}/access_tokens`, {
    method: "POST",
-   headers: { Authorization: `Bearer ${jwt}`, Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" },
+   headers: options.scope === undefined ? headers : { ...headers, "Content-Type": "application/json" },
+   ...payload,
    redirect: "error",
    signal: AbortSignal.timeout(timeoutMs),
   });
