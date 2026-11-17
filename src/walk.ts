@@ -600,6 +600,14 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
      const candidates = [...plan.selected];
      const implementIds = new Set(plan.implement.map((n) => n.id));
      const laneOf = (id: string) => implementIds.has(id) ? "implement" : "research";
+     const requeueAfterVsaRefusal = (nodeId: string): { heads: typeof classified; vetoErrors: string[] } => {
+      vsaRefused.add(nodeId);
+      const next = planOf(classified);
+      return {
+       heads: next.implement.filter((head) => !next.vetoed.includes(head)),
+       vetoErrors: next.implement.filter((head) => next.vetoed.includes(head)).map((head) => `#${head.id} vetoed — not claimed`),
+      };
+     };
 
      for (let i = 0; i < candidates.length; i++) {
       const node = candidates[i];
@@ -661,16 +669,10 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
       if (!outcome.claimed) {
        errors.push(outcome.error);
        if (outcome.refusedBy === "vsa" && laneOf(node.id) === "implement") {
-        vsaRefused.add(node.id);
-        const next = planOf(classified);
-        for (const head of next.implement) {
-         if (next.vetoed.includes(head)) {
-          errors.push(`#${head.id} vetoed — not claimed`);
-         } else {
-          implementIds.add(head.id);
-          candidates.splice(i + 1, 0, head);
-         }
-        }
+        const { heads, vetoErrors } = requeueAfterVsaRefusal(node.id);
+        errors.push(...vetoErrors);
+        for (const head of heads) implementIds.add(head.id);
+        candidates.splice(i + 1, 0, ...heads);
        }
        continue;
       }

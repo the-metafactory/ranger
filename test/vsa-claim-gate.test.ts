@@ -283,10 +283,10 @@ describe("walk VSA gate", () => {
  });
  afterEach(() => { journal.close(); discord.stop(); rmSync(dir, { recursive: true, force: true }); });
 
- const frontier = (nodes: { id: string; body: string }[]) => writeFileSync(
+ const frontier = (nodes: { id: string; body: string; kind?: string }[]) => writeFileSync(
   join(env.FAKE_SOMA_DIR, `${repo.replace("/", "__")}-frontier.json`),
-  JSON.stringify({ repo, root: "1", frontier: nodes.map(({ id, body }) => ({
-   ref: { id }, node: { id, title: `Build ${id}`, kind: "task", autonomy: "auto", probes: [] }, body,
+  JSON.stringify({ repo, root: "1", frontier: nodes.map(({ id, body, kind }) => ({
+   ref: { id }, node: { id, title: `Build ${id}`, kind: kind ?? "task", autonomy: "auto", probes: [] }, body,
    status: "open", assignees: [], blockedBy: [], author: "alice", typed: true,
    url: `https://github.com/${repo}/issues/${id}`,
   })) }));
@@ -316,6 +316,32 @@ describe("walk VSA gate", () => {
   expect(journal.getWorker("30", repo)).toBeNull();
   expect(reads).toEqual(["30", "31"]);
   expect(journal.listEvents(repo, 50, "30").filter(e => e.kind === "refused")).toHaveLength(1);
+ });
+
+ test("the replanned head is held like the first plan's: with briefs unverified, a build node behind a refused head is not claimed", async () => {
+  frontier([
+   { id: "30", body: "Build the thing." },
+   { id: "31", body: "Serves ISC-2.", kind: "build" },
+   { id: "32", body: "Serves ISC-2." },
+  ]);
+  env.FAKE_SOMA_AUDIT_FAIL = "1";
+  const reads: string[] = [];
+  const result = await tick({ 30: AFTER, 31: AFTER, 32: AFTER }, reads);
+  expect(result.maps[0].errors).toContainEqual(expect.stringContaining("build briefs unverified"));
+  expect(result.maps[0].claimed).toEqual(["32"]);
+  expect(journal.getWorker("31", repo)).toBeNull();
+  expect(reads).toEqual(["30", "32"]);
+ });
+
+ test("a vetoed node replanned behind a refused head is reported and not claimed", async () => {
+  frontier([{ id: "30", body: "Build the thing." }, { id: "31", body: "Serves ISC-2." }, { id: "32", body: "Serves ISC-2." }]);
+  journal.recordVeto({ repo, nodeId: "31", root: 1, commentId: "c-31" });
+  const reads: string[] = [];
+  const result = await tick({ 30: AFTER, 31: AFTER, 32: AFTER }, reads);
+  expect(result.maps[0].claimed).toEqual([]);
+  expect(result.maps[0].errors).toContain("#31 vetoed — not claimed");
+  expect(journal.getWorker("31", repo)).toBeNull();
+  expect(reads).toEqual(["30"]);
  });
 
  test("a refused head with an older node behind it lets the older node through", async () => {
