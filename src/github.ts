@@ -607,29 +607,33 @@ interface InstallationTokenScope {
  permissions: Readonly<Record<string, "read">>;
 }
 
-const INSTALLATION_TOKEN_TIMEOUT_MS = 30_000;
+export interface AppRequestOptions {
+ apiBaseUrl?: string;
+ fetch?: FetchFn;
+ timeoutMs?: number;
+}
 
-/**
- * Exchange the App JWT for one installation's token, in-process with `Authorization: Bearer`:
- * `gh` would send the JWT under the `token` scheme, which GitHub refuses, and would put it in a
- * child's environment. Any refusal, timeout or malformed answer throws without either credential.
- */
-export async function createInstallationToken(jwt: string, installationId: number, options: { apiBaseUrl?: string; fetch?: FetchFn; timeoutMs?: number; scope?: InstallationTokenScope } = {}): Promise<InstallationToken> {
+const APP_REQUEST_TIMEOUT_MS = 30_000;
+
+async function appBearerJson(jwt: string, path: string, label: string, options: AppRequestOptions, request: { method: "GET" | "POST"; body?: string }): Promise<Record<string, unknown> | null> {
  const apiBaseUrl = GitHubApiBaseUrlSchema.parse(options.apiBaseUrl);
  const fetchFn = options.fetch ?? fetch;
- const timeoutMs = options.timeoutMs ?? INSTALLATION_TOKEN_TIMEOUT_MS;
- const label = `installation ${installationId} token`;
+ const timeoutMs = options.timeoutMs ?? APP_REQUEST_TIMEOUT_MS;
  const redact = (text: string): string => (jwt.length > 0 ? text.replaceAll(jwt, "[jwt]") : text).slice(0, 200);
  const timedOut = (error: unknown): boolean => error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError");
  const timeout = new GitHubError(`${label}: timed out after ${timeoutMs}ms`);
- const headers = { Authorization: `Bearer ${jwt}`, Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" };
- const payload = options.scope === undefined ? {} : { body: JSON.stringify(options.scope) };
+ const headers: Record<string, string> = {
+  Authorization: `Bearer ${jwt}`,
+  Accept: "application/vnd.github+json",
+  "X-GitHub-Api-Version": "2022-11-28",
+  ...(request.body === undefined ? {} : { "Content-Type": "application/json" }),
+ };
  let response: Response;
  try {
-  response = await fetchFn(`${apiBaseUrl}/app/installations/${installationId}/access_tokens`, {
-   method: "POST",
-   headers: options.scope === undefined ? headers : { ...headers, "Content-Type": "application/json" },
-   ...payload,
+  response = await fetchFn(`${apiBaseUrl}${path}`, {
+   method: request.method,
+   headers,
+   ...(request.body === undefined ? {} : { body: request.body }),
    redirect: "error",
    signal: AbortSignal.timeout(timeoutMs),
   });
@@ -641,11 +645,55 @@ export async function createInstallationToken(jwt: string, installationId: numbe
   const message = typeof raw?.message === "string" ? `: ${redact(raw.message)}` : "";
   throw new GitHubError(`${label}: HTTP ${response.status}${message}`);
  }
+ return raw;
+}
+
+/**
+ * Exchange the App JWT for one installation's token, in-process under `Authorization: Bearer`:
+ * `gh` would send the JWT under the `token` scheme, which GitHub refuses, and would put it in a
+ * child's environment. Any refusal or malformed answer throws without either credential.
+ */
+export async function createInstallationToken(jwt: string, installationId: number, options: AppRequestOptions & { scope?: InstallationTokenScope } = {}): Promise<InstallationToken> {
+ const raw = await appBearerJson(jwt, `/app/installations/${installationId}/access_tokens`, `installation ${installationId} token`, options, {
+  method: "POST",
+  ...(options.scope === undefined ? {} : { body: JSON.stringify(options.scope) }),
+ });
  const expiresAtMs = typeof raw?.expires_at === "string" ? Date.parse(raw.expires_at) : Number.NaN;
  if (typeof raw?.token !== "string" || raw.token.length === 0 || !Number.isFinite(expiresAtMs)) {
-  throw new GitHubError(`${label}: invalid response`);
+  throw new GitHubError(`installation ${installationId} token: invalid response`);
  }
  return { token: raw.token, expiresAtMs };
+}
+
+/** The App's own view of one installation: the account it sits on, its app, and how far it reaches. */
+/** `selected` covers the repositories the App was installed on; `all` covers every repository it can see. */
+export type RepositorySelection = "all" | "selected";
+
+export interface AppInstallation {
+ account: string;
+ appId: number;
+ repositorySelection: RepositorySelection;
+ writePermissions: string[];
+}
+
+/**
+ * Read one installation under the App JWT (`GET /app/installations/{id}`), so a caller can
+ * bind a configured installation id to the account and the read-only reach it expects before
+ * it mints a token from it.
+ */
+export async function readAppInstallation(jwt: string, installationId: number, options: AppRequestOptions = {}): Promise<AppInstallation> {
+ const label = `installation ${installationId}`;
+ const raw = await appBearerJson(jwt, `/app/installations/${installationId}`, label, options, { method: "GET" });
+ const account = (raw?.account as Record<string, unknown> | null | undefined)?.login;
+ const permissions = raw?.permissions;
+ const selection = raw?.repository_selection;
+ if (typeof account !== "string" || account.length === 0 || typeof raw?.app_id !== "number" || (selection !== "all" && selection !== "selected") || typeof permissions !== "object" || permissions === null) {
+  throw new GitHubError(`${label}: invalid response`);
+ }
+ const writePermissions = Object.entries(permissions as Record<string, unknown>)
+  .filter(([, level]) => level !== "read")
+  .map(([name]) => name);
+ return { account, appId: raw.app_id, repositorySelection: selection, writePermissions };
 }
 
 export type CheckConclusion = "success" | "failure" | "neutral" | "cancelled" | "timed_out";

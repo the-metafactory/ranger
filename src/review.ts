@@ -86,9 +86,11 @@ function preflightFailure(result: Pick<RunResult, "code" | "stderr">): SagePrefl
 const markerAllowsRetry = (result: Pick<RunResult, "code" | "stderr">): boolean =>
  (preflightFailure(result)?.kind ?? "transient") === "transient";
 
+const BEST_EFFORT_BUDGET_PROBE_TIMEOUT_MS = 5_000;
+
 async function recordAppWindow(source: string, env: NodeJS.ProcessEnv): Promise<void> {
  try {
-  await meteredGauge({ component: "sage-review", source })("gh", ["api", "rate_limit"], { env, timeoutMs: 15_000 });
+  await meteredGauge({ component: "sage-review", source })("gh", ["api", "rate_limit"], { env, timeoutMs: BEST_EFFORT_BUDGET_PROBE_TIMEOUT_MS });
  } catch {
   process.stderr.write(`ranger: GitHub budget reading unavailable for ${source}\n`);
  }
@@ -108,11 +110,11 @@ export async function sageReview(
  // already said, and never scopes a lens to the delta.
  const extra = opts.reviewAuthor === undefined ? {} : { SAGE_REVIEW_AUTHOR_LOGIN: opts.reviewAuthor };
  const gated = gatedEnv(readOnlyToken, extra, workerHostEnv());
+ const source = opts.tokenSource ?? READ_ONLY_TOKEN_SOURCE;
+ const app = source.startsWith(SAGE_APP_SOURCE_PREFIX);
  try {
   const args = ["review", nodeKey(repo, prNumber), "--emit-verdict-block"];
   args.push("--substrate", opts.substrate);
-  const source = opts.tokenSource ?? READ_ONLY_TOKEN_SOURCE;
-  const app = source.startsWith(SAGE_APP_SOURCE_PREFIX);
   const run: typeof runCmd = async (bin, args, options) => {
    const result = await runCmd(bin, args, options);
    if (!app) return result;
@@ -150,19 +152,15 @@ export async function sageReview(
      verdict = undefined;
     }
    }
-   if (verdict?.verdict === "changes-requested") {
-    if (app) await recordAppWindow(source, gated.env);
-    return verdict;
-   }
+   if (verdict?.verdict === "changes-requested") return verdict;
    throw new ReviewError(
     `sage review ${repo}${changeRequestRef(repo, prNumber)} exited ${result.code}: ${(result.stderr || result.stdout).trim().slice(-400)}`,
     preflightFailure(result),
    );
   }
-  const verdict = parseVerdictBlock(result.stdout);
-  if (app) await recordAppWindow(source, gated.env);
-  return verdict;
+  return parseVerdictBlock(result.stdout);
  } finally {
+  if (app) await recordAppWindow(source, gated.env);
   gated.cleanup();
  }
 }

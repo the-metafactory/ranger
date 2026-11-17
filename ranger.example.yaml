@@ -165,7 +165,9 @@ workers:
   noCiGraceMin: 30
 
 auth:
-  # Optional dedicated read-only GitHub App for Sage reviews.
+  # Optional dedicated read-only GitHub App for Sage reviews. Install it on the
+  # selected repositories only (never all repositories) and grant read access
+  # only: ranger refuses an installation that reaches further.
   # sageApp:
   #   appId: 123456
   #   privateKeyFile: /operator-private/sage-app.pem

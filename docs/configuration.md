@@ -66,6 +66,10 @@ Set `auth.sageApp.appId`, `auth.sageApp.privateKeyFile`, and `auth.sageApp.insta
 
 Ranger mints a token for the reviewed repository and passes it through the gated Sage environment. `ranger budget` reports reviews and their core window under `sage-app:<appId>:<installationId>`. The principal's PAT cooldown and the App installation's cooldown are independent. Maps without a matching installation keep their configured PAT. A configured installation that cannot mint a token fails the review.
 
+Before minting, ranger reads the installation under the App JWT (`GET /app/installations/{id}`) and refuses the review unless it is this App's installation, is installed on the repository's owner, selects repositories rather than all of them, and grants nothing above `read`. The configured id is a bare number, so a wrong one then refuses instead of minting a token for another account's same-named repository, and an App granted more than Sage needs never becomes Sage's credential.
+
+The key file is readable by any process of the account that runs ranger, including a worker session, exactly as the `checkReporter` App key is: the file mode keeps other *users* out, not other processes of this user. Ranger bounds what a leaked key can reach — read-only, selected repositories — and a signing key held under a separate OS identity is host provisioning outside this configuration.
+
 ## Tick run ledger
 
 An optional `bus` section makes each `ranger tick` publish one `execution.run.finished` envelope. The envelope has producer `ranger`, `ran: {kind: job, ref: "ranger:tick"}`, a new run UUID, the start and end times of the pass, and the journal path as `detail_ref`. Exit 0 reports `succeeded`. Exits 1 and 2 report `failed`. A tick that fails to load its config or context publishes nothing.
