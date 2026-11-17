@@ -15,10 +15,15 @@ function criteria(vsaText: string): Set<string> {
  return new Set([...vsaText.matchAll(ISC_CRITERION)].map(m => m[1]));
 }
 
+/** Every distinct ISC ID `text` cites, in first-cited order. */
+export function citedIds(text: string | undefined): string[] {
+ return [...new Set((text ?? "").match(ISC_CITATION) ?? [])];
+}
+
 /** The ISC IDs `text` cites that are criterion lines in `vsaText`, in first-cited order. */
 export function criterionCitations(text: string | undefined, vsaText: string): string[] {
  const known = criteria(vsaText);
- return [...new Set((text ?? "").match(ISC_CITATION) ?? [])].filter(id => known.has(id));
+ return citedIds(text).filter(id => known.has(id));
 }
 
 /** The reason of the first `ISC: none (<reason>)` line with a non-empty reason, or null. */
@@ -64,7 +69,7 @@ export function vsaClaimVerdict(
  if (criterionCitations(body, vsaText).length > 0) return null;
  const waived = iscExemption(body);
  if (waived !== null) return { waived };
- const cited = [...new Set((body ?? "").match(ISC_CITATION) ?? [])];
+ const cited = citedIds(body);
  const since = `created ${nodeCreatedAt.toISOString()}, on or after VSA.md was added ${vsaCreatedAt.toISOString()}`;
  return {
   refused: cited.length === 0
