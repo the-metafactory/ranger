@@ -540,6 +540,22 @@ describe("intake gate: the ISC line (ranger VSA ISC-2, D2)", () => {
    expect(refused[0].detail).toContain("cites no ISC criterion from VSA.md");
   } finally { r.close(); }
  });
+
+ test("a draft without a spec hash never reaches the add a refusing soma would answer: no add tried, no intake-refused, over two ticks", async () => {
+  const r = await rig({ vsa: VSA });
+  try {
+   const legacy = new Database(join(r.dir, "state.sqlite"));
+   legacy.run("UPDATE intake_drafts SET spec_hash = NULL WHERE message_id = ?", [MESSAGE]);
+   legacy.close();
+   r.discord.react(r.card(), "👍", PRINCIPAL);
+   for (let i = 0; i < 2; i++) {
+    expect(gateOf(await r.tick({ FAKE_SOMA_ADD_FAIL: "vsa" })).refused).toEqual([{ messageId: MESSAGE, reason: expect.stringContaining("no spec hash") }]);
+   }
+   const state = JSON.parse(readFileSync(join(r.dir, "soma-state.json"), "utf8"));
+   expect(state.refusedAdds ?? 0).toBe(0);
+   expect(r.journal.listEvents("acme/widgets", 50).filter((e) => e.kind === "intake-refused")).toHaveLength(0);
+  } finally { r.close(); }
+ });
 });
 
 describe("intake gate on a draft journaled with a probe that cannot close (node #414)", () => {

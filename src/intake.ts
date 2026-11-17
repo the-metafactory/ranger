@@ -1498,8 +1498,8 @@ async function fileDraft(args: GateArgs, row: IntakeDraftRow): Promise<void> {
     return;
   }
 
-  const somaRefused = journal.getHealth(somaRefusalKey(row.messageId));
-  if (somaRefused !== null && somaRefused === row.specHash) {
+  const specHash = row.specHash;
+  if (journal.getHealth(somaRefusalKey(row.messageId)) === specHash) {
     refuse("soma graph add refused this spec before (journalled once as intake-refused) — reply to the card with a correction to change it");
     return;
   }
@@ -1536,7 +1536,7 @@ async function fileDraft(args: GateArgs, row: IntakeDraftRow): Promise<void> {
     }
     const reason = somaRefusal(error);
     if (reason !== null) {
-      somaRefusedDraft(args, row, reason);
+      somaRefusedDraft(args, row, specHash, reason);
       return;
     }
     if (!(error instanceof GraphAddUnattached)) throw error;
@@ -1561,11 +1561,11 @@ function somaRefusal(error: unknown): string | null {
   return at < 0 ? null : error.message.slice(at).trim();
 }
 
-function somaRefusedDraft(args: GateArgs, row: IntakeDraftRow, reason: string): void {
+function somaRefusedDraft(args: GateArgs, row: IntakeDraftRow, specHash: string, reason: string): void {
   const { journal, map, owned, gate } = args;
   owned();
   journal.updateIntakeDraft(row.messageId, { status: "draft" });
-  journal.setHealth(somaRefusalKey(row.messageId), row.specHash ?? "");
+  journal.setHealth(somaRefusalKey(row.messageId), specHash);
   journal.recordEvent("intake-refused", {
     repo: map.repo,
     detail: `draft ${row.messageId}: nothing filed — ${reason}; reply to the card with a correction that cites an ISC`.slice(0, 400),
