@@ -25,7 +25,7 @@ import {
 } from "../src/scribe.ts";
 import { openDb } from "../src/store/db.ts";
 import { seedLegacyRoots } from "../src/store/legacy-roots.ts";
-import { baseConfigLines, createCanonicalRepo, GIT_ENV } from "./support.ts";
+import { baseConfigLines, commitVsaToOrigin, createCanonicalRepo, GIT_ENV } from "./support.ts";
 
 const MAP = { repo: "acme/widgets", root: 9 };
 const SPEC: AddSpec = { title: "Do the thing", autonomy: "propose", kind: "build", labels: ["orienteer:build"], checkpoint: "thing-done" };
@@ -562,14 +562,7 @@ describe("scribeAfterMerge: the Scribe's pass before the close", () => {
  });
 
  const VSA = ["- [ ] ISC-2: Claims cite a criterion.", "- [x] ISC-3.1: A sub-criterion.", "- [ ] ISC-7: Another."].join("\n");
- async function pushVsa(): Promise<void> {
-  const git = (args: string[]) => runCmd("git", args, { cwd: ctx.canonical, env: { ...process.env, ...GIT_ENV } });
-  writeFileSync(join(ctx.canonical, "VSA.md"), VSA);
-  expect((await git(["add", "VSA.md"])).code).toBe(0);
-  expect((await git(["commit", "-m", "add vsa"])).code).toBe(0);
-  expect((await git(["push", "origin", "HEAD:main"])).code).toBe(0);
-  expect((await git(["fetch", "origin"])).code).toBe(0);
- }
+ const pushVsa = () => commitVsaToOrigin(ctx.canonical, VSA);
  const lastLine = (id: string) => fake.nodes.get(id)?.body?.trimEnd().split("\n").at(-1);
  const prerequisite = (resume: string, ruling = false) => (fake.nodes.set(ctx.node.ref.id, { parent: "5", blockedBy: [], autonomy: "auto" }), fileBlockedPrerequisite(fake.graph, ctx.journal, {
   map: ctx.map, node: { id: ctx.node.ref.id, title: "t", parent: { id: "5" } },

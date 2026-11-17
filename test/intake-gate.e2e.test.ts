@@ -19,8 +19,7 @@ import {
 import { Journal } from "../src/journal.ts";
 import type { ClaudeOneShot } from "../src/substrate.ts";
 import { walk } from "../src/walk.ts";
-import { runCmd } from "../src/exec.ts";
-import { baseConfigLines, claudeEnvelope, createCanonicalRepo, FAKE_BOT_ID, FAKE_GUILD_ID, fakeDiscord, fixturesBin, GIT_ENV, type FakeThreadMessage } from "./support.ts";
+import { baseConfigLines, claudeEnvelope, commitVsaToOrigin, createCanonicalRepo, FAKE_BOT_ID, FAKE_GUILD_ID, fakeDiscord, fixturesBin, type FakeThreadMessage } from "./support.ts";
 
 /**
  * The intake gate (node #251): the principal's 👍 on a draft card files the
@@ -84,14 +83,7 @@ async function rig(opts: { claude?: ClaudeOneShot; vsa?: string; observation?: s
  const dir = mkdtempSync(join(tmpdir(), "ranger-intake-gate-"));
  const discord = fakeDiscord();
  const canonical = opts.vsa === undefined ? join(dir, "no-canonical") : (await createCanonicalRepo(dir)).canonical;
- if (opts.vsa !== undefined) {
-  const git = async (args: string[]) => expect((await runCmd("git", args, { cwd: canonical, env: { ...process.env, ...GIT_ENV } })).code).toBe(0);
-  writeFileSync(join(canonical, "VSA.md"), opts.vsa);
-  await git(["add", "VSA.md"]);
-  await git(["commit", "-m", "add vsa"]);
-  await git(["push", "origin", "HEAD:main"]);
-  await git(["fetch", "origin"]);
- }
+ if (opts.vsa !== undefined) await commitVsaToOrigin(canonical, opts.vsa);
  const lines = baseConfigLines(dir, { map: [`    canonical: ${canonical}`], auth: ["  writeTokens:", '    "acme/*": RANGER_WRITE_TEST'] });
  lines.push("principal:", "  login: jcfischer", `  discordId: "${PRINCIPAL}"`);
  const configPath = join(dir, "ranger.yaml");
