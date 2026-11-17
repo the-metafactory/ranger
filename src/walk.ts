@@ -132,6 +132,7 @@ export type ClaimNodeOutcome =
     messageId: string | null;
     error: string;
     holder?: string | null;
+    refusedBy?: "vsa";
    };
 
 /**
@@ -155,8 +156,11 @@ export async function claimNode(args: ClaimNodeArgs): Promise<ClaimNodeOutcome> 
  const vsaRefusal = await vsaGateRefusal({ config: args.config, map, node, token, forge: args.forge });
  if (vsaRefusal !== null) {
   const detail = `#${node.id} claim refused by the VSA gate: ${vsaRefusal}`;
-  journal.recordEvent("refused", { nodeId: node.id, repo: map.repo, detail: detail.slice(0, 400) });
-  return { claimed: false, messageId: null, error: detail };
+  const journaled = detail.slice(0, 400);
+  if (journal.lastEventDetail("refused", map.repo, node.id) !== journaled) {
+   journal.recordEvent("refused", { nodeId: node.id, repo: map.repo, detail: journaled });
+  }
+  return { claimed: false, messageId: null, error: detail, refusedBy: "vsa" };
  }
  let messageId: string | null = null;
  let announceError: string | null = null;
@@ -573,7 +577,8 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
       rootAuthor,
      });
      if (!briefs.ok) errors.push(`build briefs unverified — build nodes held this tick: ${briefs.error}`);
-     const planOf = (nodes: typeof classified) => planTick(freshCandidates(nodes, map, journal.listWorkers(map.repo)), {
+     const vsaRefused = new Set<string>();
+     const planOf = (nodes: typeof classified) => planTick(freshCandidates(nodes, map, journal.listWorkers(map.repo)).filter((n) => !vsaRefused.has(n.id)), {
       laneBusy: lanesTakenThisTick.has(implementLane(map)) || implementLaneBusy(journal, implementLane(map)),
       vetoed: (id) => journal.hasVeto(id, map.repo),
       implementDrained: drain?.scope === "lane",
@@ -588,11 +593,12 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
      errors.push(...gate.errors);
      owned();
      const plan = gate.plan;
-     const candidates = plan.selected;
-     const laneOf = (id: string) =>
-      plan.implement.some((n) => n.id === id) ? "implement" : "research";
+     const candidates = [...plan.selected];
+     const implementIds = new Set(plan.implement.map((n) => n.id));
+     const laneOf = (id: string) => implementIds.has(id) ? "implement" : "research";
 
-     for (const node of candidates) {
+     for (let i = 0; i < candidates.length; i++) {
+      const node = candidates[i];
       if (
        journal.spawnsToday(ctx.now?.() ?? new Date()) >=
        config.workers.spawnCapPerDay
@@ -650,6 +656,18 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
       if (outcome.messageId !== null) mapResult.announced.push(node.id);
       if (!outcome.claimed) {
        errors.push(outcome.error);
+       if (outcome.refusedBy === "vsa" && laneOf(node.id) === "implement") {
+        vsaRefused.add(node.id);
+        const next = planOf(classified);
+        for (const head of next.implement) {
+         if (next.vetoed.includes(head)) {
+          errors.push(`#${head.id} vetoed — not claimed`);
+         } else {
+          implementIds.add(head.id);
+          candidates.splice(i + 1, 0, head);
+         }
+        }
+       }
        continue;
       }
       mapResult.claimed.push(node.id);

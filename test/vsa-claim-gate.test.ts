@@ -7,9 +7,10 @@ import { vsaClaimRefusal } from "../src/candidates.ts";
 import { loadConfig, type RangerConfig } from "../src/config.ts";
 import { Journal } from "../src/journal.ts";
 import { readBaseVsa } from "../src/vsa-gate.ts";
-import { claimNode } from "../src/walk.ts";
+import { claimNode, walk } from "../src/walk.ts";
+import type { ForgePort } from "../src/forge.ts";
 import { runCmd } from "../src/exec.ts";
-import { GIT_ENV } from "./support.ts";
+import { GIT_ENV, fakeDiscord, fixturesBin } from "./support.ts";
 
 const VSA = [
  "## Checkpoints",
@@ -170,5 +171,91 @@ describe("claimNode VSA gate", () => {
   });
   expect(outcome).toMatchObject({ claimed: false, error: expect.stringContaining("forge down") });
   expect(announced).toEqual([]);
+ });
+});
+
+describe("walk VSA gate", () => {
+ const repo = "acme/widgets";
+ let dir: string;
+ let config: RangerConfig;
+ let configPath: string;
+ let journal: Journal;
+ let discord: ReturnType<typeof fakeDiscord>;
+ let env: Record<string, string>;
+ beforeEach(async () => {
+  dir = mkdtempSync(join(tmpdir(), "ranger-vsa-walk-"));
+  const canonical = await seedCanonicalAddingVsaAtAddedThenEditing(dir, true);
+  discord = fakeDiscord();
+  configPath = join(dir, "ranger.yaml");
+  writeFileSync(configPath, stringify({
+   version: 1,
+   maps: [{ repo, root: 1, walk: "full", canonical, commands: { test: "true" },
+    discord: { tokenEnv: "RANGER_DISCORD_TOKEN", channelId: "1234567890" } }],
+   bot: { identity: "ivy-bot" },
+   auth: { defaultWriteTokenEnv: "RANGER_WRITE_TEST" },
+   state: { journalPath: join(dir, "journal.sqlite") },
+  }));
+  config = loadConfig(configPath).config;
+  journal = new Journal(config.state.journalPath);
+  const data = join(dir, "data");
+  mkdirSync(data);
+  const state = join(dir, "state.json");
+  writeFileSync(state, JSON.stringify({ nodes: {}, decisions: [] }));
+  env = {
+   PATH: `${fixturesBin}:${process.env.PATH ?? ""}`,
+   FAKE_SOMA_DIR: data, FAKE_SOMA_STATE: state,
+   RANGER_WRITE_TEST: "ghp_write", RANGER_NO_SPAWN: "1",
+   RANGER_DISCORD_TOKEN: "fake-bot-token",
+   RANGER_DISCORD_API_BASE: `http://127.0.0.1:${discord.port}`,
+   RANGER_DISCORD_ALLOW_TEST_OVERRIDE: "1", RANGER_DISCORD_MIN_INTERVAL_MS: "5",
+  };
+ });
+ afterEach(() => { journal.close(); discord.stop(); rmSync(dir, { recursive: true, force: true }); });
+
+ const frontier = (nodes: { id: string; body: string }[]) => writeFileSync(
+  join(env.FAKE_SOMA_DIR, `${repo.replace("/", "__")}-frontier.json`),
+  JSON.stringify({ repo, root: "1", frontier: nodes.map(({ id, body }) => ({
+   ref: { id }, node: { id, title: `Build ${id}`, kind: "task", autonomy: "auto", probes: [] }, body,
+   status: "open", assignees: [], blockedBy: [], author: "alice", typed: true,
+   url: `https://github.com/${repo}/issues/${id}`,
+  })) }));
+
+ async function tick(createdAt: Record<string, Date>, reads: string[]) {
+  const saved = { ...process.env };
+  const github = {
+   issueCreatedAt: async (_repo: string, issue: number) => { reads.push(String(issue)); return createdAt[String(issue)].toISOString(); },
+   issueLabels: async () => [],
+  } as unknown as ForgePort;
+  try {
+   Object.assign(process.env, env);
+   return await walk({ config, configPath, journal, github, spawnRunNode: async () => process.pid,
+    claim: async (_repo, node) => ({ repo, node, held: true, assignees: ["ivy-bot"] }),
+    hostLoad: () => ({ load: 0, cores: 8 }) });
+  } finally {
+   for (const key of Object.keys(process.env)) if (!(key in saved)) Reflect.deleteProperty(process.env, key);
+   Object.assign(process.env, saved);
+  }
+ }
+
+ test("a refused head does not block the implement lane: the next implement candidate is claimed in the same tick", async () => {
+  frontier([{ id: "30", body: "Build the thing." }, { id: "31", body: "Serves ISC-2." }, { id: "32", body: "Serves ISC-2." }]);
+  const reads: string[] = [];
+  const result = await tick({ 30: AFTER, 31: AFTER, 32: AFTER }, reads);
+  expect(result.maps[0].claimed).toEqual(["31"]);
+  expect(journal.getWorker("30", repo)).toBeNull();
+  expect(reads).toEqual(["30", "31"]);
+  expect(journal.listEvents(repo, 50, "30").filter(e => e.kind === "refused")).toHaveLength(1);
+ });
+
+ test("a refused head with an older node behind it lets the older node through", async () => {
+  frontier([{ id: "30", body: "Build the thing." }, { id: "31", body: "Build the other thing." }]);
+  const result = await tick({ 30: AFTER, 31: BEFORE }, []);
+  expect(result.maps[0].claimed).toEqual(["31"]);
+ });
+
+ test("the same refused head over two ticks journals one refused event", async () => {
+  frontier([{ id: "30", body: "Build the thing." }]);
+  for (let i = 0; i < 2; i++) expect((await tick({ 30: AFTER }, [])).maps[0].claimed).toEqual([]);
+  expect(journal.listEvents(repo, 50, "30").filter(e => e.kind === "refused")).toHaveLength(1);
  });
 });

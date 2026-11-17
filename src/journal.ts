@@ -885,6 +885,13 @@ export class Journal {
   return row?.n ?? 0;
  }
 
+ lastEventDetail(kind: EventKind, repo: string, nodeId: string): string | null {
+  const row = this.db.select({ detail: events.detail }).from(events)
+   .where(and(eq(events.kind, kind), eq(events.repo, repo), eq(events.nodeId, nodeId)))
+   .orderBy(desc(events.id)).limit(1).get();
+  return row?.detail ?? null;
+ }
+
  /** The newest `limit` events, of one repo and, with `nodeId`, one node of it. */
  listEvents(repo?: string, limit = 50, nodeId?: string): EventRow[] {
   const where = and(
