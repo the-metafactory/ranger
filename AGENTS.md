@@ -19,5 +19,5 @@ Prefer a check over a line here; a rule marked "docs only" has nothing that fail
 
 | Where | Rule | Why | Until |
 | --- | --- | --- | --- |
-| `src/host-load.ts:21` | test mode | CLIs a test spawns read a quiet host; contexts default to the real reader | #324 |
-| `src/intake.ts:14` | test mode | a spawned tick under test must not call `claude -p` | #324 |
+| `src/host-load.ts:21` | test mode | CLIs a test spawns read a quiet host; contexts default to the real reader | no date: #324 (closed as out of scope) removes it if reopened |
+| `src/intake.ts:14` | test mode | a spawned tick under test must not call `claude -p` | no date: #324 (closed as out of scope) removes it if reopened |
