@@ -2,6 +2,7 @@ import { CONTAINER_BOOTSTRAP_FLAGS } from "./isolation.ts";
 
 export const MYELIN_REPOSITORY = "github:github.com/the-metafactory/myelin";
 export const RANGER_REPOSITORY = "github:github.com/the-metafactory/ranger";
+export const THREVA_APP_REPOSITORY = "github:github.com/jcfischer/threva-app";
 export const CORTEX_REPOSITORY = "github:github.com/the-metafactory/cortex";
 export const RANGER_OPT_IN_TEST_FILES = [
  "test/remote-test-executor-integration.test.ts",
@@ -101,6 +102,14 @@ export const REVIEWED_RECIPES: ReviewedRecipeRegistry = {
    unit: [...ISOLATED_BUN, "test", "--preload=./test/preload.ts", "--randomize", "--parallel=2", "--timeout=60000", ...RANGER_OPT_IN_TEST_FILES.flatMap(file => ["--path-ignore-patterns", file])],
    typecheck: [...ISOLATED_BUN, "./node_modules/typescript/bin/tsc", "--noEmit"],
    lint: [...ISOLATED_BUN, "./node_modules/eslint/bin/eslint.js", "."],
+  } } },
+ [THREVA_APP_REPOSITORY]: { "threva-app-v1": {
+  packageName: "threva-app",
+  scripts: { test: "bun test test", lint: "bun eslint/suppressions-guard.ts && bun --bun eslint ." },
+  testRoots: ["test/"], needsNats: false, checks: {
+   typecheck: [...ISOLATED_BUN, "./node_modules/typescript/bin/tsc", "--noEmit"],
+   lint: [...ISOLATED_BUN, "./node_modules/eslint/bin/eslint.js", "."],
+   unit: [...ISOLATED_BUN, "test", "test"],
   } } },
  [CORTEX_REPOSITORY]: { "cortex-v1": {
   packageName: "@the-metafactory/cortex",
