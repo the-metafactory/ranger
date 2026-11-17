@@ -26,7 +26,8 @@ import type { Journal, WorkerRow } from "./journal.ts";
 import { ClaimLockBusy, withClaimLock } from "./claim-lock.ts";
 import type { OwnedCheck } from "./lock.ts";
 import { classifyFrontier, loadProbeRegistry } from "./route.ts";
-import type { ForgePort } from "./forge.ts";
+import type { ForgePort, ForgeReadPort } from "./forge.ts";
+import { vsaGateRefusal } from "./vsa-gate.ts";
 import { probeRequeueCandidates, requeueProbes, type ProbeRequeueResult } from "./probe-requeue.ts";
 import { sweepMap, type SweepMapResult } from "./sweep.ts";
 import { emptyJobPass, jobPass, jobsPending, type JobPassResult, type SpawnJobArgs } from "./jobs.ts";
@@ -109,7 +110,7 @@ export interface ClaimNodeArgs extends DispatchDeps {
  config?: RangerConfig;
  journal: Journal;
  map: RangerMapConfig;
- node: { id: string; title: string };
+ node: { id: string; title: string; kind: string; body?: string };
  lane: "implement" | "research";
  botIdentity: string;
  token: string;
@@ -121,6 +122,7 @@ export interface ClaimNodeArgs extends DispatchDeps {
  spawnRunNode?: (args: SpawnRunNodeArgs) => Promise<number | null>;
  now?: () => Date;
  owned?: OwnedCheck;
+ forge?: Pick<ForgeReadPort, "issueCreatedAt">;
 }
 
 export type ClaimNodeOutcome =
@@ -150,6 +152,12 @@ export async function claimNode(args: ClaimNodeArgs): Promise<ClaimNodeOutcome> 
   error: `map ${mapKey(map)} fresh claims held after worker start failure on #${startHold.nodeId}; resume or release that node before claiming more work` };
  const refusal = freshClaimRefusal(map, node.id, previous);
  if (refusal !== null) return { claimed: false, messageId: null, error: refusal };
+ const vsaRefusal = await vsaGateRefusal({ config: args.config, map, node, token, forge: args.forge });
+ if (vsaRefusal !== null) {
+  const detail = `#${node.id} claim refused by the VSA gate: ${vsaRefusal}`;
+  journal.recordEvent("refused", { nodeId: node.id, repo: map.repo, detail: detail.slice(0, 400) });
+  return { claimed: false, messageId: null, error: detail };
+ }
  let messageId: string | null = null;
  let announceError: string | null = null;
  try {
@@ -632,6 +640,7 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
         endpointProbe: ctx.endpointProbe, endpointLookup: ctx.endpointLookup, nodeSelector: ctx.nodeSelector,
         now: ctx.now,
         owned,
+        forge: portFor(map.repo),
        });
       } catch (error) {
        if (!(error instanceof GraphWriteError)) throw error;

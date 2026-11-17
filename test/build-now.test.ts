@@ -173,7 +173,7 @@ describe("node #58 — build-now claims and starts a walkable node", () => {
    r.journal.upsertWorker({ nodeId: "10", repo: REPO, root: 1, status, phase: "review", prNumber: 500, reviewRound: 2 });
    const before = r.journal.getWorker("10", REPO);
    const ctx = r.ctx();
-   const outcome = await claimNode({ ...ctx, node: { id: "10", title: "held" }, lane: "implement", cliEntry: "unused" });
+   const outcome = await claimNode({ ...ctx, node: { id: "10", title: "held", kind: "task" }, lane: "implement", cliEntry: "unused" });
    expect(outcome).toMatchObject({ claimed: false, error: expect.stringMatching(/resume-node.*Resume/i) });
    expect(r.announced).toEqual([]);
    expect(r.claimed).toEqual([]);
@@ -498,7 +498,7 @@ describe("node #58 — the claim lock serializes claimers", () => {
    claimNode({
     journal: r.journal,
     map: r.config.maps[0],
-    node: { id: "10", title: "node 10" },
+    node: { id: "10", title: "node 10", kind: "task" },
     lane: "implement",
     botIdentity: BOT,
     token: "ghp_write",

@@ -359,6 +359,17 @@ export async function issueLabels(
  );
 }
 
+export async function issueCreatedAt(
+ repo: string,
+ number: number,
+ token: string,
+): Promise<string> {
+ const raw = await ghApi(token, [`repos/${repo}/issues/${number}`], `issue #${number}`) as { created_at?: unknown } | null;
+ const at = raw?.created_at;
+ if (typeof at !== "string" || Number.isNaN(Date.parse(at))) throw new Error(`issue #${number} on ${repo} has no valid created_at`);
+ return at;
+}
+
 export async function checkRunsFor(
  repo: string,
  sha: string,

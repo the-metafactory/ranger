@@ -3,9 +3,39 @@
  * Pure, and free of any graph-write import, so the walk (`walk.ts`) and the
  * dashboard (`serve.ts`, #37) read the same selection rather than two copies.
  */
-import type { ClassifiedNode } from "./route.ts";
+import { IMPLEMENT_KINDS, type ClassifiedNode } from "./route.ts";
 import type { ImplementLane } from "./lanes.ts";
 import type { WorkerRow } from "./journal.ts";
+
+const ISC_CITATION = /\bISC-\d+(?:\.\d+)?\b/g;
+const ISC_CRITERION = /^\s*[-*]\s+\[[ xX]\]\s+(ISC-\d+(?:\.\d+)?)\b/gm;
+
+/**
+ * The VSA claim gate (ranger VSA ISC-2), or null when the claim may go on.
+ * A repo without `VSA.md` (`vsaText` null) allows every claim. Only
+ * implement kinds need a citation, and only nodes created at or after the
+ * instant `VSA.md` was added to the base; older nodes keep flowing. A cited
+ * ID counts only when it is a criterion line in that `VSA.md`.
+ */
+export function vsaClaimRefusal(
+ body: string | undefined,
+ kind: string,
+ nodeCreatedAt: Date | null,
+ vsaText: string | null,
+ vsaCreatedAt: Date | null,
+): string | null {
+ if (vsaText === null || !IMPLEMENT_KINDS.has(kind)) return null;
+ if (vsaCreatedAt === null || Number.isNaN(vsaCreatedAt.getTime())) return "VSA.md creation date unknown";
+ if (nodeCreatedAt === null || Number.isNaN(nodeCreatedAt.getTime())) return "node creation date unknown";
+ if (nodeCreatedAt.getTime() < vsaCreatedAt.getTime()) return null;
+ const cited = [...new Set((body ?? "").match(ISC_CITATION) ?? [])];
+ const known = new Set([...vsaText.matchAll(ISC_CRITERION)].map(m => m[1]));
+ if (cited.some(id => known.has(id))) return null;
+ const since = `created ${nodeCreatedAt.toISOString()}, on or after VSA.md was added ${vsaCreatedAt.toISOString()}`;
+ return cited.length === 0
+  ? `${kind} node cites no ISC from VSA.md (${since})`
+  : `${kind} node cites ${cited.join(", ")}, not a criterion in VSA.md (${since})`;
+}
 
 export function freshClaimRefusal(
  map: { repo: string },
