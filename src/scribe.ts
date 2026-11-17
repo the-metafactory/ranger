@@ -213,9 +213,14 @@ function titled(prefix: string, title: string): string {
  return raw.length > 120 ? `${raw.slice(0, 119)}…` : raw;
 }
 
-/** `spec` with `line` as its body's last paragraph, for an implement kind; any other spec, or no line, as it is. */
+/** Does a node filed from `spec` need an ISC line? Only implement kinds do. */
+export function needsIscLine(spec: AddSpec): boolean {
+ return IMPLEMENT_KINDS.has(spec.kind ?? "");
+}
+
+/** `spec` with `line` as its body's last paragraph, when it needs one; any other spec, or no line, as it is. */
 export function withIscLine(spec: AddSpec, line: string | null): AddSpec {
- if (line === null || !IMPLEMENT_KINDS.has(spec.kind ?? "")) return spec;
+ if (line === null || !needsIscLine(spec)) return spec;
  return { ...spec, body: spec.body === undefined || spec.body === "" ? line : `${spec.body}\n\n${line}` };
 }
 
@@ -648,7 +653,7 @@ export async function fileBlockedPrerequisite(
  }
  const filingParent = sameNode(map.repo, parent, String(map.root)) ? node.id : parent;
  const spec = blockedPrerequisiteSpec(node, park.report);
- const filedSpec = park.isc === undefined || !IMPLEMENT_KINDS.has(spec.kind ?? "") ? spec : withIscLine(spec, await park.isc());
+ const filedSpec = park.isc === undefined || !needsIscLine(spec) ? spec : withIscLine(spec, await park.isc());
  const filed = await scribeFile(graph, journal, {
   map, parent: filingParent, owner: node.id, variant: parkIdentity(resume), provenance: "blocked-prerequisite", spec: filedSpec,
  }, fence);
