@@ -198,14 +198,14 @@ describe("recording ranger's own calls", () => {
  });
 
  test("a sage run is on the record under the source of the token it reviews with", async () => {
-  await sageReview("acme/widgets", 7, SENTINEL_CREDENTIAL, { command: "/usr/bin/false", substrate: "claude", tokenSource: "RANGER_READONLY_A" }).catch(() => undefined);
+  await expect(sageReview("acme/widgets", 7, SENTINEL_CREDENTIAL, { command: "/usr/bin/false", substrate: "claude", tokenSource: "RANGER_READONLY_A" })).rejects.toThrow();
   expect(recorded().map((r) => [r.kind, r.component, r.source])).toEqual([["opaque", "sage-review", "RANGER_READONLY_A"]]);
  });
 
  test("a failed App review still records the closing budget reading", async () => {
   const source = "sage-app:10:20";
   fakeGh({ rate_limit: { body: "{}" } });
-  await sageReview("acme/widgets", 7, SENTINEL_CREDENTIAL, { command: "/usr/bin/false", substrate: "claude", tokenSource: source }).catch(() => undefined);
+  await expect(sageReview("acme/widgets", 7, SENTINEL_CREDENTIAL, { command: "/usr/bin/false", substrate: "claude", tokenSource: source })).rejects.toThrow();
   expect(recorded().map((r) => [r.kind, r.source])).toEqual([["gauge", source], ["opaque", source], ["gauge", source]]);
  });
 
