@@ -136,48 +136,20 @@ test("a readable installation of this App mints one repository- and read-scoped 
  }
 });
 
-test("an installation on another account is refused before any token is minted", async () => {
- const { config, dir } = configWithAcmeSageApp();
- const seen: string[] = [];
- try {
-  const fetch = recordingAppApi(seen, acmeInstallationReadOnly({ account: { login: "Other" } }));
-  await expect(resolveSageReviewToken(config, REPO, "test-pat", fetch)).rejects.toThrow("belongs to Other, not acme");
-  expect(seen).toEqual([`GET ${INSTALLATION_URL}`]);
- } finally {
-  rmSync(dir, { recursive: true, force: true });
- }
-});
+const INSTALLATION_REFUSALS: [string, Record<string, unknown>, string][] = [
+ ["an installation on another account", { account: { login: "Other" } }, "belongs to Other, not acme"],
+ ["an installation of a different App", { app_id: 11 }, "installation 20 of GitHub App 11, not App 10"],
+ ["an App installed on all repositories", { repository_selection: "all" }, "installed on all repositories (all)"],
+ ["an installation that grants write access", { permissions: { contents: "read", pull_requests: "write" } }, "grants write access (pull_requests)"],
+ ["an installation with array permissions", { permissions: [] }, "invalid response"],
+];
 
-test("an installation of a different App is refused by its app id", async () => {
+test.each(INSTALLATION_REFUSALS)("%s is refused before any token is minted", async (_name, override, message) => {
  const { config, dir } = configWithAcmeSageApp();
  const seen: string[] = [];
  try {
-  const fetch = recordingAppApi(seen, acmeInstallationReadOnly({ app_id: 11 }));
-  await expect(resolveSageReviewToken(config, REPO, "test-pat", fetch)).rejects.toThrow("installation 20 of GitHub App 11, not App 10");
-  expect(seen).toEqual([`GET ${INSTALLATION_URL}`]);
- } finally {
-  rmSync(dir, { recursive: true, force: true });
- }
-});
-
-test("an App installed on all repositories is refused, so its key cannot mint beyond the mapped ones", async () => {
- const { config, dir } = configWithAcmeSageApp();
- const seen: string[] = [];
- try {
-  const fetch = recordingAppApi(seen, acmeInstallationReadOnly({ repository_selection: "all" }));
-  await expect(resolveSageReviewToken(config, REPO, "test-pat", fetch)).rejects.toThrow("installed on all repositories (all)");
-  expect(seen).toEqual([`GET ${INSTALLATION_URL}`]);
- } finally {
-  rmSync(dir, { recursive: true, force: true });
- }
-});
-
-test("an installation that grants write access is refused", async () => {
- const { config, dir } = configWithAcmeSageApp();
- const seen: string[] = [];
- try {
-  const fetch = recordingAppApi(seen, acmeInstallationReadOnly({ permissions: { contents: "read", pull_requests: "write" } }));
-  await expect(resolveSageReviewToken(config, REPO, "test-pat", fetch)).rejects.toThrow("grants write access (pull_requests)");
+  const fetch = recordingAppApi(seen, acmeInstallationReadOnly(override));
+  await expect(resolveSageReviewToken(config, REPO, "test-pat", fetch)).rejects.toThrow(message);
   expect(seen).toEqual([`GET ${INSTALLATION_URL}`]);
  } finally {
   rmSync(dir, { recursive: true, force: true });

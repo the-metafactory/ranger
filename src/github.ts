@@ -687,7 +687,7 @@ export async function readAppInstallation(jwt: string, installationId: number, o
  const account = (raw?.account as Record<string, unknown> | null | undefined)?.login;
  const permissions = raw?.permissions;
  const selection = raw?.repository_selection;
- if (typeof account !== "string" || account.length === 0 || typeof raw?.app_id !== "number" || (selection !== "all" && selection !== "selected") || typeof permissions !== "object" || permissions === null) {
+ if (typeof account !== "string" || account.length === 0 || typeof raw?.app_id !== "number" || (selection !== "all" && selection !== "selected") || typeof permissions !== "object" || permissions === null || Array.isArray(permissions)) {
   throw new GitHubError(`${label}: invalid response`);
  }
  const writePermissions = Object.entries(permissions as Record<string, unknown>)
