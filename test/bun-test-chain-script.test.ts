@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { bunTestChain } from "../src/implement.ts";
 
 const command = "bun run test && bunx tsc --noEmit && bun run lint";
-const script = "bun test --parallel=4 --timeout=60000";
+const script = "bun test --parallel=2 --timeout=60000";
 
 describe("bun test package-script resolution", () => {
  test("resolves Ranger's test script and keeps the remaining steps", () => {

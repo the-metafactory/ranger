@@ -3426,7 +3426,7 @@ describe("implement lane (node #23)", () => {
   const stepRuns = (calls: { command: string; cwd: string }[]) => calls.filter((c) => c.cwd.includes("ranger-test-steps-"));
   const reviewed = (r: Rig) => r.journal.listEvents("acme/widgets", 200).map((e) => e.detail ?? "");
 
-  const rangerTestScript = "bun test --parallel=4 --timeout=60000";
+  const rangerTestScript = "bun test --parallel=2 --timeout=60000";
   const packageWithTest = (script: string) => JSON.stringify({ scripts: { test: script } });
 
   test("a package fixture preserves the rig's explicit after step", async () => {
