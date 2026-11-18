@@ -227,6 +227,10 @@ describe("recording ranger's own calls", () => {
   expect(verdict.body).toContain("Review output [credential]");
   expect(recorded().map((r) => [r.kind, r.source])).toEqual([["gauge", source], ["opaque", source], ["gauge", source]]);
   expect(JSON.stringify(recorded())).not.toContain(SENTINEL_CREDENTIAL);
+ });
+
+ test("coincident PAT and App budget windows report apart", () => {
+  const source = "sage-app:10:20";
   seed("2026-11-08", [
    call(0, "token-gate", 0),
    call(1, "sage-review", 4900, { source }),
