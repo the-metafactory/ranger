@@ -198,8 +198,48 @@ describe("recording ranger's own calls", () => {
  });
 
  test("a sage run is on the record under the source of the token it reviews with", async () => {
-  await sageReview("acme/widgets", 7, SENTINEL_CREDENTIAL, { command: "/usr/bin/false", substrate: "claude", tokenSource: "RANGER_READONLY_A" }).catch(() => undefined);
+  await expect(sageReview("acme/widgets", 7, SENTINEL_CREDENTIAL, { command: "/usr/bin/false", substrate: "claude", tokenSource: "RANGER_READONLY_A" })).rejects.toThrow();
   expect(recorded().map((r) => [r.kind, r.component, r.source])).toEqual([["opaque", "sage-review", "RANGER_READONLY_A"]]);
+ });
+
+ test("a failed App review still records the closing budget reading", async () => {
+  const source = "sage-app:10:20";
+  fakeGh({ rate_limit: { body: "{}" } });
+  await expect(sageReview("acme/widgets", 7, SENTINEL_CREDENTIAL, { command: "/usr/bin/false", substrate: "claude", tokenSource: source })).rejects.toThrow();
+  expect(recorded().map((r) => [r.kind, r.source])).toEqual([["gauge", source], ["opaque", source], ["gauge", source]]);
+ });
+
+ test("Sage uses the gated App credential and records its budget apart from coincident PAT windows", async () => {
+  const source = "sage-app:10:20";
+  fakeGh({ rate_limit: { body: "{}" } });
+  const sage = join(dir, "app-sage");
+  const fence = String.fromCharCode(96).repeat(3);
+  const block = [fence + "json", JSON.stringify({ verdict: "approved", summary: "OK", commit_id: "abc", findings: { blockers: 0, majors: 0, nits: 0 } }), fence].join("\n");
+  writeFileSync(sage, [
+   "#!/usr/bin/env bun",
+   'import { readdirSync } from "node:fs";',
+   `if (process.env.GH_TOKEN !== ${JSON.stringify(SENTINEL_CREDENTIAL)} || process.env.GITHUB_TOKEN !== process.env.GH_TOKEN) process.exit(93);`,
+   'if (readdirSync(process.env.GH_CONFIG_DIR).length !== 0) process.exit(94);',
+   'console.log("Review output " + process.env.GH_TOKEN);',
+   `console.log(${JSON.stringify(block)});`,
+  ].join("\n"), { mode: 0o700 });
+  const verdict = await sageReview("acme/widgets", 7, SENTINEL_CREDENTIAL, { substrate: "codex", tokenSource: source, command: sage });
+  expect(verdict.body).toContain("Review output [credential]");
+  expect(recorded().map((r) => [r.kind, r.source])).toEqual([["gauge", source], ["opaque", source], ["gauge", source]]);
+  expect(JSON.stringify(recorded())).not.toContain(SENTINEL_CREDENTIAL);
+ });
+
+ test("coincident PAT and App budget windows report apart", () => {
+  const source = "sage-app:10:20";
+  seed("2026-11-08", [
+   call(0, "token-gate", 0),
+   call(1, "sage-review", 4900, { source }),
+   call(1, "sage-review", 4800, { source: "sage-app:10:30" }),
+  ]);
+  const { windows } = buildUsageReport(usageDir, period.since, period.until);
+  expect(windows.map((window) => [window.sources, window.exhausted])).toEqual([
+   [["RANGER_READONLY_A"], true], [[source], false], [["sage-app:10:30"], false],
+  ]);
  });
 
  test("a ranger command records its calls and soma runs beside its journal", async () => {

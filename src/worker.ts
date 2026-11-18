@@ -61,7 +61,9 @@ import {
  type SubstrateName,
  type SubstrateReaders,
 } from "./substrate.ts";
+import { sageAppInstallation } from "./sage-auth.ts";
 import { resolveReadOnlyToken, type ResolvedToken } from "./token-gate.ts";
+import type { FetchFn } from "./github.ts";
 import { workerEnv } from "./worker-env.ts";
 import { assertNotPrincipal, type CommitAuthor } from "./identity.ts";
 import { sessionJournalPath } from "./journal-guard.ts";
@@ -156,6 +158,7 @@ export interface RunNodeContext {
  /** Injectable CI timing for tests; production uses the default settling window. */
  researchCiTiming?: ResearchCiTiming;
  reviewer?: Reviewer;
+ sageAppFetch?: FetchFn;
  /** For tests: the read-only token (defaults to the map's `auth.readOnlyTokens` env). */
  readOnlyToken?: string;
  /** For tests: the read gate a GitLab map's graph reads run under (default: `assertReadOnlyToken`). */
@@ -746,7 +749,7 @@ async function runImplementNode(
   finish(journal, nodeId, repo, "parked", humanRecovery(journal, nodeId, repo, ratify));
   return { ...base, status: "refused", detail: ratify };
  }
- const readOnlyToken = ctx.readOnlyToken ?? resolveReadOnlyToken(config, repo).token;
+ const readOnlyToken = sageAppInstallation(config, repo) === undefined ? ctx.readOnlyToken ?? resolveReadOnlyToken(config, repo).token : undefined;
 
  const canonical = canonicalDir(config, map);
  const slug = slugify(node.node.title);
@@ -791,6 +794,7 @@ async function runImplementNode(
   testBackend: ctx.testBackend,
   github: ctx.github,
   reviewer: ctx.reviewer,
+  sageAppFetch: ctx.sageAppFetch,
   viewsDependencies: ctx.viewsDependencies,
   hostLoad: ctx.hostLoad,
   quietHost: ctx.quietHost,

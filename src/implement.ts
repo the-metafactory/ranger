@@ -70,7 +70,7 @@ import {
 import { GRAPH_CALL_TIMEOUT_MS, graphNode, somaRepo, type NodeResult } from "./graph.ts";
 import { finishClosedElsewhere } from "./closed-elsewhere.ts";
 import { WRITE_TOKEN_SOURCE } from "./github-usage.ts";
-import { budgetedRead, budgetPolicy, clearThrottleStrikes, MAX_REVIEW_THROTTLES_IN_A_ROW, recordThrottle, reviewCooldownScope, reviewThrottle, reviewTokenSource } from "./budget.ts";
+import { budgetedRead, budgetPolicy, clearThrottleStrikes, MAX_REVIEW_THROTTLES_IN_A_ROW, recordThrottle, reviewCooldownScope, reviewThrottle } from "./budget.ts";
 import { GraphAddUnattached, closeTimeoutForNode, graphAdd, graphClose, graphDecisions, graphLink, type AddSpec, type CloseResult } from "./graph-write.ts";
 import { FixNodeLockBusy, withFixNodeLock } from "./fix-node-lock.ts";
 import { assertFilable, codeCommentSpec, fileBlockedPrerequisite, foundByProbeSpec, landminesInDiff, parkIdentity, scribeFile, splitOutOfReviewSpec, withIscLine, type PrerequisiteFiling, type Provenance, type ScribeGraph } from "./scribe.ts";
@@ -98,6 +98,7 @@ import type { CommitAuthor } from "./identity.ts";
 import { tryWorkerLog, workerLogFile } from "./worker-log.ts";
 import { captureViews, redactViewsReason, saveViewsRecord, viewsComment, viewsDirectory, type ViewsDependencies, type ViewsRecord } from "./views.ts";
 import { NEEDS_EYE_LABEL } from "./labels.ts";
+import { resolveSageReviewToken } from "./sage-auth.ts";
 import { createShadowTestBackend, measureShadowTests, runShadowMeasured } from "./remote-test/shadow.ts";
 import { assertTestEvidence, assertTestSource, createSshTestBackend, localTestBackend, runTestBackend, testCorrelationId, type TestBackend, type TestRequest, type TestResult } from "./remote-test/supervisor-backend.ts";
 
@@ -142,8 +143,7 @@ export interface ImplementContext {
  config: RangerConfig;
  map: RangerMapConfig;
  token: string;
- /** The map's read-only token — the reviewer reads the PR under it (node #8). */
- readOnlyToken: string;
+ readOnlyToken?: string;
  /** The credential graph reads run under (`graphReadToken`); the write token when unset, GitHub's path. */
  graphToken?: ResolvedToken;
  botIdentity: string;
@@ -170,6 +170,7 @@ export interface ImplementContext {
  testBackend?: TestBackend;
  github?: ForgePort;
  reviewer?: Reviewer;
+ sageAppFetch?: gh.FetchFn;
  /** How long to wait for GitHub to show a pushed head (default 2 min; tests shorten it). */
  headPollMs?: number;
  /** The substrate the worker runs on (node #45). */
@@ -1836,6 +1837,7 @@ async function runImplementFlow(ctx: ImplementContext): Promise<ImplementOutcome
    const cooling = reviewThrottle(journal, config, repo, ctx.now?.() ?? new Date());
    if (cooling !== null) throw new ReviewRateLimitWait(reviewRateLimitOutcome({ round, until: cooling.until, reason: cooling.reason }));
    const { substrate: reviewSubstrate, chosenOn } = await selectReviewSubstrate(ctx, live.headSha);
+   const reviewToken = await resolveSageReviewToken(config, repo, ctx.readOnlyToken, ctx.sageAppFetch);
    // The sage round is a substrate session (node #56): its row opens under
    // the generation fence once selection has settled (selection awaits, and
    // the generation can move meanwhile), and ends with the cap confirmation,
@@ -1847,11 +1849,11 @@ async function runImplementFlow(ctx: ImplementContext): Promise<ImplementOutcome
      openSession();
      try {
       return {
-       verdict: await reviewer(repo, open.iid, ctx.readOnlyToken, {
+       verdict: await reviewer(repo, open.iid, reviewToken.token, {
         substrate: reviewSubstrate,
         nice: config.workers.niceness,
         reviewAuthor: botIdentity,
-        tokenSource: reviewTokenSource(config, repo),
+        tokenSource: reviewToken.source,
        }),
       };
      } catch (error) {

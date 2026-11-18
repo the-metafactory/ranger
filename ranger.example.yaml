@@ -165,6 +165,15 @@ workers:
   noCiGraceMin: 30
 
 auth:
+  # Optional dedicated read-only GitHub App for Sage reviews. Install it on the
+  # selected repositories only (never all repositories) and grant read access
+  # only: ranger refuses an installation that reaches further.
+  # sageApp:
+  #   appId: 123456
+  #   privateKeyFile: /operator-private/sage-app.pem
+  #   installations:
+  #     the-metafactory: 234567
+  #     jcfischer: 345678
   readOnlyTokens:
     # Longest-prefix match: "the-metafactory/*" covers every metafactory repo,
     # "jcfischer/*" covers personal repos. A more specific prefix wins.

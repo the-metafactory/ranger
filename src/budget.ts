@@ -1,9 +1,10 @@
 import type { RangerConfig } from "./config.ts";
-import { meteredGauge, READ_ONLY_TOKEN_SOURCE, recordGauge } from "./github-usage.ts";
+import { meteredGauge, recordGauge } from "./github-usage.ts";
 import { RateLimitError } from "./graph.ts";
 import type { Journal } from "./journal.ts";
-import { gatedEnv, assertGitLabReadGrant, matchTokenEnv, type ResolvedToken } from "./token-gate.ts";
+import { gatedEnv, assertGitLabReadGrant, type ResolvedToken } from "./token-gate.ts";
 import { parseForgeRef } from "./forge-ref.ts";
+import { reviewTokenSource } from "./sage-auth.ts";
 
 /**
  * The GitHub budget gate in front of every GraphQL-costing graph read.
@@ -84,11 +85,6 @@ export interface Cooldown {
 export function cooldownScope(repo: string, source: string): string {
   const ref = parseForgeRef(repo);
   return ref.forge === "github" ? source : `${ref.forge}:${ref.host}:${source}`;
-}
-
-/** The label of the read-only token sage reviews under: its env var name. */
-export function reviewTokenSource(config: Pick<RangerConfig, "auth">, repo: string): string {
-  return matchTokenEnv(config.auth, repo) ?? READ_ONLY_TOKEN_SOURCE;
 }
 
 /**
