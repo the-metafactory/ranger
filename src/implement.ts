@@ -56,6 +56,7 @@ import {
  blockedOutcome,
  policyBlockedOutcome,
  probesFailedOutcome,
+ testsFailedOutcome,
  isGateFailedOutcome,
  gitlabReviewHoldOutcome,
  hostLoadOutcome,
@@ -3708,7 +3709,7 @@ export function failedTestNames(result: RunResult): string[] {
 function testsFailedDetail(ctx: ImplementContext, testCommand: string, tests: RunResult, after: string): string {
  failedOperations.set(ctx, processOutcome(tests, "supervisor-tests", undefined));
  const names = failedTestNames(tests);
- return `tests (${testCommand}) failed ${after} (${exitText(tests, testTimeoutMs(ctx))})${names.length > 0 ? ` — failing: ${names.join("; ")}` : " — failing test names unavailable"} — output tail: ${tail(tests, true)}`;
+ return testsFailedOutcome({ command: testCommand, after, exit: exitText(tests, testTimeoutMs(ctx)), names, tail: tail(tests, true) });
 }
 
 /**
