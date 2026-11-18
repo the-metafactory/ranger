@@ -56,6 +56,7 @@ import {
  blockedOutcome,
  policyBlockedOutcome,
  probesFailedOutcome,
+ isGateFailedOutcome,
  gitlabReviewHoldOutcome,
  hostLoadOutcome,
  reviewCapHeadMovedOutcome,
@@ -1525,6 +1526,7 @@ async function runImplementFlow(ctx: ImplementContext): Promise<ImplementOutcome
   throw error;
  }
  const phase = resolvePhase(pr);
+ const gateParkResume = phase === "review" && isGateFailedOutcome(journal.lastEventDetail(["parked", "refused"], repo, nodeId) ?? "");
  if (pr?.state === "merged") await preserveUnmergedClosure(ctx, pr);
  if (node.status === "closed") return finishClosedElsewhere({ ...ctx, pr });
  journal.recordEvent("worker-start", {
@@ -1542,16 +1544,6 @@ async function runImplementFlow(ctx: ImplementContext): Promise<ImplementOutcome
   return closeAfterMerge(ctx, github, pr as ChangeRequest);
  }
  let checkedResume: CheckedOnBase | undefined;
- if (phase === "review" && pr !== null && pr.headSha === await headSha(worktree)) {
-  journal.updateWorker(nodeId, repo, { phase: "review" });
-  const checkpoint = nodeCheckpoint(ctx);
-  const accepted = checkpoint?.evidence.some(evidence => evidence.kind === "tests-gate" && evidence.result === "passed" && evidence.detail === testCommand);
-  if (!accepted) {
-   const prNumber = pr.iid, prHead = pr.headSha;
-   checkedResume = await checkOnCurrentBase(ctx, testCommand, { label: "resumed checkpoint", mergeFirst: false, mergesLeft: () => mergesLeftOnPr(ctx, github, prNumber, prHead), recordMerge: recordMachineMerge(ctx, github, prNumber) });
-   if (checkedResume.failure !== undefined) return { status: "failed", detail: checkedResume.failure, workerExit: null };
-  }
- }
 
  // ---- implement ----
  let workerExit: number | null = null;
@@ -1803,12 +1795,22 @@ async function runImplementFlow(ctx: ImplementContext): Promise<ImplementOutcome
    // A head the merge desk sent back because no CI ran on it merges in any
    // base commit it lacks: the push is what starts CI (noCiStep).
    const noCi = journal.listCiAbsent(repo, nodeId).some((s) => s.head === live.headSha && s.step === "sent-back");
-   const verdict = await prepareWorktree(ctx, { at: "stale-base", limit: noCi ? 0 : config.workers.maxBehindBase, budgetLeft: baseMerges < MAX_BASE_MERGES });
+   const verdict = await prepareWorktree(ctx, { at: "stale-base", limit: noCi || gateParkResume ? 0 : config.workers.maxBehindBase, budgetLeft: baseMerges < MAX_BASE_MERGES });
+   if (gateParkResume && verdict.kind === "budget-spent") throw new ParkSignal(baseConflictOutcome({ repo, pr: open.iid, base, passes: baseMerges }));
    if (verdict.kind !== "within-limit") staleMerged = true;
    if (verdict.kind === "merge") {
     const failed = await mergeBaseIn(live.headSha, verdict.stale);
     if (failed !== undefined) return failed;
     continue;
+   }
+  }
+  if (phase === "review" && checkedResume === undefined) {
+   const checkpoint = nodeCheckpoint(ctx);
+   const accepted = checkpoint?.evidence.some(evidence => evidence.kind === "tests-gate" && evidence.result === "passed" && evidence.detail === testCommand);
+   if (!accepted) {
+    const prNumber = open.iid, prHead = live.headSha;
+    checkedResume = await checkOnCurrentBase(ctx, testCommand, { label: "resumed checkpoint", mergeFirst: false, mergesLeft: () => mergesLeftOnPr(ctx, github, prNumber, prHead), recordMerge: recordMachineMerge(ctx, github, prNumber) });
+    if (checkedResume.failure !== undefined) return { status: "failed", detail: checkedResume.failure, workerExit: null };
    }
   }
   let current = reviewAtHead(reviews, live.headSha);
@@ -2410,7 +2412,7 @@ async function staleBaseVerdict(ctx: ImplementContext, limit: number, budgetLeft
  journal.recordEvent("reviewed", {
   nodeId: ctx.node.ref.id,
   repo: ctx.map.repo,
-  detail: `${branch} is ${behind} commit(s) behind origin/${base} (limit ${limit}), but the node has used its ${MAX_BASE_MERGES} base merge pass(es): it goes on as it is`,
+  detail: `${branch} is ${behind} commit(s) behind origin/${base} (limit ${limit}), but the node has used its ${MAX_BASE_MERGES} base merge pass(es): no stale-base merge runs`,
  });
  return { kind: "budget-spent" };
 }
@@ -2750,7 +2752,7 @@ async function baseMergePass(ctx: ImplementContext, testCommand: string, from: M
   detail:
    stale === undefined
     ? `${from.kind === "local" ? ctx.branch : changeRequestNoun(ctx.map.repo)} conflicts with origin/${base}${files.length > 0 ? ` in ${files.join(", ")}` : ""} — a worker merges it in`
-    : `${ctx.branch}: ${baseMergeWhy(base, stale)}${files.length > 0 ? `, conflicting in ${files.join(", ")}` : ""} — a worker merges it in before any review or probe run`,
+    : `${ctx.branch}: ${baseMergeWhy(base, stale)}${files.length > 0 ? `, conflicting in ${files.join(", ")}` : ""} — a worker merges it in before any review or probe run; head ${start}, base tip ${baseSha}`,
  });
  const pass = await workerPass(ctx, testCommand, { kind: "base-merge", base, files, ...(stale === undefined ? {} : { stale }) });
  if (from.kind === "local" && (await headSha(ctx.worktree)) === start) {

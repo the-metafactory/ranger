@@ -259,6 +259,11 @@ export function probesFailedOutcome(r: {
 
 export const PROBES_FAILED_OUTCOME = /^browser probes failed twice\b/;
 
+export function isGateFailedOutcome(outcome: string): boolean {
+ const firstLine = outcome.split("\n", 1)[0];
+ return PROBES_FAILED_OUTCOME.test(firstLine) || firstLine.startsWith("merge gate failed (probes)") || /^tests \([^\r\n]*\) failed /.test(firstLine);
+}
+
 /** At most this many probes are named in a summary, each in at most this many characters. */
 const SUMMARY_PROBES = 20;
 const SUMMARY_LINE = 300;
