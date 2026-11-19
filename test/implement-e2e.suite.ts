@@ -4591,6 +4591,21 @@ describe("implement lane (node #23)", () => {
   expect(r.announced[1]).toBe("🔗 Node #20 is blocked on node #30, which is already open: ranger linked it as #20's blocker.");
  }, 60_000);
 
+ test("a blocked park that names an upstream release files no prerequisite here, watches the upstream's tag and asks the principal once", async () => {
+  const r = await rig({ parent: "5" });
+  cleanup.push(r.dir);
+  r.ctx.workerCommand = [implementWorker, "blocked-release"];
+  r.ctx.releases = { latestTag: async () => "v1.0.0", sinceTag: async () => { throw new Error("no release command, so no compare"); } };
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("parked");
+  expect(outcome.detail).toContain("resume condition: an acme/sdk release carries the feature export.");
+  expect(JSON.parse(readFileSync(r.statePath, "utf8")).issues ?? {}).toEqual({});
+  expect(JSON.parse(r.journal.getHealth("release-watch.acme/widgets#20") ?? "null")).toMatchObject({ upstream: "acme/sdk", tag: "v1.0.0" });
+  expect(r.announced).toHaveLength(1);
+  expect(r.announced[0]).toMatch(/^🙋 Node #20 \(.*\) waits for a release of acme\/sdk\. acme\/sdk has no release command in ranger's config/);
+  expect(r.journal.listEvents("acme/widgets", 200).filter((e) => e.kind === "filed")).toEqual([]);
+ }, 60_000);
+
  test("a park that is not blocked files no prerequisite (node #514)", async () => {
   const r = await rig({ parent: "5", probe: "fake-probe fail {node}" });
   cleanup.push(r.dir);

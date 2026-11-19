@@ -34,6 +34,7 @@ import { emptyJobPass, jobPass, jobsPending, type JobPassResult, type SpawnJobAr
 import { intakePass, type IntakeContext, type IntakeResult } from "./intake.ts";
 import { gateProposeReads, ratifyPass, rebuildVetoes, type RatifyResult } from "./ratify.ts";
 import { refuseProposalCard } from "./card-sync.ts";
+import { githubReleaseReads, watchReleases, type ReleaseReads } from "./release.ts";
 import {
  drainGate,
  freshCandidates,
@@ -86,6 +87,7 @@ export interface WalkContext extends DispatchDeps {
  hostLoad?: HostLoad;
  maintenance?: "sweep" | { desk: string };
  spawnJob?: (args: SpawnJobArgs) => Promise<number | null>;
+ releases?: ReleaseReads;
 }
 
 /** Is this resource lane held? (awaiting-merge does not hold it.) */
@@ -510,6 +512,13 @@ export async function walk(ctx: WalkContext): Promise<WalkResult> {
   });
  } catch (error) {
   result.ratify.errors.push(`ratify phase failed: ${error instanceof Error ? error.message : String(error)}`);
+ }
+
+ try {
+  const failed = await watchReleases({ journal, maps: retryMaps, reads: ctx.releases ?? githubReleaseReads(config) });
+  for (const { map, error } of failed) walked.find((w) => w.map === map)?.errors.push(error);
+ } catch (error) {
+  for (const w of walked) w.errors.push(`release watch failed: ${error instanceof Error ? error.message : String(error)}`);
  }
 
  if (journal.listResumeQueue().length > 0) {

@@ -13,6 +13,7 @@ import { basename, join } from "node:path";
 import { DiscordAnnouncer } from "./announce.ts";
 import { code, renderCard } from "./card-render.ts";
 import { deployMerged } from "./deploy.ts";
+import { githubReleaseReads, parkForRelease, type ReleaseReads } from "./release.ts";
 import { mapKey } from "./maps.ts";
 import type { RangerConfig, RangerMapConfig } from "./config.ts";
 import { exitText, runCmd, type RunOptions, type RunResult } from "./exec.ts";
@@ -198,6 +199,7 @@ export interface ImplementContext {
  fixNode?: FixNodeGraph;
  /** The Scribe's graph port (design §6, node #24); default is `soma graph` under the machine token. */
  scribe?: ScribeGraph;
+ releases?: ReleaseReads;
 }
 
 /** The graph port the fix-the-base filer writes and reads through (node #152). */
@@ -3143,6 +3145,15 @@ async function parkPrerequisite(ctx: ImplementContext, report: BlockedReport): P
  const fence = () => {
   journal.assertGeneration(nodeId, map.repo, ctx.generation, "file the blocked prerequisite");
  };
+ const announce = ctx.announce ?? ((text: string) => DiscordAnnouncer.fromMap(map).post(text, "blocked prerequisite notice"));
+ if (report.needsRelease !== undefined) {
+  await parkForRelease({
+   config: ctx.config, journal, map, node: { id: nodeId, title: node.node.title }, generation: ctx.generation, upstream: report.needsRelease,
+   reads: ctx.releases ?? githubReleaseReads(ctx.config), announce, fence,
+   ...(ctx.shellRun === undefined ? {} : { run: ctx.shellRun }), ...(ctx.now === undefined ? {} : { now: ctx.now }),
+  });
+  return;
+ }
  const spawning = { id: nodeId, title: node.node.title, ...(node.parent === undefined ? {} : { parent: node.parent }) };
  let filing: PrerequisiteFiling;
  try {
@@ -3162,7 +3173,7 @@ async function parkPrerequisite(ctx: ImplementContext, report: BlockedReport): P
  const key = `blocked-prerequisite.${mapKey(map)}.${nodeId}.${parkIdentity(report.resume)}`;
  if (journal.getHealth(key) !== null) return;
  try {
-  await (ctx.announce ?? ((text: string) => DiscordAnnouncer.fromMap(map).post(text, "blocked prerequisite notice")))(notice);
+  await announce(notice);
  } catch (error) {
   const message = error instanceof Error ? error.message : String(error);
   journal.recordEvent("filed", { nodeId, repo: map.repo, detail: `the blocked prerequisite notice did not post (${message}); a later park retries it`.slice(0, 400) });

@@ -6,6 +6,7 @@ import { stringify } from "yaml";
 import { Journal } from "../src/journal.ts";
 import { recordThrottle } from "../src/budget.ts";
 import { recordRecovery, nodeRecoveryScope } from "../src/recovery.ts";
+import { releaseWatchKey } from "../src/release.ts";
 import { fakeDiscord, fixturesBin, GIT_ENV, runCli } from "./support.ts";
 
 const REPO = "acme/widgets";
@@ -137,6 +138,25 @@ describe("a node stuck on a failure that never clears goes quiet within a bounde
 
   expect(stillWaking(snapshots)).toEqual({});
   expect(said(snapshots[SETTLED_BY - 1], "20", "closure sweep parked")).toBe(true);
+ }, 120_000);
+
+ test("a node parked for an upstream release whose tag can never be read waits without a word per tick", async () => {
+  const h = host();
+  h.node("40");
+  const journal = h.journal();
+  journal.upsertWorker({ repo: REPO, root: 1, nodeId: "40", status: "parked", lane: "implement", phase: "implement", pid: null, finishedAt: "2026-10-06T00:00:00Z" });
+  const generation = journal.getWorker("40", REPO)?.generation ?? 0;
+  journal.setHealth(releaseWatchKey(REPO, "40"), JSON.stringify({ upstream: "acme/sdk", tag: "v1.0.0", generation }));
+  journal.close();
+
+  const snapshots = await soak(h);
+
+  expect(stillWaking(snapshots)).toEqual({});
+  const after = h.journal();
+  try {
+   expect(after.getResume(REPO, "40")).toBeNull();
+   expect(after.getWorker("40", REPO)?.status).toBe("parked");
+  } finally { after.close(); }
  }, 120_000);
 
  test("a queued resume whose start is refused every tick is dropped (#168)", async () => {

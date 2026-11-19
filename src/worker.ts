@@ -178,6 +178,7 @@ export interface RunNodeContext {
  /** Fix-the-base node filing (node #152); tests inject a fake graph port. */
  fixNode?: ImplementContext["fixNode"];
  mergeablePoll?: ImplementContext["mergeablePoll"];
+ releases?: ImplementContext["releases"];
 }
 
 /** The worktree dir for a node, under the canonical checkout. */
@@ -801,6 +802,7 @@ async function runImplementNode(
   announce: ctx.announce,
   fixNode: ctx.fixNode,
   mergeablePoll: ctx.mergeablePoll,
+  releases: ctx.releases,
   substrateReaders: resolveReaders(ctx),
   now: ctx.now,
  };
