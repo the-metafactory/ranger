@@ -210,6 +210,10 @@ const BLOCKED_RULE = `- Blocked: if the node cannot be done yet because a precon
   \`Gap: code\` when it is a code or provisioning gap a worker could close. On the build
   pass, a ruling park that names no class is refused once, and you are asked to take a
   default instead.
+  When the block is a change merged on another repository's main branch that no
+  release of it carries yet, also write one line \`Needs-release: <owner>/<name>\` naming
+  that repository. Ranger then asks for its release and resumes the node once a new
+  release tag appears; file nothing about it in this repository.
   The supervisor parks the node on it: it pushes nothing and opens no pull request.
   Only an unmet precondition is a block; a hard task or failing tests are not.`;
 

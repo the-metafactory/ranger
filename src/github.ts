@@ -831,3 +831,22 @@ export async function listPullRequestHeads(repo: string, token: string, api: GhA
   };
  });
 }
+
+/** The newest release's tag on `repo`, or null when it has none. */
+export async function latestReleaseTag(repo: string, token: string, source = WRITE_TOKEN_SOURCE): Promise<string | null> {
+ const raw = await ghApi(token, [`repos/${repo}/releases?per_page=1`], `latest release of ${repo}`, source);
+ const tag = (Array.isArray(raw) ? raw[0] as { tag_name?: unknown } | undefined : undefined)?.tag_name;
+ return typeof tag === "string" && tag.length > 0 ? tag : null;
+}
+
+/** `branch`'s head on `repo` and how many commits it has that `tag` lacks; every commit counts when there is no tag. */
+export async function commitsSinceTag(repo: string, tag: string | null, branch: string, token: string, source = WRITE_TOKEN_SOURCE): Promise<{ head: string; ahead: number }> {
+ const commit = await ghApi(token, [`repos/${repo}/commits/${encodeURIComponent(branch)}`], `head of ${repo} ${branch}`, source) as { sha?: unknown } | null;
+ const head = commit?.sha;
+ if (typeof head !== "string" || !/^[0-9a-f]{40}$/.test(head)) throw new GitHubError(`head of ${repo} ${branch}: no commit SHA`);
+ if (tag === null) return { head, ahead: 1 };
+ const comparison = await ghApi(token, [`repos/${repo}/compare/${encodeURIComponent(tag)}...${head}`], `compare ${repo} ${tag}...${branch}`, source) as { ahead_by?: unknown } | null;
+ const ahead = comparison?.ahead_by;
+ if (typeof ahead !== "number") throw new GitHubError(`compare ${repo} ${tag}...${branch}: no ahead_by`);
+ return { head, ahead };
+}

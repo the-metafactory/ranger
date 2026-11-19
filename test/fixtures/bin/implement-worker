@@ -15,7 +15,7 @@
 # merge pass does nothing; merge-forge — a base merge pass commits without merging and moves
 # refs/remotes/origin/main onto its own parent (one commit ahead, base "inside"); orphan — builds on a
 # root commit of its own, sharing no history with origin/main; blocked — writes the blocked report
-# (.ranger-blocked.md) uncommitted and exits 0; blocker-note — commits only a docs/ blocker note; ruling-unclassed — parks on a ruling with no class, then builds with a Default: line once the prompt says the park was refused; ruling-insists — always parks on a ruling with no class; ruling-security — parks on a security ruling. Base merge pass (prompt carries "## Base merge pass"): merges
+# (.ranger-blocked.md) uncommitted and exits 0; blocked-release — the same, with a Needs-release: acme/sdk line; blocker-note — commits only a docs/ blocker note; ruling-unclassed — parks on a ruling with no class, then builds with a Default: line once the prompt says the park was refused; ruling-insists — always parks on a ruling with no class; ruling-security — parks on a security ruling. Base merge pass (prompt carries "## Base merge pass"): merges
 # origin/main, resolving a conflict on src/feature.ts by keeping both sides. CI fix pass (prompt
 # carries "## CI fix pass"): commits a CI fix; in mode ci-noop it commits nothing (a flaky red). Probe fix
 # pass (prompt carries "## Probe fix pass"): commits src/probe-fix.ts; in mode probe-noop it commits nothing. Finish pass (prompt
@@ -37,6 +37,10 @@ cd "$(git rev-parse --show-toplevel)"
 if [ "$mode" = "noop" ]; then exit 0; fi
 if [ "$mode" = "blocked" ]; then
   printf '# Node #20 is blocked\n\nThe widgets SDK has no release with the feature export.\n\nResume condition: publish a widgets SDK release that exports feature().\n' > .ranger-blocked.md
+  exit 0
+fi
+if [ "$mode" = "blocked-release" ]; then
+  printf '# Node #20 is blocked\n\nThe feature export is merged on acme/sdk main but in no release.\n\nNeeds-release: acme/sdk\n\nResume condition: an acme/sdk release carries the feature export.\n' > .ranger-blocked.md
   exit 0
 fi
 if [ "$mode" = "blocked-again" ]; then

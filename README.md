@@ -74,6 +74,10 @@ git -C ~/.local/share/metafactory/arc/repos/ranger fetch origin
 git -C ~/.local/share/metafactory/arc/repos/ranger checkout -B main --track origin/main
 ```
 
+### Wait for another repo's release
+
+A worker whose node needs a change that is merged on another repo's main but in no release writes `Needs-release: owner/name` in its blocked report. Ranger then files no prerequisite in the parked node's repo. It records that repo's newest release tag, and each tick queues the node's resume once the newest tag differs. When that repo is one of ranger's maps with `commands.release` set and its base has commits since the tag, ranger runs the command once per base head (see `ranger.example.yaml`). Otherwise it asks the principal once per park in the map's channel.
+
 ## Commands
 
 | Command | What it does |

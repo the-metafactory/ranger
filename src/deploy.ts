@@ -8,6 +8,9 @@ import { workerHostEnv } from "./worker-env.ts";
 
 export type DeployRun = (command: string, opts: RunOptions) => Promise<RunResult>;
 
+/** An operator command from ranger.yaml, run as `/bin/sh -c`. */
+export const runShellCommand: DeployRun = (command, opts) => runCmd("/bin/sh", ["-c", command], opts);
+
 export interface DeployRequest {
  repo: string;
  command: string;
@@ -28,6 +31,13 @@ export function deployLockFile(journalPath: string, repo: string): string {
  return join(dirname(journalPath), `deploy-${repo.replace(/[^A-Za-z0-9._-]/g, "_")}.lock`);
 }
 
+/** Why an operator command failed: its timeout or exit code, and the tail of what it printed. */
+export function commandFailure(result: RunResult, timeoutMs: number): string {
+ const why = result.timedOut === true ? `timed out after ${Math.round(timeoutMs / 60_000)} min` : `exited ${result.code}`;
+ const tail = (result.stderr || result.stdout).trim().slice(-300);
+ return `${why}${tail === "" ? "" : `: ${tail}`}`;
+}
+
 /**
  * Deploy a merged change with the map's `commands.deploy`: the operator's
  * command from ranger.yaml, never text from the repo or the tracker. Deploys
@@ -41,7 +51,7 @@ export function deployLockFile(journalPath: string, repo: string): string {
  * tokens; the worktree is removed afterwards.
  */
 export async function deployMerged(req: DeployRequest): Promise<DeployResult> {
- const run: DeployRun = req.run ?? ((command, opts) => runCmd("/bin/sh", ["-c", command], opts));
+ const run: DeployRun = req.run ?? runShellCommand;
  try {
   return await withOwnedLease(
    deployLockFile(req.journalPath, req.repo),
@@ -63,9 +73,7 @@ export async function deployMerged(req: DeployRequest): Promise<DeployResult> {
      owned();
      const result = await run(req.command, { cwd: checkout, env: workerHostEnv(), timeoutMs: req.timeoutMs, processGroup: true });
      if (result.code === 0) return { status: "deployed", sha, result };
-     const why = result.timedOut === true ? `timed out after ${Math.round(req.timeoutMs / 60_000)} min` : `exited ${result.code}`;
-     const tail = (result.stderr || result.stdout).trim().slice(-300);
-     return { status: "failed", detail: `${why}${tail === "" ? "" : `: ${tail}`}`, sha, result };
+     return { status: "failed", detail: commandFailure(result, req.timeoutMs), sha, result };
     } finally {
      await safeGit(["worktree", "remove", "--force", checkout], { cwd: req.canonical, timeoutMs: 60_000 });
      rmSync(scratch, { recursive: true, force: true });
