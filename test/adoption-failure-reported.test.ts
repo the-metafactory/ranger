@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { rmSync } from "node:fs";
+import { rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { runCmd, type RunResult } from "../src/exec.ts";
 import { runNode } from "../src/worker.ts";
 import { implementWorker, loadSequence, restoreEnv, rig, type Rig } from "./implement-rig.ts";
@@ -78,6 +79,59 @@ describe("a failed adoption is reported as its test failure (node #568)", () => 
   expect(pr.head).toBe(BRANCH);
   expect(events(r).some((d) => d.startsWith("adoption tests timed out") && d.includes("retrying once"))).toBe(true);
   expect(events(r).some((d) => d.startsWith(`adopting ${head.slice(0, 8)}`))).toBe(true);
+ }, 120_000);
+
+ test("an empty fix pass names the adopted fix's failing test and preserves its commits", async () => {
+  let adoptedHead = "";
+  let pushedHead = "";
+  let workerMode = "build";
+  const r = await rig({
+   blockers: [1, 0],
+   onReview: async (round) => {
+    if (round !== 1) return;
+    const cwd = join(r.canonical, ".worktrees", "node-20");
+    pushedHead = await r.github.sha(BRANCH);
+    writeFileSync(join(cwd, "src/feature.ts"), "export const feature = () => 2;\n");
+    expect((await runCmd("git", ["add", "src/feature.ts"], { cwd })).code).toBe(0);
+    expect((await runCmd("git", ["commit", "-m", "fix: address review for node #20"], { cwd })).code).toBe(0);
+    adoptedHead = (await runCmd("git", ["rev-parse", "HEAD"], { cwd })).stdout.trim();
+    workerMode = "noop";
+   },
+  });
+  cleanup.push(r.dir);
+  quietHost(r);
+  delete r.ctx.workerCommand;
+  r.ctx.worker = (prompt, opts) => runCmd(implementWorker, [workerMode, prompt], opts);
+  const tests = scriptedTests(r, [PASSED, FAILED]);
+  const outcome = await runNode("20", r.ctx);
+  expect(tests.calls).toBe(2);
+  expect(outcome.status).toBe("failed");
+  expect(outcome.detail).toContain("widgets > renders the feature");
+  expect(outcome.detail).toContain("the fix pass 1 after it committed nothing");
+  expect(outcome.detail).not.toContain("the blockers stand");
+  expect(r.journal.getWorker("20", REPO)?.outcome).toContain("widgets > renders the feature");
+  expect(events(r).some((d) => d.includes("widgets > renders the feature") && d.endsWith("— the worker continues"))).toBe(true);
+  expect(adoptedHead).not.toBe(pushedHead);
+  expect(await r.github.sha(BRANCH)).toBe(adoptedHead);
+  const cwd = join(r.canonical, ".worktrees", "node-20");
+  expect((await runCmd("git", ["merge-base", "--is-ancestor", pushedHead, adoptedHead], { cwd })).code).toBe(0);
+  expect((await runCmd("git", ["rev-parse", "HEAD"], { cwd })).stdout.trim()).toBe(adoptedHead);
+  expect((await runCmd("git", ["status", "--porcelain"], { cwd })).stdout.trim()).toBe("");
+ }, 120_000);
+
+ test("an empty fix pass without an adoption keeps its blockers outcome", async () => {
+  let workerMode = "build";
+  const r = await rig({ blockers: [1, 0], onReview: async () => { workerMode = "noop"; } });
+  cleanup.push(r.dir);
+  quietHost(r);
+  delete r.ctx.workerCommand;
+  r.ctx.worker = (prompt, opts) => runCmd(implementWorker, [workerMode, prompt], opts);
+  const tests = scriptedTests(r, [PASSED]);
+  const outcome = await runNode("20", r.ctx);
+  expect(tests.calls).toBe(1);
+  expect(outcome.status).toBe("failed");
+  expect(outcome.detail).toContain("fix pass 1 committed nothing — the blockers stand");
+  expect(await r.github.sha(BRANCH)).not.toBe("");
  }, 120_000);
 
  test("a build pass that commits nothing on a branch with no work of its own still reports nothing to push", async () => {

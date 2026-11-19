@@ -1997,9 +1997,11 @@ async function runImplementFlow(ctx: ImplementContext): Promise<ImplementOutcome
   // during the review binds this pass, not the next (ranger issue #230).
   const readRulings = async (): Promise<string[]> =>
    principalRulings(await github.listComments(repo, open.iid, token), principalLoginForRepo(config, repo));
-  const fixed =
-   (await adoptBuiltWork(ctx, testCommand, { fix: { round: current.round, pushedHead: live.headSha } })).pass ??
-   (await workerPass(ctx, testCommand, { kind: "fix", round: current.round, body: current.body, rulings: await readRulings() }));
+  const adoption = await adoptBuiltWork(ctx, testCommand, { fix: { round: current.round, pushedHead: live.headSha } });
+  const fixed = adoption.pass ?? (await workerPass(ctx, testCommand, {
+   kind: "fix", round: current.round, body: current.body, rulings: await readRulings(),
+   ...(adoption.failure === undefined ? {} : { adoptionFailure: adoption.failure }),
+  }));
   workerExit = fixed.workerExit;
   if (fixed.failure !== undefined) return fixed.failure;
   await publishPass(ctx, github, open.iid, fixed, "push fix", `fix pass ${current.round} @ ${fixed.sha.slice(0, 8)}`);
@@ -2830,7 +2832,7 @@ export function refusesRulingPark(spec: WorkerPassSpec, report: BlockedReport): 
 /** What a worker session is for: the build, a fix pass answering a sage round, a red CI or failed probes, or a base merge. */
 type WorkerPassSpec =
  | { kind: "build"; refusedPark?: string; adoptionFailure?: string }
- | { kind: "fix"; round: number; body: string; rulings: string[] }
+ | { kind: "fix"; round: number; body: string; rulings: string[]; adoptionFailure?: string }
  | { kind: "finish-fix"; round: number; red: string; body: string; rulings: string[] }
  | { kind: "ci-fix"; red: string; reason: string; log: string; rulings: string[] }
  | { kind: "probe-fix"; red: string; failed: string[]; summary: string[]; rulings: string[] }
@@ -2856,11 +2858,12 @@ function passLabel(spec: WorkerPassSpec): string {
 
 /** Why a pass that exited 0 without a new commit failed. */
 function nothingCommitted(spec: WorkerPassSpec): string {
+ if ("adoptionFailure" in spec && spec.adoptionFailure !== undefined) {
+  return `${spec.adoptionFailure} — the ${passLabel(spec)} after it committed nothing`;
+ }
  switch (spec.kind) {
   case "build":
-   return spec.adoptionFailure === undefined
-    ? "worker exited 0 but committed nothing — nothing to push"
-    : `${spec.adoptionFailure} — the build pass after it committed nothing`;
+   return "worker exited 0 but committed nothing — nothing to push";
   case "fix":
    return `fix pass ${spec.round} committed nothing — the blockers stand`;
   case "finish-fix":
