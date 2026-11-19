@@ -37,9 +37,12 @@ export interface BlockedReport {
  resume: string;
  ruling?: boolean;
  rulingClass?: RulingClass;
+ needsRelease?: string;
 }
 
 const GAP_LINE = new RegExp(`^\\s*(?:#{1,6}\\s*)?(?:\\*\\*)?gap(?:\\*\\*)?\\s*:\\s*(?:\\*\\*)?\\s*(ruling|code|provisioning)\\b(?:[\\s:(,—–-]*(${RULING_CLASSES.join("|")})\\b)?`, "i");
+
+const NEEDS_RELEASE_LINE = /^\s*(?:#{1,6}\s*)?(?:\*\*)?needs[ -]release(?:\*\*)?\s*:\s*(?:\*\*)?\s*`?([\w.-]+\/[\w.-]+)`?\s*$/i;
 
 const RESUME_LINE = /^\s*(#{1,6}\s*)?(?:\*\*)?resume[ -]condition(?:\*\*)?\s*:?(?:\*\*)?\s*(.*)$/i;
 const HEADING = /^\s*#{1,6}\s/;
@@ -90,7 +93,9 @@ function fold(lines: string[]): string {
 export function parseBlockedReport(text: string): BlockedReport {
  const lines = text.split(/\r?\n/);
  const gap = lines.map((l) => GAP_LINE.exec(l)).find((m) => m !== null);
- const parsed = parseParts(lines.filter((l) => !GAP_LINE.test(l)));
+ const release = lines.map((l) => NEEDS_RELEASE_LINE.exec(l)).find((m) => m !== null)?.[1];
+ const parts = parseParts(lines.filter((l) => !GAP_LINE.test(l) && !NEEDS_RELEASE_LINE.test(l)));
+ const parsed = release === undefined ? parts : { ...parts, needsRelease: release };
  if (gap?.[1].toLowerCase() !== "ruling") return parsed;
  const named = (gap[2] as string | undefined)?.toLowerCase() as RulingClass | undefined;
  return named === undefined ? { ...parsed, ruling: true } : { ...parsed, ruling: true, rulingClass: named };
@@ -187,5 +192,6 @@ export async function blockerNoteBranch(worktree: string, base: string): Promise
   resume: parsed.resume,
   ...(parsed.ruling === true ? { ruling: true } : {}),
   ...(parsed.rulingClass === undefined ? {} : { rulingClass: parsed.rulingClass }),
+  ...(parsed.needsRelease === undefined ? {} : { needsRelease: parsed.needsRelease }),
  };
 }

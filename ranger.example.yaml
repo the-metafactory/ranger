@@ -61,6 +61,15 @@ maps:
     #   # deploy is journaled (deploy-failed) and announced; the close stands.
     #   deploy: arc upgrade ranger --force && launchctl kickstart -k gui/$(id -u)/ch.invisible.ranger-serve
     #   deployTimeoutMin: 15
+    #   # Cut a release of this repo when a node on any map parks with
+    #   # `Needs-release: <this repo>` and this map's base has commits since the
+    #   # newest release tag. At most once per base head; it runs in an empty
+    #   # directory under the host env without forge tokens (RANGER_RELEASE_REPO
+    #   # and RANGER_RELEASE_HEAD name the repo and head), 15 minutes at most,
+    #   # and its last stdout line is the new tag. Without it, such a park asks
+    #   # the principal once. Either way the parked node resumes when a new tag
+    #   # appears (release-requested, release-cut, release-failed, release-seen).
+    #   release: $HOME/bin/cortex-release
     #   # Informational sheet for ranger:needs-eye, after passing final-head probes.
     #   # before = detached merge-base build; after + after2 = final head + noise control.
     #   # {out} is outside the worktree, under the journal directory, per repo/node/SHA.

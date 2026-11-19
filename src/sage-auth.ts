@@ -29,9 +29,6 @@ async function assertInstallationIsThisAppOnItsOwnerReadOnly(jwt: string, app: {
  if (installation.account.toLowerCase() !== owner.toLowerCase()) {
   throw new GateError(`${source}: installation ${id} belongs to ${installation.account}, not ${owner} — refusing to mint a token for another account's repository`);
  }
- if (installation.repositorySelection !== "selected") {
-  throw new GateError(`${source}: the App is installed on all repositories (${installation.repositorySelection}); install it on the selected repositories ranger reviews`);
- }
  if (installation.writePermissions.length > 0) {
   throw new GateError(`${source}: the App installation grants write access (${installation.writePermissions.join(", ")}); grant read access only`);
  }
@@ -43,8 +40,8 @@ async function assertInstallationIsThisAppOnItsOwnerReadOnly(jwt: string, app: {
  *
  * `auth.sageApp.installations` holds a bare installation id per owner, so the id is checked
  * against the App's own view of it before a token is minted: it must be this App's
- * installation, sit on the reviewed repository's owner, select repositories rather than reach
- * all of them, and grant nothing above read. A mistyped id then refuses instead of minting a
+ * installation, sit on the reviewed repository's owner, and grant nothing above read. The App
+ * may reach all of the owner's repositories: the minted token is scoped to the reviewed one. A mistyped id then refuses instead of minting a
  * token for another account's same-named repository, and an App installed or granted more
  * broadly than Sage needs never becomes Sage's credential. The key file behind that check is
  * readable by every process of this account, as the `checkReporter` App key is; the reach

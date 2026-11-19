@@ -29,7 +29,7 @@ import { Database } from "bun:sqlite";
 import { openJournal, type Journal } from "../src/journal.ts";
 import { ReviewError, type ReviewVerdict } from "../src/review.ts";
 import { LAST_IMPLEMENT_MAP } from "../src/maps.ts";
-import { HOST_LOAD_OUTCOME } from "../src/outcomes.ts";
+import { HOST_LOAD_OUTCOME, journalOutcome, probesFailedOutcome } from "../src/outcomes.ts";
 import { implementLane } from "../src/lanes.ts";
 import { sweepMap } from "../src/sweep.ts";
 import { processResumeQueue } from "../src/resume.ts";
@@ -940,6 +940,97 @@ describe("implement lane (node #23)", () => {
   r.ctx.config.workers.maxBehindBase = 2;
   expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
   expect((r.github.comments.get(1) ?? []).some((c) => c.body.includes("ranger:base-merge"))).toBe(false);
+ }, 60_000);
+
+ const gatePark = async (kind: "probes" | "tests") => {
+  const r = await rig({ probe: `fake-probe ${kind === "probes" ? "fail" : "ok"} {node}` });
+  cleanup.push(r.dir);
+  expect((await runNode("20", r.ctx)).status).toBe(kind === "probes" ? "parked" : "awaiting-merge");
+  if (kind === "tests") {
+   r.ctx.map.commands.test = "test -f base-1.txt";
+   reclaim(r);
+   expect((await runNode("20", r.ctx)).status).toBe("failed");
+  }
+  r.ctx.map.commands.probe = "fake-probe ok {node}";
+  reclaim(r);
+  r.journal.updateWorker("20", "acme/widgets", { outcome: null });
+  return r;
+ };
+
+ test.each(["probes", "tests", "truncated", "one-commit", "clean-gate"] as const)("a gate-park resume merges a moved base before its first gate (node #566): %s", async kind => {
+  const r = await gatePark(kind === "tests" ? "tests" : "probes");
+  const head = await r.github.sha(BRANCH);
+  if (kind === "truncated") {
+   const detail = journalOutcome(probesFailedOutcome({ repo: "acme/widgets", pr: 1, sha: head, exit: 1,
+    failed: Array.from({ length: 30 }, (_, i) => `probe-long-failure-${i}.mjs`),
+    redOnBase: ["base-red.mjs"], tail: "" }));
+   expect(detail).toHaveLength(400);
+   expect(detail).not.toContain("red on the merge base too:");
+   r.journal.recordEvent("parked", { repo: "acme/widgets", nodeId: "20", detail });
+  }
+  let base = await pushFromOutside(r, "base-1.txt", "main");
+  const behind = kind === "one-commit" ? 1 : 2;
+  if (behind === 2) base = await pushFromOutside(r, "base-2.txt", "main");
+  r.ctx.map.commands.test = kind === "clean-gate" ? "test -f src/feature.ts" : "test -f base-1.txt";
+  const tested: string[] = [];
+  const pushedBeforeProbes: boolean[] = [];
+  const prior = r.journal.listEvents("acme/widgets", 1000).length;
+  r.ctx.shellRun = async (command, opts) => {
+   if (command === r.ctx.map.commands.test) tested.push((await git(["rev-parse", "HEAD"], opts.cwd ?? r.canonical)).stdout.trim());
+   if (command.startsWith("fake-probe")) pushedBeforeProbes.push(eventsSince(r, prior).some(e => e.kind === "pushed" && e.detail?.startsWith("base merge pass 1 @")));
+   return runCmd("/bin/sh", ["-c", command], opts);
+  };
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  expect(tested.length).toBeGreaterThan(0);
+  for (const sha of tested) expect(await holds(r, base, sha)).toBe(true);
+  expect(pushedBeforeProbes).toEqual([true]);
+  expect(markersOn(r)).toHaveLength(1);
+  const events = eventsSince(r, prior);
+  const push = events.findIndex(e => e.kind === "pushed" && e.detail?.startsWith("base merge pass 1 @"));
+  const probe = events.findIndex(e => e.detail?.startsWith("probes passed at"));
+  expect(push).toBeGreaterThanOrEqual(0);
+  expect(probe).toBeGreaterThan(push);
+  expect(events.some(e => e.detail?.includes(head) && e.detail.includes(base) && e.detail.includes(`${behind} commit(s) behind origin/main`))).toBe(true);
+ }, 60_000);
+
+ test.each(["probes", "tests"] as const)("a gate-park resume already at the base reruns its gate without a merge (node #566): %s", async kind => {
+  const r = await gatePark(kind);
+  r.ctx.map.commands.test = "test -f src/feature.ts && test -f tests/feature.test.ts";
+  const head = await r.github.sha(BRANCH);
+  let tests = 0;
+  r.ctx.shellRun = async (command, opts) => {
+   if (command === r.ctx.map.commands.test) tests++;
+   return runCmd("/bin/sh", ["-c", command], opts);
+  };
+  const prior = r.journal.listEvents("acme/widgets", 1000).length;
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  expect(await r.github.sha(BRANCH)).toBe(head);
+  expect(markersOn(r)).toHaveLength(0);
+  expect(tests).toBe(1);
+  if (kind === "probes") expect(eventsSince(r, prior).some(e => e.detail?.startsWith("probes passed at"))).toBe(true);
+ }, 60_000);
+
+ test.each(["review cap reached", "base merge conflict", "worker budget spent"])("a later unrelated park keeps the normal stale-base limit on resume (node #566): %s", async reason => {
+  const r = await gatePark("probes");
+  r.journal.recordEvent("refused", { repo: "acme/widgets", nodeId: "20", detail: reason });
+  for (const file of ["base-1.txt", "base-2.txt"]) await pushFromOutside(r, file, "main");
+  const head = await r.github.sha(BRANCH);
+  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+  expect(await r.github.sha(BRANCH)).toBe(head);
+  expect(markersOn(r)).toHaveLength(0);
+ }, 60_000);
+
+ test.each(["probes", "tests"] as const)("a gate-park resume with its base merge budget spent parks before any gate (node #566): %s", async kind => {
+  const r = await gatePark(kind);
+  const head = await r.github.sha(BRANCH);
+  await spendBaseMergeBudget(r, head);
+  for (const file of ["base-1.txt", "base-2.txt"]) await pushFromOutside(r, file, "main");
+  r.ctx.shellRun = async () => { throw new Error("no gate may run with a spent base merge budget"); };
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("parked");
+  expect(outcome.detail).toContain("conflicts with main again after 2 base merge pass(es)");
+  expect(await r.github.sha(BRANCH)).toBe(head);
+  expect(markersOn(r)).toHaveLength(2);
  }, 60_000);
 
  test("a head the merge desk sent back because no CI ran on it merges in even one base commit (reflex #43, 2026-10-13)", async () => {
@@ -4498,6 +4589,21 @@ describe("implement lane (node #23)", () => {
   expect(state.nodes["20"].blockedBy).toEqual([String(first.number), "30"]);
   expect(r.announced).toHaveLength(2);
   expect(r.announced[1]).toBe("🔗 Node #20 is blocked on node #30, which is already open: ranger linked it as #20's blocker.");
+ }, 60_000);
+
+ test("a blocked park that names an upstream release files no prerequisite here, watches the upstream's tag and asks the principal once", async () => {
+  const r = await rig({ parent: "5" });
+  cleanup.push(r.dir);
+  r.ctx.workerCommand = [implementWorker, "blocked-release"];
+  r.ctx.releases = { latestTag: async () => "v1.0.0", sinceTag: async () => { throw new Error("no release command, so no compare"); } };
+  const outcome = await runNode("20", r.ctx);
+  expect(outcome.status).toBe("parked");
+  expect(outcome.detail).toContain("resume condition: an acme/sdk release carries the feature export.");
+  expect(JSON.parse(readFileSync(r.statePath, "utf8")).issues ?? {}).toEqual({});
+  expect(JSON.parse(r.journal.getHealth("release-watch.acme/widgets#20") ?? "null")).toMatchObject({ upstream: "acme/sdk", tag: "v1.0.0" });
+  expect(r.announced).toHaveLength(1);
+  expect(r.announced[0]).toMatch(/^🙋 Node #20 \(.*\) waits for a release of acme\/sdk\. acme\/sdk has no release command in ranger's config/);
+  expect(r.journal.listEvents("acme/widgets", 200).filter((e) => e.kind === "filed")).toEqual([]);
  }, 60_000);
 
  test("a park that is not blocked files no prerequisite (node #514)", async () => {

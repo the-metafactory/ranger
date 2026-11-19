@@ -35,6 +35,22 @@ describe("Journal — SQLite state (design §8)", () => {
   j.close();
  });
 
+ test("the last event detail selects the newest matching terminal event for one node", () => {
+  const j = new Journal(":memory:");
+  const terminal = ["parked", "refused"] as const;
+  expect(j.lastEventDetail(terminal, "acme/widgets", "10")).toBeNull();
+  j.recordEvent("parked", { nodeId: "10", repo: "acme/widgets", detail: "probe park" });
+  j.recordEvent("refused", { nodeId: "10", repo: "acme/widgets", detail: "tests failed" });
+  j.recordEvent("parked", { nodeId: "11", repo: "acme/widgets", detail: "other node" });
+  j.recordEvent("parked", { nodeId: "10", repo: "acme/gadgets", detail: "other repo" });
+  for (let n = 0; n < 100; n++) j.recordEvent("reviewed", { nodeId: "10", repo: "acme/widgets", detail: "noise" });
+  expect(j.lastEventDetail(terminal, "acme/widgets", "10")).toBe("tests failed");
+  expect(j.lastEventDetail("parked", "acme/widgets", "10")).toBe("probe park");
+  j.recordEvent("parked", { nodeId: "10", repo: "acme/widgets", detail: "review cap" });
+  expect(j.lastEventDetail(terminal, "acme/widgets", "10")).toBe("review cap");
+  j.close();
+ });
+
  test("dead-man counter: reset, bump, threshold is the caller's, pause is sticky", () => {
   const j = new Journal(":memory:");
   expect(j.deadmanCount()).toBe(0);

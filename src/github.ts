@@ -666,13 +666,9 @@ export async function createInstallationToken(jwt: string, installationId: numbe
 }
 
 /** The App's own view of one installation: the account it sits on, its app, and how far it reaches. */
-/** `selected` covers the repositories the App was installed on; `all` covers every repository it can see. */
-export type RepositorySelection = "all" | "selected";
-
 export interface AppInstallation {
  account: string;
  appId: number;
- repositorySelection: RepositorySelection;
  writePermissions: string[];
 }
 
@@ -686,14 +682,13 @@ export async function readAppInstallation(jwt: string, installationId: number, o
  const raw = await appBearerJson(jwt, `/app/installations/${installationId}`, label, options, { method: "GET" });
  const account = (raw?.account as Record<string, unknown> | null | undefined)?.login;
  const permissions = raw?.permissions;
- const selection = raw?.repository_selection;
- if (typeof account !== "string" || account.length === 0 || typeof raw?.app_id !== "number" || (selection !== "all" && selection !== "selected") || typeof permissions !== "object" || permissions === null || Array.isArray(permissions)) {
+ if (typeof account !== "string" || account.length === 0 || typeof raw?.app_id !== "number" || typeof permissions !== "object" || permissions === null || Array.isArray(permissions)) {
   throw new GitHubError(`${label}: invalid response`);
  }
  const writePermissions = Object.entries(permissions as Record<string, unknown>)
   .filter(([, level]) => level !== "read")
   .map(([name]) => name);
- return { account, appId: raw.app_id, repositorySelection: selection, writePermissions };
+ return { account, appId: raw.app_id, writePermissions };
 }
 
 export type CheckConclusion = "success" | "failure" | "neutral" | "cancelled" | "timed_out";
@@ -835,4 +830,23 @@ export async function listPullRequestHeads(repo: string, token: string, api: GhA
    headSha: typeof head.sha === "string" ? head.sha : "",
   };
  });
+}
+
+/** The newest release's tag on `repo`, or null when it has none. */
+export async function latestReleaseTag(repo: string, token: string, source = WRITE_TOKEN_SOURCE): Promise<string | null> {
+ const raw = await ghApi(token, [`repos/${repo}/releases?per_page=1`], `latest release of ${repo}`, source);
+ const tag = (Array.isArray(raw) ? raw[0] as { tag_name?: unknown } | undefined : undefined)?.tag_name;
+ return typeof tag === "string" && tag.length > 0 ? tag : null;
+}
+
+/** `branch`'s head on `repo` and how many commits it has that `tag` lacks; every commit counts when there is no tag. */
+export async function commitsSinceTag(repo: string, tag: string | null, branch: string, token: string, source = WRITE_TOKEN_SOURCE): Promise<{ head: string; ahead: number }> {
+ const commit = await ghApi(token, [`repos/${repo}/commits/${encodeURIComponent(branch)}`], `head of ${repo} ${branch}`, source) as { sha?: unknown } | null;
+ const head = commit?.sha;
+ if (typeof head !== "string" || !/^[0-9a-f]{40}$/.test(head)) throw new GitHubError(`head of ${repo} ${branch}: no commit SHA`);
+ if (tag === null) return { head, ahead: 1 };
+ const comparison = await ghApi(token, [`repos/${repo}/compare/${encodeURIComponent(tag)}...${head}`], `compare ${repo} ${tag}...${branch}`, source) as { ahead_by?: unknown } | null;
+ const ahead = comparison?.ahead_by;
+ if (typeof ahead !== "number") throw new GitHubError(`compare ${repo} ${tag}...${branch}: no ahead_by`);
+ return { head, ahead };
 }

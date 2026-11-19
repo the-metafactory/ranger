@@ -136,10 +136,21 @@ test("a readable installation of this App mints one repository- and read-scoped 
  }
 });
 
+test("an App installed on all of the owner's repositories mints one repository-scoped token", async () => {
+ const { config, dir } = configWithAcmeSageApp();
+ const seen: string[] = [];
+ try {
+  const fetch = recordingAppApi(seen, acmeInstallationReadOnly({ repository_selection: "all" }));
+  expect(await resolveSageReviewToken(config, REPO, "test-pat", fetch)).toEqual({ token: INSTALLATION_TOKEN, source: SOURCE });
+  expect(seen).toEqual([`GET ${INSTALLATION_URL}`, `POST ${INSTALLATION_URL}/access_tokens`]);
+ } finally {
+  rmSync(dir, { recursive: true, force: true });
+ }
+});
+
 const INSTALLATION_REFUSALS: [string, Record<string, unknown>, string][] = [
  ["an installation on another account", { account: { login: "Other" } }, "belongs to Other, not acme"],
  ["an installation of a different App", { app_id: 11 }, "installation 20 of GitHub App 11, not App 10"],
- ["an App installed on all repositories", { repository_selection: "all" }, "installed on all repositories (all)"],
  ["an installation that grants write access", { permissions: { contents: "read", pull_requests: "write" } }, "grants write access (pull_requests)"],
  ["an installation with array permissions", { permissions: [] }, "invalid response"],
 ];
