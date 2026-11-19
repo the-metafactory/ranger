@@ -259,6 +259,17 @@ export function probesFailedOutcome(r: {
 
 export const PROBES_FAILED_OUTCOME = /^browser probes failed twice\b/;
 
+export function testsFailedOutcome(r: { command: string; after: string; exit: string; names: readonly string[]; tail: string }): string {
+ return `tests (${r.command}) failed ${r.after} (${r.exit})${r.names.length > 0 ? ` — failing: ${r.names.join("; ")}` : " — failing test names unavailable"} — output tail: ${r.tail}`;
+}
+
+export const TESTS_FAILED_OUTCOME = /^tests \([^\r\n]*\) failed /;
+
+export function isGateFailedOutcome(outcome: string): boolean {
+ const firstLine = outcome.split("\n", 1)[0];
+ return [PROBES_FAILED_OUTCOME, MERGE_GATE_PROBES_FAILED_OUTCOME, TESTS_FAILED_OUTCOME].some(pattern => pattern.test(firstLine));
+}
+
 /** At most this many probes are named in a summary, each in at most this many characters. */
 const SUMMARY_PROBES = 20;
 const SUMMARY_LINE = 300;
@@ -339,6 +350,8 @@ export function parseBlockedOutcome(outcome: string): { reason: string; resume: 
 export function mergeGateFailedOutcome(r: { check: string; reason: string }): string {
  return `merge gate failed (${r.check}): ${r.reason}`;
 }
+
+export const MERGE_GATE_PROBES_FAILED_OUTCOME = /^merge gate failed \(probes\)/;
 
 /**
  * A merge-gate park on CI alone (node #104): the gate reads CI before the

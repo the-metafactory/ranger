@@ -887,9 +887,9 @@ export class Journal {
   return row?.n ?? 0;
  }
 
- lastEventDetail(kind: EventKind, repo: string, nodeId: string): string | null {
+ lastEventDetail(kind: EventKind | readonly EventKind[], repo: string, nodeId: string): string | null {
   const row = this.db.select({ detail: events.detail }).from(events)
-   .where(and(eq(events.kind, kind), eq(events.repo, repo), eq(events.nodeId, nodeId)))
+   .where(and(typeof kind === "string" ? eq(events.kind, kind) : inArray(events.kind, [...kind]), eq(events.repo, repo), eq(events.nodeId, nodeId)))
    .orderBy(desc(events.id)).limit(1).get();
   return row?.detail ?? null;
  }
