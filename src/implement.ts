@@ -1568,8 +1568,14 @@ async function runImplementFlow(ctx: ImplementContext): Promise<ImplementOutcome
   // Work an earlier run built and committed, but never pushed, is adopted
   // when it passes the supervisor's checks (#691: its tests failed under
   // load; a fresh worker would find nothing to commit and fail again).
-  let built = (await adoptBuiltWork(ctx, testCommand)) ?? (await workerPass(ctx, testCommand, { kind: "build" }));
-  if (built.refusedRuling !== undefined) built = await workerPass(ctx, testCommand, { kind: "build", refusedPark: built.refusedRuling });
+  const adoption = await adoptBuiltWork(ctx, testCommand);
+  const buildPass = (refusedPark?: string): WorkerPassSpec => ({
+   kind: "build",
+   ...(adoption.failure === undefined ? {} : { adoptionFailure: adoption.failure }),
+   ...(refusedPark === undefined ? {} : { refusedPark }),
+  });
+  let built = adoption.pass ?? (await workerPass(ctx, testCommand, buildPass()));
+  if (built.refusedRuling !== undefined) built = await workerPass(ctx, testCommand, buildPass(built.refusedRuling));
   workerExit = built.workerExit;
   if (built.failure !== undefined) return built.failure;
 
@@ -1996,9 +2002,11 @@ async function runImplementFlow(ctx: ImplementContext): Promise<ImplementOutcome
   // during the review binds this pass, not the next (ranger issue #230).
   const readRulings = async (): Promise<string[]> =>
    principalRulings(await github.listComments(repo, open.iid, token), principalLoginForRepo(config, repo));
-  const fixed =
-   (await adoptBuiltWork(ctx, testCommand, { fix: { round: current.round, pushedHead: live.headSha } })) ??
-   (await workerPass(ctx, testCommand, { kind: "fix", round: current.round, body: current.body, rulings: await readRulings() }));
+  const adoption = await adoptBuiltWork(ctx, testCommand, { fix: { round: current.round, pushedHead: live.headSha } });
+  const fixed = adoption.pass ?? (await workerPass(ctx, testCommand, {
+   kind: "fix", round: current.round, body: current.body, rulings: await readRulings(),
+   ...(adoption.failure === undefined ? {} : { adoptionFailure: adoption.failure }),
+  }));
   workerExit = fixed.workerExit;
   if (fixed.failure !== undefined) return fixed.failure;
   await publishPass(ctx, github, open.iid, fixed, "push fix", `fix pass ${current.round} @ ${fixed.sha.slice(0, 8)}`);
@@ -2828,8 +2836,8 @@ export function refusesRulingPark(spec: WorkerPassSpec, report: BlockedReport): 
 
 /** What a worker session is for: the build, a fix pass answering a sage round, a red CI or failed probes, or a base merge. */
 type WorkerPassSpec =
- | { kind: "build"; refusedPark?: string }
- | { kind: "fix"; round: number; body: string; rulings: string[] }
+ | { kind: "build"; refusedPark?: string; adoptionFailure?: string }
+ | { kind: "fix"; round: number; body: string; rulings: string[]; adoptionFailure?: string }
  | { kind: "finish-fix"; round: number; red: string; body: string; rulings: string[] }
  | { kind: "ci-fix"; red: string; reason: string; log: string; rulings: string[] }
  | { kind: "probe-fix"; red: string; failed: string[]; summary: string[]; rulings: string[] }
@@ -2855,6 +2863,9 @@ function passLabel(spec: WorkerPassSpec): string {
 
 /** Why a pass that exited 0 without a new commit failed. */
 function nothingCommitted(spec: WorkerPassSpec): string {
+ if ("adoptionFailure" in spec && spec.adoptionFailure !== undefined) {
+  return `${spec.adoptionFailure} — the ${passLabel(spec)} after it committed nothing`;
+ }
  switch (spec.kind) {
   case "build":
    return "worker exited 0 but committed nothing — nothing to push";
@@ -4271,8 +4282,10 @@ async function freshCheckoutTests(
  * tests failed, or it crashed before the push): when the branch is ahead of
  * the base with a clean tree and passes the supervisor's checks, it is
  * pushed as it stands, with no new worker session. One that fails them goes
- * to the worker as before, which can fix what broke. Null when there is
- * nothing to adopt or it does not pass.
+ * to the worker as before, which can fix what broke, and its test failure is
+ * returned beside the null pass, so a build pass that commits nothing names
+ * it instead of reporting "nothing to push". Null pass when there is nothing
+ * to adopt or it does not pass.
  *
  * The git state is trusted exactly as on any resumed pass: checked against
  * the known-good record (node #81), so a change the failed run's tests made
@@ -4287,13 +4300,13 @@ async function adoptBuiltWork(
  ctx: ImplementContext,
  testCommand: string,
  opts: { fix?: { round: number; pushedHead: string }; baseMerged?: boolean } = {},
-): Promise<PassResult | null> {
+): Promise<Adoption> {
  const { fix, baseMerged = false } = opts;
  const { map, worktree, journal, node } = ctx;
  if (fix === undefined ? (await commitsAhead(worktree, map.base)) === 0 : !(await fixCommitsOn(worktree, fix.pushedHead))) {
-  return null;
+  return { pass: null };
  }
- if ((await dirtyFiles(worktree)).length > 0) return null;
+ if ((await dirtyFiles(worktree)).length > 0) return { pass: null };
  const what = fix === undefined ? "build" : `fix pass ${fix.round}`;
  if (fix === undefined) {
   const note = await blockerNoteBranch(worktree, map.base);
@@ -4328,20 +4341,17 @@ async function adoptBuiltWork(
   if (await prepareWorktree(ctx, { at: "red-adoption", what: `the adoption tests (${testCommand})`, baseSha: await fetchBaseTrusted(ctx) })) return adoptBuiltWork(ctx, testCommand, { baseMerged: true });
  }
  if (tests.code !== 0) {
-  if (remoteTests(ctx)) return { workerExit: null, snapshot, sha, failure: { status: "failed", detail: tests.stderr, workerExit: null } };
-  journal.recordEvent("reviewed", {
-   nodeId: node.ref.id,
-   repo: map.repo,
-   detail: `${testsFailedDetail(ctx, testCommand, tests, "on the work a previous run committed")} — the worker continues`.slice(0, 400),
-  });
-  return null;
+  if (remoteTests(ctx)) return { pass: { workerExit: null, snapshot, sha, failure: { status: "failed", detail: tests.stderr, workerExit: null } } };
+  const failure = testsFailedDetail(ctx, testCommand, tests, "on the work a previous run committed");
+  journal.recordEvent("reviewed", { nodeId: node.ref.id, repo: map.repo, detail: `${failure} — the worker continues`.slice(0, 400) });
+  return { pass: null, failure };
  }
- if ((await headSha(worktree)) !== sha || (await dirtyFiles(worktree)).length > 0) return null;
+ if ((await headSha(worktree)) !== sha || (await dirtyFiles(worktree)).length > 0) return { pass: null };
  recordKnownGood(journal, ctx.canonical, clean, "passing adoption tests");
  await assertNoClosingKeywords(worktree, map.base, parseForgeRef(map.repo).forge);
  const restored = remoteTests(ctx) ? null : await restoreWorktree(ctx, sha);
  if (restored !== null) {
-  return { workerExit: null, snapshot, sha, failure: { status: "failed", detail: restored, workerExit: null } };
+  return { pass: { workerExit: null, snapshot, sha, failure: { status: "failed", detail: restored, workerExit: null } } };
  }
  await checkpointAcceptedTests(ctx, sha, testCommand, true);
  journal.recordEvent("reviewed", {
@@ -4349,7 +4359,12 @@ async function adoptBuiltWork(
   repo: map.repo,
   detail: `adopting ${sha.slice(0, 8)}${fix === undefined ? "" : ` as fix pass ${fix.round}`}: a previous run built and committed it, and it passes the supervisor's tests — no new worker session`,
  });
- return { workerExit: null, snapshot, sha, adopted: true };
+ return { pass: { workerExit: null, snapshot, sha, adopted: true } };
+}
+
+interface Adoption {
+ pass: PassResult | null;
+ failure?: string;
 }
 
 /** Whether HEAD is commits on top of `pushedHead` with no merge among them. */
