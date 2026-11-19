@@ -666,13 +666,9 @@ export async function createInstallationToken(jwt: string, installationId: numbe
 }
 
 /** The App's own view of one installation: the account it sits on, its app, and how far it reaches. */
-/** `selected` covers the repositories the App was installed on; `all` covers every repository it can see. */
-export type RepositorySelection = "all" | "selected";
-
 export interface AppInstallation {
  account: string;
  appId: number;
- repositorySelection: RepositorySelection;
  writePermissions: string[];
 }
 
@@ -686,14 +682,13 @@ export async function readAppInstallation(jwt: string, installationId: number, o
  const raw = await appBearerJson(jwt, `/app/installations/${installationId}`, label, options, { method: "GET" });
  const account = (raw?.account as Record<string, unknown> | null | undefined)?.login;
  const permissions = raw?.permissions;
- const selection = raw?.repository_selection;
- if (typeof account !== "string" || account.length === 0 || typeof raw?.app_id !== "number" || (selection !== "all" && selection !== "selected") || typeof permissions !== "object" || permissions === null || Array.isArray(permissions)) {
+ if (typeof account !== "string" || account.length === 0 || typeof raw?.app_id !== "number" || typeof permissions !== "object" || permissions === null || Array.isArray(permissions)) {
   throw new GitHubError(`${label}: invalid response`);
  }
  const writePermissions = Object.entries(permissions as Record<string, unknown>)
   .filter(([, level]) => level !== "read")
   .map(([name]) => name);
- return { account, appId: raw.app_id, repositorySelection: selection, writePermissions };
+ return { account, appId: raw.app_id, writePermissions };
 }
 
 export type CheckConclusion = "success" | "failure" | "neutral" | "cancelled" | "timed_out";
