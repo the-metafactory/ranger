@@ -16,6 +16,13 @@ provides:
     - name: ranger
       command: bun src/cli.ts
       description: Scout, walk and sweep orienteer maps; claim, run and resume work-graph nodes.
+  files:
+    - source: src/hooks/canonical-guard.hook.ts
+      target: ~/.claude/hooks/RangerCanonicalGuard.hook.ts
+  hooks:
+    - event: PreToolUse
+      command: ${PAI_DIR}/hooks/RangerCanonicalGuard.hook.ts
+      matcher: Bash
 
 depends_on:
   tools:
@@ -56,6 +63,8 @@ capabilities:
       - podman
       - osascript
   secrets: []
+  hooks:
+    - "PreToolUse"
 
 bundle:
   exclude:
