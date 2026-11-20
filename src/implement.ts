@@ -280,6 +280,11 @@ async function assertRemotePush(ctx: ImplementContext, sha: string): Promise<voi
  ctx.journal.assertGeneration(ctx.node.ref.id, ctx.map.repo, ctx.generation, "push remotely tested commit");
 }
 
+/** The `reviewed` event's head for a recorded round: its head, verdict and gating counts. */
+export function reviewedRoundDetail(round: number, verdict: Pick<ReviewVerdict, "commitId" | "verdict" | "blockers" | "majors">): string {
+ return `round ${round} @ ${verdict.commitId.slice(0, 8)}: ${verdict.verdict}, ${verdict.blockers} blocker(s), ${verdict.majors} major(s)`;
+}
+
 /** The review-round marker ranger writes into each review comment it posts. */
 export function reviewMarker(round: number, v: Pick<ReviewVerdict, "commitId" | "blockers" | "majors" | "nits"> & { settled?: number }, substrate?: string, carried?: string): string {
  const base = `<!-- ranger:review round=${round} sha=${v.commitId} blockers=${v.blockers} majors=${v.majors} nits=${v.nits}`;
@@ -1918,7 +1923,7 @@ async function runImplementFlow(ctx: ImplementContext): Promise<ImplementOutcome
    journal.recordEvent("reviewed", {
     nodeId,
     repo,
-    detail: `round ${round} @ ${verdict.commitId.slice(0, 8)}: ${verdict.verdict}, ${verdict.blockers} blocker(s), ${verdict.majors} major(s)${chosenOn}`,
+    detail: `${reviewedRoundDetail(round, verdict)}${chosenOn}`,
    });
    if (anchor !== undefined) {
     journal.recordEvent("reviewed", {
@@ -3423,7 +3428,7 @@ async function awaitHead(
 /** GitHub caps a comment at 65 536 characters; the marker always survives, first. */
 const COMMENT_BUDGET = 60_000;
 
-function reviewComment(
+export function reviewComment(
  round: number,
  verdict: ReviewVerdict,
  substrate?: SubstrateName,

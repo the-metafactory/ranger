@@ -51,7 +51,7 @@ import {
 import { runNode, runNodeRunOutcome, type RunNodeContext, type RunNodeOutcome } from "./worker.ts";
 import { trustCurrentGitState } from "./git-trust.ts";
 import { existingWorkerLog } from "./worker-log.ts";
-import { mergeGateNow } from "./merge-desk.ts";
+import { mergeGateNow, recordOperatorReview } from "./merge-desk.ts";
 import { walk } from "./walk.ts";
 import { emitTickRunFinished, emitNodeRunIfGenerated, type RunLedgerDeps } from "./run-ledger.ts";
 import { holdAwake } from "./awake.ts";
@@ -411,30 +411,59 @@ async function settleMergeability(config: RangerConfig, journal: Journal, map: R
  }
 }
 
+interface NodeChangeRequest {
+ config: RangerConfig;
+ journal: Journal;
+ map: RangerMapConfig;
+ prNumber: number;
+ token: string;
+ botIdentity: string;
+}
+
+async function withNodeChangeRequest(
+ nodeId: string,
+ selector: string,
+ configPath: string,
+ act: (cr: NodeChangeRequest) => Promise<{ ok: boolean; text: string }>,
+): Promise<{ ok: boolean; text: string }> {
+ const { config, journal } = loadCtx(configPath);
+ try {
+  const map = pickMap(config, selector);
+  const row = journal.getWorker(nodeId, map.repo);
+  if (row?.root !== map.root || row.prNumber === null) {
+   return { ok: false, text: `node ${nodeId} has no ${changeRequestNoun(map.repo)} recorded on ${mapKey(map)}` };
+  }
+  const { token, botIdentity } = await writeContext(config, map);
+  return await act({ config, journal, map, prNumber: row.prNumber, token, botIdentity });
+ } finally {
+  journal.close();
+ }
+}
+
+function runRecordReview(nodeId: string, selector: string, sageOutput: string, configPath: string): Promise<{ ok: boolean; text: string }> {
+ return withNodeChangeRequest(nodeId, selector, configPath, async ({ config, journal, map, prNumber, token, botIdentity }) => {
+  const outcome = await recordOperatorReview({ github: lanePort(config, map.repo), journal, map, nodeId, prNumber, sageOutput, token, botIdentity });
+  if ("refused" in outcome) return { ok: false, text: `not recorded: ${outcome.refused}` };
+  const r = outcome.recorded;
+  return { ok: true, text: `recorded round ${r.round} at ${r.sha.slice(0, 8)}: ${r.blockers} blocker(s), ${r.majors} major(s); \`ranger merge-gate ${nodeId} --map ${mapKey(map)} --sha ${r.sha}\` reads it` };
+ });
+}
+
 /**
  * Operator verb: the merge desk's gate for one node's PR, read live. Exits 0
  * only when the gate passes at exactly `sha`; otherwise it names the check
  * on stderr and exits 2. Reads only. `ranger serve` runs it before a
  * dashboard merge of an awaiting-merge row.
  */
-async function runMergeGate(nodeId: string, selector: string, sha: string, configPath: string): Promise<{ ok: boolean; text: string }> {
- const { config, journal } = loadCtx(configPath);
- try {
-  const map = pickMap(config, selector);
-  const row = journal.getWorker(nodeId, map.repo);
-  if (row === null || row.root !== map.root || row.prNumber === null) {
-   return { ok: false, text: `node ${nodeId} has no ${changeRequestNoun(map.repo)} recorded on ${mapKey(map)}` };
-  }
-  const { token, botIdentity } = await writeContext(config, map);
-  const gate = await mergeGateNow(lanePort(config, map.repo), map, row.prNumber, token, botIdentity);
+function runMergeGate(nodeId: string, selector: string, sha: string, configPath: string): Promise<{ ok: boolean; text: string }> {
+ return withNodeChangeRequest(nodeId, selector, configPath, async ({ config, map, prNumber, token, botIdentity }) => {
+  const gate = await mergeGateNow(lanePort(config, map.repo), map, prNumber, token, botIdentity);
   if (gate.status !== "pass") return { ok: false, text: `merge gate ${gate.status} (${gate.check}): ${gate.reason}` };
   if (gate.headSha !== sha) {
    return { ok: false, text: `the gate passes at ${gate.headSha.slice(0, 8)}, not at the confirmed head ${sha.slice(0, 8)}` };
   }
-  return { ok: true, text: JSON.stringify({ nodeId, pr: row.prNumber, gate }, null, 2) };
- } finally {
-  journal.close();
- }
+  return { ok: true, text: JSON.stringify({ nodeId, pr: prNumber, gate }, null, 2) };
+ });
 }
 
 /**
@@ -1171,6 +1200,33 @@ program
   } catch (error) {
    process.stderr.write(
     `ranger merge-gate: ${error instanceof Error ? error.message : String(error)}\n`,
+   );
+   process.exit(1);
+  }
+ });
+
+program
+ .command("record-review")
+ .description(
+  "Operator verb: record a sage review run outside ranger as ranger's next review round on one node's PR, so the merge gate reads it. --verdict is the saved stdout of `sage review <pr> --post --emit-verdict-block`, which ranger takes as the operator's attestation; exit 2, nothing posted, unless its verdict block names the PR's live head",
+ )
+ .argument("<id>", "node id")
+ .requiredOption("-m, --map <owner/name#root>", "map repo#root (repo alone only when unique)")
+ .requiredOption("--verdict <file>", "sage's saved stdout, or - for stdin")
+ .option("-c, --config <path>", "path to ranger.yaml (fallback: $RANGER_CONFIG, then ~/.config/ranger/ranger.yaml)")
+ .action(async (id: string, options: { map: string; verdict: string; config: string | undefined }) => {
+  try {
+   const configPath = resolveConfigPath(options.config, process.env, process.cwd());
+   const sageOutput = options.verdict === "-" ? await Bun.stdin.text() : await readFile(options.verdict, "utf8");
+   const result = await runRecordReview(id, options.map, sageOutput, configPath);
+   if (!result.ok) {
+    process.stderr.write(result.text + "\n");
+    process.exit(2);
+   }
+   process.stdout.write(result.text + "\n");
+  } catch (error) {
+   process.stderr.write(
+    `ranger record-review: ${error instanceof Error ? error.message : String(error)}\n`,
    );
    process.exit(1);
   }

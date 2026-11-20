@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { stringify } from "yaml";
 import { loadConfig } from "../src/config.ts";
 import { openJournal } from "../src/journal.ts";
-import { mergeGateNow, runMergeDesk } from "../src/merge-desk.ts";
+import { mergeGateNow, recordOperatorReview, runMergeDesk } from "../src/merge-desk.ts";
 import { ciFixMarker, ciRerunMarker, probeMarker, type ForgePort } from "../src/implement.ts";
 import type { IssueComment, ChangeRequest } from "../src/forge.ts";
 import type { CheckRun } from "../src/github.ts";
@@ -925,6 +925,61 @@ describe("mergeGateNow — the desk's gate, for a dashboard merge", () => {
    try {
     const gh = fakeGitHub({ comments: [...comments], ci: GREEN });
     expect(await mergeGateNow(gh.github, r.config.maps[0], 709, "t", BOT)).toMatchObject({ status: "fail", check });
+   } finally { r.close(); }
+  });
+ }
+});
+
+describe("an operator's sage review recorded as ranger's round", () => {
+ const sageOutput = (sha: string, majors = 0) => [
+  "## Sage code review — approved", "", "No findings. Sage approves.", "", "<!-- sage:reviewed-commit:" + sha + " -->", "",
+  "```json", JSON.stringify({ verdict: majors === 0 ? "approved" : "changes-requested", summary: "s", commit_id: sha, findings: { blockers: 0, majors, nits: 1 } }), "```",
+ ].join("\n");
+ function recording(head: string, comments: IssueComment[]) {
+  const gh = fakeGitHub({ head, comments, ci: GREEN });
+  const posted: string[] = [];
+  gh.github.postComment = async (_repo, _n, body) => { posted.push(body); comments.push({ id: 100 + posted.length, author: BOT, body }); return 100 + posted.length; };
+  return { gh, posted };
+ }
+
+ test("a review read at the live head becomes the next round, and the gate passes there", async () => {
+  const r = rig();
+  try {
+   const comments = [review(MOVED, 0, 0, 3)];
+   const { gh, posted } = recording(CERTIFIED, comments);
+   expect(await mergeGateNow(gh.github, r.config.maps[0], 709, "t", BOT)).toMatchObject({ status: "fail", check: "review-clean" });
+   const outcome = await recordOperatorReview({ github: gh.github, journal: r.journal, map: r.config.maps[0], nodeId: "96", prNumber: 709, sageOutput: sageOutput(CERTIFIED), token: "t", botIdentity: BOT });
+   expect(outcome).toEqual({ recorded: { round: 4, sha: CERTIFIED, blockers: 0, majors: 0 } });
+   expect(posted).toHaveLength(1);
+   expect(posted[0]).toStartWith(`<!-- ranger:review round=4 sha=${CERTIFIED} blockers=0 majors=0 nits=1`);
+   expect(await mergeGateNow(gh.github, r.config.maps[0], 709, "t", BOT)).toMatchObject({ status: "pass", headSha: CERTIFIED });
+   expect(r.events("reviewed").at(-1)?.detail).toBe(`round 4 @ ${CERTIFIED.slice(0, 8)}: approved, 0 blocker(s), 0 major(s), attested by the operator from sage's verdict block`);
+   expect(r.journal.getWorker("96", GAME)).toMatchObject({ reviewRound: 4, verdictSha: CERTIFIED, verdictBlockers: 0 });
+  } finally { r.close(); }
+ });
+
+ test("a recorded major still holds the gate", async () => {
+  const r = rig();
+  try {
+   const { gh } = recording(CERTIFIED, []);
+   expect(await recordOperatorReview({ github: gh.github, journal: r.journal, map: r.config.maps[0], nodeId: "96", prNumber: 709, sageOutput: sageOutput(CERTIFIED, 1), token: "t", botIdentity: BOT }))
+    .toEqual({ recorded: { round: 1, sha: CERTIFIED, blockers: 0, majors: 1 } });
+   expect(await mergeGateNow(gh.github, r.config.maps[0], 709, "t", BOT)).toMatchObject({ status: "fail", check: "review-clean" });
+  } finally { r.close(); }
+ });
+
+ for (const [why, output, refusal] of [
+  ["sage read another head", sageOutput(MOVED), `sage read ${MOVED.slice(0, 8)}, but PR #709's live head is ${CERTIFIED.slice(0, 8)}`],
+  ["the output has no verdict block", "## Sage code review — approved", "no ```json verdict block"],
+ ] as const) {
+  test(`refuses and posts nothing: ${why}`, async () => {
+   const r = rig();
+   try {
+    const { gh, posted } = recording(CERTIFIED, []);
+    const outcome = await recordOperatorReview({ github: gh.github, journal: r.journal, map: r.config.maps[0], nodeId: "96", prNumber: 709, sageOutput: output, token: "t", botIdentity: BOT });
+    expect("refused" in outcome ? outcome.refused : "").toContain(refusal);
+    expect(posted).toEqual([]);
+    expect(r.events("reviewed")).toEqual([]);
    } finally { r.close(); }
   });
  }
