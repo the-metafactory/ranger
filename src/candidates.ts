@@ -80,7 +80,7 @@ export function vsaClaimVerdict(
  const since = `created ${nodeCreatedAt.toISOString()}, on or after VSA.md was added ${vsaCreatedAt.toISOString()}`;
  return {
   refused: cited.length === 0
-   ? `${kind} node cites no ISC from VSA.md (${since})`
+   ? `${kind} node cites no ISC from VSA.md on a Serves: line (${since})`
    : `${kind} node cites ${cited.join(", ")}, not a criterion in VSA.md (${since})`,
  };
 }

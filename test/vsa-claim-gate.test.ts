@@ -61,7 +61,7 @@ describe("vsaClaimRefusal", () => {
  test("ISC-10 does not match a VSA that only has ISC-1", () => {
   const refusal = vsaClaimRefusal("Serves: ISC-10.", "task", AFTER, "- [ ] ISC-1: One.", ADDED);
   expect(refusal).toContain("ISC-10");
-  expect(vsaClaimRefusal("Serves XISC-1 and ISC-1x.", "task", AFTER, "- [ ] ISC-1: One.", ADDED)).toContain("cites no ISC");
+  expect(vsaClaimRefusal("Serves: XISC-1 and ISC-1x.", "task", AFTER, "- [ ] ISC-1: One.", ADDED)).toContain("cites no ISC");
  });
  test("an unknown node creation date refuses an implement node in a VSA repo", () => {
   expect(vsaClaimRefusal("no citation", "task", null, VSA, ADDED)).toContain("creation date");
