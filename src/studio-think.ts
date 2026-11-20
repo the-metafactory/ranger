@@ -91,7 +91,7 @@ export async function prepareStudio(job: RangerJobConfig, params: Record<string,
   const status = await git(dir, ["status", "--porcelain", "--untracked-files=all"]);
   const currentHead = await git(dir, ["rev-parse", "--verify", "HEAD"]);
   if (status.code !== 0 || status.stdout.trim() || currentHead.code !== 0 || currentHead.stdout.trim() !== boundHead) return deferred("Studio must have a committed HEAD and a clean working tree");
-  return { kind: "ready", dir, path, text, head: boundHead, policy: studioPolicy(front.areas, areas), params: input, policyStamp: JSON.stringify(areas), question: front.type === "question" };
+  return { kind: "ready", dir, path, text, head: boundHead, policy: studioPolicy(front.areas, areas), params: input, policyStamp: JSON.stringify(areas), question: front.type !== "topic" && front.type !== "making" };
  } catch (error) {
   return deferred(`Studio preparation deferred: ${error instanceof Error ? error.message : String(error)}`);
  }

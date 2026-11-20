@@ -442,6 +442,17 @@ function retype(r: ReturnType<typeof rig>, type: string, stand = "Carefully.") {
  r.git("add", "."); r.git("commit", "-qm", `${type} fixture`);
 }
 
+test("a thread whose type is missing or unknown is held to the single-line question rule", async () => {
+ for (const type of ["Question", "\"topic \""]) {
+  const r = rig();
+  retype(r, type);
+  const before = readFileSync(join(r.repo, "threads/alpha.md"), "utf8");
+  const result = await thinkWith(r, { note: "Reasoning.", stand: "First line.\n\nSecond line.", ideas: [] });
+  expect(result.status).toBe("failed");
+  expect(readFileSync(join(r.repo, "threads/alpha.md"), "utf8")).toBe(before);
+ }
+});
+
 for (const stand of ["First line.\n\nSecond line.", "First line.\r\nSecond line.", "First line.\u2028Second line."]) test(`a question refuses a multiline stand proposal ${JSON.stringify(stand)} and writes nothing`, async () => {
  const r = rig();
  const before = readFileSync(join(r.repo, "threads/alpha.md"), "utf8");
