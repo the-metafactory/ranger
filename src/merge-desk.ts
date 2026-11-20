@@ -21,6 +21,7 @@ import {
  recordedReviews,
  reviewAtHead,
  reviewComment,
+ reviewedRoundDetail,
  supersededNote,
  workerFixableCi,
 } from "./implement.ts";
@@ -299,8 +300,9 @@ export type OperatorReviewOutcome =
  * `sage review <pr> --post --emit-verdict-block`: its verdict block carries
  * the reviewed commit and the counts. Ranger posts the round marker under its
  * machine account, journals it and records it on the row, as it does for its
- * own round. Refused, with nothing posted, unless sage read the live head of
- * the open change request.
+ * own round. The block is the operator's attestation: ranger does not check
+ * that sage posted it. Refused, with nothing posted, unless the change request
+ * is open and the block names its live head.
  */
 export async function recordOperatorReview(args: {
  github: ForgePort;
@@ -331,7 +333,7 @@ export async function recordOperatorReview(args: {
  journal.recordEvent("reviewed", {
   nodeId,
   repo: map.repo,
-  detail: `round ${round} @ ${verdict.commitId.slice(0, 8)}: ${verdict.verdict}, ${verdict.blockers} blocker(s), ${verdict.majors} major(s), recorded from an operator's sage review`,
+  detail: `${reviewedRoundDetail(round, verdict)}, attested by the operator from sage's verdict block`,
  });
  journal.updateWorker(nodeId, map.repo, { reviewRound: round, verdictSha: verdict.commitId, verdictBlockers: verdict.blockers });
  return { recorded: { round, sha: verdict.commitId, blockers: verdict.blockers, majors: verdict.majors } };

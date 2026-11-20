@@ -93,7 +93,7 @@ A worker whose node needs a change that is merged on another repo's main but in 
 | `job` | Queues, runs, and lists scheduled jobs. |
 | `journal` | Shows the journal's workers, events, and health. |
 | `merge-gate <id>` | Checks one node's PR against the merge desk's gate. Exits 0 only when the gate passes. |
-| `record-review <id> --verdict <file>` | Records a sage review run outside ranger (the saved stdout of `sage review <pr> --post --emit-verdict-block`) as ranger's next review round, so `merge-gate` reads it. Refuses unless sage read the PR's live head. |
+| `record-review <id> --verdict <file>` | Records a sage review run outside ranger (the saved stdout of `sage review <pr> --post --emit-verdict-block`) as ranger's next review round, so `merge-gate` reads it. The file is the operator's attestation; ranger does not check that sage posted it. Refuses unless its verdict block names the PR's live head. |
 | `merge-desk` | Runs one map's merge desk now. |
 | `approve-node <id>` | Approves an `approve` node at the version its approval card shows. |
 | `build-now <id>` | Claims one walkable node and starts its worker now. |

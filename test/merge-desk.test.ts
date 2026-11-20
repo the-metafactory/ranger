@@ -953,7 +953,7 @@ describe("an operator's sage review recorded as ranger's round", () => {
    expect(posted).toHaveLength(1);
    expect(posted[0]).toStartWith(`<!-- ranger:review round=4 sha=${CERTIFIED} blockers=0 majors=0 nits=1`);
    expect(await mergeGateNow(gh.github, r.config.maps[0], 709, "t", BOT)).toMatchObject({ status: "pass", headSha: CERTIFIED });
-   expect(r.events("reviewed").at(-1)?.detail).toBe(`round 4 @ ${CERTIFIED.slice(0, 8)}: approved, 0 blocker(s), 0 major(s), recorded from an operator's sage review`);
+   expect(r.events("reviewed").at(-1)?.detail).toBe(`round 4 @ ${CERTIFIED.slice(0, 8)}: approved, 0 blocker(s), 0 major(s), attested by the operator from sage's verdict block`);
    expect(r.journal.getWorker("96", GAME)).toMatchObject({ reviewRound: 4, verdictSha: CERTIFIED, verdictBlockers: 0 });
   } finally { r.close(); }
  });

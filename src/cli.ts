@@ -1208,7 +1208,7 @@ program
 program
  .command("record-review")
  .description(
-  "Operator verb: record a sage review run outside ranger as ranger's next review round on one node's PR, so the merge gate reads it. --verdict is the saved stdout of `sage review <pr> --post --emit-verdict-block`; exit 2, nothing posted, unless sage read the PR's live head",
+  "Operator verb: record a sage review run outside ranger as ranger's next review round on one node's PR, so the merge gate reads it. --verdict is the saved stdout of `sage review <pr> --post --emit-verdict-block`, which ranger takes as the operator's attestation; exit 2, nothing posted, unless its verdict block names the PR's live head",
  )
  .argument("<id>", "node id")
  .requiredOption("-m, --map <owner/name#root>", "map repo#root (repo alone only when unique)")
