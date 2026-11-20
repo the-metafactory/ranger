@@ -10,6 +10,7 @@ import type { WorkerRow } from "./journal.ts";
 const ISC_CITATION = /\bISC-\d+(?:\.\d+)?\b/g;
 const ISC_CRITERION = /^\s*[-*]\s+\[[ xX]\]\s+(ISC-\d+(?:\.\d+)?)\b/gm;
 const ISC_EXEMPTION = /^ISC: none \((.*)\)[ \t]*$/gm;
+const SERVES_LINE = /^Serves:.*$/gm;
 
 function criteria(vsaText: string): Set<string> {
  return new Set([...vsaText.matchAll(ISC_CRITERION)].map(m => m[1]));
@@ -45,6 +46,10 @@ export function iscLine(cites: readonly string[], none?: string): string | null 
  return none === undefined || none.trim() === "" ? null : `ISC: none (${none})`;
 }
 
+function servesLines(body: string | undefined): string {
+ return ((body ?? "").match(SERVES_LINE) ?? []).join("\n");
+}
+
 export type VsaClaimVerdict = { refused: string } | { waived: string } | null;
 
 /**
@@ -52,7 +57,8 @@ export type VsaClaimVerdict = { refused: string } | { waived: string } | null;
  * A repo without `VSA.md` (`vsaText` null) allows every claim. Only
  * implement kinds need a citation, and only nodes created at or after the
  * instant `VSA.md` was added to the base; older nodes keep flowing. A cited
- * ID counts only when it is a criterion line in that `VSA.md`. A node that
+ * ID counts only on a `Serves:` line and only when it is a criterion line in
+ * that `VSA.md`; an ISC named in prose cites nothing. A node that
  * cites none but carries `ISC: none (<reason>)` is waived with that reason.
  */
 export function vsaClaimVerdict(
@@ -66,10 +72,11 @@ export function vsaClaimVerdict(
  if (vsaCreatedAt === null || Number.isNaN(vsaCreatedAt.getTime())) return { refused: "VSA.md creation date unknown" };
  if (nodeCreatedAt === null || Number.isNaN(nodeCreatedAt.getTime())) return { refused: "node creation date unknown" };
  if (nodeCreatedAt.getTime() < vsaCreatedAt.getTime()) return null;
- if (criterionCitations(body, vsaText).length > 0) return null;
+ const serves = servesLines(body);
+ if (criterionCitations(serves, vsaText).length > 0) return null;
  const waived = iscExemption(body);
  if (waived !== null) return { waived };
- const cited = citedIds(body);
+ const cited = citedIds(serves);
  const since = `created ${nodeCreatedAt.toISOString()}, on or after VSA.md was added ${vsaCreatedAt.toISOString()}`;
  return {
   refused: cited.length === 0
