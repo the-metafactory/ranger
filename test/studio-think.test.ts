@@ -6,7 +6,7 @@ import { stringify } from "yaml";
 import { loadConfig } from "../src/config.ts";
 import { enqueueJob, jobPass, runJob } from "../src/jobs.ts";
 import { openJournal } from "../src/journal.ts";
-import { appendStudioNotes, finishStudio, prepareStudio, studioCommand, studioEnvironment, studioPolicy, studioSubstrates } from "../src/studio-think.ts";
+import { appendStudioNotes, finishStudio, prepareStudio, studioCommand, studioEnvironment, studioPolicy, studioPrompt, studioSubstrates } from "../src/studio-think.ts";
 
 const cleanup: (() => void)[] = [];
 afterEach(() => { for (const close of cleanup.splice(0).reverse()) close(); });
@@ -430,4 +430,84 @@ test("parking a thread defers queued automatic work but permits an explicit mode
  r.git("add",".");r.git("commit","-qm","Parked fixture");
  expect(await prepareStudio(r.job,r.params)).toMatchObject({kind:"deferred",reason:"thread is parked; automatic thinking deferred"});
  expect(await prepareStudio(r.job,{...r.params,mode:"grill"})).toMatchObject({kind:"ready"});
+});
+
+async function thinkWith(r: ReturnType<typeof rig>, answer: Record<string, unknown>) {
+ const id = await reserve(r);
+ return runJob(id, { ...r, now: () => now, substrate: "claude", runSession: async () => ({ code: 0, stdout: JSON.stringify(answer), stderr: "" }) });
+}
+
+function retype(r: ReturnType<typeof rig>, type: string | null, stand = "Carefully.") {
+ writeFileSync(join(r.repo, "threads/alpha.md"), thread().replace("type: question\n", type === null ? "" : `type: ${type}\n`).replace("Carefully.", stand));
+ r.git("add", "."); r.git("commit", "-qm", `${type} fixture`);
+}
+
+test("a thread whose type is missing or unknown is held to the single-line question rule", async () => {
+ for (const type of [null, "Question", "\"topic \""]) {
+  const r = rig();
+  retype(r, type);
+  const before = readFileSync(join(r.repo, "threads/alpha.md"), "utf8");
+  const result = await thinkWith(r, { note: "Reasoning.", stand: "First line.\n\nSecond line.", ideas: [] });
+  expect(result.status).toBe("failed");
+  expect(readFileSync(result.log ?? "", "utf8")).toContain("A question's stand must be a single line");
+  expect(readFileSync(join(r.repo, "threads/alpha.md"), "utf8")).toBe(before);
+ }
+});
+
+for (const stand of ["First line.\n\nSecond line.", "First line.\r\nSecond line.", "First line.\u2028Second line."]) test(`a question refuses a multiline stand proposal ${JSON.stringify(stand)} and writes nothing`, async () => {
+ const r = rig();
+ const before = readFileSync(join(r.repo, "threads/alpha.md"), "utf8");
+ const result = await thinkWith(r, { note: "Full reasoning.", stand, ideas: [] });
+ expect(result.status).toBe("failed");
+ expect(readFileSync(result.log ?? "", "utf8")).toContain("A question's stand must be a single line");
+ expect(readFileSync(join(r.repo, "threads/alpha.md"), "utf8")).toBe(before);
+ expect(r.git("rev-list", "--count", "HEAD")).toBe("1");
+ expect(r.git("status", "--porcelain")).toBe("");
+});
+
+test("a question thinks without a stand and keeps the multiline reasoning in its note", async () => {
+ const r = rig();
+ const result = await thinkWith(r, { note: "First reason.\n\nSecond reason.", ideas: [] });
+ expect(result.status).toBe("succeeded");
+ const text = readFileSync(join(r.repo, "threads/alpha.md"), "utf8");
+ expect(text).toContain("First reason.\n\nSecond reason.");
+ expect(text).not.toContain("kind: stand");
+ expect(text).toContain("## Where I stand\n\nCarefully.");
+});
+
+test("a question accepts a single-line stand proposal without adopting it", async () => {
+ const r = rig();
+ const result = await thinkWith(r, { note: "Reasoning.", stand: "Test through git.\n", ideas: [] });
+ expect(result.status).toBe("succeeded");
+ const text = readFileSync(join(r.repo, "threads/alpha.md"), "utf8");
+ expect(text).toContain("kind: stand\nstatus: open\n\nTest through git.\n");
+ expect(text).toContain("## Where I stand\n\nCarefully.");
+});
+
+test("a legacy multiline question stand stays unchanged when a note is added", async () => {
+ const r = rig();
+ const legacy = "Legacy answer.\n\nFull reasoning stays here.";
+ retype(r, "question", legacy);
+ const result = await thinkWith(r, { note: "A new thought.", ideas: [] });
+ expect(result.status).toBe("succeeded");
+ expect(readFileSync(join(r.repo, "threads/alpha.md"), "utf8")).toContain(`## Where I stand\n\n${legacy}\n\n## Material`);
+});
+
+for (const type of ["topic", "making"]) test(`a ${type} thread still accepts a multiline stand proposal`, async () => {
+ const r = rig();
+ retype(r, type);
+ const result = await thinkWith(r, { note: "Reasoning.", stand: "First line.\n\nSecond line.", ideas: [] });
+ expect(result.status).toBe("succeeded");
+ expect(readFileSync(join(r.repo, "threads/alpha.md"), "utf8")).toContain("kind: stand\nstatus: open\n\nFirst line.\n\nSecond line.\n");
+});
+
+test("only a question's prompt asks for a single-line stand", async () => {
+ const r = rig();
+ const question = await prepareStudio(r.job, r.params);
+ if (question.kind !== "ready") throw new Error(question.reason);
+ expect(studioPrompt(question)).toContain("single line");
+ retype(r, "topic");
+ const topic = await prepareStudio(r.job, r.params);
+ if (topic.kind !== "ready") throw new Error(topic.reason);
+ expect(studioPrompt(topic)).not.toContain("single line");
 });
