@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stringify } from "yaml";
@@ -49,19 +49,19 @@ describe("vsaClaimRefusal", () => {
   expect(vsaClaimRefusal(undefined, "build", AFTER, VSA, ADDED)).toContain("cites no ISC");
  });
  test("a cited criterion from VSA.md allows the claim", () => {
-  expect(vsaClaimRefusal("Serves ISC-2.", "task", AFTER, VSA, ADDED)).toBeNull();
-  expect(vsaClaimRefusal("Serves ISC-3.1 and ISC-99.", "build", AFTER, VSA, ADDED)).toBeNull();
+  expect(vsaClaimRefusal("Serves: ISC-2.", "task", AFTER, VSA, ADDED)).toBeNull();
+  expect(vsaClaimRefusal("Serves: ISC-3.1 and ISC-99.", "build", AFTER, VSA, ADDED)).toBeNull();
  });
  test("only unknown ISC IDs refuse and name them", () => {
-  const refusal = vsaClaimRefusal("Serves ISC-9 and ISC-7.", "task", AFTER, VSA, ADDED);
+  const refusal = vsaClaimRefusal("Serves: ISC-9 and ISC-7.", "task", AFTER, VSA, ADDED);
   expect(refusal).toContain("ISC-9");
   expect(refusal).toContain("ISC-7");
   expect(refusal).toContain("not a criterion");
  });
  test("ISC-10 does not match a VSA that only has ISC-1", () => {
-  const refusal = vsaClaimRefusal("Serves ISC-10.", "task", AFTER, "- [ ] ISC-1: One.", ADDED);
+  const refusal = vsaClaimRefusal("Serves: ISC-10.", "task", AFTER, "- [ ] ISC-1: One.", ADDED);
   expect(refusal).toContain("ISC-10");
-  expect(vsaClaimRefusal("Serves XISC-1 and ISC-1x.", "task", AFTER, "- [ ] ISC-1: One.", ADDED)).toContain("cites no ISC");
+  expect(vsaClaimRefusal("Serves: XISC-1 and ISC-1x.", "task", AFTER, "- [ ] ISC-1: One.", ADDED)).toContain("cites no ISC");
  });
  test("an unknown node creation date refuses an implement node in a VSA repo", () => {
   expect(vsaClaimRefusal("no citation", "task", null, VSA, ADDED)).toContain("creation date");
@@ -90,6 +90,24 @@ describe("the ISC exemption line", () => {
   expect(iscLine([], "fix-base: main is broken")).toBe("ISC: none (fix-base: main is broken)");
   expect(iscLine([])).toBeNull();
   expect(criterionCitations("ISC-3.1, ISC-7, ISC-2 and ISC-3.1 again", VSA)).toEqual(["ISC-3.1", "ISC-2"]);
+ });
+});
+
+describe("only the Serves: line cites", () => {
+ const VSA_WITH_ISC_9 = `${VSA}\n- [ ] ISC-9: The claim gate refuses uncited nodes.`;
+ test("threva #197 names ISC-9 in its prose and has no Serves: line, so it is refused", () => {
+  const body = readFileSync(join(import.meta.dir, "fixtures/threva-197-body.md"), "utf8");
+  expect(vsaClaimRefusal(body, "build", AFTER, VSA_WITH_ISC_9, ADDED)).toContain("cites no ISC");
+ });
+ test("an ISC named in prose beside a Serves: line does not count", () => {
+  expect(vsaClaimRefusal("Builds on ISC-2.\n\nServes: ISC-42.", "task", AFTER, VSA, ADDED)).toContain("ISC-42, not a criterion");
+ });
+ test("the Serves: line counts anywhere in the body, with or without a gloss", () => {
+  expect(vsaClaimRefusal("## Deliverable\n\nText.\n\nServes: ISC-2.", "task", AFTER, VSA, ADDED)).toBeNull();
+  expect(vsaClaimRefusal("Serves: ISC-2 (VSA.md: ranger refuses uncited claims).", "task", AFTER, VSA, ADDED)).toBeNull();
+ });
+ test("a Serves: that does not start its line does not count", () => {
+  expect(vsaClaimRefusal("This node Serves: ISC-2.", "task", AFTER, VSA, ADDED)).toContain("cites no ISC");
  });
 });
 
@@ -201,7 +219,7 @@ describe("claimNode VSA gate", () => {
 
  test("a new node citing a known ISC is claimed", async () => {
   const announced: string[] = [];
-  expect(await claim("Serves ISC-2.", AFTER, announced)).toMatchObject({ claimed: true });
+  expect(await claim("Serves: ISC-2.", AFTER, announced)).toMatchObject({ claimed: true });
   expect(announced).toEqual(["30"]);
  });
 
@@ -242,7 +260,7 @@ describe("claimNode VSA gate", () => {
  test("a node citing a criterion only on the remote's VSA.md is claimed after the gate fetches the base", async () => {
   await pushVsaFromElsewhere(VSA_WITH_ISC_20);
   const announced: string[] = [];
-  expect(await claim("Serves ISC-20.", AFTER, announced)).toMatchObject({ claimed: true });
+  expect(await claim("Serves: ISC-20.", AFTER, announced)).toMatchObject({ claimed: true });
   expect(announced).toEqual(["30"]);
   expect(journal.listEvents(repo, 50, "30").filter(e => e.kind === "refused")).toHaveLength(0);
  });
@@ -250,7 +268,7 @@ describe("claimNode VSA gate", () => {
  test("a node citing a criterion absent on the remote too is still refused and journaled after the fetch", async () => {
   await pushVsaFromElsewhere(VSA_WITH_ISC_20);
   const announced: string[] = [];
-  const outcome = await claim("Serves ISC-21.", AFTER, announced);
+  const outcome = await claim("Serves: ISC-21.", AFTER, announced);
   expect(outcome).toMatchObject({ claimed: false, error: expect.stringContaining("ISC-21, not a criterion") });
   expect(announced).toEqual([]);
   const refused = journal.listEvents(repo, 50, "30").filter(e => e.kind === "refused");
@@ -261,7 +279,7 @@ describe("claimNode VSA gate", () => {
  test("a failed fetch keeps the refusal and names the fetch error", async () => {
   rmSync(join(dir, "origin.git"), { recursive: true, force: true });
   const announced: string[] = [];
-  const outcome = await claim("Serves ISC-20.", AFTER, announced);
+  const outcome = await claim("Serves: ISC-20.", AFTER, announced);
   if (outcome.claimed) throw new Error("claimed despite a failed fetch");
   expect(outcome.error).toContain("ISC-20, not a criterion");
   expect(outcome.error).toContain("fetch of origin/main failed");
@@ -348,7 +366,7 @@ describe("walk VSA gate", () => {
  }
 
  test("a refused head does not block the implement lane: the next implement candidate is claimed in the same tick", async () => {
-  frontier([{ id: "30", body: "Build the thing." }, { id: "31", body: "Serves ISC-2." }, { id: "32", body: "Serves ISC-2." }]);
+  frontier([{ id: "30", body: "Build the thing." }, { id: "31", body: "Serves: ISC-2." }, { id: "32", body: "Serves: ISC-2." }]);
   const reads: string[] = [];
   const result = await tick({ 30: AFTER, 31: AFTER, 32: AFTER }, reads);
   expect(result.maps[0].claimed).toEqual(["31"]);
@@ -360,8 +378,8 @@ describe("walk VSA gate", () => {
  test("the replanned head is held like the first plan's: with briefs unverified, a build node behind a refused head is not claimed", async () => {
   frontier([
    { id: "30", body: "Build the thing." },
-   { id: "31", body: "Serves ISC-2.", kind: "build" },
-   { id: "32", body: "Serves ISC-2." },
+   { id: "31", body: "Serves: ISC-2.", kind: "build" },
+   { id: "32", body: "Serves: ISC-2." },
   ]);
   env.FAKE_SOMA_AUDIT_FAIL = "1";
   const reads: string[] = [];
@@ -373,7 +391,7 @@ describe("walk VSA gate", () => {
  });
 
  test("a vetoed node replanned behind a refused head is reported and not claimed", async () => {
-  frontier([{ id: "30", body: "Build the thing." }, { id: "31", body: "Serves ISC-2." }, { id: "32", body: "Serves ISC-2." }]);
+  frontier([{ id: "30", body: "Build the thing." }, { id: "31", body: "Serves: ISC-2." }, { id: "32", body: "Serves: ISC-2." }]);
   journal.recordVeto({ repo, nodeId: "31", root: 1, commentId: "c-31" });
   const reads: string[] = [];
   const result = await tick({ 30: AFTER, 31: AFTER, 32: AFTER }, reads);
