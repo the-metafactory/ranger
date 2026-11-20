@@ -3423,7 +3423,7 @@ async function awaitHead(
 /** GitHub caps a comment at 65 536 characters; the marker always survives, first. */
 const COMMENT_BUDGET = 60_000;
 
-function reviewComment(
+export function reviewComment(
  round: number,
  verdict: ReviewVerdict,
  substrate?: SubstrateName,

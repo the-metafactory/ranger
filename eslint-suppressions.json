@@ -88,9 +88,6 @@
     "@typescript-eslint/non-nullable-type-assertion-style": {
       "count": 1
     },
-    "@typescript-eslint/prefer-optional-chain": {
-      "count": 1
-    },
     "@typescript-eslint/require-await": {
       "count": 1
     },

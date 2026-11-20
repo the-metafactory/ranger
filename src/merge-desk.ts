@@ -20,6 +20,7 @@ import {
  recordedProbes,
  recordedReviews,
  reviewAtHead,
+ reviewComment,
  supersededNote,
  workerFixableCi,
 } from "./implement.ts";
@@ -34,6 +35,7 @@ import { changeRequestLabel, changeRequestNoun, forgeName } from "./forge-text.t
 import { closingKeywordRefusal, findClosingKeyword, hasCommit, headSha as worktreeHead, isAncestor } from "./git-ops.ts";
 import { recordedRebaseFrom } from "./worktree-head.ts";
 import { squashTitle } from "./github.ts";
+import { parseVerdictBlock, ReviewError } from "./review.ts";
 
 /**
  * The merge desk (design §4/§5, #23): each tick, every implement-lane row
@@ -285,6 +287,54 @@ export async function mergeGateNow(
  if (pr.state !== "open") return evaluateMergeGate(gateInput(map, pr, { state: "pending", reason: "not read" }));
  const { last, probe } = headEvidence(await github.listComments(map.repo, prNumber, token), pr.headSha, botIdentity);
  return evaluateMergeGate(gateInput(map, pr, await github.ciVerdictFor(map.repo, pr.headSha, token, "merge", map.advisoryChecks), last, probe));
+}
+
+export type OperatorReviewOutcome =
+ | { recorded: { round: number; sha: string; blockers: number; majors: number } }
+ | { refused: string };
+
+/**
+ * Record a sage review the operator ran outside ranger as ranger's next
+ * review round, so the merge gate reads it. `sageOutput` is the stdout of
+ * `sage review <pr> --post --emit-verdict-block`: its verdict block carries
+ * the reviewed commit and the counts. Ranger posts the round marker under its
+ * machine account, journals it and records it on the row, as it does for its
+ * own round. Refused, with nothing posted, unless sage read the live head of
+ * the open change request.
+ */
+export async function recordOperatorReview(args: {
+ github: ForgePort;
+ journal: Journal;
+ map: RangerMapConfig;
+ nodeId: string;
+ prNumber: number;
+ sageOutput: string;
+ token: string;
+ botIdentity: string;
+}): Promise<OperatorReviewOutcome> {
+ const { github, journal, map, nodeId, prNumber, token } = args;
+ let verdict;
+ try {
+  verdict = parseVerdictBlock(args.sageOutput);
+ } catch (error) {
+  if (error instanceof ReviewError) return { refused: error.message };
+  throw error;
+ }
+ const cr = changeRequestLabel(map.repo, prNumber);
+ const pr = await github.getPr(map.repo, prNumber, token);
+ if (pr.state !== "open") return { refused: `${cr} is ${pr.state}` };
+ if (verdict.commitId !== pr.headSha) {
+  return { refused: `sage read ${verdict.commitId.slice(0, 8)}, but ${cr}'s live head is ${pr.headSha.slice(0, 8)}` };
+ }
+ const round = (recordedReviews(await github.listComments(map.repo, prNumber, token), args.botIdentity).at(-1)?.round ?? 0) + 1;
+ await github.postComment(map.repo, prNumber, reviewComment(round, verdict), token);
+ journal.recordEvent("reviewed", {
+  nodeId,
+  repo: map.repo,
+  detail: `round ${round} @ ${verdict.commitId.slice(0, 8)}: ${verdict.verdict}, ${verdict.blockers} blocker(s), ${verdict.majors} major(s), recorded from an operator's sage review`,
+ });
+ journal.updateWorker(nodeId, map.repo, { reviewRound: round, verdictSha: verdict.commitId, verdictBlockers: verdict.blockers });
+ return { recorded: { round, sha: verdict.commitId, blockers: verdict.blockers, majors: verdict.majors } };
 }
 
 /**
