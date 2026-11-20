@@ -437,18 +437,19 @@ async function thinkWith(r: ReturnType<typeof rig>, answer: Record<string, unkno
  return runJob(id, { ...r, now: () => now, substrate: "claude", runSession: async () => ({ code: 0, stdout: JSON.stringify(answer), stderr: "" }) });
 }
 
-function retype(r: ReturnType<typeof rig>, type: string, stand = "Carefully.") {
- writeFileSync(join(r.repo, "threads/alpha.md"), thread().replace("type: question", `type: ${type}`).replace("Carefully.", stand));
+function retype(r: ReturnType<typeof rig>, type: string | null, stand = "Carefully.") {
+ writeFileSync(join(r.repo, "threads/alpha.md"), thread().replace("type: question\n", type === null ? "" : `type: ${type}\n`).replace("Carefully.", stand));
  r.git("add", "."); r.git("commit", "-qm", `${type} fixture`);
 }
 
 test("a thread whose type is missing or unknown is held to the single-line question rule", async () => {
- for (const type of ["Question", "\"topic \""]) {
+ for (const type of [null, "Question", "\"topic \""]) {
   const r = rig();
   retype(r, type);
   const before = readFileSync(join(r.repo, "threads/alpha.md"), "utf8");
   const result = await thinkWith(r, { note: "Reasoning.", stand: "First line.\n\nSecond line.", ideas: [] });
   expect(result.status).toBe("failed");
+  expect(readFileSync(result.log ?? "", "utf8")).toContain("A question's stand must be a single line");
   expect(readFileSync(join(r.repo, "threads/alpha.md"), "utf8")).toBe(before);
  }
 });
