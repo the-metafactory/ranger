@@ -6,7 +6,7 @@ import { ParkSignal } from "./signals.ts";
 import { assertNoClosingKeywords, commitsAhead, dirtyFiles, fetchBranch, fetchRemoteBranch, gitCredential, hasCommit, headSha, isAncestor, safeGit, vettedPush } from "./git-ops.ts";
 import { recordKnownGood, trustedSnapshot } from "./git-trust.ts";
 import { mapKey } from "./maps.ts";
-import { forgeName } from "./forge-text.ts";
+import { changeRequestHeadRef } from "./forge-text.ts";
 import { parseForgeRef } from "./forge-ref.ts";
 import { assertResearchFindingsOnly } from "./research-ci.ts";
 
@@ -181,10 +181,6 @@ async function progressPushPolicy(ctx: ProgressContext, sha: string): Promise<vo
  const checkedOut = await safeGit(["symbolic-ref", "--short", "HEAD"], { cwd: ctx.worktree, timeoutMs: 10_000 });
  if (checkedOut.code !== 0 || checkedOut.stdout.trim() !== ctx.branch) throw new ProgressConflict(`research worktree is not on ${ctx.branch}; remote preservation refused`);
  await assertResearchFindingsOnly(ctx.canonical, base, sha);
-}
-
-function changeRequestHeadRef(repo: string, iid: number): string {
- return forgeName(repo) === "GitHub" ? `refs/pull/${iid}/head` : `refs/merge-requests/${iid}/head`;
 }
 
 async function mergedHeadContains(ctx: ProgressContext, pr: ChangeRequest, here: string): Promise<boolean> {

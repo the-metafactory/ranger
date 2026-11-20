@@ -38,6 +38,11 @@ export function changeRequestLabel(repo: Repo, iid: number | string): string {
  return `${changeRequestNoun(repo)} ${changeRequestRef(repo, iid)}`;
 }
 
+/** The git ref a forge keeps for a change request's head, which outlives its deleted branch. */
+export function changeRequestHeadRef(repo: Repo, iid: number | string): string {
+ return refOf(repo).forge === "github" ? `refs/pull/${iid}/head` : `refs/merge-requests/${iid}/head`;
+}
+
 export function changeRequestUrl(repo: Repo, iid: number | string, webUrl?: string): string {
  const ref = refOf(repo);
  return prefer(webUrl, () => ref.forge === "github" ? `${base(ref)}/pull/${iid}` : `${base(ref)}/-/merge_requests/${iid}`);
