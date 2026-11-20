@@ -6,6 +6,7 @@ import { ParkSignal } from "./signals.ts";
 import { assertNoClosingKeywords, commitsAhead, dirtyFiles, fetchBranch, fetchRemoteBranch, gitCredential, hasCommit, headSha, isAncestor, safeGit, vettedPush } from "./git-ops.ts";
 import { recordKnownGood, trustedSnapshot } from "./git-trust.ts";
 import { mapKey } from "./maps.ts";
+import { changeRequestHeadRef } from "./forge-text.ts";
 import { parseForgeRef } from "./forge-ref.ts";
 import { assertResearchFindingsOnly } from "./research-ci.ts";
 
@@ -182,6 +183,20 @@ async function progressPushPolicy(ctx: ProgressContext, sha: string): Promise<vo
  await assertResearchFindingsOnly(ctx.canonical, base, sha);
 }
 
+async function mergedHeadContains(ctx: ProgressContext, pr: ChangeRequest, here: string): Promise<boolean> {
+ if (pr.state !== "merged") return false;
+ try {
+  if (!(await hasCommit(ctx.worktree, pr.headSha))) {
+   await fetchBranch(ctx.canonical, changeRequestHeadRef(ctx.map.repo, pr.iid), gitCredential(ctx.map.repo, ctx.token));
+   if (!(await hasCommit(ctx.worktree, pr.headSha))) return false;
+  }
+  return await isAncestor(ctx.worktree, here, pr.headSha);
+ } catch (error) {
+  if (error instanceof FencedError) throw error;
+  return false;
+ }
+}
+
 async function mergedResultContains(ctx: ProgressContext, pr: ChangeRequest, here: string): Promise<boolean> {
  const merged = pr.mergeCommitSha ?? null;
  if (pr.state !== "merged" || merged === null) return false;
@@ -208,6 +223,7 @@ export async function preserveUnmergedClosure(ctx: ProgressContext, pr: ChangeRe
   throw new ProgressConflict(`checkpoint ${saved.sha} is missing from worktree ${here}; reconcile ${saved.worktree} before closure cleanup`);
  }
  if (here === pr.headSha || await isAncestor(ctx.worktree, here, `origin/${ctx.map.base}`)) return;
+ if (await mergedHeadContains(ctx, pr, here)) return;
  if (await mergedResultContains(ctx, pr, here)) return;
  const failure = await preserveNodeProgress(ctx);
  throw new ProgressConflict(`merged PR ${pr.iid} covers ${pr.headSha}, but worktree ${here} contains additional committed progress; reconcile ${ctx.worktree} before closing${failure === null ? `; preserved at ${here} on origin/${ctx.branch}` : `; ${failure}`}`);

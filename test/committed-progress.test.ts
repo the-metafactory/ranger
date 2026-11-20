@@ -230,6 +230,30 @@ test("a squash-merged PR that already holds every worktree change closes without
  expect(r.journal.listNodeEvents("acme/widgets", "20").some(event => event.kind === "progress-preserved")).toBe(false);
 });
 
+test("a squash-merged PR whose head builds on the worktree head closes, even when later commits rewrote its lines", async () => {
+ const r = await rig({}); rigs.push(r);
+ expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");
+ const ctx = context(r);
+ const here = await git(ctx.worktree, ["rev-parse", "HEAD"]);
+ const operator = mkdtempSync(join(tmpdir(), "ranger-operator-"));
+ let prHead: string;
+ try {
+  const op = gitIn(operator);
+  await op(["clone", "--branch", ctx.branch, r.origin, "."]);
+  writeFileSync(join(operator, "src/feature.ts"), "export const feature = \"rewritten by the operator\";\n");
+  await op(["commit", "-qam", "operator rework on top of the worker's commit"]);
+  await op(["push", "origin", `HEAD:refs/heads/${ctx.branch}`, "HEAD:refs/pull/1/head"]);
+  prHead = await op(["rev-parse", "HEAD"]);
+ } finally { rmSync(operator, { recursive: true, force: true }); }
+ const squash = await squashMerge(r, ctx.branch);
+ await markSquashMerged(r, squash);
+ const pr = { ...await r.github.getPr("acme/widgets", 1), headSha: prHead };
+ expect((await runCmd("git", ["cat-file", "-e", `${prHead}^{commit}`], { cwd: ctx.worktree })).code).not.toBe(0);
+ await preserveUnmergedClosure(ctx, pr);
+ expect(await git(ctx.worktree, ["rev-parse", "HEAD"])).toBe(here);
+ expect(r.journal.listNodeEvents("acme/widgets", "20").some(event => event.kind === "progress-preserved")).toBe(false);
+});
+
 test("a squash-merged PR that lacks a worktree change still parks on the preserved progress", async () => {
  const r = await rig({}); rigs.push(r);
  expect((await runNode("20", r.ctx)).status).toBe("awaiting-merge");

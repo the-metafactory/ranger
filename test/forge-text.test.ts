@@ -6,6 +6,7 @@ import { stringify } from "yaml";
 import { loadConfig } from "../src/config.ts";
 import type { ChangeRequest, CiVerdict, IssueComment } from "../src/forge.ts";
 import {
+ changeRequestHeadRef,
  changeRequestLabel,
  changeRequestNoun,
  changeRequestRef,
@@ -635,6 +636,7 @@ describe("node #129 — the forge-text module", () => {
   expect([forgeName(GITHUB), changeRequestNoun(GITHUB), changeRequestRef(GITHUB, 7), changeRequestLabel(GITHUB, 7)])
    .toEqual(["GitHub", "PR", "#7", "PR #7"]);
   expect(changeRequestUrl(GITHUB, 7)).toBe("https://github.com/acme/widgets/pull/7");
+  expect(changeRequestHeadRef(GITHUB, 7)).toBe("refs/pull/7/head");
   expect(nodeUrl(GITHUB, "129")).toBe("https://github.com/acme/widgets/issues/129");
   expect(ciRunUrl(GITHUB, 901)).toBe("https://github.com/acme/widgets/runs/901");
   expect(nodeCommentUrl(GITHUB, "https://github.com/acme/widgets/issues/129", 5)).toBe("https://github.com/acme/widgets/issues/129#issuecomment-5");
@@ -649,6 +651,7 @@ describe("node #129 — the forge-text module", () => {
   expect([forgeName(GITLAB), changeRequestNoun(GITLAB), changeRequestRef(GITLAB, 7), changeRequestLabel(GITLAB, 7)])
    .toEqual(["GitLab", "MR", "!7", "MR !7"]);
   expect(changeRequestUrl(GITLAB, 7)).toBe(`${GL}/-/merge_requests/7`);
+  expect(changeRequestHeadRef(GITLAB, 7)).toBe("refs/merge-requests/7/head");
   expect(nodeUrl(GITLAB, "129")).toBe(`${GL}/-/issues/129`);
   expect(ciRunUrl(GITLAB, 901)).toBe(`${GL}/-/pipelines/901`);
   expect(nodeCommentUrl(GITLAB, `${GL}/-/issues/129`, 5)).toBe(`${GL}/-/issues/129#note_5`);
