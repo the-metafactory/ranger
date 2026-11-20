@@ -1571,8 +1571,8 @@ async function runImplementFlow(ctx: ImplementContext): Promise<ImplementOutcome
   // Before the install, so it installs what the moved base declares.
   const caughtUp = await prepareWorktree(ctx, { at: "no-pr", testCommand });
   if (caughtUp?.failure !== undefined) return caughtUp.failure;
-  const installed = await installDependencies(ctx, "install");
-  if (installed !== undefined) return { status: "failed", detail: installed, workerExit: caughtUp?.workerExit ?? null };
+  const installFailure = await installDependencies(ctx, "install");
+  if (installFailure !== undefined) return { status: "failed", detail: installFailure, workerExit: caughtUp?.workerExit ?? null };
   // Work an earlier run built and committed, but never pushed, is adopted
   // when it passes the supervisor's checks (#691: its tests failed under
   // load; a fresh worker would find nothing to commit and fail again).
@@ -2451,8 +2451,8 @@ async function mergeBaseBeforeTests(ctx: ImplementContext, budgetLeft: boolean):
  const merged = await machineMergeBase(ctx, { why: "the commits on this head wait on the supervisor's tests", then: "the tests run on the merge", baseSha, behind });
  if (!merged) return {};
  const stale: StaleBase = { behind, limit: 0 };
- const installed = await installDependencies(ctx, "base merge before the tests: install", "after the base merge");
- return installed === undefined ? { merged: stale } : { merged: stale, failure: installed };
+ const installFailure = await installDependencies(ctx, "base merge before the tests: install", "after the base merge");
+ return installFailure === undefined ? { merged: stale } : { merged: stale, failure: installFailure };
 }
 
 interface CheckedOnBase {
@@ -2493,8 +2493,8 @@ async function checkOnCurrentBase(ctx: ImplementContext, testCommand: string, in
  };
  let prepared: MergedBeforeTests = input.mergeFirst ? await mergeUp() : {};
  if (prepared.failure === undefined && !installedRuns.has(ctx)) {
-  const installed = await installDependencies(ctx, `${input.label}: install`, "before the tests");
-  if (installed !== undefined) prepared = { ...prepared, failure: installed };
+  const installFailure = await installDependencies(ctx, `${input.label}: install`, "before the tests");
+  if (installFailure !== undefined) prepared = { ...prepared, failure: installFailure };
  }
  for (let moves = 0; ; moves += 1) {
   const sha = await headSha(worktree);
@@ -3036,8 +3036,8 @@ async function checkedWorkerPass(
  // tracked file (a lockfile, generated source) fails the pass rather than
  // letting the tests certify content that never gets pushed.
  if (spec.kind === "base-merge") {
-  const installed = await installDependencies(ctx, `${pass}: install`, "after the base merge");
-  if (installed !== undefined) return fail(installed);
+  const installFailure = await installDependencies(ctx, `${pass}: install`, "after the base merge");
+  if (installFailure !== undefined) return fail(installFailure);
  }
  const sha = await headSha(worktree);
  // A CI fix pass may find the red is not the branch's (a flaky test, a
@@ -4158,8 +4158,8 @@ async function restoreWorktree(ctx: ImplementContext, sha: string): Promise<stri
   const r = await safeGit(["--no-replace-objects", ...args], { cwd: worktree, timeoutMs: 120_000 });
   if (r.code !== 0) return `could not restore the worktree to ${sha.slice(0, 8)} (git ${args[0]}): ${r.stderr.trim()}`;
  }
- const installed = await installDependencies(ctx, "restoring the worktree: install", "after restoring the worktree");
- if (installed !== undefined) return installed;
+ const installFailure = await installDependencies(ctx, "restoring the worktree: install", "after restoring the worktree");
+ if (installFailure !== undefined) return installFailure;
  if ((await headSha(worktree)) !== sha || (await dirtyFiles(worktree)).length > 0) {
   return `the worktree is not at a clean ${sha.slice(0, 8)} after restoring it`;
  }
