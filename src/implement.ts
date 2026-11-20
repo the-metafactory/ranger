@@ -1443,6 +1443,16 @@ async function tryCarryReview(ctx: ImplementContext, reviews: RecordedReview[], 
 }
 
 const failedOperations = new WeakMap<ImplementContext, OperationOutcome>();
+const installedRuns = new WeakSet<ImplementContext>();
+
+async function installDependencies(ctx: ImplementContext, label: string, when?: string): Promise<string | undefined> {
+ const command = ctx.map.commands.install;
+ if (remoteTests(ctx) || command === undefined) return undefined;
+ const install = await runShell(command, ctx.worktree, ctx, { label, timeoutMs: INSTALL_TIMEOUT_MS });
+ if (install.code !== 0) return `install (${command})${when === undefined ? "" : ` ${when}`} exited ${install.code}: ${tail(install)}`;
+ installedRuns.add(ctx);
+ return undefined;
+}
 
 function failedReviewSessionOutcome(error: ReviewError, cap: CapSignal | null): SessionOutcome {
  const kind = error.preflight?.kind;
@@ -1467,6 +1477,7 @@ function reviewFailure(ctx: ImplementContext, error: ReviewError, round: number)
 export async function runImplement(ctx: ImplementContext): Promise<ImplementOutcome> {
  failedOperations.delete(ctx);
  workerGateBudgets.delete(ctx);
+ installedRuns.delete(ctx);
  let outcome: ImplementOutcome;
  try {
   outcome = await runImplementFlow(ctx);
@@ -1560,16 +1571,8 @@ async function runImplementFlow(ctx: ImplementContext): Promise<ImplementOutcome
   // Before the install, so it installs what the moved base declares.
   const caughtUp = await prepareWorktree(ctx, { at: "no-pr", testCommand });
   if (caughtUp?.failure !== undefined) return caughtUp.failure;
-  if (!remoteTests(ctx) && map.commands.install !== undefined) {
-   const install = await runShell(map.commands.install, worktree, ctx, { label: "install", timeoutMs: INSTALL_TIMEOUT_MS });
-   if (install.code !== 0) {
-    return {
-     status: "failed",
-     detail: `install (${map.commands.install}) exited ${install.code}: ${tail(install)}`,
-     workerExit: caughtUp?.workerExit ?? null,
-    };
-   }
-  }
+  const installFailure = await installDependencies(ctx, "install");
+  if (installFailure !== undefined) return { status: "failed", detail: installFailure, workerExit: caughtUp?.workerExit ?? null };
   // Work an earlier run built and committed, but never pushed, is adopted
   // when it passes the supervisor's checks (#691: its tests failed under
   // load; a fresh worker would find nothing to commit and fail again).
@@ -2448,11 +2451,8 @@ async function mergeBaseBeforeTests(ctx: ImplementContext, budgetLeft: boolean):
  const merged = await machineMergeBase(ctx, { why: "the commits on this head wait on the supervisor's tests", then: "the tests run on the merge", baseSha, behind });
  if (!merged) return {};
  const stale: StaleBase = { behind, limit: 0 };
- if (!remoteTests(ctx) && map.commands.install !== undefined) {
-  const install = await runShell(map.commands.install, worktree, ctx, { label: "base merge before the tests: install", timeoutMs: INSTALL_TIMEOUT_MS });
-  if (install.code !== 0) return { merged: stale, failure: `install (${map.commands.install}) after the base merge exited ${install.code}: ${tail(install)}` };
- }
- return { merged: stale };
+ const installFailure = await installDependencies(ctx, "base merge before the tests: install", "after the base merge");
+ return installFailure === undefined ? { merged: stale } : { merged: stale, failure: installFailure };
 }
 
 interface CheckedOnBase {
@@ -2492,6 +2492,10 @@ async function checkOnCurrentBase(ctx: ImplementContext, testCommand: string, in
   return prepared;
  };
  let prepared: MergedBeforeTests = input.mergeFirst ? await mergeUp() : {};
+ if (prepared.failure === undefined && !installedRuns.has(ctx)) {
+  const installFailure = await installDependencies(ctx, `${input.label}: install`, "before the tests");
+  if (installFailure !== undefined) prepared = { ...prepared, failure: installFailure };
+ }
  for (let moves = 0; ; moves += 1) {
   const sha = await headSha(worktree);
   const snapshot = await trustedSnapshot(journal, ctx.canonical, { repo: map.repo, nodeId: ctx.node.ref.id }, mapKey(map));
@@ -3031,11 +3035,9 @@ async function checkedWorkerPass(
  // before the commit and clean-tree checks, so an install that rewrites a
  // tracked file (a lockfile, generated source) fails the pass rather than
  // letting the tests certify content that never gets pushed.
- if (!remoteTests(ctx) && spec.kind === "base-merge" && map.commands.install !== undefined) {
-  const install = await runShell(map.commands.install, worktree, ctx, { label: `${pass}: install`, timeoutMs: INSTALL_TIMEOUT_MS });
-  if (install.code !== 0) {
-   return fail(`install (${map.commands.install}) after the base merge exited ${install.code}: ${tail(install)}`);
-  }
+ if (spec.kind === "base-merge") {
+  const installFailure = await installDependencies(ctx, `${pass}: install`, "after the base merge");
+  if (installFailure !== undefined) return fail(installFailure);
  }
  const sha = await headSha(worktree);
  // A CI fix pass may find the red is not the branch's (a flaky test, a
@@ -4156,10 +4158,8 @@ async function restoreWorktree(ctx: ImplementContext, sha: string): Promise<stri
   const r = await safeGit(["--no-replace-objects", ...args], { cwd: worktree, timeoutMs: 120_000 });
   if (r.code !== 0) return `could not restore the worktree to ${sha.slice(0, 8)} (git ${args[0]}): ${r.stderr.trim()}`;
  }
- if (!remoteTests(ctx) && map.commands.install !== undefined) {
-  const install = await runShell(map.commands.install, worktree, ctx, { label: "restoring the worktree: install", timeoutMs: INSTALL_TIMEOUT_MS });
-  if (install.code !== 0) return `install (${map.commands.install}) after restoring the worktree exited ${install.code}: ${tail(install)}`;
- }
+ const installFailure = await installDependencies(ctx, "restoring the worktree: install", "after restoring the worktree");
+ if (installFailure !== undefined) return installFailure;
  if ((await headSha(worktree)) !== sha || (await dirtyFiles(worktree)).length > 0) {
   return `the worktree is not at a clean ${sha.slice(0, 8)} after restoring it`;
  }
