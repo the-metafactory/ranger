@@ -25,10 +25,10 @@ import { SUSPICIOUS_REVIEW_ROUND } from "./review-round.ts";
  * refuses a foreign Host or Origin, a missing token, and any node that is not
  * a grilling on the cached frontier and still open and unclaimed when read
  * live. **What the allowlist proves is narrower than the session**: it is the
- * environment `osascript` runs with, and `test/serve.test.ts` holds it. The
- * shell iTerm2 then opens is started by iTerm2, and is expected to take
- * iTerm2's own environment rather than this process's — that is how a
- * launched app's window works, and it is not tested here.
+ * environment `rex` runs with, and `test/serve.test.ts` holds it. The
+ * shell Rex then opens is started by the Rex server, and takes the
+ * principal's login shell environment rather than this process's; that is
+ * not tested here.
  *
  * **"Needs you" actions run outside this process (node #54).** The parked,
  * failed and needs-eye rows (`serve-parked.ts`) carry buttons, and each one
@@ -37,7 +37,7 @@ import { SUSPICIOUS_REVIEW_ROUND } from "./review-round.ts";
  * stored under HOME; which account that is goes unchecked), on a GitLab map
  * `glab api` on the MR's merge endpoint the same way (node #132: glab uses the
  * principal's login, and the pipeline is re-read under it first), or
- * the iTerm2 launch above. The process itself still writes nothing: the
+ * the Rex launch above. The process itself still writes nothing: the
  * journal stays read-only here and no graph write is imported. Each action is
  * guarded like the launch — Host, Origin, page token, a numeric id — and the
  * id must name a row the journal holds in the action's state when the request
@@ -78,7 +78,7 @@ import { meteredGh } from "./github-usage.ts";
 import { briefHoldReason, classify, classifyFrontier, type ClassifiedNode, loadProbeRegistry } from "./route.ts";
 import { liveSession, substrateUsageViews, type SubstrateUsageView } from "./substrate-usage.ts";
 import { resolveReadOnlyToken, assertReadOnlyToken, gatedEnv, gitlabApiRead, tokenBatch, type TokenBatch, type ResolvedToken } from "./token-gate.ts";
-import { childEnv, itermArgv, shellQuote, sessionCommand, sessionSubstrate } from "./launch.ts";
+import { childEnv, rexArgv, sessionLabel, shellQuote, sessionCommand, sessionSubstrate } from "./launch.ts";
 import type { SessionKind, SubstrateName } from "./store/schema.ts";
 import {
  type ActionKind,
@@ -691,7 +691,7 @@ export interface LaunchPlan {
 }
 
 /**
- * The command that opens an iTerm2 window in the principal's checkout and
+ * The command that opens a Rex session in the principal's checkout and
  * starts `claude` on one grilling node (the principal's terminal, 2026-10-03).
  * The prompt is built from the repo and the id only; no tracker text.
  */
@@ -721,7 +721,7 @@ export function launchPlan(args: {
      `Read it with \`soma graph node ${args.nodeId} --repo ${args.repo}\`, ` +
      `then work it with the orienteer skill.`;
  const shellCommand = `cd ${shellQuote(args.cwd)} && ${sessionCommand(prompt, args.substrate)}`;
- return { prompt, shellCommand, argv: itermArgv(shellCommand) };
+ return { prompt, shellCommand, argv: rexArgv(shellCommand, sessionLabel(args.repo, args.nodeId)) };
 }
 
 /** The token-injecting wrapper every scheduled ranger run goes through (node #11). */
@@ -1309,8 +1309,8 @@ function renderAuto(s) {
  }));
 }
 function grillButton(m, g) {
- return sessionControls(m.key + "/" + g.id, "Start session", g.launchable, g.why || "Open iTerm2 in " + m.localCheckout, async (substrate) => {
-  try { await post("/api/grill", { key: m.key, id: g.id, substrate }); say("Opened a " + substrate + " session on #" + g.id + " in iTerm2."); }
+ return sessionControls(m.key + "/" + g.id, "Start session", g.launchable, g.why || "Open a Rex session in " + m.localCheckout, async (substrate) => {
+  try { await post("/api/grill", { key: m.key, id: g.id, substrate }); say("Opened a " + substrate + " session on #" + g.id + " in Rex."); }
   catch (e) { say("Could not start #" + g.id + ": " + e.message, true); }
  });
 }
@@ -1428,7 +1428,7 @@ function needsCard(n) {
  }
  acts.append(mergeButton(n, "Merge"));
  const session = n.actions.session;
- acts.append(sessionControls(id, "Open session", session.offered, session.offered ? "Open iTerm2 in " + session.cwd : session.why, (substrate) => act("session", n, { substrate })));
+ acts.append(sessionControls(id, "Open session", session.offered, session.offered ? "Open a Rex session in " + session.cwd : session.why, (substrate) => act("session", n, { substrate })));
  if (n.pr) acts.append(link(n.pr.url, openText(n)));
  const last = results.get(id);
  return el("div", { class: "card" },

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RangerConfig } from "../src/config.ts";
 import { Journal, type EventRow, type WorkerRow } from "../src/journal.ts";
+import { REX_BIN } from "../src/launch.ts";
 import {
  blockedOutcome,
  CRASH_PARK_OUTCOME,
@@ -37,7 +38,7 @@ import {
 /**
  * Node #54 — "Needs you": parked and failed rows, why ranger stopped them,
  * and the actions the principal may take. Fixtures are shaped like the
- * journal rows of 2026-10-03/04. Nothing here runs gh, osascript or ranger:
+ * journal rows of 2026-10-03/04. Nothing here runs gh, rex or ranger:
  * the runner and the PR reader are injected and recorded.
  */
 
@@ -749,7 +750,7 @@ describe("node #54 — the actions and their guards", () => {
   const res = await handler(post("/api/session", { ...ok, dryRun: true }));
   expect(res.status).toBe(200);
   const script = ((await res.json()) as { argv: string[] }).argv.join(" ");
-  expect(script).toContain("iTerm2");
+  expect(script).toContain(" new ");
   expect(script).toContain("#663");
   expect(script).toContain(SEELITE);
   expect(script).toContain("review cap");
@@ -764,7 +765,7 @@ describe("node #54 — the actions and their guards", () => {
   expect(script).not.toContain("Stations are solid");
   expect(runs).toHaveLength(0);
   await handler(post("/api/session", ok));
-  expect(runs[0].argv[0]).toBe("osascript");
+  expect(runs[0].argv[0]).toBe(REX_BIN);
   expect(Object.keys(runs[0].env).sort()).toEqual(["HOME", "PATH"]);
  });
 

@@ -61,7 +61,7 @@ capabilities:
       - codex
       - ssh
       - podman
-      - osascript
+      - rex
   secrets: []
   hooks:
     - "PreToolUse"

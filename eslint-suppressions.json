@@ -457,7 +457,7 @@
   },
   "src/launch.ts": {
     "ranger/no-comments": {
-      "count": 3
+      "count": 2
     }
   },
   "src/lock.ts": {
