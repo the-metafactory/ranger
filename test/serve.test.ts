@@ -27,6 +27,7 @@ import {
 import { selectCandidates } from "../src/walk.ts";
 import { needsYouEntries } from "../src/serve-parked.ts";
 import { approvalVersion } from "../src/approval-spec.ts";
+import { REX_BIN } from "../src/launch.ts";
 
 /**
  * #37 — `ranger serve`: the state the dashboard shows, the launch it may make,
@@ -507,8 +508,9 @@ describe("#37 — the session the dashboard may launch", () => {
   const plan = launchPlan({ repo: REPO, root: 1, nodeId: "12", cwd: "/Users/someone/acme" });
   expect(plan.prompt).toContain("#12");
   expect(plan.prompt).toContain(`--repo ${REPO}`);
-  expect(plan.argv[0]).toBe("osascript");
-  expect(plan.argv.join(" ")).toContain("iTerm2");
+  expect(plan.argv[0]).toBe(REX_BIN);
+  expect(plan.argv.slice(1, 3)).toEqual(["new", "widgets-12"]);
+  expect(plan.argv.at(-1)).toContain(plan.shellCommand);
   expect(plan.shellCommand).toContain("cd '/Users/someone/acme'");
  });
 
@@ -597,7 +599,7 @@ describe("#37 — the launch endpoint refuses", () => {
   const { handler, launched } = setup();
   const res = await handler(post({ ...ok, dryRun: true }));
   expect(res.status).toBe(200);
-  expect(((await res.json()) as { argv: string[] }).argv[0]).toBe("osascript");
+  expect(((await res.json()) as { argv: string[] }).argv[0]).toBe(REX_BIN);
   expect(launched).toHaveLength(0);
  });
 

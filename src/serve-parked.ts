@@ -18,19 +18,19 @@ import type { MergeState } from "./forge.ts";
  * tokens and config dropped, so the CLI uses the login stored under this
  * user's HOME (the principal's, on the principal's machine; nothing here
  * checks which account that is), and a session opens
- * iTerm2 the way the grilling button does, in the map's `localCheckout` only:
+ * Rex the way the grilling button does, in the map's `localCheckout` only:
  * the worker's worktree belongs to the machine-account clone. A queued resume
  * and its cancel run `ranger resume-node --when-free` / `--cancel` (node
  * #166); the drain lives in serve-drain.ts. Every action is re-checked against the journal as it
  * reads when the request arrives, and the spawner is injected so no test runs
- * `gh`, `osascript` or ranger.
+ * `gh`, `rex` or ranger.
  */
 import { classifyGithubCheckRuns } from "./github-ci.ts";
 import { REPO_PATTERN } from "./config.ts";
 import type { EventRow, ResumeQueueRow, WorkerRow } from "./journal.ts";
 import { startsImplementSession, type ImplementLane } from "./lanes.ts";
 import { whenFreeQueues } from "./resume-gates.ts";
-import { childEnv, itermArgv, shellQuote, sessionCommand, sessionSubstrate } from "./launch.ts";
+import { childEnv, rexArgv, sessionLabel, shellQuote, sessionCommand, sessionSubstrate } from "./launch.ts";
 import type { SubstrateName } from "./store/schema.ts";
 import {
  CRASH_PARK_OUTCOME,
@@ -782,7 +782,7 @@ export function sessionPlan(args: {
   (facts.length === 0 ? "" : `${facts.join(" ")} `) +
   `Then tell me what the next step is.`;
  const shellCommand = `cd ${shellQuote(args.cwd)} && ${sessionCommand(prompt, args.substrate)}`;
- return { prompt, shellCommand, argv: itermArgv(shellCommand) };
+ return { prompt, shellCommand, argv: rexArgv(shellCommand, sessionLabel(args.repo, args.nodeId)) };
 }
 
 export interface ActionBody {

@@ -1,6 +1,6 @@
 /**
  * What `ranger serve` hands a child process (#37, node #54): the environment
- * allowlist and the iTerm2 launch, shared by the grilling button and the
+ * allowlist and the Rex launch, shared by the grilling button and the
  * "Needs you" actions.
  */
 
@@ -42,18 +42,26 @@ export function sessionCommand(prompt: string, substrate: SubstrateName = "claud
  return `${substrate} ${shellQuote(prompt)}`;
 }
 
-/** Escape a string for an AppleScript string literal. */
-const appleQuote = (s: string): string =>
- `"${s.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
+/**
+ * The Rex CLI inside the app bundle. An absolute path, because the PATH that
+ * launchd hands `ranger serve` does not include `~/bin`.
+ */
+export const REX_BIN = "/Applications/Rex.app/Contents/Helpers/Rex Server.rex/Contents/MacOS/rex";
 
-/** `osascript` argv that opens a new iTerm2 window and types `shellCommand` into it. */
-export function itermArgv(shellCommand: string): string[] {
- const script = [
-  'tell application "iTerm2"',
-  " set w to (create window with default profile)",
-  ` tell current session of w to write text ${appleQuote(shellCommand)}`,
-  " activate",
-  "end tell",
- ].join("\n");
- return ["osascript", "-e", script];
+/** A Rex session label: lowercase words joined by hyphens. */
+export function sessionLabel(repo: string, nodeId: string): string {
+ const name = repo.split("/").pop() ?? repo;
+ return `${name}-${nodeId}`.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+}
+
+/**
+ * `rex new` argv that opens a Rex session labelled `label` and runs
+ * `shellCommand` in it. Rex starts the command with the principal's login
+ * and interactive shell environment (`--interactive` reads ~/.zshrc, as the
+ * iTerm2 window it replaces did), not this process's. When the command exits,
+ * the pane drops into a login shell instead of closing, so the session can be
+ * resumed by hand.
+ */
+export function rexArgv(shellCommand: string, label: string): string[] {
+ return [REX_BIN, "new", label, "--interactive", "--", "sh", "-c", shellCommand + '; exec "${SHELL:-/bin/zsh}" -l'];
 }
